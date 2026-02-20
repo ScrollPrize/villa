@@ -7,6 +7,7 @@
 #include <nlohmann/json_fwd.hpp>
 
 class CollapsibleSettingsGroup;
+class QComboBox;
 class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
@@ -58,9 +59,11 @@ signals:
 private:
     void writeSetting(const QString& key, const QVariant& value);
     void validateConfigText();
+    void loadProfile(int index);
 
     CollapsibleSettingsGroup* _group{nullptr};
 
+    QComboBox* _profileCombo{nullptr};
     QLineEdit* _pythonEdit{nullptr};
     QToolButton* _pythonBrowse{nullptr};
     QLineEdit* _modelEdit{nullptr};

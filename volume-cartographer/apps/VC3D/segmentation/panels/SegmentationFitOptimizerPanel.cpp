@@ -4,6 +4,7 @@
 #include "VCSettings.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 
+#include <QComboBox>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -22,12 +23,22 @@
 
 #include <iostream>
 
-static const char* kDefaultConfig = R"({
+// ---------------------------------------------------------------------------
+// Predefined optimizer profiles
+// ---------------------------------------------------------------------------
+struct FitProfile {
+    const char* name;
+    const char* description;
+    const char* json;
+};
+
+static const FitProfile kProfiles[] = {
+    {"Quick Reopt (2k)", "Fast re-optimization of existing mesh",
+     R"({
     "base": {
         "dir_v": 10.0,
         "dir_conn": 1.0,
         "step": 100.0,
-        "smooth_x": 0.0,
         "smooth_y": 0.01,
         "gradmag": 1.0,
         "data": 0.4,
@@ -43,7 +54,201 @@ static const char* kDefaultConfig = R"({
             "min_scaledown": 0
         }
     ]
-})";
+})"},
+
+    {"Final Refinement (10k)", "Single-stage full-resolution refinement",
+     R"({
+    "base": {
+        "dir_v": 1.0,
+        "dir_conn": 0.1,
+        "step": 0.1,
+        "smooth_y": 0.01,
+        "gradmag": 0.01,
+        "meshoff_sy": 0.001,
+        "angle": 0.001,
+        "data": 4.0,
+        "data_plain": 2.0
+    },
+    "stages": [
+        {
+            "name": "sd0",
+            "steps": 10000,
+            "lr": [1.0, 0.1, 0.01],
+            "params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
+            "min_scaledown": 0
+        }
+    ]
+})"},
+
+    {"Scalespace (21k)", "Multi-scale coarse-to-fine optimization",
+     R"({
+    "base": {
+        "dir_v": 1.0,
+        "dir_conn": 0.1,
+        "step": 0.1,
+        "smooth_y": 0.01,
+        "gradmag": 0.01,
+        "angle": 0.001
+    },
+    "stages": [
+        {
+            "name": "sd4",
+            "steps": 2000,
+            "lr": 1.0,
+            "params": ["mesh_ms", "conn_offset_ms"],
+            "min_scaledown": 4
+        },
+        {
+            "name": "sd3",
+            "steps": 2000,
+            "lr": 0.1,
+            "params": ["mesh_ms", "conn_offset_ms"],
+            "min_scaledown": 3,
+            "w_fac": {"dir_conn": 10.0, "gradmag": 10.0}
+        },
+        {
+            "name": "sd2",
+            "steps": 5000,
+            "lr": 0.1,
+            "params": ["mesh_ms", "conn_offset_ms"],
+            "min_scaledown": 2,
+            "w_fac": {"dir_conn": 10.0, "gradmag": 10.0}
+        },
+        {
+            "name": "sd1",
+            "steps": 5000,
+            "lr": 0.1,
+            "params": ["mesh_ms", "conn_offset_ms"],
+            "min_scaledown": 1,
+            "w_fac": {"dir_conn": 10.0, "gradmag": 10.0}
+        },
+        {
+            "name": "sd0",
+            "steps": 5000,
+            "lr": 0.01,
+            "params": ["mesh_ms", "conn_offset_ms"],
+            "min_scaledown": 0,
+            "w_fac": {"dir_conn": 10000.0, "gradmag": 1.0}
+        }
+    ]
+})"},
+
+    {"Direct + Init (4k)", "Global transform init, then mesh optimization",
+     R"({
+    "base": {
+        "dir_v": 1.0,
+        "dir_conn": 1.0,
+        "step": 1.0,
+        "gradmag": 1.0,
+        "mean_pos": 0.1
+    },
+    "stages": [
+        {
+            "name": "init",
+            "steps": 1000,
+            "lr": 0.01,
+            "params": ["theta", "winding_scale"],
+            "min_scaledown": 0
+        },
+        {
+            "name": "mesh",
+            "steps": 3000,
+            "lr": 0.1,
+            "params": ["mesh_ms", "conn_offset_ms"],
+            "min_scaledown": 0
+        }
+    ]
+})"},
+
+    {"Direct + Grow", "Init, mesh opt, then grow up/down",
+     R"({
+    "base": {
+        "dir_v": 1.0,
+        "dir_conn": 1.0,
+        "step": 1.0,
+        "gradmag": 1.0,
+        "mean_pos": 0.1
+    },
+    "stages": [
+        {
+            "name": "init",
+            "steps": 500,
+            "lr": 0.1,
+            "params": ["theta", "winding_scale"],
+            "min_scaledown": 0
+        },
+        {
+            "name": "mesh",
+            "steps": 3000,
+            "lr": 0.1,
+            "params": ["mesh_ms", "conn_offset_ms"],
+            "min_scaledown": 0
+        },
+        {
+            "name": "grow_only",
+            "grow": {
+                "directions": ["down", "up"],
+                "generations": 30,
+                "steps": 1
+            },
+            "global_opt": {
+                "steps": 0,
+                "lr": 0.1,
+                "params": ["mesh_ms", "conn_offset_ms"],
+                "min_scaledown": 0
+            },
+            "local_opt": {
+                "opt_window": 2,
+                "steps": 300,
+                "lr": 0.1,
+                "params": ["mesh_ms", "conn_offset_ms"],
+                "min_scaledown": 0,
+                "w_fac": {"mean_pos": 0.0}
+            }
+        }
+    ]
+})"},
+
+    {"Grow Left", "Extend mesh leftward with local optimization",
+     R"({
+    "base": {
+        "dir_v": 1.0,
+        "dir_conn": 100.0,
+        "step": 0.1,
+        "smooth_y": 0.01,
+        "contr": 0.1,
+        "gradmag": 10.0,
+        "angle": 0.001,
+        "data": 4.0,
+        "data_plain": 2.0
+    },
+    "stages": [
+        {
+            "name": "grow_left",
+            "grow": {
+                "directions": ["left"],
+                "generations": 10,
+                "steps": 1
+            },
+            "global_opt": {
+                "steps": 0,
+                "lr": 0.01,
+                "params": ["mesh_ms", "conn_offset_ms", "amp", "bias"]
+            },
+            "local_opt": {
+                "steps": 1000,
+                "lr": 0.01,
+                "params": ["mesh_ms", "conn_offset_ms", "amp", "bias"]
+            }
+        }
+    ]
+})"},
+
+    {"Custom", "User-defined configuration", nullptr},
+};
+
+static constexpr int kProfileCount = sizeof(kProfiles) / sizeof(kProfiles[0]);
+static constexpr int kCustomProfileIndex = kProfileCount - 1;
 
 SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     const QString& settingsGroup, QWidget* parent)
@@ -100,6 +305,17 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         row->addWidget(_outputEdit, 1);
         row->addWidget(_outputBrowse);
     }, tr("Directory where re-exported tifxyz segments will be written."));
+
+    // -- Profile dropdown --
+    _group->addRow(tr("Profile:"), [&](QHBoxLayout* row) {
+        _profileCombo = new QComboBox(content);
+        for (int i = 0; i < kProfileCount; ++i) {
+            _profileCombo->addItem(
+                QString::fromUtf8(kProfiles[i].name),
+                QString::fromUtf8(kProfiles[i].description));
+        }
+        row->addWidget(_profileCombo, 1);
+    }, tr("Predefined optimizer configurations. Select 'Custom' to edit freely."));
 
     // -- JSON config editor --
     auto* configLabel = new QLabel(tr("Optimizer config (JSON):"), content);
@@ -219,12 +435,33 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         }
     });
 
+    // Profile combo
+    connect(_profileCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (_restoringSettings) return;
+        writeSetting(QStringLiteral("fit_profile_index"), index);
+        loadProfile(index);
+    });
+
     // Config editor
     connect(_configEdit, &QPlainTextEdit::textChanged, this, [this]() {
         if (_restoringSettings) return;
         _fitConfigText = _configEdit->toPlainText();
         writeSetting(QStringLiteral("fit_config_text"), _fitConfigText);
         validateConfigText();
+
+        // Switch to "Custom" if user manually edits while a preset is selected
+        if (_profileCombo && _profileCombo->currentIndex() != kCustomProfileIndex) {
+            int idx = _profileCombo->currentIndex();
+            if (idx >= 0 && idx < kCustomProfileIndex && kProfiles[idx].json) {
+                QString profileText = QString::fromUtf8(kProfiles[idx].json).trimmed();
+                if (_fitConfigText.trimmed() != profileText) {
+                    const QSignalBlocker b(_profileCombo);
+                    _profileCombo->setCurrentIndex(kCustomProfileIndex);
+                    writeSetting(QStringLiteral("fit_profile_index"), kCustomProfileIndex);
+                }
+            }
+        }
     });
 
     // Run button
@@ -362,8 +599,21 @@ void SegmentationFitOptimizerPanel::restoreSettings(QSettings& settings)
     _fitOutputDir = settings.value(QStringLiteral("fit_output_dir"), QString()).toString();
     _fitConfigText = settings.value(QStringLiteral("fit_config_text"), QString()).toString();
 
+    int profileIndex = settings.value(QStringLiteral("fit_profile_index"), 0).toInt();
+    if (profileIndex < 0 || profileIndex >= kProfileCount) {
+        profileIndex = 0;
+    }
+
     if (_fitConfigText.trimmed().isEmpty()) {
-        _fitConfigText = QString::fromUtf8(kDefaultConfig);
+        if (profileIndex < kCustomProfileIndex && kProfiles[profileIndex].json) {
+            _fitConfigText = QString::fromUtf8(kProfiles[profileIndex].json);
+        } else {
+            _fitConfigText = QString::fromUtf8(kProfiles[0].json);
+        }
+    }
+
+    if (_profileCombo) {
+        _profileCombo->setCurrentIndex(profileIndex);
     }
 
     const bool expanded = settings.value(
@@ -450,6 +700,28 @@ void SegmentationFitOptimizerPanel::setFitOutputDir(const QString& path)
         const QSignalBlocker b(_outputEdit);
         _outputEdit->setText(path);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Profile loading
+// ---------------------------------------------------------------------------
+
+void SegmentationFitOptimizerPanel::loadProfile(int index)
+{
+    if (index < 0 || index >= kProfileCount) return;
+    if (index == kCustomProfileIndex) return;  // Don't overwrite on "Custom"
+
+    const char* json = kProfiles[index].json;
+    if (!json) return;
+
+    _fitConfigText = QString::fromUtf8(json);
+    writeSetting(QStringLiteral("fit_config_text"), _fitConfigText);
+
+    if (_configEdit) {
+        const QSignalBlocker b(_configEdit);
+        _configEdit->setPlainText(_fitConfigText);
+    }
+    validateConfigText();
 }
 
 // ---------------------------------------------------------------------------
