@@ -59,6 +59,9 @@ def main(argv: list[str] | None = None) -> int:
 
 	data_cfg = cli_data.from_args(args)
 	model_cfg = cli_model.from_args(args)
+	# --bbox implies init_size_frac=1.0 so model exactly covers the bounding box
+	if getattr(args, "bbox", None) is not None:
+		model_cfg = replace(model_cfg, init_size_frac=1.0, init_size_frac_h=None, init_size_frac_v=None)
 	opt_cfg = cli_opt.from_args(args)
 	vis_cfg = cli_vis.from_args(args)
 	progress_enabled = bool(args.progress)

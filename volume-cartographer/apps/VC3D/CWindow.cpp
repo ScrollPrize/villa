@@ -1774,6 +1774,7 @@ void CWindow::CreateWidgets(void)
     // -- Fit optimizer connections --
     connect(_segmentationWidget, &SegmentationWidget::fitOptimizeRequested, this, [this]() {
         auto& mgr = FitServiceManager::instance();
+        const bool isNewModel = (_segmentationWidget->fitMode() == 1);
 
         // Ensure service is running (external or internal)
         if (mgr.isExternal()) {
@@ -1800,22 +1801,24 @@ void CWindow::CreateWidgets(void)
             segPath = activeSurface->path;
         }
 
-        // Model path — must exist as model.pt inside the segment directory
+        // Model path — required for re-optimize, optional for new model
         QString modelPath;
-        if (!segPath.empty()) {
-            auto modelFile = segPath / "model.pt";
-            if (std::filesystem::exists(modelFile)) {
-                try {
-                    modelPath = QString::fromStdString(
-                        std::filesystem::canonical(modelFile).string());
-                } catch (const std::filesystem::filesystem_error&) {}
+        if (!isNewModel) {
+            if (!segPath.empty()) {
+                auto modelFile = segPath / "model.pt";
+                if (std::filesystem::exists(modelFile)) {
+                    try {
+                        modelPath = QString::fromStdString(
+                            std::filesystem::canonical(modelFile).string());
+                    } catch (const std::filesystem::filesystem_error&) {}
+                }
             }
-        }
-        if (modelPath.isEmpty()) {
-            auto msg = tr("No model.pt found in segment directory. Cannot run fit optimizer.");
-            std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
-            statusBar()->showMessage(msg, 5000);
-            return;
+            if (modelPath.isEmpty()) {
+                auto msg = tr("No model.pt found in segment directory. Cannot run fit optimizer.");
+                std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
+                statusBar()->showMessage(msg, 5000);
+                return;
+            }
         }
 
         // Data input path (zarr)
@@ -1827,74 +1830,147 @@ void CWindow::CreateWidgets(void)
             return;
         }
 
-        // Output dir: always use the segment's parent directory (paths dir)
+        // Output dir: use the segment's parent directory (paths dir)
         QString outputDir;
         if (!segPath.empty()) {
             outputDir = QString::fromStdString(segPath.parent_path().string());
         }
 
         // --- Compute next version name ---
-        // Current segment: e.g. "winding_combined.tifxyz" or "winding_combined_v003.tifxyz"
-        // New segment:     "winding_combined_v004.tifxyz"
         QString outputName;
-        if (!segPath.empty()) {
-            auto segName = segPath.filename().string(); // e.g. "winding_combined.tifxyz"
-            // Strip .tifxyz suffix
-            std::string baseName = segName;
+        {
+            std::string rootName = "new_model";  // Default for new model without segment
             const std::string tifxyzSuffix = ".tifxyz";
-            if (baseName.size() > tifxyzSuffix.size() &&
-                baseName.compare(baseName.size() - tifxyzSuffix.size(),
-                                 tifxyzSuffix.size(), tifxyzSuffix) == 0) {
-                baseName = baseName.substr(0, baseName.size() - tifxyzSuffix.size());
-            }
-            // Strip existing _vNNN suffix to get the root name
-            std::string rootName = baseName;
-            if (rootName.size() > 5) { // at least "_v001"
-                auto pos = rootName.rfind("_v");
-                if (pos != std::string::npos && pos + 2 < rootName.size()) {
-                    bool allDigits = true;
-                    for (size_t i = pos + 2; i < rootName.size(); ++i) {
-                        if (!std::isdigit(static_cast<unsigned char>(rootName[i]))) {
-                            allDigits = false;
-                            break;
+
+            if (!segPath.empty()) {
+                auto segName = segPath.filename().string();
+                std::string baseName = segName;
+                if (baseName.size() > tifxyzSuffix.size() &&
+                    baseName.compare(baseName.size() - tifxyzSuffix.size(),
+                                     tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                    baseName = baseName.substr(0, baseName.size() - tifxyzSuffix.size());
+                }
+                rootName = baseName;
+                if (rootName.size() > 5) {
+                    auto pos = rootName.rfind("_v");
+                    if (pos != std::string::npos && pos + 2 < rootName.size()) {
+                        bool allDigits = true;
+                        for (size_t i = pos + 2; i < rootName.size(); ++i) {
+                            if (!std::isdigit(static_cast<unsigned char>(rootName[i]))) {
+                                allDigits = false;
+                                break;
+                            }
                         }
-                    }
-                    if (allDigits) {
-                        rootName = rootName.substr(0, pos);
+                        if (allDigits) rootName = rootName.substr(0, pos);
                     }
                 }
             }
-            // Scan siblings for highest existing version
+
+            // Scan for highest existing version in the output directory
             int maxVersion = 0;
-            auto parentDir = segPath.parent_path();
-            std::error_code ec;
-            for (auto& entry : std::filesystem::directory_iterator(parentDir, ec)) {
-                auto name = entry.path().filename().string();
-                // Check if it starts with rootName + "_v" and ends with .tifxyz
-                std::string prefix = rootName + "_v";
-                if (name.size() > prefix.size() + tifxyzSuffix.size() &&
-                    name.compare(0, prefix.size(), prefix) == 0 &&
-                    name.compare(name.size() - tifxyzSuffix.size(),
-                                 tifxyzSuffix.size(), tifxyzSuffix) == 0) {
-                    auto numStr = name.substr(prefix.size(),
-                        name.size() - prefix.size() - tifxyzSuffix.size());
-                    bool allDigits = true;
-                    for (auto c : numStr) {
-                        if (!std::isdigit(static_cast<unsigned char>(c))) {
-                            allDigits = false;
-                            break;
+            if (!outputDir.isEmpty()) {
+                std::error_code ec;
+                for (auto& entry : std::filesystem::directory_iterator(
+                         outputDir.toStdString(), ec)) {
+                    auto name = entry.path().filename().string();
+                    std::string prefix = rootName + "_v";
+                    if (name.size() > prefix.size() + tifxyzSuffix.size() &&
+                        name.compare(0, prefix.size(), prefix) == 0 &&
+                        name.compare(name.size() - tifxyzSuffix.size(),
+                                     tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                        auto numStr = name.substr(prefix.size(),
+                            name.size() - prefix.size() - tifxyzSuffix.size());
+                        bool allDigits = true;
+                        for (auto c : numStr) {
+                            if (!std::isdigit(static_cast<unsigned char>(c)))
+                                allDigits = false;
                         }
-                    }
-                    if (allDigits && !numStr.empty()) {
-                        int v = std::stoi(numStr);
-                        if (v > maxVersion) maxVersion = v;
+                        if (allDigits && !numStr.empty()) {
+                            int v = std::stoi(numStr);
+                            if (v > maxVersion) maxVersion = v;
+                        }
                     }
                 }
             }
-            int nextVersion = maxVersion + 1;
             char numBuf[16];
-            std::snprintf(numBuf, sizeof(numBuf), "_v%03d", nextVersion);
+            std::snprintf(numBuf, sizeof(numBuf), "_v%03d", maxVersion + 1);
             outputName = QString::fromStdString(rootName + numBuf + ".tifxyz");
+        }
+
+        // Parse config JSON from the editor
+        QJsonObject config;
+        QString configText = _segmentationWidget->fitConfigText().trimmed();
+        if (!configText.isEmpty()) {
+            QJsonDocument doc = QJsonDocument::fromJson(configText.toUtf8());
+            if (doc.isObject()) {
+                config = doc.object();
+            }
+        }
+
+        // --- New Model: inject crop, init_size_frac, z_size, grow into config ---
+        if (isNewModel) {
+            int nmW = _segmentationWidget->newModelWidth();
+            int nmH = _segmentationWidget->newModelHeight();
+            int nmD = _segmentationWidget->newModelDepth();
+
+            // Get focus/cursor position for centering the bbox
+            POI* focus = _surf_col ? _surf_col->poi("focus") : nullptr;
+            if (!focus) {
+                auto msg = tr("No focus position set. Place the cursor first.");
+                std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
+                statusBar()->showMessage(msg, 5000);
+                return;
+            }
+            int cx = static_cast<int>(focus->p[0]);
+            int cy = static_cast<int>(focus->p[1]);
+            int cz = static_cast<int>(focus->p[2]);
+
+            // Build/override the "args" section with --bbox CX CY CZ W H
+            QJsonObject args = config[QStringLiteral("args")].toObject();
+            args[QStringLiteral("bbox")] = QJsonArray{cx, cy, cz, nmW, nmH};
+            args[QStringLiteral("z-size")] = 1;
+            config[QStringLiteral("args")] = args;
+
+            // Override grow.generations in any grow stage to match depth
+            if (nmD > 1) {
+                QJsonArray stages = config[QStringLiteral("stages")].toArray();
+                bool hasGrow = false;
+                for (int i = 0; i < stages.size(); ++i) {
+                    QJsonObject stage = stages[i].toObject();
+                    if (stage.contains(QStringLiteral("grow"))) {
+                        QJsonObject grow = stage[QStringLiteral("grow")].toObject();
+                        grow[QStringLiteral("generations")] = nmD;
+                        stage[QStringLiteral("grow")] = grow;
+                        stages[i] = stage;
+                        hasGrow = true;
+                    }
+                }
+                // If no grow stage exists, append a default one
+                if (!hasGrow) {
+                    QJsonObject growStage;
+                    growStage[QStringLiteral("name")] = QStringLiteral("auto_grow");
+                    QJsonObject grow;
+                    grow[QStringLiteral("directions")] = QJsonArray{
+                        QStringLiteral("down"), QStringLiteral("up")};
+                    grow[QStringLiteral("generations")] = nmD;
+                    grow[QStringLiteral("steps")] = 1;
+                    growStage[QStringLiteral("grow")] = grow;
+                    QJsonObject localOpt;
+                    localOpt[QStringLiteral("opt_window")] = 2;
+                    localOpt[QStringLiteral("steps")] = 300;
+                    localOpt[QStringLiteral("lr")] = 0.1;
+                    localOpt[QStringLiteral("params")] = QJsonArray{
+                        QStringLiteral("mesh_ms"), QStringLiteral("conn_offset_ms")};
+                    localOpt[QStringLiteral("min_scaledown")] = 0;
+                    growStage[QStringLiteral("local_opt")] = localOpt;
+                    stages.append(growStage);
+                }
+                config[QStringLiteral("stages")] = stages;
+            }
+
+            std::cerr << "[fit-optimizer] new model: bbox center=(" << cx << "," << cy
+                      << "," << cz << ") size=(" << nmW << "x" << nmH
+                      << ") depth=" << nmD << std::endl;
         }
 
         // Build optimization request
@@ -1905,9 +1981,15 @@ void CWindow::CreateWidgets(void)
         if (!outputName.isEmpty()) {
             request[QStringLiteral("output_name")] = outputName;
         }
+        request[QStringLiteral("config")] = config;
 
-        if (mgr.isExternal()) {
-            // External mode: send model.pt as base64 data (no local paths)
+        if (isNewModel) {
+            // New model: no model_input/model_data needed
+            if (!mgr.isExternal()) {
+                request[QStringLiteral("output_dir")] = outputDir;
+            }
+        } else if (mgr.isExternal()) {
+            // Re-optimize external: send model.pt as base64 data
             QFile modelFile(modelPath);
             if (!modelFile.open(QIODevice::ReadOnly)) {
                 auto msg = tr("Cannot read model file: %1").arg(modelPath);
@@ -1920,23 +2002,16 @@ void CWindow::CreateWidgets(void)
             request[QStringLiteral("model_data")] =
                 QString::fromLatin1(modelBytes.toBase64());
         } else {
-            // Internal mode: send local paths directly
+            // Re-optimize internal: send local paths directly
             request[QStringLiteral("model_input")] = modelPath;
             request[QStringLiteral("output_dir")] = outputDir;
         }
 
-        // Parse config JSON from the editor
-        QString configText = _segmentationWidget->fitConfigText().trimmed();
-        if (!configText.isEmpty()) {
-            QJsonDocument doc = QJsonDocument::fromJson(configText.toUtf8());
-            if (doc.isObject()) {
-                request[QStringLiteral("config")] = doc.object();
-            }
-        }
-
         mgr.startOptimization(request, mgr.isExternal() ? outputDir : QString());
         statusBar()->showMessage(
-            tr("Fit optimization started. Output: %1").arg(outputName), 3000);
+            tr("Fit optimization started (%1). Output: %2")
+                .arg(isNewModel ? tr("new model") : tr("re-optimize"))
+                .arg(outputName), 3000);
     });
 
     connect(_segmentationWidget, &SegmentationWidget::fitStopRequested, this, [this]() {

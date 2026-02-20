@@ -50,6 +50,9 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--device", default="cuda")
 	g.add_argument("--downscale", type=float, default=4.0)
 	g.add_argument("--crop", type=int, nargs=4, default=None)
+	g.add_argument("--bbox", type=int, nargs=5, default=None, metavar=("CX", "CY", "CZ", "W", "H"),
+		help="Bounding box: center (CX,CY,CZ) + size (W,H) in full-res voxels. "
+		     "Sets crop and unet-z. Use with --init-size-frac 1.0 for exact sizing.")
 	g.add_argument("--grad-mag-blur-sigma", type=float, default=0.0)
 	g.add_argument("--dir-blur-sigma", type=float, default=0.0)
 
@@ -59,6 +62,11 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		raise ValueError("missing --input (can be provided via JSON config args)")
 	crop = tuple(int(v) for v in args.crop) if args.crop is not None else None
 	unet_z = None if args.unet_z is None else int(args.unet_z)
+	# --bbox CX CY CZ W H: derive crop and unet_z from bounding box center + size
+	if getattr(args, "bbox", None) is not None:
+		cx, cy, cz, bw, bh = (int(v) for v in args.bbox)
+		crop = (cx - bw // 2, cy - bh // 2, bw, bh)
+		unet_z = cz
 	z_step = max(1, int(args.z_step))
 	if (crop is None or unet_z is None or int(args.z_step) == 1) and args.unet_checkpoint is not None:
 		mp = _load_model_params_from_checkpoint(str(args.unet_checkpoint))

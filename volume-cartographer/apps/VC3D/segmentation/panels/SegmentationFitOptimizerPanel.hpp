@@ -14,6 +14,7 @@ class QPlainTextEdit;
 class QProgressBar;
 class QPushButton;
 class QSettings;
+class QSpinBox;
 class QStackedWidget;
 class QToolButton;
 class QWidget;
@@ -36,10 +37,17 @@ public:
     explicit SegmentationFitOptimizerPanel(const QString& settingsGroup,
                                             QWidget* parent = nullptr);
 
+    /** 0 = Re-optimize, 1 = New Model */
+    enum FitMode { ReOptimize = 0, NewModel = 1 };
+
     // Getters
     [[nodiscard]] QString fitDataInputPath() const { return _fitDataInputPath; }
     [[nodiscard]] QString fitConfigText() const { return _fitConfigText; }
     [[nodiscard]] std::optional<nlohmann::json> fitConfigJson() const;
+    [[nodiscard]] FitMode fitMode() const { return static_cast<FitMode>(_fitMode); }
+    [[nodiscard]] int newModelWidth() const;
+    [[nodiscard]] int newModelHeight() const;
+    [[nodiscard]] int newModelDepth() const;
 
     // Setters
     void setFitDataInputPath(const QString& path);
@@ -56,6 +64,7 @@ private:
     void writeSetting(const QString& key, const QVariant& value);
     void validateConfigText();
     void loadProfile(int index);
+    void onFitModeChanged(int index);
     void onConnectionModeChanged(int index);
     void refreshDiscoveredServices();
     void onDiscoveredServiceSelected(int index);
@@ -78,6 +87,13 @@ private:
     QComboBox* _datasetCombo{nullptr};
     QStackedWidget* _dataInputStack{nullptr};
 
+    // Mode (re-optimize vs new model)
+    QComboBox* _modeCombo{nullptr};
+    QWidget* _newModelWidget{nullptr};
+    QSpinBox* _widthSpin{nullptr};
+    QSpinBox* _heightSpin{nullptr};
+    QSpinBox* _depthSpin{nullptr};
+
     QComboBox* _profileCombo{nullptr};
     QLineEdit* _dataInputEdit{nullptr};
     QToolButton* _dataInputBrowse{nullptr};
@@ -93,6 +109,7 @@ private:
     QString _fitConfigText;
     QString _configError;
 
+    int _fitMode{0};         // 0=re-optimize, 1=new model
     int _connectionMode{0};  // 0=internal, 1=external
     QString _externalHost{"127.0.0.1"};
     int _externalPort{9999};

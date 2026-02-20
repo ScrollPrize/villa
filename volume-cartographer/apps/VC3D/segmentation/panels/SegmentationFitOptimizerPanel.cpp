@@ -21,6 +21,7 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QSpinBox>
 #include <QStackedWidget>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -319,6 +320,45 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     _group->contentLayout()->addWidget(_externalWidget);
     _externalWidget->setVisible(false);  // Start hidden (internal mode)
 
+    // -- Mode: Re-optimize / New Model --
+    _group->addRow(tr("Mode:"), [&](QHBoxLayout* row) {
+        _modeCombo = new QComboBox(content);
+        _modeCombo->addItem(tr("Re-optimize"));
+        _modeCombo->addItem(tr("New Model"));
+        row->addWidget(_modeCombo, 1);
+    }, tr("Re-optimize refines an existing model. New Model creates a fresh model centered at the cursor."));
+
+    // -- New model dimensions (visible only in New Model mode) --
+    _newModelWidget = new QWidget(content);
+    auto* dimLayout = new QHBoxLayout(_newModelWidget);
+    dimLayout->setContentsMargins(0, 0, 0, 0);
+    dimLayout->setSpacing(4);
+
+    dimLayout->addWidget(new QLabel(tr("W:"), _newModelWidget));
+    _widthSpin = new QSpinBox(_newModelWidget);
+    _widthSpin->setRange(64, 16384);
+    _widthSpin->setValue(2048);
+    _widthSpin->setSingleStep(64);
+    dimLayout->addWidget(_widthSpin, 1);
+
+    dimLayout->addWidget(new QLabel(tr("H:"), _newModelWidget));
+    _heightSpin = new QSpinBox(_newModelWidget);
+    _heightSpin->setRange(64, 16384);
+    _heightSpin->setValue(2048);
+    _heightSpin->setSingleStep(64);
+    dimLayout->addWidget(_heightSpin, 1);
+
+    dimLayout->addWidget(new QLabel(tr("D:"), _newModelWidget));
+    _depthSpin = new QSpinBox(_newModelWidget);
+    _depthSpin->setRange(1, 200);
+    _depthSpin->setValue(30);
+    _depthSpin->setSingleStep(1);
+    _depthSpin->setToolTip(tr("Depth in z-grow generations"));
+    dimLayout->addWidget(_depthSpin, 1);
+
+    _group->contentLayout()->addWidget(_newModelWidget);
+    _newModelWidget->setVisible(false);  // Hidden until "New Model" selected
+
     // -- Data input (zarr) — stacked: file browse (page 0) or dataset combo (page 1) --
     _dataInputStack = new QStackedWidget(content);
 
@@ -407,6 +447,21 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     // -----------------------------------------------------------------------
     // Signal wiring
     // -----------------------------------------------------------------------
+
+    // Mode combo (Re-optimize / New Model)
+    connect(_modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &SegmentationFitOptimizerPanel::onFitModeChanged);
+
+    // Persist dimension changes
+    connect(_widthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        writeSetting(QStringLiteral("fit_new_model_width"), v);
+    });
+    connect(_heightSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        writeSetting(QStringLiteral("fit_new_model_height"), v);
+    });
+    connect(_depthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        writeSetting(QStringLiteral("fit_new_model_depth"), v);
+    });
 
     // Connection mode
     connect(_connectionCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -689,6 +744,26 @@ void SegmentationFitOptimizerPanel::restoreSettings(QSettings& settings)
     _fitDataInputPath = settings.value(QStringLiteral("fit_data_input_path"), QString()).toString();
     _fitConfigText = settings.value(QStringLiteral("fit_config_text"), QString()).toString();
 
+    _fitMode = settings.value(QStringLiteral("fit_mode"), 0).toInt();
+    if (_modeCombo) {
+        _modeCombo->setCurrentIndex(_fitMode);
+    }
+    if (_newModelWidget) {
+        _newModelWidget->setVisible(_fitMode == 1);
+    }
+    if (_widthSpin) {
+        const QSignalBlocker b(_widthSpin);
+        _widthSpin->setValue(settings.value(QStringLiteral("fit_new_model_width"), 2048).toInt());
+    }
+    if (_heightSpin) {
+        const QSignalBlocker b(_heightSpin);
+        _heightSpin->setValue(settings.value(QStringLiteral("fit_new_model_height"), 2048).toInt());
+    }
+    if (_depthSpin) {
+        const QSignalBlocker b(_depthSpin);
+        _depthSpin->setValue(settings.value(QStringLiteral("fit_new_model_depth"), 30).toInt());
+    }
+
     _connectionMode = settings.value(QStringLiteral("fit_connection_mode"), 0).toInt();
     _externalHost = settings.value(QStringLiteral("fit_external_host"),
                                    QStringLiteral("127.0.0.1")).toString();
@@ -841,6 +916,35 @@ std::optional<nlohmann::json> SegmentationFitOptimizerPanel::fitConfigJson() con
     } catch (...) {}
 
     return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// Fit mode (Re-optimize / New Model)
+// ---------------------------------------------------------------------------
+
+int SegmentationFitOptimizerPanel::newModelWidth() const
+{
+    return _widthSpin ? _widthSpin->value() : 2048;
+}
+
+int SegmentationFitOptimizerPanel::newModelHeight() const
+{
+    return _heightSpin ? _heightSpin->value() : 2048;
+}
+
+int SegmentationFitOptimizerPanel::newModelDepth() const
+{
+    return _depthSpin ? _depthSpin->value() : 30;
+}
+
+void SegmentationFitOptimizerPanel::onFitModeChanged(int index)
+{
+    if (_restoringSettings) return;
+    _fitMode = index;
+    writeSetting(QStringLiteral("fit_mode"), _fitMode);
+    if (_newModelWidget) {
+        _newModelWidget->setVisible(index == 1);  // Show for "New Model"
+    }
 }
 
 // ---------------------------------------------------------------------------

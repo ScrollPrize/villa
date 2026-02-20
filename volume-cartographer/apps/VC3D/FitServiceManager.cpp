@@ -604,7 +604,15 @@ QJsonArray FitServiceManager::discoverServices()
     proc.start(QStringLiteral("avahi-browse"),
                {QStringLiteral("-r"), QStringLiteral("-t"),
                 QStringLiteral("--parsable"), QStringLiteral("_fitoptimizer._tcp")});
-    if (proc.waitForFinished(5000)) {
+    bool finished = proc.waitForFinished(5000);
+    if (!finished) {
+        proc.terminate();
+        if (!proc.waitForFinished(2000)) {
+            proc.kill();
+            proc.waitForFinished(1000);
+        }
+    }
+    if (finished) {
         // Parsable output format (resolved lines start with '='):
         // =;interface;protocol;name;type;domain;hostname;address;port;txt1 txt2 ...
         QString output = QString::fromUtf8(proc.readAllStandardOutput());

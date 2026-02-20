@@ -412,5 +412,9 @@ void SegmentationWidget::setEraseBrushActive(bool /*active*/) {}
 
 QString SegmentationWidget::fitDataInputPath() const { return _fitOptimizerPanel->fitDataInputPath(); }
 QString SegmentationWidget::fitConfigText() const { return _fitOptimizerPanel->fitConfigText(); }
+int SegmentationWidget::fitMode() const { return static_cast<int>(_fitOptimizerPanel->fitMode()); }
+int SegmentationWidget::newModelWidth() const { return _fitOptimizerPanel->newModelWidth(); }
+int SegmentationWidget::newModelHeight() const { return _fitOptimizerPanel->newModelHeight(); }
+int SegmentationWidget::newModelDepth() const { return _fitOptimizerPanel->newModelDepth(); }
 
 void SegmentationWidget::setFitDataInputPath(const QString& path) { _fitOptimizerPanel->setFitDataInputPath(path); }

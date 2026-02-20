@@ -264,10 +264,8 @@ def _run_optimization(body: dict[str, Any]) -> None:
     data_input = body.get("data_input")
     output_dir = body.get("output_dir")
     config = body.get("config", {})
+    is_new_model = not model_input and not model_data
 
-    if not model_input and not model_data:
-        _job.set_error("missing 'model_input' or 'model_data'")
-        return
     if not data_input:
         _job.set_error("missing 'data_input'")
         return
@@ -283,6 +281,8 @@ def _run_optimization(body: dict[str, Any]) -> None:
             model_input = str(Path(tmp_dir) / "model_input.pt")
             Path(model_input).write_bytes(model_bytes)
             print(f"[fit-service] received model data ({len(model_bytes)} bytes)", flush=True)
+        elif is_new_model:
+            print("[fit-service] new model mode (no model_input)", flush=True)
 
         # If no output_dir, create a temp dir for results (external mode)
         results_tmp = None
@@ -298,7 +298,8 @@ def _run_optimization(body: dict[str, Any]) -> None:
         cfg = dict(config)
         args_section = dict(cfg.get("args", {}))
         args_section["input"] = str(data_input)
-        args_section["model-input"] = str(model_input)
+        if model_input:
+            args_section["model-input"] = str(model_input)
         args_section["model-output"] = str(model_output)
         # Only set out-dir if explicitly requested (enables debug vis output).
         # By default we skip vis output for speed.

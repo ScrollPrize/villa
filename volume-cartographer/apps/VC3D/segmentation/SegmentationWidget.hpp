@@ -166,6 +166,10 @@ public:
     // Fit optimizer getters — delegated to panel
     [[nodiscard]] QString fitDataInputPath() const;
     [[nodiscard]] QString fitConfigText() const;
+    [[nodiscard]] int fitMode() const;
+    [[nodiscard]] int newModelWidth() const;
+    [[nodiscard]] int newModelHeight() const;
+    [[nodiscard]] int newModelDepth() const;
 
     // Fit optimizer setters
     void setFitDataInputPath(const QString& path);
