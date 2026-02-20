@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
@@ -14,6 +15,10 @@
 #include <QUrl>
 
 #include <iostream>
+
+#ifdef Q_OS_UNIX
+#include <signal.h>
+#endif
 
 namespace
 {
@@ -104,15 +109,64 @@ FitServiceManager::~FitServiceManager()
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+QString FitServiceManager::baseUrl() const
+{
+    return QStringLiteral("http://%1:%2").arg(_host).arg(_port);
+}
+
+// ---------------------------------------------------------------------------
 // Service lifecycle
 // ---------------------------------------------------------------------------
 
 bool FitServiceManager::ensureServiceRunning(const QString& pythonPath)
 {
+    if (_isExternal && _serviceReady) {
+        return true;
+    }
     if (_process && _process->state() == QProcess::Running && _serviceReady) {
         return true;
     }
     return startService(pythonPath);
+}
+
+void FitServiceManager::connectToExternal(const QString& host, int port)
+{
+    // Stop any existing internal service first
+    if (_process) {
+        stopService();
+    }
+
+    _isExternal = true;
+    _host = host;
+    _port = port;
+    _lastError.clear();
+    _serviceReady = false;
+
+    emit statusMessage(tr("Connecting to external service at %1:%2...").arg(host).arg(port));
+
+    // Ping GET /health
+    QUrl url(QStringLiteral("%1/health").arg(baseUrl()));
+    QNetworkRequest req(url);
+
+    QNetworkReply* reply = _nam->get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+
+        if (reply->error() != QNetworkReply::NoError) {
+            _lastError = tr("Cannot reach external service: %1").arg(reply->errorString());
+            _serviceReady = false;
+            _isExternal = false;
+            emit serviceError(_lastError);
+            return;
+        }
+
+        _serviceReady = true;
+        emit statusMessage(tr("Connected to external service on %1:%2").arg(_host).arg(_port));
+        emit serviceStarted();
+    });
 }
 
 bool FitServiceManager::startService(const QString& pythonPath)
@@ -206,6 +260,17 @@ void FitServiceManager::stopService()
 {
     _pollTimer->stop();
 
+    if (_isExternal) {
+        // External mode: just reset state, don't terminate any process
+        _serviceReady = false;
+        _optimizationRunning = false;
+        _isExternal = false;
+        _host = QStringLiteral("127.0.0.1");
+        _port = 0;
+        emit serviceStopped();
+        return;
+    }
+
     if (!_process) {
         return;
     }
@@ -230,6 +295,9 @@ void FitServiceManager::stopService()
 
 bool FitServiceManager::isRunning() const
 {
+    if (_isExternal) {
+        return _serviceReady;
+    }
     return _process && _process->state() == QProcess::Running && _serviceReady;
 }
 
@@ -315,7 +383,7 @@ void FitServiceManager::startOptimization(const QJsonObject& config)
         return;
     }
 
-    QUrl url(QStringLiteral("http://127.0.0.1:%1/optimize").arg(_port));
+    QUrl url(QStringLiteral("%1/optimize").arg(baseUrl()));
     QNetworkRequest req(url);
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
 
@@ -331,7 +399,7 @@ void FitServiceManager::stopOptimization()
 {
     if (!isRunning()) return;
 
-    QUrl url(QStringLiteral("http://127.0.0.1:%1/stop").arg(_port));
+    QUrl url(QStringLiteral("%1/stop").arg(baseUrl()));
     QNetworkRequest req(url);
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
 
@@ -368,7 +436,7 @@ void FitServiceManager::pollStatus()
         return;
     }
 
-    QUrl url(QStringLiteral("http://127.0.0.1:%1/status").arg(_port));
+    QUrl url(QStringLiteral("%1/status").arg(baseUrl()));
     QNetworkRequest req(url);
 
     QNetworkReply* reply = _nam->get(req);
@@ -411,4 +479,72 @@ void FitServiceManager::handleStatusReply(QNetworkReply* reply)
         _optimizationRunning = false;
         _pollTimer->stop();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Service discovery
+// ---------------------------------------------------------------------------
+
+QJsonArray FitServiceManager::discoverServices()
+{
+    QJsonArray result;
+    QString dirPath = QDir::homePath() + QStringLiteral("/.fit_services");
+    QDir dir(dirPath);
+    if (!dir.exists()) {
+        return result;
+    }
+
+    const auto entries = dir.entryInfoList(
+        QStringList{QStringLiteral("*.json")}, QDir::Files);
+    for (const QFileInfo& fi : entries) {
+        QFile f(fi.absoluteFilePath());
+        if (!f.open(QIODevice::ReadOnly)) {
+            continue;
+        }
+        QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+        f.close();
+        if (!doc.isObject()) {
+            QFile::remove(fi.absoluteFilePath());
+            continue;
+        }
+        QJsonObject obj = doc.object();
+        int pid = obj[QStringLiteral("pid")].toInt(-1);
+        if (pid <= 0) {
+            QFile::remove(fi.absoluteFilePath());
+            continue;
+        }
+
+        // Check if PID is still alive
+#ifdef Q_OS_UNIX
+        if (kill(pid, 0) != 0) {
+            QFile::remove(fi.absoluteFilePath());
+            continue;
+        }
+#endif
+
+        result.append(obj);
+    }
+    return result;
+}
+
+void FitServiceManager::fetchDatasets()
+{
+    if (!isRunning()) {
+        return;
+    }
+
+    QUrl url(QStringLiteral("%1/datasets").arg(baseUrl()));
+    QNetworkRequest req(url);
+
+    QNetworkReply* reply = _nam->get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            return;
+        }
+        QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
+        QJsonObject obj = doc.object();
+        QJsonArray datasets = obj[QStringLiteral("datasets")].toArray();
+        emit datasetsReceived(datasets);
+    });
 }

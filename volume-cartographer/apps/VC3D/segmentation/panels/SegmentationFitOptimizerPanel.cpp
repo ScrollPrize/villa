@@ -9,6 +9,9 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHBoxLayout>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPlainTextEdit>
@@ -16,6 +19,7 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QStackedWidget>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -262,8 +266,16 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     _group = new CollapsibleSettingsGroup(tr("Fit Optimizer"), this);
     auto* content = _group->contentWidget();
 
-    // -- Python executable --
-    _group->addRow(tr("Python:"), [&](QHBoxLayout* row) {
+    // -- Connection mode --
+    _group->addRow(tr("Connection:"), [&](QHBoxLayout* row) {
+        _connectionCombo = new QComboBox(content);
+        _connectionCombo->addItem(tr("Internal (local)"));
+        _connectionCombo->addItem(tr("External (remote)"));
+        row->addWidget(_connectionCombo, 1);
+    }, tr("Internal launches a local Python process. External connects to a running service."));
+
+    // -- Internal widget: Python path --
+    _internalWidget = _group->addRow(tr("Python:"), [&](QHBoxLayout* row) {
         _pythonEdit = new QLineEdit(content);
         _pythonEdit->setPlaceholderText(
             tr("Path to Python (leave empty for auto-detect)"));
@@ -272,6 +284,47 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         row->addWidget(_pythonEdit, 1);
         row->addWidget(_pythonBrowse);
     }, tr("Python executable with torch installed."));
+
+    // -- External widgets: discovery + host/port --
+    _externalWidget = new QWidget(content);
+    auto* extLayout = new QVBoxLayout(_externalWidget);
+    extLayout->setContentsMargins(0, 0, 0, 0);
+    extLayout->setSpacing(4);
+
+    // Discovery row
+    auto* discRow = new QHBoxLayout();
+    auto* discLabel = new QLabel(tr("Service:"), _externalWidget);
+    discLabel->setFixedWidth(60);
+    _discoveryCombo = new QComboBox(_externalWidget);
+    _discoveryCombo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    _refreshBtn = new QToolButton(_externalWidget);
+    _refreshBtn->setText(QStringLiteral("\u21BB"));  // ↻
+    _refreshBtn->setToolTip(tr("Refresh discovered services"));
+    discRow->addWidget(discLabel);
+    discRow->addWidget(_discoveryCombo, 1);
+    discRow->addWidget(_refreshBtn);
+    extLayout->addLayout(discRow);
+
+    // Host/port row
+    auto* hostRow = new QHBoxLayout();
+    auto* hostLabel = new QLabel(tr("Host:"), _externalWidget);
+    hostLabel->setFixedWidth(60);
+    _hostEdit = new QLineEdit(_externalWidget);
+    _hostEdit->setText(QStringLiteral("127.0.0.1"));
+    _hostEdit->setPlaceholderText(QStringLiteral("127.0.0.1"));
+    auto* portLabel = new QLabel(tr("Port:"), _externalWidget);
+    _portEdit = new QLineEdit(_externalWidget);
+    _portEdit->setText(QStringLiteral("9999"));
+    _portEdit->setPlaceholderText(QStringLiteral("9999"));
+    _portEdit->setFixedWidth(70);
+    hostRow->addWidget(hostLabel);
+    hostRow->addWidget(_hostEdit, 1);
+    hostRow->addWidget(portLabel);
+    hostRow->addWidget(_portEdit);
+    extLayout->addLayout(hostRow);
+
+    _group->contentLayout()->addWidget(_externalWidget);
+    _externalWidget->setVisible(false);  // Start hidden (internal mode)
 
     // -- Model checkpoint --
     _group->addRow(tr("Model:"), [&](QHBoxLayout* row) {
@@ -284,15 +337,29 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         row->addWidget(_modelBrowse);
     }, tr("Fit model checkpoint (.pt). Auto-populated from segment's model.pt symlink."));
 
-    // -- Data input (zarr) --
+    // -- Data input (zarr) — stacked: file browse (page 0) or dataset combo (page 1) --
+    _dataInputStack = new QStackedWidget(content);
+
+    // Page 0: file browse
+    auto* browseWidget = new QWidget(_dataInputStack);
+    auto* browseLayout = new QHBoxLayout(browseWidget);
+    browseLayout->setContentsMargins(0, 0, 0, 0);
+    _dataInputEdit = new QLineEdit(browseWidget);
+    _dataInputEdit->setPlaceholderText(tr("Path to input data (.zarr)"));
+    _dataInputBrowse = new QToolButton(browseWidget);
+    _dataInputBrowse->setText(QStringLiteral("..."));
+    browseLayout->addWidget(_dataInputEdit, 1);
+    browseLayout->addWidget(_dataInputBrowse);
+    _dataInputStack->addWidget(browseWidget);
+
+    // Page 1: dataset combo
+    _datasetCombo = new QComboBox(_dataInputStack);
+    _dataInputStack->addWidget(_datasetCombo);
+
+    _dataInputStack->setCurrentIndex(0);  // Default: file browse
+
     _group->addRow(tr("Data:"), [&](QHBoxLayout* row) {
-        _dataInputEdit = new QLineEdit(content);
-        _dataInputEdit->setPlaceholderText(
-            tr("Path to input data (.zarr)"));
-        _dataInputBrowse = new QToolButton(content);
-        _dataInputBrowse->setText(QStringLiteral("..."));
-        row->addWidget(_dataInputEdit, 1);
-        row->addWidget(_dataInputBrowse);
+        row->addWidget(_dataInputStack, 1);
     }, tr("Input data zarr (e.g. s5_cos.zarr) required by the fit optimizer."));
 
     // -- Output directory --
@@ -369,6 +436,56 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     // -----------------------------------------------------------------------
     // Signal wiring
     // -----------------------------------------------------------------------
+
+    // Connection mode
+    connect(_connectionCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &SegmentationFitOptimizerPanel::onConnectionModeChanged);
+
+    // External: refresh button
+    connect(_refreshBtn, &QToolButton::clicked, this,
+            &SegmentationFitOptimizerPanel::refreshDiscoveredServices);
+
+    // External: discovered service selection
+    connect(_discoveryCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &SegmentationFitOptimizerPanel::onDiscoveredServiceSelected);
+
+    // External: host/port manual editing
+    connect(_hostEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+        _externalHost = text.trimmed();
+        writeSetting(QStringLiteral("fit_external_host"), _externalHost);
+    });
+    connect(_portEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+        _externalPort = text.trimmed().toInt();
+        writeSetting(QStringLiteral("fit_external_port"), _externalPort);
+    });
+
+    // Dataset combo selection
+    connect(_datasetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (index < 0) return;
+        QString path = _datasetCombo->currentData().toString();
+        if (!path.isEmpty()) {
+            _fitDataInputPath = path;
+            writeSetting(QStringLiteral("fit_data_input_path"), _fitDataInputPath);
+        }
+    });
+
+    // Datasets received from service
+    connect(&FitServiceManager::instance(), &FitServiceManager::datasetsReceived,
+            this, [this](const QJsonArray& datasets) {
+        _datasetCombo->clear();
+        if (datasets.isEmpty()) {
+            _dataInputStack->setCurrentIndex(0);  // Fall back to file browse
+            return;
+        }
+        for (const auto& val : datasets) {
+            QJsonObject ds = val.toObject();
+            QString name = ds[QStringLiteral("name")].toString();
+            QString path = ds[QStringLiteral("path")].toString();
+            _datasetCombo->addItem(name, path);
+        }
+        _dataInputStack->setCurrentIndex(1);  // Show dataset combo
+    });
 
     // Python path
     connect(_pythonEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
@@ -473,6 +590,32 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
             _progressLabel->setVisible(true);
             return;
         }
+
+        // If in external mode and not yet connected, connect first
+        if (_connectionMode == 1) {
+            auto& mgr = FitServiceManager::instance();
+            if (!mgr.isExternal() || !mgr.isRunning()) {
+                mgr.connectToExternal(_externalHost, _externalPort);
+                // Wait for serviceStarted signal to emit fitOptimizeRequested
+                auto* conn = new QMetaObject::Connection;
+                *conn = connect(&mgr, &FitServiceManager::serviceStarted, this,
+                    [this, conn]() {
+                        QObject::disconnect(*conn);
+                        delete conn;
+                        emit fitOptimizeRequested();
+                    });
+                auto* errConn = new QMetaObject::Connection;
+                *errConn = connect(&mgr, &FitServiceManager::serviceError, this,
+                    [this, conn, errConn](const QString&) {
+                        QObject::disconnect(*conn);
+                        QObject::disconnect(*errConn);
+                        delete conn;
+                        delete errConn;
+                    });
+                return;
+            }
+        }
+
         emit fitOptimizeRequested();
     });
 
@@ -598,6 +741,24 @@ void SegmentationFitOptimizerPanel::restoreSettings(QSettings& settings)
     _fitDataInputPath = settings.value(QStringLiteral("fit_data_input_path"), QString()).toString();
     _fitOutputDir = settings.value(QStringLiteral("fit_output_dir"), QString()).toString();
     _fitConfigText = settings.value(QStringLiteral("fit_config_text"), QString()).toString();
+
+    _connectionMode = settings.value(QStringLiteral("fit_connection_mode"), 0).toInt();
+    _externalHost = settings.value(QStringLiteral("fit_external_host"),
+                                   QStringLiteral("127.0.0.1")).toString();
+    _externalPort = settings.value(QStringLiteral("fit_external_port"), 9999).toInt();
+
+    if (_connectionCombo) {
+        _connectionCombo->setCurrentIndex(_connectionMode);
+    }
+    if (_hostEdit) {
+        const QSignalBlocker b(_hostEdit);
+        _hostEdit->setText(_externalHost);
+    }
+    if (_portEdit) {
+        const QSignalBlocker b(_portEdit);
+        _portEdit->setText(QString::number(_externalPort));
+    }
+    updateConnectionWidgets();
 
     int profileIndex = settings.value(QStringLiteral("fit_profile_index"), 0).toInt();
     if (profileIndex < 0 || profileIndex >= kProfileCount) {
@@ -778,4 +939,89 @@ std::optional<nlohmann::json> SegmentationFitOptimizerPanel::fitConfigJson() con
     } catch (...) {}
 
     return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// Connection mode
+// ---------------------------------------------------------------------------
+
+void SegmentationFitOptimizerPanel::onConnectionModeChanged(int index)
+{
+    if (_restoringSettings) return;
+    _connectionMode = index;
+    writeSetting(QStringLiteral("fit_connection_mode"), _connectionMode);
+    updateConnectionWidgets();
+
+    // If switching to external, disconnect any internal service
+    if (_connectionMode == 1) {
+        auto& mgr = FitServiceManager::instance();
+        if (!mgr.isExternal() && mgr.isRunning()) {
+            mgr.stopService();
+        }
+    }
+}
+
+void SegmentationFitOptimizerPanel::updateConnectionWidgets()
+{
+    bool external = (_connectionMode == 1);
+
+    // Show/hide python path row (internal) vs external widgets
+    if (_internalWidget) _internalWidget->setVisible(!external);
+    if (_externalWidget) _externalWidget->setVisible(external);
+
+    // Reset data input stack when switching modes
+    if (!external) {
+        if (_dataInputStack) _dataInputStack->setCurrentIndex(0);
+    }
+}
+
+void SegmentationFitOptimizerPanel::refreshDiscoveredServices()
+{
+    if (!_discoveryCombo) return;
+
+    _discoveryCombo->clear();
+    _discoveryCombo->addItem(tr("(manual entry)"));
+
+    QJsonArray services = FitServiceManager::discoverServices();
+    for (const auto& val : services) {
+        QJsonObject svc = val.toObject();
+        QString host = svc[QStringLiteral("host")].toString();
+        int port = svc[QStringLiteral("port")].toInt();
+        int pid = svc[QStringLiteral("pid")].toInt();
+        QString label = QStringLiteral("%1:%2 (pid %3)").arg(host).arg(port).arg(pid);
+        _discoveryCombo->addItem(label, QJsonDocument(svc).toJson(QJsonDocument::Compact));
+    }
+}
+
+void SegmentationFitOptimizerPanel::onDiscoveredServiceSelected(int index)
+{
+    if (index <= 0) return;  // "(manual entry)" or invalid
+    if (!_discoveryCombo) return;
+
+    QByteArray data = _discoveryCombo->currentData().toByteArray();
+    QJsonObject svc = QJsonDocument::fromJson(data).object();
+
+    QString host = svc[QStringLiteral("host")].toString();
+    int port = svc[QStringLiteral("port")].toInt();
+
+    if (_hostEdit) {
+        _hostEdit->setText(host);
+    }
+    if (_portEdit) {
+        _portEdit->setText(QString::number(port));
+    }
+
+    _externalHost = host;
+    _externalPort = port;
+
+    // Auto-connect; fetch datasets once connected
+    auto& mgr = FitServiceManager::instance();
+    auto* conn = new QMetaObject::Connection;
+    *conn = connect(&mgr, &FitServiceManager::serviceStarted, this,
+        [this, conn]() {
+            QObject::disconnect(*conn);
+            delete conn;
+            FitServiceManager::instance().fetchDatasets();
+        });
+    mgr.connectToExternal(host, port);
 }

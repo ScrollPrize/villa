@@ -1,24 +1,103 @@
 """HTTP service wrapping the 2D fit optimizer for use by VC3D.
 
 Start with:
-    python fit_service.py [--port PORT]
+    python fit_service.py [--port PORT] [--data-dir PATH]
 
 Endpoints:
     GET  /health          -> {"status": "ok"}
     GET  /status          -> current job state
+    GET  /datasets        -> available .zarr datasets from --data-dir
     POST /optimize        -> start an optimization job (JSON body)
     POST /stop            -> request cancellation of the running job
 """
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
+import os
 import sys
 import threading
 import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Global config
+# ---------------------------------------------------------------------------
+
+_data_dir: str | None = None  # Set via --data-dir CLI flag
+
+
+# ---------------------------------------------------------------------------
+# Service announcement (file-based discovery)
+# ---------------------------------------------------------------------------
+
+_ANNOUNCE_DIR = Path.home() / ".fit_services"
+_announce_file: Path | None = None
+
+
+def _list_datasets() -> list[dict[str, str]]:
+    """Return available .zarr directories from _data_dir."""
+    if not _data_dir:
+        return []
+    data_path = Path(_data_dir)
+    if not data_path.is_dir():
+        return []
+    datasets = []
+    for entry in sorted(data_path.iterdir()):
+        if entry.is_dir() and entry.name.endswith(".zarr"):
+            datasets.append({"name": entry.name, "path": str(entry.resolve())})
+    return datasets
+
+
+def _clean_stale_announcements() -> None:
+    """Remove announcement files whose PIDs are no longer alive."""
+    if not _ANNOUNCE_DIR.is_dir():
+        return
+    for f in _ANNOUNCE_DIR.glob("*.json"):
+        try:
+            info = json.loads(f.read_text())
+            pid = info.get("pid", -1)
+            # Check if process is alive
+            os.kill(pid, 0)
+        except (OSError, json.JSONDecodeError, TypeError):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
+def _write_announcement(host: str, port: int) -> None:
+    """Write a service announcement file for discovery."""
+    global _announce_file
+    _ANNOUNCE_DIR.mkdir(parents=True, exist_ok=True)
+    _clean_stale_announcements()
+
+    pid = os.getpid()
+    datasets = _list_datasets()
+    info = {
+        "host": host,
+        "port": port,
+        "pid": pid,
+        "data_dir": _data_dir or "",
+        "datasets": [d["name"] for d in datasets],
+    }
+    _announce_file = _ANNOUNCE_DIR / f"{pid}.json"
+    _announce_file.write_text(json.dumps(info, indent=2))
+
+
+def _remove_announcement() -> None:
+    """Remove the announcement file on shutdown."""
+    global _announce_file
+    if _announce_file is not None:
+        try:
+            _announce_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        _announce_file = None
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +312,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"status": "ok"})
         elif self.path == "/status":
             self._send_json(_job.snapshot())
+        elif self.path == "/datasets":
+            self._send_json({"datasets": _list_datasets()})
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -274,13 +355,24 @@ class _Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global _data_dir
+
     p = argparse.ArgumentParser(description="Fit optimizer HTTP service for VC3D")
     p.add_argument("--port", type=int, default=0, help="Port (0 = auto-select)")
     p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--data-dir", default=None,
+                   help="Directory containing .zarr datasets")
     args = p.parse_args()
+
+    if args.data_dir:
+        _data_dir = str(Path(args.data_dir).resolve())
 
     server = HTTPServer((args.host, args.port), _Handler)
     actual_port = server.server_address[1]
+
+    # Write service announcement for discovery
+    _write_announcement(args.host, actual_port)
+    atexit.register(_remove_announcement)
 
     # This exact format is parsed by FitServiceManager on the C++ side
     print(f"listening on http://{args.host}:{actual_port}", flush=True)
@@ -290,6 +382,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        _remove_announcement()
         server.server_close()
 
 

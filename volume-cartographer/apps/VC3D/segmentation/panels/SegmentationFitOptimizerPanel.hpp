@@ -14,7 +14,9 @@ class QPlainTextEdit;
 class QProgressBar;
 class QPushButton;
 class QSettings;
+class QStackedWidget;
 class QToolButton;
+class QWidget;
 
 /**
  * Segmentation sidebar panel for the 2D fit optimizer.
@@ -60,8 +62,27 @@ private:
     void writeSetting(const QString& key, const QVariant& value);
     void validateConfigText();
     void loadProfile(int index);
+    void onConnectionModeChanged(int index);
+    void refreshDiscoveredServices();
+    void onDiscoveredServiceSelected(int index);
+    void updateConnectionWidgets();
 
     CollapsibleSettingsGroup* _group{nullptr};
+
+    // Connection mode
+    QComboBox* _connectionCombo{nullptr};
+    QWidget* _internalWidget{nullptr};   // contains python path row
+    QWidget* _externalWidget{nullptr};   // contains discovery + host/port
+
+    // External service widgets
+    QComboBox* _discoveryCombo{nullptr};
+    QToolButton* _refreshBtn{nullptr};
+    QLineEdit* _hostEdit{nullptr};
+    QLineEdit* _portEdit{nullptr};
+
+    // Data input with dataset combo support
+    QComboBox* _datasetCombo{nullptr};
+    QStackedWidget* _dataInputStack{nullptr};
 
     QComboBox* _profileCombo{nullptr};
     QLineEdit* _pythonEdit{nullptr};
@@ -86,6 +107,10 @@ private:
     QString _fitOutputDir;
     QString _fitConfigText;
     QString _configError;
+
+    int _connectionMode{0};  // 0=internal, 1=external
+    QString _externalHost{"127.0.0.1"};
+    int _externalPort{9999};
 
     bool _restoringSettings{false};
     const QString _settingsGroup;

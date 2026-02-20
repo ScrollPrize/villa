@@ -1775,11 +1775,19 @@ void CWindow::CreateWidgets(void)
     connect(_segmentationWidget, &SegmentationWidget::fitOptimizeRequested, this, [this]() {
         auto& mgr = FitServiceManager::instance();
 
-        // Ensure service is running
-        const QString pythonPath = _segmentationWidget->fitPythonPath();
-        if (!mgr.ensureServiceRunning(pythonPath)) {
-            statusBar()->showMessage(tr("Failed to start fit service: %1").arg(mgr.lastError()), 5000);
-            return;
+        // Ensure service is running (external or internal)
+        if (mgr.isExternal()) {
+            if (!mgr.isRunning()) {
+                statusBar()->showMessage(
+                    tr("External service not connected. Select a service or check host/port."), 5000);
+                return;
+            }
+        } else {
+            const QString pythonPath = _segmentationWidget->fitPythonPath();
+            if (!mgr.ensureServiceRunning(pythonPath)) {
+                statusBar()->showMessage(tr("Failed to start fit service: %1").arg(mgr.lastError()), 5000);
+                return;
+            }
         }
 
         // Get the active segment path
