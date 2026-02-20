@@ -393,11 +393,11 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
             }
 
             if (bestRow != -1) {
-                const float bestDist = std::sqrt(bestDistSq);
                 const float breakThreshold = (radius == 0)
                                                  ? stepNorm
                                                  : stepNorm * 1.5f * static_cast<float>(radius);
-                if (bestDist <= breakThreshold) {
+                const float breakThresholdSq = breakThreshold * breakThreshold;
+                if (bestDistSq <= breakThresholdSq) {
                     break;
                 }
             }
@@ -436,11 +436,11 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
             }
 
             if (bestRow != -1) {
-                const float bestDist = std::sqrt(bestDistSq);
                 const float breakRadius = (radius == 0)
                                               ? stepNorm
                                               : stepNorm * profile.breakMultiplier * static_cast<float>(radius);
-                if (bestDist <= breakRadius) {
+                const float breakRadiusSq = breakRadius * breakRadius;
+                if (bestDistSq <= breakRadiusSq) {
                     break;
                 }
             }

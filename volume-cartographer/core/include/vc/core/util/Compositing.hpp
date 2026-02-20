@@ -30,7 +30,35 @@ struct CompositeParams {
 
     // Pre-processing
     uint8_t isoCutoff = 0;           // Highpass filter: values below this are set to 0
+
+    bool operator==(const CompositeParams&) const = default;
 };
+
+// Consolidated rendering settings for composite mode (Qt-free)
+struct CompositeRenderSettings {
+    bool enabled = false;
+    int layersFront = 8;
+    int layersBehind = 0;
+    bool reverseDirection = false;
+
+    bool planeEnabled = false;
+    int planeLayersFront = 4;
+    int planeLayersBehind = 4;
+
+    bool useVolumeGradients = false;
+
+    CompositeParams params;  // method, alpha, BL, lighting, isoCutoff
+
+    // Postprocessing (applied after composite render)
+    bool postStretchValues = false;
+    bool postRemoveSmallComponents = false;
+    int postMinComponentSize = 50;
+
+    bool operator==(const CompositeRenderSettings&) const = default;
+};
+
+// Apply postprocessing to a composited image (stretch values, remove small components)
+void postprocessComposite(cv::Mat_<uint8_t>& img, const CompositeRenderSettings& settings);
 
 // Layer values for a single pixel across all layers
 // Used by compositing methods to process per-pixel data

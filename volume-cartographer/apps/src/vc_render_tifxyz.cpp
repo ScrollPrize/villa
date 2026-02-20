@@ -4,7 +4,7 @@
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Zarr.hpp"
 #include "vc/core/util/StreamOperators.hpp"
-#include "vc/core/util/ABFFlattening.hpp"
+#include "vc/flattening/ABFFlattening.hpp"
 
 #include "z5/factory.hxx"
 #include <nlohmann/json.hpp>
@@ -199,8 +199,11 @@ static void applyAffineTransform(cv::Mat_<cv::Vec3f>& points,
             double nx = invAT(0,0)*n[0] + invAT(0,1)*n[1] + invAT(0,2)*n[2];
             double ny = invAT(1,0)*n[0] + invAT(1,1)*n[1] + invAT(1,2)*n[2];
             double nz = invAT(2,0)*n[0] + invAT(2,1)*n[1] + invAT(2,2)*n[2];
-            double len = std::sqrt(nx*nx + ny*ny + nz*nz);
-            if (len > 0) n = cv::Vec3f(float(nx/len), float(ny/len), float(nz/len));
+            const double len2 = nx*nx + ny*ny + nz*nz;
+            if (len2 > 0) {
+                const double invLen = 1.0 / std::sqrt(len2);
+                n = cv::Vec3f(float(nx*invLen), float(ny*invLen), float(nz*invLen));
+            }
         }
 }
 
@@ -246,8 +249,10 @@ static void normalizeNormals(cv::Mat_<cv::Vec3f>& nrm)
         for (int x = 0; x < nrm.cols; x++) {
             auto& v = nrm(y, x);
             if (std::isnan(v[0])) continue;
-            float L = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
-            if (L > 0) v /= L;
+            const float L2 = v[0]*v[0] + v[1]*v[1] + v[2]*v[2];
+            if (L2 > 0) {
+                v /= std::sqrt(L2);
+            }
         }
 }
 

@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -75,6 +76,19 @@ public:
     static std::optional<TriangleSegment> clipTriangleToPlane(const TriangleCandidate& tri,
                                                               const PlaneSurface& plane,
                                                               float epsilon = 1e-4f);
+
+    static bool segmentsEqual(const std::vector<TriangleSegment>& a,
+                              const std::vector<TriangleSegment>& b,
+                              float epsilon = 1e-4f);
+
+    std::unordered_map<SurfacePtr, std::vector<TriangleSegment>>
+    computePlaneIntersections(
+        const PlaneSurface& plane,
+        const cv::Rect& planeRoi,
+        const std::unordered_set<SurfacePtr>& targets,
+        float clipTolerance = 1e-4f,
+        std::vector<TriangleCandidate>* triangleBuf = nullptr,
+        std::unordered_map<SurfacePtr, std::vector<size_t>>* surfaceBuf = nullptr) const;
 
     bool updateSurface(const SurfacePtr& surface);
     bool updateSurfaceRegion(const SurfacePtr& surface,

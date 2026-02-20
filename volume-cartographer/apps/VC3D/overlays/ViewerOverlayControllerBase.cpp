@@ -2,6 +2,7 @@
 
 #include "../CVolumeViewer.hpp"
 #include "../ViewerManager.hpp"
+#include "../elements/COutlinedTextItem.hpp"
 
 #include <QGraphicsEllipseItem>
 #include <QGraphicsPathItem>
@@ -9,6 +10,7 @@
 #include <QGraphicsRectItem>
 #include <QGraphicsScene>
 #include <QGraphicsSimpleTextItem>
+#include <QGraphicsTextItem>
 #include <QPainterPath>
 #include <QPen>
 #include <QBrush>
@@ -78,14 +80,16 @@ float ViewerOverlayControllerBase::PathPrimitive::interpolateZ(float percent,
     for (size_t i = 1; i < points.size(); ++i) {
         const cv::Vec3f& p1 = points[i - 1];
         const cv::Vec3f& p2 = points[i];
-        float segmentLength = std::sqrt(std::pow(p2[0] - p1[0], 2.0f) + std::pow(p2[1] - p1[1], 2.0f));
+        const float segmentLength2 = std::pow(p2[0] - p1[0], 2.0f) + std::pow(p2[1] - p1[1], 2.0f);
 
-        if (accumulatedLength + segmentLength >= targetLength && segmentLength > 0.0f) {
-            float segmentPercent = (targetLength - accumulatedLength) / segmentLength;
-            return p1[2] + segmentPercent * (p2[2] - p1[2]);
+        if (segmentLength2 > 0.0f) {
+            const float segmentLength = std::sqrt(segmentLength2);
+            if (accumulatedLength + segmentLength >= targetLength) {
+                float segmentPercent = (targetLength - accumulatedLength) / segmentLength;
+                return p1[2] + segmentPercent * (p2[2] - p1[2]);
+            }
+            accumulatedLength += segmentLength;
         }
-
-        accumulatedLength += segmentLength;
     }
 
     return points.back()[2];
@@ -148,13 +152,15 @@ void ViewerOverlayControllerBase::OverlayBuilder::addRect(const QRectF& rect,
 void ViewerOverlayControllerBase::OverlayBuilder::addText(const QPointF& position,
                                                           const QString& text,
                                                           const QFont& font,
-                                                          OverlayStyle style)
+                                                          OverlayStyle style,
+                                                          bool outlined)
 {
     TextPrimitive prim;
     prim.position = position;
     prim.text = text;
     prim.font = font;
     prim.style = style;
+    prim.outlined = outlined;
     _primitives.emplace_back(std::move(prim));
 }
 
@@ -486,6 +492,8 @@ void applyStyle(QGraphicsItem* item, const ViewerOverlayControllerBase::OverlayS
     } else if (auto* ellipseItem = qgraphicsitem_cast<QGraphicsEllipseItem*>(item)) {
         ellipseItem->setPen(pen);
         ellipseItem->setBrush(QBrush(style.brushColor));
+    } else if (auto* outlinedTextItem = qgraphicsitem_cast<QGraphicsTextItem*>(item)) {
+        outlinedTextItem->setDefaultTextColor(style.penColor);
     } else if (auto* textItem = qgraphicsitem_cast<QGraphicsSimpleTextItem*>(item)) {
         textItem->setBrush(QBrush(style.penColor));
         textItem->setPen(pen);
@@ -629,10 +637,19 @@ void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
                     addItem(item, style);
                 } else if constexpr (std::is_same_v<T, TextPrimitive>) {
                     flushPointGroups();
-                    auto* item = new QGraphicsSimpleTextItem(prim.text);
-                    item->setFont(prim.font);
-                    item->setPos(prim.position);
-                    addItem(item, prim.style);
+                    if (prim.outlined) {
+                        auto* item = new COutlinedTextItem();
+                        item->setPlainText(prim.text);
+                        item->setFont(prim.font);
+                        item->setDefaultTextColor(prim.style.penColor);
+                        item->setPos(prim.position);
+                        addItem(item, prim.style);
+                    } else {
+                        auto* item = new QGraphicsSimpleTextItem(prim.text);
+                        item->setFont(prim.font);
+                        item->setPos(prim.position);
+                        addItem(item, prim.style);
+                    }
                 } else if constexpr (std::is_same_v<T, PathPrimitive>) {
                     flushPointGroups();
                     if (prim.points.empty()) {

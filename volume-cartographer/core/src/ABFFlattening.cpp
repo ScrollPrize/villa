@@ -1,4 +1,4 @@
-#include "vc/core/util/ABFFlattening.hpp"
+#include "vc/flattening/ABFFlattening.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <OpenABF/OpenABF.hpp>

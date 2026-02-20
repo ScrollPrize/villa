@@ -183,7 +183,7 @@ float PlaneSurface::scalarp(cv::Vec3f point) const
 
 
 
-void PlaneSurface::gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset)
+void PlaneSurface::gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) const
 {
     bool create_normals = normals || offset[2] || ptr[2];
     cv::Vec3f total_offset = internal_loc(offset/scale, ptr, {1,1});
@@ -232,7 +232,7 @@ cv::Vec3f PlaneSurface::loc(const cv::Vec3f &ptr, const cv::Vec3f &offset)
     return ptr + offset;
 }
 
-cv::Vec3f PlaneSurface::coord(const cv::Vec3f &ptr, const cv::Vec3f &offset)
+cv::Vec3f PlaneSurface::coord(const cv::Vec3f &ptr, const cv::Vec3f &offset) const
 {
     cv::Mat_<cv::Vec3f> coords;
     gen(&coords, nullptr, {1,1}, ptr, 1.0, offset);

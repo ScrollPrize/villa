@@ -785,6 +785,10 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     connect(flipVAction, &QAction::triggered, this, [this, segmentId]() {
         emit flipVRequested(segmentId);
     });
+    QAction* flipNormalsAction = flipMenu->addAction(tr("Normals"));
+    connect(flipNormalsAction, &QAction::triggered, this, [this, segmentId]() {
+        emit flipURequested(segmentId);
+    });
 
     QAction* rotateAction = contextMenu.addAction(tr("Rotate Surface 90° CW"));
     connect(rotateAction, &QAction::triggered, this, [this, segmentId]() {
@@ -1525,10 +1529,6 @@ void SurfacePanelController::applyFiltersInternal()
         }
         if (surf && _surfaces && !_surfaces->surface(id)) {
             _surfaces->setSurface(id, surf, true, false);
-        }
-
-        if (restrictToCurrent && !id.empty()) {
-            show = show && (id == _currentSurfaceId);
         }
 
         if (hasSurfaceIdFilter && !id.empty()) {

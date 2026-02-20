@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <memory>
 
 #include <QObject>
@@ -15,19 +14,6 @@ struct POI
     std::string surfaceId;  // ID of the source surface (for lookup, not ownership)
     cv::Vec3f n = {0,0,0};
 };
-
-struct IntersectionLine
-{
-    std::array<cv::Vec3f, 2> world{};         // 3D points in volume space
-    std::array<cv::Vec3f, 2> surfaceParams{}; // QuadSurface ptr-space samples aligned with `world`
-};
-
-struct Intersection
-{
-    std::vector<IntersectionLine> lines;
-};
-
-
 
 // This class shall handle all the (GUI) interactions for its stored objects but does not itself provide the GUI
 // Slices: all the defined slices of all kinds

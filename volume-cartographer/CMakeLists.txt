@@ -30,6 +30,7 @@ option(VC_ENABLE_ASAN       "Enable AddressSanitizer for memory error detection"
 option(VC_ENABLE_UBSAN      "Enable UndefinedBehaviorSanitizer"                  OFF)
 option(VC_ENABLE_TSAN       "Enable ThreadSanitizer for data race detection"     OFF)
 option(VC_ENABLE_LSAN       "Enable LeakSanitizer for memory leak detection (standalone)" OFF)
+option(VC_BUILD_TESTS          "Build unit tests"                               OFF)
 mark_as_advanced(VC_DEVELOPER_WARNINGS)
 
 # ---- Modules -----------------------------------------------------------------
@@ -45,6 +46,11 @@ add_subdirectory(misc)
 add_subdirectory(libs/OpenABF)
 add_subdirectory(core)
 add_subdirectory(apps)
+
+if(VC_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(core/test)
+endif()
 
 include(VCPackageConfig)
 include(VCInstall)
