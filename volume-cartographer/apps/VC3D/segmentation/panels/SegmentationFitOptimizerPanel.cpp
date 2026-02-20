@@ -390,21 +390,21 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
 
     dimLayout->addWidget(new QLabel(tr("W:"), _newModelWidget));
     _widthSpin = new QSpinBox(_newModelWidget);
-    _widthSpin->setRange(64, 16384);
+    _widthSpin->setRange(1, 999999);
     _widthSpin->setValue(2048);
     _widthSpin->setSingleStep(64);
     dimLayout->addWidget(_widthSpin, 1);
 
     dimLayout->addWidget(new QLabel(tr("H:"), _newModelWidget));
     _heightSpin = new QSpinBox(_newModelWidget);
-    _heightSpin->setRange(64, 16384);
+    _heightSpin->setRange(1, 999999);
     _heightSpin->setValue(2048);
     _heightSpin->setSingleStep(64);
     dimLayout->addWidget(_heightSpin, 1);
 
     dimLayout->addWidget(new QLabel(tr("D:"), _newModelWidget));
     _depthSpin = new QSpinBox(_newModelWidget);
-    _depthSpin->setRange(1, 16384);
+    _depthSpin->setRange(1, 999999);
     _depthSpin->setValue(2048);
     _depthSpin->setSingleStep(64);
     _depthSpin->setToolTip(tr("Depth in full-resolution voxels"));
