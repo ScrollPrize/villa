@@ -12,21 +12,21 @@ class QNetworkAccessManager;
 class QNetworkReply;
 
 /**
- * Manages the lifecycle of the Python fit optimizer HTTP service.
+ * Manages the lifecycle of the Python lasagna HTTP service.
  *
  * Supports two modes:
- *   - Internal: launches fit_service.py as a subprocess
+ *   - Internal: launches lasagna_service.py as a subprocess
  *   - External: connects to a pre-started service on a known host:port
  *
  * The service is kept alive so repeated optimizations avoid
  * Python/torch startup overhead.
  */
-class FitServiceManager : public QObject
+class LasagnaServiceManager : public QObject
 {
     Q_OBJECT
 
 public:
-    static FitServiceManager& instance();
+    static LasagnaServiceManager& instance();
 
     /**
      * Ensure the service process is running (internal mode).
@@ -85,11 +85,11 @@ signals:
     void datasetsReceived(const QJsonArray& datasets);
 
 private:
-    explicit FitServiceManager(QObject* parent = nullptr);
-    ~FitServiceManager() override;
+    explicit LasagnaServiceManager(QObject* parent = nullptr);
+    ~LasagnaServiceManager() override;
 
-    FitServiceManager(const FitServiceManager&) = delete;
-    FitServiceManager& operator=(const FitServiceManager&) = delete;
+    LasagnaServiceManager(const LasagnaServiceManager&) = delete;
+    LasagnaServiceManager& operator=(const LasagnaServiceManager&) = delete;
 
     /** Construct base URL from current _host and _port. */
     QString baseUrl() const;

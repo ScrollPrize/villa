@@ -93,7 +93,7 @@
 #include "segmentation/growth/SegmentationGrower.hpp"
 #include "SurfacePanelController.hpp"
 #include "MenuActionController.hpp"
-#include "FitServiceManager.hpp"
+#include "LasagnaServiceManager.hpp"
 #include "vc/core/Version.hpp"
 
 #include "vc/core/util/Logging.hpp"
@@ -1771,23 +1771,23 @@ void CWindow::CreateWidgets(void)
         }
     });
 
-    // -- Fit optimizer connections --
-    connect(_segmentationWidget, &SegmentationWidget::fitOptimizeRequested, this, [this]() {
-        auto& mgr = FitServiceManager::instance();
-        const bool isNewModel = (_segmentationWidget->fitMode() == 1);
+    // -- Lasagna connections --
+    connect(_segmentationWidget, &SegmentationWidget::lasagnaOptimizeRequested, this, [this]() {
+        auto& mgr = LasagnaServiceManager::instance();
+        const bool isNewModel = (_segmentationWidget->lasagnaMode() == 1);
 
         // Ensure service is running (external or internal)
         if (mgr.isExternal()) {
             if (!mgr.isRunning()) {
                 auto msg = tr("External service not connected. Select a service or check host/port.");
-                std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
                 statusBar()->showMessage(msg, 5000);
                 return;
             }
         } else {
             if (!mgr.ensureServiceRunning()) {
-                auto msg = tr("Failed to start fit service: %1").arg(mgr.lastError());
-                std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
+                auto msg = tr("Failed to start lasagna service: %1").arg(mgr.lastError());
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
                 statusBar()->showMessage(msg, 5000);
                 return;
             }
@@ -1814,18 +1814,18 @@ void CWindow::CreateWidgets(void)
                 }
             }
             if (modelPath.isEmpty()) {
-                auto msg = tr("No model.pt found in segment directory. Cannot run fit optimizer.");
-                std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
+                auto msg = tr("No model.pt found in segment directory. Cannot run lasagna.");
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
                 statusBar()->showMessage(msg, 5000);
                 return;
             }
         }
 
         // Data input path (zarr)
-        QString dataInput = _segmentationWidget->fitDataInputPath();
+        QString dataInput = _segmentationWidget->lasagnaDataInputPath();
         if (dataInput.isEmpty()) {
-            auto msg = tr("No data input path set. Set the zarr path in the Fit Optimizer panel.");
-            std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
+            auto msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             statusBar()->showMessage(msg, 5000);
             return;
         }
@@ -1899,7 +1899,7 @@ void CWindow::CreateWidgets(void)
 
         // Parse config JSON from the editor
         QJsonObject config;
-        QString configText = _segmentationWidget->fitConfigText().trimmed();
+        QString configText = _segmentationWidget->lasagnaConfigText().trimmed();
         if (!configText.isEmpty()) {
             QJsonDocument doc = QJsonDocument::fromJson(configText.toUtf8());
             if (doc.isObject()) {
@@ -1917,7 +1917,7 @@ void CWindow::CreateWidgets(void)
             POI* focus = _surf_col ? _surf_col->poi("focus") : nullptr;
             if (!focus) {
                 auto msg = tr("No focus position set. Place the cursor first.");
-                std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
                 statusBar()->showMessage(msg, 5000);
                 return;
             }
@@ -1932,7 +1932,7 @@ void CWindow::CreateWidgets(void)
             args[QStringLiteral("z-size")] = nmD;
             config[QStringLiteral("args")] = args;
 
-            std::cerr << "[fit-optimizer] new model: bbox center=(" << cx << "," << cy
+            std::cerr << "[lasagna] new model: bbox center=(" << cx << "," << cy
                       << "," << cz << ") size=(" << nmW << "x" << nmH
                       << "x" << nmD << ")" << std::endl;
         }
@@ -1957,7 +1957,7 @@ void CWindow::CreateWidgets(void)
             QFile modelFile(modelPath);
             if (!modelFile.open(QIODevice::ReadOnly)) {
                 auto msg = tr("Cannot read model file: %1").arg(modelPath);
-                std::cerr << "[fit-optimizer] " << msg.toStdString() << std::endl;
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
                 statusBar()->showMessage(msg, 5000);
                 return;
             }
@@ -1973,21 +1973,21 @@ void CWindow::CreateWidgets(void)
 
         mgr.startOptimization(request, mgr.isExternal() ? outputDir : QString());
         statusBar()->showMessage(
-            tr("Fit optimization started (%1). Output: %2")
+            tr("Lasagna optimization started (%1). Output: %2")
                 .arg(isNewModel ? tr("new model") : tr("re-optimize"))
                 .arg(outputName), 3000);
     });
 
-    connect(_segmentationWidget, &SegmentationWidget::fitStopRequested, this, [this]() {
-        FitServiceManager::instance().stopOptimization();
-        statusBar()->showMessage(tr("Fit optimization stop requested."), 3000);
+    connect(_segmentationWidget, &SegmentationWidget::lasagnaStopRequested, this, [this]() {
+        LasagnaServiceManager::instance().stopOptimization();
+        statusBar()->showMessage(tr("Lasagna optimization stop requested."), 3000);
     });
 
     // Auto-reload segments when fit optimization finishes
-    connect(&FitServiceManager::instance(), &FitServiceManager::optimizationFinished,
+    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::optimizationFinished,
             this, [this](const QString& outputDir) {
         statusBar()->showMessage(
-            tr("Fit optimization finished. Reloading segments from %1").arg(outputDir), 5000);
+            tr("Lasagna optimization finished. Reloading segments from %1").arg(outputDir), 5000);
         if (_surfacePanel) {
             _surfacePanel->loadSurfacesIncremental();
         }

@@ -10,7 +10,7 @@
 #include "panels/SegmentationCellReoptPanel.hpp"
 #include "panels/SegmentationNeuralTracerPanel.hpp"
 #include "panels/SegmentationDirectionFieldPanel.hpp"
-#include "panels/SegmentationFitOptimizerPanel.hpp"
+#include "panels/SegmentationLasagnaPanel.hpp"
 #include "VCSettings.hpp"
 
 #include <QSettings>
@@ -56,8 +56,8 @@ void SegmentationWidget::buildUi()
     _neuralTracerPanel = new SegmentationNeuralTracerPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_neuralTracerPanel);
 
-    _fitOptimizerPanel = new SegmentationFitOptimizerPanel(QStringLiteral("segmentation_edit"), this);
-    layout->addWidget(_fitOptimizerPanel);
+    _lasagnaPanel = new SegmentationLasagnaPanel(QStringLiteral("segmentation_edit"), this);
+    layout->addWidget(_lasagnaPanel);
 
     _correctionsPanel = new SegmentationCorrectionsPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_correctionsPanel);
@@ -170,13 +170,13 @@ void SegmentationWidget::buildUi()
     connect(_neuralTracerPanel, &SegmentationNeuralTracerPanel::neuralTracerStatusMessage,
             this, &SegmentationWidget::neuralTracerStatusMessage);
 
-    // Forward fit optimizer panel signals
-    connect(_fitOptimizerPanel, &SegmentationFitOptimizerPanel::fitOptimizeRequested,
-            this, &SegmentationWidget::fitOptimizeRequested);
-    connect(_fitOptimizerPanel, &SegmentationFitOptimizerPanel::fitStopRequested,
-            this, &SegmentationWidget::fitStopRequested);
-    connect(_fitOptimizerPanel, &SegmentationFitOptimizerPanel::fitStatusMessage,
-            this, &SegmentationWidget::fitStatusMessage);
+    // Forward lasagna panel signals
+    connect(_lasagnaPanel, &SegmentationLasagnaPanel::lasagnaOptimizeRequested,
+            this, &SegmentationWidget::lasagnaOptimizeRequested);
+    connect(_lasagnaPanel, &SegmentationLasagnaPanel::lasagnaStopRequested,
+            this, &SegmentationWidget::lasagnaStopRequested);
+    connect(_lasagnaPanel, &SegmentationLasagnaPanel::lasagnaStatusMessage,
+            this, &SegmentationWidget::lasagnaStatusMessage);
 }
 
 void SegmentationWidget::syncUiState()
@@ -198,7 +198,7 @@ void SegmentationWidget::syncUiState()
     _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
     _approvalMaskPanel->syncUiState();
     _cellReoptPanel->syncUiState(_approvalMaskPanel->showApprovalMask(), _growthInProgress);
-    _fitOptimizerPanel->syncUiState(_editingEnabled, false);
+    _lasagnaPanel->syncUiState(_editingEnabled, false);
 }
 
 void SegmentationWidget::restoreSettings()
@@ -217,7 +217,7 @@ void SegmentationWidget::restoreSettings()
     _approvalMaskPanel->restoreSettings(settings);
     _neuralTracerPanel->restoreSettings(settings);
     _cellReoptPanel->restoreSettings(settings);
-    _fitOptimizerPanel->restoreSettings(settings);
+    _lasagnaPanel->restoreSettings(settings);
 
     settings.endGroup();
     _restoringSettings = false;
@@ -408,13 +408,13 @@ void SegmentationWidget::setVolumeZarrPath(const QString& path) { _neuralTracerP
 
 void SegmentationWidget::setEraseBrushActive(bool /*active*/) {}
 
-// --- Fit optimizer delegations ---
+// --- Lasagna delegations ---
 
-QString SegmentationWidget::fitDataInputPath() const { return _fitOptimizerPanel->fitDataInputPath(); }
-QString SegmentationWidget::fitConfigText() const { return _fitOptimizerPanel->fitConfigText(); }
-int SegmentationWidget::fitMode() const { return static_cast<int>(_fitOptimizerPanel->fitMode()); }
-int SegmentationWidget::newModelWidth() const { return _fitOptimizerPanel->newModelWidth(); }
-int SegmentationWidget::newModelHeight() const { return _fitOptimizerPanel->newModelHeight(); }
-int SegmentationWidget::newModelDepth() const { return _fitOptimizerPanel->newModelDepth(); }
+QString SegmentationWidget::lasagnaDataInputPath() const { return _lasagnaPanel->lasagnaDataInputPath(); }
+QString SegmentationWidget::lasagnaConfigText() const { return _lasagnaPanel->lasagnaConfigText(); }
+int SegmentationWidget::lasagnaMode() const { return static_cast<int>(_lasagnaPanel->lasagnaMode()); }
+int SegmentationWidget::newModelWidth() const { return _lasagnaPanel->newModelWidth(); }
+int SegmentationWidget::newModelHeight() const { return _lasagnaPanel->newModelHeight(); }
+int SegmentationWidget::newModelDepth() const { return _lasagnaPanel->newModelDepth(); }
 
-void SegmentationWidget::setFitDataInputPath(const QString& path) { _fitOptimizerPanel->setFitDataInputPath(path); }
+void SegmentationWidget::setLasagnaDataInputPath(const QString& path) { _lasagnaPanel->setLasagnaDataInputPath(path); }

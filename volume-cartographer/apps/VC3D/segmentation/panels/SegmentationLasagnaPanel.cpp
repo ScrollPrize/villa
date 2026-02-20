@@ -1,6 +1,6 @@
-#include "SegmentationFitOptimizerPanel.hpp"
+#include "SegmentationLasagnaPanel.hpp"
 
-#include "FitServiceManager.hpp"
+#include "LasagnaServiceManager.hpp"
 #include "VCSettings.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 
@@ -33,13 +33,13 @@
 // ---------------------------------------------------------------------------
 // Predefined optimizer profiles
 // ---------------------------------------------------------------------------
-struct FitProfile {
+struct LasagnaProfile {
     const char* name;
     const char* description;
     const char* json;
 };
 
-static const FitProfile kProfiles[] = {
+static const LasagnaProfile kProfiles[] = {
     {"Quick Reopt (2k)", "Fast re-optimization of existing mesh",
      R"({
     "base": {
@@ -311,7 +311,7 @@ static const FitProfile kProfiles[] = {
 static constexpr int kProfileCount = sizeof(kProfiles) / sizeof(kProfiles[0]);
 static constexpr int kCustomProfileIndex = kProfileCount - 1;
 
-SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
+SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     const QString& settingsGroup, QWidget* parent)
     : QWidget(parent)
     , _settingsGroup(settingsGroup)
@@ -320,7 +320,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     panelLayout->setContentsMargins(0, 0, 0, 0);
     panelLayout->setSpacing(0);
 
-    _group = new CollapsibleSettingsGroup(tr("Fit Optimizer"), this);
+    _group = new CollapsibleSettingsGroup(tr("Lasagna Model"), this);
     auto* content = _group->contentWidget();
 
     // -- Connection mode --
@@ -436,7 +436,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
 
     _group->addRow(tr("Data:"), [&](QHBoxLayout* row) {
         row->addWidget(_dataInputStack, 1);
-    }, tr("Input data zarr (e.g. s5_cos.zarr) required by the fit optimizer."));
+    }, tr("Input data zarr (e.g. s5_cos.zarr) required by the lasagna."));
 
     // -- Profile dropdown --
     _group->addRow(tr("Profile:"), [&](QHBoxLayout* row) {
@@ -504,39 +504,39 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
 
     // Mode combo (Re-optimize / New Model)
     connect(_modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, &SegmentationFitOptimizerPanel::onFitModeChanged);
+            this, &SegmentationLasagnaPanel::onLasagnaModeChanged);
 
     // Persist dimension changes
     connect(_widthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
-        writeSetting(QStringLiteral("fit_new_model_width"), v);
+        writeSetting(QStringLiteral("lasagna_new_model_width"), v);
     });
     connect(_heightSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
-        writeSetting(QStringLiteral("fit_new_model_height"), v);
+        writeSetting(QStringLiteral("lasagna_new_model_height"), v);
     });
     connect(_depthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
-        writeSetting(QStringLiteral("fit_new_model_depth"), v);
+        writeSetting(QStringLiteral("lasagna_new_model_depth"), v);
     });
 
     // Connection mode
     connect(_connectionCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, &SegmentationFitOptimizerPanel::onConnectionModeChanged);
+            this, &SegmentationLasagnaPanel::onConnectionModeChanged);
 
     // External: refresh button
     connect(_refreshBtn, &QToolButton::clicked, this,
-            &SegmentationFitOptimizerPanel::refreshDiscoveredServices);
+            &SegmentationLasagnaPanel::refreshDiscoveredServices);
 
     // External: discovered service selection
     connect(_discoveryCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, &SegmentationFitOptimizerPanel::onDiscoveredServiceSelected);
+            this, &SegmentationLasagnaPanel::onDiscoveredServiceSelected);
 
     // External: host/port manual editing
     connect(_hostEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         _externalHost = text.trimmed();
-        writeSetting(QStringLiteral("fit_external_host"), _externalHost);
+        writeSetting(QStringLiteral("lasagna_external_host"), _externalHost);
     });
     connect(_portEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         _externalPort = text.trimmed().toInt();
-        writeSetting(QStringLiteral("fit_external_port"), _externalPort);
+        writeSetting(QStringLiteral("lasagna_external_port"), _externalPort);
     });
 
     // Dataset combo selection
@@ -545,13 +545,13 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         if (index < 0) return;
         QString path = _datasetCombo->currentData().toString();
         if (!path.isEmpty()) {
-            _fitDataInputPath = path;
-            writeSetting(QStringLiteral("fit_data_input_path"), _fitDataInputPath);
+            _lasagnaDataInputPath = path;
+            writeSetting(QStringLiteral("lasagna_data_input_path"), _lasagnaDataInputPath);
         }
     });
 
     // Datasets received from service
-    connect(&FitServiceManager::instance(), &FitServiceManager::datasetsReceived,
+    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::datasetsReceived,
             this, [this](const QJsonArray& datasets) {
         _datasetCombo->clear();
         if (datasets.isEmpty()) {
@@ -569,16 +569,16 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
 
     // Data input
     connect(_dataInputEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
-        _fitDataInputPath = text.trimmed();
-        writeSetting(QStringLiteral("fit_data_input_path"), _fitDataInputPath);
+        _lasagnaDataInputPath = text.trimmed();
+        writeSetting(QStringLiteral("lasagna_data_input_path"), _lasagnaDataInputPath);
     });
     connect(_dataInputBrowse, &QToolButton::clicked, this, [this]() {
-        QString initial = _fitDataInputPath.isEmpty()
-            ? QDir::homePath() : QFileInfo(_fitDataInputPath).absolutePath();
+        QString initial = _lasagnaDataInputPath.isEmpty()
+            ? QDir::homePath() : QFileInfo(_lasagnaDataInputPath).absolutePath();
         QString path = QFileDialog::getExistingDirectory(
             this, tr("Select input data (.zarr directory)"), initial);
         if (!path.isEmpty()) {
-            _fitDataInputPath = path;
+            _lasagnaDataInputPath = path;
             _dataInputEdit->setText(path);
         }
     });
@@ -587,15 +587,15 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     connect(_profileCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, [this](int index) {
         if (_restoringSettings) return;
-        writeSetting(QStringLiteral("fit_profile_index"), index);
+        writeSetting(QStringLiteral("lasagna_profile_index"), index);
         loadProfile(index);
     });
 
     // Config editor
     connect(_configEdit, &QPlainTextEdit::textChanged, this, [this]() {
         if (_restoringSettings) return;
-        _fitConfigText = _configEdit->toPlainText();
-        writeSetting(QStringLiteral("fit_config_text"), _fitConfigText);
+        _lasagnaConfigText = _configEdit->toPlainText();
+        writeSetting(QStringLiteral("lasagna_config_text"), _lasagnaConfigText);
         validateConfigText();
 
         // Switch to "Custom" if user manually edits while a preset is selected
@@ -603,10 +603,10 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
             int idx = _profileCombo->currentIndex();
             if (idx >= 0 && idx < kCustomProfileIndex && kProfiles[idx].json) {
                 QString profileText = QString::fromUtf8(kProfiles[idx].json).trimmed();
-                if (_fitConfigText.trimmed() != profileText) {
+                if (_lasagnaConfigText.trimmed() != profileText) {
                     const QSignalBlocker b(_profileCombo);
                     _profileCombo->setCurrentIndex(kCustomProfileIndex);
-                    writeSetting(QStringLiteral("fit_profile_index"), kCustomProfileIndex);
+                    writeSetting(QStringLiteral("lasagna_profile_index"), kCustomProfileIndex);
                 }
             }
         }
@@ -624,19 +624,19 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
 
         // If in external mode and not yet connected, connect first
         if (_connectionMode == 1) {
-            auto& mgr = FitServiceManager::instance();
+            auto& mgr = LasagnaServiceManager::instance();
             if (!mgr.isExternal() || !mgr.isRunning()) {
                 mgr.connectToExternal(_externalHost, _externalPort);
-                // Wait for serviceStarted signal to emit fitOptimizeRequested
+                // Wait for serviceStarted signal to emit lasagnaOptimizeRequested
                 auto* conn = new QMetaObject::Connection;
-                *conn = connect(&mgr, &FitServiceManager::serviceStarted, this,
+                *conn = connect(&mgr, &LasagnaServiceManager::serviceStarted, this,
                     [this, conn]() {
                         QObject::disconnect(*conn);
                         delete conn;
-                        emit fitOptimizeRequested();
+                        emit lasagnaOptimizeRequested();
                     });
                 auto* errConn = new QMetaObject::Connection;
-                *errConn = connect(&mgr, &FitServiceManager::serviceError, this,
+                *errConn = connect(&mgr, &LasagnaServiceManager::serviceError, this,
                     [this, conn, errConn](const QString&) {
                         QObject::disconnect(*conn);
                         QObject::disconnect(*errConn);
@@ -647,37 +647,37 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
             }
         }
 
-        emit fitOptimizeRequested();
+        emit lasagnaOptimizeRequested();
     });
 
     // Stop button
     connect(_stopBtn, &QPushButton::clicked, this, [this]() {
-        emit fitStopRequested();
+        emit lasagnaStopRequested();
     });
 
     // Stop Service button — kills the Python process entirely
     connect(_stopServiceBtn, &QPushButton::clicked, this, []() {
-        FitServiceManager::instance().stopService();
+        LasagnaServiceManager::instance().stopService();
     });
 
     // Connect to service manager signals
-    auto& mgr = FitServiceManager::instance();
-    connect(&mgr, &FitServiceManager::statusMessage, this, [this](const QString& msg) {
+    auto& mgr = LasagnaServiceManager::instance();
+    connect(&mgr, &LasagnaServiceManager::statusMessage, this, [this](const QString& msg) {
         if (_progressLabel) {
             _progressLabel->setText(msg);
             _progressLabel->setStyleSheet(QString());
             _progressLabel->setVisible(true);
         }
-        emit fitStatusMessage(msg);
+        emit lasagnaStatusMessage(msg);
     });
-    connect(&mgr, &FitServiceManager::serviceStarted, this, [this]() {
+    connect(&mgr, &LasagnaServiceManager::serviceStarted, this, [this]() {
         if (_progressLabel) {
             _progressLabel->setText(tr("Service running"));
             _progressLabel->setStyleSheet(QStringLiteral("color: #27ae60;"));
         }
         if (_stopServiceBtn) _stopServiceBtn->setEnabled(true);
     });
-    connect(&mgr, &FitServiceManager::serviceStopped, this, [this]() {
+    connect(&mgr, &LasagnaServiceManager::serviceStopped, this, [this]() {
         if (_progressBar) _progressBar->setVisible(false);
         if (_progressLabel) {
             _progressLabel->setText(tr("Service stopped"));
@@ -687,15 +687,15 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         if (_stopServiceBtn) _stopServiceBtn->setEnabled(false);
         if (_runBtn) _runBtn->setEnabled(true);
     });
-    connect(&mgr, &FitServiceManager::serviceError, this, [this](const QString& err) {
-        std::cerr << "[fit-optimizer] service error: " << err.toStdString() << std::endl;
+    connect(&mgr, &LasagnaServiceManager::serviceError, this, [this](const QString& err) {
+        std::cerr << "[lasagna] service error: " << err.toStdString() << std::endl;
         if (_progressLabel) {
             _progressLabel->setText(tr("Error: %1").arg(err));
             _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
             _progressLabel->setVisible(true);
         }
     });
-    connect(&mgr, &FitServiceManager::optimizationStarted, this, [this]() {
+    connect(&mgr, &LasagnaServiceManager::optimizationStarted, this, [this]() {
         if (_stopBtn) _stopBtn->setEnabled(true);
         if (_runBtn) _runBtn->setEnabled(false);
         if (_progressLabel) {
@@ -704,7 +704,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
             _progressLabel->setVisible(true);
         }
     });
-    connect(&mgr, &FitServiceManager::optimizationProgress, this,
+    connect(&mgr, &LasagnaServiceManager::optimizationProgress, this,
             [this](const QString& stage, int step, int total, double loss) {
         if (_progressBar) {
             if (total > 0) {
@@ -726,7 +726,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
             _progressLabel->setVisible(true);
         }
     });
-    connect(&mgr, &FitServiceManager::optimizationFinished, this,
+    connect(&mgr, &LasagnaServiceManager::optimizationFinished, this,
             [this](const QString& outputDir) {
         if (_stopBtn) _stopBtn->setEnabled(false);
         if (_runBtn) _runBtn->setEnabled(true);
@@ -737,9 +737,9 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
             _progressLabel->setVisible(true);
         }
     });
-    connect(&mgr, &FitServiceManager::optimizationError, this,
+    connect(&mgr, &LasagnaServiceManager::optimizationError, this,
             [this](const QString& err) {
-        std::cerr << "[fit-optimizer] optimization error: " << err.toStdString() << std::endl;
+        std::cerr << "[lasagna] optimization error: " << err.toStdString() << std::endl;
         if (_stopBtn) _stopBtn->setEnabled(false);
         if (_runBtn) _runBtn->setEnabled(true);
         if (_progressBar) _progressBar->setVisible(false);
@@ -775,7 +775,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
         }
     });
     watcher->setFuture(QtConcurrent::run([]() {
-        return FitServiceManager::discoverServices();
+        return LasagnaServiceManager::discoverServices();
     }));
 }
 
@@ -783,7 +783,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
 // Settings
 // ---------------------------------------------------------------------------
 
-void SegmentationFitOptimizerPanel::writeSetting(const QString& key, const QVariant& value)
+void SegmentationLasagnaPanel::writeSetting(const QString& key, const QVariant& value)
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.beginGroup(_settingsGroup);
@@ -791,37 +791,37 @@ void SegmentationFitOptimizerPanel::writeSetting(const QString& key, const QVari
     settings.endGroup();
 }
 
-void SegmentationFitOptimizerPanel::restoreSettings(QSettings& settings)
+void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
 {
     _restoringSettings = true;
 
-    _fitDataInputPath = settings.value(QStringLiteral("fit_data_input_path"), QString()).toString();
-    _fitConfigText = settings.value(QStringLiteral("fit_config_text"), QString()).toString();
+    _lasagnaDataInputPath = settings.value(QStringLiteral("lasagna_data_input_path"), QString()).toString();
+    _lasagnaConfigText = settings.value(QStringLiteral("lasagna_config_text"), QString()).toString();
 
-    _fitMode = settings.value(QStringLiteral("fit_mode"), 0).toInt();
+    _lasagnaMode = settings.value(QStringLiteral("lasagna_mode"), 0).toInt();
     if (_modeCombo) {
-        _modeCombo->setCurrentIndex(_fitMode);
+        _modeCombo->setCurrentIndex(_lasagnaMode);
     }
     if (_newModelWidget) {
-        _newModelWidget->setVisible(_fitMode == 1);
+        _newModelWidget->setVisible(_lasagnaMode == 1);
     }
     if (_widthSpin) {
         const QSignalBlocker b(_widthSpin);
-        _widthSpin->setValue(settings.value(QStringLiteral("fit_new_model_width"), 2048).toInt());
+        _widthSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_width"), 2048).toInt());
     }
     if (_heightSpin) {
         const QSignalBlocker b(_heightSpin);
-        _heightSpin->setValue(settings.value(QStringLiteral("fit_new_model_height"), 2048).toInt());
+        _heightSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_height"), 2048).toInt());
     }
     if (_depthSpin) {
         const QSignalBlocker b(_depthSpin);
-        _depthSpin->setValue(settings.value(QStringLiteral("fit_new_model_depth"), 2048).toInt());
+        _depthSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_depth"), 2048).toInt());
     }
 
-    _connectionMode = settings.value(QStringLiteral("fit_connection_mode"), 0).toInt();
-    _externalHost = settings.value(QStringLiteral("fit_external_host"),
+    _connectionMode = settings.value(QStringLiteral("lasagna_connection_mode"), 0).toInt();
+    _externalHost = settings.value(QStringLiteral("lasagna_external_host"),
                                    QStringLiteral("127.0.0.1")).toString();
-    _externalPort = settings.value(QStringLiteral("fit_external_port"), 9999).toInt();
+    _externalPort = settings.value(QStringLiteral("lasagna_external_port"), 9999).toInt();
 
     if (_connectionCombo) {
         _connectionCombo->setCurrentIndex(_connectionMode);
@@ -836,16 +836,16 @@ void SegmentationFitOptimizerPanel::restoreSettings(QSettings& settings)
     }
     updateConnectionWidgets();
 
-    int profileIndex = settings.value(QStringLiteral("fit_profile_index"), 0).toInt();
+    int profileIndex = settings.value(QStringLiteral("lasagna_profile_index"), 0).toInt();
     if (profileIndex < 0 || profileIndex >= kProfileCount) {
         profileIndex = 0;
     }
 
-    if (_fitConfigText.trimmed().isEmpty()) {
+    if (_lasagnaConfigText.trimmed().isEmpty()) {
         if (profileIndex < kCustomProfileIndex && kProfiles[profileIndex].json) {
-            _fitConfigText = QString::fromUtf8(kProfiles[profileIndex].json);
+            _lasagnaConfigText = QString::fromUtf8(kProfiles[profileIndex].json);
         } else {
-            _fitConfigText = QString::fromUtf8(kProfiles[0].json);
+            _lasagnaConfigText = QString::fromUtf8(kProfiles[0].json);
         }
     }
 
@@ -854,7 +854,7 @@ void SegmentationFitOptimizerPanel::restoreSettings(QSettings& settings)
     }
 
     const bool expanded = settings.value(
-        QStringLiteral("group_fit_optimizer_expanded"), false).toBool();
+        QStringLiteral("group_lasagna_expanded"), false).toBool();
     if (_group) {
         _group->setExpanded(expanded);
     }
@@ -862,15 +862,15 @@ void SegmentationFitOptimizerPanel::restoreSettings(QSettings& settings)
     _restoringSettings = false;
 }
 
-void SegmentationFitOptimizerPanel::syncUiState(bool /*editingEnabled*/, bool optimizing)
+void SegmentationLasagnaPanel::syncUiState(bool /*editingEnabled*/, bool optimizing)
 {
     if (_dataInputEdit) {
         const QSignalBlocker b(_dataInputEdit);
-        _dataInputEdit->setText(_fitDataInputPath);
+        _dataInputEdit->setText(_lasagnaDataInputPath);
     }
-    if (_configEdit && _configEdit->toPlainText() != _fitConfigText) {
+    if (_configEdit && _configEdit->toPlainText() != _lasagnaConfigText) {
         const QSignalBlocker b(_configEdit);
-        _configEdit->setPlainText(_fitConfigText);
+        _configEdit->setPlainText(_lasagnaConfigText);
     }
 
     if (_runBtn) _runBtn->setEnabled(!optimizing);
@@ -883,11 +883,11 @@ void SegmentationFitOptimizerPanel::syncUiState(bool /*editingEnabled*/, bool op
 // Setters
 // ---------------------------------------------------------------------------
 
-void SegmentationFitOptimizerPanel::setFitDataInputPath(const QString& path)
+void SegmentationLasagnaPanel::setLasagnaDataInputPath(const QString& path)
 {
-    if (_fitDataInputPath == path) return;
-    _fitDataInputPath = path;
-    writeSetting(QStringLiteral("fit_data_input_path"), _fitDataInputPath);
+    if (_lasagnaDataInputPath == path) return;
+    _lasagnaDataInputPath = path;
+    writeSetting(QStringLiteral("lasagna_data_input_path"), _lasagnaDataInputPath);
     if (_dataInputEdit) {
         const QSignalBlocker b(_dataInputEdit);
         _dataInputEdit->setText(path);
@@ -898,7 +898,7 @@ void SegmentationFitOptimizerPanel::setFitDataInputPath(const QString& path)
 // Profile loading
 // ---------------------------------------------------------------------------
 
-void SegmentationFitOptimizerPanel::loadProfile(int index)
+void SegmentationLasagnaPanel::loadProfile(int index)
 {
     if (index < 0 || index >= kProfileCount) return;
     if (index == kCustomProfileIndex) return;  // Don't overwrite on "Custom"
@@ -906,12 +906,12 @@ void SegmentationFitOptimizerPanel::loadProfile(int index)
     const char* json = kProfiles[index].json;
     if (!json) return;
 
-    _fitConfigText = QString::fromUtf8(json);
-    writeSetting(QStringLiteral("fit_config_text"), _fitConfigText);
+    _lasagnaConfigText = QString::fromUtf8(json);
+    writeSetting(QStringLiteral("lasagna_config_text"), _lasagnaConfigText);
 
     if (_configEdit) {
         const QSignalBlocker b(_configEdit);
-        _configEdit->setPlainText(_fitConfigText);
+        _configEdit->setPlainText(_lasagnaConfigText);
     }
     validateConfigText();
 }
@@ -920,11 +920,11 @@ void SegmentationFitOptimizerPanel::loadProfile(int index)
 // Config JSON
 // ---------------------------------------------------------------------------
 
-void SegmentationFitOptimizerPanel::validateConfigText()
+void SegmentationLasagnaPanel::validateConfigText()
 {
     _configError.clear();
 
-    QString trimmed = _fitConfigText.trimmed();
+    QString trimmed = _lasagnaConfigText.trimmed();
     if (trimmed.isEmpty()) {
         if (_configStatus) _configStatus->setVisible(false);
         return;
@@ -957,9 +957,9 @@ void SegmentationFitOptimizerPanel::validateConfigText()
     }
 }
 
-std::optional<nlohmann::json> SegmentationFitOptimizerPanel::fitConfigJson() const
+std::optional<nlohmann::json> SegmentationLasagnaPanel::lasagnaConfigJson() const
 {
-    QString trimmed = _fitConfigText.trimmed();
+    QString trimmed = _lasagnaConfigText.trimmed();
     if (trimmed.isEmpty()) return std::nullopt;
 
     try {
@@ -973,29 +973,29 @@ std::optional<nlohmann::json> SegmentationFitOptimizerPanel::fitConfigJson() con
 }
 
 // ---------------------------------------------------------------------------
-// Fit mode (Re-optimize / New Model)
+// Lasagna mode (Re-optimize / New Model)
 // ---------------------------------------------------------------------------
 
-int SegmentationFitOptimizerPanel::newModelWidth() const
+int SegmentationLasagnaPanel::newModelWidth() const
 {
     return _widthSpin ? _widthSpin->value() : 2048;
 }
 
-int SegmentationFitOptimizerPanel::newModelHeight() const
+int SegmentationLasagnaPanel::newModelHeight() const
 {
     return _heightSpin ? _heightSpin->value() : 2048;
 }
 
-int SegmentationFitOptimizerPanel::newModelDepth() const
+int SegmentationLasagnaPanel::newModelDepth() const
 {
     return _depthSpin ? _depthSpin->value() : 2048;
 }
 
-void SegmentationFitOptimizerPanel::onFitModeChanged(int index)
+void SegmentationLasagnaPanel::onLasagnaModeChanged(int index)
 {
     if (_restoringSettings) return;
-    _fitMode = index;
-    writeSetting(QStringLiteral("fit_mode"), _fitMode);
+    _lasagnaMode = index;
+    writeSetting(QStringLiteral("lasagna_mode"), _lasagnaMode);
     if (_newModelWidget) {
         _newModelWidget->setVisible(index == 1);  // Show for "New Model"
     }
@@ -1005,23 +1005,23 @@ void SegmentationFitOptimizerPanel::onFitModeChanged(int index)
 // Connection mode
 // ---------------------------------------------------------------------------
 
-void SegmentationFitOptimizerPanel::onConnectionModeChanged(int index)
+void SegmentationLasagnaPanel::onConnectionModeChanged(int index)
 {
     if (_restoringSettings) return;
     _connectionMode = index;
-    writeSetting(QStringLiteral("fit_connection_mode"), _connectionMode);
+    writeSetting(QStringLiteral("lasagna_connection_mode"), _connectionMode);
     updateConnectionWidgets();
 
     // If switching to external, disconnect any internal service
     if (_connectionMode == 1) {
-        auto& mgr = FitServiceManager::instance();
+        auto& mgr = LasagnaServiceManager::instance();
         if (!mgr.isExternal() && mgr.isRunning()) {
             mgr.stopService();
         }
     }
 }
 
-void SegmentationFitOptimizerPanel::updateConnectionWidgets()
+void SegmentationLasagnaPanel::updateConnectionWidgets()
 {
     bool external = (_connectionMode == 1);
 
@@ -1034,14 +1034,14 @@ void SegmentationFitOptimizerPanel::updateConnectionWidgets()
     }
 }
 
-void SegmentationFitOptimizerPanel::refreshDiscoveredServices()
+void SegmentationLasagnaPanel::refreshDiscoveredServices()
 {
     if (!_discoveryCombo) return;
 
     _discoveryCombo->clear();
     _discoveryCombo->addItem(tr("(manual entry)"));
 
-    QJsonArray services = FitServiceManager::discoverServices();
+    QJsonArray services = LasagnaServiceManager::discoverServices();
     for (const auto& val : services) {
         QJsonObject svc = val.toObject();
         QString host = svc[QStringLiteral("host")].toString();
@@ -1061,7 +1061,7 @@ void SegmentationFitOptimizerPanel::refreshDiscoveredServices()
     }
 }
 
-void SegmentationFitOptimizerPanel::onDiscoveredServiceSelected(int index)
+void SegmentationLasagnaPanel::onDiscoveredServiceSelected(int index)
 {
     // Show host/port only for manual entry (index 0)
     if (_hostPortWidget) {
@@ -1088,13 +1088,13 @@ void SegmentationFitOptimizerPanel::onDiscoveredServiceSelected(int index)
     _externalPort = port;
 
     // Auto-connect; fetch datasets once connected
-    auto& mgr = FitServiceManager::instance();
+    auto& mgr = LasagnaServiceManager::instance();
     auto* conn = new QMetaObject::Connection;
-    *conn = connect(&mgr, &FitServiceManager::serviceStarted, this,
+    *conn = connect(&mgr, &LasagnaServiceManager::serviceStarted, this,
         [this, conn]() {
             QObject::disconnect(*conn);
             delete conn;
-            FitServiceManager::instance().fetchDatasets();
+            LasagnaServiceManager::instance().fetchDatasets();
         });
     mgr.connectToExternal(host, port);
 }

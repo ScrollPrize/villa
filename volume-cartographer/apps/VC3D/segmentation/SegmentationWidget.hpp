@@ -23,7 +23,7 @@ class SegmentationApprovalMaskPanel;
 class SegmentationCellReoptPanel;
 class SegmentationNeuralTracerPanel;
 class SegmentationDirectionFieldPanel;
-class SegmentationFitOptimizerPanel;
+class SegmentationLasagnaPanel;
 
 class SegmentationWidget : public QWidget
 {
@@ -163,16 +163,16 @@ public:
     void setCellReoptMode(bool enabled);
     void setCellReoptCollections(const QVector<QPair<uint64_t, QString>>& collections);
 
-    // Fit optimizer getters — delegated to panel
-    [[nodiscard]] QString fitDataInputPath() const;
-    [[nodiscard]] QString fitConfigText() const;
-    [[nodiscard]] int fitMode() const;
+    // Lasagna getters — delegated to panel
+    [[nodiscard]] QString lasagnaDataInputPath() const;
+    [[nodiscard]] QString lasagnaConfigText() const;
+    [[nodiscard]] int lasagnaMode() const;
     [[nodiscard]] int newModelWidth() const;
     [[nodiscard]] int newModelHeight() const;
     [[nodiscard]] int newModelDepth() const;
 
-    // Fit optimizer setters
-    void setFitDataInputPath(const QString& path);
+    // Lasagna setters
+    void setLasagnaDataInputPath(const QString& path);
 
 signals:
     void editingModeChanged(bool enabled);
@@ -219,10 +219,10 @@ signals:
     void neuralTracerEnabledChanged(bool enabled);
     void neuralTracerStatusMessage(const QString& message);
 
-    // Fit optimizer signals
-    void fitOptimizeRequested();
-    void fitStopRequested();
-    void fitStatusMessage(const QString& message);
+    // Lasagna signals
+    void lasagnaOptimizeRequested();
+    void lasagnaStopRequested();
+    void lasagnaStatusMessage(const QString& message);
 
     // Cell reoptimization signals
     void cellReoptModeChanged(bool enabled);
@@ -253,6 +253,6 @@ private:
     SegmentationCellReoptPanel* _cellReoptPanel{nullptr};
     SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
     SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
-    SegmentationFitOptimizerPanel* _fitOptimizerPanel{nullptr};
+    SegmentationLasagnaPanel* _lasagnaPanel{nullptr};
 
 };

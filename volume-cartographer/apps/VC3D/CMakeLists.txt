@@ -107,10 +107,10 @@ set(srcs
     segmentation/SegmentationUndoHistory.hpp
     NeuralTraceServiceManager.cpp
     NeuralTraceServiceManager.hpp
-    FitServiceManager.cpp
-    FitServiceManager.hpp
-    segmentation/panels/SegmentationFitOptimizerPanel.cpp
-    segmentation/panels/SegmentationFitOptimizerPanel.hpp
+    LasagnaServiceManager.cpp
+    LasagnaServiceManager.hpp
+    segmentation/panels/SegmentationLasagnaPanel.cpp
+    segmentation/panels/SegmentationLasagnaPanel.hpp
     ViewerManager.cpp
     ViewerManager.hpp
     SegmentRenderThread.cpp

@@ -1,4 +1,4 @@
-#include "FitServiceManager.hpp"
+#include "LasagnaServiceManager.hpp"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -72,17 +72,17 @@ QString findPythonExecutable()
     return "python3";
 }
 
-QString findFitServiceScript()
+QString findLasagnaServiceScript()
 {
     QString appDir = QCoreApplication::applicationDirPath();
     QStringList searchPaths = {
         // Development: build dir is volume-cartographer/build/bin/
-        QDir(appDir).filePath("../../vesuvius/src/vesuvius/exps_2d_model/fit_service.py"),
-        QDir(appDir).filePath("../../../vesuvius/src/vesuvius/exps_2d_model/fit_service.py"),
+        QDir(appDir).filePath("../../vesuvius/src/vesuvius/exps_2d_model/lasagna_service.py"),
+        QDir(appDir).filePath("../../../vesuvius/src/vesuvius/exps_2d_model/lasagna_service.py"),
         // Installed
-        QDir(appDir).filePath("../share/vesuvius/exps_2d_model/fit_service.py"),
+        QDir(appDir).filePath("../share/vesuvius/exps_2d_model/lasagna_service.py"),
         // Environment variable
-        qEnvironmentVariable("FIT_SERVICE_PATH"),
+        qEnvironmentVariable("LASAGNA_SERVICE_PATH"),
     };
 
     for (const QString& path : searchPaths) {
@@ -98,22 +98,22 @@ QString findFitServiceScript()
 // Singleton
 // ---------------------------------------------------------------------------
 
-FitServiceManager& FitServiceManager::instance()
+LasagnaServiceManager& LasagnaServiceManager::instance()
 {
-    static FitServiceManager inst;
+    static LasagnaServiceManager inst;
     return inst;
 }
 
-FitServiceManager::FitServiceManager(QObject* parent)
+LasagnaServiceManager::LasagnaServiceManager(QObject* parent)
     : QObject(parent)
 {
     _nam = new QNetworkAccessManager(this);
     _pollTimer = new QTimer(this);
     _pollTimer->setInterval(kPollIntervalMs);
-    connect(_pollTimer, &QTimer::timeout, this, &FitServiceManager::pollStatus);
+    connect(_pollTimer, &QTimer::timeout, this, &LasagnaServiceManager::pollStatus);
 }
 
-FitServiceManager::~FitServiceManager()
+LasagnaServiceManager::~LasagnaServiceManager()
 {
     stopService();
 }
@@ -122,7 +122,7 @@ FitServiceManager::~FitServiceManager()
 // Helpers
 // ---------------------------------------------------------------------------
 
-QString FitServiceManager::baseUrl() const
+QString LasagnaServiceManager::baseUrl() const
 {
     return QStringLiteral("http://%1:%2").arg(_host).arg(_port);
 }
@@ -131,7 +131,7 @@ QString FitServiceManager::baseUrl() const
 // Service lifecycle
 // ---------------------------------------------------------------------------
 
-bool FitServiceManager::ensureServiceRunning(const QString& pythonPath)
+bool LasagnaServiceManager::ensureServiceRunning(const QString& pythonPath)
 {
     if (_isExternal && _serviceReady) {
         return true;
@@ -142,7 +142,7 @@ bool FitServiceManager::ensureServiceRunning(const QString& pythonPath)
     return startService(pythonPath);
 }
 
-void FitServiceManager::connectToExternal(const QString& host, int port)
+void LasagnaServiceManager::connectToExternal(const QString& host, int port)
 {
     // Stop any existing internal service first
     if (_process) {
@@ -179,15 +179,15 @@ void FitServiceManager::connectToExternal(const QString& host, int port)
     });
 }
 
-bool FitServiceManager::startService(const QString& pythonPath)
+bool LasagnaServiceManager::startService(const QString& pythonPath)
 {
     _lastError.clear();
     _serviceReady = false;
     _port = 0;
 
-    QString scriptPath = findFitServiceScript();
+    QString scriptPath = findLasagnaServiceScript();
     if (scriptPath.isEmpty()) {
-        _lastError = tr("Could not find fit_service.py. Set FIT_SERVICE_PATH environment variable.");
+        _lastError = tr("Could not find lasagna_service.py. Set LASAGNA_SERVICE_PATH environment variable.");
         emit serviceError(_lastError);
         return false;
     }
@@ -196,15 +196,15 @@ bool FitServiceManager::startService(const QString& pythonPath)
     _process->setProcessChannelMode(QProcess::SeparateChannels);
 
     connect(_process.get(), QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, &FitServiceManager::handleProcessFinished);
+            this, &LasagnaServiceManager::handleProcessFinished);
     connect(_process.get(), &QProcess::errorOccurred,
-            this, &FitServiceManager::handleProcessError);
+            this, &LasagnaServiceManager::handleProcessError);
     connect(_process.get(), &QProcess::readyReadStandardOutput,
-            this, &FitServiceManager::handleReadyReadStdout);
+            this, &LasagnaServiceManager::handleReadyReadStdout);
     connect(_process.get(), &QProcess::readyReadStandardError,
-            this, &FitServiceManager::handleReadyReadStderr);
+            this, &LasagnaServiceManager::handleReadyReadStderr);
 
-    // Set PYTHONPATH so fit_service.py can import sibling modules (fit, optimizer, etc.)
+    // Set PYTHONPATH so lasagna_service.py can import sibling modules (fit, optimizer, etc.)
     QDir scriptDir(QFileInfo(scriptPath).absolutePath());
     QString exps2dPath = scriptDir.absolutePath();
 
@@ -222,8 +222,8 @@ bool FitServiceManager::startService(const QString& pythonPath)
     // Port 0 = auto-select
     QStringList args = {scriptPath, "--port", "0"};
 
-    emit statusMessage(tr("Starting fit optimizer service..."));
-    std::cout << "Starting fit service: " << python.toStdString();
+    emit statusMessage(tr("Starting lasagna service..."));
+    std::cout << "Starting lasagna service: " << python.toStdString();
     for (const QString& arg : args) {
         std::cout << " " << arg.toStdString();
     }
@@ -232,13 +232,13 @@ bool FitServiceManager::startService(const QString& pythonPath)
     _process->start(python, args);
 
     if (!_process->waitForStarted(5000)) {
-        _lastError = tr("Failed to start fit optimizer service process");
+        _lastError = tr("Failed to start lasagna service process");
         emit serviceError(_lastError);
         _process.reset();
         return false;
     }
 
-    emit statusMessage(tr("Waiting for fit optimizer service to initialize..."));
+    emit statusMessage(tr("Waiting for lasagna service to initialize..."));
 
     QElapsedTimer timer;
     timer.start();
@@ -246,27 +246,27 @@ bool FitServiceManager::startService(const QString& pythonPath)
         QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
 
         if (_serviceReady) {
-            emit statusMessage(tr("Fit optimizer service ready on port %1").arg(_port));
+            emit statusMessage(tr("Lasagna service ready on port %1").arg(_port));
             emit serviceStarted();
             return true;
         }
 
         if (!_process || _process->state() != QProcess::Running) {
             if (_lastError.isEmpty()) {
-                _lastError = tr("Fit optimizer service terminated unexpectedly");
+                _lastError = tr("Lasagna service terminated unexpectedly");
             }
             emit serviceError(_lastError);
             return false;
         }
     }
 
-    _lastError = tr("Fit optimizer service startup timed out");
+    _lastError = tr("Lasagna service startup timed out");
     emit serviceError(_lastError);
     stopService();
     return false;
 }
 
-void FitServiceManager::stopService()
+void LasagnaServiceManager::stopService()
 {
     _pollTimer->stop();
 
@@ -285,7 +285,7 @@ void FitServiceManager::stopService()
         return;
     }
 
-    std::cout << "Stopping fit optimizer service..." << std::endl;
+    std::cout << "Stopping lasagna service..." << std::endl;
 
     if (_process->state() == QProcess::Running) {
         _process->terminate();
@@ -303,7 +303,7 @@ void FitServiceManager::stopService()
     emit serviceStopped();
 }
 
-bool FitServiceManager::isRunning() const
+bool LasagnaServiceManager::isRunning() const
 {
     if (_isExternal) {
         return _serviceReady;
@@ -315,14 +315,14 @@ bool FitServiceManager::isRunning() const
 // Process I/O handlers
 // ---------------------------------------------------------------------------
 
-void FitServiceManager::handleProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
+void LasagnaServiceManager::handleProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
 {
-    std::cout << "Fit optimizer service finished with exit code " << exitCode << std::endl;
+    std::cout << "Lasagna service finished with exit code " << exitCode << std::endl;
 
     if (exitStatus == QProcess::CrashExit) {
-        _lastError = tr("Fit optimizer service crashed");
+        _lastError = tr("Lasagna service crashed");
     } else if (exitCode != 0) {
-        _lastError = tr("Fit optimizer service exited with code %1").arg(exitCode);
+        _lastError = tr("Lasagna service exited with code %1").arg(exitCode);
     }
 
     _serviceReady = false;
@@ -330,32 +330,32 @@ void FitServiceManager::handleProcessFinished(int exitCode, QProcess::ExitStatus
     emit serviceStopped();
 }
 
-void FitServiceManager::handleProcessError(QProcess::ProcessError error)
+void LasagnaServiceManager::handleProcessError(QProcess::ProcessError error)
 {
     QString errorStr;
     switch (error) {
     case QProcess::FailedToStart:
-        errorStr = tr("Failed to start fit optimizer service");
+        errorStr = tr("Failed to start lasagna service");
         break;
     case QProcess::Crashed:
-        errorStr = tr("Fit optimizer service crashed");
+        errorStr = tr("Lasagna service crashed");
         break;
     default:
-        errorStr = tr("Fit optimizer service error");
+        errorStr = tr("Lasagna service error");
         break;
     }
 
     _lastError = errorStr;
-    std::cerr << "Fit service error: " << errorStr.toStdString() << std::endl;
+    std::cerr << "[lasagna] service error: " << errorStr.toStdString() << std::endl;
     emit serviceError(errorStr);
 }
 
-void FitServiceManager::handleReadyReadStdout()
+void LasagnaServiceManager::handleReadyReadStdout()
 {
     if (!_process) return;
 
     QString output = QString::fromUtf8(_process->readAllStandardOutput());
-    std::cout << "[fit-service] " << output.toStdString();
+    std::cout << "[lasagna] " << output.toStdString();
 
     // Parse "listening on http://127.0.0.1:PORT"
     if (!_serviceReady) {
@@ -368,12 +368,12 @@ void FitServiceManager::handleReadyReadStdout()
     }
 }
 
-void FitServiceManager::handleReadyReadStderr()
+void LasagnaServiceManager::handleReadyReadStderr()
 {
     if (!_process) return;
 
     QString error = QString::fromUtf8(_process->readAllStandardError());
-    std::cerr << "[fit-service] " << error.toStdString();
+    std::cerr << "[lasagna] " << error.toStdString();
 
     if (!error.trimmed().isEmpty() && !_serviceReady) {
         if (_lastError.isEmpty() && error.contains("error", Qt::CaseInsensitive)) {
@@ -386,11 +386,11 @@ void FitServiceManager::handleReadyReadStderr()
 // HTTP communication
 // ---------------------------------------------------------------------------
 
-void FitServiceManager::startOptimization(const QJsonObject& config,
+void LasagnaServiceManager::startOptimization(const QJsonObject& config,
                                            const QString& localOutputDir)
 {
     if (!isRunning()) {
-        emit optimizationError(tr("Fit optimizer service is not running"));
+        emit optimizationError(tr("Lasagna service is not running"));
         return;
     }
 
@@ -408,7 +408,7 @@ void FitServiceManager::startOptimization(const QJsonObject& config,
     });
 }
 
-void FitServiceManager::stopOptimization()
+void LasagnaServiceManager::stopOptimization()
 {
     if (!isRunning()) return;
 
@@ -419,7 +419,7 @@ void FitServiceManager::stopOptimization()
     _nam->post(req, QByteArray("{}"));
 }
 
-void FitServiceManager::handleOptimizeReply(QNetworkReply* reply)
+void LasagnaServiceManager::handleOptimizeReply(QNetworkReply* reply)
 {
     reply->deleteLater();
 
@@ -442,7 +442,7 @@ void FitServiceManager::handleOptimizeReply(QNetworkReply* reply)
     emit optimizationStarted();
 }
 
-void FitServiceManager::pollStatus()
+void LasagnaServiceManager::pollStatus()
 {
     if (!isRunning()) {
         _pollTimer->stop();
@@ -458,7 +458,7 @@ void FitServiceManager::pollStatus()
     });
 }
 
-void FitServiceManager::handleStatusReply(QNetworkReply* reply)
+void LasagnaServiceManager::handleStatusReply(QNetworkReply* reply)
 {
     reply->deleteLater();
 
@@ -503,7 +503,7 @@ void FitServiceManager::handleStatusReply(QNetworkReply* reply)
 // Results download (external mode)
 // ---------------------------------------------------------------------------
 
-void FitServiceManager::downloadResults()
+void LasagnaServiceManager::downloadResults()
 {
     emit statusMessage(tr("Downloading results from external service..."));
 
@@ -521,11 +521,11 @@ void FitServiceManager::downloadResults()
         }
 
         QByteArray data = reply->readAll();
-        std::cout << "[fit-optimizer] downloaded results archive ("
+        std::cout << "[lasagna] downloaded results archive ("
                   << data.size() << " bytes)" << std::endl;
 
         // Write tar.gz to a temp file, then extract into _localOutputDir
-        QString tarPath = _localOutputDir + QStringLiteral("/.fit_results.tar.gz");
+        QString tarPath = _localOutputDir + QStringLiteral("/.lasagna_results.tar.gz");
         QFile tarFile(tarPath);
         if (!tarFile.open(QIODevice::WriteOnly)) {
             emit optimizationError(tr("Cannot write temp file: %1").arg(tarPath));
@@ -552,7 +552,7 @@ void FitServiceManager::downloadResults()
             return;
         }
 
-        std::cout << "[fit-optimizer] results unpacked to "
+        std::cout << "[lasagna] results unpacked to "
                   << _localOutputDir.toStdString() << std::endl;
         emit optimizationFinished(_localOutputDir);
     });
@@ -562,7 +562,7 @@ void FitServiceManager::downloadResults()
 // Service discovery
 // ---------------------------------------------------------------------------
 
-QJsonArray FitServiceManager::discoverServices()
+QJsonArray LasagnaServiceManager::discoverServices()
 {
     QJsonArray result;
 
@@ -719,7 +719,7 @@ QJsonArray FitServiceManager::discoverServices()
                 }
                 avahi_client_free(client);
             } else {
-                std::cerr << "[fit-service] avahi client error: "
+                std::cerr << "[lasagna] avahi client error: "
                           << avahi_strerror(error) << std::endl;
             }
             avahi_simple_poll_free(poll);
@@ -730,7 +730,7 @@ QJsonArray FitServiceManager::discoverServices()
     return result;
 }
 
-void FitServiceManager::fetchDatasets()
+void LasagnaServiceManager::fetchDatasets()
 {
     if (!isRunning()) {
         return;

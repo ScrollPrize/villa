@@ -20,7 +20,7 @@ class QToolButton;
 class QWidget;
 
 /**
- * Segmentation sidebar panel for the 2D fit optimizer.
+ * Segmentation sidebar panel for the 2D lasagna.
  *
  * Displays:
  *   - Connection mode (internal/external)
@@ -29,42 +29,42 @@ class QWidget;
  *   - Run / Stop buttons
  *   - Progress status label
  */
-class SegmentationFitOptimizerPanel : public QWidget
+class SegmentationLasagnaPanel : public QWidget
 {
     Q_OBJECT
 
 public:
-    explicit SegmentationFitOptimizerPanel(const QString& settingsGroup,
+    explicit SegmentationLasagnaPanel(const QString& settingsGroup,
                                             QWidget* parent = nullptr);
 
     /** 0 = Re-optimize, 1 = New Model */
-    enum FitMode { ReOptimize = 0, NewModel = 1 };
+    enum LasagnaMode { ReOptimize = 0, NewModel = 1 };
 
     // Getters
-    [[nodiscard]] QString fitDataInputPath() const { return _fitDataInputPath; }
-    [[nodiscard]] QString fitConfigText() const { return _fitConfigText; }
-    [[nodiscard]] std::optional<nlohmann::json> fitConfigJson() const;
-    [[nodiscard]] FitMode fitMode() const { return static_cast<FitMode>(_fitMode); }
+    [[nodiscard]] QString lasagnaDataInputPath() const { return _lasagnaDataInputPath; }
+    [[nodiscard]] QString lasagnaConfigText() const { return _lasagnaConfigText; }
+    [[nodiscard]] std::optional<nlohmann::json> lasagnaConfigJson() const;
+    [[nodiscard]] LasagnaMode lasagnaMode() const { return static_cast<LasagnaMode>(_lasagnaMode); }
     [[nodiscard]] int newModelWidth() const;
     [[nodiscard]] int newModelHeight() const;
     [[nodiscard]] int newModelDepth() const;
 
     // Setters
-    void setFitDataInputPath(const QString& path);
+    void setLasagnaDataInputPath(const QString& path);
 
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled, bool optimizing);
 
 signals:
-    void fitOptimizeRequested();
-    void fitStopRequested();
-    void fitStatusMessage(const QString& message);
+    void lasagnaOptimizeRequested();
+    void lasagnaStopRequested();
+    void lasagnaStatusMessage(const QString& message);
 
 private:
     void writeSetting(const QString& key, const QVariant& value);
     void validateConfigText();
     void loadProfile(int index);
-    void onFitModeChanged(int index);
+    void onLasagnaModeChanged(int index);
     void onConnectionModeChanged(int index);
     void refreshDiscoveredServices();
     void onDiscoveredServiceSelected(int index);
@@ -105,11 +105,11 @@ private:
     QProgressBar* _progressBar{nullptr};
     QLabel* _progressLabel{nullptr};
 
-    QString _fitDataInputPath;
-    QString _fitConfigText;
+    QString _lasagnaDataInputPath;
+    QString _lasagnaConfigText;
     QString _configError;
 
-    int _fitMode{0};         // 0=re-optimize, 1=new model
+    int _lasagnaMode{0};         // 0=re-optimize, 1=new model
     int _connectionMode{0};  // 0=internal, 1=external
     QString _externalHost{"127.0.0.1"};
     int _externalPort{9999};
