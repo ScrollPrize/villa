@@ -754,6 +754,7 @@ static ABFFlattenResult runAbfFlattenTask(const ABFFlattenTaskConfig& cfg, const
         config.downsampleFactor = std::max(1, cfg.downsampleFactor);
         config.useABF = true;
         config.scaleToOriginalArea = true;
+        config.alignToInputGrid = true;
         config.rotateHighZToTop = false;
 
         std::unique_ptr<QuadSurface> flatSurf(vc::abfFlattenToNewSurface(*surf, config));

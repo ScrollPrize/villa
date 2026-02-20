@@ -29,6 +29,13 @@ struct ABFConfig {
      */
     int downsampleFactor = 1;
 
+    /**
+     * If true, normalize UV orientation to follow input grid directions
+     * (increasing column -> +U, increasing row -> +V). This removes large
+     * arbitrary global rotations/flips from ABF/LSCM.
+     */
+    bool alignToInputGrid = false;
+
     /** If true, rotate output so highest Z values are at row 0 (default: false) */
     bool rotateHighZToTop = false;
 };

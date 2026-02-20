@@ -10,6 +10,8 @@
 #include <iostream>
 #include <cmath>
 #include <limits>
+#include <array>
+#include <vector>
 
 namespace vc {
 
@@ -195,6 +197,111 @@ static cv::Mat_<cv::Vec2f> upsampleUVs(const cv::Mat_<cv::Vec2f>& coarseUVs,
     return result;
 }
 
+static void alignUVsToInputGrid(const cv::Mat_<cv::Vec3f>& points, cv::Mat_<cv::Vec2f>& uvs)
+{
+    auto isValidPoint = [&](int row, int col) -> bool {
+        const cv::Vec3f& p = points(row, col);
+        return p[0] != -1.f && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+    };
+    auto isValidUV = [&](int row, int col) -> bool {
+        const cv::Vec2f& uv = uvs(row, col);
+        return uv[0] != -1.f && std::isfinite(uv[0]) && std::isfinite(uv[1]);
+    };
+
+    cv::Vec2d dCol(0.0, 0.0);
+    cv::Vec2d dRow(0.0, 0.0);
+    std::size_t colSamples = 0;
+    std::size_t rowSamples = 0;
+
+    for (int row = 0; row < points.rows; ++row) {
+        for (int col = 0; col + 1 < points.cols; ++col) {
+            if (!isValidPoint(row, col) || !isValidPoint(row, col + 1) ||
+                !isValidUV(row, col) || !isValidUV(row, col + 1)) {
+                continue;
+            }
+            cv::Vec2f delta = uvs(row, col + 1) - uvs(row, col);
+            dCol[0] += delta[0];
+            dCol[1] += delta[1];
+            ++colSamples;
+        }
+    }
+
+    for (int row = 0; row + 1 < points.rows; ++row) {
+        for (int col = 0; col < points.cols; ++col) {
+            if (!isValidPoint(row, col) || !isValidPoint(row + 1, col) ||
+                !isValidUV(row, col) || !isValidUV(row + 1, col)) {
+                continue;
+            }
+            cv::Vec2f delta = uvs(row + 1, col) - uvs(row, col);
+            dRow[0] += delta[0];
+            dRow[1] += delta[1];
+            ++rowSamples;
+        }
+    }
+
+    if (colSamples == 0 && rowSamples == 0) {
+        return;
+    }
+
+    const double colNorm = std::sqrt(dCol.dot(dCol));
+    const double rowNorm = std::sqrt(dRow.dot(dRow));
+    if (colNorm < 1e-12 && rowNorm < 1e-12) {
+        return;
+    }
+
+    struct Mat2 {
+        float a, b, c, d;
+    };
+    // D4: all axis-aligned rotations/reflections.
+    const std::array<Mat2, 8> candidates{{
+        { 1.f,  0.f,  0.f,  1.f}, // identity
+        { 0.f, -1.f,  1.f,  0.f}, // rotate +90
+        {-1.f,  0.f,  0.f, -1.f}, // rotate 180
+        { 0.f,  1.f, -1.f,  0.f}, // rotate -90
+        {-1.f,  0.f,  0.f,  1.f}, // mirror X
+        { 1.f,  0.f,  0.f, -1.f}, // mirror Y
+        { 0.f,  1.f,  1.f,  0.f}, // mirror y=x
+        { 0.f, -1.f, -1.f,  0.f}  // mirror y=-x
+    }};
+
+    auto transform = [](const Mat2& m, const cv::Vec2d& v) -> cv::Vec2d {
+        return cv::Vec2d(m.a * v[0] + m.b * v[1], m.c * v[0] + m.d * v[1]);
+    };
+
+    double bestScore = -std::numeric_limits<double>::infinity();
+    Mat2 best = candidates.front();
+    for (const auto& m : candidates) {
+        double score = 0.0;
+        if (colNorm >= 1e-12) {
+            cv::Vec2d t = transform(m, dCol);
+            score += t[0] / colNorm;               // prefer +U along +col
+            score -= 0.25 * std::abs(t[1]) / colNorm; // penalize cross-axis
+        }
+        if (rowNorm >= 1e-12) {
+            cv::Vec2d t = transform(m, dRow);
+            score += t[1] / rowNorm;               // prefer +V along +row
+            score -= 0.25 * std::abs(t[0]) / rowNorm; // penalize cross-axis
+        }
+        if (score > bestScore) {
+            bestScore = score;
+            best = m;
+        }
+    }
+
+    for (int row = 0; row < uvs.rows; ++row) {
+        for (int col = 0; col < uvs.cols; ++col) {
+            if (!isValidUV(row, col)) {
+                continue;
+            }
+            const cv::Vec2f uv = uvs(row, col);
+            uvs(row, col) = cv::Vec2f(
+                best.a * uv[0] + best.b * uv[1],
+                best.c * uv[0] + best.d * uv[1]
+            );
+        }
+    }
+}
+
 /**
  * @brief Internal ABF++ flattening on the provided surface (no downsampling)
  */
@@ -217,7 +324,8 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface, const 
     std::unordered_map<std::size_t, int> vertexToGrid;
 
     // First pass: collect all valid vertices from valid quads
-    std::unordered_map<int, bool> usedVertices;
+    std::vector<uint8_t> usedVertices(points->rows * points->cols, uint8_t(0));
+    bool hasUsedVertices = false;
     for (int row = 0; row < points->rows - 1; ++row) {
         for (int col = 0; col < points->cols - 1; ++col) {
             const cv::Vec3f& p00 = (*points)(row, col);
@@ -229,21 +337,25 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface, const 
                 continue;
 
             // Mark vertices as used
-            usedVertices[row * points->cols + col] = true;
-            usedVertices[row * points->cols + (col + 1)] = true;
-            usedVertices[(row + 1) * points->cols + col] = true;
-            usedVertices[(row + 1) * points->cols + (col + 1)] = true;
+            usedVertices[row * points->cols + col] = 1;
+            usedVertices[row * points->cols + (col + 1)] = 1;
+            usedVertices[(row + 1) * points->cols + col] = 1;
+            usedVertices[(row + 1) * points->cols + (col + 1)] = 1;
+            hasUsedVertices = true;
         }
     }
 
-    if (usedVertices.empty()) {
+    if (!hasUsedVertices) {
         std::cerr << "ABF++: No valid quads found" << std::endl;
         return cv::Mat_<cv::Vec2f>();
     }
 
     // Step 1: Insert vertices
     std::size_t vertexIdx = 0;
-    for (const auto& [linearIdx, _] : usedVertices) {
+    for (int linearIdx = 0; linearIdx < points->rows * points->cols; ++linearIdx) {
+        if (!usedVertices[linearIdx]) {
+            continue;
+        }
         int row = linearIdx / points->cols;
         int col = linearIdx % points->cols;
         const cv::Vec3f& pt = (*points)(row, col);
@@ -372,7 +484,11 @@ cv::Mat_<cv::Vec2f> abfFlatten(const QuadSurface& surface, const ABFConfig& conf
 
     // If no downsampling requested, run directly
     if (config.downsampleFactor <= 1) {
-        return abfFlattenInternal(surface, config);
+        cv::Mat_<cv::Vec2f> uvs = abfFlattenInternal(surface, config);
+        if (!uvs.empty() && config.alignToInputGrid) {
+            alignUVsToInputGrid(*points, uvs);
+        }
+        return uvs;
     }
 
     // Downsample the grid
@@ -403,7 +519,11 @@ cv::Mat_<cv::Vec2f> abfFlatten(const QuadSurface& surface, const ABFConfig& conf
     std::cout << "ABF++: Upsampling UVs from " << coarseUVs.rows << "x" << coarseUVs.cols
               << " to " << originalRows << "x" << originalCols << std::endl;
 
-    return upsampleUVs(coarseUVs, originalRows, originalCols, config.downsampleFactor);
+    cv::Mat_<cv::Vec2f> result = upsampleUVs(coarseUVs, originalRows, originalCols, config.downsampleFactor);
+    if (!result.empty() && config.alignToInputGrid) {
+        alignUVsToInputGrid(*points, result);
+    }
+    return result;
 }
 
 bool abfFlattenInPlace(QuadSurface& surface, const ABFConfig& config) {

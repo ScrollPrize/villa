@@ -47,6 +47,12 @@ _COPY_ARG_ALIASES = {
     "dense_checkpoint_path": "checkpoint_path",
     "volume_zarr": "volume_path",
     "tifxyz_out_dir": "out_dir",
+    "_DENSE_PROJECTION_NEIGHBORHOOD_RADIUS": "dp_radius",
+    "_DENSE_PROJECTION_REJECT_OUTLIER_FRACTION": "dp_reject_frac",
+    "_DENSE_PROJECTION_REJECT_MIN_KEEP": "dp_reject_min_keep",
+    "dense_projection_neighborhood_radius": "dp_radius",
+    "dense_projection_reject_outlier_fraction": "dp_reject_frac",
+    "dense_projection_reject_min_keep": "dp_reject_min_keep",
 }
 _COPY_ARG_TO_CLI = {
     "tifxyz_path": "--tifxyz-path",
@@ -74,6 +80,9 @@ _COPY_ARG_TO_CLI = {
     "iter_direction": "--iter-direction",
     "tifxyz_step_size": "--tifxyz-step-size",
     "tifxyz_voxel_size_um": "--tifxyz-voxel-size-um",
+    "dp_radius": "--dp-radius",
+    "dp_reject_frac": "--dp-reject-frac",
+    "dp_reject_min_keep": "--dp-reject-min-keep",
 }
 _DENSE_PROJECTION_INTERP_METHOD = "catmull_rom"
 _DENSE_PROJECTION_NEIGHBORHOOD_RADIUS = 5
@@ -164,6 +173,24 @@ def parse_args(argv=None):
 
     parser.add_argument("--tifxyz-step-size", type=int, default=None)
     parser.add_argument("--tifxyz-voxel-size-um", type=float, default=None)
+    parser.add_argument(
+        "--dp-radius",
+        type=int,
+        default=_DENSE_PROJECTION_NEIGHBORHOOD_RADIUS,
+        help="Dense-projection neighborhood radius in UV cells.",
+    )
+    parser.add_argument(
+        "--dp-reject-frac",
+        type=float,
+        default=_DENSE_PROJECTION_REJECT_OUTLIER_FRACTION,
+        help="Dense-projection max outlier rejection fraction in [0, 1].",
+    )
+    parser.add_argument(
+        "--dp-reject-min-keep",
+        type=int,
+        default=_DENSE_PROJECTION_REJECT_MIN_KEEP,
+        help="Dense-projection minimum kept samples after rejection.",
+    )
 
     parser.add_argument("--verbose", action="store_true")
 
@@ -195,6 +222,12 @@ def parse_args(argv=None):
         parser.error("--flip-check-rel-margin must be >= 0")
     if args.flip_check_min_band_points < 1:
         parser.error("--flip-check-min-band-points must be >= 1")
+    if args.dp_radius < 0:
+        parser.error("--dp-radius must be >= 0")
+    if args.dp_reject_frac < 0.0 or args.dp_reject_frac > 1.0:
+        parser.error("--dp-reject-frac must satisfy 0.0 <= value <= 1.0")
+    if args.dp_reject_min_keep < 1:
+        parser.error("--dp-reject-min-keep must be >= 1")
     return args
 
 
@@ -899,6 +932,9 @@ def _run_triplet_inference(
     n_total = len(records)
     n_batches = (n_total + int(args.batch_size) - 1) // int(args.batch_size)
     kept_bboxes = 0
+    dp_radius = int(getattr(args, "dp_radius", _DENSE_PROJECTION_NEIGHBORHOOD_RADIUS))
+    dp_reject_frac = float(getattr(args, "dp_reject_frac", _DENSE_PROJECTION_REJECT_OUTLIER_FRACTION))
+    dp_reject_min_keep = int(getattr(args, "dp_reject_min_keep", _DENSE_PROJECTION_REJECT_MIN_KEEP))
 
     batch_iter = _iter_bbox_batches(records, int(args.batch_size))
     batch_iter = tqdm(batch_iter, total=n_batches, desc="triplet_batches", unit="batch")
@@ -984,6 +1020,9 @@ def _run_triplet_inference(
                     uv_b,
                     world_b,
                     subsample_stride=int(dense_subsample_stride),
+                    neighborhood_radius=dp_radius,
+                    reject_outlier_fraction=dp_reject_frac,
+                    reject_min_keep=dp_reject_min_keep,
                 )
                 _accumulate_displaced(sum_back, count_back, uv_b, world_b_robust)
 
@@ -992,6 +1031,9 @@ def _run_triplet_inference(
                     uv_f,
                     world_f,
                     subsample_stride=int(dense_subsample_stride),
+                    neighborhood_radius=dp_radius,
+                    reject_outlier_fraction=dp_reject_frac,
+                    reject_min_keep=dp_reject_min_keep,
                 )
                 _accumulate_displaced(sum_front, count_front, uv_f, world_f_robust)
 
@@ -1189,9 +1231,9 @@ def _run_single_iteration(
         "effective_step_size_used": int(tifxyz_step_size),
         "projection_dense_interp_method": str(_DENSE_PROJECTION_INTERP_METHOD),
         "projection_dense_uv_mode": "per_bbox",
-        "projection_dense_neighborhood": int(2 * _DENSE_PROJECTION_NEIGHBORHOOD_RADIUS + 1),
-        "projection_dense_reject_outlier_fraction": float(_DENSE_PROJECTION_REJECT_OUTLIER_FRACTION),
-        "projection_dense_reject_min_keep": int(_DENSE_PROJECTION_REJECT_MIN_KEEP),
+        "projection_dense_neighborhood": int(2 * int(args.dp_radius) + 1),
+        "projection_dense_reject_outlier_fraction": float(args.dp_reject_frac),
+        "projection_dense_reject_min_keep": int(args.dp_reject_min_keep),
         "projection_dense_scale_factor": int(dense_subsample_stride),
         "front_projection": infer_out["front_projection_meta"],
         "back_projection": infer_out["back_projection_meta"],
