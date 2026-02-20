@@ -70,6 +70,7 @@ private:
     // External service widgets
     QComboBox* _discoveryCombo{nullptr};
     QToolButton* _refreshBtn{nullptr};
+    QWidget* _hostPortWidget{nullptr};   // host/port row (hidden when discovered)
     QLineEdit* _hostEdit{nullptr};
     QLineEdit* _portEdit{nullptr};
 

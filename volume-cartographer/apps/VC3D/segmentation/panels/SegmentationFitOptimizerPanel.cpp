@@ -294,15 +294,17 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     discRow->addWidget(_refreshBtn);
     extLayout->addLayout(discRow);
 
-    // Host/port row
-    auto* hostRow = new QHBoxLayout();
-    auto* hostLabel = new QLabel(tr("Host:"), _externalWidget);
+    // Host/port row (hidden when a discovered service is selected)
+    _hostPortWidget = new QWidget(_externalWidget);
+    auto* hostRow = new QHBoxLayout(_hostPortWidget);
+    hostRow->setContentsMargins(0, 0, 0, 0);
+    auto* hostLabel = new QLabel(tr("Host:"), _hostPortWidget);
     hostLabel->setFixedWidth(60);
-    _hostEdit = new QLineEdit(_externalWidget);
+    _hostEdit = new QLineEdit(_hostPortWidget);
     _hostEdit->setText(QStringLiteral("127.0.0.1"));
     _hostEdit->setPlaceholderText(QStringLiteral("127.0.0.1"));
-    auto* portLabel = new QLabel(tr("Port:"), _externalWidget);
-    _portEdit = new QLineEdit(_externalWidget);
+    auto* portLabel = new QLabel(tr("Port:"), _hostPortWidget);
+    _portEdit = new QLineEdit(_hostPortWidget);
     _portEdit->setText(QStringLiteral("9999"));
     _portEdit->setPlaceholderText(QStringLiteral("9999"));
     _portEdit->setFixedWidth(70);
@@ -310,7 +312,7 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
     hostRow->addWidget(_hostEdit, 1);
     hostRow->addWidget(portLabel);
     hostRow->addWidget(_portEdit);
-    extLayout->addLayout(hostRow);
+    extLayout->addWidget(_hostPortWidget);
 
     _group->contentLayout()->addWidget(_externalWidget);
     _externalWidget->setVisible(false);  // Start hidden (internal mode)
@@ -873,6 +875,11 @@ void SegmentationFitOptimizerPanel::refreshDiscoveredServices()
 
 void SegmentationFitOptimizerPanel::onDiscoveredServiceSelected(int index)
 {
+    // Show host/port only for manual entry (index 0)
+    if (_hostPortWidget) {
+        _hostPortWidget->setVisible(index <= 0);
+    }
+
     if (index <= 0) return;  // "(manual entry)" or invalid
     if (!_discoveryCombo) return;
 
