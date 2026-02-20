@@ -46,10 +46,18 @@ static const FitProfile kProfiles[] = {
         "dir_v": 10.0,
         "dir_conn": 1.0,
         "step": 100.0,
+        "smooth_x": 0.0,
         "smooth_y": 0.01,
         "gradmag": 1.0,
+        "mean_pos": 0.0,
+        "meshoff_sy": 0.001,
+        "conn_sy_l": 0.0,
+        "conn_sy_r": 0.0,
+        "angle": 0.001,
+        "y_straight": 0.0,
         "data": 0.4,
         "data_plain": 0.2,
+        "data_grad": 0.0,
         "z_straight": 10.0
     },
     "stages": [
@@ -66,15 +74,22 @@ static const FitProfile kProfiles[] = {
     {"Final Refinement (10k)", "Single-stage full-resolution refinement",
      R"({
     "base": {
-        "dir_v": 1.0,
-        "dir_conn": 0.1,
-        "step": 0.1,
+        "dir_v": 10.0,
+        "dir_conn": 1.0,
+        "step": 100.0,
+        "smooth_x": 0.0,
         "smooth_y": 0.01,
-        "gradmag": 0.01,
+        "gradmag": 1.0,
+        "mean_pos": 0.0,
         "meshoff_sy": 0.001,
+        "conn_sy_l": 0.0,
+        "conn_sy_r": 0.0,
         "angle": 0.001,
-        "data": 4.0,
-        "data_plain": 2.0
+        "y_straight": 0.0,
+        "data": 0.4,
+        "data_plain": 0.2,
+        "data_grad": 0.0,
+        "z_straight": 10.0
     },
     "stages": [
         {
@@ -90,12 +105,22 @@ static const FitProfile kProfiles[] = {
     {"Scalespace (21k)", "Multi-scale coarse-to-fine optimization",
      R"({
     "base": {
-        "dir_v": 1.0,
-        "dir_conn": 0.1,
-        "step": 0.1,
+        "dir_v": 10.0,
+        "dir_conn": 1.0,
+        "step": 100.0,
+        "smooth_x": 0.0,
         "smooth_y": 0.01,
-        "gradmag": 0.01,
-        "angle": 0.001
+        "gradmag": 1.0,
+        "mean_pos": 0.0,
+        "meshoff_sy": 0.001,
+        "conn_sy_l": 0.0,
+        "conn_sy_r": 0.0,
+        "angle": 0.001,
+        "y_straight": 0.0,
+        "data": 0.4,
+        "data_plain": 0.2,
+        "data_grad": 0.0,
+        "z_straight": 10.0
     },
     "stages": [
         {
@@ -143,11 +168,22 @@ static const FitProfile kProfiles[] = {
     {"Direct + Init (4k)", "Global transform init, then mesh optimization",
      R"({
     "base": {
-        "dir_v": 1.0,
+        "dir_v": 10.0,
         "dir_conn": 1.0,
-        "step": 1.0,
+        "step": 100.0,
+        "smooth_x": 0.0,
+        "smooth_y": 0.01,
         "gradmag": 1.0,
-        "mean_pos": 0.1
+        "mean_pos": 0.0,
+        "meshoff_sy": 0.001,
+        "conn_sy_l": 0.0,
+        "conn_sy_r": 0.0,
+        "angle": 0.001,
+        "y_straight": 0.0,
+        "data": 0.4,
+        "data_plain": 0.2,
+        "data_grad": 0.0,
+        "z_straight": 10.0
     },
     "stages": [
         {
@@ -170,11 +206,22 @@ static const FitProfile kProfiles[] = {
     {"Direct + Grow", "Init, mesh opt, then grow up/down",
      R"({
     "base": {
-        "dir_v": 1.0,
+        "dir_v": 10.0,
         "dir_conn": 1.0,
-        "step": 1.0,
+        "step": 100.0,
+        "smooth_x": 0.0,
+        "smooth_y": 0.01,
         "gradmag": 1.0,
-        "mean_pos": 0.1
+        "mean_pos": 0.0,
+        "meshoff_sy": 0.001,
+        "conn_sy_l": 0.0,
+        "conn_sy_r": 0.0,
+        "angle": 0.001,
+        "y_straight": 0.0,
+        "data": 0.4,
+        "data_plain": 0.2,
+        "data_grad": 0.0,
+        "z_straight": 10.0
     },
     "stages": [
         {
@@ -219,15 +266,22 @@ static const FitProfile kProfiles[] = {
     {"Grow Left", "Extend mesh leftward with local optimization",
      R"({
     "base": {
-        "dir_v": 1.0,
-        "dir_conn": 100.0,
-        "step": 0.1,
+        "dir_v": 10.0,
+        "dir_conn": 1.0,
+        "step": 100.0,
+        "smooth_x": 0.0,
         "smooth_y": 0.01,
-        "contr": 0.1,
-        "gradmag": 10.0,
+        "gradmag": 1.0,
+        "mean_pos": 0.0,
+        "meshoff_sy": 0.001,
+        "conn_sy_l": 0.0,
+        "conn_sy_r": 0.0,
         "angle": 0.001,
-        "data": 4.0,
-        "data_plain": 2.0
+        "y_straight": 0.0,
+        "data": 0.4,
+        "data_plain": 0.2,
+        "data_grad": 0.0,
+        "z_straight": 10.0
     },
     "stages": [
         {
@@ -350,10 +404,10 @@ SegmentationFitOptimizerPanel::SegmentationFitOptimizerPanel(
 
     dimLayout->addWidget(new QLabel(tr("D:"), _newModelWidget));
     _depthSpin = new QSpinBox(_newModelWidget);
-    _depthSpin->setRange(1, 200);
-    _depthSpin->setValue(30);
-    _depthSpin->setSingleStep(1);
-    _depthSpin->setToolTip(tr("Depth in z-grow generations"));
+    _depthSpin->setRange(1, 16384);
+    _depthSpin->setValue(2048);
+    _depthSpin->setSingleStep(64);
+    _depthSpin->setToolTip(tr("Depth in full-resolution voxels"));
     dimLayout->addWidget(_depthSpin, 1);
 
     _group->contentLayout()->addWidget(_newModelWidget);
@@ -761,7 +815,7 @@ void SegmentationFitOptimizerPanel::restoreSettings(QSettings& settings)
     }
     if (_depthSpin) {
         const QSignalBlocker b(_depthSpin);
-        _depthSpin->setValue(settings.value(QStringLiteral("fit_new_model_depth"), 30).toInt());
+        _depthSpin->setValue(settings.value(QStringLiteral("fit_new_model_depth"), 2048).toInt());
     }
 
     _connectionMode = settings.value(QStringLiteral("fit_connection_mode"), 0).toInt();
@@ -934,7 +988,7 @@ int SegmentationFitOptimizerPanel::newModelHeight() const
 
 int SegmentationFitOptimizerPanel::newModelDepth() const
 {
-    return _depthSpin ? _depthSpin->value() : 30;
+    return _depthSpin ? _depthSpin->value() : 2048;
 }
 
 void SegmentationFitOptimizerPanel::onFitModeChanged(int index)

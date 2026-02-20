@@ -122,6 +122,14 @@ def main(argv: list[str] | None = None) -> int:
 		if int(z_size_from_state) > 0:
 			z_size_use = max(int(z_size_use), int(z_size_from_state))
 
+	# --bbox: z-size is depth in full-res voxels; convert to number of z-slices
+	if getattr(args, "bbox", None) is not None and model_cfg.model_input is None:
+		z_step_eff = max(1, int(z_step_use) * int(round(data_cfg.downscale)))
+		z_size_voxels = int(z_size_use)
+		z_size_use = max(1, int(round(z_size_voxels / z_step_eff)))
+		print(f"[bbox] z depth {z_size_voxels} voxels -> {z_size_use} z-slices "
+			  f"(z_step={z_step_use}, downscale={data_cfg.downscale}, z_step_eff={z_step_eff})")
+
 	if model_params_in is not None:
 		print("model_params_in:\n" + json.dumps(model_params_in, indent=2, sort_keys=True))
 	points_tensor_work = point_constraints.to_working_coords(
