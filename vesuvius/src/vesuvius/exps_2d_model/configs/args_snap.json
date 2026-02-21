@@ -1,0 +1,16 @@
+{
+	"args": {
+		"unet-checkpoint": "../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt",
+		"crop": [2000, 2500, 1600, 1600],
+		"input": "../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/",
+		"out-dir": "res_snap",
+		"mesh-step": 10.0,
+		"winding-step": 10.0,
+		"init-size-frac": 0.15,
+		"init-size-frac-h": 2.0,
+		"unet-z": 6000.0,
+		"grad-mag-blur-sigma" : 4.0,
+		"dir-blur-sigma" : 2.0,
+		"model-input": "res_direct/model_snapshots/model_stage1_005000.pt"
+		}
+}

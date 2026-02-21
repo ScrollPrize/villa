@@ -635,6 +635,13 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
                            SurfacePatchIndex* surfaceIndex, PointIndex* pointIndex)
 {
     ensureLoaded();
+
+    // Guard: grid too small or scale is zero — cannot search
+    if (!_points || _points->cols < 4 || _points->rows < 4 ||
+        _scale[0] < 1e-12f || _scale[1] < 1e-12f) {
+        return -1;
+    }
+
     cv::Vec2f loc = cv::Vec2f(ptr[0], ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
     cv::Vec3f _out;
 

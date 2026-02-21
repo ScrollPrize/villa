@@ -1,0 +1,91 @@
+{
+	"base": {
+		"data": 1.0,
+		"grad_data": 10.0,
+		"grad_mag": 1.0,
+		"smooth_x": 10000.0,
+		"smooth_y": 10000.0,
+		"step": 1.0,
+		"mod_smooth": 0.0,
+		"quad_tri": 1.0,
+		"angle_sym": 1.0,
+		"dir_v": 10.0,
+		"dir_conn": 10.0,
+		"line_smooth_y": 0.0,
+		"y_straight": 1.0
+	},
+	"stages": [
+		{
+			"name": "stage1",
+			"steps": 1000,
+			"lr": 0.01,
+			"params": ["theta", "winding_scale", "phase"],
+			"default_mul": 1.0,
+			"w_fac": {
+				"data": 0.0,
+				"grad_data": 0.0,
+				"smooth_x": 0.0,
+				"smooth_y": 0.0,
+				"step": 0.0,
+				"mod_smooth": 0.0,
+				"quad_tri": 0.0,
+				"angle_sym": 0.0,
+				"y_straight": 0.0
+			}
+		},
+		{
+			"name": "stage2",
+			"steps": 10000,
+			"lr": 0.0001,
+			"params": ["amp_coarse", "bias_coarse", "mesh_ms", "line_offset"],
+			"default_mul": 1.0,
+			"use_full_dir_unet": false,
+			"w_fac": {
+				"data": 0.0,
+				"grad_data": 0.0,
+				"grad_mag": 1.0,
+				"quad_tri": 0.0,
+				"step": 1.0,
+				"mod_smooth": 0.0,
+				"angle_sym": 10.0,
+				"dir_v": 10.0,
+				"dir_conn": 10.0,
+				"smooth_x": 0.0,
+				"smooth_y": 0.0,
+				"line_smooth_y": 0.1,
+				"y_straight": 1.0
+			}
+		},
+		{
+			"name": "stage3",
+			"steps": 20000,
+			"lr": 0.0001,
+			"params": ["amp_coarse", "bias_coarse", "mesh_ms", "line_offset"],
+			"default_mul": 1.0,
+			"use_full_dir_unet": false,
+			"w_fac": {
+				"data": 0.0,
+				"grad_data": 0.0,
+				"grad_mag": 1.0,
+				"quad_tri": 0.0,
+				"step": 1.0,
+				"mod_smooth": 0.0,
+				"angle_sym": 1.0,
+				"dir_v": 10.0,
+				"dir_conn": 10.0,
+				"smooth_x": 0.0,
+				"smooth_y": 0.0,
+				"line_smooth_y": 0.1,
+				"y_straight": 1.0
+			}
+		},
+		{
+			"name": "stage4",
+			"steps": 5000,
+			"lr": 0.0001,
+			"params": ["theta", "winding_scale", "phase", "amp_coarse", "bias_coarse", "mesh_ms", "line_offset"],
+			"default_mul": null,
+			"w_fac": null
+		}
+	]
+}

@@ -12,7 +12,7 @@ RUN apt-get update \
     build-essential git cmake ninja-build pkg-config \
     qt6-base-dev libboost-system-dev libboost-program-options-dev libceres-dev \
     libopencv-dev libopencv-contrib-dev \
-    libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev libcurl4-openssl-dev nlohmann-json3-dev \
+    libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev libcurl4-openssl-dev nlohmann-json3-dev libavahi-client-dev \
     file curl unzip ca-certificates bzip2 wget fuse jq gimp desktop-file-utils \
  && rm -rf /var/lib/apt/lists/*
 

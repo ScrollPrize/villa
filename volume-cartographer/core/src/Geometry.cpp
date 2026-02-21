@@ -13,7 +13,10 @@
 //somehow opencvs functions are pretty slow
 static cv::Vec3f normed(const cv::Vec3f& v)
 {
-    return v/sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
+    float len = sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
+    if (len < 1e-12f)
+        return {0.f, 0.f, 0.f};
+    return v/len;
 }
 
 static cv::Vec2f vmin(const cv::Vec2f &a, const cv::Vec2f &b)

@@ -1,0 +1,59 @@
+{
+	"args": {
+		"input": "./s5_cos.zarr",
+		"out-dir": "res_corrz",
+		"z-step": 5,
+		"model-input": "res_growz/model_snapshots/model_final_000000.pt",
+		"points" : "2025-02-16_corr_growz.json"
+	},
+	"base": {
+		"dir_v": 10.0,
+		"dir_conn": 1.0,
+		"step": 100.0,
+		"smooth_x": 0.0,
+		"smooth_y": 0.01,
+		"gradmag": 1.0,
+		"mean_pos": 0.0,
+		"meshoff_sy": 0.001,
+		"conn_sy_l": 0.0,
+		"conn_sy_r": 0.0,
+		"angle": 0.001,
+		"y_straight": 0.0,
+		"data": 0.4,
+		"data_plain": 0.2,
+		"data_grad": 0.0,
+		"z_straight": 10.0,
+		"corr_winding": 100.0
+	},
+	"stages": [
+		{
+			"name": "global",
+			"global_opt": {
+				"steps": 1000,
+				"lr": [0.1, 0.01, 0.001],
+				"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
+				"min_scaledown": 0,
+				"w_fac": {
+					"corr_winding": 0.0
+				}
+			},
+			"local_opt": {
+				"steps": 0
+			}
+		},
+		{
+			"name": "corr",
+			"global_opt": {
+				"steps": 5000,
+				"lr": [0.01, 0.001, 0.0001],
+				"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
+				"min_scaledown": 0,
+				"w_fac": {
+				}
+			},
+			"local_opt": {
+				"steps": 0
+			}
+		}
+	]
+}

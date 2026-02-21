@@ -84,3 +84,25 @@ Logs and checkpoints will be written into a timestamped subdirectory of `--log-d
 ```text
 runs/unet/20251124_121207_unet_baseline/
 ```
+
+## Exporting tifxyz (one per winding)
+
+Export a fitted model snapshot (state_dict) into a directory of tifxyz surfaces:
+
+```bash
+python fit2tifxyz.py --input path/to/model_*.pt --output out_tifxyz/
+```
+
+This writes `out_tifxyz/winding_XXXX.tifxyz/` directories containing `x.tif`, `y.tif`, `z.tif`, and `meta.json`.
+
+Notes:
+
+- `x/y` are written in **original pixel units** by multiplying by `--downscale` (default 4.0).
+- `--offset x y z` adds a global translation in original pixel/voxel units (for crop & z-start alignment).
+- `meta.json` contains required `uuid` (dirname) and `type="seg"`.
+
+
+## Exporting PLY (one per winding)
+
+- Written automatically during visualization to: `vis/ply/winding_XXXX/<postfix>.ply`
+- Connected grid mesh along the winding direction for every z slice (no skipping)
