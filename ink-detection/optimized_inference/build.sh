@@ -2,6 +2,13 @@
 
 set -e
 
+if [[ "${AGENTS_AGENT_MODE:-0}" == "1" && "${AGENTS_ALLOW_INSTALL:-0}" != "1" ]]; then
+  echo "INFO: build.sh is disabled by default in agent mode."
+  echo "Set AGENTS_ALLOW_INSTALL=1 to run this script."
+  echo "Example: AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 ./ink-detection/optimized_inference/build.sh"
+  exit 0
+fi
+
 VERSION=$1
 DIR=$(readlink -f $(dirname $0))
 

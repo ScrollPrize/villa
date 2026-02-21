@@ -82,7 +82,11 @@ The `Dockerfile` builds a slim runtime with a prebuilt virtualenv layer.
 ### Build
 
 ```bash
+# Local/manual use (no agent flags required)
 docker build -t ink-detection-optimized-inference .
+
+# Agent mode with explicit opt-in
+AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 docker build -t ink-detection-optimized-inference .
 ```
 
 Notes:

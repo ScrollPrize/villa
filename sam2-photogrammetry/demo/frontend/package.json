@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "preinstall": "[ \"${AGENTS_AGENT_MODE:-0}\" != \"1\" ] || [ \"${AGENTS_ALLOW_INSTALL:-0}\" = \"1\" ] || { echo \"Install is disabled by default in agent mode. Set AGENTS_ALLOW_INSTALL=1 to install dependencies.\"; exit 1; }",
     "dev": "vite",
     "merge-schemas": "tsx schemas/merge-schemas",
     "relay": "yarn merge-schemas && relay-compiler",
