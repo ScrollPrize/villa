@@ -155,7 +155,7 @@ def z_normal_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch
 	if n_terms > 1:
 		lm = lm / float(n_terms)
 
-	return lm, mask
+	return lm * mask, mask
 
 
 def dir_v_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
