@@ -306,7 +306,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 (https://github.com/StewartSethA/VesuviusInkGenerator) by Seth Stewart, ink volume sample patches generated using gradient ascent
 
 - [Ink feature visualization]
-(https://github.com/StewartSethA/ink-seer) by Seth Stewart, ink feature vector clustering and visualization via T-SNE to distinguish ink from non-ink features
+(https://github.com/StewartSethA/ink-seer) by Seth Stewart, ink feature vector clustering and visualization via t-SNE to distinguish ink from non-ink features
 
 - [Scroll 5 Ink Labels](https://github.com/Bodillium/Herculaneum-Scroll-Labels) by Nicola Bodill. Early ink labels for Scroll 5.
 
