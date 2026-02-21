@@ -325,10 +325,16 @@ def central_winding_pie_ema(*, model: fit_model.Model2D, it: int, params: dict) 
 		raise ValueError("model.xy_ema must be (N,Hm,Wm,2)")
 	if xyc.ndim != 5 or int(xyc.shape[-2]) != 3 or int(xyc.shape[-1]) != 2:
 		raise ValueError("model.xy_conn_ema must be (N,Hm,Wm,3,2)")
-	if model.params.crop_xyzwhd is None:
-		raise ValueError("central_winding_pie_ema requires params.crop_xyzwhd")
-	_cx, _cy, cw, ch, _z0, _d = model.params.crop_xyzwhd
-	h_img, w_img = int(ch), int(cw)
+	# Use data dimensions when available (expanded data with margins);
+	# fall back to crop dimensions for backward compat.
+	dh, dw = model.params.data_size_modelpx
+	if dh > 0 and dw > 0:
+		h_img, w_img = int(dh), int(dw)
+	else:
+		if model.params.crop_xyzwhd is None:
+			raise ValueError("central_winding_pie_ema requires params.crop_xyzwhd or data_size_modelpx")
+		_cx, _cy, cw, ch, _z0, _d = model.params.crop_xyzwhd
+		h_img, w_img = int(ch), int(cw)
 	if n == 0:
 		return torch.ones((0, 1, h_img, w_img), device=xy.device, dtype=torch.float32)
 
