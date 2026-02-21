@@ -6,6 +6,18 @@ import torch.nn.functional as F
 import model as fit_model
 
 
+def _encode_dir(gx: torch.Tensor, gy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Encode a 2D direction vector (gx, gy) into the (dir0, dir1) representation."""
+	eps = 1e-8
+	r2 = gx * gx + gy * gy + eps
+	cos2 = (gx * gx - gy * gy) / r2
+	sin2 = 2.0 * gx * gy / r2
+	inv_sqrt2 = 1.0 / (2.0 ** 0.5)
+	d0 = 0.5 + 0.5 * cos2
+	d1 = 0.5 + 0.5 * ((cos2 - sin2) * inv_sqrt2)
+	return d0, d1
+
+
 def _dir_pred_v(*, xy_lr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 	# Vertical mesh edge vector (v-edge), then rotate by +90° to match the
 	# connection-supervised direction convention.
@@ -20,14 +32,7 @@ def _dir_pred_v(*, xy_lr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 		dvy[:, :, -1, :] = dvy[:, :, -2, :]
 	gx = dvy
 	gy = -dvx
-	eps = 1e-8
-	r2 = gx * gx + gy * gy + eps
-	cos2 = (gx * gx - gy * gy) / r2
-	sin2 = (2.0 * gx * gy) / r2
-	inv_sqrt2 = 1.0 / (2.0 ** 0.5)
-	dir0 = 0.5 + 0.5 * cos2
-	dir1 = 0.5 + 0.5 * ((cos2 - sin2) * inv_sqrt2)
-	return dir0, dir1
+	return _encode_dir(gx, gy)
 
 
 def dir_v_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tensor]:
@@ -66,13 +71,7 @@ def dir_conn_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch
 	def _dir_lm(*, x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
 		dx = (x1[..., 0] - x0[..., 0]).unsqueeze(1)
 		dy = (x1[..., 1] - x0[..., 1]).unsqueeze(1)
-		eps = 1e-8
-		r2 = dx * dx + dy * dy + eps
-		cos2 = (dx * dx - dy * dy) / r2
-		sin2 = (2.0 * dx * dy) / r2
-		inv_sqrt2 = 1.0 / (2.0 ** 0.5)
-		dir0 = 0.5 + 0.5 * cos2
-		dir1 = 0.5 + 0.5 * ((cos2 - sin2) * inv_sqrt2)
+		dir0, dir1 = _encode_dir(dx, dy)
 		diff0 = dir0 - unet_dir0_lr
 		diff1 = dir1 - unet_dir1_lr
 		return 0.5 * (diff0 * diff0 + diff1 * diff1)
@@ -80,16 +79,6 @@ def dir_conn_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch
 	lm_conn_l_lr = _dir_lm(x0=left, x1=mid) * mask_conn_l_lr
 	lm_conn_r_lr = _dir_lm(x0=mid, x1=right) * mask_conn_r_lr
 	return lm_conn_l_lr, lm_conn_r_lr, mask_conn_l_lr, mask_conn_r_lr
-def _encode_dir(gx: torch.Tensor, gy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-	"""Encode a 2D direction vector (gx, gy) into the (dir0, dir1) representation."""
-	eps = 1e-8
-	r2 = gx * gx + gy * gy + eps
-	cos2 = (gx * gx - gy * gy) / r2
-	sin2 = 2.0 * gx * gy / r2
-	inv_sqrt2 = 1.0 / (2.0 ** 0.5)
-	d0 = 0.5 + 0.5 * cos2
-	d1 = 0.5 + 0.5 * ((cos2 - sin2) * inv_sqrt2)
-	return d0, d1
 
 
 def z_normal_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch.Tensor]:
@@ -121,8 +110,8 @@ def z_normal_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch
 	dx = dxy[..., 0]  # (N-1, Hm, Wm)
 	dy = dxy[..., 1]  # (N-1, Hm, Wm)
 
-	# dz in model pixel units (consistent with dx/dy)
-	dz = float(res.params.z_step_vx) / max(1e-6, float(res.params.scaledown))
+	# dz in LR model units (same coordinate space as dx/dy from xy_lr)
+	dz = float(res.params.z_step_vx)
 
 	lr_size = xy.shape[1:3]  # (Hm, Wm)
 
