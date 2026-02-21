@@ -242,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
 		dir0_x=data.dir0_x,
 		dir1_x=data.dir1_x,
 		downscale=float(data.downscale),
+		data_margin_xy=data.data_margin_xy,
 		constraints=fit_data.ConstraintsData(
 			points=fit_data.PointConstraintsData(
 				points_xyz_winda=points_all,
@@ -254,6 +255,18 @@ def main(argv: list[str] | None = None) -> int:
 		),
 	)
 	device = data.cos.device
+	_margin_xy = tuple(float(v) for v in data.data_margin_xy)
+	_data_size = tuple(int(v) for v in data.size)  # (h, w) in model pixels
+	# For checkpoint models: translate mesh and update params for expanded data.
+	if mdl is not None:
+		updates = {"data_size_modelpx": _data_size}
+		if _margin_xy[0] != 0.0 or _margin_xy[1] != 0.0:
+			updates["data_margin_modelpx"] = _margin_xy
+			with torch.no_grad():
+				mdl.mesh_ms[-1].data[:, 0, :, :] += _margin_xy[0]
+				mdl.mesh_ms[-1].data[:, 1, :, :] += _margin_xy[1]
+			print(f"[fit] translated checkpoint mesh by margin ({_margin_xy[0]:.1f}, {_margin_xy[1]:.1f})")
+		mdl.params = replace(mdl.params, **updates)
 	if mdl is None:
 		mdl = model.Model2D.from_fit_data(
 			data=data,
@@ -269,6 +282,8 @@ def main(argv: list[str] | None = None) -> int:
 			subsample_mesh=int(subsample_mesh_use),
 			subsample_winding=int(subsample_winding_use),
 			crop_xyzwhd=crop_xyzwhd,
+			data_margin_modelpx=_margin_xy,
+			data_size_modelpx=_data_size,
 		)
 		print("model_init:", mdl.init)
 		print("mesh:", mdl.mesh_h, mdl.mesh_w)

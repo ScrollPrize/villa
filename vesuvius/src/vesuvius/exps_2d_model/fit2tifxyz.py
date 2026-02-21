@@ -194,18 +194,23 @@ def main(argv: list[str] | None = None) -> int:
 		elif isinstance(c6_model, (list, tuple)) and len(c6_model) == 6:
 			c6 = c6_model
 			crop_key = "crop_xyzwhd"
+		# Margin from expanded data: mesh model coords are shifted by margin.
+		# Subtract margin (in full-res) from offset so conversion is correct.
+		margin_modelpx = model_params.get("data_margin_modelpx", (0.0, 0.0))
+		if not isinstance(margin_modelpx, (list, tuple)) or len(margin_modelpx) != 2:
+			margin_modelpx = (0.0, 0.0)
 		if c6 is not None:
 			x0c, y0c, _wc, _hc, z0c, _d = (int(v) for v in c6)
 			if not bool(offset_explicit):
 				if crop_key == "crop_fullres_xyzwhd":
-					base["offset_x"] = float(x0c)
-					base["offset_y"] = float(y0c)
+					base["offset_x"] = float(x0c) - float(margin_modelpx[0]) * float(base["downscale"])
+					base["offset_y"] = float(y0c) - float(margin_modelpx[1]) * float(base["downscale"])
 				else:
 					ds = float(base["downscale"])
 					if ds <= 0.0:
 						ds = 1.0
-					base["offset_x"] = float(x0c) * ds
-					base["offset_y"] = float(y0c) * ds
+					base["offset_x"] = float(x0c) * ds - float(margin_modelpx[0]) * ds
+					base["offset_y"] = float(y0c) * ds - float(margin_modelpx[1]) * ds
 				base["offset_z"] = 0
 			base["z0"] = int(z0c)
 		if "z_step_vx" in model_params:
@@ -216,7 +221,23 @@ def main(argv: list[str] | None = None) -> int:
 	if model_params is not None:
 		c6_full = model_params.get("crop_fullres_xyzwhd", None)
 		c6_model = model_params.get("crop_xyzwhd", None)
-		if isinstance(c6_full, (list, tuple)) and len(c6_full) == 6:
+		# When data has margins, use expanded data bounds for clipping
+		# (the valid channel already handled masking during fit).
+		data_sz = model_params.get("data_size_modelpx", (0, 0))
+		if not isinstance(data_sz, (list, tuple)) or len(data_sz) != 2:
+			data_sz = (0, 0)
+		margin_modelpx = model_params.get("data_margin_modelpx", (0.0, 0.0))
+		if not isinstance(margin_modelpx, (list, tuple)) or len(margin_modelpx) != 2:
+			margin_modelpx = (0.0, 0.0)
+		ds_cb = float(cfg.downscale) if float(cfg.downscale) > 0.0 else 1.0
+		if int(data_sz[0]) > 0 and int(data_sz[1]) > 0:
+			# Use full data extent for crop bounds
+			x0 = float(cfg.offset_x)
+			y0 = float(cfg.offset_y)
+			x1 = x0 + float(max(0, int(data_sz[1]) - 1)) * ds_cb
+			y1 = y0 + float(max(0, int(data_sz[0]) - 1)) * ds_cb
+			crop_bounds_fullres = (x0, y0, x1, y1)
+		elif isinstance(c6_full, (list, tuple)) and len(c6_full) == 6:
 			x0c, y0c, wc, hc, _z0c, _d = (int(v) for v in c6_full)
 			x0 = float(x0c)
 			y0 = float(y0c)
@@ -225,13 +246,10 @@ def main(argv: list[str] | None = None) -> int:
 			crop_bounds_fullres = (x0, y0, x1, y1)
 		elif isinstance(c6_model, (list, tuple)) and len(c6_model) == 6:
 			x0c, y0c, wc, hc, _z0c, _d = (int(v) for v in c6_model)
-			ds = float(cfg.downscale)
-			if ds <= 0.0:
-				ds = 1.0
-			x0 = float(x0c) * ds
-			y0 = float(y0c) * ds
-			x1 = x0 + float(max(0, int(wc) - 1)) * ds
-			y1 = y0 + float(max(0, int(hc) - 1)) * ds
+			x0 = float(x0c) * ds_cb
+			y0 = float(y0c) * ds_cb
+			x1 = x0 + float(max(0, int(wc) - 1)) * ds_cb
+			y1 = y0 + float(max(0, int(hc) - 1)) * ds_cb
 			crop_bounds_fullres = (x0, y0, x1, y1)
 
 	offset_src = "cli --offset" if bool(offset_explicit) else "model crop"

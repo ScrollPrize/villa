@@ -42,12 +42,15 @@ class FitData:
 	dir1_x: torch.Tensor | None = None
 	downscale: float = 1.0
 	constraints: ConstraintsData | None = None
+	# Margin (in model pixels) added around the original crop when reading expanded data.
+	# Used by fit.py to adjust crop_xyzwhd and translate loaded meshes.
+	data_margin_xy: tuple[float, float] = (0.0, 0.0)
 
 	def grid_sample_px(self, *, xy_px: torch.Tensor) -> "FitData":
 		"""Sample using pixel xy positions.
 
-		- `xy_px`: (N,H,W,2) with x in [0,W-1], y in [0,H-1].
-		- Internally converts to normalized coords for `grid_sample`.
+		- `xy_px`: (N,H,W,2) with x in [0,W-1], y in [0,H-1] in model pixel coords.
+		- Model pixel coords = data pixel coords (no offset).
 		"""
 		if xy_px.ndim != 4 or int(xy_px.shape[-1]) != 2:
 			raise ValueError("xy_px must be (N,H,W,2)")
@@ -78,6 +81,7 @@ class FitData:
 			dir1_x=_gs_opt(self.dir1_x),
 			downscale=float(self.downscale),
 			constraints=self.constraints,
+			data_margin_xy=self.data_margin_xy,
 		)
 
 	@property
@@ -197,6 +201,7 @@ def grow_z_from_omezarr_unet(
 				dir1_x=_cat_opt(d_new.dir1_x, data.dir1_x),
 				downscale=float(data.downscale),
 				constraints=data.constraints,
+				data_margin_xy=data.data_margin_xy,
 			),
 			int(unet_z0),
 		)
@@ -213,6 +218,7 @@ def grow_z_from_omezarr_unet(
 			dir1_x=_cat_opt(data.dir1_x, d_new.dir1_x),
 			downscale=float(data.downscale),
 			constraints=data.constraints,
+			data_margin_xy=data.data_margin_xy,
 		),
 		int(unet_z0),
 	)
@@ -288,6 +294,8 @@ def load(
 	dir1_y_t: torch.Tensor | None = None
 	dir0_x_t: torch.Tensor | None = None
 	dir1_x_t: torch.Tensor | None = None
+	margin_x = 0
+	margin_y = 0
 	is_omezarr = (
 		s.endswith(".zarr")
 		or s.endswith(".ome.zarr")
@@ -386,6 +394,8 @@ def load(
 			y0 = 0
 			cw = int(w_all)
 			ch = int(h_all)
+			margin_x = 0
+			margin_y = 0
 			if crop is not None:
 				x0i, y0i, wi, hi = (int(v) for v in crop)
 				ds_i = max(1, int(round(float(ds_meta))))
@@ -393,12 +403,22 @@ def load(
 				y0s = max(0, int(y0i))
 				x1s = max(x0s, int(x0i) + max(0, int(wi)))
 				y1s = max(y0s, int(y0i) + max(0, int(hi)))
-				x0 = int(x0s) // int(ds_i)
-				y0 = int(y0s) // int(ds_i)
-				x1m = _ceil_div(int(x1s), int(ds_i))
-				y1m = _ceil_div(int(y1s), int(ds_i))
-				cw = max(1, min(int(x1m), int(w_all)) - int(x0))
-				ch = max(1, min(int(y1m), int(h_all)) - int(y0))
+				x0_orig = int(x0s) // int(ds_i)
+				y0_orig = int(y0s) // int(ds_i)
+				x1m_orig = _ceil_div(int(x1s), int(ds_i))
+				y1m_orig = _ceil_div(int(y1s), int(ds_i))
+				cw_orig = max(1, min(int(x1m_orig), int(w_all)) - int(x0_orig))
+				ch_orig = max(1, min(int(y1m_orig), int(h_all)) - int(y0_orig))
+				# Expand read area by 1x crop size in each direction (3x total per axis)
+				x0 = max(0, int(x0_orig) - int(cw_orig))
+				y0 = max(0, int(y0_orig) - int(ch_orig))
+				x1m = min(int(w_all), int(x0_orig) + 2 * int(cw_orig))
+				y1m = min(int(h_all), int(y0_orig) + 2 * int(ch_orig))
+				cw = max(1, int(x1m) - int(x0))
+				ch = max(1, int(y1m) - int(y0))
+				# Offset: model pixel (0,0) maps to data pixel (margin_x, margin_y)
+				margin_x = int(x0_orig) - int(x0)
+				margin_y = int(y0_orig) - int(y0)
 			x1 = int(x0) + int(cw)
 			y1 = int(y0) + int(ch)
 
@@ -421,7 +441,8 @@ def load(
 				f"z_idx_loaded={z_idx} "
 				f"z_step_eff_meta={int(z_step_eff_meta)} "
 				f"output_full_scaled={int(output_full_scaled)} "
-				f"crop_xywh=({int(x0)},{int(y0)},{int(cw)},{int(ch)})",
+				f"crop_xywh=({int(x0)},{int(y0)},{int(cw)},{int(ch)}) "
+				f"margin_xy=({int(margin_x)},{int(margin_y)})",
 				flush=True,
 			)
 
@@ -602,4 +623,5 @@ def load(
 		dir1_x=dir1_x_t,
 		downscale=float(downscale) if downscale is not None else 1.0,
 		constraints=None,
+		data_margin_xy=(float(margin_x), float(margin_y)),
 	)

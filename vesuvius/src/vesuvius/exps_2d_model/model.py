@@ -33,6 +33,12 @@ class ModelParams:
 	scaledown: float
 	# 3D crop in full-res voxel/pixel space: (x, y, w, h, z0, d).
 	crop_fullres_xyzwhd: tuple[int, int, int, int, int, int] | None = None
+	# Margin (in model pixels) from expanded data origin to original crop origin.
+	# Used by _build_base_grid to center mesh on the original crop within expanded data.
+	data_margin_modelpx: tuple[float, float] = (0.0, 0.0)
+	# Data size in model pixels (h, w). Used for validity masking and mask scheduling
+	# when data has expanded margins. (0,0) = not set, fall back to crop dims.
+	data_size_modelpx: tuple[int, int] = (0, 0)
 
 	@property
 	def crop_xyzwhd(self) -> tuple[int, int, int, int, int, int] | None:
@@ -59,14 +65,22 @@ def xy_img_validity_mask(*, params: ModelParams, xy: torch.Tensor) -> torch.Tens
 
 	`xy` must encode (x,y) in the last dimension (..,2) in model pixel coords.
 	Output has shape `xy.shape[:-1]`.
+
+	When data_size_modelpx is set (expanded data with margins), uses data extent
+	as the valid region. Otherwise falls back to crop bounds.
 	"""
 	if xy.ndim < 1 or int(xy.shape[-1]) != 2:
 		raise ValueError("xy must have last dim == 2")
-	if params.crop_xyzwhd is None:
-		raise ValueError("xy_img_validity_mask requires params.crop_xyzwhd")
-	_cx, _cy, cw, ch, _z0, _d = params.crop_xyzwhd
-	h = float(max(1, int(ch) - 1))
-	w = float(max(1, int(cw) - 1))
+	dh, dw = params.data_size_modelpx
+	if dh > 0 and dw > 0:
+		h = float(max(1, int(dh) - 1))
+		w = float(max(1, int(dw) - 1))
+	else:
+		if params.crop_xyzwhd is None:
+			raise ValueError("xy_img_validity_mask requires params.crop_xyzwhd or data_size_modelpx")
+		_cx, _cy, cw, ch, _z0, _d = params.crop_xyzwhd
+		h = float(max(1, int(ch) - 1))
+		w = float(max(1, int(cw) - 1))
 	flat = xy.reshape(-1, 2)
 	x = flat[:, 0]
 	y = flat[:, 1]
@@ -243,6 +257,8 @@ class Model2D(nn.Module):
 		z_step_vx: int,
 		scaledown: float,
 		crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
+		data_margin_modelpx: tuple[float, float] | None = None,
+		data_size_modelpx: tuple[int, int] | None = None,
 	) -> None:
 		super().__init__()
 		self.init = init
@@ -260,6 +276,8 @@ class Model2D(nn.Module):
 			z_step_vx=max(1, int(z_step_vx)),
 			scaledown=float(scaledown),
 			crop_fullres_xyzwhd=None if crop_xyzwhd is None else tuple(int(v) for v in crop_xyzwhd),
+			data_margin_modelpx=tuple(float(v) for v in data_margin_modelpx) if data_margin_modelpx is not None else (0.0, 0.0),
+			data_size_modelpx=tuple(int(v) for v in data_size_modelpx) if data_size_modelpx is not None else (0, 0),
 		)
 
 		self.mesh_h = max(2, int(init.mesh_h))
@@ -340,34 +358,35 @@ class Model2D(nn.Module):
 		bias_hr = F.interpolate(bias_lr, size=(h, w), mode="bilinear", align_corners=True)
 		target_mod = bias_hr + amp_hr * (target_plain - 0.5)
 		target_mod = target_mod.clamp(0.0, 1.0)
-		mask_hr = self.xy_img_validity_mask(xy=xy_hr).unsqueeze(1)
-		mask_lr = self.xy_img_validity_mask(xy=xy_lr).unsqueeze(1)
-		mask_conn = self.xy_img_validity_mask(xy=xy_conn).unsqueeze(1)
-		# Incorporate zarr valid channel when available (marks where UNet produced data)
+		# Masking: when valid channel is available (preprocessed zarr with expanded data),
+		# use it directly — model pixel coords = data pixel coords, no offset.
+		# Otherwise fall back to crop-bounds validity mask.
 		if data.valid is not None:
 			def _sample_valid(xy: torch.Tensor) -> torch.Tensor:
-				h_img, w_img = data.size
-				hd = float(max(1, int(h_img) - 1))
-				wd = float(max(1, int(w_img) - 1))
+				h_data, w_data = data.size
+				hd = float(max(1, int(h_data) - 1))
+				wd = float(max(1, int(w_data) - 1))
 				grid = xy.clone()
 				grid[..., 0] = (xy[..., 0] / wd) * 2.0 - 1.0
 				grid[..., 1] = (xy[..., 1] / hd) * 2.0 - 1.0
 				sv = F.grid_sample(data.valid, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
 				return (sv > 0.5).to(dtype=torch.float32)
-			mask_hr = mask_hr * _sample_valid(xy_hr)
-			mask_lr = mask_lr * _sample_valid(xy_lr)
+			mask_hr = _sample_valid(xy_hr)
+			mask_lr = _sample_valid(xy_lr)
 			# xy_conn has extra dim: (N, Hm, Wm, 3, 2) — sample each of the 3 conn points
 			n, hm, wm, _3, _2 = (int(v) for v in xy_conn.shape)
 			conn_flat = xy_conn.reshape(n, hm, wm * 3, 2)
 			valid_conn = _sample_valid(conn_flat).reshape(n, 1, hm, wm, 3)
-			mask_conn = mask_conn * valid_conn
+			mask_conn = valid_conn
+		else:
+			mask_hr = self.xy_img_validity_mask(xy=xy_hr).unsqueeze(1)
+			mask_lr = self.xy_img_validity_mask(xy=xy_lr).unsqueeze(1)
+			mask_conn = self.xy_img_validity_mask(xy=xy_conn).unsqueeze(1)
 		# Edge conn points are synthetic (copied from the nearest column) and should not be used.
 		if mask_conn.shape[3] >= 1:
 			mask_conn[:, :, :, 0, 0] = 0.0
 			mask_conn[:, :, :, -1, 2] = 0.0
-		if self.params.crop_xyzwhd is None:
-			raise ValueError("model.params.crop_xyzwhd must be set")
-		_cx, _cy, cw, ch, _z0, _d = self.params.crop_xyzwhd
+		h_data, w_data = data.size
 		return FitResult(
 			_xy_lr=xy_lr,
 			_xy_hr=xy_hr,
@@ -381,8 +400,8 @@ class Model2D(nn.Module):
 			_mask_hr=mask_hr,
 			_mask_lr=mask_lr,
 			_mask_conn=mask_conn,
-			_h_img=int(ch),
-			_w_img=int(cw),
+			_h_img=int(h_data),
+			_w_img=int(w_data),
 			_params=self.params,
 		)
 
@@ -779,11 +798,21 @@ class Model2D(nn.Module):
 		z_step_vx: int = 1,
 		scaledown: float = 1.0,
 		crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
+		data_margin_modelpx: tuple[float, float] | None = None,
+		data_size_modelpx: tuple[int, int] | None = None,
 		*,
 		subsample_mesh: int = 4,
 		subsample_winding: int = 4,
 	) -> "Model2D":
-		h_img, w_img = data.size
+		# Use crop dimensions (not data.size) for mesh sizing — data may have
+		# expanded margins for valid-mask coverage.
+		if crop_xyzwhd is not None:
+			_cx, _cy, _cw, _ch, _z0, _d = crop_xyzwhd
+			ds = max(1e-6, float(scaledown))
+			h_img = max(1, int(round(float(_ch) / ds)))
+			w_img = max(1, int(round(float(_cw) / ds)))
+		else:
+			h_img, w_img = data.size
 		step_h = int(mesh_step_px)
 		step_w = int(winding_step_px)
 		fh = float(init_size_frac if init_size_frac_h is None else init_size_frac_h)
@@ -810,6 +839,8 @@ class Model2D(nn.Module):
 			z_step_vx=max(1, int(z_step_vx)),
 			scaledown=float(scaledown),
 			crop_xyzwhd=crop_xyzwhd,
+			data_margin_modelpx=data_margin_modelpx,
+			data_size_modelpx=data_size_modelpx,
 		)
 
 	def _build_base_grid(self, *, gh0: int, gw0: int) -> torch.Tensor:
@@ -820,8 +851,10 @@ class Model2D(nn.Module):
 		_cx, _cy, cw, ch, _z0, _d = self.params.crop_xyzwhd
 		w = float(max(1, int(cw) - 1))
 		h = float(max(1, int(ch) - 1))
-		xc = 0.5 * w
-		yc = 0.5 * h
+		# Center mesh on the original crop within (possibly expanded) data.
+		mx, my = self.params.data_margin_modelpx
+		xc = float(mx) + 0.5 * w
+		yc = float(my) + 0.5 * h
 		fh = float(self.init.init_size_frac if self.init.init_size_frac_h is None else self.init.init_size_frac_h)
 		fw = float(self.init.init_size_frac if self.init.init_size_frac_v is None else self.init.init_size_frac_v)
 		u0 = xc - 0.5 * fw * w
