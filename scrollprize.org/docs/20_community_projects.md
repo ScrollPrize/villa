@@ -61,7 +61,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🛠️ Tools
 
-- [vesuvius-c](https://github.com/ScrollPrize/vesuvius-c): C library for accessing Vesuvius Challenge data. Allows direct access to scroll data without managing download scripts or storing terabytes of CT scans locally.
+- [vesuvius-c](https://github.com/ScrollPrize/villa/tree/main/vesuvius-c): C library for accessing Vesuvius Challenge data. Allows direct access to scroll data without managing download scripts or storing terabytes of CT scans locally.
 
 - [vesuvius-gui](https://github.com/jrudolph/vesuvius-gui) is a single binary GUI to render volumes and segments on-the-fly. By Johannes Rudolph
 
