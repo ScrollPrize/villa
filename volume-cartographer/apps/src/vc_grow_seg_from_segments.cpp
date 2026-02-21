@@ -59,8 +59,8 @@ static void add_target_context(json& meta, const std::filesystem::path& volume_p
         }
     }
 
-    if (!scroll_name.empty() && !meta.contains("target_scroll")) {
-        meta["target_scroll"] = scroll_name;
+    if (!scroll_name.empty() && !meta.contains("scroll_source")) {
+        meta["scroll_source"] = scroll_name;
     }
 }
 
