@@ -343,6 +343,24 @@ class Model2D(nn.Module):
 		mask_hr = self.xy_img_validity_mask(xy=xy_hr).unsqueeze(1)
 		mask_lr = self.xy_img_validity_mask(xy=xy_lr).unsqueeze(1)
 		mask_conn = self.xy_img_validity_mask(xy=xy_conn).unsqueeze(1)
+		# Incorporate zarr valid channel when available (marks where UNet produced data)
+		if data.valid is not None:
+			def _sample_valid(xy: torch.Tensor) -> torch.Tensor:
+				h_img, w_img = data.size
+				hd = float(max(1, int(h_img) - 1))
+				wd = float(max(1, int(w_img) - 1))
+				grid = xy.clone()
+				grid[..., 0] = (xy[..., 0] / wd) * 2.0 - 1.0
+				grid[..., 1] = (xy[..., 1] / hd) * 2.0 - 1.0
+				sv = F.grid_sample(data.valid, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+				return (sv > 0.5).to(dtype=torch.float32)
+			mask_hr = mask_hr * _sample_valid(xy_hr)
+			mask_lr = mask_lr * _sample_valid(xy_lr)
+			# xy_conn has extra dim: (N, Hm, Wm, 3, 2) — sample each of the 3 conn points
+			n, hm, wm, _3, _2 = (int(v) for v in xy_conn.shape)
+			conn_flat = xy_conn.reshape(n, hm, wm * 3, 2)
+			valid_conn = _sample_valid(conn_flat).reshape(n, 1, hm, wm, 3)
+			mask_conn = mask_conn * valid_conn
 		# Edge conn points are synthetic (copied from the nearest column) and should not be used.
 		if mask_conn.shape[3] >= 1:
 			mask_conn[:, :, :, 0, 0] = 0.0
