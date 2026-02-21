@@ -107,7 +107,7 @@ def build_trainer(args, wandb_logger):
                     ModelCheckpoint(
                         filename="epoch{epoch}",
                         dirpath=CFG.model_dir,
-                        every_n_epochs=1,
+                        every_n_epochs=int(getattr(CFG, "save_every_n_epochs", 1)),
                         save_top_k=-1,
                     )
                 ]
@@ -124,6 +124,17 @@ def fit(trainer, model, data_state, run_state):
         model=model,
         train_dataloaders=data_state["train_loader"],
         val_dataloaders=data_state["val_loaders"],
+        ckpt_path=run_state["resume_ckpt_path"],
+    )
+    if wandb.run is not None:
+        wandb.finish()
+
+
+def validate(trainer, model, data_state, run_state):
+    log("starting trainer.validate (stitch_only)")
+    trainer.validate(
+        model=model,
+        dataloaders=data_state["val_loaders"],
         ckpt_path=run_state["resume_ckpt_path"],
     )
     if wandb.run is not None:

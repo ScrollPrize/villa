@@ -27,7 +27,10 @@ def main():
     data_state = build_datasets(run_state)
     model = tr.build_model(run_state, data_state, wandb_logger)
     trainer = tr.build_trainer(args, wandb_logger)
-    tr.fit(trainer, model, data_state, run_state)
+    if args.stitch_only:
+        tr.validate(trainer, model, data_state, run_state)
+    else:
+        tr.fit(trainer, model, data_state, run_state)
 
 
 if __name__ == "__main__":
