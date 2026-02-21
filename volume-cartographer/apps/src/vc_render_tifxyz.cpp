@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <sstream>
 #include <algorithm>
+#include <optional>
 #include <atomic>
 #include <boost/program_options.hpp>
 #include <mutex>
@@ -867,6 +868,32 @@ static void renderTiles(
 }
 
 
+static std::optional<double> readVolumeVoxelSize(const std::filesystem::path& volPath)
+{
+    const auto metaPath = volPath / "meta.json";
+    const auto metadataPath = volPath / "metadata.json";
+    try {
+        if (std::filesystem::exists(metaPath)) {
+            auto j = json::parse(std::ifstream(metaPath));
+            if (j.contains("voxelsize") && j["voxelsize"].is_number())
+                return j["voxelsize"].get<double>();
+        }
+        if (std::filesystem::exists(metadataPath)) {
+            auto j = json::parse(std::ifstream(metadataPath));
+            if (j.contains("scan") && j["scan"].is_object()) {
+                const auto& scan = j["scan"];
+                if (scan.contains("voxelsize") && scan["voxelsize"].is_number())
+                    return scan["voxelsize"].get<double>();
+            }
+            if (j.contains("voxelsize") && j["voxelsize"].is_number())
+                return j["voxelsize"].get<double>();
+        }
+    } catch (...) {
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
 // ============================================================
 // main
 // ============================================================
@@ -889,6 +916,8 @@ int main(int argc, char *argv[])
         ("timeout", po::value<int>()->default_value(0), "Kill process if not finished within N minutes")
         ("num-slices,n", po::value<int>()->default_value(1), "Number of slices to render")
         ("slice-step", po::value<float>()->default_value(1.0f), "Spacing between slices along normal")
+        ("voxel-size", po::value<double>(), "Physical voxel size for OME-Zarr scale metadata (optional; default from metadata voxelsize, else 1.0)")
+        ("voxel-unit", po::value<std::string>()->default_value("nanometer"), "Physical unit for OME-Zarr scale metadata (e.g. nanometer, micrometer)")
         ("accum", po::value<float>()->default_value(0.0f), "Accumulation sub-step (0 = disabled)")
         ("accum-type", po::value<std::string>()->default_value("max"), "Reducer: max, mean, median, alpha, beerlambert")
         ("crop-x", po::value<int>()->default_value(0), "Crop X") ("crop-y", po::value<int>()->default_value(0), "Crop Y")
@@ -1050,6 +1079,24 @@ int main(int argc, char *argv[])
 
     const float ds_scale = std::ldexp(1.0f, -group_idx);
     float scale_seg = parsed["scale-segmentation"].as<float>();
+
+    const std::string voxel_unit = parsed["voxel-unit"].as<std::string>();
+    double base_voxel_size = 1.0;
+    if (parsed.count("voxel-size")) {
+        base_voxel_size = parsed["voxel-size"].as<double>();
+        if (!std::isfinite(base_voxel_size) || base_voxel_size <= 0.0) {
+            logPrintf(stderr, "Error: --voxel-size must be positive\n");
+            return EXIT_FAILURE;
+        }
+    } else if (auto metadataVoxelSize = readVolumeVoxelSize(vol_path); metadataVoxelSize.has_value()) {
+        if (std::isfinite(*metadataVoxelSize) && *metadataVoxelSize > 0.0) {
+            base_voxel_size = *metadataVoxelSize;
+        } else {
+            logPrintf(stderr, "Warning: ignoring invalid metadata voxelsize; using default 1.0 %s\n", voxel_unit.c_str());
+        }
+    } else {
+        logPrintf(stdout, "Using default voxel size: 1.0 %s (override with --voxel-size)\n", voxel_unit.c_str());
+    }
     double rotate_angle = parsed["rotate"].as<double>();
     int flip_axis = parsed["flip"].as<int>();
     const bool quickTif = parsed["quick-tif"].as<bool>();
@@ -1262,7 +1309,8 @@ int main(int argc, char *argv[])
                 cv::Size attrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFile, vol_path, group_idx, baseZ, slice_step, accum_step,
-                               accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW);
+                               accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
+                               base_voxel_size * ds_scale, voxel_unit);
                 return;
             } else if (numParts > 1) {
                 if (!std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
@@ -1423,7 +1471,8 @@ int main(int argc, char *argv[])
                 cv::Size attrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFile, vol_path, group_idx, baseZ, slice_step, accum_step,
-                               accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW);
+                               accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
+                               base_voxel_size * ds_scale, voxel_unit);
             }
         }
     };
