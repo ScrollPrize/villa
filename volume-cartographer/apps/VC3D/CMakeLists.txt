@@ -107,6 +107,10 @@ set(srcs
     segmentation/SegmentationUndoHistory.hpp
     NeuralTraceServiceManager.cpp
     NeuralTraceServiceManager.hpp
+    LasagnaServiceManager.cpp
+    LasagnaServiceManager.hpp
+    segmentation/panels/SegmentationLasagnaPanel.cpp
+    segmentation/panels/SegmentationLasagnaPanel.hpp
     ViewerManager.cpp
     ViewerManager.hpp
     SegmentRenderThread.cpp
@@ -139,6 +143,14 @@ target_include_directories(VC3D
         ${CMAKE_SOURCE_DIR}/libs/djikstra3d
 )
 
+# Avahi for mDNS service discovery (Linux only)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(AVAHI IMPORTED_TARGET avahi-client)
+    endif()
+endif()
+
 target_link_libraries(VC3D
     vc_core
     vc_ui
@@ -147,7 +159,9 @@ target_link_libraries(VC3D
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
+    Qt6::Network
     opencv_ximgproc
+    $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
 )
 
 if (${VC_INSTALL_APPS})

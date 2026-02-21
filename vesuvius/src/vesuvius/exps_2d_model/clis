@@ -52,3 +52,83 @@ python batch_fit_cosine_grid.py \
 excellent!
 time python fit_cosine_grid.py --image ../data/kaggle_dataset/images/sample_00001.tif --layer 0 --output-prefix res/res --grid-step 2 --device cuda --snapshot 1000 --lr 0.001 --steps 5000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 1 --unet-checkpoint snapshots/20251129_161224_test_newgrad_lr1e-3/unet_current.pt
 
+#cont with two dir outputs
+python train_unet.py --images-dir ../../../../../data/kaggle_dataset/images/ --labels-dir ../../../../../data/kaggle_dataset/labels/ --log-dir ../../../../../exps_2d/logs/ --run-name test_newgrad_lr1e-3 --batch-size 32 --lr 1e-3 --epochs 100 --weights ../../../../../exps_2d/snapshots/20251129_161224_test_newgrad_lr1e-3/unet_2025-11-29.pt
+
+#build ext
+python setup.py build_ext --inplace
+
+#new inference
+time python /home/hendrik/business/aiconsulting/vesuviuschallenge/villa/vesuvius/src/vesuvius/exps_2d_model/tiled_infer.py --image s5_6000.tif --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --out-dir res2/ --tile-size 320 --overlap 128 --border 32
+
+
+#fit large in vesuviuschallenge/data/model2d_fullsize_exps
+time python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit_cosine_grid.py --input res2 --layer 0 --output-prefix res_fit/res --grid-step 2 --device cuda --snapshot 1000 --lr 0.001 --steps 20000 --lambda-mono 0 --dbg --steps-stage1 1000 --samples-per-period 1 --crop 4000 4000 2000 1000 --steps-stage2 5000
+
+
+time python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit_cosine_grid.py --input res2 --layer 0 --output-prefix res_fit/res --grid-step 2 --device cuda --snapshot 1000 --lr 0.001 --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/default_stages.json --samples-per-period 1 --crop 2000 2500 1600 1600 --dbg
+
+python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --device cuda --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/default_stages.json
+
+python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --device cuda --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/stages_scalespace.json
+
+python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --device cuda --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/stages_scalespace.json
+
+python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --device cuda --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/direct_scalespace.json
+(at c0c464276b2b37192874d105d04ed8e5582cf48c)
+
+python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --init-size-frac 0.1 --device cuda --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/direct_scalespace.json
+
+
+[hendrik@staticsheep model2d_fullsize_exps]$ rm -rf res_fit2/* && python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --device cuda --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/direct_scalespace_grow.json --init-size-frac 0.15
+
+[hendrik@staticsheep model2d_fullsize_exps]$ rm -rf res_fit2/* && time python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --device cuda --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/stages_scalespace.json --init-size-frac 0.15 --init-size-frac-h 2.0
+
+
+rm -rf res_fit2/*/* && time python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input /home/hendrik/remote/turbosheep/home/hendrik/business/aiconsulting/vesuviuschallenge/data/s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --device cuda --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/stages_scalespace.json --init-size-frac 0.15 --init-size-frac-h 2.0
+
+# grow from scratch
+rm -rf res_fit2/*/* && time python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --crop 2000 2500 1600 1600 --input /home/hendrik/remote/turbosheep/home/hendrik/business/aiconsulting/vesuviuschallenge/data/s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/  --out-dir res_fit2  --mesh-step 10 --winding-step 10 --device cuda --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/stages_scalespace.json --init-size-frac 0.15 --init-size-frac-h 2.0 --unet-z 6000
+
+# grow in z after snapping
+rm -rf res_growz/*/* && time python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --crop 2000 2500 1600 1600 --input /home/hendrik/remote/turbosheep/home/hendrik/business/aiconsulting/vesuviuschallenge/data/s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/  --out-dir res_growz  --mesh-step 10 --winding-step 10 --device cuda --init-size-frac 0.15 --init-size-frac-h 2.0 --stages-json ../../villa/vesuvius/src/vesuvius/exps_2d_model/grow_z_first.json --unet-z 6000 --model-input res_fit2_nice/model_snapshots/model_stage0_010000.pt
+
+source env.sh
+
+ffmpeg -framerate 10 -pattern_type glob -i 'res_growz/grids/res_grid_stage0_grow00*.jpg' -vf "crop=in_w/2:in_h/2:in_w/4:in_h/4" -c:v libx264 -pix_fmt yuv420p direct_fit.mkv
+
+# retry global init stages - this works!
+python ../../villa/vesuvius/src/vesuvius/exps_2d_model/fit.py --crop 2000 2500 1600 1600 --input res2/  --out-dir res_fit3  --mesh-step 10 --winding-step 10 --device cuda ../../villa/vesuvius/src/vesuvius/exps_2d_model/stages_scalespace.json --init-size-frac 0.15 --init-size-frac-h 2.0 --mesh-step 10 --winding-step 10
+
+# snapping
+
+
+# try local exp to get robust params for final scale from scratch
+time python $SRC/fit.py $SRC/direct_robust.json $SRC/grow_z_args.json
+
+# current very nice edb29bf40aab3140535bf90d3bf4c690668086f7
+time python $SRC/fit.py $SRC/direct_robust_exp.json $SRC/direct_fit_args.json
+# then
+time python $SRC/fit.py $SRC/grow_z_stages.json $SRC/grow_z_args.json
+
+#vis
+ffmpeg -framerate 10 -pattern_type glob -i 'res_growz2/grids/res_grid_stage0_grow*500.jpg' -vf "crop=in_w/2:in_h/2:in_w/4:in_h/4" -c:v libx264 -pix_fmt yuv420p grow_direct_tuned.mkv
+
+python $SRC/fit2tifxyz.py --input log/res_growz3/model_snapshots/model_final_000000.pt --output surfs/ --offset 2000 2500 6000
+
+#preproc cos volume
+python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/ --output s5_cos.zarr  --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --crop 2000 2500 6000 1600 1600 1000
+
+[hendrik@turbosheep volumes]$ sshfs staticsheep:/home/hendrik/business/aiconsulting/vesuviuschallenge/data/model2d_fullsize_exps/vis_fit_cos.ome.zarr vis_fit_cos.ome.zarr
+sshfs: bad mount point `vis_fit_cos.ome.zarr': No such file or directory
+[hendrik@turbosheep volumes]$ mkdir vis_fit_cos.ome.zarr
+[hendrik@turbosheep volumes]$ sshfs staticsheep:/home/hendrik/business/aiconsulting/vesuviuschallenge/data/model2d_fullsize_exps/vis_fit_cos.ome.zarr vis_fit_cos.ome.zarr
+[hendrik@turbosheep volumes]$
+
+[hendrik@staticsheep model2d_fullsize_exps]$ python $SRC/convert_fit_zarr_to_vc3d_omezarr.py --level 5 --input s5_cos.zarr/ --output vis_fit
+
+hendrik@staticsheep model2d_fullsize_exps]$ python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/ --output s5_cos.zarr  --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --crop 1500 2000 6000 3000 3000 4000 --z-step 5
+
+python $SRC/fit2tifxyz.py --input res_growz/model_snapshots/model_final_000000.pt --prefix edit_ --single-segment --copy-model --output ../s5/PHerc172.volpkg/paths/
+
+[hendrik@staticsheep volumes_lasagna]$ python /home/hendrik/remote/turbosheep/home/hendrik/business/aiconsulting/vesuviuschallenge/villa/vesuvius/src/vesuvius/exps_2d_model/fit_service.py --host 0.0.0.0 --port 9999 --data-dir ./

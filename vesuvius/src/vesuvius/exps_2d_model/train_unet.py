@@ -426,13 +426,16 @@ def erode_mask(
  
 def compute_frac_mag_dir(
     frac_norm: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Derive gradient magnitude & direction from a fractional-position tensor
-    frac_norm of shape (N,1,H,W).
+    Derive gradient magnitude & two direction encodings from a fractional-position
+    tensor frac_norm of shape (N,1,H,W).
  
-    Direction is encoded as 0.5 + 0.5 * cos(2*theta) where theta is the gradient
-    direction, matching the supervision used for the direction branch.
+    Directions are encoded as:
+      - dir0: 0.5 + 0.5 * cos(2*theta)
+      - dir1: 0.5 + 0.5 * cos(2*theta + pi/4)
+    where theta is the gradient direction. This provides an additional shifted
+    encoding to reduce directional ambiguities.
  
     A small blur is applied before finite differencing to reduce noise and
     aliasing in the gradient estimates.
@@ -448,12 +451,24 @@ def compute_frac_mag_dir(
     eps = 1e-8
     mag = torch.sqrt(gx * gx + gy * gy + eps)
  
-    # Gradient direction ground truth encoded as cos(2*theta).
-    # Use identity cos(2*theta) = (gx^2 - gy^2) / (gx^2 + gy^2).
+    # Gradient direction encodings derived from gx,gy.
+    # cos(2*theta) = (gx^2 - gy^2) / (gx^2 + gy^2)
+    # sin(2*theta) = 2*gx*gy / (gx^2 + gy^2)
     r2 = gx * gx + gy * gy + eps
     cos2theta = (gx * gx - gy * gy) / r2
-    dir_enc = 0.5 + 0.5 * cos2theta
-    return mag, dir_enc
+    sin2theta = (2.0 * gx * gy) / r2
+ 
+    # Primary encoding: 0.5 + 0.5*cos(2*theta).
+    dir0_enc = 0.5 + 0.5 * cos2theta
+ 
+    # Secondary encoding shifted by 45 degrees:
+    # cos(2*theta + pi/4) = cos(2*theta)*cos(pi/4) - sin(2*theta)*sin(pi/4)
+    #                     = (cos(2*theta) - sin(2*theta)) / sqrt(2)
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+    cos2theta_shift = (cos2theta - sin2theta) * inv_sqrt2
+    dir1_enc = 0.5 + 0.5 * cos2theta_shift
+ 
+    return mag, dir0_enc, dir1_enc
  
  
 def compute_frac_grad_mag(frac_norm: torch.Tensor) -> torch.Tensor:
@@ -461,7 +476,7 @@ def compute_frac_grad_mag(frac_norm: torch.Tensor) -> torch.Tensor:
     Backwards-compatible helper returning only gradient magnitude, implemented
     via compute_frac_mag_dir to avoid duplicating finite-difference logic.
     """
-    mag, _ = compute_frac_mag_dir(frac_norm)
+    mag, _dir0, _dir1 = compute_frac_mag_dir(frac_norm)
     return mag
 
 
@@ -483,16 +498,21 @@ def compute_geom_losses(
     Total loss is a weighted sum of three terms:
     - w_cos * cos_loss  : multi-scale (scale-space) MSE on the cosine branch (channel 0).
     - w_mag * loss_mag  : multi-scale MSE on gradient magnitude branch (channel 1).
-    - w_dir * loss_dir  : multi-scale MSE on gradient direction branch (channel 2,
-                          encoded via cos(2*theta)).
+    - w_dir * loss_dir  : multi-scale MSE on *two* gradient direction branches
+                          (channels 2 & 3), encoded via
+                              0.5 + 0.5*cos(2*theta)
+                          and
+                              0.5 + 0.5*cos(2*theta + pi/4),
+                          combined as the average of their individual losses.
     """
-    if pred.ndim != 4 or pred.size(1) < 3:
-        raise ValueError(f"Expected pred shape (N,3,H,W) or more channels, got {tuple(pred.shape)}")
+    if pred.ndim != 4 or pred.size(1) < 4:
+        raise ValueError(f"Expected pred shape (N,4,H,W) or more channels, got {tuple(pred.shape)}")
  
     # Split prediction into branches.
     cos_pred = pred[:, 0:1]
     mag_pred = pred[:, 1:2]
-    dir_pred = pred[:, 2:3]
+    dir0_pred = pred[:, 2:3]
+    dir1_pred = pred[:, 3:4]
  
     # Cosine loss: use multi-scale MSE with the same validity mask used for frac.
     loss_cos = cos_scale_loss(cos_pred, cos_gt, mask=frac_mask)
@@ -504,7 +524,7 @@ def compute_geom_losses(
     m_eroded = erode_mask(m_full)
  
     # Magnitude & direction ground truth from shared helper (no masking on input).
-    mag_gt, dir_gt = compute_frac_mag_dir(frac_norm)
+    mag_gt, dir0_gt, dir1_gt = compute_frac_mag_dir(frac_norm)
  
     # Validity for gradients: both neighbors must be valid inside the eroded mask.
     m = m_eroded > 0.5
@@ -537,18 +557,22 @@ def compute_geom_losses(
                 continue
             cc_mask = cc_mask_hw.unsqueeze(1).float()  # (N,1,H,W)
  
-            # Multi-scale MSE on magnitude and direction branches.
+            # Multi-scale MSE on magnitude and both direction branches.
             loss_mag_k = geom_scale_loss(mag_pred, mag_gt, mask=cc_mask)
-            loss_dir_k = geom_scale_loss(dir_pred, dir_gt, mask=cc_mask)
+            loss_dir0_k = geom_scale_loss(dir0_pred, dir0_gt, mask=cc_mask)
+            loss_dir1_k = geom_scale_loss(dir1_pred, dir1_gt, mask=cc_mask)
             loss_mag = loss_mag + loss_mag_k
-            loss_dir = loss_dir + loss_dir_k
+            # Average the two directional encodings for the combined direction loss.
+            loss_dir = loss_dir + 0.5 * (loss_dir0_k + loss_dir1_k)
     else:
         # Fallback: no outer CCs; use global mask if there are any valid gradient pixels.
         valid_mask = valid_mask_hw
         if valid_mask.any():
             cc_mask = valid_mask.unsqueeze(1).float()
             loss_mag = geom_scale_loss(mag_pred, mag_gt, mask=cc_mask)
-            loss_dir = geom_scale_loss(dir_pred, dir_gt, mask=cc_mask)
+            loss_dir0 = geom_scale_loss(dir0_pred, dir0_gt, mask=cc_mask)
+            loss_dir1 = geom_scale_loss(dir1_pred, dir1_gt, mask=cc_mask)
+            loss_dir = 0.5 * (loss_dir0 + loss_dir1)
         else:
             loss_mag = torch.zeros((), device=device, dtype=dtype)
             loss_dir = torch.zeros((), device=device, dtype=dtype)
@@ -637,7 +661,7 @@ def train(
         device=device,
         weights=weights,
         in_channels=1,
-        out_channels=3,
+        out_channels=4,
         base_channels=32,
         num_levels=6,
         max_channels=1024,
@@ -669,8 +693,11 @@ def train(
     train_vis_frac_gt: Optional[torch.Tensor] = None       # underlying frac field for vis
     train_vis_frac_mag_gt: Optional[torch.Tensor] = None   # gradient magnitude GT for vis
     train_vis_frac_mag_pred: Optional[torch.Tensor] = None # gradient magnitude prediction for vis
-    train_vis_dir_gt: Optional[torch.Tensor] = None        # gradient direction GT for vis
-    train_vis_dir_pred: Optional[torch.Tensor] = None      # gradient direction prediction for vis
+    # Gradient direction GT/pred for both encodings dir0 & dir1.
+    train_vis_dir0_gt: Optional[torch.Tensor] = None
+    train_vis_dir0_pred: Optional[torch.Tensor] = None
+    train_vis_dir1_gt: Optional[torch.Tensor] = None
+    train_vis_dir1_pred: Optional[torch.Tensor] = None
     train_vis_outer_idx: Optional[torch.Tensor] = None
     test_gt_logged = False
 
@@ -732,11 +759,14 @@ def train(
         vis_images: List[torch.Tensor] = []
         vis_cos_pred: List[torch.Tensor] = []
         vis_cos_gt: List[torch.Tensor] = []
-        vis_frac: List[torch.Tensor] = []            # underlying frac field
-        vis_frac_mag_pred: List[torch.Tensor] = []   # magnitude predictions
-        vis_frac_mag_gt: List[torch.Tensor] = []     # magnitude GT
-        vis_dir_pred: List[torch.Tensor] = []        # direction predictions
-        vis_dir_gt: List[torch.Tensor] = []          # direction GT
+        vis_frac: List[torch.Tensor] = []              # underlying frac field
+        vis_frac_mag_pred: List[torch.Tensor] = []     # magnitude predictions
+        vis_frac_mag_gt: List[torch.Tensor] = []       # magnitude GT
+        # Direction predictions/GT for both encodings.
+        vis_dir0_pred: List[torch.Tensor] = []         # dir0 predictions
+        vis_dir0_gt: List[torch.Tensor] = []           # dir0 GT
+        vis_dir1_pred: List[torch.Tensor] = []         # dir1 predictions
+        vis_dir1_gt: List[torch.Tensor] = []           # dir1 GT
         vis_outer_idx: List[torch.Tensor] = []
  
         with torch.no_grad():
@@ -753,7 +783,8 @@ def train(
                 pred = model(images)
                 cos_pred = pred[:, 0:1]
                 mag_pred = pred[:, 1:2]
-                dir_pred = pred[:, 2:3]
+                dir0_pred = pred[:, 2:3]
+                dir1_pred = pred[:, 3:4]
  
                 cos_gt, frac_norm, frac_mask = compute_geom_targets(
                     frac_pos_batch,
@@ -762,7 +793,7 @@ def train(
                 )
                 frac_mask_eroded = erode_mask(frac_mask)
                 # Compute GT gradients on raw frac_norm; apply masking only in losses/vis.
-                mag_gt_vis, dir_gt_vis = compute_frac_mag_dir(frac_norm)
+                mag_gt_vis, dir0_gt_vis, dir1_gt_vis = compute_frac_mag_dir(frac_norm)
  
                 loss, loss_cos, loss_frac_mag, loss_frac_dir = compute_geom_losses(
                     pred,
@@ -785,8 +816,10 @@ def train(
                     # Mask gradient vis by the eroded frac mask so edges at the masked boundary disappear.
                     mag_pred_masked = mag_pred * frac_mask_eroded
                     mag_gt_vis_masked = mag_gt_vis * frac_mask_eroded
-                    dir_pred_masked = dir_pred * frac_mask_eroded
-                    dir_gt_vis_masked = dir_gt_vis * frac_mask_eroded
+                    dir0_pred_masked = dir0_pred * frac_mask_eroded
+                    dir0_gt_vis_masked = dir0_gt_vis * frac_mask_eroded
+                    dir1_pred_masked = dir1_pred * frac_mask_eroded
+                    dir1_gt_vis_masked = dir1_gt_vis * frac_mask_eroded
                     frac_vis_masked = frac_norm * frac_mask_eroded
  
                     vis_images.append(images.cpu())
@@ -795,8 +828,10 @@ def train(
                     vis_frac.append(frac_vis_masked.cpu())
                     vis_frac_mag_pred.append(mag_pred_masked.cpu())
                     vis_frac_mag_gt.append(mag_gt_vis_masked.cpu())
-                    vis_dir_pred.append(dir_pred_masked.cpu())
-                    vis_dir_gt.append(dir_gt_vis_masked.cpu())
+                    vis_dir0_pred.append(dir0_pred_masked.cpu())
+                    vis_dir0_gt.append(dir0_gt_vis_masked.cpu())
+                    vis_dir1_pred.append(dir1_pred_masked.cpu())
+                    vis_dir1_gt.append(dir1_gt_vis_masked.cpu())
                     vis_outer_idx.append(outer_cc_idx_batch.cpu())
  
         if test_losses:
@@ -816,16 +851,21 @@ def train(
             frac_grid = torch.cat(vis_frac, dim=0)
             frac_mag_pred_grid = torch.cat(vis_frac_mag_pred, dim=0)
             frac_mag_gt_grid = torch.cat(vis_frac_mag_gt, dim=0)
-            dir_pred_grid = torch.cat(vis_dir_pred, dim=0)
-            dir_gt_grid = torch.cat(vis_dir_gt, dim=0)
+            dir0_pred_grid = torch.cat(vis_dir0_pred, dim=0)
+            dir0_gt_grid = torch.cat(vis_dir0_gt, dim=0)
+            dir1_pred_grid = torch.cat(vis_dir1_pred, dim=0)
+            dir1_gt_grid = torch.cat(vis_dir1_gt, dim=0)
             outer_idx_grid = torch.cat(vis_outer_idx, dim=0).unsqueeze(1).float()
  
             frac_grid_disp = _normalize_for_display(frac_grid)
             frac_mag_pred_grid_disp, frac_mag_gt_grid_disp = _normalize_frac_pair_for_display(
                 frac_mag_pred_grid, frac_mag_gt_grid
             )
-            dir_pred_grid_disp, dir_gt_grid_disp = _normalize_frac_pair_for_display(
-                dir_pred_grid, dir_gt_grid
+            dir0_pred_grid_disp, dir0_gt_grid_disp = _normalize_frac_pair_for_display(
+                dir0_pred_grid, dir0_gt_grid
+            )
+            dir1_pred_grid_disp, dir1_gt_grid_disp = _normalize_frac_pair_for_display(
+                dir1_pred_grid, dir1_gt_grid
             )
             outer_idx_disp = _normalize_for_display(outer_idx_grid)
  
@@ -835,8 +875,10 @@ def train(
             writer.add_images("test/frac", frac_grid_disp, global_step)
             writer.add_images("test/frac_mag_pred", frac_mag_pred_grid_disp, global_step)
             writer.add_images("test/frac_mag_gt", frac_mag_gt_grid_disp, global_step)
-            writer.add_images("test/frac_dir_pred", dir_pred_grid_disp, global_step)
-            writer.add_images("test/frac_dir_gt", dir_gt_grid_disp, global_step)
+            writer.add_images("test/frac_dir0_pred", dir0_pred_grid_disp, global_step)
+            writer.add_images("test/frac_dir0_gt", dir0_gt_grid_disp, global_step)
+            writer.add_images("test/frac_dir1_pred", dir1_pred_grid_disp, global_step)
+            writer.add_images("test/frac_dir1_gt", dir1_gt_grid_disp, global_step)
             writer.add_images("test/outer_idx", outer_idx_disp, global_step)
             if not test_gt_logged:
                 test_gt_logged = True
@@ -870,13 +912,24 @@ def train(
                         )
                         writer.add_images("train/frac_mag_gt", frac_gt_train_disp, global_step)
                         writer.add_images("train/frac_mag_pred", frac_pred_train_disp, global_step)
-                    if train_vis_dir_gt is not None and train_vis_dir_pred is not None:
-                        dir_pred_train_disp, dir_gt_train_disp = _normalize_frac_pair_for_display(
-                            train_vis_dir_pred[:n],
-                            train_vis_dir_gt[:n],
+                    if (
+                        train_vis_dir0_gt is not None
+                        and train_vis_dir0_pred is not None
+                        and train_vis_dir1_gt is not None
+                        and train_vis_dir1_pred is not None
+                    ):
+                        dir0_pred_train_disp, dir0_gt_train_disp = _normalize_frac_pair_for_display(
+                            train_vis_dir0_pred[:n],
+                            train_vis_dir0_gt[:n],
                         )
-                        writer.add_images("train/frac_dir_gt", dir_gt_train_disp, global_step)
-                        writer.add_images("train/frac_dir_pred", dir_pred_train_disp, global_step)
+                        dir1_pred_train_disp, dir1_gt_train_disp = _normalize_frac_pair_for_display(
+                            train_vis_dir1_pred[:n],
+                            train_vis_dir1_gt[:n],
+                        )
+                        writer.add_images("train/frac_dir0_gt", dir0_gt_train_disp, global_step)
+                        writer.add_images("train/frac_dir0_pred", dir0_pred_train_disp, global_step)
+                        writer.add_images("train/frac_dir1_gt", dir1_gt_train_disp, global_step)
+                        writer.add_images("train/frac_dir1_pred", dir1_pred_train_disp, global_step)
                     if train_vis_outer_idx is not None:
                         outer_idx_train = train_vis_outer_idx[:n].unsqueeze(1).float()
                         outer_idx_train_disp = _normalize_for_display(outer_idx_train)
@@ -975,12 +1028,13 @@ def train(
             )
             frac_mask_eroded = erode_mask(frac_mask)
             # Compute GT gradients on raw frac_norm; apply masking only in losses/vis.
-            mag_gt_vis, dir_gt_vis = compute_frac_mag_dir(frac_norm)
+            mag_gt_vis, dir0_gt_vis, dir1_gt_vis = compute_frac_mag_dir(frac_norm)
  
             pred = model(images)
             cos_pred = pred[:, 0:1]
             mag_pred = pred[:, 1:2]
-            dir_pred = pred[:, 2:3]
+            dir0_pred = pred[:, 2:3]
+            dir1_pred = pred[:, 3:4]
  
             loss, loss_cos, loss_frac_mag, loss_frac_dir = compute_geom_losses(
                 pred,
@@ -1032,9 +1086,11 @@ def train(
                     frac_gt_vis_masked = frac_norm[:n_vis] * frac_mask_vis
                     mag_gt_vis_masked = mag_gt_vis[:n_vis] * frac_mask_vis
                     mag_pred_masked = mag_pred[:n_vis] * frac_mask_vis
-                    dir_gt_vis_masked = dir_gt_vis[:n_vis] * frac_mask_vis
-                    dir_pred_masked = dir_pred[:n_vis] * frac_mask_vis
- 
+                    dir0_gt_vis_masked = dir0_gt_vis[:n_vis] * frac_mask_vis
+                    dir0_pred_masked = dir0_pred[:n_vis] * frac_mask_vis
+                    dir1_gt_vis_masked = dir1_gt_vis[:n_vis] * frac_mask_vis
+                    dir1_pred_masked = dir1_pred[:n_vis] * frac_mask_vis
+    
                     train_vis_images_raw = raw_images[:n_vis].detach().cpu()
                     train_vis_images = images[:n_vis].detach().cpu()
                     train_vis_preds = cos_pred[:n_vis].detach().cpu()
@@ -1044,8 +1100,10 @@ def train(
                     train_vis_frac_gt = frac_gt_vis_masked.detach().cpu()
                     train_vis_frac_mag_gt = mag_gt_vis_masked.detach().cpu()
                     train_vis_frac_mag_pred = mag_pred_masked.detach().cpu()
-                    train_vis_dir_gt = dir_gt_vis_masked.detach().cpu()
-                    train_vis_dir_pred = dir_pred_masked.detach().cpu()
+                    train_vis_dir0_gt = dir0_gt_vis_masked.detach().cpu()
+                    train_vis_dir0_pred = dir0_pred_masked.detach().cpu()
+                    train_vis_dir1_gt = dir1_gt_vis_masked.detach().cpu()
+                    train_vis_dir1_pred = dir1_pred_masked.detach().cpu()
                     train_vis_outer_idx = outer_cc_idx_batch[:n_vis].detach().cpu()
                     train_vis_ids = list(sample_ids[:n_vis])
                 evaluate_and_visualize(global_step)
