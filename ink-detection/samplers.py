@@ -14,6 +14,7 @@ class GroupStratifiedBatchSampler(Sampler[List[int]]):
         batch_size: int,
         seed: int = 0,
         drop_last: bool = True,
+        epoch_size_mode: str = "dataset",
     ):
         self.batch_size = int(batch_size)
         if self.batch_size <= 0:
@@ -21,6 +22,12 @@ class GroupStratifiedBatchSampler(Sampler[List[int]]):
 
         self.drop_last = bool(drop_last)
         self._rng = random.Random(int(seed))
+        self.epoch_size_mode = str(epoch_size_mode).strip().lower()
+        if self.epoch_size_mode not in {"dataset", "min_group"}:
+            raise ValueError(
+                "epoch_size_mode must be 'dataset' or 'min_group', "
+                f"got {epoch_size_mode!r}"
+            )
 
         group_indices_list = [int(x) for x in group_indices]
         if not group_indices_list:
@@ -49,11 +56,20 @@ class GroupStratifiedBatchSampler(Sampler[List[int]]):
             raise ValueError(f"Some groups have 0 samples: {sorted(empty_groups)}")
 
         self._indices_by_group = indices_by_group
-        self._epoch_batches = (
-            len(group_indices_list) // self.batch_size
-            if self.drop_last
-            else int(math.ceil(len(group_indices_list) / self.batch_size))
-        )
+        self._min_group_size = min(len(v) for v in self._indices_by_group.values())
+        if self.epoch_size_mode == "dataset":
+            self._epoch_batches = (
+                len(group_indices_list) // self.batch_size
+                if self.drop_last
+                else int(math.ceil(len(group_indices_list) / self.batch_size))
+            )
+        else:
+            self._epoch_batches = (
+                self._min_group_size // self.per_group
+                if self.drop_last
+                else int(math.ceil(self._min_group_size / self.per_group))
+            )
+            self._epoch_batches = max(1, int(self._epoch_batches))
 
     def __len__(self) -> int:
         return int(self._epoch_batches)
@@ -86,4 +102,3 @@ class GroupStratifiedBatchSampler(Sampler[List[int]]):
             # mix groups within the batch
             self._rng.shuffle(batch)
             yield batch
-

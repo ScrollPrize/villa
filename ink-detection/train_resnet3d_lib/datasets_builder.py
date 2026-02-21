@@ -1,4 +1,8 @@
+import hashlib
+import json
 import math
+import os
+import os.path as osp
 import time
 
 import numpy as np
@@ -29,9 +33,28 @@ from train_resnet3d_lib.data_ops import (
     _build_mask_store_and_patch_index,
     _mask_border,
     _downsample_bool_mask_any,
-    _mask_bbox_downsample,
+    _mask_component_bboxes_downsample,
     _mask_store_shape,
 )
+
+_PATCH_INDEX_CACHE_SCHEMA_VERSION = 1
+_PATCH_INDEX_CACHE_REQUIRED_META_KEYS = {
+    "schema_version",
+    "fragment_id",
+    "split",
+    "filter_empty_tile",
+    "size",
+    "tile_size",
+    "stride",
+    "label_suffix",
+    "mask_suffix",
+    "mask_shape",
+    "mask_store_mode",
+}
+_PATCH_INDEX_CACHE_HASH_META_KEYS = {
+    "label_sha256",
+    "fragment_mask_sha256",
+}
 
 
 def _segment_meta(segments_metadata, fragment_id):
@@ -69,6 +92,586 @@ def _segment_reverse_layers(seg_meta, fragment_id):
             f"segments[{fragment_id!r}].reverse_layers must be boolean, got {type(reverse_layers).__name__}"
         )
     return reverse_layers
+
+
+def _require_2d_array(value, *, context):
+    arr = np.asarray(value)
+    if arr.ndim != 2:
+        raise ValueError(f"{context}: expected 2D array, got shape={tuple(arr.shape)}")
+    return arr
+
+
+def _label_mask_uint8(mask, *, context):
+    mask_arr = _require_2d_array(mask, context=context)
+    if mask_arr.dtype == np.uint8:
+        return mask_arr
+    if np.issubdtype(mask_arr.dtype, np.integer) or np.issubdtype(mask_arr.dtype, np.floating):
+        return np.clip(mask_arr, 0, 255).astype(np.uint8, copy=False)
+    raise TypeError(f"{context}: expected integer/float label mask dtype, got {mask_arr.dtype}")
+
+
+def _sha256_array(arr, *, context):
+    arr_2d = _require_2d_array(arr, context=context)
+    arr_c = np.ascontiguousarray(arr_2d)
+    hasher = hashlib.sha256()
+    hasher.update(np.asarray(arr_c.shape, dtype=np.int64).tobytes())
+    hasher.update(str(arr_c.dtype).encode("utf-8"))
+    hasher.update(arr_c.tobytes(order="C"))
+    return hasher.hexdigest()
+
+
+def _cache_segment_slug(segment_id, *, max_len=80):
+    raw = str(segment_id)
+    normalized = "".join(ch if (ch.isalnum() or ch in {"-", "_", "."}) else "_" for ch in raw)
+    normalized = normalized.strip("._-")
+    if not normalized:
+        normalized = "segment"
+    return normalized[:max_len]
+
+
+def _resolve_patch_index_cache_dir():
+    cache_dir_value = getattr(CFG, "dataset_cache_dir", "./dataset_cache/train_resnet3d_patch_index")
+    if not isinstance(cache_dir_value, str):
+        raise TypeError(f"CFG.dataset_cache_dir must be a string, got {type(cache_dir_value).__name__}")
+    cache_dir = cache_dir_value.strip()
+    if not cache_dir:
+        raise ValueError("CFG.dataset_cache_dir must be a non-empty string")
+    if not osp.isabs(cache_dir):
+        cache_dir = osp.abspath(cache_dir)
+    return cache_dir
+
+
+def _build_patch_index_cache_params(
+    *,
+    fragment_id,
+    split_name,
+    filter_empty_tile,
+    label_suffix,
+    mask_suffix,
+):
+    split = str(split_name)
+    if split not in {"train", "val"}:
+        raise ValueError(f"split_name must be 'train' or 'val', got {split_name!r}")
+    return {
+        "schema_version": int(_PATCH_INDEX_CACHE_SCHEMA_VERSION),
+        "fragment_id": str(fragment_id),
+        "split": split,
+        "filter_empty_tile": bool(filter_empty_tile),
+        "size": int(CFG.size),
+        "tile_size": int(CFG.tile_size),
+        "stride": int(CFG.stride),
+        "label_suffix": str(label_suffix),
+        "mask_suffix": str(mask_suffix),
+    }
+
+
+def _build_patch_index_expected_metadata(params, mask, fragment_mask, *, check_hash):
+    mask_arr = _require_2d_array(mask, context="patch-index cache label")
+    fragment_mask_arr = _require_2d_array(fragment_mask, context="patch-index cache fragment mask")
+    if mask_arr.shape != fragment_mask_arr.shape:
+        raise ValueError(
+            "patch-index cache label/mask shape mismatch: "
+            f"{tuple(mask_arr.shape)} vs {tuple(fragment_mask_arr.shape)}"
+        )
+    metadata = dict(params)
+    metadata["mask_shape"] = [int(mask_arr.shape[0]), int(mask_arr.shape[1])]
+    if bool(check_hash):
+        metadata["label_sha256"] = _sha256_array(mask_arr, context="patch-index cache label")
+        metadata["fragment_mask_sha256"] = _sha256_array(
+            fragment_mask_arr,
+            context="patch-index cache fragment mask",
+        )
+    return metadata
+
+
+def _patch_index_cache_file_path(cache_dir, params):
+    params_json = json.dumps(params, sort_keys=True, separators=(",", ":"))
+    params_hash = hashlib.sha256(params_json.encode("utf-8")).hexdigest()[:16]
+    segment_slug = _cache_segment_slug(params["fragment_id"])
+    filename = f"{segment_slug}__{params['split']}__{params_hash}.npz"
+    return osp.join(cache_dir, filename)
+
+
+def _atomic_save_npz(path, payload):
+    directory = osp.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}.{time.time_ns()}"
+    try:
+        with open(tmp_path, "wb") as f:
+            np.savez_compressed(f, **payload)
+        os.replace(tmp_path, path)
+    finally:
+        if osp.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _serialize_patch_index_cache_payload(
+    *,
+    metadata,
+    mask_store,
+    xyxys,
+    sample_bbox_indices,
+):
+    if not isinstance(mask_store, dict):
+        raise TypeError(f"mask_store must be a dict, got {type(mask_store).__name__}")
+
+    xy = np.asarray(xyxys, dtype=np.int64)
+    if xy.ndim != 2 or xy.shape[1] != 4:
+        raise ValueError(f"xyxys must have shape (N, 4), got {tuple(xy.shape)}")
+    bbox_idx = np.asarray(sample_bbox_indices, dtype=np.int32).reshape(-1)
+    if bbox_idx.shape[0] != xy.shape[0]:
+        raise ValueError(
+            f"sample_bbox_indices length {bbox_idx.shape[0]} does not match xyxys length {xy.shape[0]}"
+        )
+
+    mode = str(mask_store.get("mode"))
+    payload_meta = dict(metadata)
+    payload_meta["mask_store_mode"] = mode
+    if mode == "full":
+        if xy.shape[0] > 0 and np.any(bbox_idx != -1):
+            raise ValueError("mask_store mode='full' requires all sample_bbox_indices to be -1")
+        bboxes = np.zeros((0, 4), dtype=np.int32)
+    elif mode == "bboxes":
+        bboxes = np.asarray(mask_store.get("bboxes"), dtype=np.int32)
+        if bboxes.ndim != 2 or bboxes.shape[1] != 4:
+            raise ValueError(f"mask_store mode='bboxes' requires bboxes shape (N, 4), got {tuple(bboxes.shape)}")
+        if xy.shape[0] > 0:
+            if int(bboxes.shape[0]) <= 0:
+                raise ValueError("mask_store mode='bboxes' has patches but no bboxes")
+            if np.any(bbox_idx < 0):
+                raise ValueError("mask_store mode='bboxes' requires non-negative sample_bbox_indices")
+            max_idx = int(bbox_idx.max())
+            if max_idx >= int(bboxes.shape[0]):
+                raise ValueError(
+                    f"sample_bbox_indices max={max_idx} is out of range for {int(bboxes.shape[0])} bboxes"
+                )
+    else:
+        raise ValueError(f"unsupported mask_store mode: {mode!r}")
+
+    return {
+        "metadata_json": np.asarray(json.dumps(payload_meta, sort_keys=True)),
+        "xyxys": xy,
+        "sample_bbox_indices": bbox_idx,
+        "bboxes": bboxes.astype(np.int32, copy=False),
+    }
+
+
+def _save_patch_index_cache(
+    *,
+    cache_path,
+    metadata,
+    mask_store,
+    xyxys,
+    sample_bbox_indices,
+):
+    payload = _serialize_patch_index_cache_payload(
+        metadata=metadata,
+        mask_store=mask_store,
+        xyxys=xyxys,
+        sample_bbox_indices=sample_bbox_indices,
+    )
+    _atomic_save_npz(cache_path, payload)
+
+
+def _rebuild_mask_store_from_cached_bboxes(mask, bboxes):
+    mask_u8 = _label_mask_uint8(mask, context="patch-index cache label")
+    bboxes_i32 = np.asarray(bboxes, dtype=np.int32)
+    if bboxes_i32.ndim != 2 or bboxes_i32.shape[1] != 4:
+        raise ValueError(f"cached bboxes must have shape (N, 4), got {tuple(bboxes_i32.shape)}")
+
+    mask_h = int(mask_u8.shape[0])
+    mask_w = int(mask_u8.shape[1])
+    mask_crops = []
+    for bbox in bboxes_i32.tolist():
+        y0, y1, x0, x1 = [int(v) for v in bbox]
+        if y1 <= y0 or x1 <= x0:
+            raise ValueError(f"invalid cached bbox: {(y0, y1, x0, x1)}")
+        if y0 < 0 or x0 < 0 or y1 > mask_h or x1 > mask_w:
+            raise ValueError(f"cached bbox out of bounds for mask shape {tuple(mask_u8.shape)}: {(y0, y1, x0, x1)}")
+        mask_crops.append(np.asarray(mask_u8[y0:y1, x0:x1], dtype=np.uint8).copy())
+
+    return {
+        "mode": "bboxes",
+        "shape": tuple(mask_u8.shape),
+        "bboxes": bboxes_i32,
+        "mask_crops": mask_crops,
+    }
+
+
+def _load_patch_index_cache(
+    *,
+    cache_path,
+    expected_metadata,
+    mask,
+):
+    if not osp.exists(cache_path):
+        return None
+
+    with np.load(cache_path, allow_pickle=False) as npz_data:
+        required_keys = {"metadata_json", "xyxys", "sample_bbox_indices", "bboxes"}
+        missing_keys = required_keys - set(npz_data.files)
+        if missing_keys:
+            raise ValueError(f"cache file {cache_path!r} is missing keys: {sorted(missing_keys)!r}")
+
+        raw_metadata = npz_data["metadata_json"]
+        metadata_text = str(np.asarray(raw_metadata).item())
+        metadata = json.loads(metadata_text)
+        if not isinstance(metadata, dict):
+            raise TypeError(f"cache metadata must be an object, got {type(metadata).__name__}")
+
+        missing_meta_keys = _PATCH_INDEX_CACHE_REQUIRED_META_KEYS - set(metadata.keys())
+        if missing_meta_keys:
+            raise ValueError(
+                f"cache metadata {cache_path!r} is missing keys: {sorted(missing_meta_keys)!r}"
+            )
+        if all(key in expected_metadata for key in _PATCH_INDEX_CACHE_HASH_META_KEYS):
+            missing_hash_keys = _PATCH_INDEX_CACHE_HASH_META_KEYS - set(metadata.keys())
+            if missing_hash_keys:
+                return None
+
+        for key, expected_value in expected_metadata.items():
+            if key not in metadata:
+                return None
+            if metadata[key] != expected_value:
+                return None
+
+        mode = str(metadata["mask_store_mode"])
+        xyxys = np.asarray(npz_data["xyxys"], dtype=np.int64)
+        if xyxys.ndim != 2 or xyxys.shape[1] != 4:
+            raise ValueError(f"cached xyxys must have shape (N, 4), got {tuple(xyxys.shape)}")
+
+        bbox_idx = np.asarray(npz_data["sample_bbox_indices"], dtype=np.int32).reshape(-1)
+        if bbox_idx.shape[0] != xyxys.shape[0]:
+            raise ValueError(
+                f"cached sample_bbox_indices length {bbox_idx.shape[0]} does not match xyxys length {xyxys.shape[0]}"
+            )
+
+        if mode == "full":
+            if xyxys.shape[0] > 0 and np.any(bbox_idx != -1):
+                raise ValueError("cached mode='full' requires all sample_bbox_indices to be -1")
+            mask_u8 = _label_mask_uint8(mask, context="patch-index cache label")
+            mask_store = {"mode": "full", "shape": tuple(mask_u8.shape), "mask": mask_u8}
+        elif mode == "bboxes":
+            bboxes = np.asarray(npz_data["bboxes"], dtype=np.int32)
+            if bboxes.ndim != 2 or bboxes.shape[1] != 4:
+                raise ValueError(f"cached bboxes must have shape (N, 4), got {tuple(bboxes.shape)}")
+            if xyxys.shape[0] > 0:
+                if int(bboxes.shape[0]) <= 0:
+                    raise ValueError("cached mode='bboxes' has patches but no bboxes")
+                if np.any(bbox_idx < 0):
+                    raise ValueError("cached mode='bboxes' requires non-negative sample_bbox_indices")
+                max_idx = int(bbox_idx.max())
+                if max_idx >= int(bboxes.shape[0]):
+                    raise ValueError(
+                        f"cached sample_bbox_indices max={max_idx} is out of range for {int(bboxes.shape[0])} bboxes"
+                    )
+            mask_store = _rebuild_mask_store_from_cached_bboxes(mask, bboxes)
+        else:
+            raise ValueError(f"unsupported cached mask_store_mode: {mode!r}")
+
+    return mask_store, xyxys, bbox_idx
+
+
+def _build_mask_store_and_patch_index_cached(
+    mask,
+    fragment_mask,
+    *,
+    fragment_id,
+    split_name,
+    filter_empty_tile,
+    label_suffix,
+    mask_suffix,
+):
+    if not bool(getattr(CFG, "dataset_cache_enabled", True)):
+        return _build_mask_store_and_patch_index(
+            mask,
+            fragment_mask,
+            filter_empty_tile=bool(filter_empty_tile),
+        )
+
+    params = _build_patch_index_cache_params(
+        fragment_id=fragment_id,
+        split_name=split_name,
+        filter_empty_tile=filter_empty_tile,
+        label_suffix=label_suffix,
+        mask_suffix=mask_suffix,
+    )
+    check_hash = bool(getattr(CFG, "dataset_cache_check_hash", True))
+    expected_metadata = _build_patch_index_expected_metadata(
+        params,
+        mask,
+        fragment_mask,
+        check_hash=check_hash,
+    )
+    cache_dir = _resolve_patch_index_cache_dir()
+    cache_path = _patch_index_cache_file_path(cache_dir, params)
+    cached = _load_patch_index_cache(
+        cache_path=cache_path,
+        expected_metadata=expected_metadata,
+        mask=mask,
+    )
+    if cached is not None:
+        log(f"patch-index cache hit split={split_name} segment={fragment_id} path={cache_path}")
+        return cached
+
+    log(f"patch-index cache miss split={split_name} segment={fragment_id} path={cache_path}")
+    mask_store, xyxys, sample_bbox_indices = _build_mask_store_and_patch_index(
+        mask,
+        fragment_mask,
+        filter_empty_tile=bool(filter_empty_tile),
+    )
+    _save_patch_index_cache(
+        cache_path=cache_path,
+        metadata=expected_metadata,
+        mask_store=mask_store,
+        xyxys=xyxys,
+        sample_bbox_indices=sample_bbox_indices,
+    )
+    return mask_store, xyxys, sample_bbox_indices
+
+
+def _label_foreground_mask(mask):
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim != 2:
+        raise ValueError(f"expected 2D label mask, got shape={tuple(mask_arr.shape)}")
+    if np.issubdtype(mask_arr.dtype, np.floating):
+        return mask_arr > 0.0
+    return mask_arr >= 3
+
+
+def _init_uint8_stats_accumulator():
+    return {
+        "hist": np.zeros((256,), dtype=np.int64),
+        "count": 0,
+        "sum": 0.0,
+        "sum_sq": 0.0,
+    }
+
+
+def _accumulate_uint8_values(stats_accumulator, values, *, context):
+    values_arr = np.asarray(values)
+    if values_arr.size == 0:
+        return
+    if values_arr.dtype != np.uint8:
+        if np.issubdtype(values_arr.dtype, np.integer):
+            values_min = int(values_arr.min())
+            values_max = int(values_arr.max())
+            if values_min < 0 or values_max > 255:
+                raise ValueError(
+                    f"{context}: expected integer values in [0, 255], "
+                    f"got min={values_min}, max={values_max}"
+                )
+            values_arr = values_arr.astype(np.uint8, copy=False)
+        else:
+            raise TypeError(f"{context}: expected uint8/integer values, got {values_arr.dtype}")
+
+    flat_u8 = values_arr.reshape(-1)
+    stats_accumulator["hist"] += np.bincount(flat_u8, minlength=256).astype(np.int64, copy=False)
+
+    flat_f64 = flat_u8.astype(np.float64, copy=False)
+    stats_accumulator["count"] += int(flat_f64.size)
+    stats_accumulator["sum"] += float(flat_f64.sum(dtype=np.float64))
+    stats_accumulator["sum_sq"] += float(np.square(flat_f64, dtype=np.float64).sum(dtype=np.float64))
+
+
+def _accumulate_image_foreground_uint8_stats(stats_accumulator, image, foreground_mask, *, context):
+    image_arr = np.asarray(image)
+    foreground = np.asarray(foreground_mask, dtype=bool)
+    if image_arr.ndim != 3:
+        raise ValueError(f"{context}: expected image shape (H, W, C), got {tuple(image_arr.shape)}")
+    if foreground.ndim != 2:
+        raise ValueError(f"{context}: expected foreground mask shape (H, W), got {tuple(foreground.shape)}")
+    if image_arr.shape[:2] != foreground.shape:
+        raise ValueError(
+            f"{context}: image/mask shape mismatch image={tuple(image_arr.shape[:2])} "
+            f"mask={tuple(foreground.shape)}"
+        )
+
+    chunk_h = max(1, int(getattr(CFG, "size", 256)))
+    h = int(image_arr.shape[0])
+    for y0 in range(0, h, chunk_h):
+        y1 = min(h, y0 + chunk_h)
+        fg_chunk = foreground[y0:y1]
+        if not bool(fg_chunk.any()):
+            continue
+        values = image_arr[y0:y1][fg_chunk]
+        _accumulate_uint8_values(stats_accumulator, values, context=context)
+
+
+def _accumulate_volume_foreground_uint8_stats(stats_accumulator, volume, foreground_mask, *, context):
+    foreground = np.asarray(foreground_mask, dtype=bool)
+    if foreground.ndim != 2:
+        raise ValueError(f"{context}: expected foreground mask shape (H, W), got {tuple(foreground.shape)}")
+
+    h = int(foreground.shape[0])
+    w = int(foreground.shape[1])
+    chunk_size = max(1, int(getattr(CFG, "tile_size", 1024)))
+    for y0 in range(0, h, chunk_size):
+        y1 = min(h, y0 + chunk_size)
+        for x0 in range(0, w, chunk_size):
+            x1 = min(w, x0 + chunk_size)
+            fg_chunk = foreground[y0:y1, x0:x1]
+            if not bool(fg_chunk.any()):
+                continue
+            patch = volume.read_patch(y0, y1, x0, x1)
+            if patch.shape[0] != fg_chunk.shape[0] or patch.shape[1] != fg_chunk.shape[1]:
+                raise ValueError(
+                    f"{context}: patch/foreground shape mismatch patch={tuple(patch.shape)} "
+                    f"mask={tuple(fg_chunk.shape)}"
+                )
+            values = patch[fg_chunk]
+            _accumulate_uint8_values(stats_accumulator, values, context=context)
+
+
+def _percentile_from_histogram_uint8(histogram, percentile):
+    q = float(percentile)
+    if not (0.0 <= q <= 100.0):
+        raise ValueError(f"percentile must be in [0, 100], got {q}")
+
+    hist = np.asarray(histogram, dtype=np.int64).reshape(-1)
+    if hist.shape[0] != 256:
+        raise ValueError(f"expected histogram with 256 bins, got shape={tuple(hist.shape)}")
+    total = int(hist.sum())
+    if total <= 0:
+        raise ValueError("cannot compute percentile from empty histogram")
+
+    rank = (q / 100.0) * float(total - 1)
+    lower_rank = int(math.floor(rank))
+    upper_rank = int(math.ceil(rank))
+    cdf = np.cumsum(hist, dtype=np.int64)
+    lower_idx = int(np.searchsorted(cdf, lower_rank + 1, side="left"))
+    upper_idx = int(np.searchsorted(cdf, upper_rank + 1, side="left"))
+    if lower_rank == upper_rank:
+        return float(lower_idx)
+    alpha = float(rank - lower_rank)
+    return float((1.0 - alpha) * lower_idx + alpha * upper_idx)
+
+
+def _finalize_uint8_stats(stats_accumulator):
+    total_count = int(stats_accumulator["count"])
+    if total_count <= 0:
+        raise ValueError("normalization stats require at least one foreground voxel")
+
+    total_sum = float(stats_accumulator["sum"])
+    total_sum_sq = float(stats_accumulator["sum_sq"])
+    mean = total_sum / float(total_count)
+    variance = (total_sum_sq / float(total_count)) - (mean * mean)
+    if variance < 0 and abs(variance) < 1e-12:
+        variance = 0.0
+    if variance < 0:
+        raise ValueError(f"computed negative variance: {variance}")
+    std = float(np.sqrt(variance))
+    if std <= 0:
+        raise ValueError(f"computed non-positive std: {std}")
+
+    p005 = _percentile_from_histogram_uint8(stats_accumulator["hist"], 0.5)
+    p995 = _percentile_from_histogram_uint8(stats_accumulator["hist"], 99.5)
+    if p995 < p005:
+        raise ValueError(f"invalid percentile bounds: p0.5={p005}, p99.5={p995}")
+
+    return {
+        "percentile_00_5": float(p005),
+        "percentile_99_5": float(p995),
+        "mean": float(mean),
+        "std": float(std),
+        "num_voxels": int(total_count),
+    }
+
+
+def _maybe_prepare_fold_label_foreground_percentile_clip_zscore_stats(
+    *,
+    segments_metadata,
+    train_fragment_ids,
+    data_backend,
+    train_label_suffix,
+    train_mask_suffix,
+    volume_cache,
+):
+    normalization_mode = str(getattr(CFG, "normalization_mode", "clip_max_div255")).strip().lower()
+    if normalization_mode != "train_fold_fg_clip_zscore":
+        CFG.fold_label_foreground_percentile_clip_zscore_stats = None
+        return
+
+    stats_accumulator = _init_uint8_stats_accumulator()
+    segments_with_foreground = 0
+
+    if data_backend == "zarr":
+        for fragment_id in train_fragment_ids:
+            sid = str(fragment_id)
+            seg_meta = _segment_meta(segments_metadata, fragment_id)
+            layer_range = _segment_layer_range(seg_meta, fragment_id)
+            reverse_layers = _segment_reverse_layers(seg_meta, fragment_id)
+
+            volume = volume_cache.get(sid)
+            if volume is None:
+                volume = ZarrSegmentVolume(
+                    sid,
+                    seg_meta,
+                    layer_range=layer_range,
+                    reverse_layers=reverse_layers,
+                )
+                volume_cache[sid] = volume
+
+            label_mask, fragment_mask = read_label_and_fragment_mask_for_shape(
+                sid,
+                volume.shape[:2],
+                label_suffix=train_label_suffix,
+                mask_suffix=train_mask_suffix,
+            )
+            foreground = _label_foreground_mask(label_mask) & (np.asarray(fragment_mask) > 0)
+            if not bool(foreground.any()):
+                log(f"normalization stats: segment={sid} has no foreground label voxels; skipping")
+                continue
+            segments_with_foreground += 1
+            _accumulate_volume_foreground_uint8_stats(
+                stats_accumulator,
+                volume,
+                foreground,
+                context=f"normalization stats segment={sid}",
+            )
+    elif data_backend == "tiff":
+        for fragment_id in train_fragment_ids:
+            seg_meta = _segment_meta(segments_metadata, fragment_id)
+            layer_range = _segment_layer_range(seg_meta, fragment_id)
+            reverse_layers = _segment_reverse_layers(seg_meta, fragment_id)
+            image, label_mask, fragment_mask = read_image_mask(
+                fragment_id,
+                layer_range=layer_range,
+                reverse_layers=reverse_layers,
+                label_suffix=train_label_suffix,
+                mask_suffix=train_mask_suffix,
+            )
+            foreground = _label_foreground_mask(label_mask) & (np.asarray(fragment_mask) > 0)
+            if not bool(foreground.any()):
+                log(f"normalization stats: segment={fragment_id} has no foreground label voxels; skipping")
+                continue
+            segments_with_foreground += 1
+            _accumulate_image_foreground_uint8_stats(
+                stats_accumulator,
+                image,
+                foreground,
+                context=f"normalization stats segment={fragment_id}",
+            )
+    else:
+        raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
+
+    if segments_with_foreground <= 0:
+        raise ValueError(
+            "normalization_mode='train_fold_fg_clip_zscore' requires at least one "
+            "training segment with foreground label voxels"
+        )
+
+    stats = _finalize_uint8_stats(stats_accumulator)
+    CFG.fold_label_foreground_percentile_clip_zscore_stats = stats
+    log(
+        "normalization stats "
+        f"mode={normalization_mode} train_segments={len(train_fragment_ids)} "
+        f"segments_with_foreground={segments_with_foreground} "
+        f"num_voxels={stats['num_voxels']} "
+        f"p0.5={stats['percentile_00_5']:.6f} "
+        f"p99.5={stats['percentile_99_5']:.6f} "
+        f"mean={stats['mean']:.6f} std={stats['std']:.6f}"
+    )
 
 
 def build_group_metadata(fragment_ids, segments_metadata, group_key):
@@ -147,7 +750,12 @@ def load_train_segment(
         )
     mask_bbox = None
     if bool(getattr(CFG, "stitch_use_roi", False)):
-        mask_bbox = _mask_bbox_downsample(fragment_mask, int(getattr(CFG, "stitch_downsample", 1)))
+        bboxes = _mask_component_bboxes_downsample(
+            fragment_mask,
+            int(getattr(CFG, "stitch_downsample", 1)),
+        )
+        if int(bboxes.shape[0]) > 0:
+            mask_bbox = bboxes
 
     return {
         "patch_count": patch_count,
@@ -243,7 +851,12 @@ def load_val_segment(
         )
     mask_bbox = None
     if bool(getattr(CFG, "stitch_use_roi", False)):
-        mask_bbox = _mask_bbox_downsample(fragment_mask_val, int(getattr(CFG, "stitch_downsample", 1)))
+        bboxes = _mask_component_bboxes_downsample(
+            fragment_mask_val,
+            int(getattr(CFG, "stitch_downsample", 1)),
+        )
+        if int(bboxes.shape[0]) > 0:
+            mask_bbox = bboxes
 
     return {
         "patch_count": patch_count,
@@ -302,11 +915,14 @@ def _build_train_loader_from_dataset(train_dataset, train_groups, group_names):
     elif CFG.sampler == "group_stratified":
         train_sampler = None
         train_shuffle = False
+        epoch_size_mode = str(getattr(CFG, "group_stratified_epoch_size_mode", "dataset")).strip().lower()
+        log(f"group_stratified sampler epoch_size_mode={epoch_size_mode!r}")
         train_batch_sampler = GroupStratifiedBatchSampler(
             train_groups,
             batch_size=CFG.train_batch_size,
             seed=getattr(CFG, "seed", 0),
             drop_last=True,
+            epoch_size_mode=epoch_size_mode,
         )
     else:
         raise ValueError(f"Unknown training.sampler: {CFG.sampler!r}")
@@ -558,9 +1174,9 @@ def build_log_only_stitch_loaders(
         log_only_shapes.append(tuple(fragment_mask.shape))
         log_only_segment_ids.append(str(fragment_id))
 
-        bbox = _mask_bbox_downsample(fragment_mask, int(log_only_downsample))
-        if bbox is not None:
-            log_only_bboxes[str(fragment_id)] = bbox
+        bboxes = _mask_component_bboxes_downsample(fragment_mask, int(log_only_downsample))
+        if int(bboxes.shape[0]) > 0:
+            log_only_bboxes[str(fragment_id)] = bboxes
 
     return log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes
 
@@ -625,9 +1241,9 @@ def build_log_only_stitch_loaders_lazy(
         log_only_shapes.append(tuple(fragment_mask.shape))
         log_only_segment_ids.append(sid)
 
-        bbox = _mask_bbox_downsample(fragment_mask, int(log_only_downsample))
-        if bbox is not None:
-            log_only_bboxes[sid] = bbox
+        bboxes = _mask_component_bboxes_downsample(fragment_mask, int(log_only_downsample))
+        if int(bboxes.shape[0]) > 0:
+            log_only_bboxes[sid] = bboxes
 
     return log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes
 
@@ -646,9 +1262,6 @@ def build_datasets(run_state):
     )
     group_idx_by_segment = {str(fragment_id): int(group_idx) for fragment_id, group_idx in fragment_to_group_idx.items()}
 
-    train_transform = get_transforms(data="train", cfg=CFG)
-    valid_transform = get_transforms(data="valid", cfg=CFG)
-
     train_label_suffix = getattr(CFG, "train_label_suffix", "")
     train_mask_suffix = getattr(CFG, "train_mask_suffix", "")
     val_label_suffix = getattr(CFG, "val_label_suffix", "_val")
@@ -665,6 +1278,20 @@ def build_datasets(run_state):
     if data_backend not in {"zarr", "tiff"}:
         raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
     log(f"data backend={data_backend}")
+    if bool(getattr(CFG, "dataset_cache_enabled", True)) and not bool(getattr(CFG, "dataset_cache_check_hash", True)):
+        log("WARNING: dataset cache hash validation is disabled (metadata.training.dataset_cache_check_hash=false)")
+    shared_volume_cache = {}
+    _maybe_prepare_fold_label_foreground_percentile_clip_zscore_stats(
+        segments_metadata=segments_metadata,
+        train_fragment_ids=train_fragment_ids,
+        data_backend=data_backend,
+        train_label_suffix=train_label_suffix,
+        train_mask_suffix=train_mask_suffix,
+        volume_cache=shared_volume_cache,
+    )
+
+    train_transform = get_transforms(data="train", cfg=CFG)
+    valid_transform = get_transforms(data="valid", cfg=CFG)
 
     if data_backend == "zarr":
         train_patch_counts_by_segment = {}
@@ -688,7 +1315,7 @@ def build_datasets(run_state):
 
         log("building datasets (zarr lazy)")
         include_train_xyxys = bool(getattr(CFG, "stitch_train", False))
-        volume_cache = {}
+        volume_cache = shared_volume_cache
 
         for fragment_id in train_fragment_ids:
             sid = str(fragment_id)
@@ -718,10 +1345,14 @@ def build_datasets(run_state):
                 label_suffix=train_label_suffix,
                 mask_suffix=train_mask_suffix,
             )
-            mask_store, xyxys, sample_bbox_indices = _build_mask_store_and_patch_index(
+            mask_store, xyxys, sample_bbox_indices = _build_mask_store_and_patch_index_cached(
                 mask,
                 fragment_mask,
+                fragment_id=sid,
+                split_name="train",
                 filter_empty_tile=True,
+                label_suffix=train_label_suffix,
+                mask_suffix=train_mask_suffix,
             )
             patch_count = int(len(xyxys))
             train_patch_counts_by_segment[fragment_id] = patch_count
@@ -741,9 +1372,12 @@ def build_datasets(run_state):
                     _downsample_bool_mask_any(fragment_mask, int(getattr(CFG, "stitch_downsample", 1)))
                 )
             if bool(getattr(CFG, "stitch_use_roi", False)):
-                bbox = _mask_bbox_downsample(fragment_mask, int(getattr(CFG, "stitch_downsample", 1)))
-                if bbox is not None:
-                    train_mask_bboxes[sid] = bbox
+                bboxes = _mask_component_bboxes_downsample(
+                    fragment_mask,
+                    int(getattr(CFG, "stitch_downsample", 1)),
+                )
+                if int(bboxes.shape[0]) > 0:
+                    train_mask_bboxes[sid] = bboxes
 
         for fragment_id in val_fragment_ids:
             sid = str(fragment_id)
@@ -773,10 +1407,14 @@ def build_datasets(run_state):
                 label_suffix=val_label_suffix,
                 mask_suffix=val_mask_suffix,
             )
-            mask_store_val, val_xyxys, val_sample_bbox_indices = _build_mask_store_and_patch_index(
+            mask_store_val, val_xyxys, val_sample_bbox_indices = _build_mask_store_and_patch_index_cached(
                 mask_val,
                 fragment_mask_val,
+                fragment_id=sid,
+                split_name="val",
                 filter_empty_tile=False,
+                label_suffix=val_label_suffix,
+                mask_suffix=val_mask_suffix,
             )
             patch_count = int(len(val_xyxys))
             val_patch_counts_by_segment[fragment_id] = patch_count
@@ -814,9 +1452,12 @@ def build_datasets(run_state):
                     _downsample_bool_mask_any(fragment_mask_val, int(getattr(CFG, "stitch_downsample", 1)))
                 )
             if bool(getattr(CFG, "stitch_use_roi", False)):
-                bbox = _mask_bbox_downsample(fragment_mask_val, int(getattr(CFG, "stitch_downsample", 1)))
-                if bbox is not None:
-                    val_mask_bboxes[sid] = bbox
+                bboxes = _mask_component_bboxes_downsample(
+                    fragment_mask_val,
+                    int(getattr(CFG, "stitch_downsample", 1)),
+                )
+                if int(bboxes.shape[0]) > 0:
+                    val_mask_bboxes[sid] = bboxes
 
             if fragment_id == CFG.valid_id:
                 stitch_val_dataloader_idx = len(val_loaders) - 1

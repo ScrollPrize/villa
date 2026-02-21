@@ -2,6 +2,7 @@ import time
 import os.path as osp
 from contextlib import nullcontext
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -108,16 +109,13 @@ class StitchManager:
         stitch_train_every_n_epochs=1,
     ):
         self.downsample = max(1, int(stitch_downsample or 1))
-        self.buffers = {}
-        self.segment_ids = {}
-        self.buffer_meta = {}
-        self.train_buffer_meta = {}
+        self._roi_meta_by_split = {"val": {}, "train": {}, "log_only": {}}
+        self._roi_buffers_by_split = {"val": {}, "log_only": {}}
+        self._val_loader_to_segment = {}
         self.train_segment_ids = []
         self.train_loaders = []
         self.train_enabled = bool(stitch_train)
         self.train_every_n_epochs = max(1, int(stitch_train_every_n_epochs or 1))
-        self.log_only_buffers = {}
-        self.log_only_buffer_meta = {}
         self.log_only_segment_ids = []
         self.log_only_loaders = []
         self.log_only_every_n_epochs = max(1, int(stitch_log_only_every_n_epochs or 10))
@@ -128,7 +126,7 @@ class StitchManager:
         self.train_bboxes = dict(stitch_train_bboxes or {})
         self.log_only_bboxes = dict(stitch_log_only_bboxes or {})
         self._gaussian_cache = {}
-        self._gaussian_sigma_scale = 0.125
+        self._gaussian_sigma_scale = 1.0 / 8.0
         self._gaussian_min_weight = 1e-6
 
         def _resolve_roi(shape, bbox, ds):
@@ -149,6 +147,77 @@ class StitchManager:
                     return (y0, y1, x0, x1), (ds_h, ds_w)
             return (0, ds_h, 0, ds_w), (ds_h, ds_w)
 
+        def _resolve_rois(shape, bboxes, ds):
+            base_roi, full_shape = _resolve_roi(shape, None, ds)
+            if (not self.use_roi) or bboxes is None:
+                return [base_roi], full_shape
+            bboxes_arr = np.asarray(bboxes, dtype=np.int64)
+            if bboxes_arr.ndim == 1:
+                if bboxes_arr.shape[0] != 4:
+                    raise ValueError(
+                        f"stitch ROI bbox must be shape (4,) or (N,4), got shape={tuple(bboxes_arr.shape)}"
+                    )
+                bbox = tuple(int(v) for v in bboxes_arr.tolist())
+                roi, _ = _resolve_roi(shape, bbox, ds)
+                return [roi], full_shape
+            if bboxes_arr.ndim != 2 or bboxes_arr.shape[1] != 4:
+                raise ValueError(
+                    f"stitch ROI bboxes must be shape (N, 4), got shape={tuple(bboxes_arr.shape)}"
+                )
+            ds_h, ds_w = full_shape
+            rois = []
+            for bbox_row in bboxes_arr.tolist():
+                y0, y1, x0, x1 = [int(v) for v in bbox_row]
+                y0 = max(0, min(y0, ds_h))
+                y1 = max(0, min(y1, ds_h))
+                x0 = max(0, min(x0, ds_w))
+                x1 = max(0, min(x1, ds_w))
+                if y1 <= y0 or x1 <= x0:
+                    continue
+                rois.append((y0, y1, x0, x1))
+            if len(rois) == 0:
+                raise ValueError("stitch ROI bboxes resolved to empty region list")
+            return rois, full_shape
+
+        def _build_segment_roi_meta(shape, bboxes, ds):
+            rois, (ds_h, ds_w) = _resolve_rois(shape, bboxes, ds)
+            roi_meta = []
+            for y0, y1, x0, x1 in rois:
+                buf_h = max(1, int(y1 - y0))
+                buf_w = max(1, int(x1 - x0))
+                roi_meta.append(
+                    {
+                        "offset": (int(y0), int(x0)),
+                        "buffer_shape": (int(buf_h), int(buf_w)),
+                    }
+                )
+            if len(roi_meta) == 0:
+                raise ValueError("segment ROI metadata cannot be empty")
+            return {
+                "full_shape": (int(ds_h), int(ds_w)),
+                "rois": roi_meta,
+            }
+
+        def _allocate_segment_buffers(split, segment_id):
+            split = str(split)
+            if split not in self._roi_buffers_by_split:
+                raise ValueError(f"unsupported split for buffer allocation: {split!r}")
+            meta = self._roi_meta_by_split[split].get(str(segment_id))
+            if meta is None:
+                raise ValueError(f"missing ROI metadata for split={split!r} segment_id={segment_id!r}")
+            buffers = []
+            for roi in meta["rois"]:
+                buf_h, buf_w = [int(v) for v in roi["buffer_shape"]]
+                offset = tuple(int(v) for v in roi["offset"])
+                buffers.append(
+                    (
+                        np.zeros((buf_h, buf_w), dtype=np.float32),
+                        np.zeros((buf_h, buf_w), dtype=np.float32),
+                        offset,
+                    )
+                )
+            self._roi_buffers_by_split[split][str(segment_id)] = buffers
+
         if bool(stitch_all_val):
             if stitch_all_val_shapes is None or stitch_all_val_segment_ids is None:
                 raise ValueError("stitch_all_val requires stitch_all_val_shapes and stitch_all_val_segment_ids")
@@ -159,37 +228,33 @@ class StitchManager:
                 )
 
             for loader_idx, (segment_id, shape) in enumerate(zip(stitch_all_val_segment_ids, stitch_all_val_shapes)):
-                bbox = self.val_bboxes.get(str(segment_id))
-                (y0, y1, x0, x1), (ds_h, ds_w) = _resolve_roi(shape, bbox, self.downsample)
-                buf_h = max(1, int(y1 - y0))
-                buf_w = max(1, int(x1 - x0))
-                self.buffers[int(loader_idx)] = (
-                    np.zeros((buf_h, buf_w), dtype=np.float32),
-                    np.zeros((buf_h, buf_w), dtype=np.float32),
-                )
-                self.segment_ids[int(loader_idx)] = str(segment_id)
-                self.buffer_meta[int(loader_idx)] = {
-                    "offset": (int(y0), int(x0)),
-                    "full_shape": (int(ds_h), int(ds_w)),
-                }
+                seg_id = str(segment_id)
+                idx = int(loader_idx)
+                if idx in self._val_loader_to_segment:
+                    raise ValueError(f"duplicate val stitch loader index: {idx}")
+                if seg_id in self._roi_meta_by_split["val"]:
+                    raise ValueError(f"duplicate val stitch segment id: {seg_id!r}")
+                bbox = self.val_bboxes.get(seg_id)
+                self._roi_meta_by_split["val"][seg_id] = _build_segment_roi_meta(shape, bbox, self.downsample)
+                _allocate_segment_buffers("val", seg_id)
+                self._val_loader_to_segment[idx] = seg_id
         else:
             stitch_enabled = (stitch_val_dataloader_idx is not None) and (stitch_pred_shape is not None)
             if stitch_enabled:
                 idx = int(stitch_val_dataloader_idx)
                 segment_id = str(stitch_segment_id or idx)
+                if idx in self._val_loader_to_segment:
+                    raise ValueError(f"duplicate val stitch loader index: {idx}")
+                if segment_id in self._roi_meta_by_split["val"]:
+                    raise ValueError(f"duplicate val stitch segment id: {segment_id!r}")
                 bbox = self.val_bboxes.get(segment_id)
-                (y0, y1, x0, x1), (ds_h, ds_w) = _resolve_roi(stitch_pred_shape, bbox, self.downsample)
-                buf_h = max(1, int(y1 - y0))
-                buf_w = max(1, int(x1 - x0))
-                self.buffers[idx] = (
-                    np.zeros((buf_h, buf_w), dtype=np.float32),
-                    np.zeros((buf_h, buf_w), dtype=np.float32),
+                self._roi_meta_by_split["val"][segment_id] = _build_segment_roi_meta(
+                    stitch_pred_shape,
+                    bbox,
+                    self.downsample,
                 )
-                self.segment_ids[idx] = segment_id
-                self.buffer_meta[idx] = {
-                    "offset": (int(y0), int(x0)),
-                    "full_shape": (int(ds_h), int(ds_w)),
-                }
+                _allocate_segment_buffers("val", segment_id)
+                self._val_loader_to_segment[idx] = segment_id
 
         if stitch_train_shapes is not None or stitch_train_segment_ids is not None:
             stitch_train_shapes = stitch_train_shapes or []
@@ -202,15 +267,10 @@ class StitchManager:
 
             for segment_id, shape in zip(stitch_train_segment_ids, stitch_train_shapes):
                 seg_id = str(segment_id)
+                if seg_id in self._roi_meta_by_split["train"]:
+                    raise ValueError(f"duplicate train stitch segment id: {seg_id!r}")
                 bbox = self.train_bboxes.get(seg_id)
-                (y0, y1, x0, x1), (ds_h, ds_w) = _resolve_roi(shape, bbox, self.downsample)
-                buf_h = max(1, int(y1 - y0))
-                buf_w = max(1, int(x1 - x0))
-                self.train_buffer_meta[seg_id] = {
-                    "offset": (int(y0), int(x0)),
-                    "full_shape": (int(ds_h), int(ds_w)),
-                    "buffer_shape": (int(buf_h), int(buf_w)),
-                }
+                self._roi_meta_by_split["train"][seg_id] = _build_segment_roi_meta(shape, bbox, self.downsample)
                 self.train_segment_ids.append(seg_id)
 
         if stitch_log_only_shapes is not None and stitch_log_only_segment_ids is not None:
@@ -221,21 +281,18 @@ class StitchManager:
                 )
             for segment_id, shape in zip(stitch_log_only_segment_ids, stitch_log_only_shapes):
                 seg_id = str(segment_id)
+                if seg_id in self._roi_meta_by_split["log_only"]:
+                    raise ValueError(f"duplicate log-only stitch segment id: {seg_id!r}")
                 bbox = self.log_only_bboxes.get(seg_id)
-                (y0, y1, x0, x1), (ds_h, ds_w) = _resolve_roi(shape, bbox, self.log_only_downsample)
-                buf_h = max(1, int(y1 - y0))
-                buf_w = max(1, int(x1 - x0))
-                self.log_only_buffers[seg_id] = (
-                    np.zeros((buf_h, buf_w), dtype=np.float32),
-                    np.zeros((buf_h, buf_w), dtype=np.float32),
+                self._roi_meta_by_split["log_only"][seg_id] = _build_segment_roi_meta(
+                    shape,
+                    bbox,
+                    self.log_only_downsample,
                 )
-                self.log_only_buffer_meta[seg_id] = {
-                    "offset": (int(y0), int(x0)),
-                    "full_shape": (int(ds_h), int(ds_w)),
-                }
+                _allocate_segment_buffers("log_only", seg_id)
                 self.log_only_segment_ids.append(seg_id)
 
-        self.enabled = len(self.buffers) > 0
+        self.enabled = len(self._roi_buffers_by_split["val"]) > 0
 
     def set_borders(self, *, train_borders=None, val_borders=None):
         if train_borders is not None:
@@ -267,13 +324,14 @@ class StitchManager:
         if self._distributed_world_size(model) <= 1:
             return False
         device = model.device
-        for pred_buf, count_buf in self.buffers.values():
-            pred_tensor = torch.from_numpy(np.ascontiguousarray(pred_buf)).to(device=device, dtype=torch.float32)
-            count_tensor = torch.from_numpy(np.ascontiguousarray(count_buf)).to(device=device, dtype=torch.float32)
-            pred_tensor = self._reduce_sum_distributed(model, pred_tensor)
-            count_tensor = self._reduce_sum_distributed(model, count_tensor)
-            pred_buf[...] = pred_tensor.detach().cpu().numpy()
-            count_buf[...] = count_tensor.detach().cpu().numpy()
+        for roi_buffers in self._roi_buffers_by_split["val"].values():
+            for pred_buf, count_buf, _offset in roi_buffers:
+                pred_tensor = torch.from_numpy(np.ascontiguousarray(pred_buf)).to(device=device, dtype=torch.float32)
+                count_tensor = torch.from_numpy(np.ascontiguousarray(count_buf)).to(device=device, dtype=torch.float32)
+                pred_tensor = self._reduce_sum_distributed(model, pred_tensor)
+                count_tensor = self._reduce_sum_distributed(model, count_tensor)
+                pred_buf[...] = pred_tensor.detach().cpu().numpy()
+                count_buf[...] = count_tensor.detach().cpu().numpy()
         return True
 
     def _gaussian_weights(self, h: int, w: int) -> np.ndarray:
@@ -306,21 +364,67 @@ class StitchManager:
         self._gaussian_cache[key] = weights
         return weights
 
+    @staticmethod
+    def _sigmoid_numpy(arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr, dtype=np.float32)
+        arr_clipped = np.clip(arr, -80.0, 80.0)
+        return (1.0 / (1.0 + np.exp(-arr_clipped))).astype(np.float32)
+
+    def _stitch_prob_map(self, pred_buf: np.ndarray, count_buf: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        covered = count_buf != 0
+        stitched_logits = np.divide(
+            pred_buf.astype(np.float32),
+            count_buf.astype(np.float32),
+            out=np.zeros_like(pred_buf, dtype=np.float32),
+            where=covered,
+        )
+        stitched_probs = np.zeros_like(stitched_logits, dtype=np.float32)
+        if covered.any():
+            stitched_probs[covered] = self._sigmoid_numpy(stitched_logits[covered])
+        return stitched_probs, covered
+
+    def _compose_segment_from_roi_buffers(self, roi_buffers, full_shape):
+        full_shape = tuple(int(v) for v in full_shape)
+        if len(full_shape) != 2 or full_shape[0] <= 0 or full_shape[1] <= 0:
+            raise ValueError(f"invalid full_shape for stitched composition: {full_shape!r}")
+        full_pred = np.zeros(full_shape, dtype=np.float32)
+        full_count = np.zeros(full_shape, dtype=np.float32)
+        for pred_buf, count_buf, offset in roi_buffers:
+            y0, x0 = [int(v) for v in offset]
+            h, w = pred_buf.shape
+            y1 = y0 + h
+            x1 = x0 + w
+            if y0 < 0 or x0 < 0 or y1 > full_shape[0] or x1 > full_shape[1]:
+                raise ValueError(
+                    f"ROI {(y0, y1, x0, x1)} is out of bounds for full_shape={full_shape!r}"
+                )
+            full_pred[y0:y1, x0:x1] += pred_buf
+            full_count[y0:y1, x0:x1] += count_buf
+        base, has = self._stitch_prob_map(full_pred, full_count)
+        return np.clip(base, 0, 1), has
+
     def accumulate_to_buffers(self, *, outputs, xyxys, pred_buf, count_buf, offset=(0, 0), ds_override=None):
         ds = int(ds_override or self.downsample)
-        y_preds = torch.sigmoid(outputs).to("cpu")
+        y_logits = outputs.detach().to("cpu", dtype=torch.float32)
         buf_h, buf_w = pred_buf.shape[:2]
         off_y, off_x = offset
         for i, (x1, y1, x2, y2) in enumerate(xyxys):
-            x1 = int(x1)
-            y1 = int(y1)
-            x2 = int(x2)
-            y2 = int(y2)
+            x1_i = int(x1)
+            y1_i = int(y1)
+            x2_i = int(x2)
+            y2_i = int(y2)
+            if ds > 1:
+                if (x1_i % ds) != 0 or (y1_i % ds) != 0 or (x2_i % ds) != 0 or (y2_i % ds) != 0:
+                    raise ValueError(
+                        "stitch coordinates are not aligned to stitch_downsample. "
+                        f"Got xyxy=({x1_i}, {y1_i}, {x2_i}, {y2_i}) with downsample={ds}; "
+                        "ensure patch size/stride and generated patch coordinates are multiples of stitch_downsample."
+                    )
 
-            x1_ds = x1 // ds
-            y1_ds = y1 // ds
-            x2_ds = (x2 + ds - 1) // ds
-            y2_ds = (y2 + ds - 1) // ds
+            x1_ds = x1_i // ds
+            y1_ds = y1_i // ds
+            x2_ds = (x2_i + ds - 1) // ds
+            y2_ds = (y2_i + ds - 1) // ds
             x1_ds -= int(off_x)
             x2_ds -= int(off_x)
             y1_ds -= int(off_y)
@@ -330,7 +434,7 @@ class StitchManager:
             if target_h <= 0 or target_w <= 0:
                 continue
 
-            pred_patch = y_preds[i].unsqueeze(0).float()
+            pred_patch = y_logits[i].unsqueeze(0)
             if pred_patch.shape[-2:] != (target_h, target_w):
                 pred_patch = F.interpolate(
                     pred_patch,
@@ -366,12 +470,20 @@ class StitchManager:
         if not self.enabled:
             return
         idx = int(dataloader_idx)
-        if idx not in self.buffers:
-            return
-        pred_buf, count_buf = self.buffers[idx]
-        meta = self.buffer_meta.get(idx, {})
-        offset = meta.get("offset", (0, 0))
-        self.accumulate_to_buffers(outputs=outputs, xyxys=xyxys, pred_buf=pred_buf, count_buf=count_buf, offset=offset)
+        segment_id = self._val_loader_to_segment.get(idx)
+        if segment_id is None:
+            raise KeyError(f"stitch val loader index {idx} has no ROI buffers")
+        roi_buffers = self._roi_buffers_by_split["val"].get(str(segment_id))
+        if not roi_buffers:
+            raise ValueError(f"stitch val segment_id={segment_id!r} has empty ROI buffers")
+        for pred_buf, count_buf, offset in roi_buffers:
+            self.accumulate_to_buffers(
+                outputs=outputs,
+                xyxys=xyxys,
+                pred_buf=pred_buf,
+                count_buf=count_buf,
+                offset=offset,
+            )
 
     def run_train_stitch_pass(self, model):
         if not self.train_enabled:
@@ -408,46 +520,55 @@ class StitchManager:
             with torch.inference_mode(), precision_context:
                 for loader, segment_id in zip(self.train_loaders, self.train_segment_ids):
                     segment_id = str(segment_id)
-                    meta = self.train_buffer_meta.get(segment_id)
+                    meta = self._roi_meta_by_split["train"].get(segment_id)
                     if meta is None:
                         raise ValueError(f"Missing train stitch metadata for segment_id={segment_id!r}")
-                    buf_h, buf_w = [int(v) for v in meta.get("buffer_shape", (0, 0))]
-                    if buf_h <= 0 or buf_w <= 0:
+                    full_shape = tuple(int(v) for v in meta.get("full_shape", (0, 0)))
+                    if len(full_shape) != 2 or full_shape[0] <= 0 or full_shape[1] <= 0:
                         raise ValueError(
-                            f"Invalid train stitch buffer shape for segment_id={segment_id!r}: "
-                            f"{meta.get('buffer_shape')!r}"
+                            f"Invalid train stitch full_shape for segment_id={segment_id!r}: {full_shape!r}"
                         )
-                    pred_buf = np.zeros((buf_h, buf_w), dtype=np.float32)
-                    count_buf = np.zeros((buf_h, buf_w), dtype=np.float32)
-                    offset = meta.get("offset", (0, 0))
+                    roi_meta = list(meta.get("rois", []))
+                    if len(roi_meta) == 0:
+                        raise ValueError(f"Missing train stitch ROI metadata for segment_id={segment_id!r}")
+                    roi_buffers = []
+                    for roi in roi_meta:
+                        buf_h, buf_w = [int(v) for v in roi.get("buffer_shape", (0, 0))]
+                        if buf_h <= 0 or buf_w <= 0:
+                            raise ValueError(
+                                f"Invalid train stitch ROI buffer shape for segment_id={segment_id!r}: "
+                                f"{roi.get('buffer_shape')!r}"
+                            )
+                        offset = tuple(int(v) for v in roi.get("offset", (0, 0)))
+                        roi_buffers.append(
+                            (
+                                np.zeros((buf_h, buf_w), dtype=np.float32),
+                                np.zeros((buf_h, buf_w), dtype=np.float32),
+                                offset,
+                            )
+                        )
                     for batch in loader:
                         x, _y, xyxys, _g = batch
                         x = x.to(model.device, non_blocking=True)
                         outputs = model(x)
-                        self.accumulate_to_buffers(
-                            outputs=outputs,
-                            xyxys=xyxys,
-                            pred_buf=pred_buf,
-                            count_buf=count_buf,
-                            offset=offset,
-                            ds_override=self.downsample,
-                        )
-                    covered = count_buf > 0
+                        for pred_buf, count_buf, offset in roi_buffers:
+                            self.accumulate_to_buffers(
+                                outputs=outputs,
+                                xyxys=xyxys,
+                                pred_buf=pred_buf,
+                                count_buf=count_buf,
+                                offset=offset,
+                                ds_override=self.downsample,
+                            )
+                    stitched, covered = self._compose_segment_from_roi_buffers(roi_buffers, full_shape)
                     covered_px = int(covered.sum())
                     total_px = int(covered.size)
                     coverage = float(covered_px) / float(max(1, total_px))
                     if covered_px > 0:
-                        stitched = np.divide(
-                            pred_buf.astype(np.float32),
-                            count_buf.astype(np.float32),
-                            out=np.zeros((buf_h, buf_w), dtype=np.float32),
-                            where=covered,
-                        )
                         vals = stitched[covered]
                         prob_mean = float(vals.mean()) if vals.size else float("nan")
                         prob_max = float(vals.max()) if vals.size else float("nan")
                     else:
-                        stitched = np.zeros((buf_h, buf_w), dtype=np.float32)
                         prob_mean = float("nan")
                         prob_max = float("nan")
                     log(
@@ -459,8 +580,8 @@ class StitchManager:
                         "img_u8": (np.clip(stitched, 0.0, 1.0) * 255.0).astype(np.uint8),
                         "has": covered,
                         "meta": {
-                            "offset": tuple(meta.get("offset", (0, 0))),
-                            "full_shape": tuple(meta.get("full_shape", stitched.shape)),
+                            "offset": (0, 0),
+                            "full_shape": full_shape,
                         },
                     }
         finally:
@@ -488,11 +609,13 @@ class StitchManager:
         log(f"log-only stitch pass start epoch={epoch}")
 
         for segment_id in self.log_only_segment_ids:
-            if segment_id not in self.log_only_buffers:
-                raise ValueError(f"Missing log-only stitch buffers for segment_id={segment_id!r}")
-            pred_buf, count_buf = self.log_only_buffers[segment_id]
-            pred_buf.fill(0)
-            count_buf.fill(0)
+            sid = str(segment_id)
+            roi_buffers = self._roi_buffers_by_split["log_only"].get(sid)
+            if not roi_buffers:
+                raise ValueError(f"Missing log-only stitch ROI buffers for segment_id={sid!r}")
+            for pred_buf, count_buf, _offset in roi_buffers:
+                pred_buf.fill(0)
+                count_buf.fill(0)
 
         def _unpack(batch):
             if isinstance(batch, (list, tuple)):
@@ -516,21 +639,23 @@ class StitchManager:
             model.eval()
             with torch.inference_mode(), precision_context:
                 for loader, segment_id in zip(self.log_only_loaders, self.log_only_segment_ids):
-                    pred_buf, count_buf = self.log_only_buffers[str(segment_id)]
-                    meta = self.log_only_buffer_meta.get(str(segment_id), {})
-                    offset = meta.get("offset", (0, 0))
+                    sid = str(segment_id)
+                    roi_buffers = self._roi_buffers_by_split["log_only"].get(sid)
+                    if not roi_buffers:
+                        raise ValueError(f"Missing log-only stitch ROI buffers for segment_id={sid!r}")
                     for batch in loader:
                         x, xyxys = _unpack(batch)
                         x = x.to(model.device, non_blocking=True)
                         outputs = model(x)
-                        self.accumulate_to_buffers(
-                            outputs=outputs,
-                            xyxys=xyxys,
-                            pred_buf=pred_buf,
-                            count_buf=count_buf,
-                            offset=offset,
-                            ds_override=self.log_only_downsample,
-                        )
+                        for pred_buf, count_buf, offset in roi_buffers:
+                            self.accumulate_to_buffers(
+                                outputs=outputs,
+                                xyxys=xyxys,
+                                pred_buf=pred_buf,
+                                count_buf=count_buf,
+                                offset=offset,
+                                ds_override=self.log_only_downsample,
+                            )
         finally:
             if was_training:
                 model.train()
@@ -539,14 +664,16 @@ class StitchManager:
         return True
 
     def on_validation_epoch_end(self, model):
-        if not self.enabled or not self.buffers:
+        if not self.enabled or not self._roi_buffers_by_split["val"]:
             return
 
         sanity_checking = bool(model.trainer is not None and getattr(model.trainer, "sanity_checking", False))
         is_global_zero = bool(model.trainer is None or model.trainer.is_global_zero)
-        train_configured = bool(self.train_loaders) and bool(self.train_segment_ids) and bool(self.train_buffer_meta)
+        train_configured = bool(self.train_loaders) and bool(self.train_segment_ids) and bool(self._roi_meta_by_split["train"])
         stitch_train_mode = bool(self.train_enabled and train_configured)
-        log_only_configured = bool(self.log_only_loaders) and bool(self.log_only_segment_ids) and bool(self.log_only_buffers)
+        log_only_configured = bool(self.log_only_loaders) and bool(self.log_only_segment_ids) and bool(
+            self._roi_buffers_by_split["log_only"]
+        )
 
         did_run_train_stitch = False
         train_segment_viz = {}
@@ -564,9 +691,10 @@ class StitchManager:
 
         log_only_mode = bool(log_only_configured)
         if log_only_mode and (not is_global_zero):
-            for pred_buf, count_buf in self.log_only_buffers.values():
-                pred_buf.fill(0)
-                count_buf.fill(0)
+            for roi_buffers in self._roi_buffers_by_split["log_only"].values():
+                for pred_buf, count_buf, _offset in roi_buffers:
+                    pred_buf.fill(0)
+                    count_buf.fill(0)
             log_only_mode = False
         if log_only_mode and (not sanity_checking):
             did_run_log_only = self.run_log_only_stitch_pass(model)
@@ -576,43 +704,31 @@ class StitchManager:
         did_sync_val_buffers = self.sync_val_buffers_distributed(model)
         if did_sync_val_buffers and (not is_global_zero):
             # Non-zero ranks are done once global stitched val buffers are reduced.
-            for pred_buf, count_buf in self.buffers.values():
-                pred_buf.fill(0)
-                count_buf.fill(0)
+            for roi_buffers in self._roi_buffers_by_split["val"].values():
+                for pred_buf, count_buf, _offset in roi_buffers:
+                    pred_buf.fill(0)
+                    count_buf.fill(0)
             return
 
         log_train_stitch = bool(stitch_train_mode and did_run_train_stitch)
 
         segment_to_val = {}
         segment_to_val_meta = {}
-        for loader_idx, (pred_buf, count_buf) in self.buffers.items():
-            segment_id = self.segment_ids.get(loader_idx, str(loader_idx))
-            stitched = np.divide(
-                pred_buf,
-                count_buf,
-                out=np.zeros_like(pred_buf),
-                where=count_buf != 0,
-            )
-            segment_id = str(segment_id)
-            segment_to_val[segment_id] = (np.clip(stitched, 0, 1), (count_buf != 0))
-            meta = self.buffer_meta.get(int(loader_idx), {})
-            segment_to_val_meta[segment_id] = {
-                "offset": meta.get("offset", (0, 0)),
-                "full_shape": meta.get("full_shape", stitched.shape),
+        for loader_idx, segment_id in self._val_loader_to_segment.items():
+            sid = str(segment_id)
+            roi_buffers = self._roi_buffers_by_split["val"].get(sid)
+            if not roi_buffers:
+                continue
+            meta = self._roi_meta_by_split["val"].get(sid)
+            if meta is None:
+                raise ValueError(f"Missing val ROI metadata for segment_id={sid!r}")
+            full_shape = tuple(meta.get("full_shape", roi_buffers[0][0].shape))
+            base, has = self._compose_segment_from_roi_buffers(roi_buffers, full_shape)
+            segment_to_val[sid] = (base, has)
+            segment_to_val_meta[sid] = {
+                "offset": (0, 0),
+                "full_shape": full_shape,
             }
-
-        def _expand_to_full(img, has, meta):
-            offset = meta.get("offset", (0, 0))
-            full_shape = meta.get("full_shape", img.shape)
-            if offset == (0, 0) and tuple(full_shape) == tuple(img.shape):
-                return img, has
-            y0, x0 = [int(v) for v in offset]
-            full = np.zeros(tuple(full_shape), dtype=img.dtype)
-            full_has = np.zeros(tuple(full_shape), dtype=bool)
-            h, w = img.shape
-            full[y0 : y0 + h, x0 : x0 + w] = img
-            full_has[y0 : y0 + h, x0 : x0 + w] = has
-            return full, full_has
 
         def _to_u8(img_float):
             return (np.clip(img_float, 0.0, 1.0) * 255.0).astype(np.uint8)
@@ -648,7 +764,33 @@ class StitchManager:
                     raise ValueError(f"source_downsample must be >= 1, got {source_downsample}")
                 if source_downsample > 1 or wandb_media_downsample == 1:
                     return img
-                return np.ascontiguousarray(img[::wandb_media_downsample, ::wandb_media_downsample])
+                in_h, in_w = img.shape[:2]
+                factor = int(wandb_media_downsample)
+                if (in_h % factor) == 0 and (in_w % factor) == 0:
+                    out_h = in_h // factor
+                    out_w = in_w // factor
+                    if img.ndim == 2:
+                        reduced = img.reshape(out_h, factor, out_w, factor).mean(axis=(1, 3))
+                    elif img.ndim == 3:
+                        channels = int(img.shape[2])
+                        reduced = img.reshape(out_h, factor, out_w, factor, channels).mean(axis=(1, 3))
+                    else:
+                        raise ValueError(f"Unsupported image ndim for W&B downsample: {img.ndim}")
+                    if img.dtype == np.uint8:
+                        reduced = np.clip(np.rint(reduced), 0.0, 255.0).astype(np.uint8, copy=False)
+                    else:
+                        reduced = reduced.astype(img.dtype, copy=False)
+                    return np.ascontiguousarray(reduced)
+                out_h = max(1, (int(in_h) + factor - 1) // factor)
+                out_w = max(1, (int(in_w) + factor - 1) // factor)
+                if out_h == in_h and out_w == in_w:
+                    return img
+                resized = cv2.resize(
+                    img,
+                    (out_w, out_h),
+                    interpolation=cv2.INTER_AREA,
+                )
+                return np.ascontiguousarray(resized)
 
             masks_logged = 0
             masks_log_only_logged = 0
@@ -660,15 +802,15 @@ class StitchManager:
                     val_has = None
                     if segment_id in segment_to_val:
                         val_img, val_cov = segment_to_val[segment_id]
-                        val_meta = segment_to_val_meta.get(segment_id, {})
-                        val_base, val_has = _expand_to_full(val_img, val_cov, val_meta)
-                        val_base = _to_u8(val_base)
+                        val_base = _to_u8(val_img)
+                        val_has = val_cov
 
                     train_base = None
                     train_has = None
                     if segment_id in train_segment_viz:
                         entry = train_segment_viz[segment_id]
-                        train_base, train_has = _expand_to_full(entry["img_u8"], entry["has"], entry["meta"])
+                        train_base = entry["img_u8"]
+                        train_has = entry["has"]
 
                     if val_base is None and train_base is None:
                         continue
@@ -702,16 +844,8 @@ class StitchManager:
                     masks_logged += 1
             else:
                 want_color = bool(self.train_enabled)
-                for loader_idx, (pred_buf, count_buf) in self.buffers.items():
-                    stitched = np.divide(
-                        pred_buf,
-                        count_buf,
-                        out=np.zeros_like(pred_buf),
-                        where=count_buf != 0,
-                    )
-                    segment_id = str(self.segment_ids.get(loader_idx, str(loader_idx)))
-                    base = np.clip(stitched, 0, 1)
-                    base, _ = _expand_to_full(base, count_buf != 0, segment_to_val_meta.get(segment_id, {}))
+                for segment_id, (base, covered) in segment_to_val.items():
+                    base = np.clip(base, 0, 1)
                     base_u8 = _to_u8(base)
                     if want_color:
                         image = _add_borders_rgb(base_u8, segment_id)
@@ -728,17 +862,18 @@ class StitchManager:
 
             if log_only_mode:
                 for segment_id in self.log_only_segment_ids:
-                    pred_buf, count_buf = self.log_only_buffers[str(segment_id)]
-                    stitched = np.divide(
-                        pred_buf,
-                        count_buf,
-                        out=np.zeros_like(pred_buf),
-                        where=count_buf != 0,
-                    )
-                    meta = self.log_only_buffer_meta.get(str(segment_id), {})
-                    base = np.clip(stitched, 0, 1)
-                    base, _ = _expand_to_full(base, count_buf != 0, meta)
-                    image = _downsample_for_wandb(_to_u8(base), source_downsample=int(self.log_only_downsample))
+                    sid = str(segment_id)
+                    roi_buffers = self._roi_buffers_by_split["log_only"].get(sid)
+                    if not roi_buffers:
+                        raise ValueError(f"Missing log-only stitch ROI buffers for segment_id={sid!r}")
+                    meta = self._roi_meta_by_split["log_only"].get(sid)
+                    if meta is None:
+                        raise ValueError(f"Missing log-only ROI metadata for segment_id={sid!r}")
+                    full_shape = tuple(meta.get("full_shape", roi_buffers[0][0].shape))
+                    base, _ = self._compose_segment_from_roi_buffers(roi_buffers, full_shape)
+                    base = np.clip(base, 0, 1)
+                    image = _to_u8(base)
+                    image = _downsample_for_wandb(image, source_downsample=int(self.log_only_downsample))
                     safe_segment_id = str(segment_id).replace("/", "_")
                     model.logger.log_image(
                         key=f"masks_log_only/{safe_segment_id}",
@@ -1026,13 +1161,15 @@ class StitchManager:
                             ] = ",".join(str(v) for v in q_ids)
 
         # reset stitch buffers
-        for pred_buf, count_buf in self.buffers.values():
-            pred_buf.fill(0)
-            count_buf.fill(0)
-        if log_only_mode:
-            for pred_buf, count_buf in self.log_only_buffers.values():
+        for roi_buffers in self._roi_buffers_by_split["val"].values():
+            for pred_buf, count_buf, _offset in roi_buffers:
                 pred_buf.fill(0)
                 count_buf.fill(0)
+        if log_only_mode:
+            for roi_buffers in self._roi_buffers_by_split["log_only"].values():
+                for pred_buf, count_buf, _offset in roi_buffers:
+                    pred_buf.fill(0)
+                    count_buf.fill(0)
 
 class RegressionPLModel(pl.LightningModule):
     def __init__(
@@ -1139,8 +1276,18 @@ class RegressionPLModel(pl.LightningModule):
         self.loss_func1 = smp.losses.DiceLoss(mode="binary")
         self.loss_func2 = smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
 
+        resnet3d_model_depth = getattr(CFG, "resnet3d_model_depth", None)
+        if resnet3d_model_depth is None:
+            raise KeyError("CFG.resnet3d_model_depth is required")
+        resnet3d_model_depth = int(resnet3d_model_depth)
+        if resnet3d_model_depth not in {50, 101, 152}:
+            raise ValueError(
+                "CFG.resnet3d_model_depth must be one of [50, 101, 152], "
+                f"got {resnet3d_model_depth}"
+            )
+
         self.backbone = generate_model(
-            model_depth=50,
+            model_depth=resnet3d_model_depth,
             n_input_channels=1,
             forward_features=True,
             n_classes=1039,
@@ -1150,11 +1297,21 @@ class RegressionPLModel(pl.LightningModule):
         group_norm_groups = int(group_norm_groups)
         init_ckpt_path = getattr(CFG, "init_ckpt_path", None)
         if not init_ckpt_path:
-            backbone_pretrained_path = getattr(CFG, "backbone_pretrained_path", "./r3d50_KM_200ep.pth")
+            backbone_pretrained_path = getattr(CFG, "backbone_pretrained_path", None)
+            if not isinstance(backbone_pretrained_path, str):
+                raise TypeError(
+                    "CFG.backbone_pretrained_path must be a string when init_ckpt_path is not provided, "
+                    f"got {type(backbone_pretrained_path).__name__}"
+                )
+            backbone_pretrained_path = backbone_pretrained_path.strip()
+            if not backbone_pretrained_path:
+                raise ValueError(
+                    "CFG.backbone_pretrained_path must be non-empty when init_ckpt_path is not provided"
+                )
             if not osp.exists(backbone_pretrained_path):
                 raise FileNotFoundError(
                     f"Missing backbone pretrained weights: {backbone_pretrained_path}. "
-                    "Either place r3d50_KM_200ep.pth next to train_resnet3d.py, set CFG.backbone_pretrained_path, "
+                    "Set training_hyperparameters.model.backbone_pretrained_path to a valid file, "
                     "or pass --init_ckpt_path to fine-tune from a previous run."
                 )
             backbone_ckpt = torch.load(backbone_pretrained_path, map_location="cpu")
@@ -1234,18 +1391,23 @@ class RegressionPLModel(pl.LightningModule):
         self._train_group_count = torch.zeros(self.n_groups, device=device)
 
     def _update_train_stats(self, per_sample_loss, per_sample_dice, group_idx):
-        self._train_loss_sum += per_sample_loss.sum()
-        self._train_dice_sum += per_sample_dice.sum()
-        self._train_count += float(per_sample_loss.numel())
+        # Keep epoch-level bookkeeping off the autograd graph to avoid retaining step history.
+        with torch.no_grad():
+            loss_det = per_sample_loss.detach()
+            dice_det = per_sample_dice.detach()
+            group_idx = group_idx.long()
 
-        group_idx = group_idx.long()
-        self._train_group_loss_sum.scatter_add_(0, group_idx, per_sample_loss)
-        self._train_group_dice_sum.scatter_add_(0, group_idx, per_sample_dice)
-        self._train_group_count.scatter_add_(
-            0,
-            group_idx,
-            torch.ones_like(per_sample_loss, dtype=self._train_group_count.dtype),
-        )
+            self._train_loss_sum += loss_det.sum()
+            self._train_dice_sum += dice_det.sum()
+            self._train_count += float(loss_det.numel())
+
+            self._train_group_loss_sum.scatter_add_(0, group_idx, loss_det)
+            self._train_group_dice_sum.scatter_add_(0, group_idx, dice_det)
+            self._train_group_count.scatter_add_(
+                0,
+                group_idx,
+                torch.ones_like(loss_det, dtype=self._train_group_count.dtype),
+            )
 
     def forward(self, x):
         if x.ndim == 4:

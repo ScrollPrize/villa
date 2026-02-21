@@ -36,6 +36,8 @@ class CFG:
     # backbone = 'efficientnet-b0'
     # backbone = 'se_resnext50_32x4d'
     backbone = 'resnet3d'
+    resnet3d_model_depth = 50
+    backbone_pretrained_path = "./r3d50_KM_200ep.pth"
     in_chans = 62  # 65
     encoder_depth = 5
     norm = "batch"  # "batch" | "group"
@@ -84,13 +86,18 @@ class CFG:
     val_mask_suffix = "_val"
     data_backend = "zarr"  # "zarr" (default) | "tiff"
     dataset_root = "train_scrolls"
+    dataset_cache_enabled = True
+    dataset_cache_check_hash = True
+    dataset_cache_dir = "./dataset_cache/train_resnet3d_patch_index"
 
     # ============== group DRO cfg =============
     objective = "erm"  # "erm" | "group_dro"
     sampler = "shuffle"  # "shuffle" | "group_balanced" | "group_stratified"
+    group_stratified_epoch_size_mode = "dataset"  # "dataset" | "min_group"
     loss_mode = "batch"  # "batch" | "per_sample"
     erm_group_topk = 0  # if >0 and objective=erm+per_sample: optimize mean(worst-k group losses) per batch
     save_every_epoch = False
+    save_every_n_epochs = 1
     accumulate_grad_batches = 1
 
     # ============== eval metrics cfg (validation-only) =============
@@ -124,6 +131,9 @@ class CFG:
 
     min_lr = 1e-6
     weight_decay = 1e-6
+    max_clip_value = 200
+    normalization_mode = "clip_max_div255"
+    fold_label_foreground_percentile_clip_zscore_stats = None
     exclude_weight_decay_bias_norm = True
     max_grad_norm = 100
 
@@ -153,6 +163,7 @@ class CFG:
     fourth_augment_max_crop_ratio = 1.0
     fourth_augment_cutout_max_count = 2
     fourth_augment_cutout_p = 0.6
+    invert_augment_p = 0.0
 
 
 def set_seed(seed=None, cudnn_deterministic=True):
@@ -239,6 +250,116 @@ def parse_bool_strict(value, *, key):
             return bool(value)
         raise ValueError(f"{key} must be a boolean, got {value!r}")
     raise ValueError(f"{key} must be a boolean, got {value!r}")
+
+
+def parse_optional_positive_int_strict(value, *, key):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a positive integer or null, got {value!r}")
+    if isinstance(value, int):
+        parsed_value = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{key} must be a positive integer or null, got {value!r}")
+        parsed_value = int(value)
+    elif isinstance(value, str):
+        parsed_text = value.strip().lower()
+        if parsed_text in {"none", "null"}:
+            return None
+        if not re.fullmatch(r"[+-]?\d+", parsed_text):
+            raise ValueError(f"{key} must be a positive integer or null, got {value!r}")
+        parsed_value = int(parsed_text)
+    else:
+        raise ValueError(f"{key} must be a positive integer or null, got {value!r}")
+    if parsed_value <= 0:
+        raise ValueError(f"{key} must be > 0 when provided, got {parsed_value}")
+    return parsed_value
+
+
+def parse_normalization_mode_strict(value, *, key):
+    if not isinstance(value, str):
+        raise TypeError(f"{key} must be a string, got {type(value).__name__}")
+    parsed_value = value.strip().lower()
+    valid_modes = {
+        "clip_max_div255",
+        "train_fold_fg_clip_zscore",
+    }
+    if parsed_value not in valid_modes:
+        raise ValueError(
+            f"{key} must be one of {sorted(valid_modes)!r}, got {value!r}"
+        )
+    return parsed_value
+
+
+def _validate_patch_grid(cfg):
+    size = int(getattr(cfg, "size"))
+    tile_size = int(getattr(cfg, "tile_size"))
+    stride = int(getattr(cfg, "stride"))
+    if tile_size % size != 0:
+        raise ValueError(
+            "training_hyperparameters.training.tile_size must be a multiple of "
+            "training_hyperparameters.training.size, "
+            f"got tile_size={tile_size} size={size}"
+        )
+    if stride > size:
+        log(
+            "WARNING: training_hyperparameters.training.stride is larger than "
+            f"size ({stride} > {size}); this creates gaps between neighboring patches."
+        )
+
+
+def _validate_stitch_grid_alignment(cfg):
+    ds = int(getattr(cfg, "stitch_downsample", 1) or 1)
+    if ds <= 1:
+        return
+    size = int(getattr(cfg, "size"))
+    stride = int(getattr(cfg, "stride"))
+    misaligned = []
+    if size % ds != 0:
+        misaligned.append(f"size={size}")
+    if stride % ds != 0:
+        misaligned.append(f"stride={stride}")
+    if misaligned:
+        joined = ", ".join(misaligned)
+        raise ValueError(
+            "metadata.training.stitch_downsample requires a downsample-aligned patch grid. "
+            "Expected both training_hyperparameters.training.size and "
+            f"training_hyperparameters.training.stride to be divisible by stitch_downsample={ds}; "
+            f"got {joined}."
+        )
+
+
+def _apply_fold_label_foreground_percentile_clip_zscore(image, **kwargs):
+    stats = getattr(CFG, "fold_label_foreground_percentile_clip_zscore_stats", None)
+    if not isinstance(stats, dict):
+        raise ValueError(
+            "CFG.fold_label_foreground_percentile_clip_zscore_stats must be computed "
+            "before using normalization_mode='train_fold_fg_clip_zscore'"
+        )
+    lower_bound = float(stats["percentile_00_5"])
+    upper_bound = float(stats["percentile_99_5"])
+    mean_intensity = float(stats["mean"])
+    std_intensity = float(stats["std"])
+    if std_intensity <= 0:
+        raise ValueError(
+            "CFG.fold_label_foreground_percentile_clip_zscore_stats['std'] must be > 0, "
+            f"got {std_intensity}"
+        )
+    image = image.astype(np.float32, copy=True)
+    np.clip(image, lower_bound, upper_bound, out=image)
+    image -= mean_intensity
+    image /= std_intensity
+    return image
+
+
+def _build_intensity_normalization_transform(cfg, *, in_chans):
+    mode = str(getattr(cfg, "normalization_mode", "clip_max_div255")).strip().lower()
+    if mode == "clip_max_div255":
+        return A.Normalize(mean=[0] * in_chans, std=[1] * in_chans)
+    if mode == "train_fold_fg_clip_zscore":
+        return A.Lambda(image=_apply_fold_label_foreground_percentile_clip_zscore, p=1.0)
+    raise ValueError(f"Unsupported normalization_mode: {mode!r}")
 
 
 def normalize_wandb_config(wandb_cfg, *, key_prefix="metadata_json.wandb"):
@@ -353,6 +474,7 @@ def rebuild_augmentations(cfg, augmentation_cfg=None):
     size = cfg.size
     in_chans = cfg.in_chans
     fourth_augment_cfg = augmentation_cfg["fourth_augment"]
+    invert_cfg = augmentation_cfg.get("invert")
     required_fourth_augment_keys = (
         "p",
         "min_crop_ratio",
@@ -372,6 +494,7 @@ def rebuild_augmentations(cfg, augmentation_cfg=None):
     cfg.fourth_augment_max_crop_ratio = float(fourth_augment_cfg["max_crop_ratio"])
     cfg.fourth_augment_cutout_max_count = int(fourth_augment_cfg["cutout_max_count"])
     cfg.fourth_augment_cutout_p = float(fourth_augment_cfg["cutout_p"])
+    cfg.invert_augment_p = 0.0 if invert_cfg is None else float(invert_cfg["p"])
 
     if not (0.0 <= cfg.fourth_augment_p <= 1.0):
         raise ValueError(f"augmentation.fourth_augment.p must be in [0,1], got {cfg.fourth_augment_p}")
@@ -389,6 +512,8 @@ def rebuild_augmentations(cfg, augmentation_cfg=None):
         raise ValueError(
             f"augmentation.fourth_augment.cutout_p must be in [0,1], got {cfg.fourth_augment_cutout_p}"
         )
+    if not (0.0 <= cfg.invert_augment_p <= 1.0):
+        raise ValueError(f"augmentation.invert.p must be in [0,1], got {cfg.invert_augment_p}")
 
     hflip_p = float(augmentation_cfg.get("horizontal_flip", 0.5))
     vflip_p = float(augmentation_cfg.get("vertical_flip", 0.5))
@@ -433,6 +558,8 @@ def rebuild_augmentations(cfg, augmentation_cfg=None):
             mask_fill_value=0,
             p=coarse_dropout_p,
         )
+    train_normalization_transform = _build_intensity_normalization_transform(cfg, in_chans=in_chans)
+    valid_normalization_transform = _build_intensity_normalization_transform(cfg, in_chans=in_chans)
 
     cfg.train_aug_list = [
         A.Resize(size, size),
@@ -447,13 +574,13 @@ def rebuild_augmentations(cfg, augmentation_cfg=None):
         ),
         A.OneOf(blur_transforms or [A.GaussianBlur(), A.MotionBlur()], p=float(blur_cfg.get("p", 0.4))),
         coarse_dropout,
-        A.Normalize(mean=[0] * in_chans, std=[1] * in_chans),
+        train_normalization_transform,
         ToTensorV2(transpose_mask=True),
     ]
 
     cfg.valid_aug_list = [
         A.Resize(size, size),
-        A.Normalize(mean=[0] * in_chans, std=[1] * in_chans),
+        valid_normalization_transform,
         ToTensorV2(transpose_mask=True),
     ]
 
@@ -476,7 +603,17 @@ def apply_metadata_hyperparameters(cfg, metadata):
     model_hp = hp["model"]
     train_hp = hp["training"]
     training_cfg = metadata["training"]
-    required_model_keys = ["model_name", "backbone", "encoder_depth", "target_size", "in_chans", "norm", "group_norm_groups"]
+    required_model_keys = [
+        "model_name",
+        "backbone",
+        "resnet3d_model_depth",
+        "backbone_pretrained_path",
+        "encoder_depth",
+        "target_size",
+        "in_chans",
+        "norm",
+        "group_norm_groups",
+    ]
     missing_model_keys = [k for k in required_model_keys if k not in model_hp]
     if missing_model_keys:
         raise KeyError(f"metadata.training_hyperparameters.model missing required keys: {missing_model_keys}")
@@ -506,7 +643,17 @@ def apply_metadata_hyperparameters(cfg, metadata):
             setattr(cfg, "norm", str(model_hp[k]).lower())
         elif k == "group_norm_groups":
             setattr(cfg, "group_norm_groups", int(model_hp[k]))
-        elif k in {"encoder_depth", "target_size", "in_chans"}:
+        elif k == "backbone_pretrained_path":
+            if not isinstance(model_hp[k], str):
+                raise TypeError(
+                    "metadata.training_hyperparameters.model.backbone_pretrained_path must be a string, "
+                    f"got {type(model_hp[k]).__name__}"
+                )
+            normalized_pretrained_path = model_hp[k].strip()
+            if not normalized_pretrained_path:
+                raise ValueError("metadata.training_hyperparameters.model.backbone_pretrained_path must be non-empty")
+            setattr(cfg, k, normalized_pretrained_path)
+        elif k in {"encoder_depth", "target_size", "in_chans", "resnet3d_model_depth"}:
             setattr(cfg, k, int(model_hp[k]))
         else:
             setattr(cfg, k, model_hp[k])
@@ -534,6 +681,8 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("cosine_warmup_pct", "cosine_warmup_pct"),
         ("min_lr", "min_lr"),
         ("weight_decay", "weight_decay"),
+        ("max_clip_value", "max_clip_value"),
+        ("normalization_mode", "normalization_mode"),
         ("exclude_weight_decay_bias_norm", "exclude_weight_decay_bias_norm"),
         ("max_grad_norm", "max_grad_norm"),
         ("eval_threshold", "eval_threshold"),
@@ -570,6 +719,7 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("tile_size", "training_hyperparameters.training.tile_size", 1),
         ("stride", "training_hyperparameters.training.stride", 1),
         ("in_chans", "training_hyperparameters.model.in_chans", 1),
+        ("resnet3d_model_depth", "training_hyperparameters.model.resnet3d_model_depth", 1),
         ("train_batch_size", "training_hyperparameters.training.train_batch_size", 1),
         ("valid_batch_size", "training_hyperparameters.training.valid_batch_size", 1),
         ("epochs", "training_hyperparameters.training.epochs", 1),
@@ -584,9 +734,15 @@ def apply_metadata_hyperparameters(cfg, metadata):
             constraint = ">= 0" if min_value == 0 else "> 0"
             raise ValueError(f"{meta_key} must be {constraint}, got {value}")
     cfg.seed = int(cfg.seed)
+    _validate_patch_grid(cfg)
 
     if cfg.norm not in {"batch", "group"}:
         raise ValueError(f"training_hyperparameters.model.norm must be 'batch' or 'group', got {cfg.norm!r}")
+    if cfg.resnet3d_model_depth not in {50, 101, 152}:
+        raise ValueError(
+            "training_hyperparameters.model.resnet3d_model_depth must be one of [50, 101, 152], "
+            f"got {cfg.resnet3d_model_depth}"
+        )
 
     cfg.optimizer = str(getattr(cfg, "optimizer", "adamw")).strip().lower()
     if cfg.optimizer not in {"adamw", "sgd"}:
@@ -624,12 +780,31 @@ def apply_metadata_hyperparameters(cfg, metadata):
 
     cfg.objective = str(training_cfg.get("objective", getattr(cfg, "objective", "erm"))).lower()
     cfg.sampler = str(training_cfg.get("sampler", getattr(cfg, "sampler", "shuffle"))).lower()
+    cfg.group_stratified_epoch_size_mode = str(
+        training_cfg.get(
+            "group_stratified_epoch_size_mode",
+            getattr(cfg, "group_stratified_epoch_size_mode", "dataset"),
+        )
+    ).strip().lower()
+    if cfg.group_stratified_epoch_size_mode not in {"dataset", "min_group"}:
+        raise ValueError(
+            "metadata.training.group_stratified_epoch_size_mode must be "
+            f"'dataset' or 'min_group', got {cfg.group_stratified_epoch_size_mode!r}"
+        )
     cfg.loss_mode = str(training_cfg.get("loss_mode", getattr(cfg, "loss_mode", "batch"))).lower()
     cfg.erm_group_topk = int(training_cfg.get("erm_group_topk", getattr(cfg, "erm_group_topk", 0) or 0))
     cfg.save_every_epoch = parse_bool_strict(
         training_cfg.get("save_every_epoch", getattr(cfg, "save_every_epoch", False)),
         key="metadata.training.save_every_epoch",
     )
+    cfg.save_every_n_epochs = int(
+        training_cfg.get("save_every_n_epochs", getattr(cfg, "save_every_n_epochs", 1) or 1)
+    )
+    if cfg.save_every_n_epochs < 1:
+        raise ValueError(
+            "metadata.training.save_every_n_epochs must be >= 1, "
+            f"got {cfg.save_every_n_epochs}"
+        )
     cfg.stitch_all_val = parse_bool_strict(
         training_cfg.get("stitch_all_val", getattr(cfg, "stitch_all_val", False)),
         key="metadata.training.stitch_all_val",
@@ -642,6 +817,27 @@ def apply_metadata_hyperparameters(cfg, metadata):
     if cfg.data_backend not in {"zarr", "tiff"}:
         raise ValueError(f"training.data_backend must be 'zarr' or 'tiff', got {cfg.data_backend!r}")
     cfg.dataset_root = str(training_cfg.get("dataset_root", getattr(cfg, "dataset_root", "train_scrolls")))
+    cfg.dataset_cache_enabled = parse_bool_strict(
+        training_cfg.get("dataset_cache_enabled", getattr(cfg, "dataset_cache_enabled", True)),
+        key="metadata.training.dataset_cache_enabled",
+    )
+    cfg.dataset_cache_check_hash = parse_bool_strict(
+        training_cfg.get("dataset_cache_check_hash", getattr(cfg, "dataset_cache_check_hash", True)),
+        key="metadata.training.dataset_cache_check_hash",
+    )
+    dataset_cache_dir = training_cfg.get(
+        "dataset_cache_dir",
+        getattr(cfg, "dataset_cache_dir", "./dataset_cache/train_resnet3d_patch_index"),
+    )
+    if not isinstance(dataset_cache_dir, str):
+        raise TypeError(
+            "metadata.training.dataset_cache_dir must be a string, "
+            f"got {type(dataset_cache_dir).__name__}"
+        )
+    dataset_cache_dir = dataset_cache_dir.strip()
+    if not dataset_cache_dir:
+        raise ValueError("metadata.training.dataset_cache_dir must be a non-empty string")
+    cfg.dataset_cache_dir = dataset_cache_dir
     cfg.stitch_log_only_segments = list(
         training_cfg.get("stitch_log_only_segments", getattr(cfg, "stitch_log_only_segments", [])) or []
     )
@@ -696,6 +892,7 @@ def apply_metadata_hyperparameters(cfg, metadata):
     else:
         cfg.stitch_downsample = 8 if cfg.stitch_all_val else int(getattr(cfg, "stitch_downsample", 1))
     cfg.stitch_downsample = max(1, int(cfg.stitch_downsample))
+    _validate_stitch_grid_alignment(cfg)
 
     if cfg.eval_stitch_every_n_epochs < 1:
         raise ValueError(
@@ -740,6 +937,24 @@ def apply_metadata_hyperparameters(cfg, metadata):
         getattr(cfg, "eval_enable_skeleton_metrics", True),
         key="training_hyperparameters.training.eval_enable_skeleton_metrics",
     )
+    cfg.max_clip_value = parse_optional_positive_int_strict(
+        getattr(cfg, "max_clip_value", 200),
+        key="training_hyperparameters.training.max_clip_value",
+    )
+    cfg.normalization_mode = parse_normalization_mode_strict(
+        getattr(cfg, "normalization_mode", "clip_max_div255"),
+        key="training_hyperparameters.training.normalization_mode",
+    )
+    cfg.fold_label_foreground_percentile_clip_zscore_stats = None
+    if (
+        cfg.normalization_mode == "train_fold_fg_clip_zscore"
+        and cfg.max_clip_value is not None
+    ):
+        raise ValueError(
+            "training_hyperparameters.training.max_clip_value must be null when "
+            "training_hyperparameters.training.normalization_mode is "
+            "'train_fold_fg_clip_zscore'"
+        )
     cv_fold = training_cfg.get("cv_fold", getattr(cfg, "cv_fold", None))
     if isinstance(cv_fold, str) and cv_fold.strip().lower() in {"", "none", "null"}:
         cv_fold = None

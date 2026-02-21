@@ -74,6 +74,18 @@ def _compute_selected_layer_indices(fragment_id, layer_range):
     return [int(i) for i in idxs]
 
 
+def _clip_intensity_inplace(image):
+    normalization_mode = str(getattr(CFG, "normalization_mode", "clip_max_div255")).strip().lower()
+    if normalization_mode == "clip_max_div255":
+        if CFG.max_clip_value is None:
+            return
+        np.clip(image, 0, int(CFG.max_clip_value), out=image)
+        return
+    if normalization_mode == "train_fold_fg_clip_zscore":
+        return
+    raise ValueError(f"Unsupported normalization_mode: {normalization_mode!r}")
+
+
 def read_image_layers(
     fragment_id,
     *,
@@ -111,7 +123,7 @@ def read_image_layers(
     out_w = base_w + pad1
 
     images = np.zeros((out_h, out_w, len(idxs)), dtype=first.dtype)
-    np.clip(first, 0, 200, out=first)
+    _clip_intensity_inplace(first)
     images[:base_h, :base_w, 0] = first
 
     def _load_and_write(task):
@@ -129,7 +141,7 @@ def read_image_layers(
             raise ValueError(
                 f"{fragment_id}: layer {i:02} has shape {img.shape} but expected {(base_h, base_w)}"
             )
-        np.clip(img, 0, 200, out=img)
+        _clip_intensity_inplace(img)
         images[:base_h, :base_w, chan] = img
         return None
 
@@ -509,7 +521,7 @@ class ZarrSegmentVolume:
         patch = self._read_patch(y1, y2, x1, x2)
 
         patch = _from_uint16_to_uint8(patch, fragment_id=self.fragment_id)
-        np.clip(patch, 0, 200, out=patch)
+        _clip_intensity_inplace(patch)
 
         expected = (int(y2 - y1), int(x2 - x1), int(CFG.in_chans))
         if patch.shape != expected:
@@ -973,16 +985,11 @@ def _downsample_bool_mask_any(mask: np.ndarray, ds: int) -> np.ndarray:
     return mask_bool.any(axis=(1, 3))
 
 
-def _mask_bbox_downsample(mask: np.ndarray, ds: int) -> tuple[int, int, int, int] | None:
+def _mask_component_bboxes_downsample(mask: np.ndarray, ds: int) -> np.ndarray:
     mask_ds = _downsample_bool_mask_any(mask, int(ds))
     if not mask_ds.any():
-        return None
-    ys, xs = np.where(mask_ds)
-    y0 = int(ys.min())
-    y1 = int(ys.max()) + 1
-    x0 = int(xs.min())
-    x1 = int(xs.max()) + 1
-    return (y0, y1, x0, x1)
+        return np.zeros((0, 4), dtype=np.int32)
+    return _component_bboxes(mask_ds.astype(np.uint8, copy=False), connectivity=2)
 
 
 def _mask_border(mask_bool: np.ndarray) -> np.ndarray:
@@ -1101,6 +1108,33 @@ def _maybe_fourth_augment(image, cfg):
     return image
 
 
+def _invert_augment(image):
+    if not isinstance(image, np.ndarray):
+        raise TypeError(f"image must be a numpy array, got {type(image).__name__}")
+    if image.size == 0:
+        raise ValueError("image must be non-empty for invert augment")
+
+    min_value = image.min()
+    max_value = image.max()
+    if np.issubdtype(image.dtype, np.integer):
+        image_i64 = image.astype(np.int64, copy=False)
+        inverted = (np.int64(min_value) + np.int64(max_value)) - image_i64
+        return inverted.astype(image.dtype, copy=False)
+    if np.issubdtype(image.dtype, np.floating):
+        inverted = (float(min_value) + float(max_value)) - image
+        return inverted.astype(image.dtype, copy=False)
+    raise TypeError(f"unsupported image dtype for invert augment: {image.dtype}")
+
+
+def _maybe_invert_augment(image, cfg):
+    p = float(cfg.invert_augment_p)
+    if not (0.0 <= p <= 1.0):
+        raise ValueError(f"invert_augment_p must be in [0, 1], got {p}")
+    if random.random() < p:
+        return _invert_augment(image)
+    return image
+
+
 class CustomDataset(Dataset):
     def __init__(self, images, cfg, xyxys=None, labels=None, groups=None, transform=None):
         self.images = images
@@ -1137,6 +1171,7 @@ class CustomDataset(Dataset):
             # image=image.transpose(2,1,0)#(h,w,c)
 
             image = _maybe_fourth_augment(image, self.cfg)
+            image = _maybe_invert_augment(image, self.cfg)
             image, label = _apply_joint_transform(self.transform, image, label, self.cfg)
             return image, label, group_id
 
@@ -1299,6 +1334,7 @@ class LazyZarrTrainDataset(Dataset):
         image = self.volumes[segment_id].read_patch(y1, y2, x1, x2)
         label = _read_mask_patch(self.masks[segment_id], y1=y1, y2=y2, x1=x1, x2=x2, bbox_index=bbox_idx)[..., None]
         image = _maybe_fourth_augment(image, self.cfg)
+        image = _maybe_invert_augment(image, self.cfg)
         image, label = _apply_joint_transform(self.transform, image, label, self.cfg)
 
         return image, label, group_id
