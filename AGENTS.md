@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file defines how automated agents (Codex, Claude, chat-based coding agents, CI bots, etc.) should operate inside the **`villa/`** monorepo.
+This file defines how automated agents (Codex, Claude, chat-based coding agents, CI bots, etc.) should operate inside this monorepo.
 
 The repo contains multiple subprojects with different languages, runtimes, and constraints. **Do not assume one “global” build/run workflow applies everywhere.** Instead:
 
