@@ -1538,12 +1538,17 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     for(auto sm : approved_sm)
         std::cout << "approved: " << sm->id << std::endl;
 
-    // Build overlapping map: for each surface, collect pointers to its overlapping surfaces
+    // Build overlapping map: for each surface, collect pointers to its overlapping surfaces.
+    // Mirror links as a safety net for one-sided overlap metadata so candidate expansion can
+    // still traverse both ways.
     std::unordered_map<QuadSurface*, std::set<QuadSurface*>> overlapping_map;
     for(auto &sm : surfs_v)
         for(const auto& name : sm->overlappingIds())
-            if (surfs.contains(name))
-                overlapping_map[sm].insert(surfs[name]);
+            if (surfs.contains(name)) {
+                auto* other = surfs[name];
+                overlapping_map[sm].insert(other);
+                overlapping_map[other].insert(sm);
+            }
 
     SurfacePatchIndex patch_index;
     SurfacePatchIndex* patch_index_ptr = nullptr;
