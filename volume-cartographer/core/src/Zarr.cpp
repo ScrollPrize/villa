@@ -234,7 +234,8 @@ void writeZarrAttrs(z5::filesystem::handle::File& outFile,
                     const std::filesystem::path& volPath, int groupIdx,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
-                    const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW)
+                    const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
+                    double baseVoxelSize, const std::string& voxelUnit)
 {
     json attrs;
     attrs["source_zarr"] = volPath.string();
@@ -253,17 +254,18 @@ void writeZarrAttrs(z5::filesystem::handle::File& outFile,
     json ms;
     ms["version"] = "0.4"; ms["name"] = "render";
     ms["axes"] = json::array({
-        json{{"name","z"},{"type","space"}},
-        json{{"name","y"},{"type","space"}},
-        json{{"name","x"},{"type","space"}}
+        json{{"name","z"},{"type","space"},{"unit",voxelUnit}},
+        json{{"name","y"},{"type","space"},{"unit",voxelUnit}},
+        json{{"name","x"},{"type","space"},{"unit",voxelUnit}}
     });
     ms["datasets"] = json::array();
     for (int l = 0; l <= 5; l++) {
-        double s = std::pow(2.0, l);
+        const double levelScale = std::pow(2.0, l);
+        const double physicalScale = baseVoxelSize * levelScale;
         ms["datasets"].push_back({
             {"path", std::to_string(l)},
             {"coordinateTransformations", json::array({
-                json{{"type","scale"},{"scale",json::array({s,s,s})}},
+                json{{"type","scale"},{"scale",json::array({physicalScale,physicalScale,physicalScale})}},
                 json{{"type","translation"},{"translation",json::array({0.0,0.0,0.0})}}
             })}
         });
