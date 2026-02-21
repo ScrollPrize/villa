@@ -22,7 +22,11 @@ Our implementation uses `torch`, `torch-lightning`,the [`timesformer-pytorch`](h
 EASY: build the docker image: 
 
 ```bash
+# Local/manual use (no agent flags required)
 docker build -t youssef_gp .
+
+# Agent mode with explicit opt-in
+AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 docker build -t youssef_gp .
 docker run --gpus all --shm-size=150g -it -v </your-path-to-train-scrolls>:/workspace/train_scrolls youssef_gp
 ```
 

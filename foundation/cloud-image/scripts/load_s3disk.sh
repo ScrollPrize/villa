@@ -1,3 +1,13 @@
+#!/bin/bash
+set -e
+
+if [[ "${AGENTS_AGENT_MODE:-0}" == "1" && "${AGENTS_ALLOW_INSTALL:-0}" != "1" ]]; then
+  echo "INFO: load_s3disk.sh is disabled by default in agent mode."
+  echo "Set AGENTS_ALLOW_INSTALL=1 to run this script."
+  echo "Example: AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 ./foundation/cloud-image/scripts/load_s3disk.sh"
+  exit 0
+fi
+
 # Install s3fs and set up mount points
 sudo apt install -y s3fs
 

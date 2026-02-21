@@ -25,6 +25,11 @@ A Retrieval-Augmented Generation (RAG) chatbot that answers questions based on D
 pip install -r requirements.txt
 ```
 
+For agent mode (Codex/CI) where installs should be opt-in:
+```bash
+AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 ./install.sh
+```
+
 2. Copy `.env.example` to `.env` and set your credentials:
 ```bash
 cp .env.example .env

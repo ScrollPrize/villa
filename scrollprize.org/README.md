@@ -4,8 +4,13 @@ This website is built using [Docusaurus 2](https://docusaurus.io/), a modern sta
 
 ### Installation
 
+``` 
+yarn
 ```
-$ yarn
+
+For agent mode (Codex/CI) where installs should be opt-in:
+```
+AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 yarn
 ```
 
 ### Local Development

@@ -7,6 +7,13 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
+if [[ "${AGENTS_AGENT_MODE:-0}" == "1" && "${AGENTS_ALLOW_INSTALL:-0}" != "1" ]]; then
+  echo "INFO: build_dependencies.sh is disabled by default in agent mode."
+  echo "Set AGENTS_ALLOW_INSTALL=1 to run this script."
+  echo "Example: AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 ./volume-cartographer/scripts/build_dependencies.sh"
+  exit 0
+fi
+
 # ---------------------------------------------------------------------------
 # Paths / config
 # ---------------------------------------------------------------------------

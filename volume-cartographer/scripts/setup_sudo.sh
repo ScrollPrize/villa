@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+if [[ "${AGENTS_AGENT_MODE:-0}" == "1" && "${AGENTS_ALLOW_INSTALL:-0}" != "1" ]]; then
+  echo "INFO: setup_sudo.sh is disabled by default in agent mode."
+  echo "Set AGENTS_ALLOW_INSTALL=1 to run this script."
+  echo "Example: AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 ./volume-cartographer/scripts/setup_sudo.sh"
+  exit 0
+fi
+
 # Update and install system packages
 sudo apt -y update
 sudo apt -y install software-properties-common
