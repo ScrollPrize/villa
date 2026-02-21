@@ -3,7 +3,10 @@
 Setup:
 
 Docker setup: 
+Local/manual use (no agent flags required)
     docker build -t thaumato_image -f DockerfileThaumato .
+Agent mode with explicit opt-in:
+    AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 docker build -t thaumato_image -f DockerfileThaumato .
 There is also a file containing the complete Conda environment. The environment is called "thaumato".
 
 Segmentation with ThaumatoAnakalyptor:
@@ -58,4 +61,3 @@ By 3D gradient analysis of the 3D picture and propperly calculating the sheets n
 The whole Scroll surface point volume then is split into subvolumes of size 200x200x200 and a 3D instance segmentation algorithm is used to cluster the surface points to their respective surface. Overlapping the subvolumes and predicting the sheet patches with overlap lets an random walk algorithm combine them to larger sheets.
 In a next step, the subvolume surface patches are again combined into sheets. These sheets consisting of points and metadate related to their points positions(angular winding position(what winding of the papyrus sheet it belongs to, points might be spacially close in x y z in the scroll, but belong to different windings)) within the sheet are converted with the help of poisson surface reconstruction to form the sheet's mesh that then can be used in the vc_renderer to generate the sheet's surface_volume tif stack.
 Poisson is applied on a half winding each, the resulting meshes then are stitched to form the complete papyrus sheet over multiple wraps.
-

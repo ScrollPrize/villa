@@ -1,5 +1,12 @@
 #!/bin/bash
 
+if [[ "${AGENTS_AGENT_MODE:-0}" == "1" && "${AGENTS_ALLOW_INSTALL:-0}" != "1" ]]; then
+  echo "INFO: install_dependencies.sh is disabled by default in agent mode."
+  echo "Set AGENTS_ALLOW_INSTALL=1 to run this script."
+  echo "Example: AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 ./foundation/cloud-image/scripts/install_dependencies.sh"
+  exit 0
+fi
+
 # Update the system
 sudo apt-get update
 sudo apt-get upgrade -y --with-new-pkgs
