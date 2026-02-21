@@ -3,7 +3,7 @@
   "description": "Collection of 2um resolution segments for ink detection training",
   "wandb": {
     "enabled": true,
-    "project": "ink-group-dro",
+    "project": "ink-2um-experiments",
     "entity": "vesuvius-challenge",
     "group": "ink-2um",
     "tags": [
@@ -11,15 +11,6 @@
     ]
   },
   "segments": {
-    "20250807020208": {
-      "original_path": "0175_2um/20250807020208",
-      "base_path": "0139",
-      "layer_range": [
-        1,
-        63
-      ],
-      "reverse_layers": false
-    },
     "20250806145318": {
       "original_path": "0175_2um/20250806145318",
       "base_path": "0139",
@@ -82,12 +73,167 @@
         108
       ],
       "reverse_layers": false
+    },
+    "w012_2025010815": {
+      "original_path": "Pherc0139-2um_030226_labels/w012_2025010815",
+      "base_path": "0139",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w016_2025010815": {
+      "original_path": "Pherc0139-2um_030226_labels/w016_2025010815",
+      "base_path": "0139",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w017_2025010815": {
+      "original_path": "Pherc0139-2um_030226_labels/w017_2025010815",
+      "base_path": "0139",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w025_2025083102_crop": {
+      "original_path": "Pherc0139-2um_030226_labels/w025_2025083102_crop",
+      "base_path": "0139",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w013_20240304141531": {
+      "original_path": "PHerc1667-labels_2um/w013_20240304141531",
+      "base_path": "pherc1667",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w018_20240304144031": {
+      "original_path": "PHerc1667-labels_2um/w018_20240304144031",
+      "base_path": "pherc1667",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w023_20240304161941": {
+      "original_path": "PHerc1667-labels_2um/w023_20240304161941",
+      "base_path": "pherc1667",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w028_20251208130119156": {
+      "original_path": "PHerc1667-labels_2um/w028_20251208130119156",
+      "base_path": "pherc1667",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w029_20251212185248662": {
+      "original_path": "PHerc1667-labels_2um/w029_20251212185248662",
+      "base_path": "pherc1667",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w030_2025122002": {
+      "original_path": "PHerc1667-labels_2um/w030_2025122002",
+      "base_path": "pherc1667",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w031_2025122323": {
+      "original_path": "PHerc1667-labels_2um/w031_2025122323",
+      "base_path": "pherc1667",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w032_2026010505": {
+      "original_path": "PHerc1667-labels_2um/w032_2026010505",
+      "base_path": "pherc1667",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w033_2026011001": {
+      "original_path": "PHerc1667-labels_2um/w033_2026011001",
+      "base_path": "pherc1667",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w034_2026011516": {
+      "original_path": "PHerc1667-labels_2um/w034_2026011516",
+      "base_path": "pherc1667",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "w035_2026011623": {
+      "original_path": "PHerc1667-labels_2um/w035_2026011623",
+      "base_path": "pherc1667",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "auto_grown_20251218010446110-w0": {
+      "original_path": "PHercMANBP/auto_grown_20251218010446110-w0",
+      "base_path": "phercmanbp",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "auto_grown_20260118224834866_07": {
+      "original_path": "PHercMANBP/auto_grown_20260118224834866_07",
+      "base_path": "phercmanbp",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
     }
   },
   "training_hyperparameters": {
     "model": {
       "model_name": "Unet",
       "backbone": "resnet3d",
+      "resnet3d_model_depth": 50,
+      "backbone_pretrained_path": "r3d50_KM_200ep.pth",
       "in_chans": 62,
       "encoder_depth": 5,
       "norm": "batch",
@@ -110,12 +256,14 @@
       "weight_decay": 1e-06,
       "exclude_weight_decay_bias_norm": true,
       "max_grad_norm": 100,
+      "max_clip_value": null,
+      "normalization_mode": "clip_max_div255",
       "pretrained": true,
       "num_workers": 12,
       "layer_read_workers": 12,
       "seed": 130697,
       "eval_threshold": 0.5,
-      "eval_stitch_metrics": true,
+      "eval_stitch_metrics": false,
       "eval_topological_metrics_every_n_epochs": 5,
       "eval_drd_block_size": 8,
       "eval_boundary_k": 3,
@@ -129,8 +277,8 @@
       "eval_component_min_area": 8192,
       "eval_component_pad": 5,
       "eval_stitch_full_region_metrics": false,
-      "eval_save_stitch_debug_images": true,
-      "eval_save_stitch_debug_images_every_n_epochs": 5,
+      "eval_save_stitch_debug_images": false,
+      "eval_save_stitch_debug_images_every_n_epochs": 10,
       "eval_threshold_grid_min": 0.4,
       "eval_threshold_grid_max": 0.7,
       "eval_threshold_grid_steps": 5,
@@ -145,6 +293,9 @@
         "max_crop_ratio": 1.0,
         "cutout_max_count": 2,
         "cutout_p": 0.6
+      },
+      "invert": {
+        "p": 0.0
       },
       "horizontal_flip": 0.5,
       "vertical_flip": 0.5,
@@ -172,8 +323,10 @@
   },
   "training": {
     "data_backend": "zarr",
+    "dataset_cache_check_hash": false,
     "objective": "erm",
     "sampler": "shuffle",
+    "group_stratified_epoch_size_mode": "dataset",
     "loss_mode": "batch",
     "erm_group_topk": 0,
     "save_every_epoch": true,
@@ -192,7 +345,23 @@
       "500p2a",
       "-1",
       "20250910185200",
-      "20250919125754-auto_grown_20250919055754487_inp_hr"
+      "20250919125754-auto_grown_20250919055754487_inp_hr",
+      "w012_2025010815",
+      "w016_2025010815",
+      "w017_2025010815",
+      "w025_2025083102_crop",
+      "w013_20240304141531",
+      "w018_20240304144031",
+      "w023_20240304161941",
+      "w028_20251208130119156",
+      "w029_20251212185248662",
+      "w030_2025122002",
+      "w031_2025122323",
+      "w032_2026010505",
+      "w033_2026011001",
+      "w034_2026011516",
+      "w035_2026011623",
+      "auto_grown_20251218010446110-w0"
     ],
     "val_segments": [
       "20250806145318",
@@ -201,7 +370,29 @@
       "500p2a",
       "-1",
       "20250910185200",
-      "20250919125754-auto_grown_20250919055754487_inp_hr"
+      "20250919125754-auto_grown_20250919055754487_inp_hr",
+      "w012_2025010815",
+      "w016_2025010815",
+      "w017_2025010815",
+      "w025_2025083102_crop",
+      "w013_20240304141531",
+      "w018_20240304144031",
+      "w023_20240304161941",
+      "w028_20251208130119156",
+      "w029_20251212185248662",
+      "w030_2025122002",
+      "w031_2025122323",
+      "w032_2026010505",
+      "w033_2026011001",
+      "w034_2026011516",
+      "w035_2026011623",
+      "auto_grown_20251218010446110-w0"
+    ]
+  },
+  "stitch": {
+    "segment_ids": [
+      "auto_grown_20260118224834866_07",
+      "auto_grown_20251218010446110-w0"
     ]
   },
   "group_dro": {
