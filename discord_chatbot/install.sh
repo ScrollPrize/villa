@@ -8,4 +8,5 @@ if [[ "${AGENTS_AGENT_MODE:-0}" == "1" && "${AGENTS_ALLOW_INSTALL:-0}" != "1" ]]
   exit 0
 fi
 
-python3 -m pip install -r requirements.txt
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python3 -m pip install -r "$SCRIPT_DIR/requirements.txt"
