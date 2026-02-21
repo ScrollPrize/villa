@@ -511,7 +511,9 @@ def optimize(
 
 		def _print_status(*, step_label: str, loss_val: float, tv: dict[str, float], pv: dict[str, float]) -> None:
 			nonlocal _status_rows_since_header
-			cols = list(tv.keys()) + [f"p:{k}" for k in pv.keys()]
+			tv_keys = sorted(tv.keys())
+			pv_keys = sorted(pv.keys())
+			cols = tv_keys + [f"p:{k}" for k in pv_keys]
 			if _status_rows_since_header % 20 == 0:
 				hdr = f"{'step':>20s}  {'loss':>8s}"
 				for c in cols:
@@ -519,9 +521,9 @@ def optimize(
 				print(hdr)
 			_status_rows_since_header += 1
 			row = f"{step_label:>20s}  {loss_val:8.4f}"
-			for k in tv:
+			for k in tv_keys:
 				row += f"  {tv[k]:10.4f}"
-			for k in pv:
+			for k in pv_keys:
 				row += f"  {pv[k]:10.4f}"
 			print(row)
 
