@@ -32,12 +32,17 @@ using json = nlohmann::json;
 
 static void add_target_context(json& meta, const std::filesystem::path& volume_path)
 {
-    const std::string volume_name = volume_path.filename().string();
+    std::filesystem::path normalized_volume_path = volume_path.lexically_normal();
+    if (normalized_volume_path.filename().empty()) {
+        normalized_volume_path = normalized_volume_path.parent_path();
+    }
+
+    const std::string volume_name = normalized_volume_path.filename().string();
     if (!volume_name.empty() && !meta.contains("target_volume")) {
         meta["target_volume"] = volume_name;
     }
 
-    const std::filesystem::path volumes_dir = volume_path.parent_path();
+    const std::filesystem::path volumes_dir = normalized_volume_path.parent_path();
     if (volumes_dir.filename() != "volumes") {
         return;
     }
