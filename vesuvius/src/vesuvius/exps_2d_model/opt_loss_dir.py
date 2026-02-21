@@ -123,8 +123,9 @@ def z_normal_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch
 	n_terms = 0
 
 	if has_y:
-		# ZX plane: image width=X, image height=Z → gx=dx, gy=dz
-		pred_d0, pred_d1 = _encode_dir(dx, torch.full_like(dx, dz))
+		# ZX plane: z-segment tangent is (dx, dz), rotate +90° to get normal
+		# matching _dir_pred_v convention: (gx, gy) = (dz, -dx)
+		pred_d0, pred_d1 = _encode_dir(torch.full_like(dx, dz), -dx)
 		pred_d0 = pred_d0.unsqueeze(1)  # (N-1, 1, Hm, Wm)
 		pred_d1 = pred_d1.unsqueeze(1)
 
@@ -139,8 +140,9 @@ def z_normal_loss_maps(*, res: fit_model.FitResult) -> tuple[torch.Tensor, torch
 		n_terms += 1
 
 	if has_x:
-		# ZY plane: image width=Y, image height=Z → gx=dy, gy=dz
-		pred_d0, pred_d1 = _encode_dir(dy, torch.full_like(dy, dz))
+		# ZY plane: z-segment tangent is (dy, dz), rotate +90° to get normal
+		# matching _dir_pred_v convention: (gx, gy) = (dz, -dy)
+		pred_d0, pred_d1 = _encode_dir(torch.full_like(dy, dz), -dy)
 		pred_d0 = pred_d0.unsqueeze(1)
 		pred_d1 = pred_d1.unsqueeze(1)
 
