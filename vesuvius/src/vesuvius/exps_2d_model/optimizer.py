@@ -196,6 +196,7 @@ def load_stages_cfg(cfg: dict) -> list[Stage]:
 			"angle": 0.0,
 			"y_straight": 0.0,
 			"z_straight": 0.0,
+			"z_normal": 0.0,
 			"corr_winding": 0.0,
 	}
 	base_cfg = cfg.pop("base", None)
@@ -355,6 +356,7 @@ def optimize(
 			"angle": lambda: opt_loss_geom.angle_symmetry_loss_map(res=res),
 			"y_straight": lambda: opt_loss_geom.y_straight_loss_map(res=res),
 			"z_straight": lambda: opt_loss_geom.z_straight_loss_map(res=res),
+			"z_normal": lambda: opt_loss_dir.z_normal_loss_maps(res=res),
 			"corr_winding": lambda: (lambda lv, lms, ms: (lms[0], ms[0]))(*opt_loss_corr.corr_winding_loss(res=res, pts_c=_corr_pts_for_res())),
 			"step": lambda: (lambda lm: (lm, torch.ones_like(lm)))(opt_loss_step.step_loss_maps(res=res)),
 		}
@@ -491,6 +493,7 @@ def optimize(
 			"angle": {"loss": opt_loss_geom.angle_symmetry_loss},
 			"y_straight": {"loss": opt_loss_geom.y_straight_loss},
 			"z_straight": {"loss": opt_loss_geom.z_straight_loss},
+			"z_normal": {"loss": opt_loss_dir.z_normal_loss},
 			"corr_winding": {"loss": lambda *, res: opt_loss_corr.corr_winding_loss(res=res, pts_c=_corr_pts_for_res(res))},
 		}
 		with torch.no_grad():
