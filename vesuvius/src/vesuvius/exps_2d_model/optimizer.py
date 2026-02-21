@@ -380,9 +380,20 @@ def optimize(
 			out[name] = [float(x) for x in _masked_mean_per_z(lm=lm, mask=mask).detach().cpu().tolist()]
 		if not out:
 			return
-		for k in sorted(out.keys()):
-			vs = [round(float(x), 6) for x in out[k]]
-			print(f"{label} losses_per_z {k}: {vs}")
+		names = sorted(out.keys())
+		n_z = max(len(v) for v in out.values())
+		# Print as table: rows=z-slices, cols=loss terms
+		hdr = f"{'z':>4s}"
+		for k in names:
+			hdr += f"  {k:>10s}"
+		print(f"{label} losses_per_z:")
+		print(hdr)
+		for zi in range(n_z):
+			row = f"{zi:4d}"
+			for k in names:
+				v = out[k][zi] if zi < len(out[k]) else 0.0
+				row += f"  {v:10.6f}"
+			print(row)
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, keep_only_grown_z: bool = False) -> None:
 		if opt_cfg.steps <= 0:
 			return
@@ -496,6 +507,24 @@ def optimize(
 			"z_normal": {"loss": opt_loss_dir.z_normal_loss},
 			"corr_winding": {"loss": lambda *, res: opt_loss_corr.corr_winding_loss(res=res, pts_c=_corr_pts_for_res(res))},
 		}
+		_status_rows_since_header = 0
+
+		def _print_status(*, step_label: str, loss_val: float, tv: dict[str, float], pv: dict[str, float]) -> None:
+			nonlocal _status_rows_since_header
+			cols = list(tv.keys()) + [f"p:{k}" for k in pv.keys()]
+			if _status_rows_since_header % 20 == 0:
+				hdr = f"{'step':>20s}  {'loss':>8s}"
+				for c in cols:
+					hdr += f"  {c:>10s}"
+				print(hdr)
+			_status_rows_since_header += 1
+			row = f"{step_label:>20s}  {loss_val:8.4f}"
+			for k in tv:
+				row += f"  {tv[k]:10.4f}"
+			for k in pv:
+				row += f"  {pv[k]:10.4f}"
+			print(row)
+
 		with torch.no_grad():
 			res0 = model(data)
 			if stage.masks is not None:
@@ -523,7 +552,7 @@ def optimize(
 					param_vals0[k] = float(vs[0].detach().cpu())
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
-			print(f"{label} step 0/{opt_cfg.steps}: loss={loss0.item():.4f} terms={term_vals0} params={param_vals0}")
+			_print_status(step_label=f"{label} 0/{opt_cfg.steps}", loss_val=loss0.item(), tv=term_vals0, pv=param_vals0)
 			_print_losses_per_z(label=f"{label} step 0/{opt_cfg.steps}", res=res0, eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
 		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0, vis_losses=vis_losses0)
 
@@ -564,7 +593,7 @@ def optimize(
 						param_vals[k] = float(vs[0].detach().cpu())
 				term_vals = {k: round(v, 4) for k, v in term_vals.items()}
 				param_vals = {k: round(v, 4) for k, v in param_vals.items()}
-				print(f"{label} step {step1}/{opt_cfg.steps}: loss={loss.item():.4f} terms={term_vals} params={param_vals}")
+				_print_status(step_label=f"{label} {step1}/{opt_cfg.steps}", loss_val=loss.item(), tv=term_vals, pv=param_vals)
 
 			if snap_int > 0 and (step1 % snap_int) == 0:
 				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data, res=res, vis_losses=vis_losses)
