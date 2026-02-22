@@ -153,72 +153,97 @@ def closest_conn_segment_indices(
 	leftp = xy_conn[:, :, :, 0, :]
 	rightp = xy_conn[:, :, :, 2, :]
 
-	def _closest_side(conn_pts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-		out = torch.empty((int(pts.shape[0]), 3), dtype=torch.int64, device=xy_conn.device)
-		ok = torch.zeros((int(pts.shape[0]),), dtype=torch.bool, device=xy_conn.device)
-		dist = torch.full((int(pts.shape[0]),), float("inf"), dtype=torch.float32, device=xy_conn.device)
+	k = int(pts.shape[0])
+	idx_left = torch.empty((k, 3), dtype=torch.int64, device=xy_conn.device)
+	ok_left = torch.zeros((k,), dtype=torch.bool, device=xy_conn.device)
+	dist_left = torch.full((k,), float("inf"), dtype=torch.float32, device=xy_conn.device)
+	idx_right = torch.empty((k, 3), dtype=torch.int64, device=xy_conn.device)
+	ok_right = torch.zeros((k,), dtype=torch.bool, device=xy_conn.device)
+	dist_right = torch.full((k,), float("inf"), dtype=torch.float32, device=xy_conn.device)
 
-		def _cross_z(a2: torch.Tensor, b2: torch.Tensor) -> torch.Tensor:
-			return a2[..., 0] * b2[..., 1] - a2[..., 1] * b2[..., 0]
+	def _cross_z(a2: torch.Tensor, b2: torch.Tensor) -> torch.Tensor:
+		return a2[..., 0] * b2[..., 1] - a2[..., 1] * b2[..., 0]
 
-		for i in range(int(pts.shape[0])):
-			z = int(torch.round(pts[i, 2]).item())
-			z = max(0, min(n - 1, z))
-			q = pts[i, 0:2].view(1, 1, 2)
+	def _side_d2(*, conn_side: torch.Tensor, p0: torch.Tensor, p1: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+		"""Compute filtered d2 (hm-1, wm) for one side with inside test."""
+		c0 = conn_side[:-1, :, :]
+		c1 = conn_side[1:, :, :]
 
-			# Vertical segments: (row,col) -> (row+1,col)
-			p0 = center[z, :-1, :, :]
-			p1 = center[z, 1:, :, :]
-			c0 = conn_pts[z, :-1, :, :]
-			c1 = conn_pts[z, 1:, :, :]
+		s = p1 - p0
+		l2 = (s * s).sum(dim=-1).clamp_min(1e-12)
+		qp0 = q - p0
+		a = ((qp0 * s).sum(dim=-1) / l2).clamp(0.0, 1.0)
+		c = p0 + s * a.unsqueeze(-1)
+		v0 = c0 - p0
+		v1 = c1 - p1
 
-			s = p1 - p0
-			l2 = (s * s).sum(dim=-1).clamp_min(1e-12)
-			qp0 = q - p0
-			a = ((qp0 * s).sum(dim=-1) / l2).clamp(0.0, 1.0)
-			c = p0 + s * a.unsqueeze(-1)
-			v0 = c0 - p0
-			v1 = c1 - p1
+		dot01 = (v0 * v1).sum(dim=-1)
+		same_dir = dot01 > 0.0
+		probe = 0.5 * (p0 + p1) + 0.5 * (v0 + v1)
 
-			# Enclosure for an open segment-side region:
-			# q must be on the same side of 3 lines (seg, upper conn, lower conn)
-			# as an interior probe point, and conn vectors must point broadly same dir.
-			dot01 = (v0 * v1).sum(dim=-1)
-			same_dir = dot01 > 0.0
-			probe = 0.5 * (p0 + p1) + 0.5 * (v0 + v1)
+		s_q = _cross_z(s, q - p0)
+		s_p = _cross_z(s, probe - p0)
+		u_q = _cross_z(v0, q - p0)
+		u_p = _cross_z(v0, probe - p0)
+		l_q = _cross_z(v1, q - p1)
+		l_p = _cross_z(v1, probe - p1)
+		conn_inside = (s_q * s_p >= 0.0) & (u_q * u_p >= 0.0) & (l_q * l_p >= 0.0) & same_dir
 
-			ls = s
-			lu = v0
-			ll = v1
-			s_q = _cross_z(ls, q - p0)
-			s_p = _cross_z(ls, probe - p0)
-			u_q = _cross_z(lu, q - p0)
-			u_p = _cross_z(lu, probe - p0)
-			l_q = _cross_z(ll, q - p1)
-			l_p = _cross_z(ll, probe - p1)
-			inside = (s_q * s_p >= 0.0) & (u_q * u_p >= 0.0) & (l_q * l_p >= 0.0) & same_dir
+		nrm = torch.stack([-s[..., 1], s[..., 0]], dim=-1)
+		n_u_q = ((q - p0) * nrm).sum(dim=-1)
+		n_u_v = (v0 * nrm).sum(dim=-1)
+		n_l_q = ((q - p1) * nrm).sum(dim=-1)
+		n_l_v = (v1 * nrm).sum(dim=-1)
+		normal_inside = (s_q * s_p >= 0.0) & ((n_u_q * n_u_v >= 0.0) | (n_l_q * n_l_v >= 0.0)) & same_dir
 
-			d2 = ((q - c) * (q - c)).sum(dim=-1)
-			d2 = torch.where(inside, d2, torch.full_like(d2, float("inf")))
-			best = torch.amin(d2)
-			if not torch.isfinite(best):
-				out[i, 0] = int(z)
-				out[i, 1] = -1
-				out[i, 2] = -1
-				continue
-			flat = d2.reshape(-1)
-			j = int(torch.argmin(flat).item())
-			r = j // wm
-			cl = j % wm
-			out[i, 0] = int(z)
-			out[i, 1] = int(r)
-			out[i, 2] = int(cl)
-			ok[i] = True
-			dist[i] = torch.sqrt(best).to(dtype=torch.float32)
-		return out, ok, dist
+		inside = conn_inside | normal_inside
 
-	idx_left, ok_left, dist_left = _closest_side(leftp)
-	idx_right, ok_right, dist_right = _closest_side(rightp)
+		d2 = ((q - c) * (q - c)).sum(dim=-1)
+		return torch.where(inside, d2, torch.full_like(d2, float("inf")))
+
+	for i in range(k):
+		z = int(torch.round(pts[i, 2]).item())
+		z = max(0, min(n - 1, z))
+		q = pts[i, 0:2].view(1, 1, 2)
+
+		p0 = center[z, :-1, :, :]
+		p1 = center[z, 1:, :, :]
+
+		d2_r = _side_d2(conn_side=rightp[z], p0=p0, p1=p1, q=q)  # (hm-1, wm)
+		d2_l = _side_d2(conn_side=leftp[z], p0=p0, p1=p1, q=q)
+
+		# Per-column (per-winding) minimum distance
+		min_r, argmin_r = d2_r.min(dim=0)  # (wm,)
+		min_l, argmin_l = d2_l.min(dim=0)
+
+		# Joint selection: point is between winding c (right side) and
+		# winding c+1 (left side).  Pick the pair with min combined dist.
+		if wm < 2:
+			idx_left[i] = torch.tensor([z, -1, -1], dtype=torch.int64)
+			idx_right[i] = torch.tensor([z, -1, -1], dtype=torch.int64)
+			continue
+
+		combined = min_r[:-1] + min_l[1:]  # (wm-1,)
+		best_gap = int(combined.argmin().item())
+
+		if not torch.isfinite(combined[best_gap]):
+			idx_left[i] = torch.tensor([z, -1, -1], dtype=torch.int64)
+			idx_right[i] = torch.tensor([z, -1, -1], dtype=torch.int64)
+			continue
+
+		c_r = best_gap
+		c_l = best_gap + 1
+		idx_right[i, 0] = z
+		idx_right[i, 1] = int(argmin_r[c_r].item())
+		idx_right[i, 2] = c_r
+		ok_right[i] = True
+		dist_right[i] = torch.sqrt(min_r[c_r]).to(dtype=torch.float32)
+
+		idx_left[i, 0] = z
+		idx_left[i, 1] = int(argmin_l[c_l].item())
+		idx_left[i, 2] = c_l
+		ok_left[i] = True
+		dist_left[i] = torch.sqrt(min_l[c_l]).to(dtype=torch.float32)
 	return pts, idx_left, ok_left, dist_left, idx_right, ok_right, dist_right
 
 
