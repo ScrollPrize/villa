@@ -8,6 +8,7 @@
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrent>
 #include <QDir>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHBoxLayout>
@@ -16,7 +17,6 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
-#include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QSettings>
@@ -29,287 +29,6 @@
 #include <nlohmann/json.hpp>
 
 #include <iostream>
-
-// ---------------------------------------------------------------------------
-// Predefined optimizer profiles
-// ---------------------------------------------------------------------------
-struct LasagnaProfile {
-    const char* name;
-    const char* description;
-    const char* json;
-};
-
-static const LasagnaProfile kProfiles[] = {
-    {"Quick Reopt (2k)", "Fast re-optimization of existing mesh",
-     R"({
-    "base": {
-        "dir_v": 10.0,
-        "dir_conn": 1.0,
-        "step": 100.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.01,
-        "gradmag": 1.0,
-        "mean_pos": 0.0,
-        "meshoff_sy": 0.001,
-        "conn_sy_l": 0.0,
-        "conn_sy_r": 0.0,
-        "angle": 0.001,
-        "y_straight": 0.0,
-        "data": 0.4,
-        "data_plain": 0.2,
-        "data_grad": 0.0,
-        "z_straight": 10.0
-    },
-    "stages": [
-        {
-            "name": "reopt",
-            "steps": 2000,
-            "lr": [0.1, 0.01, 0.001],
-            "params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
-            "min_scaledown": 0
-        }
-    ]
-})"},
-
-    {"Final Refinement (10k)", "Single-stage full-resolution refinement",
-     R"({
-    "base": {
-        "dir_v": 10.0,
-        "dir_conn": 1.0,
-        "step": 100.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.01,
-        "gradmag": 1.0,
-        "mean_pos": 0.0,
-        "meshoff_sy": 0.001,
-        "conn_sy_l": 0.0,
-        "conn_sy_r": 0.0,
-        "angle": 0.001,
-        "y_straight": 0.0,
-        "data": 0.4,
-        "data_plain": 0.2,
-        "data_grad": 0.0,
-        "z_straight": 10.0
-    },
-    "stages": [
-        {
-            "name": "sd0",
-            "steps": 10000,
-            "lr": [1.0, 0.1, 0.01],
-            "params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
-            "min_scaledown": 0
-        }
-    ]
-})"},
-
-    {"Scalespace (21k)", "Multi-scale coarse-to-fine optimization",
-     R"({
-    "base": {
-        "dir_v": 10.0,
-        "dir_conn": 1.0,
-        "step": 100.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.01,
-        "gradmag": 1.0,
-        "mean_pos": 0.0,
-        "meshoff_sy": 0.001,
-        "conn_sy_l": 0.0,
-        "conn_sy_r": 0.0,
-        "angle": 0.001,
-        "y_straight": 0.0,
-        "data": 0.4,
-        "data_plain": 0.2,
-        "data_grad": 0.0,
-        "z_straight": 10.0
-    },
-    "stages": [
-        {
-            "name": "sd4",
-            "steps": 2000,
-            "lr": 1.0,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 4
-        },
-        {
-            "name": "sd3",
-            "steps": 2000,
-            "lr": 0.1,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 3,
-            "w_fac": {"dir_conn": 10.0, "gradmag": 10.0}
-        },
-        {
-            "name": "sd2",
-            "steps": 5000,
-            "lr": 0.1,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 2,
-            "w_fac": {"dir_conn": 10.0, "gradmag": 10.0}
-        },
-        {
-            "name": "sd1",
-            "steps": 5000,
-            "lr": 0.1,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 1,
-            "w_fac": {"dir_conn": 10.0, "gradmag": 10.0}
-        },
-        {
-            "name": "sd0",
-            "steps": 5000,
-            "lr": 0.01,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 0,
-            "w_fac": {"dir_conn": 10000.0, "gradmag": 1.0}
-        }
-    ]
-})"},
-
-    {"Direct + Init (4k)", "Global transform init, then mesh optimization",
-     R"({
-    "base": {
-        "dir_v": 10.0,
-        "dir_conn": 1.0,
-        "step": 100.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.01,
-        "gradmag": 1.0,
-        "mean_pos": 0.0,
-        "meshoff_sy": 0.001,
-        "conn_sy_l": 0.0,
-        "conn_sy_r": 0.0,
-        "angle": 0.001,
-        "y_straight": 0.0,
-        "data": 0.4,
-        "data_plain": 0.2,
-        "data_grad": 0.0,
-        "z_straight": 10.0
-    },
-    "stages": [
-        {
-            "name": "init",
-            "steps": 1000,
-            "lr": 0.01,
-            "params": ["theta", "winding_scale"],
-            "min_scaledown": 0
-        },
-        {
-            "name": "mesh",
-            "steps": 3000,
-            "lr": 0.1,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 0
-        }
-    ]
-})"},
-
-    {"Direct + Grow", "Init, mesh opt, then grow up/down",
-     R"({
-    "base": {
-        "dir_v": 10.0,
-        "dir_conn": 1.0,
-        "step": 100.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.01,
-        "gradmag": 1.0,
-        "mean_pos": 0.0,
-        "meshoff_sy": 0.001,
-        "conn_sy_l": 0.0,
-        "conn_sy_r": 0.0,
-        "angle": 0.001,
-        "y_straight": 0.0,
-        "data": 0.4,
-        "data_plain": 0.2,
-        "data_grad": 0.0,
-        "z_straight": 10.0
-    },
-    "stages": [
-        {
-            "name": "init",
-            "steps": 500,
-            "lr": 0.1,
-            "params": ["theta", "winding_scale"],
-            "min_scaledown": 0
-        },
-        {
-            "name": "mesh",
-            "steps": 3000,
-            "lr": 0.1,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 0
-        },
-        {
-            "name": "grow_only",
-            "grow": {
-                "directions": ["down", "up"],
-                "generations": 30,
-                "steps": 1
-            },
-            "global_opt": {
-                "steps": 0,
-                "lr": 0.1,
-                "params": ["mesh_ms", "conn_offset_ms"],
-                "min_scaledown": 0
-            },
-            "local_opt": {
-                "opt_window": 2,
-                "steps": 300,
-                "lr": 0.1,
-                "params": ["mesh_ms", "conn_offset_ms"],
-                "min_scaledown": 0,
-                "w_fac": {"mean_pos": 0.0}
-            }
-        }
-    ]
-})"},
-
-    {"Grow Left", "Extend mesh leftward with local optimization",
-     R"({
-    "base": {
-        "dir_v": 10.0,
-        "dir_conn": 1.0,
-        "step": 100.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.01,
-        "gradmag": 1.0,
-        "mean_pos": 0.0,
-        "meshoff_sy": 0.001,
-        "conn_sy_l": 0.0,
-        "conn_sy_r": 0.0,
-        "angle": 0.001,
-        "y_straight": 0.0,
-        "data": 0.4,
-        "data_plain": 0.2,
-        "data_grad": 0.0,
-        "z_straight": 10.0
-    },
-    "stages": [
-        {
-            "name": "grow_left",
-            "grow": {
-                "directions": ["left"],
-                "generations": 10,
-                "steps": 1
-            },
-            "global_opt": {
-                "steps": 0,
-                "lr": 0.01,
-                "params": ["mesh_ms", "conn_offset_ms", "amp", "bias"]
-            },
-            "local_opt": {
-                "steps": 1000,
-                "lr": 0.01,
-                "params": ["mesh_ms", "conn_offset_ms", "amp", "bias"]
-            }
-        }
-    ]
-})"},
-
-    {"Custom", "User-defined configuration", nullptr},
-};
-
-static constexpr int kProfileCount = sizeof(kProfiles) / sizeof(kProfiles[0]);
-static constexpr int kCustomProfileIndex = kProfileCount - 1;
 
 SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     const QString& settingsGroup, QWidget* parent)
@@ -438,36 +157,16 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         row->addWidget(_dataInputStack, 1);
     }, tr("Input data zarr (e.g. s5_cos.zarr) required by the lasagna."));
 
-    // -- Profile dropdown --
-    _group->addRow(tr("Profile:"), [&](QHBoxLayout* row) {
-        _profileCombo = new QComboBox(content);
-        for (int i = 0; i < kProfileCount; ++i) {
-            _profileCombo->addItem(
-                QString::fromUtf8(kProfiles[i].name),
-                QString::fromUtf8(kProfiles[i].description));
-        }
-        row->addWidget(_profileCombo, 1);
-    }, tr("Predefined optimizer configurations. Select 'Custom' to edit freely."));
-
-    // -- JSON config editor --
-    auto* configLabel = new QLabel(tr("Optimizer config (JSON):"), content);
-    _group->contentLayout()->addWidget(configLabel);
-
-    _configEdit = new QPlainTextEdit(content);
-    _configEdit->setPlaceholderText(tr("Paste optimizer JSON config here"));
-    _configEdit->setTabStopDistance(20);
-    _configEdit->setMinimumHeight(200);
-    _configEdit->setLineWrapMode(QPlainTextEdit::NoWrap);
-    QFont monoFont("monospace");
-    monoFont.setStyleHint(QFont::Monospace);
-    monoFont.setPointSize(9);
-    _configEdit->setFont(monoFont);
-    _group->contentLayout()->addWidget(_configEdit);
-
-    _configStatus = new QLabel(content);
-    _configStatus->setWordWrap(true);
-    _configStatus->setVisible(false);
-    _group->contentLayout()->addWidget(_configStatus);
+    // -- Config file selector (dropdown + browse button) --
+    _group->addRow(tr("Config:"), [&](QHBoxLayout* row) {
+        _configFileCombo = new QComboBox(content);
+        _configFileCombo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        _configFileBrowse = new QToolButton(content);
+        _configFileBrowse->setText(QStringLiteral("..."));
+        _configFileBrowse->setToolTip(tr("Browse for a JSON config file"));
+        row->addWidget(_configFileCombo, 1);
+        row->addWidget(_configFileBrowse);
+    }, tr("JSON config file for the optimizer. File is read when optimization starts."));
 
     // -- Run / Stop / Stop Service buttons --
     auto* btnRow = new QHBoxLayout();
@@ -583,40 +282,43 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         }
     });
 
-    // Profile combo
-    connect(_profileCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+    // Config file combo selection
+    connect(_configFileCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, [this](int index) {
-        if (_restoringSettings) return;
-        writeSetting(QStringLiteral("lasagna_profile_index"), index);
-        loadProfile(index);
+        if (_restoringSettings || index < 0) return;
+        QString path = _configFileCombo->currentData().toString();
+        if (!path.isEmpty()) {
+            _lasagnaConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_config_file_path"), _lasagnaConfigFilePath);
+        }
     });
 
-    // Config editor
-    connect(_configEdit, &QPlainTextEdit::textChanged, this, [this]() {
-        if (_restoringSettings) return;
-        _lasagnaConfigText = _configEdit->toPlainText();
-        writeSetting(QStringLiteral("lasagna_config_text"), _lasagnaConfigText);
-        validateConfigText();
-
-        // Switch to "Custom" if user manually edits while a preset is selected
-        if (_profileCombo && _profileCombo->currentIndex() != kCustomProfileIndex) {
-            int idx = _profileCombo->currentIndex();
-            if (idx >= 0 && idx < kCustomProfileIndex && kProfiles[idx].json) {
-                QString profileText = QString::fromUtf8(kProfiles[idx].json).trimmed();
-                if (_lasagnaConfigText.trimmed() != profileText) {
-                    const QSignalBlocker b(_profileCombo);
-                    _profileCombo->setCurrentIndex(kCustomProfileIndex);
-                    writeSetting(QStringLiteral("lasagna_profile_index"), kCustomProfileIndex);
-                }
-            }
+    // Config file browse button
+    connect(_configFileBrowse, &QToolButton::clicked, this, [this]() {
+        QString initial = _lasagnaConfigFilePath.isEmpty()
+            ? QDir::homePath() : QFileInfo(_lasagnaConfigFilePath).absolutePath();
+        QString path = QFileDialog::getOpenFileName(
+            this, tr("Select optimizer config JSON file"), initial,
+            tr("JSON files (*.json);;All files (*)"));
+        if (!path.isEmpty()) {
+            _lasagnaConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_config_file_path"), _lasagnaConfigFilePath);
+            QFileInfo fi(path);
+            populateConfigFileCombo(fi.absolutePath(), fi.fileName());
         }
     });
 
     // Run button
     connect(_runBtn, &QPushButton::clicked, this, [this]() {
-        validateConfigText();
-        if (!_configError.isEmpty()) {
-            _progressLabel->setText(tr("Fix JSON errors before running."));
+        // Validate config file on run
+        if (_lasagnaConfigFilePath.isEmpty()) {
+            _progressLabel->setText(tr("No config file selected."));
+            _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
+            _progressLabel->setVisible(true);
+            return;
+        }
+        if (!QFileInfo::exists(_lasagnaConfigFilePath)) {
+            _progressLabel->setText(tr("Config file not found: %1").arg(_lasagnaConfigFilePath));
             _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
             _progressLabel->setVisible(true);
             return;
@@ -798,7 +500,7 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
     _restoringSettings = true;
 
     _lasagnaDataInputPath = settings.value(QStringLiteral("lasagna_data_input_path"), QString()).toString();
-    _lasagnaConfigText = settings.value(QStringLiteral("lasagna_config_text"), QString()).toString();
+    _lasagnaConfigFilePath = settings.value(QStringLiteral("lasagna_config_file_path"), QString()).toString();
 
     _lasagnaMode = settings.value(QStringLiteral("lasagna_mode"), 0).toInt();
     if (_modeCombo) {
@@ -838,21 +540,18 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
     }
     updateConnectionWidgets();
 
-    int profileIndex = settings.value(QStringLiteral("lasagna_profile_index"), 0).toInt();
-    if (profileIndex < 0 || profileIndex >= kProfileCount) {
-        profileIndex = 0;
-    }
-
-    if (_lasagnaConfigText.trimmed().isEmpty()) {
-        if (profileIndex < kCustomProfileIndex && kProfiles[profileIndex].json) {
-            _lasagnaConfigText = QString::fromUtf8(kProfiles[profileIndex].json);
+    // Populate config file combo from saved path
+    if (!_lasagnaConfigFilePath.isEmpty()) {
+        QFileInfo fi(_lasagnaConfigFilePath);
+        if (fi.exists()) {
+            populateConfigFileCombo(fi.absolutePath(), fi.fileName());
         } else {
-            _lasagnaConfigText = QString::fromUtf8(kProfiles[0].json);
+            // File gone — just show the name as-is
+            if (_configFileCombo) {
+                _configFileCombo->clear();
+                _configFileCombo->addItem(fi.fileName(), _lasagnaConfigFilePath);
+            }
         }
-    }
-
-    if (_profileCombo) {
-        _profileCombo->setCurrentIndex(profileIndex);
     }
 
     const bool expanded = settings.value(
@@ -870,15 +569,9 @@ void SegmentationLasagnaPanel::syncUiState(bool /*editingEnabled*/, bool optimiz
         const QSignalBlocker b(_dataInputEdit);
         _dataInputEdit->setText(_lasagnaDataInputPath);
     }
-    if (_configEdit && _configEdit->toPlainText() != _lasagnaConfigText) {
-        const QSignalBlocker b(_configEdit);
-        _configEdit->setPlainText(_lasagnaConfigText);
-    }
 
     if (_runBtn) _runBtn->setEnabled(!optimizing);
     if (_stopBtn) _stopBtn->setEnabled(optimizing);
-
-    validateConfigText();
 }
 
 // ---------------------------------------------------------------------------
@@ -897,75 +590,58 @@ void SegmentationLasagnaPanel::setLasagnaDataInputPath(const QString& path)
 }
 
 // ---------------------------------------------------------------------------
-// Profile loading
+// Config file selector
 // ---------------------------------------------------------------------------
 
-void SegmentationLasagnaPanel::loadProfile(int index)
+void SegmentationLasagnaPanel::populateConfigFileCombo(
+    const QString& dir, const QString& selectName)
 {
-    if (index < 0 || index >= kProfileCount) return;
-    if (index == kCustomProfileIndex) return;  // Don't overwrite on "Custom"
+    if (!_configFileCombo) return;
 
-    const char* json = kProfiles[index].json;
-    if (!json) return;
+    const QSignalBlocker b(_configFileCombo);
+    _configFileCombo->clear();
 
-    _lasagnaConfigText = QString::fromUtf8(json);
-    writeSetting(QStringLiteral("lasagna_config_text"), _lasagnaConfigText);
+    QDir d(dir);
+    QStringList jsonFiles = d.entryList(
+        QStringList{QStringLiteral("*.json")}, QDir::Files, QDir::Name);
 
-    if (_configEdit) {
-        const QSignalBlocker b(_configEdit);
-        _configEdit->setPlainText(_lasagnaConfigText);
+    int selectIndex = -1;
+    for (int i = 0; i < jsonFiles.size(); ++i) {
+        QString fullPath = d.absoluteFilePath(jsonFiles[i]);
+        _configFileCombo->addItem(jsonFiles[i], fullPath);
+        if (jsonFiles[i] == selectName) {
+            selectIndex = i;
+        }
     }
-    validateConfigText();
+
+    if (selectIndex >= 0) {
+        _configFileCombo->setCurrentIndex(selectIndex);
+        _lasagnaConfigFilePath = _configFileCombo->currentData().toString();
+    } else if (_configFileCombo->count() > 0) {
+        _configFileCombo->setCurrentIndex(0);
+        _lasagnaConfigFilePath = _configFileCombo->currentData().toString();
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Config JSON
+// Config JSON — reads file from disk on demand
 // ---------------------------------------------------------------------------
 
-void SegmentationLasagnaPanel::validateConfigText()
+QString SegmentationLasagnaPanel::lasagnaConfigText() const
 {
-    _configError.clear();
-
-    QString trimmed = _lasagnaConfigText.trimmed();
-    if (trimmed.isEmpty()) {
-        if (_configStatus) _configStatus->setVisible(false);
-        return;
-    }
-
-    try {
-        QByteArray utf8 = trimmed.toUtf8();
-        nlohmann::json parsed = nlohmann::json::parse(
-            utf8.constData(), utf8.constData() + utf8.size());
-        if (!parsed.is_object()) {
-            _configError = tr("Config must be a JSON object.");
-        }
-    } catch (const nlohmann::json::parse_error& ex) {
-        _configError = tr("JSON parse error (byte %1): %2")
-                           .arg(static_cast<qulonglong>(ex.byte))
-                           .arg(QString::fromStdString(ex.what()));
-    } catch (const std::exception& ex) {
-        _configError = tr("JSON error: %1").arg(QString::fromStdString(ex.what()));
-    }
-
-    if (_configStatus) {
-        if (_configError.isEmpty()) {
-            _configStatus->setText(tr("JSON valid"));
-            _configStatus->setStyleSheet(QStringLiteral("color: #27ae60;"));
-        } else {
-            _configStatus->setText(_configError);
-            _configStatus->setStyleSheet(QStringLiteral("color: #c0392b;"));
-        }
-        _configStatus->setVisible(true);
-    }
+    if (_lasagnaConfigFilePath.isEmpty()) return {};
+    QFile f(_lasagnaConfigFilePath);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return {};
+    return QString::fromUtf8(f.readAll());
 }
 
 std::optional<nlohmann::json> SegmentationLasagnaPanel::lasagnaConfigJson() const
 {
-    QString trimmed = _lasagnaConfigText.trimmed();
-    if (trimmed.isEmpty()) return std::nullopt;
+    QString text = lasagnaConfigText().trimmed();
+    if (text.isEmpty()) return std::nullopt;
 
     try {
-        QByteArray utf8 = trimmed.toUtf8();
+        QByteArray utf8 = text.toUtf8();
         nlohmann::json parsed = nlohmann::json::parse(
             utf8.constData(), utf8.constData() + utf8.size());
         if (parsed.is_object()) return parsed;

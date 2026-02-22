@@ -10,7 +10,6 @@ class CollapsibleSettingsGroup;
 class QComboBox;
 class QLabel;
 class QLineEdit;
-class QPlainTextEdit;
 class QProgressBar;
 class QPushButton;
 class QSettings;
@@ -25,7 +24,7 @@ class QWidget;
  * Displays:
  *   - Connection mode (internal/external)
  *   - Data input path (.zarr)
- *   - Editable JSON config for the optimizer (base weights, stages, args)
+ *   - Config file selector (JSON file from disk)
  *   - Run / Stop buttons
  *   - Progress status label
  */
@@ -42,7 +41,8 @@ public:
 
     // Getters
     [[nodiscard]] QString lasagnaDataInputPath() const { return _lasagnaDataInputPath; }
-    [[nodiscard]] QString lasagnaConfigText() const { return _lasagnaConfigText; }
+    /** Reads the selected config JSON file from disk and returns its contents. */
+    [[nodiscard]] QString lasagnaConfigText() const;
     [[nodiscard]] std::optional<nlohmann::json> lasagnaConfigJson() const;
     [[nodiscard]] LasagnaMode lasagnaMode() const { return static_cast<LasagnaMode>(_lasagnaMode); }
     [[nodiscard]] int newModelWidth() const;
@@ -62,8 +62,7 @@ signals:
 
 private:
     void writeSetting(const QString& key, const QVariant& value);
-    void validateConfigText();
-    void loadProfile(int index);
+    void populateConfigFileCombo(const QString& dir, const QString& selectName = {});
     void onLasagnaModeChanged(int index);
     void onConnectionModeChanged(int index);
     void refreshDiscoveredServices();
@@ -94,11 +93,10 @@ private:
     QSpinBox* _heightSpin{nullptr};
     QSpinBox* _depthSpin{nullptr};
 
-    QComboBox* _profileCombo{nullptr};
+    QComboBox* _configFileCombo{nullptr};
+    QToolButton* _configFileBrowse{nullptr};
     QLineEdit* _dataInputEdit{nullptr};
     QToolButton* _dataInputBrowse{nullptr};
-    QPlainTextEdit* _configEdit{nullptr};
-    QLabel* _configStatus{nullptr};
     QPushButton* _runBtn{nullptr};
     QPushButton* _stopBtn{nullptr};
     QPushButton* _stopServiceBtn{nullptr};
@@ -106,8 +104,7 @@ private:
     QLabel* _progressLabel{nullptr};
 
     QString _lasagnaDataInputPath;
-    QString _lasagnaConfigText;
-    QString _configError;
+    QString _lasagnaConfigFilePath;
 
     int _lasagnaMode{0};         // 0=re-optimize, 1=new model
     int _connectionMode{0};  // 0=internal, 1=external
