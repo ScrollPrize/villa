@@ -583,6 +583,7 @@ def optimize(
 			opt.zero_grad(set_to_none=True)
 			loss.backward()
 			opt.step()
+			model.update_conn_offsets()
 			_done_steps[0] += 1
 			if progress_fn is not None:
 				progress_fn(step=_done_steps[0], total=_total_steps, loss=float(loss.detach().cpu()))

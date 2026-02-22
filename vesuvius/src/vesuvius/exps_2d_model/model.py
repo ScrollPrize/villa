@@ -670,9 +670,13 @@ class Model2D(nn.Module):
 		"""Return per-mesh connection positions in pixel coordinates.
 
 		For each base-mesh point, returns 3 pixel positions:
-		- left-connection interpolation result (to previous column)
+		- left-connection orthogonal intersection (to previous column)
 		- the point itself
-		- right-connection interpolation result (to next column)
+		- right-connection orthogonal intersection (to next column)
+
+		Connection vectors are orthogonal to the v-direction by construction.
+		Connection points are line-segment intersections of the orthogonal ray
+		with the segment in the neighbor column selected by conn_offset.
 
 		Shape: (N,Hm,Wm,3,2)
 		"""
@@ -684,15 +688,78 @@ class Model2D(nn.Module):
 		mesh_off = self.conn_offset_coarse()
 		if mesh_off.shape[-2:] != (hm, wm):
 			raise RuntimeError("mesh_offset must be defined on the base mesh")
-		xy_px = xy_lr.permute(0, 3, 1, 2).contiguous()
+		xy_px = xy_lr.permute(0, 3, 1, 2).contiguous()  # (N, 2, Hm, Wm)
 
+		# --- 1. V-direction via central / forward / backward difference ---
+		v_dir = xy_px.new_zeros(xy_px.shape)  # (N, 2, Hm, Wm)
+		if hm >= 3:
+			v_dir[:, :, 1:-1, :] = xy_px[:, :, 2:, :] - xy_px[:, :, :-2, :]
+			v_dir[:, :, 0, :] = xy_px[:, :, 1, :] - xy_px[:, :, 0, :]
+			v_dir[:, :, -1, :] = xy_px[:, :, -1, :] - xy_px[:, :, -2, :]
+		elif hm >= 2:
+			v_dir[:, :, 0, :] = xy_px[:, :, 1, :] - xy_px[:, :, 0, :]
+			v_dir[:, :, 1, :] = v_dir[:, :, 0, :]
+		# hm == 1: v_dir stays zero, edge fallback handles it
+
+		# --- 2. Orthogonal direction: rotate 90° CCW → (-vy, vx) ---
+		d_x = -v_dir[:, 1:2, :, :]  # (N, 1, Hm, Wm)
+		d_y = v_dir[:, 0:1, :, :]
+
+		# --- 3. Neighbor columns (shifted, edge-replicated) ---
 		left_src = torch.cat([xy_px[:, :, :, 0:1], xy_px[:, :, :, :-1]], dim=3)
 		right_src = torch.cat([xy_px[:, :, :, 1:], xy_px[:, :, :, -1:]], dim=3)
-		off_l = mesh_off[:, 0]
+
+		off_l = mesh_off[:, 0]  # (N, Hm, Wm)
 		off_r = mesh_off[:, 1]
 		base_i = torch.arange(hm, device=xy_lr.device, dtype=xy_lr.dtype).view(1, hm, 1)
-		left_conn = self._interp_col(src=left_src, y=base_i + off_l)
-		right_conn = self._interp_col(src=right_src, y=base_i + off_r)
+
+		def _intersect(src: torch.Tensor, off: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+			"""Intersect orthogonal ray from xy_px with segment in src.
+
+			Returns: conn (N,2,Hm,Wm), t (N,Hm,Wm), seg_start (N,Hm,Wm)
+			"""
+			idx = base_i + off
+			seg_s = torch.floor(idx).clamp(0.0, float(hm - 2))
+			seg_si = seg_s.to(dtype=torch.int64)
+
+			idx0 = seg_si.unsqueeze(1).expand(-1, 2, -1, -1)
+			idx1 = (seg_si + 1).unsqueeze(1).expand(-1, 2, -1, -1)
+			A = torch.take_along_dim(src, idx0, dim=2)  # (N, 2, Hm, Wm)
+			B = torch.take_along_dim(src, idx1, dim=2)
+
+			# Segment direction
+			e_x = B[:, 0:1] - A[:, 0:1]  # (N, 1, Hm, Wm)
+			e_y = B[:, 1:2] - A[:, 1:2]
+
+			# g = p - A (ray origin minus segment start)
+			g_x = xy_px[:, 0:1] - A[:, 0:1]
+			g_y = xy_px[:, 1:2] - A[:, 1:2]
+
+			# t = (g × d) / (e × d), 2D cross: a×b = ax*by - ay*bx
+			g_cross_d = g_x * d_y - g_y * d_x
+			e_cross_d = e_x * d_y - e_y * d_x
+
+			eps = 1e-8
+			denom = torch.where(e_cross_d.abs() < eps,
+								torch.full_like(e_cross_d, eps),
+								e_cross_d)
+			t = (g_cross_d / denom).squeeze(1)  # (N, Hm, Wm)
+
+			# Intersection point: A + t * (B - A)
+			t_exp = t.unsqueeze(1)
+			conn = A + t_exp * (B - A)
+
+			return conn, t, seg_s
+
+		left_conn, t_l, seg_l = _intersect(left_src, off_l)
+		right_conn, t_r, seg_r = _intersect(right_src, off_r)
+
+		# Store intersection info for offset update (detached)
+		self._last_conn_t_l = t_l.detach()
+		self._last_conn_t_r = t_r.detach()
+		self._last_conn_seg_l = seg_l.detach()
+		self._last_conn_seg_r = seg_r.detach()
+
 		# Edge fallback for undefined horizontal neighbors:
 		# mirror the nearest inside conn vector (visual/search-only backup).
 		with torch.no_grad():
@@ -703,6 +770,48 @@ class Model2D(nn.Module):
 				right_conn[:, :, :, -1] = (xy_px[:, :, :, -1] - v_in_r).detach()
 		conn = torch.stack([left_conn, xy_px, right_conn], dim=1)
 		return conn.permute(0, 3, 4, 1, 2).contiguous()
+
+	@torch.no_grad()
+	def update_conn_offsets(self) -> None:
+		"""Update conn_offset_ms to match the latest orthogonal intersection positions.
+
+		After each optimization step, the mesh positions change.  This method
+		updates the offset values so they track the actual intersection parameter
+		of the orthogonal ray with the neighbor segments.
+
+		new_offset = floor(old_idx) + t - base_row
+		where old_idx = base_row + old_offset, and t is the intersection
+		parameter along the segment [floor(old_idx), floor(old_idx)+1].
+		"""
+		t_l = getattr(self, '_last_conn_t_l', None)
+		t_r = getattr(self, '_last_conn_t_r', None)
+		seg_l = getattr(self, '_last_conn_seg_l', None)
+		seg_r = getattr(self, '_last_conn_seg_r', None)
+		if t_l is None or t_r is None or seg_l is None or seg_r is None:
+			return
+
+		hm = int(t_l.shape[1])
+		base_i = torch.arange(hm, device=t_l.device, dtype=t_l.dtype).view(1, hm, 1)
+
+		# New offset = seg_start + t - base_row
+		new_off_l = seg_l + t_l - base_i
+		new_off_r = seg_r + t_r - base_i
+
+		# Compute delta from current reconstructed offset
+		current_off = self.conn_offset_coarse()  # (N, 2, Hm, Wm)
+		delta_l = new_off_l - current_off[:, 0]
+		delta_r = new_off_r - current_off[:, 1]
+
+		# Apply delta to the finest (base) pyramid level.
+		# conn_offset_coarse() = ms[0] + upsample(ms[1] + upsample(...))
+		# so adding to ms[0] directly adds to the reconstructed output.
+		self.conn_offset_ms[0].data[:, 0] += delta_l
+		self.conn_offset_ms[0].data[:, 1] += delta_r
+
+		self._last_conn_t_l = None
+		self._last_conn_t_r = None
+		self._last_conn_seg_l = None
+		self._last_conn_seg_r = None
 
 	@staticmethod
 	def _interp_col(*, src: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
