@@ -257,15 +257,36 @@ def main(argv: list[str] | None = None) -> int:
 	device = data.cos.device
 	_margin_xy = tuple(float(v) for v in data.data_margin_xy)
 	_data_size = tuple(int(v) for v in data.size)  # (h, w) in model pixels
-	# For checkpoint models: translate mesh and update params for expanded data.
+	# Shift point constraints from crop-relative to data-space model pixels.
+	# to_working_coords maps to (abs - crop_origin) / ds, but with margins
+	# the crop origin sits at (margin_x, margin_y) in model pixel space.
+	if _margin_xy[0] != 0.0 or _margin_xy[1] != 0.0:
+		if int(points_all.shape[0]) > 0:
+			points_all[:, 0] += _margin_xy[0]
+			points_all[:, 1] += _margin_xy[1]
+			print(f"[fit] shifted {int(points_all.shape[0])} constraint points by margin ({_margin_xy[0]:.1f}, {_margin_xy[1]:.1f})")
+		if int(points_tensor_work.shape[0]) > 0:
+			points_tensor_work[:, 0] += _margin_xy[0]
+			points_tensor_work[:, 1] += _margin_xy[1]
+	# For checkpoint models: translate mesh by the delta between new and old margins.
+	# A checkpoint saved with margins already has them baked into the mesh coords.
 	if mdl is not None:
-		updates = {"data_size_modelpx": _data_size}
-		if _margin_xy[0] != 0.0 or _margin_xy[1] != 0.0:
-			updates["data_margin_modelpx"] = _margin_xy
+		old_margin = (0.0, 0.0)
+		if model_params_in is not None:
+			old_m = model_params_in.get("data_margin_modelpx", (0.0, 0.0))
+			if isinstance(old_m, (list, tuple)) and len(old_m) == 2:
+				old_margin = (float(old_m[0]), float(old_m[1]))
+		delta_x = _margin_xy[0] - old_margin[0]
+		delta_y = _margin_xy[1] - old_margin[1]
+		updates = {"data_size_modelpx": _data_size, "data_margin_modelpx": _margin_xy}
+		if delta_x != 0.0 or delta_y != 0.0:
 			with torch.no_grad():
-				mdl.mesh_ms[-1].data[:, 0, :, :] += _margin_xy[0]
-				mdl.mesh_ms[-1].data[:, 1, :, :] += _margin_xy[1]
-			print(f"[fit] translated checkpoint mesh by margin ({_margin_xy[0]:.1f}, {_margin_xy[1]:.1f})")
+				mdl.mesh_ms[-1].data[:, 0, :, :] += delta_x
+				mdl.mesh_ms[-1].data[:, 1, :, :] += delta_y
+			print(f"[fit] translated checkpoint mesh by margin delta ({delta_x:.1f}, {delta_y:.1f})"
+				  f" (old={old_margin}, new={_margin_xy})")
+		else:
+			print(f"[fit] checkpoint margin matches data margin ({_margin_xy[0]:.1f}, {_margin_xy[1]:.1f}), no translation")
 		mdl.params = replace(mdl.params, **updates)
 	if mdl is None:
 		mdl = model.Model2D.from_fit_data(
