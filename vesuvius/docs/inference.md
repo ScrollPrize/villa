@@ -5,7 +5,6 @@ The Vesuvius tooling exposes three command-line stages plus a convenience orches
 1. `vesuvius.predict` — run a trained model and write patch logits.
 2. `vesuvius.blend_logits` — merge overlapping patches with Gaussian weighting.
 3. `vesuvius.finalize_outputs` — convert logits into probabilities or masks and build a multiscale Zarr.
-4. `vesuvius.inference_pipeline` — execute all steps sequentially on a single machine (optionally using multiple GPUs).
 
 All commands honour local paths and remote storage backed by `fsspec` (for example S3). Run `vesuvius.accept_terms --yes` before accessing remote scroll volumes.
 
@@ -109,32 +108,6 @@ vesuvius.finalize_outputs /tmp/merged_logits.zarr /tmp/final_output.zarr \
 | `--quiet` | Suppress verbose logging.
 
 Without `--threshold`, binary mode outputs a single softmax foreground channel; multiclass mode writes one channel per class plus an argmax channel. `surface_frame` mode bypasses thresholding entirely and stores orthonormal 9-channel frames in float32.
-
-## Single-Machine Convenience — `vesuvius.inference_pipeline`
-
-`vesuvius.inference_pipeline` automates the three stages on one machine. It can route different parts to different GPUs and manage intermediate directories.
-
-```bash
-vesuvius.inference_pipeline \
-  --input /data/Scroll1.zarr \
-  --output /results/ink.zarr \
-  --model hf://scrollprize/surface_recto \
-  --mode binary \
-  --threshold \
-  --gpus 0,1 \
-  --parts-per-gpu 2 \
-  --batch-size 2
-```
-
-Important flags:
-
-- `--workdir`: where to place intermediate logits (defaults to `<output>_work`).
-- `--mode surface_frame`: keep 9-channel tangent frames; thresholding is disabled automatically.
-- `--skip-predict`, `--skip-blend`, `--skip-finalize`: rerun only specific stages.
-- `--parts-per-gpu`: how many logical parts each GPU should process.
-- `--keep-intermediates`: retain the intermediate logits/chunks for debugging.
-
-The pipeline command internally invokes the individual CLIs, so pass model- and inference-specific flags exactly as you would to `vesuvius.predict`.
 
 ## Full Remote Workflow Example
 
