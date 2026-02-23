@@ -657,7 +657,7 @@ static void renderTiles(
                         size_t offX = (size_t(tx) & 1) * halfCW;
                         auto& pa = pyrAccum[0];
                         if (l1cx < pa.bufs.size()) {
-                            downsampleTileInto(
+                            downsampleTileIntoPreserveZ(
                                 existingBuf.data(), chunkZ, chunkY, chunkX,
                                 pa.bufs[l1cx].data(), pa.chZ, pa.chY, pa.chX,
                                 numZ, dy_actual, dx_actual,
@@ -748,7 +748,7 @@ static void renderTiles(
                     size_t offX = (size_t(tx) & 1) * halfCW;
                     auto& pa = pyrAccum[0];
                     if (l1cx < pa.bufs.size()) {
-                        downsampleTileInto(
+                        downsampleTileIntoPreserveZ(
                             chunkBuf.data(), chunkZ, chunkY, chunkX,
                             pa.bufs[l1cx].data(), pa.chZ, pa.chY, pa.chX,
                             numZ, dy_actual, dx_actual,
@@ -823,7 +823,7 @@ static void renderTiles(
                         size_t offY = (pyrChunkRow & 1) * halfY;
                         size_t offX = (cx & 1) * halfX;
                         if (nextCx < nextPa.bufs.size()) {
-                            downsampleTileInto(
+                            downsampleTileIntoPreserveZ(
                                 pa.bufs[cx].data(), pa.chZ, pa.chY, pa.chX,
                                 nextPa.bufs[nextCx].data(), nextPa.chZ, nextPa.chY, nextPa.chX,
                                 pa.chZ, pa.chY, pa.chX,

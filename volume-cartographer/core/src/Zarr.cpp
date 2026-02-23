@@ -117,6 +117,32 @@ template void downsampleTileInto<uint8_t>(const uint8_t*, size_t, size_t, size_t
 template void downsampleTileInto<uint16_t>(const uint16_t*, size_t, size_t, size_t,
     uint16_t*, size_t, size_t, size_t, size_t, size_t, size_t, size_t, size_t);
 
+template <typename T>
+void downsampleTileIntoPreserveZ(const T* src, size_t srcZ, size_t srcY, size_t srcX,
+                                T* dst, size_t dstZ, size_t dstY, size_t dstX,
+                                size_t srcActualZ, size_t srcActualY, size_t srcActualX,
+                                size_t dstOffY, size_t dstOffX)
+{
+    size_t halfY = (srcActualY + 1) / 2;
+    size_t halfX = (srcActualX + 1) / 2;
+    for (size_t zz = 0; zz < srcActualZ && zz < dstZ; zz++)
+        for (size_t yy = 0; yy < halfY && (dstOffY + yy) < dstY; yy++)
+            for (size_t xx = 0; xx < halfX && (dstOffX + xx) < dstX; xx++) {
+                uint32_t sum = 0; int cnt = 0;
+                for (int d1 = 0; d1 < 2 && 2 * yy + d1 < int(srcActualY); d1++)
+                    for (int d2 = 0; d2 < 2 && 2 * xx + d2 < int(srcActualX); d2++) {
+                        sum += src[zz * srcY * srcX + (2 * yy + d1) * srcX + (2 * xx + d2)];
+                        cnt++;
+                    }
+                dst[zz * dstY * dstX + (dstOffY + yy) * dstX + (dstOffX + xx)] = T((sum + cnt / 2) / std::max(1, cnt));
+            }
+}
+
+template void downsampleTileIntoPreserveZ<uint8_t>(const uint8_t*, size_t, size_t, size_t,
+    uint8_t*, size_t, size_t, size_t, size_t, size_t, size_t, size_t, size_t);
+template void downsampleTileIntoPreserveZ<uint16_t>(const uint16_t*, size_t, size_t, size_t,
+    uint16_t*, size_t, size_t, size_t, size_t, size_t, size_t, size_t, size_t);
+
 // ============================================================
 // buildPyramidLevel
 // ============================================================
@@ -182,7 +208,7 @@ void buildPyramidLevel(z5::filesystem::handle::File& outFile, int level,
                 size_t offY = sy * halfY;
                 size_t offX = sx * halfX;
 
-                downsampleTileInto(
+                downsampleTileIntoPreserveZ(
                     srcBuf.data(), sc[0], sc[1], sc[2],
                     dstBuf.data(), dc[0], dc[1], dc[2],
                     saZ, saY, saX, offY, offX);
@@ -215,10 +241,10 @@ void createPyramidDatasets(z5::filesystem::handle::File& outFile,
     std::string dtype = isU16 ? "uint16" : "uint8";
 
     // All pyramid levels use the same chunk Y×X as the input volume (typically 128×128).
-    // Only shape halves at each level; chunks stay fixed for fewer, larger files.
+    // Keep Z fixed and halve only X/Y at each level.
     std::vector<size_t> prevShape = shape0;
     for (int level = 1; level <= 5; level++) {
-        std::vector<size_t> ds = {(prevShape[0]+1)/2, (prevShape[1]+1)/2, (prevShape[2]+1)/2};
+        std::vector<size_t> ds = {prevShape[0], (prevShape[1] + 1) / 2, (prevShape[2] + 1) / 2};
         size_t chZ = std::min(ds[0], shape0[0]);  // clamp to level shape Z
         std::vector<size_t> dc = {chZ, std::min(CH, ds[1]), std::min(CW, ds[2])};
         z5::createDataset(outFile, std::to_string(level), dtype, ds, dc, std::string("blosc"), compOpts);
@@ -260,10 +286,11 @@ void writeZarrAttrs(z5::filesystem::handle::File& outFile,
     ms["datasets"] = json::array();
     for (int l = 0; l <= 5; l++) {
         double s = std::pow(2.0, l);
+        const double sz = 1.0;
         ms["datasets"].push_back({
             {"path", std::to_string(l)},
             {"coordinateTransformations", json::array({
-                json{{"type","scale"},{"scale",json::array({s,s,s})}},
+                json{{"type","scale"},{"scale",json::array({sz,s,s})}},
                 json{{"type","translation"},{"translation",json::array({0.0,0.0,0.0})}}
             })}
         });
@@ -272,4 +299,3 @@ void writeZarrAttrs(z5::filesystem::handle::File& outFile,
     attrs["multiscales"] = json::array({ms});
     z5::filesystem::writeAttributes(outFile, attrs);
 }
-

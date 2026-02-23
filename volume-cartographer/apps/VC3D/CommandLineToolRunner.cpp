@@ -591,7 +591,7 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
     switch (tool) {
         case Tool::RenderTifXYZ:
             args << "--volume" << _volumePath
-                 << "--output" << _outputPattern
+                 << "--tif-output" << _outputPattern
                  << "--segmentation" << _segmentPath
                  << "--scale" << QString::number(_scale)
                  << "--group-idx" << QString::number(_resolution)
