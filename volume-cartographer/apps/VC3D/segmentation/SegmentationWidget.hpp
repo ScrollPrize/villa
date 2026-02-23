@@ -170,9 +170,11 @@ public:
     [[nodiscard]] int newModelWidth() const;
     [[nodiscard]] int newModelHeight() const;
     [[nodiscard]] int newModelDepth() const;
+    [[nodiscard]] QString seedPointText() const;
 
     // Lasagna setters
     void setLasagnaDataInputPath(const QString& path);
+    void setSeedFromFocus(int x, int y, int z);
 
 signals:
     void editingModeChanged(bool enabled);
@@ -223,6 +225,7 @@ signals:
     void lasagnaOptimizeRequested();
     void lasagnaStopRequested();
     void lasagnaStatusMessage(const QString& message);
+    void seedFromFocusRequested();
 
     // Cell reoptimization signals
     void cellReoptModeChanged(bool enabled);

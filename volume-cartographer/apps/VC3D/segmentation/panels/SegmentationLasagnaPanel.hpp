@@ -48,6 +48,7 @@ public:
     [[nodiscard]] int newModelWidth() const;
     [[nodiscard]] int newModelHeight() const;
     [[nodiscard]] int newModelDepth() const;
+    [[nodiscard]] QString seedPointText() const;
 
     // Setters
     void setLasagnaDataInputPath(const QString& path);
@@ -55,10 +56,14 @@ public:
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled, bool optimizing);
 
+public slots:
+    void setSeedFromFocus(int x, int y, int z);
+
 signals:
     void lasagnaOptimizeRequested();
     void lasagnaStopRequested();
     void lasagnaStatusMessage(const QString& message);
+    void seedFromFocusRequested();
 
 private:
     void writeSetting(const QString& key, const QVariant& value);
@@ -92,6 +97,10 @@ private:
     QSpinBox* _widthSpin{nullptr};
     QSpinBox* _heightSpin{nullptr};
     QSpinBox* _depthSpin{nullptr};
+
+    QWidget* _seedWidget{nullptr};
+    QLineEdit* _seedEdit{nullptr};
+    QPushButton* _seedFromFocusBtn{nullptr};
 
     QComboBox* _configFileCombo{nullptr};
     QToolButton* _configFileBrowse{nullptr};

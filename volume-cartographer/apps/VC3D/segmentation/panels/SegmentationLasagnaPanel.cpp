@@ -132,6 +132,26 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     _group->contentLayout()->addWidget(_newModelWidget);
     _newModelWidget->setVisible(false);  // Hidden until "New Model" selected
 
+    // -- Seed point (visible only in New Model mode) --
+    _seedWidget = new QWidget(content);
+    auto* seedLayout = new QHBoxLayout(_seedWidget);
+    seedLayout->setContentsMargins(0, 0, 0, 0);
+    seedLayout->setSpacing(4);
+
+    seedLayout->addWidget(new QLabel(tr("Seed:"), _seedWidget));
+    _seedEdit = new QLineEdit(_seedWidget);
+    _seedEdit->setPlaceholderText(tr("auto (center)"));
+    _seedEdit->setToolTip(tr("Dilation seed point in full-res voxel coords: X, Y, Z"));
+    seedLayout->addWidget(_seedEdit, 1);
+
+    _seedFromFocusBtn = new QPushButton(tr("Focus"), _seedWidget);
+    _seedFromFocusBtn->setToolTip(tr("Use current focus point as seed"));
+    connect(_seedFromFocusBtn, &QPushButton::clicked, this, &SegmentationLasagnaPanel::seedFromFocusRequested);
+    seedLayout->addWidget(_seedFromFocusBtn);
+
+    _group->contentLayout()->addWidget(_seedWidget);
+    _seedWidget->setVisible(false);
+
     // -- Data input (zarr) — stacked: file browse (page 0) or dataset combo (page 1) --
     _dataInputStack = new QStackedWidget(content);
 
@@ -214,6 +234,11 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     });
     connect(_depthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
         writeSetting(QStringLiteral("lasagna_new_model_depth"), v);
+    });
+
+    // Persist seed point text
+    connect(_seedEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+        writeSetting(QStringLiteral("lasagna_seed_point"), text.trimmed());
     });
 
     // Connection mode
@@ -509,6 +534,13 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
     if (_newModelWidget) {
         _newModelWidget->setVisible(_lasagnaMode == 1);
     }
+    if (_seedWidget) {
+        _seedWidget->setVisible(_lasagnaMode == 1);
+    }
+    if (_seedEdit) {
+        const QSignalBlocker b(_seedEdit);
+        _seedEdit->setText(settings.value(QStringLiteral("lasagna_seed_point"), QString()).toString());
+    }
     if (_widthSpin) {
         const QSignalBlocker b(_widthSpin);
         _widthSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_width"), 2048).toInt());
@@ -669,6 +701,17 @@ int SegmentationLasagnaPanel::newModelDepth() const
     return _depthSpin ? _depthSpin->value() : 2048;
 }
 
+QString SegmentationLasagnaPanel::seedPointText() const
+{
+    return _seedEdit ? _seedEdit->text().trimmed() : QString();
+}
+
+void SegmentationLasagnaPanel::setSeedFromFocus(int x, int y, int z)
+{
+    if (_seedEdit)
+        _seedEdit->setText(QString("%1, %2, %3").arg(x).arg(y).arg(z));
+}
+
 void SegmentationLasagnaPanel::onLasagnaModeChanged(int index)
 {
     if (_restoringSettings) return;
@@ -676,6 +719,9 @@ void SegmentationLasagnaPanel::onLasagnaModeChanged(int index)
     writeSetting(QStringLiteral("lasagna_mode"), _lasagnaMode);
     if (_newModelWidget) {
         _newModelWidget->setVisible(index == 1);  // Show for "New Model"
+    }
+    if (_seedWidget) {
+        _seedWidget->setVisible(index == 1);
     }
 }
 

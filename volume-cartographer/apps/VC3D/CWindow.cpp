@@ -1772,6 +1772,15 @@ void CWindow::CreateWidgets(void)
     });
 
     // -- Lasagna connections --
+    connect(_segmentationWidget, &SegmentationWidget::seedFromFocusRequested, this, [this]() {
+        POI* focus = _surf_col ? _surf_col->poi("focus") : nullptr;
+        if (focus)
+            _segmentationWidget->setSeedFromFocus(
+                static_cast<int>(focus->p[0]),
+                static_cast<int>(focus->p[1]),
+                static_cast<int>(focus->p[2]));
+    });
+
     connect(_segmentationWidget, &SegmentationWidget::lasagnaOptimizeRequested, this, [this]() {
         auto& mgr = LasagnaServiceManager::instance();
         const bool isNewModel = (_segmentationWidget->lasagnaMode() == 1);
@@ -1913,17 +1922,32 @@ void CWindow::CreateWidgets(void)
             int nmH = _segmentationWidget->newModelHeight();
             int nmD = _segmentationWidget->newModelDepth();
 
-            // Get focus/cursor position for centering the bbox
-            POI* focus = _surf_col ? _surf_col->poi("focus") : nullptr;
-            if (!focus) {
-                auto msg = tr("No focus position set. Place the cursor first.");
-                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-                statusBar()->showMessage(msg, 5000);
-                return;
+            // Get bbox center: use seed point if specified, otherwise focus
+            int cx, cy, cz;
+            QString seedText = _segmentationWidget->seedPointText();
+            bool seedOk = false;
+            if (!seedText.isEmpty()) {
+                QStringList parts = seedText.split(',');
+                if (parts.size() == 3) {
+                    bool ok0, ok1, ok2;
+                    cx = parts[0].trimmed().toInt(&ok0);
+                    cy = parts[1].trimmed().toInt(&ok1);
+                    cz = parts[2].trimmed().toInt(&ok2);
+                    seedOk = ok0 && ok1 && ok2;
+                }
             }
-            int cx = static_cast<int>(focus->p[0]);
-            int cy = static_cast<int>(focus->p[1]);
-            int cz = static_cast<int>(focus->p[2]);
+            if (!seedOk) {
+                POI* focus = _surf_col ? _surf_col->poi("focus") : nullptr;
+                if (!focus) {
+                    auto msg = tr("No focus position or seed point set. Place the cursor or enter a seed.");
+                    std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                    statusBar()->showMessage(msg, 5000);
+                    return;
+                }
+                cx = static_cast<int>(focus->p[0]);
+                cy = static_cast<int>(focus->p[1]);
+                cz = static_cast<int>(focus->p[2]);
+            }
 
             // Build/override the "args" section with --bbox CX CY CZ W H
             // and --z-size for the full 3D extent (no grow stages needed)
