@@ -59,7 +59,7 @@ const sidebars = {
       collapsed: true,
       link: { type: 'doc', id: 'data' },
       items: [
-        { type: 'doc', id: 'data_browser', label: 'Sample Browser' },
+        { type: 'doc', id: 'data_browser', label: 'Data Browser' },
         { type: 'doc', id: 'data_segments' },
         { type: 'doc', id: 'data_datasets' },
       ],
