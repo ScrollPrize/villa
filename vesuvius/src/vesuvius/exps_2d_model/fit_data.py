@@ -269,6 +269,36 @@ def _gaussian_blur_nchw(*, x: torch.Tensor, sigma: float, kernel_size: int = 21)
 	return y
 
 
+def get_preprocessed_params(path: str) -> dict | None:
+	"""Probe preprocessed zarr metadata for z_step and downscale.
+
+	Returns dict with keys 'z_step', 'z_step_eff', 'downscale_xy', or None.
+	"""
+	p = Path(path)
+	s = str(p)
+	is_omezarr = (
+		s.endswith(".zarr")
+		or s.endswith(".ome.zarr")
+		or (".zarr/" in s)
+		or (".ome.zarr/" in s)
+	)
+	if not is_omezarr:
+		return None
+	try:
+		zsrc = zarr.open(s, mode="r")
+	except Exception:
+		return None
+	if not (isinstance(zsrc, zarr.Array) and int(len(zsrc.shape)) == 4 and int(zsrc.shape[0]) >= 4):
+		return None
+	params = dict(getattr(zsrc, "attrs", {}).get("preprocess_params", {}) or {})
+	if not params:
+		return None
+	ds = float(params.get("downscale_xy", 1.0))
+	zs = int(params.get("z_step", 1))
+	z_step_eff = int(params.get("z_step_eff", int(zs) * int(max(1, int(ds)))))
+	return {"z_step": zs, "z_step_eff": z_step_eff, "downscale_xy": ds}
+
+
 def load(
 	path: str,
 	device: torch.device,
@@ -434,15 +464,21 @@ def load(
 					f"z_step_eff_meta={int(z_step_eff_meta)}"
 				)
 
+			_z_fullres_first = int(z_req_raw[0]) if z_req_raw else 0
+			_z_fullres_last = int(z_req_raw[-1]) if z_req_raw else 0
+			_z_fullres_extent = _z_fullres_last - _z_fullres_first + int(z_step_eff_meta)
 			print(
-				"[fit_data] preprocessed zarr load "
-				f"shape_czyx={shape_czyx} "
-				f"z_req_raw={z_req_raw} "
-				f"z_idx_loaded={z_idx} "
-				f"z_step_eff_meta={int(z_step_eff_meta)} "
-				f"output_full_scaled={int(output_full_scaled)} "
-				f"crop_xywh=({int(x0)},{int(y0)},{int(cw)},{int(ch)}) "
-				f"margin_xy=({int(margin_x)},{int(margin_y)})",
+				f"[fit_data] === PREPROCESSED ZARR LOAD ===\n"
+				f"[fit_data]   zarr shape_czyx={shape_czyx}\n"
+				f"[fit_data]   z_size(requested)={zs} z_step_eff_meta={int(z_step_eff_meta)}\n"
+				f"[fit_data]   z0_raw(unet_z)={z0_raw} z_step(cli)={z_step}\n"
+				f"[fit_data]   zarr z_step_meta={zs_meta} downscale_meta={ds_meta}\n"
+				f"[fit_data]   z_idx range: [{z_idx[0]}..{z_idx[-1]}] ({len(z_idx)} slices from zarr)\n"
+				f"[fit_data]   fullres z range: [{_z_fullres_first}..{_z_fullres_last}] "
+				f"extent={_z_fullres_extent} voxels (EXPECT ~480)\n"
+				f"[fit_data]   xy crop=({int(x0)},{int(y0)},{int(cw)},{int(ch)}) "
+				f"margin=({int(margin_x)},{int(margin_y)})\n"
+				f"[fit_data] ================================",
 				flush=True,
 			)
 
