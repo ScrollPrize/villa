@@ -1,4 +1,4 @@
 {
-  "metadataUrl": "metadata.json",
+  "metadataUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/metadata.json",
   "version": "0.1"
 }
