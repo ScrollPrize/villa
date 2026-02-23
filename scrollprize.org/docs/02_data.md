@@ -54,7 +54,9 @@ We host the dataset in **two repositories** (with the **same folder layout**):
 - **Web-browsable samples:** https://data.aws.ash2txt.org/samples/
 - **Open data bucket:** `s3://vesuvius-challenge-open-data/` usable with any S3‑compatible client (e.g., AWS CLI, boto3, s3fs, etc.). It's also [browsable directly](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html).
 
-An overview of the dataset can be found in the [data browser](data_browser).
+An overview of the dataset can be found in the [Sample Browser](data_browser).
+The browser is the unified sample index for both scrolls and fragments.
+For deeper exploration, use [Segments](data_segments) when you want mapped surface data, and [Curated Datasets](data_datasets) for ready-to-use bundles built for specific research tasks.
 
 ## What's included
 
@@ -100,7 +102,10 @@ You will typically browse by **sample ID** (e.g., a specific scroll or fragment)
 
 - Detached fragments with exposed ink on their surfaces. These are especially useful for building and validating ML approaches (e.g., ink detection), because they provide ground truth signals.
 
-➡️ **Browse all samples:** [Browser](data_browser)
+➡️ **Browse all samples:** [Sample Browser](data_browser)
+
+Looking for scroll-only or fragment-only views? Use the same browser row-by-row and apply the relevant filters.
+- [Segments](data_segments) for mapped surface exports and segment artifacts
 
 
 ## Documentation and references
