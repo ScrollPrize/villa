@@ -152,6 +152,22 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     _group->contentLayout()->addWidget(_seedWidget);
     _seedWidget->setVisible(false);
 
+    // -- Output name (visible only in New Model mode) --
+    {
+        auto* nameWidget = new QWidget(content);
+        auto* nameLayout = new QHBoxLayout(nameWidget);
+        nameLayout->setContentsMargins(0, 0, 0, 0);
+        nameLayout->setSpacing(4);
+        nameLayout->addWidget(new QLabel(tr("Name:"), nameWidget));
+        _outputNameEdit = new QLineEdit(nameWidget);
+        _outputNameEdit->setPlaceholderText(tr("new_model"));
+        _outputNameEdit->setToolTip(tr("Output name prefix (auto-versioned, e.g. mysheet → mysheet_v001.tifxyz)"));
+        nameLayout->addWidget(_outputNameEdit, 1);
+        _group->contentLayout()->addWidget(nameWidget);
+        // Reuse _seedWidget's parent for visibility? No — just track via _outputNameEdit's parent
+        nameWidget->setVisible(false);
+    }
+
     // -- Data input (zarr) — stacked: file browse (page 0) or dataset combo (page 1) --
     _dataInputStack = new QStackedWidget(content);
 
@@ -239,6 +255,11 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     // Persist seed point text
     connect(_seedEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         writeSetting(QStringLiteral("lasagna_seed_point"), text.trimmed());
+    });
+
+    // Persist output name
+    connect(_outputNameEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+        writeSetting(QStringLiteral("lasagna_output_name"), text.trimmed());
     });
 
     // Connection mode
@@ -541,6 +562,12 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
         const QSignalBlocker b(_seedEdit);
         _seedEdit->setText(settings.value(QStringLiteral("lasagna_seed_point"), QString()).toString());
     }
+    if (_outputNameEdit) {
+        const QSignalBlocker b(_outputNameEdit);
+        _outputNameEdit->setText(settings.value(QStringLiteral("lasagna_output_name"), QString()).toString());
+        if (_outputNameEdit->parentWidget())
+            _outputNameEdit->parentWidget()->setVisible(_lasagnaMode == 1);
+    }
     if (_widthSpin) {
         const QSignalBlocker b(_widthSpin);
         _widthSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_width"), 2048).toInt());
@@ -706,6 +733,11 @@ QString SegmentationLasagnaPanel::seedPointText() const
     return _seedEdit ? _seedEdit->text().trimmed() : QString();
 }
 
+QString SegmentationLasagnaPanel::newModelOutputName() const
+{
+    return _outputNameEdit ? _outputNameEdit->text().trimmed() : QString();
+}
+
 void SegmentationLasagnaPanel::setSeedFromFocus(int x, int y, int z)
 {
     if (_seedEdit)
@@ -722,6 +754,9 @@ void SegmentationLasagnaPanel::onLasagnaModeChanged(int index)
     }
     if (_seedWidget) {
         _seedWidget->setVisible(index == 1);
+    }
+    if (_outputNameEdit && _outputNameEdit->parentWidget()) {
+        _outputNameEdit->parentWidget()->setVisible(index == 1);
     }
 }
 

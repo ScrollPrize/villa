@@ -49,6 +49,7 @@ public:
     [[nodiscard]] int newModelHeight() const;
     [[nodiscard]] int newModelDepth() const;
     [[nodiscard]] QString seedPointText() const;
+    [[nodiscard]] QString newModelOutputName() const;
 
     // Setters
     void setLasagnaDataInputPath(const QString& path);
@@ -101,6 +102,7 @@ private:
     QWidget* _seedWidget{nullptr};
     QLineEdit* _seedEdit{nullptr};
     QPushButton* _seedFromFocusBtn{nullptr};
+    QLineEdit* _outputNameEdit{nullptr};
 
     QComboBox* _configFileCombo{nullptr};
     QToolButton* _configFileBrowse{nullptr};

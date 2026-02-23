@@ -171,6 +171,7 @@ public:
     [[nodiscard]] int newModelHeight() const;
     [[nodiscard]] int newModelDepth() const;
     [[nodiscard]] QString seedPointText() const;
+    [[nodiscard]] QString newModelOutputName() const;
 
     // Lasagna setters
     void setLasagnaDataInputPath(const QString& path);

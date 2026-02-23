@@ -1839,19 +1839,31 @@ void CWindow::CreateWidgets(void)
             return;
         }
 
-        // Output dir: use the segment's parent directory (paths dir)
+        // Output dir: for re-optimize use the segment's parent directory;
+        // for new model use the volpkg's segmentation directory
         QString outputDir;
         if (!segPath.empty()) {
             outputDir = QString::fromStdString(segPath.parent_path().string());
+        } else if (fVpkg) {
+            auto vpkgRoot = std::filesystem::path(fVpkg->getVolpkgDirectory());
+            auto segDir = vpkgRoot / fVpkg->getSegmentationDirectory();
+            outputDir = QString::fromStdString(segDir.string());
         }
 
         // --- Compute next version name ---
         QString outputName;
         {
-            std::string rootName = "new_model";  // Default for new model without segment
+            std::string rootName = "new_model";  // Default fallback
             const std::string tifxyzSuffix = ".tifxyz";
 
-            if (!segPath.empty()) {
+            if (isNewModel) {
+                // New model: use the output name field, fall back to "new_model"
+                QString nmName = _segmentationWidget->newModelOutputName();
+                if (!nmName.isEmpty()) {
+                    rootName = nmName.toStdString();
+                }
+            } else if (!segPath.empty()) {
+                // Re-optimize: derive from existing segment name
                 auto segName = segPath.filename().string();
                 std::string baseName = segName;
                 if (baseName.size() > tifxyzSuffix.size() &&
