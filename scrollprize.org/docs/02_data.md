@@ -52,7 +52,9 @@ Our goal is to **virtually unwrap** the scrolls from their 3D X‑ray volumes an
 We host the dataset in **two repositories** (with the **same folder layout**):
 
 - **Web-browsable samples:** https://data.aws.ash2txt.org/samples/
-- **Open data bucket:** `s3://vesuvius-challenge-open-data/`
+- **Open data bucket:** `s3://vesuvius-challenge-open-data/` usable with any S3‑compatible client (e.g., AWS CLI, boto3, s3fs, etc.). It's also [browsable directly](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html).
+
+An overview of the dataset can be found in the [data browser](data_browser).
 
 ## What's included
 
@@ -67,13 +69,13 @@ The open data repository provides a consistent set of artifacts across scrolls a
 
 This is a practical "what you'll actually see on disk" summary.
 
-| Data type | What it represents | Common formats |
-|---|---|---|
-| **Volumetric scans ("volumes")** | 3D density/intensity values from CT reconstruction | **OME‑Zarr** (primary), sometimes **TIFF stacks** |
-| **Segment surface volumes** | 2D/3D data extracted along a papyrus surface at several depths | **OME‑Zarr** and/or **TIFF stacks** (`00.tif`, `01.tif`, …) |
-| **Surface geometry ("meshes")** | The 3D sheet geometry and its flattened mapping | **OBJ** meshes, plus **TIFXYZ** (x/y/z TIFF triplet + metadata) |
-| **Model outputs** | Predicted surfaces, ink probability maps, derived images | **OME‑Zarr** (volumetric outputs), **TIFF** (image outputs) |
-| **Metadata** | Provenance, parameters, IDs, links between artifacts | **JSON** (and occasional text files) |
+| Data type                        | What it represents                                             | Common formats                                                  |
+| -------------------------------- | -------------------------------------------------------------- | --------------------------------------------------------------- |
+| **Volumetric scans ("volumes")** | 3D density/intensity values from CT reconstruction             | **OME‑Zarr** (primary), sometimes **TIFF stacks**               |
+| **Segment surface volumes**      | 2D/3D data extracted along a papyrus surface at several depths | **OME‑Zarr** and/or **TIFF stacks** (`00.tif`, `01.tif`, …)     |
+| **Surface geometry ("meshes")**  | The 3D sheet geometry and its flattened mapping                | **OBJ** meshes, plus **TIFXYZ** (x/y/z TIFF triplet + metadata) |
+| **Model outputs**                | Predicted surfaces, ink probability maps, derived images       | **OME‑Zarr** (volumetric outputs), **TIFF** (image outputs)     |
+| **Metadata**                     | Provenance, parameters, IDs, links between artifacts           | **JSON** (and occasional text files)                            |
 
 ### Why OME‑Zarr?
 
@@ -88,7 +90,7 @@ Both repositories follow the same high‑level structure:
 ├── volumes/            # 3D reconstructed volumes (OME‑Zarr, sometimes TIFF)
 ├── segments/           # Extracted surfaces: meshes, surface volumes, (optional) ink results
 └── representations/    # Derived artifacts (e.g., predictions)
-````
+```
 
 You will typically browse by **sample ID** (e.g., a specific scroll or fragment), then choose the artifact you need (a volume, a segment, or a derived representation).
 
@@ -96,7 +98,7 @@ You will typically browse by **sample ID** (e.g., a specific scroll or fragment)
 
 Herculaneum scrolls scanned via synchrotron micro‑CT. These are the core targets for "virtual unwrapping" and reading.
 
-➡️ **Browse the scroll list:** [Scrolls](data_scrolls)
+➡️ **Browse all samples:** [Browser](data_browser)
 
 <div>
   <table>
@@ -188,15 +190,14 @@ Detached fragments with exposed ink on their surfaces. These are especially usef
 
 ## Documentation and references
 
-* [EduceLab-Scrolls (2019)](https://arxiv.org/abs/2304.02084): technical paper describing the original dataset work.
-* [EduceLab Data Sheet (2023)](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing): technical description of more recent scans added to the dataset.
-* [Scan at ESRF Draft Info Sheet (2025)](https://docs.google.com/document/d/1CDPgx7XhNsnLJw6uErT8Z5tgY3wnETQdvXpR5Kwu9K4/edit?usp=sharing)
-
+- [EduceLab-Scrolls (2019)](https://arxiv.org/abs/2304.02084): technical paper describing the original dataset work.
+- [EduceLab Data Sheet (2023)](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing): technical description of more recent scans added to the dataset.
+- [Scan at ESRF Draft Info Sheet (2025)](https://docs.google.com/document/d/1CDPgx7XhNsnLJw6uErT8Z5tgY3wnETQdvXpR5Kwu9K4/edit?usp=sharing)
 
 ## Support
 
-* GitHub Issues: [Vesuvius Challenge repository](https://github.com/scrollprize/villa)
-* Community Forum: [Discord](https://discord.gg/V4fJhvtaQn)
+- GitHub Issues: [Vesuvius Challenge repository](https://github.com/scrollprize/villa)
+- Community Forum: [Discord](https://discord.gg/V4fJhvtaQn)
 
 ## Licenses
 

@@ -60,7 +60,6 @@ const sidebars = {
       link: { type: 'doc', id: 'data' },
       items: [
         { type: 'doc', id: 'data_browser', label: 'Browser' },
-        { type: 'doc', id: 'data_scrolls' },
         { type: 'doc', id: 'data_fragments' },
         { type: 'doc', id: 'data_segments' },
         { type: 'doc', id: 'data_datasets' },

@@ -42,18 +42,21 @@ hide_table_of_contents: true
 
 <!-- ====================================================== -->
 
-Scanning protocols, coordinate systems, and data formats mirror those used for the [full scrolls](data_scrolls). Every fragment dataset contains:
+Scanning protocols, coordinate systems, and data formats mirror those used for the full scrolls. Fragment dataset contains:
 
-* **3D X‑ray volumes** at several resolutions / beam energies.
-* **Multispectral photographs** (RGB + IR).
-* **Hand‑labeled ink masks** for at least one surface volume, suitable for supervised ML.
+- **3D X‑ray volumes** at several resolutions / beam energies.
+- **Multispectral photographs** (RGB + IR).
+- **Hand‑labeled ink masks** for at least one surface volume, suitable for supervised ML.
 
 We group the fragments by the facility where they were scanned:
 
 1. **DLS Fragments (2023)** – Six fragments scanned at Diamond Light Source (UK).
 2. **ESRF Fragments (2025)** – Three fragments scanned on beamline BM18 at the European Synchrotron Radiation Facility (Grenoble, FR).
 
-> **Work‑in‑progress 👷‍♀️**   File formats, folder names, and alignment conventions may still shift.  Expect additional volumes, surface volumes and meshes and ink labels to appear over time!
+> **Work‑in‑progress 👷‍♀️**   File formats, folder names, and alignment conventions may still shift. Expect additional volumes, surface volumes and meshes and ink labels to appear over time!
+
+The data is linked from the [Data Browser](data_browser), fragments are annotated
+with a special marker in the table.
 
 ---
 
@@ -65,6 +68,7 @@ For more technical details, see [EduceLab-Scrolls: Verifiable Recovery of Text f
 > ⚠️3D x-ray scan volumes of Fragments 5-6 are aligned, but Fragments 1-4 are NOT aligned.
 
 ### PHerc. Paris 2 Fr 47 (Fragment 1)
+
 <div className="flex flex-wrap mb-4">
   <div className="w-[45%] mb-2 mr-2 max-w-[200px]"><img src="/img/data/fr1.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. Paris 2 Fr 47 (Fragment 1)</figcaption></div>
 </div>
@@ -72,14 +76,15 @@ For more technical details, see [EduceLab-Scrolls: Verifiable Recovery of Text f
 <p>Volume [20230213100222](https://dl.ash2txt.org/fragments/Frag1/PHercParis2Fr47.volpkg/volumes/20230213100222/): 3.24µm, 88keV, 7229 x 24MB .tif files. Total size: 171 GB</p>
 
 ### PHerc. Paris 2 Fr 143 (Fragment 2)
+
 <div className="flex flex-wrap mb-4">
   <div className="w-[45%] mb-2 mr-2 max-w-[200px]"><img src="/img/data/fr2.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. Paris 2 Fr 143 (Fragment 2)</figcaption></div>
 </div>
 <p>Volume [20230216174557](https://dl.ash2txt.org/fragments/Frag2/PHercParis2Fr143.volpkg/volumes/20230216174557/): 3.24µm, 54keV, 14111 x 46MB .tif files. Total size: 645 GB</p>
 <p>Volume [20230226143835](https://dl.ash2txt.org/fragments/Frag2/PHercParis2Fr143.volpkg/volumes/20230226143835/): 3.24µm, 88keV, 14144 x 43MB .tif files. Total size: 599 GB</p>
 
-
 ### PHerc. Paris 1 Fr 34 (Fragment 3)
+
 <div className="flex flex-wrap mb-4">
   <div className="w-[45%] mb-2 mr-2 max-w-[220px]"><img src="/img/data/fr3.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. Paris 1 Fr 34 (Fragment 3)</figcaption></div>
 </div>
@@ -87,7 +92,9 @@ For more technical details, see [EduceLab-Scrolls: Verifiable Recovery of Text f
 <p>Volume [20230215142309](https://dl.ash2txt.org/fragments/Frag3/PHercParis1Fr34.volpkg/volumes/20230215142309/): 3.24µm, 54keV, 6656 x 18MB .tif files. Total size: 121 GB</p>
 
 ### PHerc. Paris 1 Fr 39 (Fragment 4)
+
 Originally held back for automated scoring in the [Kaggle](https://kaggle.com/competitions/vesuvius-challenge-ink-detection/) competition, this fragment has since been released.
+
 <div className="flex flex-wrap mb-4">
   <div className="w-[45%] mb-2 mr-2 max-w-[170px]"><img src="/img/data/fr4.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. Paris 1 Fr 39 (Fragment 4)</figcaption></div>
 </div>
@@ -95,7 +102,9 @@ Originally held back for automated scoring in the [Kaggle](https://kaggle.com/co
 <p>Volume [20230222173037](https://dl.ash2txt.org/fragments/Frag4/PHercParis1Fr39.volpkg/volumes/20230222173037/): 3.24µm, 88keV, 9209 x 24MB .tif files. Total size: 216 GB</p>
 
 ### PHerc. 1667 Cr 1 Fr 3 (Fragment 5)
+
 From the same original scroll as Scroll 4 (PHerc. 1667), which was partially opened in 1987 using the Oslo method. Find this fragment on [Chartes.it](https://www.chartes.it/index.php?r=document/view&id=1691).
+
 <div className="flex flex-wrap mb-4">
   <div className="w-[45%] mb-2 mr-2 max-w-[300px]"><img src="/img/data/fr5-2.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 1667 Cr 1 Fr 3 (Fragment 5)</figcaption></div>
 </div>
@@ -103,6 +112,7 @@ From the same original scroll as Scroll 4 (PHerc. 1667), which was partially ope
 <p>Volume [20231130111236](https://dl.ash2txt.org/fragments/Frag5/PHerc1667Cr1Fr3.volpkg/volumes/20231130111236/): 7.91µm, 70keV, 3131 x 3MB .tif files. Total size: 8.5 GB</p>
 
 ### PHerc. 51 Cr 4 Fr 8 (Fragment 6)
+
 <div className="flex flex-wrap mb-4">
   <div className="w-[45%] mb-2 mr-2 max-w-[325px]"><img src="/img/data/fr6-2.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 51 Cr 4 Fr 8 (Fragment 6)</figcaption></div>
 </div>
@@ -123,11 +133,11 @@ From the same original scroll as Scroll 4 (PHerc. 1667), which was partially ope
 
 ## 2 · ESRF Fragments (BM18, Grenoble — May 2025)
 
-Between **6 May 2025 and 12 May 2025** we scanned three additional fragments on the **BM18** beamline at the 4th‑generation European Synchrotron Radiation Facility (ESRF).  Phase‑contrast helical CT, ultrafine 2.2 µm voxels, and several sample‑to‑detector distances were explored.
+Between **6 May 2025 and 12 May 2025** we scanned three additional fragments on the **BM18** beamline at the 4th‑generation European Synchrotron Radiation Facility (ESRF). Phase‑contrast helical CT, ultrafine 2.2 µm voxels, and several sample‑to‑detector distances were explored.
 
 👉 **Draft info‑sheet**: <a href="https://docs.google.com/document/d/1CDPgx7XhNsnLJw6uErT8Z5tgY3wnETQdvXpR5Kwu9K4/edit?usp=sharing" target="_blank" rel="noopener">ESRF Fragment Data (May 2025)</a>
 
-> *All ESRF volumes are published as **OME‑Zarr** (six‑level multiscale) rather than loose TIFF stacks.
+> \*All ESRF volumes are published as **OME‑Zarr** (six‑level multiscale) rather than loose TIFF stacks.
 
 ### Fragment 500P2
 
@@ -135,8 +145,8 @@ Between **6 May 2025 and 12 May 2025** we scanned three additional fr
   <div className="w-[45%] mb-2 mr-2 max-w-[260px]"><img src="/img/data/PHerc0500P2-ir.JPG" className="w-[100%]"/><figcaption className="mt-[-6px]">PHerc. 500P2 – infrared</figcaption></div>
 </div>
 - **2.215 µm, 110 keV** · OME‑Zarr
-- **4.317 µm, 111 keV** · OME‑Zarr 
-- Multispectral stack (16 bands, 420–1050 nm)  
+- **4.317 µm, 111 keV** · OME‑Zarr
+- Multispectral stack (16 bands, 420–1050 nm)
 - Case + mesh STL (nylon 12 print‑ready)
 
 ### Fragment 343P
@@ -146,7 +156,7 @@ Between **6 May 2025 and 12 May 2025** we scanned three additional fr
 </div>
 - **2.215 µm, 111 keV** · OME‑Zarr
 - **4.320 µm, 116 keV (bin×2)** · OME‑Zarr
-- Multispectral stack (16 bands)  
+- Multispectral stack (16 bands)
 - Case + mesh STL
 
 ### Fragment 9B
@@ -161,12 +171,14 @@ Data available [here](https://data.aws.ash2txt.org/samples/PHerc0009B/) and [her
 - Unwrapped segments
 - Case + mesh STL
 
-> **Preliminary ink detection**  – Our TimesFormer ML models already pick up discrete strokes in the 2.2 µm volumes of 343P and 500P2.  For a sneak‑peek see the [blog post](https://scrollprize.substack.com/p/summer-haze-comes-with-ink).  Surface volumes & precise IR alignment are coming soon.
+> **Preliminary ink detection**  – Our TimesFormer ML models already pick up discrete strokes in the 2.2 µm volumes of 343P and 500P2. For a sneak‑peek see the [blog post](https://scrollprize.substack.com/p/summer-haze-comes-with-ink). Surface volumes & precise IR alignment are coming soon.
 
 ---
 
 ## Data format at a glance
-> **Work‑in‑progress 👷‍♀️**   File formats, folder names, and alignment conventions may still shift.  Expect additional volumes, surface volumes and meshes and ink labels to appear over time!
+
+> **Work‑in‑progress 👷‍♀️**   File formats, folder names, and alignment conventions may still shift. Expect additional volumes, surface volumes and meshes and ink labels to appear over time!
+
 ```
 /fragments/                # EduceLab classic datasets (TIFF stacks)
   └─ Frag1/PHerc… .volpkg/
@@ -179,7 +191,7 @@ Data available [here](https://data.aws.ash2txt.org/samples/PHerc0009B/) and [her
                  ├─ ir.png
                  ├─ inklabels.png
                  └─ alignment.psd
-                 
+
 /fragments/          # ESRF 2025 datasets (OME‑Zarr)
   └─ PHerc0500P2/
        ├─ 2.215um_HEL_TA_0.4m_110keV.zarr/
@@ -189,10 +201,10 @@ Data available [here](https://data.aws.ash2txt.org/samples/PHerc0009B/) and [her
        └─ cases/           # STL meshes & 3D‑printed holders
 ```
 
-* **Fragments 1‑6** use the original *TIFF‑stack* `.volpkg` layout.
-> ⚠️ **ESRF fragments** ship as **OME‑Zarr multiscale** volumes for instant cloud streaming.
+- **Fragments 1‑6** use the original *TIFF‑stack* `.volpkg` layout.
+  > ⚠️ **ESRF fragments** ship as **OME‑Zarr multiscale** volumes for instant cloud streaming.
 
-> ⚠️ All infrared & multispectral images are supplied *pre‑aligned* where possible.  Otherwise, check the `alignment.psd` layers.
+> ⚠️ All infrared & multispectral images are supplied _pre‑aligned_ where possible. Otherwise, check the `alignment.psd` layers.
 
 ---
 
