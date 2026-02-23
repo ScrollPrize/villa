@@ -94,99 +94,14 @@ Both repositories follow the same high‑level structure:
 
 You will typically browse by **sample ID** (e.g., a specific scroll or fragment), then choose the artifact you need (a volume, a segment, or a derived representation).
 
-## Scrolls
+## Scrolls and Fragments
 
-Herculaneum scrolls scanned via synchrotron micro‑CT. These are the core targets for "virtual unwrapping" and reading.
+- Herculaneum scrolls scanned via synchrotron micro‑CT. These are the core targets for "virtual unwrapping" and reading.
+
+- Detached fragments with exposed ink on their surfaces. These are especially useful for building and validating ML approaches (e.g., ink detection), because they provide ground truth signals.
 
 ➡️ **Browse all samples:** [Browser](data_browser)
 
-<div>
-  <table>
-    <tbody>
-      <tr>
-        <td>
-          <div className="flex flex-wrap max-w-[500px]">
-            <div className="sm:w-[45%] mb-2 mr-2">
-              <img src="/img/overview/scroll1-actual-new.webp" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. Paris. 4 (Scroll 1)</figcaption>
-            </div>
-            <div className="sm:w-[35.5%] mb-2 mr-2">
-              <img src="/img/overview/PHerc332.webp" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. 332 (Scroll 3)</figcaption>
-            </div>
-            <div className="sm:w-[55%] mb-2">
-              <img src="/img/overview/PHerc1667.webp" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. 1667 (Scroll 4)</figcaption>
-            </div>
-            <div className="sm:w-[55%] mb-2">
-              <img src="/img/overview/PHerc172.webp" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. 172 (Scroll 5)</figcaption>
-            </div>
-            <div className="sm:w-[55%] mb-2">
-              <img src="/img/overview/PHerc139.jpg" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. 139</figcaption>
-            </div>
-          </div>
-        </td>
-      </tr>
-    </tbody>
-  </table>
-</div>
-
-## Fragments
-
-Detached fragments with exposed ink on their surfaces. These are especially useful for building and validating ML approaches (e.g., ink detection), because they provide ground truth signals.
-
-➡️ **Browse the fragment list:** [Fragments](data_fragments)
-
-<div>
-  <table>
-    <tbody>
-      <tr>
-        <td>
-          <div className="flex flex-wrap">
-            <div className="sm:w-[45%] max-w-[200px] mb-2 mr-2">
-              <img src="/img/data/fr1.webp" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. Paris. 2 Fr 47 (Fragment 1)</figcaption>
-            </div>
-            <div className="sm:w-[45%] max-w-[200px] mb-2 mr-2">
-              <img src="/img/data/fr2.webp" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. Paris. 2 Fr 143 (Fragment 2)</figcaption>
-            </div>
-            <div className="sm:w-[45%] max-w-[200px] mb-2 mr-2">
-              <img src="/img/data/fr3.webp" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. Paris. 1 Fr 34 (Fragment 3)</figcaption>
-            </div>
-            <div className="sm:w-[45%] max-w-[200px] mb-2 mr-2">
-              <img src="/img/data/fr4.webp" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. Paris. 1 Fr 39 (Fragment 4)</figcaption>
-            </div>
-            <div className="sm:w-[45%] max-w-[130px] mb-2 mr-2">
-              <img src="/img/data/fr5.webp" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. 1667 Cr 1 Fr 3 (Fragment 5)</figcaption>
-            </div>
-            <div className="sm:w-[45%] max-w-[220px] mb-2 mr-2">
-              <img src="/img/data/fr6.webp" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. 51 Cr 4 Fr 48 (Fragment 6)</figcaption>
-            </div>
-            <div className="sm:w-[45%] max-w-[220px] mb-2 mr-2">
-              <img src="/img/data/PHerc0009B-ir.JPG" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. 9B</figcaption>
-            </div>
-            <div className="sm:w-[45%] max-w-[220px] mb-2 mr-2">
-              <img src="/img/data/PHerc0343P-ir.JPG" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. 343P</figcaption>
-            </div>
-            <div className="sm:w-[45%] max-w-[220px] mb-2 mr-2">
-              <img src="/img/data/PHerc0500P2-ir.JPG" className="w-[100%]" />
-              <figcaption className="mt-[-6px]">PHerc. 500P2</figcaption>
-            </div>
-          </div>
-        </td>
-      </tr>
-    </tbody>
-  </table>
-</div>
 
 ## Documentation and references
 
