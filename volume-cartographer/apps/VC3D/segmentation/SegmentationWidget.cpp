@@ -177,6 +177,8 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::lasagnaStopRequested);
     connect(_lasagnaPanel, &SegmentationLasagnaPanel::lasagnaStatusMessage,
             this, &SegmentationWidget::lasagnaStatusMessage);
+    connect(_lasagnaPanel, &SegmentationLasagnaPanel::seedFromFocusRequested,
+            this, &SegmentationWidget::seedFromFocusRequested);
 }
 
 void SegmentationWidget::syncUiState()
@@ -416,5 +418,7 @@ int SegmentationWidget::lasagnaMode() const { return static_cast<int>(_lasagnaPa
 int SegmentationWidget::newModelWidth() const { return _lasagnaPanel->newModelWidth(); }
 int SegmentationWidget::newModelHeight() const { return _lasagnaPanel->newModelHeight(); }
 int SegmentationWidget::newModelDepth() const { return _lasagnaPanel->newModelDepth(); }
+QString SegmentationWidget::seedPointText() const { return _lasagnaPanel->seedPointText(); }
 
 void SegmentationWidget::setLasagnaDataInputPath(const QString& path) { _lasagnaPanel->setLasagnaDataInputPath(path); }
+void SegmentationWidget::setSeedFromFocus(int x, int y, int z) { _lasagnaPanel->setSeedFromFocus(x, y, z); }
