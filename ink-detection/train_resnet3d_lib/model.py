@@ -770,10 +770,19 @@ class StitchManager:
                     out_h = in_h // factor
                     out_w = in_w // factor
                     if img.ndim == 2:
-                        reduced = img.reshape(out_h, factor, out_w, factor).mean(axis=(1, 3))
+                        if img.dtype == np.uint8:
+                            reduced = img.reshape(out_h, factor, out_w, factor).mean(axis=(1, 3), dtype=np.float32)
+                        else:
+                            reduced = img.reshape(out_h, factor, out_w, factor).mean(axis=(1, 3))
                     elif img.ndim == 3:
                         channels = int(img.shape[2])
-                        reduced = img.reshape(out_h, factor, out_w, factor, channels).mean(axis=(1, 3))
+                        if img.dtype == np.uint8:
+                            reduced = img.reshape(out_h, factor, out_w, factor, channels).mean(
+                                axis=(1, 3),
+                                dtype=np.float32,
+                            )
+                        else:
+                            reduced = img.reshape(out_h, factor, out_w, factor, channels).mean(axis=(1, 3))
                     else:
                         raise ValueError(f"Unsupported image ndim for W&B downsample: {img.ndim}")
                     if img.dtype == np.uint8:

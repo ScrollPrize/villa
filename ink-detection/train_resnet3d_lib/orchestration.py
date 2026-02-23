@@ -19,6 +19,7 @@ from train_resnet3d_lib.config import (
     load_and_validate_base_config,
     log,
     merge_config_with_overrides,
+    normalize_cv_fold,
     normalize_wandb_config,
     slugify,
     unflatten_dict,
@@ -115,26 +116,11 @@ def load_wandb_preinit_overrides():
     return unflatten_dict(flat_overrides)
 
 
-def _normalize_cv_fold(cv_fold):
-    if cv_fold is None:
-        return None
-    if isinstance(cv_fold, str):
-        stripped = cv_fold.strip()
-        if stripped.lower() in {"", "none", "null"}:
-            return None
-        if stripped.isdigit():
-            return int(stripped)
-        return stripped
-    if isinstance(cv_fold, float) and float(cv_fold).is_integer():
-        return int(cv_fold)
-    return cv_fold
-
-
 def build_default_run_slug(*, objective, sampler, loss_mode, lr, weight_decay, cv_fold=None):
     lr_tag = f"{float(lr):.2e}"
     wd_tag = f"{float(weight_decay):.2e}"
     run_slug = f"{objective}_{sampler}_{loss_mode}_lr={lr_tag}_wd={wd_tag}"
-    normalized_cv_fold = _normalize_cv_fold(cv_fold)
+    normalized_cv_fold = normalize_cv_fold(cv_fold)
     if normalized_cv_fold is not None:
         run_slug = f"{run_slug}_fold={normalized_cv_fold}"
     return run_slug

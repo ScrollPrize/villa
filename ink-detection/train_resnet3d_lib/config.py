@@ -292,6 +292,21 @@ def parse_normalization_mode_strict(value, *, key):
     return parsed_value
 
 
+def normalize_cv_fold(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.lower() in {"", "none", "null"}:
+            return None
+        if stripped.isdigit():
+            return int(stripped)
+        return stripped
+    if isinstance(value, float) and float(value).is_integer():
+        return int(value)
+    return value
+
+
 def _validate_patch_grid(cfg):
     size = int(getattr(cfg, "size"))
     tile_size = int(getattr(cfg, "tile_size"))
@@ -955,16 +970,7 @@ def apply_metadata_hyperparameters(cfg, metadata):
             "training_hyperparameters.training.normalization_mode is "
             "'train_fold_fg_clip_zscore'"
         )
-    cv_fold = training_cfg.get("cv_fold", getattr(cfg, "cv_fold", None))
-    if isinstance(cv_fold, str) and cv_fold.strip().lower() in {"", "none", "null"}:
-        cv_fold = None
-    if isinstance(cv_fold, str):
-        cv_fold = cv_fold.strip()
-        if cv_fold.isdigit():
-            cv_fold = int(cv_fold)
-    if isinstance(cv_fold, float) and float(cv_fold).is_integer():
-        cv_fold = int(cv_fold)
-    cfg.cv_fold = cv_fold
+    cfg.cv_fold = normalize_cv_fold(training_cfg.get("cv_fold", getattr(cfg, "cv_fold", None)))
 
     def _suffix_or_default(value, default):
         if value is None:
