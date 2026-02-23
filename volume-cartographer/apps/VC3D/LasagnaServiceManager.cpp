@@ -474,9 +474,13 @@ void LasagnaServiceManager::handleStatusReply(QNetworkReply* reply)
     int step = obj["step"].toInt();
     int totalSteps = obj["total_steps"].toInt();
     double loss = obj["loss"].toDouble();
+    double stageProgress = obj["stage_progress"].toDouble();
+    double overallProgress = obj["overall_progress"].toDouble();
+    QString stageName = obj["stage_name"].toString();
 
     if (state == "running") {
-        emit optimizationProgress(stage, step, totalSteps, loss);
+        emit optimizationProgress(stage, step, totalSteps, loss,
+                                  stageProgress, overallProgress, stageName);
     } else if (state == "finished") {
         _optimizationRunning = false;
         _pollTimer->stop();

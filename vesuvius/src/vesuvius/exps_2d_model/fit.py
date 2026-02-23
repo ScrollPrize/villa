@@ -416,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
 			mdl.save_tiff(data=data, path=f"{_out_dir}/raw_{stage}_{step:06d}.tif")
 		_save_model_snapshot(stage=stage, step=step)
 
-	def _progress(*, step: int, total: int, loss: float) -> None:
+	def _progress(*, step: int, total: int, loss: float, **_kw: object) -> None:
 		if progress_enabled:
 			print(f"PROGRESS {step} {total} {loss:.6f}", flush=True)
 

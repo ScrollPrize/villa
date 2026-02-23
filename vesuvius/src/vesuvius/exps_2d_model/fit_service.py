@@ -162,6 +162,9 @@ class _JobState:
         self._step = 0
         self._total_steps = 0
         self._loss = 0.0
+        self._stage_progress = 0.0
+        self._overall_progress = 0.0
+        self._stage_name = ""
         self._error: str | None = None
         self._cancel = False
         self._output_dir: str | None = None
@@ -175,17 +178,25 @@ class _JobState:
                 "step": self._step,
                 "total_steps": self._total_steps,
                 "loss": self._loss,
+                "stage_progress": self._stage_progress,
+                "overall_progress": self._overall_progress,
+                "stage_name": self._stage_name,
                 "error": self._error,
                 "output_dir": self._output_dir,
             }
 
-    def set_running(self, stage: str, step: int, total: int, loss: float) -> None:
+    def set_running(self, stage: str, step: int, total: int, loss: float,
+                    stage_progress: float = 0.0, overall_progress: float = 0.0,
+                    stage_name: str = "") -> None:
         with self._lock:
             self._state = "running"
             self._stage = stage
             self._step = step
             self._total_steps = total
             self._loss = loss
+            self._stage_progress = stage_progress
+            self._overall_progress = overall_progress
+            self._stage_name = stage_name
 
     def set_finished(self, output_dir: str, results_tmp: str | None = None) -> None:
         with self._lock:
@@ -324,12 +335,17 @@ def _run_optimization(body: dict[str, Any]) -> None:
                 if orig_snapshot is not None:
                     orig_snapshot(stage=stage, step=step, loss=loss, **kw)
 
-            def _wrapped_progress(*, step: int, total: int, loss: float) -> None:
-                _job.set_running("optimizing", step, total, loss)
+            def _wrapped_progress(*, step: int, total: int, loss: float, **kw: Any) -> None:
+                _job.set_running(
+                    "optimizing", step, total, loss,
+                    stage_progress=float(kw.get("stage_progress", 0.0)),
+                    overall_progress=float(kw.get("overall_progress", 0.0)),
+                    stage_name=str(kw.get("stage_name", "")),
+                )
                 if _job.cancelled:
                     raise KeyboardInterrupt("cancelled by user")
                 if orig_progress is not None:
-                    orig_progress(step=step, total=total, loss=loss)
+                    orig_progress(step=step, total=total, loss=loss, **kw)
 
             kwargs["snapshot_fn"] = _wrapped_snapshot
             kwargs["progress_fn"] = _wrapped_progress
