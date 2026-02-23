@@ -409,23 +409,23 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         }
     });
     connect(&mgr, &LasagnaServiceManager::optimizationProgress, this,
-            [this](const QString& stage, int step, int total, double loss) {
+            [this](const QString& /*stage*/, int /*step*/, int /*total*/, double loss,
+                   double stageProgress, double overallProgress,
+                   const QString& stageName) {
         if (_progressBar) {
-            if (total > 0) {
-                _progressBar->setRange(0, total);
-                _progressBar->setValue(step);
-                _progressBar->setFormat(
-                    tr("%1/%2  Loss: %3")
-                        .arg(step).arg(total).arg(loss, 0, 'g', 5));
-                _progressBar->setVisible(true);
-            } else {
-                _progressBar->setVisible(false);
-            }
+            _progressBar->setRange(0, 1000);
+            _progressBar->setValue(static_cast<int>(overallProgress * 1000.0));
+            _progressBar->setFormat(
+                tr("Overall: %1%").arg(overallProgress * 100.0, 0, 'f', 1));
+            _progressBar->setVisible(true);
         }
         if (_progressLabel) {
             _progressLabel->setText(
-                tr("Step %1/%2  |  Loss: %3  |  Stage: %4")
-                    .arg(step).arg(total).arg(loss, 0, 'g', 5).arg(stage));
+                tr("Stage: %1 (%2%)  |  Overall: %3%  |  Loss: %4")
+                    .arg(stageName.isEmpty() ? QStringLiteral("...") : stageName)
+                    .arg(stageProgress * 100.0, 0, 'f', 1)
+                    .arg(overallProgress * 100.0, 0, 'f', 1)
+                    .arg(loss, 0, 'g', 5));
             _progressLabel->setStyleSheet(QString());
             _progressLabel->setVisible(true);
         }

@@ -77,7 +77,9 @@ signals:
     void statusMessage(const QString& message);
 
     void optimizationStarted();
-    void optimizationProgress(const QString& stage, int step, int totalSteps, double loss);
+    void optimizationProgress(const QString& stage, int step, int totalSteps, double loss,
+                              double stageProgress, double overallProgress,
+                              const QString& stageName);
     void optimizationFinished(const QString& outputDir);
     void optimizationError(const QString& message);
 

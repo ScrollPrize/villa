@@ -28,6 +28,7 @@ def _require_consumed_dict(*, where: str, cfg: dict) -> None:
 @dataclass(frozen=True)
 class OptSettings:
 	steps: int
+	termination: str  # "steps" (default) or "mask"
 	lr: float | list[float]
 	params: list[str]
 	min_scaledown: int
@@ -101,6 +102,9 @@ def _parse_opt_settings(
 ) -> OptSettings:
 	opt_cfg = dict(opt_cfg)
 	steps = max(0, int(opt_cfg.get("steps", 0)))
+	termination = str(opt_cfg.pop("termination", "steps"))
+	if termination not in ("steps", "mask"):
+		raise ValueError(f"stages_json: stage '{stage_name}' opt.termination: must be 'steps' or 'mask', got '{termination}'")
 	lr_raw = opt_cfg.get("lr", 1e-3)
 	if isinstance(lr_raw, list):
 		if not lr_raw:
@@ -141,6 +145,7 @@ def _parse_opt_settings(
 	eff, _mods = _stage_to_modifiers(base, prev_eff, default_mul, w_fac)
 	return OptSettings(
 		steps=steps,
+		termination=termination,
 		lr=lr,
 		params=params,
 		min_scaledown=min_scaledown,
@@ -282,14 +287,18 @@ def total_steps_for_stages(stages: list[Stage]) -> int:
 	total = 0
 	for stage in stages:
 		if stage.grow is None:
-			total += max(0, stage.global_opt.steps)
+			# Mask-terminated stages contribute 0 (unknown duration)
+			if stage.global_opt.termination != "mask":
+				total += max(0, stage.global_opt.steps)
 		else:
 			generations = max(0, int(stage.grow.get("generations", 0)))
 			local_opts = stage.local_opt if stage.local_opt is not None else [stage.global_opt]
 			for _gi in range(generations):
-				total += max(0, stage.global_opt.steps)
+				if stage.global_opt.termination != "mask":
+					total += max(0, stage.global_opt.steps)
 				for lo in local_opts:
-					total += max(0, lo.steps)
+					if lo.termination != "mask":
+						total += max(0, lo.steps)
 	return total
 
 
@@ -395,7 +404,7 @@ def optimize(
 				row += f"  {v:10.6f}"
 			print(row)
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, keep_only_grown_z: bool = False) -> None:
-		if opt_cfg.steps <= 0:
+		if opt_cfg.steps <= 0 and opt_cfg.termination != "mask":
 			return
 		# If the stage does not optimize any global transform params, bake the current
 		# global transform into the mesh and disable it.
@@ -558,7 +567,9 @@ def optimize(
 			_print_losses_per_z(label=f"{label} step 0/{opt_cfg.steps}", res=res0, eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
 		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0, vis_losses=vis_losses0)
 
-		for step in range(opt_cfg.steps):
+		max_steps = opt_cfg.steps if opt_cfg.termination == "steps" else 10_000_000
+		actual_steps = 0
+		for step in range(max_steps):
 			res = model(data)
 			model.update_ema(xy_lr=res.xy_lr, xy_conn=res.xy_conn)
 			if stage.masks is not None:
@@ -585,25 +596,50 @@ def optimize(
 			opt.step()
 			model.update_conn_offsets()
 			_done_steps[0] += 1
-			if progress_fn is not None:
-				progress_fn(step=_done_steps[0], total=_total_steps, loss=float(loss.detach().cpu()))
-
+			actual_steps = step + 1
 			step1 = step + 1
-			if step == 0 or step1 == opt_cfg.steps or (step1 % 100) == 0:
+
+			# Compute mask completion (used for progress reporting & termination)
+			_mask_completion = 0.0
+			if opt_cfg.termination == "mask" and stage.masks is not None:
+				_mask_completion = mask_schedule.stage_mask_completed(model=model, masks=stage.masks)
+
+			# Compute stage and overall progress
+			if opt_cfg.termination == "mask":
+				_stage_progress = _mask_completion
+			else:
+				_stage_progress = step1 / max_steps if max_steps > 0 else 1.0
+			_overall_progress = (si + _stage_progress) / _num_stages if _num_stages > 0 else 1.0
+
+			if progress_fn is not None:
+				progress_fn(
+					step=_done_steps[0], total=_total_steps, loss=float(loss.detach().cpu()),
+					stage_progress=_stage_progress, overall_progress=_overall_progress,
+					stage_name=stage.name,
+				)
+
+			if step == 0 or step1 == max_steps or (step1 % 100) == 0:
 				param_vals: dict[str, float] = {}
 				for k, vs in all_params.items():
 					if len(vs) == 1 and vs[0].numel() == 1:
 						param_vals[k] = float(vs[0].detach().cpu())
 				term_vals = {k: round(v, 4) for k, v in term_vals.items()}
 				param_vals = {k: round(v, 4) for k, v in param_vals.items()}
-				_print_status(step_label=f"{label} {step1}/{opt_cfg.steps}", loss_val=loss.item(), tv=term_vals, pv=param_vals)
+				_print_status(step_label=f"{label} {step1}/{opt_cfg.steps if opt_cfg.termination == 'steps' else '?'}", loss_val=loss.item(), tv=term_vals, pv=param_vals)
+				if opt_cfg.termination == "mask":
+					print(f"  mask mean: {_mask_completion:.4f}")
 
 			if snap_int > 0 and (step1 % snap_int) == 0:
 				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data, res=res, vis_losses=vis_losses)
 
-		snapshot_fn(stage=label, step=opt_cfg.steps, loss=float(loss.detach().cpu()), data=data, res=res, vis_losses=vis_losses)
+			# Check mask termination (threshold < 1.0 for trilinear upsample precision)
+			if opt_cfg.termination == "mask" and _mask_completion >= 0.999:
+				print(f"[{label}] mask completed at step {step1} (mean={_mask_completion:.6f})")
+				break
+
+		snapshot_fn(stage=label, step=actual_steps, loss=float(loss.detach().cpu()), data=data, res=res, vis_losses=vis_losses)
 		with torch.no_grad():
-			_print_losses_per_z(label=f"{label} step {opt_cfg.steps}/{opt_cfg.steps}", res=res, eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
+			_print_losses_per_z(label=f"{label} step {actual_steps}/{opt_cfg.steps if opt_cfg.termination == 'steps' else '?'}", res=res, eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
 		for h in hooks:
 			h.remove()
 
@@ -613,10 +649,11 @@ def optimize(
 
 	_total_steps = total_steps_for_stages(stages)
 	_done_steps = [0]  # mutable counter
+	_num_stages = len(stages)
 
 	for si, stage in enumerate(stages):
 		if stage.grow is None:
-			if stage.global_opt.steps > 0:
+			if stage.global_opt.steps > 0 or stage.global_opt.termination == "mask":
 				_run_opt(si=si, label=f"stage{si}", stage=stage, opt_cfg=stage.global_opt)
 			continue
 		grow = stage.grow
@@ -646,9 +683,9 @@ def optimize(
 					)
 			stage_g = f"stage{si}_grow{gi:04d}"
 			snapshot_fn(stage=stage_g, step=0, loss=0.0, data=data)
-			if stage.global_opt.steps > 0:
+			if stage.global_opt.steps > 0 or stage.global_opt.termination == "mask":
 				_run_opt(si=si, label=f"{stage_g}_global", stage=stage, opt_cfg=stage.global_opt, keep_only_grown_z=False)
-			if not local_opts or all(int(o.steps) <= 0 for o in local_opts):
+			if not local_opts or all(int(o.steps) <= 0 and o.termination != "mask" for o in local_opts):
 				continue
 			ins = model._last_grow_insert_lr
 			if ins is None:

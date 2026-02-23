@@ -6,6 +6,7 @@ import math
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 import model as fit_model
 
@@ -467,6 +468,182 @@ def central_winding_pie_ema(*, model: fit_model.Model2D, it: int, params: dict) 
 	return out
 
 
+def _gaussian_blur_mask_nchw(*, x: torch.Tensor, sigma: float) -> torch.Tensor:
+	"""2D separable Gaussian blur for (N,1,H,W) mask tensors."""
+	if x.ndim != 4:
+		raise ValueError("_gaussian_blur_mask_nchw: x must be (N,C,H,W)")
+	if float(sigma) <= 0.0:
+		return x
+	ks = int(max(3, int(round(6.0 * float(sigma))) | 1))
+	if ks <= 1:
+		return x
+	if (ks % 2) == 0:
+		ks += 1
+	device = x.device
+	dtype = x.dtype
+	r = ks // 2
+	idx = torch.arange(-r, r + 1, device=device, dtype=dtype)
+	k = torch.exp(-(idx * idx) / (2.0 * float(sigma) * float(sigma)))
+	k = k / (k.sum() + 1e-12)
+	kx = k.view(1, 1, 1, ks)
+	ky = k.view(1, 1, ks, 1)
+	c = int(x.shape[1])
+	pad = (r, r, 0, 0)
+	y = F.pad(x, pad, mode="reflect")
+	y = F.conv2d(y, kx.expand(c, 1, 1, ks), groups=c)
+	pad = (0, 0, r, r)
+	y = F.pad(y, pad, mode="reflect")
+	y = F.conv2d(y, ky.expand(c, 1, ks, 1), groups=c)
+	return y
+
+
+class DilationMaskState:
+	"""Stateful mask that grows outward from a seed voxel via 3D morphological dilation."""
+
+	def __init__(self, *, model: fit_model.Model2D, params: dict) -> None:
+		xy = model.xy_ema  # (Z, Hm, Wm, 2)
+		mesh_step_px = int(model.params.mesh_step_px)
+		scaledown = float(model.params.scaledown)
+		z_size = int(xy.shape[0])
+		device = xy.device
+
+		# Image resolution in model pixels (for upsampling target)
+		dh, dw = model.params.data_size_modelpx
+		if dh > 0 and dw > 0:
+			h_img, w_img = int(dh), int(dw)
+		else:
+			if model.params.crop_xyzwhd is None:
+				raise ValueError("DilationMaskState requires data_size_modelpx or crop_xyzwhd")
+			_cx, _cy, cw, ch, _z0, _d = model.params.crop_xyzwhd
+			h_img, w_img = int(ch), int(cw)
+
+		# Mask grid at volume-scaled resolution.
+		# Each mask voxel = mesh_step_px model pixels in XY, scaledown z-slices in Z.
+		mask_w = max(1, math.ceil(w_img / mesh_step_px))
+		mask_h = max(1, math.ceil(h_img / mesh_step_px))
+		mask_z = max(1, math.ceil(z_size / scaledown))
+
+		self.mesh_step_px = mesh_step_px
+		self.scaledown = scaledown
+		self.h_img = h_img
+		self.w_img = w_img
+		self.z_size = z_size
+
+		self.mask = torch.zeros((mask_z, 1, mask_h, mask_w), device=device, dtype=torch.float32)
+		self.accum = 0.0
+		self.blur_sigma = float(params.get("blur_sigma", 3.0))
+
+		# Seed: single voxel at center of mesh, converted to mask coords
+		hm = int(xy.shape[1])
+		wm = int(xy.shape[2])
+		zi = z_size // 2
+		yi_m = hm // 2
+		xi_m = wm // 2
+		center_xy = xy[zi, yi_m, xi_m]  # (2,) in model pixels
+		x_px = float(center_xy[0].cpu())
+		y_px = float(center_xy[1].cpu())
+		mask_x = max(0, min(mask_w - 1, round(x_px / mesh_step_px)))
+		mask_y = max(0, min(mask_h - 1, round(y_px / mesh_step_px)))
+		mask_zi = max(0, min(mask_z - 1, round(zi / scaledown)))
+		self.mask[mask_zi, 0, mask_y, mask_x] = 1.0
+
+		self.blurred = self._recompute_blurred()
+
+	def _recompute_blurred(self) -> torch.Tensor:
+		"""Blur mask at mask resolution, then trilinear-upsample to image resolution."""
+		m = self.mask
+		if self.blur_sigma > 0.0:
+			m = _gaussian_blur_mask_nchw(x=m, sigma=self.blur_sigma).clamp(0.0, 1.0)
+		# Upsample (mask_z, 1, mask_h, mask_w) -> (z_size, 1, h_img, w_img)
+		mz, _, mh, mw = (int(v) for v in m.shape)
+		m5 = m.reshape(1, 1, mz, mh, mw)
+		m5 = F.interpolate(m5, size=(self.z_size, self.h_img, self.w_img), mode="trilinear", align_corners=False)
+		return m5.reshape(self.z_size, 1, self.h_img, self.w_img)
+
+	def advance(self, mvx_per_it: float) -> None:
+		"""Grow the mask by `mvx_per_it` mask-voxels (fractional accumulation)."""
+		self.accum += float(mvx_per_it)
+		n = int(math.floor(self.accum))
+		self.accum -= float(n)
+		if n > 0:
+			ks = 2 * n + 1
+			# Reshape (Z,1,H,W) -> (1,1,Z,H,W) for 3D max_pool
+			z, c, h, w = (int(v) for v in self.mask.shape)
+			m5 = self.mask.reshape(1, 1, z, h, w)
+			m5 = F.max_pool3d(m5, kernel_size=ks, stride=1, padding=n)
+			self.mask = m5.reshape(z, 1, h, w)
+		self.blurred = self._recompute_blurred()
+
+	def completed(self, model: fit_model.Model2D) -> float:
+		"""Return fraction of valid mesh positions covered by the blurred mask."""
+		xy = model.xy_ema  # (Z, Hm, Wm, 2)
+		if xy.numel() == 0:
+			return 1.0
+		z, hm, wm, _ = (int(v) for v in xy.shape)
+
+		# Compute validity mask at mesh positions
+		valid = fit_model.xy_img_validity_mask(params=model.params, xy=xy)  # (Z, Hm, Wm)
+
+		# Sample blurred mask at mesh positions via grid_sample
+		dh, dw = model.params.data_size_modelpx
+		if dh > 0 and dw > 0:
+			h_img, w_img = int(dh), int(dw)
+		else:
+			if model.params.crop_xyzwhd is None:
+				return 1.0
+			_cx, _cy, cw, ch, _z0, _d = model.params.crop_xyzwhd
+			h_img, w_img = int(ch), int(cw)
+
+		grid = xy.detach().to(dtype=torch.float32).clone()  # (Z, Hm, Wm, 2)
+		hd = float(max(1, h_img - 1))
+		wd = float(max(1, w_img - 1))
+		grid[..., 0] = (grid[..., 0] / wd) * 2.0 - 1.0
+		grid[..., 1] = (grid[..., 1] / hd) * 2.0 - 1.0
+		# grid_sample expects (N,C,H_in,W_in) and grid (N,H_out,W_out,2)
+		s = F.grid_sample(
+			self.blurred.to(dtype=torch.float32),
+			grid,
+			mode="bilinear",
+			padding_mode="zeros",
+			align_corners=True,
+		)  # (Z, 1, Hm, Wm)
+		mask_vals = s[:, 0, :, :]  # (Z, Hm, Wm)
+
+		valid_sum = valid.sum()
+		if float(valid_sum) == 0.0:
+			return 1.0
+		return float((mask_vals * valid).sum() / valid_sum)
+
+
+@torch.no_grad()
+def constant_velocity_dilation(*, model: fit_model.Model2D, it: int, params: dict) -> torch.Tensor:
+	"""Return a growing dilation mask (Z, 1, H, W).
+
+	The mask starts from a single seed voxel at the mesh center and grows
+	outward via 3D morphological dilation at a configurable rate.
+	"""
+	if "_state" not in params:
+		params["_state"] = DilationMaskState(model=model, params=params)
+	state = params["_state"]
+	state.advance(float(params.get("mvx_per_it", 1.0)))
+	return state.blurred
+
+
+def stage_mask_completed(*, model: fit_model.Model2D, masks: list[dict] | None) -> float:
+	"""Return minimum completion fraction across all stateful masks in a stage.
+
+	Returns 1.0 if there are no masks or no stateful masks.
+	"""
+	if not masks:
+		return 1.0
+	min_c = 1.0
+	for m in masks:
+		state = m.get("_state")
+		if state is not None and hasattr(state, "completed"):
+			min_c = min(min_c, state.completed(model))
+	return min_c
+
+
 @torch.no_grad()
 def build_stage_img_masks(
 	*,
@@ -498,6 +675,8 @@ def build_stage_img_masks(
 			raise ValueError(f"stage masks[{mi}]: missing/empty type")
 		if mtype == "central_winding_pie_ema":
 			mask = central_winding_pie_ema(model=model, it=int(it), params=m)
+		elif mtype == "constant_velocity_dilation":
+			mask = constant_velocity_dilation(model=model, it=int(it), params=m0)
 		else:
 			raise ValueError(f"stage masks[{mi}]: unknown type '{mtype}'")
 		mask = mask.detach()
