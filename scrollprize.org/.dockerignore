@@ -1,0 +1,12 @@
+node_modules
+build
+.docusaurus
+.git
+.gitignore
+*.md
+!docs/**/*.md
+!blog/**/*.md
+Dockerfile
+.dockerignore
+.playwright-mcp
+.yarn
