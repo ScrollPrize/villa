@@ -320,19 +320,6 @@ def _run_optimization(body: dict[str, Any]) -> None:
         cfg_path = str(Path(tmp_dir) / "fit_config.json")
         Path(cfg_path).write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
-        # ---- Z-SIZE DIAGNOSTICS ----
-        _bbox = args_section.get("bbox", None)
-        _zs = args_section.get("z-size", args_section.get("z_size", "?"))
-        _mi = "SET" if model_input else "None"
-        _ds = args_section.get("downscale", "?")
-        _zstep = args_section.get("z-step", args_section.get("z_step", "?"))
-        print(f"[fit-service] === JOB CONFIG Z-DIAG ===", flush=True)
-        print(f"[fit-service]   data_input={data_input}", flush=True)
-        print(f"[fit-service]   model_input={_mi} is_new_model={is_new_model}", flush=True)
-        print(f"[fit-service]   bbox={_bbox} z-size={_zs} z-step={_zstep} downscale={_ds}", flush=True)
-        print(f"[fit-service]   full args_section keys: {sorted(args_section.keys())}", flush=True)
-        print(f"[fit-service] ================================", flush=True)
-
         # Monkey-patch the optimizer to report progress & check cancellation.
         import optimizer as opt_mod
 

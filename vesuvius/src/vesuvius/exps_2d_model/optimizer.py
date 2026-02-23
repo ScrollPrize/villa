@@ -403,96 +403,6 @@ def optimize(
 				v = out[k][zi] if zi < len(out[k]) else 0.0
 				row += f"  {v:10.6f}"
 			print(row)
-	def _save_dbg_zx_slice(step: int, label: str, data, res) -> None:
-		"""Save a ZX cross-section through the center of the model for debugging."""
-		try:
-			import numpy as np
-			import matplotlib
-			matplotlib.use('Agg')
-			import matplotlib.pyplot as plt
-		except ImportError:
-			return
-		with torch.no_grad():
-			xy_lr = res.xy_lr  # (N, Hm, Wm, 2)
-			cos = data.cos     # (N, 1, H, W)
-			N, _, H, W = cos.shape
-			Hm = xy_lr.shape[1]
-			Wm = xy_lr.shape[2]
-			if N < 2:
-				return
-			z_step = float(res.params.z_step_vx)
-			sd = float(res.params.scaledown)
-			crop = res.params.crop_fullres_xyzwhd  # (x, y, w, h, z0, d) or None
-			margin = res.params.data_margin_modelpx  # (mx, my) in model pixels
-			mx, my = (float(margin[0]), float(margin[1])) if margin else (0.0, 0.0)
-
-			# Center of mesh in model-pixel coords
-			center_x_px = float(xy_lr[:, Hm // 2, Wm // 2, 0].mean().cpu())
-			center_y_px = float(xy_lr[:, Hm // 2, Wm // 2, 1].mean().cpu())
-			center_zi = N // 2
-			y_idx = max(0, min(H - 1, round(center_y_px)))
-
-			# Data image bbox in model-pixel coords (the cos image extent)
-			# x: [0, W), y: [0, H), z: [0, N) with z_step spacing
-			data_x0_mp, data_y0_mp = 0.0, 0.0
-			data_x1_mp, data_y1_mp = float(W), float(H)
-			data_z0_mp, data_z1_mp = 0.0, float(N - 1) * z_step
-
-			# Convert model-pixel to full-res voxel coords:
-			# model_pixel = (fullres - crop_origin) / scaledown + margin
-			# => fullres = (model_pixel - margin) * scaledown + crop_origin
-			if crop is not None:
-				cx0, cy0, cw, ch, cz0, cd = (int(v) for v in crop)
-				z_step_full = z_step * sd
-
-				center_x_full = (center_x_px - mx) * sd + cx0
-				center_y_full = (center_y_px - my) * sd + cy0
-				center_z_full = cz0 + center_zi * z_step_full
-
-				data_x0_full = (data_x0_mp - mx) * sd + cx0
-				data_y0_full = (data_y0_mp - my) * sd + cy0
-				data_z0_full = cz0
-				data_x1_full = (data_x1_mp - mx) * sd + cx0
-				data_y1_full = (data_y1_mp - my) * sd + cy0
-				data_z1_full = cz0 + (N - 1) * z_step_full
-
-				print(f'[dbg-zx] step {step}: slice center model-px=({center_x_px:.1f}, {center_y_px:.1f}, zi={center_zi}*{z_step:.1f}={center_zi*z_step:.1f})')
-				print(f'[dbg-zx]   slice center fullres=({center_x_full:.0f}, {center_y_full:.0f}, {center_z_full:.0f})')
-				print(f'[dbg-zx]   data bbox model-px: x=[{data_x0_mp:.0f},{data_x1_mp:.0f}) y=[{data_y0_mp:.0f},{data_y1_mp:.0f}) z=[{data_z0_mp:.0f},{data_z1_mp:.0f}]')
-				print(f'[dbg-zx]   data bbox fullres:   x=[{data_x0_full:.0f},{data_x1_full:.0f}) y=[{data_y0_full:.0f},{data_y1_full:.0f}) z=[{data_z0_full:.0f},{data_z1_full:.0f}]')
-				print(f'[dbg-zx]   crop=({cx0},{cy0},{cw},{ch},{cz0},{cd}) sd={sd} z_step_vx={z_step} margin=({mx:.1f},{my:.1f})')
-			else:
-				print(f'[dbg-zx] step {step}: slice center model-px=({center_x_px:.1f}, {center_y_px:.1f}, zi={center_zi}*{z_step:.1f}={center_zi*z_step:.1f})')
-				print(f'[dbg-zx]   data bbox model-px: x=[0,{W}) y=[0,{H}) z=[0,{data_z1_mp:.0f}]')
-				print(f'[dbg-zx]   (no crop info — cannot compute fullres coords)')
-
-			# ZX slice of cos: rows = z-slices, cols = x-pixels
-			zx = cos[:, 0, y_idx, :].cpu().numpy()  # (N, W)
-			# Z coordinates in model-pixel units
-			z_coords = np.arange(N) * z_step
-			fig, ax = plt.subplots(1, 1, figsize=(14, max(3, N * 0.3)))
-			extent = [0, W, z_coords[-1] + z_step * 0.5, z_coords[0] - z_step * 0.5]
-			ax.imshow(zx, aspect='auto', cmap='gray', extent=extent, origin='upper')
-			# Mesh overlay: for each z, for each mesh column, find the row
-			# whose y is closest to center_y_px, then use that row's x.
-			mesh_xy = xy_lr.cpu().numpy()  # (N, Hm, Wm, 2)
-			for zi in range(N):
-				z_val = z_coords[zi]
-				best_x = []
-				for wi in range(Wm):
-					col_y = mesh_xy[zi, :, wi, 1]  # (Hm,)
-					best_row = int(np.argmin(np.abs(col_y - center_y_px)))
-					best_x.append(mesh_xy[zi, best_row, wi, 0])
-				ax.plot(best_x, [z_val] * len(best_x), 'r.-', markersize=2, linewidth=0.8, alpha=0.8)
-			ax.set_xlabel('X (model pixels)')
-			ax.set_ylabel('Z (model pixels)')
-			ax.set_title(f'{label} step {step} — ZX slice at y={y_idx} (center_y={center_y_px:.1f})')
-			plt.tight_layout()
-			path = f'dbg_zx_{label}_step{step:05d}.png'
-			plt.savefig(path, dpi=100)
-			plt.close(fig)
-			print(f'[dbg] saved {path}')
-
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, keep_only_grown_z: bool = False) -> None:
 		if opt_cfg.steps <= 0 and opt_cfg.termination != "mask":
 			return
@@ -718,7 +628,6 @@ def optimize(
 				_print_status(step_label=f"{label} {step1}/{opt_cfg.steps if opt_cfg.termination == 'steps' else '?'}", loss_val=loss.item(), tv=term_vals, pv=param_vals)
 				if opt_cfg.termination == "mask":
 					print(f"  mask mean: {_mask_completion:.4f}")
-				_save_dbg_zx_slice(step=step1, label=label, data=data, res=res)
 
 			if snap_int > 0 and (step1 % snap_int) == 0:
 				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data, res=res, vis_losses=vis_losses)
