@@ -467,20 +467,9 @@ def load(
 			_z_fullres_first = int(z_req_raw[0]) if z_req_raw else 0
 			_z_fullres_last = int(z_req_raw[-1]) if z_req_raw else 0
 			_z_fullres_extent = _z_fullres_last - _z_fullres_first + int(z_step_eff_meta)
-			print(
-				f"[fit_data] === PREPROCESSED ZARR LOAD ===\n"
-				f"[fit_data]   zarr shape_czyx={shape_czyx}\n"
-				f"[fit_data]   z_size(requested)={zs} z_step_eff_meta={int(z_step_eff_meta)}\n"
-				f"[fit_data]   z0_raw(unet_z)={z0_raw} z_step(cli)={z_step}\n"
-				f"[fit_data]   zarr z_step_meta={zs_meta} downscale_meta={ds_meta}\n"
-				f"[fit_data]   z_idx range: [{z_idx[0]}..{z_idx[-1]}] ({len(z_idx)} slices from zarr)\n"
-				f"[fit_data]   fullres z range: [{_z_fullres_first}..{_z_fullres_last}] "
-				f"extent={_z_fullres_extent} voxels (EXPECT ~480)\n"
-				f"[fit_data]   xy crop=({int(x0)},{int(y0)},{int(cw)},{int(ch)}) "
-				f"margin=({int(margin_x)},{int(margin_y)})\n"
-				f"[fit_data] ================================",
-				flush=True,
-			)
+			print(f"[fit_data] preprocessed zarr: {len(z_idx)} z-slices, "
+				  f"z=[{_z_fullres_first}..{_z_fullres_last}] ({_z_fullres_extent} fullres voxels), "
+				  f"xy=({cw}x{ch})+margin({margin_x},{margin_y})", flush=True)
 
 			def _read_ch(name: str) -> np.ndarray:
 				ci0 = int(ci[name])

@@ -137,16 +137,13 @@ def main(argv: list[str] | None = None) -> int:
 	if prep_params is not None:
 		zarr_z_step = int(prep_params["z_step"])
 		zarr_z_step_eff = int(prep_params["z_step_eff"])
-		print(f"[zarr-probe] detected: z_step={zarr_z_step} z_step_eff={zarr_z_step_eff} "
-			  f"downscale={prep_params['downscale_xy']}", flush=True)
+		print(f"[fit] zarr z_step={zarr_z_step} z_step_eff={zarr_z_step_eff}", flush=True)
 		# The model's z_step_vx must match the zarr's z_step so that dz in
 		# z-normal loss and export z-coordinates are correct.
 		if int(z_step_use) != zarr_z_step:
-			print(f"[zarr-probe] overriding z_step_use: {z_step_use} -> {zarr_z_step}", flush=True)
+			print(f"[fit] z_step override: {z_step_use} -> {zarr_z_step} (from zarr)", flush=True)
 			z_step_use = zarr_z_step
 			data_cfg = replace(data_cfg, z_step=int(z_step_use))
-	else:
-		print(f"[zarr-probe] NOT detected for input={data_cfg.input}", flush=True)
 
 	# When loading a checkpoint with a preprocessed zarr, the checkpoint's z_size
 	# may have been computed with a different z_step_eff. Recompute z_size to
@@ -159,11 +156,9 @@ def main(argv: list[str] | None = None) -> int:
 		# Infer what full-res depth the checkpoint intended
 		original_fullres = int(z_size_use) * ckpt_z_step_eff
 		correct_z_size = max(1, int(round(original_fullres / zarr_z_step_eff)))
-		print(f"[z-fix] checkpoint: z_size={z_size_use} ckpt_z_step_vx={ckpt_z_step_vx} "
-			  f"ckpt_z_step_eff={ckpt_z_step_eff} -> original_fullres={original_fullres}", flush=True)
-		print(f"[z-fix] zarr_z_step_eff={zarr_z_step_eff} -> correct_z_size={correct_z_size}", flush=True)
 		if z_size_use != correct_z_size:
-			print(f"[z-fix] CORRECTING z_size: {z_size_use} -> {correct_z_size}", flush=True)
+			print(f"[fit] z_size corrected: {z_size_use} -> {correct_z_size} "
+				  f"(ckpt z_step_eff={ckpt_z_step_eff} vs zarr={zarr_z_step_eff})", flush=True)
 			z_size_use = correct_z_size
 
 	# --bbox: args.z_size is depth in full-res voxels; convert to number of z-slices.
@@ -176,40 +171,9 @@ def main(argv: list[str] | None = None) -> int:
 		else:
 			z_step_eff = max(1, int(z_step_use) * int(round(data_cfg.downscale)))
 		z_size_new = max(1, int(round(z_size_fullres / z_step_eff)))
-		if z_size_use != z_size_new:
-			print(f"[bbox] z_size correction: {z_size_use} -> {z_size_new} "
-				  f"(fullres_depth={z_size_fullres}, z_step_eff={z_step_eff})", flush=True)
 		z_size_use = z_size_new
-		print(f"[bbox] z depth {z_size_fullres} fullres voxels -> {z_size_use} z-slices "
-			  f"(z_step_vx={z_step_use}, downscale={data_cfg.downscale}, z_step_eff={z_step_eff})", flush=True)
+		print(f"[fit] bbox z_size: {z_size_fullres} fullres -> {z_size_use} slices (z_step_eff={z_step_eff})", flush=True)
 
-	# ---- Z-SIZE DIAGNOSTICS ----
-	_zs_eff = max(1, int(z_step_use) * int(round(data_cfg.downscale)))
-	_z_fullres_extent = int(z_size_use) * _zs_eff
-	print(f"[z-diag] === Z-SIZE SUMMARY ===", flush=True)
-	print(f"[z-diag] args.z_size={getattr(args, 'z_size', '?')} args.bbox={getattr(args, 'bbox', None)}", flush=True)
-	print(f"[z-diag] model_cfg.model_input={'SET' if model_cfg.model_input else 'None'} "
-		  f"model_cfg.z_size={model_cfg.z_size}", flush=True)
-	print(f"[z-diag] z_size_from_state={z_size_from_state}", flush=True)
-	if model_params_in is not None:
-		_mp_zstep = model_params_in.get("z_step_vx", "?")
-		_mp_crop = model_params_in.get("crop_fullres_xyzwhd", None)
-		_mp_d = _mp_crop[5] if isinstance(_mp_crop, (list, tuple)) and len(_mp_crop) == 6 else "?"
-		_mp_zsize = model_params_in.get("z_size", "?")
-		print(f"[z-diag] checkpoint: z_step_vx={_mp_zstep} crop_d={_mp_d} z_size={_mp_zsize}", flush=True)
-	print(f"[z-diag] FINAL: z_step_use={z_step_use} z_size_use={z_size_use} "
-		  f"downscale={data_cfg.downscale} data_cfg.z_step={data_cfg.z_step}", flush=True)
-	print(f"[z-diag] FINAL: z_step_eff={_zs_eff} fullres_z_extent={_z_fullres_extent} "
-		  f"(EXPECTED ~480 for 500 bbox depth)", flush=True)
-	print(f"[z-diag] data_cfg.unet_z={data_cfg.unet_z} "
-		  f"data_cfg.crop={data_cfg.crop}", flush=True)
-	if data_cfg.unet_z is not None:
-		print(f"[z-diag] fullres z range: [{data_cfg.unet_z}, {int(data_cfg.unet_z) + _z_fullres_extent}] "
-			  f"({_z_fullres_extent} voxels)", flush=True)
-	print(f"[z-diag] =========================", flush=True)
-
-	if model_params_in is not None:
-		print("model_params_in:\n" + json.dumps(model_params_in, indent=2, sort_keys=True))
 	points_tensor_work = point_constraints.to_working_coords(
 		points_xyz_winda=points_tensor,
 		downscale=float(data_cfg.downscale),
@@ -299,11 +263,6 @@ def main(argv: list[str] | None = None) -> int:
 	if mdl is not None:
 		print("model_init:", mdl.init)
 		print("mesh:", mdl.mesh_h, mdl.mesh_w)
-		_m_zstep_eff = max(1, int(mdl.params.z_step_vx) * int(round(float(mdl.params.scaledown))))
-		_m_z_fullres = int(mdl.z_size) * _m_zstep_eff
-		print(f"[z-diag] MODEL: z_size={mdl.z_size} z_step_vx={mdl.params.z_step_vx} "
-			  f"scaledown={mdl.params.scaledown} -> fullres_z_extent={_m_z_fullres} "
-			  f"(EXPECT ~480)", flush=True)
 	if int(points_tensor_work.shape[0]) > 0:
 		print("[point_constraints] starting closest segment search")
 		with torch.no_grad():
@@ -331,17 +290,7 @@ def main(argv: list[str] | None = None) -> int:
 		print("[point_constraints] winding_error_obs_minus_avg_plus_winda", winding_err)
 
 	_out_dir = vis_cfg.out_dir  # None means skip all debug/vis output
-	print(f"[z-diag] calling load_fit_data with z_size={z_size_use}, z_step={data_cfg.z_step}, "
-		  f"unet_z={data_cfg.unet_z}, downscale={data_cfg.downscale}", flush=True)
 	data = cli_data.load_fit_data(data_cfg, z_size=int(z_size_use), out_dir_base=_out_dir)
-	print(f"[z-diag] loaded data: cos.shape={tuple(data.cos.shape)} "
-		  f"(N={data.cos.shape[0]} z-slices, H={data.cos.shape[2]}, W={data.cos.shape[3]})", flush=True)
-	_loaded_z_fullres = int(data.cos.shape[0]) * max(1, int(z_step_use) * int(round(data_cfg.downscale)))
-	print(f"[z-diag] loaded z fullres extent = {data.cos.shape[0]} slices * {z_step_use} z_step * "
-		  f"{data_cfg.downscale} downscale = {_loaded_z_fullres} voxels (EXPECT ~480)", flush=True)
-	if mdl is not None:
-		print(f"[z-diag] COMPARISON: model_z_size={mdl.z_size} vs data_z_slices={data.cos.shape[0]} "
-			  f"| model_z_step_vx={mdl.params.z_step_vx} vs data_cfg.z_step={data_cfg.z_step}", flush=True)
 	data = fit_data.FitData(
 		cos=data.cos,
 		grad_mag=data.grad_mag,
