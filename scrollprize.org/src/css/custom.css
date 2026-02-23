@@ -268,6 +268,75 @@ main {
 .docs-doc-id-grandprize article h3 {
   line-height: 1.1;
 }
+/* ================================================
+   Atlas Browser — embedded overrides
+   ================================================ */
+
+/* Bump base font size to match Docusaurus body text */
+#atlas-root {
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+/* Remove all table borders: no outer box, no vertical column lines */
+#atlas-root table,
+#atlas-root table thead,
+#atlas-root table tbody,
+#atlas-root table tr,
+#atlas-root table th,
+#atlas-root table td {
+  border: none !important;
+}
+
+/* Outer table wrapper: no border */
+#atlas-root *[class*="border"][class*="rounded"] {
+  border: none !important;
+}
+
+/* Flatten all row backgrounds — remove Docusaurus striping */
+#atlas-root table tbody tr,
+#atlas-root table tbody tr:nth-child(2n) {
+  background: transparent !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06) !important;
+}
+
+/* Consistent hover on every row */
+#atlas-root table tbody tr:hover {
+  background-color: rgba(255, 255, 255, 0.05) !important;
+}
+
+/* Header bottom separator */
+#atlas-root table thead tr {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+}
+
+/* Table header: muted */
+#atlas-root table thead {
+  background: transparent !important;
+}
+
+#atlas-root table thead th {
+  font-weight: 500 !important;
+  font-size: 0.8125rem !important;
+  color: rgba(255, 255, 255, 0.35) !important;
+}
+
+/* Soften non-table borders (tabs, cards, etc.) */
+#atlas-root *[class*="border"] {
+  border-color: rgba(255, 255, 255, 0.06) !important;
+}
+
+/* Filter input */
+#atlas-root input[type="text"] {
+  border-color: rgba(255, 255, 255, 0.1) !important;
+}
+
+/* Headings inside atlas: match site style */
+#atlas-root h1, #atlas-root h2 {
+  font-weight: 900;
+  letter-spacing: -0.05em;
+}
+
 /* Docusaurus inline table of contents */
 [class*="tableOfContentsInline_node_modules-"] ul li {
   list-style-type: none; /* Remove bullet points */

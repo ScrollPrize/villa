@@ -52,7 +52,7 @@ Two key technical problems remain: unwrapping at scale and ink identification.
   * Our approach to solving unwrapping at scale will be to continue to leverage the community through a series of open source “progress prizes” we will award throughout the year, while hiring in full-time or part-time roles the most productive contributors to do the needed deep work.
 * Ink identification
   * The ink-detection breakthroughs of 2023 and 2024 do not appear to generalize to the entire collection. Why is that? We have evidence that the ink signal enhanced by the machine learning model in the two readable scrolls corresponds either to large morphological cracks or to brighter spots under X-ray, indicating a higher concentration of metals. Unfortunately, ink-detection models trained to amplify these signals are not currently performing well on the other scrolls. As a result, we are now looking for different ink characteristics to train our models on.
-   * Analysis of [fragments](data_fragments) suggests that when ink is neither metal‑rich nor “cracked,” higher‑resolution scans may be required to enhance the amount of signal in the data. We are currently (July 2025) exploring this route.
+  * Analysis of fragments suggests that when ink is neither metal‑rich nor “cracked,” higher‑resolution scans may be required to enhance the amount of signal in the data. We are currently (July 2025) exploring this route.
 
 Improvements in both unwrapping at scale and ink identification are the main goals of 2025. 
 

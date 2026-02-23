@@ -42,6 +42,8 @@ hide_table_of_contents: true
 
 A segment is a mapped section of the written surface inside the scroll. The scrolls have a complex interior structure because they were crumpled and charred by the weight and heat of volcanic debris. Many different tools and techniques have been employed to map the intricate 3D shapes of these papyrus sheets ([Segmentation Tutorial](tutorial3)).
 
+For a first-pass inventory of which scrolls have segment coverage, use the [Sample Browser](data_browser) and then open the relevant sample entry.
+
 <figure className="max-w-[500px]">
   <video autoPlay playsInline muted controls className="w-[100%] rounded-xl" poster="/img/tutorials/vc-extrapolation2.webp">
     <source src="/img/tutorials/vc-extrapolation2.webm" type="video/webm"/>
