@@ -1937,6 +1937,26 @@ void CWindow::CreateWidgets(void)
                       << "x" << nmD << ")" << std::endl;
         }
 
+        // Inject loaded point collections as corr_points
+        if (_point_collection) {
+            const auto& cols = _point_collection->getAllCollections();
+            if (!cols.empty()) {
+                nlohmann::json corr_json;
+                nlohmann::json cols_json = nlohmann::json::object();
+                for (const auto& [cid, col] : cols) {
+                    cols_json[std::to_string(cid)] = col;
+                }
+                corr_json["collections"] = cols_json;
+                QJsonDocument corrDoc = QJsonDocument::fromJson(
+                    QByteArray::fromStdString(corr_json.dump()));
+                if (corrDoc.isObject()) {
+                    config[QStringLiteral("corr_points")] = corrDoc.object();
+                    std::cerr << "[lasagna] injected " << cols.size()
+                              << " point collection(s) as corr_points" << std::endl;
+                }
+            }
+        }
+
         // Build optimization request
         QJsonObject request;
         request[QStringLiteral("data_input")] = dataInput;

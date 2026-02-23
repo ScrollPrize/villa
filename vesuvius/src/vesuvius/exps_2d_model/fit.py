@@ -67,6 +67,14 @@ def main(argv: list[str] | None = None) -> int:
 	progress_enabled = bool(args.progress)
 	points_cfg = point_constraints.from_args(args)
 	points_tensor, points_collection_idx = point_constraints.load_points_tensor(points_cfg)
+	# Merge inline corr_points from config JSON (e.g. sent by VC3D)
+	corr_points_obj = cfg.pop("corr_points", None)
+	if isinstance(corr_points_obj, dict):
+		inline_pts, inline_cids = point_constraints.load_points_from_collections_dict(corr_points_obj)
+		if inline_pts.shape[0] > 0:
+			print(f"[fit] loaded {inline_pts.shape[0]} inline corr_points from config")
+			points_tensor = torch.cat([points_tensor, inline_pts], dim=0)
+			points_collection_idx = torch.cat([points_collection_idx, inline_cids], dim=0)
 	point_constraints.print_points_tensor(points_tensor)
 
 	print("data:", data_cfg)
