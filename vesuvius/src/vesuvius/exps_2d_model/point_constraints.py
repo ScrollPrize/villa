@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -136,30 +137,31 @@ def closest_conn_segment_indices(
 	*,
 	points_xyz_winda: torch.Tensor,
 	xy_conn: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-	"""Return closest enclosing LR-segment indices for each annotation point.
+) -> tuple[
+	torch.Tensor,  # points_all (K,4)
+	torch.Tensor, torch.Tensor, torch.Tensor,  # idx_left, valid_left, min_dist_left (lo)
+	torch.Tensor, torch.Tensor, torch.Tensor,  # idx_right, valid_right, min_dist_right (lo)
+	torch.Tensor, torch.Tensor, torch.Tensor,  # idx_left_hi, valid_left_hi, min_dist_left_hi
+	torch.Tensor, torch.Tensor, torch.Tensor,  # idx_right_hi, valid_right_hi, min_dist_right_hi
+	torch.Tensor,  # z_frac (K,)
+]:
+	"""Return closest enclosing LR-segment indices at both neighboring z-slices.
+
+	For each point, searches at z_lo=floor(z) and z_hi=ceil(z).  The returned
+	z_frac (in [0,1]) gives the bilinear weight for the hi slice.
 
 	- points_xyz_winda: (K,4) as [x,y,z,wind_a]
 	- xy_conn: (N,Hm,Wm,3,2) in order [left,point,right]
-	Returns:
-	- points_all: (K,4) all input points in working coords
-	- idx_left: (K,3) [z,row_top,col]
-	- valid_left: (K,) bool
-	- min_dist_left: (K,) float32 (pixel distance to chosen segment projection; inf if invalid)
-	- idx_right: (K,3) [z,row_top,col]
-	- valid_right: (K,) bool
-	- min_dist_right: (K,) float32 (pixel distance to chosen segment projection; inf if invalid)
-	where each segment is between (row_top,col) and (row_top+1,col).
 	"""
+	_empty = lambda *shape, dtype=torch.float32: torch.empty(shape, dtype=dtype, device=xy_conn.device)
 	if points_xyz_winda.ndim != 2 or int(points_xyz_winda.shape[1]) < 3:
 		return (
-			torch.empty((0, 4), dtype=torch.float32, device=xy_conn.device),
-			torch.empty((0, 3), dtype=torch.int64, device=xy_conn.device),
-			torch.empty((0,), dtype=torch.bool, device=xy_conn.device),
-			torch.empty((0,), dtype=torch.float32, device=xy_conn.device),
-			torch.empty((0, 3), dtype=torch.int64, device=xy_conn.device),
-			torch.empty((0,), dtype=torch.bool, device=xy_conn.device),
-			torch.empty((0,), dtype=torch.float32, device=xy_conn.device),
+			_empty(0, 4),
+			_empty(0, 3, dtype=torch.int64), _empty(0, dtype=torch.bool), _empty(0),
+			_empty(0, 3, dtype=torch.int64), _empty(0, dtype=torch.bool), _empty(0),
+			_empty(0, 3, dtype=torch.int64), _empty(0, dtype=torch.bool), _empty(0),
+			_empty(0, 3, dtype=torch.int64), _empty(0, dtype=torch.bool), _empty(0),
+			_empty(0),
 		)
 	if xy_conn.ndim != 5 or int(xy_conn.shape[3]) != 3 or int(xy_conn.shape[4]) != 2:
 		raise ValueError("xy_conn must be (N,Hm,Wm,3,2)")
@@ -174,12 +176,19 @@ def closest_conn_segment_indices(
 	rightp = xy_conn[:, :, :, 2, :]
 
 	k = int(pts.shape[0])
-	idx_left = torch.empty((k, 3), dtype=torch.int64, device=xy_conn.device)
-	ok_left = torch.zeros((k,), dtype=torch.bool, device=xy_conn.device)
-	dist_left = torch.full((k,), float("inf"), dtype=torch.float32, device=xy_conn.device)
-	idx_right = torch.empty((k, 3), dtype=torch.int64, device=xy_conn.device)
-	ok_right = torch.zeros((k,), dtype=torch.bool, device=xy_conn.device)
-	dist_right = torch.full((k,), float("inf"), dtype=torch.float32, device=xy_conn.device)
+	dev = xy_conn.device
+
+	def _alloc():
+		idx = torch.empty((k, 3), dtype=torch.int64, device=dev)
+		ok = torch.zeros((k,), dtype=torch.bool, device=dev)
+		dist = torch.full((k,), float("inf"), dtype=torch.float32, device=dev)
+		return idx, ok, dist
+
+	idx_left, ok_left, dist_left = _alloc()
+	idx_right, ok_right, dist_right = _alloc()
+	idx_left_hi, ok_left_hi, dist_left_hi = _alloc()
+	idx_right_hi, ok_right_hi, dist_right_hi = _alloc()
+	z_frac_out = torch.zeros((k,), dtype=torch.float32, device=dev)
 
 	def _cross_z(a2: torch.Tensor, b2: torch.Tensor) -> torch.Tensor:
 		return a2[..., 0] * b2[..., 1] - a2[..., 1] * b2[..., 0]
@@ -221,54 +230,69 @@ def closest_conn_segment_indices(
 		d2 = ((q - c) * (q - c)).sum(dim=-1)
 		return torch.where(inside, d2, torch.full_like(d2, float("inf")))
 
-	for i in range(k):
-		z = int(torch.round(pts[i, 2]).item())
+	def _search_at_z(z: int, q: torch.Tensor):
+		"""Search for best gap at a single z-slice. Returns (idx_l, ok_l, dist_l, idx_r, ok_r, dist_r)."""
 		z = max(0, min(n - 1, z))
-		q = pts[i, 0:2].view(1, 1, 2)
-
 		p0 = center[z, :-1, :, :]
 		p1 = center[z, 1:, :, :]
-
-		d2_r = _side_d2(conn_side=rightp[z], p0=p0, p1=p1, q=q)  # (hm-1, wm)
+		d2_r = _side_d2(conn_side=rightp[z], p0=p0, p1=p1, q=q)
 		d2_l = _side_d2(conn_side=leftp[z], p0=p0, p1=p1, q=q)
-
-		# Per-column (per-winding) minimum distance
-		min_r, argmin_r = d2_r.min(dim=0)  # (wm,)
+		min_r, argmin_r = d2_r.min(dim=0)
 		min_l, argmin_l = d2_l.min(dim=0)
 
-		# Joint selection: point is between winding c (right side) and
-		# winding c+1 (left side).  Pick the pair with min combined dist.
 		if wm < 2:
-			idx_left[i] = torch.tensor([z, -1, -1], dtype=torch.int64)
-			idx_right[i] = torch.tensor([z, -1, -1], dtype=torch.int64)
-			continue
+			inv = torch.tensor([z, -1, -1], dtype=torch.int64, device=dev)
+			return inv, False, float("inf"), inv.clone(), False, float("inf")
 
-		combined = min_r[:-1] + min_l[1:]  # (wm-1,)
+		combined = min_r[:-1] + min_l[1:]
 		best_gap = int(combined.argmin().item())
-
 		if not torch.isfinite(combined[best_gap]):
-			idx_left[i] = torch.tensor([z, -1, -1], dtype=torch.int64)
-			idx_right[i] = torch.tensor([z, -1, -1], dtype=torch.int64)
-			continue
+			inv = torch.tensor([z, -1, -1], dtype=torch.int64, device=dev)
+			return inv, False, float("inf"), inv.clone(), False, float("inf")
 
 		c_r = best_gap
 		c_l = best_gap + 1
-		idx_right[i, 0] = z
-		idx_right[i, 1] = int(argmin_r[c_r].item())
-		idx_right[i, 2] = c_r
-		ok_right[i] = True
-		dist_right[i] = torch.sqrt(min_r[c_r]).to(dtype=torch.float32)
+		ir = torch.tensor([z, int(argmin_r[c_r].item()), c_r], dtype=torch.int64, device=dev)
+		il = torch.tensor([z, int(argmin_l[c_l].item()), c_l], dtype=torch.int64, device=dev)
+		dr = float(torch.sqrt(min_r[c_r]).item())
+		dl = float(torch.sqrt(min_l[c_l]).item())
+		return il, True, dl, ir, True, dr
 
-		idx_left[i, 0] = z
-		idx_left[i, 1] = int(argmin_l[c_l].item())
-		idx_left[i, 2] = c_l
-		ok_left[i] = True
-		dist_left[i] = torch.sqrt(min_l[c_l]).to(dtype=torch.float32)
-	return pts, idx_left, ok_left, dist_left, idx_right, ok_right, dist_right
+	for i in range(k):
+		z_f = pts[i, 2].item()
+		z_lo = max(0, min(n - 1, int(math.floor(z_f))))
+		z_hi = max(0, min(n - 1, int(math.ceil(z_f))))
+		frac = z_f - math.floor(z_f)
+		if z_lo == z_hi:
+			frac = 0.0
+		z_frac_out[i] = frac
+		q = pts[i, 0:2].view(1, 1, 2)
+
+		# Search at lo z-slice
+		il, ol, dl, ir, or_, dr = _search_at_z(z_lo, q)
+		idx_left[i] = il; ok_left[i] = ol; dist_left[i] = dl
+		idx_right[i] = ir; ok_right[i] = or_; dist_right[i] = dr
+
+		# Search at hi z-slice
+		il_h, ol_h, dl_h, ir_h, or_h, dr_h = _search_at_z(z_hi, q)
+		idx_left_hi[i] = il_h; ok_left_hi[i] = ol_h; dist_left_hi[i] = dl_h
+		idx_right_hi[i] = ir_h; ok_right_hi[i] = or_h; dist_right_hi[i] = dr_h
+
+	return (
+		pts,
+		idx_left, ok_left, dist_left,
+		idx_right, ok_right, dist_right,
+		idx_left_hi, ok_left_hi, dist_left_hi,
+		idx_right_hi, ok_right_hi, dist_right_hi,
+		z_frac_out,
+	)
 
 
 def print_closest_conn_segments(*, points_xyz_winda: torch.Tensor, xy_conn: torch.Tensor) -> None:
-	pts_all, idx_l, ok_l, d_l, idx_r, ok_r, d_r = closest_conn_segment_indices(points_xyz_winda=points_xyz_winda, xy_conn=xy_conn)
+	(pts_all,
+	 idx_l, ok_l, d_l, idx_r, ok_r, d_r,
+	 idx_l_hi, ok_l_hi, d_l_hi, idx_r_hi, ok_r_hi, d_r_hi,
+	 z_frac) = closest_conn_segment_indices(points_xyz_winda=points_xyz_winda, xy_conn=xy_conn)
 	print("[point_constraints] points_xyz_winda_work_all", pts_all)
 	print("[point_constraints] closest_conn_left[z,row,colL]", idx_l)
 	print("[point_constraints] closest_conn_left_valid", ok_l)
@@ -276,6 +300,7 @@ def print_closest_conn_segments(*, points_xyz_winda: torch.Tensor, xy_conn: torc
 	print("[point_constraints] closest_conn_right[z,row,colL]", idx_r)
 	print("[point_constraints] closest_conn_right_valid", ok_r)
 	print("[point_constraints] closest_conn_right_min_dist_px", d_r)
+	print("[point_constraints] z_frac", z_frac)
 
 
 def winding_observed_and_error(

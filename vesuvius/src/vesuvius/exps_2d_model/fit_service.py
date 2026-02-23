@@ -485,8 +485,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, 404)
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        # Prefix HTTP logs
-        print(f"[fit-service] {fmt % args}", flush=True)
+        msg = fmt % args
+        if "/status" in msg:
+            return
+        print(f"[fit-service] {msg}", flush=True)
 
 
 # ---------------------------------------------------------------------------

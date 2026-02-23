@@ -311,6 +311,7 @@ def optimize(
 	stages: list[Stage],
 	snapshot_interval: int,
 	snapshot_fn,
+	corr_snapshot_fn=None,
 	progress_fn=None,
 ) -> fit_data.FitData:
 	data_z0 = data_cfg.unet_z if data_cfg is not None else None
@@ -338,7 +339,12 @@ def optimize(
 		def _corr_pts_for_res() -> fit_data.PointConstraintsData | None:
 			if pts_c0 is None:
 				return None
-			pts_all, idx_left, valid_left, _d_l, idx_right, valid_right, _d_r = point_constraints.closest_conn_segment_indices(
+			(pts_all,
+			 idx_left, valid_left, _d_l,
+			 idx_right, valid_right, _d_r,
+			 idx_left_hi, valid_left_hi, _d_l_hi,
+			 idx_right_hi, valid_right_hi, _d_r_hi,
+			 z_frac) = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=pts_c0.points_xyz_winda,
 				xy_conn=res.xy_conn,
 			)
@@ -349,6 +355,11 @@ def optimize(
 				valid_left=valid_left,
 				idx_right=idx_right,
 				valid_right=valid_right,
+				idx_left_hi=idx_left_hi,
+				valid_left_hi=valid_left_hi,
+				idx_right_hi=idx_right_hi,
+				valid_right_hi=valid_right_hi,
+				z_frac=z_frac,
 			)
 		term_to_maps = {
 			"data": lambda: opt_loss_data.data_loss_map(res=res),
@@ -482,7 +493,12 @@ def optimize(
 		def _corr_pts_for_res(res) -> fit_data.PointConstraintsData | None:
 			if pts_c0 is None:
 				return None
-			pts_all, idx_left, valid_left, _d_l, idx_right, valid_right, _d_r = point_constraints.closest_conn_segment_indices(
+			(pts_all,
+			 idx_left, valid_left, _d_l,
+			 idx_right, valid_right, _d_r,
+			 idx_left_hi, valid_left_hi, _d_l_hi,
+			 idx_right_hi, valid_right_hi, _d_r_hi,
+			 z_frac) = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=pts_c0.points_xyz_winda,
 				xy_conn=res.xy_conn,
 			)
@@ -493,6 +509,11 @@ def optimize(
 				valid_left=valid_left,
 				idx_right=idx_right,
 				valid_right=valid_right,
+				idx_left_hi=idx_left_hi,
+				valid_left_hi=valid_left_hi,
+				idx_right_hi=idx_right_hi,
+				valid_right_hi=valid_right_hi,
+				z_frac=z_frac,
 			)
 		terms = {
 			"dir_v": {"loss": opt_loss_dir.dir_v_loss},
@@ -626,8 +647,8 @@ def optimize(
 				term_vals = {k: round(v, 4) for k, v in term_vals.items()}
 				param_vals = {k: round(v, 4) for k, v in param_vals.items()}
 				_print_status(step_label=f"{label} {step1}/{opt_cfg.steps if opt_cfg.termination == 'steps' else '?'}", loss_val=loss.item(), tv=term_vals, pv=param_vals)
-				if opt_cfg.termination == "mask":
-					print(f"  mask mean: {_mask_completion:.4f}")
+				if corr_snapshot_fn is not None:
+					corr_snapshot_fn(stage=label, step=step1, data=data, res=res)
 
 			if snap_int > 0 and (step1 % snap_int) == 0:
 				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data, res=res, vis_losses=vis_losses)
