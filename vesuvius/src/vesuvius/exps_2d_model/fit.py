@@ -174,14 +174,23 @@ def main(argv: list[str] | None = None) -> int:
 		z_size_use = z_size_new
 		print(f"[fit] bbox z_size: {z_size_fullres} fullres -> {z_size_use} slices (z_step_eff={z_step_eff})", flush=True)
 
+	# Effective full-res z-spacing per working z-plane.  Preprocessed zarrs
+	# bake z_step*downscale into each slice; raw OME-Zarr slices are loaded
+	# at raw z_step spacing (downscale only affects x/y).
+	if prep_params is not None:
+		_z_step_fullres = int(prep_params["z_step_eff"])
+	else:
+		_z_step_fullres = int(z_step_use)
 	points_tensor_work = point_constraints.to_working_coords(
 		points_xyz_winda=points_tensor,
 		downscale=float(data_cfg.downscale),
 		crop_xywh=data_cfg.crop,
 		z0=data_cfg.unet_z,
-		z_step=int(z_step_use),
+		z_step=int(_z_step_fullres),
 		z_size=int(z_size_use),
 	)
+	print(f"[fit] point coord mapping: z0={data_cfg.unet_z} z_step_fullres={_z_step_fullres} "
+		  f"ds={data_cfg.downscale} crop={data_cfg.crop}")
 	print("[point_constraints] points_xyz_winda_work", points_tensor_work)
 	points_all = torch.empty((0, 4), dtype=torch.float32)
 	idx_left = torch.empty((0, 3), dtype=torch.int64)
@@ -268,28 +277,38 @@ def main(argv: list[str] | None = None) -> int:
 		with torch.no_grad():
 			xy_lr0 = mdl._grid_xy()
 			xy_conn0 = mdl._xy_conn_px(xy_lr=xy_lr0)
-		points_all, idx_left, valid_left, min_dist_left, idx_right, valid_right, min_dist_right = point_constraints.closest_conn_segment_indices(points_xyz_winda=points_tensor_work, xy_conn=xy_conn0)
-		print("[point_constraints] points_xyz_winda_work_all", points_all)
-		print("[point_constraints] closest_conn_left[z,row,colL]", idx_left)
-		print("[point_constraints] closest_conn_left_valid", valid_left)
-		print("[point_constraints] closest_conn_left_min_dist_px", min_dist_left)
-		print("[point_constraints] closest_conn_right[z,row,colL]", idx_right)
-		print("[point_constraints] closest_conn_right_valid", valid_right)
-		print("[point_constraints] closest_conn_right_min_dist_px", min_dist_right)
-		winding_obs, winding_avg, winding_err = point_constraints.winding_observed_and_error(
-			points_xyz_winda=points_all,
-			collection_idx=points_collection_idx,
-			xy_conn=xy_conn0,
-			idx_left=idx_left,
-			valid_left=valid_left,
-			idx_right=idx_right,
-			valid_right=valid_right,
-		)
-		print("[point_constraints] winding_observed", winding_obs)
-		print("[point_constraints] winding_collection_avg", winding_avg)
-		print("[point_constraints] winding_error_obs_minus_avg_plus_winda", winding_err)
+		(points_all,
+		 idx_left, valid_left, min_dist_left,
+		 idx_right, valid_right, min_dist_right,
+		 idx_left_hi, valid_left_hi, _dist_left_hi,
+		 idx_right_hi, valid_right_hi, _dist_right_hi,
+		 z_frac) = point_constraints.closest_conn_segment_indices(points_xyz_winda=points_tensor_work, xy_conn=xy_conn0)
+		n_lo = int(valid_left.sum().item())
+		n_hi = int(valid_left_hi.sum().item())
+		n_interp = int(((z_frac > 0.0) & valid_left & valid_left_hi).sum().item())
+		print(f"[point_constraints] {int(points_all.shape[0])} pts: {n_lo} valid_lo, {n_hi} valid_hi, {n_interp} z-interpolated")
+		for pi in range(int(points_all.shape[0])):
+			pf = points_tensor[pi]  # original fullres
+			pw = points_all[pi]     # working coords (after margin shift)
+			z_lo_i = int(idx_left[pi, 0].item())
+			z_hi_i = int(idx_left_hi[pi, 0].item())
+			frac_i = z_frac[pi].item()
+			print(f"  pt{pi}: fullres=({pf[0]:.0f},{pf[1]:.0f},{pf[2]:.0f}) "
+				  f"work=({pw[0]:.1f},{pw[1]:.1f},{pw[2]:.2f}) "
+				  f"z_lo={z_lo_i} z_hi={z_hi_i} z_frac={frac_i:.3f}")
 
+	_z0_fullres = int(data_cfg.unet_z) if data_cfg.unet_z is not None else 0
 	_out_dir = vis_cfg.out_dir  # None means skip all debug/vis output
+	# Corr point vis always gets a directory when points exist.
+	# Falls back to cwd (the fit_service working directory).
+	_corr_out_dir: str | None = None
+	if int(points_all.shape[0]) > 0:
+		if _out_dir is not None:
+			_corr_out_dir = _out_dir
+		else:
+			import os
+			_corr_out_dir = os.getcwd()
+		print(f"[fit] corr_out_dir={_corr_out_dir}")
 	data = cli_data.load_fit_data(data_cfg, z_size=int(z_size_use), out_dir_base=_out_dir)
 	data = fit_data.FitData(
 		cos=data.cos,
@@ -311,6 +330,11 @@ def main(argv: list[str] | None = None) -> int:
 				valid_left=valid_left,
 				idx_right=idx_right,
 				valid_right=valid_right,
+				idx_left_hi=idx_left_hi,
+				valid_left_hi=valid_left_hi,
+				idx_right_hi=idx_right_hi,
+				valid_right_hi=valid_right_hi,
+				z_frac=z_frac,
 			)
 		),
 	)
@@ -372,7 +396,10 @@ def main(argv: list[str] | None = None) -> int:
 		with torch.no_grad():
 			xy_lr_corr = mdl._grid_xy()
 			xy_conn_corr = mdl._xy_conn_px(xy_lr=xy_lr_corr)
-			pts_corr, idx_l_corr, ok_l_corr, _d_l, idx_r_corr, ok_r_corr, _d_r = point_constraints.closest_conn_segment_indices(
+			(pts_corr,
+			 idx_l_corr, ok_l_corr, _d_l,
+			 idx_r_corr, ok_r_corr, _d_r,
+			 *_hi_corr) = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=points_all,
 				xy_conn=xy_conn_corr,
 			)
@@ -385,7 +412,7 @@ def main(argv: list[str] | None = None) -> int:
 				idx_right=idx_r_corr,
 				valid_right=ok_r_corr,
 			)
-		if _out_dir is not None:
+		if _corr_out_dir is not None:
 			vis.save_corr_points(
 				data=data,
 				xy_lr=xy_lr_corr,
@@ -398,8 +425,10 @@ def main(argv: list[str] | None = None) -> int:
 				winding_avg=winding_avg,
 				winding_err=winding_err,
 				postfix="init",
-				out_dir=_out_dir,
+				out_dir=_corr_out_dir,
 				scale=vis_cfg.scale,
+				z0_fullres=_z0_fullres,
+				z_step_fullres=_z_step_fullres,
 			)
 
 	if _out_dir is not None:
@@ -427,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
 
 	_save_model_snapshot(stage="init", step=0)
 	def _snapshot(*, stage: str, step: int, loss: float, data, res=None, vis_losses=None) -> None:
-		if _out_dir is not None and int(points_all.shape[0]) > 0:
+		if _corr_out_dir is not None and int(points_all.shape[0]) > 0:
 			if res is not None:
 				xy_lr_corr = res.xy_lr
 				xy_conn_corr = res.xy_conn
@@ -435,7 +464,10 @@ def main(argv: list[str] | None = None) -> int:
 				with torch.no_grad():
 					xy_lr_corr = mdl._grid_xy()
 					xy_conn_corr = mdl._xy_conn_px(xy_lr=xy_lr_corr)
-			pts_corr, idx_l_corr, ok_l_corr, _d_l, idx_r_corr, ok_r_corr, _d_r = point_constraints.closest_conn_segment_indices(
+			(pts_corr,
+			 idx_l_corr, ok_l_corr, _d_l,
+			 idx_r_corr, ok_r_corr, _d_r,
+			 *_hi_corr) = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=points_all,
 				xy_conn=xy_conn_corr,
 			)
@@ -460,8 +492,10 @@ def main(argv: list[str] | None = None) -> int:
 				winding_avg=wavg,
 				winding_err=werr,
 				postfix=f"{stage}_{step:06d}",
-				out_dir=_out_dir,
+				out_dir=_corr_out_dir,
 				scale=vis_cfg.scale,
+				z0_fullres=_z0_fullres,
+				z_step_fullres=_z_step_fullres,
 			)
 		if _out_dir is not None:
 			vis.save(
@@ -476,6 +510,47 @@ def main(argv: list[str] | None = None) -> int:
 			mdl.save_tiff(data=data, path=f"{_out_dir}/raw_{stage}_{step:06d}.tif")
 		_save_model_snapshot(stage=stage, step=step)
 
+	def _corr_snapshot(*, stage: str, step: int, data, res) -> None:
+		"""Save corr-point debug images (lightweight, every 100 steps)."""
+		if _corr_out_dir is None or int(points_all.shape[0]) <= 0:
+			return
+		with torch.no_grad():
+			xy_lr_corr = res.xy_lr
+			xy_conn_corr = res.xy_conn
+			(pts_corr,
+			 idx_l_corr, ok_l_corr, _d_l,
+			 idx_r_corr, ok_r_corr, _d_r,
+			 *_hi_corr) = point_constraints.closest_conn_segment_indices(
+				points_xyz_winda=points_all,
+				xy_conn=xy_conn_corr,
+			)
+			_wobs, wavg, werr = point_constraints.winding_observed_and_error(
+				points_xyz_winda=pts_corr,
+				collection_idx=points_collection_idx,
+				xy_conn=xy_conn_corr,
+				idx_left=idx_l_corr,
+				valid_left=ok_l_corr,
+				idx_right=idx_r_corr,
+				valid_right=ok_r_corr,
+			)
+		vis.save_corr_points(
+			data=data,
+			xy_lr=xy_lr_corr,
+			xy_conn=xy_conn_corr,
+			points_xyz_winda=pts_corr,
+			idx_left=idx_l_corr,
+			valid_left=ok_l_corr,
+			idx_right=idx_r_corr,
+			valid_right=ok_r_corr,
+			winding_avg=wavg,
+			winding_err=werr,
+			postfix=f"{stage}_{step:06d}",
+			out_dir=_corr_out_dir,
+			scale=vis_cfg.scale,
+			z0_fullres=_z0_fullres,
+			z_step_fullres=_z_step_fullres,
+		)
+
 	def _progress(*, step: int, total: int, loss: float, **_kw: object) -> None:
 		if progress_enabled:
 			print(f"PROGRESS {step} {total} {loss:.6f}", flush=True)
@@ -488,41 +563,47 @@ def main(argv: list[str] | None = None) -> int:
 		stages=stages,
 		snapshot_interval=opt_cfg.snapshot_interval,
 		snapshot_fn=_snapshot,
+		corr_snapshot_fn=_corr_snapshot,
 		progress_fn=_progress,
 	)
-	if _out_dir is not None:
-		if int(points_all.shape[0]) > 0:
-			with torch.no_grad():
-				xy_lr_corr = mdl._grid_xy()
-				xy_conn_corr = mdl._xy_conn_px(xy_lr=xy_lr_corr)
-				pts_corr, idx_l_corr, ok_l_corr, _d_l, idx_r_corr, ok_r_corr, _d_r = point_constraints.closest_conn_segment_indices(
-					points_xyz_winda=points_all,
-					xy_conn=xy_conn_corr,
-				)
-				_wobsf, wavgf, werrf = point_constraints.winding_observed_and_error(
-					points_xyz_winda=pts_corr,
-					collection_idx=points_collection_idx,
-					xy_conn=xy_conn_corr,
-					idx_left=idx_l_corr,
-					valid_left=ok_l_corr,
-					idx_right=idx_r_corr,
-					valid_right=ok_r_corr,
-				)
-			vis.save_corr_points(
-				data=data,
-				xy_lr=xy_lr_corr,
+	if _corr_out_dir is not None and int(points_all.shape[0]) > 0:
+		with torch.no_grad():
+			xy_lr_corr = mdl._grid_xy()
+			xy_conn_corr = mdl._xy_conn_px(xy_lr=xy_lr_corr)
+			(pts_corr,
+			 idx_l_corr, ok_l_corr, _d_l,
+			 idx_r_corr, ok_r_corr, _d_r,
+			 *_hi_corr) = point_constraints.closest_conn_segment_indices(
+				points_xyz_winda=points_all,
 				xy_conn=xy_conn_corr,
+			)
+			_wobsf, wavgf, werrf = point_constraints.winding_observed_and_error(
 				points_xyz_winda=pts_corr,
+				collection_idx=points_collection_idx,
+				xy_conn=xy_conn_corr,
 				idx_left=idx_l_corr,
 				valid_left=ok_l_corr,
 				idx_right=idx_r_corr,
 				valid_right=ok_r_corr,
-				winding_avg=wavgf,
-				winding_err=werrf,
-				postfix="final",
-				out_dir=_out_dir,
-				scale=vis_cfg.scale,
 			)
+		vis.save_corr_points(
+			data=data,
+			xy_lr=xy_lr_corr,
+			xy_conn=xy_conn_corr,
+			points_xyz_winda=pts_corr,
+			idx_left=idx_l_corr,
+			valid_left=ok_l_corr,
+			idx_right=idx_r_corr,
+			valid_right=ok_r_corr,
+			winding_avg=wavgf,
+			winding_err=werrf,
+			postfix="final",
+			out_dir=_corr_out_dir,
+			scale=vis_cfg.scale,
+			z0_fullres=_z0_fullres,
+			z_step_fullres=_z_step_fullres,
+		)
+	if _out_dir is not None:
 		vis.save(model=mdl, data=data, postfix="final", out_dir=_out_dir, scale=vis_cfg.scale)
 		mdl.save_tiff(data=data, path=f"{_out_dir}/raw_final.tif")
 	_save_model_snapshot(stage="final", step=0)

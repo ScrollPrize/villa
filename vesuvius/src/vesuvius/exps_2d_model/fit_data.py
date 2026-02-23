@@ -18,10 +18,18 @@ import cli_data
 class PointConstraintsData:
 	points_xyz_winda: torch.Tensor
 	collection_idx: torch.Tensor
+	# lo z-slice (floor of point z)
 	idx_left: torch.Tensor
 	valid_left: torch.Tensor
 	idx_right: torch.Tensor
 	valid_right: torch.Tensor
+	# hi z-slice (ceil of point z)
+	idx_left_hi: torch.Tensor
+	valid_left_hi: torch.Tensor
+	idx_right_hi: torch.Tensor
+	valid_right_hi: torch.Tensor
+	# interpolation weight for hi slice: 0.0 = all lo, 1.0 = all hi
+	z_frac: torch.Tensor
 
 
 @dataclass(frozen=True)
