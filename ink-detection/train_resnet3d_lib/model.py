@@ -921,6 +921,7 @@ class StitchManager:
 
             if should_run_stitch_metrics:
                 from metrics.stitched_metrics import (
+                    _threshold_tag,
                     component_metric_specs,
                     compute_stitched_metrics,
                     summarize_component_rows,
@@ -930,6 +931,7 @@ class StitchManager:
                 label_suffix = str(getattr(CFG, "val_label_suffix", "_val"))
                 mask_suffix = str(getattr(CFG, "val_mask_suffix", "_val"))
                 threshold = float(getattr(CFG, "eval_threshold", 0.5))
+                threshold_tag_main = _threshold_tag(threshold)
                 betti_connectivity = 2
                 drd_block_size = int(getattr(CFG, "eval_drd_block_size", 8))
                 boundary_k = int(getattr(CFG, "eval_boundary_k", 3))
@@ -1124,15 +1126,44 @@ class StitchManager:
                     )
 
                 if global_component_rows:
+                    global_rows_by_threshold = {}
+                    threshold_value_by_tag = {}
+                    for entry in global_component_rows:
+                        threshold_tag = entry.get("threshold_tag")
+                        if not isinstance(threshold_tag, str) or not threshold_tag:
+                            raise KeyError(
+                                "global component row is missing a valid threshold_tag; "
+                                f"entry keys={sorted(entry.keys())!r}"
+                            )
+                        threshold_value = float(entry["threshold"])
+                        existing_threshold_value = threshold_value_by_tag.get(threshold_tag)
+                        if existing_threshold_value is None:
+                            threshold_value_by_tag[threshold_tag] = threshold_value
+                        elif not np.isclose(float(existing_threshold_value), threshold_value):
+                            raise ValueError(
+                                f"inconsistent threshold values for threshold_tag={threshold_tag!r}: "
+                                f"{existing_threshold_value} vs {threshold_value}"
+                            )
+                        global_rows_by_threshold.setdefault(threshold_tag, []).append(entry)
+                    if threshold_tag_main not in global_rows_by_threshold:
+                        available_tags = sorted(global_rows_by_threshold.keys())
+                        raise ValueError(
+                            "eval_threshold is missing from stitched threshold rows; "
+                            f"eval_threshold={threshold} threshold_tag={threshold_tag_main!r} "
+                            f"available_threshold_tags={available_tags!r}"
+                        )
+
+                    global_metric_specs = component_metric_specs(
+                        enable_skeleton_metrics=enable_skeleton_metrics,
+                        include_cadenced_metrics=run_topological_metrics,
+                    )
+                    global_component_rows_main = global_rows_by_threshold[threshold_tag_main]
                     global_stats, global_rankings = summarize_component_rows(
-                        global_component_rows,
+                        global_component_rows_main,
                         worst_q=component_worst_q,
                         worst_k=component_worst_k,
                         id_key="global_component_id",
-                        metric_specs=component_metric_specs(
-                            enable_skeleton_metrics=enable_skeleton_metrics,
-                            include_cadenced_metrics=run_topological_metrics,
-                        ),
+                        metric_specs=global_metric_specs,
                     )
                     for metric_name, stats in global_stats.items():
                         for stat_name, stat_val in stats.items():
@@ -1142,11 +1173,32 @@ class StitchManager:
                                 on_epoch=True,
                                 prog_bar=False,
                             )
+                    sorted_threshold_tags = sorted(
+                        global_rows_by_threshold.keys(), key=lambda tag: (float(threshold_value_by_tag[tag]), str(tag))
+                    )
+                    for threshold_tag in sorted_threshold_tags:
+                        threshold_rows = global_rows_by_threshold[threshold_tag]
+                        threshold_stats, _ = summarize_component_rows(
+                            threshold_rows,
+                            worst_q=component_worst_q,
+                            worst_k=component_worst_k,
+                            id_key="global_component_id",
+                            metric_specs=global_metric_specs,
+                        )
+                        for metric_name, stats in threshold_stats.items():
+                            for stat_name, stat_val in stats.items():
+                                model.log(
+                                    "metrics/val_stitch/global/thresholds/components/"
+                                    f"{metric_name}/{stat_name}/thr_{threshold_tag}",
+                                    float(stat_val),
+                                    on_epoch=True,
+                                    prog_bar=False,
+                                )
                     manifest_path = None
                     manifest_output_dir = stitched_inputs_output_dir
                     if manifest_output_dir:
                         manifest_path = write_global_component_manifest(
-                            component_rows=global_component_rows,
+                            component_rows=global_component_rows_main,
                             output_dir=manifest_output_dir,
                             downsample=self.downsample,
                             worst_k=component_worst_k,

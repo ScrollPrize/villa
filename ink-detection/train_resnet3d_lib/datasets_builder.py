@@ -404,6 +404,32 @@ def _build_mask_store_and_patch_index_cached(
     return mask_store, xyxys, sample_bbox_indices
 
 
+def extract_infer_patch_coordinates_cached(
+    *,
+    fragment_mask,
+    fragment_id,
+    mask_suffix,
+    split_name="val",
+):
+    split = str(split_name)
+    if split not in {"train", "val"}:
+        raise ValueError(f"split_name must be 'train' or 'val', got {split_name!r}")
+
+    fragment_mask_u8 = _label_mask_uint8(fragment_mask, context="inference patch-index fragment mask")
+    _mask_store, xyxys, _sample_bbox_indices = _build_mask_store_and_patch_index_cached(
+        fragment_mask_u8,
+        fragment_mask_u8,
+        fragment_id=str(fragment_id),
+        split_name=split,
+        filter_empty_tile=False,
+        label_suffix="__stitch_infer__",
+        mask_suffix=str(mask_suffix),
+    )
+    if xyxys.ndim != 2 or xyxys.shape[1] != 4:
+        raise ValueError(f"inference cached xyxys must have shape (N, 4), got {tuple(xyxys.shape)}")
+    return xyxys
+
+
 def _label_foreground_mask(mask):
     mask_arr = np.asarray(mask)
     if mask_arr.ndim != 2:
@@ -1431,7 +1457,12 @@ def build_log_only_stitch_loaders_lazy(
             volume.shape[:2],
             mask_suffix=mask_suffix,
         )
-        xyxys = extract_patch_coordinates(None, fragment_mask, filter_empty_tile=False)
+        xyxys = extract_infer_patch_coordinates_cached(
+            fragment_mask=fragment_mask,
+            fragment_id=sid,
+            mask_suffix=mask_suffix,
+            split_name="val",
+        )
         log(f"patches log-only segment={sid} n={int(len(xyxys))}")
         if int(len(xyxys)) == 0:
             continue

@@ -9,7 +9,6 @@ import uuid
 import yaml
 
 import torch
-from pytorch_lightning.loggers import WandbLogger
 
 from train_resnet3d_lib.checkpointing import resolve_checkpoint_path
 from train_resnet3d_lib.config import (
@@ -24,6 +23,7 @@ from train_resnet3d_lib.config import (
     slugify,
     unflatten_dict,
 )
+from train_resnet3d_lib.wandb_local_metrics import LocalMetricsWandbLogger
 
 
 def parse_args():
@@ -168,11 +168,17 @@ def expand_wandb_metric_summary_keys(metric_summaries, *, segment_ids):
             continue
         if metric_name.count("*") != 1:
             raise ValueError(f"unsupported wildcard metric summary key: {metric_name!r}")
-        if not safe_segment_ids:
-            raise ValueError("cannot expand wildcard metric summary keys without any segment ids")
-        for safe_segment_id in safe_segment_ids:
-            expanded_key = metric_name.replace("*", safe_segment_id)
-            expanded[expanded_key] = summary_mode
+        if "segments/*/" in metric_name:
+            if not safe_segment_ids:
+                raise ValueError("cannot expand wildcard metric summary keys without any segment ids")
+            for safe_segment_id in safe_segment_ids:
+                expanded_key = metric_name.replace("*", safe_segment_id)
+                expanded[expanded_key] = summary_mode
+            continue
+        if metric_name.endswith("/thr_*"):
+            expanded[metric_name] = summary_mode
+            continue
+        raise ValueError(f"unsupported wildcard metric summary key: {metric_name!r}")
     return expanded
 
 
@@ -195,7 +201,7 @@ def init_wandb_logger(args, base_config, *, preinit_overrides=None):
         log("wandb disabled")
         return None
 
-    wandb_logger_sig = inspect.signature(WandbLogger.__init__)
+    wandb_logger_sig = inspect.signature(LocalMetricsWandbLogger.__init__)
     wandb_logger_kwargs = {k: v for k, v in wandb_logger_kwargs.items() if k in wandb_logger_sig.parameters}
 
     initial_run_name = args.run_name
@@ -207,7 +213,7 @@ def init_wandb_logger(args, base_config, *, preinit_overrides=None):
         f"name={initial_run_name!r} mode={os.environ.get('WANDB_MODE')!r}"
     )
     wandb_t0 = time.time()
-    wandb_logger = WandbLogger(project=wandb_project, name=initial_run_name, **wandb_logger_kwargs)
+    wandb_logger = LocalMetricsWandbLogger(project=wandb_project, name=initial_run_name, **wandb_logger_kwargs)
     log(f"wandb ready in {time.time() - wandb_t0:.1f}s")
     return wandb_logger
 
@@ -247,7 +253,7 @@ def define_wandb_metric_summaries(wandb_logger, merged_config):
         segment_ids=list(merged_config["segments"].keys()),
     )
     for metric_name, summary_mode in metric_summaries.items():
-        if "*" in metric_name:
+        if "*" in metric_name and not metric_name.endswith("/thr_*"):
             raise ValueError(f"wildcard metric key reached define_metric: {metric_name!r}")
         run.define_metric(
             metric_name,
@@ -426,6 +432,8 @@ def prepare_runtime_state(
         "init_ckpt_path": resolved_init_ckpt_path,
         "resume_ckpt_path": resolved_resume_ckpt_path,
         "run_slug": run_slug,
+        "run_id": run_id,
+        "run_dir": run_dir,
     }
     return {"run_state": run_state}
 
@@ -442,10 +450,22 @@ def prepare_run(args, merged_config, wandb_logger):
     )
     run_state = prepared["run_state"]
     if wandb_logger is not None:
+        if not isinstance(wandb_logger, LocalMetricsWandbLogger):
+            raise TypeError(
+                "wandb_logger must be LocalMetricsWandbLogger when W&B is enabled, "
+                f"got {type(wandb_logger).__name__}"
+            )
+        wandb_logger.configure_local_persistence(log_dir=str(CFG.log_dir))
         run = wandb_logger.experiment
-        desired_run_name = str(run_state["run_slug"])
+        run_dir_name = osp.basename(str(run_state["run_dir"]).rstrip("/\\"))
+        if not run_dir_name:
+            raise ValueError(f"failed to derive run_dir basename from run_dir={run_state['run_dir']!r}")
+        desired_run_name = str(run_dir_name)
         current_run_name = str(run.name) if run.name is not None else None
         if current_run_name != desired_run_name:
             run.name = desired_run_name
             log(f"wandb run name updated current={current_run_name!r} merged={desired_run_name!r}")
+        run.summary["local/run_dir"] = str(run_state["run_dir"])
+        run.summary["local/checkpoints_dir"] = str(CFG.model_dir)
+        run.summary["local/log_dir"] = str(CFG.log_dir)
     return run_state

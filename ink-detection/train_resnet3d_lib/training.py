@@ -9,6 +9,7 @@ from train_resnet3d_lib.config import (
 )
 from train_resnet3d_lib.model import RegressionPLModel
 from train_resnet3d_lib.checkpointing import load_state_dict_from_checkpoint
+from train_resnet3d_lib.wandb_local_metrics import LocalMetricsWandbLogger
 
 
 def build_model(run_state, data_state, wandb_logger):
@@ -118,6 +119,20 @@ def build_trainer(args, wandb_logger):
     )
 
 
+def finalize_wandb_logging(trainer):
+    logger = trainer.logger
+    if logger is False or logger is None:
+        return
+    if not isinstance(logger, LocalMetricsWandbLogger):
+        raise TypeError(
+            "trainer.logger must be LocalMetricsWandbLogger when W&B logging is active, "
+            f"got {type(logger).__name__}"
+        )
+    logger.persist_local_state()
+    if wandb.run is not None:
+        wandb.finish()
+
+
 def fit(trainer, model, data_state, run_state):
     log("starting trainer.fit")
     trainer.fit(
@@ -126,8 +141,7 @@ def fit(trainer, model, data_state, run_state):
         val_dataloaders=data_state["val_loaders"],
         ckpt_path=run_state["resume_ckpt_path"],
     )
-    if wandb.run is not None:
-        wandb.finish()
+    finalize_wandb_logging(trainer)
 
 
 def validate(trainer, model, data_state, run_state):
@@ -136,6 +150,6 @@ def validate(trainer, model, data_state, run_state):
         model=model,
         dataloaders=data_state["val_loaders"],
         ckpt_path=run_state["resume_ckpt_path"],
+        verbose=False,
     )
-    if wandb.run is not None:
-        wandb.finish()
+    finalize_wandb_logging(trainer)

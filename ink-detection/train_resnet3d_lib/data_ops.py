@@ -117,8 +117,8 @@ def read_image_layers(
         )
 
     base_h, base_w = first.shape[:2]
-    pad0 = (256 - base_h % 256)
-    pad1 = (256 - base_w % 256)
+    pad0 = (256 - base_h % 256) % 256
+    pad1 = (256 - base_w % 256) % 256
     out_h = base_h + pad0
     out_w = base_w + pad1
 
@@ -385,8 +385,8 @@ class ZarrSegmentVolume:
         self._z_slice_start = int(meta["z_slice_start"])
         self._z_slice_stop = int(meta["z_slice_stop"])
 
-        pad_h = int(256 - (self._base_h % 256))
-        pad_w = int(256 - (self._base_w % 256))
+        pad_h = int((256 - (self._base_h % 256)) % 256)
+        pad_w = int((256 - (self._base_w % 256)) % 256)
         self._padded_h = int(self._base_h + pad_h)
         self._padded_w = int(self._base_w + pad_w)
         self._out_h = int(self._padded_h)
@@ -676,7 +676,8 @@ def extract_patch_coordinates(
                 mask[a:a + CFG.tile_size, b:b + CFG.tile_size]
             ):
                 continue
-            if np.any(fragment_mask[a:a + CFG.tile_size, b:b + CFG.tile_size] == 0):
+            tile_has_invalid = bool(np.any(fragment_mask[a:a + CFG.tile_size, b:b + CFG.tile_size] == 0))
+            if tile_has_invalid and filter_empty_tile:
                 continue
 
             for yi in range(0, CFG.tile_size, CFG.size):
@@ -686,6 +687,8 @@ def extract_patch_coordinates(
                     y2 = y1 + CFG.size
                     x2 = x1 + CFG.size
                     if (y1, y2, x1, x2) in windows_dict:
+                        continue
+                    if tile_has_invalid and (not filter_empty_tile) and np.any(fragment_mask[y1:y2, x1:x2] == 0):
                         continue
                     windows_dict[(y1, y2, x1, x2)] = True
                     xyxys.append([x1, y1, x2, y2])
@@ -893,8 +896,7 @@ def extract_patches_infer(image, fragment_mask, *, include_xyxys=True):
 
     for a in y1_list:
         for b in x1_list:
-            if np.any(fragment_mask[a:a + CFG.tile_size, b:b + CFG.tile_size] == 0):
-                continue
+            tile_has_invalid = bool(np.any(fragment_mask[a:a + CFG.tile_size, b:b + CFG.tile_size] == 0))
 
             for yi in range(0, CFG.tile_size, CFG.size):
                 for xi in range(0, CFG.tile_size, CFG.size):
@@ -903,6 +905,8 @@ def extract_patches_infer(image, fragment_mask, *, include_xyxys=True):
                     y2 = y1 + CFG.size
                     x2 = x1 + CFG.size
                     if (y1, y2, x1, x2) in windows_dict:
+                        continue
+                    if tile_has_invalid and np.any(fragment_mask[y1:y2, x1:x2] == 0):
                         continue
 
                     windows_dict[(y1, y2, x1, x2)] = True
@@ -946,7 +950,8 @@ def extract_patches(image, mask, fragment_mask, *, include_xyxys, filter_empty_t
         for b in x1_list:
             if filter_empty_tile and _label_tile_is_empty(mask[a:a + CFG.tile_size, b:b + CFG.tile_size]):
                 continue
-            if np.any(fragment_mask[a:a + CFG.tile_size, b:b + CFG.tile_size] == 0):
+            tile_has_invalid = bool(np.any(fragment_mask[a:a + CFG.tile_size, b:b + CFG.tile_size] == 0))
+            if tile_has_invalid and filter_empty_tile:
                 continue
 
             for yi in range(0, CFG.tile_size, CFG.size):
@@ -956,6 +961,8 @@ def extract_patches(image, mask, fragment_mask, *, include_xyxys, filter_empty_t
                     y2 = y1 + CFG.size
                     x2 = x1 + CFG.size
                     if (y1, y2, x1, x2) in windows_dict:
+                        continue
+                    if tile_has_invalid and (not filter_empty_tile) and np.any(fragment_mask[y1:y2, x1:x2] == 0):
                         continue
 
                     windows_dict[(y1, y2, x1, x2)] = True
