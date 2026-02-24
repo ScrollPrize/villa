@@ -152,7 +152,6 @@ class EdtSegDataset(Dataset):
         config.setdefault('use_triplet_direction_priors', True)
         config.setdefault('triplet_direction_prior_mask', 'cond')  # cond|full
         config.setdefault('triplet_random_channel_swap_prob', 0.5)
-        config.setdefault('triplet_surface_cache_max_items', 0)
         config.setdefault('triplet_overlap_mask_filename', 'overlap_mask.tif')
         config.setdefault('triplet_warn_missing_overlap_masks', False)
         config.setdefault('triplet_close_check_enabled', True)
@@ -435,10 +434,6 @@ class EdtSegDataset(Dataset):
         else:
             self._load_patch_metadata(patch_metadata)
 
-        self._triplet_surface_cache_max_items = int(config.get('triplet_surface_cache_max_items', 0))
-        if self._triplet_surface_cache_max_items < 0:
-            self._triplet_surface_cache_max_items = 0
-        self._triplet_surface_cache = OrderedDict()
         self._enable_volume_crop_cache = bool(config.get('enable_volume_crop_cache', False))
         self._volume_crop_cache_max_items = int(config.get('volume_crop_cache_max_items', 0))
         if self._volume_crop_cache_max_items < 0:
@@ -768,27 +763,10 @@ class EdtSegDataset(Dataset):
         return np.stack([z_full, y_full, x_full], axis=-1)
 
     def _extract_wrap_world_surface_cached(self, patch_idx: int, wrap_idx: int, require_all_valid: bool = True):
-        """LRU-cache extracted wrap world surfaces for triplet mode."""
+        """Extract one wrap surface by (patch_idx, wrap_idx)."""
         patch = self.patches[patch_idx]
         wrap = patch.wraps[wrap_idx]
-
-        if self._triplet_surface_cache_max_items <= 0:
-            return self._extract_wrap_world_surface(patch, wrap, require_all_valid=require_all_valid)
-
-        cache_key = (patch_idx, wrap_idx, int(bool(require_all_valid)))
-        cached = self._triplet_surface_cache.get(cache_key)
-        if cached is not None:
-            self._triplet_surface_cache.move_to_end(cache_key)
-            return cached
-
-        surface_zyxs = self._extract_wrap_world_surface(patch, wrap, require_all_valid=require_all_valid)
-        if surface_zyxs is None:
-            return None
-
-        self._triplet_surface_cache[cache_key] = surface_zyxs
-        if len(self._triplet_surface_cache) > self._triplet_surface_cache_max_items:
-            self._triplet_surface_cache.popitem(last=False)
-        return surface_zyxs
+        return self._extract_wrap_world_surface(patch, wrap, require_all_valid=require_all_valid)
 
     @staticmethod
     def _read_volume_crop_from_patch(patch: ChunkPatch, crop_size, min_corner, max_corner):
