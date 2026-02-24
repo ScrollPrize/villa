@@ -9,11 +9,11 @@ def create_centered_conditioning(dataset, idx: int, patch_idx: int, wrap_idx: in
     if triplet_meta is None:
         return None
 
-    center_zyxs = dataset._extract_wrap_world_surface_cached(patch_idx, wrap_idx, require_all_valid=True)
-    behind_zyxs = dataset._extract_wrap_world_surface_cached(
+    center_zyxs = dataset._extract_wrap_world_surface_by_index(patch_idx, wrap_idx, require_all_valid=True)
+    behind_zyxs = dataset._extract_wrap_world_surface_by_index(
         patch_idx, triplet_meta["behind_wrap_idx"], require_all_valid=True
     )
-    front_zyxs = dataset._extract_wrap_world_surface_cached(
+    front_zyxs = dataset._extract_wrap_world_surface_by_index(
         patch_idx, triplet_meta["front_wrap_idx"], require_all_valid=True
     )
     if center_zyxs is None or behind_zyxs is None or front_zyxs is None:

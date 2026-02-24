@@ -613,7 +613,7 @@ class EdtSegDataset(Dataset):
         x_full, y_full, z_full = trimmed
         return np.stack([z_full, y_full, x_full], axis=-1)
 
-    def _extract_wrap_world_surface_cached(self, patch_idx: int, wrap_idx: int, require_all_valid: bool = True):
+    def _extract_wrap_world_surface_by_index(self, patch_idx: int, wrap_idx: int, require_all_valid: bool = True):
         """Extract one wrap surface by (patch_idx, wrap_idx)."""
         patch = self.patches[patch_idx]
         wrap = patch.wraps[wrap_idx]
