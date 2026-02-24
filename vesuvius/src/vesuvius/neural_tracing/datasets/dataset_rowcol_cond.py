@@ -1,10 +1,11 @@
-import edt
 import zarr
 import vesuvius.tifxyz as tifxyz
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 import json
+import hashlib
+import pickle
 import tifffile
 from pathlib import Path
 from vesuvius.neural_tracing.datasets.common import ChunkPatch, compute_heatmap_targets, voxelize_surface_grid
@@ -13,21 +14,103 @@ from vesuvius.models.augmentation.pipelines.training_transforms import create_tr
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import random
 from vesuvius.neural_tracing.datasets.extrapolation import compute_extrapolation
-import cv2
+from vesuvius.tifxyz.upsampling import interpolate_at_points
 from scipy import ndimage
 from collections import OrderedDict
 import warnings
-
+import re
 import os
-os.environ['OMP_NUM_THREADS'] = '1' # this is set to 1 because by default the edt package uses omp to threads the edt call
-                                    # which is problematic if you use multiple dataloader workers (thread contention smokes cpu)
-
+from functools import lru_cache
 
 class EdtSegDataset(Dataset):
+    @staticmethod
+    def _parse_z_range(z_range):
+        if z_range is None:
+            return None
+        if not isinstance(z_range, (list, tuple)) or len(z_range) != 2:
+            raise ValueError(f"dataset z_range must be [z_min, z_max], got {z_range!r}")
+        z_min = float(z_range[0])
+        z_max = float(z_range[1])
+        if not np.isfinite(z_min) or not np.isfinite(z_max):
+            raise ValueError(f"dataset z_range must contain finite numbers, got {z_range!r}")
+        if z_min > z_max:
+            z_min, z_max = z_max, z_min
+        return z_min, z_max
+
+    @staticmethod
+    def _segment_z_bounds(seg):
+        valid = seg._valid_mask
+        if not np.any(valid):
+            return None
+        if seg.bbox is not None:
+            # Segment bbox is in XYZ order: (x_min, y_min, z_min, x_max, y_max, z_max)
+            z_min = float(seg.bbox[2])
+            z_max = float(seg.bbox[5])
+        else:
+            z_vals = seg._z[valid]
+            z_min = float(np.min(z_vals))
+            z_max = float(np.max(z_vals))
+        return z_min, z_max
+
+    @classmethod
+    def _segment_overlaps_z_range(cls, seg, z_range):
+        if z_range is None:
+            return True
+        z_bounds = cls._segment_z_bounds(seg)
+        if z_bounds is None:
+            return False
+        seg_z_min, seg_z_max = z_bounds
+        z_min, z_max = z_range
+        return not (seg_z_min > z_max or seg_z_max < z_min)
+
+    @staticmethod
+    def _extract_wrap_ids(name: str):
+        if not name:
+            return tuple()
+        wrap_ids = sorted({int(m.group(1)) for m in re.finditer(r"w(\d+)", str(name))})
+        return tuple(wrap_ids)
+
+    @staticmethod
+    def _has_consecutive_wrap_ids(left_ids, right_ids):
+        if not left_ids or not right_ids:
+            return False
+        right_set = set(right_ids)
+        for wrap_id in left_ids:
+            if (wrap_id - 1) in right_set or (wrap_id + 1) in right_set:
+                return True
+        return False
+
+    @staticmethod
+    def _triplet_wraps_compatible(target_wrap_meta: dict, other_wrap_meta: dict):
+        if target_wrap_meta["segment_idx"] == other_wrap_meta["segment_idx"]:
+            return True
+        return EdtSegDataset._has_consecutive_wrap_ids(
+            target_wrap_meta.get("wrap_ids", tuple()),
+            other_wrap_meta.get("wrap_ids", tuple()),
+        )
+
+    @staticmethod
+    def _wrap_bbox_has_overlap(mask: np.ndarray, bbox_2d):
+        if mask is None:
+            return False
+        mask_arr = np.asarray(mask)
+        if mask_arr.ndim != 2 or mask_arr.size == 0:
+            return False
+        r_min, r_max, c_min, c_max = [int(v) for v in bbox_2d]
+        h, w = mask_arr.shape
+        r0 = max(0, r_min)
+        r1 = min(h - 1, r_max)
+        c0 = max(0, c_min)
+        c1 = min(w - 1, c_max)
+        if r1 < r0 or c1 < c0:
+            return False
+        return bool(np.any(mask_arr[r0:r1 + 1, c0:c1 + 1]))
+
     def __init__(
             self,
             config,
-            apply_augmentation: bool = True
+            apply_augmentation: bool = True,
+            patch_metadata=None
     ):
         self.config = config
         self.apply_augmentation = apply_augmentation
@@ -64,22 +147,27 @@ class EdtSegDataset(Dataset):
         config.setdefault('other_wrap_prob', 0.5)  # probability of including other wraps when available
         config.setdefault('sample_mode', 'wrap')  # 'wrap' = each wrap is a sample, 'chunk' = random wrap per chunk
         config.setdefault('use_triplet_wrap_displacement', False)
-        config.setdefault('triplet_dense_weight_mode', 'band')  # band|conditioning|all|neighbors
+        config.setdefault('triplet_dense_weight_mode', 'band')  # band|all
         config.setdefault('triplet_band_padding_voxels', 4.0)
+        config.setdefault('triplet_edt_bbox_padding_voxels', 4.0)
         config.setdefault('triplet_band_distance_percentile', 95.0)
-        config.setdefault('triplet_dense_roi_enabled', True)
-        config.setdefault('triplet_dense_roi_padding_voxels', 8.0)
-        config.setdefault('triplet_dense_roi_adaptive_padding', False)
-        config.setdefault('triplet_dense_roi_max_padding_voxels', 128.0)
-        config.setdefault('triplet_surface_cache_max_items', 2048)
-        config.setdefault('triplet_order_abs_margin', 0.25)
-        config.setdefault('triplet_order_rel_margin', 0.08)
-        config.setdefault('triplet_order_warn_drop_fraction', 0.05)
-        config.setdefault('triplet_order_min_band_points', 32)
-        config.setdefault('triplet_order_debug_examples', 0)
-        config.setdefault('enable_volume_crop_cache', True)
-        config.setdefault('volume_crop_cache_max_items', 8)
-        config.setdefault('validate_result_tensors', True)
+        config.setdefault('triplet_gt_vector_dilation_radius', 0.0)
+        config.setdefault('use_triplet_direction_priors', True)
+        config.setdefault('triplet_direction_prior_mask', 'cond')  # cond|full
+        config.setdefault('triplet_random_channel_swap_prob', 0.5)
+        config.setdefault('triplet_surface_cache_max_items', 0)
+        config.setdefault('triplet_overlap_mask_filename', 'overlap_mask.tif')
+        config.setdefault('triplet_warn_missing_overlap_masks', False)
+        config.setdefault('triplet_lookup_cache_enabled', True)
+        config.setdefault('triplet_lookup_cache_dir', None)
+        config.setdefault('triplet_close_check_enabled', True)
+        config.setdefault('triplet_close_distance_voxels', 1.0)
+        config.setdefault('triplet_close_fraction_threshold', 0.05)
+        config.setdefault('triplet_close_print', True)
+        config.setdefault('enable_volume_crop_cache', False)
+        config.setdefault('volume_crop_cache_max_items', 0)
+        config.setdefault('validate_result_tensors', False)
+        config.setdefault('dense_edt_backend', 'scipy')  # scipy|auto|cucim
 
         config.setdefault('overlap_fraction', 0.0)
         config.setdefault('min_span_ratio', 1.0)
@@ -126,6 +214,60 @@ class EdtSegDataset(Dataset):
             )
         self.use_dense_displacement = bool(config.get('use_dense_displacement', False))
         self.use_triplet_wrap_displacement = bool(config.get('use_triplet_wrap_displacement', False))
+        self.dense_edt_backend_mode = str(config.get('dense_edt_backend', 'scipy')).lower()
+        if self.dense_edt_backend_mode not in {'scipy', 'auto', 'cucim'}:
+            raise ValueError(
+                "dense_edt_backend must be one of {'scipy', 'auto', 'cucim'}, "
+                f"got {self.dense_edt_backend_mode!r}"
+            )
+        self._dense_edt_backend = None
+        self._dense_edt_backend_fallback_warned = False
+        self._cupy = None
+        self._cucim_distance_transform_edt = None
+        self.use_triplet_direction_priors = bool(config.get('use_triplet_direction_priors', True))
+        self.triplet_direction_prior_mask = str(config.get('triplet_direction_prior_mask', 'cond')).lower()
+        if self.triplet_direction_prior_mask not in {'cond', 'full'}:
+            raise ValueError(
+                "triplet_direction_prior_mask must be 'cond' or 'full', "
+                f"got {self.triplet_direction_prior_mask!r}"
+            )
+        self.triplet_random_channel_swap_prob = float(config.get('triplet_random_channel_swap_prob', 0.5))
+        if not np.isfinite(self.triplet_random_channel_swap_prob):
+            raise ValueError(
+                f"triplet_random_channel_swap_prob must be finite, got {self.triplet_random_channel_swap_prob!r}"
+            )
+        if self.triplet_random_channel_swap_prob < 0.0 or self.triplet_random_channel_swap_prob > 1.0:
+            raise ValueError(
+                "triplet_random_channel_swap_prob must satisfy 0 <= p <= 1, "
+                f"got {self.triplet_random_channel_swap_prob}"
+            )
+        self.triplet_close_check_enabled = bool(config.get('triplet_close_check_enabled', True))
+        self.triplet_close_distance_voxels = float(config.get('triplet_close_distance_voxels', 1.0))
+        if not np.isfinite(self.triplet_close_distance_voxels) or self.triplet_close_distance_voxels < 0.0:
+            raise ValueError(
+                "triplet_close_distance_voxels must be finite and >= 0, "
+                f"got {self.triplet_close_distance_voxels!r}"
+            )
+        self.triplet_close_fraction_threshold = float(config.get('triplet_close_fraction_threshold', 0.05))
+        if (
+            not np.isfinite(self.triplet_close_fraction_threshold) or
+            self.triplet_close_fraction_threshold < 0.0 or
+            self.triplet_close_fraction_threshold > 1.0
+        ):
+            raise ValueError(
+                "triplet_close_fraction_threshold must satisfy 0 <= threshold <= 1, "
+                f"got {self.triplet_close_fraction_threshold!r}"
+            )
+        self.triplet_edt_bbox_padding_voxels = float(config.get('triplet_edt_bbox_padding_voxels', 4.0))
+        if (
+            not np.isfinite(self.triplet_edt_bbox_padding_voxels) or
+            self.triplet_edt_bbox_padding_voxels < 0.0
+        ):
+            raise ValueError(
+                "triplet_edt_bbox_padding_voxels must be finite and >= 0, "
+                f"got {self.triplet_edt_bbox_padding_voxels!r}"
+            )
+        self.triplet_close_print = bool(config.get('triplet_close_print', True))
         if self.displacement_supervision == 'normal_scalar' and self.use_dense_displacement:
             raise ValueError("displacement_supervision='normal_scalar' is not supported with use_dense_displacement=True")
         if self.use_triplet_wrap_displacement:
@@ -141,6 +283,13 @@ class EdtSegDataset(Dataset):
                 raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_heatmap_targets")
             if config.get('use_segmentation', False):
                 raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_segmentation")
+            if not np.isclose(self.triplet_random_channel_swap_prob, 0.5, atol=1e-8):
+                warnings.warn(
+                    "Triplet mode treats the two displacement branches as unordered; "
+                    "overriding triplet_random_channel_swap_prob to 0.5.",
+                    RuntimeWarning,
+                )
+                self.triplet_random_channel_swap_prob = 0.5
         self._needs_point_normals = self.displacement_supervision == 'normal_scalar'
         self._validate_result_tensors_enabled = bool(config.get('validate_result_tensors', True))
 
@@ -155,125 +304,169 @@ class EdtSegDataset(Dataset):
         else:
             self._augmentations = None
 
-        patches = []
-
-        for dataset in config['datasets']:
-            volume_path = dataset['volume_path']
-            volume_scale = dataset['volume_scale']
-            volume = zarr.open_group(volume_path, mode='r')
-            segments_path = dataset['segments_path']
-            dataset_segments = list(tifxyz.load_folder(segments_path))
-
-            # retarget to the proper scale
-            retarget_factor = 2 ** volume_scale
-            scaled_segments = []
-            for i, seg in enumerate(dataset_segments):
-                if i == 0:
-                    if config['verbose']:
-                        print(f"  [DEBUG PRE-RETARGET] seg._scale={seg._scale}, shape={seg._z.shape}")
-                        print(f"  [DEBUG PRE-RETARGET] z range: {seg._z[seg._valid_mask].min():.2f} to {seg._z[seg._valid_mask].max():.2f}")
-                seg_scaled = seg.retarget(retarget_factor)
-                if i == 0:
-                    if config['verbose']:
-                        print(f"  [DEBUG POST-RETARGET factor={retarget_factor}] seg._scale={seg_scaled._scale}, shape={seg_scaled._z.shape}")
-                        print(f"  [DEBUG POST-RETARGET] z range: {seg_scaled._z[seg_scaled._valid_mask].min():.2f} to {seg_scaled._z[seg_scaled._valid_mask].max():.2f}")
-                seg_scaled.volume = volume
-                scaled_segments.append(seg_scaled)
-
-            ref_scale = int(config.get('patch_count_reference_scale', 0))
-            if config.get('scale_normalize_patch_counts', True):
-                count_scale = float(2 ** (volume_scale - ref_scale))
-                count_scale_sq = count_scale * count_scale
-            else:
-                count_scale_sq = 1.0
-
-            min_points_per_wrap = max(1, int(round(
-                float(config.get('min_points_per_wrap', 100)) * count_scale_sq
-            )))
-            edge_touch_min_count = max(1, int(round(
-                float(config.get('edge_touch_min_count', 10)) * count_scale_sq
-            )))
-
-            if config.get('verbose', False):
-                print(
-                    "  [DEBUG PATCH COUNTS] "
-                    f"volume_scale={volume_scale}, ref_scale={ref_scale}, "
-                    f"count_scale_sq={count_scale_sq:.3f}, "
-                    f"min_points_per_wrap={min_points_per_wrap}, "
-                    f"edge_touch_min_count={edge_touch_min_count}"
-                )
-
-            cache_dir = Path(segments_path) / ".patch_cache" if segments_path else None
-            chunk_results = find_world_chunk_patches(
-                segments=scaled_segments,
-                target_size=target_size,
-                overlap_fraction=config.get('overlap_fraction', 0.0),
-                min_span_ratio=config.get('min_span_ratio', 1.0),
-                edge_touch_frac=config.get('edge_touch_frac', 0.1),
-                edge_touch_min_count=edge_touch_min_count,
-                edge_touch_pad=config.get('edge_touch_pad', 0),
-                min_points_per_wrap=min_points_per_wrap,
-                bbox_pad_2d=config.get('bbox_pad_2d', 0),
-                require_all_valid_in_bbox=config.get('require_all_valid_in_bbox', True),
-                skip_chunk_if_any_invalid=config.get('skip_chunk_if_any_invalid', False),
-                inner_bbox_fraction=config.get('inner_bbox_fraction', 0.7),
-                cache_dir=cache_dir,
-                force_recompute=config.get('force_recompute_patches', False),
-                verbose=True,
-                chunk_pad=config.get('chunk_pad', 0.0),
-            )
-
-            for chunk in chunk_results:
-                wraps_in_chunk = []
-                for w in chunk["wraps"]:
-                    seg_idx = w["segment_idx"]
-                    wraps_in_chunk.append({
-                        "segment": scaled_segments[seg_idx],
-                        "bbox_2d": tuple(w["bbox_2d"]),
-                        "wrap_id": w["wrap_id"],
-                        "segment_idx": seg_idx,
-                    })
-
-                patches.append(ChunkPatch(
-                    chunk_id=tuple(chunk["chunk_id"]),
-                    volume=volume,
-                    scale=volume_scale,
-                    world_bbox=tuple(chunk["bbox_3d"]),
-                    wraps=wraps_in_chunk,
-                    segments=scaled_segments,
-                ))
-
-        self.patches = patches
         self.sample_mode = str(config.get('sample_mode', 'wrap')).lower()
         if self.sample_mode not in {'wrap', 'chunk'}:
             raise ValueError(f"sample_mode must be 'wrap' or 'chunk', got {self.sample_mode!r}")
-        self.sample_index = self._build_sample_index()
         self._triplet_neighbor_lookup = {}
         self._triplet_lookup_stats = {}
-        self._triplet_surface_cache_max_items = int(config.get('triplet_surface_cache_max_items', 2048))
+        self._triplet_overlap_kept_indices = tuple()
+
+        if patch_metadata is None:
+            patches = []
+            for dataset_idx, dataset in enumerate(config['datasets']):
+                volume_path = dataset['volume_path']
+                volume_scale = dataset['volume_scale']
+                volume = zarr.open_group(volume_path, mode='r')
+                segments_path = dataset['segments_path']
+                z_range = self._parse_z_range(dataset.get('z_range', None))
+                dataset_segments = list(tifxyz.load_folder(segments_path))
+
+                # retarget to the proper scale
+                retarget_factor = 2 ** volume_scale
+                scaled_segments = []
+                dropped_by_z_range = 0
+                for i, seg in enumerate(dataset_segments):
+                    if i == 0:
+                        if config['verbose']:
+                            print(f"  [DEBUG PRE-RETARGET] seg._scale={seg._scale}, shape={seg._z.shape}")
+                            print(f"  [DEBUG PRE-RETARGET] z range: {seg._z[seg._valid_mask].min():.2f} to {seg._z[seg._valid_mask].max():.2f}")
+                    seg_scaled = seg.retarget(retarget_factor)
+                    if i == 0:
+                        if config['verbose']:
+                            print(f"  [DEBUG POST-RETARGET factor={retarget_factor}] seg._scale={seg_scaled._scale}, shape={seg_scaled._z.shape}")
+                            print(f"  [DEBUG POST-RETARGET] z range: {seg_scaled._z[seg_scaled._valid_mask].min():.2f} to {seg_scaled._z[seg_scaled._valid_mask].max():.2f}")
+                    if not self._segment_overlaps_z_range(seg_scaled, z_range):
+                        dropped_by_z_range += 1
+                        continue
+                    seg_scaled.volume = volume
+                    scaled_segments.append(seg_scaled)
+
+                if z_range is not None and config.get('verbose', False):
+                    print(
+                        "  [DEBUG Z FILTER] "
+                        f"dataset_idx={dataset_idx}, z_range={z_range}, "
+                        f"kept={len(scaled_segments)}, dropped={dropped_by_z_range}"
+                    )
+
+                if not scaled_segments:
+                    warnings.warn(
+                        f"No segments remain after z_range filtering for dataset_idx={dataset_idx} "
+                        f"(segments_path={segments_path}, z_range={z_range}); skipping dataset entry."
+                    )
+                    continue
+
+                ref_scale = int(config.get('patch_count_reference_scale', 0))
+                if config.get('scale_normalize_patch_counts', True):
+                    count_scale = float(2 ** (volume_scale - ref_scale))
+                    count_scale_sq = count_scale * count_scale
+                else:
+                    count_scale_sq = 1.0
+
+                min_points_per_wrap = max(1, int(round(
+                    float(config.get('min_points_per_wrap', 100)) * count_scale_sq
+                )))
+                edge_touch_min_count = max(1, int(round(
+                    float(config.get('edge_touch_min_count', 10)) * count_scale_sq
+                )))
+
+                if config.get('verbose', False):
+                    print(
+                        "  [DEBUG PATCH COUNTS] "
+                        f"volume_scale={volume_scale}, ref_scale={ref_scale}, "
+                        f"count_scale_sq={count_scale_sq:.3f}, "
+                        f"min_points_per_wrap={min_points_per_wrap}, "
+                        f"edge_touch_min_count={edge_touch_min_count}"
+                    )
+
+                cache_dir = Path(segments_path) / ".patch_cache" if segments_path else None
+                chunk_results = find_world_chunk_patches(
+                    segments=scaled_segments,
+                    target_size=target_size,
+                    overlap_fraction=config.get('overlap_fraction', 0.0),
+                    min_span_ratio=config.get('min_span_ratio', 1.0),
+                    edge_touch_frac=config.get('edge_touch_frac', 0.1),
+                    edge_touch_min_count=edge_touch_min_count,
+                    edge_touch_pad=config.get('edge_touch_pad', 0),
+                    min_points_per_wrap=min_points_per_wrap,
+                    bbox_pad_2d=config.get('bbox_pad_2d', 0),
+                    require_all_valid_in_bbox=config.get('require_all_valid_in_bbox', True),
+                    skip_chunk_if_any_invalid=config.get('skip_chunk_if_any_invalid', False),
+                    inner_bbox_fraction=config.get('inner_bbox_fraction', 0.7),
+                    cache_dir=cache_dir,
+                    force_recompute=config.get('force_recompute_patches', False),
+                    verbose=config.get('verbose', False),
+                    chunk_pad=config.get('chunk_pad', 0.0),
+                )
+
+                for chunk in chunk_results:
+                    wraps_in_chunk = []
+                    for w in chunk["wraps"]:
+                        seg_idx = w["segment_idx"]
+                        wraps_in_chunk.append({
+                            "segment": scaled_segments[seg_idx],
+                            "bbox_2d": tuple(w["bbox_2d"]),
+                            "wrap_id": w["wrap_id"],
+                            "segment_idx": seg_idx,
+                        })
+
+                    patches.append(ChunkPatch(
+                        chunk_id=tuple(chunk["chunk_id"]),
+                        volume=volume,
+                        scale=volume_scale,
+                        world_bbox=tuple(chunk["bbox_3d"]),
+                        wraps=wraps_in_chunk,
+                        segments=scaled_segments,
+                    ))
+
+            triplet_cache_path = None
+            loaded_triplet_cache = False
+            cached_sample_index = None
+            if self.use_triplet_wrap_displacement:
+                if self.sample_mode != 'wrap':
+                    raise ValueError("use_triplet_wrap_displacement=True requires sample_mode='wrap'")
+                triplet_cache_path = self._resolve_triplet_lookup_cache_path(patches)
+                if triplet_cache_path is not None:
+                    loaded_triplet_cache, patches, cached_sample_index = self._try_load_triplet_lookup_cache(
+                        triplet_cache_path,
+                        patches,
+                    )
+                if not loaded_triplet_cache:
+                    patches = self._filter_triplet_overlap_chunks(patches)
+
+            self.patches = patches
+            if loaded_triplet_cache:
+                self.sample_index = cached_sample_index
+            else:
+                self.sample_index = self._build_sample_index()
+                if self.use_triplet_wrap_displacement:
+                    self._triplet_neighbor_lookup = self._build_triplet_neighbor_lookup()
+                    self.sample_index = [
+                        (patch_idx, wrap_idx)
+                        for patch_idx, wrap_idx in self.sample_index
+                        if (patch_idx, wrap_idx) in self._triplet_neighbor_lookup
+                    ]
+                    if not self.sample_index:
+                        raise ValueError(
+                            "Triplet mode enabled but no wraps have same/adjacent neighbors on both sides."
+                        )
+                    if triplet_cache_path is not None:
+                        self._save_triplet_lookup_cache(triplet_cache_path)
+            self._cond_percent_min, self._cond_percent_max = self._parse_cond_percent()
+        else:
+            self._load_patch_metadata(patch_metadata)
+
+        self._triplet_surface_cache_max_items = int(config.get('triplet_surface_cache_max_items', 0))
         if self._triplet_surface_cache_max_items < 0:
             self._triplet_surface_cache_max_items = 0
         self._triplet_surface_cache = OrderedDict()
-        self._enable_volume_crop_cache = bool(config.get('enable_volume_crop_cache', True))
-        self._volume_crop_cache_max_items = int(config.get('volume_crop_cache_max_items', 8))
+        self._enable_volume_crop_cache = bool(config.get('enable_volume_crop_cache', False))
+        self._volume_crop_cache_max_items = int(config.get('volume_crop_cache_max_items', 0))
         if self._volume_crop_cache_max_items < 0:
             self._volume_crop_cache_max_items = 0
         self._volume_crop_cache = OrderedDict()
         self._dense_axis_cache = {}
-        if self.use_triplet_wrap_displacement:
-            if self.sample_mode != 'wrap':
-                raise ValueError("use_triplet_wrap_displacement=True requires sample_mode='wrap'")
-            self._triplet_neighbor_lookup = self._build_triplet_neighbor_lookup()
-            self.sample_index = [
-                (patch_idx, wrap_idx)
-                for patch_idx, wrap_idx in self.sample_index
-                if (patch_idx, wrap_idx) in self._triplet_neighbor_lookup
-            ]
-            if not self.sample_index:
-                raise ValueError(
-                    "Triplet mode enabled but no wraps have same-segment neighbors on both sides."
-                )
-        self._cond_percent_min, self._cond_percent_max = self._parse_cond_percent()
+        self._cc_structure_26 = np.ones((3, 3, 3), dtype=np.uint8)
+        self._closing_structure_3 = np.ones((3, 3, 3), dtype=bool)
 
         if config.get('verbose', False):
             total_wraps = sum(len(p.wraps) for p in self.patches)
@@ -298,6 +491,277 @@ class EdtSegDataset(Dataset):
             for wrap_idx in range(len(patch.wraps)):
                 sample_index.append((patch_idx, wrap_idx))
         return sample_index
+
+    def _filter_triplet_overlap_chunks(self, patches):
+        """Drop triplet chunks that include any wrap overlap inside that wrap's bbox."""
+        mask_filename = str(self.config.get("triplet_overlap_mask_filename", "overlap_mask.tif"))
+        warn_missing_masks = bool(self.config.get("triplet_warn_missing_overlap_masks", True))
+        mask_cache = {}
+        warned_missing = set()
+        warned_load_fail = set()
+        filter_stats = {
+            "chunks_total": len(patches),
+            "chunks_dropped_overlap": 0,
+            "chunks_kept": 0,
+            "missing_masks": 0,
+        }
+        kept = []
+        kept_indices = []
+
+        for patch_idx, patch in enumerate(patches):
+            drop_chunk = False
+            for wrap in patch.wraps:
+                seg = wrap.get("segment")
+                seg_path = getattr(seg, "path", None)
+                if seg_path is None:
+                    continue
+                seg_path = Path(seg_path)
+                mask_path = seg_path / mask_filename
+                mask_key = str(mask_path)
+
+                if mask_key not in mask_cache:
+                    if not mask_path.exists():
+                        mask_cache[mask_key] = None
+                        filter_stats["missing_masks"] += 1
+                        if warn_missing_masks and mask_key not in warned_missing:
+                            warned_missing.add(mask_key)
+                            warnings.warn(
+                                f"Triplet overlap mask not found at {mask_path}; treating as no-overlap for this wrap.",
+                                RuntimeWarning,
+                            )
+                    else:
+                        try:
+                            loaded_mask = tifffile.imread(str(mask_path))
+                            loaded_mask = np.asarray(loaded_mask)
+                            if loaded_mask.ndim > 2:
+                                loaded_mask = np.squeeze(loaded_mask)
+                            if loaded_mask.ndim != 2:
+                                raise ValueError(
+                                    f"Expected 2D overlap mask, got shape {loaded_mask.shape} at {mask_path}"
+                                )
+                            mask_cache[mask_key] = loaded_mask > 0
+                        except Exception as exc:
+                            mask_cache[mask_key] = None
+                            if warn_missing_masks and mask_key not in warned_load_fail:
+                                warned_load_fail.add(mask_key)
+                                warnings.warn(
+                                    f"Failed to load triplet overlap mask at {mask_path}: {exc}; "
+                                    "treating as no-overlap for this wrap.",
+                                    RuntimeWarning,
+                                )
+
+                overlap_mask = mask_cache.get(mask_key)
+                if overlap_mask is None:
+                    continue
+
+                if self._wrap_bbox_has_overlap(overlap_mask, wrap["bbox_2d"]):
+                    drop_chunk = True
+                    break
+
+            if drop_chunk:
+                filter_stats["chunks_dropped_overlap"] += 1
+            else:
+                kept.append(patch)
+                kept_indices.append(int(patch_idx))
+                filter_stats["chunks_kept"] += 1
+
+        self._triplet_overlap_filter_stats = filter_stats
+        self._triplet_overlap_kept_indices = tuple(kept_indices)
+        if filter_stats["chunks_dropped_overlap"] > 0 and self.config.get("verbose", False):
+            print(
+                "Triplet overlap filtering: "
+                f"kept={filter_stats['chunks_kept']}/{filter_stats['chunks_total']}, "
+                f"dropped={filter_stats['chunks_dropped_overlap']}, "
+                f"missing_masks={filter_stats['missing_masks']}"
+            )
+        return kept
+
+    def _resolve_triplet_lookup_cache_path(self, patches):
+        if not self.use_triplet_wrap_displacement:
+            return None
+        if not bool(self.config.get("triplet_lookup_cache_enabled", True)):
+            return None
+        if len(patches) == 0:
+            return None
+
+        cache_dir_cfg = self.config.get("triplet_lookup_cache_dir", None)
+        cache_dir = Path(cache_dir_cfg) if cache_dir_cfg else Path("/tmp/vesuvius_triplet_lookup_cache")
+
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            cache_dir = Path("/tmp/vesuvius_triplet_lookup_cache")
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return None
+
+        cache_key = self._compute_triplet_lookup_cache_key(patches)
+        return cache_dir / f"triplet_lookup_{cache_key}.pkl"
+
+    def _compute_triplet_lookup_cache_key(self, patches):
+        key_cfg = {
+            "version": 4,
+            "sample_mode": self.sample_mode,
+            "triplet_overlap_mask_filename": str(self.config.get("triplet_overlap_mask_filename", "overlap_mask.tif")),
+            "triplet_dense_weight_mode": str(self.config.get("triplet_dense_weight_mode", "band")),
+            "triplet_band_distance_percentile": float(self.config.get("triplet_band_distance_percentile", 95.0)),
+            "triplet_band_padding_voxels": float(self.config.get("triplet_band_padding_voxels", 4.0)),
+            "triplet_gt_vector_dilation_radius": float(self.config.get("triplet_gt_vector_dilation_radius", 0.0)),
+            "crop_size": tuple(int(v) for v in self.crop_size),
+        }
+        hasher = hashlib.sha256()
+        hasher.update(json.dumps(key_cfg, sort_keys=True).encode("utf-8"))
+
+        for patch in patches:
+            hasher.update(np.asarray(patch.chunk_id, dtype=np.int64).tobytes())
+            hasher.update(np.asarray(patch.world_bbox, dtype=np.float64).tobytes())
+            hasher.update(np.asarray([int(patch.scale), int(len(patch.wraps))], dtype=np.int64).tobytes())
+            for wrap in patch.wraps:
+                seg = wrap.get("segment")
+                seg_path = str(getattr(seg, "path", ""))
+                hasher.update(seg_path.encode("utf-8", errors="ignore"))
+                hasher.update(b"\0")
+                hasher.update(np.asarray(wrap.get("bbox_2d", (0, 0, 0, 0)), dtype=np.int64).tobytes())
+                hasher.update(
+                    np.asarray(
+                        [int(wrap.get("segment_idx", -1)), int(wrap.get("wrap_id", -1))],
+                        dtype=np.int64,
+                    ).tobytes()
+                )
+        return hasher.hexdigest()
+
+    def _try_load_triplet_lookup_cache(self, cache_path: Path, patches):
+        try:
+            with cache_path.open("rb") as f:
+                payload = pickle.load(f)
+        except (OSError, pickle.UnpicklingError, EOFError):
+            return False, patches, None
+
+        kept_indices = payload.get("kept_patch_indices", ())
+        if not isinstance(kept_indices, (list, tuple)):
+            return False, patches, None
+
+        kept_indices = [int(i) for i in kept_indices]
+        if any((i < 0 or i >= len(patches)) for i in kept_indices):
+            return False, patches, None
+
+        cached_patches = [patches[i] for i in kept_indices]
+        if len(cached_patches) == 0:
+            return False, patches, None
+
+        triplet_lookup = payload.get("triplet_neighbor_lookup", {})
+        if not isinstance(triplet_lookup, dict) or len(triplet_lookup) == 0:
+            return False, patches, None
+
+        remapped_lookup = {}
+        for key, value in triplet_lookup.items():
+            if not (isinstance(key, tuple) and len(key) == 2):
+                continue
+            patch_idx = int(key[0])
+            wrap_idx = int(key[1])
+            if patch_idx < 0 or patch_idx >= len(cached_patches):
+                continue
+            if wrap_idx < 0 or wrap_idx >= len(cached_patches[patch_idx].wraps):
+                continue
+            remapped_lookup[(patch_idx, wrap_idx)] = value
+        if len(remapped_lookup) == 0:
+            return False, patches, None
+
+        sample_index_raw = payload.get("sample_index", ())
+        if not isinstance(sample_index_raw, (list, tuple)):
+            return False, patches, None
+
+        sample_index = []
+        for pair in sample_index_raw:
+            if not (isinstance(pair, (list, tuple)) and len(pair) == 2):
+                continue
+            patch_idx = int(pair[0])
+            wrap_idx = int(pair[1])
+            if patch_idx < 0 or patch_idx >= len(cached_patches):
+                continue
+            if wrap_idx < 0 or wrap_idx >= len(cached_patches[patch_idx].wraps):
+                continue
+            if (patch_idx, wrap_idx) not in remapped_lookup:
+                continue
+            sample_index.append((patch_idx, wrap_idx))
+        if len(sample_index) == 0:
+            return False, patches, None
+
+        self._triplet_neighbor_lookup = remapped_lookup
+        self._triplet_lookup_stats = payload.get("triplet_lookup_stats", {})
+        self._triplet_overlap_filter_stats = payload.get("triplet_overlap_filter_stats", {})
+        self._triplet_overlap_kept_indices = tuple(kept_indices)
+        return True, cached_patches, sample_index
+
+    def _save_triplet_lookup_cache(self, cache_path: Path):
+        kept_indices = tuple(int(i) for i in getattr(self, "_triplet_overlap_kept_indices", tuple()))
+        if len(kept_indices) == 0:
+            return
+        if len(self._triplet_neighbor_lookup) == 0:
+            return
+        if len(self.sample_index) == 0:
+            return
+
+        payload = {
+            "kept_patch_indices": kept_indices,
+            "triplet_neighbor_lookup": self._triplet_neighbor_lookup,
+            "sample_index": tuple(self.sample_index),
+            "triplet_lookup_stats": self._triplet_lookup_stats,
+            "triplet_overlap_filter_stats": getattr(self, "_triplet_overlap_filter_stats", {}),
+        }
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        try:
+            with tmp_path.open("wb") as f:
+                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, cache_path)
+        except OSError:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+
+    def _load_patch_metadata(self, patch_metadata):
+        metadata_triplet_mode = bool(
+            patch_metadata.get('use_triplet_wrap_displacement', self.use_triplet_wrap_displacement)
+        )
+        if metadata_triplet_mode != self.use_triplet_wrap_displacement:
+            raise ValueError(
+                "patch_metadata triplet mode does not match dataset config: "
+                f"metadata={metadata_triplet_mode}, config={self.use_triplet_wrap_displacement}"
+            )
+        sample_mode = patch_metadata.get('sample_mode', self.sample_mode)
+        if sample_mode not in {'wrap', 'chunk'}:
+            raise ValueError(f"Invalid sample_mode in patch_metadata: {sample_mode!r}")
+        if sample_mode != self.sample_mode:
+            raise ValueError(
+                "patch_metadata sample_mode does not match dataset config: "
+                f"metadata={sample_mode}, config={self.sample_mode}"
+            )
+        self.sample_mode = sample_mode
+        self.patches = patch_metadata['patches']
+        self.sample_index = list(patch_metadata['sample_index'])
+        self._triplet_neighbor_lookup = patch_metadata.get('triplet_neighbor_lookup', {})
+        self._triplet_lookup_stats = patch_metadata.get('triplet_lookup_stats', {})
+        self._triplet_overlap_filter_stats = patch_metadata.get('triplet_overlap_filter_stats', {})
+        self._triplet_overlap_kept_indices = tuple(
+            int(i) for i in patch_metadata.get('triplet_overlap_kept_indices', tuple())
+        )
+        self._cond_percent_min, self._cond_percent_max = patch_metadata['cond_percent']
+
+    def export_patch_metadata(self):
+        return {
+            'sample_mode': self.sample_mode,
+            'patches': self.patches,
+            'sample_index': tuple(self.sample_index),
+            'triplet_neighbor_lookup': self._triplet_neighbor_lookup,
+            'triplet_lookup_stats': self._triplet_lookup_stats,
+            'triplet_overlap_filter_stats': getattr(self, '_triplet_overlap_filter_stats', {}),
+            'triplet_overlap_kept_indices': tuple(getattr(self, '_triplet_overlap_kept_indices', tuple())),
+            'cond_percent': (self._cond_percent_min, self._cond_percent_max),
+            'use_triplet_wrap_displacement': self.use_triplet_wrap_displacement,
+        }
 
     def _compute_wrap_order_stats(self, wrap):
         """Compute robust world-space stats/points used for triplet wrap ordering."""
@@ -351,236 +815,81 @@ class EdtSegDataset(Dataset):
             "points_zyx": points_zyx,
         }
 
-    @staticmethod
-    def _score_wrap_xy_distance_in_band(
-        points_zyx: np.ndarray,
-        band_z_min: float,
-        band_z_max: float,
-        center_y: float,
-        center_x: float,
-        min_band_points: int,
-    ):
-        """Return robust in-band XY distance score and robust in-band XY center."""
-        if points_zyx is None or points_zyx.size == 0:
-            return None
-        z_vals = points_zyx[:, 0]
-        in_band = (z_vals >= band_z_min) & (z_vals <= band_z_max)
-        if int(np.count_nonzero(in_band)) < int(min_band_points):
-            return None
-        pts = points_zyx[in_band]
-        if pts.size == 0:
-            return None
-        y_vals = pts[:, 1]
-        x_vals = pts[:, 2]
-        dy = y_vals - center_y
-        dx = x_vals - center_x
-        radial = np.sqrt((dy * dy) + (dx * dx))
-        if radial.size == 0 or not np.isfinite(radial).any():
-            return None
-        score = float(np.median(radial))
-        xy_center = np.array([float(np.median(y_vals)), float(np.median(x_vals))], dtype=np.float64)
-        if not np.isfinite(score) or not np.isfinite(xy_center).all():
-            return None
-        return {
-            "score": score,
-            "xy_center": xy_center,
-            "points_in_band": int(pts.shape[0]),
-        }
-
-    @staticmethod
-    def _volume_center_zyx(patch: ChunkPatch) -> np.ndarray:
-        """Global center of the source volume used by this patch, in ZYX coordinates."""
-        volume = patch.volume
-        if isinstance(volume, zarr.Group):
-            volume = volume[str(patch.scale)]
-        shape_zyx = np.array(volume.shape, dtype=np.float64)
-        return 0.5 * np.maximum(shape_zyx - 1.0, 0.0)
-
     def _build_triplet_neighbor_lookup(self):
         """Build (patch_idx, wrap_idx) -> neighbor-wrap metadata for triplet mode.
 
-        Adjacent neighbors are chosen from the per-segment wrap ordering. Then
-        we orient them so "front" is always the adjacent neighbor closer to the
-        volume center within the local Z band occupied by the candidate triplet,
-        and "behind" is the farther one.
+        A wrap is kept only when it has one compatible neighbor on each side in
+        local wrap ordering. Branches are intentionally unordered in triplet mode:
+        we assign a deterministic side-based mapping so channel layout is stable,
+        and rely on random branch swapping during training.
         """
         lookup = {}
-        abs_margin = max(0.0, float(self.config.get("triplet_order_abs_margin", 0.25)))
-        rel_margin = max(0.0, float(self.config.get("triplet_order_rel_margin", 0.08)))
-        warn_drop_fraction = float(self.config.get("triplet_order_warn_drop_fraction", 0.05))
-        warn_drop_fraction = float(np.clip(warn_drop_fraction, 0.0, 1.0))
-        min_band_points = max(1, int(self.config.get("triplet_order_min_band_points", 32)))
-        debug_examples = max(0, int(self.config.get("triplet_order_debug_examples", 0)))
-        debug_lines = []
         order_stats = {
             "candidate_triplets": 0,
             "kept_triplets": 0,
-            "dropped_ambiguous": 0,
-            "dropped_missing_band_points": 0,
+            "dropped_missing_neighbors": 0,
         }
-        sep_values = []
         for patch_idx, patch in enumerate(self.patches):
-            vol_center_zyx = self._volume_center_zyx(patch)
-            wraps_by_segment = {}
+            wrap_stats = []
             for wrap_idx, wrap in enumerate(patch.wraps):
-                wraps_by_segment.setdefault(wrap["segment_idx"], []).append((wrap_idx, wrap))
+                s = self._compute_wrap_order_stats(wrap)
+                if s is None:
+                    continue
+                seg = wrap.get("segment")
+                seg_path = getattr(seg, "path", None)
+                seg_name = Path(seg_path).name if seg_path is not None else ""
+                wrap_ids = self._extract_wrap_ids(seg_name)
+                if not wrap_ids:
+                    wrap_ids = self._extract_wrap_ids(getattr(seg, "uuid", ""))
+                wrap_stats.append({
+                    "wrap_idx": wrap_idx,
+                    "segment_idx": int(wrap["segment_idx"]),
+                    "wrap_ids": wrap_ids,
+                    "x_median": s["x_median"],
+                    "y_median": s["y_median"],
+                    "x_span": s["x_span"],
+                    "y_span": s["y_span"],
+                })
 
-            for segment_idx in sorted(wraps_by_segment):
-                wraps_in_seg = sorted(wraps_by_segment[segment_idx], key=lambda x: x[0])
-                if len(wraps_in_seg) < 3:
+            if len(wrap_stats) < 3:
+                continue
+
+            x_spans = np.array([s["x_span"] for s in wrap_stats], dtype=np.float32)
+            y_spans = np.array([s["y_span"] for s in wrap_stats], dtype=np.float32)
+            principal_axis = "x" if float(np.median(x_spans)) >= float(np.median(y_spans)) else "y"
+            order_axis = "y" if principal_axis == "x" else "x"
+
+            if order_axis == "x":
+                ordered = sorted(wrap_stats, key=lambda s: (s["x_median"], s["wrap_idx"]))
+            else:
+                ordered = sorted(wrap_stats, key=lambda s: (s["y_median"], s["wrap_idx"]))
+
+            for pos, target in enumerate(ordered):
+                prev_neighbor = None
+                for left_pos in range(pos - 1, -1, -1):
+                    candidate = ordered[left_pos]
+                    if self._triplet_wraps_compatible(target, candidate):
+                        prev_neighbor = candidate
+                        break
+
+                next_neighbor = None
+                for right_pos in range(pos + 1, len(ordered)):
+                    candidate = ordered[right_pos]
+                    if self._triplet_wraps_compatible(target, candidate):
+                        next_neighbor = candidate
+                        break
+
+                if prev_neighbor is None or next_neighbor is None:
+                    order_stats["dropped_missing_neighbors"] += 1
                     continue
 
-                wrap_stats = []
-                for wrap_idx, wrap in wraps_in_seg:
-                    s = self._compute_wrap_order_stats(wrap)
-                    if s is None:
-                        continue
-                    wrap_stats.append({
-                        "wrap_idx": wrap_idx,
-                        "z_median": s["z_median"],
-                        "z_min": s["z_min"],
-                        "z_max": s["z_max"],
-                        "x_median": s["x_median"],
-                        "y_median": s["y_median"],
-                        "x_span": s["x_span"],
-                        "y_span": s["y_span"],
-                        "points_zyx": s["points_zyx"],
-                    })
-
-                if len(wrap_stats) < 3:
-                    continue
-
-                x_spans = np.array([s["x_span"] for s in wrap_stats], dtype=np.float32)
-                y_spans = np.array([s["y_span"] for s in wrap_stats], dtype=np.float32)
-                principal_axis = "x" if float(np.median(x_spans)) >= float(np.median(y_spans)) else "y"
-                order_axis = "y" if principal_axis == "x" else "x"
-
-                if order_axis == "x":
-                    ordered = sorted(wrap_stats, key=lambda s: (s["x_median"], s["wrap_idx"]))
-                else:
-                    ordered = sorted(wrap_stats, key=lambda s: (s["y_median"], s["wrap_idx"]))
-
-                for pos in range(1, len(ordered) - 1):
-                    order_stats["candidate_triplets"] += 1
-                    target = ordered[pos]
-                    prev_neighbor = ordered[pos - 1]
-                    next_neighbor = ordered[pos + 1]
-
-                    # Use a z-band-aware center reference: clamp the global center Z
-                    # into the local Z band occupied by this triplet's wraps.
-                    band_z_min = min(
-                        target["z_min"], prev_neighbor["z_min"], next_neighbor["z_min"]
-                    )
-                    band_z_max = max(
-                        target["z_max"], prev_neighbor["z_max"], next_neighbor["z_max"]
-                    )
-                    center_z = float(np.clip(vol_center_zyx[0], band_z_min, band_z_max))
-                    prev_score = self._score_wrap_xy_distance_in_band(
-                        prev_neighbor["points_zyx"],
-                        band_z_min=band_z_min,
-                        band_z_max=band_z_max,
-                        center_y=float(vol_center_zyx[1]),
-                        center_x=float(vol_center_zyx[2]),
-                        min_band_points=min_band_points,
-                    )
-                    next_score = self._score_wrap_xy_distance_in_band(
-                        next_neighbor["points_zyx"],
-                        band_z_min=band_z_min,
-                        band_z_max=band_z_max,
-                        center_y=float(vol_center_zyx[1]),
-                        center_x=float(vol_center_zyx[2]),
-                        min_band_points=min_band_points,
-                    )
-                    if prev_score is None or next_score is None:
-                        order_stats["dropped_missing_band_points"] += 1
-                        if len(debug_lines) < debug_examples:
-                            debug_lines.append(
-                                f"drop missing-band patch={patch_idx} seg={segment_idx} "
-                                f"target={target['wrap_idx']} prev={prev_neighbor['wrap_idx']} next={next_neighbor['wrap_idx']} "
-                                f"z_band=[{band_z_min:.2f},{band_z_max:.2f}] center_z={center_z:.2f}"
-                            )
-                        continue
-
-                    sep_xy = float(np.linalg.norm(prev_score["xy_center"] - next_score["xy_center"]))
-                    if np.isfinite(sep_xy):
-                        sep_values.append(sep_xy)
-                    else:
-                        sep_xy = 0.0
-                    margin = max(abs_margin, rel_margin * sep_xy)
-                    gap = abs(prev_score["score"] - next_score["score"])
-
-                    if gap <= margin:
-                        order_stats["dropped_ambiguous"] += 1
-                        if len(debug_lines) < debug_examples:
-                            debug_lines.append(
-                                f"drop ambiguous patch={patch_idx} seg={segment_idx} target={target['wrap_idx']} "
-                                f"prev={prev_neighbor['wrap_idx']} next={next_neighbor['wrap_idx']} "
-                                f"prev_score={prev_score['score']:.3f} next_score={next_score['score']:.3f} "
-                                f"gap={gap:.3f} margin={margin:.3f} sep_xy={sep_xy:.3f}"
-                            )
-                        continue
-
-                    # Enforce orientation: front is the adjacent neighbor closer
-                    # to the z-band-aware XY volume center, behind is farther.
-                    if prev_score["score"] < next_score["score"]:
-                        front = prev_neighbor
-                        behind = next_neighbor
-                        front_score = prev_score["score"]
-                        behind_score = next_score["score"]
-                    elif next_score["score"] < prev_score["score"]:
-                        front = next_neighbor
-                        behind = prev_neighbor
-                        front_score = next_score["score"]
-                        behind_score = prev_score["score"]
-                    else:
-                        order_stats["dropped_ambiguous"] += 1
-                        continue
-                    lookup[(patch_idx, target["wrap_idx"])] = {
-                        "behind_wrap_idx": behind["wrap_idx"],
-                        "front_wrap_idx": front["wrap_idx"],
-                        "principal_axis": principal_axis,
-                        "order_axis": order_axis,
-                        "front_score": float(front_score),
-                        "behind_score": float(behind_score),
-                        "decision_gap": float(gap),
-                        "decision_margin": float(margin),
-                        "band_z_min": float(band_z_min),
-                        "band_z_max": float(band_z_max),
-                    }
-                    order_stats["kept_triplets"] += 1
-        dropped_total = int(order_stats["candidate_triplets"] - order_stats["kept_triplets"])
-        drop_fraction = (
-            float(dropped_total) / float(order_stats["candidate_triplets"])
-            if order_stats["candidate_triplets"] > 0 else 0.0
-        )
-        sep_arr = np.asarray(sep_values, dtype=np.float32)
-        sep_p10 = float(np.percentile(sep_arr, 10)) if sep_arr.size > 0 else 0.0
-        sep_p50 = float(np.percentile(sep_arr, 50)) if sep_arr.size > 0 else 0.0
-        sep_p90 = float(np.percentile(sep_arr, 90)) if sep_arr.size > 0 else 0.0
-        order_stats["drop_fraction"] = drop_fraction
-        order_stats["sep_xy_p10"] = sep_p10
-        order_stats["sep_xy_p50"] = sep_p50
-        order_stats["sep_xy_p90"] = sep_p90
+                order_stats["candidate_triplets"] += 1
+                lookup[(patch_idx, target["wrap_idx"])] = {
+                    "behind_wrap_idx": int(prev_neighbor["wrap_idx"]),
+                    "front_wrap_idx": int(next_neighbor["wrap_idx"]),
+                }
+                order_stats["kept_triplets"] += 1
         self._triplet_lookup_stats = order_stats
-        if dropped_total > 0:
-            base_msg = (
-                "Triplet ordering dropped candidates: "
-                f"kept={order_stats['kept_triplets']}/{order_stats['candidate_triplets']} "
-                f"(drop={drop_fraction * 100.0:.2f}%), "
-                f"ambiguous={order_stats['dropped_ambiguous']}, "
-                f"missing_band_points={order_stats['dropped_missing_band_points']}, "
-                f"sep_xy[p10/p50/p90]=[{sep_p10:.2f}, {sep_p50:.2f}, {sep_p90:.2f}]"
-            )
-            warnings.warn(base_msg, RuntimeWarning)
-            if drop_fraction >= warn_drop_fraction:
-                warnings.warn(
-                    "Triplet ordering drop fraction exceeded warning threshold: "
-                    f"drop={drop_fraction * 100.0:.2f}% threshold={warn_drop_fraction * 100.0:.2f}%",
-                    RuntimeWarning,
-                )
-        if debug_lines:
-            for line in debug_lines:
-                print(f"[triplet-order-debug] {line}")
         return lookup
 
     def _parse_cond_percent(self):
@@ -711,6 +1020,225 @@ class EdtSegDataset(Dataset):
                 return False
         return True
 
+    @staticmethod
+    def _estimate_triplet_unit_direction(disp_np: np.ndarray, cond_mask: np.ndarray):
+        """Estimate one robust unit direction from dense displacement on conditioning voxels."""
+        disp = np.asarray(disp_np, dtype=np.float32)
+        mask = np.asarray(cond_mask, dtype=bool)
+        if disp.ndim != 4 or disp.shape[0] != 3:
+            raise ValueError(f"disp_np must have shape (3, D, H, W), got {tuple(disp.shape)}")
+        if mask.shape != tuple(disp.shape[1:]):
+            raise ValueError(
+                f"cond_mask shape must match displacement spatial dims {tuple(disp.shape[1:])}, got {tuple(mask.shape)}"
+            )
+        if not bool(mask.any()):
+            return np.zeros((3,), dtype=np.float32)
+
+        vecs = disp[:, mask].T  # [N, 3]
+        if vecs.size == 0:
+            return np.zeros((3,), dtype=np.float32)
+        finite = np.isfinite(vecs).all(axis=1)
+        vecs = vecs[finite]
+        if vecs.shape[0] == 0:
+            return np.zeros((3,), dtype=np.float32)
+
+        mags = np.linalg.norm(vecs, axis=1)
+        vecs = vecs[mags > 1e-6]
+        if vecs.shape[0] == 0:
+            return np.zeros((3,), dtype=np.float32)
+
+        unit_vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True).clip(min=1e-6)
+        mean_vec = np.mean(unit_vecs, axis=0, dtype=np.float64).astype(np.float32, copy=False)
+        norm = float(np.linalg.norm(mean_vec))
+        if not np.isfinite(norm) or norm <= 1e-6:
+            return np.zeros((3,), dtype=np.float32)
+        return (mean_vec / norm).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _build_triplet_direction_priors(
+        crop_size,
+        cond_mask: np.ndarray,
+        ch0_dir: np.ndarray,
+        ch1_dir: np.ndarray,
+        mask_mode: str = 'cond',
+    ):
+        """Build broadcast direction priors for 2 triplet displacement branches."""
+        crop_size = tuple(int(v) for v in crop_size)
+        if len(crop_size) != 3:
+            raise ValueError(f"crop_size must be length 3, got {crop_size}")
+        priors = np.zeros((6, *crop_size), dtype=np.float32)
+        v0 = np.asarray(ch0_dir, dtype=np.float32).reshape(3)
+        v1 = np.asarray(ch1_dir, dtype=np.float32).reshape(3)
+        for axis in range(3):
+            priors[axis, ...] = v0[axis]
+            priors[axis + 3, ...] = v1[axis]
+
+        mode = str(mask_mode).lower()
+        if mode == 'cond':
+            mask = np.asarray(cond_mask, dtype=np.float32)
+            if mask.shape != crop_size:
+                raise ValueError(f"cond_mask shape must match crop_size {crop_size}, got {tuple(mask.shape)}")
+            priors *= mask[None]
+        elif mode != 'full':
+            raise ValueError(f"mask_mode must be 'cond' or 'full', got {mask_mode!r}")
+        return priors
+
+    @staticmethod
+    def _swap_triplet_branch_channels(dense_gt_np: np.ndarray, dir_priors_np: np.ndarray = None):
+        """Swap branch channel groups [0:3] and [3:6] for GT and optional priors."""
+        dense = np.asarray(dense_gt_np, dtype=np.float32)
+        if dense.ndim != 4 or dense.shape[0] < 6:
+            raise ValueError(f"dense_gt_np must have at least 6 channels, got shape {tuple(dense.shape)}")
+        swapped_dense = np.concatenate([dense[3:6], dense[0:3]], axis=0).astype(np.float32, copy=False)
+        if dir_priors_np is None:
+            return swapped_dense, None
+        priors = np.asarray(dir_priors_np, dtype=np.float32)
+        if priors.ndim != 4 or priors.shape[0] != 6:
+            raise ValueError(f"dir_priors_np must have shape (6, D, H, W), got {tuple(priors.shape)}")
+        swapped_priors = np.concatenate([priors[3:6], priors[0:3]], axis=0).astype(np.float32, copy=False)
+        return swapped_dense, swapped_priors
+
+    @staticmethod
+    def _fraction_within_distance(dist_map: np.ndarray, source_mask: np.ndarray, max_distance_voxels: float) -> float:
+        dist = np.asarray(dist_map, dtype=np.float32)
+        mask = np.asarray(source_mask, dtype=bool)
+        if dist.shape != mask.shape:
+            raise ValueError(
+                f"dist_map shape must match source_mask shape, got {tuple(dist.shape)} vs {tuple(mask.shape)}"
+            )
+        if not bool(mask.any()):
+            return 0.0
+        vals = dist[mask]
+        finite = np.isfinite(vals)
+        vals = vals[finite]
+        if vals.size == 0:
+            return 0.0
+        return float(np.mean(vals <= float(max_distance_voxels)))
+
+    @classmethod
+    def _triplet_close_contact_fractions(
+        cls,
+        cond_mask: np.ndarray,
+        behind_mask: np.ndarray,
+        front_mask: np.ndarray,
+        behind_disp_np: np.ndarray,
+        front_disp_np: np.ndarray,
+        max_distance_voxels: float,
+    ):
+        behind_disp = np.asarray(behind_disp_np, dtype=np.float32)
+        front_disp = np.asarray(front_disp_np, dtype=np.float32)
+        if behind_disp.ndim != 4 or behind_disp.shape[0] != 3:
+            raise ValueError(f"behind_disp_np must have shape (3, D, H, W), got {tuple(behind_disp.shape)}")
+        if front_disp.ndim != 4 or front_disp.shape[0] != 3:
+            raise ValueError(f"front_disp_np must have shape (3, D, H, W), got {tuple(front_disp.shape)}")
+
+        behind_dist = np.linalg.norm(behind_disp, axis=0)
+        front_dist = np.linalg.norm(front_disp, axis=0)
+
+        cond_behind_frac = cls._fraction_within_distance(behind_dist, cond_mask, max_distance_voxels)
+        cond_front_frac = cls._fraction_within_distance(front_dist, cond_mask, max_distance_voxels)
+        behind_to_front_frac = cls._fraction_within_distance(front_dist, behind_mask, max_distance_voxels)
+        front_to_behind_frac = cls._fraction_within_distance(behind_dist, front_mask, max_distance_voxels)
+        behind_front_frac = max(behind_to_front_frac, front_to_behind_frac)
+        return cond_behind_frac, cond_front_frac, behind_front_frac
+
+    @staticmethod
+    def _compute_triplet_edt_bbox(
+        cond_mask: np.ndarray,
+        behind_mask: np.ndarray,
+        front_mask: np.ndarray,
+        padding_voxels: float,
+    ):
+        """Return padded (z,y,x) slices for triplet EDT compute region, or None if empty."""
+        cond = np.asarray(cond_mask, dtype=bool)
+        behind = np.asarray(behind_mask, dtype=bool)
+        front = np.asarray(front_mask, dtype=bool)
+        if cond.shape != behind.shape or cond.shape != front.shape:
+            raise ValueError(
+                "triplet EDT bbox masks must share shape, "
+                f"got cond={tuple(cond.shape)} behind={tuple(behind.shape)} front={tuple(front.shape)}"
+            )
+        if cond.ndim != 3:
+            raise ValueError(f"triplet EDT bbox masks must be 3D, got shape {tuple(cond.shape)}")
+
+        union = cond | behind | front
+        if not union.any():
+            return None
+
+        pad = int(np.ceil(max(0.0, float(padding_voxels))))
+        zz, yy, xx = np.nonzero(union)
+        d, h, w = union.shape
+
+        z0 = max(0, int(zz.min()) - pad)
+        y0 = max(0, int(yy.min()) - pad)
+        x0 = max(0, int(xx.min()) - pad)
+        z1 = min(d - 1, int(zz.max()) + pad)
+        y1 = min(h - 1, int(yy.max()) + pad)
+        x1 = min(w - 1, int(xx.max()) + pad)
+        if z1 < z0 or y1 < y0 or x1 < x0:
+            return None
+        return (slice(z0, z1 + 1), slice(y0, y1 + 1), slice(x0, x1 + 1))
+
+    def _compute_dense_displacement_field_bbox(
+        self,
+        full_surface_mask: np.ndarray,
+        bbox_slices,
+        return_weights: bool = True,
+        return_distances: bool = False,
+    ):
+        """Compute dense displacement on a bbox and scatter outputs back to full volume."""
+        surface = np.asarray(full_surface_mask) > 0.5
+        if surface.ndim != 3:
+            raise ValueError(f"full_surface_mask must be 3D, got shape {tuple(surface.shape)}")
+        if not surface.any():
+            if return_distances:
+                return None, None, None
+            return None, None
+        if bbox_slices is None or len(bbox_slices) != 3:
+            raise ValueError("bbox_slices must be a tuple/list of (z, y, x) slices")
+
+        z_slice, y_slice, x_slice = bbox_slices
+        sub_surface = surface[z_slice, y_slice, x_slice]
+        if sub_surface.size == 0 or not sub_surface.any():
+            if return_distances:
+                return None, None, None
+            return None, None
+
+        if return_distances:
+            sub_disp, sub_weights, sub_dist = self._compute_dense_displacement_field(
+                sub_surface,
+                return_weights=return_weights,
+                return_distances=True,
+            )
+        else:
+            sub_disp, sub_weights = self._compute_dense_displacement_field(
+                sub_surface,
+                return_weights=return_weights,
+                return_distances=False,
+            )
+            sub_dist = None
+        if sub_disp is None:
+            if return_distances:
+                return None, None, None
+            return None, None
+
+        disp_full = np.zeros((3, *surface.shape), dtype=np.float32)
+        disp_full[:, z_slice, y_slice, x_slice] = sub_disp.astype(np.float32, copy=False)
+
+        if return_weights:
+            weights_full = np.zeros((1, *surface.shape), dtype=np.float32)
+            if sub_weights is not None:
+                weights_full[:, z_slice, y_slice, x_slice] = sub_weights.astype(np.float32, copy=False)
+        else:
+            weights_full = None
+
+        if return_distances:
+            dist_full = np.full(surface.shape, np.inf, dtype=np.float32)
+            if sub_dist is not None:
+                dist_full[z_slice, y_slice, x_slice] = sub_dist.astype(np.float32, copy=False)
+            return disp_full, weights_full, dist_full
+        return disp_full, weights_full
+
     def _getitem_triplet_wrap_displacement(self, idx: int, patch_idx: int, wrap_idx: int):
         patch = self.patches[patch_idx]
         triplet_meta = self._triplet_neighbor_lookup.get((patch_idx, wrap_idx))
@@ -797,104 +1325,124 @@ class EdtSegDataset(Dataset):
         cond_bin_full = cond_np > 0.5
         behind_bin_full = behind_np > 0.5
         front_bin_full = front_np > 0.5
-
-        full_slices = (
-            slice(0, int(crop_size[0])),
-            slice(0, int(crop_size[1])),
-            slice(0, int(crop_size[2])),
+        triplet_gt_vector_dilation_radius = max(
+            0.0,
+            float(self.config.get("triplet_gt_vector_dilation_radius", 0.0)),
         )
-        use_dense_roi = bool(self.config.get("triplet_dense_roi_enabled", True)) and weight_mode != "all"
-        dense_roi_slices = full_slices
-        dense_roi_bounds = None
-        roi_pad = max(0, int(round(float(self.config.get("triplet_dense_roi_padding_voxels", 8.0)))))
-        if use_dense_roi:
-            union_bin = cond_bin_full | behind_bin_full | front_bin_full
-            dense_roi_bounds = self._mask_bounds_zyx(union_bin)
-            if dense_roi_bounds is None:
-                return self[np.random.randint(len(self))]
-            dense_roi_slices = self._bounds_to_slices(dense_roi_bounds, roi_pad, crop_size)
+        if triplet_gt_vector_dilation_radius > 0.0:
+            behind_bin_for_gt = self._edt_dilate_binary_mask(
+                behind_bin_full,
+                triplet_gt_vector_dilation_radius,
+            )
+            front_bin_for_gt = self._edt_dilate_binary_mask(
+                front_bin_full,
+                triplet_gt_vector_dilation_radius,
+            )
+        else:
+            behind_bin_for_gt = behind_bin_full
+            front_bin_for_gt = front_bin_full
+        if not behind_bin_for_gt.any() or not front_bin_for_gt.any():
+            return self[np.random.randint(len(self))]
 
         band_padding = max(0.0, float(self.config.get("triplet_band_padding_voxels", 4.0)))
         band_pct = float(self.config.get("triplet_band_distance_percentile", 95.0))
         band_pct = min(100.0, max(1.0, band_pct))
 
-        adaptive_roi_for_band = (
-            need_neighbor_distances and
-            use_dense_roi and
-            bool(self.config.get("triplet_dense_roi_adaptive_padding", True))
-        )
-        roi_pad_max = max(int(crop_size[0]), int(crop_size[1]), int(crop_size[2]))
-        if adaptive_roi_for_band:
-            roi_pad_max = max(
-                roi_pad,
-                int(round(float(self.config.get("triplet_dense_roi_max_padding_voxels", float(roi_pad_max)))))
+        if need_neighbor_distances:
+            triplet_edt_bbox = self._compute_triplet_edt_bbox(
+                cond_mask=cond_bin_full,
+                behind_mask=behind_bin_for_gt,
+                front_mask=front_bin_for_gt,
+                padding_voxels=self.triplet_edt_bbox_padding_voxels,
             )
+            behind_disp_work = None
+            front_disp_work = None
+            d_behind_work = None
+            d_front_work = None
+            if triplet_edt_bbox is not None:
+                behind_disp_work, _, d_behind_work = self._compute_dense_displacement_field_bbox(
+                    behind_bin_for_gt,
+                    bbox_slices=triplet_edt_bbox,
+                    return_weights=False,
+                    return_distances=True,
+                )
+                front_disp_work, _, d_front_work = self._compute_dense_displacement_field_bbox(
+                    front_bin_for_gt,
+                    bbox_slices=triplet_edt_bbox,
+                    return_weights=False,
+                    return_distances=True,
+                )
+                if (
+                    behind_disp_work is not None and
+                    front_disp_work is not None and
+                    d_behind_work is not None and
+                    d_front_work is not None
+                ):
+                    support_mask = cond_bin_full | behind_bin_for_gt | front_bin_for_gt
+                    if (
+                        not np.isfinite(d_behind_work[support_mask]).all() or
+                        not np.isfinite(d_front_work[support_mask]).all()
+                    ):
+                        behind_disp_work = None
+                        front_disp_work = None
+                        d_behind_work = None
+                        d_front_work = None
 
-        while True:
-            behind_for_disp = behind_np[dense_roi_slices] if use_dense_roi else behind_np
-            front_for_disp = front_np[dense_roi_slices] if use_dense_roi else front_np
-            if need_neighbor_distances:
+            if (
+                behind_disp_work is None or
+                front_disp_work is None or
+                d_behind_work is None or
+                d_front_work is None
+            ):
                 behind_disp_work, _, d_behind_work = self._compute_dense_displacement_field(
-                    behind_for_disp,
+                    behind_bin_for_gt,
                     return_weights=False,
                     return_distances=True,
                 )
                 front_disp_work, _, d_front_work = self._compute_dense_displacement_field(
-                    front_for_disp,
+                    front_bin_for_gt,
                     return_weights=False,
                     return_distances=True,
                 )
-            else:
-                behind_disp_work, _ = self._compute_dense_displacement_field(behind_for_disp, return_weights=False)
-                front_disp_work, _ = self._compute_dense_displacement_field(front_for_disp, return_weights=False)
-                d_behind_work = None
-                d_front_work = None
-
-            if behind_disp_work is None or front_disp_work is None:
-                return self[np.random.randint(len(self))]
-            if not adaptive_roi_for_band:
-                break
-
-            cond_bin_roi = cond_bin_full[dense_roi_slices]
-            if cond_bin_roi.sum() == 0 or d_behind_work is None or d_front_work is None:
-                return self[np.random.randint(len(self))]
-            cond_mask_roi = cond_bin_roi > 0
-            cond_to_front = d_front_work[cond_mask_roi]
-            cond_to_behind = d_behind_work[cond_mask_roi]
-            if cond_to_front.size == 0 or cond_to_behind.size == 0:
-                return self[np.random.randint(len(self))]
-
-            front_radius = float(np.percentile(cond_to_front, band_pct)) + band_padding
-            behind_radius = float(np.percentile(cond_to_behind, band_pct)) + band_padding
-            required_pad = int(np.ceil(max(front_radius, behind_radius)))
-            next_pad = min(roi_pad_max, max(roi_pad, required_pad))
-            if next_pad <= roi_pad:
-                break
-            roi_pad = next_pad
-            dense_roi_slices = self._bounds_to_slices(dense_roi_bounds, roi_pad, crop_size)
-
-        if use_dense_roi:
-            behind_disp_np = np.zeros((3, *crop_size), dtype=np.float32)
-            front_disp_np = np.zeros((3, *crop_size), dtype=np.float32)
-            roi_index = (slice(None),) + dense_roi_slices
-            behind_disp_np[roi_index] = behind_disp_work.astype(np.float32, copy=False)
-            front_disp_np[roi_index] = front_disp_work.astype(np.float32, copy=False)
         else:
-            behind_disp_np = behind_disp_work.astype(np.float32, copy=False)
-            front_disp_np = front_disp_work.astype(np.float32, copy=False)
+            behind_disp_work, _ = self._compute_dense_displacement_field(behind_bin_for_gt, return_weights=False)
+            front_disp_work, _ = self._compute_dense_displacement_field(front_bin_for_gt, return_weights=False)
+            d_behind_work = None
+            d_front_work = None
+        if behind_disp_work is None or front_disp_work is None:
+            return self[np.random.randint(len(self))]
+        behind_disp_np = behind_disp_work.astype(np.float32, copy=False)
+        front_disp_np = front_disp_work.astype(np.float32, copy=False)
+        if self.triplet_close_check_enabled:
+            cond_behind_frac, cond_front_frac, behind_front_frac = self._triplet_close_contact_fractions(
+                cond_mask=cond_bin_full,
+                behind_mask=behind_bin_for_gt,
+                front_mask=front_bin_for_gt,
+                behind_disp_np=behind_disp_np,
+                front_disp_np=front_disp_np,
+                max_distance_voxels=self.triplet_close_distance_voxels,
+            )
+            max_close_frac = max(cond_behind_frac, cond_front_frac, behind_front_frac)
+            if max_close_frac > self.triplet_close_fraction_threshold:
+                if self.triplet_close_print:
+                    print(
+                        "Triplet close-contact reject "
+                        f"idx={idx} patch={patch_idx} wrap={wrap_idx} "
+                        f"cond-behind={cond_behind_frac:.4f} "
+                        f"cond-front={cond_front_frac:.4f} "
+                        f"behind-front={behind_front_frac:.4f} "
+                        f"thr={self.triplet_close_fraction_threshold:.4f} "
+                        f"dist<={self.triplet_close_distance_voxels:.3f}"
+                    )
+                return self[np.random.randint(len(self))]
 
-        if weight_mode == "conditioning":
-            dense_weight_np = (cond_np > 0.5).astype(np.float32, copy=False)[None]
-        elif weight_mode == "neighbors":
-            dense_weight_np = (np.maximum(behind_np, front_np) > 0.5).astype(np.float32, copy=False)[None]
-        elif weight_mode == "all":
+        if weight_mode == "all":
             dense_weight_np = np.ones((1, *crop_size), dtype=np.float32)
         elif weight_mode == "band":
             if d_behind_work is None or d_front_work is None:
                 return self[np.random.randint(len(self))]
 
-            cond_bin = cond_bin_full[dense_roi_slices].astype(np.uint8, copy=False) if use_dense_roi \
-                else cond_bin_full.astype(np.uint8, copy=False)
+            cond_bin = cond_bin_full.astype(np.uint8, copy=False)
             if cond_bin.sum() == 0:
                 return self[np.random.randint(len(self))]
 
@@ -918,10 +1466,8 @@ class EdtSegDataset(Dataset):
             if not dense_band.any():
                 return self[np.random.randint(len(self))]
 
-            cc_structure = np.ones((3, 3, 3), dtype=np.uint8)  # 26-connected neighborhood
-
             # Remove isolated islands: keep only components connected to conditioning.
-            labels, num_labels = ndimage.label(dense_band, structure=cc_structure)
+            labels, num_labels = ndimage.label(dense_band, structure=self._cc_structure_26)
             if num_labels <= 0:
                 return self[np.random.randint(len(self))]
             touching = np.unique(labels[cond_mask])
@@ -935,14 +1481,14 @@ class EdtSegDataset(Dataset):
             # Fill tiny holes inside the slab.
             dense_band = ndimage.binary_closing(
                 dense_band,
-                structure=np.ones((3, 3, 3), dtype=bool),
+                structure=self._closing_structure_3,
                 iterations=1,
             )
             if not dense_band.any():
                 return self[np.random.randint(len(self))]
 
             # Closing can create small detached islands; keep only cond-connected components.
-            labels, num_labels = ndimage.label(dense_band, structure=cc_structure)
+            labels, num_labels = ndimage.label(dense_band, structure=self._cc_structure_26)
             if num_labels <= 0:
                 return self[np.random.randint(len(self))]
             touching = np.unique(labels[cond_mask])
@@ -952,20 +1498,32 @@ class EdtSegDataset(Dataset):
             keep = np.zeros(num_labels + 1, dtype=bool)
             keep[touching] = True
             dense_band = keep[labels].astype(np.float32, copy=False)
-            if use_dense_roi:
-                dense_weight_np = np.zeros((1, *crop_size), dtype=np.float32)
-                dense_weight_np[(0,) + dense_roi_slices] = dense_band
-            else:
-                dense_weight_np = dense_band[None]
+            dense_weight_np = dense_band[None]
         else:
             raise ValueError(
-                "triplet_dense_weight_mode must be one of {'conditioning', 'neighbors', 'all', 'band'}, "
+                "triplet_dense_weight_mode must be one of {'all', 'band'}, "
                 f"got {weight_mode!r}"
             )
         if float(dense_weight_np.sum()) <= 0:
             return self[np.random.randint(len(self))]
 
         dense_gt_np = np.concatenate([behind_disp_np, front_disp_np], axis=0).astype(np.float32, copy=False)
+        dir_priors_np = None
+        if self.use_triplet_direction_priors:
+            ch0_dir = self._estimate_triplet_unit_direction(behind_disp_np, cond_bin_full)
+            ch1_dir = self._estimate_triplet_unit_direction(front_disp_np, cond_bin_full)
+            dir_priors_np = self._build_triplet_direction_priors(
+                crop_size,
+                cond_bin_full,
+                ch0_dir,
+                ch1_dir,
+                mask_mode=self.triplet_direction_prior_mask,
+            )
+        triplet_channel_order_np = np.array([0, 1], dtype=np.int64)
+        if self.triplet_random_channel_swap_prob > 0.0:
+            if random.random() < self.triplet_random_channel_swap_prob:
+                dense_gt_np, dir_priors_np = self._swap_triplet_branch_channels(dense_gt_np, dir_priors_np)
+                triplet_channel_order_np = np.array([1, 0], dtype=np.int64)
         dense_gt_disp = torch.from_numpy(dense_gt_np).to(torch.float32)
         dense_loss_weight = torch.from_numpy(dense_weight_np).to(torch.float32)
 
@@ -973,9 +1531,12 @@ class EdtSegDataset(Dataset):
             "vol": vol_crop,
             "cond": center_seg,
             "masked_seg": masked_seg,
-            "dense_gt_displacement": dense_gt_disp,  # (6, D, H, W): behind(dz,dy,dx), front(dz,dy,dx)
+            "dense_gt_displacement": dense_gt_disp,  # (6, D, H, W): channel0(dz,dy,dx), channel1(dz,dy,dx)
             "dense_loss_weight": dense_loss_weight,  # (1, D, H, W)
+            "triplet_channel_order": torch.from_numpy(triplet_channel_order_np).to(torch.int64),  # [2]: slot0/slot1 -> canonical A/B
         }
+        if dir_priors_np is not None:
+            result["dir_priors"] = torch.from_numpy(dir_priors_np).to(torch.float32)
         if not self._validate_result_tensors(result, idx):
             return self[np.random.randint(len(self))]
         return result
@@ -991,13 +1552,59 @@ class EdtSegDataset(Dataset):
 
     @staticmethod
     def _upsample_world_triplet(x_s, y_s, z_s, scale_y: float, scale_x: float):
-        """Upsample (x, y, z) sampled grids in one cv2 call."""
+        """Upsample (x, y, z) sampled grids using tifxyz interpolation."""
         h_s, w_s = x_s.shape
         h_up = int(round(h_s / scale_y))
         w_up = int(round(w_s / scale_x))
-        xyz_s = np.stack([x_s, y_s, z_s], axis=-1)
-        xyz_up = cv2.resize(xyz_s, (w_up, h_up), interpolation=cv2.INTER_LINEAR)
-        return xyz_up[..., 0], xyz_up[..., 1], xyz_up[..., 2]
+        dense_rows = np.linspace(0, h_s - 1, h_up, dtype=np.float32)
+        dense_cols = np.linspace(0, w_s - 1, w_up, dtype=np.float32)
+        query_row, query_col = np.meshgrid(dense_rows, dense_cols, indexing="ij")
+
+        x_src = np.asarray(x_s, dtype=np.float32)
+        y_src = np.asarray(y_s, dtype=np.float32)
+        z_src = np.asarray(z_s, dtype=np.float32)
+        valid_src = np.ones((h_s, w_s), dtype=bool)
+
+        x_up, y_up, z_up, valid = interpolate_at_points(
+            x_src,
+            y_src,
+            z_src,
+            valid_src,
+            query_row,
+            query_col,
+            scale=(1.0, 1.0),
+            method="catmull_rom",
+        )
+
+        if not np.all(valid):
+            x_lin, y_lin, z_lin, valid_lin = interpolate_at_points(
+                x_src,
+                y_src,
+                z_src,
+                valid_src,
+                query_row,
+                query_col,
+                scale=(1.0, 1.0),
+                method="linear",
+            )
+
+            replace_lin = (~valid) & valid_lin
+            if np.any(replace_lin):
+                x_up[replace_lin] = x_lin[replace_lin]
+                y_up[replace_lin] = y_lin[replace_lin]
+                z_up[replace_lin] = z_lin[replace_lin]
+                valid[replace_lin] = True
+
+            if not np.all(valid):
+                # Guarantee dense coverage: nearest-neighbor fill for any residual invalids.
+                nn_r = np.clip(np.rint(query_row).astype(np.int64), 0, h_s - 1)
+                nn_c = np.clip(np.rint(query_col).astype(np.int64), 0, w_s - 1)
+                replace_nn = ~valid
+                x_up[replace_nn] = x_src[nn_r[replace_nn], nn_c[replace_nn]]
+                y_up[replace_nn] = y_src[nn_r[replace_nn], nn_c[replace_nn]]
+                z_up[replace_nn] = z_src[nn_r[replace_nn], nn_c[replace_nn]]
+
+        return x_up, y_up, z_up
 
     @staticmethod
     def _trim_to_world_bbox(x_full, y_full, z_full, world_bbox):
@@ -1024,42 +1631,6 @@ class EdtSegDataset(Dataset):
             x_full[r0:r1 + 1, c0:c1 + 1],
             y_full[r0:r1 + 1, c0:c1 + 1],
             z_full[r0:r1 + 1, c0:c1 + 1],
-        )
-
-    @staticmethod
-    def _mask_bounds_zyx(mask: np.ndarray):
-        """Return inclusive (z0, z1, y0, y1, x0, x1) for True voxels, or None."""
-        if mask.size == 0:
-            return None
-        z_any = np.any(mask, axis=(1, 2))
-        y_any = np.any(mask, axis=(0, 2))
-        x_any = np.any(mask, axis=(0, 1))
-        if not z_any.any() or not y_any.any() or not x_any.any():
-            return None
-        z_idx = np.flatnonzero(z_any)
-        y_idx = np.flatnonzero(y_any)
-        x_idx = np.flatnonzero(x_any)
-        return (
-            int(z_idx[0]), int(z_idx[-1]),
-            int(y_idx[0]), int(y_idx[-1]),
-            int(x_idx[0]), int(x_idx[-1]),
-        )
-
-    @staticmethod
-    def _bounds_to_slices(bounds_zyx, pad_voxels: int, shape_zyx):
-        if bounds_zyx is None:
-            return (
-                slice(0, int(shape_zyx[0])),
-                slice(0, int(shape_zyx[1])),
-                slice(0, int(shape_zyx[2])),
-            )
-        z0, z1, y0, y1, x0, x1 = bounds_zyx
-        pad = max(0, int(pad_voxels))
-        d, h, w = int(shape_zyx[0]), int(shape_zyx[1]), int(shape_zyx[2])
-        return (
-            slice(max(0, z0 - pad), min(d, z1 + pad + 1)),
-            slice(max(0, y0 - pad), min(h, y1 + pad + 1)),
-            slice(max(0, x0 - pad), min(w, x1 + pad + 1)),
         )
 
     @staticmethod
@@ -1100,6 +1671,71 @@ class EdtSegDataset(Dataset):
             self._dense_axis_cache[shape_key] = axes
         return axes
 
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _load_cucim_backend():
+        try:
+            import cupy as cp
+            from cucim.core.operations.morphology import distance_transform_edt as cucim_distance_transform_edt
+        except Exception as exc:
+            return None, None, exc
+        return cp, cucim_distance_transform_edt, None
+
+    def _warn_dense_edt_fallback_once(self, reason: str):
+        if self._dense_edt_backend_fallback_warned:
+            return
+        warnings.warn(
+            "dense_edt_backend='auto': falling back to scipy.ndimage.distance_transform_edt "
+            f"({reason})",
+            RuntimeWarning,
+        )
+        self._dense_edt_backend_fallback_warned = True
+
+    def _resolve_dense_edt_backend(self):
+        if self._dense_edt_backend is not None:
+            return self._dense_edt_backend
+        if self.dense_edt_backend_mode == 'scipy':
+            self._dense_edt_backend = 'scipy'
+            return self._dense_edt_backend
+
+        cp, cucim_edt, import_err = self._load_cucim_backend()
+        if cp is None or cucim_edt is None:
+            reason = f"failed to import cupy/cucim: {type(import_err).__name__}: {import_err}"
+            if self.dense_edt_backend_mode == 'auto':
+                self._warn_dense_edt_fallback_once(reason)
+                self._dense_edt_backend = 'scipy'
+                return self._dense_edt_backend
+            raise RuntimeError(
+                "dense_edt_backend='cucim' requested but cupy/cucim could not be imported; "
+                f"{reason}"
+            ) from import_err
+
+        try:
+            device_count = int(cp.cuda.runtime.getDeviceCount())
+        except Exception as exc:
+            device_count = 0
+            device_err = exc
+        else:
+            device_err = None
+
+        if device_count <= 0:
+            reason = "no CUDA devices available"
+            if device_err is not None:
+                reason = f"{reason} ({type(device_err).__name__}: {device_err})"
+            if self.dense_edt_backend_mode == 'auto':
+                self._warn_dense_edt_fallback_once(reason)
+                self._dense_edt_backend = 'scipy'
+                return self._dense_edt_backend
+            raise RuntimeError(
+                "dense_edt_backend='cucim' requested but no CUDA device is available; "
+                f"{reason}"
+            )
+
+        self._cupy = cp
+        self._cucim_distance_transform_edt = cucim_edt
+        self._dense_edt_backend = 'cucim'
+        return self._dense_edt_backend
+
     def _compute_dense_displacement_field(
         self,
         full_surface_mask: np.ndarray,
@@ -1123,16 +1759,57 @@ class EdtSegDataset(Dataset):
                 return None, None, None
             return None, None
 
-        # Distance transform on inverse mask gives nearest foreground (surface) index per voxel.
-        edt_out = ndimage.distance_transform_edt(
-            ~surface, return_distances=return_distances, return_indices=True
-        )
-        if return_distances:
-            distances, nearest_idx = edt_out
-            distances = distances.astype(np.float32, copy=False)
+        # Nearest foreground (surface) index per voxel.
+        backend = self._resolve_dense_edt_backend()
+        if backend == 'cucim':
+            try:
+                surface_inv_gpu = self._cupy.asarray(~surface)
+                if return_distances:
+                    distances_gpu, nearest_idx_gpu = self._cucim_distance_transform_edt(
+                        surface_inv_gpu,
+                        return_distances=True,
+                        return_indices=True,
+                        float64_distances=False,
+                    )
+                    distances = self._cupy.asnumpy(distances_gpu).astype(np.float32, copy=False)
+                else:
+                    nearest_idx_gpu = self._cucim_distance_transform_edt(
+                        surface_inv_gpu,
+                        return_distances=False,
+                        return_indices=True,
+                    )
+                    distances = None
+                nearest_idx = self._cupy.asnumpy(nearest_idx_gpu)
+            except Exception as exc:
+                if self.dense_edt_backend_mode != 'auto':
+                    raise
+                self._warn_dense_edt_fallback_once(
+                    f"runtime cuCIM EDT failed ({type(exc).__name__}: {exc})"
+                )
+                self._dense_edt_backend = 'scipy'
+                self._cupy = None
+                self._cucim_distance_transform_edt = None
+                if return_distances:
+                    distances, nearest_idx = ndimage.distance_transform_edt(
+                        ~surface, return_distances=True, return_indices=True
+                    )
+                    distances = distances.astype(np.float32, copy=False)
+                else:
+                    nearest_idx = ndimage.distance_transform_edt(
+                        ~surface, return_distances=False, return_indices=True
+                    )
+                    distances = None
         else:
-            nearest_idx = edt_out
-            distances = None
+            if return_distances:
+                distances, nearest_idx = ndimage.distance_transform_edt(
+                    ~surface, return_distances=True, return_indices=True
+                )
+                distances = distances.astype(np.float32, copy=False)
+            else:
+                nearest_idx = ndimage.distance_transform_edt(
+                    ~surface, return_distances=False, return_indices=True
+                )
+                distances = None
         disp = nearest_idx.astype(np.float32, copy=False)
         z_axis, y_axis, x_axis = self._get_dense_axis_offsets(surface.shape)
         disp[0] -= z_axis
@@ -1142,6 +1819,37 @@ class EdtSegDataset(Dataset):
         if return_distances:
             return disp, weights, distances
         return disp, weights
+
+    @staticmethod
+    @lru_cache(maxsize=5)
+    def _small_spherical_footprint(radius: int):
+        offsets = np.arange(-radius, radius + 1, dtype=np.int32)
+        zz, yy, xx = np.meshgrid(offsets, offsets, offsets, indexing='ij')
+        return (zz * zz + yy * yy + xx * xx) <= (radius * radius)
+
+    @staticmethod
+    def _edt_dilate_binary_mask(mask: np.ndarray, radius_voxels: float) -> np.ndarray:
+        """Dilate binary mask by EDT thresholding; returns a boolean mask."""
+        radius = float(radius_voxels)
+        mask_bool = np.asarray(mask) > 0
+        if radius <= 0.0 or not mask_bool.any():
+            return mask_bool
+        # Exact structuring-element dilation is faster than EDT for common small
+        # integer radii (for example, triplet_gt_vector_dilation_radius=1.0).
+        rounded_radius = int(round(radius))
+        if abs(radius - rounded_radius) <= 1e-6 and rounded_radius <= 4:
+            footprint = EdtSegDataset._small_spherical_footprint(rounded_radius)
+            return ndimage.binary_dilation(mask_bool, structure=footprint, iterations=1)
+        dist = ndimage.distance_transform_edt(~mask_bool)
+        return dist <= radius
+
+    @staticmethod
+    def _signed_distance_field(mask: np.ndarray) -> np.ndarray:
+        """Signed distance using the legacy sign convention (positive inside)."""
+        mask_bool = np.asarray(mask) > 0
+        dist_outside = ndimage.distance_transform_edt(~mask_bool)
+        dist_inside = ndimage.distance_transform_edt(mask_bool)
+        return (dist_inside - dist_outside).astype(np.float32, copy=False)
 
     def _maybe_perturb_conditioning_surface(self, cond_zyxs: np.ndarray) -> np.ndarray:
         """Apply local normal-direction pushes with Gaussian falloff on small regions."""
@@ -1427,7 +2135,7 @@ class EdtSegDataset(Dataset):
         use_dilation = self.config.get('use_dilation', False)
         if use_dilation:
             dilation_radius = self.config.get('dilation_radius', 1.0)
-            dist_from_cond = edt.edt(1 - cond_segmentation, parallel=1)
+            dist_from_cond = ndimage.distance_transform_edt(cond_segmentation <= 0.5)
             cond_segmentation = (dist_from_cond <= dilation_radius).astype(np.float32)
 
         use_segmentation = self.config.get('use_segmentation', False)
@@ -1447,13 +2155,13 @@ class EdtSegDataset(Dataset):
                 seg_dilated = full_segmentation
             else:
                 dilation_radius = self.config.get('dilation_radius', 1.0)
-                distance_from_surface = edt.edt(1 - full_segmentation, parallel=1)
+                distance_from_surface = ndimage.distance_transform_edt(full_segmentation <= 0.5)
                 seg_dilated = (distance_from_surface <= dilation_radius).astype(np.float32)
-            sdt = edt.sdf(seg_dilated, parallel=1).astype(np.float32)
+            sdt = self._signed_distance_field(seg_dilated)
 
         if use_segmentation:
             dilation_radius = self.config.get('dilation_radius', 1.0)
-            distance_from_surface = edt.edt(1 - full_segmentation_raw, parallel=1)
+            distance_from_surface = ndimage.distance_transform_edt(full_segmentation_raw <= 0.5)
             seg_dilated = (distance_from_surface <= dilation_radius).astype(np.float32)
             seg_skel = (distance_from_surface == 0).astype(np.float32)
 
