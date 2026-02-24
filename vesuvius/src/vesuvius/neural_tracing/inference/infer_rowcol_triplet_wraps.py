@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from scipy import ndimage
 import torch
 import zarr
 from tqdm import tqdm
@@ -473,6 +474,91 @@ def _maybe_swap_bbox_front_back(
     return False, "already_oriented"
 
 
+def _compute_surface_tangent_axis(surface_grid, surface_valid, axis):
+    grid = np.asarray(surface_grid, dtype=np.float32)
+    valid = np.asarray(surface_valid, dtype=bool)
+    if grid.ndim != 3 or grid.shape[2] != 3:
+        raise RuntimeError(f"Expected surface_grid shape [H,W,3], got {tuple(grid.shape)}")
+    if valid.shape != grid.shape[:2]:
+        raise RuntimeError(f"surface_valid shape {tuple(valid.shape)} does not match grid shape {tuple(grid.shape[:2])}")
+    if axis not in (0, 1):
+        raise RuntimeError(f"axis must be 0 or 1, got {axis}")
+
+    tangent = np.zeros_like(grid, dtype=np.float32)
+    tangent_valid = np.zeros(valid.shape, dtype=bool)
+    h, w = valid.shape
+
+    if axis == 0:
+        if h >= 3:
+            central_ok = valid[1:-1, :] & valid[:-2, :] & valid[2:, :]
+            central_delta = 0.5 * (grid[2:, :, :] - grid[:-2, :, :])
+            tangent[1:-1, :, :][central_ok] = central_delta[central_ok]
+            tangent_valid[1:-1, :][central_ok] = True
+
+        if h >= 2:
+            diff = grid[1:, :, :] - grid[:-1, :, :]
+            diff_ok = valid[1:, :] & valid[:-1, :]
+
+            use_forward = (~tangent_valid[:-1, :]) & diff_ok
+            tangent[:-1, :, :][use_forward] = diff[use_forward]
+            tangent_valid[:-1, :][use_forward] = True
+
+            use_backward = (~tangent_valid[1:, :]) & diff_ok
+            tangent[1:, :, :][use_backward] = diff[use_backward]
+            tangent_valid[1:, :][use_backward] = True
+    else:
+        if w >= 3:
+            central_ok = valid[:, 1:-1] & valid[:, :-2] & valid[:, 2:]
+            central_delta = 0.5 * (grid[:, 2:, :] - grid[:, :-2, :])
+            tangent[:, 1:-1, :][central_ok] = central_delta[central_ok]
+            tangent_valid[:, 1:-1][central_ok] = True
+
+        if w >= 2:
+            diff = grid[:, 1:, :] - grid[:, :-1, :]
+            diff_ok = valid[:, 1:] & valid[:, :-1]
+
+            use_forward = (~tangent_valid[:, :-1]) & diff_ok
+            tangent[:, :-1, :][use_forward] = diff[use_forward]
+            tangent_valid[:, :-1][use_forward] = True
+
+            use_backward = (~tangent_valid[:, 1:]) & diff_ok
+            tangent[:, 1:, :][use_backward] = diff[use_backward]
+            tangent_valid[:, 1:][use_backward] = True
+
+    return tangent, tangent_valid
+
+
+def _compute_surface_normals_from_input_grid(input_grid, input_valid):
+    grid = np.asarray(input_grid, dtype=np.float32)
+    valid = np.asarray(input_valid, dtype=bool)
+    row_tangent, row_tangent_valid = _compute_surface_tangent_axis(grid, valid, axis=0)
+    col_tangent, col_tangent_valid = _compute_surface_tangent_axis(grid, valid, axis=1)
+    normals = np.cross(col_tangent, row_tangent)
+    norms = np.linalg.norm(normals, axis=2)
+    finite = np.isfinite(normals).all(axis=2) & np.isfinite(norms)
+    normals_valid = valid & row_tangent_valid & col_tangent_valid & finite & (norms > 1e-6)
+    out = np.zeros_like(normals, dtype=np.float32)
+    if bool(normals_valid.any()):
+        out[normals_valid] = normals[normals_valid] / norms[normals_valid, None]
+    return out, normals_valid
+
+
+def _concat_selected_points(uv, world_back_all, world_front_all, from_back_mask, from_front_mask):
+    uv_parts = []
+    world_parts = []
+    if bool(from_back_mask.any()):
+        uv_parts.append(uv[from_back_mask])
+        world_parts.append(world_back_all[from_back_mask])
+    if bool(from_front_mask.any()):
+        uv_parts.append(uv[from_front_mask])
+        world_parts.append(world_front_all[from_front_mask])
+    if len(uv_parts) == 0:
+        return np.zeros((0, 2), dtype=np.int32), np.zeros((0, 3), dtype=np.float32)
+    uv_out = np.concatenate(uv_parts, axis=0).astype(np.int32, copy=False)
+    world_out = np.concatenate(world_parts, axis=0).astype(np.float32, copy=False)
+    return uv_out, world_out
+
+
 def _accumulate_displaced(sum_grid, count_grid, uv_rc, world_zyx):
     if uv_rc.size == 0 or world_zyx.size == 0:
         return
@@ -772,12 +858,28 @@ def _project_sparse_to_input_lattice(pred_grid, pred_valid):
 
 
 def _merge_with_original(original_grid, original_valid, pred_grid, pred_valid):
-    merged = np.asarray(original_grid, dtype=np.float32).copy()
-    merged_valid = np.asarray(original_valid, dtype=bool).copy()
-    overwrite = np.asarray(pred_valid, dtype=bool)
-    if overwrite.any():
-        merged[overwrite] = np.asarray(pred_grid, dtype=np.float32)[overwrite]
-        merged_valid[overwrite] = True
+    original_arr = np.asarray(original_grid, dtype=np.float32)
+    original_mask = np.asarray(original_valid, dtype=bool)
+    pred_arr = np.asarray(pred_grid, dtype=np.float32)
+    pred_mask = np.asarray(pred_valid, dtype=bool)
+
+    merged = np.full_like(original_arr, -1.0, dtype=np.float32)
+    merged_valid = np.zeros_like(original_mask, dtype=bool)
+
+    support = pred_mask & np.isfinite(pred_arr).all(axis=2)
+    if bool(support.any()):
+        merged[support] = pred_arr[support]
+        merged_valid[support] = True
+
+    needs_fill = original_mask & ~support
+    if bool(needs_fill.any()) and bool(support.any()):
+        # Map each unresolved original-valid cell to its nearest predicted support cell in UV.
+        _, nearest_idx = ndimage.distance_transform_edt(~support, return_indices=True)
+        nearest_r = nearest_idx[0][needs_fill]
+        nearest_c = nearest_idx[1][needs_fill]
+        merged[needs_fill] = pred_arr[nearest_r, nearest_c]
+        merged_valid[needs_fill] = True
+
     merged[~merged_valid] = -1.0
     return merged, merged_valid
 
@@ -904,23 +1006,34 @@ def _run_triplet_inference(
     volume_arr,
     shape_hw,
     dense_subsample_stride,
+    input_normals,
+    input_normals_valid,
 ):
     h, w = int(shape_hw[0]), int(shape_hw[1])
     sum_back = np.zeros((h, w, 3), dtype=np.float32)
     sum_front = np.zeros((h, w, 3), dtype=np.float32)
     count_back = np.zeros((h, w), dtype=np.uint32)
     count_front = np.zeros((h, w), dtype=np.uint32)
+    normals_arr = np.asarray(input_normals, dtype=np.float32)
+    normals_valid_arr = np.asarray(input_normals_valid, dtype=bool)
+    if normals_arr.shape != (h, w, 3):
+        raise RuntimeError(
+            f"input_normals shape {tuple(normals_arr.shape)} does not match expected {(h, w, 3)}"
+        )
+    if normals_valid_arr.shape != (h, w):
+        raise RuntimeError(
+            f"input_normals_valid shape {tuple(normals_valid_arr.shape)} does not match expected {(h, w)}"
+        )
     flip_checks_total = 0
     flip_swaps_applied = 0
     flip_skipped_ambiguous = 0
     flip_skipped_insufficient_points = 0
+    orientation_samples_used = 0
+    orientation_sample_fallback_used = 0
 
     volume_shape = np.asarray(np.shape(volume_arr), dtype=np.float64)
     if volume_shape.size < 3:
-        raise RuntimeError(f"Expected 3D volume for center-based flip checks, got shape={tuple(np.shape(volume_arr))}")
-    volume_center_zyx = 0.5 * np.maximum(volume_shape[:3] - 1.0, 0.0)
-    volume_center_y = float(volume_center_zyx[1])
-    volume_center_x = float(volume_center_zyx[2])
+        raise RuntimeError(f"Expected 3D volume for triplet inference, got shape={tuple(np.shape(volume_arr))}")
 
     expected_in_channels = int(model_state["expected_in_channels"])
     if expected_in_channels != 2:
@@ -975,45 +1088,87 @@ def _run_triplet_inference(
 
             back_disp, back_valid = _sample_trilinear_displacement_stack(back_batch[i], local)
             front_disp, front_valid = _sample_trilinear_displacement_stack(front_batch[i], local)
+            world_back_all = world + back_disp
+            world_front_all = world + front_disp
+            finite_back = np.isfinite(world_back_all).all(axis=1)
+            finite_front = np.isfinite(world_front_all).all(axis=1)
+            back_ok = np.asarray(back_valid, dtype=bool) & finite_back
+            front_ok = np.asarray(front_valid, dtype=bool) & finite_front
 
-            uv_b = np.zeros((0, 2), dtype=np.int32)
-            world_b = np.zeros((0, 3), dtype=np.float32)
-            if bool(back_valid.any()):
-                uv_b = uv[back_valid]
-                world_b = world[back_valid] + back_disp[back_valid]
-                finite_b = np.isfinite(world_b).all(axis=1)
-                uv_b = uv_b[finite_b]
-                world_b = world_b[finite_b]
+            normal_uv = normals_arr[uv[:, 0], uv[:, 1]]
+            normal_valid = normals_valid_arr[uv[:, 0], uv[:, 1]]
+            both_ok = back_ok & front_ok
+            both_with_normals = both_ok & normal_valid
+            signed_delta = np.full((uv.shape[0],), np.nan, dtype=np.float32)
+            if bool(both_with_normals.any()):
+                signed_delta[both_with_normals] = np.einsum(
+                    "ij,ij->i",
+                    world_front_all[both_with_normals] - world_back_all[both_with_normals],
+                    normal_uv[both_with_normals],
+                ).astype(np.float32, copy=False)
+            signed_delta_valid = both_with_normals & np.isfinite(signed_delta)
 
-            uv_f = np.zeros((0, 2), dtype=np.int32)
-            world_f = np.zeros((0, 3), dtype=np.float32)
-            if bool(front_valid.any()):
-                uv_f = uv[front_valid]
-                world_f = world[front_valid] + front_disp[front_valid]
-                finite_f = np.isfinite(world_f).all(axis=1)
-                uv_f = uv_f[finite_f]
-                world_f = world_f[finite_f]
-
-            if bool(args.flip_check_enabled) and uv_b.shape[0] > 0 and uv_f.shape[0] > 0:
+            should_swap_bbox = False
+            use_ambiguous_fallback = False
+            if bool(args.flip_check_enabled) and bool(both_ok.any()):
                 flip_checks_total += 1
-                should_swap, swap_reason = _maybe_swap_bbox_front_back(
-                    world_center_zyx=world,
-                    world_back_zyx=world_b,
-                    world_front_zyx=world_f,
-                    center_y=volume_center_y,
-                    center_x=volume_center_x,
-                    abs_margin=float(args.flip_check_abs_margin),
-                    rel_margin=float(args.flip_check_rel_margin),
-                    min_band_points=int(args.flip_check_min_band_points),
-                )
-                if should_swap:
-                    uv_b, uv_f = uv_f, uv_b
-                    world_b, world_f = world_f, world_b
-                    flip_swaps_applied += 1
-                elif swap_reason == "ambiguous":
-                    flip_skipped_ambiguous += 1
-                elif swap_reason == "insufficient_band_points":
+                n_vote_points = int(np.count_nonzero(signed_delta_valid))
+                orientation_samples_used += n_vote_points
+                if n_vote_points < int(args.flip_check_min_band_points):
                     flip_skipped_insufficient_points += 1
+                else:
+                    delta_vals = signed_delta[signed_delta_valid].astype(np.float64, copy=False)
+                    median_delta = float(np.median(delta_vals))
+                    separation_scale = float(np.median(np.abs(delta_vals)))
+                    if not np.isfinite(separation_scale):
+                        separation_scale = 0.0
+                    margin = max(
+                        float(args.flip_check_abs_margin),
+                        float(args.flip_check_rel_margin) * separation_scale,
+                    )
+                    if median_delta < -margin:
+                        should_swap_bbox = True
+                        flip_swaps_applied += 1
+                    elif median_delta <= margin:
+                        use_ambiguous_fallback = True
+                        flip_skipped_ambiguous += 1
+                        orientation_sample_fallback_used += 1
+
+            only_back = back_ok & (~front_ok)
+            only_front = front_ok & (~back_ok)
+            back_from_back = np.zeros((uv.shape[0],), dtype=bool)
+            back_from_front = np.zeros((uv.shape[0],), dtype=bool)
+            front_from_back = np.zeros((uv.shape[0],), dtype=bool)
+            front_from_front = np.zeros((uv.shape[0],), dtype=bool)
+
+            if should_swap_bbox:
+                back_from_front = front_ok
+                front_from_back = back_ok
+            elif use_ambiguous_fallback:
+                positive = signed_delta_valid & (signed_delta > 0.0)
+                negative = signed_delta_valid & (signed_delta < 0.0)
+                back_from_back = only_back | positive
+                back_from_front = negative
+                front_from_front = only_front | positive
+                front_from_back = negative
+            else:
+                back_from_back = back_ok
+                front_from_front = front_ok
+
+            uv_b, world_b = _concat_selected_points(
+                uv=uv,
+                world_back_all=world_back_all,
+                world_front_all=world_front_all,
+                from_back_mask=back_from_back,
+                from_front_mask=back_from_front,
+            )
+            uv_f, world_f = _concat_selected_points(
+                uv=uv,
+                world_back_all=world_back_all,
+                world_front_all=world_front_all,
+                from_back_mask=front_from_back,
+                from_front_mask=front_from_front,
+            )
 
             if uv_b.shape[0] > 0:
                 world_b_robust = _robustify_samples_with_dense_projection(
@@ -1070,6 +1225,14 @@ def _run_triplet_inference(
         "flip_swaps_applied": int(flip_swaps_applied),
         "flip_skipped_ambiguous": int(flip_skipped_ambiguous),
         "flip_skipped_insufficient_points": int(flip_skipped_insufficient_points),
+        "orientation_mode": "global_normals_per_bbox_vote",
+        "orientation_global_normals_points": int(np.count_nonzero(normals_valid_arr)),
+        "orientation_bbox_votes_total": int(flip_checks_total),
+        "orientation_bbox_flips_applied": int(flip_swaps_applied),
+        "orientation_bbox_ambiguous": int(flip_skipped_ambiguous),
+        "orientation_bbox_insufficient_points": int(flip_skipped_insufficient_points),
+        "orientation_samples_used": int(orientation_samples_used),
+        "orientation_sample_fallback_used": int(orientation_sample_fallback_used),
     }
 
 
@@ -1168,6 +1331,7 @@ def _run_single_iteration(
         retarget_factor=retarget_factor,
         verbose=bool(args.verbose),
     )
+    input_normals, input_normals_valid = _compute_surface_normals_from_input_grid(input_grid, input_valid)
     records = _generate_cover_bboxes_from_points(
         world_points,
         tifxyz_uuid=input_uuid,
@@ -1189,6 +1353,8 @@ def _run_single_iteration(
         volume_arr=volume_arr,
         shape_hw=input_valid.shape,
         dense_subsample_stride=dense_subsample_stride,
+        input_normals=input_normals,
+        input_normals_valid=input_normals_valid,
     )
 
     back_merged, back_merged_valid = _merge_with_original(
@@ -1226,6 +1392,14 @@ def _run_single_iteration(
         "flip_swaps_applied": int(infer_out.get("flip_swaps_applied", 0)),
         "flip_skipped_ambiguous": int(infer_out.get("flip_skipped_ambiguous", 0)),
         "flip_skipped_insufficient_points": int(infer_out.get("flip_skipped_insufficient_points", 0)),
+        "orientation_mode": str(infer_out.get("orientation_mode", "legacy")),
+        "orientation_global_normals_points": int(infer_out.get("orientation_global_normals_points", 0)),
+        "orientation_bbox_votes_total": int(infer_out.get("orientation_bbox_votes_total", 0)),
+        "orientation_bbox_flips_applied": int(infer_out.get("orientation_bbox_flips_applied", 0)),
+        "orientation_bbox_ambiguous": int(infer_out.get("orientation_bbox_ambiguous", 0)),
+        "orientation_bbox_insufficient_points": int(infer_out.get("orientation_bbox_insufficient_points", 0)),
+        "orientation_samples_used": int(infer_out.get("orientation_samples_used", 0)),
+        "orientation_sample_fallback_used": int(infer_out.get("orientation_sample_fallback_used", 0)),
         "save_coordinate_scale_factor": int(save_scale_factor),
         "stored_scale_rc": None if stored_scale_rc is None else [float(stored_scale_rc[0]), float(stored_scale_rc[1])],
         "effective_step_size_used": int(tifxyz_step_size),
