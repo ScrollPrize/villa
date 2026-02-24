@@ -20,6 +20,13 @@
 
 set -euo pipefail
 
+if [[ "${AGENTS_AGENT_MODE:-0}" == "1" && "${AGENTS_ALLOW_INSTALL:-0}" != "1" ]]; then
+  echo "INFO: h264-zarr-only.sh is disabled by default in agent mode."
+  echo "Set AGENTS_ALLOW_INSTALL=1 to run this script."
+  echo "Example: AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 ./volume-cartographer/scripts/h264-zarr-only.sh"
+  exit 0
+fi
+
 # Determine script and VC root directories (before any cd commands)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VC_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

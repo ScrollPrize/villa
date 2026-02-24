@@ -10,6 +10,7 @@
 #include "panels/SegmentationCellReoptPanel.hpp"
 #include "panels/SegmentationNeuralTracerPanel.hpp"
 #include "panels/SegmentationDirectionFieldPanel.hpp"
+#include "panels/SegmentationLasagnaPanel.hpp"
 #include "VCSettings.hpp"
 
 #include <QSettings>
@@ -54,6 +55,9 @@ void SegmentationWidget::buildUi()
 
     _neuralTracerPanel = new SegmentationNeuralTracerPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_neuralTracerPanel);
+
+    _lasagnaPanel = new SegmentationLasagnaPanel(QStringLiteral("segmentation_edit"), this);
+    layout->addWidget(_lasagnaPanel);
 
     _correctionsPanel = new SegmentationCorrectionsPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_correctionsPanel);
@@ -167,6 +171,14 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::neuralTracerStatusMessage);
     connect(_neuralTracerPanel, &SegmentationNeuralTracerPanel::copyWithNtRequested,
             this, &SegmentationWidget::copyWithNtRequested);
+
+    // Forward lasagna panel signals
+    connect(_lasagnaPanel, &SegmentationLasagnaPanel::lasagnaOptimizeRequested,
+            this, &SegmentationWidget::lasagnaOptimizeRequested);
+    connect(_lasagnaPanel, &SegmentationLasagnaPanel::lasagnaStopRequested,
+            this, &SegmentationWidget::lasagnaStopRequested);
+    connect(_lasagnaPanel, &SegmentationLasagnaPanel::lasagnaStatusMessage,
+            this, &SegmentationWidget::lasagnaStatusMessage);
 }
 
 void SegmentationWidget::syncUiState()
@@ -189,6 +201,7 @@ void SegmentationWidget::syncUiState()
     _approvalMaskPanel->syncUiState();
     _cellReoptPanel->syncUiState(_approvalMaskPanel->showApprovalMask(), _growthInProgress);
     _neuralTracerPanel->syncUiState();
+    _lasagnaPanel->syncUiState(_editingEnabled, false);
 }
 
 void SegmentationWidget::restoreSettings()
@@ -207,6 +220,7 @@ void SegmentationWidget::restoreSettings()
     _approvalMaskPanel->restoreSettings(settings);
     _neuralTracerPanel->restoreSettings(settings);
     _cellReoptPanel->restoreSettings(settings);
+    _lasagnaPanel->restoreSettings(settings);
 
     settings.endGroup();
     _restoringSettings = false;
@@ -410,3 +424,14 @@ void SegmentationWidget::setCopyCheckpointPath(const QString& path) { _neuralTra
 void SegmentationWidget::setVolumeZarrPath(const QString& path) { _neuralTracerPanel->setVolumeZarrPath(path); }
 
 void SegmentationWidget::setEraseBrushActive(bool /*active*/) {}
+
+// --- Lasagna delegations ---
+
+QString SegmentationWidget::lasagnaDataInputPath() const { return _lasagnaPanel->lasagnaDataInputPath(); }
+QString SegmentationWidget::lasagnaConfigText() const { return _lasagnaPanel->lasagnaConfigText(); }
+int SegmentationWidget::lasagnaMode() const { return static_cast<int>(_lasagnaPanel->lasagnaMode()); }
+int SegmentationWidget::newModelWidth() const { return _lasagnaPanel->newModelWidth(); }
+int SegmentationWidget::newModelHeight() const { return _lasagnaPanel->newModelHeight(); }
+int SegmentationWidget::newModelDepth() const { return _lasagnaPanel->newModelDepth(); }
+
+void SegmentationWidget::setLasagnaDataInputPath(const QString& path) { _lasagnaPanel->setLasagnaDataInputPath(path); }

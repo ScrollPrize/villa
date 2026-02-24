@@ -85,7 +85,11 @@ This example shows how to do segmentation on Scroll 3 (PHerc0332).
     Build and start the Docker Container:
 
     ```bash
+    # Local/manual use (no agent flags required)
     docker build -t thaumato_image -f DockerfileThaumato .
+
+    # Agent mode with explicit opt-in
+    AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 docker build -t thaumato_image -f DockerfileThaumato .
     ```
     The following commands might need adjustments based on how you would like to access your scroll data:
     ```bash

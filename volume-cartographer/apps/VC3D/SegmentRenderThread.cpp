@@ -51,12 +51,12 @@ void SegmentRenderThread::run()
     }
 
     QStringList args;
-    args << m_volumePath
-         << m_outputPattern
-         << m_segmentPath
-         << QString::number(m_scale)
-         << QString::number(m_resolution)
-         << QString::number(m_layers);
+    args << "--volume" << m_volumePath
+         << "--tif-output" << m_outputPattern
+         << "--segmentation" << m_segmentPath
+         << "--scale" << QString::number(m_scale)
+         << "--group-idx" << QString::number(m_resolution)
+         << "--num-slices" << QString::number(m_layers);
 
     emit renderingStarted("Starting rendering process for: " + QFileInfo(m_segmentPath).fileName());
     

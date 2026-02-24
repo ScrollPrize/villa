@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file defines how automated agents (Codex, Claude, chat-based coding agents, CI bots, etc.) should operate inside the **`villa/`** monorepo.
+This file defines how automated agents (Codex, Claude, chat-based coding agents, CI bots, etc.) should operate inside this monorepo.
 
 The repo contains multiple subprojects with different languages, runtimes, and constraints. **Do not assume one “global” build/run workflow applies everywhere.** Instead:
 
@@ -12,16 +12,34 @@ The repo contains multiple subprojects with different languages, runtimes, and c
 
 ## 1) Monorepo-wide rules
 
+### 1.0 Portal startup policy (important)
+- Treat discovery/exploration runs as **read-only** unless the user explicitly asks for environment setup.
+- **Do not run installation/bootstrap commands by default** when starting work in this repo.
+- Skip side-effect scripts until explicitly requested by the user:
+  - `build_dependencies.sh`
+  - `install_dependencies.sh`
+  - `install_repositories.sh`
+  - `setup_user.sh`
+  - `setup_sudo.sh`
+  - `npm install`, `yarn install`, `pip install`, `poetry install`, `conda env` creation, `uv sync`, Docker build/pull
+- If dependencies are needed, report the exact minimal install command per target subproject and ask for confirmation.
+- For agent-mode runs (Codex/CI), skip install/bootstrap side effects unless explicitly allowed:
+  - Set `AGENTS_AGENT_MODE=1` for that session/run.
+  - Then explicitly set `AGENTS_ALLOW_INSTALL=1` to run installs.
+- For local/manual usage, no extra env var is required; run installs directly.
+
 ### 1.1 Scope first, then act
 - Treat each top-level folder as an independent product unless proven otherwise.
 - Make the smallest change that solves the requested task.
 - If the task spans multiple subprojects, split your work into clearly separated commits/patches.
+- Do not execute setup, install, or build scripts in non-target subprojects.
 
 ### 1.2 Don’t guess build systems or dependencies
 Before changing code:
 - Look for **subproject-local** docs and scripts:
   - `README*`, `docs/`, `scripts/`, `Makefile`, `CMakeLists.txt`, `pyproject.toml`, `requirements.txt`, `environment.yml`, `package.json`, `Dockerfile`
 - Prefer **existing scripts** over inventing new commands.
+- If the target subproject is not explicit, ask the user once for scope before running any install/build/discovery script.
 
 ### 1.3 Default to correctness and reproducibility
 Unless the prompt explicitly says otherwise:

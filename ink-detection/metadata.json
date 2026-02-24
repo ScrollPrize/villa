@@ -1,0 +1,212 @@
+{
+  "dataset_name": "2um_dataset",
+  "description": "Collection of 2um resolution segments for ink detection training",
+  "wandb": {
+    "enabled": true,
+    "project": "ink-group-dro",
+    "entity": "vesuvius-challenge",
+    "group": "ink-2um",
+    "tags": [
+      "ink-2um"
+    ]
+  },
+  "segments": {
+    "20250807020208": {
+      "original_path": "0175_2um/20250807020208",
+      "base_path": "0139",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "20250806145318": {
+      "original_path": "0175_2um/20250806145318",
+      "base_path": "0139",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "l2_0_crop": {
+      "original_path": "0139_segments/2um/l2_0_crop",
+      "base_path": "0139",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "658": {
+      "original_path": "train_scrolls/658",
+      "base_path": "343P",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": true
+    },
+    "500p2a": {
+      "original_path": "train_scrolls/500p2a",
+      "base_path": "500p2a",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": true
+    },
+    "-1": {
+      "original_path": "sean_hiddenlayers/-1",
+      "base_path": "500p2a",
+      "layer_range": [
+        1,
+        63
+      ],
+      "reverse_layers": false
+    },
+    "20250910185200": {
+      "original_path": "new_traces9b/david_9b",
+      "base_path": "9b",
+      "layer_range": [
+        1,
+        108
+      ],
+      "reverse_layers": false
+    },
+    "20250919125754-auto_grown_20250919055754487_inp_hr": {
+      "original_path": "9b",
+      "base_path": "9b",
+      "layer_range": [
+        1,
+        108
+      ],
+      "reverse_layers": false
+    }
+  },
+  "training_hyperparameters": {
+    "model": {
+      "model_name": "Unet",
+      "backbone": "resnet3d",
+      "in_chans": 62,
+      "encoder_depth": 5,
+      "norm": "batch",
+      "group_norm_groups": 32,
+      "target_size": 1
+    },
+    "training": {
+      "size": 256,
+      "tile_size": 1024,
+      "stride": 128,
+      "train_batch_size": 24,
+      "valid_batch_size": 32,
+      "use_amp": true,
+      "epochs": 30,
+      "scheduler": "OneCycleLR",
+      "warmup_factor": 25,
+      "cosine_warmup_pct": 0.15,
+      "lr": 1e-05,
+      "min_lr": 1e-06,
+      "weight_decay": 1e-06,
+      "exclude_weight_decay_bias_norm": true,
+      "max_grad_norm": 100,
+      "pretrained": true,
+      "num_workers": 12,
+      "layer_read_workers": 12,
+      "seed": 130697,
+      "eval_threshold": 0.5,
+      "eval_stitch_metrics": true,
+      "eval_topological_metrics_every_n_epochs": 5,
+      "eval_drd_block_size": 8,
+      "eval_boundary_k": 3,
+      "eval_boundary_tols": [
+        1.0
+      ],
+      "eval_skeleton_thinning_type": "guo_hall",
+      "eval_enable_skeleton_metrics": true,
+      "eval_component_worst_q": 0.2,
+      "eval_component_worst_k": 2,
+      "eval_component_min_area": 8192,
+      "eval_component_pad": 5,
+      "eval_stitch_full_region_metrics": false,
+      "eval_save_stitch_debug_images": true,
+      "eval_save_stitch_debug_images_every_n_epochs": 5,
+      "eval_threshold_grid_min": 0.4,
+      "eval_threshold_grid_max": 0.7,
+      "eval_threshold_grid_steps": 5,
+      "eval_threshold_grid": null,
+      "stitch_log_only_downsample": 8,
+      "eval_wandb_media_downsample": 8
+    },
+    "augmentation": {
+      "fourth_augment": {
+        "p": 0.6,
+        "min_crop_ratio": 0.9,
+        "max_crop_ratio": 1.0,
+        "cutout_max_count": 2,
+        "cutout_p": 0.6
+      },
+      "horizontal_flip": 0.5,
+      "vertical_flip": 0.5,
+      "shift_scale_rotate": {
+        "rotate_limit": 360,
+        "shift_limit": 0.15,
+        "scale_limit": 0.1,
+        "p": 0.75
+      },
+      "blur": {
+        "types": [
+          "GaussNoise",
+          "GaussianBlur",
+          "MotionBlur"
+        ],
+        "p": 0.4
+      },
+      "coarse_dropout": {
+        "max_holes": 2,
+        "max_width_ratio": 0.2,
+        "max_height_ratio": 0.2,
+        "p": 0.5
+      }
+    }
+  },
+  "training": {
+    "data_backend": "zarr",
+    "objective": "erm",
+    "sampler": "shuffle",
+    "loss_mode": "batch",
+    "erm_group_topk": 0,
+    "save_every_epoch": true,
+    "stitch_all_val": true,
+    "stitch_train": true,
+    "stitching_schedule": {
+      "train_every_n_epochs": 10,
+      "eval_every_n_epochs": 1,
+      "eval_every_n_epochs_plus_one": true
+    },
+    "stitch_downsample": 1,
+    "train_segments": [
+      "20250806145318",
+      "l2_0_crop",
+      "658",
+      "500p2a",
+      "-1",
+      "20250910185200",
+      "20250919125754-auto_grown_20250919055754487_inp_hr"
+    ],
+    "val_segments": [
+      "20250806145318",
+      "l2_0_crop",
+      "658",
+      "500p2a",
+      "-1",
+      "20250910185200",
+      "20250919125754-auto_grown_20250919055754487_inp_hr"
+    ]
+  },
+  "group_dro": {
+    "group_key": "base_path",
+    "robust_step_size": 0.01
+  },
+  "source_file": "train_resnet3d.py"
+}

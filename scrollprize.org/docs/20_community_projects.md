@@ -61,7 +61,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🛠️ Tools
 
-- [vesuvius-c](https://github.com/ScrollPrize/vesuvius-c): C library for accessing Vesuvius Challenge data. Allows direct access to scroll data without managing download scripts or storing terabytes of CT scans locally.
+- [vesuvius-c](https://github.com/ScrollPrize/villa/tree/main/vesuvius-c): C library for accessing Vesuvius Challenge data. Allows direct access to scroll data without managing download scripts or storing terabytes of CT scans locally.
 
 - [vesuvius-gui](https://github.com/jrudolph/vesuvius-gui) is a single binary GUI to render volumes and segments on-the-fly. By Johannes Rudolph
 
@@ -228,6 +228,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Scroll Sleuth](https://github.com/Paul-G2/ScrollSleuth) by Paul Geiger. A web app that supports visual ink-searching in segment volumes via multiple display modes and segmentation tools.
 
+- [Scroll Slab Viewer](https://github.com/Paul-G2/ScrollSlabViewer) by Paul Geiger. A 3D viewer tailored for the [Kaggle Surface Detection challenge](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection).
+
 ## Ink Detection
 
 ### 🏆 3D Ink Detection
@@ -304,6 +306,9 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Ink Generator]
 (https://github.com/StewartSethA/VesuviusInkGenerator) by Seth Stewart, ink volume sample patches generated using gradient ascent
+
+- [Ink feature visualization]
+(https://github.com/StewartSethA/ink-seer) by Seth Stewart, ink feature vector clustering and visualization via t-SNE to distinguish ink from non-ink features
 
 - [Scroll 5 Ink Labels](https://github.com/Bodillium/Herculaneum-Scroll-Labels) by Nicola Bodill. Early ink labels for Scroll 5.
 

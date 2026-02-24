@@ -24,6 +24,7 @@ class SegmentationApprovalMaskPanel;
 class SegmentationCellReoptPanel;
 class SegmentationNeuralTracerPanel;
 class SegmentationDirectionFieldPanel;
+class SegmentationLasagnaPanel;
 
 class SegmentationWidget : public QWidget
 {
@@ -177,6 +178,17 @@ public:
     void setCellReoptMode(bool enabled);
     void setCellReoptCollections(const QVector<QPair<uint64_t, QString>>& collections);
 
+    // Lasagna getters — delegated to panel
+    [[nodiscard]] QString lasagnaDataInputPath() const;
+    [[nodiscard]] QString lasagnaConfigText() const;
+    [[nodiscard]] int lasagnaMode() const;
+    [[nodiscard]] int newModelWidth() const;
+    [[nodiscard]] int newModelHeight() const;
+    [[nodiscard]] int newModelDepth() const;
+
+    // Lasagna setters
+    void setLasagnaDataInputPath(const QString& path);
+
 signals:
     void editingModeChanged(bool enabled);
     void dragRadiusChanged(float value);
@@ -223,6 +235,11 @@ signals:
     void neuralTracerStatusMessage(const QString& message);
     void copyWithNtRequested();
 
+    // Lasagna signals
+    void lasagnaOptimizeRequested();
+    void lasagnaStopRequested();
+    void lasagnaStatusMessage(const QString& message);
+
     // Cell reoptimization signals
     void cellReoptModeChanged(bool enabled);
     void cellReoptMaxStepsChanged(int steps);
@@ -252,5 +269,6 @@ private:
     SegmentationCellReoptPanel* _cellReoptPanel{nullptr};
     SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
     SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
+    SegmentationLasagnaPanel* _lasagnaPanel{nullptr};
 
 };

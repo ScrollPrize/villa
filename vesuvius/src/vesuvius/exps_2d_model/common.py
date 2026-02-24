@@ -135,6 +135,8 @@ class UNet(nn.Module):
 def load_unet(
 	device: Union[str, torch.device],
 	weights: Optional[str] = None,
+	*,
+	strict: bool = True,
 	in_channels: int = 1,
 	out_channels: int = 3,
 	base_channels: int = 32,
@@ -164,6 +166,13 @@ def load_unet(
 		else:
 			state_dict = ckpt
 
+		if isinstance(state_dict, dict) and any(k.startswith("module.") for k in state_dict.keys()):
+			state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
+
+		if strict:
+			model.load_state_dict(state_dict, strict=True)
+			return model
+
 		model_state = model.state_dict()
 		filtered = {}
 		for k, v in state_dict.items():
@@ -179,3 +188,151 @@ def load_unet(
 			print(f"[load_unet] ignored unexpected checkpoint keys: {sorted(unexpected_keys)}")
 
 	return model
+
+def unet_infer_tiled(
+	model: UNet,
+	image: torch.Tensor,
+	tile_size: int = 512,
+	overlap: int = 128,
+	border: int = 0,
+) -> torch.Tensor:
+	"""
+	Run 2D UNet inference on an image using overlapping tiles with linear blending.
+
+	Args:
+		model:
+			UNet model. Assumed to be in eval() mode & run under no_grad() by caller.
+		image:
+			Input tensor of shape (N,C,H,W). Typically N=1, C=1 as used in this repo.
+		tile_size:
+			Spatial size of square tiles (tile_size x tile_size).
+		overlap:
+			Number of pixels of linear-overlap between neighboring tiles along each
+			axis. Effective stride is (tile_size - overlap). Must be < tile_size.
+		border:
+			Number of pixels at each tile border that have blend weight 0 before
+			linear ramping. These border pixels from each tile are completely
+			discarded in the weighted blending.
+
+	Returns:
+		Tensor of shape (N, model.out_channels, H, W) with stitched prediction.
+	"""
+	if image.ndim != 4:
+		raise ValueError(f"expected image of shape (N,C,H,W), got {tuple(image.shape)}")
+
+	n, c, h0, w0 = image.shape
+	pad0 = max(0, int(border))
+	if pad0 > 0:
+		image = torch.nn.functional.pad(image, (pad0, pad0, pad0, pad0), mode="reflect")
+
+	n, c, h, w = image.shape
+	if n > 1:
+		# Process batch element-wise to keep tiling/simple.
+		outs = []
+		for i in range(n):
+			outs.append(unet_infer_tiled(model, image[i : i + 1], tile_size=tile_size, overlap=overlap, border=border))
+		return torch.cat(outs, dim=0)
+
+	if tile_size <= 0:
+		raise ValueError(f"tile_size must be > 0, got {tile_size}")
+	if overlap < 0 or overlap >= tile_size:
+		raise ValueError(f"overlap must satisfy 0 <= overlap < tile_size (got {overlap}, tile_size={tile_size})")
+	if border < 0:
+		raise ValueError(f"border must be >= 0, got {border}")
+
+	# Small images: fall back to single forward pass.
+	if h <= tile_size and w <= tile_size and overlap == 0 and border == 0:
+		return model(image)
+
+	device = image.device
+	dtype = image.dtype
+
+	def _build_positions(size: int, tile: int, stride: int) -> list[int]:
+		if size <= tile:
+			return [0]
+		positions = list(range(0, size - tile + 1, stride))
+		last = size - tile
+		if positions[-1] != last:
+			positions.append(last)
+		return positions
+
+	stride = max(1, tile_size - overlap)
+	y_positions = _build_positions(h, tile_size, stride)
+	x_positions = _build_positions(w, tile_size, stride)
+	
+	# Per-dimension 1D blending ramp builder.
+	#
+	# Semantics:
+	# - A hard border of width `b` at each side has weight 0 (never used).
+	# - The linear cross-fade happens within the *usable* overlap after removing
+	#   the border on both sides: ov_eff = max(0, overlap - 2*border).
+	def _blend_ramp(length: int, ov: int, b: int) -> torch.Tensor:
+		ramp = torch.zeros(length, device=device, dtype=dtype)
+		if length <= 0:
+			return ramp
+	
+		if b < 0:
+			raise ValueError(f"border must be >= 0, got {b}")
+	
+		# Effective interior region after removing border on both sides.
+		core_start = min(b, length)
+		core_end = max(core_start, length - b)
+		core_len = max(0, core_end - core_start)
+	
+		# No interior -> everything stays zero.
+		if core_len <= 0:
+			return ramp
+	
+		# Inside the core, apply the original ramp logic (border=0 there).
+		core = torch.ones(core_len, device=device, dtype=dtype)
+	
+		if ov > 0:
+			ov_core = min(ov, core_len // 2)
+			if ov_core > 0:
+				edges = torch.linspace(0.0, 1.0, steps=ov_core + 1, device=device, dtype=dtype)[1:]
+				core[:ov_core] = edges
+				core[-ov_core:] = edges.flip(0)
+	
+		ramp[core_start:core_end] = core
+		return ramp
+	
+	# Accumulators for blended output & weights.
+	out_channels = getattr(model, "out_channels", None)
+	if out_channels is None:
+		# Fallback: run a tiny dummy forward to infer channel count.
+		with torch.no_grad():
+			dummy = torch.zeros(1, c, min(tile_size, h), min(tile_size, w), device=device, dtype=dtype)
+			out_channels = model(dummy).shape[1]
+
+	acc = torch.zeros(1, out_channels, h, w, device=device, dtype=dtype)
+	wsum = torch.zeros(1, 1, h, w, device=device, dtype=dtype)
+
+	for y0 in y_positions:
+		for x0 in x_positions:
+			y1 = min(y0 + tile_size, h)
+			x1 = min(x0 + tile_size, w)
+			patch = image[:, :, y0:y1, x0:x1]
+			ph = y1 - y0
+			pw = x1 - x0
+	
+			# Build weight mask for the actual patch size so that border/ramps
+			# are always aligned with the true patch edges, even for truncated
+			# tiles at the image boundary.
+			ov_eff = max(0, int(overlap) - 2 * int(border))
+			ramp_y = _blend_ramp(ph, ov_eff, border)
+			ramp_x = _blend_ramp(pw, ov_eff, border)
+			w_patch = (ramp_y.view(-1, 1) * ramp_x.view(1, -1)).unsqueeze(0).unsqueeze(0)
+	
+			with torch.no_grad():
+				pred = model(patch)  # (1,out_channels,ph,pw)
+	
+			acc[:, :, y0:y1, x0:x1] += pred * w_patch
+			wsum[:, :, y0:y1, x0:x1] += w_patch
+
+	# Avoid division by zero; outside any tile wsum is 0, but that should not occur.
+	eps = torch.finfo(dtype).eps if torch.is_floating_point(wsum) else 1e-6
+	wsafe = torch.clamp(wsum, min=eps)
+	out = acc / wsafe
+	if pad0 > 0:
+		return out[:, :, pad0 : pad0 + h0, pad0 : pad0 + w0]
+	return out

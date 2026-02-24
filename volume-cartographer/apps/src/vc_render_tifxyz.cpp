@@ -207,42 +207,6 @@ static void applyAffineTransform(cv::Mat_<cv::Vec3f>& points,
         }
 }
 
-static cv::Vec3f calculateMeshCentroid(const cv::Mat_<cv::Vec3f>& points)
-{
-    cv::Vec3f sum(0,0,0); int count = 0;
-    for (int y = 0; y < points.rows; y++)
-        for (int x = 0; x < points.cols; x++) {
-            const auto& pt = points(y, x);
-            if (!std::isnan(pt[0])) { sum += pt; count++; }
-        }
-    return count > 0 ? sum / float(count) : sum;
-}
-
-static bool shouldFlipNormals(const cv::Mat_<cv::Vec3f>& points,
-                               const cv::Mat_<cv::Vec3f>& normals,
-                               const cv::Vec3f& ref)
-{
-    size_t toward = 0, away = 0;
-    for (int y = 0; y < points.rows; y++)
-        for (int x = 0; x < points.cols; x++) {
-            const auto& pt = points(y, x);
-            const auto& n = normals(y, x);
-            if (std::isnan(pt[0]) || std::isnan(n[0])) continue;
-            ((ref - pt).dot(n) > 0 ? toward : away)++;
-        }
-    return away > toward;
-}
-
-static void flipNormalsIf(cv::Mat_<cv::Vec3f>& normals, bool flip)
-{
-    if (!flip) return;
-    for (int y = 0; y < normals.rows; y++)
-        for (int x = 0; x < normals.cols; x++) {
-            auto& n = normals(y, x);
-            if (!std::isnan(n[0])) n = -n;
-        }
-}
-
 static void normalizeNormals(cv::Mat_<cv::Vec3f>& nrm)
 {
     for (int y = 0; y < nrm.rows; y++)
@@ -298,28 +262,13 @@ static void genTile(QuadSurface* surf, const cv::Size& size, float render_scale,
 static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv::Vec3f>& nrm,
                                 float scale_seg, float ds_scale,
                                 bool hasAffine, const AffineTransform& aff,
-                                bool flipDecision,
                                 cv::Mat_<cv::Vec3f>& base, cv::Mat_<cv::Vec3f>& dirs)
 {
     base = pts.clone(); base *= scale_seg;
     dirs = nrm.clone();
     if (hasAffine) applyAffineTransform(base, dirs, aff);
-    flipNormalsIf(dirs, flipDecision);
     normalizeNormals(dirs);
     base *= ds_scale;
-}
-
-static bool computeGlobalFlipDecision(QuadSurface* surf, int dx, int dy,
-                                       float u0, float v0, float render_scale,
-                                       float scale_seg, bool hasAffine,
-                                       const AffineTransform& aff, cv::Vec3f& centroid)
-{
-    cv::Mat_<cv::Vec3f> tp, tn;
-    surf->gen(&tp, &tn, cv::Size(dx, dy), cv::Vec3f(0,0,0), render_scale, cv::Vec3f(u0, v0, 0));
-    tp *= scale_seg;
-    if (hasAffine) applyAffineTransform(tp, tn, aff);
-    centroid = calculateMeshCentroid(tp);
-    return shouldFlipNormals(tp, tn, centroid);
 }
 
 // ============================================================
@@ -427,14 +376,6 @@ static void renderBands(
 {
     const uint32_t numBands = (uint32_t(tgtSize.height) + bandH - 1) / bandH;
 
-    // Global flip decision
-    cv::Vec3f centroid;
-    float u0b, v0b; computeCanvasOrigin(fullSize, u0b, v0b);
-    u0b += float(crop.x); v0b += float(crop.y);
-    bool globalFlip = computeGlobalFlipDecision(
-        surf, std::min(128, tgtSize.width), std::min(128, tgtSize.height),
-        u0b, v0b, renderScale, scaleSeg, hasAffine, aff, centroid);
-
     // Build offset list for readMultiSlice
     auto allOffsets = buildOffsetList(numSlices, sliceStep, dsScale, accumOffsets);
 
@@ -458,7 +399,7 @@ static void renderBands(
         genTile(surf, cv::Size(tgtSize.width, int(dy)), renderScale, u0, v0, bandPts, bandNrm);
 
         cv::Mat_<cv::Vec3f> base, dirs;
-        prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, globalFlip, base, dirs);
+        prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
 
         std::vector<cv::Mat> slices;
 
@@ -568,14 +509,6 @@ static void renderTiles(
     // Pre-warm validMask cache (thread-safety: subsequent calls are read-only)
     surf->validMask();
 
-    // Global flip decision
-    cv::Vec3f centroid;
-    float u0b, v0b; computeCanvasOrigin(fullSize, u0b, v0b);
-    u0b += float(crop.x); v0b += float(crop.y);
-    bool globalFlip = computeGlobalFlipDecision(
-        surf, std::min(128, tgtSize.width), std::min(128, tgtSize.height),
-        u0b, v0b, renderScale, scaleSeg, hasAffine, aff, centroid);
-
     // Build offset list
     auto allOffsets = buildOffsetList(numSlices, sliceStep, dsScale, accumOffsets);
 
@@ -657,7 +590,7 @@ static void renderTiles(
                         size_t offX = (size_t(tx) & 1) * halfCW;
                         auto& pa = pyrAccum[0];
                         if (l1cx < pa.bufs.size()) {
-                            downsampleTileInto(
+                            downsampleTileIntoPreserveZ(
                                 existingBuf.data(), chunkZ, chunkY, chunkX,
                                 pa.bufs[l1cx].data(), pa.chZ, pa.chY, pa.chX,
                                 numZ, dy_actual, dx_actual,
@@ -680,7 +613,7 @@ static void renderTiles(
 
             // 2. Prepare base coords and step directions
             cv::Mat_<cv::Vec3f> base, dirs;
-            prepareBaseAndDirs(tilePts, tileNrm, scaleSeg, dsScale, hasAffine, aff, globalFlip, base, dirs);
+            prepareBaseAndDirs(tilePts, tileNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
 
             // 3. Sample all slices for this tile (single-threaded)
             std::vector<cv::Mat_<T>> raw;
@@ -748,7 +681,7 @@ static void renderTiles(
                     size_t offX = (size_t(tx) & 1) * halfCW;
                     auto& pa = pyrAccum[0];
                     if (l1cx < pa.bufs.size()) {
-                        downsampleTileInto(
+                        downsampleTileIntoPreserveZ(
                             chunkBuf.data(), chunkZ, chunkY, chunkX,
                             pa.bufs[l1cx].data(), pa.chZ, pa.chY, pa.chX,
                             numZ, dy_actual, dx_actual,
@@ -823,7 +756,7 @@ static void renderTiles(
                         size_t offY = (pyrChunkRow & 1) * halfY;
                         size_t offX = (cx & 1) * halfX;
                         if (nextCx < nextPa.bufs.size()) {
-                            downsampleTileInto(
+                            downsampleTileIntoPreserveZ(
                                 pa.bufs[cx].data(), pa.chZ, pa.chY, pa.chX,
                                 nextPa.bufs[nextCx].data(), nextPa.chZ, nextPa.chY, nextPa.chX,
                                 pa.chZ, pa.chY, pa.chX,

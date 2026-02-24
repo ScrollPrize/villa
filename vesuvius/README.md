@@ -26,7 +26,6 @@ _this package is in active development_
 | `vesuvius.predict`            | `models.run.inference`             | outputs logits from a pretrained nnUNet-v2 model or one trained within the Vesuvius training framework; currently only works on Zarr data and can be fully distributed with `--num_parts` and `--part_id` |
 | `vesuvius.blend_logits`       | `models.run.blending`              | blends the logits from `vesuvius.predict` using Gaussian blending                                                                                                                                         |
 | `vesuvius.finalize_outputs`   | `models.run.finalize_outputs`      | performs softmax / argmax / none on the blended array and writes a final `uint8` volume                                                                                                                   |
-| `vesuvius.inference_pipeline` | `models.run.vesuvius_pipeline`     | runs the three steps above (predict → blend → finalize) in sequence                                                                                                                                       |
 | `vesuvius.compute_st`         | `structure_tensor.run_create_st`   | computes structure tensors on input data and derives eigen-values/vectors                                                                                                                                 |
 | `vesuvius.napari_trainer`     | `napari_trainer.main_window`       | launches a Napari window for interactive training and inference                                                                                                                                           |
 | `vesuvius.proofreader`        | `utils.vc_proofreader.main`        | opens a Napari window that loads local / remote image-label arrays and extracts training patches                                                                                                          |
@@ -153,32 +152,6 @@ Training will output the current losses in the `tqdm` progress bar, and will sav
 By default, the last 10 checkpoints are saved. This is not a smart way to do it, and will be changed to just store the last 3 + last 2 best validation. 
 
 Training will run for 1,000 epochs by default, with 200 batches/epoch. This can be modified through the configuration file, which can be optionally provided to `vesuvius.train`, and some examples are provided in the [models folder](src/vesuvius/models/configuration/)
-
-### Running inference with `vesuvius.inference_pipeline`
-
-Detailed documentation is available in [the inference readme](docs/docs/inference.md)
-
-The inference process is a bit convoluted. Due to our focus on very large volumetric data, it becomes very difficult for writes to keep pace with multi-gpu systems, necessitating a map-reduce style of inference where we store intermediate logits before blending.  It **stores a very large amount of intermediate data** , in the form of float16 logits from patches. In the case that you do not have a lot of storage space, it might make sense to borrow some of the functions from the inferer, and rewrite the inference process to write directly to uint8 final arrays.
-
-The inference process is in 3 parts -- inference, blending, and finalization
-
-1. `inference.py` creates a vc_dataset, which reads data from the Volume class in volume.py
- 
-    - patches are ran through forward passes in batches, and either rotation or mirroring TTA is applied
-    - patches are stored in intermediate 'logits' arrays, named by their gpu rank, in a zarr array of shape `patch_z, patch_y, patch_x * num_patches`. It's just a zarr array that is very long and skinny. the reason for this is that writing to overlapping chunks in zarr arrays (which we have because we take 50% of the patch size as overlap during inference) is difficult when you have to keep pace with your gpus to avoid unbounded memory growth. We went with a map-reduce style here to avoid this entirely.
-2. the logits arrays are read by `blending.py` chunkwise, along with their 8 neighbors (which contribute to their final values), and accumulated into a "weights array"
-   - this accumulation array is normalized chunkwise by the number of patches which contributed to its values
-3. the blended array is read by `finalize_outputs.py` , which applies the activation functions (softmax, argmax, or none), casts to uint8, and writes the final zarr
-
-This pipeline can be performed individually, through `vesuvius.predict` , `vesuvius.blend_logits` and `vesuvius.finalize_outputs`, respectively. It also can be performed sequentially with `vesuvius.inference_pipeline` 
-
-On a single machine, running the full pipeline is recommended. You can use local volumes or remote (s3, http) volumes. To begin inference, run
-```
-vesuvius.inference_pipeline --input /path/to/input.zarr --output /path/to/output.zarr --model hf://scrollprize/surface_recto --batch-size 4
-```
-You can use local models or models hosted on huggingface hub, so long as they are either nnUNetv2 models or models created with the vesuvius trainer. We have some of our fiber and surface models hosted [here](https://huggingface.co/collections/scrollprize/representation-67e1b44299d5c18f5845874f), but you could use your own as well. 
-
-To use a local model point at either the `nnUNet_results` folder which contains the `dataset.json` and the `fold` directories, or if using a vesuvius model, the `checkpoint.pth` file
 
 ### Rendering and Flattening objs
 Documentation is provided in [the rendering folder](src/vesuvius/rendering/README.md)
