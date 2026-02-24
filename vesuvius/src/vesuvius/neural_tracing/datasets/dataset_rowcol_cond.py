@@ -4,8 +4,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 import json
-import hashlib
-import pickle
 import tifffile
 from pathlib import Path
 from vesuvius.neural_tracing.datasets.common import ChunkPatch, compute_heatmap_targets, voxelize_surface_grid
@@ -19,7 +17,6 @@ from scipy import ndimage
 from collections import OrderedDict
 import warnings
 import re
-import os
 from functools import lru_cache
 
 class EdtSegDataset(Dataset):
@@ -158,8 +155,6 @@ class EdtSegDataset(Dataset):
         config.setdefault('triplet_surface_cache_max_items', 0)
         config.setdefault('triplet_overlap_mask_filename', 'overlap_mask.tif')
         config.setdefault('triplet_warn_missing_overlap_masks', False)
-        config.setdefault('triplet_lookup_cache_enabled', True)
-        config.setdefault('triplet_lookup_cache_dir', None)
         config.setdefault('triplet_close_check_enabled', True)
         config.setdefault('triplet_close_distance_voxels', 1.0)
         config.setdefault('triplet_close_fraction_threshold', 0.05)
@@ -418,39 +413,24 @@ class EdtSegDataset(Dataset):
                         segments=scaled_segments,
                     ))
 
-            triplet_cache_path = None
-            loaded_triplet_cache = False
-            cached_sample_index = None
             if self.use_triplet_wrap_displacement:
                 if self.sample_mode != 'wrap':
                     raise ValueError("use_triplet_wrap_displacement=True requires sample_mode='wrap'")
-                triplet_cache_path = self._resolve_triplet_lookup_cache_path(patches)
-                if triplet_cache_path is not None:
-                    loaded_triplet_cache, patches, cached_sample_index = self._try_load_triplet_lookup_cache(
-                        triplet_cache_path,
-                        patches,
-                    )
-                if not loaded_triplet_cache:
-                    patches = self._filter_triplet_overlap_chunks(patches)
+                patches = self._filter_triplet_overlap_chunks(patches)
 
             self.patches = patches
-            if loaded_triplet_cache:
-                self.sample_index = cached_sample_index
-            else:
-                self.sample_index = self._build_sample_index()
-                if self.use_triplet_wrap_displacement:
-                    self._triplet_neighbor_lookup = self._build_triplet_neighbor_lookup()
-                    self.sample_index = [
-                        (patch_idx, wrap_idx)
-                        for patch_idx, wrap_idx in self.sample_index
-                        if (patch_idx, wrap_idx) in self._triplet_neighbor_lookup
-                    ]
-                    if not self.sample_index:
-                        raise ValueError(
-                            "Triplet mode enabled but no wraps have same/adjacent neighbors on both sides."
-                        )
-                    if triplet_cache_path is not None:
-                        self._save_triplet_lookup_cache(triplet_cache_path)
+            self.sample_index = self._build_sample_index()
+            if self.use_triplet_wrap_displacement:
+                self._triplet_neighbor_lookup = self._build_triplet_neighbor_lookup()
+                self.sample_index = [
+                    (patch_idx, wrap_idx)
+                    for patch_idx, wrap_idx in self.sample_index
+                    if (patch_idx, wrap_idx) in self._triplet_neighbor_lookup
+                ]
+                if not self.sample_index:
+                    raise ValueError(
+                        "Triplet mode enabled but no wraps have same/adjacent neighbors on both sides."
+                    )
             self._cond_percent_min, self._cond_percent_max = self._parse_cond_percent()
         else:
             self._load_patch_metadata(patch_metadata)
@@ -575,152 +555,6 @@ class EdtSegDataset(Dataset):
                 f"missing_masks={filter_stats['missing_masks']}"
             )
         return kept
-
-    def _resolve_triplet_lookup_cache_path(self, patches):
-        if not self.use_triplet_wrap_displacement:
-            return None
-        if not bool(self.config.get("triplet_lookup_cache_enabled", True)):
-            return None
-        if len(patches) == 0:
-            return None
-
-        cache_dir_cfg = self.config.get("triplet_lookup_cache_dir", None)
-        cache_dir = Path(cache_dir_cfg) if cache_dir_cfg else Path("/tmp/vesuvius_triplet_lookup_cache")
-
-        try:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            cache_dir = Path("/tmp/vesuvius_triplet_lookup_cache")
-            try:
-                cache_dir.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                return None
-
-        cache_key = self._compute_triplet_lookup_cache_key(patches)
-        return cache_dir / f"triplet_lookup_{cache_key}.pkl"
-
-    def _compute_triplet_lookup_cache_key(self, patches):
-        key_cfg = {
-            "version": 4,
-            "sample_mode": self.sample_mode,
-            "triplet_overlap_mask_filename": str(self.config.get("triplet_overlap_mask_filename", "overlap_mask.tif")),
-            "triplet_dense_weight_mode": str(self.config.get("triplet_dense_weight_mode", "band")),
-            "triplet_band_distance_percentile": float(self.config.get("triplet_band_distance_percentile", 95.0)),
-            "triplet_band_padding_voxels": float(self.config.get("triplet_band_padding_voxels", 4.0)),
-            "triplet_gt_vector_dilation_radius": float(self.config.get("triplet_gt_vector_dilation_radius", 0.0)),
-            "crop_size": tuple(int(v) for v in self.crop_size),
-        }
-        hasher = hashlib.sha256()
-        hasher.update(json.dumps(key_cfg, sort_keys=True).encode("utf-8"))
-
-        for patch in patches:
-            hasher.update(np.asarray(patch.chunk_id, dtype=np.int64).tobytes())
-            hasher.update(np.asarray(patch.world_bbox, dtype=np.float64).tobytes())
-            hasher.update(np.asarray([int(patch.scale), int(len(patch.wraps))], dtype=np.int64).tobytes())
-            for wrap in patch.wraps:
-                seg = wrap.get("segment")
-                seg_path = str(getattr(seg, "path", ""))
-                hasher.update(seg_path.encode("utf-8", errors="ignore"))
-                hasher.update(b"\0")
-                hasher.update(np.asarray(wrap.get("bbox_2d", (0, 0, 0, 0)), dtype=np.int64).tobytes())
-                hasher.update(
-                    np.asarray(
-                        [int(wrap.get("segment_idx", -1)), int(wrap.get("wrap_id", -1))],
-                        dtype=np.int64,
-                    ).tobytes()
-                )
-        return hasher.hexdigest()
-
-    def _try_load_triplet_lookup_cache(self, cache_path: Path, patches):
-        try:
-            with cache_path.open("rb") as f:
-                payload = pickle.load(f)
-        except (OSError, pickle.UnpicklingError, EOFError):
-            return False, patches, None
-
-        kept_indices = payload.get("kept_patch_indices", ())
-        if not isinstance(kept_indices, (list, tuple)):
-            return False, patches, None
-
-        kept_indices = [int(i) for i in kept_indices]
-        if any((i < 0 or i >= len(patches)) for i in kept_indices):
-            return False, patches, None
-
-        cached_patches = [patches[i] for i in kept_indices]
-        if len(cached_patches) == 0:
-            return False, patches, None
-
-        triplet_lookup = payload.get("triplet_neighbor_lookup", {})
-        if not isinstance(triplet_lookup, dict) or len(triplet_lookup) == 0:
-            return False, patches, None
-
-        remapped_lookup = {}
-        for key, value in triplet_lookup.items():
-            if not (isinstance(key, tuple) and len(key) == 2):
-                continue
-            patch_idx = int(key[0])
-            wrap_idx = int(key[1])
-            if patch_idx < 0 or patch_idx >= len(cached_patches):
-                continue
-            if wrap_idx < 0 or wrap_idx >= len(cached_patches[patch_idx].wraps):
-                continue
-            remapped_lookup[(patch_idx, wrap_idx)] = value
-        if len(remapped_lookup) == 0:
-            return False, patches, None
-
-        sample_index_raw = payload.get("sample_index", ())
-        if not isinstance(sample_index_raw, (list, tuple)):
-            return False, patches, None
-
-        sample_index = []
-        for pair in sample_index_raw:
-            if not (isinstance(pair, (list, tuple)) and len(pair) == 2):
-                continue
-            patch_idx = int(pair[0])
-            wrap_idx = int(pair[1])
-            if patch_idx < 0 or patch_idx >= len(cached_patches):
-                continue
-            if wrap_idx < 0 or wrap_idx >= len(cached_patches[patch_idx].wraps):
-                continue
-            if (patch_idx, wrap_idx) not in remapped_lookup:
-                continue
-            sample_index.append((patch_idx, wrap_idx))
-        if len(sample_index) == 0:
-            return False, patches, None
-
-        self._triplet_neighbor_lookup = remapped_lookup
-        self._triplet_lookup_stats = payload.get("triplet_lookup_stats", {})
-        self._triplet_overlap_filter_stats = payload.get("triplet_overlap_filter_stats", {})
-        self._triplet_overlap_kept_indices = tuple(kept_indices)
-        return True, cached_patches, sample_index
-
-    def _save_triplet_lookup_cache(self, cache_path: Path):
-        kept_indices = tuple(int(i) for i in getattr(self, "_triplet_overlap_kept_indices", tuple()))
-        if len(kept_indices) == 0:
-            return
-        if len(self._triplet_neighbor_lookup) == 0:
-            return
-        if len(self.sample_index) == 0:
-            return
-
-        payload = {
-            "kept_patch_indices": kept_indices,
-            "triplet_neighbor_lookup": self._triplet_neighbor_lookup,
-            "sample_index": tuple(self.sample_index),
-            "triplet_lookup_stats": self._triplet_lookup_stats,
-            "triplet_overlap_filter_stats": getattr(self, "_triplet_overlap_filter_stats", {}),
-        }
-        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        try:
-            with tmp_path.open("wb") as f:
-                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-            os.replace(tmp_path, cache_path)
-        except OSError:
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except OSError:
-                pass
 
     def _load_patch_metadata(self, patch_metadata):
         metadata_triplet_mode = bool(
