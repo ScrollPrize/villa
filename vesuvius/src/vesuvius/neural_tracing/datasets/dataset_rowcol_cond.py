@@ -13,9 +13,12 @@ from vesuvius.neural_tracing.datasets.direction_helpers import (
     maybe_swap_triplet_branch_channels,
 )
 from vesuvius.neural_tracing.datasets.dataset_defaults import setdefault_rowcol_cond_dataset_config
-from vesuvius.neural_tracing.datasets.conditioning_perturbation import (
+from vesuvius.neural_tracing.datasets.perturbation import (
     compute_surface_normals,
-    maybe_perturb_conditioning_surface,
+)
+from vesuvius.neural_tracing.datasets.conditioning import (
+    create_centered_conditioning,
+    create_split_conditioning,
 )
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
@@ -899,36 +902,17 @@ class EdtSegDataset(Dataset):
 
     def _getitem_triplet_wrap_displacement(self, idx: int, patch_idx: int, wrap_idx: int):
         patch = self.patches[patch_idx]
-        triplet_meta = self._triplet_neighbor_lookup.get((patch_idx, wrap_idx))
-        if triplet_meta is None:
+        conditioning = create_centered_conditioning(self, idx, patch_idx, wrap_idx, patch)
+        if conditioning is None:
             return self[np.random.randint(len(self))]
-
-        center_zyxs = self._extract_wrap_world_surface_cached(patch_idx, wrap_idx, require_all_valid=True)
-        behind_zyxs = self._extract_wrap_world_surface_cached(
-            patch_idx, triplet_meta["behind_wrap_idx"], require_all_valid=True
-        )
-        front_zyxs = self._extract_wrap_world_surface_cached(
-            patch_idx, triplet_meta["front_wrap_idx"], require_all_valid=True
-        )
-        if center_zyxs is None or behind_zyxs is None or front_zyxs is None:
-            return self[np.random.randint(len(self))]
-
-        center_zyxs_unperturbed = center_zyxs
-        center_zyxs_perturbed = maybe_perturb_conditioning_surface(
-            center_zyxs_unperturbed,
-            config=self.config,
-            apply_augmentation=self.apply_augmentation,
-        )
-
+        center_zyxs_unperturbed = conditioning["center_zyxs_unperturbed"]
+        center_zyxs_perturbed = conditioning["center_zyxs_perturbed"]
+        behind_zyxs = conditioning["behind_zyxs"]
+        front_zyxs = conditioning["front_zyxs"]
+        min_corner = conditioning["min_corner"]
+        max_corner = conditioning["max_corner"]
+        vol_cache_key = conditioning["vol_cache_key"]
         crop_size = self.crop_size
-        z_min, _, y_min, _, x_min, _ = patch.world_bbox
-        min_corner = np.round([z_min, y_min, x_min]).astype(np.int64)
-        max_corner = min_corner + np.array(crop_size)
-        vol_cache_key = (
-            patch_idx,
-            int(min_corner[0]), int(min_corner[1]), int(min_corner[2]),
-            int(crop_size[0]), int(crop_size[1]), int(crop_size[2]),
-        )
 
         vol_crop = self._load_volume_crop_from_patch(
             patch,
@@ -1391,125 +1375,25 @@ class EdtSegDataset(Dataset):
         crop_size = self.crop_size  # tuple (D, H, W)
         target_shape = crop_size
 
-        # in wrap mode, use the indexed wrap; in chunk mode, choose randomly (legacy behavior)
-        wrap = patch.wraps[wrap_idx] if wrap_idx is not None else random.choice(patch.wraps)
-        seg = wrap["segment"]
-        r_min, r_max, c_min, c_max = wrap["bbox_2d"]
-
-        # clamp bbox to segment bounds (bbox is inclusive in stored resolution)
-        seg_h, seg_w = seg._valid_mask.shape
-        r_min = max(0, r_min)
-        r_max = min(seg_h - 1, r_max)
-        c_min = max(0, c_min)
-        c_max = min(seg_w - 1, c_max)
-        if r_max < r_min or c_max < c_min:
+        conditioning = create_split_conditioning(self, idx, patch_idx, wrap_idx, patch)
+        if conditioning is None:
             return self[np.random.randint(len(self))]
-
-        seg.use_stored_resolution()
-        scale_y, scale_x = seg._scale
-        x_full_s, y_full_s, z_full_s, valid_full_s = seg[r_min:r_max+1, c_min:c_max+1]
-
-        # if any sample contains an invalid point, just grab a new one
-        if not valid_full_s.all():
-            return self[np.random.randint(len(self))]
-
-        # upsampling here instead of in the tifxyz module because of the annoyances with 
-        # handling coords in dif scales
-        x_full, y_full, z_full = self._upsample_world_triplet(x_full_s, y_full_s, z_full_s, scale_y, scale_x)
-        trimmed = self._trim_to_world_bbox(x_full, y_full, z_full, patch.world_bbox)
-        if trimmed is None:
-            return self[np.random.randint(len(self))]
-        x_full, y_full, z_full = trimmed
-        h_up, w_up = x_full.shape  # update dimensions after crop
-
-        # split into cond and mask on the upsampled grid
-        conditioning_percent = random.uniform(self._cond_percent_min, self._cond_percent_max)
-        if h_up < 2 and w_up < 2:
-            return self[np.random.randint(len(self))]
-
-        valid_directions = []
-        if w_up >= 2:
-            valid_directions.extend(["left", "right"])
-        if h_up >= 2:
-            valid_directions.extend(["up", "down"])
-        if not valid_directions:
-            return self[np.random.randint(len(self))]
-
-        r_cond_up = int(round(h_up * conditioning_percent))
-        c_cond_up = int(round(w_up * conditioning_percent))
-        if h_up >= 2:
-            r_cond_up = min(max(r_cond_up, 1), h_up - 1)
-        if w_up >= 2:
-            c_cond_up = min(max(c_cond_up, 1), w_up - 1)
-
-        # Split boundaries measured from top/left in the upsampled frame.
-        r_split_up_top = r_cond_up
-        c_split_up_left = c_cond_up
-
-        cond_direction = random.choice(valid_directions)
-
-        if cond_direction == "left":
-            # conditioning is left, mask the right
-            x_cond, y_cond, z_cond = x_full[:, :c_split_up_left], y_full[:, :c_split_up_left], z_full[:, :c_split_up_left]
-            x_mask, y_mask, z_mask = x_full[:, c_split_up_left:], y_full[:, c_split_up_left:], z_full[:, c_split_up_left:]
-            cond_row_off, cond_col_off = 0, 0
-            mask_row_off, mask_col_off = 0, c_split_up_left
-        elif cond_direction == "right":
-            # conditioning is right, mask the left
-            c_split_up_left = w_up - c_cond_up
-            x_cond, y_cond, z_cond = x_full[:, c_split_up_left:], y_full[:, c_split_up_left:], z_full[:, c_split_up_left:]
-            x_mask, y_mask, z_mask = x_full[:, :c_split_up_left], y_full[:, :c_split_up_left], z_full[:, :c_split_up_left]
-            cond_row_off, cond_col_off = 0, c_split_up_left
-            mask_row_off, mask_col_off = 0, 0
-        elif cond_direction == "up":
-            # conditioning is up, mask the bottom
-            x_cond, y_cond, z_cond = x_full[:r_split_up_top, :], y_full[:r_split_up_top, :], z_full[:r_split_up_top, :]
-            x_mask, y_mask, z_mask = x_full[r_split_up_top:, :], y_full[r_split_up_top:, :], z_full[r_split_up_top:, :]
-            cond_row_off, cond_col_off = 0, 0
-            mask_row_off, mask_col_off = r_split_up_top, 0
-        elif cond_direction == "down":
-            # conditioning is down, mask the top
-            r_split_up_top = h_up - r_cond_up
-            x_cond, y_cond, z_cond = x_full[r_split_up_top:, :], y_full[r_split_up_top:, :], z_full[r_split_up_top:, :]
-            x_mask, y_mask, z_mask = x_full[:r_split_up_top, :], y_full[:r_split_up_top, :], z_full[:r_split_up_top, :]
-            cond_row_off, cond_col_off = r_split_up_top, 0
-            mask_row_off, mask_col_off = 0, 0
-
-        cond_h, cond_w = x_cond.shape
-        mask_h, mask_w = x_mask.shape
-        if cond_h == 0 or cond_w == 0 or mask_h == 0 or mask_w == 0:
-            return self[np.random.randint(len(self))]
-
-        uv_cond = np.stack(np.meshgrid(
-            np.arange(cond_h) + cond_row_off,
-            np.arange(cond_w) + cond_col_off,
-            indexing='ij'
-        ), axis=-1)
-
-        uv_mask = np.stack(np.meshgrid(
-            np.arange(mask_h) + mask_row_off,
-            np.arange(mask_w) + mask_col_off,
-            indexing='ij'
-        ), axis=-1)
-
-        cond_zyxs = np.stack([z_cond, y_cond, x_cond], axis=-1)
-        masked_zyxs = np.stack([z_mask, y_mask, x_mask], axis=-1)
-        cond_zyxs_unperturbed = cond_zyxs.copy()
-        cond_zyxs = maybe_perturb_conditioning_surface(
-            cond_zyxs,
-            config=self.config,
-            apply_augmentation=self.apply_augmentation,
-        )
-
-        # use world_bbox directly as crop position, this is the crop returned by find_patches
-        z_min, z_max, y_min, y_max, x_min, x_max = patch.world_bbox
-        min_corner = np.round([z_min, y_min, x_min]).astype(np.int64)
-        max_corner = min_corner + np.array(crop_size)
-        vol_cache_key = (
-            patch_idx,
-            int(min_corner[0]), int(min_corner[1]), int(min_corner[2]),
-            int(crop_size[0]), int(crop_size[1]), int(crop_size[2]),
-        )
+        wrap = conditioning["wrap"]
+        seg = conditioning["seg"]
+        r_min = conditioning["r_min"]
+        r_max = conditioning["r_max"]
+        c_min = conditioning["c_min"]
+        c_max = conditioning["c_max"]
+        conditioning_percent = conditioning["conditioning_percent"]
+        cond_direction = conditioning["cond_direction"]
+        uv_cond = conditioning["uv_cond"]
+        uv_mask = conditioning["uv_mask"]
+        cond_zyxs = conditioning["cond_zyxs"]
+        cond_zyxs_unperturbed = conditioning["cond_zyxs_unperturbed"]
+        masked_zyxs = conditioning["masked_zyxs"]
+        min_corner = conditioning["min_corner"]
+        max_corner = conditioning["max_corner"]
+        vol_cache_key = conditioning["vol_cache_key"]
 
         # if we're extrapolating, compute it with the extrapolation module
         if self.config['use_extrapolation']:
