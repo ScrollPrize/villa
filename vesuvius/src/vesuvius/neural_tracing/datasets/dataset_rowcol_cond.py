@@ -694,10 +694,13 @@ class EdtSegDataset(Dataset):
         if not self._validate_result_tensors_enabled:
             return True
         for key, tensor in result.items():
+            if not torch.is_tensor(tensor):
+                print(f"WARNING: Non-tensor value for '{key}' at index {idx}, resampling...")
+                return False
             if tensor.numel() == 0:
                 print(f"WARNING: Empty tensor for '{key}' at index {idx}, resampling...")
                 return False
-            if not np.isfinite(tensor.numpy()).all():
+            if not bool(torch.isfinite(tensor).all()):
                 print(f"WARNING: Non-finite values in '{key}' at index {idx}, resampling...")
                 return False
         return True
@@ -843,11 +846,11 @@ class EdtSegDataset(Dataset):
             return disp_full, weights_full, dist_full
         return disp_full, weights_full
 
-    def _getitem_triplet_wrap_displacement(self, idx: int, patch_idx: int, wrap_idx: int):
+    def create_neighbor_masks(self, idx: int, patch_idx: int, wrap_idx: int):
         patch = self.patches[patch_idx]
         conditioning = create_centered_conditioning(self, idx, patch_idx, wrap_idx, patch)
         if conditioning is None:
-            return self[np.random.randint(len(self))]
+            return None
         center_zyxs_unperturbed = conditioning["center_zyxs_unperturbed"]
         center_zyxs_perturbed = conditioning["center_zyxs_perturbed"]
         behind_zyxs = conditioning["behind_zyxs"]
@@ -880,34 +883,30 @@ class EdtSegDataset(Dataset):
         front_seg = voxelize_surface_grid(front_local, crop_size).astype(np.float32)
 
         if not center_seg.any() or not center_seg_gt.any() or not behind_seg.any() or not front_seg.any():
-            return self[np.random.randint(len(self))]
+            return None
 
-        masked_seg = np.maximum(behind_seg, front_seg).astype(np.float32)
+        return {
+            "vol": torch.from_numpy(vol_crop).to(torch.float32),
+            "cond": torch.from_numpy(center_seg).to(torch.float32),
+            "cond_gt": torch.from_numpy(center_seg_gt).to(torch.float32),
+            "behind_seg": torch.from_numpy(behind_seg).to(torch.float32),
+            "front_seg": torch.from_numpy(front_seg).to(torch.float32),
+        }
 
-        vol_crop = torch.from_numpy(vol_crop).to(torch.float32)
-        center_seg = torch.from_numpy(center_seg).to(torch.float32)
-        center_seg_gt = torch.from_numpy(center_seg_gt).to(torch.float32)
-        behind_seg = torch.from_numpy(behind_seg).to(torch.float32)
-        front_seg = torch.from_numpy(front_seg).to(torch.float32)
-        masked_seg = torch.from_numpy(masked_seg).to(torch.float32)
-
-        if self._augmentations is not None:
-            seg_list = torch.stack([masked_seg, center_seg, center_seg_gt, behind_seg, front_seg], dim=0)
-            augmented = self._augmentations(
-                image=vol_crop[None],
-                segmentation=seg_list,
-                crop_shape=crop_size,
-            )
-            vol_crop = augmented["image"].squeeze(0)
-            masked_seg = augmented["segmentation"][0]
-            center_seg = augmented["segmentation"][1]
-            center_seg_gt = augmented["segmentation"][2]
-            behind_seg = augmented["segmentation"][3]
-            front_seg = augmented["segmentation"][4]
-
-        cond_np = center_seg_gt.numpy()
-        behind_np = behind_seg.numpy()
-        front_np = front_seg.numpy()
+    def create_neighbor_targets(
+        self,
+        *,
+        cond_seg_gt: torch.Tensor,
+        behind_seg: torch.Tensor,
+        front_seg: torch.Tensor,
+        idx: int,
+        patch_idx: int,
+        wrap_idx: int,
+    ):
+        crop_size = self.crop_size
+        cond_np = cond_seg_gt.detach().cpu().numpy()
+        behind_np = behind_seg.detach().cpu().numpy()
+        front_np = front_seg.detach().cpu().numpy()
 
         weight_mode = str(self.config.get("triplet_dense_weight_mode", "band")).lower()
         need_neighbor_distances = weight_mode == "band"
@@ -931,7 +930,7 @@ class EdtSegDataset(Dataset):
             behind_bin_for_gt = behind_bin_full
             front_bin_for_gt = front_bin_full
         if not behind_bin_for_gt.any() or not front_bin_for_gt.any():
-            return self[np.random.randint(len(self))]
+            return None
 
         band_padding = max(0.0, float(self.config.get("triplet_band_padding_voxels", 4.0)))
         band_pct = float(self.config.get("triplet_band_distance_percentile", 95.0))
@@ -999,7 +998,7 @@ class EdtSegDataset(Dataset):
             d_behind_work = None
             d_front_work = None
         if behind_disp_work is None or front_disp_work is None:
-            return self[np.random.randint(len(self))]
+            return None
         behind_disp_np = behind_disp_work.astype(np.float32, copy=False)
         front_disp_np = front_disp_work.astype(np.float32, copy=False)
         if self.triplet_close_check_enabled:
@@ -1023,23 +1022,23 @@ class EdtSegDataset(Dataset):
                         f"thr={self.triplet_close_fraction_threshold:.4f} "
                         f"dist<={self.triplet_close_distance_voxels:.3f}"
                     )
-                return self[np.random.randint(len(self))]
+                return None
 
         if weight_mode == "all":
             dense_weight_np = np.ones((1, *crop_size), dtype=np.float32)
         elif weight_mode == "band":
             if d_behind_work is None or d_front_work is None:
-                return self[np.random.randint(len(self))]
+                return None
 
             cond_bin = cond_bin_full.astype(np.uint8, copy=False)
             if cond_bin.sum() == 0:
-                return self[np.random.randint(len(self))]
+                return None
 
             cond_mask = cond_bin > 0
             cond_to_front = d_front_work[cond_mask]
             cond_to_behind = d_behind_work[cond_mask]
             if cond_to_front.size == 0 or cond_to_behind.size == 0:
-                return self[np.random.randint(len(self))]
+                return None
 
             # Build a dense slab between front/back using displacement geometry:
             # inside points tend to have front/back displacement vectors pointing
@@ -1047,22 +1046,22 @@ class EdtSegDataset(Dataset):
             d_sum_work = d_front_work + d_behind_work
             cond_sum = (cond_to_front + cond_to_behind).astype(np.float32, copy=False)
             if cond_sum.size == 0:
-                return self[np.random.randint(len(self))]
+                return None
 
             sum_threshold = float(np.percentile(cond_sum, band_pct)) + (2.0 * band_padding)
             vector_dot = np.sum(front_disp_work * behind_disp_work, axis=0, dtype=np.float32)
             dense_band = (vector_dot <= 0.0) & (d_sum_work <= sum_threshold)
             if not dense_band.any():
-                return self[np.random.randint(len(self))]
+                return None
 
             # Remove isolated islands: keep only components connected to conditioning.
             labels, num_labels = ndimage.label(dense_band, structure=self._cc_structure_26)
             if num_labels <= 0:
-                return self[np.random.randint(len(self))]
+                return None
             touching = np.unique(labels[cond_mask])
             touching = touching[touching > 0]
             if touching.size == 0:
-                return self[np.random.randint(len(self))]
+                return None
             keep = np.zeros(num_labels + 1, dtype=bool)
             keep[touching] = True
 
@@ -1074,16 +1073,16 @@ class EdtSegDataset(Dataset):
                 iterations=1,
             )
             if not dense_band.any():
-                return self[np.random.randint(len(self))]
+                return None
 
             # Closing can create small detached islands; keep only cond-connected components.
             labels, num_labels = ndimage.label(dense_band, structure=self._cc_structure_26)
             if num_labels <= 0:
-                return self[np.random.randint(len(self))]
+                return None
             touching = np.unique(labels[cond_mask])
             touching = touching[touching > 0]
             if touching.size == 0:
-                return self[np.random.randint(len(self))]
+                return None
             keep = np.zeros(num_labels + 1, dtype=bool)
             keep[touching] = True
             dense_band = keep[labels].astype(np.float32, copy=False)
@@ -1094,7 +1093,7 @@ class EdtSegDataset(Dataset):
                 f"got {weight_mode!r}"
             )
         if float(dense_weight_np.sum()) <= 0:
-            return self[np.random.randint(len(self))]
+            return None
 
         dense_gt_np = np.concatenate([behind_disp_np, front_disp_np], axis=0).astype(np.float32, copy=False)
         dir_priors_np = None
@@ -1116,17 +1115,12 @@ class EdtSegDataset(Dataset):
         dense_loss_weight = torch.from_numpy(dense_weight_np).to(torch.float32)
 
         result = {
-            "vol": vol_crop,
-            "cond": center_seg,
-            "masked_seg": masked_seg,
             "dense_gt_displacement": dense_gt_disp,  # (6, D, H, W): channel0(dz,dy,dx), channel1(dz,dy,dx)
             "dense_loss_weight": dense_loss_weight,  # (1, D, H, W)
             "triplet_channel_order": torch.from_numpy(triplet_channel_order_np).to(torch.int64),  # [2]: slot0/slot1 -> canonical A/B
         }
         if dir_priors_np is not None:
             result["dir_priors"] = torch.from_numpy(dir_priors_np).to(torch.float32)
-        if not self._validate_result_tensors(result, idx):
-            return self[np.random.randint(len(self))]
         return result
 
     @staticmethod
@@ -1300,18 +1294,14 @@ class EdtSegDataset(Dataset):
         dist_inside = ndimage.distance_transform_edt(mask_bool)
         return (dist_inside - dist_outside).astype(np.float32, copy=False)
 
-    def __getitem__(self, idx):
-        patch_idx, wrap_idx = self.sample_index[idx]
-        if self.use_triplet_wrap_displacement:
-            return self._getitem_triplet_wrap_displacement(idx, patch_idx, wrap_idx)
-
+    def create_split_masks(self, idx: int, patch_idx: int, wrap_idx: int):
         patch = self.patches[patch_idx]
         crop_size = self.crop_size  # tuple (D, H, W)
         target_shape = crop_size
 
         conditioning = create_split_conditioning(self, idx, patch_idx, wrap_idx, patch)
         if conditioning is None:
-            return self[np.random.randint(len(self))]
+            return None
         wrap = conditioning["wrap"]
         seg = conditioning["seg"]
         r_min = conditioning["r_min"]
@@ -1349,9 +1339,9 @@ class EdtSegDataset(Dataset):
 
         # make sure we actually have some conditioning
         if not cond_segmentation.any():
-            return self[np.random.randint(len(self))]
+            return None
         if not cond_segmentation_gt.any():
-            return self[np.random.randint(len(self))]
+            return None
 
         cond_segmentation_raw = cond_segmentation.copy()
         cond_segmentation_gt_raw = cond_segmentation_gt.copy()
@@ -1419,7 +1409,7 @@ class EdtSegDataset(Dataset):
                 axis_1d=self._heatmap_axes[0],
             )
             if heatmap_tensor is None:
-                return self[np.random.randint(len(self))]
+                return None
 
         # other wrap conditioning: find and voxelize other wraps from the same segment
         use_other_wrap_cond = self.config['use_other_wrap_cond']
@@ -1466,117 +1456,185 @@ class EdtSegDataset(Dataset):
                     other_vox = voxelize_surface_grid(other_zyxs_local, crop_shape)
                     other_wraps_vox = np.maximum(other_wraps_vox, other_vox)
 
-        vol_crop = torch.from_numpy(vol_crop).to(torch.float32)
-        masked_seg = torch.from_numpy(masked_segmentation).to(torch.float32)
-        cond_seg = torch.from_numpy(cond_segmentation).to(torch.float32)
-        cond_seg_gt = torch.from_numpy(cond_segmentation_gt_raw).to(torch.float32)
-        other_wraps_tensor = torch.from_numpy(other_wraps_vox).to(torch.float32)
+        result = {
+            "vol": torch.from_numpy(vol_crop).to(torch.float32),
+            "masked_seg": torch.from_numpy(masked_segmentation).to(torch.float32),
+            "cond": torch.from_numpy(cond_segmentation).to(torch.float32),
+            "cond_gt": torch.from_numpy(cond_segmentation_gt_raw).to(torch.float32),
+            "other_wraps": torch.from_numpy(other_wraps_vox).to(torch.float32),
+        }
         if use_segmentation:
-            full_seg = torch.from_numpy(seg_dilated).to(torch.float32)
-            seg_skel = torch.from_numpy(seg_skel).to(torch.float32)
-
-        use_sdt = self.config['use_sdt']
+            result["segmentation"] = torch.from_numpy(seg_dilated).to(torch.float32)
+            result["segmentation_skel"] = torch.from_numpy(seg_skel).to(torch.float32)
         if use_sdt:
-            sdt_tensor = torch.from_numpy(sdt).to(torch.float32)
+            result["sdt"] = torch.from_numpy(sdt).to(torch.float32)
+        if use_heatmap:
+            result["heatmap_target"] = heatmap_tensor.to(torch.float32)
+        return result
 
-        if self._augmentations is not None:
-            seg_list = [masked_seg, cond_seg, other_wraps_tensor]
-            seg_keys = ['masked_seg', 'cond_seg', 'other_wraps']
-            seg_list.append(cond_seg_gt)
-            seg_keys.append('cond_seg_gt')
-            if use_segmentation:
-                seg_list.append(full_seg)
-                seg_keys.append('full_seg')
-                seg_list.append(seg_skel)
-                seg_keys.append('seg_skel')
-
-            dist_list = []
-            dist_keys = []
-            if use_sdt:
-                dist_list.append(sdt_tensor)
-                dist_keys.append('sdt')
-
-            aug_kwargs = {
-                'image': vol_crop[None],  # [1, D, H, W]
-                'segmentation': torch.stack(seg_list, dim=0),
-                'crop_shape': crop_size,
-            }
-            if dist_list:
-                aug_kwargs['dist_map'] = torch.stack(dist_list, dim=0)
-            if use_heatmap:
-                aug_kwargs['heatmap_target'] = heatmap_tensor[None]  # (1, D, H, W)
-                aug_kwargs['regression_keys'] = ['heatmap_target']
-
-            augmented = self._augmentations(**aug_kwargs)
-
-            vol_crop = augmented['image'].squeeze(0)
-            for i, key in enumerate(seg_keys):
-                if key == 'masked_seg':
-                    masked_seg = augmented['segmentation'][i]
-                elif key == 'cond_seg':
-                    cond_seg = augmented['segmentation'][i]
-                elif key == 'other_wraps':
-                    other_wraps_tensor = augmented['segmentation'][i]
-                elif key == 'cond_seg_gt':
-                    cond_seg_gt = augmented['segmentation'][i]
-                elif key == 'full_seg':
-                    full_seg = augmented['segmentation'][i]
-                elif key == 'seg_skel':
-                    seg_skel = augmented['segmentation'][i]
-
-            if dist_list:
-                for i, key in enumerate(dist_keys):
-                    if key == 'sdt':
-                        sdt_tensor = augmented['dist_map'][i]
-
-            if use_heatmap:
-                heatmap_tensor = augmented['heatmap_target'].squeeze(0)
-
-        # Build dense GT from augmented surfaces so supervision is in the same frame
-        # as transformed inputs/labels.
+    def create_split_targets(
+        self,
+        *,
+        cond_seg_gt: torch.Tensor,
+        masked_seg: torch.Tensor,
+    ):
         full_dense_surface = torch.maximum(masked_seg, cond_seg_gt)
         dense_disp_np, dense_weight_np = self._compute_dense_displacement_field(
-            full_dense_surface.numpy()
+            full_dense_surface.detach().cpu().numpy()
         )
         if dense_disp_np is None:
-            return self[np.random.randint(len(self))]
+            return None
         dense_gt_disp = torch.from_numpy(dense_disp_np).to(torch.float32)
         dense_loss_weight = torch.from_numpy(dense_weight_np).to(torch.float32)
-
-        result = {
-            "vol": vol_crop,                 # raw volume crop
-            "cond": cond_seg,                # conditioning segmentation
-            "masked_seg": masked_seg,        # masked (target) segmentation
+        return {
+            "dense_gt_displacement": dense_gt_disp,  # (3, D, H, W)
+            "dense_loss_weight": dense_loss_weight,  # (1, D, H, W)
         }
 
-        if use_other_wrap_cond:
-            result["other_wraps"] = other_wraps_tensor  # other wraps from same segment as context
-
-        result["dense_gt_displacement"] = dense_gt_disp  # (3, D, H, W)
-        result["dense_loss_weight"] = dense_loss_weight  # (1, D, H, W)
-
-        if use_sdt:
-            result["sdt"] = sdt_tensor                 # signed distance transform of full (dilated) segmentation
-
-        if use_heatmap:
-            result["heatmap_target"] = heatmap_tensor  # (D, H, W) gaussian heatmap at expected positions
-
-        if use_segmentation:
-            result["segmentation"] = full_seg           # full segmentation (cond + masked)
-            result["segmentation_skel"] = seg_skel      # skeleton for medial surface recall loss
-
-        # Validate all tensors are non-empty and contain no NaN/Inf
-        for key, tensor in result.items():
-            if tensor.numel() == 0:
-                print(f"WARNING: Empty tensor for '{key}' at index {idx}, resampling...")
-                return self[np.random.randint(len(self))]
-            if torch.isnan(tensor).any():
-                print(f"WARNING: NaN values in '{key}' at index {idx}, resampling...")
-                return self[np.random.randint(len(self))]
-            if torch.isinf(tensor).any():
-                print(f"WARNING: Inf values in '{key}' at index {idx}, resampling...")
+    def __getitem__(self, idx):
+        patch_idx, wrap_idx = self.sample_index[idx]
+        if self.use_triplet_wrap_displacement:
+            mask_bundle = self.create_neighbor_masks(idx, patch_idx, wrap_idx)
+            if mask_bundle is None:
                 return self[np.random.randint(len(self))]
 
+            vol_crop = mask_bundle["vol"]
+            cond_seg = mask_bundle["cond"]
+            cond_seg_gt = mask_bundle["cond_gt"]
+            behind_seg = mask_bundle["behind_seg"]
+            front_seg = mask_bundle["front_seg"]
+
+            if self._augmentations is not None:
+                seg_list = torch.stack([cond_seg, cond_seg_gt, behind_seg, front_seg], dim=0)
+                augmented = self._augmentations(
+                    image=vol_crop[None],
+                    segmentation=seg_list,
+                    crop_shape=self.crop_size,
+                )
+                vol_crop = augmented["image"].squeeze(0)
+                cond_seg = augmented["segmentation"][0]
+                cond_seg_gt = augmented["segmentation"][1]
+                behind_seg = augmented["segmentation"][2]
+                front_seg = augmented["segmentation"][3]
+
+            target_payload = self.create_neighbor_targets(
+                cond_seg_gt=cond_seg_gt,
+                behind_seg=behind_seg,
+                front_seg=front_seg,
+                idx=idx,
+                patch_idx=patch_idx,
+                wrap_idx=wrap_idx,
+            )
+            if target_payload is None:
+                return self[np.random.randint(len(self))]
+
+            result = {
+                "vol": vol_crop,
+                "cond": cond_seg,
+            }
+            result.update(target_payload)
+        else:
+            use_other_wrap_cond = self.config['use_other_wrap_cond']
+            use_sdt = self.config['use_sdt']
+            use_heatmap = self.config['use_heatmap_targets']
+            use_segmentation = self.config.get('use_segmentation', False)
+
+            mask_bundle = self.create_split_masks(idx, patch_idx, wrap_idx)
+            if mask_bundle is None:
+                return self[np.random.randint(len(self))]
+
+            vol_crop = mask_bundle["vol"]
+            masked_seg = mask_bundle["masked_seg"]
+            cond_seg = mask_bundle["cond"]
+            cond_seg_gt = mask_bundle["cond_gt"]
+            other_wraps_tensor = mask_bundle["other_wraps"]
+            if use_segmentation:
+                full_seg = mask_bundle["segmentation"]
+                seg_skel = mask_bundle["segmentation_skel"]
+            if use_sdt:
+                sdt_tensor = mask_bundle["sdt"]
+            if use_heatmap:
+                heatmap_tensor = mask_bundle["heatmap_target"]
+
+            if self._augmentations is not None:
+                seg_list = [masked_seg, cond_seg, other_wraps_tensor]
+                seg_keys = ['masked_seg', 'cond_seg', 'other_wraps']
+                seg_list.append(cond_seg_gt)
+                seg_keys.append('cond_seg_gt')
+                if use_segmentation:
+                    seg_list.append(full_seg)
+                    seg_keys.append('full_seg')
+                    seg_list.append(seg_skel)
+                    seg_keys.append('seg_skel')
+
+                dist_list = []
+                dist_keys = []
+                if use_sdt:
+                    dist_list.append(sdt_tensor)
+                    dist_keys.append('sdt')
+
+                aug_kwargs = {
+                    'image': vol_crop[None],  # [1, D, H, W]
+                    'segmentation': torch.stack(seg_list, dim=0),
+                    'crop_shape': self.crop_size,
+                }
+                if dist_list:
+                    aug_kwargs['dist_map'] = torch.stack(dist_list, dim=0)
+                if use_heatmap:
+                    aug_kwargs['heatmap_target'] = heatmap_tensor[None]  # (1, D, H, W)
+                    aug_kwargs['regression_keys'] = ['heatmap_target']
+
+                augmented = self._augmentations(**aug_kwargs)
+
+                vol_crop = augmented['image'].squeeze(0)
+                for i, key in enumerate(seg_keys):
+                    if key == 'masked_seg':
+                        masked_seg = augmented['segmentation'][i]
+                    elif key == 'cond_seg':
+                        cond_seg = augmented['segmentation'][i]
+                    elif key == 'other_wraps':
+                        other_wraps_tensor = augmented['segmentation'][i]
+                    elif key == 'cond_seg_gt':
+                        cond_seg_gt = augmented['segmentation'][i]
+                    elif key == 'full_seg':
+                        full_seg = augmented['segmentation'][i]
+                    elif key == 'seg_skel':
+                        seg_skel = augmented['segmentation'][i]
+
+                if dist_list:
+                    for i, key in enumerate(dist_keys):
+                        if key == 'sdt':
+                            sdt_tensor = augmented['dist_map'][i]
+
+                if use_heatmap:
+                    heatmap_tensor = augmented['heatmap_target'].squeeze(0)
+
+            target_payload = self.create_split_targets(
+                cond_seg_gt=cond_seg_gt,
+                masked_seg=masked_seg,
+            )
+            if target_payload is None:
+                return self[np.random.randint(len(self))]
+
+            result = {
+                "vol": vol_crop,                 # raw volume crop
+                "cond": cond_seg,                # conditioning segmentation
+                "masked_seg": masked_seg,        # masked (target) segmentation
+            }
+
+            if use_other_wrap_cond:
+                result["other_wraps"] = other_wraps_tensor  # other wraps from same segment as context
+            if use_sdt:
+                result["sdt"] = sdt_tensor  # signed distance transform of full (dilated) segmentation
+            if use_heatmap:
+                result["heatmap_target"] = heatmap_tensor  # (D, H, W) gaussian heatmap at expected positions
+            if use_segmentation:
+                result["segmentation"] = full_seg  # full segmentation (cond + masked)
+                result["segmentation_skel"] = seg_skel  # skeleton for medial surface recall loss
+            result.update(target_payload)
+
+        if not self._validate_result_tensors(result, idx):
+            return self[np.random.randint(len(self))]
         return result
     
 
