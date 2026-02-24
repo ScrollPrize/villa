@@ -6,6 +6,7 @@ with optional SDT (Signed Distance Transform) prediction.
 """
 import os
 import json
+import sys
 import click
 import torch
 import wandb
@@ -14,13 +15,16 @@ import random
 import accelerate
 import numpy as np
 from tqdm import tqdm
+import time
 
 from vesuvius.neural_tracing.datasets.dataset_rowcol_cond import EdtSegDataset
 from vesuvius.neural_tracing.loss.displacement_losses import (
+    dense_displacement_error_stats,
     dense_displacement_loss,
     surface_sampled_loss,
     surface_sampled_normal_loss,
     smoothness_loss,
+    triplet_min_displacement_loss,
 )
 from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
 from vesuvius.models.training.loss.skeleton_recall import DC_SkelREC_and_CE_loss
@@ -34,7 +38,6 @@ from vesuvius.neural_tracing.trainers.rowcol_cond_visualization import (
 from accelerate.utils import TorchDynamoPlugin
 
 import multiprocessing
-multiprocessing.set_start_method('spawn', force=True)
 
 
 def seed_worker(worker_id):
@@ -42,6 +45,24 @@ def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+
+def resolve_dataloader_context(config):
+    """Resolve multiprocessing context for DataLoader workers."""
+    context_name = str(config.get('dataloader_multiprocessing_context', 'auto')).lower()
+    if context_name == 'auto':
+        context_name = 'fork' if sys.platform.startswith('linux') else 'spawn'
+    if context_name not in {'fork', 'spawn', 'forkserver'}:
+        raise ValueError(
+            "dataloader_multiprocessing_context must be one of "
+            "'auto', 'fork', 'spawn', 'forkserver'"
+        )
+    try:
+        return multiprocessing.get_context(context_name)
+    except ValueError as exc:
+        raise ValueError(
+            f"Multiprocessing context {context_name!r} is not available on this platform"
+        ) from exc
 
 
 def collate_with_padding(batch):
@@ -96,6 +117,10 @@ def collate_with_padding(batch):
         result['dense_gt_displacement'] = torch.stack([b['dense_gt_displacement'] for b in batch])
         if 'dense_loss_weight' in batch[0]:
             result['dense_loss_weight'] = torch.stack([b['dense_loss_weight'] for b in batch])
+    if 'dir_priors' in batch[0]:
+        result['dir_priors'] = torch.stack([b['dir_priors'] for b in batch])
+    if 'triplet_channel_order' in batch[0]:
+        result['triplet_channel_order'] = torch.stack([b['triplet_channel_order'] for b in batch])
 
     # Optional SDT
     if 'sdt' in batch[0]:
@@ -123,6 +148,8 @@ def prepare_batch(batch, use_sdt=False, use_heatmap=False, use_segmentation=Fals
     cond = batch['cond'].unsqueeze(1)  # [B, 1, D, H, W]
 
     input_list = [vol, cond]
+    if 'dir_priors' in batch:
+        input_list.append(batch['dir_priors'])  # [B, 6, D, H, W]
     if 'extrap_surface' in batch:
         extrap_surf = batch['extrap_surface'].unsqueeze(1)  # [B, 1, D, H, W]
         input_list.append(extrap_surf)
@@ -181,10 +208,25 @@ def train(config_path):
     config.setdefault('use_other_wrap_cond', False)
     config.setdefault('use_dense_displacement', False)
     config.setdefault('use_triplet_wrap_displacement', False)
+    triplet_mode = bool(config.get('use_triplet_wrap_displacement', False))
+    config.setdefault('use_triplet_direction_priors', triplet_mode)
+    config.setdefault('triplet_direction_prior_mask', 'cond')
+    config.setdefault('triplet_random_channel_swap_prob', 0.5)
     config.setdefault('triplet_dense_weight_mode', 'band')
-    default_in_channels = 2 + int(config.get('use_extrapolation', True)) + int(config.get('use_other_wrap_cond', False))
+    use_triplet_direction_priors = bool(config.get('use_triplet_direction_priors', False))
+    if triplet_mode and use_triplet_direction_priors:
+        default_in_channels = 8
+    else:
+        default_in_channels = (
+            2 + int(config.get('use_extrapolation', True)) + int(config.get('use_other_wrap_cond', False))
+        )
     config.setdefault('in_channels', default_in_channels)
     if int(config['in_channels']) != default_in_channels:
+        if triplet_mode and use_triplet_direction_priors:
+            raise ValueError(
+                f"in_channels={config['in_channels']} does not match configured inputs "
+                "(expected 8 from triplet mode with direction priors: vol+cond+6 direction channels)"
+            )
         raise ValueError(
             f"in_channels={config['in_channels']} does not match configured inputs "
             f"(expected {default_in_channels} from use_extrapolation={config.get('use_extrapolation', True)}, "
@@ -199,6 +241,13 @@ def train(config_path):
     config.setdefault('weight_decay', 3e-5)
     config.setdefault('batch_size', 4)
     config.setdefault('num_workers', 4)
+    config.setdefault('val_num_workers', 1)
+    config.setdefault('pin_memory', True)
+    config.setdefault('non_blocking', True)
+    config.setdefault('persistent_workers', True)
+    config.setdefault('prefetch_factor', 1)
+    config.setdefault('val_prefetch_factor', 1)
+    config.setdefault('dataloader_multiprocessing_context', 'auto')
     config.setdefault('seed', 0)
     config.setdefault('use_sdt', False)
     config.setdefault('lambda_sdt', 1.0)
@@ -210,6 +259,8 @@ def train(config_path):
     config.setdefault('supervise_conditioning', False)
     config.setdefault('cond_supervision_weight', 0.1)
     config.setdefault('lambda_cond_disp', 0.0)
+    config.setdefault('triplet_min_disp_vox', 1.0)
+    config.setdefault('lambda_triplet_min_disp', 0.0)
     config.setdefault('displacement_supervision', 'vector')  # 'vector' or 'normal_scalar'
     config.setdefault('displacement_loss_type', 'vector_l2')
     config.setdefault('displacement_huber_beta', 5.0)
@@ -218,12 +269,17 @@ def train(config_path):
     config.setdefault('lambda_smooth', 0.0)
     config.setdefault('eval_perturbed_val', False)
     config.setdefault('log_perturbed_val_images', False)
-    config.setdefault('val_batches_per_log', 25)
+    config.setdefault('val_batches_per_log', 4)
+    config.setdefault('log_at_step_zero', False)
+    config.setdefault('ckpt_at_step_zero', False)
+    config.setdefault('use_accelerate_dynamo', False)
     config.setdefault('wandb_resume', False)
     config.setdefault('wandb_resume_mode', 'allow')
+    config.setdefault('profile_data_time', False)
+    config.setdefault('profile_step_time', False)
+    config.setdefault('profile_log_every', 100)
 
     # Build targets dict based on config
-    triplet_mode = bool(config.get('use_triplet_wrap_displacement', False))
     displacement_out_channels = 6 if triplet_mode else 3
     targets = {
         'displacement': {'out_channels': displacement_out_channels, 'activation': 'none'}
@@ -247,19 +303,25 @@ def train(config_path):
     torch.manual_seed(config['seed'])
     torch.cuda.manual_seed_all(config['seed'])
 
-    dynamo_plugin = TorchDynamoPlugin(
-            backend="inductor",  # Options: "inductor", "aot_eager", "aot_nvfuser", etc.
-            mode="default",      # Options: "default", "reduce-overhead", "max-autotune"
+    dynamo_plugin = None
+    if config.get('use_accelerate_dynamo', False):
+        dynamo_plugin = TorchDynamoPlugin(
+            backend="inductor",
+            mode="default",
             fullgraph=False,
             dynamic=False,
-            use_regional_compilation=False
+            use_regional_compilation=False,
         )
-    
+
+    dataloader_config = accelerate.DataLoaderConfiguration(
+        non_blocking=bool(config.get('non_blocking', True))
+    )
 
     accelerator = accelerate.Accelerator(
         mixed_precision=config.get('mixed_precision', 'no'),
         gradient_accumulation_steps=config.get('grad_acc_steps', 1),
-        dynamo_plugin=dynamo_plugin
+        dynamo_plugin=dynamo_plugin,
+        dataloader_config=dataloader_config,
     )
 
     preloaded_ckpt = None
@@ -307,6 +369,8 @@ def train(config_path):
     lambda_heatmap = config.get('lambda_heatmap', 1.0)
     lambda_segmentation = config.get('lambda_segmentation', 1.0)
     lambda_cond_disp = config.get('lambda_cond_disp', 0.0)
+    triplet_min_disp_vox = float(config.get('triplet_min_disp_vox', 1.0))
+    lambda_triplet_min_disp = float(config.get('lambda_triplet_min_disp', 0.0))
     lambda_smooth = config.get('lambda_smooth', 0.0)
     if config.get('supervise_conditioning', False) and lambda_cond_disp > 0.0:
         raise ValueError(
@@ -316,6 +380,8 @@ def train(config_path):
         )
     mask_cond_from_seg_loss = config.get('mask_cond_from_seg_loss', False)
     use_dense_displacement = bool(config.get('use_dense_displacement', False))
+    triplet_direction_prior_mask = str(config.get('triplet_direction_prior_mask', 'cond')).lower()
+    triplet_random_channel_swap_prob = float(config.get('triplet_random_channel_swap_prob', 0.5))
     if triplet_mode and not use_dense_displacement:
         raise ValueError("use_triplet_wrap_displacement=True requires use_dense_displacement=True")
     if triplet_mode and config.get('use_extrapolation', True):
@@ -326,6 +392,26 @@ def train(config_path):
         raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_heatmap_targets")
     if triplet_mode and config.get('use_segmentation', False):
         raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_segmentation")
+    if triplet_mode and use_triplet_direction_priors:
+        if triplet_direction_prior_mask not in {'cond', 'full'}:
+            raise ValueError(
+                "triplet_direction_prior_mask must be 'cond' or 'full', "
+                f"got {triplet_direction_prior_mask!r}"
+            )
+        if not np.isfinite(triplet_random_channel_swap_prob):
+            raise ValueError(
+                "triplet_random_channel_swap_prob must be finite, "
+                f"got {triplet_random_channel_swap_prob!r}"
+            )
+        if triplet_random_channel_swap_prob < 0.0 or triplet_random_channel_swap_prob > 1.0:
+            raise ValueError(
+                "triplet_random_channel_swap_prob must satisfy 0 <= p <= 1, "
+                f"got {triplet_random_channel_swap_prob}"
+            )
+    if triplet_min_disp_vox < 0:
+        raise ValueError(f"triplet_min_disp_vox must be >= 0, got {triplet_min_disp_vox}")
+    if lambda_triplet_min_disp > 0.0 and not triplet_mode:
+        raise ValueError("lambda_triplet_min_disp > 0 requires use_triplet_wrap_displacement=True")
     disp_supervision = str(config.get('displacement_supervision', 'vector')).lower()
     if disp_supervision not in {'vector', 'normal_scalar'}:
         raise ValueError(
@@ -436,7 +522,8 @@ def train(config_path):
 
     # Train with augmentation, val without
     train_dataset = EdtSegDataset(config, apply_augmentation=True)
-    val_dataset = EdtSegDataset(config, apply_augmentation=False)
+    patch_metadata = train_dataset.export_patch_metadata()
+    val_dataset = EdtSegDataset(config, apply_augmentation=False, patch_metadata=patch_metadata)
     val_pert_dataset = None
     if config.get('eval_perturbed_val', False):
         val_pert_config = copy.deepcopy(config)
@@ -444,7 +531,7 @@ def train(config_path):
         val_pert_cfg['enabled'] = True
         val_pert_cfg['apply_without_augmentation'] = True
         val_pert_config['cond_local_perturb'] = val_pert_cfg
-        val_pert_dataset = EdtSegDataset(val_pert_config, apply_augmentation=False)
+        val_pert_dataset = EdtSegDataset(val_pert_config, apply_augmentation=False, patch_metadata=patch_metadata)
 
     # Train/val split by indices
     num_patches = len(train_dataset)
@@ -466,36 +553,65 @@ def train(config_path):
     if val_pert_dataset is not None:
         val_pert_dataset = _restrict_dataset_samples(val_pert_dataset, val_indices)
 
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
+    train_num_workers = max(0, int(config.get('num_workers', 0)))
+    val_num_workers = max(0, int(config.get('val_num_workers', 1)))
+    pin_memory = bool(config.get('pin_memory', True))
+    train_prefetch_factor = max(1, int(config.get('prefetch_factor', 2)))
+    val_prefetch_factor = max(1, int(config.get('val_prefetch_factor', train_prefetch_factor)))
+    train_persistent_workers = bool(config.get('persistent_workers', True)) and train_num_workers > 0
+    val_persistent_workers = bool(config.get('persistent_workers', True)) and val_num_workers > 0
+
+    dataloader_context = None
+    if max(train_num_workers, val_num_workers) > 0:
+        dataloader_context = resolve_dataloader_context(config)
+
+    train_dataloader_kwargs = dict(
         batch_size=config['batch_size'],
         shuffle=True,
-        num_workers=config['num_workers'],
+        num_workers=train_num_workers,
         worker_init_fn=seed_worker,
         generator=make_generator(0),
         drop_last=True,
         collate_fn=collate_with_padding,
+        pin_memory=pin_memory,
     )
-    val_dataloader = torch.utils.data.DataLoader(
-        val_dataset,
+    if train_num_workers > 0:
+        train_dataloader_kwargs['persistent_workers'] = train_persistent_workers
+        train_dataloader_kwargs['prefetch_factor'] = train_prefetch_factor
+        train_dataloader_kwargs['multiprocessing_context'] = dataloader_context
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, **train_dataloader_kwargs)
+
+    val_dataloader_kwargs = dict(
         batch_size=config['batch_size'],
         shuffle=False,
-        num_workers=1,
+        num_workers=val_num_workers,
         worker_init_fn=seed_worker,
         generator=make_generator(1),
         collate_fn=collate_with_padding,
+        pin_memory=pin_memory,
     )
+    if val_num_workers > 0:
+        val_dataloader_kwargs['persistent_workers'] = val_persistent_workers
+        val_dataloader_kwargs['prefetch_factor'] = val_prefetch_factor
+        val_dataloader_kwargs['multiprocessing_context'] = dataloader_context
+    val_dataloader = torch.utils.data.DataLoader(val_dataset, **val_dataloader_kwargs)
+
     val_pert_dataloader = None
     if val_pert_dataset is not None:
-        val_pert_dataloader = torch.utils.data.DataLoader(
-            val_pert_dataset,
+        val_pert_dataloader_kwargs = dict(
             batch_size=config['batch_size'],
             shuffle=False,
-            num_workers=1,
+            num_workers=val_num_workers,
             worker_init_fn=seed_worker,
             generator=make_generator(2),
             collate_fn=collate_with_padding,
+            pin_memory=pin_memory,
         )
+        if val_num_workers > 0:
+            val_pert_dataloader_kwargs['persistent_workers'] = val_persistent_workers
+            val_pert_dataloader_kwargs['prefetch_factor'] = val_prefetch_factor
+            val_pert_dataloader_kwargs['multiprocessing_context'] = dataloader_context
+        val_pert_dataloader = torch.utils.data.DataLoader(val_pert_dataset, **val_pert_dataloader_kwargs)
 
     model = make_model(config)
 
@@ -599,6 +715,19 @@ def train(config_path):
             accelerator.print(f"Lambda segmentation: {lambda_segmentation}")
         if lambda_cond_disp > 0.0:
             accelerator.print(f"Lambda cond disp: {lambda_cond_disp}")
+        if lambda_triplet_min_disp > 0.0:
+            accelerator.print(
+                f"Lambda triplet min disp: {lambda_triplet_min_disp} (min={triplet_min_disp_vox} vx)"
+            )
+        if triplet_mode:
+            accelerator.print(
+                f"Triplet direction priors: enabled={use_triplet_direction_priors}"
+            )
+            if use_triplet_direction_priors:
+                accelerator.print(
+                    f"Triplet prior mask={triplet_direction_prior_mask}, "
+                    f"random_swap_prob={triplet_random_channel_swap_prob}"
+                )
         accelerator.print(f"Supervise conditioning: {config.get('supervise_conditioning', False)}")
         if config.get('supervise_conditioning', False):
             accelerator.print(f"Cond supervision weight: {config.get('cond_supervision_weight', 0.1)}")
@@ -617,6 +746,9 @@ def train(config_path):
     val_pert_iterator = iter(val_pert_dataloader) if val_pert_dataloader is not None else None
     train_iterator = iter(train_dataloader)
     grad_clip = config['grad_clip']
+    profile_data_time = bool(config.get('profile_data_time', False))
+    profile_step_time = bool(config.get('profile_step_time', False))
+    profile_log_every = max(1, int(config.get('profile_log_every', 100)))
 
     progress_bar = tqdm(
         total=config['num_iterations'],
@@ -627,11 +759,18 @@ def train(config_path):
     for iteration in range(start_iteration, config['num_iterations']):
         if config['verbose']:
             print(f"starting iteration {iteration}")
+        should_log_this_iteration = (
+            (iteration > 0 or config.get('log_at_step_zero', False))
+            and iteration % config['log_frequency'] == 0
+        )
+        data_wait_start = time.perf_counter()
         try:
             batch = next(train_iterator)
         except StopIteration:
             train_iterator = iter(train_dataloader)
             batch = next(train_iterator)
+        data_wait_time = time.perf_counter() - data_wait_start
+        step_start_time = time.perf_counter()
 
         if config['verbose']:
             print(f"got batch, keys: {batch.keys()}")
@@ -661,6 +800,25 @@ def train(config_path):
             total_loss = surf_loss
 
             wandb_log['surf_loss'] = surf_loss.detach().item()
+
+            if (
+                should_log_this_iteration
+                and accelerator.is_main_process
+                and dense_gt_displacement is not None
+            ):
+                with torch.no_grad():
+                    train_disp_stats = dense_displacement_error_stats(
+                        disp_pred,
+                        dense_gt_displacement,
+                        sample_weights=dense_loss_weight,
+                    )
+                wandb_log['train_disp_err_mean'] = train_disp_stats['mean']
+                wandb_log['train_disp_err_p50'] = train_disp_stats['p50']
+                wandb_log['train_disp_err_p75'] = train_disp_stats['p75']
+                wandb_log['train_disp_err_p90'] = train_disp_stats['p90']
+                wandb_log['train_disp_err_p95'] = train_disp_stats['p95']
+                wandb_log['train_disp_err_p99'] = train_disp_stats['p99']
+                wandb_log['train_disp_err_count'] = float(train_disp_stats['count'])
 
             # Smoothness loss on displacement field
             if lambda_smooth > 0:
@@ -710,6 +868,18 @@ def train(config_path):
                 total_loss = total_loss + weighted_cond_loss
                 wandb_log['cond_disp_loss'] = weighted_cond_loss.detach().item()
 
+            if lambda_triplet_min_disp > 0.0:
+                cond_mask = (inputs[:, 1:2] > 0.5).float()
+                triplet_min_loss = triplet_min_displacement_loss(
+                    disp_pred,
+                    cond_mask,
+                    min_magnitude=triplet_min_disp_vox,
+                    loss_type='squared_hinge',
+                )
+                weighted_triplet_min_loss = lambda_triplet_min_disp * triplet_min_loss
+                total_loss = total_loss + weighted_triplet_min_loss
+                wandb_log['triplet_min_disp_loss'] = weighted_triplet_min_loss.detach().item()
+
             if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
 
@@ -729,11 +899,17 @@ def train(config_path):
                 optimizer.step()
                 lr_scheduler.step()
             optimizer.zero_grad()
+        step_compute_time = time.perf_counter() - step_start_time
 
         wandb_log['loss'] = total_loss.detach().item()
         wandb_log['current_lr'] = optimizer.param_groups[0]['lr']
         if grad_norm is not None:
             wandb_log['grad_norm'] = float(grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm)
+        if (iteration % profile_log_every) == 0:
+            if profile_data_time:
+                wandb_log['data_wait_time'] = data_wait_time
+            if profile_step_time:
+                wandb_log['step_compute_time'] = step_compute_time
 
         postfix = {
             'loss': f"{wandb_log['loss']:.4f}",
@@ -749,14 +925,20 @@ def train(config_path):
             postfix['seg'] = f"{wandb_log['seg_loss']:.4f}"
         if lambda_cond_disp > 0.0:
             postfix['cond'] = f"{wandb_log['cond_disp_loss']:.4f}"
+        if lambda_triplet_min_disp > 0.0:
+            postfix['min1vx'] = f"{wandb_log['triplet_min_disp_loss']:.4f}"
+        if 'train_disp_err_p95' in wandb_log:
+            postfix['p95'] = f"{wandb_log['train_disp_err_p95']:.2f}"
+        if 'train_disp_err_p99' in wandb_log:
+            postfix['p99'] = f"{wandb_log['train_disp_err_p99']:.2f}"
         progress_bar.set_postfix(postfix)
         progress_bar.update(1)
 
-        if iteration % config['log_frequency'] == 0 and accelerator.is_main_process:
+        if should_log_this_iteration and accelerator.is_main_process:
             with torch.no_grad():
                 model.eval()
 
-                val_batches_per_log = max(1, int(config.get('val_batches_per_log', 10)))
+                val_batches_per_log = max(1, int(config.get('val_batches_per_log', 4)))
                 val_metric_sums = {
                     'val_surf_loss': 0.0,
                     'val_loss': 0.0,
@@ -771,6 +953,17 @@ def train(config_path):
                     val_metric_sums['val_seg_loss'] = 0.0
                 if lambda_cond_disp > 0.0:
                     val_metric_sums['val_cond_disp_loss'] = 0.0
+                if lambda_triplet_min_disp > 0.0:
+                    val_metric_sums['val_triplet_min_disp_loss'] = 0.0
+                val_disp_stats_weighted = {
+                    'mean': 0.0,
+                    'p50': 0.0,
+                    'p75': 0.0,
+                    'p90': 0.0,
+                    'p95': 0.0,
+                    'p99': 0.0,
+                }
+                val_disp_count_total = 0.0
 
                 first_val_vis = None
                 for val_batch_idx in range(val_batches_per_log):
@@ -799,6 +992,17 @@ def train(config_path):
                     )
                     val_total_loss = val_surf_loss
                     val_metric_sums['val_surf_loss'] += val_surf_loss.item()
+                    if val_dense_gt_displacement is not None:
+                        val_disp_stats = dense_displacement_error_stats(
+                            val_disp_pred,
+                            val_dense_gt_displacement,
+                            sample_weights=val_dense_loss_weight,
+                        )
+                        val_count = float(val_disp_stats['count'])
+                        if val_count > 0.0:
+                            val_disp_count_total += val_count
+                            for key in val_disp_stats_weighted:
+                                val_disp_stats_weighted[key] += val_disp_stats[key] * val_count
 
                     val_sdt_pred = None
                     if lambda_smooth > 0:
@@ -844,6 +1048,18 @@ def train(config_path):
                         val_total_loss = val_total_loss + val_weighted_cond_loss
                         val_metric_sums['val_cond_disp_loss'] += val_weighted_cond_loss.item()
 
+                    if lambda_triplet_min_disp > 0.0:
+                        val_cond_mask = (val_inputs[:, 1:2] > 0.5).float()
+                        val_triplet_min_loss = triplet_min_displacement_loss(
+                            val_disp_pred,
+                            val_cond_mask,
+                            min_magnitude=triplet_min_disp_vox,
+                            loss_type='squared_hinge',
+                        )
+                        val_weighted_triplet_min_loss = lambda_triplet_min_disp * val_triplet_min_loss
+                        val_total_loss = val_total_loss + val_weighted_triplet_min_loss
+                        val_metric_sums['val_triplet_min_disp_loss'] += val_weighted_triplet_min_loss.item()
+
                     val_metric_sums['val_loss'] += val_total_loss.item()
 
                     if val_batch_idx == 0:
@@ -855,6 +1071,7 @@ def train(config_path):
                             'valid_mask': val_valid_mask,
                             'dense_gt_displacement': val_dense_gt_displacement,
                             'dense_loss_weight': val_dense_loss_weight,
+                            'triplet_channel_order': val_batch.get('triplet_channel_order', None),
                             'sdt_pred': val_sdt_pred,
                             'sdt_target': val_sdt_target,
                             'heatmap_pred': val_heatmap_pred,
@@ -873,6 +1090,10 @@ def train(config_path):
 
                 for key, value in val_metric_sums.items():
                     wandb_log[key] = value / val_batches_per_log
+                if val_disp_count_total > 0.0:
+                    wandb_log['val_disp_err_count'] = val_disp_count_total
+                    for key, weighted_sum in val_disp_stats_weighted.items():
+                        wandb_log[f'val_disp_err_{key}'] = weighted_sum / val_disp_count_total
 
                 # Create visualization
                 train_img_path = f'{out_dir}/{iteration:06}_train.png'
@@ -910,6 +1131,7 @@ def train(config_path):
                 elif train_can_visualize_dense and first_val_vis is not None and first_val_vis.get('can_visualize_dense', False):
                     make_dense_visualization(
                         inputs, disp_pred, dense_gt_displacement, dense_loss_weight,
+                        triplet_channel_order=batch.get('triplet_channel_order', None),
                         sdt_pred=train_sdt_pred, sdt_target=sdt_target,
                         heatmap_pred=train_heatmap_pred, heatmap_target=heatmap_target,
                         seg_pred=train_seg_pred, seg_target=seg_target if use_segmentation else None,
@@ -918,6 +1140,7 @@ def train(config_path):
                     make_dense_visualization(
                         first_val_vis['inputs'], first_val_vis['disp_pred'],
                         first_val_vis['dense_gt_displacement'], first_val_vis['dense_loss_weight'],
+                        triplet_channel_order=first_val_vis['triplet_channel_order'],
                         sdt_pred=first_val_vis['sdt_pred'], sdt_target=first_val_vis['sdt_target'],
                         heatmap_pred=first_val_vis['heatmap_pred'], heatmap_target=first_val_vis['heatmap_target'],
                         seg_pred=first_val_vis['seg_pred'],
@@ -1000,6 +1223,18 @@ def train(config_path):
                         val_pert_total_loss = val_pert_total_loss + val_pert_weighted_cond_loss
                         wandb_log['val_pert_cond_disp_loss'] = val_pert_weighted_cond_loss.item()
 
+                    if lambda_triplet_min_disp > 0.0:
+                        val_pert_cond_mask = (val_pert_inputs[:, 1:2] > 0.5).float()
+                        val_pert_triplet_min_loss = triplet_min_displacement_loss(
+                            val_pert_disp_pred,
+                            val_pert_cond_mask,
+                            min_magnitude=triplet_min_disp_vox,
+                            loss_type='squared_hinge',
+                        )
+                        val_pert_weighted_triplet_min_loss = lambda_triplet_min_disp * val_pert_triplet_min_loss
+                        val_pert_total_loss = val_pert_total_loss + val_pert_weighted_triplet_min_loss
+                        wandb_log['val_pert_triplet_min_disp_loss'] = val_pert_weighted_triplet_min_loss.item()
+
                     wandb_log['val_pert_loss'] = val_pert_total_loss.item()
 
                     if config.get('log_perturbed_val_images', False):
@@ -1023,6 +1258,7 @@ def train(config_path):
                             val_pert_img_path = f'{out_dir}/{iteration:06}_val_pert.png'
                             make_dense_visualization(
                                 val_pert_inputs, val_pert_disp_pred, val_pert_dense_gt_displacement, val_pert_dense_loss_weight,
+                                triplet_channel_order=val_pert_batch.get('triplet_channel_order', None),
                                 sdt_pred=val_pert_sdt_pred, sdt_target=val_pert_sdt_target,
                                 heatmap_pred=val_pert_heatmap_pred, heatmap_target=val_pert_heatmap_target,
                                 seg_pred=val_pert_output.get('segmentation') if use_segmentation else None,
@@ -1034,7 +1270,11 @@ def train(config_path):
 
                 model.train()
 
-        if iteration % config['ckpt_frequency'] == 0 and accelerator.is_main_process:
+        if (
+            (iteration > 0 or config.get('ckpt_at_step_zero', False))
+            and iteration % config['ckpt_frequency'] == 0
+            and accelerator.is_main_process
+        ):
             torch.save({
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
