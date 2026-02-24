@@ -26,7 +26,6 @@ from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import random
 from vesuvius.tifxyz.upsampling import interpolate_at_points
 from scipy import ndimage
-from collections import OrderedDict
 import warnings
 import re
 from functools import lru_cache
@@ -306,11 +305,6 @@ class EdtSegDataset(Dataset):
         else:
             self._load_patch_metadata(patch_metadata)
 
-        self._enable_volume_crop_cache = bool(config.get('enable_volume_crop_cache', False))
-        self._volume_crop_cache_max_items = int(config.get('volume_crop_cache_max_items', 0))
-        if self._volume_crop_cache_max_items < 0:
-            self._volume_crop_cache_max_items = 0
-        self._volume_crop_cache = OrderedDict()
         self._dense_axis_cache = {}
         self._cc_structure_26 = np.ones((3, 3, 3), dtype=np.uint8)
         self._closing_structure_3 = np.ones((3, 3, 3), dtype=bool)
@@ -665,33 +659,6 @@ class EdtSegDataset(Dataset):
             ]
         return normalize_zscore(vol_crop)
 
-    def _load_volume_crop_from_patch(
-        self,
-        patch: ChunkPatch,
-        crop_size,
-        min_corner,
-        max_corner,
-        cache_key=None,
-    ):
-        use_cache = (
-            self._enable_volume_crop_cache and
-            self._volume_crop_cache_max_items > 0 and
-            cache_key is not None
-        )
-        if not use_cache:
-            return self._read_volume_crop_from_patch(patch, crop_size, min_corner, max_corner)
-
-        cached = self._volume_crop_cache.get(cache_key)
-        if cached is not None:
-            self._volume_crop_cache.move_to_end(cache_key)
-            return cached.copy()
-
-        vol_crop = self._read_volume_crop_from_patch(patch, crop_size, min_corner, max_corner)
-        self._volume_crop_cache[cache_key] = vol_crop
-        if len(self._volume_crop_cache) > self._volume_crop_cache_max_items:
-            self._volume_crop_cache.popitem(last=False)
-        return vol_crop.copy()
-
     def _validate_result_tensors(self, result: dict, idx: int):
         if not self._validate_result_tensors_enabled:
             return True
@@ -920,15 +887,13 @@ class EdtSegDataset(Dataset):
         front_zyxs = conditioning["front_zyxs"]
         min_corner = conditioning["min_corner"]
         max_corner = conditioning["max_corner"]
-        vol_cache_key = conditioning["vol_cache_key"]
         crop_size = self.crop_size
 
-        vol_crop = self._load_volume_crop_from_patch(
+        vol_crop = self._read_volume_crop_from_patch(
             patch,
             crop_size,
             min_corner,
             max_corner,
-            cache_key=vol_cache_key,
         )
 
         center_local_gt = (center_zyxs_unperturbed - min_corner).astype(np.float64)
@@ -1371,14 +1336,12 @@ class EdtSegDataset(Dataset):
         masked_zyxs = conditioning["masked_zyxs"]
         min_corner = conditioning["min_corner"]
         max_corner = conditioning["max_corner"]
-        vol_cache_key = conditioning["vol_cache_key"]
 
-        vol_crop = self._load_volume_crop_from_patch(
+        vol_crop = self._read_volume_crop_from_patch(
             patch,
             target_shape,
             min_corner,
             max_corner,
-            cache_key=vol_cache_key,
         )
 
         # convert cond and masked coords to crop-local coords (float for line interpolation)
