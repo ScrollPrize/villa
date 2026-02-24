@@ -60,3 +60,68 @@ python inference_timesformer.py --segment_id 20231210121321 20231221180251 --seg
 ```
 
 The optional parameter ```--out_path``` can be used to specify the output path of the predictions.
+
+## ResNet3D training (`train_resnet3d.py`)
+
+Zarr setup
+
+- `dataset_root/<segment_id>.zarr`
+- Train files:
+  - `dataset_root/<segment_id>/<segment_id>_inklabels.png` (or `.tif`/`.tiff`)
+  - `dataset_root/<segment_id>/<segment_id>_mask.png` (or `.tif`/`.tiff`)
+- Val files:
+  - `dataset_root/<segment_id>/<segment_id>_inklabels_val.png` (or `.tif`/`.tiff`)
+  - `dataset_root/<segment_id>/<segment_id>_mask_val.png` (or `.tif`/`.tiff`)
+- Set `training.data_backend: zarr` and `training.dataset_root` (default: `train_scrolls`).
+
+Tiff setup
+
+- `dataset_root/<segment_id>/layers/` with layer files (example: `00.tif`, `01.tif`, ...)
+- Train files:
+  - `dataset_root/<segment_id>/<segment_id>_inklabels.png` (or `.tif`/`.tiff`)
+  - `dataset_root/<segment_id>/<segment_id>_mask.png` (or `.tif`/`.tiff`)
+- Val files:
+  - `dataset_root/<segment_id>/<segment_id>_inklabels_val.png` (or `.tif`/`.tiff`)
+  - `dataset_root/<segment_id>/<segment_id>_mask_val.png` (or `.tif`/`.tiff`)
+- Set `training.data_backend: tiff` and `training.dataset_root` (default: `train_scrolls`).
+
+Segment metadata (required per segment):
+
+- `layer_range: [start_idx, end_idx]` (end is exclusive; must include at least `in_chans` layers; if larger, centered to `in_chans`).
+- `reverse_layers: true|false`.
+
+Metadata keys to set (edit the existing `metadata.json` template):
+
+- `segments.<segment_id>.base_path`, `segments.<segment_id>.layer_range`, `segments.<segment_id>.reverse_layers`.
+- `training.train_segments`, `training.val_segments`, optional `training.cv_fold`.
+- `training.objective`, `training.sampler`, `training.loss_mode`, `training.save_every_epoch`, `training.stitching_schedule`.
+- `training_hyperparameters.model.backbone_pretrained_path`.
+
+Fold/suffix behavior:
+
+- If `training.cv_fold` is set and suffixes are not explicitly set, defaults are:
+  - train suffixes: `_{cv_fold}`
+  - val suffixes: `_val_{cv_fold}`
+
+Pretrained 3D-ResNet checkpoint:
+
+- Download from `3D-ResNets-PyTorch` pretrained models and place it in this folder (or any path).
+- Set `training_hyperparameters.model.backbone_pretrained_path`, e.g. `r3d50_KM_200ep.pth`, `r3d101_KM_200ep.pth`, or `r3d152_KM_200ep.pth`.
+
+Run:
+
+```bash
+cd villa/ink-detection
+python train_resnet3d.py --metadata_json metadata.json --outputs_path ./outputs
+```
+
+W&B sweep example
+
+```bash
+cd villa/ink-detection
+wandb login
+wandb sweep train_resnet3d_lib/sweeps/sweep_erm_hparams_shuffle_accum4.yaml
+wandb agent <entity>/<project>/<sweep_id>
+```
+
+If needed, edit the sweep YAML `command` block (`--metadata_json`, `--outputs_path`) before creating the sweep.
