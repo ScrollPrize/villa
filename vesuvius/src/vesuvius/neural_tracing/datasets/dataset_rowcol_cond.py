@@ -802,66 +802,6 @@ class EdtSegDataset(Dataset):
             return None
         return (slice(z0, z1 + 1), slice(y0, y1 + 1), slice(x0, x1 + 1))
 
-    def _compute_dense_displacement_field_bbox(
-        self,
-        full_surface_mask: np.ndarray,
-        bbox_slices,
-        return_weights: bool = True,
-        return_distances: bool = False,
-    ):
-        """Compute dense displacement on a bbox and scatter outputs back to full volume."""
-        surface = np.asarray(full_surface_mask) > 0.5
-        if surface.ndim != 3:
-            raise ValueError(f"full_surface_mask must be 3D, got shape {tuple(surface.shape)}")
-        if not surface.any():
-            if return_distances:
-                return None, None, None
-            return None, None
-        if bbox_slices is None or len(bbox_slices) != 3:
-            raise ValueError("bbox_slices must be a tuple/list of (z, y, x) slices")
-
-        z_slice, y_slice, x_slice = bbox_slices
-        sub_surface = surface[z_slice, y_slice, x_slice]
-        if sub_surface.size == 0 or not sub_surface.any():
-            if return_distances:
-                return None, None, None
-            return None, None
-
-        if return_distances:
-            sub_disp, sub_weights, sub_dist = self._compute_dense_displacement_field(
-                sub_surface,
-                return_weights=return_weights,
-                return_distances=True,
-            )
-        else:
-            sub_disp, sub_weights = self._compute_dense_displacement_field(
-                sub_surface,
-                return_weights=return_weights,
-                return_distances=False,
-            )
-            sub_dist = None
-        if sub_disp is None:
-            if return_distances:
-                return None, None, None
-            return None, None
-
-        disp_full = np.zeros((3, *surface.shape), dtype=np.float32)
-        disp_full[:, z_slice, y_slice, x_slice] = sub_disp.astype(np.float32, copy=False)
-
-        if return_weights:
-            weights_full = np.zeros((1, *surface.shape), dtype=np.float32)
-            if sub_weights is not None:
-                weights_full[:, z_slice, y_slice, x_slice] = sub_weights.astype(np.float32, copy=False)
-        else:
-            weights_full = None
-
-        if return_distances:
-            dist_full = np.full(surface.shape, np.inf, dtype=np.float32)
-            if sub_dist is not None:
-                dist_full[z_slice, y_slice, x_slice] = sub_dist.astype(np.float32, copy=False)
-            return disp_full, weights_full, dist_full
-        return disp_full, weights_full
-
     def create_neighbor_masks(self, idx: int, patch_idx: int, wrap_idx: int):
         patch = self.patches[patch_idx]
         conditioning = create_centered_conditioning(self, idx, patch_idx, wrap_idx, patch)
@@ -955,17 +895,17 @@ class EdtSegDataset(Dataset):
             d_behind_work = None
             d_front_work = None
             if triplet_edt_bbox is not None:
-                behind_disp_work, _, d_behind_work = self._compute_dense_displacement_field_bbox(
+                behind_disp_work, _, d_behind_work = self._compute_dense_displacement_field(
                     behind_bin_for_gt,
-                    bbox_slices=triplet_edt_bbox,
                     return_weights=False,
                     return_distances=True,
+                    bbox_slices=triplet_edt_bbox,
                 )
-                front_disp_work, _, d_front_work = self._compute_dense_displacement_field_bbox(
+                front_disp_work, _, d_front_work = self._compute_dense_displacement_field(
                     front_bin_for_gt,
-                    bbox_slices=triplet_edt_bbox,
                     return_weights=False,
                     return_distances=True,
+                    bbox_slices=triplet_edt_bbox,
                 )
                 if (
                     behind_disp_work is not None and
@@ -1231,19 +1171,71 @@ class EdtSegDataset(Dataset):
         full_surface_mask: np.ndarray,
         return_weights: bool = True,
         return_distances: bool = False,
+        bbox_slices=None,
     ):
         """Compute nearest-surface displacement vector for every voxel.
 
         Args:
             full_surface_mask: (D, H, W) binary/boolean mask of GT surface voxels.
             return_distances: whether to also return nearest-surface Euclidean distance map.
+            bbox_slices: optional (z, y, x) slices to compute on a sub-volume and
+                scatter back into full-volume outputs.
 
         Returns:
             disp_field: (3, D, H, W) with components (dz, dy, dx)
             weight_mask: (1, D, H, W) per-voxel supervision weights
             distance_map: (D, H, W) nearest-surface distance (optional)
         """
-        surface = full_surface_mask > 0.5
+        surface = np.asarray(full_surface_mask) > 0.5
+        if bbox_slices is not None:
+            if surface.ndim != 3:
+                raise ValueError(f"full_surface_mask must be 3D, got shape {tuple(surface.shape)}")
+            if len(bbox_slices) != 3:
+                raise ValueError("bbox_slices must be a tuple/list of (z, y, x) slices")
+            z_slice, y_slice, x_slice = bbox_slices
+            sub_surface = surface[z_slice, y_slice, x_slice]
+            if sub_surface.size == 0 or not sub_surface.any():
+                if return_distances:
+                    return None, None, None
+                return None, None
+
+            if return_distances:
+                sub_disp, sub_weights, sub_dist = self._compute_dense_displacement_field(
+                    sub_surface,
+                    return_weights=return_weights,
+                    return_distances=True,
+                    bbox_slices=None,
+                )
+            else:
+                sub_disp, sub_weights = self._compute_dense_displacement_field(
+                    sub_surface,
+                    return_weights=return_weights,
+                    return_distances=False,
+                    bbox_slices=None,
+                )
+                sub_dist = None
+            if sub_disp is None:
+                if return_distances:
+                    return None, None, None
+                return None, None
+
+            disp_full = np.zeros((3, *surface.shape), dtype=np.float32)
+            disp_full[:, z_slice, y_slice, x_slice] = sub_disp.astype(np.float32, copy=False)
+
+            if return_weights:
+                weights_full = np.zeros((1, *surface.shape), dtype=np.float32)
+                if sub_weights is not None:
+                    weights_full[:, z_slice, y_slice, x_slice] = sub_weights.astype(np.float32, copy=False)
+            else:
+                weights_full = None
+
+            if return_distances:
+                dist_full = np.full(surface.shape, np.inf, dtype=np.float32)
+                if sub_dist is not None:
+                    dist_full[z_slice, y_slice, x_slice] = sub_dist.astype(np.float32, copy=False)
+                return disp_full, weights_full, dist_full
+            return disp_full, weights_full
+
         if not surface.any():
             if return_distances:
                 return None, None, None
