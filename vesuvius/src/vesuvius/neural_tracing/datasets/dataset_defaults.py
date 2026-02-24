@@ -1,0 +1,82 @@
+from typing import Any, MutableMapping
+
+
+def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> None:
+    """Populate default config values for the row/col conditioning dataset."""
+    config.setdefault("use_sdt", False)
+    config.setdefault("dilation_radius", 1)  # voxels
+    config.setdefault("cond_percent", [0.5, 0.5])
+    config.setdefault("use_extrapolation", True)
+    config.setdefault("use_dense_displacement", False)
+    config.setdefault("extrapolation_method", "linear_edge")
+    config.setdefault("supervise_conditioning", False)
+    config.setdefault("cond_supervision_weight", 0.1)
+    config.setdefault("force_recompute_patches", False)
+    config.setdefault("use_heatmap_targets", False)
+    config.setdefault("heatmap_step_size", 10)
+    config.setdefault("heatmap_step_count", 5)
+    config.setdefault("heatmap_sigma", 2.0)
+    config.setdefault("use_segmentation", False)
+    config.setdefault("sample_mode", "wrap")
+
+    # Other-wrap conditioning defaults.
+    config.setdefault("use_other_wrap_cond", False)
+    config.setdefault("other_wrap_prob", 0.5)
+
+    # Triplet-wrap displacement defaults.
+    config.setdefault("use_triplet_wrap_displacement", False)
+    config.setdefault("triplet_dense_weight_mode", "band")
+    config.setdefault("triplet_band_padding_voxels", 4.0)
+    config.setdefault("triplet_edt_bbox_padding_voxels", 4.0)
+    config.setdefault("triplet_band_distance_percentile", 95.0)
+    config.setdefault("triplet_gt_vector_dilation_radius", 0.0)
+    config.setdefault("use_triplet_direction_priors", True)
+    config.setdefault("triplet_direction_prior_mask", "cond")
+    config.setdefault("triplet_random_channel_swap_prob", 0.5)
+    config.setdefault("triplet_overlap_mask_filename", "overlap_mask.tif")
+    config.setdefault("triplet_warn_missing_overlap_masks", False)
+    config.setdefault("triplet_close_check_enabled", True)
+    config.setdefault("triplet_close_distance_voxels", 1.0)
+    config.setdefault("triplet_close_fraction_threshold", 0.05)
+    config.setdefault("triplet_close_print", True)
+
+    config.setdefault("enable_volume_crop_cache", False)
+    config.setdefault("volume_crop_cache_max_items", 0)
+    config.setdefault("validate_result_tensors", False)
+    # Patch-finding defaults.
+    config.setdefault("overlap_fraction", 0.0)
+    config.setdefault("min_span_ratio", 1.0)
+    config.setdefault("edge_touch_frac", 0.1)
+    config.setdefault("edge_touch_min_count", 10)
+    config.setdefault("edge_touch_pad", 0)
+    config.setdefault("min_points_per_wrap", 100)
+    config.setdefault("scale_normalize_patch_counts", True)
+    config.setdefault("patch_count_reference_scale", 0)
+    config.setdefault("bbox_pad_2d", 0)
+    config.setdefault("require_all_valid_in_bbox", True)
+    config.setdefault("skip_chunk_if_any_invalid", False)
+    config.setdefault("min_cond_span", 0.3)
+    config.setdefault("inner_bbox_fraction", 0.7)
+    config.setdefault("filter_oob_extrap_points", True)
+
+    cond_local_perturb = dict(config.get("cond_local_perturb") or {})
+    cond_local_perturb.setdefault("enabled", True)
+    cond_local_perturb.setdefault("probability", 0.35)
+    cond_local_perturb.setdefault("num_blobs", [1, 3])
+    cond_local_perturb.setdefault("points_affected", 10)
+    cond_local_perturb.setdefault("sigma_fraction_range", [0.04, 0.10])
+    cond_local_perturb.setdefault("amplitude_range", [0.25, 1.25])
+    cond_local_perturb.setdefault("radius_sigma_mult", 2.5)
+    cond_local_perturb.setdefault("max_total_displacement", 6.0)
+    cond_local_perturb.setdefault("apply_without_augmentation", False)
+    config["cond_local_perturb"] = cond_local_perturb
+
+    config.setdefault("rbf_downsample_factor", 4)
+    config.setdefault("rbf_edge_downsample_factor", 8)
+    config.setdefault("rbf_max_points", None)
+    config.setdefault("rbf_edge_band_frac", 0.10)
+    config.setdefault("rbf_edge_band_cells", None)
+    config.setdefault("rbf_edge_min_points", 128)
+    config.setdefault("debug_extrapolation_oob", False)
+    config.setdefault("debug_extrapolation_oob_every", 100)
+    config.setdefault("displacement_supervision", "vector")

@@ -12,6 +12,11 @@ from vesuvius.neural_tracing.datasets.direction_helpers import (
     build_triplet_direction_priors_from_displacements,
     maybe_swap_triplet_branch_channels,
 )
+from vesuvius.neural_tracing.datasets.dataset_defaults import setdefault_rowcol_cond_dataset_config
+from vesuvius.neural_tracing.datasets.conditioning_perturbation import (
+    compute_surface_normals,
+    maybe_perturb_conditioning_surface,
+)
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import random
@@ -128,82 +133,7 @@ class EdtSegDataset(Dataset):
         target_size = self.crop_size
         self._heatmap_axes = [torch.arange(s, dtype=torch.float32) for s in self.crop_size]
 
-        config.setdefault('use_sdt', False)
-        config.setdefault('dilation_radius', 1)  # voxels
-        config.setdefault('cond_percent', [0.5, 0.5])
-        config.setdefault('use_extrapolation', True)
-        config.setdefault('use_dense_displacement', False)
-        config.setdefault('extrapolation_method', 'linear_edge')
-        config.setdefault('supervise_conditioning', False)
-        config.setdefault('cond_supervision_weight', 0.1)
-        config.setdefault('force_recompute_patches', False)
-        config.setdefault('use_heatmap_targets', False)
-        config.setdefault('heatmap_step_size', 10)
-        config.setdefault('heatmap_step_count', 5)
-        config.setdefault('heatmap_sigma', 2.0)
-        config.setdefault('use_segmentation', False)
-
-        # other wrap conditioning: provide other wraps from same segment as context
-        config.setdefault('use_other_wrap_cond', False)
-        config.setdefault('other_wrap_prob', 0.5)  # probability of including other wraps when available
-        config.setdefault('sample_mode', 'wrap')  # 'wrap' = each wrap is a sample, 'chunk' = random wrap per chunk
-        config.setdefault('use_triplet_wrap_displacement', False)
-        config.setdefault('triplet_dense_weight_mode', 'band')  # band|all
-        config.setdefault('triplet_band_padding_voxels', 4.0)
-        config.setdefault('triplet_edt_bbox_padding_voxels', 4.0)
-        config.setdefault('triplet_band_distance_percentile', 95.0)
-        config.setdefault('triplet_gt_vector_dilation_radius', 0.0)
-        config.setdefault('use_triplet_direction_priors', True)
-        config.setdefault('triplet_direction_prior_mask', 'cond')  # cond|full
-        config.setdefault('triplet_random_channel_swap_prob', 0.5)
-        config.setdefault('triplet_overlap_mask_filename', 'overlap_mask.tif')
-        config.setdefault('triplet_warn_missing_overlap_masks', False)
-        config.setdefault('triplet_close_check_enabled', True)
-        config.setdefault('triplet_close_distance_voxels', 1.0)
-        config.setdefault('triplet_close_fraction_threshold', 0.05)
-        config.setdefault('triplet_close_print', True)
-        config.setdefault('enable_volume_crop_cache', False)
-        config.setdefault('volume_crop_cache_max_items', 0)
-        config.setdefault('validate_result_tensors', False)
-        config.setdefault('dense_edt_backend', 'scipy')  # scipy|auto|cucim
-
-        config.setdefault('overlap_fraction', 0.0)
-        config.setdefault('min_span_ratio', 1.0)
-        config.setdefault('edge_touch_frac', 0.1)
-        config.setdefault('edge_touch_min_count', 10)
-        config.setdefault('edge_touch_pad', 0)
-        config.setdefault('min_points_per_wrap', 100)
-        # Point-count thresholds in patch finding depend on tifxyz point density,
-        # which changes with volume_scale after retargeting. Keep scale=1 behavior
-        # as the default reference and scale counts quadratically for other scales.
-        config.setdefault('scale_normalize_patch_counts', True)
-        config.setdefault('patch_count_reference_scale', 0)
-        config.setdefault('bbox_pad_2d', 0)
-        config.setdefault('require_all_valid_in_bbox', True)
-        config.setdefault('skip_chunk_if_any_invalid', False)
-        config.setdefault('min_cond_span', 0.3)
-        config.setdefault('inner_bbox_fraction', 0.7)
-        config.setdefault('filter_oob_extrap_points', True)
-        cond_local_perturb = dict(config.get('cond_local_perturb') or {})
-        cond_local_perturb.setdefault('enabled', True)
-        cond_local_perturb.setdefault('probability', 0.35)
-        cond_local_perturb.setdefault('num_blobs', [1, 3])
-        cond_local_perturb.setdefault('points_affected', 10)
-        cond_local_perturb.setdefault('sigma_fraction_range', [0.04, 0.10])
-        cond_local_perturb.setdefault('amplitude_range', [0.25, 1.25])
-        cond_local_perturb.setdefault('radius_sigma_mult', 2.5)
-        cond_local_perturb.setdefault('max_total_displacement', 6.0)
-        cond_local_perturb.setdefault('apply_without_augmentation', False)
-        config['cond_local_perturb'] = cond_local_perturb
-        config.setdefault('rbf_downsample_factor', 4)
-        config.setdefault('rbf_edge_downsample_factor', 8)
-        config.setdefault('rbf_max_points', None)
-        config.setdefault('rbf_edge_band_frac', 0.10)
-        config.setdefault('rbf_edge_band_cells', None)
-        config.setdefault('rbf_edge_min_points', 128)
-        config.setdefault('debug_extrapolation_oob', False)
-        config.setdefault('debug_extrapolation_oob_every', 100)
-        config.setdefault('displacement_supervision', 'vector')
+        setdefault_rowcol_cond_dataset_config(config)
         self.displacement_supervision = str(config.get('displacement_supervision', 'vector')).lower()
         if self.displacement_supervision not in {'vector', 'normal_scalar'}:
             raise ValueError(
@@ -212,16 +142,6 @@ class EdtSegDataset(Dataset):
             )
         self.use_dense_displacement = bool(config.get('use_dense_displacement', False))
         self.use_triplet_wrap_displacement = bool(config.get('use_triplet_wrap_displacement', False))
-        self.dense_edt_backend_mode = str(config.get('dense_edt_backend', 'scipy')).lower()
-        if self.dense_edt_backend_mode not in {'scipy', 'auto', 'cucim'}:
-            raise ValueError(
-                "dense_edt_backend must be one of {'scipy', 'auto', 'cucim'}, "
-                f"got {self.dense_edt_backend_mode!r}"
-            )
-        self._dense_edt_backend = None
-        self._dense_edt_backend_fallback_warned = False
-        self._cupy = None
-        self._cucim_distance_transform_edt = None
         self.use_triplet_direction_priors = bool(config.get('use_triplet_direction_priors', True))
         self.triplet_direction_prior_mask = str(config.get('triplet_direction_prior_mask', 'cond')).lower()
         if self.triplet_direction_prior_mask not in {'cond', 'full'}:
@@ -994,7 +914,11 @@ class EdtSegDataset(Dataset):
             return self[np.random.randint(len(self))]
 
         center_zyxs_unperturbed = center_zyxs
-        center_zyxs_perturbed = self._maybe_perturb_conditioning_surface(center_zyxs_unperturbed)
+        center_zyxs_perturbed = maybe_perturb_conditioning_surface(
+            center_zyxs_unperturbed,
+            config=self.config,
+            apply_augmentation=self.apply_augmentation,
+        )
 
         crop_size = self.crop_size
         z_min, _, y_min, _, x_min, _ = patch.world_bbox
@@ -1370,31 +1294,6 @@ class EdtSegDataset(Dataset):
             z_full[r0:r1 + 1, c0:c1 + 1],
         )
 
-    @staticmethod
-    def _compute_surface_normals(surface_zyxs: np.ndarray) -> np.ndarray:
-        """Estimate per-point unit normals from local row/col tangents."""
-        h, w, _ = surface_zyxs.shape
-        if h < 2 or w < 2:
-            return np.zeros_like(surface_zyxs, dtype=np.float32)
-
-        surface = surface_zyxs.astype(np.float32, copy=False)
-        row_tangent = np.empty_like(surface)
-        col_tangent = np.empty_like(surface)
-
-        row_tangent[1:-1] = surface[2:] - surface[:-2]
-        row_tangent[0] = surface[1] - surface[0]
-        row_tangent[-1] = surface[-1] - surface[-2]
-
-        col_tangent[:, 1:-1] = surface[:, 2:] - surface[:, :-2]
-        col_tangent[:, 0] = surface[:, 1] - surface[:, 0]
-        col_tangent[:, -1] = surface[:, -1] - surface[:, -2]
-
-        normals = np.cross(col_tangent, row_tangent)
-        norms = np.linalg.norm(normals, axis=-1, keepdims=True)
-        normals = normals / np.maximum(norms, 1e-6)
-        normals[norms[..., 0] <= 1e-6] = 0.0
-        return normals.astype(np.float32, copy=False)
-
     def _get_dense_axis_offsets(self, shape_zyx):
         shape_key = tuple(int(s) for s in shape_zyx)
         axes = self._dense_axis_cache.get(shape_key)
@@ -1407,71 +1306,6 @@ class EdtSegDataset(Dataset):
             )
             self._dense_axis_cache[shape_key] = axes
         return axes
-
-    @staticmethod
-    @lru_cache(maxsize=1)
-    def _load_cucim_backend():
-        try:
-            import cupy as cp
-            from cucim.core.operations.morphology import distance_transform_edt as cucim_distance_transform_edt
-        except Exception as exc:
-            return None, None, exc
-        return cp, cucim_distance_transform_edt, None
-
-    def _warn_dense_edt_fallback_once(self, reason: str):
-        if self._dense_edt_backend_fallback_warned:
-            return
-        warnings.warn(
-            "dense_edt_backend='auto': falling back to scipy.ndimage.distance_transform_edt "
-            f"({reason})",
-            RuntimeWarning,
-        )
-        self._dense_edt_backend_fallback_warned = True
-
-    def _resolve_dense_edt_backend(self):
-        if self._dense_edt_backend is not None:
-            return self._dense_edt_backend
-        if self.dense_edt_backend_mode == 'scipy':
-            self._dense_edt_backend = 'scipy'
-            return self._dense_edt_backend
-
-        cp, cucim_edt, import_err = self._load_cucim_backend()
-        if cp is None or cucim_edt is None:
-            reason = f"failed to import cupy/cucim: {type(import_err).__name__}: {import_err}"
-            if self.dense_edt_backend_mode == 'auto':
-                self._warn_dense_edt_fallback_once(reason)
-                self._dense_edt_backend = 'scipy'
-                return self._dense_edt_backend
-            raise RuntimeError(
-                "dense_edt_backend='cucim' requested but cupy/cucim could not be imported; "
-                f"{reason}"
-            ) from import_err
-
-        try:
-            device_count = int(cp.cuda.runtime.getDeviceCount())
-        except Exception as exc:
-            device_count = 0
-            device_err = exc
-        else:
-            device_err = None
-
-        if device_count <= 0:
-            reason = "no CUDA devices available"
-            if device_err is not None:
-                reason = f"{reason} ({type(device_err).__name__}: {device_err})"
-            if self.dense_edt_backend_mode == 'auto':
-                self._warn_dense_edt_fallback_once(reason)
-                self._dense_edt_backend = 'scipy'
-                return self._dense_edt_backend
-            raise RuntimeError(
-                "dense_edt_backend='cucim' requested but no CUDA device is available; "
-                f"{reason}"
-            )
-
-        self._cupy = cp
-        self._cucim_distance_transform_edt = cucim_edt
-        self._dense_edt_backend = 'cucim'
-        return self._dense_edt_backend
 
     def _compute_dense_displacement_field(
         self,
@@ -1497,56 +1331,16 @@ class EdtSegDataset(Dataset):
             return None, None
 
         # Nearest foreground (surface) index per voxel.
-        backend = self._resolve_dense_edt_backend()
-        if backend == 'cucim':
-            try:
-                surface_inv_gpu = self._cupy.asarray(~surface)
-                if return_distances:
-                    distances_gpu, nearest_idx_gpu = self._cucim_distance_transform_edt(
-                        surface_inv_gpu,
-                        return_distances=True,
-                        return_indices=True,
-                        float64_distances=False,
-                    )
-                    distances = self._cupy.asnumpy(distances_gpu).astype(np.float32, copy=False)
-                else:
-                    nearest_idx_gpu = self._cucim_distance_transform_edt(
-                        surface_inv_gpu,
-                        return_distances=False,
-                        return_indices=True,
-                    )
-                    distances = None
-                nearest_idx = self._cupy.asnumpy(nearest_idx_gpu)
-            except Exception as exc:
-                if self.dense_edt_backend_mode != 'auto':
-                    raise
-                self._warn_dense_edt_fallback_once(
-                    f"runtime cuCIM EDT failed ({type(exc).__name__}: {exc})"
-                )
-                self._dense_edt_backend = 'scipy'
-                self._cupy = None
-                self._cucim_distance_transform_edt = None
-                if return_distances:
-                    distances, nearest_idx = ndimage.distance_transform_edt(
-                        ~surface, return_distances=True, return_indices=True
-                    )
-                    distances = distances.astype(np.float32, copy=False)
-                else:
-                    nearest_idx = ndimage.distance_transform_edt(
-                        ~surface, return_distances=False, return_indices=True
-                    )
-                    distances = None
+        if return_distances:
+            distances, nearest_idx = ndimage.distance_transform_edt(
+                ~surface, return_distances=True, return_indices=True
+            )
+            distances = distances.astype(np.float32, copy=False)
         else:
-            if return_distances:
-                distances, nearest_idx = ndimage.distance_transform_edt(
-                    ~surface, return_distances=True, return_indices=True
-                )
-                distances = distances.astype(np.float32, copy=False)
-            else:
-                nearest_idx = ndimage.distance_transform_edt(
-                    ~surface, return_distances=False, return_indices=True
-                )
-                distances = None
+            nearest_idx = ndimage.distance_transform_edt(
+                ~surface, return_distances=False, return_indices=True
+            )
+            distances = None
         disp = nearest_idx.astype(np.float32, copy=False)
         z_axis, y_axis, x_axis = self._get_dense_axis_offsets(surface.shape)
         disp[0] -= z_axis
@@ -1587,96 +1381,6 @@ class EdtSegDataset(Dataset):
         dist_outside = ndimage.distance_transform_edt(~mask_bool)
         dist_inside = ndimage.distance_transform_edt(mask_bool)
         return (dist_inside - dist_outside).astype(np.float32, copy=False)
-
-    def _maybe_perturb_conditioning_surface(self, cond_zyxs: np.ndarray) -> np.ndarray:
-        """Apply local normal-direction pushes with Gaussian falloff on small regions."""
-        cfg = self.config.get('cond_local_perturb', {})
-        apply_without_aug = bool(cfg.get('apply_without_augmentation', False))
-        if (not self.apply_augmentation and not apply_without_aug) or not cfg.get('enabled', True):
-            return cond_zyxs
-        if random.random() >= float(cfg.get('probability', 0.35)):
-            return cond_zyxs
-
-        cond_h, cond_w, _ = cond_zyxs.shape
-        if cond_h < 2 or cond_w < 2:
-            return cond_zyxs
-
-        normals = self._compute_surface_normals(cond_zyxs)
-        valid_normal_idx = np.argwhere(np.linalg.norm(normals, axis=-1) > 1e-6)
-        if len(valid_normal_idx) == 0:
-            return cond_zyxs
-
-        blob_cfg = cfg.get('num_blobs', [1, 3])
-        if isinstance(blob_cfg, (list, tuple)) and len(blob_cfg) == 2:
-            min_blobs = max(1, int(blob_cfg[0]))
-            max_blobs = max(min_blobs, int(blob_cfg[1]))
-        else:
-            min_blobs = max_blobs = 1
-        n_blobs = random.randint(min_blobs, max_blobs)
-
-        sigma_cfg = cfg.get('sigma_fraction_range', [0.04, 0.10])
-        if isinstance(sigma_cfg, (list, tuple)) and len(sigma_cfg) == 2:
-            sigma_lo_frac = max(0.01, float(sigma_cfg[0]))
-            sigma_hi_frac = max(sigma_lo_frac, float(sigma_cfg[1]))
-        else:
-            sigma_lo_frac, sigma_hi_frac = 0.04, 0.10
-        sigma_scale = float(min(cond_h, cond_w))
-        sigma_lo = max(0.3, sigma_lo_frac * sigma_scale)
-        sigma_hi = max(sigma_lo, sigma_hi_frac * sigma_scale)
-
-        amp_cfg = cfg.get('amplitude_range', [0.25, 1.25])
-        if isinstance(amp_cfg, (list, tuple)) and len(amp_cfg) == 2:
-            amp_lo = max(0.0, float(amp_cfg[0]))
-            amp_hi = max(amp_lo, float(amp_cfg[1]))
-        else:
-            amp_lo, amp_hi = 0.25, 1.25
-
-        radius_sigma_mult = max(0.5, float(cfg.get('radius_sigma_mult', 2.5)))
-        max_total_disp = max(0.0, float(cfg.get('max_total_displacement', 1.5)))
-        if max_total_disp <= 0.0:
-            return cond_zyxs
-
-        rr, cc = np.meshgrid(np.arange(cond_h), np.arange(cond_w), indexing='ij')
-        disp_along_normal = np.zeros((cond_h, cond_w), dtype=np.float32)
-        points_affected = int(cfg.get('points_affected', 10))
-        use_k_neighborhood = points_affected > 0
-
-        for _ in range(n_blobs):
-            seed_r, seed_c = valid_normal_idx[np.random.randint(len(valid_normal_idx))]
-
-            dr = rr - float(seed_r)
-            dc = cc - float(seed_c)
-            dist2 = dr * dr + dc * dc
-
-            if use_k_neighborhood:
-                flat_dist2 = dist2.reshape(-1)
-                k = min(points_affected, flat_dist2.size)
-                if k <= 0:
-                    continue
-                kth_idx = np.argpartition(flat_dist2, k - 1)[k - 1]
-                radius2 = float(flat_dist2[kth_idx])
-                local_mask = dist2 <= radius2
-                sigma = max(0.3, np.sqrt(max(radius2, 1e-6)) / max(radius_sigma_mult, 1e-3))
-            else:
-                sigma = random.uniform(sigma_lo, sigma_hi)
-                radius2 = (radius_sigma_mult * sigma) ** 2
-                local_mask = dist2 <= radius2
-
-            if not np.any(local_mask):
-                continue
-
-            amp = random.uniform(amp_lo, amp_hi)
-            signed_amp = amp if random.random() < 0.5 else -amp
-            falloff = np.exp(-0.5 * dist2 / max(sigma * sigma, 1e-6))
-            disp_along_normal[local_mask] += (signed_amp * falloff[local_mask]).astype(np.float32)
-
-        if not np.any(disp_along_normal):
-            return cond_zyxs
-
-        disp_along_normal = np.clip(disp_along_normal, -max_total_disp, max_total_disp)
-        perturbed = cond_zyxs.astype(np.float32, copy=True)
-        perturbed += normals * disp_along_normal[..., None]
-        return perturbed.astype(cond_zyxs.dtype, copy=False)
 
     def __getitem__(self, idx):
         patch_idx, wrap_idx = self.sample_index[idx]
@@ -1791,7 +1495,11 @@ class EdtSegDataset(Dataset):
         cond_zyxs = np.stack([z_cond, y_cond, x_cond], axis=-1)
         masked_zyxs = np.stack([z_mask, y_mask, x_mask], axis=-1)
         cond_zyxs_unperturbed = cond_zyxs.copy()
-        cond_zyxs = self._maybe_perturb_conditioning_surface(cond_zyxs)
+        cond_zyxs = maybe_perturb_conditioning_surface(
+            cond_zyxs,
+            config=self.config,
+            apply_augmentation=self.apply_augmentation,
+        )
 
         # use world_bbox directly as crop position, this is the crop returned by find_patches
         z_min, z_max, y_min, y_max, x_min, x_max = patch.world_bbox
@@ -2005,7 +1713,7 @@ class EdtSegDataset(Dataset):
                 cond_weight = max(0.0, float(self.config.get('cond_supervision_weight', 0.1)))
                 cond_normals_local = None
                 if self._needs_point_normals:
-                    cond_normals_grid = self._compute_surface_normals(cond_zyxs_unperturbed)
+                    cond_normals_grid = compute_surface_normals(cond_zyxs_unperturbed)
                     cond_normals_local = cond_normals_grid.reshape(-1, 3).astype(np.float32)
 
                 cond_in_bounds = (
