@@ -173,7 +173,6 @@ class EdtSegDataset(Dataset):
         else:
             self._augmentations = None
         self._cond_local_perturb_active = self._should_attempt_cond_local_perturb()
-        self._assert_augmentation_supports_cond_surface_keypoints()
 
         self.sample_mode = str(config.get('sample_mode', 'wrap')).lower()
         self._triplet_neighbor_lookup = {}
@@ -720,39 +719,25 @@ class EdtSegDataset(Dataset):
         return True
 
     @staticmethod
-    def _iter_augmentation_leaf_transforms(transform):
-        if transform is None:
-            return
-        if hasattr(transform, "transforms"):
-            for child in transform.transforms:
-                yield from EdtSegDataset._iter_augmentation_leaf_transforms(child)
-            return
-        if hasattr(transform, "transform"):
-            yield from EdtSegDataset._iter_augmentation_leaf_transforms(transform.transform)
-            return
-        if hasattr(transform, "list_of_transforms"):
-            for child in transform.list_of_transforms:
-                yield from EdtSegDataset._iter_augmentation_leaf_transforms(child)
-            return
-        yield transform
-
-    def _assert_augmentation_supports_cond_surface_keypoints(self) -> None:
-        if self._augmentations is None or not self._cond_local_perturb_active:
-            return
-        allowed_spatial = {"Rot90Transform", "MirrorTransform", "TransposeAxesTransform"}
-        unsupported = []
-        for leaf in self._iter_augmentation_leaf_transforms(self._augmentations):
-            if not getattr(leaf, "_is_spatial", False):
-                continue
-            leaf_name = type(leaf).__name__
-            if leaf_name not in allowed_spatial:
-                unsupported.append(leaf_name)
-        if unsupported:
-            names = ", ".join(sorted(set(unsupported)))
+    def _require_augmented_keypoints(augmented: dict, expected_shape, mode: str):
+        augmented_keypoints = augmented.get("keypoints")
+        expected_tuple = tuple(expected_shape)
+        requirement = (
+            "cond_local_perturb post-augmentation requires the augmentation pipeline to preserve "
+            "keypoints when cond_surface_local is provided."
+        )
+        if augmented_keypoints is None:
             raise RuntimeError(
-                "cond_local_perturb post-augmentation requires spatial transforms with explicit "
-                f"keypoint support. Unsupported spatial transforms in pipeline: {names}."
+                f"{mode} augmentation did not return keypoints (expected shape {expected_tuple}); "
+                f"{requirement}"
             )
+        actual_tuple = tuple(augmented_keypoints.shape)
+        if actual_tuple != expected_tuple:
+            raise RuntimeError(
+                f"{mode} augmentation returned keypoints with shape {actual_tuple}; expected "
+                f"{expected_tuple}. {requirement}"
+            )
+        return augmented_keypoints
 
     def _conditioning_from_surface(
         self,
@@ -1597,9 +1582,11 @@ class EdtSegDataset(Dataset):
                 behind_seg = augmented["segmentation"][1]
                 front_seg = augmented["segmentation"][2]
                 if cond_surface_keypoints is not None:
-                    augmented_keypoints = augmented.get("keypoints")
-                    if augmented_keypoints is None or augmented_keypoints.shape != cond_surface_keypoints.shape:
-                        return self[np.random.randint(len(self))]
+                    augmented_keypoints = self._require_augmented_keypoints(
+                        augmented,
+                        cond_surface_keypoints.shape,
+                        mode="triplet",
+                    )
                     cond_surface_local = augmented_keypoints.reshape(*cond_surface_shape, 3).contiguous()
 
             if cond_local_perturb_active and cond_surface_local is not None:
@@ -1713,9 +1700,11 @@ class EdtSegDataset(Dataset):
                 if use_heatmap:
                     heatmap_tensor = augmented['heatmap_target'].squeeze(0)
                 if cond_surface_keypoints is not None:
-                    augmented_keypoints = augmented.get("keypoints")
-                    if augmented_keypoints is None or augmented_keypoints.shape != cond_surface_keypoints.shape:
-                        return self[np.random.randint(len(self))]
+                    augmented_keypoints = self._require_augmented_keypoints(
+                        augmented,
+                        cond_surface_keypoints.shape,
+                        mode="split",
+                    )
                     cond_surface_local = augmented_keypoints.reshape(*cond_surface_shape, 3).contiguous()
 
             if cond_local_perturb_active and cond_surface_local is not None:
