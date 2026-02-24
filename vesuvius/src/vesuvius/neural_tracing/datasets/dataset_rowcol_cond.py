@@ -301,7 +301,14 @@ class EdtSegDataset(Dataset):
                     raise ValueError(
                         "Triplet mode enabled but no wraps have same/adjacent neighbors on both sides."
                     )
-            self._cond_percent_min, self._cond_percent_max = self._parse_cond_percent()
+            spec = self.config['cond_percent']
+            if not isinstance(spec, (list, tuple)) or len(spec) != 2:
+                raise ValueError("cond_percent must be [min, max], e.g. [0.1, 0.5]")
+
+            low, high = float(spec[0]), float(spec[1])
+            if not (0.0 < low <= high < 1.0):
+                raise ValueError("cond_percent values must satisfy 0 < min <= max < 1")
+            self._cond_percent_min, self._cond_percent_max = low, high
         else:
             self._load_patch_metadata(patch_metadata)
 
@@ -459,7 +466,7 @@ class EdtSegDataset(Dataset):
         }
 
     def _compute_wrap_order_stats(self, wrap):
-        """Compute robust world-space stats/points used for triplet wrap ordering."""
+        """Compute per-wrap medians used for triplet neighbor ordering."""
         seg = wrap["segment"]
         r_min, r_max, c_min, c_max = wrap["bbox_2d"]
 
@@ -472,7 +479,7 @@ class EdtSegDataset(Dataset):
             return None
 
         seg.use_stored_resolution()
-        x_s, y_s, z_s, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
+        x_s, y_s, _, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
         if x_s.size == 0:
             return None
 
@@ -481,33 +488,22 @@ class EdtSegDataset(Dataset):
                 return None
             x_vals = x_s[valid_s]
             y_vals = y_s[valid_s]
-            z_vals = z_s[valid_s]
         else:
             x_vals = x_s.reshape(-1)
             y_vals = y_s.reshape(-1)
-            z_vals = z_s.reshape(-1)
 
-        finite = np.isfinite(x_vals) & np.isfinite(y_vals) & np.isfinite(z_vals)
+        finite = np.isfinite(x_vals) & np.isfinite(y_vals)
         if not finite.any():
             return None
         x_vals = x_vals[finite]
         y_vals = y_vals[finite]
-        z_vals = z_vals[finite]
 
-        if x_vals.size == 0 or y_vals.size == 0 or z_vals.size == 0:
+        if x_vals.size == 0 or y_vals.size == 0:
             return None
 
-        points_zyx = np.stack([z_vals, y_vals, x_vals], axis=1).astype(np.float64, copy=False)
-
         return {
-            "z_median": float(np.median(z_vals)),
-            "z_min": float(np.min(z_vals)),
-            "z_max": float(np.max(z_vals)),
             "x_median": float(np.median(x_vals)),
             "y_median": float(np.median(y_vals)),
-            "x_span": float(np.max(x_vals) - np.min(x_vals)),
-            "y_span": float(np.max(y_vals) - np.min(y_vals)),
-            "points_zyx": points_zyx,
         }
 
     def _build_triplet_neighbor_lookup(self):
@@ -542,17 +538,16 @@ class EdtSegDataset(Dataset):
                     "wrap_ids": wrap_ids,
                     "x_median": s["x_median"],
                     "y_median": s["y_median"],
-                    "x_span": s["x_span"],
-                    "y_span": s["y_span"],
                 })
 
             if len(wrap_stats) < 3:
                 continue
 
-            x_spans = np.array([s["x_span"] for s in wrap_stats], dtype=np.float32)
-            y_spans = np.array([s["y_span"] for s in wrap_stats], dtype=np.float32)
-            principal_axis = "x" if float(np.median(x_spans)) >= float(np.median(y_spans)) else "y"
-            order_axis = "y" if principal_axis == "x" else "x"
+            x_medians = np.array([s["x_median"] for s in wrap_stats], dtype=np.float32)
+            y_medians = np.array([s["y_median"] for s in wrap_stats], dtype=np.float32)
+            x_spread = float(np.max(x_medians) - np.min(x_medians))
+            y_spread = float(np.max(y_medians) - np.min(y_medians))
+            order_axis = "x" if x_spread >= y_spread else "y"
 
             if order_axis == "x":
                 ordered = sorted(wrap_stats, key=lambda s: (s["x_median"], s["wrap_idx"]))
@@ -586,16 +581,6 @@ class EdtSegDataset(Dataset):
                 order_stats["kept_triplets"] += 1
         self._triplet_lookup_stats = order_stats
         return lookup
-
-    def _parse_cond_percent(self):
-        spec = self.config['cond_percent']
-        if not isinstance(spec, (list, tuple)) or len(spec) != 2:
-            raise ValueError("cond_percent must be [min, max], e.g. [0.1, 0.5]")
-
-        low, high = float(spec[0]), float(spec[1])
-        if not (0.0 < low <= high < 1.0):
-            raise ValueError("cond_percent values must satisfy 0 < min <= max < 1")
-        return low, high
 
     def _extract_wrap_world_surface(self, patch: ChunkPatch, wrap: dict, require_all_valid: bool = True):
         """Extract one wrap as upsampled world-coordinate [H, W, 3] (ZYX)."""
