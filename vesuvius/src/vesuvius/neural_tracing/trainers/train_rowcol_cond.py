@@ -1,7 +1,7 @@
 """
 Trainer for row/col conditioned displacement field prediction.
 
-Trains a model to predict dense 3D displacement fields from extrapolated surfaces,
+Trains a model to predict dense 3D displacement fields from conditioned surfaces,
 with optional SDT (Signed Distance Transform) prediction.
 """
 import os
@@ -220,9 +220,7 @@ def train(config_path):
     if triplet_mode and use_triplet_direction_priors:
         default_in_channels = 8
     else:
-        default_in_channels = (
-            2 + int(config.get('use_extrapolation', True)) + int(config.get('use_other_wrap_cond', False))
-        )
+        default_in_channels = 2 + int(config.get('use_other_wrap_cond', False))
     config.setdefault('in_channels', default_in_channels)
     if int(config['in_channels']) != default_in_channels:
         if triplet_mode and use_triplet_direction_priors:
@@ -232,8 +230,7 @@ def train(config_path):
             )
         raise ValueError(
             f"in_channels={config['in_channels']} does not match configured inputs "
-            f"(expected {default_in_channels} from use_extrapolation={config.get('use_extrapolation', True)}, "
-            f"use_other_wrap_cond={config.get('use_other_wrap_cond', False)})"
+            f"(expected {default_in_channels} from use_other_wrap_cond={config.get('use_other_wrap_cond', False)})"
         )
     config.setdefault('step_count', 1)  # Required by make_model
     config.setdefault('num_iterations', 250000)
@@ -390,10 +387,12 @@ def train(config_path):
     if lambda_triplet_min_disp > 0.0 and not triplet_mode:
         raise ValueError("lambda_triplet_min_disp > 0 requires use_triplet_wrap_displacement=True")
     disp_supervision = str(config.get('displacement_supervision', 'vector')).lower()
-    if not config.get('use_extrapolation', True) and not use_dense_displacement:
-        raise ValueError("Need at least one displacement supervision path: use_extrapolation or use_dense_displacement")
-    if disp_supervision == 'normal_scalar' and not config.get('use_extrapolation', True):
-        raise ValueError("displacement_supervision='normal_scalar' requires use_extrapolation=True")
+    if not use_dense_displacement:
+        raise ValueError(
+            "rowcol_cond training now requires use_dense_displacement=True."
+        )
+    if disp_supervision == 'normal_scalar':
+        raise ValueError("displacement_supervision='normal_scalar' is not supported in dense-only rowcol_cond training")
     disp_loss_type = config.get('displacement_loss_type', 'vector_l2')
     disp_huber_beta = config.get('displacement_huber_beta', 5.0)
     normal_loss_type = str(config.get('normal_loss_type', 'normal_huber')).lower()

@@ -16,9 +16,6 @@ from vesuvius.neural_tracing.datasets.dataset_defaults import (
     setdefault_rowcol_cond_dataset_config,
     validate_rowcol_cond_dataset_config,
 )
-from vesuvius.neural_tracing.datasets.perturbation import (
-    compute_surface_normals,
-)
 from vesuvius.neural_tracing.datasets.conditioning import (
     create_centered_conditioning,
     create_split_conditioning,
@@ -26,7 +23,6 @@ from vesuvius.neural_tracing.datasets.conditioning import (
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import random
-from vesuvius.neural_tracing.datasets.extrapolation import compute_extrapolation
 from vesuvius.tifxyz.upsampling import interpolate_at_points
 from scipy import ndimage
 from collections import OrderedDict
@@ -144,6 +140,9 @@ class EdtSegDataset(Dataset):
         self.displacement_supervision = str(config.get('displacement_supervision', 'vector')).lower()
         self.use_dense_displacement = bool(config.get('use_dense_displacement', False))
         self.use_triplet_wrap_displacement = bool(config.get('use_triplet_wrap_displacement', False))
+        if not self.use_triplet_wrap_displacement:
+            # Regular split is dense-supervision only.
+            self.use_dense_displacement = True
         self.use_triplet_direction_priors = bool(config.get('use_triplet_direction_priors', True))
         self.triplet_direction_prior_mask = str(config.get('triplet_direction_prior_mask', 'cond')).lower()
         self.triplet_random_channel_swap_prob = float(config.get('triplet_random_channel_swap_prob', 0.5))
@@ -160,7 +159,6 @@ class EdtSegDataset(Dataset):
                     RuntimeWarning,
                 )
                 self.triplet_random_channel_swap_prob = 0.5
-        self._needs_point_normals = self.displacement_supervision == 'normal_scalar'
         self._validate_result_tensors_enabled = bool(config.get('validate_result_tensors', True))
 
         aug_config = config.get('augmentation', {})
@@ -1132,15 +1130,6 @@ class EdtSegDataset(Dataset):
         return result
 
     @staticmethod
-    def _coords_in_bounds(coords_zyx: torch.Tensor, shape_zyx) -> torch.Tensor:
-        d, h, w = (int(shape_zyx[0]), int(shape_zyx[1]), int(shape_zyx[2]))
-        return (
-            (coords_zyx[:, 0] >= 0) & (coords_zyx[:, 0] <= d - 1) &
-            (coords_zyx[:, 1] >= 0) & (coords_zyx[:, 1] <= h - 1) &
-            (coords_zyx[:, 2] >= 0) & (coords_zyx[:, 2] <= w - 1)
-        )
-
-    @staticmethod
     def _upsample_world_triplet(x_s, y_s, z_s, scale_y: float, scale_x: float):
         """Upsample (x, y, z) sampled grids using tifxyz interpolation."""
         h_s, w_s = x_s.shape
@@ -1331,50 +1320,12 @@ class EdtSegDataset(Dataset):
         c_max = conditioning["c_max"]
         conditioning_percent = conditioning["conditioning_percent"]
         cond_direction = conditioning["cond_direction"]
-        uv_cond = conditioning["uv_cond"]
-        uv_mask = conditioning["uv_mask"]
         cond_zyxs = conditioning["cond_zyxs"]
         cond_zyxs_unperturbed = conditioning["cond_zyxs_unperturbed"]
         masked_zyxs = conditioning["masked_zyxs"]
         min_corner = conditioning["min_corner"]
         max_corner = conditioning["max_corner"]
         vol_cache_key = conditioning["vol_cache_key"]
-
-        # if we're extrapolating, compute it with the extrapolation module
-        if self.config['use_extrapolation']:
-            method_name = self.config['extrapolation_method']
-            rbf_downsample = int(self.config.get('rbf_downsample_factor', 2))
-            edge_downsample_cfg = self.config.get('rbf_edge_downsample_factor', None)
-            edge_downsample = rbf_downsample if edge_downsample_cfg is None else int(edge_downsample_cfg)
-            selected_downsample = edge_downsample if method_name == 'rbf_edge_only' else rbf_downsample
-
-            extrap_result = compute_extrapolation(
-                uv_cond=uv_cond,
-                zyx_cond=cond_zyxs,
-                uv_mask=uv_mask,
-                zyx_mask=masked_zyxs,
-                min_corner=min_corner,
-                crop_size=crop_size,
-                method=method_name,
-                downsample_factor=selected_downsample,
-                rbf_max_points=self.config.get('rbf_max_points'),
-                edge_band_frac=float(self.config.get('rbf_edge_band_frac', 0.10)),
-                edge_band_cells=self.config.get('rbf_edge_band_cells'),
-                edge_min_points=int(self.config.get('rbf_edge_min_points', 128)),
-                cond_direction=cond_direction,
-                degrade_prob=self.config.get('extrap_degrade_prob', 0.0),
-                degrade_curvature_range=self.config.get('extrap_degrade_curvature_range', (0.001, 0.01)),
-                degrade_gradient_range=self.config.get('extrap_degrade_gradient_range', (0.05, 0.2)),
-                debug_no_in_bounds=bool(self.config.get('debug_extrapolation_oob', False)),
-                debug_no_in_bounds_every=int(self.config.get('debug_extrapolation_oob_every', 100)),
-                return_gt_normals=self._needs_point_normals,
-            )
-            if extrap_result is None:
-                return self[np.random.randint(len(self))]
-            extrap_surface = extrap_result['extrap_surface']
-            extrap_coords_local = extrap_result['extrap_coords_local']
-            gt_coords_local = extrap_result['gt_coords_local']
-            gt_normals_local = extrap_result.get('gt_normals_local')
 
         vol_crop = self._load_volume_crop_from_patch(
             patch,
@@ -1399,7 +1350,7 @@ class EdtSegDataset(Dataset):
         # make sure we actually have some conditioning
         if not cond_segmentation.any():
             return self[np.random.randint(len(self))]
-        if self.use_dense_displacement and not cond_segmentation_gt.any():
+        if not cond_segmentation_gt.any():
             return self[np.random.randint(len(self))]
 
         cond_segmentation_raw = cond_segmentation.copy()
@@ -1414,7 +1365,6 @@ class EdtSegDataset(Dataset):
 
         use_segmentation = self.config.get('use_segmentation', False)
         use_sdt = self.config['use_sdt']
-        use_dense_displacement = self.use_dense_displacement
         full_segmentation = None
         full_segmentation_raw = None
         if use_sdt:
@@ -1525,56 +1475,6 @@ class EdtSegDataset(Dataset):
             full_seg = torch.from_numpy(seg_dilated).to(torch.float32)
             seg_skel = torch.from_numpy(seg_skel).to(torch.float32)
 
-        use_extrapolation = self.config['use_extrapolation']
-        if use_extrapolation:
-            sample_coords_local = extrap_coords_local
-            target_coords_local = gt_coords_local
-            point_weights_local = np.ones(sample_coords_local.shape[0], dtype=np.float32)
-            point_normals_local = None
-            if self._needs_point_normals:
-                if gt_normals_local is None:
-                    raise ValueError("Expected gt_normals_local for normal_scalar supervision, got None")
-                point_normals_local = gt_normals_local.astype(np.float32, copy=False)
-
-            if self.config.get('supervise_conditioning', False):
-                cond_sample_coords_local = (cond_zyxs - min_corner).reshape(-1, 3).astype(np.float32)
-                cond_target_coords_local = (cond_zyxs_unperturbed - min_corner).reshape(-1, 3).astype(np.float32)
-                cond_weight = max(0.0, float(self.config.get('cond_supervision_weight', 0.1)))
-                cond_normals_local = None
-                if self._needs_point_normals:
-                    cond_normals_grid = compute_surface_normals(cond_zyxs_unperturbed)
-                    cond_normals_local = cond_normals_grid.reshape(-1, 3).astype(np.float32)
-
-                cond_in_bounds = (
-                    (cond_sample_coords_local[:, 0] >= 0) & (cond_sample_coords_local[:, 0] < crop_size[0]) &
-                    (cond_sample_coords_local[:, 1] >= 0) & (cond_sample_coords_local[:, 1] < crop_size[1]) &
-                    (cond_sample_coords_local[:, 2] >= 0) & (cond_sample_coords_local[:, 2] < crop_size[2]) &
-                    (cond_target_coords_local[:, 0] >= 0) & (cond_target_coords_local[:, 0] < crop_size[0]) &
-                    (cond_target_coords_local[:, 1] >= 0) & (cond_target_coords_local[:, 1] < crop_size[1]) &
-                    (cond_target_coords_local[:, 2] >= 0) & (cond_target_coords_local[:, 2] < crop_size[2])
-                )
-                cond_sample_coords_local = cond_sample_coords_local[cond_in_bounds]
-                cond_target_coords_local = cond_target_coords_local[cond_in_bounds]
-                if cond_normals_local is not None:
-                    cond_normals_local = cond_normals_local[cond_in_bounds]
-
-                if cond_sample_coords_local.shape[0] > 0:
-                    sample_coords_local = np.concatenate([sample_coords_local, cond_sample_coords_local], axis=0)
-                    target_coords_local = np.concatenate([target_coords_local, cond_target_coords_local], axis=0)
-                    cond_weights = np.full(cond_sample_coords_local.shape[0], cond_weight, dtype=np.float32)
-                    point_weights_local = np.concatenate([point_weights_local, cond_weights], axis=0)
-                    if point_normals_local is not None and cond_normals_local is not None:
-                        point_normals_local = np.concatenate([point_normals_local, cond_normals_local], axis=0)
-
-            extrap_surf = torch.from_numpy(extrap_surface).to(torch.float32)
-            extrap_coords = torch.from_numpy(sample_coords_local).to(torch.float32)
-            gt_coords = torch.from_numpy(target_coords_local).to(torch.float32)
-            point_weights = torch.from_numpy(point_weights_local).to(torch.float32)
-            point_normals = None
-            if point_normals_local is not None:
-                point_normals = torch.from_numpy(point_normals_local).to(torch.float32)
-            n_points = len(extrap_coords)
-
         use_sdt = self.config['use_sdt']
         if use_sdt:
             sdt_tensor = torch.from_numpy(sdt).to(torch.float32)
@@ -1582,17 +1482,13 @@ class EdtSegDataset(Dataset):
         if self._augmentations is not None:
             seg_list = [masked_seg, cond_seg, other_wraps_tensor]
             seg_keys = ['masked_seg', 'cond_seg', 'other_wraps']
-            if use_dense_displacement:
-                seg_list.append(cond_seg_gt)
-                seg_keys.append('cond_seg_gt')
+            seg_list.append(cond_seg_gt)
+            seg_keys.append('cond_seg_gt')
             if use_segmentation:
                 seg_list.append(full_seg)
                 seg_keys.append('full_seg')
                 seg_list.append(seg_skel)
                 seg_keys.append('seg_skel')
-            if use_extrapolation:
-                seg_list.append(extrap_surf)
-                seg_keys.append('extrap_surf')
 
             dist_list = []
             dist_keys = []
@@ -1607,13 +1503,6 @@ class EdtSegDataset(Dataset):
             }
             if dist_list:
                 aug_kwargs['dist_map'] = torch.stack(dist_list, dim=0)
-            if use_extrapolation:
-                # stack both coordinate sets together - they get the same keypoint transform
-                # we will split them after augmentation and compute displacement from the difference
-                aug_kwargs['keypoints'] = torch.cat([extrap_coords, gt_coords], dim=0)
-                if point_normals is not None:
-                    aug_kwargs['point_normals'] = point_normals
-                    aug_kwargs['vector_keys'] = ['point_normals']
             if use_heatmap:
                 aug_kwargs['heatmap_target'] = heatmap_tensor[None]  # (1, D, H, W)
                 aug_kwargs['regression_keys'] = ['heatmap_target']
@@ -1634,55 +1523,25 @@ class EdtSegDataset(Dataset):
                     full_seg = augmented['segmentation'][i]
                 elif key == 'seg_skel':
                     seg_skel = augmented['segmentation'][i]
-                elif key == 'extrap_surf':
-                    extrap_surf = augmented['segmentation'][i]
 
             if dist_list:
                 for i, key in enumerate(dist_keys):
                     if key == 'sdt':
                         sdt_tensor = augmented['dist_map'][i]
 
-            if use_extrapolation:
-                all_coords = augmented['keypoints']
-                extrap_coords = all_coords[:n_points]
-                gt_coords = all_coords[n_points:]
-                if point_normals is not None:
-                    point_normals = augmented['point_normals']
-                # compute displacement AFTER augmentation 
-                # both coordinate sets received the same spatial transform, so their
-                # difference (displacement) is now in the post-augmentation coordinate system
-                gt_disp = gt_coords - extrap_coords
             if use_heatmap:
                 heatmap_tensor = augmented['heatmap_target'].squeeze(0)
-        else:
-            # No augmentation - compute displacement directly from coordinates
-            if use_extrapolation:
-                gt_disp = gt_coords - extrap_coords
 
-        if use_extrapolation and self.config.get('filter_oob_extrap_points', True):
-            in_bounds = self._coords_in_bounds(extrap_coords, vol_crop.shape)
-            if not torch.all(in_bounds):
-                extrap_coords = extrap_coords[in_bounds]
-                gt_disp = gt_disp[in_bounds]
-                point_weights = point_weights[in_bounds]
-                if point_normals is not None:
-                    point_normals = point_normals[in_bounds]
-            if extrap_coords.shape[0] == 0:
-                return self[np.random.randint(len(self))]
-
-        dense_gt_disp = None
-        dense_loss_weight = None
-        if use_dense_displacement:
-            # Build dense GT from augmented surfaces so supervision is in the same frame
-            # as transformed inputs/labels.
-            full_dense_surface = torch.maximum(masked_seg, cond_seg_gt)
-            dense_disp_np, dense_weight_np = self._compute_dense_displacement_field(
-                full_dense_surface.numpy()
-            )
-            if dense_disp_np is None:
-                return self[np.random.randint(len(self))]
-            dense_gt_disp = torch.from_numpy(dense_disp_np).to(torch.float32)
-            dense_loss_weight = torch.from_numpy(dense_weight_np).to(torch.float32)
+        # Build dense GT from augmented surfaces so supervision is in the same frame
+        # as transformed inputs/labels.
+        full_dense_surface = torch.maximum(masked_seg, cond_seg_gt)
+        dense_disp_np, dense_weight_np = self._compute_dense_displacement_field(
+            full_dense_surface.numpy()
+        )
+        if dense_disp_np is None:
+            return self[np.random.randint(len(self))]
+        dense_gt_disp = torch.from_numpy(dense_disp_np).to(torch.float32)
+        dense_loss_weight = torch.from_numpy(dense_weight_np).to(torch.float32)
 
         result = {
             "vol": vol_crop,                 # raw volume crop
@@ -1693,17 +1552,8 @@ class EdtSegDataset(Dataset):
         if use_other_wrap_cond:
             result["other_wraps"] = other_wraps_tensor  # other wraps from same segment as context
 
-        if use_extrapolation:
-            result["extrap_surface"] = extrap_surf     # extrapolated surface voxelization
-            result["extrap_coords"] = extrap_coords    # (N, 3) coords for sampling predicted field
-            result["gt_displacement"] = gt_disp        # (N, 3) ground truth displacement
-            result["point_weights"] = point_weights    # (N,) per-point supervision weights
-            if point_normals is not None:
-                result["point_normals"] = point_normals  # (N, 3) normals for normal-scalar supervision
-
-        if use_dense_displacement:
-            result["dense_gt_displacement"] = dense_gt_disp  # (3, D, H, W)
-            result["dense_loss_weight"] = dense_loss_weight  # (1, D, H, W)
+        result["dense_gt_displacement"] = dense_gt_disp  # (3, D, H, W)
+        result["dense_loss_weight"] = dense_loss_weight  # (1, D, H, W)
 
         if use_sdt:
             result["sdt"] = sdt_tensor                 # signed distance transform of full (dilated) segmentation
@@ -1761,18 +1611,13 @@ if __name__ == "__main__":
         sample = train_ds[i]
 
         # Save 3D volumes as tif
-        for key in ['vol', 'cond', 'masked_seg', 'extrap_surface', 'other_wraps', 'sdt', 'heatmap_target',
+        for key in ['vol', 'cond', 'masked_seg', 'other_wraps', 'sdt', 'heatmap_target',
                     'segmentation', 'segmentation_skel', 'dense_gt_displacement', 'dense_loss_weight']:
             if key in sample:
                 subdir = out_dir / key
                 subdir.mkdir(exist_ok=True)
                 tifffile.imwrite(subdir / f"{i:03d}.tif", sample[key].numpy())
 
-        # Print info about point data
         print(f"[{i+1}/{num_samples}] Sample {i:03d}:")
-        if 'extrap_coords' in sample:
-            print(f"  extrap_coords shape: {sample['extrap_coords'].shape}")
-            print(f"  gt_displacement shape: {sample['gt_displacement'].shape}")
-            print(f"  displacement magnitude range: [{sample['gt_displacement'].norm(dim=-1).min():.2f}, {sample['gt_displacement'].norm(dim=-1).max():.2f}]")
 
     print(f"Output saved to {out_dir}")

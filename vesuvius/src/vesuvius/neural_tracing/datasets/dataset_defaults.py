@@ -8,8 +8,8 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("use_sdt", False)
     config.setdefault("dilation_radius", 1)  # voxels
     config.setdefault("cond_percent", [0.5, 0.5])
-    config.setdefault("use_extrapolation", True)
-    config.setdefault("use_dense_displacement", False)
+    config.setdefault("use_extrapolation", False)
+    config.setdefault("use_dense_displacement", True)
     config.setdefault("extrapolation_method", "linear_edge")
     config.setdefault("supervise_conditioning", False)
     config.setdefault("cond_supervision_weight", 0.1)
@@ -144,6 +144,12 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
 
     use_dense_displacement = bool(config.get("use_dense_displacement", False))
     use_triplet_wrap_displacement = bool(config.get("use_triplet_wrap_displacement", False))
+
+    if not use_triplet_wrap_displacement and not use_dense_displacement:
+        raise ValueError(
+            "Regular split no longer supports sparse extrapolation supervision; "
+            "set use_dense_displacement=True."
+        )
 
     if displacement_supervision == "normal_scalar" and use_dense_displacement:
         raise ValueError("displacement_supervision='normal_scalar' is not supported with use_dense_displacement=True")

@@ -52,7 +52,8 @@
     "overlap_fraction": 0.25,
     "sample_mode": "wrap",
     "val_fraction": 0.05,
-    "use_extrapolation": true,
+    "use_extrapolation": false,
+    "use_dense_displacement": true,
     "extrapolation_method": "rbf",
     "rbf_downsample_factor": 4,
     "cond_percent": [0.10, 0.50],
@@ -96,7 +97,7 @@
     "mixed_precision": "bf16",
     "compile_model": true,
 
-    "in_channels": 3,
+    "in_channels": 2,
     "model_type": "unet",
 
     "model_config": {
