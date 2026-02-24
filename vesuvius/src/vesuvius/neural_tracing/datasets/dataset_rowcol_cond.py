@@ -1097,32 +1097,11 @@ class EdtSegDataset(Dataset):
         )
 
         if not np.all(valid):
-            x_lin, y_lin, z_lin, valid_lin = interpolate_at_points(
-                x_src,
-                y_src,
-                z_src,
-                valid_src,
-                query_row,
-                query_col,
-                scale=(1.0, 1.0),
-                method="linear",
+            invalid_count = int((~valid).sum())
+            raise ValueError(
+                "Invalid points from Catmull-Rom interpolation: "
+                f"{invalid_count}/{valid.size}"
             )
-
-            replace_lin = (~valid) & valid_lin
-            if np.any(replace_lin):
-                x_up[replace_lin] = x_lin[replace_lin]
-                y_up[replace_lin] = y_lin[replace_lin]
-                z_up[replace_lin] = z_lin[replace_lin]
-                valid[replace_lin] = True
-
-            if not np.all(valid):
-                # Guarantee dense coverage: nearest-neighbor fill for any residual invalids.
-                nn_r = np.clip(np.rint(query_row).astype(np.int64), 0, h_s - 1)
-                nn_c = np.clip(np.rint(query_col).astype(np.int64), 0, w_s - 1)
-                replace_nn = ~valid
-                x_up[replace_nn] = x_src[nn_r[replace_nn], nn_c[replace_nn]]
-                y_up[replace_nn] = y_src[nn_r[replace_nn], nn_c[replace_nn]]
-                z_up[replace_nn] = z_src[nn_r[replace_nn], nn_c[replace_nn]]
 
         return x_up, y_up, z_up
 
