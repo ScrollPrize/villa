@@ -4,6 +4,8 @@ Displacement field loss functions for neural tracing.
 Surface-sampled loss for training models to predict dense displacement fields
 from extrapolated surfaces.
 """
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -11,6 +13,92 @@ import torch.nn.functional as F
 def _safe_vector_norm(x, dim, eps=1e-12):
     """Stable vector norm with finite gradient at zero."""
     return torch.sqrt((x ** 2).sum(dim=dim) + eps)
+
+
+def _resolve_dense_sample_weights(sample_weights, ref_tensor):
+    """Resolve optional dense sample weights to a [B, D, H, W] tensor."""
+    if sample_weights is None:
+        return torch.ones_like(ref_tensor)
+    if sample_weights.ndim == 5:
+        effective_mask = sample_weights.squeeze(1)
+    elif sample_weights.ndim == 4:
+        effective_mask = sample_weights
+    else:
+        raise ValueError(
+            "sample_weights must have shape (B, 1, D, H, W) or (B, D, H, W), "
+            f"got {tuple(sample_weights.shape)}"
+        )
+    return effective_mask.to(dtype=ref_tensor.dtype, device=ref_tensor.device)
+
+
+def _dense_displacement_branch_magnitudes(error):
+    """Return per-branch vector magnitudes as [B, num_branches, D, H, W]."""
+    channels = int(error.shape[1])
+    if channels % 3 != 0:
+        return _safe_vector_norm(error, dim=1).unsqueeze(1)
+    num_branches = channels // 3
+    branch_error = error.reshape(error.shape[0], num_branches, 3, *error.shape[2:])
+    return _safe_vector_norm(branch_error, dim=2)
+
+
+def _percentile_key(percentile):
+    """Convert percentile number to stable dictionary key (e.g. 95 -> 'p95')."""
+    if not math.isfinite(float(percentile)):
+        raise ValueError(f"percentiles must be finite, got {percentile!r}")
+    p = float(percentile)
+    if p < 0.0 or p > 100.0:
+        raise ValueError(f"percentiles must satisfy 0 <= p <= 100, got {percentile!r}")
+    if abs(p - round(p)) < 1e-9:
+        return f"p{int(round(p))}"
+    return f"p{str(p).replace('.', '_')}"
+
+
+def dense_displacement_error_stats(
+    pred_field,
+    gt_displacement,
+    sample_weights=None,
+    percentiles=(50, 75, 90, 95, 99),
+):
+    """Compute dense displacement error distribution stats on supervised voxels.
+
+    Error magnitude is computed per displacement branch (dz/dy/dx triplets).
+    For C=3 this is a single branch; for C=6 triplet mode this yields two branch
+    magnitudes per voxel. Voxels with sample weight <= 0 are excluded.
+
+    Returns:
+        dict with keys {'mean', 'count', 'p50', 'p75', ...} for requested
+        percentiles.
+    """
+    if pred_field.shape != gt_displacement.shape:
+        raise ValueError(
+            f"pred_field and gt_displacement must match shape, got "
+            f"{tuple(pred_field.shape)} vs {tuple(gt_displacement.shape)}"
+        )
+
+    error = pred_field - gt_displacement
+    branch_mags = _dense_displacement_branch_magnitudes(error)  # [B, K, D, H, W]
+    effective_mask = _resolve_dense_sample_weights(sample_weights, branch_mags[:, 0]) > 0
+
+    supervised_branch_mask = effective_mask.unsqueeze(1).expand_as(branch_mags)
+    selected = branch_mags.masked_select(supervised_branch_mask)
+
+    result = {"mean": 0.0, "count": int(selected.numel())}
+    percentile_keys = [_percentile_key(p) for p in percentiles]
+    for key in percentile_keys:
+        result[key] = 0.0
+
+    if selected.numel() == 0:
+        return result
+
+    selected = selected.to(torch.float32)
+    result["mean"] = float(selected.mean().item())
+
+    q = torch.tensor([float(p) / 100.0 for p in percentiles], device=selected.device, dtype=selected.dtype)
+    q_vals = torch.quantile(selected, q)
+    for key, value in zip(percentile_keys, q_vals):
+        result[key] = float(value.item())
+
+    return result
 
 
 def _sample_pred_field(pred_field, extrap_coords):
@@ -148,10 +236,15 @@ def dense_displacement_loss(pred_field, gt_displacement, sample_weights=None,
     """Voxelwise displacement supervision for dense targets.
 
     Args:
-        pred_field: (B, 3, D, H, W) predicted dense displacement field
-        gt_displacement: (B, 3, D, H, W) dense GT displacement vectors
+        pred_field: (B, C, D, H, W) predicted dense displacement field
+        gt_displacement: (B, C, D, H, W) dense GT displacement vectors
         sample_weights: optional (B, 1, D, H, W) or (B, D, H, W) per-voxel weights
-        loss_type: one of {'vector_l2', 'vector_huber', 'component_huber'}
+        loss_type: one of {
+            'vector_l2',
+            'vector_huber',
+            'vector_huber_per_branch',
+            'component_huber',
+        }
         beta: Huber transition point
     """
     if pred_field.shape != gt_displacement.shape:
@@ -167,27 +260,92 @@ def dense_displacement_loss(pred_field, gt_displacement, sample_weights=None,
     elif loss_type == 'vector_huber':
         dist = _safe_vector_norm(error, dim=1)  # [B, D, H, W]
         diff = F.smooth_l1_loss(dist, torch.zeros_like(dist), beta=beta, reduction='none')
+    elif loss_type == 'vector_huber_per_branch':
+        channels = int(error.shape[1])
+        if channels % 3 != 0:
+            raise ValueError(
+                "vector_huber_per_branch requires channel count divisible by 3 "
+                f"(dz/dy/dx groups), got C={channels}"
+            )
+        num_branches = channels // 3
+        branch_error = error.reshape(error.shape[0], num_branches, 3, *error.shape[2:])
+        branch_dist = _safe_vector_norm(branch_error, dim=2)  # [B, num_branches, D, H, W]
+        branch_diff = F.smooth_l1_loss(
+            branch_dist,
+            torch.zeros_like(branch_dist),
+            beta=beta,
+            reduction='none',
+        )
+        diff = branch_diff.mean(dim=1)  # [B, D, H, W]
     elif loss_type == 'component_huber':
         diff = F.smooth_l1_loss(pred_field, gt_displacement, beta=beta, reduction='none').sum(dim=1)
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
-    if sample_weights is None:
-        effective_mask = torch.ones_like(diff)
-    else:
-        if sample_weights.ndim == 5:
-            effective_mask = sample_weights.squeeze(1)
-        elif sample_weights.ndim == 4:
-            effective_mask = sample_weights
-        else:
-            raise ValueError(
-                "sample_weights must have shape (B, 1, D, H, W) or (B, D, H, W), "
-                f"got {tuple(sample_weights.shape)}"
-            )
-        effective_mask = effective_mask.to(dtype=diff.dtype, device=diff.device)
+    effective_mask = _resolve_dense_sample_weights(sample_weights, diff)
 
     masked_diff = diff * effective_mask
     return masked_diff.sum() / effective_mask.sum().clamp(min=1)
+
+
+def triplet_min_displacement_loss(
+    pred_field,
+    cond_mask,
+    min_magnitude=1.0,
+    loss_type='squared_hinge',
+):
+    """Penalize triplet displacement magnitudes below a minimum on conditioning voxels.
+
+    Args:
+        pred_field: (B, 6+, D, H, W) predicted triplet displacement field
+        cond_mask: (B, 1, D, H, W) or (B, D, H, W) conditioning region mask
+        min_magnitude: minimum desired displacement magnitude in voxels
+        loss_type: one of {'squared_hinge', 'linear_hinge'}
+    """
+    if pred_field.ndim != 5:
+        raise ValueError(f"pred_field must have shape (B, C, D, H, W), got {tuple(pred_field.shape)}")
+    if pred_field.shape[1] < 6:
+        raise ValueError(
+            "triplet_min_displacement_loss requires at least 6 channels "
+            f"(back dz/dy/dx + front dz/dy/dx), got {pred_field.shape[1]}"
+        )
+    if cond_mask.ndim == 5:
+        if cond_mask.shape[1] != 1:
+            raise ValueError(
+                "cond_mask with 5 dims must have shape (B, 1, D, H, W), "
+                f"got {tuple(cond_mask.shape)}"
+            )
+        mask = cond_mask.squeeze(1)
+    elif cond_mask.ndim == 4:
+        mask = cond_mask
+    else:
+        raise ValueError(
+            "cond_mask must have shape (B, 1, D, H, W) or (B, D, H, W), "
+            f"got {tuple(cond_mask.shape)}"
+        )
+
+    if min_magnitude < 0:
+        raise ValueError(f"min_magnitude must be >= 0, got {min_magnitude}")
+
+    back_mag = _safe_vector_norm(pred_field[:, 0:3], dim=1)   # [B, D, H, W]
+    front_mag = _safe_vector_norm(pred_field[:, 3:6], dim=1)  # [B, D, H, W]
+
+    back_deficit = F.relu(float(min_magnitude) - back_mag)
+    front_deficit = F.relu(float(min_magnitude) - front_mag)
+
+    if loss_type == 'squared_hinge':
+        back_pen = back_deficit ** 2
+        front_pen = front_deficit ** 2
+    elif loss_type == 'linear_hinge':
+        back_pen = back_deficit
+        front_pen = front_deficit
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}")
+
+    mask = mask.to(dtype=pred_field.dtype, device=pred_field.device)
+    masked_pen = (back_pen + front_pen) * mask
+    denom = (2.0 * mask.sum()).clamp(min=1.0)
+    return masked_pen.sum() / denom
 
 
 def smoothness_loss(pred_field):

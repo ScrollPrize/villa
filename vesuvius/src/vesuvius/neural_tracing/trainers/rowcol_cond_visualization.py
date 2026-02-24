@@ -448,9 +448,10 @@ def _make_dense_triplet_visualization(
     disp_pred,
     dense_gt_displacement,
     dense_loss_weight=None,
+    triplet_channel_order=None,
     save_path=None,
 ):
-    """Triplet-mode dense visualization with explicit cond->front/back panels."""
+    """Triplet-mode dense visualization with swap-aware Channel A/B pairing."""
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
 
@@ -468,13 +469,34 @@ def _make_dense_triplet_visualization(
             f"(got pred={pred_3d.shape[0]}, gt={gt_3d.shape[0]})"
         )
 
-    pred_back_mag_3d = np.linalg.norm(pred_3d[:3], axis=0)
-    pred_front_mag_3d = np.linalg.norm(pred_3d[3:6], axis=0)
-    gt_back_mag_3d = np.linalg.norm(gt_3d[:3], axis=0)
-    gt_front_mag_3d = np.linalg.norm(gt_3d[3:6], axis=0)
+    channel_order = np.array([0, 1], dtype=np.int64)
+    if triplet_channel_order is not None:
+        if isinstance(triplet_channel_order, torch.Tensor):
+            order_arr = triplet_channel_order.detach().cpu().numpy()
+        else:
+            order_arr = np.asarray(triplet_channel_order)
+        if order_arr.ndim == 2:
+            if b < order_arr.shape[0]:
+                order_arr = order_arr[b]
+        if order_arr.ndim == 1 and order_arr.size == 2:
+            candidate = order_arr.astype(np.int64, copy=False)
+            if set(candidate.tolist()) == {0, 1}:
+                channel_order = candidate
+
+    slot_a = int(np.flatnonzero(channel_order == 0)[0])
+    slot_b = int(np.flatnonzero(channel_order == 1)[0])
+
+    def _branch_mag(field_3d, slot_idx):
+        start = int(slot_idx) * 3
+        return np.linalg.norm(field_3d[start:start + 3], axis=0)
+
+    pred_channel_a_mag_3d = _branch_mag(pred_3d, slot_a)
+    pred_channel_b_mag_3d = _branch_mag(pred_3d, slot_b)
+    gt_channel_a_mag_3d = _branch_mag(gt_3d, slot_a)
+    gt_channel_b_mag_3d = _branch_mag(gt_3d, slot_b)
 
     cond_mask_3d = cond_3d > 0.5
-    other_wraps_union_3d = ((gt_back_mag_3d < 0.5) | (gt_front_mag_3d < 0.5))
+    other_wraps_union_3d = ((gt_channel_a_mag_3d < 0.5) | (gt_channel_b_mag_3d < 0.5))
 
     if dense_loss_weight is None:
         weight_3d = np.ones((D, H, W), dtype=np.float32)
@@ -490,13 +512,13 @@ def _make_dense_triplet_visualization(
         val = np.percentile(arr, p)
         return float(val if np.isfinite(val) and val > 1e-8 else fallback)
 
-    front_vmax = max(
-        _safe_percentile(pred_front_mag_3d[cond_supervised], 99, fallback=1.0),
-        _safe_percentile(gt_front_mag_3d[cond_supervised], 99, fallback=1.0),
+    channel_a_vmax = max(
+        _safe_percentile(pred_channel_a_mag_3d[cond_supervised], 99, fallback=1.0),
+        _safe_percentile(gt_channel_a_mag_3d[cond_supervised], 99, fallback=1.0),
     )
-    back_vmax = max(
-        _safe_percentile(pred_back_mag_3d[cond_supervised], 99, fallback=1.0),
-        _safe_percentile(gt_back_mag_3d[cond_supervised], 99, fallback=1.0),
+    channel_b_vmax = max(
+        _safe_percentile(pred_channel_b_mag_3d[cond_supervised], 99, fallback=1.0),
+        _safe_percentile(gt_channel_b_mag_3d[cond_supervised], 99, fallback=1.0),
     )
 
     z0, y0, x0 = D // 2, H // 2, W // 2
@@ -514,10 +536,10 @@ def _make_dense_triplet_visualization(
         return arr[:, :, idx]
 
     # Show only supervised band voxels in displacement panels.
-    gt_front_band = np.where(supervised_mask, gt_front_mag_3d, np.nan)
-    pred_front_band = np.where(supervised_mask, pred_front_mag_3d, np.nan)
-    gt_back_band = np.where(supervised_mask, gt_back_mag_3d, np.nan)
-    pred_back_band = np.where(supervised_mask, pred_back_mag_3d, np.nan)
+    gt_channel_a_band = np.where(supervised_mask, gt_channel_a_mag_3d, np.nan)
+    pred_channel_a_band = np.where(supervised_mask, pred_channel_a_mag_3d, np.nan)
+    gt_channel_b_band = np.where(supervised_mask, gt_channel_b_mag_3d, np.nan)
+    pred_channel_b_band = np.where(supervised_mask, pred_channel_b_mag_3d, np.nan)
 
     disp_cmap = plt.cm.inferno.copy()
     disp_cmap.set_bad(color="black")
@@ -536,10 +558,10 @@ def _make_dense_triplet_visualization(
         vol_slice = _slice(vol_3d, axis, idx)
         cond_slice = _slice(cond_mask_3d, axis, idx)
         other_slice = _slice(other_wraps_union_3d, axis, idx)
-        gt_front_slice = _slice(gt_front_band, axis, idx)
-        pred_front_slice = _slice(pred_front_band, axis, idx)
-        gt_back_slice = _slice(gt_back_band, axis, idx)
-        pred_back_slice = _slice(pred_back_band, axis, idx)
+        gt_channel_a_slice = _slice(gt_channel_a_band, axis, idx)
+        pred_channel_a_slice = _slice(pred_channel_a_band, axis, idx)
+        gt_channel_b_slice = _slice(gt_channel_b_band, axis, idx)
+        pred_channel_b_slice = _slice(pred_channel_b_band, axis, idx)
 
         vol_norm = (vol_slice - vol_slice.min()) / (vol_slice.max() - vol_slice.min() + 1e-8)
         overlay = np.stack([vol_norm, vol_norm, vol_norm], axis=-1)
@@ -553,29 +575,29 @@ def _make_dense_triplet_visualization(
         axes[row, 0].set_title(f"Overlay ({label})")
         axes[row, 0].set_ylabel(ylabel)
 
-        axes[row, 1].imshow(gt_front_slice, cmap=disp_cmap, vmin=0, vmax=front_vmax, extent=extent)
-        axes[row, 1].set_title("GT Cond->Front |disp| (band)")
+        axes[row, 1].imshow(gt_channel_a_slice, cmap=disp_cmap, vmin=0, vmax=channel_a_vmax, extent=extent)
+        axes[row, 1].set_title("GT Channel A |disp| (band)")
         axes[row, 1].set_yticks([])
 
-        axes[row, 2].imshow(pred_front_slice, cmap=disp_cmap, vmin=0, vmax=front_vmax, extent=extent)
-        axes[row, 2].set_title("Pred Cond->Front |disp| (band)")
+        axes[row, 2].imshow(pred_channel_a_slice, cmap=disp_cmap, vmin=0, vmax=channel_a_vmax, extent=extent)
+        axes[row, 2].set_title("Pred Channel A |disp| (band)")
         axes[row, 2].set_yticks([])
 
-        axes[row, 3].imshow(gt_back_slice, cmap=disp_cmap, vmin=0, vmax=back_vmax, extent=extent)
-        axes[row, 3].set_title("GT Cond->Back |disp| (band)")
+        axes[row, 3].imshow(gt_channel_b_slice, cmap=disp_cmap, vmin=0, vmax=channel_b_vmax, extent=extent)
+        axes[row, 3].set_title("GT Channel B |disp| (band)")
         axes[row, 3].set_yticks([])
 
-        axes[row, 4].imshow(pred_back_slice, cmap=disp_cmap, vmin=0, vmax=back_vmax, extent=extent)
-        axes[row, 4].set_title("Pred Cond->Back |disp| (band)")
+        axes[row, 4].imshow(pred_channel_b_slice, cmap=disp_cmap, vmin=0, vmax=channel_b_vmax, extent=extent)
+        axes[row, 4].set_title("Pred Channel B |disp| (band)")
         axes[row, 4].set_yticks([])
 
         for c in range(n_cols):
             axes[row, c].set_xlabel(xlabel)
 
-    band_front_gt_vals = gt_front_mag_3d[supervised_mask]
-    band_front_pred_vals = pred_front_mag_3d[supervised_mask]
-    band_back_gt_vals = gt_back_mag_3d[supervised_mask]
-    band_back_pred_vals = pred_back_mag_3d[supervised_mask]
+    band_channel_a_gt_vals = gt_channel_a_mag_3d[supervised_mask]
+    band_channel_a_pred_vals = pred_channel_a_mag_3d[supervised_mask]
+    band_channel_b_gt_vals = gt_channel_b_mag_3d[supervised_mask]
+    band_channel_b_pred_vals = pred_channel_b_mag_3d[supervised_mask]
 
     stats_lines = [
         "=" * 42,
@@ -584,17 +606,19 @@ def _make_dense_triplet_visualization(
         f"Supervised voxels: {int(supervised_mask.sum())}",
         f"Conditioning voxels: {int(cond_mask_3d.sum())}",
         f"Cond&supervised voxels: {int(cond_supervised.sum())}",
+        f"Slot mapping: slot0->Channel {'A' if int(channel_order[0]) == 0 else 'B'}, "
+        f"slot1->Channel {'A' if int(channel_order[1]) == 0 else 'B'}",
         "",
-        "--- Band (supervised) -> Front ---",
-        f"GT   mean |disp|: {float(band_front_gt_vals.mean()) if band_front_gt_vals.size > 0 else 0.0:.4f}",
-        f"Pred mean |disp|: {float(band_front_pred_vals.mean()) if band_front_pred_vals.size > 0 else 0.0:.4f}",
+        "--- Band (supervised) -> Channel A ---",
+        f"GT   mean |disp|: {float(band_channel_a_gt_vals.mean()) if band_channel_a_gt_vals.size > 0 else 0.0:.4f}",
+        f"Pred mean |disp|: {float(band_channel_a_pred_vals.mean()) if band_channel_a_pred_vals.size > 0 else 0.0:.4f}",
         "",
-        "--- Band (supervised) -> Back ---",
-        f"GT   mean |disp|: {float(band_back_gt_vals.mean()) if band_back_gt_vals.size > 0 else 0.0:.4f}",
-        f"Pred mean |disp|: {float(band_back_pred_vals.mean()) if band_back_pred_vals.size > 0 else 0.0:.4f}",
+        "--- Band (supervised) -> Channel B ---",
+        f"GT   mean |disp|: {float(band_channel_b_gt_vals.mean()) if band_channel_b_gt_vals.size > 0 else 0.0:.4f}",
+        f"Pred mean |disp|: {float(band_channel_b_pred_vals.mean()) if band_channel_b_pred_vals.size > 0 else 0.0:.4f}",
         "",
         "Overlay colors:",
-        "  Front/Back wraps = light green",
+        "  Neighbor wraps (A/B) = light green",
         "  Conditioning = magenta",
         "=" * 42,
     ]
@@ -618,6 +642,7 @@ def make_dense_visualization(
     disp_pred,
     dense_gt_displacement,
     dense_loss_weight=None,
+    triplet_channel_order=None,
     sdt_pred=None,
     sdt_target=None,
     heatmap_pred=None,
@@ -646,6 +671,7 @@ def make_dense_visualization(
             disp_pred=disp_pred,
             dense_gt_displacement=dense_gt_displacement,
             dense_loss_weight=dense_loss_weight,
+            triplet_channel_order=triplet_channel_order,
             save_path=save_path,
         )
         return
