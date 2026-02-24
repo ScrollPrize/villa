@@ -20,6 +20,7 @@ from vesuvius.neural_tracing.datasets.conditioning import (
     create_centered_conditioning,
     create_split_conditioning,
 )
+from vesuvius.neural_tracing.datasets.perturbation import maybe_perturb_conditioning_surface
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import random
@@ -171,6 +172,8 @@ class EdtSegDataset(Dataset):
             )
         else:
             self._augmentations = None
+        self._cond_local_perturb_active = self._should_attempt_cond_local_perturb()
+        self._assert_augmentation_supports_cond_surface_keypoints()
 
         self.sample_mode = str(config.get('sample_mode', 'wrap')).lower()
         self._triplet_neighbor_lookup = {}
@@ -705,6 +708,82 @@ class EdtSegDataset(Dataset):
                 return False
         return True
 
+    def _should_attempt_cond_local_perturb(self) -> bool:
+        cfg = dict(self.config.get("cond_local_perturb", {}) or {})
+        if not bool(cfg.get("enabled", True)):
+            return False
+        if float(cfg.get("probability", 0.35)) <= 0.0:
+            return False
+        apply_without_aug = bool(cfg.get("apply_without_augmentation", False))
+        if (not bool(getattr(self, "apply_augmentation", True))) and (not apply_without_aug):
+            return False
+        return True
+
+    @staticmethod
+    def _iter_augmentation_leaf_transforms(transform):
+        if transform is None:
+            return
+        if hasattr(transform, "transforms"):
+            for child in transform.transforms:
+                yield from EdtSegDataset._iter_augmentation_leaf_transforms(child)
+            return
+        if hasattr(transform, "transform"):
+            yield from EdtSegDataset._iter_augmentation_leaf_transforms(transform.transform)
+            return
+        if hasattr(transform, "list_of_transforms"):
+            for child in transform.list_of_transforms:
+                yield from EdtSegDataset._iter_augmentation_leaf_transforms(child)
+            return
+        yield transform
+
+    def _assert_augmentation_supports_cond_surface_keypoints(self) -> None:
+        if self._augmentations is None or not self._cond_local_perturb_active:
+            return
+        allowed_spatial = {"Rot90Transform", "MirrorTransform", "TransposeAxesTransform"}
+        unsupported = []
+        for leaf in self._iter_augmentation_leaf_transforms(self._augmentations):
+            if not getattr(leaf, "_is_spatial", False):
+                continue
+            leaf_name = type(leaf).__name__
+            if leaf_name not in allowed_spatial:
+                unsupported.append(leaf_name)
+        if unsupported:
+            names = ", ".join(sorted(set(unsupported)))
+            raise RuntimeError(
+                "cond_local_perturb post-augmentation requires spatial transforms with explicit "
+                f"keypoint support. Unsupported spatial transforms in pipeline: {names}."
+            )
+
+    def _conditioning_from_surface(
+        self,
+        *,
+        cond_surface_local,
+        cond_seg_gt: torch.Tensor,
+    ):
+        if cond_surface_local is None:
+            return cond_seg_gt.clone()
+
+        surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float64, copy=False)
+        perturbed_surface = maybe_perturb_conditioning_surface(
+            surface_np,
+            config=self.config,
+            apply_augmentation=bool(getattr(self, "apply_augmentation", True)),
+        )
+        if perturbed_surface is surface_np:
+            return cond_seg_gt.clone()
+
+        cond_np = voxelize_surface_grid(
+            np.asarray(perturbed_surface, dtype=np.float64),
+            self.crop_size,
+        ).astype(np.float32, copy=False)
+        if not bool(cond_np.any()):
+            return None
+
+        cond_seg = torch.from_numpy(cond_np).to(torch.float32)
+        if not bool(torch.isfinite(cond_seg).all()):
+            return None
+        return cond_seg
+
     @staticmethod
     def _fraction_within_distance(dist_map: np.ndarray, source_mask: np.ndarray, max_distance_voxels: float) -> float:
         dist = np.asarray(dist_map, dtype=np.float32)
@@ -852,7 +931,6 @@ class EdtSegDataset(Dataset):
         if conditioning is None:
             return None
         center_zyxs_unperturbed = conditioning["center_zyxs_unperturbed"]
-        center_zyxs_perturbed = conditioning["center_zyxs_perturbed"]
         behind_zyxs = conditioning["behind_zyxs"]
         front_zyxs = conditioning["front_zyxs"]
         min_corner = conditioning["min_corner"]
@@ -873,24 +951,18 @@ class EdtSegDataset(Dataset):
         front_local = (front_zyxs - min_corner).astype(np.float64)
 
         center_seg_gt = voxelize_surface_grid(center_local_gt, crop_size).astype(np.float32)
-        if center_zyxs_perturbed is center_zyxs_unperturbed:
-            # Common path: perturbation skipped, so cond and GT segmentations are identical.
-            center_seg = center_seg_gt.copy()
-        else:
-            center_local = (center_zyxs_perturbed - min_corner).astype(np.float64)
-            center_seg = voxelize_surface_grid(center_local, crop_size).astype(np.float32)
         behind_seg = voxelize_surface_grid(behind_local, crop_size).astype(np.float32)
         front_seg = voxelize_surface_grid(front_local, crop_size).astype(np.float32)
 
-        if not center_seg.any() or not center_seg_gt.any() or not behind_seg.any() or not front_seg.any():
+        if not center_seg_gt.any() or not behind_seg.any() or not front_seg.any():
             return None
 
         return {
             "vol": torch.from_numpy(vol_crop).to(torch.float32),
-            "cond": torch.from_numpy(center_seg).to(torch.float32),
             "cond_gt": torch.from_numpy(center_seg_gt).to(torch.float32),
             "behind_seg": torch.from_numpy(behind_seg).to(torch.float32),
             "front_seg": torch.from_numpy(front_seg).to(torch.float32),
+            "center_surface_local": torch.from_numpy(center_local_gt.astype(np.float32, copy=False)).to(torch.float32),
         }
 
     def create_neighbor_targets(
@@ -1310,7 +1382,6 @@ class EdtSegDataset(Dataset):
         c_max = conditioning["c_max"]
         conditioning_percent = conditioning["conditioning_percent"]
         cond_direction = conditioning["cond_direction"]
-        cond_zyxs = conditioning["cond_zyxs"]
         cond_zyxs_unperturbed = conditioning["cond_zyxs_unperturbed"]
         masked_zyxs = conditioning["masked_zyxs"]
         min_corner = conditioning["min_corner"]
@@ -1326,32 +1397,30 @@ class EdtSegDataset(Dataset):
         )
 
         # convert cond and masked coords to crop-local coords (float for line interpolation)
-        cond_zyxs_local_float = (cond_zyxs - min_corner).astype(np.float64)
         cond_zyxs_unperturbed_local_float = (cond_zyxs_unperturbed - min_corner).astype(np.float64)
         masked_zyxs_local_float = (masked_zyxs - min_corner).astype(np.float64)
 
         crop_shape = target_shape
 
         # voxelize with line interpolation between adjacent grid points
-        cond_segmentation = voxelize_surface_grid(cond_zyxs_local_float, crop_shape)
         cond_segmentation_gt = voxelize_surface_grid(cond_zyxs_unperturbed_local_float, crop_shape)
         masked_segmentation = voxelize_surface_grid(masked_zyxs_local_float, crop_shape)
 
         # make sure we actually have some conditioning
-        if not cond_segmentation.any():
-            return None
         if not cond_segmentation_gt.any():
             return None
 
-        cond_segmentation_raw = cond_segmentation.copy()
+        cond_segmentation_raw = cond_segmentation_gt.copy()
         cond_segmentation_gt_raw = cond_segmentation_gt.copy()
 
         # add thickness to conditioning segmentation via dilation
         use_dilation = self.config.get('use_dilation', False)
         if use_dilation:
             dilation_radius = self.config.get('dilation_radius', 1.0)
-            dist_from_cond = ndimage.distance_transform_edt(cond_segmentation <= 0.5)
+            dist_from_cond = ndimage.distance_transform_edt(cond_segmentation_gt <= 0.5)
             cond_segmentation = (dist_from_cond <= dilation_radius).astype(np.float32)
+        else:
+            cond_segmentation = cond_segmentation_gt
 
         use_segmentation = self.config.get('use_segmentation', False)
         use_sdt = self.config['use_sdt']
@@ -1459,9 +1528,9 @@ class EdtSegDataset(Dataset):
         result = {
             "vol": torch.from_numpy(vol_crop).to(torch.float32),
             "masked_seg": torch.from_numpy(masked_segmentation).to(torch.float32),
-            "cond": torch.from_numpy(cond_segmentation).to(torch.float32),
             "cond_gt": torch.from_numpy(cond_segmentation_gt_raw).to(torch.float32),
             "other_wraps": torch.from_numpy(other_wraps_vox).to(torch.float32),
+            "cond_surface_local": torch.from_numpy(cond_zyxs_unperturbed_local_float.astype(np.float32, copy=False)).to(torch.float32),
         }
         if use_segmentation:
             result["segmentation"] = torch.from_numpy(seg_dilated).to(torch.float32)
@@ -1493,29 +1562,57 @@ class EdtSegDataset(Dataset):
 
     def __getitem__(self, idx):
         patch_idx, wrap_idx = self.sample_index[idx]
+        cond_local_perturb_active = bool(
+            getattr(self, "_cond_local_perturb_active", self._should_attempt_cond_local_perturb())
+        )
         if self.use_triplet_wrap_displacement:
             mask_bundle = self.create_neighbor_masks(idx, patch_idx, wrap_idx)
             if mask_bundle is None:
                 return self[np.random.randint(len(self))]
 
             vol_crop = mask_bundle["vol"]
-            cond_seg = mask_bundle["cond"]
             cond_seg_gt = mask_bundle["cond_gt"]
             behind_seg = mask_bundle["behind_seg"]
             front_seg = mask_bundle["front_seg"]
+            cond_surface_local = mask_bundle.get("center_surface_local")
+            cond_surface_shape = None
+            cond_surface_keypoints = None
+            if cond_surface_local is not None:
+                if cond_surface_local.ndim != 3 or int(cond_surface_local.shape[-1]) != 3:
+                    return self[np.random.randint(len(self))]
+                cond_surface_shape = tuple(int(s) for s in cond_surface_local.shape[:2])
+                cond_surface_keypoints = cond_surface_local.reshape(-1, 3).contiguous()
 
             if self._augmentations is not None:
-                seg_list = torch.stack([cond_seg, cond_seg_gt, behind_seg, front_seg], dim=0)
-                augmented = self._augmentations(
-                    image=vol_crop[None],
-                    segmentation=seg_list,
-                    crop_shape=self.crop_size,
-                )
+                aug_kwargs = {
+                    "image": vol_crop[None],
+                    "segmentation": torch.stack([cond_seg_gt, behind_seg, front_seg], dim=0),
+                    "crop_shape": self.crop_size,
+                }
+                if cond_surface_keypoints is not None:
+                    aug_kwargs["keypoints"] = cond_surface_keypoints
+                augmented = self._augmentations(**aug_kwargs)
                 vol_crop = augmented["image"].squeeze(0)
-                cond_seg = augmented["segmentation"][0]
-                cond_seg_gt = augmented["segmentation"][1]
-                behind_seg = augmented["segmentation"][2]
-                front_seg = augmented["segmentation"][3]
+                cond_seg_gt = augmented["segmentation"][0]
+                behind_seg = augmented["segmentation"][1]
+                front_seg = augmented["segmentation"][2]
+                if cond_surface_keypoints is not None:
+                    augmented_keypoints = augmented.get("keypoints")
+                    if augmented_keypoints is None or augmented_keypoints.shape != cond_surface_keypoints.shape:
+                        return self[np.random.randint(len(self))]
+                    cond_surface_local = augmented_keypoints.reshape(*cond_surface_shape, 3).contiguous()
+
+            if cond_local_perturb_active and cond_surface_local is not None:
+                cond_seg = self._conditioning_from_surface(
+                    cond_surface_local=cond_surface_local,
+                    cond_seg_gt=cond_seg_gt,
+                )
+                if cond_seg is None:
+                    return self[np.random.randint(len(self))]
+            else:
+                cond_seg = mask_bundle.get("cond")
+                if cond_seg is None:
+                    cond_seg = cond_seg_gt.clone()
 
             target_payload = self.create_neighbor_targets(
                 cond_seg_gt=cond_seg_gt,
@@ -1545,9 +1642,16 @@ class EdtSegDataset(Dataset):
 
             vol_crop = mask_bundle["vol"]
             masked_seg = mask_bundle["masked_seg"]
-            cond_seg = mask_bundle["cond"]
             cond_seg_gt = mask_bundle["cond_gt"]
             other_wraps_tensor = mask_bundle["other_wraps"]
+            cond_surface_local = mask_bundle.get("cond_surface_local")
+            cond_surface_shape = None
+            cond_surface_keypoints = None
+            if cond_surface_local is not None:
+                if cond_surface_local.ndim != 3 or int(cond_surface_local.shape[-1]) != 3:
+                    return self[np.random.randint(len(self))]
+                cond_surface_shape = tuple(int(s) for s in cond_surface_local.shape[:2])
+                cond_surface_keypoints = cond_surface_local.reshape(-1, 3).contiguous()
             if use_segmentation:
                 full_seg = mask_bundle["segmentation"]
                 seg_skel = mask_bundle["segmentation_skel"]
@@ -1557,8 +1661,8 @@ class EdtSegDataset(Dataset):
                 heatmap_tensor = mask_bundle["heatmap_target"]
 
             if self._augmentations is not None:
-                seg_list = [masked_seg, cond_seg, other_wraps_tensor]
-                seg_keys = ['masked_seg', 'cond_seg', 'other_wraps']
+                seg_list = [masked_seg, other_wraps_tensor]
+                seg_keys = ['masked_seg', 'other_wraps']
                 seg_list.append(cond_seg_gt)
                 seg_keys.append('cond_seg_gt')
                 if use_segmentation:
@@ -1578,6 +1682,8 @@ class EdtSegDataset(Dataset):
                     'segmentation': torch.stack(seg_list, dim=0),
                     'crop_shape': self.crop_size,
                 }
+                if cond_surface_keypoints is not None:
+                    aug_kwargs['keypoints'] = cond_surface_keypoints
                 if dist_list:
                     aug_kwargs['dist_map'] = torch.stack(dist_list, dim=0)
                 if use_heatmap:
@@ -1590,8 +1696,6 @@ class EdtSegDataset(Dataset):
                 for i, key in enumerate(seg_keys):
                     if key == 'masked_seg':
                         masked_seg = augmented['segmentation'][i]
-                    elif key == 'cond_seg':
-                        cond_seg = augmented['segmentation'][i]
                     elif key == 'other_wraps':
                         other_wraps_tensor = augmented['segmentation'][i]
                     elif key == 'cond_seg_gt':
@@ -1608,6 +1712,23 @@ class EdtSegDataset(Dataset):
 
                 if use_heatmap:
                     heatmap_tensor = augmented['heatmap_target'].squeeze(0)
+                if cond_surface_keypoints is not None:
+                    augmented_keypoints = augmented.get("keypoints")
+                    if augmented_keypoints is None or augmented_keypoints.shape != cond_surface_keypoints.shape:
+                        return self[np.random.randint(len(self))]
+                    cond_surface_local = augmented_keypoints.reshape(*cond_surface_shape, 3).contiguous()
+
+            if cond_local_perturb_active and cond_surface_local is not None:
+                cond_seg = self._conditioning_from_surface(
+                    cond_surface_local=cond_surface_local,
+                    cond_seg_gt=cond_seg_gt,
+                )
+                if cond_seg is None:
+                    return self[np.random.randint(len(self))]
+            else:
+                cond_seg = mask_bundle.get("cond")
+                if cond_seg is None:
+                    cond_seg = cond_seg_gt.clone()
 
             target_payload = self.create_split_targets(
                 cond_seg_gt=cond_seg_gt,

@@ -2,10 +2,6 @@ import random
 
 import numpy as np
 
-from vesuvius.neural_tracing.datasets.perturbation import (
-    maybe_perturb_conditioning_surface,
-)
-
 
 def create_centered_conditioning(dataset, idx: int, patch_idx: int, wrap_idx: int, patch):
     _ = idx
@@ -24,11 +20,6 @@ def create_centered_conditioning(dataset, idx: int, patch_idx: int, wrap_idx: in
         return None
 
     center_zyxs_unperturbed = center_zyxs
-    center_zyxs_perturbed = maybe_perturb_conditioning_surface(
-        center_zyxs_unperturbed,
-        config=dataset.config,
-        apply_augmentation=dataset.apply_augmentation,
-    )
 
     crop_size = dataset.crop_size
     z_min, _, y_min, _, x_min, _ = patch.world_bbox
@@ -42,7 +33,6 @@ def create_centered_conditioning(dataset, idx: int, patch_idx: int, wrap_idx: in
 
     return {
         "center_zyxs_unperturbed": center_zyxs_unperturbed,
-        "center_zyxs_perturbed": center_zyxs_perturbed,
         "behind_zyxs": behind_zyxs,
         "front_zyxs": front_zyxs,
         "min_corner": min_corner,
@@ -160,11 +150,6 @@ def create_split_conditioning(dataset, idx: int, patch_idx: int, wrap_idx: int, 
     cond_zyxs = np.stack([z_cond, y_cond, x_cond], axis=-1)
     masked_zyxs = np.stack([z_mask, y_mask, x_mask], axis=-1)
     cond_zyxs_unperturbed = cond_zyxs.copy()
-    cond_zyxs = maybe_perturb_conditioning_surface(
-        cond_zyxs,
-        config=dataset.config,
-        apply_augmentation=dataset.apply_augmentation,
-    )
 
     # use world_bbox directly as crop position, this is the crop returned by find_patches
     z_min, _, y_min, _, x_min, _ = patch.world_bbox
@@ -187,7 +172,6 @@ def create_split_conditioning(dataset, idx: int, patch_idx: int, wrap_idx: int, 
         "cond_direction": cond_direction,
         "uv_cond": uv_cond,
         "uv_mask": uv_mask,
-        "cond_zyxs": cond_zyxs,
         "cond_zyxs_unperturbed": cond_zyxs_unperturbed,
         "masked_zyxs": masked_zyxs,
         "min_corner": min_corner,
