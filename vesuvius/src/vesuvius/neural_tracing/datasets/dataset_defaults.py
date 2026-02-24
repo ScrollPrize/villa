@@ -1,5 +1,7 @@
 from typing import Any, MutableMapping
 
+import numpy as np
+
 
 def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> None:
     """Populate default config values for the row/col conditioning dataset."""
@@ -80,3 +82,84 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("debug_extrapolation_oob", False)
     config.setdefault("debug_extrapolation_oob_every", 100)
     config.setdefault("displacement_supervision", "vector")
+
+
+def _require_choice(name: str, value: str, allowed: set[str]) -> None:
+    if value not in allowed:
+        options = "', '".join(sorted(allowed))
+        raise ValueError(f"{name} must be '{options}', got {value!r}")
+
+
+def _require_finite(name: str, value: float) -> None:
+    if not np.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+
+
+def _require_finite_range(
+    name: str,
+    value: float,
+    *,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> None:
+    _require_finite(name, value)
+    if min_value is not None and value < min_value:
+        raise ValueError(f"{name} must satisfy {min_value} <= value, got {value!r}")
+    if max_value is not None and value > max_value:
+        raise ValueError(f"{name} must satisfy value <= {max_value}, got {value!r}")
+
+
+def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> None:
+    """Validate row/col conditioning dataset config invariants."""
+    displacement_supervision = str(config.get("displacement_supervision", "vector")).lower()
+    _require_choice("displacement_supervision", displacement_supervision, {"vector", "normal_scalar"})
+
+    sample_mode = str(config.get("sample_mode", "wrap")).lower()
+    _require_choice("sample_mode", sample_mode, {"wrap", "chunk"})
+
+    triplet_direction_prior_mask = str(config.get("triplet_direction_prior_mask", "cond")).lower()
+    _require_choice("triplet_direction_prior_mask", triplet_direction_prior_mask, {"cond", "full"})
+
+    triplet_random_channel_swap_prob = float(config.get("triplet_random_channel_swap_prob", 0.5))
+    _require_finite_range(
+        "triplet_random_channel_swap_prob",
+        triplet_random_channel_swap_prob,
+        min_value=0.0,
+        max_value=1.0,
+    )
+
+    triplet_close_distance_voxels = float(config.get("triplet_close_distance_voxels", 1.0))
+    _require_finite_range("triplet_close_distance_voxels", triplet_close_distance_voxels, min_value=0.0)
+
+    triplet_close_fraction_threshold = float(config.get("triplet_close_fraction_threshold", 0.05))
+    _require_finite_range(
+        "triplet_close_fraction_threshold",
+        triplet_close_fraction_threshold,
+        min_value=0.0,
+        max_value=1.0,
+    )
+
+    triplet_edt_bbox_padding_voxels = float(config.get("triplet_edt_bbox_padding_voxels", 4.0))
+    _require_finite_range("triplet_edt_bbox_padding_voxels", triplet_edt_bbox_padding_voxels, min_value=0.0)
+
+    use_dense_displacement = bool(config.get("use_dense_displacement", False))
+    use_triplet_wrap_displacement = bool(config.get("use_triplet_wrap_displacement", False))
+
+    if displacement_supervision == "normal_scalar" and use_dense_displacement:
+        raise ValueError("displacement_supervision='normal_scalar' is not supported with use_dense_displacement=True")
+
+    if use_triplet_wrap_displacement:
+        if not use_dense_displacement:
+            raise ValueError("use_triplet_wrap_displacement=True requires use_dense_displacement=True")
+        if config.get("use_extrapolation", True):
+            raise ValueError("use_triplet_wrap_displacement=True requires use_extrapolation=False")
+        if config.get("use_other_wrap_cond", False):
+            raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_other_wrap_cond")
+        if config.get("use_sdt", False):
+            raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_sdt")
+        if config.get("use_heatmap_targets", False):
+            raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_heatmap_targets")
+        if config.get("use_segmentation", False):
+            raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_segmentation")
+        if sample_mode != "wrap":
+            raise ValueError("use_triplet_wrap_displacement=True requires sample_mode='wrap'")

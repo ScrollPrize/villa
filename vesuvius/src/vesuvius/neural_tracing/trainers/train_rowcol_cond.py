@@ -18,6 +18,10 @@ from tqdm import tqdm
 import time
 
 from vesuvius.neural_tracing.datasets.dataset_rowcol_cond import EdtSegDataset
+from vesuvius.neural_tracing.datasets.dataset_defaults import (
+    setdefault_rowcol_cond_dataset_config,
+    validate_rowcol_cond_dataset_config,
+)
 from vesuvius.neural_tracing.loss.displacement_losses import (
     dense_displacement_error_stats,
     dense_displacement_loss,
@@ -203,16 +207,15 @@ def train(config_path):
     with open(config_path, 'r') as f:
         config = json.load(f)
 
+    user_set_triplet_direction_priors = 'use_triplet_direction_priors' in config
+    setdefault_rowcol_cond_dataset_config(config)
+
     # Defaults
-    config.setdefault('use_extrapolation', True)
-    config.setdefault('use_other_wrap_cond', False)
-    config.setdefault('use_dense_displacement', False)
-    config.setdefault('use_triplet_wrap_displacement', False)
     triplet_mode = bool(config.get('use_triplet_wrap_displacement', False))
-    config.setdefault('use_triplet_direction_priors', triplet_mode)
-    config.setdefault('triplet_direction_prior_mask', 'cond')
-    config.setdefault('triplet_random_channel_swap_prob', 0.5)
-    config.setdefault('triplet_dense_weight_mode', 'band')
+    if not user_set_triplet_direction_priors:
+        config['use_triplet_direction_priors'] = triplet_mode
+    validate_rowcol_cond_dataset_config(config)
+
     use_triplet_direction_priors = bool(config.get('use_triplet_direction_priors', False))
     if triplet_mode and use_triplet_direction_priors:
         default_in_channels = 8
@@ -382,48 +385,15 @@ def train(config_path):
     use_dense_displacement = bool(config.get('use_dense_displacement', False))
     triplet_direction_prior_mask = str(config.get('triplet_direction_prior_mask', 'cond')).lower()
     triplet_random_channel_swap_prob = float(config.get('triplet_random_channel_swap_prob', 0.5))
-    if triplet_mode and not use_dense_displacement:
-        raise ValueError("use_triplet_wrap_displacement=True requires use_dense_displacement=True")
-    if triplet_mode and config.get('use_extrapolation', True):
-        raise ValueError("use_triplet_wrap_displacement=True requires use_extrapolation=False")
-    if triplet_mode and config.get('use_sdt', False):
-        raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_sdt")
-    if triplet_mode and config.get('use_heatmap_targets', False):
-        raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_heatmap_targets")
-    if triplet_mode and config.get('use_segmentation', False):
-        raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_segmentation")
-    if triplet_mode and use_triplet_direction_priors:
-        if triplet_direction_prior_mask not in {'cond', 'full'}:
-            raise ValueError(
-                "triplet_direction_prior_mask must be 'cond' or 'full', "
-                f"got {triplet_direction_prior_mask!r}"
-            )
-        if not np.isfinite(triplet_random_channel_swap_prob):
-            raise ValueError(
-                "triplet_random_channel_swap_prob must be finite, "
-                f"got {triplet_random_channel_swap_prob!r}"
-            )
-        if triplet_random_channel_swap_prob < 0.0 or triplet_random_channel_swap_prob > 1.0:
-            raise ValueError(
-                "triplet_random_channel_swap_prob must satisfy 0 <= p <= 1, "
-                f"got {triplet_random_channel_swap_prob}"
-            )
     if triplet_min_disp_vox < 0:
         raise ValueError(f"triplet_min_disp_vox must be >= 0, got {triplet_min_disp_vox}")
     if lambda_triplet_min_disp > 0.0 and not triplet_mode:
         raise ValueError("lambda_triplet_min_disp > 0 requires use_triplet_wrap_displacement=True")
     disp_supervision = str(config.get('displacement_supervision', 'vector')).lower()
-    if disp_supervision not in {'vector', 'normal_scalar'}:
-        raise ValueError(
-            "displacement_supervision must be 'vector' or 'normal_scalar', "
-            f"got {disp_supervision!r}"
-        )
     if not config.get('use_extrapolation', True) and not use_dense_displacement:
         raise ValueError("Need at least one displacement supervision path: use_extrapolation or use_dense_displacement")
     if disp_supervision == 'normal_scalar' and not config.get('use_extrapolation', True):
         raise ValueError("displacement_supervision='normal_scalar' requires use_extrapolation=True")
-    if disp_supervision == 'normal_scalar' and use_dense_displacement:
-        raise ValueError("displacement_supervision='normal_scalar' is not supported with use_dense_displacement=True")
     disp_loss_type = config.get('displacement_loss_type', 'vector_l2')
     disp_huber_beta = config.get('displacement_huber_beta', 5.0)
     normal_loss_type = str(config.get('normal_loss_type', 'normal_huber')).lower()

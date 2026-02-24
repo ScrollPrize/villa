@@ -12,7 +12,10 @@ from vesuvius.neural_tracing.datasets.direction_helpers import (
     build_triplet_direction_priors_from_displacements,
     maybe_swap_triplet_branch_channels,
 )
-from vesuvius.neural_tracing.datasets.dataset_defaults import setdefault_rowcol_cond_dataset_config
+from vesuvius.neural_tracing.datasets.dataset_defaults import (
+    setdefault_rowcol_cond_dataset_config,
+    validate_rowcol_cond_dataset_config,
+)
 from vesuvius.neural_tracing.datasets.perturbation import (
     compute_surface_normals,
 )
@@ -137,73 +140,19 @@ class EdtSegDataset(Dataset):
         self._heatmap_axes = [torch.arange(s, dtype=torch.float32) for s in self.crop_size]
 
         setdefault_rowcol_cond_dataset_config(config)
+        validate_rowcol_cond_dataset_config(config)
         self.displacement_supervision = str(config.get('displacement_supervision', 'vector')).lower()
-        if self.displacement_supervision not in {'vector', 'normal_scalar'}:
-            raise ValueError(
-                "displacement_supervision must be 'vector' or 'normal_scalar', "
-                f"got {self.displacement_supervision!r}"
-            )
         self.use_dense_displacement = bool(config.get('use_dense_displacement', False))
         self.use_triplet_wrap_displacement = bool(config.get('use_triplet_wrap_displacement', False))
         self.use_triplet_direction_priors = bool(config.get('use_triplet_direction_priors', True))
         self.triplet_direction_prior_mask = str(config.get('triplet_direction_prior_mask', 'cond')).lower()
-        if self.triplet_direction_prior_mask not in {'cond', 'full'}:
-            raise ValueError(
-                "triplet_direction_prior_mask must be 'cond' or 'full', "
-                f"got {self.triplet_direction_prior_mask!r}"
-            )
         self.triplet_random_channel_swap_prob = float(config.get('triplet_random_channel_swap_prob', 0.5))
-        if not np.isfinite(self.triplet_random_channel_swap_prob):
-            raise ValueError(
-                f"triplet_random_channel_swap_prob must be finite, got {self.triplet_random_channel_swap_prob!r}"
-            )
-        if self.triplet_random_channel_swap_prob < 0.0 or self.triplet_random_channel_swap_prob > 1.0:
-            raise ValueError(
-                "triplet_random_channel_swap_prob must satisfy 0 <= p <= 1, "
-                f"got {self.triplet_random_channel_swap_prob}"
-            )
         self.triplet_close_check_enabled = bool(config.get('triplet_close_check_enabled', True))
         self.triplet_close_distance_voxels = float(config.get('triplet_close_distance_voxels', 1.0))
-        if not np.isfinite(self.triplet_close_distance_voxels) or self.triplet_close_distance_voxels < 0.0:
-            raise ValueError(
-                "triplet_close_distance_voxels must be finite and >= 0, "
-                f"got {self.triplet_close_distance_voxels!r}"
-            )
         self.triplet_close_fraction_threshold = float(config.get('triplet_close_fraction_threshold', 0.05))
-        if (
-            not np.isfinite(self.triplet_close_fraction_threshold) or
-            self.triplet_close_fraction_threshold < 0.0 or
-            self.triplet_close_fraction_threshold > 1.0
-        ):
-            raise ValueError(
-                "triplet_close_fraction_threshold must satisfy 0 <= threshold <= 1, "
-                f"got {self.triplet_close_fraction_threshold!r}"
-            )
         self.triplet_edt_bbox_padding_voxels = float(config.get('triplet_edt_bbox_padding_voxels', 4.0))
-        if (
-            not np.isfinite(self.triplet_edt_bbox_padding_voxels) or
-            self.triplet_edt_bbox_padding_voxels < 0.0
-        ):
-            raise ValueError(
-                "triplet_edt_bbox_padding_voxels must be finite and >= 0, "
-                f"got {self.triplet_edt_bbox_padding_voxels!r}"
-            )
         self.triplet_close_print = bool(config.get('triplet_close_print', True))
-        if self.displacement_supervision == 'normal_scalar' and self.use_dense_displacement:
-            raise ValueError("displacement_supervision='normal_scalar' is not supported with use_dense_displacement=True")
         if self.use_triplet_wrap_displacement:
-            if not self.use_dense_displacement:
-                raise ValueError("use_triplet_wrap_displacement=True requires use_dense_displacement=True")
-            if config.get('use_extrapolation', True):
-                raise ValueError("use_triplet_wrap_displacement=True requires use_extrapolation=False")
-            if config.get('use_other_wrap_cond', False):
-                raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_other_wrap_cond")
-            if config.get('use_sdt', False):
-                raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_sdt")
-            if config.get('use_heatmap_targets', False):
-                raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_heatmap_targets")
-            if config.get('use_segmentation', False):
-                raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_segmentation")
             if not np.isclose(self.triplet_random_channel_swap_prob, 0.5, atol=1e-8):
                 warnings.warn(
                     "Triplet mode treats the two displacement branches as unordered; "
@@ -226,8 +175,6 @@ class EdtSegDataset(Dataset):
             self._augmentations = None
 
         self.sample_mode = str(config.get('sample_mode', 'wrap')).lower()
-        if self.sample_mode not in {'wrap', 'chunk'}:
-            raise ValueError(f"sample_mode must be 'wrap' or 'chunk', got {self.sample_mode!r}")
         self._triplet_neighbor_lookup = {}
         self._triplet_lookup_stats = {}
         self._triplet_overlap_kept_indices = tuple()
@@ -340,8 +287,6 @@ class EdtSegDataset(Dataset):
                     ))
 
             if self.use_triplet_wrap_displacement:
-                if self.sample_mode != 'wrap':
-                    raise ValueError("use_triplet_wrap_displacement=True requires sample_mode='wrap'")
                 patches = self._filter_triplet_overlap_chunks(patches)
 
             self.patches = patches
