@@ -3,9 +3,12 @@ import numpy as np
 from numba import njit
 from dataclasses import dataclass
 from vesuvius.tifxyz import Tifxyz
+from vesuvius.tifxyz.upsampling import interpolate_at_points
 import zarr
 from typing import Any, Dict, List, Tuple
 import re
+from functools import lru_cache
+from scipy import ndimage
 
 
 def _parse_z_range(z_range):
@@ -89,6 +92,99 @@ def _wrap_bbox_has_overlap(mask: np.ndarray, bbox_2d):
     if r1 < r0 or c1 < c0:
         return False
     return bool(np.any(mask_arr[r0:r1 + 1, c0:c1 + 1]))
+
+
+@lru_cache(maxsize=5)
+def _small_spherical_footprint(radius: int):
+    offsets = np.arange(-radius, radius + 1, dtype=np.int32)
+    zz, yy, xx = np.meshgrid(offsets, offsets, offsets, indexing='ij')
+    return (zz * zz + yy * yy + xx * xx) <= (radius * radius)
+
+
+def edt_dilate_binary_mask(mask: np.ndarray, radius_voxels: float) -> np.ndarray:
+    """Dilate binary mask by EDT thresholding; returns a boolean mask."""
+    radius = float(radius_voxels)
+    mask_bool = np.asarray(mask) > 0
+    if radius <= 0.0 or not mask_bool.any():
+        return mask_bool
+    # Exact structuring-element dilation is faster than EDT for common small
+    # integer radii (for example, triplet_gt_vector_dilation_radius=1.0).
+    rounded_radius = int(round(radius))
+    if abs(radius - rounded_radius) <= 1e-6 and rounded_radius <= 4:
+        footprint = _small_spherical_footprint(rounded_radius)
+        return ndimage.binary_dilation(mask_bool, structure=footprint, iterations=1)
+    dist = ndimage.distance_transform_edt(~mask_bool)
+    return dist <= radius
+
+
+def _signed_distance_field(mask: np.ndarray) -> np.ndarray:
+    """Signed distance using the legacy sign convention (positive inside)."""
+    mask_bool = np.asarray(mask) > 0
+    dist_outside = ndimage.distance_transform_edt(~mask_bool)
+    dist_inside = ndimage.distance_transform_edt(mask_bool)
+    return (dist_inside - dist_outside).astype(np.float32, copy=False)
+
+
+def _upsample_world_triplet(x_s, y_s, z_s, scale_y: float, scale_x: float):
+    """Upsample (x, y, z) sampled grids using tifxyz interpolation."""
+    h_s, w_s = x_s.shape
+    h_up = int(round(h_s / scale_y))
+    w_up = int(round(w_s / scale_x))
+    dense_rows = np.linspace(0, h_s - 1, h_up, dtype=np.float32)
+    dense_cols = np.linspace(0, w_s - 1, w_up, dtype=np.float32)
+    query_row, query_col = np.meshgrid(dense_rows, dense_cols, indexing="ij")
+
+    x_src = np.asarray(x_s, dtype=np.float32)
+    y_src = np.asarray(y_s, dtype=np.float32)
+    z_src = np.asarray(z_s, dtype=np.float32)
+    valid_src = np.ones((h_s, w_s), dtype=bool)
+
+    x_up, y_up, z_up, valid = interpolate_at_points(
+        x_src,
+        y_src,
+        z_src,
+        valid_src,
+        query_row,
+        query_col,
+        scale=(1.0, 1.0),
+        method="catmull_rom",
+    )
+
+    if not np.all(valid):
+        invalid_count = int((~valid).sum())
+        raise ValueError(
+            "Invalid points from Catmull-Rom interpolation: "
+            f"{invalid_count}/{valid.size}"
+        )
+
+    return x_up, y_up, z_up
+
+
+def _trim_to_world_bbox(x_full, y_full, z_full, world_bbox):
+    """Keep the minimal row/col slab that intersects the world bbox."""
+    z_min, z_max, y_min, y_max, x_min, x_max = world_bbox
+    in_bounds = (
+        (z_full >= z_min) & (z_full < z_max) &
+        (y_full >= y_min) & (y_full < y_max) &
+        (x_full >= x_min) & (x_full < x_max)
+    )
+    if not in_bounds.any():
+        return None
+
+    valid_rows = np.any(in_bounds, axis=1)
+    valid_cols = np.any(in_bounds, axis=0)
+    row_idx = np.flatnonzero(valid_rows)
+    col_idx = np.flatnonzero(valid_cols)
+    if row_idx.size == 0 or col_idx.size == 0:
+        return None
+
+    r0, r1 = int(row_idx[0]), int(row_idx[-1])
+    c0, c1 = int(col_idx[0]), int(col_idx[-1])
+    return (
+        x_full[r0:r1 + 1, c0:c1 + 1],
+        y_full[r0:r1 + 1, c0:c1 + 1],
+        z_full[r0:r1 + 1, c0:c1 + 1],
+    )
 
 
 @njit

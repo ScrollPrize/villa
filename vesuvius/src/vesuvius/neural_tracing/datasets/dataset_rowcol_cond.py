@@ -11,9 +11,13 @@ from vesuvius.neural_tracing.datasets.common import (
     _extract_wrap_ids,
     _parse_z_range,
     _segment_overlaps_z_range,
+    _signed_distance_field,
+    _trim_to_world_bbox,
     _triplet_wraps_compatible,
+    _upsample_world_triplet,
     _wrap_bbox_has_overlap,
     compute_heatmap_targets,
+    edt_dilate_binary_mask,
     voxelize_surface_grid,
 )
 from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
@@ -33,10 +37,8 @@ from vesuvius.neural_tracing.datasets.perturbation import maybe_perturb_conditio
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import random
-from vesuvius.tifxyz.upsampling import interpolate_at_points
 from scipy import ndimage
 import warnings
-from functools import lru_cache
 
 class EdtSegDataset(Dataset):
     def __init__(
@@ -70,20 +72,12 @@ class EdtSegDataset(Dataset):
             self.use_dense_displacement = True
         self.use_triplet_direction_priors = bool(config['use_triplet_direction_priors'])
         self.triplet_direction_prior_mask = str(config['triplet_direction_prior_mask']).lower()
-        self.triplet_random_channel_swap_prob = float(config['triplet_random_channel_swap_prob'])
+        self.triplet_random_channel_swap_prob = 0.5
         self.triplet_close_check_enabled = bool(config['triplet_close_check_enabled'])
         self.triplet_close_distance_voxels = float(config['triplet_close_distance_voxels'])
         self.triplet_close_fraction_threshold = float(config['triplet_close_fraction_threshold'])
         self.triplet_edt_bbox_padding_voxels = float(config['triplet_edt_bbox_padding_voxels'])
         self.triplet_close_print = bool(config['triplet_close_print'])
-        if self.use_triplet_wrap_displacement:
-            if not np.isclose(self.triplet_random_channel_swap_prob, 0.5, atol=1e-8):
-                warnings.warn(
-                    "Triplet mode treats the two displacement branches as unordered; "
-                    "overriding triplet_random_channel_swap_prob to 0.5.",
-                    RuntimeWarning,
-                )
-                self.triplet_random_channel_swap_prob = 0.5
         self._validate_result_tensors_enabled = bool(config['validate_result_tensors'])
 
         aug_config = config.get('augmentation', {})
@@ -528,8 +522,8 @@ class EdtSegDataset(Dataset):
             if not require_all_valid and not valid_s.any():
                 return None
 
-        x_full, y_full, z_full = self._upsample_world_triplet(x_s, y_s, z_s, scale_y, scale_x)
-        trimmed = self._trim_to_world_bbox(x_full, y_full, z_full, patch.world_bbox)
+        x_full, y_full, z_full = _upsample_world_triplet(x_s, y_s, z_s, scale_y, scale_x)
+        trimmed = _trim_to_world_bbox(x_full, y_full, z_full, patch.world_bbox)
         if trimmed is None:
             return None
         x_full, y_full, z_full = trimmed
@@ -830,11 +824,11 @@ class EdtSegDataset(Dataset):
             float(self.config["triplet_gt_vector_dilation_radius"]),
         )
         if triplet_gt_vector_dilation_radius > 0.0:
-            behind_bin_for_gt = self._edt_dilate_binary_mask(
+            behind_bin_for_gt = edt_dilate_binary_mask(
                 behind_bin_full,
                 triplet_gt_vector_dilation_radius,
             )
-            front_bin_for_gt = self._edt_dilate_binary_mask(
+            front_bin_for_gt = edt_dilate_binary_mask(
                 front_bin_full,
                 triplet_gt_vector_dilation_radius,
             )
@@ -1035,68 +1029,6 @@ class EdtSegDataset(Dataset):
             result["dir_priors"] = torch.from_numpy(dir_priors_np).to(torch.float32)
         return result
 
-    @staticmethod
-    def _upsample_world_triplet(x_s, y_s, z_s, scale_y: float, scale_x: float):
-        """Upsample (x, y, z) sampled grids using tifxyz interpolation."""
-        h_s, w_s = x_s.shape
-        h_up = int(round(h_s / scale_y))
-        w_up = int(round(w_s / scale_x))
-        dense_rows = np.linspace(0, h_s - 1, h_up, dtype=np.float32)
-        dense_cols = np.linspace(0, w_s - 1, w_up, dtype=np.float32)
-        query_row, query_col = np.meshgrid(dense_rows, dense_cols, indexing="ij")
-
-        x_src = np.asarray(x_s, dtype=np.float32)
-        y_src = np.asarray(y_s, dtype=np.float32)
-        z_src = np.asarray(z_s, dtype=np.float32)
-        valid_src = np.ones((h_s, w_s), dtype=bool)
-
-        x_up, y_up, z_up, valid = interpolate_at_points(
-            x_src,
-            y_src,
-            z_src,
-            valid_src,
-            query_row,
-            query_col,
-            scale=(1.0, 1.0),
-            method="catmull_rom",
-        )
-
-        if not np.all(valid):
-            invalid_count = int((~valid).sum())
-            raise ValueError(
-                "Invalid points from Catmull-Rom interpolation: "
-                f"{invalid_count}/{valid.size}"
-            )
-
-        return x_up, y_up, z_up
-
-    @staticmethod
-    def _trim_to_world_bbox(x_full, y_full, z_full, world_bbox):
-        """Keep the minimal row/col slab that intersects the world bbox."""
-        z_min, z_max, y_min, y_max, x_min, x_max = world_bbox
-        in_bounds = (
-            (z_full >= z_min) & (z_full < z_max) &
-            (y_full >= y_min) & (y_full < y_max) &
-            (x_full >= x_min) & (x_full < x_max)
-        )
-        if not in_bounds.any():
-            return None
-
-        valid_rows = np.any(in_bounds, axis=1)
-        valid_cols = np.any(in_bounds, axis=0)
-        row_idx = np.flatnonzero(valid_rows)
-        col_idx = np.flatnonzero(valid_cols)
-        if row_idx.size == 0 or col_idx.size == 0:
-            return None
-
-        r0, r1 = int(row_idx[0]), int(row_idx[-1])
-        c0, c1 = int(col_idx[0]), int(col_idx[-1])
-        return (
-            x_full[r0:r1 + 1, c0:c1 + 1],
-            y_full[r0:r1 + 1, c0:c1 + 1],
-            z_full[r0:r1 + 1, c0:c1 + 1],
-        )
-
     def _get_dense_axis_offsets(self, shape_zyx):
         shape_key = tuple(int(s) for s in shape_zyx)
         axes = self._dense_axis_cache.get(shape_key)
@@ -1206,37 +1138,6 @@ class EdtSegDataset(Dataset):
             return disp, weights, distances
         return disp, weights
 
-    @staticmethod
-    @lru_cache(maxsize=5)
-    def _small_spherical_footprint(radius: int):
-        offsets = np.arange(-radius, radius + 1, dtype=np.int32)
-        zz, yy, xx = np.meshgrid(offsets, offsets, offsets, indexing='ij')
-        return (zz * zz + yy * yy + xx * xx) <= (radius * radius)
-
-    @staticmethod
-    def _edt_dilate_binary_mask(mask: np.ndarray, radius_voxels: float) -> np.ndarray:
-        """Dilate binary mask by EDT thresholding; returns a boolean mask."""
-        radius = float(radius_voxels)
-        mask_bool = np.asarray(mask) > 0
-        if radius <= 0.0 or not mask_bool.any():
-            return mask_bool
-        # Exact structuring-element dilation is faster than EDT for common small
-        # integer radii (for example, triplet_gt_vector_dilation_radius=1.0).
-        rounded_radius = int(round(radius))
-        if abs(radius - rounded_radius) <= 1e-6 and rounded_radius <= 4:
-            footprint = EdtSegDataset._small_spherical_footprint(rounded_radius)
-            return ndimage.binary_dilation(mask_bool, structure=footprint, iterations=1)
-        dist = ndimage.distance_transform_edt(~mask_bool)
-        return dist <= radius
-
-    @staticmethod
-    def _signed_distance_field(mask: np.ndarray) -> np.ndarray:
-        """Signed distance using the legacy sign convention (positive inside)."""
-        mask_bool = np.asarray(mask) > 0
-        dist_outside = ndimage.distance_transform_edt(~mask_bool)
-        dist_inside = ndimage.distance_transform_edt(mask_bool)
-        return (dist_inside - dist_outside).astype(np.float32, copy=False)
-
     def create_split_masks(self, idx: int, patch_idx: int, wrap_idx: int):
         patch = self.patches[patch_idx]
         crop_size = self.crop_size  # tuple (D, H, W)
@@ -1285,7 +1186,7 @@ class EdtSegDataset(Dataset):
         use_dilation = self.config.get('use_dilation', False)
         if use_dilation:
             dilation_radius = self.config['dilation_radius']
-            cond_segmentation = self._edt_dilate_binary_mask(
+            cond_segmentation = edt_dilate_binary_mask(
                 cond_segmentation_gt > 0.5,
                 dilation_radius,
             ).astype(np.float32, copy=False)
@@ -1308,16 +1209,16 @@ class EdtSegDataset(Dataset):
                 seg_dilated = full_segmentation
             else:
                 dilation_radius = self.config['dilation_radius']
-                seg_dilated = self._edt_dilate_binary_mask(
+                seg_dilated = edt_dilate_binary_mask(
                     full_segmentation > 0.5,
                     dilation_radius,
                 ).astype(np.float32, copy=False)
-            sdt = self._signed_distance_field(seg_dilated)
+            sdt = _signed_distance_field(seg_dilated)
 
         if use_segmentation:
             dilation_radius = self.config['dilation_radius']
             full_segmentation_raw_bin = full_segmentation_raw > 0.5
-            seg_dilated = self._edt_dilate_binary_mask(
+            seg_dilated = edt_dilate_binary_mask(
                 full_segmentation_raw_bin,
                 dilation_radius,
             ).astype(np.float32, copy=False)
@@ -1386,8 +1287,8 @@ class EdtSegDataset(Dataset):
                     if not ovalid_s.all():
                         continue
 
-                    ox_full, oy_full, oz_full = self._upsample_world_triplet(ox_s, oy_s, oz_s, o_scale_y, o_scale_x)
-                    trimmed = self._trim_to_world_bbox(
+                    ox_full, oy_full, oz_full = _upsample_world_triplet(ox_s, oy_s, oz_s, o_scale_y, o_scale_x)
+                    trimmed = _trim_to_world_bbox(
                         ox_full, oy_full, oz_full, (z_min_w, z_max_w, y_min_w, y_max_w, x_min_w, x_max_w)
                     )
                     if trimmed is None:
