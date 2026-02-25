@@ -264,23 +264,7 @@ class EdtSegDataset(Dataset):
         return kept
 
     def _load_patch_metadata(self, patch_metadata):
-        metadata_triplet_mode = bool(
-            patch_metadata.get('use_triplet_wrap_displacement', self.use_triplet_wrap_displacement)
-        )
-        if metadata_triplet_mode != self.use_triplet_wrap_displacement:
-            raise ValueError(
-                "patch_metadata triplet mode does not match dataset config: "
-                f"metadata={metadata_triplet_mode}, config={self.use_triplet_wrap_displacement}"
-            )
-        sample_mode = patch_metadata.get('sample_mode', self.sample_mode)
-        if sample_mode not in {'wrap', 'chunk'}:
-            raise ValueError(f"Invalid sample_mode in patch_metadata: {sample_mode!r}")
-        if sample_mode != self.sample_mode:
-            raise ValueError(
-                "patch_metadata sample_mode does not match dataset config: "
-                f"metadata={sample_mode}, config={self.sample_mode}"
-            )
-        self.sample_mode = sample_mode
+        self.sample_mode = patch_metadata.get('sample_mode', self.sample_mode)
         self.patches = patch_metadata['patches']
         self.sample_index = list(patch_metadata['sample_index'])
         self._triplet_neighbor_lookup = patch_metadata.get('triplet_neighbor_lookup', {})
