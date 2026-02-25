@@ -3,6 +3,41 @@ import random
 import numpy as np
 
 
+def _estimate_mean_unit_direction_from_field(disp_np: np.ndarray, mask: np.ndarray) -> np.ndarray | None:
+    """Estimate one robust mean unit direction from a 3-channel dense field."""
+    disp = np.asarray(disp_np, dtype=np.float32)
+    if disp.ndim != 4 or disp.shape[0] != 3:
+        raise ValueError(f"disp_np must have shape (3, D, H, W), got {tuple(disp.shape)}")
+    mask_bool = np.asarray(mask, dtype=bool)
+    if mask_bool.shape != tuple(disp.shape[1:]):
+        raise ValueError(
+            "mask shape must match displacement spatial dims "
+            f"{tuple(disp.shape[1:])}, got {tuple(mask_bool.shape)}"
+        )
+    if not bool(mask_bool.any()):
+        return None
+
+    vecs = disp[:, mask_bool].T  # [N, 3]
+    if vecs.size == 0:
+        return None
+    finite = np.isfinite(vecs).all(axis=1)
+    vecs = vecs[finite]
+    if vecs.shape[0] == 0:
+        return None
+
+    mags = np.linalg.norm(vecs, axis=1)
+    vecs = vecs[mags > 1e-6]
+    if vecs.shape[0] == 0:
+        return None
+
+    unit_vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True).clip(min=1e-6)
+    mean_vec = np.mean(unit_vecs, axis=0, dtype=np.float64).astype(np.float32, copy=False)
+    norm = float(np.linalg.norm(mean_vec))
+    if not np.isfinite(norm) or norm <= 1e-6:
+        return None
+    return (mean_vec / norm).astype(np.float32, copy=False)
+
+
 def _compute_surface_tangent_axis(surface_grid: np.ndarray, surface_valid: np.ndarray, axis: int):
     """Estimate local tangent vectors along one grid axis."""
     grid = np.asarray(surface_grid, dtype=np.float32)
@@ -226,3 +261,55 @@ def maybe_swap_triplet_branch_channels(
         dense_gt_np, dir_priors_np = swap_triplet_branch_channels(dense_gt_np, dir_priors_np)
         triplet_channel_order_np = np.array([1, 0], dtype=np.int64)
     return dense_gt_np, dir_priors_np, triplet_channel_order_np
+
+
+def align_triplet_branch_channels_to_priors(
+    dense_gt_np: np.ndarray,
+    dir_priors_np: np.ndarray,
+    cond_mask: np.ndarray | None = None,
+):
+    """Deterministically align triplet GT branch order to prior slots.
+
+    Returns:
+        dense_gt_np: possibly swapped dense GT channels
+        dir_priors_np: unchanged
+        channel_order_np: mapping from current channels to original branch ids
+            ([0, 1] for no swap, [1, 0] when swapped)
+    """
+    dense = np.asarray(dense_gt_np, dtype=np.float32)
+    priors = np.asarray(dir_priors_np, dtype=np.float32)
+    if dense.ndim != 4 or dense.shape[0] < 6:
+        raise ValueError(f"dense_gt_np must have at least 6 channels, got shape {tuple(dense.shape)}")
+    if priors.ndim != 4 or priors.shape[0] != 6:
+        raise ValueError(f"dir_priors_np must have shape (6, D, H, W), got {tuple(priors.shape)}")
+    if dense.shape[1:] != priors.shape[1:]:
+        raise ValueError(
+            "dense_gt_np and dir_priors_np must share spatial shape, got "
+            f"{tuple(dense.shape[1:])} vs {tuple(priors.shape[1:])}"
+        )
+
+    if cond_mask is None:
+        mask = np.any(np.abs(priors) > 0, axis=0)
+    else:
+        mask = np.asarray(cond_mask, dtype=bool)
+        if mask.shape != tuple(dense.shape[1:]):
+            raise ValueError(
+                "cond_mask shape must match spatial shape "
+                f"{tuple(dense.shape[1:])}, got {tuple(mask.shape)}"
+            )
+    if not bool(mask.any()):
+        return dense_gt_np, dir_priors_np, np.array([0, 1], dtype=np.int64)
+
+    g0 = _estimate_mean_unit_direction_from_field(dense[0:3], mask)
+    g1 = _estimate_mean_unit_direction_from_field(dense[3:6], mask)
+    p0 = _estimate_mean_unit_direction_from_field(priors[0:3], mask)
+    p1 = _estimate_mean_unit_direction_from_field(priors[3:6], mask)
+    if any(v is None for v in (g0, g1, p0, p1)):
+        return dense_gt_np, dir_priors_np, np.array([0, 1], dtype=np.int64)
+
+    keep_score = float(np.dot(g0, p0) + np.dot(g1, p1))
+    swap_score = float(np.dot(g0, p1) + np.dot(g1, p0))
+    if swap_score > keep_score:
+        dense_swapped = np.concatenate([dense[3:6], dense[0:3]], axis=0).astype(np.float32, copy=False)
+        return dense_swapped, dir_priors_np, np.array([1, 0], dtype=np.int64)
+    return dense_gt_np, dir_priors_np, np.array([0, 1], dtype=np.int64)

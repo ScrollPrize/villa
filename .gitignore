@@ -33,3 +33,4 @@ vesuvius/AGENTS.md
 /vesuvius/src/external
 
 *.cover
+/vesuvius/src/vesuvius/neural_tracing/tests/test_band_filtering

@@ -32,6 +32,7 @@ from vesuvius.neural_tracing.datasets.common import (
 )
 from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
 from vesuvius.neural_tracing.datasets.direction_helpers import (
+    align_triplet_branch_channels_to_priors,
     build_triplet_direction_priors_from_conditioning_surface,
     maybe_swap_triplet_branch_channels,
 )
@@ -64,6 +65,7 @@ _EDT_BACKEND_CACHE = {
     "fn": None,
     "cp": None,
     "kwargs": None,
+    "stream": None,
 }
 
 
@@ -77,6 +79,7 @@ def _resolve_edt_backend():
     backend_fn = ndimage.distance_transform_edt
     backend_cp = None
     backend_kwargs = {}
+    backend_stream = None
 
     try:
         import cupy as cp
@@ -87,6 +90,11 @@ def _resolve_edt_backend():
             backend_fn = cndimage.distance_transform_edt
             backend_cp = cp
             backend_kwargs = {"float64_distances": False}
+            try:
+                backend_stream = cp.cuda.Stream(non_blocking=True)
+            except Exception:
+                # Fallback to default stream behavior if stream creation fails.
+                backend_stream = None
     except Exception:
         # Fallback is scipy; this keeps dataset functionality available on CPU
         # or when CUDA runtime is unavailable in the current process.
@@ -97,6 +105,7 @@ def _resolve_edt_backend():
     _EDT_BACKEND_CACHE["fn"] = backend_fn
     _EDT_BACKEND_CACHE["cp"] = backend_cp
     _EDT_BACKEND_CACHE["kwargs"] = backend_kwargs
+    _EDT_BACKEND_CACHE["stream"] = backend_stream
     return _EDT_BACKEND_CACHE
 
 
@@ -121,22 +130,76 @@ def _distance_transform_edt(
 
     cp = backend["cp"]
     kwargs = backend["kwargs"] or {}
-    input_gpu = cp.asarray(np.asarray(input_mask, dtype=bool))
-    out = edt_fn(
-        input_gpu,
-        sampling=sampling,
-        return_distances=bool(return_distances),
-        return_indices=bool(return_indices),
-        **kwargs,
-    )
-    if return_distances and return_indices:
-        dist_gpu, idx_gpu = out
-        return cp.asnumpy(dist_gpu), cp.asnumpy(idx_gpu)
-    if return_distances and not return_indices:
-        return cp.asnumpy(out)
-    if (not return_distances) and return_indices:
-        return cp.asnumpy(out)
-    return None
+    stream = backend.get("stream", None)
+
+    if stream is None:
+        input_gpu = cp.asarray(np.asarray(input_mask, dtype=bool))
+        out = edt_fn(
+            input_gpu,
+            sampling=sampling,
+            return_distances=bool(return_distances),
+            return_indices=bool(return_indices),
+            **kwargs,
+        )
+        if return_distances and return_indices:
+            dist_gpu, idx_gpu = out
+            return cp.asnumpy(dist_gpu), cp.asnumpy(idx_gpu)
+        if return_distances and not return_indices:
+            return cp.asnumpy(out)
+        if (not return_distances) and return_indices:
+            return cp.asnumpy(out)
+        return None
+
+    # Use a dedicated non-blocking stream and async host copies.
+    # We still synchronize before returning to keep outputs ready for callers.
+    try:
+        with stream:
+            input_gpu = cp.asarray(np.asarray(input_mask, dtype=bool))
+            out = edt_fn(
+                input_gpu,
+                sampling=sampling,
+                return_distances=bool(return_distances),
+                return_indices=bool(return_indices),
+                **kwargs,
+            )
+
+        if return_distances and return_indices:
+            dist_gpu, idx_gpu = out
+            dist_host = np.empty(dist_gpu.shape, dtype=dist_gpu.dtype)
+            idx_host = np.empty(idx_gpu.shape, dtype=idx_gpu.dtype)
+            cp.asnumpy(dist_gpu, stream=stream, out=dist_host, blocking=False)
+            cp.asnumpy(idx_gpu, stream=stream, out=idx_host, blocking=False)
+            stream.synchronize()
+            return dist_host, idx_host
+        if return_distances and not return_indices:
+            out_host = np.empty(out.shape, dtype=out.dtype)
+            cp.asnumpy(out, stream=stream, out=out_host, blocking=False)
+            stream.synchronize()
+            return out_host
+        if (not return_distances) and return_indices:
+            out_host = np.empty(out.shape, dtype=out.dtype)
+            cp.asnumpy(out, stream=stream, out=out_host, blocking=False)
+            stream.synchronize()
+            return out_host
+        return None
+    except Exception:
+        # Safety fallback to blocking transfer behavior.
+        input_gpu = cp.asarray(np.asarray(input_mask, dtype=bool))
+        out = edt_fn(
+            input_gpu,
+            sampling=sampling,
+            return_distances=bool(return_distances),
+            return_indices=bool(return_indices),
+            **kwargs,
+        )
+        if return_distances and return_indices:
+            dist_gpu, idx_gpu = out
+            return cp.asnumpy(dist_gpu), cp.asnumpy(idx_gpu)
+        if return_distances and not return_indices:
+            return cp.asnumpy(out)
+        if (not return_distances) and return_indices:
+            return cp.asnumpy(out)
+        return None
 
 
 class EdtSegDataset(Dataset):
@@ -173,7 +236,7 @@ class EdtSegDataset(Dataset):
             self.use_dense_displacement = True
         self.use_triplet_direction_priors = bool(config['use_triplet_direction_priors'])
         self.triplet_direction_prior_mask = str(config['triplet_direction_prior_mask']).lower()
-        self.triplet_random_channel_swap_prob = 0.5
+        self.triplet_random_channel_swap_prob = float(config['triplet_random_channel_swap_prob'])
         self.triplet_close_check_enabled = bool(config['triplet_close_check_enabled'])
         self.triplet_close_distance_voxels = float(config['triplet_close_distance_voxels'])
         self.triplet_close_fraction_threshold = float(config['triplet_close_fraction_threshold'])
@@ -752,6 +815,7 @@ class EdtSegDataset(Dataset):
         dense_gt_np = np.empty((6, *crop_size), dtype=np.float32)
         dense_gt_np[:3, ...] = behind_disp_np
         dense_gt_np[3:, ...] = front_disp_np
+        canonical_channel_order_np = np.array([0, 1], dtype=np.int64)
         dir_priors_np = None
         if self.use_triplet_direction_priors:
             if cond_surface_local is None:
@@ -771,12 +835,20 @@ class EdtSegDataset(Dataset):
                     "triplet direction priors unavailable"
                 )
                 return None
-        dense_gt_np, dir_priors_np, triplet_channel_order_np = maybe_swap_triplet_branch_channels(
+            # Canonicalize branch/channel assignment to match prior slots before
+            # optional random swap augmentation.
+            dense_gt_np, dir_priors_np, canonical_channel_order_np = align_triplet_branch_channels_to_priors(
+                dense_gt_np,
+                dir_priors_np,
+                cond_mask=cond_bin_full,
+            )
+        dense_gt_np, dir_priors_np, random_channel_order_np = maybe_swap_triplet_branch_channels(
             dense_gt_np,
             dir_priors_np,
             swap_prob=self.triplet_random_channel_swap_prob,
             rng=random,
         )
+        triplet_channel_order_np = canonical_channel_order_np[random_channel_order_np]
         dense_gt_disp = torch.from_numpy(dense_gt_np).to(torch.float32)
         dense_loss_weight = torch.from_numpy(dense_weight_np).to(torch.float32)
 
