@@ -2,7 +2,6 @@
 **/.venv*/
 **/.idea/*
 *.pyc
-*.tif
 node_modules/.yarn-integrity
 **/*.egg-info*/
 
