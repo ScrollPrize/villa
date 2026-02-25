@@ -584,8 +584,9 @@ def optimize(
 					param_vals0[k] = float(vs[0].detach().cpu())
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
-			_print_status(step_label=f"{label} 0/{opt_cfg.steps}", loss_val=loss0.item(), tv=term_vals0, pv=param_vals0)
 			_print_losses_per_z(label=f"{label} step 0/{opt_cfg.steps}", res=res0, eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
+			_status_rows_since_header = 0
+			_print_status(step_label=f"{label} 0/{opt_cfg.steps}", loss_val=loss0.item(), tv=term_vals0, pv=param_vals0)
 		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0, vis_losses=vis_losses0)
 
 		max_steps = opt_cfg.steps if opt_cfg.termination == "steps" else 10_000_000
@@ -661,6 +662,7 @@ def optimize(
 		snapshot_fn(stage=label, step=actual_steps, loss=float(loss.detach().cpu()), data=data, res=res, vis_losses=vis_losses)
 		with torch.no_grad():
 			_print_losses_per_z(label=f"{label} step {actual_steps}/{opt_cfg.steps if opt_cfg.termination == 'steps' else '?'}", res=res, eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
+		_status_rows_since_header = 0
 		for h in hooks:
 			h.remove()
 
