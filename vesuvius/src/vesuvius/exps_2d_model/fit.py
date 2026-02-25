@@ -199,6 +199,11 @@ def main(argv: list[str] | None = None) -> int:
 	idx_right = torch.empty((0, 3), dtype=torch.int64)
 	valid_right = torch.empty((0,), dtype=torch.bool)
 	min_dist_right = torch.empty((0,), dtype=torch.float32)
+	idx_left_hi = torch.empty((0, 3), dtype=torch.int64)
+	valid_left_hi = torch.empty((0,), dtype=torch.bool)
+	idx_right_hi = torch.empty((0, 3), dtype=torch.int64)
+	valid_right_hi = torch.empty((0,), dtype=torch.bool)
+	z_frac = torch.empty((0,), dtype=torch.float32)
 	winding_obs = torch.empty((0,), dtype=torch.float32)
 	winding_avg = torch.empty((0,), dtype=torch.float32)
 	winding_err = torch.empty((0,), dtype=torch.float32)
@@ -272,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
 	if mdl is not None:
 		print("model_init:", mdl.init)
 		print("mesh:", mdl.mesh_h, mdl.mesh_w)
-	if int(points_tensor_work.shape[0]) > 0:
+	if int(points_tensor_work.shape[0]) > 0 and mdl is not None:
 		print("[point_constraints] starting closest segment search")
 		with torch.no_grad():
 			xy_lr0 = mdl._grid_xy()
@@ -392,6 +397,53 @@ def main(argv: list[str] | None = None) -> int:
 		)
 		print("model_init:", mdl.init)
 		print("mesh:", mdl.mesh_h, mdl.mesh_w)
+	if int(points_all.shape[0]) == 0 and int(points_tensor_work.shape[0]) > 0:
+		# Deferred setup: early block was skipped because mdl wasn't created yet.
+		# points_tensor_work is already margin-shifted at this point.
+		print("[point_constraints] deferred closest segment search (model created from scratch)")
+		with torch.no_grad():
+			xy_lr0 = mdl._grid_xy()
+			xy_conn0 = mdl._xy_conn_px(xy_lr=xy_lr0)
+		(points_all,
+		 idx_left, valid_left, min_dist_left,
+		 idx_right, valid_right, min_dist_right,
+		 idx_left_hi, valid_left_hi, _dist_left_hi,
+		 idx_right_hi, valid_right_hi, _dist_right_hi,
+		 z_frac) = point_constraints.closest_conn_segment_indices(points_xyz_winda=points_tensor_work, xy_conn=xy_conn0)
+		n_lo = int(valid_left.sum().item())
+		n_hi = int(valid_left_hi.sum().item())
+		n_interp = int(((z_frac > 0.0) & valid_left & valid_left_hi).sum().item())
+		print(f"[point_constraints] {int(points_all.shape[0])} pts: {n_lo} valid_lo, {n_hi} valid_hi, {n_interp} z-interpolated")
+		for pi in range(int(points_all.shape[0])):
+			pf = points_tensor[pi]  # original fullres
+			pw = points_all[pi]     # working coords (margin-shifted)
+			z_lo_i = int(idx_left[pi, 0].item())
+			z_hi_i = int(idx_left_hi[pi, 0].item())
+			frac_i = z_frac[pi].item()
+			print(f"  pt{pi}: fullres=({pf[0]:.0f},{pf[1]:.0f},{pf[2]:.0f}) "
+				  f"work=({pw[0]:.1f},{pw[1]:.1f},{pw[2]:.2f}) "
+				  f"z_lo={z_lo_i} z_hi={z_hi_i} z_frac={frac_i:.3f}")
+		if _out_dir is not None:
+			_corr_out_dir = _out_dir
+		else:
+			import os
+			_corr_out_dir = os.getcwd()
+		print(f"[fit] corr_out_dir={_corr_out_dir}")
+		data = replace(data, constraints=fit_data.ConstraintsData(
+			points=fit_data.PointConstraintsData(
+				points_xyz_winda=points_all,
+				collection_idx=points_collection_idx,
+				idx_left=idx_left,
+				valid_left=valid_left,
+				idx_right=idx_right,
+				valid_right=valid_right,
+				idx_left_hi=idx_left_hi,
+				valid_left_hi=valid_left_hi,
+				idx_right_hi=idx_right_hi,
+				valid_right_hi=valid_right_hi,
+				z_frac=z_frac,
+			)
+		))
 	if int(points_all.shape[0]) > 0:
 		with torch.no_grad():
 			xy_lr_corr = mdl._grid_xy()
