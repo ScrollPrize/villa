@@ -75,7 +75,6 @@ def _build_filter_only_dataset() -> EdtSegDataset:
         "sample_index": [],
         "triplet_neighbor_lookup": {},
         "triplet_lookup_stats": {},
-        "triplet_overlap_filter_stats": {},
         "triplet_overlap_kept_indices": tuple(),
         "cond_percent": [0.35, 0.35],
         "sample_mode": "wrap",
@@ -161,10 +160,4 @@ def test_dataset_triplet_overlap_filter_drops_overlap_chunks_keeps_no_overlap_ch
     kept_chunk_ids = [tuple(p.chunk_id) for p in kept]
     assert kept_chunk_ids == [(2, 0, 0)]
 
-    assert dataset._triplet_overlap_filter_stats == {
-        "chunks_total": 3,
-        "chunks_dropped_overlap": 2,
-        "chunks_kept": 1,
-        "missing_masks": 0,
-    }
     assert dataset._triplet_overlap_kept_indices == (2,)

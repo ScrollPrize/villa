@@ -228,13 +228,6 @@ class EdtSegDataset(Dataset):
         warn_missing_masks = bool(self.config["triplet_warn_missing_overlap_masks"])
         warned_missing = set()
         warned_load_fail = set()
-        seen_missing_masks = set()
-        filter_stats = {
-            "chunks_total": len(patches),
-            "chunks_dropped_overlap": 0,
-            "chunks_kept": 0,
-            "missing_masks": 0,
-        }
         kept = []
         kept_indices = []
 
@@ -250,9 +243,6 @@ class EdtSegDataset(Dataset):
                 mask_key = str(mask_path)
 
                 if not mask_path.exists():
-                    if mask_key not in seen_missing_masks:
-                        seen_missing_masks.add(mask_key)
-                        filter_stats["missing_masks"] += 1
                     if warn_missing_masks and mask_key not in warned_missing:
                         warned_missing.add(mask_key)
                         warnings.warn(
@@ -285,22 +275,11 @@ class EdtSegDataset(Dataset):
                     drop_chunk = True
                     break
 
-            if drop_chunk:
-                filter_stats["chunks_dropped_overlap"] += 1
-            else:
+            if not drop_chunk:
                 kept.append(patch)
                 kept_indices.append(int(patch_idx))
-                filter_stats["chunks_kept"] += 1
 
-        self._triplet_overlap_filter_stats = filter_stats
         self._triplet_overlap_kept_indices = tuple(kept_indices)
-        if filter_stats["chunks_dropped_overlap"] > 0 and self.config.get("verbose", False):
-            print(
-                "Triplet overlap filtering: "
-                f"kept={filter_stats['chunks_kept']}/{filter_stats['chunks_total']}, "
-                f"dropped={filter_stats['chunks_dropped_overlap']}, "
-                f"missing_masks={filter_stats['missing_masks']}"
-            )
         return kept
 
     def _load_patch_metadata(self, patch_metadata):
@@ -325,7 +304,6 @@ class EdtSegDataset(Dataset):
         self.sample_index = list(patch_metadata['sample_index'])
         self._triplet_neighbor_lookup = patch_metadata.get('triplet_neighbor_lookup', {})
         self._triplet_lookup_stats = patch_metadata.get('triplet_lookup_stats', {})
-        self._triplet_overlap_filter_stats = patch_metadata.get('triplet_overlap_filter_stats', {})
         self._triplet_overlap_kept_indices = tuple(
             int(i) for i in patch_metadata.get('triplet_overlap_kept_indices', tuple())
         )
@@ -338,7 +316,6 @@ class EdtSegDataset(Dataset):
             'sample_index': tuple(self.sample_index),
             'triplet_neighbor_lookup': self._triplet_neighbor_lookup,
             'triplet_lookup_stats': self._triplet_lookup_stats,
-            'triplet_overlap_filter_stats': getattr(self, '_triplet_overlap_filter_stats', {}),
             'triplet_overlap_kept_indices': tuple(getattr(self, '_triplet_overlap_kept_indices', tuple())),
             'cond_percent': (self._cond_percent_min, self._cond_percent_max),
             'use_triplet_wrap_displacement': self.use_triplet_wrap_displacement,

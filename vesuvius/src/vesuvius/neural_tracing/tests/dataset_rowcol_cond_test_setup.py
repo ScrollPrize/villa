@@ -287,7 +287,6 @@ def _make_patch_metadata(*, patch: ChunkPatch, use_triplet_wrap_displacement: bo
         "use_triplet_wrap_displacement": bool(use_triplet_wrap_displacement),
         "triplet_neighbor_lookup": {},
         "triplet_lookup_stats": {},
-        "triplet_overlap_filter_stats": {},
         "triplet_overlap_kept_indices": tuple(),
     }
     if use_triplet_wrap_displacement:

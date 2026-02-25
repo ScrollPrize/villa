@@ -170,10 +170,6 @@ def test_dataset_patch_metadata_roundtrip_consistency_for_patchfinding_outputs(r
     assert ds_from_metadata.sample_index == base_ds.sample_index
     assert ds_from_metadata._triplet_neighbor_lookup == base_ds._triplet_neighbor_lookup
     assert ds_from_metadata._triplet_lookup_stats == base_ds._triplet_lookup_stats
-    assert ds_from_metadata._triplet_overlap_filter_stats == metadata.get(
-        "triplet_overlap_filter_stats",
-        {},
-    )
     assert ds_from_metadata._triplet_overlap_kept_indices == tuple(
         int(i) for i in metadata.get("triplet_overlap_kept_indices", tuple())
     )

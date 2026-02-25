@@ -106,10 +106,6 @@ def test_triplet_real343p_overlap_filter_and_neighbor_lookup_invariants(triplet_
     assert len(ds.patches) > 0
     assert len(ds.sample_index) > 0
 
-    stats = ds._triplet_overlap_filter_stats
-    assert int(stats["chunks_total"]) > int(stats["chunks_kept"])
-    assert int(stats["chunks_dropped_overlap"]) > 0
-
     mask_cache: dict[str, np.ndarray] = {}
     for patch in ds.patches:
         for wrap in patch.wraps:
