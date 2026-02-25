@@ -198,12 +198,8 @@ class EdtSegDataset(Dataset):
                         "Triplet mode enabled but no wraps have same/adjacent neighbors on both sides."
                     )
             spec = self.config['cond_percent']
-            if not isinstance(spec, (list, tuple)) or len(spec) != 2:
-                raise ValueError("cond_percent must be [min, max], e.g. [0.1, 0.5]")
-
             low, high = float(spec[0]), float(spec[1])
-            if not (0.0 < low <= high < 1.0):
-                raise ValueError("cond_percent values must satisfy 0 < min <= max < 1")
+
             self._cond_percent_min, self._cond_percent_max = low, high
         else:
             self._load_patch_metadata(patch_metadata)
