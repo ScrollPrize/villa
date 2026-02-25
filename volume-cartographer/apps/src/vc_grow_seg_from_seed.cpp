@@ -141,17 +141,17 @@ static auto load_direction_fields(json const&params, ChunkCache<uint8_t> *chunk_
             }
             int const ome_scale = direction_field["scale"];
             float scale_factor = std::pow(2, -ome_scale);
-            vc::zarr::Store dirs_group(zarr_path);
+            vc::zarr::Group dirs_group(zarr_path);
             std::vector<std::unique_ptr<vc::zarr::Dataset>> direction_dss;
             for (auto dim : std::string("xyz")) {
-                vc::zarr::Store dim_group(dirs_group, std::string(&dim, 1));
+                vc::zarr::Group dim_group(dirs_group, std::string(&dim, 1));
                 direction_dss.push_back(vc::zarr::Dataset::open(dim_group, std::to_string(ome_scale), "."));
             }
             std::cout << "direction field dataset shape " << direction_dss.front()->shape() << std::endl;
             std::unique_ptr<vc::zarr::Dataset> maybe_weight_ds;
             if (direction_field.contains("weight_zarr")) {
                 std::string const weight_zarr_path = direction_field["weight_zarr"];
-                vc::zarr::Store weight_group(weight_zarr_path);
+                vc::zarr::Group weight_group(weight_zarr_path);
                 maybe_weight_ds = vc::zarr::Dataset::open(weight_group, std::to_string(ome_scale), ".");
             }
             std::string const unique_id = std::to_string(std::hash<std::string>{}(dirs_group.path().string() + std::to_string(ome_scale)));
@@ -300,7 +300,7 @@ int main(int argc, char *argv[])
         set_space_tracing_use_cuda(true);
     }
 
-    vc::zarr::Store group(vol_path);
+    vc::zarr::Group group(vol_path);
     auto ds = vc::zarr::Dataset::open(group, "0", json::parse(std::ifstream(vol_path/"0/.zarray")).value<std::string>("dimension_separator","."));
 
     std::cout << "zarr dataset size for scale group 0 " << ds->shape() << std::endl;

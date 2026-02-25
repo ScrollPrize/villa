@@ -818,8 +818,8 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
     cv::Vec3i origin_xyz(0, 0, 0);
     int step = 1;
     {
-        vc::zarr::Store rootFile(zarr_root);
-        vc::zarr::Store root(rootFile, "");
+        vc::zarr::Group rootFile(zarr_root);
+        vc::zarr::Group root(rootFile, "");
         try {
             nlohmann::json attrs = root.readAttrs();
             if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
@@ -834,8 +834,8 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
     }
 
     auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<vc::zarr::Dataset> {
-        vc::zarr::Store file(zarr_root);
-        vc::zarr::Store axis_group(file, axis);
+        vc::zarr::Group file(zarr_root);
+        vc::zarr::Group axis_group(file, axis);
         return vc::zarr::Dataset::open(axis_group, "0", delim);
     };
 
@@ -935,8 +935,8 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
     cv::Vec3i origin_xyz(0, 0, 0);
     int step = 1;
     {
-        vc::zarr::Store rootFile(zarr_root);
-        vc::zarr::Store root(rootFile, "");
+        vc::zarr::Group rootFile(zarr_root);
+        vc::zarr::Group root(rootFile, "");
         try {
             nlohmann::json attrs = root.readAttrs();
             if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
@@ -951,8 +951,8 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
     }
 
     auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<vc::zarr::Dataset> {
-        vc::zarr::Store file(zarr_root);
-        vc::zarr::Store axis_group(file, axis);
+        vc::zarr::Group file(zarr_root);
+        vc::zarr::Group axis_group(file, axis);
         return vc::zarr::Dataset::open(axis_group, "0", delim);
     };
 
@@ -1202,8 +1202,8 @@ static void run_align_normals_zarr(
     cv::Vec3i origin_xyz(0, 0, 0);
     int step = 1;
     {
-        vc::zarr::Store rootFile(zarr_root);
-        vc::zarr::Store root(rootFile, "");
+        vc::zarr::Group rootFile(zarr_root);
+        vc::zarr::Group root(rootFile, "");
         try {
             nlohmann::json attrs = root.readAttrs();
             if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
@@ -1218,8 +1218,8 @@ static void run_align_normals_zarr(
     }
 
     auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<vc::zarr::Dataset> {
-        vc::zarr::Store file(zarr_root);
-        vc::zarr::Store axis_group(file, axis);
+        vc::zarr::Group file(zarr_root);
+        vc::zarr::Group axis_group(file, axis);
         return vc::zarr::Dataset::open(axis_group, "0", delim);
     };
 
@@ -1614,7 +1614,7 @@ static void run_align_normals_zarr(
     }
 
     // Write output zarr: create full-sized datasets and only write the cropped subarray.
-    auto outFile = vc::zarr::Store::create(out_zarr, true);
+    auto outFile = vc::zarr::Group::create(out_zarr, true);
     outFile.createGroup("x");
     outFile.createGroup("y");
     outFile.createGroup("z");
@@ -1622,9 +1622,9 @@ static void run_align_normals_zarr(
     const std::vector<size_t> chunks = {std::min<size_t>(64, full_shape[0]), std::min<size_t>(64, full_shape[1]), std::min<size_t>(64, full_shape[2])};
     nlohmann::json compOpts = {{"cname", "zstd"}, {"clevel", 1}, {"shuffle", 0}};
 
-    vc::zarr::Store gx(outFile, "x");
-    vc::zarr::Store gy(outFile, "y");
-    vc::zarr::Store gz(outFile, "z");
+    vc::zarr::Group gx(outFile, "x");
+    vc::zarr::Group gy(outFile, "y");
+    vc::zarr::Group gz(outFile, "z");
     auto out_dsx = vc::zarr::Dataset::create(gx, "0", "uint8", full_shape, chunks, "blosc", compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
     auto out_dsy = vc::zarr::Dataset::create(gy, "0", "uint8", full_shape, chunks, "blosc", compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
     auto out_dsz = vc::zarr::Dataset::create(gz, "0", "uint8", full_shape, chunks, "blosc", compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
@@ -1649,7 +1649,7 @@ static void run_align_normals_zarr(
     attrs["crop_max_xyz"] = {crop_xyz.max[0], crop_xyz.max[1], crop_xyz.max[2]};
     attrs["crop_off_zyx"] = {crop_zyx.off[0], crop_zyx.off[1], crop_zyx.off[2]};
     attrs["crop_shape_zyx"] = {crop_zyx.shape[0], crop_zyx.shape[1], crop_zyx.shape[2]};
-    vc::zarr::Store root(outFile, "");
+    vc::zarr::Group root(outFile, "");
     root.writeAttrs(attrs);
 }
 
@@ -2410,7 +2410,7 @@ static void run_fit_normals(
         // NOTE: direction-field readers in vc_grow_seg_from_seed expect:
         //   <root>/{x,y,z}/0/.zarray
         // and will read the delimiter from that .zarray.
-        auto outFile = vc::zarr::Store::create(out_zarr, true);
+        auto outFile = vc::zarr::Group::create(out_zarr, true);
 
         // Ensure groups exist so zarr format is inferred when creating datasets.
         outFile.createGroup("x");
@@ -2425,13 +2425,13 @@ static void run_fit_normals(
         const std::vector<size_t> chunks = {std::min<size_t>(64, shape[0]), std::min<size_t>(64, shape[1]), std::min<size_t>(64, shape[2])};
         nlohmann::json compOpts = {{"cname", "zstd"}, {"clevel", 1}, {"shuffle", 0}};
 
-        vc::zarr::Store gx(outFile, "x");
-        vc::zarr::Store gy(outFile, "y");
-        vc::zarr::Store gz(outFile, "z");
-        vc::zarr::Store g_rms(outFile, "fit_rms");
-        vc::zarr::Store g_frac(outFile, "fit_frac_short_paths");
-        vc::zarr::Store g_rad(outFile, "fit_used_radius");
-        vc::zarr::Store g_sc(outFile, "fit_segment_count");
+        vc::zarr::Group gx(outFile, "x");
+        vc::zarr::Group gy(outFile, "y");
+        vc::zarr::Group gz(outFile, "z");
+        vc::zarr::Group g_rms(outFile, "fit_rms");
+        vc::zarr::Group g_frac(outFile, "fit_frac_short_paths");
+        vc::zarr::Group g_rad(outFile, "fit_used_radius");
+        vc::zarr::Group g_sc(outFile, "fit_segment_count");
 
         auto dsx = vc::zarr::Dataset::create(gx, "0", "uint8", shape, chunks, "blosc", compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
         auto dsy = vc::zarr::Dataset::create(gy, "0", "uint8", shape, chunks, "blosc", compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
@@ -2478,7 +2478,7 @@ static void run_fit_normals(
         attrs["fit_frac_short_paths_decode"] = "v/255";
         attrs["fit_used_radius_decode"] = "2 + (v/255)*(512-2)";
         attrs["fit_segment_count_decode"] = "(v/255)*8192";
-        vc::zarr::Store root(outFile, "");
+        vc::zarr::Group root(outFile, "");
         root.writeAttrs(attrs);
     }
 }

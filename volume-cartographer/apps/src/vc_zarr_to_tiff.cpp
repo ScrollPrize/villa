@@ -71,7 +71,7 @@ int main(int argc, char** argv)
             dimsep = j["dimension_separator"].get<std::string>();
     } catch (...) {}
 
-    vc::zarr::Store root(inRoot);
+    vc::zarr::Group root(inRoot);
     auto ds = vc::zarr::Dataset::open(root, dsName, dimsep);
 
     const auto& shape = ds->shape(); // [Z, Y, X]

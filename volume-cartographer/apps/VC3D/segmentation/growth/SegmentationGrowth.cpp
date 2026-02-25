@@ -174,13 +174,13 @@ bool appendDirectionField(const SegmentationDirectionFieldConfig& config,
     }
 
     try {
-        vc::zarr::Store group(zarrPath);
+        vc::zarr::Group group(zarrPath);
         const int scaleLevel = std::clamp(config.scale, 0, 5);
 
         std::vector<std::unique_ptr<vc::zarr::Dataset>> datasets;
         datasets.reserve(3);
         for (char axis : std::string("xyz")) {
-            vc::zarr::Store axisGroup(group, std::string(1, axis));
+            vc::zarr::Group axisGroup(group, std::string(1, axis));
             datasets.push_back(vc::zarr::Dataset::open(axisGroup, std::to_string(scaleLevel), "."));
         }
 

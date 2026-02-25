@@ -985,10 +985,10 @@ int main(int argc, char** argv) {
                         json j = json::parse(std::ifstream((ds_path / ".zarray").string()));
                         if (j.contains("dimension_separator")) dimsep = j["dimension_separator"].get<std::string>();
                     } catch (...) {}
-                    vc::zarr::Store parent(ds_path.parent_path());
+                    vc::zarr::Group parent(ds_path.parent_path());
                     return vc::zarr::Dataset::open(parent, ds_path.filename().string(), dimsep);
                 } else {
-                    vc::zarr::Store root(in_root);
+                    vc::zarr::Group root(in_root);
                     try {
                         json j = json::parse(std::ifstream((in_root / std::to_string(group_idx) / ".zarray").string()));
                         if (j.contains("dimension_separator")) dimsep = j["dimension_separator"].get<std::string>();
@@ -1158,7 +1158,7 @@ int main(int argc, char** argv) {
             }
 
             // Else: Prepare output zarr root and level-0 dataset
-            auto outFile = vc::zarr::Store::create(out_root, true);
+            auto outFile = vc::zarr::Group::create(out_root, true);
 
             const size_t CH = 128, CW = 128; // chunking in Y,X; Z chunk = 1 for per-slice IO
             const size_t CZ = 1;

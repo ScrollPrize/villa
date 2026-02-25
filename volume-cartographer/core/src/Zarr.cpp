@@ -148,7 +148,7 @@ template void downsampleTileIntoPreserveZ<uint16_t>(const uint16_t*, size_t, siz
 // ============================================================
 
 template <typename T>
-void buildPyramidLevel(vc::zarr::Store& outFile, int level,
+void buildPyramidLevel(vc::zarr::Group& outFile, int level,
                        size_t CH, size_t CW,
                        int numParts, int partId)
 {
@@ -226,14 +226,14 @@ void buildPyramidLevel(vc::zarr::Store& outFile, int level,
     if (myTiles > 0) std::cout << std::endl;
 }
 
-template void buildPyramidLevel<uint8_t>(vc::zarr::Store&, int, size_t, size_t, int, int);
-template void buildPyramidLevel<uint16_t>(vc::zarr::Store&, int, size_t, size_t, int, int);
+template void buildPyramidLevel<uint8_t>(vc::zarr::Group&, int, size_t, size_t, int, int);
+template void buildPyramidLevel<uint16_t>(vc::zarr::Group&, int, size_t, size_t, int, int);
 
 // ============================================================
 // createPyramidDatasets
 // ============================================================
 
-void createPyramidDatasets(vc::zarr::Store& outFile,
+void createPyramidDatasets(vc::zarr::Group& outFile,
                            const std::vector<size_t>& shape0,
                            size_t CH, size_t CW, bool isU16)
 {
@@ -256,7 +256,7 @@ void createPyramidDatasets(vc::zarr::Store& outFile,
 // writeZarrAttrs
 // ============================================================
 
-void writeZarrAttrs(vc::zarr::Store& outFile,
+void writeZarrAttrs(vc::zarr::Group& outFile,
                     const std::filesystem::path& volPath, int groupIdx,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,

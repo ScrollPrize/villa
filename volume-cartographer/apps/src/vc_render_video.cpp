@@ -91,7 +91,7 @@ int main(int argc, char *argv[])
     for(int i=3;i<argc;i++)
         seg_dirs.push_back(argv[i]);
 
-    vc::zarr::Store group(vol_path);
+    vc::zarr::Group group(vol_path);
     auto ds = vc::zarr::Dataset::open(group, "1", json::parse(std::ifstream(vol_path/"1/.zarray")).value<std::string>("dimension_separator","."));
 
     std::cout << "zarr dataset size for scale group 1 " << ds->shape() << std::endl;

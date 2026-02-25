@@ -127,8 +127,8 @@ void Volume::zarrOpen()
     if (!metadata_.contains("format") || metadata_["format"].get<std::string>() != "zarr")
         return;
 
-    zarrStore_ = std::make_unique<vc::zarr::Store>(path_);
-    zarrGroup_ = zarrStore_->readAttrs();
+    zarrRoot_ = std::make_unique<vc::zarr::Group>(path_);
+    zarrAttrs_ = zarrRoot_->readAttrs();
 
     auto isPowerOfTwoScale = [](double v) {
         if (!(v > 0.0)) return false;
@@ -148,9 +148,9 @@ void Volume::zarrOpen()
     std::vector<Candidate> candidates;
 
     bool usedOmeMultiscales = false;
-    if (zarrGroup_.contains("multiscales") && zarrGroup_["multiscales"].is_array() &&
-        !zarrGroup_["multiscales"].empty()) {
-        const auto& ms0 = zarrGroup_["multiscales"][0];
+    if (zarrAttrs_.contains("multiscales") && zarrAttrs_["multiscales"].is_array() &&
+        !zarrAttrs_["multiscales"].empty()) {
+        const auto& ms0 = zarrAttrs_["multiscales"][0];
         if (ms0.contains("datasets") && ms0["datasets"].is_array()) {
             usedOmeMultiscales = true;
             for (const auto& ds : ms0["datasets"]) {
@@ -196,7 +196,7 @@ void Volume::zarrOpen()
     }
 
     if (!usedOmeMultiscales) {
-        auto groups = zarrStore_->keys();
+        auto groups = zarrRoot_->keys();
         std::sort(groups.begin(), groups.end());
         for (const auto& name : groups) {
             try {
@@ -232,7 +232,7 @@ void Volume::zarrOpen()
             continue;
         }
 
-        auto ds = vc::zarr::Dataset::open(*zarrStore_, c.path);
+        auto ds = vc::zarr::Dataset::open(*zarrRoot_, c.path);
         if (ds->getDtype() != vc::zarr::Datatype::uint8 && ds->getDtype() != vc::zarr::Datatype::uint16)
             throw std::runtime_error("only uint8 & uint16 is currently supported for zarr datasets incompatible type found in "+path_.string()+" / " +c.path);
 

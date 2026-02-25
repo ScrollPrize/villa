@@ -69,17 +69,17 @@ const std::string& dtypeToName(Datatype dt)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Store
+//  Group
 // ─────────────────────────────────────────────────────────────────────────────
 
-Store::Store(std::filesystem::path root) : path_(std::move(root)) {}
+Group::Group(std::filesystem::path root) : path_(std::move(root)) {}
 
-Store::Store(const Store& parent, const std::string& child)
+Group::Group(const Group& parent, const std::string& child)
     : path_(parent.path_ / child) {}
 
-bool Store::exists() const { return std::filesystem::exists(path_); }
+bool Group::exists() const { return std::filesystem::exists(path_); }
 
-std::vector<std::string> Store::keys() const
+std::vector<std::string> Group::keys() const
 {
     std::vector<std::string> out;
     if (!std::filesystem::exists(path_)) return out;
@@ -90,7 +90,7 @@ std::vector<std::string> Store::keys() const
     return out;
 }
 
-nlohmann::json Store::readAttrs() const
+nlohmann::json Group::readAttrs() const
 {
     auto p = path_ / ".zattrs";
     if (!std::filesystem::exists(p)) return nlohmann::json{};
@@ -100,7 +100,7 @@ nlohmann::json Store::readAttrs() const
     return j;
 }
 
-void Store::writeAttrs(const nlohmann::json& j) const
+void Group::writeAttrs(const nlohmann::json& j) const
 {
     auto p = path_ / ".zattrs";
     nlohmann::json existing;
@@ -114,28 +114,28 @@ void Store::writeAttrs(const nlohmann::json& j) const
     f << existing;
 }
 
-Store Store::create(const std::filesystem::path& path, bool overwrite)
+Group Group::create(const std::filesystem::path& path, bool overwrite)
 {
     if (std::filesystem::exists(path)) {
         if (overwrite)
             std::filesystem::remove_all(path);
         else if (std::filesystem::exists(path / ".zgroup"))
-            return Store(path);  // already a zarr store
+            return Group(path);  // already a zarr group
     }
     std::filesystem::create_directories(path);
     // Write .zgroup marker
     std::ofstream f(path / ".zgroup");
     f << R"({"zarr_format":2})" << std::endl;
-    return Store(path);
+    return Group(path);
 }
 
-Store Store::createGroup(const std::string& name) const
+Group Group::createGroup(const std::string& name) const
 {
     auto p = path_ / name;
     std::filesystem::create_directories(p);
     std::ofstream f(p / ".zgroup");
     f << R"({"zarr_format":2})" << std::endl;
-    return Store(p);
+    return Group(p);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -255,7 +255,7 @@ std::unique_ptr<Dataset> Dataset::openImpl(const std::filesystem::path& dsPath,
     return ds;
 }
 
-std::unique_ptr<Dataset> Dataset::open(const Store& parent, const std::string& name)
+std::unique_ptr<Dataset> Dataset::open(const Group& parent, const std::string& name)
 {
     return openImpl(parent.path() / name, "");
 }
@@ -265,14 +265,14 @@ std::unique_ptr<Dataset> Dataset::open(const std::filesystem::path& dsPath)
     return openImpl(dsPath, "");
 }
 
-std::unique_ptr<Dataset> Dataset::open(const Store& parent, const std::string& name,
+std::unique_ptr<Dataset> Dataset::open(const Group& parent, const std::string& name,
                                        const std::string& dimSeparator)
 {
     return openImpl(parent.path() / name, dimSeparator);
 }
 
 std::unique_ptr<Dataset> Dataset::create(
-    const Store& parent, const std::string& name,
+    const Group& parent, const std::string& name,
     const std::string& dtype, const ShapeType& shape, const ShapeType& chunks,
     const std::string& compressor, const nlohmann::json& compOpts,
     double fillValue, const std::string& dimSeparator)

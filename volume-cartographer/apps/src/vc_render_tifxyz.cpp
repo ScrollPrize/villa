@@ -1023,7 +1023,7 @@ int main(int argc, char *argv[])
     }
 
     // --- Open source volume ---
-    vc::zarr::Store group(vol_path);
+    vc::zarr::Group group(vol_path);
     auto ds = vc::zarr::Dataset::open(group, std::to_string(group_idx),
         json::parse(std::ifstream(vol_path/std::to_string(group_idx)/".zarray")).value<std::string>("dimension_separator","."));
     {
@@ -1169,7 +1169,7 @@ int main(int argc, char *argv[])
         size_t baseZ = isCompositeMode ? 1 : size_t(std::max(1, num_slices));
         std::vector<size_t> chunks0;
         std::unique_ptr<vc::zarr::Dataset> dsOut;
-        vc::zarr::Store outFile(wantZarr ? zarrOutputArg : "/dev/null");
+        vc::zarr::Group outFile(wantZarr ? zarrOutputArg : "/dev/null");
         size_t tilesYSrc = 0, tilesXSrc = 0;
 
         if (wantZarr) {
@@ -1177,7 +1177,7 @@ int main(int argc, char *argv[])
             if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(zarrXY.width, zarrXY.height);
             size_t baseY = zarrXY.height, baseX = zarrXY.width;
 
-            outFile = vc::zarr::Store(zarrOutputArg);
+            outFile = vc::zarr::Group(zarrOutputArg);
             std::vector<size_t> shape0 = {baseZ, baseY, baseX};
             chunks0 = {shape0[0], std::min(CH, shape0[1]), std::min(CW, shape0[2])};
             json compOpts = {{"cname","zstd"},{"clevel",1},{"shuffle",0}};
@@ -1185,7 +1185,7 @@ int main(int argc, char *argv[])
 
             if (pre_flag) {
                 logPrintf(stdout, "[pre] creating zarr + all levels...\n");
-                outFile = vc::zarr::Store::create(outFile.path(), true);
+                outFile = vc::zarr::Group::create(outFile.path(), true);
                 vc::zarr::Dataset::create(outFile, "0", dtype, shape0, chunks0, "blosc", compOpts);
                 logPrintf(stdout, "[pre] L0 shape: [%zu,%zu,%zu]\n", shape0[0], shape0[1], shape0[2]);
                 if (wantPyramid)
@@ -1205,7 +1205,7 @@ int main(int argc, char *argv[])
                 dsOut = vc::zarr::Dataset::open(outFile, "0");
                 logPrintf(stdout, "[resume] opening existing zarr\n");
             } else {
-                outFile = vc::zarr::Store::create(outFile.path(), true);
+                outFile = vc::zarr::Group::create(outFile.path(), true);
                 dsOut = vc::zarr::Dataset::create(outFile, "0", dtype, shape0, chunks0, "blosc", compOpts);
             }
 

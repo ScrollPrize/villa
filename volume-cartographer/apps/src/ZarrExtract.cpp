@@ -58,7 +58,7 @@ void timed_plane_slice(Surface &plane, vc::zarr::Dataset *ds, int size, ChunkCac
 int main(int argc, char *argv[])
 {
   assert(argc == 2 || argc == 3);
-  vc::zarr::Store group(argv[1]);
+  vc::zarr::Group group(argv[1]);
   std::unique_ptr<vc::zarr::Dataset> ds = vc::zarr::Dataset::open(group, "1", "/");
 
    bool nearest_neighbor =  (argc == 3 && strncmp(argv[2],"nearest",7) == 0);

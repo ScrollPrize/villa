@@ -119,7 +119,7 @@ int continuous3d_main(const po::variables_map& vm) {
 
     std::cout << "Found point " << *target_point << " for winding " << target_winding << std::endl;
 
-    vc::zarr::Store group_handle(volume_path);
+    vc::zarr::Group group_handle(volume_path);
     std::unique_ptr<vc::zarr::Dataset> ds = vc::zarr::Dataset::open(group_handle, dataset_name);
     if (!ds) {
         std::cerr << "Error: Could not open dataset '" << dataset_name << "' in volume '" << volume_path << "'." << std::endl;

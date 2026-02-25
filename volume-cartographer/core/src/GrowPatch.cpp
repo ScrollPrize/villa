@@ -2837,7 +2837,7 @@ QuadSurface *tracer(vc::zarr::Dataset *ds, float scale, ChunkCache<uint8_t> *cac
 
             // Assert the direction-field was aligned by vc_ngrids --align-normals.
             try {
-                vc::zarr::Store rootStore(zarr_root);
+                vc::zarr::Group rootStore(zarr_root);
                 nlohmann::json attrs = rootStore.readAttrs();
                 const bool aligned = attrs.value("align_normals", false);
                 if (!aligned) {
@@ -2853,8 +2853,8 @@ QuadSurface *tracer(vc::zarr::Dataset *ds, float scale, ChunkCache<uint8_t> *cac
             const int vol_y = static_cast<int>(vol_shape_zyx.at(1));
             const int vol_x = static_cast<int>(vol_shape_zyx.at(2));
 
-            vc::zarr::Store dirs_group(zarr_root);
-            vc::zarr::Store x_group(dirs_group, "x");
+            vc::zarr::Group dirs_group(zarr_root);
+            vc::zarr::Group x_group(dirs_group, "x");
             auto x_ds = vc::zarr::Dataset::open(x_group, "0", delim);
             const auto nshape = x_ds->shape();
             if (nshape.size() != 3) {
@@ -2893,7 +2893,7 @@ QuadSurface *tracer(vc::zarr::Dataset *ds, float scale, ChunkCache<uint8_t> *cac
 
             std::vector<std::unique_ptr<vc::zarr::Dataset>> dss;
             for (auto dim : std::string("xyz")) {
-                vc::zarr::Store dim_group(dirs_group, std::string(&dim, 1));
+                vc::zarr::Group dim_group(dirs_group, std::string(&dim, 1));
                 dss.push_back(vc::zarr::Dataset::open(dim_group, std::to_string(scale_level), delim));
             }
 
@@ -2903,10 +2903,10 @@ QuadSurface *tracer(vc::zarr::Dataset *ds, float scale, ChunkCache<uint8_t> *cac
             // Optional normal-fit diagnostics (written by vc_ngrids) to modulate loss weights.
             // Expected layout: <root>/fit_rms/0 and <root>/fit_frac_short_paths/0 (uint8, ZYX).
             try {
-                vc::zarr::Store g_rms(dirs_group, "fit_rms");
+                vc::zarr::Group g_rms(dirs_group, "fit_rms");
                 auto ds_rms = vc::zarr::Dataset::open(g_rms, std::to_string(scale_level), delim);
 
-                vc::zarr::Store g_frac(dirs_group, "fit_frac_short_paths");
+                vc::zarr::Group g_frac(dirs_group, "fit_frac_short_paths");
                 auto ds_frac = vc::zarr::Dataset::open(g_frac, std::to_string(scale_level), delim);
 
                 trace_data.normal3d_fit_quality = std::make_unique<NormalFitQualityWeightField>(

@@ -406,7 +406,7 @@ int main(int argc, char *argv[])
     const nlohmann::json params = nlohmann::json::parse(params_f);
     const RefinementConfig cfg = parse_config(params);
 
-    vc::zarr::Store group(vol_path.string());
+    vc::zarr::Group group(vol_path.string());
     std::unique_ptr<vc::zarr::Dataset> ds = vc::zarr::Dataset::open(group, cfg.dataset_group, "/");
 
     std::cout << "zarr dataset size for scale group " << cfg.dataset_group << " " << ds->shape() << std::endl;

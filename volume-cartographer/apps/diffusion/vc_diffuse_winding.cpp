@@ -175,7 +175,7 @@ int main(int argc, char** argv) {
     std::cout << "Found umbilicus point at: " << *umbilicus_point << std::endl;
 
     // Load volume data using zarr and ChunkedTensor
-    vc::zarr::Store group_handle(volume_path);
+    vc::zarr::Group group_handle(volume_path);
     std::unique_ptr<vc::zarr::Dataset> ds = vc::zarr::Dataset::open(group_handle, dataset_name);
     if (!ds) {
         std::cerr << "Error: Could not open dataset '" << dataset_name << "' in volume '" << volume_path << "'." << std::endl;

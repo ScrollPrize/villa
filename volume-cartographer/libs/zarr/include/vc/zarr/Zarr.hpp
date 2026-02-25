@@ -44,16 +44,16 @@ Datatype dtypeFromName(const std::string& name);
 const std::string& dtypeToName(Datatype dt);
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Store  (replaces z5::filesystem::handle::File / Group / Dataset handles)
+//  Group  (zarr group node — container with .zgroup marker and .zattrs)
 // ─────────────────────────────────────────────────────────────────────────────
 
-class Store {
+class Group {
 public:
-    /// Open an existing store rooted at `root`.
-    explicit Store(std::filesystem::path root);
+    /// Open an existing group rooted at `root`.
+    explicit Group(std::filesystem::path root);
 
-    /// Create a child store (sub-group).
-    Store(const Store& parent, const std::string& child);
+    /// Create a child group handle (sub-group).
+    Group(const Group& parent, const std::string& child);
 
     const std::filesystem::path& path() const { return path_; }
     bool exists() const;
@@ -67,11 +67,11 @@ public:
     /// Write .zattrs (merges into existing).
     void writeAttrs(const nlohmann::json& j) const;
 
-    /// Create a new store directory + .zgroup marker. Returns the store.
-    static Store create(const std::filesystem::path& path, bool overwrite = false);
+    /// Create a new group directory + .zgroup marker. Returns the group.
+    static Group create(const std::filesystem::path& path, bool overwrite = false);
 
     /// Create a child group with .zgroup marker.
-    Store createGroup(const std::string& name) const;
+    Group createGroup(const std::string& name) const;
 
 private:
     std::filesystem::path path_;
@@ -112,21 +112,21 @@ public:
 
     // --- Open existing ---
 
-    /// Open by parent store + name (auto-detects dimSeparator from .zarray).
-    static std::unique_ptr<Dataset> open(const Store& parent, const std::string& name);
+    /// Open by parent group + name (auto-detects dimSeparator from .zarray).
+    static std::unique_ptr<Dataset> open(const Group& parent, const std::string& name);
 
     /// Open by absolute path (auto-detects dimSeparator from .zarray).
     static std::unique_ptr<Dataset> open(const std::filesystem::path& dsPath);
 
     /// Open with explicit dimSeparator (skips re-reading .zarray for separator).
-    static std::unique_ptr<Dataset> open(const Store& parent, const std::string& name,
+    static std::unique_ptr<Dataset> open(const Group& parent, const std::string& name,
                                          const std::string& dimSeparator);
 
     // --- Create new ---
 
     /// Create a new dataset. `compOpts` is {"cname":"zstd","clevel":1,"shuffle":0}.
     static std::unique_ptr<Dataset> create(
-        const Store& parent, const std::string& name,
+        const Group& parent, const std::string& name,
         const std::string& dtype, const ShapeType& shape, const ShapeType& chunks,
         const std::string& compressor, const nlohmann::json& compOpts,
         double fillValue = 0, const std::string& dimSeparator = ".");

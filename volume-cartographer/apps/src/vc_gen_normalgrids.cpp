@@ -264,7 +264,7 @@ void run_generate(const po::variables_map& vm) {
     std::cout << "Input Zarr path: " << input_path << std::endl;
     std::cout << "Output directory: " << output_path << std::endl;
 
-    vc::zarr::Store group_handle(input_path);
+    vc::zarr::Group group_handle(input_path);
     std::unique_ptr<vc::zarr::Dataset> ds = vc::zarr::Dataset::open(group_handle, "0");
     if (!ds) {
         std::cerr << "Error: Could not open dataset '0' in volume '" << input_path << "'." << std::endl;

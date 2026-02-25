@@ -10,7 +10,7 @@
 // Forward declarations
 namespace vc::zarr {
     class Dataset;
-    class Store;
+    class Group;
 }
 
 class Volume
@@ -58,9 +58,9 @@ protected:
     int _height{0};
     int _slices{0};
 
-    std::unique_ptr<vc::zarr::Store> zarrStore_;
+    std::unique_ptr<vc::zarr::Group> zarrRoot_;
     std::vector<std::unique_ptr<vc::zarr::Dataset>> zarrDs_;
-    nlohmann::json zarrGroup_;
+    nlohmann::json zarrAttrs_;
     void zarrOpen();
 
     void loadMetadata();
