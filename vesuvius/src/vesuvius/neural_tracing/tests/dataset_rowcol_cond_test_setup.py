@@ -305,6 +305,7 @@ def _build_dataset(*, patch: ChunkPatch, augmentation, use_triplet_wrap_displace
     ds = EdtSegDataset(
         config=config,
         apply_augmentation=True,
+        apply_perturbation=False,
         patch_metadata=metadata,
     )
     ds._augmentations = augmentation

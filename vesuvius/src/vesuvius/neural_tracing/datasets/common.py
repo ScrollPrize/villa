@@ -222,14 +222,13 @@ def _validate_result_tensors(result: dict, idx: int, enabled: bool):
     return True
 
 
-def _should_attempt_cond_local_perturb(config: dict, apply_augmentation: bool = True) -> bool:
+def _should_attempt_cond_local_perturb(config: dict, apply_perturbation: bool = True) -> bool:
     cfg = dict(config["cond_local_perturb"] or {})
     if not bool(cfg["enabled"]):
         return False
     if float(cfg["probability"]) <= 0.0:
         return False
-    apply_without_aug = bool(cfg["apply_without_augmentation"])
-    if (not bool(apply_augmentation)) and (not apply_without_aug):
+    if not bool(apply_perturbation):
         return False
     return True
 

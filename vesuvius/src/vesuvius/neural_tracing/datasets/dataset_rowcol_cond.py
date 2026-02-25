@@ -57,10 +57,12 @@ class EdtSegDataset(Dataset):
             self,
             config,
             apply_augmentation: bool = True,
+            apply_perturbation: bool = True,
             patch_metadata=None
     ):
         self.config = config
         self.apply_augmentation = apply_augmentation
+        self.apply_perturbation = bool(apply_perturbation)
 
         crop_size_cfg = config.get('crop_size', 128)
         if isinstance(crop_size_cfg, (list, tuple)):
@@ -104,7 +106,7 @@ class EdtSegDataset(Dataset):
             self._augmentations = None
         self._cond_local_perturb_active = _should_attempt_cond_local_perturb(
             config=self.config,
-            apply_augmentation=bool(getattr(self, "apply_augmentation", True)),
+            apply_perturbation=bool(self.apply_perturbation),
         )
 
         self.sample_mode = str(config['sample_mode']).lower()
@@ -389,7 +391,7 @@ class EdtSegDataset(Dataset):
         perturbed_surface = maybe_perturb_conditioning_surface(
             surface_np,
             config=self.config,
-            apply_augmentation=bool(getattr(self, "apply_augmentation", True)),
+            apply_perturbation=bool(self.apply_perturbation),
         )
         if perturbed_surface is surface_np:
             return cond_seg_gt.clone()
@@ -978,7 +980,7 @@ class EdtSegDataset(Dataset):
                 "_cond_local_perturb_active",
                 _should_attempt_cond_local_perturb(
                     config=self.config,
-                    apply_augmentation=bool(getattr(self, "apply_augmentation", True)),
+                    apply_perturbation=bool(self.apply_perturbation),
                 ),
             )
         )

@@ -63,7 +63,6 @@
     "cond_local_perturb": {
         "enabled": true,
         "probability": 0.75,
-        "apply_without_augmentation": false,
         "num_blobs": [1, 6],
         "points_affected": 250,
         "amplitude_range": [1.0, 4.0],

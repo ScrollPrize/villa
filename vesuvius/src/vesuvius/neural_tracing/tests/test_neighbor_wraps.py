@@ -94,7 +94,12 @@ def triplet_real343p_dataset(tmp_path_factory):
     orig_fn = rowcol_dataset_module.find_world_chunk_patches
     rowcol_dataset_module.find_world_chunk_patches = _find_world_chunk_patches_no_cache
     try:
-        ds = EdtSegDataset(config=config, apply_augmentation=False, patch_metadata=None)
+        ds = EdtSegDataset(
+            config=config,
+            apply_augmentation=False,
+            apply_perturbation=False,
+            patch_metadata=None,
+        )
     finally:
         rowcol_dataset_module.find_world_chunk_patches = orig_fn
     return ds

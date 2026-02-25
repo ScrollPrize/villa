@@ -80,7 +80,12 @@ def _build_filter_only_dataset() -> EdtSegDataset:
         "sample_mode": "wrap",
         "use_triplet_wrap_displacement": True,
     }
-    return EdtSegDataset(config=config, apply_augmentation=False, patch_metadata=patch_metadata)
+    return EdtSegDataset(
+        config=config,
+        apply_augmentation=False,
+        apply_perturbation=False,
+        patch_metadata=patch_metadata,
+    )
 
 
 def _build_chunk(chunk_id, wrap_specs, segments_by_name):

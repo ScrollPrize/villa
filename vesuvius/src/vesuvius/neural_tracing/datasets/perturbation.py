@@ -32,12 +32,11 @@ def compute_surface_normals(surface_zyxs: np.ndarray) -> np.ndarray:
 def maybe_perturb_conditioning_surface(
     cond_zyxs: np.ndarray,
     config: Mapping[str, Any],
-    apply_augmentation: bool,
+    apply_perturbation: bool,
 ) -> np.ndarray:
     """Apply local normal-direction pushes with Gaussian falloff on small regions."""
     cfg = config.get("cond_local_perturb", {})
-    apply_without_aug = bool(cfg.get("apply_without_augmentation", False))
-    if (not apply_augmentation and not apply_without_aug) or not cfg.get("enabled", True):
+    if (not apply_perturbation) or (not cfg.get("enabled", True)):
         return cond_zyxs
     if random.random() >= float(cfg.get("probability", 0.35)):
         return cond_zyxs

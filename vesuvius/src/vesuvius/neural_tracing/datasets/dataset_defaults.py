@@ -69,7 +69,6 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     cond_local_perturb.setdefault("amplitude_range", [0.25, 1.25])
     cond_local_perturb.setdefault("radius_sigma_mult", 2.5)
     cond_local_perturb.setdefault("max_total_displacement", 6.0)
-    cond_local_perturb.setdefault("apply_without_augmentation", False)
     config["cond_local_perturb"] = cond_local_perturb
 
     config.setdefault("rbf_downsample_factor", 4)

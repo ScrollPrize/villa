@@ -482,7 +482,7 @@ def train(config_path):
     if config.get('force_recompute_patches', False):
         if accelerator.is_main_process:
             accelerator.print("force_recompute_patches=True: recomputing patch cache once on main process...")
-            _recompute_ds = EdtSegDataset(config, apply_augmentation=False)
+            _recompute_ds = EdtSegDataset(config, apply_augmentation=False, apply_perturbation=False)
             del _recompute_ds
             accelerator.print("Patch cache recompute complete.")
         accelerator.wait_for_everyone()
@@ -490,17 +490,26 @@ def train(config_path):
         config['force_recompute_patches'] = False
 
     # Train with augmentation, val without
-    train_dataset = EdtSegDataset(config, apply_augmentation=True)
+    train_dataset = EdtSegDataset(config, apply_augmentation=True, apply_perturbation=True)
     patch_metadata = train_dataset.export_patch_metadata()
-    val_dataset = EdtSegDataset(config, apply_augmentation=False, patch_metadata=patch_metadata)
+    val_dataset = EdtSegDataset(
+        config,
+        apply_augmentation=False,
+        apply_perturbation=False,
+        patch_metadata=patch_metadata,
+    )
     val_pert_dataset = None
     if config.get('eval_perturbed_val', False):
         val_pert_config = copy.deepcopy(config)
         val_pert_cfg = dict(val_pert_config.get('cond_local_perturb') or {})
         val_pert_cfg['enabled'] = True
-        val_pert_cfg['apply_without_augmentation'] = True
         val_pert_config['cond_local_perturb'] = val_pert_cfg
-        val_pert_dataset = EdtSegDataset(val_pert_config, apply_augmentation=False, patch_metadata=patch_metadata)
+        val_pert_dataset = EdtSegDataset(
+            val_pert_config,
+            apply_augmentation=False,
+            apply_perturbation=True,
+            patch_metadata=patch_metadata,
+        )
 
     # Train/val split by indices
     num_patches = len(train_dataset)
