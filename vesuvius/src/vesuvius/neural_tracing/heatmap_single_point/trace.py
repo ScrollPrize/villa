@@ -8,7 +8,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from datetime import datetime
 
-from vesuvius.neural_tracing.models import make_model, load_checkpoint
+from vesuvius.neural_tracing.nets.models import make_model, load_checkpoint
 from vesuvius.neural_tracing.infer import Inference
 from vesuvius.neural_tracing.heatmap_single_point.tifxyz import save_tifxyz, get_area
 

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
-from vesuvius.neural_tracing.youssef_mae import Vesuvius3dViTModel
+from vesuvius.neural_tracing.nets.youssef_mae import Vesuvius3dViTModel
 
 try:
     from huggingface_hub import snapshot_download

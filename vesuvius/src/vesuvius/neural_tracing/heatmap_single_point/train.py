@@ -17,7 +17,7 @@ from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper, 
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.loss.deep_supervision import _resize_for_ds, _compute_ds_weights
-from vesuvius.neural_tracing.models import make_model, strip_state, resolve_checkpoint_path
+from vesuvius.neural_tracing.nets.models import make_model, strip_state, resolve_checkpoint_path
 from vesuvius.neural_tracing.heatmap_single_point.cropping import safe_crop_with_padding, transform_to_first_crop_space
 from vesuvius.models.training.loss.losses import CosineSimilarityLoss
 from vesuvius.neural_tracing.heatmap_single_point.visualization import make_canvas, print_training_config

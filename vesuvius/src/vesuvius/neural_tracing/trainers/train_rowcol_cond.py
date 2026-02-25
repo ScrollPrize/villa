@@ -34,7 +34,7 @@ from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
 from vesuvius.models.training.loss.skeleton_recall import DC_SkelREC_and_CE_loss
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
-from vesuvius.neural_tracing.models import make_model
+from vesuvius.neural_tracing.nets.models import make_model
 from vesuvius.neural_tracing.trainers.rowcol_cond_visualization import (
     make_dense_visualization,
     make_visualization,

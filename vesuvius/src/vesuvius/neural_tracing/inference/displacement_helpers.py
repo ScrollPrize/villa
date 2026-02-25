@@ -4,7 +4,7 @@ from datetime import datetime
 import torch
 
 from vesuvius.neural_tracing.inference.displacement_tta import run_model_tta
-from vesuvius.neural_tracing.models import load_checkpoint, resolve_checkpoint_path
+from vesuvius.neural_tracing.nets.models import load_checkpoint, resolve_checkpoint_path
 
 
 def predict_displacement(args, model_state, model_inputs, use_tta=None, profiler=None):

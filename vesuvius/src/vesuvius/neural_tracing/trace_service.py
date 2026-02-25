@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from vesuvius.neural_tracing.infer import Inference
-from vesuvius.neural_tracing.models import load_checkpoint
+from vesuvius.neural_tracing.nets.models import load_checkpoint
 
 HEATMAP_REQUEST_TYPE = "heatmap_next_points"
 DENSE_REQUEST_TYPE = "dense_displacement_grow"

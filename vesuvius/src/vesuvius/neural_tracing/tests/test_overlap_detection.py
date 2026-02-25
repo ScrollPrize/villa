@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 
 import vesuvius.neural_tracing.datasets.dataset_rowcol_cond as rowcol_dataset_module
-from pherc0139_overlap_test_utils import (
+from overlap_test_utils import (
     PARENT_WRAP_NAMES,
     PHERC0139_ROOT,
     cutout_name_map,
