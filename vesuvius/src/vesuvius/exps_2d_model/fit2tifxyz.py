@@ -115,7 +115,7 @@ def _apply_global_transform_from_state_dict(*, uv: torch.Tensor, st: dict) -> to
 	return torch.cat([x, y], dim=1)
 
 
-def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray, scale: float, model_source: Path | None = None, copy_model: bool = False) -> None:
+def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray, scale: float, model_source: Path | None = None, copy_model: bool = False, fit_config: dict | None = None) -> None:
 	out_dir.mkdir(parents=True, exist_ok=True)
 	if x.shape != y.shape or x.shape != z.shape:
 		raise ValueError("x/y/z must have identical shapes")
@@ -140,6 +140,8 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		meta["model_source"] = str(model_source)
 	else:
 		meta.pop("model_source", None)
+	if fit_config is not None:
+		meta["fit_config"] = fit_config
 	(out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 	tifffile.imwrite(str(out_dir / "x.tif"), xf, compression="lzw")
 	tifffile.imwrite(str(out_dir / "y.tif"), yf, compression="lzw")
@@ -182,6 +184,9 @@ def main(argv: list[str] | None = None) -> int:
 	model_params = st.get("_model_params_", None)
 	if not isinstance(model_params, dict):
 		model_params = None
+	fit_config = st.get("_fit_config_", None)
+	if not isinstance(fit_config, dict):
+		fit_config = None
 
 	if model_params is not None:
 		c6_full = model_params.get("crop_fullres_xyzwhd", None)
@@ -342,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
 
 		seg_name = cfg.output_name if cfg.output_name else f"{cfg.prefix}.tifxyz"
 		out_dir = out_base / seg_name
-		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model)
+		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config)
 		if model_params is not None:
 			(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 		if mask_all is not None:
@@ -353,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
 			y = xy_lr[idx_z_a, :, wi, 1]
 			x, y, z_use, mask = _apply_crop_mask(x, y, z_grid)
 			out_dir = out_base / f"{cfg.prefix}{wi:04d}.tifxyz"
-			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z_use, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model)
+			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z_use, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config)
 			if model_params is not None:
 				(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 			if mask is not None:

@@ -54,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
 	cfg_paths, argv_rest = cli_json.split_cfg_argv(argv_cfg_scan)
 	cfg_paths = [str(x) for x in cfg_paths]
 	cfg = cli_json.merge_cfgs(cfg_paths)
+	fit_config = dict(cfg)  # snapshot before pops; saved into checkpoint
 	cli_json.apply_defaults_from_cfg_args(parser, cfg)
 	args = parser.parse_args((argv_rest or []) + points_argv)
 
@@ -497,6 +498,7 @@ def main(argv: list[str] | None = None) -> int:
 		p = out_snap / f"model_{stage}_{step:06d}.pt"
 		st = dict(mdl.state_dict())
 		st["_model_params_"] = asdict(mdl.params)
+		st["_fit_config_"] = fit_config
 		torch.save(st, str(p))
 
 	def _save_model_output_final() -> None:
@@ -504,6 +506,7 @@ def main(argv: list[str] | None = None) -> int:
 			return
 		st = dict(mdl.state_dict())
 		st["_model_params_"] = asdict(mdl.params)
+		st["_fit_config_"] = fit_config
 		torch.save(st, str(model_cfg.model_output))
 
 	_save_model_snapshot(stage="init", step=0)
