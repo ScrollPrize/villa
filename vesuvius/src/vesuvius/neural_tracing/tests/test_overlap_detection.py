@@ -2,7 +2,7 @@ from pathlib import Path
 
 import numpy as np
 
-import vesuvius.neural_tracing.datasets.dataset_rowcol_cond as rowcol_dataset_module
+import vesuvius.neural_tracing.datasets.common as common_module
 from overlap_test_utils import (
     PARENT_WRAP_NAMES,
     PHERC0139_ROOT,
@@ -12,7 +12,7 @@ from overlap_test_utils import (
     probe_mask,
     projected_bbox_2d,
 )
-from vesuvius.neural_tracing.datasets.common import ChunkPatch
+from vesuvius.neural_tracing.datasets.common import ChunkPatch, _filter_triplet_overlap_chunks
 from vesuvius.neural_tracing.datasets.dataset_defaults import (
     setdefault_rowcol_cond_dataset_config,
     validate_rowcol_cond_dataset_config,
@@ -142,7 +142,7 @@ def test_dataset_triplet_overlap_filter_drops_overlap_chunks_keeps_no_overlap_ch
         ),
     ]
 
-    original_imread = rowcol_dataset_module.tifffile.imread
+    original_imread = common_module.tifffile.imread
     mask_image_by_path = {}
     for parent_name, mask in parent_masks.items():
         path = (PHERC0139_ROOT / parent_name / "overlap_mask.tif").resolve()
@@ -154,10 +154,9 @@ def test_dataset_triplet_overlap_filter_drops_overlap_chunks_keeps_no_overlap_ch
             return mask_image_by_path[key]
         return original_imread(path, *args, **kwargs)
 
-    monkeypatch.setattr(rowcol_dataset_module.tifffile, "imread", _imread_override)
+    monkeypatch.setattr(common_module.tifffile, "imread", _imread_override)
 
-    kept = dataset._filter_triplet_overlap_chunks(patches)
+    kept, kept_indices = _filter_triplet_overlap_chunks(patches, config=dataset.config)
     kept_chunk_ids = [tuple(p.chunk_id) for p in kept]
     assert kept_chunk_ids == [(2, 0, 0)]
-
-    assert dataset._triplet_overlap_kept_indices == (2,)
+    assert kept_indices == (2,)
