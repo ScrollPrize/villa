@@ -227,7 +227,6 @@ class EdtSegDataset(Dataset):
         mask_filename = str(self.config["triplet_overlap_mask_filename"])
         warn_missing_masks = bool(self.config["triplet_warn_missing_overlap_masks"])
         warned_missing = set()
-        warned_load_fail = set()
         kept = []
         kept_indices = []
 
@@ -251,25 +250,7 @@ class EdtSegDataset(Dataset):
                         )
                     continue
 
-                try:
-                    overlap_mask = tifffile.imread(str(mask_path))
-                    overlap_mask = np.asarray(overlap_mask)
-                    if overlap_mask.ndim > 2:
-                        overlap_mask = np.squeeze(overlap_mask)
-                    if overlap_mask.ndim != 2:
-                        raise ValueError(
-                            f"Expected 2D overlap mask, got shape {overlap_mask.shape} at {mask_path}"
-                        )
-                    overlap_mask = overlap_mask > 0
-                except Exception as exc:
-                    if warn_missing_masks and mask_key not in warned_load_fail:
-                        warned_load_fail.add(mask_key)
-                        warnings.warn(
-                            f"Failed to load triplet overlap mask at {mask_path}: {exc}; "
-                            "treating as no-overlap for this wrap.",
-                            RuntimeWarning,
-                        )
-                    continue
+                overlap_mask = np.asarray(tifffile.imread(str(mask_path))) > 0
 
                 if _wrap_bbox_has_overlap(overlap_mask, wrap["bbox_2d"]):
                     drop_chunk = True
