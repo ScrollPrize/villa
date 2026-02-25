@@ -112,27 +112,12 @@ class EdtSegDataset(Dataset):
                 scaled_segments = []
                 dropped_by_z_range = 0
                 for i, seg in enumerate(dataset_segments):
-                    if i == 0:
-                        if config['verbose']:
-                            print(f"  [DEBUG PRE-RETARGET] seg._scale={seg._scale}, shape={seg._z.shape}")
-                            print(f"  [DEBUG PRE-RETARGET] z range: {seg._z[seg._valid_mask].min():.2f} to {seg._z[seg._valid_mask].max():.2f}")
                     seg_scaled = seg.retarget(retarget_factor)
-                    if i == 0:
-                        if config['verbose']:
-                            print(f"  [DEBUG POST-RETARGET factor={retarget_factor}] seg._scale={seg_scaled._scale}, shape={seg_scaled._z.shape}")
-                            print(f"  [DEBUG POST-RETARGET] z range: {seg_scaled._z[seg_scaled._valid_mask].min():.2f} to {seg_scaled._z[seg_scaled._valid_mask].max():.2f}")
                     if not _segment_overlaps_z_range(seg_scaled, z_range):
                         dropped_by_z_range += 1
                         continue
                     seg_scaled.volume = volume
                     scaled_segments.append(seg_scaled)
-
-                if z_range is not None and config.get('verbose', False):
-                    print(
-                        "  [DEBUG Z FILTER] "
-                        f"dataset_idx={dataset_idx}, z_range={z_range}, "
-                        f"kept={len(scaled_segments)}, dropped={dropped_by_z_range}"
-                    )
 
                 if not scaled_segments:
                     warnings.warn(
@@ -155,14 +140,6 @@ class EdtSegDataset(Dataset):
                     float(config['edge_touch_min_count']) * count_scale_sq
                 )))
 
-                if config.get('verbose', False):
-                    print(
-                        "  [DEBUG PATCH COUNTS] "
-                        f"volume_scale={volume_scale}, ref_scale={ref_scale}, "
-                        f"count_scale_sq={count_scale_sq:.3f}, "
-                        f"min_points_per_wrap={min_points_per_wrap}, "
-                        f"edge_touch_min_count={edge_touch_min_count}"
-                    )
 
                 cache_dir = Path(segments_path) / ".patch_cache" if segments_path else None
                 chunk_results = find_world_chunk_patches(
