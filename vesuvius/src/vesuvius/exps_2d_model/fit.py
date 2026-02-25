@@ -54,7 +54,8 @@ def main(argv: list[str] | None = None) -> int:
 	cfg_paths, argv_rest = cli_json.split_cfg_argv(argv_cfg_scan)
 	cfg_paths = [str(x) for x in cfg_paths]
 	cfg = cli_json.merge_cfgs(cfg_paths)
-	fit_config = dict(cfg)  # snapshot before pops; saved into checkpoint
+	import copy
+	fit_config = copy.deepcopy(cfg)  # snapshot before pops; saved into checkpoint
 	cli_json.apply_defaults_from_cfg_args(parser, cfg)
 	args = parser.parse_args((argv_rest or []) + points_argv)
 

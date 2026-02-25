@@ -546,6 +546,14 @@ class DilationMaskState:
 		mask_y = max(0, min(mask_h - 1, round(y_px / mesh_step_px)))
 		mask_zi = max(0, min(mask_z - 1, round(zi / scaledown)))
 		self.mask[mask_zi, 0, mask_y, mask_x] = 1.0
+		self._step = 0
+
+		print(f"[dilation_mask] init: z_size={z_size} h_img={h_img} w_img={w_img} "
+			  f"mesh_step_px={mesh_step_px} scaledown={scaledown}")
+		print(f"[dilation_mask] mask grid: z={mask_z} h={mask_h} w={mask_w} "
+			  f"(1 mask voxel = {mesh_step_px}px XY, {scaledown} slices Z)")
+		print(f"[dilation_mask] seed: mask_zi={mask_zi} mask_y={mask_y} mask_x={mask_x} "
+			  f"(from zi={zi} x_px={x_px:.1f} y_px={y_px:.1f})")
 
 		self.blurred = self._recompute_blurred()
 
@@ -565,6 +573,7 @@ class DilationMaskState:
 		self.accum += float(mvx_per_it)
 		n = int(math.floor(self.accum))
 		self.accum -= float(n)
+		self._step += 1
 		if n > 0:
 			ks = 2 * n + 1
 			# Reshape (Z,1,H,W) -> (1,1,Z,H,W) for 3D max_pool
@@ -572,6 +581,13 @@ class DilationMaskState:
 			m5 = self.mask.reshape(1, 1, z, h, w)
 			m5 = F.max_pool3d(m5, kernel_size=ks, stride=1, padding=n)
 			self.mask = m5.reshape(z, 1, h, w)
+			# Coverage: count nonzero per z-slice
+			nz_per_z = (self.mask[:, 0] > 0).sum(dim=(1, 2)).tolist()
+			total_hw = int(h) * int(w)
+			z_active = sum(1 for v in nz_per_z if v > 0)
+			print(f"[dilation_mask] step={self._step} dilated ks={ks} "
+				  f"mask({z},{h},{w}) z_active={z_active}/{z} "
+				  f"nz_per_z={[int(v) for v in nz_per_z]}/{total_hw}")
 		self.blurred = self._recompute_blurred()
 
 	def completed(self, model: fit_model.Model2D) -> float:
