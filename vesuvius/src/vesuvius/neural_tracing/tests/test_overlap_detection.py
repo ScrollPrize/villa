@@ -6,6 +6,7 @@ import vesuvius.neural_tracing.datasets.dataset_rowcol_cond as rowcol_dataset_mo
 from pherc0139_overlap_test_utils import (
     PARENT_WRAP_NAMES,
     PHERC0139_ROOT,
+    cutout_name_map,
     detect_parent_overlap_masks,
     load_parent_tifxyz_segments,
     probe_mask,
@@ -21,10 +22,11 @@ from vesuvius.neural_tracing.datasets.dataset_rowcol_cond import EdtSegDataset
 
 def test_detect_wrap_overlap_masks_marks_overlap_cutouts_and_skips_no_overlap_regions():
     masks = detect_parent_overlap_masks()
+    cutouts = cutout_name_map()
 
     expected_overlap_pairs = {
-        "w018_w019_overlap": ("w018_20260130192417321", "w019_20260203030108447"),
-        "w020_w019_overlap": ("w020_20260219135139420", "w019_20260203030108447"),
+        cutouts["w018_w019_overlap"]: ("w018_20260130192417321", "w019_20260203030108447"),
+        cutouts["w019_w020_overlap"]: ("w020_20260219135139420", "w019_20260203030108447"),
     }
     for cutout_name, parent_names in expected_overlap_pairs.items():
         for parent_name in parent_names:
@@ -37,7 +39,7 @@ def test_detect_wrap_overlap_masks_marks_overlap_cutouts_and_skips_no_overlap_re
                 f"distance_max={stats.max_distance:.4f}"
             )
 
-    no_overlap_cutouts = ("w018_no_overlap", "w019_no_overlap")
+    no_overlap_cutouts = (cutouts["w018_no_overlap"], cutouts["w019_no_overlap"])
     for cutout_name in no_overlap_cutouts:
         for parent_name in PARENT_WRAP_NAMES:
             stats = probe_mask(masks[parent_name], cutout_name, parent_name)
@@ -112,29 +114,30 @@ def test_dataset_triplet_overlap_filter_drops_overlap_chunks_keeps_no_overlap_ch
     parent_masks = detect_parent_overlap_masks()
     segments_by_name = load_parent_tifxyz_segments()
     dataset = _build_filter_only_dataset()
+    cutouts = cutout_name_map()
 
     patches = [
         _build_chunk(
             (0, 0, 0),
             [
-                {"segment_name": "w018_20260130192417321", "cutout_name": "w018_w019_overlap"},
-                {"segment_name": "w019_20260203030108447", "cutout_name": "w018_w019_overlap"},
+                {"segment_name": "w018_20260130192417321", "cutout_name": cutouts["w018_w019_overlap"]},
+                {"segment_name": "w019_20260203030108447", "cutout_name": cutouts["w018_w019_overlap"]},
             ],
             segments_by_name,
         ),
         _build_chunk(
             (1, 0, 0),
             [
-                {"segment_name": "w020_20260219135139420", "cutout_name": "w020_w019_overlap"},
-                {"segment_name": "w019_20260203030108447", "cutout_name": "w020_w019_overlap"},
+                {"segment_name": "w020_20260219135139420", "cutout_name": cutouts["w019_w020_overlap"]},
+                {"segment_name": "w019_20260203030108447", "cutout_name": cutouts["w019_w020_overlap"]},
             ],
             segments_by_name,
         ),
         _build_chunk(
             (2, 0, 0),
             [
-                {"segment_name": "w018_20260130192417321", "cutout_name": "w018_no_overlap"},
-                {"segment_name": "w019_20260203030108447", "cutout_name": "w019_no_overlap"},
+                {"segment_name": "w018_20260130192417321", "cutout_name": cutouts["w018_no_overlap"]},
+                {"segment_name": "w019_20260203030108447", "cutout_name": cutouts["w019_no_overlap"]},
             ],
             segments_by_name,
         ),

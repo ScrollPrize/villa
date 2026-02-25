@@ -16,12 +16,6 @@ PARENT_WRAP_NAMES = (
     "w019_20260203030108447",
     "w020_20260219135139420",
 )
-CUTOUT_WRAP_NAMES = (
-    "w018_no_overlap",
-    "w019_no_overlap",
-    "w018_w019_overlap",
-    "w020_w019_overlap",
-)
 
 
 @dataclass(frozen=True)
@@ -34,6 +28,36 @@ class ProbeStats:
     max_distance: float
 
 
+def _resolve_existing_name(candidates: tuple[str, ...]) -> str:
+    for name in candidates:
+        if (PHERC0139_ROOT / name).is_dir():
+            return name
+    raise FileNotFoundError(
+        f"None of the expected cutout directories exist under {PHERC0139_ROOT}: {candidates}"
+    )
+
+
+@lru_cache(maxsize=1)
+def cutout_name_map() -> dict[str, str]:
+    return {
+        "w018_no_overlap": _resolve_existing_name(("w018_no_overlap",)),
+        "w019_no_overlap": _resolve_existing_name(("w019_no_overlap",)),
+        "w018_w019_overlap": _resolve_existing_name(("w018_w019_overlap", "w019_w018_overlap")),
+        "w019_w020_overlap": _resolve_existing_name(("w019_w020_overlap", "w020_w019_overlap")),
+    }
+
+
+@lru_cache(maxsize=1)
+def cutout_wrap_names() -> tuple[str, ...]:
+    mapping = cutout_name_map()
+    return (
+        mapping["w018_no_overlap"],
+        mapping["w019_no_overlap"],
+        mapping["w018_w019_overlap"],
+        mapping["w019_w020_overlap"],
+    )
+
+
 def _load_wrap_by_name(name: str) -> overlap_module.LoadedWrap:
     infos = overlap_module._wrap_infos(PHERC0139_ROOT / name)
     if len(infos) != 1:
@@ -43,7 +67,7 @@ def _load_wrap_by_name(name: str) -> overlap_module.LoadedWrap:
 
 @lru_cache(maxsize=1)
 def loaded_wraps_by_name() -> dict[str, overlap_module.LoadedWrap]:
-    names = PARENT_WRAP_NAMES + CUTOUT_WRAP_NAMES
+    names = PARENT_WRAP_NAMES + cutout_wrap_names()
     return {name: _load_wrap_by_name(name) for name in names}
 
 
