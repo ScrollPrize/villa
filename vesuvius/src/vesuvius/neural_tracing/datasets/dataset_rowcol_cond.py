@@ -31,7 +31,7 @@ from vesuvius.neural_tracing.datasets.common import (
 )
 from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
 from vesuvius.neural_tracing.datasets.direction_helpers import (
-    build_triplet_direction_priors_from_displacements,
+    build_triplet_direction_priors_from_conditioning_surface,
     maybe_swap_triplet_branch_channels,
 )
 from vesuvius.neural_tracing.datasets.augmentation import (
@@ -485,6 +485,7 @@ class EdtSegDataset(Dataset):
         cond_seg_gt: torch.Tensor,
         behind_seg: torch.Tensor,
         front_seg: torch.Tensor,
+        cond_surface_local: torch.Tensor | None = None,
         idx: int,
         patch_idx: int,
         wrap_idx: int,
@@ -640,13 +641,17 @@ class EdtSegDataset(Dataset):
         dense_gt_np = np.concatenate([behind_disp_np, front_disp_np], axis=0)
         dir_priors_np = None
         if self.use_triplet_direction_priors:
-            dir_priors_np = build_triplet_direction_priors_from_displacements(
+            if cond_surface_local is None:
+                return None
+            cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+            dir_priors_np = build_triplet_direction_priors_from_conditioning_surface(
                 crop_size,
                 cond_bin_full,
-                behind_disp_np,
-                front_disp_np,
+                cond_surface_np,
                 mask_mode=self.triplet_direction_prior_mask,
             )
+            if dir_priors_np is None:
+                return None
         dense_gt_np, dir_priors_np, triplet_channel_order_np = maybe_swap_triplet_branch_channels(
             dense_gt_np,
             dir_priors_np,
@@ -1029,6 +1034,7 @@ class EdtSegDataset(Dataset):
                 cond_seg_gt=cond_seg_gt,
                 behind_seg=behind_seg,
                 front_seg=front_seg,
+                cond_surface_local=cond_surface_local,
                 idx=idx,
                 patch_idx=patch_idx,
                 wrap_idx=wrap_idx,

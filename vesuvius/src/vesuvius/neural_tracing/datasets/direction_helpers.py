@@ -3,6 +3,93 @@ import random
 import numpy as np
 
 
+def _compute_surface_tangent_axis(surface_grid: np.ndarray, surface_valid: np.ndarray, axis: int):
+    """Estimate local tangent vectors along one grid axis."""
+    grid = np.asarray(surface_grid, dtype=np.float32)
+    valid = np.asarray(surface_valid, dtype=bool)
+    if grid.ndim != 3 or grid.shape[2] != 3:
+        raise ValueError(f"surface_grid must have shape (H, W, 3), got {tuple(grid.shape)}")
+    if valid.shape != grid.shape[:2]:
+        raise ValueError(
+            f"surface_valid shape {tuple(valid.shape)} must match grid shape {tuple(grid.shape[:2])}"
+        )
+    if axis not in (0, 1):
+        raise ValueError(f"axis must be 0 or 1, got {axis!r}")
+
+    tangent = np.zeros_like(grid, dtype=np.float32)
+    tangent_valid = np.zeros(valid.shape, dtype=bool)
+    h, w = valid.shape
+
+    if axis == 0:
+        if h >= 3:
+            central_ok = valid[1:-1, :] & valid[:-2, :] & valid[2:, :]
+            central_delta = 0.5 * (grid[2:, :, :] - grid[:-2, :, :])
+            tangent[1:-1, :, :][central_ok] = central_delta[central_ok]
+            tangent_valid[1:-1, :][central_ok] = True
+
+        if h >= 2:
+            diff = grid[1:, :, :] - grid[:-1, :, :]
+            diff_ok = valid[1:, :] & valid[:-1, :]
+
+            use_forward = (~tangent_valid[:-1, :]) & diff_ok
+            tangent[:-1, :, :][use_forward] = diff[use_forward]
+            tangent_valid[:-1, :][use_forward] = True
+
+            use_backward = (~tangent_valid[1:, :]) & diff_ok
+            tangent[1:, :, :][use_backward] = diff[use_backward]
+            tangent_valid[1:, :][use_backward] = True
+    else:
+        if w >= 3:
+            central_ok = valid[:, 1:-1] & valid[:, :-2] & valid[:, 2:]
+            central_delta = 0.5 * (grid[:, 2:, :] - grid[:, :-2, :])
+            tangent[:, 1:-1, :][central_ok] = central_delta[central_ok]
+            tangent_valid[:, 1:-1][central_ok] = True
+
+        if w >= 2:
+            diff = grid[:, 1:, :] - grid[:, :-1, :]
+            diff_ok = valid[:, 1:] & valid[:, :-1]
+
+            use_forward = (~tangent_valid[:, :-1]) & diff_ok
+            tangent[:, :-1, :][use_forward] = diff[use_forward]
+            tangent_valid[:, :-1][use_forward] = True
+
+            use_backward = (~tangent_valid[:, 1:]) & diff_ok
+            tangent[:, 1:, :][use_backward] = diff[use_backward]
+            tangent_valid[:, 1:][use_backward] = True
+
+    return tangent, tangent_valid
+
+
+def estimate_global_unit_normal_from_surface_grid(surface_grid: np.ndarray) -> np.ndarray:
+    """Estimate a global unit normal from one ordered surface grid.
+
+    Returns a zero vector when no stable estimate can be formed.
+    """
+    grid = np.asarray(surface_grid, dtype=np.float32)
+    if grid.ndim != 3 or grid.shape[2] != 3:
+        return np.zeros((3,), dtype=np.float32)
+
+    valid = np.isfinite(grid).all(axis=2)
+    if not bool(valid.any()):
+        return np.zeros((3,), dtype=np.float32)
+
+    row_tangent, row_tangent_valid = _compute_surface_tangent_axis(grid, valid, axis=0)
+    col_tangent, col_tangent_valid = _compute_surface_tangent_axis(grid, valid, axis=1)
+    normals = np.cross(col_tangent, row_tangent)
+    norms = np.linalg.norm(normals, axis=2)
+    finite = np.isfinite(normals).all(axis=2) & np.isfinite(norms)
+    normals_valid = valid & row_tangent_valid & col_tangent_valid & finite & (norms > 1e-6)
+    if not bool(normals_valid.any()):
+        return np.zeros((3,), dtype=np.float32)
+
+    unit_normals = normals[normals_valid] / norms[normals_valid, None]
+    mean_vec = np.mean(unit_normals, axis=0, dtype=np.float64).astype(np.float32, copy=False)
+    mean_norm = float(np.linalg.norm(mean_vec))
+    if not np.isfinite(mean_norm) or mean_norm <= 1e-6:
+        return np.zeros((3,), dtype=np.float32)
+    return (mean_vec / mean_norm).astype(np.float32, copy=False)
+
+
 def estimate_triplet_unit_direction(disp_np: np.ndarray, cond_mask: np.ndarray) -> np.ndarray:
     """Estimate one robust unit direction from dense displacement on conditioning voxels."""
     disp = np.asarray(disp_np, dtype=np.float32)
@@ -80,6 +167,25 @@ def build_triplet_direction_priors_from_displacements(
         cond_mask,
         ch0_dir,
         ch1_dir,
+        mask_mode=mask_mode,
+    )
+
+
+def build_triplet_direction_priors_from_conditioning_surface(
+    crop_size,
+    cond_mask: np.ndarray,
+    cond_surface_local: np.ndarray,
+    mask_mode: str = "cond",
+) -> np.ndarray | None:
+    """Build triplet priors from conditioning-surface geometry only (no neighbor GT)."""
+    global_unit_normal = estimate_global_unit_normal_from_surface_grid(cond_surface_local)
+    if float(np.linalg.norm(global_unit_normal)) <= 1e-6:
+        return None
+    return build_triplet_direction_priors(
+        crop_size,
+        cond_mask,
+        global_unit_normal,
+        -global_unit_normal,
         mask_mode=mask_mode,
     )
 

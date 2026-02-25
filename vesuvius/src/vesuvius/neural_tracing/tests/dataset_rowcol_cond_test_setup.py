@@ -361,6 +361,7 @@ def _attach_triplet_capture_hooks(ds: EdtSegDataset):
         cond_seg_gt,
         behind_seg,
         front_seg,
+        cond_surface_local=None,
         idx,
         patch_idx,
         wrap_idx,
@@ -369,11 +370,13 @@ def _attach_triplet_capture_hooks(ds: EdtSegDataset):
             "cond_seg_gt": cond_seg_gt.detach().clone(),
             "behind_seg": behind_seg.detach().clone(),
             "front_seg": front_seg.detach().clone(),
+            "cond_surface_local": None if cond_surface_local is None else cond_surface_local.detach().clone(),
         }
         return orig_create_neighbor_targets(
             cond_seg_gt=cond_seg_gt,
             behind_seg=behind_seg,
             front_seg=front_seg,
+            cond_surface_local=cond_surface_local,
             idx=idx,
             patch_idx=patch_idx,
             wrap_idx=wrap_idx,
