@@ -1,7 +1,7 @@
 {
 	"base": {
-		"dir_v": 10.0,
-		"dir_conn": 1.0,
+		"dir_v": 100.0,
+		"dir_conn": 0.0,
 		"step": 1.0,
 		"smooth_x": 0.0,
 		"smooth_y": 0.0,
