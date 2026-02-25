@@ -7,10 +7,8 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     """Populate default config values for the row/col conditioning dataset."""
     config.setdefault("use_sdt", False)
     config.setdefault("dilation_radius", 1)  # voxels
-    config.setdefault("cond_percent", [0.5, 0.5])
-    config.setdefault("use_extrapolation", False)
+    config.setdefault("cond_percent", [0.1, 0.5])
     config.setdefault("use_dense_displacement", True)
-    config.setdefault("extrapolation_method", "linear_edge")
     config.setdefault("supervise_conditioning", False)
     config.setdefault("cond_supervision_weight", 0.1)
     config.setdefault("force_recompute_patches", False)
@@ -41,9 +39,8 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("triplet_close_fraction_threshold", 0.05)
     config.setdefault("triplet_close_print", True)
 
-    config.setdefault("enable_volume_crop_cache", False)
-    config.setdefault("volume_crop_cache_max_items", 0)
     config.setdefault("validate_result_tensors", False)
+    
     # Patch-finding defaults.
     config.setdefault("overlap_fraction", 0.0)
     config.setdefault("min_span_ratio", 1.0)
@@ -56,10 +53,9 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("bbox_pad_2d", 0)
     config.setdefault("require_all_valid_in_bbox", True)
     config.setdefault("skip_chunk_if_any_invalid", False)
-    config.setdefault("min_cond_span", 0.3)
     config.setdefault("inner_bbox_fraction", 0.7)
-    config.setdefault("filter_oob_extrap_points", True)
 
+    # conditioning perturbation defaults
     cond_local_perturb = dict(config.get("cond_local_perturb") or {})
     cond_local_perturb.setdefault("enabled", True)
     cond_local_perturb.setdefault("probability", 0.35)
@@ -71,14 +67,6 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     cond_local_perturb.setdefault("max_total_displacement", 6.0)
     config["cond_local_perturb"] = cond_local_perturb
 
-    config.setdefault("rbf_downsample_factor", 4)
-    config.setdefault("rbf_edge_downsample_factor", 8)
-    config.setdefault("rbf_max_points", None)
-    config.setdefault("rbf_edge_band_frac", 0.10)
-    config.setdefault("rbf_edge_band_cells", None)
-    config.setdefault("rbf_edge_min_points", 128)
-    config.setdefault("debug_extrapolation_oob", False)
-    config.setdefault("debug_extrapolation_oob_every", 100)
     config.setdefault("displacement_supervision", "vector")
 
 
@@ -137,7 +125,7 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
 
     if not use_triplet_wrap_displacement and not use_dense_displacement:
         raise ValueError(
-            "Regular split no longer supports sparse extrapolation supervision; "
+            "Regular split no longer supports sparse supervision; "
             "set use_dense_displacement=True."
         )
 
@@ -147,8 +135,6 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
     if use_triplet_wrap_displacement:
         if not use_dense_displacement:
             raise ValueError("use_triplet_wrap_displacement=True requires use_dense_displacement=True")
-        if config.get("use_extrapolation", True):
-            raise ValueError("use_triplet_wrap_displacement=True requires use_extrapolation=False")
         if config.get("use_other_wrap_cond", False):
             raise ValueError("use_triplet_wrap_displacement=True is not compatible with use_other_wrap_cond")
         if config.get("use_sdt", False):
