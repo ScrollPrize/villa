@@ -381,7 +381,7 @@ def train(config_path):
     mask_cond_from_seg_loss = config.get('mask_cond_from_seg_loss', False)
     use_dense_displacement = bool(config.get('use_dense_displacement', False))
     triplet_direction_prior_mask = str(config.get('triplet_direction_prior_mask', 'cond')).lower()
-    triplet_random_channel_swap_prob = float(config.get('triplet_random_channel_swap_prob', 0.5))
+    triplet_random_channel_swap_prob = 0.5
     if triplet_min_disp_vox < 0:
         raise ValueError(f"triplet_min_disp_vox must be >= 0, got {triplet_min_disp_vox}")
     if lambda_triplet_min_disp > 0.0 and not triplet_mode:

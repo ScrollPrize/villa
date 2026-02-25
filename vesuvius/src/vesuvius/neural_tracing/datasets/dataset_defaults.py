@@ -34,7 +34,6 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("triplet_gt_vector_dilation_radius", 0.0)
     config.setdefault("use_triplet_direction_priors", True)
     config.setdefault("triplet_direction_prior_mask", "cond")
-    config.setdefault("triplet_random_channel_swap_prob", 0.5)
     config.setdefault("triplet_overlap_mask_filename", "overlap_mask.tif")
     config.setdefault("triplet_warn_missing_overlap_masks", False)
     config.setdefault("triplet_close_check_enabled", True)
@@ -119,14 +118,6 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
 
     triplet_direction_prior_mask = str(config.get("triplet_direction_prior_mask", "cond")).lower()
     _require_choice("triplet_direction_prior_mask", triplet_direction_prior_mask, {"cond", "full"})
-
-    triplet_random_channel_swap_prob = float(config.get("triplet_random_channel_swap_prob", 0.5))
-    _require_finite_range(
-        "triplet_random_channel_swap_prob",
-        triplet_random_channel_swap_prob,
-        min_value=0.0,
-        max_value=1.0,
-    )
 
     triplet_close_distance_voxels = float(config.get("triplet_close_distance_voxels", 1.0))
     _require_finite_range("triplet_close_distance_voxels", triplet_close_distance_voxels, min_value=0.0)
