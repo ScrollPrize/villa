@@ -20,6 +20,7 @@ SIDES = (SIDE_FRONT, SIDE_BACK)
 class DetectorConfig:
     edge_depth_rows: Optional[int] = None
     max_band_rows: Optional[int] = None
+    band_inward_margin_rows: int = 24
     row_point_stride: int = 4
     min_row_points: int = 32
     min_band_rows: int = 8
@@ -97,6 +98,15 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--min-row-points", type=int, default=32, help="Minimum valid points per column candidate.")
     parser.add_argument("--min-band-rows", type=int, default=8, help="Minimum accepted overlap-band column count.")
     parser.add_argument("--score-threshold", type=float, default=1.5, help="Minimum edge-jump detection score.")
+    parser.add_argument(
+        "--band-inward-margin-rows",
+        type=int,
+        default=24,
+        help=(
+            "Expand each detected edge band inward by this many columns before writing masks. "
+            "This reduces brittle misses from small edge-cutoff shifts."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing overlap_mask.tif files.")
     parser.add_argument("--napari", action="store_true", help="Display wrap and overlap points in napari.")
     parser.add_argument("--napari-downsample", type=int, default=8, help="Point downsample stride for napari.")
@@ -118,6 +128,8 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--min-row-points must be >= 1")
     if args.min_band_rows < 1:
         parser.error("--min-band-rows must be >= 1")
+    if args.band_inward_margin_rows < 0:
+        parser.error("--band-inward-margin-rows must be >= 0")
     if args.max_band_rows is not None and args.max_band_rows < args.min_band_rows:
         parser.error("--max-band-rows must be >= --min-band-rows")
     if args.napari_downsample < 1:
@@ -276,12 +288,15 @@ def _pick_best_prefix_length(
     return best_len, best_score
 
 
-def _band_cols_from_edge(width: int, side: str, last_col: int) -> np.ndarray:
+def _band_cols_from_edge(width: int, side: str, last_col: int, inward_margin: int = 0) -> np.ndarray:
     col_mask = np.zeros((width,), dtype=bool)
+    inward_margin = max(0, int(inward_margin))
     if side == SIDE_FRONT:
-        col_mask[: last_col + 1] = True
+        hi = min(width - 1, int(last_col) + inward_margin)
+        col_mask[: hi + 1] = True
     elif side == SIDE_BACK:
-        col_mask[last_col:] = True
+        lo = max(0, int(last_col) - inward_margin)
+        col_mask[lo:] = True
     else:
         raise ValueError(f"Unknown side: {side}")
     return col_mask
@@ -443,7 +458,12 @@ class OverlapDetector:
             return None
 
         last_col = int(src_rows[best_len - 1])
-        band_col_mask = _band_cols_from_edge(source.shape[1], source_side, last_col)
+        band_col_mask = _band_cols_from_edge(
+            source.shape[1],
+            source_side,
+            last_col,
+            inward_margin=self.cfg.band_inward_margin_rows,
+        )
         if not bool((band_col_mask[None, :] & source.valid).any()):
             return None
 
@@ -590,6 +610,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cfg = DetectorConfig(
         edge_depth_rows=args.edge_depth_rows,
         max_band_rows=args.max_band_rows,
+        band_inward_margin_rows=int(args.band_inward_margin_rows),
         row_point_stride=args.row_point_stride,
         min_row_points=args.min_row_points,
         min_band_rows=args.min_band_rows,
