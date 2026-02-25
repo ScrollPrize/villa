@@ -137,20 +137,20 @@ class EdtSegDataset(Dataset):
 
         setdefault_rowcol_cond_dataset_config(config)
         validate_rowcol_cond_dataset_config(config)
-        self.displacement_supervision = str(config.get('displacement_supervision', 'vector')).lower()
-        self.use_dense_displacement = bool(config.get('use_dense_displacement', False))
-        self.use_triplet_wrap_displacement = bool(config.get('use_triplet_wrap_displacement', False))
+        self.displacement_supervision = str(config['displacement_supervision']).lower()
+        self.use_dense_displacement = bool(config['use_dense_displacement'])
+        self.use_triplet_wrap_displacement = bool(config['use_triplet_wrap_displacement'])
         if not self.use_triplet_wrap_displacement:
             # Regular split is dense-supervision only.
             self.use_dense_displacement = True
-        self.use_triplet_direction_priors = bool(config.get('use_triplet_direction_priors', True))
-        self.triplet_direction_prior_mask = str(config.get('triplet_direction_prior_mask', 'cond')).lower()
-        self.triplet_random_channel_swap_prob = float(config.get('triplet_random_channel_swap_prob', 0.5))
-        self.triplet_close_check_enabled = bool(config.get('triplet_close_check_enabled', True))
-        self.triplet_close_distance_voxels = float(config.get('triplet_close_distance_voxels', 1.0))
-        self.triplet_close_fraction_threshold = float(config.get('triplet_close_fraction_threshold', 0.05))
-        self.triplet_edt_bbox_padding_voxels = float(config.get('triplet_edt_bbox_padding_voxels', 4.0))
-        self.triplet_close_print = bool(config.get('triplet_close_print', True))
+        self.use_triplet_direction_priors = bool(config['use_triplet_direction_priors'])
+        self.triplet_direction_prior_mask = str(config['triplet_direction_prior_mask']).lower()
+        self.triplet_random_channel_swap_prob = float(config['triplet_random_channel_swap_prob'])
+        self.triplet_close_check_enabled = bool(config['triplet_close_check_enabled'])
+        self.triplet_close_distance_voxels = float(config['triplet_close_distance_voxels'])
+        self.triplet_close_fraction_threshold = float(config['triplet_close_fraction_threshold'])
+        self.triplet_edt_bbox_padding_voxels = float(config['triplet_edt_bbox_padding_voxels'])
+        self.triplet_close_print = bool(config['triplet_close_print'])
         if self.use_triplet_wrap_displacement:
             if not np.isclose(self.triplet_random_channel_swap_prob, 0.5, atol=1e-8):
                 warnings.warn(
@@ -159,7 +159,7 @@ class EdtSegDataset(Dataset):
                     RuntimeWarning,
                 )
                 self.triplet_random_channel_swap_prob = 0.5
-        self._validate_result_tensors_enabled = bool(config.get('validate_result_tensors', True))
+        self._validate_result_tensors_enabled = bool(config['validate_result_tensors'])
 
         aug_config = config.get('augmentation', {})
         if apply_augmentation and aug_config.get('enabled', True):
@@ -173,7 +173,7 @@ class EdtSegDataset(Dataset):
             self._augmentations = None
         self._cond_local_perturb_active = self._should_attempt_cond_local_perturb()
 
-        self.sample_mode = str(config.get('sample_mode', 'wrap')).lower()
+        self.sample_mode = str(config['sample_mode']).lower()
         self._triplet_neighbor_lookup = {}
         self._triplet_lookup_stats = {}
         self._triplet_overlap_kept_indices = tuple()
@@ -719,6 +719,49 @@ class EdtSegDataset(Dataset):
         cond_seg = torch.from_numpy(cond_np).to(torch.float32)
         if not bool(torch.isfinite(cond_seg).all()):
             return None
+        return cond_seg
+
+    @staticmethod
+    def _prepare_cond_surface_keypoints(cond_surface_local):
+        if cond_surface_local is None:
+            return None, None, None, True
+        if cond_surface_local.ndim != 3 or int(cond_surface_local.shape[-1]) != 3:
+            return None, None, None, False
+        cond_surface_shape = tuple(int(s) for s in cond_surface_local.shape[:2])
+        cond_surface_keypoints = cond_surface_local.reshape(-1, 3).contiguous()
+        return cond_surface_local, cond_surface_shape, cond_surface_keypoints, True
+
+    def _restore_cond_surface_from_augmented(
+        self,
+        *,
+        augmented: dict,
+        cond_surface_keypoints: torch.Tensor,
+        cond_surface_shape,
+        mode: str,
+    ):
+        augmented_keypoints = self._require_augmented_keypoints(
+            augmented,
+            cond_surface_keypoints.shape,
+            mode=mode,
+        )
+        return augmented_keypoints.reshape(*cond_surface_shape, 3).contiguous()
+
+    def _resolve_conditioning_segmentation(
+        self,
+        *,
+        mask_bundle: dict,
+        cond_seg_gt: torch.Tensor,
+        cond_surface_local,
+        cond_local_perturb_active: bool,
+    ):
+        if cond_local_perturb_active and cond_surface_local is not None:
+            return self._conditioning_from_surface(
+                cond_surface_local=cond_surface_local,
+                cond_seg_gt=cond_seg_gt,
+            )
+        cond_seg = mask_bundle.get("cond")
+        if cond_seg is None:
+            cond_seg = cond_seg_gt.clone()
         return cond_seg
 
     @staticmethod
@@ -1314,15 +1357,16 @@ class EdtSegDataset(Dataset):
         if not cond_segmentation_gt.any():
             return None
 
-        cond_segmentation_raw = cond_segmentation_gt.copy()
         cond_segmentation_gt_raw = cond_segmentation_gt.copy()
 
         # add thickness to conditioning segmentation via dilation
         use_dilation = self.config.get('use_dilation', False)
         if use_dilation:
             dilation_radius = self.config.get('dilation_radius', 1.0)
-            dist_from_cond = ndimage.distance_transform_edt(cond_segmentation_gt <= 0.5)
-            cond_segmentation = (dist_from_cond <= dilation_radius).astype(np.float32)
+            cond_segmentation = self._edt_dilate_binary_mask(
+                cond_segmentation_gt > 0.5,
+                dilation_radius,
+            ).astype(np.float32, copy=False)
         else:
             cond_segmentation = cond_segmentation_gt
 
@@ -1334,7 +1378,7 @@ class EdtSegDataset(Dataset):
             # combine cond + masked into full segmentation
             full_segmentation = np.maximum(cond_segmentation, masked_segmentation)
         if use_segmentation:
-            full_segmentation_raw = np.maximum(cond_segmentation_raw, masked_segmentation)
+            full_segmentation_raw = np.maximum(cond_segmentation_gt_raw, masked_segmentation)
 
         if use_sdt:
             # if already dilated, just compute SDT directly; otherwise dilate first
@@ -1342,15 +1386,20 @@ class EdtSegDataset(Dataset):
                 seg_dilated = full_segmentation
             else:
                 dilation_radius = self.config.get('dilation_radius', 1.0)
-                distance_from_surface = ndimage.distance_transform_edt(full_segmentation <= 0.5)
-                seg_dilated = (distance_from_surface <= dilation_radius).astype(np.float32)
+                seg_dilated = self._edt_dilate_binary_mask(
+                    full_segmentation > 0.5,
+                    dilation_radius,
+                ).astype(np.float32, copy=False)
             sdt = self._signed_distance_field(seg_dilated)
 
         if use_segmentation:
             dilation_radius = self.config.get('dilation_radius', 1.0)
-            distance_from_surface = ndimage.distance_transform_edt(full_segmentation_raw <= 0.5)
-            seg_dilated = (distance_from_surface <= dilation_radius).astype(np.float32)
-            seg_skel = (distance_from_surface == 0).astype(np.float32)
+            full_segmentation_raw_bin = full_segmentation_raw > 0.5
+            seg_dilated = self._edt_dilate_binary_mask(
+                full_segmentation_raw_bin,
+                dilation_radius,
+            ).astype(np.float32, copy=False)
+            seg_skel = full_segmentation_raw_bin.astype(np.float32, copy=False)
 
         # generate heatmap targets for expected positions in masked region
         use_heatmap = self.config['use_heatmap_targets']
@@ -1478,14 +1527,11 @@ class EdtSegDataset(Dataset):
             cond_seg_gt = mask_bundle["cond_gt"]
             behind_seg = mask_bundle["behind_seg"]
             front_seg = mask_bundle["front_seg"]
-            cond_surface_local = mask_bundle.get("center_surface_local")
-            cond_surface_shape = None
-            cond_surface_keypoints = None
-            if cond_surface_local is not None:
-                if cond_surface_local.ndim != 3 or int(cond_surface_local.shape[-1]) != 3:
-                    return self[np.random.randint(len(self))]
-                cond_surface_shape = tuple(int(s) for s in cond_surface_local.shape[:2])
-                cond_surface_keypoints = cond_surface_local.reshape(-1, 3).contiguous()
+            cond_surface_local, cond_surface_shape, cond_surface_keypoints, valid_cond_surface = (
+                self._prepare_cond_surface_keypoints(mask_bundle.get("center_surface_local"))
+            )
+            if not valid_cond_surface:
+                return self[np.random.randint(len(self))]
 
             if self._augmentations is not None:
                 aug_kwargs = {
@@ -1501,24 +1547,20 @@ class EdtSegDataset(Dataset):
                 behind_seg = augmented["segmentation"][1]
                 front_seg = augmented["segmentation"][2]
                 if cond_surface_keypoints is not None:
-                    augmented_keypoints = self._require_augmented_keypoints(
-                        augmented,
-                        cond_surface_keypoints.shape,
+                    cond_surface_local = self._restore_cond_surface_from_augmented(
+                        augmented=augmented,
+                        cond_surface_keypoints=cond_surface_keypoints,
+                        cond_surface_shape=cond_surface_shape,
                         mode="triplet",
                     )
-                    cond_surface_local = augmented_keypoints.reshape(*cond_surface_shape, 3).contiguous()
-
-            if cond_local_perturb_active and cond_surface_local is not None:
-                cond_seg = self._conditioning_from_surface(
-                    cond_surface_local=cond_surface_local,
-                    cond_seg_gt=cond_seg_gt,
-                )
-                if cond_seg is None:
-                    return self[np.random.randint(len(self))]
-            else:
-                cond_seg = mask_bundle.get("cond")
-                if cond_seg is None:
-                    cond_seg = cond_seg_gt.clone()
+            cond_seg = self._resolve_conditioning_segmentation(
+                mask_bundle=mask_bundle,
+                cond_seg_gt=cond_seg_gt,
+                cond_surface_local=cond_surface_local,
+                cond_local_perturb_active=cond_local_perturb_active,
+            )
+            if cond_seg is None:
+                return self[np.random.randint(len(self))]
 
             target_payload = self.create_neighbor_targets(
                 cond_seg_gt=cond_seg_gt,
@@ -1550,14 +1592,11 @@ class EdtSegDataset(Dataset):
             masked_seg = mask_bundle["masked_seg"]
             cond_seg_gt = mask_bundle["cond_gt"]
             other_wraps_tensor = mask_bundle["other_wraps"]
-            cond_surface_local = mask_bundle.get("cond_surface_local")
-            cond_surface_shape = None
-            cond_surface_keypoints = None
-            if cond_surface_local is not None:
-                if cond_surface_local.ndim != 3 or int(cond_surface_local.shape[-1]) != 3:
-                    return self[np.random.randint(len(self))]
-                cond_surface_shape = tuple(int(s) for s in cond_surface_local.shape[:2])
-                cond_surface_keypoints = cond_surface_local.reshape(-1, 3).contiguous()
+            cond_surface_local, cond_surface_shape, cond_surface_keypoints, valid_cond_surface = (
+                self._prepare_cond_surface_keypoints(mask_bundle.get("cond_surface_local"))
+            )
+            if not valid_cond_surface:
+                return self[np.random.randint(len(self))]
             if use_segmentation:
                 full_seg = mask_bundle["segmentation"]
                 seg_skel = mask_bundle["segmentation_skel"]
@@ -1619,24 +1658,20 @@ class EdtSegDataset(Dataset):
                 if use_heatmap:
                     heatmap_tensor = augmented['heatmap_target'].squeeze(0)
                 if cond_surface_keypoints is not None:
-                    augmented_keypoints = self._require_augmented_keypoints(
-                        augmented,
-                        cond_surface_keypoints.shape,
+                    cond_surface_local = self._restore_cond_surface_from_augmented(
+                        augmented=augmented,
+                        cond_surface_keypoints=cond_surface_keypoints,
+                        cond_surface_shape=cond_surface_shape,
                         mode="split",
                     )
-                    cond_surface_local = augmented_keypoints.reshape(*cond_surface_shape, 3).contiguous()
-
-            if cond_local_perturb_active and cond_surface_local is not None:
-                cond_seg = self._conditioning_from_surface(
-                    cond_surface_local=cond_surface_local,
-                    cond_seg_gt=cond_seg_gt,
-                )
-                if cond_seg is None:
-                    return self[np.random.randint(len(self))]
-            else:
-                cond_seg = mask_bundle.get("cond")
-                if cond_seg is None:
-                    cond_seg = cond_seg_gt.clone()
+            cond_seg = self._resolve_conditioning_segmentation(
+                mask_bundle=mask_bundle,
+                cond_seg_gt=cond_seg_gt,
+                cond_surface_local=cond_surface_local,
+                cond_local_perturb_active=cond_local_perturb_active,
+            )
+            if cond_seg is None:
+                return self[np.random.randint(len(self))]
 
             target_payload = self.create_split_targets(
                 cond_seg_gt=cond_seg_gt,
