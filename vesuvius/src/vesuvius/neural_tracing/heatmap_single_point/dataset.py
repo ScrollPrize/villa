@@ -13,7 +13,7 @@ from functools import lru_cache
 import torch.nn.functional as F
 from dataclasses import dataclass
 
-import vesuvius.neural_tracing.augmentation as augmentation
+import vesuvius.neural_tracing.heatmap_single_point.augmentation as augmentation
 
 
 

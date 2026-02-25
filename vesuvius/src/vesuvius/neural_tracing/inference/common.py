@@ -16,7 +16,7 @@ from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid
 from vesuvius.neural_tracing.datasets.extrapolation import _EXTRAPOLATION_METHODS, apply_degradation
 from vesuvius.neural_tracing.inference.extrap_lookup import ExtrapLookupArrays
 
-from vesuvius.neural_tracing.tifxyz import save_tifxyz
+from vesuvius.neural_tracing.heatmap_single_point.tifxyz import save_tifxyz
 
 
 def _resolve_extrapolation_settings(args, runtime_config):

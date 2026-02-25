@@ -33,7 +33,7 @@ from vesuvius.neural_tracing.inference.infer_global_extrap import (
     _sample_trilinear_displacement_stack,
     _surface_to_stored_uv_samples_lattice,
 )
-from vesuvius.neural_tracing.tifxyz import save_tifxyz
+from vesuvius.neural_tracing.heatmap_single_point.tifxyz import save_tifxyz
 from vesuvius.tifxyz import read_tifxyz
 from vesuvius.tifxyz.upsampling import interpolate_at_points
 

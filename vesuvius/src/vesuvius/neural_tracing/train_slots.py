@@ -18,7 +18,7 @@ import torch.utils.checkpoint
 from einops import rearrange
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.dataset import load_datasets
+from vesuvius.neural_tracing.heatmap_single_point.dataset import load_datasets
 from vesuvius.neural_tracing.datasets.dataset_slotted import HeatmapDatasetSlotted
 from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper, DC_and_BCE_loss
 from vesuvius.models.training.optimizers import create_optimizer
@@ -26,7 +26,7 @@ from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds_weights
 from vesuvius.neural_tracing.models import make_model
 from vesuvius.models.training.loss.losses import CosineSimilarityLoss
-from vesuvius.neural_tracing.visualization import make_canvas, print_training_config
+from vesuvius.neural_tracing.heatmap_single_point.visualization import make_canvas, print_training_config
 
 
 def prepare_batch(batch, config):

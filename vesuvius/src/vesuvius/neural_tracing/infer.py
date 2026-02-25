@@ -14,7 +14,7 @@ from typing import List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from cachetools import LRUCache
 
-from vesuvius.neural_tracing.dataset import get_crop_from_volume, build_localiser, make_heatmaps, mark_context_point
+from vesuvius.neural_tracing.heatmap_single_point.dataset import get_crop_from_volume, build_localiser, make_heatmaps, mark_context_point
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 from vesuvius.models.run.tta import infer_with_tta
 
