@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from numba import njit
 from dataclasses import dataclass
+from pathlib import Path
 from vesuvius.tifxyz import Tifxyz
 from vesuvius.tifxyz.upsampling import interpolate_at_points
 import zarr
@@ -9,6 +10,8 @@ from typing import Any, Dict, List, Tuple
 import re
 from functools import lru_cache
 from scipy import ndimage
+import tifffile
+import warnings
 
 
 def _parse_z_range(z_range):
@@ -92,6 +95,228 @@ def _wrap_bbox_has_overlap(mask: np.ndarray, bbox_2d):
     if r1 < r0 or c1 < c0:
         return False
     return bool(np.any(mask_arr[r0:r1 + 1, c0:c1 + 1]))
+
+
+def _filter_triplet_overlap_chunks(patches, config):
+    """Drop triplet chunks that include any wrap overlap inside that wrap's bbox."""
+    mask_filename = str(config["triplet_overlap_mask_filename"])
+    warn_missing_masks = bool(config["triplet_warn_missing_overlap_masks"])
+    warned_missing = set()
+    kept = []
+    kept_indices = []
+
+    for patch_idx, patch in enumerate(patches):
+        drop_chunk = False
+        for wrap in patch.wraps:
+            seg = wrap.get("segment")
+            seg_path = getattr(seg, "path", None)
+            if seg_path is None:
+                continue
+            seg_path = Path(seg_path)
+            mask_path = seg_path / mask_filename
+            mask_key = str(mask_path)
+
+            if not mask_path.exists():
+                if warn_missing_masks and mask_key not in warned_missing:
+                    warned_missing.add(mask_key)
+                    warnings.warn(
+                        f"Triplet overlap mask not found at {mask_path}; treating as no-overlap for this wrap.",
+                        RuntimeWarning,
+                    )
+                continue
+
+            overlap_mask = np.asarray(tifffile.imread(str(mask_path))) > 0
+
+            if _wrap_bbox_has_overlap(overlap_mask, wrap["bbox_2d"]):
+                drop_chunk = True
+                break
+
+        if not drop_chunk:
+            kept.append(patch)
+            kept_indices.append(int(patch_idx))
+
+    return kept, tuple(kept_indices)
+
+
+def _compute_wrap_order_stats(wrap):
+    """Compute per-wrap medians used for triplet neighbor ordering."""
+    seg = wrap["segment"]
+    r_min, r_max, c_min, c_max = wrap["bbox_2d"]
+
+    seg_h, seg_w = seg._valid_mask.shape
+    r_min = max(0, r_min)
+    r_max = min(seg_h - 1, r_max)
+    c_min = max(0, c_min)
+    c_max = min(seg_w - 1, c_max)
+    if r_max < r_min or c_max < c_min:
+        return None
+
+    seg.use_stored_resolution()
+    x_s, y_s, _, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
+    if x_s.size == 0:
+        return None
+
+    if valid_s is not None:
+        if not valid_s.any():
+            return None
+        x_vals = x_s[valid_s]
+        y_vals = y_s[valid_s]
+    else:
+        x_vals = x_s.reshape(-1)
+        y_vals = y_s.reshape(-1)
+
+    finite = np.isfinite(x_vals) & np.isfinite(y_vals)
+    if not finite.any():
+        return None
+    x_vals = x_vals[finite]
+    y_vals = y_vals[finite]
+
+    if x_vals.size == 0 or y_vals.size == 0:
+        return None
+
+    return {
+        "x_median": float(np.median(x_vals)),
+        "y_median": float(np.median(y_vals)),
+    }
+
+
+def _validate_result_tensors(result: dict, idx: int, enabled: bool):
+    if not bool(enabled):
+        return True
+    for key, tensor in result.items():
+        if not torch.is_tensor(tensor):
+            print(f"WARNING: Non-tensor value for '{key}' at index {idx}, resampling...")
+            return False
+        if tensor.numel() == 0:
+            print(f"WARNING: Empty tensor for '{key}' at index {idx}, resampling...")
+            return False
+        if not bool(torch.isfinite(tensor).all()):
+            print(f"WARNING: Non-finite values in '{key}' at index {idx}, resampling...")
+            return False
+    return True
+
+
+def _should_attempt_cond_local_perturb(config: dict, apply_augmentation: bool = True) -> bool:
+    cfg = dict(config["cond_local_perturb"] or {})
+    if not bool(cfg["enabled"]):
+        return False
+    if float(cfg["probability"]) <= 0.0:
+        return False
+    apply_without_aug = bool(cfg["apply_without_augmentation"])
+    if (not bool(apply_augmentation)) and (not apply_without_aug):
+        return False
+    return True
+
+
+def _require_augmented_keypoints(augmented: dict, expected_shape, mode: str):
+    augmented_keypoints = augmented.get("keypoints")
+    expected_tuple = tuple(expected_shape)
+    requirement = (
+        "cond_local_perturb post-augmentation requires the augmentation pipeline to preserve "
+        "keypoints when cond_surface_local is provided."
+    )
+    if augmented_keypoints is None:
+        raise RuntimeError(
+            f"{mode} augmentation did not return keypoints (expected shape {expected_tuple}); "
+            f"{requirement}"
+        )
+    actual_tuple = tuple(augmented_keypoints.shape)
+    if actual_tuple != expected_tuple:
+        raise RuntimeError(
+            f"{mode} augmentation returned keypoints with shape {actual_tuple}; expected "
+            f"{expected_tuple}. {requirement}"
+        )
+    return augmented_keypoints
+
+
+def _prepare_cond_surface_keypoints(cond_surface_local):
+    if cond_surface_local is None:
+        return None, None, None, True
+    if cond_surface_local.ndim != 3 or int(cond_surface_local.shape[-1]) != 3:
+        return None, None, None, False
+    cond_surface_shape = tuple(int(s) for s in cond_surface_local.shape[:2])
+    cond_surface_keypoints = cond_surface_local.reshape(-1, 3).contiguous()
+    return cond_surface_local, cond_surface_shape, cond_surface_keypoints, True
+
+
+def _fraction_within_distance(dist_map: np.ndarray, source_mask: np.ndarray, max_distance_voxels: float) -> float:
+    dist = np.asarray(dist_map, dtype=np.float32)
+    mask = np.asarray(source_mask, dtype=bool)
+    if dist.shape != mask.shape:
+        raise ValueError(
+            f"dist_map shape must match source_mask shape, got {tuple(dist.shape)} vs {tuple(mask.shape)}"
+        )
+    if not bool(mask.any()):
+        return 0.0
+    vals = dist[mask]
+    finite = np.isfinite(vals)
+    vals = vals[finite]
+    if vals.size == 0:
+        return 0.0
+    return float(np.mean(vals <= float(max_distance_voxels)))
+
+
+def _triplet_close_contact_fractions(
+    cond_mask: np.ndarray,
+    behind_mask: np.ndarray,
+    front_mask: np.ndarray,
+    behind_disp_np: np.ndarray,
+    front_disp_np: np.ndarray,
+    max_distance_voxels: float,
+):
+    behind_disp = np.asarray(behind_disp_np, dtype=np.float32)
+    front_disp = np.asarray(front_disp_np, dtype=np.float32)
+    if behind_disp.ndim != 4 or behind_disp.shape[0] != 3:
+        raise ValueError(f"behind_disp_np must have shape (3, D, H, W), got {tuple(behind_disp.shape)}")
+    if front_disp.ndim != 4 or front_disp.shape[0] != 3:
+        raise ValueError(f"front_disp_np must have shape (3, D, H, W), got {tuple(front_disp.shape)}")
+
+    behind_dist = np.linalg.norm(behind_disp, axis=0)
+    front_dist = np.linalg.norm(front_disp, axis=0)
+
+    cond_behind_frac = _fraction_within_distance(behind_dist, cond_mask, max_distance_voxels)
+    cond_front_frac = _fraction_within_distance(front_dist, cond_mask, max_distance_voxels)
+    behind_to_front_frac = _fraction_within_distance(front_dist, behind_mask, max_distance_voxels)
+    front_to_behind_frac = _fraction_within_distance(behind_dist, front_mask, max_distance_voxels)
+    behind_front_frac = max(behind_to_front_frac, front_to_behind_frac)
+    return cond_behind_frac, cond_front_frac, behind_front_frac
+
+
+def _compute_triplet_edt_bbox(
+    cond_mask: np.ndarray,
+    behind_mask: np.ndarray,
+    front_mask: np.ndarray,
+    padding_voxels: float,
+):
+    """Return padded (z,y,x) slices for triplet EDT compute region, or None if empty."""
+    cond = np.asarray(cond_mask, dtype=bool)
+    behind = np.asarray(behind_mask, dtype=bool)
+    front = np.asarray(front_mask, dtype=bool)
+    if cond.shape != behind.shape or cond.shape != front.shape:
+        raise ValueError(
+            "triplet EDT bbox masks must share shape, "
+            f"got cond={tuple(cond.shape)} behind={tuple(behind.shape)} front={tuple(front.shape)}"
+        )
+    if cond.ndim != 3:
+        raise ValueError(f"triplet EDT bbox masks must be 3D, got shape {tuple(cond.shape)}")
+
+    union = cond | behind | front
+    if not union.any():
+        return None
+
+    pad = int(np.ceil(max(0.0, float(padding_voxels))))
+    zz, yy, xx = np.nonzero(union)
+    d, h, w = union.shape
+
+    z0 = max(0, int(zz.min()) - pad)
+    y0 = max(0, int(yy.min()) - pad)
+    x0 = max(0, int(xx.min()) - pad)
+    z1 = min(d - 1, int(zz.max()) + pad)
+    y1 = min(h - 1, int(yy.max()) + pad)
+    x1 = min(w - 1, int(xx.max()) + pad)
+    if z1 < z0 or y1 < y0 or x1 < x0:
+        return None
+    return (slice(z0, z1 + 1), slice(y0, y1 + 1), slice(x0, x1 + 1))
 
 
 @lru_cache(maxsize=5)

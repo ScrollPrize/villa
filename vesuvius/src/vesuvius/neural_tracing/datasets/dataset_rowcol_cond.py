@@ -8,14 +8,21 @@ import tifffile
 from pathlib import Path
 from vesuvius.neural_tracing.datasets.common import (
     ChunkPatch,
+    _compute_triplet_edt_bbox,
+    _compute_wrap_order_stats,
     _extract_wrap_ids,
+    _filter_triplet_overlap_chunks,
+    _prepare_cond_surface_keypoints,
     _parse_z_range,
+    _require_augmented_keypoints,
     _segment_overlaps_z_range,
     _signed_distance_field,
+    _should_attempt_cond_local_perturb,
+    _triplet_close_contact_fractions,
     _trim_to_world_bbox,
     _triplet_wraps_compatible,
     _upsample_world_triplet,
-    _wrap_bbox_has_overlap,
+    _validate_result_tensors,
     compute_heatmap_targets,
     edt_dilate_binary_mask,
     voxelize_surface_grid,
@@ -90,7 +97,10 @@ class EdtSegDataset(Dataset):
             )
         else:
             self._augmentations = None
-        self._cond_local_perturb_active = self._should_attempt_cond_local_perturb()
+        self._cond_local_perturb_active = _should_attempt_cond_local_perturb(
+            config=self.config,
+            apply_augmentation=bool(getattr(self, "apply_augmentation", True)),
+        )
 
         self.sample_mode = str(config['sample_mode']).lower()
         self._triplet_neighbor_lookup = {}
@@ -182,7 +192,10 @@ class EdtSegDataset(Dataset):
                     ))
 
             if self.use_triplet_wrap_displacement:
-                patches = self._filter_triplet_overlap_chunks(patches)
+                patches, self._triplet_overlap_kept_indices = _filter_triplet_overlap_chunks(
+                    patches,
+                    config=self.config,
+                )
 
             self.patches = patches
             self.sample_index = self._build_sample_index()
@@ -222,47 +235,6 @@ class EdtSegDataset(Dataset):
                 sample_index.append((patch_idx, wrap_idx))
         return sample_index
 
-    def _filter_triplet_overlap_chunks(self, patches):
-        """Drop triplet chunks that include any wrap overlap inside that wrap's bbox."""
-        mask_filename = str(self.config["triplet_overlap_mask_filename"])
-        warn_missing_masks = bool(self.config["triplet_warn_missing_overlap_masks"])
-        warned_missing = set()
-        kept = []
-        kept_indices = []
-
-        for patch_idx, patch in enumerate(patches):
-            drop_chunk = False
-            for wrap in patch.wraps:
-                seg = wrap.get("segment")
-                seg_path = getattr(seg, "path", None)
-                if seg_path is None:
-                    continue
-                seg_path = Path(seg_path)
-                mask_path = seg_path / mask_filename
-                mask_key = str(mask_path)
-
-                if not mask_path.exists():
-                    if warn_missing_masks and mask_key not in warned_missing:
-                        warned_missing.add(mask_key)
-                        warnings.warn(
-                            f"Triplet overlap mask not found at {mask_path}; treating as no-overlap for this wrap.",
-                            RuntimeWarning,
-                        )
-                    continue
-
-                overlap_mask = np.asarray(tifffile.imread(str(mask_path))) > 0
-
-                if _wrap_bbox_has_overlap(overlap_mask, wrap["bbox_2d"]):
-                    drop_chunk = True
-                    break
-
-            if not drop_chunk:
-                kept.append(patch)
-                kept_indices.append(int(patch_idx))
-
-        self._triplet_overlap_kept_indices = tuple(kept_indices)
-        return kept
-
     def _load_patch_metadata(self, patch_metadata):
         self.sample_mode = patch_metadata.get('sample_mode', self.sample_mode)
         self.patches = patch_metadata['patches']
@@ -286,47 +258,6 @@ class EdtSegDataset(Dataset):
             'use_triplet_wrap_displacement': self.use_triplet_wrap_displacement,
         }
 
-    def _compute_wrap_order_stats(self, wrap):
-        """Compute per-wrap medians used for triplet neighbor ordering."""
-        seg = wrap["segment"]
-        r_min, r_max, c_min, c_max = wrap["bbox_2d"]
-
-        seg_h, seg_w = seg._valid_mask.shape
-        r_min = max(0, r_min)
-        r_max = min(seg_h - 1, r_max)
-        c_min = max(0, c_min)
-        c_max = min(seg_w - 1, c_max)
-        if r_max < r_min or c_max < c_min:
-            return None
-
-        seg.use_stored_resolution()
-        x_s, y_s, _, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
-        if x_s.size == 0:
-            return None
-
-        if valid_s is not None:
-            if not valid_s.any():
-                return None
-            x_vals = x_s[valid_s]
-            y_vals = y_s[valid_s]
-        else:
-            x_vals = x_s.reshape(-1)
-            y_vals = y_s.reshape(-1)
-
-        finite = np.isfinite(x_vals) & np.isfinite(y_vals)
-        if not finite.any():
-            return None
-        x_vals = x_vals[finite]
-        y_vals = y_vals[finite]
-
-        if x_vals.size == 0 or y_vals.size == 0:
-            return None
-
-        return {
-            "x_median": float(np.median(x_vals)),
-            "y_median": float(np.median(y_vals)),
-        }
-
     def _build_triplet_neighbor_lookup(self):
         """Build (patch_idx, wrap_idx) -> neighbor-wrap metadata for triplet mode.
 
@@ -344,7 +275,7 @@ class EdtSegDataset(Dataset):
         for patch_idx, patch in enumerate(self.patches):
             wrap_stats = []
             for wrap_idx, wrap in enumerate(patch.wraps):
-                s = self._compute_wrap_order_stats(wrap)
+                s = _compute_wrap_order_stats(wrap)
                 if s is None:
                     continue
                 seg = wrap.get("segment")
@@ -465,53 +396,6 @@ class EdtSegDataset(Dataset):
             ]
         return normalize_zscore(vol_crop)
 
-    def _validate_result_tensors(self, result: dict, idx: int):
-        if not self._validate_result_tensors_enabled:
-            return True
-        for key, tensor in result.items():
-            if not torch.is_tensor(tensor):
-                print(f"WARNING: Non-tensor value for '{key}' at index {idx}, resampling...")
-                return False
-            if tensor.numel() == 0:
-                print(f"WARNING: Empty tensor for '{key}' at index {idx}, resampling...")
-                return False
-            if not bool(torch.isfinite(tensor).all()):
-                print(f"WARNING: Non-finite values in '{key}' at index {idx}, resampling...")
-                return False
-        return True
-
-    def _should_attempt_cond_local_perturb(self) -> bool:
-        cfg = dict(self.config["cond_local_perturb"] or {})
-        if not bool(cfg["enabled"]):
-            return False
-        if float(cfg["probability"]) <= 0.0:
-            return False
-        apply_without_aug = bool(cfg["apply_without_augmentation"])
-        if (not bool(getattr(self, "apply_augmentation", True))) and (not apply_without_aug):
-            return False
-        return True
-
-    @staticmethod
-    def _require_augmented_keypoints(augmented: dict, expected_shape, mode: str):
-        augmented_keypoints = augmented.get("keypoints")
-        expected_tuple = tuple(expected_shape)
-        requirement = (
-            "cond_local_perturb post-augmentation requires the augmentation pipeline to preserve "
-            "keypoints when cond_surface_local is provided."
-        )
-        if augmented_keypoints is None:
-            raise RuntimeError(
-                f"{mode} augmentation did not return keypoints (expected shape {expected_tuple}); "
-                f"{requirement}"
-            )
-        actual_tuple = tuple(augmented_keypoints.shape)
-        if actual_tuple != expected_tuple:
-            raise RuntimeError(
-                f"{mode} augmentation returned keypoints with shape {actual_tuple}; expected "
-                f"{expected_tuple}. {requirement}"
-            )
-        return augmented_keypoints
-
     def _conditioning_from_surface(
         self,
         *,
@@ -542,16 +426,6 @@ class EdtSegDataset(Dataset):
             return None
         return cond_seg
 
-    @staticmethod
-    def _prepare_cond_surface_keypoints(cond_surface_local):
-        if cond_surface_local is None:
-            return None, None, None, True
-        if cond_surface_local.ndim != 3 or int(cond_surface_local.shape[-1]) != 3:
-            return None, None, None, False
-        cond_surface_shape = tuple(int(s) for s in cond_surface_local.shape[:2])
-        cond_surface_keypoints = cond_surface_local.reshape(-1, 3).contiguous()
-        return cond_surface_local, cond_surface_shape, cond_surface_keypoints, True
-
     def _restore_cond_surface_from_augmented(
         self,
         *,
@@ -560,7 +434,7 @@ class EdtSegDataset(Dataset):
         cond_surface_shape,
         mode: str,
     ):
-        augmented_keypoints = self._require_augmented_keypoints(
+        augmented_keypoints = _require_augmented_keypoints(
             augmented,
             cond_surface_keypoints.shape,
             mode=mode,
@@ -584,87 +458,6 @@ class EdtSegDataset(Dataset):
         if cond_seg is None:
             cond_seg = cond_seg_gt.clone()
         return cond_seg
-
-    @staticmethod
-    def _fraction_within_distance(dist_map: np.ndarray, source_mask: np.ndarray, max_distance_voxels: float) -> float:
-        dist = np.asarray(dist_map, dtype=np.float32)
-        mask = np.asarray(source_mask, dtype=bool)
-        if dist.shape != mask.shape:
-            raise ValueError(
-                f"dist_map shape must match source_mask shape, got {tuple(dist.shape)} vs {tuple(mask.shape)}"
-            )
-        if not bool(mask.any()):
-            return 0.0
-        vals = dist[mask]
-        finite = np.isfinite(vals)
-        vals = vals[finite]
-        if vals.size == 0:
-            return 0.0
-        return float(np.mean(vals <= float(max_distance_voxels)))
-
-    @classmethod
-    def _triplet_close_contact_fractions(
-        cls,
-        cond_mask: np.ndarray,
-        behind_mask: np.ndarray,
-        front_mask: np.ndarray,
-        behind_disp_np: np.ndarray,
-        front_disp_np: np.ndarray,
-        max_distance_voxels: float,
-    ):
-        behind_disp = np.asarray(behind_disp_np, dtype=np.float32)
-        front_disp = np.asarray(front_disp_np, dtype=np.float32)
-        if behind_disp.ndim != 4 or behind_disp.shape[0] != 3:
-            raise ValueError(f"behind_disp_np must have shape (3, D, H, W), got {tuple(behind_disp.shape)}")
-        if front_disp.ndim != 4 or front_disp.shape[0] != 3:
-            raise ValueError(f"front_disp_np must have shape (3, D, H, W), got {tuple(front_disp.shape)}")
-
-        behind_dist = np.linalg.norm(behind_disp, axis=0)
-        front_dist = np.linalg.norm(front_disp, axis=0)
-
-        cond_behind_frac = cls._fraction_within_distance(behind_dist, cond_mask, max_distance_voxels)
-        cond_front_frac = cls._fraction_within_distance(front_dist, cond_mask, max_distance_voxels)
-        behind_to_front_frac = cls._fraction_within_distance(front_dist, behind_mask, max_distance_voxels)
-        front_to_behind_frac = cls._fraction_within_distance(behind_dist, front_mask, max_distance_voxels)
-        behind_front_frac = max(behind_to_front_frac, front_to_behind_frac)
-        return cond_behind_frac, cond_front_frac, behind_front_frac
-
-    @staticmethod
-    def _compute_triplet_edt_bbox(
-        cond_mask: np.ndarray,
-        behind_mask: np.ndarray,
-        front_mask: np.ndarray,
-        padding_voxels: float,
-    ):
-        """Return padded (z,y,x) slices for triplet EDT compute region, or None if empty."""
-        cond = np.asarray(cond_mask, dtype=bool)
-        behind = np.asarray(behind_mask, dtype=bool)
-        front = np.asarray(front_mask, dtype=bool)
-        if cond.shape != behind.shape or cond.shape != front.shape:
-            raise ValueError(
-                "triplet EDT bbox masks must share shape, "
-                f"got cond={tuple(cond.shape)} behind={tuple(behind.shape)} front={tuple(front.shape)}"
-            )
-        if cond.ndim != 3:
-            raise ValueError(f"triplet EDT bbox masks must be 3D, got shape {tuple(cond.shape)}")
-
-        union = cond | behind | front
-        if not union.any():
-            return None
-
-        pad = int(np.ceil(max(0.0, float(padding_voxels))))
-        zz, yy, xx = np.nonzero(union)
-        d, h, w = union.shape
-
-        z0 = max(0, int(zz.min()) - pad)
-        y0 = max(0, int(yy.min()) - pad)
-        x0 = max(0, int(xx.min()) - pad)
-        z1 = min(d - 1, int(zz.max()) + pad)
-        y1 = min(h - 1, int(yy.max()) + pad)
-        x1 = min(w - 1, int(xx.max()) + pad)
-        if z1 < z0 or y1 < y0 or x1 < x0:
-            return None
-        return (slice(z0, z1 + 1), slice(y0, y1 + 1), slice(x0, x1 + 1))
 
     def create_neighbor_masks(self, idx: int, patch_idx: int, wrap_idx: int):
         patch = self.patches[patch_idx]
@@ -748,7 +541,7 @@ class EdtSegDataset(Dataset):
         band_pct = min(100.0, max(1.0, band_pct))
 
         if need_neighbor_distances:
-            triplet_edt_bbox = self._compute_triplet_edt_bbox(
+            triplet_edt_bbox = _compute_triplet_edt_bbox(
                 cond_mask=cond_bin_full,
                 behind_mask=behind_bin_for_gt,
                 front_mask=front_bin_for_gt,
@@ -813,7 +606,7 @@ class EdtSegDataset(Dataset):
         behind_disp_np = behind_disp_work.astype(np.float32, copy=False)
         front_disp_np = front_disp_work.astype(np.float32, copy=False)
         if self.triplet_close_check_enabled:
-            cond_behind_frac, cond_front_frac, behind_front_frac = self._triplet_close_contact_fractions(
+            cond_behind_frac, cond_front_frac, behind_front_frac = _triplet_close_contact_fractions(
                 cond_mask=cond_bin_full,
                 behind_mask=behind_bin_for_gt,
                 front_mask=front_bin_for_gt,
@@ -1244,7 +1037,14 @@ class EdtSegDataset(Dataset):
     def __getitem__(self, idx):
         patch_idx, wrap_idx = self.sample_index[idx]
         cond_local_perturb_active = bool(
-            getattr(self, "_cond_local_perturb_active", self._should_attempt_cond_local_perturb())
+            getattr(
+                self,
+                "_cond_local_perturb_active",
+                _should_attempt_cond_local_perturb(
+                    config=self.config,
+                    apply_augmentation=bool(getattr(self, "apply_augmentation", True)),
+                ),
+            )
         )
         if self.use_triplet_wrap_displacement:
             mask_bundle = self.create_neighbor_masks(idx, patch_idx, wrap_idx)
@@ -1256,7 +1056,7 @@ class EdtSegDataset(Dataset):
             behind_seg = mask_bundle["behind_seg"]
             front_seg = mask_bundle["front_seg"]
             cond_surface_local, cond_surface_shape, cond_surface_keypoints, valid_cond_surface = (
-                self._prepare_cond_surface_keypoints(mask_bundle.get("center_surface_local"))
+                _prepare_cond_surface_keypoints(mask_bundle.get("center_surface_local"))
             )
             if not valid_cond_surface:
                 return self[np.random.randint(len(self))]
@@ -1321,7 +1121,7 @@ class EdtSegDataset(Dataset):
             cond_seg_gt = mask_bundle["cond_gt"]
             other_wraps_tensor = mask_bundle["other_wraps"]
             cond_surface_local, cond_surface_shape, cond_surface_keypoints, valid_cond_surface = (
-                self._prepare_cond_surface_keypoints(mask_bundle.get("cond_surface_local"))
+                _prepare_cond_surface_keypoints(mask_bundle.get("cond_surface_local"))
             )
             if not valid_cond_surface:
                 return self[np.random.randint(len(self))]
@@ -1425,7 +1225,11 @@ class EdtSegDataset(Dataset):
                 result["segmentation_skel"] = seg_skel  # skeleton for medial surface recall loss
             result.update(target_payload)
 
-        if not self._validate_result_tensors(result, idx):
+        if not _validate_result_tensors(
+            result,
+            idx,
+            enabled=self._validate_result_tensors_enabled,
+        ):
             return self[np.random.randint(len(self))]
         return result
     
