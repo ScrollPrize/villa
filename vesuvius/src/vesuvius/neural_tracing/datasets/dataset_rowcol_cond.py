@@ -222,18 +222,18 @@ class EdtSegDataset(Dataset):
                     )
                     continue
 
-                ref_scale = int(config.get('patch_count_reference_scale', 0))
-                if config.get('scale_normalize_patch_counts', True):
+                ref_scale = int(config['patch_count_reference_scale'])
+                if config['scale_normalize_patch_counts']:
                     count_scale = float(2 ** (volume_scale - ref_scale))
                     count_scale_sq = count_scale * count_scale
                 else:
                     count_scale_sq = 1.0
 
                 min_points_per_wrap = max(1, int(round(
-                    float(config.get('min_points_per_wrap', 100)) * count_scale_sq
+                    float(config['min_points_per_wrap']) * count_scale_sq
                 )))
                 edge_touch_min_count = max(1, int(round(
-                    float(config.get('edge_touch_min_count', 10)) * count_scale_sq
+                    float(config['edge_touch_min_count']) * count_scale_sq
                 )))
 
                 if config.get('verbose', False):
@@ -249,18 +249,18 @@ class EdtSegDataset(Dataset):
                 chunk_results = find_world_chunk_patches(
                     segments=scaled_segments,
                     target_size=target_size,
-                    overlap_fraction=config.get('overlap_fraction', 0.0),
-                    min_span_ratio=config.get('min_span_ratio', 1.0),
-                    edge_touch_frac=config.get('edge_touch_frac', 0.1),
+                    overlap_fraction=config['overlap_fraction'],
+                    min_span_ratio=config['min_span_ratio'],
+                    edge_touch_frac=config['edge_touch_frac'],
                     edge_touch_min_count=edge_touch_min_count,
-                    edge_touch_pad=config.get('edge_touch_pad', 0),
+                    edge_touch_pad=config['edge_touch_pad'],
                     min_points_per_wrap=min_points_per_wrap,
-                    bbox_pad_2d=config.get('bbox_pad_2d', 0),
-                    require_all_valid_in_bbox=config.get('require_all_valid_in_bbox', True),
-                    skip_chunk_if_any_invalid=config.get('skip_chunk_if_any_invalid', False),
-                    inner_bbox_fraction=config.get('inner_bbox_fraction', 0.7),
+                    bbox_pad_2d=config['bbox_pad_2d'],
+                    require_all_valid_in_bbox=config['require_all_valid_in_bbox'],
+                    skip_chunk_if_any_invalid=config['skip_chunk_if_any_invalid'],
+                    inner_bbox_fraction=config['inner_bbox_fraction'],
                     cache_dir=cache_dir,
-                    force_recompute=config.get('force_recompute_patches', False),
+                    force_recompute=config['force_recompute_patches'],
                     verbose=config.get('verbose', False),
                     chunk_pad=config.get('chunk_pad', 0.0),
                 )
@@ -342,8 +342,8 @@ class EdtSegDataset(Dataset):
 
     def _filter_triplet_overlap_chunks(self, patches):
         """Drop triplet chunks that include any wrap overlap inside that wrap's bbox."""
-        mask_filename = str(self.config.get("triplet_overlap_mask_filename", "overlap_mask.tif"))
-        warn_missing_masks = bool(self.config.get("triplet_warn_missing_overlap_masks", True))
+        mask_filename = str(self.config["triplet_overlap_mask_filename"])
+        warn_missing_masks = bool(self.config["triplet_warn_missing_overlap_masks"])
         mask_cache = {}
         warned_missing = set()
         warned_load_fail = set()
@@ -660,12 +660,12 @@ class EdtSegDataset(Dataset):
         return True
 
     def _should_attempt_cond_local_perturb(self) -> bool:
-        cfg = dict(self.config.get("cond_local_perturb", {}) or {})
-        if not bool(cfg.get("enabled", True)):
+        cfg = dict(self.config["cond_local_perturb"] or {})
+        if not bool(cfg["enabled"]):
             return False
-        if float(cfg.get("probability", 0.35)) <= 0.0:
+        if float(cfg["probability"]) <= 0.0:
             return False
-        apply_without_aug = bool(cfg.get("apply_without_augmentation", False))
+        apply_without_aug = bool(cfg["apply_without_augmentation"])
         if (not bool(getattr(self, "apply_augmentation", True))) and (not apply_without_aug):
             return False
         return True
@@ -898,14 +898,14 @@ class EdtSegDataset(Dataset):
         behind_np = behind_seg.detach().cpu().numpy()
         front_np = front_seg.detach().cpu().numpy()
 
-        weight_mode = str(self.config.get("triplet_dense_weight_mode", "band")).lower()
+        weight_mode = str(self.config["triplet_dense_weight_mode"]).lower()
         need_neighbor_distances = weight_mode == "band"
         cond_bin_full = cond_np > 0.5
         behind_bin_full = behind_np > 0.5
         front_bin_full = front_np > 0.5
         triplet_gt_vector_dilation_radius = max(
             0.0,
-            float(self.config.get("triplet_gt_vector_dilation_radius", 0.0)),
+            float(self.config["triplet_gt_vector_dilation_radius"]),
         )
         if triplet_gt_vector_dilation_radius > 0.0:
             behind_bin_for_gt = self._edt_dilate_binary_mask(
@@ -922,8 +922,8 @@ class EdtSegDataset(Dataset):
         if not behind_bin_for_gt.any() or not front_bin_for_gt.any():
             return None
 
-        band_padding = max(0.0, float(self.config.get("triplet_band_padding_voxels", 4.0)))
-        band_pct = float(self.config.get("triplet_band_distance_percentile", 95.0))
+        band_padding = max(0.0, float(self.config["triplet_band_padding_voxels"]))
+        band_pct = float(self.config["triplet_band_distance_percentile"])
         band_pct = min(100.0, max(1.0, band_pct))
 
         if need_neighbor_distances:
@@ -1362,7 +1362,7 @@ class EdtSegDataset(Dataset):
         # add thickness to conditioning segmentation via dilation
         use_dilation = self.config.get('use_dilation', False)
         if use_dilation:
-            dilation_radius = self.config.get('dilation_radius', 1.0)
+            dilation_radius = self.config['dilation_radius']
             cond_segmentation = self._edt_dilate_binary_mask(
                 cond_segmentation_gt > 0.5,
                 dilation_radius,
@@ -1370,7 +1370,7 @@ class EdtSegDataset(Dataset):
         else:
             cond_segmentation = cond_segmentation_gt
 
-        use_segmentation = self.config.get('use_segmentation', False)
+        use_segmentation = self.config['use_segmentation']
         use_sdt = self.config['use_sdt']
         full_segmentation = None
         full_segmentation_raw = None
@@ -1385,7 +1385,7 @@ class EdtSegDataset(Dataset):
             if use_dilation:
                 seg_dilated = full_segmentation
             else:
-                dilation_radius = self.config.get('dilation_radius', 1.0)
+                dilation_radius = self.config['dilation_radius']
                 seg_dilated = self._edt_dilate_binary_mask(
                     full_segmentation > 0.5,
                     dilation_radius,
@@ -1393,7 +1393,7 @@ class EdtSegDataset(Dataset):
             sdt = self._signed_distance_field(seg_dilated)
 
         if use_segmentation:
-            dilation_radius = self.config.get('dilation_radius', 1.0)
+            dilation_radius = self.config['dilation_radius']
             full_segmentation_raw_bin = full_segmentation_raw > 0.5
             seg_dilated = self._edt_dilate_binary_mask(
                 full_segmentation_raw_bin,
@@ -1582,7 +1582,7 @@ class EdtSegDataset(Dataset):
             use_other_wrap_cond = self.config['use_other_wrap_cond']
             use_sdt = self.config['use_sdt']
             use_heatmap = self.config['use_heatmap_targets']
-            use_segmentation = self.config.get('use_segmentation', False)
+            use_segmentation = self.config['use_segmentation']
 
             mask_bundle = self.create_split_masks(idx, patch_idx, wrap_idx)
             if mask_bundle is None:
