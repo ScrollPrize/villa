@@ -51,6 +51,7 @@ add_subdirectory(apps)
 if(VC_BUILD_TESTS)
     enable_testing()
     add_subdirectory(core/test)
+    add_subdirectory(libs/zarr/test)
 endif()
 
 include(VCPackageConfig)

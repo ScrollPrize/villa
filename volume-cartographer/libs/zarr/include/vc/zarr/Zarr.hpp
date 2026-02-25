@@ -221,7 +221,7 @@ void copyBufferToView(const std::vector<T>& buffer,
 
     const std::size_t dim = view.dimension();
     const auto& viewShape = view.shape();
-    std::size_t bufferOffset = 0, viewOffset = 0;
+    std::size_t bufferOffset = 0, viewOffset = view.data_offset();
     ShapeType dimPos(dim, 0);
     const std::size_t memLen = viewShape[dim - 1];
 
@@ -262,7 +262,7 @@ void copyViewToBuffer(const xt::xexpression<VIEW>& viewExpr,
 
     const std::size_t dim = view.dimension();
     const auto& viewShape = view.shape();
-    std::size_t bufferOffset = 0, viewOffset = 0;
+    std::size_t bufferOffset = 0, viewOffset = view.data_offset();
     ShapeType dimPos(dim, 0);
     const std::size_t memLen = viewShape[dim - 1];
 
