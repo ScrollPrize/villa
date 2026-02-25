@@ -34,6 +34,10 @@ from vesuvius.neural_tracing.datasets.direction_helpers import (
     build_triplet_direction_priors_from_displacements,
     maybe_swap_triplet_branch_channels,
 )
+from vesuvius.neural_tracing.datasets.augmentation import (
+    augment_split_payload,
+    augment_triplet_payload,
+)
 from vesuvius.neural_tracing.datasets.dataset_defaults import (
     setdefault_rowcol_cond_dataset_config,
     validate_rowcol_cond_dataset_config,
@@ -993,26 +997,23 @@ class EdtSegDataset(Dataset):
             if not valid_cond_surface:
                 return self[np.random.randint(len(self))]
 
-            if self._augmentations is not None:
-                aug_kwargs = {
-                    "image": vol_crop[None],
-                    "segmentation": torch.stack([cond_seg_gt, behind_seg, front_seg], dim=0),
-                    "crop_shape": self.crop_size,
-                }
-                if cond_surface_keypoints is not None:
-                    aug_kwargs["keypoints"] = cond_surface_keypoints
-                augmented = self._augmentations(**aug_kwargs)
-                vol_crop = augmented["image"].squeeze(0)
-                cond_seg_gt = augmented["segmentation"][0]
-                behind_seg = augmented["segmentation"][1]
-                front_seg = augmented["segmentation"][2]
-                if cond_surface_keypoints is not None:
-                    cond_surface_local = self._restore_cond_surface_from_augmented(
-                        augmented=augmented,
-                        cond_surface_keypoints=cond_surface_keypoints,
-                        cond_surface_shape=cond_surface_shape,
-                        mode="triplet",
-                    )
+            triplet_augmented = augment_triplet_payload(
+                augmentations=self._augmentations,
+                crop_size=self.crop_size,
+                vol_crop=vol_crop,
+                cond_seg_gt=cond_seg_gt,
+                behind_seg=behind_seg,
+                front_seg=front_seg,
+                cond_surface_local=cond_surface_local,
+                cond_surface_keypoints=cond_surface_keypoints,
+                cond_surface_shape=cond_surface_shape,
+                restore_cond_surface_fn=self._restore_cond_surface_from_augmented,
+            )
+            vol_crop = triplet_augmented["vol_crop"]
+            cond_seg_gt = triplet_augmented["cond_seg_gt"]
+            behind_seg = triplet_augmented["behind_seg"]
+            front_seg = triplet_augmented["front_seg"]
+            cond_surface_local = triplet_augmented["cond_surface_local"]
             cond_seg = self._resolve_conditioning_segmentation(
                 mask_bundle=mask_bundle,
                 cond_seg_gt=cond_seg_gt,
@@ -1065,65 +1066,37 @@ class EdtSegDataset(Dataset):
             if use_heatmap:
                 heatmap_tensor = mask_bundle["heatmap_target"]
 
-            if self._augmentations is not None:
-                seg_list = [masked_seg, other_wraps_tensor]
-                seg_keys = ['masked_seg', 'other_wraps']
-                seg_list.append(cond_seg_gt)
-                seg_keys.append('cond_seg_gt')
-                if use_segmentation:
-                    seg_list.append(full_seg)
-                    seg_keys.append('full_seg')
-                    seg_list.append(seg_skel)
-                    seg_keys.append('seg_skel')
-
-                dist_list = []
-                dist_keys = []
-                if use_sdt:
-                    dist_list.append(sdt_tensor)
-                    dist_keys.append('sdt')
-
-                aug_kwargs = {
-                    'image': vol_crop[None],  # [1, D, H, W]
-                    'segmentation': torch.stack(seg_list, dim=0),
-                    'crop_shape': self.crop_size,
-                }
-                if cond_surface_keypoints is not None:
-                    aug_kwargs['keypoints'] = cond_surface_keypoints
-                if dist_list:
-                    aug_kwargs['dist_map'] = torch.stack(dist_list, dim=0)
-                if use_heatmap:
-                    aug_kwargs['heatmap_target'] = heatmap_tensor[None]  # (1, D, H, W)
-                    aug_kwargs['regression_keys'] = ['heatmap_target']
-
-                augmented = self._augmentations(**aug_kwargs)
-
-                vol_crop = augmented['image'].squeeze(0)
-                for i, key in enumerate(seg_keys):
-                    if key == 'masked_seg':
-                        masked_seg = augmented['segmentation'][i]
-                    elif key == 'other_wraps':
-                        other_wraps_tensor = augmented['segmentation'][i]
-                    elif key == 'cond_seg_gt':
-                        cond_seg_gt = augmented['segmentation'][i]
-                    elif key == 'full_seg':
-                        full_seg = augmented['segmentation'][i]
-                    elif key == 'seg_skel':
-                        seg_skel = augmented['segmentation'][i]
-
-                if dist_list:
-                    for i, key in enumerate(dist_keys):
-                        if key == 'sdt':
-                            sdt_tensor = augmented['dist_map'][i]
-
-                if use_heatmap:
-                    heatmap_tensor = augmented['heatmap_target'].squeeze(0)
-                if cond_surface_keypoints is not None:
-                    cond_surface_local = self._restore_cond_surface_from_augmented(
-                        augmented=augmented,
-                        cond_surface_keypoints=cond_surface_keypoints,
-                        cond_surface_shape=cond_surface_shape,
-                        mode="split",
-                    )
+            split_augmented = augment_split_payload(
+                augmentations=self._augmentations,
+                crop_size=self.crop_size,
+                vol_crop=vol_crop,
+                masked_seg=masked_seg,
+                other_wraps_tensor=other_wraps_tensor,
+                cond_seg_gt=cond_seg_gt,
+                cond_surface_local=cond_surface_local,
+                cond_surface_keypoints=cond_surface_keypoints,
+                cond_surface_shape=cond_surface_shape,
+                restore_cond_surface_fn=self._restore_cond_surface_from_augmented,
+                use_segmentation=use_segmentation,
+                use_sdt=use_sdt,
+                use_heatmap=use_heatmap,
+                full_seg=full_seg if use_segmentation else None,
+                seg_skel=seg_skel if use_segmentation else None,
+                sdt_tensor=sdt_tensor if use_sdt else None,
+                heatmap_tensor=heatmap_tensor if use_heatmap else None,
+            )
+            vol_crop = split_augmented["vol_crop"]
+            masked_seg = split_augmented["masked_seg"]
+            other_wraps_tensor = split_augmented["other_wraps_tensor"]
+            cond_seg_gt = split_augmented["cond_seg_gt"]
+            cond_surface_local = split_augmented["cond_surface_local"]
+            if use_segmentation:
+                full_seg = split_augmented["full_seg"]
+                seg_skel = split_augmented["seg_skel"]
+            if use_sdt:
+                sdt_tensor = split_augmented["sdt_tensor"]
+            if use_heatmap:
+                heatmap_tensor = split_augmented["heatmap_tensor"]
             cond_seg = self._resolve_conditioning_segmentation(
                 mask_bundle=mask_bundle,
                 cond_seg_gt=cond_seg_gt,
@@ -1165,4 +1138,3 @@ class EdtSegDataset(Dataset):
             return self[np.random.randint(len(self))]
         return result
     
-
