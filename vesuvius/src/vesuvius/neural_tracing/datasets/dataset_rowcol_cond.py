@@ -235,16 +235,6 @@ class EdtSegDataset(Dataset):
         self._cc_structure_26 = np.ones((3, 3, 3), dtype=np.uint8)
         self._closing_structure_3 = np.ones((3, 3, 3), dtype=bool)
 
-        if config.get('verbose', False):
-            total_wraps = sum(len(p.wraps) for p in self.patches)
-            print(
-                f"RowCol dataset built: chunks={len(self.patches)}, "
-                f"wraps={total_wraps}, sample_mode={self.sample_mode}, "
-                f"samples={len(self.sample_index)}"
-            )
-            if self.use_triplet_wrap_displacement:
-                print(f"Triplet-wrap samples={len(self.sample_index)}")
-
     def __len__(self):
         return len(self.sample_index)
 
