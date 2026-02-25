@@ -1,6 +1,7 @@
 import argparse
 import colorsys
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -8,6 +9,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import tifffile
 from scipy.spatial import cKDTree
+from tqdm import tqdm
 
 from vesuvius.tifxyz import list_tifxyz, read_tifxyz
 
@@ -108,6 +110,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing overlap_mask.tif files.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     parser.add_argument("--napari", action="store_true", help="Display wrap and overlap points in napari.")
     parser.add_argument("--napari-downsample", type=int, default=8, help="Point downsample stride for napari.")
     parser.add_argument("--napari-point-size", type=float, default=3.0, help="Point size for napari point layers.")
@@ -307,7 +310,10 @@ class OverlapDetector:
         self.wraps = list(wraps)
         self.cfg = cfg
         self._row_cache: Dict[Tuple[Path, str], np.ndarray] = {}
+        self._col_valid_count_cache: Dict[Path, np.ndarray] = {}
+        self._sampled_points_cache: Dict[Tuple[Path, int], np.ndarray] = {}
         self._edge_points_cache: Dict[Tuple[Path, str], Tuple[np.ndarray, np.ndarray]] = {}
+        self._edge_tree_cache: Dict[Tuple[Path, str], Tuple[cKDTree, np.ndarray]] = {}
 
     def _candidate_rows(self, wrap: LoadedWrap, side: str) -> np.ndarray:
         key = (wrap.info.path, side)
@@ -316,31 +322,39 @@ class OverlapDetector:
             return cached
 
         width = wrap.shape[1]
-        row_order = np.arange(width, dtype=np.int32)
-        if side == SIDE_BACK:
-            row_order = row_order[::-1]
-        elif side != SIDE_FRONT:
+        if side not in (SIDE_FRONT, SIDE_BACK):
             raise ValueError(f"Unknown side: {side}")
 
         depth_limit = width if self.cfg.edge_depth_rows is None else min(width, int(self.cfg.edge_depth_rows))
 
-        rows: List[int] = []
-        for row in row_order:
-            if int(wrap.valid[:, row].sum()) >= self.cfg.min_row_points:
-                rows.append(int(row))
-            if len(rows) >= depth_limit:
-                break
-        result = np.asarray(rows, dtype=np.int32)
+        col_valid_counts = self._col_valid_count_cache.get(wrap.info.path)
+        if col_valid_counts is None:
+            col_valid_counts = np.asarray(wrap.valid.sum(axis=0), dtype=np.int32)
+            self._col_valid_count_cache[wrap.info.path] = col_valid_counts
+
+        rows = np.flatnonzero(col_valid_counts >= self.cfg.min_row_points).astype(np.int32, copy=False)
+        if side == SIDE_BACK:
+            rows = rows[::-1]
+        result = rows[:depth_limit].copy()
         self._row_cache[key] = result
         return result
 
     def _sample_row_points(self, wrap: LoadedWrap, row: int) -> np.ndarray:
+        key = (wrap.info.path, int(row))
+        cached = self._sampled_points_cache.get(key)
+        if cached is not None:
+            return cached
+
         valid_rows = np.flatnonzero(wrap.valid[:, row])
         if valid_rows.size == 0:
-            return np.zeros((0, 3), dtype=np.float32)
+            points = np.zeros((0, 3), dtype=np.float32)
+            self._sampled_points_cache[key] = points
+            return points
         sampled_rows = valid_rows[:: self.cfg.row_point_stride]
         if sampled_rows.size == 0:
-            return np.zeros((0, 3), dtype=np.float32)
+            points = np.zeros((0, 3), dtype=np.float32)
+            self._sampled_points_cache[key] = points
+            return points
 
         points = np.stack(
             [
@@ -351,7 +365,9 @@ class OverlapDetector:
             axis=-1,
         ).astype(np.float32, copy=False)
         finite = np.isfinite(points).all(axis=1)
-        return points[finite]
+        points = points[finite]
+        self._sampled_points_cache[key] = points
+        return points
 
     def _edge_points(self, wrap: LoadedWrap, side: str) -> Tuple[np.ndarray, np.ndarray]:
         key = (wrap.info.path, side)
@@ -380,6 +396,20 @@ class OverlapDetector:
         self._edge_points_cache[key] = result
         return result
 
+    def _edge_tree(self, wrap: LoadedWrap, side: str) -> Tuple[Optional[cKDTree], np.ndarray]:
+        key = (wrap.info.path, side)
+        cached = self._edge_tree_cache.get(key)
+        if cached is not None:
+            return cached[0], cached[1]
+
+        tgt_points, tgt_point_rows = self._edge_points(wrap, side)
+        if tgt_points.shape[0] < self.cfg.min_row_points:
+            return None, tgt_point_rows
+
+        tree = cKDTree(tgt_points)
+        self._edge_tree_cache[key] = (tree, tgt_point_rows)
+        return tree, tgt_point_rows
+
     def detect_band(
         self,
         source: LoadedWrap,
@@ -391,24 +421,42 @@ class OverlapDetector:
         if src_rows.size < self.cfg.min_band_rows:
             return None
 
-        tgt_points, tgt_point_rows = self._edge_points(target, target_side)
-        if tgt_points.shape[0] < self.cfg.min_row_points:
+        tree, tgt_point_rows = self._edge_tree(target, target_side)
+        if tree is None:
             return None
 
-        tree = cKDTree(tgt_points)
         min_query_points = max(6, self.cfg.min_row_points // max(1, self.cfg.row_point_stride))
 
         medians = np.full((src_rows.size,), np.nan, dtype=np.float64)
         q80s = np.full((src_rows.size,), np.nan, dtype=np.float64)
         line_iqrs = np.full((src_rows.size,), np.nan, dtype=np.float64)
 
+        query_parts: List[np.ndarray] = []
+        query_row_indices: List[int] = []
+        query_row_lengths: List[int] = []
         for idx, row in enumerate(src_rows):
             points = self._sample_row_points(source, int(row))
             if points.shape[0] < min_query_points:
                 continue
-            dists, nearest_idx = tree.query(points, k=1)
+            query_parts.append(points)
+            query_row_indices.append(idx)
+            query_row_lengths.append(int(points.shape[0]))
+
+        if not query_parts:
+            return None
+
+        batched_points = np.concatenate(query_parts, axis=0)
+        dists_all, nearest_idx_all = tree.query(batched_points, k=1)
+        dists_all = np.asarray(dists_all, dtype=np.float64)
+        nearest_idx_all = np.asarray(nearest_idx_all, dtype=np.int64)
+
+        offset = 0
+        for idx, length in zip(query_row_indices, query_row_lengths):
+            end = offset + length
+            dists = dists_all[offset:end]
+            nearest_idx = nearest_idx_all[offset:end]
+            offset = end
             dists = np.asarray(dists, dtype=np.float64)
-            nearest_idx = np.asarray(nearest_idx, dtype=np.int64)
             if dists.size == 0:
                 continue
 
@@ -622,7 +670,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
 
     inter_hits = 0
-    for left_info, right_info in inter_pairs:
+    inter_pairs_iter = tqdm(
+        inter_pairs,
+        total=len(inter_pairs),
+        desc="inter-pairs",
+        unit="pair",
+        disable=bool(args.no_progress) or not sys.stderr.isatty(),
+    )
+    for left_info, right_info in inter_pairs_iter:
         left = wraps_by_name[left_info.name]
         right = wraps_by_name[right_info.name]
 
@@ -649,7 +704,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
 
     self_hits = 0
-    for info in self_items:
+    self_items_iter = tqdm(
+        self_items,
+        total=len(self_items),
+        desc="self-wraps",
+        unit="wrap",
+        disable=bool(args.no_progress) or not sys.stderr.isatty(),
+    )
+    for info in self_items_iter:
         wrap = wraps_by_name[info.name]
         detections = detector.detect_self(wrap)
         for detection in detections:

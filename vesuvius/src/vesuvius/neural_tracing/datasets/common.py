@@ -98,10 +98,60 @@ def _wrap_bbox_has_overlap(mask: np.ndarray, bbox_2d):
     return bool(np.any(mask_arr[r0:r1 + 1, c0:c1 + 1]))
 
 
+def _wrap_chunk_has_overlap(mask: np.ndarray, wrap: dict, patch_world_bbox):
+    """Return True when overlap-mask pixels for this wrap fall inside the chunk bbox."""
+    if mask is None:
+        return False
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim != 2 or mask_arr.size == 0:
+        return False
+
+    seg = wrap.get("segment")
+    if seg is None:
+        return False
+
+    r_min, r_max, c_min, c_max = [int(v) for v in wrap["bbox_2d"]]
+    seg_h, seg_w = seg._valid_mask.shape
+    mask_h, mask_w = mask_arr.shape
+    r0 = max(0, r_min)
+    r1 = min(seg_h - 1, mask_h - 1, r_max)
+    c0 = max(0, c_min)
+    c1 = min(seg_w - 1, mask_w - 1, c_max)
+    if r1 < r0 or c1 < c0:
+        return False
+
+    overlap_local = mask_arr[r0:r1 + 1, c0:c1 + 1] > 0
+    if not bool(np.any(overlap_local)):
+        return False
+
+    seg.use_stored_resolution()
+    x_s, y_s, z_s, valid_s = seg[r0:r1 + 1, c0:c1 + 1]
+    if x_s.size == 0:
+        return False
+
+    z_min, z_max, y_min, y_max, x_min, x_max = patch_world_bbox
+    in_chunk = (
+        (z_s >= z_min) & (z_s < z_max) &
+        (y_s >= y_min) & (y_s < y_max) &
+        (x_s >= x_min) & (x_s < x_max)
+    )
+    finite = np.isfinite(z_s) & np.isfinite(y_s) & np.isfinite(x_s)
+    in_chunk &= finite
+    if valid_s is not None:
+        in_chunk &= np.asarray(valid_s, dtype=bool)
+    return bool(np.any(overlap_local & in_chunk))
+
+
 def _filter_triplet_overlap_chunks(patches, config):
-    """Drop triplet chunks that include any wrap overlap inside that wrap's bbox."""
+    """Drop triplet chunks based on configured overlap filtering mode.
+
+    Modes:
+      - bbox: drop if overlap_mask has hits inside the wrap bbox.
+      - any_masked_pixel: drop if overlap_mask hits overlap with this wrap inside this chunk's world bbox.
+    """
     mask_filename = str(config["triplet_overlap_mask_filename"])
     warn_missing_masks = bool(config["triplet_warn_missing_overlap_masks"])
+    overlap_filter_mode = str(config.get("triplet_overlap_filter_mode", "bbox")).lower()
     warned_missing = set()
     kept = []
     kept_indices = []
@@ -128,7 +178,16 @@ def _filter_triplet_overlap_chunks(patches, config):
 
             overlap_mask = np.asarray(tifffile.imread(str(mask_path))) > 0
 
-            if _wrap_bbox_has_overlap(overlap_mask, wrap["bbox_2d"]):
+            if overlap_filter_mode == "any_masked_pixel":
+                has_overlap = _wrap_chunk_has_overlap(overlap_mask, wrap, patch.world_bbox)
+            elif overlap_filter_mode == "bbox":
+                has_overlap = _wrap_bbox_has_overlap(overlap_mask, wrap["bbox_2d"])
+            else:
+                raise ValueError(
+                    "triplet_overlap_filter_mode must be one of {'bbox', 'any_masked_pixel'}, "
+                    f"got {overlap_filter_mode!r}"
+                )
+            if has_overlap:
                 drop_chunk = True
                 break
 
@@ -281,6 +340,36 @@ def _fraction_within_distance(dist_map: np.ndarray, source_mask: np.ndarray, max
     return float(np.mean(vals <= float(max_distance_voxels)))
 
 
+def _fraction_disp_within_distance(
+    disp_np: np.ndarray,
+    source_mask: np.ndarray,
+    max_distance_voxels: float,
+) -> float:
+    """Fraction of masked voxels whose displacement magnitude is <= threshold."""
+    disp = np.asarray(disp_np, dtype=np.float32)
+    mask = np.asarray(source_mask, dtype=bool)
+    if disp.ndim != 4 or disp.shape[0] != 3:
+        raise ValueError(f"disp_np must have shape (3, D, H, W), got {tuple(disp.shape)}")
+    if mask.shape != tuple(disp.shape[1:]):
+        raise ValueError(
+            "source_mask shape must match displacement spatial shape, "
+            f"got {tuple(mask.shape)} vs {tuple(disp.shape[1:])}"
+        )
+    if not bool(mask.any()):
+        return 0.0
+
+    masked_disp = disp[:, mask]
+    if masked_disp.size == 0:
+        return 0.0
+    finite = np.isfinite(masked_disp).all(axis=0)
+    masked_disp = masked_disp[:, finite]
+    if masked_disp.size == 0:
+        return 0.0
+
+    mags = np.sqrt(np.sum(masked_disp * masked_disp, axis=0, dtype=np.float32), dtype=np.float32)
+    return float(np.mean(mags <= float(max_distance_voxels)))
+
+
 def _triplet_close_contact_fractions(
     cond_mask: np.ndarray,
     behind_mask: np.ndarray,
@@ -296,13 +385,10 @@ def _triplet_close_contact_fractions(
     if front_disp.ndim != 4 or front_disp.shape[0] != 3:
         raise ValueError(f"front_disp_np must have shape (3, D, H, W), got {tuple(front_disp.shape)}")
 
-    behind_dist = np.linalg.norm(behind_disp, axis=0)
-    front_dist = np.linalg.norm(front_disp, axis=0)
-
-    cond_behind_frac = _fraction_within_distance(behind_dist, cond_mask, max_distance_voxels)
-    cond_front_frac = _fraction_within_distance(front_dist, cond_mask, max_distance_voxels)
-    behind_to_front_frac = _fraction_within_distance(front_dist, behind_mask, max_distance_voxels)
-    front_to_behind_frac = _fraction_within_distance(behind_dist, front_mask, max_distance_voxels)
+    cond_behind_frac = _fraction_disp_within_distance(behind_disp, cond_mask, max_distance_voxels)
+    cond_front_frac = _fraction_disp_within_distance(front_disp, cond_mask, max_distance_voxels)
+    behind_to_front_frac = _fraction_disp_within_distance(front_disp, behind_mask, max_distance_voxels)
+    front_to_behind_frac = _fraction_disp_within_distance(behind_disp, front_mask, max_distance_voxels)
     behind_front_frac = max(behind_to_front_frac, front_to_behind_frac)
     return cond_behind_frac, cond_front_frac, behind_front_frac
 

@@ -23,7 +23,6 @@ from vesuvius.neural_tracing.datasets.dataset_defaults import (
     validate_rowcol_cond_dataset_config,
 )
 from vesuvius.neural_tracing.loss.displacement_losses import (
-    dense_displacement_error_stats,
     dense_displacement_loss,
     surface_sampled_loss,
     surface_sampled_normal_loss,
@@ -779,25 +778,6 @@ def train(config_path):
 
             wandb_log['surf_loss'] = surf_loss.detach().item()
 
-            if (
-                should_log_this_iteration
-                and accelerator.is_main_process
-                and dense_gt_displacement is not None
-            ):
-                with torch.no_grad():
-                    train_disp_stats = dense_displacement_error_stats(
-                        disp_pred,
-                        dense_gt_displacement,
-                        sample_weights=dense_loss_weight,
-                    )
-                wandb_log['train_disp_err_mean'] = train_disp_stats['mean']
-                wandb_log['train_disp_err_p50'] = train_disp_stats['p50']
-                wandb_log['train_disp_err_p75'] = train_disp_stats['p75']
-                wandb_log['train_disp_err_p90'] = train_disp_stats['p90']
-                wandb_log['train_disp_err_p95'] = train_disp_stats['p95']
-                wandb_log['train_disp_err_p99'] = train_disp_stats['p99']
-                wandb_log['train_disp_err_count'] = float(train_disp_stats['count'])
-
             # Smoothness loss on displacement field
             if lambda_smooth > 0:
                 smooth_loss = smoothness_loss(disp_pred)
@@ -905,10 +885,6 @@ def train(config_path):
             postfix['cond'] = f"{wandb_log['cond_disp_loss']:.4f}"
         if lambda_triplet_min_disp > 0.0:
             postfix['min1vx'] = f"{wandb_log['triplet_min_disp_loss']:.4f}"
-        if 'train_disp_err_p95' in wandb_log:
-            postfix['p95'] = f"{wandb_log['train_disp_err_p95']:.2f}"
-        if 'train_disp_err_p99' in wandb_log:
-            postfix['p99'] = f"{wandb_log['train_disp_err_p99']:.2f}"
         progress_bar.set_postfix(postfix)
         progress_bar.update(1)
 
@@ -933,15 +909,6 @@ def train(config_path):
                     val_metric_sums['val_cond_disp_loss'] = 0.0
                 if lambda_triplet_min_disp > 0.0:
                     val_metric_sums['val_triplet_min_disp_loss'] = 0.0
-                val_disp_stats_weighted = {
-                    'mean': 0.0,
-                    'p50': 0.0,
-                    'p75': 0.0,
-                    'p90': 0.0,
-                    'p95': 0.0,
-                    'p99': 0.0,
-                }
-                val_disp_count_total = 0.0
 
                 first_val_vis = None
                 for val_batch_idx in range(val_batches_per_log):
@@ -970,17 +937,6 @@ def train(config_path):
                     )
                     val_total_loss = val_surf_loss
                     val_metric_sums['val_surf_loss'] += val_surf_loss.item()
-                    if val_dense_gt_displacement is not None:
-                        val_disp_stats = dense_displacement_error_stats(
-                            val_disp_pred,
-                            val_dense_gt_displacement,
-                            sample_weights=val_dense_loss_weight,
-                        )
-                        val_count = float(val_disp_stats['count'])
-                        if val_count > 0.0:
-                            val_disp_count_total += val_count
-                            for key in val_disp_stats_weighted:
-                                val_disp_stats_weighted[key] += val_disp_stats[key] * val_count
 
                     val_sdt_pred = None
                     if lambda_smooth > 0:
@@ -1068,10 +1024,6 @@ def train(config_path):
 
                 for key, value in val_metric_sums.items():
                     wandb_log[key] = value / val_batches_per_log
-                if val_disp_count_total > 0.0:
-                    wandb_log['val_disp_err_count'] = val_disp_count_total
-                    for key, weighted_sum in val_disp_stats_weighted.items():
-                        wandb_log[f'val_disp_err_{key}'] = weighted_sum / val_disp_count_total
 
                 # Create visualization
                 train_img_path = f'{out_dir}/{iteration:06}_train.png'

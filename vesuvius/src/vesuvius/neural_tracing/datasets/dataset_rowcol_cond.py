@@ -5,6 +5,7 @@ import torch
 from torch.utils.data import Dataset
 import json
 import tifffile
+import os
 from pathlib import Path
 from vesuvius.neural_tracing.datasets.common import (
     ChunkPatch,
@@ -38,6 +39,10 @@ from vesuvius.neural_tracing.datasets.augmentation import (
     augment_split_payload,
     augment_triplet_payload,
 )
+from vesuvius.neural_tracing.datasets.triplet_resampling import (
+    TripletResampleTracker,
+    choose_replacement_index,
+)
 from vesuvius.neural_tracing.datasets.dataset_defaults import (
     setdefault_rowcol_cond_dataset_config,
     validate_rowcol_cond_dataset_config,
@@ -51,6 +56,88 @@ from vesuvius.models.augmentation.pipelines.training_transforms import create_tr
 import random
 from scipy import ndimage
 import warnings
+
+
+_EDT_BACKEND_CACHE = {
+    "pid": None,
+    "name": None,
+    "fn": None,
+    "cp": None,
+    "kwargs": None,
+}
+
+
+def _resolve_edt_backend():
+    """Resolve EDT backend per-process: prefer cupyx, fallback to scipy."""
+    pid = int(os.getpid())
+    if _EDT_BACKEND_CACHE["pid"] == pid and _EDT_BACKEND_CACHE["fn"] is not None:
+        return _EDT_BACKEND_CACHE
+
+    backend_name = "scipy"
+    backend_fn = ndimage.distance_transform_edt
+    backend_cp = None
+    backend_kwargs = {}
+
+    try:
+        import cupy as cp
+        from cupyx.scipy import ndimage as cndimage
+
+        if int(cp.cuda.runtime.getDeviceCount()) > 0:
+            backend_name = "cupyx"
+            backend_fn = cndimage.distance_transform_edt
+            backend_cp = cp
+            backend_kwargs = {"float64_distances": False}
+    except Exception:
+        # Fallback is scipy; this keeps dataset functionality available on CPU
+        # or when CUDA runtime is unavailable in the current process.
+        pass
+
+    _EDT_BACKEND_CACHE["pid"] = pid
+    _EDT_BACKEND_CACHE["name"] = backend_name
+    _EDT_BACKEND_CACHE["fn"] = backend_fn
+    _EDT_BACKEND_CACHE["cp"] = backend_cp
+    _EDT_BACKEND_CACHE["kwargs"] = backend_kwargs
+    return _EDT_BACKEND_CACHE
+
+
+def _distance_transform_edt(
+    input_mask,
+    *,
+    return_distances: bool,
+    return_indices: bool,
+    sampling=None,
+):
+    backend = _resolve_edt_backend()
+    backend_name = backend["name"]
+    edt_fn = backend["fn"]
+
+    if backend_name == "scipy":
+        return edt_fn(
+            input_mask,
+            sampling=sampling,
+            return_distances=bool(return_distances),
+            return_indices=bool(return_indices),
+        )
+
+    cp = backend["cp"]
+    kwargs = backend["kwargs"] or {}
+    input_gpu = cp.asarray(np.asarray(input_mask, dtype=bool))
+    out = edt_fn(
+        input_gpu,
+        sampling=sampling,
+        return_distances=bool(return_distances),
+        return_indices=bool(return_indices),
+        **kwargs,
+    )
+    if return_distances and return_indices:
+        dist_gpu, idx_gpu = out
+        return cp.asnumpy(dist_gpu), cp.asnumpy(idx_gpu)
+    if return_distances and not return_indices:
+        return cp.asnumpy(out)
+    if (not return_distances) and return_indices:
+        return cp.asnumpy(out)
+    return None
+
 
 class EdtSegDataset(Dataset):
     def __init__(
@@ -113,6 +200,7 @@ class EdtSegDataset(Dataset):
         self._triplet_neighbor_lookup = {}
         self._triplet_lookup_stats = {}
         self._triplet_overlap_kept_indices = tuple()
+        self._triplet_resample_tracker = TripletResampleTracker()
 
         if patch_metadata is None:
             patches = []
@@ -490,6 +578,7 @@ class EdtSegDataset(Dataset):
         patch_idx: int,
         wrap_idx: int,
     ):
+        self._triplet_resample_tracker.reset_last_target_failure_reason()
         crop_size = self.crop_size
         cond_np = cond_seg_gt.detach().cpu().numpy()
         behind_np = behind_seg.detach().cpu().numpy()
@@ -517,11 +606,10 @@ class EdtSegDataset(Dataset):
             behind_bin_for_gt = behind_bin_full
             front_bin_for_gt = front_bin_full
         if not behind_bin_for_gt.any() or not front_bin_for_gt.any():
+            self._triplet_resample_tracker.set_last_target_failure_reason(
+                "empty neighbor mask after dilation"
+            )
             return None
-
-        band_padding = max(0.0, float(self.config["triplet_band_padding_voxels"]))
-        band_pct = float(self.config["triplet_band_distance_percentile"])
-        band_pct = min(100.0, max(1.0, band_pct))
 
         if need_neighbor_distances:
             triplet_edt_bbox = _compute_triplet_edt_bbox(
@@ -553,10 +641,15 @@ class EdtSegDataset(Dataset):
                     d_behind_work is not None and
                     d_front_work is not None
                 ):
-                    support_mask = cond_bin_full | behind_bin_for_gt | front_bin_for_gt
+                    z_slice, y_slice, x_slice = triplet_edt_bbox
+                    support_mask = (
+                        cond_bin_full[z_slice, y_slice, x_slice] |
+                        behind_bin_for_gt[z_slice, y_slice, x_slice] |
+                        front_bin_for_gt[z_slice, y_slice, x_slice]
+                    )
                     if (
-                        not np.isfinite(d_behind_work[support_mask]).all() or
-                        not np.isfinite(d_front_work[support_mask]).all()
+                        not np.isfinite(d_behind_work[z_slice, y_slice, x_slice][support_mask]).all() or
+                        not np.isfinite(d_front_work[z_slice, y_slice, x_slice][support_mask]).all()
                     ):
                         behind_disp_work = None
                         front_disp_work = None
@@ -585,6 +678,9 @@ class EdtSegDataset(Dataset):
             d_behind_work = None
             d_front_work = None
         if behind_disp_work is None or front_disp_work is None:
+            self._triplet_resample_tracker.set_last_target_failure_reason(
+                "dense displacement field unavailable"
+            )
             return None
         behind_disp_np = behind_disp_work
         front_disp_np = front_disp_work
@@ -609,12 +705,21 @@ class EdtSegDataset(Dataset):
                         f"thr={self.triplet_close_fraction_threshold:.4f} "
                         f"dist<={self.triplet_close_distance_voxels:.3f}"
                     )
+                self._triplet_resample_tracker.set_last_target_failure_reason(
+                    "triplet close-contact reject"
+                )
                 return None
 
         if weight_mode == "all":
             dense_weight_np = np.ones((1, *crop_size), dtype=np.float32)
         elif weight_mode == "band":
+            band_padding = max(0.0, float(self.config["triplet_band_padding_voxels"]))
+            band_pct = float(self.config["triplet_band_distance_percentile"])
+            band_pct = min(100.0, max(1.0, band_pct))
             if d_behind_work is None or d_front_work is None:
+                self._triplet_resample_tracker.set_last_target_failure_reason(
+                    "triplet band distances unavailable"
+                )
                 return None
             dense_band = create_band_mask(
                 cond_bin_full=cond_bin_full,
@@ -628,6 +733,9 @@ class EdtSegDataset(Dataset):
                 closing_structure_3=self._closing_structure_3,
             )
             if dense_band is None:
+                self._triplet_resample_tracker.set_last_target_failure_reason(
+                    "triplet band mask unavailable"
+                )
                 return None
             dense_weight_np = dense_band[None]
         else:
@@ -636,12 +744,20 @@ class EdtSegDataset(Dataset):
                 f"got {weight_mode!r}"
             )
         if float(dense_weight_np.sum()) <= 0:
+            self._triplet_resample_tracker.set_last_target_failure_reason(
+                "triplet dense weight is empty"
+            )
             return None
 
-        dense_gt_np = np.concatenate([behind_disp_np, front_disp_np], axis=0)
+        dense_gt_np = np.empty((6, *crop_size), dtype=np.float32)
+        dense_gt_np[:3, ...] = behind_disp_np
+        dense_gt_np[3:, ...] = front_disp_np
         dir_priors_np = None
         if self.use_triplet_direction_priors:
             if cond_surface_local is None:
+                self._triplet_resample_tracker.set_last_target_failure_reason(
+                    "conditioning surface missing for direction priors"
+                )
                 return None
             cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
             dir_priors_np = build_triplet_direction_priors_from_conditioning_surface(
@@ -651,6 +767,9 @@ class EdtSegDataset(Dataset):
                 mask_mode=self.triplet_direction_prior_mask,
             )
             if dir_priors_np is None:
+                self._triplet_resample_tracker.set_last_target_failure_reason(
+                    "triplet direction priors unavailable"
+                )
                 return None
         dense_gt_np, dir_priors_np, triplet_channel_order_np = maybe_swap_triplet_branch_channels(
             dense_gt_np,
@@ -703,7 +822,37 @@ class EdtSegDataset(Dataset):
             weight_mask: (1, D, H, W) per-voxel supervision weights
             distance_map: (D, H, W) nearest-surface distance (optional)
         """
-        surface = np.asarray(full_surface_mask) > 0.5
+        surface = np.asarray(full_surface_mask)
+        if surface.dtype != np.bool_:
+            surface = surface > 0.5
+
+        def _compute_core(surface_bool: np.ndarray):
+            if not surface_bool.any():
+                if return_distances:
+                    return None, None, None
+                return None, None
+
+            if return_distances:
+                distances, nearest_idx = _distance_transform_edt(
+                    ~surface_bool, return_distances=True, return_indices=True
+                )
+                distances = distances.astype(np.float32, copy=False)
+            else:
+                nearest_idx = _distance_transform_edt(
+                    ~surface_bool, return_distances=False, return_indices=True
+                )
+                distances = None
+
+            disp = nearest_idx.astype(np.float32, copy=False)
+            z_axis, y_axis, x_axis = self._get_dense_axis_offsets(surface_bool.shape)
+            disp[0] -= z_axis
+            disp[1] -= y_axis
+            disp[2] -= x_axis
+            weights = np.ones((1, *surface_bool.shape), dtype=np.float32) if return_weights else None
+            if return_distances:
+                return disp, weights, distances
+            return disp, weights
+
         if bbox_slices is not None:
             if surface.ndim != 3:
                 raise ValueError(f"full_surface_mask must be 3D, got shape {tuple(surface.shape)}")
@@ -717,19 +866,9 @@ class EdtSegDataset(Dataset):
                 return None, None
 
             if return_distances:
-                sub_disp, sub_weights, sub_dist = self._compute_dense_displacement_field(
-                    sub_surface,
-                    return_weights=return_weights,
-                    return_distances=True,
-                    bbox_slices=None,
-                )
+                sub_disp, sub_weights, sub_dist = _compute_core(sub_surface)
             else:
-                sub_disp, sub_weights = self._compute_dense_displacement_field(
-                    sub_surface,
-                    return_weights=return_weights,
-                    return_distances=False,
-                    bbox_slices=None,
-                )
+                sub_disp, sub_weights = _compute_core(sub_surface)
                 sub_dist = None
             if sub_disp is None:
                 if return_distances:
@@ -753,31 +892,7 @@ class EdtSegDataset(Dataset):
                 return disp_full, weights_full, dist_full
             return disp_full, weights_full
 
-        if not surface.any():
-            if return_distances:
-                return None, None, None
-            return None, None
-
-        # Nearest foreground (surface) index per voxel.
-        if return_distances:
-            distances, nearest_idx = ndimage.distance_transform_edt(
-                ~surface, return_distances=True, return_indices=True
-            )
-            distances = distances.astype(np.float32, copy=False)
-        else:
-            nearest_idx = ndimage.distance_transform_edt(
-                ~surface, return_distances=False, return_indices=True
-            )
-            distances = None
-        disp = nearest_idx.astype(np.float32, copy=False)
-        z_axis, y_axis, x_axis = self._get_dense_axis_offsets(surface.shape)
-        disp[0] -= z_axis
-        disp[1] -= y_axis
-        disp[2] -= x_axis
-        weights = np.ones((1, *surface.shape), dtype=np.float32) if return_weights else None
-        if return_distances:
-            return disp, weights, distances
-        return disp, weights
+        return _compute_core(surface)
 
     def create_split_masks(self, idx: int, patch_idx: int, wrap_idx: int):
         patch = self.patches[patch_idx]
@@ -977,7 +1092,60 @@ class EdtSegDataset(Dataset):
             "dense_loss_weight": dense_loss_weight,  # (1, D, H, W)
         }
 
-    def __getitem__(self, idx):
+    def _format_triplet_target_unavailable_reason(self):
+        reason = "triplet target payload unavailable"
+        detail = self._triplet_resample_tracker.last_target_failure_reason
+        if detail:
+            return f"{reason} ({detail})"
+        return reason
+
+    def _resample_item(self, idx, reason, patch_idx=None, wrap_idx=None, attempted_indices=None):
+        attempted = set(int(i) for i in (attempted_indices or ()))
+        if 0 <= int(idx) < len(self):
+            attempted.add(int(idx))
+
+        if (
+            self.use_triplet_wrap_displacement and
+            str(reason).startswith("triplet target payload unavailable") and
+            0 <= int(idx) < len(self.sample_index)
+        ):
+            self._triplet_resample_tracker.mark_failed_target_key(self.sample_index[int(idx)])
+
+        blocked_keys = (
+            self._triplet_resample_tracker.failed_target_keys
+            if self.use_triplet_wrap_displacement
+            else None
+        )
+        new_idx = choose_replacement_index(
+            self.sample_index,
+            attempted_indices=attempted,
+            failed_target_keys=blocked_keys,
+        )
+        if new_idx is None:
+            raise RuntimeError(
+                f"Unable to resample item after exhausting {len(attempted)} unique indices; "
+                f"last idx={idx}, reason={reason}"
+            )
+        patch_str = f" patch={patch_idx}" if patch_idx is not None else ""
+        wrap_str = f" wrap={wrap_idx}" if wrap_idx is not None else ""
+        print(
+            f"[EdtSegDataset] Resampling item idx={idx}{patch_str}{wrap_str} "
+            f"reason={reason} replacement_idx={new_idx}"
+        )
+        return self.__getitem__(new_idx, _attempted_indices=attempted)
+
+    def __getitem__(self, idx, _attempted_indices=None):
+        idx = int(idx)
+        if _attempted_indices is None:
+            _attempted_indices = set()
+        if idx in _attempted_indices:
+            return self._resample_item(
+                idx,
+                "duplicate resample index encountered",
+                attempted_indices=_attempted_indices,
+            )
+        _attempted_indices.add(idx)
+
         patch_idx, wrap_idx = self.sample_index[idx]
         cond_local_perturb_active = bool(
             getattr(
@@ -992,7 +1160,13 @@ class EdtSegDataset(Dataset):
         if self.use_triplet_wrap_displacement:
             mask_bundle = self.create_neighbor_masks(idx, patch_idx, wrap_idx)
             if mask_bundle is None:
-                return self[np.random.randint(len(self))]
+                return self._resample_item(
+                    idx,
+                    "triplet mask bundle missing",
+                    patch_idx=patch_idx,
+                    wrap_idx=wrap_idx,
+                    attempted_indices=_attempted_indices,
+                )
 
             vol_crop = mask_bundle["vol"]
             cond_seg_gt = mask_bundle["cond_gt"]
@@ -1002,7 +1176,13 @@ class EdtSegDataset(Dataset):
                 _prepare_cond_surface_keypoints(mask_bundle.get("center_surface_local"))
             )
             if not valid_cond_surface:
-                return self[np.random.randint(len(self))]
+                return self._resample_item(
+                    idx,
+                    "triplet conditioning surface invalid",
+                    patch_idx=patch_idx,
+                    wrap_idx=wrap_idx,
+                    attempted_indices=_attempted_indices,
+                )
 
             triplet_augmented = augment_triplet_payload(
                 augmentations=self._augmentations,
@@ -1028,7 +1208,13 @@ class EdtSegDataset(Dataset):
                 cond_local_perturb_active=cond_local_perturb_active,
             )
             if cond_seg is None:
-                return self[np.random.randint(len(self))]
+                return self._resample_item(
+                    idx,
+                    "triplet conditioning segmentation unresolved",
+                    patch_idx=patch_idx,
+                    wrap_idx=wrap_idx,
+                    attempted_indices=_attempted_indices,
+                )
 
             target_payload = self.create_neighbor_targets(
                 cond_seg_gt=cond_seg_gt,
@@ -1040,7 +1226,13 @@ class EdtSegDataset(Dataset):
                 wrap_idx=wrap_idx,
             )
             if target_payload is None:
-                return self[np.random.randint(len(self))]
+                return self._resample_item(
+                    idx,
+                    self._format_triplet_target_unavailable_reason(),
+                    patch_idx=patch_idx,
+                    wrap_idx=wrap_idx,
+                    attempted_indices=_attempted_indices,
+                )
 
             result = {
                 "vol": vol_crop,
@@ -1055,7 +1247,13 @@ class EdtSegDataset(Dataset):
 
             mask_bundle = self.create_split_masks(idx, patch_idx, wrap_idx)
             if mask_bundle is None:
-                return self[np.random.randint(len(self))]
+                return self._resample_item(
+                    idx,
+                    "split mask bundle missing",
+                    patch_idx=patch_idx,
+                    wrap_idx=wrap_idx,
+                    attempted_indices=_attempted_indices,
+                )
 
             vol_crop = mask_bundle["vol"]
             masked_seg = mask_bundle["masked_seg"]
@@ -1065,7 +1263,13 @@ class EdtSegDataset(Dataset):
                 _prepare_cond_surface_keypoints(mask_bundle.get("cond_surface_local"))
             )
             if not valid_cond_surface:
-                return self[np.random.randint(len(self))]
+                return self._resample_item(
+                    idx,
+                    "split conditioning surface invalid",
+                    patch_idx=patch_idx,
+                    wrap_idx=wrap_idx,
+                    attempted_indices=_attempted_indices,
+                )
             if use_segmentation:
                 full_seg = mask_bundle["segmentation"]
                 seg_skel = mask_bundle["segmentation_skel"]
@@ -1112,14 +1316,26 @@ class EdtSegDataset(Dataset):
                 cond_local_perturb_active=cond_local_perturb_active,
             )
             if cond_seg is None:
-                return self[np.random.randint(len(self))]
+                return self._resample_item(
+                    idx,
+                    "split conditioning segmentation unresolved",
+                    patch_idx=patch_idx,
+                    wrap_idx=wrap_idx,
+                    attempted_indices=_attempted_indices,
+                )
 
             target_payload = self.create_split_targets(
                 cond_seg_gt=cond_seg_gt,
                 masked_seg=masked_seg,
             )
             if target_payload is None:
-                return self[np.random.randint(len(self))]
+                return self._resample_item(
+                    idx,
+                    "split target payload unavailable",
+                    patch_idx=patch_idx,
+                    wrap_idx=wrap_idx,
+                    attempted_indices=_attempted_indices,
+                )
 
             result = {
                 "vol": vol_crop,                 # raw volume crop
@@ -1143,6 +1359,12 @@ class EdtSegDataset(Dataset):
             idx,
             enabled=self._validate_result_tensors_enabled,
         ):
-            return self[np.random.randint(len(self))]
+            return self._resample_item(
+                idx,
+                "result tensor validation failed",
+                patch_idx=patch_idx,
+                wrap_idx=wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
         return result
     

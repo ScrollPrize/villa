@@ -4,7 +4,6 @@ Displacement field loss functions for neural tracing.
 Surface-sampled loss for training models to predict dense displacement fields
 from extrapolated surfaces.
 """
-import math
 
 import torch
 import torch.nn.functional as F
@@ -39,66 +38,6 @@ def _dense_displacement_branch_magnitudes(error):
     num_branches = channels // 3
     branch_error = error.reshape(error.shape[0], num_branches, 3, *error.shape[2:])
     return _safe_vector_norm(branch_error, dim=2)
-
-
-def _percentile_key(percentile):
-    """Convert percentile number to stable dictionary key (e.g. 95 -> 'p95')."""
-    if not math.isfinite(float(percentile)):
-        raise ValueError(f"percentiles must be finite, got {percentile!r}")
-    p = float(percentile)
-    if p < 0.0 or p > 100.0:
-        raise ValueError(f"percentiles must satisfy 0 <= p <= 100, got {percentile!r}")
-    if abs(p - round(p)) < 1e-9:
-        return f"p{int(round(p))}"
-    return f"p{str(p).replace('.', '_')}"
-
-
-def dense_displacement_error_stats(
-    pred_field,
-    gt_displacement,
-    sample_weights=None,
-    percentiles=(50, 75, 90, 95, 99),
-):
-    """Compute dense displacement error distribution stats on supervised voxels.
-
-    Error magnitude is computed per displacement branch (dz/dy/dx triplets).
-    For C=3 this is a single branch; for C=6 triplet mode this yields two branch
-    magnitudes per voxel. Voxels with sample weight <= 0 are excluded.
-
-    Returns:
-        dict with keys {'mean', 'count', 'p50', 'p75', ...} for requested
-        percentiles.
-    """
-    if pred_field.shape != gt_displacement.shape:
-        raise ValueError(
-            f"pred_field and gt_displacement must match shape, got "
-            f"{tuple(pred_field.shape)} vs {tuple(gt_displacement.shape)}"
-        )
-
-    error = pred_field - gt_displacement
-    branch_mags = _dense_displacement_branch_magnitudes(error)  # [B, K, D, H, W]
-    effective_mask = _resolve_dense_sample_weights(sample_weights, branch_mags[:, 0]) > 0
-
-    supervised_branch_mask = effective_mask.unsqueeze(1).expand_as(branch_mags)
-    selected = branch_mags.masked_select(supervised_branch_mask)
-
-    result = {"mean": 0.0, "count": int(selected.numel())}
-    percentile_keys = [_percentile_key(p) for p in percentiles]
-    for key in percentile_keys:
-        result[key] = 0.0
-
-    if selected.numel() == 0:
-        return result
-
-    selected = selected.to(torch.float32)
-    result["mean"] = float(selected.mean().item())
-
-    q = torch.tensor([float(p) / 100.0 for p in percentiles], device=selected.device, dtype=selected.dtype)
-    q_vals = torch.quantile(selected, q)
-    for key, value in zip(percentile_keys, q_vals):
-        result[key] = float(value.item())
-
-    return result
 
 
 def _sample_pred_field(pred_field, extrap_coords):

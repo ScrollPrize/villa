@@ -18,6 +18,8 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("heatmap_sigma", 2.0)
     config.setdefault("use_segmentation", False)
     config.setdefault("sample_mode", "wrap")
+    config.setdefault("val_num_workers", 0)
+    config.setdefault("persistent_workers", False)
 
     # Other-wrap conditioning defaults.
     config.setdefault("use_other_wrap_cond", False)
@@ -34,6 +36,7 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("triplet_direction_prior_mask", "cond")
     config.setdefault("triplet_overlap_mask_filename", "overlap_mask.tif")
     config.setdefault("triplet_warn_missing_overlap_masks", False)
+    config.setdefault("triplet_overlap_filter_mode", "bbox")
     config.setdefault("triplet_close_check_enabled", True)
     config.setdefault("triplet_close_distance_voxels", 1.0)
     config.setdefault("triplet_close_fraction_threshold", 0.05)
@@ -105,6 +108,9 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
 
     triplet_direction_prior_mask = str(config.get("triplet_direction_prior_mask", "cond")).lower()
     _require_choice("triplet_direction_prior_mask", triplet_direction_prior_mask, {"cond", "full"})
+
+    triplet_overlap_filter_mode = str(config.get("triplet_overlap_filter_mode", "bbox")).lower()
+    _require_choice("triplet_overlap_filter_mode", triplet_overlap_filter_mode, {"bbox", "any_masked_pixel"})
 
     triplet_close_distance_voxels = float(config.get("triplet_close_distance_voxels", 1.0))
     _require_finite_range("triplet_close_distance_voxels", triplet_close_distance_voxels, min_value=0.0)
