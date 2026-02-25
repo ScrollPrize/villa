@@ -504,6 +504,7 @@ class DilationMaskState:
 		xy = model.xy_ema  # (Z, Hm, Wm, 2)
 		mesh_step_px = int(model.params.mesh_step_px)
 		scaledown = float(model.params.scaledown)
+		z_step_vx = int(model.params.z_step_vx)
 		z_size = int(xy.shape[0])
 		device = xy.device
 
@@ -517,20 +518,29 @@ class DilationMaskState:
 			_cx, _cy, cw, ch, _z0, _d = model.params.crop_xyzwhd
 			h_img, w_img = int(ch), int(cw)
 
-		# Mask grid at volume-scaled resolution.
-		# Each mask voxel = mesh_step_px model pixels in XY, scaledown z-slices in Z.
-		mask_w = max(1, math.ceil(w_img / mesh_step_px))
-		mask_h = max(1, math.ceil(h_img / mesh_step_px))
-		mask_z = max(1, math.ceil(z_size / scaledown))
+		# Mask grid: XY = data size in model pixels, Z = z_size (one per data slice).
+		# 1 XY mask voxel = 1 model pixel = scaledown fullres voxels.
+		# 1 Z  mask voxel = 1 z-slice   = z_step_vx fullres voxels.
+		mask_w = w_img
+		mask_h = h_img
+		mask_z = z_size
+
+		# Fullres voxels per one mask-space dilation step in each dimension.
+		# Model pixel space = fullres / scaledown.
+		# XY: 1 mask voxel = 1 model pixel = scaledown fullres voxels.
+		# Z:  1 mask voxel = 1 z-slice = z_step_vx * scaledown fullres voxels.
+		#     (z_step_vx is the z-stride in model pixels; multiply by scaledown for fullres.)
+		self.xy_vx_per_mvx = scaledown
+		self.z_vx_per_mvx = float(z_step_vx) * scaledown
 
 		self.mesh_step_px = mesh_step_px
-		self.scaledown = scaledown
 		self.h_img = h_img
 		self.w_img = w_img
 		self.z_size = z_size
 
 		self.mask = torch.zeros((mask_z, 1, mask_h, mask_w), device=device, dtype=torch.float32)
-		self.accum = 0.0
+		self.xy_accum = 0.0
+		self.z_accum = 0.0
 		self.blur_sigma = float(params.get("blur_sigma", 3.0))
 
 		# Seed: single voxel at center of mesh, converted to mask coords
@@ -542,50 +552,51 @@ class DilationMaskState:
 		center_xy = xy[zi, yi_m, xi_m]  # (2,) in model pixels
 		x_px = float(center_xy[0].cpu())
 		y_px = float(center_xy[1].cpu())
-		mask_x = max(0, min(mask_w - 1, round(x_px / mesh_step_px)))
-		mask_y = max(0, min(mask_h - 1, round(y_px / mesh_step_px)))
-		mask_zi = max(0, min(mask_z - 1, round(zi / scaledown)))
+		mask_x = max(0, min(mask_w - 1, round(x_px)))
+		mask_y = max(0, min(mask_h - 1, round(y_px)))
+		mask_zi = max(0, min(mask_z - 1, zi))
 		self.mask[mask_zi, 0, mask_y, mask_x] = 1.0
 		self._step = 0
 
-		print(f"[dilation_mask] init: z_size={z_size} h_img={h_img} w_img={w_img} "
-			  f"mesh_step_px={mesh_step_px} scaledown={scaledown}")
+		print(f"[dilation_mask] init: z_size={z_size} z_step_vx={z_step_vx} scaledown={scaledown} "
+			  f"h_img={h_img} w_img={w_img} mesh_step_px={mesh_step_px}")
 		print(f"[dilation_mask] mask grid: z={mask_z} h={mask_h} w={mask_w} "
-			  f"(1 mask voxel = {mesh_step_px}px XY, {scaledown} slices Z)")
+			  f"(1 xy mvx = {self.xy_vx_per_mvx:.1f} fullres vx, "
+			  f"1 z mvx = {self.z_vx_per_mvx:.1f} fullres vx)")
 		print(f"[dilation_mask] seed: mask_zi={mask_zi} mask_y={mask_y} mask_x={mask_x} "
 			  f"(from zi={zi} x_px={x_px:.1f} y_px={y_px:.1f})")
 
 		self.blurred = self._recompute_blurred()
 
 	def _recompute_blurred(self) -> torch.Tensor:
-		"""Blur mask at mask resolution, then trilinear-upsample to image resolution."""
+		"""Blur mask (already at data resolution)."""
 		m = self.mask
 		if self.blur_sigma > 0.0:
 			m = _gaussian_blur_mask_nchw(x=m, sigma=self.blur_sigma).clamp(0.0, 1.0)
-		# Upsample (mask_z, 1, mask_h, mask_w) -> (z_size, 1, h_img, w_img)
-		mz, _, mh, mw = (int(v) for v in m.shape)
-		m5 = m.reshape(1, 1, mz, mh, mw)
-		m5 = F.interpolate(m5, size=(self.z_size, self.h_img, self.w_img), mode="trilinear", align_corners=False)
-		return m5.reshape(self.z_size, 1, self.h_img, self.w_img)
+		return m
 
-	def advance(self, mvx_per_it: float) -> None:
-		"""Grow the mask by `mvx_per_it` mask-voxels (fractional accumulation)."""
-		self.accum += float(mvx_per_it)
-		n = int(math.floor(self.accum))
-		self.accum -= float(n)
+	def advance(self, vx_per_it: float) -> None:
+		"""Grow the mask by `vx_per_it` fullres voxels (separate xy/z accumulation)."""
+		self.xy_accum += float(vx_per_it)
+		self.z_accum += float(vx_per_it)
+		n_xy = int(math.floor(self.xy_accum / self.xy_vx_per_mvx))
+		n_z = int(math.floor(self.z_accum / self.z_vx_per_mvx))
+		self.xy_accum -= float(n_xy) * self.xy_vx_per_mvx
+		self.z_accum -= float(n_z) * self.z_vx_per_mvx
 		self._step += 1
-		if n > 0:
-			ks = 2 * n + 1
-			# Reshape (Z,1,H,W) -> (1,1,Z,H,W) for 3D max_pool
+		if n_xy > 0 or n_z > 0:
+			ks_xy = 2 * n_xy + 1
+			ks_z = 2 * n_z + 1
 			z, c, h, w = (int(v) for v in self.mask.shape)
 			m5 = self.mask.reshape(1, 1, z, h, w)
-			m5 = F.max_pool3d(m5, kernel_size=ks, stride=1, padding=n)
+			m5 = F.max_pool3d(m5, kernel_size=(ks_z, ks_xy, ks_xy),
+							  stride=1, padding=(n_z, n_xy, n_xy))
 			self.mask = m5.reshape(z, 1, h, w)
 			# Coverage: count nonzero per z-slice
 			nz_per_z = (self.mask[:, 0] > 0).sum(dim=(1, 2)).tolist()
 			total_hw = int(h) * int(w)
 			z_active = sum(1 for v in nz_per_z if v > 0)
-			print(f"[dilation_mask] step={self._step} dilated ks={ks} "
+			print(f"[dilation_mask] step={self._step} dilated ks_xy={ks_xy} ks_z={ks_z} "
 				  f"mask({z},{h},{w}) z_active={z_active}/{z} "
 				  f"nz_per_z={[int(v) for v in nz_per_z]}/{total_hw}")
 		self.blurred = self._recompute_blurred()
@@ -641,7 +652,7 @@ def constant_velocity_dilation(*, model: fit_model.Model2D, it: int, params: dic
 	if "_state" not in params:
 		params["_state"] = DilationMaskState(model=model, params=params)
 	state = params["_state"]
-	state.advance(float(params.get("mvx_per_it", 1.0)))
+	state.advance(float(params.get("vx_per_it", 1.0)))
 	return state.blurred
 
 
