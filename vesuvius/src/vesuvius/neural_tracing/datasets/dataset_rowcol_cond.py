@@ -470,7 +470,7 @@ class EdtSegDataset(Dataset):
             "cond_gt": torch.from_numpy(center_seg_gt).to(torch.float32),
             "behind_seg": torch.from_numpy(behind_seg).to(torch.float32),
             "front_seg": torch.from_numpy(front_seg).to(torch.float32),
-            "center_surface_local": torch.from_numpy(center_local_gt.astype(np.float32, copy=False)).to(torch.float32),
+            "center_surface_local": torch.from_numpy(center_local_gt).to(torch.float32),
         }
 
     def create_neighbor_targets(
@@ -579,8 +579,8 @@ class EdtSegDataset(Dataset):
             d_front_work = None
         if behind_disp_work is None or front_disp_work is None:
             return None
-        behind_disp_np = behind_disp_work.astype(np.float32, copy=False)
-        front_disp_np = front_disp_work.astype(np.float32, copy=False)
+        behind_disp_np = behind_disp_work
+        front_disp_np = front_disp_work
         if self.triplet_close_check_enabled:
             cond_behind_frac, cond_front_frac, behind_front_frac = _triplet_close_contact_fractions(
                 cond_mask=cond_bin_full,
@@ -631,7 +631,7 @@ class EdtSegDataset(Dataset):
         if float(dense_weight_np.sum()) <= 0:
             return None
 
-        dense_gt_np = np.concatenate([behind_disp_np, front_disp_np], axis=0).astype(np.float32, copy=False)
+        dense_gt_np = np.concatenate([behind_disp_np, front_disp_np], axis=0)
         dir_priors_np = None
         if self.use_triplet_direction_priors:
             dir_priors_np = build_triplet_direction_priors_from_displacements(
@@ -726,19 +726,19 @@ class EdtSegDataset(Dataset):
                 return None, None
 
             disp_full = np.zeros((3, *surface.shape), dtype=np.float32)
-            disp_full[:, z_slice, y_slice, x_slice] = sub_disp.astype(np.float32, copy=False)
+            disp_full[:, z_slice, y_slice, x_slice] = sub_disp
 
             if return_weights:
                 weights_full = np.zeros((1, *surface.shape), dtype=np.float32)
                 if sub_weights is not None:
-                    weights_full[:, z_slice, y_slice, x_slice] = sub_weights.astype(np.float32, copy=False)
+                    weights_full[:, z_slice, y_slice, x_slice] = sub_weights
             else:
                 weights_full = None
 
             if return_distances:
                 dist_full = np.full(surface.shape, np.inf, dtype=np.float32)
                 if sub_dist is not None:
-                    dist_full[z_slice, y_slice, x_slice] = sub_dist.astype(np.float32, copy=False)
+                    dist_full[z_slice, y_slice, x_slice] = sub_dist
                 return disp_full, weights_full, dist_full
             return disp_full, weights_full
 
@@ -936,7 +936,7 @@ class EdtSegDataset(Dataset):
             "masked_seg": torch.from_numpy(masked_segmentation).to(torch.float32),
             "cond_gt": torch.from_numpy(cond_segmentation_gt_raw).to(torch.float32),
             "other_wraps": torch.from_numpy(other_wraps_vox).to(torch.float32),
-            "cond_surface_local": torch.from_numpy(cond_zyxs_unperturbed_local_float.astype(np.float32, copy=False)).to(torch.float32),
+            "cond_surface_local": torch.from_numpy(cond_zyxs_unperturbed_local_float).to(torch.float32),
         }
         if use_segmentation:
             result["segmentation"] = torch.from_numpy(seg_dilated).to(torch.float32)
