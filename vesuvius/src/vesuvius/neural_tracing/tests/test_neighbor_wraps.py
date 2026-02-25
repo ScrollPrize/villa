@@ -10,6 +10,7 @@ from dataset_rowcol_cond_test_setup import (
     build_rowcol_patchfinding_config,
     make_temp_test_volume_zarr,
 )
+from vesuvius.neural_tracing.datasets.common import _extract_wrap_ids, _wrap_bbox_has_overlap
 from vesuvius.neural_tracing.datasets.dataset_rowcol_cond import EdtSegDataset
 from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
 
@@ -22,7 +23,7 @@ def _segment_wrap_ids(wrap: dict) -> tuple[int, ...]:
     seg_path = getattr(seg, "path", None)
     if seg_path is None:
         raise AssertionError("Expected wrap segment to have a real filesystem path")
-    wrap_ids = EdtSegDataset._extract_wrap_ids(Path(seg_path).name)
+    wrap_ids = _extract_wrap_ids(Path(seg_path).name)
     if not wrap_ids:
         raise AssertionError(f"Could not parse wrap id from segment path: {seg_path}")
     return wrap_ids
@@ -113,7 +114,7 @@ def test_triplet_real343p_overlap_filter_and_neighbor_lookup_invariants(triplet_
     for patch in ds.patches:
         for wrap in patch.wraps:
             overlap_mask = _load_overlap_mask_bool(mask_cache, wrap)
-            has_overlap = EdtSegDataset._wrap_bbox_has_overlap(overlap_mask, wrap["bbox_2d"])
+            has_overlap = _wrap_bbox_has_overlap(overlap_mask, wrap["bbox_2d"])
             assert not has_overlap
 
     lookup = ds._triplet_neighbor_lookup
@@ -146,7 +147,7 @@ def test_triplet_real343p_generates_training_payloads_without_overlap_chunks(tri
         patch = ds.patches[int(patch_idx)]
         for wrap in patch.wraps:
             overlap_mask = _load_overlap_mask_bool(mask_cache, wrap)
-            has_overlap = EdtSegDataset._wrap_bbox_has_overlap(overlap_mask, wrap["bbox_2d"])
+            has_overlap = _wrap_bbox_has_overlap(overlap_mask, wrap["bbox_2d"])
             assert not has_overlap
 
         sample = ds[sample_idx]

@@ -6,7 +6,16 @@ from torch.utils.data import Dataset
 import json
 import tifffile
 from pathlib import Path
-from vesuvius.neural_tracing.datasets.common import ChunkPatch, compute_heatmap_targets, voxelize_surface_grid
+from vesuvius.neural_tracing.datasets.common import (
+    ChunkPatch,
+    _extract_wrap_ids,
+    _parse_z_range,
+    _segment_overlaps_z_range,
+    _triplet_wraps_compatible,
+    _wrap_bbox_has_overlap,
+    compute_heatmap_targets,
+    voxelize_surface_grid,
+)
 from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
 from vesuvius.neural_tracing.datasets.direction_helpers import (
     build_triplet_direction_priors_from_displacements,
@@ -27,93 +36,9 @@ import random
 from vesuvius.tifxyz.upsampling import interpolate_at_points
 from scipy import ndimage
 import warnings
-import re
 from functools import lru_cache
 
 class EdtSegDataset(Dataset):
-    @staticmethod
-    def _parse_z_range(z_range):
-        if z_range is None:
-            return None
-        if not isinstance(z_range, (list, tuple)) or len(z_range) != 2:
-            raise ValueError(f"dataset z_range must be [z_min, z_max], got {z_range!r}")
-        z_min = float(z_range[0])
-        z_max = float(z_range[1])
-        if not np.isfinite(z_min) or not np.isfinite(z_max):
-            raise ValueError(f"dataset z_range must contain finite numbers, got {z_range!r}")
-        if z_min > z_max:
-            z_min, z_max = z_max, z_min
-        return z_min, z_max
-
-    @staticmethod
-    def _segment_z_bounds(seg):
-        valid = seg._valid_mask
-        if not np.any(valid):
-            return None
-        if seg.bbox is not None:
-            # Segment bbox is in XYZ order: (x_min, y_min, z_min, x_max, y_max, z_max)
-            z_min = float(seg.bbox[2])
-            z_max = float(seg.bbox[5])
-        else:
-            z_vals = seg._z[valid]
-            z_min = float(np.min(z_vals))
-            z_max = float(np.max(z_vals))
-        return z_min, z_max
-
-    @classmethod
-    def _segment_overlaps_z_range(cls, seg, z_range):
-        if z_range is None:
-            return True
-        z_bounds = cls._segment_z_bounds(seg)
-        if z_bounds is None:
-            return False
-        seg_z_min, seg_z_max = z_bounds
-        z_min, z_max = z_range
-        return not (seg_z_min > z_max or seg_z_max < z_min)
-
-    @staticmethod
-    def _extract_wrap_ids(name: str):
-        if not name:
-            return tuple()
-        wrap_ids = sorted({int(m.group(1)) for m in re.finditer(r"w(\d+)", str(name))})
-        return tuple(wrap_ids)
-
-    @staticmethod
-    def _has_consecutive_wrap_ids(left_ids, right_ids):
-        if not left_ids or not right_ids:
-            return False
-        right_set = set(right_ids)
-        for wrap_id in left_ids:
-            if (wrap_id - 1) in right_set or (wrap_id + 1) in right_set:
-                return True
-        return False
-
-    @staticmethod
-    def _triplet_wraps_compatible(target_wrap_meta: dict, other_wrap_meta: dict):
-        if target_wrap_meta["segment_idx"] == other_wrap_meta["segment_idx"]:
-            return True
-        return EdtSegDataset._has_consecutive_wrap_ids(
-            target_wrap_meta.get("wrap_ids", tuple()),
-            other_wrap_meta.get("wrap_ids", tuple()),
-        )
-
-    @staticmethod
-    def _wrap_bbox_has_overlap(mask: np.ndarray, bbox_2d):
-        if mask is None:
-            return False
-        mask_arr = np.asarray(mask)
-        if mask_arr.ndim != 2 or mask_arr.size == 0:
-            return False
-        r_min, r_max, c_min, c_max = [int(v) for v in bbox_2d]
-        h, w = mask_arr.shape
-        r0 = max(0, r_min)
-        r1 = min(h - 1, r_max)
-        c0 = max(0, c_min)
-        c1 = min(w - 1, c_max)
-        if r1 < r0 or c1 < c0:
-            return False
-        return bool(np.any(mask_arr[r0:r1 + 1, c0:c1 + 1]))
-
     def __init__(
             self,
             config,
@@ -185,7 +110,7 @@ class EdtSegDataset(Dataset):
                 volume_scale = dataset['volume_scale']
                 volume = zarr.open_group(volume_path, mode='r')
                 segments_path = dataset['segments_path']
-                z_range = self._parse_z_range(dataset.get('z_range', None))
+                z_range = _parse_z_range(dataset.get('z_range', None))
                 dataset_segments = list(tifxyz.load_folder(segments_path))
 
                 # retarget to the proper scale
@@ -202,7 +127,7 @@ class EdtSegDataset(Dataset):
                         if config['verbose']:
                             print(f"  [DEBUG POST-RETARGET factor={retarget_factor}] seg._scale={seg_scaled._scale}, shape={seg_scaled._z.shape}")
                             print(f"  [DEBUG POST-RETARGET] z range: {seg_scaled._z[seg_scaled._valid_mask].min():.2f} to {seg_scaled._z[seg_scaled._valid_mask].max():.2f}")
-                    if not self._segment_overlaps_z_range(seg_scaled, z_range):
+                    if not _segment_overlaps_z_range(seg_scaled, z_range):
                         dropped_by_z_range += 1
                         continue
                     seg_scaled.volume = volume
@@ -344,9 +269,9 @@ class EdtSegDataset(Dataset):
         """Drop triplet chunks that include any wrap overlap inside that wrap's bbox."""
         mask_filename = str(self.config["triplet_overlap_mask_filename"])
         warn_missing_masks = bool(self.config["triplet_warn_missing_overlap_masks"])
-        mask_cache = {}
         warned_missing = set()
         warned_load_fail = set()
+        seen_missing_masks = set()
         filter_stats = {
             "chunks_total": len(patches),
             "chunks_dropped_overlap": 0,
@@ -367,42 +292,39 @@ class EdtSegDataset(Dataset):
                 mask_path = seg_path / mask_filename
                 mask_key = str(mask_path)
 
-                if mask_key not in mask_cache:
-                    if not mask_path.exists():
-                        mask_cache[mask_key] = None
+                if not mask_path.exists():
+                    if mask_key not in seen_missing_masks:
+                        seen_missing_masks.add(mask_key)
                         filter_stats["missing_masks"] += 1
-                        if warn_missing_masks and mask_key not in warned_missing:
-                            warned_missing.add(mask_key)
-                            warnings.warn(
-                                f"Triplet overlap mask not found at {mask_path}; treating as no-overlap for this wrap.",
-                                RuntimeWarning,
-                            )
-                    else:
-                        try:
-                            loaded_mask = tifffile.imread(str(mask_path))
-                            loaded_mask = np.asarray(loaded_mask)
-                            if loaded_mask.ndim > 2:
-                                loaded_mask = np.squeeze(loaded_mask)
-                            if loaded_mask.ndim != 2:
-                                raise ValueError(
-                                    f"Expected 2D overlap mask, got shape {loaded_mask.shape} at {mask_path}"
-                                )
-                            mask_cache[mask_key] = loaded_mask > 0
-                        except Exception as exc:
-                            mask_cache[mask_key] = None
-                            if warn_missing_masks and mask_key not in warned_load_fail:
-                                warned_load_fail.add(mask_key)
-                                warnings.warn(
-                                    f"Failed to load triplet overlap mask at {mask_path}: {exc}; "
-                                    "treating as no-overlap for this wrap.",
-                                    RuntimeWarning,
-                                )
-
-                overlap_mask = mask_cache.get(mask_key)
-                if overlap_mask is None:
+                    if warn_missing_masks and mask_key not in warned_missing:
+                        warned_missing.add(mask_key)
+                        warnings.warn(
+                            f"Triplet overlap mask not found at {mask_path}; treating as no-overlap for this wrap.",
+                            RuntimeWarning,
+                        )
                     continue
 
-                if self._wrap_bbox_has_overlap(overlap_mask, wrap["bbox_2d"]):
+                try:
+                    overlap_mask = tifffile.imread(str(mask_path))
+                    overlap_mask = np.asarray(overlap_mask)
+                    if overlap_mask.ndim > 2:
+                        overlap_mask = np.squeeze(overlap_mask)
+                    if overlap_mask.ndim != 2:
+                        raise ValueError(
+                            f"Expected 2D overlap mask, got shape {overlap_mask.shape} at {mask_path}"
+                        )
+                    overlap_mask = overlap_mask > 0
+                except Exception as exc:
+                    if warn_missing_masks and mask_key not in warned_load_fail:
+                        warned_load_fail.add(mask_key)
+                        warnings.warn(
+                            f"Failed to load triplet overlap mask at {mask_path}: {exc}; "
+                            "treating as no-overlap for this wrap.",
+                            RuntimeWarning,
+                        )
+                    continue
+
+                if _wrap_bbox_has_overlap(overlap_mask, wrap["bbox_2d"]):
                     drop_chunk = True
                     break
 
@@ -529,9 +451,9 @@ class EdtSegDataset(Dataset):
                 seg = wrap.get("segment")
                 seg_path = getattr(seg, "path", None)
                 seg_name = Path(seg_path).name if seg_path is not None else ""
-                wrap_ids = self._extract_wrap_ids(seg_name)
+                wrap_ids = _extract_wrap_ids(seg_name)
                 if not wrap_ids:
-                    wrap_ids = self._extract_wrap_ids(getattr(seg, "uuid", ""))
+                    wrap_ids = _extract_wrap_ids(getattr(seg, "uuid", ""))
                 wrap_stats.append({
                     "wrap_idx": wrap_idx,
                     "segment_idx": int(wrap["segment_idx"]),
@@ -558,14 +480,14 @@ class EdtSegDataset(Dataset):
                 prev_neighbor = None
                 for left_pos in range(pos - 1, -1, -1):
                     candidate = ordered[left_pos]
-                    if self._triplet_wraps_compatible(target, candidate):
+                    if _triplet_wraps_compatible(target, candidate):
                         prev_neighbor = candidate
                         break
 
                 next_neighbor = None
                 for right_pos in range(pos + 1, len(ordered)):
                     candidate = ordered[right_pos]
-                    if self._triplet_wraps_compatible(target, candidate):
+                    if _triplet_wraps_compatible(target, candidate):
                         next_neighbor = candidate
                         break
 

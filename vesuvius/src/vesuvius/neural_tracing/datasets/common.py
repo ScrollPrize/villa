@@ -5,6 +5,90 @@ from dataclasses import dataclass
 from vesuvius.tifxyz import Tifxyz
 import zarr
 from typing import Any, Dict, List, Tuple
+import re
+
+
+def _parse_z_range(z_range):
+    if z_range is None:
+        return None
+    if not isinstance(z_range, (list, tuple)) or len(z_range) != 2:
+        raise ValueError(f"dataset z_range must be [z_min, z_max], got {z_range!r}")
+    z_min = float(z_range[0])
+    z_max = float(z_range[1])
+    if not np.isfinite(z_min) or not np.isfinite(z_max):
+        raise ValueError(f"dataset z_range must contain finite numbers, got {z_range!r}")
+    if z_min > z_max:
+        z_min, z_max = z_max, z_min
+    return z_min, z_max
+
+
+def _segment_z_bounds(seg):
+    valid = seg._valid_mask
+    if not np.any(valid):
+        return None
+    if seg.bbox is not None:
+        # Segment bbox is in XYZ order: (x_min, y_min, z_min, x_max, y_max, z_max)
+        z_min = float(seg.bbox[2])
+        z_max = float(seg.bbox[5])
+    else:
+        z_vals = seg._z[valid]
+        z_min = float(np.min(z_vals))
+        z_max = float(np.max(z_vals))
+    return z_min, z_max
+
+
+def _segment_overlaps_z_range(seg, z_range):
+    if z_range is None:
+        return True
+    z_bounds = _segment_z_bounds(seg)
+    if z_bounds is None:
+        return False
+    seg_z_min, seg_z_max = z_bounds
+    z_min, z_max = z_range
+    return not (seg_z_min > z_max or seg_z_max < z_min)
+
+
+def _extract_wrap_ids(name: str):
+    if not name:
+        return tuple()
+    wrap_ids = sorted({int(m.group(1)) for m in re.finditer(r"w(\d+)", str(name))})
+    return tuple(wrap_ids)
+
+
+def _has_consecutive_wrap_ids(left_ids, right_ids):
+    if not left_ids or not right_ids:
+        return False
+    right_set = set(right_ids)
+    for wrap_id in left_ids:
+        if (wrap_id - 1) in right_set or (wrap_id + 1) in right_set:
+            return True
+    return False
+
+
+def _triplet_wraps_compatible(target_wrap_meta: dict, other_wrap_meta: dict):
+    if target_wrap_meta["segment_idx"] == other_wrap_meta["segment_idx"]:
+        return True
+    return _has_consecutive_wrap_ids(
+        target_wrap_meta.get("wrap_ids", tuple()),
+        other_wrap_meta.get("wrap_ids", tuple()),
+    )
+
+
+def _wrap_bbox_has_overlap(mask: np.ndarray, bbox_2d):
+    if mask is None:
+        return False
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim != 2 or mask_arr.size == 0:
+        return False
+    r_min, r_max, c_min, c_max = [int(v) for v in bbox_2d]
+    h, w = mask_arr.shape
+    r0 = max(0, r_min)
+    r1 = min(h - 1, r_max)
+    c0 = max(0, c_min)
+    c1 = min(w - 1, c_max)
+    if r1 < r0 or c1 < c0:
+        return False
+    return bool(np.any(mask_arr[r0:r1 + 1, c0:c1 + 1]))
 
 
 @njit
