@@ -381,7 +381,7 @@ class EdtSegDataset(Dataset):
         if cond_surface_local is None:
             return cond_seg_gt.clone()
 
-        surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float64, copy=False)
+        surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
         perturbed_surface = maybe_perturb_conditioning_surface(
             surface_np,
             config=self.config,
@@ -391,7 +391,7 @@ class EdtSegDataset(Dataset):
             return cond_seg_gt.clone()
 
         cond_np = voxelize_surface_grid(
-            np.asarray(perturbed_surface, dtype=np.float64),
+            np.asarray(perturbed_surface, dtype=np.float32),
             self.crop_size,
         ).astype(np.float32, copy=False)
         if not bool(cond_np.any()):
@@ -454,9 +454,9 @@ class EdtSegDataset(Dataset):
             max_corner,
         )
 
-        center_local_gt = (center_zyxs_unperturbed - min_corner).astype(np.float64)
-        behind_local = (behind_zyxs - min_corner).astype(np.float64)
-        front_local = (front_zyxs - min_corner).astype(np.float64)
+        center_local_gt = (center_zyxs_unperturbed - min_corner).astype(np.float32)
+        behind_local = (behind_zyxs - min_corner).astype(np.float32)
+        front_local = (front_zyxs - min_corner).astype(np.float32)
 
         center_seg_gt = voxelize_surface_grid(center_local_gt, crop_size).astype(np.float32)
         behind_seg = voxelize_surface_grid(behind_local, crop_size).astype(np.float32)
@@ -797,8 +797,8 @@ class EdtSegDataset(Dataset):
         )
 
         # convert cond and masked coords to crop-local coords (float for line interpolation)
-        cond_zyxs_unperturbed_local_float = (cond_zyxs_unperturbed - min_corner).astype(np.float64)
-        masked_zyxs_local_float = (masked_zyxs - min_corner).astype(np.float64)
+        cond_zyxs_unperturbed_local_float = (cond_zyxs_unperturbed - min_corner).astype(np.float32)
+        masked_zyxs_local_float = (masked_zyxs - min_corner).astype(np.float32)
 
         crop_shape = target_shape
 
@@ -926,7 +926,7 @@ class EdtSegDataset(Dataset):
                     ox_full, oy_full, oz_full = trimmed
 
                     other_zyxs = np.stack([oz_full, oy_full, ox_full], axis=-1)
-                    other_zyxs_local = (other_zyxs - min_corner).astype(np.float64)
+                    other_zyxs_local = (other_zyxs - min_corner).astype(np.float32)
 
                     other_vox = voxelize_surface_grid(other_zyxs_local, crop_shape)
                     other_wraps_vox = np.maximum(other_wraps_vox, other_vox)
