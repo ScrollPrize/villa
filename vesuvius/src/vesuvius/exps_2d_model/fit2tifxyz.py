@@ -178,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
 	cfg = ExportConfig(**base)
 	dev = torch.device(cfg.device)
 
-	st = torch.load(cfg.input, map_location=dev)
+	st = torch.load(cfg.input, map_location=dev, weights_only=False)
 	if not isinstance(st, dict):
 		raise ValueError("expected a state_dict checkpoint")
 	model_params = st.get("_model_params_", None)
