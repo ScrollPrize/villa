@@ -282,6 +282,75 @@ def _triplet_close_contact_fractions(
     return cond_behind_frac, cond_front_frac, behind_front_frac
 
 
+def create_band_mask(
+    cond_bin_full: np.ndarray,
+    d_front_work: np.ndarray,
+    d_behind_work: np.ndarray,
+    front_disp_work: np.ndarray,
+    behind_disp_work: np.ndarray,
+    band_pct: float,
+    band_padding: float,
+    cc_structure_26: np.ndarray,
+    closing_structure_3: np.ndarray,
+):
+    """Build a dense slab mask between two wrap displacements for triplet band mode."""
+    cond_bin = np.asarray(cond_bin_full, dtype=np.uint8)
+    if cond_bin.sum() == 0:
+        return None
+
+    cond_mask = cond_bin > 0
+    cond_to_front = d_front_work[cond_mask]
+    cond_to_behind = d_behind_work[cond_mask]
+    if cond_to_front.size == 0 or cond_to_behind.size == 0:
+        return None
+
+    # Inside points tend to have front/back displacement vectors pointing in
+    # opposite directions (non-positive dot product).
+    d_sum_work = d_front_work + d_behind_work
+    cond_sum = (cond_to_front + cond_to_behind).astype(np.float32, copy=False)
+    if cond_sum.size == 0:
+        return None
+
+    sum_threshold = float(np.percentile(cond_sum, band_pct)) + (2.0 * band_padding)
+    vector_dot = np.sum(front_disp_work * behind_disp_work, axis=0, dtype=np.float32)
+    dense_band = (vector_dot <= 0.0) & (d_sum_work <= sum_threshold)
+    if not dense_band.any():
+        return None
+
+    # Remove isolated islands: keep only components connected to conditioning.
+    labels, num_labels = ndimage.label(dense_band, structure=cc_structure_26)
+    if num_labels <= 0:
+        return None
+    touching = np.unique(labels[cond_mask])
+    touching = touching[touching > 0]
+    if touching.size == 0:
+        return None
+    keep = np.zeros(num_labels + 1, dtype=bool)
+    keep[touching] = True
+
+    dense_band = keep[labels]
+    # Fill tiny holes inside the slab.
+    dense_band = ndimage.binary_closing(
+        dense_band,
+        structure=closing_structure_3,
+        iterations=1,
+    )
+    if not dense_band.any():
+        return None
+
+    # Closing can create detached islands; keep only cond-connected components.
+    labels, num_labels = ndimage.label(dense_band, structure=cc_structure_26)
+    if num_labels <= 0:
+        return None
+    touching = np.unique(labels[cond_mask])
+    touching = touching[touching > 0]
+    if touching.size == 0:
+        return None
+    keep = np.zeros(num_labels + 1, dtype=bool)
+    keep[touching] = True
+    return keep[labels].astype(np.float32, copy=False)
+
+
 def _compute_triplet_edt_bbox(
     cond_mask: np.ndarray,
     behind_mask: np.ndarray,

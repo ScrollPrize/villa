@@ -23,6 +23,7 @@ from vesuvius.neural_tracing.datasets.common import (
     _triplet_wraps_compatible,
     _upsample_world_triplet,
     _validate_result_tensors,
+    create_band_mask,
     compute_heatmap_targets,
     edt_dilate_binary_mask,
     voxelize_surface_grid,
@@ -633,63 +634,19 @@ class EdtSegDataset(Dataset):
         elif weight_mode == "band":
             if d_behind_work is None or d_front_work is None:
                 return None
-
-            cond_bin = cond_bin_full.astype(np.uint8, copy=False)
-            if cond_bin.sum() == 0:
-                return None
-
-            cond_mask = cond_bin > 0
-            cond_to_front = d_front_work[cond_mask]
-            cond_to_behind = d_behind_work[cond_mask]
-            if cond_to_front.size == 0 or cond_to_behind.size == 0:
-                return None
-
-            # Build a dense slab between front/back using displacement geometry:
-            # inside points tend to have front/back displacement vectors pointing
-            # in opposite directions (non-positive dot product).
-            d_sum_work = d_front_work + d_behind_work
-            cond_sum = (cond_to_front + cond_to_behind).astype(np.float32, copy=False)
-            if cond_sum.size == 0:
-                return None
-
-            sum_threshold = float(np.percentile(cond_sum, band_pct)) + (2.0 * band_padding)
-            vector_dot = np.sum(front_disp_work * behind_disp_work, axis=0, dtype=np.float32)
-            dense_band = (vector_dot <= 0.0) & (d_sum_work <= sum_threshold)
-            if not dense_band.any():
-                return None
-
-            # Remove isolated islands: keep only components connected to conditioning.
-            labels, num_labels = ndimage.label(dense_band, structure=self._cc_structure_26)
-            if num_labels <= 0:
-                return None
-            touching = np.unique(labels[cond_mask])
-            touching = touching[touching > 0]
-            if touching.size == 0:
-                return None
-            keep = np.zeros(num_labels + 1, dtype=bool)
-            keep[touching] = True
-
-            dense_band = keep[labels]
-            # Fill tiny holes inside the slab.
-            dense_band = ndimage.binary_closing(
-                dense_band,
-                structure=self._closing_structure_3,
-                iterations=1,
+            dense_band = create_band_mask(
+                cond_bin_full=cond_bin_full,
+                d_front_work=d_front_work,
+                d_behind_work=d_behind_work,
+                front_disp_work=front_disp_work,
+                behind_disp_work=behind_disp_work,
+                band_pct=band_pct,
+                band_padding=band_padding,
+                cc_structure_26=self._cc_structure_26,
+                closing_structure_3=self._closing_structure_3,
             )
-            if not dense_band.any():
+            if dense_band is None:
                 return None
-
-            # Closing can create small detached islands; keep only cond-connected components.
-            labels, num_labels = ndimage.label(dense_band, structure=self._cc_structure_26)
-            if num_labels <= 0:
-                return None
-            touching = np.unique(labels[cond_mask])
-            touching = touching[touching > 0]
-            if touching.size == 0:
-                return None
-            keep = np.zeros(num_labels + 1, dtype=bool)
-            keep[touching] = True
-            dense_band = keep[labels].astype(np.float32, copy=False)
             dense_weight_np = dense_band[None]
         else:
             raise ValueError(
