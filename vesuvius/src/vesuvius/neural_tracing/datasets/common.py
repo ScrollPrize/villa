@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Tuple
 import re
 from functools import lru_cache
 from scipy import ndimage
+from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import tifffile
 import warnings
 
@@ -178,6 +179,31 @@ def _compute_wrap_order_stats(wrap):
         "x_median": float(np.median(x_vals)),
         "y_median": float(np.median(y_vals)),
     }
+
+
+def _read_volume_crop_from_patch(patch, crop_size, min_corner, max_corner):
+    volume = patch.volume
+    if isinstance(volume, zarr.Group):
+        volume = volume[str(patch.scale)]
+
+    vol_crop = np.zeros(crop_size, dtype=volume.dtype)
+    vol_shape = volume.shape
+    src_starts = np.maximum(min_corner, 0)
+    src_ends = np.minimum(max_corner, np.array(vol_shape, dtype=np.int64))
+    dst_starts = src_starts - min_corner
+    dst_ends = dst_starts + (src_ends - src_starts)
+
+    if np.all(src_ends > src_starts):
+        vol_crop[
+            dst_starts[0]:dst_ends[0],
+            dst_starts[1]:dst_ends[1],
+            dst_starts[2]:dst_ends[2],
+        ] = volume[
+            src_starts[0]:src_ends[0],
+            src_starts[1]:src_ends[1],
+            src_starts[2]:src_ends[2],
+        ]
+    return normalize_zscore(vol_crop)
 
 
 def _validate_result_tensors(result: dict, idx: int, enabled: bool):

@@ -14,6 +14,7 @@ from vesuvius.neural_tracing.datasets.common import (
     _filter_triplet_overlap_chunks,
     _prepare_cond_surface_keypoints,
     _parse_z_range,
+    _read_volume_crop_from_patch,
     _require_augmented_keypoints,
     _segment_overlaps_z_range,
     _signed_distance_field,
@@ -43,7 +44,6 @@ from vesuvius.neural_tracing.datasets.conditioning import (
 )
 from vesuvius.neural_tracing.datasets.perturbation import maybe_perturb_conditioning_surface
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
-from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import random
 from scipy import ndimage
 import warnings
@@ -372,31 +372,6 @@ class EdtSegDataset(Dataset):
         wrap = patch.wraps[wrap_idx]
         return self._extract_wrap_world_surface(patch, wrap, require_all_valid=require_all_valid)
 
-    @staticmethod
-    def _read_volume_crop_from_patch(patch: ChunkPatch, crop_size, min_corner, max_corner):
-        volume = patch.volume
-        if isinstance(volume, zarr.Group):
-            volume = volume[str(patch.scale)]
-
-        vol_crop = np.zeros(crop_size, dtype=volume.dtype)
-        vol_shape = volume.shape
-        src_starts = np.maximum(min_corner, 0)
-        src_ends = np.minimum(max_corner, np.array(vol_shape, dtype=np.int64))
-        dst_starts = src_starts - min_corner
-        dst_ends = dst_starts + (src_ends - src_starts)
-
-        if np.all(src_ends > src_starts):
-            vol_crop[
-                dst_starts[0]:dst_ends[0],
-                dst_starts[1]:dst_ends[1],
-                dst_starts[2]:dst_ends[2],
-            ] = volume[
-                src_starts[0]:src_ends[0],
-                src_starts[1]:src_ends[1],
-                src_starts[2]:src_ends[2],
-            ]
-        return normalize_zscore(vol_crop)
-
     def _conditioning_from_surface(
         self,
         *,
@@ -472,7 +447,7 @@ class EdtSegDataset(Dataset):
         max_corner = conditioning["max_corner"]
         crop_size = self.crop_size
 
-        vol_crop = self._read_volume_crop_from_patch(
+        vol_crop = _read_volume_crop_from_patch(
             patch,
             crop_size,
             min_corner,
@@ -814,7 +789,7 @@ class EdtSegDataset(Dataset):
         min_corner = conditioning["min_corner"]
         max_corner = conditioning["max_corner"]
 
-        vol_crop = self._read_volume_crop_from_patch(
+        vol_crop = _read_volume_crop_from_patch(
             patch,
             target_shape,
             min_corner,
