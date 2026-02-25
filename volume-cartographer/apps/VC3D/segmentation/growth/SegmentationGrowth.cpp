@@ -12,7 +12,7 @@
 #include <QLoggingCategory>
 #include <QString>
 
-#include "z5/factory.hxx"
+#include "vc/zarr/Zarr.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
@@ -174,15 +174,14 @@ bool appendDirectionField(const SegmentationDirectionFieldConfig& config,
     }
 
     try {
-        z5::filesystem::handle::Group group(zarrPath, z5::FileMode::FileMode::r);
+        vc::zarr::Store group(zarrPath);
         const int scaleLevel = std::clamp(config.scale, 0, 5);
 
-        std::vector<std::unique_ptr<z5::Dataset>> datasets;
+        std::vector<std::unique_ptr<vc::zarr::Dataset>> datasets;
         datasets.reserve(3);
         for (char axis : std::string("xyz")) {
-            z5::filesystem::handle::Group axisGroup(group, std::string(1, axis));
-            z5::filesystem::handle::Dataset datasetHandle(axisGroup, std::to_string(scaleLevel), ".");
-            datasets.push_back(z5::filesystem::openDataset(datasetHandle));
+            vc::zarr::Store axisGroup(group, std::string(1, axis));
+            datasets.push_back(vc::zarr::Dataset::open(axisGroup, std::to_string(scaleLevel), "."));
         }
 
         const float scaleFactor = std::pow(2.0f, -static_cast<float>(scaleLevel));
@@ -356,7 +355,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
 
     ensureNormalsInward(context.resumeSurface, context.volume);
 
-    z5::Dataset* dataset = context.volume->zarrDataset(0);
+    vc::zarr::Dataset* dataset = context.volume->zarrDataset(0);
     if (!dataset) {
         result.error = QStringLiteral("Unable to access primary volume dataset");
         return result;

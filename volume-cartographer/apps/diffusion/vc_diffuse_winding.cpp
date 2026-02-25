@@ -23,10 +23,7 @@
 #include <ceres/ceres.h>
 
 #include <xtensor/containers/xarray.hpp>
-#include "z5/factory.hxx"
-#include "z5/filesystem/handle.hxx"
-#include "z5/common.hxx"
-#include "z5/multiarray/xtensor_access.hxx"
+#include "vc/zarr/Zarr.hpp"
 
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/Slicing.hpp"
@@ -177,9 +174,9 @@ int main(int argc, char** argv) {
     }
     std::cout << "Found umbilicus point at: " << *umbilicus_point << std::endl;
 
-    // Load volume data using z5 and ChunkedTensor
-    z5::filesystem::handle::Group group_handle(volume_path);
-    std::unique_ptr<z5::Dataset> ds = z5::openDataset(group_handle, dataset_name);
+    // Load volume data using zarr and ChunkedTensor
+    vc::zarr::Store group_handle(volume_path);
+    std::unique_ptr<vc::zarr::Dataset> ds = vc::zarr::Dataset::open(group_handle, dataset_name);
     if (!ds) {
         std::cerr << "Error: Could not open dataset '" << dataset_name << "' in volume '" << volume_path << "'." << std::endl;
         return 1;

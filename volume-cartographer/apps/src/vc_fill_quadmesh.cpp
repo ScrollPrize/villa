@@ -5,7 +5,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 
-#include "z5/factory.hxx"
+#include "vc/zarr/Zarr.hpp"
 #include <nlohmann/json.hpp>
 
 #include <opencv2/imgcodecs.hpp>

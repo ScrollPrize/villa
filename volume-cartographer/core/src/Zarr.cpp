@@ -10,7 +10,7 @@
 
 #include <nlohmann/json.hpp>
 #include <omp.h>
-#include <z5/factory.hxx>
+#include <vc/zarr/Zarr.hpp>
 
 using json = nlohmann::json;
 
@@ -19,7 +19,7 @@ using json = nlohmann::json;
 // ============================================================
 
 template <typename T>
-void writeZarrBand(z5::Dataset* dsOut, const std::vector<cv::Mat>& slices,
+void writeZarrBand(vc::zarr::Dataset* dsOut, const std::vector<cv::Mat>& slices,
                    uint32_t bandIdx, const std::vector<size_t>& chunks0,
                    size_t tilesXSrc, size_t tilesYSrc,
                    int rotQuad, int flipAxis)
@@ -47,14 +47,14 @@ void writeZarrBand(z5::Dataset* dsOut, const std::vector<cv::Mat>& slices,
                 std::memcpy(&chunkBuf[sliceOff + yy * chunkX], &row[x0s], dx_actual * sizeof(T));
             }
         }
-        z5::types::ShapeType chunkId = {0, size_t(dstTy), size_t(dstTx)};
+        vc::zarr::ShapeType chunkId = {0, size_t(dstTy), size_t(dstTx)};
         dsOut->writeChunk(chunkId, chunkBuf.data());
     }
 }
 
-template void writeZarrBand<uint8_t>(z5::Dataset*, const std::vector<cv::Mat>&,
+template void writeZarrBand<uint8_t>(vc::zarr::Dataset*, const std::vector<cv::Mat>&,
     uint32_t, const std::vector<size_t>&, size_t, size_t, int, int);
-template void writeZarrBand<uint16_t>(z5::Dataset*, const std::vector<cv::Mat>&,
+template void writeZarrBand<uint16_t>(vc::zarr::Dataset*, const std::vector<cv::Mat>&,
     uint32_t, const std::vector<size_t>&, size_t, size_t, int, int);
 
 // ============================================================
@@ -148,12 +148,12 @@ template void downsampleTileIntoPreserveZ<uint16_t>(const uint16_t*, size_t, siz
 // ============================================================
 
 template <typename T>
-void buildPyramidLevel(z5::filesystem::handle::File& outFile, int level,
+void buildPyramidLevel(vc::zarr::Store& outFile, int level,
                        size_t CH, size_t CW,
                        int numParts, int partId)
 {
-    auto src = z5::openDataset(outFile, std::to_string(level - 1));
-    auto dst = z5::openDataset(outFile, std::to_string(level));
+    auto src = vc::zarr::Dataset::open(outFile, std::to_string(level - 1));
+    auto dst = vc::zarr::Dataset::open(outFile, std::to_string(level));
     const auto& ss = src->shape();
     const auto& sc = src->defaultChunkShape();  // source chunk shape (fixed, e.g. 128×128)
     const auto& dc = dst->defaultChunkShape();  // dst chunk shape (same Y×X as source)
@@ -191,7 +191,7 @@ void buildPyramidLevel(z5::filesystem::handle::File& outFile, int level,
                 size_t scx = dcx * 2 + sx;
                 if (scy >= srcChunksY || scx >= srcChunksX) continue;
 
-                z5::types::ShapeType srcId = {0, scy, scx};
+                vc::zarr::ShapeType srcId = {0, scy, scx};
                 std::vector<T> srcBuf(srcElems, T(0));
                 if (src->chunkExists(srcId))
                     src->readChunk(srcId, srcBuf.data());
@@ -215,7 +215,7 @@ void buildPyramidLevel(z5::filesystem::handle::File& outFile, int level,
             }
         }
 
-        z5::types::ShapeType dstId = {0, dcy, dcx};
+        vc::zarr::ShapeType dstId = {0, dcy, dcx};
         dst->writeChunk(dstId, dstBuf.data());
 
         size_t d = ++done;
@@ -226,14 +226,14 @@ void buildPyramidLevel(z5::filesystem::handle::File& outFile, int level,
     if (myTiles > 0) std::cout << std::endl;
 }
 
-template void buildPyramidLevel<uint8_t>(z5::filesystem::handle::File&, int, size_t, size_t, int, int);
-template void buildPyramidLevel<uint16_t>(z5::filesystem::handle::File&, int, size_t, size_t, int, int);
+template void buildPyramidLevel<uint8_t>(vc::zarr::Store&, int, size_t, size_t, int, int);
+template void buildPyramidLevel<uint16_t>(vc::zarr::Store&, int, size_t, size_t, int, int);
 
 // ============================================================
 // createPyramidDatasets
 // ============================================================
 
-void createPyramidDatasets(z5::filesystem::handle::File& outFile,
+void createPyramidDatasets(vc::zarr::Store& outFile,
                            const std::vector<size_t>& shape0,
                            size_t CH, size_t CW, bool isU16)
 {
@@ -247,7 +247,7 @@ void createPyramidDatasets(z5::filesystem::handle::File& outFile,
         std::vector<size_t> ds = {prevShape[0], (prevShape[1] + 1) / 2, (prevShape[2] + 1) / 2};
         size_t chZ = std::min(ds[0], shape0[0]);  // clamp to level shape Z
         std::vector<size_t> dc = {chZ, std::min(CH, ds[1]), std::min(CW, ds[2])};
-        z5::createDataset(outFile, std::to_string(level), dtype, ds, dc, std::string("blosc"), compOpts);
+        vc::zarr::Dataset::create(outFile, std::to_string(level), dtype, ds, dc, "blosc", compOpts);
         prevShape = ds;
     }
 }
@@ -256,7 +256,7 @@ void createPyramidDatasets(z5::filesystem::handle::File& outFile,
 // writeZarrAttrs
 // ============================================================
 
-void writeZarrAttrs(z5::filesystem::handle::File& outFile,
+void writeZarrAttrs(vc::zarr::Store& outFile,
                     const std::filesystem::path& volPath, int groupIdx,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
@@ -297,5 +297,5 @@ void writeZarrAttrs(z5::filesystem::handle::File& outFile,
     }
     ms["metadata"] = json{{"downsampling_method","mean"}};
     attrs["multiscales"] = json::array({ms});
-    z5::filesystem::writeAttributes(outFile, attrs);
+    outFile.writeAttrs(attrs);
 }

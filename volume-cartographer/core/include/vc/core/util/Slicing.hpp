@@ -8,20 +8,20 @@
 #include <vc/core/util/Compositing.hpp>
 
 // Forward declaration
-namespace z5 { class Dataset; }
+namespace vc::zarr { class Dataset; }
 
 // Read interpolated 3D data from a z5 dataset
-void readInterpolated3D(cv::Mat_<uint8_t> &out, z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint8_t> *cache, bool nearest_neighbor=false);
-void readInterpolated3D(cv::Mat_<uint16_t> &out, z5::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint16_t> *cache, bool nearest_neighbor=false);
+void readInterpolated3D(cv::Mat_<uint8_t> &out, vc::zarr::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint8_t> *cache, bool nearest_neighbor=false);
+void readInterpolated3D(cv::Mat_<uint16_t> &out, vc::zarr::Dataset *ds, const cv::Mat_<cv::Vec3f> &coords, ChunkCache<uint16_t> *cache, bool nearest_neighbor=false);
 
 // Read a 3D area from a z5 dataset
-void readArea3D(xt::xtensor<uint8_t,3,xt::layout_type::column_major> &out, const cv::Vec3i& offset, z5::Dataset *ds, ChunkCache<uint8_t> *cache);
-void readArea3D(xt::xtensor<uint16_t,3,xt::layout_type::column_major> &out, const cv::Vec3i& offset, z5::Dataset *ds, ChunkCache<uint16_t> *cache);
+void readArea3D(xt::xtensor<uint8_t,3,xt::layout_type::column_major> &out, const cv::Vec3i& offset, vc::zarr::Dataset *ds, ChunkCache<uint8_t> *cache);
+void readArea3D(xt::xtensor<uint16_t,3,xt::layout_type::column_major> &out, const cv::Vec3i& offset, vc::zarr::Dataset *ds, ChunkCache<uint16_t> *cache);
 
 // Fast composite rendering - nearest neighbor only, uses ChunkCache directly
 void readCompositeFast(
     cv::Mat_<uint8_t>& out,
-    z5::Dataset* ds,
+    vc::zarr::Dataset* ds,
     const cv::Mat_<cv::Vec3f>& baseCoords,
     const cv::Mat_<cv::Vec3f>& normals,
     float zStep,
@@ -36,7 +36,7 @@ void readCompositeFast(
 // basePoints/stepDirs use (X,Y,Z) in Vec3f[0],[1],[2] (same convention as readInterpolated3D coords).
 void readMultiSlice(
     std::vector<cv::Mat_<uint8_t>>& out,
-    z5::Dataset* ds,
+    vc::zarr::Dataset* ds,
     ChunkCache<uint8_t>* cache,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
@@ -45,7 +45,7 @@ void readMultiSlice(
 
 void readMultiSlice(
     std::vector<cv::Mat_<uint16_t>>& out,
-    z5::Dataset* ds,
+    vc::zarr::Dataset* ds,
     ChunkCache<uint16_t>* cache,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
@@ -56,7 +56,7 @@ void readMultiSlice(
 // Same trilinear math as readMultiSlice but no internal OMP parallelism.
 void sampleTileSlices(
     std::vector<cv::Mat_<uint8_t>>& out,
-    z5::Dataset* ds,
+    vc::zarr::Dataset* ds,
     ChunkCache<uint8_t>* cache,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
@@ -65,7 +65,7 @@ void sampleTileSlices(
 
 void sampleTileSlices(
     std::vector<cv::Mat_<uint16_t>>& out,
-    z5::Dataset* ds,
+    vc::zarr::Dataset* ds,
     ChunkCache<uint16_t>* cache,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
@@ -76,6 +76,6 @@ void sampleTileSlices(
 // Returns normalized gradient vectors at each raw grid point.
 // dsScale converts from world coordinates to dataset coordinates.
 cv::Mat_<cv::Vec3f> computeVolumeGradientsNative(
-    z5::Dataset* ds,
+    vc::zarr::Dataset* ds,
     const cv::Mat_<cv::Vec3f>& rawPoints,
     float dsScale);

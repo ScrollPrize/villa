@@ -844,7 +844,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTarget(const cv::
         datasetIndex = std::clamp(datasetIndex, 0, static_cast<int>(scaleCount) - 1);
     }
 
-    z5::Dataset* dataset = volume->zarrDataset(datasetIndex);
+    vc::zarr::Dataset* dataset = volume->zarrDataset(datasetIndex);
     if (!dataset) {
         dataset = volume->zarrDataset(0);
     }

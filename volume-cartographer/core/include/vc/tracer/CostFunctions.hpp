@@ -31,8 +31,8 @@ double  val(const JetT &v) { return v.a; }
 //     frac_short_paths: 0.0 -> 1.0, 1.0 -> 0.0 (linear ramp, clamped)
 //   final = w_rms * w_frac
 struct NormalFitQualityWeightField {
-    NormalFitQualityWeightField(std::unique_ptr<z5::Dataset>&& rms_ds,
-                                std::unique_ptr<z5::Dataset>&& frac_ds,
+    NormalFitQualityWeightField(std::unique_ptr<vc::zarr::Dataset>&& rms_ds,
+                                std::unique_ptr<vc::zarr::Dataset>&& frac_ds,
                                 float scale,
                                 ChunkCache<uint8_t>* cache,
                                 const std::string& cache_root,
@@ -91,8 +91,8 @@ private:
     Chunked3d<uint8_t, passTroughComputor> _rms;
     Chunked3d<uint8_t, passTroughComputor> _frac;
     float _scale;
-    std::unique_ptr<z5::Dataset> _rms_ds;
-    std::unique_ptr<z5::Dataset> _frac_ds;
+    std::unique_ptr<vc::zarr::Dataset> _rms_ds;
+    std::unique_ptr<vc::zarr::Dataset> _frac_ds;
     CachedChunked3dInterpolator<uint8_t, passTroughComputor> _interp_rms;
     CachedChunked3dInterpolator<uint8_t, passTroughComputor> _interp_frac;
 };

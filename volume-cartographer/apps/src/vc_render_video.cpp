@@ -4,10 +4,7 @@
 #include <xtensor/io/xio.hpp>
 #include <xtensor/views/xview.hpp>
 
-#include "z5/factory.hxx"
-#include "z5/filesystem/handle.hxx"
-#include "z5/multiarray/xtensor_access.hxx"
-#include "z5/attributes.hxx"
+#include "vc/zarr/Zarr.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>
@@ -19,11 +16,12 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <omp.h>
 
 #include "vc/core/util/StreamOperators.hpp"
 
-using shape = z5::types::ShapeType;
+using shape = vc::zarr::ShapeType;
 using namespace xt::placeholders;
 
 
@@ -93,12 +91,11 @@ int main(int argc, char *argv[])
     for(int i=3;i<argc;i++)
         seg_dirs.push_back(argv[i]);
 
-    z5::filesystem::handle::Group group(vol_path, z5::FileMode::FileMode::r);
-    z5::filesystem::handle::Dataset ds_handle(group, "1", json::parse(std::ifstream(vol_path/"1/.zarray")).value<std::string>("dimension_separator","."));
-    std::unique_ptr<z5::Dataset> ds = z5::filesystem::openDataset(ds_handle);
+    vc::zarr::Store group(vol_path);
+    auto ds = vc::zarr::Dataset::open(group, "1", json::parse(std::ifstream(vol_path/"1/.zarray")).value<std::string>("dimension_separator","."));
 
     std::cout << "zarr dataset size for scale group 1 " << ds->shape() << std::endl;
-    std::cout << "chunk shape shape " << ds->chunking().blockShape() << std::endl;
+    std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
 
     cv::Size tgt_size = {3840, 2160};
 

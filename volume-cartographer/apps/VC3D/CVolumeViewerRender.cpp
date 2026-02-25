@@ -214,7 +214,7 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
 
     cv::Mat baseColor;
 
-    z5::Dataset* baseDataset = volume ? volume->zarrDataset(_ds_sd_idx) : nullptr;
+    vc::zarr::Dataset* baseDataset = volume ? volume->zarrDataset(_ds_sd_idx) : nullptr;
 
     // Check if this is a plane surface that should use plane composite rendering
     PlaneSurface* plane = dynamic_cast<PlaneSurface*>(surf.get());
@@ -308,7 +308,7 @@ cv::Mat CVolumeViewer::render_area(const cv::Rect &roi)
             }
 
             cv::Mat_<uint8_t> overlayValues;
-            z5::Dataset* overlayDataset = _overlayVolume->zarrDataset(overlayIdx);
+            vc::zarr::Dataset* overlayDataset = _overlayVolume->zarrDataset(overlayIdx);
             if (overlayDataset) {
                 readInterpolated3D(overlayValues, overlayDataset, coords * overlayScale, cache, /*nearest_neighbor=*/true);
             }

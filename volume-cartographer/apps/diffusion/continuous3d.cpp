@@ -4,10 +4,7 @@
 
 #include <vc/ui/VCCollection.hpp>
 #include <vc/core/util/GridStore.hpp>
-#include "z5/factory.hxx"
-#include "z5/filesystem/handle.hxx"
-#include "z5/common.hxx"
-#include "z5/multiarray/xtensor_access.hxx"
+#include "vc/zarr/Zarr.hpp"
 
 #include <boost/program_options.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -122,8 +119,8 @@ int continuous3d_main(const po::variables_map& vm) {
 
     std::cout << "Found point " << *target_point << " for winding " << target_winding << std::endl;
 
-    z5::filesystem::handle::Group group_handle(volume_path);
-    std::unique_ptr<z5::Dataset> ds = z5::openDataset(group_handle, dataset_name);
+    vc::zarr::Store group_handle(volume_path);
+    std::unique_ptr<vc::zarr::Dataset> ds = vc::zarr::Dataset::open(group_handle, dataset_name);
     if (!ds) {
         std::cerr << "Error: Could not open dataset '" << dataset_name << "' in volume '" << volume_path << "'." << std::endl;
         return 1;

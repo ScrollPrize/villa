@@ -1,7 +1,7 @@
 #pragma once
 
 #include <opencv2/opencv.hpp>
-#include <z5/factory.hxx>
+#include <vc/zarr/Zarr.hpp>
 #include <boost/program_options.hpp>
 #include <vc/core/util/Slicing.hpp>
 

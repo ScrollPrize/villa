@@ -8,15 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vc/core/util/LoadJson.hpp"
-
-#include "z5/attributes.hxx"
-#include "z5/dataset.hxx"
-#include "z5/filesystem/handle.hxx"
-#include "z5/handle.hxx"
-#include "z5/types/types.hxx"
-#include "z5/factory.hxx"
-#include "z5/filesystem/metadata.hxx"
-#include "z5/multiarray/xtensor_access.hxx"
+#include "vc/zarr/Zarr.hpp"
 
 static const std::filesystem::path METADATA_FILE = "meta.json";
 static const std::filesystem::path METADATA_FILE_ALT = "metadata.json";
@@ -135,9 +127,8 @@ void Volume::zarrOpen()
     if (!metadata_.contains("format") || metadata_["format"].get<std::string>() != "zarr")
         return;
 
-    zarrFile_ = std::make_unique<z5::filesystem::handle::File>(path_);
-    z5::filesystem::handle::Group group(path_, z5::FileMode::FileMode::r);
-    z5::readAttributes(group, zarrGroup_);
+    zarrStore_ = std::make_unique<vc::zarr::Store>(path_);
+    zarrGroup_ = zarrStore_->readAttrs();
 
     auto isPowerOfTwoScale = [](double v) {
         if (!(v > 0.0)) return false;
@@ -205,8 +196,7 @@ void Volume::zarrOpen()
     }
 
     if (!usedOmeMultiscales) {
-        std::vector<std::string> groups;
-        zarrFile_->keys(groups);
+        auto groups = zarrStore_->keys();
         std::sort(groups.begin(), groups.end());
         for (const auto& name : groups) {
             try {
@@ -242,16 +232,8 @@ void Volume::zarrOpen()
             continue;
         }
 
-        // Read metadata first to discover the dimension separator
-        z5::filesystem::handle::Dataset tmp_handle(path_ / c.path, z5::FileMode::FileMode::r);
-        z5::DatasetMetadata dsMeta;
-        z5::filesystem::readMetadata(tmp_handle, dsMeta);
-
-        // Re-create handle with correct delimiter so chunk keys resolve properly
-        z5::filesystem::handle::Dataset ds_handle(group, c.path, dsMeta.zarrDelimiter);
-
-        auto ds = z5::filesystem::openDataset(ds_handle);
-        if (ds->getDtype() != z5::types::Datatype::uint8 && ds->getDtype() != z5::types::Datatype::uint16)
+        auto ds = vc::zarr::Dataset::open(*zarrStore_, c.path);
+        if (ds->getDtype() != vc::zarr::Datatype::uint8 && ds->getDtype() != vc::zarr::Datatype::uint16)
             throw std::runtime_error("only uint8 & uint16 is currently supported for zarr datasets incompatible type found in "+path_.string()+" / " +c.path);
 
         zarrDs_[static_cast<size_t>(c.level)] = std::move(ds);
@@ -371,7 +353,7 @@ double Volume::voxelSize() const
     return metadata_["voxelsize"].get<double>();
 }
 
-z5::Dataset *Volume::zarrDataset(int level) const {
+vc::zarr::Dataset *Volume::zarrDataset(int level) const {
     if (level < 0 || zarrDs_.empty())
         return nullptr;
 

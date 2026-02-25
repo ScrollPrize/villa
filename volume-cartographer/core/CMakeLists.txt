@@ -32,7 +32,7 @@ target_link_libraries(vc_core
         opencv_calib3d
         opencv_video
         nlohmann_json::nlohmann_json
-        z5
+        vc_zarr
         OpenMP::OpenMP_CXX
         TIFF::TIFF
         #${CURL_LIBRARIES}
@@ -97,17 +97,12 @@ target_precompile_headers(vc_core PRIVATE
     <opencv2/imgcodecs.hpp>
     # Boost (used by CLI apps)
     <boost/program_options.hpp>
-    # z5/xtensor (zarr volume access - heavy templates)
+    # xtensor (zarr volume access - heavy templates)
     <xtensor/containers/xarray.hpp>
     <xtensor/containers/xadapt.hpp>
     <xtensor/views/xview.hpp>
     <xtensor/generators/xbuilder.hpp>
-    <z5/factory.hxx>
-    <z5/dataset.hxx>
-    <z5/attributes.hxx>
-    <z5/filesystem/handle.hxx>
-    <z5/filesystem/dataset.hxx>
-    <z5/multiarray/xtensor_access.hxx>
+    <vc/zarr/Zarr.hpp>
 )
 endif()
 
