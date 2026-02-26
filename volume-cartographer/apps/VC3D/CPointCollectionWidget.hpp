@@ -13,10 +13,19 @@
 #include <QDoubleSpinBox>
 #include <QLabel>
 
+#include <cmath>
+#include <filesystem>
+#include <unordered_map>
 
 
 
 
+
+
+struct CorrPointResult {
+    float winding_obs = NAN;
+    float winding_err = NAN;
+};
 
 class CPointCollectionWidget : public QDockWidget
 {
@@ -25,6 +34,9 @@ class CPointCollectionWidget : public QDockWidget
 public:
     explicit CPointCollectionWidget(VCCollection *collection, QWidget *parent = nullptr);
     ~CPointCollectionWidget();
+
+    void loadCorrPointsResults(const std::filesystem::path& jsonPath);
+    void clearCorrPointsResults();
 
 signals:
     void collectionSelected(uint64_t collectionId);
@@ -95,5 +107,8 @@ private slots:
     QCheckBox *_winding_enabled_checkbox;
     QDoubleSpinBox* _winding_spinbox;
     QPushButton *_convert_to_anchor_button;
+
+    std::unordered_map<uint64_t, CorrPointResult> _corr_point_results;
+    std::unordered_map<uint64_t, float> _corr_collection_avgs;
 };
 

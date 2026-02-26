@@ -68,15 +68,16 @@ def main(argv: list[str] | None = None) -> int:
 	vis_cfg = cli_vis.from_args(args)
 	progress_enabled = bool(args.progress)
 	points_cfg = point_constraints.from_args(args)
-	points_tensor, points_collection_idx = point_constraints.load_points_tensor(points_cfg)
+	points_tensor, points_collection_idx, points_ids = point_constraints.load_points_tensor(points_cfg)
 	# Merge inline corr_points from config JSON (e.g. sent by VC3D)
 	corr_points_obj = cfg.pop("corr_points", None)
 	if isinstance(corr_points_obj, dict):
-		inline_pts, inline_cids = point_constraints.load_points_from_collections_dict(corr_points_obj)
+		inline_pts, inline_cids, inline_pids = point_constraints.load_points_from_collections_dict(corr_points_obj)
 		if inline_pts.shape[0] > 0:
 			print(f"[fit] loaded {inline_pts.shape[0]} inline corr_points from config")
 			points_tensor = torch.cat([points_tensor, inline_pts], dim=0)
 			points_collection_idx = torch.cat([points_collection_idx, inline_cids], dim=0)
+			points_ids = torch.cat([points_ids, inline_pids], dim=0)
 	point_constraints.print_points_tensor(points_tensor)
 
 	print("data:", data_cfg)
@@ -431,6 +432,42 @@ def main(argv: list[str] | None = None) -> int:
 				z_frac=z_frac,
 			)
 		))
+	def _build_corr_points_results(*, obs, avg, err, pt_ids, collection_idx):
+		"""Build JSON-serializable dict of per-point winding results."""
+		import math
+		result = {"points": {}, "collection_avgs": {}}
+		n = int(obs.shape[0]) if obs.numel() > 0 else 0
+		for i in range(n):
+			pid = int(pt_ids[i].item()) if i < int(pt_ids.shape[0]) else -1
+			o = float(obs[i].item())
+			e = float(err[i].item())
+			cid = int(collection_idx[i].item()) if i < int(collection_idx.shape[0]) else -1
+			entry = {"collection_id": cid}
+			if math.isfinite(o):
+				entry["winding_obs"] = round(o, 6)
+			else:
+				entry["winding_obs"] = None
+			if math.isfinite(e):
+				entry["winding_err"] = round(e, 6)
+			else:
+				entry["winding_err"] = None
+			result["points"][str(pid)] = entry
+		# Per-collection averages
+		if avg.numel() > 0 and collection_idx.numel() > 0:
+			import math as _m
+			uc = torch.unique(collection_idx)
+			for cid_t in uc.tolist():
+				cid_int = int(cid_t)
+				mask = (collection_idx == cid_int)
+				avg_vals = avg[mask]
+				if avg_vals.numel() > 0:
+					v = float(avg_vals[0].item())
+					if _m.isfinite(v):
+						result["collection_avgs"][str(cid_int)] = round(v, 6)
+		return result
+
+	_last_corr_results: list[dict | None] = [None]  # mutable container for nested function access
+
 	if int(points_all.shape[0]) > 0:
 		with torch.no_grad():
 			xy_lr_corr = mdl._grid_xy()
@@ -453,6 +490,9 @@ def main(argv: list[str] | None = None) -> int:
 				z_hi=z_hi_corr,
 				z_frac=z_frac_corr,
 			)
+		_last_corr_results[0] = _build_corr_points_results(
+			obs=_wobs0, avg=winding_avg, err=winding_err,
+			pt_ids=points_ids, collection_idx=points_collection_idx)
 		if _corr_out_dir is not None:
 			vis.save_corr_points(
 				data=data,
@@ -476,6 +516,7 @@ def main(argv: list[str] | None = None) -> int:
 		vis.save(model=mdl, data=data, postfix="init", out_dir=_out_dir, scale=vis_cfg.scale)
 		mdl.save_tiff(data=data, path=f"{_out_dir}/raw_init.tif")
 	stages = optimizer.load_stages_cfg(cfg)
+
 	def _save_model_snapshot(*, stage: str, step: int) -> None:
 		if _out_dir is None:
 			return
@@ -487,6 +528,8 @@ def main(argv: list[str] | None = None) -> int:
 		st = dict(mdl.state_dict())
 		st["_model_params_"] = asdict(mdl.params)
 		st["_fit_config_"] = fit_config
+		if _last_corr_results[0] is not None:
+			st["_corr_points_results_"] = _last_corr_results[0]
 		torch.save(st, str(p))
 
 	def _save_model_output_final() -> None:
@@ -495,6 +538,8 @@ def main(argv: list[str] | None = None) -> int:
 		st = dict(mdl.state_dict())
 		st["_model_params_"] = asdict(mdl.params)
 		st["_fit_config_"] = fit_config
+		if _last_corr_results[0] is not None:
+			st["_corr_points_results_"] = _last_corr_results[0]
 		torch.save(st, str(model_cfg.model_output))
 
 	_save_model_snapshot(stage="init", step=0)
@@ -525,6 +570,9 @@ def main(argv: list[str] | None = None) -> int:
 				z_hi=z_hi_corr,
 				z_frac=z_frac_corr,
 			)
+			_last_corr_results[0] = _build_corr_points_results(
+				obs=_wobs, avg=wavg, err=werr,
+				pt_ids=points_ids, collection_idx=points_collection_idx)
 			vis.save_corr_points(
 				data=data,
 				xy_lr=xy_lr_corr,
@@ -580,6 +628,9 @@ def main(argv: list[str] | None = None) -> int:
 				z_hi=z_hi_corr,
 				z_frac=z_frac_corr,
 			)
+			_last_corr_results[0] = _build_corr_points_results(
+				obs=_wobs, avg=wavg, err=werr,
+				pt_ids=points_ids, collection_idx=points_collection_idx)
 		vis.save_corr_points(
 			data=data,
 			xy_lr=xy_lr_corr,
@@ -635,6 +686,9 @@ def main(argv: list[str] | None = None) -> int:
 				z_hi=z_hi_corr,
 				z_frac=z_frac_corr,
 			)
+		_last_corr_results[0] = _build_corr_points_results(
+			obs=_wobsf, avg=wavgf, err=werrf,
+			pt_ids=points_ids, collection_idx=points_collection_idx)
 		vis.save_corr_points(
 			data=data,
 			xy_lr=xy_lr_corr,

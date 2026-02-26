@@ -35,8 +35,8 @@ def from_args(args: argparse.Namespace) -> PointConstraintsConfig:
 	return PointConstraintsConfig(points=paths)
 
 
-def _collect_from_obj(obj: object, rows: list[list[float]], cids: list[int]) -> None:
-	"""Parse a collections dict and append points to rows/cids."""
+def _collect_from_obj(obj: object, rows: list[list[float]], cids: list[int], pids: list[int]) -> None:
+	"""Parse a collections dict and append points to rows/cids/pids."""
 	cols = obj.get("collections", {}) if isinstance(obj, dict) else {}
 	if not isinstance(cols, dict):
 		return
@@ -64,6 +64,10 @@ def _collect_from_obj(obj: object, rows: list[list[float]], cids: list[int]) -> 
 				cid_i = int(_cid)
 			except Exception:
 				cid_i = -1
+			try:
+				pid_i = int(_pid)
+			except Exception:
+				pid_i = -1
 			rows.append([
 				float(pv[0]),
 				float(pv[1]),
@@ -71,29 +75,33 @@ def _collect_from_obj(obj: object, rows: list[list[float]], cids: list[int]) -> 
 				float(wa),
 			])
 			cids.append(cid_i)
+			pids.append(pid_i)
 
 
-def _rows_to_tensors(rows: list[list[float]], cids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+def _rows_to_tensors(rows: list[list[float]], cids: list[int], pids: list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 	pts = torch.tensor(rows, dtype=torch.float32) if rows else torch.empty((0, 4), dtype=torch.float32)
 	col_idx = torch.tensor(cids, dtype=torch.int64) if cids else torch.empty((0,), dtype=torch.int64)
-	return pts, col_idx
+	pt_ids = torch.tensor(pids, dtype=torch.int64) if pids else torch.empty((0,), dtype=torch.int64)
+	return pts, col_idx, pt_ids
 
 
-def load_points_tensor(cfg: PointConstraintsConfig) -> tuple[torch.Tensor, torch.Tensor]:
+def load_points_tensor(cfg: PointConstraintsConfig) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 	rows: list[list[float]] = []
 	cids: list[int] = []
+	pids: list[int] = []
 	for pth in cfg.points:
 		obj = json.loads(Path(pth).read_text(encoding="utf-8"))
-		_collect_from_obj(obj, rows, cids)
-	return _rows_to_tensors(rows, cids)
+		_collect_from_obj(obj, rows, cids, pids)
+	return _rows_to_tensors(rows, cids, pids)
 
 
-def load_points_from_collections_dict(obj: dict) -> tuple[torch.Tensor, torch.Tensor]:
+def load_points_from_collections_dict(obj: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 	"""Load points from an inline collections dict (same format as file)."""
 	rows: list[list[float]] = []
 	cids: list[int] = []
-	_collect_from_obj(obj, rows, cids)
-	return _rows_to_tensors(rows, cids)
+	pids: list[int] = []
+	_collect_from_obj(obj, rows, cids, pids)
+	return _rows_to_tensors(rows, cids, pids)
 
 
 def print_points_tensor(t: torch.Tensor) -> None:

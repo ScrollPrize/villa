@@ -2047,6 +2047,13 @@ void CWindow::CreateWidgets(void)
         if (_surfacePanel) {
             _surfacePanel->loadSurfacesIncremental();
         }
+        // Reload corr_points_results for the active surface
+        if (_point_collection_widget) {
+            auto surf = _surf_weak.lock();
+            if (surf && !surf->path.empty()) {
+                _point_collection_widget->loadCorrPointsResults(surf->path / "corr_points_results.json");
+            }
+        }
     });
 
     // Create Drawing widget
@@ -3663,6 +3670,13 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         if (_segmentationModule) {
             _segmentationModule->onActiveSegmentChanged(surf.get());
         }
+
+        // Load corr_points_results for the new segment
+        if (_point_collection_widget && surf && !surf->path.empty()) {
+            _point_collection_widget->loadCorrPointsResults(surf->path / "corr_points_results.json");
+        } else if (_point_collection_widget) {
+            _point_collection_widget->clearCorrPointsResults();
+        }
     }
 
     if (surf) {
@@ -3691,6 +3705,13 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
 
     if (_surfID != previousSurfId && _segmentationModule) {
         _segmentationModule->onActiveSegmentChanged(surf.get());
+
+        // Load corr_points_results for the new segment
+        if (_point_collection_widget && surf && !surf->path.empty()) {
+            _point_collection_widget->loadCorrPointsResults(surf->path / "corr_points_results.json");
+        } else if (_point_collection_widget) {
+            _point_collection_widget->clearCorrPointsResults();
+        }
 
         const bool wantsEditing = _segmentationWidget && _segmentationWidget->isEditingEnabled();
         if (wantsEditing) {

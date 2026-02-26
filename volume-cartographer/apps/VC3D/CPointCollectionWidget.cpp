@@ -14,7 +14,10 @@
 #include <QMenu>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
- 
+
+#include <fstream>
+#include <nlohmann/json.hpp>
+
 #include "vc/ui/VCCollection.hpp"
  
 
@@ -170,7 +173,7 @@ void CPointCollectionWidget::refreshTree()
         }
 
         _model->clear();
-        _model->setHorizontalHeaderLabels({"Name", "Points"});
+        _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error"});
         _model->blockSignals(false);
     }
 
@@ -197,11 +200,22 @@ void CPointCollectionWidget::refreshTree()
         name_item->setData(QBrush(color), Qt::DecorationRole);
         name_item->setData(QVariant::fromValue(collection.id));
         name_item->setFlags(name_item->flags() & ~Qt::ItemIsEditable);
-        
+
         QStandardItem *count_item = new QStandardItem(QString::number(collection.points.size()));
         count_item->setFlags(count_item->flags() & ~Qt::ItemIsEditable);
-        
-        _model->appendRow({name_item, count_item});
+
+        // Collection-level winding average
+        QStandardItem *col_winding_item = new QStandardItem();
+        col_winding_item->setFlags(col_winding_item->flags() & ~Qt::ItemIsEditable);
+        auto col_avg_it = _corr_collection_avgs.find(collection.id);
+        if (col_avg_it != _corr_collection_avgs.end()) {
+            col_winding_item->setText(QString::number(col_avg_it->second, 'f', 3));
+        }
+
+        QStandardItem *col_err_item = new QStandardItem();
+        col_err_item->setFlags(col_err_item->flags() & ~Qt::ItemIsEditable);
+
+        _model->appendRow({name_item, count_item, col_winding_item, col_err_item});
 
         // Get points and sort them by ID
         std::vector<ColPoint> sorted_points;
@@ -219,11 +233,26 @@ void CPointCollectionWidget::refreshTree()
             QStandardItem *id_item = new QStandardItem(QString::number(point.id));
             id_item->setData(QVariant::fromValue(point.id));
             id_item->setFlags(id_item->flags() & ~Qt::ItemIsEditable);
-            
+
             QStandardItem *pos_item = new QStandardItem(QString("{%1, %2, %3}").arg(point.p[0]).arg(point.p[1]).arg(point.p[2]));
             pos_item->setFlags(pos_item->flags() & ~Qt::ItemIsEditable);
-            
-            name_item->appendRow({id_item, pos_item});
+
+            QStandardItem *pt_winding_item = new QStandardItem();
+            pt_winding_item->setFlags(pt_winding_item->flags() & ~Qt::ItemIsEditable);
+            QStandardItem *pt_err_item = new QStandardItem();
+            pt_err_item->setFlags(pt_err_item->flags() & ~Qt::ItemIsEditable);
+
+            auto res_it = _corr_point_results.find(point.id);
+            if (res_it != _corr_point_results.end()) {
+                if (std::isfinite(res_it->second.winding_obs)) {
+                    pt_winding_item->setText(QString::number(res_it->second.winding_obs, 'f', 3));
+                }
+                if (std::isfinite(res_it->second.winding_err)) {
+                    pt_err_item->setText(QString::number(res_it->second.winding_err, 'f', 3));
+                }
+            }
+
+            name_item->appendRow({id_item, pos_item, pt_winding_item, pt_err_item});
         }
     }
 
@@ -251,7 +280,17 @@ void CPointCollectionWidget::onCollectionsAdded(const std::vector<uint64_t>& col
         QStandardItem *count_item = new QStandardItem(QString::number(collection.points.size()));
         count_item->setFlags(count_item->flags() & ~Qt::ItemIsEditable);
 
-        _model->appendRow({name_item, count_item});
+        QStandardItem *col_winding_item = new QStandardItem();
+        col_winding_item->setFlags(col_winding_item->flags() & ~Qt::ItemIsEditable);
+        auto col_avg_it = _corr_collection_avgs.find(collectionId);
+        if (col_avg_it != _corr_collection_avgs.end()) {
+            col_winding_item->setText(QString::number(col_avg_it->second, 'f', 3));
+        }
+
+        QStandardItem *col_err_item = new QStandardItem();
+        col_err_item->setFlags(col_err_item->flags() & ~Qt::ItemIsEditable);
+
+        _model->appendRow({name_item, count_item, col_winding_item, col_err_item});
 
         for(const auto& point_pair : collection.points) {
             onPointAdded(point_pair.second);
@@ -284,7 +323,7 @@ void CPointCollectionWidget::onCollectionRemoved(uint64_t collectionId)
             _model->blockSignals(true);
             _model->removeRows(0, _model->rowCount());
             _model->clear();
-            _model->setHorizontalHeaderLabels({"Name", "Points"});
+            _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error"});
             _model->blockSignals(false);
         }
         return;
@@ -303,12 +342,27 @@ void CPointCollectionWidget::onPointAdded(const ColPoint& point)
         QStandardItem *id_item = new QStandardItem(QString::number(point.id));
         id_item->setData(QVariant::fromValue(point.id));
         id_item->setFlags(id_item->flags() & ~Qt::ItemIsEditable);
-        
+
         QStandardItem *pos_item = new QStandardItem(QString("{%1, %2, %3}").arg(point.p[0]).arg(point.p[1]).arg(point.p[2]));
         pos_item->setFlags(pos_item->flags() & ~Qt::ItemIsEditable);
-        
-        collection_item->appendRow({id_item, pos_item});
-        
+
+        QStandardItem *pt_winding_item = new QStandardItem();
+        pt_winding_item->setFlags(pt_winding_item->flags() & ~Qt::ItemIsEditable);
+        QStandardItem *pt_err_item = new QStandardItem();
+        pt_err_item->setFlags(pt_err_item->flags() & ~Qt::ItemIsEditable);
+
+        auto res_it = _corr_point_results.find(point.id);
+        if (res_it != _corr_point_results.end()) {
+            if (std::isfinite(res_it->second.winding_obs)) {
+                pt_winding_item->setText(QString::number(res_it->second.winding_obs, 'f', 3));
+            }
+            if (std::isfinite(res_it->second.winding_err)) {
+                pt_err_item->setText(QString::number(res_it->second.winding_err, 'f', 3));
+            }
+        }
+
+        collection_item->appendRow({id_item, pos_item, pt_winding_item, pt_err_item});
+
         // Update count
         QStandardItem* count_item = _model->item(collection_item->row(), 1);
         if(count_item) {
@@ -657,6 +711,62 @@ void CPointCollectionWidget::showContextMenu(const QPoint& pos)
     if (chosen == focusAction) {
         emit focusViewsRequested(_selected_collection_id, _selected_point_id);
     }
+}
+
+void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& jsonPath)
+{
+    _corr_point_results.clear();
+    _corr_collection_avgs.clear();
+
+    if (jsonPath.empty() || !std::filesystem::exists(jsonPath)) {
+        refreshTree();
+        return;
+    }
+
+    try {
+        std::ifstream ifs(jsonPath);
+        if (!ifs.is_open()) {
+            refreshTree();
+            return;
+        }
+        nlohmann::json j = nlohmann::json::parse(ifs);
+
+        if (j.contains("points") && j["points"].is_object()) {
+            for (auto& [key, val] : j["points"].items()) {
+                uint64_t pid = 0;
+                try { pid = std::stoull(key); } catch (...) { continue; }
+                CorrPointResult r;
+                if (val.contains("winding_obs") && val["winding_obs"].is_number()) {
+                    r.winding_obs = val["winding_obs"].get<float>();
+                }
+                if (val.contains("winding_err") && val["winding_err"].is_number()) {
+                    r.winding_err = val["winding_err"].get<float>();
+                }
+                _corr_point_results[pid] = r;
+            }
+        }
+
+        if (j.contains("collection_avgs") && j["collection_avgs"].is_object()) {
+            for (auto& [key, val] : j["collection_avgs"].items()) {
+                uint64_t cid = 0;
+                try { cid = std::stoull(key); } catch (...) { continue; }
+                if (val.is_number()) {
+                    _corr_collection_avgs[cid] = val.get<float>();
+                }
+            }
+        }
+    } catch (...) {
+        // Silently ignore parse errors
+    }
+
+    refreshTree();
+}
+
+void CPointCollectionWidget::clearCorrPointsResults()
+{
+    _corr_point_results.clear();
+    _corr_collection_avgs.clear();
+    refreshTree();
 }
 
 CPointCollectionWidget::~CPointCollectionWidget() {
