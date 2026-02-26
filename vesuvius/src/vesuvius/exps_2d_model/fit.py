@@ -432,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
 				z_frac=z_frac,
 			)
 		))
-	def _build_corr_points_results(*, obs, avg, err, pt_ids, collection_idx):
+	def _build_corr_points_results(*, obs, avg, err, pt_ids, collection_idx, points_fullres):
 		"""Build JSON-serializable dict of per-point winding results."""
 		import math
 		result = {"points": {}, "collection_avgs": {}}
@@ -451,6 +451,12 @@ def main(argv: list[str] | None = None) -> int:
 				entry["winding_err"] = round(e, 6)
 			else:
 				entry["winding_err"] = None
+			if i < int(points_fullres.shape[0]):
+				entry["p"] = [
+					round(float(points_fullres[i, 0].item()), 2),
+					round(float(points_fullres[i, 1].item()), 2),
+					round(float(points_fullres[i, 2].item()), 2),
+				]
 			result["points"][str(pid)] = entry
 		# Per-collection averages
 		if avg.numel() > 0 and collection_idx.numel() > 0:
@@ -492,7 +498,8 @@ def main(argv: list[str] | None = None) -> int:
 			)
 		_last_corr_results[0] = _build_corr_points_results(
 			obs=_wobs0, avg=winding_avg, err=winding_err,
-			pt_ids=points_ids, collection_idx=points_collection_idx)
+			pt_ids=points_ids, collection_idx=points_collection_idx,
+			points_fullres=points_tensor)
 		if _corr_out_dir is not None:
 			vis.save_corr_points(
 				data=data,
@@ -572,7 +579,8 @@ def main(argv: list[str] | None = None) -> int:
 			)
 			_last_corr_results[0] = _build_corr_points_results(
 				obs=_wobs, avg=wavg, err=werr,
-				pt_ids=points_ids, collection_idx=points_collection_idx)
+				pt_ids=points_ids, collection_idx=points_collection_idx,
+				points_fullres=points_tensor)
 			vis.save_corr_points(
 				data=data,
 				xy_lr=xy_lr_corr,
@@ -630,7 +638,8 @@ def main(argv: list[str] | None = None) -> int:
 			)
 			_last_corr_results[0] = _build_corr_points_results(
 				obs=_wobs, avg=wavg, err=werr,
-				pt_ids=points_ids, collection_idx=points_collection_idx)
+				pt_ids=points_ids, collection_idx=points_collection_idx,
+				points_fullres=points_tensor)
 		vis.save_corr_points(
 			data=data,
 			xy_lr=xy_lr_corr,
@@ -688,7 +697,8 @@ def main(argv: list[str] | None = None) -> int:
 			)
 		_last_corr_results[0] = _build_corr_points_results(
 			obs=_wobsf, avg=wavgf, err=werrf,
-			pt_ids=points_ids, collection_idx=points_collection_idx)
+			pt_ids=points_ids, collection_idx=points_collection_idx,
+			points_fullres=points_tensor)
 		vis.save_corr_points(
 			data=data,
 			xy_lr=xy_lr_corr,
