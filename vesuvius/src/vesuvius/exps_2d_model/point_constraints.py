@@ -139,16 +139,16 @@ def closest_conn_segment_indices(
 	xy_conn: torch.Tensor,
 ) -> tuple[
 	torch.Tensor,  # points_all (K,4)
-	torch.Tensor, torch.Tensor, torch.Tensor,  # idx_left, valid_left, min_dist_left (lo)
-	torch.Tensor, torch.Tensor, torch.Tensor,  # idx_right, valid_right, min_dist_right (lo)
-	torch.Tensor, torch.Tensor, torch.Tensor,  # idx_left_hi, valid_left_hi, min_dist_left_hi
-	torch.Tensor, torch.Tensor, torch.Tensor,  # idx_right_hi, valid_right_hi, min_dist_right_hi
+	torch.Tensor, torch.Tensor, torch.Tensor,  # idx_left, valid_left, min_dist_left
+	torch.Tensor, torch.Tensor, torch.Tensor,  # idx_right, valid_right, min_dist_right
+	torch.Tensor,  # z_hi (K,)
 	torch.Tensor,  # z_frac (K,)
 ]:
-	"""Return closest enclosing LR-segment indices at both neighboring z-slices.
+	"""Return closest enclosing LR-segment indices on z-interpolated mesh.
 
-	For each point, searches at z_lo=floor(z) and z_hi=ceil(z).  The returned
-	z_frac (in [0,1]) gives the bilinear weight for the hi slice.
+	For each point, linearly interpolates the mesh between z_lo=floor(z)
+	and z_hi=ceil(z), then searches that single interpolated mesh.
+	idx_left/idx_right store z_lo in [:, 0] for loss map distribution.
 
 	- points_xyz_winda: (K,4) as [x,y,z,wind_a]
 	- xy_conn: (N,Hm,Wm,3,2) in order [left,point,right]
@@ -159,8 +159,7 @@ def closest_conn_segment_indices(
 			_empty(0, 4),
 			_empty(0, 3, dtype=torch.int64), _empty(0, dtype=torch.bool), _empty(0),
 			_empty(0, 3, dtype=torch.int64), _empty(0, dtype=torch.bool), _empty(0),
-			_empty(0, 3, dtype=torch.int64), _empty(0, dtype=torch.bool), _empty(0),
-			_empty(0, 3, dtype=torch.int64), _empty(0, dtype=torch.bool), _empty(0),
+			_empty(0, dtype=torch.int64),
 			_empty(0),
 		)
 	if xy_conn.ndim != 5 or int(xy_conn.shape[3]) != 3 or int(xy_conn.shape[4]) != 2:
@@ -222,22 +221,19 @@ def closest_conn_segment_indices(
 		d2 = ((q - c) * (q - c)).sum(dim=-1)
 		return torch.where(inside, d2, torch.full_like(d2, float("inf")))
 
-	def _batch_search_at_z(z_indices: torch.Tensor):
-		"""Search for best gap at z-slices for all K points simultaneously.
+	def _batch_search_interp(*, center_k: torch.Tensor, leftp_k: torch.Tensor, rightp_k: torch.Tensor, z_ref: torch.Tensor):
+		"""Search for best gap on pre-gathered per-point mesh slices.
 
-		z_indices: (K,) long tensor of z-slice indices.
+		center_k, leftp_k, rightp_k: (K, Hm, Wm, 2) interpolated mesh.
+		z_ref: (K,) long tensor stored in idx[:, 0] for loss map distribution.
 		Returns (idx_l, ok_l, dist_l, idx_r, ok_r, dist_r) all with leading K dim.
 		"""
-		z_clamped = z_indices.clamp(0, n - 1)
-		center_z = center[z_clamped]      # (K, Hm, Wm, 2)
-		leftp_z = leftp[z_clamped]        # (K, Hm, Wm, 2)
-		rightp_z = rightp[z_clamped]      # (K, Hm, Wm, 2)
-		p0 = center_z[:, :-1, :, :]      # (K, Hm-1, Wm, 2)
-		p1 = center_z[:, 1:, :, :]       # (K, Hm-1, Wm, 2)
+		p0 = center_k[:, :-1, :, :]      # (K, Hm-1, Wm, 2)
+		p1 = center_k[:, 1:, :, :]       # (K, Hm-1, Wm, 2)
 		q = pts[:, 0:2].view(k, 1, 1, 2)
 
-		d2_r = _batch_side_d2(conn_side=rightp_z, p0=p0, p1=p1, q=q)  # (K, Hm-1, Wm)
-		d2_l = _batch_side_d2(conn_side=leftp_z, p0=p0, p1=p1, q=q)   # (K, Hm-1, Wm)
+		d2_r = _batch_side_d2(conn_side=rightp_k, p0=p0, p1=p1, q=q)  # (K, Hm-1, Wm)
+		d2_l = _batch_side_d2(conn_side=leftp_k, p0=p0, p1=p1, q=q)   # (K, Hm-1, Wm)
 
 		min_r, argmin_r = d2_r.min(dim=1)  # (K, Wm)
 		min_l, argmin_l = d2_l.min(dim=1)  # (K, Wm)
@@ -245,7 +241,7 @@ def closest_conn_segment_indices(
 		ki = torch.arange(k, device=dev)
 
 		if wm < 2:
-			idx = torch.stack([z_clamped, torch.full_like(z_clamped, -1), torch.full_like(z_clamped, -1)], dim=-1)
+			idx = torch.stack([z_ref, torch.full_like(z_ref, -1), torch.full_like(z_ref, -1)], dim=-1)
 			ok = torch.zeros(k, dtype=torch.bool, device=dev)
 			dist = torch.full((k,), float("inf"), dtype=torch.float32, device=dev)
 			return idx, ok, dist, idx.clone(), ok.clone(), dist.clone()
@@ -260,12 +256,12 @@ def closest_conn_segment_indices(
 		row_r = argmin_r[ki, c_r]  # (K,)
 		row_l = argmin_l[ki, c_l]  # (K,)
 
-		idx_l = torch.stack([z_clamped, row_l, c_l], dim=-1)   # (K, 3)
-		idx_r = torch.stack([z_clamped, row_r, c_r], dim=-1)   # (K, 3)
+		idx_l = torch.stack([z_ref, row_l, c_l], dim=-1)   # (K, 3)
+		idx_r = torch.stack([z_ref, row_r, c_r], dim=-1)   # (K, 3)
 		dist_l = torch.sqrt(min_l[ki, c_l])  # (K,)
 		dist_r = torch.sqrt(min_r[ki, c_r])  # (K,)
 
-		inv_idx = torch.stack([z_clamped, torch.full_like(z_clamped, -1), torch.full_like(z_clamped, -1)], dim=-1)
+		inv_idx = torch.stack([z_ref, torch.full_like(z_ref, -1), torch.full_like(z_ref, -1)], dim=-1)
 		idx_l = torch.where(gap_finite.unsqueeze(-1), idx_l, inv_idx)
 		idx_r = torch.where(gap_finite.unsqueeze(-1), idx_r, inv_idx)
 		dist_l = torch.where(gap_finite, dist_l, torch.full_like(dist_l, float("inf")))
@@ -280,16 +276,23 @@ def closest_conn_segment_indices(
 	frac = z_f - z_f.floor()
 	z_frac_out = torch.where(z_lo == z_hi, torch.zeros_like(frac), frac)
 
-	# Batch search at lo and hi z-slices
-	idx_left, ok_left, dist_left, idx_right, ok_right, dist_right = _batch_search_at_z(z_lo)
-	idx_left_hi, ok_left_hi, dist_left_hi, idx_right_hi, ok_right_hi, dist_right_hi = _batch_search_at_z(z_hi)
+	# Interpolate mesh per-point
+	z_lo_c = z_lo.clamp(0, n - 1)
+	z_hi_c = z_hi.clamp(0, n - 1)
+	frac_view = z_frac_out.view(k, 1, 1, 1)  # (K,1,1,1) for broadcasting
+	center_interp = center[z_lo_c] * (1.0 - frac_view) + center[z_hi_c] * frac_view  # (K,Hm,Wm,2)
+	leftp_interp = leftp[z_lo_c] * (1.0 - frac_view) + leftp[z_hi_c] * frac_view
+	rightp_interp = rightp[z_lo_c] * (1.0 - frac_view) + rightp[z_hi_c] * frac_view
+
+	# Single search on interpolated mesh
+	idx_left, ok_left, dist_left, idx_right, ok_right, dist_right = _batch_search_interp(
+		center_k=center_interp, leftp_k=leftp_interp, rightp_k=rightp_interp, z_ref=z_lo)
 
 	return (
 		pts,
 		idx_left, ok_left, dist_left,
 		idx_right, ok_right, dist_right,
-		idx_left_hi, ok_left_hi, dist_left_hi,
-		idx_right_hi, ok_right_hi, dist_right_hi,
+		z_hi,
 		z_frac_out,
 	)
 
@@ -297,15 +300,15 @@ def closest_conn_segment_indices(
 def print_closest_conn_segments(*, points_xyz_winda: torch.Tensor, xy_conn: torch.Tensor) -> None:
 	(pts_all,
 	 idx_l, ok_l, d_l, idx_r, ok_r, d_r,
-	 idx_l_hi, ok_l_hi, d_l_hi, idx_r_hi, ok_r_hi, d_r_hi,
-	 z_frac) = closest_conn_segment_indices(points_xyz_winda=points_xyz_winda, xy_conn=xy_conn)
+	 z_hi, z_frac) = closest_conn_segment_indices(points_xyz_winda=points_xyz_winda, xy_conn=xy_conn)
 	print("[point_constraints] points_xyz_winda_work_all", pts_all)
-	print("[point_constraints] closest_conn_left[z,row,colL]", idx_l)
+	print("[point_constraints] closest_conn_left[z_lo,row,colL]", idx_l)
 	print("[point_constraints] closest_conn_left_valid", ok_l)
 	print("[point_constraints] closest_conn_left_min_dist_px", d_l)
-	print("[point_constraints] closest_conn_right[z,row,colL]", idx_r)
+	print("[point_constraints] closest_conn_right[z_lo,row,colL]", idx_r)
 	print("[point_constraints] closest_conn_right_valid", ok_r)
 	print("[point_constraints] closest_conn_right_min_dist_px", d_r)
+	print("[point_constraints] z_hi", z_hi)
 	print("[point_constraints] z_frac", z_frac)
 
 
@@ -318,8 +321,12 @@ def winding_observed_and_error(
 	valid_left: torch.Tensor,
 	idx_right: torch.Tensor,
 	valid_right: torch.Tensor,
+	z_hi: torch.Tensor,
+	z_frac: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 	"""Return per-point observed winding, per-point collection average, and winding error.
+
+	Uses z-interpolated mesh lookups (z_lo from idx[:, 0], z_hi, z_frac).
 
 	- observed winding uses both sides when valid:
 	  left estimate:  col_left - xfrac_left
@@ -337,6 +344,8 @@ def winding_observed_and_error(
 	idx_r = idx_right.to(device=xy_conn.device, dtype=torch.int64)
 	ok_l = valid_left.to(device=xy_conn.device, dtype=torch.bool)
 	ok_r = valid_right.to(device=xy_conn.device, dtype=torch.bool)
+	z_hi_t = z_hi.to(device=xy_conn.device, dtype=torch.int64)
+	z_frac_t = z_frac.to(device=xy_conn.device, dtype=torch.float32)
 
 	center = xy_conn[:, :, :, 1, :]
 	leftp = xy_conn[:, :, :, 0, :]
@@ -353,13 +362,15 @@ def winding_observed_and_error(
 		if not valid.any():
 			return xf
 		zi_s = zi.clamp(0, max(n - 1, 0))
+		z_hi_s = z_hi_t.clamp(0, max(n - 1, 0))
 		ri_s = ri.clamp(0, max(hm - 2, 0))
 		ci_s = ci.clamp(0, max(wm - 1, 0))
+		fk = z_frac_t.unsqueeze(-1)  # (K, 1)
 		q = pts[:, 0:2]
-		p0 = center[zi_s, ri_s, ci_s]
-		p1 = center[zi_s, ri_s + 1, ci_s]
-		c0 = side_pts[zi_s, ri_s, ci_s]
-		c1 = side_pts[zi_s, ri_s + 1, ci_s]
+		p0 = center[zi_s, ri_s, ci_s] * (1.0 - fk) + center[z_hi_s, ri_s, ci_s] * fk
+		p1 = center[zi_s, ri_s + 1, ci_s] * (1.0 - fk) + center[z_hi_s, ri_s + 1, ci_s] * fk
+		c0 = side_pts[zi_s, ri_s, ci_s] * (1.0 - fk) + side_pts[z_hi_s, ri_s, ci_s] * fk
+		c1 = side_pts[zi_s, ri_s + 1, ci_s] * (1.0 - fk) + side_pts[z_hi_s, ri_s + 1, ci_s] * fk
 		s = p1 - p0
 		l2 = (s * s).sum(dim=-1)
 		valid = valid & (l2 > 1e-12)
