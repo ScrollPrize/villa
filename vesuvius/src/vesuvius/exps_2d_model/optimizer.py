@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, replace
 
 import torch
@@ -594,7 +595,16 @@ def optimize(
 
 		max_steps = opt_cfg.steps if opt_cfg.termination == "steps" else 10_000_000
 		actual_steps = 0
+		_use_cuda = data.cos.device.type == "cuda"
+		_sync = torch.cuda.synchronize if _use_cuda else lambda: None
+		_t_model_fw_acc = 0.0
+		_t_corr_acc = 0.0
+		_t_other_loss_acc = 0.0
+		_t_bw_acc = 0.0
+		_t_steps_acc = 0
 		for step in range(max_steps):
+			_sync()
+			_t0 = time.perf_counter()
 			res = model(data)
 			model.update_ema(xy_lr=res.xy_lr, xy_conn=res.xy_conn)
 			if stage.masks is not None:
@@ -605,21 +615,40 @@ def optimize(
 						masks=stage.masks,
 					)
 				res = replace(res, _stage_img_masks=stage_img_masks, _stage_img_masks_losses=stage_img_masks_losses)
+			_sync()
+			_t1 = time.perf_counter()
+			_t_model_fw_acc += _t1 - _t0
 			loss = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
 			term_vals: dict[str, float] = {}
 			vis_losses = VisLossCollection(loss_maps={})
+			_t_corr_step = 0.0
 			for name, t in terms.items():
 				w = _need_term(name, opt_cfg.eff)
 				if w == 0.0:
 					continue
+				if name == "corr_winding":
+					_sync()
+					_tc0 = time.perf_counter()
 				lv, lms, masks = _loss3(loss_fn=t["loss"], res=res)
+				if name == "corr_winding":
+					_sync()
+					_tc1 = time.perf_counter()
+					_t_corr_step = _tc1 - _tc0
 				vis_losses = vis_losses.add_or_update(name=name, maps=lms, masks=masks)
 				term_vals[name] = float(lv.detach().cpu())
 				loss = loss + w * lv
+			_sync()
+			_t2 = time.perf_counter()
+			_t_corr_acc += _t_corr_step
+			_t_other_loss_acc += (_t2 - _t1) - _t_corr_step
 			opt.zero_grad(set_to_none=True)
 			loss.backward()
 			opt.step()
+			_sync()
+			_t3 = time.perf_counter()
+			_t_bw_acc += _t3 - _t2
 			model.update_conn_offsets()
+			_t_steps_acc += 1
 			_done_steps[0] += 1
 			actual_steps = step + 1
 			step1 = step + 1
@@ -651,6 +680,17 @@ def optimize(
 				term_vals = {k: round(v, 4) for k, v in term_vals.items()}
 				param_vals = {k: round(v, 4) for k, v in param_vals.items()}
 				_print_status(step_label=f"{label} {step1}/{opt_cfg.steps if opt_cfg.termination == 'steps' else '?'}", loss_val=loss.item(), tv=term_vals, pv=param_vals)
+				if _t_steps_acc > 0:
+					_t_total = _t_model_fw_acc + _t_other_loss_acc + _t_corr_acc + _t_bw_acc
+					if _t_total > 0:
+						_pct = lambda v: 100.0 * v / _t_total
+						print(f"  [timing] {_t_steps_acc} steps, {1000*_t_total/_t_steps_acc:.1f} ms/step | "
+							  f"model_fw {_pct(_t_model_fw_acc):.1f}% | "
+							  f"other_loss {_pct(_t_other_loss_acc):.1f}% | "
+							  f"corr_pts {_pct(_t_corr_acc):.1f}% | "
+							  f"bw+opt {_pct(_t_bw_acc):.1f}%")
+					_t_model_fw_acc = _t_corr_acc = _t_other_loss_acc = _t_bw_acc = 0.0
+					_t_steps_acc = 0
 				if corr_snapshot_fn is not None:
 					corr_snapshot_fn(stage=label, step=step1, data=data, res=res)
 

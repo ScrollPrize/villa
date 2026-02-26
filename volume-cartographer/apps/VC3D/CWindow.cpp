@@ -2084,6 +2084,7 @@ void CWindow::CreateWidgets(void)
     }
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
+    connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
 
     // Tab the docks - keep Segmentation, Seeding, Point Collections, and Drawing together
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
@@ -4100,6 +4101,153 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
     _point_collection->removePoint(pointId);
 
     statusBar()->showMessage(tr("Converted point to anchor at grid position (%1, %2)").arg(anchor2d[0]).arg(anchor2d[1]), 3000);
+}
+
+void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
+{
+    if (!_surf_col || !_point_collection) return;
+
+    const auto& collections = _point_collection->getAllCollections();
+    auto it = collections.find(collectionId);
+    if (it == collections.end()) return;
+
+    const auto& collection = it->second;
+    if (collection.points.empty()) return;
+
+    // Gather all 3D points
+    std::vector<cv::Vec3f> pts;
+    pts.reserve(collection.points.size());
+    for (const auto& pair : collection.points) {
+        pts.push_back(pair.second.p);
+    }
+
+    // Compute centroid
+    cv::Vec3f centroid(0, 0, 0);
+    for (const auto& p : pts) centroid += p;
+    centroid *= 1.0f / pts.size();
+
+    // Determine focus position
+    cv::Vec3f focusPos = centroid;
+    if (pointId != 0) {
+        auto point_opt = _point_collection->getPoint(pointId);
+        if (point_opt) focusPos = point_opt->p;
+    }
+
+    // Compute plane normal via PCA (only if >= 3 points)
+    cv::Vec3f N(0, 0, 1); // default
+    if (pts.size() >= 3) {
+        // Build 3x3 covariance matrix from centered points
+        cv::Matx33f cov = cv::Matx33f::zeros();
+        for (const auto& p : pts) {
+            cv::Vec3f d = p - centroid;
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 3; c++)
+                    cov(r, c) += d[r] * d[c];
+        }
+        cv::Mat eigenvalues, eigenvectors;
+        cv::eigen(cv::Mat(cov), eigenvalues, eigenvectors);
+        // Eigenvectors are sorted descending by eigenvalue.
+        // Smallest eigenvalue's eigenvector (row 2) = plane normal.
+        N = cv::Vec3f(eigenvectors.at<float>(2, 0),
+                      eigenvectors.at<float>(2, 1),
+                      eigenvectors.at<float>(2, 2));
+        N = normalizeOrZero(N);
+        if (cv::norm(N) < kEpsilon) N = cv::Vec3f(0, 0, 1);
+    } else if (pts.size() == 2) {
+        cv::Vec3f d = normalizeOrZero(pts[1] - pts[0]);
+        if (cv::norm(d) > kEpsilon) {
+            // Pick N perpendicular to d and closest to a canonical axis
+            cv::Vec3f candidates[3] = {{1,0,0}, {0,1,0}, {0,0,1}};
+            float bestDot = 1.0f;
+            cv::Vec3f bestN(0, 0, 1);
+            for (auto& axis : candidates) {
+                float absDot = std::abs(d.dot(axis));
+                if (absDot < bestDot) {
+                    bestDot = absDot;
+                    cv::Vec3f proj = normalizeOrZero(axis - d * d.dot(axis));
+                    if (cv::norm(proj) > kEpsilon) bestN = proj;
+                }
+            }
+            N = bestN;
+        }
+    } else {
+        // 1 point: just center, don't change orientation
+        centerFocusAt(focusPos, cv::Vec3f(0, 0, 1), "", true);
+        return;
+    }
+
+    // Choose which viewer gets the primary plane
+    const cv::Vec3f segYZCanonical(1, 0, 0);
+    const cv::Vec3f segXZCanonical(0, 1, 0);
+
+    std::string primaryName, secondaryName;
+    cv::Vec3f secondaryCanonical;
+
+    if (std::abs(N.dot(segYZCanonical)) >= std::abs(N.dot(segXZCanonical))) {
+        primaryName = "seg yz";
+        secondaryName = "seg xz";
+        secondaryCanonical = segXZCanonical;
+    } else {
+        primaryName = "seg xz";
+        secondaryName = "seg yz";
+        secondaryCanonical = segYZCanonical;
+    }
+
+    // Helper to configure a plane with Z-up in-plane rotation
+    const auto configureFocusPlane = [&](const std::string& planeName,
+                                         const cv::Vec3f& normal) {
+        auto planeShared = std::dynamic_pointer_cast<PlaneSurface>(_surf_col->surface(planeName));
+        if (!planeShared) {
+            planeShared = std::make_shared<PlaneSurface>();
+        }
+        planeShared->setOrigin(focusPos);
+        planeShared->setNormal(normal);
+        planeShared->setInPlaneRotation(0.0f);
+
+        // Adjust in-plane rotation so Z projects "up"
+        const cv::Vec3f upAxis(0.0f, 0.0f, 1.0f);
+        const cv::Vec3f projectedUp = projectVectorOntoPlane(upAxis, normal);
+        const cv::Vec3f desiredUp = normalizeOrZero(projectedUp);
+        if (cv::norm(desiredUp) > kEpsilon) {
+            const cv::Vec3f currentUp = planeShared->basisY();
+            const float delta = signedAngleBetween(currentUp, desiredUp, normal);
+            if (std::abs(delta) > kEpsilon) {
+                planeShared->setInPlaneRotation(delta);
+            }
+        }
+
+        _surf_col->setSurface(planeName, planeShared);
+    };
+
+    // Set focus POI first — this triggers applySlicePlaneOrientation() which
+    // overwrites slice planes. We set our custom planes after.
+    POI* focus = _surf_col->poi("focus");
+    if (!focus) {
+        focus = new POI;
+    }
+    focus->p = focusPos;
+    focus->n = N;
+    _surf_col->setPOI("focus", focus);
+
+    // Now set our PCA-derived planes (overriding what applySlicePlaneOrientation set)
+    configureFocusPlane(primaryName, N);
+
+    // Set secondary plane: component of other canonical axis orthogonal to N
+    cv::Vec3f secNormal = normalizeOrZero(secondaryCanonical - N * N.dot(secondaryCanonical));
+    if (cv::norm(secNormal) < kEpsilon) {
+        // Fallback: use cross product
+        secNormal = normalizeOrZero(crossProduct(N, cv::Vec3f(0, 0, 1)));
+        if (cv::norm(secNormal) < kEpsilon) {
+            secNormal = normalizeOrZero(crossProduct(N, cv::Vec3f(0, 1, 0)));
+        }
+    }
+    configureFocusPlane(secondaryName, secNormal);
+
+    if (_planeSlicingOverlay) {
+        _planeSlicingOverlay->refreshAll();
+    }
+
+    statusBar()->showMessage(tr("Focus views aligned to %1 points").arg(pts.size()), 3000);
 }
 
 void CWindow::onZoomOut()
