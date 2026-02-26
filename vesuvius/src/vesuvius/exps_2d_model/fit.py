@@ -201,10 +201,7 @@ def main(argv: list[str] | None = None) -> int:
 	idx_right = torch.empty((0, 3), dtype=torch.int64)
 	valid_right = torch.empty((0,), dtype=torch.bool)
 	min_dist_right = torch.empty((0,), dtype=torch.float32)
-	idx_left_hi = torch.empty((0, 3), dtype=torch.int64)
-	valid_left_hi = torch.empty((0,), dtype=torch.bool)
-	idx_right_hi = torch.empty((0, 3), dtype=torch.int64)
-	valid_right_hi = torch.empty((0,), dtype=torch.bool)
+	z_hi = torch.empty((0,), dtype=torch.int64)
 	z_frac = torch.empty((0,), dtype=torch.float32)
 	winding_obs = torch.empty((0,), dtype=torch.float32)
 	winding_avg = torch.empty((0,), dtype=torch.float32)
@@ -287,18 +284,15 @@ def main(argv: list[str] | None = None) -> int:
 		(points_all,
 		 idx_left, valid_left, min_dist_left,
 		 idx_right, valid_right, min_dist_right,
-		 idx_left_hi, valid_left_hi, _dist_left_hi,
-		 idx_right_hi, valid_right_hi, _dist_right_hi,
-		 z_frac) = point_constraints.closest_conn_segment_indices(points_xyz_winda=points_tensor_work, xy_conn=xy_conn0)
-		n_lo = int(valid_left.sum().item())
-		n_hi = int(valid_left_hi.sum().item())
-		n_interp = int(((z_frac > 0.0) & valid_left & valid_left_hi).sum().item())
-		print(f"[point_constraints] {int(points_all.shape[0])} pts: {n_lo} valid_lo, {n_hi} valid_hi, {n_interp} z-interpolated")
+		 z_hi, z_frac) = point_constraints.closest_conn_segment_indices(points_xyz_winda=points_tensor_work, xy_conn=xy_conn0)
+		n_valid = int(valid_left.sum().item())
+		n_interp = int((z_frac > 0.0).sum().item())
+		print(f"[point_constraints] {int(points_all.shape[0])} pts: {n_valid} valid, {n_interp} z-interpolated")
 		for pi in range(int(points_all.shape[0])):
 			pf = points_tensor[pi]  # original fullres
 			pw = points_all[pi]     # working coords (after margin shift)
 			z_lo_i = int(idx_left[pi, 0].item())
-			z_hi_i = int(idx_left_hi[pi, 0].item())
+			z_hi_i = int(z_hi[pi].item())
 			frac_i = z_frac[pi].item()
 			print(f"  pt{pi}: fullres=({pf[0]:.0f},{pf[1]:.0f},{pf[2]:.0f}) "
 				  f"work=({pw[0]:.1f},{pw[1]:.1f},{pw[2]:.2f}) "
@@ -337,10 +331,7 @@ def main(argv: list[str] | None = None) -> int:
 				valid_left=valid_left,
 				idx_right=idx_right,
 				valid_right=valid_right,
-				idx_left_hi=idx_left_hi,
-				valid_left_hi=valid_left_hi,
-				idx_right_hi=idx_right_hi,
-				valid_right_hi=valid_right_hi,
+				z_hi=z_hi,
 				z_frac=z_frac,
 			)
 		),
@@ -409,18 +400,15 @@ def main(argv: list[str] | None = None) -> int:
 		(points_all,
 		 idx_left, valid_left, min_dist_left,
 		 idx_right, valid_right, min_dist_right,
-		 idx_left_hi, valid_left_hi, _dist_left_hi,
-		 idx_right_hi, valid_right_hi, _dist_right_hi,
-		 z_frac) = point_constraints.closest_conn_segment_indices(points_xyz_winda=points_tensor_work, xy_conn=xy_conn0)
-		n_lo = int(valid_left.sum().item())
-		n_hi = int(valid_left_hi.sum().item())
-		n_interp = int(((z_frac > 0.0) & valid_left & valid_left_hi).sum().item())
-		print(f"[point_constraints] {int(points_all.shape[0])} pts: {n_lo} valid_lo, {n_hi} valid_hi, {n_interp} z-interpolated")
+		 z_hi, z_frac) = point_constraints.closest_conn_segment_indices(points_xyz_winda=points_tensor_work, xy_conn=xy_conn0)
+		n_valid = int(valid_left.sum().item())
+		n_interp = int((z_frac > 0.0).sum().item())
+		print(f"[point_constraints] {int(points_all.shape[0])} pts: {n_valid} valid, {n_interp} z-interpolated")
 		for pi in range(int(points_all.shape[0])):
 			pf = points_tensor[pi]  # original fullres
 			pw = points_all[pi]     # working coords (margin-shifted)
 			z_lo_i = int(idx_left[pi, 0].item())
-			z_hi_i = int(idx_left_hi[pi, 0].item())
+			z_hi_i = int(z_hi[pi].item())
 			frac_i = z_frac[pi].item()
 			print(f"  pt{pi}: fullres=({pf[0]:.0f},{pf[1]:.0f},{pf[2]:.0f}) "
 				  f"work=({pw[0]:.1f},{pw[1]:.1f},{pw[2]:.2f}) "
@@ -439,10 +427,7 @@ def main(argv: list[str] | None = None) -> int:
 				valid_left=valid_left,
 				idx_right=idx_right,
 				valid_right=valid_right,
-				idx_left_hi=idx_left_hi,
-				valid_left_hi=valid_left_hi,
-				idx_right_hi=idx_right_hi,
-				valid_right_hi=valid_right_hi,
+				z_hi=z_hi,
 				z_frac=z_frac,
 			)
 		))
@@ -453,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
 			(pts_corr,
 			 idx_l_corr, ok_l_corr, _d_l,
 			 idx_r_corr, ok_r_corr, _d_r,
-			 *_hi_corr) = point_constraints.closest_conn_segment_indices(
+			 z_hi_corr, z_frac_corr) = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=points_all,
 				xy_conn=xy_conn_corr,
 			)
@@ -465,6 +450,8 @@ def main(argv: list[str] | None = None) -> int:
 				valid_left=ok_l_corr,
 				idx_right=idx_r_corr,
 				valid_right=ok_r_corr,
+				z_hi=z_hi_corr,
+				z_frac=z_frac_corr,
 			)
 		if _corr_out_dir is not None:
 			vis.save_corr_points(
@@ -523,7 +510,7 @@ def main(argv: list[str] | None = None) -> int:
 			(pts_corr,
 			 idx_l_corr, ok_l_corr, _d_l,
 			 idx_r_corr, ok_r_corr, _d_r,
-			 *_hi_corr) = point_constraints.closest_conn_segment_indices(
+			 z_hi_corr, z_frac_corr) = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=points_all,
 				xy_conn=xy_conn_corr,
 			)
@@ -535,6 +522,8 @@ def main(argv: list[str] | None = None) -> int:
 				valid_left=ok_l_corr,
 				idx_right=idx_r_corr,
 				valid_right=ok_r_corr,
+				z_hi=z_hi_corr,
+				z_frac=z_frac_corr,
 			)
 			vis.save_corr_points(
 				data=data,
@@ -576,7 +565,7 @@ def main(argv: list[str] | None = None) -> int:
 			(pts_corr,
 			 idx_l_corr, ok_l_corr, _d_l,
 			 idx_r_corr, ok_r_corr, _d_r,
-			 *_hi_corr) = point_constraints.closest_conn_segment_indices(
+			 z_hi_corr, z_frac_corr) = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=points_all,
 				xy_conn=xy_conn_corr,
 			)
@@ -588,6 +577,8 @@ def main(argv: list[str] | None = None) -> int:
 				valid_left=ok_l_corr,
 				idx_right=idx_r_corr,
 				valid_right=ok_r_corr,
+				z_hi=z_hi_corr,
+				z_frac=z_frac_corr,
 			)
 		vis.save_corr_points(
 			data=data,
@@ -629,7 +620,7 @@ def main(argv: list[str] | None = None) -> int:
 			(pts_corr,
 			 idx_l_corr, ok_l_corr, _d_l,
 			 idx_r_corr, ok_r_corr, _d_r,
-			 *_hi_corr) = point_constraints.closest_conn_segment_indices(
+			 z_hi_corr, z_frac_corr) = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=points_all,
 				xy_conn=xy_conn_corr,
 			)
@@ -641,6 +632,8 @@ def main(argv: list[str] | None = None) -> int:
 				valid_left=ok_l_corr,
 				idx_right=idx_r_corr,
 				valid_right=ok_r_corr,
+				z_hi=z_hi_corr,
+				z_frac=z_frac_corr,
 			)
 		vis.save_corr_points(
 			data=data,

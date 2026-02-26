@@ -4247,7 +4247,7 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
         _planeSlicingOverlay->refreshAll();
     }
 
-    statusBar()->showMessage(tr("Focus views aligned to %1 points").arg(pts.size()), 3000);
+    statusBar()->showMessage(tr("Focused && aligned view to %1 points").arg(pts.size()), 3000);
 }
 
 void CWindow::onZoomOut()

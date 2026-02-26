@@ -344,9 +344,7 @@ def optimize(
 			(pts_all,
 			 idx_left, valid_left, _d_l,
 			 idx_right, valid_right, _d_r,
-			 idx_left_hi, valid_left_hi, _d_l_hi,
-			 idx_right_hi, valid_right_hi, _d_r_hi,
-			 z_frac) = point_constraints.closest_conn_segment_indices(
+			 z_hi, z_frac) = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=pts_c0.points_xyz_winda,
 				xy_conn=res.xy_conn,
 			)
@@ -357,10 +355,7 @@ def optimize(
 				valid_left=valid_left,
 				idx_right=idx_right,
 				valid_right=valid_right,
-				idx_left_hi=idx_left_hi,
-				valid_left_hi=valid_left_hi,
-				idx_right_hi=idx_right_hi,
-				valid_right_hi=valid_right_hi,
+				z_hi=z_hi,
 				z_frac=z_frac,
 			)
 		term_to_maps = {
@@ -499,9 +494,7 @@ def optimize(
 			(pts_all,
 			 idx_left, valid_left, _d_l,
 			 idx_right, valid_right, _d_r,
-			 idx_left_hi, valid_left_hi, _d_l_hi,
-			 idx_right_hi, valid_right_hi, _d_r_hi,
-			 z_frac) = point_constraints.closest_conn_segment_indices(
+			 z_hi, z_frac) = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=pts_c0.points_xyz_winda,
 				xy_conn=res.xy_conn,
 			)
@@ -512,10 +505,7 @@ def optimize(
 				valid_left=valid_left,
 				idx_right=idx_right,
 				valid_right=valid_right,
-				idx_left_hi=idx_left_hi,
-				valid_left_hi=valid_left_hi,
-				idx_right_hi=idx_right_hi,
-				valid_right_hi=valid_right_hi,
+				z_hi=z_hi,
 				z_frac=z_frac,
 			)
 		terms = {
