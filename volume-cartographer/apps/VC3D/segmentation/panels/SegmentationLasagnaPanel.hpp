@@ -21,12 +21,11 @@ class QWidget;
 /**
  * Segmentation sidebar panel for the 2D lasagna.
  *
- * Displays:
- *   - Connection mode (internal/external)
- *   - Data input path (.zarr)
- *   - Config file selector (JSON file from disk)
- *   - Run / Stop buttons
- *   - Progress status label
+ * Sections:
+ *   - Connection  (expandable) — connection mode + data input
+ *   - New Model   (button + expandable settings)
+ *   - Re-optimize (button + expandable settings)
+ *   - Shared: stop buttons, progress bar/label
  */
 class SegmentationLasagnaPanel : public QWidget
 {
@@ -68,14 +67,18 @@ signals:
 
 private:
     void writeSetting(const QString& key, const QVariant& value);
-    void populateConfigFileCombo(const QString& dir, const QString& selectName = {});
-    void onLasagnaModeChanged(int index);
+    void populateConfigCombo(QComboBox* combo, const QString& dir,
+                             const QString& selectName, QString& outPath);
     void onConnectionModeChanged(int index);
     void refreshDiscoveredServices();
     void onDiscoveredServiceSelected(int index);
     void updateConnectionWidgets();
+    void triggerOptimization();
 
-    CollapsibleSettingsGroup* _group{nullptr};
+    // -- Sections --
+    CollapsibleSettingsGroup* _connectionGroup{nullptr};
+    CollapsibleSettingsGroup* _newModelGroup{nullptr};
+    CollapsibleSettingsGroup* _reoptGroup{nullptr};
 
     // Connection mode
     QComboBox* _connectionCombo{nullptr};
@@ -91,31 +94,35 @@ private:
     // Data input with dataset combo support
     QComboBox* _datasetCombo{nullptr};
     QStackedWidget* _dataInputStack{nullptr};
+    QLineEdit* _dataInputEdit{nullptr};
+    QToolButton* _dataInputBrowse{nullptr};
 
-    // Mode (re-optimize vs new model)
-    QComboBox* _modeCombo{nullptr};
-    QWidget* _newModelWidget{nullptr};
+    // New model settings
     QSpinBox* _widthSpin{nullptr};
     QSpinBox* _heightSpin{nullptr};
     QSpinBox* _depthSpin{nullptr};
-
-    QWidget* _seedWidget{nullptr};
     QLineEdit* _seedEdit{nullptr};
     QPushButton* _seedFromFocusBtn{nullptr};
     QLineEdit* _outputNameEdit{nullptr};
 
-    QComboBox* _configFileCombo{nullptr};
-    QToolButton* _configFileBrowse{nullptr};
-    QLineEdit* _dataInputEdit{nullptr};
-    QToolButton* _dataInputBrowse{nullptr};
-    QPushButton* _runBtn{nullptr};
+    // Config combos (one per section)
+    QComboBox* _newModelConfigCombo{nullptr};
+    QToolButton* _newModelConfigBrowse{nullptr};
+    QComboBox* _reoptConfigCombo{nullptr};
+    QToolButton* _reoptConfigBrowse{nullptr};
+
+    // Action buttons
+    QPushButton* _newModelBtn{nullptr};
+    QPushButton* _reoptBtn{nullptr};
     QPushButton* _stopBtn{nullptr};
     QPushButton* _stopServiceBtn{nullptr};
+
     QProgressBar* _progressBar{nullptr};
     QLabel* _progressLabel{nullptr};
 
     QString _lasagnaDataInputPath;
-    QString _lasagnaConfigFilePath;
+    QString _newModelConfigFilePath;
+    QString _reoptConfigFilePath;
 
     int _lasagnaMode{0};         // 0=re-optimize, 1=new model
     int _connectionMode{0};  // 0=internal, 1=external
