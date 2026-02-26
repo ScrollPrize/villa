@@ -296,11 +296,12 @@ def total_steps_for_stages(stages: list[Stage]) -> int:
 			generations = max(0, int(stage.grow.get("generations", 0)))
 			local_opts = stage.local_opt if stage.local_opt is not None else [stage.global_opt]
 			for _gi in range(generations):
-				if stage.global_opt.termination != "mask":
-					total += max(0, stage.global_opt.steps)
 				for lo in local_opts:
 					if lo.termination != "mask":
 						total += max(0, lo.steps)
+			# Global opt runs once after all generations
+			if generations > 0 and stage.global_opt.termination != "mask":
+				total += max(0, stage.global_opt.steps)
 	return total
 
 
@@ -721,9 +722,23 @@ def optimize(
 		generations = max(0, int(grow.get("generations", 0)))
 		grow_steps = max(0, int(grow.get("steps", 0)))
 		local_opts = stage.local_opt if stage.local_opt is not None else [stage.global_opt]
+
+		# Save original model dimensions before grow loop for cumulative masking.
+		orig_z_size = int(model.z_size)
+		orig_mesh_h = int(model.mesh_h)
+		orig_mesh_w = int(model.mesh_w)
+		cum_py = 0  # cumulative Y offset of original mesh in grown mesh
+		cum_px = 0  # cumulative X offset of original mesh in grown mesh
+		orig_z_start = 0  # start index of original Z slices in grown model
+		grew_z = False
+
 		for gi in range(generations):
 			model.grow(directions=[str(d) for d in directions], steps=grow_steps)
 			if model._last_grow_insert_z is not None:
+				grew_z = True
+				ins_z = int(model._last_grow_insert_z)
+				if ins_z == 0:  # bw: prepended at front
+					orig_z_start += 1
 				if int(data.cos.shape[0]) != int(model.z_size):
 					if data_cfg is None:
 						raise ValueError("grow fw/bw requires passing data_cfg")
@@ -737,10 +752,15 @@ def optimize(
 						insert_z=int(model._last_grow_insert_z),
 						out_dir_base=data_out_dir_base,
 					)
+			if model._last_grow_insert_lr is not None:
+				py0, px0, _ho, _wo = model._last_grow_insert_lr
+				cum_py += int(py0)
+				cum_px += int(px0)
+
 			stage_g = f"stage{si}_grow{gi:04d}"
 			snapshot_fn(stage=stage_g, step=0, loss=0.0, data=data)
-			if stage.global_opt.steps > 0 or stage.global_opt.termination == "mask":
-				_run_opt(si=si, label=f"{stage_g}_global", stage=stage, opt_cfg=stage.global_opt, keep_only_grown_z=False)
+
+			# -- Local opt: optimize ONLY what was just added this generation --
 			if not local_opts or all(int(o.steps) <= 0 and o.termination != "mask" for o in local_opts):
 				continue
 			ins = model._last_grow_insert_lr
@@ -758,7 +778,7 @@ def optimize(
 			x0 = int(px0)
 			y1 = int(py0 + ho)
 			x1 = int(px0 + wo)
-			win = max(0, int(local_opt.opt_window) - 1)
+			win = max(0, int(local_opts[0].opt_window) - 1)
 			n = int(data.cos.shape[0])
 			cm = torch.zeros(n, 1, hm, wm, device=data.cos.device, dtype=torch.float32)
 			cm[:, :, y0:y1, x0:x1] = 1.0
@@ -768,6 +788,21 @@ def optimize(
 			cm[:, :, y0:y1, max(x0, x1 - win):x1] = 0.0
 			model.const_mask_lr = cm
 			for li, opt_cfg in enumerate(local_opts):
-				_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg, keep_only_grown_z=True)
+				_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg, keep_only_grown_z=False)
+
+		# -- Global opt: after all generations, freeze original model, optimize all grown --
+		if generations > 0 and (stage.global_opt.steps > 0 or stage.global_opt.termination == "mask"):
+			n = int(data.cos.shape[0])
+			hm = int(model.mesh_h)
+			wm = int(model.mesh_w)
+			cm = torch.zeros(n, 1, hm, wm, device=data.cos.device, dtype=torch.float32)
+			if grew_z:
+				# Z growth: freeze original Z slices entirely
+				cm[orig_z_start:orig_z_start + orig_z_size, :, :, :] = 1.0
+			else:
+				# XY growth: freeze original XY region across all Z slices
+				cm[:, :, cum_py:cum_py + orig_mesh_h, cum_px:cum_px + orig_mesh_w] = 1.0
+			model.const_mask_lr = cm
+			_run_opt(si=si, label=f"stage{si}_global", stage=stage, opt_cfg=stage.global_opt, keep_only_grown_z=False)
 	model.const_mask_lr = None
 	return data
