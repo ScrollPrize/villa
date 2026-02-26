@@ -1,7 +1,7 @@
 python train_unet.py --images-dir ../data/kaggle_dataset/images/ --labels-dir ../data/kaggle_dataset/labels/ --log-dir logs/ --run-name init_lr1e-5 --bench --batch-size 32
 
 
-[hendrik@staticsheep exps_2d]$ python gen_post_data.py --out vis.tif --layer 1 ../data/kaggle_dataset/images/sample_00706.tif 
+[hendrik@staticsheep exps_2d]$ python gen_post_data.py --out vis.tif --layer 1 ../data/kaggle_dataset/images/sample_00706.tif
 
 
 python fit_cosine_grid.py --image inf_sample1.tif --output-prefix res --downscale 4 --lambda-smooth 100 --device cuda --snapshot 100 --lr 0.001 --steps 10000
@@ -146,6 +146,8 @@ python $SRC/preprocess_cos_omezarr.py integrate --z-volume ../s5/PHerc172.volpkg
 #
 python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/ --output full_cos_z.zarr  --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --z-step 5
 python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/ --output full_cos_x.zarr  --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --z-step 5 --axis x
+
+
 python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/ --output full_cos_y.zarr  --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --z-step 5 --axis y
 
 
