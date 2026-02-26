@@ -9,6 +9,7 @@
 #include <QtConcurrent/QtConcurrent>
 #include <QDir>
 #include <QFile>
+#include <QFrame>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHBoxLayout>
@@ -128,15 +129,15 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         row->addWidget(_dataInputStack, 1);
     }, tr("Input data zarr (e.g. s5_cos.zarr) required by the lasagna."));
 
-    panelLayout->addWidget(_connectionGroup);
+    frameLayout->addWidget(_connectionGroup);
 
     // =======================================================================
     // New Model button + settings section
     // =======================================================================
-    _newModelBtn = new QPushButton(tr("New Model"), this);
-    panelLayout->addWidget(_newModelBtn);
+    _newModelBtn = new QPushButton(tr("New Model"), frame);
+    frameLayout->addWidget(_newModelBtn);
 
-    _newModelGroup = new CollapsibleSettingsGroup(tr("New Model"), this);
+    _newModelGroup = new CollapsibleSettingsGroup(tr("New Model Settings"), frame);
     auto* nmContent = _newModelGroup->contentWidget();
 
     // Config file row
@@ -216,15 +217,15 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         _newModelGroup->contentLayout()->addWidget(nameWidget);
     }
 
-    panelLayout->addWidget(_newModelGroup);
+    frameLayout->addWidget(_newModelGroup);
 
     // =======================================================================
     // Re-optimize button + settings section
     // =======================================================================
-    _reoptBtn = new QPushButton(tr("Re-optimize"), this);
-    panelLayout->addWidget(_reoptBtn);
+    _reoptBtn = new QPushButton(tr("Re-optimize"), frame);
+    frameLayout->addWidget(_reoptBtn);
 
-    _reoptGroup = new CollapsibleSettingsGroup(tr("Re-optimize"), this);
+    _reoptGroup = new CollapsibleSettingsGroup(tr("Re-optimize Settings"), frame);
     auto* reoptContent = _reoptGroup->contentWidget();
 
     // Config file row
@@ -238,32 +239,34 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         row->addWidget(_reoptConfigBrowse);
     }, tr("JSON config file for re-optimization."));
 
-    panelLayout->addWidget(_reoptGroup);
+    frameLayout->addWidget(_reoptGroup);
 
     // =======================================================================
     // Shared bottom area — stop buttons, progress
     // =======================================================================
     auto* btnRow = new QHBoxLayout();
-    _stopBtn = new QPushButton(tr("Stop"), this);
+    _stopBtn = new QPushButton(tr("Stop"), frame);
     _stopBtn->setEnabled(false);
-    _stopServiceBtn = new QPushButton(tr("Stop Service"), this);
+    _stopServiceBtn = new QPushButton(tr("Stop Service"), frame);
     _stopServiceBtn->setEnabled(false);
     btnRow->addWidget(_stopBtn);
     btnRow->addWidget(_stopServiceBtn);
     btnRow->addStretch(1);
-    panelLayout->addLayout(btnRow);
+    frameLayout->addLayout(btnRow);
 
-    _progressBar = new QProgressBar(this);
+    _progressBar = new QProgressBar(frame);
     _progressBar->setRange(0, 100);
     _progressBar->setValue(0);
     _progressBar->setTextVisible(true);
     _progressBar->setVisible(false);
-    panelLayout->addWidget(_progressBar);
+    frameLayout->addWidget(_progressBar);
 
-    _progressLabel = new QLabel(this);
+    _progressLabel = new QLabel(frame);
     _progressLabel->setWordWrap(true);
     _progressLabel->setVisible(false);
-    panelLayout->addWidget(_progressLabel);
+    frameLayout->addWidget(_progressLabel);
+
+    panelLayout->addWidget(frame);
 
     // -----------------------------------------------------------------------
     // Signal wiring
