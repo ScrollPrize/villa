@@ -178,25 +178,17 @@ def closest_conn_segment_indices(
 	k = int(pts.shape[0])
 	dev = xy_conn.device
 
-	def _alloc():
-		idx = torch.empty((k, 3), dtype=torch.int64, device=dev)
-		ok = torch.zeros((k,), dtype=torch.bool, device=dev)
-		dist = torch.full((k,), float("inf"), dtype=torch.float32, device=dev)
-		return idx, ok, dist
-
-	idx_left, ok_left, dist_left = _alloc()
-	idx_right, ok_right, dist_right = _alloc()
-	idx_left_hi, ok_left_hi, dist_left_hi = _alloc()
-	idx_right_hi, ok_right_hi, dist_right_hi = _alloc()
-	z_frac_out = torch.zeros((k,), dtype=torch.float32, device=dev)
-
 	def _cross_z(a2: torch.Tensor, b2: torch.Tensor) -> torch.Tensor:
 		return a2[..., 0] * b2[..., 1] - a2[..., 1] * b2[..., 0]
 
-	def _side_d2(*, conn_side: torch.Tensor, p0: torch.Tensor, p1: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-		"""Compute filtered d2 (hm-1, wm) for one side with inside test."""
-		c0 = conn_side[:-1, :, :]
-		c1 = conn_side[1:, :, :]
+	def _batch_side_d2(*, conn_side: torch.Tensor, p0: torch.Tensor, p1: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+		"""Batched _side_d2: all inputs have leading K dimension.
+
+		conn_side: (K, Hm, Wm, 2), p0/p1: (K, Hm-1, Wm, 2), q: (K, 1, 1, 2).
+		Returns (K, Hm-1, Wm).
+		"""
+		c0 = conn_side[:, :-1, :, :]
+		c1 = conn_side[:, 1:, :, :]
 
 		s = p1 - p0
 		l2 = (s * s).sum(dim=-1).clamp_min(1e-12)
@@ -230,53 +222,67 @@ def closest_conn_segment_indices(
 		d2 = ((q - c) * (q - c)).sum(dim=-1)
 		return torch.where(inside, d2, torch.full_like(d2, float("inf")))
 
-	def _search_at_z(z: int, q: torch.Tensor):
-		"""Search for best gap at a single z-slice. Returns (idx_l, ok_l, dist_l, idx_r, ok_r, dist_r)."""
-		z = max(0, min(n - 1, z))
-		p0 = center[z, :-1, :, :]
-		p1 = center[z, 1:, :, :]
-		d2_r = _side_d2(conn_side=rightp[z], p0=p0, p1=p1, q=q)
-		d2_l = _side_d2(conn_side=leftp[z], p0=p0, p1=p1, q=q)
-		min_r, argmin_r = d2_r.min(dim=0)
-		min_l, argmin_l = d2_l.min(dim=0)
+	def _batch_search_at_z(z_indices: torch.Tensor):
+		"""Search for best gap at z-slices for all K points simultaneously.
+
+		z_indices: (K,) long tensor of z-slice indices.
+		Returns (idx_l, ok_l, dist_l, idx_r, ok_r, dist_r) all with leading K dim.
+		"""
+		z_clamped = z_indices.clamp(0, n - 1)
+		center_z = center[z_clamped]      # (K, Hm, Wm, 2)
+		leftp_z = leftp[z_clamped]        # (K, Hm, Wm, 2)
+		rightp_z = rightp[z_clamped]      # (K, Hm, Wm, 2)
+		p0 = center_z[:, :-1, :, :]      # (K, Hm-1, Wm, 2)
+		p1 = center_z[:, 1:, :, :]       # (K, Hm-1, Wm, 2)
+		q = pts[:, 0:2].view(k, 1, 1, 2)
+
+		d2_r = _batch_side_d2(conn_side=rightp_z, p0=p0, p1=p1, q=q)  # (K, Hm-1, Wm)
+		d2_l = _batch_side_d2(conn_side=leftp_z, p0=p0, p1=p1, q=q)   # (K, Hm-1, Wm)
+
+		min_r, argmin_r = d2_r.min(dim=1)  # (K, Wm)
+		min_l, argmin_l = d2_l.min(dim=1)  # (K, Wm)
+
+		ki = torch.arange(k, device=dev)
 
 		if wm < 2:
-			inv = torch.tensor([z, -1, -1], dtype=torch.int64, device=dev)
-			return inv, False, float("inf"), inv.clone(), False, float("inf")
+			idx = torch.stack([z_clamped, torch.full_like(z_clamped, -1), torch.full_like(z_clamped, -1)], dim=-1)
+			ok = torch.zeros(k, dtype=torch.bool, device=dev)
+			dist = torch.full((k,), float("inf"), dtype=torch.float32, device=dev)
+			return idx, ok, dist, idx.clone(), ok.clone(), dist.clone()
 
-		combined = min_r[:-1] + min_l[1:]
-		best_gap = int(combined.argmin().item())
-		if not torch.isfinite(combined[best_gap]):
-			inv = torch.tensor([z, -1, -1], dtype=torch.int64, device=dev)
-			return inv, False, float("inf"), inv.clone(), False, float("inf")
+		combined = min_r[:, :-1] + min_l[:, 1:]  # (K, Wm-1)
+		best_gap = combined.argmin(dim=1)          # (K,)
+		best_val = combined[ki, best_gap]          # (K,)
+		gap_finite = torch.isfinite(best_val)
 
-		c_r = best_gap
-		c_l = best_gap + 1
-		ir = torch.tensor([z, int(argmin_r[c_r].item()), c_r], dtype=torch.int64, device=dev)
-		il = torch.tensor([z, int(argmin_l[c_l].item()), c_l], dtype=torch.int64, device=dev)
-		dr = float(torch.sqrt(min_r[c_r]).item())
-		dl = float(torch.sqrt(min_l[c_l]).item())
-		return il, True, dl, ir, True, dr
+		c_r = best_gap          # (K,) right column
+		c_l = best_gap + 1      # (K,) left column
+		row_r = argmin_r[ki, c_r]  # (K,)
+		row_l = argmin_l[ki, c_l]  # (K,)
 
-	for i in range(k):
-		z_f = pts[i, 2].item()
-		z_lo = max(0, min(n - 1, int(math.floor(z_f))))
-		z_hi = max(0, min(n - 1, int(math.ceil(z_f))))
-		frac = z_f - math.floor(z_f)
-		if z_lo == z_hi:
-			frac = 0.0
-		z_frac_out[i] = frac
-		q = pts[i, 0:2].view(1, 1, 2)
+		idx_l = torch.stack([z_clamped, row_l, c_l], dim=-1)   # (K, 3)
+		idx_r = torch.stack([z_clamped, row_r, c_r], dim=-1)   # (K, 3)
+		dist_l = torch.sqrt(min_l[ki, c_l])  # (K,)
+		dist_r = torch.sqrt(min_r[ki, c_r])  # (K,)
 
-		# Search at lo z-slice
-		il, ol, dl, ir, or_, dr = _search_at_z(z_lo, q)
-		idx_left[i] = il; ok_left[i] = ol; dist_left[i] = dl
-		idx_right[i] = ir; ok_right[i] = or_; dist_right[i] = dr
+		inv_idx = torch.stack([z_clamped, torch.full_like(z_clamped, -1), torch.full_like(z_clamped, -1)], dim=-1)
+		idx_l = torch.where(gap_finite.unsqueeze(-1), idx_l, inv_idx)
+		idx_r = torch.where(gap_finite.unsqueeze(-1), idx_r, inv_idx)
+		dist_l = torch.where(gap_finite, dist_l, torch.full_like(dist_l, float("inf")))
+		dist_r = torch.where(gap_finite, dist_r, torch.full_like(dist_r, float("inf")))
 
-		# Search at hi z-slice
-		il_h, ol_h, dl_h, ir_h, or_h, dr_h = _search_at_z(z_hi, q)
-		idx_left_hi[i] = il_h; ok_left_hi[i] = ol_h; dist_left_hi[i] = dl_h
-		idx_right_hi[i] = ir_h; ok_right_hi[i] = or_h; dist_right_hi[i] = dr_h
+		return idx_l, gap_finite.clone(), dist_l, idx_r, gap_finite.clone(), dist_r
+
+	# Vectorized z computation for all K points
+	z_f = pts[:, 2]
+	z_lo = z_f.floor().long().clamp(0, n - 1)
+	z_hi = z_f.ceil().long().clamp(0, n - 1)
+	frac = z_f - z_f.floor()
+	z_frac_out = torch.where(z_lo == z_hi, torch.zeros_like(frac), frac)
+
+	# Batch search at lo and hi z-slices
+	idx_left, ok_left, dist_left, idx_right, ok_right, dist_right = _batch_search_at_z(z_lo)
+	idx_left_hi, ok_left_hi, dist_left_hi, idx_right_hi, ok_right_hi, dist_right_hi = _batch_search_at_z(z_hi)
 
 	return (
 		pts,
@@ -338,34 +344,36 @@ def winding_observed_and_error(
 	n, hm, wm = int(center.shape[0]), int(center.shape[1]), int(center.shape[2])
 
 	def _xfrac_for_side(*, side_pts: torch.Tensor, idx: torch.Tensor, ok: torch.Tensor) -> torch.Tensor:
-		xf = torch.full((int(pts.shape[0]),), float("nan"), dtype=torch.float32, device=xy_conn.device)
-		for i in range(int(pts.shape[0])):
-			if not bool(ok[i].item()):
-				continue
-			z = int(idx[i, 0].item())
-			r = int(idx[i, 1].item())
-			c = int(idx[i, 2].item())
-			if z < 0 or z >= n or r < 0 or (r + 1) >= hm or c < 0 or c >= wm:
-				continue
-			q = pts[i, 0:2]
-			p0 = center[z, r, c]
-			p1 = center[z, r + 1, c]
-			c0 = side_pts[z, r, c]
-			c1 = side_pts[z, r + 1, c]
-			s = p1 - p0
-			l2 = float((s * s).sum().item())
-			if l2 <= 1e-12:
-				continue
-			a = float(((q - p0) * s).sum().item()) / l2
-			a = max(0.0, min(1.0, a))
-			cp = p0 + s * a
-			v0 = c0 - p0
-			v1 = c1 - p1
-			v = v0 * (1.0 - a) + v1 * a
-			v2 = float((v * v).sum().item())
-			if v2 <= 1e-12:
-				continue
-			xf[i] = float(((q - cp) * v).sum().item()) / v2
+		kk = int(pts.shape[0])
+		xf = torch.full((kk,), float("nan"), dtype=torch.float32, device=xy_conn.device)
+		zi = idx[:, 0]
+		ri = idx[:, 1]
+		ci = idx[:, 2]
+		valid = ok & (zi >= 0) & (zi < n) & (ri >= 0) & (ri + 1 < hm) & (ci >= 0) & (ci < wm)
+		if not valid.any():
+			return xf
+		zi_s = zi.clamp(0, max(n - 1, 0))
+		ri_s = ri.clamp(0, max(hm - 2, 0))
+		ci_s = ci.clamp(0, max(wm - 1, 0))
+		q = pts[:, 0:2]
+		p0 = center[zi_s, ri_s, ci_s]
+		p1 = center[zi_s, ri_s + 1, ci_s]
+		c0 = side_pts[zi_s, ri_s, ci_s]
+		c1 = side_pts[zi_s, ri_s + 1, ci_s]
+		s = p1 - p0
+		l2 = (s * s).sum(dim=-1)
+		valid = valid & (l2 > 1e-12)
+		l2 = l2.clamp_min(1e-12)
+		a = (((q - p0) * s).sum(dim=-1) / l2).clamp(0.0, 1.0)
+		cp = p0 + s * a.unsqueeze(-1)
+		v0 = c0 - p0
+		v1 = c1 - p1
+		v = v0 * (1.0 - a).unsqueeze(-1) + v1 * a.unsqueeze(-1)
+		v2 = (v * v).sum(dim=-1)
+		valid = valid & (v2 > 1e-12)
+		v2 = v2.clamp_min(1e-12)
+		result = ((q - cp) * v).sum(dim=-1) / v2
+		xf[valid] = result[valid]
 		return xf
 
 	xf_l = _xfrac_for_side(side_pts=leftp, idx=idx_l, ok=ok_l)
