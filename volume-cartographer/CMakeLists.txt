@@ -30,6 +30,7 @@ option(VC_ENABLE_ASAN       "Enable AddressSanitizer for memory error detection"
 option(VC_ENABLE_UBSAN      "Enable UndefinedBehaviorSanitizer"                  OFF)
 option(VC_ENABLE_TSAN       "Enable ThreadSanitizer for data race detection"     OFF)
 option(VC_ENABLE_LSAN       "Enable LeakSanitizer for memory leak detection (standalone)" OFF)
+option(VC_ENABLE_COVERAGE   "Enable code coverage instrumentation (use with Debug build)" OFF)
 option(VC_BUILD_TESTS          "Build unit tests"                               OFF)
 mark_as_advanced(VC_DEVELOPER_WARNINGS)
 
