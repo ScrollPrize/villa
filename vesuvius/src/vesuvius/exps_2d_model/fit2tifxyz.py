@@ -187,6 +187,9 @@ def main(argv: list[str] | None = None) -> int:
 	fit_config = st.get("_fit_config_", None)
 	if not isinstance(fit_config, dict):
 		fit_config = None
+	corr_points_results = st.get("_corr_points_results_", None)
+	if not isinstance(corr_points_results, dict):
+		corr_points_results = None
 
 	if model_params is not None:
 		c6_full = model_params.get("crop_fullres_xyzwhd", None)
@@ -350,6 +353,8 @@ def main(argv: list[str] | None = None) -> int:
 		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config)
 		if model_params is not None:
 			(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
+		if corr_points_results is not None:
+			(out_dir / "corr_points_results.json").write_text(json.dumps(corr_points_results, indent=2) + "\n", encoding="utf-8")
 		if mask_all is not None:
 			tifffile.imwrite(str(out_dir / "mask.tif"), mask_all, compression="lzw")
 	else:
@@ -361,6 +366,8 @@ def main(argv: list[str] | None = None) -> int:
 			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z_use, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config)
 			if model_params is not None:
 				(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
+			if corr_points_results is not None:
+				(out_dir / "corr_points_results.json").write_text(json.dumps(corr_points_results, indent=2) + "\n", encoding="utf-8")
 			if mask is not None:
 				tifffile.imwrite(str(out_dir / "mask.tif"), mask, compression="lzw")
 
