@@ -57,7 +57,6 @@ void SegmentationWidget::buildUi()
     layout->addWidget(_neuralTracerPanel);
 
     _lasagnaPanel = new SegmentationLasagnaPanel(QStringLiteral("segmentation_edit"), this);
-    layout->addWidget(_lasagnaPanel);
 
     _correctionsPanel = new SegmentationCorrectionsPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_correctionsPanel);

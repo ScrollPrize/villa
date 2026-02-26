@@ -163,6 +163,9 @@ public:
     void setCellReoptMode(bool enabled);
     void setCellReoptCollections(const QVector<QPair<uint64_t, QString>>& collections);
 
+    /** Returns the lasagna panel widget (for hosting in a separate dock). */
+    [[nodiscard]] SegmentationLasagnaPanel* lasagnaPanel() const { return _lasagnaPanel; }
+
     // Lasagna getters — delegated to panel
     [[nodiscard]] QString lasagnaDataInputPath() const;
     [[nodiscard]] QString lasagnaConfigText() const;

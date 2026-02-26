@@ -89,6 +89,7 @@
 #include "CommandLineToolRunner.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 #include "segmentation/SegmentationModule.hpp"
+#include "segmentation/panels/SegmentationLasagnaPanel.hpp"
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "segmentation/growth/SegmentationGrower.hpp"
 #include "SurfacePanelController.hpp"
@@ -703,6 +704,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
             "QMenuBar::item:selected { background: rgb(235, 180, 30); }"
             "QWidget#dockWidgetVolumesContent { background: rgb(55, 55, 55); }"
             "QWidget#dockWidgetSegmentationContent { background: rgb(55, 55, 55); }"
+            "QWidget#dockWidgetLasagnaContent { background: rgb(55, 55, 55); }"
             "QWidget#dockWidgetAnnotationsContent { background: rgb(55, 55, 55); }"
             "QDockWidget::title { padding-top: 6px; background: rgb(60, 60, 75); }"
             "QTabBar::tab { background: rgb(60, 60, 75); }"
@@ -714,6 +716,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
             "QMenuBar::item:selected { background: rgb(255, 200, 50); }"
             "QWidget#dockWidgetVolumesContent { background: rgb(245, 245, 255); }"
             "QWidget#dockWidgetSegmentationContent { background: rgb(245, 245, 255); }"
+            "QWidget#dockWidgetLasagnaContent { background: rgb(245, 245, 255); }"
             "QWidget#dockWidgetAnnotationsContent { background: rgb(245, 245, 255); }"
             "QDockWidget::title { padding-top: 6px; background: rgb(205, 210, 240); }"
             "QTabBar::tab { background: rgb(205, 210, 240); }"
@@ -1670,6 +1673,17 @@ void CWindow::CreateWidgets(void)
     _segmentationWidget->setNormalGridPathHint(initialHint);
     attachScrollAreaToDock(ui.dockWidgetSegmentation, _segmentationWidget, QStringLiteral("dockWidgetSegmentationContent"));
 
+    // Create Lasagna dock (separate tab from Segmentation)
+    _lasagnaDock = new QDockWidget(tr("Lasagna"), this);
+    _lasagnaDock->setMinimumSize(QSize(150, 0));
+    _lasagnaDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+    addDockWidget(Qt::RightDockWidgetArea, _lasagnaDock);
+    attachScrollAreaToDock(_lasagnaDock, _segmentationWidget->lasagnaPanel(),
+                           QStringLiteral("dockWidgetLasagnaContent"));
+    ensureDockWidgetFeatures(_lasagnaDock);
+    connect(_lasagnaDock, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_lasagnaDock, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
     _segmentationEdit->setViewerManager(_viewerManager.get());
     _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_surf_col, this);
@@ -2093,7 +2107,8 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
     connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
 
-    // Tab the docks - keep Segmentation, Seeding, Point Collections, and Drawing together
+    // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Drawing together
+    tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);
