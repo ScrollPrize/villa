@@ -1,11 +1,25 @@
 # --- VC dependencies ----------------------------------------------------------
 include(FetchContent)
 
+# Recursively suppress all warnings for vendored subproject targets.
+function(vc_suppress_warnings dir)
+    get_property(targets DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(t IN LISTS targets)
+        get_property(type TARGET "${t}" PROPERTY TYPE)
+        if(type MATCHES "STATIC_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY|OBJECT_LIBRARY|EXECUTABLE")
+            target_compile_options("${t}" PRIVATE -w)
+        endif()
+    endforeach()
+    get_property(subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+    foreach(sd IN LISTS subdirs)
+        vc_suppress_warnings("${sd}")
+    endforeach()
+endfunction()
 
 set(BUILD_Z5PY OFF CACHE BOOL "Disable Python bits for z5" FORCE)
 set(WITH_BLOSC ON  CACHE BOOL "Enable Blosc in z5"        FORCE)
 
-# ---- xtl / xsimd / xtensor from source (before z5, which needs them) --------
+# ---- xtl / xsimd / xtensor (chunk buffer type, used throughout) --------------
 set(XTENSOR_USE_XSIMD 1)
 
 FetchContent_Declare(
@@ -24,12 +38,14 @@ FetchContent_Declare(
     GIT_TAG        0.27.1
 )
 FetchContent_MakeAvailable(xtl xsimd xtensor)
+foreach(_dep xtl xsimd xtensor)
+    vc_suppress_warnings("${${_dep}_SOURCE_DIR}")
+endforeach()
 
 # xtensor sets cxx_std_20 INTERFACE which can downgrade our C++23; upgrade it
 set_property(TARGET xtensor PROPERTY INTERFACE_COMPILE_FEATURES cxx_std_23)
 
 # Mark xtensor-stack headers as SYSTEM to suppress warnings from -Weverything
-# This requires getting the interface include dirs and re-adding them as SYSTEM
 foreach(_target xtl xsimd xtensor)
     get_target_property(_inc_dirs ${_target} INTERFACE_INCLUDE_DIRECTORIES)
     if(_inc_dirs)
@@ -63,7 +79,7 @@ if(_z5_inc_dirs)
 endif()
 
 # ---- Qt (apps / utils) -------------------------------------------------------
-find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network)
+find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
@@ -138,7 +154,7 @@ else()
     install(TARGETS openmp_stub EXPORT "${targets_export_name}")
 endif()
 
-# ---- xtensor/xsimd (already fetched above, before z5) -----------------------
+# ---- xtensor/xsimd (already fetched above) -----------------------------------
 
 # ---- nlohmann/json -----------------------------------------------------------
 FetchContent_Declare(
@@ -152,7 +168,11 @@ if (NOT json_POPULATED)
     set(JSON_Install   ON  CACHE INTERNAL "")
     FetchContent_Populate(json)
     add_subdirectory(${json_SOURCE_DIR} ${json_BINARY_DIR} EXCLUDE_FROM_ALL)
+    vc_suppress_warnings("${json_SOURCE_DIR}")
 endif()
+
+# ---- CURL (for HTTP chunk source / remote volumes) ---------------------------
+find_package(CURL REQUIRED)
 
 # ---- TIFF --------------------------------------------------------------------
 find_package(TIFF REQUIRED)
