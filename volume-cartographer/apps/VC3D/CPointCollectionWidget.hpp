@@ -25,6 +25,7 @@
 struct CorrPointResult {
     float winding_obs = NAN;
     float winding_err = NAN;
+    float p[3] = {NAN, NAN, NAN};  // fullres position used during optimization
 };
 
 class CPointCollectionWidget : public QDockWidget

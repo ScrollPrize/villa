@@ -19,7 +19,19 @@
 #include <nlohmann/json.hpp>
 
 #include "vc/ui/VCCollection.hpp"
- 
+
+namespace {
+// Check if a corr result's stored position matches the current point position.
+// Returns true if the positions match within 0.1 voxel per axis.
+bool corrResultPositionMatches(const CorrPointResult& r, const cv::Vec3f& currentPos)
+{
+    constexpr float kTol = 0.1f;
+    return std::isfinite(r.p[0]) &&
+           std::abs(r.p[0] - currentPos[0]) < kTol &&
+           std::abs(r.p[1] - currentPos[1]) < kTol &&
+           std::abs(r.p[2] - currentPos[2]) < kTol;
+}
+} // namespace
 
 
 CPointCollectionWidget::CPointCollectionWidget(VCCollection *collection, QWidget *parent)
@@ -243,7 +255,7 @@ void CPointCollectionWidget::refreshTree()
             pt_err_item->setFlags(pt_err_item->flags() & ~Qt::ItemIsEditable);
 
             auto res_it = _corr_point_results.find(point.id);
-            if (res_it != _corr_point_results.end()) {
+            if (res_it != _corr_point_results.end() && corrResultPositionMatches(res_it->second, point.p)) {
                 if (std::isfinite(res_it->second.winding_obs)) {
                     pt_winding_item->setText(QString::number(res_it->second.winding_obs, 'f', 3));
                 }
@@ -352,7 +364,7 @@ void CPointCollectionWidget::onPointAdded(const ColPoint& point)
         pt_err_item->setFlags(pt_err_item->flags() & ~Qt::ItemIsEditable);
 
         auto res_it = _corr_point_results.find(point.id);
-        if (res_it != _corr_point_results.end()) {
+        if (res_it != _corr_point_results.end() && corrResultPositionMatches(res_it->second, point.p)) {
             if (std::isfinite(res_it->second.winding_obs)) {
                 pt_winding_item->setText(QString::number(res_it->second.winding_obs, 'f', 3));
             }
@@ -373,7 +385,40 @@ void CPointCollectionWidget::onPointAdded(const ColPoint& point)
 
 void CPointCollectionWidget::onPointChanged(const ColPoint& point)
 {
-    // For now, just update the metadata if it's the selected point
+    // Update the tree row for this point (position text + winding/error validity)
+    for (int i = 0; i < _model->rowCount(); ++i) {
+        QStandardItem *collection_item = _model->item(i);
+        if (!collection_item) continue;
+        for (int j = 0; j < collection_item->rowCount(); ++j) {
+            QStandardItem *point_item = collection_item->child(j, 0);
+            if (!point_item || point_item->data().toULongLong() != point.id) continue;
+
+            // Update position text (column 1)
+            QStandardItem *pos_item = collection_item->child(j, 1);
+            if (pos_item) {
+                pos_item->setText(QString("{%1, %2, %3}").arg(point.p[0]).arg(point.p[1]).arg(point.p[2]));
+            }
+
+            // Re-evaluate winding/error display (columns 2-3)
+            QStandardItem *winding_item = collection_item->child(j, 2);
+            QStandardItem *err_item = collection_item->child(j, 3);
+            if (winding_item) winding_item->setText({});
+            if (err_item) err_item->setText({});
+
+            auto res_it = _corr_point_results.find(point.id);
+            if (res_it != _corr_point_results.end() && corrResultPositionMatches(res_it->second, point.p)) {
+                if (winding_item && std::isfinite(res_it->second.winding_obs)) {
+                    winding_item->setText(QString::number(res_it->second.winding_obs, 'f', 3));
+                }
+                if (err_item && std::isfinite(res_it->second.winding_err)) {
+                    err_item->setText(QString::number(res_it->second.winding_err, 'f', 3));
+                }
+            }
+
+            break;
+        }
+    }
+
     if (point.id == _selected_point_id) {
         updateMetadataWidgets();
     }
@@ -741,6 +786,11 @@ void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& 
                 }
                 if (val.contains("winding_err") && val["winding_err"].is_number()) {
                     r.winding_err = val["winding_err"].get<float>();
+                }
+                if (val.contains("p") && val["p"].is_array() && val["p"].size() >= 3) {
+                    r.p[0] = val["p"][0].get<float>();
+                    r.p[1] = val["p"][1].get<float>();
+                    r.p[2] = val["p"][2].get<float>();
                 }
                 _corr_point_results[pid] = r;
             }
