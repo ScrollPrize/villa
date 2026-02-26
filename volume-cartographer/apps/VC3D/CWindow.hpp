@@ -205,6 +205,7 @@ private:
   
     SeedingWidget* _seedingWidget;
     SegmentationWidget* _segmentationWidget{nullptr};
+    QDockWidget* _lasagnaDock{nullptr};
     DrawingWidget* _drawingWidget;
     CPointCollectionWidget* _point_collection_widget;
 
