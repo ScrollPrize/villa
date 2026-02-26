@@ -11,6 +11,7 @@
 #include <QKeyEvent>
 #include <QMessageBox>
 #include <QLabel>
+#include <QMenu>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
  
@@ -47,6 +48,8 @@ void CPointCollectionWidget::setupUi()
     _tree_view->setModel(_model);
     _tree_view->setSelectionBehavior(QAbstractItemView::SelectRows);
     _tree_view->setSelectionMode(QAbstractItemView::SingleSelection);
+    _tree_view->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(_tree_view, &QWidget::customContextMenuRequested, this, &CPointCollectionWidget::showContextMenu);
     layout->addWidget(_tree_view);
 
     connect(_tree_view->selectionModel(), &QItemSelectionModel::selectionChanged, this, &CPointCollectionWidget::onSelectionChanged);
@@ -641,6 +644,18 @@ void CPointCollectionWidget::keyPressEvent(QKeyEvent *event)
         event->accept();
     } else {
         QDockWidget::keyPressEvent(event);
+    }
+}
+
+void CPointCollectionWidget::showContextMenu(const QPoint& pos)
+{
+    if (_selected_collection_id == 0) return;
+
+    QMenu menu(tr("Context Menu"), _tree_view);
+    QAction* focusAction = menu.addAction(tr("Focus && Align View"));
+    QAction* chosen = menu.exec(_tree_view->viewport()->mapToGlobal(pos));
+    if (chosen == focusAction) {
+        emit focusViewsRequested(_selected_collection_id, _selected_point_id);
     }
 }
 

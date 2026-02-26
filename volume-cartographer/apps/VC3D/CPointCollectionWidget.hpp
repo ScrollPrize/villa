@@ -31,6 +31,7 @@ signals:
     void pointSelected(uint64_t pointId);
     void pointDoubleClicked(uint64_t pointId);
     void convertPointToAnchorRequested(uint64_t pointId, uint64_t collectionId);
+    void focusViewsRequested(uint64_t collectionId, uint64_t pointId);
 
 public slots:
     void selectCollection(uint64_t collectionId);
@@ -60,7 +61,8 @@ private slots:
     void onLoadClicked();
     void onConvertToAnchorClicked();
     void onClearAnchorClicked();
-  
+    void showContextMenu(const QPoint& pos);
+
  private:
     void keyPressEvent(QKeyEvent *event) override;
     void setupUi();
