@@ -533,6 +533,8 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             _progressLabel->setStyleSheet(QStringLiteral("color: #27ae60;"));
         }
         if (_stopServiceBtn) _stopServiceBtn->setEnabled(true);
+        // Always fetch datasets from the connected service
+        LasagnaServiceManager::instance().fetchDatasets();
     });
     connect(&mgr, &LasagnaServiceManager::serviceStopped, this, [this]() {
         if (_progressBar) _progressBar->setVisible(false);
@@ -592,6 +594,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         if (_stopBtn) _stopBtn->setEnabled(false);
         if (_newModelBtn) _newModelBtn->setEnabled(true);
         if (_reoptBtn) _reoptBtn->setEnabled(true);
+        if (_expandBtn) _expandBtn->setEnabled(true);
         if (_progressBar) _progressBar->setVisible(false);
         if (_progressLabel) {
             _progressLabel->setText(tr("Optimization finished. Output: %1").arg(outputDir));
@@ -605,6 +608,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         if (_stopBtn) _stopBtn->setEnabled(false);
         if (_newModelBtn) _newModelBtn->setEnabled(true);
         if (_reoptBtn) _reoptBtn->setEnabled(true);
+        if (_expandBtn) _expandBtn->setEnabled(true);
         if (_progressBar) _progressBar->setVisible(false);
         if (_progressLabel) {
             _progressLabel->setText(tr("Optimization error: %1").arg(err));
@@ -767,6 +771,11 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
         _portEdit->setText(QString::number(_externalPort));
     }
     updateConnectionWidgets();
+
+    // Auto-reconnect to saved external service (triggers dataset fetch via serviceStarted)
+    if (_connectionMode == 1 && !_externalHost.isEmpty() && _externalPort > 0) {
+        LasagnaServiceManager::instance().connectToExternal(_externalHost, _externalPort);
+    }
 
     // Expand settings
     _expandConfigFilePath = settings.value(QStringLiteral("lasagna_expand_config_file_path"), QString()).toString();
@@ -1048,6 +1057,11 @@ void SegmentationLasagnaPanel::updateConnectionWidgets()
     if (!external) {
         if (_dataInputStack) _dataInputStack->setCurrentIndex(0);
     }
+
+    // When switching to external, try connecting (triggers dataset fetch via serviceStarted)
+    if (external && !_restoringSettings && !_externalHost.isEmpty() && _externalPort > 0) {
+        LasagnaServiceManager::instance().connectToExternal(_externalHost, _externalPort);
+    }
 }
 
 void SegmentationLasagnaPanel::refreshDiscoveredServices()
@@ -1102,24 +1116,6 @@ void SegmentationLasagnaPanel::onDiscoveredServiceSelected(int index)
     _externalHost = host;
     _externalPort = port;
 
-    // Auto-connect; fetch datasets once connected
-    auto& mgr = LasagnaServiceManager::instance();
-    auto* conn = new QMetaObject::Connection;
-    auto* errConn = new QMetaObject::Connection;
-    *conn = connect(&mgr, &LasagnaServiceManager::serviceStarted, this,
-        [this, conn, errConn]() {
-            QObject::disconnect(*conn);
-            QObject::disconnect(*errConn);
-            delete conn;
-            delete errConn;
-            LasagnaServiceManager::instance().fetchDatasets();
-        });
-    *errConn = connect(&mgr, &LasagnaServiceManager::serviceError, this,
-        [conn, errConn](const QString&) {
-            QObject::disconnect(*conn);
-            QObject::disconnect(*errConn);
-            delete conn;
-            delete errConn;
-        });
-    mgr.connectToExternal(host, port);
+    // Auto-connect (datasets are fetched via the permanent serviceStarted handler)
+    LasagnaServiceManager::instance().connectToExternal(host, port);
 }

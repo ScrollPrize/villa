@@ -433,15 +433,19 @@ def optimize(
 				raise ValueError("const_mask_lr batch must match data batch")
 			keep_lr = (1.0 - cm_lr)
 
-		ins_z = model._last_grow_insert_z if bool(keep_only_grown_z) else None
 		z_keep = None
-		if ins_z is not None:
-			ins_z = int(ins_z)
-			n = int(data.cos.shape[0])
-			if not (0 <= ins_z < n):
-				raise ValueError("grow z index out of range")
-			z_keep = torch.zeros(n, 1, 1, 1, device=data.cos.device, dtype=torch.float32)
-			z_keep[ins_z, 0, 0, 0] = 1.0
+		if bool(keep_only_grown_z):
+			z_list = getattr(model, "_last_grow_insert_z_list", [])
+			if not z_list and model._last_grow_insert_z is not None:
+				z_list = [int(model._last_grow_insert_z)]
+			if z_list:
+				n = int(data.cos.shape[0])
+				z_keep = torch.zeros(n, 1, 1, 1, device=data.cos.device, dtype=torch.float32)
+				for iz in z_list:
+					iz = int(iz)
+					if not (0 <= iz < n):
+						raise ValueError("grow z index out of range")
+					z_keep[iz, 0, 0, 0] = 1.0
 		param_groups: list[dict] = []
 		for name in opt_cfg.params:
 			if name in {"theta", "winding_scale"}:
@@ -734,9 +738,12 @@ def optimize(
 
 		for gi in range(generations):
 			model.grow(directions=[str(d) for d in directions], steps=grow_steps)
-			if model._last_grow_insert_z is not None:
+			z_inserts = getattr(model, "_last_grow_insert_z_list", [])
+			if not z_inserts and model._last_grow_insert_z is not None:
+				z_inserts = [int(model._last_grow_insert_z)]
+			for ins_z in z_inserts:
 				grew_z = True
-				ins_z = int(model._last_grow_insert_z)
+				ins_z = int(ins_z)
 				if ins_z == 0:  # bw: prepended at front
 					orig_z_start += 1
 				if int(data.cos.shape[0]) != int(model.z_size):
@@ -748,8 +755,8 @@ def optimize(
 						data=data,
 						cfg=data_cfg,
 						unet_z0=int(data_z0),
-						new_z_size=int(model.z_size),
-						insert_z=int(model._last_grow_insert_z),
+						new_z_size=int(data.cos.shape[0]) + 1,
+						insert_z=ins_z,
 						out_dir_base=data_out_dir_base,
 					)
 			if model._last_grow_insert_lr is not None:
@@ -763,32 +770,41 @@ def optimize(
 			# -- Local opt: optimize ONLY what was just added this generation --
 			if not local_opts or all(int(o.steps) <= 0 and o.termination != "mask" for o in local_opts):
 				continue
-			ins = model._last_grow_insert_lr
-			if ins is None:
-				if model._last_grow_insert_z is not None:
-					model.const_mask_lr = None
-					for li, opt_cfg in enumerate(local_opts):
-						_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg, keep_only_grown_z=True)
-					continue
-				raise RuntimeError("grow: missing insertion rect")
-			py0, px0, ho, wo = ins
+			ins_lr = model._last_grow_insert_lr
+			z_inserts_local = getattr(model, "_last_grow_insert_z_list", [])
+			if not z_inserts_local and model._last_grow_insert_z is not None:
+				z_inserts_local = [int(model._last_grow_insert_z)]
+			if ins_lr is None and not z_inserts_local:
+				raise RuntimeError("grow: missing insertion info")
+
+			n = int(data.cos.shape[0])
 			hm = int(model.mesh_h)
 			wm = int(model.mesh_w)
-			y0 = int(py0)
-			x0 = int(px0)
-			y1 = int(py0 + ho)
-			x1 = int(px0 + wo)
-			win = max(0, int(local_opts[0].opt_window) - 1)
-			n = int(data.cos.shape[0])
-			cm = torch.zeros(n, 1, hm, wm, device=data.cos.device, dtype=torch.float32)
-			cm[:, :, y0:y1, x0:x1] = 1.0
-			cm[:, :, y0:min(y1, y0 + win), x0:x1] = 0.0
-			cm[:, :, max(y0, y1 - win):y1, x0:x1] = 0.0
-			cm[:, :, y0:y1, x0:min(x1, x0 + win)] = 0.0
-			cm[:, :, y0:y1, max(x0, x1 - win):x1] = 0.0
-			model.const_mask_lr = cm
+
+			if ins_lr is not None:
+				# Build XY mask: freeze old region, free new border
+				py0, px0, ho, wo = ins_lr
+				y0 = int(py0)
+				x0 = int(px0)
+				y1 = int(py0 + ho)
+				x1 = int(px0 + wo)
+				win = max(0, int(local_opts[0].opt_window) - 1)
+				cm = torch.zeros(n, 1, hm, wm, device=data.cos.device, dtype=torch.float32)
+				cm[:, :, y0:y1, x0:x1] = 1.0
+				cm[:, :, y0:min(y1, y0 + win), x0:x1] = 0.0
+				cm[:, :, max(y0, y1 - win):y1, x0:x1] = 0.0
+				cm[:, :, y0:y1, x0:min(x1, x0 + win)] = 0.0
+				cm[:, :, y0:y1, max(x0, x1 - win):x1] = 0.0
+				for iz in z_inserts_local:
+					cm[int(iz), :, :, :] = 0.0  # new Z slices are free everywhere
+				model.const_mask_lr = cm
+			else:
+				# Z-only: no XY mask, use z_keep mechanism
+				model.const_mask_lr = None
+
+			use_z_keep = (z_inserts_local and ins_lr is None)
 			for li, opt_cfg in enumerate(local_opts):
-				_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg, keep_only_grown_z=False)
+				_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg, keep_only_grown_z=use_z_keep)
 
 		# -- Global opt: after all generations, freeze original model, optimize all grown --
 		if generations > 0 and (stage.global_opt.steps > 0 or stage.global_opt.termination == "mask"):
@@ -796,12 +812,9 @@ def optimize(
 			hm = int(model.mesh_h)
 			wm = int(model.mesh_w)
 			cm = torch.zeros(n, 1, hm, wm, device=data.cos.device, dtype=torch.float32)
-			if grew_z:
-				# Z growth: freeze original Z slices entirely
-				cm[orig_z_start:orig_z_start + orig_z_size, :, :, :] = 1.0
-			else:
-				# XY growth: freeze original XY region across all Z slices
-				cm[:, :, cum_py:cum_py + orig_mesh_h, cum_px:cum_px + orig_mesh_w] = 1.0
+			# Freeze the original Z×XY region (handles Z-only, XY-only, and combined)
+			cm[orig_z_start:orig_z_start + orig_z_size, :,
+			   cum_py:cum_py + orig_mesh_h, cum_px:cum_px + orig_mesh_w] = 1.0
 			model.const_mask_lr = cm
 			_run_opt(si=si, label=f"stage{si}_global", stage=stage, opt_cfg=stage.global_opt, keep_only_grown_z=False)
 	model.const_mask_lr = None
