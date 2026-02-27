@@ -151,4 +151,5 @@ python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webc
 python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/ --output full_cos_y.zarr  --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --z-step 5 --axis y
 
 
+python $SRC/preprocess_cos_omezarr.py integrate --z-volume ../s5/PHerc172.volpkg/volumes_lasagna/full_cos_z.zarr --output full_cos_s5.zarr --x-volume full_cos_x.zarr --y-volume full_cos_y.zarr
 

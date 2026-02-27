@@ -12,6 +12,7 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFrame>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -125,10 +126,14 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     panelLayout->addWidget(_connectionGroup);
 
     // =======================================================================
-    // New Model button + settings section
+    // New Model settings + action button
     // =======================================================================
-    _newModelBtn = new QPushButton(tr("New Model"), this);
-    panelLayout->addWidget(_newModelBtn);
+    {
+        auto* sep = new QFrame(this);
+        sep->setFrameShape(QFrame::HLine);
+        sep->setFrameShadow(QFrame::Sunken);
+        panelLayout->addWidget(sep);
+    }
 
     _newModelGroup = new CollapsibleSettingsGroup(tr("New Model Settings"), this);
     auto* nmContent = _newModelGroup->contentWidget();
@@ -212,11 +217,18 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
 
     panelLayout->addWidget(_newModelGroup);
 
+    _newModelBtn = new QPushButton(tr("New Model"), this);
+    panelLayout->addWidget(_newModelBtn);
+
     // =======================================================================
-    // Re-optimize button + settings section
+    // Re-optimize settings + action button
     // =======================================================================
-    _reoptBtn = new QPushButton(tr("Re-optimize"), this);
-    panelLayout->addWidget(_reoptBtn);
+    {
+        auto* sep = new QFrame(this);
+        sep->setFrameShape(QFrame::HLine);
+        sep->setFrameShadow(QFrame::Sunken);
+        panelLayout->addWidget(sep);
+    }
 
     _reoptGroup = new CollapsibleSettingsGroup(tr("Re-optimize Settings"), this);
     auto* reoptContent = _reoptGroup->contentWidget();
@@ -234,11 +246,18 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
 
     panelLayout->addWidget(_reoptGroup);
 
+    _reoptBtn = new QPushButton(tr("Re-optimize"), this);
+    panelLayout->addWidget(_reoptBtn);
+
     // =======================================================================
-    // Expand button + settings section
+    // Expand settings + action button
     // =======================================================================
-    _expandBtn = new QPushButton(tr("Expand"), this);
-    panelLayout->addWidget(_expandBtn);
+    {
+        auto* sep = new QFrame(this);
+        sep->setFrameShape(QFrame::HLine);
+        sep->setFrameShadow(QFrame::Sunken);
+        panelLayout->addWidget(sep);
+    }
 
     _expandGroup = new CollapsibleSettingsGroup(tr("Expand Settings"), this);
     auto* expandContent = _expandGroup->contentWidget();
@@ -277,6 +296,9 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     _expandGenSpin->setValue(10);
 
     panelLayout->addWidget(_expandGroup);
+
+    _expandBtn = new QPushButton(tr("Expand"), this);
+    panelLayout->addWidget(_expandBtn);
 
     // =======================================================================
     // Shared bottom area — stop buttons, progress
