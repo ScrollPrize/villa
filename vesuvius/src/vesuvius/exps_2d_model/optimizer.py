@@ -588,6 +588,8 @@ def optimize(
 			_print_status(step_label=f"{label} 0/{opt_cfg.steps}", loss_val=loss0.item(), tv=term_vals0, pv=param_vals0)
 		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0, vis_losses=vis_losses0)
 
+		if opt_cfg.termination == "mask" and stage.masks is None:
+			raise ValueError(f"[{label}] termination='mask' but stage has no masks configured")
 		max_steps = opt_cfg.steps if opt_cfg.termination == "steps" else 10_000_000
 		actual_steps = 0
 		_use_cuda = data.cos.device.type == "cuda"

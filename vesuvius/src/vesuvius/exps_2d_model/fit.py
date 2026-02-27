@@ -303,14 +303,7 @@ def main(argv: list[str] | None = None) -> int:
 	_out_dir = vis_cfg.out_dir  # None means skip all debug/vis output
 	# Corr point vis always gets a directory when points exist.
 	# Falls back to cwd (the fit_service working directory).
-	_corr_out_dir: str | None = None
-	if int(points_all.shape[0]) > 0:
-		if _out_dir is not None:
-			_corr_out_dir = _out_dir
-		else:
-			import os
-			_corr_out_dir = os.getcwd()
-		print(f"[fit] corr_out_dir={_corr_out_dir}")
+	_corr_out_dir: str | None = _out_dir if int(points_all.shape[0]) > 0 else None
 	data = cli_data.load_fit_data(data_cfg, z_size=int(z_size_use), out_dir_base=_out_dir)
 	data = fit_data.FitData(
 		cos=data.cos,
@@ -414,12 +407,7 @@ def main(argv: list[str] | None = None) -> int:
 			print(f"  pt{pi}: fullres=({pf[0]:.0f},{pf[1]:.0f},{pf[2]:.0f}) "
 				  f"work=({pw[0]:.1f},{pw[1]:.1f},{pw[2]:.2f}) "
 				  f"z_lo={z_lo_i} z_hi={z_hi_i} z_frac={frac_i:.3f}")
-		if _out_dir is not None:
-			_corr_out_dir = _out_dir
-		else:
-			import os
-			_corr_out_dir = os.getcwd()
-		print(f"[fit] corr_out_dir={_corr_out_dir}")
+		_corr_out_dir = _out_dir
 		data = replace(data, constraints=fit_data.ConstraintsData(
 			points=fit_data.PointConstraintsData(
 				points_xyz_winda=points_all,
