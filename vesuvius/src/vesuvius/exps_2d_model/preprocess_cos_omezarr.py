@@ -459,8 +459,8 @@ def main(argv: list[str] | None = None) -> int:
 	p.add_argument("--axis", choices=["z", "y", "x"], default="z",
 		help="Dimension to slice along (default: z). The 2D plane perpendicular to this axis is processed by the UNet.")
 	p.add_argument("--crop-xyzwhd", "--crop", dest="crop_xyzwhd", type=int, nargs=6, default=None, help="Crop in absolute input coordinates: x y z w h d.")
-	p.add_argument("--z-step", "--step", dest="z_step", type=int, default=10,
-		help="Step along the slice axis before downscale (default: 10).")
+	p.add_argument("--z-step", "--step", dest="z_step", type=int, default=5,
+		help="Step along the slice axis before downscale (default: 5).")
 	p.add_argument("--tile-size", type=int, default=2048, help="Tile size.")
 	p.add_argument("--overlap", type=int, default=128, help="Tile overlap.")
 	p.add_argument("--border", type=int, default=32, help="Tile border discard width.")
