@@ -277,6 +277,11 @@ def train(config_path):
     config.setdefault('profile_data_time', False)
     config.setdefault('profile_step_time', False)
     config.setdefault('profile_log_every', 100)
+    config.setdefault('compile_model', True)
+    config.setdefault(
+        'separate_eager_eval_for_logging',
+        bool(config.get('compile_model', True)),
+    )
 
     # Build targets dict based on config
     displacement_out_channels = 6 if triplet_mode else 3
@@ -380,7 +385,7 @@ def train(config_path):
     mask_cond_from_seg_loss = config.get('mask_cond_from_seg_loss', False)
     use_dense_displacement = bool(config.get('use_dense_displacement', False))
     triplet_direction_prior_mask = str(config.get('triplet_direction_prior_mask', 'cond')).lower()
-    triplet_random_channel_swap_prob = 0.5
+    triplet_random_channel_swap_prob = float(config.get('triplet_random_channel_swap_prob', 0.5))
     if triplet_min_disp_vox < 0:
         raise ValueError(f"triplet_min_disp_vox must be >= 0, got {triplet_min_disp_vox}")
     if lambda_triplet_min_disp > 0.0 and not triplet_mode:
@@ -533,7 +538,7 @@ def train(config_path):
     train_num_workers = max(0, int(config.get('num_workers', 0)))
     val_num_workers = max(0, int(config.get('val_num_workers', 1)))
     pin_memory = bool(config.get('pin_memory', True))
-    train_prefetch_factor = max(1, int(config.get('prefetch_factor', 2)))
+    train_prefetch_factor = max(1, int(config.get('prefetch_factor', 1)))
     val_prefetch_factor = max(1, int(config.get('val_prefetch_factor', train_prefetch_factor)))
     train_persistent_workers = bool(config.get('persistent_workers', True)) and train_num_workers > 0
     val_persistent_workers = bool(config.get('persistent_workers', True)) and val_num_workers > 0
@@ -666,6 +671,19 @@ def train(config_path):
         model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
             model, optimizer, train_dataloader, val_dataloader, lr_scheduler
         )
+
+    def _state_dict_for_eager_eval():
+        state_dict = accelerator.unwrap_model(model).state_dict()
+        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
+        return state_dict
+
+    use_separate_eager_eval_for_logging = bool(config.get('separate_eager_eval_for_logging', False))
+    eval_model = None
+    if use_separate_eager_eval_for_logging and accelerator.is_main_process:
+        eval_model = make_model(config).to(accelerator.device)
+        eval_model.eval()
+        eval_model.load_state_dict(_state_dict_for_eager_eval())
 
     if accelerator.is_main_process:
         accelerator.print("\n=== Displacement Field Training Configuration ===")
@@ -890,7 +908,13 @@ def train(config_path):
 
         if should_log_this_iteration and accelerator.is_main_process:
             with torch.no_grad():
-                model.eval()
+                eval_forward_model = model
+                if eval_model is not None:
+                    eval_model.load_state_dict(_state_dict_for_eager_eval())
+                    eval_model.eval()
+                    eval_forward_model = eval_model
+                else:
+                    model.eval()
 
                 val_batches_per_log = max(1, int(config.get('val_batches_per_log', 4)))
                 val_metric_sums = {
@@ -922,7 +946,8 @@ def train(config_path):
                         val_batch, use_sdt, use_heatmap, use_segmentation
                     )
 
-                    val_output = model(val_inputs)
+                    with accelerator.autocast():
+                        val_output = eval_forward_model(val_inputs)
                     val_disp_pred = val_output['displacement']
 
                     val_surf_loss = compute_displacement_loss(
@@ -1093,7 +1118,8 @@ def train(config_path):
                         val_pert_batch, use_sdt, use_heatmap, use_segmentation
                     )
 
-                    val_pert_output = model(val_pert_inputs)
+                    with accelerator.autocast():
+                        val_pert_output = eval_forward_model(val_pert_inputs)
                     val_pert_disp_pred = val_pert_output['displacement']
 
                     val_pert_surf_loss = compute_displacement_loss(
@@ -1198,7 +1224,8 @@ def train(config_path):
                             if wandb.run is not None:
                                 wandb_log['val_pert_image'] = wandb.Image(val_pert_img_path)
 
-                model.train()
+                if eval_model is None:
+                    model.train()
 
         if (
             (iteration > 0 or config.get('ckpt_at_step_zero', False))

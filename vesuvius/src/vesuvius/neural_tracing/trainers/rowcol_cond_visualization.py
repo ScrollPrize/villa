@@ -4,6 +4,15 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+
+def _tensor_to_numpy(tensor):
+    """Convert torch tensor to numpy, upcasting bfloat16 for compatibility."""
+    tensor_cpu = tensor.detach().cpu()
+    if tensor_cpu.dtype == torch.bfloat16:
+        tensor_cpu = tensor_cpu.float()
+    return tensor_cpu.numpy()
+
+
 def rasterize_sparse_to_slice(coords, values, valid_mask, slice_idx, shape, tol=1.5, axis='z'):
     """Rasterize sparse 3D points to a 2D slice.
 
@@ -66,20 +75,20 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
     D, H, W = inputs.shape[2], inputs.shape[3], inputs.shape[4]
 
     # Precompute 3D arrays
-    vol_3d = inputs[b, 0].cpu().numpy()
-    cond_3d = inputs[b, 1].cpu().numpy()
-    extrap_surf_3d = inputs[b, 2].cpu().numpy()
-    other_wraps_3d = inputs[b, 3].cpu().numpy() if inputs.shape[1] > 3 else None
+    vol_3d = _tensor_to_numpy(inputs[b, 0])
+    cond_3d = _tensor_to_numpy(inputs[b, 1])
+    extrap_surf_3d = _tensor_to_numpy(inputs[b, 2])
+    other_wraps_3d = _tensor_to_numpy(inputs[b, 3]) if inputs.shape[1] > 3 else None
 
     # Displacement: [3, D, H, W] where components are (dz, dy, dx)
-    disp_3d = disp_pred[b].cpu().numpy()
+    disp_3d = _tensor_to_numpy(disp_pred[b])
     disp_mag_3d = np.linalg.norm(disp_3d, axis=0)
 
     # GT displacement processing
-    gt_disp_np = gt_displacement[b].cpu().numpy()  # (N, 3)
+    gt_disp_np = _tensor_to_numpy(gt_displacement[b])  # (N, 3)
     gt_disp_mag = np.linalg.norm(gt_disp_np, axis=-1)
-    coords_np = extrap_coords[b].cpu().numpy()  # (N, 3) - z, y, x
-    valid_np = valid_mask[b].cpu().numpy().astype(bool)
+    coords_np = _tensor_to_numpy(extrap_coords[b])  # (N, 3) - z, y, x
+    valid_np = _tensor_to_numpy(valid_mask[b]).astype(bool)
 
     # Sample predicted displacement vectors at extrap coords via trilinear interpolation.
     # This matches the training loss sampling path and reduces metric jitter from rounding.
@@ -93,7 +102,7 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
     coords_normalized[..., 2] = 2 * coords_normalized[..., 2] / w_denom - 1  # x
     grid = coords_normalized[..., [2, 1, 0]].view(1, -1, 1, 1, 3)  # grid_sample expects x,y,z
     sampled_pred = F.grid_sample(disp_pred[b:b + 1], grid, mode='bilinear', align_corners=True)
-    pred_sampled_vectors = sampled_pred.view(1, 3, -1).permute(0, 2, 1)[0].detach().cpu().numpy()  # [N, 3]
+    pred_sampled_vectors = _tensor_to_numpy(sampled_pred.view(1, 3, -1).permute(0, 2, 1)[0])  # [N, 3]
     pred_sampled_mag = np.linalg.norm(pred_sampled_vectors, axis=-1)
 
     # Filter to valid points only
@@ -177,16 +186,16 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
     disp_vmax_comp = np.percentile(np.abs(disp_3d), 99)
 
     # Optional 3D arrays
-    sdt_pred_3d = sdt_pred[b, 0].cpu().numpy() if sdt_pred is not None else None
-    sdt_gt_3d = sdt_target[b, 0].cpu().numpy() if sdt_target is not None else None
+    sdt_pred_3d = _tensor_to_numpy(sdt_pred[b, 0]) if sdt_pred is not None else None
+    sdt_gt_3d = _tensor_to_numpy(sdt_target[b, 0]) if sdt_target is not None else None
     sdt_vmax = max(np.abs(sdt_pred_3d).max(), np.abs(sdt_gt_3d).max()) if sdt_pred_3d is not None else 1.0
-    hm_pred_3d = torch.sigmoid(heatmap_pred[b, 0]).cpu().numpy() if heatmap_pred is not None else None
-    hm_gt_3d = heatmap_target[b, 0].cpu().numpy() if heatmap_target is not None else None
+    hm_pred_3d = _tensor_to_numpy(torch.sigmoid(heatmap_pred[b, 0])) if heatmap_pred is not None else None
+    hm_gt_3d = _tensor_to_numpy(heatmap_target[b, 0]) if heatmap_target is not None else None
 
     # Segmentation: pred is [B, 2, D, H, W], target is [B, 1, D, H, W]
     has_seg = seg_pred is not None and seg_target is not None
-    seg_pred_3d = seg_pred[b].argmax(dim=0).cpu().numpy() if seg_pred is not None else None  # [D, H, W]
-    seg_gt_3d = seg_target[b, 0].cpu().numpy() if seg_target is not None else None  # [D, H, W]
+    seg_pred_3d = _tensor_to_numpy(seg_pred[b].argmax(dim=0)) if seg_pred is not None else None  # [D, H, W]
+    seg_gt_3d = _tensor_to_numpy(seg_target[b, 0]) if seg_target is not None else None  # [D, H, W]
 
     # Setup figure: 6 rows (2 per slice orientation), variable columns + text panel
     from matplotlib.gridspec import GridSpec
@@ -453,15 +462,16 @@ def _make_dense_triplet_visualization(
 ):
     """Triplet-mode dense visualization with swap-aware Channel A/B pairing."""
     import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
     from matplotlib.gridspec import GridSpec
 
     b = 0
     D, H, W = inputs.shape[2], inputs.shape[3], inputs.shape[4]
 
-    vol_3d = inputs[b, 0].cpu().numpy()
-    cond_3d = inputs[b, 1].cpu().numpy()
-    pred_3d = disp_pred[b].cpu().numpy()
-    gt_3d = dense_gt_displacement[b].cpu().numpy()
+    vol_3d = _tensor_to_numpy(inputs[b, 0])
+    cond_3d = _tensor_to_numpy(inputs[b, 1])
+    pred_3d = _tensor_to_numpy(disp_pred[b])
+    gt_3d = _tensor_to_numpy(dense_gt_displacement[b])
 
     if pred_3d.shape[0] != 6 or gt_3d.shape[0] != 6:
         raise ValueError(
@@ -472,7 +482,7 @@ def _make_dense_triplet_visualization(
     channel_order = np.array([0, 1], dtype=np.int64)
     if triplet_channel_order is not None:
         if isinstance(triplet_channel_order, torch.Tensor):
-            order_arr = triplet_channel_order.detach().cpu().numpy()
+            order_arr = _tensor_to_numpy(triplet_channel_order)
         else:
             order_arr = np.asarray(triplet_channel_order)
         if order_arr.ndim == 2:
@@ -501,24 +511,72 @@ def _make_dense_triplet_visualization(
     if dense_loss_weight is None:
         weight_3d = np.ones((D, H, W), dtype=np.float32)
     else:
-        w = dense_loss_weight[b].cpu().numpy()
+        w = _tensor_to_numpy(dense_loss_weight[b])
         weight_3d = w[0] if w.ndim == 4 else w
     supervised_mask = weight_3d > 0
     cond_supervised = cond_mask_3d & supervised_mask
 
-    def _safe_percentile(arr, p, fallback=1.0):
-        if arr.size == 0:
-            return fallback
-        val = np.percentile(arr, p)
-        return float(val if np.isfinite(val) and val > 1e-8 else fallback)
+    zero_disp_tol = 0.5
 
-    channel_a_vmax = max(
-        _safe_percentile(pred_channel_a_mag_3d[cond_supervised], 99, fallback=1.0),
-        _safe_percentile(gt_channel_a_mag_3d[cond_supervised], 99, fallback=1.0),
+    def _zero_disp_overlap_stats(pred_mag_3d: np.ndarray, gt_mag_3d: np.ndarray, mask_3d: np.ndarray):
+        mask = np.asarray(mask_3d, dtype=bool)
+        gt_zero = (gt_mag_3d <= zero_disp_tol) & mask
+        pred_zero = (pred_mag_3d <= zero_disp_tol) & mask
+        overlap = gt_zero & pred_zero
+        gt_count = int(gt_zero.sum())
+        pred_count = int(pred_zero.sum())
+        overlap_count = int(overlap.sum())
+        overlap_pct_gt = (100.0 * overlap_count / gt_count) if gt_count > 0 else 0.0
+        return {
+            "gt_count": gt_count,
+            "pred_count": pred_count,
+            "overlap_count": overlap_count,
+            "overlap_pct_gt": float(overlap_pct_gt),
+        }
+
+    channel_a_zero_stats = _zero_disp_overlap_stats(
+        pred_channel_a_mag_3d,
+        gt_channel_a_mag_3d,
+        supervised_mask,
     )
-    channel_b_vmax = max(
-        _safe_percentile(pred_channel_b_mag_3d[cond_supervised], 99, fallback=1.0),
-        _safe_percentile(gt_channel_b_mag_3d[cond_supervised], 99, fallback=1.0),
+    channel_b_zero_stats = _zero_disp_overlap_stats(
+        pred_channel_b_mag_3d,
+        gt_channel_b_mag_3d,
+        supervised_mask,
+    )
+
+    def _build_magnitude_norm(pred_vals, gt_vals):
+        """Build a robust norm that keeps contrast when magnitudes cluster."""
+        merged = np.concatenate([pred_vals.reshape(-1), gt_vals.reshape(-1)])
+        merged = merged[np.isfinite(merged)]
+        merged = merged[merged >= 0]
+        if merged.size == 0:
+            return mcolors.Normalize(vmin=0.0, vmax=1.0, clip=True), 0.0, 1.0, "linear"
+
+        p01, p50, p99 = np.percentile(merged, [1, 50, 99])
+        vmin = max(0.0, float(p01))
+        vmax = float(max(p99, vmin + 1e-6))
+
+        # If the robust window is nearly flat, expand around median for visibility.
+        if (vmax - vmin) < max(1e-6, 1e-3 * max(float(p50), 1.0)):
+            half_span = max(0.05 * max(float(p50), 1.0), 1e-3)
+            vmin = max(0.0, float(p50 - half_span))
+            vmax = float(p50 + half_span)
+            return mcolors.Normalize(vmin=vmin, vmax=vmax, clip=True), vmin, vmax, "linear-local"
+
+        # Power-law scaling increases contrast in the low/mid range.
+        return mcolors.PowerNorm(gamma=0.65, vmin=vmin, vmax=vmax, clip=True), vmin, vmax, "power"
+
+    channel_a_vals_pred = pred_channel_a_mag_3d[supervised_mask] if np.any(supervised_mask) else pred_channel_a_mag_3d.reshape(-1)
+    channel_a_vals_gt = gt_channel_a_mag_3d[supervised_mask] if np.any(supervised_mask) else gt_channel_a_mag_3d.reshape(-1)
+    channel_b_vals_pred = pred_channel_b_mag_3d[supervised_mask] if np.any(supervised_mask) else pred_channel_b_mag_3d.reshape(-1)
+    channel_b_vals_gt = gt_channel_b_mag_3d[supervised_mask] if np.any(supervised_mask) else gt_channel_b_mag_3d.reshape(-1)
+
+    channel_a_norm, channel_a_vmin, channel_a_vmax, channel_a_norm_name = _build_magnitude_norm(
+        channel_a_vals_pred, channel_a_vals_gt
+    )
+    channel_b_norm, channel_b_vmin, channel_b_vmax, channel_b_norm_name = _build_magnitude_norm(
+        channel_b_vals_pred, channel_b_vals_gt
     )
 
     z0, y0, x0 = D // 2, H // 2, W // 2
@@ -541,7 +599,7 @@ def _make_dense_triplet_visualization(
     gt_channel_b_band = np.where(supervised_mask, gt_channel_b_mag_3d, np.nan)
     pred_channel_b_band = np.where(supervised_mask, pred_channel_b_mag_3d, np.nan)
 
-    disp_cmap = plt.cm.inferno.copy()
+    disp_cmap = plt.cm.cividis.copy()
     disp_cmap.set_bad(color="black")
 
     n_cols = 5
@@ -575,20 +633,26 @@ def _make_dense_triplet_visualization(
         axes[row, 0].set_title(f"Overlay ({label})")
         axes[row, 0].set_ylabel(ylabel)
 
-        axes[row, 1].imshow(gt_channel_a_slice, cmap=disp_cmap, vmin=0, vmax=channel_a_vmax, extent=extent)
+        axes[row, 1].imshow(gt_channel_a_slice, cmap=disp_cmap, norm=channel_a_norm, extent=extent)
         axes[row, 1].set_title("GT Channel A |disp| (band)")
         axes[row, 1].set_yticks([])
 
-        axes[row, 2].imshow(pred_channel_a_slice, cmap=disp_cmap, vmin=0, vmax=channel_a_vmax, extent=extent)
-        axes[row, 2].set_title("Pred Channel A |disp| (band)")
+        axes[row, 2].imshow(pred_channel_a_slice, cmap=disp_cmap, norm=channel_a_norm, extent=extent)
+        axes[row, 2].set_title(
+            "Pred Channel A |disp| (band)\n"
+            f"0-disp overlap vs GT: {channel_a_zero_stats['overlap_pct_gt']:.1f}%"
+        )
         axes[row, 2].set_yticks([])
 
-        axes[row, 3].imshow(gt_channel_b_slice, cmap=disp_cmap, vmin=0, vmax=channel_b_vmax, extent=extent)
+        axes[row, 3].imshow(gt_channel_b_slice, cmap=disp_cmap, norm=channel_b_norm, extent=extent)
         axes[row, 3].set_title("GT Channel B |disp| (band)")
         axes[row, 3].set_yticks([])
 
-        axes[row, 4].imshow(pred_channel_b_slice, cmap=disp_cmap, vmin=0, vmax=channel_b_vmax, extent=extent)
-        axes[row, 4].set_title("Pred Channel B |disp| (band)")
+        axes[row, 4].imshow(pred_channel_b_slice, cmap=disp_cmap, norm=channel_b_norm, extent=extent)
+        axes[row, 4].set_title(
+            "Pred Channel B |disp| (band)\n"
+            f"0-disp overlap vs GT: {channel_b_zero_stats['overlap_pct_gt']:.1f}%"
+        )
         axes[row, 4].set_yticks([])
 
         for c in range(n_cols):
@@ -612,10 +676,22 @@ def _make_dense_triplet_visualization(
         "--- Band (supervised) -> Channel A ---",
         f"GT   mean |disp|: {float(band_channel_a_gt_vals.mean()) if band_channel_a_gt_vals.size > 0 else 0.0:.4f}",
         f"Pred mean |disp|: {float(band_channel_a_pred_vals.mean()) if band_channel_a_pred_vals.size > 0 else 0.0:.4f}",
+        (
+            f"0-disp overlap vs GT (<= {zero_disp_tol:.2f} vx): "
+            f"{channel_a_zero_stats['overlap_pct_gt']:.1f}% "
+            f"[{channel_a_zero_stats['overlap_count']}/{channel_a_zero_stats['gt_count']}]"
+        ),
+        f"Display scale: {channel_a_norm_name}, [{channel_a_vmin:.3f}, {channel_a_vmax:.3f}]",
         "",
         "--- Band (supervised) -> Channel B ---",
         f"GT   mean |disp|: {float(band_channel_b_gt_vals.mean()) if band_channel_b_gt_vals.size > 0 else 0.0:.4f}",
         f"Pred mean |disp|: {float(band_channel_b_pred_vals.mean()) if band_channel_b_pred_vals.size > 0 else 0.0:.4f}",
+        (
+            f"0-disp overlap vs GT (<= {zero_disp_tol:.2f} vx): "
+            f"{channel_b_zero_stats['overlap_pct_gt']:.1f}% "
+            f"[{channel_b_zero_stats['overlap_count']}/{channel_b_zero_stats['gt_count']}]"
+        ),
+        f"Display scale: {channel_b_norm_name}, [{channel_b_vmin:.3f}, {channel_b_vmax:.3f}]",
         "",
         "Overlay colors:",
         "  Neighbor wraps (A/B) = light green",
@@ -658,12 +734,12 @@ def make_dense_visualization(
     b = 0
     D, H, W = inputs.shape[2], inputs.shape[3], inputs.shape[4]
 
-    vol_3d = inputs[b, 0].cpu().numpy()
-    cond_3d = inputs[b, 1].cpu().numpy()
-    aux_3d = inputs[b, 2].cpu().numpy() if inputs.shape[1] > 2 else None
+    vol_3d = _tensor_to_numpy(inputs[b, 0])
+    cond_3d = _tensor_to_numpy(inputs[b, 1])
+    aux_3d = _tensor_to_numpy(inputs[b, 2]) if inputs.shape[1] > 2 else None
 
-    pred_3d = disp_pred[b].cpu().numpy()
-    gt_3d = dense_gt_displacement[b].cpu().numpy()
+    pred_3d = _tensor_to_numpy(disp_pred[b])
+    gt_3d = _tensor_to_numpy(dense_gt_displacement[b])
     triplet_mode = pred_3d.shape[0] == 6 and gt_3d.shape[0] == 6
     if triplet_mode:
         _make_dense_triplet_visualization(
@@ -705,7 +781,7 @@ def make_dense_visualization(
     if dense_loss_weight is None:
         weight_3d = np.ones((D, H, W), dtype=np.float32)
     else:
-        w = dense_loss_weight[b].cpu().numpy()
+        w = _tensor_to_numpy(dense_loss_weight[b])
         weight_3d = w[0] if w.ndim == 4 else w
     weight_3d = weight_3d.astype(np.float32, copy=False)
     supervised_mask = weight_3d > 0
@@ -737,16 +813,16 @@ def make_dense_visualization(
         back_disp_vmax = max(_safe_percentile(pred_back_for_scale, 99), _safe_percentile(gt_back_for_scale, 99))
         front_disp_vmax = max(_safe_percentile(pred_front_for_scale, 99), _safe_percentile(gt_front_for_scale, 99))
 
-    sdt_pred_3d = sdt_pred[b, 0].cpu().numpy() if sdt_pred is not None else None
-    sdt_gt_3d = sdt_target[b, 0].cpu().numpy() if sdt_target is not None else None
+    sdt_pred_3d = _tensor_to_numpy(sdt_pred[b, 0]) if sdt_pred is not None else None
+    sdt_gt_3d = _tensor_to_numpy(sdt_target[b, 0]) if sdt_target is not None else None
     sdt_vmax = 1.0
     if sdt_pred_3d is not None:
         sdt_vmax = max(float(np.abs(sdt_pred_3d).max()), float(np.abs(sdt_gt_3d).max()) if sdt_gt_3d is not None else 0.0, 1e-6)
-    hm_pred_3d = torch.sigmoid(heatmap_pred[b, 0]).cpu().numpy() if heatmap_pred is not None else None
-    hm_gt_3d = heatmap_target[b, 0].cpu().numpy() if heatmap_target is not None else None
+    hm_pred_3d = _tensor_to_numpy(torch.sigmoid(heatmap_pred[b, 0])) if heatmap_pred is not None else None
+    hm_gt_3d = _tensor_to_numpy(heatmap_target[b, 0]) if heatmap_target is not None else None
     has_seg = seg_pred is not None and seg_target is not None
-    seg_pred_3d = seg_pred[b].argmax(dim=0).cpu().numpy() if seg_pred is not None else None
-    seg_gt_3d = seg_target[b, 0].cpu().numpy() if seg_target is not None else None
+    seg_pred_3d = _tensor_to_numpy(seg_pred[b].argmax(dim=0)) if seg_pred is not None else None
+    seg_gt_3d = _tensor_to_numpy(seg_target[b, 0]) if seg_target is not None else None
 
     use_aux = aux_3d is not None
     use_sdt = sdt_pred_3d is not None

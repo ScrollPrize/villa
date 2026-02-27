@@ -300,16 +300,35 @@ def align_triplet_branch_channels_to_priors(
     if not bool(mask.any()):
         return dense_gt_np, dir_priors_np, np.array([0, 1], dtype=np.int64)
 
-    g0 = _estimate_mean_unit_direction_from_field(dense[0:3], mask)
-    g1 = _estimate_mean_unit_direction_from_field(dense[3:6], mask)
-    p0 = _estimate_mean_unit_direction_from_field(priors[0:3], mask)
-    p1 = _estimate_mean_unit_direction_from_field(priors[3:6], mask)
-    if any(v is None for v in (g0, g1, p0, p1)):
+    # Side-based canonicalization:
+    # Use slot-0 prior as oriented +n direction and assign branch channels by
+    # signed projection on conditioning voxels.
+    n = _estimate_mean_unit_direction_from_field(priors[0:3], mask)
+    if n is None:
         return dense_gt_np, dir_priors_np, np.array([0, 1], dtype=np.int64)
 
-    keep_score = float(np.dot(g0, p0) + np.dot(g1, p1))
-    swap_score = float(np.dot(g0, p1) + np.dot(g1, p0))
-    if swap_score > keep_score:
+    def _median_signed_projection(disp_field: np.ndarray) -> float | None:
+        vecs = np.asarray(disp_field, dtype=np.float32)[:, mask].T
+        if vecs.size == 0:
+            return None
+        finite = np.isfinite(vecs).all(axis=1)
+        vecs = vecs[finite]
+        if vecs.shape[0] == 0:
+            return None
+        mags = np.linalg.norm(vecs, axis=1)
+        vecs = vecs[mags > 1e-6]
+        if vecs.shape[0] == 0:
+            return None
+        return float(np.median(vecs @ n))
+
+    s0 = _median_signed_projection(dense[0:3])
+    s1 = _median_signed_projection(dense[3:6])
+    if s0 is None or s1 is None:
+        return dense_gt_np, dir_priors_np, np.array([0, 1], dtype=np.int64)
+
+    # Swap when branch-1 is more +n than branch-0 so slot-0 consistently maps
+    # to the +n side defined by dir_priors[0:3].
+    if s1 > s0:
         dense_swapped = np.concatenate([dense[3:6], dense[0:3]], axis=0).astype(np.float32, copy=False)
         return dense_swapped, dir_priors_np, np.array([1, 0], dtype=np.int64)
     return dense_gt_np, dir_priors_np, np.array([0, 1], dtype=np.int64)

@@ -648,7 +648,8 @@ class EdtSegDataset(Dataset):
         front_np = front_seg.detach().cpu().numpy()
 
         weight_mode = str(self.config["triplet_dense_weight_mode"]).lower()
-        need_neighbor_distances = weight_mode == "band"
+        need_band_mask = weight_mode in {"band", "all_band_boost"}
+        need_neighbor_distances = need_band_mask
         cond_bin_full = cond_np > 0.5
         behind_bin_full = behind_np > 0.5
         front_bin_full = front_np > 0.5
@@ -675,49 +676,51 @@ class EdtSegDataset(Dataset):
             return None
 
         if need_neighbor_distances:
-            triplet_edt_bbox = _compute_triplet_edt_bbox(
-                cond_mask=cond_bin_full,
-                behind_mask=behind_bin_for_gt,
-                front_mask=front_bin_for_gt,
-                padding_voxels=self.triplet_edt_bbox_padding_voxels,
-            )
             behind_disp_work = None
             front_disp_work = None
             d_behind_work = None
             d_front_work = None
-            if triplet_edt_bbox is not None:
-                behind_disp_work, _, d_behind_work = self._compute_dense_displacement_field(
-                    behind_bin_for_gt,
-                    return_weights=False,
-                    return_distances=True,
-                    bbox_slices=triplet_edt_bbox,
+            use_triplet_edt_bbox = weight_mode == "band"
+            if use_triplet_edt_bbox:
+                triplet_edt_bbox = _compute_triplet_edt_bbox(
+                    cond_mask=cond_bin_full,
+                    behind_mask=behind_bin_for_gt,
+                    front_mask=front_bin_for_gt,
+                    padding_voxels=self.triplet_edt_bbox_padding_voxels,
                 )
-                front_disp_work, _, d_front_work = self._compute_dense_displacement_field(
-                    front_bin_for_gt,
-                    return_weights=False,
-                    return_distances=True,
-                    bbox_slices=triplet_edt_bbox,
-                )
-                if (
-                    behind_disp_work is not None and
-                    front_disp_work is not None and
-                    d_behind_work is not None and
-                    d_front_work is not None
-                ):
-                    z_slice, y_slice, x_slice = triplet_edt_bbox
-                    support_mask = (
-                        cond_bin_full[z_slice, y_slice, x_slice] |
-                        behind_bin_for_gt[z_slice, y_slice, x_slice] |
-                        front_bin_for_gt[z_slice, y_slice, x_slice]
+                if triplet_edt_bbox is not None:
+                    behind_disp_work, _, d_behind_work = self._compute_dense_displacement_field(
+                        behind_bin_for_gt,
+                        return_weights=False,
+                        return_distances=True,
+                        bbox_slices=triplet_edt_bbox,
+                    )
+                    front_disp_work, _, d_front_work = self._compute_dense_displacement_field(
+                        front_bin_for_gt,
+                        return_weights=False,
+                        return_distances=True,
+                        bbox_slices=triplet_edt_bbox,
                     )
                     if (
-                        not np.isfinite(d_behind_work[z_slice, y_slice, x_slice][support_mask]).all() or
-                        not np.isfinite(d_front_work[z_slice, y_slice, x_slice][support_mask]).all()
+                        behind_disp_work is not None and
+                        front_disp_work is not None and
+                        d_behind_work is not None and
+                        d_front_work is not None
                     ):
-                        behind_disp_work = None
-                        front_disp_work = None
-                        d_behind_work = None
-                        d_front_work = None
+                        z_slice, y_slice, x_slice = triplet_edt_bbox
+                        support_mask = (
+                            cond_bin_full[z_slice, y_slice, x_slice] |
+                            behind_bin_for_gt[z_slice, y_slice, x_slice] |
+                            front_bin_for_gt[z_slice, y_slice, x_slice]
+                        )
+                        if (
+                            not np.isfinite(d_behind_work[z_slice, y_slice, x_slice][support_mask]).all() or
+                            not np.isfinite(d_front_work[z_slice, y_slice, x_slice][support_mask]).all()
+                        ):
+                            behind_disp_work = None
+                            front_disp_work = None
+                            d_behind_work = None
+                            d_front_work = None
 
             if (
                 behind_disp_work is None or
@@ -775,35 +778,47 @@ class EdtSegDataset(Dataset):
 
         if weight_mode == "all":
             dense_weight_np = np.ones((1, *crop_size), dtype=np.float32)
-        elif weight_mode == "band":
+        elif need_band_mask:
             band_padding = max(0.0, float(self.config["triplet_band_padding_voxels"]))
             band_pct = float(self.config["triplet_band_distance_percentile"])
             band_pct = min(100.0, max(1.0, band_pct))
             if d_behind_work is None or d_front_work is None:
-                self._triplet_resample_tracker.set_last_target_failure_reason(
-                    "triplet band distances unavailable"
+                if weight_mode == "all_band_boost":
+                    dense_weight_np = np.ones((1, *crop_size), dtype=np.float32)
+                else:
+                    self._triplet_resample_tracker.set_last_target_failure_reason(
+                        "triplet band distances unavailable"
+                    )
+                    return None
+            else:
+                dense_band = create_band_mask(
+                    cond_bin_full=cond_bin_full,
+                    d_front_work=d_front_work,
+                    d_behind_work=d_behind_work,
+                    front_disp_work=front_disp_work,
+                    behind_disp_work=behind_disp_work,
+                    band_pct=band_pct,
+                    band_padding=band_padding,
+                    cc_structure_26=self._cc_structure_26,
+                    closing_structure_3=self._closing_structure_3,
                 )
-                return None
-            dense_band = create_band_mask(
-                cond_bin_full=cond_bin_full,
-                d_front_work=d_front_work,
-                d_behind_work=d_behind_work,
-                front_disp_work=front_disp_work,
-                behind_disp_work=behind_disp_work,
-                band_pct=band_pct,
-                band_padding=band_padding,
-                cc_structure_26=self._cc_structure_26,
-                closing_structure_3=self._closing_structure_3,
-            )
-            if dense_band is None:
-                self._triplet_resample_tracker.set_last_target_failure_reason(
-                    "triplet band mask unavailable"
-                )
-                return None
-            dense_weight_np = dense_band[None]
+                if dense_band is None:
+                    if weight_mode == "all_band_boost":
+                        dense_weight_np = np.ones((1, *crop_size), dtype=np.float32)
+                    else:
+                        self._triplet_resample_tracker.set_last_target_failure_reason(
+                            "triplet band mask unavailable"
+                        )
+                        return None
+                elif weight_mode == "all_band_boost":
+                    band_boost_weight = float(self.config.get("triplet_band_boost_weight", 2.0))
+                    dense_weight_np = np.ones((1, *crop_size), dtype=np.float32)
+                    dense_weight_np += (band_boost_weight - 1.0) * dense_band[None]
+                else:
+                    dense_weight_np = dense_band[None]
         else:
             raise ValueError(
-                "triplet_dense_weight_mode must be one of {'all', 'band'}, "
+                "triplet_dense_weight_mode must be one of {'all', 'band', 'all_band_boost'}, "
                 f"got {weight_mode!r}"
             )
         if float(dense_weight_np.sum()) <= 0:

@@ -31,6 +31,7 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("triplet_band_padding_voxels", 4.0)
     config.setdefault("triplet_edt_bbox_padding_voxels", 4.0)
     config.setdefault("triplet_band_distance_percentile", 95.0)
+    config.setdefault("triplet_band_boost_weight", 2.0)
     config.setdefault("triplet_gt_vector_dilation_radius", 0.0)
     config.setdefault("use_triplet_direction_priors", True)
     config.setdefault("triplet_direction_prior_mask", "cond")
@@ -121,6 +122,12 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
 
     triplet_overlap_filter_mode = str(config.get("triplet_overlap_filter_mode", "bbox")).lower()
     _require_choice("triplet_overlap_filter_mode", triplet_overlap_filter_mode, {"bbox", "any_masked_pixel"})
+
+    triplet_dense_weight_mode = str(config.get("triplet_dense_weight_mode", "band")).lower()
+    _require_choice("triplet_dense_weight_mode", triplet_dense_weight_mode, {"all", "band", "all_band_boost"})
+
+    triplet_band_boost_weight = float(config.get("triplet_band_boost_weight", 2.0))
+    _require_finite_range("triplet_band_boost_weight", triplet_band_boost_weight, min_value=1.0)
 
     triplet_close_distance_voxels = float(config.get("triplet_close_distance_voxels", 1.0))
     _require_finite_range("triplet_close_distance_voxels", triplet_close_distance_voxels, min_value=0.0)
