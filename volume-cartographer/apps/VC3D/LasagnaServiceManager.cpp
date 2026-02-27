@@ -474,14 +474,18 @@ void LasagnaServiceManager::handleStatusReply(QNetworkReply* reply)
     int step = obj["step"].toInt();
     int totalSteps = obj["total_steps"].toInt();
     double loss = obj["loss"].toDouble();
+    double stageProgress = obj["stage_progress"].toDouble();
+    double overallProgress = obj["overall_progress"].toDouble();
+    QString stageName = obj["stage_name"].toString();
 
     if (state == "running") {
-        emit optimizationProgress(stage, step, totalSteps, loss);
+        emit optimizationProgress(stage, step, totalSteps, loss,
+                                  stageProgress, overallProgress, stageName);
     } else if (state == "finished") {
         _optimizationRunning = false;
         _pollTimer->stop();
-        if (_isExternal && !_localOutputDir.isEmpty()) {
-            // External mode: download results archive and unpack locally
+        if (!_localOutputDir.isEmpty()) {
+            // Download results archive and unpack locally
             downloadResults();
         } else {
             QString outputDir = obj["output_dir"].toString();
@@ -500,7 +504,7 @@ void LasagnaServiceManager::handleStatusReply(QNetworkReply* reply)
 }
 
 // ---------------------------------------------------------------------------
-// Results download (external mode)
+// Results download
 // ---------------------------------------------------------------------------
 
 void LasagnaServiceManager::downloadResults()

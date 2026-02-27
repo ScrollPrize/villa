@@ -327,6 +327,8 @@ def save_corr_points(
 	postfix: str,
 	out_dir: str,
 	scale: int,
+	z0_fullres: int = 0,
+	z_step_fullres: int = 1,
 ) -> None:
 	with torch.no_grad():
 		if int(points_xyz_winda.shape[0]) <= 0:
@@ -447,7 +449,8 @@ def save_corr_points(
 						lineType=cv2.LINE_8,
 					)
 
-			out_path = out_corr / f"corr_grid_{str(postfix)}_z{int(z):04d}.jpg"
+			z_fr = int(z0_fullres) + int(z) * int(z_step_fullres)
+			out_path = out_corr / f"corr_grid_{str(postfix)}_z{int(z):04d}_fr{z_fr:06d}.jpg"
 			cv2.imwrite(str(out_path), np.flip(bg, -1))
 
 

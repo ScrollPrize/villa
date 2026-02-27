@@ -1,21 +1,22 @@
 {
 	"base": {
-		"dir_v": 10.0,
-		"dir_conn": 1.0,
-		"step": 100.0,
+		"dir_v": 100.0,
+		"dir_conn": 0.0,
+		"step": 1.0,
 		"smooth_x": 0.0,
-		"smooth_y": 0.01,
-		"gradmag": 1.0,
+		"smooth_y": 0.0,
+		"gradmag": 10.0,
 		"mean_pos": 0.0,
-		"meshoff_sy": 0.001,
+		"meshoff_sy": 0.0,
 		"conn_sy_l": 0.0,
 		"conn_sy_r": 0.0,
-		"angle": 0.001,
+		"angle": 0.0,
 		"y_straight": 0.0,
 		"data": 4.0,
 		"data_plain": 2.0,
 		"data_grad": 0.0,
 		"z_straight": 10.0,
+		"z_normal": 10.0,
 		"corr_winding": 10.0
 	},
 	"stages": [
@@ -23,12 +24,11 @@
 			"name": "corr",
 			"steps": 1000,
 			"lr": [0.1, 0.01, 0.001],
-			"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
+			"params": ["mesh_ms", "conn_offset_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
 				"data": 0.0,
-				"data_plain": 0.0,
-				"z_straight": 0.001
+				"data_plain": 0.0
 			}
 		},
 		{
@@ -37,17 +37,16 @@
 				"label": "dilation",
 				"type": "constant_velocity_dilation",
 				"losses": ["data", "data_plain", "data_grad"],
-				"mvx_per_it": 0.1,
+				"mvx_per_it": 0.05,
 				"blur_sigma": 2.0
 			}],
 			"global_opt": {
 				"termination": "mask",
 				"steps": 0,
 				"lr": [0.1, 0.01, 0.001],
-				"params": ["mesh_ms", "conn_offset_ms"],
+				"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
 				"min_scaledown": 0,
 				"w_fac": {
-					"z_straight": 0.001
 				}
 			}
 		}

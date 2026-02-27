@@ -53,7 +53,7 @@ public:
     /**
      * Submit an optimization job.
      * @param config  JSON body for POST /optimize.
-     * @param localOutputDir  Where to unpack results (external mode only).
+     * @param localOutputDir  Where to unpack results after completion.
      */
     void startOptimization(const QJsonObject& config,
                            const QString& localOutputDir = QString());
@@ -77,7 +77,9 @@ signals:
     void statusMessage(const QString& message);
 
     void optimizationStarted();
-    void optimizationProgress(const QString& stage, int step, int totalSteps, double loss);
+    void optimizationProgress(const QString& stage, int step, int totalSteps, double loss,
+                              double stageProgress, double overallProgress,
+                              const QString& stageName);
     void optimizationFinished(const QString& outputDir);
     void optimizationError(const QString& message);
 
@@ -104,7 +106,7 @@ private:
     void handleStatusReply(QNetworkReply* reply);
     void handleOptimizeReply(QNetworkReply* reply);
 
-    /** Download results archive from external service and unpack. */
+    /** Download results archive from service and unpack locally. */
     void downloadResults();
 
     std::unique_ptr<QProcess> _process;
@@ -117,5 +119,5 @@ private:
     QString _lastError;
     bool _serviceReady{false};
     bool _optimizationRunning{false};
-    QString _localOutputDir;  // where to unpack results (external mode)
+    QString _localOutputDir;  // where to unpack results
 };

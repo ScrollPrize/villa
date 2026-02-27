@@ -89,6 +89,7 @@
 #include "CommandLineToolRunner.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 #include "segmentation/SegmentationModule.hpp"
+#include "segmentation/panels/SegmentationLasagnaPanel.hpp"
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "segmentation/growth/SegmentationGrower.hpp"
 #include "SurfacePanelController.hpp"
@@ -703,6 +704,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
             "QMenuBar::item:selected { background: rgb(235, 180, 30); }"
             "QWidget#dockWidgetVolumesContent { background: rgb(55, 55, 55); }"
             "QWidget#dockWidgetSegmentationContent { background: rgb(55, 55, 55); }"
+            "QWidget#dockWidgetLasagnaContent { background: rgb(55, 55, 55); }"
             "QWidget#dockWidgetAnnotationsContent { background: rgb(55, 55, 55); }"
             "QDockWidget::title { padding-top: 6px; background: rgb(60, 60, 75); }"
             "QTabBar::tab { background: rgb(60, 60, 75); }"
@@ -714,6 +716,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
             "QMenuBar::item:selected { background: rgb(255, 200, 50); }"
             "QWidget#dockWidgetVolumesContent { background: rgb(245, 245, 255); }"
             "QWidget#dockWidgetSegmentationContent { background: rgb(245, 245, 255); }"
+            "QWidget#dockWidgetLasagnaContent { background: rgb(245, 245, 255); }"
             "QWidget#dockWidgetAnnotationsContent { background: rgb(245, 245, 255); }"
             "QDockWidget::title { padding-top: 6px; background: rgb(205, 210, 240); }"
             "QTabBar::tab { background: rgb(205, 210, 240); }"
@@ -1670,6 +1673,17 @@ void CWindow::CreateWidgets(void)
     _segmentationWidget->setNormalGridPathHint(initialHint);
     attachScrollAreaToDock(ui.dockWidgetSegmentation, _segmentationWidget, QStringLiteral("dockWidgetSegmentationContent"));
 
+    // Create Lasagna dock (separate tab from Segmentation)
+    _lasagnaDock = new QDockWidget(tr("Lasagna"), this);
+    _lasagnaDock->setMinimumSize(QSize(150, 0));
+    _lasagnaDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+    addDockWidget(Qt::RightDockWidgetArea, _lasagnaDock);
+    attachScrollAreaToDock(_lasagnaDock, _segmentationWidget->lasagnaPanel(),
+                           QStringLiteral("dockWidgetLasagnaContent"));
+    ensureDockWidgetFeatures(_lasagnaDock);
+    connect(_lasagnaDock, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_lasagnaDock, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
     _segmentationEdit->setViewerManager(_viewerManager.get());
     _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_surf_col, this);
@@ -1772,6 +1786,15 @@ void CWindow::CreateWidgets(void)
     });
 
     // -- Lasagna connections --
+    connect(_segmentationWidget, &SegmentationWidget::seedFromFocusRequested, this, [this]() {
+        POI* focus = _surf_col ? _surf_col->poi("focus") : nullptr;
+        if (focus)
+            _segmentationWidget->setSeedFromFocus(
+                static_cast<int>(focus->p[0]),
+                static_cast<int>(focus->p[1]),
+                static_cast<int>(focus->p[2]));
+    });
+
     connect(_segmentationWidget, &SegmentationWidget::lasagnaOptimizeRequested, this, [this]() {
         auto& mgr = LasagnaServiceManager::instance();
         const bool isNewModel = (_segmentationWidget->lasagnaMode() == 1);
@@ -1830,19 +1853,31 @@ void CWindow::CreateWidgets(void)
             return;
         }
 
-        // Output dir: use the segment's parent directory (paths dir)
+        // Output dir: for re-optimize use the segment's parent directory;
+        // for new model use the volpkg's segmentation directory
         QString outputDir;
         if (!segPath.empty()) {
             outputDir = QString::fromStdString(segPath.parent_path().string());
+        } else if (fVpkg) {
+            auto vpkgRoot = std::filesystem::path(fVpkg->getVolpkgDirectory());
+            auto segDir = vpkgRoot / fVpkg->getSegmentationDirectory();
+            outputDir = QString::fromStdString(segDir.string());
         }
 
         // --- Compute next version name ---
         QString outputName;
         {
-            std::string rootName = "new_model";  // Default for new model without segment
+            std::string rootName = "new_model";  // Default fallback
             const std::string tifxyzSuffix = ".tifxyz";
 
-            if (!segPath.empty()) {
+            if (isNewModel) {
+                // New model: use the output name field, fall back to "new_model"
+                QString nmName = _segmentationWidget->newModelOutputName();
+                if (!nmName.isEmpty()) {
+                    rootName = nmName.toStdString();
+                }
+            } else if (!segPath.empty()) {
+                // Re-optimize: derive from existing segment name
                 auto segName = segPath.filename().string();
                 std::string baseName = segName;
                 if (baseName.size() > tifxyzSuffix.size() &&
@@ -1913,17 +1948,32 @@ void CWindow::CreateWidgets(void)
             int nmH = _segmentationWidget->newModelHeight();
             int nmD = _segmentationWidget->newModelDepth();
 
-            // Get focus/cursor position for centering the bbox
-            POI* focus = _surf_col ? _surf_col->poi("focus") : nullptr;
-            if (!focus) {
-                auto msg = tr("No focus position set. Place the cursor first.");
-                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-                statusBar()->showMessage(msg, 5000);
-                return;
+            // Get bbox center: use seed point if specified, otherwise focus
+            int cx, cy, cz;
+            QString seedText = _segmentationWidget->seedPointText();
+            bool seedOk = false;
+            if (!seedText.isEmpty()) {
+                QStringList parts = seedText.split(',');
+                if (parts.size() == 3) {
+                    bool ok0, ok1, ok2;
+                    cx = parts[0].trimmed().toInt(&ok0);
+                    cy = parts[1].trimmed().toInt(&ok1);
+                    cz = parts[2].trimmed().toInt(&ok2);
+                    seedOk = ok0 && ok1 && ok2;
+                }
             }
-            int cx = static_cast<int>(focus->p[0]);
-            int cy = static_cast<int>(focus->p[1]);
-            int cz = static_cast<int>(focus->p[2]);
+            if (!seedOk) {
+                POI* focus = _surf_col ? _surf_col->poi("focus") : nullptr;
+                if (!focus) {
+                    auto msg = tr("No focus position or seed point set. Place the cursor or enter a seed.");
+                    std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                    statusBar()->showMessage(msg, 5000);
+                    return;
+                }
+                cx = static_cast<int>(focus->p[0]);
+                cy = static_cast<int>(focus->p[1]);
+                cz = static_cast<int>(focus->p[2]);
+            }
 
             // Build/override the "args" section with --bbox CX CY CZ W H
             // and --z-size for the full 3D extent (no grow stages needed)
@@ -1937,6 +1987,26 @@ void CWindow::CreateWidgets(void)
                       << "x" << nmD << ")" << std::endl;
         }
 
+        // Inject loaded point collections as corr_points
+        if (_point_collection) {
+            const auto& cols = _point_collection->getAllCollections();
+            if (!cols.empty()) {
+                nlohmann::json corr_json;
+                nlohmann::json cols_json = nlohmann::json::object();
+                for (const auto& [cid, col] : cols) {
+                    cols_json[std::to_string(cid)] = col;
+                }
+                corr_json["collections"] = cols_json;
+                QJsonDocument corrDoc = QJsonDocument::fromJson(
+                    QByteArray::fromStdString(corr_json.dump()));
+                if (corrDoc.isObject()) {
+                    config[QStringLiteral("corr_points")] = corrDoc.object();
+                    std::cerr << "[lasagna] injected " << cols.size()
+                              << " point collection(s) as corr_points" << std::endl;
+                }
+            }
+        }
+
         // Build optimization request
         QJsonObject request;
         request[QStringLiteral("data_input")] = dataInput;
@@ -1947,13 +2017,8 @@ void CWindow::CreateWidgets(void)
         }
         request[QStringLiteral("config")] = config;
 
-        if (isNewModel) {
-            // New model: no model_input/model_data needed
-            if (!mgr.isExternal()) {
-                request[QStringLiteral("output_dir")] = outputDir;
-            }
-        } else if (mgr.isExternal()) {
-            // Re-optimize external: send model.pt as base64 data
+        if (!isNewModel) {
+            // Re-optimize / Expand: send model.pt as base64 data
             QFile modelFile(modelPath);
             if (!modelFile.open(QIODevice::ReadOnly)) {
                 auto msg = tr("Cannot read model file: %1").arg(modelPath);
@@ -1965,13 +2030,9 @@ void CWindow::CreateWidgets(void)
             modelFile.close();
             request[QStringLiteral("model_data")] =
                 QString::fromLatin1(modelBytes.toBase64());
-        } else {
-            // Re-optimize internal: send local paths directly
-            request[QStringLiteral("model_input")] = modelPath;
-            request[QStringLiteral("output_dir")] = outputDir;
         }
 
-        mgr.startOptimization(request, mgr.isExternal() ? outputDir : QString());
+        mgr.startOptimization(request, outputDir);
         statusBar()->showMessage(
             tr("Lasagna optimization started (%1). Output: %2")
                 .arg(isNewModel ? tr("new model") : tr("re-optimize"))
@@ -1990,6 +2051,13 @@ void CWindow::CreateWidgets(void)
             tr("Lasagna optimization finished. Reloading segments from %1").arg(outputDir), 5000);
         if (_surfacePanel) {
             _surfacePanel->loadSurfacesIncremental();
+        }
+        // Reload corr_points_results for the active surface
+        if (_point_collection_widget) {
+            auto surf = _surf_weak.lock();
+            if (surf && !surf->path.empty()) {
+                _point_collection_widget->loadCorrPointsResults(surf->path / "corr_points_results.json");
+            }
         }
     });
 
@@ -2028,8 +2096,10 @@ void CWindow::CreateWidgets(void)
     }
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
+    connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
 
-    // Tab the docks - keep Segmentation, Seeding, Point Collections, and Drawing together
+    // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Drawing together
+    tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);
@@ -3606,6 +3676,13 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         if (_segmentationModule) {
             _segmentationModule->onActiveSegmentChanged(surf.get());
         }
+
+        // Load corr_points_results for the new segment
+        if (_point_collection_widget && surf && !surf->path.empty()) {
+            _point_collection_widget->loadCorrPointsResults(surf->path / "corr_points_results.json");
+        } else if (_point_collection_widget) {
+            _point_collection_widget->clearCorrPointsResults();
+        }
     }
 
     if (surf) {
@@ -3634,6 +3711,13 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
 
     if (_surfID != previousSurfId && _segmentationModule) {
         _segmentationModule->onActiveSegmentChanged(surf.get());
+
+        // Load corr_points_results for the new segment
+        if (_point_collection_widget && surf && !surf->path.empty()) {
+            _point_collection_widget->loadCorrPointsResults(surf->path / "corr_points_results.json");
+        } else if (_point_collection_widget) {
+            _point_collection_widget->clearCorrPointsResults();
+        }
 
         const bool wantsEditing = _segmentationWidget && _segmentationWidget->isEditingEnabled();
         if (wantsEditing) {
@@ -4044,6 +4128,153 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
     _point_collection->removePoint(pointId);
 
     statusBar()->showMessage(tr("Converted point to anchor at grid position (%1, %2)").arg(anchor2d[0]).arg(anchor2d[1]), 3000);
+}
+
+void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
+{
+    if (!_surf_col || !_point_collection) return;
+
+    const auto& collections = _point_collection->getAllCollections();
+    auto it = collections.find(collectionId);
+    if (it == collections.end()) return;
+
+    const auto& collection = it->second;
+    if (collection.points.empty()) return;
+
+    // Gather all 3D points
+    std::vector<cv::Vec3f> pts;
+    pts.reserve(collection.points.size());
+    for (const auto& pair : collection.points) {
+        pts.push_back(pair.second.p);
+    }
+
+    // Compute centroid
+    cv::Vec3f centroid(0, 0, 0);
+    for (const auto& p : pts) centroid += p;
+    centroid *= 1.0f / pts.size();
+
+    // Determine focus position
+    cv::Vec3f focusPos = centroid;
+    if (pointId != 0) {
+        auto point_opt = _point_collection->getPoint(pointId);
+        if (point_opt) focusPos = point_opt->p;
+    }
+
+    // Compute plane normal via PCA (only if >= 3 points)
+    cv::Vec3f N(0, 0, 1); // default
+    if (pts.size() >= 3) {
+        // Build 3x3 covariance matrix from centered points
+        cv::Matx33f cov = cv::Matx33f::zeros();
+        for (const auto& p : pts) {
+            cv::Vec3f d = p - centroid;
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 3; c++)
+                    cov(r, c) += d[r] * d[c];
+        }
+        cv::Mat eigenvalues, eigenvectors;
+        cv::eigen(cv::Mat(cov), eigenvalues, eigenvectors);
+        // Eigenvectors are sorted descending by eigenvalue.
+        // Smallest eigenvalue's eigenvector (row 2) = plane normal.
+        N = cv::Vec3f(eigenvectors.at<float>(2, 0),
+                      eigenvectors.at<float>(2, 1),
+                      eigenvectors.at<float>(2, 2));
+        N = normalizeOrZero(N);
+        if (cv::norm(N) < kEpsilon) N = cv::Vec3f(0, 0, 1);
+    } else if (pts.size() == 2) {
+        cv::Vec3f d = normalizeOrZero(pts[1] - pts[0]);
+        if (cv::norm(d) > kEpsilon) {
+            // Pick N perpendicular to d and closest to a canonical axis
+            cv::Vec3f candidates[3] = {{1,0,0}, {0,1,0}, {0,0,1}};
+            float bestDot = 1.0f;
+            cv::Vec3f bestN(0, 0, 1);
+            for (auto& axis : candidates) {
+                float absDot = std::abs(d.dot(axis));
+                if (absDot < bestDot) {
+                    bestDot = absDot;
+                    cv::Vec3f proj = normalizeOrZero(axis - d * d.dot(axis));
+                    if (cv::norm(proj) > kEpsilon) bestN = proj;
+                }
+            }
+            N = bestN;
+        }
+    } else {
+        // 1 point: just center, don't change orientation
+        centerFocusAt(focusPos, cv::Vec3f(0, 0, 1), "", true);
+        return;
+    }
+
+    // Choose which viewer gets the primary plane
+    const cv::Vec3f segYZCanonical(1, 0, 0);
+    const cv::Vec3f segXZCanonical(0, 1, 0);
+
+    std::string primaryName, secondaryName;
+    cv::Vec3f secondaryCanonical;
+
+    if (std::abs(N.dot(segYZCanonical)) >= std::abs(N.dot(segXZCanonical))) {
+        primaryName = "seg yz";
+        secondaryName = "seg xz";
+        secondaryCanonical = segXZCanonical;
+    } else {
+        primaryName = "seg xz";
+        secondaryName = "seg yz";
+        secondaryCanonical = segYZCanonical;
+    }
+
+    // Helper to configure a plane with Z-up in-plane rotation
+    const auto configureFocusPlane = [&](const std::string& planeName,
+                                         const cv::Vec3f& normal) {
+        auto planeShared = std::dynamic_pointer_cast<PlaneSurface>(_surf_col->surface(planeName));
+        if (!planeShared) {
+            planeShared = std::make_shared<PlaneSurface>();
+        }
+        planeShared->setOrigin(focusPos);
+        planeShared->setNormal(normal);
+        planeShared->setInPlaneRotation(0.0f);
+
+        // Adjust in-plane rotation so Z projects "up"
+        const cv::Vec3f upAxis(0.0f, 0.0f, 1.0f);
+        const cv::Vec3f projectedUp = projectVectorOntoPlane(upAxis, normal);
+        const cv::Vec3f desiredUp = normalizeOrZero(projectedUp);
+        if (cv::norm(desiredUp) > kEpsilon) {
+            const cv::Vec3f currentUp = planeShared->basisY();
+            const float delta = signedAngleBetween(currentUp, desiredUp, normal);
+            if (std::abs(delta) > kEpsilon) {
+                planeShared->setInPlaneRotation(delta);
+            }
+        }
+
+        _surf_col->setSurface(planeName, planeShared);
+    };
+
+    // Set focus POI first — this triggers applySlicePlaneOrientation() which
+    // overwrites slice planes. We set our custom planes after.
+    POI* focus = _surf_col->poi("focus");
+    if (!focus) {
+        focus = new POI;
+    }
+    focus->p = focusPos;
+    focus->n = N;
+    _surf_col->setPOI("focus", focus);
+
+    // Now set our PCA-derived planes (overriding what applySlicePlaneOrientation set)
+    configureFocusPlane(primaryName, N);
+
+    // Set secondary plane: component of other canonical axis orthogonal to N
+    cv::Vec3f secNormal = normalizeOrZero(secondaryCanonical - N * N.dot(secondaryCanonical));
+    if (cv::norm(secNormal) < kEpsilon) {
+        // Fallback: use cross product
+        secNormal = normalizeOrZero(crossProduct(N, cv::Vec3f(0, 0, 1)));
+        if (cv::norm(secNormal) < kEpsilon) {
+            secNormal = normalizeOrZero(crossProduct(N, cv::Vec3f(0, 1, 0)));
+        }
+    }
+    configureFocusPlane(secondaryName, secNormal);
+
+    if (_planeSlicingOverlay) {
+        _planeSlicingOverlay->refreshAll();
+    }
+
+    statusBar()->showMessage(tr("Focused && aligned view to %1 points").arg(pts.size()), 3000);
 }
 
 void CWindow::onZoomOut()

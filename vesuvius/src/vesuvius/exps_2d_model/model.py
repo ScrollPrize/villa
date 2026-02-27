@@ -33,6 +33,12 @@ class ModelParams:
 	scaledown: float
 	# 3D crop in full-res voxel/pixel space: (x, y, w, h, z0, d).
 	crop_fullres_xyzwhd: tuple[int, int, int, int, int, int] | None = None
+	# Margin (in model pixels) from expanded data origin to original crop origin.
+	# Used by _build_base_grid to center mesh on the original crop within expanded data.
+	data_margin_modelpx: tuple[float, float] = (0.0, 0.0)
+	# Data size in model pixels (h, w). Used for validity masking and mask scheduling
+	# when data has expanded margins. (0,0) = not set, fall back to crop dims.
+	data_size_modelpx: tuple[int, int] = (0, 0)
 
 	@property
 	def crop_xyzwhd(self) -> tuple[int, int, int, int, int, int] | None:
@@ -59,14 +65,22 @@ def xy_img_validity_mask(*, params: ModelParams, xy: torch.Tensor) -> torch.Tens
 
 	`xy` must encode (x,y) in the last dimension (..,2) in model pixel coords.
 	Output has shape `xy.shape[:-1]`.
+
+	When data_size_modelpx is set (expanded data with margins), uses data extent
+	as the valid region. Otherwise falls back to crop bounds.
 	"""
 	if xy.ndim < 1 or int(xy.shape[-1]) != 2:
 		raise ValueError("xy must have last dim == 2")
-	if params.crop_xyzwhd is None:
-		raise ValueError("xy_img_validity_mask requires params.crop_xyzwhd")
-	_cx, _cy, cw, ch, _z0, _d = params.crop_xyzwhd
-	h = float(max(1, int(ch) - 1))
-	w = float(max(1, int(cw) - 1))
+	dh, dw = params.data_size_modelpx
+	if dh > 0 and dw > 0:
+		h = float(max(1, int(dh) - 1))
+		w = float(max(1, int(dw) - 1))
+	else:
+		if params.crop_xyzwhd is None:
+			raise ValueError("xy_img_validity_mask requires params.crop_xyzwhd or data_size_modelpx")
+		_cx, _cy, cw, ch, _z0, _d = params.crop_xyzwhd
+		h = float(max(1, int(ch) - 1))
+		w = float(max(1, int(cw) - 1))
 	flat = xy.reshape(-1, 2)
 	x = flat[:, 0]
 	y = flat[:, 1]
@@ -243,6 +257,8 @@ class Model2D(nn.Module):
 		z_step_vx: int,
 		scaledown: float,
 		crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
+		data_margin_modelpx: tuple[float, float] | None = None,
+		data_size_modelpx: tuple[int, int] | None = None,
 	) -> None:
 		super().__init__()
 		self.init = init
@@ -260,6 +276,8 @@ class Model2D(nn.Module):
 			z_step_vx=max(1, int(z_step_vx)),
 			scaledown=float(scaledown),
 			crop_fullres_xyzwhd=None if crop_xyzwhd is None else tuple(int(v) for v in crop_xyzwhd),
+			data_margin_modelpx=tuple(float(v) for v in data_margin_modelpx) if data_margin_modelpx is not None else (0.0, 0.0),
+			data_size_modelpx=tuple(int(v) for v in data_size_modelpx) if data_size_modelpx is not None else (0, 0),
 		)
 
 		self.mesh_h = max(2, int(init.mesh_h))
@@ -340,16 +358,35 @@ class Model2D(nn.Module):
 		bias_hr = F.interpolate(bias_lr, size=(h, w), mode="bilinear", align_corners=True)
 		target_mod = bias_hr + amp_hr * (target_plain - 0.5)
 		target_mod = target_mod.clamp(0.0, 1.0)
-		mask_hr = self.xy_img_validity_mask(xy=xy_hr).unsqueeze(1)
-		mask_lr = self.xy_img_validity_mask(xy=xy_lr).unsqueeze(1)
-		mask_conn = self.xy_img_validity_mask(xy=xy_conn).unsqueeze(1)
+		# Masking: when valid channel is available (preprocessed zarr with expanded data),
+		# use it directly — model pixel coords = data pixel coords, no offset.
+		# Otherwise fall back to crop-bounds validity mask.
+		if data.valid is not None:
+			def _sample_valid(xy: torch.Tensor) -> torch.Tensor:
+				h_data, w_data = data.size
+				hd = float(max(1, int(h_data) - 1))
+				wd = float(max(1, int(w_data) - 1))
+				grid = xy.clone()
+				grid[..., 0] = (xy[..., 0] / wd) * 2.0 - 1.0
+				grid[..., 1] = (xy[..., 1] / hd) * 2.0 - 1.0
+				sv = F.grid_sample(data.valid, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+				return (sv > 0.5).to(dtype=torch.float32)
+			mask_hr = _sample_valid(xy_hr)
+			mask_lr = _sample_valid(xy_lr)
+			# xy_conn has extra dim: (N, Hm, Wm, 3, 2) — sample each of the 3 conn points
+			n, hm, wm, _3, _2 = (int(v) for v in xy_conn.shape)
+			conn_flat = xy_conn.reshape(n, hm, wm * 3, 2)
+			valid_conn = _sample_valid(conn_flat).reshape(n, 1, hm, wm, 3)
+			mask_conn = valid_conn
+		else:
+			mask_hr = self.xy_img_validity_mask(xy=xy_hr).unsqueeze(1)
+			mask_lr = self.xy_img_validity_mask(xy=xy_lr).unsqueeze(1)
+			mask_conn = self.xy_img_validity_mask(xy=xy_conn).unsqueeze(1)
 		# Edge conn points are synthetic (copied from the nearest column) and should not be used.
 		if mask_conn.shape[3] >= 1:
 			mask_conn[:, :, :, 0, 0] = 0.0
 			mask_conn[:, :, :, -1, 2] = 0.0
-		if self.params.crop_xyzwhd is None:
-			raise ValueError("model.params.crop_xyzwhd must be set")
-		_cx, _cy, cw, ch, _z0, _d = self.params.crop_xyzwhd
+		h_data, w_data = data.size
 		return FitResult(
 			_xy_lr=xy_lr,
 			_xy_hr=xy_hr,
@@ -363,8 +400,8 @@ class Model2D(nn.Module):
 			_mask_hr=mask_hr,
 			_mask_lr=mask_lr,
 			_mask_conn=mask_conn,
-			_h_img=int(ch),
-			_w_img=int(cw),
+			_h_img=int(h_data),
+			_w_img=int(w_data),
 			_params=self.params,
 		)
 
@@ -444,14 +481,16 @@ class Model2D(nn.Module):
 		bad = dirs - {"left", "right", "up", "down", "fw", "bw"}
 		if bad:
 			raise ValueError(f"invalid grow direction(s): {sorted(bad)}")
-		if ("fw" in dirs or "bw" in dirs) and (dirs - {"fw", "bw"}):
-			raise ValueError("grow: fw/bw may only be used alone")
-		if "fw" in dirs and "bw" in dirs:
-			raise ValueError("grow: cannot combine fw and bw")
-
 		self._last_grow_insert_z = None
-		if "fw" in dirs or "bw" in dirs:
-			side = +1 if "fw" in dirs else -1
+		self._last_grow_insert_z_list = []
+		self._last_grow_insert_lr = None
+		self.const_mask_lr = None
+
+		# -- Z directions (fw/bw) — one step each --
+		for z_dir in ("bw", "fw"):
+			if z_dir not in dirs:
+				continue
+			side = +1 if z_dir == "fw" else -1
 			z0 = int(self.z_size)
 			self.mesh_ms = nn.ParameterList(
 				[nn.Parameter(self._expand_copy_edge(src=p, dim=0, side=side)) for p in list(self.mesh_ms)]
@@ -462,52 +501,53 @@ class Model2D(nn.Module):
 			self.amp = nn.Parameter(self._expand_copy_edge(src=self.amp, dim=0, side=side))
 			self.bias = nn.Parameter(self._expand_copy_edge(src=self.bias, dim=0, side=side))
 			self.z_size = int(self.z_size) + 1
-			self._last_grow_insert_z = z0 if side > 0 else 0
-			self._last_grow_insert_lr = None
-			self.const_mask_lr = None
-			return
+			ins = z0 if side > 0 else 0
+			self._last_grow_insert_z = ins
+			self._last_grow_insert_z_list.append(ins)
 
-		h0 = int(self.mesh_h)
-		w0 = int(self.mesh_w)
-		py0 = 0
-		px0 = 0
-		ho = h0
-		wo = w0
-		order = ["up", "down", "left", "right"]
-		dirs_list = [d for d in order if d in dirs]
-		grow_specs: dict[str, tuple[int, int, int, int, int, int]] = {
-			# (dim, side, d_mesh_h, d_mesh_w, d_py0, d_px0)
-			"up": (2, -1, +1, 0, +1, 0),
-			"down": (2, +1, +1, 0, 0, 0),
-			"left": (3, -1, 0, +1, 0, +1),
-			"right": (3, +1, 0, +1, 0, 0),
-		}
-		for _ in range(int(steps)):
-			for d in dirs_list:
-				dim, side, dh, dw, dpy, dpx = grow_specs[d]
-				self.mesh_ms = self._grow_param_pyramid_flat_edit(
-					src=self.mesh_ms,
-					dim=dim,
-					side=side,
-					editor=self._expand_linear,
-				)
-				self.conn_offset_ms = self._grow_param_pyramid_flat_edit(
-					src=self.conn_offset_ms,
-					dim=dim,
-					side=side,
-					editor=self._expand_copy_edge,
-				)
-				amp2 = self._expand_copy_edge(src=self.amp, dim=dim, side=side)
-				bias2 = self._expand_copy_edge(src=self.bias, dim=dim, side=side)
-				self.amp = nn.Parameter(amp2)
-				self.bias = nn.Parameter(bias2)
-				self.mesh_h = int(self.mesh_h) + dh
-				self.mesh_w = int(self.mesh_w) + dw
-				py0 += dpy
-				px0 += dpx
+		# -- XY directions --
+		xy_dirs = dirs - {"fw", "bw"}
+		if xy_dirs:
+			h0 = int(self.mesh_h)
+			w0 = int(self.mesh_w)
+			py0 = 0
+			px0 = 0
+			ho = h0
+			wo = w0
+			order = ["up", "down", "left", "right"]
+			dirs_list = [d for d in order if d in xy_dirs]
+			grow_specs: dict[str, tuple[int, int, int, int, int, int]] = {
+				# (dim, side, d_mesh_h, d_mesh_w, d_py0, d_px0)
+				"up": (2, -1, +1, 0, +1, 0),
+				"down": (2, +1, +1, 0, 0, 0),
+				"left": (3, -1, 0, +1, 0, +1),
+				"right": (3, +1, 0, +1, 0, 0),
+			}
+			for _ in range(int(steps)):
+				for d in dirs_list:
+					dim, side, dh, dw, dpy, dpx = grow_specs[d]
+					self.mesh_ms = self._grow_param_pyramid_flat_edit(
+						src=self.mesh_ms,
+						dim=dim,
+						side=side,
+						editor=self._expand_linear,
+					)
+					self.conn_offset_ms = self._grow_param_pyramid_flat_edit(
+						src=self.conn_offset_ms,
+						dim=dim,
+						side=side,
+						editor=self._expand_copy_edge,
+					)
+					amp2 = self._expand_copy_edge(src=self.amp, dim=dim, side=side)
+					bias2 = self._expand_copy_edge(src=self.bias, dim=dim, side=side)
+					self.amp = nn.Parameter(amp2)
+					self.bias = nn.Parameter(bias2)
+					self.mesh_h = int(self.mesh_h) + dh
+					self.mesh_w = int(self.mesh_w) + dw
+					py0 += dpy
+					px0 += dpx
 
-		self._last_grow_insert_lr = (int(py0), int(px0), int(ho), int(wo))
-		self.const_mask_lr = None
+			self._last_grow_insert_lr = (int(py0), int(px0), int(ho), int(wo))
 
 	@staticmethod
 	def _expand_linear(*, src: torch.Tensor, dim: int, side: int) -> torch.Tensor:
@@ -633,9 +673,13 @@ class Model2D(nn.Module):
 		"""Return per-mesh connection positions in pixel coordinates.
 
 		For each base-mesh point, returns 3 pixel positions:
-		- left-connection interpolation result (to previous column)
+		- left-connection orthogonal intersection (to previous column)
 		- the point itself
-		- right-connection interpolation result (to next column)
+		- right-connection orthogonal intersection (to next column)
+
+		Connection vectors are orthogonal to the v-direction by construction.
+		Connection points are line-segment intersections of the orthogonal ray
+		with the segment in the neighbor column selected by conn_offset.
 
 		Shape: (N,Hm,Wm,3,2)
 		"""
@@ -647,15 +691,78 @@ class Model2D(nn.Module):
 		mesh_off = self.conn_offset_coarse()
 		if mesh_off.shape[-2:] != (hm, wm):
 			raise RuntimeError("mesh_offset must be defined on the base mesh")
-		xy_px = xy_lr.permute(0, 3, 1, 2).contiguous()
+		xy_px = xy_lr.permute(0, 3, 1, 2).contiguous()  # (N, 2, Hm, Wm)
 
+		# --- 1. V-direction via central / forward / backward difference ---
+		v_dir = xy_px.new_zeros(xy_px.shape)  # (N, 2, Hm, Wm)
+		if hm >= 3:
+			v_dir[:, :, 1:-1, :] = xy_px[:, :, 2:, :] - xy_px[:, :, :-2, :]
+			v_dir[:, :, 0, :] = xy_px[:, :, 1, :] - xy_px[:, :, 0, :]
+			v_dir[:, :, -1, :] = xy_px[:, :, -1, :] - xy_px[:, :, -2, :]
+		elif hm >= 2:
+			v_dir[:, :, 0, :] = xy_px[:, :, 1, :] - xy_px[:, :, 0, :]
+			v_dir[:, :, 1, :] = v_dir[:, :, 0, :]
+		# hm == 1: v_dir stays zero, edge fallback handles it
+
+		# --- 2. Orthogonal direction: rotate 90° CCW → (-vy, vx) ---
+		d_x = -v_dir[:, 1:2, :, :]  # (N, 1, Hm, Wm)
+		d_y = v_dir[:, 0:1, :, :]
+
+		# --- 3. Neighbor columns (shifted, edge-replicated) ---
 		left_src = torch.cat([xy_px[:, :, :, 0:1], xy_px[:, :, :, :-1]], dim=3)
 		right_src = torch.cat([xy_px[:, :, :, 1:], xy_px[:, :, :, -1:]], dim=3)
-		off_l = mesh_off[:, 0]
+
+		off_l = mesh_off[:, 0]  # (N, Hm, Wm)
 		off_r = mesh_off[:, 1]
 		base_i = torch.arange(hm, device=xy_lr.device, dtype=xy_lr.dtype).view(1, hm, 1)
-		left_conn = self._interp_col(src=left_src, y=base_i + off_l)
-		right_conn = self._interp_col(src=right_src, y=base_i + off_r)
+
+		def _intersect(src: torch.Tensor, off: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+			"""Intersect orthogonal ray from xy_px with segment in src.
+
+			Returns: conn (N,2,Hm,Wm), t (N,Hm,Wm), seg_start (N,Hm,Wm)
+			"""
+			idx = base_i + off
+			seg_s = torch.floor(idx).clamp(0.0, float(hm - 2))
+			seg_si = seg_s.to(dtype=torch.int64)
+
+			idx0 = seg_si.unsqueeze(1).expand(-1, 2, -1, -1)
+			idx1 = (seg_si + 1).unsqueeze(1).expand(-1, 2, -1, -1)
+			A = torch.take_along_dim(src, idx0, dim=2)  # (N, 2, Hm, Wm)
+			B = torch.take_along_dim(src, idx1, dim=2)
+
+			# Segment direction
+			e_x = B[:, 0:1] - A[:, 0:1]  # (N, 1, Hm, Wm)
+			e_y = B[:, 1:2] - A[:, 1:2]
+
+			# g = p - A (ray origin minus segment start)
+			g_x = xy_px[:, 0:1] - A[:, 0:1]
+			g_y = xy_px[:, 1:2] - A[:, 1:2]
+
+			# t = (g × d) / (e × d), 2D cross: a×b = ax*by - ay*bx
+			g_cross_d = g_x * d_y - g_y * d_x
+			e_cross_d = e_x * d_y - e_y * d_x
+
+			eps = 1e-8
+			denom = torch.where(e_cross_d.abs() < eps,
+								torch.full_like(e_cross_d, eps),
+								e_cross_d)
+			t = (g_cross_d / denom).squeeze(1)  # (N, Hm, Wm)
+
+			# Intersection point: A + t * (B - A)
+			t_exp = t.unsqueeze(1)
+			conn = A + t_exp * (B - A)
+
+			return conn, t, seg_s
+
+		left_conn, t_l, seg_l = _intersect(left_src, off_l)
+		right_conn, t_r, seg_r = _intersect(right_src, off_r)
+
+		# Store intersection info for offset update (detached)
+		self._last_conn_t_l = t_l.detach()
+		self._last_conn_t_r = t_r.detach()
+		self._last_conn_seg_l = seg_l.detach()
+		self._last_conn_seg_r = seg_r.detach()
+
 		# Edge fallback for undefined horizontal neighbors:
 		# mirror the nearest inside conn vector (visual/search-only backup).
 		with torch.no_grad():
@@ -666,6 +773,48 @@ class Model2D(nn.Module):
 				right_conn[:, :, :, -1] = (xy_px[:, :, :, -1] - v_in_r).detach()
 		conn = torch.stack([left_conn, xy_px, right_conn], dim=1)
 		return conn.permute(0, 3, 4, 1, 2).contiguous()
+
+	@torch.no_grad()
+	def update_conn_offsets(self) -> None:
+		"""Update conn_offset_ms to match the latest orthogonal intersection positions.
+
+		After each optimization step, the mesh positions change.  This method
+		updates the offset values so they track the actual intersection parameter
+		of the orthogonal ray with the neighbor segments.
+
+		new_offset = floor(old_idx) + t - base_row
+		where old_idx = base_row + old_offset, and t is the intersection
+		parameter along the segment [floor(old_idx), floor(old_idx)+1].
+		"""
+		t_l = getattr(self, '_last_conn_t_l', None)
+		t_r = getattr(self, '_last_conn_t_r', None)
+		seg_l = getattr(self, '_last_conn_seg_l', None)
+		seg_r = getattr(self, '_last_conn_seg_r', None)
+		if t_l is None or t_r is None or seg_l is None or seg_r is None:
+			return
+
+		hm = int(t_l.shape[1])
+		base_i = torch.arange(hm, device=t_l.device, dtype=t_l.dtype).view(1, hm, 1)
+
+		# New offset = seg_start + t - base_row
+		new_off_l = seg_l + t_l - base_i
+		new_off_r = seg_r + t_r - base_i
+
+		# Compute delta from current reconstructed offset
+		current_off = self.conn_offset_coarse()  # (N, 2, Hm, Wm)
+		delta_l = new_off_l - current_off[:, 0]
+		delta_r = new_off_r - current_off[:, 1]
+
+		# Apply delta to the finest (base) pyramid level.
+		# conn_offset_coarse() = ms[0] + upsample(ms[1] + upsample(...))
+		# so adding to ms[0] directly adds to the reconstructed output.
+		self.conn_offset_ms[0].data[:, 0] += delta_l
+		self.conn_offset_ms[0].data[:, 1] += delta_r
+
+		self._last_conn_t_l = None
+		self._last_conn_t_r = None
+		self._last_conn_seg_l = None
+		self._last_conn_seg_r = None
 
 	@staticmethod
 	def _interp_col(*, src: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -761,11 +910,21 @@ class Model2D(nn.Module):
 		z_step_vx: int = 1,
 		scaledown: float = 1.0,
 		crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
+		data_margin_modelpx: tuple[float, float] | None = None,
+		data_size_modelpx: tuple[int, int] | None = None,
 		*,
 		subsample_mesh: int = 4,
 		subsample_winding: int = 4,
 	) -> "Model2D":
-		h_img, w_img = data.size
+		# Use crop dimensions (not data.size) for mesh sizing — data may have
+		# expanded margins for valid-mask coverage.
+		if crop_xyzwhd is not None:
+			_cx, _cy, _cw, _ch, _z0, _d = crop_xyzwhd
+			ds = max(1e-6, float(scaledown))
+			h_img = max(1, int(round(float(_ch) / ds)))
+			w_img = max(1, int(round(float(_cw) / ds)))
+		else:
+			h_img, w_img = data.size
 		step_h = int(mesh_step_px)
 		step_w = int(winding_step_px)
 		fh = float(init_size_frac if init_size_frac_h is None else init_size_frac_h)
@@ -792,6 +951,8 @@ class Model2D(nn.Module):
 			z_step_vx=max(1, int(z_step_vx)),
 			scaledown=float(scaledown),
 			crop_xyzwhd=crop_xyzwhd,
+			data_margin_modelpx=data_margin_modelpx,
+			data_size_modelpx=data_size_modelpx,
 		)
 
 	def _build_base_grid(self, *, gh0: int, gw0: int) -> torch.Tensor:
@@ -802,8 +963,10 @@ class Model2D(nn.Module):
 		_cx, _cy, cw, ch, _z0, _d = self.params.crop_xyzwhd
 		w = float(max(1, int(cw) - 1))
 		h = float(max(1, int(ch) - 1))
-		xc = 0.5 * w
-		yc = 0.5 * h
+		# Center mesh on the original crop within (possibly expanded) data.
+		mx, my = self.params.data_margin_modelpx
+		xc = float(mx) + 0.5 * w
+		yc = float(my) + 0.5 * h
 		fh = float(self.init.init_size_frac if self.init.init_size_frac_h is None else self.init.init_size_frac_h)
 		fw = float(self.init.init_size_frac if self.init.init_size_frac_v is None else self.init.init_size_frac_v)
 		u0 = xc - 0.5 * fw * w
