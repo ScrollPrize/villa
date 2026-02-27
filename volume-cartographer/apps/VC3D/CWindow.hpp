@@ -186,6 +186,7 @@ private slots:
     void onSliceStepSizeChanged(int newSize);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
+    void onFocusViewsRequested(uint64_t collectionId, uint64_t pointId);
 
 private:
     void recalcAreaForSegments(const std::vector<std::string>& ids);
@@ -204,6 +205,7 @@ private:
   
     SeedingWidget* _seedingWidget;
     SegmentationWidget* _segmentationWidget{nullptr};
+    QDockWidget* _lasagnaDock{nullptr};
     DrawingWidget* _drawingWidget;
     CPointCollectionWidget* _point_collection_widget;
 

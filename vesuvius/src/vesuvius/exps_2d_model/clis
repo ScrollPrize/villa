@@ -1,7 +1,7 @@
 python train_unet.py --images-dir ../data/kaggle_dataset/images/ --labels-dir ../data/kaggle_dataset/labels/ --log-dir logs/ --run-name init_lr1e-5 --bench --batch-size 32
 
 
-[hendrik@staticsheep exps_2d]$ python gen_post_data.py --out vis.tif --layer 1 ../data/kaggle_dataset/images/sample_00706.tif 
+[hendrik@staticsheep exps_2d]$ python gen_post_data.py --out vis.tif --layer 1 ../data/kaggle_dataset/images/sample_00706.tif
 
 
 python fit_cosine_grid.py --image inf_sample1.tif --output-prefix res --downscale 4 --lambda-smooth 100 --device cuda --snapshot 100 --lr 0.001 --steps 10000
@@ -132,3 +132,24 @@ hendrik@staticsheep model2d_fullsize_exps]$ python $SRC/preprocess_cos_omezarr.p
 python $SRC/fit2tifxyz.py --input res_growz/model_snapshots/model_final_000000.pt --prefix edit_ --single-segment --copy-model --output ../s5/PHerc172.volpkg/paths/
 
 [hendrik@staticsheep volumes_lasagna]$ python /home/hendrik/remote/turbosheep/home/hendrik/business/aiconsulting/vesuviuschallenge/villa/vesuvius/src/vesuvius/exps_2d_model/fit_service.py --host 0.0.0.0 --port 9999 --data-dir ./
+
+# process x and y slicings
+
+python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/ --output s5_cos_x.zarr  --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --crop 1500 2000 6000 3000 3000 4000 --z-step 5 --axis x
+
+python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/ --output s5_cos_y.zarr  --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --crop 1500 2000 6000 3000 3000 4000 --z-step 5 --axis y
+
+# combine
+python $SRC/preprocess_cos_omezarr.py integrate --z-volume ../s5/PHerc172.volpkg/volumes_lasagna/s5_cos.zarr --output cos_comb.zarr --x-volume s5_cos_x.zarr --y-volume s5_cos_y.zarr
+
+
+#
+python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/ --output full_cos_z.zarr  --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --z-step 5 &&
+python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/ --output full_cos_x.zarr  --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --z-step 5 --axis x
+
+
+python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webcache/s5_rechunked.zarr/0/ --output full_cos_y.zarr  --unet-checkpoint ../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt --z-step 5 --axis y
+
+
+python $SRC/preprocess_cos_omezarr.py integrate --z-volume ../s5/PHerc172.volpkg/volumes_lasagna/full_cos_z.zarr --output full_cos_s5.zarr --x-volume full_cos_x.zarr --y-volume full_cos_y.zarr
+

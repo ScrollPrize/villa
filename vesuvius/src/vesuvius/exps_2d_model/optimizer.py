@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, replace
 
 import torch
@@ -14,6 +15,7 @@ import opt_loss_gradmag
 import opt_loss_mod
 import opt_loss_step
 import opt_loss_corr
+import opt_loss_min_dist
 import mask_schedule
 import point_constraints
 
@@ -28,6 +30,7 @@ def _require_consumed_dict(*, where: str, cfg: dict) -> None:
 @dataclass(frozen=True)
 class OptSettings:
 	steps: int
+	termination: str  # "steps" (default) or "mask"
 	lr: float | list[float]
 	params: list[str]
 	min_scaledown: int
@@ -101,6 +104,9 @@ def _parse_opt_settings(
 ) -> OptSettings:
 	opt_cfg = dict(opt_cfg)
 	steps = max(0, int(opt_cfg.get("steps", 0)))
+	termination = str(opt_cfg.pop("termination", "steps"))
+	if termination not in ("steps", "mask"):
+		raise ValueError(f"stages_json: stage '{stage_name}' opt.termination: must be 'steps' or 'mask', got '{termination}'")
 	lr_raw = opt_cfg.get("lr", 1e-3)
 	if isinstance(lr_raw, list):
 		if not lr_raw:
@@ -141,6 +147,7 @@ def _parse_opt_settings(
 	eff, _mods = _stage_to_modifiers(base, prev_eff, default_mul, w_fac)
 	return OptSettings(
 		steps=steps,
+		termination=termination,
 		lr=lr,
 		params=params,
 		min_scaledown=min_scaledown,
@@ -196,6 +203,7 @@ def load_stages_cfg(cfg: dict) -> list[Stage]:
 			"angle": 0.0,
 			"y_straight": 0.0,
 			"z_straight": 0.0,
+			"z_normal": 0.0,
 			"corr_winding": 0.0,
 	}
 	base_cfg = cfg.pop("base", None)
@@ -281,14 +289,19 @@ def total_steps_for_stages(stages: list[Stage]) -> int:
 	total = 0
 	for stage in stages:
 		if stage.grow is None:
-			total += max(0, stage.global_opt.steps)
+			# Mask-terminated stages contribute 0 (unknown duration)
+			if stage.global_opt.termination != "mask":
+				total += max(0, stage.global_opt.steps)
 		else:
 			generations = max(0, int(stage.grow.get("generations", 0)))
 			local_opts = stage.local_opt if stage.local_opt is not None else [stage.global_opt]
 			for _gi in range(generations):
-				total += max(0, stage.global_opt.steps)
 				for lo in local_opts:
-					total += max(0, lo.steps)
+					if lo.termination != "mask":
+						total += max(0, lo.steps)
+			# Global opt runs once after all generations
+			if generations > 0 and stage.global_opt.termination != "mask":
+				total += max(0, stage.global_opt.steps)
 	return total
 
 
@@ -301,6 +314,7 @@ def optimize(
 	stages: list[Stage],
 	snapshot_interval: int,
 	snapshot_fn,
+	corr_snapshot_fn=None,
 	progress_fn=None,
 ) -> fit_data.FitData:
 	data_z0 = data_cfg.unet_z if data_cfg is not None else None
@@ -328,7 +342,10 @@ def optimize(
 		def _corr_pts_for_res() -> fit_data.PointConstraintsData | None:
 			if pts_c0 is None:
 				return None
-			pts_all, idx_left, valid_left, _d_l, idx_right, valid_right, _d_r = point_constraints.closest_conn_segment_indices(
+			(pts_all,
+			 idx_left, valid_left, _d_l,
+			 idx_right, valid_right, _d_r,
+			 z_hi, z_frac) = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=pts_c0.points_xyz_winda,
 				xy_conn=res.xy_conn,
 			)
@@ -339,6 +356,8 @@ def optimize(
 				valid_left=valid_left,
 				idx_right=idx_right,
 				valid_right=valid_right,
+				z_hi=z_hi,
+				z_frac=z_frac,
 			)
 		term_to_maps = {
 			"data": lambda: opt_loss_data.data_loss_map(res=res),
@@ -355,8 +374,10 @@ def optimize(
 			"angle": lambda: opt_loss_geom.angle_symmetry_loss_map(res=res),
 			"y_straight": lambda: opt_loss_geom.y_straight_loss_map(res=res),
 			"z_straight": lambda: opt_loss_geom.z_straight_loss_map(res=res),
+			"z_normal": lambda: opt_loss_dir.z_normal_loss_maps(res=res),
 			"corr_winding": lambda: (lambda lv, lms, ms: (lms[0], ms[0]))(*opt_loss_corr.corr_winding_loss(res=res, pts_c=_corr_pts_for_res())),
 			"step": lambda: (lambda lm: (lm, torch.ones_like(lm)))(opt_loss_step.step_loss_maps(res=res)),
+			"min_dist": lambda: opt_loss_min_dist.min_dist_loss_map(res=res),
 		}
 		if mean_pos_xy is not None:
 			term_to_maps["mean_pos"] = lambda: opt_loss_geom.mean_pos_loss_map(res=res, target_xy=mean_pos_xy)
@@ -378,11 +399,22 @@ def optimize(
 			out[name] = [float(x) for x in _masked_mean_per_z(lm=lm, mask=mask).detach().cpu().tolist()]
 		if not out:
 			return
-		for k in sorted(out.keys()):
-			vs = [round(float(x), 6) for x in out[k]]
-			print(f"{label} losses_per_z {k}: {vs}")
+		names = sorted(out.keys())
+		n_z = max(len(v) for v in out.values())
+		# Print as table: rows=z-slices, cols=loss terms
+		hdr = f"{'z':>4s}"
+		for k in names:
+			hdr += f"  {k:>10s}"
+		print(f"{label} losses_per_z:")
+		print(hdr)
+		for zi in range(n_z):
+			row = f"{zi:4d}"
+			for k in names:
+				v = out[k][zi] if zi < len(out[k]) else 0.0
+				row += f"  {v:10.6f}"
+			print(row)
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, keep_only_grown_z: bool = False) -> None:
-		if opt_cfg.steps <= 0:
+		if opt_cfg.steps <= 0 and opt_cfg.termination != "mask":
 			return
 		# If the stage does not optimize any global transform params, bake the current
 		# global transform into the mesh and disable it.
@@ -401,15 +433,19 @@ def optimize(
 				raise ValueError("const_mask_lr batch must match data batch")
 			keep_lr = (1.0 - cm_lr)
 
-		ins_z = model._last_grow_insert_z if bool(keep_only_grown_z) else None
 		z_keep = None
-		if ins_z is not None:
-			ins_z = int(ins_z)
-			n = int(data.cos.shape[0])
-			if not (0 <= ins_z < n):
-				raise ValueError("grow z index out of range")
-			z_keep = torch.zeros(n, 1, 1, 1, device=data.cos.device, dtype=torch.float32)
-			z_keep[ins_z, 0, 0, 0] = 1.0
+		if bool(keep_only_grown_z):
+			z_list = getattr(model, "_last_grow_insert_z_list", [])
+			if not z_list and model._last_grow_insert_z is not None:
+				z_list = [int(model._last_grow_insert_z)]
+			if z_list:
+				n = int(data.cos.shape[0])
+				z_keep = torch.zeros(n, 1, 1, 1, device=data.cos.device, dtype=torch.float32)
+				for iz in z_list:
+					iz = int(iz)
+					if not (0 <= iz < n):
+						raise ValueError("grow z index out of range")
+					z_keep[iz, 0, 0, 0] = 1.0
 		param_groups: list[dict] = []
 		for name in opt_cfg.params:
 			if name in {"theta", "winding_scale"}:
@@ -460,7 +496,10 @@ def optimize(
 		def _corr_pts_for_res(res) -> fit_data.PointConstraintsData | None:
 			if pts_c0 is None:
 				return None
-			pts_all, idx_left, valid_left, _d_l, idx_right, valid_right, _d_r = point_constraints.closest_conn_segment_indices(
+			(pts_all,
+			 idx_left, valid_left, _d_l,
+			 idx_right, valid_right, _d_r,
+			 z_hi, z_frac) = point_constraints.closest_conn_segment_indices(
 				points_xyz_winda=pts_c0.points_xyz_winda,
 				xy_conn=res.xy_conn,
 			)
@@ -471,6 +510,8 @@ def optimize(
 				valid_left=valid_left,
 				idx_right=idx_right,
 				valid_right=valid_right,
+				z_hi=z_hi,
+				z_frac=z_frac,
 			)
 		terms = {
 			"dir_v": {"loss": opt_loss_dir.dir_v_loss},
@@ -491,8 +532,30 @@ def optimize(
 			"angle": {"loss": opt_loss_geom.angle_symmetry_loss},
 			"y_straight": {"loss": opt_loss_geom.y_straight_loss},
 			"z_straight": {"loss": opt_loss_geom.z_straight_loss},
+			"z_normal": {"loss": opt_loss_dir.z_normal_loss},
 			"corr_winding": {"loss": lambda *, res: opt_loss_corr.corr_winding_loss(res=res, pts_c=_corr_pts_for_res(res))},
+			"min_dist": {"loss": opt_loss_min_dist.min_dist_loss},
 		}
+		_status_rows_since_header = 0
+
+		def _print_status(*, step_label: str, loss_val: float, tv: dict[str, float], pv: dict[str, float]) -> None:
+			nonlocal _status_rows_since_header
+			tv_keys = sorted(tv.keys())
+			pv_keys = sorted(pv.keys())
+			cols = tv_keys + [f"p:{k}" for k in pv_keys]
+			if _status_rows_since_header % 20 == 0:
+				hdr = f"{'step':>20s}  {'loss':>8s}"
+				for c in cols:
+					hdr += f"  {c:>10s}"
+				print(hdr)
+			_status_rows_since_header += 1
+			row = f"{step_label:>20s}  {loss_val:8.4f}"
+			for k in tv_keys:
+				row += f"  {tv[k]:10.4f}"
+			for k in pv_keys:
+				row += f"  {pv[k]:10.4f}"
+			print(row)
+
 		with torch.no_grad():
 			res0 = model(data)
 			if stage.masks is not None:
@@ -520,11 +583,25 @@ def optimize(
 					param_vals0[k] = float(vs[0].detach().cpu())
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
-			print(f"{label} step 0/{opt_cfg.steps}: loss={loss0.item():.4f} terms={term_vals0} params={param_vals0}")
 			_print_losses_per_z(label=f"{label} step 0/{opt_cfg.steps}", res=res0, eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
+			_status_rows_since_header = 0
+			_print_status(step_label=f"{label} 0/{opt_cfg.steps}", loss_val=loss0.item(), tv=term_vals0, pv=param_vals0)
 		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0, vis_losses=vis_losses0)
 
-		for step in range(opt_cfg.steps):
+		if opt_cfg.termination == "mask" and stage.masks is None:
+			raise ValueError(f"[{label}] termination='mask' but stage has no masks configured")
+		max_steps = opt_cfg.steps if opt_cfg.termination == "steps" else 10_000_000
+		actual_steps = 0
+		_use_cuda = data.cos.device.type == "cuda"
+		_sync = torch.cuda.synchronize if _use_cuda else lambda: None
+		_t_model_fw_acc = 0.0
+		_t_corr_acc = 0.0
+		_t_other_loss_acc = 0.0
+		_t_bw_acc = 0.0
+		_t_steps_acc = 0
+		for step in range(max_steps):
+			_sync()
+			_t0 = time.perf_counter()
 			res = model(data)
 			model.update_ema(xy_lr=res.xy_lr, xy_conn=res.xy_conn)
 			if stage.masks is not None:
@@ -535,40 +612,97 @@ def optimize(
 						masks=stage.masks,
 					)
 				res = replace(res, _stage_img_masks=stage_img_masks, _stage_img_masks_losses=stage_img_masks_losses)
+			_sync()
+			_t1 = time.perf_counter()
+			_t_model_fw_acc += _t1 - _t0
 			loss = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
 			term_vals: dict[str, float] = {}
 			vis_losses = VisLossCollection(loss_maps={})
+			_t_corr_step = 0.0
 			for name, t in terms.items():
 				w = _need_term(name, opt_cfg.eff)
 				if w == 0.0:
 					continue
+				if name == "corr_winding":
+					_sync()
+					_tc0 = time.perf_counter()
 				lv, lms, masks = _loss3(loss_fn=t["loss"], res=res)
+				if name == "corr_winding":
+					_sync()
+					_tc1 = time.perf_counter()
+					_t_corr_step = _tc1 - _tc0
 				vis_losses = vis_losses.add_or_update(name=name, maps=lms, masks=masks)
 				term_vals[name] = float(lv.detach().cpu())
 				loss = loss + w * lv
+			_sync()
+			_t2 = time.perf_counter()
+			_t_corr_acc += _t_corr_step
+			_t_other_loss_acc += (_t2 - _t1) - _t_corr_step
 			opt.zero_grad(set_to_none=True)
 			loss.backward()
 			opt.step()
+			_sync()
+			_t3 = time.perf_counter()
+			_t_bw_acc += _t3 - _t2
+			model.update_conn_offsets()
+			_t_steps_acc += 1
 			_done_steps[0] += 1
-			if progress_fn is not None:
-				progress_fn(step=_done_steps[0], total=_total_steps, loss=float(loss.detach().cpu()))
-
+			actual_steps = step + 1
 			step1 = step + 1
-			if step == 0 or step1 == opt_cfg.steps or (step1 % 100) == 0:
+
+			# Compute mask completion (used for progress reporting & termination)
+			_mask_completion = 0.0
+			if opt_cfg.termination == "mask" and stage.masks is not None:
+				_mask_completion = mask_schedule.stage_mask_completed(model=model, masks=stage.masks)
+
+			# Compute stage and overall progress
+			if opt_cfg.termination == "mask":
+				_stage_progress = _mask_completion
+			else:
+				_stage_progress = step1 / max_steps if max_steps > 0 else 1.0
+			_overall_progress = (si + _stage_progress) / _num_stages if _num_stages > 0 else 1.0
+
+			if progress_fn is not None:
+				progress_fn(
+					step=_done_steps[0], total=_total_steps, loss=float(loss.detach().cpu()),
+					stage_progress=_stage_progress, overall_progress=_overall_progress,
+					stage_name=stage.name,
+				)
+
+			if step == 0 or step1 == max_steps or (step1 % 100) == 0:
 				param_vals: dict[str, float] = {}
 				for k, vs in all_params.items():
 					if len(vs) == 1 and vs[0].numel() == 1:
 						param_vals[k] = float(vs[0].detach().cpu())
 				term_vals = {k: round(v, 4) for k, v in term_vals.items()}
 				param_vals = {k: round(v, 4) for k, v in param_vals.items()}
-				print(f"{label} step {step1}/{opt_cfg.steps}: loss={loss.item():.4f} terms={term_vals} params={param_vals}")
+				_print_status(step_label=f"{label} {step1}/{opt_cfg.steps if opt_cfg.termination == 'steps' else '?'}", loss_val=loss.item(), tv=term_vals, pv=param_vals)
+				if _t_steps_acc > 0:
+					_t_total = _t_model_fw_acc + _t_other_loss_acc + _t_corr_acc + _t_bw_acc
+					if _t_total > 0:
+						_pct = lambda v: 100.0 * v / _t_total
+						print(f"  [timing] {_t_steps_acc} steps, {1000*_t_total/_t_steps_acc:.1f} ms/step | "
+							  f"model_fw {_pct(_t_model_fw_acc):.1f}% | "
+							  f"other_loss {_pct(_t_other_loss_acc):.1f}% | "
+							  f"corr_pts {_pct(_t_corr_acc):.1f}% | "
+							  f"bw+opt {_pct(_t_bw_acc):.1f}%")
+					_t_model_fw_acc = _t_corr_acc = _t_other_loss_acc = _t_bw_acc = 0.0
+					_t_steps_acc = 0
+				if corr_snapshot_fn is not None:
+					corr_snapshot_fn(stage=label, step=step1, data=data, res=res)
 
 			if snap_int > 0 and (step1 % snap_int) == 0:
 				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data, res=res, vis_losses=vis_losses)
 
-		snapshot_fn(stage=label, step=opt_cfg.steps, loss=float(loss.detach().cpu()), data=data, res=res, vis_losses=vis_losses)
+			# Check mask termination (threshold < 1.0 for trilinear upsample precision)
+			if opt_cfg.termination == "mask" and _mask_completion >= 0.999:
+				print(f"[{label}] mask completed at step {step1} (mean={_mask_completion:.6f})")
+				break
+
+		snapshot_fn(stage=label, step=actual_steps, loss=float(loss.detach().cpu()), data=data, res=res, vis_losses=vis_losses)
 		with torch.no_grad():
-			_print_losses_per_z(label=f"{label} step {opt_cfg.steps}/{opt_cfg.steps}", res=res, eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
+			_print_losses_per_z(label=f"{label} step {actual_steps}/{opt_cfg.steps if opt_cfg.termination == 'steps' else '?'}", res=res, eff=opt_cfg.eff, mean_pos_xy=mean_pos_xy)
+		_status_rows_since_header = 0
 		for h in hooks:
 			h.remove()
 
@@ -578,10 +712,11 @@ def optimize(
 
 	_total_steps = total_steps_for_stages(stages)
 	_done_steps = [0]  # mutable counter
+	_num_stages = len(stages)
 
 	for si, stage in enumerate(stages):
 		if stage.grow is None:
-			if stage.global_opt.steps > 0:
+			if stage.global_opt.steps > 0 or stage.global_opt.termination == "mask":
 				_run_opt(si=si, label=f"stage{si}", stage=stage, opt_cfg=stage.global_opt)
 			continue
 		grow = stage.grow
@@ -593,9 +728,26 @@ def optimize(
 		generations = max(0, int(grow.get("generations", 0)))
 		grow_steps = max(0, int(grow.get("steps", 0)))
 		local_opts = stage.local_opt if stage.local_opt is not None else [stage.global_opt]
+
+		# Save original model dimensions before grow loop for cumulative masking.
+		orig_z_size = int(model.z_size)
+		orig_mesh_h = int(model.mesh_h)
+		orig_mesh_w = int(model.mesh_w)
+		cum_py = 0  # cumulative Y offset of original mesh in grown mesh
+		cum_px = 0  # cumulative X offset of original mesh in grown mesh
+		orig_z_start = 0  # start index of original Z slices in grown model
+		grew_z = False
+
 		for gi in range(generations):
 			model.grow(directions=[str(d) for d in directions], steps=grow_steps)
-			if model._last_grow_insert_z is not None:
+			z_inserts = getattr(model, "_last_grow_insert_z_list", [])
+			if not z_inserts and model._last_grow_insert_z is not None:
+				z_inserts = [int(model._last_grow_insert_z)]
+			for ins_z in z_inserts:
+				grew_z = True
+				ins_z = int(ins_z)
+				if ins_z == 0:  # bw: prepended at front
+					orig_z_start += 1
 				if int(data.cos.shape[0]) != int(model.z_size):
 					if data_cfg is None:
 						raise ValueError("grow fw/bw requires passing data_cfg")
@@ -605,41 +757,67 @@ def optimize(
 						data=data,
 						cfg=data_cfg,
 						unet_z0=int(data_z0),
-						new_z_size=int(model.z_size),
-						insert_z=int(model._last_grow_insert_z),
+						new_z_size=int(data.cos.shape[0]) + 1,
+						insert_z=ins_z,
 						out_dir_base=data_out_dir_base,
 					)
+			if model._last_grow_insert_lr is not None:
+				py0, px0, _ho, _wo = model._last_grow_insert_lr
+				cum_py += int(py0)
+				cum_px += int(px0)
+
 			stage_g = f"stage{si}_grow{gi:04d}"
 			snapshot_fn(stage=stage_g, step=0, loss=0.0, data=data)
-			if stage.global_opt.steps > 0:
-				_run_opt(si=si, label=f"{stage_g}_global", stage=stage, opt_cfg=stage.global_opt, keep_only_grown_z=False)
-			if not local_opts or all(int(o.steps) <= 0 for o in local_opts):
+
+			# -- Local opt: optimize ONLY what was just added this generation --
+			if not local_opts or all(int(o.steps) <= 0 and o.termination != "mask" for o in local_opts):
 				continue
-			ins = model._last_grow_insert_lr
-			if ins is None:
-				if model._last_grow_insert_z is not None:
-					model.const_mask_lr = None
-					for li, opt_cfg in enumerate(local_opts):
-						_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg, keep_only_grown_z=True)
-					continue
-				raise RuntimeError("grow: missing insertion rect")
-			py0, px0, ho, wo = ins
+			ins_lr = model._last_grow_insert_lr
+			z_inserts_local = getattr(model, "_last_grow_insert_z_list", [])
+			if not z_inserts_local and model._last_grow_insert_z is not None:
+				z_inserts_local = [int(model._last_grow_insert_z)]
+			if ins_lr is None and not z_inserts_local:
+				raise RuntimeError("grow: missing insertion info")
+
+			n = int(data.cos.shape[0])
 			hm = int(model.mesh_h)
 			wm = int(model.mesh_w)
-			y0 = int(py0)
-			x0 = int(px0)
-			y1 = int(py0 + ho)
-			x1 = int(px0 + wo)
-			win = max(0, int(local_opt.opt_window) - 1)
-			n = int(data.cos.shape[0])
-			cm = torch.zeros(n, 1, hm, wm, device=data.cos.device, dtype=torch.float32)
-			cm[:, :, y0:y1, x0:x1] = 1.0
-			cm[:, :, y0:min(y1, y0 + win), x0:x1] = 0.0
-			cm[:, :, max(y0, y1 - win):y1, x0:x1] = 0.0
-			cm[:, :, y0:y1, x0:min(x1, x0 + win)] = 0.0
-			cm[:, :, y0:y1, max(x0, x1 - win):x1] = 0.0
-			model.const_mask_lr = cm
+
+			if ins_lr is not None:
+				# Build XY mask: freeze old region, free new border
+				py0, px0, ho, wo = ins_lr
+				y0 = int(py0)
+				x0 = int(px0)
+				y1 = int(py0 + ho)
+				x1 = int(px0 + wo)
+				win = max(0, int(local_opts[0].opt_window) - 1)
+				cm = torch.zeros(n, 1, hm, wm, device=data.cos.device, dtype=torch.float32)
+				cm[:, :, y0:y1, x0:x1] = 1.0
+				cm[:, :, y0:min(y1, y0 + win), x0:x1] = 0.0
+				cm[:, :, max(y0, y1 - win):y1, x0:x1] = 0.0
+				cm[:, :, y0:y1, x0:min(x1, x0 + win)] = 0.0
+				cm[:, :, y0:y1, max(x0, x1 - win):x1] = 0.0
+				for iz in z_inserts_local:
+					cm[int(iz), :, :, :] = 0.0  # new Z slices are free everywhere
+				model.const_mask_lr = cm
+			else:
+				# Z-only: no XY mask, use z_keep mechanism
+				model.const_mask_lr = None
+
+			use_z_keep = (z_inserts_local and ins_lr is None)
 			for li, opt_cfg in enumerate(local_opts):
-				_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg, keep_only_grown_z=True)
+				_run_opt(si=si, label=f"{stage_g}_local{li}", stage=stage, opt_cfg=opt_cfg, keep_only_grown_z=use_z_keep)
+
+		# -- Global opt: after all generations, freeze original model, optimize all grown --
+		if generations > 0 and (stage.global_opt.steps > 0 or stage.global_opt.termination == "mask"):
+			n = int(data.cos.shape[0])
+			hm = int(model.mesh_h)
+			wm = int(model.mesh_w)
+			cm = torch.zeros(n, 1, hm, wm, device=data.cos.device, dtype=torch.float32)
+			# Freeze the original Z×XY region (handles Z-only, XY-only, and combined)
+			cm[orig_z_start:orig_z_start + orig_z_size, :,
+			   cum_py:cum_py + orig_mesh_h, cum_px:cum_px + orig_mesh_w] = 1.0
+			model.const_mask_lr = cm
+			_run_opt(si=si, label=f"stage{si}_global", stage=stage, opt_cfg=stage.global_opt, keep_only_grown_z=False)
 	model.const_mask_lr = None
 	return data

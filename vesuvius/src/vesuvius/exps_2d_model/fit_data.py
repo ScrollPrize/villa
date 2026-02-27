@@ -16,12 +16,14 @@ import cli_data
 
 @dataclass(frozen=True)
 class PointConstraintsData:
-	points_xyz_winda: torch.Tensor
-	collection_idx: torch.Tensor
-	idx_left: torch.Tensor
-	valid_left: torch.Tensor
-	idx_right: torch.Tensor
-	valid_right: torch.Tensor
+	points_xyz_winda: torch.Tensor  # (K,4)
+	collection_idx: torch.Tensor     # (K,)
+	idx_left: torch.Tensor           # (K,3) [z_lo, row, col]
+	valid_left: torch.Tensor         # (K,)
+	idx_right: torch.Tensor          # (K,3) [z_lo, row, col]
+	valid_right: torch.Tensor        # (K,)
+	z_hi: torch.Tensor               # (K,) ceil z-index
+	z_frac: torch.Tensor             # (K,) interp weight (0=lo, 1=hi)
 
 
 @dataclass(frozen=True)
@@ -36,14 +38,21 @@ class FitData:
 	dir0: torch.Tensor
 	dir1: torch.Tensor
 	valid: torch.Tensor | None = None
+	dir0_y: torch.Tensor | None = None
+	dir1_y: torch.Tensor | None = None
+	dir0_x: torch.Tensor | None = None
+	dir1_x: torch.Tensor | None = None
 	downscale: float = 1.0
 	constraints: ConstraintsData | None = None
+	# Margin (in model pixels) added around the original crop when reading expanded data.
+	# Used by fit.py to adjust crop_xyzwhd and translate loaded meshes.
+	data_margin_xy: tuple[float, float] = (0.0, 0.0)
 
 	def grid_sample_px(self, *, xy_px: torch.Tensor) -> "FitData":
 		"""Sample using pixel xy positions.
 
-		- `xy_px`: (N,H,W,2) with x in [0,W-1], y in [0,H-1].
-		- Internally converts to normalized coords for `grid_sample`.
+		- `xy_px`: (N,H,W,2) with x in [0,W-1], y in [0,H-1] in model pixel coords.
+		- Model pixel coords = data pixel coords (no offset).
 		"""
 		if xy_px.ndim != 4 or int(xy_px.shape[-1]) != 2:
 			raise ValueError("xy_px must be (N,H,W,2)")
@@ -60,14 +69,21 @@ class FitData:
 		mag_t = F.grid_sample(self.grad_mag, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
 		dir0_t = F.grid_sample(self.dir0, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
 		dir1_t = F.grid_sample(self.dir1, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+		def _gs_opt(t):
+			return None if t is None else F.grid_sample(t, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
 		return FitData(
 			cos=cos_t,
 			grad_mag=mag_t,
 			dir0=dir0_t,
 			dir1=dir1_t,
-			valid=None if self.valid is None else F.grid_sample(self.valid, grid, mode="bilinear", padding_mode="zeros", align_corners=True),
+			valid=_gs_opt(self.valid),
+			dir0_y=_gs_opt(self.dir0_y),
+			dir1_y=_gs_opt(self.dir1_y),
+			dir0_x=_gs_opt(self.dir0_x),
+			dir1_x=_gs_opt(self.dir1_x),
 			downscale=float(self.downscale),
 			constraints=self.constraints,
+			data_margin_xy=self.data_margin_xy,
 		)
 
 	@property
@@ -169,6 +185,10 @@ def grow_z_from_omezarr_unet(
 	)
 	if int(d_new.cos.shape[0]) != 1:
 		raise RuntimeError("grow_z: expected 1 inferred slice")
+	def _cat_opt(a, b, dim=0):
+		if a is None or b is None:
+			return None
+		return torch.cat([a, b], dim=dim)
 	if ins == 0:
 		return (
 			FitData(
@@ -176,9 +196,14 @@ def grow_z_from_omezarr_unet(
 				grad_mag=torch.cat([d_new.grad_mag, data.grad_mag], dim=0),
 				dir0=torch.cat([d_new.dir0, data.dir0], dim=0),
 				dir1=torch.cat([d_new.dir1, data.dir1], dim=0),
-				valid=None if (d_new.valid is None or data.valid is None) else torch.cat([d_new.valid, data.valid], dim=0),
+				valid=_cat_opt(d_new.valid, data.valid),
+				dir0_y=_cat_opt(d_new.dir0_y, data.dir0_y),
+				dir1_y=_cat_opt(d_new.dir1_y, data.dir1_y),
+				dir0_x=_cat_opt(d_new.dir0_x, data.dir0_x),
+				dir1_x=_cat_opt(d_new.dir1_x, data.dir1_x),
 				downscale=float(data.downscale),
 				constraints=data.constraints,
+				data_margin_xy=data.data_margin_xy,
 			),
 			int(unet_z0),
 		)
@@ -188,9 +213,14 @@ def grow_z_from_omezarr_unet(
 			grad_mag=torch.cat([data.grad_mag, d_new.grad_mag], dim=0),
 			dir0=torch.cat([data.dir0, d_new.dir0], dim=0),
 			dir1=torch.cat([data.dir1, d_new.dir1], dim=0),
-			valid=None if (data.valid is None or d_new.valid is None) else torch.cat([data.valid, d_new.valid], dim=0),
+			valid=_cat_opt(data.valid, d_new.valid),
+			dir0_y=_cat_opt(data.dir0_y, d_new.dir0_y),
+			dir1_y=_cat_opt(data.dir1_y, d_new.dir1_y),
+			dir0_x=_cat_opt(data.dir0_x, d_new.dir0_x),
+			dir1_x=_cat_opt(data.dir1_x, d_new.dir1_x),
 			downscale=float(data.downscale),
 			constraints=data.constraints,
+			data_margin_xy=data.data_margin_xy,
 		),
 		int(unet_z0),
 	)
@@ -241,6 +271,36 @@ def _gaussian_blur_nchw(*, x: torch.Tensor, sigma: float, kernel_size: int = 21)
 	return y
 
 
+def get_preprocessed_params(path: str) -> dict | None:
+	"""Probe preprocessed zarr metadata for z_step and downscale.
+
+	Returns dict with keys 'z_step', 'z_step_eff', 'downscale_xy', or None.
+	"""
+	p = Path(path)
+	s = str(p)
+	is_omezarr = (
+		s.endswith(".zarr")
+		or s.endswith(".ome.zarr")
+		or (".zarr/" in s)
+		or (".ome.zarr/" in s)
+	)
+	if not is_omezarr:
+		return None
+	try:
+		zsrc = zarr.open(s, mode="r")
+	except Exception:
+		return None
+	if not (isinstance(zsrc, zarr.Array) and int(len(zsrc.shape)) == 4 and int(zsrc.shape[0]) >= 4):
+		return None
+	params = dict(getattr(zsrc, "attrs", {}).get("preprocess_params", {}) or {})
+	if not params:
+		return None
+	ds = float(params.get("downscale_xy", 1.0))
+	zs = int(params.get("z_step", 1))
+	z_step_eff = int(params.get("z_step_eff", int(zs) * int(max(1, int(ds)))))
+	return {"z_step": zs, "z_step_eff": z_step_eff, "downscale_xy": ds}
+
+
 def load(
 	path: str,
 	device: torch.device,
@@ -262,6 +322,12 @@ def load(
 	p = Path(path)
 	s = str(p)
 	skip_postprocess = False
+	dir0_y_t: torch.Tensor | None = None
+	dir1_y_t: torch.Tensor | None = None
+	dir0_x_t: torch.Tensor | None = None
+	dir1_x_t: torch.Tensor | None = None
+	margin_x = 0
+	margin_y = 0
 	is_omezarr = (
 		s.endswith(".zarr")
 		or s.endswith(".ome.zarr")
@@ -360,6 +426,8 @@ def load(
 			y0 = 0
 			cw = int(w_all)
 			ch = int(h_all)
+			margin_x = 0
+			margin_y = 0
 			if crop is not None:
 				x0i, y0i, wi, hi = (int(v) for v in crop)
 				ds_i = max(1, int(round(float(ds_meta))))
@@ -367,12 +435,22 @@ def load(
 				y0s = max(0, int(y0i))
 				x1s = max(x0s, int(x0i) + max(0, int(wi)))
 				y1s = max(y0s, int(y0i) + max(0, int(hi)))
-				x0 = int(x0s) // int(ds_i)
-				y0 = int(y0s) // int(ds_i)
-				x1m = _ceil_div(int(x1s), int(ds_i))
-				y1m = _ceil_div(int(y1s), int(ds_i))
-				cw = max(1, min(int(x1m), int(w_all)) - int(x0))
-				ch = max(1, min(int(y1m), int(h_all)) - int(y0))
+				x0_orig = int(x0s) // int(ds_i)
+				y0_orig = int(y0s) // int(ds_i)
+				x1m_orig = _ceil_div(int(x1s), int(ds_i))
+				y1m_orig = _ceil_div(int(y1s), int(ds_i))
+				cw_orig = max(1, min(int(x1m_orig), int(w_all)) - int(x0_orig))
+				ch_orig = max(1, min(int(y1m_orig), int(h_all)) - int(y0_orig))
+				# Expand read area by 1x crop size in each direction (3x total per axis)
+				x0 = max(0, int(x0_orig) - int(cw_orig))
+				y0 = max(0, int(y0_orig) - int(ch_orig))
+				x1m = min(int(w_all), int(x0_orig) + 2 * int(cw_orig))
+				y1m = min(int(h_all), int(y0_orig) + 2 * int(ch_orig))
+				cw = max(1, int(x1m) - int(x0))
+				ch = max(1, int(y1m) - int(y0))
+				# Offset: model pixel (0,0) maps to data pixel (margin_x, margin_y)
+				margin_x = int(x0_orig) - int(x0)
+				margin_y = int(y0_orig) - int(y0)
 			x1 = int(x0) + int(cw)
 			y1 = int(y0) + int(ch)
 
@@ -388,16 +466,12 @@ def load(
 					f"z_step_eff_meta={int(z_step_eff_meta)}"
 				)
 
-			print(
-				"[fit_data] preprocessed zarr load "
-				f"shape_czyx={shape_czyx} "
-				f"z_req_raw={z_req_raw} "
-				f"z_idx_loaded={z_idx} "
-				f"z_step_eff_meta={int(z_step_eff_meta)} "
-				f"output_full_scaled={int(output_full_scaled)} "
-				f"crop_xywh=({int(x0)},{int(y0)},{int(cw)},{int(ch)})",
-				flush=True,
-			)
+			_z_fullres_first = int(z_req_raw[0]) if z_req_raw else 0
+			_z_fullres_last = int(z_req_raw[-1]) if z_req_raw else 0
+			_z_fullres_extent = _z_fullres_last - _z_fullres_first + int(z_step_eff_meta)
+			print(f"[fit_data] preprocessed zarr: {len(z_idx)} z-slices, "
+				  f"z=[{_z_fullres_first}..{_z_fullres_last}] ({_z_fullres_extent} fullres voxels), "
+				  f"xy=({cw}x{ch})+margin({margin_x},{margin_y})", flush=True)
 
 			def _read_ch(name: str) -> np.ndarray:
 				ci0 = int(ci[name])
@@ -433,6 +507,10 @@ def load(
 			dir0_t = _u8_to_t(dir0_np)
 			dir1_t = _u8_to_t(dir1_np)
 			valid_t = None if valid_np is None else _u8_valid_to_t(valid_np)
+			dir0_y_t = _u8_to_t(_read_ch("dir0_y")) if "dir0_y" in ci else None
+			dir1_y_t = _u8_to_t(_read_ch("dir1_y")) if "dir1_y" in ci else None
+			dir0_x_t = _u8_to_t(_read_ch("dir0_x")) if "dir0_x" in ci else None
+			dir1_x_t = _u8_to_t(_read_ch("dir1_x")) if "dir1_x" in ci else None
 			crop = None
 			downscale = float(ds_meta)
 			skip_postprocess = True
@@ -566,6 +644,11 @@ def load(
 		dir0=dir0_t,
 		dir1=dir1_t,
 		valid=valid_t,
+		dir0_y=dir0_y_t,
+		dir1_y=dir1_y_t,
+		dir0_x=dir0_x_t,
+		dir1_x=dir1_x_t,
 		downscale=float(downscale) if downscale is not None else 1.0,
 		constraints=None,
+		data_margin_xy=(float(margin_x), float(margin_y)),
 	)

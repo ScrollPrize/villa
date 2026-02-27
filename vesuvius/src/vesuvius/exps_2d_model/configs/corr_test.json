@@ -1,0 +1,44 @@
+{
+	"args": {
+		"__unet-checkpoint": "../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt",
+		"input": "../s5/PHerc172.volpkg/volumes_lasagna/cos_comb.zarr",
+		"out-dir": "res_corr_test",
+		"model-input" : "/home/hendrik/remote/turbosheep/home/hendrik/business/aiconsulting/vesuviuschallenge/data/s5/PHerc172.volpkg/paths/manual_v003.tifxyz/model.pt",
+		"points" : "zickezacke.json",
+		"snapshot-interval" : 100
+	},
+	"base": {
+		"dir_v": 10.0,
+		"dir_conn": 1.0,
+		"step": 100.0,
+		"smooth_x": 0.0,
+		"smooth_y": 0.01,
+		"gradmag": 1.0,
+		"mean_pos": 0.0,
+		"meshoff_sy": 0.001,
+		"conn_sy_l": 0.0,
+		"conn_sy_r": 0.0,
+		"angle": 0.001,
+		"y_straight": 0.0,
+		"data": 0.4,
+		"data_plain": 0.2,
+		"data_grad": 0.0,
+		"z_straight": 10.0,
+		"z_normal": 10.0,
+		"corr_winding": 1.0
+	},
+	"stages": [
+		{
+			"name": "global2",
+			"steps": 2000,
+			"lr": [0.1, 0.01, 0.001],
+			"params": ["mesh_ms", "conn_offset_ms"],
+			"min_scaledown": 0,
+			"w_fac": {
+				"data": 0.0,
+				"data_plain": 0.0,
+				"z_straight": 0.001
+			}
+		}
+	]
+}
