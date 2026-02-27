@@ -11,6 +11,16 @@ import torch
 import zarr
 from tqdm import tqdm
 
+try:
+    import trimesh
+except Exception:  # pragma: no cover - optional dependency at runtime
+    trimesh = None
+
+try:
+    from numba import njit
+except Exception:  # pragma: no cover - optional dependency at runtime
+    njit = None
+
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 from vesuvius.neural_tracing.inference.common import (
@@ -1103,9 +1113,20 @@ def _save_surface(
     voxel_size_um,
     source,
     metadata,
+    apply_mesh_cleanup=True,
 ):
     save_grid = np.asarray(grid, dtype=np.float32).copy()
     save_valid = np.asarray(valid, dtype=bool)
+    metadata_out = dict(metadata) if isinstance(metadata, dict) else {}
+
+    if bool(apply_mesh_cleanup):
+        save_grid, cleanup_meta = _cleanup_surface_grid_before_save(
+            save_grid,
+            save_valid,
+            target_step_size=float(step_size),
+        )
+        metadata_out.update(cleanup_meta)
+
     save_grid[~save_valid] = -1.0
     save_tifxyz(
         save_grid,
@@ -1114,9 +1135,341 @@ def _save_surface(
         step_size=int(step_size),
         voxel_size_um=float(voxel_size_um),
         source=source,
-        additional_metadata=metadata,
+        additional_metadata=metadata_out,
     )
     return str(Path(out_dir) / uuid)
+
+
+def _build_valid_grid_triangles(valid_mask):
+    valid = np.asarray(valid_mask, dtype=bool)
+    h, w = valid.shape
+    if h < 2 or w < 2:
+        return np.zeros((0, 3), dtype=np.int64)
+
+    quad_valid = valid[:-1, :-1] & valid[1:, :-1] & valid[:-1, 1:] & valid[1:, 1:]
+    qr, qc = np.where(quad_valid)
+    if qr.size == 0:
+        return np.zeros((0, 3), dtype=np.int64)
+
+    index_grid = -np.ones_like(valid, dtype=np.int64)
+    vr, vc = np.where(valid)
+    index_grid[vr, vc] = np.arange(vr.size, dtype=np.int64)
+
+    v00 = index_grid[qr, qc]
+    v10 = index_grid[qr + 1, qc]
+    v01 = index_grid[qr, qc + 1]
+    v11 = index_grid[qr + 1, qc + 1]
+
+    t0 = np.stack([v00, v10, v11], axis=1)
+    t1 = np.stack([v00, v11, v01], axis=1)
+    faces = np.concatenate([t0, t1], axis=0)
+    return faces.astype(np.int64, copy=False)
+
+
+def _build_valid_grid_edges(valid_mask):
+    valid = np.asarray(valid_mask, dtype=bool)
+    h, w = valid.shape
+    if h == 0 or w == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    index_grid = -np.ones_like(valid, dtype=np.int64)
+    vr, vc = np.where(valid)
+    if vr.size < 2:
+        return np.zeros((0, 2), dtype=np.int64)
+    index_grid[vr, vc] = np.arange(vr.size, dtype=np.int64)
+
+    horiz = valid[:, :-1] & valid[:, 1:]
+    hr, hc = np.where(horiz)
+    h_edges = np.zeros((0, 2), dtype=np.int64)
+    if hr.size > 0:
+        h_edges = np.stack([index_grid[hr, hc], index_grid[hr, hc + 1]], axis=1)
+
+    vert = valid[:-1, :] & valid[1:, :]
+    vr_e, vc_e = np.where(vert)
+    v_edges = np.zeros((0, 2), dtype=np.int64)
+    if vr_e.size > 0:
+        v_edges = np.stack([index_grid[vr_e, vc_e], index_grid[vr_e + 1, vc_e]], axis=1)
+
+    if h_edges.size == 0 and v_edges.size == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    if h_edges.size == 0:
+        return v_edges.astype(np.int64, copy=False)
+    if v_edges.size == 0:
+        return h_edges.astype(np.int64, copy=False)
+    return np.concatenate([h_edges, v_edges], axis=0).astype(np.int64, copy=False)
+
+
+def _resolve_duplicate_vertex_positions(vertices, edges, target_step):
+    verts = np.asarray(vertices, dtype=np.float64).copy()
+    if verts.shape[0] < 2:
+        return verts, 0
+
+    tol = max(1e-3, float(target_step) * 1e-4)
+    max_shift = max(tol, 0.75 * float(target_step))
+    original = verts.copy()
+    quantized = np.round(verts / tol).astype(np.int64)
+    _, inverse, counts = np.unique(quantized, axis=0, return_inverse=True, return_counts=True)
+    dup_groups = np.where(counts > 1)[0]
+    if dup_groups.size == 0:
+        return verts, 0
+
+    edge_idx = np.asarray(edges, dtype=np.int64)
+    if edge_idx.size == 0:
+        return verts, 0
+    src = np.concatenate([edge_idx[:, 0], edge_idx[:, 1]], axis=0)
+    dst = np.concatenate([edge_idx[:, 1], edge_idx[:, 0]], axis=0)
+    order = np.argsort(src, kind="stable")
+    src_sorted = src[order]
+    dst_sorted = dst[order]
+    vertex_ids = np.arange(verts.shape[0], dtype=np.int64)
+    nbr_start = np.searchsorted(src_sorted, vertex_ids, side="left")
+    nbr_end = np.searchsorted(src_sorted, vertex_ids, side="right")
+
+    fixed = 0
+    for gid in dup_groups.tolist():
+        members = np.where(inverse == gid)[0]
+        if members.size <= 1:
+            continue
+        member_set = set(int(v) for v in members.tolist())
+        for rank, vid in enumerate(members[1:], start=1):
+            vid_i = int(vid)
+            start = int(nbr_start[vid_i])
+            end = int(nbr_end[vid_i])
+            nbrs_all = dst_sorted[start:end]
+            nbrs = [int(n) for n in nbrs_all.tolist() if int(n) not in member_set]
+            if len(nbrs) > 0:
+                new_pos = np.mean(verts[np.asarray(nbrs, dtype=np.int64)], axis=0)
+            else:
+                seed = float((vid_i + 1) * (rank + 3))
+                direction = np.array(
+                    [
+                        np.sin(seed),
+                        np.cos(2.0 * seed),
+                        np.sin(3.0 * seed + 0.5),
+                    ],
+                    dtype=np.float64,
+                )
+                norm = np.linalg.norm(direction)
+                if norm < 1e-8:
+                    direction = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                else:
+                    direction /= norm
+                new_pos = verts[vid_i] + direction * tol
+            delta = new_pos - original[vid_i]
+            delta_norm = float(np.linalg.norm(delta))
+            if delta_norm > max_shift:
+                new_pos = original[vid_i] + (delta / delta_norm) * max_shift
+            verts[vid_i] = new_pos
+            fixed += 1
+
+    return verts, int(fixed)
+
+
+if njit is not None:
+    @njit(cache=True)
+    def _regularize_edge_lengths_numba_kernel(
+        vertices,
+        edges,
+        target_step,
+        iterations,
+        relax_step,
+        anchor_weight,
+        max_displacement,
+    ):
+        verts = vertices.copy()
+        original = vertices.copy()
+        n_vertices = verts.shape[0]
+        n_edges = edges.shape[0]
+        eps = 1e-8
+
+        for _ in range(iterations):
+            disp = np.zeros((n_vertices, 3), dtype=np.float64)
+            counts = np.zeros((n_vertices,), dtype=np.float64)
+
+            for k in range(n_edges):
+                i = edges[k, 0]
+                j = edges[k, 1]
+
+                dx0 = verts[j, 0] - verts[i, 0]
+                dx1 = verts[j, 1] - verts[i, 1]
+                dx2 = verts[j, 2] - verts[i, 2]
+
+                length = np.sqrt(dx0 * dx0 + dx1 * dx1 + dx2 * dx2)
+                if length <= eps:
+                    continue
+
+                inv_len = 1.0 / length
+                err = length - target_step
+                move0 = 0.5 * err * dx0 * inv_len
+                move1 = 0.5 * err * dx1 * inv_len
+                move2 = 0.5 * err * dx2 * inv_len
+
+                disp[i, 0] += move0
+                disp[i, 1] += move1
+                disp[i, 2] += move2
+                disp[j, 0] -= move0
+                disp[j, 1] -= move1
+                disp[j, 2] -= move2
+                counts[i] += 1.0
+                counts[j] += 1.0
+
+            for i in range(n_vertices):
+                if counts[i] > 0.0:
+                    verts[i, 0] += relax_step * (disp[i, 0] / counts[i]) + anchor_weight * (original[i, 0] - verts[i, 0])
+                    verts[i, 1] += relax_step * (disp[i, 1] / counts[i]) + anchor_weight * (original[i, 1] - verts[i, 1])
+                    verts[i, 2] += relax_step * (disp[i, 2] / counts[i]) + anchor_weight * (original[i, 2] - verts[i, 2])
+                else:
+                    verts[i, 0] += anchor_weight * (original[i, 0] - verts[i, 0])
+                    verts[i, 1] += anchor_weight * (original[i, 1] - verts[i, 1])
+                    verts[i, 2] += anchor_weight * (original[i, 2] - verts[i, 2])
+
+                dx0 = verts[i, 0] - original[i, 0]
+                dx1 = verts[i, 1] - original[i, 1]
+                dx2 = verts[i, 2] - original[i, 2]
+                dist = np.sqrt(dx0 * dx0 + dx1 * dx1 + dx2 * dx2)
+                if dist > max_displacement and dist > eps:
+                    scale = max_displacement / dist
+                    verts[i, 0] = original[i, 0] + dx0 * scale
+                    verts[i, 1] = original[i, 1] + dx1 * scale
+                    verts[i, 2] = original[i, 2] + dx2 * scale
+
+        return verts
+else:
+    _regularize_edge_lengths_numba_kernel = None
+
+
+def _regularize_edge_lengths(
+    vertices,
+    edges,
+    target_step,
+    iterations=8,
+    relax_step=0.35,
+    anchor_weight=0.08,
+    max_displacement_ratio=0.5,
+):
+    verts = np.asarray(vertices, dtype=np.float64).copy()
+    if verts.shape[0] == 0 or np.asarray(edges).size == 0:
+        return verts
+
+    edge_idx = np.asarray(edges, dtype=np.int64)
+    if edge_idx.shape[0] == 0:
+        return verts
+
+    max_displacement = max(1e-6, float(target_step) * float(max_displacement_ratio))
+
+    if _regularize_edge_lengths_numba_kernel is not None and edge_idx.shape[0] >= 256:
+        return _regularize_edge_lengths_numba_kernel(
+            verts,
+            edge_idx,
+            float(target_step),
+            int(iterations),
+            float(relax_step),
+            float(anchor_weight),
+            float(max_displacement),
+        )
+
+    e0 = edge_idx[:, 0]
+    e1 = edge_idx[:, 1]
+    original = verts.copy()
+    target = float(target_step)
+    eps = 1e-8
+
+    for _ in range(int(iterations)):
+        delta = verts[e1] - verts[e0]
+        lengths = np.linalg.norm(delta, axis=1)
+        good = lengths > eps
+        if not bool(good.any()):
+            break
+
+        direction = np.zeros_like(delta)
+        direction[good] = delta[good] / lengths[good, None]
+        length_error = lengths - target
+        move = 0.5 * length_error[:, None] * direction
+
+        disp = np.zeros_like(verts)
+        counts = np.zeros((verts.shape[0], 1), dtype=np.float64)
+        np.add.at(disp, e0, move)
+        np.add.at(disp, e1, -move)
+        np.add.at(counts, e0, 1.0)
+        np.add.at(counts, e1, 1.0)
+
+        nonzero = counts[:, 0] > 0
+        update = np.zeros_like(verts)
+        update[nonzero] = disp[nonzero] / counts[nonzero]
+
+        verts = verts + float(relax_step) * update + float(anchor_weight) * (original - verts)
+        delta_from_original = verts - original
+        delta_norm = np.linalg.norm(delta_from_original, axis=1)
+        too_far = delta_norm > max_displacement
+        if bool(too_far.any()):
+            scale = (max_displacement / np.maximum(delta_norm[too_far], 1e-8))[:, None]
+            verts[too_far] = original[too_far] + delta_from_original[too_far] * scale
+
+    return verts
+
+
+def _cleanup_surface_grid_before_save(grid, valid, target_step_size):
+    grid_arr = np.asarray(grid, dtype=np.float32)
+    valid_mask = np.asarray(valid, dtype=bool)
+    out = grid_arr.copy()
+
+    cleanup_meta = {
+        "mesh_cleanup_enabled": bool(trimesh is not None),
+        "mesh_cleanup_target_step": float(target_step_size),
+        "mesh_cleanup_duplicate_vertices_fixed": 0,
+        "mesh_cleanup_unique_edges": 0,
+        "mesh_cleanup_relaxation_applied": False,
+    }
+
+    if trimesh is None:
+        return out, cleanup_meta
+
+    vr, vc = np.where(valid_mask)
+    if vr.size < 3:
+        return out, cleanup_meta
+
+    faces = _build_valid_grid_triangles(valid_mask)
+    if faces.shape[0] == 0:
+        return out, cleanup_meta
+
+    edges_unique = _build_valid_grid_edges(valid_mask)
+    if edges_unique.shape[0] == 0:
+        return out, cleanup_meta
+
+    verts = out[vr, vc].astype(np.float64, copy=True)
+    if not np.isfinite(verts).all():
+        return out, cleanup_meta
+
+    try:
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False, validate=False)
+        mesh.update_faces(mesh.unique_faces())
+        mesh.update_faces(mesh.nondegenerate_faces())
+        mesh.remove_unreferenced_vertices()
+    except ValueError:
+        return out, cleanup_meta
+
+    cleanup_meta["mesh_cleanup_unique_edges"] = int(edges_unique.shape[0])
+
+    verts, dup_fixed = _resolve_duplicate_vertex_positions(
+        verts,
+        edges_unique,
+        target_step=float(target_step_size),
+    )
+    cleanup_meta["mesh_cleanup_duplicate_vertices_fixed"] = int(dup_fixed)
+
+    if target_step_size is not None and float(target_step_size) > 0.0:
+        verts = _regularize_edge_lengths(
+            verts,
+            edges_unique,
+            target_step=float(target_step_size),
+            iterations=8,
+            relax_step=0.35,
+            anchor_weight=0.08,
+        )
+        cleanup_meta["mesh_cleanup_relaxation_applied"] = True
+
+    out[vr, vc] = verts.astype(np.float32, copy=False)
+    return out, cleanup_meta
 
 
 def _rescale_grid_for_save(grid, valid, scale_factor):
@@ -1287,6 +1640,7 @@ def _run_single_iteration(
                 tifxyz_voxel_size_um,
                 source=source,
                 metadata={**run_meta, "surface_role": "original"},
+                apply_mesh_cleanup=False,
             )
         else:
             outputs["original"] = str(input_path_resolved)
