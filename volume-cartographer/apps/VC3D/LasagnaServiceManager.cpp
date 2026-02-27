@@ -484,8 +484,8 @@ void LasagnaServiceManager::handleStatusReply(QNetworkReply* reply)
     } else if (state == "finished") {
         _optimizationRunning = false;
         _pollTimer->stop();
-        if (_isExternal && !_localOutputDir.isEmpty()) {
-            // External mode: download results archive and unpack locally
+        if (!_localOutputDir.isEmpty()) {
+            // Download results archive and unpack locally
             downloadResults();
         } else {
             QString outputDir = obj["output_dir"].toString();
@@ -504,7 +504,7 @@ void LasagnaServiceManager::handleStatusReply(QNetworkReply* reply)
 }
 
 // ---------------------------------------------------------------------------
-// Results download (external mode)
+// Results download
 // ---------------------------------------------------------------------------
 
 void LasagnaServiceManager::downloadResults()

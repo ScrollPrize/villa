@@ -2017,13 +2017,8 @@ void CWindow::CreateWidgets(void)
         }
         request[QStringLiteral("config")] = config;
 
-        if (isNewModel) {
-            // New model: no model_input/model_data needed
-            if (!mgr.isExternal()) {
-                request[QStringLiteral("output_dir")] = outputDir;
-            }
-        } else if (mgr.isExternal()) {
-            // Re-optimize external: send model.pt as base64 data
+        if (!isNewModel) {
+            // Re-optimize / Expand: send model.pt as base64 data
             QFile modelFile(modelPath);
             if (!modelFile.open(QIODevice::ReadOnly)) {
                 auto msg = tr("Cannot read model file: %1").arg(modelPath);
@@ -2035,13 +2030,9 @@ void CWindow::CreateWidgets(void)
             modelFile.close();
             request[QStringLiteral("model_data")] =
                 QString::fromLatin1(modelBytes.toBase64());
-        } else {
-            // Re-optimize internal: send local paths directly
-            request[QStringLiteral("model_input")] = modelPath;
-            request[QStringLiteral("output_dir")] = outputDir;
         }
 
-        mgr.startOptimization(request, mgr.isExternal() ? outputDir : QString());
+        mgr.startOptimization(request, outputDir);
         statusBar()->showMessage(
             tr("Lasagna optimization started (%1). Output: %2")
                 .arg(isNewModel ? tr("new model") : tr("re-optimize"))

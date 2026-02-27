@@ -481,14 +481,16 @@ class Model2D(nn.Module):
 		bad = dirs - {"left", "right", "up", "down", "fw", "bw"}
 		if bad:
 			raise ValueError(f"invalid grow direction(s): {sorted(bad)}")
-		if ("fw" in dirs or "bw" in dirs) and (dirs - {"fw", "bw"}):
-			raise ValueError("grow: fw/bw may only be used alone")
-		if "fw" in dirs and "bw" in dirs:
-			raise ValueError("grow: cannot combine fw and bw")
-
 		self._last_grow_insert_z = None
-		if "fw" in dirs or "bw" in dirs:
-			side = +1 if "fw" in dirs else -1
+		self._last_grow_insert_z_list = []
+		self._last_grow_insert_lr = None
+		self.const_mask_lr = None
+
+		# -- Z directions (fw/bw) — one step each --
+		for z_dir in ("bw", "fw"):
+			if z_dir not in dirs:
+				continue
+			side = +1 if z_dir == "fw" else -1
 			z0 = int(self.z_size)
 			self.mesh_ms = nn.ParameterList(
 				[nn.Parameter(self._expand_copy_edge(src=p, dim=0, side=side)) for p in list(self.mesh_ms)]
@@ -499,52 +501,53 @@ class Model2D(nn.Module):
 			self.amp = nn.Parameter(self._expand_copy_edge(src=self.amp, dim=0, side=side))
 			self.bias = nn.Parameter(self._expand_copy_edge(src=self.bias, dim=0, side=side))
 			self.z_size = int(self.z_size) + 1
-			self._last_grow_insert_z = z0 if side > 0 else 0
-			self._last_grow_insert_lr = None
-			self.const_mask_lr = None
-			return
+			ins = z0 if side > 0 else 0
+			self._last_grow_insert_z = ins
+			self._last_grow_insert_z_list.append(ins)
 
-		h0 = int(self.mesh_h)
-		w0 = int(self.mesh_w)
-		py0 = 0
-		px0 = 0
-		ho = h0
-		wo = w0
-		order = ["up", "down", "left", "right"]
-		dirs_list = [d for d in order if d in dirs]
-		grow_specs: dict[str, tuple[int, int, int, int, int, int]] = {
-			# (dim, side, d_mesh_h, d_mesh_w, d_py0, d_px0)
-			"up": (2, -1, +1, 0, +1, 0),
-			"down": (2, +1, +1, 0, 0, 0),
-			"left": (3, -1, 0, +1, 0, +1),
-			"right": (3, +1, 0, +1, 0, 0),
-		}
-		for _ in range(int(steps)):
-			for d in dirs_list:
-				dim, side, dh, dw, dpy, dpx = grow_specs[d]
-				self.mesh_ms = self._grow_param_pyramid_flat_edit(
-					src=self.mesh_ms,
-					dim=dim,
-					side=side,
-					editor=self._expand_linear,
-				)
-				self.conn_offset_ms = self._grow_param_pyramid_flat_edit(
-					src=self.conn_offset_ms,
-					dim=dim,
-					side=side,
-					editor=self._expand_copy_edge,
-				)
-				amp2 = self._expand_copy_edge(src=self.amp, dim=dim, side=side)
-				bias2 = self._expand_copy_edge(src=self.bias, dim=dim, side=side)
-				self.amp = nn.Parameter(amp2)
-				self.bias = nn.Parameter(bias2)
-				self.mesh_h = int(self.mesh_h) + dh
-				self.mesh_w = int(self.mesh_w) + dw
-				py0 += dpy
-				px0 += dpx
+		# -- XY directions --
+		xy_dirs = dirs - {"fw", "bw"}
+		if xy_dirs:
+			h0 = int(self.mesh_h)
+			w0 = int(self.mesh_w)
+			py0 = 0
+			px0 = 0
+			ho = h0
+			wo = w0
+			order = ["up", "down", "left", "right"]
+			dirs_list = [d for d in order if d in xy_dirs]
+			grow_specs: dict[str, tuple[int, int, int, int, int, int]] = {
+				# (dim, side, d_mesh_h, d_mesh_w, d_py0, d_px0)
+				"up": (2, -1, +1, 0, +1, 0),
+				"down": (2, +1, +1, 0, 0, 0),
+				"left": (3, -1, 0, +1, 0, +1),
+				"right": (3, +1, 0, +1, 0, 0),
+			}
+			for _ in range(int(steps)):
+				for d in dirs_list:
+					dim, side, dh, dw, dpy, dpx = grow_specs[d]
+					self.mesh_ms = self._grow_param_pyramid_flat_edit(
+						src=self.mesh_ms,
+						dim=dim,
+						side=side,
+						editor=self._expand_linear,
+					)
+					self.conn_offset_ms = self._grow_param_pyramid_flat_edit(
+						src=self.conn_offset_ms,
+						dim=dim,
+						side=side,
+						editor=self._expand_copy_edge,
+					)
+					amp2 = self._expand_copy_edge(src=self.amp, dim=dim, side=side)
+					bias2 = self._expand_copy_edge(src=self.bias, dim=dim, side=side)
+					self.amp = nn.Parameter(amp2)
+					self.bias = nn.Parameter(bias2)
+					self.mesh_h = int(self.mesh_h) + dh
+					self.mesh_w = int(self.mesh_w) + dw
+					py0 += dpy
+					px0 += dpx
 
-		self._last_grow_insert_lr = (int(py0), int(px0), int(ho), int(wo))
-		self.const_mask_lr = None
+			self._last_grow_insert_lr = (int(py0), int(px0), int(ho), int(wo))
 
 	@staticmethod
 	def _expand_linear(*, src: torch.Tensor, dim: int, side: int) -> torch.Tensor:
