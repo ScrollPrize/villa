@@ -521,13 +521,7 @@ def load(
 			dir1_y_t = _u8_to_t(_read_ch("dir1_y")) if "dir1_y" in ci else None
 			dir0_x_t = _u8_to_t(_read_ch("dir0_x")) if "dir0_x" in ci else None
 			dir1_x_t = _u8_to_t(_read_ch("dir1_x")) if "dir1_x" in ci else None
-			_has_pred_dt = "pred_dt" in ci
-			print(f"[fit_data] pred_dt in ci: {_has_pred_dt}", flush=True)
-			if _has_pred_dt:
-				pred_dt_t = _u8_raw_to_t(_read_ch("pred_dt"))
-				print(f"[fit_data] pred_dt_t shape={pred_dt_t.shape} min={pred_dt_t.min().item():.1f} max={pred_dt_t.max().item():.1f}", flush=True)
-			else:
-				pred_dt_t = None
+			pred_dt_t = _u8_raw_to_t(_read_ch("pred_dt")) if "pred_dt" in ci else None
 			crop = None
 			downscale = float(ds_meta)
 			skip_postprocess = True
@@ -655,7 +649,6 @@ def load(
 		for zi in range(int(cos_np_all.shape[0])):
 			tifffile.imwrite(str(dbg_dir / f"z{zi:04d}.tif"), cos_np_all[zi], compression="lzw")
 
-	print(f"[fit_data] load() returning: pred_dt_t is None: {pred_dt_t is None}", flush=True)
 	return FitData(
 		cos=cos_t,
 		grad_mag=mag_t,
