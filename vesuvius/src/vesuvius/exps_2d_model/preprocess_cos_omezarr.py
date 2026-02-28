@@ -67,6 +67,7 @@ def run_preprocess(
 	dir_blur_sigma: float,
 	chunk_z: int,
 	chunk_yx: int,
+	measure_cuda_timings: bool = False,
 ) -> None:
 	a_in = zarr.open(str(input_path), mode="r")
 	if not hasattr(a_in, "shape"):
@@ -223,10 +224,10 @@ def run_preprocess(
 
 		for bi, ss in enumerate(s_keep):
 			raw_i = raw_blk[bi : bi + 1]
-			if torch_device.type == "cuda":
+			if measure_cuda_timings and torch_device.type == "cuda":
 				torch.cuda.synchronize(torch_device)
 			t_inf0 = time.time()
-			with torch.no_grad():
+			with torch.inference_mode(), torch.autocast(device_type=torch_device.type):
 				pred_i = unet_infer_tiled(
 					model,
 					raw_i,
@@ -234,7 +235,7 @@ def run_preprocess(
 					overlap=int(overlap),
 					border=int(border),
 				)
-			if torch_device.type == "cuda":
+			if measure_cuda_timings and torch_device.type == "cuda":
 				torch.cuda.synchronize(torch_device)
 			t_infer_sum += float(time.time() - t_inf0)
 
@@ -260,12 +261,6 @@ def run_preprocess(
 			if float(dir_blur_sigma) > 0.0:
 				dir0 = _gaussian_blur_nchw(x=dir0, sigma=float(dir_blur_sigma))
 				dir1 = _gaussian_blur_nchw(x=dir1, sigma=float(dir_blur_sigma))
-			gm_np = grad_mag[0, 0].detach().cpu().numpy().astype(np.float32)
-			print(
-				f"[preprocess_cos_omezarr][grad_mag] {ax_name}={int(ss)} min={float(gm_np.min()):.6f} max={float(gm_np.max()):.6f} mean={float(gm_np.mean()):.6f}",
-				flush=True,
-			)
-
 			cos_u8 = np.clip(cos_np * 255.0, 0.0, 255.0).astype(np.uint8)
 			grad_mag_u8 = np.clip(grad_mag[0, 0].detach().cpu().numpy().astype(np.float32) * 1000.0, 0.0, 255.0).astype(np.uint8)
 			dir0_u8 = np.clip(dir0[0, 0].detach().cpu().numpy().astype(np.float32) * 255.0, 0.0, 255.0).astype(np.uint8)
@@ -472,6 +467,8 @@ def main(argv: list[str] | None = None) -> int:
 		help="Output chunk size along the slice axis.")
 	p.add_argument("--chunk-yx", "--chunk-plane", dest="chunk_yx", type=int, default=32,
 		help="Output chunk size for the plane axes.")
+	p.add_argument("--measure-cuda-timings", action="store_true", default=False,
+		help="Insert cuda.synchronize() calls to measure per-step timings accurately (slower).")
 	args = p.parse_args(argv)
 
 	run_preprocess(
@@ -490,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
 		dir_blur_sigma=float(args.dir_blur_sigma),
 		chunk_z=int(args.chunk_z),
 		chunk_yx=int(args.chunk_yx),
+		measure_cuda_timings=bool(args.measure_cuda_timings),
 	)
 	return 0
 

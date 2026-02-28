@@ -316,6 +316,7 @@ def optimize(
 	snapshot_fn,
 	corr_snapshot_fn=None,
 	progress_fn=None,
+	measure_cuda_timings: bool = False,
 ) -> fit_data.FitData:
 	data_z0 = data_cfg.unet_z if data_cfg is not None else None
 	def _masked_mean_per_z(*, lm: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -538,18 +539,20 @@ def optimize(
 		}
 		_status_rows_since_header = 0
 
-		def _print_status(*, step_label: str, loss_val: float, tv: dict[str, float], pv: dict[str, float]) -> None:
+		def _print_status(*, step_label: str, loss_val: float, tv: dict[str, float], pv: dict[str, float],
+						  its: float | None = None) -> None:
 			nonlocal _status_rows_since_header
 			tv_keys = sorted(tv.keys())
 			pv_keys = sorted(pv.keys())
 			cols = tv_keys + [f"p:{k}" for k in pv_keys]
 			if _status_rows_since_header % 20 == 0:
-				hdr = f"{'step':>20s}  {'loss':>8s}"
+				hdr = f"{'step':>20s}  {'loss':>8s}  {'it/s':>6s}"
 				for c in cols:
 					hdr += f"  {c:>10s}"
 				print(hdr)
 			_status_rows_since_header += 1
-			row = f"{step_label:>20s}  {loss_val:8.4f}"
+			its_str = f"{its:6.1f}" if its is not None else f"{'':>6s}"
+			row = f"{step_label:>20s}  {loss_val:8.4f}  {its_str}"
 			for k in tv_keys:
 				row += f"  {tv[k]:10.4f}"
 			for k in pv_keys:
@@ -593,12 +596,14 @@ def optimize(
 		max_steps = opt_cfg.steps if opt_cfg.termination == "steps" else 10_000_000
 		actual_steps = 0
 		_use_cuda = data.cos.device.type == "cuda"
-		_sync = torch.cuda.synchronize if _use_cuda else lambda: None
+		_do_cuda_timing = measure_cuda_timings and _use_cuda
+		_sync = torch.cuda.synchronize if _do_cuda_timing else lambda: None
 		_t_model_fw_acc = 0.0
 		_t_corr_acc = 0.0
 		_t_other_loss_acc = 0.0
 		_t_bw_acc = 0.0
 		_t_steps_acc = 0
+		_t_wall_start = time.perf_counter()
 		for step in range(max_steps):
 			_sync()
 			_t0 = time.perf_counter()
@@ -614,7 +619,8 @@ def optimize(
 				res = replace(res, _stage_img_masks=stage_img_masks, _stage_img_masks_losses=stage_img_masks_losses)
 			_sync()
 			_t1 = time.perf_counter()
-			_t_model_fw_acc += _t1 - _t0
+			if _do_cuda_timing:
+				_t_model_fw_acc += _t1 - _t0
 			loss = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
 			term_vals: dict[str, float] = {}
 			vis_losses = VisLossCollection(loss_maps={})
@@ -623,11 +629,11 @@ def optimize(
 				w = _need_term(name, opt_cfg.eff)
 				if w == 0.0:
 					continue
-				if name == "corr_winding":
+				if _do_cuda_timing and name == "corr_winding":
 					_sync()
 					_tc0 = time.perf_counter()
 				lv, lms, masks = _loss3(loss_fn=t["loss"], res=res)
-				if name == "corr_winding":
+				if _do_cuda_timing and name == "corr_winding":
 					_sync()
 					_tc1 = time.perf_counter()
 					_t_corr_step = _tc1 - _tc0
@@ -636,14 +642,16 @@ def optimize(
 				loss = loss + w * lv
 			_sync()
 			_t2 = time.perf_counter()
-			_t_corr_acc += _t_corr_step
-			_t_other_loss_acc += (_t2 - _t1) - _t_corr_step
+			if _do_cuda_timing:
+				_t_corr_acc += _t_corr_step
+				_t_other_loss_acc += (_t2 - _t1) - _t_corr_step
 			opt.zero_grad(set_to_none=True)
 			loss.backward()
 			opt.step()
 			_sync()
 			_t3 = time.perf_counter()
-			_t_bw_acc += _t3 - _t2
+			if _do_cuda_timing:
+				_t_bw_acc += _t3 - _t2
 			model.update_conn_offsets()
 			_t_steps_acc += 1
 			_done_steps[0] += 1
@@ -676,8 +684,13 @@ def optimize(
 						param_vals[k] = float(vs[0].detach().cpu())
 				term_vals = {k: round(v, 4) for k, v in term_vals.items()}
 				param_vals = {k: round(v, 4) for k, v in param_vals.items()}
-				_print_status(step_label=f"{label} {step1}/{opt_cfg.steps if opt_cfg.termination == 'steps' else '?'}", loss_val=loss.item(), tv=term_vals, pv=param_vals)
-				if _t_steps_acc > 0:
+				# Compute it/s from wall-clock time
+				_t_wall_now = time.perf_counter()
+				_t_wall_elapsed = _t_wall_now - _t_wall_start
+				_its = _t_steps_acc / _t_wall_elapsed if _t_wall_elapsed > 0 else None
+				_print_status(step_label=f"{label} {step1}/{opt_cfg.steps if opt_cfg.termination == 'steps' else '?'}",
+							  loss_val=loss.item(), tv=term_vals, pv=param_vals, its=_its)
+				if _do_cuda_timing and _t_steps_acc > 0:
 					_t_total = _t_model_fw_acc + _t_other_loss_acc + _t_corr_acc + _t_bw_acc
 					if _t_total > 0:
 						_pct = lambda v: 100.0 * v / _t_total
@@ -686,8 +699,9 @@ def optimize(
 							  f"other_loss {_pct(_t_other_loss_acc):.1f}% | "
 							  f"corr_pts {_pct(_t_corr_acc):.1f}% | "
 							  f"bw+opt {_pct(_t_bw_acc):.1f}%")
-					_t_model_fw_acc = _t_corr_acc = _t_other_loss_acc = _t_bw_acc = 0.0
-					_t_steps_acc = 0
+				_t_model_fw_acc = _t_corr_acc = _t_other_loss_acc = _t_bw_acc = 0.0
+				_t_steps_acc = 0
+				_t_wall_start = _t_wall_now
 				if corr_snapshot_fn is not None:
 					corr_snapshot_fn(stage=label, step=step1, data=data, res=res)
 
@@ -696,7 +710,6 @@ def optimize(
 
 			# Check mask termination (threshold < 1.0 for trilinear upsample precision)
 			if opt_cfg.termination == "mask" and _mask_completion >= 0.999:
-				print(f"[{label}] mask completed at step {step1} (mean={_mask_completion:.6f})")
 				break
 
 		snapshot_fn(stage=label, step=actual_steps, loss=float(loss.detach().cpu()), data=data, res=res, vis_losses=vis_losses)
