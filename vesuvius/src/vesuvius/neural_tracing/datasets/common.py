@@ -2,9 +2,594 @@ import torch
 import numpy as np
 from numba import njit
 from dataclasses import dataclass
+from pathlib import Path
 from vesuvius.tifxyz import Tifxyz
+from vesuvius.tifxyz.upsampling import interpolate_at_points
 import zarr
 from typing import Any, Dict, List, Tuple
+import re
+from functools import lru_cache
+from scipy import ndimage
+from vesuvius.image_proc.intensity.normalization import normalize_zscore
+import tifffile
+import warnings
+
+
+def _parse_z_range(z_range):
+    if z_range is None:
+        return None
+    if not isinstance(z_range, (list, tuple)) or len(z_range) != 2:
+        raise ValueError(f"dataset z_range must be [z_min, z_max], got {z_range!r}")
+    z_min = float(z_range[0])
+    z_max = float(z_range[1])
+    if not np.isfinite(z_min) or not np.isfinite(z_max):
+        raise ValueError(f"dataset z_range must contain finite numbers, got {z_range!r}")
+    if z_min > z_max:
+        z_min, z_max = z_max, z_min
+    return z_min, z_max
+
+
+def _segment_z_bounds(seg):
+    valid = seg._valid_mask
+    if not np.any(valid):
+        return None
+    if seg.bbox is not None:
+        # Segment bbox is in XYZ order: (x_min, y_min, z_min, x_max, y_max, z_max)
+        z_min = float(seg.bbox[2])
+        z_max = float(seg.bbox[5])
+    else:
+        z_vals = seg._z[valid]
+        z_min = float(np.min(z_vals))
+        z_max = float(np.max(z_vals))
+    return z_min, z_max
+
+
+def _segment_overlaps_z_range(seg, z_range):
+    if z_range is None:
+        return True
+    z_bounds = _segment_z_bounds(seg)
+    if z_bounds is None:
+        return False
+    seg_z_min, seg_z_max = z_bounds
+    z_min, z_max = z_range
+    return not (seg_z_min > z_max or seg_z_max < z_min)
+
+
+def _extract_wrap_ids(name: str):
+    if not name:
+        return tuple()
+    wrap_ids = sorted({int(m.group(1)) for m in re.finditer(r"w(\d+)", str(name))})
+    return tuple(wrap_ids)
+
+
+def _has_consecutive_wrap_ids(left_ids, right_ids):
+    if not left_ids or not right_ids:
+        return False
+    right_set = set(right_ids)
+    for wrap_id in left_ids:
+        if (wrap_id - 1) in right_set or (wrap_id + 1) in right_set:
+            return True
+    return False
+
+
+def _triplet_wraps_compatible(target_wrap_meta: dict, other_wrap_meta: dict):
+    if target_wrap_meta["segment_idx"] == other_wrap_meta["segment_idx"]:
+        return True
+    return _has_consecutive_wrap_ids(
+        target_wrap_meta.get("wrap_ids", tuple()),
+        other_wrap_meta.get("wrap_ids", tuple()),
+    )
+
+
+def _wrap_bbox_has_overlap(mask: np.ndarray, bbox_2d):
+    if mask is None:
+        return False
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim != 2 or mask_arr.size == 0:
+        return False
+    r_min, r_max, c_min, c_max = [int(v) for v in bbox_2d]
+    h, w = mask_arr.shape
+    r0 = max(0, r_min)
+    r1 = min(h - 1, r_max)
+    c0 = max(0, c_min)
+    c1 = min(w - 1, c_max)
+    if r1 < r0 or c1 < c0:
+        return False
+    return bool(np.any(mask_arr[r0:r1 + 1, c0:c1 + 1]))
+
+
+def _wrap_chunk_has_overlap(mask: np.ndarray, wrap: dict, patch_world_bbox):
+    """Return True when overlap-mask pixels for this wrap fall inside the chunk bbox."""
+    if mask is None:
+        return False
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim != 2 or mask_arr.size == 0:
+        return False
+
+    seg = wrap.get("segment")
+    if seg is None:
+        return False
+
+    r_min, r_max, c_min, c_max = [int(v) for v in wrap["bbox_2d"]]
+    seg_h, seg_w = seg._valid_mask.shape
+    mask_h, mask_w = mask_arr.shape
+    r0 = max(0, r_min)
+    r1 = min(seg_h - 1, mask_h - 1, r_max)
+    c0 = max(0, c_min)
+    c1 = min(seg_w - 1, mask_w - 1, c_max)
+    if r1 < r0 or c1 < c0:
+        return False
+
+    overlap_local = mask_arr[r0:r1 + 1, c0:c1 + 1] > 0
+    if not bool(np.any(overlap_local)):
+        return False
+
+    seg.use_stored_resolution()
+    x_s, y_s, z_s, valid_s = seg[r0:r1 + 1, c0:c1 + 1]
+    if x_s.size == 0:
+        return False
+
+    z_min, z_max, y_min, y_max, x_min, x_max = patch_world_bbox
+    in_chunk = (
+        (z_s >= z_min) & (z_s < z_max) &
+        (y_s >= y_min) & (y_s < y_max) &
+        (x_s >= x_min) & (x_s < x_max)
+    )
+    finite = np.isfinite(z_s) & np.isfinite(y_s) & np.isfinite(x_s)
+    in_chunk &= finite
+    if valid_s is not None:
+        in_chunk &= np.asarray(valid_s, dtype=bool)
+    return bool(np.any(overlap_local & in_chunk))
+
+
+def _filter_triplet_overlap_chunks(patches, config):
+    """Drop triplet chunks based on configured overlap filtering mode.
+
+    Modes:
+      - bbox: drop if overlap_mask has hits inside the wrap bbox.
+      - any_masked_pixel: drop if overlap_mask hits overlap with this wrap inside this chunk's world bbox.
+    """
+    mask_filename = str(config["triplet_overlap_mask_filename"])
+    warn_missing_masks = bool(config["triplet_warn_missing_overlap_masks"])
+    overlap_filter_mode = str(config.get("triplet_overlap_filter_mode", "bbox")).lower()
+    warned_missing = set()
+    kept = []
+    kept_indices = []
+
+    for patch_idx, patch in enumerate(patches):
+        drop_chunk = False
+        for wrap in patch.wraps:
+            seg = wrap.get("segment")
+            seg_path = getattr(seg, "path", None)
+            if seg_path is None:
+                continue
+            seg_path = Path(seg_path)
+            mask_path = seg_path / mask_filename
+            mask_key = str(mask_path)
+
+            if not mask_path.exists():
+                if warn_missing_masks and mask_key not in warned_missing:
+                    warned_missing.add(mask_key)
+                    warnings.warn(
+                        f"Triplet overlap mask not found at {mask_path}; treating as no-overlap for this wrap.",
+                        RuntimeWarning,
+                    )
+                continue
+
+            overlap_mask = np.asarray(tifffile.imread(str(mask_path))) > 0
+
+            if overlap_filter_mode == "any_masked_pixel":
+                has_overlap = _wrap_chunk_has_overlap(overlap_mask, wrap, patch.world_bbox)
+            elif overlap_filter_mode == "bbox":
+                has_overlap = _wrap_bbox_has_overlap(overlap_mask, wrap["bbox_2d"])
+            else:
+                raise ValueError(
+                    "triplet_overlap_filter_mode must be one of {'bbox', 'any_masked_pixel'}, "
+                    f"got {overlap_filter_mode!r}"
+                )
+            if has_overlap:
+                drop_chunk = True
+                break
+
+        if not drop_chunk:
+            kept.append(patch)
+            kept_indices.append(int(patch_idx))
+
+    return kept, tuple(kept_indices)
+
+
+def _compute_wrap_order_stats(wrap):
+    """Compute per-wrap medians used for triplet neighbor ordering."""
+    seg = wrap["segment"]
+    r_min, r_max, c_min, c_max = wrap["bbox_2d"]
+
+    seg_h, seg_w = seg._valid_mask.shape
+    r_min = max(0, r_min)
+    r_max = min(seg_h - 1, r_max)
+    c_min = max(0, c_min)
+    c_max = min(seg_w - 1, c_max)
+    if r_max < r_min or c_max < c_min:
+        return None
+
+    seg.use_stored_resolution()
+    x_s, y_s, _, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
+    if x_s.size == 0:
+        return None
+
+    if valid_s is not None:
+        if not valid_s.any():
+            return None
+        x_vals = x_s[valid_s]
+        y_vals = y_s[valid_s]
+    else:
+        x_vals = x_s.reshape(-1)
+        y_vals = y_s.reshape(-1)
+
+    finite = np.isfinite(x_vals) & np.isfinite(y_vals)
+    if not finite.any():
+        return None
+    x_vals = x_vals[finite]
+    y_vals = y_vals[finite]
+
+    if x_vals.size == 0 or y_vals.size == 0:
+        return None
+
+    return {
+        "x_median": float(np.median(x_vals)),
+        "y_median": float(np.median(y_vals)),
+    }
+
+
+def _read_volume_crop_from_patch(patch, crop_size, min_corner, max_corner):
+    volume = patch.volume
+    if isinstance(volume, zarr.Group):
+        volume = volume[str(patch.scale)]
+
+    vol_crop = np.zeros(crop_size, dtype=volume.dtype)
+    vol_shape = volume.shape
+    src_starts = np.maximum(min_corner, 0)
+    src_ends = np.minimum(max_corner, np.array(vol_shape, dtype=np.int64))
+    dst_starts = src_starts - min_corner
+    dst_ends = dst_starts + (src_ends - src_starts)
+
+    if np.all(src_ends > src_starts):
+        vol_crop[
+            dst_starts[0]:dst_ends[0],
+            dst_starts[1]:dst_ends[1],
+            dst_starts[2]:dst_ends[2],
+        ] = volume[
+            src_starts[0]:src_ends[0],
+            src_starts[1]:src_ends[1],
+            src_starts[2]:src_ends[2],
+        ]
+    return normalize_zscore(vol_crop)
+
+
+def _validate_result_tensors(result: dict, idx: int, enabled: bool):
+    if not bool(enabled):
+        return True
+    for key, tensor in result.items():
+        if not torch.is_tensor(tensor):
+            print(f"WARNING: Non-tensor value for '{key}' at index {idx}, resampling...")
+            return False
+        if tensor.numel() == 0:
+            print(f"WARNING: Empty tensor for '{key}' at index {idx}, resampling...")
+            return False
+        if not bool(torch.isfinite(tensor).all()):
+            print(f"WARNING: Non-finite values in '{key}' at index {idx}, resampling...")
+            return False
+    return True
+
+
+def _should_attempt_cond_local_perturb(config: dict, apply_perturbation: bool = True) -> bool:
+    cfg = dict(config["cond_local_perturb"] or {})
+    if not bool(cfg["enabled"]):
+        return False
+    if float(cfg["probability"]) <= 0.0:
+        return False
+    if not bool(apply_perturbation):
+        return False
+    return True
+
+
+def _require_augmented_keypoints(augmented: dict, expected_shape, mode: str):
+    augmented_keypoints = augmented.get("keypoints")
+    expected_tuple = tuple(expected_shape)
+    requirement = (
+        "cond_local_perturb post-augmentation requires the augmentation pipeline to preserve "
+        "keypoints when cond_surface_local is provided."
+    )
+    if augmented_keypoints is None:
+        raise RuntimeError(
+            f"{mode} augmentation did not return keypoints (expected shape {expected_tuple}); "
+            f"{requirement}"
+        )
+    actual_tuple = tuple(augmented_keypoints.shape)
+    if actual_tuple != expected_tuple:
+        raise RuntimeError(
+            f"{mode} augmentation returned keypoints with shape {actual_tuple}; expected "
+            f"{expected_tuple}. {requirement}"
+        )
+    return augmented_keypoints
+
+
+def _prepare_cond_surface_keypoints(cond_surface_local):
+    if cond_surface_local is None:
+        return None, None, None, True
+    if cond_surface_local.ndim != 3 or int(cond_surface_local.shape[-1]) != 3:
+        return None, None, None, False
+    cond_surface_shape = tuple(int(s) for s in cond_surface_local.shape[:2])
+    cond_surface_keypoints = cond_surface_local.reshape(-1, 3).contiguous()
+    return cond_surface_local, cond_surface_shape, cond_surface_keypoints, True
+
+
+def _fraction_within_distance(dist_map: np.ndarray, source_mask: np.ndarray, max_distance_voxels: float) -> float:
+    dist = np.asarray(dist_map, dtype=np.float32)
+    mask = np.asarray(source_mask, dtype=bool)
+    if dist.shape != mask.shape:
+        raise ValueError(
+            f"dist_map shape must match source_mask shape, got {tuple(dist.shape)} vs {tuple(mask.shape)}"
+        )
+    if not bool(mask.any()):
+        return 0.0
+    vals = dist[mask]
+    finite = np.isfinite(vals)
+    vals = vals[finite]
+    if vals.size == 0:
+        return 0.0
+    return float(np.mean(vals <= float(max_distance_voxels)))
+
+
+def _fraction_disp_within_distance(
+    disp_np: np.ndarray,
+    source_mask: np.ndarray,
+    max_distance_voxels: float,
+) -> float:
+    """Fraction of masked voxels whose displacement magnitude is <= threshold."""
+    disp = np.asarray(disp_np, dtype=np.float32)
+    mask = np.asarray(source_mask, dtype=bool)
+    if disp.ndim != 4 or disp.shape[0] != 3:
+        raise ValueError(f"disp_np must have shape (3, D, H, W), got {tuple(disp.shape)}")
+    if mask.shape != tuple(disp.shape[1:]):
+        raise ValueError(
+            "source_mask shape must match displacement spatial shape, "
+            f"got {tuple(mask.shape)} vs {tuple(disp.shape[1:])}"
+        )
+    if not bool(mask.any()):
+        return 0.0
+
+    masked_disp = disp[:, mask]
+    if masked_disp.size == 0:
+        return 0.0
+    finite = np.isfinite(masked_disp).all(axis=0)
+    masked_disp = masked_disp[:, finite]
+    if masked_disp.size == 0:
+        return 0.0
+
+    mags = np.sqrt(np.sum(masked_disp * masked_disp, axis=0, dtype=np.float32), dtype=np.float32)
+    return float(np.mean(mags <= float(max_distance_voxels)))
+
+
+def _triplet_close_contact_fractions(
+    cond_mask: np.ndarray,
+    behind_mask: np.ndarray,
+    front_mask: np.ndarray,
+    behind_disp_np: np.ndarray,
+    front_disp_np: np.ndarray,
+    max_distance_voxels: float,
+):
+    behind_disp = np.asarray(behind_disp_np, dtype=np.float32)
+    front_disp = np.asarray(front_disp_np, dtype=np.float32)
+    if behind_disp.ndim != 4 or behind_disp.shape[0] != 3:
+        raise ValueError(f"behind_disp_np must have shape (3, D, H, W), got {tuple(behind_disp.shape)}")
+    if front_disp.ndim != 4 or front_disp.shape[0] != 3:
+        raise ValueError(f"front_disp_np must have shape (3, D, H, W), got {tuple(front_disp.shape)}")
+
+    cond_behind_frac = _fraction_disp_within_distance(behind_disp, cond_mask, max_distance_voxels)
+    cond_front_frac = _fraction_disp_within_distance(front_disp, cond_mask, max_distance_voxels)
+    behind_to_front_frac = _fraction_disp_within_distance(front_disp, behind_mask, max_distance_voxels)
+    front_to_behind_frac = _fraction_disp_within_distance(behind_disp, front_mask, max_distance_voxels)
+    behind_front_frac = max(behind_to_front_frac, front_to_behind_frac)
+    return cond_behind_frac, cond_front_frac, behind_front_frac
+
+
+def create_band_mask(
+    cond_bin_full: np.ndarray,
+    d_front_work: np.ndarray,
+    d_behind_work: np.ndarray,
+    front_disp_work: np.ndarray,
+    behind_disp_work: np.ndarray,
+    band_pct: float,
+    band_padding: float,
+    cc_structure_26: np.ndarray,
+    closing_structure_3: np.ndarray,
+):
+    """Build a dense slab mask between two wrap displacements for triplet band mode."""
+    cond_bin = np.asarray(cond_bin_full, dtype=np.uint8)
+    if cond_bin.sum() == 0:
+        return None
+
+    cond_mask = cond_bin > 0
+    cond_to_front = d_front_work[cond_mask]
+    cond_to_behind = d_behind_work[cond_mask]
+    if cond_to_front.size == 0 or cond_to_behind.size == 0:
+        return None
+
+    # Inside points tend to have front/back displacement vectors pointing in
+    # opposite directions (non-positive dot product).
+    d_sum_work = d_front_work + d_behind_work
+    cond_sum = (cond_to_front + cond_to_behind).astype(np.float32, copy=False)
+    if cond_sum.size == 0:
+        return None
+
+    sum_threshold = float(np.percentile(cond_sum, band_pct)) + (2.0 * band_padding)
+    vector_dot = np.sum(front_disp_work * behind_disp_work, axis=0, dtype=np.float32)
+    dense_band = (vector_dot <= 0.0) & (d_sum_work <= sum_threshold)
+    if not dense_band.any():
+        return None
+
+    # Remove isolated islands: keep only components connected to conditioning.
+    labels, num_labels = ndimage.label(dense_band, structure=cc_structure_26)
+    if num_labels <= 0:
+        return None
+    touching = np.unique(labels[cond_mask])
+    touching = touching[touching > 0]
+    if touching.size == 0:
+        return None
+    keep = np.zeros(num_labels + 1, dtype=bool)
+    keep[touching] = True
+
+    dense_band = keep[labels]
+    # Fill tiny holes inside the slab.
+    dense_band = ndimage.binary_closing(
+        dense_band,
+        structure=closing_structure_3,
+        iterations=1,
+    )
+    if not dense_band.any():
+        return None
+
+    # Closing can create detached islands; keep only cond-connected components.
+    labels, num_labels = ndimage.label(dense_band, structure=cc_structure_26)
+    if num_labels <= 0:
+        return None
+    touching = np.unique(labels[cond_mask])
+    touching = touching[touching > 0]
+    if touching.size == 0:
+        return None
+    keep = np.zeros(num_labels + 1, dtype=bool)
+    keep[touching] = True
+    return keep[labels].astype(np.float32, copy=False)
+
+
+def _compute_triplet_edt_bbox(
+    cond_mask: np.ndarray,
+    behind_mask: np.ndarray,
+    front_mask: np.ndarray,
+    padding_voxels: float,
+):
+    """Return padded (z,y,x) slices for triplet EDT compute region, or None if empty."""
+    cond = np.asarray(cond_mask, dtype=bool)
+    behind = np.asarray(behind_mask, dtype=bool)
+    front = np.asarray(front_mask, dtype=bool)
+    if cond.shape != behind.shape or cond.shape != front.shape:
+        raise ValueError(
+            "triplet EDT bbox masks must share shape, "
+            f"got cond={tuple(cond.shape)} behind={tuple(behind.shape)} front={tuple(front.shape)}"
+        )
+    if cond.ndim != 3:
+        raise ValueError(f"triplet EDT bbox masks must be 3D, got shape {tuple(cond.shape)}")
+
+    union = cond | behind | front
+    if not union.any():
+        return None
+
+    pad = int(np.ceil(max(0.0, float(padding_voxels))))
+    zz, yy, xx = np.nonzero(union)
+    d, h, w = union.shape
+
+    z0 = max(0, int(zz.min()) - pad)
+    y0 = max(0, int(yy.min()) - pad)
+    x0 = max(0, int(xx.min()) - pad)
+    z1 = min(d - 1, int(zz.max()) + pad)
+    y1 = min(h - 1, int(yy.max()) + pad)
+    x1 = min(w - 1, int(xx.max()) + pad)
+    if z1 < z0 or y1 < y0 or x1 < x0:
+        return None
+    return (slice(z0, z1 + 1), slice(y0, y1 + 1), slice(x0, x1 + 1))
+
+
+@lru_cache(maxsize=5)
+def _small_spherical_footprint(radius: int):
+    offsets = np.arange(-radius, radius + 1, dtype=np.int32)
+    zz, yy, xx = np.meshgrid(offsets, offsets, offsets, indexing='ij')
+    return (zz * zz + yy * yy + xx * xx) <= (radius * radius)
+
+
+def edt_dilate_binary_mask(mask: np.ndarray, radius_voxels: float) -> np.ndarray:
+    """Dilate binary mask by EDT thresholding; returns a boolean mask."""
+    radius = float(radius_voxels)
+    mask_bool = np.asarray(mask) > 0
+    if radius <= 0.0 or not mask_bool.any():
+        return mask_bool
+    # Exact structuring-element dilation is faster than EDT for common small
+    # integer radii (for example, triplet_gt_vector_dilation_radius=1.0).
+    rounded_radius = int(round(radius))
+    if abs(radius - rounded_radius) <= 1e-6 and rounded_radius <= 4:
+        footprint = _small_spherical_footprint(rounded_radius)
+        return ndimage.binary_dilation(mask_bool, structure=footprint, iterations=1)
+    dist = ndimage.distance_transform_edt(~mask_bool)
+    return dist <= radius
+
+
+def _signed_distance_field(mask: np.ndarray) -> np.ndarray:
+    """Signed distance using the legacy sign convention (positive inside)."""
+    mask_bool = np.asarray(mask) > 0
+    dist_outside = ndimage.distance_transform_edt(~mask_bool)
+    dist_inside = ndimage.distance_transform_edt(mask_bool)
+    return (dist_inside - dist_outside).astype(np.float32, copy=False)
+
+
+def _upsample_world_triplet(x_s, y_s, z_s, scale_y: float, scale_x: float):
+    """Upsample (x, y, z) sampled grids using tifxyz interpolation."""
+    h_s, w_s = x_s.shape
+    h_up = int(round(h_s / scale_y))
+    w_up = int(round(w_s / scale_x))
+    dense_rows = np.linspace(0, h_s - 1, h_up, dtype=np.float32)
+    dense_cols = np.linspace(0, w_s - 1, w_up, dtype=np.float32)
+    query_row, query_col = np.meshgrid(dense_rows, dense_cols, indexing="ij")
+
+    x_src = np.asarray(x_s, dtype=np.float32)
+    y_src = np.asarray(y_s, dtype=np.float32)
+    z_src = np.asarray(z_s, dtype=np.float32)
+    valid_src = np.ones((h_s, w_s), dtype=bool)
+
+    x_up, y_up, z_up, valid = interpolate_at_points(
+        x_src,
+        y_src,
+        z_src,
+        valid_src,
+        query_row,
+        query_col,
+        scale=(1.0, 1.0),
+        method="catmull_rom",
+    )
+
+    if not np.all(valid):
+        invalid_count = int((~valid).sum())
+        raise ValueError(
+            "Invalid points from Catmull-Rom interpolation: "
+            f"{invalid_count}/{valid.size}"
+        )
+
+    return x_up, y_up, z_up
+
+
+def _trim_to_world_bbox(x_full, y_full, z_full, world_bbox):
+    """Keep the minimal row/col slab that intersects the world bbox."""
+    z_min, z_max, y_min, y_max, x_min, x_max = world_bbox
+    in_bounds = (
+        (z_full >= z_min) & (z_full < z_max) &
+        (y_full >= y_min) & (y_full < y_max) &
+        (x_full >= x_min) & (x_full < x_max)
+    )
+    if not in_bounds.any():
+        return None
+
+    valid_rows = np.any(in_bounds, axis=1)
+    valid_cols = np.any(in_bounds, axis=0)
+    row_idx = np.flatnonzero(valid_rows)
+    col_idx = np.flatnonzero(valid_cols)
+    if row_idx.size == 0 or col_idx.size == 0:
+        return None
+
+    r0, r1 = int(row_idx[0]), int(row_idx[-1])
+    c0, c1 = int(col_idx[0]), int(col_idx[-1])
+    return (
+        x_full[r0:r1 + 1, c0:c1 + 1],
+        y_full[r0:r1 + 1, c0:c1 + 1],
+        z_full[r0:r1 + 1, c0:c1 + 1],
+    )
 
 
 @njit
@@ -105,6 +690,69 @@ def voxelize_surface_grid(
     # Draw vertical lines (between adjacent rows)
     for r in range(n_rows - 1):
         for c in range(n_cols):
+            z0 = int(round(zyx_grid[r, c, 0]))
+            y0 = int(round(zyx_grid[r, c, 1]))
+            x0 = int(round(zyx_grid[r, c, 2]))
+            z1 = int(round(zyx_grid[r + 1, c, 0]))
+            y1 = int(round(zyx_grid[r + 1, c, 1]))
+            x1 = int(round(zyx_grid[r + 1, c, 2]))
+            _draw_line_3d(volume, z0, y0, x0, z1, y1, x1)
+
+    return volume
+
+@njit
+def voxelize_surface_grid_masked(
+    zyx_grid: np.ndarray,
+    crop_size: tuple,
+    valid_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Voxelize a 2D grid of 3D points while honoring a per-cell validity mask.
+
+    Behavior:
+    - Draw all valid points.
+    - Draw row/col edges only when both endpoints are valid.
+
+    Args:
+        zyx_grid: (H, W, 3) array of ZYX coordinates in local crop space
+        crop_size: (D, H, W) shape of output volume
+        valid_mask: (H, W) bool/0-1 mask; True means the grid cell is valid
+
+    Returns:
+        (D, H, W) binary volume with masked surface rasterization
+    """
+    volume = np.zeros(crop_size, dtype=np.float32)
+    n_rows, n_cols = zyx_grid.shape[0], zyx_grid.shape[1]
+
+    # Draw valid points so isolated valid cells are still represented.
+    for r in range(n_rows):
+        for c in range(n_cols):
+            if not valid_mask[r, c]:
+                continue
+            z = int(round(zyx_grid[r, c, 0]))
+            y = int(round(zyx_grid[r, c, 1]))
+            x = int(round(zyx_grid[r, c, 2]))
+            if 0 <= z < volume.shape[0] and 0 <= y < volume.shape[1] and 0 <= x < volume.shape[2]:
+                volume[z, y, x] = 1.0
+
+    # Draw horizontal lines between adjacent valid columns.
+    for r in range(n_rows):
+        for c in range(n_cols - 1):
+            if not (valid_mask[r, c] and valid_mask[r, c + 1]):
+                continue
+            z0 = int(round(zyx_grid[r, c, 0]))
+            y0 = int(round(zyx_grid[r, c, 1]))
+            x0 = int(round(zyx_grid[r, c, 2]))
+            z1 = int(round(zyx_grid[r, c + 1, 0]))
+            y1 = int(round(zyx_grid[r, c + 1, 1]))
+            x1 = int(round(zyx_grid[r, c + 1, 2]))
+            _draw_line_3d(volume, z0, y0, x0, z1, y1, x1)
+
+    # Draw vertical lines between adjacent valid rows.
+    for r in range(n_rows - 1):
+        for c in range(n_cols):
+            if not (valid_mask[r, c] and valid_mask[r + 1, c]):
+                continue
             z0 = int(round(zyx_grid[r, c, 0]))
             y0 = int(round(zyx_grid[r, c, 1]))
             x0 = int(round(zyx_grid[r, c, 2]))

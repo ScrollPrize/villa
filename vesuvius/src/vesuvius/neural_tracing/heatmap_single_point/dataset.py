@@ -13,7 +13,7 @@ from functools import lru_cache
 import torch.nn.functional as F
 from dataclasses import dataclass
 
-import vesuvius.neural_tracing.augmentation as augmentation
+import vesuvius.neural_tracing.heatmap_single_point.augmentation as augmentation
 
 
 
@@ -614,7 +614,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         # Generate srf_overlap mask if enabled
         srf_overlap_mask = None
         if self._config.get('aux_srf_overlap', False):
-            from vesuvius.neural_tracing.surf_overlap_loss import render_surf_overlap_mask
+            from vesuvius.neural_tracing.loss.surf_overlap_loss import render_surf_overlap_mask
             srf_overlap_thickness = self._config.get('srf_overlap_thickness', 2.0)
             # Use first step coordinates for srf_overlap (step 0)
             srf_overlap_mask = render_surf_overlap_mask(

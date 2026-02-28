@@ -12,15 +12,15 @@ import torch.utils.checkpoint
 from einops import rearrange
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.dataset import HeatmapDatasetV2, load_datasets, make_heatmaps
+from vesuvius.neural_tracing.heatmap_single_point.dataset import HeatmapDatasetV2, load_datasets, make_heatmaps
 from vesuvius.models.training.loss.nnunet_losses import DeepSupervisionWrapper, MemoryEfficientSoftDiceLoss
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
-from vesuvius.neural_tracing.deep_supervision import _resize_for_ds, _compute_ds_weights
-from vesuvius.neural_tracing.models import make_model, strip_state, resolve_checkpoint_path
-from vesuvius.neural_tracing.cropping import safe_crop_with_padding, transform_to_first_crop_space
+from vesuvius.neural_tracing.loss.deep_supervision import _resize_for_ds, _compute_ds_weights
+from vesuvius.neural_tracing.nets.models import make_model, strip_state, resolve_checkpoint_path
+from vesuvius.neural_tracing.heatmap_single_point.cropping import safe_crop_with_padding, transform_to_first_crop_space
 from vesuvius.models.training.loss.losses import CosineSimilarityLoss
-from vesuvius.neural_tracing.visualization import make_canvas, print_training_config
+from vesuvius.neural_tracing.heatmap_single_point.visualization import make_canvas, print_training_config
 
 
 @click.command()
@@ -272,7 +272,7 @@ def train(config_path):
         else:
             normals_loss = normals = normals_pred_for_vis = None
         if use_srf_overlap and batch.get('srf_overlap_mask') is not None:
-            from vesuvius.neural_tracing.surf_overlap_loss import compute_surf_overlap_loss
+            from vesuvius.neural_tracing.loss.surf_overlap_loss import compute_surf_overlap_loss
             srf_overlap_mask_raw = batch['srf_overlap_mask']
             # Crop srf_overlap mask to match the subcrop
             srf_overlap_mask_cropped = safe_crop_with_padding(srf_overlap_mask_raw.unsqueeze(-1), first_min_corner_in_outer, config['crop_size']).squeeze(-1)
