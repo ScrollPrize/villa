@@ -391,22 +391,6 @@ def central_winding_pie_ema(*, model: fit_model.Model2D, it: int, params: dict) 
 
 	v_l = v_l / (torch.sqrt((v_l * v_l).sum(dim=1, keepdim=True) + 1e-12))
 	v_r = v_r / (torch.sqrt((v_r * v_r).sum(dim=1, keepdim=True) + 1e-12))
-	if dbg_do and int(n) > 0:
-		pc0 = [float(x) for x in p_c[0].detach().cpu().tolist()]
-		pl0 = [float(x) for x in p_l[0].detach().cpu().tolist()]
-		pr0 = [float(x) for x in p_r[0].detach().cpu().tolist()]
-		vl0 = [float(x) for x in v_l[0].detach().cpu().tolist()]
-		vr0 = [float(x) for x in v_r[0].detach().cpu().tolist()]
-		print(
-			"mask central_winding_pie_ema dbg:",
-			f"it={int(it)} ix={int(ix)} iy_c={float(iy_c):.3f} dh={float(dh):.3f} iy0={float(iy0_f):.3f} iy1={float(iy1_f):.3f}",
-			f"p_c={pc0}",
-			f"p_upper={pl0}",
-			f"p_lower={pr0}",
-			f"n_upper={vl0}",
-			f"n_lower={vr0}",
-		)
-
 	out = torch.zeros((n, 1, h_img, w_img), device=xy.device, dtype=torch.float32)
 	for i in range(n):
 		pl = (float(p_l[i, 0].cpu()), float(p_l[i, 1].cpu()))
@@ -592,13 +576,6 @@ class DilationMaskState:
 			m5 = F.max_pool3d(m5, kernel_size=(ks_z, ks_xy, ks_xy),
 							  stride=1, padding=(n_z, n_xy, n_xy))
 			self.mask = m5.reshape(z, 1, h, w)
-			# Coverage: count nonzero per z-slice
-			nz_per_z = (self.mask[:, 0] > 0).sum(dim=(1, 2)).tolist()
-			total_hw = int(h) * int(w)
-			z_active = sum(1 for v in nz_per_z if v > 0)
-			print(f"[dilation_mask] step={self._step} dilated ks_xy={ks_xy} ks_z={ks_z} "
-				  f"mask({z},{h},{w}) z_active={z_active}/{z} "
-				  f"nz_per_z={[int(v) for v in nz_per_z]}/{total_hw}")
 		self.blurred = self._recompute_blurred()
 
 	def completed(self, model: fit_model.Model2D) -> float:
