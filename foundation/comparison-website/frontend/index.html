@@ -1,0 +1,1202 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pairwise Preference</title>
+    <style>
+      :root {
+        --bg: #f3f5fb;
+        --surface: #ffffff;
+        --hero-surface: #ffffff;
+        --hero-line: #d5deee;
+        --text: #0f172a;
+        --subtle: #586275;
+        --line: #cfd7e6;
+        --ok: #047857;
+        --err: #b42318;
+        --focus: #1d4ed8;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Avenir Next", "Avenir", "Segoe UI", "Inter", system-ui, -apple-system, sans-serif;
+        background:
+          radial-gradient(circle at 20% 0%, #eef2ff 0, transparent 25%),
+          radial-gradient(circle at 80% 100%, #f5eefe 0, transparent 30%),
+          var(--bg);
+        color: var(--text);
+        display: grid;
+        place-items: center;
+        padding: 16px;
+      }
+
+      .app {
+        width: min(980px, 100%);
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        box-shadow: 0 12px 30px rgba(9, 15, 36, 0.1);
+        padding: 16px;
+      }
+
+      .topbar {
+        display: grid;
+        gap: 12px;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: 1.35fr 0.65fr;
+        gap: 10px;
+        align-items: center;
+        padding: 10px;
+        border: 1px solid var(--hero-line);
+        border-radius: 12px;
+        background: var(--hero-surface);
+      }
+
+      .hero-copy {
+        min-width: 0;
+      }
+
+      .hero-copy h2 {
+        margin: 0;
+        font-size: 1rem;
+        line-height: 1.3;
+        font-weight: 650;
+      }
+
+      .hero-copy p {
+        margin: 8px 0 0;
+        color: var(--subtle);
+        font-size: 0.85rem;
+        max-width: 52ch;
+      }
+
+      .hero-media {
+        width: clamp(120px, 11vw, 160px);
+        max-width: 100%;
+        aspect-ratio: 2 / 3;
+        overflow: hidden;
+        border-radius: 12px;
+        justify-self: end;
+      }
+
+      .hero-media img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        object-position: center 18%;
+        display: block;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 1.2rem;
+        font-weight: 650;
+      }
+
+      .status-strip {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        color: var(--subtle);
+        font-size: 0.92rem;
+        min-height: 1.4rem;
+      }
+
+      .selectors {
+        display: grid;
+        gap: 10px;
+      }
+
+      .selectors .field {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        border: 1px solid var(--line);
+        background: #fafcff;
+        border-radius: 10px;
+        padding: 8px 10px;
+      }
+
+      .field label {
+        font-size: 0.85rem;
+        color: var(--subtle);
+      }
+
+      .field select,
+      .field input {
+        border: 1px solid var(--line);
+        background: #fff;
+        border-radius: 8px;
+        padding: 8px;
+        font: inherit;
+        min-width: 220px;
+        color: var(--text);
+      }
+
+      .selectors .field:focus-within {
+        border-color: var(--focus);
+      }
+
+      .pair-meta {
+        margin: 12px 0;
+        color: var(--subtle);
+        font-size: 0.93rem;
+        min-height: 1.2rem;
+      }
+
+      .pair {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+      }
+
+      .caption {
+        margin: 0;
+        color: var(--subtle);
+        font-size: 0.78rem;
+        text-align: center;
+      }
+
+      .image-card {
+        border: 2px solid transparent;
+        border-radius: 12px;
+        padding: 8px;
+        background: #fcfdff;
+        position: relative;
+        min-height: 280px;
+        display: grid;
+        gap: 8px;
+        grid-template-rows: auto 1fr auto;
+        cursor: pointer;
+      }
+
+      .image-card.is-disabled {
+        opacity: 0.96;
+        pointer-events: none;
+      }
+
+      .image-card[role="button"] {
+        border-color: var(--line);
+      }
+
+      .image-card.selected {
+        border-color: #111827;
+        box-shadow: 0 0 0 2px rgba(30, 64, 175, 0.15);
+      }
+
+      .image-card:focus-visible {
+        outline: none;
+        border-color: var(--focus);
+        box-shadow: 0 0 0 3px rgba(29, 78, 216, 0.28);
+      }
+
+      .badge {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        display: grid;
+        place-items: center;
+        font-size: 0.8rem;
+        font-weight: 650;
+        background: rgba(15, 23, 42, 0.84);
+        color: #fff;
+      }
+
+      .image-card img {
+        width: 100%;
+        height: 320px;
+        object-fit: contain;
+        background: #edf1f8;
+        border-radius: 8px;
+      }
+
+      .open-full {
+        border: 0;
+        background: transparent;
+        padding: 0;
+        margin: 0;
+        justify-self: end;
+        color: #334155;
+        font-size: 0.82rem;
+        text-decoration: underline;
+        min-height: 40px;
+        min-width: 60px;
+        text-align: right;
+        cursor: pointer;
+        font: inherit;
+        line-height: 1.2;
+      }
+
+      .open-full.is-disabled {
+        pointer-events: none;
+        opacity: 0.5;
+      }
+
+      .open-full:hover,
+      .open-full:focus-visible {
+        text-decoration: underline;
+        color: var(--text);
+      }
+
+      .full-view {
+        position: fixed;
+        inset: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        background: rgba(7, 11, 24, 0.92);
+        padding: 14px;
+        touch-action: none;
+        z-index: 20;
+      }
+
+      .full-view.open {
+        display: grid;
+      }
+
+      .full-view-inner {
+        display: grid;
+        gap: 10px;
+        justify-items: center;
+        width: min(100%, 1100px);
+      }
+
+      .full-view-meta {
+        display: grid;
+        gap: 5px;
+        text-align: center;
+        color: #f8fafc;
+        width: 100%;
+        max-width: min(100%, 1080px);
+      }
+
+      .full-view-meta {
+        pointer-events: none;
+      }
+
+      .full-side {
+        font-weight: 650;
+        font-size: 0.95rem;
+      }
+
+      .full-view img {
+        max-width: min(94vw, 1080px);
+        max-height: min(72vh, 720px);
+        object-fit: contain;
+        width: auto;
+        height: auto;
+        border-radius: 8px;
+        background: #111827;
+      }
+
+      .full-view-actions {
+        display: flex;
+        gap: 10px;
+      }
+
+      .full-view button {
+        border-color: #f1f5f9;
+        background: #f1f5f9;
+        color: #111827;
+        min-height: 44px;
+        min-width: 72px;
+      }
+
+      .full-hint {
+        color: #cbd5e1;
+        font-size: 0.78rem;
+        min-height: 1.1rem;
+      }
+
+      .filter-helper {
+        margin: 2px 0 0;
+        color: var(--subtle);
+        font-size: 0.76rem;
+      }
+
+      .meta-actions {
+        margin-top: 10px;
+        display: flex;
+        gap: 10px;
+      }
+
+      button {
+        border: 1px solid #111827;
+        background: #111827;
+        color: #fff;
+        border-radius: 10px;
+        padding: 12px 14px;
+        min-height: 48px;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      .image-card:focus-visible,
+      .open-full:focus-visible,
+      .full-view button:focus-visible {
+        outline: 3px solid rgba(29, 78, 216, 0.6);
+        outline-offset: 2px;
+      }
+
+      button:hover:not(:disabled) {
+        filter: brightness(1.08);
+      }
+
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      button.ghost {
+        background: #fff;
+        color: #111827;
+        border-color: var(--line);
+      }
+
+      .status {
+        margin-top: 10px;
+        min-height: 1.4rem;
+        font-size: 0.9rem;
+        color: var(--subtle);
+      }
+
+      .status.error {
+        color: var(--err);
+      }
+
+      .status.ok {
+        color: var(--ok);
+      }
+
+      .toast {
+        position: fixed;
+        left: 50%;
+        bottom: 16px;
+        transform: translateX(-50%) translateY(20px);
+        background: #111827;
+        color: #fff;
+        border-radius: 10px;
+        padding: 8px 12px;
+        font-size: 0.85rem;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 150ms ease, transform 150ms ease;
+        z-index: 5;
+      }
+
+      .toast.show {
+        opacity: 1;
+        transform: translateX(-50%) translateY(0);
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .toast {
+          transition: none;
+        }
+      }
+
+      @keyframes pairIn {
+        from {
+          opacity: 0;
+          transform: translateY(4px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      .pair {
+        animation: pairIn 150ms ease;
+      }
+
+      @media (max-width: 900px) {
+        body {
+          padding: 8px;
+        }
+
+        .app {
+          padding: 10px;
+          width: 100%;
+        }
+
+        .topbar,
+        .pair {
+          gap: 10px;
+        }
+
+        .pair {
+          grid-template-columns: 1fr;
+        }
+
+        .hero-media {
+          width: min(140px, 70vw);
+        }
+
+        .hero {
+          gap: 8px;
+          padding: 8px;
+        }
+
+        .field {
+          display: flex;
+          flex-direction: column;
+          align-items: stretch;
+        }
+
+        .field input,
+        .field select {
+          min-width: 0;
+          min-height: 48px;
+          font-size: 1rem;
+        }
+
+        .hero {
+          grid-template-columns: 1fr;
+        }
+
+        .hero-copy p {
+          max-width: none;
+        }
+
+        .hero-media {
+          width: min(280px, 88vw);
+          justify-self: center;
+        }
+
+        .image-card img {
+          height: min(52vh, 420px);
+        }
+
+        .image-card {
+          min-height: auto;
+          padding: 8px 8px 10px;
+          gap: 6px;
+        }
+
+        .image-card .caption {
+          min-height: 1rem;
+        }
+
+        .open-full {
+          min-height: 44px;
+        }
+
+        .full-view-actions {
+          width: 100%;
+          justify-content: center;
+        }
+
+        .full-view button {
+          min-height: 48px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <h2 id="hero-title">Help us build a Virtual Youssef</h2>
+          <p>Labeling these image pairs helps train a better virtual assistant through your visual preferences.</p>
+        </div>
+        <figure class="hero-media">
+          <img
+            src="/virtual-youssef.png"
+            alt="Virtual Youssef concept"
+            loading="lazy"
+          />
+        </figure>
+      </section>
+
+      <section class="topbar">
+        <h1>Image Preference Pairing</h1>
+        <div class="status-strip">
+          <span id="sessionMeta" aria-live="polite">Loading session...</span>
+          <span id="pairMeta" aria-live="polite">Ready</span>
+        </div>
+
+        <div class="selectors">
+          <div class="field">
+            <label for="userId">User ID</label>
+            <input id="userId" autocomplete="off" placeholder="user-xxxx" />
+          </div>
+          <div class="field">
+            <label for="sampleFilter">Sample</label>
+            <select id="sampleFilter">
+              <option value="">Any sample</option>
+            </select>
+          </div>
+          <p class="filter-helper">No sample? leave as <strong>Any sample</strong>.</p>
+        </div>
+      </section>
+
+      <section class="pair">
+        <figure
+          id="leftCard"
+          class="image-card"
+          data-side="left"
+          role="button"
+          tabindex="0"
+          aria-pressed="false"
+          aria-label="Left image"
+        >
+          <span class="badge">L</span>
+          <img id="leftImage" alt="Left image candidate" src="" />
+          <button id="leftOpen" class="open-full" type="button" aria-label="Open left image in full view">Open full</button>
+          <p class="caption">Tap to choose this side</p>
+        </figure>
+
+        <figure
+          id="rightCard"
+          class="image-card"
+          data-side="right"
+          role="button"
+          tabindex="0"
+          aria-pressed="false"
+          aria-label="Right image"
+        >
+          <span class="badge">R</span>
+          <img id="rightImage" alt="Right image candidate" src="" />
+          <button id="rightOpen" class="open-full" type="button" aria-label="Open right image in full view">Open full</button>
+          <p class="caption">Tap to choose this side</p>
+        </figure>
+      </section>
+
+      <div class="meta-actions">
+        <button id="undoBtn" class="ghost" type="button" hidden>Undo last response</button>
+        <button id="retryBtn" class="ghost" type="button" hidden>Retry</button>
+      </div>
+
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <div
+      id="fullView"
+      class="full-view"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="fullViewSide"
+      aria-hidden="true"
+      tabindex="-1"
+    >
+      <div class="full-view-inner">
+        <div class="full-view-meta">
+          <p id="fullViewSide" class="full-side">Viewing left</p>
+          <p id="fullViewHint" class="full-hint" hidden>Swipe left/right to switch. Press V to vote for the current side.</p>
+        </div>
+        <img id="fullImage" alt="Full image preview" />
+        <div class="full-view-actions">
+          <button id="fullPrev" type="button" aria-label="Previous image">◀</button>
+          <button id="fullClose" type="button" aria-label="Close preview">Close</button>
+          <button id="fullNext" type="button" aria-label="Next image">▶</button>
+          <button id="fullVote" type="button" aria-label="Vote for displayed image">Vote</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const state = {
+        userId: localStorage.getItem('pairUserId') || `user-${Math.floor(Math.random() * 1000000)}`,
+        pairIndex: 0,
+        sessionCount: 0,
+        pair: null,
+        busy: false,
+        retryPayload: null,
+        undoPair: null,
+        catalog: [],
+        lastActiveControl: 'leftCard',
+      };
+
+      const userIdInput = document.getElementById('userId');
+      const sampleFilter = document.getElementById('sampleFilter');
+      const pairMeta = document.getElementById('pairMeta');
+      const sessionMeta = document.getElementById('sessionMeta');
+      const leftImage = document.getElementById('leftImage');
+      const rightImage = document.getElementById('rightImage');
+      const leftOpen = document.getElementById('leftOpen');
+      const rightOpen = document.getElementById('rightOpen');
+      const leftCard = document.getElementById('leftCard');
+      const rightCard = document.getElementById('rightCard');
+      const retryBtn = document.getElementById('retryBtn');
+      const undoBtn = document.getElementById('undoBtn');
+      const status = document.getElementById('status');
+      const toast = document.getElementById('toast');
+      const fullView = document.getElementById('fullView');
+      const fullImage = document.getElementById('fullImage');
+      const fullPrev = document.getElementById('fullPrev');
+      const fullNext = document.getElementById('fullNext');
+      const fullClose = document.getElementById('fullClose');
+      const fullVote = document.getElementById('fullVote');
+      const fullViewSide = document.getElementById('fullViewSide');
+      const fullViewHint = document.getElementById('fullViewHint');
+      let toastTimer = null;
+      let fullViewIndex = 0;
+      let fullViewTouchStartX = null;
+      let fullHintShown = false;
+      let fullViewLauncher = null;
+
+      userIdInput.value = state.userId;
+      localStorage.setItem('pairUserId', state.userId);
+
+      function setStatus(message, kind = '') {
+        status.textContent = message;
+        status.className = `status ${kind}`.trim();
+      }
+
+      function showToast(message, ms = 1500) {
+        toast.textContent = message;
+        toast.classList.add('show');
+        clearTimeout(toastTimer);
+        if (ms > 0) {
+          toastTimer = setTimeout(() => toast.classList.remove('show'), ms);
+        }
+      }
+
+      function disableControls(disabled) {
+        leftCard.disabled = disabled;
+        rightCard.disabled = disabled;
+        leftOpen.disabled = disabled;
+        rightOpen.disabled = disabled;
+        leftCard.classList.toggle('is-disabled', disabled);
+        rightCard.classList.toggle('is-disabled', disabled);
+        leftOpen.classList.toggle('is-disabled', disabled);
+        rightOpen.classList.toggle('is-disabled', disabled);
+        sampleFilter.disabled = disabled;
+        leftCard.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+        rightCard.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+      }
+
+      function renderMeta() {
+        sessionMeta.textContent = `#${state.pairIndex} · saved: ${state.sessionCount}`;
+      }
+
+      function renderPair(pair) {
+        leftCard.setAttribute('aria-label', `Left image ${pair.left.id}`);
+        rightCard.setAttribute('aria-label', `Right image ${pair.right.id}`);
+
+        leftImage.src = pair.left.url;
+        leftImage.loading = 'lazy';
+        rightImage.src = pair.right.url;
+        rightImage.loading = 'lazy';
+        pairMeta.textContent = `Pair: ${pair.pair_id}  —  ${pair.fold} / ${pair.sample}`;
+      }
+
+      function renderSampleOptions() {
+        const currentSample = sampleFilter.value;
+
+        sampleFilter.innerHTML = '<option value="">Any sample</option>';
+
+        let hasAnySample = false;
+
+        for (const foldEntry of state.catalog) {
+          for (const sample of foldEntry.samples || []) {
+            hasAnySample = true;
+
+            const option = document.createElement('option');
+            option.value = `${foldEntry.name}:::${sample}`;
+            option.textContent = `${foldEntry.name} / ${sample}`;
+            option.dataset.fold = foldEntry.name;
+            option.dataset.sample = sample;
+            sampleFilter.appendChild(option);
+          }
+        }
+
+        if (!hasAnySample) {
+          sampleFilter.disabled = true;
+          return;
+        }
+
+        sampleFilter.disabled = false;
+
+        if ([...sampleFilter.options].some((option) => option.value === currentSample)) {
+          sampleFilter.value = currentSample;
+        } else {
+          sampleFilter.value = '';
+        }
+      }
+
+      function setUndoVisible(visible) {
+        undoBtn.hidden = !visible;
+      }
+
+      function setBusy(busy, message = '') {
+        state.busy = busy;
+        disableControls(busy);
+
+        if (busy) {
+          retryBtn.hidden = true;
+          state.retryPayload = null;
+        }
+
+        if (message) {
+          setStatus(message, busy ? '' : '');
+        }
+      }
+
+      function setRetry(payload) {
+        if (!payload) {
+          state.retryPayload = null;
+          retryBtn.hidden = true;
+          return;
+        }
+
+        state.retryPayload = payload;
+        retryBtn.hidden = false;
+      }
+
+      function renderFullImage() {
+        if (!state.pair) {
+          return;
+        }
+
+        const image = fullViewIndex === 0 ? state.pair.left : state.pair.right;
+        const side = fullViewIndex === 0 ? 'left' : 'right';
+
+        fullImage.src = image.url;
+        fullImage.alt = `${side.charAt(0).toUpperCase() + side.slice(1)} image full preview`;
+        fullViewSide.textContent = `Viewing ${side === 'left' ? 'left' : 'right'} side`;
+        fullVote.textContent = `Vote ${side}`;
+        fullVote.setAttribute('aria-label', `Vote for ${side} image`);
+        fullPrev.setAttribute('aria-label', `Show ${side === 'left' ? 'right' : 'left'} image`);
+        fullNext.setAttribute('aria-label', `Show ${side === 'left' ? 'right' : 'left'} image`);
+      }
+
+      function openFullView(side) {
+        if (!state.pair) {
+          return;
+        }
+
+        fullViewIndex = side === 'right' ? 1 : 0;
+        renderFullImage();
+        fullView.classList.add('open');
+        fullView.setAttribute('aria-hidden', 'false');
+
+        fullViewLauncher = document.activeElement instanceof HTMLElement ? document.activeElement : document.getElementById(side === 'left' ? 'leftCard' : 'rightCard');
+        if (!fullHintShown) {
+          fullHintShown = true;
+          fullViewHint.hidden = false;
+          setTimeout(() => {
+            fullViewHint.hidden = true;
+          }, 2200);
+        }
+
+        setStatus('Full view open. Swipe/arrow to switch, V to vote current image.');
+        requestAnimationFrame(() => {
+          fullVote.focus();
+        });
+      }
+
+      function closeFullView() {
+        fullView.classList.remove('open');
+        fullView.setAttribute('aria-hidden', 'true');
+
+        if (fullViewLauncher && fullViewLauncher.focus) {
+          fullViewLauncher.focus();
+        }
+      }
+
+      function toggleFullImage() {
+        fullViewIndex = fullViewIndex === 0 ? 1 : 0;
+        renderFullImage();
+      }
+
+      async function fetchCatalog() {
+        try {
+          const res = await fetch('/api/catalog');
+          if (!res.ok) {
+            throw new Error(`Could not load catalog (${res.status})`);
+          }
+
+          const data = await res.json();
+          state.catalog = data.folds || [];
+          renderSampleOptions();
+        } catch (error) {
+          setStatus(error.message || 'Could not load catalog', 'error');
+          state.catalog = [];
+          renderSampleOptions();
+        }
+      }
+
+      function toQueryParams() {
+        const params = new URLSearchParams();
+        const selectedOption = sampleFilter.selectedOptions[0];
+        if (selectedOption && selectedOption.value) {
+          const foldValue = selectedOption.dataset.fold || '';
+          const sampleValue = selectedOption.dataset.sample || '';
+          if (foldValue) {
+            params.set('fold', foldValue);
+          }
+          if (sampleValue) {
+            params.set('sample', sampleValue);
+          }
+        }
+        return params.toString();
+      }
+
+      async function fetchPair() {
+        closeFullView();
+        setBusy(true, 'Loading next pair...');
+        try {
+          const query = toQueryParams();
+          const response = await fetch(`/api/pairs${query ? `?${query}` : ''}`);
+
+          if (!response.ok) {
+            if (response.status === 404) {
+              pairMeta.textContent = 'No matching pair found for selected filters';
+              throw new Error('No matching pair found for selected filters');
+            }
+            throw new Error(`Could not load pair (${response.status})`);
+          }
+
+          const pair = await response.json();
+          state.pair = pair;
+          state.pairIndex += 1;
+          renderPair(pair);
+          renderMeta();
+          setStatus('Press 1/2 (desktop) or tap an image to choose');
+          showToast('New pair ready', 900);
+          setRetry(null);
+          document.getElementById(state.lastActiveControl).focus();
+        } catch (error) {
+          setStatus(error.message, 'error');
+          showToast(error.message, 1500);
+        } finally {
+          setBusy(false);
+          sampleFilter.disabled = false;
+          disableControls(state.busy);
+        }
+      }
+
+      async function submit(payload) {
+        if (state.busy || !state.pair) {
+          return;
+        }
+
+        setBusy(true, 'Saving...');
+        setStatus('Saving...');
+
+        try {
+          const response = await fetch('/api/preferences', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+
+          if (!response.ok) {
+            const err = await response.json().catch(() => ({}));
+            const message = err.detail || `Could not submit (${response.status})`;
+            throw new Error(message);
+          }
+
+          await response.json();
+          state.sessionCount += 1;
+          state.undoPair = payload;
+          setUndoVisible(true);
+          renderMeta();
+          setStatus('Saved', 'ok');
+          showToast('Saved', 900);
+          setRetry(null);
+          state.lastActiveControl = payload.preference === 'left' ? 'leftCard' : 'rightCard';
+          state.undoPair = {
+            pair_id: state.pair.pair_id,
+            fold: state.pair.fold,
+            sample: state.pair.sample,
+            left: {
+              id: state.pair.left.id,
+              url: state.pair.left.url,
+            },
+            right: {
+              id: state.pair.right.id,
+              url: state.pair.right.url,
+            },
+          };
+          await fetchPair();
+        } catch (error) {
+          setStatus('Connection issue, retry', 'error');
+          showToast('Connection issue, retry', 2000);
+          setRetry(payload);
+        } finally {
+          if (state.retryPayload) {
+            retryBtn.hidden = false;
+          }
+          setBusy(false);
+        }
+      }
+
+      function buildPayload(choice) {
+        if (!state.pair) {
+          return null;
+        }
+
+        if (choice !== 'left' && choice !== 'right') {
+          return null;
+        }
+
+        const userId = userIdInput.value.trim() || state.userId;
+
+        return {
+          user_id: userId,
+          pair_id: state.pair.pair_id,
+          fold: state.pair.fold,
+          sample: state.pair.sample,
+          left_image: state.pair.left.url,
+          right_image: state.pair.right.url,
+          preference: choice,
+        };
+      }
+
+      function sendChoice(choice) {
+        const payload = buildPayload(choice);
+        if (!payload) {
+          setStatus('No active pair yet', 'error');
+          return;
+        }
+
+        state.lastActiveControl = choice === 'left' ? 'leftCard' : 'rightCard';
+        submit(payload);
+      }
+
+      leftCard.addEventListener('click', () => {
+        if (state.busy) return;
+        sendChoice('left');
+      });
+
+      rightCard.addEventListener('click', () => {
+        if (state.busy) return;
+        sendChoice('right');
+      });
+
+      leftOpen.addEventListener('click', (event) => {
+        event.stopPropagation();
+        openFullView('left');
+      });
+
+      rightOpen.addEventListener('click', (event) => {
+        event.stopPropagation();
+        openFullView('right');
+      });
+
+      fullPrev.addEventListener('click', () => {
+        if (!state.pair) {
+          return;
+        }
+        toggleFullImage();
+      });
+
+      fullNext.addEventListener('click', () => {
+        if (!state.pair) {
+          return;
+        }
+        toggleFullImage();
+      });
+
+      fullVote.addEventListener('click', () => {
+        if (state.busy || !state.pair) {
+          return;
+        }
+        sendChoice(fullViewIndex === 0 ? 'left' : 'right');
+      });
+
+      fullClose.addEventListener('click', closeFullView);
+
+      fullView.addEventListener('click', (event) => {
+        if (event.target === fullView) {
+          closeFullView();
+        }
+      });
+
+      fullView.addEventListener('touchstart', (event) => {
+        fullViewTouchStartX = event.changedTouches[0].clientX;
+        event.preventDefault();
+      });
+
+      fullView.addEventListener('touchend', (event) => {
+        if (fullViewTouchStartX === null) {
+          return;
+        }
+
+        event.preventDefault();
+        const endX = event.changedTouches[0].clientX;
+        const deltaX = endX - fullViewTouchStartX;
+        fullViewTouchStartX = null;
+
+        if (Math.abs(deltaX) < 35) {
+          return;
+        }
+
+        toggleFullImage();
+      });
+
+      leftCard.addEventListener('keydown', (event) => {
+        if (state.busy) return;
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          sendChoice('left');
+        }
+      });
+
+      rightCard.addEventListener('keydown', (event) => {
+        if (state.busy) return;
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          sendChoice('right');
+        }
+      });
+
+      async function undoLastResponse() {
+        if (!state.undoPair) {
+          showToast('Nothing to undo');
+          return;
+        }
+
+        const response = await fetch('/api/preferences/undo', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            user_id: state.userId,
+            pair_id: state.undoPair.pair_id,
+          }),
+        });
+
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({}));
+          throw new Error(err.detail || `Could not undo (${response.status})`);
+        }
+
+        setUndoVisible(false);
+        state.pair = {
+          pair_id: state.undoPair.pair_id,
+          fold: state.undoPair.fold,
+          sample: state.undoPair.sample,
+          left: {
+            id: state.undoPair.left.id,
+            url: state.undoPair.left.url,
+          },
+          right: {
+            id: state.undoPair.right.id,
+            url: state.undoPair.right.url,
+          },
+        };
+
+        renderPair(state.pair);
+        setStatus('Re-evaluating previous pair. Submit your correction when ready.');
+        showToast('Redo previous pair', 1200);
+      }
+
+      undoBtn.addEventListener('click', () => {
+        setBusy(true, 'Undoing last response...');
+        setStatus('Undoing last response...');
+        undoLastResponse()
+          .catch((error) => {
+            setStatus(error.message, 'error');
+            showToast(error.message, 1600);
+          })
+          .finally(() => setBusy(false));
+      });
+
+      retryBtn.addEventListener('click', async () => {
+        if (!state.retryPayload) {
+          return;
+        }
+
+        const retryPayload = state.retryPayload;
+        setRetry(null);
+        submit(retryPayload);
+      });
+
+      sampleFilter.addEventListener('change', fetchPair);
+
+      retryBtn.type = 'button';
+      undoBtn.type = 'button';
+
+      userIdInput.addEventListener('change', () => {
+        const value = userIdInput.value.trim() || `user-${Math.floor(Math.random() * 1000000)}`;
+        state.userId = value;
+        userIdInput.value = value;
+        localStorage.setItem('pairUserId', value);
+      });
+
+      document.addEventListener('keydown', (event) => {
+        if (event.defaultPrevented) {
+          return;
+        }
+
+        if (fullView.classList.contains('open')) {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            closeFullView();
+            return;
+          }
+
+          if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+            event.preventDefault();
+            toggleFullImage();
+            return;
+          }
+
+          if (event.key.toLowerCase() === 'v') {
+            event.preventDefault();
+            sendChoice(fullViewIndex === 0 ? 'left' : 'right');
+            return;
+          }
+
+          return;
+        }
+
+        if (state.busy) {
+          return;
+        }
+
+        if (event.target instanceof HTMLElement) {
+          const tag = event.target.tagName;
+          if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+            return;
+          }
+        }
+
+        const key = event.key.toLowerCase();
+
+        if (key === '1') {
+          event.preventDefault();
+          state.lastActiveControl = 'leftCard';
+          sendChoice('left');
+          return;
+        }
+
+        if (key === '2') {
+          event.preventDefault();
+          state.lastActiveControl = 'rightCard';
+          sendChoice('right');
+          return;
+        }
+      });
+
+      disableControls(true);
+      renderMeta();
+      Promise.all([fetchCatalog()])
+        .catch(() => {})
+        .finally(() => {
+          renderSampleOptions();
+          fetchPair();
+        });
+    </script>
+  </body>
+</html>
