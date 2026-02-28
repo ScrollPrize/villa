@@ -1,4 +1,5 @@
 #include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include "vc/core/util/Geometry.hpp"
@@ -167,6 +168,81 @@ static cv::Mat_<uchar> make_approved_mask(const cv::Mat& approval,
     }
 
     return approved;
+}
+
+struct MaskedGrowthRegion
+{
+    cv::Mat_<uchar> allowed;
+    cv::Rect bbox;
+};
+
+static std::optional<MaskedGrowthRegion> build_masked_growth_region(const std::string& mask_path,
+                                                                    const cv::Mat_<cv::Vec3f>& resume_points,
+                                                                    const cv::Rect& resume_area,
+                                                                    const cv::Size& trace_size)
+{
+    if (mask_path.empty()) {
+        return std::nullopt;
+    }
+
+    cv::Mat mask = cv::imread(mask_path, cv::IMREAD_UNCHANGED);
+    if (mask.empty()) {
+        throw std::runtime_error("Masked growth: failed to read mask image from " + mask_path);
+    }
+
+    cv::Mat gray;
+    if (mask.channels() == 1) {
+        gray = mask;
+    } else if (mask.channels() == 3) {
+        cv::cvtColor(mask, gray, cv::COLOR_BGR2GRAY);
+    } else if (mask.channels() == 4) {
+        cv::cvtColor(mask, gray, cv::COLOR_BGRA2GRAY);
+    } else {
+        throw std::runtime_error("Masked growth: unsupported mask channel count");
+    }
+
+    if (gray.rows != resume_points.rows || gray.cols != resume_points.cols) {
+        cv::Mat resized;
+        cv::resize(gray, resized, resume_points.size(), 0.0, 0.0, cv::INTER_NEAREST);
+        gray = std::move(resized);
+    }
+
+    cv::Mat binary;
+    if (gray.depth() == CV_8U) {
+        cv::compare(gray, 0, binary, cv::CMP_GT);
+    } else {
+        cv::Mat grayFloat;
+        gray.convertTo(grayFloat, CV_32F);
+        cv::compare(grayFloat, 0.0f, binary, cv::CMP_GT);
+    }
+
+    MaskedGrowthRegion region;
+    region.allowed = cv::Mat_<uchar>(trace_size, static_cast<uchar>(0));
+
+    for (int r = 0; r < resume_points.rows; ++r) {
+        for (int c = 0; c < resume_points.cols; ++c) {
+            if (resume_points(r, c)[0] == -1.0f) {
+                continue;
+            }
+            if (binary.at<uint8_t>(r, c) == 0) {
+                continue;
+            }
+            const int tr = resume_area.y + r;
+            const int tc = resume_area.x + c;
+            if (tr < 0 || tr >= region.allowed.rows || tc < 0 || tc >= region.allowed.cols) {
+                continue;
+            }
+            region.allowed(tr, tc) = 1;
+        }
+    }
+
+    std::vector<cv::Point> nz;
+    cv::findNonZero(region.allowed, nz);
+    if (nz.empty()) {
+        throw std::runtime_error("Masked growth: mask has no covered valid cells.");
+    }
+    region.bbox = cv::boundingRect(nz);
+    return region;
 }
 
 struct lineLossDistance
@@ -3073,6 +3149,26 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     loss_settings.x_max = params.value("x_max", std::numeric_limits<int>::max());
     loss_settings.flipback_threshold = params.value("flipback_threshold", 5.0f);
     loss_settings.flipback_weight = params.value("flipback_weight", 1.0f);
+    const bool masked_growth_enabled = params.value("masked_growth_enabled", false);
+    const std::string masked_growth_mask_path = params.value("masked_growth_mask_path", std::string{});
+    cv::Mat_<uchar> masked_growth_allowed;
+    cv::Rect masked_growth_bbox;
+    bool has_masked_growth = false;
+
+    auto in_masked_growth_region = [&](const cv::Vec2i& p) -> bool {
+        if (!has_masked_growth) {
+            return true;
+        }
+        return point_in_bounds(masked_growth_allowed, p) && masked_growth_allowed(p) != 0;
+    };
+
+    auto in_masked_growth_bbox = [&](const cv::Vec2i& p) -> bool {
+        if (!has_masked_growth) {
+            return true;
+        }
+        return masked_growth_bbox.contains(cv::Point(p[1], p[0]));
+    };
+
     std::cout << "Anti-flipback: threshold=" << loss_settings.flipback_threshold
               << " weight=" << loss_settings.flipback_weight
               << (loss_settings.flipback_weight == 0 ? " (DISABLED)" : "") << std::endl;
@@ -3103,6 +3199,9 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         w = resume_generations.cols + 2 * gen_diff + 50;
         h = resume_generations.rows + 2 * gen_diff + 50;
     } else {
+        if (masked_growth_enabled) {
+            throw std::runtime_error("Masked growth requires resuming from an existing surface.");
+        }
         // Calculate the maximum possible size the patch might grow to
         //FIXME show and handle area edge!
         w = 2*stop_gen+50;
@@ -3371,6 +3470,26 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         resume_pad_y = (h - resume_points.rows) / 2;
 
         used_area = cv::Rect(resume_pad_x, resume_pad_y, resume_points.cols, resume_points.rows);
+
+        if (masked_growth_enabled) {
+            if (masked_growth_mask_path.empty()) {
+                throw std::runtime_error("Masked growth enabled but no mask path was provided.");
+            }
+            const auto region = build_masked_growth_region(masked_growth_mask_path,
+                                                           resume_points,
+                                                           used_area,
+                                                           trace_params.state.size());
+            if (!region.has_value()) {
+                throw std::runtime_error("Masked growth region is unavailable.");
+            }
+            masked_growth_allowed = region->allowed;
+            masked_growth_bbox = region->bbox;
+            has_masked_growth = true;
+            const cv::Rect& bbox = region->bbox;
+            std::cout << "Masked growth region loaded from " << masked_growth_mask_path
+                      << " bbox=(" << bbox.x << "," << bbox.y << " "
+                      << bbox.width << "x" << bbox.height << ")" << std::endl;
+        }
  
         double min_val, max_val;
         cv::minMaxLoc(resume_generations, &min_val, &max_val);
@@ -3774,12 +3893,20 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         }
 
         // Rebuild fringe from valid points
+        bool has_masked_seed = false;
         for (int j = used_area.y; j < used_area.br().y; ++j) {
             for (int i = used_area.x; i < used_area.br().x; ++i) {
-                if (trace_params.state(j, i) & STATE_LOC_VALID) {
+                if ((trace_params.state(j, i) & STATE_LOC_VALID) &&
+                    in_masked_growth_region(cv::Vec2i{j, i})) {
                     fringe.push_back({j, i});
+                    if (has_masked_growth) {
+                        has_masked_seed = true;
+                    }
                 }
             }
+        }
+        if (has_masked_growth && !has_masked_seed) {
+            throw std::runtime_error("Masked growth has no valid seed cells on the resume surface.");
         }
 
         last_succ = succ;
@@ -4125,12 +4252,16 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         for(const auto& p : fringe)
         {
             for(const auto& n : neighs)
-                if (bounds.contains(cv::Point(p+n))
-                    && (trace_params.state(p+n) & STATE_PROCESSING) == 0
-                    && (trace_params.state(p+n) & STATE_LOC_VALID) == 0) {
-                    trace_params.state(p+n) |= STATE_PROCESSING;
-                    cands.push_back(p+n);
+            {
+                const cv::Vec2i candidate = p + n;
+                if (bounds.contains(cv::Point(candidate[1], candidate[0]))
+                    && in_masked_growth_bbox(candidate)
+                    && (trace_params.state(candidate) & STATE_PROCESSING) == 0
+                    && (trace_params.state(candidate) & STATE_LOC_VALID) == 0) {
+                    trace_params.state(candidate) |= STATE_PROCESSING;
+                    cands.push_back(candidate);
                 }
+            }
         }
         std::cout << "gen " << generation << " processing " << cands.size() << " fringe cands (total done " << succ << " fringe: " << fringe.size() << ")" << std::endl;
         fringe.resize(0);
@@ -4164,16 +4295,21 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
 
                 auto const points_placed = call_neural_tracer_for_points(batch_cands, trace_params, neural_tracer.get());
 
+                int accepted_points = 0;
                 for (cv::Vec2i const &p : points_placed) {
+                    if (!in_masked_growth_bbox(p)) {
+                        continue;
+                    }
                     generations(p) = generation;
                     if (!used_area.contains(cv::Point(p[1],p[0]))) {
                         used_area = used_area | cv::Rect(p[1],p[0],1,1);
                     }
                     fringe.push_back(p);
                     succ_gen_ps.push_back(p);
+                    ++accepted_points;
                 }
-                succ += points_placed.size();
-                succ_gen += points_placed.size();
+                succ += accepted_points;
+                succ_gen += accepted_points;
 
                 if (cands_processed.size() == cands.size())
                     break;

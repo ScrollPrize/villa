@@ -159,6 +159,7 @@ private:
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
     void onMaskedNeighborCopyRequested(bool forward);
+    void onGrowAllInMaskedRequested();
     void updateSurfaceOverlayDropdown();
     void onSurfaceOverlaySelectionChanged(const QModelIndex& topLeft, const QModelIndex& bottomRight, const QVector<int>& roles);
     QColor getOverlayColor(size_t index) const;

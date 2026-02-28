@@ -246,6 +246,7 @@ signals:
     void approvalMaskCreateRequested(const QString& displayName);
     void copyMaskedForwardRequested();
     void copyMaskedBackwardRequested();
+    void growAllInMaskedRequested();
 
     // Neural tracer signals
     void neuralTracerEnabledChanged(bool enabled);

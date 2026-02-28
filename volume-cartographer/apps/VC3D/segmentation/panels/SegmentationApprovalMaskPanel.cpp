@@ -57,8 +57,12 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& sett
     _btnCopyMaskedForward->setToolTip(tr("Run masked neighbor copy forward on the active segment."));
     _btnCopyMaskedBackward = new QPushButton(tr("Copy Masked Backward"), approvalParent);
     _btnCopyMaskedBackward->setToolTip(tr("Run masked neighbor copy backward on the active segment."));
+    _btnGrowAllInMasked = new QPushButton(tr("Grow All in Masked"), approvalParent);
+    _btnGrowAllInMasked->setToolTip(
+        tr("Run regular growth constrained to masked valid cells from the selected approval mask."));
     maskedCopyRow->addWidget(_btnCopyMaskedForward);
     maskedCopyRow->addWidget(_btnCopyMaskedBackward);
+    maskedCopyRow->addWidget(_btnGrowAllInMasked);
     maskedCopyRow->addStretch(1);
     approvalLayout->addLayout(maskedCopyRow);
 
@@ -307,6 +311,9 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& sett
     });
     connect(_btnCopyMaskedBackward, &QPushButton::clicked, this, [this]() {
         emit copyMaskedBackwardRequested();
+    });
+    connect(_btnGrowAllInMasked, &QPushButton::clicked, this, [this]() {
+        emit growAllInMaskedRequested();
     });
 
     connect(_groupApprovalMask, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
@@ -626,6 +633,9 @@ void SegmentationApprovalMaskPanel::setApprovalBrushColor(const QColor& color)
     if (_btnCopyMaskedBackward) {
         _btnCopyMaskedBackward->setEnabled(canCopyMasked);
     }
+    if (_btnGrowAllInMasked) {
+        _btnGrowAllInMasked->setEnabled(canCopyMasked);
+    }
 }
 
 void SegmentationApprovalMaskPanel::restoreSettings(QSettings& settings)
@@ -737,5 +747,17 @@ void SegmentationApprovalMaskPanel::syncUiState()
     if (_btnApprovalColor) {
         _btnApprovalColor->setStyleSheet(
             QStringLiteral("background-color: %1; border: 1px solid #888;").arg(_approvalBrushColor.name()));
+    }
+
+    const bool hasMaskSelection = !_approvalMaskOptions.isEmpty();
+    const bool canCopyMasked = _showApprovalMask && hasMaskSelection;
+    if (_btnCopyMaskedForward) {
+        _btnCopyMaskedForward->setEnabled(canCopyMasked);
+    }
+    if (_btnCopyMaskedBackward) {
+        _btnCopyMaskedBackward->setEnabled(canCopyMasked);
+    }
+    if (_btnGrowAllInMasked) {
+        _btnGrowAllInMasked->setEnabled(canCopyMasked);
     }
 }

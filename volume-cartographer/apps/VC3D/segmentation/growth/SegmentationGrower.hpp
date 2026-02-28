@@ -74,7 +74,14 @@ public:
                SegmentationGrowthMethod method,
                SegmentationGrowthDirection direction,
                int steps,
-               bool inpaintOnly);
+               bool inpaintOnly,
+               const QString& maskedGrowthMaskPath = QString());
+    bool startMasked(const VolumeContext& volumeContext,
+                     SegmentationGrowthMethod method,
+                     SegmentationGrowthDirection direction,
+                     int steps,
+                     bool inpaintOnly,
+                     const QString& maskedGrowthMaskPath);
     bool startCopyWithNt(const VolumeContext& volumeContext);
 
     bool running() const { return _running; }

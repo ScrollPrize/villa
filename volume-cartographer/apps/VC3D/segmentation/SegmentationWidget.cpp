@@ -140,6 +140,8 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::copyMaskedForwardRequested);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::copyMaskedBackwardRequested,
             this, &SegmentationWidget::copyMaskedBackwardRequested);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::growAllInMaskedRequested,
+            this, &SegmentationWidget::growAllInMaskedRequested);
 
     // Forward cell reopt panel signals
     connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptModeChanged,

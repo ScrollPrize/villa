@@ -83,6 +83,7 @@ signals:
     void approvalMaskCreateRequested(const QString& displayName);
     void copyMaskedForwardRequested();
     void copyMaskedBackwardRequested();
+    void growAllInMaskedRequested();
 
 private:
     void writeSetting(const QString& key, const QVariant& value);
@@ -107,6 +108,7 @@ private:
     QPushButton* _btnNewApprovalMask{nullptr};
     QPushButton* _btnCopyMaskedForward{nullptr};
     QPushButton* _btnCopyMaskedBackward{nullptr};
+    QPushButton* _btnGrowAllInMasked{nullptr};
 
     bool _showApprovalMask{false};
     bool _editApprovedMask{false};

@@ -1051,7 +1051,8 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
                                SegmentationGrowthMethod method,
                                SegmentationGrowthDirection direction,
                                int steps,
-                               bool inpaintOnly)
+                               bool inpaintOnly,
+                               const QString& maskedGrowthMaskPath)
 {
     auto showStatus = [&](const QString& text, int timeout) {
         if (_callbacks.showStatus) {
@@ -1079,8 +1080,15 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
     ensureGenerationsChannel(segmentationSurface.get());
 
+    const QString trimmedMaskedGrowthMaskPath = maskedGrowthMaskPath.trimmed();
+    const bool maskedGrowthRequested = !trimmedMaskedGrowthMaskPath.isEmpty();
+
     // Handle Extrapolation method separately - it doesn't need volume data
     if (method == SegmentationGrowthMethod::Extrapolation) {
+        if (maskedGrowthRequested) {
+            showStatus(tr("Grow All in Masked is only supported for tracer-based growth."), kStatusLong);
+            return false;
+        }
         const int sanitizedSteps = std::max(1, steps);
         const SegmentationGrowthDirection effectiveDirection = direction;
 
@@ -1399,6 +1407,22 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     request.steps = sanitizedSteps;
     request.inpaintOnly = inpaintOnly;
 
+    if (maskedGrowthRequested) {
+        if (inpaintOnly) {
+            showStatus(tr("Masked growth does not support inpaint mode."), kStatusLong);
+            return false;
+        }
+        if (!segmentationSurface || segmentationSurface->path.empty()) {
+            showStatus(tr("Masked growth requires an active segmentation surface."), kStatusLong);
+            return false;
+        }
+        if (!QFileInfo::exists(trimmedMaskedGrowthMaskPath) ||
+            !QFileInfo(trimmedMaskedGrowthMaskPath).isFile()) {
+            showStatus(tr("Selected mask file does not exist: %1").arg(trimmedMaskedGrowthMaskPath), kStatusLong);
+            return false;
+        }
+    }
+
     if (inpaintOnly) {
         // Consume any pending overrides; inpainting ignores directional constraints.
         const auto pendingOverride = _context.module->takeShortcutDirectionOverride();
@@ -1435,6 +1459,14 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     }
     if (auto customParams = _context.widget->customParamsJson()) {
         request.customParams = std::move(*customParams);
+    }
+    if (maskedGrowthRequested) {
+        if (!request.customParams) {
+            request.customParams = nlohmann::json::object();
+        }
+        (*request.customParams)["masked_growth_enabled"] = true;
+        (*request.customParams)["masked_growth_mask_path"] =
+            trimmedMaskedGrowthMaskPath.toStdString();
     }
     if (method == SegmentationGrowthMethod::Corrections &&
         _context.module && _context.module->cellReoptCollectionPending()) {
@@ -1733,6 +1765,21 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     _watcher->setFuture(future);
 
     return true;
+}
+
+bool SegmentationGrower::startMasked(const VolumeContext& volumeContext,
+                                     SegmentationGrowthMethod method,
+                                     SegmentationGrowthDirection direction,
+                                     int steps,
+                                     bool inpaintOnly,
+                                     const QString& maskedGrowthMaskPath)
+{
+    return start(volumeContext,
+                 method,
+                 direction,
+                 steps,
+                 inpaintOnly,
+                 maskedGrowthMaskPath);
 }
 
 bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)

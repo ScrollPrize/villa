@@ -3,6 +3,7 @@
 #include "SurfacePanelController.hpp"
 #include "VCSettings.hpp"
 #include "segmentation/SegmentationModule.hpp"
+#include "segmentation/growth/SegmentationGrower.hpp"
 
 #include <functional>
 #include <algorithm>
@@ -1170,6 +1171,78 @@ void CWindow::onMaskedNeighborCopyRequested(bool forward)
                             forward,
                             QString::fromStdString(maskPath.string()),
                             true);
+}
+
+void CWindow::onGrowAllInMaskedRequested()
+{
+    if (!_segmentationModule || !_segmentationWidget || !_segmentationGrower) {
+        QMessageBox::warning(this, tr("Error"), tr("Segmentation growth is unavailable."));
+        return;
+    }
+
+    std::shared_ptr<Surface> surfaceHolder;
+    QuadSurface* activeSurface = _segmentationModule->activeBaseSurface();
+    if (!activeSurface && _surf_col) {
+        surfaceHolder = _surf_col->surface("segmentation");
+        activeSurface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
+    }
+
+    if (!activeSurface || activeSurface->id.empty() || activeSurface->path.empty()) {
+        QMessageBox::warning(this, tr("Error"), tr("No active segment selected for masked growth."));
+        return;
+    }
+
+    _segmentationModule->saveApprovalMaskToDisk();
+
+    const std::filesystem::path maskPath = _segmentationModule->activeApprovalMaskPath(activeSurface);
+    if (maskPath.empty()) {
+        QMessageBox::warning(this, tr("Error"), tr("No approval mask selected for the active segment."));
+        return;
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(maskPath, ec) || ec) {
+        QMessageBox::warning(this,
+                             tr("Error"),
+                             tr("Selected approval mask does not exist on disk:\n%1")
+                                 .arg(QString::fromStdString(maskPath.string())));
+        return;
+    }
+
+    SegmentationGrower::Context context{
+        _segmentationModule.get(),
+        _segmentationWidget,
+        _surf_col,
+        _viewerManager.get(),
+        chunk_cache
+    };
+    _segmentationGrower->updateContext(context);
+
+    SegmentationGrower::VolumeContext volumeContext{
+        fVpkg,
+        currentVolume,
+        currentVolumeId,
+        _segmentationGrowthVolumeId.empty() ? currentVolumeId : _segmentationGrowthVolumeId,
+        _normalGridPath,
+        _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString()
+    };
+
+    const auto allowed = _segmentationWidget->allowedGrowthDirections();
+    auto direction = SegmentationGrowthDirection::All;
+    if (allowed.size() == 1) {
+        direction = allowed.front();
+    }
+
+    const auto method = _segmentationWidget->growthMethod();
+    const int steps = _segmentationWidget->growthSteps();
+    if (!_segmentationGrower->startMasked(volumeContext,
+                                          method,
+                                          direction,
+                                          steps,
+                                          false,
+                                          QString::fromStdString(maskPath.string()))) {
+        return;
+    }
 }
 
 void CWindow::onNeighborCopyRequested(const QString& segmentId,

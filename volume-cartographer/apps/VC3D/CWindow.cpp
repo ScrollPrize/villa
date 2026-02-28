@@ -1791,6 +1791,8 @@ void CWindow::CreateWidgets(void)
             this, [this]() { onMaskedNeighborCopyRequested(true); });
     connect(_segmentationWidget, &SegmentationWidget::copyMaskedBackwardRequested,
             this, [this]() { onMaskedNeighborCopyRequested(false); });
+    connect(_segmentationWidget, &SegmentationWidget::growAllInMaskedRequested,
+            this, &CWindow::onGrowAllInMaskedRequested);
 
     // -- Lasagna connections --
     connect(_segmentationWidget, &SegmentationWidget::seedFromFocusRequested, this, [this]() {
