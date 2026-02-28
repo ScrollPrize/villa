@@ -37,7 +37,7 @@
       }
 
       .app {
-        width: min(1024px, 100%);
+        width: min(980px, 100%);
         background: var(--surface);
         border: 1px solid var(--line);
         border-radius: 14px;
@@ -80,7 +80,7 @@
       }
 
       .hero-media {
-        width: clamp(120px, 12vw, 170px);
+        width: clamp(120px, 11vw, 160px);
         max-width: 100%;
         aspect-ratio: 2 / 3;
         overflow: hidden;
@@ -161,6 +161,13 @@
         gap: 12px;
       }
 
+      .caption {
+        margin: 0;
+        color: var(--subtle);
+        font-size: 0.78rem;
+        text-align: center;
+      }
+
       .image-card {
         border: 2px solid transparent;
         border-radius: 12px;
@@ -172,6 +179,11 @@
         gap: 8px;
         grid-template-rows: auto 1fr auto;
         cursor: pointer;
+      }
+
+      .image-card.is-disabled {
+        opacity: 0.96;
+        pointer-events: none;
       }
 
       .image-card[role="button"] {
@@ -213,15 +225,107 @@
       }
 
       .open-full {
+        border: 0;
+        background: transparent;
+        padding: 0;
+        margin: 0;
         justify-self: end;
         color: #334155;
         font-size: 0.82rem;
-        text-decoration: none;
+        text-decoration: underline;
+        min-height: 40px;
+        min-width: 60px;
+        text-align: right;
+        cursor: pointer;
+        font: inherit;
+        line-height: 1.2;
+      }
+
+      .open-full.is-disabled {
+        pointer-events: none;
+        opacity: 0.5;
       }
 
       .open-full:hover,
-      .open-full:focus {
+      .open-full:focus-visible {
         text-decoration: underline;
+        color: var(--text);
+      }
+
+      .full-view {
+        position: fixed;
+        inset: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        background: rgba(7, 11, 24, 0.92);
+        padding: 14px;
+        touch-action: none;
+        z-index: 20;
+      }
+
+      .full-view.open {
+        display: grid;
+      }
+
+      .full-view-inner {
+        display: grid;
+        gap: 10px;
+        justify-items: center;
+        width: min(100%, 1100px);
+      }
+
+      .full-view-meta {
+        display: grid;
+        gap: 5px;
+        text-align: center;
+        color: #f8fafc;
+        width: 100%;
+        max-width: min(100%, 1080px);
+      }
+
+      .full-view-meta {
+        pointer-events: none;
+      }
+
+      .full-side {
+        font-weight: 650;
+        font-size: 0.95rem;
+      }
+
+      .full-view img {
+        max-width: min(94vw, 1080px);
+        max-height: min(72vh, 720px);
+        object-fit: contain;
+        width: auto;
+        height: auto;
+        border-radius: 8px;
+        background: #111827;
+      }
+
+      .full-view-actions {
+        display: flex;
+        gap: 10px;
+      }
+
+      .full-view button {
+        border-color: #f1f5f9;
+        background: #f1f5f9;
+        color: #111827;
+        min-height: 44px;
+        min-width: 72px;
+      }
+
+      .full-hint {
+        color: #cbd5e1;
+        font-size: 0.78rem;
+        min-height: 1.1rem;
+      }
+
+      .filter-helper {
+        margin: 2px 0 0;
+        color: var(--subtle);
+        font-size: 0.76rem;
       }
 
       .meta-actions {
@@ -240,6 +344,13 @@
         font: inherit;
         font-weight: 600;
         cursor: pointer;
+      }
+
+      .image-card:focus-visible,
+      .open-full:focus-visible,
+      .full-view button:focus-visible {
+        outline: 3px solid rgba(29, 78, 216, 0.6);
+        outline-offset: 2px;
       }
 
       button:hover:not(:disabled) {
@@ -315,8 +426,31 @@
       }
 
       @media (max-width: 900px) {
+        body {
+          padding: 8px;
+        }
+
+        .app {
+          padding: 10px;
+          width: 100%;
+        }
+
+        .topbar,
+        .pair {
+          gap: 10px;
+        }
+
         .pair {
           grid-template-columns: 1fr;
+        }
+
+        .hero-media {
+          width: min(140px, 70vw);
+        }
+
+        .hero {
+          gap: 8px;
+          padding: 8px;
         }
 
         .field {
@@ -328,6 +462,8 @@
         .field input,
         .field select {
           min-width: 0;
+          min-height: 48px;
+          font-size: 1rem;
         }
 
         .hero {
@@ -339,12 +475,35 @@
         }
 
         .hero-media {
-          width: min(170px, 70vw);
+          width: min(280px, 88vw);
           justify-self: center;
         }
 
         .image-card img {
-          height: 260px;
+          height: min(52vh, 420px);
+        }
+
+        .image-card {
+          min-height: auto;
+          padding: 8px 8px 10px;
+          gap: 6px;
+        }
+
+        .image-card .caption {
+          min-height: 1rem;
+        }
+
+        .open-full {
+          min-height: 44px;
+        }
+
+        .full-view-actions {
+          width: 100%;
+          justify-content: center;
+        }
+
+        .full-view button {
+          min-height: 48px;
         }
       }
     </style>
@@ -358,10 +517,9 @@
         </div>
         <figure class="hero-media">
           <img
-            src="/assets/virtual-youssef.png"
+            src="/virtual-youssef.png"
             alt="Virtual Youssef concept"
-            loading="eager"
-            fetchpriority="high"
+            loading="lazy"
           />
         </figure>
       </section>
@@ -384,6 +542,7 @@
               <option value="">Any sample</option>
             </select>
           </div>
+          <p class="filter-helper">No sample? leave as <strong>Any sample</strong>.</p>
         </div>
       </section>
 
@@ -399,7 +558,8 @@
         >
           <span class="badge">L</span>
           <img id="leftImage" alt="Left image candidate" src="" />
-          <a id="leftOpen" class="open-full" target="_blank" rel="noopener noreferrer">Open full</a>
+          <button id="leftOpen" class="open-full" type="button" aria-label="Open left image in full view">Open full</button>
+          <p class="caption">Tap to choose this side</p>
         </figure>
 
         <figure
@@ -413,7 +573,8 @@
         >
           <span class="badge">R</span>
           <img id="rightImage" alt="Right image candidate" src="" />
-          <a id="rightOpen" class="open-full" target="_blank" rel="noopener noreferrer">Open full</a>
+          <button id="rightOpen" class="open-full" type="button" aria-label="Open right image in full view">Open full</button>
+          <p class="caption">Tap to choose this side</p>
         </figure>
       </section>
 
@@ -426,6 +587,30 @@
     </main>
 
     <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <div
+      id="fullView"
+      class="full-view"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="fullViewSide"
+      aria-hidden="true"
+      tabindex="-1"
+    >
+      <div class="full-view-inner">
+        <div class="full-view-meta">
+          <p id="fullViewSide" class="full-side">Viewing left</p>
+          <p id="fullViewHint" class="full-hint" hidden>Swipe left/right to switch. Press V to vote for the current side.</p>
+        </div>
+        <img id="fullImage" alt="Full image preview" />
+        <div class="full-view-actions">
+          <button id="fullPrev" type="button" aria-label="Previous image">◀</button>
+          <button id="fullClose" type="button" aria-label="Close preview">Close</button>
+          <button id="fullNext" type="button" aria-label="Next image">▶</button>
+          <button id="fullVote" type="button" aria-label="Vote for displayed image">Vote</button>
+        </div>
+      </div>
+    </div>
 
     <script>
       const state = {
@@ -454,7 +639,19 @@
       const undoBtn = document.getElementById('undoBtn');
       const status = document.getElementById('status');
       const toast = document.getElementById('toast');
+      const fullView = document.getElementById('fullView');
+      const fullImage = document.getElementById('fullImage');
+      const fullPrev = document.getElementById('fullPrev');
+      const fullNext = document.getElementById('fullNext');
+      const fullClose = document.getElementById('fullClose');
+      const fullVote = document.getElementById('fullVote');
+      const fullViewSide = document.getElementById('fullViewSide');
+      const fullViewHint = document.getElementById('fullViewHint');
       let toastTimer = null;
+      let fullViewIndex = 0;
+      let fullViewTouchStartX = null;
+      let fullHintShown = false;
+      let fullViewLauncher = null;
 
       userIdInput.value = state.userId;
       localStorage.setItem('pairUserId', state.userId);
@@ -476,7 +673,15 @@
       function disableControls(disabled) {
         leftCard.disabled = disabled;
         rightCard.disabled = disabled;
+        leftOpen.disabled = disabled;
+        rightOpen.disabled = disabled;
+        leftCard.classList.toggle('is-disabled', disabled);
+        rightCard.classList.toggle('is-disabled', disabled);
+        leftOpen.classList.toggle('is-disabled', disabled);
+        rightOpen.classList.toggle('is-disabled', disabled);
         sampleFilter.disabled = disabled;
+        leftCard.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+        rightCard.setAttribute('aria-disabled', disabled ? 'true' : 'false');
       }
 
       function renderMeta() {
@@ -491,8 +696,6 @@
         leftImage.loading = 'lazy';
         rightImage.src = pair.right.url;
         rightImage.loading = 'lazy';
-        leftOpen.href = pair.left.url;
-        rightOpen.href = pair.right.url;
         pairMeta.textContent = `Pair: ${pair.pair_id}  —  ${pair.fold} / ${pair.sample}`;
       }
 
@@ -559,6 +762,62 @@
         retryBtn.hidden = false;
       }
 
+      function renderFullImage() {
+        if (!state.pair) {
+          return;
+        }
+
+        const image = fullViewIndex === 0 ? state.pair.left : state.pair.right;
+        const side = fullViewIndex === 0 ? 'left' : 'right';
+
+        fullImage.src = image.url;
+        fullImage.alt = `${side.charAt(0).toUpperCase() + side.slice(1)} image full preview`;
+        fullViewSide.textContent = `Viewing ${side === 'left' ? 'left' : 'right'} side`;
+        fullVote.textContent = `Vote ${side}`;
+        fullVote.setAttribute('aria-label', `Vote for ${side} image`);
+        fullPrev.setAttribute('aria-label', `Show ${side === 'left' ? 'right' : 'left'} image`);
+        fullNext.setAttribute('aria-label', `Show ${side === 'left' ? 'right' : 'left'} image`);
+      }
+
+      function openFullView(side) {
+        if (!state.pair) {
+          return;
+        }
+
+        fullViewIndex = side === 'right' ? 1 : 0;
+        renderFullImage();
+        fullView.classList.add('open');
+        fullView.setAttribute('aria-hidden', 'false');
+
+        fullViewLauncher = document.activeElement instanceof HTMLElement ? document.activeElement : document.getElementById(side === 'left' ? 'leftCard' : 'rightCard');
+        if (!fullHintShown) {
+          fullHintShown = true;
+          fullViewHint.hidden = false;
+          setTimeout(() => {
+            fullViewHint.hidden = true;
+          }, 2200);
+        }
+
+        setStatus('Full view open. Swipe/arrow to switch, V to vote current image.');
+        requestAnimationFrame(() => {
+          fullVote.focus();
+        });
+      }
+
+      function closeFullView() {
+        fullView.classList.remove('open');
+        fullView.setAttribute('aria-hidden', 'true');
+
+        if (fullViewLauncher && fullViewLauncher.focus) {
+          fullViewLauncher.focus();
+        }
+      }
+
+      function toggleFullImage() {
+        fullViewIndex = fullViewIndex === 0 ? 1 : 0;
+        renderFullImage();
+      }
+
       async function fetchCatalog() {
         try {
           const res = await fetch('/api/catalog');
@@ -593,6 +852,7 @@
       }
 
       async function fetchPair() {
+        closeFullView();
         setBusy(true, 'Loading next pair...');
         try {
           const query = toQueryParams();
@@ -611,7 +871,7 @@
           state.pairIndex += 1;
           renderPair(pair);
           renderMeta();
-          setStatus('Press 1/A, 2/L, or click an image to choose');
+          setStatus('Press 1/2 (desktop) or tap an image to choose');
           showToast('New pair ready', 900);
           setRetry(null);
           document.getElementById(state.lastActiveControl).focus();
@@ -726,10 +986,63 @@
 
       leftOpen.addEventListener('click', (event) => {
         event.stopPropagation();
+        openFullView('left');
       });
 
       rightOpen.addEventListener('click', (event) => {
         event.stopPropagation();
+        openFullView('right');
+      });
+
+      fullPrev.addEventListener('click', () => {
+        if (!state.pair) {
+          return;
+        }
+        toggleFullImage();
+      });
+
+      fullNext.addEventListener('click', () => {
+        if (!state.pair) {
+          return;
+        }
+        toggleFullImage();
+      });
+
+      fullVote.addEventListener('click', () => {
+        if (state.busy || !state.pair) {
+          return;
+        }
+        sendChoice(fullViewIndex === 0 ? 'left' : 'right');
+      });
+
+      fullClose.addEventListener('click', closeFullView);
+
+      fullView.addEventListener('click', (event) => {
+        if (event.target === fullView) {
+          closeFullView();
+        }
+      });
+
+      fullView.addEventListener('touchstart', (event) => {
+        fullViewTouchStartX = event.changedTouches[0].clientX;
+        event.preventDefault();
+      });
+
+      fullView.addEventListener('touchend', (event) => {
+        if (fullViewTouchStartX === null) {
+          return;
+        }
+
+        event.preventDefault();
+        const endX = event.changedTouches[0].clientX;
+        const deltaX = endX - fullViewTouchStartX;
+        fullViewTouchStartX = null;
+
+        if (Math.abs(deltaX) < 35) {
+          return;
+        }
+
+        toggleFullImage();
       });
 
       leftCard.addEventListener('keydown', (event) => {
@@ -801,6 +1114,28 @@
           return;
         }
 
+        if (fullView.classList.contains('open')) {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            closeFullView();
+            return;
+          }
+
+          if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+            event.preventDefault();
+            toggleFullImage();
+            return;
+          }
+
+          if (event.key.toLowerCase() === 'v') {
+            event.preventDefault();
+            sendChoice(fullViewIndex === 0 ? 'left' : 'right');
+            return;
+          }
+
+          return;
+        }
+
         if (state.busy) {
           return;
         }
@@ -814,14 +1149,14 @@
 
         const key = event.key.toLowerCase();
 
-        if (key === '1' || key === 'a') {
+        if (key === '1') {
           event.preventDefault();
           state.lastActiveControl = 'leftCard';
           sendChoice('left');
           return;
         }
 
-        if (key === '2' || key === 'l') {
+        if (key === '2') {
           event.preventDefault();
           state.lastActiveControl = 'rightCard';
           sendChoice('right');

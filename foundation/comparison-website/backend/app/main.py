@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import json
 import random
 import sqlite3
 from dataclasses import dataclass
@@ -26,8 +27,10 @@ DATASET_ROOT = Path(os.getenv("DATASET_ROOT", "/data/images")).resolve()
 DB_PATH = Path(os.getenv("DATABASE_PATH", "/app/data/preferences.db")).resolve()
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 CATALOG_CACHE_TTL_SECONDS = 30
+MANIFEST_CACHE_TTL_SECONDS = 30
 
 _catalog_cache: dict[str, tuple[float, list[dict[str, str | list[str]]]]] = {}
+_manifest_cache: dict[str, tuple[float, list[dict[str, object]]]] = {}
 
 app = FastAPI(title="Pairwise Preference Collector")
 app.add_middleware(
@@ -128,6 +131,160 @@ def _collect_samples(fold_filter: str | None, sample_filter: str | None) -> list
                 samples.append((fold_dir.name, sample_dir.name, images))
 
     return samples
+
+
+def _load_manifest_cached(sample_dir: Path) -> list[dict[str, object]]:
+    if not sample_dir.exists():
+        return []
+
+    manifest_path = sample_dir / "pairs.jsonl"
+    key = str(sample_dir)
+    now = time.time()
+    expires, rows = _manifest_cache.get(key, (0.0, []))
+    if now < expires and rows:
+        return rows
+
+    cached: list[dict[str, object]] = []
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    cached.append(payload)
+
+    _manifest_cache[key] = (now + MANIFEST_CACHE_TTL_SECONDS, cached)
+    return cached
+
+
+def _manifest_images_from_entry(
+    fold_name: str, sample_name: str, entry: dict[str, object]
+) -> tuple[str | None, str | None]:
+    left = entry.get("left_image")
+    if left is None:
+        left = entry.get("left")
+
+    right = entry.get("right_image")
+    if right is None:
+        right = entry.get("right")
+
+    def normalize(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().replace("\\", "/").lstrip("/")
+        if normalized.startswith("images/"):
+            normalized = normalized[len("images/") :]
+        if normalized.startswith(f"{fold_name}/{sample_name}/"):
+            return normalized
+        if "/" not in normalized:
+            return f"{fold_name}/{sample_name}/{normalized}"
+        return f"{fold_name}/{sample_name}/{Path(normalized).name}" if not normalized.startswith(
+            fold_name + "/"
+        ) else normalized
+
+    return normalize(left), normalize(right)
+
+
+def _get_manifest_entries_for_sample(
+    fold_name: str, sample_name: str
+) -> list[dict[str, object]]:
+    sample_dir = DATASET_ROOT / fold_name / sample_name
+    entries = _load_manifest_cached(sample_dir)
+    pairs: list[dict[str, object]] = []
+
+    for entry in entries:
+        left_rel, right_rel = _manifest_images_from_entry(
+            fold_name, sample_name, entry
+        )
+        if left_rel is None or right_rel is None:
+            continue
+        left_path = DATASET_ROOT / left_rel
+        right_path = DATASET_ROOT / right_rel
+        if not left_path.exists() or not right_path.exists():
+            continue
+        if not (
+            left_path.suffix.lower() in IMAGE_EXTENSIONS
+            and right_path.suffix.lower() in IMAGE_EXTENSIONS
+        ):
+            continue
+        pairs.append(entry)
+
+    return pairs
+
+
+def _manifest_pair_id_for_paths(
+    fold_name: str, sample_name: str, left_rel: str, right_rel: str
+) -> str | None:
+    for entry in _get_manifest_entries_for_sample(fold_name, sample_name):
+        candidate_left, candidate_right = _manifest_images_from_entry(
+            fold_name, sample_name, entry
+        )
+        if candidate_left is None or candidate_right is None:
+            continue
+        if (candidate_left == left_rel and candidate_right == right_rel) or (
+            candidate_left == right_rel and candidate_right == left_rel
+        ):
+            value = entry.get("pair_id")
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _build_pair_from_manifest(
+    fold_filter: str | None, sample_filter: str | None
+) -> ImagePair | None:
+    if not DATASET_ROOT.exists():
+        return None
+
+    matching_samples: list[tuple[str, str]] = []
+    for fold_dir in sorted(p for p in DATASET_ROOT.iterdir() if p.is_dir()):
+        if fold_filter and fold_dir.name != fold_filter:
+            continue
+        for sample_dir in sorted(p for p in fold_dir.iterdir() if p.is_dir()):
+            if sample_filter and sample_dir.name != sample_filter:
+                continue
+            pairs = _get_manifest_entries_for_sample(fold_dir.name, sample_dir.name)
+            if pairs:
+                matching_samples.append((fold_dir.name, sample_dir.name))
+
+    if not matching_samples:
+        return None
+
+    fold_name, sample_name = random.choice(matching_samples)
+    manifest_entries = _get_manifest_entries_for_sample(fold_name, sample_name)
+    if not manifest_entries:
+        return None
+
+    entry = random.choice(manifest_entries)
+    left_rel, right_rel = _manifest_images_from_entry(
+        fold_name, sample_name, entry
+    )
+    if left_rel is None or right_rel is None:
+        return None
+
+    pair_id = entry.get("pair_id")
+    if not isinstance(pair_id, str) or not pair_id:
+        pair_id = _pair_id(
+            fold_name,
+            sample_name,
+            DATASET_ROOT / left_rel,
+            DATASET_ROOT / right_rel,
+        )
+
+    return ImagePair(
+        pair_id=pair_id,
+        fold=fold_name,
+        sample=sample_name,
+        left_image=left_rel,
+        right_image=right_rel,
+        left_display=_to_public_url(DATASET_ROOT / left_rel),
+        right_display=_to_public_url(DATASET_ROOT / right_rel),
+    )
 
 
 def _collect_catalog() -> list[dict[str, str | list[str]]]:
@@ -232,22 +389,32 @@ def get_pair(fold: str | None = None, sample: str | None = None) -> PairOut:
         raise HTTPException(status_code=404, detail="Dataset root not found")
 
     if fold is not None or sample is not None:
-        samples = _collect_samples(fold, sample)
-        if not samples:
-            raise HTTPException(status_code=404, detail="No matching sample found")
-        fold_name, sample_name, images = random.choice(samples)
-        left, right = random.sample(images, 2)
-        pair = ImagePair(
-            pair_id=_pair_id(fold_name, sample_name, left, right),
-            fold=fold_name,
-            sample=sample_name,
-            left_image=left.relative_to(DATASET_ROOT).as_posix(),
-            right_image=right.relative_to(DATASET_ROOT).as_posix(),
-            left_display=_to_public_url(left),
-            right_display=_to_public_url(right),
-        )
+        manifest_pair = _build_pair_from_manifest(fold, sample)
+        if manifest_pair is None:
+            # Fallback to legacy random image pairing for backwards compatibility.
+            samples = _collect_samples(fold, sample)
+            if not samples:
+                raise HTTPException(status_code=404, detail="No matching sample found")
+            fold_name, sample_name, images = random.choice(samples)
+            left, right = random.sample(images, 2)
+            pair = ImagePair(
+                pair_id=_pair_id(fold_name, sample_name, left, right),
+                fold=fold_name,
+                sample=sample_name,
+                left_image=left.relative_to(DATASET_ROOT).as_posix(),
+                right_image=right.relative_to(DATASET_ROOT).as_posix(),
+                left_display=_to_public_url(left),
+                right_display=_to_public_url(right),
+            )
+        else:
+            pair = manifest_pair
     else:
-        pair = _build_pair()
+        # Random pair from manifest when available, with legacy fallback.
+        manifest_pair = _build_pair_from_manifest(None, None)
+        if manifest_pair is not None:
+            pair = manifest_pair
+        else:
+            pair = _build_pair()
 
     return PairOut(
         pair_id=pair.pair_id,
@@ -269,7 +436,13 @@ def log_preference(payload: PreferenceIn) -> PreferenceOut:
     left_rel = _safe_rel_path(payload.left_image)
     right_rel = _safe_rel_path(payload.right_image)
 
-    expected_id = _pair_id(payload.fold, payload.sample, DATASET_ROOT / left_rel, DATASET_ROOT / right_rel)
+    expected_id = _pair_id(
+        payload.fold, payload.sample, DATASET_ROOT / left_rel, DATASET_ROOT / right_rel
+    )
+
+    manifest_id = _manifest_pair_id_for_paths(payload.fold, payload.sample, left_rel, right_rel)
+    if manifest_id:
+        expected_id = manifest_id
 
     # pair_id can come from client, but we keep a stable canonical id for this image pair.
     pair_id = expected_id
