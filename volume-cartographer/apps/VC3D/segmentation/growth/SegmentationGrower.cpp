@@ -20,7 +20,9 @@
 #include <QtConcurrent/QtConcurrent>
 
 #include <QDir>
+#include <QFileInfo>
 #include <QLoggingCategory>
+#include <QUuid>
 
 #include <algorithm>
 #include <chrono>
@@ -31,15 +33,26 @@
 #include <limits>
 #include <utility>
 #include <cstdint>
+#include <cctype>
+#include <cstring>
+#include <set>
+#include <unordered_set>
 
 #include <opencv2/core.hpp>
 
 #include <nlohmann/json.hpp>
 
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth);
 
 namespace
 {
+const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest");
+const QString kCopyLatestSentinel = QStringLiteral("copy_displacement_latest");
+
 QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
 {
     if (!pkg) {
@@ -606,6 +619,408 @@ void refreshSegmentationViewers(ViewerManager* manager)
         }
     });
 }
+
+struct DenseDisplacementJob
+{
+    QString socketPath;
+    QString tifxyzInputPath;
+    QString volumeZarrPath;
+    int volumeScale{0};
+    int iterations{1};
+    QString checkpointPath;
+    DenseTtaMode ttaMode{DenseTtaMode::Mirror};
+    QString ttaMergeMethod{QStringLiteral("vector_geomedian")};
+    double ttaOutlierDropThresh{1.25};
+    std::optional<nlohmann::json> customParams;
+    std::vector<SegmentationGrowthDirection> directions;
+};
+
+struct CopyDisplacementJob
+{
+    QString socketPath;
+    QString tifxyzInputPath;
+    QString volumeZarrPath;
+    int volumeScale{0};
+    QString checkpointPath;
+    DenseTtaMode ttaMode{DenseTtaMode::Mirror};
+    QString ttaMergeMethod{QStringLiteral("vector_geomedian")};
+    double ttaOutlierDropThresh{1.25};
+    std::optional<nlohmann::json> customParams;
+};
+
+std::optional<std::string> denseDirectionToToken(SegmentationGrowthDirection direction)
+{
+    switch (direction) {
+    case SegmentationGrowthDirection::Left:
+        return std::string("left");
+    case SegmentationGrowthDirection::Right:
+        return std::string("right");
+    case SegmentationGrowthDirection::Up:
+        return std::string("up");
+    case SegmentationGrowthDirection::Down:
+        return std::string("down");
+    case SegmentationGrowthDirection::All:
+        return std::string("all");
+    default:
+        return std::nullopt;
+    }
+}
+
+std::vector<SegmentationGrowthDirection> resolveDenseDirections(
+    SegmentationGrowthDirection primaryDirection,
+    const std::vector<SegmentationGrowthDirection>& allowedDirections)
+{
+    if (primaryDirection != SegmentationGrowthDirection::All) {
+        return {primaryDirection};
+    }
+
+    const std::vector<SegmentationGrowthDirection> order = {
+        SegmentationGrowthDirection::Left,
+        SegmentationGrowthDirection::Right,
+        SegmentationGrowthDirection::Up,
+        SegmentationGrowthDirection::Down,
+    };
+
+    std::set<SegmentationGrowthDirection> allowedSet;
+    for (auto dir : allowedDirections) {
+        if (dir == SegmentationGrowthDirection::All) {
+            allowedSet.insert(order.begin(), order.end());
+            break;
+        }
+        if (dir == SegmentationGrowthDirection::Left ||
+            dir == SegmentationGrowthDirection::Right ||
+            dir == SegmentationGrowthDirection::Up ||
+            dir == SegmentationGrowthDirection::Down) {
+            allowedSet.insert(dir);
+        }
+    }
+    if (allowedSet.empty()) {
+        allowedSet.insert(order.begin(), order.end());
+    }
+
+    if (allowedSet.size() == order.size()) {
+        return {SegmentationGrowthDirection::All};
+    }
+
+    std::vector<SegmentationGrowthDirection> resolved;
+    resolved.reserve(4);
+    for (auto dir : order) {
+        if (allowedSet.count(dir) > 0) {
+            resolved.push_back(dir);
+        }
+    }
+    return resolved;
+}
+
+QString createDenseSnapshotPath(const QString& preferredDir)
+{
+    QString outputDir = preferredDir.trimmed();
+    if (outputDir.isEmpty()) {
+        outputDir = QDir::tempPath();
+    }
+
+    QDir dir(outputDir);
+    if (!dir.exists() && !dir.mkpath(QStringLiteral("."))) {
+        dir = QDir(QDir::tempPath());
+    }
+
+    const QString suffix = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    return dir.filePath(QStringLiteral("vc_dense_input_%1").arg(suffix));
+}
+
+nlohmann::json sendSocketJsonRequest(const QString& socketPath, const nlohmann::json& request)
+{
+    const std::string socketStd = socketPath.toStdString();
+    int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) {
+        throw std::runtime_error("Failed to create UNIX socket.");
+    }
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    if (socketStd.size() >= sizeof(addr.sun_path)) {
+        ::close(sock);
+        throw std::runtime_error("Neural socket path is too long.");
+    }
+    std::strncpy(addr.sun_path, socketStd.c_str(), sizeof(addr.sun_path) - 1);
+
+    if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(sock);
+        throw std::runtime_error("Failed to connect to neural trace socket.");
+    }
+
+    const std::string requestPayload = request.dump() + "\n";
+    if (::send(sock, requestPayload.c_str(), requestPayload.size(), 0) < 0) {
+        ::close(sock);
+        throw std::runtime_error("Failed to send dense displacement request.");
+    }
+
+    std::string responsePayload;
+    char ch = 0;
+    while (::recv(sock, &ch, 1, 0) == 1) {
+        if (ch == '\n') {
+            break;
+        }
+        responsePayload.push_back(ch);
+    }
+    ::close(sock);
+
+    if (responsePayload.empty()) {
+        throw std::runtime_error("Dense displacement service returned an empty response.");
+    }
+
+    return nlohmann::json::parse(responsePayload);
+}
+
+std::string sanitizeSegmentId(const std::string& value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (unsigned char ch : value) {
+        if (std::isalnum(ch) || ch == '_' || ch == '-') {
+            out.push_back(static_cast<char>(ch));
+        } else {
+            out.push_back('_');
+        }
+    }
+    while (!out.empty() && out.back() == '_') {
+        out.pop_back();
+    }
+    if (out.empty()) {
+        out = "dense_displacement";
+    }
+    return out;
+}
+
+std::string makeUniqueSegmentId(const std::filesystem::path& pathsDir, const std::string& base)
+{
+    std::string candidate = base;
+    int suffix = 1;
+    while (std::filesystem::exists(pathsDir / candidate)) {
+        candidate = base + "_" + std::to_string(suffix++);
+    }
+    return candidate;
+}
+
+TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
+{
+    TracerGrowthResult result;
+    std::vector<std::filesystem::path> temporaryPaths;
+    temporaryPaths.reserve(job.directions.size() + 1);
+    if (!job.tifxyzInputPath.isEmpty()) {
+        temporaryPaths.emplace_back(job.tifxyzInputPath.toStdString());
+    }
+
+    auto finalizeResult = [&]() -> TracerGrowthResult {
+        result.temporarySurfacePaths.clear();
+        result.temporarySurfacePaths.reserve(temporaryPaths.size());
+        for (const auto& path : temporaryPaths) {
+            if (!path.empty()) {
+                result.temporarySurfacePaths.push_back(path);
+            }
+        }
+        return result;
+    };
+
+    QString currentInputPath = job.tifxyzInputPath;
+    QString finalOutputPath = job.tifxyzInputPath;
+
+    for (auto direction : job.directions) {
+        const auto directionToken = denseDirectionToToken(direction);
+        if (!directionToken.has_value()) {
+            continue;
+        }
+
+        nlohmann::json request;
+        request["request_type"] = "dense_displacement_grow";
+        request["tifxyz_path"] = currentInputPath.toStdString();
+        request["grow_direction"] = *directionToken;
+        request["iterations"] = std::max(1, job.iterations);
+        request["edge_input_rowscols"] = 40;
+        request["volume_path"] = job.volumeZarrPath.toStdString();
+        request["volume_scale"] = std::max(0, job.volumeScale);
+        request["checkpoint_path"] = job.checkpointPath.toStdString();
+        request["tta_merge_method"] = job.ttaMergeMethod.toStdString();
+        request["tta_outlier_drop_thresh"] = job.ttaOutlierDropThresh;
+        switch (job.ttaMode) {
+        case DenseTtaMode::Rotate3:
+            request["tta"] = true;
+            request["tta_transform"] = "rotate3";
+            break;
+        case DenseTtaMode::None:
+            request["tta"] = false;
+            break;
+        case DenseTtaMode::Mirror:
+        default:
+            request["tta"] = true;
+            request["tta_transform"] = "mirror";
+            break;
+        }
+
+        if (job.customParams) {
+            auto denseArgsIt = job.customParams->find("dense_args");
+            if (denseArgsIt != job.customParams->end() && denseArgsIt->is_object()) {
+                request["dense_args"] = *denseArgsIt;
+            }
+            auto denseOverridesIt = job.customParams->find("dense_overrides");
+            if (denseOverridesIt != job.customParams->end() && denseOverridesIt->is_object()) {
+                request["overrides"] = *denseOverridesIt;
+            }
+        }
+
+        nlohmann::json response;
+        try {
+            response = sendSocketJsonRequest(job.socketPath, request);
+        } catch (const std::exception& ex) {
+            result.error = QStringLiteral("Dense displacement request failed: %1").arg(ex.what());
+            return finalizeResult();
+        }
+
+        if (response.contains("error")) {
+            QString serviceError;
+            if (response["error"].is_string()) {
+                serviceError = QString::fromStdString(response["error"].get<std::string>());
+            } else {
+                serviceError = QString::fromStdString(response["error"].dump());
+            }
+            result.error = QStringLiteral("Dense displacement service error: %1").arg(serviceError);
+            return finalizeResult();
+        }
+        if (!response.contains("output_tifxyz_path") || !response["output_tifxyz_path"].is_string()) {
+            result.error = QStringLiteral("Dense displacement response missing output_tifxyz_path.");
+            return finalizeResult();
+        }
+
+        finalOutputPath = QString::fromStdString(response["output_tifxyz_path"].get<std::string>());
+        currentInputPath = finalOutputPath;
+        if (!finalOutputPath.isEmpty()) {
+            temporaryPaths.emplace_back(finalOutputPath.toStdString());
+        }
+    }
+
+    if (finalOutputPath.isEmpty()) {
+        result.error = QStringLiteral("Dense displacement did not produce an output path.");
+        return finalizeResult();
+    }
+
+    std::unique_ptr<QuadSurface> loaded;
+    try {
+        loaded = load_quad_from_tifxyz(finalOutputPath.toStdString());
+    } catch (const std::exception& ex) {
+        result.error = QStringLiteral("Failed to load dense displacement output: %1").arg(ex.what());
+        return finalizeResult();
+    }
+    if (!loaded) {
+        result.error = QStringLiteral("Dense displacement output could not be loaded.");
+        return finalizeResult();
+    }
+
+    result.surface = loaded.release();
+    result.statusMessage = QStringLiteral("Dense displacement growth completed");
+    return finalizeResult();
+}
+
+TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
+{
+    TracerGrowthResult result;
+    std::vector<std::filesystem::path> temporaryPaths;
+    temporaryPaths.reserve(3);
+    if (!job.tifxyzInputPath.isEmpty()) {
+        temporaryPaths.emplace_back(job.tifxyzInputPath.toStdString());
+    }
+
+    auto finalizeResult = [&]() -> TracerGrowthResult {
+        result.temporarySurfacePaths.clear();
+        result.temporarySurfacePaths.reserve(temporaryPaths.size());
+        for (const auto& path : temporaryPaths) {
+            if (!path.empty()) {
+                result.temporarySurfacePaths.push_back(path);
+            }
+        }
+        return result;
+    };
+
+    nlohmann::json request;
+    request["request_type"] = "displacement_copy_grow";
+    request["tifxyz_path"] = job.tifxyzInputPath.toStdString();
+    request["volume_path"] = job.volumeZarrPath.toStdString();
+    request["volume_scale"] = std::max(0, job.volumeScale);
+    request["checkpoint_path"] = job.checkpointPath.toStdString();
+    request["tta_merge_method"] = job.ttaMergeMethod.toStdString();
+    request["tta_outlier_drop_thresh"] = job.ttaOutlierDropThresh;
+
+    switch (job.ttaMode) {
+    case DenseTtaMode::Rotate3:
+        request["tta"] = true;
+        request["tta_transform"] = "rotate3";
+        break;
+    case DenseTtaMode::None:
+        request["tta"] = false;
+        break;
+    case DenseTtaMode::Mirror:
+    default:
+        request["tta"] = true;
+        request["tta_transform"] = "mirror";
+        break;
+    }
+
+    if (job.customParams) {
+        auto copyArgsIt = job.customParams->find("copy_args");
+        if (copyArgsIt != job.customParams->end() && copyArgsIt->is_object()) {
+            request["copy_args"] = *copyArgsIt;
+        }
+        auto copyOverridesIt = job.customParams->find("copy_overrides");
+        if (copyOverridesIt != job.customParams->end() && copyOverridesIt->is_object()) {
+            request["overrides"] = *copyOverridesIt;
+        }
+    }
+
+    nlohmann::json response;
+    try {
+        response = sendSocketJsonRequest(job.socketPath, request);
+    } catch (const std::exception& ex) {
+        result.error = QStringLiteral("Displacement copy request failed: %1").arg(ex.what());
+        return finalizeResult();
+    }
+
+    if (response.contains("error")) {
+        QString serviceError;
+        if (response["error"].is_string()) {
+            serviceError = QString::fromStdString(response["error"].get<std::string>());
+        } else {
+            serviceError = QString::fromStdString(response["error"].dump());
+        }
+        result.error = QStringLiteral("Displacement copy service error: %1").arg(serviceError);
+        return finalizeResult();
+    }
+
+    if (!response.contains("output_tifxyz_paths") || !response["output_tifxyz_paths"].is_object()) {
+        result.error = QStringLiteral("Displacement copy response missing output_tifxyz_paths.");
+        return finalizeResult();
+    }
+
+    const auto& outputs = response["output_tifxyz_paths"];
+    if (!outputs.contains("front") || !outputs["front"].is_string()) {
+        result.error = QStringLiteral("Displacement copy response missing front output.");
+        return finalizeResult();
+    }
+    if (!outputs.contains("back") || !outputs["back"].is_string()) {
+        result.error = QStringLiteral("Displacement copy response missing back output.");
+        return finalizeResult();
+    }
+
+    const QString frontPath = QString::fromStdString(outputs["front"].get<std::string>());
+    const QString backPath = QString::fromStdString(outputs["back"].get<std::string>());
+    if (!frontPath.isEmpty()) {
+        temporaryPaths.emplace_back(frontPath.toStdString());
+    }
+    if (!backPath.isEmpty()) {
+        temporaryPaths.emplace_back(backPath.toStdString());
+    }
+
+    result.statusMessage = QStringLiteral("Displacement copy completed");
+    return finalizeResult();
+}
 } // namespace
 
 SegmentationGrower::SegmentationGrower(Context context,
@@ -1030,11 +1445,148 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         qCInfo(lcSegGrowth) << "Cell reoptimization mode enabled for tracer params.";
     }
 
-    // Handle neural tracer integration - pass neural_socket when enabled, GrowPatch will use it as needed
-    if (_context.widget->neuralTracerEnabled()) {
-        const QString checkpointPath = _context.widget->neuralCheckpointPath();
+    const bool neuralTracerEnabled = _context.widget->neuralTracerEnabled();
+    const bool denseMode = neuralTracerEnabled &&
+        _context.widget->neuralModelType() == NeuralTracerModelType::DenseDisplacement;
+
+    if (denseMode) {
+        const QString denseCheckpointPath = _context.widget->denseCheckpointPath().trimmed();
         const QString pythonPath = _context.widget->neuralPythonPath();
-        const QString volumeZarr = _context.widget->volumeZarrPath();
+        const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
+        const int volumeScale = _context.widget->neuralVolumeScale();
+        const DenseTtaMode denseTtaMode = _context.widget->denseTtaMode();
+        const QString denseTtaMergeMethod = _context.widget->denseTtaMergeMethod().trimmed();
+        const double denseTtaOutlierDropThresh = _context.widget->denseTtaOutlierDropThresh();
+        const auto outputMode = _context.widget->neuralOutputMode();
+
+        if (denseCheckpointPath.isEmpty()) {
+            showStatus(tr("Dense displacement requires a dense checkpoint path."), kStatusLong);
+            return false;
+        }
+        const bool usingDenseLatestPreset = denseCheckpointPath == kDenseLatestSentinel;
+        if (!usingDenseLatestPreset &&
+            (!QFileInfo::exists(denseCheckpointPath) || !QFileInfo(denseCheckpointPath).isFile())) {
+            showStatus(tr("Dense checkpoint does not exist: %1").arg(denseCheckpointPath), kStatusLong);
+            return false;
+        }
+        if (volumeZarr.isEmpty()) {
+            showStatus(tr("Dense displacement requires a volume zarr path."), kStatusLong);
+            return false;
+        }
+
+        auto& serviceManager = NeuralTraceServiceManager::instance();
+        showStatus(tr("Starting neural trace service for dense displacement..."), kStatusLong);
+        if (!serviceManager.ensureServiceRunning(denseCheckpointPath, volumeZarr, volumeScale, pythonPath)) {
+            const QString error = serviceManager.lastError();
+            showStatus(tr("Failed to start neural trace service: %1").arg(error), kStatusLong);
+            return false;
+        }
+        const QString socketPath = serviceManager.socketPath();
+        if (socketPath.isEmpty()) {
+            showStatus(tr("Neural trace service is running but socket path is unavailable."), kStatusLong);
+            return false;
+        }
+
+        const auto denseDirections = resolveDenseDirections(effectiveDirection, request.allowedDirections);
+        if (denseDirections.empty()) {
+            showStatus(tr("No valid dense growth directions are enabled."), kStatusLong);
+            return false;
+        }
+
+        const QString segmentationPath = QString::fromStdString(segmentationSurface->path.string());
+        const QString denseSnapshotDir = segmentationPath.isEmpty()
+            ? QString()
+            : QFileInfo(segmentationPath).dir().absolutePath();
+        const QString denseInputPath = createDenseSnapshotPath(denseSnapshotDir);
+        try {
+            const QFileInfo snapshotInfo(denseInputPath);
+            const std::string snapshotId = snapshotInfo.fileName().toStdString();
+
+            // QuadSurface::save mutates the instance path/id/meta. Preserve and restore
+            // so taking a dense snapshot does not retarget the live segmentation surface.
+            const std::filesystem::path originalSurfacePath = segmentationSurface->path;
+            const std::string originalSurfaceId = segmentationSurface->id;
+            std::unique_ptr<nlohmann::json> originalSurfaceMeta;
+            if (segmentationSurface->meta) {
+                originalSurfaceMeta = std::make_unique<nlohmann::json>(*segmentationSurface->meta);
+            }
+
+            const auto restoreLiveSurfaceState = [&]() {
+                segmentationSurface->path = originalSurfacePath;
+                segmentationSurface->id = originalSurfaceId;
+                if (originalSurfaceMeta) {
+                    segmentationSurface->meta = std::make_unique<nlohmann::json>(*originalSurfaceMeta);
+                } else {
+                    segmentationSurface->meta.reset();
+                }
+            };
+
+            try {
+                segmentationSurface->save(denseInputPath.toStdString(), snapshotId, false);
+            } catch (...) {
+                restoreLiveSurfaceState();
+                throw;
+            }
+            restoreLiveSurfaceState();
+        } catch (const std::exception& ex) {
+            showStatus(tr("Failed to prepare dense displacement input: %1").arg(ex.what()), kStatusLong);
+            return false;
+        }
+
+        DenseDisplacementJob denseJob;
+        denseJob.socketPath = socketPath;
+        denseJob.tifxyzInputPath = denseInputPath;
+        denseJob.volumeZarrPath = volumeZarr;
+        denseJob.volumeScale = volumeScale;
+        denseJob.iterations = std::max(1, sanitizedSteps);
+        denseJob.checkpointPath = denseCheckpointPath;
+        denseJob.ttaMode = denseTtaMode;
+        denseJob.ttaMergeMethod = denseTtaMergeMethod.isEmpty()
+            ? QStringLiteral("vector_geomedian")
+            : denseTtaMergeMethod;
+        denseJob.ttaOutlierDropThresh = std::max(0.01, denseTtaOutlierDropThresh);
+        denseJob.customParams = request.customParams;
+        denseJob.directions = denseDirections;
+
+        qCInfo(lcSegGrowth) << "Dense displacement enabled:"
+                            << "socket" << socketPath
+                            << "iterations" << denseJob.iterations
+                            << "directions" << static_cast<int>(denseDirections.size());
+
+        _running = true;
+        _context.module->setGrowthInProgress(true);
+
+        ActiveRequest pending;
+        pending.volumeContext = volumeContext;
+        pending.growthVolume = growthVolume;
+        pending.growthVolumeId = growthVolumeId;
+        pending.segmentationSurface = segmentationSurface;
+        pending.growthVoxelSize = growthVolume->voxelSize();
+        pending.usingCorrections = false;
+        pending.inpaintOnly = inpaintOnly;
+        pending.denseDisplacement = true;
+        pending.denseCreateNewSegment = outputMode == NeuralTracerOutputMode::CreateNewSegment;
+        _activeRequest = std::move(pending);
+
+        showStatus(
+            outputMode == NeuralTracerOutputMode::CreateNewSegment
+                ? tr("Running dense displacement (create new segment)...")
+                : tr("Running dense displacement (overwrite current segment)..."),
+            kStatusMedium);
+
+        auto future = QtConcurrent::run(runDenseDisplacementGrowth, denseJob);
+        _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
+        connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
+                this, &SegmentationGrower::onFutureFinished);
+        _watcher->setFuture(future);
+        return true;
+    }
+
+    // Heatmap neural tracer integration - pass neural_socket to GrowPatch when enabled.
+    if (neuralTracerEnabled) {
+        const QString checkpointPath = _context.widget->neuralCheckpointPath().trimmed();
+        const QString pythonPath = _context.widget->neuralPythonPath();
+        const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
         const int volumeScale = _context.widget->neuralVolumeScale();
         const int batchSize = _context.widget->neuralBatchSize();
 
@@ -1062,7 +1614,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             return false;
         }
 
-        // Add neural socket parameters to custom params
         if (!request.customParams) {
             request.customParams = nlohmann::json::object();
         }
@@ -1176,6 +1727,183 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     _activeRequest = std::move(pending);
 
     auto future = QtConcurrent::run(runTracerGrowth, request, ctx);
+    _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
+    connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
+            this, &SegmentationGrower::onFutureFinished);
+    _watcher->setFuture(future);
+
+    return true;
+}
+
+bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
+{
+    auto showStatus = [&](const QString& text, int timeout) {
+        if (_callbacks.showStatus) {
+            _callbacks.showStatus(text, timeout);
+        }
+    };
+
+    if (_running) {
+        showStatus(tr("A surface growth operation is already running."), kStatusMedium);
+        return false;
+    }
+    if (!_context.module || !_context.widget || !_context.surfaces) {
+        showStatus(tr("Segmentation growth is unavailable."), kStatusLong);
+        return false;
+    }
+    if (!_context.widget->neuralTracerEnabled()) {
+        showStatus(tr("Enable neural tracer before using Copy with NT."), kStatusLong);
+        return false;
+    }
+    if (_context.widget->neuralModelType() != NeuralTracerModelType::DisplacementCopy) {
+        showStatus(tr("Select 'Displacement Copy' model type to use Copy with NT."), kStatusLong);
+        return false;
+    }
+    if (!_context.widget->customParamsValid()) {
+        const QString errorText = _context.widget->customParamsError();
+        const QString message = errorText.isEmpty()
+            ? tr("Custom params JSON is invalid. Fix the contents and try again.")
+            : tr("Custom params JSON is invalid: %1").arg(errorText);
+        showStatus(message, kStatusLong);
+        return false;
+    }
+
+    auto segmentationSurface = std::dynamic_pointer_cast<QuadSurface>(_context.surfaces->surface("segmentation"));
+    if (!segmentationSurface) {
+        showStatus(tr("Segmentation surface is not available."), kStatusMedium);
+        return false;
+    }
+
+    std::shared_ptr<Volume> growthVolume;
+    std::string growthVolumeId = volumeContext.requestedVolumeId;
+    if (volumeContext.package && !volumeContext.requestedVolumeId.empty()) {
+        try {
+            growthVolume = volumeContext.package->volume(volumeContext.requestedVolumeId);
+        } catch (const std::out_of_range&) {
+            growthVolume.reset();
+        }
+    }
+    if (!growthVolume) {
+        growthVolume = volumeContext.activeVolume;
+        growthVolumeId = volumeContext.activeVolumeId;
+    }
+    if (!growthVolume) {
+        showStatus(tr("No volume available for growth."), kStatusMedium);
+        return false;
+    }
+
+    const QString copyCheckpointPath = _context.widget->copyCheckpointPath().trimmed();
+    const QString pythonPath = _context.widget->neuralPythonPath();
+    const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
+    const int volumeScale = _context.widget->neuralVolumeScale();
+    const DenseTtaMode ttaMode = _context.widget->denseTtaMode();
+    const QString ttaMergeMethod = _context.widget->denseTtaMergeMethod().trimmed();
+    const double ttaOutlierDropThresh = _context.widget->denseTtaOutlierDropThresh();
+    const bool usingCopyLatestPreset = copyCheckpointPath == kCopyLatestSentinel;
+
+    if (copyCheckpointPath.isEmpty()) {
+        showStatus(tr("Displacement copy requires a checkpoint path."), kStatusLong);
+        return false;
+    }
+    if (!usingCopyLatestPreset &&
+        (!QFileInfo::exists(copyCheckpointPath) || !QFileInfo(copyCheckpointPath).isFile())) {
+        showStatus(tr("Copy checkpoint does not exist: %1").arg(copyCheckpointPath), kStatusLong);
+        return false;
+    }
+    if (volumeZarr.isEmpty()) {
+        showStatus(tr("Displacement copy requires a volume zarr path."), kStatusLong);
+        return false;
+    }
+
+    auto& serviceManager = NeuralTraceServiceManager::instance();
+    showStatus(tr("Starting neural trace service for displacement copy..."), kStatusLong);
+    if (!serviceManager.ensureServiceRunning(copyCheckpointPath, volumeZarr, volumeScale, pythonPath)) {
+        const QString error = serviceManager.lastError();
+        showStatus(tr("Failed to start neural trace service: %1").arg(error), kStatusLong);
+        return false;
+    }
+
+    const QString socketPath = serviceManager.socketPath();
+    if (socketPath.isEmpty()) {
+        showStatus(tr("Neural trace service is running but socket path is unavailable."), kStatusLong);
+        return false;
+    }
+
+    const QString segmentationPath = QString::fromStdString(segmentationSurface->path.string());
+    const QString snapshotDir = segmentationPath.isEmpty()
+        ? QString()
+        : QFileInfo(segmentationPath).dir().absolutePath();
+    const QString snapshotPath = createDenseSnapshotPath(snapshotDir);
+    try {
+        const QFileInfo snapshotInfo(snapshotPath);
+        const std::string snapshotId = snapshotInfo.fileName().toStdString();
+
+        const std::filesystem::path originalSurfacePath = segmentationSurface->path;
+        const std::string originalSurfaceId = segmentationSurface->id;
+        std::unique_ptr<nlohmann::json> originalSurfaceMeta;
+        if (segmentationSurface->meta) {
+            originalSurfaceMeta = std::make_unique<nlohmann::json>(*segmentationSurface->meta);
+        }
+
+        const auto restoreLiveSurfaceState = [&]() {
+            segmentationSurface->path = originalSurfacePath;
+            segmentationSurface->id = originalSurfaceId;
+            if (originalSurfaceMeta) {
+                segmentationSurface->meta = std::make_unique<nlohmann::json>(*originalSurfaceMeta);
+            } else {
+                segmentationSurface->meta.reset();
+            }
+        };
+
+        try {
+            segmentationSurface->save(snapshotPath.toStdString(), snapshotId, false);
+        } catch (...) {
+            restoreLiveSurfaceState();
+            throw;
+        }
+        restoreLiveSurfaceState();
+    } catch (const std::exception& ex) {
+        showStatus(tr("Failed to prepare displacement copy input: %1").arg(ex.what()), kStatusLong);
+        return false;
+    }
+
+    std::optional<nlohmann::json> customParams;
+    if (auto parsed = _context.widget->customParamsJson()) {
+        customParams = std::move(*parsed);
+    }
+
+    CopyDisplacementJob copyJob;
+    copyJob.socketPath = socketPath;
+    copyJob.tifxyzInputPath = snapshotPath;
+    copyJob.volumeZarrPath = volumeZarr;
+    copyJob.volumeScale = volumeScale;
+    copyJob.checkpointPath = copyCheckpointPath;
+    copyJob.ttaMode = ttaMode;
+    copyJob.ttaMergeMethod = ttaMergeMethod.isEmpty()
+        ? QStringLiteral("vector_geomedian")
+        : ttaMergeMethod;
+    copyJob.ttaOutlierDropThresh = std::max(0.01, ttaOutlierDropThresh);
+    copyJob.customParams = customParams;
+
+    _running = true;
+    _context.module->setGrowthInProgress(true);
+
+    ActiveRequest pending;
+    pending.volumeContext = volumeContext;
+    pending.growthVolume = growthVolume;
+    pending.growthVolumeId = growthVolumeId;
+    pending.segmentationSurface = segmentationSurface;
+    pending.growthVoxelSize = growthVolume->voxelSize();
+    pending.usingCorrections = false;
+    pending.inpaintOnly = false;
+    pending.denseDisplacement = false;
+    pending.denseCreateNewSegment = true;
+    pending.copyDisplacement = true;
+    _activeRequest = std::move(pending);
+
+    showStatus(tr("Running displacement copy (creating front/back segments)..."), kStatusMedium);
+
+    auto future = QtConcurrent::run(runCopyDisplacementGrowth, copyJob);
     _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
     connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
             this, &SegmentationGrower::onFutureFinished);
@@ -1317,17 +2045,243 @@ void SegmentationGrower::onFutureFinished()
     ActiveRequest request = std::move(*_activeRequest);
     _activeRequest.reset();
 
+    auto cleanupDisplacementTemporarySurfaces = [&](const std::filesystem::path& preservePath = std::filesystem::path()) {
+        if (!request.denseDisplacement && !request.copyDisplacement) {
+            return;
+        }
+        if (result.temporarySurfacePaths.empty()) {
+            return;
+        }
+
+        const std::filesystem::path preserved = preservePath.lexically_normal();
+        std::unordered_set<std::string> visited;
+        for (const auto& rawPath : result.temporarySurfacePaths) {
+            if (rawPath.empty()) {
+                continue;
+            }
+            const std::filesystem::path candidate = rawPath.lexically_normal();
+            if (!preserved.empty() && candidate == preserved) {
+                continue;
+            }
+
+            const std::string key = candidate.string();
+            if (!visited.insert(key).second) {
+                continue;
+            }
+
+            std::error_code existsEc;
+            if (!std::filesystem::exists(candidate, existsEc) || existsEc) {
+                continue;
+            }
+
+            std::error_code rmEc;
+            std::filesystem::remove_all(candidate, rmEc);
+            if (rmEc) {
+                qCInfo(lcSegGrowth) << "Failed to remove displacement temporary surface"
+                                    << QString::fromStdString(candidate.string())
+                                    << QString::fromStdString(rmEc.message());
+            }
+        }
+    };
+
     if (!result.error.isEmpty()) {
         qCInfo(lcSegGrowth) << "Tracer growth error" << result.error;
+        cleanupDisplacementTemporarySurfaces(request.segmentationSurface
+                                                 ? request.segmentationSurface->path
+                                                 : std::filesystem::path());
         showStatus(result.error, kStatusLong);
         finalize(false);
         return;
     }
 
+    if (request.copyDisplacement) {
+        if (!request.volumeContext.package) {
+            showStatus(tr("Displacement copy requires an active volume package."), kStatusLong);
+            cleanupDisplacementTemporarySurfaces();
+            finalize(false);
+            return;
+        }
+
+        if (result.temporarySurfacePaths.size() < 3) {
+            showStatus(tr("Displacement copy did not produce front/back outputs."), kStatusLong);
+            cleanupDisplacementTemporarySurfaces();
+            finalize(false);
+            return;
+        }
+
+        const std::filesystem::path frontPath = result.temporarySurfacePaths[result.temporarySurfacePaths.size() - 2];
+        const std::filesystem::path backPath = result.temporarySurfacePaths.back();
+        if (frontPath.empty() || backPath.empty()) {
+            showStatus(tr("Displacement copy did not produce front/back outputs."), kStatusLong);
+            cleanupDisplacementTemporarySurfaces();
+            finalize(false);
+            return;
+        }
+
+        std::unique_ptr<QuadSurface> frontSurface;
+        std::unique_ptr<QuadSurface> backSurface;
+        try {
+            frontSurface = load_quad_from_tifxyz(frontPath.string());
+            backSurface = load_quad_from_tifxyz(backPath.string());
+        } catch (const std::exception& ex) {
+            showStatus(tr("Failed to load displacement copy outputs: %1").arg(ex.what()), kStatusLong);
+            cleanupDisplacementTemporarySurfaces();
+            finalize(false);
+            return;
+        }
+        if (!frontSurface || !backSurface) {
+            showStatus(tr("Failed to load displacement copy outputs."), kStatusLong);
+            cleanupDisplacementTemporarySurfaces();
+            finalize(false);
+            return;
+        }
+
+        const std::filesystem::path volpkgRoot(request.volumeContext.package->getVolpkgDirectory());
+        const std::string segmentationDir = request.volumeContext.package->getSegmentationDirectory();
+        const std::filesystem::path segmentsDir = volpkgRoot / segmentationDir;
+        std::error_code mkdirEc;
+        std::filesystem::create_directories(segmentsDir, mkdirEc);
+        if (mkdirEc) {
+            showStatus(tr("Failed to create %1 directory for displacement copy: %2")
+                           .arg(QString::fromStdString(segmentationDir))
+                           .arg(QString::fromStdString(mkdirEc.message())),
+                       kStatusLong);
+            cleanupDisplacementTemporarySurfaces();
+            finalize(false);
+            return;
+        }
+
+        auto persistAsNewSegment = [&](QuadSurface* surface, const std::string& fallbackBaseId) -> std::optional<std::string> {
+            if (!surface) {
+                return std::nullopt;
+            }
+            const std::string baseId = sanitizeSegmentId(surface->id.empty() ? fallbackBaseId : surface->id);
+            const std::string newSegmentId = makeUniqueSegmentId(segmentsDir, baseId);
+            const std::filesystem::path newSegmentPath = segmentsDir / newSegmentId;
+            try {
+                surface->save(newSegmentPath.string(), newSegmentId, false);
+            } catch (const std::exception& ex) {
+                showStatus(tr("Failed to save displacement copy result: %1").arg(ex.what()), kStatusLong);
+                return std::nullopt;
+            }
+
+            if (!request.volumeContext.package->addSingleSegmentation(newSegmentId)) {
+                request.volumeContext.package->refreshSegmentations();
+            }
+            return newSegmentId;
+        };
+
+        const auto frontId = persistAsNewSegment(frontSurface.get(), "copy_displacement_front");
+        const auto backId = persistAsNewSegment(backSurface.get(), "copy_displacement_back");
+        if (!frontId || !backId) {
+            cleanupDisplacementTemporarySurfaces();
+            finalize(false);
+            return;
+        }
+
+        cleanupDisplacementTemporarySurfaces();
+
+        if (_surfacePanel) {
+            _surfacePanel->addSingleSegmentation(*frontId);
+            _surfacePanel->refreshSurfaceMetrics(*frontId);
+            _surfacePanel->addSingleSegmentation(*backId);
+            _surfacePanel->refreshSurfaceMetrics(*backId);
+        } else if (_context.surfaces) {
+            auto loadedFront = request.volumeContext.package->loadSurface(*frontId);
+            if (loadedFront) {
+                _context.surfaces->setSurface(*frontId, loadedFront, true, false);
+            }
+            auto loadedBack = request.volumeContext.package->loadSurface(*backId);
+            if (loadedBack) {
+                _context.surfaces->setSurface(*backId, loadedBack, true, false);
+            }
+        }
+
+        refreshSegmentationViewers(_context.viewerManager);
+        showStatus(
+            tr("Displacement copy created new segments '%1' and '%2'.")
+                .arg(QString::fromStdString(*frontId))
+                .arg(QString::fromStdString(*backId)),
+            kStatusLong);
+        finalize(true);
+        return;
+    }
+
     if (!result.surface) {
         qCInfo(lcSegGrowth) << "Tracer growth returned null surface";
+        cleanupDisplacementTemporarySurfaces(request.segmentationSurface
+                                                 ? request.segmentationSurface->path
+                                                 : std::filesystem::path());
         showStatus(tr("Tracer growth did not return a surface."), kStatusMedium);
         finalize(false);
+        return;
+    }
+
+    if (request.denseDisplacement && request.denseCreateNewSegment) {
+        if (!request.volumeContext.package) {
+            showStatus(tr("Dense displacement new-segment mode requires an active volume package."), kStatusLong);
+            cleanupDisplacementTemporarySurfaces();
+            delete result.surface;
+            finalize(false);
+            return;
+        }
+
+        const std::filesystem::path volpkgRoot(request.volumeContext.package->getVolpkgDirectory());
+        const std::string segmentationDir = request.volumeContext.package->getSegmentationDirectory();
+        const std::filesystem::path segmentsDir = volpkgRoot / segmentationDir;
+        std::error_code mkdirEc;
+        std::filesystem::create_directories(segmentsDir, mkdirEc);
+        if (mkdirEc) {
+            showStatus(tr("Failed to create %1 directory for new segment: %2")
+                           .arg(QString::fromStdString(segmentationDir))
+                           .arg(QString::fromStdString(mkdirEc.message())),
+                       kStatusLong);
+            cleanupDisplacementTemporarySurfaces();
+            delete result.surface;
+            finalize(false);
+            return;
+        }
+
+        const std::string baseId = sanitizeSegmentId(
+            result.surface->id.empty() ? std::string("dense_displacement") : result.surface->id);
+        const std::string newSegmentId = makeUniqueSegmentId(segmentsDir, baseId);
+        const std::filesystem::path newSegmentPath = segmentsDir / newSegmentId;
+
+        try {
+            result.surface->save(newSegmentPath.string(), newSegmentId, false);
+        } catch (const std::exception& ex) {
+            showStatus(tr("Failed to save dense displacement result: %1").arg(ex.what()), kStatusLong);
+            cleanupDisplacementTemporarySurfaces();
+            delete result.surface;
+            finalize(false);
+            return;
+        }
+
+        // The new directory exists on disk now, but VolumePkg may not know this ID yet.
+        // Register it before any loadSurface call.
+        if (!request.volumeContext.package->addSingleSegmentation(newSegmentId)) {
+            request.volumeContext.package->refreshSegmentations();
+        }
+
+        cleanupDisplacementTemporarySurfaces(newSegmentPath);
+        delete result.surface;
+
+        if (_surfacePanel) {
+            _surfacePanel->addSingleSegmentation(newSegmentId);
+            _surfacePanel->refreshSurfaceMetrics(newSegmentId);
+        } else if (_context.surfaces) {
+            auto loadedSurface = request.volumeContext.package->loadSurface(newSegmentId);
+            if (loadedSurface) {
+                _context.surfaces->setSurface(newSegmentId, loadedSurface, true, false);
+            }
+        }
+
+        refreshSegmentationViewers(_context.viewerManager);
+        showStatus(
+            tr("Dense displacement created new segment '%1'.")
+                .arg(QString::fromStdString(newSegmentId)),
+            kStatusLong);
+        finalize(true);
         return;
     }
 
@@ -1465,6 +2419,39 @@ void SegmentationGrower::onFutureFinished()
             if (surfaceToPersist) {
                 ensureSurfaceMetaObject(surfaceToPersist);
                 surfaceToPersist->saveOverwrite();
+
+                // Dense overwrite mode persists an updated segment in-place;
+                // force reload from disk so in-app references observe the new geometry.
+                if (request.denseDisplacement && !request.denseCreateNewSegment) {
+                    std::shared_ptr<QuadSurface> reloadedSurface;
+                    const std::string persistedId = surfaceToPersist->id;
+
+                    if (request.volumeContext.package && !persistedId.empty()) {
+                        request.volumeContext.package->unloadSurface(persistedId);
+                        reloadedSurface = request.volumeContext.package->loadSurface(persistedId);
+                    }
+
+                    if (!reloadedSurface && !surfaceToPersist->path.empty()) {
+                        try {
+                            auto loadedFromDisk = load_quad_from_tifxyz(surfaceToPersist->path.string());
+                            if (loadedFromDisk) {
+                                reloadedSurface.reset(loadedFromDisk.release());
+                            }
+                        } catch (const std::exception& ex) {
+                            qCInfo(lcSegGrowth) << "Dense overwrite reload fallback failed" << ex.what();
+                        }
+                    }
+
+                    if (reloadedSurface) {
+                        if (_context.surfaces && !persistedId.empty() && _context.surfaces->surface(persistedId)) {
+                            _context.surfaces->setSurface(persistedId, reloadedSurface, true, false);
+                        }
+                        request.segmentationSurface = reloadedSurface;
+                        surfaceToPersist = reloadedSurface.get();
+                    } else {
+                        qCInfo(lcSegGrowth) << "Dense overwrite reload skipped; using in-memory geometry";
+                    }
+                }
             }
         } catch (const std::exception& ex) {
             qCInfo(lcSegGrowth) << "Failed to save tracer result" << ex.what();
@@ -1623,6 +2610,8 @@ void SegmentationGrower::onFutureFinished()
     }
 
     qCInfo(lcSegGrowth) << "Tracer growth completed successfully";
+
+    cleanupDisplacementTemporarySurfaces(surfaceToPersist ? surfaceToPersist->path : std::filesystem::path());
     delete result.surface;
 
     QString message;

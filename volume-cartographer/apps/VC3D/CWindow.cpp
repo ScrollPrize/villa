@@ -94,6 +94,7 @@
 #include "segmentation/growth/SegmentationGrower.hpp"
 #include "SurfacePanelController.hpp"
 #include "MenuActionController.hpp"
+#include "NeuralTraceServiceManager.hpp"
 #include "LasagnaServiceManager.hpp"
 #include "vc/core/Version.hpp"
 
@@ -1784,6 +1785,8 @@ void CWindow::CreateWidgets(void)
             }
         }
     });
+    connect(_segmentationWidget, &SegmentationWidget::copyWithNtRequested,
+            this, &CWindow::onCopyWithNtRequested);
 
     // -- Lasagna connections --
     connect(_segmentationWidget, &SegmentationWidget::seedFromFocusRequested, this, [this]() {
@@ -3235,6 +3238,8 @@ void CWindow::saveWindowState()
 void CWindow::closeEvent(QCloseEvent* event)
 {
     saveWindowState();
+    NeuralTraceServiceManager::instance().stopService();
+    event->accept();
     std::quick_exit(0);
 }
 
@@ -4596,6 +4601,36 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
     };
 
     if (!_segmentationGrower->start(volumeContext, method, direction, steps, inpaintOnly)) {
+        return;
+    }
+}
+
+void CWindow::onCopyWithNtRequested()
+{
+    if (!_segmentationGrower) {
+        statusBar()->showMessage(tr("Segmentation growth is unavailable."), 4000);
+        return;
+    }
+
+    SegmentationGrower::Context context{
+        _segmentationModule.get(),
+        _segmentationWidget,
+        _surf_col,
+        _viewerManager.get(),
+        chunk_cache
+    };
+    _segmentationGrower->updateContext(context);
+
+    SegmentationGrower::VolumeContext volumeContext{
+        fVpkg,
+        currentVolume,
+        currentVolumeId,
+        _segmentationGrowthVolumeId.empty() ? currentVolumeId : _segmentationGrowthVolumeId,
+        _normalGridPath,
+        _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString()
+    };
+
+    if (!_segmentationGrower->startCopyWithNt(volumeContext)) {
         return;
     }
 }

@@ -18,7 +18,7 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, additional_m
         zyxs = zyxs.detach().cpu().numpy()
     else:
         zyxs = np.asarray(zyxs)
-    zyxs = zyxs.astype(np.float32)
+    zyxs = zyxs.astype(np.float32, copy=False)
 
     path = f'{path}/{uuid}'
     os.makedirs(path, exist_ok=True)

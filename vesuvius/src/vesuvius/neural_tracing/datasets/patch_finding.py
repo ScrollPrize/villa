@@ -842,18 +842,34 @@ def find_world_chunk_patches(
         json.dumps(cache_key_data, sort_keys=True).encode()
     ).hexdigest()
 
-    # Try loading from cache
-    if cache_dir is not None and not force_recompute:
+    # Try loading from cache and always report whether we hit cache or recomputed.
+    cache_file = None
+    cache_miss_reason = None
+    if cache_dir is None:
+        cache_miss_reason = "cache disabled (cache_dir=None)"
+    else:
         cache_file = cache_dir / f"world_chunks_{cache_key}.json"
-        if cache_file.exists():
+        if force_recompute:
+            cache_miss_reason = "force_recompute=True"
+        elif cache_file.exists():
             try:
                 with open(cache_file, "r") as f:
                     cached = json.load(f)
-                if verbose:
-                    print(f"Loaded {len(cached)} chunks from cache: {cache_file}")
+                print(
+                    f"[find_world_chunk_patches] cache hit key={cache_key} "
+                    f"chunks={len(cached)} path={cache_file}"
+                )
                 return cached
             except (json.JSONDecodeError, KeyError):
-                pass  # Cache corrupted, recompute
+                cache_miss_reason = f"cache unreadable path={cache_file}"
+        else:
+            cache_miss_reason = f"cache miss path={cache_file}"
+
+    if cache_miss_reason is None:
+        cache_miss_reason = "cache unavailable"
+    print(
+        f"[find_world_chunk_patches] recompute key={cache_key} reason={cache_miss_reason}"
+    )
 
     # Compute dataset bbox
     if verbose:

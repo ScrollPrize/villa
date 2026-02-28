@@ -41,8 +41,10 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, mgr, device, l
         for key, value in checkpoint['intensity_properties'].items():
             print(f"  {key}: {value:.4f}")
 
+    optimizer_rebuilt = False
+
     def _rebuild_model_from_checkpoint_config():
-        nonlocal model, optimizer
+        nonlocal model, optimizer, optimizer_rebuilt
         from vesuvius.models.build.build_network_from_config import NetworkFromConfig
         from vesuvius.models.training.optimizers import create_optimizer
 
@@ -75,6 +77,7 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, mgr, device, l
             'weight_decay': mgr.weight_decay
         }
         optimizer = create_optimizer(optimizer_config, model)
+        optimizer_rebuilt = True
         # Update mgr.model_config to reflect the rebuilt model
         try:
             mgr.model_config = checkpoint['model_config']
@@ -271,6 +274,21 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, mgr, device, l
     start_epoch = 0
     
     if not load_weights_only and strict_loaded and isinstance(checkpoint, dict) and 'optimizer' in checkpoint and 'scheduler' in checkpoint:
+        # If the model/optimizer was rebuilt from checkpoint config, the scheduler created
+        # before load_checkpoint may still be bound to the old optimizer. Recreate it here
+        # so scheduler.step() updates the optimizer actually used for training.
+        if optimizer_rebuilt:
+            from vesuvius.models.training.lr_schedulers import get_scheduler
+
+            scheduler_type = getattr(mgr, 'scheduler', 'poly')
+            scheduler_kwargs = getattr(mgr, 'scheduler_kwargs', {})
+            scheduler = get_scheduler(
+                scheduler_type=scheduler_type,
+                optimizer=optimizer,
+                initial_lr=mgr.initial_lr,
+                max_steps=mgr.max_epoch,
+                **scheduler_kwargs
+            )
         # Only load optimizer, scheduler, epoch if we are NOT in "weights_only" mode
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])

@@ -2,7 +2,6 @@
 **/.venv*/
 **/.idea/*
 *.pyc
-*.tif
 node_modules/.yarn-integrity
 **/*.egg-info*/
 
@@ -33,3 +32,5 @@ vesuvius/AGENTS.md
 /volume-cartographer/scratch
 /vesuvius/src/external
 
+*.cover
+/vesuvius/src/vesuvius/neural_tracing/tests/test_band_filtering

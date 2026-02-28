@@ -6,9 +6,58 @@ Supports multiple extrapolation methods via the `method` parameter.
 import numpy as np
 import torch
 import random
+from contextlib import nullcontext
 from typing import Callable, Optional
 
 from .common import voxelize_surface_grid
+
+
+def _resolve_torch_precision(value) -> torch.dtype:
+    if value is None:
+        return torch.float64
+    if isinstance(value, torch.dtype):
+        if value in (torch.float32, torch.float64):
+            return value
+        raise ValueError(f"Unsupported precision dtype: {value}")
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in {"float32", "fp32", "single", "f32"}:
+            return torch.float32
+        if token in {"float64", "fp64", "double", "f64"}:
+            return torch.float64
+    if value in (np.float32, np.dtype(np.float32)):
+        return torch.float32
+    if value in (np.float64, np.dtype(np.float64)):
+        return torch.float64
+    raise ValueError(
+        "Unsupported precision value for RBF extrapolation. "
+        "Use float32/fp32 or float64/fp64."
+    )
+
+
+def _compute_surface_normals_grid(surface_zyx: np.ndarray) -> np.ndarray:
+    """Estimate per-point unit normals from local row/col tangents."""
+    h, w, _ = surface_zyx.shape
+    if h < 2 or w < 2:
+        return np.zeros_like(surface_zyx, dtype=np.float32)
+
+    surface = surface_zyx.astype(np.float32, copy=False)
+    row_tangent = np.empty_like(surface)
+    col_tangent = np.empty_like(surface)
+
+    row_tangent[1:-1] = surface[2:] - surface[:-2]
+    row_tangent[0] = surface[1] - surface[0]
+    row_tangent[-1] = surface[-1] - surface[-2]
+
+    col_tangent[:, 1:-1] = surface[:, 2:] - surface[:, :-2]
+    col_tangent[:, 0] = surface[:, 1] - surface[:, 0]
+    col_tangent[:, -1] = surface[:, -1] - surface[:, -2]
+
+    normals = np.cross(col_tangent, row_tangent)
+    norms = np.linalg.norm(normals, axis=-1, keepdims=True)
+    normals = normals / np.maximum(norms, 1e-6)
+    normals[norms[..., 0] <= 1e-6] = 0.0
+    return normals.astype(np.float32, copy=False)
 
 
 def apply_degradation(
@@ -37,7 +86,7 @@ def apply_degradation(
         return zyx_local, False
 
     # Reshape to grid to compute distance from conditioning edge
-    zyx_grid = zyx_local.reshape(uv_shape + (3,))
+    zyx_grid = zyx_local.reshape(uv_shape + (3,)).astype(np.float32, copy=False)
     R, C = uv_shape
 
     # Compute distance from conditioning edge
@@ -54,7 +103,7 @@ def apply_degradation(
         # Conditioning on bottom, distance increases as row decreases
         distance = (R - 1 - np.arange(R))[:, None].repeat(C, axis=1)
 
-    distance = distance.astype(np.float64)
+    distance = distance.astype(np.float32, copy=False)
 
     # Avoid issues if all same distance
     if distance.max() < 1e-6:
@@ -64,17 +113,17 @@ def apply_degradation(
     if random.random() < 0.5:
         # Curvature bias: error = k * distance^2
         k = random.uniform(curvature_range[0], curvature_range[1])
-        direction = np.random.randn(3)
+        direction = np.random.randn(3).astype(np.float32, copy=False)
         direction = direction / (np.linalg.norm(direction) + 1e-8)
         error = k * (distance[:, :, None] ** 2) * direction
     else:
         # Gradient perturbation: linear tilt
         magnitude = random.uniform(gradient_range[0], gradient_range[1])
-        tilt = np.random.randn(3) * magnitude
+        tilt = (np.random.randn(3).astype(np.float32, copy=False) * np.float32(magnitude))
         error = distance[:, :, None] * tilt
 
-    degraded_grid = zyx_grid + error
-    return degraded_grid.reshape(-1, 3), True
+    degraded_grid = (zyx_grid + error).astype(np.float32, copy=False)
+    return degraded_grid.reshape(-1, 3).astype(np.float32, copy=False), True
 
 
 # Registry of extrapolation methods
@@ -89,13 +138,117 @@ def register_method(name: str):
     return decorator
 
 
+def _run_fallback_method(
+    fallback_method: Optional[str],
+    uv_cond: np.ndarray,
+    zyx_cond: np.ndarray,
+    uv_query: np.ndarray,
+    cond_direction: Optional[str],
+    default: str = 'linear_edge',
+    disallow: Optional[tuple[str, ...]] = None,
+) -> np.ndarray:
+    """Run a registered fallback method for extrapolation."""
+    chosen = fallback_method or default
+    if disallow and chosen in disallow:
+        chosen = default
+    if chosen == 'rbf':
+        chosen = default
+
+    fallback_fn = _EXTRAPOLATION_METHODS.get(chosen)
+    if fallback_fn is None:
+        available = list(_EXTRAPOLATION_METHODS.keys())
+        raise ValueError(f"Unknown fallback extrapolation method '{chosen}'. Available: {available}")
+
+    return fallback_fn(
+        uv_cond=uv_cond,
+        zyx_cond=zyx_cond,
+        uv_query=uv_query,
+        cond_direction=cond_direction,
+    )
+
+
+def _profile_section(profiler, name: str):
+    if profiler is None:
+        return nullcontext()
+    return profiler.section(name)
+
+
+def _downsample_uv_cond_directional(
+    uv_cond: np.ndarray,
+    zyx_cond: np.ndarray,
+    stride: int,
+    cond_direction: Optional[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Downsample conditioning points in a direction-aware way.
+
+    Why: `uv_cond[::stride]` is order-dependent. For row-major edge bands this
+    creates phase aliasing where small changes in edge-band width (e.g., 4->5)
+    radically change which columns are selected per row.
+    """
+    stride = max(1, int(stride))
+    if stride <= 1 or len(uv_cond) == 0:
+        return uv_cond, zyx_cond
+
+    uv = np.asarray(uv_cond)
+    zyx = np.asarray(zyx_cond)
+
+    keep_mask = np.zeros((uv.shape[0],), dtype=bool)
+    if cond_direction in {"left", "right"}:
+        line_vals = uv[:, 0]
+        boundary_vals = -uv[:, 1] if cond_direction == "left" else uv[:, 1]
+    elif cond_direction in {"up", "down"}:
+        line_vals = uv[:, 1]
+        boundary_vals = -uv[:, 0] if cond_direction == "up" else uv[:, 0]
+    else:
+        # Unknown direction: preserve legacy behavior.
+        keep_mask[::stride] = True
+        return uv[keep_mask], zyx[keep_mask]
+
+    # Sort once by line, then by edge-distance ordering within each line.
+    sorted_idx = np.lexsort((boundary_vals, line_vals))
+    sorted_lines = line_vals[sorted_idx]
+    group_starts = np.flatnonzero(np.r_[True, sorted_lines[1:] != sorted_lines[:-1]])
+    group_ends = np.r_[group_starts[1:], sorted_idx.size]
+
+    for start, end in zip(group_starts, group_ends):
+        keep_mask[sorted_idx[start:end:stride]] = True
+
+    if not keep_mask.any():
+        keep_mask[::stride] = True
+
+    return uv[keep_mask], zyx[keep_mask]
+
+
+def _infer_cond_direction(
+    uv_cond: np.ndarray,
+    uv_query: np.ndarray,
+    cond_direction: Optional[str],
+) -> Optional[str]:
+    """Infer conditioning-side direction if not explicitly provided."""
+    if cond_direction in {"left", "right", "up", "down"}:
+        return cond_direction
+    if uv_cond.size == 0 or uv_query.size == 0:
+        return None
+
+    cond_center = uv_cond.mean(axis=0)
+    query_center = uv_query.mean(axis=0)
+    delta_row = query_center[0] - cond_center[0]
+    delta_col = query_center[1] - cond_center[1]
+
+    if abs(delta_col) > abs(delta_row):
+        return "left" if delta_col > 0 else "right"
+    return "up" if delta_row > 0 else "down"
+
+
 @register_method('rbf')
 def _extrapolate_rbf(
     uv_cond: np.ndarray,
     zyx_cond: np.ndarray,
     uv_query: np.ndarray,
     downsample_factor: int = 40,
-    fallback_method: str = 'linear_rowcol',
+    rbf_max_points: Optional[int] = None,
+    fallback_method: str = 'linear_edge',
     singular_smoothing: float = 1e-4,
     **kwargs,
 ) -> np.ndarray:
@@ -107,6 +260,8 @@ def _extrapolate_rbf(
         zyx_cond: (N, 3) flattened ZYX coordinates of conditioning points
         uv_query: (M, 2) flattened UV coordinates to extrapolate to
         downsample_factor: downsample conditioning points for efficiency
+        rbf_max_points: optional cap on post-downsample conditioning points.
+            If set and exceeded, points are uniformly subselected.
         fallback_method: fallback method if RBF system remains singular
         singular_smoothing: smoothing floor used for singular retry
 
@@ -114,53 +269,72 @@ def _extrapolate_rbf(
         (M, 3) extrapolated ZYX coordinates
     """
     from vesuvius.neural_tracing.datasets.interpolation.torch_rbf import RBFInterpolator
+    profiler = kwargs.get("profiler")
 
-    # Downsample for RBF fitting
-    uv_cond_ds = uv_cond[::downsample_factor]
-    zyx_cond_ds = zyx_cond[::downsample_factor]
+    with _profile_section(profiler, "iter_edge_rbf_downsample"):
+        # Downsample for RBF fitting.
+        stride = max(1, int(downsample_factor))
+        cond_direction = kwargs.get("cond_direction")
+        uv_cond_ds, zyx_cond_ds = _downsample_uv_cond_directional(
+            uv_cond,
+            zyx_cond,
+            stride,
+            cond_direction=cond_direction,
+        )
+
+        # Optional cap on the number of control points to reduce solve cost on large crops.
+        if rbf_max_points is not None:
+            max_pts = int(rbf_max_points)
+            if max_pts > 0 and len(uv_cond_ds) > max_pts:
+                keep_idx = np.linspace(0, len(uv_cond_ds) - 1, num=max_pts, dtype=np.int64)
+                uv_cond_ds = uv_cond_ds[keep_idx]
+                zyx_cond_ds = zyx_cond_ds[keep_idx]
+
+        rbf_precision = _resolve_torch_precision(kwargs.get("precision"))
+        np_precision = np.float64 if rbf_precision == torch.float64 else np.float32
+        uv_cond_t = torch.from_numpy(np.asarray(uv_cond_ds, dtype=np_precision))
+        zyx_cond_t = torch.from_numpy(np.asarray(zyx_cond_ds, dtype=np_precision))
+        uv_query_t = torch.from_numpy(np.asarray(uv_query, dtype=np_precision))
 
     smoothing = kwargs.get('smoothing', 0.0)
     rbf_kwargs = dict(
-        y=torch.from_numpy(uv_cond_ds).float(),   # input: (N, 2) UV
-        d=torch.from_numpy(zyx_cond_ds).float(),  # output: (N, 3) ZYX
+        y=uv_cond_t,   # input: (N, 2) UV
+        d=zyx_cond_t,  # output: (N, 3) ZYX
         kernel='thin_plate_spline',
+        precision=rbf_precision,
     )
 
-    try:
-        rbf = RBFInterpolator(
-            smoothing=smoothing,
-            **rbf_kwargs,
-        )
-        return rbf(torch.from_numpy(uv_query).float()).numpy()
-    except ValueError as exc:
-        # Degenerate UV geometry can make the RBF system singular for some crops.
-        if "Singular matrix" not in str(exc):
-            raise
-
+    with _profile_section(profiler, "iter_edge_rbf_solve_eval"):
         try:
             rbf = RBFInterpolator(
-                smoothing=max(float(smoothing), float(singular_smoothing)),
+                smoothing=smoothing,
                 **rbf_kwargs,
             )
-            return rbf(torch.from_numpy(uv_query).float()).numpy()
-        except ValueError as retry_exc:
-            if "Singular matrix" not in str(retry_exc):
+            return rbf(uv_query_t).cpu().numpy().astype(np_precision, copy=False)
+        except ValueError as exc:
+            # Degenerate UV geometry can make the RBF system singular for some crops.
+            if "Singular matrix" not in str(exc):
                 raise
 
+            try:
+                rbf = RBFInterpolator(
+                    smoothing=max(float(smoothing), float(singular_smoothing)),
+                    **rbf_kwargs,
+                )
+                return rbf(uv_query_t).cpu().numpy().astype(np_precision, copy=False)
+            except ValueError as retry_exc:
+                if "Singular matrix" not in str(retry_exc):
+                    raise
+
     # Last-resort fallback for singular systems; this avoids killing dataloader workers.
-    if fallback_method == 'rbf':
-        fallback_method = 'linear_rowcol'
-
-    fallback_fn = _EXTRAPOLATION_METHODS.get(fallback_method)
-    if fallback_fn is None:
-        available = list(_EXTRAPOLATION_METHODS.keys())
-        raise ValueError(f"Unknown fallback extrapolation method '{fallback_method}'. Available: {available}")
-
-    return fallback_fn(
+    return _run_fallback_method(
+        fallback_method=fallback_method,
         uv_cond=uv_cond,
         zyx_cond=zyx_cond,
         uv_query=uv_query,
         cond_direction=kwargs.get('cond_direction'),
+        default='linear_edge',
+        disallow=('rbf',),
     )
 
 
@@ -223,7 +397,7 @@ def _extrapolate_linear_edge(
     col_to_idx = {c: i for i, c in enumerate(cols_unique)}
 
     # Build 2D grids for ZYX (NaN for missing entries to avoid zero corruption)
-    zyx_grid = np.full((n_rows, n_cols, 3), np.nan, dtype=np.float64)
+    zyx_grid = np.full((n_rows, n_cols, 3), np.nan, dtype=np.float32)
     for i, (uv, zyx) in enumerate(zip(uv_cond, zyx_cond)):
         ri, ci = row_to_idx[uv[0]], col_to_idx[uv[1]]
         zyx_grid[ri, ci] = zyx
@@ -254,7 +428,7 @@ def _extrapolate_linear_edge(
         if valid_rows_mask.any():
             median_gradient = np.nanmedian(gradient[valid_rows_mask], axis=0)
         else:
-            median_gradient = np.zeros(3, dtype=np.float64)
+            median_gradient = np.zeros(3, dtype=np.float32)
 
         # For rows with NaN edge or gradient, use median gradient fallback
         for ri in range(n_rows):
@@ -269,7 +443,7 @@ def _extrapolate_linear_edge(
                 gradient[ri] = median_gradient
 
         # For each query point, find matching row and extrapolate
-        zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float64)
+        zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float32)
         for i, uv in enumerate(uv_query):
             query_row, query_col = uv[0], uv[1]
 
@@ -308,7 +482,7 @@ def _extrapolate_linear_edge(
         if valid_cols_mask.any():
             median_gradient = np.nanmedian(gradient[valid_cols_mask], axis=0)
         else:
-            median_gradient = np.zeros(3, dtype=np.float64)
+            median_gradient = np.zeros(3, dtype=np.float32)
 
         # For cols with NaN edge or gradient, use median gradient fallback
         for ci in range(n_cols):
@@ -323,7 +497,7 @@ def _extrapolate_linear_edge(
                 gradient[ci] = median_gradient
 
         # For each query point, find matching col and extrapolate
-        zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float64)
+        zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float32)
         for i, uv in enumerate(uv_query):
             query_row, query_col = uv[0], uv[1]
 
@@ -339,241 +513,99 @@ def _extrapolate_linear_edge(
     return zyx_extrapolated
 
 
-@register_method('rbf_clamped')
-def _extrapolate_rbf_clamped(
-    uv_cond: np.ndarray,
-    zyx_cond: np.ndarray,
-    uv_query: np.ndarray,
-    min_corner: np.ndarray = None,
-    crop_size: tuple = None,
-    margin_factor: float = 0.5,
-    downsample_factor: int = 40,
-    **kwargs,
-) -> np.ndarray:
-    """
-    RBF extrapolation with output clamping to prevent extreme values.
-
-    Same as RBF but clamps extrapolated coordinates to crop bounds + margin.
-    Points outside the actual crop bounds are filtered out later by
-    compute_extrapolation's in-bounds check.
-
-    Args:
-        uv_cond: (N, 2) flattened UV coordinates of conditioning points
-        zyx_cond: (N, 3) flattened ZYX coordinates of conditioning points
-        uv_query: (M, 2) flattened UV coordinates to extrapolate to
-        min_corner: (3,) origin of crop in world coords (z, y, x)
-        crop_size: (D, H, W) size of crop
-        margin_factor: extra margin as fraction of crop size (default 0.5 = 50%)
-        downsample_factor: downsample conditioning points for efficiency
-
-    Returns:
-        (M, 3) extrapolated ZYX coordinates, clamped to generous bounds
-    """
-    # Run standard RBF extrapolation
-    zyx_extrapolated = _extrapolate_rbf(
-        uv_cond=uv_cond,
-        zyx_cond=zyx_cond,
-        uv_query=uv_query,
-        downsample_factor=downsample_factor,
-    )
-
-    # Clamp to crop bounds + margin (in world coordinates)
-    # The margin allows some flexibility; downstream filtering removes OOB points
-    if min_corner is not None and crop_size is not None:
-        crop_size_arr = np.asarray(crop_size)
-        margin = crop_size_arr * margin_factor
-        zyx_min = np.asarray(min_corner) - margin
-        zyx_max = np.asarray(min_corner) + crop_size_arr + margin
-        zyx_extrapolated = np.clip(zyx_extrapolated, zyx_min, zyx_max)
-
-    return zyx_extrapolated
-
-
-@register_method('linear_rowcol')
-def _extrapolate_linear_rowcol(
+@register_method('rbf_edge_only')
+def _extrapolate_rbf_edge_only(
     uv_cond: np.ndarray,
     zyx_cond: np.ndarray,
     uv_query: np.ndarray,
     cond_direction: Optional[str] = None,
+    downsample_factor: int = 40,
+    rbf_max_points: Optional[int] = None,
+    edge_band_frac: float = 0.35,
+    edge_band_cells: Optional[int] = None,
+    edge_min_points: int = 128,
+    fallback_method: str = 'linear_edge',
+    singular_smoothing: float = 1e-4,
+    smoothing: float = 0.0,
     **kwargs,
 ) -> np.ndarray:
     """
-    Linear extrapolation fitting a line per-row or per-column.
+    RBF extrapolation using only conditioning points near the mask-adjacent edge.
 
-    Detects extrapolation direction, then:
-    - Horizontal: fit linear model per-row (z,y,x as function of col)
-    - Vertical: fit linear model per-col (z,y,x as function of row)
-
-    More robust than linear_edge since it uses all points in each row/col.
-
-    Args:
-        uv_cond: (N, 2) flattened UV coordinates of conditioning points
-        zyx_cond: (N, 3) flattened ZYX coordinates of conditioning points
-        uv_query: (M, 2) flattened UV coordinates to extrapolate to
-        cond_direction: optional "left", "right", "up", or "down" to override
-            UV-center-based direction inference
-
-    Returns:
-        (M, 3) extrapolated ZYX coordinates
+    This selects an edge strip from the conditioning region in UV space, then
+    runs the standard RBF solver on that subset.
     """
-    if cond_direction is not None:
-        is_horizontal = cond_direction in ("left", "right")
+    if len(uv_cond) == 0:
+        rbf_precision = _resolve_torch_precision(kwargs.get("precision"))
+        out_dtype = np.float64 if rbf_precision == torch.float64 else np.float32
+        return np.zeros((0, 3), dtype=out_dtype)
+
+    direction = _infer_cond_direction(uv_cond, uv_query, cond_direction)
+    if direction is None:
+        # If direction is unknown, fall back to full conditioning set.
+        direction = cond_direction
+        uv_fit = uv_cond
+        zyx_fit = zyx_cond
     else:
-        # Detect extrapolation direction
-        cond_center = uv_cond.mean(axis=0)
-        query_center = uv_query.mean(axis=0)
-        delta_row = query_center[0] - cond_center[0]
-        delta_col = query_center[1] - cond_center[1]
+        rows_unique = np.unique(uv_cond[:, 0])
+        cols_unique = np.unique(uv_cond[:, 1])
 
-        is_horizontal = abs(delta_col) > abs(delta_row)
+        axis_vals = cols_unique if direction in {"left", "right"} else rows_unique
+        axis = uv_cond[:, 1] if direction in {"left", "right"} else uv_cond[:, 0]
+        n_axis = len(axis_vals)
 
-    # Get unique rows and cols
-    rows_unique = np.unique(uv_cond[:, 0])
-    cols_unique = np.unique(uv_cond[:, 1])
-
-    # Build lookup structures
-    row_to_idx = {r: i for i, r in enumerate(rows_unique)}
-    col_to_idx = {c: i for i, c in enumerate(cols_unique)}
-
-    zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float64)
-
-    if is_horizontal:
-        # Fit linear model per row: zyx = a * col + b
-        # Store coefficients for each row
-        row_coeffs = {}  # row -> (slope, intercept) for each of z,y,x
-
-        for row in rows_unique:
-            # Get all points in this row
-            mask = uv_cond[:, 0] == row
-            cols_in_row = uv_cond[mask, 1]
-            zyx_in_row = zyx_cond[mask]
-
-            if len(cols_in_row) >= 2:
-                # Fit linear: [col, 1] @ [a, b].T = zyx
-                A = np.column_stack([cols_in_row, np.ones(len(cols_in_row))])
-                coeffs, *_ = np.linalg.lstsq(A, zyx_in_row, rcond=None)
-                row_coeffs[row] = coeffs  # (2, 3): [slope; intercept] for z,y,x
+        if n_axis == 0:
+            uv_fit = uv_cond
+            zyx_fit = zyx_cond
+        else:
+            if edge_band_cells is not None:
+                band = int(edge_band_cells)
             else:
-                # Single point: use constant extrapolation
-                row_coeffs[row] = np.array([[0, 0, 0], zyx_in_row[0]])
+                frac = float(edge_band_frac)
+                frac = min(max(frac, 0.0), 1.0)
+                band = int(np.ceil(frac * n_axis))
+            band = min(max(band, 1), n_axis)
 
-        # Extrapolate query points
-        for i, (query_row, query_col) in enumerate(uv_query):
-            # Find closest row
-            closest_row_idx = np.argmin(np.abs(rows_unique - query_row))
-            closest_row = rows_unique[closest_row_idx]
-
-            coeffs = row_coeffs[closest_row]
-            # zyx = slope * col + intercept
-            zyx_extrapolated[i] = coeffs[0] * query_col + coeffs[1]
-
-    else:
-        # Fit linear model per column: zyx = a * row + b
-        col_coeffs = {}
-
-        for col in cols_unique:
-            # Get all points in this column
-            mask = uv_cond[:, 1] == col
-            rows_in_col = uv_cond[mask, 0]
-            zyx_in_col = zyx_cond[mask]
-
-            if len(rows_in_col) >= 2:
-                A = np.column_stack([rows_in_col, np.ones(len(rows_in_col))])
-                coeffs, *_ = np.linalg.lstsq(A, zyx_in_col, rcond=None)
-                col_coeffs[col] = coeffs
+            if direction in {"left", "up"}:
+                threshold = axis_vals[-band]
+                edge_mask = axis >= threshold
+                edge_distance = axis_vals[-1] - axis
             else:
-                col_coeffs[col] = np.array([[0, 0, 0], zyx_in_col[0]])
+                threshold = axis_vals[band - 1]
+                edge_mask = axis <= threshold
+                edge_distance = axis - axis_vals[0]
 
-        # Extrapolate query points
-        for i, (query_row, query_col) in enumerate(uv_query):
-            # Find closest column
-            closest_col_idx = np.argmin(np.abs(cols_unique - query_col))
-            closest_col = cols_unique[closest_col_idx]
+            uv_edge = uv_cond[edge_mask]
+            zyx_edge = zyx_cond[edge_mask]
 
-            coeffs = col_coeffs[closest_col]
-            zyx_extrapolated[i] = coeffs[0] * query_row + coeffs[1]
+            min_points = max(3, int(edge_min_points))
+            if len(uv_edge) >= min_points or len(uv_edge) == len(uv_cond):
+                uv_fit = uv_edge
+                zyx_fit = zyx_edge
+            else:
+                # Expand by nearest-to-edge points until minimum count is met.
+                keep = min(len(uv_cond), min_points)
+                order = np.argsort(edge_distance, kind='stable')
+                keep_idx = order[:keep]
+                uv_fit = uv_cond[keep_idx]
+                zyx_fit = zyx_cond[keep_idx]
 
-    return zyx_extrapolated
+    fb = fallback_method
+    if fb == 'rbf_edge_only':
+        fb = 'linear_edge'
 
-
-@register_method('polynomial')
-def _extrapolate_polynomial(
-    uv_cond: np.ndarray,
-    zyx_cond: np.ndarray,
-    uv_query: np.ndarray,
-    degree: int = 2,
-    **kwargs,
-) -> np.ndarray:
-    """
-    Polynomial surface extrapolation using 2D polynomial fitting.
-
-    Fits a polynomial f(u,v) = Σ c_ij * u^i * v^j for each output dimension.
-
-    Args:
-        uv_cond: (N, 2) flattened UV coordinates of conditioning points
-        zyx_cond: (N, 3) flattened ZYX coordinates of conditioning points
-        uv_query: (M, 2) flattened UV coordinates to extrapolate to
-        degree: polynomial degree (2=quadratic, 3=cubic)
-
-    Returns:
-        (M, 3) extrapolated ZYX coordinates
-    """
-    from numpy.polynomial.polynomial import polyvander2d
-
-    u_cond, v_cond = uv_cond[:, 0], uv_cond[:, 1]
-    u_query, v_query = uv_query[:, 0], uv_query[:, 1]
-
-    # Build Vandermonde matrix for conditioning points
-    # For degree=2: columns are [1, u, v, u², uv, v², ...]
-    vander_cond = polyvander2d(u_cond, v_cond, [degree, degree])
-
-    # Fit coefficients for each output dimension (z, y, x) using least squares
-    coeffs, *_ = np.linalg.lstsq(vander_cond, zyx_cond, rcond=None)
-
-    # Evaluate at query points
-    vander_query = polyvander2d(u_query, v_query, [degree, degree])
-    zyx_extrapolated = vander_query @ coeffs
-
-    return zyx_extrapolated
-
-
-@register_method('bspline')
-def _extrapolate_bspline(
-    uv_cond: np.ndarray,
-    zyx_cond: np.ndarray,
-    uv_query: np.ndarray,
-    degree: int = 3,
-    smoothing: float = 0,
-    **kwargs,
-) -> np.ndarray:
-    """
-    B-spline surface extrapolation using scipy's bivariate spline fitting.
-
-    Args:
-        uv_cond: (N, 2) flattened UV coordinates of conditioning points
-        zyx_cond: (N, 3) flattened ZYX coordinates of conditioning points
-        uv_query: (M, 2) flattened UV coordinates to extrapolate to
-        degree: spline degree (1=linear, 3=cubic)
-        smoothing: smoothing factor (0=interpolate exactly, higher=smoother)
-
-    Returns:
-        (M, 3) extrapolated ZYX coordinates
-    """
-    from scipy.interpolate import bisplrep, bisplev
-
-    u_cond, v_cond = uv_cond[:, 0], uv_cond[:, 1]
-    u_query, v_query = uv_query[:, 0], uv_query[:, 1]
-
-    zyx_extrapolated = np.zeros((len(uv_query), 3), dtype=np.float64)
-
-    for dim in range(3):  # z, y, x
-        # Fit spline to scattered data
-        tck = bisplrep(u_cond, v_cond, zyx_cond[:, dim],
-                       kx=degree, ky=degree, s=smoothing)
-        # Evaluate at query points
-        zyx_extrapolated[:, dim] = bisplev(u_query, v_query, tck, grid=False)
-
-    return zyx_extrapolated
+    return _extrapolate_rbf(
+        uv_cond=uv_fit,
+        zyx_cond=zyx_fit,
+        uv_query=uv_query,
+        downsample_factor=downsample_factor,
+        rbf_max_points=rbf_max_points,
+        fallback_method=fb,
+        singular_smoothing=singular_smoothing,
+        smoothing=smoothing,
+        cond_direction=direction,
+        **kwargs,
+    )
 
 
 def generate_extended_uv(
@@ -661,7 +693,7 @@ def compute_boundary_extrapolation(
         zyx_cond: (H, W, 3) ZYX world coordinates of conditioning region
         growth_direction: "up", "down", "left", or "right" - direction to extend
         extension_size: number of rows/columns to extend beyond the boundary
-        method: extrapolation method ('linear_edge', 'linear_rowcol', 'rbf', etc.)
+        method: extrapolation method ('linear_edge', 'rbf', etc.)
         **method_kwargs: additional kwargs passed to the extrapolation method
 
     Returns:
@@ -767,6 +799,9 @@ def compute_extrapolation(
     degrade_prob: float = 0.0,
     degrade_curvature_range: tuple = (0.001, 0.01),
     degrade_gradient_range: tuple = (0.05, 0.2),
+    debug_no_in_bounds: bool = False,
+    debug_no_in_bounds_every: int = 1,
+    return_gt_normals: bool = False,
     **method_kwargs,
 ) -> dict:
     """
@@ -830,6 +865,11 @@ def compute_extrapolation(
     y_gt = zyx_mask_flat[:, 1]
     x_gt = zyx_mask_flat[:, 2]
 
+    gt_normals_flat = None
+    if return_gt_normals:
+        gt_normals_grid = _compute_surface_normals_grid(zyx_mask)
+        gt_normals_flat = gt_normals_grid.reshape(-1, 3)
+
     # Displacement = ground truth - extrapolated
     dz = z_gt - z_extrap
     dy = y_gt - y_extrap
@@ -864,14 +904,23 @@ def compute_extrapolation(
     )
 
     if in_bounds.sum() == 0:
-        print(f"DEBUG: No extrapolated points in bounds")
-        print(f"  crop_size: {crop_size}")
-        print(f"  min_corner: {min_corner}")
-        print(f"  uv_cond range: rows [{uv_cond_flat[:, 0].min():.0f}, {uv_cond_flat[:, 0].max():.0f}], cols [{uv_cond_flat[:, 1].min():.0f}, {uv_cond_flat[:, 1].max():.0f}]")
-        print(f"  uv_query range: rows [{uv_mask_flat[:, 0].min():.0f}, {uv_mask_flat[:, 0].max():.0f}], cols [{uv_mask_flat[:, 1].min():.0f}, {uv_mask_flat[:, 1].max():.0f}]")
-        print(f"  zyx_cond (training) range: z [{zyx_cond_flat[:, 0].min():.1f}, {zyx_cond_flat[:, 0].max():.1f}], y [{zyx_cond_flat[:, 1].min():.1f}, {zyx_cond_flat[:, 1].max():.1f}], x [{zyx_cond_flat[:, 2].min():.1f}, {zyx_cond_flat[:, 2].max():.1f}]")
-        print(f"  zyx_extrapolated range: z [{z_extrap.min():.1f}, {z_extrap.max():.1f}], y [{y_extrap.min():.1f}, {y_extrap.max():.1f}], x [{x_extrap.min():.1f}, {x_extrap.max():.1f}]")
-        print(f"  local coords range: z [{z_extrap_local.min():.1f}, {z_extrap_local.max():.1f}], y [{y_extrap_local.min():.1f}, {y_extrap_local.max():.1f}], x [{x_extrap_local.min():.1f}, {x_extrap_local.max():.1f}]")
+        if debug_no_in_bounds:
+            every = max(1, int(debug_no_in_bounds_every))
+            count = getattr(compute_extrapolation, "_debug_no_in_bounds_count", 0) + 1
+            compute_extrapolation._debug_no_in_bounds_count = count
+
+            if (count % every) == 0:
+                print(
+                    f"DEBUG: No extrapolated points in bounds "
+                    f"(count={count}, every={every})"
+                )
+                print(f"  crop_size: {crop_size}")
+                print(f"  min_corner: {min_corner}")
+                print(f"  uv_cond range: rows [{uv_cond_flat[:, 0].min():.0f}, {uv_cond_flat[:, 0].max():.0f}], cols [{uv_cond_flat[:, 1].min():.0f}, {uv_cond_flat[:, 1].max():.0f}]")
+                print(f"  uv_query range: rows [{uv_mask_flat[:, 0].min():.0f}, {uv_mask_flat[:, 0].max():.0f}], cols [{uv_mask_flat[:, 1].min():.0f}, {uv_mask_flat[:, 1].max():.0f}]")
+                print(f"  zyx_cond (training) range: z [{zyx_cond_flat[:, 0].min():.1f}, {zyx_cond_flat[:, 0].max():.1f}], y [{zyx_cond_flat[:, 1].min():.1f}, {zyx_cond_flat[:, 1].max():.1f}], x [{zyx_cond_flat[:, 2].min():.1f}, {zyx_cond_flat[:, 2].max():.1f}]")
+                print(f"  zyx_extrapolated range: z [{z_extrap.min():.1f}, {z_extrap.max():.1f}], y [{y_extrap.min():.1f}, {y_extrap.max():.1f}], x [{x_extrap.min():.1f}, {x_extrap.max():.1f}]")
+                print(f"  local coords range: z [{z_extrap_local.min():.1f}, {z_extrap_local.max():.1f}], y [{y_extrap_local.min():.1f}, {y_extrap_local.max():.1f}], x [{x_extrap_local.min():.1f}, {x_extrap_local.max():.1f}]")
         return None  # Let caller handle retry
 
     # Build outputs for in-bounds points only
@@ -899,6 +948,10 @@ def compute_extrapolation(
         dx[in_bounds]
     ], axis=-1)  # (N, 3)
 
+    gt_normals_local = None
+    if gt_normals_flat is not None:
+        gt_normals_local = gt_normals_flat[in_bounds].astype(np.float32, copy=False)
+
     # Voxelize extrapolated surface with line interpolation
     # Reshape local coords back to original UV grid shape for line drawing
     zyx_extrap_local = np.stack([z_extrap_local, y_extrap_local, x_extrap_local], axis=-1)
@@ -906,9 +959,12 @@ def compute_extrapolation(
     zyx_grid_local = zyx_extrap_local.reshape(uv_mask_shape + (3,))
     extrap_surface = voxelize_surface_grid(zyx_grid_local, crop_size)
 
-    return {
+    result = {
         'extrap_coords_local': extrap_coords_local,
         'gt_coords_local': gt_coords_local,  # Ground truth coords for post-augmentation displacement
         'gt_displacement': gt_displacement,  # Pre-computed displacement (deprecated, for backward compat)
         'extrap_surface': extrap_surface,
     }
+    if gt_normals_local is not None:
+        result['gt_normals_local'] = gt_normals_local
+    return result

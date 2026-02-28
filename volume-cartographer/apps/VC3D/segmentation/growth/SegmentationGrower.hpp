@@ -75,6 +75,7 @@ public:
                SegmentationGrowthDirection direction,
                int steps,
                bool inpaintOnly);
+    bool startCopyWithNt(const VolumeContext& volumeContext);
 
     bool running() const { return _running; }
 
@@ -93,6 +94,9 @@ private:
         std::optional<CorrectionsBounds> correctionsBounds;
         std::unique_ptr<QuadSurface> beforeCrop;
         SegmentationCorrectionsPayload corrections;
+        bool denseDisplacement{false};
+        bool denseCreateNewSegment{false};
+        bool copyDisplacement{false};
     };
 
     void finalize(bool ok);

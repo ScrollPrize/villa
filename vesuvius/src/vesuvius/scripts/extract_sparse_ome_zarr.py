@@ -34,6 +34,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def open_zarr_read(store_path: str):
+    """Open a Zarr store for reading, supporting local paths and URI stores."""
+    if "://" in store_path and not store_path.startswith("file://"):
+        import fsspec
+
+        return zarr.open(fsspec.get_mapper(store_path), mode="r")
+    return zarr.open(store_path, mode="r")
+
+
 def discover_tifxyz_dirs(folder: Path) -> List[Path]:
     """Find all tifxyz directories by looking for meta.json files.
 
@@ -260,7 +269,7 @@ def copy_chunk_worker(args: Tuple) -> Tuple[Tuple[int, int, int], bool]:
 
     try:
         # Read from source
-        source = zarr.open(source_path, mode="r")
+        source = open_zarr_read(source_path)
         src_arr = source[str(level)]
         chunk_data = src_arr[z_start:z_end, y_start:y_end, x_start:x_end]
 
@@ -303,7 +312,7 @@ def copy_sparse_chunks(
     Dict[int, int]
         Number of non-empty chunks copied per level.
     """
-    source = zarr.open(source_path, mode="r")
+    source = open_zarr_read(source_path)
     copied_counts = {}
 
     for level in sorted(chunks_by_level.keys()):
@@ -344,7 +353,7 @@ def copy_sparse_chunks(
 
 
 def extract_sparse_ome_zarr(
-    source_zarr: Path,
+    source_zarr: str,
     output_zarr: Path,
     tifxyz_folder: Path,
     margin_voxels: int = 64,
@@ -355,8 +364,8 @@ def extract_sparse_ome_zarr(
 
     Parameters
     ----------
-    source_zarr : Path
-        Path to source OME-Zarr.
+    source_zarr : str
+        Path or URI to source OME-Zarr.
     output_zarr : Path
         Path to output sparse OME-Zarr.
     tifxyz_folder : Path
@@ -380,7 +389,7 @@ def extract_sparse_ome_zarr(
 
     # Open source zarr to get metadata
     logger.info(f"Opening source zarr: {source_zarr}")
-    source = zarr.open(str(source_zarr), mode="r")
+    source = open_zarr_read(source_zarr)
     src_arr = source["0"]
     volume_shape = src_arr.shape
     chunk_size = src_arr.chunks
@@ -435,7 +444,7 @@ def extract_sparse_ome_zarr(
     # Copy chunks
     logger.info("Copying chunks from source...")
     copied_counts = copy_sparse_chunks(
-        str(source_zarr),
+        source_zarr,
         str(output_zarr),
         chunks_by_level,
         num_workers,
@@ -474,8 +483,8 @@ def main():
     )
     parser.add_argument(
         "source_zarr",
-        type=Path,
-        help="Path to source OME-Zarr volume",
+        type=str,
+        help="Path or URI to source OME-Zarr volume",
     )
     parser.add_argument(
         "output_zarr",
