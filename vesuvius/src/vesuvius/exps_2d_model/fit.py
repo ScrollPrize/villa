@@ -31,6 +31,8 @@ def _build_parser() -> argparse.ArgumentParser:
 	point_constraints.add_args(p)
 	p.add_argument("--progress", action="store_true", default=False,
 		help="Print machine-readable PROGRESS lines to stdout")
+	p.add_argument("--measure-cuda-timings", action="store_true", default=False,
+		help="Insert cuda.synchronize() calls to measure per-component timings (slow)")
 	return p
 
 
@@ -67,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
 	opt_cfg = cli_opt.from_args(args)
 	vis_cfg = cli_vis.from_args(args)
 	progress_enabled = bool(args.progress)
+	measure_cuda_timings = bool(args.measure_cuda_timings)
 	points_cfg = point_constraints.from_args(args)
 	points_tensor, points_collection_idx, points_ids = point_constraints.load_points_tensor(points_cfg)
 	# Merge inline corr_points from config JSON (e.g. sent by VC3D)
@@ -660,6 +663,7 @@ def main(argv: list[str] | None = None) -> int:
 		snapshot_fn=_snapshot,
 		corr_snapshot_fn=_corr_snapshot,
 		progress_fn=_progress,
+		measure_cuda_timings=measure_cuda_timings,
 	)
 	if _corr_out_dir is not None and int(points_all.shape[0]) > 0:
 		with torch.no_grad():
