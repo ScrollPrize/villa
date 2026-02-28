@@ -5,7 +5,9 @@ from pathlib import Path
 import time
 
 import cv2
+import edt as edt_mod
 import numpy as np
+from skimage.morphology import skeletonize
 import torch
 import zarr
 
@@ -322,6 +324,127 @@ def run_preprocess(
 	)
 
 
+def _compute_pred_dt_channel(
+	*,
+	pred_path: str,
+	output_arr: zarr.Array,
+	channel_idx: int,
+	ref_z: int, ref_y: int, ref_x: int,
+	downscale_xy: int,
+	z_step_eff: int,
+	crop_xyzwhd: list[int] | None,
+	chunk_depth: int = 1000,
+	overlap: int = 255,
+) -> None:
+	"""Compute distance-to-skeleton channel from a prediction zarr and write into output_arr."""
+	pred = zarr.open(str(pred_path), mode="r")
+	if not hasattr(pred, "shape"):
+		raise ValueError(f"pred-dt must point to a zarr array, got: {pred_path}")
+	pred_shape = tuple(int(v) for v in pred.shape)
+	if len(pred_shape) != 3:
+		raise ValueError(f"pred-dt array must be (Z,Y,X), got shape {pred_shape}")
+	pZ, pY, pX = pred_shape
+
+	# Apply crop to prediction volume (same coordinate space as input volume)
+	if crop_xyzwhd is not None:
+		cx, cy, cz, cw, ch, cd = (int(v) for v in crop_xyzwhd)
+		p_z0 = max(0, min(cz, pZ))
+		p_z1 = max(p_z0, min(cz + max(0, cd), pZ))
+		p_y0 = max(0, min(cy, pY))
+		p_y1 = max(p_y0, min(cy + max(0, ch), pY))
+		p_x0 = max(0, min(cx, pX))
+		p_x1 = max(p_x0, min(cx + max(0, cw), pX))
+	else:
+		p_z0, p_z1 = 0, pZ
+		p_y0, p_y1 = 0, pY
+		p_x0, p_x1 = 0, pX
+
+	total_z = p_z1 - p_z0
+	if total_z <= 0:
+		print(f"[pred_dt] WARNING: empty z range after crop, skipping")
+		return
+
+	print(
+		f"[pred_dt] pred={pred_path} shape={pred_shape} crop_z=[{p_z0},{p_z1}) "
+		f"crop_y=[{p_y0},{p_y1}) crop_x=[{p_x0},{p_x1}) "
+		f"downscale_xy={downscale_xy} z_step_eff={z_step_eff} "
+		f"chunk_depth={chunk_depth} overlap={overlap}",
+		flush=True,
+	)
+
+	t0 = time.time()
+	# Process in z-chunks with overlap for accurate EDT near boundaries
+	z_pos = p_z0
+	while z_pos < p_z1:
+		z_chunk_end = min(p_z1, z_pos + chunk_depth)
+
+		# Padded read range
+		read_z0 = max(p_z0, z_pos - overlap)
+		read_z1 = min(p_z1, z_chunk_end + overlap)
+
+		# Read prediction chunk
+		chunk_np = np.asarray(pred[read_z0:read_z1, p_y0:p_y1, p_x0:p_x1])
+
+		# Binarize: labels > 0 = surface
+		binary = chunk_np > 0
+
+		# 3D skeletonize: thick sheets → 1-voxel medial surface
+		skeleton = skeletonize(binary)
+
+		# EDT from skeleton voxels (distance from non-skeleton to nearest skeleton)
+		dt = edt_mod.edt(~skeleton, parallel=0).astype(np.float32)
+
+		# Crop off overlap padding to keep center region
+		pad_before = z_pos - read_z0
+		center_depth = z_chunk_end - z_pos
+		dt_center = dt[pad_before:pad_before + center_depth]
+
+		# Clamp to 255, cast to uint8
+		dt_u8 = np.clip(dt_center, 0.0, 255.0).astype(np.uint8)
+
+		# Downscale to output grid
+		# Z: subsample at z_step_eff spacing
+		z_indices_full = list(range(z_pos, z_chunk_end, z_step_eff))
+		if not z_indices_full:
+			z_pos = z_chunk_end
+			continue
+
+		for zf in z_indices_full:
+			local_z = zf - z_pos
+			if local_z < 0 or local_z >= dt_u8.shape[0]:
+				continue
+			slc = dt_u8[local_z]
+
+			# YX downscale
+			if downscale_xy > 1:
+				out_h = max(1, slc.shape[0] // downscale_xy)
+				out_w = max(1, slc.shape[1] // downscale_xy)
+				slc = cv2.resize(slc, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+			# Output z index
+			out_zi = zf // z_step_eff
+			if out_zi < 0 or out_zi >= ref_z:
+				continue
+
+			# Write — handle possible size mismatch at boundaries
+			wy = min(ref_y, slc.shape[0])
+			wx = min(ref_x, slc.shape[1])
+			output_arr[channel_idx, out_zi, :wy, :wx] = slc[:wy, :wx]
+
+		elapsed = max(1e-6, time.time() - t0)
+		progress = min(1.0, float(z_chunk_end - p_z0) / float(max(1, total_z)))
+		eta = elapsed / max(1e-6, progress) * (1.0 - progress)
+		print(
+			f"\r[pred_dt] {z_chunk_end - p_z0}/{total_z} ({100.0 * progress:.1f}%) "
+			f"eta {int(eta // 60):02d}:{int(eta % 60):02d}",
+			end="", flush=True,
+		)
+		z_pos = z_chunk_end
+
+	print("", flush=True)
+	print(f"[pred_dt] done in {time.time() - t0:.1f}s")
+
+
 def run_integrate_directions(
 	*,
 	z_volume_path: str,
@@ -329,6 +452,7 @@ def run_integrate_directions(
 	x_volume_path: str | None = None,
 	output_path: str,
 	batch_size: int = 32,
+	pred_dt_path: str | None = None,
 ) -> None:
 	"""Integrate dir channels from axis-y and axis-x volumes into the axis-z reference volume.
 
@@ -369,6 +493,9 @@ def run_integrate_directions(
 		x_ds = int(x_params.get("downscale_xy", 1))
 		sources.append(("x", x_vol, float(z_step_eff) / float(max(1, x_ds))))
 		channel_names.extend(["dir0_x", "dir1_x"])
+
+	if pred_dt_path:
+		channel_names.append("pred_dt")
 
 	if not sources:
 		raise ValueError("at least one of y_volume_path or x_volume_path must be provided")
@@ -443,6 +570,19 @@ def run_integrate_directions(
 	print("", flush=True)
 	print(f"[integrate_directions] done in {time.time() - t0:.1f}s")
 
+	if pred_dt_path:
+		pred_dt_ch = channel_names.index("pred_dt")
+		crop_param = z_params.get("crop_xyzwhd", None)
+		_compute_pred_dt_channel(
+			pred_path=pred_dt_path,
+			output_arr=out,
+			channel_idx=pred_dt_ch,
+			ref_z=ref_z, ref_y=ref_y, ref_x=ref_x,
+			downscale_xy=int(z_params.get("downscale_xy", 1)),
+			z_step_eff=z_step_eff,
+			crop_xyzwhd=crop_param,
+		)
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -503,6 +643,7 @@ def main_integrate(argv: list[str] | None = None) -> int:
 	p.add_argument("--x-volume", default=None, help="Axis-x preprocessed zarr (optional).")
 	p.add_argument("--output", required=True, help="Output zarr path.")
 	p.add_argument("--batch-size", type=int, default=32, help="Z-slices per batch for resize (default: 32).")
+	p.add_argument("--pred-dt", default=None, help="Surface prediction zarr for distance-to-skeleton channel.")
 	args = p.parse_args(argv)
 
 	if args.y_volume is None and args.x_volume is None:
@@ -514,6 +655,7 @@ def main_integrate(argv: list[str] | None = None) -> int:
 		x_volume_path=str(args.x_volume) if args.x_volume else None,
 		output_path=str(args.output),
 		batch_size=int(args.batch_size),
+		pred_dt_path=str(args.pred_dt) if args.pred_dt else None,
 	)
 	return 0
 
