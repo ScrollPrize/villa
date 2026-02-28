@@ -63,6 +63,11 @@ class PreferenceIn(BaseModel):
     preference: Literal["left", "right"]
 
 
+class UndoIn(BaseModel):
+    user_id: str = Field(min_length=1)
+    pair_id: str = Field(min_length=1)
+
+
 class PreferenceOut(BaseModel):
     id: int
     message: str
@@ -448,6 +453,10 @@ def log_preference(payload: PreferenceIn) -> PreferenceOut:
     pair_id = expected_id
 
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "DELETE FROM preference_logs WHERE user_id = ? AND pair_id = ?",
+            (payload.user_id, pair_id),
+        )
         cur = conn.execute(
             "INSERT INTO preference_logs (ts, user_id, pair_id, fold, sample, left_image, right_image, preference)\n             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
@@ -463,6 +472,27 @@ def log_preference(payload: PreferenceIn) -> PreferenceOut:
         )
         conn.commit()
         return PreferenceOut(id=cur.lastrowid, message="logged")
+
+
+@app.post("/api/preferences/undo")
+def undo_preference(payload: UndoIn) -> dict[str, object]:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT id, pair_id FROM preference_logs WHERE user_id = ? AND pair_id = ? ORDER BY id DESC LIMIT 1",
+            (payload.user_id, payload.pair_id),
+        ).fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No matching preference to undo",
+            )
+
+        deleted_id = row[0]
+        conn.execute("DELETE FROM preference_logs WHERE id = ?", (deleted_id,))
+        conn.commit()
+
+    return {"id": deleted_id, "pair_id": payload.pair_id, "message": "undone"}
 
 
 @app.get("/api/preferences")

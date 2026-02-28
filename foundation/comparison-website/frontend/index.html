@@ -1061,10 +1061,24 @@
         }
       });
 
-      undoBtn.addEventListener('click', () => {
+      async function undoLastResponse() {
         if (!state.undoPair) {
           showToast('Nothing to undo');
           return;
+        }
+
+        const response = await fetch('/api/preferences/undo', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            user_id: state.userId,
+            pair_id: state.undoPair.pair_id,
+          }),
+        });
+
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({}));
+          throw new Error(err.detail || `Could not undo (${response.status})`);
         }
 
         setUndoVisible(false);
@@ -1085,6 +1099,17 @@
         renderPair(state.pair);
         setStatus('Re-evaluating previous pair. Submit your correction when ready.');
         showToast('Redo previous pair', 1200);
+      }
+
+      undoBtn.addEventListener('click', () => {
+        setBusy(true, 'Undoing last response...');
+        setStatus('Undoing last response...');
+        undoLastResponse()
+          .catch((error) => {
+            setStatus(error.message, 'error');
+            showToast(error.message, 1600);
+          })
+          .finally(() => setBusy(false));
       });
 
       retryBtn.addEventListener('click', async () => {
