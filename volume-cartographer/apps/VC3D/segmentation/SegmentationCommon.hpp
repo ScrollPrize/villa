@@ -20,3 +20,8 @@ enum class DenseTtaMode {
     Rotate3 = 1,
     None = 2,
 };
+
+enum class ApprovalBrushShape {
+    Rectangle = 0,
+    Circle = 1,
+};

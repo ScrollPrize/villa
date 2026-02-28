@@ -522,6 +522,7 @@ struct TraceData {
     bool cell_reopt_mode = false;
     cv::Mat_<uchar> boundary_mask;
     cv::Mat_<uchar> interior_mask;
+    cv::Mat_<uchar> resume_local_opt_mask;
     const cv::Mat_<cv::Vec3d>* reopt_anchors = nullptr;
     const cv::Mat_<cv::Vec3d>* reopt_normals = nullptr;
     double reopt_tangent_weight = 10.0;
@@ -2590,6 +2591,12 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
                     fixed = true;
                 }
             }
+            if (!trace_data.resume_local_opt_mask.empty()) {
+                if (!point_in_bounds(trace_data.resume_local_opt_mask, op) ||
+                    trace_data.resume_local_opt_mask(op) == 0) {
+                    fixed = true;
+                }
+            }
             if (fixed) {
                 problem.SetParameterBlockConstant(&params.dpoints(op)[0]);
             }
@@ -2780,12 +2787,16 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
     loss_settings.space_line_steps = std::max(2, params.value("space_line_steps", loss_settings.space_line_steps));
     loss_settings.space_line_threshold = std::clamp(static_cast<float>(params.value("space_line_threshold", loss_settings.space_line_threshold)), 0.0f, 255.0f);
     loss_settings.space_line_invert = params.value("space_line_invert", loss_settings.space_line_invert);
+    const bool resume_local_use_mask = params.value("resume_local_use_mask", false);
     trace_data.cell_reopt_mode = params.value("cell_reopt_mode", false);
     if (trace_data.cell_reopt_mode) {
         std::cout << "Cell reoptimization mode enabled." << std::endl;
         trace_data.reopt_tangent_weight = std::max(0.0, params.value("cell_reopt_tangent_weight", 10.0));
         trace_data.reopt_boundary_weight = std::max(0.0, params.value("cell_reopt_boundary_weight", 10.0));
         trace_data.reopt_boundary_max = std::max(0.0, params.value("cell_reopt_boundary_max", 3.0));
+    }
+    if (resume_local_use_mask) {
+        std::cout << "Resume-local mask gating enabled." << std::endl;
     }
     if (trace_data.cell_reopt_mode && loss_settings.w[LossType::SURFACE_SDT] > 0.0f) {
         auto sdt_context = std::make_shared<SDTContext>();
@@ -3389,6 +3400,23 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
         }
 
         trace_data.point_correction = PointCorrection(corrections);
+        auto initialize_cell_reopt_anchors = [&]() {
+            std::vector<cv::Point> interior_points;
+            cv::findNonZero(trace_data.interior_mask, interior_points);
+            if (interior_points.empty()) {
+                return;
+            }
+            reopt_anchors = trace_params.dpoints.clone();
+            reopt_normals = cv::Mat_<cv::Vec3d>(trace_params.dpoints.size(), cv::Vec3d(0,0,0));
+            for (const auto& pt : interior_points) {
+                const cv::Vec2i grid{pt.y, pt.x};
+                if (trace_params.state(grid) & STATE_LOC_VALID) {
+                    update_surface_normal(grid, trace_params.dpoints, trace_params.state, reopt_normals);
+                }
+            }
+            trace_data.reopt_anchors = &reopt_anchors;
+            trace_data.reopt_normals = &reopt_normals;
+        };
 
         if (trace_data.point_correction.isValid()) {
             trace_data.point_correction.init(trace_params.dpoints);
@@ -3579,21 +3607,7 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 if (resample_inside_boundary(trace_params, trace_data, loss_settings)) {
                     std::cout << "Cell reopt resample completed." << std::endl;
                 }
-
-                std::vector<cv::Point> interior_points;
-                cv::findNonZero(trace_data.interior_mask, interior_points);
-                if (!interior_points.empty()) {
-                    reopt_anchors = trace_params.dpoints.clone();
-                    reopt_normals = cv::Mat_<cv::Vec3d>(trace_params.dpoints.size(), cv::Vec3d(0,0,0));
-                    for (const auto& pt : interior_points) {
-                        const cv::Vec2i grid{pt.y, pt.x};
-                        if (trace_params.state(grid) & STATE_LOC_VALID) {
-                            update_surface_normal(grid, trace_params.dpoints, trace_params.state, reopt_normals);
-                        }
-                    }
-                    trace_data.reopt_anchors = &reopt_anchors;
-                    trace_data.reopt_normals = &reopt_normals;
-                }
+                initialize_cell_reopt_anchors();
             }
 
             struct OptCenter {
@@ -3662,6 +3676,100 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
                 surf->save(tgt_path, true);
                 delete surf;
                 std::cout << "saved snapshot in " << tgt_path << std::endl;
+            }
+        }
+
+        if (resume_surf && (trace_data.cell_reopt_mode || resume_local_use_mask)) {
+            cv::Mat moved_mask = resume_surf->channel("resume_local_mask", SURF_CHANNEL_NORESIZE);
+            if (!moved_mask.empty()) {
+                cv::Mat moved_gray;
+                if (moved_mask.channels() == 1) {
+                    moved_gray = moved_mask;
+                } else if (moved_mask.channels() == 3) {
+                    cv::cvtColor(moved_mask, moved_gray, cv::COLOR_BGR2GRAY);
+                } else if (moved_mask.channels() == 4) {
+                    cv::cvtColor(moved_mask, moved_gray, cv::COLOR_BGRA2GRAY);
+                } else {
+                    moved_gray = cv::Mat();
+                }
+
+                if (!moved_gray.empty()) {
+                    cv::Mat moved_binary;
+                    if (moved_gray.depth() == CV_8U) {
+                        cv::compare(moved_gray, 0, moved_binary, cv::CMP_GT);
+                    } else {
+                        cv::Mat moved_float;
+                        moved_gray.convertTo(moved_float, CV_32F);
+                        cv::compare(moved_float, 0.0f, moved_binary, cv::CMP_GT);
+                    }
+
+                    if (moved_binary.rows != resume_points.rows || moved_binary.cols != resume_points.cols) {
+                        cv::Mat moved_resized;
+                        cv::resize(moved_binary, moved_resized, resume_points.size(), 0.0, 0.0, cv::INTER_NEAREST);
+                        moved_binary = std::move(moved_resized);
+                    }
+
+                    const bool build_cell_reopt_masks = trace_data.cell_reopt_mode && trace_data.interior_mask.empty();
+                    if (build_cell_reopt_masks) {
+                        trace_data.interior_mask = cv::Mat_<uchar>(trace_params.state.size(), static_cast<uchar>(0));
+                        trace_data.boundary_mask = cv::Mat_<uchar>(trace_params.state.size(), static_cast<uchar>(0));
+                    }
+                    if (resume_local_use_mask) {
+                        trace_data.resume_local_opt_mask = cv::Mat_<uchar>(trace_params.state.size(), static_cast<uchar>(0));
+                    }
+
+                    int moved_count = 0;
+                    int resume_mask_count = 0;
+                    for (int j = 0; j < resume_points.rows; ++j) {
+                        for (int i = 0; i < resume_points.cols; ++i) {
+                            if (moved_binary.at<uint8_t>(j, i) == 0) {
+                                continue;
+                            }
+                            if (resume_points(j, i)[0] == -1.f) {
+                                continue;
+                            }
+                            const int y = resume_pad_y + j;
+                            const int x = resume_pad_x + i;
+                            if (y < 0 || y >= trace_params.state.rows || x < 0 || x >= trace_params.state.cols) {
+                                continue;
+                            }
+                            if (build_cell_reopt_masks) {
+                                trace_data.interior_mask(y, x) = 1;
+                                ++moved_count;
+                            }
+                            if (resume_local_use_mask) {
+                                trace_data.resume_local_opt_mask(y, x) = 1;
+                                ++resume_mask_count;
+                            }
+                        }
+                    }
+
+                    if (resume_local_use_mask) {
+                        if (resume_mask_count > 0) {
+                            std::cout << "Resume-local mask from resume_local_mask: interior="
+                                      << resume_mask_count << std::endl;
+                        } else {
+                            trace_data.resume_local_opt_mask.release();
+                            std::cout << "Resume-local mask had no valid moved points." << std::endl;
+                        }
+                    }
+
+                    if (build_cell_reopt_masks) {
+                        if (moved_count > 0) {
+                            compute_boundary_from_interior(trace_data.interior_mask, trace_data.boundary_mask);
+                            std::cout << "Cell reopt masks from resume_local_mask: interior=" << moved_count
+                                      << " boundary=" << cv::countNonZero(trace_data.boundary_mask) << std::endl;
+                            if (resample_inside_boundary(trace_params, trace_data, loss_settings)) {
+                                std::cout << "Cell reopt resample completed." << std::endl;
+                            }
+                            initialize_cell_reopt_anchors();
+                        } else {
+                            trace_data.interior_mask.release();
+                            trace_data.boundary_mask.release();
+                            std::cout << "Cell reopt resume_local_mask had no valid moved points." << std::endl;
+                        }
+                    }
+                }
             }
         }
 
@@ -3801,7 +3909,13 @@ QuadSurface *tracer(z5::Dataset *ds, float scale, ChunkCache<uint8_t> *cache, cv
             std::vector<cv::Vec2i> opt_local;
             for (int j = used_area.y; j < used_area.br().y; ++j) {
                 for (int i = used_area.x; i < used_area.br().x; ++i) {
-                    if ((trace_params.state(j, i) & STATE_LOC_VALID) && (i % opt_step == 0 && j % opt_step == 0)) {
+                    bool include = (trace_params.state(j, i) & STATE_LOC_VALID) &&
+                                   (i % opt_step == 0 && j % opt_step == 0);
+                    if (include && !trace_data.resume_local_opt_mask.empty()) {
+                        include = point_in_bounds(trace_data.resume_local_opt_mask, cv::Vec2i{j, i}) &&
+                                  trace_data.resume_local_opt_mask(j, i) != 0;
+                    }
+                    if (include) {
                         opt_local.push_back({j, i});
                     }
                 }

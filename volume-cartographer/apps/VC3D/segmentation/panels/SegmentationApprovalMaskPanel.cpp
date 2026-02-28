@@ -4,10 +4,13 @@
 #include "elements/CollapsibleSettingsGroup.hpp"
 
 #include <QCheckBox>
+#include <QComboBox>
 #include <QColorDialog>
 #include <QDoubleSpinBox>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QLabel>
+#include <QLineEdit>
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -34,6 +37,30 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& sett
     _chkShowApprovalMask = new QCheckBox(tr("Show Approval Mask"), approvalParent);
     _chkShowApprovalMask->setToolTip(tr("Display the approval mask overlay on the surface."));
     approvalLayout->addWidget(_chkShowApprovalMask);
+
+    // Approval mask selection row
+    auto* maskSelectionRow = new QHBoxLayout();
+    maskSelectionRow->setSpacing(8);
+    auto* maskSelectionLabel = new QLabel(tr("Mask:"), approvalParent);
+    _comboApprovalMask = new QComboBox(approvalParent);
+    _comboApprovalMask->setToolTip(tr("Select which mask file is shown and edited."));
+    _btnNewApprovalMask = new QPushButton(tr("New"), approvalParent);
+    _btnNewApprovalMask->setToolTip(tr("Create a new named mask file for this segment."));
+    maskSelectionRow->addWidget(maskSelectionLabel);
+    maskSelectionRow->addWidget(_comboApprovalMask, 1);
+    maskSelectionRow->addWidget(_btnNewApprovalMask);
+    approvalLayout->addLayout(maskSelectionRow);
+
+    auto* maskedCopyRow = new QHBoxLayout();
+    maskedCopyRow->setSpacing(8);
+    _btnCopyMaskedForward = new QPushButton(tr("Copy Masked Forward"), approvalParent);
+    _btnCopyMaskedForward->setToolTip(tr("Run masked neighbor copy forward on the active segment."));
+    _btnCopyMaskedBackward = new QPushButton(tr("Copy Masked Backward"), approvalParent);
+    _btnCopyMaskedBackward->setToolTip(tr("Run masked neighbor copy backward on the active segment."));
+    maskedCopyRow->addWidget(_btnCopyMaskedForward);
+    maskedCopyRow->addWidget(_btnCopyMaskedBackward);
+    maskedCopyRow->addStretch(1);
+    approvalLayout->addLayout(maskedCopyRow);
 
     // Edit checkboxes row - mutually exclusive approve/unapprove modes
     auto* editRow = new QHBoxLayout();
@@ -121,6 +148,20 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& sett
     approvalBrushRow->addStretch(1);
     approvalLayout->addLayout(approvalBrushRow);
 
+    auto* brushShapeRow = new QHBoxLayout();
+    brushShapeRow->setSpacing(8);
+    auto* brushShapeLabel = new QLabel(tr("Shape:"), approvalParent);
+    _comboApprovalBrushShape = new QComboBox(approvalParent);
+    _comboApprovalBrushShape->addItem(tr("Rectangle"), static_cast<int>(ApprovalBrushShape::Rectangle));
+    _comboApprovalBrushShape->addItem(tr("Circle"), static_cast<int>(ApprovalBrushShape::Circle));
+    _comboApprovalBrushShape->setToolTip(
+        tr("Brush shape used in the flattened segmentation view.\n"
+           "Plane views continue using the existing cylinder footprint."));
+    brushShapeRow->addWidget(brushShapeLabel);
+    brushShapeRow->addWidget(_comboApprovalBrushShape);
+    brushShapeRow->addStretch(1);
+    approvalLayout->addLayout(brushShapeRow);
+
     // Opacity slider row
     auto* opacityRow = new QHBoxLayout();
     opacityRow->setSpacing(8);
@@ -162,6 +203,8 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& sett
     approvalLayout->addLayout(buttonRow);
 
     panelLayout->addWidget(_groupApprovalMask);
+
+    setApprovalMaskOptions(_approvalMaskOptions);
 
     // --- Signal wiring (moved from SegmentationWidget::buildUi) ---
 
@@ -210,6 +253,15 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& sett
         setApprovalBrushDepth(static_cast<float>(value));
     });
 
+    connect(_comboApprovalBrushShape, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0 || !_comboApprovalBrushShape) {
+            return;
+        }
+        const QVariant data = _comboApprovalBrushShape->itemData(index);
+        const ApprovalBrushShape shape = static_cast<ApprovalBrushShape>(data.toInt());
+        setApprovalBrushShape(shape);
+    });
+
     connect(_sliderApprovalMaskOpacity, &QSlider::valueChanged, this, [this](int value) {
         setApprovalMaskOpacity(value);
     });
@@ -222,6 +274,40 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& sett
     });
 
     connect(_btnUndoApprovalStroke, &QPushButton::clicked, this, &SegmentationApprovalMaskPanel::approvalStrokesUndoRequested);
+
+    connect(_comboApprovalMask, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0 || !_comboApprovalMask) {
+            return;
+        }
+        const QString maskId = _comboApprovalMask->itemData(index).toString();
+        setSelectedApprovalMaskId(maskId);
+    });
+
+    connect(_btnNewApprovalMask, &QPushButton::clicked, this, [this]() {
+        bool accepted = false;
+        const QString entered = QInputDialog::getText(
+            this,
+            tr("Create Mask"),
+            tr("Mask name:"),
+            QLineEdit::Normal,
+            QString(),
+            &accepted);
+        if (!accepted) {
+            return;
+        }
+        const QString trimmed = entered.trimmed();
+        if (trimmed.isEmpty()) {
+            return;
+        }
+        emit approvalMaskCreateRequested(trimmed);
+    });
+
+    connect(_btnCopyMaskedForward, &QPushButton::clicked, this, [this]() {
+        emit copyMaskedForwardRequested();
+    });
+    connect(_btnCopyMaskedBackward, &QPushButton::clicked, this, [this]() {
+        emit copyMaskedBackwardRequested();
+    });
 
     connect(_groupApprovalMask, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
         if (_restoringSettings) {
@@ -418,6 +504,85 @@ void SegmentationApprovalMaskPanel::setApprovalBrushDepth(float depth)
     }
 }
 
+void SegmentationApprovalMaskPanel::setApprovalBrushShape(ApprovalBrushShape shape)
+{
+    if (_approvalBrushShape == shape) {
+        return;
+    }
+    _approvalBrushShape = shape;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_brush_shape"), static_cast<int>(_approvalBrushShape));
+        emit approvalBrushShapeChanged(_approvalBrushShape);
+    }
+    if (_comboApprovalBrushShape) {
+        const QSignalBlocker blocker(_comboApprovalBrushShape);
+        const int idx = _comboApprovalBrushShape->findData(static_cast<int>(_approvalBrushShape));
+        if (idx >= 0) {
+            _comboApprovalBrushShape->setCurrentIndex(idx);
+        }
+    }
+}
+
+void SegmentationApprovalMaskPanel::setApprovalMaskOptions(const QVector<QPair<QString, QString>>& options)
+{
+    QVector<QPair<QString, QString>> sanitized = options;
+    if (sanitized.isEmpty()) {
+        sanitized.push_back({QStringLiteral("default"), QStringLiteral("approval")});
+    }
+    _approvalMaskOptions = sanitized;
+
+    if (_comboApprovalMask) {
+        const QSignalBlocker blocker(_comboApprovalMask);
+        _comboApprovalMask->clear();
+        for (const auto& option : _approvalMaskOptions) {
+            _comboApprovalMask->addItem(option.second, option.first);
+        }
+    }
+
+    bool selectedFound = false;
+    for (const auto& option : _approvalMaskOptions) {
+        if (option.first == _selectedApprovalMaskId) {
+            selectedFound = true;
+            break;
+        }
+    }
+    if (!selectedFound) {
+        _selectedApprovalMaskId = _approvalMaskOptions.front().first;
+    }
+    syncUiState();
+}
+
+void SegmentationApprovalMaskPanel::setSelectedApprovalMaskId(const QString& maskId)
+{
+    QString resolved = maskId;
+    bool found = false;
+    for (const auto& option : _approvalMaskOptions) {
+        if (option.first == resolved) {
+            found = true;
+            break;
+        }
+    }
+    if (!found && !_approvalMaskOptions.isEmpty()) {
+        resolved = _approvalMaskOptions.front().first;
+    }
+
+    if (_selectedApprovalMaskId == resolved) {
+        return;
+    }
+    _selectedApprovalMaskId = resolved;
+    if (!_restoringSettings) {
+        writeSetting(QStringLiteral("approval_selected_mask_id"), _selectedApprovalMaskId);
+        emit approvalMaskSelected(_selectedApprovalMaskId);
+    }
+    if (_comboApprovalMask) {
+        const QSignalBlocker blocker(_comboApprovalMask);
+        const int idx = _comboApprovalMask->findData(_selectedApprovalMaskId);
+        if (idx >= 0) {
+            _comboApprovalMask->setCurrentIndex(idx);
+        }
+    }
+}
+
 void SegmentationApprovalMaskPanel::setApprovalMaskOpacity(int opacity)
 {
     const int sanitized = std::clamp(opacity, 0, 100);
@@ -452,6 +617,15 @@ void SegmentationApprovalMaskPanel::setApprovalBrushColor(const QColor& color)
         _btnApprovalColor->setStyleSheet(
             QStringLiteral("background-color: %1; border: 1px solid #888;").arg(_approvalBrushColor.name()));
     }
+
+    const bool hasMaskSelection = !_approvalMaskOptions.isEmpty();
+    const bool canCopyMasked = _showApprovalMask && hasMaskSelection;
+    if (_btnCopyMaskedForward) {
+        _btnCopyMaskedForward->setEnabled(canCopyMasked);
+    }
+    if (_btnCopyMaskedBackward) {
+        _btnCopyMaskedBackward->setEnabled(canCopyMasked);
+    }
 }
 
 void SegmentationApprovalMaskPanel::restoreSettings(QSettings& settings)
@@ -464,6 +638,13 @@ void SegmentationApprovalMaskPanel::restoreSettings(QSettings& settings)
     _approvalBrushRadius = std::clamp(_approvalBrushRadius, 1.0f, 1000.0f);
     _approvalBrushDepth = settings.value(segmentation::APPROVAL_BRUSH_DEPTH, _approvalBrushDepth).toFloat();
     _approvalBrushDepth = std::clamp(_approvalBrushDepth, 1.0f, 500.0f);
+    const int brushShapeValue = settings.value(segmentation::APPROVAL_BRUSH_SHAPE,
+                                               static_cast<int>(_approvalBrushShape)).toInt();
+    if (brushShapeValue == static_cast<int>(ApprovalBrushShape::Circle)) {
+        _approvalBrushShape = ApprovalBrushShape::Circle;
+    } else {
+        _approvalBrushShape = ApprovalBrushShape::Rectangle;
+    }
 
     _approvalMaskOpacity = settings.value(segmentation::APPROVAL_MASK_OPACITY, _approvalMaskOpacity).toInt();
     _approvalMaskOpacity = std::clamp(_approvalMaskOpacity, 0, 100);
@@ -471,6 +652,8 @@ void SegmentationApprovalMaskPanel::restoreSettings(QSettings& settings)
     if (QColor::isValidColorName(colorName)) {
         _approvalBrushColor = QColor::fromString(colorName);
     }
+    _selectedApprovalMaskId = settings.value(segmentation::APPROVAL_SELECTED_MASK_ID,
+                                             _selectedApprovalMaskId).toString();
     _showApprovalMask = settings.value(segmentation::SHOW_APPROVAL_MASK, _showApprovalMask).toBool();
 
     // Auto-approval settings — fall back to legacy key if new key not found
@@ -528,11 +711,31 @@ void SegmentationApprovalMaskPanel::syncUiState()
         const QSignalBlocker blocker(_spinAutoApprovalMaxDistance);
         _spinAutoApprovalMaxDistance->setValue(static_cast<double>(_autoApprovalMaxDistance));
     }
+    if (_comboApprovalMask) {
+        const QSignalBlocker blocker(_comboApprovalMask);
+        const int idx = _comboApprovalMask->findData(_selectedApprovalMaskId);
+        if (idx >= 0) {
+            _comboApprovalMask->setCurrentIndex(idx);
+        } else if (_comboApprovalMask->count() > 0) {
+            _comboApprovalMask->setCurrentIndex(0);
+        }
+    }
+    if (_comboApprovalBrushShape) {
+        const QSignalBlocker blocker(_comboApprovalBrushShape);
+        const int idx = _comboApprovalBrushShape->findData(static_cast<int>(_approvalBrushShape));
+        if (idx >= 0) {
+            _comboApprovalBrushShape->setCurrentIndex(idx);
+        }
+    }
     if (_sliderApprovalMaskOpacity) {
         const QSignalBlocker blocker(_sliderApprovalMaskOpacity);
         _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
     }
     if (_lblApprovalMaskOpacity) {
         _lblApprovalMaskOpacity->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
+    }
+    if (_btnApprovalColor) {
+        _btnApprovalColor->setStyleSheet(
+            QStringLiteral("background-color: %1; border: 1px solid #888;").arg(_approvalBrushColor.name()));
     }
 }

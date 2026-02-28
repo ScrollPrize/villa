@@ -124,12 +124,22 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::approvalBrushRadiusChanged);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalBrushDepthChanged,
             this, &SegmentationWidget::approvalBrushDepthChanged);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalBrushShapeChanged,
+            this, &SegmentationWidget::approvalBrushShapeChanged);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalMaskOpacityChanged,
             this, &SegmentationWidget::approvalMaskOpacityChanged);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalBrushColorChanged,
             this, &SegmentationWidget::approvalBrushColorChanged);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalStrokesUndoRequested,
             this, &SegmentationWidget::approvalStrokesUndoRequested);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalMaskSelected,
+            this, &SegmentationWidget::approvalMaskSelected);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalMaskCreateRequested,
+            this, &SegmentationWidget::approvalMaskCreateRequested);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::copyMaskedForwardRequested,
+            this, &SegmentationWidget::copyMaskedForwardRequested);
+    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::copyMaskedBackwardRequested,
+            this, &SegmentationWidget::copyMaskedBackwardRequested);
 
     // Forward cell reopt panel signals
     connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptModeChanged,
@@ -288,8 +298,10 @@ float SegmentationWidget::autoApprovalMaxDistance() const { return _approvalMask
 
 float SegmentationWidget::approvalBrushRadius() const { return _approvalMaskPanel->approvalBrushRadius(); }
 float SegmentationWidget::approvalBrushDepth() const { return _approvalMaskPanel->approvalBrushDepth(); }
+ApprovalBrushShape SegmentationWidget::approvalBrushShape() const { return _approvalMaskPanel->approvalBrushShape(); }
 int SegmentationWidget::approvalMaskOpacity() const { return _approvalMaskPanel->approvalMaskOpacity(); }
 QColor SegmentationWidget::approvalBrushColor() const { return _approvalMaskPanel->approvalBrushColor(); }
+QString SegmentationWidget::selectedApprovalMaskId() const { return _approvalMaskPanel->selectedApprovalMaskId(); }
 
 void SegmentationWidget::setShowApprovalMask(bool enabled) { _approvalMaskPanel->setShowApprovalMask(enabled); syncUiState(); }
 void SegmentationWidget::setEditApprovedMask(bool enabled) { _approvalMaskPanel->setEditApprovedMask(enabled); }
@@ -302,8 +314,16 @@ void SegmentationWidget::setAutoApprovalMaxDistance(float distance) { _approvalM
 
 void SegmentationWidget::setApprovalBrushRadius(float radius) { _approvalMaskPanel->setApprovalBrushRadius(radius); }
 void SegmentationWidget::setApprovalBrushDepth(float depth) { _approvalMaskPanel->setApprovalBrushDepth(depth); }
+void SegmentationWidget::setApprovalBrushShape(ApprovalBrushShape shape) { _approvalMaskPanel->setApprovalBrushShape(shape); }
 void SegmentationWidget::setApprovalMaskOpacity(int opacity) { _approvalMaskPanel->setApprovalMaskOpacity(opacity); }
 void SegmentationWidget::setApprovalBrushColor(const QColor& color) { _approvalMaskPanel->setApprovalBrushColor(color); }
+void SegmentationWidget::setApprovalMaskOptions(const QVector<QPair<QString, QString>>& options,
+                                                const QString& selectedMaskId)
+{
+    _approvalMaskPanel->setApprovalMaskOptions(options);
+    _approvalMaskPanel->setSelectedApprovalMaskId(selectedMaskId);
+}
+void SegmentationWidget::setSelectedApprovalMaskId(const QString& maskId) { _approvalMaskPanel->setSelectedApprovalMaskId(maskId); }
 
 // --- Cell reoptimization delegations ---
 

@@ -18,6 +18,7 @@
 #include <limits>
 
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -45,6 +46,18 @@ constexpr qreal kRadiusCircleZ = 80.0;
 
 // Full opacity for mask pixels - the slider controls overall opacity via QGraphicsPixmapItem::setOpacity
 constexpr int kApprovalMaskAlpha = 255;
+
+std::filesystem::path resolveApprovalMaskPath(const QuadSurface* surface,
+                                              const std::filesystem::path& requestedPath)
+{
+    if (!surface || surface->path.empty()) {
+        return {};
+    }
+    if (!requestedPath.empty()) {
+        return requestedPath;
+    }
+    return surface->path / "approval.tif";
+}
 }
 
 bool SegmentationOverlayController::State::operator==(const State& rhs) const
@@ -134,6 +147,7 @@ bool SegmentationOverlayController::State::operator==(const State& rhs) const
            approvalStrokeSegments == rhs.approvalStrokeSegments &&
            maskEqual(approvalCurrentStroke, rhs.approvalCurrentStroke) &&
            floatEqual(approvalBrushRadius, rhs.approvalBrushRadius) &&
+           approvalBrushShape == rhs.approvalBrushShape &&
            paintingApproval == rhs.paintingApproval &&
            approvalBrushColor == rhs.approvalBrushColor &&
            surface == rhs.surface &&
@@ -193,14 +207,16 @@ void SegmentationOverlayController::applyState(const State& state)
     refreshAll();
 }
 
-void SegmentationOverlayController::loadApprovalMaskImage(QuadSurface* surface)
+void SegmentationOverlayController::loadApprovalMaskImage(QuadSurface* surface,
+                                                          const std::filesystem::path& maskPath)
 {
     // If there are unsaved pending changes and a debounced save is active,
     // save immediately before loading new data to avoid losing auto-approvals
     if (_approvalSaveTimer && _approvalSaveTimer->isActive() && _approvalSaveSurface) {
         _approvalSaveTimer->stop();
-        saveApprovalMaskToSurface(_approvalSaveSurface);
+        saveApprovalMaskToSurface(_approvalSaveSurface, _approvalSaveMaskPath);
         _approvalSaveSurface = nullptr;
+        _approvalSaveMaskPath.clear();
     }
 
     // Clear undo stack - old entries are for a different surface
@@ -212,7 +228,12 @@ void SegmentationOverlayController::loadApprovalMaskImage(QuadSurface* surface)
         return;
     }
 
-    cv::Mat approvalMask = surface->channel("approval", SURF_CHANNEL_NORESIZE);
+    const std::filesystem::path resolvedMaskPath = resolveApprovalMaskPath(surface, maskPath);
+
+    cv::Mat approvalMask;
+    if (!resolvedMaskPath.empty() && std::filesystem::exists(resolvedMaskPath)) {
+        approvalMask = cv::imread(resolvedMaskPath.string(), cv::IMREAD_UNCHANGED);
+    }
     if (approvalMask.empty()) {
         // Create new empty mask
         const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
@@ -221,7 +242,13 @@ void SegmentationOverlayController::loadApprovalMaskImage(QuadSurface* surface)
             _pendingApprovalMaskImage = QImage();
             return;
         }
-        approvalMask = cv::Mat_<uint8_t>(points->size(), static_cast<uint8_t>(0));
+        approvalMask = cv::Mat_<cv::Vec3b>(points->size(), cv::Vec3b(0, 0, 0));
+    }
+
+    if (approvalMask.channels() == 4) {
+        cv::Mat bgrMask;
+        cv::cvtColor(approvalMask, bgrMask, cv::COLOR_BGRA2BGR);
+        approvalMask = bgrMask;
     }
 
     // Convert saved mask to ARGB32_Premultiplied format
@@ -403,7 +430,8 @@ void SegmentationOverlayController::paintApprovalMaskDirect(
     invalidatePlaneIntersections();
 }
 
-void SegmentationOverlayController::saveApprovalMaskToSurface(QuadSurface* surface)
+void SegmentationOverlayController::saveApprovalMaskToSurface(QuadSurface* surface,
+                                                              const std::filesystem::path& maskPath)
 {
     if (!surface || (_savedApprovalMaskImage.isNull() && _pendingApprovalMaskImage.isNull())) {
         return;
@@ -450,9 +478,22 @@ void SegmentationOverlayController::saveApprovalMaskToSurface(QuadSurface* surfa
         }
     }
 
-    // Save to surface
-    surface->setChannel("approval", approvalMask);
-    surface->saveOverwrite();
+    const std::filesystem::path resolvedMaskPath = resolveApprovalMaskPath(surface, maskPath);
+    if (resolvedMaskPath.empty()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(resolvedMaskPath.parent_path(), ec);
+    if (ec) {
+        qWarning() << "saveApprovalMaskToSurface: failed to create mask directory:"
+                   << QString::fromStdString(resolvedMaskPath.parent_path().string());
+        return;
+    }
+    if (!cv::imwrite(resolvedMaskPath.string(), approvalMask)) {
+        qWarning() << "saveApprovalMaskToSurface: failed to write mask:"
+                   << QString::fromStdString(resolvedMaskPath.string());
+        return;
+    }
 
     // Update saved image to match what we just wrote and clear pending
     for (int row = 0; row < height; ++row) {
@@ -573,9 +614,10 @@ void SegmentationOverlayController::clearApprovalMaskUndoHistory()
     _approvalMaskUndoStack.clear();
 }
 
-void SegmentationOverlayController::scheduleDebouncedSave(QuadSurface* surface)
+void SegmentationOverlayController::scheduleDebouncedSave(QuadSurface* surface,
+                                                          const std::filesystem::path& maskPath)
 {
-    scheduleApprovalMaskSave(surface);
+    scheduleApprovalMaskSave(surface, maskPath);
 }
 
 void SegmentationOverlayController::flushPendingApprovalMaskSave()
@@ -584,18 +626,21 @@ void SegmentationOverlayController::flushPendingApprovalMaskSave()
     // This ensures changes are saved to the correct surface before segment switching
     if (_approvalSaveTimer && _approvalSaveTimer->isActive() && _approvalSaveSurface) {
         _approvalSaveTimer->stop();
-        saveApprovalMaskToSurface(_approvalSaveSurface);
+        saveApprovalMaskToSurface(_approvalSaveSurface, _approvalSaveMaskPath);
         _approvalSaveSurface = nullptr;
+        _approvalSaveMaskPath.clear();
     }
 }
 
-void SegmentationOverlayController::scheduleApprovalMaskSave(QuadSurface* surface)
+void SegmentationOverlayController::scheduleApprovalMaskSave(QuadSurface* surface,
+                                                             const std::filesystem::path& maskPath)
 {
     if (!surface) {
         return;
     }
 
     _approvalSaveSurface = surface;
+    _approvalSaveMaskPath = maskPath;
 
     if (!_approvalSaveTimer) {
         _approvalSaveTimer = new QTimer(this);
@@ -613,8 +658,9 @@ void SegmentationOverlayController::performDebouncedApprovalSave()
         return;
     }
 
-    saveApprovalMaskToSurface(_approvalSaveSurface);
+    saveApprovalMaskToSurface(_approvalSaveSurface, _approvalSaveMaskPath);
     _approvalSaveSurface = nullptr;
+    _approvalSaveMaskPath.clear();
 }
 
 bool SegmentationOverlayController::isOverlayEnabledFor(CVolumeViewer* viewer) const
@@ -717,8 +763,9 @@ void SegmentationOverlayController::onSurfaceChanged(std::string name, std::shar
     // save immediately before the surface pointer becomes dangling
     if (_approvalSaveTimer && _approvalSaveTimer->isActive() && _approvalSaveSurface) {
         _approvalSaveTimer->stop();
-        saveApprovalMaskToSurface(_approvalSaveSurface);
+        saveApprovalMaskToSurface(_approvalSaveSurface, _approvalSaveMaskPath);
         _approvalSaveSurface = nullptr;
+        _approvalSaveMaskPath.clear();
     }
 
     if (name == "segmentation") {
@@ -1130,7 +1177,6 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
             }
         } else {
             // For segmentation/flattened view: convert world position to scene coordinates
-            // Draw a rectangle (cylinder side view): Width = 2 * radius (diameter), Height = depth
             const float brushDepthNative = state.approvalBrushDepth;
             const float thisViewerScale = viewer->getCurrentScale();
 
@@ -1150,70 +1196,77 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
             // Convert grid units to scene pixels using viewer scale
             const qreal gridToScene = thisViewerScale / surfaceScale;
 
+            ViewerOverlayControllerBase::OverlayStyle style;
+            style.penColor = state.paintingApproval ? QColor(0, 0, 255) : QColor(255, 0, 0);
+            style.penWidth = 6.0;
+            style.brushColor = Qt::transparent;
+            style.penStyle = Qt::DashLine;
+            style.dashPattern = {4.0, 4.0};  // Dashed pattern
+            style.z = kApprovalMaskZ + 10.0;
+
             // Add a small offset to account for painting extending to cell edges
             constexpr float gridOffset = 0.5f;
-            const qreal rectHalfWidth = (gridRadius + gridOffset) * gridToScene;
-            const qreal rectHalfHeight = (gridDepth / 2.0f + gridOffset) * gridToScene;
-
-            if (rectHalfWidth > 1.0 && rectHalfHeight > 1.0) {
-                ViewerOverlayControllerBase::OverlayStyle style;
-                style.penColor = state.paintingApproval ? QColor(0, 0, 255) : QColor(255, 0, 0);
-                style.penWidth = 6.0;
-                style.brushColor = Qt::transparent;
-                style.penStyle = Qt::DashLine;
-                style.dashPattern = {4.0, 4.0};  // Dashed pattern
-                style.z = kApprovalMaskZ + 10.0;
-
-                // Determine rectangle orientation based on cylinder axis (plane normal)
-                qreal rotationDegrees = 0.0;
-                if (state.approvalHoverPlaneNormal) {
-                    // When hovering in XY/XZ/YZ planes, orient the rectangle along the cylinder axis
-                    // Project the cylinder axis (plane normal) into the flattened view
-                    const cv::Vec3f& normal = *state.approvalHoverPlaneNormal;
-                    const cv::Vec3f axisEndWorld = hoverWorld + normal * brushDepthNative;
-                    const QPointF axisEndScene = viewer->volumePointToScene(axisEndWorld);
-
-                    // Compute angle from center to axis end
-                    const qreal dx = axisEndScene.x() - sceneCenter.x();
-                    const qreal dy = axisEndScene.y() - sceneCenter.y();
-                    if (std::abs(dx) > 0.1 || std::abs(dy) > 0.1) {
-                        // atan2 gives angle from positive X axis, we want rotation where
-                        // the rectangle's height (Y) aligns with the cylinder axis
-                        rotationDegrees = std::atan2(dy, dx) * 180.0 / M_PI - 90.0;
-                    }
+            if (state.approvalBrushShape == ApprovalBrushShape::Circle) {
+                const qreal circleRadius = (gridRadius + gridOffset) * gridToScene;
+                if (circleRadius > 1.0) {
+                    builder.addCircle(sceneCenter, circleRadius, false, style);
                 }
+            } else {
+                const qreal rectHalfWidth = (gridRadius + gridOffset) * gridToScene;
+                const qreal rectHalfHeight = (gridDepth / 2.0f + gridOffset) * gridToScene;
 
-                if (std::abs(rotationDegrees) < 0.1) {
-                    // No rotation needed - draw axis-aligned rectangle
-                    const QRectF rect(sceneCenter.x() - rectHalfWidth,
-                                      sceneCenter.y() - rectHalfHeight,
-                                      rectHalfWidth * 2.0,
-                                      rectHalfHeight * 2.0);
-                    builder.addRect(rect, false, style);
-                } else {
-                    // Draw rotated rectangle as a closed line strip
-                    const qreal angleRad = rotationDegrees * M_PI / 180.0;
-                    const qreal cosA = std::cos(angleRad);
-                    const qreal sinA = std::sin(angleRad);
+                if (rectHalfWidth > 1.0 && rectHalfHeight > 1.0) {
+                    // Determine rectangle orientation based on cylinder axis (plane normal)
+                    qreal rotationDegrees = 0.0;
+                    if (state.approvalHoverPlaneNormal) {
+                        // When hovering in XY/XZ/YZ planes, orient the rectangle along the cylinder axis
+                        // Project the cylinder axis (plane normal) into the flattened view
+                        const cv::Vec3f& normal = *state.approvalHoverPlaneNormal;
+                        const cv::Vec3f axisEndWorld = hoverWorld + normal * brushDepthNative;
+                        const QPointF axisEndScene = viewer->volumePointToScene(axisEndWorld);
 
-                    // Rectangle corners before rotation (centered at origin)
-                    // Width along X, Height along Y
-                    const std::array<QPointF, 4> corners = {{
-                        {-rectHalfWidth, -rectHalfHeight},
-                        { rectHalfWidth, -rectHalfHeight},
-                        { rectHalfWidth,  rectHalfHeight},
-                        {-rectHalfWidth,  rectHalfHeight}
-                    }};
-
-                    std::vector<QPointF> points;
-                    points.reserve(4);
-                    for (const auto& corner : corners) {
-                        // Rotate and translate
-                        const qreal rx = corner.x() * cosA - corner.y() * sinA + sceneCenter.x();
-                        const qreal ry = corner.x() * sinA + corner.y() * cosA + sceneCenter.y();
-                        points.emplace_back(rx, ry);
+                        // Compute angle from center to axis end
+                        const qreal dx = axisEndScene.x() - sceneCenter.x();
+                        const qreal dy = axisEndScene.y() - sceneCenter.y();
+                        if (std::abs(dx) > 0.1 || std::abs(dy) > 0.1) {
+                            // atan2 gives angle from positive X axis, we want rotation where
+                            // the rectangle's height (Y) aligns with the cylinder axis
+                            rotationDegrees = std::atan2(dy, dx) * 180.0 / M_PI - 90.0;
+                        }
                     }
-                    builder.addLineStrip(points, true, style);
+
+                    if (std::abs(rotationDegrees) < 0.1) {
+                        // No rotation needed - draw axis-aligned rectangle
+                        const QRectF rect(sceneCenter.x() - rectHalfWidth,
+                                          sceneCenter.y() - rectHalfHeight,
+                                          rectHalfWidth * 2.0,
+                                          rectHalfHeight * 2.0);
+                        builder.addRect(rect, false, style);
+                    } else {
+                        // Draw rotated rectangle as a closed line strip
+                        const qreal angleRad = rotationDegrees * M_PI / 180.0;
+                        const qreal cosA = std::cos(angleRad);
+                        const qreal sinA = std::sin(angleRad);
+
+                        // Rectangle corners before rotation (centered at origin)
+                        // Width along X, Height along Y
+                        const std::array<QPointF, 4> corners = {{
+                            {-rectHalfWidth, -rectHalfHeight},
+                            { rectHalfWidth, -rectHalfHeight},
+                            { rectHalfWidth,  rectHalfHeight},
+                            {-rectHalfWidth,  rectHalfHeight}
+                        }};
+
+                        std::vector<QPointF> points;
+                        points.reserve(4);
+                        for (const auto& corner : corners) {
+                            // Rotate and translate
+                            const qreal rx = corner.x() * cosA - corner.y() * sinA + sceneCenter.x();
+                            const qreal ry = corner.x() * sinA + corner.y() * cosA + sceneCenter.y();
+                            points.emplace_back(rx, ry);
+                        }
+                        builder.addLineStrip(points, true, style);
+                    }
                 }
             }
         }

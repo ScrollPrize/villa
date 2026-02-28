@@ -1032,6 +1032,27 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
                 std::filesystem::copy_options::overwrite_existing, copyEc);
             // Ignore errors - corrections are not critical for surface integrity
         }
+
+        // Preserve legacy approval mask file when it is not part of this save payload.
+        std::filesystem::path legacyApprovalFile = final_path / "approval.tif";
+        if (std::filesystem::exists(legacyApprovalFile) &&
+            !std::filesystem::exists(temp_path / "approval.tif")) {
+            std::error_code copyEc;
+            std::filesystem::copy_file(legacyApprovalFile, temp_path / "approval.tif",
+                std::filesystem::copy_options::overwrite_existing, copyEc);
+        }
+
+        // Preserve additional per-mask files.
+        std::filesystem::path masksDir = final_path / "masks";
+        if (std::filesystem::exists(masksDir) && std::filesystem::is_directory(masksDir) &&
+            !std::filesystem::exists(temp_path / "masks")) {
+            std::error_code copyEc;
+            std::filesystem::copy(
+                masksDir,
+                temp_path / "masks",
+                std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing,
+                copyEc);
+        }
     }
 
     // Atomically move the saved data to the final location

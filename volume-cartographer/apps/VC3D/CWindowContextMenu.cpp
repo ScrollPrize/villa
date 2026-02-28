@@ -2,6 +2,7 @@
 #include "CSurfaceCollection.hpp"
 #include "SurfacePanelController.hpp"
 #include "VCSettings.hpp"
+#include "segmentation/SegmentationModule.hpp"
 
 #include <functional>
 #include <algorithm>
@@ -1129,7 +1130,52 @@ void CWindow::onAddOverlap(const std::string& segmentId)
     statusBar()->showMessage(tr("Adding overlap for segment: %1").arg(QString::fromStdString(segmentId)), 5000);
 }
 
-void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
+void CWindow::onMaskedNeighborCopyRequested(bool forward)
+{
+    if (!_segmentationModule) {
+        QMessageBox::warning(this, tr("Error"), tr("Segmentation module is unavailable."));
+        return;
+    }
+
+    std::shared_ptr<Surface> surfaceHolder;
+    QuadSurface* activeSurface = _segmentationModule->activeBaseSurface();
+    if (!activeSurface && _surf_col) {
+        surfaceHolder = _surf_col->surface("segmentation");
+        activeSurface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
+    }
+
+    if (!activeSurface || activeSurface->id.empty() || activeSurface->path.empty()) {
+        QMessageBox::warning(this, tr("Error"), tr("No active segment selected for masked copy."));
+        return;
+    }
+
+    _segmentationModule->saveApprovalMaskToDisk();
+
+    const std::filesystem::path maskPath = _segmentationModule->activeApprovalMaskPath(activeSurface);
+    if (maskPath.empty()) {
+        QMessageBox::warning(this, tr("Error"), tr("No approval mask selected for the active segment."));
+        return;
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(maskPath, ec) || ec) {
+        QMessageBox::warning(this,
+                             tr("Error"),
+                             tr("Selected approval mask does not exist on disk:\n%1")
+                                 .arg(QString::fromStdString(maskPath.string())));
+        return;
+    }
+
+    onNeighborCopyRequested(QString::fromStdString(activeSurface->id),
+                            forward,
+                            QString::fromStdString(maskPath.string()),
+                            true);
+}
+
+void CWindow::onNeighborCopyRequested(const QString& segmentId,
+                                      bool copyOut,
+                                      const QString& copyMaskPath,
+                                      bool maskedOnly)
 {
     if (!fVpkg) {
         QMessageBox::warning(this, tr("Error"), tr("No volume package loaded."));
@@ -1153,97 +1199,131 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
         return;
     }
 
-    QVector<NeighborCopyVolumeOption> volumeOptions;
-    for (const auto& volumeId : fVpkg->volumeIDs()) {
-        auto volume = fVpkg->volume(volumeId);
-        if (!volume) {
-            continue;
-        }
-        NeighborCopyVolumeOption option;
-        option.id = QString::fromStdString(volumeId);
-        option.name = QString::fromStdString(volume->name());
-        option.path = QString::fromStdString(volume->path().string());
-        volumeOptions.push_back(option);
-    }
-
-    if (volumeOptions.isEmpty()) {
-        QMessageBox::warning(this, tr("Error"), tr("No volumes available in the volume package."));
+    const QString surfacePath = QString::fromStdString(surf->path.string());
+    const QString trimmedCopyMaskPath = copyMaskPath.trimmed();
+    const bool maskedCopyEnabled = !trimmedCopyMaskPath.isEmpty();
+    const bool singlePass = maskedOnly;
+    if (singlePass && !maskedCopyEnabled) {
+        QMessageBox::warning(this, tr("Error"), tr("Masked copy requires a selected mask path."));
         return;
     }
 
-    QString defaultVolumeId = volumeOptions.front().id;
-    if (!currentVolumeId.empty()) {
-        const QString currentId = QString::fromStdString(currentVolumeId);
-        for (const auto& opt : volumeOptions) {
-            if (opt.id == currentId) {
-                defaultVolumeId = currentId;
-                break;
-            }
-        }
-    }
-
-    const QString surfacePath = QString::fromStdString(surf->path.string());
     QString volpkgRoot = fVpkgPath;
     if (volpkgRoot.isEmpty()) {
         volpkgRoot = QString::fromStdString(fVpkg->getVolpkgDirectory());
     }
-    QString defaultOutputDir = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
-
-    NeighborCopyDialog dlg(this, surfacePath, volumeOptions, defaultVolumeId, defaultOutputDir);
-    if (dlg.exec() != QDialog::Accepted) {
-        statusBar()->showMessage(tr("Copy %1 cancelled").arg(copyOut ? tr("out") : tr("in")), 3000);
-        return;
-    }
-
-    QString selectedVolumePath = dlg.selectedVolumePath();
-    if (selectedVolumePath.isEmpty()) {
-        QMessageBox::warning(this, tr("Error"), tr("No target volume selected."));
-        return;
-    }
-
-    QString outputDirPath = dlg.outputPath().trimmed();
-    if (outputDirPath.isEmpty()) {
-        QMessageBox::warning(this, tr("Error"), tr("Output path cannot be empty."));
-        return;
-    }
-    QDir outDir(outputDirPath);
-    if (!outDir.exists() && !outDir.mkpath(".")) {
-        QMessageBox::warning(this, tr("Error"), tr("Failed to create output directory: %1").arg(outputDirPath));
-        return;
-    }
-    outputDirPath = outDir.absolutePath();
-
     const QString normalGridPath = QDir(volpkgRoot).filePath(QStringLiteral("normal_grids"));
 
+    QString selectedVolumePath;
+    QString outputDirPath;
+    int pass2OmpThreads = 1;
     QJsonObject pass1Params;
-    pass1Params["normal_grid_path"] = normalGridPath;
-    pass1Params["neighbor_dir"] = copyOut ? QStringLiteral("out") : QStringLiteral("in");
-    pass1Params["neighbor_max_distance"] = dlg.neighborMaxDistance();
-    pass1Params["mode"] = QStringLiteral("gen_neighbor");
-    pass1Params["neighbor_min_clearance"] = dlg.neighborMinClearance();
-    pass1Params["neighbor_fill"] = dlg.neighborFill();
-    pass1Params["neighbor_interp_window"] = dlg.neighborInterpWindow();
-    pass1Params["generations"] = dlg.generations();
-    pass1Params["neighbor_spike_window"] = dlg.neighborSpikeWindow();
-
-    auto pass1JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass1_XXXXXX.json"));
-    if (!pass1JsonFile->open()) {
-        QMessageBox::warning(this, tr("Error"), tr("Failed to create temporary params file."));
-        return;
-    }
-    pass1JsonFile->write(QJsonDocument(pass1Params).toJson(QJsonDocument::Indented));
-    pass1JsonFile->flush();
-
     QJsonObject pass2Params;
-    pass2Params["normal_grid_path"] = normalGridPath;
-    pass2Params["max_gen"] = 1;
-    pass2Params["generations"] = 1;
-    pass2Params["resume_local_opt_step"] = dlg.resumeLocalOptStep();
-    pass2Params["resume_local_opt_radius"] = dlg.resumeLocalOptRadius();
-    pass2Params["resume_local_max_iters"] = dlg.resumeLocalMaxIters();
-    pass2Params["resume_local_dense_qr"] = dlg.resumeLocalDenseQr();
 
-    {
+    if (singlePass) {
+        std::shared_ptr<Volume> targetVolume;
+        const std::string preferredVolumeId = !_segmentationGrowthVolumeId.empty()
+                                                  ? _segmentationGrowthVolumeId
+                                                  : currentVolumeId;
+        if (!preferredVolumeId.empty()) {
+            try {
+                targetVolume = fVpkg->volume(preferredVolumeId);
+            } catch (const std::out_of_range&) {
+                targetVolume.reset();
+            }
+        }
+        if (!targetVolume && currentVolume) {
+            targetVolume = currentVolume;
+        }
+        if (!targetVolume) {
+            QMessageBox::warning(this, tr("Error"), tr("No target volume selected."));
+            return;
+        }
+
+        selectedVolumePath = QString::fromStdString(targetVolume->path().string());
+        outputDirPath = QString::fromStdString(surf->path.parent_path().string());
+        if (outputDirPath.isEmpty()) {
+            QMessageBox::warning(this, tr("Error"), tr("Unable to resolve output directory for active segment."));
+            return;
+        }
+
+        pass1Params["normal_grid_path"] = normalGridPath;
+        pass1Params["neighbor_dir"] = copyOut ? QStringLiteral("out") : QStringLiteral("in");
+        pass1Params["neighbor_max_distance"] = 200;
+        pass1Params["mode"] = QStringLiteral("gen_neighbor");
+        pass1Params["neighbor_min_clearance"] = 4;
+        pass1Params["neighbor_fill"] = true;
+        pass1Params["neighbor_interp_window"] = 5;
+        pass1Params["generations"] = 2;
+        pass1Params["neighbor_spike_window"] = 2;
+        pass1Params["copy_mask"] = trimmedCopyMaskPath;
+    } else {
+        QVector<NeighborCopyVolumeOption> volumeOptions;
+        for (const auto& volumeId : fVpkg->volumeIDs()) {
+            auto volume = fVpkg->volume(volumeId);
+            if (!volume) {
+                continue;
+            }
+            NeighborCopyVolumeOption option;
+            option.id = QString::fromStdString(volumeId);
+            option.name = QString::fromStdString(volume->name());
+            option.path = QString::fromStdString(volume->path().string());
+            volumeOptions.push_back(option);
+        }
+
+        if (volumeOptions.isEmpty()) {
+            QMessageBox::warning(this, tr("Error"), tr("No volumes available in the volume package."));
+            return;
+        }
+
+        QString defaultVolumeId = volumeOptions.front().id;
+        if (!currentVolumeId.empty()) {
+            const QString currentId = QString::fromStdString(currentVolumeId);
+            for (const auto& opt : volumeOptions) {
+                if (opt.id == currentId) {
+                    defaultVolumeId = currentId;
+                    break;
+                }
+            }
+        }
+
+        QString defaultOutputDir = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
+        NeighborCopyDialog dlg(this, surfacePath, volumeOptions, defaultVolumeId, defaultOutputDir);
+        if (dlg.exec() != QDialog::Accepted) {
+            statusBar()->showMessage(tr("Copy %1 cancelled").arg(copyOut ? tr("out") : tr("in")), 3000);
+            return;
+        }
+
+        selectedVolumePath = dlg.selectedVolumePath();
+        if (selectedVolumePath.isEmpty()) {
+            QMessageBox::warning(this, tr("Error"), tr("No target volume selected."));
+            return;
+        }
+
+        outputDirPath = dlg.outputPath().trimmed();
+        pass2OmpThreads = dlg.pass2OmpThreads();
+
+        pass1Params["normal_grid_path"] = normalGridPath;
+        pass1Params["neighbor_dir"] = copyOut ? QStringLiteral("out") : QStringLiteral("in");
+        pass1Params["neighbor_max_distance"] = dlg.neighborMaxDistance();
+        pass1Params["mode"] = QStringLiteral("gen_neighbor");
+        pass1Params["neighbor_min_clearance"] = dlg.neighborMinClearance();
+        pass1Params["neighbor_fill"] = dlg.neighborFill();
+        pass1Params["neighbor_interp_window"] = dlg.neighborInterpWindow();
+        pass1Params["generations"] = dlg.generations();
+        pass1Params["neighbor_spike_window"] = dlg.neighborSpikeWindow();
+        if (maskedCopyEnabled) {
+            pass1Params["copy_mask"] = trimmedCopyMaskPath;
+        }
+
+        pass2Params["normal_grid_path"] = normalGridPath;
+        pass2Params["max_gen"] = 1;
+        pass2Params["generations"] = 1;
+        pass2Params["resume_local_opt_step"] = dlg.resumeLocalOptStep();
+        pass2Params["resume_local_opt_radius"] = dlg.resumeLocalOptRadius();
+        pass2Params["resume_local_max_iters"] = dlg.resumeLocalMaxIters();
+        pass2Params["resume_local_dense_qr"] = dlg.resumeLocalDenseQr();
+
         QString pass2Error;
         auto extraParams = dlg.pass2TracerParamsJson(&pass2Error);
         if (!pass2Error.isEmpty()) {
@@ -1257,13 +1337,35 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
         }
     }
 
-    auto pass2JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass2_XXXXXX.json"));
-    if (!pass2JsonFile->open()) {
-        QMessageBox::warning(this, tr("Error"), tr("Failed to create temporary params file for pass 2."));
+    if (outputDirPath.isEmpty()) {
+        QMessageBox::warning(this, tr("Error"), tr("Output path cannot be empty."));
         return;
     }
-    pass2JsonFile->write(QJsonDocument(pass2Params).toJson(QJsonDocument::Indented));
-    pass2JsonFile->flush();
+    QDir outDir(outputDirPath);
+    if (!outDir.exists() && !outDir.mkpath(".")) {
+        QMessageBox::warning(this, tr("Error"), tr("Failed to create output directory: %1").arg(outputDirPath));
+        return;
+    }
+    outputDirPath = outDir.absolutePath();
+
+    auto pass1JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass1_XXXXXX.json"));
+    if (!pass1JsonFile->open()) {
+        QMessageBox::warning(this, tr("Error"), tr("Failed to create temporary params file."));
+        return;
+    }
+    pass1JsonFile->write(QJsonDocument(pass1Params).toJson(QJsonDocument::Indented));
+    pass1JsonFile->flush();
+
+    std::unique_ptr<QTemporaryFile> pass2JsonFile;
+    if (!singlePass) {
+        pass2JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass2_XXXXXX.json"));
+        if (!pass2JsonFile->open()) {
+            QMessageBox::warning(this, tr("Error"), tr("Failed to create temporary params file for pass 2."));
+            return;
+        }
+        pass2JsonFile->write(QJsonDocument(pass2Params).toJson(QJsonDocument::Indented));
+        pass2JsonFile->flush();
+    }
 
     _neighborCopyJob = NeighborCopyJob{};
     auto& job = *_neighborCopyJob;
@@ -1273,10 +1375,15 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
     job.resumeSurfacePath = surfacePath;
     job.outputDir = outputDirPath;
     job.pass1JsonPath = pass1JsonFile->fileName();
-    job.pass2JsonPath = pass2JsonFile->fileName();
-    job.directoryPrefix = copyOut ? QStringLiteral("neighbor_out_") : QStringLiteral("neighbor_in_");
+    job.pass2JsonPath = pass2JsonFile ? pass2JsonFile->fileName() : QString();
+    if (maskedCopyEnabled) {
+        job.directoryPrefix = copyOut ? QStringLiteral("neighbor_copy_out_") : QStringLiteral("neighbor_copy_in_");
+    } else {
+        job.directoryPrefix = copyOut ? QStringLiteral("neighbor_out_") : QStringLiteral("neighbor_in_");
+    }
     job.copyOut = copyOut;
-    job.pass2OmpThreads = dlg.pass2OmpThreads();
+    job.maskedOnly = singlePass;
+    job.pass2OmpThreads = pass2OmpThreads;
     job.baselineEntries = snapshotDirectoryEntries(outputDirPath);
     job.pass1JsonFile = std::move(pass1JsonFile);
     job.pass2JsonFile = std::move(pass2JsonFile);
@@ -1293,10 +1400,17 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
     }
 
     const QString dirName = QFileInfo(job.resumeSurfacePath).fileName();
-    statusBar()->showMessage(tr("Copy %1 started for %2")
-                                 .arg(copyOut ? tr("out") : tr("in"))
-                                 .arg(dirName.isEmpty() ? segmentId : dirName),
-                             5000);
+    if (singlePass) {
+        statusBar()->showMessage(tr("Masked copy %1 started for %2")
+                                     .arg(copyOut ? tr("forward") : tr("backward"))
+                                     .arg(dirName.isEmpty() ? segmentId : dirName),
+                                 5000);
+    } else {
+        statusBar()->showMessage(tr("Copy %1 started for %2")
+                                     .arg(copyOut ? tr("out") : tr("in"))
+                                     .arg(dirName.isEmpty() ? segmentId : dirName),
+                                 5000);
+    }
 }
 
 void CWindow::onResumeLocalGrowPatchRequested(const QString& segmentId)
@@ -1967,13 +2081,26 @@ void CWindow::handleNeighborCopyToolFinished(bool success)
 
         job.generatedSurfacePath = newSurface;
         job.baselineEntries.insert(QFileInfo(newSurface).fileName());
-        job.stage = NeighborCopyJob::Stage::SecondPass;
+        if (job.maskedOnly) {
+            const QString surfaceName = QFileInfo(job.generatedSurfacePath).fileName();
+            const bool copyOut = job.copyOut;
+            _neighborCopyJob.reset();
+            _cmdRunner->setOmpThreads(-1);
+            if (_surfacePanel) {
+                _surfacePanel->reloadSurfacesFromDisk();
+            }
+            statusBar()->showMessage(tr("Masked copy %1 complete: %2")
+                                         .arg(copyOut ? tr("forward") : tr("backward"))
+                                         .arg(surfaceName),
+                                     5000);
+            return;
+        }
 
+        job.stage = NeighborCopyJob::Stage::SecondPass;
         statusBar()->showMessage(
             tr("Neighbor copy pass 1 complete: %1")
                 .arg(QFileInfo(newSurface).fileName()),
             3000);
-
         launchNeighborCopySecondPass();
         return;
     }

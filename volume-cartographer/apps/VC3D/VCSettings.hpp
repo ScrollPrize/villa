@@ -283,6 +283,8 @@ namespace segmentation {
     constexpr auto APPROVAL_BRUSH_DEPTH = "approval_brush_depth";
     constexpr auto APPROVAL_MASK_OPACITY = "approval_mask_opacity";
     constexpr auto APPROVAL_BRUSH_COLOR = "approval_brush_color";
+    constexpr auto APPROVAL_BRUSH_SHAPE = "approval_brush_shape";
+    constexpr auto APPROVAL_SELECTED_MASK_ID = "approval_selected_mask_id";
     constexpr auto SHOW_APPROVAL_MASK = "show_approval_mask";
     constexpr auto APPROVAL_AUTO_APPROVE_EDITS = "approval_auto_approve_edits";
 

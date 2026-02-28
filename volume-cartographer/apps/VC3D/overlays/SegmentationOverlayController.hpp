@@ -1,10 +1,12 @@
 #pragma once
 
 #include "ViewerOverlayControllerBase.hpp"
+#include "../segmentation/SegmentationCommon.hpp"
 
 #include <QColor>
 #include <chrono>
 #include <deque>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <vector>
@@ -71,6 +73,7 @@ public:
         std::vector<cv::Vec3f> approvalCurrentStroke;  // Current active stroke
         float approvalBrushRadius{50.0f};     // Cylinder radius (native voxels)
         float approvalBrushDepth{15.0f};      // Cylinder depth (native voxels)
+        ApprovalBrushShape approvalBrushShape{ApprovalBrushShape::Rectangle};
         float approvalEffectiveRadius{0.0f};  // For plane viewers: brush radius adjusted for distance
         bool paintingApproval{true};
         QColor approvalBrushColor{0, 255, 0};  // Current painting color (default pure green)
@@ -92,7 +95,8 @@ public:
     void applyState(const State& state);
 
     // Load approval mask from surface into QImage (call once when entering approval mode)
-    void loadApprovalMaskImage(QuadSurface* surface);
+    void loadApprovalMaskImage(QuadSurface* surface,
+                               const std::filesystem::path& maskPath = {});
 
     // Paint directly into the approval mask QImage (fast, in-place editing)
     // If useRectangle is true, paints a rectangle using widthSteps x heightSteps dimensions
@@ -109,10 +113,12 @@ public:
                                   bool isAutoApproval = false);
 
     // Save the approval mask QImage back to the surface
-    void saveApprovalMaskToSurface(QuadSurface* surface);
+    void saveApprovalMaskToSurface(QuadSurface* surface,
+                                   const std::filesystem::path& maskPath = {});
 
     // Schedule a debounced save of the approval mask (saves after kApprovalSaveDelayMs of inactivity)
-    void scheduleDebouncedSave(QuadSurface* surface);
+    void scheduleDebouncedSave(QuadSurface* surface,
+                               const std::filesystem::path& maskPath = {});
 
     // Flush any pending approval mask saves immediately (uses the surface from scheduleDebouncedSave)
     // Call this before segment switching to ensure changes are saved to the correct surface
@@ -226,8 +232,10 @@ private:
     // Debounce timer for auto-saving approval mask after painting
     QTimer* _approvalSaveTimer{nullptr};
     QuadSurface* _approvalSaveSurface{nullptr};  // Surface to save to when timer fires
+    std::filesystem::path _approvalSaveMaskPath;
     static constexpr int kApprovalSaveDelayMs = 500;
-    void scheduleApprovalMaskSave(QuadSurface* surface);
+    void scheduleApprovalMaskSave(QuadSurface* surface,
+                                  const std::filesystem::path& maskPath);
     void performDebouncedApprovalSave();
 
     // Approval mask overlay opacity (0-100, where 50 is default)

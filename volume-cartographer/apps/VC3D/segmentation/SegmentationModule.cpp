@@ -19,6 +19,7 @@
 #include <QLoggingCategory>
 #include <QPointer>
 #include <QString>
+#include <QUuid>
 #include <QTimer>
 
 #include <algorithm>
@@ -32,6 +33,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vc/core/util/QuadSurface.hpp"
+#include <opencv2/imgcodecs.hpp>
 
 
 Q_LOGGING_CATEGORY(lcSegModule, "vc.segmentation.module")
@@ -56,6 +58,10 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
     }
     surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
 }
+
+constexpr const char* kApprovalMaskCatalogMetaKey = "approval_masks_v2";
+constexpr const char* kDefaultApprovalMaskId = "default";
+constexpr const char* kDefaultApprovalMaskDisplayName = "approval";
 }
 
 void SegmentationModule::DragState::reset()
@@ -124,6 +130,8 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _autoApprovalRadius = _widget->autoApprovalRadius();
         _autoApprovalThreshold = _widget->autoApprovalThreshold();
         _autoApprovalMaxDistance = _widget->autoApprovalMaxDistance();
+        _approvalBrushShape = _widget->approvalBrushShape();
+        _selectedApprovalMaskId = _widget->selectedApprovalMaskId();
     }
 
     if (_overlay) {
@@ -204,6 +212,9 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
             scheduleCorrectionsAutoSave();
         });
     }
+
+    std::shared_ptr<Surface> approvalSurfaceHolder;
+    rebuildApprovalMaskCatalog(currentApprovalSurface(&approvalSurfaceHolder));
 
     updateCorrectionsWidget();
     updateCellReoptCollections();
@@ -357,12 +368,18 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::setApprovalMaskBrushRadius);
     connect(_widget, &SegmentationWidget::approvalBrushDepthChanged,
             this, &SegmentationModule::setApprovalBrushDepth);
+    connect(_widget, &SegmentationWidget::approvalBrushShapeChanged,
+            this, &SegmentationModule::setApprovalBrushShape);
     connect(_widget, &SegmentationWidget::approvalBrushColorChanged,
             this, &SegmentationModule::setApprovalBrushColor);
     connect(_widget, &SegmentationWidget::approvalMaskOpacityChanged,
             _overlay, &SegmentationOverlayController::setApprovalMaskOpacity);
     connect(_widget, &SegmentationWidget::approvalStrokesUndoRequested,
             this, &SegmentationModule::undoApprovalStroke);
+    connect(_widget, &SegmentationWidget::approvalMaskSelected,
+            this, &SegmentationModule::handleApprovalMaskSelected);
+    connect(_widget, &SegmentationWidget::approvalMaskCreateRequested,
+            this, &SegmentationModule::handleApprovalMaskCreateRequested);
     connect(_widget, &SegmentationWidget::cellReoptModeChanged,
             this, &SegmentationModule::setCellReoptimizationMode);
     connect(_widget, &SegmentationWidget::cellReoptMaxStepsChanged,
@@ -474,6 +491,254 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     updateAutosaveState();
 }
 
+std::filesystem::path SegmentationModule::defaultApprovalMaskPathFor(const QuadSurface* surface)
+{
+    if (!surface || surface->path.empty()) {
+        return {};
+    }
+    return surface->path / "approval.tif";
+}
+
+QuadSurface* SegmentationModule::currentApprovalSurface(std::shared_ptr<Surface>* holder) const
+{
+    if (holder) {
+        holder->reset();
+    }
+
+    if (_editManager && _editManager->hasSession()) {
+        return _editManager->baseSurface().get();
+    }
+
+    if (_surfaces) {
+        std::shared_ptr<Surface> surfaceHolder = _surfaces->surface("segmentation");
+        if (holder) {
+            *holder = surfaceHolder;
+        }
+        return dynamic_cast<QuadSurface*>(surfaceHolder.get());
+    }
+
+    return nullptr;
+}
+
+std::filesystem::path SegmentationModule::activeApprovalMaskPath(QuadSurface* surface) const
+{
+    if (!surface || surface->path.empty()) {
+        return {};
+    }
+    if (_selectedApprovalMaskId == QString::fromLatin1(kDefaultApprovalMaskId)) {
+        return defaultApprovalMaskPathFor(surface);
+    }
+    for (const auto& entry : _approvalMaskEntries) {
+        if (entry.id == _selectedApprovalMaskId && !entry.isDefault) {
+            return surface->path / entry.relativePath;
+        }
+    }
+    return defaultApprovalMaskPathFor(surface);
+}
+
+bool SegmentationModule::persistApprovalMaskCatalogMeta(QuadSurface* surface)
+{
+    if (!surface || surface->path.empty()) {
+        return false;
+    }
+
+    ensureSurfaceMetaObject(surface);
+
+    nlohmann::json catalog = nlohmann::json::array();
+    for (const auto& entry : _approvalMaskEntries) {
+        if (entry.isDefault) {
+            continue;
+        }
+        nlohmann::json obj = nlohmann::json::object();
+        obj["id"] = entry.id.toStdString();
+        obj["name"] = entry.displayName.toStdString();
+        obj["relative_path"] = entry.relativePath.generic_string();
+        catalog.push_back(std::move(obj));
+    }
+    (*surface->meta)[kApprovalMaskCatalogMetaKey] = std::move(catalog);
+
+    try {
+        surface->save_meta();
+    } catch (const std::exception& ex) {
+        qCWarning(lcSegModule) << "Failed to persist approval mask metadata:" << ex.what();
+        return false;
+    }
+    return true;
+}
+
+void SegmentationModule::rebuildApprovalMaskCatalog(QuadSurface* surface)
+{
+    _approvalMaskEntries.clear();
+    _approvalMaskEntries.push_back({
+        QString::fromLatin1(kDefaultApprovalMaskId),
+        QString::fromLatin1(kDefaultApprovalMaskDisplayName),
+        std::filesystem::path("approval.tif"),
+        true
+    });
+
+    if (surface) {
+        ensureSurfaceMetaObject(surface);
+        const nlohmann::json* catalog = nullptr;
+        if (surface->meta && surface->meta->is_object() &&
+            surface->meta->contains(kApprovalMaskCatalogMetaKey)) {
+            catalog = &(*surface->meta)[kApprovalMaskCatalogMetaKey];
+        }
+
+        std::set<QString> seenIds;
+        seenIds.insert(QString::fromLatin1(kDefaultApprovalMaskId));
+        if (catalog && catalog->is_array()) {
+            for (const auto& item : *catalog) {
+                if (!item.is_object()) {
+                    continue;
+                }
+                if (!item.contains("id") || !item.contains("name") || !item.contains("relative_path")) {
+                    continue;
+                }
+                const QString id = QString::fromStdString(item.value("id", std::string()));
+                const QString name = QString::fromStdString(item.value("name", std::string()));
+                const std::filesystem::path relPath(item.value("relative_path", std::string()));
+                if (id.isEmpty() || name.isEmpty() || relPath.empty() || relPath.is_absolute()) {
+                    continue;
+                }
+                if (seenIds.count(id) > 0) {
+                    continue;
+                }
+                seenIds.insert(id);
+                _approvalMaskEntries.push_back({id, name, relPath, false});
+            }
+        }
+    }
+
+    bool selectedFound = false;
+    for (const auto& entry : _approvalMaskEntries) {
+        if (entry.id == _selectedApprovalMaskId) {
+            selectedFound = true;
+            break;
+        }
+    }
+    if (!selectedFound) {
+        _selectedApprovalMaskId = QString::fromLatin1(kDefaultApprovalMaskId);
+    }
+
+    if (_widget) {
+        QVector<QPair<QString, QString>> options;
+        options.reserve(static_cast<int>(_approvalMaskEntries.size()));
+        for (const auto& entry : _approvalMaskEntries) {
+            options.push_back({entry.id, entry.displayName});
+        }
+        _widget->setApprovalMaskOptions(options, _selectedApprovalMaskId);
+    }
+}
+
+void SegmentationModule::applySelectedApprovalMaskToOverlay(QuadSurface* surface)
+{
+    if (!_overlay) {
+        return;
+    }
+    if (!surface) {
+        _overlay->loadApprovalMaskImage(nullptr);
+        return;
+    }
+    _overlay->loadApprovalMaskImage(surface, activeApprovalMaskPath(surface));
+}
+
+void SegmentationModule::handleApprovalMaskSelected(const QString& maskId)
+{
+    QString resolved = maskId;
+    bool found = false;
+    for (const auto& entry : _approvalMaskEntries) {
+        if (entry.id == resolved) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        resolved = QString::fromLatin1(kDefaultApprovalMaskId);
+    }
+
+    if (_selectedApprovalMaskId == resolved) {
+        return;
+    }
+    _selectedApprovalMaskId = resolved;
+
+    std::shared_ptr<Surface> holder;
+    QuadSurface* surface = currentApprovalSurface(&holder);
+    if ((_showApprovalMask || isEditingApprovalMask()) && surface) {
+        applySelectedApprovalMaskToOverlay(surface);
+    }
+    refreshOverlay();
+}
+
+void SegmentationModule::handleApprovalMaskCreateRequested(const QString& displayName)
+{
+    const QString trimmed = displayName.trimmed();
+    if (trimmed.isEmpty()) {
+        emit statusMessageRequested(tr("Mask name cannot be empty."), kStatusShort);
+        return;
+    }
+
+    std::shared_ptr<Surface> holder;
+    QuadSurface* surface = currentApprovalSurface(&holder);
+    if (!surface || surface->path.empty()) {
+        emit statusMessageRequested(tr("No active segment to create mask for."), kStatusMedium);
+        return;
+    }
+
+    const QString foldedName = trimmed.toCaseFolded();
+    for (const auto& entry : _approvalMaskEntries) {
+        if (entry.displayName.toCaseFolded() == foldedName) {
+            emit statusMessageRequested(tr("A mask with that name already exists."), kStatusMedium);
+            return;
+        }
+    }
+
+    QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    while (std::any_of(_approvalMaskEntries.begin(), _approvalMaskEntries.end(),
+                       [&id](const ApprovalMaskEntry& entry) { return entry.id == id; })) {
+        id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    }
+
+    const std::filesystem::path relativePath = std::filesystem::path("masks") / (id.toStdString() + ".tif");
+    const std::filesystem::path absolutePath = surface->path / relativePath;
+    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        emit statusMessageRequested(tr("Cannot create mask: segment surface has no grid."), kStatusMedium);
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(absolutePath.parent_path(), ec);
+    if (ec) {
+        emit statusMessageRequested(tr("Failed to create masks directory."), kStatusMedium);
+        return;
+    }
+
+    const cv::Mat_<cv::Vec3b> emptyMask(points->rows, points->cols, cv::Vec3b(0, 0, 0));
+    if (!cv::imwrite(absolutePath.string(), emptyMask)) {
+        emit statusMessageRequested(tr("Failed to create mask file."), kStatusMedium);
+        return;
+    }
+
+    _approvalMaskEntries.push_back({id, trimmed, relativePath, false});
+    _selectedApprovalMaskId = id;
+    if (!persistApprovalMaskCatalogMeta(surface)) {
+        std::error_code removeEc;
+        std::filesystem::remove(absolutePath, removeEc);
+        _approvalMaskEntries.pop_back();
+        _selectedApprovalMaskId = QString::fromLatin1(kDefaultApprovalMaskId);
+        emit statusMessageRequested(tr("Failed to persist mask metadata."), kStatusMedium);
+        rebuildApprovalMaskCatalog(surface);
+        return;
+    }
+
+    rebuildApprovalMaskCatalog(surface);
+    if (_showApprovalMask || isEditingApprovalMask()) {
+        applySelectedApprovalMaskToOverlay(surface);
+    }
+    emit statusMessageRequested(tr("Created mask \"%1\".").arg(trimmed), kStatusShort);
+    refreshOverlay();
+}
+
 void SegmentationModule::setShowApprovalMask(bool enabled)
 {
     if (_showApprovalMask == enabled) {
@@ -484,22 +749,10 @@ void SegmentationModule::setShowApprovalMask(bool enabled)
     qCInfo(lcSegModule) << "=== Show Approval Mask:" << (enabled ? "ENABLED" : "DISABLED") << "===";
 
     if (_showApprovalMask) {
-        // Showing approval mask - load it for display
-        QuadSurface* surface = nullptr;
-        std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
-        if (_editManager && _editManager->hasSession()) {
-            qCInfo(lcSegModule) << "  Loading approval mask (has active session)";
-            surface = _editManager->baseSurface().get();
-        } else if (_surfaces) {
-            qCInfo(lcSegModule) << "  Loading approval mask (from surfaces collection)";
-            surfaceHolder = _surfaces->surface("segmentation");
-            surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
-        }
-
-        if (surface && _overlay) {
-            _overlay->loadApprovalMaskImage(surface);
-            qCInfo(lcSegModule) << "  Loaded approval mask into QImage";
-        }
+        std::shared_ptr<Surface> surfaceHolder;
+        QuadSurface* surface = currentApprovalSurface(&surfaceHolder);
+        rebuildApprovalMaskCatalog(surface);
+        applySelectedApprovalMaskToOverlay(surface);
     }
 
     refreshOverlay();
@@ -535,36 +788,16 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
         }
     }
 
+    rebuildApprovalMaskCatalog(newSurface);
+
     // Sync show approval mask state from widget (handles restored settings case)
     if (_widget && _widget->showApprovalMask() != _showApprovalMask) {
         qCInfo(lcSegModule) << "  Syncing showApprovalMask from widget:" << _widget->showApprovalMask();
         _showApprovalMask = _widget->showApprovalMask();
     }
 
-    // Check if new surface has an approval mask
-    bool hasApprovalMask = false;
-    if (newSurface) {
-        cv::Mat approvalChannel = newSurface->channel("approval", SURF_CHANNEL_NORESIZE);
-        hasApprovalMask = !approvalChannel.empty();
-        qCInfo(lcSegModule) << "  New surface has approval mask:" << hasApprovalMask;
-    }
-
-    if (_showApprovalMask) {
-        if (hasApprovalMask && newSurface && _overlay) {
-            // Load the new surface's approval mask
-            qCInfo(lcSegModule) << "  Loading approval mask for new surface";
-            _overlay->loadApprovalMaskImage(newSurface);
-        } else {
-            // No approval mask on new surface - turn off show mode
-            qCInfo(lcSegModule) << "  No approval mask on new surface, turning off show mode";
-            _showApprovalMask = false;
-            if (_widget) {
-                _widget->setShowApprovalMask(false);
-            }
-            if (_overlay) {
-                _overlay->loadApprovalMaskImage(nullptr);  // Clear the mask
-            }
-        }
+    if (_showApprovalMask && _overlay) {
+        applySelectedApprovalMaskToOverlay(newSurface);
     }
 
     // Save corrections for old segment and load for new segment
@@ -617,24 +850,13 @@ void SegmentationModule::setEditApprovedMask(bool enabled)
             _approvalTool->setActive(true);
             _approvalTool->setPaintMode(ApprovalMaskBrushTool::PaintMode::Approve);
 
-            // Set surface on approval tool - prefer surface from collection since it has
-            // the most up-to-date approval mask (preserved after tracer growth)
-            QuadSurface* surface = nullptr;
-            std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
-            if (_surfaces) {
-                surfaceHolder = _surfaces->surface("segmentation");
-                surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
-            }
-            if (!surface && _editManager && _editManager->hasSession()) {
-                surface = _editManager->baseSurface().get();
-            }
+            std::shared_ptr<Surface> surfaceHolder;
+            QuadSurface* surface = currentApprovalSurface(&surfaceHolder);
 
             if (surface) {
                 _approvalTool->setSurface(surface);
-                // Reload approval mask image to ensure dimensions match current surface
-                if (_overlay) {
-                    _overlay->loadApprovalMaskImage(surface);
-                }
+                rebuildApprovalMaskCatalog(surface);
+                applySelectedApprovalMaskToOverlay(surface);
             }
         }
 
@@ -679,24 +901,13 @@ void SegmentationModule::setEditUnapprovedMask(bool enabled)
             _approvalTool->setActive(true);
             _approvalTool->setPaintMode(ApprovalMaskBrushTool::PaintMode::Unapprove);
 
-            // Set surface on approval tool - prefer surface from collection since it has
-            // the most up-to-date approval mask (preserved after tracer growth)
-            QuadSurface* surface = nullptr;
-            std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
-            if (_surfaces) {
-                surfaceHolder = _surfaces->surface("segmentation");
-                surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
-            }
-            if (!surface && _editManager && _editManager->hasSession()) {
-                surface = _editManager->baseSurface().get();
-            }
+            std::shared_ptr<Surface> surfaceHolder;
+            QuadSurface* surface = currentApprovalSurface(&surfaceHolder);
 
             if (surface) {
                 _approvalTool->setSurface(surface);
-                // Reload approval mask image to ensure dimensions match current surface
-                if (_overlay) {
-                    _overlay->loadApprovalMaskImage(surface);
-                }
+                rebuildApprovalMaskCatalog(surface);
+                applySelectedApprovalMaskToOverlay(surface);
             }
         }
 
@@ -788,7 +999,8 @@ void SegmentationModule::performAutoApproval(const std::vector<std::pair<int, in
     constexpr bool kIsAutoApproval = true;
     const QColor brushColor = approvalBrushColor();
     _overlay->paintApprovalMaskDirect(vertices, _autoApprovalRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
-    _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
+    QuadSurface* surface = _editManager ? _editManager->baseSurface().get() : nullptr;
+    _overlay->scheduleDebouncedSave(surface, activeApprovalMaskPath(surface));
     qCInfo(lcSegModule) << "Auto-approved" << vertices.size() << "vertices with radius" << _autoApprovalRadius;
 }
 
@@ -796,17 +1008,11 @@ void SegmentationModule::saveApprovalMaskToDisk()
 {
     qCInfo(lcSegModule) << "Saving approval mask to disk...";
 
-    QuadSurface* surface = nullptr;
-    std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
-    if (_editManager && _editManager->hasSession()) {
-        surface = _editManager->baseSurface().get();
-    } else if (_surfaces) {
-        surfaceHolder = _surfaces->surface("segmentation");
-        surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
-    }
+    std::shared_ptr<Surface> surfaceHolder;
+    QuadSurface* surface = currentApprovalSurface(&surfaceHolder);
 
     if (_overlay && surface) {
-        _overlay->saveApprovalMaskToSurface(surface);
+        _overlay->saveApprovalMaskToSurface(surface, activeApprovalMaskPath(surface));
         emit statusMessageRequested(tr("Saved approval mask."), kStatusShort);
         qCInfo(lcSegModule) << "  Approval mask saved to disk";
 
@@ -826,6 +1032,18 @@ void SegmentationModule::setApprovalMaskBrushRadius(float radiusSteps)
 void SegmentationModule::setApprovalBrushDepth(float depth)
 {
     _approvalBrushDepth = std::clamp(depth, 1.0f, 500.0f);
+}
+
+void SegmentationModule::setApprovalBrushShape(ApprovalBrushShape shape)
+{
+    if (_approvalBrushShape == shape) {
+        return;
+    }
+    _approvalBrushShape = shape;
+    if (_widget && _widget->approvalBrushShape() != shape) {
+        _widget->setApprovalBrushShape(shape);
+    }
+    refreshOverlay();
 }
 
 void SegmentationModule::setApprovalBrushColor(const QColor& color)
@@ -1067,6 +1285,7 @@ void SegmentationModule::refreshOverlay()
         state.approvalMaskMode = true;  // Must be true to render brush
         state.approvalBrushRadius = _approvalMaskBrushRadius;
         state.approvalBrushDepth = _approvalBrushDepth;
+        state.approvalBrushShape = _approvalBrushShape;
         state.surface = approvalSurface;
         if (_approvalTool) {
             state.approvalStrokeActive = _approvalTool->strokeActive();

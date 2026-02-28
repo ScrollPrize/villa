@@ -297,7 +297,7 @@ void ApprovalMaskBrushTool::finishStroke()
     // Schedule debounced save to disk so brush strokes auto-persist
     if (_surface) {
         if (auto overlay = _module.overlay()) {
-            overlay->scheduleDebouncedSave(_surface);
+            overlay->scheduleDebouncedSave(_surface, _module.activeApprovalMaskPath(_surface));
         }
     }
 }
@@ -324,7 +324,7 @@ bool ApprovalMaskBrushTool::applyPending(float /*dragRadiusSteps*/)
     }
 
     // Save the approval mask QImage to disk
-    overlay->saveApprovalMaskToSurface(_surface);
+    overlay->saveApprovalMaskToSurface(_surface, _module.activeApprovalMaskPath(_surface));
 
     qCDebug(lcApprovalMask) << "Saved approval mask to disk in" << totalTimer.elapsed() << "ms";
 
@@ -362,7 +362,7 @@ void ApprovalMaskBrushTool::clear()
     // Reload approval mask from disk to discard pending changes
     auto overlay = _module.overlay();
     if (overlay && _surface) {
-        overlay->loadApprovalMaskImage(_surface);
+        overlay->loadApprovalMaskImage(_surface, _module.activeApprovalMaskPath(_surface));
         qCDebug(lcApprovalMask) << "Reloaded approval mask from disk (discarded pending changes)";
     }
 
@@ -412,12 +412,16 @@ void ApprovalMaskBrushTool::paintAccumulatedPointsToImage()
         paintRadius = 1.0f;
         useRectangle = false;  // Plane views paint individual cells
     } else {
-        // For segmentation/flattened view strokes: paint a rectangle (cylinder side view)
-        // Width = diameter (2 * radius), Height = depth
-        paintWidth = gridRadius * 2.0f;
-        paintHeight = gridDepth;
         paintRadius = gridRadius;
-        useRectangle = true;
+        if (_module.approvalBrushShape() == ApprovalBrushShape::Rectangle) {
+            // For segmentation/flattened view strokes: paint a rectangle (cylinder side view)
+            // Width = diameter (2 * radius), Height = depth
+            paintWidth = gridRadius * 2.0f;
+            paintHeight = gridDepth;
+            useRectangle = true;
+        } else {
+            useRectangle = false;
+        }
     }
     const float clampedRadius = std::clamp(paintRadius, 0.5f, 500.0f);
     const QColor brushColor = _module.approvalBrushColor();
@@ -808,7 +812,7 @@ void ApprovalMaskBrushTool::finishStrokeFromWorld()
     // Schedule debounced save to disk so brush strokes auto-persist
     if (_surface) {
         if (auto overlay = _module.overlay()) {
-            overlay->scheduleDebouncedSave(_surface);
+            overlay->scheduleDebouncedSave(_surface, _module.activeApprovalMaskPath(_surface));
         }
     }
 }

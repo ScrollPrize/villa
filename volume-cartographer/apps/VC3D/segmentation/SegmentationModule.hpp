@@ -22,6 +22,7 @@
 #include "../CVolumeViewer.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "growth/SegmentationGrowth.hpp"
+#include "SegmentationCommon.hpp"
 #include "SegmentationPushPullConfig.hpp"
 #include "SegmentationUndoHistory.hpp"
 
@@ -108,12 +109,16 @@ public:
     void performAutoApproval(const std::vector<std::pair<int, int>>& vertices);
     void setApprovalMaskBrushRadius(float radiusSteps);
     void setApprovalBrushDepth(float depth);
+    void setApprovalBrushShape(ApprovalBrushShape shape);
     void setApprovalBrushColor(const QColor& color);
     [[nodiscard]] SegmentationOverlayController* overlay() const { return _overlay; }
     [[nodiscard]] ViewerManager* viewerManager() const { return _viewerManager; }
     [[nodiscard]] float approvalMaskBrushRadius() const { return _approvalMaskBrushRadius; }
     [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
+    [[nodiscard]] ApprovalBrushShape approvalBrushShape() const { return _approvalBrushShape; }
     [[nodiscard]] QColor approvalBrushColor() const { return _approvalBrushColor; }
+    [[nodiscard]] std::filesystem::path activeApprovalMaskPath(QuadSurface* surface) const;
+    void saveApprovalMaskToDisk();
     void undoApprovalStroke();
 
     // Cell reoptimization
@@ -326,7 +331,13 @@ private:
     void performAutosave();
     void ensureAutosaveTimer();
     void updateAutosaveState();
-    void saveApprovalMaskToDisk();
+    void rebuildApprovalMaskCatalog(QuadSurface* surface);
+    void handleApprovalMaskSelected(const QString& maskId);
+    void handleApprovalMaskCreateRequested(const QString& displayName);
+    void applySelectedApprovalMaskToOverlay(QuadSurface* surface);
+    [[nodiscard]] QuadSurface* currentApprovalSurface(std::shared_ptr<Surface>* holder = nullptr) const;
+    [[nodiscard]] static std::filesystem::path defaultApprovalMaskPathFor(const QuadSurface* surface);
+    bool persistApprovalMaskCatalogMeta(QuadSurface* surface);
 
     SegmentationWidget* _widget{nullptr};
     SegmentationEditManager* _editManager{nullptr};
@@ -381,7 +392,17 @@ private:
 
     float _approvalMaskBrushRadius{50.0f};  // Cylinder radius
     float _approvalBrushDepth{15.0f};       // Cylinder depth
+    ApprovalBrushShape _approvalBrushShape{ApprovalBrushShape::Rectangle};
     QColor _approvalBrushColor{0, 255, 0};  // RGB color for approval painting
+    struct ApprovalMaskEntry
+    {
+        QString id;
+        QString displayName;
+        std::filesystem::path relativePath;
+        bool isDefault{false};
+    };
+    std::vector<ApprovalMaskEntry> _approvalMaskEntries;
+    QString _selectedApprovalMaskId{QStringLiteral("default")};
 
     segmentation::UndoHistory _undoHistory;
     bool _suppressUndoCapture{false};

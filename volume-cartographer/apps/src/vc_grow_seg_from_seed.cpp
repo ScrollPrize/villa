@@ -5,6 +5,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Geometry.hpp"
 
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/StreamOperators.hpp"
@@ -209,7 +210,9 @@ int main(int argc, char *argv[])
             ("inpaint", "perform automatic inpainting on all detected holes.")
             ("resume-opt", po::value<std::string>(), "Resume optimization option (skip, local, global)")
             ("resume-generations", po::value<int>(), "Number of additional generations to grow from current (overrides JSON generations)")
-            ("segment-name", po::value<std::string>(), "Output segment name (uses target-dir directly instead of creating subfolder)");
+            ("segment-name", po::value<std::string>(), "Output segment name (uses target-dir directly instead of creating subfolder)")
+            ("copy-mask", po::value<std::string>(), "Mask image/TIFF selecting vertices to move in gen_neighbor mode")
+            ("copy-direction", po::value<std::string>(), "Direction override for gen_neighbor mode: in|out|forward|backward");
 
         po::variables_map vm;
         try {
@@ -288,6 +291,24 @@ int main(int argc, char *argv[])
         if (vm.count("segment-name")) {
             segment_name = vm["segment-name"].as<std::string>();
         }
+
+        if (vm.count("copy-mask")) {
+            params["copy_mask"] = vm["copy-mask"].as<std::string>();
+        }
+
+        if (vm.count("copy-direction")) {
+            std::string copy_direction = vm["copy-direction"].as<std::string>();
+            if (copy_direction == "forward") {
+                copy_direction = "out";
+            } else if (copy_direction == "backward") {
+                copy_direction = "in";
+            }
+            if (copy_direction != "in" && copy_direction != "out") {
+                std::cerr << "ERROR: --copy-direction must be one of 'in', 'out', 'forward', or 'backward'" << std::endl;
+                return EXIT_FAILURE;
+            }
+            params["neighbor_dir"] = copy_direction;
+        }
     }
 
     if (params.empty()) {
@@ -335,6 +356,12 @@ int main(int argc, char *argv[])
     }
 
     std::string mode = params.value("mode", "seed");
+    if (params.contains("copy_mask") && params["copy_mask"].is_string() &&
+        !params["copy_mask"].get<std::string>().empty() && mode != "gen_neighbor") {
+        std::cout << "copy-mask provided, forcing mode to gen_neighbor" << std::endl;
+        mode = "gen_neighbor";
+        params["mode"] = "gen_neighbor";
+    }
     
     std::cout << "mode: " << mode << std::endl;
     std::cout << "step size: " << params.value("step_size", 20.0f) << std::endl;
@@ -585,10 +612,51 @@ int main(int argc, char *argv[])
         const cv::Mat_<cv::Vec3f> src_points = src_surface->rawPoints();
         const int rows = src_points.rows;
         const int cols = src_points.cols;
+        const std::string copy_mask_path = params.value("copy_mask", std::string());
 
         const auto is_valid_vertex = [](const cv::Vec3f& p) -> bool {
             return p[0] != -1.f && p[1] != -1.f && p[2] != -1.f;
         };
+
+        cv::Mat_<uchar> copy_mask;
+        if (!copy_mask_path.empty()) {
+            cv::Mat raw_mask = cv::imread(copy_mask_path, cv::IMREAD_UNCHANGED);
+            if (raw_mask.empty()) {
+                std::cerr << "ERROR: failed to read copy mask: " << copy_mask_path << std::endl;
+                return EXIT_FAILURE;
+            }
+
+            cv::Mat gray_mask;
+            if (raw_mask.channels() == 1) {
+                gray_mask = raw_mask;
+            } else if (raw_mask.channels() == 3) {
+                cv::cvtColor(raw_mask, gray_mask, cv::COLOR_BGR2GRAY);
+            } else if (raw_mask.channels() == 4) {
+                cv::cvtColor(raw_mask, gray_mask, cv::COLOR_BGRA2GRAY);
+            } else {
+                std::cerr << "ERROR: unsupported copy mask channel count (" << raw_mask.channels() << ")" << std::endl;
+                return EXIT_FAILURE;
+            }
+
+            cv::Mat binary_mask;
+            if (gray_mask.depth() == CV_8U) {
+                cv::compare(gray_mask, 0, binary_mask, cv::CMP_GT);
+            } else {
+                cv::Mat gray_float;
+                gray_mask.convertTo(gray_float, CV_32F);
+                cv::compare(gray_float, 0.0f, binary_mask, cv::CMP_GT);
+            }
+
+            if (binary_mask.rows != rows || binary_mask.cols != cols) {
+                cv::resize(binary_mask, copy_mask, cv::Size(cols, rows), 0.0, 0.0, cv::INTER_NEAREST);
+                std::cout << "gen_neighbor copy: resized mask from "
+                          << binary_mask.cols << "x" << binary_mask.rows
+                          << " to " << cols << "x" << rows << std::endl;
+            } else {
+                copy_mask = binary_mask;
+            }
+        }
+        const bool copy_mask_enabled = !copy_mask.empty();
 
         const cv::Vec3f invalid_marker(-1.f, -1.f, -1.f);
         cv::Mat_<cv::Vec3f> dst_points(src_points.size());
@@ -1247,108 +1315,156 @@ int main(int argc, char *argv[])
             }
         }
 
-        // Apply measured scale factor (clamped to reasonable range)
-        const bool neighbor_auto_scale = params.value("neighbor_auto_scale", true);
-        double scale_factor = 1.0;
-        if (neighbor_auto_scale && src_extent[0] > 0.1 && src_extent[1] > 0.1) {
-            scale_factor = std::clamp(measured_scale_factor, 0.5, 2.0);
-        }
+        cv::Mat_<cv::Vec3f> final_points;
+        cv::Mat_<uint8_t> moved_points_mask;
+        int moved_point_count = 0;
+        if (copy_mask_enabled) {
+            final_points = src_points.clone();
+            int selected_count = 0;
+            int replaced_count = 0;
+            int kept_original_count = 0;
+            int selected_invalid_source = 0;
+            const float moved_eps = std::max(0.0f, static_cast<float>(params.value("copy_moved_eps", 1e-3)));
+            moved_points_mask = cv::Mat_<uint8_t>(rows, cols, static_cast<uint8_t>(0));
 
-        // Debug: Calculate bounding box of dst_points before any resize
-        auto calc_bbox = [&](const cv::Mat_<cv::Vec3f>& pts) -> std::pair<cv::Vec3f, cv::Vec3f> {
-            cv::Vec3f min_pos(FLT_MAX, FLT_MAX, FLT_MAX);
-            cv::Vec3f max_pos(-FLT_MAX, -FLT_MAX, -FLT_MAX);
-            for (int r = 0; r < pts.rows; ++r) {
-                for (int c = 0; c < pts.cols; ++c) {
-                    if (is_valid_vertex(pts(r, c))) {
-                        for (int i = 0; i < 3; ++i) {
-                            min_pos[i] = std::min(min_pos[i], pts(r, c)[i]);
-                            max_pos[i] = std::max(max_pos[i], pts(r, c)[i]);
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < cols; ++c) {
+                    if (copy_mask(r, c) == 0) {
+                        continue;
+                    }
+                    ++selected_count;
+                    if (!src_valid(r, c)) {
+                        ++selected_invalid_source;
+                        continue;
+                    }
+                    if (is_valid_vertex(dst_points(r, c))) {
+                        const cv::Vec3f& moved = dst_points(r, c);
+                        final_points(r, c) = moved;
+                        ++replaced_count;
+                        if (cv::norm(moved - src_points(r, c)) > moved_eps) {
+                            moved_points_mask(r, c) = 255;
+                            ++moved_point_count;
+                        }
+                    } else {
+                        ++kept_original_count;
+                    }
+                }
+            }
+
+            std::cout << "gen_neighbor copy: selected=" << selected_count
+                      << " replaced=" << replaced_count
+                      << " kept_original=" << kept_original_count
+                      << " selected_invalid_source=" << selected_invalid_source
+                      << " moved_points=" << moved_point_count
+                      << std::endl;
+            std::cout << "gen_neighbor copy: output grid " << final_points.cols << "x" << final_points.rows
+                      << " (same as source)" << std::endl;
+        } else {
+            // Apply measured scale factor (clamped to reasonable range)
+            const bool neighbor_auto_scale = params.value("neighbor_auto_scale", true);
+            double scale_factor = 1.0;
+            if (neighbor_auto_scale && src_extent[0] > 0.1 && src_extent[1] > 0.1) {
+                scale_factor = std::clamp(measured_scale_factor, 0.5, 2.0);
+            }
+
+            // Debug: Calculate bounding box of dst_points before any resize
+            auto calc_bbox = [&](const cv::Mat_<cv::Vec3f>& pts) -> std::pair<cv::Vec3f, cv::Vec3f> {
+                cv::Vec3f min_pos(FLT_MAX, FLT_MAX, FLT_MAX);
+                cv::Vec3f max_pos(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+                for (int r = 0; r < pts.rows; ++r) {
+                    for (int c = 0; c < pts.cols; ++c) {
+                        if (is_valid_vertex(pts(r, c))) {
+                            for (int i = 0; i < 3; ++i) {
+                                min_pos[i] = std::min(min_pos[i], pts(r, c)[i]);
+                                max_pos[i] = std::max(max_pos[i], pts(r, c)[i]);
+                            }
                         }
                     }
                 }
-            }
-            return {min_pos, max_pos};
-        };
+                return {min_pos, max_pos};
+            };
 
-        auto [src_min, src_max] = calc_bbox(src_points);
-        auto [dst_min, dst_max] = calc_bbox(dst_points);
-        std::cout << "DEBUG gen_neighbor:" << std::endl;
-        std::cout << "  Source grid: " << cols << "x" << rows << ", scale: " << src_surface->scale() << std::endl;
-        std::cout << "  Source extent: [" << src_extent[0] << ", " << src_extent[1] << "]" << std::endl;
-        std::cout << "  Dst extent: [" << dst_extent[0] << ", " << dst_extent[1] << "]" << std::endl;
-        std::cout << "  x_scale: " << x_scale << ", y_scale: " << y_scale << std::endl;
-        std::cout << "  measured_scale_factor: " << measured_scale_factor << " (from extent ratio)" << std::endl;
-        std::cout << "  scale_factor (after clamp): " << scale_factor << std::endl;
+            auto [src_min, src_max] = calc_bbox(src_points);
+            auto [dst_min, dst_max] = calc_bbox(dst_points);
+            std::cout << "DEBUG gen_neighbor:" << std::endl;
+            std::cout << "  Source grid: " << cols << "x" << rows << ", scale: " << src_surface->scale() << std::endl;
+            std::cout << "  Source extent: [" << src_extent[0] << ", " << src_extent[1] << "]" << std::endl;
+            std::cout << "  Dst extent: [" << dst_extent[0] << ", " << dst_extent[1] << "]" << std::endl;
+            std::cout << "  x_scale: " << x_scale << ", y_scale: " << y_scale << std::endl;
+            std::cout << "  measured_scale_factor: " << measured_scale_factor << " (from extent ratio)" << std::endl;
+            std::cout << "  scale_factor (after clamp): " << scale_factor << std::endl;
 
-        // Resize grid if scale factor is significantly different from 1.0
-        cv::Mat_<cv::Vec3f> final_points = dst_points;
-        if (std::abs(scale_factor - 1.0) > 0.01) {
-            int new_cols = static_cast<int>(std::round(cols * scale_factor));
-            int new_rows = static_cast<int>(std::round(rows * scale_factor));
+            // Resize grid if scale factor is significantly different from 1.0
+            final_points = dst_points;
+            if (std::abs(scale_factor - 1.0) > 0.01) {
+                int new_cols = static_cast<int>(std::round(cols * scale_factor));
+                int new_rows = static_cast<int>(std::round(rows * scale_factor));
 
-            std::cout << "  Resizing grid from " << cols << "x" << rows
-                      << " to " << new_cols << "x" << new_rows << std::endl;
+                std::cout << "  Resizing grid from " << cols << "x" << rows
+                          << " to " << new_cols << "x" << new_rows << std::endl;
 
-            // Custom bilinear interpolation that properly handles invalid markers
-            // cv::resize doesn't work because it interpolates invalid (-1,-1,-1) markers
-            // as if they were real coordinates, corrupting the result
-            cv::Mat_<cv::Vec3f> resized_points(new_rows, new_cols);
-            resized_points.setTo(invalid_marker);
+                // Custom bilinear interpolation that properly handles invalid markers
+                // cv::resize doesn't work because it interpolates invalid (-1,-1,-1) markers
+                // as if they were real coordinates, corrupting the result
+                cv::Mat_<cv::Vec3f> resized_points(new_rows, new_cols);
+                resized_points.setTo(invalid_marker);
 
-            #pragma omp parallel for schedule(static)
-            for (int new_r = 0; new_r < new_rows; ++new_r) {
-                for (int new_c = 0; new_c < new_cols; ++new_c) {
-                    // Map back to original grid position (floating point)
-                    // Using (new_idx + 0.5) / scale - 0.5 for proper pixel-center alignment
-                    float orig_r = (static_cast<float>(new_r) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
-                    float orig_c = (static_cast<float>(new_c) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
+                #pragma omp parallel for schedule(static)
+                for (int new_r = 0; new_r < new_rows; ++new_r) {
+                    for (int new_c = 0; new_c < new_cols; ++new_c) {
+                        // Map back to original grid position (floating point)
+                        // Using (new_idx + 0.5) / scale - 0.5 for proper pixel-center alignment
+                        float orig_r = (static_cast<float>(new_r) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
+                        float orig_c = (static_cast<float>(new_c) + 0.5f) / static_cast<float>(scale_factor) - 0.5f;
 
-                    // Clamp to valid range
-                    orig_r = std::clamp(orig_r, 0.0f, static_cast<float>(rows - 1));
-                    orig_c = std::clamp(orig_c, 0.0f, static_cast<float>(cols - 1));
+                        // Clamp to valid range
+                        orig_r = std::clamp(orig_r, 0.0f, static_cast<float>(rows - 1));
+                        orig_c = std::clamp(orig_c, 0.0f, static_cast<float>(cols - 1));
 
-                    // Bilinear interpolation indices
-                    int r0 = static_cast<int>(std::floor(orig_r));
-                    int c0 = static_cast<int>(std::floor(orig_c));
-                    int r1 = std::min(r0 + 1, rows - 1);
-                    int c1 = std::min(c0 + 1, cols - 1);
+                        // Bilinear interpolation indices
+                        int r0 = static_cast<int>(std::floor(orig_r));
+                        int c0 = static_cast<int>(std::floor(orig_c));
+                        int r1 = std::min(r0 + 1, rows - 1);
+                        int c1 = std::min(c0 + 1, cols - 1);
 
-                    // Check all 4 corners are valid - skip if any are invalid
-                    if (!is_valid_vertex(dst_points(r0, c0)) || !is_valid_vertex(dst_points(r0, c1)) ||
-                        !is_valid_vertex(dst_points(r1, c0)) || !is_valid_vertex(dst_points(r1, c1))) {
-                        continue;  // Leave as invalid marker
+                        // Check all 4 corners are valid - skip if any are invalid
+                        if (!is_valid_vertex(dst_points(r0, c0)) || !is_valid_vertex(dst_points(r0, c1)) ||
+                            !is_valid_vertex(dst_points(r1, c0)) || !is_valid_vertex(dst_points(r1, c1))) {
+                            continue;  // Leave as invalid marker
+                        }
+
+                        float t_r = orig_r - static_cast<float>(r0);
+                        float t_c = orig_c - static_cast<float>(c0);
+
+                        cv::Vec3f p00 = dst_points(r0, c0);
+                        cv::Vec3f p01 = dst_points(r0, c1);
+                        cv::Vec3f p10 = dst_points(r1, c0);
+                        cv::Vec3f p11 = dst_points(r1, c1);
+
+                        // Bilinear interpolation of world coordinates
+                        cv::Vec3f top = p00 * (1.0f - t_c) + p01 * t_c;
+                        cv::Vec3f bot = p10 * (1.0f - t_c) + p11 * t_c;
+                        resized_points(new_r, new_c) = top * (1.0f - t_r) + bot * t_r;
                     }
-
-                    float t_r = orig_r - static_cast<float>(r0);
-                    float t_c = orig_c - static_cast<float>(c0);
-
-                    cv::Vec3f p00 = dst_points(r0, c0);
-                    cv::Vec3f p01 = dst_points(r0, c1);
-                    cv::Vec3f p10 = dst_points(r1, c0);
-                    cv::Vec3f p11 = dst_points(r1, c1);
-
-                    // Bilinear interpolation of world coordinates
-                    cv::Vec3f top = p00 * (1.0f - t_c) + p01 * t_c;
-                    cv::Vec3f bot = p10 * (1.0f - t_c) + p11 * t_c;
-                    resized_points(new_r, new_c) = top * (1.0f - t_r) + bot * t_r;
                 }
+
+                final_points = resized_points;
+
+                // Debug: Show bbox after resize
+                auto [final_min, final_max] = calc_bbox(final_points);
+                std::cout << "  Final bbox (after resize): [" << final_min << "] to [" << final_max << "]" << std::endl;
             }
 
-            final_points = resized_points;
-
-            // Debug: Show bbox after resize
-            auto [final_min, final_max] = calc_bbox(final_points);
-            std::cout << "  Final bbox (after resize): [" << final_min << "] to [" << final_max << "]" << std::endl;
+            // Debug: Final output info
+            std::cout << "  Output grid: " << final_points.cols << "x" << final_points.rows << std::endl;
         }
-
-        // Debug: Final output info
-        std::cout << "  Output grid: " << final_points.cols << "x" << final_points.rows << std::endl;
 
         // Prepare output surface and save
         std::unique_ptr<QuadSurface> out_surf(new QuadSurface(final_points, src_surface->scale()));
         // Prepare naming
-        std::string neighbor_prefix = std::string("neighbor_") + (cast_out ? "out_" : "in_");
+        std::string neighbor_prefix = copy_mask_enabled
+                                        ? (std::string("neighbor_copy_") + (cast_out ? "out_" : "in_"))
+                                        : (std::string("neighbor_") + (cast_out ? "out_" : "in_"));
         std::string uuid_local = neighbor_prefix + time_str();
         std::filesystem::path out_dir = tgt_dir / uuid_local;
 
@@ -1359,9 +1475,60 @@ int main(int argc, char *argv[])
         neighbor_meta["vc_gsfs_mode"] = mode;
         neighbor_meta["vc_gsfs_version"] = "dev";
         add_target_context(neighbor_meta, vol_path);
+        if (copy_mask_enabled) {
+            neighbor_meta["copy_mask"] = copy_mask_path;
+            neighbor_meta["copy_moved_points"] = moved_point_count;
+        }
 
         out_surf->meta = std::make_unique<nlohmann::json>(std::move(neighbor_meta));
-        out_surf->save(out_dir, uuid_local, true);
+
+        if (copy_mask_enabled) {
+            // Keep generation IDs from the source surface so resume-local optimization can run without growing.
+            cv::Mat src_generations = src_surface->channel("generations", SURF_CHANNEL_NORESIZE);
+            if (src_generations.empty()) {
+                cv::Mat_<uint16_t> generated(src_points.size(), static_cast<uint16_t>(0));
+                for (int r = 0; r < src_points.rows; ++r) {
+                    for (int c = 0; c < src_points.cols; ++c) {
+                        if (src_valid(r, c)) {
+                            generated(r, c) = 1;
+                        }
+                    }
+                }
+                out_surf->setChannel("generations", generated);
+            } else {
+                if (src_generations.type() != CV_16UC1) {
+                    cv::Mat converted;
+                    src_generations.convertTo(converted, CV_16UC1);
+                    src_generations = converted;
+                }
+                out_surf->setChannel("generations", src_generations);
+            }
+
+            if (!moved_points_mask.empty()) {
+                out_surf->setChannel("resume_local_mask", moved_points_mask);
+            }
+        }
+
+        if (copy_mask_enabled && moved_point_count > 0) {
+            json resume_local_params = params;
+            resume_local_params["mode"] = "resume";
+            resume_local_params["resume_opt"] = "local";
+            resume_local_params["resume_local_use_mask"] = true;
+            resume_local_params["generations"] = 1;
+
+            VCCollection empty_corrections;
+            std::cout << "gen_neighbor copy: running automatic resume local optimization on moved points only" << std::endl;
+            QuadSurface* optimized = tracer(ds.get(), 1.0, &chunk_cache, cv::Vec3f(0.0f, 0.0f, 0.0f), resume_local_params, cache_root,
+                                            voxelsize, direction_fields, out_surf.get(), out_dir,
+                                            *out_surf->meta, empty_corrections);
+            optimized->save(out_dir, uuid_local, true);
+            delete optimized;
+        } else {
+            if (copy_mask_enabled) {
+                std::cout << "gen_neighbor copy: no moved points found, skipping automatic resume local optimization" << std::endl;
+            }
+            out_surf->save(out_dir, uuid_local, true);
+        }
 
         // Done
         return EXIT_SUCCESS;

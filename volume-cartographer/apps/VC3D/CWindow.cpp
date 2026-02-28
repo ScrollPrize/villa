@@ -1787,6 +1787,10 @@ void CWindow::CreateWidgets(void)
     });
     connect(_segmentationWidget, &SegmentationWidget::copyWithNtRequested,
             this, &CWindow::onCopyWithNtRequested);
+    connect(_segmentationWidget, &SegmentationWidget::copyMaskedForwardRequested,
+            this, [this]() { onMaskedNeighborCopyRequested(true); });
+    connect(_segmentationWidget, &SegmentationWidget::copyMaskedBackwardRequested,
+            this, [this]() { onMaskedNeighborCopyRequested(false); });
 
     // -- Lasagna connections --
     connect(_segmentationWidget, &SegmentationWidget::seedFromFocusRequested, this, [this]() {

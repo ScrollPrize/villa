@@ -129,8 +129,10 @@ public:
 
     [[nodiscard]] float approvalBrushRadius() const;
     [[nodiscard]] float approvalBrushDepth() const;
+    [[nodiscard]] ApprovalBrushShape approvalBrushShape() const;
     [[nodiscard]] int approvalMaskOpacity() const;
     [[nodiscard]] QColor approvalBrushColor() const;
+    [[nodiscard]] QString selectedApprovalMaskId() const;
 
     // Approval mask setters
     void setShowApprovalMask(bool enabled);
@@ -144,8 +146,12 @@ public:
 
     void setApprovalBrushRadius(float radius);
     void setApprovalBrushDepth(float depth);
+    void setApprovalBrushShape(ApprovalBrushShape shape);
     void setApprovalMaskOpacity(int opacity);
     void setApprovalBrushColor(const QColor& color);
+    void setApprovalMaskOptions(const QVector<QPair<QString, QString>>& options,
+                                const QString& selectedMaskId);
+    void setSelectedApprovalMaskId(const QString& maskId);
 
     // Neural tracer setters
     void setNeuralTracerEnabled(bool enabled);
@@ -232,9 +238,14 @@ signals:
 
     void approvalBrushRadiusChanged(float radius);
     void approvalBrushDepthChanged(float depth);
+    void approvalBrushShapeChanged(ApprovalBrushShape shape);
     void approvalMaskOpacityChanged(int opacity);
     void approvalBrushColorChanged(QColor color);
     void approvalStrokesUndoRequested();
+    void approvalMaskSelected(const QString& maskId);
+    void approvalMaskCreateRequested(const QString& displayName);
+    void copyMaskedForwardRequested();
+    void copyMaskedBackwardRequested();
 
     // Neural tracer signals
     void neuralTracerEnabledChanged(bool enabled);

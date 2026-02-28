@@ -3,10 +3,13 @@
 #include "segmentation/SegmentationCommon.hpp"
 
 #include <QColor>
+#include <QPair>
 #include <QString>
+#include <QVector>
 #include <QWidget>
 
 class QCheckBox;
+class QComboBox;
 class QDoubleSpinBox;
 class QLabel;
 class QPushButton;
@@ -34,8 +37,10 @@ public:
 
     [[nodiscard]] float approvalBrushRadius() const { return _approvalBrushRadius; }
     [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
+    [[nodiscard]] ApprovalBrushShape approvalBrushShape() const { return _approvalBrushShape; }
     [[nodiscard]] int approvalMaskOpacity() const { return _approvalMaskOpacity; }
     [[nodiscard]] QColor approvalBrushColor() const { return _approvalBrushColor; }
+    [[nodiscard]] QString selectedApprovalMaskId() const { return _selectedApprovalMaskId; }
 
     // Setters
     void setShowApprovalMask(bool enabled);
@@ -49,8 +54,11 @@ public:
 
     void setApprovalBrushRadius(float radius);
     void setApprovalBrushDepth(float depth);
+    void setApprovalBrushShape(ApprovalBrushShape shape);
     void setApprovalMaskOpacity(int opacity);
     void setApprovalBrushColor(const QColor& color);
+    void setApprovalMaskOptions(const QVector<QPair<QString, QString>>& options);
+    void setSelectedApprovalMaskId(const QString& maskId);
 
     void restoreSettings(QSettings& settings);
     void syncUiState();
@@ -67,9 +75,14 @@ signals:
 
     void approvalBrushRadiusChanged(float radius);
     void approvalBrushDepthChanged(float depth);
+    void approvalBrushShapeChanged(ApprovalBrushShape shape);
     void approvalMaskOpacityChanged(int opacity);
     void approvalBrushColorChanged(QColor color);
     void approvalStrokesUndoRequested();
+    void approvalMaskSelected(const QString& maskId);
+    void approvalMaskCreateRequested(const QString& displayName);
+    void copyMaskedForwardRequested();
+    void copyMaskedBackwardRequested();
 
 private:
     void writeSetting(const QString& key, const QVariant& value);
@@ -85,10 +98,15 @@ private:
 
     QDoubleSpinBox* _spinApprovalBrushRadius{nullptr};
     QDoubleSpinBox* _spinApprovalBrushDepth{nullptr};
+    QComboBox* _comboApprovalBrushShape{nullptr};
     QSlider* _sliderApprovalMaskOpacity{nullptr};
     QLabel* _lblApprovalMaskOpacity{nullptr};
     QPushButton* _btnApprovalColor{nullptr};
     QPushButton* _btnUndoApprovalStroke{nullptr};
+    QComboBox* _comboApprovalMask{nullptr};
+    QPushButton* _btnNewApprovalMask{nullptr};
+    QPushButton* _btnCopyMaskedForward{nullptr};
+    QPushButton* _btnCopyMaskedBackward{nullptr};
 
     bool _showApprovalMask{false};
     bool _editApprovedMask{false};
@@ -100,8 +118,13 @@ private:
 
     float _approvalBrushRadius{50.0f};
     float _approvalBrushDepth{15.0f};
+    ApprovalBrushShape _approvalBrushShape{ApprovalBrushShape::Rectangle};
     int _approvalMaskOpacity{50};
     QColor _approvalBrushColor{0, 255, 0};
+    QString _selectedApprovalMaskId{QStringLiteral("default")};
+    QVector<QPair<QString, QString>> _approvalMaskOptions{
+        {QStringLiteral("default"), QStringLiteral("approval")}
+    };
 
     bool _restoringSettings{false};
     const QString _settingsGroup;

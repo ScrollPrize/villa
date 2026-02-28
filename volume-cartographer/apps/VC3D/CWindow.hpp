@@ -100,7 +100,10 @@ public slots:
     void onAWSUpload(const std::string& segmentId);
     void onExportWidthChunks(const std::string& segmentId);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
-    void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
+    void onNeighborCopyRequested(const QString& segmentId,
+                                 bool copyOut,
+                                 const QString& copyMaskPath = QString(),
+                                 bool maskedOnly = false);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);
     void onReloadFromBackup(const QString& segmentId, int backupIndex);
     void onCopySurfaceRequested(const QString& segmentId);
@@ -155,6 +158,7 @@ private:
     bool centerFocusOnCursor();
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
+    void onMaskedNeighborCopyRequested(bool forward);
     void updateSurfaceOverlayDropdown();
     void onSurfaceOverlaySelectionChanged(const QModelIndex& topLeft, const QModelIndex& bottomRight, const QVector<int>& roles);
     QColor getOverlayColor(size_t index) const;
@@ -382,6 +386,7 @@ private:
         QString resumeOptMode{QStringLiteral("local")};
         int pass2OmpThreads{1};
         bool copyOut{true};
+        bool maskedOnly{false};
         QSet<QString> baselineEntries;
         std::unique_ptr<QTemporaryFile> pass1JsonFile;
         std::unique_ptr<QTemporaryFile> pass2JsonFile;
