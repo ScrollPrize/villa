@@ -153,3 +153,5 @@ python $SRC/preprocess_cos_omezarr.py --input ../s5/PHerc172.volpkg/volumes_webc
 
 python $SRC/preprocess_cos_omezarr.py integrate --z-volume ../s5/PHerc172.volpkg/volumes_lasagna/full_cos_z.zarr --output full_cos_s5.zarr --x-volume full_cos_x.zarr --y-volume full_cos_y.zarr
 
+# combine + dt
+python /home/hendrik/remote/turbosheep/home/hendrik/business/aiconsulting/vesuviuschallenge/villa-fit2d-volfusion/vesuvius/src/vesuvius/exps_2d_model/preprocess_cos_omezarr.py integrate --z-volume ../s5/PHerc172.volpkg/volumes_lasagna/s5_cos.zarr --output cos_comb_dt.zarr --x-volume s5_cos_x.zarr --y-volume s5_cos_y.zarr --pred-dt /home/hendrik/remote/turbosheep/home/hendrik/business/aiconsulting/vesuviuschallenge/data/s5/PHerc172.volpkg/volumes/s5_059_medial_ome.zarr/0/

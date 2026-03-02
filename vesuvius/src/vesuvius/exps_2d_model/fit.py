@@ -318,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
 		dir1_y=data.dir1_y,
 		dir0_x=data.dir0_x,
 		dir1_x=data.dir1_x,
+		pred_dt=data.pred_dt,
 		downscale=float(data.downscale),
 		data_margin_xy=data.data_margin_xy,
 		constraints=fit_data.ConstraintsData(

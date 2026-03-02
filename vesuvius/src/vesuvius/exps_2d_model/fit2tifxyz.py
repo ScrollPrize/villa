@@ -26,13 +26,9 @@ class ExportConfig:
 	offset_x: float = 0.0
 	offset_y: float = 0.0
 	offset_z: int = 0
-	# Defaults follow the requested convention:
-	# - scale unit is the grid-step (meta.scale=0.1)
-	# - z-step is 1 and we only output every 10th slice
 	z0: int = 0
 	z_step: int = 10
 	grid_step: int = 10
-	scale: float = 0.1
 	single_segment: bool = False
 	copy_model: bool = False
 	output_name: str | None = None
@@ -223,6 +219,8 @@ def main(argv: list[str] | None = None) -> int:
 			base["z0"] = int(z0c)
 		if "z_step_vx" in model_params:
 			base["z_step"] = max(1, int(model_params["z_step_vx"]))
+		if "mesh_step_px" in model_params:
+			base["grid_step"] = max(1, int(model_params["mesh_step_px"]))
 		cfg = ExportConfig(**base)
 
 	crop_bounds_fullres: tuple[float, float, float, float] | None = None
@@ -273,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
 			"offset_y": float(cfg.offset_y),
 			"offset_z": int(cfg.offset_z),
 			"downscale": float(cfg.downscale),
+			"grid_step": int(cfg.grid_step),
 			"crop_from_checkpoint": crop_dbg,
 		},
 	)
@@ -308,7 +307,8 @@ def main(argv: list[str] | None = None) -> int:
 	z_vals = np.asarray([cfg.z0 + int(cfg.offset_z) + zi * int(z_step_fullres) for zi in idx_z], dtype=np.float32)
 	z_grid = z_vals.reshape(-1, 1).repeat(hm, axis=1)
 
-	meta_scale = float(cfg.scale) * float(cfg.downscale)
+	xy_step_fullres = float(cfg.grid_step) * float(cfg.downscale)
+	meta_scale = 1.0 / xy_step_fullres
 	BORDER_W = 2  # invalid-point border width between windings in single-segment mode
 
 	def _apply_crop_mask(x: np.ndarray, y: np.ndarray, z_use: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:

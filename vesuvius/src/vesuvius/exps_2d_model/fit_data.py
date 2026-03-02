@@ -42,6 +42,7 @@ class FitData:
 	dir1_y: torch.Tensor | None = None
 	dir0_x: torch.Tensor | None = None
 	dir1_x: torch.Tensor | None = None
+	pred_dt: torch.Tensor | None = None
 	downscale: float = 1.0
 	constraints: ConstraintsData | None = None
 	# Margin (in model pixels) added around the original crop when reading expanded data.
@@ -81,6 +82,7 @@ class FitData:
 			dir1_y=_gs_opt(self.dir1_y),
 			dir0_x=_gs_opt(self.dir0_x),
 			dir1_x=_gs_opt(self.dir1_x),
+			pred_dt=_gs_opt(self.pred_dt),
 			downscale=float(self.downscale),
 			constraints=self.constraints,
 			data_margin_xy=self.data_margin_xy,
@@ -201,6 +203,7 @@ def grow_z_from_omezarr_unet(
 				dir1_y=_cat_opt(d_new.dir1_y, data.dir1_y),
 				dir0_x=_cat_opt(d_new.dir0_x, data.dir0_x),
 				dir1_x=_cat_opt(d_new.dir1_x, data.dir1_x),
+				pred_dt=_cat_opt(d_new.pred_dt, data.pred_dt),
 				downscale=float(data.downscale),
 				constraints=data.constraints,
 				data_margin_xy=data.data_margin_xy,
@@ -218,6 +221,7 @@ def grow_z_from_omezarr_unet(
 			dir1_y=_cat_opt(data.dir1_y, d_new.dir1_y),
 			dir0_x=_cat_opt(data.dir0_x, d_new.dir0_x),
 			dir1_x=_cat_opt(data.dir1_x, d_new.dir1_x),
+			pred_dt=_cat_opt(data.pred_dt, d_new.pred_dt),
 			downscale=float(data.downscale),
 			constraints=data.constraints,
 			data_margin_xy=data.data_margin_xy,
@@ -326,6 +330,7 @@ def load(
 	dir1_y_t: torch.Tensor | None = None
 	dir0_x_t: torch.Tensor | None = None
 	dir1_x_t: torch.Tensor | None = None
+	pred_dt_t: torch.Tensor | None = None
 	margin_x = 0
 	margin_y = 0
 	is_omezarr = (
@@ -498,6 +503,11 @@ def load(
 				t = torch.from_numpy(a.astype(np.float32) / s).to(device=device, dtype=torch.float32)
 				return t.unsqueeze(1)
 
+			def _u8_raw_to_t(a: np.ndarray) -> torch.Tensor:
+				"""Convert uint8 distance to sqrt(distance) float32."""
+				t = torch.from_numpy(np.sqrt(a.astype(np.float32))).to(device=device, dtype=torch.float32)
+				return t.unsqueeze(1)
+
 			def _u8_valid_to_t(a: np.ndarray) -> torch.Tensor:
 				t = torch.from_numpy((a > 0).astype(np.float32)).to(device=device, dtype=torch.float32)
 				return t.unsqueeze(1)
@@ -511,6 +521,7 @@ def load(
 			dir1_y_t = _u8_to_t(_read_ch("dir1_y")) if "dir1_y" in ci else None
 			dir0_x_t = _u8_to_t(_read_ch("dir0_x")) if "dir0_x" in ci else None
 			dir1_x_t = _u8_to_t(_read_ch("dir1_x")) if "dir1_x" in ci else None
+			pred_dt_t = _u8_raw_to_t(_read_ch("pred_dt")) if "pred_dt" in ci else None
 			crop = None
 			downscale = float(ds_meta)
 			skip_postprocess = True
@@ -648,6 +659,7 @@ def load(
 		dir1_y=dir1_y_t,
 		dir0_x=dir0_x_t,
 		dir1_x=dir1_x_t,
+		pred_dt=pred_dt_t,
 		downscale=float(downscale) if downscale is not None else 1.0,
 		constraints=None,
 		data_margin_xy=(float(margin_x), float(margin_y)),

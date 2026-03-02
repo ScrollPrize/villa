@@ -17,7 +17,8 @@
 		"data_grad": 0.0,
 		"z_straight": 10.0,
 		"z_normal": 10.0,
-		"corr_winding": 10.0
+		"corr_winding": 10.0,
+		"pred_dt": 1.0
 	},
 	"stages": [
 				{
@@ -31,7 +32,8 @@
 					"data": 0.0,
 					"data_plain": 0.0,
 					"z_straight": 0.0,
-					"z_normal": 0.0
+					"z_normal": 0.0,
+					"pred_dt" : 0.0
 				}
 			}
 		},
@@ -43,7 +45,8 @@
 			"min_scaledown": 0,
 			"w_fac": {
 				"data": 0.0,
-				"data_plain": 0.0
+				"data_plain": 0.0,
+				"pred_dt" : 0.0
 			}
 		},
 		{
@@ -51,8 +54,8 @@
 			"masks": [{
 				"label": "dilation",
 				"type": "constant_velocity_dilation",
-				"losses": ["data", "data_plain", "data_grad"],
-				"mvx_per_it": 0.05,
+				"losses": ["data", "data_plain", "data_grad","pred_dt"],
+				"vx_per_it": 1.0,
 				"blur_sigma": 2.0
 			}],
 			"global_opt": {

@@ -16,6 +16,7 @@ import opt_loss_mod
 import opt_loss_step
 import opt_loss_corr
 import opt_loss_min_dist
+import opt_loss_pred_dt
 import mask_schedule
 import point_constraints
 
@@ -205,6 +206,7 @@ def load_stages_cfg(cfg: dict) -> list[Stage]:
 			"z_straight": 0.0,
 			"z_normal": 0.0,
 			"corr_winding": 0.0,
+			"pred_dt": 0.0,
 	}
 	base_cfg = cfg.pop("base", None)
 	if isinstance(base_cfg, dict):
@@ -379,6 +381,7 @@ def optimize(
 			"corr_winding": lambda: (lambda lv, lms, ms: (lms[0], ms[0]))(*opt_loss_corr.corr_winding_loss(res=res, pts_c=_corr_pts_for_res())),
 			"step": lambda: (lambda lm: (lm, torch.ones_like(lm)))(opt_loss_step.step_loss_maps(res=res)),
 			"min_dist": lambda: opt_loss_min_dist.min_dist_loss_map(res=res),
+			"pred_dt": lambda: opt_loss_pred_dt.pred_dt_loss_map(res=res),
 		}
 		if mean_pos_xy is not None:
 			term_to_maps["mean_pos"] = lambda: opt_loss_geom.mean_pos_loss_map(res=res, target_xy=mean_pos_xy)
@@ -536,6 +539,7 @@ def optimize(
 			"z_normal": {"loss": opt_loss_dir.z_normal_loss},
 			"corr_winding": {"loss": lambda *, res: opt_loss_corr.corr_winding_loss(res=res, pts_c=_corr_pts_for_res(res))},
 			"min_dist": {"loss": opt_loss_min_dist.min_dist_loss},
+			"pred_dt": {"loss": opt_loss_pred_dt.pred_dt_loss},
 		}
 		_status_rows_since_header = 0
 
