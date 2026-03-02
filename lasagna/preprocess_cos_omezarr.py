@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 from pathlib import Path
+import threading
 import time
 
 import cv2
@@ -18,6 +21,12 @@ except ImportError:
 	edt_mod = None
 	_HAS_EDT = False
 import numpy as np
+try:
+	import numba
+	_HAS_NUMBA = True
+except ImportError:
+	numba = None
+	_HAS_NUMBA = False
 import torch
 import zarr
 
@@ -575,6 +584,401 @@ def _compute_pred_dt_channel(
 	print(f"[pred_dt] done in {time.time() - t0:.1f}s", flush=True)
 
 
+_N_WORKERS = min(16, os.cpu_count() or 4)
+
+
+def _make_fuse_tile_3axis():
+	"""Create numba-jitted fuse kernel if numba is available."""
+	if not _HAS_NUMBA:
+		return None
+
+	@numba.njit(cache=True)
+	def _fuse_tile_3axis(z, y, x, out, eps):
+		"""Fuse one spatial tile from 3 axis volumes.
+
+		z, y, x: (5, nz, ny, nx) float32 — [cos, grad_mag, dir0, dir1, valid]
+		out: (9, nz, ny, nx) uint8 — [cos, gm, dir0_z, dir1_z, valid, dir0_y, dir1_y, dir0_x, dir1_x]
+		"""
+		nz = z.shape[1]
+		ny = z.shape[2]
+		nx = z.shape[3]
+		inv255 = np.float32(1.0 / 255.0)
+		sqrt2 = np.float32(np.sqrt(2.0))
+		for zi in range(nz):
+			for yi in range(ny):
+				for xi in range(nx):
+					# Read raw uint8-scale values
+					z_cos = z[0, zi, yi, xi]
+					z_gm = z[1, zi, yi, xi]
+					z_d0 = z[2, zi, yi, xi] * inv255
+					z_d1 = z[3, zi, yi, xi] * inv255
+					z_val = z[4, zi, yi, xi]
+
+					y_cos = y[0, zi, yi, xi]
+					y_gm = y[1, zi, yi, xi]
+					y_d0 = y[2, zi, yi, xi] * inv255
+					y_d1 = y[3, zi, yi, xi] * inv255
+
+					x_cos = x[0, zi, yi, xi]
+					x_gm = x[1, zi, yi, xi]
+					x_d0 = x[2, zi, yi, xi] * inv255
+					x_d1 = x[3, zi, yi, xi] * inv255
+
+					# Decode dir angles: θ = 0.5 * arctan2(sin2t, cos2t)
+					cos2t_z = np.float32(2.0) * z_d0 - np.float32(1.0)
+					sin2t_z = cos2t_z - sqrt2 * (np.float32(2.0) * z_d1 - np.float32(1.0))
+					theta_z = np.arctan2(sin2t_z, cos2t_z) * np.float32(0.5)
+
+					cos2t_y = np.float32(2.0) * y_d0 - np.float32(1.0)
+					sin2t_y = cos2t_y - sqrt2 * (np.float32(2.0) * y_d1 - np.float32(1.0))
+					theta_y = np.arctan2(sin2t_y, cos2t_y) * np.float32(0.5)
+
+					cos2t_x = np.float32(2.0) * x_d0 - np.float32(1.0)
+					sin2t_x = cos2t_x - sqrt2 * (np.float32(2.0) * x_d1 - np.float32(1.0))
+					theta_x = np.arctan2(sin2t_x, cos2t_x) * np.float32(0.5)
+
+					sz = np.sin(theta_z)
+					cz = np.cos(theta_z)
+					sy = np.sin(theta_y)
+					cy = np.cos(theta_y)
+					sx = np.sin(theta_x)
+					cx = np.cos(theta_x)
+
+					# Cross products (candidate normals)
+					n1_x = cz * cy
+					n1_y = sz * cy
+					n1_z = cz * sy
+
+					n2_x = cz * cx
+					n2_y = sz * cx
+					n2_z = sz * sx
+
+					n3_x = cy * sx
+					n3_y = sy * cx
+					n3_z = sy * sx
+
+					# Align signs
+					dot2 = n1_x * n2_x + n1_y * n2_y + n1_z * n2_z
+					if dot2 < np.float32(0.0):
+						n2_x = -n2_x
+						n2_y = -n2_y
+						n2_z = -n2_z
+
+					dot3 = n1_x * n3_x + n1_y * n3_y + n1_z * n3_z
+					if dot3 < np.float32(0.0):
+						n3_x = -n3_x
+						n3_y = -n3_y
+						n3_z = -n3_z
+
+					# Sum and normalize
+					nnx = n1_x + n2_x + n3_x
+					nny = n1_y + n2_y + n3_y
+					nnz = n1_z + n2_z + n3_z
+					norm = np.sqrt(nnx * nnx + nny * nny + nnz * nnz) + eps
+
+					w_z = np.abs(nnz) / norm
+					w_y = np.abs(nny) / norm
+					w_x = np.abs(nnx) / norm
+
+					# Weighted fusion
+					w_sum = w_z + w_y + w_x + eps
+					cos_fused = (w_z * z_cos + w_y * y_cos + w_x * x_cos) / w_sum
+					gm_fused = (z_gm + y_gm + x_gm) / w_sum
+
+					# Clip and write uint8
+					out[0, zi, yi, xi] = np.uint8(min(np.float32(255.0), max(np.float32(0.0), cos_fused)))
+					out[1, zi, yi, xi] = np.uint8(min(np.float32(255.0), max(np.float32(0.0), gm_fused)))
+					out[2, zi, yi, xi] = np.uint8(z[2, zi, yi, xi])
+					out[3, zi, yi, xi] = np.uint8(z[3, zi, yi, xi])
+					out[4, zi, yi, xi] = np.uint8(z_val)
+					out[5, zi, yi, xi] = np.uint8(y[2, zi, yi, xi])
+					out[6, zi, yi, xi] = np.uint8(y[3, zi, yi, xi])
+					out[7, zi, yi, xi] = np.uint8(x[2, zi, yi, xi])
+					out[8, zi, yi, xi] = np.uint8(x[3, zi, yi, xi])
+
+	return _fuse_tile_3axis
+
+
+_fuse_tile_3axis = _make_fuse_tile_3axis()
+
+
+def _fuse_tile_3axis_numpy(z, y, x, out, eps):
+	"""Numpy fallback for _fuse_tile_3axis when numba is unavailable."""
+	dir0_z = z[2] / 255.0
+	dir1_z = z[3] / 255.0
+	dir0_y = y[2] / 255.0
+	dir1_y = y[3] / 255.0
+	dir0_x = x[2] / 255.0
+	dir1_x = x[3] / 255.0
+
+	w_z, w_y, w_x = _estimate_normal_weights(
+		dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x, eps=eps)
+
+	w_sum = w_z + w_y + w_x + eps
+	cos_fused = (w_z * z[0] + w_y * y[0] + w_x * x[0]) / w_sum
+	gm_fused = (z[1] + y[1] + x[1]) / w_sum
+
+	out[0] = np.clip(cos_fused, 0, 255).astype(np.uint8)
+	out[1] = np.clip(gm_fused, 0, 255).astype(np.uint8)
+	out[2] = z[2].astype(np.uint8)
+	out[3] = z[3].astype(np.uint8)
+	out[4] = z[4].astype(np.uint8)
+	out[5] = y[2].astype(np.uint8)
+	out[6] = y[3].astype(np.uint8)
+	out[7] = x[2].astype(np.uint8)
+	out[8] = x[3].astype(np.uint8)
+
+
+def _process_tile_2axis(z, y_data, x_data, out, have_y, have_x):
+	"""Process a tile when only 2 axes are available (no normal-weight fusion)."""
+	out[0] = z[0].astype(np.uint8)
+	out[1] = z[1].astype(np.uint8)
+	out[2] = z[2].astype(np.uint8)
+	out[3] = z[3].astype(np.uint8)
+	out[4] = z[4].astype(np.uint8)
+	ch = 5
+	if have_y:
+		out[ch] = np.clip(y_data[2], 0, 255).astype(np.uint8)
+		out[ch + 1] = np.clip(y_data[3], 0, 255).astype(np.uint8)
+		ch += 2
+	if have_x:
+		out[ch] = np.clip(x_data[2], 0, 255).astype(np.uint8)
+		out[ch + 1] = np.clip(x_data[3], 0, 255).astype(np.uint8)
+
+
+def _warmup_fuse_kernel():
+	"""Trigger numba JIT compilation with a tiny dummy tile."""
+	if _fuse_tile_3axis is None:
+		return
+	dummy = np.zeros((5, 1, 1, 1), dtype=np.float32)
+	out = np.zeros((9, 1, 1, 1), dtype=np.uint8)
+	_fuse_tile_3axis(dummy, dummy, dummy, out, np.float32(1e-7))
+
+
+def _run_integrate_tile_parallel(
+	*, z_vol, y_vol, x_vol, out,
+	have_y, have_x, have_all_3, n_out_ch, out_chunks, eps,
+	zi_lo, zi_hi, yi_lo, yi_hi, xi_lo, xi_hi,
+):
+	"""Tile-parallel path: numba fused kernel releases GIL, threads run in parallel."""
+	_, cz_out, cy_out, cx_out = out_chunks
+	tiles = []
+	for zs in range(zi_lo, zi_hi, cz_out):
+		ze = min(zi_hi, zs + cz_out)
+		for ys in range(yi_lo, yi_hi, cy_out):
+			ye = min(yi_hi, ys + cy_out)
+			for xs in range(xi_lo, xi_hi, cx_out):
+				xe = min(xi_hi, xs + cx_out)
+				tiles.append((zs, ze, ys, ye, xs, xe))
+
+	n_tiles = len(tiles)
+	print(f"[integrate_directions] {n_tiles} tiles, {_N_WORKERS} workers, compute=numba")
+
+	print("[integrate_directions] warming up numba kernel...", end="", flush=True)
+	t_warmup = time.time()
+	_warmup_fuse_kernel()
+	print(f" {time.time() - t_warmup:.1f}s", flush=True)
+
+	lock = threading.Lock()
+	done_count = [0]
+	t_read_sum = [0.0]
+	t_compute_sum = [0.0]
+	t_write_sum = [0.0]
+
+	def process_tile(coords):
+		zs, ze, ys, ye, xs, xe = coords
+		t_r0 = time.time()
+		z_chunk = np.asarray(z_vol[:5, zs:ze, ys:ye, xs:xe]).astype(np.float32)
+		y_chunk = np.asarray(y_vol[:5, zs:ze, ys:ye, xs:xe]).astype(np.float32) if have_y else None
+		x_chunk = np.asarray(x_vol[:5, zs:ze, ys:ye, xs:xe]).astype(np.float32) if have_x else None
+		dt_read = time.time() - t_r0
+
+		t_c0 = time.time()
+		out_tile = np.empty((n_out_ch, ze - zs, ye - ys, xe - xs), dtype=np.uint8)
+		if have_all_3:
+			_fuse_tile_3axis(z_chunk, y_chunk, x_chunk, out_tile, eps)
+		else:
+			_process_tile_2axis(z_chunk, y_chunk, x_chunk, out_tile, have_y, have_x)
+		dt_compute = time.time() - t_c0
+
+		t_w0 = time.time()
+		for ch in range(n_out_ch):
+			out[ch, zs:ze, ys:ye, xs:xe] = out_tile[ch]
+		dt_write = time.time() - t_w0
+
+		with lock:
+			t_read_sum[0] += dt_read
+			t_compute_sum[0] += dt_compute
+			t_write_sum[0] += dt_write
+			done_count[0] += 1
+
+	t0 = time.time()
+	with ThreadPoolExecutor(max_workers=_N_WORKERS) as pool:
+		futures = [pool.submit(process_tile, t) for t in tiles]
+		for f in as_completed(futures):
+			f.result()
+			with lock:
+				dc = done_count[0]
+			elapsed = max(1e-6, time.time() - t0)
+			per = elapsed / max(1, dc)
+			eta = per * max(0, n_tiles - dc)
+			bar_w = 30
+			fill = int(round(float(dc) / float(max(1, n_tiles)) * bar_w))
+			bar = "#" * fill + "-" * (bar_w - fill)
+			print(
+				f"\r[integrate] [{bar}] {dc}/{n_tiles} "
+				f"({100.0 * dc / max(1, n_tiles):.1f}%) "
+				f"eta {int(eta // 60):02d}:{int(eta % 60):02d} "
+				f"avg={1000.0 * elapsed / max(1, dc):.2f}ms/tile",
+				end="", flush=True,
+			)
+
+	print("", flush=True)
+	total = time.time() - t0
+	avg_ms = 1000.0 * total / max(1, n_tiles)
+	avg_read = 1000.0 * t_read_sum[0] / max(1, n_tiles)
+	avg_compute = 1000.0 * t_compute_sum[0] / max(1, n_tiles)
+	avg_write = 1000.0 * t_write_sum[0] / max(1, n_tiles)
+	print(f"[integrate_directions] done in {total:.1f}s "
+		  f"({n_tiles} tiles, avg {avg_ms:.2f}ms/tile: "
+		  f"read={avg_read:.2f}ms compute={avg_compute:.2f}ms write={avg_write:.2f}ms)")
+
+
+def _run_integrate_slab(
+	*, z_vol, y_vol, x_vol, out,
+	have_y, have_x, have_all_3, n_out_ch, z_chunks, eps,
+	zi_lo, zi_hi, yi_lo, yi_hi, xi_lo, xi_hi,
+	crop_z_count,
+):
+	"""Slab-based path: read/compute full z-slabs with numpy, pipelined I/O."""
+	src_z_chunk = z_chunks[1]
+	batch_size = src_z_chunk
+
+	vols_to_read = [z_vol]
+	if have_y:
+		vols_to_read.append(y_vol)
+	if have_x:
+		vols_to_read.append(x_vol)
+
+	ys, ye, xs, xe = yi_lo, yi_hi, xi_lo, xi_hi
+	io_pool = ThreadPoolExecutor(max_workers=len(vols_to_read) + 1)
+
+	def _do_read(vol, s, e):
+		return np.asarray(vol[:5, s:e, ys:ye, xs:xe]).astype(np.float32)
+
+	def _submit_reads(zi_s, zi_e):
+		return [io_pool.submit(_do_read, vol, zi_s, zi_e) for vol in vols_to_read]
+
+	def _do_write(out_arr, ch_data, zi_s, zi_e):
+		for ch, data in ch_data:
+			out_arr[ch, zi_s:zi_e, ys:ye, xs:xe] = data
+
+	batches = [(zi_s, min(zi_hi, zi_s + batch_size))
+			   for zi_s in range(zi_lo, zi_hi, batch_size)]
+	n_batches_total = len(batches)
+	print(f"[integrate_directions] {n_batches_total} z-slabs, batch_size={batch_size}, "
+		  f"compute=numpy (slab), pipeline read||compute||write")
+
+	t0 = time.time()
+	t_read_wait = 0.0
+	t_compute_total = 0.0
+	t_write_wait = 0.0
+	done_batches = 0
+
+	read_futs = _submit_reads(*batches[0]) if batches else []
+	write_fut = None
+
+	for bi, (zi_start, zi_end) in enumerate(batches):
+		t_rw0 = time.time()
+		read_results = [f.result() for f in read_futs]
+		t_read_wait += time.time() - t_rw0
+
+		ri = 0
+		z_batch = read_results[ri]; ri += 1
+		y_batch = read_results[ri] if have_y else None
+		if have_y:
+			ri += 1
+		x_batch = read_results[ri] if have_x else None
+
+		if bi + 1 < len(batches):
+			read_futs = _submit_reads(*batches[bi + 1])
+
+		if write_fut is not None:
+			t_ww0 = time.time()
+			write_fut.result()
+			t_write_wait += time.time() - t_ww0
+
+		t_c0 = time.time()
+		ch_data = []
+
+		if have_all_3:
+			dir0_z = z_batch[2] / 255.0
+			dir1_z = z_batch[3] / 255.0
+			dir0_y = y_batch[2] / 255.0
+			dir1_y = y_batch[3] / 255.0
+			dir0_x = x_batch[2] / 255.0
+			dir1_x = x_batch[3] / 255.0
+			w_z, w_y, w_x = _estimate_normal_weights(
+				dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x)
+			w_sum = w_z + w_y + w_x + eps
+			cos_fused = (w_z * z_batch[0] + w_y * y_batch[0] + w_x * x_batch[0]) / w_sum
+			gm_fused = (z_batch[1] + y_batch[1] + x_batch[1]) / w_sum
+			ch_data.append((0, np.clip(cos_fused, 0, 255).astype(np.uint8)))
+			ch_data.append((1, np.clip(gm_fused, 0, 255).astype(np.uint8)))
+		else:
+			ch_data.append((0, z_batch[0].astype(np.uint8)))
+			ch_data.append((1, z_batch[1].astype(np.uint8)))
+
+		ch_data.append((2, z_batch[2].astype(np.uint8)))
+		ch_data.append((3, z_batch[3].astype(np.uint8)))
+		ch_data.append((4, z_batch[4].astype(np.uint8)))
+		ch_off = 5
+		if have_y:
+			ch_data.append((ch_off, np.clip(y_batch[2], 0, 255).astype(np.uint8)))
+			ch_data.append((ch_off + 1, np.clip(y_batch[3], 0, 255).astype(np.uint8)))
+			ch_off += 2
+		if have_x:
+			ch_data.append((ch_off, np.clip(x_batch[2], 0, 255).astype(np.uint8)))
+			ch_data.append((ch_off + 1, np.clip(x_batch[3], 0, 255).astype(np.uint8)))
+			ch_off += 2
+
+		t_compute_total += time.time() - t_c0
+
+		write_fut = io_pool.submit(_do_write, out, ch_data, zi_start, zi_end)
+
+		done_batches += 1
+		done = zi_end - zi_lo
+		elapsed = max(1e-6, time.time() - t0)
+		per = elapsed / max(1, done)
+		eta = per * max(0, crop_z_count - done)
+		bar_w = 30
+		fill = int(round(float(done) / float(max(1, crop_z_count)) * bar_w))
+		bar = "#" * fill + "-" * (bar_w - fill)
+		nb = max(1, done_batches)
+		print(
+			f"\r[integrate] [{bar}] {done}/{crop_z_count} "
+			f"({100.0 * done / max(1, crop_z_count):.1f}%) "
+			f"eta {int(eta // 60):02d}:{int(eta % 60):02d} "
+			f"read={t_read_wait / nb:.2f}s "
+			f"compute={t_compute_total / nb:.2f}s "
+			f"write={t_write_wait / nb:.2f}s",
+			end="", flush=True,
+		)
+
+	if write_fut is not None:
+		t_ww0 = time.time()
+		write_fut.result()
+		t_write_wait += time.time() - t_ww0
+
+	io_pool.shutdown(wait=False)
+
+	print("", flush=True)
+	total = time.time() - t0
+	print(f"[integrate_directions] done in {total:.1f}s "
+		  f"({n_batches_total} slabs: "
+		  f"read={t_read_wait:.1f}s compute={t_compute_total:.1f}s write={t_write_wait:.1f}s)")
+
+
 def run_integrate_directions(
 	*,
 	z_volume_path: str,
@@ -599,8 +1003,6 @@ def run_integrate_directions(
 	Output channels: [cos, grad_mag, dir0_z, dir1_z, valid, dir0_y, dir1_y, dir0_x, dir1_x]
 	(y/x pairs only present if the corresponding volume is provided; pred_dt appended if given)
 	"""
-	import torch.nn.functional as F
-
 	z_vol = zarr.open(str(z_volume_path), mode="r")
 	z_shape = tuple(int(v) for v in z_vol.shape)
 	if len(z_shape) != 4 or z_shape[0] != 5:
@@ -609,6 +1011,21 @@ def run_integrate_directions(
 
 	z_params = dict(z_vol.attrs.get("preprocess_params", {}))
 	scaledown = int(z_params.get("scaledown", 1))
+
+	crop_param = z_params.get("crop_xyzwhd", None)
+	if crop_param is not None:
+		cx, cy, cz, cw, ch, cd = (int(v) for v in crop_param)
+		zi_lo = max(0, min(cz // scaledown, ref_z))
+		zi_hi = max(zi_lo, min((cz + cd + scaledown - 1) // scaledown, ref_z))
+		yi_lo = max(0, min(cy // scaledown, ref_y))
+		yi_hi = max(yi_lo, min((cy + ch + scaledown - 1) // scaledown, ref_y))
+		xi_lo = max(0, min(cx // scaledown, ref_x))
+		xi_hi = max(xi_lo, min((cx + cw + scaledown - 1) // scaledown, ref_x))
+	else:
+		zi_lo, zi_hi = 0, ref_z
+		yi_lo, yi_hi = 0, ref_y
+		xi_lo, xi_hi = 0, ref_x
+	crop_z_count = zi_hi - zi_lo
 
 	have_y = y_volume_path is not None
 	have_x = x_volume_path is not None
@@ -670,121 +1087,34 @@ def run_integrate_directions(
 		print(f"[integrate_directions] x_volume shape={tuple(int(v) for v in x_vol.shape)}")
 	print(f"[integrate_directions] fusion={'3-axis normal-weighted' if have_all_3 else 'z-only (no fusion)'}")
 	print(f"[integrate_directions] -> {output_path} shape=({n_out_ch}, {ref_z}, {ref_y}, {ref_x})")
+	if crop_param is not None:
+		print(f"[integrate_directions] crop z=[{zi_lo},{zi_hi}) y=[{yi_lo},{yi_hi}) x=[{xi_lo},{xi_hi}) "
+			  f"of ({ref_z},{ref_y},{ref_x}) => {crop_z_count}x{yi_hi-yi_lo}x{xi_hi-xi_lo} slices")
+	else:
+		print(f"[integrate_directions] no crop — processing full {ref_z}x{ref_y}x{ref_x}")
 
-	eps = 1e-7
+	eps = np.float32(1e-7)
 
-	def _read_source_batch(vol, axis_label: str, zi_s: int, zi_e: int) -> np.ndarray:
-		"""Read channels 0-4 from a source volume for a z-index range.
+	# Choose processing strategy: tile-parallel (numba releases GIL) vs slab-based (numpy)
+	use_numba = have_all_3 and _fuse_tile_3axis is not None
 
-		Source volumes have z as dim index 2 (plane dim for axis=y/x).
-		  y-volume zarr: (C, Y_ds, Z_ds, X_ds) → slice at z gives (C, Y, X)
-		  x-volume zarr: (C, X_ds, Z_ds, Y_ds) → slice at z gives (C, X, Y) → transpose to (C, Y, X)
-
-		Returns (batch, 5, ref_y, ref_x) float32 array.
-		"""
-		vol_z_size = int(vol.shape[2])
-		zs = max(0, min(zi_s, vol_z_size))
-		ze = max(zs, min(zi_e, vol_z_size))
-		actual = ze - zs
-		target = zi_e - zi_s
-
-		if actual > 0:
-			raw = np.asarray(vol[:5, :, zs:ze, :])  # (5, dim1, batch, dim3)
-			raw = np.moveaxis(raw, 2, 0).astype(np.float32)  # (batch, 5, dim1, dim3)
-		else:
-			raw = np.zeros((0, 5, int(vol.shape[1]), int(vol.shape[3])), dtype=np.float32)
-
-		if axis_label == "x":
-			# x-volume: (batch, 5, X_ds, Y_ds) → swap to (batch, 5, Y_ds, X_ds)
-			raw = np.ascontiguousarray(np.swapaxes(raw, 2, 3))
-
-		# Pad if we hit the boundary
-		if actual < target:
-			pad = np.zeros((target - actual, 5, raw.shape[2], raw.shape[3]), dtype=np.float32)
-			raw = np.concatenate([raw, pad], axis=0)
-
-		# Resize to (ref_y, ref_x) if needed
-		h, w = raw.shape[2], raw.shape[3]
-		if h != ref_y or w != ref_x:
-			raw_t = torch.from_numpy(raw.reshape(-1, 1, h, w))
-			resized = F.interpolate(raw_t, size=(ref_y, ref_x), mode="bilinear", align_corners=False)
-			raw = resized.numpy().reshape(target, 5, ref_y, ref_x)
-
-		return raw
-
-	t0 = time.time()
-	for zi_start in range(0, ref_z, batch_size):
-		zi_end = min(ref_z, zi_start + batch_size)
-
-		# Read z-volume batch: (5, bs, ref_y, ref_x)
-		z_batch = np.asarray(z_vol[:5, zi_start:zi_end]).astype(np.float32)
-
-		if have_all_3:
-			y_batch = _read_source_batch(y_vol, "y", zi_start, zi_end)  # (bs, 5, Y, X)
-			x_batch = _read_source_batch(x_vol, "x", zi_start, zi_end)  # (bs, 5, Y, X)
-
-			# Decode dir channels to [0,1] float
-			dir0_z = z_batch[2] / 255.0  # (bs, Y, X)
-			dir1_z = z_batch[3] / 255.0
-			dir0_y = y_batch[:, 2] / 255.0
-			dir1_y = y_batch[:, 3] / 255.0
-			dir0_x = x_batch[:, 2] / 255.0
-			dir1_x = x_batch[:, 3] / 255.0
-
-			# Estimate 3D normal weights
-			w_z, w_y, w_x = _estimate_normal_weights(
-				dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x)
-
-			# Fuse cos (weighted average, raw uint8 scale)
-			w_sum = w_z + w_y + w_x + eps
-			cos_fused = (w_z * z_batch[0] + w_y * y_batch[:, 0] + w_x * x_batch[:, 0]) / w_sum
-
-			# Fuse grad_mag (sum / weight_sum, raw uint8 scale)
-			gm_fused = (z_batch[1] + y_batch[:, 1] + x_batch[:, 1]) / w_sum
-
-			# Write fused cos and grad_mag
-			out[0, zi_start:zi_end] = np.clip(cos_fused, 0, 255).astype(np.uint8)
-			out[1, zi_start:zi_end] = np.clip(gm_fused, 0, 255).astype(np.uint8)
-		else:
-			# No fusion: use z-only cos and grad_mag
-			out[0, zi_start:zi_end] = z_batch[0].astype(np.uint8)
-			out[1, zi_start:zi_end] = z_batch[1].astype(np.uint8)
-
-		# Z-axis dir0, dir1, valid (always from z-volume)
-		out[2, zi_start:zi_end] = z_batch[2].astype(np.uint8)
-		out[3, zi_start:zi_end] = z_batch[3].astype(np.uint8)
-		out[4, zi_start:zi_end] = z_batch[4].astype(np.uint8)
-
-		# Per-axis dir channels
-		ch_off = 5
-		if have_y:
-			if not have_all_3:
-				y_batch = _read_source_batch(y_vol, "y", zi_start, zi_end)
-			out[ch_off, zi_start:zi_end] = np.clip(y_batch[:, 2], 0, 255).astype(np.uint8)
-			out[ch_off + 1, zi_start:zi_end] = np.clip(y_batch[:, 3], 0, 255).astype(np.uint8)
-			ch_off += 2
-		if have_x:
-			if not have_all_3:
-				x_batch = _read_source_batch(x_vol, "x", zi_start, zi_end)
-			out[ch_off, zi_start:zi_end] = np.clip(x_batch[:, 2], 0, 255).astype(np.uint8)
-			out[ch_off + 1, zi_start:zi_end] = np.clip(x_batch[:, 3], 0, 255).astype(np.uint8)
-			ch_off += 2
-
-		elapsed = max(1e-6, time.time() - t0)
-		per = elapsed / max(1, zi_end)
-		eta = per * max(0, ref_z - zi_end)
-		bar_w = 30
-		fill = int(round(float(zi_end) / float(max(1, ref_z)) * bar_w))
-		bar = "#" * fill + "-" * (bar_w - fill)
-		print(
-			f"\r[integrate_directions] [{bar}] {zi_end}/{ref_z} "
-			f"({100.0 * zi_end / max(1, ref_z):.1f}%) "
-			f"eta {int(eta // 60):02d}:{int(eta % 60):02d}",
-			end="", flush=True,
+	if use_numba:
+		_run_integrate_tile_parallel(
+			z_vol=z_vol, y_vol=y_vol, x_vol=x_vol, out=out,
+			have_y=have_y, have_x=have_x, have_all_3=have_all_3,
+			n_out_ch=n_out_ch, out_chunks=out_chunks, eps=eps,
+			zi_lo=zi_lo, zi_hi=zi_hi, yi_lo=yi_lo, yi_hi=yi_hi,
+			xi_lo=xi_lo, xi_hi=xi_hi,
 		)
-
-	print("", flush=True)
-	print(f"[integrate_directions] done in {time.time() - t0:.1f}s")
+	else:
+		_run_integrate_slab(
+			z_vol=z_vol, y_vol=y_vol, x_vol=x_vol, out=out,
+			have_y=have_y, have_x=have_x, have_all_3=have_all_3,
+			n_out_ch=n_out_ch, z_chunks=z_chunks, eps=eps,
+			zi_lo=zi_lo, zi_hi=zi_hi, yi_lo=yi_lo, yi_hi=yi_hi,
+			xi_lo=xi_lo, xi_hi=xi_hi,
+			crop_z_count=crop_z_count,
+		)
 
 	if pred_dt_path:
 		pred_dt_ch = channel_names.index("pred_dt")
