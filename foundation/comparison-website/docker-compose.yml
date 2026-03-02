@@ -1,0 +1,26 @@
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATASET_ROOT: /data/images
+      DATABASE_PATH: /app/data/preferences.db
+      ALLOWED_ORIGINS: "*"
+    volumes:
+      - ./images:/data/images:ro
+      - ./data:/app/data
+    restart: unless-stopped
+
+  web:
+    image: nginx:1.27-alpine
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./images:/data/images:ro
+      - ./images_deprecated:/data/images_deprecated:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
