@@ -5,6 +5,18 @@ from pathlib import Path
 import time
 
 import cv2
+try:
+	import cupy as cp
+	from cupyx.scipy import ndimage as cnd
+	_HAS_CUPY = True
+except ImportError:
+	_HAS_CUPY = False
+try:
+	import edt as edt_mod
+	_HAS_EDT = True
+except ImportError:
+	edt_mod = None
+	_HAS_EDT = False
 import numpy as np
 import torch
 import zarr
@@ -317,6 +329,182 @@ def run_preprocess(
 	)
 
 
+def _compute_pred_dt_channel(
+	*,
+	pred_path: str,
+	output_arr: zarr.Array,
+	channel_idx: int,
+	ref_z: int, ref_y: int, ref_x: int,
+	downscale_xy: int,
+	z_step_eff: int,
+	crop_xyzwhd: list[int] | None,
+	chunk_depth: int = 1000,
+	chunk_yx: int = 1024,
+	overlap: int = 255,
+) -> None:
+	"""Compute distance-to-surface channel from a prediction zarr and write into output_arr."""
+	pred = zarr.open(str(pred_path), mode="r")
+	if not hasattr(pred, "shape"):
+		# OME-Zarr group — use highest-resolution array (level 0)
+		if hasattr(pred, "__getitem__") and "0" in pred:
+			pred = pred["0"]
+		else:
+			raise ValueError(f"pred-dt must point to a zarr array or OME-Zarr group, got: {pred_path}")
+	pred_shape = tuple(int(v) for v in pred.shape)
+	if len(pred_shape) != 3:
+		raise ValueError(f"pred-dt array must be (Z,Y,X), got shape {pred_shape}")
+	pZ, pY, pX = pred_shape
+
+	# Apply crop to prediction volume (same coordinate space as input volume)
+	if crop_xyzwhd is not None:
+		cx, cy, cz, cw, ch, cd = (int(v) for v in crop_xyzwhd)
+		p_z0 = max(0, min(cz, pZ))
+		p_z1 = max(p_z0, min(cz + max(0, cd), pZ))
+		p_y0 = max(0, min(cy, pY))
+		p_y1 = max(p_y0, min(cy + max(0, ch), pY))
+		p_x0 = max(0, min(cx, pX))
+		p_x1 = max(p_x0, min(cx + max(0, cw), pX))
+	else:
+		p_z0, p_z1 = 0, pZ
+		p_y0, p_y1 = 0, pY
+		p_x0, p_x1 = 0, pX
+
+	total_z = p_z1 - p_z0
+	total_y = p_y1 - p_y0
+	total_x = p_x1 - p_x0
+	if total_z <= 0:
+		print(f"[pred_dt] WARNING: empty z range after crop, skipping")
+		return
+
+	# Round up chunk_depth to a multiple of z_step_eff so z sampling phase
+	# stays aligned across chunk boundaries
+	if z_step_eff > 1:
+		chunk_depth = ((chunk_depth + z_step_eff - 1) // z_step_eff) * z_step_eff
+
+	# Build chunk grid for all 3 axes
+	z_starts = list(range(p_z0, p_z1, chunk_depth))
+	y_starts = list(range(p_y0, p_y1, chunk_yx))
+	x_starts = list(range(p_x0, p_x1, chunk_yx))
+	n_chunks = len(z_starts) * len(y_starts) * len(x_starts)
+
+	print(
+		f"[pred_dt] pred={pred_path} shape={pred_shape} crop_z=[{p_z0},{p_z1}) "
+		f"crop_y=[{p_y0},{p_y1}) crop_x=[{p_x0},{p_x1}) "
+		f"downscale_xy={downscale_xy} z_step_eff={z_step_eff} "
+		f"chunk_depth={chunk_depth} chunk_yx={chunk_yx} overlap={overlap}",
+		flush=True,
+	)
+	print(
+		f"[pred_dt] {len(z_starts)}z x {len(y_starts)}y x {len(x_starts)}x = {n_chunks} chunk(s)",
+		flush=True,
+	)
+
+	t0 = time.time()
+	chunk_i = 0
+
+	for z_pos in z_starts:
+		z_chunk_end = min(p_z1, z_pos + chunk_depth)
+		# Padded read range in Z
+		read_z0 = max(p_z0, z_pos - overlap)
+		read_z1 = min(p_z1, z_chunk_end + overlap)
+
+		for y_pos in y_starts:
+			y_chunk_end = min(p_y1, y_pos + chunk_yx)
+			# Padded read range in Y
+			read_y0 = max(p_y0, y_pos - overlap)
+			read_y1 = min(p_y1, y_chunk_end + overlap)
+
+			for x_pos in x_starts:
+				x_chunk_end = min(p_x1, x_pos + chunk_yx)
+				# Padded read range in X
+				read_x0 = max(p_x0, x_pos - overlap)
+				read_x1 = min(p_x1, x_chunk_end + overlap)
+
+				chunk_i += 1
+				read_sz = (read_z1 - read_z0, read_y1 - read_y0, read_x1 - read_x0)
+				print(
+					f"[pred_dt] chunk {chunk_i}/{n_chunks}  "
+					f"z=[{z_pos},{z_chunk_end}) y=[{y_pos},{y_chunk_end}) x=[{x_pos},{x_chunk_end})  "
+					f"reading {read_sz} ...",
+					end="", flush=True,
+				)
+				t_read = time.time()
+				chunk_np = np.asarray(pred[read_z0:read_z1, read_y0:read_y1, read_x0:read_x1])
+				print(f" {time.time() - t_read:.1f}s", flush=True)
+
+				# Binarize and compute distance transform
+				binary = chunk_np > 0
+				if _HAS_CUPY:
+					print(f"[pred_dt] chunk {chunk_i}/{n_chunks}  distance_transform_edt (GPU) ...", end="", flush=True)
+					t_edt = time.time()
+					binary_gpu = cp.asarray(binary)
+					dt_gpu = cnd.distance_transform_edt(~binary_gpu)
+					dt = cp.asnumpy(dt_gpu).astype(np.float32)
+				elif _HAS_EDT:
+					print(f"[pred_dt] chunk {chunk_i}/{n_chunks}  distance_transform_edt (CPU) ...", end="", flush=True)
+					t_edt = time.time()
+					dt = edt_mod.edt(~binary, parallel=32).astype(np.float32)
+				else:
+					raise ImportError("pred-dt requires either CuPy (GPU) or the 'edt' package (CPU). Install with: pip install edt")
+				print(f" {time.time() - t_edt:.1f}s", flush=True)
+
+				# Crop off overlap padding to keep center region
+				pad_z = z_pos - read_z0
+				pad_y = y_pos - read_y0
+				pad_x = x_pos - read_x0
+				center_z = z_chunk_end - z_pos
+				center_y = y_chunk_end - y_pos
+				center_x = x_chunk_end - x_pos
+				dt_center = dt[pad_z:pad_z + center_z, pad_y:pad_y + center_y, pad_x:pad_x + center_x]
+
+				# Clamp to 255, cast to uint8
+				dt_u8 = np.clip(dt_center, 0.0, 255.0).astype(np.uint8)
+
+				# Downscale to output grid
+				# Z: subsample at z_step_eff spacing
+				z_indices_full = list(range(z_pos, z_chunk_end, z_step_eff))
+				if not z_indices_full:
+					continue
+
+				for zf in z_indices_full:
+					local_z = zf - z_pos
+					if local_z < 0 or local_z >= dt_u8.shape[0]:
+						continue
+					slc = dt_u8[local_z]
+
+					# YX downscale
+					if downscale_xy > 1:
+						out_h = max(1, slc.shape[0] // downscale_xy)
+						out_w = max(1, slc.shape[1] // downscale_xy)
+						slc = cv2.resize(slc, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+					# Output indices
+					out_zi = zf // z_step_eff
+					if out_zi < 0 or out_zi >= ref_z:
+						continue
+					out_y0 = y_pos // max(1, downscale_xy)
+					out_x0 = x_pos // max(1, downscale_xy)
+					out_y1 = min(ref_y, out_y0 + slc.shape[0])
+					out_x1 = min(ref_x, out_x0 + slc.shape[1])
+					wy = out_y1 - out_y0
+					wx = out_x1 - out_x0
+					if wy > 0 and wx > 0:
+						output_arr[channel_idx, out_zi, out_y0:out_y1, out_x0:out_x1] = slc[:wy, :wx]
+
+				elapsed = max(1e-6, time.time() - t0)
+				progress = float(chunk_i) / float(max(1, n_chunks))
+				eta = elapsed / max(1e-6, progress) * (1.0 - progress)
+				print(
+					f"[pred_dt] chunk {chunk_i}/{n_chunks} done — "
+					f"{100.0 * progress:.1f}%  "
+					f"elapsed {int(elapsed // 60):02d}:{int(elapsed % 60):02d}  "
+					f"eta {int(eta // 60):02d}:{int(eta % 60):02d}",
+					flush=True,
+				)
+
+	print(f"[pred_dt] done in {time.time() - t0:.1f}s", flush=True)
+
+
 def run_integrate_directions(
 	*,
 	z_volume_path: str,
@@ -324,6 +512,7 @@ def run_integrate_directions(
 	x_volume_path: str | None = None,
 	output_path: str,
 	batch_size: int = 32,
+	pred_dt_path: str | None = None,
 ) -> None:
 	"""Integrate dir channels from axis-y and axis-x volumes into the axis-z reference volume.
 
@@ -364,6 +553,21 @@ def run_integrate_directions(
 		x_ds = int(x_params.get("downscale_xy", 1))
 		sources.append(("x", x_vol, float(z_step_eff) / float(max(1, x_ds))))
 		channel_names.extend(["dir0_x", "dir1_x"])
+
+	# Validate pred-dt early, before any heavy processing
+	if pred_dt_path:
+		_pred_check = zarr.open(str(pred_dt_path), mode="r")
+		if not hasattr(_pred_check, "shape"):
+			if hasattr(_pred_check, "__getitem__") and "0" in _pred_check:
+				_pred_check = _pred_check["0"]
+			else:
+				raise ValueError(f"pred-dt must point to a zarr array or OME-Zarr group, got: {pred_dt_path}")
+		_pred_shape = tuple(int(v) for v in _pred_check.shape)
+		if len(_pred_shape) != 3:
+			raise ValueError(f"pred-dt array must be 3D (Z,Y,X), got shape {_pred_shape}")
+		print(f"[integrate_directions] pred-dt={pred_dt_path} shape={_pred_shape}", flush=True)
+		del _pred_check, _pred_shape
+		channel_names.append("pred_dt")
 
 	if not sources:
 		raise ValueError("at least one of y_volume_path or x_volume_path must be provided")
@@ -438,6 +642,19 @@ def run_integrate_directions(
 	print("", flush=True)
 	print(f"[integrate_directions] done in {time.time() - t0:.1f}s")
 
+	if pred_dt_path:
+		pred_dt_ch = channel_names.index("pred_dt")
+		crop_param = z_params.get("crop_xyzwhd", None)
+		_compute_pred_dt_channel(
+			pred_path=pred_dt_path,
+			output_arr=out,
+			channel_idx=pred_dt_ch,
+			ref_z=ref_z, ref_y=ref_y, ref_x=ref_x,
+			downscale_xy=int(z_params.get("downscale_xy", 1)),
+			z_step_eff=z_step_eff,
+			crop_xyzwhd=crop_param,
+		)
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -501,6 +718,7 @@ def main_integrate(argv: list[str] | None = None) -> int:
 	p.add_argument("--x-volume", default=None, help="Axis-x preprocessed zarr (optional).")
 	p.add_argument("--output", required=True, help="Output zarr path.")
 	p.add_argument("--batch-size", type=int, default=32, help="Z-slices per batch for resize (default: 32).")
+	p.add_argument("--pred-dt", default=None, help="Surface prediction zarr for distance-to-skeleton channel.")
 	args = p.parse_args(argv)
 
 	if args.y_volume is None and args.x_volume is None:
@@ -512,6 +730,7 @@ def main_integrate(argv: list[str] | None = None) -> int:
 		x_volume_path=str(args.x_volume) if args.x_volume else None,
 		output_path=str(args.output),
 		batch_size=int(args.batch_size),
+		pred_dt_path=str(args.pred_dt) if args.pred_dt else None,
 	)
 	return 0
 
