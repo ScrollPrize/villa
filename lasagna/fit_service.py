@@ -1,4 +1,4 @@
-"""HTTP service wrapping the 2D fit optimizer for use by VC3D.
+"""HTTP service wrapping the 3D fit optimizer for use by VC3D.
 
 Start with:
     python fit_service.py [--port PORT] [--data-dir PATH]

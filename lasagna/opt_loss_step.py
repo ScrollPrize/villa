@@ -5,24 +5,23 @@ import torch
 import model as fit_model
 
 
+def step_loss_maps(*, res: fit_model.FitResult3D) -> torch.Tensor:
+	"""Return height-step squared penalty (relative), shape (D, 1, Hm-1, Wm).
 
-def step_loss_maps(*, res: fit_model.FitResult) -> torch.Tensor:
-	"""Return vertical step squared penalty (relative), shape (1,1,H-1,W)."""
-	x = res.xy_lr[..., 0].unsqueeze(1)
-	y = res.xy_lr[..., 1].unsqueeze(1)
-
-	dx_v = x[:, :, 1:, :] - x[:, :, :-1, :]
-	dy_v = y[:, :, 1:, :] - y[:, :, :-1, :]
-	len_v = torch.sqrt(dx_v * dx_v + dy_v * dy_v + 1e-8)
-
-	t_v = float(res.mesh_step_px)
-	eps = 1e-12
-	rel = (len_v - t_v) / (t_v + eps)
+	Computes distance between adjacent mesh points along the height (H) axis
+	and penalizes deviation from the target mesh_step in fullres voxels.
+	"""
+	# res.xyz_lr: (D, Hm, Wm, 3)
+	diff = res.xyz_lr[:, 1:, :, :] - res.xyz_lr[:, :-1, :, :]  # (D, Hm-1, Wm, 3)
+	len_v = torch.sqrt((diff * diff).sum(dim=-1, keepdim=True) + 1e-8)  # (D, Hm-1, Wm, 1)
+	len_v = len_v.permute(0, 3, 1, 2)  # (D, 1, Hm-1, Wm)
+	t_v = float(res.params.mesh_step)
+	rel = (len_v - t_v) / (t_v + 1e-12)
 	return rel * rel
 
 
-def step_loss(*, res: fit_model.FitResult) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Penalize vertical mesh edge lengths deviating from the configured step size (relative)."""
-	step_v = step_loss_maps(res=res)
-	mask = torch.ones_like(step_v)
-	return step_v.mean(), (step_v,), (mask,)
+def step_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Penalize height mesh edge lengths deviating from mesh_step (relative)."""
+	lm = step_loss_maps(res=res)
+	mask = torch.ones_like(lm)
+	return lm.mean(), (lm,), (mask,)
