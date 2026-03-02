@@ -112,6 +112,8 @@ blending = [
     "scipy>=1.13.1",       # For scipy.ndimage.gaussian_filter in blending.py
     "tqdm>=4.67.1",        # Progress bars
     "nest-asyncio>=1.6.0", # Required by vesuvius.utils.catalog (imported via __init__)
+    "scikit-image>=0.24.0", # For topo post-processing (label, euler_number, morphology)
+    "numba>=0.60.0",        # For JIT-compiled rasterization in topo post-processing
 ]
 
 tests = ["pytest>=8.4.2"]
