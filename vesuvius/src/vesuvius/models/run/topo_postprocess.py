@@ -366,7 +366,8 @@ def fit_curved_sheet_to_component_optimized(
     else:
         _rasterize_surface_dense_sampling_original(grid_points, sheet_volume, samples_per_quad=samples_per_edge)
 
-    sheet_volume = zero_volume_faces(sheet_volume, thickness=5)
+    # NOTE: zero_volume_faces skipped for per-chunk processing — chunk faces
+    # are interior boundaries, not volume edges.
 
     if thickness > 0:
         iterations = max(1, thickness // 2)
@@ -917,14 +918,6 @@ def apply_topo_finalization(logits_np, num_classes, config: TopoPostprocessConfi
         probs = exp_logits / exp_logits.sum(axis=0, keepdims=True)
         prob_map = probs[1]  # (Z, Y, X)
 
-    border = config.topo_border_crop
-
-    # Check if volume is too small for border cropping
-    if any(s <= 2 * border for s in prob_map.shape):
-        # Volume too small for border crop, skip topo processing
-        result = np.zeros((1,) + prob_map.shape, dtype=np.uint8)
-        return result, True
-
     # 2. Run topo_postprocess at multiple threshold levels
     pred = topo_postprocess(
         prob_map,
@@ -947,28 +940,24 @@ def apply_topo_finalization(logits_np, num_classes, config: TopoPostprocessConfi
         )
         alt_preds.append(alt_pred)
 
-    # 3. zero_volume_faces + remove_small_objects on each
-    pred = zero_volume_faces(pred.astype(bool), thickness=config.topo_thickness)
+    # 3. remove_small_objects on each
+    # NOTE: zero_volume_faces and border crop/pad are intentionally skipped
+    # for per-chunk processing — chunk faces are interior boundaries, not
+    # volume edges, so zeroing them would create gaps between chunks.
     pred = remove_small_objects(pred.astype(bool), min_size=config.topo_min_object_size, connectivity=3)
 
     for idx in range(len(alt_preds)):
-        alt_preds[idx] = zero_volume_faces(alt_preds[idx].astype(bool), thickness=config.topo_thickness)
         alt_preds[idx] = remove_small_objects(alt_preds[idx].astype(bool), min_size=config.topo_min_object_size, connectivity=3)
 
     # 4. Fill holes on primary pred
     pred = binary_fill_holes(pred.astype(bool))
-
-    # 5. Crop border from all
-    s = slice(border, -border)
-    pred = pred[s, s, s]
-    alt_preds = [ap[s, s, s] for ap in alt_preds]
 
     # Early exit if nothing survived
     if not np.any(pred) and not any(np.any(ap) for ap in alt_preds):
         result = np.zeros((1,) + prob_map.shape, dtype=np.uint8)
         return result, True
 
-    # 6. Advanced component processing
+    # 5. Advanced component processing
     result_binary, _result_labeled = process_multiple_components_parallel(
         pred,
         grid_resolution=config.topo_grid_resolution,
@@ -984,7 +973,7 @@ def apply_topo_finalization(logits_np, num_classes, config: TopoPostprocessConfi
         samples_per_edge=config.topo_samples_per_edge,
     )
 
-    # 7. Final cleanup — result_binary is (Z', Y', X'); take first if tuple
+    # 6. Final cleanup
     if isinstance(result_binary, tuple):
         result_binary = result_binary[0]
 
@@ -992,14 +981,6 @@ def apply_topo_finalization(logits_np, num_classes, config: TopoPostprocessConfi
         result_binary.astype(bool),
         min_size=config.topo_final_min_object_size,
         connectivity=3
-    )
-
-    # 8. Pad back the border
-    pred_final = np.pad(
-        pred_final,
-        pad_width=((border, border), (border, border), (border, border)),
-        mode="constant",
-        constant_values=0,
     )
 
     # Shape back to (1, Z, Y, X) for consistency with finalize output
