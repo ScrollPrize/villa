@@ -25,7 +25,6 @@ from skimage.measure import euler_number, label
 from skimage.morphology import ball, remove_small_objects
 
 from numba import jit, prange
-from concurrent.futures import ThreadPoolExecutor
 
 
 # ============================================================================
@@ -51,7 +50,6 @@ class TopoPostprocessConfig:
     topo_samples_per_edge: int = 8
     topo_alt_t_lows: tuple = (0.5, 0.7)
     topo_border_crop: int = 3
-    topo_inner_parallelism: bool = False
 
 
 # ============================================================================
@@ -599,7 +597,7 @@ def _reinterpolate_bad_components(
     result_labeled,
     grid_resolution, thickness, smoothing, max_distance, samples_per_edge,
     overlap_buffer, min_dice, min_coverage, alt_min_dice, alt_min_coverage,
-    alternative_volumes, use_parallel, n_jobs,
+    alternative_volumes,
     max_iterations=3,
 ):
     """
@@ -626,7 +624,7 @@ def _reinterpolate_bad_components(
         if not bad_ids:
             break
 
-        # Step A: Fit sheets in parallel
+        # Step A: Fit sheets
         fit_args = [
             (cid,
              (check_labeled == cid),
@@ -637,13 +635,7 @@ def _reinterpolate_bad_components(
              samples_per_edge)
             for cid in bad_ids
         ]
-
-        if use_parallel and len(fit_args) > 1:
-            max_workers = n_jobs if n_jobs > 0 else None
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                fit_results = list(executor.map(process_component_wrapper, fit_args))
-        else:
-            fit_results = [process_component_wrapper(a) for a in fit_args]
+        fit_results = [process_component_wrapper(a) for a in fit_args]
 
         fitted_sheets = {cid: fitted for cid, fitted in fit_results}
 
@@ -671,13 +663,7 @@ def _reinterpolate_bad_components(
              alternative_volumes, erosion_iterations, struct_elem)
             for cid in bad_ids
         ]
-
-        if use_parallel and len(eval_args) > 1:
-            max_workers = n_jobs if n_jobs > 0 else None
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                eval_results = list(executor.map(_evaluate_component_worker, eval_args))
-        else:
-            eval_results = [_evaluate_component_worker(a) for a in eval_args]
+        eval_results = [_evaluate_component_worker(a) for a in eval_args]
 
         # Step D: Update result_labeled
         next_label = result_labeled.max() + 1
@@ -724,14 +710,14 @@ def process_multiple_components_parallel(
     alt_min_coverage=None,
     alt_min_dice=None,
     max_distance=10,
-    use_parallel=True,
-    n_jobs=-1,
+    use_parallel=False,
+    n_jobs=1,
     samples_per_edge=8,
     max_reinterp_iterations=1,
 ):
     """
-    Parallel processing with Euler-based pre-filtering, Numba JIT rasterization,
-    parallel fitting/evaluation, and iterative beta1 re-interpolation.
+    Component processing with Euler-based pre-filtering, Numba JIT rasterization,
+    fitting/evaluation, and iterative beta1 re-interpolation.
     """
     labeled_volume = label(volume)
     num_components = labeled_volume.max()
@@ -767,13 +753,7 @@ def process_multiple_components_parallel(
              thickness + overlap_buffer, smoothing, max_distance, samples_per_edge)
             for i in needs_interpolation
         ]
-
-        if use_parallel and len(needs_interpolation) > 1:
-            max_workers = n_jobs if n_jobs > 0 else None
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                fit_results = list(executor.map(process_component_wrapper, fit_args))
-        else:
-            fit_results = [process_component_wrapper(a) for a in fit_args]
+        fit_results = [process_component_wrapper(a) for a in fit_args]
 
         for cid, fitted in fit_results:
             fitted_sheets[cid] = fitted
@@ -800,12 +780,7 @@ def process_multiple_components_parallel(
         for i in range(1, num_components + 1)
     ]
 
-    if use_parallel and num_components > 1:
-        max_workers = n_jobs if n_jobs > 0 else None
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            eval_results = list(executor.map(_evaluate_component_worker, eval_args))
-    else:
-        eval_results = [_evaluate_component_worker(a) for a in eval_args]
+    eval_results = [_evaluate_component_worker(a) for a in eval_args]
 
     # STEP 5: Assemble result_labeled
     result_labeled = np.zeros_like(volume, dtype=np.int32)
@@ -842,8 +817,6 @@ def process_multiple_components_parallel(
         alt_min_dice=alt_min_dice,
         alt_min_coverage=alt_min_coverage,
         alternative_volumes=alternative_volumes,
-        use_parallel=use_parallel,
-        n_jobs=n_jobs,
         max_iterations=max_reinterp_iterations,
     )
 
@@ -1006,8 +979,6 @@ def apply_topo_finalization(logits_np, num_classes, config: TopoPostprocessConfi
         min_dice=config.topo_min_dice,
         max_distance=config.topo_max_distance,
         alternative_volumes=alt_preds,
-        use_parallel=config.topo_inner_parallelism,
-        n_jobs=-1 if config.topo_inner_parallelism else 1,
         alt_min_coverage=0.75,
         alt_min_dice=0.45,
         samples_per_edge=config.topo_samples_per_edge,

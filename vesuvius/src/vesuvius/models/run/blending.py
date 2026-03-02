@@ -1100,11 +1100,6 @@ def blend_and_finalize_main():
                         help='Comma-separated T_low values for alternative volumes. Default: 0.5,0.7')
     parser.add_argument('--topo_border_crop', type=int, default=3,
                         help='Border crop size in voxels. Default: 3')
-    parser.add_argument('--topo_inner_parallelism', action='store_true',
-                        help='Enable inner thread parallelism for topo component processing. '
-                             'Usually not needed since the outer ProcessPoolExecutor already '
-                             'parallelizes across chunks. Default: disabled')
-
     args = parser.parse_args()
 
     if args.part_id < 0 or args.part_id >= args.num_parts:
@@ -1141,7 +1136,6 @@ def blend_and_finalize_main():
             topo_samples_per_edge=args.topo_samples_per_edge,
             topo_alt_t_lows=alt_t_lows,
             topo_border_crop=args.topo_border_crop,
-            topo_inner_parallelism=args.topo_inner_parallelism,
         )
 
     from vesuvius.models.run.finalize_outputs import FinalizeConfig
