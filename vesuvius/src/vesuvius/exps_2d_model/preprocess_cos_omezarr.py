@@ -11,7 +11,12 @@ try:
 	_HAS_CUPY = True
 except ImportError:
 	_HAS_CUPY = False
-import edt as edt_mod
+try:
+	import edt as edt_mod
+	_HAS_EDT = True
+except ImportError:
+	edt_mod = None
+	_HAS_EDT = False
 import numpy as np
 import torch
 import zarr
@@ -376,6 +381,11 @@ def _compute_pred_dt_channel(
 		print(f"[pred_dt] WARNING: empty z range after crop, skipping")
 		return
 
+	# Round up chunk_depth to a multiple of z_step_eff so z sampling phase
+	# stays aligned across chunk boundaries
+	if z_step_eff > 1:
+		chunk_depth = ((chunk_depth + z_step_eff - 1) // z_step_eff) * z_step_eff
+
 	# Build chunk grid for all 3 axes
 	z_starts = list(range(p_z0, p_z1, chunk_depth))
 	y_starts = list(range(p_y0, p_y1, chunk_yx))
@@ -435,10 +445,12 @@ def _compute_pred_dt_channel(
 					binary_gpu = cp.asarray(binary)
 					dt_gpu = cnd.distance_transform_edt(~binary_gpu)
 					dt = cp.asnumpy(dt_gpu).astype(np.float32)
-				else:
+				elif _HAS_EDT:
 					print(f"[pred_dt] chunk {chunk_i}/{n_chunks}  distance_transform_edt (CPU) ...", end="", flush=True)
 					t_edt = time.time()
 					dt = edt_mod.edt(~binary, parallel=32).astype(np.float32)
+				else:
+					raise ImportError("pred-dt requires either CuPy (GPU) or the 'edt' package (CPU). Install with: pip install edt")
 				print(f" {time.time() - t_edt:.1f}s", flush=True)
 
 				# Crop off overlap padding to keep center region
