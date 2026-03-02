@@ -419,11 +419,7 @@ def _compute_pred_dt_channel(
 	"""Compute distance-to-surface channel from a prediction zarr and write into output_arr."""
 	pred = zarr.open(str(pred_path), mode="r")
 	if not hasattr(pred, "shape"):
-		# OME-Zarr group — use highest-resolution array (level 0)
-		if hasattr(pred, "__getitem__") and "0" in pred:
-			pred = pred["0"]
-		else:
-			raise ValueError(f"pred-dt must point to a zarr array or OME-Zarr group, got: {pred_path}")
+		raise ValueError(f"pred-dt must point to a zarr array, got group: {pred_path}")
 	pred_shape = tuple(int(v) for v in pred.shape)
 	if len(pred_shape) != 3:
 		raise ValueError(f"pred-dt array must be (Z,Y,X), got shape {pred_shape}")
@@ -639,12 +635,10 @@ def run_integrate_directions(
 
 	# Validate pred-dt early, before any heavy processing
 	if pred_dt_path:
+		pred_dt_path = pred_dt_path.rstrip("/")
 		_pred_check = zarr.open(str(pred_dt_path), mode="r")
 		if not hasattr(_pred_check, "shape"):
-			if hasattr(_pred_check, "__getitem__") and "0" in _pred_check:
-				_pred_check = _pred_check["0"]
-			else:
-				raise ValueError(f"pred-dt must point to a zarr array or OME-Zarr group, got: {pred_dt_path}")
+			raise ValueError(f"pred-dt must point to a zarr array, got group: {pred_dt_path}")
 		_pred_shape = tuple(int(v) for v in _pred_check.shape)
 		if len(_pred_shape) != 3:
 			raise ValueError(f"pred-dt array must be 3D (Z,Y,X), got shape {_pred_shape}")

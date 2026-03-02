@@ -204,4 +204,14 @@ python preprocess_cos_omezarr.py integrate \
     --x-volume x_cos.zarr \
     --output fused.zarr \
     --pred-dt <PRED_SURFACE>.zarr
+
+# 3. Convert to VC3D OME-Zarr for visualization
+python convert_fit_zarr_to_vc3d_omezarr.py \
+    --input fused.zarr \
+    --output-prefix vc3d
 ```
+
+Step 3 produces one OME-Zarr pyramid per channel: `vc3d_cos.ome.zarr`,
+`vc3d_grad_mag.ome.zarr`, etc. Each pyramid has 5 levels (configurable via
+`--levels`) and reads `scaledown` from the input zarr metadata to place the
+crop at the correct absolute position in the pyramid.

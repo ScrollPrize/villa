@@ -12,13 +12,6 @@ def _down2(a: np.ndarray) -> np.ndarray:
 	return a[::2, ::2, ::2]
 
 
-def _expand_z_repeat(a: np.ndarray, *, z_repeat: int) -> np.ndarray:
-	r = max(1, int(z_repeat))
-	if r <= 1:
-		return a
-	return np.repeat(a, repeats=r, axis=0)
-
-
 def _shape_div2(shape: tuple[int, int, int], n: int) -> tuple[int, int, int]:
 	z, y, x = (int(v) for v in shape)
 	for _ in range(max(0, int(n))):
@@ -99,8 +92,8 @@ def _channels_from_src(*, c_in: int, params: dict) -> list[str]:
 	return [f"ch{i}" for i in range(int(c_in))]
 
 
-def _first_filled_level_from_downscale(*, downscale_xy: int) -> int:
-	d = max(1, int(downscale_xy))
+def _first_filled_level_from_downscale(scaledown: int) -> int:
+	d = max(1, int(scaledown))
 	lv = 0
 	while d > 1:
 		d //= 2
@@ -122,12 +115,8 @@ def run(
 		raise ValueError(f"input dtype must be uint8, got {a.dtype}")
 
 	params = dict(getattr(a, "attrs", {}).get("preprocess_params", {}) or {})
-	z_repeat = int(params.get("z_step", 1) or 1)
-	downscale_xy = int(params.get("downscale_xy", 1) or 1)
-	first_filled_level = _first_filled_level_from_downscale(downscale_xy=downscale_xy)
-	z_step_eff = int(params.get("z_step_eff", int(z_repeat) * int(max(1, int(downscale_xy)))))
-	if z_step_eff <= 0:
-		raise ValueError(f"invalid preprocess_params.z_step_eff: {z_step_eff}")
+	scaledown = int(params.get("scaledown", 1) or 1)
+	first_filled_level = _first_filled_level_from_downscale(scaledown)
 
 	c_in, z0, y0, x0 = (int(v) for v in a.shape)
 	zs0 = 0
@@ -140,12 +129,12 @@ def run(
 	if isinstance(crop_xyzwhd, (list, tuple)) and len(crop_xyzwhd) == 6:
 		x0f, y0f, z0f, wf, hf, df = (int(v) for v in crop_xyzwhd)
 		if wf > 0 and hf > 0 and df > 0:
-			xs0 = max(0, int(x0f) // int(max(1, downscale_xy)))
-			ys0 = max(0, int(y0f) // int(max(1, downscale_xy)))
-			zs0 = max(0, int(z0f) // int(z_step_eff))
-			xs1 = min(int(x0), _ceil_div(int(x0f) + int(wf), int(max(1, downscale_xy))))
-			ys1 = min(int(y0), _ceil_div(int(y0f) + int(hf), int(max(1, downscale_xy))))
-			zs1 = min(int(z0), _ceil_div(int(z0f) + int(df), int(z_step_eff)))
+			xs0 = max(0, x0f // scaledown)
+			ys0 = max(0, y0f // scaledown)
+			zs0 = max(0, z0f // scaledown)
+			xs1 = min(int(x0), _ceil_div(x0f + wf, scaledown))
+			ys1 = min(int(y0), _ceil_div(y0f + hf, scaledown))
+			zs1 = min(int(z0), _ceil_div(z0f + df, scaledown))
 	if zs1 <= zs0 or ys1 <= ys0 or xs1 <= xs0:
 		raise ValueError(
 			f"empty crop selection for conversion: z=[{zs0},{zs1}) y=[{ys0},{ys1}) x=[{xs0},{xs1}) from input shape={(z0, y0, x0)}"
@@ -164,10 +153,9 @@ def run(
 			chunk=max(1, int(chunk)),
 			label=f"[convert_fit_zarr_to_vc3d_omezarr] load {ch}",
 		)
-		base = _expand_z_repeat(base, z_repeat=z_repeat)
 		base_shape = tuple(int(v) for v in base.shape)
-		base_full_shape = (int(z0) * int(max(1, int(z_repeat))), int(y0), int(x0))
-		off_base = (int(zs0) * int(max(1, int(z_repeat))), int(ys0), int(xs0))
+		base_full_shape = (int(z0), int(y0), int(x0))
+		off_base = (int(zs0), int(ys0), int(xs0))
 
 		arrs: dict[int, zarr.Array] = {}
 		for lv in range(max(1, int(levels))):
@@ -255,12 +243,10 @@ def run(
 		g.attrs["vc3d_convert"] = {
 			"channel": str(ch),
 			"channel_index": int(ci),
-			"z_repeat": int(z_repeat),
-			"downscale_xy": int(downscale_xy),
-			"z_step_eff": int(z_step_eff),
+			"scaledown": int(scaledown),
 			"crop_scaled_zyx_start": [int(zs0), int(ys0), int(xs0)],
 			"crop_scaled_zyx_stop": [int(zs1), int(ys1), int(xs1)],
-			"crop_repeated_zyx_start": [int(off_base[0]), int(off_base[1]), int(off_base[2])],
+			"crop_offset_zyx": [int(off_base[0]), int(off_base[1]), int(off_base[2])],
 			"base_full_shape": [int(base_full_shape[0]), int(base_full_shape[1]), int(base_full_shape[2])],
 			"levels": int(levels),
 			"first_filled_level": int(first_filled_level),
@@ -268,7 +254,7 @@ def run(
 
 		print(
 			f"[convert_fit_zarr_to_vc3d_omezarr] channel={ch} "
-			f"input=(Z,Y,X)={(z0, y0, x0)} crop_scaled=[z:{zs0}:{zs1},y:{ys0}:{ys1},x:{xs0}:{xs1}] repeated_z={int(base_shape[0])} "
+			f"input=(Z,Y,X)={(z0, y0, x0)} crop_scaled=[z:{zs0}:{zs1},y:{ys0}:{ys1},x:{xs0}:{xs1}] "
 			f"base_full={(int(base_full_shape[0]), int(base_full_shape[1]), int(base_full_shape[2]))} "
 			f"out={str(out_path)} filled_levels={int(first_filled_level)}..{int(levels)-1}"
 		)
