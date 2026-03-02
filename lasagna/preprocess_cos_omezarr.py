@@ -62,6 +62,86 @@ def _pyrdown2d(arr: np.ndarray, *, factor: int) -> np.ndarray:
 	return out
 
 
+def _decode_dir_angle(dir0: np.ndarray, dir1: np.ndarray) -> np.ndarray:
+	"""Decode dir0+dir1 (in [0,1]) to angle θ ∈ (-π/2, π/2]."""
+	cos2t = 2.0 * dir0 - 1.0
+	sin2t = cos2t - np.sqrt(2.0) * (2.0 * dir1 - 1.0)
+	return np.arctan2(sin2t, cos2t) * 0.5
+
+
+def _estimate_normal_weights(
+	dir0_z: np.ndarray, dir1_z: np.ndarray,
+	dir0_y: np.ndarray, dir1_y: np.ndarray,
+	dir0_x: np.ndarray, dir1_x: np.ndarray,
+	eps: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+	"""Estimate 3D surface normal weights from three axis dir channel pairs.
+
+	Each axis's dir0/dir1 (in [0,1]) encodes a 2D gradient direction in the
+	slicing plane. The three constraints form a 3×3 system whose least-squares
+	normal is found via cross products of row pairs.
+
+	Returns (w_z, w_y, w_x) — absolute normal components, each same shape as
+	the input arrays.
+	"""
+	theta_z = _decode_dir_angle(dir0_z, dir1_z)
+	theta_y = _decode_dir_angle(dir0_y, dir1_y)
+	theta_x = _decode_dir_angle(dir0_x, dir1_x)
+
+	sz, cz = np.sin(theta_z), np.cos(theta_z)
+	sy, cy = np.sin(theta_y), np.cos(theta_y)
+	sx, cx = np.sin(theta_x), np.cos(theta_x)
+
+	# Constraint rows (see lasagna_3d.md for derivation):
+	#   r1 = (sin θ_z, -cos θ_z, 0)       from z-slices
+	#   r2 = (sin θ_y,  0,      -cos θ_y)  from y-slices
+	#   r3 = (0,         sin θ_x, -cos θ_x) from x-slices
+	#
+	# Cross products (candidate normals):
+	# n1 = r1 × r2
+	n1_x = cz * cy
+	n1_y = sz * cy
+	n1_z = cz * sy  # note: cross product sign works out positive here
+
+	# n2 = r1 × r3
+	n2_x = cz * cx
+	n2_y = sz * cx
+	n2_z = sz * sx
+
+	# n3 = r2 × r3
+	n3_x = cy * sx
+	n3_y = sy * cx
+	n3_z = sy * sx
+
+	# Align signs: flip n2, n3 so dot(ni, n1) >= 0
+	dot2 = n1_x * n2_x + n1_y * n2_y + n1_z * n2_z
+	sign2 = np.where(dot2 >= 0, 1.0, -1.0)
+	n2_x = n2_x * sign2
+	n2_y = n2_y * sign2
+	n2_z = n2_z * sign2
+
+	dot3 = n1_x * n3_x + n1_y * n3_y + n1_z * n3_z
+	sign3 = np.where(dot3 >= 0, 1.0, -1.0)
+	n3_x = n3_x * sign3
+	n3_y = n3_y * sign3
+	n3_z = n3_z * sign3
+
+	# Sum and normalize
+	nx = n1_x + n2_x + n3_x
+	ny = n1_y + n2_y + n3_y
+	nz = n1_z + n2_z + n3_z
+	norm = np.sqrt(nx * nx + ny * ny + nz * nz) + eps
+
+	# Weights = |components| of normalized normal
+	# w_z = |nz|/norm (how much z-slicing axis sees the surface)
+	# w_y = |ny|/norm, w_x = |nx|/norm
+	w_z = np.abs(nz) / norm
+	w_y = np.abs(ny) / norm
+	w_x = np.abs(nx) / norm
+
+	return w_z, w_y, w_x
+
+
 def run_preprocess(
 	*,
 	input_path: str,
@@ -70,11 +150,10 @@ def run_preprocess(
 	device: str | None,
 	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
 	axis: str = "z",
-	z_step: int,
 	tile_size: int,
 	overlap: int,
 	border: int,
-	downscale_xy: int,
+	scaledown: int,
 	grad_mag_blur_sigma: float,
 	dir_blur_sigma: float,
 	chunk_z: int,
@@ -95,8 +174,8 @@ def run_preprocess(
 	if nz <= 0 or ny <= 0 or nx <= 0:
 		raise ValueError(f"empty crop: x=[{x0},{x1}) y=[{y0},{y1}) z=[{z0},{z1}) in shape={sh}")
 
-	if downscale_xy <= 0:
-		raise ValueError("downscale must be >= 1")
+	if scaledown <= 0:
+		raise ValueError("scaledown must be >= 1")
 
 	# --- Axis-dependent dimension mapping ---
 	# Everything in ZYX order (matching zarr layout, indices 0=Z, 1=Y, 2=X)
@@ -112,29 +191,27 @@ def run_preprocess(
 	full_sizes = [int(sh[0]), int(sh[1]), int(sh[2])]
 
 	slice_start, slice_end = crop_ranges[slice_dim]
-	step_raw = max(1, int(z_step))
-	step_eff = step_raw * max(1, int(downscale_xy))
 
-	slice_sel = list(range(int(slice_start), int(slice_end), int(step_eff)))
+	slice_sel = list(range(int(slice_start), int(slice_end), int(scaledown)))
 	if len(slice_sel) <= 0:
 		raise ValueError(
 			f"empty {dim_names[slice_dim]} selection after downscale: "
-			f"{dim_names[slice_dim]}=[{slice_start},{slice_end}) step={step_eff}"
+			f"{dim_names[slice_dim]}=[{slice_start},{slice_end}) scaledown={scaledown}"
 		)
 	proc_count = len(slice_sel)
 
-	# Output sizes in ZYX order
+	# Output sizes in ZYX order — uniform scaledown in all dims
 	out_sizes = [0, 0, 0]
-	out_sizes[slice_dim] = _ds_size(full_sizes[slice_dim], step_eff)
-	out_sizes[plane_dim0] = _ds_size(full_sizes[plane_dim0], downscale_xy)
-	out_sizes[plane_dim1] = _ds_size(full_sizes[plane_dim1], downscale_xy)
+	out_sizes[slice_dim] = _ds_size(full_sizes[slice_dim], scaledown)
+	out_sizes[plane_dim0] = _ds_size(full_sizes[plane_dim0], scaledown)
+	out_sizes[plane_dim1] = _ds_size(full_sizes[plane_dim1], scaledown)
 	out_z, out_y, out_x = out_sizes
 
 	# Output offsets in ZYX order
 	out_offsets = [0, 0, 0]
-	out_offsets[slice_dim] = _ds_index(crop_ranges[slice_dim][0], step_eff)
-	out_offsets[plane_dim0] = _ds_index(crop_ranges[plane_dim0][0], downscale_xy)
-	out_offsets[plane_dim1] = _ds_index(crop_ranges[plane_dim1][0], downscale_xy)
+	out_offsets[slice_dim] = _ds_index(crop_ranges[slice_dim][0], scaledown)
+	out_offsets[plane_dim0] = _ds_index(crop_ranges[plane_dim0][0], scaledown)
+	out_offsets[plane_dim1] = _ds_index(crop_ranges[plane_dim1][0], scaledown)
 
 	if device is None:
 		device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -169,9 +246,7 @@ def run_preprocess(
 	)
 	arr.attrs["preprocess_params"] = {
 		"axis": axis,
-		"downscale_xy": int(downscale_xy),
-		"z_step": int(step_raw),
-		"z_step_eff": int(step_eff),
+		"scaledown": int(scaledown),
 		"grad_mag_blur_sigma": float(grad_mag_blur_sigma),
 		"grad_mag_encode_scale": float(1000.0),
 		"dir_blur_sigma": float(dir_blur_sigma),
@@ -184,7 +259,7 @@ def run_preprocess(
 	ax_name = dim_names[slice_dim]
 	print(
 		f"[preprocess_cos_omezarr] input={input_path} axis={axis} crop_xyzwhd=({x0},{y0},{z0},{nx},{ny},{nz}) "
-		f"step={step_raw} step_eff={step_eff} proc_slices={proc_count} out_shape_full={(out_z, out_y, out_x)} in_shape={sh} "
+		f"scaledown={scaledown} proc_slices={proc_count} out_shape_full={(out_z, out_y, out_x)} in_shape={sh} "
 		f"-> out={output_path} out_shape={(5, out_z, out_y, out_x)} dtype=uint8"
 	)
 	t0 = time.time()
@@ -207,7 +282,7 @@ def run_preprocess(
 			continue
 		slo = max(int(slice_start), sr0)
 		shi = sr1
-		s_keep = [ss for ss in range(slo, shi) if ((ss - int(slice_start)) % int(step_eff)) == 0]
+		s_keep = [ss for ss in range(slo, shi) if ((ss - int(slice_start)) % int(scaledown)) == 0]
 		if len(s_keep) <= 0:
 			continue
 		idx_keep = np.asarray([ss - sr0 for ss in s_keep], dtype=np.int64)
@@ -259,11 +334,11 @@ def run_preprocess(
 			grad_mag_np = grad_mag[0, 0].detach().cpu().numpy().astype(np.float32)
 			dir0_np = dir0[0, 0].detach().cpu().numpy().astype(np.float32)
 			dir1_np = dir1[0, 0].detach().cpu().numpy().astype(np.float32)
-			if downscale_xy > 1:
-				cos_np = _pyrdown2d(cos_np, factor=int(downscale_xy))
-				grad_mag_np = _pyrdown2d(grad_mag_np, factor=int(downscale_xy))
-				dir0_np = _pyrdown2d(dir0_np, factor=int(downscale_xy))
-				dir1_np = _pyrdown2d(dir1_np, factor=int(downscale_xy))
+			if scaledown > 1:
+				cos_np = _pyrdown2d(cos_np, factor=int(scaledown))
+				grad_mag_np = _pyrdown2d(grad_mag_np, factor=int(scaledown))
+				dir0_np = _pyrdown2d(dir0_np, factor=int(scaledown))
+				dir1_np = _pyrdown2d(dir1_np, factor=int(scaledown))
 
 			grad_mag = torch.from_numpy(grad_mag_np).to(device=torch_device, dtype=torch.float32)[None, None, :, :]
 			dir0 = torch.from_numpy(dir0_np).to(device=torch_device, dtype=torch.float32)[None, None, :, :]
@@ -280,7 +355,7 @@ def run_preprocess(
 			t_wr0 = time.time()
 
 			# Output index along slice dimension
-			oi = int(ss) // int(step_eff)
+			oi = int(ss) // int(scaledown)
 			# Output ranges for plane dimensions (shape[0]=plane_dim0, shape[1]=plane_dim1)
 			p0_start = out_offsets[plane_dim0]
 			p1_start = out_offsets[plane_dim1]
@@ -335,8 +410,7 @@ def _compute_pred_dt_channel(
 	output_arr: zarr.Array,
 	channel_idx: int,
 	ref_z: int, ref_y: int, ref_x: int,
-	downscale_xy: int,
-	z_step_eff: int,
+	scaledown: int,
 	crop_xyzwhd: list[int] | None,
 	chunk_depth: int = 1000,
 	chunk_yx: int = 1024,
@@ -376,10 +450,10 @@ def _compute_pred_dt_channel(
 		print(f"[pred_dt] WARNING: empty z range after crop, skipping")
 		return
 
-	# Round up chunk_depth to a multiple of z_step_eff so z sampling phase
+	# Round up chunk_depth to a multiple of scaledown so z sampling phase
 	# stays aligned across chunk boundaries
-	if z_step_eff > 1:
-		chunk_depth = ((chunk_depth + z_step_eff - 1) // z_step_eff) * z_step_eff
+	if scaledown > 1:
+		chunk_depth = ((chunk_depth + scaledown - 1) // scaledown) * scaledown
 
 	# Build chunk grid for all 3 axes
 	z_starts = list(range(p_z0, p_z1, chunk_depth))
@@ -390,7 +464,7 @@ def _compute_pred_dt_channel(
 	print(
 		f"[pred_dt] pred={pred_path} shape={pred_shape} crop_z=[{p_z0},{p_z1}) "
 		f"crop_y=[{p_y0},{p_y1}) crop_x=[{p_x0},{p_x1}) "
-		f"downscale_xy={downscale_xy} z_step_eff={z_step_eff} "
+		f"scaledown={scaledown} "
 		f"chunk_depth={chunk_depth} chunk_yx={chunk_yx} overlap={overlap}",
 		flush=True,
 	)
@@ -461,8 +535,8 @@ def _compute_pred_dt_channel(
 				dt_u8 = np.clip(dt_center, 0.0, 255.0).astype(np.uint8)
 
 				# Downscale to output grid
-				# Z: subsample at z_step_eff spacing
-				z_indices_full = list(range(z_pos, z_chunk_end, z_step_eff))
+				# Z: subsample at scaledown spacing
+				z_indices_full = list(range(z_pos, z_chunk_end, scaledown))
 				if not z_indices_full:
 					continue
 
@@ -473,17 +547,17 @@ def _compute_pred_dt_channel(
 					slc = dt_u8[local_z]
 
 					# YX downscale
-					if downscale_xy > 1:
-						out_h = max(1, slc.shape[0] // downscale_xy)
-						out_w = max(1, slc.shape[1] // downscale_xy)
+					if scaledown > 1:
+						out_h = max(1, slc.shape[0] // scaledown)
+						out_w = max(1, slc.shape[1] // scaledown)
 						slc = cv2.resize(slc, (out_w, out_h), interpolation=cv2.INTER_AREA)
 
 					# Output indices
-					out_zi = zf // z_step_eff
+					out_zi = zf // scaledown
 					if out_zi < 0 or out_zi >= ref_z:
 						continue
-					out_y0 = y_pos // max(1, downscale_xy)
-					out_x0 = x_pos // max(1, downscale_xy)
+					out_y0 = y_pos // max(1, scaledown)
+					out_x0 = x_pos // max(1, scaledown)
 					out_y1 = min(ref_y, out_y0 + slc.shape[0])
 					out_x1 = min(ref_x, out_x0 + slc.shape[1])
 					wy = out_y1 - out_y0
@@ -514,15 +588,20 @@ def run_integrate_directions(
 	batch_size: int = 32,
 	pred_dt_path: str | None = None,
 ) -> None:
-	"""Integrate dir channels from axis-y and axis-x volumes into the axis-z reference volume.
+	"""Fuse cos/grad_mag from three axis volumes using normal-weighted fusion.
 
-	The z-volume shape is the reference. For each source (y/x) volume:
-	  - Z indices are mapped via ratio = z_step_eff / source_downscale (= raw step).
-	  - The 2D YX plane is resized with bilinear interpolation to match z-volume dims.
-	  - Only the sparse dimension actually changes size; the other is already identical.
+	All three axis volumes must be preprocessed with the same uniform scaledown.
+	The z-volume shape is the reference. Z-index mapping is 1:1 (uniform scaledown
+	means all volumes have the same grid spacing in every dimension).
+
+	When all three axes are available, cos and grad_mag are fused using estimated
+	3D surface normal weights. When only two axes are available, z-only cos/grad_mag
+	are used (no fusion).
+
+	Dir channels are always stored separately per axis (no fusion).
 
 	Output channels: [cos, grad_mag, dir0_z, dir1_z, valid, dir0_y, dir1_y, dir0_x, dir1_x]
-	(y/x pairs only present if the corresponding volume is provided)
+	(y/x pairs only present if the corresponding volume is provided; pred_dt appended if given)
 	"""
 	import torch.nn.functional as F
 
@@ -533,25 +612,29 @@ def run_integrate_directions(
 	_, ref_z, ref_y, ref_x = z_shape
 
 	z_params = dict(z_vol.attrs.get("preprocess_params", {}))
-	z_step_eff = int(z_params.get("z_step_eff", 1))
+	scaledown = int(z_params.get("scaledown", 1))
 
-	# (axis_label, zarr handle, z-index ratio)
-	sources: list[tuple[str, zarr.Array, float]] = []
+	have_y = y_volume_path is not None
+	have_x = x_volume_path is not None
+	have_all_3 = have_y and have_x
+
+	y_vol = zarr.open(str(y_volume_path), mode="r") if have_y else None
+	x_vol = zarr.open(str(x_volume_path), mode="r") if have_x else None
+
+	if not have_y and not have_x:
+		raise ValueError("at least one of y_volume_path or x_volume_path must be provided")
+
+	if not have_all_3:
+		import warnings
+		warnings.warn(
+			"Only 2 axis volumes provided — using z-only cos/grad_mag (no fusion). "
+			"Provide all three (z, y, x) for normal-weighted fusion."
+		)
+
 	channel_names: list[str] = ["cos", "grad_mag", "dir0", "dir1", "valid"]
-
-	if y_volume_path:
-		y_vol = zarr.open(str(y_volume_path), mode="r")
-		y_params = dict(y_vol.attrs.get("preprocess_params", {}))
-		# Y-volume's Z dim uses downscale_xy (Z is a plane dim for axis=y)
-		y_ds = int(y_params.get("downscale_xy", 1))
-		sources.append(("y", y_vol, float(z_step_eff) / float(max(1, y_ds))))
+	if have_y:
 		channel_names.extend(["dir0_y", "dir1_y"])
-
-	if x_volume_path:
-		x_vol = zarr.open(str(x_volume_path), mode="r")
-		x_params = dict(x_vol.attrs.get("preprocess_params", {}))
-		x_ds = int(x_params.get("downscale_xy", 1))
-		sources.append(("x", x_vol, float(z_step_eff) / float(max(1, x_ds))))
+	if have_x:
 		channel_names.extend(["dir0_x", "dir1_x"])
 
 	# Validate pred-dt early, before any heavy processing
@@ -568,9 +651,6 @@ def run_integrate_directions(
 		print(f"[integrate_directions] pred-dt={pred_dt_path} shape={_pred_shape}", flush=True)
 		del _pred_check, _pred_shape
 		channel_names.append("pred_dt")
-
-	if not sources:
-		raise ValueError("at least one of y_volume_path or x_volume_path must be provided")
 
 	n_out_ch = len(channel_names)
 	z_chunks = tuple(int(v) for v in z_vol.chunks)
@@ -589,41 +669,111 @@ def run_integrate_directions(
 	out_params["channels"] = channel_names
 	out.attrs["preprocess_params"] = out_params
 
-	print(f"[integrate_directions] z_volume={z_volume_path} shape={z_shape}")
-	for ax_label, vol, z_ratio in sources:
-		print(f"[integrate_directions] {ax_label}_volume shape={tuple(int(v) for v in vol.shape)} z_ratio={z_ratio:.1f}")
+	print(f"[integrate_directions] z_volume={z_volume_path} shape={z_shape} scaledown={scaledown}")
+	if have_y:
+		print(f"[integrate_directions] y_volume shape={tuple(int(v) for v in y_vol.shape)}")
+	if have_x:
+		print(f"[integrate_directions] x_volume shape={tuple(int(v) for v in x_vol.shape)}")
+	print(f"[integrate_directions] fusion={'3-axis normal-weighted' if have_all_3 else 'z-only (no fusion)'}")
 	print(f"[integrate_directions] -> {output_path} shape=({n_out_ch}, {ref_z}, {ref_y}, {ref_x})")
+
+	eps = 1e-7
+
+	def _read_source_batch(vol, axis_label: str, zi_s: int, zi_e: int) -> np.ndarray:
+		"""Read channels 0-4 from a source volume for a z-index range.
+
+		Source volumes have z as dim index 2 (plane dim for axis=y/x).
+		  y-volume zarr: (C, Y_ds, Z_ds, X_ds) → slice at z gives (C, Y, X)
+		  x-volume zarr: (C, X_ds, Z_ds, Y_ds) → slice at z gives (C, X, Y) → transpose to (C, Y, X)
+
+		Returns (batch, 5, ref_y, ref_x) float32 array.
+		"""
+		vol_z_size = int(vol.shape[2])
+		zs = max(0, min(zi_s, vol_z_size))
+		ze = max(zs, min(zi_e, vol_z_size))
+		actual = ze - zs
+		target = zi_e - zi_s
+
+		if actual > 0:
+			raw = np.asarray(vol[:5, :, zs:ze, :])  # (5, dim1, batch, dim3)
+			raw = np.moveaxis(raw, 2, 0).astype(np.float32)  # (batch, 5, dim1, dim3)
+		else:
+			raw = np.zeros((0, 5, int(vol.shape[1]), int(vol.shape[3])), dtype=np.float32)
+
+		if axis_label == "x":
+			# x-volume: (batch, 5, X_ds, Y_ds) → swap to (batch, 5, Y_ds, X_ds)
+			raw = np.ascontiguousarray(np.swapaxes(raw, 2, 3))
+
+		# Pad if we hit the boundary
+		if actual < target:
+			pad = np.zeros((target - actual, 5, raw.shape[2], raw.shape[3]), dtype=np.float32)
+			raw = np.concatenate([raw, pad], axis=0)
+
+		# Resize to (ref_y, ref_x) if needed
+		h, w = raw.shape[2], raw.shape[3]
+		if h != ref_y or w != ref_x:
+			raw_t = torch.from_numpy(raw.reshape(-1, 1, h, w))
+			resized = F.interpolate(raw_t, size=(ref_y, ref_x), mode="bilinear", align_corners=False)
+			raw = resized.numpy().reshape(target, 5, ref_y, ref_x)
+
+		return raw
 
 	t0 = time.time()
 	for zi_start in range(0, ref_z, batch_size):
 		zi_end = min(ref_z, zi_start + batch_size)
 
-		# Copy all 5 z-volume channels for this batch
-		out[:5, zi_start:zi_end] = np.asarray(z_vol[:5, zi_start:zi_end])
+		# Read z-volume batch: (5, bs, ref_y, ref_x)
+		z_batch = np.asarray(z_vol[:5, zi_start:zi_end]).astype(np.float32)
 
+		if have_all_3:
+			y_batch = _read_source_batch(y_vol, "y", zi_start, zi_end)  # (bs, 5, Y, X)
+			x_batch = _read_source_batch(x_vol, "x", zi_start, zi_end)  # (bs, 5, Y, X)
+
+			# Decode dir channels to [0,1] float
+			dir0_z = z_batch[2] / 255.0  # (bs, Y, X)
+			dir1_z = z_batch[3] / 255.0
+			dir0_y = y_batch[:, 2] / 255.0
+			dir1_y = y_batch[:, 3] / 255.0
+			dir0_x = x_batch[:, 2] / 255.0
+			dir1_x = x_batch[:, 3] / 255.0
+
+			# Estimate 3D normal weights
+			w_z, w_y, w_x = _estimate_normal_weights(
+				dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x)
+
+			# Fuse cos (weighted average, raw uint8 scale)
+			w_sum = w_z + w_y + w_x + eps
+			cos_fused = (w_z * z_batch[0] + w_y * y_batch[:, 0] + w_x * x_batch[:, 0]) / w_sum
+
+			# Fuse grad_mag (sum / weight_sum, raw uint8 scale)
+			gm_fused = (z_batch[1] + y_batch[:, 1] + x_batch[:, 1]) / w_sum
+
+			# Write fused cos and grad_mag
+			out[0, zi_start:zi_end] = np.clip(cos_fused, 0, 255).astype(np.uint8)
+			out[1, zi_start:zi_end] = np.clip(gm_fused, 0, 255).astype(np.uint8)
+		else:
+			# No fusion: use z-only cos and grad_mag
+			out[0, zi_start:zi_end] = z_batch[0].astype(np.uint8)
+			out[1, zi_start:zi_end] = z_batch[1].astype(np.uint8)
+
+		# Z-axis dir0, dir1, valid (always from z-volume)
+		out[2, zi_start:zi_end] = z_batch[2].astype(np.uint8)
+		out[3, zi_start:zi_end] = z_batch[3].astype(np.uint8)
+		out[4, zi_start:zi_end] = z_batch[4].astype(np.uint8)
+
+		# Per-axis dir channels
 		ch_off = 5
-		for ax_label, vol, z_ratio in sources:
-			vol_nz = int(vol.shape[1])
-			vol_ny = int(vol.shape[2])
-			vol_nx = int(vol.shape[3])
-
-			# Map z-vol Z indices to source Z indices
-			src_indices = [min(int(round(zi * z_ratio)), vol_nz - 1) for zi in range(zi_start, zi_end)]
-
-			# Read dir0 (ch 2) and dir1 (ch 3) for each source Z index
-			slices = []
-			for sj in src_indices:
-				slices.append(np.asarray(vol[2:4, sj]))  # (2, Yv, Xv)
-			combined = np.stack(slices).astype(np.float32)  # (batch, 2, Yv, Xv)
-
-			# Resize to (ref_y, ref_x) via bilinear interpolation
-			if vol_ny != ref_y or vol_nx != ref_x:
-				combined_t = torch.from_numpy(combined)
-				resized_t = F.interpolate(combined_t, size=(ref_y, ref_x), mode="bilinear", align_corners=False)
-				combined = resized_t.numpy()
-
-			out[ch_off, zi_start:zi_end] = np.clip(combined[:, 0], 0, 255).astype(np.uint8)
-			out[ch_off + 1, zi_start:zi_end] = np.clip(combined[:, 1], 0, 255).astype(np.uint8)
+		if have_y:
+			if not have_all_3:
+				y_batch = _read_source_batch(y_vol, "y", zi_start, zi_end)
+			out[ch_off, zi_start:zi_end] = np.clip(y_batch[:, 2], 0, 255).astype(np.uint8)
+			out[ch_off + 1, zi_start:zi_end] = np.clip(y_batch[:, 3], 0, 255).astype(np.uint8)
+			ch_off += 2
+		if have_x:
+			if not have_all_3:
+				x_batch = _read_source_batch(x_vol, "x", zi_start, zi_end)
+			out[ch_off, zi_start:zi_end] = np.clip(x_batch[:, 2], 0, 255).astype(np.uint8)
+			out[ch_off + 1, zi_start:zi_end] = np.clip(x_batch[:, 3], 0, 255).astype(np.uint8)
 			ch_off += 2
 
 		elapsed = max(1e-6, time.time() - t0)
@@ -650,8 +800,7 @@ def run_integrate_directions(
 			output_arr=out,
 			channel_idx=pred_dt_ch,
 			ref_z=ref_z, ref_y=ref_y, ref_x=ref_x,
-			downscale_xy=int(z_params.get("downscale_xy", 1)),
-			z_step_eff=z_step_eff,
+			scaledown=scaledown,
 			crop_xyzwhd=crop_param,
 		)
 
@@ -671,13 +820,11 @@ def main(argv: list[str] | None = None) -> int:
 	p.add_argument("--axis", choices=["z", "y", "x"], default="z",
 		help="Dimension to slice along (default: z). The 2D plane perpendicular to this axis is processed by the UNet.")
 	p.add_argument("--crop-xyzwhd", "--crop", dest="crop_xyzwhd", type=int, nargs=6, default=None, help="Crop in absolute input coordinates: x y z w h d.")
-	p.add_argument("--z-step", "--step", dest="z_step", type=int, default=5,
-		help="Step along the slice axis before downscale (default: 5).")
 	p.add_argument("--tile-size", type=int, default=2048, help="Tile size.")
 	p.add_argument("--overlap", type=int, default=128, help="Tile overlap.")
 	p.add_argument("--border", type=int, default=32, help="Tile border discard width.")
-	p.add_argument("--downscale-xy", "--downscale", dest="downscale_xy", type=int, default=4,
-		help="Downscale factor for the 2D plane dimensions (default: 4).")
+	p.add_argument("--scaledown", type=int, default=4,
+		help="Uniform downscale factor for all three dimensions (default: 4).")
 	p.add_argument("--grad-mag-blur-sigma", type=float, default=4.0, help="Gaussian blur sigma on downscaled grad-mag.")
 	p.add_argument("--dir-blur-sigma", type=float, default=2.0, help="Gaussian blur sigma on downscaled dir0/dir1.")
 	p.add_argument("--chunk-z", "--chunk-slice", dest="chunk_z", type=int, default=32,
@@ -695,11 +842,10 @@ def main(argv: list[str] | None = None) -> int:
 		device=args.device,
 		crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd is not None else None,
 		axis=str(args.axis),
-		z_step=int(args.z_step),
 		tile_size=int(args.tile_size),
 		overlap=int(args.overlap),
 		border=int(args.border),
-		downscale_xy=int(args.downscale_xy),
+		scaledown=int(args.scaledown),
 		grad_mag_blur_sigma=float(args.grad_mag_blur_sigma),
 		dir_blur_sigma=float(args.dir_blur_sigma),
 		chunk_z=int(args.chunk_z),

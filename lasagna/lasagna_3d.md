@@ -1,3 +1,5 @@
+> **No backwards compatibility**: The 3D model is a complete rewrite. No backwards compatibility with the 2D model (archived in `old_2d/`). The 2D UNet inference is reused, but fitting code is independent.
+
 # 3d Lasagna model specs
 
 - the 3d lasagna
@@ -311,6 +313,46 @@ Two mask types (not needed for initial 3D model, but noted for completeness):
 ### 3D model preprocessing
 - **Uniform scaledown**: apply `scaledown` in all three dimensions (z included), so 1 model voxel = scaledown fullres voxels in every direction.
 - **Dir channels stored separately per axis**: all three axis-specific dir0/dir1 pairs are stored in the preprocessed zarr (no fusion). Same as the existing 2D model.
-- **3D normal estimation**: from the three axis-specific dir0/dir1 pairs, fit a 3D surface normal estimate. Each axis pair encodes the normal's projection onto that slicing plane. This normal is used for the weighting and normalization below, not stored as a separate channel.
-- **Normal-weighted per-axis weighting (applies to BOTH cos AND grad_mag)**: weight each axis's contribution by how orthogonal the slicing plane is to the surface: `w_axis = |dot(slice_normal, surface_normal)|`. A tangential slice gets near-zero weight.
-- **Angle normalization (applies ONLY to grad_mag, NOT cos)**: divide each axis's grad_mag by `cos(angle)` where angle is between the slicing plane normal and the surface normal. This corrects for the stretching effect — a nearly tangential slice observes a stretched (reduced) gradient that must be scaled back up. Not applied to cos because fractional distances are roughly angle-independent.
+
+#### Normal estimation algorithm
+
+Each axis's UNet outputs dir0/dir1 encoding the 2D gradient direction in the slicing plane via the double-angle representation. To decode the angle θ:
+
+```
+cos2θ = 2·dir0 - 1
+sin2θ = cos2θ - √2·(2·dir1 - 1)
+θ = atan2(sin2θ, cos2θ) / 2        # θ ∈ (-π/2, π/2]
+```
+
+Each axis constrains the 3D surface normal (nx, ny, nz) via a linear equation (the gradient direction in the slicing plane must be perpendicular to the surface normal projected onto that plane):
+- z-slices (XY plane, gx→X, gy→Y): `nx·sin(θ_z) - ny·cos(θ_z) = 0`
+- y-slices (XZ plane, gx→X, gy→Z): `nx·sin(θ_y) - nz·cos(θ_y) = 0`
+- x-slices (YZ plane, gx→Y, gy→Z): `ny·sin(θ_x) - nz·cos(θ_x) = 0`
+
+**Least-squares solve via cross products**: with 3 constraint rows (r₁, r₂, r₃), compute three cross products of row pairs to get candidate normals:
+- n₁ = r₁×r₂ = (cos θ_z · cos θ_y,  sin θ_z · cos θ_y,  cos θ_z · sin θ_y)
+- n₂ = r₁×r₃ = (cos θ_z · cos θ_x,  sin θ_z · cos θ_x,  sin θ_z · sin θ_x)
+- n₃ = r₂×r₃ = (cos θ_y · sin θ_x,  sin θ_y · cos θ_x,  sin θ_y · sin θ_x)
+
+Align signs so dot(nᵢ, n₁) ≥ 0, then sum: `n_avg = n₁ + n₂ + n₃`. Normalize to unit length. Cross product magnitude naturally weights by reliability — when two constraint planes are nearly parallel their cross product is small.
+
+Output weights: `(w_z, w_y, w_x) = (|nz_component|, |ny_component|, |nx_component|)` of the normalized normal. These represent how orthogonal each slicing axis is to the surface.
+
+#### Fusion formulas
+
+The UNet observes grad_mag stretched by the slicing angle: `gm_observed = G_true · cos(α)` where `cos(α) = w_axis` (the weight for that axis). Angle normalization recovers the true gradient: `G_est = gm_observed / cos(α) = gm_observed / w_axis`.
+
+**cos fusion** (weighted average, no angle normalization):
+```
+cos_fused = (w_z·cos_z + w_y·cos_y + w_x·cos_x) / (w_z + w_y + w_x)
+```
+
+**grad_mag fusion** (weight and normalization cancel):
+```
+gm_fused = Σ(w · G_est) / Σ(w)
+         = Σ(w · gm/w) / Σ(w)
+         = Σ(gm) / Σ(w)
+         = (gm_z + gm_y + gm_x) / (w_z + w_y + w_x)
+```
+
+Equivalently: `gm_fused = sqrt(gm_z² + gm_y² + gm_x²)` (L2 norm, since `gm_axis = G·|n_component|` and `|n|=1`).

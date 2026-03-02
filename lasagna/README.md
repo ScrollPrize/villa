@@ -117,22 +117,21 @@ cos, gradient-magnitude, direction, and validity channels.
 
 The `--axis` flag controls which dimension is sliced through:
 
-| `--axis` | Slice dim | 2D plane fed to UNet | Sparse output dim |
-|----------|-----------|----------------------|-------------------|
-| `z` (default) | Z | Y x X | Z |
-| `y` | Y | Z x X | Y |
-| `x` | X | Z x Y | X |
+| `--axis` | Slice dim | 2D plane fed to UNet |
+|----------|-----------|----------------------|
+| `z` (default) | Z | Y x X |
+| `y` | Y | Z x X |
+| `x` | X | Z x Y |
 
-The step (`--step` / `--z-step`) applies along the chosen slice axis. The
-downscale (`--downscale` / `--downscale-xy`) applies to both plane dimensions.
+`--scaledown` (default 4) applies **uniformly in all three dimensions** — both
+the slice stepping and the plane downscale use the same factor. This means
+1 output voxel = scaledown fullres voxels in every direction.
+
 The crop (`--crop-xyzwhd`) is always in absolute input coordinates regardless of
 axis.
 
-Each per-axis output zarr has shape `(5, out_Z, out_Y, out_X)` but the
-effective resolution differs per dimension:
-
-- **Slice dim**: `full_size // (step * downscale)` — coarse (stepped)
-- **Plane dims**: `full_size // downscale` — dense (downscaled only)
+Each per-axis output zarr has shape `(5, out_Z, out_Y, out_X)` with uniform
+resolution: `full_size // scaledown` in every dimension.
 
 Channels (identical for all axes):
 
@@ -148,27 +147,27 @@ Note: `dir0`/`dir1` represent gradient directions in the 2D plane perpendicular
 to the slice axis. For axis=z these are YX-plane directions; for axis=y, ZX-plane;
 for axis=x, ZY-plane.
 
-### Direction integration (`integrate` subcommand)
+### Fusion and integration (`integrate` subcommand)
 
-After running preprocessing for multiple axes (typically all three), the
-`integrate` subcommand merges direction channels from axis-y and axis-x volumes
-into the axis-z reference volume:
+After running preprocessing for all three axes, the `integrate` subcommand fuses
+cos and grad_mag using estimated 3D surface normal weights, and copies per-axis
+dir channels into a single output volume:
 
 ```bash
 python preprocess_cos_omezarr.py integrate \
-    --z-volume z_cos.zarr \
-    --y-volume y_cos.zarr \
-    --x-volume x_cos.zarr \
-    --output merged.zarr
+    --z-volume <Z_PREPROC>.zarr \
+    --y-volume <Y_PREPROC>.zarr \
+    --x-volume <X_PREPROC>.zarr \
+    --output <FUSED>.zarr \
+    --pred-dt <PRED_SURFACE>.zarr    # optional: distance-to-skeleton channel
 ```
 
-The output keeps the axis-z volume's shape `(N, Z_ref, Y_ref, X_ref)` and appends
-direction channels from the other axes:
+Output channels:
 
 | Index | Name | Source |
 |-------|------|--------|
-| 0 | `cos` | z-volume |
-| 1 | `grad_mag` | z-volume |
+| 0 | `cos` | **fused** — normal-weighted average of z/y/x cos |
+| 1 | `grad_mag` | **fused** — sum of z/y/x grad_mag / weight_sum |
 | 2 | `dir0` | z-volume (YX-plane directions) |
 | 3 | `dir1` | z-volume (YX-plane directions) |
 | 4 | `valid` | z-volume |
@@ -176,40 +175,33 @@ direction channels from the other axes:
 | 6 | `dir1_y` | y-volume (ZX-plane directions, resized) |
 | 7 | `dir0_x` | x-volume (ZY-plane directions, resized) |
 | 8 | `dir1_x` | x-volume (ZY-plane directions, resized) |
+| 9 | `pred_dt` | distance to skeleton (only if `--pred-dt` given) |
 
-Channels 5-6 and 7-8 are only present when the corresponding volume is provided.
-Either `--y-volume` or `--x-volume` (or both) must be given.
-
-**How the merge works:**
-
-1. Z index mapping: z-volume index `i` maps to source index `i * step` (the
-   ratio `z_step_eff / downscale`). This is exact when all runs use the same
-   `--step` and `--downscale`.
-
-2. Plane resize: each source Z-slice has one sparse dimension (Y for axis-y,
-   X for axis-x) that is `step` times smaller than the z-volume reference.
-   Bilinear interpolation (`torch.nn.functional.interpolate`) upsamples it to
-   match. The other plane dimension is already the same size.
-
-3. Processing is batched along Z (`--batch-size`, default 32) for efficiency.
+If only two axis volumes are provided the fusion falls back to z-only
+cos/grad_mag (no normal estimation).
 
 ### Full pipeline example
 
 ```bash
-# 1. Run UNet inference along all three axes (same crop & params)
+VOLUME=<INPUT_VOLUME>.zarr/0
+CKPT=<UNET_CHECKPOINT>.pt
+CROP="<X> <Y> <Z> <W> <H> <D>"   # fullres coordinates
+
+# 1. Preprocess each axis (same crop, same scaledown)
 for ax in z y x; do
     python preprocess_cos_omezarr.py \
         --axis $ax \
-        --input volume.zarr/0 \
+        --input $VOLUME \
         --output ${ax}_cos.zarr \
-        --unet-checkpoint model.pt \
-        --step 10 --downscale 4
+        --unet-checkpoint $CKPT \
+        --crop $CROP
 done
 
-# 2. Merge direction channels into z-volume
+# 2. Fuse into single volume (optionally with pred-dt)
 python preprocess_cos_omezarr.py integrate \
     --z-volume z_cos.zarr \
     --y-volume y_cos.zarr \
     --x-volume x_cos.zarr \
-    --output merged_cos.zarr
+    --output fused.zarr \
+    --pred-dt <PRED_SURFACE>.zarr
 ```
