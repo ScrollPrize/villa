@@ -523,59 +523,117 @@ def _accumulate_volume_foreground_uint8_stats(stats_accumulator, volume, foregro
             _accumulate_uint8_values(stats_accumulator, values, context=context)
 
 
-def _percentile_from_histogram_uint8(histogram, percentile):
+def _weighted_percentile(values, weights, percentile):
     q = float(percentile)
     if not (0.0 <= q <= 100.0):
         raise ValueError(f"percentile must be in [0, 100], got {q}")
 
+    values_arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    weights_arr = np.asarray(weights, dtype=np.int64).reshape(-1)
+    if values_arr.shape != weights_arr.shape:
+        raise ValueError(
+            f"values/weights shape mismatch values={tuple(values_arr.shape)} "
+            f"weights={tuple(weights_arr.shape)}"
+        )
+    if values_arr.size <= 0:
+        raise ValueError("cannot compute percentile from empty values")
+    if np.any(weights_arr < 0):
+        raise ValueError("weights must be non-negative")
+    total = int(weights_arr.sum())
+    if total <= 0:
+        raise ValueError("cannot compute percentile from empty histogram")
+
+    order = np.argsort(values_arr, kind="mergesort")
+    sorted_values = values_arr[order]
+    sorted_weights = weights_arr[order]
+    cdf = np.cumsum(sorted_weights, dtype=np.int64)
+    rank = (q / 100.0) * float(total - 1)
+    lower_rank = int(math.floor(rank))
+    upper_rank = int(math.ceil(rank))
+    lower_idx = int(np.searchsorted(cdf, lower_rank + 1, side="left"))
+    upper_idx = int(np.searchsorted(cdf, upper_rank + 1, side="left"))
+    lower_value = float(sorted_values[lower_idx])
+    upper_value = float(sorted_values[upper_idx])
+    if lower_rank == upper_rank:
+        return lower_value
+    alpha = float(rank - lower_rank)
+    return float((1.0 - alpha) * lower_value + alpha * upper_value)
+
+
+def _percentile_from_histogram_uint8(histogram, percentile):
+    q = float(percentile)
+    if not (0.0 <= q <= 100.0):
+        raise ValueError(f"percentile must be in [0, 100], got {q}")
     hist = np.asarray(histogram, dtype=np.int64).reshape(-1)
     if hist.shape[0] != 256:
         raise ValueError(f"expected histogram with 256 bins, got shape={tuple(hist.shape)}")
     total = int(hist.sum())
     if total <= 0:
         raise ValueError("cannot compute percentile from empty histogram")
-
-    rank = (q / 100.0) * float(total - 1)
-    lower_rank = int(math.floor(rank))
-    upper_rank = int(math.ceil(rank))
-    cdf = np.cumsum(hist, dtype=np.int64)
-    lower_idx = int(np.searchsorted(cdf, lower_rank + 1, side="left"))
-    upper_idx = int(np.searchsorted(cdf, upper_rank + 1, side="left"))
-    if lower_rank == upper_rank:
-        return float(lower_idx)
-    alpha = float(rank - lower_rank)
-    return float((1.0 - alpha) * lower_idx + alpha * upper_idx)
+    intensity_values = np.arange(256, dtype=np.float64)
+    return _weighted_percentile(intensity_values, hist, q)
 
 
-def _finalize_uint8_stats(stats_accumulator):
+def _median_and_mad_from_histogram_uint8(histogram):
+    hist = np.asarray(histogram, dtype=np.int64).reshape(-1)
+    if hist.shape[0] != 256:
+        raise ValueError(f"expected histogram with 256 bins, got shape={tuple(hist.shape)}")
+    total = int(hist.sum())
+    if total <= 0:
+        raise ValueError("cannot compute median/MAD from empty histogram")
+
+    intensity_values = np.arange(256, dtype=np.float64)
+    median = _weighted_percentile(intensity_values, hist, 50.0)
+    abs_deviation_values = np.abs(intensity_values - median)
+    mad = _weighted_percentile(abs_deviation_values, hist, 50.0)
+    return float(median), float(mad)
+
+
+def _finalize_uint8_stats(stats_accumulator, *, normalization_mode):
     total_count = int(stats_accumulator["count"])
     if total_count <= 0:
         raise ValueError("normalization stats require at least one foreground voxel")
-
-    total_sum = float(stats_accumulator["sum"])
-    total_sum_sq = float(stats_accumulator["sum_sq"])
-    mean = total_sum / float(total_count)
-    variance = (total_sum_sq / float(total_count)) - (mean * mean)
-    if variance < 0 and abs(variance) < 1e-12:
-        variance = 0.0
-    if variance < 0:
-        raise ValueError(f"computed negative variance: {variance}")
-    std = float(np.sqrt(variance))
-    if std <= 0:
-        raise ValueError(f"computed non-positive std: {std}")
 
     p005 = _percentile_from_histogram_uint8(stats_accumulator["hist"], 0.5)
     p995 = _percentile_from_histogram_uint8(stats_accumulator["hist"], 99.5)
     if p995 < p005:
         raise ValueError(f"invalid percentile bounds: p0.5={p005}, p99.5={p995}")
 
-    return {
-        "percentile_00_5": float(p005),
-        "percentile_99_5": float(p995),
-        "mean": float(mean),
-        "std": float(std),
-        "num_voxels": int(total_count),
-    }
+    if normalization_mode == "train_fold_fg_clip_zscore":
+        total_sum = float(stats_accumulator["sum"])
+        total_sum_sq = float(stats_accumulator["sum_sq"])
+        mean = total_sum / float(total_count)
+        variance = (total_sum_sq / float(total_count)) - (mean * mean)
+        if variance < 0 and abs(variance) < 1e-12:
+            variance = 0.0
+        if variance < 0:
+            raise ValueError(f"computed negative variance: {variance}")
+        std = float(np.sqrt(variance))
+        if std <= 0:
+            raise ValueError(f"computed non-positive std: {std}")
+        return {
+            "percentile_00_5": float(p005),
+            "percentile_99_5": float(p995),
+            "mean": float(mean),
+            "std": float(std),
+            "num_voxels": int(total_count),
+        }
+
+    if normalization_mode == "train_fold_fg_clip_robust_zscore":
+        median, mad = _median_and_mad_from_histogram_uint8(stats_accumulator["hist"])
+        robust_scale = 1.4826 * mad
+        if robust_scale <= 0:
+            raise ValueError(f"computed non-positive robust scale from MAD: {robust_scale}")
+        return {
+            "percentile_00_5": float(p005),
+            "percentile_99_5": float(p995),
+            "median": float(median),
+            "mad": float(mad),
+            "robust_scale": float(robust_scale),
+            "num_voxels": int(total_count),
+        }
+
+    raise ValueError(f"Unsupported normalization_mode for stats finalization: {normalization_mode!r}")
 
 
 def _maybe_prepare_fold_label_foreground_percentile_clip_zscore_stats(
@@ -588,7 +646,10 @@ def _maybe_prepare_fold_label_foreground_percentile_clip_zscore_stats(
     volume_cache,
 ):
     normalization_mode = str(getattr(CFG, "normalization_mode", "clip_max_div255")).strip().lower()
-    if normalization_mode != "train_fold_fg_clip_zscore":
+    if normalization_mode not in {
+        "train_fold_fg_clip_zscore",
+        "train_fold_fg_clip_robust_zscore",
+    }:
         CFG.fold_label_foreground_percentile_clip_zscore_stats = None
         return
 
@@ -657,12 +718,21 @@ def _maybe_prepare_fold_label_foreground_percentile_clip_zscore_stats(
 
     if segments_with_foreground <= 0:
         raise ValueError(
-            "normalization_mode='train_fold_fg_clip_zscore' requires at least one "
+            f"normalization_mode={normalization_mode!r} requires at least one "
             "training segment with foreground label voxels"
         )
 
-    stats = _finalize_uint8_stats(stats_accumulator)
+    stats = _finalize_uint8_stats(stats_accumulator, normalization_mode=normalization_mode)
     CFG.fold_label_foreground_percentile_clip_zscore_stats = stats
+    if normalization_mode == "train_fold_fg_clip_zscore":
+        stats_summary = f"mean={stats['mean']:.6f} std={stats['std']:.6f}"
+    elif normalization_mode == "train_fold_fg_clip_robust_zscore":
+        stats_summary = (
+            f"median={stats['median']:.6f} mad={stats['mad']:.6f} "
+            f"robust_scale={stats['robust_scale']:.6f}"
+        )
+    else:
+        raise ValueError(f"Unsupported normalization_mode: {normalization_mode!r}")
     log(
         "normalization stats "
         f"mode={normalization_mode} train_segments={len(train_fragment_ids)} "
@@ -670,7 +740,7 @@ def _maybe_prepare_fold_label_foreground_percentile_clip_zscore_stats(
         f"num_voxels={stats['num_voxels']} "
         f"p0.5={stats['percentile_00_5']:.6f} "
         f"p99.5={stats['percentile_99_5']:.6f} "
-        f"mean={stats['mean']:.6f} std={stats['std']:.6f}"
+        f"{stats_summary}"
     )
 
 

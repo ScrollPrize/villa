@@ -83,6 +83,8 @@ def _clip_intensity_inplace(image):
         return
     if normalization_mode == "train_fold_fg_clip_zscore":
         return
+    if normalization_mode == "train_fold_fg_clip_robust_zscore":
+        return
     raise ValueError(f"Unsupported normalization_mode: {normalization_mode!r}")
 
 

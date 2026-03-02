@@ -284,6 +284,7 @@ def parse_normalization_mode_strict(value, *, key):
     valid_modes = {
         "clip_max_div255",
         "train_fold_fg_clip_zscore",
+        "train_fold_fg_clip_robust_zscore",
     }
     if parsed_value not in valid_modes:
         raise ValueError(
@@ -368,12 +369,37 @@ def _apply_fold_label_foreground_percentile_clip_zscore(image, **kwargs):
     return image
 
 
+def _apply_fold_label_foreground_percentile_clip_robust_zscore(image, **kwargs):
+    stats = getattr(CFG, "fold_label_foreground_percentile_clip_zscore_stats", None)
+    if not isinstance(stats, dict):
+        raise ValueError(
+            "CFG.fold_label_foreground_percentile_clip_zscore_stats must be computed "
+            "before using normalization_mode='train_fold_fg_clip_robust_zscore'"
+        )
+    lower_bound = float(stats["percentile_00_5"])
+    upper_bound = float(stats["percentile_99_5"])
+    median_intensity = float(stats["median"])
+    robust_scale = float(stats["robust_scale"])
+    if robust_scale <= 0:
+        raise ValueError(
+            "CFG.fold_label_foreground_percentile_clip_zscore_stats['robust_scale'] must be > 0, "
+            f"got {robust_scale}"
+        )
+    image = image.astype(np.float32, copy=True)
+    np.clip(image, lower_bound, upper_bound, out=image)
+    image -= median_intensity
+    image /= robust_scale
+    return image
+
+
 def _build_intensity_normalization_transform(cfg, *, in_chans):
     mode = str(getattr(cfg, "normalization_mode", "clip_max_div255")).strip().lower()
     if mode == "clip_max_div255":
         return A.Normalize(mean=[0] * in_chans, std=[1] * in_chans)
     if mode == "train_fold_fg_clip_zscore":
         return A.Lambda(image=_apply_fold_label_foreground_percentile_clip_zscore, p=1.0)
+    if mode == "train_fold_fg_clip_robust_zscore":
+        return A.Lambda(image=_apply_fold_label_foreground_percentile_clip_robust_zscore, p=1.0)
     raise ValueError(f"Unsupported normalization_mode: {mode!r}")
 
 
@@ -961,14 +987,14 @@ def apply_metadata_hyperparameters(cfg, metadata):
         key="training_hyperparameters.training.normalization_mode",
     )
     cfg.fold_label_foreground_percentile_clip_zscore_stats = None
-    if (
-        cfg.normalization_mode == "train_fold_fg_clip_zscore"
-        and cfg.max_clip_value is not None
-    ):
+    if cfg.normalization_mode in {
+        "train_fold_fg_clip_zscore",
+        "train_fold_fg_clip_robust_zscore",
+    } and cfg.max_clip_value is not None:
         raise ValueError(
             "training_hyperparameters.training.max_clip_value must be null when "
             "training_hyperparameters.training.normalization_mode is "
-            "'train_fold_fg_clip_zscore'"
+            "'train_fold_fg_clip_zscore' or 'train_fold_fg_clip_robust_zscore'"
         )
     cfg.cv_fold = normalize_cv_fold(training_cfg.get("cv_fold", getattr(cfg, "cv_fold", None)))
 

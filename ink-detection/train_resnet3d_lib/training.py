@@ -68,10 +68,8 @@ def build_model(run_state, data_state, wandb_logger):
     if run_state["init_ckpt_path"]:
         log(f"loading init weights from {run_state['init_ckpt_path']}")
         state_dict = load_state_dict_from_checkpoint(run_state["init_ckpt_path"])
-        incompat = model.load_state_dict(state_dict, strict=False)
-        missing = len(incompat.missing_keys)
-        unexpected = len(incompat.unexpected_keys)
-        log(f"loaded init weights (missing_keys={missing}, unexpected_keys={unexpected})")
+        model.load_state_dict(state_dict, strict=True)
+        log("loaded init weights (strict=True)")
     if wandb_logger is not None:
         wandb_logger.watch(model, log="all", log_freq=100)
     return model
