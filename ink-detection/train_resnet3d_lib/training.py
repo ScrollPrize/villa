@@ -17,6 +17,16 @@ def build_model(run_state, data_state, wandb_logger):
         size=CFG.size,
         norm=getattr(CFG, "norm", "batch"),
         group_norm_groups=int(getattr(CFG, "group_norm_groups", 32)),
+        model_impl=str(getattr(CFG, "model_impl", "resnet3d_hybrid")),
+        vesuvius_model_config=getattr(CFG, "vesuvius_model_config", {}),
+        vesuvius_target_name=str(getattr(CFG, "vesuvius_target_name", "ink")),
+        vesuvius_z_projection_mode=str(getattr(CFG, "vesuvius_z_projection_mode", "logsumexp")),
+        vesuvius_z_projection_lse_tau=float(getattr(CFG, "vesuvius_z_projection_lse_tau", 1.0)),
+        vesuvius_z_projection_mlp_hidden=int(getattr(CFG, "vesuvius_z_projection_mlp_hidden", 64)),
+        vesuvius_z_projection_mlp_dropout=float(getattr(CFG, "vesuvius_z_projection_mlp_dropout", 0.0)),
+        vesuvius_z_projection_mlp_depth=int(
+            getattr(CFG, "vesuvius_z_projection_mlp_depth", None) or getattr(CFG, "in_chans", 1)
+        ),
         objective=CFG.objective,
         loss_mode=CFG.loss_mode,
         erm_group_topk=int(getattr(CFG, "erm_group_topk", 0)),
