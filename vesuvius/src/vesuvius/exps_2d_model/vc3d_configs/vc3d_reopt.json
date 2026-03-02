@@ -18,12 +18,12 @@
 		"z_straight": 10.0,
 		"z_normal": 10.0,
 		"corr_winding": 10.0,
-		"pred_dt": 10.0
+		"pred_dt": 1.0
 	},
 	"stages": [
 		{
 			"name": "corr",
-			"steps": 0,
+			"steps": 1000,
 			"lr": [0.1, 0.01, 0.001],
 			"params": ["mesh_ms", "conn_offset_ms"],
 			"min_scaledown": 0,
@@ -38,8 +38,8 @@
 			"masks": [{
 				"label": "dilation",
 				"type": "constant_velocity_dilation",
-				"losses": ["data", "data_plain", "data_grad"],
-				"mvx_per_it": 0.001,
+				"losses": ["data", "data_plain", "data_grad","pred_dt"],
+				"vx_per_it": 1.0,
 				"blur_sigma": 2.0
 			}],
 			"global_opt": {

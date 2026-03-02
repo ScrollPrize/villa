@@ -504,8 +504,8 @@ def load(
 				return t.unsqueeze(1)
 
 			def _u8_raw_to_t(a: np.ndarray) -> torch.Tensor:
-				"""Convert uint8 to float32 without dividing — values stay as raw distance (0–255)."""
-				t = torch.from_numpy(a.astype(np.float32)).to(device=device, dtype=torch.float32)
+				"""Convert uint8 distance to sqrt(distance) float32."""
+				t = torch.from_numpy(np.sqrt(a.astype(np.float32))).to(device=device, dtype=torch.float32)
 				return t.unsqueeze(1)
 
 			def _u8_valid_to_t(a: np.ndarray) -> torch.Tensor:
