@@ -51,6 +51,7 @@ class TopoPostprocessConfig:
     topo_samples_per_edge: int = 8
     topo_alt_t_lows: tuple = (0.5, 0.7)
     topo_border_crop: int = 3
+    topo_inner_parallelism: bool = False
 
 
 # ============================================================================
@@ -1005,7 +1006,8 @@ def apply_topo_finalization(logits_np, num_classes, config: TopoPostprocessConfi
         min_dice=config.topo_min_dice,
         max_distance=config.topo_max_distance,
         alternative_volumes=alt_preds,
-        n_jobs=-1,
+        use_parallel=config.topo_inner_parallelism,
+        n_jobs=-1 if config.topo_inner_parallelism else 1,
         alt_min_coverage=0.75,
         alt_min_dice=0.45,
         samples_per_edge=config.topo_samples_per_edge,
