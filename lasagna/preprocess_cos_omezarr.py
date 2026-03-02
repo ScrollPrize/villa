@@ -762,13 +762,21 @@ def _run_integrate_tile_parallel(
 ):
 	"""Tile-parallel path: numba fused kernel releases GIL, threads run in parallel."""
 	_, cz_out, cy_out, cx_out = out_chunks
+	# Align iteration to zarr chunk boundaries so each tile falls within
+	# exactly one chunk per axis — prevents concurrent write races.
+	z_base = (zi_lo // cz_out) * cz_out
+	y_base = (yi_lo // cy_out) * cy_out
+	x_base = (xi_lo // cx_out) * cx_out
 	tiles = []
-	for zs in range(zi_lo, zi_hi, cz_out):
-		ze = min(zi_hi, zs + cz_out)
-		for ys in range(yi_lo, yi_hi, cy_out):
-			ye = min(yi_hi, ys + cy_out)
-			for xs in range(xi_lo, xi_hi, cx_out):
-				xe = min(xi_hi, xs + cx_out)
+	for zs_chunk in range(z_base, zi_hi, cz_out):
+		zs = max(zi_lo, zs_chunk)
+		ze = min(zi_hi, zs_chunk + cz_out)
+		for ys_chunk in range(y_base, yi_hi, cy_out):
+			ys = max(yi_lo, ys_chunk)
+			ye = min(yi_hi, ys_chunk + cy_out)
+			for xs_chunk in range(x_base, xi_hi, cx_out):
+				xs = max(xi_lo, xs_chunk)
+				xe = min(xi_hi, xs_chunk + cx_out)
 				tiles.append((zs, ze, ys, ye, xs, xe))
 
 	n_tiles = len(tiles)
@@ -873,8 +881,10 @@ def _run_integrate_slab(
 		for ch, data in ch_data:
 			out_arr[ch, zi_s:zi_e, ys:ye, xs:xe] = data
 
-	batches = [(zi_s, min(zi_hi, zi_s + batch_size))
-			   for zi_s in range(zi_lo, zi_hi, batch_size)]
+	# Align z-batches to chunk boundaries to avoid write races
+	z_base = (zi_lo // batch_size) * batch_size
+	batches = [(max(zi_lo, zi_s), min(zi_hi, zi_s + batch_size))
+			   for zi_s in range(z_base, zi_hi, batch_size)]
 	n_batches_total = len(batches)
 	print(f"[integrate_directions] {n_batches_total} z-slabs, batch_size={batch_size}, "
 		  f"compute=numpy (slab), pipeline read||compute||write")
