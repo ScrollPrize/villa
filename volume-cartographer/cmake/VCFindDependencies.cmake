@@ -150,8 +150,6 @@ else()
     add_library(openmp_stub INTERFACE)
     add_library(OpenMP::OpenMP_CXX ALIAS openmp_stub)
     add_library(OpenMP::OpenMP_C  ALIAS openmp_stub)
-    # Add openmp_stub to the export set so install(EXPORT) works
-    install(TARGETS openmp_stub EXPORT "${targets_export_name}")
 endif()
 
 # ---- xtensor/xsimd (already fetched above) -----------------------------------
@@ -169,6 +167,32 @@ if (NOT json_POPULATED)
     FetchContent_Populate(json)
     add_subdirectory(${json_SOURCE_DIR} ${json_BINARY_DIR} EXCLUDE_FROM_ALL)
     vc_suppress_warnings("${json_SOURCE_DIR}")
+endif()
+
+# ---- c-blosc (compression for zarr chunks) -----------------------------------
+set(BUILD_TESTS      OFF CACHE BOOL "" FORCE)
+set(BUILD_FUZZERS    OFF CACHE BOOL "" FORCE)
+set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED     OFF CACHE BOOL "" FORCE)
+set(BUILD_STATIC     ON  CACHE BOOL "" FORCE)
+set(PREFER_EXTERNAL_ZLIB OFF CACHE BOOL "" FORCE)
+set(PREFER_EXTERNAL_ZSTD OFF CACHE BOOL "" FORCE)
+set(PREFER_EXTERNAL_LZ4  OFF CACHE BOOL "" FORCE)
+set(DEACTIVATE_SNAPPY ON CACHE BOOL "" FORCE)
+# c-blosc has cmake_minimum_required < 3.5; newer CMake rejects it.
+if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+endif()
+FetchContent_Declare(
+    c-blosc
+    DOWNLOAD_EXTRACT_TIMESTAMP ON
+    URL https://github.com/Blosc/c-blosc/archive/refs/tags/v1.21.6.tar.gz
+)
+FetchContent_GetProperties(c-blosc)
+if(NOT c-blosc_POPULATED)
+    FetchContent_Populate(c-blosc)
+    add_subdirectory(${c-blosc_SOURCE_DIR} ${c-blosc_BINARY_DIR} EXCLUDE_FROM_ALL)
+    vc_suppress_warnings("${c-blosc_SOURCE_DIR}")
 endif()
 
 # ---- CURL (for HTTP chunk source / remote volumes) ---------------------------

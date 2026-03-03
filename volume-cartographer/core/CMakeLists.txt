@@ -18,6 +18,7 @@ add_library(vc_core
         src/Render.cpp
         src/Tiff.cpp
         src/Zarr.cpp
+        src/VcDataset.cpp
         src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
@@ -38,6 +39,17 @@ target_link_libraries(vc_core
         #${CURL_LIBRARIES}
         #${OPENSSL_LIBRARIES}
         #${ZLIB_LIBRARIES}
+)
+
+# VcDataset dependencies
+target_link_libraries(vc_core PRIVATE blosc_static utils)
+
+# c-blosc internal headers (zstd, lz4, zlib) for VcDataset decompression
+target_include_directories(vc_core PRIVATE
+    ${c-blosc_SOURCE_DIR}/blosc
+    ${c-blosc_SOURCE_DIR}/internal-complibs/zstd-1.5.5
+    ${c-blosc_SOURCE_DIR}/internal-complibs/lz4-1.9.4
+    ${c-blosc_SOURCE_DIR}/internal-complibs/zlib-1.2.13
 )
 
 # Precompiled headers for faster builds
@@ -128,41 +140,3 @@ if(VC_USE_PCH)
     target_precompile_headers(vc_tracer REUSE_FROM vc_core)
 endif()
 
-if(VC_INSTALL_LIBS)
-    install(
-            TARGETS vc_core
-            COMPONENT "Libraries"
-            EXPORT "${targets_export_name}"
-            ARCHIVE DESTINATION "lib"
-            LIBRARY DESTINATION "lib"
-            INCLUDES DESTINATION "${include_install_dir}"
-            RUNTIME DESTINATION "bin"
-    )
-
-    install(
-            TARGETS vc_flattening
-            COMPONENT "Libraries"
-            EXPORT "${targets_export_name}"
-            ARCHIVE DESTINATION "lib"
-            LIBRARY DESTINATION "lib"
-            INCLUDES DESTINATION "${include_install_dir}"
-            RUNTIME DESTINATION "bin"
-    )
-
-    install(
-            TARGETS vc_ui
-            COMPONENT "Libraries"
-            EXPORT "${targets_export_name}"
-            ARCHIVE DESTINATION "lib"
-            LIBRARY DESTINATION "lib"
-            INCLUDES DESTINATION "${include_install_dir}"
-            RUNTIME DESTINATION "bin"
-    )
-
-    install(
-            DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
-            DESTINATION "${include_install_dir}"
-            COMPONENT "Libraries"
-            FILES_MATCHING REGEX ".*\\.(h|hpp)$"
-    )
-endif()

@@ -110,12 +110,9 @@ RUN install -m 0755 ./flatboi /usr/local/bin/flatboi
 RUN mkdir -p /src/build
 WORKDIR /src/build
 RUN cmake -DVC_WITH_CUDA_SPARSE=off \
-          -DCPACK_DEBIAN_PACKAGE_SHLIBDEPS=ON \
-          -DCPACK_DEBIAN_PACKAGE_DEPENDS="" \
           -GNinja /src \
  && ninja \
- && cpack -G DEB -V \
- && dpkg -i /src/build/pkgs/vc3d*.deb
+ && cp bin/* /usr/local/bin/
 
 # --------------------------- Cleanup build tree ------------------------------
 RUN apt -y autoremove && rm -rf /src

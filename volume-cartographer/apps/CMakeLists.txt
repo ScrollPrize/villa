@@ -189,38 +189,3 @@ if(VC_USE_PCH)
         target_precompile_headers(${_app} REUSE_FROM vc_core)
     endforeach()
 endif()
-
-# Install targets
-if(VC_INSTALL_APPS)
-install(
-    TARGETS
-        vc_render_video
-        vc_render_tifxyz
-        vc_objrefine
-        vc_grow_seg_from_seed
-        vc_grow_seg_from_segments
-        vc_seg_add_overlap
-        vc_tifxyz2obj
-        vc_obj2tifxyz
-        vc_obj2tifxyz_legacy
-        vc_flatten
-        vc_tifxyz2rgb
-        vc_rgb2tifxyz
-        vc_tifxyz_winding
-        vc_tifxyz_gengt
-        vc_fill_quadmesh
-        vc_calc_surface_metrics
-        vc_diffuse_winding
-        vc_ced2d
-        vc_transform_geom
-        vc_gen_normalgrids
-        vc_ngrids
-        vc_telea_inpaint
-        vc_thinning
-        vc_tifxyz
-        vc_zarr_to_tiff
-        ${extra_apps}
-    RUNTIME DESTINATION bin
-    COMPONENT Programs
-)
-endif()
