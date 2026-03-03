@@ -10,6 +10,7 @@ import cli_data
 import fit_data
 import opt_loss_dir
 import opt_loss_step
+import opt_loss_smooth
 import opt_loss_winding_density
 
 
@@ -127,6 +128,7 @@ def _parse_opt_settings(
 lambda_global: dict[str, float] = {
 	"dir": 1.0,
 	"step": 0.0,
+	"smooth": 0.0,
 	"winding_density": 0.0,
 }
 
@@ -210,6 +212,7 @@ def optimize(
 	terms = {
 		"dir": {"loss": opt_loss_dir.dir_loss},
 		"step": {"loss": opt_loss_step.step_loss},
+		"smooth": {"loss": opt_loss_smooth.smooth_loss},
 		"winding_density": {"loss": opt_loss_winding_density.winding_density_loss},
 	}
 
