@@ -1012,7 +1012,17 @@ def _resize_label_for_loss(label, cfg):
         label = label.to(dtype=torch.float32)
     if label.numel() > 0 and float(label.max().detach().item()) > 1.0:
         label = label / 255.0
-    return F.interpolate(label.unsqueeze(0), (cfg.size // 4, cfg.size // 4)).squeeze(0)
+
+    model_impl = str(getattr(cfg, "model_impl", "resnet3d_hybrid")).strip().lower()
+    target_side = int(getattr(cfg, "size", 256))
+    if model_impl != "vesuvius_resunet_hybrid":
+        target_side = max(1, target_side // 4)
+    target_hw = (target_side, target_side)
+
+    label_4d = label.unsqueeze(0)
+    if tuple(label_4d.shape[-2:]) != target_hw:
+        label_4d = F.interpolate(label_4d, size=target_hw)
+    return label_4d.squeeze(0)
 
 
 def _apply_joint_transform(transform, image, label, cfg):
