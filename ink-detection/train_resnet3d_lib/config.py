@@ -57,7 +57,7 @@ class CFG:
     valid_batch_size = train_batch_size
     use_amp = True
 
-    scheduler = "OneCycleLR"  # "OneCycleLR" | "cosine"
+    scheduler = "OneCycleLR"  # "OneCycleLR" | "cosine" | "cosine_warmup" | "diffusers_cosine_warmup"
     epochs = 30  # 30
 
     optimizer = "adamw"  # "adamw" | "sgd"
@@ -75,6 +75,8 @@ class CFG:
     onecycle_div_factor = 25.0
     onecycle_final_div_factor = 1e2
     cosine_warmup_pct = 0.15
+    scheduler_warmup_steps = None
+    scheduler_num_cycles = 0.5
     # ============== fold =============
     valid_id = None
     stitch_all_val = False
@@ -632,6 +634,8 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("onecycle_div_factor", "onecycle_div_factor"),
         ("onecycle_final_div_factor", "onecycle_final_div_factor"),
         ("cosine_warmup_pct", "cosine_warmup_pct"),
+        ("scheduler_warmup_steps", "scheduler_warmup_steps"),
+        ("scheduler_num_cycles", "scheduler_num_cycles"),
         ("min_lr", "min_lr"),
         ("weight_decay", "weight_decay"),
         ("exclude_weight_decay_bias_norm", "exclude_weight_decay_bias_norm"),
@@ -720,6 +724,44 @@ def apply_metadata_hyperparameters(cfg, metadata):
         raise ValueError(
             "training_hyperparameters.training.sgd_nesterov requires sgd_momentum > 0, "
             f"got sgd_momentum={cfg.sgd_momentum}"
+        )
+
+    cfg.scheduler = str(getattr(cfg, "scheduler", "OneCycleLR")).strip()
+    scheduler_name = cfg.scheduler.lower()
+    supported_schedulers = {
+        "onecyclelr",
+        "cosine",
+        "cosine_warmup",
+        "diffusers_cosine_warmup",
+        "gradualwarmupschedulerv2",
+    }
+    if scheduler_name not in supported_schedulers:
+        raise ValueError(
+            "training_hyperparameters.training.scheduler must be one of "
+            "'OneCycleLR', 'cosine', 'cosine_warmup', 'diffusers_cosine_warmup', "
+            f"'GradualWarmupSchedulerV2'; got {cfg.scheduler!r}"
+        )
+
+    raw_scheduler_warmup_steps = getattr(cfg, "scheduler_warmup_steps", None)
+    if isinstance(raw_scheduler_warmup_steps, str):
+        text = raw_scheduler_warmup_steps.strip().lower()
+        if text in {"", "none", "null"}:
+            raw_scheduler_warmup_steps = None
+    if raw_scheduler_warmup_steps is None:
+        cfg.scheduler_warmup_steps = None
+    else:
+        cfg.scheduler_warmup_steps = int(raw_scheduler_warmup_steps)
+        if cfg.scheduler_warmup_steps < 0:
+            raise ValueError(
+                "training_hyperparameters.training.scheduler_warmup_steps must be >= 0 when set, "
+                f"got {cfg.scheduler_warmup_steps}"
+            )
+
+    cfg.scheduler_num_cycles = float(getattr(cfg, "scheduler_num_cycles", 0.5))
+    if cfg.scheduler_num_cycles <= 0:
+        raise ValueError(
+            "training_hyperparameters.training.scheduler_num_cycles must be > 0, "
+            f"got {cfg.scheduler_num_cycles}"
         )
 
     cfg.objective = str(training_cfg.get("objective", getattr(cfg, "objective", "erm"))).lower()

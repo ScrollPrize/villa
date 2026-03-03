@@ -1205,6 +1205,8 @@ class RegressionPLModel(pl.LightningModule):
         self.decoder = None
         self.vesuvius_network = None
         self.z_projection_head = None
+        self._vesuvius_depth_divisor = 1
+        self._vesuvius_depth_pad_logged = False
 
         if self.model_impl == "resnet3d_hybrid":
             self._init_resnet3d_hybrid(norm=norm, group_norm_groups=group_norm_groups)
@@ -1381,6 +1383,35 @@ class RegressionPLModel(pl.LightningModule):
         mgr.op_dims = 3
 
         self.vesuvius_network = NetworkFromConfig(mgr)
+        must_div = getattr(self.vesuvius_network, "must_be_divisible_by", None)
+        if isinstance(must_div, (list, tuple, np.ndarray)) and len(must_div) > 0:
+            self._vesuvius_depth_divisor = max(1, int(must_div[0]))
+
+    def _maybe_pad_vesuvius_depth(self, x: torch.Tensor) -> torch.Tensor:
+        divisor = int(getattr(self, "_vesuvius_depth_divisor", 1))
+        if divisor <= 1:
+            return x
+        depth = int(x.shape[2])
+        remainder = depth % divisor
+        if remainder == 0:
+            return x
+
+        if self.vesuvius_z_projection_mode == "learned_mlp":
+            raise ValueError(
+                "Input depth is not divisible by the network downsampling factor "
+                f"(depth={depth}, divisor={divisor}). "
+                "For learned_mlp z-projection, set in_chans/layer_range to a divisible value."
+            )
+
+        pad_depth = divisor - remainder
+        x = F.pad(x, (0, 0, 0, 0, 0, pad_depth), mode="replicate")
+        if not self._vesuvius_depth_pad_logged:
+            log(
+                "auto-padding input depth for vesuvius_resunet_hybrid "
+                f"from {depth} to {depth + pad_depth} (divisor={divisor})"
+            )
+            self._vesuvius_depth_pad_logged = True
+        return x
 
     def _project_z(self, logits_3d: torch.Tensor) -> torch.Tensor:
         if logits_3d.ndim != 5:
@@ -1469,6 +1500,7 @@ class RegressionPLModel(pl.LightningModule):
             pred_mask = self.decoder(feat_maps_pooled)
             return pred_mask
 
+        x = self._maybe_pad_vesuvius_depth(x)
         outputs = self.vesuvius_network(x)
         return self._extract_vesuvius_logits(outputs)
 
@@ -1906,12 +1938,45 @@ class RegressionPLModel(pl.LightningModule):
                     eta_min=float(eta_min),
             )
             interval = "step"
+        elif scheduler_name in {"cosine_warmup", "diffusers_cosine_warmup"}:
+            try:
+                from vesuvius.models.training.lr_schedulers import get_scheduler as get_vesuvius_scheduler
+            except Exception as exc:
+                raise ImportError(
+                    "Scheduler requires vesuvius.models.training.lr_schedulers to be importable."
+                ) from exc
+
+            total_steps = max(1, steps_per_epoch * epochs)
+            raw_warmup_steps = getattr(CFG, "scheduler_warmup_steps", None)
+            if raw_warmup_steps is None:
+                warmup_steps = int(0.1 * total_steps)
+            else:
+                warmup_steps = int(raw_warmup_steps)
+            warmup_steps = max(0, min(warmup_steps, total_steps - 1))
+
+            scheduler_kwargs = {
+                "warmup_steps": int(warmup_steps),
+            }
+            if scheduler_name == "diffusers_cosine_warmup":
+                scheduler_kwargs["num_cycles"] = float(getattr(CFG, "scheduler_num_cycles", 0.5))
+
+            scheduler = get_vesuvius_scheduler(
+                scheduler_type=scheduler_name,
+                optimizer=optimizer,
+                initial_lr=float(CFG.lr),
+                max_steps=int(total_steps),
+                **scheduler_kwargs,
+            )
+            interval = "step"
         elif scheduler_name == "gradualwarmupschedulerv2":
             scheduler = get_scheduler(CFG, optimizer)
             interval = "epoch"
         else:
             raise ValueError(
-                f"Unsupported scheduler={CFG.scheduler!r}. Supported: 'OneCycleLR' | 'cosine' | 'GradualWarmupSchedulerV2'."
+                "Unsupported scheduler="
+                f"{CFG.scheduler!r}. Supported: "
+                "'OneCycleLR' | 'cosine' | 'cosine_warmup' | "
+                "'diffusers_cosine_warmup' | 'GradualWarmupSchedulerV2'."
             )
 
         return {
