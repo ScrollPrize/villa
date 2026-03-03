@@ -305,13 +305,17 @@ def resolve_segment_zarr_path(fragment_id):
     if not fragment_id:
         raise ValueError("segment id must be a non-empty string")
 
-    candidate = osp.normpath(osp.join(dataset_root, f"{fragment_id}.zarr"))
-    if _looks_like_zarr_store(candidate):
-        return candidate
+    candidates = [
+        osp.normpath(osp.join(dataset_root, f"{fragment_id}.zarr")),
+        osp.normpath(osp.join(dataset_root, fragment_id, f"{fragment_id}.zarr")),
+    ]
+    for candidate in candidates:
+        if _looks_like_zarr_store(candidate):
+            return candidate
 
     raise FileNotFoundError(
         f"Could not resolve zarr volume path for segment={fragment_id}. "
-        f"Expected zarr store at {candidate!r}."
+        f"Tried: {candidates!r}."
     )
 
 
@@ -566,15 +570,6 @@ def read_label_and_fragment_mask_for_shape(
         fragment_mask.shape[:2],
         pad_multiple,
     )
-    _assert_bottom_right_pad_compatible_global(
-        str(fragment_id),
-        "label",
-        mask.shape[:2],
-        "mask",
-        fragment_mask.shape[:2],
-        pad_multiple,
-    )
-
     fragment_mask_padded = np.zeros((image_h, image_w), dtype=fragment_mask.dtype)
     h = min(fragment_mask.shape[0], fragment_mask_padded.shape[0])
     w = min(fragment_mask.shape[1], fragment_mask_padded.shape[1])
