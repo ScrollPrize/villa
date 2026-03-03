@@ -286,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
 
 		st = torch.load(model_cfg.model_input, map_location=device)
 		miss, unexp = mdl.load_state_dict_compat(st, strict=False)
+		mdl.arc_enabled = False  # saved models have baked arcs
 		if unexp:
 			print("state_dict: unexpected keys:", sorted(unexp))
 		if miss:
