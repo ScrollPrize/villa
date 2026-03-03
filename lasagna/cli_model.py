@@ -26,7 +26,7 @@ class ModelConfig:
 def add_args(p: argparse.ArgumentParser) -> None:
 	g = p.add_argument_group("model")
 	g.add_argument("--mesh-step", type=int, default=16)
-	g.add_argument("--winding-step", type=int, default=16)
+	g.add_argument("--winding-step", type=int, default=25)
 	g.add_argument("--subsample-mesh", type=int, default=4)
 	g.add_argument("--subsample-winding", type=int, default=4)
 	g.add_argument("--depth", type=int, default=3)

@@ -205,6 +205,25 @@ def main(argv: list[str] | None = None) -> int:
 			  f"r={arc['arc_radius']:.1f} a0={arc['arc_angle0']:.3f} a1={arc['arc_angle1']:.3f} "
 			  f"z={arc['z_center']:.1f}", flush=True)
 
+	# --- Auto-size mesh from bbox (new model only) ---
+	if is_new_model and data_cfg.bbox is not None:
+		seed_w, seed_h = float(data_cfg.bbox[3]), float(data_cfg.bbox[4])
+
+		# Radial extent → depth (number of windings)
+		radial_extent = min(seed_w, seed_h)
+		auto_depth = max(1, int(radial_extent / model_cfg.winding_step))
+
+		# Z extent → mesh_h
+		z_ext = float(data_cfg.z_size) if data_cfg.z_size is not None else (model_cfg.mesh_step * (model_cfg.mesh_h - 1))
+		auto_mesh_h = max(2, int(z_ext / model_cfg.mesh_step) + 1)
+
+		# Angular extent → mesh_w (match resolution to mesh_step)
+		arc_length = model_cfg.arc_radius * (model_cfg.arc_angle1 - model_cfg.arc_angle0)
+		auto_mesh_w = max(2, int(arc_length / model_cfg.mesh_step) + 1)
+
+		model_cfg = dataclasses.replace(model_cfg, depth=auto_depth, mesh_h=auto_mesh_h, mesh_w=auto_mesh_w)
+		print(f"[fit] auto-sized: depth={auto_depth} mesh_h={auto_mesh_h} mesh_w={auto_mesh_w}", flush=True)
+
 	# --- Auto-crop from mesh bbox ---
 	if data_cfg.crop is None and volume_extent_fullres is not None:
 		mesh_bbox = None
