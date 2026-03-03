@@ -10,6 +10,7 @@ import cli_data
 import fit_data
 import opt_loss_dir
 import opt_loss_step
+import opt_loss_winding_density
 
 
 def _require_consumed_dict(*, where: str, cfg: dict) -> None:
@@ -88,7 +89,7 @@ def _parse_opt_settings(
 	if not isinstance(params, list):
 		params = []
 	params = [str(p) for p in params]
-	valid = {"mesh_ms", "conn_offset_ms", "amp", "bias",
+	valid = {"mesh_ms", "amp", "bias",
 			 "arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1"}
 	bad_params = sorted(set(params) - valid)
 	if bad_params:
@@ -126,6 +127,7 @@ def _parse_opt_settings(
 lambda_global: dict[str, float] = {
 	"dir": 1.0,
 	"step": 0.0,
+	"winding_density": 0.0,
 }
 
 
@@ -208,6 +210,7 @@ def optimize(
 	terms = {
 		"dir": {"loss": opt_loss_dir.dir_loss},
 		"step": {"loss": opt_loss_step.step_loss},
+		"winding_density": {"loss": opt_loss_winding_density.winding_density_loss},
 	}
 
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings) -> None:
@@ -224,7 +227,7 @@ def optimize(
 		param_groups: list[dict] = []
 		for name in opt_cfg.params:
 			group = all_params.get(name, [])
-			if name in {"mesh_ms", "conn_offset_ms"}:
+			if name in {"mesh_ms"}:
 				k0 = max(0, int(opt_cfg.min_scaledown))
 				for pi, p in enumerate(group):
 					if pi < k0:
@@ -301,6 +304,7 @@ def optimize(
 			opt.zero_grad(set_to_none=True)
 			loss.backward()
 			opt.step()
+			model.update_conn_offsets()
 			_t_steps_acc += 1
 			_done_steps[0] += 1
 

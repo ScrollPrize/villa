@@ -97,12 +97,12 @@ For the 3D model:
 - Reconstruction: integrate from coarsest to finest: `result = ms[-1]; for i in reversed(range(len(ms)-1)): result = upsample_crop(result) + ms[i]`. Upsampling is now 3D (trilinear) instead of 2D bilinear.
 - All mesh positions are stored in **fullres voxel coordinates**. They are converted to grid_sample coordinates ([-1, 1]) only at sampling time by dividing by the volume dimensions.
 
-### Connection offset pyramid
+### Connection offset buffer
 
-- Same pyramid structure as mesh (D, H, W all pyramided), shape `(D, Hm, Wm, 2)` — 2 channels for **(prev_winding_offset, next_winding_offset)**, i.e. ±D direction.
-- These fractional row offsets tell the orthogonal intersection algorithm which row-segment in the **neighbor depth slice** (D±1) to target.
-- Offsets are relative to the base row index: `target_row = base_row + offset`.
-- The connection ray is cast along the quad surface normal and intersects a bilinear quad in the neighbor depth slice, as described in the top-level spec.
+- A flat registered buffer (not a pyramid, not gradient-optimized), shape `(4, D, Hm, Wm)` — channels `[prev_h_off, prev_w_off, next_h_off, next_w_off]`.
+- In 2D, connections go to a fixed neighbor column, so only a scalar row offset is needed. In 3D, connections target a 2D depth slice (H×W grid), so each direction (prev/next) requires **two** offsets (H and W).
+- These fractional offsets tell the orthogonal intersection algorithm which quad in the **neighbor depth slice** (D±1) to target: `target_h = h + h_off`, `target_w = w + w_off`.
+- Updated after each optimizer step by `update_conn_offsets()` (not gradient-optimized — tracked from intersection parameters).
 
 ### Amplitude and bias (modulation parameters)
 
@@ -134,7 +134,7 @@ For the 3D model:
 2. **Apply global transform**: arc + winding-step transform (see init section).
 3. **xy_lr**: the LR mesh `(D, Hm, Wm, 3)` — one 3D position per mesh vertex.
 4. **xy_hr**: bilinear upsample of xy_lr to `(D, He, We, 3)` where `He = (Hm-1)*subsample_mesh+1`, `We = (Wm-1)*subsample_winding+1`.
-5. **xy_conn**: for each mesh vertex, compute connection points to neighbor depth slices (see below).
+5. **xy_conn**: `(D, Hm, Wm, 3, 3)` — for each mesh vertex, compute connection points to neighbor depth slices via ray-bilinear-patch intersection (see below). The 3 connection points are `[prev_conn, self, next_conn]`, each a 3D fullres point. **mask_conn**: `(D, 1, Hm, Wm, 3)` — validity per connection point.
 6. **Sample data**: use grid_sample at xy_hr positions → sampled cos, grad_mag, dir channels.
 7. **Compute targets**: target_plain and target_mod from amp/bias at HR resolution.
 8. **Compute masks**: sample valid channel at LR/HR/conn positions; multiply by any stage masks.
@@ -147,20 +147,21 @@ For each mesh vertex at column `c`:
 2. Rotate 90° to get orthogonal direction `d = (-vy, vx)`.
 3. Cast ray from vertex in direction d.
 4. Intersect with line segments in neighbor columns `c-1` (left) and `c+1` (right).
-5. The target segment is selected by `conn_offset_ms` (fractional row offset from current row).
+5. The target quad is determined by `conn_offsets`: `target_h = h + h_off`, `target_w = w + w_off`. The integer part (`floor`) selects the quad corner indices in the neighbor slice; the fractional part seeds the bilinear interpolation parameters (u, v) for the ray-patch intersection.
 6. Returns `xy_conn (N, Hm, Wm, 3, 2)`: [left_conn, self, right_conn].
 
 ### 3D model adaptation
 - Connections are in the **±D direction** (prev/next winding), not left/right.
 - The mesh surface is a quadmesh in 3D: each cell is a **bilinear quad** defined by 4 corner positions.
-- The orthogonal direction d is perpendicular to the quad surface (the quad normal).
+- The orthogonal direction d is the vertex normal (cross product of central-difference edge vectors along H and W).
 - The intersection target is a quad in the **neighbor depth slice** (D-1 or D+1), not a neighbor column.
-- **Intersection algorithm**: cast a ray from vertex along the quad normal and intersect with the bilinear quad in the neighbor depth slice. This is a ray-bilinear-patch intersection (can be solved as a quadratic in parameter space).
-- Connection offsets specify which row in the neighbor depth slice to target, and the intersection is computed on the quad formed by `[row, row+1] × [height_i, height_i+1]`.
-- Returns `xy_conn (D, Hm, Wm, 3, 3)`: [prev_winding_conn, self, next_winding_conn], each a 3D point.
+- **Connection offsets** `(4, D, Hm, Wm)` with channels `[prev_h, prev_w, next_h, next_w]` specify the target quad in the neighbor slice. For vertex `(d, h, w)` and direction prev (d-1): `target_h = h + prev_h_off`, `target_w = w + prev_w_off`. Floor to get quad corner indices `row = floor(target_h)`, `col = floor(target_w)`, clamped to valid range. The quad is `P00=nb[row,col]`, `P10=nb[row+1,col]`, `P01=nb[row,col+1]`, `P11=nb[row+1,col+1]`.
+- **Intersection algorithm**: ray-bilinear-patch intersection. Ray: `O = xyz_lr[d,h,w]`, direction `n = normal[d,h,w]`. Patch: `Q(u,v) = (1-u)(1-v)*P00 + u(1-v)*P10 + (1-u)*v*P01 + u*v*P11`. Reduce `Q(u,v) = O + s*n` to a quadratic in u using 2D cross products of edge vectors `(a, b, c, g)` with the ray direction `n` across two axis pairs. Solve the quadratic (linear fallback if leading coefficient ≈ 0). Two u solutions → pick closest to `frac(target_h)`. Compute `v` from the remaining linear equation.
+- **Edge fallback**: d=0 (no prev) mirrors the next direction's vector (detached); d=D-1 (no next) mirrors prev. Mask is zeroed for the missing direction.
+- Returns `xy_conn (D, Hm, Wm, 3, 3)`: [prev_winding_conn, self, next_winding_conn], each a 3D fullres point.
 
 ### Post-step offset update
-After each optimizer step, `update_conn_offsets()` adjusts the offsets to track the actual intersection parameter. This ensures the offsets stay aligned with the evolving mesh geometry.
+After each optimizer step, `update_conn_offsets()` writes new offsets from the intersection parameters under `torch.no_grad()`: `new_h_off = row + u - h`, `new_w_off = col + v - w`. This ensures the offsets track the evolving mesh geometry without gradient flow.
 
 ## Losses (relevant subset)
 
@@ -260,13 +261,12 @@ Penalizes mesh vertices that are far from predicted sheet surfaces. Evaluated at
 
 ### Parameter groups
 - `mesh_ms`: multiscale 3D mesh pyramid levels (D×H×W all pyramided). Each level gets its own learning rate from the lr list (last = finest).
-- `conn_offset_ms`: same 3D pyramid structure for connection offsets (D×H×W pyramided).
 - `amp`, `bias`: modulation parameters, use the finest LR.
 - Global transform parameters: arc center, radius, angular extent (only if global transform is enabled).
 
 ### Optimizer
 - Adam optimizer with per-parameter-group learning rates.
-- After each step: `model.update_conn_offsets()` re-aligns connection offsets.
+- After each step: `model.update_conn_offsets()` writes new connection offsets from the latest intersection parameters (no gradient flow — pure tracking).
 - `model.update_ema()` updates exponential moving averages of mesh positions (used by mask scheduling).
 
 ### Growing (3D adaptation)
@@ -283,7 +283,7 @@ Two mask types (not needed for initial 3D model, but noted for completeness):
 - **constant_velocity_dilation**: 3D morphological dilation from a seed voxel at the mesh center, growing at a configured rate in fullres voxels per iteration. Separate XY/Z accumulators handle anisotropic grid spacing.
 
 ### const_mask_lr (gradient masking for grow)
-- A `(D, Hm, Wm, 1)` binary mask applied as a gradient hook on mesh_ms[0] and conn_offset_ms[0].
+- A `(D, Hm, Wm, 1)` binary mask applied as a gradient hook on mesh_ms[0].
 - `1.0` = frozen (gradients zeroed), `0.0` = free to optimize.
 - An `opt_window` parameter creates a transition zone at the boundary between old and new regions.
 
