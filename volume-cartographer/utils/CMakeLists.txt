@@ -20,6 +20,8 @@ set(UTILS_HEADERS
     compositing
     zarr
     http_fetch
+    thread_pool
+    compression
 )
 
 foreach(header ${UTILS_HEADERS})
@@ -43,7 +45,7 @@ endif()
 # zarr needs nlohmann_json
 target_link_libraries(utils_zarr INTERFACE nlohmann_json::nlohmann_json)
 
-# Optional: find compression libraries for zarr.hpp
+# Optional: find compression libraries for compression.hpp / zarr.hpp
 find_library(ZSTD_LIB zstd QUIET)
 find_library(LZ4_LIB lz4 QUIET)
 find_library(ZLIB_LIB z QUIET)
@@ -60,6 +62,7 @@ endif()
 if(UTILS_COMPRESSION_LIBS)
     target_link_libraries(utils INTERFACE ${UTILS_COMPRESSION_LIBS})
     target_link_libraries(utils_zarr INTERFACE ${UTILS_COMPRESSION_LIBS})
+    target_link_libraries(utils_compression INTERFACE ${UTILS_COMPRESSION_LIBS})
 endif()
 
 # Tests
