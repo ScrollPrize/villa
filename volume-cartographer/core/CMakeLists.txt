@@ -19,6 +19,13 @@ add_library(vc_core
         src/Tiff.cpp
         src/Zarr.cpp
         src/VcDataset.cpp
+        src/cache/ChunkSource.cpp
+        src/cache/DiskStore.cpp
+        src/cache/HttpMetadataFetcher.cpp
+        src/cache/IOPool.cpp
+        src/cache/TieredChunkCache.cpp
+        src/cache/VcDecompressor.cpp
+        src/cache/SimpleCacheFactory.cpp
         src/NetworkFilesystem.cpp
         src/RemoteUrl.cpp
         src/CoordGrid.cpp
@@ -42,6 +49,9 @@ target_link_libraries(vc_core
         TIFF::TIFF
         CURL::libcurl
 )
+
+# Enable curl-backed HTTP cache code
+target_compile_definitions(vc_core PUBLIC VC_USE_CURL)
 
 # VcDataset dependencies
 target_link_libraries(vc_core PRIVATE blosc_static utils)

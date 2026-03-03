@@ -1,12 +1,12 @@
 #pragma once
 
-#include <cerrno>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include <cstdio>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -43,12 +43,7 @@ namespace vc::cache {
     size_t total = 0;
     while (total < fileSize) {
         ssize_t n = ::read(fd, buf.data() + total, fileSize - total);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            ::close(fd);
-            return std::nullopt;
-        }
-        if (n == 0) {  // unexpected EOF
+        if (n <= 0) {
             ::close(fd);
             return std::nullopt;
         }
