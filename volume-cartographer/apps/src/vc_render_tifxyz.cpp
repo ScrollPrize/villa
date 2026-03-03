@@ -1068,7 +1068,7 @@ int main(int argc, char *argv[])
     // ============================================================
     // process_one: render a single segmentation to output
     // ============================================================
-    auto process_one = [&](const std::filesystem::path& seg_folder) {
+    auto process_one = [&](const std::filesystem::path& seg_folder) -> bool {
         {
             std::ostringstream oss;
             oss << "Rendering: " << seg_folder.string();
@@ -1079,7 +1079,7 @@ int main(int argc, char *argv[])
 
         std::unique_ptr<QuadSurface> surf;
         try { surf = load_quad_from_tifxyz(seg_folder); }
-        catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return; }
+        catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }
 
         if (parsed["flatten"].as<bool>()) {
             logPrintf(stdout, "Applying ABF++ flattening...\n");
@@ -1140,7 +1140,7 @@ int main(int argc, char *argv[])
         int cx = parsed["crop-x"].as<int>(), cy = parsed["crop-y"].as<int>();
         int cw = parsed["crop-width"].as<int>(), ch = parsed["crop-height"].as<int>();
         bool manual = cw > 0 && ch > 0, autoCrop = parsed["auto-crop"].as<bool>();
-        if (autoCrop && manual) { logPrintf(stderr, "Error: --auto-crop and --crop-* are mutually exclusive\n"); return; }
+        if (autoCrop && manual) { logPrintf(stderr, "Error: --auto-crop and --crop-* are mutually exclusive\n"); return false; }
 
         if (autoCrop && col_max >= col_min) {
             double sx = render_scale / surf->_scale[0], sy = render_scale / surf->_scale[1];
@@ -1151,7 +1151,7 @@ int main(int argc, char *argv[])
             logPrintf(stdout, "auto-crop: [%d×%d from (%d,%d)]\n", crop.width, crop.height, crop.x, crop.y);
         } else if (manual) {
             crop = cv::Rect(cx, cy, cw, ch) & canvasROI;
-            if (crop.width <= 0 || crop.height <= 0) { logPrintf(stderr, "Error: crop outside canvas\n"); return; }
+            if (crop.width <= 0 || crop.height <= 0) { logPrintf(stderr, "Error: crop outside canvas\n"); return false; }
             tgt_size = crop.size();
         }
 
@@ -1196,10 +1196,10 @@ int main(int argc, char *argv[])
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFile, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW);
-                return;
+                return true;
             } else if (numParts > 1) {
                 if (!std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
-                    logPrintf(stderr, "Error: run --pre first in multi-part mode\n"); return;
+                    logPrintf(stderr, "Error: run --pre first in multi-part mode\n"); return false;
                 }
                 dsOut = z5::openDataset(outFile, "0");
             } else if (resumeFlag && std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
@@ -1241,7 +1241,7 @@ int main(int argc, char *argv[])
                 bool all = true;
                 for (int z = 0; z < tifSlices; z++) if (!std::filesystem::exists(makePartPath(z))) { all = false; break; }
                 if (all) {
-                    if (!wantZarr) { logPrintf(stdout, "[tif] all slices exist, skipping.\n"); return; }
+                    if (!wantZarr) { logPrintf(stdout, "[tif] all slices exist, skipping.\n"); return true; }
                     logPrintf(stdout, "[tif] all slices exist, skipping tif output.\n");
                     tifSkip = true;
                 }
@@ -1359,9 +1359,11 @@ int main(int argc, char *argv[])
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW);
             }
         }
+        return true;
     };
 
-    process_one(seg_path);
+    if (!process_one(seg_path))
+        return EXIT_FAILURE;
 
     // Print final cache stats
     auto printStats = [](const char* name, const auto& s) {
