@@ -28,6 +28,7 @@ add_library(vc_core
         src/cache/SimpleCacheFactory.cpp
         src/NetworkFilesystem.cpp
         src/RemoteUrl.cpp
+        src/RemoteScroll.cpp
         src/CoordGrid.cpp
         src/PostProcess.cpp
         src/Geometry.cpp

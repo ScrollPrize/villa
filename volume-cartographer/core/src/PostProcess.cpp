@@ -8,8 +8,6 @@ namespace vc {
 
 void applyPostProcess(cv::Mat_<uint8_t>& img, const PostProcessParams& params)
 {
-    if (img.empty()) return;
-
     // 1. ISO cutoff
     if (params.isoCutoff > 0) {
         cv::threshold(img, img, params.isoCutoff - 1, 0, cv::THRESH_TOZERO);
@@ -61,7 +59,7 @@ void applyPostProcess(cv::Mat_<uint8_t>& img, const PostProcessParams& params)
         baseFloat.convertTo(img, CV_8U, 255.0f);
     } else {
         const int windowLowInt = static_cast<int>(
-            std::clamp(params.windowLow, 0.0f, 254.0f));
+            std::clamp(params.windowLow, 0.0f, 255.0f));
         const int windowHighInt = static_cast<int>(
             std::clamp(params.windowHigh, static_cast<float>(windowLowInt + 1), 255.0f));
         const float windowSpan = std::max(

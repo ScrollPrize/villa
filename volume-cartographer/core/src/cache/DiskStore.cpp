@@ -267,17 +267,9 @@ void DiskStore::initTotalBytes()
 
 void DiskStore::clearVolume(const std::string& volumeId)
 {
+    auto volDir = config_.root / volumeId;
     std::error_code ec;
-    if (config_.directMode) {
-        // In directMode, chunks are stored directly under root/<level>/...
-        // Clear everything under root
-        for (auto& entry : std::filesystem::directory_iterator(config_.root, ec)) {
-            std::filesystem::remove_all(entry.path(), ec);
-        }
-    } else {
-        auto volDir = config_.root / volumeId;
-        std::filesystem::remove_all(volDir, ec);
-    }
+    std::filesystem::remove_all(volDir, ec);
     // Re-scan since we can't easily know how much was in this volume
     initTotalBytes();
 }

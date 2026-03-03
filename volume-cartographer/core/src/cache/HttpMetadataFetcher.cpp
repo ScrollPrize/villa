@@ -52,13 +52,52 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    // Don't use FAILONERROR — we check HTTP codes ourselves to distinguish
+    // 403 (auth error) from 404 (not found)
 
     auto authGuard = applyCurlAuth(curl, auth);
 
     CURLcode res = curl_easy_perform(curl);
 
-    if (res != CURLE_OK) return {};
+    if (res != CURLE_OK) {
+        std::fprintf(stderr, "[httpGetString] curl error %d for %s: %s\n",
+                     res, url.c_str(), curl_easy_strerror(res));
+        return {};
+    }
+
+    long httpCode = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+
+    if (httpCode >= 400) {
+        // Check for S3 auth/token errors in response body
+        // S3 returns 400 for expired tokens, 403 for access denied
+        bool isAuthError = (httpCode == 401 || httpCode == 403);
+        if (!isAuthError && !response.empty()) {
+            // S3 returns XML errors like <Code>ExpiredToken</Code>
+            isAuthError = response.find("ExpiredToken") != std::string::npos ||
+                          response.find("AccessDenied") != std::string::npos ||
+                          response.find("InvalidAccessKeyId") != std::string::npos ||
+                          response.find("SignatureDoesNotMatch") != std::string::npos ||
+                          response.find("TokenRefreshRequired") != std::string::npos;
+        }
+
+        if (isAuthError) {
+            // Try to extract the S3 error message
+            std::string errMsg = "Access denied (HTTP " + std::to_string(httpCode) + ")";
+            auto msgStart = response.find("<Message>");
+            auto msgEnd = response.find("</Message>");
+            if (msgStart != std::string::npos && msgEnd != std::string::npos) {
+                msgStart += 9;  // strlen("<Message>")
+                errMsg = response.substr(msgStart, msgEnd - msgStart) +
+                         " (HTTP " + std::to_string(httpCode) + ")";
+            }
+            throw std::runtime_error(errMsg + ". Check your AWS credentials.");
+        }
+
+        // 404, 500, etc. — treat as "not found"
+        return {};
+    }
+
     return response;
 #else
     (void)url;

@@ -117,15 +117,6 @@ void IOPool::cancelPending()
     queue_.cancel_pending();
 }
 
-void IOPool::cancelAndDrain()
-{
-    queue_.cancel_pending();
-    // Spin-wait for in-flight tasks to complete
-    while (queue_.in_flight_count() > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-}
-
 size_t IOPool::pendingCount() const
 {
     return queue_.queued_count() + queue_.in_flight_count();

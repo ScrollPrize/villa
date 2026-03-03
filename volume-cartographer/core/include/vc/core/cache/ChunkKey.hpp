@@ -25,7 +25,6 @@ struct ChunkKey {
     // Each level halves spatial resolution, so chunk indices halve.
     [[nodiscard]] ChunkKey coarsen(int targetLevel) const noexcept
     {
-        if (targetLevel <= level) return *this;
         int shift = targetLevel - level;
         return {targetLevel, iz >> shift, iy >> shift, ix >> shift};
     }

@@ -56,9 +56,6 @@ public:
     // Cancel all pending (not in-flight) tasks.
     void cancelPending();
 
-    // Cancel pending tasks and wait for all in-flight tasks to finish.
-    void cancelAndDrain();
-
     // Number of pending + in-flight tasks.
     [[nodiscard]] size_t pendingCount() const;
 

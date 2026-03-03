@@ -32,10 +32,6 @@ ResolvedUrl resolveRemoteUrl(const std::string& input)
         }
 
         std::string region = input.substr(3, schemeEnd - 3);  // between "s3+" and "://"
-        if (region.empty()) {
-            // Malformed s3+:// without region — treat as plain URL
-            return ResolvedUrl{input, {}, false};
-        }
         std::string rest = input.substr(schemeEnd + 3);
 
         auto slash = rest.find('/');
