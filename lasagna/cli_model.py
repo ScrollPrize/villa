@@ -19,6 +19,7 @@ class ModelConfig:
 	arc_angle0: float        # start angle (radians)
 	arc_angle1: float        # end angle (radians)
 	z_center: float          # scroll height center (fullres)
+	pyramid_d: bool
 	model_input: str | None
 	model_output: str | None
 
@@ -38,6 +39,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--arc-angle-start", type=float, default=-0.5)
 	g.add_argument("--arc-angle-end", type=float, default=0.5)
 	g.add_argument("--z-center", type=float, default=0.0)
+	g.add_argument("--pyramid-d", action="store_true", default=False)
 	g.add_argument("--model-input", default=None)
 	g.add_argument("--model-output", default=None)
 
@@ -57,6 +59,7 @@ def from_args(args: argparse.Namespace) -> ModelConfig:
 		arc_angle0=float(args.arc_angle_start),
 		arc_angle1=float(args.arc_angle_end),
 		z_center=float(args.z_center),
+		pyramid_d=bool(args.pyramid_d),
 		model_input=None if args.model_input is None else str(args.model_input),
 		model_output=None if args.model_output is None else str(args.model_output),
 	)

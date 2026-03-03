@@ -10,9 +10,9 @@ from pathlib import Path
 import numpy as np
 import tifffile
 import torch
-import torch.nn.functional as F
 
 import cli_json
+import model
 
 
 @dataclass(frozen=True)
@@ -39,26 +39,6 @@ def _build_parser() -> argparse.ArgumentParser:
 		help="Copy model checkpoint instead of symlink")
 	g.add_argument("--output-name", default=None, help="Override tifxyz directory name")
 	return p
-
-
-def _integrate_pyramid_3d(src: list[torch.Tensor]) -> torch.Tensor:
-	"""Integrate residual pyramid -> (C, D, H, W)."""
-	v = src[-1]
-	for d in reversed(src[:-1]):
-		up = F.interpolate(v.unsqueeze(0), scale_factor=2.0, mode='trilinear', align_corners=True).squeeze(0)
-		up = up[:, :int(d.shape[1]), :int(d.shape[2]), :int(d.shape[3])]
-		v = up + d
-	return v
-
-
-def _mesh_coarse_from_state_dict(st: dict) -> torch.Tensor:
-	"""Reconstruct mesh from checkpoint. Returns (3, D, Hm, Wm) in fullres coords."""
-	keys = sorted(k for k in st.keys() if k.startswith("mesh_ms.") and k.split(".")[-1].isdigit())
-	if not keys:
-		raise ValueError("checkpoint missing mesh_ms.* tensors")
-	idx_keys = sorted(((int(k.split(".")[-1]), k) for k in keys), key=lambda t: t[0])
-	pyr = [st[k].detach() for _i, k in idx_keys]
-	return _integrate_pyramid_3d(pyr)
 
 
 def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
@@ -127,7 +107,8 @@ def main(argv: list[str] | None = None) -> int:
 		fit_config = None
 
 	# Reconstruct mesh (3, D, Hm, Wm) — pyramid stores full xyz positions
-	mesh = _mesh_coarse_from_state_dict(st)
+	mdl = model.Model3D.from_checkpoint(st, device=dev)
+	mesh = mdl.mesh_coarse()
 
 	_, D, Hm, Wm = (int(v) for v in mesh.shape)
 	mesh_np = mesh.detach().cpu().numpy()  # (3, D, Hm, Wm)

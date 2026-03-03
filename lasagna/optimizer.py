@@ -199,6 +199,28 @@ def _lr_scalespace(*, lr: float | list[float], scale_i: int) -> float:
 	return float(lr[0])
 
 
+def check_data_bounds(model, data: fit_data.FitData3D, margin: float = 100.0) -> bool:
+	"""Return True if any mesh vertex is within `margin` fullres voxels of the data border."""
+	with torch.no_grad():
+		xyz = model._grid_xyz()  # (D, Hm, Wm, 3)
+		mesh_min = [float(xyz[..., i].min()) for i in range(3)]
+		mesh_max = [float(xyz[..., i].max()) for i in range(3)]
+	Z, Y, X = data.size
+	# Data extent in fullres: (x, y, z)
+	data_min = list(data.origin_fullres)
+	data_max = [
+		data.origin_fullres[0] + (X - 1) * data.spacing[0],
+		data.origin_fullres[1] + (Y - 1) * data.spacing[1],
+		data.origin_fullres[2] + (Z - 1) * data.spacing[2],
+	]
+	for i in range(3):
+		if mesh_min[i] - data_min[i] < margin:
+			return True
+		if data_max[i] - mesh_max[i] < margin:
+			return True
+	return False
+
+
 def optimize(
 	*,
 	model,
@@ -207,6 +229,7 @@ def optimize(
 	snapshot_interval: int,
 	snapshot_fn,
 	progress_fn=None,
+	load_data_fn=None,
 ) -> fit_data.FitData3D:
 
 	terms = {
@@ -216,9 +239,9 @@ def optimize(
 		"winding_density": {"loss": opt_loss_winding_density.winding_density_loss},
 	}
 
-	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings) -> None:
+	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:
 		if opt_cfg.steps <= 0:
-			return
+			return data
 
 		# If arc params not in optimized set, bake arc into mesh
 		arc_params_set = {"arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1"}
@@ -337,10 +360,15 @@ def optimize(
 				_t_steps_acc = 0
 				_t_wall_start = _t_wall_now
 
+			if load_data_fn is not None and (step1 % 100) == 0 and check_data_bounds(model, data):
+				print(f"[optimizer] mesh near data border at step {step1}, reloading data", flush=True)
+				data = load_data_fn()
+
 			if snap_int > 0 and (step1 % snap_int) == 0:
 				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data, res=res)
 
 		snapshot_fn(stage=label, step=max_steps, loss=float(loss.detach().cpu()), data=data, res=res)
+		return data
 
 	snap_int = int(snapshot_interval)
 	if snap_int < 0:
@@ -352,6 +380,6 @@ def optimize(
 
 	for si, stage in enumerate(stages):
 		if stage.global_opt.steps > 0:
-			_run_opt(si=si, label=f"stage{si}", stage=stage, opt_cfg=stage.global_opt)
+			data = _run_opt(si=si, label=f"stage{si}", stage=stage, opt_cfg=stage.global_opt, data=data)
 
 	return data

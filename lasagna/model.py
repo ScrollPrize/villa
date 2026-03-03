@@ -17,6 +17,7 @@ class ModelParams3D:
 	scaledown: float        # data xy downscale factor
 	z_step_eff: int         # effective z spacing in fullres voxels
 	volume_extent: tuple[float, float, float, float, float, float] | None  # (x0,y0,z0,x1,y1,z1) fullres bbox
+	pyramid_d: bool         # whether depth axis participates in pyramid
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,7 @@ class Model3D(nn.Module):
 		arc_angle0: float = -0.5,
 		arc_angle1: float = 0.5,
 		volume_extent: tuple[float, float, float, float, float, float] | None = None,
+		pyramid_d: bool = False,
 	) -> None:
 		super().__init__()
 		self.depth = max(1, int(depth))
@@ -64,6 +66,7 @@ class Model3D(nn.Module):
 		self.mesh_w = max(2, int(mesh_w))
 		self.z_center = float(z_center)
 		self.arc_enabled = True
+		self.pyramid_d = bool(pyramid_d)
 
 		self.params = ModelParams3D(
 			mesh_step=int(mesh_step),
@@ -73,6 +76,7 @@ class Model3D(nn.Module):
 			scaledown=float(scaledown),
 			z_step_eff=max(1, int(z_step_eff)),
 			volume_extent=volume_extent,
+			pyramid_d=self.pyramid_d,
 		)
 
 		# Arc parameters (fullres coordinates)
@@ -85,7 +89,8 @@ class Model3D(nn.Module):
 		# Residual mesh pyramid: (3, D, H, W) per scale, 5 levels
 		n_scales = 5
 		self.mesh_ms = self._build_zero_pyramid(
-			n_scales=n_scales, channels=3, d=self.depth, h=self.mesh_h, w=self.mesh_w, device=device
+			n_scales=n_scales, channels=3, d=self.depth, h=self.mesh_h, w=self.mesh_w, device=device,
+			pyramid_d=self.pyramid_d,
 		)
 		# Connection offsets buffer: (4, D, Hm, Wm) — [prev_h, prev_w, next_h, next_w]
 		# Not gradient-optimized; updated by update_conn_offsets() after each step.
@@ -98,11 +103,14 @@ class Model3D(nn.Module):
 		self.bias = nn.Parameter(bias_init)
 
 	@staticmethod
-	def _build_zero_pyramid(*, n_scales: int, channels: int, d: int, h: int, w: int, device: torch.device) -> nn.ParameterList:
+	def _build_zero_pyramid(*, n_scales: int, channels: int, d: int, h: int, w: int, device: torch.device, pyramid_d: bool) -> nn.ParameterList:
 		shapes: list[tuple[int, int, int]] = [(d, h, w)]
 		for _ in range(1, max(1, n_scales)):
 			dp, hp, wp = shapes[-1]
-			shapes.append((max(2, (dp + 1) // 2), max(2, (hp + 1) // 2), max(2, (wp + 1) // 2)))
+			if pyramid_d:
+				shapes.append((max(2, (dp + 1) // 2), max(2, (hp + 1) // 2), max(2, (wp + 1) // 2)))
+			else:
+				shapes.append((dp, max(2, (hp + 1) // 2), max(2, (wp + 1) // 2)))
 		return nn.ParameterList([
 			nn.Parameter(torch.zeros(channels, di, hi, wi, device=device, dtype=torch.float32))
 			for di, hi, wi in shapes
@@ -111,33 +119,44 @@ class Model3D(nn.Module):
 	# --- 3D pyramid operations ---
 
 	@staticmethod
-	def _upsample3_crop(src: torch.Tensor, d_t: int, h_t: int, w_t: int) -> torch.Tensor:
-		up = F.interpolate(src.unsqueeze(0), scale_factor=2.0, mode='trilinear', align_corners=True).squeeze(0)
-		return up[:, :d_t, :h_t, :w_t]
+	def _upsample_crop(src: torch.Tensor, d_t: int, h_t: int, w_t: int, *, pyramid_d: bool) -> torch.Tensor:
+		if pyramid_d:
+			up = F.interpolate(src.unsqueeze(0), scale_factor=2.0, mode='trilinear', align_corners=True).squeeze(0)
+			return up[:, :d_t, :h_t, :w_t]
+		else:
+			up = F.interpolate(src, scale_factor=2.0, mode='bilinear', align_corners=True)
+			return up[:, :, :h_t, :w_t]
 
 	@staticmethod
-	def _integrate_pyramid_3d(src: nn.ParameterList) -> torch.Tensor:
+	def _integrate_pyramid_3d(src: nn.ParameterList, *, pyramid_d: bool) -> torch.Tensor:
 		v = src[-1]
 		for d in reversed(list(src[:-1])):
-			v = Model3D._upsample3_crop(v, d.shape[1], d.shape[2], d.shape[3]) + d
+			v = Model3D._upsample_crop(v, d.shape[1], d.shape[2], d.shape[3], pyramid_d=pyramid_d) + d
 		return v
 
 	@staticmethod
-	def _construct_pyramid_from_flat_3d(flat: torch.Tensor, n_scales: int) -> nn.ParameterList:
+	def _construct_pyramid_from_flat_3d(flat: torch.Tensor, n_scales: int, *, pyramid_d: bool) -> nn.ParameterList:
 		shapes: list[tuple[int, int, int]] = [(int(flat.shape[1]), int(flat.shape[2]), int(flat.shape[3]))]
 		for _ in range(1, n_scales):
 			d, h, w = shapes[-1]
-			shapes.append((max(2, (d + 1) // 2), max(2, (h + 1) // 2), max(2, (w + 1) // 2)))
+			if pyramid_d:
+				shapes.append((max(2, (d + 1) // 2), max(2, (h + 1) // 2), max(2, (w + 1) // 2)))
+			else:
+				shapes.append((d, max(2, (h + 1) // 2), max(2, (w + 1) // 2)))
 		targets: list[torch.Tensor] = [flat]
 		for (d, h, w) in shapes[1:]:
-			t = F.interpolate(targets[-1].unsqueeze(0), size=(d, h, w),
-							  mode='trilinear', align_corners=True).squeeze(0)
+			if pyramid_d:
+				t = F.interpolate(targets[-1].unsqueeze(0), size=(d, h, w),
+								  mode='trilinear', align_corners=True).squeeze(0)
+			else:
+				t = F.interpolate(targets[-1], size=(h, w),
+								  mode='bilinear', align_corners=True)
 			targets.append(t)
 		residuals: list[torch.Tensor | None] = [None] * len(targets)
 		recon = targets[-1]
 		residuals[-1] = targets[-1]
 		for i in range(len(targets) - 2, -1, -1):
-			up = Model3D._upsample3_crop(recon, *targets[i].shape[1:])
+			up = Model3D._upsample_crop(recon, *targets[i].shape[1:], pyramid_d=pyramid_d)
 			residuals[i] = targets[i] - up
 			recon = up + residuals[i]
 		return nn.ParameterList([nn.Parameter(r) for r in residuals])
@@ -183,7 +202,7 @@ class Model3D(nn.Module):
 
 	def mesh_coarse(self) -> torch.Tensor:
 		"""Integrate residual pyramid -> (3, D, H, W)."""
-		return self._integrate_pyramid_3d(self.mesh_ms)
+		return self._integrate_pyramid_3d(self.mesh_ms, pyramid_d=self.pyramid_d)
 
 	def _grid_xyz(self) -> torch.Tensor:
 		"""(D, Hm, Wm, 3) mesh positions in fullres voxel coords."""
@@ -507,7 +526,7 @@ class Model3D(nn.Module):
 		"""Absorb arc transform into mesh_ms, disable arc."""
 		with torch.no_grad():
 			final = self._arc_base_positions() + self.mesh_coarse()
-			self.mesh_ms = self._construct_pyramid_from_flat_3d(final, len(self.mesh_ms))
+			self.mesh_ms = self._construct_pyramid_from_flat_3d(final, len(self.mesh_ms), pyramid_d=self.pyramid_d)
 			self.arc_enabled = False
 
 	def load_state_dict_compat(self, state_dict: dict, *, strict: bool = False) -> tuple[list[str], list[str]]:
@@ -521,3 +540,27 @@ class Model3D(nn.Module):
 				st.pop(k)
 		incompat = super().load_state_dict(st, strict=bool(strict))
 		return list(incompat.missing_keys), list(incompat.unexpected_keys)
+
+	@classmethod
+	def from_checkpoint(cls, state_dict: dict, *, device: torch.device) -> 'Model3D':
+		"""Construct a Model3D from a saved checkpoint state_dict."""
+		mp = state_dict["_model_params_"]
+		mesh0 = state_dict["mesh_ms.0"]
+		_c, D, H, W = (int(v) for v in mesh0.shape)
+		mdl = cls(
+			device=device,
+			depth=D,
+			mesh_h=H,
+			mesh_w=W,
+			mesh_step=int(mp["mesh_step"]),
+			winding_step=int(mp["winding_step"]),
+			subsample_mesh=int(mp["subsample_mesh"]),
+			subsample_winding=int(mp["subsample_winding"]),
+			scaledown=float(mp["scaledown"]),
+			z_step_eff=int(mp["z_step_eff"]),
+			volume_extent=mp.get("volume_extent"),
+			pyramid_d=bool(mp.get("pyramid_d", False)),
+		)
+		mdl.load_state_dict_compat(state_dict, strict=False)
+		mdl.arc_enabled = False
+		return mdl

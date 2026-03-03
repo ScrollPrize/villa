@@ -1,14 +1,12 @@
 import argparse
 import copy
 import dataclasses
-import json
 import math
 import sys
 from dataclasses import asdict
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 import cli_data
 import cli_json
@@ -59,64 +57,6 @@ def _arc_params_from_bbox(
 		"arc_angle1": seed_angle + half_angle,
 		"z_center": seed_cz,
 	}
-
-
-def _compute_mesh_bbox_from_arc(
-	*,
-	arc_cx: float, arc_cy: float, arc_radius: float,
-	arc_angle0: float, arc_angle1: float,
-	z_center: float, mesh_step: int, mesh_h: int,
-	depth: int, winding_step: int,
-) -> tuple[float, float, float, float, float, float]:
-	"""Compute (x_min, y_min, z_min, x_max, y_max, z_max) in fullres voxels."""
-	# Z extent
-	h_extent = mesh_step * (mesh_h - 1)
-	z_min = z_center - h_extent / 2.0
-	z_max = z_center + h_extent / 2.0
-
-	# Radius range across depth layers
-	r_min = arc_radius - (depth - 1) / 2.0 * winding_step
-	r_max = arc_radius + (depth - 1) / 2.0 * winding_step
-
-	# Find trig extrema over angle range
-	cos_vals = [math.cos(arc_angle0), math.cos(arc_angle1)]
-	sin_vals = [math.sin(arc_angle0), math.sin(arc_angle1)]
-	for k in range(-4, 5):
-		t = k * math.pi
-		if arc_angle0 <= t <= arc_angle1:
-			cos_vals.append(math.cos(t))
-		t_pos = k * math.pi + math.pi / 2.0
-		if arc_angle0 <= t_pos <= arc_angle1:
-			sin_vals.append(math.sin(t_pos))
-		t_neg = k * math.pi - math.pi / 2.0
-		if arc_angle0 <= t_neg <= arc_angle1:
-			sin_vals.append(math.sin(t_neg))
-
-	cos_mn, cos_mx = min(cos_vals), max(cos_vals)
-	sin_mn, sin_mx = min(sin_vals), max(sin_vals)
-
-	x_candidates = [arc_cx + r * c for r in [r_min, r_max] for c in [cos_mn, cos_mx]]
-	y_candidates = [arc_cy + r * s for r in [r_min, r_max] for s in [sin_mn, sin_mx]]
-
-	return (min(x_candidates), min(y_candidates), z_min,
-			max(x_candidates), max(y_candidates), z_max)
-
-
-def _mesh_bbox_from_state_dict(state_dict: dict) -> tuple[float, float, float, float, float, float] | None:
-	"""Extract mesh bbox from a saved model's state dict (arc already baked)."""
-	ms_keys = sorted(k for k in state_dict if k.startswith("mesh_ms."))
-	if not ms_keys:
-		return None
-	tensors = [state_dict[k] for k in ms_keys]
-	# Integrate pyramid: coarsest to finest
-	v = tensors[-1]
-	for d in reversed(tensors[:-1]):
-		up = F.interpolate(v.unsqueeze(0), scale_factor=2.0,
-						   mode='trilinear', align_corners=True).squeeze(0)
-		v = up[:, :d.shape[1], :d.shape[2], :d.shape[3]] + d
-	# v is (3, D, H, W) in fullres coordinates
-	return (float(v[0].min()), float(v[1].min()), float(v[2].min()),
-			float(v[0].max()), float(v[1].max()), float(v[2].max()))
 
 
 def _auto_crop(
@@ -224,94 +164,8 @@ def main(argv: list[str] | None = None) -> int:
 		model_cfg = dataclasses.replace(model_cfg, depth=auto_depth, mesh_h=auto_mesh_h, mesh_w=auto_mesh_w)
 		print(f"[fit] auto-sized: depth={auto_depth} mesh_h={auto_mesh_h} mesh_w={auto_mesh_w}", flush=True)
 
-	# --- Auto-crop from mesh bbox ---
-	if data_cfg.crop is None and volume_extent_fullres is not None:
-		mesh_bbox = None
-		if not is_new_model and model_cfg.model_input is not None:
-			# Loaded model: peek state dict to get mesh bbox
-			st_peek = torch.load(model_cfg.model_input, map_location="cpu", weights_only=False)
-			mesh_bbox = _mesh_bbox_from_state_dict(st_peek)
-			del st_peek
-			if mesh_bbox is not None:
-				print(f"[fit] mesh bbox from checkpoint: "
-					  f"min=({mesh_bbox[0]:.0f},{mesh_bbox[1]:.0f},{mesh_bbox[2]:.0f}) "
-					  f"max=({mesh_bbox[3]:.0f},{mesh_bbox[4]:.0f},{mesh_bbox[5]:.0f})", flush=True)
-		elif is_new_model:
-			mesh_bbox = _compute_mesh_bbox_from_arc(
-				arc_cx=model_cfg.arc_cx, arc_cy=model_cfg.arc_cy,
-				arc_radius=model_cfg.arc_radius,
-				arc_angle0=model_cfg.arc_angle0, arc_angle1=model_cfg.arc_angle1,
-				z_center=model_cfg.z_center,
-				mesh_step=model_cfg.mesh_step, mesh_h=model_cfg.mesh_h,
-				depth=model_cfg.depth, winding_step=model_cfg.winding_step,
-			)
-			print(f"[fit] mesh bbox from arc: "
-				  f"min=({mesh_bbox[0]:.0f},{mesh_bbox[1]:.0f},{mesh_bbox[2]:.0f}) "
-				  f"max=({mesh_bbox[3]:.0f},{mesh_bbox[4]:.0f},{mesh_bbox[5]:.0f})", flush=True)
-		if mesh_bbox is not None:
-			auto_crop = _auto_crop(mesh_bbox, volume_extent_fullres, margin=3.0)
-			print(f"[fit] auto-crop: x={auto_crop[0]} y={auto_crop[1]} z={auto_crop[2]} "
-				  f"w={auto_crop[3]} h={auto_crop[4]} d={auto_crop[5]}", flush=True)
-			data_cfg = dataclasses.replace(data_cfg, crop=auto_crop)
-
-	# Load 3D data
-	data = cli_data.load_fit_data(data_cfg)
-
-	# Determine volume extent from data
-	Z, Y, X = data.size
-	volume_extent = (
-		data.origin_fullres[0],
-		data.origin_fullres[1],
-		data.origin_fullres[2],
-		data.origin_fullres[0] + (X - 1) * data.spacing[0],
-		data.origin_fullres[1] + (Y - 1) * data.spacing[1],
-		data.origin_fullres[2] + (Z - 1) * data.spacing[2],
-	)
-
-	# Create or load model
-	model_params_in: dict | None = None
-	if model_cfg.model_input is not None:
-		st_in = torch.load(model_cfg.model_input, map_location="cpu")
-		if isinstance(st_in, dict) and isinstance(st_in.get("_model_params_", None), dict):
-			model_params_in = st_in["_model_params_"]
-
-	if model_cfg.model_input is not None and model_params_in is not None:
-		# Load checkpoint — derive model shape from state dict
-		st_cpu = torch.load(model_cfg.model_input, map_location="cpu")
-		mesh0 = st_cpu.get("mesh_ms.0", None)
-		if mesh0 is None or not hasattr(mesh0, "shape"):
-			raise ValueError("model_input missing mesh_ms.0")
-		_c, D, H, W = (int(v) for v in mesh0.shape)
-
-		mdl = model.Model3D(
-			device=device,
-			depth=D,
-			mesh_h=H,
-			mesh_w=W,
-			mesh_step=int(model_params_in.get("mesh_step", model_cfg.mesh_step)),
-			winding_step=int(model_params_in.get("winding_step", model_cfg.winding_step)),
-			subsample_mesh=int(model_params_in.get("subsample_mesh", model_cfg.subsample_mesh)),
-			subsample_winding=int(model_params_in.get("subsample_winding", model_cfg.subsample_winding)),
-			scaledown=float(model_params_in.get("scaledown", scaledown)),
-			z_step_eff=int(round(float(model_params_in.get("scaledown", scaledown)))),
-			z_center=float(model_cfg.z_center),
-			arc_cx=float(model_cfg.arc_cx),
-			arc_cy=float(model_cfg.arc_cy),
-			arc_radius=float(model_cfg.arc_radius),
-			arc_angle0=float(model_cfg.arc_angle0),
-			arc_angle1=float(model_cfg.arc_angle1),
-			volume_extent=volume_extent,
-		)
-
-		st = torch.load(model_cfg.model_input, map_location=device)
-		miss, unexp = mdl.load_state_dict_compat(st, strict=False)
-		mdl.arc_enabled = False  # saved models have baked arcs
-		if unexp:
-			print("state_dict: unexpected keys:", sorted(unexp))
-		if miss:
-			print("state_dict: missing keys:", sorted(miss))
-	else:
-		# Create new model from CLI args
+	# --- Construct / load model (before data, so we can compute bbox) ---
+	if is_new_model:
 		mdl = model.Model3D(
 			device=device,
 			depth=model_cfg.depth,
@@ -329,18 +183,55 @@ def main(argv: list[str] | None = None) -> int:
 			arc_radius=model_cfg.arc_radius,
 			arc_angle0=model_cfg.arc_angle0,
 			arc_angle1=model_cfg.arc_angle1,
-			volume_extent=volume_extent,
+			volume_extent=None,
+			pyramid_d=model_cfg.pyramid_d,
 		)
+	else:
+		st = torch.load(model_cfg.model_input, map_location=device, weights_only=False)
+		mdl = model.Model3D.from_checkpoint(st, device=device)
 
 	print(f"Model3D: depth={mdl.depth} mesh_h={mdl.mesh_h} mesh_w={mdl.mesh_w} "
 		  f"arc_enabled={mdl.arc_enabled}")
 
+	# --- Data loading (with auto-crop, blur, and reload support) ---
+	def _load_data() -> fit_data.FitData3D:
+		with torch.no_grad():
+			xyz = mdl._grid_xyz()  # (D, Hm, Wm, 3)
+			mesh_bbox = (float(xyz[..., 0].min()), float(xyz[..., 1].min()), float(xyz[..., 2].min()),
+						 float(xyz[..., 0].max()), float(xyz[..., 1].max()), float(xyz[..., 2].max()))
+		print(f"[fit] mesh bbox: "
+			  f"min=({mesh_bbox[0]:.0f},{mesh_bbox[1]:.0f},{mesh_bbox[2]:.0f}) "
+			  f"max=({mesh_bbox[3]:.0f},{mesh_bbox[4]:.0f},{mesh_bbox[5]:.0f})", flush=True)
+		if volume_extent_fullres is not None:
+			auto_crop = _auto_crop(mesh_bbox, volume_extent_fullres, margin=3.0)
+			print(f"[fit] auto-crop: x={auto_crop[0]} y={auto_crop[1]} z={auto_crop[2]} "
+				  f"w={auto_crop[3]} h={auto_crop[4]} d={auto_crop[5]}", flush=True)
+			cfg = dataclasses.replace(data_cfg, crop=auto_crop)
+		else:
+			cfg = data_cfg
+		d = cli_data.load_fit_data(cfg)
+		fit_data.blur_3d(d, sigma=2.0)
+		print("[fit] blurred data sigma=2.0", flush=True)
+		Z, Y, X = d.size
+		volume_extent = (
+			d.origin_fullres[0],
+			d.origin_fullres[1],
+			d.origin_fullres[2],
+			d.origin_fullres[0] + (X - 1) * d.spacing[0],
+			d.origin_fullres[1] + (Y - 1) * d.spacing[1],
+			d.origin_fullres[2] + (Z - 1) * d.spacing[2],
+		)
+		mdl.params = dataclasses.replace(mdl.params, volume_extent=volume_extent)
+		return d
+
+	data = _load_data()
+
 	# Print initial mesh stats
 	with torch.no_grad():
-		xyz0 = mdl._grid_xyz()
-		mn = xyz0.amin(dim=(0, 1, 2)).cpu().numpy().tolist()
-		mx = xyz0.amax(dim=(0, 1, 2)).cpu().numpy().tolist()
-		mean = xyz0.mean(dim=(0, 1, 2)).cpu().numpy().tolist()
+		xyz = mdl._grid_xyz()
+		mn = xyz.amin(dim=(0, 1, 2)).cpu().numpy().tolist()
+		mx = xyz.amax(dim=(0, 1, 2)).cpu().numpy().tolist()
+		mean = xyz.mean(dim=(0, 1, 2)).cpu().numpy().tolist()
 		print(f"initial mesh: mean={[round(v, 1) for v in mean]} "
 			  f"min={[round(v, 1) for v in mn]} max={[round(v, 1) for v in mx]}")
 
@@ -375,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
 		snapshot_interval=opt_cfg.snapshot_interval,
 		snapshot_fn=_snapshot,
 		progress_fn=_progress,
+		load_data_fn=_load_data,
 	)
 
 	# Save final model

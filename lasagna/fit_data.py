@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,6 +69,47 @@ class FitData3D:
 			pred_dt=_gs(self.pred_dt),
 			origin_fullres=self.origin_fullres,
 			spacing=self.spacing,
+		)
+
+
+def blur_3d(data: FitData3D, sigma: float) -> None:
+	"""Apply separable 3D Gaussian blur in-place to all data channels.
+
+	Erodes the valid mask by the blur radius so blurred edge artifacts are excluded.
+	"""
+	radius = int(math.ceil(2 * sigma))
+	ks = 2 * radius + 1
+	# 1D Gaussian kernel
+	x = torch.arange(ks, dtype=torch.float32, device=data.cos.device) - radius
+	k1d = torch.exp(-0.5 * (x / sigma) ** 2)
+	k1d = k1d / k1d.sum()
+
+	def _blur_separable(t: torch.Tensor) -> torch.Tensor:
+		# t: (1, 1, Z, Y, X)
+		# Apply along Z (dim=2), Y (dim=3), X (dim=4) using conv3d with 1D kernels
+		v = t
+		# Z axis: kernel shape (1,1,ks,1,1)
+		kz = k1d.view(1, 1, ks, 1, 1)
+		v = F.conv3d(F.pad(v, (0, 0, 0, 0, radius, radius), mode='reflect'), kz)
+		# Y axis: kernel shape (1,1,1,ks,1)
+		ky = k1d.view(1, 1, 1, ks, 1)
+		v = F.conv3d(F.pad(v, (0, 0, radius, radius, 0, 0), mode='reflect'), ky)
+		# X axis: kernel shape (1,1,1,1,ks)
+		kx = k1d.view(1, 1, 1, 1, ks)
+		v = F.conv3d(F.pad(v, (radius, radius, 0, 0, 0, 0), mode='reflect'), kx)
+		return v
+
+	# Blur all signal channels in-place
+	for name in ("cos", "grad_mag", "dir0_z", "dir1_z",
+				 "dir0_y", "dir1_y", "dir0_x", "dir1_x"):
+		t = getattr(data, name)
+		if t is not None:
+			t.copy_(_blur_separable(t))
+
+	# Erode valid mask by blur radius using 3D min-pool
+	if data.valid is not None:
+		data.valid.copy_(
+			-F.max_pool3d(-data.valid, kernel_size=ks, stride=1, padding=radius)
 		)
 
 
