@@ -6,14 +6,19 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ModelConfig:
-	mesh_step_px: int
-	winding_step_px: int
+	mesh_step: int           # fullres voxels
+	winding_step: int        # fullres voxels
 	subsample_mesh: int
 	subsample_winding: int
-	init_size_frac: float
-	init_size_frac_h: float | None
-	init_size_frac_v: float | None
-	z_size: int
+	depth: int               # number of windings
+	mesh_h: int              # mesh grid height
+	mesh_w: int              # mesh grid width
+	arc_cx: float            # arc center x (fullres)
+	arc_cy: float            # arc center y (fullres)
+	arc_radius: float        # arc radius (fullres)
+	arc_angle0: float        # start angle (radians)
+	arc_angle1: float        # end angle (radians)
+	z_center: float          # scroll height center (fullres)
 	model_input: str | None
 	model_output: str | None
 
@@ -24,24 +29,34 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--winding-step", type=int, default=16)
 	g.add_argument("--subsample-mesh", type=int, default=4)
 	g.add_argument("--subsample-winding", type=int, default=4)
-	g.add_argument("--init-size-frac", type=float, default=2.0)
-	g.add_argument("--init-size-frac-h", type=float, default=None)
-	g.add_argument("--init-size-frac-v", type=float, default=None)
-	g.add_argument("--z-size", type=int, default=1)
+	g.add_argument("--depth", type=int, default=3)
+	g.add_argument("--mesh-h", type=int, default=32)
+	g.add_argument("--mesh-w", type=int, default=32)
+	g.add_argument("--arc-cx", type=float, default=0.0)
+	g.add_argument("--arc-cy", type=float, default=0.0)
+	g.add_argument("--arc-radius", type=float, default=1000.0)
+	g.add_argument("--arc-angle-start", type=float, default=-0.5)
+	g.add_argument("--arc-angle-end", type=float, default=0.5)
+	g.add_argument("--z-center", type=float, default=0.0)
 	g.add_argument("--model-input", default=None)
 	g.add_argument("--model-output", default=None)
 
 
 def from_args(args: argparse.Namespace) -> ModelConfig:
 	return ModelConfig(
-		mesh_step_px=int(args.mesh_step),
-		winding_step_px=int(args.winding_step),
+		mesh_step=int(args.mesh_step),
+		winding_step=int(args.winding_step),
 		subsample_mesh=int(args.subsample_mesh),
 		subsample_winding=int(args.subsample_winding),
-		init_size_frac=float(args.init_size_frac),
-		init_size_frac_h=None if args.init_size_frac_h is None else float(args.init_size_frac_h),
-		init_size_frac_v=None if args.init_size_frac_v is None else float(args.init_size_frac_v),
-		z_size=max(1, int(args.z_size)),
+		depth=max(1, int(args.depth)),
+		mesh_h=max(2, int(args.mesh_h)),
+		mesh_w=max(2, int(args.mesh_w)),
+		arc_cx=float(args.arc_cx),
+		arc_cy=float(args.arc_cy),
+		arc_radius=float(args.arc_radius),
+		arc_angle0=float(args.arc_angle_start),
+		arc_angle1=float(args.arc_angle_end),
+		z_center=float(args.z_center),
 		model_input=None if args.model_input is None else str(args.model_input),
 		model_output=None if args.model_output is None else str(args.model_output),
 	)
