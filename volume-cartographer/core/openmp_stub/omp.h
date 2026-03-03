@@ -1,7 +1,7 @@
 #pragma once
 
-#include <sys/time.h>
 #include <cstddef>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -69,13 +69,13 @@ static inline int omp_test_nest_lock(omp_nest_lock_t* lock) {
 
 /* Timing functions */
 static inline double omp_get_wtime(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
 static inline double omp_get_wtick(void) {
-    return 1.0e-6;
+    return 1.0e-9;
 }
 
 /* Schedule functions */

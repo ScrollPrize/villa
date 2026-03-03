@@ -100,6 +100,7 @@ CMAKE_COMMON=(
     -DCMAKE_CXX_FLAGS=" -O3 -march=native -flto=thin -ffat-lto-objects "
     -DBUILD_SHARED_LIBS=ON
     -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 )
 
 download() {
@@ -613,6 +614,7 @@ build_gklib() {
     cmake .. -G Ninja \
         -DCMAKE_C_COMPILER=clang \
         -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DOPENMP=OFF \
         -DSHARED=ON \
         -DGKLIB_BUILD_APPS=OFF
@@ -658,6 +660,7 @@ build_metis() {
     cmake .. -G Ninja \
         -DCMAKE_C_COMPILER=clang \
         -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DGKLIB_PATH="$PREFIX" \
         -DOPENMP=OFF \
         -DSHARED=ON \
@@ -845,8 +848,23 @@ WRAPPER
 
     # Create a user-config.jam pointing to the wrapper
     cat > user-config.jam <<EOF
-using clang : : "$BUILDDIR/bin/clang++-ccache" : <archiver>llvm-ar <ranlib>llvm-ranlib ;
+using clang : : "$BUILDDIR/bin/clang++-ccache" : <archiver>llvm-ar <ranlib>llvm-ranlib <linkflags>-fuse-ld=lld ;
 EOF
+
+    # Find GCC's C++ include/lib paths so clang can locate <cstddef> and crtbeginS.o
+    local gcc_ver b2_extra_flags=""
+    gcc_ver=$(ls /usr/include/c++/ 2>/dev/null | sort -V | tail -1)
+    if [[ -n "$gcc_ver" ]]; then
+        local arch_triple=$(gcc -dumpmachine 2>/dev/null || echo "")
+        b2_extra_flags="cxxflags=-isystem/usr/include/c++/$gcc_ver"
+        if [[ -n "$arch_triple" ]]; then
+            b2_extra_flags+=" cxxflags=-isystem/usr/include/$arch_triple/c++/$gcc_ver"
+            b2_extra_flags+=" linkflags=-L/usr/lib/gcc/$arch_triple/$gcc_ver"
+            b2_extra_flags+=" linkflags=-B/usr/lib/gcc/$arch_triple/$gcc_ver"
+            b2_extra_flags+=" linkflags=-fuse-ld=lld"
+        fi
+        b2_extra_flags+=" cxxflags=-isystem/usr/include/c++/$gcc_ver/backward"
+    fi
 
     ./b2 install \
         --user-config=user-config.jam \
@@ -854,6 +872,7 @@ EOF
         link=shared \
         threading=multi \
         variant=release \
+        $b2_extra_flags \
         -j"$JOBS"
 
     mark_done boost
