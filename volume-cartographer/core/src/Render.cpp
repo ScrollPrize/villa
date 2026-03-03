@@ -34,7 +34,7 @@ void render_binary_mask(QuadSurface* surf,
     // Use surface's scale divided by user scale, so when scale=1.0:
     // genScale = surf->_scale (e.g. 0.05), and sx = 0.05/0.05 = 1.0
     // This samples 1:1 from the raw points grid
-    cv::Vec3f ptr = surf->pointer();
+    cv::Vec3f ptr(0, 0, 0);
     cv::Vec3f offset(-rawSize.width/2.0f, -rawSize.height/2.0f, 0);
     float genScale = surf->_scale[0] / scale;
     surf->gen(&coords_out, nullptr, targetSize, ptr, genScale, offset);

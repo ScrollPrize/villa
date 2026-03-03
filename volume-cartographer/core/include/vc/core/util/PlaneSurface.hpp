@@ -8,7 +8,6 @@ class PlaneSurface : public Surface
 {
 public:
     //Surface API
-    cv::Vec3f pointer() override;
     void move(cv::Vec3f &ptr, const cv::Vec3f &offset) override;
     bool valid(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override { return true; };
     cv::Vec3f loc(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override;

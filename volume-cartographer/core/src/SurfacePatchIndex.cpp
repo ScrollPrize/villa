@@ -527,7 +527,15 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     impl_->surfaceRecords.clear();
     impl_->patchCount = 0;
 
-    const size_t surfaceCount = surfaces.size();
+    // Filter out null surfaces.
+    std::vector<SurfacePtr> loaded;
+    loaded.reserve(surfaces.size());
+    for (const auto& s : surfaces) {
+        if (s) {
+            loaded.push_back(s);
+        }
+    }
+    const size_t surfaceCount = loaded.size();
     if (surfaceCount == 0) {
         impl_->tree.reset();
         impl_->samplingStride = std::max(1, impl_->samplingStride);
@@ -539,7 +547,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     const float padding = bboxPadding;
 
     // Pre-create all masks (sequential, enables thread-safe parallel access)
-    for (const SurfacePtr& surface : surfaces) {
+    for (const SurfacePtr& surface : loaded) {
         impl_->ensureMask(surface);
     }
 
@@ -551,7 +559,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < surfaceCount; ++i) {
         perSurfaceCells[i] = Impl::collectEntriesForSurface(
-            surfaces[i],
+            loaded[i],
             padding,
             stride,
             0,

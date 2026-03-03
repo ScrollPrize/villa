@@ -111,12 +111,12 @@ std::shared_ptr<QuadSurface> Segmentation::loadSurface()
     }
 
     try {
-        // Load the surface directly (no SurfaceMeta wrapper)
-        surface_ = load_quad_from_tifxyz(path_.string());
+        // Create surface with metadata only; TIFF point data loads lazily
+        // on first access (ensureLoaded). This avoids reading all TIFFs at startup.
+        surface_ = std::make_shared<QuadSurface>(path_);
 
-        // Load overlapping info and cache mask timestamp
+        // Load overlapping info (separate JSON, no TIFF I/O)
         surface_->readOverlappingJson();
-        surface_->refreshMaskTimestamp();
 
         return surface_;
     } catch (const std::exception& e) {
