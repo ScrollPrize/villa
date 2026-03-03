@@ -14,6 +14,8 @@ class DataConfig:
 	device: str
 	downscale: float
 	crop: tuple[int, int, int, int, int, int] | None  # (x, y, z, w, h, d) fullres
+	bbox: tuple[int, int, int, int, int] | None        # (cx, cy, cz, w, h) fullres seed
+	z_size: int | None                                  # z extent in fullres voxels
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -24,6 +26,11 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--crop", type=int, nargs=6, default=None,
 		metavar=("X", "Y", "Z", "W", "H", "D"),
 		help="3D volume crop in fullres voxels: x y z w h d")
+	g.add_argument("--bbox", type=int, nargs=5, default=None,
+		metavar=("CX", "CY", "CZ", "W", "H"),
+		help="Seed bbox: center + XY size in fullres voxels")
+	g.add_argument("--z-size", type=int, default=None,
+		help="Z extent in fullres voxels (used with --bbox)")
 
 
 def from_args(args: argparse.Namespace) -> DataConfig:
@@ -34,11 +41,19 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		crop = tuple(int(v) for v in args.crop)
 		if len(crop) != 6:
 			raise ValueError("--crop requires exactly 6 values: x y z w h d")
+	bbox = None
+	if getattr(args, "bbox", None) is not None:
+		bbox = tuple(int(v) for v in args.bbox)
+		if len(bbox) != 5:
+			raise ValueError("--bbox requires exactly 5 values: cx cy cz w h")
+	z_size = None if getattr(args, "z_size", None) is None else int(args.z_size)
 	return DataConfig(
 		input=str(args.input),
 		device=str(args.device),
 		downscale=float(args.downscale),
 		crop=crop,
+		bbox=bbox,
+		z_size=z_size,
 	)
 
 

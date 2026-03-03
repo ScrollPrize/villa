@@ -1,11 +1,14 @@
 import argparse
 import copy
+import dataclasses
 import json
+import math
 import sys
 from dataclasses import asdict
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 import cli_data
 import cli_json
@@ -14,6 +17,136 @@ import cli_opt
 import fit_data
 import model
 import optimizer
+
+
+def _arc_params_from_bbox(
+	bbox: tuple[int, int, int, int, int],
+	z_size: int | None,
+	volume_extent_fullres: tuple[int, int, int],
+) -> dict:
+	"""Derive arc params from bbox seed point.
+
+	bbox: (cx, cy, cz, w, h) in fullres voxels — seed center + XY extent
+	volume_extent_fullres: (X_total, Y_total, Z_total) in fullres voxels
+	Returns dict with keys matching ModelConfig arc fields.
+	"""
+	seed_cx, seed_cy, seed_cz = float(bbox[0]), float(bbox[1]), float(bbox[2])
+	seed_w, seed_h = float(bbox[3]), float(bbox[4])
+	vol_x, vol_y, _vol_z = volume_extent_fullres
+
+	# Volume center XY = estimate of scroll axis
+	arc_cx = vol_x / 2.0
+	arc_cy = vol_y / 2.0
+
+	# Arc radius = distance from volume center to seed point
+	dx = seed_cx - arc_cx
+	dy = seed_cy - arc_cy
+	arc_radius = math.sqrt(dx * dx + dy * dy)
+	arc_radius = max(arc_radius, 100.0)
+
+	# Seed angle
+	seed_angle = math.atan2(dy, dx)
+
+	# Angular half-extent to cover bbox
+	half_angle = max(seed_w, seed_h) / (2.0 * arc_radius)
+	half_angle = max(half_angle, 0.05)
+
+	return {
+		"arc_cx": arc_cx,
+		"arc_cy": arc_cy,
+		"arc_radius": arc_radius,
+		"arc_angle0": seed_angle - half_angle,
+		"arc_angle1": seed_angle + half_angle,
+		"z_center": seed_cz,
+	}
+
+
+def _compute_mesh_bbox_from_arc(
+	*,
+	arc_cx: float, arc_cy: float, arc_radius: float,
+	arc_angle0: float, arc_angle1: float,
+	z_center: float, mesh_step: int, mesh_h: int,
+	depth: int, winding_step: int,
+) -> tuple[float, float, float, float, float, float]:
+	"""Compute (x_min, y_min, z_min, x_max, y_max, z_max) in fullres voxels."""
+	# Z extent
+	h_extent = mesh_step * (mesh_h - 1)
+	z_min = z_center - h_extent / 2.0
+	z_max = z_center + h_extent / 2.0
+
+	# Radius range across depth layers
+	r_min = arc_radius - (depth - 1) / 2.0 * winding_step
+	r_max = arc_radius + (depth - 1) / 2.0 * winding_step
+
+	# Find trig extrema over angle range
+	cos_vals = [math.cos(arc_angle0), math.cos(arc_angle1)]
+	sin_vals = [math.sin(arc_angle0), math.sin(arc_angle1)]
+	for k in range(-4, 5):
+		t = k * math.pi
+		if arc_angle0 <= t <= arc_angle1:
+			cos_vals.append(math.cos(t))
+		t_pos = k * math.pi + math.pi / 2.0
+		if arc_angle0 <= t_pos <= arc_angle1:
+			sin_vals.append(math.sin(t_pos))
+		t_neg = k * math.pi - math.pi / 2.0
+		if arc_angle0 <= t_neg <= arc_angle1:
+			sin_vals.append(math.sin(t_neg))
+
+	cos_mn, cos_mx = min(cos_vals), max(cos_vals)
+	sin_mn, sin_mx = min(sin_vals), max(sin_vals)
+
+	x_candidates = [arc_cx + r * c for r in [r_min, r_max] for c in [cos_mn, cos_mx]]
+	y_candidates = [arc_cy + r * s for r in [r_min, r_max] for s in [sin_mn, sin_mx]]
+
+	return (min(x_candidates), min(y_candidates), z_min,
+			max(x_candidates), max(y_candidates), z_max)
+
+
+def _mesh_bbox_from_state_dict(state_dict: dict) -> tuple[float, float, float, float, float, float] | None:
+	"""Extract mesh bbox from a saved model's state dict (arc already baked)."""
+	ms_keys = sorted(k for k in state_dict if k.startswith("mesh_ms."))
+	if not ms_keys:
+		return None
+	tensors = [state_dict[k] for k in ms_keys]
+	# Integrate pyramid: coarsest to finest
+	v = tensors[-1]
+	for d in reversed(tensors[:-1]):
+		up = F.interpolate(v.unsqueeze(0), scale_factor=2.0,
+						   mode='trilinear', align_corners=True).squeeze(0)
+		v = up[:, :d.shape[1], :d.shape[2], :d.shape[3]] + d
+	# v is (3, D, H, W) in fullres coordinates
+	return (float(v[0].min()), float(v[1].min()), float(v[2].min()),
+			float(v[0].max()), float(v[1].max()), float(v[2].max()))
+
+
+def _auto_crop(
+	mesh_bbox: tuple[float, float, float, float, float, float],
+	volume_extent_fullres: tuple[int, int, int],
+	margin: float = 3.0,
+) -> tuple[int, int, int, int, int, int]:
+	"""Compute crop = margin × mesh extent, centered on mesh, clamped to volume.
+
+	Returns (x0, y0, z0, w, h, d) in fullres voxels.
+	"""
+	x_min, y_min, z_min, x_max, y_max, z_max = mesh_bbox
+	vol_x, vol_y, vol_z = volume_extent_fullres
+
+	cx = (x_min + x_max) / 2.0
+	cy = (y_min + y_max) / 2.0
+	cz = (z_min + z_max) / 2.0
+
+	ex = max((x_max - x_min) * margin / 2.0, 100.0)
+	ey = max((y_max - y_min) * margin / 2.0, 100.0)
+	ez = max((z_max - z_min) * margin / 2.0, 100.0)
+
+	x0 = max(0, int(cx - ex))
+	y0 = max(0, int(cy - ey))
+	z0 = max(0, int(cz - ez))
+	x1 = min(vol_x, int(cx + ex))
+	y1 = min(vol_y, int(cy + ey))
+	z1 = min(vol_z, int(cz + ez))
+
+	return (x0, y0, z0, x1 - x0, y1 - y0, z1 - z0)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -54,12 +187,53 @@ def main(argv: list[str] | None = None) -> int:
 
 	device = torch.device(data_cfg.device)
 
-	# Probe preprocessed zarr for z_step_eff
+	# Probe preprocessed zarr for scaledown and volume extent
 	prep_params = fit_data.get_preprocessed_params(str(data_cfg.input))
-	z_step_eff = 1
+	scaledown = data_cfg.downscale
+	volume_extent_fullres = None
 	if prep_params is not None:
-		z_step_eff = int(prep_params["z_step_eff"])
-		print(f"[fit] zarr z_step_eff={z_step_eff}", flush=True)
+		scaledown = float(prep_params["scaledown"])
+		volume_extent_fullres = prep_params.get("volume_extent_fullres")
+		print(f"[fit] zarr scaledown={scaledown} volume_extent={volume_extent_fullres}", flush=True)
+
+	# --- Arc init from bbox (new model only) ---
+	is_new_model = model_cfg.model_input is None
+	if is_new_model and data_cfg.bbox is not None and volume_extent_fullres is not None:
+		arc = _arc_params_from_bbox(data_cfg.bbox, data_cfg.z_size, volume_extent_fullres)
+		model_cfg = dataclasses.replace(model_cfg, **arc)
+		print(f"[fit] arc from bbox: cx={arc['arc_cx']:.1f} cy={arc['arc_cy']:.1f} "
+			  f"r={arc['arc_radius']:.1f} a0={arc['arc_angle0']:.3f} a1={arc['arc_angle1']:.3f} "
+			  f"z={arc['z_center']:.1f}", flush=True)
+
+	# --- Auto-crop from mesh bbox ---
+	if data_cfg.crop is None and volume_extent_fullres is not None:
+		mesh_bbox = None
+		if not is_new_model and model_cfg.model_input is not None:
+			# Loaded model: peek state dict to get mesh bbox
+			st_peek = torch.load(model_cfg.model_input, map_location="cpu", weights_only=False)
+			mesh_bbox = _mesh_bbox_from_state_dict(st_peek)
+			del st_peek
+			if mesh_bbox is not None:
+				print(f"[fit] mesh bbox from checkpoint: "
+					  f"min=({mesh_bbox[0]:.0f},{mesh_bbox[1]:.0f},{mesh_bbox[2]:.0f}) "
+					  f"max=({mesh_bbox[3]:.0f},{mesh_bbox[4]:.0f},{mesh_bbox[5]:.0f})", flush=True)
+		elif is_new_model:
+			mesh_bbox = _compute_mesh_bbox_from_arc(
+				arc_cx=model_cfg.arc_cx, arc_cy=model_cfg.arc_cy,
+				arc_radius=model_cfg.arc_radius,
+				arc_angle0=model_cfg.arc_angle0, arc_angle1=model_cfg.arc_angle1,
+				z_center=model_cfg.z_center,
+				mesh_step=model_cfg.mesh_step, mesh_h=model_cfg.mesh_h,
+				depth=model_cfg.depth, winding_step=model_cfg.winding_step,
+			)
+			print(f"[fit] mesh bbox from arc: "
+				  f"min=({mesh_bbox[0]:.0f},{mesh_bbox[1]:.0f},{mesh_bbox[2]:.0f}) "
+				  f"max=({mesh_bbox[3]:.0f},{mesh_bbox[4]:.0f},{mesh_bbox[5]:.0f})", flush=True)
+		if mesh_bbox is not None:
+			auto_crop = _auto_crop(mesh_bbox, volume_extent_fullres, margin=3.0)
+			print(f"[fit] auto-crop: x={auto_crop[0]} y={auto_crop[1]} z={auto_crop[2]} "
+				  f"w={auto_crop[3]} h={auto_crop[4]} d={auto_crop[5]}", flush=True)
+			data_cfg = dataclasses.replace(data_cfg, crop=auto_crop)
 
 	# Load 3D data
 	data = cli_data.load_fit_data(data_cfg)
@@ -99,8 +273,8 @@ def main(argv: list[str] | None = None) -> int:
 			winding_step=int(model_params_in.get("winding_step", model_cfg.winding_step)),
 			subsample_mesh=int(model_params_in.get("subsample_mesh", model_cfg.subsample_mesh)),
 			subsample_winding=int(model_params_in.get("subsample_winding", model_cfg.subsample_winding)),
-			scaledown=float(model_params_in.get("scaledown", data_cfg.downscale)),
-			z_step_eff=int(model_params_in.get("z_step_eff", z_step_eff)),
+			scaledown=float(model_params_in.get("scaledown", scaledown)),
+			z_step_eff=int(round(float(model_params_in.get("scaledown", scaledown)))),
 			z_center=float(model_cfg.z_center),
 			arc_cx=float(model_cfg.arc_cx),
 			arc_cy=float(model_cfg.arc_cy),
@@ -127,8 +301,8 @@ def main(argv: list[str] | None = None) -> int:
 			winding_step=model_cfg.winding_step,
 			subsample_mesh=model_cfg.subsample_mesh,
 			subsample_winding=model_cfg.subsample_winding,
-			scaledown=data_cfg.downscale,
-			z_step_eff=z_step_eff,
+			scaledown=scaledown,
+			z_step_eff=int(round(scaledown)),
 			z_center=model_cfg.z_center,
 			arc_cx=model_cfg.arc_cx,
 			arc_cy=model_cfg.arc_cy,

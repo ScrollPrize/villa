@@ -72,9 +72,9 @@ class FitData3D:
 
 
 def get_preprocessed_params(path: str) -> dict | None:
-	"""Probe preprocessed zarr metadata for z_step and downscale.
+	"""Probe preprocessed zarr metadata for scaledown and volume extent.
 
-	Returns dict with keys 'z_step', 'z_step_eff', 'downscale_xy', or None.
+	Returns dict with keys 'scaledown', 'volume_extent_fullres', or None.
 	"""
 	p = Path(path)
 	s = str(p)
@@ -95,10 +95,11 @@ def get_preprocessed_params(path: str) -> dict | None:
 	params = dict(getattr(zsrc, "attrs", {}).get("preprocess_params", {}) or {})
 	if not params:
 		return None
-	ds = float(params.get("downscale_xy", 1.0))
-	zs = int(params.get("z_step", 1))
-	z_step_eff = int(params.get("z_step_eff", int(zs) * int(max(1, int(ds)))))
-	return {"z_step": zs, "z_step_eff": z_step_eff, "downscale_xy": ds}
+	ds = float(params["scaledown"])
+	ds_i = max(1, int(round(ds)))
+	C_all, Z_all, Y_all, X_all = (int(v) for v in zsrc.shape)
+	volume_extent_fullres = (X_all * ds_i, Y_all * ds_i, Z_all * ds_i)
+	return {"scaledown": ds, "volume_extent_fullres": volume_extent_fullres}
 
 
 def load_3d(
@@ -143,8 +144,8 @@ def load_3d(
 	if miss:
 		raise ValueError(f"preprocessed zarr missing required channels: {miss}; available={channels}")
 
-	ds_meta = float(params.get("downscale_xy", 1.0))
-	z_step_eff = int(params.get("z_step_eff", 1))
+	ds_meta = float(params["scaledown"])
+	ds_i = max(1, int(round(ds_meta)))
 	gmag_enc = float(params.get("grad_mag_encode_scale", 255.0))
 	if gmag_enc <= 0.0:
 		raise ValueError(f"invalid grad_mag_encode_scale: {gmag_enc}")
@@ -152,24 +153,22 @@ def load_3d(
 	shape_czyx = tuple(int(v) for v in zsrc.shape)
 	C_all, Z_all, Y_all, X_all = shape_czyx
 
-	# Determine read bounds
+	# Determine read bounds (crop is in fullres voxels, zarr is downscaled by ds_i)
 	if crop is not None:
 		x0, y0, z0, cw, ch, cd = (int(v) for v in crop)
-		ds_i = max(1, int(round(ds_meta)))
-		# Convert fullres crop to zarr voxel coords
 		x0v = max(0, x0 // ds_i)
 		y0v = max(0, y0 // ds_i)
-		z0v = max(0, z0 // z_step_eff) if z_step_eff > 0 else 0
+		z0v = max(0, z0 // ds_i)
 		x1v = min(X_all, (x0 + cw + ds_i - 1) // ds_i)
 		y1v = min(Y_all, (y0 + ch + ds_i - 1) // ds_i)
-		z1v = min(Z_all, (z0 + cd + z_step_eff - 1) // z_step_eff) if z_step_eff > 0 else Z_all
-		origin_fullres = (float(x0v * ds_i), float(y0v * ds_i), float(z0v * z_step_eff))
+		z1v = min(Z_all, (z0 + cd + ds_i - 1) // ds_i)
+		origin_fullres = (float(x0v * ds_i), float(y0v * ds_i), float(z0v * ds_i))
 	else:
 		x0v, y0v, z0v = 0, 0, 0
 		x1v, y1v, z1v = X_all, Y_all, Z_all
 		origin_fullres = (0.0, 0.0, 0.0)
 
-	spacing = (float(ds_meta), float(ds_meta), float(z_step_eff))
+	spacing = (float(ds_meta), float(ds_meta), float(ds_meta))
 
 	print(f"[fit_data] load_3d: zarr shape={shape_czyx}, reading "
 		  f"z=[{z0v}:{z1v}] y=[{y0v}:{y1v}] x=[{x0v}:{x1v}], "
