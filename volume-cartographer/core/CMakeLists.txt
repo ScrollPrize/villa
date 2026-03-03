@@ -19,6 +19,10 @@ add_library(vc_core
         src/Tiff.cpp
         src/Zarr.cpp
         src/VcDataset.cpp
+        src/NetworkFilesystem.cpp
+        src/RemoteUrl.cpp
+        src/CoordGrid.cpp
+        src/PostProcess.cpp
         src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
@@ -36,9 +40,7 @@ target_link_libraries(vc_core
         z5
         OpenMP::OpenMP_CXX
         TIFF::TIFF
-        #${CURL_LIBRARIES}
-        #${OPENSSL_LIBRARIES}
-        #${ZLIB_LIBRARIES}
+        CURL::libcurl
 )
 
 # VcDataset dependencies
