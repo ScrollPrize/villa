@@ -239,43 +239,44 @@ class Model3D(nn.Module):
 		device = xyz_lr.device
 		normals = self._vertex_normals(xyz_lr)  # (D, Hm, Wm, 3)
 
-		# Mesh index grids
-		h_idx = torch.arange(Hm, device=device, dtype=torch.float32).view(1, Hm, 1).expand(D, Hm, Wm)
-		w_idx = torch.arange(Wm, device=device, dtype=torch.float32).view(1, 1, Wm).expand(D, Hm, Wm)
-
 		# conn_offsets: (4, D, Hm, Wm) — [prev_h, prev_w, next_h, next_w]
 		prev_h_off = self.conn_offsets[0]
 		prev_w_off = self.conn_offsets[1]
 		next_h_off = self.conn_offsets[2]
 		next_w_off = self.conn_offsets[3]
 
-		def _intersect_direction(nb_xyz: torch.Tensor, h_off: torch.Tensor, w_off: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+		def _intersect_direction(src_xyz: torch.Tensor, src_n: torch.Tensor, nb_xyz: torch.Tensor, h_off: torch.Tensor, w_off: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 			"""Ray-bilinear-patch intersection for one direction.
 
-			nb_xyz: (D, Hm, Wm, 3) — neighbor slice positions.
-			h_off, w_off: (D, Hm, Wm) — offsets.
+			src_xyz: (B, Hm, Wm, 3) — source vertex positions (ray origins).
+			src_n: (B, Hm, Wm, 3) — source vertex normals (ray directions).
+			nb_xyz: (B, Hm, Wm, 3) — neighbor slice positions.
+			h_off, w_off: (B, Hm, Wm) — offsets.
 
-			Returns: (conn_pt, u, v, row, col) where conn_pt is (D, Hm, Wm, 3).
+			Returns: (conn_pt, u, v, row, col) where conn_pt is (B, Hm, Wm, 3).
 			"""
-			target_h = h_idx + h_off
-			target_w = w_idx + w_off
+			B = src_xyz.shape[0]
+			h_idx_b = torch.arange(Hm, device=device, dtype=torch.float32).view(1, Hm, 1).expand(B, Hm, Wm)
+			w_idx_b = torch.arange(Wm, device=device, dtype=torch.float32).view(1, 1, Wm).expand(B, Hm, Wm)
+
+			target_h = h_idx_b + h_off
+			target_w = w_idx_b + w_off
 			row = target_h.floor().clamp(0, Hm - 2).long()
 			col = target_w.floor().clamp(0, Wm - 2).long()
 			frac_h = target_h - row.float()
 			frac_w = target_w - col.float()
 
 			# Gather quad corners from neighbor slice: P00, P10, P01, P11
-			# nb_xyz: (D, Hm, Wm, 3) — index with (row, col), (row+1, col), etc.
-			d_idx = torch.arange(D, device=device).view(D, 1, 1).expand(D, Hm, Wm)
-			P00 = nb_xyz[d_idx, row, col]              # (D, Hm, Wm, 3)
+			d_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, Hm, Wm)
+			P00 = nb_xyz[d_idx, row, col]              # (B, Hm, Wm, 3)
 			P10 = nb_xyz[d_idx, row + 1, col]
 			P01 = nb_xyz[d_idx, row, col + 1]
 			P11 = nb_xyz[d_idx, row + 1, col + 1]
 
 			# Ray: O + s*n, Patch: Q(u,v) = (1-u)(1-v)*P00 + u(1-v)*P10 + (1-u)*v*P01 + u*v*P11
 			# Rearrange: Q(u,v) = P00 + u*a + v*b + u*v*c  where:
-			O = xyz_lr  # (D, Hm, Wm, 3) — broadcast over all vertices
-			n = normals
+			O = src_xyz
+			n = src_n
 			a = P10 - P00
 			b = P01 - P00
 			c = P11 - P10 - P01 + P00
@@ -361,17 +362,17 @@ class Model3D(nn.Module):
 		self._conn_params: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 		if D >= 2:
-			# Prev connections (d -> d-1): use slices [1:] connecting to [:-1]
+			# Prev connections (d -> d-1): source is slices [1:], neighbor is [:-1]
 			prev_conn, prev_u, prev_v, prev_row, prev_col = _intersect_direction(
-				xyz_lr[:-1], prev_h_off[1:], prev_w_off[1:]
+				xyz_lr[1:], normals[1:], xyz_lr[:-1], prev_h_off[1:], prev_w_off[1:]
 			)
 			# prev_conn shape: (D-1, Hm, Wm, 3) for slices [1:]
 			xy_conn[1:, :, :, :, 0] = prev_conn
 			self._conn_params["prev"] = (prev_u, prev_v, prev_row, prev_col)
 
-			# Next connections (d -> d+1): use slices [:-1] connecting to [1:]
+			# Next connections (d -> d+1): source is slices [:-1], neighbor is [1:]
 			next_conn, next_u, next_v, next_row, next_col = _intersect_direction(
-				xyz_lr[1:], next_h_off[:-1], next_w_off[:-1]
+				xyz_lr[:-1], normals[:-1], xyz_lr[1:], next_h_off[:-1], next_w_off[:-1]
 			)
 			xy_conn[:-1, :, :, :, 2] = next_conn
 			self._conn_params["next"] = (next_u, next_v, next_row, next_col)
