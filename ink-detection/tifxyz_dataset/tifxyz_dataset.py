@@ -5,16 +5,19 @@ import cv2
 from torch.utils.data import Dataset
 
 from common import (
-    _fix_known_bottom_right_padding,
+    _build_normal_offset_mask_from_labeled_points,
+    _get_segment_normals_zyx as _common_get_segment_normals_zyx,
+    _get_segment_positive_points_zyx as _common_get_segment_positive_points_zyx,
+    _load_segment_ink_mask as _common_load_segment_ink_mask,
     _normalize_patch_size_zyx,
     _points_to_voxels,
     _points_within_minmax,
     _read_volume_crop_from_patch_dict,
+    _voxelize_positive_labels as _common_voxelize_positive_labels,
+    _voxelize_surface as _common_voxelize_surface,
 )
 from patch_finding import _PATCH_CACHE_DEFAULT_FILENAME, find_patches
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
-from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
-from vesuvius.tifxyz import interpolate_at_points
 
 class TifxyzInkDataset(Dataset):
     def __init__(
@@ -28,6 +31,10 @@ class TifxyzInkDataset(Dataset):
         self.patch_size = config["patch_size"]                                          # 3d vol crop / model input patch size
         self.bg_distance = config["bg_distance"]                                        # distance to project along normal (or edt), in "layers"
         self.label_distance = config["label_distance"]                                  # distance to project along normal (or edt), in "layers"
+        self.bg_dilate_distance = int(config.get("bg_dilate_distance", 192))            # 2d surface dilation radius (pixels) used to define near-ink background
+        self.normal_sample_step = float(config.get("normal_sample_step", 0.5))
+        self.normal_trilinear_threshold = float(config.get("normal_trilinear_threshold", 1e-4))
+        self.use_numba_for_normal_mask = bool(config.get("use_numba_for_normal_mask", True))
         self.patch_size_zyx = _normalize_patch_size_zyx(self.patch_size)        
         self.overlap_fraction = float(config.get("overlap_fraction", 0.25))             # amount of overlap (stride) in train/val patches, as a percentage of the patch size
         self.min_positive_fraction = float(config.get("min_positive_fraction", 0.01))   # minimum amount of labeled voxels in a candidate bbox to be added to our patches list, as a percentage of the total voxels
@@ -46,7 +53,11 @@ class TifxyzInkDataset(Dataset):
 
         self._segment_grid_cache = {}
         self._segment_ink_mask_cache = {}
+        self._segment_surface_supervision_cache = {}
+        self._segment_normal_cache = {}
         self._segment_positive_points_cache = {}
+        self._segment_positive_samples_cache = {}
+        self._segment_background_samples_cache = {}
 
         if apply_augmentation:                                                          # we'll use the vesuvius augmentation pipeline , see vesuvius/src/vesuvius/models/augmentation/pipelines/training_transforms.py
             self.augmentations = create_training_transforms(                            # for current defaults 
@@ -99,58 +110,38 @@ class TifxyzInkDataset(Dataset):
         return cached
 
     def _load_segment_ink_mask(self, segment):
+        return _common_load_segment_ink_mask(self, segment)
+
+    def _get_segment_positive_points_zyx(self, segment):
+        return _common_get_segment_positive_points_zyx(self, segment)
+
+    def _load_segment_surface_supervision(self, segment):
         segment_uuid = str(segment.uuid)
-        cached = self._segment_ink_mask_cache.get(segment_uuid)
+        cached = self._segment_surface_supervision_cache.get(segment_uuid)
         if cached is not None:
             return cached
 
-        grid = self._get_segment_stored_grid(segment)
-        expected_shape = tuple(int(v) for v in grid["shape"])
-        ink_meta = next(
-            (label for label in segment.list_labels() if label.get("name") == "inklabels"),
-            None,
-        )
-        if ink_meta is None:
-            out = np.zeros(expected_shape, dtype=bool)
-            self._segment_ink_mask_cache[segment_uuid] = out
-            return out
+        ink_mask = self._load_segment_ink_mask(segment)
+        # Surface labels: 1=ink, 0=near-ink background, 100=ignore/far background.
+        surface_supervision = np.full(ink_mask.shape, 100, dtype=np.uint8)
+        surface_supervision[ink_mask] = 1
 
-        ink_label = cv2.imread(str(ink_meta["path"]), cv2.IMREAD_UNCHANGED)
-        if ink_label is None:
-            out = np.zeros(expected_shape, dtype=bool)
-            self._segment_ink_mask_cache[segment_uuid] = out
-            return out
-        if ink_label.ndim == 3:
-            if ink_label.shape[2] == 4:
-                ink_label = cv2.cvtColor(ink_label, cv2.COLOR_BGRA2GRAY)
-            else:
-                ink_label = cv2.cvtColor(ink_label, cv2.COLOR_BGR2GRAY)
-
-        if tuple(int(v) for v in ink_label.shape) != expected_shape:
-            fixed_label, _ = _fix_known_bottom_right_padding(
-                ink_label,
-                expected_shape,
-                self.auto_fix_padding_multiples,
+        dilate_radius = max(0, int(self.bg_dilate_distance))
+        if dilate_radius > 0 and bool(np.any(ink_mask)):
+            kernel_size = 2 * dilate_radius + 1
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (kernel_size, kernel_size),
             )
-            if fixed_label is not None:
-                ink_label = fixed_label
-            else:
-                ink_label = (
-                    cv2.resize(
-                        (ink_label > 0).astype(np.uint8),
-                        (int(expected_shape[1]), int(expected_shape[0])),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                    > 0
-                ).astype(np.uint8)
+            dilated = cv2.dilate(ink_mask.astype(np.uint8), kernel, iterations=1) > 0
+            surface_supervision[dilated & (~ink_mask)] = 0
 
-        out = np.asarray(ink_label > 0, dtype=bool)
-        self._segment_ink_mask_cache[segment_uuid] = out
-        return out
+        self._segment_surface_supervision_cache[segment_uuid] = surface_supervision
+        return surface_supervision
 
-    def _get_segment_positive_points_zyx(self, segment):
+    def _get_segment_positive_samples(self, segment):
         segment_uuid = str(segment.uuid)
-        cached = self._segment_positive_points_cache.get(segment_uuid)
+        cached = self._segment_positive_samples_cache.get(segment_uuid)
         if cached is not None:
             return cached
 
@@ -168,12 +159,19 @@ class TifxyzInkDataset(Dataset):
 
         positive_mask = np.asarray(grid["valid"] & ink_mask, dtype=bool)
         if not bool(np.any(positive_mask)):
-            out = np.empty((0, 3), dtype=np.float32)
-            self._segment_positive_points_cache[segment_uuid] = out
+            out = {
+                "rows": np.empty((0,), dtype=np.int32),
+                "cols": np.empty((0,), dtype=np.int32),
+                "points_zyx": np.empty((0, 3), dtype=np.float32),
+            }
+            self._segment_positive_samples_cache[segment_uuid] = out
+            self._segment_positive_points_cache[segment_uuid] = out["points_zyx"]
             return out
 
         row_idx, col_idx = np.where(positive_mask)
-        out = np.stack(
+        row_idx = np.asarray(row_idx, dtype=np.int32)
+        col_idx = np.asarray(col_idx, dtype=np.int32)
+        points_zyx = np.stack(
             [
                 grid["z"][row_idx, col_idx],
                 grid["y"][row_idx, col_idx],
@@ -181,72 +179,189 @@ class TifxyzInkDataset(Dataset):
             ],
             axis=-1,
         ).astype(np.float32, copy=False)
-        self._segment_positive_points_cache[segment_uuid] = out
+
+        out = {
+            "rows": row_idx,
+            "cols": col_idx,
+            "points_zyx": points_zyx,
+        }
+        self._segment_positive_samples_cache[segment_uuid] = out
+        self._segment_positive_points_cache[segment_uuid] = points_zyx
         return out
 
+    def _get_segment_background_samples(self, segment):
+        segment_uuid = str(segment.uuid)
+        cached = self._segment_background_samples_cache.get(segment_uuid)
+        if cached is not None:
+            return cached
+
+        grid = self._get_segment_stored_grid(segment)
+        surface_supervision = self._load_segment_surface_supervision(segment)
+        if tuple(int(v) for v in surface_supervision.shape) != tuple(int(v) for v in grid["shape"]):
+            surface_supervision = cv2.resize(
+                surface_supervision.astype(np.uint8),
+                (int(grid["shape"][1]), int(grid["shape"][0])),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(np.uint8, copy=False)
+
+        background_mask = np.asarray(grid["valid"] & (surface_supervision == 0), dtype=bool)
+        if not bool(np.any(background_mask)):
+            out = {
+                "rows": np.empty((0,), dtype=np.int32),
+                "cols": np.empty((0,), dtype=np.int32),
+                "points_zyx": np.empty((0, 3), dtype=np.float32),
+            }
+            self._segment_background_samples_cache[segment_uuid] = out
+            return out
+
+        row_idx, col_idx = np.where(background_mask)
+        row_idx = np.asarray(row_idx, dtype=np.int32)
+        col_idx = np.asarray(col_idx, dtype=np.int32)
+        points_zyx = np.stack(
+            [
+                grid["z"][row_idx, col_idx],
+                grid["y"][row_idx, col_idx],
+                grid["x"][row_idx, col_idx],
+            ],
+            axis=-1,
+        ).astype(np.float32, copy=False)
+
+        out = {
+            "rows": row_idx,
+            "cols": col_idx,
+            "points_zyx": points_zyx,
+        }
+        self._segment_background_samples_cache[segment_uuid] = out
+        return out
+
+    def _get_segment_normals_zyx(self, segment):
+        return _common_get_segment_normals_zyx(self, segment)
+
     def _voxelize_positive_labels(self, segment, min_corner, max_corner, crop_size):
-        positive_points_world = self._get_segment_positive_points_zyx(segment)
-        if positive_points_world.shape[0] == 0:
-            return np.zeros(tuple(int(v) for v in crop_size), dtype=np.float32)
-
-        in_bbox = _points_within_minmax(positive_points_world, min_corner, max_corner)
-        if not bool(np.any(in_bbox)):
-            return np.zeros(tuple(int(v) for v in crop_size), dtype=np.float32)
-
-        local_points = positive_points_world[in_bbox] - np.asarray(min_corner, dtype=np.float32)[None, :]
-        return _points_to_voxels(local_points, crop_size)
+        return _common_voxelize_positive_labels(
+            self,
+            segment,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            crop_size=crop_size,
+        )
 
     def _voxelize_surface(self, segment, min_corner, max_corner, crop_size):
-        crop_size_tuple = tuple(int(v) for v in crop_size)
-        grid = self._get_segment_stored_grid(segment)
-        x_stored = grid["x"]
-        y_stored = grid["y"]
-        z_stored = grid["z"]
-        valid_mask = grid["valid"]
-
-        in_bbox = (
-            valid_mask &
-            (z_stored >= float(min_corner[0])) & (z_stored < float(max_corner[0])) &
-            (y_stored >= float(min_corner[1])) & (y_stored < float(max_corner[1])) &
-            (x_stored >= float(min_corner[2])) & (x_stored < float(max_corner[2]))
+        return _common_voxelize_surface(
+            self,
+            segment,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            crop_size=crop_size,
         )
+
+    def _voxelize_label_tolerance_band(self, segment, min_corner, max_corner, crop_size):
+        positive_samples = self._get_segment_positive_samples(segment)
+        return self._voxelize_normal_offset_band(
+            segment=segment,
+            samples=positive_samples,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            crop_size=crop_size,
+            label_distance=float(self.label_distance),
+        )
+
+    def _voxelize_background_surface_labels(self, segment, min_corner, max_corner, crop_size):
+        crop_size_tuple = tuple(int(v) for v in crop_size)
+        background_samples = self._get_segment_background_samples(segment)
+        points_world = background_samples["points_zyx"]
+        if points_world.shape[0] == 0:
+            return np.zeros(crop_size_tuple, dtype=np.float32)
+
+        in_bbox = _points_within_minmax(points_world, min_corner, max_corner)
         if not bool(np.any(in_bbox)):
             return np.zeros(crop_size_tuple, dtype=np.float32)
 
-        rows, cols = np.where(in_bbox)
-        row_min, row_max = int(rows.min()), int(rows.max())
-        col_min, col_max = int(cols.min()), int(cols.max())
-        query_rows = np.arange(row_min, row_max + 1, dtype=np.float32)
-        query_cols = np.arange(col_min, col_max + 1, dtype=np.float32)
-        query_y, query_x = np.meshgrid(query_rows, query_cols, indexing="ij")
+        local_points = points_world[in_bbox] - np.asarray(min_corner, dtype=np.float32)[None, :]
+        return _points_to_voxels(local_points, crop_size_tuple)
 
-        x_int, y_int, z_int, int_valid = interpolate_at_points(
-            x_stored,
-            y_stored,
-            z_stored,
-            valid_mask,
-            query_y,
-            query_x,
-            scale=(1.0, 1.0),
-            method="catmull_rom",
-            invalid_value=-1.0,
+    def _voxelize_background_tolerance_band(self, segment, min_corner, max_corner, crop_size):
+        background_samples = self._get_segment_background_samples(segment)
+        return self._voxelize_normal_offset_band(
+            segment=segment,
+            samples=background_samples,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            crop_size=crop_size,
+            label_distance=float(self.bg_distance),
         )
-        zyx_world = np.stack([z_int, y_int, x_int], axis=-1).astype(np.float32, copy=False)
-        valid_interp = np.asarray(int_valid, dtype=bool)
-        valid_interp &= np.isfinite(zyx_world).all(axis=-1)
-        valid_interp &= (
-            (zyx_world[..., 0] >= float(min_corner[0])) & (zyx_world[..., 0] < float(max_corner[0])) &
-            (zyx_world[..., 1] >= float(min_corner[1])) & (zyx_world[..., 1] < float(max_corner[1])) &
-            (zyx_world[..., 2] >= float(min_corner[2])) & (zyx_world[..., 2] < float(max_corner[2]))
-        )
-        if not bool(np.any(valid_interp)):
+
+    def _voxelize_normal_offset_band(
+        self,
+        segment,
+        samples,
+        min_corner,
+        max_corner,
+        crop_size,
+        label_distance,
+    ):
+        crop_size_tuple = tuple(int(v) for v in crop_size)
+        points_world = samples["points_zyx"]
+        if points_world.shape[0] == 0:
             return np.zeros(crop_size_tuple, dtype=np.float32)
 
-        local_grid = zyx_world - np.asarray(min_corner, dtype=np.float32).reshape(1, 1, 3)
-        return voxelize_surface_grid_masked(local_grid, crop_size_tuple, valid_interp).astype(
-            np.float32,
-            copy=False,
+        distance = float(label_distance)
+        if distance <= 0.0:
+            in_bbox = _points_within_minmax(points_world, min_corner, max_corner)
+            if not bool(np.any(in_bbox)):
+                return np.zeros(crop_size_tuple, dtype=np.float32)
+            local_points = points_world[in_bbox] - np.asarray(min_corner, dtype=np.float32)[None, :]
+            return _points_to_voxels(local_points, crop_size_tuple)
+
+        normals_grid = self._get_segment_normals_zyx(segment)
+        row_idx = samples["rows"]
+        col_idx = samples["cols"]
+        normals_zyx = normals_grid[row_idx, col_idx].astype(np.float32, copy=False)
+
+        expand = distance + 1.0
+        expanded_min = np.asarray(min_corner, dtype=np.float32) - expand
+        expanded_max = np.asarray(max_corner, dtype=np.float32) + expand
+        in_expanded = _points_within_minmax(points_world, expanded_min, expanded_max)
+        if not bool(np.any(in_expanded)):
+            return np.zeros(crop_size_tuple, dtype=np.float32)
+
+        return _build_normal_offset_mask_from_labeled_points(
+            points_world[in_expanded],
+            normals_zyx[in_expanded],
+            min_corner=min_corner,
+            crop_size=crop_size_tuple,
+            label_distance=distance,
+            sample_step=float(self.normal_sample_step),
+            trilinear_threshold=float(self.normal_trilinear_threshold),
+            use_numba=bool(self.use_numba_for_normal_mask),
         )
+
+    def _build_projected_loss_mask_volume(self, segment, min_corner, max_corner, crop_size):
+        crop_size_tuple = tuple(int(v) for v in crop_size)
+        out = np.full(crop_size_tuple, 2.0, dtype=np.float32)
+        background_tolerance_vox = self._voxelize_background_tolerance_band(
+            segment,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            crop_size=crop_size_tuple,
+        )
+        out[background_tolerance_vox > 0.0] = 0.0
+
+        label_tolerance_vox = self._voxelize_label_tolerance_band(
+            segment,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            crop_size=crop_size_tuple,
+        )
+        out[label_tolerance_vox > 0.0] = 1.0
+        return out
+
+    def _build_surface_label_volume(self, positive_label_vox, background_label_vox, crop_size):
+        crop_size_tuple = tuple(int(v) for v in crop_size)
+        out = np.full(crop_size_tuple, 2.0, dtype=np.float32)
+        out[background_label_vox > 0.0] = 0.0
+        out[positive_label_vox > 0.0] = 1.0
+        return out
 
     def __getitem__(self, idx):
         patch = self.patches[idx]
@@ -271,7 +386,24 @@ class TifxyzInkDataset(Dataset):
             max_corner=max_corner,
             crop_size=crop_size,
         )
+        background_label_vox = self._voxelize_background_surface_labels(
+            segment,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            crop_size=crop_size,
+        )
         surface_vox = self._voxelize_surface(
+            segment,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            crop_size=crop_size,
+        )
+        surface_label_vox = self._build_surface_label_volume(
+            positive_label_vox=positive_label_vox,
+            background_label_vox=background_label_vox,
+            crop_size=crop_size,
+        )
+        mil_loss_mask_vox = self._build_projected_loss_mask_volume(
             segment,
             min_corner=min_corner,
             max_corner=max_corner,
@@ -281,14 +413,26 @@ class TifxyzInkDataset(Dataset):
         return {
             "vol": vol_crop,
             "positive_label_vox": positive_label_vox,
+            "background_label_vox": background_label_vox,
+            "surface_label_vox": surface_label_vox,
             "surface_vox": surface_vox,
+            "mil_loss_mask_vox": mil_loss_mask_vox,
             "patch": patch,
             "idx": int(idx),
         }
 
 
 if __name__ == "__main__":
+    import argparse
     import json
+
+    parser = argparse.ArgumentParser(description="Inspect the TifxyzInkDataset.")
+    parser.add_argument(
+        "--napari",
+        action="store_true",
+        help="Iterate the dataset once and visualize outputs in a Napari viewer.",
+    )
+    args = parser.parse_args()
 
     config_path = os.path.join(os.path.dirname(__file__), "example_config.json")
     with open(config_path, "r", encoding="utf-8") as f:
@@ -302,3 +446,33 @@ if __name__ == "__main__":
 
     print(f"loaded patches: {len(ds)}")
     print(json.dumps(ds.patch_generation_stats, indent=2, sort_keys=True))
+
+    if args.napari:
+        try:
+            import napari
+        except ImportError as exc:
+            raise ImportError(
+                "napari is required for --napari. Install it and re-run."
+            ) from exc
+
+        output_keys = (
+            "vol",
+            "positive_label_vox",
+            "background_label_vox",
+            "surface_label_vox",
+            "surface_vox",
+            "mil_loss_mask_vox",
+        )
+        stacked_outputs = {k: [] for k in output_keys}
+
+        for sample in ds:
+            for key in output_keys:
+                stacked_outputs[key].append(np.asarray(sample[key]))
+
+        viewer = napari.Viewer()
+        for key in output_keys:
+            if not stacked_outputs[key]:
+                continue
+            viewer.add_image(np.stack(stacked_outputs[key], axis=0), name=key)
+
+        napari.run()

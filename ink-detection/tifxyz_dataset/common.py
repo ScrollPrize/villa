@@ -129,6 +129,63 @@ def _points_to_voxels(points_local, crop_size):
     return vox
 
 
+def _load_segment_ink_mask(dataset, segment):
+    import cv2
+
+    segment_uuid = str(segment.uuid)
+    cached = dataset._segment_ink_mask_cache.get(segment_uuid)
+    if cached is not None:
+        return cached
+
+    grid = dataset._get_segment_stored_grid(segment)
+    expected_shape = tuple(int(v) for v in grid["shape"])
+    ink_meta = next(
+        (label for label in segment.list_labels() if label.get("name") == "inklabels"),
+        None,
+    )
+    if ink_meta is None:
+        out = np.zeros(expected_shape, dtype=bool)
+        dataset._segment_ink_mask_cache[segment_uuid] = out
+        return out
+
+    ink_label = cv2.imread(str(ink_meta["path"]), cv2.IMREAD_UNCHANGED)
+    if ink_label is None:
+        out = np.zeros(expected_shape, dtype=bool)
+        dataset._segment_ink_mask_cache[segment_uuid] = out
+        return out
+    if ink_label.ndim == 3:
+        if ink_label.shape[2] == 4:
+            ink_label = cv2.cvtColor(ink_label, cv2.COLOR_BGRA2GRAY)
+        else:
+            ink_label = cv2.cvtColor(ink_label, cv2.COLOR_BGR2GRAY)
+
+    if tuple(int(v) for v in ink_label.shape) != expected_shape:
+        fixed_label, _ = _fix_known_bottom_right_padding(
+            ink_label,
+            expected_shape,
+            dataset.auto_fix_padding_multiples,
+        )
+        if fixed_label is not None:
+            ink_label = fixed_label
+        else:
+            ink_label = (
+                cv2.resize(
+                    (ink_label > 0).astype(np.uint8),
+                    (int(expected_shape[1]), int(expected_shape[0])),
+                    interpolation=cv2.INTER_AREA,
+                )
+                > 0
+            ).astype(np.uint8)
+
+    out = np.asarray(ink_label > 0, dtype=bool)
+    dataset._segment_ink_mask_cache[segment_uuid] = out
+    return out
+
+
+def _get_segment_positive_points_zyx(dataset, segment):
+    return dataset._get_segment_positive_samples(segment)["points_zyx"]
+
+
 if njit is not None:
     @njit(cache=True)
     def _splat_points_trilinear_numba(points, size_z, size_y, size_x):
@@ -244,6 +301,10 @@ def _estimate_surface_normals_zyx(x_grid, y_grid, z_grid, valid_mask, eps=1e-6):
     v_next_r = np.roll(valid, -1, axis=0)
     v_prev_c = np.roll(valid, 1, axis=1)
     v_next_c = np.roll(valid, -1, axis=1)
+    v_prev_r[0, :] = False
+    v_next_r[-1, :] = False
+    v_prev_c[:, 0] = False
+    v_next_c[:, -1] = False
 
     tangent_r = np.zeros_like(p, dtype=np.float32)
     tangent_c = np.zeros_like(p, dtype=np.float32)
@@ -268,6 +329,98 @@ def _estimate_surface_normals_zyx(x_grid, y_grid, z_grid, valid_mask, eps=1e-6):
     out = np.zeros_like(normals, dtype=np.float32)
     out[good] = normals[good] / norm[good]
     return out
+
+
+def _get_segment_normals_zyx(dataset, segment):
+    segment_uuid = str(segment.uuid)
+    cached = dataset._segment_normal_cache.get(segment_uuid)
+    if cached is not None:
+        return cached
+
+    grid = dataset._get_segment_stored_grid(segment)
+    normals = _estimate_surface_normals_zyx(
+        grid["x"],
+        grid["y"],
+        grid["z"],
+        grid["valid"],
+    )
+    dataset._segment_normal_cache[segment_uuid] = normals
+    return normals
+
+
+def _voxelize_positive_labels(dataset, segment, min_corner, max_corner, crop_size):
+    positive_points_world = _get_segment_positive_points_zyx(dataset, segment)
+    if positive_points_world.shape[0] == 0:
+        return np.zeros(tuple(int(v) for v in crop_size), dtype=np.float32)
+
+    in_bbox = _points_within_minmax(positive_points_world, min_corner, max_corner)
+    if not bool(np.any(in_bbox)):
+        return np.zeros(tuple(int(v) for v in crop_size), dtype=np.float32)
+
+    local_points = positive_points_world[in_bbox] - np.asarray(min_corner, dtype=np.float32)[None, :]
+    return _points_to_voxels(local_points, crop_size)
+
+
+def _voxelize_surface(dataset, segment, min_corner, max_corner, crop_size):
+    from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
+    from vesuvius.tifxyz import interpolate_at_points
+
+    crop_size_tuple = tuple(int(v) for v in crop_size)
+    grid = dataset._get_segment_stored_grid(segment)
+    x_stored = grid["x"]
+    y_stored = grid["y"]
+    z_stored = grid["z"]
+    valid_mask = grid["valid"]
+
+    in_bbox = (
+        valid_mask
+        & (z_stored >= float(min_corner[0]))
+        & (z_stored < float(max_corner[0]))
+        & (y_stored >= float(min_corner[1]))
+        & (y_stored < float(max_corner[1]))
+        & (x_stored >= float(min_corner[2]))
+        & (x_stored < float(max_corner[2]))
+    )
+    if not bool(np.any(in_bbox)):
+        return np.zeros(crop_size_tuple, dtype=np.float32)
+
+    rows, cols = np.where(in_bbox)
+    row_min, row_max = int(rows.min()), int(rows.max())
+    col_min, col_max = int(cols.min()), int(cols.max())
+    query_rows = np.arange(row_min, row_max + 1, dtype=np.float32)
+    query_cols = np.arange(col_min, col_max + 1, dtype=np.float32)
+    query_y, query_x = np.meshgrid(query_rows, query_cols, indexing="ij")
+
+    x_int, y_int, z_int, int_valid = interpolate_at_points(
+        x_stored,
+        y_stored,
+        z_stored,
+        valid_mask,
+        query_y,
+        query_x,
+        scale=(1.0, 1.0),
+        method="catmull_rom",
+        invalid_value=-1.0,
+    )
+    zyx_world = np.stack([z_int, y_int, x_int], axis=-1).astype(np.float32, copy=False)
+    valid_interp = np.asarray(int_valid, dtype=bool)
+    valid_interp &= np.isfinite(zyx_world).all(axis=-1)
+    valid_interp &= (
+        (zyx_world[..., 0] >= float(min_corner[0]))
+        & (zyx_world[..., 0] < float(max_corner[0]))
+        & (zyx_world[..., 1] >= float(min_corner[1]))
+        & (zyx_world[..., 1] < float(max_corner[1]))
+        & (zyx_world[..., 2] >= float(min_corner[2]))
+        & (zyx_world[..., 2] < float(max_corner[2]))
+    )
+    if not bool(np.any(valid_interp)):
+        return np.zeros(crop_size_tuple, dtype=np.float32)
+
+    local_grid = zyx_world - np.asarray(min_corner, dtype=np.float32).reshape(1, 1, 3)
+    return voxelize_surface_grid_masked(local_grid, crop_size_tuple, valid_interp).astype(
+        np.float32,
+        copy=False,
+    )
 
 
 def _build_normal_offset_mask_from_labeled_points(
