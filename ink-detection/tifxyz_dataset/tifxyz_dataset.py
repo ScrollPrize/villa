@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import Dataset
 
 from common import (
+    _build_normal_offset_mask_from_labeled_points,
     _build_projected_loss_mask_volume,
     _build_surface_label_volume,
     _build_surface_supervision_from_ink_mask,
@@ -51,6 +52,12 @@ class TifxyzInkDataset(Dataset):
         if self.surface_bbox_pad < 0.0:
             self.surface_bbox_pad = 0.0
         self.surface_interp_method = str(config.get("surface_interp_method", "catmull_rom")).strip().lower()
+        self.wrap_mode = str(config.get("wrap_mode", "single_wrap")).strip().lower()
+        if self.wrap_mode not in {"single_wrap", "multi_wrap"}:
+            warnings.warn(
+                f"Unknown wrap_mode={self.wrap_mode!r}; falling back to 'single_wrap'."
+            )
+            self.wrap_mode = "single_wrap"
         self.patch_size_zyx = _normalize_patch_size_zyx(self.patch_size)        
         self.overlap_fraction = float(config.get("overlap_fraction", 0.25))             # amount of overlap (stride) in train/val patches, as a percentage of the patch size
         self.min_positive_fraction = float(config.get("min_positive_fraction", 0.01))   # minimum amount of labeled voxels in a candidate bbox to be added to our patches list, as a percentage of the total voxels
@@ -71,9 +78,12 @@ class TifxyzInkDataset(Dataset):
         self._segment_ink_mask_cache = {}
         self._segment_surface_supervision_cache = {}
         self._segment_normal_cache = {}
+        self._segment_world_bounds_cache = {}
         self._segment_positive_points_cache = {}
         self._segment_positive_samples_cache = {}
         self._segment_background_samples_cache = {}
+        self._multi_wrap_segments_by_dataset_idx = {}
+        self._multi_wrap_candidate_segments_cache = {}
 
         if apply_augmentation:                                                          # we'll use the vesuvius augmentation pipeline , see vesuvius/src/vesuvius/models/augmentation/pipelines/training_transforms.py
             self.augmentations = create_training_transforms(                            # for current defaults 
@@ -97,6 +107,15 @@ class TifxyzInkDataset(Dataset):
         self._segment_ink_label_path_by_uuid = {}
         for patch in self.patches:
             segment_uuid = str(patch.get("segment_uuid", ""))
+            dataset_idx = int(patch.get("dataset_idx", -1))
+            segment = patch.get("segment")
+            if segment is not None:
+                dataset_segments = self._multi_wrap_segments_by_dataset_idx.setdefault(
+                    dataset_idx,
+                    {},
+                )
+                dataset_segments.setdefault(segment_uuid, segment)
+
             ink_label_path = patch.get("ink_label_path")
             if not ink_label_path:
                 warnings.warn(
@@ -104,6 +123,11 @@ class TifxyzInkDataset(Dataset):
                 )
                 continue
             self._segment_ink_label_path_by_uuid[segment_uuid] = str(ink_label_path)
+
+        self._multi_wrap_segments_by_dataset_idx = {
+            int(dataset_idx): tuple(segment_map.values())
+            for dataset_idx, segment_map in self._multi_wrap_segments_by_dataset_idx.items()
+        }
 
 
 
@@ -198,6 +222,125 @@ class TifxyzInkDataset(Dataset):
         self._segment_surface_supervision_cache[segment_uuid] = surface_supervision
         return surface_supervision
 
+    @staticmethod
+    def _segment_bounds_intersect_crop(segment_bounds, min_corner, max_corner):
+        if segment_bounds is None:
+            return False
+
+        min_corner = np.asarray(min_corner, dtype=np.float32).reshape(3)
+        max_corner = np.asarray(max_corner, dtype=np.float32).reshape(3)
+        z_min, z_max, y_min, y_max, x_min, x_max = [float(v) for v in segment_bounds]
+        return not (
+            (z_max < float(min_corner[0])) or (z_min >= float(max_corner[0])) or
+            (y_max < float(min_corner[1])) or (y_min >= float(max_corner[1])) or
+            (x_max < float(min_corner[2])) or (x_min >= float(max_corner[2]))
+        )
+
+    def _get_segment_world_bounds(self, segment):
+        segment_uuid = str(segment.uuid)
+        if segment_uuid in self._segment_world_bounds_cache:
+            return self._segment_world_bounds_cache[segment_uuid]
+
+        grid = self._get_segment_stored_grid(segment)
+        valid = np.asarray(grid["valid"], dtype=bool)
+        if not bool(np.any(valid)):
+            self._segment_world_bounds_cache[segment_uuid] = None
+            return None
+
+        z_vals = np.asarray(grid["z"], dtype=np.float32)[valid]
+        y_vals = np.asarray(grid["y"], dtype=np.float32)[valid]
+        x_vals = np.asarray(grid["x"], dtype=np.float32)[valid]
+        bounds = (
+            float(np.min(z_vals)),
+            float(np.max(z_vals)),
+            float(np.min(y_vals)),
+            float(np.max(y_vals)),
+            float(np.min(x_vals)),
+            float(np.max(x_vals)),
+        )
+        self._segment_world_bounds_cache[segment_uuid] = bounds
+        return bounds
+
+    @staticmethod
+    def _merge_projected_loss_mask(combined_mask, segment_mask):
+        segment_bg = np.asarray(segment_mask == 0.0, dtype=bool)
+        segment_pos = np.asarray(segment_mask == 1.0, dtype=bool)
+        combined_mask[segment_bg & (combined_mask != 1.0)] = 0.0
+        combined_mask[segment_pos] = 1.0
+
+    @staticmethod
+    def _suppress_projected_mask_overlap_with_foreign_labels(
+        projected_mask,
+        foreign_labeled_surface_mask,
+        own_labeled_surface_mask=None,
+    ):
+        foreign_mask = np.asarray(foreign_labeled_surface_mask > 0.0, dtype=bool)
+        if own_labeled_surface_mask is not None:
+            own_mask = np.asarray(own_labeled_surface_mask > 0.0, dtype=bool)
+            foreign_mask &= ~own_mask
+        if bool(np.any(foreign_mask)):
+            projected_mask[foreign_mask] = 2.0
+
+    def _get_multi_wrap_candidate_segments(self, idx, patch, min_corner, max_corner):
+        cached = self._multi_wrap_candidate_segments_cache.get(int(idx))
+        if cached is not None:
+            return cached
+
+        if self.wrap_mode != "multi_wrap":
+            out = tuple()
+            self._multi_wrap_candidate_segments_cache[int(idx)] = out
+            return out
+
+        dataset_idx = int(patch.get("dataset_idx", -1))
+        patch_segment_uuid = str(patch.get("segment_uuid", ""))
+        patch_segment = patch.get("segment")
+        if patch_segment and not patch_segment_uuid:
+            patch_segment_uuid = str(patch_segment.uuid)
+
+        candidate_segments = []
+        for segment in self._multi_wrap_segments_by_dataset_idx.get(dataset_idx, ()):
+            segment_uuid = str(segment.uuid)
+            if segment_uuid == patch_segment_uuid:
+                continue
+            segment_bounds = self._get_segment_world_bounds(segment)
+            if not self._segment_bounds_intersect_crop(segment_bounds, min_corner, max_corner):
+                continue
+            candidate_segments.append(segment)
+
+        out = tuple(candidate_segments)
+        self._multi_wrap_candidate_segments_cache[int(idx)] = out
+        return out
+
+    def _voxelize_full_surface_background_tolerance_from_sampled_grid(
+        self,
+        segment,
+        min_corner,
+        max_corner,
+        crop_size,
+        sampled_grid,
+    ):
+        in_patch_with_normals = sampled_grid["in_patch"] & sampled_grid["normals_valid"]
+        if bool(np.any(in_patch_with_normals)):
+            return _build_normal_offset_mask_from_labeled_points(
+                sampled_grid["world_grid"][in_patch_with_normals],
+                sampled_grid["normals_zyx"][in_patch_with_normals],
+                min_corner=min_corner,
+                crop_size=crop_size,
+                label_distance=(self.bg_distance_pos, self.bg_distance_neg),
+                sample_step=float(self.normal_sample_step),
+                trilinear_threshold=float(self.normal_trilinear_threshold),
+                use_numba=bool(self.use_numba_for_normal_mask),
+            )
+
+        return _voxelize_surface_from_sampled_grid(
+            self,
+            segment,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            crop_size=crop_size,
+            sampled_grid=sampled_grid,
+        )
+
     def __getitem__(self, idx):
         patch = self.patches[idx]
 
@@ -248,11 +391,6 @@ class TifxyzInkDataset(Dataset):
             crop_size=crop_size,
             sampled_grid=sampled_grid,
         )
-        labeled_vox_at_surface = _build_surface_label_volume(
-            positive_label_vox=positive_label_vox,
-            background_label_vox=background_label_vox,
-            crop_size=crop_size,
-        )
         projected_loss_mask = _build_projected_loss_mask_volume(
             self,
             segment,
@@ -260,6 +398,123 @@ class TifxyzInkDataset(Dataset):
             max_corner=max_corner,
             crop_size=crop_size,
             sampled_grid=sampled_grid,
+        )
+        
+        if self.wrap_mode == "multi_wrap":
+            extra_bbox_pad = max(float(self.bg_distance_max), float(self.label_distance_max)) + 1.0
+            labeled_surface_vox_union = np.asarray(
+                (positive_label_vox > 0.0) | (background_label_vox > 0.0),
+                dtype=bool,
+            )
+            other_segments = self._get_multi_wrap_candidate_segments(
+                idx=idx,
+                patch=patch,
+                min_corner=min_corner,
+                max_corner=max_corner,
+            )
+            for other_segment in other_segments:
+                other_sampled_grid = _sample_patch_supervision_grid(
+                    self,
+                    other_segment,
+                    min_corner=min_corner,
+                    max_corner=max_corner,
+                    extra_bbox_pad=extra_bbox_pad,
+                )
+                if other_sampled_grid["local_grid"].size == 0 or not bool(np.any(other_sampled_grid["in_patch"])):
+                    continue
+
+                other_surface_vox = _voxelize_surface_from_sampled_grid(
+                    self,
+                    other_segment,
+                    min_corner=min_corner,
+                    max_corner=max_corner,
+                    crop_size=crop_size,
+                    sampled_grid=other_sampled_grid,
+                )
+                if bool(np.any(other_surface_vox > 0.0)):
+                    surface_vox = np.maximum(surface_vox, other_surface_vox)
+
+                has_labels_in_crop = bool(
+                    np.any(other_sampled_grid["in_patch"] & (other_sampled_grid["class_codes"] == 1))
+                )
+                if has_labels_in_crop:
+                    other_positive_label_vox = _voxelize_positive_labels_from_sampled_grid(
+                        self,
+                        other_segment,
+                        min_corner=min_corner,
+                        max_corner=max_corner,
+                        crop_size=crop_size,
+                        sampled_grid=other_sampled_grid,
+                    )
+
+                    other_background_label_vox = _voxelize_background_surface_labels_from_sampled_grid(
+                        self,
+                        other_segment,
+                        min_corner=min_corner,
+                        max_corner=max_corner,
+                        crop_size=crop_size,
+                        sampled_grid=other_sampled_grid,
+                    )
+                    other_labeled_surface_vox = np.asarray(
+                        (other_positive_label_vox > 0.0) | (other_background_label_vox > 0.0),
+                        dtype=bool,
+                    )
+                    self._suppress_projected_mask_overlap_with_foreign_labels(
+                        projected_loss_mask,
+                        other_labeled_surface_vox,
+                        own_labeled_surface_mask=labeled_surface_vox_union,
+                    )
+
+                    if bool(np.any(other_background_label_vox > 0.0)):
+                        background_label_vox = np.maximum(
+                            background_label_vox,
+                            other_background_label_vox,
+                        )
+
+                    other_projected_loss_mask = _build_projected_loss_mask_volume(
+                        self,
+                        other_segment,
+                        min_corner=min_corner,
+                        max_corner=max_corner,
+                        crop_size=crop_size,
+                        sampled_grid=other_sampled_grid,
+                    )
+                    self._suppress_projected_mask_overlap_with_foreign_labels(
+                        other_projected_loss_mask,
+                        labeled_surface_vox_union,
+                        own_labeled_surface_mask=other_labeled_surface_vox,
+                    )
+                    self._merge_projected_loss_mask(
+                        projected_loss_mask,
+                        other_projected_loss_mask,
+                    )
+                    if bool(np.any(other_positive_label_vox > 0.0)):
+                        positive_label_vox = np.maximum(
+                            positive_label_vox,
+                            other_positive_label_vox,
+                        )
+                    labeled_surface_vox_union |= other_labeled_surface_vox
+                else:
+                    if bool(np.any(other_surface_vox > 0.0)):
+                        background_label_vox = np.maximum(
+                            background_label_vox,
+                            other_surface_vox,
+                        )
+
+                    other_bg_tolerance_vox = self._voxelize_full_surface_background_tolerance_from_sampled_grid(
+                        other_segment,
+                        min_corner=min_corner,
+                        max_corner=max_corner,
+                        crop_size=crop_size,
+                        sampled_grid=other_sampled_grid,
+                    )
+                    bg_mask = np.asarray(other_bg_tolerance_vox > 0.0, dtype=bool)
+                    projected_loss_mask[bg_mask & (projected_loss_mask != 1.0)] = 0.0
+
+        labeled_vox_at_surface = _build_surface_label_volume(
+            positive_label_vox=positive_label_vox,
+            background_label_vox=background_label_vox,
+            crop_size=crop_size,
         )
 
         if self.augmentations is not None:
