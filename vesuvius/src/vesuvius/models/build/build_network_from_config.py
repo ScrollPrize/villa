@@ -224,6 +224,19 @@ class NetworkFromConfig(nn.Module):
             print("model_config is empty; using default configuration")
             model_config = {}
 
+        self.op_dims = getattr(mgr, 'op_dims', None)
+        if self.op_dims is None:
+            if len(self.patch_size) == 2:
+                self.op_dims = 2
+                print(f"Using 2D operations based on patch_size {self.patch_size}")
+            elif len(self.patch_size) == 3:
+                self.op_dims = 3
+                print(f"Using 3D operations based on patch_size {self.patch_size}")
+            else:
+                raise ValueError(f"Patch size must have either 2 or 3 dimensions! Got {len(self.patch_size)}D: {self.patch_size}")
+        else:
+            print(f"Using dimensionality ({self.op_dims}D) from ConfigManager")
+
         self.task_z_projection_cfg = {}
         self.task_z_projection_heads = nn.ModuleDict()
 
@@ -256,19 +269,6 @@ class NetworkFromConfig(nn.Module):
         self.conv_bias = model_config.get("conv_bias", True)
         self.nonlin = model_config.get("nonlin", "nn.LeakyReLU")
         self.nonlin_kwargs = model_config.get("nonlin_kwargs", {"inplace": True})
-
-        self.op_dims = getattr(mgr, 'op_dims', None)
-        if self.op_dims is None:
-            if len(self.patch_size) == 2:
-                self.op_dims = 2
-                print(f"Using 2D operations based on patch_size {self.patch_size}")
-            elif len(self.patch_size) == 3:
-                self.op_dims = 3
-                print(f"Using 3D operations based on patch_size {self.patch_size}")
-            else:
-                raise ValueError(f"Patch size must have either 2 or 3 dimensions! Got {len(self.patch_size)}D: {self.patch_size}")
-        else:
-            print(f"Using dimensionality ({self.op_dims}D) from ConfigManager")
 
         # Convert string operation types to actual PyTorch classes
         if isinstance(self.conv_op, str):
