@@ -1,5 +1,6 @@
 import os
 import numpy as np
+import warnings
 
 from torch.utils.data import Dataset
 
@@ -95,10 +96,11 @@ class TifxyzInkDataset(Dataset):
         self._segment_ink_label_path_by_uuid = {}
         for patch in self.patches:
             segment_uuid = str(patch.get("segment_uuid", ""))
-            if not segment_uuid:
-                continue
             ink_label_path = patch.get("ink_label_path")
             if not ink_label_path:
+                warnings.warn(
+                    f"Unable to load ink labels for segment: {segment_uuid}"
+                )
                 continue
             self._segment_ink_label_path_by_uuid[segment_uuid] = str(ink_label_path)
 
@@ -155,6 +157,7 @@ class TifxyzInkDataset(Dataset):
         max_corner = np.array([z1 + 1, y1 + 1, x1 + 1], dtype=np.int32)
         crop_size = tuple(int(v) for v in self.patch_size_zyx)
 
+        # zscore normalization is applied within this function , DO NOT MINMAX NORMALIZE AFTER WITHOUT CONSIDERING THIS
         vol_crop = _read_volume_crop_from_patch_dict(
             patch,
             crop_size=crop_size,
