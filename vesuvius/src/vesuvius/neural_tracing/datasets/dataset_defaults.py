@@ -20,6 +20,7 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("sample_mode", "wrap")
     config.setdefault("val_num_workers", 0)
     config.setdefault("persistent_workers", False)
+    config.setdefault("volume_auth_json", None)
 
     # Other-wrap conditioning defaults.
     config.setdefault("use_other_wrap_cond", False)
@@ -80,6 +81,13 @@ def _require_choice(name: str, value: str, allowed: set[str]) -> None:
     if value not in allowed:
         options = "', '".join(sorted(allowed))
         raise ValueError(f"{name} must be '{options}', got {value!r}")
+
+
+def _require_optional_non_empty_str(name: str, value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string when provided, got {value!r}")
 
 
 def _require_finite(name: str, value: float) -> None:
@@ -148,6 +156,21 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
         raise ValueError(
             f"triplet_lookup_num_workers must satisfy value >= 0, got {triplet_lookup_num_workers!r}"
         )
+
+    _require_optional_non_empty_str(
+        "volume_auth_json",
+        config.get("volume_auth_json", None),
+    )
+
+    datasets = config.get("datasets", [])
+    if isinstance(datasets, list):
+        for dataset_idx, dataset in enumerate(datasets):
+            if not isinstance(dataset, dict):
+                continue
+            _require_optional_non_empty_str(
+                f"datasets[{dataset_idx}].volume_auth_json",
+                dataset.get("volume_auth_json", None),
+            )
 
     use_dense_displacement = bool(config.get("use_dense_displacement", False))
     use_triplet_wrap_displacement = bool(config.get("use_triplet_wrap_displacement", False))

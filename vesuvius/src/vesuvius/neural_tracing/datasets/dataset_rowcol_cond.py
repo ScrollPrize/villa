@@ -1,9 +1,7 @@
-import zarr
 import vesuvius.tifxyz as tifxyz
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-import json
 import tifffile
 import os
 from pathlib import Path
@@ -28,6 +26,7 @@ from vesuvius.neural_tracing.datasets.common import (
     create_band_mask,
     compute_heatmap_targets,
     edt_dilate_binary_mask,
+    open_zarr,
     voxelize_surface_grid,
 )
 from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
@@ -67,7 +66,6 @@ _EDT_BACKEND_CACHE = {
     "kwargs": None,
     "stream": None,
 }
-
 
 def _resolve_edt_backend():
     """Resolve EDT backend per-process: prefer cupyx, fallback to scipy."""
@@ -270,7 +268,13 @@ class EdtSegDataset(Dataset):
             for dataset_idx, dataset in enumerate(config['datasets']):
                 volume_path = dataset['volume_path']
                 volume_scale = dataset['volume_scale']
-                volume = zarr.open_group(volume_path, mode='r')
+                volume_auth_json = dataset.get('volume_auth_json', config.get('volume_auth_json'))
+                volume = open_zarr(
+                    volume_path,
+                    scale=volume_scale,
+                    auth_json_path=volume_auth_json,
+                    config=config,
+                )
                 segments_path = dataset['segments_path']
                 z_range = _parse_z_range(dataset.get('z_range', None))
                 dataset_segments = list(tifxyz.load_folder(segments_path))
