@@ -7,22 +7,15 @@ from torch.utils.data.sampler import WeightedRandomSampler
 from samplers import GroupStratifiedBatchSampler
 
 from train_resnet3d_lib.config import CFG, log
-from train_resnet3d_lib.data.build_state import (
-    append_val_entry,
-    build_data_state,
-    init_dataset_tracking,
-)
 from train_resnet3d_lib.data.datasets_runtime import (
     CustomDataset,
     LazyZarrTrainDataset,
 )
+from train_resnet3d_lib.data.image_readers import build_group_mappings
+from train_resnet3d_lib.data.segment_metadata import get_segment_meta as _segment_meta
 from train_resnet3d_lib.data.transforms_runtime import get_transforms
 from train_resnet3d_lib.data.normalization_stats import (
     prepare_fold_label_foreground_percentile_clip_zscore_stats,
-)
-from train_resnet3d_lib.data.segment_groups import (
-    build_group_metadata,
-    segment_group_context,
 )
 from train_resnet3d_lib.data.segment_trainval import (
     load_train_segment,
@@ -34,6 +27,106 @@ from train_resnet3d_lib.data.segment_stitching import (
     build_train_stitch_outputs,
     build_log_only_outputs,
 )
+
+
+def init_dataset_tracking(*, include_train_xyxys):
+    return {
+        "include_train_xyxys": bool(include_train_xyxys),
+        "val_loaders": [],
+        "val_stitch_shapes": [],
+        "val_stitch_segment_ids": [],
+        "val_mask_borders": {},
+        "val_mask_bboxes": {},
+        "stitch_val_dataloader_idx": None,
+        "stitch_pred_shape": None,
+        "stitch_segment_id": None,
+    }
+
+
+def append_val_entry(
+    tracking,
+    *,
+    fragment_id,
+    val_loader,
+    mask_shape,
+    mask_border=None,
+    mask_bbox=None,
+    valid_id=None,
+):
+    tracking["val_loaders"].append(val_loader)
+    tracking["val_stitch_shapes"].append(mask_shape)
+    tracking["val_stitch_segment_ids"].append(fragment_id)
+
+    if mask_border is not None:
+        tracking["val_mask_borders"][str(fragment_id)] = mask_border
+    if mask_bbox is not None:
+        tracking["val_mask_bboxes"][str(fragment_id)] = mask_bbox
+
+    if fragment_id == valid_id:
+        tracking["stitch_val_dataloader_idx"] = len(tracking["val_loaders"]) - 1
+        tracking["stitch_pred_shape"] = mask_shape
+        tracking["stitch_segment_id"] = fragment_id
+
+
+def build_data_state(
+    *,
+    train_loader,
+    group_names,
+    group_idx_by_segment,
+    train_group_counts,
+    steps_per_epoch,
+    train_stitch_loaders,
+    train_stitch_shapes,
+    train_stitch_segment_ids,
+    train_mask_borders,
+    train_mask_bboxes,
+    log_only_loaders,
+    log_only_shapes,
+    log_only_segment_ids,
+    log_only_bboxes,
+    tracking,
+):
+    return {
+        "train_loader": train_loader,
+        "val_loaders": tracking["val_loaders"],
+        "group_names": group_names,
+        "group_idx_by_segment": group_idx_by_segment,
+        "train_group_counts": train_group_counts,
+        "steps_per_epoch": steps_per_epoch,
+        "train_stitch_loaders": train_stitch_loaders,
+        "train_stitch_shapes": train_stitch_shapes,
+        "train_stitch_segment_ids": train_stitch_segment_ids,
+        "train_mask_borders": train_mask_borders,
+        "train_mask_bboxes": train_mask_bboxes,
+        "val_mask_borders": tracking["val_mask_borders"],
+        "val_mask_bboxes": tracking["val_mask_bboxes"],
+        "log_only_stitch_loaders": log_only_loaders,
+        "log_only_stitch_shapes": log_only_shapes,
+        "log_only_stitch_segment_ids": log_only_segment_ids,
+        "log_only_mask_bboxes": log_only_bboxes,
+        "include_train_xyxys": tracking["include_train_xyxys"],
+        "stitch_val_dataloader_idx": tracking["stitch_val_dataloader_idx"],
+        "stitch_pred_shape": tracking["stitch_pred_shape"],
+        "stitch_segment_id": tracking["stitch_segment_id"],
+        "val_stitch_shapes": tracking["val_stitch_shapes"],
+        "val_stitch_segment_ids": tracking["val_stitch_segment_ids"],
+    }
+
+
+def _build_group_metadata(fragment_ids, segments_metadata, group_key):
+    group_names, _group_name_to_idx, fragment_to_group_idx = build_group_mappings(
+        fragment_ids,
+        segments_metadata,
+        group_key=group_key,
+    )
+    return group_names, fragment_to_group_idx
+
+
+def _segment_group_context(fragment_id, segments_metadata, fragment_to_group_idx, group_names):
+    seg_meta = _segment_meta(segments_metadata, fragment_id)
+    group_idx = int(fragment_to_group_idx[fragment_id])
+    group_name = group_names[group_idx] if group_idx < len(group_names) else str(group_idx)
+    return seg_meta, group_idx, group_name
 
 
 def summarize_patch_counts(split_name, fragment_ids_list, counts_by_segment, *, group_names, fragment_to_group_idx):
@@ -225,7 +318,7 @@ def log_training_budget(train_loader):
 
 
 def _load_with_group_context(fragment_id, *, segments_metadata, fragment_to_group_idx, group_names, loader_fn, **kwargs):
-    seg_meta, group_idx, group_name = segment_group_context(
+    seg_meta, group_idx, group_name = _segment_group_context(
         fragment_id,
         segments_metadata,
         fragment_to_group_idx,
@@ -255,7 +348,7 @@ def _build_group_metadata_for_active_splits(
     log_only_segments,
     group_key,
 ):
-    group_names, fragment_to_group_idx = build_group_metadata(
+    group_names, fragment_to_group_idx = _build_group_metadata(
         train_fragment_ids,
         segments_metadata,
         group_key,
