@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include <curl/curl.h>
+
 namespace vc::cache {
 
 // Optional auth config for HTTP requests (e.g. AWS SigV4 signing).
@@ -51,9 +53,7 @@ S3ListResult s3ListObjects(const std::string& httpsBaseUrl, const HttpAuth& auth
 // Uses atomic write (temp file + rename).
 bool httpDownloadFile(const std::string& url, const std::filesystem::path& dest, const HttpAuth& auth = {});
 
-// ---- Shared curl auth helper (VC_USE_CURL only) -----------------------------
-#ifdef VC_USE_CURL
-#include <curl/curl.h>
+// ---- Shared curl auth helper ------------------------------------------------
 
 // RAII guard that applies AWS SigV4 auth to a CURL handle.
 // The guard owns the header slist and userpwd string, which must outlive
@@ -99,6 +99,5 @@ struct CurlAuthGuard {
     }
     return guard;
 }
-#endif  // VC_USE_CURL
 
 }  // namespace vc::cache

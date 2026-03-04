@@ -55,7 +55,8 @@ target_link_libraries(vc_core
 target_compile_definitions(vc_core PUBLIC VC_USE_CURL)
 
 # VcDataset dependencies
-target_link_libraries(vc_core PRIVATE blosc_static utils)
+target_link_libraries(vc_core PRIVATE blosc_static)
+target_link_libraries(vc_core PUBLIC utils)
 
 # c-blosc internal headers (zstd, lz4, zlib) for VcDataset decompression
 target_include_directories(vc_core PRIVATE

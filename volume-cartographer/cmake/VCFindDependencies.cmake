@@ -193,6 +193,11 @@ if(NOT c-blosc_POPULATED)
     FetchContent_Populate(c-blosc)
     add_subdirectory(${c-blosc_SOURCE_DIR} ${c-blosc_BINARY_DIR} EXCLUDE_FROM_ALL)
     vc_suppress_warnings("${c-blosc_SOURCE_DIR}")
+    # GCC 15+ defaults to C23 where `bool` is a keyword, breaking blosc's
+    # `typedef _Bool bool`.  Pin blosc_static to C17 to avoid this.
+    if(TARGET blosc_static)
+        set_target_properties(blosc_static PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED ON)
+    endif()
 endif()
 
 # ---- CURL (for HTTP chunk source / remote volumes) ---------------------------
