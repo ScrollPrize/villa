@@ -129,6 +129,7 @@ public slots:
     void onABFFlatten(const std::string& segmentId);
     void onAWSUpload(const std::string& segmentId);
     void onExportWidthChunks(const std::string& segmentId);
+    void onRasterizeSegments(const QStringList& segmentIds);
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);
@@ -148,6 +149,9 @@ public:
                                const QString& resumeSurface,
                                const QString& resumeOpt,
                                int ompThreads);
+    bool appendRasterizationMetadata(const QString& outputZarrPath,
+                                   const QStringList& segmentIds,
+                                   const QStringList& segmentPaths) const;
 
 private:
     /** Helper: get current volume path from state */

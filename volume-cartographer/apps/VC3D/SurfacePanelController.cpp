@@ -874,6 +874,15 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit exportTifxyzChunksRequested(segmentId);
     });
 
+    QAction* rasterizeAction = contextMenu.addAction(tr("Rasterize"));
+    connect(rasterizeAction, &QAction::triggered, this, [this, selectedSegmentIds, segmentId]() {
+        QStringList rasterizeTargets = selectedSegmentIds;
+        if (rasterizeTargets.isEmpty()) {
+            rasterizeTargets << segmentId;
+        }
+        emit rasterizeSegmentsRequested(rasterizeTargets);
+    });
+
     contextMenu.addSeparator();
 
     QAction* inpaintTeleaAction = contextMenu.addAction(tr("Inpaint (Telea) && Rebuild Segment"));

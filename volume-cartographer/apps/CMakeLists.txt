@@ -28,6 +28,9 @@ target_link_libraries(vc_grow_seg_from_segments vc_core vc_tracer)
 add_executable(vc_tifxyz2obj src/vc_tifxyz2obj.cpp)
 target_link_libraries(vc_tifxyz2obj vc_core)
 
+add_executable(vc_tifxyz2zarr_sparse src/vc_tifxyz2zarr_sparse.cpp)
+target_link_libraries(vc_tifxyz2zarr_sparse vc_core Boost::program_options)
+
 add_executable(vc_obj2tifxyz src/vc_obj2tifxyz.cpp)
 target_link_libraries(vc_obj2tifxyz vc_core)
 
@@ -164,6 +167,7 @@ if(VC_USE_PCH)
         vc_flatten
         vc_tifxyz_inp_mask
         vc_tifxyz_winding
+        vc_tifxyz2zarr_sparse
         vc_fill_quadmesh
         vc_tiffxyz_upscale_grounding
         vc_calc_surface_metrics
