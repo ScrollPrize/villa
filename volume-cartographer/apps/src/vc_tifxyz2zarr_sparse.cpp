@@ -467,6 +467,41 @@ static bool hasTifxyzInDir(const fs::path& path) {
         && fs::is_regular_file(path / "z.tif");
 }
 
+static double parseVoxelSizeFromReference(const fs::path& ref) {
+    std::vector<fs::path> candidates = {
+        ref / "meta.json",
+        ref / "0" / "meta.json"
+    };
+    if (ref.has_parent_path()) {
+        candidates.emplace_back(ref.parent_path() / "meta.json");
+    }
+
+    for (const auto& metaPath : candidates) {
+        if (!std::filesystem::is_regular_file(metaPath)) {
+            continue;
+        }
+
+        try {
+            std::ifstream in(metaPath);
+            if (!in) {
+                continue;
+            }
+            const auto meta = nlohmann::json::parse(in);
+            const auto it = meta.find("voxelsize");
+            if (it != meta.end() && it->is_number()) {
+                const double vox = it->get<double>();
+                if (std::isfinite(vox) && vox > 0.0) {
+                    return vox;
+                }
+            }
+        } catch (...) {
+            // intentionally ignored; fallback below
+        }
+    }
+
+    return 0.0;
+}
+
 static std::vector<fs::path> discoverTifxyzMeshes(const fs::path& inputRoot) {
     std::vector<fs::path> meshes;
     std::unordered_set<std::string> seen;
@@ -512,6 +547,14 @@ static Shape3 parseShapeFromReference(const fs::path& ref) {
         throw std::runtime_error("reference zarr must have 3 dimensions (Z,Y,X)");
     }
     return {s[0], s[1], s[2]};
+}
+
+static nlohmann::json toJsonArray(const std::vector<std::string>& values) {
+    nlohmann::json result = nlohmann::json::array();
+    for (const auto& value : values) {
+        result.push_back(value);
+    }
+    return result;
 }
 
 static bool chunkHasAnyNonZero(const std::vector<uint8_t>& data) {
@@ -995,6 +1038,55 @@ static void writeSparseAttrs(const fs::path& outDir,
     vc::writeZarrAttributes(outDir, attrs);
 }
 
+static void writeVolumeMetadata(const fs::path& outDir,
+                               const Shape3& level0Shape,
+                               const std::optional<fs::path>& sourceRef,
+                               int sourceGroup,
+                               double voxelSize,
+                               const std::vector<std::string>& sourceSegments,
+                               const std::vector<std::string>& sourceMeshes) {
+    const std::string uuid = outDir.filename().string();
+    nlohmann::json meta;
+    meta["type"] = "vol";
+    meta["uuid"] = uuid;
+    meta["name"] = uuid;
+    meta["width"] = static_cast<long long>(level0Shape[2]);
+    meta["height"] = static_cast<long long>(level0Shape[1]);
+    meta["slices"] = static_cast<long long>(level0Shape[0]);
+    meta["voxelsize"] = voxelSize;
+    meta["min"] = 0.0;
+    meta["max"] = 255.0;
+    meta["format"] = "zarr";
+
+    if (sourceRef) {
+        meta["source_zarr"] = sourceRef->string();
+    }
+    if (sourceGroup >= 0) {
+        meta["source_group"] = sourceGroup;
+    }
+    if (!sourceSegments.empty()) {
+        meta["source_segments"] = toJsonArray(sourceSegments);
+    }
+    if (!sourceMeshes.empty()) {
+        meta["source_meshes"] = toJsonArray(sourceMeshes);
+    }
+    if (!sourceSegments.empty() || !sourceMeshes.empty()) {
+        meta["source_mesh_count"] = static_cast<long long>(
+            !sourceSegments.empty() ? sourceSegments.size() : sourceMeshes.size());
+    }
+    meta["rasterizer"] = "vc_tifxyz2zarr_sparse";
+
+    const fs::path metaPath = outDir / "meta.json";
+    std::ofstream metaOut(metaPath);
+    if (!metaOut) {
+        throw std::runtime_error("failed creating meta.json: " + metaPath.string());
+    }
+    metaOut << meta.dump(2) << "\n";
+    if (!metaOut) {
+        throw std::runtime_error("failed writing meta.json: " + metaPath.string());
+    }
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -1014,6 +1106,8 @@ int main(int argc, char* argv[])
                   << "  --shape-x N               full output X\n"
                   << "  --reference-zarr PATH      infer shape from existing zarr (uses /0 if present)\n"
                   << "  --chunk-size N             isotropic chunk edge (default 128)\n"
+                  << "  --source-segment SEGMENT    optional segment ID provenance (repeatable)\n"
+                  << "  --source-mesh PATH         optional mesh path provenance (repeatable)\n"
                   << "  --spool-memory-mb N       in-memory spool budget in MiB (default 4096, 0 = immediate disk append)\n"
                   << "  --threads N                raster + materialize threads (default hw)\n"
                   << "  --spool-dir PATH           spool directory (default <output>/.spool)\n"
@@ -1037,6 +1131,10 @@ int main(int argc, char* argv[])
             ("shape-x", po::value<size_t>(), "Output X size")
             ("reference-zarr", po::value<std::string>(), "Reference OME-Zarr for shape inference")
             ("chunk-size", po::value<size_t>()->default_value(128), "Isotropic chunk size")
+            ("source-segment", po::value<std::vector<std::string>>()->multitoken(),
+             "Segment ID used for provenance (repeatable)")
+            ("source-mesh", po::value<std::vector<std::string>>()->multitoken(),
+             "Mesh path used for provenance (repeatable)")
             ("spool-memory-mb", po::value<size_t>()->default_value(4096),
              "In-memory spool budget in MiB; 0 disables RAM buffering")
             ("threads,t", po::value<int>()->default_value(0), "Worker threads (raster/materialize/pyramid)")
@@ -1082,6 +1180,12 @@ int main(int argc, char* argv[])
         const bool verbose = vm["verbose"].as<bool>();
         const int sourceGroup = vm["source-group"].as<int>();
         const size_t spoolMemMB = vm["spool-memory-mb"].as<size_t>();
+        const auto sourceSegments = vm.count("source-segment")
+                                       ? vm["source-segment"].as<std::vector<std::string>>()
+                                       : std::vector<std::string>{};
+        const auto sourceMeshes = vm.count("source-mesh")
+                                     ? vm["source-mesh"].as<std::vector<std::string>>()
+                                     : std::vector<std::string>{};
 
         const size_t chunkSize = vm["chunk-size"].as<size_t>();
         if (chunkSize == 0) throw std::runtime_error("--chunk-size must be > 0");
@@ -1089,6 +1193,7 @@ int main(int argc, char* argv[])
             throw std::runtime_error("spool-memory-mb too large");
         }
         const size_t inMemoryBudgetBytes = spoolMemMB * 1024ull * 1024ull;
+        double voxelSize = 0.0;
 
         const bool hasShape = vm.count("shape-z") || vm.count("shape-y") || vm.count("shape-x");
         if (hasShape && !(vm.count("shape-z") && vm.count("shape-y") && vm.count("shape-x"))) {
@@ -1108,6 +1213,7 @@ int main(int argc, char* argv[])
             const fs::path ref = vm["reference-zarr"].as<std::string>();
             sourceRef = fs::weakly_canonical(ref);
             shape = parseShapeFromReference(*sourceRef);
+            voxelSize = parseVoxelSizeFromReference(*sourceRef);
         } else {
             throw std::runtime_error("provide either --shape-z/y/x or --reference-zarr");
         }
@@ -1230,6 +1336,8 @@ int main(int argc, char* argv[])
         writeSparseAttrs(outRoot, levelShape[0], levelChunks[0],
                         sourceRef ? &(*sourceRef) : nullptr,
                         sourceGroup, kPyramidLevels);
+        writeVolumeMetadata(outRoot, levelShape[0], sourceRef, sourceGroup,
+                           voxelSize, sourceSegments, sourceMeshes);
 
         if (!keepSpool) {
             if (fs::exists(spoolDir)) {

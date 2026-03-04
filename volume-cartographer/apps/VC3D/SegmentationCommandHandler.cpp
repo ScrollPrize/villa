@@ -2464,6 +2464,12 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
          << QStringLiteral("--reference-zarr")
          << referenceZarr
          << QStringLiteral("--overwrite");
+    for (const QString& segmentId : validIds) {
+        args << QStringLiteral("--source-segment") << segmentId;
+    }
+    for (const QString& segmentPath : segmentPaths) {
+        args << QStringLiteral("--source-mesh") << segmentPath;
+    }
 
     auto runner = _cmdRunner;
     if (!runner) {
@@ -2716,7 +2722,23 @@ bool SegmentationCommandHandler::appendRasterizationMetadata(const QString& outp
         return false;
     }
 
+    const QString metaJsonPath = outDir.filePath(QStringLiteral("meta.json"));
     const QString zattrsPath = outDir.filePath(QStringLiteral(".zattrs"));
+
+    QJsonObject metaJson = readJsonObject(metaJsonPath);
+    if (metaJson.isEmpty()) {
+        metaJson["type"] = QStringLiteral("vol");
+        metaJson["uuid"] = outDir.dirName();
+        metaJson["name"] = outDir.dirName();
+        metaJson["width"] = 0;
+        metaJson["height"] = 0;
+        metaJson["slices"] = 0;
+        metaJson["voxelsize"] = 0.0;
+        metaJson["min"] = 0.0;
+        metaJson["max"] = 255.0;
+        metaJson["format"] = QStringLiteral("zarr");
+    }
+
     QJsonObject zattrs = readJsonObject(zattrsPath);
     QJsonArray idArray;
     QJsonArray pathArray;
@@ -2738,17 +2760,21 @@ bool SegmentationCommandHandler::appendRasterizationMetadata(const QString& outp
         return false;
     }
 
-    QJsonObject metaFile;
-    metaFile.insert(QStringLiteral("label_volume"), QStringLiteral("rasterized"));
-    metaFile.insert(QStringLiteral("source_segments"), idArray);
-    metaFile.insert(QStringLiteral("source_meshes"), pathArray);
-    metaFile.insert(QStringLiteral("source_mesh_count"), static_cast<int>(segmentIds.size()));
-    metaFile.insert(QStringLiteral("rasterized_at"),
-                    QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
-    metaFile.insert(QStringLiteral("rasterizer"), QStringLiteral("vc_tifxyz2zarr_sparse"));
+    const QJsonValue rasterizedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    metaJson.insert(QStringLiteral("label_volume"), QStringLiteral("rasterized"));
+    metaJson.insert(QStringLiteral("source_segments"), idArray);
+    metaJson.insert(QStringLiteral("source_meshes"), pathArray);
+    metaJson.insert(QStringLiteral("source_mesh_count"), static_cast<int>(segmentIds.size()));
+    metaJson.insert(QStringLiteral("rasterized_at"), rasterizedAt);
+    metaJson.insert(QStringLiteral("rasterizer"), QStringLiteral("vc_tifxyz2zarr_sparse"));
+
+    if (!writeJsonObject(metaJsonPath, metaJson)) {
+        return false;
+    }
 
     const QString metafilePath = outDir.filePath(QStringLiteral("metafile"));
-    if (!writeJsonObject(metafilePath, metaFile)) {
+    const QJsonObject legacyMeta = metaJson;
+    if (!writeJsonObject(metafilePath, legacyMeta)) {
         return false;
     }
 
