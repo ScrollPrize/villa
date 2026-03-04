@@ -512,14 +512,22 @@ int Volume::sampleBestEffort(cv::Mat_<uint8_t>& out,
     const int nScales = static_cast<int>(numScales());
     const int level = params.level;
 
+    // Compute world-space bounding box once, reuse for all level checks.
+    // This avoids re-scanning border/interior pixels per level.
+    auto wb = coordsWorldBBox(coords);
+
     for (int lvl = level; lvl < nScales; lvl++) {
-        if (allChunksCached(coords, lvl)) {
+        if (allChunksCachedFast(wb, lvl)) {
             auto scaled = scaleCoords(coords, lvl);
             readInterpolated3D(out, tieredCache(), lvl, scaled, params.method);
             if (lvl > level) {
+                // Prefetch desired level and one intermediate for progressive refinement
                 prefetchChunks(coords, level);
                 if (lvl - level > 1)
                     prefetchChunks(coords, level + 1);
+            } else if (lvl > 0) {
+                // At desired level — prefetch next finer for smooth zoom-in
+                prefetchChunks(coords, lvl - 1);
             }
             if (!out.empty())
                 applyOptionalPostProcess(out, params);
@@ -533,8 +541,11 @@ int Volume::sampleBestEffort(cv::Mat_<uint8_t>& out,
     int last = std::max(0, nScales - 1);
     auto scaled = scaleCoords(coords, last);
     readInterpolated3D(out, tieredCache(), last, scaled, params.method);
-    if (last > level)
+    if (last > level) {
         prefetchChunks(coords, level);
+        if (last - level > 1)
+            prefetchChunks(coords, level + 1);
+    }
     if (!out.empty())
         applyOptionalPostProcess(out, params);
     return last;
@@ -864,41 +875,28 @@ const Volume::DataBounds& Volume::dataBounds() const
 // Chunk query / prefetch
 // ============================================================================
 
-Volume::ChunkBBox Volume::coordsToChunkBBox(
-    const cv::Mat_<cv::Vec3f>& coords, int level) const
+Volume::WorldBBox Volume::coordsWorldBBox(const cv::Mat_<cv::Vec3f>& coords) const
 {
-    vc::VcDataset* ds = zarrDataset(level);
-    if (!ds || coords.empty()) {
-        return {0, -1, 0, -1, 0, -1};  // invalid bbox
-    }
+    WorldBBox wb;
+    wb.loX = std::numeric_limits<float>::max();
+    wb.loY = std::numeric_limits<float>::max();
+    wb.loZ = std::numeric_limits<float>::max();
+    wb.hiX = std::numeric_limits<float>::lowest();
+    wb.hiY = std::numeric_limits<float>::lowest();
+    wb.hiZ = std::numeric_limits<float>::lowest();
 
-    float scale = (level > 0) ? (1.0f / static_cast<float>(1 << level)) : 1.0f;
-    auto cs = ds->defaultChunkShape();  // {cz, cy, cx}
+    if (coords.empty()) return wb;
 
-    float loX = std::numeric_limits<float>::max();
-    float loY = std::numeric_limits<float>::max();
-    float loZ = std::numeric_limits<float>::max();
-    float hiX = std::numeric_limits<float>::lowest();
-    float hiY = std::numeric_limits<float>::lowest();
-    float hiZ = std::numeric_limits<float>::lowest();
-
-    // Sample border pixels + a sparse grid instead of iterating every pixel.
-    // Coords come from surface gen on a regular grid, so the bounding box
-    // is determined by border pixels.  Interior pixels on curved surfaces
-    // are covered by the interpolation margin below.
     const int h = coords.rows;
     const int w = coords.cols;
 
     auto updateBounds = [&](const cv::Vec3f& v) {
-        float sx = v[0] * scale;
-        float sy = v[1] * scale;
-        float sz = v[2] * scale;
-        loX = std::min(loX, sx); hiX = std::max(hiX, sx);
-        loY = std::min(loY, sy); hiY = std::max(hiY, sy);
-        loZ = std::min(loZ, sz); hiZ = std::max(hiZ, sz);
+        wb.loX = std::min(wb.loX, v[0]); wb.hiX = std::max(wb.hiX, v[0]);
+        wb.loY = std::min(wb.loY, v[1]); wb.hiY = std::max(wb.hiY, v[1]);
+        wb.loZ = std::min(wb.loZ, v[2]); wb.hiZ = std::max(wb.hiZ, v[2]);
     };
 
-    // All 4 borders (using raw pointers)
+    // All 4 borders
     const auto* topRow = coords.ptr<cv::Vec3f>(0);
     const auto* botRow = coords.ptr<cv::Vec3f>(h - 1);
     for (int x = 0; x < w; ++x) {
@@ -919,11 +917,26 @@ Volume::ChunkBBox Volume::coordsToChunkBBox(
         }
     }
 
-    // Add margin for interpolation + any interior curvature we may have missed
-    loX -= 2.0f; loY -= 2.0f; loZ -= 2.0f;
-    hiX += 2.0f; hiY += 2.0f; hiZ += 2.0f;
+    return wb;
+}
 
-    const auto& shape = ds->shape();  // {z, y, x}
+Volume::ChunkBBox Volume::worldBBoxToChunkBBox(const WorldBBox& wb, int level) const
+{
+    vc::VcDataset* ds = zarrDataset(level);
+    if (!ds) return {0, -1, 0, -1, 0, -1};
+
+    float scale = (level > 0) ? (1.0f / static_cast<float>(1 << level)) : 1.0f;
+    auto cs = ds->defaultChunkShape();
+    const auto& shape = ds->shape();
+
+    // Apply scale + interpolation margin
+    float loX = wb.loX * scale - 2.0f;
+    float loY = wb.loY * scale - 2.0f;
+    float loZ = wb.loZ * scale - 2.0f;
+    float hiX = wb.hiX * scale + 2.0f;
+    float hiY = wb.hiY * scale + 2.0f;
+    float hiZ = wb.hiZ * scale + 2.0f;
+
     ChunkBBox bb;
     bb.minIx = std::max(0, static_cast<int>(std::floor(loX / cs[2])));
     bb.maxIx = std::min(static_cast<int>(std::ceil(hiX / cs[2])),
@@ -937,16 +950,33 @@ Volume::ChunkBBox Volume::coordsToChunkBBox(
     return bb;
 }
 
+Volume::ChunkBBox Volume::coordsToChunkBBox(
+    const cv::Mat_<cv::Vec3f>& coords, int level) const
+{
+    return worldBBoxToChunkBBox(coordsWorldBBox(coords), level);
+}
+
 bool Volume::allChunksCached(const cv::Mat_<cv::Vec3f>& coords, int level) const
 {
     ensureTieredCache();
     if (!tieredCache_) return false;
 
     auto bb = coordsToChunkBBox(coords, level);
-    if (bb.minIx > bb.maxIx || bb.minIy > bb.maxIy || bb.minIz > bb.maxIz) return false;  // invalid bbox
+    if (bb.minIx > bb.maxIx || bb.minIy > bb.maxIy || bb.minIz > bb.maxIz) return false;
 
-    // Batch check acquires hot + negative locks once each, instead of
-    // per-chunk lock pairs in a loop.
+    return tieredCache_->areAllCachedInRegion(
+        level, bb.minIz, bb.minIy, bb.minIx,
+        bb.maxIz, bb.maxIy, bb.maxIx);
+}
+
+bool Volume::allChunksCachedFast(const WorldBBox& wb, int level) const
+{
+    ensureTieredCache();
+    if (!tieredCache_) return false;
+
+    auto bb = worldBBoxToChunkBBox(wb, level);
+    if (bb.minIx > bb.maxIx || bb.minIy > bb.maxIy || bb.minIz > bb.maxIz) return false;
+
     return tieredCache_->areAllCachedInRegion(
         level, bb.minIz, bb.minIy, bb.minIx,
         bb.maxIz, bb.maxIy, bb.maxIx);

@@ -79,7 +79,7 @@ struct CacheParams {
 // ChunkSampler — thread-local fast voxel access via raw pointer + strides
 // ============================================================================
 
-template<typename T, int kSlots = 8>
+template<typename T, int kSlots = 16>
 struct ChunkSampler {
     struct Slot {
         int iz = -1, iy = -1, ix = -1;

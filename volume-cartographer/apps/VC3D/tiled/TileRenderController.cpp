@@ -24,8 +24,10 @@ TileRenderController::TileRenderController(TileScene* tileScene, RenderPool* sha
     connect(_tickTimer, &QTimer::timeout, this, &TileRenderController::tick);
     // Not started here — ensureTickRunning() starts it when work arrives.
 
-    // Also drain immediately when a tile completes (makes draining more responsive)
-    connect(_renderPool, &RenderPool::tileReady, this, &TileRenderController::drainResults,
+    // When a tile completes, wake the tick timer so it drains on the next cycle.
+    // Don't call drainResults directly — the tick consolidates all drain + refinement
+    // work, avoiding redundant lock acquisitions and double-draining.
+    connect(_renderPool, &RenderPool::tileReady, this, &TileRenderController::ensureTickRunning,
             Qt::QueuedConnection);
 }
 
@@ -66,8 +68,21 @@ void TileRenderController::onCameraChanged(
     _lastBuildParams = buildParams;
     _lastViewportRect = viewportRect;
 
-    // Get visible tiles (+ buffer for smooth scrolling)
+    // Get visible tiles (+ buffer for smooth scrolling), sorted center-first
+    // so the user sees the most important tiles render before edges.
     auto visibleKeys = _tileScene->visibleTiles(viewportRect, tiled_config::VISIBLE_BUFFER_TILES);
+    {
+        float vcx = static_cast<float>(viewportRect.center().x()) / TileScene::TILE_PX;
+        float vcy = static_cast<float>(viewportRect.center().y()) / TileScene::TILE_PX;
+        std::sort(visibleKeys.begin(), visibleKeys.end(),
+            [vcx, vcy](const WorldTileKey& a, const WorldTileKey& b) {
+                float da = (a.worldCol - vcx) * (a.worldCol - vcx)
+                         + (a.worldRow - vcy) * (a.worldRow - vcy);
+                float db = (b.worldCol - vcx) * (b.worldCol - vcx)
+                         + (b.worldRow - vcy) * (b.worldRow - vcy);
+                return da < db;
+            });
+    }
 
     for (const auto& wk : visibleKeys) {
         SliceCacheKey cacheKey = SliceCacheKey::make(wk, camera, _paramsHash);
@@ -243,9 +258,8 @@ void TileRenderController::tick()
                 const uint64_t epoch = _currentEpoch->load(std::memory_order_relaxed);
                 for (int i = 0; i < maxRefine; i++) {
                     TileRenderParams params = _lastBuildParams(stale[i]);
-                    // Use current controller epoch, not camera epoch — buildRenderParams
-                    // copies _camera.epoch which is stale after markChunkArrived() bumped
-                    // the controller epoch.
+                    // Use current controller epoch so the render isn't filtered
+                    // as stale by pre/post-render checks in RenderPool.
                     params.epoch = epoch;
                     _renderPool->submit(params, _lastSurface, _lastVolume, _currentEpoch, _controllerId);
                 }
@@ -292,10 +306,17 @@ void TileRenderController::markOverlaysDirty()
 void TileRenderController::markChunkArrived()
 {
     _chunkArrived = true;
-    // Bump epoch so tiles rendered at the correct level with partial data are
-    // considered stale — staleTilesInRect will include them (m.epoch < epoch),
-    // and setTile will accept the re-render (new epoch > old epoch).
-    _currentEpoch->fetch_add(1, std::memory_order_relaxed);
+    // Do NOT bump _currentEpoch here.  Bumping the epoch invalidates ALL
+    // in-flight renders (pre/post-render staleness checks in RenderPool and
+    // the minEpoch filter in drainCompleted discard results whose epoch <
+    // _currentEpoch).  Since chunks arrive continuously during progressive
+    // loading, this caused a cascade where every chunk arrival killed all
+    // queued renders, leaving tiles gray.
+    //
+    // Progressive refinement works without an epoch bump because
+    // staleTilesInRect already detects tiles whose render level is coarser
+    // than the desired level (m.level > desiredLevel), and setTile accepts
+    // finer-level results at the same epoch (level < m.level passes).
     ensureTickRunning();
 }
 

@@ -179,8 +179,16 @@ protected:
     struct ChunkBBox {
         int minIx, maxIx, minIy, maxIy, minIz, maxIz;
     };
+    // World-space bounding box (level-0 coordinates, no scaling applied)
+    struct WorldBBox {
+        float loX, loY, loZ, hiX, hiY, hiZ;
+    };
     ChunkBBox coordsToChunkBBox(const cv::Mat_<cv::Vec3f>& coords, int level) const;
+    // Compute world-space bbox once, then derive chunk bbox for any level cheaply
+    WorldBBox coordsWorldBBox(const cv::Mat_<cv::Vec3f>& coords) const;
+    ChunkBBox worldBBoxToChunkBBox(const WorldBBox& wb, int level) const;
     bool allChunksCached(const cv::Mat_<cv::Vec3f>& coords, int level) const;
+    bool allChunksCachedFast(const WorldBBox& wb, int level) const;
     void prefetchChunks(const cv::Mat_<cv::Vec3f>& coords, int level);
 
     void sampleComposite(cv::Mat_<uint8_t>& out,
