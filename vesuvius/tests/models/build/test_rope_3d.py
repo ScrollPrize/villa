@@ -82,3 +82,53 @@ def test_rope_3d_passed_to_blocks_with_dtype():
     assert block.last_rope is not None
     assert block.last_rope.dtype == x.dtype
     assert block.last_rope.shape == (seq_len, eva.head_dim * 2)
+
+
+def test_rope_patch_drop_exposes_head_axis_for_kept_positions():
+    torch.manual_seed(0)
+    eva = Eva(
+        embed_dim=96,
+        depth=1,
+        num_heads=4,
+        ref_feat_shape=(2, 3, 4),
+        use_abs_pos_emb=False,
+        use_rot_pos_emb=True,
+        pos_emb_type="rope",
+        patch_drop_rate=0.5,
+        block_fn=CaptureBlock,
+    )
+    eva.train()
+    seq_len = 2 * 3 * 4
+    x = torch.zeros(2, seq_len, eva.embed_dim, dtype=torch.float32)
+
+    eva.forward_features(x)
+
+    block = eva.blocks[0]
+    assert block.last_rope is not None
+    assert block.last_rope.ndim == 4
+    assert block.last_rope.shape[0] == x.shape[0]
+    assert block.last_rope.shape[1] == 1
+    assert block.last_rope.shape[-1] == eva.head_dim * 2
+
+
+def test_rope_patch_drop_forward_no_shape_error():
+    torch.manual_seed(0)
+    eva = Eva(
+        embed_dim=192,
+        depth=1,
+        num_heads=4,
+        ref_feat_shape=(2, 2, 2),
+        use_abs_pos_emb=False,
+        use_rot_pos_emb=True,
+        pos_emb_type="rope",
+        patch_drop_rate=0.5,
+    )
+    eva.train()
+    x = torch.randn(2, 8, 192)
+
+    y, keep_indices = eva(x)
+
+    assert y.shape[0] == x.shape[0]
+    assert y.shape[-1] == x.shape[-1]
+    assert keep_indices is not None
+    assert keep_indices.shape[0] == x.shape[0]

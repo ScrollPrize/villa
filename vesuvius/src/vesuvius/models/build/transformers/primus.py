@@ -78,6 +78,7 @@ class Primus(AbstractDynamicNetworkArchitectures):
             f"deeper patch embedding downsamples by 8x. Use patch_embed_size={tuple([8] * len(input_shape))}."
         )
         self.ndim = len(input_shape)
+        self._input_shape = tuple(input_shape)
 
         super().__init__()
         self.key_to_encoder = "eva"
@@ -162,6 +163,21 @@ class Primus(AbstractDynamicNetworkArchitectures):
         return (restored, restored_mask)
 
     def forward(self, x, ret_mask=False):
+        expected_ndim = self.ndim + 2
+        if x.ndim != expected_ndim:
+            raise ValueError(
+                f"Primus expected input with {expected_ndim} dims "
+                f"(B, C, {', '.join(['spatial'] * self.ndim)}), got shape {tuple(x.shape)}."
+            )
+
+        spatial = tuple(x.shape[2:])
+        if spatial != tuple(self._input_shape):
+            raise ValueError(
+                "Primus received a runtime spatial shape that does not match the configured input_shape. "
+                f"Expected {tuple(self._input_shape)}, got {spatial}. "
+                "Primus uses fixed positional embeddings and requires a consistent patch size."
+            )
+
         full_spatial = x.shape[2:]  # Full spatial dimensions (H, W) or (D, H, W)
         x = self.down_projection(x)
 

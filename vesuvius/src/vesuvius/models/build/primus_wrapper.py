@@ -165,6 +165,21 @@ class PrimusEncoder(nn.Module):
 
         Supports both 2D (B, C, H, W) and 3D (B, C, D, H, W) inputs.
         """
+        expected_ndim = self.ndim + 2
+        if x.ndim != expected_ndim:
+            raise ValueError(
+                f"PrimusEncoder expected input with {expected_ndim} dims "
+                f"(B, C, {', '.join(['spatial'] * self.ndim)}), got shape {tuple(x.shape)}."
+            )
+
+        spatial = tuple(x.shape[2:])
+        if spatial != tuple(self.input_shape):
+            raise ValueError(
+                "PrimusEncoder received a runtime spatial shape that does not match the configured input_shape. "
+                f"Expected {tuple(self.input_shape)}, got {spatial}. "
+                "Primus uses fixed positional embeddings and requires a consistent patch size."
+            )
+
         # Store original shape for mask expansion
         full_spatial = x.shape[2:]  # Full resolution spatial dims
 
