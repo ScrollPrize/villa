@@ -361,25 +361,7 @@ class Model3D(nn.Module):
 			return conn_pt, u, v, row, col
 
 		# --- Compute connections for prev (d-1) and next (d+1) ---
-		# For prev: neighbor is d-1; for next: neighbor is d+1.
-		# At boundaries, use the valid direction mirrored.
-
-		xy_conn = torch.zeros(D, Hm, Wm, 3, 3, device=device, dtype=xyz_lr.dtype)
-		mask_conn = torch.zeros(D, 1, Hm, Wm, 3, device=device, dtype=xyz_lr.dtype)
-
-		# Center point is always the vertex itself
-		xy_conn[:, :, :, :, 1] = xyz_lr
-		# Center mask: sample validity
-		if data.valid is not None:
-			center_valid = data.grid_sample_fullres(xyz_lr).valid
-			if center_valid is not None:
-				mask_conn[:, :, :, :, 1] = (center_valid.squeeze(0).squeeze(0) > 0.5).to(dtype=xyz_lr.dtype).unsqueeze(1)
-			else:
-				mask_conn[:, :, :, :, 1] = 1.0
-		else:
-			mask_conn[:, :, :, :, 1] = 1.0
-
-		# Store intersection params for update_conn_offsets
+		# Built via cat/stack for clean autograd (no in-place version tracking).
 		self._conn_params: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 		if D >= 2:
@@ -387,45 +369,48 @@ class Model3D(nn.Module):
 			prev_conn, prev_u, prev_v, prev_row, prev_col = _intersect_direction(
 				xyz_lr[1:], normals[1:], xyz_lr[:-1], prev_h_off[1:], prev_w_off[1:]
 			)
-			# prev_conn shape: (D-1, Hm, Wm, 3) for slices [1:]
-			xy_conn[1:, :, :, :, 0] = prev_conn
 			self._conn_params["prev"] = (prev_u, prev_v, prev_row, prev_col)
 
 			# Next connections (d -> d+1): source is slices [:-1], neighbor is [1:]
 			next_conn, next_u, next_v, next_row, next_col = _intersect_direction(
 				xyz_lr[:-1], normals[:-1], xyz_lr[1:], next_h_off[:-1], next_w_off[:-1]
 			)
-			xy_conn[:-1, :, :, :, 2] = next_conn
 			self._conn_params["next"] = (next_u, next_v, next_row, next_col)
 
 			# Boundary fallback: mirror the valid direction (detached)
-			# d=0 has no prev → mirror next
-			xy_conn[0, :, :, :, 0] = (2.0 * xyz_lr[0] - xy_conn[0, :, :, :, 2]).detach()
-			# d=D-1 has no next → mirror prev
-			xy_conn[-1, :, :, :, 2] = (2.0 * xyz_lr[-1] - xy_conn[-1, :, :, :, 0]).detach()
+			boundary_prev = (2.0 * xyz_lr[0] - next_conn[0]).detach()
+			boundary_next = (2.0 * xyz_lr[-1] - prev_conn[-1]).detach()
 
-			# Connection masks: sample validity at prev/next points
+			prev_full = torch.cat([boundary_prev.unsqueeze(0), prev_conn], dim=0)   # (D, Hm, Wm, 3)
+			next_full = torch.cat([next_conn, boundary_next.unsqueeze(0)], dim=0)   # (D, Hm, Wm, 3)
+
+			xy_conn = torch.stack([prev_full, xyz_lr, next_full], dim=-1)  # (D, Hm, Wm, 3, 3)
+
+			# Connection masks: sample validity
 			if data.valid is not None:
-				prev_valid_s = data.grid_sample_fullres(xy_conn[:, :, :, :, 0]).valid
-				next_valid_s = data.grid_sample_fullres(xy_conn[:, :, :, :, 2]).valid
-				if prev_valid_s is not None:
-					mask_conn[:, :, :, :, 0] = (prev_valid_s.squeeze(0).squeeze(0) > 0.5).to(dtype=xyz_lr.dtype).unsqueeze(1)
-				else:
-					mask_conn[:, :, :, :, 0] = 1.0
-				if next_valid_s is not None:
-					mask_conn[:, :, :, :, 2] = (next_valid_s.squeeze(0).squeeze(0) > 0.5).to(dtype=xyz_lr.dtype).unsqueeze(1)
-				else:
-					mask_conn[:, :, :, :, 2] = 1.0
+				def _valid_mask(v: torch.Tensor | None) -> torch.Tensor:
+					if v is not None:
+						return (v.squeeze(0).squeeze(0) > 0.5).to(dtype=xyz_lr.dtype).unsqueeze(1)
+					return torch.ones(D, 1, Hm, Wm, device=device, dtype=xyz_lr.dtype)
+
+				mask_prev = _valid_mask(data.grid_sample_fullres(prev_full).valid)
+				mask_center = _valid_mask(data.grid_sample_fullres(xyz_lr).valid)
+				mask_next = _valid_mask(data.grid_sample_fullres(next_full).valid)
 			else:
-				mask_conn[:, :, :, :, 0] = 1.0
-				mask_conn[:, :, :, :, 2] = 1.0
+				mask_prev = torch.ones(D, 1, Hm, Wm, device=device, dtype=xyz_lr.dtype)
+				mask_center = torch.ones(D, 1, Hm, Wm, device=device, dtype=xyz_lr.dtype)
+				mask_next = torch.ones(D, 1, Hm, Wm, device=device, dtype=xyz_lr.dtype)
 
 			# Zero mask at boundary D edges
-			mask_conn[0, :, :, :, 0] = 0.0   # no prev at d=0
-			mask_conn[-1, :, :, :, 2] = 0.0  # no next at d=D-1
+			mask_prev[0] = 0.0   # no prev at d=0
+			mask_next[-1] = 0.0  # no next at d=D-1
+
+			mask_conn = torch.stack([mask_prev, mask_center, mask_next], dim=-1)  # (D, 1, Hm, Wm, 3)
 		else:
-			# D=1: no connections possible, masks stay zero
-			pass
+			# D=1: no connections possible
+			zeros = torch.zeros_like(xyz_lr)
+			xy_conn = torch.stack([zeros, xyz_lr, zeros], dim=-1)
+			mask_conn = torch.zeros(D, 1, Hm, Wm, 3, device=device, dtype=xyz_lr.dtype)
 
 		return xy_conn, mask_conn
 
