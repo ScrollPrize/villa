@@ -112,7 +112,7 @@ class TifxyzInkDataset(Dataset):
         vol_crop,
         surface_label_vox,
         surface_vox,
-        mil_loss_mask_vox,
+        projected_loss_mask,
     ):
         image = torch.as_tensor(
             np.asarray(vol_crop, dtype=np.float32),
@@ -123,7 +123,7 @@ class TifxyzInkDataset(Dataset):
                 (
                     np.asarray(surface_label_vox, dtype=np.float32),
                     np.asarray(surface_vox, dtype=np.float32),
-                    np.asarray(mil_loss_mask_vox, dtype=np.float32),
+                    np.asarray(projected_loss_mask, dtype=np.float32),
                 ),
                 axis=0,
             ),
@@ -253,7 +253,7 @@ class TifxyzInkDataset(Dataset):
             background_label_vox=background_label_vox,
             crop_size=crop_size,
         )
-        mil_loss_mask_vox = _build_projected_loss_mask_volume(
+        projected_loss_mask = _build_projected_loss_mask_volume(
             self,
             segment,
             min_corner=min_corner,
@@ -267,24 +267,24 @@ class TifxyzInkDataset(Dataset):
                 vol_crop,
                 surface_label_vox,
                 surface_vox,
-                mil_loss_mask_vox,
+                projected_loss_mask,
             ) = self._apply_sample_augmentation(
                 vol_crop=vol_crop,
                 surface_label_vox=surface_label_vox,
                 surface_vox=surface_vox,
-                mil_loss_mask_vox=mil_loss_mask_vox,
+                projected_loss_mask=projected_loss_mask,
             )
 
         vol_crop = self._to_float32_tensor(vol_crop)
         surface_label_vox = self._to_float32_tensor(surface_label_vox)
         surface_vox = self._to_float32_tensor(surface_vox)
-        mil_loss_mask_vox = self._to_float32_tensor(mil_loss_mask_vox)
+        projected_loss_mask = self._to_float32_tensor(projected_loss_mask)
 
         return {
             "vol": vol_crop,
             "surface_label_vox": surface_label_vox,
             "surface_vox": surface_vox,
-            "mil_loss_mask_vox": mil_loss_mask_vox,
+            "projected_loss_mask": projected_loss_mask,
             "patch": patch,
             "idx": int(idx),
         }
@@ -328,7 +328,7 @@ if __name__ == "__main__":
             "vol",
             "surface_label_vox",
             "surface_vox",
-            "mil_loss_mask_vox",
+            "projected_loss_mask",
         )
         stacked_outputs = {k: [] for k in output_keys}
         sample_positive_counts = []
@@ -363,7 +363,7 @@ if __name__ == "__main__":
 
         vol_4d = np.stack(stacked_outputs["vol"], axis=0)
         surface_label_raw = np.stack(stacked_outputs["surface_label_vox"], axis=0).astype(np.int16, copy=False)
-        mil_label_raw = np.stack(stacked_outputs["mil_loss_mask_vox"], axis=0).astype(np.int16, copy=False)
+        projected_loss_mask_raw = np.stack(stacked_outputs["projected_loss_mask"], axis=0).astype(np.int16, copy=False)
         positive_4d = (surface_label_raw == 1).astype(np.uint8)
         background_4d = (surface_label_raw == 0).astype(np.uint8)
         surface_4d = (np.stack(stacked_outputs["surface_vox"], axis=0) > 0.0).astype(np.uint8)
@@ -373,9 +373,9 @@ if __name__ == "__main__":
         surface_label_vis[surface_label_raw == 1] = 1
         surface_label_vis[surface_label_raw == 0] = 2
 
-        mil_label_vis = np.zeros_like(mil_label_raw, dtype=np.uint8)
-        mil_label_vis[mil_label_raw == 1] = 1
-        mil_label_vis[mil_label_raw == 0] = 2
+        projected_loss_mask_vis = np.zeros_like(projected_loss_mask_raw, dtype=np.uint8)
+        projected_loss_mask_vis[projected_loss_mask_raw == 1] = 1
+        projected_loss_mask_vis[projected_loss_mask_raw == 0] = 2
 
         viewer = napari.Viewer(ndisplay=3)
         viewer.add_image(vol_4d, name="vol", rendering="mip", interpolation3d="nearest")
@@ -404,8 +404,8 @@ if __name__ == "__main__":
             blending="additive",
         )
         viewer.add_labels(
-            mil_label_vis,
-            name="mil_loss_mask_vox",
+            projected_loss_mask_vis,
+            name="projected_loss_mask",
             opacity=0.5,
             blending="additive",
         )
