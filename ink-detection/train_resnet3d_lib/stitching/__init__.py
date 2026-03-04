@@ -2,8 +2,8 @@
 
 - `roi_layout`: ROI resolution + buffer allocation
 - `epoch_passes`: train/log-only stitch passes
-- `manager_setup`: StitchManager initialization + segment registration
-- `manager_runtime`: StitchManager runtime helpers (sync/context/epoch flow)
+- `manager_setup`: compatibility re-export of setup helpers from `train_resnet3d_lib.stitch_manager`
+- `manager_runtime`: compatibility re-export of runtime helpers from `train_resnet3d_lib.stitch_manager`
 - `wandb_media`: stitched image logging
 - `metrics_runtime`: stitched metric computation/logging
 - `metrics_runtime_config`: stitched metrics schedule + option parsing
