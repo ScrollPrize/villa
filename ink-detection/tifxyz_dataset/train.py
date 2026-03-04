@@ -14,6 +14,16 @@ from vesuvius.neural_tracing.nets.models import make_model
 
 from tifxyz_dataset import TifxyzInkDataset
 
+################################
+# THIS IS A STUB -- DO NOT USE #
+################################
+################################
+# THIS IS A STUB -- DO NOT USE #
+################################
+################################
+# THIS IS A STUB -- DO NOT USE #
+################################
+
 class TifxyzInkTrainer():
     def __init__(config_path):
         
@@ -61,4 +71,5 @@ class TifxyzInkTrainer():
         num_val     = max(1, num_patches * config.get('val_fraction', 0.1))
         num_train   = num_patches - num_val
 
-        
+        raise NotImplementedError("Do not use this trainer, it is not done, it does nothing.")
+
