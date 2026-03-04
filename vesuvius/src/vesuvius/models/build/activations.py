@@ -26,7 +26,7 @@ class SwiGLUBlock(nn.Module):
     """
     Linear(d → 2×hidden) → SwiGLU → Linear(hidden → d)
     """
-    def __init__(self, channels, conv_op, bias=True, expansion_factor=1.5):
+    def __init__(self, channels, conv_op, bias=True, expansion_factor=16/3):
         super().__init__()
         hidden_channels = int(channels * expansion_factor)
         # Ensure hidden_channels is even for the split in SwiGLU
