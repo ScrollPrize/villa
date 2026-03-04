@@ -27,7 +27,7 @@ dependencies = [
     "requests>=2.32.5",
     "pyyaml>=6.0.2",
     "fsspec>=2025.9.0",
-    "numcodecs>=0.12.1",
+    "numcodecs>=0.12.1,<0.16", # <0.16 because zarr 2.x is not compatible with numcodecs 0.16+
     "zarr>=2,<3",
     "s3fs>=2025.9.0",
     "cachetools>=6.2.4",
@@ -42,7 +42,7 @@ volume-only = [
     "requests>=2.32.5",
     "pyyaml>=6.0.2",
     "fsspec>=2025.9.0",
-    "numcodecs>=0.12.1",
+    "numcodecs>=0.12.1,<0.16", # <0.16 because zarr 2.x is not compatible with numcodecs 0.16+
     "zarr>=2,<3",
     "s3fs>=2025.9.0",
 ]
