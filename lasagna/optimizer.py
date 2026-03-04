@@ -130,6 +130,7 @@ lambda_global: dict[str, float] = {
 	"step": 0.0,
 	"smooth": 0.0,
 	"winding_density": 0.0,
+	"normal": 0.0,
 }
 
 
@@ -237,6 +238,7 @@ def optimize(
 		"step": {"loss": opt_loss_step.step_loss},
 		"smooth": {"loss": opt_loss_smooth.smooth_loss},
 		"winding_density": {"loss": opt_loss_winding_density.winding_density_loss},
+		"normal": {"loss": opt_loss_dir.normal_loss},
 	}
 
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:
