@@ -530,13 +530,16 @@ class ZarrDataset(Dataset):
         """Attempt to load patch cache using current validation params."""
         from vesuvius.models.preprocessing.patches import try_load_patch_cache
 
-        # Get valid_patch_value from target config
+        # Get valid_patch_value from target config, with dataset-level fallback
         valid_patch_value = None
         for target_name in self.target_names:
             info = self.targets.get(target_name, {})
             if 'valid_patch_value' in info:
                 valid_patch_value = info['valid_patch_value']
                 break
+        if valid_patch_value is None:
+            dataset_cfg = getattr(self.mgr, "dataset_config", {}) or {}
+            valid_patch_value = dataset_cfg.get("valid_patch_value")
 
         volume_ids = [vol.volume_id for vol in self._volumes]
 
