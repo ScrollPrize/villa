@@ -3,13 +3,13 @@
 		"dir": 0.0,
 		"normal": 10.0,
 		"step": 10.0,
-		"smooth": 0.001,
-		"winding_density": 1.0
+		"smooth": 0.0,
+		"winding_density": 2.0
 	},
 	"stages": [
 		{
 			"name": "reopt",
-			"steps": 2000,
+			"steps": 5000,
 			"min_scaledown": 0,
 			"lr": [0.1, 0.01, 0.001],
 			"params": ["mesh_ms"]
