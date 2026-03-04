@@ -1,28 +1,21 @@
+import os.path as osp
 from dataclasses import asdict, is_dataclass
 from types import SimpleNamespace
 
 import pytorch_lightning as pl
+import segmentation_models_pytorch as smp
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+from metrics import StreamingBinarySegmentationMetrics
+from models.resnetall import generate_model
+from train_resnet3d_lib.config import CFG, log
+from train_resnet3d_lib.modeling.architecture import Decoder, replace_batchnorm_with_groupnorm
+from train_resnet3d_lib.modeling.group_dro import GroupDROComputer
 from train_resnet3d_lib.modeling.losses import build_bce_targets, compute_per_sample_loss_and_dice
 from train_resnet3d_lib.modeling.optimizers_runtime import configure_optimizers as configure_optimizers_runtime
-from train_resnet3d_lib.modeling.runtime_init import (
-    initialize_regression_state,
-    save_regression_hyperparameters,
-)
-from train_resnet3d_lib.modeling.train_val_runtime import (
-    accumulate_train_stats,
-    accumulate_validation_stats,
-    compute_objective_loss,
-    finalize_training_batch,
-    initialize_validation_metrics,
-    log_train_epoch_metrics,
-    log_validation_epoch_metrics,
-    reset_train_epoch_accumulators,
-    reset_validation_epoch_accumulators,
-    sync_validation_accumulators,
-    update_validation_stream_metrics,
-)
+from train_resnet3d_lib.stitch_manager import StitchManager
 
 
 def _cfg_to_dict(value, *, key):
@@ -173,6 +166,587 @@ def _coerce_regression_model_state(
         "objective_cfg": _coerce_objective_cfg(objective_cfg),
         "stitch_cfg": _coerce_stitch_cfg(stitch_cfg),
     }
+
+
+def save_regression_hyperparameters(model, *, model_cfg, objective_cfg, stitch_cfg):
+    model.save_hyperparameters(
+        {
+            "model_cfg": {
+                "size": int(model_cfg.size),
+                "enc": str(model_cfg.enc),
+                "with_norm": bool(model_cfg.with_norm),
+                "total_steps": int(model_cfg.total_steps),
+                "n_groups": int(model_cfg.n_groups),
+                "group_names": list(model_cfg.group_names),
+                "norm": str(model_cfg.norm),
+                "group_norm_groups": int(model_cfg.group_norm_groups),
+            },
+            "objective_cfg": {
+                "objective": str(objective_cfg.objective),
+                "loss_mode": str(objective_cfg.loss_mode),
+                "loss_recipe": str(objective_cfg.loss_recipe),
+                "bce_smooth_factor": float(objective_cfg.bce_smooth_factor),
+                "soft_label_positive": float(objective_cfg.soft_label_positive),
+                "soft_label_negative": float(objective_cfg.soft_label_negative),
+                "robust_step_size": objective_cfg.robust_step_size,
+                "group_counts": list(objective_cfg.group_counts),
+                "group_dro_gamma": float(objective_cfg.group_dro_gamma),
+                "group_dro_btl": bool(objective_cfg.group_dro_btl),
+                "group_dro_alpha": objective_cfg.group_dro_alpha,
+                "group_dro_normalize_loss": bool(objective_cfg.group_dro_normalize_loss),
+                "group_dro_min_var_weight": float(objective_cfg.group_dro_min_var_weight),
+                "erm_group_topk": int(objective_cfg.erm_group_topk),
+            },
+            "stitch_cfg": {
+                "stitch_all_val": bool(stitch_cfg.stitch_all_val),
+                "stitch_downsample": int(stitch_cfg.stitch_downsample),
+                "stitch_log_only_downsample": int(stitch_cfg.stitch_log_only_downsample),
+                "stitch_log_only_every_n_epochs": int(stitch_cfg.stitch_log_only_every_n_epochs),
+                "stitch_train": bool(stitch_cfg.stitch_train),
+                "stitch_train_every_n_epochs": int(stitch_cfg.stitch_train_every_n_epochs),
+            },
+        }
+    )
+
+
+def _normalize_stitch_group_idx_by_segment(stitch_group_idx_by_segment, *, n_groups):
+    if stitch_group_idx_by_segment is None:
+        return {}
+    if not isinstance(stitch_group_idx_by_segment, dict):
+        raise TypeError(
+            "stitch_group_idx_by_segment must be a dict mapping segment id to group index, "
+            f"got {type(stitch_group_idx_by_segment).__name__}"
+        )
+    normalized_group_map = {}
+    for segment_id, group_idx in stitch_group_idx_by_segment.items():
+        segment_key = str(segment_id)
+        group_idx_i = int(group_idx)
+        if group_idx_i < 0 or group_idx_i >= int(n_groups):
+            raise ValueError(
+                f"stitch_group_idx_by_segment[{segment_key!r}]={group_idx_i} out of range [0, {int(n_groups)})"
+            )
+        normalized_group_map[segment_key] = group_idx_i
+    return normalized_group_map
+
+
+def _init_group_dro_if_needed(model, *, objective_cfg):
+    model.group_dro = None
+    if model.objective != "group_dro":
+        return
+    robust_step_size = objective_cfg.robust_step_size
+    if robust_step_size is None:
+        raise ValueError("group_dro.robust_step_size is required when training.objective is group_dro")
+    group_counts = objective_cfg.group_counts
+    if group_counts is None:
+        raise ValueError("group_counts is required when training.objective is group_dro")
+
+    model.group_dro = GroupDROComputer(
+        n_groups=model.n_groups,
+        group_counts=group_counts,
+        alpha=objective_cfg.group_dro_alpha,
+        gamma=objective_cfg.group_dro_gamma,
+        adj=objective_cfg.group_dro_adj,
+        min_var_weight=objective_cfg.group_dro_min_var_weight,
+        step_size=robust_step_size,
+        normalize_loss=objective_cfg.group_dro_normalize_loss,
+        btl=objective_cfg.group_dro_btl,
+    )
+
+
+def _build_backbone_with_optional_pretrained(*, model_cfg):
+    resnet3d_model_depth = getattr(CFG, "resnet3d_model_depth", None)
+    if resnet3d_model_depth is None:
+        raise KeyError("CFG.resnet3d_model_depth is required")
+    resnet3d_model_depth = int(resnet3d_model_depth)
+    if resnet3d_model_depth not in {50, 101, 152}:
+        raise ValueError(
+            "CFG.resnet3d_model_depth must be one of [50, 101, 152], "
+            f"got {resnet3d_model_depth}"
+        )
+
+    backbone = generate_model(
+        model_depth=resnet3d_model_depth,
+        n_input_channels=1,
+        forward_features=True,
+        n_classes=1039,
+    )
+
+    norm = str(model_cfg.norm).lower()
+    group_norm_groups = int(model_cfg.group_norm_groups)
+    init_ckpt_path = getattr(CFG, "init_ckpt_path", None)
+    use_pretrained = bool(getattr(CFG, "pretrained", True))
+    if use_pretrained and (not init_ckpt_path):
+        backbone_pretrained_path = getattr(CFG, "backbone_pretrained_path", None)
+        if not isinstance(backbone_pretrained_path, str):
+            raise TypeError(
+                "CFG.backbone_pretrained_path must be a string when init_ckpt_path is not provided, "
+                f"got {type(backbone_pretrained_path).__name__}"
+            )
+        backbone_pretrained_path = backbone_pretrained_path.strip()
+        if not backbone_pretrained_path:
+            raise ValueError(
+                "CFG.backbone_pretrained_path must be non-empty when init_ckpt_path is not provided"
+            )
+        if not osp.exists(backbone_pretrained_path):
+            raise FileNotFoundError(
+                f"Missing backbone pretrained weights: {backbone_pretrained_path}. "
+                "Set training_hyperparameters.model.backbone_pretrained_path to a valid file, "
+                "or pass --init_ckpt_path to fine-tune from a previous run."
+            )
+        backbone_ckpt = torch.load(backbone_pretrained_path, map_location="cpu")
+        state_dict = backbone_ckpt.get("state_dict", backbone_ckpt)
+        conv1_weight = state_dict["conv1.weight"]
+        state_dict["conv1.weight"] = conv1_weight.sum(dim=1, keepdim=True)
+        backbone.load_state_dict(state_dict, strict=False)
+    elif not use_pretrained:
+        log("CFG.pretrained=False; skipping backbone pretrained weight loading.")
+
+    if norm == "group":
+        replace_batchnorm_with_groupnorm(backbone, desired_groups=group_norm_groups)
+    return backbone
+
+
+def _infer_encoder_dims(backbone):
+    was_training = backbone.training
+    try:
+        backbone.eval()
+        with torch.no_grad():
+            encoder_dims = [x.size(1) for x in backbone(torch.rand(1, 1, 20, 256, 256))]
+    finally:
+        if was_training:
+            backbone.train()
+    return encoder_dims
+
+
+def _build_stitch_manager(stitch_cfg):
+    return StitchManager(**_cfg_to_dict(stitch_cfg, key="stitch_cfg"))
+
+
+def initialize_regression_state(model, *, model_cfg, objective_cfg, stitch_cfg):
+    model.objective = objective_cfg.objective.lower()
+    model.loss_mode = objective_cfg.loss_mode.lower()
+    model.loss_recipe = objective_cfg.loss_recipe.lower()
+    model.bce_smooth_factor = objective_cfg.bce_smooth_factor
+    model.soft_label_positive = objective_cfg.soft_label_positive
+    model.soft_label_negative = objective_cfg.soft_label_negative
+    model.with_norm = model_cfg.with_norm
+    model.total_steps = model_cfg.total_steps
+
+    if model.loss_recipe not in {"dice_bce", "bce_only"}:
+        raise ValueError(f"training.loss_recipe must be one of ['bce_only', 'dice_bce'], got {model.loss_recipe!r}")
+    if not (0.0 <= model.bce_smooth_factor <= 0.5):
+        raise ValueError(
+            "training_hyperparameters.training.bce_smooth_factor must be in [0.0, 0.5], "
+            f"got {model.bce_smooth_factor}"
+        )
+    if not (0.0 <= model.soft_label_positive <= 1.0):
+        raise ValueError(
+            "training_hyperparameters.training.soft_label_positive must be in [0.0, 1.0], "
+            f"got {model.soft_label_positive}"
+        )
+    if not (0.0 <= model.soft_label_negative <= 1.0):
+        raise ValueError(
+            "training_hyperparameters.training.soft_label_negative must be in [0.0, 1.0], "
+            f"got {model.soft_label_negative}"
+        )
+    if model.soft_label_positive <= model.soft_label_negative:
+        raise ValueError(
+            "training_hyperparameters.training.soft_label_positive must be greater than soft_label_negative, "
+            f"got {model.soft_label_positive} <= {model.soft_label_negative}"
+        )
+
+    model.n_groups = int(model_cfg.n_groups)
+    model.group_names = list(model_cfg.group_names)
+    if len(model.group_names) == 0:
+        model.group_names = [str(i) for i in range(model.n_groups)]
+    if len(model.group_names) != model.n_groups:
+        raise ValueError(f"group_names length must be {model.n_groups}, got {len(model.group_names)}")
+    model._stitch_group_idx_by_segment = _normalize_stitch_group_idx_by_segment(
+        model_cfg.stitch_group_idx_by_segment,
+        n_groups=model.n_groups,
+    )
+
+    _init_group_dro_if_needed(model, objective_cfg=objective_cfg)
+
+    model.erm_group_topk = int(objective_cfg.erm_group_topk or 0)
+    if model.erm_group_topk < 0:
+        raise ValueError(f"erm_group_topk must be >= 0, got {model.erm_group_topk}")
+
+    model._ema_decay = float(getattr(CFG, "ema_decay", 0.9))
+    model._ema_metrics = {}
+
+    model._eval_threshold = float(getattr(CFG, "eval_threshold", 0.5))
+    model._val_eval_metrics = None
+
+    model.loss_func1 = smp.losses.DiceLoss(mode="binary")
+
+    model.backbone = _build_backbone_with_optional_pretrained(model_cfg=model_cfg)
+
+    norm = str(model_cfg.norm).lower()
+    group_norm_groups = int(model_cfg.group_norm_groups)
+    encoder_dims = _infer_encoder_dims(model.backbone)
+
+    model.decoder = Decoder(encoder_dims=encoder_dims, upscale=1, norm=norm, group_norm_groups=group_norm_groups)
+
+    if model.with_norm:
+        if norm == "group":
+            model.normalization = nn.GroupNorm(num_groups=1, num_channels=1)
+        else:
+            model.normalization = nn.BatchNorm3d(num_features=1)
+
+    model._stitcher = _build_stitch_manager(stitch_cfg)
+
+
+def reset_train_epoch_accumulators(model):
+    device = model.device
+    model._train_loss_sum = torch.tensor(0.0, device=device)
+    model._train_dice_sum = torch.tensor(0.0, device=device)
+    model._train_count = torch.tensor(0.0, device=device)
+
+    model._train_group_loss_sum = torch.zeros(model.n_groups, device=device)
+    model._train_group_dice_sum = torch.zeros(model.n_groups, device=device)
+    model._train_group_count = torch.zeros(model.n_groups, device=device)
+
+
+def accumulate_train_stats(model, per_sample_loss, per_sample_dice, group_idx):
+    with torch.no_grad():
+        loss_det = per_sample_loss.detach()
+        dice_det = per_sample_dice.detach()
+        group_idx = group_idx.long()
+
+        model._train_loss_sum += loss_det.sum()
+        model._train_dice_sum += dice_det.sum()
+        model._train_count += float(loss_det.numel())
+
+        model._train_group_loss_sum.scatter_add_(0, group_idx, loss_det)
+        model._train_group_dice_sum.scatter_add_(0, group_idx, dice_det)
+        model._train_group_count.scatter_add_(
+            0,
+            group_idx,
+            torch.ones_like(loss_det, dtype=model._train_group_count.dtype),
+        )
+
+
+def compute_group_avg(model, values, group_idx):
+    group_idx = group_idx.long()
+    group_map = (
+        group_idx
+        == torch.arange(model.n_groups, device=group_idx.device).unsqueeze(1).long()
+    ).float()
+    group_count = group_map.sum(1)
+    group_denom = group_count + (group_count == 0).float()
+    group_avg = (group_map @ values.view(-1)) / group_denom
+    return group_avg, group_count
+
+
+def update_ema_metric(model, name, value):
+    decay = float(model._ema_decay)
+    if torch.is_tensor(value):
+        val = float(value.detach().cpu().item())
+    else:
+        val = float(value)
+    prev = model._ema_metrics.get(name)
+    if prev is None:
+        ema = val
+    else:
+        ema = decay * prev + (1.0 - decay) * val
+    model._ema_metrics[name] = ema
+    model.log(f"{name}_ema", ema, on_step=False, on_epoch=True, prog_bar=False)
+
+
+def distributed_world_size(model):
+    trainer = getattr(model, "trainer", None)
+    if trainer is None:
+        return 1
+    return int(getattr(trainer, "world_size", 1) or 1)
+
+
+def reduce_sum_distributed(model, tensor):
+    if distributed_world_size(model) <= 1:
+        return tensor
+    strategy = getattr(getattr(model, "trainer", None), "strategy", None)
+    if strategy is None or not hasattr(strategy, "reduce"):
+        raise RuntimeError("distributed validation reduction requested but trainer.strategy.reduce is unavailable")
+    return strategy.reduce(tensor, reduce_op="sum")
+
+
+def sync_validation_accumulators(model):
+    if distributed_world_size(model) <= 1:
+        return
+    model._val_loss_sum = reduce_sum_distributed(model, model._val_loss_sum)
+    model._val_dice_sum = reduce_sum_distributed(model, model._val_dice_sum)
+    model._val_bce_sum = reduce_sum_distributed(model, model._val_bce_sum)
+    model._val_dice_loss_sum = reduce_sum_distributed(model, model._val_dice_loss_sum)
+    model._val_count = reduce_sum_distributed(model, model._val_count)
+    model._val_group_loss_sum = reduce_sum_distributed(model, model._val_group_loss_sum)
+    model._val_group_dice_sum = reduce_sum_distributed(model, model._val_group_dice_sum)
+    model._val_group_bce_sum = reduce_sum_distributed(model, model._val_group_bce_sum)
+    model._val_group_dice_loss_sum = reduce_sum_distributed(model, model._val_group_dice_loss_sum)
+    model._val_group_count = reduce_sum_distributed(model, model._val_group_count)
+
+
+def _log_group_train_metrics(model, group_loss, group_count, *, include_adv_probs):
+    present = group_count > 0
+    if present.any():
+        worst_group_loss = group_loss[present].max()
+    else:
+        worst_group_loss = group_loss.max()
+    model.log("train/worst_group_loss", worst_group_loss, on_step=True, on_epoch=False, prog_bar=False)
+
+    for group_i, group_name in enumerate(model.group_names):
+        safe_group_name = str(group_name).replace("/", "_")
+        model.log(
+            f"train/group_{group_i}_{safe_group_name}/loss",
+            group_loss[group_i],
+            on_step=True,
+            on_epoch=False,
+        )
+        model.log(
+            f"train/group_{group_i}_{safe_group_name}/count",
+            group_count[group_i],
+            on_step=True,
+            on_epoch=False,
+        )
+        if include_adv_probs:
+            model.log(
+                f"train/group_{group_i}_{safe_group_name}/adv_prob",
+                model.group_dro.adv_probs[group_i],
+                on_step=True,
+                on_epoch=False,
+            )
+
+
+def compute_objective_loss(
+    model,
+    *,
+    outputs,
+    targets,
+    per_sample_loss,
+    per_sample_dice,
+    per_sample_bce,
+    per_sample_dice_loss,
+    group_idx,
+):
+    objective = str(model.objective).lower()
+    loss_mode = str(model.loss_mode).lower()
+    loss_recipe = str(getattr(model, "loss_recipe", "dice_bce")).lower()
+    group_idx = group_idx.long()
+
+    if objective == "erm":
+        if loss_mode == "batch":
+            bce_targets = model.build_bce_targets(targets)
+            bce_loss = F.binary_cross_entropy_with_logits(outputs, bce_targets)
+            if loss_recipe == "dice_bce":
+                dice_loss = model.loss_func1(outputs, targets)
+                loss = 0.5 * dice_loss + 0.5 * bce_loss
+            elif loss_recipe == "bce_only":
+                dice_loss = per_sample_dice_loss.mean()
+                loss = bce_loss
+            else:
+                raise ValueError(f"Unknown training.loss_recipe: {model.loss_recipe!r}")
+            model.log("train/dice_loss", dice_loss, on_step=True, on_epoch=True, prog_bar=False)
+            model.log("train/bce_loss", bce_loss, on_step=True, on_epoch=True, prog_bar=False)
+            return loss
+
+        if loss_mode != "per_sample":
+            raise ValueError(f"Unknown training.loss_mode: {model.loss_mode!r}")
+
+        if model.erm_group_topk > 0:
+            group_loss, group_count = compute_group_avg(model, per_sample_loss, group_idx)
+            present = group_count > 0
+            if present.any():
+                present_losses = group_loss[present]
+                topk = min(int(model.erm_group_topk), int(present_losses.numel()))
+                topk_losses, _ = torch.topk(present_losses, topk, largest=True)
+                loss = topk_losses.mean()
+            else:
+                loss = per_sample_loss.mean()
+
+            if model.global_step % CFG.print_freq == 0:
+                _log_group_train_metrics(
+                    model,
+                    group_loss,
+                    group_count,
+                    include_adv_probs=False,
+                )
+        else:
+            loss = per_sample_loss.mean()
+
+        model.log("train/dice", per_sample_dice.mean(), on_step=True, on_epoch=True, prog_bar=False)
+        model.log("train/dice_loss", per_sample_dice_loss.mean(), on_step=True, on_epoch=True, prog_bar=False)
+        model.log("train/bce_loss", per_sample_bce.mean(), on_step=True, on_epoch=True, prog_bar=False)
+        return loss
+
+    if objective == "group_dro":
+        if loss_mode != "per_sample":
+            raise ValueError("GroupDRO requires training.loss_mode=per_sample")
+        if model.group_dro is None:
+            raise RuntimeError("GroupDRO objective was set but group_dro computer was not initialized")
+
+        robust_loss, group_loss, group_count, _weights = model.group_dro.loss(per_sample_loss, group_idx)
+        model.log("train/dice", per_sample_dice.mean(), on_step=True, on_epoch=True, prog_bar=False)
+        model.log("train/dice_loss", per_sample_dice_loss.mean(), on_step=True, on_epoch=True, prog_bar=False)
+        model.log("train/bce_loss", per_sample_bce.mean(), on_step=True, on_epoch=True, prog_bar=False)
+
+        if model.global_step % CFG.print_freq == 0:
+            _log_group_train_metrics(
+                model,
+                group_loss,
+                group_count,
+                include_adv_probs=True,
+            )
+
+        return robust_loss
+
+    raise ValueError(f"Unknown training.objective: {model.objective!r}")
+
+
+def finalize_training_batch(model, *, loss, per_sample_loss, per_sample_dice, group_idx):
+    accumulate_train_stats(model, per_sample_loss, per_sample_dice, group_idx)
+    if torch.isnan(loss).any():
+        raise FloatingPointError("NaN loss encountered during training_step")
+    model.log("train/total_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+
+
+def log_train_epoch_metrics(model):
+    if model._train_count.item() > 0:
+        avg_loss = model._train_loss_sum / model._train_count
+        avg_dice = model._train_dice_sum / model._train_count
+    else:
+        avg_loss = torch.tensor(0.0, device=model.device)
+        avg_dice = torch.tensor(0.0, device=model.device)
+
+    group_count = model._train_group_count
+    group_loss = model._train_group_loss_sum / group_count.clamp_min(1)
+    group_dice = model._train_group_dice_sum / group_count.clamp_min(1)
+    worst_group_loss = group_loss.max() if group_loss.numel() else torch.tensor(0.0, device=model.device)
+
+    model.log("train/epoch_avg_loss", avg_loss, on_step=False, on_epoch=True, prog_bar=False)
+    model.log("train/epoch_avg_dice", avg_dice, on_step=False, on_epoch=True, prog_bar=False)
+    update_ema_metric(model, "train/total_loss", avg_loss)
+    update_ema_metric(model, "train/dice", avg_dice)
+    update_ema_metric(model, "train/worst_group_loss", worst_group_loss)
+    for group_i, group_name in enumerate(model.group_names):
+        safe_group_name = str(group_name).replace("/", "_")
+        model.log(
+            f"train/group_{group_i}_{safe_group_name}/epoch_loss",
+            group_loss[group_i],
+            on_step=False,
+            on_epoch=True,
+        )
+        model.log(
+            f"train/group_{group_i}_{safe_group_name}/epoch_dice",
+            group_dice[group_i],
+            on_step=False,
+            on_epoch=True,
+        )
+        model.log(
+            f"train/group_{group_i}_{safe_group_name}/epoch_count",
+            group_count[group_i],
+            on_step=False,
+            on_epoch=True,
+        )
+
+
+def reset_validation_epoch_accumulators(model):
+    device = model.device
+    model._val_loss_sum = torch.tensor(0.0, device=device)
+    model._val_dice_sum = torch.tensor(0.0, device=device)
+    model._val_bce_sum = torch.tensor(0.0, device=device)
+    model._val_dice_loss_sum = torch.tensor(0.0, device=device)
+    model._val_count = torch.tensor(0.0, device=device)
+
+    model._val_group_loss_sum = torch.zeros(model.n_groups, device=device)
+    model._val_group_dice_sum = torch.zeros(model.n_groups, device=device)
+    model._val_group_bce_sum = torch.zeros(model.n_groups, device=device)
+    model._val_group_dice_loss_sum = torch.zeros(model.n_groups, device=device)
+    model._val_group_count = torch.zeros(model.n_groups, device=device)
+
+
+def initialize_validation_metrics(model):
+    model._val_eval_metrics = StreamingBinarySegmentationMetrics(
+        threshold=model._eval_threshold,
+        device=model.device,
+    )
+
+
+def accumulate_validation_stats(
+    model,
+    *,
+    per_sample_loss,
+    per_sample_dice,
+    per_sample_bce,
+    per_sample_dice_loss,
+    group_idx,
+):
+    model._val_loss_sum += per_sample_loss.sum()
+    model._val_dice_sum += per_sample_dice.sum()
+    model._val_bce_sum += per_sample_bce.sum()
+    model._val_dice_loss_sum += per_sample_dice_loss.sum()
+    model._val_count += float(per_sample_loss.numel())
+
+    group_idx = group_idx.long()
+    model._val_group_loss_sum.scatter_add_(0, group_idx, per_sample_loss)
+    model._val_group_dice_sum.scatter_add_(0, group_idx, per_sample_dice)
+    model._val_group_bce_sum.scatter_add_(0, group_idx, per_sample_bce)
+    model._val_group_dice_loss_sum.scatter_add_(0, group_idx, per_sample_dice_loss)
+    model._val_group_count.scatter_add_(0, group_idx, torch.ones_like(per_sample_loss, dtype=model._val_group_count.dtype))
+
+
+def update_validation_stream_metrics(model, *, outputs, targets):
+    if model._val_eval_metrics is not None:
+        model._val_eval_metrics.update(logits=outputs, targets=targets)
+
+
+def log_validation_epoch_metrics(model):
+    if model._val_count.item() > 0:
+        avg_loss = model._val_loss_sum / model._val_count
+        avg_dice = model._val_dice_sum / model._val_count
+        avg_bce = model._val_bce_sum / model._val_count
+        avg_dice_loss = model._val_dice_loss_sum / model._val_count
+    else:
+        avg_loss = torch.tensor(0.0, device=model.device)
+        avg_dice = torch.tensor(0.0, device=model.device)
+        avg_bce = torch.tensor(0.0, device=model.device)
+        avg_dice_loss = torch.tensor(0.0, device=model.device)
+
+    group_count = model._val_group_count
+    group_loss = model._val_group_loss_sum / group_count.clamp_min(1)
+    group_dice = model._val_group_dice_sum / group_count.clamp_min(1)
+    group_bce = model._val_group_bce_sum / group_count.clamp_min(1)
+    group_dice_loss = model._val_group_dice_loss_sum / group_count.clamp_min(1)
+
+    present = group_count > 0
+    if present.any():
+        worst_group_loss = group_loss[present].max()
+        worst_group_dice = group_dice[present].min()
+    else:
+        worst_group_loss = group_loss.max()
+        worst_group_dice = group_dice.min()
+
+    model.log("val/avg_loss", avg_loss, on_epoch=True, prog_bar=True)
+    model.log("val/worst_group_loss", worst_group_loss, on_epoch=True, prog_bar=True)
+    model.log("val/avg_dice", avg_dice, on_epoch=True, prog_bar=False)
+    model.log("val/worst_group_dice", worst_group_dice, on_epoch=True, prog_bar=False)
+    model.log("val/avg_bce_loss", avg_bce, on_epoch=True, prog_bar=False)
+    model.log("val/avg_dice_loss", avg_dice_loss, on_epoch=True, prog_bar=False)
+    update_ema_metric(model, "val/avg_loss", avg_loss)
+    update_ema_metric(model, "val/worst_group_loss", worst_group_loss)
+    update_ema_metric(model, "val/avg_dice", avg_dice)
+    update_ema_metric(model, "val/worst_group_dice", worst_group_dice)
+
+    if model._val_eval_metrics is not None:
+        eval_metrics = model._val_eval_metrics.compute()
+        for metric_name, metric_value in eval_metrics.items():
+            model.log(f"metrics/val/{metric_name}", metric_value, on_epoch=True, prog_bar=False)
+
+    for group_i, group_name in enumerate(model.group_names):
+        safe_group_name = str(group_name).replace("/", "_")
+        model.log(f"val/group_{group_i}_{safe_group_name}/loss", group_loss[group_i], on_epoch=True)
+        model.log(f"val/group_{group_i}_{safe_group_name}/dice", group_dice[group_i], on_epoch=True)
+        model.log(f"val/group_{group_i}_{safe_group_name}/bce_loss", group_bce[group_i], on_epoch=True)
+        model.log(f"val/group_{group_i}_{safe_group_name}/dice_loss", group_dice_loss[group_i], on_epoch=True)
+        model.log(f"val/group_{group_i}_{safe_group_name}/count", group_count[group_i], on_epoch=True)
 
 
 class RegressionPLModel(pl.LightningModule):
