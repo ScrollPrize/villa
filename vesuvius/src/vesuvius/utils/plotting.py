@@ -90,10 +90,11 @@ def _resolve_display_signal(
     """Resolve the signal actually rendered by convert_slice_to_bgr for consistent global scaling."""
     task_cfg = task_cfg or {}
     task_type = task_cfg.get("visualization") or task_cfg.get("type")
+    is_spatial_3d_volume = arr_np.ndim == 3 and not is_2d_run
     is_surface = (
         (task_name is not None and task_name.endswith("surface_frame"))
         or task_type == "surface_frame"
-        or (arr_np.ndim >= 3 and arr_np.shape[0] == 9)
+        or (arr_np.ndim >= 3 and arr_np.shape[0] == 9 and not is_spatial_3d_volume)
     )
     if is_surface:
         return None
