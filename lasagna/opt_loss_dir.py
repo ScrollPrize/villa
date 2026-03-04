@@ -27,7 +27,7 @@ def _quad_face_normals(xyz_lr: torch.Tensor) -> torch.Tensor:
 	e_h = xyz_lr[:, 1:, :-1, :] - xyz_lr[:, :-1, :-1, :]  # along height
 	e_w = xyz_lr[:, :-1, 1:, :] - xyz_lr[:, :-1, :-1, :]  # along width
 	n = torch.cross(e_h, e_w, dim=-1)
-	return n / (n.norm(dim=-1, keepdim=True) + 1e-8)
+	return n * torch.rsqrt((n * n).sum(dim=-1, keepdim=True) + 1e-12)
 
 
 def dir_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch.Tensor]:
@@ -60,25 +60,25 @@ def dir_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch.Te
 		d0, d1 = _encode_dir(nx, ny)
 		data_d0 = data_at_faces.dir0_z.squeeze(0).squeeze(0)  # (D, Hm-1, Wm-1)
 		data_d1 = data_at_faces.dir1_z.squeeze(0).squeeze(0)
-		w = (nx * nx + ny * ny).sqrt()
+		w = nx * nx + ny * ny
 		lm = lm + w * 0.5 * ((d0 - data_d0) ** 2 + (d1 - data_d1) ** 2)
 		w_total = w_total + w
 
-	# y-axis (XZ plane): project -> (nx, nz), weight by sqrt(nx²+nz²)
+	# y-axis (XZ plane): project -> (nx, nz), weight by nx²+nz²
 	if data_at_faces.dir0_y is not None:
 		d0, d1 = _encode_dir(nx, nz)
 		data_d0 = data_at_faces.dir0_y.squeeze(0).squeeze(0)
 		data_d1 = data_at_faces.dir1_y.squeeze(0).squeeze(0)
-		w = (nx * nx + nz * nz).sqrt()
+		w = nx * nx + nz * nz
 		lm = lm + w * 0.5 * ((d0 - data_d0) ** 2 + (d1 - data_d1) ** 2)
 		w_total = w_total + w
 
-	# x-axis (YZ plane): project -> (ny, nz), weight by sqrt(ny²+nz²)
+	# x-axis (YZ plane): project -> (ny, nz), weight by ny²+nz²
 	if data_at_faces.dir0_x is not None:
 		d0, d1 = _encode_dir(ny, nz)
 		data_d0 = data_at_faces.dir0_x.squeeze(0).squeeze(0)
 		data_d1 = data_at_faces.dir1_x.squeeze(0).squeeze(0)
-		w = (ny * ny + nz * nz).sqrt()
+		w = ny * ny + nz * nz
 		lm = lm + w * 0.5 * ((d0 - data_d0) ** 2 + (d1 - data_d1) ** 2)
 		w_total = w_total + w
 

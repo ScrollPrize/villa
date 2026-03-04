@@ -451,6 +451,9 @@ class Model3D(nn.Module):
 				# These cover slices [0:D-1]
 				self.conn_offsets[2, :-1] = row.float() + u - h_idx[:-1]
 				self.conn_offsets[3, :-1] = col.float() + v - w_idx[:-1]
+			# Degenerate quadratic solves can produce NaN; sanitize to avoid
+			# garbage indices from NaN.long() in the next forward pass.
+			self.conn_offsets.nan_to_num_(0.0)
 
 	def forward(self, data: fit_data.FitData3D) -> FitResult3D:
 		xyz_lr = self._grid_xyz()  # (D, Hm, Wm, 3)
