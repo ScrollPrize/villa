@@ -31,7 +31,6 @@ import torch
 import zarr
 
 from common import load_unet, unet_infer_tiled
-from fit_data import _gaussian_blur_nchw
 
 
 def _crop_xyzwhd_bounds(*, shape_zyx: tuple[int, int, int], crop_xyzwhd: tuple[int, int, int, int, int, int] | None) -> tuple[int, int, int, int, int, int]:
@@ -169,8 +168,6 @@ def run_preprocess(
 	overlap: int,
 	border: int,
 	scaledown: int,
-	grad_mag_blur_sigma: float,
-	dir_blur_sigma: float,
 	chunk_z: int,
 	chunk_yx: int,
 	measure_cuda_timings: bool = False,
@@ -262,9 +259,7 @@ def run_preprocess(
 	arr.attrs["preprocess_params"] = {
 		"axis": axis,
 		"scaledown": int(scaledown),
-		"grad_mag_blur_sigma": float(grad_mag_blur_sigma),
 		"grad_mag_encode_scale": float(1000.0),
-		"dir_blur_sigma": float(dir_blur_sigma),
 		"processed_z_slices": int(proc_count),
 		"crop_xyzwhd": [int(x0), int(y0), int(z0), int(nx), int(ny), int(nz)],
 		"output_full_scaled": True,
@@ -355,18 +350,10 @@ def run_preprocess(
 				dir0_np = _pyrdown2d(dir0_np, factor=int(scaledown))
 				dir1_np = _pyrdown2d(dir1_np, factor=int(scaledown))
 
-			grad_mag = torch.from_numpy(grad_mag_np).to(device=torch_device, dtype=torch.float32)[None, None, :, :]
-			dir0 = torch.from_numpy(dir0_np).to(device=torch_device, dtype=torch.float32)[None, None, :, :]
-			dir1 = torch.from_numpy(dir1_np).to(device=torch_device, dtype=torch.float32)[None, None, :, :]
-			if float(grad_mag_blur_sigma) > 0.0:
-				grad_mag = _gaussian_blur_nchw(x=grad_mag, sigma=float(grad_mag_blur_sigma))
-			if float(dir_blur_sigma) > 0.0:
-				dir0 = _gaussian_blur_nchw(x=dir0, sigma=float(dir_blur_sigma))
-				dir1 = _gaussian_blur_nchw(x=dir1, sigma=float(dir_blur_sigma))
 			cos_u8 = np.clip(cos_np * 255.0, 0.0, 255.0).astype(np.uint8)
-			grad_mag_u8 = np.clip(grad_mag[0, 0].detach().cpu().numpy().astype(np.float32) * 1000.0, 0.0, 255.0).astype(np.uint8)
-			dir0_u8 = np.clip(dir0[0, 0].detach().cpu().numpy().astype(np.float32) * 255.0, 0.0, 255.0).astype(np.uint8)
-			dir1_u8 = np.clip(dir1[0, 0].detach().cpu().numpy().astype(np.float32) * 255.0, 0.0, 255.0).astype(np.uint8)
+			grad_mag_u8 = np.clip(grad_mag_np * 1000.0, 0.0, 255.0).astype(np.uint8)
+			dir0_u8 = np.clip(dir0_np * 255.0, 0.0, 255.0).astype(np.uint8)
+			dir1_u8 = np.clip(dir1_np * 255.0, 0.0, 255.0).astype(np.uint8)
 			t_wr0 = time.time()
 
 			# Output index along slice dimension
@@ -1169,8 +1156,6 @@ def main(argv: list[str] | None = None) -> int:
 	p.add_argument("--border", type=int, default=32, help="Tile border discard width.")
 	p.add_argument("--scaledown", type=int, default=4,
 		help="Uniform downscale factor for all three dimensions (default: 4).")
-	p.add_argument("--grad-mag-blur-sigma", type=float, default=4.0, help="Gaussian blur sigma on downscaled grad-mag.")
-	p.add_argument("--dir-blur-sigma", type=float, default=2.0, help="Gaussian blur sigma on downscaled dir0/dir1.")
 	p.add_argument("--chunk-z", "--chunk-slice", dest="chunk_z", type=int, default=32,
 		help="Output chunk size along the slice axis.")
 	p.add_argument("--chunk-yx", "--chunk-plane", dest="chunk_yx", type=int, default=32,
@@ -1190,8 +1175,6 @@ def main(argv: list[str] | None = None) -> int:
 		overlap=int(args.overlap),
 		border=int(args.border),
 		scaledown=int(args.scaledown),
-		grad_mag_blur_sigma=float(args.grad_mag_blur_sigma),
-		dir_blur_sigma=float(args.dir_blur_sigma),
 		chunk_z=int(args.chunk_z),
 		chunk_yx=int(args.chunk_yx),
 		measure_cuda_timings=bool(args.measure_cuda_timings),

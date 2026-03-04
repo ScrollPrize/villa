@@ -29,9 +29,9 @@
     - normal should continue to be fused separately (we need the three plane directions) but for cos and grad density:
         - use the 3 plane intersection normal estimate to fit a 3d normal
         - use the normal to
-            - 1. calculate the weight how much each direction should influence the output - a slice tangential to the surface should obviousl not influence the estimate, while a slice orthogonal is best
-            - 2. normalize the grad magnitude with the normal - as the 2d network observed along its slicing plane the distance can be stretched depending on the angle (and hence the gradient magniutde reduced proportionally)
-            - this norm must _not_ be used for the data term (as fractional distances should stay the mostly independend of the angle)
+            - 1. calculate weights: `w_axis = sqrt(1 - n_axis²)` = in-plane projection magnitude. A slice edge-on to the surface sees a clear line (reliable); a face-on slice sees no line (unreliable, low weight).
+            - 2. normalize the grad magnitude: the UNet outputs the in-plane gradient `gm_axis = G · sqrt(1 - n_axis²)`. Dividing by `w_axis` recovers the true 3D gradient `G`. In the fusion `Σ(gm) / Σ(w)` the projection factors cancel.
+            - this norm must _not_ be used for the data term (as fractional distances should stay mostly independent of the angle)
 - losses - relevant losses (leave out description and later also implementation of the other lossses)
     - dir_v - call it just dir - it should just enforce the model folloing the tangentials of the data (respectively orthogonal to the data normal)
     - step - mesh-step distance between quadmesh corners points
@@ -53,14 +53,14 @@ Most data originates from a UNet applied to 2D slices of the CT volume along thr
 ### cos (cosine) — periodic layer signal
 - UNet channel 0. Oscillates between 0 and 1 as the slice crosses papyrus layers.
 - Stored as uint8 in preprocessed zarr, decoded: `float32 / 255.0` → range [0, 1].
-- In the 3D model: preprocessed from three axis volumes. The cos values from each axis-slice are **weighted by normal alignment** (see preprocessing section). Not affected by the angle normalization (division by cos(angle)).
+- In the 3D model: preprocessed from three axis volumes. The cos values from each axis-slice are **weighted by in-plane projection** `w_axis = sqrt(1 - n_axis²)` — higher weight for edge-on views where the sheet is clearly visible (see preprocessing section). Not affected by the gradient angle normalization.
 
 ### grad_mag (gradient magnitude) — sheet density
 - UNet channel 1. Encodes the **density of papyrus sheets** = `|∇(fractional_winding_position)|`.
 - The UNet predicts a fractional winding position field (`frac_pos`) derived from distance transforms to sheet skeletons → monotone normalization → iterative weighted averaging (see `gen_post_data.py:compute_label_supervision()`, `train_unet.py:compute_frac_mag_dir()`). `grad_mag` is the magnitude of the spatial gradient of this field — it measures how fast winding position changes spatially. High grad_mag = sheets closely packed; low = sheets far apart.
 - Stored as uint8 with `grad_mag_encode_scale = 1000.0`, decoded: `float32 / 1000.0`.
 - Optionally Gaussian blurred (configurable `grad_mag_blur_sigma`, default 4.0 in preprocessing).
-- In the 3D model: each axis's grad_mag is both **weighted by normal alignment** AND **normalized by dividing by `cos(angle)`** between the slicing plane and the fitted 3D surface normal (see preprocessing section). The normalization corrects for the stretching effect of oblique slicing.
+- In the 3D model: fused from three axis volumes. The UNet outputs the in-plane gradient `gm_axis = G · sqrt(1 - n_axis²)`. The fusion `gm_fused = Σ(gm) / Σ(w)` with `w_axis = sqrt(1 - n_axis²)` recovers the true 3D gradient magnitude `G` (projection factors cancel). See preprocessing section.
 
 ### dir0, dir1 — 2D direction encoding (180°-symmetric)
 - UNet channels 2 and 3. Encode the local layer normal direction in the slicing plane using a double-angle representation:
@@ -177,7 +177,9 @@ loss = 0.5 * ((pred_dir0 - data_dir0)² + (pred_dir1 - data_dir1)²)
 ```
 Mask: requires both the current vertex and its forward neighbor (j and j+1) to be valid. Last row copies the mask of the previous row.
 
-**3D adaptation**: The model surface is a quad in 3D. Compute the **quad face normal** from cross product of the two quad edge directions. Compare the model normal against each axis's dir0/dir1 encoding separately (all three pairs are stored in preprocessing, no fusion). Each axis comparison is weighted by how aligned the slicing plane is with the model surface.
+**3D adaptation**: The model surface is a quad in 3D. Compute the **quad face normal** `(nx, ny, nz)` from cross product of the two quad edge directions. Compare the model normal against each axis's dir0/dir1 encoding separately (all three pairs are stored in preprocessing, no fusion). Each axis is weighted by the **squared in-plane projection** of the normal: `w_z = nx² + ny²` for z-slices, `w_y = nx² + nz²` for y-slices, `w_x = ny² + nz²` for x-slices. This gives high weight when the surface is edge-on (direction well-defined) and zero when face-on (direction degenerate).
+
+There is also a **normal loss** that reconstructs the target 3D normal from the per-plane direction encodings via constraint-row cross products (same math as the preprocessing normal estimation). Loss: `1 - |dot(mesh_normal, target_normal)|`. This provides a holistic 3D constraint that avoids the feedback loop where the dir loss gets stuck favoring one dominant plane.
 
 ### step — mesh step distance
 
@@ -207,7 +209,7 @@ Integrates the sheet density (grad_mag) along the connection direction (±depth 
 7. Loss = `(mag_normalized - 1.0)²`, averaged over the two strips.
 8. Masked by: connection validity (both endpoints valid) AND image-space validity of ALL strip sample points (amin across strip dim).
 
-**3D adaptation**: The strip direction is **±depth (winding direction)**, running from the current vertex to its neighbor in the D±1 depth slice along the quad surface normal. Each strip is effectively a **mini-model**: three quadmesh surfaces (prev, center, next winding) with bilinearly interpolated points between them — the strip samples live on these interpolated surfaces. Sample grad_mag from the 3D volume at these 3D strip points via **trilinear** interpolation. Length computation uses 3D Euclidean distance. The scaledown factor is uniform in xyz. The integral of sheet density along one winding connection should equal 1.0.
+**3D adaptation (winding_density loss)**: The strip direction is **±depth (winding direction)**, running from the current vertex to its connection point on the D±1 depth slice. Both strips (prev→center, center→next) go in the **anti-normal** direction (outward from the surface). The signed strip length is `-(diff · normal)` — positive when the strip goes anti-normal (correct side), negative when along-normal (wrong side / self-intersection, creating a strong penalty). Each strip's grad_mag samples are multiplied by this signed length: `mag_n = grad_mag × signed_len`, target 1.0. All coordinates are in **fullres voxels** (mesh positions are fullres, fused grad_mag is in per-fullres-voxel units from the UNet), so no scaledown factor is needed. The integral of sheet density along one winding connection should equal 1.0.
 
 ### data — cosine MSE loss
 
@@ -324,7 +326,7 @@ sin2θ = cos2θ - √2·(2·dir1 - 1)
 θ = atan2(sin2θ, cos2θ) / 2        # θ ∈ (-π/2, π/2]
 ```
 
-Each axis constrains the 3D surface normal (nx, ny, nz) via a linear equation (the gradient direction in the slicing plane must be perpendicular to the surface normal projected onto that plane):
+Each axis constrains the 3D surface normal (nx, ny, nz) via a linear equation (the gradient direction in the slicing plane is parallel to the surface normal projected onto that plane — their 2D cross product is zero):
 - z-slices (XY plane, gx→X, gy→Y): `nx·sin(θ_z) - ny·cos(θ_z) = 0`
 - y-slices (XZ plane, gx→X, gy→Z): `nx·sin(θ_y) - nz·cos(θ_y) = 0`
 - x-slices (YZ plane, gx→Y, gy→Z): `ny·sin(θ_x) - nz·cos(θ_x) = 0`
