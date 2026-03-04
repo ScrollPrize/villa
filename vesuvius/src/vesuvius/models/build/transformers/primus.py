@@ -1,4 +1,5 @@
 from typing import Tuple
+import math
 import torch
 from torch import nn
 
@@ -183,7 +184,7 @@ class Primus(AbstractDynamicNetworkArchitectures):
 
         B, C = x.shape[:2]
         spatial_shape = x.shape[2:]  # (H, W) or (D, H, W)
-        num_patches = int(torch.tensor(spatial_shape).prod().item())
+        num_patches = math.prod(spatial_shape)
 
         if self.ndim == 2:
             x = rearrange(x, "b c h w -> b (h w) c")
