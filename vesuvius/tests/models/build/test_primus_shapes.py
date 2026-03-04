@@ -101,3 +101,20 @@ def test_primus_rejects_runtime_spatial_mismatch_with_clear_error():
 
     with pytest.raises(ValueError, match="configured input_shape"):
         model(torch.randn(1, 1, 24, 24, 24))
+
+
+def test_primus_disables_deep_supervision_with_warning(capsys):
+    mgr = _make_mgr(
+        patch_size=(16, 16, 16),
+        targets={"ink": {"out_channels": 1, "activation": "none"}},
+    )
+    mgr.enable_deep_supervision = True
+
+    model = NetworkFromConfig(mgr)
+    captured = capsys.readouterr()
+
+    assert "Disabling deep supervision for this run" in captured.out
+    assert mgr.enable_deep_supervision is False
+
+    out = model(torch.randn(1, 1, 16, 16, 16))
+    assert out["ink"].shape == (1, 1, 16, 16, 16)
