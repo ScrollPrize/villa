@@ -327,30 +327,9 @@ def export_vis_obj(
 	st = torch.load(model_path, map_location=dev, weights_only=False)
 	mdl = fit_model.Model3D.from_checkpoint(st, device=dev)
 
-	# Load data
-	mp = st["_model_params_"]
-	fit_cfg = st.get("_fit_config_", {}) or {}
-	fit_args = fit_cfg.get("args", {}) or {}
-
-	crop = fit_args.get("crop") or fit_args.get("bbox")
-	if crop is not None:
-		crop = tuple(int(v) for v in crop)
-		# bbox format: (cx, cy, cz, w, h) — convert to (x0, y0, z0, w, h, d)
-		if len(crop) == 5:
-			cx, cy, cz, w, h = crop
-			z_size = fit_args.get("z-size", 1)
-			crop = (cx - w // 2, cy - h // 2, cz - int(z_size) // 2, w, h, int(z_size))
-		elif len(crop) == 4:
-			x0, y0, w, h = crop
-			crop = (x0, y0, 0, w, h, 9999)
-
-	print(f"[export_vis] loading data from {data_path} (crop={crop})", flush=True)
-	data = fit_data.load_3d(
-		path=data_path,
-		device=dev,
-		downscale=float(mp["scaledown"]),
-		crop=crop,
-	)
+	# Load data (auto-crop around mesh bbox)
+	print(f"[export_vis] loading data from {data_path}", flush=True)
+	data = fit_data.load_3d_for_model(path=data_path, device=dev, model=mdl)
 
 	# Forward pass
 	print("[export_vis] running forward pass", flush=True)

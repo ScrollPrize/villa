@@ -494,21 +494,25 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, 404)
 
     def _handle_export_vis(self, body: dict[str, Any]) -> None:
-        """Synchronously export multi-layer OBJ visualization."""
+        """Synchronously export multi-layer OBJ visualization.
+
+        Returns the exported files as a tar.gz binary response.
+        """
         import base64
+        import io
+        import shutil
+        import tarfile
         import tempfile
 
         model_input = body.get("model_input")
         model_data = body.get("model_data")
         data_input = body.get("data_input")
-        output_dir = body.get("output_dir")
-
-        if not output_dir:
-            self._send_json({"error": "missing 'output_dir'"}, 400)
-            return
 
         tmp_model = None
+        tmp_dir = None
         try:
+            tmp_dir = tempfile.mkdtemp(prefix="fit_vis_")
+
             if model_data:
                 model_bytes = base64.b64decode(model_data)
                 tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
@@ -540,7 +544,7 @@ class _Handler(BaseHTTPRequestHandler):
             export_vis_obj.export_vis_obj(
                 model_path=str(model_input),
                 data_path=str(data_input),
-                output_dir=str(output_dir),
+                output_dir=tmp_dir,
                 slices=body.get("slices", []),
                 channels=body.get("channels", []),
                 losses=body.get("losses", []),
@@ -548,7 +552,22 @@ class _Handler(BaseHTTPRequestHandler):
                 include_connections=bool(body.get("include_connections", True)),
                 device=body.get("device", "cuda"),
             )
-            self._send_json({"status": "ok", "output_dir": str(output_dir)})
+
+            # Package as tar.gz
+            buf = io.BytesIO()
+            out_path = Path(tmp_dir)
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                for child in sorted(out_path.iterdir()):
+                    tar.add(str(child), arcname=child.name)
+
+            data = buf.getvalue()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+            print(f"[fit-service] export_vis done ({len(data)} bytes)", flush=True)
         except Exception as exc:
             tb = traceback.format_exc()
             print(f"[fit-service] export_vis error: {tb}", file=sys.stderr, flush=True)
@@ -559,6 +578,8 @@ class _Handler(BaseHTTPRequestHandler):
                     os.unlink(tmp_model)
                 except OSError:
                     pass
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         msg = fmt % args

@@ -1474,7 +1474,6 @@ int ABFFlattenDialog::downsampleFactor() const
 // ================= VisLasagnaObjDialog =================
 // static session members
 bool VisLasagnaObjDialog::s_haveSession = false;
-QString VisLasagnaObjDialog::s_outputDir;
 bool VisLasagnaObjDialog::s_xy = true;
 bool VisLasagnaObjDialog::s_xz = false;
 bool VisLasagnaObjDialog::s_yz = false;
@@ -1591,7 +1590,7 @@ bool VisLasagnaObjDialog::includeConnections() const { return chkConn_->isChecke
 void VisLasagnaObjDialog::applySessionDefaults()
 {
     if (!s_haveSession) return;
-    if (!s_outputDir.isEmpty()) edtOutput_->setText(s_outputDir);
+    // Don't restore s_outputDir — always use the segment-derived path from constructor
     chkXY_->setChecked(s_xy);
     chkXZ_->setChecked(s_xz);
     chkYZ_->setChecked(s_yz);
@@ -1609,7 +1608,6 @@ void VisLasagnaObjDialog::applySessionDefaults()
 void VisLasagnaObjDialog::updateSessionFromUI()
 {
     s_haveSession = true;
-    s_outputDir = edtOutput_->text();
     s_xy = chkXY_->isChecked();
     s_xz = chkXZ_->isChecked();
     s_yz = chkYZ_->isChecked();

@@ -426,12 +426,17 @@ void LasagnaServiceManager::exportLasagnaVis(const QJsonObject& config)
         return;
     }
 
+    // Extract output_dir from config — it's a client-side path, not sent to server
+    QJsonObject serverConfig = config;
+    _visOutputDir = serverConfig[QStringLiteral("output_dir")].toString();
+    serverConfig.remove(QStringLiteral("output_dir"));
+
     QUrl url(QStringLiteral("%1/export_vis").arg(baseUrl()));
     QNetworkRequest req(url);
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     req.setTransferTimeout(120000); // 2 min timeout for export
 
-    QByteArray body = QJsonDocument(config).toJson(QJsonDocument::Compact);
+    QByteArray body = QJsonDocument(serverConfig).toJson(QJsonDocument::Compact);
 
     QNetworkReply* reply = _nam->post(req, body);
     connect(reply, &QNetworkReply::finished, this, [this, reply]() {
@@ -442,16 +447,49 @@ void LasagnaServiceManager::exportLasagnaVis(const QJsonObject& config)
             return;
         }
 
-        QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
-        QJsonObject obj = doc.object();
+        // Check Content-Type: JSON means error, gzip means success
+        QString contentType = reply->header(QNetworkRequest::ContentTypeHeader).toString();
+        QByteArray data = reply->readAll();
 
-        if (obj.contains(QStringLiteral("error"))) {
+        if (contentType.contains(QStringLiteral("json"))) {
+            QJsonDocument doc = QJsonDocument::fromJson(data);
+            QJsonObject obj = doc.object();
             emit visExportError(obj[QStringLiteral("error")].toString());
             return;
         }
 
-        QString outputDir = obj[QStringLiteral("output_dir")].toString();
-        emit visExportFinished(outputDir);
+        // Extract tar.gz into _visOutputDir
+        QDir().mkpath(_visOutputDir);
+        QString tarPath = _visOutputDir + QStringLiteral("/.lasagna_vis.tar.gz");
+        QFile tarFile(tarPath);
+        if (!tarFile.open(QIODevice::WriteOnly)) {
+            emit visExportError(tr("Cannot write temp file: %1").arg(tarPath));
+            return;
+        }
+        tarFile.write(data);
+        tarFile.close();
+
+        QProcess tar;
+        tar.setWorkingDirectory(_visOutputDir);
+        tar.start(QStringLiteral("tar"),
+                  {QStringLiteral("xzf"), tarPath});
+        if (!tar.waitForFinished(30000)) {
+            QFile::remove(tarPath);
+            emit visExportError(tr("tar extraction timed out"));
+            return;
+        }
+        QFile::remove(tarPath);
+
+        if (tar.exitCode() != 0) {
+            QString err = QString::fromUtf8(tar.readAllStandardError());
+            emit visExportError(tr("tar extraction failed: %1").arg(err));
+            return;
+        }
+
+        std::cout << "[lasagna] vis export unpacked to "
+                  << _visOutputDir.toStdString() << " ("
+                  << data.size() << " bytes)" << std::endl;
+        emit visExportFinished(_visOutputDir);
     });
 }
 

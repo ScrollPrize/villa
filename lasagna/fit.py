@@ -59,36 +59,6 @@ def _arc_params_from_bbox(
 	}
 
 
-def _auto_crop(
-	mesh_bbox: tuple[float, float, float, float, float, float],
-	volume_extent_fullres: tuple[int, int, int],
-	margin: float = 3.0,
-) -> tuple[int, int, int, int, int, int]:
-	"""Compute crop = margin × mesh extent, centered on mesh, clamped to volume.
-
-	Returns (x0, y0, z0, w, h, d) in fullres voxels.
-	"""
-	x_min, y_min, z_min, x_max, y_max, z_max = mesh_bbox
-	vol_x, vol_y, vol_z = volume_extent_fullres
-
-	cx = (x_min + x_max) / 2.0
-	cy = (y_min + y_max) / 2.0
-	cz = (z_min + z_max) / 2.0
-
-	ex = max((x_max - x_min) * margin / 2.0, 100.0)
-	ey = max((y_max - y_min) * margin / 2.0, 100.0)
-	ez = max((z_max - z_min) * margin / 2.0, 100.0)
-
-	x0 = max(0, int(cx - ex))
-	y0 = max(0, int(cy - ey))
-	z0 = max(0, int(cz - ez))
-	x1 = min(vol_x, int(cx + ex))
-	y1 = min(vol_y, int(cy + ey))
-	z1 = min(vol_z, int(cz + ez))
-
-	return (x0, y0, z0, x1 - x0, y1 - y0, z1 - z0)
-
-
 def _build_parser() -> argparse.ArgumentParser:
 	p = argparse.ArgumentParser(
 		prog="fit.py",
@@ -195,23 +165,9 @@ def main(argv: list[str] | None = None) -> int:
 
 	# --- Data loading (with auto-crop, blur, and reload support) ---
 	def _load_data() -> fit_data.FitData3D:
-		with torch.no_grad():
-			xyz = mdl._grid_xyz()  # (D, Hm, Wm, 3)
-			mesh_bbox = (float(xyz[..., 0].min()), float(xyz[..., 1].min()), float(xyz[..., 2].min()),
-						 float(xyz[..., 0].max()), float(xyz[..., 1].max()), float(xyz[..., 2].max()))
-		print(f"[fit] mesh bbox: "
-			  f"min=({mesh_bbox[0]:.0f},{mesh_bbox[1]:.0f},{mesh_bbox[2]:.0f}) "
-			  f"max=({mesh_bbox[3]:.0f},{mesh_bbox[4]:.0f},{mesh_bbox[5]:.0f})", flush=True)
-		if volume_extent_fullres is not None:
-			auto_crop = _auto_crop(mesh_bbox, volume_extent_fullres, margin=3.0)
-			print(f"[fit] auto-crop: x={auto_crop[0]} y={auto_crop[1]} z={auto_crop[2]} "
-				  f"w={auto_crop[3]} h={auto_crop[4]} d={auto_crop[5]}", flush=True)
-			cfg = dataclasses.replace(data_cfg, crop=auto_crop)
-		else:
-			cfg = data_cfg
-		d = cli_data.load_fit_data(cfg)
-		fit_data.blur_3d(d, sigma=2.0)
-		print("[fit] blurred data sigma=2.0", flush=True)
+		d = fit_data.load_3d_for_model(
+			path=str(data_cfg.input), device=device, model=mdl,
+		)
 		Z, Y, X = d.size
 		volume_extent = (
 			d.origin_fullres[0],

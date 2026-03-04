@@ -1548,24 +1548,21 @@ void CWindow::onVisLasagnaObj(const std::string& segmentId)
     // Build request JSON
     QJsonObject request;
 
-    // Read model file and send as base64 for external; local path for internal
-    if (mgr.isExternal()) {
-        QFile modelFile(QString::fromStdString(modelPath.string()));
-        if (!modelFile.open(QIODevice::ReadOnly)) {
-            QMessageBox::warning(this, tr("Error"),
-                tr("Cannot read model file: %1").arg(QString::fromStdString(modelPath.string())));
-            return;
-        }
-        QByteArray modelBytes = modelFile.readAll();
-        modelFile.close();
-        request[QStringLiteral("model_data")] = QString::fromLatin1(modelBytes.toBase64());
-    } else {
-        request[QStringLiteral("model_input")] = QString::fromStdString(modelPath.string());
+    // Always read model file and send as base64 (server uses a tempdir)
+    QFile modelFile(QString::fromStdString(modelPath.string()));
+    if (!modelFile.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(this, tr("Error"),
+            tr("Cannot read model file: %1").arg(QString::fromStdString(modelPath.string())));
+        return;
     }
+    QByteArray modelBytes = modelFile.readAll();
+    modelFile.close();
+    request[QStringLiteral("model_data")] = QString::fromLatin1(modelBytes.toBase64());
 
     // data_input is extracted from the checkpoint's _fit_config_ on the Python side.
     // No need to send it explicitly.
 
+    // output_dir is where the client unpacks the results (not sent to server)
     request[QStringLiteral("output_dir")] = dlg.outputDir();
 
     QJsonArray slicesArr;

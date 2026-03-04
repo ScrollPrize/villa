@@ -384,7 +384,6 @@ public:
 private:
     // Session defaults (in-memory)
     static bool s_haveSession;
-    static QString s_outputDir;
     static bool s_xy, s_xz, s_yz;
     static bool s_cos, s_gradMag;
     static bool s_lDir, s_lStep, s_lSmooth, s_lWinding, s_lNormal;

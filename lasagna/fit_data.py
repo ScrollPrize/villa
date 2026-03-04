@@ -72,6 +72,61 @@ class FitData3D:
 		)
 
 
+def auto_crop_for_mesh(
+	mesh_bbox: tuple[float, float, float, float, float, float],
+	volume_extent_fullres: tuple[int, int, int],
+	margin: float = 3.0,
+) -> tuple[int, int, int, int, int, int]:
+	"""Compute crop = margin x mesh extent, centered on mesh, clamped to volume.
+
+	Returns (x0, y0, z0, w, h, d) in fullres voxels.
+	"""
+	x_min, y_min, z_min, x_max, y_max, z_max = mesh_bbox
+	vol_x, vol_y, vol_z = volume_extent_fullres
+
+	cx = (x_min + x_max) / 2.0
+	cy = (y_min + y_max) / 2.0
+	cz = (z_min + z_max) / 2.0
+
+	ex = max((x_max - x_min) * margin / 2.0, 100.0)
+	ey = max((y_max - y_min) * margin / 2.0, 100.0)
+	ez = max((z_max - z_min) * margin / 2.0, 100.0)
+
+	x0 = max(0, int(cx - ex))
+	y0 = max(0, int(cy - ey))
+	z0 = max(0, int(cz - ez))
+	x1 = min(vol_x, int(cx + ex))
+	y1 = min(vol_y, int(cy + ey))
+	z1 = min(vol_z, int(cz + ez))
+
+	return (x0, y0, z0, x1 - x0, y1 - y0, z1 - z0)
+
+
+def load_3d_for_model(
+	*, path: str, device: torch.device, model: object,
+	blur_sigma: float = 2.0,
+) -> FitData3D:
+	"""Load 3D data auto-cropped around model mesh bbox. Optionally blurs."""
+	scaledown = float(model.params.scaledown)
+	with torch.no_grad():
+		xyz = model._grid_xyz()
+		mesh_bbox = (xyz[..., 0].min().item(), xyz[..., 1].min().item(), xyz[..., 2].min().item(),
+					 xyz[..., 0].max().item(), xyz[..., 1].max().item(), xyz[..., 2].max().item())
+	print(f"[fit_data] mesh bbox: "
+		  f"min=({mesh_bbox[0]:.0f},{mesh_bbox[1]:.0f},{mesh_bbox[2]:.0f}) "
+		  f"max=({mesh_bbox[3]:.0f},{mesh_bbox[4]:.0f},{mesh_bbox[5]:.0f})", flush=True)
+	prep = get_preprocessed_params(path)
+	crop = auto_crop_for_mesh(mesh_bbox, prep["volume_extent_fullres"]) if prep else None
+	if crop is not None:
+		print(f"[fit_data] auto-crop: x={crop[0]} y={crop[1]} z={crop[2]} "
+			  f"w={crop[3]} h={crop[4]} d={crop[5]}", flush=True)
+	data = load_3d(path=path, device=device, downscale=scaledown, crop=crop)
+	if blur_sigma > 0:
+		blur_3d(data, sigma=blur_sigma)
+		print(f"[fit_data] blurred data sigma={blur_sigma}", flush=True)
+	return data
+
+
 def blur_3d(data: FitData3D, sigma: float) -> None:
 	"""Apply separable 3D Gaussian blur in-place to all data channels.
 

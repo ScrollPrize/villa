@@ -128,5 +128,6 @@ private:
     QString _lastError;
     bool _serviceReady{false};
     bool _optimizationRunning{false};
-    QString _localOutputDir;  // where to unpack results
+    QString _localOutputDir;  // where to unpack optimization results
+    QString _visOutputDir;    // where to unpack vis export results
 };
