@@ -1,5 +1,5 @@
 import os.path as osp
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 
 import segmentation_models_pytorch as smp
 import torch
@@ -163,7 +163,18 @@ def _infer_encoder_dims(backbone):
 
 
 def _build_stitch_manager(stitch_cfg):
-    return StitchManager(**asdict(stitch_cfg))
+    if isinstance(stitch_cfg, dict):
+        payload = dict(stitch_cfg)
+    elif is_dataclass(stitch_cfg):
+        payload = asdict(stitch_cfg)
+    elif hasattr(stitch_cfg, "__dict__"):
+        payload = dict(vars(stitch_cfg))
+    else:
+        raise TypeError(
+            "stitch_cfg must be a dict/dataclass/object with attributes, "
+            f"got {type(stitch_cfg).__name__}"
+        )
+    return StitchManager(**payload)
 
 
 def initialize_regression_state(model, *, model_cfg, objective_cfg, stitch_cfg):
@@ -239,4 +250,3 @@ def initialize_regression_state(model, *, model_cfg, objective_cfg, stitch_cfg):
             model.normalization = nn.BatchNorm3d(num_features=1)
 
     model._stitcher = _build_stitch_manager(stitch_cfg)
-

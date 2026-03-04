@@ -1,6 +1,5 @@
 """Modeling helpers for train_resnet3d.
 
-- `model_config`: grouped config dataclasses + builders
 - `group_dro`: GroupDRO objective helper
 - `losses`: reusable loss utilities
 - `architecture`: decoder/norm helpers
@@ -10,7 +9,6 @@
 """
 
 __all__ = [
-    "model_config",
     "group_dro",
     "losses",
     "architecture",
