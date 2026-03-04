@@ -1,13 +1,13 @@
 #pragma once
 
 #include "ViewerOverlayControllerBase.hpp"
-#include "../CSurfaceCollection.hpp"
-
 #include <memory>
 #include <optional>
 
 #include <opencv2/core.hpp>
 
+struct POI;
+class CState;
 class QuadSurface;
 
 // Overlay controller that displays the raw surface grid points
@@ -22,7 +22,7 @@ class RawPointsOverlayController : public ViewerOverlayControllerBase
     Q_OBJECT
 
 public:
-    explicit RawPointsOverlayController(CSurfaceCollection* surfaces, QObject* parent = nullptr);
+    explicit RawPointsOverlayController(CState* state, QObject* parent = nullptr);
     ~RawPointsOverlayController() override;
 
     // Enable/disable the overlay
@@ -52,8 +52,8 @@ public:
     [[nodiscard]] float pointOpacity() const { return _pointOpacity; }
 
 protected:
-    bool isOverlayEnabledFor(CVolumeViewer* viewer) const override;
-    void collectPrimitives(CVolumeViewer* viewer, OverlayBuilder& builder) override;
+    bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
+    void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 
 private slots:
     void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surface);
@@ -64,16 +64,16 @@ private:
     std::optional<std::pair<int, int>> focusGridPosition(QuadSurface* surface) const;
 
     // Collect points for flattened (segmentation) view
-    void collectFlattenedViewPoints(CVolumeViewer* viewer,
+    void collectFlattenedViewPoints(VolumeViewerBase* viewer,
                                     QuadSurface* surface,
                                     OverlayBuilder& builder);
 
     // Collect points for plane (XY/XZ/YZ) view
-    void collectPlaneViewPoints(CVolumeViewer* viewer,
+    void collectPlaneViewPoints(VolumeViewerBase* viewer,
                                 QuadSurface* surface,
                                 OverlayBuilder& builder);
 
-    CSurfaceCollection* _surfaces{nullptr};
+    CState* _state{nullptr};
     bool _enabled{false};
     int _maxPoints{2000};
     int _gridRadius{50};  // Grid steps from POI for flattened view

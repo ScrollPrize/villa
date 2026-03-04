@@ -191,6 +191,12 @@ TieredChunkCache::TieredChunkCache(
                 }
 
                 // Notify listeners (e.g., to trigger UI refresh).
+                // NOTE (Issue 32): The debounce flag means only the first chunk
+                // to arrive after clearChunkArrivedFlag() triggers callbacks.
+                // The `key` passed to callbacks is therefore just one of potentially
+                // many chunks that arrived — callers should not treat it as an
+                // exhaustive list. The key.level field is still useful for coarsest-
+                // level pin progress tracking.
                 if (!chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
                     std::lock_guard cbLock(callbackMutex_);
                     for (const auto& [id, cb] : chunkReadyListeners_) {

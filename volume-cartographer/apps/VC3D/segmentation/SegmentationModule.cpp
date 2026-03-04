@@ -1,8 +1,8 @@
 #include "SegmentationModule.hpp"
 
-#include "CVolumeViewer.hpp"
+#include "tiled/CTiledVolumeViewer.hpp"
 #include "CVolumeViewerView.hpp"
-#include "CSurfaceCollection.hpp"
+#include "CState.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
 #include "tools/SegmentationLineTool.hpp"
@@ -69,7 +69,7 @@ void SegmentationModule::DragState::reset()
     moved = false;
 }
 
-void SegmentationModule::HoverState::set(int r, int c, const cv::Vec3f& w, CVolumeViewer* v)
+void SegmentationModule::HoverState::set(int r, int c, const cv::Vec3f& w, CTiledVolumeViewer* v)
 {
     valid = true;
     row = r;
@@ -90,7 +90,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
                                        SegmentationEditManager* editManager,
                                        SegmentationOverlayController* overlay,
                                        ViewerManager* viewerManager,
-                                       CSurfaceCollection* surfaces,
+                                       CState* state,
                                        VCCollection* pointCollection,
                                        bool editingEnabled,
                                        QObject* parent)
@@ -99,7 +99,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     , _editManager(editManager)
     , _overlay(overlay)
     , _viewerManager(viewerManager)
-    , _surfaces(surfaces)
+    , _state(state)
     , _pointCollection(pointCollection)
     , _editingEnabled(editingEnabled)
     , _growthMethod(_widget ? _widget->growthMethod() : SegmentationGrowthMethod::Tracer)
@@ -134,8 +134,8 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         }
     }
 
-    _lineTool = std::make_unique<SegmentationLineTool>(*this, _editManager, _surfaces, _smoothStrength, _smoothIterations);
-    _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _widget, _overlay, _surfaces);
+    _lineTool = std::make_unique<SegmentationLineTool>(*this, _editManager, _state, _smoothStrength, _smoothIterations);
+    _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _widget, _overlay, _state);
     _pushPullTool->setStepMultiplier(initialPushPullStep);
     _pushPullTool->setAlphaConfig(initialAlphaConfig);
 
@@ -164,8 +164,8 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _viewerManager->setSegmentationModule(this);
     }
 
-    if (_surfaces) {
-        connect(_surfaces, &CSurfaceCollection::sendSurfaceChanged,
+    if (_state) {
+        connect(_state, &CState::surfaceChanged,
                 this, &SegmentationModule::onSurfaceCollectionChanged);
     }
 
@@ -220,7 +220,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     updateAutosaveState();
 }
 
-void SegmentationModule::setRotationHandleHitTester(std::function<bool(CVolumeViewer*, const cv::Vec3f&)> tester)
+void SegmentationModule::setRotationHandleHitTester(std::function<bool(CTiledVolumeViewer*, const cv::Vec3f&)> tester)
 {
     _rotationHandleHitTester = std::move(tester);
 }
@@ -265,7 +265,7 @@ bool SegmentationModule::ensureHoverTarget()
     if (!_hoverPointer.valid) {
         return false;
     }
-    CVolumeViewer* viewer = _hoverPointer.viewer.data();
+    CTiledVolumeViewer* viewer = _hoverPointer.viewer.data();
     if (!viewer) {
         _hoverPointer.valid = false;
         return false;
@@ -388,32 +388,32 @@ void SegmentationModule::bindWidgetSignals()
             });
 }
 
-void SegmentationModule::bindViewerSignals(CVolumeViewer* viewer)
+void SegmentationModule::bindViewerSignals(CTiledVolumeViewer* viewer)
 {
     if (!viewer || viewer->property("vc_segmentation_bound").toBool()) {
         return;
     }
 
-    connect(viewer, &CVolumeViewer::sendMousePressVolume,
+    connect(viewer, &CTiledVolumeViewer::sendMousePressVolume,
             this, [this, viewer](const cv::Vec3f& worldPos,
                                  const cv::Vec3f& normal,
                                  Qt::MouseButton button,
                                  Qt::KeyboardModifiers modifiers) {
                 handleMousePress(viewer, worldPos, normal, button, modifiers);
             });
-    connect(viewer, &CVolumeViewer::sendMouseMoveVolume,
+    connect(viewer, &CTiledVolumeViewer::sendMouseMoveVolume,
             this, [this, viewer](const cv::Vec3f& worldPos,
                                  Qt::MouseButtons buttons,
                                  Qt::KeyboardModifiers modifiers) {
                 handleMouseMove(viewer, worldPos, buttons, modifiers);
             });
-    connect(viewer, &CVolumeViewer::sendMouseReleaseVolume,
+    connect(viewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
             this, [this, viewer](const cv::Vec3f& worldPos,
                                  Qt::MouseButton button,
                                  Qt::KeyboardModifiers modifiers) {
                 handleMouseRelease(viewer, worldPos, button, modifiers);
             });
-    connect(viewer, &CVolumeViewer::sendSegmentationRadiusWheel,
+    connect(viewer, &CTiledVolumeViewer::sendSegmentationRadiusWheel,
             this, [this, viewer](int steps, const QPointF& scenePoint, const cv::Vec3f& worldPos) {
                 handleWheel(viewer, steps, scenePoint, worldPos);
             });
@@ -423,7 +423,7 @@ void SegmentationModule::bindViewerSignals(CVolumeViewer* viewer)
     _attachedViewers.insert(viewer);
 }
 
-void SegmentationModule::attachViewer(CVolumeViewer* viewer)
+void SegmentationModule::attachViewer(CTiledVolumeViewer* viewer)
 {
     bindViewerSignals(viewer);
     updateViewerCursors();
@@ -490,9 +490,9 @@ void SegmentationModule::setShowApprovalMask(bool enabled)
         if (_editManager && _editManager->hasSession()) {
             qCInfo(lcSegModule) << "  Loading approval mask (has active session)";
             surface = _editManager->baseSurface().get();
-        } else if (_surfaces) {
+        } else if (_state) {
             qCInfo(lcSegModule) << "  Loading approval mask (from surfaces collection)";
-            surfaceHolder = _surfaces->surface("segmentation");
+            surfaceHolder = _state->surface("segmentation");
             surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
         }
 
@@ -621,8 +621,8 @@ void SegmentationModule::setEditApprovedMask(bool enabled)
             // the most up-to-date approval mask (preserved after tracer growth)
             QuadSurface* surface = nullptr;
             std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
-            if (_surfaces) {
-                surfaceHolder = _surfaces->surface("segmentation");
+            if (_state) {
+                surfaceHolder = _state->surface("segmentation");
                 surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
             }
             if (!surface && _editManager && _editManager->hasSession()) {
@@ -683,8 +683,8 @@ void SegmentationModule::setEditUnapprovedMask(bool enabled)
             // the most up-to-date approval mask (preserved after tracer growth)
             QuadSurface* surface = nullptr;
             std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
-            if (_surfaces) {
-                surfaceHolder = _surfaces->surface("segmentation");
+            if (_state) {
+                surfaceHolder = _state->surface("segmentation");
                 surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
             }
             if (!surface && _editManager && _editManager->hasSession()) {
@@ -767,7 +767,7 @@ std::vector<std::pair<int, int>> SegmentationModule::filterVerticesForAutoApprov
             const int dr = edit.row - dragCenter->first;
             const int dc = edit.col - dragCenter->second;
             const float gridDistSq = static_cast<float>(dr * dr + dc * dc);
-            if (gridDistSq > autoApprovalMaxDistanceSq) {
+            if (gridDistSq > _autoApprovalMaxDistance * _autoApprovalMaxDistance) {
                 continue;
             }
         }
@@ -800,8 +800,8 @@ void SegmentationModule::saveApprovalMaskToDisk()
     std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
     if (_editManager && _editManager->hasSession()) {
         surface = _editManager->baseSurface().get();
-    } else if (_surfaces) {
-        surfaceHolder = _surfaces->surface("segmentation");
+    } else if (_state) {
+        surfaceHolder = _state->surface("segmentation");
         surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
     }
 
@@ -929,9 +929,9 @@ void SegmentationModule::applyEdits()
     }
 
     _editManager->applyPreview();
-    if (_surfaces) {
+    if (_state) {
         auto preview = _editManager->previewSurface();
-        _surfaces->setSurface("segmentation", preview, false, true);
+        _state->setSurface("segmentation", preview, false, true);
     }
     emitPendingChanges();
     markAutosaveNeeded(true);
@@ -949,8 +949,8 @@ void SegmentationModule::resetEdits()
     cancelDrag();
     clearLineDragStroke();
     _editManager->resetPreview();
-    if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
+    if (_state) {
+        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
     refreshOverlay();
     emitPendingChanges();
@@ -1050,8 +1050,8 @@ void SegmentationModule::refreshOverlay()
     std::shared_ptr<Surface> approvalSurfaceHolder;  // Keep surface alive during this scope
     if (hasSession && _editManager) {
         approvalSurface = _editManager->baseSurface().get();
-    } else if (_surfaces) {
-        approvalSurfaceHolder = _surfaces->surface("segmentation");
+    } else if (_state) {
+        approvalSurfaceHolder = _state->surface("segmentation");
         approvalSurface = dynamic_cast<QuadSurface*>(approvalSurfaceHolder.get());
     }
 
@@ -1240,7 +1240,7 @@ void SegmentationModule::pruneMissingCorrections()
     }
 }
 
-void SegmentationModule::beginCorrectionDrag(int row, int col, CVolumeViewer* viewer, const cv::Vec3f& worldPos)
+void SegmentationModule::beginCorrectionDrag(int row, int col, CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos)
 {
     _correctionDrag.active = true;
     _correctionDrag.anchorRow = row;
@@ -1444,7 +1444,7 @@ void SegmentationModule::clearLineDragStroke()
     }
 }
 
-bool SegmentationModule::isSegmentationViewer(const CVolumeViewer* viewer) const
+bool SegmentationModule::isSegmentationViewer(const CTiledVolumeViewer* viewer) const
 {
     if (!viewer) {
         return false;
@@ -1477,7 +1477,7 @@ float SegmentationModule::gridStepWorld() const
     return result;
 }
 
-void SegmentationModule::beginDrag(int row, int col, CVolumeViewer* viewer, const cv::Vec3f& worldPos)
+void SegmentationModule::beginDrag(int row, int col, CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos)
 {
     _drag.active = true;
     _drag.row = row;
@@ -1540,8 +1540,8 @@ void SegmentationModule::finishDrag()
         }
 
         _editManager->applyPreview();
-        if (_surfaces) {
-            _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        if (_state) {
+            _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
         }
         markAutosaveNeeded();
     }
@@ -1562,7 +1562,7 @@ void SegmentationModule::cancelDrag()
     emitPendingChanges();
 }
 
-bool SegmentationModule::isNearRotationHandle(CVolumeViewer* viewer, const cv::Vec3f& worldPos) const
+bool SegmentationModule::isNearRotationHandle(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos) const
 {
     if (!_rotationHandleHitTester || !viewer) {
         return false;
@@ -1629,7 +1629,7 @@ void SegmentationModule::resetHoverLookupDetail()
     _hoverLookup.lastWorld = cv::Vec3f(0.0f, 0.0f, 0.0f);
 }
 
-void SegmentationModule::recordPointerSample(CVolumeViewer* viewer, const cv::Vec3f& worldPos)
+void SegmentationModule::recordPointerSample(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos)
 {
     if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
         _hoverPointer.valid = false;
@@ -1654,7 +1654,7 @@ void SegmentationModule::recordPointerSample(CVolumeViewer* viewer, const cv::Ve
     _hoverPointer.world = worldPos;
 }
 
-void SegmentationModule::updateHover(CVolumeViewer* viewer, const cv::Vec3f& worldPos)
+void SegmentationModule::updateHover(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos)
 {
     bool hoverChanged = false;
 

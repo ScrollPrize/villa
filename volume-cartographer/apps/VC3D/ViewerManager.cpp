@@ -1,7 +1,7 @@
 #include "ViewerManager.hpp"
 
 #include "VCSettings.hpp"
-#include "CVolumeViewer.hpp"
+#include "tiled/CTiledVolumeViewer.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
 #include "overlays/RawPointsOverlayController.hpp"
@@ -10,11 +10,12 @@
 #include "overlays/VectorOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
 #include "segmentation/SegmentationModule.hpp"
-#include "CSurfaceCollection.hpp"
+#include "CState.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/Volume.hpp"
 
 #include <QMdiArea>
+#include <QThread>
 #include <QMdiSubWindow>
 #include <QSettings>
 #include <QtConcurrent/QtConcurrent>
@@ -30,24 +31,14 @@
 
 Q_LOGGING_CATEGORY(lcViewerManager, "vc.viewer.manager")
 
-namespace {
-struct CellRegion {
-    int rowStart = 0;
-    int rowEnd = 0;
-    int colStart = 0;
-    int colEnd = 0;
-};
 
-} // namespace
-
-ViewerManager::ViewerManager(CSurfaceCollection* surfaces,
+ViewerManager::ViewerManager(CState* state,
                              VCCollection* points,
-                             ChunkCache<uint8_t>* cache,
                              QObject* parent)
     : QObject(parent)
-    , _surfaces(surfaces)
+    , _state(state)
     , _points(points)
-    , _chunkCache(cache)
+    , _renderPool(std::clamp(QThread::idealThreadCount(), 2, 8), this)
 {
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -73,39 +64,38 @@ ViewerManager::ViewerManager(CSurfaceCollection* surfaces,
             this,
             &ViewerManager::handleSurfacePatchIndexPrimeFinished);
 
-    if (_surfaces) {
-        connect(_surfaces,
-                &CSurfaceCollection::sendSurfaceChanged,
+    if (_state) {
+        connect(_state,
+                &CState::surfaceChanged,
                 this,
                 &ViewerManager::handleSurfaceChanged);
-        connect(_surfaces,
-                &CSurfaceCollection::sendSurfaceWillBeDeleted,
+        connect(_state,
+                &CState::surfaceWillBeDeleted,
                 this,
                 &ViewerManager::handleSurfaceWillBeDeleted);
     }
 }
 
-CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
-                                           const QString& title,
-                                           QMdiArea* mdiArea)
+CTiledVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
+                                                const QString& title,
+                                                QMdiArea* mdiArea)
 {
-    if (!mdiArea || !_surfaces) {
+    if (!mdiArea || !_state) {
         return nullptr;
     }
 
-    auto* viewer = new CVolumeViewer(_surfaces, this, mdiArea);
+    auto* viewer = new CTiledVolumeViewer(_state, this, mdiArea);
     auto* win = mdiArea->addSubWindow(viewer);
     win->setWindowTitle(title);
     win->setWindowFlags(Qt::WindowTitleHint | Qt::WindowMinMaxButtonsHint);
     win->installEventFilter(viewer);
 
-    viewer->setCache(_chunkCache);
     viewer->setPointCollection(_points);
 
-    if (_surfaces) {
-        connect(_surfaces, &CSurfaceCollection::sendSurfaceChanged, viewer, &CVolumeViewer::onSurfaceChanged);
-        connect(_surfaces, &CSurfaceCollection::sendSurfaceWillBeDeleted, viewer, &CVolumeViewer::onSurfaceWillBeDeleted);
-        connect(_surfaces, &CSurfaceCollection::sendPOIChanged, viewer, &CVolumeViewer::onPOIChanged);
+    if (_state) {
+        connect(_state, &CState::surfaceChanged, viewer, &CTiledVolumeViewer::onSurfaceChanged);
+        connect(_state, &CState::surfaceWillBeDeleted, viewer, &CTiledVolumeViewer::onSurfaceWillBeDeleted);
+        connect(_state, &CState::poiChanged, viewer, &CTiledVolumeViewer::onPOIChanged);
     }
 
     // Restore persisted viewer preferences
@@ -130,24 +120,16 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
     viewer->setSegmentationEditActive(_segmentationEditActive);
     viewer->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
 
-    if (_segmentationOverlay) {
-        _segmentationOverlay->attachViewer(viewer);
-    }
+    _viewers.push_back(viewer);
 
-    if (_pointsOverlay) {
-        _pointsOverlay->attachViewer(viewer);
-    }
+    // Clean up when viewer is destroyed (e.g. MDI sub-window closed)
+    connect(viewer, &QObject::destroyed, this, [this, viewer]() {
+        _viewers.erase(std::remove(_viewers.begin(), _viewers.end(), viewer), _viewers.end());
+        _resetDefaults.erase(viewer);
+    });
 
-    if (_pathsOverlay) {
-        _pathsOverlay->attachViewer(viewer);
-    }
-
-    if (_bboxOverlay) {
-        _bboxOverlay->attachViewer(viewer);
-    }
-
-    if (_vectorOverlay) {
-        _vectorOverlay->attachViewer(viewer);
+    for (auto* overlay : _allOverlays) {
+        overlay->attachViewer(viewer);
     }
 
     viewer->setIntersectionOpacity(_intersectionOpacity);
@@ -159,7 +141,6 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
     viewer->setOverlayColormap(_overlayColormapId);
     viewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
 
-    _viewers.push_back(viewer);
     if (_segmentationModule) {
         _segmentationModule->attachViewer(viewer);
     }
@@ -167,23 +148,28 @@ CVolumeViewer* ViewerManager::createViewer(const std::string& surfaceName,
     return viewer;
 }
 
+void ViewerManager::registerOverlay(ViewerOverlayControllerBase* overlay)
+{
+    if (!overlay) {
+        return;
+    }
+    if (std::find(_allOverlays.begin(), _allOverlays.end(), overlay) != _allOverlays.end()) {
+        return;
+    }
+    _allOverlays.push_back(overlay);
+    overlay->bindToViewerManager(this);
+}
+
 void ViewerManager::setSegmentationOverlay(SegmentationOverlayController* overlay)
 {
     _segmentationOverlay = overlay;
-    if (!_segmentationOverlay) {
-        return;
-    }
-    _segmentationOverlay->bindToViewerManager(this);
+    registerOverlay(overlay);
 }
 
 void ViewerManager::setSegmentationEditActive(bool active)
 {
     _segmentationEditActive = active;
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            viewer->setSegmentationEditActive(active);
-        }
-    }
+    forEachViewer([active](CTiledVolumeViewer* v) { v->setSegmentationEditActive(active); });
 }
 
 void ViewerManager::setSegmentationModule(SegmentationModule* module)
@@ -193,54 +179,37 @@ void ViewerManager::setSegmentationModule(SegmentationModule* module)
         return;
     }
 
-    for (auto* viewer : _viewers) {
-        _segmentationModule->attachViewer(viewer);
-    }
+    forEachViewer([this](CTiledVolumeViewer* v) { _segmentationModule->attachViewer(v); });
 }
 
 void ViewerManager::setPointsOverlay(PointsOverlayController* overlay)
 {
     _pointsOverlay = overlay;
-    if (!_pointsOverlay) {
-        return;
-    }
-    _pointsOverlay->bindToViewerManager(this);
+    registerOverlay(overlay);
 }
 
 void ViewerManager::setRawPointsOverlay(RawPointsOverlayController* overlay)
 {
     _rawPointsOverlay = overlay;
-    if (!_rawPointsOverlay) {
-        return;
-    }
-    _rawPointsOverlay->bindToViewerManager(this);
+    registerOverlay(overlay);
 }
 
 void ViewerManager::setPathsOverlay(PathsOverlayController* overlay)
 {
     _pathsOverlay = overlay;
-    if (!_pathsOverlay) {
-        return;
-    }
-    _pathsOverlay->bindToViewerManager(this);
+    registerOverlay(overlay);
 }
 
 void ViewerManager::setBBoxOverlay(BBoxOverlayController* overlay)
 {
     _bboxOverlay = overlay;
-    if (!_bboxOverlay) {
-        return;
-    }
-    _bboxOverlay->bindToViewerManager(this);
+    registerOverlay(overlay);
 }
 
 void ViewerManager::setVectorOverlay(VectorOverlayController* overlay)
 {
     _vectorOverlay = overlay;
-    if (!_vectorOverlay) {
-        return;
-    }
-    _vectorOverlay->bindToViewerManager(this);
+    registerOverlay(overlay);
 }
 
 void ViewerManager::setVolumeOverlay(VolumeOverlayController* overlay)
@@ -259,11 +228,7 @@ void ViewerManager::setIntersectionOpacity(float opacity)
     settings.setValue(vc3d::settings::viewer::INTERSECTION_OPACITY,
                       static_cast<int>(std::lround(_intersectionOpacity * 100.0f)));
 
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            viewer->setIntersectionOpacity(_intersectionOpacity);
-        }
-    }
+    forEachViewer([this](CTiledVolumeViewer* v) { v->setIntersectionOpacity(_intersectionOpacity); });
 }
 
 void ViewerManager::setIntersectionThickness(float thickness)
@@ -277,31 +242,19 @@ void ViewerManager::setIntersectionThickness(float thickness)
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::INTERSECTION_THICKNESS, _intersectionThickness);
 
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            viewer->setIntersectionThickness(_intersectionThickness);
-        }
-    }
+    forEachViewer([this](CTiledVolumeViewer* v) { v->setIntersectionThickness(_intersectionThickness); });
 }
 
 void ViewerManager::setHighlightedSurfaceIds(const std::vector<std::string>& ids)
 {
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            viewer->setHighlightedSurfaceIds(ids);
-        }
-    }
+    forEachViewer([&ids](CTiledVolumeViewer* v) { v->setHighlightedSurfaceIds(ids); });
 }
 
 void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId)
 {
     _overlayVolume = std::move(volume);
     _overlayVolumeId = volumeId;
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            viewer->setOverlayVolume(_overlayVolume);
-        }
-    }
+    forEachViewer([this](CTiledVolumeViewer* v) { v->setOverlayVolume(_overlayVolume); });
 
     emit overlayVolumeAvailabilityChanged(static_cast<bool>(_overlayVolume));
 }
@@ -309,21 +262,13 @@ void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::
 void ViewerManager::setOverlayOpacity(float opacity)
 {
     _overlayOpacity = std::clamp(opacity, 0.0f, 1.0f);
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            viewer->setOverlayOpacity(_overlayOpacity);
-        }
-    }
+    forEachViewer([this](CTiledVolumeViewer* v) { v->setOverlayOpacity(_overlayOpacity); });
 }
 
 void ViewerManager::setOverlayColormap(const std::string& colormapId)
 {
     _overlayColormapId = colormapId;
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            viewer->setOverlayColormap(_overlayColormapId);
-        }
-    }
+    forEachViewer([this](CTiledVolumeViewer* v) { v->setOverlayColormap(_overlayColormapId); });
 }
 
 void ViewerManager::setOverlayThreshold(float threshold)
@@ -353,11 +298,7 @@ void ViewerManager::setOverlayWindow(float low, float high)
         _volumeOverlay->syncWindowFromManager(_overlayWindowLow, _overlayWindowHigh);
     }
 
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            viewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
-        }
-    }
+    forEachViewer([this](CTiledVolumeViewer* v) { v->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh); });
 
     emit overlayWindowChanged(_overlayWindowLow, _overlayWindowHigh);
 }
@@ -384,11 +325,7 @@ void ViewerManager::setVolumeWindow(float low, float high)
     settings.setValue(vc3d::settings::viewer::BASE_WINDOW_LOW, _volumeWindowLow);
     settings.setValue(vc3d::settings::viewer::BASE_WINDOW_HIGH, _volumeWindowHigh);
 
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            viewer->setVolumeWindow(_volumeWindowLow, _volumeWindowHigh);
-        }
-    }
+    forEachViewer([this](CTiledVolumeViewer* v) { v->setVolumeWindow(_volumeWindowLow, _volumeWindowHigh); });
 
     emit volumeWindowChanged(_volumeWindowLow, _volumeWindowHigh);
 }
@@ -412,11 +349,7 @@ void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated
         _indexedSurfaceIds.clear();
     }
 
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            viewer->setSurfacePatchSamplingStride(_surfacePatchSamplingStride);
-        }
-    }
+    forEachViewer([this](CTiledVolumeViewer* v) { v->setSurfacePatchSamplingStride(_surfacePatchSamplingStride); });
 
     emit samplingStrideChanged(_surfacePatchSamplingStride);
 }
@@ -510,10 +443,10 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     if (_surfacePatchIndexWatcher->isRunning()) {
         _surfacePatchIndexWatcher->waitForFinished();
     }
-    if (!_surfaces) {
+    if (!_state) {
         return;
     }
-    auto allSurfaces = _surfaces->surfaces();
+    auto allSurfaces = _state->surfaces();
     std::vector<SurfacePatchIndex::SurfacePtr> quadSurfaces;
     std::vector<std::string> surfaceIds;
     quadSurfaces.reserve(allSurfaces.size());
@@ -564,7 +497,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
 
     // Clear any surfaces queued from a previous rebuild cycle
     _surfacesQueuedDuringRebuildIds.clear();
-    _surfacesQueuedForRemovalDuringRebuildIds.clear();
+    _surfacesQueuedForRemovalDuringRebuild.clear();
 
     // Build task captures shared_ptrs - surfaces stay alive throughout async operation
     const int stride = _surfacePatchSamplingStride;
@@ -584,7 +517,7 @@ void ViewerManager::rebuildSurfacePatchIndexIfNeeded()
     }
     _surfacePatchIndexNeedsRebuild = false;
 
-    if (!_surfaces) {
+    if (!_state) {
         _surfacePatchIndex.clear();
         _indexedSurfaceIds.clear();
         qCInfo(lcViewerManager) << "SurfacePatchIndex cleared (no surface collection)";
@@ -595,7 +528,7 @@ void ViewerManager::rebuildSurfacePatchIndexIfNeeded()
     std::vector<std::string> surfaceIds;
     // Track seen surfaces to avoid duplicates (e.g., "segmentation" alias)
     std::unordered_set<SurfacePatchIndex::SurfacePtr> seenSurfaces;
-    for (const auto& surf : _surfaces->surfaces()) {
+    for (const auto& surf : _state->surfaces()) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
             if (seenSurfaces.insert(quad).second) {
                 surfaces.push_back(quad);
@@ -633,20 +566,20 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     _indexedSurfaceIds.insert(_pendingSurfacePatchIndexSurfaceIds.begin(),
                               _pendingSurfacePatchIndexSurfaceIds.end());
 
-    // Process any surfaces that were removed during the async rebuild
-    for (const std::string& idToRemove : _surfacesQueuedForRemovalDuringRebuildIds) {
-        // Look up the surface by ID to remove from index
-        auto surf = _surfaces ? _surfaces->surface(idToRemove) : nullptr;
+    // Process any surfaces that were removed during the async rebuild.
+    // We stored the shared_ptr at queue time since the surface may no longer
+    // be available by ID lookup after deletion.
+    for (const auto& [id, surf] : _surfacesQueuedForRemovalDuringRebuild) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
             _surfacePatchIndex.removeSurface(quad);
         }
-        _indexedSurfaceIds.erase(idToRemove);
+        _indexedSurfaceIds.erase(id);
     }
-    _surfacesQueuedForRemovalDuringRebuildIds.clear();
+    _surfacesQueuedForRemovalDuringRebuild.clear();
 
     // Merge any surfaces that were added during the async rebuild
     for (const std::string& queuedId : _surfacesQueuedDuringRebuildIds) {
-        auto surf = _surfaces ? _surfaces->surface(queuedId) : nullptr;
+        auto surf = _state ? _state->surface(queuedId) : nullptr;
         if (auto queued = std::dynamic_pointer_cast<QuadSurface>(surf)) {
             if (_surfacePatchIndex.updateSurface(queued)) {
                 _indexedSurfaceIds.insert(queuedId);
@@ -660,7 +593,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     qCInfo(lcViewerManager) << "Asynchronously rebuilt SurfacePatchIndex for"
                             << _indexedSurfaceIds.size() << "surfaces"
                             << "at stride" << _surfacePatchSamplingStride;
-    forEachViewer([](CVolumeViewer* v) { v->renderIntersections(); });
+    forEachViewer([](CTiledVolumeViewer* v) { v->renderIntersections(); });
 
     // Check if progressive refinement is needed
     if (_targetRefinedStride > 0 && _surfacePatchSamplingStride > _targetRefinedStride) {
@@ -674,8 +607,8 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
         // Collect current surfaces - shared_ptrs keep surfaces alive
         std::vector<SurfacePatchIndex::SurfacePtr> surfacesForTask;
         std::vector<std::string> surfaceIdsForTask;
-        if (_surfaces) {
-            for (const auto& surf : _surfaces->surfaces()) {
+        if (_state) {
+            for (const auto& surf : _state->surfaces()) {
                 if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
                     surfacesForTask.push_back(quad);
                     surfaceIdsForTask.push_back(surf->id);
@@ -782,26 +715,34 @@ void ViewerManager::handleSurfaceWillBeDeleted(std::string name, std::shared_ptr
         // Remove from indexed surface IDs
         _indexedSurfaceIds.erase(name);
 
-        // Remove from queued IDs
+        // Remove from queued-for-add IDs
         auto removeFromVector = [&name](std::vector<std::string>& vec) {
             vec.erase(std::remove(vec.begin(), vec.end(), name), vec.end());
         };
         removeFromVector(_pendingSurfacePatchIndexSurfaceIds);
         removeFromVector(_surfacesQueuedDuringRebuildIds);
-        removeFromVector(_surfacesQueuedForRemovalDuringRebuildIds);
 
-        // Remove from the R-tree index
+        // If an async rebuild is in progress, queue for removal from the new
+        // index when it completes. Store the shared_ptr so the surface stays
+        // alive for the R-tree removal even after CState drops it.
+        bool asyncRebuildInProgress = _surfacePatchIndexWatcher &&
+                                       _surfacePatchIndexWatcher->isRunning();
+        if (asyncRebuildInProgress) {
+            _surfacesQueuedForRemovalDuringRebuild.emplace_back(name, surf);
+        }
+
+        // Remove from the current R-tree index
         _surfacePatchIndex.removeSurface(quad);
     }
 }
 
-bool ViewerManager::resetDefaultFor(CVolumeViewer* viewer) const
+bool ViewerManager::resetDefaultFor(CTiledVolumeViewer* viewer) const
 {
     auto it = _resetDefaults.find(viewer);
     return it != _resetDefaults.end() ? it->second : true;
 }
 
-void ViewerManager::setResetDefaultFor(CVolumeViewer* viewer, bool value)
+void ViewerManager::setResetDefaultFor(CTiledVolumeViewer* viewer, bool value)
 {
     if (!viewer) {
         return;
@@ -812,11 +753,7 @@ void ViewerManager::setResetDefaultFor(CVolumeViewer* viewer, bool value)
 void ViewerManager::setSegmentationCursorMirroring(bool enabled)
 {
     _mirrorCursorToSegmentation = enabled;
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            viewer->setSegmentationCursorMirroring(enabled);
-        }
-    }
+    forEachViewer([enabled](CTiledVolumeViewer* v) { v->setSegmentationCursorMirroring(enabled); });
 }
 
 void ViewerManager::setSliceStepSize(int size)
@@ -824,12 +761,14 @@ void ViewerManager::setSliceStepSize(int size)
     _sliceStepSize = std::max(1, size);
 }
 
-void ViewerManager::forEachViewer(const std::function<void(CVolumeViewer*)>& fn) const
+void ViewerManager::forEachViewer(const std::function<void(CTiledVolumeViewer*)>& fn) const
 {
     if (!fn) {
         return;
     }
     for (auto* viewer : _viewers) {
-        fn(viewer);
+        if (viewer) {
+            fn(viewer);
+        }
     }
 }

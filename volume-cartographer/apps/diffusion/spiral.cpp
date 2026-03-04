@@ -20,10 +20,6 @@
 #include <opencv2/ximgproc.hpp>
 
 #include <xtensor/containers/xarray.hpp>
-#include "z5/factory.hxx"
-#include "z5/filesystem/handle.hxx"
-#include "z5/common.hxx"
-#include "z5/multiarray/xtensor_access.hxx"
 
 #include "vc/core/util/GridStore.hpp"
 #include "vc/ui/VCCollection.hpp"

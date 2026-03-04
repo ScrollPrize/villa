@@ -1,5 +1,4 @@
 #include "CVolumeViewerView.hpp"
-#include "CVolumeViewer.hpp"
 
 #include <QGraphicsView>
 #include <QMouseEvent>
@@ -26,55 +25,50 @@ void CVolumeViewerView::drawForeground(QPainter* p, const QRectF& sceneRect)
     QGraphicsView::drawForeground(p, sceneRect);
 
     // 2) Scalebar overlay, in **viewport** coords so it never moves
-    p->save();
-    // reset any scene→view transform so we draw in raw pixels
-    p->resetTransform();
-    p->setRenderHint(QPainter::Antialiasing);
-
-    // red, 2px pen
-    QPen pen(Qt::red, 2);
-    p->setPen(pen);
-
-    // font (scaled for HiDPI)
-    QFont f = p->font();
-    f.setPointSizeF(12 * devicePixelRatioF());
-    p->setFont(f);
-
-    constexpr int M = 10;  // margin in px
-    // transform: scene units → view pixels
-    QTransform t = transform();
     const double dpr = devicePixelRatioF();
+    const double m11 = transform().m11();
+    const int vpW = viewport()->width();
+    const int vpH = viewport()->height();
 
-    // 1) how many device-px per scene‐unit
-    double pxPerScene = transform().m11() * dpr;
+    // Recompute cached scalebar only when inputs change
+    if (_cachedM11 != m11 || _cachedDpr != dpr || _cachedVpW != vpW ||
+        _cachedVpH != vpH || _cachedVx != m_vx || _scalebarCacheDirty) {
+        _cachedM11 = m11;
+        _cachedDpr = dpr;
+        _cachedVpW = vpW;
+        _cachedVpH = vpH;
+        _cachedVx = m_vx;
+        _scalebarCacheDirty = false;
 
-    // 2) how many device-px in the viewport
-    double wPx = viewport()->width() * dpr;
+        _cachedFont = p->font();
+        _cachedFont.setPointSizeF(12 * dpr);
 
-    // 3) device-px per µm
-    double pxPerUm = pxPerScene / m_vx;
+        double pxPerScene = m11 * dpr;
+        double pxPerUm = pxPerScene / m_vx;
+        double wPx = vpW * dpr;
+        double wUm = wPx / pxPerUm;
+        double barUm = chooseNiceLength(wUm / 4.0);
+        _cachedBarPx = barUm * pxPerUm;
 
-    // now compute the physical width in µm …
-    double wUm   = wPx / pxPerUm;
-    double ideal = wUm / 4.0;
-    double barUm = chooseNiceLength(ideal);
-    double barPx = barUm * pxPerUm;
-
-    // decide on unit and display value
-    double displayLength = barUm;
-    QString unit = QStringLiteral(" µm");
-    if (barUm >= 1000.0) {
-        displayLength = barUm / 1000.0;      // convert to mm
-        unit = QStringLiteral(" mm");
+        double displayLength = barUm;
+        QString unit = QStringLiteral(" µm");
+        if (barUm >= 1000.0) {
+            displayLength = barUm / 1000.0;
+            unit = QStringLiteral(" mm");
+        }
+        _cachedBarLabel = QString::number(displayLength) + unit;
     }
 
-    // draw the line (in pixels)
-    p->drawLine(int(M), int(viewport()->height()*dpr) - M, 
-                int(M + barPx), int(viewport()->height()*dpr) - M);
+    p->save();
+    p->resetTransform();
+    p->setRenderHint(QPainter::Antialiasing);
+    p->setPen(QPen(Qt::red, 2));
+    p->setFont(_cachedFont);
 
-    // draw the label
-    QString label = QString::number(displayLength) + unit;
-    p->drawText(int(M), int(viewport()->height()*dpr) - M - 5, label);
+    constexpr int M = 10;
+    int bottom = static_cast<int>(vpH * dpr) - M;
+    p->drawLine(M, bottom, static_cast<int>(M + _cachedBarPx), bottom);
+    p->drawText(M, bottom - 5, _cachedBarLabel);
     p->restore();
 }
 
@@ -155,8 +149,22 @@ void CVolumeViewerView::mouseReleaseEvent(QMouseEvent *event)
 
 void CVolumeViewerView::keyPressEvent(QKeyEvent *event)
 {
-    // Key handling moved to global QShortcut objects in CWindow
-    // Pass the event to the base class
+    // When scroll-pan is disabled (tiled renderer), block arrow keys from
+    // reaching QGraphicsView's built-in scroll handler.  They'll be handled
+    // via sendKeyRelease → onKeyRelease in CTiledVolumeViewer instead.
+    if (_scrollPanDisabled) {
+        switch (event->key()) {
+        case Qt::Key_Left:
+        case Qt::Key_Right:
+        case Qt::Key_Up:
+        case Qt::Key_Down:
+            event->accept();
+            return;
+        default:
+            break;
+        }
+    }
+
     QGraphicsView::keyPressEvent(event);
 }
 
@@ -219,28 +227,27 @@ void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
 {
     if (_regular_pan)
     {
-        QPoint scroll = _last_pan_position - QPoint(event->position().x(), event->position().y());
-        
-        int x = horizontalScrollBar()->value() + scroll.x();
-        horizontalScrollBar()->setValue(x);
-        int y = verticalScrollBar()->value() + scroll.y();
-        verticalScrollBar()->setValue(y);
-        
+        if (!_scrollPanDisabled) {
+            QPoint scroll = _last_pan_position - QPoint(event->position().x(), event->position().y());
+
+            int x = horizontalScrollBar()->value() + scroll.x();
+            horizontalScrollBar()->setValue(x);
+            int y = verticalScrollBar()->value() + scroll.y();
+            verticalScrollBar()->setValue(y);
+        }
+
         _last_pan_position = QPoint(event->position().x(), event->position().y());
         event->accept();
-        return;
     }
-    else {
-        QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
-        QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
-        
-        sendCursorMove(scene_loc);
 
-        // Forward mouse move events even without a pressed button so tools that
-        // rely on hover state (e.g. segmentation editing) receive continuous
-        // volume coordinates. Consumers that only care about drags can still
-        // ignore events where no buttons are pressed.
-        sendMouseMove(scene_loc, event->buttons(), event->modifiers());
-    }
-    event->ignore();
+    QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
+    QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
+
+    sendCursorMove(scene_loc);
+
+    // Forward mouse move events even without a pressed button so tools that
+    // rely on hover state (e.g. segmentation editing) receive continuous
+    // volume coordinates. Consumers that only care about drags can still
+    // ignore events where no buttons are pressed.
+    sendMouseMove(scene_loc, event->buttons(), event->modifiers());
 }

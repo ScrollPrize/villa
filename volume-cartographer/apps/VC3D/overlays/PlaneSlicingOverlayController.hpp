@@ -8,14 +8,14 @@
 #include <string>
 #include <unordered_map>
 
-class CSurfaceCollection;
+class CState;
 
 class PlaneSlicingOverlayController : public ViewerOverlayControllerBase
 {
     Q_OBJECT
 
 public:
-    explicit PlaneSlicingOverlayController(CSurfaceCollection* surfaces, QObject* parent = nullptr);
+    explicit PlaneSlicingOverlayController(CState* state, QObject* parent = nullptr);
 
     void setAxisAlignedEnabled(bool enabled);
     void setRotationSetter(std::function<void(const std::string&, float)> setter);
@@ -23,16 +23,16 @@ public:
     void setRotationFinishedCallback(std::function<void()> callback);
     float axisAlignedOverlayOpacity() const { return _overlayOpacity; }
 
-    bool isVolumePointNearRotationHandle(CVolumeViewer* viewer,
+    bool isVolumePointNearRotationHandle(VolumeViewerBase* viewer,
                                          const cv::Vec3f& volumePoint,
                                          qreal radiusScale = 1.5) const;
-    bool isScenePointNearRotationHandle(CVolumeViewer* viewer,
+    bool isScenePointNearRotationHandle(VolumeViewerBase* viewer,
                                         const QPointF& scenePoint,
                                         qreal radiusScale = 1.5) const;
 
 protected:
-    bool isOverlayEnabledFor(CVolumeViewer* viewer) const override;
-    void collectPrimitives(CVolumeViewer* viewer, OverlayBuilder& builder) override;
+    bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
+    void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 
 private:
     struct PlaneVisual {
@@ -54,40 +54,40 @@ private:
         QMetaObject::Connection destroyedConn;
     };
 
-    void installInteractions(CVolumeViewer* viewer, ViewerState& state);
-    void removeInteractions(CVolumeViewer* viewer);
+    void installInteractions(VolumeViewerBase* viewer, ViewerState& state);
+    void removeInteractions(VolumeViewerBase* viewer);
 
-    void handleMousePress(CVolumeViewer* viewer,
+    void handleMousePress(VolumeViewerBase* viewer,
                           const cv::Vec3f& volumePoint,
                           Qt::MouseButton button,
                           Qt::KeyboardModifiers modifiers);
-    void handleMouseMove(CVolumeViewer* viewer,
+    void handleMouseMove(VolumeViewerBase* viewer,
                          const cv::Vec3f& volumePoint,
                          Qt::MouseButtons buttons,
                          Qt::KeyboardModifiers modifiers);
-    void handleMouseRelease(CVolumeViewer* viewer,
+    void handleMouseRelease(VolumeViewerBase* viewer,
                             Qt::MouseButton button,
                             Qt::KeyboardModifiers modifiers);
 
-    ViewerState& ensureViewerState(CVolumeViewer* viewer);
-    void updateViewerState(CVolumeViewer* viewer,
+    ViewerState& ensureViewerState(VolumeViewerBase* viewer);
+    void updateViewerState(VolumeViewerBase* viewer,
                            ViewerState& state,
                            const std::string& planeName,
                            const PlaneVisual& visual);
-    void clearViewerState(CVolumeViewer* viewer);
+    void clearViewerState(VolumeViewerBase* viewer);
 
     static float normalizeDegrees(float degrees);
 
-    CSurfaceCollection* _surfaces{nullptr};
+    CState* _state{nullptr};
     bool _axisAlignedEnabled{false};
     std::function<void(const std::string&, float)> _rotationSetter;
     std::function<void()> _rotationFinishedCallback;
     float _overlayOpacity{0.7f};
 
-    mutable std::unordered_map<CVolumeViewer*, ViewerState> _viewerStates;
+    mutable std::unordered_map<VolumeViewerBase*, ViewerState> _viewerStates;
 
     struct ActiveDragState {
-        CVolumeViewer* viewer{nullptr};
+        VolumeViewerBase* viewer{nullptr};
         std::string planeName;
         bool positiveHandle{true};
     } _activeDrag;

@@ -16,8 +16,8 @@ function(vc_suppress_warnings dir)
     endforeach()
 endfunction()
 
-set(BUILD_Z5PY OFF CACHE BOOL "Disable Python bits for z5" FORCE)
-set(WITH_BLOSC ON  CACHE BOOL "Enable Blosc in z5"        FORCE)
+# ---- utils is now vendored in utils/ and added via add_subdirectory() ------
+# (see top-level CMakeLists.txt)
 
 # ---- xtl / xsimd / xtensor (chunk buffer type, used throughout) --------------
 set(XTENSOR_USE_XSIMD 1)
@@ -53,30 +53,6 @@ foreach(_target xtl xsimd xtensor)
         target_include_directories(${_target} SYSTEM INTERFACE ${_inc_dirs})
     endif()
 endforeach()
-
-# Point z5's find_package(xtensor) (and transitive deps) at FetchContent builds
-set(xtl_DIR     "${FETCHCONTENT_BASE_DIR}/xtl-build"     CACHE PATH "" FORCE)
-set(xsimd_DIR   "${FETCHCONTENT_BASE_DIR}/xsimd-build"   CACHE PATH "" FORCE)
-set(xtensor_DIR "${FETCHCONTENT_BASE_DIR}/xtensor-build" CACHE PATH "" FORCE)
-
-
-FetchContent_Declare(
-    z5
-    GIT_REPOSITORY https://github.com/constantinpape/z5.git
-    GIT_TAG        2.0.20
-)
-FetchContent_MakeAvailable(z5)
-
-# z5's CMakeLists uses include_directories() which doesn't propagate;
-# link xtensor onto the z5 INTERFACE target so consumers get the headers.
-target_link_libraries(z5 INTERFACE xtensor)
-
-# Mark z5 headers as SYSTEM to suppress warnings
-get_target_property(_z5_inc_dirs z5 INTERFACE_INCLUDE_DIRECTORIES)
-if(_z5_inc_dirs)
-    set_target_properties(z5 PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "")
-    target_include_directories(z5 SYSTEM INTERFACE ${_z5_inc_dirs})
-endif()
 
 # ---- Qt (apps / utils) -------------------------------------------------------
 find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent)

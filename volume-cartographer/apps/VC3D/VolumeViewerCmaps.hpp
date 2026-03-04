@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QImage>
 #include <QString>
 #include <opencv2/core.hpp>
 
@@ -17,7 +18,7 @@ struct OverlayColormapSpec
     QString label;
     OverlayColormapKind kind;
     int opencvCode;
-    cv::Vec3f tint; // B, G, R in [0,1]
+    cv::Vec3f tint; // R, G, B in [0,1]
 };
 
 struct OverlayColormapEntry
@@ -28,7 +29,11 @@ struct OverlayColormapEntry
 
 const std::vector<OverlayColormapSpec>& specs();
 const OverlayColormapSpec& resolve(const std::string& id);
-cv::Mat makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec);
+
+// Apply colormap and write directly into a QImage::Format_RGB32 buffer.
+// Avoids intermediate cv::Mat BGR and eliminates cvtColor conversions.
+QImage makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec);
+
 const std::vector<OverlayColormapEntry>& entries();
 
 } // namespace volume_viewer_cmaps

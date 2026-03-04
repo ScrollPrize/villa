@@ -1223,7 +1223,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                     const float approved_attach_relax = hr_attach_relax_factor;
 
                     for (auto& s : surfs) {
-                        auto ptr = s->pointer();
+                        cv::Vec3f ptr(0, 0, 0);
                         const bool is_locally_approved = approved_neighborhood.contains(s);
                         const float thr = remap_attach_surface_th * (is_locally_approved ? approved_attach_relax : 1.0f);
                         // use relaxed thr also inside pointTo
@@ -1249,7 +1249,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         float best_res = std::numeric_limits<float>::max();
                         cv::Vec3f best_loc_raw;
                         for (auto s : approved_neighborhood) {
-                            auto ptr = s->pointer();
+                            cv::Vec3f ptr(0, 0, 0);
                             float thr = remap_attach_surface_th * approved_attach_relax;
                             auto _t0 = std::chrono::steady_clock::now();
                             float res = s->pointTo(ptr, points_out(j, i), thr, point_to_max_iters, surface_patch_index); //
@@ -1323,7 +1323,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         }
                         mutex.unlock_shared();
 
-                        auto ptr = test_surf->pointer();
+                        cv::Vec3f ptr(0, 0, 0);
                         auto _t0 = std::chrono::steady_clock::now();
                         float _res = test_surf->pointTo(ptr, points_out(j, i), remap_attach_surface_th, point_to_max_iters, surface_patch_index);
                         double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
@@ -1655,7 +1655,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
         cv::Vec3f coord = points(p);
         std::cout << "testing " << p << " from cands: " << overlapping_map[seed].size() << coord << std::endl;
         for(auto s : overlapping_map[seed]) {
-            auto ptr = s->pointer();
+            cv::Vec3f ptr(0, 0, 0);
             auto _t0 = std::chrono::steady_clock::now();
             float _res = s->pointTo(ptr, coord, assoc_surface_th, point_to_seed_max_iters, patch_index_ptr);
             double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
@@ -1901,7 +1901,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 }
 
                 for(auto test_surf : test_surfs) {
-                    auto ptr = test_surf->pointer();
+                    cv::Vec3f ptr(0, 0, 0);
                     //FIXME this does not check geometry, only if its also on the surfaces (which might be good enough...)
                     auto _t0 = std::chrono::steady_clock::now();
                     float _res = test_surf->pointTo(ptr, coord, assoc_surface_th, point_to_max_iters, patch_index_ptr);
@@ -1991,7 +1991,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                     if (test_surf == best_surf)
                         continue;
 
-                    auto ptr = test_surf->pointer();
+                    cv::Vec3f ptr(0, 0, 0);
                     auto _t0 = std::chrono::steady_clock::now();
                     float _res = test_surf->pointTo(ptr, best_coord, assoc_surface_th, point_to_max_iters, patch_index_ptr);
                     double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
@@ -2022,7 +2022,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
                 //TODO only add/test if we have 2 neighs which both find locations
                 for(auto test_surf : test_surfs) {
-                    auto ptr = test_surf->pointer();
+                    cv::Vec3f ptr(0, 0, 0);
                     auto _t0 = std::chrono::steady_clock::now();
                     float res = test_surf->pointTo(ptr, best_coord, assoc_surface_th, point_to_max_iters, patch_index_ptr);
                     double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();

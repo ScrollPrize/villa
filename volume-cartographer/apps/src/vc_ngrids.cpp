@@ -23,12 +23,7 @@
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
-#include "z5/factory.hxx"
-#include "z5/dataset.hxx"
-#include "z5/multiarray/xtensor_access.hxx"
-#include "z5/filesystem/handle.hxx"
-
-#include <xtensor/containers/xadapt.hpp>
+#include "vc/core/types/VcDataset.hpp"
 
 namespace fs = std::filesystem;
 namespace po = boost::program_options;
@@ -821,11 +816,8 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
     cv::Vec3i origin_xyz(0, 0, 0);
     int step = 1;
     {
-        z5::filesystem::handle::File rootFile(zarr_root);
-        z5::filesystem::handle::Group root(rootFile, "");
         try {
-            nlohmann::json attrs;
-            z5::filesystem::readAttributes(root, attrs);
+            nlohmann::json attrs = vc::readZarrAttributes(zarr_root);
             if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
                 origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
             }
@@ -837,11 +829,8 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
         }
     }
 
-    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<z5::Dataset> {
-        z5::filesystem::handle::File file(zarr_root);
-        z5::filesystem::handle::Group axis_group(file, axis);
-        z5::filesystem::handle::Dataset ds_handle(axis_group, "0", delim);
-        return z5::filesystem::openDataset(ds_handle);
+    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<vc::VcDataset> {
+        return std::make_unique<vc::VcDataset>(zarr_root / axis / "0");
     };
 
     auto dsx = open_u8_zyx("x");
@@ -862,13 +851,16 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
     const size_t Y = shape[1];
     const size_t X = shape[2];
 
-    xt::xarray<uint8_t> ax = xt::zeros<uint8_t>({Z, Y, X});
-    xt::xarray<uint8_t> ay = xt::zeros<uint8_t>({Z, Y, X});
-    xt::xarray<uint8_t> az = xt::zeros<uint8_t>({Z, Y, X});
-    z5::types::ShapeType off = {0, 0, 0};
-    z5::multiarray::readSubarray<uint8_t>(*dsx, ax, off.begin());
-    z5::multiarray::readSubarray<uint8_t>(*dsy, ay, off.begin());
-    z5::multiarray::readSubarray<uint8_t>(*dsz, az, off.begin());
+    std::vector<uint8_t> ax(Z * Y * X, 0);
+    std::vector<uint8_t> ay(Z * Y * X, 0);
+    std::vector<uint8_t> az(Z * Y * X, 0);
+    {
+        std::vector<size_t> off = {0, 0, 0};
+        std::vector<size_t> regionShape = {Z, Y, X};
+        dsx->readRegion(off, regionShape, ax.data());
+        dsy->readRegion(off, regionShape, ay.data());
+        dsz->readRegion(off, regionShape, az.data());
+    }
 
     const CropBox3i crop = crop_opt.value_or(CropBox3i{
         cv::Vec3i(std::numeric_limits<int>::min() / 4,
@@ -893,9 +885,9 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
     for (size_t iz = 0; iz < Z; ++iz) {
         for (size_t iy = 0; iy < Y; ++iy) {
             for (size_t ix = 0; ix < X; ++ix) {
-                const uint8_t ux = ax(iz, iy, ix);
-                const uint8_t uy = ay(iz, iy, ix);
-                const uint8_t uz = az(iz, iy, ix);
+                const uint8_t ux = ax[iz * Y * X + iy * X + ix];
+                const uint8_t uy = ay[iz * Y * X + iy * X + ix];
+                const uint8_t uz = az[iz * Y * X + iy * X + ix];
                 if (ux == 128 && uy == 128 && uz == 128) continue;
 
                 const float nx = decode(ux);
@@ -940,11 +932,8 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
     cv::Vec3i origin_xyz(0, 0, 0);
     int step = 1;
     {
-        z5::filesystem::handle::File rootFile(zarr_root);
-        z5::filesystem::handle::Group root(rootFile, "");
         try {
-            nlohmann::json attrs;
-            z5::filesystem::readAttributes(root, attrs);
+            nlohmann::json attrs = vc::readZarrAttributes(zarr_root);
             if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
                 origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
             }
@@ -956,11 +945,8 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
         }
     }
 
-    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<z5::Dataset> {
-        z5::filesystem::handle::File file(zarr_root);
-        z5::filesystem::handle::Group axis_group(file, axis);
-        z5::filesystem::handle::Dataset ds_handle(axis_group, "0", delim);
-        return z5::filesystem::openDataset(ds_handle);
+    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<vc::VcDataset> {
+        return std::make_unique<vc::VcDataset>(zarr_root / axis / "0");
     };
 
     auto dsx = open_u8_zyx("x");
@@ -980,13 +966,16 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
     const size_t Y = shape[1];
     const size_t X = shape[2];
 
-    xt::xarray<uint8_t> ax = xt::zeros<uint8_t>({Z, Y, X});
-    xt::xarray<uint8_t> ay = xt::zeros<uint8_t>({Z, Y, X});
-    xt::xarray<uint8_t> az = xt::zeros<uint8_t>({Z, Y, X});
-    z5::types::ShapeType off = {0, 0, 0};
-    z5::multiarray::readSubarray<uint8_t>(*dsx, ax, off.begin());
-    z5::multiarray::readSubarray<uint8_t>(*dsy, ay, off.begin());
-    z5::multiarray::readSubarray<uint8_t>(*dsz, az, off.begin());
+    std::vector<uint8_t> ax(Z * Y * X, 0);
+    std::vector<uint8_t> ay(Z * Y * X, 0);
+    std::vector<uint8_t> az(Z * Y * X, 0);
+    {
+        std::vector<size_t> off = {0, 0, 0};
+        std::vector<size_t> regionShape = {Z, Y, X};
+        dsx->readRegion(off, regionShape, ax.data());
+        dsy->readRegion(off, regionShape, ay.data());
+        dsz->readRegion(off, regionShape, az.data());
+    }
 
     const CropBox3i crop = crop_opt.value_or(CropBox3i{
         cv::Vec3i(std::numeric_limits<int>::min() / 4,
@@ -999,7 +988,7 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
 
     auto decode = [&](uint8_t u) -> float { return (static_cast<int>(u) - 128) / 127.0f; };
     auto is_fill = [&](size_t iz, size_t iy, size_t ix) -> bool {
-        return ax(iz, iy, ix) == 128 && ay(iz, iy, ix) == 128 && az(iz, iy, ix) == 128;
+        return ax[iz * Y * X + iy * X + ix] == 128 && ay[iz * Y * X + iy * X + ix] == 128 && az[iz * Y * X + iy * X + ix] == 128;
     };
 
     auto sample_trilinear = [&](const cv::Point3f& p_xyz, cv::Point3f& out_n_xyz) -> bool {
@@ -1048,8 +1037,8 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
             return lerp(c0, c1, tz);
         };
 
-        auto c = [&](const xt::xarray<uint8_t>& a, int zz, int yy, int xx) -> double {
-            return static_cast<double>(decode(a(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx))));
+        auto c = [&](const std::vector<uint8_t>& a, int zz, int yy, int xx) -> double {
+            return static_cast<double>(decode(a[static_cast<size_t>(zz) * Y * X + static_cast<size_t>(yy) * X + static_cast<size_t>(xx)]));
         };
 
         const double nx = tri(
@@ -1131,8 +1120,8 @@ static inline uint8_t flip_u8_dir_component(uint8_t u) {
 
 struct CropIndexBox3z {
     // ZYX indices (half-open) in the zarr grid.
-    z5::types::ShapeType off = {0, 0, 0};
-    z5::types::ShapeType shape = {0, 0, 0};
+    std::vector<size_t> off = {0, 0, 0};
+    std::vector<size_t> shape = {0, 0, 0};
 };
 
 static CropIndexBox3z crop_to_zarr_zyx(
@@ -1209,11 +1198,8 @@ static void run_align_normals_zarr(
     cv::Vec3i origin_xyz(0, 0, 0);
     int step = 1;
     {
-        z5::filesystem::handle::File rootFile(zarr_root);
-        z5::filesystem::handle::Group root(rootFile, "");
         try {
-            nlohmann::json attrs;
-            z5::filesystem::readAttributes(root, attrs);
+            nlohmann::json attrs = vc::readZarrAttributes(zarr_root);
             if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
                 origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
             }
@@ -1225,11 +1211,8 @@ static void run_align_normals_zarr(
         }
     }
 
-    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<z5::Dataset> {
-        z5::filesystem::handle::File file(zarr_root);
-        z5::filesystem::handle::Group axis_group(file, axis);
-        z5::filesystem::handle::Dataset ds_handle(axis_group, "0", delim);
-        return z5::filesystem::openDataset(ds_handle);
+    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<vc::VcDataset> {
+        return std::make_unique<vc::VcDataset>(zarr_root / axis / "0");
     };
 
     auto dsx = open_u8_zyx("x");
@@ -1286,12 +1269,16 @@ static void run_align_normals_zarr(
     }
 
     // Load the cropped normals into memory.
-    xt::xarray<uint8_t> ax = xt::zeros<uint8_t>({CZ, CY, CX});
-    xt::xarray<uint8_t> ay = xt::zeros<uint8_t>({CZ, CY, CX});
-    xt::xarray<uint8_t> az = xt::zeros<uint8_t>({CZ, CY, CX});
-    z5::multiarray::readSubarray<uint8_t>(*dsx, ax, crop_zyx.off.begin());
-    z5::multiarray::readSubarray<uint8_t>(*dsy, ay, crop_zyx.off.begin());
-    z5::multiarray::readSubarray<uint8_t>(*dsz, az, crop_zyx.off.begin());
+    std::vector<uint8_t> ax(CZ * CY * CX, 0);
+    std::vector<uint8_t> ay(CZ * CY * CX, 0);
+    std::vector<uint8_t> az(CZ * CY * CX, 0);
+    {
+        std::vector<size_t> off(crop_zyx.off.begin(), crop_zyx.off.end());
+        std::vector<size_t> regionShape(crop_zyx.shape.begin(), crop_zyx.shape.end());
+        dsx->readRegion(off, regionShape, ax.data());
+        dsy->readRegion(off, regionShape, ay.data());
+        dsz->readRegion(off, regionShape, az.data());
+    }
 
     const size_t N = CZ * CY * CX;
     auto lin_of = [&](size_t iz, size_t iy, size_t ix) -> size_t {
@@ -1334,9 +1321,9 @@ static void run_align_normals_zarr(
     auto divergence_parallel_invariant = [&](size_t lin, int rad, int& out_count) -> double {
         size_t iz, iy, ix;
         idx_of_lin(lin, iz, iy, ix);
-        const uint8_t ux = ax(iz, iy, ix);
-        const uint8_t uy = ay(iz, iy, ix);
-        const uint8_t uz = az(iz, iy, ix);
+        const uint8_t ux = ax[lin_of(iz, iy, ix)];
+        const uint8_t uy = ay[lin_of(iz, iy, ix)];
+        const uint8_t uz = az[lin_of(iz, iy, ix)];
         if (!is_valid_normal_u8(ux, uy, uz)) {
             out_count = 0;
             return 1e9;
@@ -1344,9 +1331,9 @@ static void run_align_normals_zarr(
         double acc = 0.0;
         int cnt = 0;
         neighbor_iter(iz, iy, ix, rad, [&](size_t zz, size_t yy, size_t xx) {
-            const uint8_t vx = ax(zz, yy, xx);
-            const uint8_t vy = ay(zz, yy, xx);
-            const uint8_t vz = az(zz, yy, xx);
+            const uint8_t vx = ax[lin_of(zz, yy, xx)];
+            const uint8_t vy = ay[lin_of(zz, yy, xx)];
+            const uint8_t vz = az[lin_of(zz, yy, xx)];
             if (!is_valid_normal_u8(vx, vy, vz)) return;
             const double d = dot_decoded_u8(ux, uy, uz, vx, vy, vz);
             acc += (1.0 - std::abs(d));
@@ -1363,7 +1350,7 @@ static void run_align_normals_zarr(
     for (size_t iz = 0; iz < CZ; ++iz) {
         for (size_t iy = 0; iy < CY; ++iy) {
             for (size_t ix = 0; ix < CX; ++ix) {
-                if (is_valid_normal_u8(ax(iz, iy, ix), ay(iz, iy, ix), az(iz, iy, ix))) {
+                if (is_valid_normal_u8(ax[lin_of(iz, iy, ix)], ay[lin_of(iz, iy, ix)], az[lin_of(iz, iy, ix)])) {
                     valid_lin.push_back(lin_of(iz, iy, ix));
                 }
             }
@@ -1395,9 +1382,9 @@ static void run_align_normals_zarr(
     auto oriented_u8_at = [&](size_t lin, uint8_t& ox, uint8_t& oy, uint8_t& oz) {
         size_t iz, iy, ix;
         idx_of_lin(lin, iz, iy, ix);
-        ox = ax(iz, iy, ix);
-        oy = ay(iz, iy, ix);
-        oz = az(iz, iy, ix);
+        ox = ax[lin_of(iz, iy, ix)];
+        oy = ay[lin_of(iz, iy, ix)];
+        oz = az[lin_of(iz, iy, ix)];
         if (state[lin] & kFlip) {
             ox = flip_u8_dir_component(ox);
             oy = flip_u8_dir_component(oy);
@@ -1430,9 +1417,9 @@ static void run_align_normals_zarr(
                         if (zz < 0 || yy < 0 || xx < 0 || zz >= static_cast<int>(CZ) || yy >= static_cast<int>(CY) || xx >= static_cast<int>(CX)) continue;
                         const size_t nlin = lin_of(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx));
                         if (state[nlin] & kAligned) continue;
-                        if (!is_valid_normal_u8(ax(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx)),
-                                                ay(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx)),
-                                                az(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx)))) {
+                        if (!is_valid_normal_u8(ax[lin_of(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx))],
+                                                ay[lin_of(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx))],
+                                                az[lin_of(static_cast<size_t>(zz), static_cast<size_t>(yy), static_cast<size_t>(xx))])) {
                             continue;
                         }
                         if (state[nlin] & kInFringe) continue;
@@ -1458,9 +1445,9 @@ static void run_align_normals_zarr(
     auto score_candidate = [&](size_t cand_lin, int neigh_rad, int& aligned_neighbors, bool& out_flip) -> double {
         size_t iz, iy, ix;
         idx_of_lin(cand_lin, iz, iy, ix);
-        const uint8_t cx = ax(iz, iy, ix);
-        const uint8_t cy = ay(iz, iy, ix);
-        const uint8_t cz = az(iz, iy, ix);
+        const uint8_t cx = ax[lin_of(iz, iy, ix)];
+        const uint8_t cy = ay[lin_of(iz, iy, ix)];
+        const uint8_t cz = az[lin_of(iz, iy, ix)];
         if (!is_valid_normal_u8(cx, cy, cz)) {
             aligned_neighbors = 0;
             out_flip = false;
@@ -1617,31 +1604,23 @@ static void run_align_normals_zarr(
         if (!(state[lin] & kFlip)) continue;
         size_t iz, iy, ix;
         idx_of_lin(lin, iz, iy, ix);
-        ax(iz, iy, ix) = flip_u8_dir_component(ax(iz, iy, ix));
-        ay(iz, iy, ix) = flip_u8_dir_component(ay(iz, iy, ix));
-        az(iz, iy, ix) = flip_u8_dir_component(az(iz, iy, ix));
+        ax[lin_of(iz, iy, ix)] = flip_u8_dir_component(ax[lin_of(iz, iy, ix)]);
+        ay[lin_of(iz, iy, ix)] = flip_u8_dir_component(ay[lin_of(iz, iy, ix)]);
+        az[lin_of(iz, iy, ix)] = flip_u8_dir_component(az[lin_of(iz, iy, ix)]);
     }
 
     // Write output zarr: create full-sized datasets and only write the cropped subarray.
-    z5::filesystem::handle::File outFile(out_zarr);
-    z5::createFile(outFile, true);
-    z5::createGroup(outFile, "x");
-    z5::createGroup(outFile, "y");
-    z5::createGroup(outFile, "z");
+    std::filesystem::create_directories(out_zarr);
 
     const std::vector<size_t> chunks = {std::min<size_t>(64, full_shape[0]), std::min<size_t>(64, full_shape[1]), std::min<size_t>(64, full_shape[2])};
-    nlohmann::json compOpts = {{"cname", "zstd"}, {"clevel", 1}, {"shuffle", 0}};
 
-    z5::filesystem::handle::Group gx(outFile, "x");
-    z5::filesystem::handle::Group gy(outFile, "y");
-    z5::filesystem::handle::Group gz(outFile, "z");
-    auto out_dsx = z5::createDataset(gx, "0", "uint8", full_shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
-    auto out_dsy = z5::createDataset(gy, "0", "uint8", full_shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
-    auto out_dsz = z5::createDataset(gz, "0", "uint8", full_shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
+    auto out_dsx = vc::createZarrDataset(out_zarr / "x", "0", full_shape, chunks, vc::VcDtype::uint8, "blosc", "/");
+    auto out_dsy = vc::createZarrDataset(out_zarr / "y", "0", full_shape, chunks, vc::VcDtype::uint8, "blosc", "/");
+    auto out_dsz = vc::createZarrDataset(out_zarr / "z", "0", full_shape, chunks, vc::VcDtype::uint8, "blosc", "/");
 
-    z5::multiarray::writeSubarray<uint8_t>(out_dsx, ax, crop_zyx.off.begin());
-    z5::multiarray::writeSubarray<uint8_t>(out_dsy, ay, crop_zyx.off.begin());
-    z5::multiarray::writeSubarray<uint8_t>(out_dsz, az, crop_zyx.off.begin());
+    out_dsx->writeRegion(crop_zyx.off, crop_zyx.shape, ax.data());
+    out_dsy->writeRegion(crop_zyx.off, crop_zyx.shape, ay.data());
+    out_dsz->writeRegion(crop_zyx.off, crop_zyx.shape, az.data());
 
     // Minimal attrs on root.
     nlohmann::json attrs;
@@ -1659,8 +1638,7 @@ static void run_align_normals_zarr(
     attrs["crop_max_xyz"] = {crop_xyz.max[0], crop_xyz.max[1], crop_xyz.max[2]};
     attrs["crop_off_zyx"] = {crop_zyx.off[0], crop_zyx.off[1], crop_zyx.off[2]};
     attrs["crop_shape_zyx"] = {crop_zyx.shape[0], crop_zyx.shape[1], crop_zyx.shape[2]};
-    z5::filesystem::handle::Group root(outFile, "");
-    z5::filesystem::writeAttributes(root, attrs);
+    vc::writeZarrAttributes(out_zarr, attrs);
 }
 
 static void run_fit_normals(
@@ -2420,53 +2398,27 @@ static void run_fit_normals(
         // NOTE: direction-field readers in vc_grow_seg_from_seed expect:
         //   <root>/{x,y,z}/0/.zarray
         // and will read the delimiter from that .zarray.
-        z5::filesystem::handle::File outFile(out_zarr);
-        z5::createFile(outFile, true);
-
-        // Ensure groups exist so z5 can infer the zarr format when creating datasets.
-        z5::createGroup(outFile, "x");
-        z5::createGroup(outFile, "y");
-        z5::createGroup(outFile, "z");
-        z5::createGroup(outFile, "fit_rms");
-        z5::createGroup(outFile, "fit_frac_short_paths");
-        z5::createGroup(outFile, "fit_used_radius");
-        z5::createGroup(outFile, "fit_segment_count");
+        std::filesystem::create_directories(out_zarr);
 
         const std::vector<size_t> shape = {static_cast<size_t>(nz), static_cast<size_t>(ny), static_cast<size_t>(nx)}; // ZYX
         const std::vector<size_t> chunks = {std::min<size_t>(64, shape[0]), std::min<size_t>(64, shape[1]), std::min<size_t>(64, shape[2])};
-        nlohmann::json compOpts = {{"cname", "zstd"}, {"clevel", 1}, {"shuffle", 0}};
 
-        z5::filesystem::handle::Group gx(outFile, "x");
-        z5::filesystem::handle::Group gy(outFile, "y");
-        z5::filesystem::handle::Group gz(outFile, "z");
-        z5::filesystem::handle::Group g_rms(outFile, "fit_rms");
-        z5::filesystem::handle::Group g_frac(outFile, "fit_frac_short_paths");
-        z5::filesystem::handle::Group g_rad(outFile, "fit_used_radius");
-        z5::filesystem::handle::Group g_sc(outFile, "fit_segment_count");
+        auto dsx = vc::createZarrDataset(out_zarr / "x", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
+        auto dsy = vc::createZarrDataset(out_zarr / "y", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
+        auto dsz = vc::createZarrDataset(out_zarr / "z", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
+        auto ds_fit_rms = vc::createZarrDataset(out_zarr / "fit_rms", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
+        auto ds_fit_frac = vc::createZarrDataset(out_zarr / "fit_frac_short_paths", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
+        auto ds_fit_rad = vc::createZarrDataset(out_zarr / "fit_used_radius", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
+        auto ds_fit_sc = vc::createZarrDataset(out_zarr / "fit_segment_count", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
 
-        auto dsx = z5::createDataset(gx, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
-        auto dsy = z5::createDataset(gy, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
-        auto dsz = z5::createDataset(gz, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/128, /*zarrDelimiter=*/"/");
-        auto ds_fit_rms = z5::createDataset(g_rms, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
-        auto ds_fit_frac = z5::createDataset(g_frac, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
-        auto ds_fit_rad = z5::createDataset(g_rad, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
-        auto ds_fit_sc = z5::createDataset(g_sc, "0", "uint8", shape, chunks, std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
-
-        auto ax = xt::adapt(enc_x, shape);
-        auto ay = xt::adapt(enc_y, shape);
-        auto az = xt::adapt(enc_z, shape);
-        auto a_fit_rms = xt::adapt(enc_fit_rms, shape);
-        auto a_fit_frac = xt::adapt(enc_fit_frac_short_paths, shape);
-        auto a_fit_rad = xt::adapt(enc_fit_used_radius, shape);
-        auto a_fit_sc = xt::adapt(enc_fit_segment_count, shape);
-        z5::types::ShapeType off = {0, 0, 0};
-        z5::multiarray::writeSubarray<uint8_t>(dsx, ax, off.begin());
-        z5::multiarray::writeSubarray<uint8_t>(dsy, ay, off.begin());
-        z5::multiarray::writeSubarray<uint8_t>(dsz, az, off.begin());
-        z5::multiarray::writeSubarray<uint8_t>(ds_fit_rms, a_fit_rms, off.begin());
-        z5::multiarray::writeSubarray<uint8_t>(ds_fit_frac, a_fit_frac, off.begin());
-        z5::multiarray::writeSubarray<uint8_t>(ds_fit_rad, a_fit_rad, off.begin());
-        z5::multiarray::writeSubarray<uint8_t>(ds_fit_sc, a_fit_sc, off.begin());
+        std::vector<size_t> off = {0, 0, 0};
+        dsx->writeRegion(off, shape, enc_x.data());
+        dsy->writeRegion(off, shape, enc_y.data());
+        dsz->writeRegion(off, shape, enc_z.data());
+        ds_fit_rms->writeRegion(off, shape, enc_fit_rms.data());
+        ds_fit_frac->writeRegion(off, shape, enc_fit_frac_short_paths.data());
+        ds_fit_rad->writeRegion(off, shape, enc_fit_used_radius.data());
+        ds_fit_sc->writeRegion(off, shape, enc_fit_segment_count.data());
 
         // Minimal attrs on root.
         nlohmann::json attrs;
@@ -2489,8 +2441,7 @@ static void run_fit_normals(
         attrs["fit_frac_short_paths_decode"] = "v/255";
         attrs["fit_used_radius_decode"] = "2 + (v/255)*(512-2)";
         attrs["fit_segment_count_decode"] = "(v/255)*8192";
-        z5::filesystem::handle::Group root(outFile, "");
-        z5::filesystem::writeAttributes(root, attrs);
+        vc::writeZarrAttributes(out_zarr, attrs);
     }
 }
 

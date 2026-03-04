@@ -1,6 +1,6 @@
 #include "BBoxOverlayController.hpp"
 
-#include "../CVolumeViewer.hpp"
+#include "../VolumeViewerBase.hpp"
 
 namespace
 {
@@ -15,7 +15,7 @@ BBoxOverlayController::BBoxOverlayController(QObject* parent)
 {
 }
 
-bool BBoxOverlayController::isOverlayEnabledFor(CVolumeViewer* viewer) const
+bool BBoxOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
     if (!viewer) {
         return false;
@@ -26,7 +26,7 @@ bool BBoxOverlayController::isOverlayEnabledFor(CVolumeViewer* viewer) const
     return viewer->activeBBoxSceneRect().has_value();
 }
 
-void BBoxOverlayController::collectPrimitives(CVolumeViewer* viewer, OverlayBuilder& builder)
+void BBoxOverlayController::collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder)
 {
     if (!viewer) {
         return;

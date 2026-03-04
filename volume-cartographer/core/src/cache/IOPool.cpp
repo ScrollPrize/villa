@@ -26,6 +26,8 @@ void IOPool::start()
                     return; // shutdown signalled
                 }
 
+                if (stop.stop_requested()) return;
+
                 // Fetch the chunk data
                 std::vector<uint8_t> data;
                 if (fetchFunc_) {

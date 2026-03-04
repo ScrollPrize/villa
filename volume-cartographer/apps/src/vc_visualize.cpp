@@ -29,8 +29,6 @@ using json = nlohmann::json;
 class SegmentRenderer {
     std::shared_ptr<VolumePkg> vpkg_;
     std::shared_ptr<Volume> volume_;
-    ChunkCache<uint8_t>* cache_;
-
     struct SurfaceInfo {
         std::string id;
         std::shared_ptr<QuadSurface> surface;
@@ -128,12 +126,9 @@ public:
         std::cout << "Using volume: " << volume_id << " (" << volume_->name() << ")" << std::endl;
         auto [w, h, d] = volume_->shape();
         std::cout << "Volume dimensions: " << w << "x" << h << "x" << d << std::endl;
-        cache_ = new ChunkCache<uint8_t>(1ULL * 1024ULL * 1024ULL * 1024ULL);
     }
 
-    ~SegmentRenderer() {
-        delete cache_;
-    }
+    ~SegmentRenderer() = default;
 
     cv::Mat render(const std::string& segment_id, const fs::path& output_path,
                    const std::string& source, const std::string& filter = "", int stride = 0) {
@@ -171,7 +166,7 @@ private:
         cv::Size gen_size(native_width / gen_scale, native_height / gen_scale);
 
         cv::Mat_<cv::Vec3f> coords;
-        cv::Vec3f center = target_surf->pointer();
+        cv::Vec3f center(0, 0, 0);
         cv::Vec3f offset = {
             -(float)(gen_size.width / 2),
             -(float)(gen_size.height / 2),

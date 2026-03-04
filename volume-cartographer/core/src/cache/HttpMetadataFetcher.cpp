@@ -50,6 +50,12 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stringWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+#if CURL_AT_LEAST_VERSION(7, 85, 0)
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     // Don't use FAILONERROR — we check HTTP codes ourselves to distinguish
@@ -94,7 +100,13 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
             throw std::runtime_error(errMsg + ". Check your AWS credentials.");
         }
 
-        // 404, 500, etc. — treat as "not found"
+        // 5xx — server error, throw so callers know it's transient
+        if (httpCode >= 500) {
+            throw std::runtime_error(
+                "HTTP server error " + std::to_string(httpCode) + " fetching " + url);
+        }
+
+        // 404, 400, etc. — treat as "not found"
         return {};
     }
 
@@ -157,12 +169,19 @@ S3ListResult s3ListObjects(const std::string& httpsBaseUrl, const HttpAuth& auth
         return result;
     }
 
-    // Build ListObjectsV2 URL
+    // Build ListObjectsV2 URL — use a temporary curl handle for URL encoding only
+    CURL* tmpCurl = curl_easy_init();
     std::string listUrl = bucketHost + "/?list-type=2&delimiter=/";
-    if (!prefix.empty()) {
-        // URL-encode is not needed for simple path prefixes
+    if (!prefix.empty() && tmpCurl) {
+        char* encoded = curl_easy_escape(
+            tmpCurl, prefix.c_str(), static_cast<int>(prefix.size()));
+        listUrl += "&prefix=";
+        listUrl += encoded;
+        curl_free(encoded);
+    } else if (!prefix.empty()) {
         listUrl += "&prefix=" + prefix;
     }
+    if (tmpCurl) curl_easy_cleanup(tmpCurl);
 
     if (auto* log = cacheDebugLog())
         std::fprintf(log, "[S3] ListObjects: %s\n", listUrl.c_str());
@@ -194,6 +213,12 @@ S3ListResult s3ListObjects(const std::string& httpsBaseUrl, const HttpAuth& auth
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stringWriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &xml);
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+#if CURL_AT_LEAST_VERSION(7, 85, 0)
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
@@ -335,6 +360,12 @@ bool httpDownloadFile(const std::string& url, const std::filesystem::path& dest,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fileWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+#if CURL_AT_LEAST_VERSION(7, 85, 0)
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);

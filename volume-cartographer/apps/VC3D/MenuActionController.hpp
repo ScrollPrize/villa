@@ -3,6 +3,9 @@
 #include <QObject>
 #include <QPointer>
 #include <array>
+#include <string>
+
+#include "vc/core/cache/HttpMetadataFetcher.hpp"
 
 class QAction;
 class QDialog;
@@ -16,6 +19,7 @@ class MenuActionController : public QObject
 
 public:
     static constexpr int kMaxRecentVolpkg = 10;
+    static constexpr int kMaxRecentRemote = 10;
 
     explicit MenuActionController(CWindow* window);
 
@@ -29,6 +33,8 @@ public:
 private slots:
     void openVolpkg();
     void openRecentVolpkg();
+    void openRemoteVolume();
+    void openRecentRemoteVolume();
     void showSettingsDialog();
     void showAboutDialog();
     void showKeybindings();
@@ -49,6 +55,15 @@ private:
     void rebuildRecentMenu();
     void ensureRecentActions();
 
+    QStringList loadRecentRemoteUrls() const;
+    void saveRecentRemoteUrls(const QStringList& urls);
+    void updateRecentRemoteList(const QString& url);
+    void refreshRecentRemoteMenu();
+    void ensureRecentRemoteActions();
+    void openRemoteUrl(const QString& url);
+    void openRemoteZarr(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
+    void openRemoteScroll(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
+
     CWindow* _window{nullptr};
 
     QMenu* _fileMenu{nullptr};
@@ -58,9 +73,12 @@ private:
     QMenu* _selectionMenu{nullptr};
     QMenu* _helpMenu{nullptr};
     QMenu* _recentMenu{nullptr};
+    QMenu* _recentRemoteMenu{nullptr};
 
     QAction* _openAct{nullptr};
+    QAction* _openRemoteAct{nullptr};
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
+    std::array<QAction*, kMaxRecentRemote> _recentRemoteActs{};
     QAction* _settingsAct{nullptr};
     QAction* _exitAct{nullptr};
     QAction* _keybindsAct{nullptr};

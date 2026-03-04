@@ -52,3 +52,5 @@ cmake-build*/
 # VS Code
 .vscode/
 VC.ini
+
+build/

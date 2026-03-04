@@ -1,8 +1,5 @@
 # VCToolchain.cmake - Environment and toolchain detection
 
-# Prevent z5 from auto-detecting conda
-set(WITHIN_TRAVIS ON CACHE BOOL "Skip z5 conda detection" FORCE)
-
 # Ignore conda paths
 if(EXISTS "$ENV{HOME}/miniconda3")
     list(APPEND CMAKE_IGNORE_PREFIX_PATH "$ENV{HOME}/miniconda3")

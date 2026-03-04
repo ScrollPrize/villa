@@ -11,12 +11,12 @@
 #include <unordered_set>
 #include <vector>
 
-class CSurfaceCollection;
+class CState;
 class QLineEdit;
 class ViewerManager;
 class SurfaceTreeWidgetItem;
 class VolumePkg;
-class CVolumeViewer;
+class CTiledVolumeViewer;
 class VCCollection;
 class QTreeWidget;
 class QCheckBox;
@@ -74,9 +74,9 @@ public:
     };
 
     SurfacePanelController(const UiRefs& ui,
-                           CSurfaceCollection* surfaces,
+                           CState* state,
                            ViewerManager* viewerManager,
-                           std::function<CVolumeViewer*()> segmentationViewerProvider,
+                           std::function<CTiledVolumeViewer*()> segmentationViewerProvider,
                            std::function<void()> filtersUpdated,
                            QObject* parent = nullptr);
 
@@ -85,6 +85,7 @@ public:
 
     void loadSurfaces(bool reload);
     void loadSurfacesIncremental();
+    void loadRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces);
     void updateTreeItemIcon(SurfaceTreeWidgetItem* item);
     void refreshSurfaceMetrics(const std::string& surfaceId);
 
@@ -167,12 +168,13 @@ private:
     void logSurfaceLoadSummary() const;
     void applyHighlightSelection(const std::string& id, bool enabled);
     bool cycleVisibleSegment(int direction);
+    std::shared_ptr<QuadSurface> getSurfaceById(const std::string& id) const;
 
     UiRefs _ui;
-    CSurfaceCollection* _surfaces{nullptr};
+    CState* _state{nullptr};
     ViewerManager* _viewerManager{nullptr};
     std::shared_ptr<VolumePkg> _volumePkg;
-    std::function<CVolumeViewer*()> _segmentationViewerProvider;
+    std::function<CTiledVolumeViewer*()> _segmentationViewerProvider;
     std::function<void()> _filtersUpdated;
     FilterUiRefs _filters;
     TagUiRefs _tags;

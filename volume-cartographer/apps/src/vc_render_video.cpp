@@ -4,10 +4,7 @@
 #include <xtensor/io/xio.hpp>
 #include <xtensor/views/xview.hpp>
 
-#include "z5/factory.hxx"
-#include "z5/filesystem/handle.hxx"
-#include "z5/multiarray/xtensor_access.hxx"
-#include "z5/attributes.hxx"
+#include "vc/core/types/VcDataset.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>
@@ -15,6 +12,7 @@
 #include <opencv2/videoio.hpp>
 
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/cache/SimpleCacheFactory.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -23,7 +21,7 @@
 
 #include "vc/core/util/StreamOperators.hpp"
 
-using shape = z5::types::ShapeType;
+using shape = std::vector<size_t>;
 using namespace xt::placeholders;
 
 
@@ -93,16 +91,14 @@ int main(int argc, char *argv[])
     for(int i=3;i<argc;i++)
         seg_dirs.push_back(argv[i]);
 
-    z5::filesystem::handle::Group group(vol_path, z5::FileMode::FileMode::r);
-    z5::filesystem::handle::Dataset ds_handle(group, "1", json::parse(std::ifstream(vol_path/"1/.zarray")).value<std::string>("dimension_separator","."));
-    std::unique_ptr<z5::Dataset> ds = z5::filesystem::openDataset(ds_handle);
+    std::unique_ptr<vc::VcDataset> ds = std::make_unique<vc::VcDataset>(vol_path / "1");
 
     std::cout << "zarr dataset size for scale group 1 " << ds->shape() << std::endl;
-    std::cout << "chunk shape shape " << ds->chunking().blockShape() << std::endl;
+    std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
 
     cv::Size tgt_size = {3840, 2160};
 
-    ChunkCache<uint8_t> chunk_cache(10e9);
+    auto chunk_cache = vc::cache::createSimpleTieredCache(ds.get(), 10e9, ds->path());
 
     cv::VideoWriter vid(tgt_fn, cv::VideoWriter::fourcc('H','F','Y','U'), 5, tgt_size);
 
@@ -123,7 +119,7 @@ int main(int argc, char *argv[])
 
         points = points*0.5;
 
-        readInterpolated3D(img, ds.get(), points, &chunk_cache);
+        readInterpolated3D(img, chunk_cache.get(), 0, points);
 
         cv::Mat_<uint8_t> frame(tgt_size, 0);
         int pad_x = (tgt_size.width - img.size().width)/2;

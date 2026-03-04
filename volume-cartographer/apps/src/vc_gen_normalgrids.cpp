@@ -16,12 +16,11 @@
 #include <omp.h>
 
 #include <xtensor/containers/xarray.hpp>
-#include "z5/factory.hxx"
-#include "z5/filesystem/handle.hxx"
-#include "z5/common.hxx"
-#include "z5/multiarray/xtensor_access.hxx"
+#include <xtensor/containers/xtensor.hpp>
 
+#include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/cache/SimpleCacheFactory.hpp"
 #include <vc/core/util/GridStore.hpp>
 #include "vc/core/util/Thinning.hpp"
 #include "support.hpp"
@@ -267,12 +266,7 @@ void run_generate(const po::variables_map& vm) {
     std::cout << "Input Zarr path: " << input_path << std::endl;
     std::cout << "Output directory: " << output_path << std::endl;
 
-    z5::filesystem::handle::Group group_handle(input_path);
-    std::unique_ptr<z5::Dataset> ds = z5::openDataset(group_handle, "0");
-    if (!ds) {
-        std::cerr << "Error: Could not open dataset '0' in volume '" << input_path << "'." << std::endl;
-        exit(1);
-    }
+    auto ds = std::make_unique<vc::VcDataset>(std::filesystem::path(input_path) / "0");
     auto shape = ds->shape();
 
     double spiral_step = vm["spiral-step"].as<double>();
@@ -295,7 +289,7 @@ void run_generate(const po::variables_map& vm) {
     std::ofstream o(output_fs_path / "metadata.json");
     o << std::setw(4) << metadata << std::endl;
 
-    ChunkCache<uint8_t> cache(10llu*1024*1024*1024);
+    auto cache = vc::cache::createSimpleTieredCache(ds.get(), 10llu*1024*1024*1024, ds->path());
 
     int num_threads = omp_get_max_threads();
     if (num_threads == 0) num_threads = 1;
@@ -409,7 +403,7 @@ void run_generate(const po::variables_map& vm) {
             xt::xtensor<uint8_t, 3, xt::layout_type::column_major> chunk_data =
                 xt::xtensor<uint8_t, 3, xt::layout_type::column_major>::from_shape(chunk_shape);
             chunk_timer.mark("xtensor init");
-            readArea3D(chunk_data, chunk_offset, ds.get(), &cache);
+            readArea3D(chunk_data, chunk_offset, cache.get(), 0);
             chunk_timer.mark("read_chunk");
 
             for (const auto& mark : chunk_timer.getMarks()) {

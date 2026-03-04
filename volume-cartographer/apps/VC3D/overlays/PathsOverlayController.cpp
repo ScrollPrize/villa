@@ -1,6 +1,6 @@
 #include "PathsOverlayController.hpp"
 
-#include "../CVolumeViewer.hpp"
+#include "../VolumeViewerBase.hpp"
 
 #include "vc/core/util/Surface.hpp"
 
@@ -16,7 +16,7 @@ PathsOverlayController::PathsOverlayController(QObject* parent)
 {
 }
 
-bool PathsOverlayController::isOverlayEnabledFor(CVolumeViewer* viewer) const
+bool PathsOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
     if (!viewer) {
         return false;
@@ -25,7 +25,7 @@ bool PathsOverlayController::isOverlayEnabledFor(CVolumeViewer* viewer) const
     return !paths.empty();
 }
 
-void PathsOverlayController::collectPrimitives(CVolumeViewer* viewer,
+void PathsOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                                                OverlayBuilder& builder)
 {
     if (!viewer) {

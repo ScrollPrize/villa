@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/util/RemoteScroll.hpp"
 
 class VolumePkg
 {
@@ -38,6 +39,8 @@ public:
     [[nodiscard]] std::vector<std::string> getAvailableSegmentationDirectories() const;
     [[nodiscard]] std::string getVolpkgDirectory() const;
 
+    [[nodiscard]] bool isRemote() const;
+
     void refreshSegmentations();
     static void setLoadFirstSegmentationDirectory(const std::string& dirName);
 
@@ -63,6 +66,8 @@ private:
     std::map<std::string, std::string> segmentationDirectories_;
     std::set<std::string> loadedSegmentationDirs_;
     static std::optional<std::string> loadFirstSegmentationDir_;
+
+    bool isRemote_ = false;
 
     void loadSegmentationsFromDirectory(const std::string& dirName);
     void ensureSegmentScrollSource();

@@ -283,6 +283,9 @@ bool VcDataset::readRegion(const std::vector<size_t>& offset,
                             const std::vector<size_t>& regionShape,
                             void* output) const
 {
+    for (size_t d = 0; d < regionShape.size(); ++d) {
+        if (regionShape[d] == 0) return true;
+    }
     const size_t ndim = offset.size();
     const auto& chunkShape = impl_->chunkShape_;
     const size_t elemSize = impl_->dtypeSize_;
@@ -310,9 +313,6 @@ bool VcDataset::readRegion(const std::vector<size_t>& offset,
     chunkStrides[ndim - 1] = elemSize;
     for (int d = static_cast<int>(ndim) - 2; d >= 0; --d)
         chunkStrides[d] = chunkStrides[d + 1] * chunkShape[d + 1];
-
-    // Temp buffer for one chunk
-    std::vector<uint8_t> chunkBuf(chunkElems * elemSize);
 
     // Iterate over all chunks that overlap the region
     std::vector<size_t> ci(ndim);
@@ -383,6 +383,9 @@ bool VcDataset::writeRegion(const std::vector<size_t>& offset,
                              const std::vector<size_t>& regionShape,
                              const void* data)
 {
+    for (size_t d = 0; d < regionShape.size(); ++d) {
+        if (regionShape[d] == 0) return true;
+    }
     const size_t ndim = offset.size();
     const auto& chunkShape = impl_->chunkShape_;
     const size_t elemSize = impl_->dtypeSize_;
@@ -468,12 +471,7 @@ bool VcDataset::writeRegion(const std::vector<size_t>& offset,
                 }
             };
 
-            if (fullChunk) {
-                // For full chunks, copy directly into chunkBuf
-                copyLoop(0);
-            } else {
-                copyLoop(0);
-            }
+            copyLoop(0);
 
             // Write the chunk
             auto byteSpan = std::span<const std::byte>(
@@ -507,15 +505,17 @@ std::vector<std::unique_ptr<VcDataset>> openZarrLevels(
         }
     }
 
-    // Sort numerically
+    // Sort numerically where possible, lexicographically otherwise.
+    // Numeric names sort before non-numeric names.
     std::sort(levelNames.begin(), levelNames.end(),
               [](const std::string& a, const std::string& b) {
-                  // Try numeric comparison first
-                  try {
-                      return std::stoi(a) < std::stoi(b);
-                  } catch (...) {
-                      return a < b;
-                  }
+                  int ia = 0, ib = 0;
+                  bool aNum = false, bNum = false;
+                  try { ia = std::stoi(a); aNum = true; } catch (...) {}
+                  try { ib = std::stoi(b); bNum = true; } catch (...) {}
+                  if (aNum && bNum) return ia < ib;
+                  if (aNum != bNum) return aNum;  // numeric before non-numeric
+                  return a < b;
               });
 
     std::vector<std::unique_ptr<VcDataset>> result;

@@ -13,10 +13,6 @@
 #include "Surface.hpp"
 #include "Tiff.hpp"
 
-// Forward declarations
-template<typename T>
-class ChunkCache;
-
 // Surface loading and channel flags
 #define SURF_LOAD_IGNORE_MASK 1
 #define SURF_CHANNEL_NORESIZE 1

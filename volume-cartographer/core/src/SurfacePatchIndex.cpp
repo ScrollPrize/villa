@@ -527,11 +527,12 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     impl_->surfaceRecords.clear();
     impl_->patchCount = 0;
 
-    // Filter out null surfaces.
+    // Skip surfaces whose TIFF data hasn't been loaded yet.
+    // They'll be added incrementally via addSurface() when loaded.
     std::vector<SurfacePtr> loaded;
     loaded.reserve(surfaces.size());
     for (const auto& s : surfaces) {
-        if (s) {
+        if (s && s->isLoaded()) {
             loaded.push_back(s);
         }
     }
@@ -568,7 +569,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
             std::numeric_limits<int>::max());
 
         // Update mask for this surface (each surface has its own mask, no contention)
-        auto* rec = impl_->getRecord(surfaces[i].get());
+        auto* rec = impl_->getRecord(loaded[i].get());
         if (rec) {
             for (auto& cell : perSurfaceCells[i]) {
                 rec->mask.setActive(cell.first.rowIndex(), cell.first.colIndex(), cell.second.hasPatch);

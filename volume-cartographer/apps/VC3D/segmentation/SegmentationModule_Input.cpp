@@ -1,6 +1,6 @@
 #include "SegmentationModule.hpp"
 
-#include "CVolumeViewer.hpp"
+#include "tiled/CTiledVolumeViewer.hpp"
 #include "tools/SegmentationBrushTool.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/CellReoptimizationTool.hpp"
@@ -271,7 +271,7 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
     return false;
 }
 
-void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
+void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
                                           const cv::Vec3f& worldPos,
                                           const cv::Vec3f& /*surfaceNormal*/,
                                           Qt::MouseButton button,
@@ -405,7 +405,7 @@ void SegmentationModule::handleMousePress(CVolumeViewer* viewer,
     refreshOverlay();
 }
 
-void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
+void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
                                          const cv::Vec3f& worldPos,
                                          Qt::MouseButtons buttons,
                                          Qt::KeyboardModifiers modifiers)
@@ -509,7 +509,7 @@ void SegmentationModule::handleMouseMove(CVolumeViewer* viewer,
     }
 }
 
-void SegmentationModule::handleMouseRelease(CVolumeViewer* viewer,
+void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
                                             const cv::Vec3f& worldPos,
                                             Qt::MouseButton button,
                                             Qt::KeyboardModifiers /*modifiers*/)
@@ -567,7 +567,7 @@ void SegmentationModule::handleMouseRelease(CVolumeViewer* viewer,
     finishDrag();
 }
 
-void SegmentationModule::handleWheel(CVolumeViewer* viewer,
+void SegmentationModule::handleWheel(CTiledVolumeViewer* viewer,
                                      int deltaSteps,
                                      const QPointF& /*scenePos*/,
                                      const cv::Vec3f& worldPos)

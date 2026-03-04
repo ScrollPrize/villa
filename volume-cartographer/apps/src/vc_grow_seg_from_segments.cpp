@@ -3,10 +3,7 @@
 #include <xtensor/io/xio.hpp>
 #include <xtensor/views/xview.hpp>
 
-#include "z5/factory.hxx"
-#include "z5/filesystem/handle.hxx"
-#include "z5/multiarray/xtensor_access.hxx"
-#include "z5/attributes.hxx"
+#include "vc/core/types/VcDataset.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -14,13 +11,14 @@
 #include "vc/core/util/Surface.hpp"
 
 #include <filesystem>
+#include <fstream>
 
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
 
 
-using shape = z5::types::ShapeType;
+using shape = std::vector<size_t>;
 using namespace xt::placeholders;
 
 
@@ -92,12 +90,10 @@ int main(int argc, char *argv[])
     }
     params["tgt_dir"] = tgt_dir;
 
-    z5::filesystem::handle::Group group(vol_path, z5::FileMode::FileMode::r);
-    z5::filesystem::handle::Dataset ds_handle(group, "0", json::parse(std::ifstream(vol_path/"0/.zarray")).value<std::string>("dimension_separator","."));
-    std::unique_ptr<z5::Dataset> ds = z5::filesystem::openDataset(ds_handle);
+    std::unique_ptr<vc::VcDataset> ds = std::make_unique<vc::VcDataset>(vol_path / "0");
 
     std::cout << "zarr dataset size for scale group 0 " << ds->shape() << std::endl;
-    std::cout << "chunk shape shape " << ds->chunking().blockShape() << std::endl;
+    std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
 
     float voxelsize = json::parse(std::ifstream(vol_path/"meta.json"))["voxelsize"];
 

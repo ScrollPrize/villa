@@ -1,6 +1,7 @@
 #include "ViewerOverlayControllerBase.hpp"
 
-#include "../CVolumeViewer.hpp"
+#include "../VolumeViewerBase.hpp"
+#include "../tiled/CTiledVolumeViewer.hpp"
 #include "../ViewerManager.hpp"
 #include "../elements/COutlinedTextItem.hpp"
 
@@ -80,7 +81,8 @@ float ViewerOverlayControllerBase::PathPrimitive::interpolateZ(float percent,
     for (size_t i = 1; i < points.size(); ++i) {
         const cv::Vec3f& p1 = points[i - 1];
         const cv::Vec3f& p2 = points[i];
-        const float segmentLength2 = std::pow(p2[0] - p1[0], 2.0f) + std::pow(p2[1] - p1[1], 2.0f);
+        float dx = p2[0] - p1[0], dy = p2[1] - p1[1];
+        const float segmentLength2 = dx * dx + dy * dy;
 
         if (segmentLength2 > 0.0f) {
             const float segmentLength = std::sqrt(segmentLength2);
@@ -95,7 +97,7 @@ float ViewerOverlayControllerBase::PathPrimitive::interpolateZ(float percent,
     return points.back()[2];
 }
 
-ViewerOverlayControllerBase::OverlayBuilder::OverlayBuilder(CVolumeViewer* viewer)
+ViewerOverlayControllerBase::OverlayBuilder::OverlayBuilder(VolumeViewerBase* viewer)
     : _viewer(viewer)
 {
 }
@@ -220,7 +222,7 @@ ViewerOverlayControllerBase::~ViewerOverlayControllerBase()
     }
 }
 
-void ViewerOverlayControllerBase::attachViewer(CVolumeViewer* viewer)
+void ViewerOverlayControllerBase::attachViewer(VolumeViewerBase* viewer)
 {
     if (!viewer) {
         return;
@@ -236,16 +238,16 @@ void ViewerOverlayControllerBase::attachViewer(CVolumeViewer* viewer)
 
     ViewerEntry entry;
     entry.viewer = viewer;
-    entry.overlaysUpdatedConn = QObject::connect(viewer, &CVolumeViewer::overlaysUpdated,
-                                                 this, [this, viewer]() { rebuildOverlay(viewer); });
-    entry.destroyedConn = QObject::connect(viewer, &QObject::destroyed,
+    entry.overlaysUpdatedConn = viewer->connectOverlaysUpdated(
+        this, [this, viewer]() { rebuildOverlay(viewer); });
+    entry.destroyedConn = QObject::connect(viewer->asQObject(), &QObject::destroyed,
                                            this, [this, viewer]() { detachViewer(viewer); });
 
     _viewers.push_back(entry);
     rebuildOverlay(viewer);
 }
 
-void ViewerOverlayControllerBase::detachViewer(CVolumeViewer* viewer)
+void ViewerOverlayControllerBase::detachViewer(VolumeViewerBase* viewer)
 {
     auto it = std::remove_if(_viewers.begin(), _viewers.end(), [viewer](const ViewerEntry& entry) {
         return entry.viewer == viewer;
@@ -279,7 +281,7 @@ void ViewerOverlayControllerBase::bindToViewerManager(ViewerManager* manager)
     }
 
     _managerCreatedConn = QObject::connect(_manager, &ViewerManager::viewerCreated,
-                                           this, [this](CVolumeViewer* viewer) {
+                                           this, [this](CTiledVolumeViewer* viewer) {
                                                attachViewer(viewer);
                                            });
 
@@ -289,7 +291,7 @@ void ViewerOverlayControllerBase::bindToViewerManager(ViewerManager* manager)
                                                  _manager = nullptr;
                                              });
 
-    _manager->forEachViewer([this](CVolumeViewer* viewer) {
+    _manager->forEachViewer([this](CTiledVolumeViewer* viewer) {
         attachViewer(viewer);
     });
 }
@@ -301,32 +303,32 @@ void ViewerOverlayControllerBase::refreshAll()
     }
 }
 
-void ViewerOverlayControllerBase::refreshViewer(CVolumeViewer* viewer)
+void ViewerOverlayControllerBase::refreshViewer(VolumeViewerBase* viewer)
 {
     rebuildOverlay(viewer);
 }
 
-bool ViewerOverlayControllerBase::isOverlayEnabledFor(CVolumeViewer* /*viewer*/) const
+bool ViewerOverlayControllerBase::isOverlayEnabledFor(VolumeViewerBase* /*viewer*/) const
 {
     return true;
 }
 
-void ViewerOverlayControllerBase::clearOverlay(CVolumeViewer* viewer) const
+void ViewerOverlayControllerBase::clearOverlay(VolumeViewerBase* viewer) const
 {
     if (viewer) {
         viewer->clearOverlayGroup(_overlayGroupKey);
     }
 }
 
-QPointF ViewerOverlayControllerBase::volumeToScene(CVolumeViewer* viewer, const cv::Vec3f& volumePoint) const
+QPointF ViewerOverlayControllerBase::volumeToScene(VolumeViewerBase* viewer, const cv::Vec3f& volumePoint) const
 {
     if (!viewer) {
         return QPointF();
     }
-    return viewer->volumePointToScene(volumePoint);
+    return viewer->volumeToScene(volumePoint);
 }
 
-cv::Vec3f ViewerOverlayControllerBase::sceneToVolume(CVolumeViewer* viewer, const QPointF& scenePoint) const
+cv::Vec3f ViewerOverlayControllerBase::sceneToVolume(VolumeViewerBase* viewer, const QPointF& scenePoint) const
 {
     if (!viewer) {
         return cv::Vec3f();
@@ -334,7 +336,7 @@ cv::Vec3f ViewerOverlayControllerBase::sceneToVolume(CVolumeViewer* viewer, cons
     return viewer->sceneToVolume(scenePoint);
 }
 
-std::vector<QPointF> ViewerOverlayControllerBase::volumeToScene(CVolumeViewer* viewer,
+std::vector<QPointF> ViewerOverlayControllerBase::volumeToScene(VolumeViewerBase* viewer,
                                                                 const std::vector<cv::Vec3f>& volumePoints) const
 {
     std::vector<QPointF> results;
@@ -346,7 +348,7 @@ std::vector<QPointF> ViewerOverlayControllerBase::volumeToScene(CVolumeViewer* v
 }
 
 ViewerOverlayControllerBase::FilteredPoints
-ViewerOverlayControllerBase::filterPoints(CVolumeViewer* viewer,
+ViewerOverlayControllerBase::filterPoints(VolumeViewerBase* viewer,
                                           const std::vector<cv::Vec3f>& points,
                                           const PointFilterOptions& options) const
 {
@@ -384,7 +386,7 @@ ViewerOverlayControllerBase::filterPoints(CVolumeViewer* viewer,
         }
 
         if (keep && quadSurface) {
-            auto ptr = quadSurface->pointer();
+            cv::Vec3f ptr(0, 0, 0);
             float res = quadSurface->pointTo(ptr, point, options.quadDistanceTolerance, 100, patchIndex);
             if (res > options.quadDistanceTolerance) {
                 keep = false;
@@ -432,29 +434,29 @@ ViewerOverlayControllerBase::filterPoints(CVolumeViewer* viewer,
     return result;
 }
 
-QGraphicsScene* ViewerOverlayControllerBase::viewerScene(CVolumeViewer* viewer) const
+QGraphicsScene* ViewerOverlayControllerBase::viewerScene(VolumeViewerBase* viewer) const
 {
-    if (!viewer || !viewer->fGraphicsView) {
+    if (!viewer || !viewer->graphicsView()) {
         return nullptr;
     }
-    return viewer->fGraphicsView->scene();
+    return viewer->graphicsView()->scene();
 }
 
-QRectF ViewerOverlayControllerBase::visibleSceneRect(CVolumeViewer* viewer) const
+QRectF ViewerOverlayControllerBase::visibleSceneRect(VolumeViewerBase* viewer) const
 {
-    if (!viewer || !viewer->fGraphicsView) {
+    if (!viewer || !viewer->graphicsView()) {
         return QRectF();
     }
-    auto* view = viewer->fGraphicsView;
+    auto* view = viewer->graphicsView();
     return view->mapToScene(view->viewport()->rect()).boundingRect();
 }
 
-bool ViewerOverlayControllerBase::isScenePointVisible(CVolumeViewer* viewer, const QPointF& scenePoint) const
+bool ViewerOverlayControllerBase::isScenePointVisible(VolumeViewerBase* viewer, const QPointF& scenePoint) const
 {
     return visibleSceneRect(viewer).contains(scenePoint);
 }
 
-Surface* ViewerOverlayControllerBase::viewerSurface(CVolumeViewer* viewer) const
+Surface* ViewerOverlayControllerBase::viewerSurface(VolumeViewerBase* viewer) const
 {
     return viewer ? viewer->currentSurface() : nullptr;
 }
@@ -501,7 +503,7 @@ void applyStyle(QGraphicsItem* item, const ViewerOverlayControllerBase::OverlayS
 }
 } // namespace
 
-void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
+void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                                                   const std::string& overlayKey,
                                                   std::vector<OverlayPrimitive> primitives)
 {
@@ -514,7 +516,8 @@ void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
         return;
     }
 
-    auto* scene = viewer->fGraphicsView ? viewer->fGraphicsView->scene() : nullptr;
+    auto* gview = viewer->graphicsView();
+    auto* scene = gview ? gview->scene() : nullptr;
     if (!scene) {
         viewer->clearOverlayGroup(overlayKey);
         return;
@@ -659,7 +662,7 @@ void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
                     std::vector<QPointF> scenePoints;
                     scenePoints.reserve(prim.points.size());
                     for (const auto& p : prim.points) {
-                        scenePoints.emplace_back(viewer->volumePointToScene(p));
+                        scenePoints.emplace_back(viewer->volumeToScene(p));
                     }
 
                     OverlayStyle style;
@@ -764,7 +767,7 @@ void ViewerOverlayControllerBase::applyPrimitives(CVolumeViewer* viewer,
     viewer->setOverlayGroup(overlayKey, items);
 }
 
-void ViewerOverlayControllerBase::rebuildOverlay(CVolumeViewer* viewer)
+void ViewerOverlayControllerBase::rebuildOverlay(VolumeViewerBase* viewer)
 {
     if (!viewer) {
         return;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -55,18 +56,17 @@ namespace vc::cache {
 
 // Build a chunk filename from a ChunkKey: "<iz><delim><iy><delim><ix>"
 // Used by DiskStore and FileSystemChunkSource.
+// Uses a stack buffer to avoid heap allocation on the hot path (Issue 51).
 [[nodiscard]] inline std::string chunkFilename(
     const ChunkKey& key,
     const std::string& delimiter)
 {
-    std::string name;
-    name.reserve(32);
-    name += std::to_string(key.iz);
-    name += delimiter;
-    name += std::to_string(key.iy);
-    name += delimiter;
-    name += std::to_string(key.ix);
-    return name;
+    // Max: 3 * 10 digits + 2 * 1 char delimiter + NUL = 33 bytes, 64 is safe
+    char buf[64];
+    const char* d = delimiter.c_str();
+    int n = std::snprintf(buf, sizeof(buf), "%d%s%d%s%d",
+                          key.iz, d, key.iy, d, key.ix);
+    return {buf, static_cast<std::string::size_type>(n > 0 ? n : 0)};
 }
 
 }  // namespace vc::cache

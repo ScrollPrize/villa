@@ -8,7 +8,7 @@
 
 class SegmentationEditManager;
 class SegmentationWidget;
-class CSurfaceCollection;
+class CState;
 class SegmentationModule;
 
 class SegmentationBrushTool : public SegmentationTool
@@ -17,11 +17,11 @@ public:
     SegmentationBrushTool(SegmentationModule& module,
                           SegmentationEditManager* editManager,
                           SegmentationWidget* widget,
-                          CSurfaceCollection* surfaces);
+                          CState* state);
 
     void setDependencies(SegmentationEditManager* editManager,
                          SegmentationWidget* widget,
-                         CSurfaceCollection* surfaces);
+                         CState* state);
 
     void setActive(bool active);
     [[nodiscard]] bool brushActive() const { return _brushActive; }
@@ -46,7 +46,7 @@ private:
     SegmentationModule& _module;
     SegmentationEditManager* _editManager{nullptr};
     SegmentationWidget* _widget{nullptr};
-    CSurfaceCollection* _surfaces{nullptr};
+    CState* _state{nullptr};
 
     bool _brushActive{false};
     bool _strokeActive{false};

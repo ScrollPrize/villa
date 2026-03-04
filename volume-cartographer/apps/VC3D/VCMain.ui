@@ -2214,17 +2214,17 @@
  <customwidget>
    <class>DropdownChecklistButton</class>
    <extends>QToolButton</extends>
-   <header>../../../../../apps/VC3D/elements/DropdownChecklistButton.hpp</header>
+   <header>elements/DropdownChecklistButton.hpp</header>
   </customwidget>
   <customwidget>
    <class>VolumeSelector</class>
    <extends>QWidget</extends>
-   <header>../../../../../apps/VC3D/elements/VolumeSelector.hpp</header>
+   <header>elements/VolumeSelector.hpp</header>
   </customwidget>
   <customwidget>
   <class>SurfaceTreeWidget</class>
   <extends>QTreeWidget</extends>
-  <header>../../../../../apps/VC3D/SurfaceTreeWidget.hpp</header>
+  <header>SurfaceTreeWidget.hpp</header>
   </customwidget>
  </customwidgets>
  <resources/>

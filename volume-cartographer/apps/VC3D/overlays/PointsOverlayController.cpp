@@ -1,6 +1,7 @@
 #include "PointsOverlayController.hpp"
 
-#include "../CVolumeViewer.hpp"
+#include "../tiled/CTiledVolumeViewer.hpp"
+#include "../VolumeViewerBase.hpp"
 #include "../ViewerManager.hpp"
 
 #include "vc/ui/VCCollection.hpp"
@@ -75,12 +76,12 @@ void PointsOverlayController::setCollection(VCCollection* collection)
     refreshAll();
 }
 
-bool PointsOverlayController::isOverlayEnabledFor(CVolumeViewer* viewer) const
+bool PointsOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
     return _collection && viewer;
 }
 
-void PointsOverlayController::collectPrimitives(CVolumeViewer* viewer, OverlayBuilder& builder)
+void PointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder)
 {
     if (!_collection || !viewer) {
         return;
@@ -153,7 +154,7 @@ void PointsOverlayController::collectPrimitives(CVolumeViewer* viewer, OverlayBu
                     opacity = 1.0f - (dist / kFadeThreshold);
                 }
             } else if (quadSurface) {
-                auto ptr = quadSurface->pointer();
+                cv::Vec3f ptr(0, 0, 0);
                 float dist = quadSurface->pointTo(ptr, entry.world, 10.0, 100, patchIndex);
                 if (dist >= kFadeThreshold) {
                     opacity = 0.0f;

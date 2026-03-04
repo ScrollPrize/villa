@@ -5,14 +5,22 @@ add_definitions(-DCHUNK_CACHE_SIZE_GB=${CHUNK_CACHE_SIZE_GB})
 
 set(srcs
     VCAppMain.cpp
+    CState.cpp
+    CState.hpp
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp
     CWindowContextMenu.cpp
-    CVolumeViewer.cpp
-    CVolumeViewerIntersections.cpp
-    CVolumeViewerRender.cpp
-    CVolumeViewerOverlay.cpp
+    FileWatcherService.cpp
+    FileWatcherService.hpp
+    AxisAlignedSliceController.cpp
+    AxisAlignedSliceController.hpp
+    FocusHistoryManager.cpp
+    FocusHistoryManager.hpp
+    SurfaceAreaCalculator.cpp
+    SurfaceAreaCalculator.hpp
+    SegmentationCommandHandler.cpp
+    SegmentationCommandHandler.hpp
     CVolumeViewerView.cpp
     VolumeViewerCmaps.cpp
     VolumeViewerCmaps.hpp
@@ -29,7 +37,6 @@ set(srcs
     elements/RangeSlider.cpp
     elements/RangeSlider.hpp
     SettingsDialog.cpp
-    CSurfaceCollection.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
     SeedingWidget.cpp
@@ -126,6 +133,22 @@ set(srcs
     CPointCollectionWidget.cpp
     elements/COutlinedTextItem.hpp
     elements/COutlinedTextItem.cpp
+    tiled/CTiledVolumeViewer.cpp
+    tiled/CTiledVolumeViewer.hpp
+    tiled/TiledViewerCamera.cpp
+    tiled/TiledViewerCamera.hpp
+    tiled/TileScene.cpp
+    tiled/TileScene.hpp
+    tiled/TileRenderer.cpp
+    tiled/TileRenderer.hpp
+    tiled/TileRenderController.cpp
+    tiled/TileRenderController.hpp
+    tiled/SliceCache.cpp
+    tiled/SliceCache.hpp
+    tiled/RenderPool.cpp
+    tiled/RenderPool.hpp
+    tiled/PostProcess.cpp
+    tiled/PostProcess.hpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
@@ -141,6 +164,7 @@ target_include_directories(VC3D
         ${CMAKE_SOURCE_DIR}/libs/edt
         ${CMAKE_SOURCE_DIR}/libs/cc3d
         ${CMAKE_SOURCE_DIR}/libs/djikstra3d
+        ${CMAKE_SOURCE_DIR}/libs/c-blosc/blosc
 )
 
 # Avahi for mDNS service discovery (Linux only)
@@ -157,10 +181,12 @@ target_link_libraries(VC3D
     vc_tracer
     vc_flattening
     Qt6::Core
+    Qt6::Concurrent
     Qt6::Gui
     Qt6::Widgets
     Qt6::Network
     opencv_ximgproc
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
+    blosc_static
 )
 

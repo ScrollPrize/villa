@@ -1,6 +1,6 @@
 #include "SegmentationModule.hpp"
 
-#include "CSurfaceCollection.hpp"
+#include "../CState.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/CellReoptimizationTool.hpp"
@@ -30,8 +30,8 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
         return false;
     }
 
-    if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
+    if (_state) {
+        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
 
     if (_overlay) {
@@ -88,12 +88,12 @@ void SegmentationModule::endEditingSession()
     auto baseSurface = _editManager ? _editManager->baseSurface() : nullptr;
     auto previewSurface = _editManager ? _editManager->previewSurface() : nullptr;
 
-    if (_surfaces && previewSurface) {
-        auto currentSurface = _surfaces->surface("segmentation");
+    if (_state && previewSurface) {
+        auto currentSurface = _state->surface("segmentation");
         if (currentSurface.get() == previewSurface.get()) {
             const bool previousGuard = _ignoreSegSurfaceChange;
             _ignoreSegSurfaceChange = true;
-            _surfaces->setSurface("segmentation", baseSurface, false, true);
+            _state->setSurface("segmentation", baseSurface, false, true);
             _ignoreSegSurfaceChange = previousGuard;
         }
     }
@@ -252,7 +252,7 @@ bool SegmentationModule::restoreUndoSnapshot()
     }
 
     if (applied) {
-        if (_surfaces) {
+        if (_state) {
             auto preview = _editManager->previewSurface();
 
             // Queue affected cells for incremental R-tree update
@@ -266,7 +266,7 @@ bool SegmentationModule::restoreUndoSnapshot()
                 }
             }
 
-            _surfaces->setSurface("segmentation", preview, false, true);
+            _state->setSurface("segmentation", preview, false, true);
         }
 
         // Also undo the corresponding auto-approval if approval mask is active
@@ -318,8 +318,8 @@ void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
     cancelDrag();
     _editManager->clearInvalidatedEdits();
     _editManager->refreshFromBaseSurface();
-    if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
+    if (_state) {
+        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
 
     // Update approval tool surface if editing approval mask

@@ -1,7 +1,8 @@
 #include "SegmentationOverlayController.hpp"
 
-#include "../CSurfaceCollection.hpp"
-#include "../CVolumeViewer.hpp"
+#include "../CState.hpp"
+#include "../tiled/CTiledVolumeViewer.hpp"
+#include "../VolumeViewerBase.hpp"
 #include "../ViewerManager.hpp"
 #include "../segmentation/tools/SegmentationEditManager.hpp"
 
@@ -142,12 +143,12 @@ bool SegmentationOverlayController::State::operator==(const State& rhs) const
            vec3fOptEqual(approvalHoverPlaneNormal, rhs.approvalHoverPlaneNormal);
 }
 
-SegmentationOverlayController::SegmentationOverlayController(CSurfaceCollection* surfaces, QObject* parent)
+SegmentationOverlayController::SegmentationOverlayController(CState* state, QObject* parent)
     : ViewerOverlayControllerBase(kOverlayGroupKey, parent)
-    , _surfaces(surfaces)
+    , _state(state)
 {
-    if (_surfaces) {
-        connect(_surfaces, &CSurfaceCollection::sendSurfaceChanged,
+    if (_state) {
+        connect(_state, &CState::surfaceChanged,
                 this, &SegmentationOverlayController::onSurfaceChanged);
     }
 }
@@ -185,12 +186,30 @@ void SegmentationOverlayController::applyState(const State& state)
     if (now - _lastRefreshTime < kMinRefreshInterval) {
         // state changed but we're throttling - save state for next refresh
         _currentState = std::move(sanitized);
+        // ensure a deferred refresh fires after the throttle window
+        if (!_deferredRefreshTimer) {
+            _deferredRefreshTimer = new QTimer(this);
+            _deferredRefreshTimer->setSingleShot(true);
+            connect(_deferredRefreshTimer, &QTimer::timeout, this, [this]() {
+                _lastRefreshTime = {};  // Reset so next applyState proceeds
+                if (_currentState) {
+                    refreshAll();
+                }
+            });
+        }
+        _deferredRefreshTimer->start(static_cast<int>(kMinRefreshInterval.count()));
         return;
     }
     _lastRefreshTime = now;
 
     _currentState = std::move(sanitized);
     refreshAll();
+}
+
+void SegmentationOverlayController::detachViewer(VolumeViewerBase* viewer)
+{
+    _viewerCaches.erase(viewer);
+    ViewerOverlayControllerBase::detachViewer(viewer);
 }
 
 void SegmentationOverlayController::loadApprovalMaskImage(QuadSurface* surface)
@@ -617,7 +636,7 @@ void SegmentationOverlayController::performDebouncedApprovalSave()
     _approvalSaveSurface = nullptr;
 }
 
-bool SegmentationOverlayController::isOverlayEnabledFor(CVolumeViewer* viewer) const
+bool SegmentationOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
     Q_UNUSED(viewer);
     // Enable overlay rendering if editing is enabled OR if approval mask mode is active
@@ -626,7 +645,7 @@ bool SegmentationOverlayController::isOverlayEnabledFor(CVolumeViewer* viewer) c
     return _editingEnabled || approvalMaskActive;
 }
 
-void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
+void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                                                       ViewerOverlayControllerBase::OverlayBuilder& builder)
 {
     if (!viewer || !_currentState) {
@@ -643,8 +662,8 @@ void SegmentationOverlayController::collectPrimitives(CVolumeViewer* viewer,
 
     // Render correction drag line (regardless of editing mode - corrections are annotations)
     if (state.correctionDragActive) {
-        const QPointF startScene = viewer->volumePointToScene(state.correctionDragStart);
-        const QPointF currentScene = viewer->volumePointToScene(state.correctionDragCurrent);
+        const QPointF startScene = viewer->volumeToScene(state.correctionDragStart);
+        const QPointF currentScene = viewer->volumeToScene(state.correctionDragCurrent);
 
         // Draw line from start to current
         ViewerOverlayControllerBase::OverlayStyle lineStyle;
@@ -727,7 +746,7 @@ void SegmentationOverlayController::onSurfaceChanged(std::string name, std::shar
 }
 
 void SegmentationOverlayController::buildRadiusOverlay(const State& state,
-                                                       CVolumeViewer* viewer,
+                                                       VolumeViewerBase* viewer,
                                                        ViewerOverlayControllerBase::OverlayBuilder& builder) const
 {
     if (!state.activeMarker || !state.activeMarker->isActive) {
@@ -740,11 +759,11 @@ void SegmentationOverlayController::buildRadiusOverlay(const State& state,
     }
 
     const cv::Vec3f world = state.activeMarker->world;
-    const QPointF sceneCenter = viewer->volumePointToScene(world);
+    const QPointF sceneCenter = viewer->volumeToScene(world);
 
     cv::Vec3f offsetWorld = world;
     offsetWorld[0] += radiusWorld;
-    const QPointF sceneEdge = viewer->volumePointToScene(offsetWorld);
+    const QPointF sceneEdge = viewer->volumeToScene(offsetWorld);
     const qreal radiusPixels = std::hypot(sceneEdge.x() - sceneCenter.x(),
                                           sceneEdge.y() - sceneCenter.y());
 
@@ -762,7 +781,7 @@ void SegmentationOverlayController::buildRadiusOverlay(const State& state,
 }
 
 void SegmentationOverlayController::buildVertexMarkers(const State& state,
-                                                       CVolumeViewer* viewer,
+                                                       VolumeViewerBase* viewer,
                                                        ViewerOverlayControllerBase::OverlayBuilder& builder) const
 {
     const auto buildStyle = [](const VertexMarker& marker) {
@@ -785,7 +804,7 @@ void SegmentationOverlayController::buildVertexMarkers(const State& state,
     };
 
     const auto appendMarker = [&](VertexMarker marker) {
-        const QPointF scene = viewer->volumePointToScene(marker.world);
+        const QPointF scene = viewer->volumeToScene(marker.world);
         const auto style = buildStyle(marker);
         builder.addCircle(scene, kMarkerRadius, true, style);
     };
@@ -801,7 +820,7 @@ void SegmentationOverlayController::buildVertexMarkers(const State& state,
     }
 }
 
-void SegmentationOverlayController::rebuildViewerCache(CVolumeViewer* viewer, QuadSurface* surface) const
+void SegmentationOverlayController::rebuildViewerCache(VolumeViewerBase* viewer, QuadSurface* surface) const
 {
     const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
     if (!points || points->empty()) {
@@ -1050,7 +1069,7 @@ void SegmentationOverlayController::invalidatePlaneIntersections()
         return;
     }
 
-    _viewerManager->forEachViewer([](CVolumeViewer* viewer) {
+    _viewerManager->forEachViewer([](CTiledVolumeViewer* viewer) {
         if (!viewer) {
             return;
         }
@@ -1077,7 +1096,7 @@ void SegmentationOverlayController::setApprovalMaskOpacity(int opacity)
 }
 
 void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
-                                                              CVolumeViewer* viewer,
+                                                              VolumeViewerBase* viewer,
                                                               ViewerOverlayControllerBase::OverlayBuilder& builder) const
 {
     if (!state.surface) {
@@ -1086,7 +1105,7 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
 
     // Check if this viewer is displaying a PlaneSurface (XY/XZ/YZ orthogonal view)
     // For plane viewers, the approval mask is rendered via modified intersection lines
-    // in CVolumeViewerIntersections.cpp, not here
+    // in CTiledVolumeViewerIntersections.cpp, not here
     Surface* viewerSurf = viewer->currentSurface();
     const bool isPlaneViewer = dynamic_cast<PlaneSurface*>(viewerSurf) != nullptr;
 
@@ -1098,16 +1117,16 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
         const float brushRadiusNative = state.approvalBrushRadius;
 
         if (isPlaneViewer) {
-            // For plane viewers: use volumePointToScene which is fast (O(1) for PlaneSurface)
+            // For plane viewers: use volumeToScene which is fast (O(1) for PlaneSurface)
             // Compute center and radius consistently using the same projection
-            const QPointF sceneCenter = viewer->volumePointToScene(hoverWorld);
+            const QPointF sceneCenter = viewer->volumeToScene(hoverWorld);
 
             // Convert brush radius from native voxels to scene pixels
             // Use both X and Y offsets to handle different plane orientations
             const cv::Vec3f offsetPosX = hoverWorld + cv::Vec3f(brushRadiusNative, 0, 0);
             const cv::Vec3f offsetPosY = hoverWorld + cv::Vec3f(0, brushRadiusNative, 0);
-            const QPointF sceneOffsetX = viewer->volumePointToScene(offsetPosX);
-            const QPointF sceneOffsetY = viewer->volumePointToScene(offsetPosY);
+            const QPointF sceneOffsetX = viewer->volumeToScene(offsetPosX);
+            const QPointF sceneOffsetY = viewer->volumeToScene(offsetPosY);
             const qreal radiusPixelsX = std::hypot(sceneOffsetX.x() - sceneCenter.x(),
                                                     sceneOffsetX.y() - sceneCenter.y());
             const qreal radiusPixelsY = std::hypot(sceneOffsetY.x() - sceneCenter.x(),
@@ -1135,8 +1154,8 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
             const float thisViewerScale = viewer->getCurrentScale();
 
             // Convert world position to scene coordinates
-            // This uses volumePointToScene which calls pointTo for QuadSurface
-            const QPointF sceneCenter = viewer->volumePointToScene(hoverWorld);
+            // This uses volumeToScene which calls pointTo for QuadSurface
+            const QPointF sceneCenter = viewer->volumeToScene(hoverWorld);
 
             // Convert from native voxels to grid units
             float surfaceScale = 1.0f;
@@ -1171,7 +1190,7 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
                     // Project the cylinder axis (plane normal) into the flattened view
                     const cv::Vec3f& normal = *state.approvalHoverPlaneNormal;
                     const cv::Vec3f axisEndWorld = hoverWorld + normal * brushDepthNative;
-                    const QPointF axisEndScene = viewer->volumePointToScene(axisEndWorld);
+                    const QPointF axisEndScene = viewer->volumeToScene(axisEndWorld);
 
                     // Compute angle from center to axis end
                     const qreal dx = axisEndScene.x() - sceneCenter.x();

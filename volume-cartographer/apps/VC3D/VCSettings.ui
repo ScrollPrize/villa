@@ -357,13 +357,6 @@
            </property>
           </widget>
          </item>
-         <item row="1" column="0">
-          <widget class="QCheckBox" name="chkSkipImageFormatConvExp">
-           <property name="text">
-            <string>Skip image format conversion (experimental)</string>
-           </property>
-          </widget>
-         </item>
          <item row="2" column="0">
           <widget class="QLabel" name="labelParallelProcesses">
            <property name="text">
@@ -512,6 +505,126 @@
            </property>
            <property name="toolTip">
             <string>When enabled, VC3D will watch for external changes to segment files and automatically reload them. Disable if you experience issues with file watching. Requires restart.</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item row="3" column="0" colspan="2">
+       <widget class="QGroupBox" name="groupBox_5">
+        <property name="title">
+         <string>Cache</string>
+        </property>
+        <layout class="QGridLayout" name="gridLayout_5" columnstretch="1,1,0">
+         <item row="0" column="0">
+          <widget class="QLabel" name="labelRamCacheSize">
+           <property name="text">
+            <string>RAM cache size (GB)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1">
+          <widget class="QSpinBox" name="spinRamCacheSizeGB">
+           <property name="minimum">
+            <number>1</number>
+           </property>
+           <property name="maximum">
+            <number>512</number>
+           </property>
+           <property name="value">
+            <number>10</number>
+           </property>
+           <property name="suffix">
+            <string> GB</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="2">
+          <widget class="QPushButton" name="btnHelpRamCacheSize">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Minimum" vsizetype="Minimum">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="toolTip">
+            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Total RAM budget for the in-memory chunk cache (hot + warm tiers).&lt;/p&gt;&lt;p&gt;80% is used for decompressed chunks (hot), 20% for compressed chunks (warm).&lt;/p&gt;&lt;p&gt;Requires restart.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+           </property>
+           <property name="text">
+            <string/>
+           </property>
+           <property name="icon">
+            <iconset theme="help-contents"/>
+           </property>
+           <property name="flat">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="0">
+          <widget class="QLabel" name="labelDiskCacheSize">
+           <property name="text">
+            <string>Disk cache size (GB)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="1">
+          <widget class="QSpinBox" name="spinDiskCacheSizeGB">
+           <property name="minimum">
+            <number>1</number>
+           </property>
+           <property name="maximum">
+            <number>4096</number>
+           </property>
+           <property name="value">
+            <number>100</number>
+           </property>
+           <property name="suffix">
+            <string> GB</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="2">
+          <widget class="QPushButton" name="btnHelpDiskCacheSize">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Minimum" vsizetype="Minimum">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="toolTip">
+            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Maximum size of the on-disk chunk cache for remote volumes.&lt;/p&gt;&lt;p&gt;Chunks are evicted in LRU order when this limit is exceeded.&lt;/p&gt;&lt;p&gt;Requires restart.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+           </property>
+           <property name="text">
+            <string/>
+           </property>
+           <property name="icon">
+            <iconset theme="help-contents"/>
+           </property>
+           <property name="flat">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="0">
+          <widget class="QLabel" name="labelRemoteCachePath">
+           <property name="text">
+            <string>Remote cache directory</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="1">
+          <widget class="QLineEdit" name="edtRemoteCachePath">
+           <property name="placeholderText">
+            <string>~/.VC3D/remote_cache</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="2">
+          <widget class="QPushButton" name="btnBrowseRemoteCachePath">
+           <property name="text">
+            <string>Browse...</string>
            </property>
           </widget>
          </item>

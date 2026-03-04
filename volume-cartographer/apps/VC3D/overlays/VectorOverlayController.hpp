@@ -5,27 +5,27 @@
 #include <functional>
 #include <vector>
 
-class CSurfaceCollection;
+class CState;
 
 class VectorOverlayController : public ViewerOverlayControllerBase
 {
     Q_OBJECT
 
 public:
-    using Provider = std::function<void(CVolumeViewer*, OverlayBuilder&)>;
+    using Provider = std::function<void(VolumeViewerBase*, OverlayBuilder&)>;
 
-    explicit VectorOverlayController(CSurfaceCollection* surfaces, QObject* parent = nullptr);
+    explicit VectorOverlayController(CState* state, QObject* parent = nullptr);
 
     void addProvider(Provider provider);
 
 protected:
-    bool isOverlayEnabledFor(CVolumeViewer* viewer) const override;
-    void collectPrimitives(CVolumeViewer* viewer, OverlayBuilder& builder) override;
+    bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
+    void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 
 private:
-    void collectDirectionHints(CVolumeViewer* viewer, OverlayBuilder& builder) const;
-    void collectSurfaceNormals(CVolumeViewer* viewer, OverlayBuilder& builder) const;
+    void collectDirectionHints(VolumeViewerBase* viewer, OverlayBuilder& builder) const;
+    void collectSurfaceNormals(VolumeViewerBase* viewer, OverlayBuilder& builder) const;
 
-    CSurfaceCollection* _surfaces;
+    CState* _state;
     std::vector<Provider> _providers;
 };

@@ -2,6 +2,8 @@
 
 #include "VCSettings.hpp"
 
+#include <QDir>
+#include <QFileDialog>
 #include <QSettings>
 #include <QMessageBox>
 #include <QToolTip>
@@ -45,19 +47,35 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     }
 
     spinPreloadedSlices->setValue(settings.value(perf::PRELOADED_SLICES, perf::PRELOADED_SLICES_DEFAULT).toInt());
-    chkSkipImageFormatConvExp->setChecked(settings.value(perf::SKIP_IMAGE_FORMAT_CONV, perf::SKIP_IMAGE_FORMAT_CONV_DEFAULT).toBool());
     spinParallelProcesses->setValue(settings.value(perf::PARALLEL_PROCESSES, perf::PARALLEL_PROCESSES_DEFAULT).toInt());
     spinIterationCount->setValue(settings.value(perf::ITERATION_COUNT, perf::ITERATION_COUNT_DEFAULT).toInt());
     cmbDownscaleOverride->setCurrentIndex(settings.value(perf::DOWNSCALE_OVERRIDE, perf::DOWNSCALE_OVERRIDE_DEFAULT).toInt());
     chkFastInterpolation->setChecked(settings.value(perf::FAST_INTERPOLATION, perf::FAST_INTERPOLATION_DEFAULT).toBool());
     chkEnableFileWatching->setChecked(settings.value(perf::ENABLE_FILE_WATCHING, perf::ENABLE_FILE_WATCHING_DEFAULT).toBool());
 
+    // Cache settings
+    spinRamCacheSizeGB->setValue(settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toInt());
+    spinDiskCacheSizeGB->setValue(settings.value(perf::DISK_CACHE_SIZE_GB, perf::DISK_CACHE_SIZE_GB_DEFAULT).toInt());
+    {
+        QString defaultCache = QDir::homePath() + "/.VC3D/remote_cache";
+        edtRemoteCachePath->setText(settings.value(viewer::REMOTE_CACHE_DIR, defaultCache).toString());
+    }
+
+    connect(btnBrowseRemoteCachePath, &QPushButton::clicked, this, [this]{
+        QString dir = QFileDialog::getExistingDirectory(this, tr("Select Remote Cache Directory"),
+            edtRemoteCachePath->text());
+        if (!dir.isEmpty()) {
+            edtRemoteCachePath->setText(dir);
+        }
+    });
 
     connect(btnHelpDownscaleOverride, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDownscaleOverride->toolTip()); });
     connect(btnHelpScrollSpeed, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpScrollSpeed->toolTip()); });
     connect(btnHelpDisplayOpacity, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDisplayOpacity->toolTip()); });
     connect(btnHelpPreloadedSlices, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpPreloadedSlices->toolTip()); });
     connect(btnHelpFastInterpolation, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpFastInterpolation->toolTip()); });
+    connect(btnHelpRamCacheSize, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpRamCacheSize->toolTip()); });
+    connect(btnHelpDiskCacheSize, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDiskCacheSize->toolTip()); });
 }
 
 void SettingsDialog::accept()
@@ -92,12 +110,16 @@ void SettingsDialog::accept()
     }
 
     settings.setValue(perf::PRELOADED_SLICES, spinPreloadedSlices->value());
-    settings.setValue(perf::SKIP_IMAGE_FORMAT_CONV, chkSkipImageFormatConvExp->isChecked() ? "1" : "0");
     settings.setValue(perf::PARALLEL_PROCESSES, spinParallelProcesses->value());
     settings.setValue(perf::ITERATION_COUNT, spinIterationCount->value());
     settings.setValue(perf::DOWNSCALE_OVERRIDE, cmbDownscaleOverride->currentIndex());
     settings.setValue(perf::FAST_INTERPOLATION, chkFastInterpolation->isChecked() ? "1" : "0");
     settings.setValue(perf::ENABLE_FILE_WATCHING, chkEnableFileWatching->isChecked() ? "1" : "0");
+
+    // Cache settings
+    settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
+    settings.setValue(perf::DISK_CACHE_SIZE_GB, spinDiskCacheSizeGB->value());
+    settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
 
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 

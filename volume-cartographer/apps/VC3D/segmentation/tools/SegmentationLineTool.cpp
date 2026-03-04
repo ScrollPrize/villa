@@ -2,7 +2,7 @@
 
 #include "../SegmentationModule.hpp"
 #include "SegmentationEditManager.hpp"
-#include "../../CSurfaceCollection.hpp"
+#include "../../CState.hpp"
 #include "../../overlays/SegmentationOverlayController.hpp"
 
 #include <QCoreApplication>
@@ -24,22 +24,22 @@ constexpr float kBrushSampleSpacing = 2.0f;
 
 SegmentationLineTool::SegmentationLineTool(SegmentationModule& module,
                                            SegmentationEditManager* editManager,
-                                           CSurfaceCollection* surfaces,
+                                           CState* state,
                                            float& smoothStrength,
                                            int& smoothIterations)
     : _module(module)
     , _editManager(editManager)
-    , _surfaces(surfaces)
+    , _state(state)
     , _smoothStrength(&smoothStrength)
     , _smoothIterations(&smoothIterations)
 {
 }
 
 void SegmentationLineTool::setDependencies(SegmentationEditManager* editManager,
-                                           CSurfaceCollection* surfaces)
+                                           CState* state)
 {
     _editManager = editManager;
-    _surfaces = surfaces;
+    _state = state;
 }
 
 void SegmentationLineTool::setSmoothing(float& smoothStrength, int& smoothIterations)
@@ -180,8 +180,8 @@ bool SegmentationLineTool::applyStroke(const std::vector<cv::Vec3f>& stroke)
     }
 
     _editManager->applyPreview();
-    if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
+    if (_state) {
+        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
 
     _module.refreshOverlay();

@@ -78,6 +78,8 @@ std::shared_ptr<VolumePkg> VolumePkg::New(const std::filesystem::path& fileLocat
     return std::make_shared<VolumePkg>(fileLocation);
 }
 
+bool VolumePkg::isRemote() const { return isRemote_; }
+
 
 std::string VolumePkg::name() const
 {
@@ -259,6 +261,10 @@ auto VolumePkg::getVolpkgDirectory() const -> std::string
 
 auto VolumePkg::getAvailableSegmentationDirectories() const -> std::vector<std::string>
 {
+    if (isRemote_) {
+        return {"paths"};
+    }
+
     std::vector<std::string> dirs;
 
     // Check for common segmentation directories

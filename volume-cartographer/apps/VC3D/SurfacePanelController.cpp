@@ -2,8 +2,8 @@
 
 #include "SurfaceTreeWidget.hpp"
 #include "ViewerManager.hpp"
-#include "CSurfaceCollection.hpp"
-#include "CVolumeViewer.hpp"
+#include "CState.hpp"
+#include "tiled/CTiledVolumeViewer.hpp"
 #include "elements/DropdownChecklistButton.hpp"
 #include "VCSettings.hpp"
 
@@ -67,14 +67,14 @@ void sync_tag(nlohmann::json& dict, bool checked, const std::string& name, const
 } // namespace
 
 SurfacePanelController::SurfacePanelController(const UiRefs& ui,
-                                               CSurfaceCollection* surfaces,
+                                               CState* state,
                                                ViewerManager* viewerManager,
-                                               std::function<CVolumeViewer*()> segmentationViewerProvider,
+                                               std::function<CTiledVolumeViewer*()> segmentationViewerProvider,
                                                std::function<void()> filtersUpdated,
                                                QObject* parent)
     : QObject(parent)
     , _ui(ui)
-    , _surfaces(surfaces)
+    , _state(state)
     , _viewerManager(viewerManager)
     , _segmentationViewerProvider(std::move(segmentationViewerProvider))
     , _filtersUpdated(std::move(filtersUpdated))
@@ -117,10 +117,10 @@ void SurfacePanelController::loadSurfaces(bool reload)
             _viewerManager->waitForPendingIndexRebuild();
         }
         // Clear all surfaces from collection BEFORE unloading to prevent dangling pointers
-        if (_surfaces) {
-            auto names = _surfaces->surfaceNames();
+        if (_state) {
+            auto names = _state->surfaceNames();
             for (const auto& name : names) {
-                _surfaces->setSurface(name, nullptr, true, false);
+                _state->setSurface(name, nullptr, true, false);
             }
         }
         _volumePkg->unloadAllSurfaces();
@@ -129,11 +129,11 @@ void SurfacePanelController::loadSurfaces(bool reload)
     auto segIds = _volumePkg->segmentationIDs();
     _volumePkg->loadSurfacesBatch(segIds);
 
-    if (_surfaces) {
+    if (_state) {
         for (const auto& id : segIds) {
             auto surf = _volumePkg->getSurface(id);
             if (surf) {
-                _surfaces->setSurface(id, surf, true, false);
+                _state->setSurface(id, surf, true, false);
             }
         }
     }
@@ -146,6 +146,59 @@ void SurfacePanelController::loadSurfaces(bool reload)
     }
     if (_viewerManager) {
         _viewerManager->primeSurfacePatchIndicesAsync();
+    }
+    emit surfacesLoaded();
+}
+
+void SurfacePanelController::loadRemoteSurfaces(
+    const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces)
+{
+    if (!_ui.treeWidget || surfaces.empty()) {
+        return;
+    }
+
+    // Register each surface in the collection
+    for (const auto& [id, surf] : surfaces) {
+        if (_state && surf) {
+            _state->setSurface(id, surf, true, false);
+        }
+    }
+
+    // Populate tree widget
+    {
+        const QSignalBlocker blocker{_ui.treeWidget};
+        _ui.treeWidget->clear();
+
+        for (const auto& [id, surf] : surfaces) {
+            if (!surf) {
+                continue;
+            }
+            auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
+            item->setText(SURFACE_ID_COLUMN, QString::fromStdString(id));
+            item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(id));
+
+            auto* quadSurf = dynamic_cast<QuadSurface*>(surf.get());
+            if (quadSurf && quadSurf->meta) {
+                const double areaCm2 = vc::json::number_or(quadSurf->meta.get(), "area_cm2", -1.0);
+                const double avgCost = vc::json::number_or(quadSurf->meta.get(), "avg_cost", -1.0);
+                item->setText(2, QString::number(areaCm2, 'f', 3));
+                item->setText(3, QString::number(avgCost, 'f', 3));
+                item->setText(4, QString::number(quadSurf->overlappingIds().size()));
+                QString timestamp;
+                if (quadSurf->meta->contains("date_last_modified")) {
+                    timestamp = QString::fromStdString((*quadSurf->meta)["date_last_modified"].get<std::string>());
+                }
+                item->setText(5, timestamp);
+            }
+        }
+
+        _ui.treeWidget->resizeColumnToContents(0);
+        _ui.treeWidget->resizeColumnToContents(1);
+    }
+
+    applyFilters();
+    if (_filtersUpdated) {
+        _filtersUpdated();
     }
     emit surfacesLoaded();
 }
@@ -179,8 +232,8 @@ void SurfacePanelController::loadSurfacesIncremental()
         }
     }
     // Emit a single signal after batch removal
-    if (!changes.toRemove.empty() && _surfaces) {
-        _surfaces->emitSurfacesChanged();
+    if (!changes.toRemove.empty() && _state) {
+        _state->emitSurfacesChanged();
     }
 
     if (!changes.toReload.empty()) {
@@ -194,14 +247,14 @@ void SurfacePanelController::loadSurfacesIncremental()
 
         for (const auto& id : changes.toReload) {
             std::cout << "Queueing for reload: " << id << std::endl;
-            auto currentSurface = _surfaces ? _surfaces->surface(id) : nullptr;
-            auto activeSegSurface = _surfaces ? _surfaces->surface("segmentation") : nullptr;
+            auto currentSurface = _state ? _state->surface(id) : nullptr;
+            auto activeSegSurface = _state ? _state->surface("segmentation") : nullptr;
             const bool wasActiveSeg = (currentSurface != nullptr && activeSegSurface.get() == currentSurface.get());
 
-            if (_surfaces) {
-                _surfaces->setSurface(id, nullptr, true, false);
+            if (_state) {
+                _state->setSurface(id, nullptr, true, false);
                 if (wasActiveSeg) {
-                    _surfaces->setSurface("segmentation", nullptr, false, false);
+                    _state->setSurface("segmentation", nullptr, false, false);
                 }
             }
 
@@ -217,11 +270,11 @@ void SurfacePanelController::loadSurfacesIncremental()
                 continue;
             }
 
-            if (_surfaces) {
-                _surfaces->setSurface(id, reloadedSurface, true, false);
-                auto activeSegSurface = _surfaces ? _surfaces->surface("segmentation") : nullptr;
+            if (_state) {
+                _state->setSurface(id, reloadedSurface, true, false);
+                auto activeSegSurface = _state ? _state->surface("segmentation") : nullptr;
                 if (activeSegSurface == nullptr) {
-                    _surfaces->setSurface("segmentation", reloadedSurface, false, false);
+                    _state->setSurface("segmentation", reloadedSurface, false, false);
                 }
             }
 
@@ -385,7 +438,7 @@ void SurfacePanelController::refreshSurfaceMetrics(const std::string& surfaceId)
         ++iterator;
     }
 
-    auto surf = _volumePkg ? _volumePkg->getSurface(surfaceId) : nullptr;
+    auto surf = getSurfaceById(surfaceId);
     double areaCm2 = -1.0;
     double avgCost = -1.0;
     int overlapCount = 0;
@@ -413,12 +466,12 @@ void SurfacePanelController::refreshSurfaceMetrics(const std::string& surfaceId)
 
 void SurfacePanelController::updateTreeItemIcon(SurfaceTreeWidgetItem* item)
 {
-    if (!item || !_volumePkg) {
+    if (!item) {
         return;
     }
 
     const auto id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
-    auto surf = _volumePkg->getSurface(id);
+    auto surf = getSurfaceById(id);
     if (!surf || !surf->meta) {
         return;
     }
@@ -442,8 +495,8 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
         if (!surf) {
             return;
         }
-        if (_surfaces) {
-            _surfaces->setSurface(segId, surf, true, false);
+        if (_state) {
+            _state->setSurface(segId, surf, true, false);
         }
         if (_ui.treeWidget) {
             auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
@@ -479,16 +532,16 @@ void SurfacePanelController::removeSingleSegmentation(const std::string& segId, 
     std::shared_ptr<Surface> removedSurface;
     std::shared_ptr<Surface> activeSegSurface;
 
-    if (_surfaces) {
-        removedSurface = _surfaces->surface(segId);
-        activeSegSurface = _surfaces->surface("segmentation");
+    if (_state) {
+        removedSurface = _state->surface(segId);
+        activeSegSurface = _state->surface("segmentation");
     }
 
-    if (_surfaces) {
+    if (_state) {
         if (removedSurface && activeSegSurface.get() == removedSurface.get()) {
-            _surfaces->setSurface("segmentation", nullptr, suppressSignals);
+            _state->setSurface("segmentation", nullptr, suppressSignals);
         }
-        _surfaces->setSurface(segId, nullptr, suppressSignals);
+        _state->setSurface(segId, nullptr, suppressSignals);
     }
 
     if (_volumePkg) {
@@ -586,19 +639,15 @@ void SurfacePanelController::handleTreeSelectionChanged()
     const QString idQString = firstSelected->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
     const std::string id = idQString.toStdString();
 
-    std::shared_ptr<QuadSurface> surface;
-    bool surfaceJustLoaded = false;
-    if (_volumePkg) {
-        surface = _volumePkg->getSurface(id);
-        surfaceJustLoaded = (surface != nullptr);
-    }
+    std::shared_ptr<QuadSurface> surface = getSurfaceById(id);
+    bool surfaceJustLoaded = (surface != nullptr);
 
-    if (surface && _surfaces) {
+    if (surface && _state) {
         // Keep the named entry in sync so intersection viewers can retain this mesh
-        if (surfaceJustLoaded || !_surfaces->surface(id)) {
-            _surfaces->setSurface(id, surface, true, false);
+        if (surfaceJustLoaded || !_state->surface(id)) {
+            _state->setSurface(id, surface, true, false);
         }
-        _surfaces->setSurface("segmentation", surface, false, false);
+        _state->setSurface("segmentation", surface, false, false);
     }
 
     syncSelectionUi(id, surface.get());
@@ -640,23 +689,26 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         selectedSegmentIds.front();
 
     QMenu contextMenu(tr("Context Menu"), _ui.treeWidget);
+    const bool isLocal = (_volumePkg != nullptr);
 
-    std::string currentDir = _volumePkg->getSegmentationDirectory();
-    if (currentDir == "traces") {
-        QAction* moveToPathsAction = contextMenu.addAction(tr("Move to Paths"));
-        moveToPathsAction->setIcon(_ui.treeWidget->style()->standardIcon(QStyle::SP_FileDialogDetailedView));
-        connect(moveToPathsAction, &QAction::triggered, this, [this, segmentId]() {
-            emit moveToPathsRequested(segmentId);
-        });
-        contextMenu.addSeparator();
-    }
+    if (isLocal) {
+        std::string currentDir = _volumePkg->getSegmentationDirectory();
+        if (currentDir == "traces") {
+            QAction* moveToPathsAction = contextMenu.addAction(tr("Move to Paths"));
+            moveToPathsAction->setIcon(_ui.treeWidget->style()->standardIcon(QStyle::SP_FileDialogDetailedView));
+            connect(moveToPathsAction, &QAction::triggered, this, [this, segmentId]() {
+                emit moveToPathsRequested(segmentId);
+            });
+            contextMenu.addSeparator();
+        }
 
-    // Rename only for single selection
-    if (selectedSegmentIds.size() == 1) {
-        QAction* renameAction = contextMenu.addAction(tr("Rename Surface"));
-        connect(renameAction, &QAction::triggered, this, [this, segmentId]() {
-            emit renameSurfaceRequested(segmentId);
-        });
+        // Rename only for single selection
+        if (selectedSegmentIds.size() == 1) {
+            QAction* renameAction = contextMenu.addAction(tr("Rename Surface"));
+            connect(renameAction, &QAction::triggered, this, [this, segmentId]() {
+                emit renameSurfaceRequested(segmentId);
+            });
+        }
     }
 
     QAction* copyPathAction = contextMenu.addAction(tr("Copy Segment Path"));
@@ -851,6 +903,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         tr("Delete Segment");
     QAction* deleteAction = contextMenu.addAction(deleteText);
     deleteAction->setIcon(_ui.treeWidget->style()->standardIcon(QStyle::SP_TrashIcon));
+    deleteAction->setEnabled(isLocal);
     connect(deleteAction, &QAction::triggered, this, [this, deletionTargets]() {
         handleDeleteSegments(deletionTargets);
     });
@@ -902,7 +955,7 @@ void SurfacePanelController::handleDeleteSegments(const QStringList& segmentIds)
     for (const auto& id : segmentIds) {
         const std::string idStd = id.toStdString();
         try {
-            // Must clean up CSurfaceCollection before destroying the Surface
+            // Must clean up CState before destroying the Surface
             // to avoid dangling pointers in signal handlers.
             // Suppress signals during batch deletion to prevent handlers from
             // iterating over surfaces while we're in the middle of deleting them.
@@ -924,8 +977,8 @@ void SurfacePanelController::handleDeleteSegments(const QStringList& segmentIds)
     }
 
     // After all deletions are done, emit a single signal to trigger surface index rebuild
-    if (anyChanges && _surfaces) {
-        _surfaces->emitSurfacesChanged();
+    if (anyChanges && _state) {
+        _state->emitSurfacesChanged();
     }
 
     if (anyChanges) {
@@ -1431,7 +1484,7 @@ void SurfacePanelController::onTagCheckboxToggled()
 
 void SurfacePanelController::applyFiltersInternal()
 {
-    if (!_ui.treeWidget || !_volumePkg) {
+    if (!_ui.treeWidget) {
         emit filtersApplied(0);
         return;
     }
@@ -1474,14 +1527,12 @@ void SurfacePanelController::applyFiltersInternal()
             const auto idStr = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
             std::string id = idStr.toStdString();
             if (!id.empty() && !item->isHidden()) {
-                auto meta = _volumePkg->getSurface(id);
-                if (!meta) {
-                    meta = _volumePkg->loadSurface(id);
-                }
-                if (meta) {
+                // Only use already-loaded surfaces; never trigger TIFF I/O from filters.
+                auto surf = getSurfaceById(id);
+                if (surf) {
                     out.insert(id);
-                    if (_surfaces && !_surfaces->surface(id)) {
-                        _surfaces->setSurface(id, meta, true, false);
+                    if (_state && !_state->surface(id)) {
+                        _state->setSurface(id, surf, true, false);
                     }
                 }
             }
@@ -1500,7 +1551,7 @@ void SurfacePanelController::applyFiltersInternal()
         collectVisibleSurfaces(intersects);
 
         if (_viewerManager) {
-            _viewerManager->forEachViewer([&intersects](CVolumeViewer* viewer) {
+            _viewerManager->forEachViewer([&intersects](CTiledVolumeViewer* viewer) {
                 if (viewer && viewer->surfName() != "segmentation") {
                     viewer->setIntersects(intersects);
                 }
@@ -1512,7 +1563,7 @@ void SurfacePanelController::applyFiltersInternal()
     }
 
     std::set<std::string> intersects = {"segmentation"};
-    POI* poi = _surfaces ? _surfaces->poi("focus") : nullptr;
+    POI* poi = _state ? _state->poi("focus") : nullptr;
     int filterCounter = 0;
     const bool currentOnly = isChecked(_filters.currentOnly);
     const bool restrictToCurrent = currentOnly && !_currentSurfaceId.empty();
@@ -1523,13 +1574,8 @@ void SurfacePanelController::applyFiltersInternal()
         std::string id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
 
         bool show = true;
-        auto surf = _volumePkg->getSurface(id);
-        if (!surf) {
-            surf = _volumePkg->loadSurface(id);
-        }
-        if (surf && _surfaces && !_surfaces->surface(id)) {
-            _surfaces->setSurface(id, surf, true, false);
-        }
+        // Only use already-loaded surfaces; never trigger TIFF I/O from filters.
+        auto surf = getSurfaceById(id);
 
         if (hasSurfaceIdFilter && !id.empty()) {
             show = show && QString::fromStdString(id).contains(surfaceIdFilterText, Qt::CaseInsensitive);
@@ -1642,7 +1688,7 @@ void SurfacePanelController::applyFiltersInternal()
     intersects.clear();
     intersects.insert("segmentation");
     bool insertedCurrent = false;
-    if (restrictToCurrent && _volumePkg->getSurface(_currentSurfaceId)) {
+    if (restrictToCurrent && getSurfaceById(_currentSurfaceId)) {
         intersects.insert(_currentSurfaceId);
         insertedCurrent = true;
     }
@@ -1651,7 +1697,7 @@ void SurfacePanelController::applyFiltersInternal()
     }
 
     if (_viewerManager) {
-        _viewerManager->forEachViewer([&intersects](CVolumeViewer* viewer) {
+        _viewerManager->forEachViewer([&intersects](CTiledVolumeViewer* viewer) {
             if (viewer && viewer->surfName() != "segmentation") {
                 viewer->setIntersects(intersects);
             }
@@ -1750,8 +1796,8 @@ void SurfacePanelController::logSurfaceLoadSummary() const
 
     for (const auto& id : segIds) {
         bool hasSurface = false;
-        if (_surfaces) {
-            if (_surfaces->surface(id)) {
+        if (_state) {
+            if (_state->surface(id)) {
                 hasSurface = true;
             }
         } else {
@@ -1799,6 +1845,25 @@ void SurfacePanelController::applyHighlightSelection(const std::string& id, bool
         std::vector<std::string> ids(_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end());
         _viewerManager->setHighlightedSurfaceIds(ids);
     }
+}
+
+std::shared_ptr<QuadSurface> SurfacePanelController::getSurfaceById(const std::string& id) const
+{
+    // Try volumePkg first (local mode)
+    if (_volumePkg) {
+        auto surf = _volumePkg->getSurface(id);
+        if (surf) {
+            return surf;
+        }
+    }
+    // Fall back to CState (remote mode)
+    if (_state) {
+        auto surf = _state->surface(id);
+        if (surf) {
+            return std::dynamic_pointer_cast<QuadSurface>(surf);
+        }
+    }
+    return nullptr;
 }
 
 bool SurfacePanelController::cycleToNextVisibleSegment()
@@ -1869,16 +1934,13 @@ bool SurfacePanelController::cycleVisibleSegment(int direction)
     const QString idQString = nextItem->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
     const std::string id = idQString.toStdString();
 
-    std::shared_ptr<QuadSurface> surface;
-    if (_volumePkg) {
-        surface = _volumePkg->getSurface(id);
-    }
+    std::shared_ptr<QuadSurface> surface = getSurfaceById(id);
 
-    if (surface && _surfaces) {
-        if (!_surfaces->surface(id)) {
-            _surfaces->setSurface(id, surface, true, false);
+    if (surface && _state) {
+        if (!_state->surface(id)) {
+            _state->setSurface(id, surface, true, false);
         }
-        _surfaces->setSurface("segmentation", surface, false, false);
+        _state->setSurface("segmentation", surface, false, false);
     }
 
     _currentSurfaceId = id;

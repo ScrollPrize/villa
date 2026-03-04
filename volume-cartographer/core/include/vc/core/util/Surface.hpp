@@ -17,6 +17,7 @@ public:
     // Subclasses may override but default returns origin.
     virtual cv::Vec3f pointer() { return {0, 0, 0}; }
 
+
     //move pointer within internal coordinate system
     virtual void move(cv::Vec3f &ptr, const cv::Vec3f &offset) = 0;
     //does the pointer location contain valid surface data
