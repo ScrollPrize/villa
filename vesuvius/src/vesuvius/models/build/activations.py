@@ -17,9 +17,8 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         # Split input in half along the channel dimension
         x1, x2 = x.chunk(2, dim=self.dim)
-        # Apply Swish (SiLU) to first half with clamping for stability
-        # Clamp prevents numerical overflow that can cause NaN
-        gate = F.silu(x1.clamp(min=-10, max=10))
+        # Match timm SwiGLU gate behavior (plain SiLU without clamping)
+        gate = F.silu(x1)
         return gate * x2
 
 
