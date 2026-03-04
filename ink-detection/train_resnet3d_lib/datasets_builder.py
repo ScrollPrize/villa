@@ -323,8 +323,9 @@ def _build_state(
     )
 
 
-def _build_zarr_datasets(
+def _build_datasets_for_backend(
     *,
+    data_backend,
     segments_metadata,
     train_fragment_ids,
     val_fragment_ids,
@@ -339,214 +340,112 @@ def _build_zarr_datasets(
     valid_transform,
     log_only_segments,
     log_only_downsample,
-    shared_volume_cache,
+    shared_volume_cache=None,
 ):
-    log("building datasets (zarr lazy)")
+    backend = str(data_backend).strip().lower()
+    if backend not in {"zarr", "tiff"}:
+        raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
+    is_zarr = backend == "zarr"
     include_train_xyxys = bool(getattr(CFG, "stitch_train", False))
     tracking = init_dataset_tracking(include_train_xyxys=include_train_xyxys)
-    train_groups_by_segment = {str(fid): int(fragment_to_group_idx[fid]) for fid in train_fragment_ids}
 
+    train_groups_by_segment = {str(fid): int(fragment_to_group_idx[fid]) for fid in train_fragment_ids}
     train_volumes_by_segment = {}
     train_masks_by_segment = {}
     train_xyxys_by_segment = {}
     train_sample_bbox_indices_by_segment = {}
 
-    def load_train_for_backend(fragment_id):
-        return _load_with_group_context(
-            fragment_id,
-            segments_metadata=segments_metadata,
-            fragment_to_group_idx=fragment_to_group_idx,
-            group_names=group_names,
-            loader_fn=load_train_segment_lazy,
-            volume_cache=shared_volume_cache,
-            include_train_xyxys=include_train_xyxys,
-            label_suffix=train_label_suffix,
-            mask_suffix=train_mask_suffix,
-        )
-
-    def consume_train_for_backend(_fragment_id, result):
-        if int(result["patch_count"]) <= 0:
-            return
-        sid = result["sid"]
-        train_volumes_by_segment[sid] = result["volume"]
-        train_masks_by_segment[sid] = result["mask_store"]
-        train_xyxys_by_segment[sid] = result["xyxys"]
-        train_sample_bbox_indices_by_segment[sid] = result["sample_bbox_indices"]
-
-    train_patch_counts_by_segment, train_mask_borders, train_mask_bboxes = _collect_train_segments(
-        train_fragment_ids,
-        load_train_fn=load_train_for_backend,
-        consume_train_fn=consume_train_for_backend,
-    )
-
-    def load_val_for_backend(fragment_id):
-        return _load_with_group_context(
-            fragment_id,
-            segments_metadata=segments_metadata,
-            fragment_to_group_idx=fragment_to_group_idx,
-            group_names=group_names,
-            loader_fn=load_val_segment_lazy,
-            volume_cache=shared_volume_cache,
-            include_train_xyxys=include_train_xyxys,
-            valid_transform=valid_transform,
-            label_suffix=val_label_suffix,
-            mask_suffix=val_mask_suffix,
-        )
-
-    val_patch_counts_by_segment = _collect_val_segments(
-        val_fragment_ids,
-        load_val_fn=load_val_for_backend,
-        tracking=tracking,
-    )
-
-    summarize_patch_counts(
-        "train",
-        train_fragment_ids,
-        train_patch_counts_by_segment,
-        group_names=group_names,
-        fragment_to_group_idx=fragment_to_group_idx,
-    )
-    summarize_patch_counts(
-        "val",
-        val_fragment_ids,
-        val_patch_counts_by_segment,
-        group_names=group_names,
-        fragment_to_group_idx=fragment_to_group_idx,
-    )
-
-    train_patches_total = int(sum(int(v) for v in train_patch_counts_by_segment.values()))
-    log(
-        "dataset built (zarr) "
-        f"train_patches={train_patches_total} val_loaders={len(tracking['val_loaders'])}"
-    )
-    if train_patches_total == 0:
-        raise ValueError("No training data was built (all segments produced 0 training patches).")
-    if len(tracking["val_loaders"]) == 0:
-        raise ValueError("No validation data was built (all segments produced 0 validation patches).")
-
-    train_loader, train_group_counts = build_train_loader_lazy(
-        train_volumes_by_segment,
-        train_masks_by_segment,
-        train_xyxys_by_segment,
-        train_sample_bbox_indices_by_segment,
-        train_groups_by_segment,
-        group_names,
-        train_transform=train_transform,
-    )
-    steps_per_epoch = log_training_budget(train_loader)
-
-    train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids = build_train_stitch_outputs(
-        data_backend="zarr",
-        train_fragment_ids=train_fragment_ids,
-        stitch_segment_id=tracking["stitch_segment_id"],
-        valid_transform=valid_transform,
-        train_volumes_by_segment=train_volumes_by_segment,
-        train_masks_by_segment=train_masks_by_segment,
-        train_xyxys_by_segment=train_xyxys_by_segment,
-        train_sample_bbox_indices_by_segment=train_sample_bbox_indices_by_segment,
-        train_groups_by_segment=train_groups_by_segment,
-    )
-
-    log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes = build_log_only_outputs(
-        data_backend="zarr",
-        log_only_segments=log_only_segments,
-        segments_metadata=segments_metadata,
-        volume_cache=shared_volume_cache,
-        valid_transform=valid_transform,
-        mask_suffix=val_mask_suffix,
-        log_only_downsample=log_only_downsample,
-    )
-
-    return _build_state(
-        train_loader=train_loader,
-        group_names=group_names,
-        group_idx_by_segment=group_idx_by_segment,
-        train_group_counts=train_group_counts,
-        steps_per_epoch=steps_per_epoch,
-        train_stitch_loaders=train_stitch_loaders,
-        train_stitch_shapes=train_stitch_shapes,
-        train_stitch_segment_ids=train_stitch_segment_ids,
-        train_mask_borders=train_mask_borders,
-        train_mask_bboxes=train_mask_bboxes,
-        log_only_loaders=log_only_loaders,
-        log_only_shapes=log_only_shapes,
-        log_only_segment_ids=log_only_segment_ids,
-        log_only_bboxes=log_only_bboxes,
-        tracking=tracking,
-    )
-
-
-def _build_tiff_datasets(
-    *,
-    segments_metadata,
-    train_fragment_ids,
-    val_fragment_ids,
-    group_names,
-    fragment_to_group_idx,
-    group_idx_by_segment,
-    train_label_suffix,
-    train_mask_suffix,
-    val_label_suffix,
-    val_mask_suffix,
-    train_transform,
-    valid_transform,
-    log_only_segments,
-    log_only_downsample,
-):
-    log("building datasets")
-    include_train_xyxys = bool(getattr(CFG, "stitch_train", False))
-    tracking = init_dataset_tracking(include_train_xyxys=include_train_xyxys)
-
     train_images = []
     train_masks = []
     train_groups = []
     train_stitch_candidates = {}
-
-    train_set = set(train_fragment_ids)
-    val_set = set(val_fragment_ids)
-    overlap_segments = train_set & val_set
     layers_cache = {}
+    overlap_segments = set(train_fragment_ids) & set(val_fragment_ids)
 
-    def load_train_for_backend(fragment_id):
-        return _load_with_group_context(
-            fragment_id,
-            segments_metadata=segments_metadata,
-            fragment_to_group_idx=fragment_to_group_idx,
-            group_names=group_names,
-            loader_fn=load_train_segment,
-            overlap_segments=overlap_segments,
-            layers_cache=layers_cache,
-            include_train_xyxys=include_train_xyxys,
-            label_suffix=train_label_suffix,
-            mask_suffix=train_mask_suffix,
-        )
+    if is_zarr:
+        if shared_volume_cache is None:
+            raise ValueError("shared_volume_cache is required when training.data_backend is 'zarr'")
+        log("building datasets (zarr lazy)")
 
-    def consume_train_for_backend(fragment_id, result):
-        if result["stitch_candidate"] is not None:
-            train_stitch_candidates[str(fragment_id)] = result["stitch_candidate"]
-        train_images.extend(result["images"])
-        train_masks.extend(result["masks"])
-        train_groups.extend([int(result["group_idx"])] * len(result["images"]))
+        def load_train_for_backend(fragment_id):
+            return _load_with_group_context(
+                fragment_id,
+                segments_metadata=segments_metadata,
+                fragment_to_group_idx=fragment_to_group_idx,
+                group_names=group_names,
+                loader_fn=load_train_segment_lazy,
+                volume_cache=shared_volume_cache,
+                include_train_xyxys=include_train_xyxys,
+                label_suffix=train_label_suffix,
+                mask_suffix=train_mask_suffix,
+            )
+
+        def consume_train_for_backend(_fragment_id, result):
+            if int(result["patch_count"]) <= 0:
+                return
+            sid = result["sid"]
+            train_volumes_by_segment[sid] = result["volume"]
+            train_masks_by_segment[sid] = result["mask_store"]
+            train_xyxys_by_segment[sid] = result["xyxys"]
+            train_sample_bbox_indices_by_segment[sid] = result["sample_bbox_indices"]
+
+        def load_val_for_backend(fragment_id):
+            return _load_with_group_context(
+                fragment_id,
+                segments_metadata=segments_metadata,
+                fragment_to_group_idx=fragment_to_group_idx,
+                group_names=group_names,
+                loader_fn=load_val_segment_lazy,
+                volume_cache=shared_volume_cache,
+                include_train_xyxys=include_train_xyxys,
+                valid_transform=valid_transform,
+                label_suffix=val_label_suffix,
+                mask_suffix=val_mask_suffix,
+            )
+
+    else:
+        log("building datasets")
+
+        def load_train_for_backend(fragment_id):
+            return _load_with_group_context(
+                fragment_id,
+                segments_metadata=segments_metadata,
+                fragment_to_group_idx=fragment_to_group_idx,
+                group_names=group_names,
+                loader_fn=load_train_segment,
+                overlap_segments=overlap_segments,
+                layers_cache=layers_cache,
+                include_train_xyxys=include_train_xyxys,
+                label_suffix=train_label_suffix,
+                mask_suffix=train_mask_suffix,
+            )
+
+        def consume_train_for_backend(fragment_id, result):
+            if result["stitch_candidate"] is not None:
+                train_stitch_candidates[str(fragment_id)] = result["stitch_candidate"]
+            train_images.extend(result["images"])
+            train_masks.extend(result["masks"])
+            train_groups.extend([int(result["group_idx"])] * len(result["images"]))
+
+        def load_val_for_backend(fragment_id):
+            return _load_with_group_context(
+                fragment_id,
+                segments_metadata=segments_metadata,
+                fragment_to_group_idx=fragment_to_group_idx,
+                group_names=group_names,
+                loader_fn=load_val_segment,
+                layers_cache=layers_cache,
+                include_train_xyxys=include_train_xyxys,
+                valid_transform=valid_transform,
+                label_suffix=val_label_suffix,
+                mask_suffix=val_mask_suffix,
+            )
 
     train_patch_counts_by_segment, train_mask_borders, train_mask_bboxes = _collect_train_segments(
         train_fragment_ids,
         load_train_fn=load_train_for_backend,
         consume_train_fn=consume_train_for_backend,
     )
-
-    def load_val_for_backend(fragment_id):
-        return _load_with_group_context(
-            fragment_id,
-            segments_metadata=segments_metadata,
-            fragment_to_group_idx=fragment_to_group_idx,
-            group_names=group_names,
-            loader_fn=load_val_segment,
-            layers_cache=layers_cache,
-            include_train_xyxys=include_train_xyxys,
-            valid_transform=valid_transform,
-            label_suffix=val_label_suffix,
-            mask_suffix=val_mask_suffix,
-        )
 
     val_patch_counts_by_segment = _collect_val_segments(
         val_fragment_ids,
@@ -569,36 +468,77 @@ def _build_tiff_datasets(
         fragment_to_group_idx=fragment_to_group_idx,
     )
 
-    log(f"dataset built train_patches={len(train_images)} val_loaders={len(tracking['val_loaders'])}")
+    if is_zarr:
+        train_patches_total = int(sum(int(v) for v in train_patch_counts_by_segment.values()))
+        log(
+            "dataset built (zarr) "
+            f"train_patches={train_patches_total} val_loaders={len(tracking['val_loaders'])}"
+        )
+        if train_patches_total == 0:
+            raise ValueError("No training data was built (all segments produced 0 training patches).")
+    else:
+        log(f"dataset built train_patches={len(train_images)} val_loaders={len(tracking['val_loaders'])}")
     if len(tracking["val_loaders"]) == 0:
         raise ValueError("No validation data was built (all segments produced 0 validation patches).")
 
-    train_loader, train_group_counts = build_train_loader(
-        train_images,
-        train_masks,
-        train_groups,
-        group_names,
-        train_transform=train_transform,
-    )
+    if is_zarr:
+        train_loader, train_group_counts = build_train_loader_lazy(
+            train_volumes_by_segment,
+            train_masks_by_segment,
+            train_xyxys_by_segment,
+            train_sample_bbox_indices_by_segment,
+            train_groups_by_segment,
+            group_names,
+            train_transform=train_transform,
+        )
+    else:
+        train_loader, train_group_counts = build_train_loader(
+            train_images,
+            train_masks,
+            train_groups,
+            group_names,
+            train_transform=train_transform,
+        )
     steps_per_epoch = log_training_budget(train_loader)
 
-    train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids = build_train_stitch_outputs(
-        data_backend="tiff",
-        train_fragment_ids=train_fragment_ids,
-        stitch_segment_id=tracking["stitch_segment_id"],
-        valid_transform=valid_transform,
-        train_stitch_candidates=train_stitch_candidates,
-    )
-
-    log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes = build_log_only_outputs(
-        data_backend="tiff",
-        log_only_segments=log_only_segments,
-        segments_metadata=segments_metadata,
-        layers_cache=layers_cache,
-        valid_transform=valid_transform,
-        mask_suffix=val_mask_suffix,
-        log_only_downsample=log_only_downsample,
-    )
+    if is_zarr:
+        train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids = build_train_stitch_outputs(
+            data_backend="zarr",
+            train_fragment_ids=train_fragment_ids,
+            stitch_segment_id=tracking["stitch_segment_id"],
+            valid_transform=valid_transform,
+            train_volumes_by_segment=train_volumes_by_segment,
+            train_masks_by_segment=train_masks_by_segment,
+            train_xyxys_by_segment=train_xyxys_by_segment,
+            train_sample_bbox_indices_by_segment=train_sample_bbox_indices_by_segment,
+            train_groups_by_segment=train_groups_by_segment,
+        )
+        log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes = build_log_only_outputs(
+            data_backend="zarr",
+            log_only_segments=log_only_segments,
+            segments_metadata=segments_metadata,
+            volume_cache=shared_volume_cache,
+            valid_transform=valid_transform,
+            mask_suffix=val_mask_suffix,
+            log_only_downsample=log_only_downsample,
+        )
+    else:
+        train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids = build_train_stitch_outputs(
+            data_backend="tiff",
+            train_fragment_ids=train_fragment_ids,
+            stitch_segment_id=tracking["stitch_segment_id"],
+            valid_transform=valid_transform,
+            train_stitch_candidates=train_stitch_candidates,
+        )
+        log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes = build_log_only_outputs(
+            data_backend="tiff",
+            log_only_segments=log_only_segments,
+            segments_metadata=segments_metadata,
+            layers_cache=layers_cache,
+            valid_transform=valid_transform,
+            mask_suffix=val_mask_suffix,
+            log_only_downsample=log_only_downsample,
+        )
 
     return _build_state(
         train_loader=train_loader,
@@ -669,26 +609,8 @@ def build_datasets(run_state):
     valid_transform = get_transforms(data="valid", cfg=CFG)
     log_only_downsample = int(getattr(CFG, "stitch_log_only_downsample", getattr(CFG, "stitch_downsample", 1)))
 
-    if data_backend == "zarr":
-        return _build_zarr_datasets(
-            segments_metadata=segments_metadata,
-            train_fragment_ids=train_fragment_ids,
-            val_fragment_ids=val_fragment_ids,
-            group_names=group_names,
-            fragment_to_group_idx=fragment_to_group_idx,
-            group_idx_by_segment=group_idx_by_segment,
-            train_label_suffix=train_label_suffix,
-            train_mask_suffix=train_mask_suffix,
-            val_label_suffix=val_label_suffix,
-            val_mask_suffix=val_mask_suffix,
-            train_transform=train_transform,
-            valid_transform=valid_transform,
-            log_only_segments=log_only_segments,
-            log_only_downsample=log_only_downsample,
-            shared_volume_cache=shared_volume_cache,
-        )
-
-    return _build_tiff_datasets(
+    return _build_datasets_for_backend(
+        data_backend=data_backend,
         segments_metadata=segments_metadata,
         train_fragment_ids=train_fragment_ids,
         val_fragment_ids=val_fragment_ids,
@@ -703,4 +625,5 @@ def build_datasets(run_state):
         valid_transform=valid_transform,
         log_only_segments=log_only_segments,
         log_only_downsample=log_only_downsample,
+        shared_volume_cache=shared_volume_cache,
     )
