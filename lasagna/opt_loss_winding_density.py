@@ -46,29 +46,6 @@ def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tens
 	center_hr = _upsample_hw(center_pt)
 	next_hr = _upsample_hw(next_pt)
 
-	# Per-vertex unit normals for signed strip length.
-	# For the arc init, normals point inward (toward center of curvature).
-	# Both strip directions (prev→center, center→next) should go anti-normal
-	# (outward, toward the adjacent winding).  If a connection point is on the
-	# wrong side of the surface, the signed length flips negative, making the
-	# density negative and creating a strong penalty.
-	# Normals detached: winding density loss pushes/pulls points along an
-	# apparently-constant normal direction.  No gradient flows to neighbor
-	# vertices via the normal construction.
-	xyz_lr = res.xyz_lr.detach()  # (D, Hm, Wm, 3)
-	edge_h = torch.zeros_like(xyz_lr)
-	edge_h[:, 1:-1] = xyz_lr[:, 2:] - xyz_lr[:, :-2]
-	edge_h[:, 0] = xyz_lr[:, 1] - xyz_lr[:, 0]
-	edge_h[:, -1] = xyz_lr[:, -1] - xyz_lr[:, -2]
-	edge_w = torch.zeros_like(xyz_lr)
-	edge_w[:, :, 1:-1] = xyz_lr[:, :, 2:] - xyz_lr[:, :, :-2]
-	edge_w[:, :, 0] = xyz_lr[:, :, 1] - xyz_lr[:, :, 0]
-	edge_w[:, :, -1] = xyz_lr[:, :, -1] - xyz_lr[:, :, -2]
-	normals_lr = torch.cross(edge_h, edge_w, dim=-1)  # (D, Hm, Wm, 3)
-	normals_lr = normals_lr / torch.sqrt((normals_lr * normals_lr).sum(dim=-1, keepdim=True) + 1e-12)
-	normals_hr = _upsample_hw(normals_lr)  # (D, He, We, 3)
-	normals_hr = normals_hr / torch.sqrt((normals_hr * normals_hr).sum(dim=-1, keepdim=True) + 1e-12)
-
 	# Upsample mask_conn: (D, 1, Hm, Wm, 3) -> (D, 1, He, We, 3)
 	# Reshape to (D*3, 1, Hm, Wm), upsample, reshape back
 	mc = mask_conn.permute(0, 4, 1, 2, 3).reshape(D * 3, 1, Hm, Wm)
@@ -91,14 +68,11 @@ def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tens
 		mag = sampled.grad_mag.squeeze(0).squeeze(0)  # (D, He, We*S)
 		mag = mag.reshape(D, He, We, strip_samples)
 
-		# Signed strip length: projection of displacement onto anti-normal.
-		# Positive when strip goes anti-normal (correct: toward adjacent winding).
-		# Negative when strip goes along-normal (wrong side / self-intersection).
-		# Differentiable — gradient flows through the dot product to mesh positions.
-		signed_len = -(diff * normals_hr).sum(dim=-1)  # (D, He, We)
+		# Unsigned strip length (Euclidean distance between endpoints).
+		strip_len = torch.sqrt((diff * diff).sum(dim=-1) + 1e-12)  # (D, He, We)
 
-		# mag_n = grad_mag * signed_strip_length
-		mag_n = mag * signed_len.unsqueeze(-1)
+		# mag_n = grad_mag * strip_length; target is 1.0 (one winding traversed)
+		mag_n = mag * strip_len.unsqueeze(-1)
 		lm = ((mag_n - 1.0) ** 2).mean(dim=-1)  # (D, He, We)
 
 		# Strip validity: all sample points must be valid
