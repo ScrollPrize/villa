@@ -7,6 +7,7 @@ and task-specific decoders.
 """
 
 from typing import Tuple, Dict, Optional, List
+import math
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -187,7 +188,7 @@ class PrimusEncoder(nn.Module):
         x = self.patch_embed(x)
         B, C = x.shape[:2]
         spatial_shape = x.shape[2:]
-        num_patches = int(torch.tensor(spatial_shape).prod().item())
+        num_patches = math.prod(spatial_shape)
 
         # Rearrange to sequence format
         if self.ndim == 2:
