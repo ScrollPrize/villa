@@ -243,9 +243,11 @@ class Model3D(nn.Module):
 		edge_w[:, :, 1:-1] = xyz_lr[:, :, 2:] - xyz_lr[:, :, :-2]
 		edge_w[:, :, 0] = xyz_lr[:, :, 1] - xyz_lr[:, :, 0]
 		edge_w[:, :, -1] = xyz_lr[:, :, -1] - xyz_lr[:, :, -2]
-		# Normal = cross(edge_h, edge_w), normalized
+		# Normal = cross(edge_h, edge_w) — unnormalized is fine because the
+		# ray-bilinear-patch quadratic coefficients scale as |n|², so u,v are
+		# scale-invariant.  Normalizing introduces sqrt(0) grad issues.
 		n = torch.cross(edge_h, edge_w, dim=-1)
-		return F.normalize(n, dim=-1)
+		return n
 
 	def _xyz_conn(self, xyz_lr: torch.Tensor, data: fit_data.FitData3D) -> tuple[torch.Tensor, torch.Tensor]:
 		"""Compute connection points to neighbor depth slices.
@@ -331,7 +333,7 @@ class Model3D(nn.Module):
 			# Discriminant
 			disc = beta * beta - 4.0 * alpha * gamma
 			disc_safe = disc.clamp(min=0.0)
-			sqrt_disc = torch.sqrt(disc_safe)
+			sqrt_disc = torch.sqrt(disc_safe + 1e-12)
 
 			# Two solutions
 			alpha_abs = alpha.abs()
