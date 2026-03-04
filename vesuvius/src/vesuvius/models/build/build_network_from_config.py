@@ -530,7 +530,7 @@ class NetworkFromConfig(nn.Module):
         
         patch_embed_size = model_config.get("patch_embed_size", (8, 8, 8))
         if isinstance(patch_embed_size, int):
-            patch_embed_size = (patch_embed_size,) * 3
+            patch_embed_size = (patch_embed_size,) * len(self.patch_size)
         
         # Ensure input shape is specified
         input_shape = model_config.get("input_shape", self.patch_size)

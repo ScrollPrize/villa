@@ -14,12 +14,12 @@ from timm.layers import RotaryEmbeddingCat
 
 from .transformers.primus import _PRIMUS_CONFIGS
 from .transformers.eva import Eva
-from .transformers.patch_encode_decode import PatchEmbed, PatchDecode, LayerNormNd
+from .transformers.patch_encode_decode import PatchDecode, PatchEmbed_deeper, LayerNormNd
 
 
 class PrimusEncoder(nn.Module):
     """
-    Encoder wrapper for Primus that extracts features using PatchEmbed + EVA.
+    Encoder wrapper for Primus with v2-style deeper patch embedding + EVA.
     Compatible with NetworkFromConfig's encoder interface.
     """
     
@@ -58,6 +58,10 @@ class PrimusEncoder(nn.Module):
         
         # Check input shape compatibility
         assert len(input_shape) in (2, 3), "Only 2D and 3D inputs are supported"
+        assert len(patch_embed_size) == len(input_shape), "patch_embed_size dimensionality must match input_shape"
+        assert tuple(patch_embed_size) == tuple([8] * len(input_shape)), (
+            f"deeper patch embedding downsamples by 8x. Use patch_embed_size={tuple([8] * len(input_shape))}."
+        )
         assert all([j % i == 0 for i, j in zip(patch_embed_size, input_shape)]), \
             f"Input shape {input_shape} must be divisible by patch_embed_size {patch_embed_size}"
         self.ndim = len(input_shape)
@@ -65,8 +69,17 @@ class PrimusEncoder(nn.Module):
         # Calculate patch grid dimensions
         self.patch_grid = tuple([i // ds for i, ds in zip(input_shape, patch_embed_size)])
         
-        # Initialize patch embedding
-        self.patch_embed = PatchEmbed(patch_embed_size, input_channels, self.embed_dim)
+        # Initialize deeper patch embedding (Primus v2 style)
+        self.patch_embed = PatchEmbed_deeper(
+            input_channels=input_channels,
+            embed_dim=self.embed_dim,
+            base_features=32,
+            ndim=self.ndim,
+            depth_per_level=(1, 1, 1),
+            embed_proj_3x3x3=False,
+            embed_block_style="residual",
+            embed_block_type="basic",
+        )
         
         # Initialize EVA transformer
         self.eva = Eva(
