@@ -36,10 +36,18 @@ class CFG:
     # backbone = 'efficientnet-b0'
     # backbone = 'se_resnext50_32x4d'
     backbone = 'resnet3d'
+    model_impl = "resnet3d_hybrid"  # "resnet3d_hybrid" | "vesuvius_resunet_hybrid"
     in_chans = 62  # 65
     encoder_depth = 5
     norm = "batch"  # "batch" | "group"
     group_norm_groups = 32
+    vesuvius_model_config = {}
+    vesuvius_target_name = "ink"
+    vesuvius_z_projection_mode = "logsumexp"  # "logsumexp" | "max" | "mean" | "learned_mlp"
+    vesuvius_z_projection_lse_tau = 1.0
+    vesuvius_z_projection_mlp_hidden = 64
+    vesuvius_z_projection_mlp_dropout = 0.0
+    vesuvius_z_projection_mlp_depth = None
     # ============== training cfg =============
     size = 256
     tile_size = 256
@@ -49,7 +57,7 @@ class CFG:
     valid_batch_size = train_batch_size
     use_amp = True
 
-    scheduler = "OneCycleLR"  # "OneCycleLR" | "cosine"
+    scheduler = "OneCycleLR"  # "OneCycleLR" | "cosine" | "cosine_warmup" | "diffusers_cosine_warmup"
     epochs = 30  # 30
 
     optimizer = "adamw"  # "adamw" | "sgd"
@@ -67,6 +75,8 @@ class CFG:
     onecycle_div_factor = 25.0
     onecycle_final_div_factor = 1e2
     cosine_warmup_pct = 0.15
+    scheduler_warmup_steps = None
+    scheduler_num_cycles = 0.5
     # ============== fold =============
     valid_id = None
     stitch_all_val = False
@@ -511,6 +521,98 @@ def apply_metadata_hyperparameters(cfg, metadata):
         else:
             setattr(cfg, k, model_hp[k])
 
+    cfg.model_impl = str(
+        model_hp.get("model_impl", getattr(cfg, "model_impl", "resnet3d_hybrid"))
+    ).strip().lower()
+    if cfg.model_impl not in {"resnet3d_hybrid", "vesuvius_resunet_hybrid"}:
+        raise ValueError(
+            "training_hyperparameters.model.model_impl must be "
+            "'resnet3d_hybrid' or 'vesuvius_resunet_hybrid', "
+            f"got {cfg.model_impl!r}"
+        )
+
+    vesuvius_model_config = model_hp.get(
+        "vesuvius_model_config",
+        getattr(cfg, "vesuvius_model_config", {}),
+    )
+    if vesuvius_model_config is None:
+        vesuvius_model_config = {}
+    if not isinstance(vesuvius_model_config, dict):
+        raise TypeError(
+            "training_hyperparameters.model.vesuvius_model_config must be an object, "
+            f"got {type(vesuvius_model_config).__name__}"
+        )
+    cfg.vesuvius_model_config = json.loads(json.dumps(vesuvius_model_config))
+
+    cfg.vesuvius_target_name = str(
+        model_hp.get("vesuvius_target_name", getattr(cfg, "vesuvius_target_name", "ink"))
+    ).strip()
+    if not cfg.vesuvius_target_name:
+        raise ValueError("training_hyperparameters.model.vesuvius_target_name must be non-empty")
+
+    cfg.vesuvius_z_projection_mode = str(
+        model_hp.get(
+            "vesuvius_z_projection_mode",
+            getattr(cfg, "vesuvius_z_projection_mode", "logsumexp"),
+        )
+    ).strip().lower()
+    if cfg.vesuvius_z_projection_mode not in {"logsumexp", "max", "mean", "learned_mlp"}:
+        raise ValueError(
+            "training_hyperparameters.model.vesuvius_z_projection_mode must be one of "
+            "'logsumexp', 'max', 'mean', 'learned_mlp', "
+            f"got {cfg.vesuvius_z_projection_mode!r}"
+        )
+
+    cfg.vesuvius_z_projection_lse_tau = float(
+        model_hp.get(
+            "vesuvius_z_projection_lse_tau",
+            getattr(cfg, "vesuvius_z_projection_lse_tau", 1.0),
+        )
+    )
+    if cfg.vesuvius_z_projection_lse_tau <= 0:
+        raise ValueError(
+            "training_hyperparameters.model.vesuvius_z_projection_lse_tau must be > 0, "
+            f"got {cfg.vesuvius_z_projection_lse_tau}"
+        )
+
+    cfg.vesuvius_z_projection_mlp_hidden = int(
+        model_hp.get(
+            "vesuvius_z_projection_mlp_hidden",
+            getattr(cfg, "vesuvius_z_projection_mlp_hidden", 64),
+        )
+    )
+    if cfg.vesuvius_z_projection_mlp_hidden <= 0:
+        raise ValueError(
+            "training_hyperparameters.model.vesuvius_z_projection_mlp_hidden must be > 0, "
+            f"got {cfg.vesuvius_z_projection_mlp_hidden}"
+        )
+
+    cfg.vesuvius_z_projection_mlp_dropout = float(
+        model_hp.get(
+            "vesuvius_z_projection_mlp_dropout",
+            getattr(cfg, "vesuvius_z_projection_mlp_dropout", 0.0),
+        )
+    )
+    if not (0.0 <= cfg.vesuvius_z_projection_mlp_dropout <= 1.0):
+        raise ValueError(
+            "training_hyperparameters.model.vesuvius_z_projection_mlp_dropout must be in [0, 1], "
+            f"got {cfg.vesuvius_z_projection_mlp_dropout}"
+        )
+
+    raw_mlp_depth = model_hp.get(
+        "vesuvius_z_projection_mlp_depth",
+        getattr(cfg, "vesuvius_z_projection_mlp_depth", None),
+    )
+    if raw_mlp_depth is None:
+        cfg.vesuvius_z_projection_mlp_depth = int(cfg.in_chans)
+    else:
+        cfg.vesuvius_z_projection_mlp_depth = int(raw_mlp_depth)
+    if cfg.vesuvius_z_projection_mlp_depth <= 0:
+        raise ValueError(
+            "training_hyperparameters.model.vesuvius_z_projection_mlp_depth must be > 0, "
+            f"got {cfg.vesuvius_z_projection_mlp_depth}"
+        )
+
     for k, attr in [
         ("size", "size"),
         ("tile_size", "tile_size"),
@@ -532,6 +634,8 @@ def apply_metadata_hyperparameters(cfg, metadata):
         ("onecycle_div_factor", "onecycle_div_factor"),
         ("onecycle_final_div_factor", "onecycle_final_div_factor"),
         ("cosine_warmup_pct", "cosine_warmup_pct"),
+        ("scheduler_warmup_steps", "scheduler_warmup_steps"),
+        ("scheduler_num_cycles", "scheduler_num_cycles"),
         ("min_lr", "min_lr"),
         ("weight_decay", "weight_decay"),
         ("exclude_weight_decay_bias_norm", "exclude_weight_decay_bias_norm"),
@@ -620,6 +724,44 @@ def apply_metadata_hyperparameters(cfg, metadata):
         raise ValueError(
             "training_hyperparameters.training.sgd_nesterov requires sgd_momentum > 0, "
             f"got sgd_momentum={cfg.sgd_momentum}"
+        )
+
+    cfg.scheduler = str(getattr(cfg, "scheduler", "OneCycleLR")).strip()
+    scheduler_name = cfg.scheduler.lower()
+    supported_schedulers = {
+        "onecyclelr",
+        "cosine",
+        "cosine_warmup",
+        "diffusers_cosine_warmup",
+        "gradualwarmupschedulerv2",
+    }
+    if scheduler_name not in supported_schedulers:
+        raise ValueError(
+            "training_hyperparameters.training.scheduler must be one of "
+            "'OneCycleLR', 'cosine', 'cosine_warmup', 'diffusers_cosine_warmup', "
+            f"'GradualWarmupSchedulerV2'; got {cfg.scheduler!r}"
+        )
+
+    raw_scheduler_warmup_steps = getattr(cfg, "scheduler_warmup_steps", None)
+    if isinstance(raw_scheduler_warmup_steps, str):
+        text = raw_scheduler_warmup_steps.strip().lower()
+        if text in {"", "none", "null"}:
+            raw_scheduler_warmup_steps = None
+    if raw_scheduler_warmup_steps is None:
+        cfg.scheduler_warmup_steps = None
+    else:
+        cfg.scheduler_warmup_steps = int(raw_scheduler_warmup_steps)
+        if cfg.scheduler_warmup_steps < 0:
+            raise ValueError(
+                "training_hyperparameters.training.scheduler_warmup_steps must be >= 0 when set, "
+                f"got {cfg.scheduler_warmup_steps}"
+            )
+
+    cfg.scheduler_num_cycles = float(getattr(cfg, "scheduler_num_cycles", 0.5))
+    if cfg.scheduler_num_cycles <= 0:
+        raise ValueError(
+            "training_hyperparameters.training.scheduler_num_cycles must be > 0, "
+            f"got {cfg.scheduler_num_cycles}"
         )
 
     cfg.objective = str(training_cfg.get("objective", getattr(cfg, "objective", "erm"))).lower()

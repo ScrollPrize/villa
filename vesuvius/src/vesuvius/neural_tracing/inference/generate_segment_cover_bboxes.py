@@ -2,9 +2,10 @@ import argparse
 import json
 from pathlib import Path
 import colorsys
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from vesuvius.tifxyz import read_tifxyz
 
@@ -177,21 +178,65 @@ def _assign_points_to_chunks_overlapped(points_zyx, world_min_zyx, world_max_zyx
     stride_zyx = _compute_stride_from_overlap(crop_size_zyx, overlap_frac)
     grid_shape = _compute_overlapped_grid_shape(world_min_zyx, world_max_zyx, crop_size_zyx, stride_zyx)
 
+    world_min_zyx = np.asarray(world_min_zyx, dtype=np.float64)
+    rel = np.asarray(points_zyx, dtype=np.float64) - world_min_zyx[None, :]  # (N, 3)
+    stride_f = stride_zyx.astype(np.float64)
+    crop_f = crop_size_zyx.astype(np.float64)
+    gs = grid_shape.astype(np.int64)
+
+    # For each point, find the range [low, high] of grid cell indices that cover it.
+    # Cell g covers [world_min + g*stride, world_min + g*stride + crop - 1], so
+    # point p (rel = p - world_min) is covered by g iff:
+    #   floor((rel - crop) / stride) + 1 <= g <= floor(rel / stride)
+    low = (np.floor((rel - crop_f[None, :]) / stride_f[None, :]) + 1).astype(np.int64)  # (N, 3)
+    high = np.floor(rel / stride_f[None, :]).astype(np.int64)                            # (N, 3)
+    low = np.clip(low, 0, gs[None, :] - 1)
+    high = np.clip(high, 0, gs[None, :] - 1)
+
+    # Max number of extra cells per axis beyond the first (for any point).
+    # Typically 1 for 25% overlap (2 cells per axis -> 8 total offset combos).
+    delta = high - low  # (N, 3)
+    max_dz = int(np.maximum(0, delta[:, 0]).max()) if len(delta) else 0
+    max_dy = int(np.maximum(0, delta[:, 1]).max()) if len(delta) else 0
+    max_dx = int(np.maximum(0, delta[:, 2]).max()) if len(delta) else 0
+
+    N = points_zyx.shape[0]
+    point_indices = np.arange(N, dtype=np.int64)
+
+    # Outer loop is O(max_cells_per_axis^3), typically 8 iterations.
+    # Inner operations are fully vectorized over N points.
+    all_assignments = []
+    for dz in range(max_dz + 1):
+        for dy in range(max_dy + 1):
+            for dx in range(max_dx + 1):
+                gz = low[:, 0] + dz
+                gy = low[:, 1] + dy
+                gx = low[:, 2] + dx
+                mask = (gz <= high[:, 0]) & (gy <= high[:, 1]) & (gx <= high[:, 2])
+                if not np.any(mask):
+                    continue
+                all_assignments.append(np.stack(
+                    [gz[mask], gy[mask], gx[mask], point_indices[mask]], axis=1
+                ))
+
+    if not all_assignments:
+        return {}, grid_shape, stride_zyx
+
+    all_asgn = np.concatenate(all_assignments, axis=0)  # (M, 4): gz, gy, gx, point_idx
+
+    # Sort by (gz, gy, gx) and extract groups.
+    order = np.lexsort((all_asgn[:, 2], all_asgn[:, 1], all_asgn[:, 0]))
+    sorted_asgn = all_asgn[order]
+    changed = np.any(np.diff(sorted_asgn[:, :3], axis=0) != 0, axis=1)
+    starts = np.concatenate(([0], np.where(changed)[0] + 1))
+    ends = np.concatenate((starts[1:], [len(order)]))
+
     grouped = {}
-    for point_idx, point in enumerate(points_zyx):
-        zr = _axis_chunk_index_range(point[0], world_min_zyx[0], crop_size_zyx[0], stride_zyx[0], grid_shape[0])
-        yr = _axis_chunk_index_range(point[1], world_min_zyx[1], crop_size_zyx[1], stride_zyx[1], grid_shape[1])
-        xr = _axis_chunk_index_range(point[2], world_min_zyx[2], crop_size_zyx[2], stride_zyx[2], grid_shape[2])
-        if zr is None or yr is None or xr is None:
-            continue
+    for s, e in zip(starts, ends):
+        key = (int(sorted_asgn[s, 0]), int(sorted_asgn[s, 1]), int(sorted_asgn[s, 2]))
+        grouped[key] = sorted_asgn[s:e, 3]
 
-        for gz in range(zr[0], zr[1] + 1):
-            for gy in range(yr[0], yr[1] + 1):
-                for gx in range(xr[0], xr[1] + 1):
-                    grouped.setdefault((int(gz), int(gy), int(gx)), []).append(int(point_idx))
-
-    grouped_np = {k: np.asarray(v, dtype=np.int64) for k, v in grouped.items()}
-    return grouped_np, grid_shape, stride_zyx
+    return grouped, grid_shape, stride_zyx
 
 
 def _initial_bbox_from_grid_index(world_min_zyx, crop_size_zyx, grid_index_zyx, stride_zyx=None):
@@ -785,6 +830,8 @@ def _generate_segment_cover_records(
     prune_bboxes=False,
     prune_max_remove_per_band=None,
     band_workers=1,
+    show_progress=False,
+    progress_desc=None,
 ):
     points_zyx = np.asarray(points_zyx, dtype=np.float64)
     crop_size_zyx, overlap, band_workers = _validate_generation_inputs(
@@ -815,18 +862,31 @@ def _generate_segment_cover_records(
         band_points = points_zyx[band_point_indices]
         band_jobs.append((int(z_band), band_records, band_points))
 
+    progress_enabled = bool(show_progress) and len(band_jobs) > 0
+    progress_desc = str(progress_desc or "Optimizing z-bands")
+
     if band_workers == 1 or len(band_jobs) <= 1:
-        band_results = [
-            _optimize_single_band(
-                z_band,
-                band_records,
-                band_points,
-                prune_bboxes,
-                prune_max_remove_per_band,
-                overlap,
+        band_iter = band_jobs
+        if progress_enabled:
+            band_iter = tqdm(
+                band_jobs,
+                total=len(band_jobs),
+                desc=progress_desc,
+                unit="band",
+                leave=False,
             )
-            for z_band, band_records, band_points in band_jobs
-        ]
+        band_results = []
+        for z_band, band_records, band_points in band_iter:
+            band_results.append(
+                _optimize_single_band(
+                    z_band,
+                    band_records,
+                    band_points,
+                    prune_bboxes,
+                    prune_max_remove_per_band,
+                    overlap,
+                )
+            )
     else:
         with ProcessPoolExecutor(max_workers=band_workers) as executor:
             futures = [
@@ -841,7 +901,18 @@ def _generate_segment_cover_records(
                 )
                 for z_band, band_records, band_points in band_jobs
             ]
-            band_results = [future.result() for future in futures]
+            if progress_enabled:
+                band_results = []
+                for future in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc=progress_desc,
+                    unit="band",
+                    leave=False,
+                ):
+                    band_results.append(future.result())
+            else:
+                band_results = [future.result() for future in futures]
     band_results = sorted(band_results, key=lambda item: int(item[0]))
 
     final_records = []

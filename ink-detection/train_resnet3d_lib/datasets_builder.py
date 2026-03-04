@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import WeightedRandomSampler
 
-from samplers import GroupStratifiedBatchSampler
+from samplers import GroupStratifiedBatchSampler, StatefulShuffledSampler
 
 from train_resnet3d_lib.config import CFG, log
 from train_resnet3d_lib.data_ops import (
@@ -288,8 +288,44 @@ def _build_train_loader_from_dataset(train_dataset, train_groups, group_names):
     group_counts = torch.bincount(group_array, minlength=len(group_names)).float()
     train_group_counts = [int(x) for x in group_counts.tolist()]
     log(f"train group counts {dict(zip(group_names, train_group_counts))}")
+    max_steps_per_epoch = int(getattr(CFG, "max_steps_per_epoch", 0) or 0)
+    force_disable_shuffle = max_steps_per_epoch > 0
 
-    if CFG.sampler == "shuffle":
+    if force_disable_shuffle:
+        if CFG.sampler == "shuffle":
+            # Shuffle once, then continue from a persistent cursor across epochs.
+            train_sampler = StatefulShuffledSampler(
+                len(train_dataset),
+                seed=int(getattr(CFG, "seed", 0)),
+            )
+            train_shuffle = False
+            train_batch_sampler = None
+        elif CFG.sampler == "group_balanced":
+            log(
+                f"max_steps_per_epoch={max_steps_per_epoch} with sampler='group_balanced' "
+                "still allows cross-epoch repeats by design."
+            )
+            group_weights = len(train_dataset) / group_counts.clamp_min(1)
+            weights = group_weights[group_array]
+            train_sampler = WeightedRandomSampler(weights, len(train_dataset), replacement=True)
+            train_shuffle = False
+            train_batch_sampler = None
+        elif CFG.sampler == "group_stratified":
+            log(
+                f"max_steps_per_epoch={max_steps_per_epoch} with sampler='group_stratified' "
+                "can repeat samples across epochs."
+            )
+            train_sampler = None
+            train_shuffle = False
+            train_batch_sampler = GroupStratifiedBatchSampler(
+                train_groups,
+                batch_size=CFG.train_batch_size,
+                seed=getattr(CFG, "seed", 0),
+                drop_last=True,
+            )
+        else:
+            raise ValueError(f"Unknown training.sampler: {CFG.sampler!r}")
+    elif CFG.sampler == "shuffle":
         train_sampler = None
         train_shuffle = True
         train_batch_sampler = None
@@ -355,28 +391,37 @@ def build_train_loader_lazy(
 
 
 def log_training_budget(train_loader):
-    steps_per_epoch = len(train_loader)
+    raw_micro_steps_per_epoch = int(len(train_loader))
+    micro_steps_per_epoch = int(raw_micro_steps_per_epoch)
+    max_steps_per_epoch = int(getattr(CFG, "max_steps_per_epoch", 0) or 0)
+    if max_steps_per_epoch > 0:
+        micro_steps_per_epoch = min(micro_steps_per_epoch, max_steps_per_epoch)
+
+    steps_per_epoch = int(micro_steps_per_epoch)
     accum = int(getattr(CFG, "accumulate_grad_batches", 1) or 1)
     if accum > 1:
         steps_per_epoch = int(math.ceil(steps_per_epoch / accum))
 
-    micro_steps_per_epoch = int(len(train_loader))
     optimizer_steps_per_epoch = int(steps_per_epoch)
     total_optimizer_steps = int(optimizer_steps_per_epoch * int(CFG.epochs))
     effective_batch_size = int(int(CFG.train_batch_size) * int(accum))
 
     log(
         "train budget "
-        f"len(train_loader)={micro_steps_per_epoch} accumulate_grad_batches={accum} "
+        f"len(train_loader)={raw_micro_steps_per_epoch} effective_micro_steps_per_epoch={micro_steps_per_epoch} "
+        f"accumulate_grad_batches={accum} "
         f"optimizer_steps_per_epoch={optimizer_steps_per_epoch} epochs={int(CFG.epochs)} "
-        f"total_optimizer_steps={total_optimizer_steps} effective_batch_size={effective_batch_size}"
+        f"total_optimizer_steps={total_optimizer_steps} effective_batch_size={effective_batch_size} "
+        f"max_steps_per_epoch={max_steps_per_epoch if max_steps_per_epoch > 0 else None}"
     )
     log(
         "scheduler budget "
         f"scheduler={getattr(CFG, 'scheduler', None)!r} "
         f"onecycle steps_per_epoch={optimizer_steps_per_epoch} epochs={int(CFG.epochs)} "
         f"max_lr={float(CFG.lr)} div_factor={float(getattr(CFG, 'onecycle_div_factor', 25.0))} "
-        f"pct_start={float(getattr(CFG, 'onecycle_pct_start', 0.15))}"
+        f"pct_start={float(getattr(CFG, 'onecycle_pct_start', 0.15))} "
+        f"scheduler_warmup_steps={getattr(CFG, 'scheduler_warmup_steps', None)!r} "
+        f"scheduler_num_cycles={float(getattr(CFG, 'scheduler_num_cycles', 0.5))}"
     )
     return steps_per_epoch
 

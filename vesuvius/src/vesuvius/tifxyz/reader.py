@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str((1 << 63) - 1))
+
+import cv2
 import numpy as np
 import tifffile
 
 from .types import Tifxyz
 
 logger = logging.getLogger(__name__)
+
+SUPPORTED_LABEL_EXTENSIONS = {".tif", ".png", ".jpg"}
+RESERVED_IMAGE_FILENAMES = {"x.tif", "y.tif", "z.tif", "mask.tif"}
 
 
 @dataclass
@@ -358,6 +365,67 @@ class TifxyzReader:
         else:
             return mask_data != 0
 
+    def _read_label_shape(self, path: Path) -> Tuple[int, int]:
+        """Read label shape using OpenCV."""
+        image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise ValueError(f"Failed to read label image: {path}")
+        if image.ndim != 2:
+            raise ValueError(f"Label must be 2D grayscale, got shape {image.shape}")
+        return int(image.shape[0]), int(image.shape[1])
+
+    @staticmethod
+    def _label_name_from_filename(filename: str) -> str:
+        stem = Path(filename).stem
+        return stem.rsplit("_", 1)[-1]
+
+    def discover_labels(
+        self,
+        expected_shape: Tuple[int, int],
+    ) -> List[Dict[str, Any]]:
+        """Discover label images in this segment directory."""
+        labels: List[Dict[str, Any]] = []
+        for path in self.path.iterdir():
+            if not path.is_file():
+                continue
+
+            suffix = path.suffix.lower()
+            filename_lower = path.name.lower()
+            if suffix not in SUPPORTED_LABEL_EXTENSIONS:
+                continue
+            if filename_lower in RESERVED_IMAGE_FILENAMES:
+                continue
+
+            shape: Optional[Tuple[int, int]] = None
+            matches_stored_shape = False
+            error: Optional[str] = None
+            try:
+                shape = self._read_label_shape(path)
+                matches_stored_shape = shape == expected_shape
+                if not matches_stored_shape:
+                    error = (
+                        f"Shape mismatch: expected {expected_shape}, got {shape}"
+                    )
+            except Exception as exc:
+                error = str(exc)
+
+            labels.append(
+                {
+                    "index": -1,  # populated after sorting
+                    "name": self._label_name_from_filename(path.name),
+                    "filename": path.name,
+                    "path": path,
+                    "shape": shape,
+                    "matches_stored_shape": matches_stored_shape,
+                    "error": error,
+                }
+            )
+
+        labels.sort(key=lambda item: str(item["filename"]).lower())
+        for index, label in enumerate(labels):
+            label["index"] = index
+        return labels
+
     def read(
         self,
         *,
@@ -418,6 +486,8 @@ class TifxyzReader:
         y[invalid] = -1.0
         z[invalid] = -1.0
 
+        labels = self.discover_labels(expected_shape=x.shape)
+
         return Tifxyz(
             _x=x,
             _y=y,
@@ -429,6 +499,7 @@ class TifxyzReader:
             extra=meta["extra"],
             _mask=mask,
             path=self.path,
+            _labels=labels,
         )
 
     def list_extra_channels(self) -> list[str]:

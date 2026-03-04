@@ -18,7 +18,8 @@ segment_name/
 ├── y.tif        # Y coordinates (32-bit float)
 ├── z.tif        # Z coordinates (32-bit float)
 ├── meta.json    # Metadata (scale, bbox, uuid)
-└── mask.tif     # Optional validity mask
+├── mask.tif     # Optional validity mask
+└── *_label.*    # Optional grayscale labels (.tif, .png, .jpg)
 ```
 
 ## Quick Start
@@ -43,6 +44,15 @@ x, y, z, valid = surface[2000:2100, 4000:4100]  # Interpolated
 
 # Write a surface
 write_tifxyz("/path/to/output", surface, overwrite=True)
+
+# Labels in the same directory are auto-discovered on load
+labels = surface.list_labels()
+print(labels[0]["filename"], labels[0]["shape"], labels[0]["path"])
+
+# Load by index, filename, or suffix
+ink = surface.load_label(0)
+ink = surface.load_label("scroll_ink.tif")
+ink = surface.load_label("ink")  # matches *_ink.*
 ```
 
 ---
@@ -74,6 +84,13 @@ Main class representing a tifxyz surface.
 | `valid_vertex_mask` | `NDArray[bool]` | Mask of valid vertices at stored resolution |
 | `quad_area` | `float` | Surface area computed from valid quad count |
 | `quad_centers` | `NDArray[float32]` | Centers of quads at stored resolution (H-1, W-1, 3) |
+
+### Label Methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `list_labels()` | `list[dict]` | Discovered labels with `name`, `filename`, `path`, `shape`, `matches_stored_shape`, and `error`. |
+| `load_label(selector)` | `NDArray[uint8]` | Load label by index or string selector (exact filename first, then suffix). |
 
 ---
 
@@ -411,6 +428,9 @@ mask = reader.read_mask()
 # List extra channels
 channels = reader.list_extra_channels()  # e.g., ['generations']
 data = reader.read_extra_channel('generations')
+
+# Discover labels (always used internally by read/read_tifxyz)
+labels = reader.discover_labels(expected_shape=(4215, 4373))
 ```
 
 ---

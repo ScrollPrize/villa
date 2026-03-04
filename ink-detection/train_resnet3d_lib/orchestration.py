@@ -42,6 +42,12 @@ def parse_args():
     parser.add_argument("--accelerator", type=str, default="auto")
     parser.add_argument("--precision", type=str, default="16-mixed")
     parser.add_argument("--check_val_every_n_epoch", type=int, default=1)
+    parser.add_argument(
+        "--max_steps_per_epoch",
+        type=int,
+        default=None,
+        help="Cap train batches per epoch. When set, training dataloader shuffling is disabled.",
+    )
     return parser.parse_args()
 
 
@@ -52,7 +58,7 @@ def log_startup(args):
         f"metadata_json={args.metadata_json!r} valid_id={args.valid_id!r} outputs_path={args.outputs_path!r} "
         f"devices={args.devices} accelerator={args.accelerator!r} precision={args.precision!r} "
         f"run_name={args.run_name!r} init_ckpt_path={args.init_ckpt_path!r} "
-        f"resume_from_ckpt={args.resume_from_ckpt!r}"
+        f"resume_from_ckpt={args.resume_from_ckpt!r} max_steps_per_epoch={args.max_steps_per_epoch!r}"
     )
     cuda_available = bool(torch.cuda.is_available())
     device_count = int(torch.cuda.device_count()) if cuda_available else 0
