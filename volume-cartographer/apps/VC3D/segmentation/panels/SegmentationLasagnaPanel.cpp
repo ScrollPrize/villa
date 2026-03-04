@@ -4,19 +4,21 @@
 #include "VCSettings.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrent>
 #include <QDir>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFrame>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
-#include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QSettings>
@@ -30,287 +32,6 @@
 
 #include <iostream>
 
-// ---------------------------------------------------------------------------
-// Predefined optimizer profiles
-// ---------------------------------------------------------------------------
-struct LasagnaProfile {
-    const char* name;
-    const char* description;
-    const char* json;
-};
-
-static const LasagnaProfile kProfiles[] = {
-    {"Quick Reopt (2k)", "Fast re-optimization of existing mesh",
-     R"({
-    "base": {
-        "dir_v": 10.0,
-        "dir_conn": 1.0,
-        "step": 100.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.01,
-        "gradmag": 1.0,
-        "mean_pos": 0.0,
-        "meshoff_sy": 0.001,
-        "conn_sy_l": 0.0,
-        "conn_sy_r": 0.0,
-        "angle": 0.001,
-        "y_straight": 0.0,
-        "data": 0.4,
-        "data_plain": 0.2,
-        "data_grad": 0.0,
-        "z_straight": 10.0
-    },
-    "stages": [
-        {
-            "name": "reopt",
-            "steps": 2000,
-            "lr": [0.1, 0.01, 0.001],
-            "params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
-            "min_scaledown": 0
-        }
-    ]
-})"},
-
-    {"Final Refinement (10k)", "Single-stage full-resolution refinement",
-     R"({
-    "base": {
-        "dir_v": 10.0,
-        "dir_conn": 1.0,
-        "step": 100.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.01,
-        "gradmag": 1.0,
-        "mean_pos": 0.0,
-        "meshoff_sy": 0.001,
-        "conn_sy_l": 0.0,
-        "conn_sy_r": 0.0,
-        "angle": 0.001,
-        "y_straight": 0.0,
-        "data": 0.4,
-        "data_plain": 0.2,
-        "data_grad": 0.0,
-        "z_straight": 10.0
-    },
-    "stages": [
-        {
-            "name": "sd0",
-            "steps": 10000,
-            "lr": [1.0, 0.1, 0.01],
-            "params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
-            "min_scaledown": 0
-        }
-    ]
-})"},
-
-    {"Scalespace (21k)", "Multi-scale coarse-to-fine optimization",
-     R"({
-    "base": {
-        "dir_v": 10.0,
-        "dir_conn": 1.0,
-        "step": 100.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.01,
-        "gradmag": 1.0,
-        "mean_pos": 0.0,
-        "meshoff_sy": 0.001,
-        "conn_sy_l": 0.0,
-        "conn_sy_r": 0.0,
-        "angle": 0.001,
-        "y_straight": 0.0,
-        "data": 0.4,
-        "data_plain": 0.2,
-        "data_grad": 0.0,
-        "z_straight": 10.0
-    },
-    "stages": [
-        {
-            "name": "sd4",
-            "steps": 2000,
-            "lr": 1.0,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 4
-        },
-        {
-            "name": "sd3",
-            "steps": 2000,
-            "lr": 0.1,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 3,
-            "w_fac": {"dir_conn": 10.0, "gradmag": 10.0}
-        },
-        {
-            "name": "sd2",
-            "steps": 5000,
-            "lr": 0.1,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 2,
-            "w_fac": {"dir_conn": 10.0, "gradmag": 10.0}
-        },
-        {
-            "name": "sd1",
-            "steps": 5000,
-            "lr": 0.1,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 1,
-            "w_fac": {"dir_conn": 10.0, "gradmag": 10.0}
-        },
-        {
-            "name": "sd0",
-            "steps": 5000,
-            "lr": 0.01,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 0,
-            "w_fac": {"dir_conn": 10000.0, "gradmag": 1.0}
-        }
-    ]
-})"},
-
-    {"Direct + Init (4k)", "Global transform init, then mesh optimization",
-     R"({
-    "base": {
-        "dir_v": 10.0,
-        "dir_conn": 1.0,
-        "step": 100.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.01,
-        "gradmag": 1.0,
-        "mean_pos": 0.0,
-        "meshoff_sy": 0.001,
-        "conn_sy_l": 0.0,
-        "conn_sy_r": 0.0,
-        "angle": 0.001,
-        "y_straight": 0.0,
-        "data": 0.4,
-        "data_plain": 0.2,
-        "data_grad": 0.0,
-        "z_straight": 10.0
-    },
-    "stages": [
-        {
-            "name": "init",
-            "steps": 1000,
-            "lr": 0.01,
-            "params": ["theta", "winding_scale"],
-            "min_scaledown": 0
-        },
-        {
-            "name": "mesh",
-            "steps": 3000,
-            "lr": 0.1,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 0
-        }
-    ]
-})"},
-
-    {"Direct + Grow", "Init, mesh opt, then grow up/down",
-     R"({
-    "base": {
-        "dir_v": 10.0,
-        "dir_conn": 1.0,
-        "step": 100.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.01,
-        "gradmag": 1.0,
-        "mean_pos": 0.0,
-        "meshoff_sy": 0.001,
-        "conn_sy_l": 0.0,
-        "conn_sy_r": 0.0,
-        "angle": 0.001,
-        "y_straight": 0.0,
-        "data": 0.4,
-        "data_plain": 0.2,
-        "data_grad": 0.0,
-        "z_straight": 10.0
-    },
-    "stages": [
-        {
-            "name": "init",
-            "steps": 500,
-            "lr": 0.1,
-            "params": ["theta", "winding_scale"],
-            "min_scaledown": 0
-        },
-        {
-            "name": "mesh",
-            "steps": 3000,
-            "lr": 0.1,
-            "params": ["mesh_ms", "conn_offset_ms"],
-            "min_scaledown": 0
-        },
-        {
-            "name": "grow_only",
-            "grow": {
-                "directions": ["down", "up"],
-                "generations": 30,
-                "steps": 1
-            },
-            "global_opt": {
-                "steps": 0,
-                "lr": 0.1,
-                "params": ["mesh_ms", "conn_offset_ms"],
-                "min_scaledown": 0
-            },
-            "local_opt": {
-                "opt_window": 2,
-                "steps": 300,
-                "lr": 0.1,
-                "params": ["mesh_ms", "conn_offset_ms"],
-                "min_scaledown": 0,
-                "w_fac": {"mean_pos": 0.0}
-            }
-        }
-    ]
-})"},
-
-    {"Grow Left", "Extend mesh leftward with local optimization",
-     R"({
-    "base": {
-        "dir_v": 10.0,
-        "dir_conn": 1.0,
-        "step": 100.0,
-        "smooth_x": 0.0,
-        "smooth_y": 0.01,
-        "gradmag": 1.0,
-        "mean_pos": 0.0,
-        "meshoff_sy": 0.001,
-        "conn_sy_l": 0.0,
-        "conn_sy_r": 0.0,
-        "angle": 0.001,
-        "y_straight": 0.0,
-        "data": 0.4,
-        "data_plain": 0.2,
-        "data_grad": 0.0,
-        "z_straight": 10.0
-    },
-    "stages": [
-        {
-            "name": "grow_left",
-            "grow": {
-                "directions": ["left"],
-                "generations": 10,
-                "steps": 1
-            },
-            "global_opt": {
-                "steps": 0,
-                "lr": 0.01,
-                "params": ["mesh_ms", "conn_offset_ms", "amp", "bias"]
-            },
-            "local_opt": {
-                "steps": 1000,
-                "lr": 0.01,
-                "params": ["mesh_ms", "conn_offset_ms", "amp", "bias"]
-            }
-        }
-    ]
-})"},
-
-    {"Custom", "User-defined configuration", nullptr},
-};
-
-static constexpr int kProfileCount = sizeof(kProfiles) / sizeof(kProfiles[0]);
-static constexpr int kCustomProfileIndex = kProfileCount - 1;
-
 SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     const QString& settingsGroup, QWidget* parent)
     : QWidget(parent)
@@ -318,21 +39,24 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
 {
     auto* panelLayout = new QVBoxLayout(this);
     panelLayout->setContentsMargins(0, 0, 0, 0);
-    panelLayout->setSpacing(0);
+    panelLayout->setSpacing(2);
 
-    _group = new CollapsibleSettingsGroup(tr("Lasagna Model"), this);
-    auto* content = _group->contentWidget();
+    // =======================================================================
+    // Connection section
+    // =======================================================================
+    _connectionGroup = new CollapsibleSettingsGroup(tr("Solver Connection"), this);
+    auto* connContent = _connectionGroup->contentWidget();
 
     // -- Connection mode --
-    _group->addRow(tr("Connection:"), [&](QHBoxLayout* row) {
-        _connectionCombo = new QComboBox(content);
+    _connectionGroup->addRow(tr("Connection:"), [&](QHBoxLayout* row) {
+        _connectionCombo = new QComboBox(connContent);
         _connectionCombo->addItem(tr("Internal (local)"));
         _connectionCombo->addItem(tr("External (remote)"));
         row->addWidget(_connectionCombo, 1);
     }, tr("Internal launches a local Python process. External connects to a running service."));
 
     // -- External widgets: discovery + host/port --
-    _externalWidget = new QWidget(content);
+    _externalWidget = new QWidget(connContent);
     auto* extLayout = new QVBoxLayout(_externalWidget);
     extLayout->setContentsMargins(0, 0, 0, 0);
     extLayout->setSpacing(4);
@@ -371,50 +95,11 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     hostRow->addWidget(_portEdit);
     extLayout->addWidget(_hostPortWidget);
 
-    _group->contentLayout()->addWidget(_externalWidget);
+    _connectionGroup->contentLayout()->addWidget(_externalWidget);
     _externalWidget->setVisible(false);  // Start hidden (internal mode)
 
-    // -- Mode: Re-optimize / New Model --
-    _group->addRow(tr("Mode:"), [&](QHBoxLayout* row) {
-        _modeCombo = new QComboBox(content);
-        _modeCombo->addItem(tr("Re-optimize"));
-        _modeCombo->addItem(tr("New Model"));
-        row->addWidget(_modeCombo, 1);
-    }, tr("Re-optimize refines an existing model. New Model creates a fresh model centered at the cursor."));
-
-    // -- New model dimensions (visible only in New Model mode) --
-    _newModelWidget = new QWidget(content);
-    auto* dimLayout = new QHBoxLayout(_newModelWidget);
-    dimLayout->setContentsMargins(0, 0, 0, 0);
-    dimLayout->setSpacing(4);
-
-    dimLayout->addWidget(new QLabel(tr("W:"), _newModelWidget));
-    _widthSpin = new QSpinBox(_newModelWidget);
-    _widthSpin->setRange(1, 999999);
-    _widthSpin->setValue(2048);
-    _widthSpin->setSingleStep(64);
-    dimLayout->addWidget(_widthSpin, 1);
-
-    dimLayout->addWidget(new QLabel(tr("H:"), _newModelWidget));
-    _heightSpin = new QSpinBox(_newModelWidget);
-    _heightSpin->setRange(1, 999999);
-    _heightSpin->setValue(2048);
-    _heightSpin->setSingleStep(64);
-    dimLayout->addWidget(_heightSpin, 1);
-
-    dimLayout->addWidget(new QLabel(tr("D:"), _newModelWidget));
-    _depthSpin = new QSpinBox(_newModelWidget);
-    _depthSpin->setRange(1, 999999);
-    _depthSpin->setValue(2048);
-    _depthSpin->setSingleStep(64);
-    _depthSpin->setToolTip(tr("Depth in full-resolution voxels"));
-    dimLayout->addWidget(_depthSpin, 1);
-
-    _group->contentLayout()->addWidget(_newModelWidget);
-    _newModelWidget->setVisible(false);  // Hidden until "New Model" selected
-
     // -- Data input (zarr) — stacked: file browse (page 0) or dataset combo (page 1) --
-    _dataInputStack = new QStackedWidget(content);
+    _dataInputStack = new QStackedWidget(connContent);
 
     // Page 0: file browse
     auto* browseWidget = new QWidget(_dataInputStack);
@@ -434,102 +119,226 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
 
     _dataInputStack->setCurrentIndex(0);  // Default: file browse
 
-    _group->addRow(tr("Data:"), [&](QHBoxLayout* row) {
+    _connectionGroup->addRow(tr("Data:"), [&](QHBoxLayout* row) {
         row->addWidget(_dataInputStack, 1);
     }, tr("Input data zarr (e.g. s5_cos.zarr) required by the lasagna."));
 
-    // -- Profile dropdown --
-    _group->addRow(tr("Profile:"), [&](QHBoxLayout* row) {
-        _profileCombo = new QComboBox(content);
-        for (int i = 0; i < kProfileCount; ++i) {
-            _profileCombo->addItem(
-                QString::fromUtf8(kProfiles[i].name),
-                QString::fromUtf8(kProfiles[i].description));
+    panelLayout->addWidget(_connectionGroup);
+
+    // =======================================================================
+    // New Model settings + action button
+    // =======================================================================
+    {
+        auto* sep = new QFrame(this);
+        sep->setFrameShape(QFrame::HLine);
+        sep->setFrameShadow(QFrame::Sunken);
+        panelLayout->addWidget(sep);
+    }
+
+    _newModelGroup = new CollapsibleSettingsGroup(tr("New Model Settings"), this);
+    auto* nmContent = _newModelGroup->contentWidget();
+
+    // Config file row
+    _newModelGroup->addRow(tr("Config:"), [&](QHBoxLayout* row) {
+        _newModelConfigCombo = new QComboBox(nmContent);
+        _newModelConfigCombo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        _newModelConfigBrowse = new QToolButton(nmContent);
+        _newModelConfigBrowse->setText(QStringLiteral("..."));
+        _newModelConfigBrowse->setToolTip(tr("Browse for a JSON config file"));
+        row->addWidget(_newModelConfigCombo, 1);
+        row->addWidget(_newModelConfigBrowse);
+    }, tr("JSON config file for new model optimization."));
+
+    // Dimensions row
+    {
+        auto* dimWidget = new QWidget(nmContent);
+        auto* dimLayout = new QHBoxLayout(dimWidget);
+        dimLayout->setContentsMargins(0, 0, 0, 0);
+        dimLayout->setSpacing(4);
+
+        dimLayout->addWidget(new QLabel(tr("W:"), dimWidget));
+        _widthSpin = new QSpinBox(dimWidget);
+        _widthSpin->setRange(1, 999999);
+        _widthSpin->setValue(2048);
+        _widthSpin->setSingleStep(64);
+        dimLayout->addWidget(_widthSpin, 1);
+
+        dimLayout->addWidget(new QLabel(tr("H:"), dimWidget));
+        _heightSpin = new QSpinBox(dimWidget);
+        _heightSpin->setRange(1, 999999);
+        _heightSpin->setValue(2048);
+        _heightSpin->setSingleStep(64);
+        dimLayout->addWidget(_heightSpin, 1);
+
+        dimLayout->addWidget(new QLabel(tr("D:"), dimWidget));
+        _depthSpin = new QSpinBox(dimWidget);
+        _depthSpin->setRange(1, 999999);
+        _depthSpin->setValue(2048);
+        _depthSpin->setSingleStep(64);
+        _depthSpin->setToolTip(tr("Depth in full-resolution voxels"));
+        dimLayout->addWidget(_depthSpin, 1);
+
+        _newModelGroup->contentLayout()->addWidget(dimWidget);
+    }
+
+    // Seed point row
+    {
+        auto* seedWidget = new QWidget(nmContent);
+        auto* seedLayout = new QHBoxLayout(seedWidget);
+        seedLayout->setContentsMargins(0, 0, 0, 0);
+        seedLayout->setSpacing(4);
+
+        seedLayout->addWidget(new QLabel(tr("Seed:"), seedWidget));
+        _seedEdit = new QLineEdit(seedWidget);
+        _seedEdit->setPlaceholderText(tr("auto (center)"));
+        _seedEdit->setToolTip(tr("Dilation seed point in full-res voxel coords: X, Y, Z"));
+        seedLayout->addWidget(_seedEdit, 1);
+
+        _seedFromFocusBtn = new QPushButton(tr("Focus"), seedWidget);
+        _seedFromFocusBtn->setToolTip(tr("Use current focus point as seed"));
+        seedLayout->addWidget(_seedFromFocusBtn);
+
+        _newModelGroup->contentLayout()->addWidget(seedWidget);
+    }
+
+    // Output name row
+    {
+        auto* nameWidget = new QWidget(nmContent);
+        auto* nameLayout = new QHBoxLayout(nameWidget);
+        nameLayout->setContentsMargins(0, 0, 0, 0);
+        nameLayout->setSpacing(4);
+        nameLayout->addWidget(new QLabel(tr("Name:"), nameWidget));
+        _outputNameEdit = new QLineEdit(nameWidget);
+        _outputNameEdit->setPlaceholderText(tr("new_model"));
+        _outputNameEdit->setToolTip(tr("Output name prefix (auto-versioned, e.g. mysheet → mysheet_v001.tifxyz)"));
+        nameLayout->addWidget(_outputNameEdit, 1);
+        _newModelGroup->contentLayout()->addWidget(nameWidget);
+    }
+
+    panelLayout->addWidget(_newModelGroup);
+
+    _newModelBtn = new QPushButton(tr("New Model"), this);
+    panelLayout->addWidget(_newModelBtn);
+
+    // =======================================================================
+    // Re-optimize settings + action button
+    // =======================================================================
+    {
+        auto* sep = new QFrame(this);
+        sep->setFrameShape(QFrame::HLine);
+        sep->setFrameShadow(QFrame::Sunken);
+        panelLayout->addWidget(sep);
+    }
+
+    _reoptGroup = new CollapsibleSettingsGroup(tr("Re-optimize Settings"), this);
+    auto* reoptContent = _reoptGroup->contentWidget();
+
+    // Config file row
+    _reoptGroup->addRow(tr("Config:"), [&](QHBoxLayout* row) {
+        _reoptConfigCombo = new QComboBox(reoptContent);
+        _reoptConfigCombo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        _reoptConfigBrowse = new QToolButton(reoptContent);
+        _reoptConfigBrowse->setText(QStringLiteral("..."));
+        _reoptConfigBrowse->setToolTip(tr("Browse for a JSON config file"));
+        row->addWidget(_reoptConfigCombo, 1);
+        row->addWidget(_reoptConfigBrowse);
+    }, tr("JSON config file for re-optimization."));
+
+    panelLayout->addWidget(_reoptGroup);
+
+    _reoptBtn = new QPushButton(tr("Re-optimize"), this);
+    panelLayout->addWidget(_reoptBtn);
+
+    // =======================================================================
+    // Expand settings + action button
+    // =======================================================================
+    {
+        auto* sep = new QFrame(this);
+        sep->setFrameShape(QFrame::HLine);
+        sep->setFrameShadow(QFrame::Sunken);
+        panelLayout->addWidget(sep);
+    }
+
+    _expandGroup = new CollapsibleSettingsGroup(tr("Expand Settings"), this);
+    auto* expandContent = _expandGroup->contentWidget();
+
+    // Config file row (filtered to grow-only JSONs)
+    _expandGroup->addRow(tr("Config:"), [&](QHBoxLayout* row) {
+        _expandConfigCombo = new QComboBox(expandContent);
+        _expandConfigCombo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        _expandConfigBrowse = new QToolButton(expandContent);
+        _expandConfigBrowse->setText(QStringLiteral("..."));
+        _expandConfigBrowse->setToolTip(tr("Browse for a JSON config file (must contain grow stages)"));
+        row->addWidget(_expandConfigCombo, 1);
+        row->addWidget(_expandConfigBrowse);
+    }, tr("JSON config file with grow stages. Only configs containing a grow section are shown."));
+
+    // Direction checkboxes
+    {
+        auto* dirWidget = new QWidget(expandContent);
+        auto* dirLayout = new QHBoxLayout(dirWidget);
+        dirLayout->setContentsMargins(0, 0, 0, 0);
+        dirLayout->setSpacing(4);
+        dirLayout->addWidget(new QLabel(tr("Dir:"), dirWidget));
+        // Labels and direction strings: W+, W-, +V, -V, +Z, -Z
+        const char* labels[] = {"W+", "W-", "+V", "-V", "+Z", "-Z"};
+        for (int i = 0; i < kExpandDirCount; ++i) {
+            _expandDirChecks[i] = new QCheckBox(tr(labels[i]), dirWidget);
+            dirLayout->addWidget(_expandDirChecks[i]);
         }
-        row->addWidget(_profileCombo, 1);
-    }, tr("Predefined optimizer configurations. Select 'Custom' to edit freely."));
+        _expandGroup->contentLayout()->addWidget(dirWidget);
+    }
 
-    // -- JSON config editor --
-    auto* configLabel = new QLabel(tr("Optimizer config (JSON):"), content);
-    _group->contentLayout()->addWidget(configLabel);
+    // Generations spinbox
+    _expandGenSpin = _expandGroup->addSpinBox(
+        tr("Generations:"), 1, 999999, 1,
+        tr("Number of grow steps (in model units)."));
+    _expandGenSpin->setValue(10);
 
-    _configEdit = new QPlainTextEdit(content);
-    _configEdit->setPlaceholderText(tr("Paste optimizer JSON config here"));
-    _configEdit->setTabStopDistance(20);
-    _configEdit->setMinimumHeight(200);
-    _configEdit->setLineWrapMode(QPlainTextEdit::NoWrap);
-    QFont monoFont("monospace");
-    monoFont.setStyleHint(QFont::Monospace);
-    monoFont.setPointSize(9);
-    _configEdit->setFont(monoFont);
-    _group->contentLayout()->addWidget(_configEdit);
+    panelLayout->addWidget(_expandGroup);
 
-    _configStatus = new QLabel(content);
-    _configStatus->setWordWrap(true);
-    _configStatus->setVisible(false);
-    _group->contentLayout()->addWidget(_configStatus);
+    _expandBtn = new QPushButton(tr("Expand"), this);
+    panelLayout->addWidget(_expandBtn);
 
-    // -- Run / Stop / Stop Service buttons --
+    // =======================================================================
+    // Shared bottom area — stop buttons, progress
+    // =======================================================================
     auto* btnRow = new QHBoxLayout();
-    _runBtn = new QPushButton(tr("Run Optimization"), content);
-    _stopBtn = new QPushButton(tr("Stop"), content);
+    _stopBtn = new QPushButton(tr("Stop"), this);
     _stopBtn->setEnabled(false);
-    _stopServiceBtn = new QPushButton(tr("Stop Service"), content);
+    _stopServiceBtn = new QPushButton(tr("Stop Service"), this);
     _stopServiceBtn->setEnabled(false);
-    btnRow->addWidget(_runBtn);
     btnRow->addWidget(_stopBtn);
     btnRow->addWidget(_stopServiceBtn);
     btnRow->addStretch(1);
-    _group->contentLayout()->addLayout(btnRow);
+    panelLayout->addLayout(btnRow);
 
-    // -- Progress bar --
-    _progressBar = new QProgressBar(content);
+    _progressBar = new QProgressBar(this);
     _progressBar->setRange(0, 100);
     _progressBar->setValue(0);
     _progressBar->setTextVisible(true);
     _progressBar->setVisible(false);
-    _group->contentLayout()->addWidget(_progressBar);
+    panelLayout->addWidget(_progressBar);
 
-    // -- Progress label --
-    _progressLabel = new QLabel(content);
+    _progressLabel = new QLabel(this);
     _progressLabel->setWordWrap(true);
     _progressLabel->setVisible(false);
-    _group->contentLayout()->addWidget(_progressLabel);
-
-    panelLayout->addWidget(_group);
+    panelLayout->addWidget(_progressLabel);
 
     // -----------------------------------------------------------------------
     // Signal wiring
     // -----------------------------------------------------------------------
 
-    // Mode combo (Re-optimize / New Model)
-    connect(_modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, &SegmentationLasagnaPanel::onLasagnaModeChanged);
-
-    // Persist dimension changes
-    connect(_widthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
-        writeSetting(QStringLiteral("lasagna_new_model_width"), v);
-    });
-    connect(_heightSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
-        writeSetting(QStringLiteral("lasagna_new_model_height"), v);
-    });
-    connect(_depthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
-        writeSetting(QStringLiteral("lasagna_new_model_depth"), v);
-    });
-
-    // Connection mode
+    // -- Connection --
     connect(_connectionCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &SegmentationLasagnaPanel::onConnectionModeChanged);
 
-    // External: refresh button
     connect(_refreshBtn, &QToolButton::clicked, this,
             &SegmentationLasagnaPanel::refreshDiscoveredServices);
 
-    // External: discovered service selection
     connect(_discoveryCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &SegmentationLasagnaPanel::onDiscoveredServiceSelected);
 
-    // External: host/port manual editing
     connect(_hostEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         _externalHost = text.trimmed();
         writeSetting(QStringLiteral("lasagna_external_host"), _externalHost);
@@ -539,7 +348,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         writeSetting(QStringLiteral("lasagna_external_port"), _externalPort);
     });
 
-    // Dataset combo selection
+    // -- Data input --
     connect(_datasetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, [this](int index) {
         if (index < 0) return;
@@ -550,12 +359,11 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         }
     });
 
-    // Datasets received from service
     connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::datasetsReceived,
             this, [this](const QJsonArray& datasets) {
         _datasetCombo->clear();
         if (datasets.isEmpty()) {
-            _dataInputStack->setCurrentIndex(0);  // Fall back to file browse
+            _dataInputStack->setCurrentIndex(0);
             return;
         }
         for (const auto& val : datasets) {
@@ -564,10 +372,9 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             QString path = ds[QStringLiteral("path")].toString();
             _datasetCombo->addItem(name, path);
         }
-        _dataInputStack->setCurrentIndex(1);  // Show dataset combo
+        _dataInputStack->setCurrentIndex(1);
     });
 
-    // Data input
     connect(_dataInputEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         _lasagnaDataInputPath = text.trimmed();
         writeSetting(QStringLiteral("lasagna_data_input_path"), _lasagnaDataInputPath);
@@ -583,86 +390,156 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         }
     });
 
-    // Profile combo
-    connect(_profileCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+    // -- New model settings persistence --
+    connect(_widthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        writeSetting(QStringLiteral("lasagna_new_model_width"), v);
+    });
+    connect(_heightSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        writeSetting(QStringLiteral("lasagna_new_model_height"), v);
+    });
+    connect(_depthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        writeSetting(QStringLiteral("lasagna_new_model_depth"), v);
+    });
+    connect(_seedEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+        writeSetting(QStringLiteral("lasagna_seed_point"), text.trimmed());
+    });
+    connect(_outputNameEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+        writeSetting(QStringLiteral("lasagna_output_name"), text.trimmed());
+    });
+    connect(_seedFromFocusBtn, &QPushButton::clicked, this,
+            &SegmentationLasagnaPanel::seedFromFocusRequested);
+
+    // -- New model config combo --
+    connect(_newModelConfigCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, [this](int index) {
-        if (_restoringSettings) return;
-        writeSetting(QStringLiteral("lasagna_profile_index"), index);
-        loadProfile(index);
+        if (_restoringSettings || index < 0) return;
+        QString path = _newModelConfigCombo->currentData().toString();
+        if (!path.isEmpty()) {
+            _newModelConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_new_model_config_file_path"), _newModelConfigFilePath);
+        }
     });
-
-    // Config editor
-    connect(_configEdit, &QPlainTextEdit::textChanged, this, [this]() {
-        if (_restoringSettings) return;
-        _lasagnaConfigText = _configEdit->toPlainText();
-        writeSetting(QStringLiteral("lasagna_config_text"), _lasagnaConfigText);
-        validateConfigText();
-
-        // Switch to "Custom" if user manually edits while a preset is selected
-        if (_profileCombo && _profileCombo->currentIndex() != kCustomProfileIndex) {
-            int idx = _profileCombo->currentIndex();
-            if (idx >= 0 && idx < kCustomProfileIndex && kProfiles[idx].json) {
-                QString profileText = QString::fromUtf8(kProfiles[idx].json).trimmed();
-                if (_lasagnaConfigText.trimmed() != profileText) {
-                    const QSignalBlocker b(_profileCombo);
-                    _profileCombo->setCurrentIndex(kCustomProfileIndex);
-                    writeSetting(QStringLiteral("lasagna_profile_index"), kCustomProfileIndex);
-                }
-            }
+    connect(_newModelConfigBrowse, &QToolButton::clicked, this, [this]() {
+        QString initial = _newModelConfigFilePath.isEmpty()
+            ? QDir::homePath() : QFileInfo(_newModelConfigFilePath).absolutePath();
+        QString path = QFileDialog::getOpenFileName(
+            this, tr("Select optimizer config JSON file"), initial,
+            tr("JSON files (*.json);;All files (*)"));
+        if (!path.isEmpty()) {
+            _newModelConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_new_model_config_file_path"), _newModelConfigFilePath);
+            QFileInfo fi(path);
+            populateConfigCombo(_newModelConfigCombo, fi.absolutePath(), fi.fileName(), _newModelConfigFilePath);
         }
     });
 
-    // Run button
-    connect(_runBtn, &QPushButton::clicked, this, [this]() {
-        validateConfigText();
-        if (!_configError.isEmpty()) {
-            _progressLabel->setText(tr("Fix JSON errors before running."));
-            _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
-            _progressLabel->setVisible(true);
-            return;
+    // -- Re-optimize config combo --
+    connect(_reoptConfigCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (_restoringSettings || index < 0) return;
+        QString path = _reoptConfigCombo->currentData().toString();
+        if (!path.isEmpty()) {
+            _reoptConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_reopt_config_file_path"), _reoptConfigFilePath);
         }
+    });
+    connect(_reoptConfigBrowse, &QToolButton::clicked, this, [this]() {
+        QString initial = _reoptConfigFilePath.isEmpty()
+            ? QDir::homePath() : QFileInfo(_reoptConfigFilePath).absolutePath();
+        QString path = QFileDialog::getOpenFileName(
+            this, tr("Select optimizer config JSON file"), initial,
+            tr("JSON files (*.json);;All files (*)"));
+        if (!path.isEmpty()) {
+            _reoptConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_reopt_config_file_path"), _reoptConfigFilePath);
+            QFileInfo fi(path);
+            populateConfigCombo(_reoptConfigCombo, fi.absolutePath(), fi.fileName(), _reoptConfigFilePath);
+        }
+    });
 
-        // If in external mode and not yet connected, connect first
-        if (_connectionMode == 1) {
-            auto& mgr = LasagnaServiceManager::instance();
-            if (!mgr.isExternal() || !mgr.isRunning()) {
-                mgr.connectToExternal(_externalHost, _externalPort);
-                // Wait for serviceStarted signal to emit lasagnaOptimizeRequested
-                auto* conn = new QMetaObject::Connection;
-                auto* errConn = new QMetaObject::Connection;
-                *conn = connect(&mgr, &LasagnaServiceManager::serviceStarted, this,
-                    [this, conn, errConn]() {
-                        QObject::disconnect(*conn);
-                        QObject::disconnect(*errConn);
-                        delete conn;
-                        delete errConn;
-                        emit lasagnaOptimizeRequested();
-                    });
-                *errConn = connect(&mgr, &LasagnaServiceManager::serviceError, this,
-                    [this, conn, errConn](const QString&) {
-                        QObject::disconnect(*conn);
-                        QObject::disconnect(*errConn);
-                        delete conn;
-                        delete errConn;
-                    });
+    // -- Expand config combo --
+    connect(_expandConfigCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (_restoringSettings || index < 0) return;
+        QString path = _expandConfigCombo->currentData().toString();
+        if (!path.isEmpty()) {
+            _expandConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_expand_config_file_path"), _expandConfigFilePath);
+        }
+    });
+    connect(_expandConfigBrowse, &QToolButton::clicked, this, [this]() {
+        QString initial = _expandConfigFilePath.isEmpty()
+            ? QDir::homePath() : QFileInfo(_expandConfigFilePath).absolutePath();
+        QString path = QFileDialog::getOpenFileName(
+            this, tr("Select optimizer config JSON file"), initial,
+            tr("JSON files (*.json);;All files (*)"));
+        if (!path.isEmpty()) {
+            if (!jsonHasGrowStage(path)) {
+                _progressLabel->setText(tr("Selected config has no grow stages."));
+                _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
+                _progressLabel->setVisible(true);
                 return;
             }
+            _expandConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_expand_config_file_path"), _expandConfigFilePath);
+            QFileInfo fi(path);
+            populateConfigCombo(_expandConfigCombo, fi.absolutePath(), fi.fileName(),
+                                _expandConfigFilePath, /*growOnly=*/true);
         }
-
-        emit lasagnaOptimizeRequested();
     });
 
-    // Stop button
+    // -- Expand direction persistence --
+    for (int i = 0; i < kExpandDirCount; ++i) {
+        connect(_expandDirChecks[i], &QCheckBox::toggled, this, [this, i](bool checked) {
+            if (!_restoringSettings) {
+                QString key = QStringLiteral("lasagna_expand_dir_%1").arg(i);
+                writeSetting(key, checked);
+            }
+        });
+    }
+    connect(_expandGenSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        writeSetting(QStringLiteral("lasagna_expand_generations"), v);
+    });
+
+    // -- Action buttons --
+    connect(_newModelBtn, &QPushButton::clicked, this, [this]() {
+        _lasagnaMode = 1;
+        triggerOptimization();
+    });
+    connect(_reoptBtn, &QPushButton::clicked, this, [this]() {
+        _lasagnaMode = 0;
+        triggerOptimization();
+    });
+    connect(_expandBtn, &QPushButton::clicked, this, [this]() {
+        _lasagnaMode = 2;
+        triggerOptimization();
+    });
+
+    // -- Stop buttons --
     connect(_stopBtn, &QPushButton::clicked, this, [this]() {
         emit lasagnaStopRequested();
     });
-
-    // Stop Service button — kills the Python process entirely
     connect(_stopServiceBtn, &QPushButton::clicked, this, []() {
         LasagnaServiceManager::instance().stopService();
     });
 
-    // Connect to service manager signals
+    // -- Expand state persistence --
+    connect(_connectionGroup, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
+        writeSetting(QStringLiteral("group_lasagna_connection_expanded"), expanded);
+    });
+    connect(_newModelGroup, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
+        writeSetting(QStringLiteral("group_lasagna_new_model_expanded"), expanded);
+    });
+    connect(_reoptGroup, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
+        writeSetting(QStringLiteral("group_lasagna_reopt_expanded"), expanded);
+    });
+    connect(_expandGroup, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
+        writeSetting(QStringLiteral("group_lasagna_expand_expanded"), expanded);
+    });
+
+    // -----------------------------------------------------------------------
+    // Service manager signals
+    // -----------------------------------------------------------------------
     auto& mgr = LasagnaServiceManager::instance();
     connect(&mgr, &LasagnaServiceManager::statusMessage, this, [this](const QString& msg) {
         if (_progressLabel) {
@@ -678,6 +555,8 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             _progressLabel->setStyleSheet(QStringLiteral("color: #27ae60;"));
         }
         if (_stopServiceBtn) _stopServiceBtn->setEnabled(true);
+        // Always fetch datasets from the connected service
+        LasagnaServiceManager::instance().fetchDatasets();
     });
     connect(&mgr, &LasagnaServiceManager::serviceStopped, this, [this]() {
         if (_progressBar) _progressBar->setVisible(false);
@@ -687,7 +566,9 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         }
         if (_stopBtn) _stopBtn->setEnabled(false);
         if (_stopServiceBtn) _stopServiceBtn->setEnabled(false);
-        if (_runBtn) _runBtn->setEnabled(true);
+        if (_newModelBtn) _newModelBtn->setEnabled(true);
+        if (_reoptBtn) _reoptBtn->setEnabled(true);
+        if (_expandBtn) _expandBtn->setEnabled(true);
     });
     connect(&mgr, &LasagnaServiceManager::serviceError, this, [this](const QString& err) {
         std::cerr << "[lasagna] service error: " << err.toStdString() << std::endl;
@@ -699,7 +580,9 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     });
     connect(&mgr, &LasagnaServiceManager::optimizationStarted, this, [this]() {
         if (_stopBtn) _stopBtn->setEnabled(true);
-        if (_runBtn) _runBtn->setEnabled(false);
+        if (_newModelBtn) _newModelBtn->setEnabled(false);
+        if (_reoptBtn) _reoptBtn->setEnabled(false);
+        if (_expandBtn) _expandBtn->setEnabled(false);
         if (_progressLabel) {
             _progressLabel->setText(tr("Optimization started..."));
             _progressLabel->setStyleSheet(QString());
@@ -707,23 +590,23 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         }
     });
     connect(&mgr, &LasagnaServiceManager::optimizationProgress, this,
-            [this](const QString& stage, int step, int total, double loss) {
+            [this](const QString& /*stage*/, int /*step*/, int /*total*/, double loss,
+                   double stageProgress, double overallProgress,
+                   const QString& stageName) {
         if (_progressBar) {
-            if (total > 0) {
-                _progressBar->setRange(0, total);
-                _progressBar->setValue(step);
-                _progressBar->setFormat(
-                    tr("%1/%2  Loss: %3")
-                        .arg(step).arg(total).arg(loss, 0, 'g', 5));
-                _progressBar->setVisible(true);
-            } else {
-                _progressBar->setVisible(false);
-            }
+            _progressBar->setRange(0, 1000);
+            _progressBar->setValue(static_cast<int>(overallProgress * 1000.0));
+            _progressBar->setFormat(
+                tr("Overall: %1%").arg(overallProgress * 100.0, 0, 'f', 1));
+            _progressBar->setVisible(true);
         }
         if (_progressLabel) {
             _progressLabel->setText(
-                tr("Step %1/%2  |  Loss: %3  |  Stage: %4")
-                    .arg(step).arg(total).arg(loss, 0, 'g', 5).arg(stage));
+                tr("Stage: %1 (%2%)  |  Overall: %3%  |  Loss: %4")
+                    .arg(stageName.isEmpty() ? QStringLiteral("...") : stageName)
+                    .arg(stageProgress * 100.0, 0, 'f', 1)
+                    .arg(overallProgress * 100.0, 0, 'f', 1)
+                    .arg(loss, 0, 'g', 5));
             _progressLabel->setStyleSheet(QString());
             _progressLabel->setVisible(true);
         }
@@ -731,7 +614,9 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     connect(&mgr, &LasagnaServiceManager::optimizationFinished, this,
             [this](const QString& outputDir) {
         if (_stopBtn) _stopBtn->setEnabled(false);
-        if (_runBtn) _runBtn->setEnabled(true);
+        if (_newModelBtn) _newModelBtn->setEnabled(true);
+        if (_reoptBtn) _reoptBtn->setEnabled(true);
+        if (_expandBtn) _expandBtn->setEnabled(true);
         if (_progressBar) _progressBar->setVisible(false);
         if (_progressLabel) {
             _progressLabel->setText(tr("Optimization finished. Output: %1").arg(outputDir));
@@ -743,7 +628,9 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             [this](const QString& err) {
         std::cerr << "[lasagna] optimization error: " << err.toStdString() << std::endl;
         if (_stopBtn) _stopBtn->setEnabled(false);
-        if (_runBtn) _runBtn->setEnabled(true);
+        if (_newModelBtn) _newModelBtn->setEnabled(true);
+        if (_reoptBtn) _reoptBtn->setEnabled(true);
+        if (_expandBtn) _expandBtn->setEnabled(true);
         if (_progressBar) _progressBar->setVisible(false);
         if (_progressLabel) {
             _progressLabel->setText(tr("Optimization error: %1").arg(err));
@@ -782,6 +669,58 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
 }
 
 // ---------------------------------------------------------------------------
+// Trigger optimization (shared by both action buttons)
+// ---------------------------------------------------------------------------
+
+void SegmentationLasagnaPanel::triggerOptimization()
+{
+    const QString& configPath = (_lasagnaMode == 1) ? _newModelConfigFilePath
+                              : (_lasagnaMode == 2) ? _expandConfigFilePath
+                              : _reoptConfigFilePath;
+
+    if (configPath.isEmpty()) {
+        _progressLabel->setText(tr("No config file selected."));
+        _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
+        _progressLabel->setVisible(true);
+        return;
+    }
+    if (!QFileInfo::exists(configPath)) {
+        _progressLabel->setText(tr("Config file not found: %1").arg(configPath));
+        _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
+        _progressLabel->setVisible(true);
+        return;
+    }
+
+    // If in external mode and not yet connected, connect first
+    if (_connectionMode == 1) {
+        auto& mgr = LasagnaServiceManager::instance();
+        if (!mgr.isExternal() || !mgr.isRunning()) {
+            mgr.connectToExternal(_externalHost, _externalPort);
+            auto* conn = new QMetaObject::Connection;
+            auto* errConn = new QMetaObject::Connection;
+            *conn = connect(&mgr, &LasagnaServiceManager::serviceStarted, this,
+                [this, conn, errConn]() {
+                    QObject::disconnect(*conn);
+                    QObject::disconnect(*errConn);
+                    delete conn;
+                    delete errConn;
+                    emit lasagnaOptimizeRequested();
+                });
+            *errConn = connect(&mgr, &LasagnaServiceManager::serviceError, this,
+                [conn, errConn](const QString&) {
+                    QObject::disconnect(*conn);
+                    QObject::disconnect(*errConn);
+                    delete conn;
+                    delete errConn;
+                });
+            return;
+        }
+    }
+
+    emit lasagnaOptimizeRequested();
+}
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -798,15 +737,31 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
     _restoringSettings = true;
 
     _lasagnaDataInputPath = settings.value(QStringLiteral("lasagna_data_input_path"), QString()).toString();
-    _lasagnaConfigText = settings.value(QStringLiteral("lasagna_config_text"), QString()).toString();
 
-    _lasagnaMode = settings.value(QStringLiteral("lasagna_mode"), 0).toInt();
-    if (_modeCombo) {
-        _modeCombo->setCurrentIndex(_lasagnaMode);
+    // Config paths — with migration from old single key
+    _newModelConfigFilePath = settings.value(QStringLiteral("lasagna_new_model_config_file_path"), QString()).toString();
+    _reoptConfigFilePath = settings.value(QStringLiteral("lasagna_reopt_config_file_path"), QString()).toString();
+    if (_newModelConfigFilePath.isEmpty() && _reoptConfigFilePath.isEmpty()) {
+        QString oldPath = settings.value(QStringLiteral("lasagna_config_file_path"), QString()).toString();
+        if (!oldPath.isEmpty()) {
+            _newModelConfigFilePath = oldPath;
+            _reoptConfigFilePath = oldPath;
+            writeSetting(QStringLiteral("lasagna_new_model_config_file_path"), _newModelConfigFilePath);
+            writeSetting(QStringLiteral("lasagna_reopt_config_file_path"), _reoptConfigFilePath);
+        }
     }
-    if (_newModelWidget) {
-        _newModelWidget->setVisible(_lasagnaMode == 1);
+
+    // Seed point
+    if (_seedEdit) {
+        const QSignalBlocker b(_seedEdit);
+        _seedEdit->setText(settings.value(QStringLiteral("lasagna_seed_point"), QString()).toString());
     }
+    // Output name
+    if (_outputNameEdit) {
+        const QSignalBlocker b(_outputNameEdit);
+        _outputNameEdit->setText(settings.value(QStringLiteral("lasagna_output_name"), QString()).toString());
+    }
+    // Dimensions
     if (_widthSpin) {
         const QSignalBlocker b(_widthSpin);
         _widthSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_width"), 2048).toInt());
@@ -820,6 +775,7 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
         _depthSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_depth"), 2048).toInt());
     }
 
+    // Connection settings
     _connectionMode = settings.value(QStringLiteral("lasagna_connection_mode"), 0).toInt();
     _externalHost = settings.value(QStringLiteral("lasagna_external_host"),
                                    QStringLiteral("127.0.0.1")).toString();
@@ -838,27 +794,72 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
     }
     updateConnectionWidgets();
 
-    int profileIndex = settings.value(QStringLiteral("lasagna_profile_index"), 0).toInt();
-    if (profileIndex < 0 || profileIndex >= kProfileCount) {
-        profileIndex = 0;
+    // Auto-reconnect to saved external service (triggers dataset fetch via serviceStarted)
+    if (_connectionMode == 1 && !_externalHost.isEmpty() && _externalPort > 0) {
+        LasagnaServiceManager::instance().connectToExternal(_externalHost, _externalPort);
     }
 
-    if (_lasagnaConfigText.trimmed().isEmpty()) {
-        if (profileIndex < kCustomProfileIndex && kProfiles[profileIndex].json) {
-            _lasagnaConfigText = QString::fromUtf8(kProfiles[profileIndex].json);
-        } else {
-            _lasagnaConfigText = QString::fromUtf8(kProfiles[0].json);
+    // Expand settings
+    _expandConfigFilePath = settings.value(QStringLiteral("lasagna_expand_config_file_path"), QString()).toString();
+    for (int i = 0; i < kExpandDirCount; ++i) {
+        if (_expandDirChecks[i]) {
+            const QSignalBlocker b(_expandDirChecks[i]);
+            _expandDirChecks[i]->setChecked(
+                settings.value(QStringLiteral("lasagna_expand_dir_%1").arg(i), false).toBool());
+        }
+    }
+    if (_expandGenSpin) {
+        const QSignalBlocker b(_expandGenSpin);
+        _expandGenSpin->setValue(
+            settings.value(QStringLiteral("lasagna_expand_generations"), 10).toInt());
+    }
+
+    // Populate config combos from saved paths
+    if (!_newModelConfigFilePath.isEmpty()) {
+        QFileInfo fi(_newModelConfigFilePath);
+        if (fi.exists()) {
+            populateConfigCombo(_newModelConfigCombo, fi.absolutePath(), fi.fileName(), _newModelConfigFilePath);
+        } else if (_newModelConfigCombo) {
+            _newModelConfigCombo->clear();
+            _newModelConfigCombo->addItem(fi.fileName(), _newModelConfigFilePath);
+        }
+    }
+    if (!_reoptConfigFilePath.isEmpty()) {
+        QFileInfo fi(_reoptConfigFilePath);
+        if (fi.exists()) {
+            populateConfigCombo(_reoptConfigCombo, fi.absolutePath(), fi.fileName(), _reoptConfigFilePath);
+        } else if (_reoptConfigCombo) {
+            _reoptConfigCombo->clear();
+            _reoptConfigCombo->addItem(fi.fileName(), _reoptConfigFilePath);
+        }
+    }
+    if (!_expandConfigFilePath.isEmpty()) {
+        QFileInfo fi(_expandConfigFilePath);
+        if (fi.exists()) {
+            populateConfigCombo(_expandConfigCombo, fi.absolutePath(), fi.fileName(),
+                                _expandConfigFilePath, /*growOnly=*/true);
+        } else if (_expandConfigCombo) {
+            _expandConfigCombo->clear();
+            _expandConfigCombo->addItem(fi.fileName(), _expandConfigFilePath);
         }
     }
 
-    if (_profileCombo) {
-        _profileCombo->setCurrentIndex(profileIndex);
+    // Expand states
+    if (_connectionGroup) {
+        _connectionGroup->setExpanded(
+            settings.value(QStringLiteral("group_lasagna_connection_expanded"), false).toBool());
     }
-
-    const bool expanded = settings.value(
-        QStringLiteral("group_lasagna_expanded"), false).toBool();
-    if (_group) {
-        _group->setExpanded(expanded);
+    if (_newModelGroup) {
+        _newModelGroup->setExpanded(
+            settings.value(QStringLiteral("group_lasagna_new_model_expanded"), false).toBool());
+    }
+    if (_reoptGroup) {
+        _reoptGroup->setExpanded(
+            settings.value(QStringLiteral("group_lasagna_reopt_expanded"), false).toBool());
+    }
+    if (_expandGroup) {
+        _expandGroup->setExpanded(
+            settings.value(QStringLiteral("group_lasagna_expand_expanded"), false).toBool());
     }
 
     _restoringSettings = false;
@@ -870,15 +871,11 @@ void SegmentationLasagnaPanel::syncUiState(bool /*editingEnabled*/, bool optimiz
         const QSignalBlocker b(_dataInputEdit);
         _dataInputEdit->setText(_lasagnaDataInputPath);
     }
-    if (_configEdit && _configEdit->toPlainText() != _lasagnaConfigText) {
-        const QSignalBlocker b(_configEdit);
-        _configEdit->setPlainText(_lasagnaConfigText);
-    }
 
-    if (_runBtn) _runBtn->setEnabled(!optimizing);
+    if (_newModelBtn) _newModelBtn->setEnabled(!optimizing);
+    if (_reoptBtn) _reoptBtn->setEnabled(!optimizing);
+    if (_expandBtn) _expandBtn->setEnabled(!optimizing);
     if (_stopBtn) _stopBtn->setEnabled(optimizing);
-
-    validateConfigText();
 }
 
 // ---------------------------------------------------------------------------
@@ -897,75 +894,117 @@ void SegmentationLasagnaPanel::setLasagnaDataInputPath(const QString& path)
 }
 
 // ---------------------------------------------------------------------------
-// Profile loading
+// Config file selector (reusable for both combos)
 // ---------------------------------------------------------------------------
 
-void SegmentationLasagnaPanel::loadProfile(int index)
+bool SegmentationLasagnaPanel::jsonHasGrowStage(const QString& filePath)
 {
-    if (index < 0 || index >= kProfileCount) return;
-    if (index == kCustomProfileIndex) return;  // Don't overwrite on "Custom"
-
-    const char* json = kProfiles[index].json;
-    if (!json) return;
-
-    _lasagnaConfigText = QString::fromUtf8(json);
-    writeSetting(QStringLiteral("lasagna_config_text"), _lasagnaConfigText);
-
-    if (_configEdit) {
-        const QSignalBlocker b(_configEdit);
-        _configEdit->setPlainText(_lasagnaConfigText);
+    QFile f(filePath);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return false;
+    QByteArray data = f.readAll();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    if (!doc.isObject()) return false;
+    QJsonArray stages = doc.object()[QStringLiteral("stages")].toArray();
+    for (const auto& stageVal : stages) {
+        QJsonObject stage = stageVal.toObject();
+        if (stage.contains(QStringLiteral("grow")) && stage[QStringLiteral("grow")].isObject())
+            return true;
     }
-    validateConfigText();
+    return false;
+}
+
+void SegmentationLasagnaPanel::populateConfigCombo(
+    QComboBox* combo, const QString& dir,
+    const QString& selectName, QString& outPath,
+    bool growOnly)
+{
+    if (!combo) return;
+
+    const QSignalBlocker b(combo);
+    combo->clear();
+
+    QDir d(dir);
+    QStringList jsonFiles = d.entryList(
+        QStringList{QStringLiteral("*.json")}, QDir::Files, QDir::Name);
+
+    int selectIndex = -1;
+    int addedCount = 0;
+    for (const auto& fileName : jsonFiles) {
+        QString fullPath = d.absoluteFilePath(fileName);
+        if (growOnly && !jsonHasGrowStage(fullPath))
+            continue;
+        combo->addItem(fileName, fullPath);
+        if (fileName == selectName) {
+            selectIndex = addedCount;
+        }
+        ++addedCount;
+    }
+
+    if (selectIndex >= 0) {
+        combo->setCurrentIndex(selectIndex);
+        outPath = combo->currentData().toString();
+    } else if (combo->count() > 0) {
+        combo->setCurrentIndex(0);
+        outPath = combo->currentData().toString();
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Config JSON
+// Config JSON — reads file from disk on demand
 // ---------------------------------------------------------------------------
 
-void SegmentationLasagnaPanel::validateConfigText()
+QString SegmentationLasagnaPanel::lasagnaConfigText() const
 {
-    _configError.clear();
+    const QString& path = (_lasagnaMode == 1) ? _newModelConfigFilePath
+                        : (_lasagnaMode == 2) ? _expandConfigFilePath
+                        : _reoptConfigFilePath;
+    if (path.isEmpty()) return {};
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return {};
+    QByteArray raw = f.readAll();
 
-    QString trimmed = _lasagnaConfigText.trimmed();
-    if (trimmed.isEmpty()) {
-        if (_configStatus) _configStatus->setVisible(false);
-        return;
-    }
+    // For Expand mode: patch grow.directions and grow.generations in all grow stages
+    if (_lasagnaMode == 2) {
+        QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (doc.isObject()) {
+            QJsonObject root = doc.object();
+            QJsonArray stages = root[QStringLiteral("stages")].toArray();
+            int generations = _expandGenSpin ? _expandGenSpin->value() : 10;
 
-    try {
-        QByteArray utf8 = trimmed.toUtf8();
-        nlohmann::json parsed = nlohmann::json::parse(
-            utf8.constData(), utf8.constData() + utf8.size());
-        if (!parsed.is_object()) {
-            _configError = tr("Config must be a JSON object.");
+            // Collect checked directions
+            static const char* dirStrings[] = {"right", "left", "down", "up", "fw", "bw"};
+            QJsonArray dirs;
+            for (int i = 0; i < kExpandDirCount; ++i) {
+                if (_expandDirChecks[i] && _expandDirChecks[i]->isChecked())
+                    dirs.append(QString::fromLatin1(dirStrings[i]));
+            }
+
+            for (int i = 0; i < stages.size(); ++i) {
+                QJsonObject stage = stages[i].toObject();
+                if (stage.contains(QStringLiteral("grow")) &&
+                    stage[QStringLiteral("grow")].isObject()) {
+                    QJsonObject grow = stage[QStringLiteral("grow")].toObject();
+                    grow[QStringLiteral("directions")] = dirs;
+                    grow[QStringLiteral("generations")] = generations;
+                    stage[QStringLiteral("grow")] = grow;
+                    stages[i] = stage;
+                }
+            }
+            root[QStringLiteral("stages")] = stages;
+            return QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Indented));
         }
-    } catch (const nlohmann::json::parse_error& ex) {
-        _configError = tr("JSON parse error (byte %1): %2")
-                           .arg(static_cast<qulonglong>(ex.byte))
-                           .arg(QString::fromStdString(ex.what()));
-    } catch (const std::exception& ex) {
-        _configError = tr("JSON error: %1").arg(QString::fromStdString(ex.what()));
     }
 
-    if (_configStatus) {
-        if (_configError.isEmpty()) {
-            _configStatus->setText(tr("JSON valid"));
-            _configStatus->setStyleSheet(QStringLiteral("color: #27ae60;"));
-        } else {
-            _configStatus->setText(_configError);
-            _configStatus->setStyleSheet(QStringLiteral("color: #c0392b;"));
-        }
-        _configStatus->setVisible(true);
-    }
+    return QString::fromUtf8(raw);
 }
 
 std::optional<nlohmann::json> SegmentationLasagnaPanel::lasagnaConfigJson() const
 {
-    QString trimmed = _lasagnaConfigText.trimmed();
-    if (trimmed.isEmpty()) return std::nullopt;
+    QString text = lasagnaConfigText().trimmed();
+    if (text.isEmpty()) return std::nullopt;
 
     try {
-        QByteArray utf8 = trimmed.toUtf8();
+        QByteArray utf8 = text.toUtf8();
         nlohmann::json parsed = nlohmann::json::parse(
             utf8.constData(), utf8.constData() + utf8.size());
         if (parsed.is_object()) return parsed;
@@ -975,7 +1014,7 @@ std::optional<nlohmann::json> SegmentationLasagnaPanel::lasagnaConfigJson() cons
 }
 
 // ---------------------------------------------------------------------------
-// Lasagna mode (Re-optimize / New Model)
+// Lasagna mode helpers
 // ---------------------------------------------------------------------------
 
 int SegmentationLasagnaPanel::newModelWidth() const
@@ -993,14 +1032,20 @@ int SegmentationLasagnaPanel::newModelDepth() const
     return _depthSpin ? _depthSpin->value() : 2048;
 }
 
-void SegmentationLasagnaPanel::onLasagnaModeChanged(int index)
+QString SegmentationLasagnaPanel::seedPointText() const
 {
-    if (_restoringSettings) return;
-    _lasagnaMode = index;
-    writeSetting(QStringLiteral("lasagna_mode"), _lasagnaMode);
-    if (_newModelWidget) {
-        _newModelWidget->setVisible(index == 1);  // Show for "New Model"
-    }
+    return _seedEdit ? _seedEdit->text().trimmed() : QString();
+}
+
+QString SegmentationLasagnaPanel::newModelOutputName() const
+{
+    return _outputNameEdit ? _outputNameEdit->text().trimmed() : QString();
+}
+
+void SegmentationLasagnaPanel::setSeedFromFocus(int x, int y, int z)
+{
+    if (_seedEdit)
+        _seedEdit->setText(QString("%1, %2, %3").arg(x).arg(y).arg(z));
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,6 +1079,11 @@ void SegmentationLasagnaPanel::updateConnectionWidgets()
     if (!external) {
         if (_dataInputStack) _dataInputStack->setCurrentIndex(0);
     }
+
+    // When switching to external, try connecting (triggers dataset fetch via serviceStarted)
+    if (external && !_restoringSettings && !_externalHost.isEmpty() && _externalPort > 0) {
+        LasagnaServiceManager::instance().connectToExternal(_externalHost, _externalPort);
+    }
 }
 
 void SegmentationLasagnaPanel::refreshDiscoveredServices()
@@ -1049,7 +1099,6 @@ void SegmentationLasagnaPanel::refreshDiscoveredServices()
         QString host = svc[QStringLiteral("host")].toString();
         int port = svc[QStringLiteral("port")].toInt();
 
-        // Build a descriptive label from whatever info is available
         QString label;
         if (svc.contains(QStringLiteral("name"))) {
             label = QStringLiteral("%1 (%2:%3)")
@@ -1089,24 +1138,6 @@ void SegmentationLasagnaPanel::onDiscoveredServiceSelected(int index)
     _externalHost = host;
     _externalPort = port;
 
-    // Auto-connect; fetch datasets once connected
-    auto& mgr = LasagnaServiceManager::instance();
-    auto* conn = new QMetaObject::Connection;
-    auto* errConn = new QMetaObject::Connection;
-    *conn = connect(&mgr, &LasagnaServiceManager::serviceStarted, this,
-        [this, conn, errConn]() {
-            QObject::disconnect(*conn);
-            QObject::disconnect(*errConn);
-            delete conn;
-            delete errConn;
-            LasagnaServiceManager::instance().fetchDatasets();
-        });
-    *errConn = connect(&mgr, &LasagnaServiceManager::serviceError, this,
-        [conn, errConn](const QString&) {
-            QObject::disconnect(*conn);
-            QObject::disconnect(*errConn);
-            delete conn;
-            delete errConn;
-        });
-    mgr.connectToExternal(host, port);
+    // Auto-connect (datasets are fetched via the permanent serviceStarted handler)
+    LasagnaServiceManager::instance().connectToExternal(host, port);
 }

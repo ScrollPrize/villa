@@ -273,7 +273,6 @@ private:
 class QuadSurface : public Surface
 {
 public:
-    cv::Vec3f pointer() override;
     QuadSurface() = default;
     // points will be cloned in constructor
     QuadSurface(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &scale);
@@ -310,6 +309,8 @@ public:
     void save(const std::filesystem::path &path, bool force_overwrite = false);
     void save_meta();
     Rect3D bbox();
+
+    bool isLoaded() const { return !_needsLoad; }
 
     virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); return *_points; }
     virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { ensureLoaded(); return _points.get(); }

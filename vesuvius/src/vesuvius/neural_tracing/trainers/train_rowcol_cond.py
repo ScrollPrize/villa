@@ -206,8 +206,6 @@ def train(config_path):
     with open(config_path, 'r') as f:
         config = json.load(f)
 
-    config.setdefault('_config_dir', os.path.dirname(os.path.abspath(config_path)))
-
     user_set_triplet_direction_priors = 'use_triplet_direction_priors' in config
     setdefault_rowcol_cond_dataset_config(config)
 

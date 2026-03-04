@@ -26,13 +26,9 @@ class ExportConfig:
 	offset_x: float = 0.0
 	offset_y: float = 0.0
 	offset_z: int = 0
-	# Defaults follow the requested convention:
-	# - scale unit is the grid-step (meta.scale=0.1)
-	# - z-step is 1 and we only output every 10th slice
 	z0: int = 0
 	z_step: int = 10
 	grid_step: int = 10
-	scale: float = 0.1
 	single_segment: bool = False
 	copy_model: bool = False
 	output_name: str | None = None
@@ -115,7 +111,7 @@ def _apply_global_transform_from_state_dict(*, uv: torch.Tensor, st: dict) -> to
 	return torch.cat([x, y], dim=1)
 
 
-def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray, scale: float, model_source: Path | None = None, copy_model: bool = False) -> None:
+def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray, scale: float, model_source: Path | None = None, copy_model: bool = False, fit_config: dict | None = None) -> None:
 	out_dir.mkdir(parents=True, exist_ok=True)
 	if x.shape != y.shape or x.shape != z.shape:
 		raise ValueError("x/y/z must have identical shapes")
@@ -140,6 +136,8 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		meta["model_source"] = str(model_source)
 	else:
 		meta.pop("model_source", None)
+	if fit_config is not None:
+		meta["fit_config"] = fit_config
 	(out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 	tifffile.imwrite(str(out_dir / "x.tif"), xf, compression="lzw")
 	tifffile.imwrite(str(out_dir / "y.tif"), yf, compression="lzw")
@@ -176,12 +174,18 @@ def main(argv: list[str] | None = None) -> int:
 	cfg = ExportConfig(**base)
 	dev = torch.device(cfg.device)
 
-	st = torch.load(cfg.input, map_location=dev)
+	st = torch.load(cfg.input, map_location=dev, weights_only=False)
 	if not isinstance(st, dict):
 		raise ValueError("expected a state_dict checkpoint")
 	model_params = st.get("_model_params_", None)
 	if not isinstance(model_params, dict):
 		model_params = None
+	fit_config = st.get("_fit_config_", None)
+	if not isinstance(fit_config, dict):
+		fit_config = None
+	corr_points_results = st.get("_corr_points_results_", None)
+	if not isinstance(corr_points_results, dict):
+		corr_points_results = None
 
 	if model_params is not None:
 		c6_full = model_params.get("crop_fullres_xyzwhd", None)
@@ -194,29 +198,52 @@ def main(argv: list[str] | None = None) -> int:
 		elif isinstance(c6_model, (list, tuple)) and len(c6_model) == 6:
 			c6 = c6_model
 			crop_key = "crop_xyzwhd"
+		# Margin from expanded data: mesh model coords are shifted by margin.
+		# Subtract margin (in full-res) from offset so conversion is correct.
+		margin_modelpx = model_params.get("data_margin_modelpx", (0.0, 0.0))
+		if not isinstance(margin_modelpx, (list, tuple)) or len(margin_modelpx) != 2:
+			margin_modelpx = (0.0, 0.0)
 		if c6 is not None:
 			x0c, y0c, _wc, _hc, z0c, _d = (int(v) for v in c6)
 			if not bool(offset_explicit):
 				if crop_key == "crop_fullres_xyzwhd":
-					base["offset_x"] = float(x0c)
-					base["offset_y"] = float(y0c)
+					base["offset_x"] = float(x0c) - float(margin_modelpx[0]) * float(base["downscale"])
+					base["offset_y"] = float(y0c) - float(margin_modelpx[1]) * float(base["downscale"])
 				else:
 					ds = float(base["downscale"])
 					if ds <= 0.0:
 						ds = 1.0
-					base["offset_x"] = float(x0c) * ds
-					base["offset_y"] = float(y0c) * ds
+					base["offset_x"] = float(x0c) * ds - float(margin_modelpx[0]) * ds
+					base["offset_y"] = float(y0c) * ds - float(margin_modelpx[1]) * ds
 				base["offset_z"] = 0
 			base["z0"] = int(z0c)
 		if "z_step_vx" in model_params:
 			base["z_step"] = max(1, int(model_params["z_step_vx"]))
+		if "mesh_step_px" in model_params:
+			base["grid_step"] = max(1, int(model_params["mesh_step_px"]))
 		cfg = ExportConfig(**base)
 
 	crop_bounds_fullres: tuple[float, float, float, float] | None = None
 	if model_params is not None:
 		c6_full = model_params.get("crop_fullres_xyzwhd", None)
 		c6_model = model_params.get("crop_xyzwhd", None)
-		if isinstance(c6_full, (list, tuple)) and len(c6_full) == 6:
+		# When data has margins, use expanded data bounds for clipping
+		# (the valid channel already handled masking during fit).
+		data_sz = model_params.get("data_size_modelpx", (0, 0))
+		if not isinstance(data_sz, (list, tuple)) or len(data_sz) != 2:
+			data_sz = (0, 0)
+		margin_modelpx = model_params.get("data_margin_modelpx", (0.0, 0.0))
+		if not isinstance(margin_modelpx, (list, tuple)) or len(margin_modelpx) != 2:
+			margin_modelpx = (0.0, 0.0)
+		ds_cb = float(cfg.downscale) if float(cfg.downscale) > 0.0 else 1.0
+		if int(data_sz[0]) > 0 and int(data_sz[1]) > 0:
+			# Use full data extent for crop bounds
+			x0 = float(cfg.offset_x)
+			y0 = float(cfg.offset_y)
+			x1 = x0 + float(max(0, int(data_sz[1]) - 1)) * ds_cb
+			y1 = y0 + float(max(0, int(data_sz[0]) - 1)) * ds_cb
+			crop_bounds_fullres = (x0, y0, x1, y1)
+		elif isinstance(c6_full, (list, tuple)) and len(c6_full) == 6:
 			x0c, y0c, wc, hc, _z0c, _d = (int(v) for v in c6_full)
 			x0 = float(x0c)
 			y0 = float(y0c)
@@ -225,13 +252,10 @@ def main(argv: list[str] | None = None) -> int:
 			crop_bounds_fullres = (x0, y0, x1, y1)
 		elif isinstance(c6_model, (list, tuple)) and len(c6_model) == 6:
 			x0c, y0c, wc, hc, _z0c, _d = (int(v) for v in c6_model)
-			ds = float(cfg.downscale)
-			if ds <= 0.0:
-				ds = 1.0
-			x0 = float(x0c) * ds
-			y0 = float(y0c) * ds
-			x1 = x0 + float(max(0, int(wc) - 1)) * ds
-			y1 = y0 + float(max(0, int(hc) - 1)) * ds
+			x0 = float(x0c) * ds_cb
+			y0 = float(y0c) * ds_cb
+			x1 = x0 + float(max(0, int(wc) - 1)) * ds_cb
+			y1 = y0 + float(max(0, int(hc) - 1)) * ds_cb
 			crop_bounds_fullres = (x0, y0, x1, y1)
 
 	offset_src = "cli --offset" if bool(offset_explicit) else "model crop"
@@ -247,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
 			"offset_y": float(cfg.offset_y),
 			"offset_z": int(cfg.offset_z),
 			"downscale": float(cfg.downscale),
+			"grid_step": int(cfg.grid_step),
 			"crop_from_checkpoint": crop_dbg,
 		},
 	)
@@ -282,7 +307,8 @@ def main(argv: list[str] | None = None) -> int:
 	z_vals = np.asarray([cfg.z0 + int(cfg.offset_z) + zi * int(z_step_fullres) for zi in idx_z], dtype=np.float32)
 	z_grid = z_vals.reshape(-1, 1).repeat(hm, axis=1)
 
-	meta_scale = float(cfg.scale) * float(cfg.downscale)
+	xy_step_fullres = float(cfg.grid_step) * float(cfg.downscale)
+	meta_scale = 1.0 / xy_step_fullres
 	BORDER_W = 2  # invalid-point border width between windings in single-segment mode
 
 	def _apply_crop_mask(x: np.ndarray, y: np.ndarray, z_use: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
@@ -324,9 +350,11 @@ def main(argv: list[str] | None = None) -> int:
 
 		seg_name = cfg.output_name if cfg.output_name else f"{cfg.prefix}.tifxyz"
 		out_dir = out_base / seg_name
-		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model)
+		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config)
 		if model_params is not None:
 			(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
+		if corr_points_results is not None:
+			(out_dir / "corr_points_results.json").write_text(json.dumps(corr_points_results, indent=2) + "\n", encoding="utf-8")
 		if mask_all is not None:
 			tifffile.imwrite(str(out_dir / "mask.tif"), mask_all, compression="lzw")
 	else:
@@ -335,9 +363,11 @@ def main(argv: list[str] | None = None) -> int:
 			y = xy_lr[idx_z_a, :, wi, 1]
 			x, y, z_use, mask = _apply_crop_mask(x, y, z_grid)
 			out_dir = out_base / f"{cfg.prefix}{wi:04d}.tifxyz"
-			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z_use, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model)
+			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z_use, scale=meta_scale, model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config)
 			if model_params is not None:
 				(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
+			if corr_points_results is not None:
+				(out_dir / "corr_points_results.json").write_text(json.dumps(corr_points_results, indent=2) + "\n", encoding="utf-8")
 			if mask is not None:
 				tifffile.imwrite(str(out_dir / "mask.tif"), mask, compression="lzw")
 

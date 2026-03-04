@@ -1,6 +1,5 @@
 #include "vc/core/util/QuadSurface.hpp"
 
-#include "vc/core/util/ChunkCache.hpp"
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/PointIndex.hpp"
@@ -170,11 +169,6 @@ void QuadSurface::ensureLoaded()
 }
 
 QuadSurface::~QuadSurface() = default;
-
-cv::Vec3f QuadSurface::pointer()
-{
-    return cv::Vec3f(0, 0, 0);
-}
 
 void QuadSurface::move(cv::Vec3f &ptr, const cv::Vec3f &offset)
 {
@@ -635,13 +629,6 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
                            SurfacePatchIndex* surfaceIndex, PointIndex* pointIndex)
 {
     ensureLoaded();
-
-    // Guard: grid too small or scale is zero — cannot search
-    if (!_points || _points->cols < 4 || _points->rows < 4 ||
-        _scale[0] < 1e-12f || _scale[1] < 1e-12f) {
-        return -1;
-    }
-
     cv::Vec2f loc = cv::Vec2f(ptr[0], ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
     cv::Vec3f _out;
 
@@ -1935,7 +1922,7 @@ bool overlap(QuadSurface& a, QuadSurface& b, int max_iters)
         if (loc[0] == -1)
             continue;
 
-        cv::Vec3f ptr = b.pointer();
+        cv::Vec3f ptr(0, 0, 0);
         if (b.pointTo(ptr, loc, 2.0, max_iters) <= 2.0) {
             return true;
         }
@@ -1948,7 +1935,7 @@ bool contains(QuadSurface& a, const cv::Vec3f& loc, int max_iters)
     if (!intersect(a.bbox(), {loc,loc}))
         return false;
 
-    cv::Vec3f ptr = a.pointer();
+    cv::Vec3f ptr(0, 0, 0);
     if (a.pointTo(ptr, loc, 2.0, max_iters) <= 2.0) {
         return true;
     }

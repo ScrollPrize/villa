@@ -1,9 +1,5 @@
 import torch
 import numpy as np
-import aiohttp
-import fsspec
-import json
-import os
 from numba import njit
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,81 +13,6 @@ from scipy import ndimage
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import tifffile
 import warnings
-
-
-_HTTP_PREFIXES = ('http://', 'https://')
-
-
-def _resolve_config_relative_path(path_value, config):
-    if path_value is None:
-        return None
-
-    path_obj = Path(os.path.expanduser(str(path_value)))
-    if path_obj.is_absolute():
-        return path_obj
-
-    config_dir = config.get('_config_dir') or config.get('config_dir')
-    if config_dir:
-        return Path(config_dir).expanduser() / path_obj
-    return Path.cwd() / path_obj
-
-
-def _load_http_basic_auth(auth_json_path, config):
-    resolved_path = _resolve_config_relative_path(auth_json_path, config)
-    if resolved_path is None:
-        return None
-
-    if not resolved_path.exists():
-        raise FileNotFoundError(f"volume_auth_json file not found: {resolved_path}")
-
-    with open(resolved_path, 'r', encoding='utf-8') as f:
-        auth_data = json.load(f)
-
-    if not isinstance(auth_data, dict):
-        raise ValueError(
-            f"volume_auth_json must contain a JSON object, got {type(auth_data).__name__}"
-        )
-
-    auth_root = auth_data.get('auth') if isinstance(auth_data.get('auth'), dict) else auth_data
-    username = auth_root.get('username', auth_root.get('user'))
-    password = auth_root.get('password')
-
-    if not username or password is None:
-        raise ValueError(
-            f"volume_auth_json ({resolved_path}) must contain 'username' (or 'user') and 'password' fields"
-        )
-
-    return str(username), str(password)
-
-
-def open_zarr(path, scale=None, auth_json_path=None, config=None):
-    path = str(path)
-    config = {} if config is None else config
-    scale = 0 if scale is None else int(scale)
-
-    if path.startswith(_HTTP_PREFIXES):
-        fs_protocol = 'https' if path.startswith('https://') else 'http'
-        fs_kwargs = {}
-        store_exceptions = (KeyError, FileNotFoundError, PermissionError, OSError)
-
-        if auth_json_path:
-            username, password = _load_http_basic_auth(auth_json_path, config)
-            fs_kwargs['client_kwargs'] = {'auth': aiohttp.BasicAuth(username, password)}
-            store_exceptions = store_exceptions + (aiohttp.ClientResponseError,)
-
-        fs = fsspec.filesystem(fs_protocol, **fs_kwargs)
-        store = zarr.storage.FSStore(
-            path.rstrip('/'),
-            fs=fs,
-            mode='r',
-            check=False,
-            create=False,
-            exceptions=store_exceptions,
-        )
-
-        return zarr.open(store, path=str(scale), mode='r')
-
-    return zarr.open(path, path=str(scale), mode='r')
 
 
 def _parse_z_range(z_range):

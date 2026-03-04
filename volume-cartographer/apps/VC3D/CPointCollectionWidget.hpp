@@ -13,10 +13,20 @@
 #include <QDoubleSpinBox>
 #include <QLabel>
 
+#include <cmath>
+#include <filesystem>
+#include <unordered_map>
 
 
 
 
+
+
+struct CorrPointResult {
+    float winding_obs = NAN;
+    float winding_err = NAN;
+    float p[3] = {NAN, NAN, NAN};  // fullres position used during optimization
+};
 
 class CPointCollectionWidget : public QDockWidget
 {
@@ -26,11 +36,15 @@ public:
     explicit CPointCollectionWidget(VCCollection *collection, QWidget *parent = nullptr);
     ~CPointCollectionWidget();
 
+    void loadCorrPointsResults(const std::filesystem::path& jsonPath);
+    void clearCorrPointsResults();
+
 signals:
     void collectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointDoubleClicked(uint64_t pointId);
     void convertPointToAnchorRequested(uint64_t pointId, uint64_t collectionId);
+    void focusViewsRequested(uint64_t collectionId, uint64_t pointId);
 
 public slots:
     void selectCollection(uint64_t collectionId);
@@ -60,7 +74,8 @@ private slots:
     void onLoadClicked();
     void onConvertToAnchorClicked();
     void onClearAnchorClicked();
-  
+    void showContextMenu(const QPoint& pos);
+
  private:
     void keyPressEvent(QKeyEvent *event) override;
     void setupUi();
@@ -93,5 +108,8 @@ private slots:
     QCheckBox *_winding_enabled_checkbox;
     QDoubleSpinBox* _winding_spinbox;
     QPushButton *_convert_to_anchor_button;
+
+    std::unordered_map<uint64_t, CorrPointResult> _corr_point_results;
+    std::unordered_map<uint64_t, float> _corr_collection_avgs;
 };
 

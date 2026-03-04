@@ -159,11 +159,11 @@ nlohmann::json calc_point_metrics(const VCCollection& collection, QuadSurface* s
             cv::Vec3f diff = p1.p - p2.p;
             float dist_3d = cv::norm(diff);
 
-            cv::Vec3f ptr1 = surface->pointer();
+            cv::Vec3f ptr1(0, 0, 0);
             surface->pointTo(ptr1, p1.p, 5.0);
             cv::Vec2f loc1(ptr1[0], ptr1[1]);
 
-            cv::Vec3f ptr2 = surface->pointer();
+            cv::Vec3f ptr2(0, 0, 0);
             surface->pointTo(ptr2, p2.p, 5.0);
             cv::Vec2f loc2(ptr2[0], ptr2[1]);
 

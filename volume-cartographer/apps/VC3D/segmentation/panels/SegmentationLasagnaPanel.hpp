@@ -2,15 +2,17 @@
 
 #include <QWidget>
 
+#include <array>
 #include <optional>
 
 #include <nlohmann/json_fwd.hpp>
+
+class QCheckBox;
 
 class CollapsibleSettingsGroup;
 class QComboBox;
 class QLabel;
 class QLineEdit;
-class QPlainTextEdit;
 class QProgressBar;
 class QPushButton;
 class QSettings;
@@ -22,12 +24,11 @@ class QWidget;
 /**
  * Segmentation sidebar panel for the 2D lasagna.
  *
- * Displays:
- *   - Connection mode (internal/external)
- *   - Data input path (.zarr)
- *   - Editable JSON config for the optimizer (base weights, stages, args)
- *   - Run / Stop buttons
- *   - Progress status label
+ * Sections:
+ *   - Connection  (expandable) — connection mode + data input
+ *   - New Model   (button + expandable settings)
+ *   - Re-optimize (button + expandable settings)
+ *   - Shared: stop buttons, progress bar/label
  */
 class SegmentationLasagnaPanel : public QWidget
 {
@@ -37,17 +38,20 @@ public:
     explicit SegmentationLasagnaPanel(const QString& settingsGroup,
                                             QWidget* parent = nullptr);
 
-    /** 0 = Re-optimize, 1 = New Model */
-    enum LasagnaMode { ReOptimize = 0, NewModel = 1 };
+    /** 0 = Re-optimize, 1 = New Model, 2 = Expand */
+    enum LasagnaMode { ReOptimize = 0, NewModel = 1, Expand = 2 };
 
     // Getters
     [[nodiscard]] QString lasagnaDataInputPath() const { return _lasagnaDataInputPath; }
-    [[nodiscard]] QString lasagnaConfigText() const { return _lasagnaConfigText; }
+    /** Reads the selected config JSON file from disk and returns its contents. */
+    [[nodiscard]] QString lasagnaConfigText() const;
     [[nodiscard]] std::optional<nlohmann::json> lasagnaConfigJson() const;
     [[nodiscard]] LasagnaMode lasagnaMode() const { return static_cast<LasagnaMode>(_lasagnaMode); }
     [[nodiscard]] int newModelWidth() const;
     [[nodiscard]] int newModelHeight() const;
     [[nodiscard]] int newModelDepth() const;
+    [[nodiscard]] QString seedPointText() const;
+    [[nodiscard]] QString newModelOutputName() const;
 
     // Setters
     void setLasagnaDataInputPath(const QString& path);
@@ -55,22 +59,32 @@ public:
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled, bool optimizing);
 
+public slots:
+    void setSeedFromFocus(int x, int y, int z);
+
 signals:
     void lasagnaOptimizeRequested();
     void lasagnaStopRequested();
     void lasagnaStatusMessage(const QString& message);
+    void seedFromFocusRequested();
 
 private:
     void writeSetting(const QString& key, const QVariant& value);
-    void validateConfigText();
-    void loadProfile(int index);
-    void onLasagnaModeChanged(int index);
+    void populateConfigCombo(QComboBox* combo, const QString& dir,
+                             const QString& selectName, QString& outPath,
+                             bool growOnly = false);
+    static bool jsonHasGrowStage(const QString& filePath);
     void onConnectionModeChanged(int index);
     void refreshDiscoveredServices();
     void onDiscoveredServiceSelected(int index);
     void updateConnectionWidgets();
+    void triggerOptimization();
 
-    CollapsibleSettingsGroup* _group{nullptr};
+    // -- Sections --
+    CollapsibleSettingsGroup* _connectionGroup{nullptr};
+    CollapsibleSettingsGroup* _newModelGroup{nullptr};
+    CollapsibleSettingsGroup* _reoptGroup{nullptr};
+    CollapsibleSettingsGroup* _expandGroup{nullptr};
 
     // Connection mode
     QComboBox* _connectionCombo{nullptr};
@@ -86,30 +100,46 @@ private:
     // Data input with dataset combo support
     QComboBox* _datasetCombo{nullptr};
     QStackedWidget* _dataInputStack{nullptr};
+    QLineEdit* _dataInputEdit{nullptr};
+    QToolButton* _dataInputBrowse{nullptr};
 
-    // Mode (re-optimize vs new model)
-    QComboBox* _modeCombo{nullptr};
-    QWidget* _newModelWidget{nullptr};
+    // New model settings
     QSpinBox* _widthSpin{nullptr};
     QSpinBox* _heightSpin{nullptr};
     QSpinBox* _depthSpin{nullptr};
+    QLineEdit* _seedEdit{nullptr};
+    QPushButton* _seedFromFocusBtn{nullptr};
+    QLineEdit* _outputNameEdit{nullptr};
 
-    QComboBox* _profileCombo{nullptr};
-    QLineEdit* _dataInputEdit{nullptr};
-    QToolButton* _dataInputBrowse{nullptr};
-    QPlainTextEdit* _configEdit{nullptr};
-    QLabel* _configStatus{nullptr};
-    QPushButton* _runBtn{nullptr};
+    // Expand settings — 6 direction checkboxes: W+, W-, +V, -V, +Z, -Z
+    static constexpr int kExpandDirCount = 6;
+    std::array<QCheckBox*, kExpandDirCount> _expandDirChecks{};
+    QSpinBox* _expandGenSpin{nullptr};
+
+    // Config combos (one per section)
+    QComboBox* _newModelConfigCombo{nullptr};
+    QToolButton* _newModelConfigBrowse{nullptr};
+    QComboBox* _reoptConfigCombo{nullptr};
+    QToolButton* _reoptConfigBrowse{nullptr};
+    QComboBox* _expandConfigCombo{nullptr};
+    QToolButton* _expandConfigBrowse{nullptr};
+
+    // Action buttons
+    QPushButton* _newModelBtn{nullptr};
+    QPushButton* _reoptBtn{nullptr};
+    QPushButton* _expandBtn{nullptr};
     QPushButton* _stopBtn{nullptr};
     QPushButton* _stopServiceBtn{nullptr};
+
     QProgressBar* _progressBar{nullptr};
     QLabel* _progressLabel{nullptr};
 
     QString _lasagnaDataInputPath;
-    QString _lasagnaConfigText;
-    QString _configError;
+    QString _newModelConfigFilePath;
+    QString _reoptConfigFilePath;
+    QString _expandConfigFilePath;
 
-    int _lasagnaMode{0};         // 0=re-optimize, 1=new model
+    int _lasagnaMode{0};         // 0=re-optimize, 1=new model, 2=expand
     int _connectionMode{0};  // 0=internal, 1=external
     QString _externalHost{"127.0.0.1"};
     int _externalPort{9999};

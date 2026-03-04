@@ -164,24 +164,3 @@ target_link_libraries(VC3D
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
 )
 
-if (${VC_INSTALL_APPS})
-    install(
-        TARGETS VC3D
-        BUNDLE DESTINATION . COMPONENT Programs
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT Programs
-    )
-
-    install(
-            PROGRAMS ${CMAKE_SOURCE_DIR}/scripts/vc_sync.py
-            DESTINATION ${CMAKE_INSTALL_BINDIR}
-            COMPONENT Programs
-    )
-
-
-    qt_generate_deploy_app_script(
-        TARGET VC3D
-        OUTPUT_SCRIPT vc_gui_deploy_script
-        NO_UNSUPPORTED_PLATFORM_ERROR
-    )
-    install(SCRIPT ${vc_gui_deploy_script} COMPONENT Programs)
-endif()

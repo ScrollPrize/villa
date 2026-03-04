@@ -337,7 +337,7 @@ inline bool computeMaskArea(QuadSurface& surface,
         return false;
     }
 
-    cv::Vec3f ptr = surface.pointer();
+    cv::Vec3f ptr(0, 0, 0);
     cv::Vec3f offset(-mask.cols / 2.0f, -mask.rows / 2.0f, 0.0f);
 
     cv::Mat_<cv::Vec3f> coords;
