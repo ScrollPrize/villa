@@ -138,17 +138,31 @@ def _load_segment_ink_mask(dataset, segment):
         return cached
 
     grid = dataset._get_segment_stored_grid(segment)
-    expected_shape = tuple(int(v) for v in grid["shape"])
+    stored_h, stored_w = tuple(int(v) for v in grid["shape"])
+    segment.use_stored_resolution()
+    scale_y, scale_x = getattr(segment, "_scale", (1.0, 1.0))
+    scale_y = float(scale_y) if np.isfinite(scale_y) and float(scale_y) > 0.0 else 1.0
+    scale_x = float(scale_x) if np.isfinite(scale_x) and float(scale_x) > 0.0 else 1.0
+    expected_shape = (
+        int(stored_h / scale_y),
+        int(stored_w / scale_x),
+    )
+    ink_label_path = None
     ink_meta = next(
         (label for label in segment.list_labels() if label.get("name") == "inklabels"),
         None,
     )
-    if ink_meta is None:
+    if ink_meta is not None and ink_meta.get("path") is not None:
+        ink_label_path = str(ink_meta["path"])
+    if ink_label_path is None:
+        path_map = getattr(dataset, "_segment_ink_label_path_by_uuid", {})
+        ink_label_path = path_map.get(segment_uuid)
+    if ink_label_path is None:
         out = np.zeros(expected_shape, dtype=bool)
         dataset._segment_ink_mask_cache[segment_uuid] = out
         return out
 
-    ink_label = cv2.imread(str(ink_meta["path"]), cv2.IMREAD_UNCHANGED)
+    ink_label = cv2.imread(str(ink_label_path), cv2.IMREAD_UNCHANGED)
     if ink_label is None:
         out = np.zeros(expected_shape, dtype=bool)
         dataset._segment_ink_mask_cache[segment_uuid] = out
@@ -183,7 +197,496 @@ def _load_segment_ink_mask(dataset, segment):
 
 
 def _get_segment_positive_points_zyx(dataset, segment):
-    return dataset._get_segment_positive_samples(segment)["points_zyx"]
+    return _get_segment_positive_samples(dataset, segment)["points_zyx"]
+
+
+def _normalize_distance_pair(value, name):
+    if np.isscalar(value):
+        distance = float(value)
+        if not np.isfinite(distance):
+            raise ValueError(f"{name} must be finite, got {value!r}")
+        distance = max(0.0, distance)
+        return distance, distance
+
+    arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    if int(arr.size) != 2:
+        raise ValueError(
+            f"{name} must be a scalar or a two-value sequence [positive, negative], got {value!r}"
+        )
+
+    pos_distance = float(arr[0])
+    neg_distance = float(arr[1])
+    if not np.isfinite(pos_distance) or not np.isfinite(neg_distance):
+        raise ValueError(f"{name} values must be finite, got {value!r}")
+    return max(0.0, pos_distance), max(0.0, neg_distance)
+
+
+def _build_surface_supervision_from_ink_mask(ink_mask, bg_dilate_distance):
+    import cv2
+
+    ink = np.asarray(ink_mask, dtype=bool)
+    out = np.full(ink.shape, 100, dtype=np.uint8)
+    out[ink] = 1
+
+    bg_radius = max(0, int(bg_dilate_distance))
+    if bg_radius <= 0 or not bool(np.any(ink)):
+        return out
+
+    background_src = (~ink).astype(np.uint8, copy=False)
+    distances = cv2.distanceTransform(background_src, cv2.DIST_L2, 5)
+    near_bg = (~ink) & np.isfinite(distances) & (distances <= float(bg_radius))
+    out[near_bg] = 0
+    return out
+
+
+def _get_segment_positive_samples(dataset, segment):
+    import cv2
+
+    segment_uuid = str(segment.uuid)
+    cached = dataset._segment_positive_samples_cache.get(segment_uuid)
+    if cached is not None:
+        return cached
+
+    grid = dataset._get_segment_stored_grid(segment)
+    ink_mask = _load_segment_ink_mask(dataset, segment)
+    if tuple(int(v) for v in ink_mask.shape) != tuple(int(v) for v in grid["shape"]):
+        ink_mask = (
+            cv2.resize(
+                ink_mask.astype(np.uint8),
+                (int(grid["shape"][1]), int(grid["shape"][0])),
+                interpolation=cv2.INTER_AREA,
+            )
+            > 0
+        )
+
+    positive_mask = np.asarray(grid["valid"] & ink_mask, dtype=bool)
+    if not bool(np.any(positive_mask)):
+        out = {
+            "rows": np.empty((0,), dtype=np.int32),
+            "cols": np.empty((0,), dtype=np.int32),
+            "points_zyx": np.empty((0, 3), dtype=np.float32),
+        }
+        dataset._segment_positive_samples_cache[segment_uuid] = out
+        dataset._segment_positive_points_cache[segment_uuid] = out["points_zyx"]
+        return out
+
+    row_idx, col_idx = np.where(positive_mask)
+    row_idx = np.asarray(row_idx, dtype=np.int32)
+    col_idx = np.asarray(col_idx, dtype=np.int32)
+    points_zyx = np.stack(
+        [
+            grid["z"][row_idx, col_idx],
+            grid["y"][row_idx, col_idx],
+            grid["x"][row_idx, col_idx],
+        ],
+        axis=-1,
+    ).astype(np.float32, copy=False)
+
+    out = {
+        "rows": row_idx,
+        "cols": col_idx,
+        "points_zyx": points_zyx,
+    }
+    dataset._segment_positive_samples_cache[segment_uuid] = out
+    dataset._segment_positive_points_cache[segment_uuid] = points_zyx
+    return out
+
+
+def _get_segment_background_samples(dataset, segment):
+    import cv2
+
+    segment_uuid = str(segment.uuid)
+    cached = dataset._segment_background_samples_cache.get(segment_uuid)
+    if cached is not None:
+        return cached
+
+    grid = dataset._get_segment_stored_grid(segment)
+    surface_supervision = dataset._load_segment_surface_supervision(segment)
+    if tuple(int(v) for v in surface_supervision.shape) != tuple(int(v) for v in grid["shape"]):
+        surface_supervision = cv2.resize(
+            surface_supervision.astype(np.uint8),
+            (int(grid["shape"][1]), int(grid["shape"][0])),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(np.uint8, copy=False)
+
+    background_mask = np.asarray(grid["valid"] & (surface_supervision == 0), dtype=bool)
+    if not bool(np.any(background_mask)):
+        out = {
+            "rows": np.empty((0,), dtype=np.int32),
+            "cols": np.empty((0,), dtype=np.int32),
+            "points_zyx": np.empty((0, 3), dtype=np.float32),
+        }
+        dataset._segment_background_samples_cache[segment_uuid] = out
+        return out
+
+    row_idx, col_idx = np.where(background_mask)
+    row_idx = np.asarray(row_idx, dtype=np.int32)
+    col_idx = np.asarray(col_idx, dtype=np.int32)
+    points_zyx = np.stack(
+        [
+            grid["z"][row_idx, col_idx],
+            grid["y"][row_idx, col_idx],
+            grid["x"][row_idx, col_idx],
+        ],
+        axis=-1,
+    ).astype(np.float32, copy=False)
+
+    out = {
+        "rows": row_idx,
+        "cols": col_idx,
+        "points_zyx": points_zyx,
+    }
+    dataset._segment_background_samples_cache[segment_uuid] = out
+    return out
+
+
+def _sample_patch_supervision_grid(dataset, segment, min_corner, max_corner, extra_bbox_pad=0.0):
+    from vesuvius.tifxyz import interpolate_at_points
+
+    grid = dataset._get_segment_stored_grid(segment)
+    x_stored = grid["x"]
+    y_stored = grid["y"]
+    z_stored = grid["z"]
+    valid_mask = grid["valid"]
+    n_rows_stored, n_cols_stored = x_stored.shape
+    crop_size_tuple = tuple(int(v) for v in dataset.patch_size_zyx)
+    min_corner_f = np.asarray(min_corner, dtype=np.float32).reshape(3)
+    max_corner_f = np.asarray(max_corner, dtype=np.float32).reshape(3)
+
+    bbox_pad = max(float(dataset.surface_bbox_pad), float(extra_bbox_pad))
+    if bbox_pad < 0.0:
+        bbox_pad = 0.0
+
+    interp_method = str(dataset.surface_interp_method).strip().lower()
+    if interp_method not in {"catmull_rom", "linear", "bspline"}:
+        interp_method = "catmull_rom"
+
+    segment.use_stored_resolution()
+    scale_y, scale_x = getattr(segment, "_scale", (1.0, 1.0))
+    scale_y = float(scale_y) if np.isfinite(scale_y) and float(scale_y) > 0.0 else 1.0
+    scale_x = float(scale_x) if np.isfinite(scale_x) and float(scale_x) > 0.0 else 1.0
+
+    expanded_min = min_corner_f - bbox_pad
+    expanded_max = max_corner_f + bbox_pad
+    in_bbox = (
+        valid_mask
+        & (z_stored >= expanded_min[0])
+        & (z_stored < expanded_max[0])
+        & (y_stored >= expanded_min[1])
+        & (y_stored < expanded_max[1])
+        & (x_stored >= expanded_min[2])
+        & (x_stored < expanded_max[2])
+    )
+
+    if not bool(np.any(in_bbox)):
+        empty_mask = np.zeros((0, 0), dtype=bool)
+        empty_grid = np.zeros((0, 0, 3), dtype=np.float32)
+        empty_class = np.zeros((0, 0), dtype=np.uint8)
+        return {
+            "local_grid": empty_grid,
+            "world_grid": empty_grid,
+            "valid_interp": empty_mask,
+            "in_patch": empty_mask,
+            "class_codes": empty_class,
+            "normals_zyx": empty_grid,
+            "normals_valid": empty_mask,
+            "crop_size": crop_size_tuple,
+        }
+
+    rows, cols = np.where(in_bbox)
+    row_min, row_max = int(rows.min()), int(rows.max())
+    col_min, col_max = int(cols.min()), int(cols.max())
+    kernel_pad = 2 if interp_method in {"catmull_rom", "bspline"} else 1
+    row_min = max(0, row_min - kernel_pad)
+    row_max = min(n_rows_stored - 1, row_max + kernel_pad)
+    col_min = max(0, col_min - kernel_pad)
+    col_max = min(n_cols_stored - 1, col_max + kernel_pad)
+
+    n_rows_local = row_max - row_min + 1
+    n_cols_local = col_max - col_min + 1
+    query_h = 1 if n_rows_local <= 1 else max(n_rows_local, int(round(n_rows_local / scale_y)))
+    query_w = 1 if n_cols_local <= 1 else max(n_cols_local, int(round(n_cols_local / scale_x)))
+    query_rows = np.linspace(row_min, row_max, query_h, dtype=np.float32)
+    query_cols = np.linspace(col_min, col_max, query_w, dtype=np.float32)
+    query_y, query_x = np.meshgrid(query_rows, query_cols, indexing="ij")
+
+    x_int, y_int, z_int, int_valid = interpolate_at_points(
+        x_stored,
+        y_stored,
+        z_stored,
+        valid_mask,
+        query_y,
+        query_x,
+        scale=(1.0, 1.0),
+        method=interp_method,
+        invalid_value=-1.0,
+    )
+    world_grid = np.stack([z_int, y_int, x_int], axis=-1).astype(np.float32, copy=False)
+    valid_interp = np.asarray(int_valid, dtype=bool)
+    valid_interp &= np.isfinite(world_grid).all(axis=-1)
+    in_patch = (
+        valid_interp
+        & (world_grid[..., 0] >= min_corner_f[0])
+        & (world_grid[..., 0] < max_corner_f[0])
+        & (world_grid[..., 1] >= min_corner_f[1])
+        & (world_grid[..., 1] < max_corner_f[1])
+        & (world_grid[..., 2] >= min_corner_f[2])
+        & (world_grid[..., 2] < max_corner_f[2])
+    )
+
+    normals_grid = _get_segment_normals_zyx(dataset, segment)
+    nz_int, ny_int, nx_int, normals_valid = interpolate_at_points(
+        normals_grid[..., 0],
+        normals_grid[..., 1],
+        normals_grid[..., 2],
+        valid_mask,
+        query_y,
+        query_x,
+        scale=(1.0, 1.0),
+        method=interp_method,
+        invalid_value=np.nan,
+    )
+    normals_zyx = np.stack([nz_int, ny_int, nx_int], axis=-1).astype(np.float32, copy=False)
+    normals_valid = np.asarray(normals_valid, dtype=bool)
+    normals_valid &= np.isfinite(normals_zyx).all(axis=-1)
+
+    class_codes = np.full(query_y.shape, 100, dtype=np.uint8)
+    ink_mask_full = _load_segment_ink_mask(dataset, segment)
+    if ink_mask_full.size > 0:
+        full_h, full_w = ink_mask_full.shape
+        query_rows_full = query_y / scale_y
+        query_cols_full = query_x / scale_x
+        label_rows = np.rint(query_rows_full).astype(np.int64, copy=False)
+        label_cols = np.rint(query_cols_full).astype(np.int64, copy=False)
+        in_label_bounds = (
+            (label_rows >= 0)
+            & (label_rows < int(full_h))
+            & (label_cols >= 0)
+            & (label_cols < int(full_w))
+        )
+        if bool(np.any(in_label_bounds)):
+            halo = max(0, int(dataset.bg_dilate_distance))
+            rows_in = label_rows[in_label_bounds]
+            cols_in = label_cols[in_label_bounds]
+            row_min = max(0, int(rows_in.min()) - halo)
+            row_max = min(int(full_h) - 1, int(rows_in.max()) + halo)
+            col_min = max(0, int(cols_in.min()) - halo)
+            col_max = min(int(full_w) - 1, int(cols_in.max()) + halo)
+
+            ink_local = ink_mask_full[row_min:row_max + 1, col_min:col_max + 1]
+            supervision_local = _build_surface_supervision_from_ink_mask(
+                ink_local,
+                bg_dilate_distance=dataset.bg_dilate_distance,
+            )
+            class_codes[in_label_bounds] = supervision_local[
+                rows_in - row_min,
+                cols_in - col_min,
+            ]
+
+    local_grid = world_grid - min_corner_f.reshape(1, 1, 3)
+    return {
+        "local_grid": local_grid,
+        "world_grid": world_grid,
+        "valid_interp": valid_interp,
+        "in_patch": in_patch,
+        "class_codes": class_codes,
+        "normals_zyx": normals_zyx,
+        "normals_valid": normals_valid,
+        "crop_size": crop_size_tuple,
+    }
+
+
+def _voxelize_surface_from_sampled_grid(dataset, segment, min_corner, max_corner, crop_size, sampled_grid=None):
+    from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
+
+    crop_size_tuple = tuple(int(v) for v in crop_size)
+    sampled = sampled_grid
+    if sampled is None:
+        sampled = _sample_patch_supervision_grid(
+            dataset,
+            segment,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            extra_bbox_pad=0.0,
+        )
+    local_grid = sampled["local_grid"]
+    in_patch = sampled["in_patch"]
+    if local_grid.size == 0 or not bool(np.any(in_patch)):
+        return np.zeros(crop_size_tuple, dtype=np.float32)
+    return voxelize_surface_grid_masked(local_grid, crop_size_tuple, in_patch).astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def _voxelize_positive_labels_from_sampled_grid(dataset, segment, min_corner, max_corner, crop_size, sampled_grid=None):
+    crop_size_tuple = tuple(int(v) for v in crop_size)
+    sampled = sampled_grid
+    if sampled is None:
+        sampled = _sample_patch_supervision_grid(
+            dataset,
+            segment,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            extra_bbox_pad=0.0,
+        )
+    positive_mask = sampled["in_patch"] & (sampled["class_codes"] == 1)
+    if not bool(np.any(positive_mask)):
+        return np.zeros(crop_size_tuple, dtype=np.float32)
+    return _points_to_voxels(sampled["local_grid"][positive_mask], crop_size_tuple)
+
+
+def _voxelize_background_surface_labels_from_sampled_grid(
+    dataset,
+    segment,
+    min_corner,
+    max_corner,
+    crop_size,
+    sampled_grid=None,
+):
+    crop_size_tuple = tuple(int(v) for v in crop_size)
+    sampled = sampled_grid
+    if sampled is None:
+        sampled = _sample_patch_supervision_grid(
+            dataset,
+            segment,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            extra_bbox_pad=0.0,
+        )
+    background_mask = sampled["in_patch"] & (sampled["class_codes"] == 0)
+    if not bool(np.any(background_mask)):
+        return np.zeros(crop_size_tuple, dtype=np.float32)
+    return _points_to_voxels(sampled["local_grid"][background_mask], crop_size_tuple)
+
+
+def _voxelize_class_tolerance_band_from_sample(
+    dataset,
+    sampled_grid,
+    min_corner,
+    max_corner,
+    crop_size,
+    class_value,
+    label_distance,
+):
+    crop_size_tuple = tuple(int(v) for v in crop_size)
+    pos_distance, neg_distance = _normalize_distance_pair(label_distance, name="label_distance")
+    max_distance = max(pos_distance, neg_distance)
+    class_mask = sampled_grid["class_codes"] == int(class_value)
+
+    if max_distance <= 0.0:
+        in_patch = sampled_grid["in_patch"] & class_mask
+        if not bool(np.any(in_patch)):
+            return np.zeros(crop_size_tuple, dtype=np.float32)
+        return _points_to_voxels(sampled_grid["local_grid"][in_patch], crop_size_tuple)
+
+    expanded_mask = sampled_grid["valid_interp"] & class_mask & sampled_grid["normals_valid"]
+    if not bool(np.any(expanded_mask)):
+        return np.zeros(crop_size_tuple, dtype=np.float32)
+
+    points_world = sampled_grid["world_grid"][expanded_mask].astype(np.float32, copy=False)
+    normals_zyx = sampled_grid["normals_zyx"][expanded_mask].astype(np.float32, copy=False)
+    expand = max_distance + 1.0
+    expanded_min = np.asarray(min_corner, dtype=np.float32) - expand
+    expanded_max = np.asarray(max_corner, dtype=np.float32) + expand
+    in_expanded = _points_within_minmax(points_world, expanded_min, expanded_max)
+    if not bool(np.any(in_expanded)):
+        return np.zeros(crop_size_tuple, dtype=np.float32)
+
+    return _build_normal_offset_mask_from_labeled_points(
+        points_world[in_expanded],
+        normals_zyx[in_expanded],
+        min_corner=min_corner,
+        crop_size=crop_size_tuple,
+        label_distance=(pos_distance, neg_distance),
+        sample_step=float(dataset.normal_sample_step),
+        trilinear_threshold=float(dataset.normal_trilinear_threshold),
+        use_numba=bool(dataset.use_numba_for_normal_mask),
+    )
+
+
+def _voxelize_label_tolerance_band(dataset, segment, min_corner, max_corner, crop_size, sampled_grid=None):
+    sampled = sampled_grid
+    if sampled is None:
+        sampled = _sample_patch_supervision_grid(
+            dataset,
+            segment,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            extra_bbox_pad=float(dataset.label_distance_max) + 1.0,
+        )
+    return _voxelize_class_tolerance_band_from_sample(
+        dataset,
+        sampled,
+        min_corner=min_corner,
+        max_corner=max_corner,
+        crop_size=crop_size,
+        class_value=1,
+        label_distance=(dataset.label_distance_pos, dataset.label_distance_neg),
+    )
+
+
+def _voxelize_background_tolerance_band(dataset, segment, min_corner, max_corner, crop_size, sampled_grid=None):
+    sampled = sampled_grid
+    if sampled is None:
+        sampled = _sample_patch_supervision_grid(
+            dataset,
+            segment,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            extra_bbox_pad=float(dataset.bg_distance_max) + 1.0,
+        )
+    return _voxelize_class_tolerance_band_from_sample(
+        dataset,
+        sampled,
+        min_corner=min_corner,
+        max_corner=max_corner,
+        crop_size=crop_size,
+        class_value=0,
+        label_distance=(dataset.bg_distance_pos, dataset.bg_distance_neg),
+    )
+
+
+def _build_projected_loss_mask_volume(dataset, segment, min_corner, max_corner, crop_size, sampled_grid=None):
+    crop_size_tuple = tuple(int(v) for v in crop_size)
+    out = np.full(crop_size_tuple, 2.0, dtype=np.float32)
+    sampled = sampled_grid
+    if sampled is None:
+        sampled = _sample_patch_supervision_grid(
+            dataset,
+            segment,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            extra_bbox_pad=max(float(dataset.bg_distance_max), float(dataset.label_distance_max)) + 1.0,
+        )
+    background_tolerance_vox = _voxelize_background_tolerance_band(
+        dataset,
+        segment,
+        min_corner=min_corner,
+        max_corner=max_corner,
+        crop_size=crop_size_tuple,
+        sampled_grid=sampled,
+    )
+    out[background_tolerance_vox > 0.0] = 0.0
+
+    label_tolerance_vox = _voxelize_label_tolerance_band(
+        dataset,
+        segment,
+        min_corner=min_corner,
+        max_corner=max_corner,
+        crop_size=crop_size_tuple,
+        sampled_grid=sampled,
+    )
+    out[label_tolerance_vox > 0.0] = 1.0
+    return out
+
+
+def _build_surface_label_volume(positive_label_vox, background_label_vox, crop_size):
+    crop_size_tuple = tuple(int(v) for v in crop_size)
+    out = np.full(crop_size_tuple, 2.0, dtype=np.float32)
+    out[background_label_vox > 0.0] = 0.0
+    out[positive_label_vox > 0.0] = 1.0
+    return out
 
 
 if njit is not None:
@@ -366,20 +869,35 @@ def _voxelize_surface(dataset, segment, min_corner, max_corner, crop_size):
     from vesuvius.tifxyz import interpolate_at_points
 
     crop_size_tuple = tuple(int(v) for v in crop_size)
+    min_corner_f = np.asarray(min_corner, dtype=np.float32).reshape(3)
+    max_corner_f = np.asarray(max_corner, dtype=np.float32).reshape(3)
     grid = dataset._get_segment_stored_grid(segment)
     x_stored = grid["x"]
     y_stored = grid["y"]
     z_stored = grid["z"]
     valid_mask = grid["valid"]
+    n_rows_stored, n_cols_stored = x_stored.shape
+
+    bbox_pad = max(0.0, float(getattr(dataset, "surface_bbox_pad", 2.0)))
+    interp_method = str(getattr(dataset, "surface_interp_method", "catmull_rom")).strip().lower()
+    if interp_method not in {"catmull_rom", "linear", "bspline"}:
+        interp_method = "catmull_rom"
+    segment.use_stored_resolution()
+    scale_y, scale_x = getattr(segment, "_scale", (1.0, 1.0))
+    scale_y = float(scale_y) if np.isfinite(scale_y) and float(scale_y) > 0.0 else 1.0
+    scale_x = float(scale_x) if np.isfinite(scale_x) and float(scale_x) > 0.0 else 1.0
+
+    expanded_min = min_corner_f - bbox_pad
+    expanded_max = max_corner_f + bbox_pad
 
     in_bbox = (
         valid_mask
-        & (z_stored >= float(min_corner[0]))
-        & (z_stored < float(max_corner[0]))
-        & (y_stored >= float(min_corner[1]))
-        & (y_stored < float(max_corner[1]))
-        & (x_stored >= float(min_corner[2]))
-        & (x_stored < float(max_corner[2]))
+        & (z_stored >= expanded_min[0])
+        & (z_stored < expanded_max[0])
+        & (y_stored >= expanded_min[1])
+        & (y_stored < expanded_max[1])
+        & (x_stored >= expanded_min[2])
+        & (x_stored < expanded_max[2])
     )
     if not bool(np.any(in_bbox)):
         return np.zeros(crop_size_tuple, dtype=np.float32)
@@ -387,8 +905,18 @@ def _voxelize_surface(dataset, segment, min_corner, max_corner, crop_size):
     rows, cols = np.where(in_bbox)
     row_min, row_max = int(rows.min()), int(rows.max())
     col_min, col_max = int(cols.min()), int(cols.max())
-    query_rows = np.arange(row_min, row_max + 1, dtype=np.float32)
-    query_cols = np.arange(col_min, col_max + 1, dtype=np.float32)
+    kernel_pad = 2 if interp_method in {"catmull_rom", "bspline"} else 1
+    row_min = max(0, row_min - kernel_pad)
+    row_max = min(n_rows_stored - 1, row_max + kernel_pad)
+    col_min = max(0, col_min - kernel_pad)
+    col_max = min(n_cols_stored - 1, col_max + kernel_pad)
+
+    n_rows_local = row_max - row_min + 1
+    n_cols_local = col_max - col_min + 1
+    query_h = 1 if n_rows_local <= 1 else max(n_rows_local, int(round(n_rows_local / scale_y)))
+    query_w = 1 if n_cols_local <= 1 else max(n_cols_local, int(round(n_cols_local / scale_x)))
+    query_rows = np.linspace(row_min, row_max, query_h, dtype=np.float32)
+    query_cols = np.linspace(col_min, col_max, query_w, dtype=np.float32)
     query_y, query_x = np.meshgrid(query_rows, query_cols, indexing="ij")
 
     x_int, y_int, z_int, int_valid = interpolate_at_points(
@@ -399,24 +927,24 @@ def _voxelize_surface(dataset, segment, min_corner, max_corner, crop_size):
         query_y,
         query_x,
         scale=(1.0, 1.0),
-        method="catmull_rom",
+        method=interp_method,
         invalid_value=-1.0,
     )
     zyx_world = np.stack([z_int, y_int, x_int], axis=-1).astype(np.float32, copy=False)
     valid_interp = np.asarray(int_valid, dtype=bool)
     valid_interp &= np.isfinite(zyx_world).all(axis=-1)
     valid_interp &= (
-        (zyx_world[..., 0] >= float(min_corner[0]))
-        & (zyx_world[..., 0] < float(max_corner[0]))
-        & (zyx_world[..., 1] >= float(min_corner[1]))
-        & (zyx_world[..., 1] < float(max_corner[1]))
-        & (zyx_world[..., 2] >= float(min_corner[2]))
-        & (zyx_world[..., 2] < float(max_corner[2]))
+        (zyx_world[..., 0] >= min_corner_f[0])
+        & (zyx_world[..., 0] < max_corner_f[0])
+        & (zyx_world[..., 1] >= min_corner_f[1])
+        & (zyx_world[..., 1] < max_corner_f[1])
+        & (zyx_world[..., 2] >= min_corner_f[2])
+        & (zyx_world[..., 2] < max_corner_f[2])
     )
     if not bool(np.any(valid_interp)):
         return np.zeros(crop_size_tuple, dtype=np.float32)
 
-    local_grid = zyx_world - np.asarray(min_corner, dtype=np.float32).reshape(1, 1, 3)
+    local_grid = zyx_world - min_corner_f.reshape(1, 1, 3)
     return voxelize_surface_grid_masked(local_grid, crop_size_tuple, valid_interp).astype(
         np.float32,
         copy=False,
@@ -442,7 +970,22 @@ def _build_normal_offset_mask_from_labeled_points(
     if normals.ndim != 2 or normals.shape != points.shape:
         return np.zeros(crop_size_tuple, dtype=np.float32)
 
-    label_distance = float(label_distance)
+    if np.isscalar(label_distance):
+        pos_distance = float(label_distance)
+        neg_distance = float(label_distance)
+    else:
+        distance_arr = np.asarray(label_distance, dtype=np.float32).reshape(-1)
+        if int(distance_arr.size) != 2:
+            raise ValueError(
+                f"label_distance must be a scalar or [positive, negative], got {label_distance!r}"
+            )
+        pos_distance = float(distance_arr[0])
+        neg_distance = float(distance_arr[1])
+    if not np.isfinite(pos_distance) or not np.isfinite(neg_distance):
+        raise ValueError(f"label_distance values must be finite, got {label_distance!r}")
+    pos_distance = max(0.0, pos_distance)
+    neg_distance = max(0.0, neg_distance)
+
     sample_step = float(sample_step)
     if sample_step <= 0.0:
         sample_step = 0.5
@@ -456,12 +999,13 @@ def _build_normal_offset_mask_from_labeled_points(
     normals = normals[valid] / n_norm[valid, None]
     min_corner = np.asarray(min_corner, dtype=np.float32).reshape(1, 3)
 
-    if label_distance <= 0.0:
+    max_distance = max(pos_distance, neg_distance)
+    if max_distance <= 0.0:
         local_points = points - min_corner
         return _points_to_voxels(local_points, crop_size_tuple)
 
-    n_samples = max(2, int(np.ceil((2.0 * label_distance) / sample_step)) + 1)
-    offsets = np.linspace(-label_distance, label_distance, num=n_samples, dtype=np.float32)
+    n_samples = max(2, int(np.ceil((pos_distance + neg_distance) / sample_step)) + 1)
+    offsets = np.linspace(-neg_distance, pos_distance, num=n_samples, dtype=np.float32)
     sampled = points[:, None, :] + offsets[None, :, None] * normals[:, None, :]
     local_points = sampled.reshape(-1, 3) - min_corner
     return _points_to_voxels_trilinear(

@@ -240,6 +240,18 @@ def find_patches(
             str(seg_scaled.uuid): (int(segment_idx), seg_scaled)
             for segment_idx, _, seg_scaled in segment_pairs
         }
+        segment_ink_label_path_by_uuid = {}
+        for _, original_seg, seg_scaled in segment_pairs:
+            ink_meta = next(
+                (label for label in original_seg.list_labels() if label.get("name") == "inklabels"),
+                None,
+            )
+            if ink_meta is None:
+                continue
+            ink_path = ink_meta.get("path")
+            if ink_path is None:
+                continue
+            segment_ink_label_path_by_uuid[str(seg_scaled.uuid)] = str(ink_path)
 
         cache_path = os.path.join(
             str(dataset["segments_path"]),
@@ -276,6 +288,9 @@ def find_patches(
                     seg_payload = segment_by_uuid.get(segment_uuid)
                     if seg_payload is None:
                         continue
+                    ink_label_path = record.get("ink_label_path")
+                    if not ink_label_path:
+                        ink_label_path = segment_ink_label_path_by_uuid.get(segment_uuid)
                     segment_idx_cached, seg_scaled_cached = seg_payload
                     cache_patches.append(
                         {
@@ -293,6 +308,7 @@ def find_patches(
                             "positive_point_count": int(record["positive_point_count"]),
                             "positive_fraction": float(record["positive_fraction"]),
                             "span_zyx": tuple(float(v) for v in record["span_zyx"]),
+                            "ink_label_path": str(ink_label_path) if ink_label_path else None,
                         }
                     )
                 patches.extend(cache_patches)
@@ -324,6 +340,7 @@ def find_patches(
                     f"Skipping segment {original_seg.uuid!r}: unable to find 'inklabels'."
                 )
                 continue
+            segment_ink_label_path = str(ink_meta["path"])
 
             ink_label = cv2.imread(str(ink_meta["path"]), cv2.IMREAD_UNCHANGED)
             if ink_label is None:
@@ -505,6 +522,7 @@ def find_patches(
                             "positive_point_count": int(kept["positive_point_count"]),
                             "positive_fraction": float(kept["positive_fraction"]),
                             "span_zyx": tuple(float(v) for v in kept["span_zyx"]),
+                            "ink_label_path": segment_ink_label_path,
                         }
                     )
                 patch_generation_stats["kept_patches"] += int(len(kept_records))
@@ -522,6 +540,7 @@ def find_patches(
                     "positive_point_count": int(p["positive_point_count"]),
                     "positive_fraction": float(p["positive_fraction"]),
                     "span_zyx": list(p["span_zyx"]),
+                    "ink_label_path": p.get("ink_label_path"),
                 }
                 for p in dataset_patches
             ]
