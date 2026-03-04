@@ -52,7 +52,10 @@ def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tens
 	# (outward, toward the adjacent winding).  If a connection point is on the
 	# wrong side of the surface, the signed length flips negative, making the
 	# density negative and creating a strong penalty.
-	xyz_lr = res.xyz_lr  # (D, Hm, Wm, 3)
+	# Normals detached: winding density loss pushes/pulls points along an
+	# apparently-constant normal direction.  No gradient flows to neighbor
+	# vertices via the normal construction.
+	xyz_lr = res.xyz_lr.detach()  # (D, Hm, Wm, 3)
 	edge_h = torch.zeros_like(xyz_lr)
 	edge_h[:, 1:-1] = xyz_lr[:, 2:] - xyz_lr[:, :-2]
 	edge_h[:, 0] = xyz_lr[:, 1] - xyz_lr[:, 0]

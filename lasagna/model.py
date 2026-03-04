@@ -258,7 +258,7 @@ class Model3D(nn.Module):
 		"""
 		D, Hm, Wm, _ = xyz_lr.shape
 		device = xyz_lr.device
-		normals = self._vertex_normals(xyz_lr)  # (D, Hm, Wm, 3)
+		normals = self._vertex_normals(xyz_lr).detach()  # (D, Hm, Wm, 3) — constant for grad
 
 		# conn_offsets: (4, D, Hm, Wm) — [prev_h, prev_w, next_h, next_w]
 		prev_h_off = self.conn_offsets[0]
