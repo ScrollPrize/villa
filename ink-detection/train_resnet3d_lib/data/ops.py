@@ -1,0 +1,111 @@
+"""Public data API for the ResNet3D pipeline.
+
+This module is intentionally the stable import surface while heavy internals
+live in focused modules:
+- readers.py: image/zarr/mask loading
+- patching.py: patch index + mask/bbox utilities
+- transforms_runtime.py: runtime transforms + augment hooks
+- datasets_runtime.py: Dataset classes + flat segment indexing
+"""
+
+from train_resnet3d_lib.data.datasets_runtime import (
+    CustomDataset,
+    CustomDatasetTest,
+    LazyZarrTrainDataset,
+    LazyZarrXyLabelDataset,
+    LazyZarrXyOnlyDataset,
+    _flatten_segment_patch_index,
+    _init_flat_segment_index,
+    _validate_segment_data,
+)
+from train_resnet3d_lib.data.patching import (
+    _build_mask_store_and_patch_index,
+    _component_bboxes,
+    _downsample_bool_mask_any,
+    _label_tile_is_empty,
+    _mask_border,
+    _mask_component_bboxes_downsample,
+    _mask_store_shape,
+    _read_mask_patch,
+    extract_patch_coordinates,
+    extract_patches,
+    extract_patches_infer,
+)
+from train_resnet3d_lib.data.readers import (
+    ZarrSegmentVolume,
+    _assert_bottom_right_pad_compatible_global,
+    _clip_intensity_inplace,
+    _compute_selected_layer_indices,
+    _ensure_zarr_v2,
+    _from_uint16_to_uint8,
+    _looks_like_zarr_store,
+    _parse_layer_range,
+    _read_gray,
+    _require_dict,
+    build_group_mappings,
+    read_fragment_mask_for_shape,
+    read_image_fragment_mask,
+    read_image_layers,
+    read_image_mask,
+    read_label_and_fragment_mask_for_shape,
+    resolve_segment_zarr_path,
+)
+from train_resnet3d_lib.data.transforms_runtime import (
+    _apply_image_transform,
+    _apply_joint_transform,
+    _fourth_augment,
+    _invert_augment,
+    _maybe_fourth_augment,
+    _maybe_invert_augment,
+    _resize_label_for_loss,
+    _xy_to_bounds,
+    get_transforms,
+)
+
+__all__ = [
+    "_require_dict",
+    "_read_gray",
+    "_parse_layer_range",
+    "_compute_selected_layer_indices",
+    "_clip_intensity_inplace",
+    "read_image_layers",
+    "_assert_bottom_right_pad_compatible_global",
+    "read_image_mask",
+    "read_image_fragment_mask",
+    "_looks_like_zarr_store",
+    "resolve_segment_zarr_path",
+    "_ensure_zarr_v2",
+    "_from_uint16_to_uint8",
+    "ZarrSegmentVolume",
+    "read_label_and_fragment_mask_for_shape",
+    "read_fragment_mask_for_shape",
+    "_label_tile_is_empty",
+    "extract_patch_coordinates",
+    "_component_bboxes",
+    "_build_mask_store_and_patch_index",
+    "_mask_store_shape",
+    "_read_mask_patch",
+    "extract_patches_infer",
+    "build_group_mappings",
+    "extract_patches",
+    "_downsample_bool_mask_any",
+    "_mask_component_bboxes_downsample",
+    "_mask_border",
+    "get_transforms",
+    "_resize_label_for_loss",
+    "_apply_joint_transform",
+    "_apply_image_transform",
+    "_xy_to_bounds",
+    "_fourth_augment",
+    "_maybe_fourth_augment",
+    "_invert_augment",
+    "_maybe_invert_augment",
+    "CustomDataset",
+    "CustomDatasetTest",
+    "_flatten_segment_patch_index",
+    "_init_flat_segment_index",
+    "_validate_segment_data",
+    "LazyZarrTrainDataset",
+    "LazyZarrXyLabelDataset",
+    "LazyZarrXyOnlyDataset",
+]

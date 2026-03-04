@@ -1,6 +1,6 @@
 from train_resnet3d_lib.config import CFG
 from train_resnet3d_lib import training as tr
-from train_resnet3d_lib import orchestration
+from train_resnet3d_lib.runtime import orchestration
 from train_resnet3d_lib.datasets_builder import build_datasets
 
 

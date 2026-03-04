@@ -39,7 +39,7 @@ __all__ = [
 
 
 def _read_gray_any(path_base: str) -> np.ndarray:
-    from train_resnet3d_lib.data_ops import _read_gray
+    from train_resnet3d_lib.data.image_readers import _read_gray
 
     for ext in (".png", ".tiff", ".tif"):
         arr = _read_gray(f"{path_base}{ext}")

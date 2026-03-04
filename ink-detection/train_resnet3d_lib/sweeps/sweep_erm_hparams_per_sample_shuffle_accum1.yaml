@@ -37,7 +37,7 @@ parameters:
     value: true
   training.stitch_train:
     value: true
-  training.stitch_downsample:
+  stitch.downsample:
     value: 1
   wandb.tags:
     value:
