@@ -34,6 +34,7 @@ class FitResult3D:
 	mask_lr: torch.Tensor       # (D, 1, Hm, Wm)
 	xy_conn: torch.Tensor       # (D, Hm, Wm, 3, 3) — [prev, self, next], each 3D fullres
 	mask_conn: torch.Tensor     # (D, 1, Hm, Wm, 3) — validity per connection point
+	sign_conn: torch.Tensor     # (D, 1, Hm, Wm, 2) — ray param sign [prev, next]
 	params: ModelParams3D
 
 
@@ -371,12 +372,16 @@ class Model3D(nn.Module):
 			# Connection point: Q(u, v) = P00 + u*a + v*b + u*v*c
 			conn_pt = P00 + u.unsqueeze(-1) * a + v.unsqueeze(-1) * b + (u * v).unsqueeze(-1) * c
 
+			# Sign of ray parameter s: positive = forward along normal, negative = backward
+			s_sign = ((conn_pt - O) * n).sum(dim=-1).sign()  # (B, Hm, Wm)
+			s_sign = torch.where(s_sign == 0, torch.ones_like(s_sign), s_sign)
+
 			# Combined validity: target must be in mesh bounds AND u,v in [0,1]
 			in_bounds = (target_h >= 0) & (target_h <= Hm - 1) & (target_w >= 0) & (target_w <= Wm - 1)
 			uv_ok = (u >= 0) & (u <= 1) & (v >= 0) & (v <= 1)
 			valid = (in_bounds & uv_ok).to(dtype=src_xyz.dtype)
 
-			return conn_pt, u, v, row, col, valid
+			return conn_pt, u, v, row, col, valid, s_sign
 
 		# --- Compute connections for prev (d-1) and next (d+1) ---
 		# Built via cat/stack for clean autograd (no in-place version tracking).
@@ -384,13 +389,13 @@ class Model3D(nn.Module):
 
 		if D >= 2:
 			# Prev connections (d -> d-1): source is slices [1:], neighbor is [:-1]
-			prev_conn, prev_u, prev_v, prev_row, prev_col, prev_valid = _intersect_direction(
+			prev_conn, prev_u, prev_v, prev_row, prev_col, prev_valid, prev_s_sign = _intersect_direction(
 				xyz_lr[1:], normals[1:], xyz_lr[:-1], prev_h_off[1:], prev_w_off[1:]
 			)
 			self._conn_params["prev"] = (prev_u, prev_v, prev_row, prev_col)
 
 			# Next connections (d -> d+1): source is slices [:-1], neighbor is [1:]
-			next_conn, next_u, next_v, next_row, next_col, next_valid = _intersect_direction(
+			next_conn, next_u, next_v, next_row, next_col, next_valid, next_s_sign = _intersect_direction(
 				xyz_lr[:-1], normals[:-1], xyz_lr[1:], next_h_off[:-1], next_w_off[:-1]
 			)
 			self._conn_params["next"] = (next_u, next_v, next_row, next_col)
@@ -403,6 +408,12 @@ class Model3D(nn.Module):
 			next_full = torch.cat([next_conn, boundary_next.unsqueeze(0)], dim=0)   # (D, Hm, Wm, 3)
 
 			xy_conn = torch.stack([prev_full, xyz_lr, next_full], dim=-1)  # (D, Hm, Wm, 3, 3)
+
+			# Sign of ray parameter at intersection: +1 forward, -1 backward along normal
+			ones_boundary = torch.ones(1, Hm, Wm, device=device, dtype=xyz_lr.dtype)
+			prev_sign_full = torch.cat([ones_boundary, prev_s_sign], dim=0)   # (D, Hm, Wm)
+			next_sign_full = torch.cat([next_s_sign, ones_boundary], dim=0)   # (D, Hm, Wm)
+			sign_conn = torch.stack([prev_sign_full, next_sign_full], dim=-1).unsqueeze(1)  # (D, 1, Hm, Wm, 2)
 
 			# Intersection validity: bounds + UV combined (boundary slices get zeros)
 			zeros = torch.zeros(1, Hm, Wm, device=device, dtype=xyz_lr.dtype)
@@ -434,8 +445,9 @@ class Model3D(nn.Module):
 			zeros = torch.zeros_like(xyz_lr)
 			xy_conn = torch.stack([zeros, xyz_lr, zeros], dim=-1)
 			mask_conn = torch.zeros(D, 1, Hm, Wm, 3, device=device, dtype=xyz_lr.dtype)
+			sign_conn = torch.ones(D, 1, Hm, Wm, 2, device=device, dtype=xyz_lr.dtype)
 
-		return xy_conn, mask_conn
+		return xy_conn, mask_conn, sign_conn
 
 	def update_conn_offsets(self) -> None:
 		"""Update conn_offsets buffer from last intersection parameters. Call after opt.step()."""
@@ -469,7 +481,7 @@ class Model3D(nn.Module):
 		xyz_lr = self._grid_xyz()  # (D, Hm, Wm, 3)
 		xyz_hr = self._grid_xyz_hr(xyz_lr)  # (D, He, We, 3)
 		data_s = data.grid_sample_fullres(xyz_hr)
-		xy_conn, mask_conn = self._xyz_conn(xyz_lr, data)
+		xy_conn, mask_conn, sign_conn = self._xyz_conn(xyz_lr, data)
 
 		D = self.depth
 		He = int(xyz_hr.shape[1])
@@ -518,6 +530,7 @@ class Model3D(nn.Module):
 			mask_lr=mask_lr,
 			xy_conn=xy_conn,
 			mask_conn=mask_conn,
+			sign_conn=sign_conn,
 			params=self.params,
 		)
 

@@ -52,10 +52,11 @@ def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tens
 	mc = F.interpolate(mc, size=(He, We), mode='nearest')
 	mask_conn_hr = mc.reshape(D, 3, 1, He, We).permute(0, 2, 3, 4, 1)  # (D, 1, He, We, 3)
 
-	def _strip_loss(start: torch.Tensor, end: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+	def _strip_loss(start: torch.Tensor, end: torch.Tensor, sign: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 		"""Compute strip loss between two HR endpoint sets.
 
 		start, end: (D, He, We, 3)
+		sign: (D, He, We) — +1 correct side, -1 wrong side
 		Returns: lm (D, He, We), strip_valid (D, He, We)
 		"""
 		t = torch.linspace(0.0, 1.0, strip_samples, device=device, dtype=dtype)
@@ -71,8 +72,11 @@ def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tens
 		# Unsigned strip length (Euclidean distance between endpoints).
 		strip_len = torch.sqrt((diff * diff).sum(dim=-1) + 1e-12)  # (D, He, We)
 
-		# mag_n = grad_mag * strip_length; target is 1.0 (one winding traversed)
-		mag_n = mag * strip_len.unsqueeze(-1)
+		# Apply sign: wrong-side crossings produce negative integral (~-1.0 vs target +1.0)
+		signed_len = strip_len * sign
+
+		# mag_n = grad_mag * signed_strip_length; target is 1.0 (one winding traversed)
+		mag_n = mag * signed_len.unsqueeze(-1)
 		lm = ((mag_n - 1.0) ** 2).mean(dim=-1)  # (D, He, We)
 
 		# Strip validity: all sample points must be valid
@@ -85,10 +89,18 @@ def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tens
 
 		return lm, strip_valid
 
-	# Prev strip: prev_hr -> center_hr
-	lm_prev, sv_prev = _strip_loss(prev_hr, center_hr)
-	# Next strip: center_hr -> next_hr
-	lm_next, sv_next = _strip_loss(center_hr, next_hr)
+	# Upsample sign_conn: (D, 1, Hm, Wm, 2) -> (D, 1, He, We, 2)
+	sign_conn = res.sign_conn  # (D, 1, Hm, Wm, 2)
+	sc = sign_conn.permute(0, 4, 1, 2, 3).reshape(D * 2, 1, Hm, Wm)
+	sc = F.interpolate(sc, size=(He, We), mode='nearest')
+	sign_conn_hr = sc.reshape(D, 2, 1, He, We).permute(0, 2, 3, 4, 1)  # (D, 1, He, We, 2)
+	sign_prev_hr = sign_conn_hr[:, 0, :, :, 0]  # (D, He, We)
+	sign_next_hr = sign_conn_hr[:, 0, :, :, 1]  # (D, He, We)
+
+	# Prev strip: prev_hr -> center_hr (strip matches ray direction → keep sign)
+	lm_prev, sv_prev = _strip_loss(prev_hr, center_hr, sign_prev_hr)
+	# Next strip: center_hr -> next_hr (strip opposes ray direction → negate sign)
+	lm_next, sv_next = _strip_loss(center_hr, next_hr, -sign_next_hr)
 
 	# Per-direction masks: each direction gated independently
 	# mask_conn_hr: (D, 1, He, We, 3) — [prev, center, next]
