@@ -2,8 +2,6 @@
 
 - `roi_layout`: ROI resolution + buffer allocation
 - `epoch_passes`: train/log-only stitch passes
-- `manager_setup`: compatibility re-export of setup helpers from `train_resnet3d_lib.stitch_manager`
-- `manager_runtime`: compatibility re-export of runtime helpers from `train_resnet3d_lib.stitch_manager`
 - `wandb_media`: stitched image logging
 - `metrics_runtime`: stitched metric computation/logging
 - `metrics_runtime_config`: stitched metrics schedule + option parsing
@@ -15,8 +13,6 @@ __all__ = [
     "buffer_ops",
     "roi_layout",
     "epoch_passes",
-    "manager_setup",
-    "manager_runtime",
     "wandb_media",
     "metrics_runtime",
     "metrics_runtime_config",

@@ -332,29 +332,6 @@ def initialize_regression_state(model, *, model_cfg, objective_cfg, stitch_cfg):
     model.with_norm = model_cfg.with_norm
     model.total_steps = model_cfg.total_steps
 
-    if model.loss_recipe not in {"dice_bce", "bce_only"}:
-        raise ValueError(f"training.loss_recipe must be one of ['bce_only', 'dice_bce'], got {model.loss_recipe!r}")
-    if not (0.0 <= model.bce_smooth_factor <= 0.5):
-        raise ValueError(
-            "training_hyperparameters.training.bce_smooth_factor must be in [0.0, 0.5], "
-            f"got {model.bce_smooth_factor}"
-        )
-    if not (0.0 <= model.soft_label_positive <= 1.0):
-        raise ValueError(
-            "training_hyperparameters.training.soft_label_positive must be in [0.0, 1.0], "
-            f"got {model.soft_label_positive}"
-        )
-    if not (0.0 <= model.soft_label_negative <= 1.0):
-        raise ValueError(
-            "training_hyperparameters.training.soft_label_negative must be in [0.0, 1.0], "
-            f"got {model.soft_label_negative}"
-        )
-    if model.soft_label_positive <= model.soft_label_negative:
-        raise ValueError(
-            "training_hyperparameters.training.soft_label_positive must be greater than soft_label_negative, "
-            f"got {model.soft_label_positive} <= {model.soft_label_negative}"
-        )
-
     model.n_groups = int(model_cfg.n_groups)
     model.group_names = list(model_cfg.group_names)
     if len(model.group_names) == 0:

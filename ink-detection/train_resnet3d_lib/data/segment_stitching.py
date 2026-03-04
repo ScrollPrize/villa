@@ -147,19 +147,6 @@ def build_train_stitch_outputs(
 ):
     backend = str(data_backend).strip().lower()
     if backend == "zarr":
-        required = {
-            "train_volumes_by_segment": train_volumes_by_segment,
-            "train_masks_by_segment": train_masks_by_segment,
-            "train_xyxys_by_segment": train_xyxys_by_segment,
-            "train_sample_bbox_indices_by_segment": train_sample_bbox_indices_by_segment,
-            "train_groups_by_segment": train_groups_by_segment,
-        }
-        missing = [name for name, value in required.items() if value is None]
-        if missing:
-            raise ValueError(
-                "missing required arguments for zarr train stitch dispatch: "
-                f"{missing!r}"
-            )
         return build_train_stitch_loaders_lazy(
             train_fragment_ids,
             train_volumes_by_segment,
@@ -171,10 +158,6 @@ def build_train_stitch_outputs(
             valid_transform=valid_transform,
         )
     if backend == "tiff":
-        if train_stitch_candidates is None:
-            raise ValueError(
-                "train_stitch_candidates is required when training.data_backend is 'tiff'"
-            )
         return build_train_stitch_loaders(
             train_fragment_ids,
             train_stitch_candidates,
@@ -322,8 +305,6 @@ def build_log_only_outputs(
 
     backend = str(data_backend).strip().lower()
     if backend == "zarr":
-        if volume_cache is None:
-            raise ValueError("volume_cache is required when training.data_backend is 'zarr'")
         return build_log_only_stitch_loaders_lazy(
             requested_segments,
             segments_metadata=segments_metadata,
@@ -333,8 +314,6 @@ def build_log_only_outputs(
             log_only_downsample=log_only_downsample,
         )
     if backend == "tiff":
-        if layers_cache is None:
-            raise ValueError("layers_cache is required when training.data_backend is 'tiff'")
         return build_log_only_stitch_loaders(
             requested_segments,
             segments_metadata=segments_metadata,
@@ -344,5 +323,4 @@ def build_log_only_outputs(
             log_only_downsample=log_only_downsample,
         )
     raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
-
 
