@@ -84,14 +84,15 @@ def _estimate_normal_weights(
 	dir0_x: np.ndarray, dir1_x: np.ndarray,
 	eps: float = 1e-12,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-	"""Estimate 3D surface normal weights from three axis dir channel pairs.
+	"""Estimate in-plane projection weights from three axis dir channel pairs.
 
 	Each axis's dir0/dir1 (in [0,1]) encodes a 2D gradient direction in the
 	slicing plane. The three constraints form a 3×3 system whose least-squares
 	normal is found via cross products of row pairs.
 
-	Returns (w_z, w_y, w_x) — absolute normal components, each same shape as
-	the input arrays.
+	Returns (w_z, w_y, w_x) — in-plane projection magnitudes sqrt(1 - n_axis²),
+	each same shape as the input arrays.  These represent how edge-on the surface
+	is to each slicing axis (= how reliably that axis observes the sheet).
 	"""
 	theta_z = _decode_dir_angle(dir0_z, dir1_z)
 	theta_y = _decode_dir_angle(dir0_y, dir1_y)
@@ -141,12 +142,17 @@ def _estimate_normal_weights(
 	nz = n1_z + n2_z + n3_z
 	norm = np.sqrt(nx * nx + ny * ny + nz * nz) + eps
 
-	# Weights = |components| of normalized normal
-	# w_z = |nz|/norm (how much z-slicing axis sees the surface)
-	# w_y = |ny|/norm, w_x = |nx|/norm
-	w_z = np.abs(nz) / norm
-	w_y = np.abs(ny) / norm
-	w_x = np.abs(nx) / norm
+	# Weights = in-plane projection magnitude for each slicing axis.
+	# The UNet outputs the in-plane gradient: gm_axis = G * sqrt(1 - n_axis²).
+	# Using sqrt(1 - n_axis²) as weight makes the fusion recover G correctly:
+	#   gm_fused = Σ(gm_axis) / Σ(w_axis) = G * Σw / Σw = G.
+	# Also weights cos by observation reliability (edge-on = clear line = reliable).
+	nx_n = nx / norm
+	ny_n = ny / norm
+	nz_n = nz / norm
+	w_z = np.sqrt(nx_n * nx_n + ny_n * ny_n + eps)  # sqrt(1 - nz²)
+	w_y = np.sqrt(nx_n * nx_n + nz_n * nz_n + eps)  # sqrt(1 - ny²)
+	w_x = np.sqrt(ny_n * ny_n + nz_n * nz_n + eps)  # sqrt(1 - nx²)
 
 	return w_z, w_y, w_x
 
@@ -676,9 +682,13 @@ def _make_fuse_tile_3axis():
 					nnz = n1_z + n2_z + n3_z
 					norm = np.sqrt(nnx * nnx + nny * nny + nnz * nnz) + eps
 
-					w_z = np.abs(nnz) / norm
-					w_y = np.abs(nny) / norm
-					w_x = np.abs(nnx) / norm
+					# In-plane projection weights: sqrt(1 - n_axis²)
+					nnx_n = nnx / norm
+					nny_n = nny / norm
+					nnz_n = nnz / norm
+					w_z = np.sqrt(nnx_n * nnx_n + nny_n * nny_n + eps)
+					w_y = np.sqrt(nnx_n * nnx_n + nnz_n * nnz_n + eps)
+					w_x = np.sqrt(nny_n * nny_n + nnz_n * nnz_n + eps)
 
 					# Weighted fusion
 					w_sum = w_z + w_y + w_x + eps

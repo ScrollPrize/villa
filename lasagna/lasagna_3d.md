@@ -336,18 +336,18 @@ Each axis constrains the 3D surface normal (nx, ny, nz) via a linear equation (t
 
 Align signs so dot(nᵢ, n₁) ≥ 0, then sum: `n_avg = n₁ + n₂ + n₃`. Normalize to unit length. Cross product magnitude naturally weights by reliability — when two constraint planes are nearly parallel their cross product is small.
 
-Output weights: `(w_z, w_y, w_x) = (|nz_component|, |ny_component|, |nx_component|)` of the normalized normal. These represent how orthogonal each slicing axis is to the surface.
+Output weights: `(w_z, w_y, w_x) = (sqrt(1-nz²), sqrt(1-ny²), sqrt(1-nx²))` — the in-plane projection magnitudes. These represent how edge-on the surface is to each slicing axis (= how reliably that axis observes the sheet).
 
 #### Fusion formulas
 
-The UNet observes grad_mag stretched by the slicing angle: `gm_observed = G_true · cos(α)` where `cos(α) = w_axis` (the weight for that axis). Angle normalization recovers the true gradient: `G_est = gm_observed / cos(α) = gm_observed / w_axis`.
+The UNet outputs the in-plane gradient: `gm_observed = G_true · sqrt(1 - n_axis²) = G_true · w_axis`. Dividing by the projection factor recovers the true 3D gradient: `G_est = gm_observed / w_axis`.
 
-**cos fusion** (weighted average, no angle normalization):
+**cos fusion** (weighted average by observation reliability):
 ```
 cos_fused = (w_z·cos_z + w_y·cos_y + w_x·cos_x) / (w_z + w_y + w_x)
 ```
 
-**grad_mag fusion** (weight and normalization cancel):
+**grad_mag fusion** (projection factor and weight cancel):
 ```
 gm_fused = Σ(w · G_est) / Σ(w)
          = Σ(w · gm/w) / Σ(w)
@@ -355,4 +355,4 @@ gm_fused = Σ(w · G_est) / Σ(w)
          = (gm_z + gm_y + gm_x) / (w_z + w_y + w_x)
 ```
 
-Equivalently: `gm_fused = sqrt(gm_z² + gm_y² + gm_x²)` (L2 norm, since `gm_axis = G·|n_component|` and `|n|=1`).
+Equivalently: `gm_fused = sqrt((gm_z² + gm_y² + gm_x²) / 2)` (since `gm_axis = G·sqrt(1-n_axis²)` and `Σ(1-n_axis²) = 2` for unit normal).
