@@ -51,30 +51,34 @@ def dir_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch.Te
 	lm = torch.zeros_like(nx)
 	w_total = torch.zeros_like(nx)
 
-	# z-axis (XY plane): project normal -> (nx, ny), weight by |nz|
+	# Weight each axis by the normal's in-plane projection magnitude:
+	# high when the slicing plane cuts the surface edge-on (reliable direction data),
+	# low when face-on (degenerate direction data).
+
+	# z-axis (XY plane): project normal -> (nx, ny), weight by sqrt(nx²+ny²)
 	if data_at_faces.dir0_z is not None:
 		d0, d1 = _encode_dir(nx, ny)
 		data_d0 = data_at_faces.dir0_z.squeeze(0).squeeze(0)  # (D, Hm-1, Wm-1)
 		data_d1 = data_at_faces.dir1_z.squeeze(0).squeeze(0)
-		w = nz.abs()
+		w = (nx * nx + ny * ny).sqrt()
 		lm = lm + w * 0.5 * ((d0 - data_d0) ** 2 + (d1 - data_d1) ** 2)
 		w_total = w_total + w
 
-	# y-axis (XZ plane): project -> (nx, nz), weight by |ny|
+	# y-axis (XZ plane): project -> (nx, nz), weight by sqrt(nx²+nz²)
 	if data_at_faces.dir0_y is not None:
 		d0, d1 = _encode_dir(nx, nz)
 		data_d0 = data_at_faces.dir0_y.squeeze(0).squeeze(0)
 		data_d1 = data_at_faces.dir1_y.squeeze(0).squeeze(0)
-		w = ny.abs()
+		w = (nx * nx + nz * nz).sqrt()
 		lm = lm + w * 0.5 * ((d0 - data_d0) ** 2 + (d1 - data_d1) ** 2)
 		w_total = w_total + w
 
-	# x-axis (YZ plane): project -> (ny, nz), weight by |nx|
+	# x-axis (YZ plane): project -> (ny, nz), weight by sqrt(ny²+nz²)
 	if data_at_faces.dir0_x is not None:
 		d0, d1 = _encode_dir(ny, nz)
 		data_d0 = data_at_faces.dir0_x.squeeze(0).squeeze(0)
 		data_d1 = data_at_faces.dir1_x.squeeze(0).squeeze(0)
-		w = nx.abs()
+		w = (ny * ny + nz * nz).sqrt()
 		lm = lm + w * 0.5 * ((d0 - data_d0) ** 2 + (d1 - data_d1) ** 2)
 		w_total = w_total + w
 
