@@ -5,7 +5,7 @@ import torch
 
 from torch.utils.data import Dataset
 
-from common import (
+from .common import (
     _build_normal_offset_mask_from_labeled_points,
     _build_projected_loss_mask_volume,
     _build_surface_label_volume,
@@ -19,7 +19,7 @@ from common import (
     _voxelize_positive_labels_from_sampled_grid,
     _voxelize_surface_from_sampled_grid,
 )
-from patch_finding import _PATCH_CACHE_DEFAULT_FILENAME, find_patches
+from .patch_finding import _PATCH_CACHE_DEFAULT_FILENAME, find_patches
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 
 class TifxyzInkDataset(Dataset):

@@ -10,7 +10,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 import vesuvius.tifxyz as tifxyz
-from common import (
+from .common import (
     _empty_patch_generation_stats,
     _fix_known_bottom_right_padding,
 )

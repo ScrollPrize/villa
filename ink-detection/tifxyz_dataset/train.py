@@ -12,7 +12,7 @@ from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
 
 from vesuvius.neural_tracing.nets.models import make_model
 
-from tifxyz_dataset import TifxyzInkDataset
+from .tifxyz_dataset import TifxyzInkDataset
 
 ################################
 # THIS IS A STUB -- DO NOT USE #
