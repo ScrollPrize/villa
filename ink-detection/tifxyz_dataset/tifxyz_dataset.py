@@ -110,7 +110,7 @@ class TifxyzInkDataset(Dataset):
     def _apply_sample_augmentation(
         self,
         vol_crop,
-        surface_label_vox,
+        labeled_vox_at_surface,
         surface_vox,
         projected_loss_mask,
     ):
@@ -121,7 +121,7 @@ class TifxyzInkDataset(Dataset):
         segmentation = torch.as_tensor(
             np.stack(
                 (
-                    np.asarray(surface_label_vox, dtype=np.float32),
+                    np.asarray(labeled_vox_at_surface, dtype=np.float32),
                     np.asarray(surface_vox, dtype=np.float32),
                     np.asarray(projected_loss_mask, dtype=np.float32),
                 ),
@@ -248,7 +248,7 @@ class TifxyzInkDataset(Dataset):
             crop_size=crop_size,
             sampled_grid=sampled_grid,
         )
-        surface_label_vox = _build_surface_label_volume(
+        labeled_vox_at_surface = _build_surface_label_volume(
             positive_label_vox=positive_label_vox,
             background_label_vox=background_label_vox,
             crop_size=crop_size,
@@ -265,24 +265,24 @@ class TifxyzInkDataset(Dataset):
         if self.augmentations is not None:
             (
                 vol_crop,
-                surface_label_vox,
+                labeled_vox_at_surface,
                 surface_vox,
                 projected_loss_mask,
             ) = self._apply_sample_augmentation(
                 vol_crop=vol_crop,
-                surface_label_vox=surface_label_vox,
+                labeled_vox_at_surface=labeled_vox_at_surface,
                 surface_vox=surface_vox,
                 projected_loss_mask=projected_loss_mask,
             )
 
         vol_crop = self._to_float32_tensor(vol_crop)
-        surface_label_vox = self._to_float32_tensor(surface_label_vox)
+        labeled_vox_at_surface = self._to_float32_tensor(labeled_vox_at_surface)
         surface_vox = self._to_float32_tensor(surface_vox)
         projected_loss_mask = self._to_float32_tensor(projected_loss_mask)
 
         return {
             "vol": vol_crop,
-            "surface_label_vox": surface_label_vox,
+            "labeled_vox_at_surface": labeled_vox_at_surface,
             "surface_vox": surface_vox,
             "projected_loss_mask": projected_loss_mask,
             "patch": patch,
@@ -300,6 +300,12 @@ if __name__ == "__main__":
         "--napari",
         action="store_true",
         help="Iterate the dataset once and visualize outputs in a Napari viewer.",
+    )
+    parser.add_argument(
+        "--napari-downsample",
+        type=int,
+        default=10,
+        help="Spatial downsample factor for arrays shown in Napari.",
     )
     args = parser.parse_args()
 
@@ -324,49 +330,31 @@ if __name__ == "__main__":
                 "napari is required for --napari. Install it and re-run."
             ) from exc
 
-        output_keys = (
-            "vol",
-            "surface_label_vox",
-            "surface_vox",
-            "projected_loss_mask",
-        )
-        stacked_outputs = {k: [] for k in output_keys}
-        sample_positive_counts = []
-        sample_background_counts = []
+        napari_downsample = max(1, int(args.napari_downsample))
 
-        for sample in ds:
-            for key in output_keys:
-                stacked_outputs[key].append(np.asarray(sample[key]))
-            surface_label = np.asarray(sample["surface_label_vox"])
-            sample_positive_counts.append(int(np.count_nonzero(surface_label == 1.0)))
-            sample_background_counts.append(int(np.count_nonzero(surface_label == 0.0)))
+        def _downsample_spatial_3d(arr, factor):
+            if factor <= 1:
+                return arr
+            if arr.ndim != 3:
+                return arr
+            return arr[
+                ::factor,
+                ::factor,
+                ::factor,
+            ]
 
-        if not stacked_outputs["vol"]:
+        if len(ds) == 0:
             raise RuntimeError("Dataset produced no samples to visualize.")
 
-        positive_total = int(np.sum(np.asarray(sample_positive_counts, dtype=np.int64)))
-        background_total = int(np.sum(np.asarray(sample_background_counts, dtype=np.int64)))
-        print(f"positive_label_vox total nonzero: {positive_total}")
-        print(f"background_label_vox total nonzero: {background_total}")
-        if positive_total == 0:
-            print("warning: positive_label_vox is empty across all samples.")
-        if background_total == 0:
-            print("warning: background_label_vox is empty across all samples.")
+        sample = next(iter(ds))
+        sample_idx = int(sample.get("idx", -1))
 
-        focus_patch_idx = 0
-        combined_counts = np.asarray(sample_positive_counts, dtype=np.int64) + np.asarray(
-            sample_background_counts,
-            dtype=np.int64,
-        )
-        if combined_counts.size > 0 and int(np.max(combined_counts)) > 0:
-            focus_patch_idx = int(np.argmax(combined_counts))
-
-        vol_4d = np.stack(stacked_outputs["vol"], axis=0)
-        surface_label_raw = np.stack(stacked_outputs["surface_label_vox"], axis=0).astype(np.int16, copy=False)
-        projected_loss_mask_raw = np.stack(stacked_outputs["projected_loss_mask"], axis=0).astype(np.int16, copy=False)
-        positive_4d = (surface_label_raw == 1).astype(np.uint8)
-        background_4d = (surface_label_raw == 0).astype(np.uint8)
-        surface_4d = (np.stack(stacked_outputs["surface_vox"], axis=0) > 0.0).astype(np.uint8)
+        vol_3d = np.asarray(sample["vol"], dtype=np.float32)
+        surface_label_raw = np.asarray(sample["labeled_vox_at_surface"]).astype(np.int16, copy=False)
+        projected_loss_mask_raw = np.asarray(sample["projected_loss_mask"]).astype(np.int16, copy=False)
+        positive_3d = (surface_label_raw == 1).astype(np.uint8)
+        background_3d = (surface_label_raw == 0).astype(np.uint8)
+        surface_3d = (np.asarray(sample["surface_vox"]) > 0.0).astype(np.uint8)
 
         # For visualization, map ignore=2 to 0 (transparent) so only labeled classes remain visible.
         surface_label_vis = np.zeros_like(surface_label_raw, dtype=np.uint8)
@@ -377,29 +365,44 @@ if __name__ == "__main__":
         projected_loss_mask_vis[projected_loss_mask_raw == 1] = 1
         projected_loss_mask_vis[projected_loss_mask_raw == 0] = 2
 
+        vol_3d = _downsample_spatial_3d(vol_3d, napari_downsample)
+        surface_3d = _downsample_spatial_3d(surface_3d, napari_downsample)
+        positive_3d = _downsample_spatial_3d(positive_3d, napari_downsample)
+        background_3d = _downsample_spatial_3d(background_3d, napari_downsample)
+        surface_label_vis = _downsample_spatial_3d(surface_label_vis, napari_downsample)
+        projected_loss_mask_vis = _downsample_spatial_3d(projected_loss_mask_vis, napari_downsample)
+
+        positive_total = int(np.count_nonzero(surface_label_raw == 1))
+        background_total = int(np.count_nonzero(surface_label_raw == 0))
+        print(f"napari sample idx: {sample_idx}")
+        print(f"positive_label_vox sample nonzero: {positive_total}")
+        print(f"background_label_vox sample nonzero: {background_total}")
+
+        print(f"Napari spatial downsample factor: {napari_downsample}")
+
         viewer = napari.Viewer(ndisplay=3)
-        viewer.add_image(vol_4d, name="vol", rendering="mip", interpolation3d="nearest")
+        viewer.add_image(vol_3d, name="vol", rendering="mip", interpolation3d="nearest")
         viewer.add_labels(
-            surface_4d,
+            surface_3d,
             name="surface_vox",
             opacity=0.2,
             blending="additive",
         )
         viewer.add_labels(
-            positive_4d,
+            positive_3d,
             name="positive_label_vox",
             opacity=0.9,
             blending="additive",
         )
         viewer.add_labels(
-            background_4d,
+            background_3d,
             name="background_label_vox",
             opacity=0.7,
             blending="additive",
         )
         viewer.add_labels(
             surface_label_vis,
-            name="surface_label_vox",
+            name="labeled_vox_at_surface",
             opacity=0.5,
             blending="additive",
         )
@@ -409,7 +412,5 @@ if __name__ == "__main__":
             opacity=0.5,
             blending="additive",
         )
-        viewer.dims.set_current_step(0, focus_patch_idx)
-        print(f"Napari focus patch index: {focus_patch_idx}")
 
         napari.run()
