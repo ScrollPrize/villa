@@ -304,30 +304,34 @@ class Model3D(nn.Module):
 			g = P00 - O
 
 			# 2D cross product for axis pair (i, j): vec_i * n_j - vec_j * n_i
-			# Use two axis pairs (0,1) and (0,2) to form quadratic in u
 			def cross2(vec: torch.Tensor, i: int, j: int) -> torch.Tensor:
 				return vec[..., i] * n[..., j] - vec[..., j] * n[..., i]
 
-			# Pair (i=0, j=1): X,Y
-			A0 = cross2(a, 0, 1)
-			B0 = cross2(b, 0, 1)
-			C0 = cross2(c, 0, 1)
-			G0 = cross2(g, 0, 1)
+			# All three axis pair projections: (X,Y), (X,Z), (Y,Z)
+			# Each gives: G_k + u*A_k + v*(B_k + u*C_k) = 0
+			Ap = [cross2(a, 0, 1), cross2(a, 0, 2), cross2(a, 1, 2)]
+			Bp = [cross2(b, 0, 1), cross2(b, 0, 2), cross2(b, 1, 2)]
+			Cp = [cross2(c, 0, 1), cross2(c, 0, 2), cross2(c, 1, 2)]
+			Gp = [cross2(g, 0, 1), cross2(g, 0, 2), cross2(g, 1, 2)]
 
-			# Pair (i=0, j=2): X,Z
-			A1 = cross2(a, 0, 2)
-			B1 = cross2(b, 0, 2)
-			C1 = cross2(c, 0, 2)
-			G1 = cross2(g, 0, 2)
+			# Quadratic in u from eliminating v between two projections.
+			# Three possible pairs; pick the best-conditioned (largest |alpha|).
+			qpairs = [(0, 1), (0, 2), (1, 2)]
+			alphas = []
+			betas_q = []
+			gammas = []
+			for p, q in qpairs:
+				alphas.append(Ap[p] * Cp[q] - Ap[q] * Cp[p])
+				betas_q.append(Ap[p] * Bp[q] - Ap[q] * Bp[p] + Gp[p] * Cp[q] - Gp[q] * Cp[p])
+				gammas.append(Gp[p] * Bp[q] - Gp[q] * Bp[p])
 
-			# From Q(u,v) = O + s*n projected onto the two 2D planes:
-			# Plane 0: G0 + u*A0 + v*(B0 + u*C0) = 0  →  v = -(G0 + u*A0) / (B0 + u*C0)
-			# Plane 1: G1 + u*A1 + v*(B1 + u*C1) = 0  →  v = -(G1 + u*A1) / (B1 + u*C1)
-			# Equate: (G0 + u*A0)(B1 + u*C1) = (G1 + u*A1)(B0 + u*C0)
-			# Quadratic: alpha*u^2 + beta*u + gamma = 0
-			alpha = A0 * C1 - A1 * C0
-			beta = A0 * B1 - A1 * B0 + G0 * C1 - G1 * C0
-			gamma = G0 * B1 - G1 * B0
+			abs_a = [aa.abs() for aa in alphas]
+			sel_q0 = (abs_a[0] >= abs_a[1]) & (abs_a[0] >= abs_a[2])
+			sel_q1 = (~sel_q0) & (abs_a[1] >= abs_a[2])
+
+			alpha = torch.where(sel_q0, alphas[0], torch.where(sel_q1, alphas[1], alphas[2]))
+			beta = torch.where(sel_q0, betas_q[0], torch.where(sel_q1, betas_q[1], betas_q[2]))
+			gamma = torch.where(sel_q0, gammas[0], torch.where(sel_q1, gammas[1], gammas[2]))
 
 			eps = 1e-12
 			# Discriminant
@@ -351,9 +355,17 @@ class Model3D(nn.Module):
 			# Pick u closest to frac_h (stored offset hint)
 			u = torch.where((u1 - frac_h).abs() <= (u2 - frac_h).abs(), u1, u2)
 
-			# Compute v from plane 1: v = -(G1 + u*A1) / (B1 + u*C1)
-			denom_v = B1 + u * C1
-			v = -(G1 + u * A1) / (denom_v + eps * (denom_v.abs() < eps).float())
+			# Recover v from the best-conditioned projection (largest |denom_v|)
+			denom_v = [Bp[k] + u * Cp[k] for k in range(3)]
+			numer_v = [-(Gp[k] + u * Ap[k]) for k in range(3)]
+			abs_dv = [d.abs() for d in denom_v]
+
+			sel_v0 = (abs_dv[0] >= abs_dv[1]) & (abs_dv[0] >= abs_dv[2])
+			sel_v1 = (~sel_v0) & (abs_dv[1] >= abs_dv[2])
+
+			dv = torch.where(sel_v0, denom_v[0], torch.where(sel_v1, denom_v[1], denom_v[2]))
+			nv = torch.where(sel_v0, numer_v[0], torch.where(sel_v1, numer_v[1], numer_v[2]))
+			v = nv / (dv + eps * (dv.abs() < eps).float())
 
 			# Connection point: Q(u, v) = P00 + u*a + v*b + u*v*c
 			conn_pt = P00 + u.unsqueeze(-1) * a + v.unsqueeze(-1) * b + (u * v).unsqueeze(-1) * c
@@ -386,7 +398,16 @@ class Model3D(nn.Module):
 
 			xy_conn = torch.stack([prev_full, xyz_lr, next_full], dim=-1)  # (D, Hm, Wm, 3, 3)
 
-			# Connection masks: sample validity
+			# Intersection validity: u,v must be inside the patch [0, 1]
+			def _uv_valid(u_val: torch.Tensor, v_val: torch.Tensor) -> torch.Tensor:
+				return ((u_val >= 0) & (u_val <= 1) & (v_val >= 0) & (v_val <= 1)).to(dtype=xyz_lr.dtype)
+
+			prev_uv_ok = torch.cat([torch.zeros(1, Hm, Wm, device=device, dtype=xyz_lr.dtype),
+									_uv_valid(prev_u, prev_v)], dim=0)  # (D, Hm, Wm)
+			next_uv_ok = torch.cat([_uv_valid(next_u, next_v),
+									torch.zeros(1, Hm, Wm, device=device, dtype=xyz_lr.dtype)], dim=0)
+
+			# Connection masks: sample validity AND patch intersection validity
 			if data.valid is not None:
 				def _valid_mask(v: torch.Tensor | None) -> torch.Tensor:
 					if v is not None:
@@ -401,9 +422,9 @@ class Model3D(nn.Module):
 				mask_center = torch.ones(D, 1, Hm, Wm, device=device, dtype=xyz_lr.dtype)
 				mask_next = torch.ones(D, 1, Hm, Wm, device=device, dtype=xyz_lr.dtype)
 
-			# Zero mask at boundary D edges
-			mask_prev[0] = 0.0   # no prev at d=0
-			mask_next[-1] = 0.0  # no next at d=D-1
+			# Apply uv validity (also zeros boundary edges: d=0 prev, d=D-1 next)
+			mask_prev = mask_prev * prev_uv_ok.unsqueeze(1)
+			mask_next = mask_next * next_uv_ok.unsqueeze(1)
 
 			mask_conn = torch.stack([mask_prev, mask_center, mask_next], dim=-1)  # (D, 1, Hm, Wm, 3)
 		else:
