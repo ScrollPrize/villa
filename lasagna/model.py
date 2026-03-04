@@ -266,7 +266,7 @@ class Model3D(nn.Module):
 		next_h_off = self.conn_offsets[2]
 		next_w_off = self.conn_offsets[3]
 
-		def _intersect_direction(src_xyz: torch.Tensor, src_n: torch.Tensor, nb_xyz: torch.Tensor, h_off: torch.Tensor, w_off: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+		def _intersect_direction(src_xyz: torch.Tensor, src_n: torch.Tensor, nb_xyz: torch.Tensor, h_off: torch.Tensor, w_off: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 			"""Ray-bilinear-patch intersection for one direction.
 
 			src_xyz: (B, Hm, Wm, 3) — source vertex positions (ray origins).
@@ -274,7 +274,8 @@ class Model3D(nn.Module):
 			nb_xyz: (B, Hm, Wm, 3) — neighbor slice positions.
 			h_off, w_off: (B, Hm, Wm) — offsets.
 
-			Returns: (conn_pt, u, v, row, col) where conn_pt is (B, Hm, Wm, 3).
+			Returns: (conn_pt, u, v, row, col, valid) where conn_pt is (B, Hm, Wm, 3)
+			         and valid is (B, Hm, Wm) combining bounds and UV checks.
 			"""
 			B = src_xyz.shape[0]
 			h_idx_b = torch.arange(Hm, device=device, dtype=torch.float32).view(1, Hm, 1).expand(B, Hm, Wm)
@@ -370,7 +371,12 @@ class Model3D(nn.Module):
 			# Connection point: Q(u, v) = P00 + u*a + v*b + u*v*c
 			conn_pt = P00 + u.unsqueeze(-1) * a + v.unsqueeze(-1) * b + (u * v).unsqueeze(-1) * c
 
-			return conn_pt, u, v, row, col
+			# Combined validity: target must be in mesh bounds AND u,v in [0,1]
+			in_bounds = (target_h >= 0) & (target_h <= Hm - 1) & (target_w >= 0) & (target_w <= Wm - 1)
+			uv_ok = (u >= 0) & (u <= 1) & (v >= 0) & (v <= 1)
+			valid = (in_bounds & uv_ok).to(dtype=src_xyz.dtype)
+
+			return conn_pt, u, v, row, col, valid
 
 		# --- Compute connections for prev (d-1) and next (d+1) ---
 		# Built via cat/stack for clean autograd (no in-place version tracking).
@@ -378,13 +384,13 @@ class Model3D(nn.Module):
 
 		if D >= 2:
 			# Prev connections (d -> d-1): source is slices [1:], neighbor is [:-1]
-			prev_conn, prev_u, prev_v, prev_row, prev_col = _intersect_direction(
+			prev_conn, prev_u, prev_v, prev_row, prev_col, prev_valid = _intersect_direction(
 				xyz_lr[1:], normals[1:], xyz_lr[:-1], prev_h_off[1:], prev_w_off[1:]
 			)
 			self._conn_params["prev"] = (prev_u, prev_v, prev_row, prev_col)
 
 			# Next connections (d -> d+1): source is slices [:-1], neighbor is [1:]
-			next_conn, next_u, next_v, next_row, next_col = _intersect_direction(
+			next_conn, next_u, next_v, next_row, next_col, next_valid = _intersect_direction(
 				xyz_lr[:-1], normals[:-1], xyz_lr[1:], next_h_off[:-1], next_w_off[:-1]
 			)
 			self._conn_params["next"] = (next_u, next_v, next_row, next_col)
@@ -398,14 +404,10 @@ class Model3D(nn.Module):
 
 			xy_conn = torch.stack([prev_full, xyz_lr, next_full], dim=-1)  # (D, Hm, Wm, 3, 3)
 
-			# Intersection validity: u,v must be inside the patch [0, 1]
-			def _uv_valid(u_val: torch.Tensor, v_val: torch.Tensor) -> torch.Tensor:
-				return ((u_val >= 0) & (u_val <= 1) & (v_val >= 0) & (v_val <= 1)).to(dtype=xyz_lr.dtype)
-
-			prev_uv_ok = torch.cat([torch.zeros(1, Hm, Wm, device=device, dtype=xyz_lr.dtype),
-									_uv_valid(prev_u, prev_v)], dim=0)  # (D, Hm, Wm)
-			next_uv_ok = torch.cat([_uv_valid(next_u, next_v),
-									torch.zeros(1, Hm, Wm, device=device, dtype=xyz_lr.dtype)], dim=0)
+			# Intersection validity: bounds + UV combined (boundary slices get zeros)
+			zeros = torch.zeros(1, Hm, Wm, device=device, dtype=xyz_lr.dtype)
+			prev_uv_ok = torch.cat([zeros, prev_valid], dim=0)  # (D, Hm, Wm)
+			next_uv_ok = torch.cat([next_valid, zeros], dim=0)
 
 			# Connection masks: sample validity AND patch intersection validity
 			if data.valid is not None:

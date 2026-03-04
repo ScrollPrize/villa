@@ -91,6 +91,7 @@ public slots:
     void onGrowSegmentFromSegment(const std::string& segmentId);
     void onAddOverlap(const std::string& segmentId);
     void onConvertToObj(const std::string& segmentId);
+    void onVisLasagnaObj(const std::string& segmentId);
     void onCropSurfaceToValidRegion(const std::string& segmentId);
     void onFlipSurface(const std::string& segmentId, bool flipU);
     void onRotateSurface(const std::string& segmentId);

@@ -771,6 +771,10 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     connect(convertToObjAction, &QAction::triggered, this, [this, segmentId]() {
         emit convertToObjRequested(segmentId);
     });
+    QAction* visObjAction = contextMenu.addAction(tr("Lasagna Vis as OBJ"));
+    connect(visObjAction, &QAction::triggered, this, [this, segmentId]() {
+        emit visLasagnaObjRequested(segmentId);
+    });
     QAction* cropBoundsAction = contextMenu.addAction(tr("Crop bounds to valid region"));
     connect(cropBoundsAction, &QAction::triggered, this, [this, segmentId]() {
         emit cropBoundsRequested(segmentId);

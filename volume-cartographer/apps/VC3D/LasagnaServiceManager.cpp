@@ -419,6 +419,42 @@ void LasagnaServiceManager::stopOptimization()
     _nam->post(req, QByteArray("{}"));
 }
 
+void LasagnaServiceManager::exportLasagnaVis(const QJsonObject& config)
+{
+    if (!isRunning()) {
+        emit visExportError(tr("Lasagna service is not running"));
+        return;
+    }
+
+    QUrl url(QStringLiteral("%1/export_vis").arg(baseUrl()));
+    QNetworkRequest req(url);
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    req.setTransferTimeout(120000); // 2 min timeout for export
+
+    QByteArray body = QJsonDocument(config).toJson(QJsonDocument::Compact);
+
+    QNetworkReply* reply = _nam->post(req, body);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+
+        if (reply->error() != QNetworkReply::NoError) {
+            emit visExportError(tr("Export failed: %1").arg(reply->errorString()));
+            return;
+        }
+
+        QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
+        QJsonObject obj = doc.object();
+
+        if (obj.contains(QStringLiteral("error"))) {
+            emit visExportError(obj[QStringLiteral("error")].toString());
+            return;
+        }
+
+        QString outputDir = obj[QStringLiteral("output_dir")].toString();
+        emit visExportFinished(outputDir);
+    });
+}
+
 void LasagnaServiceManager::handleOptimizeReply(QNetworkReply* reply)
 {
     reply->deleteLater();

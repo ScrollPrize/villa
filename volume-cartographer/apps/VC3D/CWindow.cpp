@@ -1573,6 +1573,10 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 onConvertToObj(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::visLasagnaObjRequested,
+            this, [this](const QString& segmentId) {
+                onVisLasagnaObj(segmentId.toStdString());
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::cropBoundsRequested,
             this, [this](const QString& segmentId) {
                 onCropSurfaceToValidRegion(segmentId.toStdString());

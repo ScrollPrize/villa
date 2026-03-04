@@ -9,6 +9,7 @@ Endpoints:
     GET  /datasets        -> available .zarr datasets from --data-dir
     POST /optimize        -> start an optimization job (JSON body)
     POST /stop            -> request cancellation of the running job
+    POST /export_vis      -> export multi-layer OBJ visualization (JSON body)
 """
 from __future__ import annotations
 
@@ -481,8 +482,83 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._send_json({"status": "not running"})
 
+        elif self.path == "/export_vis":
+            try:
+                body = self._read_json()
+            except Exception as exc:
+                self._send_json({"error": f"bad json: {exc}"}, 400)
+                return
+            self._handle_export_vis(body)
+
         else:
             self._send_json({"error": "not found"}, 404)
+
+    def _handle_export_vis(self, body: dict[str, Any]) -> None:
+        """Synchronously export multi-layer OBJ visualization."""
+        import base64
+        import tempfile
+
+        model_input = body.get("model_input")
+        model_data = body.get("model_data")
+        data_input = body.get("data_input")
+        output_dir = body.get("output_dir")
+
+        if not output_dir:
+            self._send_json({"error": "missing 'output_dir'"}, 400)
+            return
+
+        tmp_model = None
+        try:
+            if model_data:
+                model_bytes = base64.b64decode(model_data)
+                tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
+                tmp.write(model_bytes)
+                tmp.close()
+                model_input = tmp.name
+                tmp_model = tmp.name
+            elif not model_input:
+                self._send_json({"error": "missing model_input or model_data"}, 400)
+                return
+
+            # If data_input not provided, extract from checkpoint's _fit_config_
+            if not data_input:
+                import torch
+                st = torch.load(str(model_input), map_location="cpu", weights_only=False)
+                fit_cfg = st.get("_fit_config_", {}) or {}
+                fit_args = fit_cfg.get("args", {}) or {}
+                data_input = fit_args.get("input")
+                if not data_input:
+                    self._send_json({"error": "missing 'data_input' and checkpoint has no _fit_config_.args.input"}, 400)
+                    return
+                # Resolve relative paths against _data_dir if available
+                if _data_dir and not Path(data_input).is_absolute():
+                    candidate = Path(_data_dir) / data_input
+                    if candidate.exists():
+                        data_input = str(candidate)
+
+            import export_vis_obj
+            export_vis_obj.export_vis_obj(
+                model_path=str(model_input),
+                data_path=str(data_input),
+                output_dir=str(output_dir),
+                slices=body.get("slices", []),
+                channels=body.get("channels", []),
+                losses=body.get("losses", []),
+                include_mesh=bool(body.get("include_mesh", True)),
+                include_connections=bool(body.get("include_connections", True)),
+                device=body.get("device", "cuda"),
+            )
+            self._send_json({"status": "ok", "output_dir": str(output_dir)})
+        except Exception as exc:
+            tb = traceback.format_exc()
+            print(f"[fit-service] export_vis error: {tb}", file=sys.stderr, flush=True)
+            self._send_json({"error": str(exc)}, 500)
+        finally:
+            if tmp_model:
+                try:
+                    os.unlink(tmp_model)
+                except OSError:
+                    pass
 
     def log_message(self, fmt: str, *args: Any) -> None:
         msg = fmt % args
