@@ -249,6 +249,8 @@ cv::Vec3f QuadSurface::gridNormal(int row, int col) const
     if (row < 0 || row >= _points->rows || col < 0 || col >= _points->cols)
         return {NAN, NAN, NAN};
 
+    std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+
     // Build normal cache on first access
     if (_normalCache.empty() || _normalCache.size() != _points->size()) {
         _normalCache.create(_points->rows, _points->cols);
@@ -337,10 +339,13 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
         return cv::Mat_<uint8_t>();
     }
 
-    if (!_validMaskCache.empty() &&
-        _validMaskCache.rows == _points->rows &&
-        _validMaskCache.cols == _points->cols) {
-        return _validMaskCache;
+    {
+        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+        if (!_validMaskCache.empty() &&
+            _validMaskCache.rows == _points->rows &&
+            _validMaskCache.cols == _points->cols) {
+            return _validMaskCache;
+        }
     }
 
     const int rows = _points->rows;
@@ -356,8 +361,13 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
             mask(j, i) = ok ? 255 : 0;
         }
     }
-    _validMaskCache = mask;
-    return mask;
+    std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+    if (_validMaskCache.empty() ||
+        _validMaskCache.rows != _points->rows ||
+        _validMaskCache.cols != _points->cols) {
+        _validMaskCache = mask;
+    }
+    return _validMaskCache;
 }
 
 void QuadSurface::writeValidMask(const cv::Mat& img)
@@ -391,6 +401,7 @@ void QuadSurface::invalidateCache()
     }
 
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    std::lock_guard<std::mutex> cacheLock(_cacheMutex);
     _validMaskCache = cv::Mat_<uint8_t>();
     _normalCache = cv::Mat_<cv::Vec3f>();
 }
@@ -813,7 +824,10 @@ void QuadSurface::invalidateMask()
 {
     // Clear from memory
     _channels.erase("mask");
-    _validMaskCache = cv::Mat_<uint8_t>();
+    {
+        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+        _validMaskCache = cv::Mat_<uint8_t>();
+    }
 
     // Delete from disk
     if (!path.empty()) {

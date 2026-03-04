@@ -415,6 +415,8 @@ private:
     bool _needsLoad = false;
     // Mutex to protect lazy loading from concurrent access
     mutable std::mutex _loadMutex;
+    // Mutex to protect lazily built caches from concurrent mutation.
+    mutable std::mutex _cacheMutex;
 };
 
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int flags = 0);
@@ -438,4 +440,3 @@ bool overlap(QuadSurface& a, QuadSurface& b, int max_iters = 1000);
 bool contains(QuadSurface& a, const cv::Vec3f& loc, int max_iters = 1000);
 bool contains(QuadSurface& a, const std::vector<cv::Vec3f>& locs);
 bool contains_any(QuadSurface& a, const std::vector<cv::Vec3f>& locs);
-
