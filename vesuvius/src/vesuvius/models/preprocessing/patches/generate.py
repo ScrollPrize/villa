@@ -251,13 +251,17 @@ def _resolve_valid_patch_value(
     target_names: List[str],
     mgr,
 ) -> Optional[Union[int, float]]:
-    """Extract valid_patch_value from target config if set."""
+    """Extract valid_patch_value from target config, with dataset-level fallback."""
     targets = getattr(mgr, "targets", {})
     for target in target_names:
         info = targets.get(target) or {}
         value = info.get("valid_patch_value")
         if value is not None:
             return value
+    dataset_cfg = getattr(mgr, "dataset_config", {}) or {}
+    dataset_value = dataset_cfg.get("valid_patch_value")
+    if dataset_value is not None:
+        return dataset_value
     return None
 
 

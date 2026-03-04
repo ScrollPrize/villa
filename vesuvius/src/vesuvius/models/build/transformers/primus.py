@@ -1,4 +1,5 @@
 from typing import Tuple
+import math
 import torch
 from torch import nn
 
@@ -8,7 +9,7 @@ from .abstract_arch import (
     test_submodules_loadable,
 )
 from .eva import Eva
-from .patch_encode_decode import LayerNormNd, PatchDecode, PatchEmbed
+from .patch_encode_decode import LayerNormNd, PatchDecode, PatchEmbed_deeper
 from vesuvius.models.utils import InitWeights_He
 from einops import rearrange
 
@@ -72,16 +73,33 @@ class Primus(AbstractDynamicNetworkArchitectures):
         """
         assert input_shape is not None
         assert len(input_shape) in (2, 3), "Only 2D and 3D inputs are supported"
+        assert len(patch_embed_size) == len(input_shape), "patch_embed_size dimensionality must match input_shape"
         assert all([j % i == 0 for i, j in zip(patch_embed_size, input_shape)])
+        assert tuple(patch_embed_size) == tuple([8] * len(input_shape)), (
+            f"deeper patch embedding downsamples by 8x. Use patch_embed_size={tuple([8] * len(input_shape))}."
+        )
         self.ndim = len(input_shape)
+        self._input_shape = tuple(input_shape)
 
         super().__init__()
         self.key_to_encoder = "eva"
         self.key_to_stem = "down_projection"
-        self.keys_to_in_proj = ("down_projection.proj",)
+        self.keys_to_in_proj = (
+            "down_projection.stem.blocks.0.conv1.conv",
+            "down_projection.stem.blocks.0.conv1.all_modules.0",
+        )
         self.key_to_lpe = "eva.pos_embed"
 
-        self.down_projection = PatchEmbed(patch_embed_size, input_channels, embed_dim)
+        self.down_projection = PatchEmbed_deeper(
+            input_channels=input_channels,
+            embed_dim=embed_dim,
+            base_features=32,
+            ndim=self.ndim,
+            depth_per_level=(1, 1, 1),
+            embed_proj_3x3x3=False,
+            embed_block_style="residual",
+            embed_block_type="basic",
+        )
         self.up_projection = PatchDecode(
             patch_embed_size, embed_dim, num_classes, norm=decoder_norm, activation=decoder_act
         )
@@ -146,13 +164,27 @@ class Primus(AbstractDynamicNetworkArchitectures):
         return (restored, restored_mask)
 
     def forward(self, x, ret_mask=False):
+        expected_ndim = self.ndim + 2
+        if x.ndim != expected_ndim:
+            raise ValueError(
+                f"Primus expected input with {expected_ndim} dims "
+                f"(B, C, {', '.join(['spatial'] * self.ndim)}), got shape {tuple(x.shape)}."
+            )
+
+        spatial = tuple(x.shape[2:])
+        if spatial != tuple(self._input_shape):
+            raise ValueError(
+                "Primus received a runtime spatial shape that does not match the configured input_shape. "
+                f"Expected {tuple(self._input_shape)}, got {spatial}. "
+                "Primus uses fixed positional embeddings and requires a consistent patch size."
+            )
+
         full_spatial = x.shape[2:]  # Full spatial dimensions (H, W) or (D, H, W)
         x = self.down_projection(x)
 
-        # Handle both 2D and 3D inputs
         B, C = x.shape[:2]
         spatial_shape = x.shape[2:]  # (H, W) or (D, H, W)
-        num_patches = int(torch.tensor(spatial_shape).prod().item())
+        num_patches = math.prod(spatial_shape)
 
         if self.ndim == 2:
             x = rearrange(x, "b c h w -> b (h w) c")
@@ -430,23 +462,3 @@ if __name__ == "__main__":
 
     test_submodules_loadable(model)
     time.sleep(5)
-
-    # 2D tests
-    print("\n" + "="*50)
-    print("2D TESTS")
-    print("="*50)
-
-    print("\nPrimus S (2D)")
-    x_2d = torch.rand([1, 1, 96, 96], device="cuda", dtype=torch.float32)
-    model_2d = PrimusS(1, 2, (8, 8), (96, 96)).cuda()
-    out = model_2d(x_2d)
-    print(f"Input shape: {x_2d.shape}, Output shape: {out.shape}")
-    print(f"Parameter count: {parameter_count(model_2d)[''] / 1e6:.2f}M")
-    test_submodules_loadable(model_2d)
-
-    print("\nPrimus B (2D)")
-    model_2d = PrimusB(1, 2, (8, 8), (96, 96)).cuda()
-    out = model_2d(x_2d)
-    print(f"Input shape: {x_2d.shape}, Output shape: {out.shape}")
-    print(f"Parameter count: {parameter_count(model_2d)[''] / 1e6:.2f}M")
-    test_submodules_loadable(model_2d)

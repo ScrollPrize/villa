@@ -103,6 +103,7 @@ class Eva(nn.Module):
         pos_emb_type = pos_emb_type.lower()
         if pos_emb_type not in ("rope", "pope"):
             raise ValueError(f"Unsupported pos_emb_type '{pos_emb_type}'. Use 'rope' or 'pope'.")
+        self.pos_emb_type = pos_emb_type
 
         if pos_emb_type == "pope" and rope_impl is RotaryEmbeddingCat:
             rope_impl = PoPEEmbedding
@@ -277,6 +278,10 @@ class Eva(nn.Module):
                 rot_pos_embed = apply_keep_indices_nlc(
                     x, rot_pos_embed, keep_indices, pos_embed_has_batch=pos_embed_has_batch
                 )
+                # RoPE is shared across heads; after per-sample patch dropping we need
+                # an explicit singleton head axis for correct broadcasting in attention.
+                if self.pos_emb_type == "rope" and rot_pos_embed.ndim == 3:
+                    rot_pos_embed = rot_pos_embed.unsqueeze(1)
             return x, rot_pos_embed, keep_indices
         else:
             return x, rot_pos_embed, None

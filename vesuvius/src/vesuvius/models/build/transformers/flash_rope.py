@@ -10,7 +10,7 @@ from torch.nn import LayerNorm
 
 
 class FlashRoPEAttention(nn.Module):
-    """EVA-style attention with RoPE, backed by flash_attn."""
+    """EVA-style attention with RoPE, backed by PyTorch SDPA."""
 
     def __init__(
         self,
@@ -65,14 +65,6 @@ class FlashRoPEAttention(nn.Module):
         self.proj = nn.Linear(attn_dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        try:
-            from flash_attn import flash_attn_func
-        except ImportError as exc:
-            raise ImportError(
-                "flash_attn is required for RoPE attention. Install it via the models extra."
-            ) from exc
-        self.flash_attn_func = flash_attn_func
-
     def forward(
         self,
         x: torch.Tensor,
@@ -115,25 +107,15 @@ class FlashRoPEAttention(nn.Module):
                 q = apply_rot_embed_cat(q, rope, half=self.rotate_half).type_as(v)
                 k = apply_rot_embed_cat(k, rope, half=self.rotate_half).type_as(v)
 
-        if attn_mask is not None:
-            raise ValueError("RoPE flash_attn does not support attn_mask.")
-        if not q.is_cuda:
-            raise RuntimeError("RoPE flash_attn requires CUDA tensors.")
-        if q.dtype not in (torch.float16, torch.bfloat16):
-            raise TypeError("RoPE flash_attn requires fp16 or bf16 tensors.")
-
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
-        x = self.flash_attn_func(
+        x = F.scaled_dot_product_attention(
             q,
             k,
             v,
+            attn_mask=attn_mask,
             dropout_p=self.attn_drop.p if self.training else 0.0,
-            softmax_scale=self.scale,
-            causal=False,
+            is_causal=False,
         )
-        x = x.transpose(1, 2).reshape(B, N, C)
+        x = x.transpose(1, 2).contiguous().reshape(B, N, C)
         x = self.norm(x)
         x = self.proj(x)
         x = self.proj_drop(x)

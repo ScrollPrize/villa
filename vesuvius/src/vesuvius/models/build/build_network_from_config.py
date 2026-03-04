@@ -249,11 +249,11 @@ class NetworkFromConfig(nn.Module):
         # Primus decoders do not emit multi-scale logits; block DS to avoid silent misconfiguration
         if self.architecture_type.lower().startswith("primus"):
             if ds_enabled:
-                raise ValueError(
-                    "Deep supervision is enabled but the selected architecture 'primus' does not "
-                    "support multi-scale logits. Please disable deep supervision or switch to the 'unet' architecture "
-                    "with separate decoders for the supervised tasks."
+                print(
+                    "Warning: Deep supervision is enabled but the selected architecture 'primus' does not "
+                    "support multi-scale logits. Disabling deep supervision for this run."
                 )
+                setattr(mgr, "enable_deep_supervision", False)
             self._init_primus(mgr, model_config)
             return
 
@@ -701,7 +701,7 @@ class NetworkFromConfig(nn.Module):
         
         patch_embed_size = model_config.get("patch_embed_size", (8, 8, 8))
         if isinstance(patch_embed_size, int):
-            patch_embed_size = (patch_embed_size,) * 3
+            patch_embed_size = (patch_embed_size,) * len(self.patch_size)
         
         # Ensure input shape is specified
         input_shape = model_config.get("input_shape", self.patch_size)

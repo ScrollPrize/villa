@@ -1,9 +1,43 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from .generate import generate_patch_caches
+
+
+def _configure_blosc_threads() -> None:
+    """
+    Configure BLOSC threads for patch cache generation stability.
+
+    If BLOSC_NTHREADS is not set, default to 1 to avoid allocator issues seen
+    on some systems during long zarr scans. Users can override by exporting
+    BLOSC_NTHREADS before running this command.
+    """
+    env_value = os.environ.get("BLOSC_NTHREADS")
+    if env_value is None:
+        desired_threads = 1
+        emit_default_msg = True
+    else:
+        emit_default_msg = False
+        try:
+            desired_threads = int(env_value)
+        except ValueError:
+            desired_threads = 1
+            print(f"Invalid BLOSC_NTHREADS={env_value!r}; falling back to 1.")
+        if desired_threads < 1:
+            desired_threads = 1
+
+    try:
+        from numcodecs import blosc
+
+        blosc.set_nthreads(desired_threads)
+        if emit_default_msg:
+            print("BLOSC_NTHREADS not set; defaulting to 1 for patch-cache stability.")
+    except Exception:
+        # numcodecs/blosc may not be available in all environments.
+        pass
 
 
 def main() -> None:
@@ -29,6 +63,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    _configure_blosc_threads()
 
     result = generate_patch_caches(
         config_path=args.config,
