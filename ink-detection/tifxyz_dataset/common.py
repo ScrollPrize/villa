@@ -879,9 +879,7 @@ def _voxelize_surface(dataset, segment, min_corner, max_corner, crop_size):
     n_rows_stored, n_cols_stored = x_stored.shape
 
     bbox_pad = max(0.0, float(getattr(dataset, "surface_bbox_pad", 2.0)))
-    interp_method = str(getattr(dataset, "surface_interp_method", "catmull_rom")).strip().lower()
-    if interp_method not in {"catmull_rom", "linear", "bspline"}:
-        interp_method = "catmull_rom"
+    interp_method = "catmull_rom"
     segment.use_stored_resolution()
     scale_y, scale_x = getattr(segment, "_scale", (1.0, 1.0))
     scale_y = float(scale_y) if np.isfinite(scale_y) and float(scale_y) > 0.0 else 1.0
@@ -905,7 +903,7 @@ def _voxelize_surface(dataset, segment, min_corner, max_corner, crop_size):
     rows, cols = np.where(in_bbox)
     row_min, row_max = int(rows.min()), int(rows.max())
     col_min, col_max = int(cols.min()), int(cols.max())
-    kernel_pad = 2 if interp_method in {"catmull_rom", "bspline"} else 1
+    kernel_pad = 2
     row_min = max(0, row_min - kernel_pad)
     row_max = min(n_rows_stored - 1, row_max + kernel_pad)
     col_min = max(0, col_min - kernel_pad)

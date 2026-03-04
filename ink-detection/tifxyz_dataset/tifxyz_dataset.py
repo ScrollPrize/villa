@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import warnings
+import torch
 
 from torch.utils.data import Dataset
 
@@ -76,7 +77,7 @@ class TifxyzInkDataset(Dataset):
 
         if apply_augmentation:                                                          # we'll use the vesuvius augmentation pipeline , see vesuvius/src/vesuvius/models/augmentation/pipelines/training_transforms.py
             self.augmentations = create_training_transforms(                            # for current defaults 
-                patch_size=self.patch_size,                                             # TODO: make these configurable 
+                patch_size=tuple(int(v) for v in self.patch_size_zyx),                  # TODO: make these configurable
                 no_spatial=False,
             )
         else:
@@ -104,6 +105,54 @@ class TifxyzInkDataset(Dataset):
                 continue
             self._segment_ink_label_path_by_uuid[segment_uuid] = str(ink_label_path)
 
+
+
+    def _apply_sample_augmentation(
+        self,
+        vol_crop,
+        surface_label_vox,
+        surface_vox,
+        mil_loss_mask_vox,
+    ):
+        image = torch.as_tensor(
+            np.asarray(vol_crop, dtype=np.float32),
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        segmentation = torch.as_tensor(
+            np.stack(
+                (
+                    np.asarray(surface_label_vox, dtype=np.float32),
+                    np.asarray(surface_vox, dtype=np.float32),
+                    np.asarray(mil_loss_mask_vox, dtype=np.float32),
+                ),
+                axis=0,
+            ),
+            dtype=torch.float32,
+        )
+
+        augmented = self.augmentations(
+            image=image,
+            segmentation=segmentation,
+        )
+        image_out = augmented["image"]
+        segmentation_out = augmented["segmentation"]
+
+        return (
+            image_out[0].to(dtype=torch.float32).cpu(),
+            segmentation_out[0].to(dtype=torch.float32).cpu(),
+            segmentation_out[1].to(dtype=torch.float32).cpu(),
+            segmentation_out[2].to(dtype=torch.float32).cpu(),
+        )
+
+    @staticmethod
+    def _to_float32_tensor(value):
+        if isinstance(value, torch.Tensor):
+            return value.to(dtype=torch.float32)
+        return torch.as_tensor(
+            np.asarray(value, dtype=np.float32),
+            dtype=torch.float32,
+        )
+    
     def __len__(self):
         return len(self.patches)
 
@@ -166,6 +215,7 @@ class TifxyzInkDataset(Dataset):
         )
         
         segment = patch["segment"]
+        
         sampled_grid = _sample_patch_supervision_grid(
             self,
             segment,
@@ -212,6 +262,24 @@ class TifxyzInkDataset(Dataset):
             sampled_grid=sampled_grid,
         )
 
+        if self.augmentations is not None:
+            (
+                vol_crop,
+                surface_label_vox,
+                surface_vox,
+                mil_loss_mask_vox,
+            ) = self._apply_sample_augmentation(
+                vol_crop=vol_crop,
+                surface_label_vox=surface_label_vox,
+                surface_vox=surface_vox,
+                mil_loss_mask_vox=mil_loss_mask_vox,
+            )
+
+        vol_crop = self._to_float32_tensor(vol_crop)
+        surface_label_vox = self._to_float32_tensor(surface_label_vox)
+        surface_vox = self._to_float32_tensor(surface_vox)
+        mil_loss_mask_vox = self._to_float32_tensor(mil_loss_mask_vox)
+
         return {
             "vol": vol_crop,
             "surface_label_vox": surface_label_vox,
@@ -220,6 +288,7 @@ class TifxyzInkDataset(Dataset):
             "patch": patch,
             "idx": int(idx),
         }
+
 
 
 if __name__ == "__main__":
