@@ -601,71 +601,107 @@ if __name__ == "__main__":
         if len(ds) == 0:
             raise RuntimeError("Dataset produced no samples to visualize.")
 
-        sample = next(iter(ds))
-        sample_idx = int(sample.get("idx", -1))
-
-        vol_3d = np.asarray(sample["vol"], dtype=np.float32)
-        surface_label_raw = np.asarray(sample["labeled_vox_at_surface"]).astype(np.int16, copy=False)
-        projected_loss_mask_raw = np.asarray(sample["projected_loss_mask"]).astype(np.int16, copy=False)
-        positive_3d = (surface_label_raw == 1).astype(np.uint8)
-        background_3d = (surface_label_raw == 0).astype(np.uint8)
-        surface_3d = (np.asarray(sample["surface_vox"]) > 0.0).astype(np.uint8)
-
-        # For visualization, map ignore=2 to 0 (transparent) so only labeled classes remain visible.
-        surface_label_vis = np.zeros_like(surface_label_raw, dtype=np.uint8)
-        surface_label_vis[surface_label_raw == 1] = 1
-        surface_label_vis[surface_label_raw == 0] = 2
-
-        projected_loss_mask_vis = np.zeros_like(projected_loss_mask_raw, dtype=np.uint8)
-        projected_loss_mask_vis[projected_loss_mask_raw == 1] = 1
-        projected_loss_mask_vis[projected_loss_mask_raw == 0] = 2
-
-        vol_3d = _downsample_spatial_3d(vol_3d, napari_downsample)
-        surface_3d = _downsample_spatial_3d(surface_3d, napari_downsample)
-        positive_3d = _downsample_spatial_3d(positive_3d, napari_downsample)
-        background_3d = _downsample_spatial_3d(background_3d, napari_downsample)
-        surface_label_vis = _downsample_spatial_3d(surface_label_vis, napari_downsample)
-        projected_loss_mask_vis = _downsample_spatial_3d(projected_loss_mask_vis, napari_downsample)
-
-        positive_total = int(np.count_nonzero(surface_label_raw == 1))
-        background_total = int(np.count_nonzero(surface_label_raw == 0))
-        print(f"napari sample idx: {sample_idx}")
-        print(f"positive_label_vox sample nonzero: {positive_total}")
-        print(f"background_label_vox sample nonzero: {background_total}")
+        from qtpy.QtWidgets import QPushButton
 
         print(f"Napari spatial downsample factor: {napari_downsample}")
 
+        def _build_napari_sample_data(sample):
+            sample_idx = int(sample.get("idx", -1))
+
+            vol_3d = np.asarray(sample["vol"], dtype=np.float32)
+            surface_label_raw = np.asarray(sample["labeled_vox_at_surface"]).astype(np.int16, copy=False)
+            projected_loss_mask_raw = np.asarray(sample["projected_loss_mask"]).astype(np.int16, copy=False)
+            positive_3d = (surface_label_raw == 1).astype(np.uint8)
+            background_3d = (surface_label_raw == 0).astype(np.uint8)
+            surface_3d = (np.asarray(sample["surface_vox"]) > 0.0).astype(np.uint8)
+
+            # For visualization, map ignore=2 to 0 (transparent) so only labeled classes remain visible.
+            surface_label_vis = np.zeros_like(surface_label_raw, dtype=np.uint8)
+            surface_label_vis[surface_label_raw == 1] = 1
+            surface_label_vis[surface_label_raw == 0] = 2
+
+            projected_loss_mask_vis = np.zeros_like(projected_loss_mask_raw, dtype=np.uint8)
+            projected_loss_mask_vis[projected_loss_mask_raw == 1] = 1
+            projected_loss_mask_vis[projected_loss_mask_raw == 0] = 2
+
+            return {
+                "sample_idx": sample_idx,
+                "positive_total": int(np.count_nonzero(surface_label_raw == 1)),
+                "background_total": int(np.count_nonzero(surface_label_raw == 0)),
+                "vol_3d": _downsample_spatial_3d(vol_3d, napari_downsample),
+                "surface_3d": _downsample_spatial_3d(surface_3d, napari_downsample),
+                "positive_3d": _downsample_spatial_3d(positive_3d, napari_downsample),
+                "background_3d": _downsample_spatial_3d(background_3d, napari_downsample),
+                "surface_label_vis": _downsample_spatial_3d(surface_label_vis, napari_downsample),
+                "projected_loss_mask_vis": _downsample_spatial_3d(projected_loss_mask_vis, napari_downsample),
+            }
+
+        def _log_sample_stats(sample_data):
+            print(f"napari sample idx: {sample_data['sample_idx']}")
+            print(f"positive_label_vox sample nonzero: {sample_data['positive_total']}")
+            print(f"background_label_vox sample nonzero: {sample_data['background_total']}")
+
+        sample_cursor = {"idx": 0}
+        initial_sample_data = _build_napari_sample_data(ds[sample_cursor["idx"]])
+        _log_sample_stats(initial_sample_data)
+
         viewer = napari.Viewer(ndisplay=3)
-        viewer.add_image(vol_3d, name="vol", rendering="mip", interpolation3d="nearest")
-        viewer.add_labels(
-            surface_3d,
+        vol_layer = viewer.add_image(
+            initial_sample_data["vol_3d"],
+            name="vol",
+            rendering="mip",
+            interpolation3d="nearest",
+        )
+        surface_layer = viewer.add_labels(
+            initial_sample_data["surface_3d"],
             name="surface_vox",
             opacity=0.2,
             blending="additive",
         )
-        viewer.add_labels(
-            positive_3d,
+        positive_layer = viewer.add_labels(
+            initial_sample_data["positive_3d"],
             name="positive_label_vox",
             opacity=0.9,
             blending="additive",
         )
-        viewer.add_labels(
-            background_3d,
+        background_layer = viewer.add_labels(
+            initial_sample_data["background_3d"],
             name="background_label_vox",
             opacity=0.7,
             blending="additive",
         )
-        viewer.add_labels(
-            surface_label_vis,
+        surface_label_layer = viewer.add_labels(
+            initial_sample_data["surface_label_vis"],
             name="labeled_vox_at_surface",
             opacity=0.5,
             blending="additive",
         )
-        viewer.add_labels(
-            projected_loss_mask_vis,
+        projected_loss_layer = viewer.add_labels(
+            initial_sample_data["projected_loss_mask_vis"],
             name="projected_loss_mask",
             opacity=0.5,
             blending="additive",
         )
+        viewer.title = f"TifxyzInkDataset sample {initial_sample_data['sample_idx']}"
+
+        def _show_sample_at_cursor():
+            sample_data = _build_napari_sample_data(ds[sample_cursor["idx"]])
+            vol_layer.data = sample_data["vol_3d"]
+            surface_layer.data = sample_data["surface_3d"]
+            positive_layer.data = sample_data["positive_3d"]
+            background_layer.data = sample_data["background_3d"]
+            surface_label_layer.data = sample_data["surface_label_vis"]
+            projected_loss_layer.data = sample_data["projected_loss_mask_vis"]
+            viewer.title = f"TifxyzInkDataset sample {sample_data['sample_idx']}"
+            _log_sample_stats(sample_data)
+
+        next_button = QPushButton("next")
+
+        def _on_next_clicked():
+            sample_cursor["idx"] = (sample_cursor["idx"] + 1) % len(ds)
+            _show_sample_at_cursor()
+
+        next_button.clicked.connect(_on_next_clicked)
+        viewer.window.add_dock_widget(next_button, area="right", name="next")
 
         napari.run()
