@@ -153,7 +153,3 @@ def register_initial_segments(
     manager.enabled = len(manager._roi_buffers_by_split["val"]) > 0
 
 
-__all__ = [
-    "initialize_manager_state",
-    "register_initial_segments",
-]

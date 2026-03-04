@@ -20,13 +20,17 @@ from train_resnet3d_lib.data.transforms_runtime import get_transforms
 from train_resnet3d_lib.data.normalization_stats import (
     prepare_fold_label_foreground_percentile_clip_zscore_stats,
 )
-from train_resnet3d_lib.data.segments import (
+from train_resnet3d_lib.data.segment_groups import (
     build_group_metadata,
     segment_group_context,
+)
+from train_resnet3d_lib.data.segment_trainval import (
     load_train_segment,
     load_train_segment_lazy,
     load_val_segment,
     load_val_segment_lazy,
+)
+from train_resnet3d_lib.data.segment_stitching import (
     build_train_stitch_outputs,
     build_log_only_outputs,
 )

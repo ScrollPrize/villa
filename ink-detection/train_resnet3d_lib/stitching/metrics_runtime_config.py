@@ -158,7 +158,3 @@ def resolve_metrics_options(*, current_epoch, eval_epoch, is_final_eval_epoch):
     }
 
 
-__all__ = [
-    "should_run_stitch_metrics",
-    "resolve_metrics_options",
-]

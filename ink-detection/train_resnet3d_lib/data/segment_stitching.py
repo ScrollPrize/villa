@@ -346,11 +346,3 @@ def build_log_only_outputs(
     raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
 
 
-__all__ = [
-    "build_train_stitch_loaders",
-    "build_train_stitch_loaders_lazy",
-    "build_train_stitch_outputs",
-    "build_log_only_stitch_loaders",
-    "build_log_only_stitch_loaders_lazy",
-    "build_log_only_outputs",
-]

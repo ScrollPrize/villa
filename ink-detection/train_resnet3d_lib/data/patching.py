@@ -355,16 +355,3 @@ def _mask_border(mask_bool: np.ndarray) -> np.ndarray:
     return mask_bool & ~eroded
 
 
-__all__ = [
-    "_label_tile_is_empty",
-    "extract_patch_coordinates",
-    "_component_bboxes",
-    "_build_mask_store_and_patch_index",
-    "_mask_store_shape",
-    "_read_mask_patch",
-    "extract_patches_infer",
-    "extract_patches",
-    "_downsample_bool_mask_any",
-    "_mask_component_bboxes_downsample",
-    "_mask_border",
-]

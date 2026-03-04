@@ -18,7 +18,3 @@ def segment_group_context(fragment_id, segments_metadata, fragment_to_group_idx,
     return seg_meta, group_idx, group_name
 
 
-__all__ = [
-    "build_group_metadata",
-    "segment_group_context",
-]

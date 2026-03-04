@@ -417,17 +417,3 @@ def build_group_mappings(fragment_ids, segments_metadata, group_key="base_path")
     return group_names, group_name_to_idx, fragment_to_group_idx
 
 
-__all__ = [
-    "_require_dict",
-    "_read_gray",
-    "_parse_layer_range",
-    "_compute_selected_layer_indices",
-    "_clip_intensity_inplace",
-    "read_image_layers",
-    "_assert_bottom_right_pad_compatible_global",
-    "read_image_mask",
-    "read_image_fragment_mask",
-    "read_label_and_fragment_mask_for_shape",
-    "read_fragment_mask_for_shape",
-    "build_group_mappings",
-]

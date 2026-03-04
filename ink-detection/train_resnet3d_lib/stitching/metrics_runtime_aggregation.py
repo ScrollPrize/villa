@@ -185,9 +185,3 @@ def log_global_component_metrics(
             ] = ",".join(str(v) for v in q_ids)
 
 
-__all__ = [
-    "segment_group_index",
-    "collect_segment_stability_metrics",
-    "log_group_stability_metrics",
-    "log_global_component_metrics",
-]

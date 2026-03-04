@@ -148,18 +148,6 @@ def _apply_bool_fields(cfg, source, *, keys, parse_bool, key_prefix):
         setattr(cfg, key, parsed)
 
 
-def _apply_lower_fields(cfg, source, *, keys):
-    for key in keys:
-        if key not in source:
-            continue
-        setattr(cfg, key, str(source[key]).strip().lower())
-
-
-def _set_str_if_present(cfg, source, key):
-    if key in source:
-        setattr(cfg, key, str(source[key]))
-
-
 def _ensure_enum(value, *, key, allowed):
     if value not in allowed:
         raise ValueError(f"{key} must be one of {sorted(allowed)!r}, got {value!r}")
@@ -220,7 +208,10 @@ def apply_metadata_hyperparameters(
         key_prefix="training_hyperparameters.training",
     )
 
-    _apply_lower_fields(cfg, training_cfg, keys=TRAIN_CFG_LOWER)
+    for key in TRAIN_CFG_LOWER:
+        if key not in training_cfg:
+            continue
+        setattr(cfg, key, str(training_cfg[key]).strip().lower())
     _apply_scalar_fields(cfg, training_cfg, casts=TRAIN_CFG_SCALARS)
     _apply_bool_fields(
         cfg,
@@ -308,10 +299,14 @@ def apply_metadata_hyperparameters(
     else:
         cfg.cv_fold = normalize_cv_fold(cfg.cv_fold)
 
-    _set_str_if_present(cfg, training_cfg, "train_label_suffix")
-    _set_str_if_present(cfg, training_cfg, "train_mask_suffix")
-    _set_str_if_present(cfg, training_cfg, "val_label_suffix")
-    _set_str_if_present(cfg, training_cfg, "val_mask_suffix")
+    if "train_label_suffix" in training_cfg:
+        cfg.train_label_suffix = str(training_cfg["train_label_suffix"])
+    if "train_mask_suffix" in training_cfg:
+        cfg.train_mask_suffix = str(training_cfg["train_mask_suffix"])
+    if "val_label_suffix" in training_cfg:
+        cfg.val_label_suffix = str(training_cfg["val_label_suffix"])
+    if "val_mask_suffix" in training_cfg:
+        cfg.val_mask_suffix = str(training_cfg["val_mask_suffix"])
 
     if cfg.cv_fold is not None:
         fold_suffix = f"_{cfg.cv_fold}"

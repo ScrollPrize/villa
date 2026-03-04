@@ -1,4 +1,5 @@
 import os.path as osp
+from dataclasses import asdict
 
 import segmentation_models_pytorch as smp
 import torch
@@ -162,38 +163,18 @@ def _infer_encoder_dims(backbone):
 
 
 def _build_stitch_manager(stitch_cfg):
-    return StitchManager(
-        stitch_val_dataloader_idx=stitch_cfg.stitch_val_dataloader_idx,
-        stitch_pred_shape=stitch_cfg.stitch_pred_shape,
-        stitch_segment_id=stitch_cfg.stitch_segment_id,
-        stitch_all_val=bool(stitch_cfg.stitch_all_val),
-        stitch_downsample=int(stitch_cfg.stitch_downsample or 1),
-        stitch_all_val_shapes=stitch_cfg.stitch_all_val_shapes,
-        stitch_all_val_segment_ids=stitch_cfg.stitch_all_val_segment_ids,
-        stitch_train_shapes=stitch_cfg.stitch_train_shapes,
-        stitch_train_segment_ids=stitch_cfg.stitch_train_segment_ids,
-        stitch_use_roi=bool(stitch_cfg.stitch_use_roi),
-        stitch_val_bboxes=stitch_cfg.stitch_val_bboxes,
-        stitch_train_bboxes=stitch_cfg.stitch_train_bboxes,
-        stitch_log_only_shapes=stitch_cfg.stitch_log_only_shapes,
-        stitch_log_only_segment_ids=stitch_cfg.stitch_log_only_segment_ids,
-        stitch_log_only_bboxes=stitch_cfg.stitch_log_only_bboxes,
-        stitch_log_only_downsample=stitch_cfg.stitch_log_only_downsample,
-        stitch_log_only_every_n_epochs=int(stitch_cfg.stitch_log_only_every_n_epochs or 10),
-        stitch_train=bool(stitch_cfg.stitch_train),
-        stitch_train_every_n_epochs=int(stitch_cfg.stitch_train_every_n_epochs or 1),
-    )
+    return StitchManager(**asdict(stitch_cfg))
 
 
 def initialize_regression_state(model, *, model_cfg, objective_cfg, stitch_cfg):
-    model.objective = str(objective_cfg.objective).lower()
-    model.loss_mode = str(objective_cfg.loss_mode).lower()
-    model.loss_recipe = str(objective_cfg.loss_recipe).lower()
-    model.bce_smooth_factor = float(objective_cfg.bce_smooth_factor)
-    model.soft_label_positive = float(objective_cfg.soft_label_positive)
-    model.soft_label_negative = float(objective_cfg.soft_label_negative)
-    model.with_norm = bool(model_cfg.with_norm)
-    model.total_steps = int(model_cfg.total_steps)
+    model.objective = objective_cfg.objective.lower()
+    model.loss_mode = objective_cfg.loss_mode.lower()
+    model.loss_recipe = objective_cfg.loss_recipe.lower()
+    model.bce_smooth_factor = objective_cfg.bce_smooth_factor
+    model.soft_label_positive = objective_cfg.soft_label_positive
+    model.soft_label_negative = objective_cfg.soft_label_negative
+    model.with_norm = model_cfg.with_norm
+    model.total_steps = model_cfg.total_steps
 
     if model.loss_recipe not in {"dice_bce", "bce_only"}:
         raise ValueError(f"training.loss_recipe must be one of ['bce_only', 'dice_bce'], got {model.loss_recipe!r}")
@@ -259,8 +240,3 @@ def initialize_regression_state(model, *, model_cfg, objective_cfg, stitch_cfg):
 
     model._stitcher = _build_stitch_manager(stitch_cfg)
 
-
-__all__ = [
-    "save_regression_hyperparameters",
-    "initialize_regression_state",
-]

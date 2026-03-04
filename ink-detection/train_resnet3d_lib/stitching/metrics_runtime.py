@@ -149,4 +149,3 @@ def log_stitched_validation_metrics(
     return True
 
 
-__all__ = ["log_stitched_validation_metrics"]

@@ -67,8 +67,3 @@ class Decoder(nn.Module):
         return mask
 
 
-__all__ = [
-    "_pick_group_norm_groups",
-    "replace_batchnorm_with_groupnorm",
-    "Decoder",
-]

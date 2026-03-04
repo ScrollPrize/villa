@@ -1,6 +1,9 @@
+import os.path as osp
+
 from train_resnet3d_lib.config import CFG
 from train_resnet3d_lib import training as tr
 from train_resnet3d_lib.runtime import orchestration
+from train_resnet3d_lib.runtime import wandb_runtime
 from train_resnet3d_lib.datasets_builder import build_datasets
 
 
@@ -14,9 +17,12 @@ def parse_args():
 def main():
     args = parse_args()
     orchestration.log_startup(args)
-    base_config = orchestration.load_base_config(args)
-    preinit_overrides = orchestration.load_wandb_preinit_overrides()
-    wandb_logger = orchestration.init_wandb_logger(args, base_config, preinit_overrides=preinit_overrides)
+    base_config = orchestration.load_and_validate_base_config(
+        args.metadata_json,
+        base_dir=osp.dirname(orchestration.__file__),
+    )
+    preinit_overrides = wandb_runtime.load_wandb_preinit_overrides()
+    wandb_logger = wandb_runtime.init_wandb_logger(args, base_config, preinit_overrides=preinit_overrides)
     merged_config = orchestration.merge_config(
         base_config,
         wandb_logger,

@@ -243,10 +243,3 @@ class ZarrSegmentVolume:
         return patch
 
 
-__all__ = [
-    "_looks_like_zarr_store",
-    "resolve_segment_zarr_path",
-    "_ensure_zarr_v2",
-    "_from_uint16_to_uint8",
-    "ZarrSegmentVolume",
-]

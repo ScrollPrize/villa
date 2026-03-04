@@ -80,23 +80,6 @@ def log_startup(args):
         f"device_count={device_count}"
     )
 
-
-def load_base_config(args):
-    return load_and_validate_base_config(args.metadata_json, base_dir=os.path.dirname(__file__))
-
-
-def load_wandb_preinit_overrides():
-    return wandb_runtime.load_wandb_preinit_overrides()
-
-
-def init_wandb_logger(args, base_config, *, preinit_overrides=None):
-    return wandb_runtime.init_wandb_logger(
-        args,
-        base_config,
-        preinit_overrides=preinit_overrides,
-    )
-
-
 def merge_config(base_config, wandb_logger, args, *, preinit_overrides=None):
     merged_config = merge_config_with_overrides(base_config, preinit_overrides or {})
     wandb_overrides = {}
@@ -227,7 +210,7 @@ def prepare_runtime_state(
     log(f"dirs checkpoints={cfg.model_dir} logs={cfg.log_dir}")
     torch.set_float32_matmul_precision("medium")
 
-    run_state = {
+    return {
         "segments_metadata": segments_metadata,
         "fragment_ids": fragment_ids,
         "train_fragment_ids": train_fragment_ids,
@@ -247,11 +230,10 @@ def prepare_runtime_state(
         "run_id": run_id,
         "run_dir": run_dir,
     }
-    return {"run_state": run_state}
 
 
 def prepare_run(args, merged_config, wandb_logger):
-    prepared = prepare_runtime_state(
+    run_state = prepare_runtime_state(
         CFG,
         merged_config,
         valid_id=args.valid_id,
@@ -260,7 +242,6 @@ def prepare_run(args, merged_config, wandb_logger):
         init_ckpt_path=args.init_ckpt_path,
         resume_from_ckpt=args.resume_from_ckpt,
     )
-    run_state = prepared["run_state"]
     if wandb_logger is not None:
         if not isinstance(wandb_logger, LocalMetricsWandbLogger):
             raise TypeError(

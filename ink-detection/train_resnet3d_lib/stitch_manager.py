@@ -223,4 +223,3 @@ class StitchManager:
         reset_epoch_end_buffers(self, log_only_mode=bool(log_only_mode))
 
 
-__all__ = ["StitchManager"]

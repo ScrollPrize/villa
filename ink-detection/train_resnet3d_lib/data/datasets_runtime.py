@@ -113,6 +113,17 @@ def _validate_segment_data(segment_ids, volumes, masks=None):
             raise ValueError(f"Missing mask for segment={segment_id}")
 
 
+def _group_id_for_index(groups, idx):
+    if groups is None:
+        return 0
+    return int(groups[idx])
+
+
+def _prepare_xy_label_group_sample(image, label, xy, group_id, *, transform, cfg):
+    image, label = _apply_joint_transform(transform, image, label, cfg)
+    return image, label, xy, int(group_id)
+
+
 class CustomDataset(Dataset):
     def __init__(self, images, cfg, xyxys=None, labels=None, groups=None, transform=None):
         self.images = images
@@ -128,15 +139,16 @@ class CustomDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        group_id = 0
-        if self.groups is not None:
-            group_id = int(self.groups[idx])
+        group_id = _group_id_for_index(self.groups, idx)
         if self.xyxys is not None:
-            image = self.images[idx]
-            label = self.labels[idx]
-            xy = self.xyxys[idx]
-            image, label = _apply_joint_transform(self.transform, image, label, self.cfg)
-            return image, label, xy, group_id
+            return _prepare_xy_label_group_sample(
+                self.images[idx],
+                self.labels[idx],
+                self.xyxys[idx],
+                group_id,
+                transform=self.transform,
+                cfg=self.cfg,
+            )
         image = self.images[idx]
         label = self.labels[idx]
         image = _maybe_fourth_augment(image, self.cfg)
@@ -251,13 +263,19 @@ class LazyZarrXyLabelDataset(Dataset):
         segment_id = self.segment_ids[seg_idx]
         xy = self.sample_xyxys[idx]
         x1, y1, x2, y2 = _xy_to_bounds(xy)
-        group_id = int(self.sample_groups[idx])
+        group_id = _group_id_for_index(self.sample_groups, idx)
         bbox_idx = int(self.sample_bbox_indices[idx]) if self.sample_bbox_indices is not None else None
 
         image = self.volumes[segment_id].read_patch(y1, y2, x1, x2)
         label = _read_mask_patch(self.masks[segment_id], y1=y1, y2=y2, x1=x1, x2=x2, bbox_index=bbox_idx)[..., None]
-        image, label = _apply_joint_transform(self.transform, image, label, self.cfg)
-        return image, label, xy, group_id
+        return _prepare_xy_label_group_sample(
+            image,
+            label,
+            xy,
+            group_id,
+            transform=self.transform,
+            cfg=self.cfg,
+        )
 
 
 class LazyZarrXyOnlyDataset(Dataset):
@@ -299,13 +317,3 @@ class LazyZarrXyOnlyDataset(Dataset):
         return image, xy
 
 
-__all__ = [
-    "CustomDataset",
-    "CustomDatasetTest",
-    "LazyZarrTrainDataset",
-    "LazyZarrXyLabelDataset",
-    "LazyZarrXyOnlyDataset",
-    "_flatten_segment_patch_index",
-    "_init_flat_segment_index",
-    "_validate_segment_data",
-]
