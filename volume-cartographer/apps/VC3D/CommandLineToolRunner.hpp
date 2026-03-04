@@ -37,12 +37,17 @@ public:
         tifxyz2obj,
         obj2tifxyz,
         AlphaCompRefine,
-        NeighborCopy
+        NeighborCopy,
+        CustomCommand
     };
 
     void setVolumePath(const QString& path);
     void setSegmentPath(const QString& path);
     void setOutputPattern(const QString& pattern);
+
+    bool executeCustomCommand(const QString& command,
+                             const QStringList& args,
+                             const QString& label = QString());
 
     // tool specific params 
     void setRenderParams(float scale, int resolution, int layers);
@@ -150,6 +155,9 @@ private:
     bool _optAlignGrid{false};
 
     Tool _currentTool;
+    QString _customCommand;
+    QStringList _customArgs;
+    QString _customLabel;
 
     QFile* _logFile;
     QTextStream* _logStream;

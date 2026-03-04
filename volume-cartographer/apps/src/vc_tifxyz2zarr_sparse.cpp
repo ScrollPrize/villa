@@ -210,6 +210,11 @@ public:
 
     bool readChunkCoords(const ChunkIndex& chunk, std::vector<VoxelCoord32>& out) const {
         const auto file = spoolPathFor(chunk);
+        const size_t startSize = out.size();
+
+        size_t fileCount = 0;
+        size_t memCount = 0;
+
         if (fs::exists(file)) {
             std::ifstream in(file, std::ios::binary);
             if (!in) return false;
@@ -220,16 +225,16 @@ public:
                 throw std::runtime_error("invalid spool file size for chunk: " + file.string());
             }
             if (fileBytes > 0) {
-                in.seekg(0, std::ios::beg);
-                const size_t existing = out.size();
                 const size_t count = fileBytes / m_recordBytes;
-                out.resize(existing + count);
-                    std::vector<uint8_t> fileBuf(fileBytes);
-                    in.read(reinterpret_cast<char*>(fileBuf.data()),
-                            static_cast<std::streamsize>(fileBytes));
+                fileCount = count;
+                in.seekg(0, std::ios::beg);
+                std::vector<uint8_t> fileBuf(fileBytes);
+                in.read(reinterpret_cast<char*>(fileBuf.data()),
+                        static_cast<std::streamsize>(fileBytes));
                 if (!in) {
                     throw std::runtime_error("failed reading spool file: " + file.string());
                 }
+                out.reserve(startSize + fileCount + memCount);
                 unpackCoords(fileBuf, out);
             }
         }
@@ -238,9 +243,10 @@ public:
             std::lock_guard<std::mutex> lk(m_memoryMutex);
             const auto memIt = m_memorySpool.find(chunk);
             if (memIt != m_memorySpool.end() && !memIt->second.empty()) {
-                const size_t existing = out.size();
-                const size_t count = memIt->second.size() / m_recordBytes;
-                out.resize(existing + count);
+                memCount = memIt->second.size() / m_recordBytes;
+                if (memCount > 0) {
+                    out.reserve(startSize + fileCount + memCount);
+                }
                 unpackCoords(memIt->second.data(), memIt->second.size(), out);
             }
         }

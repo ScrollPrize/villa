@@ -2465,20 +2465,37 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
          << referenceZarr
          << QStringLiteral("--overwrite");
 
-    auto watcher = new QFutureWatcher<int>(this);
+    auto runner = _cmdRunner;
+    if (!runner) {
+        QMessageBox::critical(_parentWidget, tr("Error"),
+                              tr("Command runner is not available."));
+        std::filesystem::remove_all(tempRoot);
+        return;
+    }
+
     QPointer<SegmentationCommandHandler> guard(this);
-    QObject::connect(watcher, &QFutureWatcher<int>::finished, this, [this, guard, watcher, tempRootStr, outputRootStr,
-                                                                    validIds, segmentPaths]() {
+    auto connection = std::make_shared<QMetaObject::Connection>();
+    *connection = connect(runner, &CommandLineToolRunner::toolFinished,
+                         this,
+                         [this, guard, connection, runner, tempRootStr, outputRootStr,
+                          validIds, segmentPaths](CommandLineToolRunner::Tool tool,
+                                                  bool success,
+                                                  const QString& message,
+                                                  const QString&,
+                                                  bool) {
         if (!guard) {
-            watcher->deleteLater();
+            disconnect(*connection);
             return;
         }
+        if (tool != CommandLineToolRunner::Tool::CustomCommand) {
+            return;
+        }
+        disconnect(*connection);
 
-        const int exitCode = watcher->result();
-        if (exitCode != 0) {
+        if (!success) {
             QMessageBox::critical(_parentWidget, tr("Error"),
-                                  tr("vc_tifxyz2zarr_sparse failed with code %1")
-                                      .arg(exitCode));
+                                  tr("vc_tifxyz2zarr_sparse failed.\n%1")
+                                      .arg(message));
             emit statusMessage(tr("Rasterize failed"), 3000);
         } else if (!appendRasterizationMetadata(outputRootStr, validIds, segmentPaths)) {
             emit showWarning(tr("Warning"), tr("Rasterization completed but metadata update failed"));
@@ -2493,24 +2510,15 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
 
         std::error_code cleanupErr;
         std::filesystem::remove_all(std::filesystem::path(tempRootStr.toStdString()), cleanupErr);
-        watcher->deleteLater();
     });
 
-    watcher->setFuture(QtConcurrent::run([executable, args]() {
-        QProcess process;
-        process.setProgram(executable);
-        process.setArguments(args);
-        process.setProcessChannelMode(QProcess::MergedChannels);
-        process.start();
-        if (!process.waitForStarted()) {
-            return 1;
-        }
-        process.waitForFinished(-1);
-        if (process.exitStatus() != QProcess::NormalExit) {
-            return 1;
-        }
-        return process.exitCode();
-    }));
+    if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_tifxyz2zarr_sparse"))) {
+        QObject::disconnect(*connection);
+        QMessageBox::critical(_parentWidget, tr("Error"),
+                              tr("Failed to start vc_tifxyz2zarr_sparse."));
+        std::filesystem::remove_all(tempRoot);
+        return;
+    }
 
     emit statusMessage(
         tr("Rasterization started for %1 segment(s)...").arg(validIds.size()), 0);
