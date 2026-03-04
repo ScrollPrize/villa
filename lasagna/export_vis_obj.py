@@ -253,7 +253,7 @@ def _sample_slice_texture(data: fit_data.FitData3D, plane: str,
 	ch_np = ch_t.squeeze().detach().cpu().numpy()  # (tex_res, tex_res)
 	# Grayscale to RGB
 	gray = (np.clip(ch_np, 0, 1) * 255).astype(np.uint8)
-	return np.stack([gray, gray, gray], axis=-1)
+	return np.stack([gray, gray, gray], axis=-1)[::-1]
 
 
 def _slice_corners(plane: str, bbox_min: np.ndarray, bbox_max: np.ndarray,
