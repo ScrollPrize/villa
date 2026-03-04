@@ -37,6 +37,9 @@ TRAIN_HPARAM_SCALARS = {
     "max_clip_value": object,
     "normalization_mode": str,
     "max_grad_norm": float,
+    "bce_smooth_factor": float,
+    "soft_label_positive": float,
+    "soft_label_negative": float,
     "eval_threshold": float,
     "eval_topological_metrics_every_n_epochs": int,
     "eval_drd_block_size": int,
@@ -95,11 +98,13 @@ TRAIN_CFG_LOWER = {
     "sampler",
     "group_stratified_epoch_size_mode",
     "loss_mode",
+    "loss_recipe",
 }
 
 VALID_OBJECTIVES = {"erm", "group_dro"}
 VALID_SAMPLERS = {"shuffle", "group_balanced", "group_stratified"}
 VALID_LOSS_MODES = {"batch", "per_sample"}
+VALID_LOSS_RECIPES = {"dice_bce", "bce_only"}
 VALID_DATA_BACKENDS = {"zarr", "tiff"}
 
 
@@ -180,6 +185,13 @@ def _ensure_number_list(value, *, key):
             raise ValueError(f"{key}[{idx}] must be numeric, got {type(item).__name__}")
 
 
+def _ensure_float_range(value, *, key, min_value, max_value):
+    fvalue = float(value)
+    if fvalue < float(min_value) or fvalue > float(max_value):
+        raise ValueError(f"{key} must be in [{min_value}, {max_value}], got {fvalue}")
+    return fvalue
+
+
 def apply_metadata_hyperparameters(
     cfg,
     metadata,
@@ -224,9 +236,17 @@ def apply_metadata_hyperparameters(
     cfg.norm = str(cfg.norm).strip().lower()
     cfg.optimizer = str(cfg.optimizer).strip().lower()
     cfg.data_backend = str(cfg.data_backend).strip().lower()
+    cfg.loss_recipe = str(getattr(cfg, "loss_recipe", "dice_bce")).strip().lower()
+    cfg.bce_smooth_factor = float(getattr(cfg, "bce_smooth_factor", 0.25))
+    cfg.soft_label_positive = float(getattr(cfg, "soft_label_positive", 1.0))
+    cfg.soft_label_negative = float(getattr(cfg, "soft_label_negative", 0.0))
+    # Allow sweeps to vary only soft_label_positive while keeping pairs complementary.
+    if "soft_label_positive" in train_hp and "soft_label_negative" not in train_hp:
+        cfg.soft_label_negative = 1.0 - float(cfg.soft_label_positive)
     _ensure_enum(cfg.objective, key="training.objective", allowed=VALID_OBJECTIVES)
     _ensure_enum(cfg.sampler, key="training.sampler", allowed=VALID_SAMPLERS)
     _ensure_enum(cfg.loss_mode, key="training.loss_mode", allowed=VALID_LOSS_MODES)
+    _ensure_enum(cfg.loss_recipe, key="training.loss_recipe", allowed=VALID_LOSS_RECIPES)
     _ensure_enum(cfg.data_backend, key="training.data_backend", allowed=VALID_DATA_BACKENDS)
     _ensure_positive_int(cfg.train_batch_size, key="training_hyperparameters.training.train_batch_size")
     _ensure_positive_int(cfg.valid_batch_size, key="training_hyperparameters.training.valid_batch_size")
@@ -240,6 +260,30 @@ def apply_metadata_hyperparameters(
     stitch_log_only_segments = getattr(cfg, "stitch_log_only_segments", [])
     if not isinstance(stitch_log_only_segments, list):
         raise ValueError("training.stitch_log_only_segments must be a list")
+
+    cfg.bce_smooth_factor = _ensure_float_range(
+        cfg.bce_smooth_factor,
+        key="training_hyperparameters.training.bce_smooth_factor",
+        min_value=0.0,
+        max_value=0.5,
+    )
+    cfg.soft_label_positive = _ensure_float_range(
+        cfg.soft_label_positive,
+        key="training_hyperparameters.training.soft_label_positive",
+        min_value=0.0,
+        max_value=1.0,
+    )
+    cfg.soft_label_negative = _ensure_float_range(
+        cfg.soft_label_negative,
+        key="training_hyperparameters.training.soft_label_negative",
+        min_value=0.0,
+        max_value=1.0,
+    )
+    if cfg.soft_label_positive <= cfg.soft_label_negative:
+        raise ValueError(
+            "training_hyperparameters.training.soft_label_positive must be greater than "
+            f"soft_label_negative, got {cfg.soft_label_positive} <= {cfg.soft_label_negative}"
+        )
 
     cfg.max_clip_value = parse_optional_positive_int(
         cfg.max_clip_value,

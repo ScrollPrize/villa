@@ -14,6 +14,7 @@ This folder is organized by workflow concern so common iteration loops are easy 
 - **Model architecture blocks (decoder/norm conversion)**: `modeling/architecture.py`
 - **Per-sample losses**: `modeling/losses.py`
 - **Model/objective config wiring**: `modeling/model_config.py`
+- **Loss recipe + soft-label controls from metadata**: `config_metadata_apply.py`, `modeling/runtime_init.py`
 - **GroupDRO logic**: `modeling/group_dro.py`
 - **Metadata -> CFG application**: `config_metadata_apply.py`
 - **Augmentations + normalization transforms**: `data/augmentations.py`
@@ -36,4 +37,3 @@ This folder is organized by workflow concern so common iteration loops are easy 
 - **Stitch manager init/runtime helpers**: `stitching/manager_setup.py`, `stitching/manager_runtime.py`
 - **Stitch metrics config + aggregation helpers**: `stitching/metrics_runtime_config.py`, `stitching/metrics_runtime_aggregation.py`
 - **Run/orchestration/W&B/checkpoint runtime**: `runtime/`
-

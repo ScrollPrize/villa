@@ -1,0 +1,68 @@
+program: train_resnet3d.py
+project: ink-2um-experiments
+entity: vesuvius-challenge
+method: grid
+
+metric:
+  name: val/worst_group_loss_ema.min
+  goal: minimize
+
+parameters:
+  training.objective:
+    value: erm
+  training.loss_mode:
+    value: batch
+  training.loss_recipe:
+    value: bce_only
+  training.sampler:
+    value: shuffle
+  training.cv_fold:
+    value: 0
+  training.train_segments:
+    value:
+      - "20250806145318"
+      - "l2_0_crop"
+      - "658"
+      - "500p2a"
+      - "-1"
+      - "20250910185200"
+      - "20250919125754-auto_grown_20250919055754487_inp_hr"
+  training.val_segments:
+    value:
+      - "20250806145318"
+      - "l2_0_crop"
+      - "658"
+      - "500p2a"
+      - "-1"
+      - "20250910185200"
+      - "20250919125754-auto_grown_20250919055754487_inp_hr"
+
+  training_hyperparameters.training.accumulate_grad_batches:
+    value: 1
+  training_hyperparameters.training.epochs:
+    value: 30
+  training_hyperparameters.training.normalization_mode:
+    value: clip_max_div255
+  training_hyperparameters.training.lr:
+    value: 1.17e-04
+  training_hyperparameters.training.weight_decay:
+    value: 1.54e-04
+  training_hyperparameters.training.bce_smooth_factor:
+    value: 0.0
+  training_hyperparameters.training.soft_label_positive:
+    values: [0.75, 0.8, 0.85, 0.9, 0.95]
+
+  wandb.tags:
+    value:
+      - ink-2um
+      - erm
+      - shuffle
+      - bce_only
+      - soft_labels
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --metadata_json
+  - metadata.json

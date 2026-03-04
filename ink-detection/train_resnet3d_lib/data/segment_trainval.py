@@ -86,7 +86,7 @@ def load_train_segment(
         mask,
         fragment_mask,
         include_xyxys=include_train_xyxys,
-        filter_empty_tile=True,
+        filter_empty_tile=False,
     )
     log(f"patches train segment={fragment_id} n={len(frag_train_images)} in {time.time() - t1:.1f}s")
     patch_count = int(len(frag_train_images))
@@ -160,7 +160,7 @@ def load_train_segment_lazy(
         fragment_mask,
         fragment_id=sid,
         split_name="train",
-        filter_empty_tile=True,
+        filter_empty_tile=False,
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
     )

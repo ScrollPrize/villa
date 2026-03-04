@@ -50,6 +50,24 @@ def summarize_patch_counts(split_name, fragment_ids_list, counts_by_segment, *, 
     log(f"{split_name} patch counts by group {counts_by_group}")
 
 
+def _validate_group_universe_for_objective(group_names, train_group_counts):
+    zero_groups = [
+        str(group_name)
+        for group_name, group_count in zip(group_names, train_group_counts)
+        if int(group_count) <= 0
+    ]
+    if not zero_groups:
+        return
+    log(f"train groups with zero patches: {zero_groups}")
+    objective = str(getattr(CFG, "objective", "erm")).strip().lower()
+    if objective == "group_dro":
+        raise ValueError(
+            "training.objective=group_dro requires every configured group to have at least one training patch; "
+            f"found zero-patch groups: {zero_groups}. "
+            "Check effective training.train_segments/sweep overrides and segment masks."
+        )
+
+
 def _collect_train_segments(train_fragment_ids, *, load_train_fn, consume_train_fn):
     train_patch_counts_by_segment = {}
     train_mask_borders = {}
@@ -105,6 +123,7 @@ def _build_train_loader_from_dataset(train_dataset, train_groups, group_names):
     group_counts = torch.bincount(group_array, minlength=len(group_names)).float()
     train_group_counts = [int(x) for x in group_counts.tolist()]
     log(f"train group counts {dict(zip(group_names, train_group_counts))}")
+    _validate_group_universe_for_objective(group_names, train_group_counts)
 
     if CFG.sampler == "shuffle":
         train_sampler = None
@@ -209,6 +228,58 @@ def _load_with_group_context(fragment_id, *, segments_metadata, fragment_to_grou
         group_names,
     )
     return loader_fn(fragment_id, seg_meta, group_idx, group_name, **kwargs)
+
+
+def _segment_group_name(*, segments_metadata, fragment_id, group_key):
+    if fragment_id not in segments_metadata:
+        raise KeyError(f"segments metadata missing segment id: {fragment_id!r}")
+    seg_meta = segments_metadata[fragment_id]
+    if not isinstance(seg_meta, dict):
+        raise TypeError(
+            f"segments[{fragment_id!r}] must be an object, got {type(seg_meta).__name__}"
+        )
+    if group_key not in seg_meta:
+        raise KeyError(f"segments[{fragment_id!r}] missing required group key {group_key!r}")
+    return str(seg_meta[group_key])
+
+
+def _build_group_metadata_for_active_splits(
+    *,
+    segments_metadata,
+    train_fragment_ids,
+    val_fragment_ids,
+    log_only_segments,
+    group_key,
+):
+    group_names, fragment_to_group_idx = build_group_metadata(
+        train_fragment_ids,
+        segments_metadata,
+        group_key,
+    )
+    group_name_to_idx = {str(name): int(idx) for idx, name in enumerate(group_names)}
+
+    def _assign_if_needed(fragment_id, *, split_name):
+        if fragment_id in fragment_to_group_idx:
+            return
+        group_name = _segment_group_name(
+            segments_metadata=segments_metadata,
+            fragment_id=fragment_id,
+            group_key=group_key,
+        )
+        if group_name not in group_name_to_idx:
+            raise ValueError(
+                f"{split_name} segment {fragment_id!r} belongs to group {group_name!r}, "
+                "which is not represented in training.train_segments. "
+                "Group-based logging/objectives require every active split group to appear in train."
+            )
+        fragment_to_group_idx[fragment_id] = int(group_name_to_idx[group_name])
+
+    for fragment_id in val_fragment_ids:
+        _assign_if_needed(fragment_id, split_name="validation")
+    for fragment_id in log_only_segments:
+        _assign_if_needed(fragment_id, split_name="stitch_log_only")
+
+    return group_names, fragment_to_group_idx
 
 
 def _build_state(
@@ -546,16 +617,19 @@ def _build_tiff_datasets(
 
 def build_datasets(run_state):
     segments_metadata = run_state["segments_metadata"]
-    fragment_ids = run_state["fragment_ids"]
     train_fragment_ids = run_state["train_fragment_ids"]
     val_fragment_ids = run_state["val_fragment_ids"]
     group_key = run_state["group_key"]
+    log_only_segments = [str(x) for x in (getattr(CFG, "stitch_log_only_segments", []) or [])]
 
-    group_names, fragment_to_group_idx = build_group_metadata(
-        fragment_ids,
-        segments_metadata,
-        group_key,
+    group_names, fragment_to_group_idx = _build_group_metadata_for_active_splits(
+        segments_metadata=segments_metadata,
+        train_fragment_ids=train_fragment_ids,
+        val_fragment_ids=val_fragment_ids,
+        log_only_segments=log_only_segments,
+        group_key=group_key,
     )
+    log(f"group universe n_groups={len(group_names)} groups={group_names}")
     group_idx_by_segment = {str(fragment_id): int(group_idx) for fragment_id, group_idx in fragment_to_group_idx.items()}
 
     train_label_suffix = getattr(CFG, "train_label_suffix", "")
@@ -589,7 +663,6 @@ def build_datasets(run_state):
 
     train_transform = get_transforms(data="train", cfg=CFG)
     valid_transform = get_transforms(data="valid", cfg=CFG)
-    log_only_segments = list(getattr(CFG, "stitch_log_only_segments", []) or [])
     log_only_downsample = int(getattr(CFG, "stitch_log_only_downsample", getattr(CFG, "stitch_downsample", 1)))
 
     if data_backend == "zarr":

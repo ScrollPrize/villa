@@ -23,6 +23,10 @@ class ModelConfig:
 class ObjectiveConfig:
     objective: str
     loss_mode: str
+    loss_recipe: str
+    bce_smooth_factor: float
+    soft_label_positive: float
+    soft_label_negative: float
     robust_step_size: float | None
     group_counts: list[int]
     group_dro_gamma: float
@@ -116,6 +120,10 @@ def coerce_objective_config(objective_cfg):
     return ObjectiveConfig(
         objective=str(data.get("objective", "erm")),
         loss_mode=str(data.get("loss_mode", "batch")),
+        loss_recipe=str(data.get("loss_recipe", "dice_bce")).lower(),
+        bce_smooth_factor=float(data.get("bce_smooth_factor", 0.25)),
+        soft_label_positive=float(data.get("soft_label_positive", 1.0)),
+        soft_label_negative=float(data.get("soft_label_negative", 0.0)),
         robust_step_size=data.get("robust_step_size"),
         group_counts=[int(x) for x in list(data.get("group_counts") or [])],
         group_dro_gamma=float(data.get("group_dro_gamma", 0.1)),
@@ -201,6 +209,10 @@ def build_regression_model_configs(run_state: dict[str, Any], data_state: dict[s
     objective_cfg = ObjectiveConfig(
         objective=str(getattr(CFG, "objective", "erm")),
         loss_mode=str(getattr(CFG, "loss_mode", "batch")),
+        loss_recipe=str(getattr(CFG, "loss_recipe", "dice_bce")).lower(),
+        bce_smooth_factor=float(getattr(CFG, "bce_smooth_factor", 0.25)),
+        soft_label_positive=float(getattr(CFG, "soft_label_positive", 1.0)),
+        soft_label_negative=float(getattr(CFG, "soft_label_negative", 0.0)),
         robust_step_size=run_state["robust_step_size"],
         group_counts=list(data_state["train_group_counts"]),
         group_dro_gamma=float(run_state["group_dro_gamma"]),

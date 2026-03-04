@@ -95,6 +95,10 @@ class CFG:
     sampler = "shuffle"  # "shuffle" | "group_balanced" | "group_stratified"
     group_stratified_epoch_size_mode = "dataset"  # "dataset" | "min_group"
     loss_mode = "batch"  # "batch" | "per_sample"
+    loss_recipe = "dice_bce"  # "dice_bce" | "bce_only"
+    bce_smooth_factor = 0.25
+    soft_label_positive = 1.0
+    soft_label_negative = 0.0
     erm_group_topk = 0  # if >0 and objective=erm+per_sample: optimize mean(worst-k group losses) per batch
     save_every_epoch = False
     save_every_n_epochs = 1

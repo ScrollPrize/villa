@@ -27,6 +27,10 @@ def save_regression_hyperparameters(model, *, model_cfg, objective_cfg, stitch_c
             "objective_cfg": {
                 "objective": str(objective_cfg.objective),
                 "loss_mode": str(objective_cfg.loss_mode),
+                "loss_recipe": str(objective_cfg.loss_recipe),
+                "bce_smooth_factor": float(objective_cfg.bce_smooth_factor),
+                "soft_label_positive": float(objective_cfg.soft_label_positive),
+                "soft_label_negative": float(objective_cfg.soft_label_negative),
                 "robust_step_size": objective_cfg.robust_step_size,
                 "group_counts": list(objective_cfg.group_counts),
                 "group_dro_gamma": float(objective_cfg.group_dro_gamma),
@@ -184,8 +188,35 @@ def _build_stitch_manager(stitch_cfg):
 def initialize_regression_state(model, *, model_cfg, objective_cfg, stitch_cfg):
     model.objective = str(objective_cfg.objective).lower()
     model.loss_mode = str(objective_cfg.loss_mode).lower()
+    model.loss_recipe = str(objective_cfg.loss_recipe).lower()
+    model.bce_smooth_factor = float(objective_cfg.bce_smooth_factor)
+    model.soft_label_positive = float(objective_cfg.soft_label_positive)
+    model.soft_label_negative = float(objective_cfg.soft_label_negative)
     model.with_norm = bool(model_cfg.with_norm)
     model.total_steps = int(model_cfg.total_steps)
+
+    if model.loss_recipe not in {"dice_bce", "bce_only"}:
+        raise ValueError(f"training.loss_recipe must be one of ['bce_only', 'dice_bce'], got {model.loss_recipe!r}")
+    if not (0.0 <= model.bce_smooth_factor <= 0.5):
+        raise ValueError(
+            "training_hyperparameters.training.bce_smooth_factor must be in [0.0, 0.5], "
+            f"got {model.bce_smooth_factor}"
+        )
+    if not (0.0 <= model.soft_label_positive <= 1.0):
+        raise ValueError(
+            "training_hyperparameters.training.soft_label_positive must be in [0.0, 1.0], "
+            f"got {model.soft_label_positive}"
+        )
+    if not (0.0 <= model.soft_label_negative <= 1.0):
+        raise ValueError(
+            "training_hyperparameters.training.soft_label_negative must be in [0.0, 1.0], "
+            f"got {model.soft_label_negative}"
+        )
+    if model.soft_label_positive <= model.soft_label_negative:
+        raise ValueError(
+            "training_hyperparameters.training.soft_label_positive must be greater than soft_label_negative, "
+            f"got {model.soft_label_positive} <= {model.soft_label_negative}"
+        )
 
     model.n_groups = int(model_cfg.n_groups)
     model.group_names = list(model_cfg.group_names)
@@ -211,7 +242,6 @@ def initialize_regression_state(model, *, model_cfg, objective_cfg, stitch_cfg):
     model._val_eval_metrics = None
 
     model.loss_func1 = smp.losses.DiceLoss(mode="binary")
-    model.loss_func2 = smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
 
     model.backbone = _build_backbone_with_optional_pretrained(model_cfg=model_cfg)
 

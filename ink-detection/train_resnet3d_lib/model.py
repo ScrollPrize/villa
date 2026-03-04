@@ -6,7 +6,7 @@ from train_resnet3d_lib.modeling.architecture import (
     _pick_group_norm_groups,
     replace_batchnorm_with_groupnorm,
 )
-from train_resnet3d_lib.modeling.losses import compute_per_sample_loss_and_dice
+from train_resnet3d_lib.modeling.losses import build_bce_targets, compute_per_sample_loss_and_dice
 from train_resnet3d_lib.modeling.model_config import (
     ModelConfig,
     ObjectiveConfig,
@@ -96,7 +96,22 @@ class RegressionPLModel(pl.LightningModule):
         return pred_mask
 
     def compute_per_sample_loss_and_dice(self, logits, targets):
-        return compute_per_sample_loss_and_dice(logits, targets)
+        return compute_per_sample_loss_and_dice(
+            logits,
+            targets,
+            loss_recipe=self.loss_recipe,
+            smooth_factor=self.bce_smooth_factor,
+            soft_label_positive=self.soft_label_positive,
+            soft_label_negative=self.soft_label_negative,
+        )
+
+    def build_bce_targets(self, targets):
+        return build_bce_targets(
+            targets,
+            smooth_factor=self.bce_smooth_factor,
+            soft_label_positive=self.soft_label_positive,
+            soft_label_negative=self.soft_label_negative,
+        )
 
     def training_step(self, batch, batch_idx):
         x, y, group_idx = batch

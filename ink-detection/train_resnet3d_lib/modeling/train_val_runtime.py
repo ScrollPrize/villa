@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from metrics import StreamingBinarySegmentationMetrics
 from train_resnet3d_lib.config import CFG
@@ -136,13 +137,21 @@ def compute_objective_loss(
 ):
     objective = str(model.objective).lower()
     loss_mode = str(model.loss_mode).lower()
+    loss_recipe = str(getattr(model, "loss_recipe", "dice_bce")).lower()
     group_idx = group_idx.long()
 
     if objective == "erm":
         if loss_mode == "batch":
-            dice_loss = model.loss_func1(outputs, targets)
-            bce_loss = model.loss_func2(outputs, targets)
-            loss = 0.5 * dice_loss + 0.5 * bce_loss
+            bce_targets = model.build_bce_targets(targets)
+            bce_loss = F.binary_cross_entropy_with_logits(outputs, bce_targets)
+            if loss_recipe == "dice_bce":
+                dice_loss = model.loss_func1(outputs, targets)
+                loss = 0.5 * dice_loss + 0.5 * bce_loss
+            elif loss_recipe == "bce_only":
+                dice_loss = per_sample_dice_loss.mean()
+                loss = bce_loss
+            else:
+                raise ValueError(f"Unknown training.loss_recipe: {model.loss_recipe!r}")
             model.log("train/dice_loss", dice_loss, on_step=True, on_epoch=True, prog_bar=False)
             model.log("train/bce_loss", bce_loss, on_step=True, on_epoch=True, prog_bar=False)
             return loss

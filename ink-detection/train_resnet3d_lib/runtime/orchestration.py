@@ -126,11 +126,11 @@ def prepare_runtime_state(
     segments_metadata = dict(merged_config["segments"])
     if not segments_metadata:
         raise ValueError("metadata_json must define at least one segment under key 'segments'")
-    fragment_ids = list(segments_metadata.keys())
+    fragment_ids = [str(fragment_id) for fragment_id in segments_metadata.keys()]
 
     training_cfg = dict(merged_config["training"])
-    train_fragment_ids = list(training_cfg.get("train_segments") or fragment_ids)
-    val_fragment_ids = list(training_cfg.get("val_segments") or fragment_ids)
+    train_fragment_ids = [str(fragment_id) for fragment_id in list(training_cfg.get("train_segments") or fragment_ids)]
+    val_fragment_ids = [str(fragment_id) for fragment_id in list(training_cfg.get("val_segments") or fragment_ids)]
     stitch_target = "all" if bool(getattr(cfg, "stitch_all_val", False)) else str(cfg.valid_id)
     log(
         "segments "
@@ -144,6 +144,8 @@ def prepare_runtime_state(
         raise ValueError(f"training.train_segments contains unknown segment ids: {missing_train}")
     if missing_val:
         raise ValueError(f"training.val_segments contains unknown segment ids: {missing_val}")
+    log(f"segments train_ids={train_fragment_ids}")
+    log(f"segments val_ids={val_fragment_ids}")
 
     group_dro_cfg = dict(merged_config["group_dro"])
     group_key = group_dro_cfg["group_key"]
@@ -187,6 +189,8 @@ def prepare_runtime_state(
 
     if valid_id is not None:
         cfg.valid_id = valid_id
+    if cfg.valid_id is not None:
+        cfg.valid_id = str(cfg.valid_id)
     if cfg.valid_id is None and val_fragment_ids:
         cfg.valid_id = val_fragment_ids[0]
     if cfg.valid_id not in val_fragment_ids and val_fragment_ids:
