@@ -110,22 +110,6 @@ def build_data_state(
     }
 
 
-def _build_group_metadata(fragment_ids, segments_metadata, group_key):
-    group_names, _group_name_to_idx, fragment_to_group_idx = build_group_mappings(
-        fragment_ids,
-        segments_metadata,
-        group_key=group_key,
-    )
-    return group_names, fragment_to_group_idx
-
-
-def _segment_group_context(fragment_id, segments_metadata, fragment_to_group_idx, group_names):
-    seg_meta = _segment_meta(segments_metadata, fragment_id)
-    group_idx = int(fragment_to_group_idx[fragment_id])
-    group_name = group_names[group_idx] if group_idx < len(group_names) else str(group_idx)
-    return seg_meta, group_idx, group_name
-
-
 def summarize_patch_counts(split_name, fragment_ids_list, counts_by_segment, *, group_names, fragment_to_group_idx):
     total = int(sum(int(counts_by_segment.get(fid, 0)) for fid in fragment_ids_list))
     counts_by_group = {name: 0 for name in group_names}
@@ -315,26 +299,10 @@ def log_training_budget(train_loader):
 
 
 def _load_with_group_context(fragment_id, *, segments_metadata, fragment_to_group_idx, group_names, loader_fn, **kwargs):
-    seg_meta, group_idx, group_name = _segment_group_context(
-        fragment_id,
-        segments_metadata,
-        fragment_to_group_idx,
-        group_names,
-    )
+    seg_meta = _segment_meta(segments_metadata, fragment_id)
+    group_idx = int(fragment_to_group_idx[fragment_id])
+    group_name = group_names[group_idx] if group_idx < len(group_names) else str(group_idx)
     return loader_fn(fragment_id, seg_meta, group_idx, group_name, **kwargs)
-
-
-def _segment_group_name(*, segments_metadata, fragment_id, group_key):
-    if fragment_id not in segments_metadata:
-        raise KeyError(f"segments metadata missing segment id: {fragment_id!r}")
-    seg_meta = segments_metadata[fragment_id]
-    if not isinstance(seg_meta, dict):
-        raise TypeError(
-            f"segments[{fragment_id!r}] must be an object, got {type(seg_meta).__name__}"
-        )
-    if group_key not in seg_meta:
-        raise KeyError(f"segments[{fragment_id!r}] missing required group key {group_key!r}")
-    return str(seg_meta[group_key])
 
 
 def _build_group_metadata_for_active_splits(
@@ -345,21 +313,26 @@ def _build_group_metadata_for_active_splits(
     log_only_segments,
     group_key,
 ):
-    group_names, fragment_to_group_idx = _build_group_metadata(
+    group_names, _group_name_to_idx, fragment_to_group_idx = build_group_mappings(
         train_fragment_ids,
         segments_metadata,
-        group_key,
+        group_key=group_key,
     )
     group_name_to_idx = {str(name): int(idx) for idx, name in enumerate(group_names)}
 
     def _assign_if_needed(fragment_id, *, split_name):
         if fragment_id in fragment_to_group_idx:
             return
-        group_name = _segment_group_name(
-            segments_metadata=segments_metadata,
-            fragment_id=fragment_id,
-            group_key=group_key,
-        )
+        if fragment_id not in segments_metadata:
+            raise KeyError(f"segments metadata missing segment id: {fragment_id!r}")
+        seg_meta = segments_metadata[fragment_id]
+        if not isinstance(seg_meta, dict):
+            raise TypeError(
+                f"segments[{fragment_id!r}] must be an object, got {type(seg_meta).__name__}"
+            )
+        if group_key not in seg_meta:
+            raise KeyError(f"segments[{fragment_id!r}] missing required group key {group_key!r}")
+        group_name = str(seg_meta[group_key])
         if group_name not in group_name_to_idx:
             raise ValueError(
                 f"{split_name} segment {fragment_id!r} belongs to group {group_name!r}, "
