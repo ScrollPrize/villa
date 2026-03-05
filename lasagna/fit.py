@@ -14,6 +14,7 @@ import cli_model
 import cli_opt
 import fit_data
 import model
+import opt_loss_corr
 import optimizer
 
 
@@ -57,6 +58,55 @@ def _arc_params_from_bbox(
 		"arc_angle1": seed_angle + half_angle,
 		"z_center": seed_cz,
 	}
+
+
+def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D | None:
+	"""Parse a VC3D corr_points collections dict into CorrPoints3D."""
+	cols = obj.get("collections", {})
+	if not isinstance(cols, dict):
+		return None
+	rows: list[list[float]] = []
+	cids: list[int] = []
+	pids: list[int] = []
+	for _cid, col in cols.items():
+		if not isinstance(col, dict):
+			continue
+		md = col.get("metadata", {})
+		if not isinstance(md, dict):
+			md = {}
+		if bool(md.get("winding_is_absolute", True)):
+			continue
+		pts = col.get("points", {})
+		if not isinstance(pts, dict):
+			continue
+		try:
+			cid_i = int(_cid)
+		except Exception:
+			cid_i = -1
+		for _pid, pd in pts.items():
+			if not isinstance(pd, dict) or "wind_a" not in pd:
+				continue
+			wa = pd["wind_a"]
+			if wa is None:
+				continue
+			pv = pd.get("p", None)
+			if not isinstance(pv, (list, tuple)) or len(pv) < 3:
+				continue
+			try:
+				pid_i = int(_pid)
+			except Exception:
+				pid_i = -1
+			rows.append([float(pv[0]), float(pv[1]), float(pv[2]), float(wa)])
+			cids.append(cid_i)
+			pids.append(pid_i)
+	if not rows:
+		return None
+	pts_t = torch.tensor(rows, dtype=torch.float32, device=device)
+	col_t = torch.tensor(cids, dtype=torch.int64, device=device)
+	pid_t = torch.tensor(pids, dtype=torch.int64, device=device)
+	print(f"[fit] loaded {pts_t.shape[0]} corr_points from config "
+		  f"({len(set(cids))} collections)")
+	return fit_data.CorrPoints3D(points_xyz_winda=pts_t, collection_idx=col_t, point_ids=pid_t)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -163,6 +213,12 @@ def main(argv: list[str] | None = None) -> int:
 	print(f"Model3D: depth={mdl.depth} mesh_h={mdl.mesh_h} mesh_w={mdl.mesh_w} "
 		  f"arc_enabled={mdl.arc_enabled}")
 
+	# Parse correction points from config (injected by VC3D)
+	corr_points_obj = cfg.pop("corr_points", None)
+	corr_points_3d: fit_data.CorrPoints3D | None = None
+	if isinstance(corr_points_obj, dict):
+		corr_points_3d = _parse_corr_points(corr_points_obj, device)
+
 	# --- Data loading (with auto-crop, blur, and reload support) ---
 	def _load_data() -> fit_data.FitData3D:
 		d = fit_data.load_3d_for_model(
@@ -178,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
 			d.origin_fullres[2] + (Z - 1) * d.spacing[2],
 		)
 		mdl.params = dataclasses.replace(mdl.params, volume_extent=volume_extent)
+		if corr_points_3d is not None:
+			d = dataclasses.replace(d, corr_points=corr_points_3d)
 		return d
 
 	data = _load_data()
@@ -200,6 +258,9 @@ def main(argv: list[str] | None = None) -> int:
 		st = dict(mdl.state_dict())
 		st["_model_params_"] = asdict(mdl.params)
 		st["_fit_config_"] = fit_config
+		corr_results = opt_loss_corr.get_last_results()
+		if corr_results is not None:
+			st["_corr_points_results_"] = corr_results
 		torch.save(st, path)
 
 	def _snapshot(*, stage: str, step: int, loss: float, data, res=None) -> None:

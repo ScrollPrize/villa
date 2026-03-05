@@ -14,6 +14,7 @@ import zarr
 class CorrPoints3D:
 	points_xyz_winda: torch.Tensor  # (K, 4) — x, y, z, winda in fullres
 	collection_idx: torch.Tensor    # (K,) — integer collection ID per point
+	point_ids: torch.Tensor         # (K,) — integer point ID per point
 
 
 @dataclass(frozen=True)

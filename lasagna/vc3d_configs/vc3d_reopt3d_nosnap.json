@@ -10,7 +10,7 @@
 	"stages": [
 		{
 			"name": "reopt",
-			"steps": 5000,
+			"steps": 1000,
 			"min_scaledown": 0,
 			"lr": [0.1, 0.01, 0.001],
 			"params": ["mesh_ms"]

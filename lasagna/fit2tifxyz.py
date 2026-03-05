@@ -105,6 +105,9 @@ def main(argv: list[str] | None = None) -> int:
 	fit_config = st.get("_fit_config_", None)
 	if not isinstance(fit_config, dict):
 		fit_config = None
+	corr_points_results = st.get("_corr_points_results_", None)
+	if not isinstance(corr_points_results, dict):
+		corr_points_results = None
 
 	# Reconstruct mesh (3, D, Hm, Wm) — pyramid stores full xyz positions
 	mdl = model.Model3D.from_checkpoint(st, device=dev)
@@ -146,6 +149,8 @@ def main(argv: list[str] | None = None) -> int:
 					  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config)
 		if model_params is not None:
 			(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
+		if corr_points_results is not None:
+			(out_dir / "corr_points_results.json").write_text(json.dumps(corr_points_results, indent=2) + "\n", encoding="utf-8")
 	else:
 		# One tifxyz per depth layer (winding)
 		for d in range(D):
@@ -157,6 +162,8 @@ def main(argv: list[str] | None = None) -> int:
 						  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config)
 			if model_params is not None:
 				(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
+			if corr_points_results is not None:
+				(out_dir / "corr_points_results.json").write_text(json.dumps(corr_points_results, indent=2) + "\n", encoding="utf-8")
 
 	return 0
 
