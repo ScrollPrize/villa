@@ -16,6 +16,77 @@ from train_resnet3d_lib.stitching.roi_layout import allocate_segment_buffers, bu
 from train_resnet3d_lib.stitching.wandb_media import log_stitched_wandb_media
 
 
+def _coerce_shape_tuple(value, *, key):
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{key} must be a 2-element sequence, got {value!r}")
+    return int(value[0]), int(value[1])
+
+
+def _coerce_shape_list(value, *, key):
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{key} must be a list of 2-element sequences")
+    out = []
+    for idx, item in enumerate(value):
+        out.append(_coerce_shape_tuple(item, key=f"{key}[{idx}]"))
+    return out
+
+
+def coerce_stitch_manager_state(data):
+    downsample = max(1, int(data.get("stitch_downsample", 1) or 1))
+    return {
+        "stitch_val_dataloader_idx": (
+            None
+            if data.get("stitch_val_dataloader_idx") is None
+            else int(data["stitch_val_dataloader_idx"])
+        ),
+        "stitch_pred_shape": _coerce_shape_tuple(
+            data.get("stitch_pred_shape"),
+            key="model_state.stitch_pred_shape",
+        ),
+        "stitch_segment_id": (
+            None if data.get("stitch_segment_id") is None else str(data["stitch_segment_id"])
+        ),
+        "stitch_all_val": bool(data.get("stitch_all_val", False)),
+        "stitch_downsample": downsample,
+        "stitch_all_val_shapes": _coerce_shape_list(
+            data.get("stitch_all_val_shapes"),
+            key="model_state.stitch_all_val_shapes",
+        ),
+        "stitch_all_val_segment_ids": [str(x) for x in (data.get("stitch_all_val_segment_ids") or [])],
+        "stitch_train_shapes": _coerce_shape_list(
+            data.get("stitch_train_shapes"),
+            key="model_state.stitch_train_shapes",
+        ),
+        "stitch_train_segment_ids": [str(x) for x in (data.get("stitch_train_segment_ids") or [])],
+        "stitch_use_roi": bool(data.get("stitch_use_roi", False)),
+        "stitch_val_bboxes": dict(data.get("stitch_val_bboxes") or {}),
+        "stitch_train_bboxes": dict(data.get("stitch_train_bboxes") or {}),
+        "stitch_log_only_shapes": _coerce_shape_list(
+            data.get("stitch_log_only_shapes"),
+            key="model_state.stitch_log_only_shapes",
+        ),
+        "stitch_log_only_segment_ids": [str(x) for x in (data.get("stitch_log_only_segment_ids") or [])],
+        "stitch_log_only_bboxes": dict(data.get("stitch_log_only_bboxes") or {}),
+        "stitch_log_only_downsample": max(
+            1,
+            int(data.get("stitch_log_only_downsample", downsample) or downsample),
+        ),
+        "stitch_log_only_every_n_epochs": max(
+            1,
+            int(data.get("stitch_log_only_every_n_epochs", 10) or 10),
+        ),
+        "stitch_train": bool(data.get("stitch_train", False)),
+        "stitch_train_every_n_epochs": max(
+            1,
+            int(data.get("stitch_train_every_n_epochs", 1) or 1),
+        ),
+    }
+
+
 def initialize_manager_state(
     manager,
     *,

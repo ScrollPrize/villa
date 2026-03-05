@@ -15,7 +15,7 @@ from train_resnet3d_lib.modeling.architecture import Decoder, replace_batchnorm_
 from train_resnet3d_lib.modeling.group_dro import GroupDROComputer
 from train_resnet3d_lib.modeling.losses import build_bce_targets, compute_per_sample_loss_and_dice
 from train_resnet3d_lib.modeling.optimizers_runtime import configure_optimizers as configure_optimizers_runtime
-from train_resnet3d_lib.stitch_manager import StitchManager
+from train_resnet3d_lib.stitch_manager import StitchManager, coerce_stitch_manager_state
 
 _VALID_OBJECTIVES = {"erm", "group_dro"}
 _VALID_LOSS_MODES = {"batch", "per_sample"}
@@ -34,25 +34,6 @@ def _cfg_to_dict(value, *, key):
     raise TypeError(f"{key} must be a dict/dataclass/object with attributes, got {type(value).__name__}")
 
 
-def _coerce_shape_tuple(value, *, key):
-    if value is None:
-        return None
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise ValueError(f"{key} must be a 2-element sequence, got {value!r}")
-    return int(value[0]), int(value[1])
-
-
-def _coerce_shape_list(value, *, key):
-    if value is None:
-        return []
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key} must be a list of 2-element sequences")
-    out = []
-    for idx, item in enumerate(value):
-        out.append(_coerce_shape_tuple(item, key=f"{key}[{idx}]"))
-    return out
-
-
 def _coerce_flat_model_state(state):
     data = _cfg_to_dict(state, key="model_state")
     n_groups = int(data.get("n_groups", 1) or 1)
@@ -65,8 +46,6 @@ def _coerce_flat_model_state(state):
         str(segment_id): int(group_idx)
         for segment_id, group_idx in dict(data.get("stitch_group_idx_by_segment") or {}).items()
     }
-
-    downsample = max(1, int(data.get("stitch_downsample", 1) or 1))
 
     return {
         "size": int(data.get("size", 256)),
@@ -93,52 +72,7 @@ def _coerce_flat_model_state(state):
         "group_dro_min_var_weight": float(data.get("group_dro_min_var_weight", 0.0)),
         "group_dro_adj": data.get("group_dro_adj"),
         "erm_group_topk": int(data.get("erm_group_topk", 0)),
-        "stitch_val_dataloader_idx": (
-            None
-            if data.get("stitch_val_dataloader_idx") is None
-            else int(data["stitch_val_dataloader_idx"])
-        ),
-        "stitch_pred_shape": _coerce_shape_tuple(
-            data.get("stitch_pred_shape"),
-            key="model_state.stitch_pred_shape",
-        ),
-        "stitch_segment_id": (
-            None if data.get("stitch_segment_id") is None else str(data["stitch_segment_id"])
-        ),
-        "stitch_all_val": bool(data.get("stitch_all_val", False)),
-        "stitch_downsample": downsample,
-        "stitch_all_val_shapes": _coerce_shape_list(
-            data.get("stitch_all_val_shapes"),
-            key="model_state.stitch_all_val_shapes",
-        ),
-        "stitch_all_val_segment_ids": [str(x) for x in (data.get("stitch_all_val_segment_ids") or [])],
-        "stitch_train_shapes": _coerce_shape_list(
-            data.get("stitch_train_shapes"),
-            key="model_state.stitch_train_shapes",
-        ),
-        "stitch_train_segment_ids": [str(x) for x in (data.get("stitch_train_segment_ids") or [])],
-        "stitch_use_roi": bool(data.get("stitch_use_roi", False)),
-        "stitch_val_bboxes": dict(data.get("stitch_val_bboxes") or {}),
-        "stitch_train_bboxes": dict(data.get("stitch_train_bboxes") or {}),
-        "stitch_log_only_shapes": _coerce_shape_list(
-            data.get("stitch_log_only_shapes"),
-            key="model_state.stitch_log_only_shapes",
-        ),
-        "stitch_log_only_segment_ids": [str(x) for x in (data.get("stitch_log_only_segment_ids") or [])],
-        "stitch_log_only_bboxes": dict(data.get("stitch_log_only_bboxes") or {}),
-        "stitch_log_only_downsample": max(
-            1,
-            int(data.get("stitch_log_only_downsample", downsample) or downsample),
-        ),
-        "stitch_log_only_every_n_epochs": max(
-            1,
-            int(data.get("stitch_log_only_every_n_epochs", 10) or 10),
-        ),
-        "stitch_train": bool(data.get("stitch_train", False)),
-        "stitch_train_every_n_epochs": max(
-            1,
-            int(data.get("stitch_train_every_n_epochs", 1) or 1),
-        ),
+        **coerce_stitch_manager_state(data),
     }
 
 
@@ -335,7 +269,7 @@ def _infer_encoder_dims(backbone):
 
 
 def _build_stitch_manager(state):
-    return StitchManager(**_cfg_to_dict(state, key="model_state"))
+    return StitchManager(**coerce_stitch_manager_state(_cfg_to_dict(state, key="model_state")))
 
 
 def initialize_regression_state(model, *, state):
