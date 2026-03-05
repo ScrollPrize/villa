@@ -406,17 +406,11 @@ class StitchManager:
         self.log_only_loaders = list(loaders or [])
         self.log_only_segment_ids = [str(x) for x in (segment_ids or [])]
 
-    def _distributed_world_size(self, model):
-        return distributed_world_size(model)
-
     def _precision_context(self, model):
         return precision_context(model)
 
     def _reset_buffers_for_split(self, split):
         reset_split_buffers(self, split)
-
-    def _reduce_sum_distributed(self, model, tensor):
-        return reduce_sum_distributed(model, tensor)
 
     def sync_val_buffers_distributed(self, model):
         return sync_val_buffers_distributed(self, model)
