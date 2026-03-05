@@ -188,8 +188,6 @@ def prepare_runtime_state(
         f"group_key={group_key!r} robust_step_size={robust_step_size!r} "
         f"gamma={group_dro_gamma} btl={group_dro_btl} alpha={group_dro_alpha!r} normalize_loss={group_dro_normalize_loss}"
     )
-    if cfg.objective == "group_dro" and cfg.loss_mode != "per_sample":
-        raise ValueError("GroupDRO requires training.loss_mode=per_sample")
     if cfg.objective == "group_dro" and robust_step_size is None:
         raise ValueError("group_dro.robust_step_size is required when training.objective is group_dro")
 

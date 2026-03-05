@@ -17,6 +17,10 @@ from train_resnet3d_lib.modeling.losses import build_bce_targets, compute_per_sa
 from train_resnet3d_lib.modeling.optimizers_runtime import configure_optimizers as configure_optimizers_runtime
 from train_resnet3d_lib.stitch_manager import StitchManager
 
+_VALID_OBJECTIVES = {"erm", "group_dro"}
+_VALID_LOSS_MODES = {"batch", "per_sample"}
+_VALID_LOSS_RECIPES = {"dice_bce", "bce_only"}
+
 
 def _cfg_to_dict(value, *, key):
     if value is None:
@@ -224,6 +228,23 @@ def _normalize_stitch_group_idx_by_segment(stitch_group_idx_by_segment, *, n_gro
     return normalized_group_map
 
 
+def _validate_runtime_objective_state(model):
+    if model.objective not in _VALID_OBJECTIVES:
+        raise ValueError(
+            f"Unsupported model_state.objective={model.objective!r}; expected one of {sorted(_VALID_OBJECTIVES)!r}"
+        )
+    if model.loss_mode not in _VALID_LOSS_MODES:
+        raise ValueError(
+            f"Unsupported model_state.loss_mode={model.loss_mode!r}; expected one of {sorted(_VALID_LOSS_MODES)!r}"
+        )
+    if model.loss_recipe not in _VALID_LOSS_RECIPES:
+        raise ValueError(
+            f"Unsupported model_state.loss_recipe={model.loss_recipe!r}; expected one of {sorted(_VALID_LOSS_RECIPES)!r}"
+        )
+    if model.objective == "group_dro" and model.loss_mode != "per_sample":
+        raise ValueError("GroupDRO requires training.loss_mode=per_sample")
+
+
 def _init_group_dro_if_needed(model, *, state):
     model.group_dro = None
     if model.objective != "group_dro":
@@ -321,6 +342,7 @@ def initialize_regression_state(model, *, state):
     model.objective = state.objective.lower()
     model.loss_mode = state.loss_mode.lower()
     model.loss_recipe = state.loss_recipe.lower()
+    _validate_runtime_objective_state(model)
     model.bce_smooth_factor = state.bce_smooth_factor
     model.soft_label_positive = state.soft_label_positive
     model.soft_label_negative = state.soft_label_negative
@@ -504,54 +526,7 @@ def compute_objective_loss(
     loss_recipe = str(getattr(model, "loss_recipe", "dice_bce")).lower()
     group_idx = group_idx.long()
 
-    if objective == "erm":
-        if loss_mode == "batch":
-            bce_targets = model.build_bce_targets(targets)
-            bce_loss = F.binary_cross_entropy_with_logits(outputs, bce_targets)
-            if loss_recipe == "dice_bce":
-                dice_loss = model.loss_func1(outputs, targets)
-                loss = 0.5 * dice_loss + 0.5 * bce_loss
-            elif loss_recipe == "bce_only":
-                dice_loss = per_sample_dice_loss.mean()
-                loss = bce_loss
-            else:
-                raise ValueError(f"Unknown training.loss_recipe: {model.loss_recipe!r}")
-            model.log("train/dice_loss", dice_loss, on_step=True, on_epoch=True, prog_bar=False)
-            model.log("train/bce_loss", bce_loss, on_step=True, on_epoch=True, prog_bar=False)
-            return loss
-
-        if loss_mode != "per_sample":
-            raise ValueError(f"Unknown training.loss_mode: {model.loss_mode!r}")
-
-        if model.erm_group_topk > 0:
-            group_loss, group_count = compute_group_avg(model, per_sample_loss, group_idx)
-            present = group_count > 0
-            if present.any():
-                present_losses = group_loss[present]
-                topk = min(int(model.erm_group_topk), int(present_losses.numel()))
-                topk_losses, _ = torch.topk(present_losses, topk, largest=True)
-                loss = topk_losses.mean()
-            else:
-                loss = per_sample_loss.mean()
-
-            if model.global_step % CFG.print_freq == 0:
-                _log_group_train_metrics(
-                    model,
-                    group_loss,
-                    group_count,
-                    include_adv_probs=False,
-                )
-        else:
-            loss = per_sample_loss.mean()
-
-        model.log("train/dice", per_sample_dice.mean(), on_step=True, on_epoch=True, prog_bar=False)
-        model.log("train/dice_loss", per_sample_dice_loss.mean(), on_step=True, on_epoch=True, prog_bar=False)
-        model.log("train/bce_loss", per_sample_bce.mean(), on_step=True, on_epoch=True, prog_bar=False)
-        return loss
-
     if objective == "group_dro":
-        if loss_mode != "per_sample":
-            raise ValueError("GroupDRO requires training.loss_mode=per_sample")
         if model.group_dro is None:
             raise RuntimeError("GroupDRO objective was set but group_dro computer was not initialized")
 
@@ -570,7 +545,44 @@ def compute_objective_loss(
 
         return robust_loss
 
-    raise ValueError(f"Unknown training.objective: {model.objective!r}")
+    if loss_mode == "batch":
+        bce_targets = model.build_bce_targets(targets)
+        bce_loss = F.binary_cross_entropy_with_logits(outputs, bce_targets)
+        if loss_recipe == "bce_only":
+            dice_loss = per_sample_dice_loss.mean()
+            loss = bce_loss
+        else:
+            dice_loss = model.loss_func1(outputs, targets)
+            loss = 0.5 * dice_loss + 0.5 * bce_loss
+        model.log("train/dice_loss", dice_loss, on_step=True, on_epoch=True, prog_bar=False)
+        model.log("train/bce_loss", bce_loss, on_step=True, on_epoch=True, prog_bar=False)
+        return loss
+
+    if model.erm_group_topk > 0:
+        group_loss, group_count = compute_group_avg(model, per_sample_loss, group_idx)
+        present = group_count > 0
+        if present.any():
+            present_losses = group_loss[present]
+            topk = min(int(model.erm_group_topk), int(present_losses.numel()))
+            topk_losses, _ = torch.topk(present_losses, topk, largest=True)
+            loss = topk_losses.mean()
+        else:
+            loss = per_sample_loss.mean()
+
+        if model.global_step % CFG.print_freq == 0:
+            _log_group_train_metrics(
+                model,
+                group_loss,
+                group_count,
+                include_adv_probs=False,
+            )
+    else:
+        loss = per_sample_loss.mean()
+
+    model.log("train/dice", per_sample_dice.mean(), on_step=True, on_epoch=True, prog_bar=False)
+    model.log("train/dice_loss", per_sample_dice_loss.mean(), on_step=True, on_epoch=True, prog_bar=False)
+    model.log("train/bce_loss", per_sample_bce.mean(), on_step=True, on_epoch=True, prog_bar=False)
+    return loss
 
 
 def finalize_training_batch(model, *, loss, per_sample_loss, per_sample_dice, group_idx):

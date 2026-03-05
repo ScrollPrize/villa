@@ -239,6 +239,8 @@ def apply_metadata_hyperparameters(
     _ensure_enum(cfg.loss_mode, key="training.loss_mode", allowed=VALID_LOSS_MODES)
     _ensure_enum(cfg.loss_recipe, key="training.loss_recipe", allowed=VALID_LOSS_RECIPES)
     _ensure_enum(cfg.data_backend, key="training.data_backend", allowed=VALID_DATA_BACKENDS)
+    if cfg.objective == "group_dro" and cfg.loss_mode != "per_sample":
+        raise ValueError("training.objective=group_dro requires training.loss_mode=per_sample")
     _ensure_positive_int(cfg.train_batch_size, key="training_hyperparameters.training.train_batch_size")
     _ensure_positive_int(cfg.valid_batch_size, key="training_hyperparameters.training.valid_batch_size")
     _ensure_positive_int(cfg.epochs, key="training_hyperparameters.training.epochs")
