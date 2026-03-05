@@ -2,12 +2,9 @@ from train_resnet3d_lib.data.augmentations import rebuild_augmentations
 
 
 MODEL_SCALARS = {
-    "model_name": str,
     "backbone": str,
     "backbone_pretrained_path": str,
     "resnet3d_model_depth": int,
-    "encoder_depth": int,
-    "target_size": int,
     "in_chans": int,
     "norm": str,
     "group_norm_groups": int,

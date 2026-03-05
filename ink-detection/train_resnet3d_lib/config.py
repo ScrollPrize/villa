@@ -14,7 +14,6 @@ PIL.Image.MAX_IMAGE_PIXELS = 109951162777600
 import numpy as np
 import torch
 
-import albumentations as A
 from train_resnet3d_lib import config_metadata_apply as _cfg_meta
 
 def log(msg):
@@ -28,18 +27,13 @@ class CFG:
 
     exp_name = 'pretraining_all'
 
-    # ============== pred target =============
-    target_size = 1
-
     # ============== model cfg =============
-    model_name = 'Unet'
     # backbone = 'efficientnet-b0'
     # backbone = 'se_resnext50_32x4d'
     backbone = 'resnet3d'
     resnet3d_model_depth = 50
     backbone_pretrained_path = "./r3d50_KM_200ep.pth"
     in_chans = 62  # 65
-    encoder_depth = 5
     norm = "batch"  # "batch" | "group"
     group_norm_groups = 32
     # ============== training cfg =============
@@ -161,7 +155,6 @@ class CFG:
     # ============== augmentation =============
     train_aug_list = []
     valid_aug_list = []
-    rotate = A.Compose([A.Rotate(5, p=1)])
     fourth_augment_p = 0.6
     fourth_augment_min_crop_ratio = 0.9
     fourth_augment_max_crop_ratio = 1.0

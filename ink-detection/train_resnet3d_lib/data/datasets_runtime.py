@@ -1,7 +1,6 @@
 import numpy as np
 from torch.utils.data import Dataset
 
-from train_resnet3d_lib.config import CFG
 from train_resnet3d_lib.data.augmentations import (
     _apply_image_transform,
     _xy_to_bounds,
@@ -137,7 +136,6 @@ class CustomDataset(Dataset):
 
         self.transform = transform
         self.xyxys = xyxys
-        self.rotate = CFG.rotate
 
     def __len__(self):
         return len(self.images)
@@ -196,7 +194,6 @@ class LazyZarrTrainDataset(Dataset):
         self.masks = dict(_require_dict(masks_by_segment, name="masks_by_segment"))
         self.cfg = cfg
         self.transform = transform
-        self.rotate = CFG.rotate
 
         (
             self.segment_ids,

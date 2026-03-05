@@ -43,8 +43,6 @@ def _coerce_flat_model_state(state):
     }
 
     return {
-        "size": int(data.get("size", 256)),
-        "enc": str(data.get("enc", "i3d")),
         "with_norm": bool(data.get("with_norm", False)),
         "total_steps": int(data.get("total_steps", 1)),
         "n_groups": n_groups,
@@ -84,8 +82,6 @@ def save_regression_hyperparameters(model, *, state):
     model.save_hyperparameters(
         {
             "model_state": {
-                "size": int(state.size),
-                "enc": str(state.enc),
                 "with_norm": bool(state.with_norm),
                 "total_steps": int(state.total_steps),
                 "n_groups": int(state.n_groups),

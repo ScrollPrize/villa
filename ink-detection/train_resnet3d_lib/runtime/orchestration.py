@@ -156,17 +156,17 @@ def prepare_runtime_state(
     group_dro_cfg = dict(merged_config["group_dro"])
     group_key = group_dro_cfg["group_key"]
 
-    requested_init_ckpt_path = init_ckpt_path or training_cfg.get("init_ckpt_path") or training_cfg.get("finetune_from")
+    requested_init_ckpt_path = init_ckpt_path or training_cfg.get("init_ckpt_path")
     if bool(getattr(cfg, "pretrained", True)):
         resolved_init_ckpt_path = resolve_checkpoint_path(requested_init_ckpt_path)
     else:
         if requested_init_ckpt_path:
-            log("CFG.pretrained=False; ignoring init_ckpt_path/finetune_from.")
+            log("CFG.pretrained=False; ignoring init_ckpt_path.")
         resolved_init_ckpt_path = None
     cfg.init_ckpt_path = resolved_init_ckpt_path
 
     resolved_resume_ckpt_path = resolve_checkpoint_path(
-        resume_from_ckpt or training_cfg.get("resume_from_ckpt") or training_cfg.get("resume_ckpt_path")
+        resume_from_ckpt or training_cfg.get("resume_from_ckpt")
     )
     if resolved_resume_ckpt_path and not osp.exists(resolved_resume_ckpt_path):
         raise FileNotFoundError(f"resume_from_ckpt not found: {resolved_resume_ckpt_path}")
@@ -178,10 +178,7 @@ def prepare_runtime_state(
     group_dro_btl = bool(group_dro_cfg.get("btl", False))
     group_dro_alpha = group_dro_cfg.get("alpha")
     group_dro_normalize_loss = bool(group_dro_cfg.get("normalize_loss", False))
-    group_dro_min_var_weight = group_dro_cfg.get(
-        "minimum_variational_weight",
-        group_dro_cfg.get("min_var_weight", 0.0),
-    )
+    group_dro_min_var_weight = group_dro_cfg.get("minimum_variational_weight", 0.0)
     group_dro_adj = group_dro_cfg.get("adj")
     log(
         "group_dro "

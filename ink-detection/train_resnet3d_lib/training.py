@@ -25,8 +25,6 @@ def _build_regression_model_state(run_state, data_state):
     # Keep one transport payload for model construction, but build it in
     # conceptual sections so research edits stay easy to locate.
     model_state = {
-        "enc": "i3d",
-        "size": int(getattr(CFG, "size", 256)),
         "with_norm": False,
         "total_steps": int(data_state["steps_per_epoch"]),
         "n_groups": int(len(data_state["group_names"])),
