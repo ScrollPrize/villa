@@ -74,30 +74,10 @@ def _coerce_flat_model_state(state):
 def _coerce_regression_model_state(
     *,
     model_state=None,
-    model_cfg=None,
-    objective_cfg=None,
-    stitch_cfg=None,
 ):
-    # Single internal state avoids config shuttling across modules while still
-    # accepting legacy grouped checkpoint payloads during migration.
-    merged_state = {}
-    if model_state is not None:
-        state = _cfg_to_dict(model_state, key="model_state")
-        for key, value in state.items():
-            if key not in {"model_cfg", "objective_cfg", "stitch_cfg"}:
-                merged_state[key] = value
-        model_cfg = state.get("model_cfg", model_cfg)
-        objective_cfg = state.get("objective_cfg", objective_cfg)
-        stitch_cfg = state.get("stitch_cfg", stitch_cfg)
-
-    if model_cfg is not None:
-        merged_state.update(_cfg_to_dict(model_cfg, key="model_cfg"))
-    if objective_cfg is not None:
-        merged_state.update(_cfg_to_dict(objective_cfg, key="objective_cfg"))
-    if stitch_cfg is not None:
-        merged_state.update(_cfg_to_dict(stitch_cfg, key="stitch_cfg"))
-
-    return _coerce_flat_model_state(merged_state)
+    if model_state is None:
+        return _coerce_flat_model_state({})
+    return _coerce_flat_model_state(_cfg_to_dict(model_state, key="model_state"))
 
 
 def save_regression_hyperparameters(model, *, state):
@@ -649,16 +629,10 @@ class RegressionPLModel(pl.LightningModule):
         self,
         *,
         model_state: dict | None = None,
-        model_cfg: dict | None = None,
-        objective_cfg: dict | None = None,
-        stitch_cfg: dict | None = None,
     ):
         super(RegressionPLModel, self).__init__()
         state = SimpleNamespace(**_coerce_regression_model_state(
             model_state=model_state,
-            model_cfg=model_cfg,
-            objective_cfg=objective_cfg,
-            stitch_cfg=stitch_cfg,
         ))
         save_regression_hyperparameters(
             self,
