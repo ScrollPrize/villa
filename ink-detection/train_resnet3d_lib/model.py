@@ -214,16 +214,16 @@ def _build_backbone_with_optional_pretrained(*, state):
     return backbone
 
 
-def _infer_encoder_dims(backbone):
-    was_training = backbone.training
-    try:
-        backbone.eval()
-        with torch.no_grad():
-            encoder_dims = [x.size(1) for x in backbone(torch.rand(1, 1, 20, 256, 256))]
-    finally:
-        if was_training:
-            backbone.train()
-    return encoder_dims
+def _encoder_dims_for_resnet3d_depth(model_depth):
+    if model_depth is None:
+        raise KeyError("CFG.resnet3d_model_depth is required")
+    model_depth = int(model_depth)
+    if model_depth in {50, 101, 152}:
+        return [256, 512, 1024, 2048]
+    raise ValueError(
+        "CFG.resnet3d_model_depth must be one of [50, 101, 152], "
+        f"got {model_depth}"
+    )
 
 
 def _build_stitch_manager(state):
@@ -269,7 +269,7 @@ def initialize_regression_state(model, *, state):
 
     norm = str(state.norm).lower()
     group_norm_groups = int(state.group_norm_groups)
-    encoder_dims = _infer_encoder_dims(model.backbone)
+    encoder_dims = _encoder_dims_for_resnet3d_depth(getattr(CFG, "resnet3d_model_depth", None))
 
     model.decoder = Decoder(encoder_dims=encoder_dims, upscale=1, norm=norm, group_norm_groups=group_norm_groups)
 
