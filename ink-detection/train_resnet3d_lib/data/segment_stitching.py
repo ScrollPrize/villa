@@ -1,7 +1,6 @@
 import time
 
 import numpy as np
-from torch.utils.data import DataLoader
 
 from train_resnet3d_lib.config import CFG, log
 from train_resnet3d_lib.data.datasets_runtime import (
@@ -9,6 +8,8 @@ from train_resnet3d_lib.data.datasets_runtime import (
     CustomDatasetTest,
     LazyZarrXyLabelDataset,
     LazyZarrXyOnlyDataset,
+    build_eval_loader,
+    normalize_data_backend,
 )
 from train_resnet3d_lib.data.patching import _mask_component_bboxes_downsample, _mask_store_shape, extract_patches_infer
 from train_resnet3d_lib.data.image_readers import (
@@ -21,27 +22,6 @@ from train_resnet3d_lib.data.image_readers import (
 )
 from train_resnet3d_lib.data.zarr_volume import ZarrSegmentVolume
 from train_resnet3d_lib.data.patch_index_cache import extract_infer_patch_coordinates_cached
-
-_SUPPORTED_DATA_BACKENDS = ("zarr", "tiff")
-
-
-def _build_eval_loader(dataset):
-    return DataLoader(
-        dataset,
-        batch_size=CFG.valid_batch_size,
-        shuffle=False,
-        num_workers=CFG.num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
-
-
-def _normalize_data_backend(data_backend):
-    backend = str(data_backend).strip().lower()
-    if backend not in _SUPPORTED_DATA_BACKENDS:
-        raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
-    return backend
-
 
 def _resolve_requested_train_stitch_ids(train_fragment_ids, available_segment_ids, stitch_segment_id):
     available = {str(x) for x in available_segment_ids}
@@ -114,7 +94,7 @@ def build_train_stitch_loaders(train_fragment_ids, train_stitch_candidates, stit
             groups=seg_groups,
             transform=valid_transform,
         )
-        return _build_eval_loader(train_dataset_viz), tuple(seg_shape), str(segment_id)
+        return build_eval_loader(train_dataset_viz), tuple(seg_shape), str(segment_id)
 
     return _build_train_stitch_common(
         train_fragment_ids,
@@ -155,7 +135,7 @@ def build_train_stitch_loaders_lazy(
             transform=valid_transform,
             sample_bbox_indices_by_segment={sid: bbox_idx},
         )
-        return _build_eval_loader(dataset), tuple(_mask_store_shape(train_masks_by_segment[sid])), sid
+        return build_eval_loader(dataset), tuple(_mask_store_shape(train_masks_by_segment[sid])), sid
 
     return _build_train_stitch_common(
         train_fragment_ids,
@@ -178,7 +158,7 @@ def build_train_stitch_outputs(
     train_sample_bbox_indices_by_segment=None,
     train_groups_by_segment=None,
 ):
-    backend = _normalize_data_backend(data_backend)
+    backend = normalize_data_backend(data_backend)
     train_stitch_builder = _train_stitch_builder_for_backend(backend=backend)
     return train_stitch_builder(
         train_fragment_ids=train_fragment_ids,
@@ -252,7 +232,7 @@ def build_log_only_stitch_loaders(
 
         xyxys = np.stack(xyxys) if len(xyxys) > 0 else np.zeros((0, 4), dtype=np.int64)
         dataset = CustomDatasetTest(images, xyxys, CFG, transform=valid_transform)
-        loader = _build_eval_loader(dataset)
+        loader = build_eval_loader(dataset)
         bboxes = _mask_component_bboxes_downsample(fragment_mask, int(log_only_downsample))
         return loader, tuple(fragment_mask.shape), str(fragment_id), bboxes
 
@@ -309,7 +289,7 @@ def build_log_only_stitch_loaders_lazy(
             CFG,
             transform=valid_transform,
         )
-        loader = _build_eval_loader(dataset)
+        loader = build_eval_loader(dataset)
         bboxes = _mask_component_bboxes_downsample(fragment_mask, int(log_only_downsample))
         return loader, tuple(fragment_mask.shape), sid, bboxes
 
@@ -334,7 +314,7 @@ def build_log_only_outputs(
     if not requested_segments:
         return [], [], [], {}
 
-    backend = _normalize_data_backend(data_backend)
+    backend = normalize_data_backend(data_backend)
     log_only_builder = _log_only_builder_for_backend(backend=backend)
     return log_only_builder(
         log_only_segments=requested_segments,

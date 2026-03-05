@@ -4,7 +4,7 @@ import os
 import os.path as osp
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 from train_resnet3d_lib.config import (
     CFG,
@@ -20,7 +20,7 @@ from train_resnet3d_lib.data.patch_index_cache import (
 from train_resnet3d_lib.data.normalization_stats import (
     prepare_fold_label_foreground_percentile_clip_zscore_stats,
 )
-from train_resnet3d_lib.data.datasets_runtime import LazyZarrXyOnlyDataset
+from train_resnet3d_lib.data.datasets_runtime import LazyZarrXyOnlyDataset, build_eval_loader
 from train_resnet3d_lib.data.augmentations import get_transforms
 from train_resnet3d_lib.data.patching import _mask_component_bboxes_downsample
 from train_resnet3d_lib.data.image_readers import (
@@ -50,17 +50,6 @@ class StitchValidationDataset(Dataset):
     def __getitem__(self, idx):
         image, xy = self.base_dataset[idx]
         return image, self._dummy_label.clone(), xy, 0
-
-
-def _build_eval_loader(dataset):
-    return DataLoader(
-        dataset,
-        batch_size=CFG.valid_batch_size,
-        shuffle=False,
-        num_workers=CFG.num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
 
 
 def parse_args():
@@ -313,7 +302,7 @@ def build_stitch_data_state(run_state, *, segment_ids, mask_suffix):
             transform=valid_transform,
         )
         val_dataset = StitchValidationDataset(xy_only_dataset)
-        val_loader = _build_eval_loader(val_dataset)
+        val_loader = build_eval_loader(val_dataset)
         loader_batch_size = int(val_loader.batch_size)
         expected_batch_size = int(CFG.valid_batch_size)
         if loader_batch_size != expected_batch_size:

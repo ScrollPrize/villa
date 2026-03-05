@@ -10,6 +10,7 @@ from train_resnet3d_lib.config import CFG, log
 from train_resnet3d_lib.data.datasets_runtime import (
     CustomDataset,
     LazyZarrTrainDataset,
+    normalize_data_backend,
 )
 from train_resnet3d_lib.data.augmentations import get_transforms
 from train_resnet3d_lib.data.image_readers import build_group_mappings, get_segment_meta as _segment_meta
@@ -24,16 +25,6 @@ from train_resnet3d_lib.data.segment_stitching import (
     build_train_stitch_outputs,
     build_log_only_outputs,
 )
-
-_SUPPORTED_DATA_BACKENDS = ("zarr", "tiff")
-
-
-def _normalize_data_backend(data_backend):
-    backend = str(data_backend).strip().lower()
-    if backend not in _SUPPORTED_DATA_BACKENDS:
-        raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
-    return backend
-
 
 def init_dataset_tracking(*, include_train_xyxys):
     return {
@@ -404,7 +395,7 @@ def _build_datasets_for_backend(
     log_only_downsample,
     shared_volume_cache=None,
 ):
-    backend = _normalize_data_backend(data_backend)
+    backend = normalize_data_backend(data_backend)
     is_zarr = backend == "zarr"
     include_train_xyxys = bool(getattr(CFG, "stitch_train", False))
     tracking = init_dataset_tracking(include_train_xyxys=include_train_xyxys)
@@ -622,7 +613,7 @@ def build_datasets(run_state):
         f"val=(label={val_label_suffix!r}, mask={val_mask_suffix!r})"
     )
 
-    data_backend = _normalize_data_backend(getattr(CFG, "data_backend", "zarr"))
+    data_backend = normalize_data_backend(getattr(CFG, "data_backend", "zarr"))
     log(f"data backend={data_backend}")
     if bool(getattr(CFG, "dataset_cache_enabled", True)) and not bool(getattr(CFG, "dataset_cache_check_hash", True)):
         log("WARNING: dataset cache hash validation is disabled (metadata.training.dataset_cache_check_hash=false)")

@@ -1,10 +1,14 @@
 import time
 
 import numpy as np
-from torch.utils.data import DataLoader
 
 from train_resnet3d_lib.config import CFG, log
-from train_resnet3d_lib.data.datasets_runtime import CustomDataset, LazyZarrXyLabelDataset
+from train_resnet3d_lib.data.datasets_runtime import (
+    CustomDataset,
+    LazyZarrXyLabelDataset,
+    build_eval_loader,
+    normalize_data_backend,
+)
 from train_resnet3d_lib.data.patching import (
     _downsample_bool_mask_any,
     _mask_border,
@@ -21,27 +25,6 @@ from train_resnet3d_lib.data.image_readers import (
 )
 from train_resnet3d_lib.data.zarr_volume import ZarrSegmentVolume
 from train_resnet3d_lib.data.patch_index_cache import build_mask_store_and_patch_index_cached
-
-_SUPPORTED_DATA_BACKENDS = ("zarr", "tiff")
-
-
-def _build_eval_loader(dataset):
-    return DataLoader(
-        dataset,
-        batch_size=CFG.valid_batch_size,
-        shuffle=False,
-        num_workers=CFG.num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
-
-
-def _normalize_data_backend(data_backend):
-    backend = str(data_backend).strip().lower()
-    if backend not in _SUPPORTED_DATA_BACKENDS:
-        raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
-    return backend
-
 
 def _stitch_mask_geometry(fragment_mask, *, include_train_xyxys):
     mask_border = None
@@ -351,7 +334,7 @@ def load_val_segment(
         groups=frag_val_groups,
         transform=valid_transform,
     )
-    val_loader = _build_eval_loader(val_dataset)
+    val_loader = build_eval_loader(val_dataset)
 
     mask_border, mask_bbox = _stitch_mask_geometry(
         fragment_mask_val,
@@ -416,7 +399,7 @@ def load_val_segment_lazy(
         transform=valid_transform,
         sample_bbox_indices_by_segment={sid: val_sample_bbox_indices},
     )
-    val_loader = _build_eval_loader(val_dataset)
+    val_loader = build_eval_loader(val_dataset)
     mask_shape = tuple(_mask_store_shape(mask_store_val))
 
     mask_border, mask_bbox = _stitch_mask_geometry(
@@ -469,7 +452,7 @@ def load_train_segment_for_backend(
     layers_cache=None,
     volume_cache=None,
 ):
-    backend = _normalize_data_backend(data_backend)
+    backend = normalize_data_backend(data_backend)
     train_loader_fn, _ = _backend_loader_fns(backend=backend)
     return train_loader_fn(
         fragment_id,
@@ -503,7 +486,7 @@ def load_val_segment_for_backend(
     layers_cache=None,
     volume_cache=None,
 ):
-    backend = _normalize_data_backend(data_backend)
+    backend = normalize_data_backend(data_backend)
     _, val_loader_fn = _backend_loader_fns(backend=backend)
     return val_loader_fn(
         fragment_id,

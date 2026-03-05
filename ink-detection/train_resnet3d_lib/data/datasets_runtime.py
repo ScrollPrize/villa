@@ -1,6 +1,7 @@
 import numpy as np
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
+from train_resnet3d_lib.config import CFG
 from train_resnet3d_lib.data.augmentations import (
     _apply_image_transform,
     _xy_to_bounds,
@@ -8,6 +9,26 @@ from train_resnet3d_lib.data.augmentations import (
     apply_train_sample_transforms,
 )
 from train_resnet3d_lib.data.patching import _read_mask_patch
+
+SUPPORTED_DATA_BACKENDS = ("zarr", "tiff")
+
+
+def normalize_data_backend(data_backend):
+    backend = str(data_backend).strip().lower()
+    if backend not in SUPPORTED_DATA_BACKENDS:
+        raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
+    return backend
+
+
+def build_eval_loader(dataset):
+    return DataLoader(
+        dataset,
+        batch_size=CFG.valid_batch_size,
+        shuffle=False,
+        num_workers=CFG.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
 
 
 def _require_dict(value, *, name):
