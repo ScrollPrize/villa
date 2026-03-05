@@ -4,10 +4,9 @@ from torch.utils.data import Dataset
 from train_resnet3d_lib.config import CFG
 from train_resnet3d_lib.data.augmentations import (
     _apply_image_transform,
-    _apply_joint_transform,
-    _maybe_fourth_augment,
-    _maybe_invert_augment,
     _xy_to_bounds,
+    apply_eval_sample_transforms,
+    apply_train_sample_transforms,
 )
 from train_resnet3d_lib.data.patching import _read_mask_patch
 
@@ -120,7 +119,12 @@ def _group_id_for_index(groups, idx):
 
 
 def _prepare_xy_label_group_sample(image, label, xy, group_id, *, transform, cfg):
-    image, label = _apply_joint_transform(transform, image, label, cfg)
+    image, label = apply_eval_sample_transforms(
+        image,
+        label,
+        transform=transform,
+        cfg=cfg,
+    )
     return image, label, xy, int(group_id)
 
 
@@ -151,9 +155,12 @@ class CustomDataset(Dataset):
             )
         image = self.images[idx]
         label = self.labels[idx]
-        image = _maybe_fourth_augment(image, self.cfg)
-        image = _maybe_invert_augment(image, self.cfg)
-        image, label = _apply_joint_transform(self.transform, image, label, self.cfg)
+        image, label = apply_train_sample_transforms(
+            image,
+            label,
+            transform=self.transform,
+            cfg=self.cfg,
+        )
         return image, label, group_id
 
 
@@ -218,9 +225,12 @@ class LazyZarrTrainDataset(Dataset):
 
         image = self.volumes[segment_id].read_patch(y1, y2, x1, x2)
         label = _read_mask_patch(self.masks[segment_id], y1=y1, y2=y2, x1=x1, x2=x2, bbox_index=bbox_idx)[..., None]
-        image = _maybe_fourth_augment(image, self.cfg)
-        image = _maybe_invert_augment(image, self.cfg)
-        image, label = _apply_joint_transform(self.transform, image, label, self.cfg)
+        image, label = apply_train_sample_transforms(
+            image,
+            label,
+            transform=self.transform,
+            cfg=self.cfg,
+        )
 
         return image, label, group_id
 
@@ -315,4 +325,3 @@ class LazyZarrXyOnlyDataset(Dataset):
         image = self.volumes[segment_id].read_patch(y1, y2, x1, x2)
         image = _apply_image_transform(self.transform, image)
         return image, xy
-

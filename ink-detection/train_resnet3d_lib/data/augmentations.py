@@ -57,6 +57,16 @@ def _apply_image_transform(transform, image):
     return data["image"].unsqueeze(0)
 
 
+def apply_train_sample_transforms(image, label, *, transform, cfg):
+    image = _maybe_fourth_augment(image, cfg)
+    image = _maybe_invert_augment(image, cfg)
+    return _apply_joint_transform(transform, image, label, cfg)
+
+
+def apply_eval_sample_transforms(image, label, *, transform, cfg):
+    return _apply_joint_transform(transform, image, label, cfg)
+
+
 def _xy_to_bounds(xy):
     x1, y1, x2, y2 = [int(v) for v in xy]
     return x1, y1, x2, y2
