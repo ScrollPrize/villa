@@ -8,7 +8,6 @@ from torch.utils.data import Dataset
 
 from train_resnet3d_lib.config import CFG, log
 from train_resnet3d_lib.runtime import orchestration
-from train_resnet3d_lib.runtime import wandb_runtime
 from train_resnet3d_lib import training as tr
 from train_resnet3d_lib.runtime.metadata_config import resolve_stitch_metadata, validate_stitch_segment_ids
 from train_resnet3d_lib.data.patch_index_cache import (
@@ -402,11 +401,10 @@ def main():
         f"device_count={device_count}"
     )
 
-    base_config = orchestration.load_and_validate_base_config(
-        args.metadata_json,
+    base_config, preinit_overrides = orchestration.load_base_config_and_preinit(
+        metadata_json=args.metadata_json,
         base_dir=osp.dirname(orchestration.__file__),
     )
-    preinit_overrides = wandb_runtime.load_wandb_preinit_overrides()
 
     data_state = None
     expected_segment_ids = None
@@ -425,15 +423,9 @@ def main():
             f"label={job['label']!r} run_name={run_args.run_name!r} "
             f"init_ckpt_path={run_args.init_ckpt_path!r} resume_from_ckpt={run_args.resume_from_ckpt!r}"
         )
-        wandb_logger = wandb_runtime.init_wandb_logger(
+        wandb_logger, merged_config = orchestration.prepare_wandb_and_merged_config(
             run_args,
             base_config,
-            preinit_overrides=preinit_overrides,
-        )
-        merged_config = orchestration.merge_config(
-            base_config,
-            wandb_logger,
-            run_args,
             preinit_overrides=preinit_overrides,
         )
         if run_args.valid_batch_size is not None:

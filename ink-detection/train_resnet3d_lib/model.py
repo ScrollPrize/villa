@@ -49,105 +49,6 @@ def _coerce_shape_list(value, *, key):
     return out
 
 
-def _extract_model_state_from_model_cfg(model_cfg):
-    data = _cfg_to_dict(model_cfg, key="model_cfg")
-    n_groups = int(data.get("n_groups", 1) or 1)
-    group_names = data.get("group_names")
-    if group_names is None:
-        group_names = [str(i) for i in range(n_groups)]
-    else:
-        group_names = [str(x) for x in group_names]
-    stitch_group_idx_by_segment = {
-        str(segment_id): int(group_idx)
-        for segment_id, group_idx in dict(data.get("stitch_group_idx_by_segment") or {}).items()
-    }
-    return {
-        "size": int(data.get("size", 256)),
-        "enc": str(data.get("enc", "i3d")),
-        "with_norm": bool(data.get("with_norm", False)),
-        "total_steps": int(data.get("total_steps", 1)),
-        "n_groups": n_groups,
-        "group_names": group_names,
-        "stitch_group_idx_by_segment": stitch_group_idx_by_segment,
-        "norm": str(data.get("norm", "batch")),
-        "group_norm_groups": int(data.get("group_norm_groups", 32)),
-    }
-
-
-def _extract_model_state_from_objective_cfg(objective_cfg):
-    data = _cfg_to_dict(objective_cfg, key="objective_cfg")
-    return {
-        "objective": str(data.get("objective", "erm")),
-        "loss_mode": str(data.get("loss_mode", "batch")),
-        "loss_recipe": str(data.get("loss_recipe", "dice_bce")).lower(),
-        "bce_smooth_factor": float(data.get("bce_smooth_factor", 0.25)),
-        "soft_label_positive": float(data.get("soft_label_positive", 1.0)),
-        "soft_label_negative": float(data.get("soft_label_negative", 0.0)),
-        "robust_step_size": data.get("robust_step_size"),
-        "group_counts": [int(x) for x in list(data.get("group_counts") or [])],
-        "group_dro_gamma": float(data.get("group_dro_gamma", 0.1)),
-        "group_dro_btl": bool(data.get("group_dro_btl", False)),
-        "group_dro_alpha": data.get("group_dro_alpha"),
-        "group_dro_normalize_loss": bool(data.get("group_dro_normalize_loss", False)),
-        "group_dro_min_var_weight": float(data.get("group_dro_min_var_weight", 0.0)),
-        "group_dro_adj": data.get("group_dro_adj"),
-        "erm_group_topk": int(data.get("erm_group_topk", 0)),
-    }
-
-
-def _extract_model_state_from_stitch_cfg(stitch_cfg):
-    data = _cfg_to_dict(stitch_cfg, key="stitch_cfg")
-    downsample = max(1, int(data.get("stitch_downsample", 1) or 1))
-    return {
-        "stitch_val_dataloader_idx": (
-            None
-            if data.get("stitch_val_dataloader_idx") is None
-            else int(data["stitch_val_dataloader_idx"])
-        ),
-        "stitch_pred_shape": _coerce_shape_tuple(
-            data.get("stitch_pred_shape"),
-            key="stitch_cfg.stitch_pred_shape",
-        ),
-        "stitch_segment_id": (
-            None if data.get("stitch_segment_id") is None else str(data["stitch_segment_id"])
-        ),
-        "stitch_all_val": bool(data.get("stitch_all_val", False)),
-        "stitch_downsample": downsample,
-        "stitch_all_val_shapes": _coerce_shape_list(
-            data.get("stitch_all_val_shapes"),
-            key="stitch_cfg.stitch_all_val_shapes",
-        ),
-        "stitch_all_val_segment_ids": [str(x) for x in (data.get("stitch_all_val_segment_ids") or [])],
-        "stitch_train_shapes": _coerce_shape_list(
-            data.get("stitch_train_shapes"),
-            key="stitch_cfg.stitch_train_shapes",
-        ),
-        "stitch_train_segment_ids": [str(x) for x in (data.get("stitch_train_segment_ids") or [])],
-        "stitch_use_roi": bool(data.get("stitch_use_roi", False)),
-        "stitch_val_bboxes": dict(data.get("stitch_val_bboxes") or {}),
-        "stitch_train_bboxes": dict(data.get("stitch_train_bboxes") or {}),
-        "stitch_log_only_shapes": _coerce_shape_list(
-            data.get("stitch_log_only_shapes"),
-            key="stitch_cfg.stitch_log_only_shapes",
-        ),
-        "stitch_log_only_segment_ids": [str(x) for x in (data.get("stitch_log_only_segment_ids") or [])],
-        "stitch_log_only_bboxes": dict(data.get("stitch_log_only_bboxes") or {}),
-        "stitch_log_only_downsample": max(
-            1,
-            int(data.get("stitch_log_only_downsample", downsample) or downsample),
-        ),
-        "stitch_log_only_every_n_epochs": max(
-            1,
-            int(data.get("stitch_log_only_every_n_epochs", 10) or 10),
-        ),
-        "stitch_train": bool(data.get("stitch_train", False)),
-        "stitch_train_every_n_epochs": max(
-            1,
-            int(data.get("stitch_train_every_n_epochs", 1) or 1),
-        ),
-    }
-
-
 def _coerce_flat_model_state(state):
     data = _cfg_to_dict(state, key="model_state")
     n_groups = int(data.get("n_groups", 1) or 1)
@@ -257,11 +158,11 @@ def _coerce_regression_model_state(
         stitch_cfg = state.get("stitch_cfg", stitch_cfg)
 
     if model_cfg is not None:
-        merged_state.update(_extract_model_state_from_model_cfg(model_cfg))
+        merged_state.update(_cfg_to_dict(model_cfg, key="model_cfg"))
     if objective_cfg is not None:
-        merged_state.update(_extract_model_state_from_objective_cfg(objective_cfg))
+        merged_state.update(_cfg_to_dict(objective_cfg, key="objective_cfg"))
     if stitch_cfg is not None:
-        merged_state.update(_extract_model_state_from_stitch_cfg(stitch_cfg))
+        merged_state.update(_cfg_to_dict(stitch_cfg, key="stitch_cfg"))
 
     return _coerce_flat_model_state(merged_state)
 

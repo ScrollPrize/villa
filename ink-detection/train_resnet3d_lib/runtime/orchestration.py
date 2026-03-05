@@ -95,6 +95,30 @@ def merge_config(base_config, wandb_logger, args, *, preinit_overrides=None):
     return merged_config
 
 
+def load_base_config_and_preinit(*, metadata_json, base_dir):
+    base_config = load_and_validate_base_config(
+        metadata_json,
+        base_dir=base_dir,
+    )
+    preinit_overrides = wandb_runtime.load_wandb_preinit_overrides()
+    return base_config, preinit_overrides
+
+
+def prepare_wandb_and_merged_config(args, base_config, *, preinit_overrides=None):
+    wandb_logger = wandb_runtime.init_wandb_logger(
+        args,
+        base_config,
+        preinit_overrides=preinit_overrides,
+    )
+    merged_config = merge_config(
+        base_config,
+        wandb_logger,
+        args,
+        preinit_overrides=preinit_overrides,
+    )
+    return wandb_logger, merged_config
+
+
 def prepare_runtime_state(
     cfg,
     merged_config,

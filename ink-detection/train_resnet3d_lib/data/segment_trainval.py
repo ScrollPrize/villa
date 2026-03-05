@@ -51,6 +51,108 @@ def _stitch_mask_geometry(fragment_mask, *, include_train_xyxys):
     return mask_border, mask_bbox
 
 
+def _segment_layer_settings(seg_meta, fragment_id):
+    return (
+        _segment_layer_range(seg_meta, fragment_id),
+        _segment_reverse_layers(seg_meta, fragment_id),
+    )
+
+
+def _read_tiff_segment(
+    fragment_id,
+    *,
+    layer_range,
+    reverse_layers,
+    label_suffix,
+    mask_suffix,
+    layers_cache=None,
+    overlap_segments=None,
+    cache_for_overlap=False,
+    reuse_layers_cache=False,
+    split_name,
+):
+    layers = None
+    if reuse_layers_cache and layers_cache is not None:
+        layers = layers_cache.get(fragment_id)
+        if layers is not None:
+            log(f"reuse layers cache for {split_name} segment={fragment_id}")
+
+    if layers is None:
+        layers = read_image_layers(
+            fragment_id,
+            layer_range=layer_range,
+        )
+        if cache_for_overlap and layers_cache is not None and fragment_id in (overlap_segments or set()):
+            layers_cache[fragment_id] = layers
+
+    return read_image_mask(
+        fragment_id,
+        reverse_layers=reverse_layers,
+        label_suffix=label_suffix,
+        mask_suffix=mask_suffix,
+        images=layers,
+    )
+
+
+def _load_or_create_zarr_volume(
+    fragment_id,
+    seg_meta,
+    *,
+    layer_range,
+    reverse_layers,
+    volume_cache,
+    split_name,
+):
+    sid = str(fragment_id)
+    volume = volume_cache.get(sid)
+    if volume is None:
+        volume = ZarrSegmentVolume(
+            sid,
+            seg_meta,
+            layer_range=layer_range,
+            reverse_layers=reverse_layers,
+        )
+        volume_cache[sid] = volume
+    else:
+        log(f"reuse zarr volume cache for {split_name} segment={sid}")
+    return sid, volume
+
+
+def _build_zarr_patch_index(
+    *,
+    sid,
+    volume,
+    split_name,
+    label_suffix,
+    mask_suffix,
+):
+    mask, fragment_mask = read_label_and_fragment_mask_for_shape(
+        sid,
+        volume.shape[:2],
+        label_suffix=label_suffix,
+        mask_suffix=mask_suffix,
+    )
+    mask_store, xyxys, sample_bbox_indices = build_mask_store_and_patch_index_cached(
+        mask,
+        fragment_mask,
+        fragment_id=sid,
+        split_name=split_name,
+        filter_empty_tile=False,
+        label_suffix=label_suffix,
+        mask_suffix=mask_suffix,
+    )
+    return mask, fragment_mask, mask_store, xyxys, sample_bbox_indices
+
+
+def _empty_val_segment_result():
+    return {
+        "patch_count": 0,
+        "val_loader": None,
+        "mask_shape": None,
+        "mask_border": None,
+    }
+
+
 def load_train_segment(
     fragment_id,
     seg_meta,
@@ -65,21 +167,19 @@ def load_train_segment(
 ):
     t0 = time.time()
     log(f"load train segment={fragment_id} group={group_name}")
-    layer_range = _segment_layer_range(seg_meta, fragment_id)
-    reverse_layers = _segment_reverse_layers(seg_meta, fragment_id)
-    layers = read_image_layers(
+    layer_range, reverse_layers = _segment_layer_settings(seg_meta, fragment_id)
+
+    image, mask, fragment_mask = _read_tiff_segment(
         fragment_id,
         layer_range=layer_range,
-    )
-    if fragment_id in overlap_segments:
-        layers_cache[fragment_id] = layers
-
-    image, mask, fragment_mask = read_image_mask(
-        fragment_id,
         reverse_layers=reverse_layers,
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
-        images=layers,
+        layers_cache=layers_cache,
+        overlap_segments=overlap_segments,
+        cache_for_overlap=True,
+        reuse_layers_cache=False,
+        split_name="train",
     )
     log(
         f"loaded train segment={fragment_id} "
@@ -138,36 +238,23 @@ def load_train_segment_lazy(
     label_suffix,
     mask_suffix,
 ):
-    sid = str(fragment_id)
-    layer_range = _segment_layer_range(seg_meta, fragment_id)
-    reverse_layers = _segment_reverse_layers(seg_meta, fragment_id)
+    layer_range, reverse_layers = _segment_layer_settings(seg_meta, fragment_id)
 
     t0 = time.time()
+    sid = str(fragment_id)
     log(f"load train segment={sid} group={group_name} (zarr)")
-    volume = volume_cache.get(sid)
-    if volume is None:
-        volume = ZarrSegmentVolume(
-            sid,
-            seg_meta,
-            layer_range=layer_range,
-            reverse_layers=reverse_layers,
-        )
-        volume_cache[sid] = volume
-    else:
-        log(f"reuse zarr volume cache for train segment={sid}")
-
-    mask, fragment_mask = read_label_and_fragment_mask_for_shape(
-        sid,
-        volume.shape[:2],
-        label_suffix=label_suffix,
-        mask_suffix=mask_suffix,
-    )
-    mask_store, xyxys, sample_bbox_indices = build_mask_store_and_patch_index_cached(
-        mask,
-        fragment_mask,
-        fragment_id=sid,
+    sid, volume = _load_or_create_zarr_volume(
+        fragment_id,
+        seg_meta,
+        layer_range=layer_range,
+        reverse_layers=reverse_layers,
+        volume_cache=volume_cache,
         split_name="train",
-        filter_empty_tile=False,
+    )
+    mask, fragment_mask, mask_store, xyxys, sample_bbox_indices = _build_zarr_patch_index(
+        sid=sid,
+        volume=volume,
+        split_name="train",
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
     )
@@ -209,23 +296,19 @@ def load_val_segment(
 ):
     t0 = time.time()
     log(f"load val segment={fragment_id} group={group_name}")
-    layer_range = _segment_layer_range(seg_meta, fragment_id)
-    reverse_layers = _segment_reverse_layers(seg_meta, fragment_id)
-    layers = layers_cache.get(fragment_id)
-    if layers is None:
-        layers = read_image_layers(
-            fragment_id,
-            layer_range=layer_range,
-        )
-    else:
-        log(f"reuse layers cache for val segment={fragment_id}")
+    layer_range, reverse_layers = _segment_layer_settings(seg_meta, fragment_id)
 
-    image_val, mask_val, fragment_mask_val = read_image_mask(
+    image_val, mask_val, fragment_mask_val = _read_tiff_segment(
         fragment_id,
+        layer_range=layer_range,
         reverse_layers=reverse_layers,
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
-        images=layers,
+        layers_cache=layers_cache,
+        overlap_segments=None,
+        cache_for_overlap=False,
+        reuse_layers_cache=True,
+        split_name="val",
     )
     log(
         f"loaded val segment={fragment_id} "
@@ -245,12 +328,7 @@ def load_val_segment(
 
     patch_count = int(len(frag_val_images))
     if patch_count == 0:
-        return {
-            "patch_count": patch_count,
-            "val_loader": None,
-            "mask_shape": None,
-            "mask_border": None,
-        }
+        return _empty_val_segment_result()
 
     frag_val_xyxys = np.stack(frag_val_xyxys) if len(frag_val_xyxys) > 0 else np.zeros((0, 4), dtype=np.int64)
     frag_val_groups = [group_idx] * len(frag_val_images)
@@ -290,36 +368,23 @@ def load_val_segment_lazy(
     label_suffix,
     mask_suffix,
 ):
-    sid = str(fragment_id)
-    layer_range = _segment_layer_range(seg_meta, fragment_id)
-    reverse_layers = _segment_reverse_layers(seg_meta, fragment_id)
+    layer_range, reverse_layers = _segment_layer_settings(seg_meta, fragment_id)
 
     t0 = time.time()
+    sid = str(fragment_id)
     log(f"load val segment={sid} group={group_name} (zarr)")
-    volume = volume_cache.get(sid)
-    if volume is None:
-        volume = ZarrSegmentVolume(
-            sid,
-            seg_meta,
-            layer_range=layer_range,
-            reverse_layers=reverse_layers,
-        )
-        volume_cache[sid] = volume
-    else:
-        log(f"reuse zarr volume cache for val segment={sid}")
-
-    mask_val, fragment_mask_val = read_label_and_fragment_mask_for_shape(
-        sid,
-        volume.shape[:2],
-        label_suffix=label_suffix,
-        mask_suffix=mask_suffix,
-    )
-    mask_store_val, val_xyxys, val_sample_bbox_indices = build_mask_store_and_patch_index_cached(
-        mask_val,
-        fragment_mask_val,
-        fragment_id=sid,
+    sid, volume = _load_or_create_zarr_volume(
+        fragment_id,
+        seg_meta,
+        layer_range=layer_range,
+        reverse_layers=reverse_layers,
+        volume_cache=volume_cache,
         split_name="val",
-        filter_empty_tile=False,
+    )
+    mask_val, fragment_mask_val, mask_store_val, val_xyxys, val_sample_bbox_indices = _build_zarr_patch_index(
+        sid=sid,
+        volume=volume,
+        split_name="val",
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
     )
@@ -329,12 +394,7 @@ def load_val_segment_lazy(
         f"mask={tuple(fragment_mask_val.shape)} patches={patch_count} in {time.time() - t0:.1f}s"
     )
     if patch_count == 0:
-        return {
-            "patch_count": patch_count,
-            "val_loader": None,
-            "mask_shape": None,
-            "mask_border": None,
-        }
+        return _empty_val_segment_result()
 
     val_dataset = LazyZarrXyLabelDataset(
         {sid: volume},
@@ -362,6 +422,15 @@ def load_val_segment_lazy(
     }
 
 
+def _backend_loader_kwargs(*, backend, overlap_segments=None, layers_cache=None, volume_cache=None):
+    if backend == "zarr":
+        return {"volume_cache": volume_cache}
+    return {
+        "overlap_segments": overlap_segments,
+        "layers_cache": layers_cache,
+    }
+
+
 def load_train_segment_for_backend(
     fragment_id,
     seg_meta,
@@ -377,28 +446,28 @@ def load_train_segment_for_backend(
     volume_cache=None,
 ):
     backend = _normalize_data_backend(data_backend)
-    if backend == "zarr":
-        return load_train_segment_lazy(
-            fragment_id,
-            seg_meta,
-            group_idx,
-            group_name,
-            volume_cache=volume_cache,
-            include_train_xyxys=include_train_xyxys,
-            label_suffix=label_suffix,
-            mask_suffix=mask_suffix,
-        )
-    return load_train_segment(
+    loader_fn = load_train_segment_lazy if backend == "zarr" else load_train_segment
+    return loader_fn(
         fragment_id,
         seg_meta,
         group_idx,
         group_name,
-        overlap_segments=overlap_segments,
-        layers_cache=layers_cache,
         include_train_xyxys=include_train_xyxys,
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
+        **_backend_loader_kwargs(
+            backend=backend,
+            overlap_segments=overlap_segments,
+            layers_cache=layers_cache,
+            volume_cache=volume_cache,
+        ),
     )
+
+
+def _backend_val_loader_kwargs(*, backend, layers_cache=None, volume_cache=None):
+    if backend == "zarr":
+        return {"volume_cache": volume_cache}
+    return {"layers_cache": layers_cache}
 
 
 def load_val_segment_for_backend(
@@ -416,26 +485,19 @@ def load_val_segment_for_backend(
     volume_cache=None,
 ):
     backend = _normalize_data_backend(data_backend)
-    if backend == "zarr":
-        return load_val_segment_lazy(
-            fragment_id,
-            seg_meta,
-            group_idx,
-            group_name,
-            volume_cache=volume_cache,
-            include_train_xyxys=include_train_xyxys,
-            valid_transform=valid_transform,
-            label_suffix=label_suffix,
-            mask_suffix=mask_suffix,
-        )
-    return load_val_segment(
+    loader_fn = load_val_segment_lazy if backend == "zarr" else load_val_segment
+    return loader_fn(
         fragment_id,
         seg_meta,
         group_idx,
         group_name,
-        layers_cache=layers_cache,
         include_train_xyxys=include_train_xyxys,
         valid_transform=valid_transform,
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
+        **_backend_val_loader_kwargs(
+            backend=backend,
+            layers_cache=layers_cache,
+            volume_cache=volume_cache,
+        ),
     )

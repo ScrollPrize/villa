@@ -377,43 +377,6 @@ def _build_group_metadata_for_active_splits(
     return group_names, fragment_to_group_idx
 
 
-def _build_state(
-    *,
-    train_loader,
-    group_names,
-    group_idx_by_segment,
-    train_group_counts,
-    steps_per_epoch,
-    train_stitch_loaders,
-    train_stitch_shapes,
-    train_stitch_segment_ids,
-    train_mask_borders,
-    train_mask_bboxes,
-    log_only_loaders,
-    log_only_shapes,
-    log_only_segment_ids,
-    log_only_bboxes,
-    tracking,
-):
-    return build_data_state(
-        train_loader=train_loader,
-        group_names=group_names,
-        group_idx_by_segment=group_idx_by_segment,
-        train_group_counts=train_group_counts,
-        steps_per_epoch=steps_per_epoch,
-        train_stitch_loaders=train_stitch_loaders,
-        train_stitch_shapes=train_stitch_shapes,
-        train_stitch_segment_ids=train_stitch_segment_ids,
-        train_mask_borders=train_mask_borders,
-        train_mask_bboxes=train_mask_bboxes,
-        log_only_loaders=log_only_loaders,
-        log_only_shapes=log_only_shapes,
-        log_only_segment_ids=log_only_segment_ids,
-        log_only_bboxes=log_only_bboxes,
-        tracking=tracking,
-    )
-
-
 def _build_datasets_for_backend(
     *,
     data_backend,
@@ -608,7 +571,7 @@ def _build_datasets_for_backend(
             log_only_downsample=log_only_downsample,
         )
 
-    return _build_state(
+    return build_data_state(
         train_loader=train_loader,
         group_names=group_names,
         group_idx_by_segment=group_idx_by_segment,

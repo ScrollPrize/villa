@@ -32,41 +32,6 @@ def _normalize_data_backend(data_backend):
     return backend
 
 
-def build_train_stitch_loaders(train_fragment_ids, train_stitch_candidates, stitch_segment_id, *, valid_transform):
-    train_stitch_loaders = []
-    train_stitch_shapes = []
-    train_stitch_segment_ids = []
-    if not bool(getattr(CFG, "stitch_train", False)):
-        return train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids
-
-    requested_ids = _resolve_requested_train_stitch_ids(
-        train_fragment_ids,
-        train_stitch_candidates.keys(),
-        stitch_segment_id,
-    )
-
-    for segment_id in requested_ids:
-        entry = train_stitch_candidates.get(str(segment_id))
-        if entry is None:
-            continue
-        seg_images, seg_masks, seg_xyxys, group_idx, seg_shape = entry
-        seg_groups = [int(group_idx)] * len(seg_images)
-        train_dataset_viz = CustomDataset(
-            seg_images,
-            CFG,
-            xyxys=seg_xyxys,
-            labels=seg_masks,
-            groups=seg_groups,
-            transform=valid_transform,
-        )
-        train_loader_viz = build_eval_loader(train_dataset_viz)
-        train_stitch_loaders.append(train_loader_viz)
-        train_stitch_shapes.append(tuple(seg_shape))
-        train_stitch_segment_ids.append(str(segment_id))
-
-    return train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids
-
-
 def _resolve_requested_train_stitch_ids(train_fragment_ids, available_segment_ids, stitch_segment_id):
     available = {str(x) for x in available_segment_ids}
     if bool(getattr(CFG, "stitch_all_val", False)):
@@ -88,6 +53,66 @@ def _resolve_requested_train_stitch_ids(train_fragment_ids, available_segment_id
     return requested_ids
 
 
+def _collect_train_stitch_loaders(requested_ids, *, build_segment_loader):
+    train_stitch_loaders = []
+    train_stitch_shapes = []
+    train_stitch_segment_ids = []
+    for segment_id in requested_ids:
+        built = build_segment_loader(str(segment_id))
+        if built is None:
+            continue
+        loader, shape, sid = built
+        train_stitch_loaders.append(loader)
+        train_stitch_shapes.append(tuple(shape))
+        train_stitch_segment_ids.append(str(sid))
+    return train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids
+
+
+def _build_train_stitch_common(
+    train_fragment_ids,
+    available_segment_ids,
+    stitch_segment_id,
+    *,
+    build_segment_loader,
+):
+    if not bool(getattr(CFG, "stitch_train", False)):
+        return [], [], []
+    requested_ids = _resolve_requested_train_stitch_ids(
+        train_fragment_ids,
+        available_segment_ids,
+        stitch_segment_id,
+    )
+    return _collect_train_stitch_loaders(
+        requested_ids,
+        build_segment_loader=build_segment_loader,
+    )
+
+
+def build_train_stitch_loaders(train_fragment_ids, train_stitch_candidates, stitch_segment_id, *, valid_transform):
+    def _build_segment_loader(segment_id):
+        entry = train_stitch_candidates.get(str(segment_id))
+        if entry is None:
+            return None
+        seg_images, seg_masks, seg_xyxys, group_idx, seg_shape = entry
+        seg_groups = [int(group_idx)] * len(seg_images)
+        train_dataset_viz = CustomDataset(
+            seg_images,
+            CFG,
+            xyxys=seg_xyxys,
+            labels=seg_masks,
+            groups=seg_groups,
+            transform=valid_transform,
+        )
+        return build_eval_loader(train_dataset_viz), tuple(seg_shape), str(segment_id)
+
+    return _build_train_stitch_common(
+        train_fragment_ids,
+        train_stitch_candidates.keys(),
+        stitch_segment_id,
+        build_segment_loader=_build_segment_loader,
+    )
+
+
 def build_train_stitch_loaders_lazy(
     train_fragment_ids,
     train_volumes_by_segment,
@@ -99,25 +124,13 @@ def build_train_stitch_loaders_lazy(
     *,
     valid_transform,
 ):
-    train_stitch_loaders = []
-    train_stitch_shapes = []
-    train_stitch_segment_ids = []
-    if not bool(getattr(CFG, "stitch_train", False)):
-        return train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids
-
-    requested_ids = _resolve_requested_train_stitch_ids(
-        train_fragment_ids,
-        train_xyxys_by_segment.keys(),
-        stitch_segment_id,
-    )
-
-    for segment_id in requested_ids:
+    def _build_segment_loader(segment_id):
         sid = str(segment_id)
         xy = train_xyxys_by_segment.get(sid)
         if xy is None or int(len(xy)) == 0:
-            continue
+            return None
         if sid not in train_volumes_by_segment or sid not in train_masks_by_segment:
-            continue
+            return None
         bbox_idx = train_sample_bbox_indices_by_segment.get(sid)
         if bbox_idx is None:
             bbox_idx = np.full((int(len(xy)),), -1, dtype=np.int32)
@@ -131,12 +144,14 @@ def build_train_stitch_loaders_lazy(
             transform=valid_transform,
             sample_bbox_indices_by_segment={sid: bbox_idx},
         )
-        loader = build_eval_loader(dataset)
-        train_stitch_loaders.append(loader)
-        train_stitch_shapes.append(tuple(_mask_store_shape(train_masks_by_segment[sid])))
-        train_stitch_segment_ids.append(sid)
+        return build_eval_loader(dataset), tuple(_mask_store_shape(train_masks_by_segment[sid])), sid
 
-    return train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids
+    return _build_train_stitch_common(
+        train_fragment_ids,
+        train_xyxys_by_segment.keys(),
+        stitch_segment_id,
+        build_segment_loader=_build_segment_loader,
+    )
 
 
 def build_train_stitch_outputs(
@@ -174,6 +189,27 @@ def build_train_stitch_outputs(
     raise AssertionError(f"unreachable backend dispatch: {backend!r}")
 
 
+def _collect_log_only_outputs(log_only_segments, *, build_segment_output):
+    log_only_loaders = []
+    log_only_shapes = []
+    log_only_segment_ids = []
+    log_only_bboxes = {}
+
+    for fragment_id in log_only_segments:
+        built = build_segment_output(str(fragment_id))
+        if built is None:
+            continue
+        loader, mask_shape, segment_id, bboxes = built
+        sid = str(segment_id)
+        log_only_loaders.append(loader)
+        log_only_shapes.append(tuple(mask_shape))
+        log_only_segment_ids.append(sid)
+        if bboxes is not None and int(bboxes.shape[0]) > 0:
+            log_only_bboxes[sid] = bboxes
+
+    return log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes
+
+
 def build_log_only_stitch_loaders(
     log_only_segments,
     *,
@@ -183,12 +219,7 @@ def build_log_only_stitch_loaders(
     mask_suffix,
     log_only_downsample,
 ):
-    log_only_loaders = []
-    log_only_shapes = []
-    log_only_segment_ids = []
-    log_only_bboxes = {}
-
-    for fragment_id in log_only_segments:
+    def _build_segment_output(fragment_id):
         seg_meta = _segment_meta(segments_metadata, fragment_id)
         layer_range = _segment_layer_range(seg_meta, fragment_id)
         reverse_layers = _segment_reverse_layers(seg_meta, fragment_id)
@@ -213,21 +244,18 @@ def build_log_only_stitch_loaders(
         images, xyxys = extract_patches_infer(image, fragment_mask, include_xyxys=True)
         log(f"patches log-only segment={fragment_id} n={len(images)} in {time.time() - t0:.1f}s")
         if len(images) == 0:
-            continue
+            return None
 
         xyxys = np.stack(xyxys) if len(xyxys) > 0 else np.zeros((0, 4), dtype=np.int64)
         dataset = CustomDatasetTest(images, xyxys, CFG, transform=valid_transform)
         loader = build_eval_loader(dataset)
-
-        log_only_loaders.append(loader)
-        log_only_shapes.append(tuple(fragment_mask.shape))
-        log_only_segment_ids.append(str(fragment_id))
-
         bboxes = _mask_component_bboxes_downsample(fragment_mask, int(log_only_downsample))
-        if int(bboxes.shape[0]) > 0:
-            log_only_bboxes[str(fragment_id)] = bboxes
+        return loader, tuple(fragment_mask.shape), str(fragment_id), bboxes
 
-    return log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes
+    return _collect_log_only_outputs(
+        log_only_segments,
+        build_segment_output=_build_segment_output,
+    )
 
 
 def build_log_only_stitch_loaders_lazy(
@@ -239,12 +267,7 @@ def build_log_only_stitch_loaders_lazy(
     mask_suffix,
     log_only_downsample,
 ):
-    log_only_loaders = []
-    log_only_shapes = []
-    log_only_segment_ids = []
-    log_only_bboxes = {}
-
-    for fragment_id in log_only_segments:
+    def _build_segment_output(fragment_id):
         sid = str(fragment_id)
         seg_meta = _segment_meta(segments_metadata, fragment_id)
         layer_range = _segment_layer_range(seg_meta, fragment_id)
@@ -274,7 +297,7 @@ def build_log_only_stitch_loaders_lazy(
         )
         log(f"patches log-only segment={sid} n={int(len(xyxys))}")
         if int(len(xyxys)) == 0:
-            continue
+            return None
 
         dataset = LazyZarrXyOnlyDataset(
             {sid: volume},
@@ -283,16 +306,13 @@ def build_log_only_stitch_loaders_lazy(
             transform=valid_transform,
         )
         loader = build_eval_loader(dataset)
-
-        log_only_loaders.append(loader)
-        log_only_shapes.append(tuple(fragment_mask.shape))
-        log_only_segment_ids.append(sid)
-
         bboxes = _mask_component_bboxes_downsample(fragment_mask, int(log_only_downsample))
-        if int(bboxes.shape[0]) > 0:
-            log_only_bboxes[sid] = bboxes
+        return loader, tuple(fragment_mask.shape), sid, bboxes
 
-    return log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes
+    return _collect_log_only_outputs(
+        log_only_segments,
+        build_segment_output=_build_segment_output,
+    )
 
 
 def build_log_only_outputs(
