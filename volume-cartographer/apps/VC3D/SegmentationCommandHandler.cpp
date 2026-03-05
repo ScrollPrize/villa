@@ -2380,16 +2380,23 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         return;
     }
 
-    std::filesystem::path outputRoot = volumesDir / baseOutputName.toStdString();
-    for (int suffix = 1; std::filesystem::exists(outputRoot, ec) && suffix < 1000; ++suffix) {
-        outputRoot = volumesDir /
+    std::filesystem::path finalOutputRoot = volumesDir / baseOutputName.toStdString();
+    for (int suffix = 1; std::filesystem::exists(finalOutputRoot, ec) && suffix < 1000; ++suffix) {
+        finalOutputRoot = volumesDir /
             QStringLiteral("labels_%1_%2.zarr").arg(timestamp).arg(suffix).toStdString();
     }
-    if (std::filesystem::exists(outputRoot)) {
+    if (std::filesystem::exists(finalOutputRoot)) {
         QMessageBox::critical(_parentWidget, tr("Error"),
                               tr("Unable to reserve output directory after retries: %1")
-                                  .arg(QString::fromStdString(outputRoot.string())));
+                                  .arg(QString::fromStdString(finalOutputRoot.string())));
         return;
+    }
+
+    std::filesystem::path stagedOutputRoot =
+        volumesDir / (".vc3d_rasterize_" + timestamp.toStdString());
+    for (int suffix = 1; std::filesystem::exists(stagedOutputRoot, ec) && suffix < 1000; ++suffix) {
+        stagedOutputRoot = volumesDir /
+            QStringLiteral(".vc3d_rasterize_%1_%2").arg(timestamp).arg(suffix).toStdString();
     }
 
     std::filesystem::path tempRoot =
@@ -2425,12 +2432,13 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         if (linkErr) {
             std::error_code copyErr;
             std::filesystem::copy(sourceSeg, targetSeg,
-                                 std::filesystem::copy_options::recursive, copyErr);
+                                  std::filesystem::copy_options::recursive, copyErr);
             if (copyErr) {
                 QMessageBox::critical(_parentWidget, tr("Error"),
                                       tr("Failed to stage segment '%1': %2")
                                           .arg(validIds.at(i))
                                           .arg(QString::fromStdString(copyErr.message())));
+                std::filesystem::remove_all(stagedOutputRoot, ec);
                 std::filesystem::remove_all(tempRoot);
                 return;
             }
@@ -2457,10 +2465,11 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     }
 
     const QString tempRootStr = QString::fromStdString(tempRoot.string());
-    const QString outputRootStr = QString::fromStdString(outputRoot.string());
+    const QString stagedOutputRootStr = QString::fromStdString(stagedOutputRoot.string());
+    const QString finalOutputRootStr = QString::fromStdString(finalOutputRoot.string());
     QStringList args;
     args << tempRootStr
-         << outputRootStr
+         << stagedOutputRootStr
          << QStringLiteral("--reference-zarr")
          << referenceZarr
          << QStringLiteral("--overwrite");
@@ -2475,6 +2484,7 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     if (!runner) {
         QMessageBox::critical(_parentWidget, tr("Error"),
                               tr("Command runner is not available."));
+        std::filesystem::remove_all(stagedOutputRoot);
         std::filesystem::remove_all(tempRoot);
         return;
     }
@@ -2483,7 +2493,8 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     auto connection = std::make_shared<QMetaObject::Connection>();
     *connection = connect(runner, &CommandLineToolRunner::toolFinished,
                          this,
-                         [this, guard, connection, runner, tempRootStr, outputRootStr,
+                         [this, guard, connection, runner,
+                          tempRootStr, stagedOutputRootStr, finalOutputRootStr,
                           validIds, segmentPaths](CommandLineToolRunner::Tool tool,
                                                   bool success,
                                                   const QString& message,
@@ -2498,23 +2509,37 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         }
         disconnect(*connection);
 
+        bool finalizeOutput = false;
         if (!success) {
             QMessageBox::critical(_parentWidget, tr("Error"),
                                   tr("vc_tifxyz2zarr_sparse failed.\n%1")
                                       .arg(message));
             emit statusMessage(tr("Rasterize failed"), 3000);
-        } else if (!appendRasterizationMetadata(outputRootStr, validIds, segmentPaths)) {
+        } else if (!appendRasterizationMetadata(stagedOutputRootStr, validIds, segmentPaths)) {
             emit showWarning(tr("Warning"), tr("Rasterization completed but metadata update failed"));
             emit statusMessage(tr("Rasterize complete, but metadata update failed"), 5000);
         } else {
-            emit statusMessage(
-                tr("Rasterized %1 segment(s) -> %2")
-                    .arg(validIds.size())
-                    .arg(QDir::toNativeSeparators(outputRootStr)),
-                5000);
+            std::error_code renameErr;
+            std::filesystem::rename(stagedOutputRootStr.toStdString(), finalOutputRootStr.toStdString(), renameErr);
+            if (renameErr) {
+                emit showWarning(tr("Warning"),
+                                 tr("Rasterization completed, but finalizing output folder failed: %1")
+                                     .arg(QString::fromStdString(renameErr.message())));
+                emit statusMessage(tr("Rasterize complete, but finalizing output failed"), 5000);
+            } else {
+                emit statusMessage(
+                    tr("Rasterized %1 segment(s) -> %2")
+                        .arg(validIds.size())
+                        .arg(QDir::toNativeSeparators(finalOutputRootStr)),
+                    5000);
+                finalizeOutput = true;
+            }
         }
 
         std::error_code cleanupErr;
+        if (!finalizeOutput) {
+            std::filesystem::remove_all(std::filesystem::path(stagedOutputRootStr.toStdString()), cleanupErr);
+        }
         std::filesystem::remove_all(std::filesystem::path(tempRootStr.toStdString()), cleanupErr);
     });
 
@@ -2522,6 +2547,8 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         QObject::disconnect(*connection);
         QMessageBox::critical(_parentWidget, tr("Error"),
                               tr("Failed to start vc_tifxyz2zarr_sparse."));
+        std::error_code cleanupErr;
+        std::filesystem::remove_all(stagedOutputRoot, cleanupErr);
         std::filesystem::remove_all(tempRoot);
         return;
     }
@@ -2723,7 +2750,6 @@ bool SegmentationCommandHandler::appendRasterizationMetadata(const QString& outp
     }
 
     const QString metaJsonPath = outDir.filePath(QStringLiteral("meta.json"));
-    const QString zattrsPath = outDir.filePath(QStringLiteral(".zattrs"));
 
     QJsonObject metaJson = readJsonObject(metaJsonPath);
     if (metaJson.isEmpty()) {
@@ -2739,7 +2765,6 @@ bool SegmentationCommandHandler::appendRasterizationMetadata(const QString& outp
         metaJson["format"] = QStringLiteral("zarr");
     }
 
-    QJsonObject zattrs = readJsonObject(zattrsPath);
     QJsonArray idArray;
     QJsonArray pathArray;
     for (const QString& id : segmentIds) {
@@ -2747,17 +2772,6 @@ bool SegmentationCommandHandler::appendRasterizationMetadata(const QString& outp
     }
     for (const QString& p : segmentPaths) {
         pathArray.append(p);
-    }
-
-    zattrs.insert(QStringLiteral("source_segments"), idArray);
-    zattrs.insert(QStringLiteral("source_meshes"), pathArray);
-    zattrs.insert(QStringLiteral("source_mesh_count"), static_cast<int>(segmentIds.size()));
-    zattrs.insert(QStringLiteral("rasterizer"), QStringLiteral("vc_tifxyz2zarr_sparse"));
-    zattrs.insert(QStringLiteral("rasterized_at"),
-                  QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
-
-    if (!writeJsonObject(zattrsPath, zattrs)) {
-        return false;
     }
 
     const QJsonValue rasterizedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
@@ -2769,12 +2783,6 @@ bool SegmentationCommandHandler::appendRasterizationMetadata(const QString& outp
     metaJson.insert(QStringLiteral("rasterizer"), QStringLiteral("vc_tifxyz2zarr_sparse"));
 
     if (!writeJsonObject(metaJsonPath, metaJson)) {
-        return false;
-    }
-
-    const QString metafilePath = outDir.filePath(QStringLiteral("metafile"));
-    const QJsonObject legacyMeta = metaJson;
-    if (!writeJsonObject(metafilePath, legacyMeta)) {
         return false;
     }
 

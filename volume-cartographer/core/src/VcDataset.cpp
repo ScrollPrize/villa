@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <numeric>
 #include <stdexcept>
 
@@ -72,6 +73,26 @@ static CompressorConfig parseCompressor(const nlohmann::json& zarray, int dtypeS
 
     return cfg;
 }
+
+#if UTILS_HAS_COMPRESSION
+static utils::ZarrArray::Codec codecFromConfig(const CompressorConfig& cfg)
+{
+    switch (cfg.id) {
+    case CompressorId::Blosc:
+        return utils::make_zarr_codec("blosc", cfg.blosc_clevel);
+    case CompressorId::Zstd:
+        return utils::make_zarr_codec("zstd", cfg.level);
+    case CompressorId::Lz4:
+        return utils::make_zarr_codec("lz4", cfg.level);
+    case CompressorId::Gzip:
+        return utils::make_zarr_codec("gzip", cfg.level);
+    case CompressorId::None:
+        throw std::runtime_error("zarr codec requested for uncompressed array");
+    }
+
+    throw std::runtime_error("unsupported zarr compressor");
+}
+#endif
 
 // ============================================================================
 // VcDataset::Impl
@@ -142,8 +163,20 @@ struct VcDataset::Impl {
     void openZarrArray()
     {
         // Open the zarr array directly from its path using utils
+        if (compressor_.id == CompressorId::None) {
+            zarrArray_ = std::make_unique<utils::ZarrArray>(
+                utils::ZarrArray::open(fsPath));
+            return;
+        }
+
+#if UTILS_HAS_COMPRESSION
+        auto codec = codecFromConfig(compressor_);
+        zarrArray_ = std::make_unique<utils::ZarrArray>(
+            utils::ZarrArray::open(fsPath, std::move(codec)));
+#else
         zarrArray_ = std::make_unique<utils::ZarrArray>(
             utils::ZarrArray::open(fsPath));
+#endif
     }
 };
 
@@ -185,6 +218,10 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
         case CompressorId::Blosc: {
             int ret = blosc_decompress(src, output, outBytes);
             if (ret < 0) {
+                if (compressed.size() == outBytes) {
+                    std::memcpy(output, compressed.data(), outBytes);
+                    break;
+                }
                 throw std::runtime_error("blosc_decompress failed with code " +
                                           std::to_string(ret));
             }
@@ -571,6 +608,7 @@ std::unique_ptr<VcDataset> createZarrDataset(
     zarray["dimension_separator"] = dimensionSeparator;
 
     if (compressor == "blosc") {
+#if UTILS_HAS_COMPRESSION
         zarray["compressor"] = {
             {"id", "blosc"},
             {"cname", "lz4"},
@@ -578,11 +616,18 @@ std::unique_ptr<VcDataset> createZarrDataset(
             {"shuffle", 1},
             {"blocksize", 0}
         };
+#else
+        zarray["compressor"] = nullptr;
+#endif
     } else if (compressor == "zstd") {
+#if UTILS_HAS_COMPRESSION
         zarray["compressor"] = {
             {"id", "zstd"},
             {"level", 3}
         };
+#else
+        zarray["compressor"] = nullptr;
+#endif
     } else if (compressor.empty() || compressor == "none") {
         zarray["compressor"] = nullptr;
     } else {

@@ -39,6 +39,7 @@ public:
 
 signals:
     void statusMessage(const QString& text, int timeout);
+    void volumeCatalogChanged(const QString& preferredVolumeId);
 
 #ifdef __linux__
 private slots:
@@ -52,6 +53,9 @@ private:
                               const std::string& newDirName);
     void processSegmentAddition(const std::string& dirName, const std::string& segmentName);
     void processSegmentRemoval(const std::string& dirName, const std::string& segmentName);
+    void processVolumeAddition(const std::string& volumeName);
+    void processVolumeRemoval(const std::string& volumeName);
+    void processVolumeRename(const std::string& oldName, const std::string& newName);
     void scheduleProcessing();
     bool shouldSkipForSegment(const std::string& segmentId, const char* eventCategory);
     void pruneExpiredRecentlyEdited();
@@ -68,12 +72,27 @@ private:
     QSocketNotifier* _inotifyNotifier{nullptr};
     QTimer* _processTimer{nullptr};
 
-    std::map<int, std::string> _watchDescriptors;
-    std::map<uint32_t, std::string> _pendingMoves;
+    struct WatchDescriptorInfo {
+        std::string dirName;
+        bool isVolumeWatch{false};
+    };
+
+    struct PendingMoveInfo {
+        std::string dirName;
+        std::string movedName;
+        bool isVolumeWatch{false};
+    };
+
+    std::map<int, WatchDescriptorInfo> _watchDescriptors;
+    std::map<uint32_t, PendingMoveInfo> _pendingMoves;
+    std::unordered_map<std::string, int> _pendingVolumeAddAttempts;
+    std::set<std::string> _pendingVolumeAddRetries;
 
     struct InotifyEvent {
         enum Type { Addition, Removal, Rename, Update };
+        enum Domain { Segment, Volume };
         Type type;
+        Domain resourceDomain;
         std::string dirName;
         std::string segmentId;
         std::string newId;
@@ -87,5 +106,7 @@ private:
 
     static constexpr int THROTTLE_MS = 100;
     static constexpr int RECENT_EDIT_GRACE_SECONDS = 30;
+    static constexpr int VOLUME_ADD_MAX_ATTEMPTS = 2;
+    static constexpr int VOLUME_ADD_RETRY_DELAY_MS = 700;
 #endif
 };

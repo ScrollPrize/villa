@@ -38,10 +38,12 @@ VolumePkg::VolumePkg(const std::filesystem::path& fileLocation) : rootDir_{fileL
     }
 
     for (const auto& entry : std::filesystem::directory_iterator(rootDir_ / "volumes")) {
-        std::filesystem::path dirpath = std::filesystem::canonical(entry);
-        if (std::filesystem::is_directory(dirpath)) {
-            auto v = Volume::New(dirpath);
-            volumes_.emplace(v->id(), v);
+        if (!entry.is_directory()) {
+            continue;
+        }
+        const auto dirName = entry.path().filename().string();
+        if (!addSingleVolume(dirName)) {
+            Logger()->warn("Skipping initial volume '{}' (invalid or duplicate)", dirName);
         }
     }
 
@@ -125,6 +127,97 @@ std::shared_ptr<Volume> VolumePkg::volume()
 std::shared_ptr<Volume> VolumePkg::volume(const std::string& id)
 {
     return volumes_.at(id);
+}
+
+bool VolumePkg::isValidVolumeDirectory(const std::filesystem::path& dirpath) const
+{
+    if (!std::filesystem::is_directory(dirpath)) {
+        return false;
+    }
+
+    if (!std::filesystem::exists(dirpath / "meta.json") &&
+        !std::filesystem::exists(dirpath / "metadata.json")) {
+        return false;
+    }
+
+    for (const auto& entry : std::filesystem::directory_iterator(dirpath)) {
+        if (!entry.is_directory()) {
+            continue;
+        }
+
+        if (std::filesystem::exists(entry.path() / ".zarray")) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
+{
+    std::filesystem::path dirpath = rootDir_ / "volumes" / volumeDirName;
+
+    if (!std::filesystem::exists(dirpath) || !std::filesystem::is_directory(dirpath)) {
+        Logger()->warn("Cannot add volume '{}': path not found or not a directory", volumeDirName);
+        return false;
+    }
+
+    if (!isValidVolumeDirectory(dirpath)) {
+        Logger()->warn("Skipping volume '{}': missing required metadata or zarr level", volumeDirName);
+        return false;
+    }
+
+    try {
+        auto v = Volume::New(dirpath);
+        auto result = volumes_.emplace(v->id(), v);
+        if (!result.second) {
+            Logger()->warn("Volume '{}' already exists in package under id '{}'", volumeDirName, v->id());
+            return false;
+        }
+        Logger()->info("Added volume '{}' as id '{}'", volumeDirName, v->id());
+        return true;
+    } catch (const std::exception& exc) {
+        Logger()->warn("Failed to add volume '{}': {}", volumeDirName, exc.what());
+        return false;
+    }
+}
+
+bool VolumePkg::removeSingleVolume(const std::string& volumeIdOrDirName)
+{
+    auto direct = volumes_.find(volumeIdOrDirName);
+    if (direct != volumes_.end()) {
+        volumes_.erase(direct);
+        Logger()->info("Removed volume '{}'", volumeIdOrDirName);
+        return true;
+    }
+
+    for (auto it = volumes_.begin(); it != volumes_.end(); ++it) {
+        if (it->second->path().filename().string() == volumeIdOrDirName) {
+            Logger()->info("Removed volume '{}' (directory '{}')",
+                           it->first,
+                           volumeIdOrDirName);
+            volumes_.erase(it);
+            return true;
+        }
+    }
+
+    Logger()->warn("Cannot remove volume '{}': not found", volumeIdOrDirName);
+    return false;
+}
+
+bool VolumePkg::reloadSingleVolume(const std::string& volumeId)
+{
+    auto it = volumes_.find(volumeId);
+    if (it == volumes_.end()) {
+        if (!addSingleVolume(volumeId)) {
+            return false;
+        }
+        return true;
+    }
+
+    const auto volumePath = it->second->path();
+    removeSingleVolume(volumeId);
+    return addSingleVolume(volumePath.filename().string());
 }
 
 bool VolumePkg::hasSegmentations() const

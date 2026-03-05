@@ -161,6 +161,7 @@ private slots:
     void onSliceStepSizeChanged(int newSize);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
+    void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
 
 private:
     CState* _state;

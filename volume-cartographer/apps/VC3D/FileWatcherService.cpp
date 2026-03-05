@@ -74,8 +74,25 @@ void FileWatcherService::startWatching()
             continue;
         }
 
-        _watchDescriptors[wd] = dirName;
+        _watchDescriptors[wd] = WatchDescriptorInfo{dirName, false};
         Logger()->info("Started inotify watch for {} directory (wd={})", dirName, wd);
+    }
+
+    // Watch volumes directory for live updates
+    {
+        std::filesystem::path volumesDir = std::filesystem::path(_state->vpkg()->getVolpkgDirectory()) / "volumes";
+        if (std::filesystem::exists(volumesDir)) {
+            int wd = inotify_add_watch(_inotifyFd, volumesDir.c_str(),
+                                      IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_ONLYDIR);
+            if (wd < 0) {
+                Logger()->error("Failed to add inotify watch for volumes directory: {}", strerror(errno));
+            } else {
+                _watchDescriptors[wd] = WatchDescriptorInfo{"volumes", true};
+                Logger()->info("Started inotify watch for volumes directory (wd={})", wd);
+            }
+        } else {
+            Logger()->warn("Volumes directory does not exist at {} - skipping watch", volumesDir.string());
+        }
     }
 
     // Set up Qt socket notifier to integrate with event loop
@@ -96,7 +113,7 @@ void FileWatcherService::stopWatching()
 
     if (_inotifyFd >= 0) {
         // Remove all watches
-        for (const auto& [wd, dirName] : _watchDescriptors) {
+        for (const auto& [wd, info] : _watchDescriptors) {
             inotify_rm_watch(_inotifyFd, wd);
         }
         _watchDescriptors.clear();
@@ -106,6 +123,8 @@ void FileWatcherService::stopWatching()
     }
 
     _pendingMoves.clear();
+    _pendingVolumeAddAttempts.clear();
+    _pendingVolumeAddRetries.clear();
 }
 
 void FileWatcherService::onInotifyEvent()
@@ -142,13 +161,16 @@ void FileWatcherService::onInotifyEvent()
             // Find the directory name for this watch descriptor
             auto it = _watchDescriptors.find(event->wd);
             if (it != _watchDescriptors.end()) {
-                std::string dirName = it->second;
+                const auto& watchInfo = it->second;
+                std::string dirName = watchInfo.isVolumeWatch ? "volumes" : watchInfo.dirName;
+                const auto resourceDomain = watchInfo.isVolumeWatch ? InotifyEvent::Volume : InotifyEvent::Segment;
 
                 // Handle different event types
                 if (event->mask & IN_CREATE) {
                     // New segment created
                     InotifyEvent evt;
                     evt.type = InotifyEvent::Addition;
+                    evt.resourceDomain = resourceDomain;
                     evt.dirName = dirName;
                     evt.segmentId = fileName;
                     _pendingEvents.push_back(evt);
@@ -157,38 +179,42 @@ void FileWatcherService::onInotifyEvent()
                     // Segment deleted
                     InotifyEvent evt;
                     evt.type = InotifyEvent::Removal;
+                    evt.resourceDomain = resourceDomain;
                     evt.dirName = dirName;
                     evt.segmentId = fileName;
                     _pendingEvents.push_back(evt);
 
                 } else if (event->mask & IN_MOVED_FROM) {
                     // First part of move/rename - store with cookie
-                    // Store both the filename and directory for orphaned move cleanup
-                    _pendingMoves[event->cookie] = dirName + "/" + fileName;
+                    _pendingMoves[event->cookie] = PendingMoveInfo{watchInfo.dirName, fileName, watchInfo.isVolumeWatch};
 
                 } else if (event->mask & IN_MOVED_TO) {
                     // Second part of move/rename
                     auto moveIt = _pendingMoves.find(event->cookie);
                     if (moveIt != _pendingMoves.end()) {
                         // This is a rename within watched directories
-                        // Extract the old filename from the stored path
-                        std::string oldPath = moveIt->second;
-                        size_t lastSlash = oldPath.rfind('/');
-                        std::string oldName = (lastSlash != std::string::npos) ?
-                                               oldPath.substr(lastSlash + 1) : oldPath;
+                        auto oldMove = moveIt->second;
                         _pendingMoves.erase(moveIt);
-
-                        InotifyEvent evt;
-                        evt.type = InotifyEvent::Rename;
-                        evt.dirName = dirName;
-                        evt.segmentId = oldName;  // old segment ID
-                        evt.newId = fileName;      // new segment ID
-                        _pendingEvents.push_back(evt);
+                        if (oldMove.isVolumeWatch == watchInfo.isVolumeWatch) {
+                            InotifyEvent evt;
+                            evt.type = InotifyEvent::Rename;
+                            evt.resourceDomain = resourceDomain;
+                            evt.dirName = dirName;
+                            evt.segmentId = oldMove.movedName;
+                            evt.newId = fileName;
+                            _pendingEvents.push_back(evt);
+                        } else {
+                            Logger()->debug("Ignoring cross-domain rename for cookie {} ({} -> {})",
+                                            event->cookie,
+                                            oldMove.isVolumeWatch ? "volumes" : "segment",
+                                            watchInfo.isVolumeWatch ? "volumes" : "segment");
+                        }
 
                     } else {
                         // File moved from outside watched directory - treat as new addition
                         InotifyEvent evt;
                         evt.type = InotifyEvent::Addition;
+                        evt.resourceDomain = resourceDomain;
                         evt.dirName = dirName;
                         evt.segmentId = fileName;
                         _pendingEvents.push_back(evt);
@@ -209,18 +235,14 @@ void FileWatcherService::onInotifyEvent()
         // Clean up orphaned moves every 5 seconds
         if (std::chrono::duration_cast<std::chrono::seconds>(now - lastCleanup).count() > 5) {
             for (auto it = _pendingMoves.begin(); it != _pendingMoves.end(); ) {
-                // Extract directory and filename from stored path
-                std::string fullPath = it->second;
-                size_t lastSlash = fullPath.rfind('/');
-                if (lastSlash != std::string::npos) {
-                    std::string dirName = fullPath.substr(0, lastSlash);
-                    std::string fileName = fullPath.substr(lastSlash + 1);
-
+                auto oldMove = it->second;
+                {
                     // Treat orphaned MOVED_FROM as deletions
                     InotifyEvent evt;
                     evt.type = InotifyEvent::Removal;
-                    evt.dirName = dirName;
-                    evt.segmentId = fileName;
+                    evt.resourceDomain = oldMove.isVolumeWatch ? InotifyEvent::Volume : InotifyEvent::Segment;
+                    evt.dirName = oldMove.isVolumeWatch ? "volumes" : oldMove.dirName;
+                    evt.segmentId = oldMove.movedName;
                     _pendingEvents.push_back(evt);
                 }
 
@@ -450,6 +472,77 @@ void FileWatcherService::processSegmentRemoval(const std::string& dirName, const
     }
 }
 
+void FileWatcherService::processVolumeAddition(const std::string& volumeName)
+{
+    if (!_state->vpkg()) return;
+
+    Logger()->info("Processing volume addition of {}", volumeName);
+    if (_state->vpkg()->addSingleVolume(volumeName)) {
+        _pendingVolumeAddAttempts.erase(volumeName);
+        _pendingVolumeAddRetries.erase(volumeName);
+        emit volumeCatalogChanged(QString::fromStdString(volumeName));
+        return;
+    }
+
+    if (_pendingVolumeAddRetries.count(volumeName) > 0) {
+        return;
+    }
+
+    const int currentAttempts = _pendingVolumeAddAttempts[volumeName] + 1;
+    _pendingVolumeAddAttempts[volumeName] = currentAttempts;
+
+    if (currentAttempts >= VOLUME_ADD_MAX_ATTEMPTS) {
+        Logger()->warn("Giving up on volume '{}' after {} attempts", volumeName, currentAttempts);
+        _pendingVolumeAddAttempts.erase(volumeName);
+        _pendingVolumeAddRetries.erase(volumeName);
+        return;
+    }
+
+    const QString volumeId = QString::fromStdString(volumeName);
+    Logger()->warn("Volume '{}' is not yet valid. Retrying {}/{} in {}ms",
+                   volumeName, currentAttempts + 1, VOLUME_ADD_MAX_ATTEMPTS, VOLUME_ADD_RETRY_DELAY_MS);
+    _pendingVolumeAddRetries.insert(volumeName);
+    QTimer::singleShot(VOLUME_ADD_RETRY_DELAY_MS, this, [this, volumeId]() {
+        if (!_state || !_state->vpkg()) {
+            _pendingVolumeAddAttempts.erase(volumeId.toStdString());
+            _pendingVolumeAddRetries.erase(volumeId.toStdString());
+            return;
+        }
+        _pendingVolumeAddRetries.erase(volumeId.toStdString());
+        processVolumeAddition(volumeId.toStdString());
+    });
+}
+
+void FileWatcherService::processVolumeRemoval(const std::string& volumeName)
+{
+    if (!_state->vpkg()) return;
+
+    Logger()->info("Processing volume removal of {}", volumeName);
+    if (_state->vpkg()->removeSingleVolume(volumeName)) {
+        _pendingVolumeAddAttempts.erase(volumeName);
+        emit volumeCatalogChanged(QString::fromStdString(volumeName));
+    }
+}
+
+void FileWatcherService::processVolumeRename(const std::string& oldVolumeName,
+                                            const std::string& newVolumeName)
+{
+    if (!_state->vpkg()) return;
+
+    Logger()->info("Processing volume rename {} -> {}", oldVolumeName, newVolumeName);
+    _pendingVolumeAddAttempts.erase(oldVolumeName);
+    _pendingVolumeAddAttempts.erase(newVolumeName);
+    _pendingVolumeAddRetries.erase(oldVolumeName);
+    _pendingVolumeAddRetries.erase(newVolumeName);
+
+    _state->vpkg()->removeSingleVolume(oldVolumeName);
+    if (_state->vpkg()->addSingleVolume(newVolumeName)) {
+        emit volumeCatalogChanged(QString::fromStdString(newVolumeName));
+    } else if (_state->vpkg()->hasVolume(oldVolumeName) || _state->hasVpkg()) {
+        emit volumeCatalogChanged(QString::fromStdString(oldVolumeName));
+    }
+}
+
 void FileWatcherService::processPendingEvents()
 {
     if (_pendingEvents.empty() && _pendingSegmentUpdates.empty()) {
@@ -465,19 +558,34 @@ void FileWatcherService::processPendingEvents()
 
     // Sort events to process removals first, then renames, then additions
     std::vector<InotifyEvent> removals, renames, additions, updates;
+    std::vector<InotifyEvent> volumeRemovals, volumeRenames, volumeAdditions;
     for (const auto& evt : _pendingEvents) {
         switch (evt.type) {
             case InotifyEvent::Removal:
-                removals.push_back(evt);
+                if (evt.resourceDomain == InotifyEvent::Segment) {
+                    removals.push_back(evt);
+                } else {
+                    volumeRemovals.push_back(evt);
+                }
                 break;
             case InotifyEvent::Rename:
-                renames.push_back(evt);
+                if (evt.resourceDomain == InotifyEvent::Segment) {
+                    renames.push_back(evt);
+                } else {
+                    volumeRenames.push_back(evt);
+                }
                 break;
             case InotifyEvent::Addition:
-                additions.push_back(evt);
+                if (evt.resourceDomain == InotifyEvent::Segment) {
+                    additions.push_back(evt);
+                } else {
+                    volumeAdditions.push_back(evt);
+                }
                 break;
             case InotifyEvent::Update:
-                updates.push_back(evt);
+                if (evt.resourceDomain == InotifyEvent::Segment) {
+                    updates.push_back(evt);
+                }
                 break;
         }
     }
@@ -509,6 +617,7 @@ void FileWatcherService::processPendingEvents()
 
                 InotifyEvent updateEvt;
                 updateEvt.type = InotifyEvent::Update;
+                updateEvt.resourceDomain = removal.resourceDomain;
                 updateEvt.dirName = removal.dirName;
                 updateEvt.segmentId = removal.segmentId;
                 updates.push_back(updateEvt);
@@ -555,6 +664,18 @@ void FileWatcherService::processPendingEvents()
 
     for (const auto& evt : updates) {
         processSegmentUpdate(evt.dirName, evt.segmentId);
+    }
+
+    for (const auto& evt : volumeRemovals) {
+        processVolumeRemoval(evt.segmentId);
+    }
+
+    for (const auto& evt : volumeRenames) {
+        processVolumeRename(evt.segmentId, evt.newId);
+    }
+
+    for (const auto& evt : volumeAdditions) {
+        processVolumeAddition(evt.segmentId);
     }
 
     // Process unique segment updates
