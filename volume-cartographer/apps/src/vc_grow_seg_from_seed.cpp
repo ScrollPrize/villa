@@ -609,7 +609,7 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
 
-        const cv::Mat_<cv::Vec3f> src_points = src_surface->rawPoints();
+        cv::Mat_<cv::Vec3f> src_points = src_surface->rawPoints();
         const int rows = src_points.rows;
         const int cols = src_points.cols;
         const std::string copy_mask_path = params.value("copy_mask", std::string());
@@ -1319,7 +1319,7 @@ int main(int argc, char *argv[])
         cv::Mat_<uint8_t> moved_points_mask;
         int moved_point_count = 0;
         if (copy_mask_enabled) {
-            final_points = src_points.clone();
+            final_points = std::move(dst_points);
             int selected_count = 0;
             int replaced_count = 0;
             int kept_original_count = 0;
@@ -1330,6 +1330,9 @@ int main(int argc, char *argv[])
             for (int r = 0; r < rows; ++r) {
                 for (int c = 0; c < cols; ++c) {
                     if (copy_mask(r, c) == 0) {
+                        if (src_valid(r, c)) {
+                            final_points(r, c) = src_points(r, c);
+                        }
                         continue;
                     }
                     ++selected_count;
@@ -1337,8 +1340,8 @@ int main(int argc, char *argv[])
                         ++selected_invalid_source;
                         continue;
                     }
-                    if (is_valid_vertex(dst_points(r, c))) {
-                        const cv::Vec3f& moved = dst_points(r, c);
+                    if (is_valid_vertex(final_points(r, c))) {
+                        const cv::Vec3f& moved = final_points(r, c);
                         final_points(r, c) = moved;
                         ++replaced_count;
                         if (cv::norm(moved - src_points(r, c)) > moved_eps) {
@@ -1346,6 +1349,7 @@ int main(int argc, char *argv[])
                             ++moved_point_count;
                         }
                     } else {
+                        final_points(r, c) = src_points(r, c);
                         ++kept_original_count;
                     }
                 }
@@ -1460,7 +1464,8 @@ int main(int argc, char *argv[])
         }
 
         // Prepare output surface and save
-        std::unique_ptr<QuadSurface> out_surf(new QuadSurface(final_points, src_surface->scale()));
+        auto out_points = std::make_unique<cv::Mat_<cv::Vec3f>>(std::move(final_points));
+        std::unique_ptr<QuadSurface> out_surf(new QuadSurface(out_points.release(), src_surface->scale()));
         // Prepare naming
         std::string neighbor_prefix = copy_mask_enabled
                                         ? (std::string("neighbor_copy_") + (cast_out ? "out_" : "in_"))
@@ -1508,6 +1513,19 @@ int main(int argc, char *argv[])
                 out_surf->setChannel("resume_local_mask", moved_points_mask);
             }
         }
+
+        // Release large temporary buffers before save/optimization to keep peak RSS lower.
+        copy_mask.release();
+        src_valid.release();
+        ray_dirs.release();
+        ray_dir_valid.release();
+        hit_dist.release();
+        new_points.release();
+        dst_points.release();
+        src_points.release();
+        final_points.release();
+        moved_points_mask.release();
+        src_surface.reset();
 
         if (copy_mask_enabled && moved_point_count > 0) {
             json resume_local_params = params;
