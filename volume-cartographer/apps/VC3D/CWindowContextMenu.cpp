@@ -1325,13 +1325,10 @@ void CWindow::onNeighborCopyRequested(const QString& segmentId,
         pass1Params["neighbor_max_distance"] = 200;
         pass1Params["mode"] = QStringLiteral("gen_neighbor");
         pass1Params["neighbor_min_clearance"] = 4;
-        // Keep masked copy memory usage bounded on large surfaces.
-        pass1Params["neighbor_fill"] = false;
+        pass1Params["neighbor_fill"] = true;
         pass1Params["neighbor_interp_window"] = 5;
         pass1Params["generations"] = 2;
         pass1Params["neighbor_spike_window"] = 2;
-        // Skip implicit local tracer pass for masked-copy button workflow.
-        pass1Params["copy_auto_resume_local"] = false;
         pass1Params["copy_mask"] = trimmedCopyMaskPath;
     } else {
         QVector<NeighborCopyVolumeOption> volumeOptions;
