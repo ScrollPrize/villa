@@ -8,10 +8,8 @@ Layout:
 - `datasets_runtime`: dataset classes and flat-index utilities
 - `segment_trainval`: train/val segment loading implementations
 - `segment_stitching`: stitch/train-viz/log-only segment loaders
-- `dataloaders`: dataloader factory helpers
 - `patch_index_cache`: patch-index caching and reuse
 - `normalization_stats`: fold-level normalization statistics
-- `segment_metadata`: compact metadata readers
 """
 
 __all__ = [
@@ -22,8 +20,6 @@ __all__ = [
     "augmentations",
     "segment_trainval",
     "segment_stitching",
-    "dataloaders",
     "patch_index_cache",
     "normalization_stats",
-    "segment_metadata",
 ]

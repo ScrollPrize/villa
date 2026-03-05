@@ -4,15 +4,13 @@ import numpy as np
 
 from train_resnet3d_lib.config import CFG, log
 from train_resnet3d_lib.data.image_readers import (
+    get_segment_layer_range as _segment_layer_range,
+    get_segment_meta as _segment_meta,
+    get_segment_reverse_layers as _segment_reverse_layers,
     read_image_mask,
     read_label_and_fragment_mask_for_shape,
 )
 from train_resnet3d_lib.data.zarr_volume import ZarrSegmentVolume
-from train_resnet3d_lib.data.segment_metadata import (
-    get_segment_layer_range as _segment_layer_range,
-    get_segment_meta as _segment_meta,
-    get_segment_reverse_layers as _segment_reverse_layers,
-)
 
 
 def _label_foreground_mask(mask):

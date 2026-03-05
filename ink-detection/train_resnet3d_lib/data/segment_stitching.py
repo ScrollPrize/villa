@@ -1,9 +1,9 @@
 import time
 
 import numpy as np
+from torch.utils.data import DataLoader
 
 from train_resnet3d_lib.config import CFG, log
-from train_resnet3d_lib.data.dataloaders import build_eval_loader
 from train_resnet3d_lib.data.datasets_runtime import (
     CustomDataset,
     CustomDatasetTest,
@@ -12,19 +12,28 @@ from train_resnet3d_lib.data.datasets_runtime import (
 )
 from train_resnet3d_lib.data.patching import _mask_component_bboxes_downsample, _mask_store_shape, extract_patches_infer
 from train_resnet3d_lib.data.image_readers import (
+    get_segment_layer_range as _segment_layer_range,
+    get_segment_meta as _segment_meta,
+    get_segment_reverse_layers as _segment_reverse_layers,
     read_fragment_mask_for_shape,
     read_image_fragment_mask,
     read_image_layers,
 )
 from train_resnet3d_lib.data.zarr_volume import ZarrSegmentVolume
 from train_resnet3d_lib.data.patch_index_cache import extract_infer_patch_coordinates_cached
-from train_resnet3d_lib.data.segment_metadata import (
-    get_segment_layer_range as _segment_layer_range,
-    get_segment_meta as _segment_meta,
-    get_segment_reverse_layers as _segment_reverse_layers,
-)
 
 _SUPPORTED_DATA_BACKENDS = ("zarr", "tiff")
+
+
+def _build_eval_loader(dataset):
+    return DataLoader(
+        dataset,
+        batch_size=CFG.valid_batch_size,
+        shuffle=False,
+        num_workers=CFG.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
 
 
 def _normalize_data_backend(data_backend):
@@ -105,7 +114,7 @@ def build_train_stitch_loaders(train_fragment_ids, train_stitch_candidates, stit
             groups=seg_groups,
             transform=valid_transform,
         )
-        return build_eval_loader(train_dataset_viz), tuple(seg_shape), str(segment_id)
+        return _build_eval_loader(train_dataset_viz), tuple(seg_shape), str(segment_id)
 
     return _build_train_stitch_common(
         train_fragment_ids,
@@ -146,7 +155,7 @@ def build_train_stitch_loaders_lazy(
             transform=valid_transform,
             sample_bbox_indices_by_segment={sid: bbox_idx},
         )
-        return build_eval_loader(dataset), tuple(_mask_store_shape(train_masks_by_segment[sid])), sid
+        return _build_eval_loader(dataset), tuple(_mask_store_shape(train_masks_by_segment[sid])), sid
 
     return _build_train_stitch_common(
         train_fragment_ids,
@@ -243,7 +252,7 @@ def build_log_only_stitch_loaders(
 
         xyxys = np.stack(xyxys) if len(xyxys) > 0 else np.zeros((0, 4), dtype=np.int64)
         dataset = CustomDatasetTest(images, xyxys, CFG, transform=valid_transform)
-        loader = build_eval_loader(dataset)
+        loader = _build_eval_loader(dataset)
         bboxes = _mask_component_bboxes_downsample(fragment_mask, int(log_only_downsample))
         return loader, tuple(fragment_mask.shape), str(fragment_id), bboxes
 
@@ -300,7 +309,7 @@ def build_log_only_stitch_loaders_lazy(
             CFG,
             transform=valid_transform,
         )
-        loader = build_eval_loader(dataset)
+        loader = _build_eval_loader(dataset)
         bboxes = _mask_component_bboxes_downsample(fragment_mask, int(log_only_downsample))
         return loader, tuple(fragment_mask.shape), sid, bboxes
 

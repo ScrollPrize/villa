@@ -12,8 +12,7 @@ from train_resnet3d_lib.data.datasets_runtime import (
     LazyZarrTrainDataset,
 )
 from train_resnet3d_lib.data.augmentations import get_transforms
-from train_resnet3d_lib.data.image_readers import build_group_mappings
-from train_resnet3d_lib.data.segment_metadata import get_segment_meta as _segment_meta
+from train_resnet3d_lib.data.image_readers import build_group_mappings, get_segment_meta as _segment_meta
 from train_resnet3d_lib.data.normalization_stats import (
     prepare_fold_label_foreground_percentile_clip_zscore_stats,
 )

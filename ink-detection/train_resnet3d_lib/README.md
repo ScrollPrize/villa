@@ -18,9 +18,10 @@ This folder is organized around the main research edit loops.
 - **GroupDRO objective logic**: `modeling/group_dro.py`
 - **Backbone/decoder architecture helpers**: `modeling/architecture.py`
 - **Optimizer/scheduler wiring**: `modeling/optimizers_runtime.py`
+- **Augmentation + runtime sample transforms**: `data/augmentations.py`
 
 ## Data backends and patch plumbing
 - **Train/val backend adapters (shared API for Zarr/TIFF)**: `data/segment_trainval.py`
 - **Stitch/log-only backend adapters**: `data/segment_stitching.py`
-- **Image/zarr readers + metadata**: `data/image_readers.py`, `data/zarr_volume.py`, `data/segment_metadata.py`
+- **Image/zarr readers + metadata helpers**: `data/image_readers.py`, `data/zarr_volume.py`
 - **Patch extraction + caches + dataset classes**: `data/patching.py`, `data/patch_index_cache.py`, `data/datasets_runtime.py`
