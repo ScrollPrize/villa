@@ -24,10 +24,12 @@ from train_resnet3d_lib.data.segment_metadata import (
     get_segment_reverse_layers as _segment_reverse_layers,
 )
 
+_SUPPORTED_DATA_BACKENDS = ("zarr", "tiff")
+
 
 def _normalize_data_backend(data_backend):
     backend = str(data_backend).strip().lower()
-    if backend not in {"zarr", "tiff"}:
+    if backend not in _SUPPORTED_DATA_BACKENDS:
         raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
     return backend
 
@@ -422,13 +424,26 @@ def load_val_segment_lazy(
     }
 
 
-def _backend_loader_kwargs(*, backend, overlap_segments=None, layers_cache=None, volume_cache=None):
+def _backend_loader_fns(*, backend):
+    if backend == "zarr":
+        return load_train_segment_lazy, load_val_segment_lazy
+    return load_train_segment, load_val_segment
+
+
+def _backend_loader_kwargs(
+    *,
+    backend,
+    split,
+    overlap_segments=None,
+    layers_cache=None,
+    volume_cache=None,
+):
     if backend == "zarr":
         return {"volume_cache": volume_cache}
-    return {
-        "overlap_segments": overlap_segments,
-        "layers_cache": layers_cache,
-    }
+    kwargs = {"layers_cache": layers_cache}
+    if split == "train":
+        kwargs["overlap_segments"] = overlap_segments
+    return kwargs
 
 
 def load_train_segment_for_backend(
@@ -446,8 +461,8 @@ def load_train_segment_for_backend(
     volume_cache=None,
 ):
     backend = _normalize_data_backend(data_backend)
-    loader_fn = load_train_segment_lazy if backend == "zarr" else load_train_segment
-    return loader_fn(
+    train_loader_fn, _ = _backend_loader_fns(backend=backend)
+    return train_loader_fn(
         fragment_id,
         seg_meta,
         group_idx,
@@ -457,17 +472,12 @@ def load_train_segment_for_backend(
         mask_suffix=mask_suffix,
         **_backend_loader_kwargs(
             backend=backend,
+            split="train",
             overlap_segments=overlap_segments,
             layers_cache=layers_cache,
             volume_cache=volume_cache,
         ),
     )
-
-
-def _backend_val_loader_kwargs(*, backend, layers_cache=None, volume_cache=None):
-    if backend == "zarr":
-        return {"volume_cache": volume_cache}
-    return {"layers_cache": layers_cache}
 
 
 def load_val_segment_for_backend(
@@ -485,8 +495,8 @@ def load_val_segment_for_backend(
     volume_cache=None,
 ):
     backend = _normalize_data_backend(data_backend)
-    loader_fn = load_val_segment_lazy if backend == "zarr" else load_val_segment
-    return loader_fn(
+    _, val_loader_fn = _backend_loader_fns(backend=backend)
+    return val_loader_fn(
         fragment_id,
         seg_meta,
         group_idx,
@@ -495,8 +505,9 @@ def load_val_segment_for_backend(
         valid_transform=valid_transform,
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
-        **_backend_val_loader_kwargs(
+        **_backend_loader_kwargs(
             backend=backend,
+            split="val",
             layers_cache=layers_cache,
             volume_cache=volume_cache,
         ),
