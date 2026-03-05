@@ -3122,6 +3122,18 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     }
 
     QString activeId = volSelect->count() > 0 ? volSelect->currentData().toString() : QString();
+
+    QString growthVolumeId = QString::fromStdString(_state->segmentationGrowthVolumeId());
+    if (!growthVolumeId.isEmpty() && !hasVolume(growthVolumeId)) {
+        growthVolumeId.clear();
+    }
+    if (growthVolumeId.isEmpty()) {
+        growthVolumeId = bestGrowthVolumeId;
+    }
+    if (growthVolumeId.isEmpty()) {
+        growthVolumeId = activeId;
+    }
+
     if (!activeId.isEmpty()) {
         if (!_state->currentVolume() || _state->currentVolumeId() != activeId.toStdString()) {
             try {
@@ -3130,25 +3142,30 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
             } catch (...) {
                 // Ignore errors - keep existing volume selection if invalid.
             }
-        } else if (_state->currentVolume() && _segmentationWidget) {
-            _segmentationWidget->setVolumeZarrPath(QString::fromStdString(_state->currentVolume()->path().string()));
         }
 
-        _state->setSegmentationGrowthVolumeId(activeId.toStdString());
+        _state->setSegmentationGrowthVolumeId(growthVolumeId.toStdString());
 
         if (_segmentationWidget) {
-            _segmentationWidget->setAvailableVolumes(volumeEntries, activeId);
+            _segmentationWidget->setAvailableVolumes(volumeEntries, growthVolumeId);
+            if (!growthVolumeId.isEmpty()) {
+                _segmentationWidget->setActiveVolume(growthVolumeId);
+            }
             try {
-                auto activeVolume = _state->vpkg()->volume(activeId.toStdString());
-                if (activeVolume) {
-                    _segmentationWidget->setVolumeZarrPath(QString::fromStdString(activeVolume->path().string()));
+                auto growthVolume = _state->vpkg()->volume(growthVolumeId.toStdString());
+                if (growthVolume) {
+                    _segmentationWidget->setVolumeZarrPath(QString::fromStdString(growthVolume->path().string()));
                 }
             } catch (...) {
                 // Ignore errors - neural growth path update is non-critical.
             }
         }
     } else if (_segmentationWidget) {
+        _state->setCurrentVolume(nullptr);
+        _state->setSegmentationGrowthVolumeId({});
         _segmentationWidget->setAvailableVolumes(QVector<QPair<QString, QString>>{}, {});
+        _segmentationWidget->setActiveVolume({});
+        _segmentationWidget->setVolumeZarrPath({});
     }
 }
 
