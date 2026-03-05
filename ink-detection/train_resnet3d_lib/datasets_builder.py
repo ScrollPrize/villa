@@ -26,6 +26,15 @@ from train_resnet3d_lib.data.segment_stitching import (
     build_log_only_outputs,
 )
 
+_SUPPORTED_DATA_BACKENDS = ("zarr", "tiff")
+
+
+def _normalize_data_backend(data_backend):
+    backend = str(data_backend).strip().lower()
+    if backend not in _SUPPORTED_DATA_BACKENDS:
+        raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
+    return backend
+
 
 def init_dataset_tracking(*, include_train_xyxys):
     return {
@@ -396,9 +405,7 @@ def _build_datasets_for_backend(
     log_only_downsample,
     shared_volume_cache=None,
 ):
-    backend = str(data_backend).strip().lower()
-    if backend not in {"zarr", "tiff"}:
-        raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
+    backend = _normalize_data_backend(data_backend)
     is_zarr = backend == "zarr"
     include_train_xyxys = bool(getattr(CFG, "stitch_train", False))
     tracking = init_dataset_tracking(include_train_xyxys=include_train_xyxys)
@@ -412,16 +419,14 @@ def _build_datasets_for_backend(
     train_images = []
     train_masks = []
     train_groups = []
-    train_stitch_candidates = {}
-    layers_cache = {}
+    train_stitch_candidates = {} if not is_zarr else None
+    layers_cache = {} if not is_zarr else None
     overlap_segments = set(train_fragment_ids) & set(val_fragment_ids)
 
     if is_zarr:
         if shared_volume_cache is None:
             raise ValueError("shared_volume_cache is required when training.data_backend is 'zarr'")
-        log("building datasets (zarr lazy)")
-    else:
-        log("building datasets")
+    log(f"building datasets ({backend}{' lazy' if is_zarr else ''})")
 
     def load_train_for_backend(fragment_id):
         return _load_with_group_context(
@@ -466,7 +471,7 @@ def _build_datasets_for_backend(
             train_sample_bbox_indices_by_segment[sid] = result["sample_bbox_indices"]
             return
 
-        if result["stitch_candidate"] is not None:
+        if train_stitch_candidates is not None and result["stitch_candidate"] is not None:
             train_stitch_candidates[str(fragment_id)] = result["stitch_candidate"]
         train_images.extend(result["images"])
         train_masks.extend(result["masks"])
@@ -501,14 +506,14 @@ def _build_datasets_for_backend(
 
     if is_zarr:
         train_patches_total = int(sum(int(v) for v in train_patch_counts_by_segment.values()))
-        log(
-            "dataset built (zarr) "
-            f"train_patches={train_patches_total} val_loaders={len(tracking['val_loaders'])}"
-        )
-        if train_patches_total == 0:
-            raise ValueError("No training data was built (all segments produced 0 training patches).")
     else:
-        log(f"dataset built train_patches={len(train_images)} val_loaders={len(tracking['val_loaders'])}")
+        train_patches_total = int(len(train_images))
+    log(
+        f"dataset built ({backend}) "
+        f"train_patches={train_patches_total} val_loaders={len(tracking['val_loaders'])}"
+    )
+    if train_patches_total == 0:
+        raise ValueError("No training data was built (all segments produced 0 training patches).")
     if len(tracking["val_loaders"]) == 0:
         raise ValueError("No validation data was built (all segments produced 0 validation patches).")
 
@@ -532,44 +537,43 @@ def _build_datasets_for_backend(
         )
     steps_per_epoch = log_training_budget(train_loader)
 
+    train_stitch_kwargs = {
+        "data_backend": backend,
+        "train_fragment_ids": train_fragment_ids,
+        "stitch_segment_id": tracking["stitch_segment_id"],
+        "valid_transform": valid_transform,
+    }
     if is_zarr:
-        train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids = build_train_stitch_outputs(
-            data_backend="zarr",
-            train_fragment_ids=train_fragment_ids,
-            stitch_segment_id=tracking["stitch_segment_id"],
-            valid_transform=valid_transform,
-            train_volumes_by_segment=train_volumes_by_segment,
-            train_masks_by_segment=train_masks_by_segment,
-            train_xyxys_by_segment=train_xyxys_by_segment,
-            train_sample_bbox_indices_by_segment=train_sample_bbox_indices_by_segment,
-            train_groups_by_segment=train_groups_by_segment,
-        )
-        log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes = build_log_only_outputs(
-            data_backend="zarr",
-            log_only_segments=log_only_segments,
-            segments_metadata=segments_metadata,
-            volume_cache=shared_volume_cache,
-            valid_transform=valid_transform,
-            mask_suffix=val_mask_suffix,
-            log_only_downsample=log_only_downsample,
+        train_stitch_kwargs.update(
+            {
+                "train_volumes_by_segment": train_volumes_by_segment,
+                "train_masks_by_segment": train_masks_by_segment,
+                "train_xyxys_by_segment": train_xyxys_by_segment,
+                "train_sample_bbox_indices_by_segment": train_sample_bbox_indices_by_segment,
+                "train_groups_by_segment": train_groups_by_segment,
+            }
         )
     else:
-        train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids = build_train_stitch_outputs(
-            data_backend="tiff",
-            train_fragment_ids=train_fragment_ids,
-            stitch_segment_id=tracking["stitch_segment_id"],
-            valid_transform=valid_transform,
-            train_stitch_candidates=train_stitch_candidates,
-        )
-        log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes = build_log_only_outputs(
-            data_backend="tiff",
-            log_only_segments=log_only_segments,
-            segments_metadata=segments_metadata,
-            layers_cache=layers_cache,
-            valid_transform=valid_transform,
-            mask_suffix=val_mask_suffix,
-            log_only_downsample=log_only_downsample,
-        )
+        train_stitch_kwargs["train_stitch_candidates"] = train_stitch_candidates
+    train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids = build_train_stitch_outputs(
+        **train_stitch_kwargs
+    )
+
+    log_only_kwargs = {
+        "data_backend": backend,
+        "log_only_segments": log_only_segments,
+        "segments_metadata": segments_metadata,
+        "valid_transform": valid_transform,
+        "mask_suffix": val_mask_suffix,
+        "log_only_downsample": log_only_downsample,
+    }
+    if is_zarr:
+        log_only_kwargs["volume_cache"] = shared_volume_cache
+    else:
+        log_only_kwargs["layers_cache"] = layers_cache
+    log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes = build_log_only_outputs(
+        **log_only_kwargs
+    )
 
     return build_data_state(
         train_loader=train_loader,
@@ -619,9 +623,7 @@ def build_datasets(run_state):
         f"val=(label={val_label_suffix!r}, mask={val_mask_suffix!r})"
     )
 
-    data_backend = str(getattr(CFG, "data_backend", "zarr")).strip().lower()
-    if data_backend not in {"zarr", "tiff"}:
-        raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
+    data_backend = _normalize_data_backend(getattr(CFG, "data_backend", "zarr"))
     log(f"data backend={data_backend}")
     if bool(getattr(CFG, "dataset_cache_enabled", True)) and not bool(getattr(CFG, "dataset_cache_check_hash", True)):
         log("WARNING: dataset cache hash validation is disabled (metadata.training.dataset_cache_check_hash=false)")
