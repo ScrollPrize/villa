@@ -1574,15 +1574,75 @@ static inline std::pair<cv::Vec2i, cv::Vec2i> order_p(const cv::Vec2i& p, const 
     return (p[0] < q[0] || (p[0] == q[0] && p[1] <= q[1])) ? std::make_pair(p, q) : std::make_pair(q, p);
 }
 
+namespace {
+struct LossStatusWindowState {
+    cv::Vec2i origin{0, 0};
+    cv::Size size{0, 0};
+    bool active{false};
+};
+
+thread_local LossStatusWindowState g_loss_status_window;
+
+class LossStatusWindowGuard {
+public:
+    LossStatusWindowGuard(const cv::Vec2i& origin, const cv::Size& size)
+        : prev_(g_loss_status_window)
+    {
+        g_loss_status_window.origin = origin;
+        g_loss_status_window.size = size;
+        g_loss_status_window.active = true;
+    }
+
+    ~LossStatusWindowGuard() { g_loss_status_window = prev_; }
+
+private:
+    LossStatusWindowState prev_;
+};
+
+static bool map_loss_status_index(const cv::Vec2i& global,
+                                  const cv::Mat_<uint16_t>& loss_status,
+                                  cv::Vec2i* mapped)
+{
+    if (g_loss_status_window.active) {
+        const int local_r = global[0] - g_loss_status_window.origin[0];
+        const int local_c = global[1] - g_loss_status_window.origin[1];
+        if (local_r < 0 || local_c < 0 ||
+            local_r >= g_loss_status_window.size.height ||
+            local_c >= g_loss_status_window.size.width) {
+            return false;
+        }
+        *mapped = cv::Vec2i{local_r, local_c};
+        return true;
+    }
+
+    if (global[0] < 0 || global[1] < 0 ||
+        global[0] >= loss_status.rows || global[1] >= loss_status.cols) {
+        return false;
+    }
+    *mapped = global;
+    return true;
+}
+} // namespace
+
 static bool loss_mask(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status)
 {
-    return loss_status(lower_p(p, off)) & (1 << bit);
+    cv::Vec2i idx;
+    if (!map_loss_status_index(lower_p(p, off), loss_status, &idx)) {
+        return false;
+    }
+    return (loss_status(idx) & (1 << bit)) != 0;
 }
 
 static int set_loss_mask(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status, int set)
 {
-    if (set)
-        loss_status(lower_p(p, off)) |= (1 << bit);
+    if (!set) {
+        return set;
+    }
+    cv::Vec2i idx;
+    if (!map_loss_status_index(lower_p(p, off), loss_status, &idx)) {
+        return 0;
+    }
+    loss_status(idx) |= (1 << bit);
     return set;
 }
 
@@ -2611,13 +2671,15 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
     auto t0 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
     ceres::Problem problem;
-    cv::Mat_<uint16_t> loss_status(params.state.size());
 
-    int r_outer = radius+3;
-
-    for(int oy=std::max(p[0]-r_outer,0);oy<=std::min(p[0]+r_outer,params.dpoints.rows-1);oy++)
-        for(int ox=std::max(p[1]-r_outer,0);ox<=std::min(p[1]+r_outer,params.dpoints.cols-1);ox++)
-            loss_status(oy,ox) = 0;
+    const int r_outer = radius + 3;
+    const int y_min = std::max(p[0] - r_outer, 0);
+    const int y_max = std::min(p[0] + r_outer, params.dpoints.rows - 1);
+    const int x_min = std::max(p[1] - r_outer, 0);
+    const int x_max = std::min(p[1] + r_outer, params.dpoints.cols - 1);
+    const cv::Size loss_window_size(x_max - x_min + 1, y_max - y_min + 1);
+    LossStatusWindowGuard loss_status_window_guard(cv::Vec2i{y_min, x_min}, loss_window_size);
+    cv::Mat_<uint16_t> loss_status(loss_window_size, static_cast<uint16_t>(0));
 
     for(int oy=std::max(p[0]-radius,0);oy<=std::min(p[0]+radius,params.dpoints.rows-1);oy++)
         for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,params.dpoints.cols-1);ox++) {

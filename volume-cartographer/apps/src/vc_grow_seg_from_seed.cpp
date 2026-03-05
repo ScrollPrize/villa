@@ -620,32 +620,13 @@ int main(int argc, char *argv[])
 
         cv::Mat_<uchar> copy_mask;
         if (!copy_mask_path.empty()) {
-            cv::Mat raw_mask = cv::imread(copy_mask_path, cv::IMREAD_UNCHANGED);
-            if (raw_mask.empty()) {
+            cv::Mat gray_mask = cv::imread(copy_mask_path, cv::IMREAD_ANYDEPTH | cv::IMREAD_GRAYSCALE);
+            if (gray_mask.empty()) {
                 std::cerr << "ERROR: failed to read copy mask: " << copy_mask_path << std::endl;
                 return EXIT_FAILURE;
             }
-
-            cv::Mat gray_mask;
-            if (raw_mask.channels() == 1) {
-                gray_mask = raw_mask;
-            } else if (raw_mask.channels() == 3) {
-                cv::cvtColor(raw_mask, gray_mask, cv::COLOR_BGR2GRAY);
-            } else if (raw_mask.channels() == 4) {
-                cv::cvtColor(raw_mask, gray_mask, cv::COLOR_BGRA2GRAY);
-            } else {
-                std::cerr << "ERROR: unsupported copy mask channel count (" << raw_mask.channels() << ")" << std::endl;
-                return EXIT_FAILURE;
-            }
-
             cv::Mat binary_mask;
-            if (gray_mask.depth() == CV_8U) {
-                cv::compare(gray_mask, 0, binary_mask, cv::CMP_GT);
-            } else {
-                cv::Mat gray_float;
-                gray_mask.convertTo(gray_float, CV_32F);
-                cv::compare(gray_float, 0.0f, binary_mask, cv::CMP_GT);
-            }
+            cv::compare(gray_mask, cv::Scalar::all(0), binary_mask, cv::CMP_GT);
 
             if (binary_mask.rows != rows || binary_mask.cols != cols) {
                 cv::resize(binary_mask, copy_mask, cv::Size(cols, rows), 0.0, 0.0, cv::INTER_NEAREST);
@@ -1527,7 +1508,8 @@ int main(int argc, char *argv[])
         moved_points_mask.release();
         src_surface.reset();
 
-        if (copy_mask_enabled && moved_point_count > 0) {
+        const bool copy_auto_resume_local = params.value("copy_auto_resume_local", true);
+        if (copy_mask_enabled && moved_point_count > 0 && copy_auto_resume_local) {
             json resume_local_params = params;
             resume_local_params["mode"] = "resume";
             resume_local_params["resume_opt"] = "local";
@@ -1543,7 +1525,11 @@ int main(int argc, char *argv[])
             delete optimized;
         } else {
             if (copy_mask_enabled) {
-                std::cout << "gen_neighbor copy: no moved points found, skipping automatic resume local optimization" << std::endl;
+                if (!copy_auto_resume_local) {
+                    std::cout << "gen_neighbor copy: skipping automatic resume local optimization (disabled by params)" << std::endl;
+                } else {
+                    std::cout << "gen_neighbor copy: no moved points found, skipping automatic resume local optimization" << std::endl;
+                }
             }
             out_surf->save(out_dir, uuid_local, true);
         }
