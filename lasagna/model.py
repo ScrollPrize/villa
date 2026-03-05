@@ -32,6 +32,7 @@ class FitResult3D:
 	bias_lr: torch.Tensor       # (D, 1, Hm, Wm)
 	mask_hr: torch.Tensor       # (D, 1, He, We)
 	mask_lr: torch.Tensor       # (D, 1, Hm, Wm)
+	normals: torch.Tensor       # (D, Hm, Wm, 3) detached unit normals
 	xy_conn: torch.Tensor       # (D, Hm, Wm, 3, 3) — [prev, self, next], each 3D fullres
 	mask_conn: torch.Tensor     # (D, 1, Hm, Wm, 3) — validity per connection point
 	sign_conn: torch.Tensor     # (D, 1, Hm, Wm, 2) — ray param sign [prev, next]
@@ -250,7 +251,7 @@ class Model3D(nn.Module):
 		n = torch.cross(edge_h, edge_w, dim=-1)
 		return n
 
-	def _xyz_conn(self, xyz_lr: torch.Tensor, data: fit_data.FitData3D) -> tuple[torch.Tensor, torch.Tensor]:
+	def _xyz_conn(self, xyz_lr: torch.Tensor, data: fit_data.FitData3D) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 		"""Compute connection points to neighbor depth slices.
 
 		Returns:
@@ -447,7 +448,7 @@ class Model3D(nn.Module):
 			mask_conn = torch.zeros(D, 1, Hm, Wm, 3, device=device, dtype=xyz_lr.dtype)
 			sign_conn = torch.ones(D, 1, Hm, Wm, 2, device=device, dtype=xyz_lr.dtype)
 
-		return xy_conn, mask_conn, sign_conn
+		return xy_conn, mask_conn, sign_conn, normals
 
 	def update_conn_offsets(self) -> None:
 		"""Update conn_offsets buffer from last intersection parameters. Call after opt.step()."""
@@ -481,7 +482,7 @@ class Model3D(nn.Module):
 		xyz_lr = self._grid_xyz()  # (D, Hm, Wm, 3)
 		xyz_hr = self._grid_xyz_hr(xyz_lr)  # (D, He, We, 3)
 		data_s = data.grid_sample_fullres(xyz_hr)
-		xy_conn, mask_conn, sign_conn = self._xyz_conn(xyz_lr, data)
+		xy_conn, mask_conn, sign_conn, normals = self._xyz_conn(xyz_lr, data)
 
 		D = self.depth
 		He = int(xyz_hr.shape[1])
@@ -528,6 +529,7 @@ class Model3D(nn.Module):
 			bias_lr=bias_lr,
 			mask_hr=mask_hr,
 			mask_lr=mask_lr,
+			normals=normals,
 			xy_conn=xy_conn,
 			mask_conn=mask_conn,
 			sign_conn=sign_conn,

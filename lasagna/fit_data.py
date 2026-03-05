@@ -11,6 +11,12 @@ import zarr
 
 
 @dataclass(frozen=True)
+class CorrPoints3D:
+	points_xyz_winda: torch.Tensor  # (K, 4) — x, y, z, winda in fullres
+	collection_idx: torch.Tensor    # (K,) — integer collection ID per point
+
+
+@dataclass(frozen=True)
 class FitData3D:
 	cos: torch.Tensor              # (1, 1, Z, Y, X)
 	grad_mag: torch.Tensor         # (1, 1, Z, Y, X)
@@ -22,6 +28,7 @@ class FitData3D:
 	dir1_x: torch.Tensor | None
 	valid: torch.Tensor | None     # (1, 1, Z, Y, X)
 	pred_dt: torch.Tensor | None
+	corr_points: CorrPoints3D | None
 	origin_fullres: tuple[float, float, float]  # (x0, y0, z0) in fullres voxels
 	spacing: tuple[float, float, float]          # (sx, sy, sz) voxel size in fullres units
 
@@ -67,6 +74,7 @@ class FitData3D:
 			dir1_x=_gs(self.dir1_x),
 			valid=_gs(self.valid),
 			pred_dt=_gs(self.pred_dt),
+			corr_points=self.corr_points,
 			origin_fullres=self.origin_fullres,
 			spacing=self.spacing,
 		)
@@ -313,6 +321,7 @@ def load_3d(
 		dir1_x=dir1_x_t,
 		valid=valid_t,
 		pred_dt=pred_dt_t,
+		corr_points=None,
 		origin_fullres=origin_fullres,
 		spacing=spacing,
 	)

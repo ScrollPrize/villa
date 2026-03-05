@@ -7,7 +7,8 @@
 		"winding_density": 2.0,
 		"data": 4.0,
 		"data_plain": 2.0,
-		"pred_dt": 0.5
+		"pred_dt": 0.5,
+		"corr": 1.0
 	},
 	"stages": [
 		{

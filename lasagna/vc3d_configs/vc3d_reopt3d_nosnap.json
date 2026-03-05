@@ -4,7 +4,8 @@
 		"normal": 10.0,
 		"step": 10.0,
 		"smooth": 0.0,
-		"winding_density": 2.0
+		"winding_density": 2.0,
+		"corr": 1.0
 	},
 	"stages": [
 		{
