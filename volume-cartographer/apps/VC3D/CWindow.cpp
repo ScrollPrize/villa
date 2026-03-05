@@ -398,6 +398,8 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _fileWatcher = std::make_unique<FileWatcherService>(_state, this);
     connect(_fileWatcher.get(), &FileWatcherService::statusMessage,
             this, &CWindow::onShowStatusMessage);
+    connect(_fileWatcher.get(), &FileWatcherService::volumeCatalogChanged,
+            this, &CWindow::refreshVolumeSelectionUi);
 
     _axisAlignedSliceController = std::make_unique<AxisAlignedSliceController>(_state, this);
 
@@ -1467,6 +1469,7 @@ void CWindow::CreateWidgets(void)
     _segmentationCommandHandler->setCmdRunner(_cmdRunner);
     _segmentationCommandHandler->setSurfacePanel(_surfacePanel.get());
     _segmentationCommandHandler->setSegmentationGrower(_segmentationGrower.get());
+    initializeCommandLineRunner();
     _segmentationCommandHandler->setIsEditingCheck([this]() -> bool {
         return _segmentationModule && _segmentationModule->isEditingApprovalMask();
     });
@@ -2990,54 +2993,9 @@ void CWindow::OpenVolume(const QString& path)
     if (_segmentationWidget) {
         _segmentationWidget->setVolumePackagePath(aVpkgPath);
     }
+
     setVolume(_state->vpkg()->volume());
-    {
-        const QSignalBlocker blocker{volSelect};
-        volSelect->clear();
-    }
-    QVector<QPair<QString, QString>> volumeEntries;
-    QString bestGrowthVolumeId = QString::fromStdString(_state->currentVolumeId());
-    bool preferredVolumeFound = false;
-    for (const auto& id : _state->vpkg()->volumeIDs()) {
-        auto vol = _state->vpkg()->volume(id);
-        const QString idStr = QString::fromStdString(id);
-        const QString nameStr = QString::fromStdString(vol->name());
-        const QString label = nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr);
-        volSelect->addItem(label, QVariant(idStr));
-        volumeEntries.append({idStr, label});
-
-        const QString loweredName = nameStr.toLower();
-        const QString loweredId = idStr.toLower();
-        const bool matchesPreferred = loweredName.contains(QStringLiteral("surface")) ||
-                                      loweredName.contains(QStringLiteral("surf")) ||
-                                      loweredId.contains(QStringLiteral("surface")) ||
-                                      loweredId.contains(QStringLiteral("surf"));
-
-        if (!preferredVolumeFound && matchesPreferred) {
-            bestGrowthVolumeId = idStr;
-            preferredVolumeFound = true;
-        }
-    }
-
-    if (bestGrowthVolumeId.isEmpty() && !volumeEntries.isEmpty()) {
-        bestGrowthVolumeId = volumeEntries.front().first;
-    }
-    _state->setSegmentationGrowthVolumeId(bestGrowthVolumeId.toStdString());
-
-    if (_segmentationWidget) {
-        _segmentationWidget->setAvailableVolumes(volumeEntries, bestGrowthVolumeId);
-        // Set initial volume zarr path for neural tracing
-        if (!bestGrowthVolumeId.isEmpty()) {
-            try {
-                auto vol = _state->vpkg()->volume(bestGrowthVolumeId.toStdString());
-                if (vol) {
-                    _segmentationWidget->setVolumeZarrPath(QString::fromStdString(vol->path().string()));
-                }
-            } catch (...) {
-                // Ignore errors - zarr path will be empty
-            }
-        }
-    }
+    refreshVolumeSelectionUi(QString());
 
     if (_volumeOverlay) {
         _volumeOverlay->setVolumePkg(_state->vpkg(), _state->vpkgPath());
@@ -3078,6 +3036,136 @@ void CWindow::OpenVolume(const QString& path)
 
     if (_fileWatcher) {
         _fileWatcher->startWatching();
+    }
+}
+
+void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
+{
+    if (!volSelect || !_state || !_state->vpkg()) {
+        return;
+    }
+
+    QVector<QPair<QString, QString>> volumeEntries;
+    std::vector<QString> orderedIds;
+    QString activeCandidate = preferredVolumeId;
+    const QString currentComboId = volSelect->currentData().toString();
+    const QString currentVolumeId = QString::fromStdString(_state->currentVolumeId());
+
+    auto hasVolume = [&](const QString& volumeId) {
+        for (const auto& id : orderedIds) {
+            if (id == volumeId) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    QString bestGrowthVolumeId;
+    bool preferredVolumeFound = false;
+    const auto volumeIds = _state->vpkg()->volumeIDs();
+    for (const auto& id : volumeIds) {
+        try {
+            auto vol = _state->vpkg()->volume(id);
+            const QString idStr = QString::fromStdString(id);
+            const QString nameStr = QString::fromStdString(vol->name());
+            const QString label = nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr);
+
+            orderedIds.push_back(idStr);
+            volumeEntries.append({idStr, label});
+
+            const QString loweredName = nameStr.toLower();
+            const QString loweredId = idStr.toLower();
+            const bool matchesPreferred = loweredName.contains(QStringLiteral("surface")) ||
+                                          loweredName.contains(QStringLiteral("surf")) ||
+                                          loweredId.contains(QStringLiteral("surface")) ||
+                                          loweredId.contains(QStringLiteral("surf"));
+
+            if (!preferredVolumeFound && matchesPreferred) {
+                bestGrowthVolumeId = idStr;
+                preferredVolumeFound = true;
+            }
+        } catch (...) {
+            continue;
+        }
+    }
+
+    if (bestGrowthVolumeId.isEmpty() && !volumeEntries.isEmpty()) {
+        bestGrowthVolumeId = orderedIds.front();
+    }
+
+    if (!activeCandidate.isEmpty() && !hasVolume(activeCandidate)) {
+        activeCandidate.clear();
+    }
+    if (activeCandidate.isEmpty() && !currentComboId.isEmpty() && hasVolume(currentComboId)) {
+        activeCandidate = currentComboId;
+    }
+    if (activeCandidate.isEmpty() && !currentVolumeId.isEmpty() && hasVolume(currentVolumeId)) {
+        activeCandidate = currentVolumeId;
+    }
+    if (activeCandidate.isEmpty() && !volumeEntries.isEmpty()) {
+        activeCandidate = orderedIds.front();
+    }
+
+    {
+        const QSignalBlocker blocker{volSelect};
+        volSelect->clear();
+        for (const auto& [id, label] : volumeEntries) {
+            volSelect->addItem(label, QVariant(id));
+        }
+        if (activeCandidate.isEmpty()) {
+            if (volSelect->count() > 0) {
+                volSelect->setCurrentIndex(0);
+            }
+        } else {
+            volSelect->setCurrentIndex(volSelect->findData(activeCandidate));
+        }
+    }
+
+    QString activeId = volSelect->count() > 0 ? volSelect->currentData().toString() : QString();
+
+    QString growthVolumeId = QString::fromStdString(_state->segmentationGrowthVolumeId());
+    if (!growthVolumeId.isEmpty() && !hasVolume(growthVolumeId)) {
+        growthVolumeId.clear();
+    }
+    if (growthVolumeId.isEmpty()) {
+        growthVolumeId = bestGrowthVolumeId;
+    }
+    if (growthVolumeId.isEmpty()) {
+        growthVolumeId = activeId;
+    }
+
+    if (!activeId.isEmpty()) {
+        if (!_state->currentVolume() || _state->currentVolumeId() != activeId.toStdString()) {
+            try {
+                auto newVolume = _state->vpkg()->volume(activeId.toStdString());
+                setVolume(newVolume);
+            } catch (...) {
+                // Ignore errors - keep existing volume selection if invalid.
+            }
+        }
+
+        _state->setSegmentationGrowthVolumeId(growthVolumeId.toStdString());
+
+        if (_segmentationWidget) {
+            _segmentationWidget->setAvailableVolumes(volumeEntries, growthVolumeId);
+            if (!growthVolumeId.isEmpty()) {
+                _segmentationWidget->setActiveVolume(growthVolumeId);
+            }
+            try {
+                auto growthVolume = _state->vpkg()->volume(growthVolumeId.toStdString());
+                if (growthVolume) {
+                    _segmentationWidget->setVolumeZarrPath(QString::fromStdString(growthVolume->path().string()));
+                }
+            } catch (...) {
+                // Ignore errors - neural growth path update is non-critical.
+            }
+        }
+    } else if (_segmentationWidget) {
+        _state->setCurrentVolume(nullptr);
+        _state->setSegmentationGrowthVolumeId({});
+        _segmentationWidget->setAvailableVolumes(QVector<QPair<QString, QString>>{}, {});
+        _segmentationWidget->setActiveVolume({});
+        _segmentationWidget->setVolumeZarrPath({});
     }
 }
 

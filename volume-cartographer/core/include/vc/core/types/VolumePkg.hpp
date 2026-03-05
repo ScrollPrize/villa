@@ -40,6 +40,10 @@ public:
     [[nodiscard]] std::string getVolpkgDirectory() const;
 
     [[nodiscard]] bool isRemote() const;
+    [[nodiscard]] bool isValidVolumeDirectory(const std::filesystem::path& dirpath) const;
+    bool addSingleVolume(const std::string& volumeDirName);
+    bool removeSingleVolume(const std::string& volumeIdOrDirName);
+    bool reloadSingleVolume(const std::string& volumeId);
 
     void refreshSegmentations();
     static void setLoadFirstSegmentationDirectory(const std::string& dirName);
