@@ -25,6 +25,13 @@ from train_resnet3d_lib.data.segment_metadata import (
 )
 
 
+def _normalize_data_backend(data_backend):
+    backend = str(data_backend).strip().lower()
+    if backend not in {"zarr", "tiff"}:
+        raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
+    return backend
+
+
 def build_train_stitch_loaders(train_fragment_ids, train_stitch_candidates, stitch_segment_id, *, valid_transform):
     train_stitch_loaders = []
     train_stitch_shapes = []
@@ -145,7 +152,7 @@ def build_train_stitch_outputs(
     train_sample_bbox_indices_by_segment=None,
     train_groups_by_segment=None,
 ):
-    backend = str(data_backend).strip().lower()
+    backend = _normalize_data_backend(data_backend)
     if backend == "zarr":
         return build_train_stitch_loaders_lazy(
             train_fragment_ids,
@@ -164,7 +171,7 @@ def build_train_stitch_outputs(
             stitch_segment_id,
             valid_transform=valid_transform,
         )
-    raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
+    raise AssertionError(f"unreachable backend dispatch: {backend!r}")
 
 
 def build_log_only_stitch_loaders(
@@ -303,7 +310,7 @@ def build_log_only_outputs(
     if not requested_segments:
         return [], [], [], {}
 
-    backend = str(data_backend).strip().lower()
+    backend = _normalize_data_backend(data_backend)
     if backend == "zarr":
         return build_log_only_stitch_loaders_lazy(
             requested_segments,
@@ -322,5 +329,4 @@ def build_log_only_outputs(
             mask_suffix=mask_suffix,
             log_only_downsample=log_only_downsample,
         )
-    raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
-
+    raise AssertionError(f"unreachable backend dispatch: {backend!r}")

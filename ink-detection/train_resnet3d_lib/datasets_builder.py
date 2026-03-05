@@ -18,10 +18,8 @@ from train_resnet3d_lib.data.normalization_stats import (
     prepare_fold_label_foreground_percentile_clip_zscore_stats,
 )
 from train_resnet3d_lib.data.segment_trainval import (
-    load_train_segment,
-    load_train_segment_lazy,
-    load_val_segment,
-    load_val_segment_lazy,
+    load_train_segment_for_backend,
+    load_val_segment_for_backend,
 )
 from train_resnet3d_lib.data.segment_stitching import (
     build_train_stitch_outputs,
@@ -459,21 +457,43 @@ def _build_datasets_for_backend(
         if shared_volume_cache is None:
             raise ValueError("shared_volume_cache is required when training.data_backend is 'zarr'")
         log("building datasets (zarr lazy)")
+    else:
+        log("building datasets")
 
-        def load_train_for_backend(fragment_id):
-            return _load_with_group_context(
-                fragment_id,
-                segments_metadata=segments_metadata,
-                fragment_to_group_idx=fragment_to_group_idx,
-                group_names=group_names,
-                loader_fn=load_train_segment_lazy,
-                volume_cache=shared_volume_cache,
-                include_train_xyxys=include_train_xyxys,
-                label_suffix=train_label_suffix,
-                mask_suffix=train_mask_suffix,
-            )
+    def load_train_for_backend(fragment_id):
+        return _load_with_group_context(
+            fragment_id,
+            segments_metadata=segments_metadata,
+            fragment_to_group_idx=fragment_to_group_idx,
+            group_names=group_names,
+            loader_fn=load_train_segment_for_backend,
+            data_backend=backend,
+            overlap_segments=overlap_segments,
+            layers_cache=layers_cache,
+            volume_cache=shared_volume_cache,
+            include_train_xyxys=include_train_xyxys,
+            label_suffix=train_label_suffix,
+            mask_suffix=train_mask_suffix,
+        )
 
-        def consume_train_for_backend(_fragment_id, result):
+    def load_val_for_backend(fragment_id):
+        return _load_with_group_context(
+            fragment_id,
+            segments_metadata=segments_metadata,
+            fragment_to_group_idx=fragment_to_group_idx,
+            group_names=group_names,
+            loader_fn=load_val_segment_for_backend,
+            data_backend=backend,
+            layers_cache=layers_cache,
+            volume_cache=shared_volume_cache,
+            include_train_xyxys=include_train_xyxys,
+            valid_transform=valid_transform,
+            label_suffix=val_label_suffix,
+            mask_suffix=val_mask_suffix,
+        )
+
+    def consume_train_for_backend(fragment_id, result):
+        if is_zarr:
             if int(result["patch_count"]) <= 0:
                 return
             sid = result["sid"]
@@ -481,58 +501,13 @@ def _build_datasets_for_backend(
             train_masks_by_segment[sid] = result["mask_store"]
             train_xyxys_by_segment[sid] = result["xyxys"]
             train_sample_bbox_indices_by_segment[sid] = result["sample_bbox_indices"]
+            return
 
-        def load_val_for_backend(fragment_id):
-            return _load_with_group_context(
-                fragment_id,
-                segments_metadata=segments_metadata,
-                fragment_to_group_idx=fragment_to_group_idx,
-                group_names=group_names,
-                loader_fn=load_val_segment_lazy,
-                volume_cache=shared_volume_cache,
-                include_train_xyxys=include_train_xyxys,
-                valid_transform=valid_transform,
-                label_suffix=val_label_suffix,
-                mask_suffix=val_mask_suffix,
-            )
-
-    else:
-        log("building datasets")
-
-        def load_train_for_backend(fragment_id):
-            return _load_with_group_context(
-                fragment_id,
-                segments_metadata=segments_metadata,
-                fragment_to_group_idx=fragment_to_group_idx,
-                group_names=group_names,
-                loader_fn=load_train_segment,
-                overlap_segments=overlap_segments,
-                layers_cache=layers_cache,
-                include_train_xyxys=include_train_xyxys,
-                label_suffix=train_label_suffix,
-                mask_suffix=train_mask_suffix,
-            )
-
-        def consume_train_for_backend(fragment_id, result):
-            if result["stitch_candidate"] is not None:
-                train_stitch_candidates[str(fragment_id)] = result["stitch_candidate"]
-            train_images.extend(result["images"])
-            train_masks.extend(result["masks"])
-            train_groups.extend([int(result["group_idx"])] * len(result["images"]))
-
-        def load_val_for_backend(fragment_id):
-            return _load_with_group_context(
-                fragment_id,
-                segments_metadata=segments_metadata,
-                fragment_to_group_idx=fragment_to_group_idx,
-                group_names=group_names,
-                loader_fn=load_val_segment,
-                layers_cache=layers_cache,
-                include_train_xyxys=include_train_xyxys,
-                valid_transform=valid_transform,
-                label_suffix=val_label_suffix,
-                mask_suffix=val_mask_suffix,
-            )
+        if result["stitch_candidate"] is not None:
+            train_stitch_candidates[str(fragment_id)] = result["stitch_candidate"]
+        train_images.extend(result["images"])
+        train_masks.extend(result["masks"])
+        train_groups.extend([int(result["group_idx"])] * len(result["images"]))
 
     train_patch_counts_by_segment, train_mask_borders, train_mask_bboxes = _collect_train_segments(
         train_fragment_ids,

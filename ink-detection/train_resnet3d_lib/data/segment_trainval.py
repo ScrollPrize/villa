@@ -25,6 +25,13 @@ from train_resnet3d_lib.data.segment_metadata import (
 )
 
 
+def _normalize_data_backend(data_backend):
+    backend = str(data_backend).strip().lower()
+    if backend not in {"zarr", "tiff"}:
+        raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
+    return backend
+
+
 def _stitch_mask_geometry(fragment_mask, *, include_train_xyxys):
     mask_border = None
     if include_train_xyxys:
@@ -355,3 +362,80 @@ def load_val_segment_lazy(
     }
 
 
+def load_train_segment_for_backend(
+    fragment_id,
+    seg_meta,
+    group_idx,
+    group_name,
+    *,
+    data_backend,
+    include_train_xyxys,
+    label_suffix,
+    mask_suffix,
+    overlap_segments=None,
+    layers_cache=None,
+    volume_cache=None,
+):
+    backend = _normalize_data_backend(data_backend)
+    if backend == "zarr":
+        return load_train_segment_lazy(
+            fragment_id,
+            seg_meta,
+            group_idx,
+            group_name,
+            volume_cache=volume_cache,
+            include_train_xyxys=include_train_xyxys,
+            label_suffix=label_suffix,
+            mask_suffix=mask_suffix,
+        )
+    return load_train_segment(
+        fragment_id,
+        seg_meta,
+        group_idx,
+        group_name,
+        overlap_segments=overlap_segments,
+        layers_cache=layers_cache,
+        include_train_xyxys=include_train_xyxys,
+        label_suffix=label_suffix,
+        mask_suffix=mask_suffix,
+    )
+
+
+def load_val_segment_for_backend(
+    fragment_id,
+    seg_meta,
+    group_idx,
+    group_name,
+    *,
+    data_backend,
+    include_train_xyxys,
+    valid_transform,
+    label_suffix,
+    mask_suffix,
+    layers_cache=None,
+    volume_cache=None,
+):
+    backend = _normalize_data_backend(data_backend)
+    if backend == "zarr":
+        return load_val_segment_lazy(
+            fragment_id,
+            seg_meta,
+            group_idx,
+            group_name,
+            volume_cache=volume_cache,
+            include_train_xyxys=include_train_xyxys,
+            valid_transform=valid_transform,
+            label_suffix=label_suffix,
+            mask_suffix=mask_suffix,
+        )
+    return load_val_segment(
+        fragment_id,
+        seg_meta,
+        group_idx,
+        group_name,
+        layers_cache=layers_cache,
+        include_train_xyxys=include_train_xyxys,
+        valid_transform=valid_transform,
+        label_suffix=label_suffix,
+        mask_suffix=mask_suffix,
+    )
