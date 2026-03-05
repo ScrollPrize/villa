@@ -21,7 +21,6 @@ from train_resnet3d_lib.config import (
 from train_resnet3d_lib.runtime.metadata_config import apply_top_level_stitch_to_cfg
 from train_resnet3d_lib.runtime import wandb_runtime
 from train_resnet3d_lib.runtime.run_naming import build_default_run_slug
-from train_resnet3d_lib.runtime.wandb_local_metrics import LocalMetricsWandbLogger
 
 
 def _resolve_run_dir(*, cfg, resume_ckpt_path, outputs_path, run_name, run_slug, run_id):
@@ -242,23 +241,5 @@ def prepare_run(args, merged_config, wandb_logger):
         init_ckpt_path=args.init_ckpt_path,
         resume_from_ckpt=args.resume_from_ckpt,
     )
-    if wandb_logger is not None:
-        if not isinstance(wandb_logger, LocalMetricsWandbLogger):
-            raise TypeError(
-                "wandb_logger must be LocalMetricsWandbLogger when W&B is enabled, "
-                f"got {type(wandb_logger).__name__}"
-            )
-        wandb_logger.configure_local_persistence(log_dir=str(CFG.log_dir))
-        run = wandb_logger.experiment
-        run_dir_name = osp.basename(str(run_state["run_dir"]).rstrip("/\\"))
-        if not run_dir_name:
-            raise ValueError(f"failed to derive run_dir basename from run_dir={run_state['run_dir']!r}")
-        desired_run_name = str(run_dir_name)
-        current_run_name = str(run.name) if run.name is not None else None
-        if current_run_name != desired_run_name:
-            run.name = desired_run_name
-            log(f"wandb run name updated current={current_run_name!r} merged={desired_run_name!r}")
-        run.summary["local/run_dir"] = str(run_state["run_dir"])
-        run.summary["local/checkpoints_dir"] = str(CFG.model_dir)
-        run.summary["local/log_dir"] = str(CFG.log_dir)
+    wandb_runtime.configure_wandb_run(wandb_logger, run_state=run_state, cfg=CFG)
     return run_state

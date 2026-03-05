@@ -186,3 +186,27 @@ def sync_wandb_run_config(wandb_logger, merged_config):
         log(f"wandb tags updated current={list(current_tags)!r} merged={list(merged_tags)!r}")
     wandb_logger.experiment.config.update(merged_config, allow_val_change=True)
     define_wandb_metric_summaries(wandb_logger, merged_config)
+
+
+def configure_wandb_run(wandb_logger, *, run_state, cfg):
+    if wandb_logger is None:
+        return
+    if not isinstance(wandb_logger, LocalMetricsWandbLogger):
+        raise TypeError(
+            "wandb_logger must be LocalMetricsWandbLogger when W&B is enabled, "
+            f"got {type(wandb_logger).__name__}"
+        )
+
+    wandb_logger.configure_local_persistence(log_dir=str(cfg.log_dir))
+    run = wandb_logger.experiment
+    run_dir_name = osp.basename(str(run_state["run_dir"]).rstrip("/\\"))
+    if not run_dir_name:
+        raise ValueError(f"failed to derive run_dir basename from run_dir={run_state['run_dir']!r}")
+    desired_run_name = str(run_dir_name)
+    current_run_name = str(run.name) if run.name is not None else None
+    if current_run_name != desired_run_name:
+        run.name = desired_run_name
+        log(f"wandb run name updated current={current_run_name!r} merged={desired_run_name!r}")
+    run.summary["local/run_dir"] = str(run_state["run_dir"])
+    run.summary["local/checkpoints_dir"] = str(cfg.model_dir)
+    run.summary["local/log_dir"] = str(cfg.log_dir)
