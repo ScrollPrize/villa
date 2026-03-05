@@ -256,17 +256,7 @@ def parse_bool_strict(value, *, key):
     raise ValueError(f"{key} must be a boolean, got {value!r}")
 
 
-def _reject_legacy_stitching_schedule(merged_config):
-    training_cfg = dict(merged_config.get("training") or {})
-    if "stitching_schedule" in training_cfg:
-        raise ValueError(
-            "metadata_json.training.stitching_schedule is no longer supported. "
-            "Use metadata_json.stitch.{train_every_n_epochs, eval_every_n_epochs, eval_plus_one}."
-        )
-
-
 def resolve_stitch_metadata(merged_config):
-    _reject_legacy_stitching_schedule(merged_config)
     stitch_cfg = dict(merged_config["stitch"])
     training_cfg = dict(merged_config.get("training") or {})
     segment_ids = [str(x).strip() for x in stitch_cfg["segment_ids"]]
@@ -290,7 +280,6 @@ def resolve_stitch_metadata(merged_config):
 
 
 def apply_top_level_stitch_to_cfg(cfg, merged_config):
-    _reject_legacy_stitching_schedule(merged_config)
     stitch_raw = merged_config.get("stitch")
     if stitch_raw is None:
         return

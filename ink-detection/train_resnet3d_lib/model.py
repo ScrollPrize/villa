@@ -17,11 +17,6 @@ from train_resnet3d_lib.modeling.losses import build_bce_targets, compute_per_sa
 from train_resnet3d_lib.modeling.optimizers_runtime import configure_optimizers as configure_optimizers_runtime
 from train_resnet3d_lib.stitch_manager import StitchManager, coerce_stitch_manager_state
 
-_VALID_OBJECTIVES = {"erm", "group_dro"}
-_VALID_LOSS_MODES = {"batch", "per_sample"}
-_VALID_LOSS_RECIPES = {"dice_bce", "bce_only"}
-
-
 def _cfg_to_dict(value, *, key):
     if value is None:
         return {}
@@ -162,23 +157,6 @@ def _normalize_stitch_group_idx_by_segment(stitch_group_idx_by_segment, *, n_gro
     return normalized_group_map
 
 
-def _validate_runtime_objective_state(model):
-    if model.objective not in _VALID_OBJECTIVES:
-        raise ValueError(
-            f"Unsupported model_state.objective={model.objective!r}; expected one of {sorted(_VALID_OBJECTIVES)!r}"
-        )
-    if model.loss_mode not in _VALID_LOSS_MODES:
-        raise ValueError(
-            f"Unsupported model_state.loss_mode={model.loss_mode!r}; expected one of {sorted(_VALID_LOSS_MODES)!r}"
-        )
-    if model.loss_recipe not in _VALID_LOSS_RECIPES:
-        raise ValueError(
-            f"Unsupported model_state.loss_recipe={model.loss_recipe!r}; expected one of {sorted(_VALID_LOSS_RECIPES)!r}"
-        )
-    if model.objective == "group_dro" and model.loss_mode != "per_sample":
-        raise ValueError("GroupDRO requires training.loss_mode=per_sample")
-
-
 def _init_group_dro_if_needed(model, *, state):
     model.group_dro = None
     if model.objective != "group_dro":
@@ -276,7 +254,6 @@ def initialize_regression_state(model, *, state):
     model.objective = state.objective.lower()
     model.loss_mode = state.loss_mode.lower()
     model.loss_recipe = state.loss_recipe.lower()
-    _validate_runtime_objective_state(model)
     model.bce_smooth_factor = state.bce_smooth_factor
     model.soft_label_positive = state.soft_label_positive
     model.soft_label_negative = state.soft_label_negative

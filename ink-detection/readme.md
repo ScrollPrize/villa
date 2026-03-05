@@ -94,7 +94,8 @@ Metadata keys to set (edit the existing `metadata.json` template):
 
 - `segments.<segment_id>.base_path`, `segments.<segment_id>.layer_range`, `segments.<segment_id>.reverse_layers`.
 - `training.train_segments`, `training.val_segments`, optional `training.cv_fold`.
-- `training.objective`, `training.sampler`, `training.loss_mode`, `training.save_every_epoch`, `training.stitching_schedule`.
+- `training.objective`, `training.sampler`, `training.loss_mode`, `training.save_every_epoch`.
+- `stitch.segment_ids`, `stitch.mask_suffix`, `stitch.downsample`, `stitch.train_every_n_epochs`, `stitch.eval_every_n_epochs`, `stitch.eval_plus_one`.
 - `training_hyperparameters.model.backbone_pretrained_path`.
 
 Fold/suffix behavior:
