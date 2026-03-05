@@ -129,6 +129,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _openAct->setShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::OpenVolpkg));
     connect(_openAct, &QAction::triggered, this, &MenuActionController::openVolpkg);
 
+    _openLocalZarrAct = new QAction(QObject::tr("Open Local &Zarr..."), this);
+    connect(_openLocalZarrAct, &QAction::triggered, this, &MenuActionController::openLocalZarr);
+
     _openRemoteAct = new QAction(QObject::tr("Open &Remote Volume..."), this);
     connect(_openRemoteAct, &QAction::triggered, this, &MenuActionController::openRemoteVolume);
 
@@ -183,6 +186,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
     _fileMenu->addAction(_openAct);
+    _fileMenu->addAction(_openLocalZarrAct);
     _fileMenu->addAction(_openRemoteAct);
 
     _recentMenu = new QMenu(QObject::tr("Open &recent volpkg"), _fileMenu);
@@ -348,6 +352,51 @@ void MenuActionController::openVolpkg()
     _window->CloseVolume();
     _window->OpenVolume(QString());
     _window->UpdateView();
+}
+
+void MenuActionController::openLocalZarr()
+{
+    if (!_window) return;
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QString dir = QFileDialog::getExistingDirectory(
+        _window,
+        QObject::tr("Open Local OME-Zarr Directory"),
+        settings.value(vc3d::settings::volpkg::DEFAULT_PATH).toString(),
+        QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks |
+        QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
+
+    if (dir.isEmpty()) return;
+
+    auto path = std::filesystem::path(dir.toStdString());
+
+    // Validate that this looks like a zarr directory
+    if (!Volume::checkDir(path)) {
+        QMessageBox::warning(
+            _window, QObject::tr("Not a Zarr Volume"),
+            QObject::tr("The selected directory does not appear to be an "
+                         "OME-Zarr volume (no .zgroup, .zattrs, or meta.json found)."));
+        return;
+    }
+
+    try {
+        auto vol = Volume::New(path);
+        _window->CloseVolume();
+        _window->setVolume(vol);
+        _window->UpdateView();
+
+        if (_window->statusBar()) {
+            _window->statusBar()->showMessage(
+                QObject::tr("Opened local zarr: %1")
+                    .arg(QString::fromStdString(vol->id())),
+                5000);
+        }
+    } catch (const std::exception& e) {
+        QMessageBox::critical(
+            _window, QObject::tr("Error Opening Zarr"),
+            QObject::tr("Failed to open zarr volume:\n%1")
+                .arg(QString::fromStdString(e.what())));
+    }
 }
 
 void MenuActionController::openRecentVolpkg()

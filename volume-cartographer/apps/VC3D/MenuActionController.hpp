@@ -33,6 +33,7 @@ public:
 private slots:
     void openVolpkg();
     void openRecentVolpkg();
+    void openLocalZarr();
     void openRemoteVolume();
     void openRecentRemoteVolume();
     void showSettingsDialog();
@@ -76,6 +77,7 @@ private:
     QMenu* _recentRemoteMenu{nullptr};
 
     QAction* _openAct{nullptr};
+    QAction* _openLocalZarrAct{nullptr};
     QAction* _openRemoteAct{nullptr};
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     std::array<QAction*, kMaxRecentRemote> _recentRemoteActs{};

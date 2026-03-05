@@ -28,6 +28,7 @@
 struct CacheParams {
     int cz, cy, cx, sz, sy, sx;
     int czShift, cyShift, cxShift, czMask, cyMask, cxMask;
+    bool pow2;  // true when all chunk dims are powers of two (fast path)
     int chunksZ, chunksY, chunksX;
 
     // Chunk index bounds from logical data extent.
@@ -42,10 +43,17 @@ struct CacheParams {
         cz = cs[0]; cy = cs[1]; cx = cs[2];
         auto shape = cache->levelShape(level);
         sz = shape[0]; sy = shape[1]; sx = shape[2];
+
         auto isPow2 = [](int v) { return v > 0 && (v & (v - 1)) == 0; };
-        assert(isPow2(cz) && isPow2(cy) && isPow2(cx) && "Chunk dimensions must be powers of two");
-        czShift = log2_pow2(cz); cyShift = log2_pow2(cy); cxShift = log2_pow2(cx);
-        czMask = cz - 1; cyMask = cy - 1; cxMask = cx - 1;
+        pow2 = isPow2(cz) && isPow2(cy) && isPow2(cx);
+        if (pow2) {
+            czShift = log2_pow2(cz); cyShift = log2_pow2(cy); cxShift = log2_pow2(cx);
+            czMask = cz - 1; cyMask = cy - 1; cxMask = cx - 1;
+        } else {
+            czShift = cyShift = cxShift = 0;
+            czMask = cyMask = cxMask = 0;
+        }
+
         chunksZ = (sz + cz - 1) / cz;
         chunksY = (sy + cy - 1) / cy;
         chunksX = (sx + cx - 1) / cx;
@@ -57,15 +65,35 @@ struct CacheParams {
         auto db = cache->dataBounds();
         if (db.valid) {
             float scale = 1.0f / static_cast<float>(1 << level);
-            dbMinCx = std::max(0, (static_cast<int>(std::floor(db.minX * scale)) >> cxShift) - 1);
-            dbMaxCx = std::min(chunksX - 1, (static_cast<int>(std::ceil(db.maxX * scale)) >> cxShift) + 1);
-            dbMinCy = std::max(0, (static_cast<int>(std::floor(db.minY * scale)) >> cyShift) - 1);
-            dbMaxCy = std::min(chunksY - 1, (static_cast<int>(std::ceil(db.maxY * scale)) >> cyShift) + 1);
-            dbMinCz = std::max(0, (static_cast<int>(std::floor(db.minZ * scale)) >> czShift) - 1);
-            dbMaxCz = std::min(chunksZ - 1, (static_cast<int>(std::ceil(db.maxZ * scale)) >> czShift) + 1);
+            dbMinCx = std::max(0, chunkIdx(static_cast<int>(std::floor(db.minX * scale)), cx, cxShift) - 1);
+            dbMaxCx = std::min(chunksX - 1, chunkIdx(static_cast<int>(std::ceil(db.maxX * scale)), cx, cxShift) + 1);
+            dbMinCy = std::max(0, chunkIdx(static_cast<int>(std::floor(db.minY * scale)), cy, cyShift) - 1);
+            dbMaxCy = std::min(chunksY - 1, chunkIdx(static_cast<int>(std::ceil(db.maxY * scale)), cy, cyShift) + 1);
+            dbMinCz = std::max(0, chunkIdx(static_cast<int>(std::floor(db.minZ * scale)), cz, czShift) - 1);
+            dbMaxCz = std::min(chunksZ - 1, chunkIdx(static_cast<int>(std::ceil(db.maxZ * scale)), cz, czShift) + 1);
             dbValid = true;
         }
     }
+
+    // Chunk index: shift for pow2, divide otherwise
+    inline int chunkIdx(int v, int c, int shift) const {
+        return pow2 ? (v >> shift) : (v / c);
+    }
+
+    // Local offset within chunk: mask for pow2, modulo otherwise
+    inline int localOff(int v, int c, int mask) const {
+        return pow2 ? (v & mask) : (v % c);
+    }
+
+    // Convenience: chunk indices from voxel coords
+    inline int chunkZ(int iz) const { return pow2 ? (iz >> czShift) : (iz / cz); }
+    inline int chunkY(int iy) const { return pow2 ? (iy >> cyShift) : (iy / cy); }
+    inline int chunkX(int ix) const { return pow2 ? (ix >> cxShift) : (ix / cx); }
+
+    // Convenience: local offsets from voxel coords
+    inline int localZ(int iz) const { return pow2 ? (iz & czMask) : (iz % cz); }
+    inline int localY(int iy) const { return pow2 ? (iy & cyMask) : (iy % cy); }
+    inline int localX(int ix) const { return pow2 ? (ix & cxMask) : (ix % cx); }
 
     static int log2_pow2(int v) {
         int r = 0;
@@ -148,20 +176,20 @@ struct ChunkSampler {
         if (iy >= p.sy) iy = p.sy - 1;
         if (ix >= p.sx) ix = p.sx - 1;
 
-        updateChunk(iz >> p.czShift, iy >> p.cyShift, ix >> p.cxShift);
+        updateChunk(p.chunkZ(iz), p.chunkY(iy), p.chunkX(ix));
         if (!data) return 0;
 
-        return data[(iz & p.czMask) * s0 + (iy & p.cyMask) * s1 + (ix & p.cxMask)];
+        return data[p.localZ(iz) * s0 + p.localY(iy) * s1 + p.localX(ix)];
     }
 
     T sampleInt(int iz, int iy, int ix) {
         if (iz < 0 || iy < 0 || ix < 0 || iz >= p.sz || iy >= p.sy || ix >= p.sx)
             return 0;
 
-        updateChunk(iz >> p.czShift, iy >> p.cyShift, ix >> p.cxShift);
+        updateChunk(p.chunkZ(iz), p.chunkY(iy), p.chunkX(ix));
         if (!data) return 0;
 
-        return data[(iz & p.czMask) * s0 + (iy & p.cyMask) * s1 + (ix & p.cxMask)];
+        return data[p.localZ(iz) * s0 + p.localY(iy) * s1 + p.localX(ix)];
     }
 
     float sampleTrilinear(float vz, float vy, float vx) {
@@ -203,11 +231,9 @@ struct ChunkSampler {
             iz + 1 >= p.sz || iy + 1 >= p.sy || ix + 1 >= p.sx)
             return sampleTrilinear(vz, vy, vx);
 
-        // Local copies of shifts for register allocation
-        const int lczShift = p.czShift, lcyShift = p.cyShift, lcxShift = p.cxShift;
-        int ciz0 = iz >> lczShift, ciz1 = (iz + 1) >> lczShift;
-        int ciy0 = iy >> lcyShift, ciy1 = (iy + 1) >> lcyShift;
-        int cix0 = ix >> lcxShift, cix1 = (ix + 1) >> lcxShift;
+        int ciz0 = p.chunkZ(iz), ciz1 = p.chunkZ(iz + 1);
+        int ciy0 = p.chunkY(iy), ciy1 = p.chunkY(iy + 1);
+        int cix0 = p.chunkX(ix), cix1 = p.chunkX(ix + 1);
 
         if (ciz0 == ciz1 && ciy0 == ciy1 && cix0 == cix1) {
             updateChunk(ciz0, ciy0, cix0);
@@ -215,8 +241,7 @@ struct ChunkSampler {
 
             // Local stride copies — s2 is always 1, eliminated
             const size_t ls0 = s0, ls1 = s1;
-            const int lczMask = p.czMask, lcyMask = p.cyMask, lcxMask = p.cxMask;
-            int lz0 = iz & lczMask, ly0 = iy & lcyMask, lx0 = ix & lcxMask;
+            int lz0 = p.localZ(iz), ly0 = p.localY(iy), lx0 = p.localX(ix);
             int lz1 = lz0 + 1, ly1 = ly0 + 1, lx1 = lx0 + 1;
 
             float c000 = data[lz0*ls0 + ly0*ls1 + lx0];
@@ -317,9 +342,9 @@ static void readVolumeImpl(
             if (iz >= p.sz) iz = p.sz - 1;
             if (iy >= p.sy) iy = p.sy - 1;
             if (ix >= p.sx) ix = p.sx - 1;
-            int ciz = iz >> p.czShift;
-            int ciy = iy >> p.cyShift;
-            int cix = ix >> p.cxShift;
+            int ciz = p.chunkZ(iz);
+            int ciy = p.chunkY(iy);
+            int cix = p.chunkX(ix);
             // Skip chunks in zero-padded regions
             if (p.dbValid && (ciz < p.dbMinCz || ciz > p.dbMaxCz ||
                               ciy < p.dbMinCy || ciy > p.dbMaxCy ||
@@ -731,9 +756,9 @@ static void readMultiSliceImpl(
 
         auto markVoxel = [&](int iz, int iy, int ix) {
             if (iz < 0 || iy < 0 || ix < 0 || iz >= p.sz || iy >= p.sy || ix >= p.sx) return;
-            int ciz = iz >> p.czShift;
-            int ciy = iy >> p.cyShift;
-            int cix = ix >> p.cxShift;
+            int ciz = p.chunkZ(iz);
+            int ciy = p.chunkY(iy);
+            int cix = p.chunkX(ix);
             size_t idx = static_cast<size_t>(ciz) * p.chunksY * p.chunksX + ciy * p.chunksX + cix;
             if (!needed[idx]) {
                 needed[idx] = 1;
@@ -793,8 +818,6 @@ static void readMultiSliceImpl(
     constexpr float maxVal = std::is_same_v<T, uint16_t> ? 65535.f : 255.f;
     const float firstOff = offsets[0];
     const float lastOff = offsets[numSlices - 1];
-    const int lczShift = p.czShift, lcyShift = p.cyShift, lcxShift = p.cxShift;
-    const int lczMask = p.czMask, lcyMask = p.cyMask, lcxMask = p.cxMask;
     const int lsz = p.sz, lsy = p.sy, lsx = p.sx;
 
     {
@@ -833,14 +856,14 @@ static void readMultiSliceImpl(
                                    izMin >= 0 && iyMin >= 0 && ixMin >= 0;
 
                 bool singleChunk = allInBounds &&
-                    (izMin >> lczShift) == (izMax >> lczShift) &&
-                    (iyMin >> lcyShift) == (iyMax >> lcyShift) &&
-                    (ixMin >> lcxShift) == (ixMax >> lcxShift);
+                    p.chunkZ(izMin) == p.chunkZ(izMax) &&
+                    p.chunkY(iyMin) == p.chunkY(iyMax) &&
+                    p.chunkX(ixMin) == p.chunkX(ixMax);
 
                 if (singleChunk) {
-                    int ciz = izMin >> lczShift;
-                    int ciy = iyMin >> lcyShift;
-                    int cix = ixMin >> lcxShift;
+                    int ciz = p.chunkZ(izMin);
+                    int ciy = p.chunkY(iyMin);
+                    int cix = p.chunkX(ixMin);
                     sampler.updateChunk(ciz, ciy, cix);
                     const T* __restrict__ d = sampler.data;
                     if (!d) continue;
@@ -855,7 +878,7 @@ static void readMultiSliceImpl(
                         int iy = static_cast<int>(vy);
                         int ix = static_cast<int>(vx);
 
-                        size_t base = (iz & lczMask)*ls0 + (iy & lcyMask)*ls1 + (ix & lcxMask);
+                        size_t base = p.localZ(iz)*ls0 + p.localY(iy)*ls1 + p.localX(ix);
                         float c000 = d[base];
                         float c100 = d[base + ls0];
                         float c010 = d[base + ls1];
@@ -960,9 +983,9 @@ static void sampleTileSlicesImpl(
         seen.reserve(16);
         auto markVoxel = [&](int iz, int iy, int ix) {
             if (iz < 0 || iy < 0 || ix < 0 || iz >= p.sz || iy >= p.sy || ix >= p.sx) return;
-            int ciz = iz >> p.czShift;
-            int ciy = iy >> p.cyShift;
-            int cix = ix >> p.cxShift;
+            int ciz = p.chunkZ(iz);
+            int ciy = p.chunkY(iy);
+            int cix = p.chunkX(ix);
             uint64_t key = (uint64_t(ciz) << 40) | (uint64_t(ciy) << 20) | uint64_t(cix);
             if (!seen.insert(key).second) return;
             neededChunks.push_back({ciz, ciy, cix});
@@ -1000,8 +1023,6 @@ static void sampleTileSlicesImpl(
     constexpr float maxVal = std::is_same_v<T, uint16_t> ? 65535.f : 255.f;
     const float firstOff = offsets[0];
     const float lastOff = offsets[numSlices - 1];
-    const int lczShift = p.czShift, lcyShift = p.cyShift, lcxShift = p.cxShift;
-    const int lczMask = p.czMask, lcyMask = p.cyMask, lcxMask = p.cxMask;
     const int lsz = p.sz, lsy = p.sy, lsx = p.sx;
 
     ChunkSampler<T, 8> sampler(p, cache, level);
@@ -1039,14 +1060,14 @@ static void sampleTileSlicesImpl(
                                izMin >= 0 && iyMin >= 0 && ixMin >= 0;
 
             bool singleChunk = allInBounds &&
-                (izMin >> lczShift) == (izMax >> lczShift) &&
-                (iyMin >> lcyShift) == (iyMax >> lcyShift) &&
-                (ixMin >> lcxShift) == (ixMax >> lcxShift);
+                p.chunkZ(izMin) == p.chunkZ(izMax) &&
+                p.chunkY(iyMin) == p.chunkY(iyMax) &&
+                p.chunkX(ixMin) == p.chunkX(ixMax);
 
             if (singleChunk) {
-                int ciz = izMin >> lczShift;
-                int ciy = iyMin >> lcyShift;
-                int cix = ixMin >> lcxShift;
+                int ciz = p.chunkZ(izMin);
+                int ciy = p.chunkY(iyMin);
+                int cix = p.chunkX(ixMin);
                 sampler.updateChunk(ciz, ciy, cix);
                 const T* __restrict__ d = sampler.data;
                 if (!d) continue;
@@ -1061,7 +1082,7 @@ static void sampleTileSlicesImpl(
                     int iy = static_cast<int>(vy);
                     int ix = static_cast<int>(vx);
 
-                    size_t base = (iz & lczMask)*ls0 + (iy & lcyMask)*ls1 + (ix & lcxMask);
+                    size_t base = p.localZ(iz)*ls0 + p.localY(iy)*ls1 + p.localX(ix);
                     float c000 = d[base];
                     float c100 = d[base + ls0];
                     float c010 = d[base + ls1];
