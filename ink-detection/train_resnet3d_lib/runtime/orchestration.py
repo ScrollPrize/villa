@@ -11,6 +11,7 @@ from train_resnet3d_lib.runtime.checkpointing import resolve_checkpoint_path
 from train_resnet3d_lib.config import (
     CFG,
     apply_metadata_hyperparameters,
+    apply_top_level_stitch_to_cfg,
     cfg_init,
     load_and_validate_base_config,
     log,
@@ -18,7 +19,6 @@ from train_resnet3d_lib.config import (
     slugify,
     unflatten_dict,
 )
-from train_resnet3d_lib.runtime.metadata_config import apply_top_level_stitch_to_cfg
 from train_resnet3d_lib.runtime import wandb_runtime
 from train_resnet3d_lib.runtime.run_naming import build_default_run_slug
 

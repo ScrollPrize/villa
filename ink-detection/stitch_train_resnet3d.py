@@ -6,10 +6,14 @@ import os.path as osp
 import torch
 from torch.utils.data import Dataset
 
-from train_resnet3d_lib.config import CFG, log
+from train_resnet3d_lib.config import (
+    CFG,
+    log,
+    resolve_stitch_metadata,
+    validate_stitch_segment_ids,
+)
 from train_resnet3d_lib.runtime import orchestration
 from train_resnet3d_lib import training as tr
-from train_resnet3d_lib.runtime.metadata_config import resolve_stitch_metadata, validate_stitch_segment_ids
 from train_resnet3d_lib.data.patch_index_cache import (
     extract_infer_patch_coordinates_cached,
 )
