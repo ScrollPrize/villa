@@ -172,6 +172,32 @@ std::optional<cv::Rect> computeValidSurfaceBounds(const cv::Mat_<cv::Vec3f>& poi
                     maxRow - minRow + 1);
 }
 
+static bool hasTifxyzMeshFiles(const std::filesystem::path& dir)
+{
+    return std::filesystem::is_directory(dir)
+        && std::filesystem::is_regular_file(dir / "x.tif")
+        && std::filesystem::is_regular_file(dir / "y.tif")
+        && std::filesystem::is_regular_file(dir / "z.tif");
+}
+
+static QJsonObject readJsonObject(const QString& path)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return {};
+
+    const auto doc = QJsonDocument::fromJson(f.readAll());
+    if (!doc.isObject()) return {};
+    return doc.object();
+}
+
+static bool writeJsonObject(const QString& path, const QJsonObject& obj)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+    f.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
+    return true;
+}
+
 bool selectResumeLocalTracerParams(QWidget* parent,
                                    const QVector<VolumeSelector::VolumeOption>& volumes,
                                    const QString& defaultVolumeId,
@@ -2265,6 +2291,245 @@ void SegmentationCommandHandler::onAWSUpload(const std::string& segmentId)
     new AWSUploadJob(_parentWidget, segDir, awsProfile, std::move(tasks), this);
 }
 
+void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentIds)
+{
+    if (!_state || !_state->vpkg()) {
+        emit statusMessage(tr("No volume package loaded"), 3000);
+        return;
+    }
+
+    if (_cmdRunner && _cmdRunner->isRunning()) {
+        QMessageBox::warning(_parentWidget, tr("Warning"),
+                             tr("A command line tool is already running."));
+        return;
+    }
+
+    QStringList requestedIds = segmentIds;
+    requestedIds.removeAll(QString());
+    if (requestedIds.isEmpty()) {
+        emit statusMessage(tr("No segments selected"), 3000);
+        return;
+    }
+
+    QStringList rasterIds;
+    QStringList validIds;
+    QSet<QString> seenIds;
+    for (const QString& id : requestedIds) {
+        const QString normalized = id.trimmed();
+        if (normalized.isEmpty()) {
+            continue;
+        }
+        if (seenIds.contains(normalized)) {
+            continue;
+        }
+        seenIds.insert(normalized);
+        rasterIds << normalized;
+    }
+
+    if (rasterIds.isEmpty()) {
+        emit statusMessage(tr("No valid segments selected"), 3000);
+        return;
+    }
+
+    QStringList segmentPaths;
+    QStringList missingIds;
+
+    for (const QString& segmentId : rasterIds) {
+        auto seg = _state->vpkg()->segmentation(segmentId.toStdString());
+        if (!seg) {
+            missingIds << segmentId;
+            continue;
+        }
+        const auto segPath = seg->path();
+        const QString segPathStr = QString::fromStdString(segPath.string());
+        if (!std::filesystem::is_directory(segPath)) {
+            missingIds << segmentId;
+            continue;
+        }
+        if (!hasTifxyzMeshFiles(segPath)) {
+            missingIds << segmentId;
+            continue;
+        }
+        validIds << segmentId;
+        segmentPaths << segPathStr;
+    }
+
+    if (segmentPaths.isEmpty()) {
+        QMessageBox::warning(_parentWidget, tr("Error"),
+                             tr("Selected segments are not tifxyz meshes: %1")
+                                 .arg(missingIds.join(QStringLiteral(", "))));
+        return;
+    }
+    if (!missingIds.isEmpty()) {
+        emit statusMessage(
+            tr("Ignoring %1 segment(s) without tifxyz meshes.")
+                .arg(missingIds.size()),
+            3000);
+    }
+
+    const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMddHHmmss"));
+    const auto baseOutputName = QStringLiteral("labels_%1.zarr").arg(timestamp);
+
+    std::error_code ec;
+    const std::filesystem::path volpkgDir(_state->vpkg()->getVolpkgDirectory());
+    const std::filesystem::path volumesDir = volpkgDir / "volumes";
+    std::filesystem::create_directories(volumesDir, ec);
+    if (ec) {
+        QMessageBox::critical(_parentWidget, tr("Error"),
+                              tr("Cannot create volumes directory: %1").arg(QString::fromStdString(ec.message())));
+        return;
+    }
+
+    std::filesystem::path outputRoot = volumesDir / baseOutputName.toStdString();
+    for (int suffix = 1; std::filesystem::exists(outputRoot, ec) && suffix < 1000; ++suffix) {
+        outputRoot = volumesDir /
+            QStringLiteral("labels_%1_%2.zarr").arg(timestamp).arg(suffix).toStdString();
+    }
+    if (std::filesystem::exists(outputRoot)) {
+        QMessageBox::critical(_parentWidget, tr("Error"),
+                              tr("Unable to reserve output directory after retries: %1")
+                                  .arg(QString::fromStdString(outputRoot.string())));
+        return;
+    }
+
+    std::filesystem::path tempRoot =
+        std::filesystem::temp_directory_path() / ("vc3d_rasterize_" + timestamp.toStdString());
+    if (std::filesystem::exists(tempRoot, ec)) {
+        const std::string ts = timestamp.toStdString();
+        for (int suffix = 1; suffix < 1000; ++suffix) {
+            tempRoot = std::filesystem::temp_directory_path() /
+                ("vc3d_rasterize_" + ts + "_" + std::to_string(suffix));
+            if (!std::filesystem::exists(tempRoot, ec)) break;
+        }
+    }
+    if (std::filesystem::exists(tempRoot, ec)) {
+        QMessageBox::critical(_parentWidget, tr("Error"),
+                              tr("Unable to reserve temporary input directory: %1")
+                                  .arg(QString::fromStdString(tempRoot.string())));
+        return;
+    }
+
+    if (!std::filesystem::create_directories(tempRoot, ec) || ec) {
+        QMessageBox::critical(_parentWidget, tr("Error"),
+                              tr("Cannot create temporary input directory: %1")
+                                  .arg(QString::fromStdString(ec.message())));
+        return;
+    }
+
+    for (int i = 0; i < validIds.size(); ++i) {
+        const auto sourceSeg = std::filesystem::path(segmentPaths[i].toStdString());
+        const auto targetSeg = tempRoot / sourceSeg.filename();
+
+        std::error_code linkErr;
+        std::filesystem::create_directory_symlink(sourceSeg, targetSeg, linkErr);
+        if (linkErr) {
+            std::error_code copyErr;
+            std::filesystem::copy(sourceSeg, targetSeg,
+                                 std::filesystem::copy_options::recursive, copyErr);
+            if (copyErr) {
+                QMessageBox::critical(_parentWidget, tr("Error"),
+                                      tr("Failed to stage segment '%1': %2")
+                                          .arg(validIds.at(i))
+                                          .arg(QString::fromStdString(copyErr.message())));
+                std::filesystem::remove_all(tempRoot);
+                return;
+            }
+        }
+    }
+
+    QString referenceZarr = !_normal3dZarrPathGetter ? QString() : _normal3dZarrPathGetter();
+    if (referenceZarr.isEmpty()) {
+        referenceZarr = getCurrentVolumePath();
+    }
+    if (referenceZarr.isEmpty()) {
+        QMessageBox::warning(_parentWidget, tr("Error"),
+                             tr("Missing reference OME-Zarr. Load a normal3d/volume first."));
+        std::filesystem::remove_all(tempRoot);
+        return;
+    }
+
+    const QString executable = findVcTool("vc_tifxyz2zarr_sparse");
+    if (executable.isEmpty()) {
+        QMessageBox::warning(_parentWidget, tr("Error"),
+                             tr("vc_tifxyz2zarr_sparse tool not found. Configure tools/vc_tifxyz2zarr_sparse path."));
+        std::filesystem::remove_all(tempRoot);
+        return;
+    }
+
+    const QString tempRootStr = QString::fromStdString(tempRoot.string());
+    const QString outputRootStr = QString::fromStdString(outputRoot.string());
+    QStringList args;
+    args << tempRootStr
+         << outputRootStr
+         << QStringLiteral("--reference-zarr")
+         << referenceZarr
+         << QStringLiteral("--overwrite");
+    for (const QString& segmentId : validIds) {
+        args << QStringLiteral("--source-segment") << segmentId;
+    }
+    for (const QString& segmentPath : segmentPaths) {
+        args << QStringLiteral("--source-mesh") << segmentPath;
+    }
+
+    auto runner = _cmdRunner;
+    if (!runner) {
+        QMessageBox::critical(_parentWidget, tr("Error"),
+                              tr("Command runner is not available."));
+        std::filesystem::remove_all(tempRoot);
+        return;
+    }
+
+    QPointer<SegmentationCommandHandler> guard(this);
+    auto connection = std::make_shared<QMetaObject::Connection>();
+    *connection = connect(runner, &CommandLineToolRunner::toolFinished,
+                         this,
+                         [this, guard, connection, runner, tempRootStr, outputRootStr,
+                          validIds, segmentPaths](CommandLineToolRunner::Tool tool,
+                                                  bool success,
+                                                  const QString& message,
+                                                  const QString&,
+                                                  bool) {
+        if (!guard) {
+            disconnect(*connection);
+            return;
+        }
+        if (tool != CommandLineToolRunner::Tool::CustomCommand) {
+            return;
+        }
+        disconnect(*connection);
+
+        if (!success) {
+            QMessageBox::critical(_parentWidget, tr("Error"),
+                                  tr("vc_tifxyz2zarr_sparse failed.\n%1")
+                                      .arg(message));
+            emit statusMessage(tr("Rasterize failed"), 3000);
+        } else if (!appendRasterizationMetadata(outputRootStr, validIds, segmentPaths)) {
+            emit showWarning(tr("Warning"), tr("Rasterization completed but metadata update failed"));
+            emit statusMessage(tr("Rasterize complete, but metadata update failed"), 5000);
+        } else {
+            emit statusMessage(
+                tr("Rasterized %1 segment(s) -> %2")
+                    .arg(validIds.size())
+                    .arg(QDir::toNativeSeparators(outputRootStr)),
+                5000);
+        }
+
+        std::error_code cleanupErr;
+        std::filesystem::remove_all(std::filesystem::path(tempRootStr.toStdString()), cleanupErr);
+    });
+
+    if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_tifxyz2zarr_sparse"))) {
+        QObject::disconnect(*connection);
+        QMessageBox::critical(_parentWidget, tr("Error"),
+                              tr("Failed to start vc_tifxyz2zarr_sparse."));
+        std::filesystem::remove_all(tempRoot);
+        return;
+    }
+
+    emit statusMessage(
+        tr("Rasterization started for %1 segment(s)...").arg(validIds.size()), 0);
+}
+
 void SegmentationCommandHandler::onExportWidthChunks(const std::string& segmentId)
 {
     auto surf = _state->vpkg() ? _state->vpkg()->getSurface(segmentId) : nullptr;
@@ -2442,6 +2707,78 @@ void SegmentationCommandHandler::onExportWidthChunks(const std::string& segmentI
     } else {
         emit statusMessage(tr("Export cancelled"), 3000);
     }
+}
+
+bool SegmentationCommandHandler::appendRasterizationMetadata(const QString& outputZarrPath,
+                                                           const QStringList& segmentIds,
+                                                           const QStringList& segmentPaths) const
+{
+    if (outputZarrPath.isEmpty()) {
+        return false;
+    }
+
+    const QDir outDir(outputZarrPath);
+    if (!outDir.exists()) {
+        return false;
+    }
+
+    const QString metaJsonPath = outDir.filePath(QStringLiteral("meta.json"));
+    const QString zattrsPath = outDir.filePath(QStringLiteral(".zattrs"));
+
+    QJsonObject metaJson = readJsonObject(metaJsonPath);
+    if (metaJson.isEmpty()) {
+        metaJson["type"] = QStringLiteral("vol");
+        metaJson["uuid"] = outDir.dirName();
+        metaJson["name"] = outDir.dirName();
+        metaJson["width"] = 0;
+        metaJson["height"] = 0;
+        metaJson["slices"] = 0;
+        metaJson["voxelsize"] = 0.0;
+        metaJson["min"] = 0.0;
+        metaJson["max"] = 255.0;
+        metaJson["format"] = QStringLiteral("zarr");
+    }
+
+    QJsonObject zattrs = readJsonObject(zattrsPath);
+    QJsonArray idArray;
+    QJsonArray pathArray;
+    for (const QString& id : segmentIds) {
+        idArray.append(id);
+    }
+    for (const QString& p : segmentPaths) {
+        pathArray.append(p);
+    }
+
+    zattrs.insert(QStringLiteral("source_segments"), idArray);
+    zattrs.insert(QStringLiteral("source_meshes"), pathArray);
+    zattrs.insert(QStringLiteral("source_mesh_count"), static_cast<int>(segmentIds.size()));
+    zattrs.insert(QStringLiteral("rasterizer"), QStringLiteral("vc_tifxyz2zarr_sparse"));
+    zattrs.insert(QStringLiteral("rasterized_at"),
+                  QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+
+    if (!writeJsonObject(zattrsPath, zattrs)) {
+        return false;
+    }
+
+    const QJsonValue rasterizedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    metaJson.insert(QStringLiteral("label_volume"), QStringLiteral("rasterized"));
+    metaJson.insert(QStringLiteral("source_segments"), idArray);
+    metaJson.insert(QStringLiteral("source_meshes"), pathArray);
+    metaJson.insert(QStringLiteral("source_mesh_count"), static_cast<int>(segmentIds.size()));
+    metaJson.insert(QStringLiteral("rasterized_at"), rasterizedAt);
+    metaJson.insert(QStringLiteral("rasterizer"), QStringLiteral("vc_tifxyz2zarr_sparse"));
+
+    if (!writeJsonObject(metaJsonPath, metaJson)) {
+        return false;
+    }
+
+    const QString metafilePath = outDir.filePath(QStringLiteral("metafile"));
+    const QJsonObject legacyMeta = metaJson;
+    if (!writeJsonObject(metafilePath, legacyMeta)) {
+        return false;
+    }
+
+    return true;
 }
 
 void SegmentationCommandHandler::onReloadFromBackup(const QString& segmentId, int backupIndex)

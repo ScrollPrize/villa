@@ -1302,6 +1302,10 @@ void CWindow::CreateWidgets(void)
         this, [this](const QString& segmentId) {
             _segmentationCommandHandler->onExportWidthChunks(segmentId.toStdString());
         });
+    connect(_surfacePanel.get(), &SurfacePanelController::rasterizeSegmentsRequested,
+        this, [this](const QStringList& segmentIds) {
+            _segmentationCommandHandler->onRasterizeSegments(segmentIds);
+        });
 
     connect(_surfacePanel.get(), &SurfacePanelController::growSeedsRequested,
             this, [this](const QString& segmentId, bool isExpand, bool isRandomSeed) {

@@ -236,6 +236,7 @@ void CommandLineToolRunner::setRenderAdvanced(
 
 bool CommandLineToolRunner::execute(Tool tool)
 {
+    const bool isCustom = (tool == Tool::CustomCommand);
     if (_process && _process->state() != QProcess::NotRunning) {
         QMessageBox::warning(nullptr, tr("Warning"), tr("A tool is already running."));
         return false;
@@ -248,7 +249,12 @@ bool CommandLineToolRunner::execute(Tool tool)
         _consoleOutput->clear();
     }
 
-    QString toolCmd = toolName(tool);
+    if (isCustom && _customCommand.isEmpty()) {
+        QMessageBox::warning(nullptr, tr("Error"), tr("Custom command not specified."));
+        return false;
+    }
+
+    QString toolCmd = isCustom ? _customCommand : toolName(tool);
     QFileInfo toolInfo(toolCmd);
     if (!toolInfo.exists() || !toolInfo.isExecutable()) {
         QString errorMsg = tr("Tool executable not found or not executable: %1").arg(toolCmd);
@@ -258,24 +264,26 @@ bool CommandLineToolRunner::execute(Tool tool)
         return false;
     }
 
-    if (_explicitVolumePath) {
-        if (_volumePath.isEmpty()) {
-            QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified."));
-            return false;
-        }
-    } else {
-        QString resolvedVolumePath = _volumePath;
-        if (_mainWindow) {
-            resolvedVolumePath = _mainWindow->getCurrentVolumePath();
-            if (resolvedVolumePath.isEmpty()) {
-                QMessageBox::warning(nullptr, tr("Error"), tr("No volume selected."));
+    if (!isCustom) {
+        if (_explicitVolumePath) {
+            if (_volumePath.isEmpty()) {
+                QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified."));
                 return false;
             }
-        } else if (resolvedVolumePath.isEmpty()) {
-            QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified and no main window available."));
-            return false;
+        } else {
+            QString resolvedVolumePath = _volumePath;
+            if (_mainWindow) {
+                resolvedVolumePath = _mainWindow->getCurrentVolumePath();
+                if (resolvedVolumePath.isEmpty()) {
+                    QMessageBox::warning(nullptr, tr("Error"), tr("No volume selected."));
+                    return false;
+                }
+            } else if (resolvedVolumePath.isEmpty()) {
+                QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified and no main window available."));
+                return false;
+            }
+            _volumePath = resolvedVolumePath;
         }
-        _volumePath = resolvedVolumePath;
     }
 
     if (tool == Tool::RenderTifXYZ && _segmentPath.isEmpty()) {
@@ -334,7 +342,8 @@ bool CommandLineToolRunner::execute(Tool tool)
 
         *_logStream << "Tool: " << toolCmd << Qt::endl;
         *_logStream << "Started: " << QDateTime::currentDateTime().toString(Qt::ISODate) << Qt::endl;
-        *_logStream << "Arguments: " << buildArguments(tool).join(" ") << Qt::endl;
+        QStringList argsForLog = isCustom ? _customArgs : buildArguments(tool);
+        *_logStream << "Arguments: " << argsForLog.join(" ") << Qt::endl;
         *_logStream << "===================================" << Qt::endl << Qt::endl;
         _logStream->flush();
 
@@ -367,16 +376,20 @@ bool CommandLineToolRunner::execute(Tool tool)
         _process->setProcessEnvironment(env);
     }
 
-    QStringList args = buildArguments(tool);
-    QString toolCommand = toolName(tool);
+    QStringList args = isCustom ? _customArgs : buildArguments(tool);
+    QString toolCommand = toolCmd;
     QString formattedCommand = formatCommand(toolCommand, args, _ompThreads);
 
     QString startMessage;
+    const QString toolLabel = isCustom
+                              ? (_customLabel.isEmpty() ? QFileInfo(toolCommand).baseName()
+                                                       : _customLabel)
+                              : QFileInfo(toolCommand).baseName();
 
     if (tool == Tool::GrowSegFromSeeds) {
         // vc_grow_seg_from_seeds needs to use xargs for parallell processes
         startMessage = tr("Starting %1 with %2 parallel processes for: %3")
-                          .arg(toolCommand)
+                          .arg(toolLabel)
                           .arg(_parallelProcesses)
                           .arg(QFileInfo(_segmentPath).fileName());
 
@@ -388,7 +401,7 @@ bool CommandLineToolRunner::execute(Tool tool)
 
         emit toolStarted(_currentTool, startMessage);
 
-        _consoleOutput->setTitle(tr("Running: %1 (with xargs)").arg(toolCommand));
+        _consoleOutput->setTitle(tr("Running: %1 (with xargs)").arg(toolLabel));
 
         if (_autoShowConsole) {
             showConsoleOutput();
@@ -398,10 +411,13 @@ bool CommandLineToolRunner::execute(Tool tool)
         _process->setArguments(QStringList() << "-c" << shellCmd);
         _process->start();
     } else {
-        startMessage = tr("Starting %1 for: %2").arg(toolCommand).arg(QFileInfo(_segmentPath).fileName());
+        startMessage = isCustom ? tr("Starting %1").arg(toolLabel)
+                               : tr("Starting %1 for: %2")
+                                     .arg(toolLabel)
+                                     .arg(QFileInfo(_segmentPath).fileName());
         emit toolStarted(_currentTool, startMessage);
 
-        _consoleOutput->setTitle(tr("Running: %1").arg(toolCommand));
+        _consoleOutput->setTitle(tr("Running: %1").arg(toolLabel));
         _consoleOutput->appendOutput(tr("Command: %1\n").arg(formattedCommand));
         if (_logStream) {
             *_logStream << "Command: " << formattedCommand << Qt::endl;
@@ -416,6 +432,16 @@ bool CommandLineToolRunner::execute(Tool tool)
     }
 
     return true;
+}
+
+bool CommandLineToolRunner::executeCustomCommand(const QString& command,
+                                                 const QStringList& args,
+                                                 const QString& label)
+{
+    _customCommand = command;
+    _customArgs = args;
+    _customLabel = label;
+    return execute(Tool::CustomCommand);
 }
 
 void CommandLineToolRunner::cancel()
@@ -680,6 +706,9 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                 args << "--resume-opt" << _resumeOpt;
             }
             break;
+        case Tool::CustomCommand:
+            args = _customArgs;
+            break;
     }
 
     return args;
@@ -713,6 +742,9 @@ QString CommandLineToolRunner::toolName(Tool tool) const
         case Tool::NeighborCopy:
             return basePath + "vc_grow_seg_from_seed";
 
+        case Tool::CustomCommand:
+            return _customCommand.isEmpty() ? "custom_command" : _customCommand;
+
         default:
             return "unknown_tool";
     }
@@ -725,6 +757,9 @@ QString CommandLineToolRunner::getOutputPath() const
     }
     if (_currentTool == Tool::NeighborCopy) {
         return _tgtDir;
+    }
+    if (_currentTool == Tool::CustomCommand) {
+        return QString();
     }
 
     QFileInfo outputInfo(_outputPattern);
