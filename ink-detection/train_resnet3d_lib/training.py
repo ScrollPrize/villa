@@ -22,7 +22,9 @@ def _resolve_trainer_precision(cli_precision):
 
 
 def _build_regression_model_state(run_state, data_state):
-    return {
+    # Keep one transport payload for model construction, but build it in
+    # conceptual sections so research edits stay easy to locate.
+    model_state = {
         "enc": "i3d",
         "size": int(getattr(CFG, "size", 256)),
         "with_norm": False,
@@ -32,6 +34,9 @@ def _build_regression_model_state(run_state, data_state):
         "stitch_group_idx_by_segment": dict(data_state["group_idx_by_segment"]),
         "norm": str(getattr(CFG, "norm", "batch")),
         "group_norm_groups": int(getattr(CFG, "group_norm_groups", 32)),
+    }
+
+    objective_state = {
         "objective": str(getattr(CFG, "objective", "erm")),
         "loss_mode": str(getattr(CFG, "loss_mode", "batch")),
         "loss_recipe": str(getattr(CFG, "loss_recipe", "dice_bce")).lower(),
@@ -47,6 +52,9 @@ def _build_regression_model_state(run_state, data_state):
         "group_dro_min_var_weight": float(run_state["group_dro_min_var_weight"]),
         "group_dro_adj": run_state["group_dro_adj"],
         "erm_group_topk": int(getattr(CFG, "erm_group_topk", 0)),
+    }
+
+    stitch_state = {
         "stitch_val_dataloader_idx": data_state["stitch_val_dataloader_idx"],
         "stitch_pred_shape": data_state["stitch_pred_shape"],
         "stitch_segment_id": (
@@ -71,6 +79,9 @@ def _build_regression_model_state(run_state, data_state):
         "stitch_train": bool(getattr(CFG, "stitch_train", False)),
         "stitch_train_every_n_epochs": int(getattr(CFG, "stitch_train_every_n_epochs", 1)),
     }
+    model_state.update(objective_state)
+    model_state.update(stitch_state)
+    return model_state
 
 
 def build_model(run_state, data_state, wandb_logger):

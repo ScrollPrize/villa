@@ -244,6 +244,8 @@ def _coerce_regression_model_state(
     objective_cfg=None,
     stitch_cfg=None,
 ):
+    # Single internal state avoids config shuttling across modules while still
+    # accepting legacy grouped checkpoint payloads during migration.
     merged_state = {}
     if model_state is not None:
         state = _cfg_to_dict(model_state, key="model_state")
