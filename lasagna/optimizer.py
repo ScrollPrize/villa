@@ -8,7 +8,9 @@ import torch
 
 import cli_data
 import fit_data
+import opt_loss_data
 import opt_loss_dir
+import opt_loss_pred_dt
 import opt_loss_step
 import opt_loss_smooth
 import opt_loss_winding_density
@@ -131,6 +133,9 @@ lambda_global: dict[str, float] = {
 	"smooth": 0.0,
 	"winding_density": 0.0,
 	"normal": 0.0,
+	"data": 0.0,
+	"data_plain": 0.0,
+	"pred_dt": 0.0,
 }
 
 
@@ -239,6 +244,9 @@ def optimize(
 		"smooth": {"loss": opt_loss_smooth.smooth_loss},
 		"winding_density": {"loss": opt_loss_winding_density.winding_density_loss},
 		"normal": {"loss": opt_loss_dir.normal_loss},
+		"data": {"loss": opt_loss_data.data_loss},
+		"data_plain": {"loss": opt_loss_data.data_plain_loss},
+		"pred_dt": {"loss": opt_loss_pred_dt.pred_dt_loss},
 	}
 
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:
