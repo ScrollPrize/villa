@@ -22,12 +22,12 @@ from train_resnet3d_lib.data.normalization_stats import (
 )
 from train_resnet3d_lib.data.dataloaders import build_eval_loader
 from train_resnet3d_lib.data.datasets_runtime import LazyZarrXyOnlyDataset
+from train_resnet3d_lib.data.augmentations import get_transforms
 from train_resnet3d_lib.data.patching import _mask_component_bboxes_downsample
 from train_resnet3d_lib.data.image_readers import (
     read_fragment_mask_for_shape,
 )
 from train_resnet3d_lib.data.zarr_volume import ZarrSegmentVolume
-from train_resnet3d_lib.data.transforms_runtime import get_transforms
 from train_resnet3d_lib.data.segment_metadata import (
     get_segment_layer_range as _segment_layer_range,
     get_segment_meta as _segment_meta,

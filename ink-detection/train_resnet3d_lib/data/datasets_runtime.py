@@ -2,14 +2,14 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from train_resnet3d_lib.config import CFG
-from train_resnet3d_lib.data.patching import _read_mask_patch
-from train_resnet3d_lib.data.transforms_runtime import (
+from train_resnet3d_lib.data.augmentations import (
     _apply_image_transform,
     _apply_joint_transform,
     _maybe_fourth_augment,
     _maybe_invert_augment,
     _xy_to_bounds,
 )
+from train_resnet3d_lib.data.patching import _read_mask_patch
 
 
 def _require_dict(value, *, name):
@@ -315,5 +315,4 @@ class LazyZarrXyOnlyDataset(Dataset):
         image = self.volumes[segment_id].read_patch(y1, y2, x1, x2)
         image = _apply_image_transform(self.transform, image)
         return image, xy
-
 

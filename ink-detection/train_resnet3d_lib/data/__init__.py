@@ -4,9 +4,8 @@ Layout:
 - `image_readers`: image/layer/label/mask readers
 - `zarr_volume`: zarr volume/path utilities
 - `patching`: patch extraction + mask store helpers
-- `transforms_runtime`: runtime transforms + augmentation hooks
+- `augmentations`: train/valid augmentation + runtime transform helpers
 - `datasets_runtime`: dataset classes and flat-index utilities
-- `augmentations`: train/valid augmentation + normalization transforms
 - `segment_trainval`: train/val segment loading implementations
 - `segment_stitching`: stitch/train-viz/log-only segment loaders
 - `dataloaders`: dataloader factory helpers
@@ -19,7 +18,6 @@ __all__ = [
     "image_readers",
     "zarr_volume",
     "patching",
-    "transforms_runtime",
     "datasets_runtime",
     "augmentations",
     "segment_trainval",
