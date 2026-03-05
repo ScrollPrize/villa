@@ -105,9 +105,14 @@ static const char* coordTypeName(SpoolCoordType type) {
 }
 
 static SpoolCoordType chooseSpoolCoordType(const Shape3& shape) {
-    const auto maxCoord = std::max(shape[0], std::max(shape[1], shape[2]));
-    if (maxCoord <= std::numeric_limits<uint8_t>::max()) return SpoolCoordType::U8;
-    if (maxCoord <= std::numeric_limits<uint16_t>::max()) return SpoolCoordType::U16;
+    if (shape[0] == 0 || shape[1] == 0 || shape[2] == 0) {
+        throw std::runtime_error("invalid volume shape with zero dimension");
+    }
+
+    const auto maxIndex = std::max(shape[0] - 1,
+                                  std::max(shape[1] - 1, shape[2] - 1));
+    if (maxIndex <= std::numeric_limits<uint8_t>::max()) return SpoolCoordType::U8;
+    if (maxIndex <= std::numeric_limits<uint16_t>::max()) return SpoolCoordType::U16;
     return SpoolCoordType::U32;
 }
 
