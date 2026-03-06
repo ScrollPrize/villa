@@ -172,6 +172,8 @@ public:
     QPointF volumeToScene(const cv::Vec3f& vol_point);
     // Transform from canvas scene coordinates to volume (world) coordinates
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const;
+    // Scene-to-volume coordinate conversion (returns position + normal)
+    bool sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n, const QPointF& scenePos) const;
     QPointF lastScenePosition() const { return _lastScenePos; }
 
     // --- BBox tool ---
@@ -244,9 +246,6 @@ private:
 
     // Build TileRenderParams for a given tile key
     TileRenderParams buildRenderParams(const WorldTileKey& wk) const;
-
-    // Scene-to-volume coordinate conversion (returns position + normal)
-    bool sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n, const QPointF& scenePos) const;
 
     void markActiveSegmentationDirty();
 
