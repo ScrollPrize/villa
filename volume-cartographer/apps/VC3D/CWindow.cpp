@@ -37,6 +37,7 @@
 #include <QRegularExpressionValidator>
 #include <QDockWidget>
 #include <QLabel>
+#include <QSpinBox>
 #include <QSizePolicy>
 #include <QProcess>
 #include <QTemporaryDir>
@@ -362,6 +363,38 @@ cv::Vec3f applyAffineTransform(const cv::Vec3f& point, const cv::Matx44d& matrix
     return cv::Vec3f(static_cast<float>(transformed[0]),
                      static_cast<float>(transformed[1]),
                      static_cast<float>(transformed[2]));
+}
+
+cv::Vec3f applyPreAffineScale(const cv::Vec3f& point, int scale)
+{
+    if (point[0] == -1.0f || scale == 1) {
+        return point;
+    }
+
+    return point * static_cast<float>(scale);
+}
+
+void transformSurfacePoints(QuadSurface* surface, int scale, const std::optional<cv::Matx44d>& matrix)
+{
+    if (!surface) {
+        return;
+    }
+
+    if (auto* points = surface->rawPointsPtr()) {
+        for (int row = 0; row < points->rows; ++row) {
+            for (int col = 0; col < points->cols; ++col) {
+                auto& point = (*points)(row, col);
+                if (point[0] == -1.0f) {
+                    continue;
+                }
+
+                point = applyPreAffineScale(point, scale);
+                if (matrix) {
+                    point = applyAffineTransform(point, *matrix);
+                }
+            }
+        }
+    }
 }
 
 std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<QuadSurface>& source)
@@ -1195,9 +1228,15 @@ bool CWindow::applyTransformPreview()
     }
 
     const auto transformPath = currentTransformJsonPath();
-    cv::Matx44d matrix = loadAffineTransformMatrix(transformPath);
-    if (_invertTransformCheck && _invertTransformCheck->isChecked()) {
-        matrix = invertAffineTransformMatrix(matrix);
+    const int scale = _transformScaleSpin ? _transformScaleSpin->value() : 1;
+    std::optional<cv::Matx44d> matrix;
+    if (!transformPath.empty() && std::filesystem::exists(transformPath)) {
+        matrix = loadAffineTransformMatrix(transformPath);
+        if (_invertTransformCheck && _invertTransformCheck->isChecked()) {
+            matrix = invertAffineTransformMatrix(*matrix);
+        }
+    } else if (scale == 1) {
+        return false;
     }
 
     auto previewSurface = cloneSurfaceForTransform(sourceSurface);
@@ -1208,17 +1247,7 @@ bool CWindow::applyTransformPreview()
     previewSurface->path.clear();
     previewSurface->id.clear();
 
-    if (auto* points = previewSurface->rawPointsPtr()) {
-        for (int row = 0; row < points->rows; ++row) {
-            for (int col = 0; col < points->cols; ++col) {
-                auto& point = (*points)(row, col);
-                if (point[0] == -1.0f) {
-                    continue;
-                }
-                point = applyAffineTransform(point, matrix);
-            }
-        }
-    }
+    transformSurfacePoints(previewSurface.get(), scale, matrix);
 
     clearTransformPreview(false);
     _transformPreviewSourceSurface = sourceSurface;
@@ -1232,7 +1261,8 @@ bool CWindow::applyTransformPreview()
 
 void CWindow::refreshTransformsPanelState()
 {
-    if (!_previewTransformCheck || !_invertTransformCheck || !_saveTransformedButton || !_transformStatusLabel) {
+    if (!_previewTransformCheck || !_invertTransformCheck || !_transformScaleSpin ||
+        !_saveTransformedButton || !_transformStatusLabel) {
         return;
     }
 
@@ -1241,7 +1271,9 @@ void CWindow::refreshTransformsPanelState()
     const auto currentVolume = _state ? _state->currentVolume() : nullptr;
     const auto transformPath = currentTransformJsonPath();
     const bool hasTransform = !transformPath.empty() && std::filesystem::exists(transformPath);
-    const bool previewEnabled = sourceSurface && hasTransform && !editingEnabled;
+    const int scale = _transformScaleSpin->value();
+    const bool hasScaleOnlyTransform = scale != 1;
+    const bool previewEnabled = sourceSurface && !editingEnabled && (hasTransform || hasScaleOnlyTransform);
     const bool saveEnabled = previewEnabled && sourceSurface && !sourceSurface->path.empty();
     QString transformLocation;
     if (currentVolume && !currentVolume->path().empty()) {
@@ -1268,12 +1300,19 @@ void CWindow::refreshTransformsPanelState()
     } else if (editingEnabled) {
         statusText = tr("Transform preview is unavailable while segmentation editing is enabled.");
     } else if (!hasTransform) {
-        statusText = tr("No transform.json found at %1")
-            .arg(transformLocation);
+        if (hasScaleOnlyTransform) {
+            statusText = tr("Scaling points by %1 before affine transform. No transform.json found at %2.")
+                .arg(scale)
+                .arg(transformLocation);
+        } else {
+            statusText = tr("No transform.json found at %1")
+                .arg(transformLocation);
+        }
     } else {
-        statusText = tr("Using %1%2")
+        statusText = tr("Using %1%2 with scale %3")
             .arg(transformLocation,
-                 (_invertTransformCheck->isChecked() ? tr(" (inverted)") : QString()));
+                 (_invertTransformCheck->isChecked() ? tr(" (inverted)") : QString()))
+            .arg(scale);
     }
 
     if (!previewEnabled && _previewTransformCheck->isChecked()) {
@@ -1297,7 +1336,8 @@ void CWindow::refreshTransformsPanelState()
     }
 
     _previewTransformCheck->setEnabled(previewEnabled);
-    _invertTransformCheck->setEnabled(previewEnabled);
+    _invertTransformCheck->setEnabled(!editingEnabled && hasTransform);
+    _transformScaleSpin->setEnabled(sourceSurface && !editingEnabled);
     _saveTransformedButton->setEnabled(saveEnabled);
     _transformStatusLabel->setText(statusText);
 }
@@ -1352,9 +1392,11 @@ void CWindow::onSaveTransformedRequested()
     }
 
     const auto transformPath = currentTransformJsonPath();
-    if (transformPath.empty() || !std::filesystem::exists(transformPath)) {
+    const int scale = _transformScaleSpin ? _transformScaleSpin->value() : 1;
+    const bool hasTransform = !transformPath.empty() && std::filesystem::exists(transformPath);
+    if (!hasTransform && scale == 1) {
         QMessageBox::warning(this, tr("Missing Transform"),
-                             tr("No transform.json was found for the current volume."));
+                             tr("No transform.json was found for the current volume, and scale is set to 1."));
         return;
     }
 
@@ -1397,26 +1439,19 @@ void CWindow::onSaveTransformedRequested()
     }
 
     try {
-        cv::Matx44d matrix = loadAffineTransformMatrix(transformPath);
-        if (_invertTransformCheck && _invertTransformCheck->isChecked()) {
-            matrix = invertAffineTransformMatrix(matrix);
+        std::optional<cv::Matx44d> matrix;
+        if (hasTransform) {
+            matrix = loadAffineTransformMatrix(transformPath);
+            if (_invertTransformCheck && _invertTransformCheck->isChecked()) {
+                matrix = invertAffineTransformMatrix(*matrix);
+            }
         }
         auto transformedSurface = cloneSurfaceForTransform(sourceSurface);
         if (!transformedSurface) {
             throw std::runtime_error("failed to clone source surface");
         }
 
-        if (auto* points = transformedSurface->rawPointsPtr()) {
-            for (int row = 0; row < points->rows; ++row) {
-                for (int col = 0; col < points->cols; ++col) {
-                    auto& point = (*points)(row, col);
-                    if (point[0] == -1.0f) {
-                        continue;
-                    }
-                    point = applyAffineTransform(point, matrix);
-                }
-            }
-        }
+        transformSurfacePoints(transformedSurface.get(), scale, matrix);
 
         const std::filesystem::path stagingPath =
             std::filesystem::path(stagingRoot.path().toStdString()) / newId;
@@ -2223,6 +2258,18 @@ void CWindow::CreateWidgets(void)
     _invertTransformCheck = new QCheckBox(tr("Invert Transform"), transformsContainer);
     transformsLayout->addWidget(_invertTransformCheck);
 
+    auto* transformScaleRow = new QHBoxLayout();
+    transformScaleRow->setContentsMargins(0, 0, 0, 0);
+    transformScaleRow->setSpacing(8);
+    transformScaleRow->addWidget(new QLabel(tr("Scale"), transformsContainer));
+    _transformScaleSpin = new QSpinBox(transformsContainer);
+    _transformScaleSpin->setMinimum(1);
+    _transformScaleSpin->setMaximum(1000);
+    _transformScaleSpin->setValue(1);
+    _transformScaleSpin->setToolTip(tr("Multiply segmentation points by this integer before applying the affine transform."));
+    transformScaleRow->addWidget(_transformScaleSpin);
+    transformsLayout->addLayout(transformScaleRow);
+
     _saveTransformedButton = new QPushButton(tr("Save Transformed"), transformsContainer);
     transformsLayout->addWidget(_saveTransformedButton);
 
@@ -2235,6 +2282,8 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onPreviewTransformToggled);
     connect(_invertTransformCheck, &QCheckBox::toggled,
             this, [this](bool) { refreshTransformsPanelState(); });
+    connect(_transformScaleSpin, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, [this](int) { refreshTransformsPanelState(); });
     connect(_saveTransformedButton, &QPushButton::clicked,
             this, &CWindow::onSaveTransformedRequested);
 
