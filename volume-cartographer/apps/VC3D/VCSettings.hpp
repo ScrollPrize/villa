@@ -128,6 +128,7 @@ namespace viewer {
     constexpr auto GROUP_RENDER_SETTINGS_EXPANDED = "viewer/group_render_settings_expanded";
     constexpr auto GROUP_COMPOSITE_EXPANDED = "viewer/group_composite_expanded";
     constexpr auto GROUP_POSTPROCESSING_EXPANDED = "viewer/group_postprocessing_expanded";
+    constexpr auto GROUP_TRANSFORMS_EXPANDED = "viewer/group_transforms_expanded";
 
     constexpr bool GROUP_PREPROCESSING_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_NORMAL_VIS_EXPANDED_DEFAULT = true;
@@ -136,6 +137,7 @@ namespace viewer {
     constexpr bool GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_COMPOSITE_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_POSTPROCESSING_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_TRANSFORMS_EXPANDED_DEFAULT = true;
 }
 
 // -----------------------------------------------------------------------------

@@ -4,14 +4,20 @@
 #include <cstdio>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <optional>
+#include <sstream>
 #include <nlohmann/json.hpp>
+
+#include <utils/hash.hpp>
 
 #ifdef VC_USE_CURL
 #include <curl/curl.h>
 #endif
 
 namespace vc::cache {
+
+static constexpr const char* kRemoteSourceFile = ".remote_source.json";
 
 // ---- curl helpers -----------------------------------------------------------
 
@@ -395,16 +401,33 @@ bool httpDownloadFile(const std::string& url, const std::filesystem::path& dest,
 
 // ---- metadata fetcher -------------------------------------------------------
 
-static std::string deriveVolumeId(const std::string& url)
+std::string normalizeRemoteUrl(const std::string& url)
 {
-    // Extract last non-empty path component from URL
     std::string u = url;
     while (!u.empty() && u.back() == '/') u.pop_back();
+    return u;
+}
+
+static std::string deriveRemoteVolumeName(const std::string& url)
+{
+    std::string u = normalizeRemoteUrl(url);
     auto pos = u.rfind('/');
     if (pos != std::string::npos) {
         return u.substr(pos + 1);
     }
     return u;
+}
+
+std::string deriveRemoteVolumeId(const std::string& url)
+{
+    const auto normalized = normalizeRemoteUrl(url);
+    const auto name = deriveRemoteVolumeName(normalized);
+    const auto hash = utils::fnv1a(std::string_view(normalized));
+
+    std::ostringstream oss;
+    oss << name << "-" << std::hex << std::nouppercase << std::setw(16)
+        << std::setfill('0') << hash;
+    return oss.str();
 }
 
 static void writeFile(const std::filesystem::path& path, const std::string& content)
@@ -421,6 +444,34 @@ static std::string readFile(const std::filesystem::path& path)
     return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
 }
 
+static std::optional<std::string> readRemoteSourceMarker(
+    const std::filesystem::path& stagingDir)
+{
+    auto markerJson = readFile(stagingDir / kRemoteSourceFile);
+    if (markerJson.empty()) {
+        return std::nullopt;
+    }
+
+    try {
+        auto marker = nlohmann::json::parse(markerJson);
+        if (!marker.contains("url") || !marker["url"].is_string()) {
+            return std::nullopt;
+        }
+        return normalizeRemoteUrl(marker["url"].get<std::string>());
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+static void writeRemoteSourceMarker(
+    const std::filesystem::path& stagingDir,
+    const std::string& baseUrl)
+{
+    nlohmann::json marker;
+    marker["url"] = baseUrl;
+    writeFile(stagingDir / kRemoteSourceFile, marker.dump(2));
+}
+
 // Check if staging dir already has valid cached metadata (meta.json + at least 0/.zarray).
 // If so, return the info without hitting the network.
 static std::optional<RemoteZarrInfo> tryLoadCachedMetadata(
@@ -428,6 +479,16 @@ static std::optional<RemoteZarrInfo> tryLoadCachedMetadata(
     const std::filesystem::path& stagingDir)
 {
     namespace fs = std::filesystem;
+
+    if (auto markerUrl = readRemoteSourceMarker(stagingDir)) {
+        if (*markerUrl != baseUrl) {
+            if (auto* log = cacheDebugLog())
+                std::fprintf(log,
+                             "[REMOTE] Rejecting cached metadata from %s: marker URL %s does not match %s\n",
+                             stagingDir.c_str(), markerUrl->c_str(), baseUrl.c_str());
+            return std::nullopt;
+        }
+    }
 
     auto metaPath = stagingDir / "meta.json";
     auto level0Zarray = stagingDir / "0" / ".zarray";
@@ -476,11 +537,10 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
     const std::filesystem::path& stagingRoot,
     const HttpAuth& auth)
 {
-    // Normalize URL: strip trailing slashes
-    std::string baseUrl = url;
-    while (!baseUrl.empty() && baseUrl.back() == '/') baseUrl.pop_back();
+    const std::string baseUrl = normalizeRemoteUrl(url);
 
-    std::string volumeId = deriveVolumeId(baseUrl);
+    const std::string volumeName = deriveRemoteVolumeName(baseUrl);
+    const std::string volumeId = deriveRemoteVolumeId(baseUrl);
     auto stagingDir = stagingRoot / volumeId;
 
     // Clean up stale sibling .chunks dir from older code path
@@ -494,6 +554,7 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
 
     // Try cached metadata first — avoids network round-trips on subsequent opens
     if (auto cached = tryLoadCachedMetadata(baseUrl, stagingDir)) {
+        writeRemoteSourceMarker(stagingDir, baseUrl);
         return *cached;
     }
 
@@ -595,7 +656,7 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
 
     nlohmann::json meta;
     meta["uuid"] = volumeId;
-    meta["name"] = volumeId;
+    meta["name"] = volumeName;
     meta["type"] = "vol";
     meta["width"] = width;
     meta["height"] = height;
@@ -606,6 +667,7 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
     meta["max"] = 255;
 
     writeFile(stagingDir / "meta.json", meta.dump(2));
+    writeRemoteSourceMarker(stagingDir, baseUrl);
 
     if (auto* log = cacheDebugLog())
         std::fprintf(log, "[REMOTE] Metadata complete: %d levels, shape=[%d, %d, %d] delimiter='%s'\n",

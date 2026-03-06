@@ -41,6 +41,7 @@ public:
 
     [[nodiscard]] bool isRemote() const;
     [[nodiscard]] bool isValidVolumeDirectory(const std::filesystem::path& dirpath) const;
+    bool addVolume(const std::shared_ptr<Volume>& volume);
     bool addSingleVolume(const std::string& volumeDirName);
     bool removeSingleVolume(const std::string& volumeIdOrDirName);
     bool reloadSingleVolume(const std::string& volumeId);

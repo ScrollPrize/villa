@@ -54,6 +54,22 @@ std::optional<std::vector<uint8_t>> DiskStore::get(
     return readFileToVector(chunkPath(volumeId, key));
 }
 
+bool DiskStore::contains(
+    const std::string& volumeId,
+    const ChunkKey& key) const
+{
+    auto path = chunkPath(volumeId, key);
+    {
+        std::lock_guard<std::mutex> lk(indexMtx_);
+        if (pathIndex_.find(path.string()) != pathIndex_.end()) {
+            return true;
+        }
+    }
+
+    std::error_code ec;
+    return std::filesystem::exists(path, ec) && !ec;
+}
+
 void DiskStore::put(
     const std::string& volumeId,
     const ChunkKey& key,

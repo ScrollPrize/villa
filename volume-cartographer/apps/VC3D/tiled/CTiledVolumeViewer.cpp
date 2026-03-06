@@ -5,6 +5,7 @@
 #include "VCSettings.hpp"
 #include "VolumeViewerCmaps.hpp"
 #include "../CState.hpp"
+#include "../overlays/SegmentationOverlayController.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -19,15 +20,18 @@
 #include <QGraphicsView>
 #include <QGraphicsScene>
 #include <QGraphicsItem>
+#include <QGraphicsPathItem>
 #include <QGraphicsPixmapItem>
 #include <QGraphicsEllipseItem>
 #include <QMdiSubWindow>
+#include <QPainterPath>
 #include <QWindowStateChangeEvent>
 #include <QScrollBar>
 #include <QGuiApplication>
 #include <QPointer>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 #include <QDebug>
@@ -38,6 +42,63 @@ constexpr auto COLOR_CURSOR = Qt::cyan;
 #define COLOR_SEG_YZ Qt::yellow
 #define COLOR_SEG_XZ Qt::red
 #define COLOR_SEG_XY QColor(255, 140, 0)
+
+namespace
+{
+constexpr qreal kIntersectionZ = 18.0;
+constexpr auto kIntersectionItemsKey = "__plane_intersections__";
+
+bool isFinitePoint(const QPointF& point)
+{
+    return std::isfinite(point.x()) && std::isfinite(point.y());
+}
+
+cv::Rect planeRoiFromSceneRect(TileScene* tileScene, const QRectF& sceneRect)
+{
+    if (!tileScene || !sceneRect.isValid()) {
+        return {};
+    }
+
+    const std::array<QPointF, 4> corners = {
+        sceneRect.topLeft(),
+        sceneRect.topRight(),
+        sceneRect.bottomLeft(),
+        sceneRect.bottomRight(),
+    };
+
+    float minX = std::numeric_limits<float>::max();
+    float minY = std::numeric_limits<float>::max();
+    float maxX = std::numeric_limits<float>::lowest();
+    float maxY = std::numeric_limits<float>::lowest();
+
+    for (const auto& corner : corners) {
+        const cv::Vec2f surfacePoint = tileScene->sceneToSurface(corner);
+        minX = std::min(minX, surfacePoint[0]);
+        minY = std::min(minY, surfacePoint[1]);
+        maxX = std::max(maxX, surfacePoint[0]);
+        maxY = std::max(maxY, surfacePoint[1]);
+    }
+
+    const int x = static_cast<int>(std::floor(minX));
+    const int y = static_cast<int>(std::floor(minY));
+    const int right = static_cast<int>(std::ceil(maxX));
+    const int bottom = static_cast<int>(std::ceil(maxY));
+    return {x, y, std::max(1, right - x), std::max(1, bottom - y)};
+}
+
+std::pair<int, int> surfaceParamToGrid(const QuadSurface* surface, const cv::Vec3f& param)
+{
+    if (!surface) {
+        return {0, 0};
+    }
+
+    const cv::Vec3f center = surface->center();
+    const cv::Vec2f scale = surface->scale();
+    const int col = static_cast<int>(std::lround(param[0] + center[0] * scale[0]));
+    const int row = static_cast<int>(std::lround(param[1] + center[1] * scale[1]));
+    return {row, col};
+}
+}  // namespace
 
 // ============================================================================
 // Construction / destruction
@@ -114,6 +175,7 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
         centerViewport();
         _camera.invalidate();
         submitRender();
+        renderIntersections();
     });
 
     _lbl = new QLabel(this);
@@ -152,7 +214,11 @@ void CTiledVolumeViewer::setSurface(const std::string& name)
     onSurfaceChanged(name, _state->surface(name));
 }
 
-void CTiledVolumeViewer::setIntersects(const std::set<std::string>& set) { _intersectTgts = set; }
+void CTiledVolumeViewer::setIntersects(const std::set<std::string>& set)
+{
+    _intersectTgts = set;
+    renderIntersections();
+}
 
 Surface* CTiledVolumeViewer::currentSurface() const
 {
@@ -255,9 +321,19 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
     }
 
     if (_surfName == name) {
+        auto previousSurf = _surfWeak.lock();
+        const bool isInPlaceQuadEditUpdate =
+            isEditUpdate &&
+            surf &&
+            previousSurf &&
+            previousSurf.get() == surf.get() &&
+            dynamic_cast<QuadSurface*>(surf.get()) != nullptr;
+
         _surfWeak = surf;
         _surfBBoxCache = {};  // invalidate bounding box cache
         if (!surf) {
+            _surfaceContentVersion = 0;
+            updateParamsHash();
             clearAllOverlayGroups();
             _tileScene->sceneCleared();
             _ov.cursor = nullptr;
@@ -270,22 +346,27 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
             // Grid will be rebuilt when new surface is set
         } else {
             invalidateVis();
-            if (!isEditUpdate) {
-                _camera.zOff = 0.0f;
-            }
+            if (isInPlaceQuadEditUpdate) {
+                ++_surfaceContentVersion;
+                updateParamsHash();
+            } else {
+                _surfaceContentVersion = 0;
+                updateParamsHash();
+                if (!isEditUpdate) {
+                    _camera.zOff = 0.0f;
+                }
 
-            // Clear rendered tile cache and visible tiles — the cache keys
-            // have no surface identifier so stale entries from the previous
-            // surface would be served as false hits.
-            _renderController->cancelAll();
-            _renderController->sliceCache().clear();
-            _tileScene->clearAll();
+                // Full surface changes still need a full render reset.
+                _renderController->cancelAll();
+                _renderController->sliceCache().clear();
+                _tileScene->clearAll();
 
-            updateContentMinScale();
-            rebuildContentGrid();
-            centerViewport();
-            if (name == "segmentation" && _resetViewOnSurfaceChange) {
-                fitSurfaceInView();
+                updateContentMinScale();
+                rebuildContentGrid();
+                centerViewport();
+                if (name == "segmentation" && _resetViewOnSurfaceChange) {
+                    fitSurfaceInView();
+                }
             }
         }
     }
@@ -296,6 +377,9 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
     }
 
     _renderController->markOverlaysDirty();
+    if (name == "segmentation" || name == _surfName) {
+        renderIntersections();
+    }
 }
 
 void CTiledVolumeViewer::onVolumeClosing()
@@ -479,6 +563,7 @@ void CTiledVolumeViewer::onPinComplete()
     fGraphicsView->setVoxelSize(vs, vs);
 
     submitRender();
+    renderIntersections();
     updateStatusLabel();
 }
 
@@ -496,19 +581,18 @@ void CTiledVolumeViewer::onDataBoundsReady()
         auto surf = _surfWeak.lock();
         auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
         if (plane) {
-            // Coordinate convention: Vec3f is (z, y, x)
-            cv::Vec3f center((db.minZ + db.maxZ) * 0.5f,
+            cv::Vec3f center((db.minX + db.maxX) * 0.5f,
                              (db.minY + db.maxY) * 0.5f,
-                             (db.minX + db.maxX) * 0.5f);
+                             (db.minZ + db.maxZ) * 0.5f);
             plane->setOrigin(center);
         }
 
         // Update focus POI — cascades to all axis-aligned viewers
         POI* focus = _state->poi("focus");
         if (focus) {
-            cv::Vec3f center((db.minZ + db.maxZ) * 0.5f,
+            cv::Vec3f center((db.minX + db.maxX) * 0.5f,
                              (db.minY + db.maxY) * 0.5f,
-                             (db.minX + db.maxX) * 0.5f);
+                             (db.minZ + db.maxZ) * 0.5f);
             focus->p = center;
             _state->setPOI("focus", focus);
         }
@@ -523,6 +607,7 @@ void CTiledVolumeViewer::onDataBoundsReady()
     centerViewport();
     _camera.invalidate();
     submitRender();
+    renderIntersections();
 }
 
 QRectF CTiledVolumeViewer::viewportSceneRect() const
@@ -554,6 +639,7 @@ void CTiledVolumeViewer::panBy(int dx, int dy)
 
     centerViewport();
     submitRender();
+    scheduleOverlayUpdate();
     updateStatusLabel();
 }
 
@@ -601,6 +687,7 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     centerViewport();
     _camera.invalidate();
     submitRender();
+    renderIntersections();
 }
 
 void CTiledVolumeViewer::setSliceOffset(float dz)
@@ -726,6 +813,7 @@ void CTiledVolumeViewer::onPanRelease(Qt::MouseButton /*buttons*/, Qt::KeyboardM
 {
     _isPanning = false;
     _renderController->markOverlaysDirty();
+    renderIntersections();
 }
 
 void CTiledVolumeViewer::onScrolled()
@@ -741,6 +829,7 @@ void CTiledVolumeViewer::onResized()
     centerViewport();
     _camera.invalidate();
     submitRender();
+    renderIntersections();
 }
 
 // ============================================================================
@@ -934,6 +1023,7 @@ bool CTiledVolumeViewer::computeQuadPrefetchBBox(const std::shared_ptr<Surface>&
 void CTiledVolumeViewer::updateParamsHash()
 {
     auto h = utils::hash_combine_values(
+        _surfaceContentVersion,
         _baseWindowLow, _baseWindowHigh, _stretchValues,
         _baseColormapId, _useFastInterpolation,
         // Composite settings — all fields that affect rendered output
@@ -966,6 +1056,7 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     TileRenderParams params;
     params.worldKey = wk;
     params.epoch = _camera.epoch;
+    params.cacheIdentity = _renderController ? _renderController->paramsHash() : 0;
 
     // Surface parameter ROI from world tile coordinates
     params.surfaceROI.x = wk.worldCol * _contentBounds.worldTileSize;
@@ -1027,24 +1118,16 @@ void CTiledVolumeViewer::onCursorMove(QPointF scene_loc)
     auto surf = _surfWeak.lock();
     if (!surf || !_state) return;
 
-    // Handle panning: if middle/right button is down, pan instead
-    if (_isPanning) {
-        QPoint currentPos = QCursor::pos();
-        QPoint delta = _lastPanPos - currentPos;
-        _lastPanPos = currentPos;
-        if (delta.x() != 0 || delta.y() != 0) {
-            panBy(-delta.x(), -delta.y());
+    auto updateCursorPoi = [this](const QPointF& cursorScenePos) {
+        cv::Vec3f p, n;
+        if (!sceneToVolumePN(p, n, cursorScenePos)) {
+            if (_ov.cursor) _ov.cursor->hide();
+            return;
         }
-        return;
-    }
 
-    cv::Vec3f p, n;
-    if (!sceneToVolumePN(p, n, scene_loc)) {
-        if (_ov.cursor) _ov.cursor->hide();
-    } else {
         if (_ov.cursor) {
             _ov.cursor->show();
-            _ov.cursor->setPos(scene_loc);
+            _ov.cursor->setPos(cursorScenePos);
         }
 
         POI* cursor = _state->poi("cursor");
@@ -1053,7 +1136,23 @@ void CTiledVolumeViewer::onCursorMove(QPointF scene_loc)
         cursor->n = n;
         cursor->surfaceId = _surfName;
         _state->setPOI("cursor", cursor);
+    };
+
+    // Handle panning: if middle/right button is down, pan instead
+    if (_isPanning) {
+        QPoint currentPos = QCursor::pos();
+        QPoint delta = _lastPanPos - currentPos;
+        _lastPanPos = currentPos;
+        if (delta.x() != 0 || delta.y() != 0) {
+            panBy(-delta.x(), -delta.y());
+        }
+
+        const QPoint viewportPos = fGraphicsView->viewport()->mapFromGlobal(currentPos);
+        updateCursorPoi(fGraphicsView->mapToScene(viewportPos));
+        return;
     }
+
+    updateCursorPoi(scene_loc);
 
     // Point highlight logic
     if (_pointCollection && _draggedPointId == 0) {
@@ -1419,6 +1518,7 @@ void CTiledVolumeViewer::fitSurfaceInView()
     rebuildContentGrid();
     centerViewport();
     submitRender();
+    renderIntersections();
 }
 
 bool CTiledVolumeViewer::isWindowMinimized() const
@@ -1503,10 +1603,26 @@ void CTiledVolumeViewer::setOverlayWindow(float low, float high) { _overlayWindo
 void CTiledVolumeViewer::setResetViewOnSurfaceChange(bool reset) { _resetViewOnSurfaceChange = reset; }
 void CTiledVolumeViewer::setSegmentationEditActive(bool active) { _segmentationEditActive = active; }
 
-void CTiledVolumeViewer::setIntersectionOpacity(float opacity) { _intersectionOpacity = std::clamp(opacity, 0.0f, 1.0f); }
-void CTiledVolumeViewer::setIntersectionThickness(float thickness) { _intersectionThickness = thickness; }
-void CTiledVolumeViewer::setHighlightedSurfaceIds(const std::vector<std::string>& ids) { _highlightedSurfaceIds = {ids.begin(), ids.end()}; }
-void CTiledVolumeViewer::setSurfacePatchSamplingStride(int stride) { _surfacePatchSamplingStride = std::max(1, stride); }
+void CTiledVolumeViewer::setIntersectionOpacity(float opacity)
+{
+    _intersectionOpacity = std::clamp(opacity, 0.0f, 1.0f);
+    renderIntersections();
+}
+void CTiledVolumeViewer::setIntersectionThickness(float thickness)
+{
+    _intersectionThickness = thickness;
+    renderIntersections();
+}
+void CTiledVolumeViewer::setHighlightedSurfaceIds(const std::vector<std::string>& ids)
+{
+    _highlightedSurfaceIds = {ids.begin(), ids.end()};
+    renderIntersections();
+}
+void CTiledVolumeViewer::setSurfacePatchSamplingStride(int stride)
+{
+    _surfacePatchSamplingStride = std::max(1, stride);
+    renderIntersections();
+}
 
 void CTiledVolumeViewer::setSurfaceOverlayEnabled(bool enabled) { _surfaceOverlayEnabled = enabled; if (_volume) renderVisible(true); }
 void CTiledVolumeViewer::setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) { _surfaceOverlays = overlays; if (_volume && _surfaceOverlayEnabled) renderVisible(true); }
@@ -1564,20 +1680,156 @@ void CTiledVolumeViewer::scheduleOverlayUpdate()
     _overlayUpdatePending = true;
     QMetaObject::invokeMethod(this, [this]() {
         _overlayUpdatePending = false;
-        scheduleOverlayUpdate();
+        updateAllOverlays();
     }, Qt::QueuedConnection);
 }
 
 void CTiledVolumeViewer::updateAllOverlays()
 {
-    scheduleOverlayUpdate();
+    if (isWindowMinimized()) {
+        _dirtyWhileMinimized = true;
+        return;
+    }
+
+    invalidateVis();
+    renderIntersections();
+    emit overlaysUpdated();
 }
 
 // ============================================================================
 // Stubs for functionality ported in later phases
 // ============================================================================
 
-void CTiledVolumeViewer::renderIntersections() { /* Phase 4 */ }
+void CTiledVolumeViewer::renderIntersections()
+{
+    invalidateIntersect();
+
+    auto surf = _surfWeak.lock();
+    auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
+    if (!plane || !_state || !_tileScene || !_viewerManager) {
+        return;
+    }
+
+    auto* patchIndex = _viewerManager->surfacePatchIndex();
+    if (!patchIndex || patchIndex->empty()) {
+        return;
+    }
+
+    const QRectF sceneRect = viewportSceneRect();
+    if (!sceneRect.isValid()) {
+        return;
+    }
+
+    std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
+    auto addTarget = [&](const std::string& name) {
+        auto quad = std::dynamic_pointer_cast<QuadSurface>(_state->surface(name));
+        if (quad) {
+            targets.insert(std::move(quad));
+        }
+    };
+
+    for (const auto& name : _intersectTgts) {
+        if (name == "visible_segmentation") {
+            if (_highlightedSurfaceIds.empty()) {
+                addTarget("segmentation");
+            } else {
+                for (const auto& id : _highlightedSurfaceIds) {
+                    addTarget(id);
+                }
+            }
+            continue;
+        }
+        addTarget(name);
+    }
+
+    if (targets.empty()) {
+        return;
+    }
+
+    const cv::Rect planeRoi = planeRoiFromSceneRect(_tileScene, sceneRect);
+    if (planeRoi.width <= 0 || planeRoi.height <= 0) {
+        return;
+    }
+
+    const auto intersections = patchIndex->computePlaneIntersections(*plane, planeRoi, targets);
+    if (intersections.empty()) {
+        return;
+    }
+
+    const auto& activeSeg = activeSegmentationHandle();
+    const QColor defaultColor = activeSeg.accentColor.isValid() ? activeSeg.accentColor : QColor(COLOR_SEG_XY);
+    auto activeSegShared = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+    auto* segOverlay = _viewerManager->segmentationOverlay();
+    const bool useApprovalMask = segOverlay && segOverlay->hasApprovalMaskData() && activeSegShared;
+
+    std::unordered_map<QRgb, QPainterPath> groupedPaths;
+    std::unordered_map<QRgb, QColor> groupedColors;
+
+    for (const auto& [targetSurface, segments] : intersections) {
+        if (!targetSurface || segments.empty()) {
+            continue;
+        }
+
+        QColor baseColor = (activeSeg.surface && targetSurface.get() == activeSeg.surface)
+            ? defaultColor
+            : (_highlightedSurfaceIds.count(targetSurface->id) > 0 ? QColor(Qt::cyan) : defaultColor);
+
+        for (const auto& segment : segments) {
+            QPointF a = volumeToScene(segment.world[0]);
+            QPointF b = volumeToScene(segment.world[1]);
+            if (!isFinitePoint(a) || !isFinitePoint(b)) {
+                continue;
+            }
+
+            QColor color = baseColor;
+            float alpha = _intersectionOpacity;
+
+            if (useApprovalMask && targetSurface.get() == activeSegShared.get()) {
+                const cv::Vec3f midParam = (segment.surfaceParams[0] + segment.surfaceParams[1]) * 0.5f;
+                const auto [row, col] = surfaceParamToGrid(targetSurface.get(), midParam);
+                const QColor approvalColor = segOverlay->queryApprovalColor(row, col);
+                if (approvalColor.isValid()) {
+                    color = approvalColor;
+                    alpha *= std::clamp(segOverlay->approvalMaskOpacity() / 100.0f, 0.0f, 1.0f);
+                }
+            }
+
+            color.setAlphaF(std::clamp(alpha, 0.0f, 1.0f));
+            if (color.alpha() <= 0) {
+                continue;
+            }
+
+            const QRgb key = color.rgba();
+            QPainterPath& path = groupedPaths[key];
+            path.moveTo(a);
+            path.lineTo(b);
+            groupedColors[key] = color;
+        }
+    }
+
+    std::vector<QGraphicsItem*> items;
+    items.reserve(groupedPaths.size());
+    for (const auto& [key, path] : groupedPaths) {
+        if (path.isEmpty()) {
+            continue;
+        }
+        auto* item = new QGraphicsPathItem(path);
+        QPen pen(groupedColors[key]);
+        pen.setWidthF(_intersectionThickness);
+        pen.setCapStyle(Qt::RoundCap);
+        pen.setJoinStyle(Qt::RoundJoin);
+        item->setPen(pen);
+        item->setBrush(Qt::NoBrush);
+        item->setZValue(kIntersectionZ);
+        _scene->addItem(item);
+        items.push_back(item);
+    }
+
+    if (!items.empty()) {
+        _ov.intersectItems[kIntersectionItemsKey] = std::move(items);
+        fGraphicsView->viewport()->update();
+    }
+}
 void CTiledVolumeViewer::invalidateVis()
 {
     for (auto* item : _ov.sliceVisItems) {
@@ -1586,7 +1838,21 @@ void CTiledVolumeViewer::invalidateVis()
     }
     _ov.sliceVisItems.clear();
 }
-void CTiledVolumeViewer::invalidateIntersect(const std::string& /*name*/) { /* Phase 4 */ }
+void CTiledVolumeViewer::invalidateIntersect(const std::string& /*name*/)
+{
+    for (auto& [key, items] : _ov.intersectItems) {
+        for (auto* item : items) {
+            if (!item) {
+                continue;
+            }
+            if (item->scene()) {
+                item->scene()->removeItem(item);
+            }
+            delete item;
+        }
+    }
+    _ov.intersectItems.clear();
+}
 
 void CTiledVolumeViewer::onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths)
 {

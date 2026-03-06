@@ -88,8 +88,10 @@ public:
 
     // --- Async prefetch ---
 
-    // Schedule background fetch from cold/ice tier. No-op if already cached.
+    // Schedule background fetch/promotion from cold/ice tier. No-op if the
+    // chunk is already ready for non-blocking access.
     void prefetch(const ChunkKey& key);
+    void prefetch(const std::vector<ChunkKey>& keys);
 
     // Prefetch all chunks needed for a region at a given level.
     void prefetchRegion(int level, int iz0, int iy0, int ix0,
@@ -142,12 +144,17 @@ public:
     // so callers should treat negative-cached chunks as available.
     [[nodiscard]] bool isNegativeCached(const ChunkKey& key) const;
 
-    // Batch check: are ALL chunks in a region either hot-cached, warm-cached,
-    // or negative-cached?  Acquires each lock only once, avoiding the
-    // per-chunk lock overhead of calling get()+isNegativeCached() in a loop.
+    // Batch check: are ALL chunks in a region ready for non-blocking access?
+    // This includes hot/warm tiers and negative-cached chunks, but excludes
+    // cold-disk-only entries that still need promotion before get() can serve
+    // them.
     [[nodiscard]] bool areAllCachedInRegion(int level,
                               int iz0, int iy0, int ix0,
                               int iz1, int iy1, int ix1) const;
+
+    // Count how many of the given keys are ready for non-blocking access
+    // (hot/warm tiers or negative-cached).
+    [[nodiscard]] size_t countAvailable(const std::vector<ChunkKey>& keys) const;
 
     // --- Notifications ---
 
@@ -241,6 +248,9 @@ private:
 
     // Full promotion chain (checks each tier in order).
     [[nodiscard]] ChunkDataPtr loadFull(const ChunkKey& key);
+
+    // Ready for non-blocking access by get(): hot/warm or negative-cached.
+    [[nodiscard]] bool isReadyForNonBlockingRead(const ChunkKey& key) const;
 
     mutable std::mutex callbackMutex_;
     std::vector<std::pair<ChunkReadyCallbackId, ChunkReadyCallback>> chunkReadyListeners_;

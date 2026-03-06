@@ -153,6 +153,24 @@ bool VolumePkg::isValidVolumeDirectory(const std::filesystem::path& dirpath) con
     return false;
 }
 
+bool VolumePkg::addVolume(const std::shared_ptr<Volume>& volume)
+{
+    if (!volume) {
+        Logger()->warn("Cannot add null volume to package");
+        return false;
+    }
+
+    const auto volumeId = volume->id();
+    auto result = volumes_.emplace(volumeId, volume);
+    if (!result.second) {
+        Logger()->warn("Volume '{}' already exists in package", volumeId);
+        return false;
+    }
+
+    Logger()->info("Added external volume '{}' from '{}'", volumeId, volume->path().string());
+    return true;
+}
+
 bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
 {
     std::filesystem::path dirpath = rootDir_ / "volumes" / volumeDirName;
@@ -169,12 +187,10 @@ bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
 
     try {
         auto v = Volume::New(dirpath);
-        auto result = volumes_.emplace(v->id(), v);
-        if (!result.second) {
+        if (!addVolume(v)) {
             Logger()->warn("Volume '{}' already exists in package under id '{}'", volumeDirName, v->id());
             return false;
         }
-        Logger()->info("Added volume '{}' as id '{}'", volumeDirName, v->id());
         return true;
     } catch (const std::exception& exc) {
         Logger()->warn("Failed to add volume '{}': {}", volumeDirName, exc.what());

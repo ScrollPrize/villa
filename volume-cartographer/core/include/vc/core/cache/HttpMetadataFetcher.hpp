@@ -32,6 +32,15 @@ struct S3ListResult {
     std::string errorMessage;           // S3 error message if any
 };
 
+// Normalize a remote zarr URL for cache keying and source matching.
+// Currently strips trailing slashes so equivalent URLs map to one cache entry.
+std::string normalizeRemoteUrl(const std::string& url);
+
+// Derive a stable cache ID for a remote zarr URL.
+// The ID keeps the basename for readability and appends a deterministic hash
+// so different URLs with the same basename never share one cache directory.
+std::string deriveRemoteVolumeId(const std::string& url);
+
 // Fetch zarr metadata from a remote URL, write to local staging dir.
 // Probes 0/.zarray, 1/.zarray, ... until 404.
 // Creates: <stagingRoot>/<volumeId>/.zgroup, <volumeId>/0/.zarray, etc.

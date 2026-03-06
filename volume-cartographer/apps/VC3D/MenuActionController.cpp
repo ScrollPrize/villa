@@ -58,6 +58,8 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <filesystem>
 #include <map>
@@ -65,6 +67,9 @@
 
 namespace
 {
+constexpr auto kRemoteVolumeRegistryFile = "remote_volumes.json";
+QString extractExceptionMessage(const std::exception& e);
+bool isAuthError(const QString& msg);
 
 static bool run_cli(QWidget* parent, const QString& program, const QStringList& args, QString* outLog = nullptr)
 {
@@ -135,6 +140,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _openRemoteAct = new QAction(QObject::tr("Open &Remote Volume..."), this);
     connect(_openRemoteAct, &QAction::triggered, this, &MenuActionController::openRemoteVolume);
 
+    _attachRemoteZarrAct = new QAction(QObject::tr("Attach Remote &Zarr..."), this);
+    connect(_attachRemoteZarrAct, &QAction::triggered, this, &MenuActionController::attachRemoteZarr);
+
     _settingsAct = new QAction(QObject::tr("Settings"), this);
     connect(_settingsAct, &QAction::triggered, this, &MenuActionController::showSettingsDialog);
 
@@ -188,6 +196,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_openAct);
     _fileMenu->addAction(_openLocalZarrAct);
     _fileMenu->addAction(_openRemoteAct);
+    _fileMenu->addAction(_attachRemoteZarrAct);
 
     _recentMenu = new QMenu(QObject::tr("Open &recent volpkg"), _fileMenu);
     _recentMenu->setEnabled(false);
@@ -351,6 +360,7 @@ void MenuActionController::openVolpkg()
 
     _window->CloseVolume();
     _window->OpenVolume(QString());
+    loadAttachedRemoteVolumesForCurrentPackage();
     _window->UpdateView();
 }
 
@@ -410,6 +420,7 @@ void MenuActionController::openRecentVolpkg()
         if (!path.isEmpty()) {
             _window->CloseVolume();
             _window->OpenVolume(path);
+            loadAttachedRemoteVolumesForCurrentPackage();
             _window->UpdateView();
         }
     }
@@ -423,6 +434,7 @@ void MenuActionController::openVolpkgAt(const QString& path)
 
     _window->CloseVolume();
     _window->OpenVolume(path);
+    loadAttachedRemoteVolumesForCurrentPackage();
     _window->UpdateView();
 }
 
@@ -503,7 +515,7 @@ void MenuActionController::openRecentRemoteVolume()
     if (auto* action = qobject_cast<QAction*>(sender())) {
         const QString url = action->data().toString();
         if (!url.isEmpty()) {
-            openRemoteUrl(url);
+            openRemoteUrl(url, false);
         }
     }
 }
@@ -527,90 +539,436 @@ void MenuActionController::openRemoteVolume()
 
     if (!ok || url.trimmed().isEmpty()) return;
 
-    openRemoteUrl(url.trimmed());
+    openRemoteUrl(url.trimmed(), false);
 }
 
-void MenuActionController::openRemoteUrl(const QString& url)
+void MenuActionController::attachRemoteZarr()
+{
+    if (!_window) return;
+
+    if (!_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::warning(_window,
+                             QObject::tr("No Volume Package Loaded"),
+                             QObject::tr("Open a volpkg before attaching a remote zarr."));
+        return;
+    }
+
+    QStringList recentUrls = loadRecentRemoteUrls();
+    QString lastUrl = recentUrls.isEmpty() ? QString() : recentUrls.first();
+
+    bool ok = false;
+    QString url = QInputDialog::getText(
+        _window,
+        QObject::tr("Attach Remote Zarr"),
+        QObject::tr("Enter remote OME-Zarr URL (http://, https://, s3://):"),
+        QLineEdit::Normal,
+        lastUrl,
+        &ok);
+
+    if (!ok || url.trimmed().isEmpty()) {
+        return;
+    }
+
+    attachRemoteZarrUrl(url.trimmed(), true);
+}
+
+bool MenuActionController::tryResolveRemoteAuth(const QString& url,
+                                                vc::cache::HttpAuth* authOut,
+                                                bool allowPrompt,
+                                                QString* errorMessage) const
+{
+    if (!authOut) {
+        return false;
+    }
+
+    *authOut = {};
+    auto resolved = vc::resolveRemoteUrl(url.trimmed().toStdString());
+    if (!resolved.useAwsSigv4) {
+        return true;
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    authOut->awsSigv4 = true;
+    authOut->region = resolved.awsRegion;
+
+    auto getEnv = [](const char* name) -> std::string {
+        const char* v = std::getenv(name);
+        return v ? v : "";
+    };
+
+    authOut->accessKey = getEnv("AWS_ACCESS_KEY_ID");
+    authOut->secretKey = getEnv("AWS_SECRET_ACCESS_KEY");
+    authOut->sessionToken = getEnv("AWS_SESSION_TOKEN");
+
+    if (authOut->accessKey.empty() || authOut->secretKey.empty()) {
+        const auto savedAccess = settings.value(vc3d::settings::aws::ACCESS_KEY).toString();
+        const auto savedSecret = settings.value(vc3d::settings::aws::SECRET_KEY).toString();
+        const auto savedToken = settings.value(vc3d::settings::aws::SESSION_TOKEN).toString();
+
+        if (!savedAccess.isEmpty() && !savedSecret.isEmpty()) {
+            authOut->accessKey = savedAccess.toStdString();
+            authOut->secretKey = savedSecret.toStdString();
+            authOut->sessionToken = savedToken.toStdString();
+        }
+    }
+
+    if (!authOut->accessKey.empty() && !authOut->secretKey.empty()) {
+        return true;
+    }
+
+    if (!allowPrompt) {
+        if (errorMessage) {
+            *errorMessage = QObject::tr("Missing AWS credentials for %1").arg(url);
+        }
+        return false;
+    }
+
+    bool credOk = false;
+    QString accessKey = QInputDialog::getText(
+        _window,
+        QObject::tr("AWS Credentials"),
+        QObject::tr("AWS_ACCESS_KEY_ID:"),
+        QLineEdit::Normal, QString(), &credOk);
+    if (!credOk || accessKey.trimmed().isEmpty()) {
+        if (errorMessage) {
+            *errorMessage = QObject::tr("AWS credential entry canceled.");
+        }
+        return false;
+    }
+
+    QString secretKey = QInputDialog::getText(
+        _window,
+        QObject::tr("AWS Credentials"),
+        QObject::tr("AWS_SECRET_ACCESS_KEY:"),
+        QLineEdit::Password, QString(), &credOk);
+    if (!credOk || secretKey.trimmed().isEmpty()) {
+        if (errorMessage) {
+            *errorMessage = QObject::tr("AWS credential entry canceled.");
+        }
+        return false;
+    }
+
+    QString sessionToken = QInputDialog::getText(
+        _window,
+        QObject::tr("AWS Credentials"),
+        QObject::tr("AWS_SESSION_TOKEN (optional, leave blank if not using STS):"),
+        QLineEdit::Normal, QString(), &credOk);
+    if (!credOk) {
+        if (errorMessage) {
+            *errorMessage = QObject::tr("AWS credential entry canceled.");
+        }
+        return false;
+    }
+
+    authOut->accessKey = accessKey.trimmed().toStdString();
+    authOut->secretKey = secretKey.trimmed().toStdString();
+    authOut->sessionToken = sessionToken.trimmed().toStdString();
+
+    settings.setValue(vc3d::settings::aws::ACCESS_KEY, accessKey.trimmed());
+    settings.setValue(vc3d::settings::aws::SECRET_KEY, secretKey.trimmed());
+    settings.setValue(vc3d::settings::aws::SESSION_TOKEN, sessionToken.trimmed());
+    return true;
+}
+
+QString MenuActionController::remoteCacheDirectory() const
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QString defaultCache = QDir::homePath() + "/.VC3D/remote_cache";
+    QString cacheDir = settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache).toString();
+    QDir().mkpath(cacheDir);
+    return cacheDir;
+}
+
+QString MenuActionController::remoteVolumeRegistryPath() const
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        return {};
+    }
+    return QDir(_window->_state->vpkgPath()).filePath(QString::fromLatin1(kRemoteVolumeRegistryFile));
+}
+
+void MenuActionController::persistAttachedRemoteVolume(const QString& url, const std::shared_ptr<Volume>& volume)
+{
+    const QString registryPath = remoteVolumeRegistryPath();
+    if (registryPath.isEmpty() || !volume) {
+        return;
+    }
+
+    nlohmann::json root = {
+        {"version", 1},
+        {"volumes", nlohmann::json::array()}
+    };
+
+    try {
+        if (QFileInfo::exists(registryPath)) {
+            std::ifstream input(registryPath.toStdString());
+            if (input.good()) {
+                input >> root;
+            }
+        }
+    } catch (const std::exception& e) {
+        Logger()->warn("Failed reading remote volume registry '{}': {}", registryPath.toStdString(), e.what());
+        root = {
+            {"version", 1},
+            {"volumes", nlohmann::json::array()}
+        };
+    }
+
+    if (!root.is_object()) {
+        root = nlohmann::json::object();
+    }
+    if (!root.contains("volumes") || !root["volumes"].is_array()) {
+        root["volumes"] = nlohmann::json::array();
+    }
+    root["version"] = 1;
+
+    const std::string urlStd = url.trimmed().toStdString();
+    const std::string idStd = volume->id();
+    nlohmann::json updated = nlohmann::json::array();
+    bool replaced = false;
+
+    for (const auto& entry : root["volumes"]) {
+        if (!entry.is_object()) {
+            continue;
+        }
+        const std::string existingUrl = entry.value("url", std::string{});
+        const std::string existingId = entry.value("id", std::string{});
+        if (existingUrl == urlStd || (!idStd.empty() && existingId == idStd)) {
+            if (!replaced) {
+                updated.push_back({
+                    {"url", urlStd},
+                    {"id", idStd},
+                    {"name", volume->name()}
+                });
+                replaced = true;
+            }
+            continue;
+        }
+        updated.push_back(entry);
+    }
+
+    if (!replaced) {
+        updated.push_back({
+            {"url", urlStd},
+            {"id", idStd},
+            {"name", volume->name()}
+        });
+    }
+
+    root["volumes"] = std::move(updated);
+
+    std::ofstream output(registryPath.toStdString(), std::ofstream::out | std::ofstream::trunc);
+    output << root.dump(2) << '\n';
+}
+
+void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
+{
+    const QString registryPath = remoteVolumeRegistryPath();
+    if (registryPath.isEmpty() || !QFileInfo::exists(registryPath) || !_window || !_window->_state || !_window->_state->vpkg()) {
+        return;
+    }
+
+    nlohmann::json root;
+    try {
+        std::ifstream input(registryPath.toStdString());
+        if (!input.good()) {
+            return;
+        }
+        input >> root;
+    } catch (const std::exception& e) {
+        Logger()->warn("Failed to parse remote volume registry '{}': {}", registryPath.toStdString(), e.what());
+        if (_window->statusBar()) {
+            _window->statusBar()->showMessage(QObject::tr("Failed to read remote_volumes.json"), 5000);
+        }
+        return;
+    }
+
+    const auto volumesIt = root.find("volumes");
+    if (volumesIt == root.end() || !volumesIt->is_array() || volumesIt->empty()) {
+        return;
+    }
+
+    const QString currentId = QString::fromStdString(_window->_state->currentVolumeId());
+    const QString cacheDir = remoteCacheDirectory();
+    int attachedCount = 0;
+    int skippedCount = 0;
+
+    for (const auto& entry : *volumesIt) {
+        if (!entry.is_object()) {
+            continue;
+        }
+
+        const QString url = QString::fromStdString(entry.value("url", std::string{})).trimmed();
+        if (url.isEmpty()) {
+            continue;
+        }
+
+        vc::cache::HttpAuth auth;
+        QString authError;
+        if (!tryResolveRemoteAuth(url, &auth, false, &authError)) {
+            Logger()->warn("Skipping persisted remote volume '{}': {}", url.toStdString(), authError.toStdString());
+            skippedCount++;
+            continue;
+        }
+
+        try {
+            auto volume = Volume::NewFromUrl(url.toStdString(), cacheDir.toStdString(), auth);
+            if (_window->_state->vpkg()->hasVolume(volume->id())) {
+                continue;
+            }
+            if (_window->_state->vpkg()->addVolume(volume)) {
+                attachedCount++;
+            } else {
+                skippedCount++;
+            }
+        } catch (const std::exception& e) {
+            Logger()->warn("Failed to attach persisted remote volume '{}': {}", url.toStdString(), e.what());
+            skippedCount++;
+        }
+    }
+
+    if (attachedCount > 0) {
+        _window->refreshCurrentVolumePackageUi(currentId, false);
+        _window->UpdateView();
+    }
+
+    if (_window->statusBar() && (attachedCount > 0 || skippedCount > 0)) {
+        _window->statusBar()->showMessage(
+            QObject::tr("Attached %1 persisted remote volume(s), skipped %2.")
+                .arg(attachedCount)
+                .arg(skippedCount),
+            5000);
+    }
+}
+
+void MenuActionController::attachRemoteZarrUrl(const QString& url, bool persistEntry)
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::warning(_window,
+                             QObject::tr("No Volume Package Loaded"),
+                             QObject::tr("Open a volpkg before attaching a remote zarr."));
+        return;
+    }
+
+    auto resolved = vc::resolveRemoteUrl(url.trimmed().toStdString());
+    std::string trimmed = resolved.httpsUrl;
+    while (!trimmed.empty() && trimmed.back() == '/') {
+        trimmed.pop_back();
+    }
+    const bool looksLikeZarr = trimmed.size() >= 5 && trimmed.substr(trimmed.size() - 5) == ".zarr";
+    if (!looksLikeZarr) {
+        QMessageBox::warning(_window,
+                             QObject::tr("Expected Remote Zarr"),
+                             QObject::tr("Attach Remote Zarr expects a direct .zarr URL, not a scroll root."));
+        return;
+    }
+
+    vc::cache::HttpAuth auth;
+    QString authError;
+    if (!tryResolveRemoteAuth(url, &auth, true, &authError)) {
+        if (!authError.isEmpty() && authError != QObject::tr("AWS credential entry canceled.")) {
+            QMessageBox::warning(_window, QObject::tr("Authentication Error"), authError);
+        }
+        return;
+    }
+
+    const QString cacheDir = remoteCacheDirectory();
+    updateRecentRemoteList(url);
+    if (_attachRemoteZarrAct) {
+        _attachRemoteZarrAct->setEnabled(false);
+    }
+    if (_window->statusBar()) {
+        _window->statusBar()->showMessage(QObject::tr("Attaching remote zarr..."));
+    }
+
+    auto* watcher = new QFutureWatcher<std::shared_ptr<Volume>>(this);
+    connect(watcher, &QFutureWatcher<std::shared_ptr<Volume>>::finished, this,
+            [this, watcher, url, persistEntry]() {
+                watcher->deleteLater();
+                if (_attachRemoteZarrAct) {
+                    _attachRemoteZarrAct->setEnabled(true);
+                }
+
+                try {
+                    auto volume = watcher->result();
+                    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+                        return;
+                    }
+
+                    if (!_window->attachVolumeToCurrentPackage(volume)) {
+                        QMessageBox::warning(
+                            _window,
+                            QObject::tr("Attach Remote Zarr"),
+                            QObject::tr("A volume with id '%1' is already present in this volume package.")
+                                .arg(QString::fromStdString(volume->id())));
+                        return;
+                    }
+
+                    if (persistEntry) {
+                        persistAttachedRemoteVolume(url, volume);
+                    }
+
+                    if (_window->statusBar()) {
+                        _window->statusBar()->showMessage(
+                            QObject::tr("Attached remote zarr: %1")
+                                .arg(QString::fromStdString(volume->id())),
+                            5000);
+                    }
+                } catch (const std::exception& e) {
+                    const QString msg = extractExceptionMessage(e);
+
+                    if (isAuthError(msg)) {
+                        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                        settings.remove(vc3d::settings::aws::ACCESS_KEY);
+                        settings.remove(vc3d::settings::aws::SECRET_KEY);
+                        settings.remove(vc3d::settings::aws::SESSION_TOKEN);
+
+                        const auto reply = QMessageBox::warning(
+                            _window,
+                            QObject::tr("Authentication Error"),
+                            QObject::tr("Failed to attach remote zarr:\n%1\n\n"
+                                        "Would you like to enter new AWS credentials and retry?")
+                                .arg(msg),
+                            QMessageBox::Yes | QMessageBox::No);
+                        if (reply == QMessageBox::Yes) {
+                            QTimer::singleShot(0, this, [this, url, persistEntry]() {
+                                attachRemoteZarrUrl(url, persistEntry);
+                            });
+                            return;
+                        }
+                    }
+
+                    QMessageBox::critical(
+                        _window,
+                        QObject::tr("Attach Remote Zarr Error"),
+                        QObject::tr("Failed to attach remote zarr:\n%1").arg(msg));
+                }
+            });
+
+    auto future = QtConcurrent::run([url, auth, cacheDir]() -> std::shared_ptr<Volume> {
+        return Volume::NewFromUrl(url.toStdString(), cacheDir.toStdString(), auth);
+    });
+    watcher->setFuture(future);
+}
+
+void MenuActionController::openRemoteUrl(const QString& url, bool isRetry)
 {
     if (!_window || url.isEmpty()) return;
+
+    if (!isRetry) {
+        _remoteOpenAuthRetries = 0;
+        _remoteScrollAuthRetries = 0;
+    }
 
     auto urlStr = url.toStdString();
     auto resolved = vc::resolveRemoteUrl(urlStr);
     vc::cache::HttpAuth auth;
-
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-
-    if (resolved.useAwsSigv4) {
-        auth.awsSigv4 = true;
-        auth.region = resolved.awsRegion;
-
-        // Try env vars first
-        auto getEnv = [](const char* name) -> std::string {
-            const char* v = std::getenv(name);
-            return v ? v : "";
-        };
-        auth.accessKey = getEnv("AWS_ACCESS_KEY_ID");
-        auth.secretKey = getEnv("AWS_SECRET_ACCESS_KEY");
-        auth.sessionToken = getEnv("AWS_SESSION_TOKEN");
-
-        // If env vars are missing, try saved credentials
-        if (auth.accessKey.empty() || auth.secretKey.empty()) {
-            auto savedAccess = settings.value(vc3d::settings::aws::ACCESS_KEY).toString();
-            auto savedSecret = settings.value(vc3d::settings::aws::SECRET_KEY).toString();
-            auto savedToken = settings.value(vc3d::settings::aws::SESSION_TOKEN).toString();
-
-            if (!savedAccess.isEmpty() && !savedSecret.isEmpty()) {
-                auth.accessKey = savedAccess.toStdString();
-                auth.secretKey = savedSecret.toStdString();
-                auth.sessionToken = savedToken.toStdString();
-            }
-        }
-
-        // If still missing, prompt the user
-        if (auth.accessKey.empty() || auth.secretKey.empty()) {
-            bool credOk = false;
-            QString accessKey = QInputDialog::getText(
-                _window,
-                QObject::tr("AWS Credentials"),
-                QObject::tr("AWS_ACCESS_KEY_ID:"),
-                QLineEdit::Normal, QString(), &credOk);
-            if (!credOk || accessKey.trimmed().isEmpty()) return;
-
-            QString secretKey = QInputDialog::getText(
-                _window,
-                QObject::tr("AWS Credentials"),
-                QObject::tr("AWS_SECRET_ACCESS_KEY:"),
-                QLineEdit::Password, QString(), &credOk);
-            if (!credOk || secretKey.trimmed().isEmpty()) return;
-
-            QString sessionToken = QInputDialog::getText(
-                _window,
-                QObject::tr("AWS Credentials"),
-                QObject::tr("AWS_SESSION_TOKEN (optional, leave blank if not using STS):"),
-                QLineEdit::Normal, QString(), &credOk);
-            if (!credOk) return;
-
-            auth.accessKey = accessKey.trimmed().toStdString();
-            auth.secretKey = secretKey.trimmed().toStdString();
-            auth.sessionToken = sessionToken.trimmed().toStdString();
-
-            // Save credentials for next time
-            settings.setValue(vc3d::settings::aws::ACCESS_KEY,
-                              QString::fromStdString(auth.accessKey));
-            settings.setValue(vc3d::settings::aws::SECRET_KEY,
-                              QString::fromStdString(auth.secretKey));
-            settings.setValue(vc3d::settings::aws::SESSION_TOKEN,
-                              QString::fromStdString(auth.sessionToken));
-        }
+    QString authError;
+    if (!tryResolveRemoteAuth(url, &auth, true, &authError)) {
+        return;
     }
 
-    // Determine cache directory — use saved setting or default
-    QString defaultCache = QDir::homePath() + "/.VC3D/remote_cache";
-    QString cacheDir = settings.value(
-        vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache).toString();
-
-    // Create the default cache dir if it doesn't exist yet
-    QDir().mkpath(cacheDir);
+    const QString cacheDir = remoteCacheDirectory();
 
     // Save the URL to recents
     updateRecentRemoteList(url);
@@ -644,12 +1002,14 @@ void MenuActionController::openRemoteUrl(const QString& url)
     }
 }
 
+namespace
+{
+
 // Helper: extract the real error message from a QFuture exception.
 // Qt wraps task exceptions in QUnhandledException whose what() returns
-// "std::exception" — useless.  Unwrap to get the original message.
-static QString extractExceptionMessage(const std::exception& e)
+// "std::exception" — useless. Unwrap to get the original message.
+QString extractExceptionMessage(const std::exception& e)
 {
-    // Try to unwrap QUnhandledException
     if (auto* unhandled = dynamic_cast<const QUnhandledException*>(&e)) {
         auto ptr = unhandled->exception();
         if (ptr) {
@@ -665,8 +1025,7 @@ static QString extractExceptionMessage(const std::exception& e)
     return QString::fromStdString(e.what());
 }
 
-// Check if an error message looks like an auth/credentials issue
-static bool isAuthError(const QString& msg)
+bool isAuthError(const QString& msg)
 {
     return msg.contains("Access denied", Qt::CaseInsensitive) ||
            msg.contains("403", Qt::CaseInsensitive) ||
@@ -674,6 +1033,8 @@ static bool isAuthError(const QString& msg)
            msg.contains("credential", Qt::CaseInsensitive) ||
            msg.contains("Forbidden", Qt::CaseInsensitive);
 }
+
+} // namespace
 
 void MenuActionController::openRemoteZarr(
     const std::string& httpsUrl,
@@ -689,6 +1050,8 @@ void MenuActionController::openRemoteZarr(
 
             try {
                 auto vol = watcher->result();
+                _remoteOpenAuthRetries = 0;
+                _remoteScrollAuthRetries = 0;
                 _window->CloseVolume();
                 _window->setVolume(vol);
                 _window->UpdateView();
@@ -725,23 +1088,26 @@ void MenuActionController::openRemoteZarr(
                         // Re-prompt for credentials by calling openRemoteUrl again.
                         // Use QTimer::singleShot to break the call stack and avoid
                         // deep recursion on repeated auth failures (Issue 31).
-                        static int authRetries = 0;
-                        if (authRetries >= 3) {
+                        if (_remoteOpenAuthRetries >= 3) {
                             if (_window->statusBar()) {
                                 _window->statusBar()->showMessage(
                                     QObject::tr("Authentication failed after 3 attempts"), 5000);
                             }
-                            authRetries = 0;
+                            _remoteOpenAuthRetries = 0;
                             return;
                         }
-                        authRetries++;
+                        ++_remoteOpenAuthRetries;
                         _openRemoteAct->setEnabled(false);
                         QTimer::singleShot(0, this, [this, httpsUrl]() {
-                            openRemoteUrl(QString::fromStdString(httpsUrl));
+                            openRemoteUrl(QString::fromStdString(httpsUrl), true);
                         });
                         return;
                     }
+
+                    _remoteOpenAuthRetries = 0;
                 } else {
+                    _remoteOpenAuthRetries = 0;
+                    _remoteScrollAuthRetries = 0;
                     QMessageBox::critical(
                         _window,
                         QObject::tr("Remote Volume Error"),
@@ -800,6 +1166,7 @@ void MenuActionController::openRemoteScroll(
                     QObject::tr("AWS_ACCESS_KEY_ID:"),
                     QLineEdit::Normal, QString(), &credOk);
                 if (!credOk || accessKey.trimmed().isEmpty()) {
+                    _remoteScrollAuthRetries = 0;
                     _openRemoteAct->setEnabled(true);
                     if (_window->statusBar()) _window->statusBar()->clearMessage();
                     return;
@@ -810,6 +1177,7 @@ void MenuActionController::openRemoteScroll(
                     QObject::tr("AWS_SECRET_ACCESS_KEY:"),
                     QLineEdit::Password, QString(), &credOk);
                 if (!credOk || secretKey.trimmed().isEmpty()) {
+                    _remoteScrollAuthRetries = 0;
                     _openRemoteAct->setEnabled(true);
                     if (_window->statusBar()) _window->statusBar()->clearMessage();
                     return;
@@ -820,6 +1188,7 @@ void MenuActionController::openRemoteScroll(
                     QObject::tr("AWS_SESSION_TOKEN (optional):"),
                     QLineEdit::Normal, QString(), &credOk);
                 if (!credOk) {
+                    _remoteScrollAuthRetries = 0;
                     _openRemoteAct->setEnabled(true);
                     if (_window->statusBar()) _window->statusBar()->clearMessage();
                     return;
@@ -841,22 +1210,23 @@ void MenuActionController::openRemoteScroll(
                 // Retry discovery with fresh credentials.
                 // Use QTimer::singleShot to break the call stack and limit
                 // recursive re-entry on repeated auth failures (Issue 31).
-                static int scrollAuthRetries = 0;
-                if (scrollAuthRetries >= 3) {
+                if (_remoteScrollAuthRetries >= 3) {
                     if (_window->statusBar()) {
                         _window->statusBar()->showMessage(
                             QObject::tr("Authentication failed after 3 attempts"), 5000);
                     }
-                    scrollAuthRetries = 0;
+                    _remoteScrollAuthRetries = 0;
                     _openRemoteAct->setEnabled(true);
                     return;
                 }
-                scrollAuthRetries++;
+                ++_remoteScrollAuthRetries;
                 QTimer::singleShot(0, this, [this, httpsUrl, freshAuth, cachePath]() {
                     openRemoteScroll(httpsUrl, freshAuth, cachePath);
                 });
                 return;
             }
+
+            _remoteScrollAuthRetries = 0;
 
             if (scrollInfo.volumeNames.empty()) {
                 // No volumes found — fall back to direct zarr open
