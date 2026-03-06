@@ -262,54 +262,25 @@ void CTiledVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 
     // Set up tiered chunk cache for progressive rendering
     if (_volume && _volume->numScales() >= 1) {
-        // Wire chunk-ready listener BEFORE pin to ensure no callbacks are missed
+        // Wire chunk-ready listener so arriving chunks trigger refinement.
         auto* ctrl = _renderController;
-        int coarsestLevel = static_cast<int>(_volume->numScales()) - 1;
         auto* cache = _volume->tieredCache();
         QPointer<CTiledVolumeViewer> viewerGuard(this);
         _chunkCbId = cache->addChunkReadyListener(
-            [ctrl, viewerGuard, cache, coarsestLevel](const vc::cache::ChunkKey& key) {
+            [ctrl, viewerGuard, cache](const vc::cache::ChunkKey& key) {
                 QMetaObject::invokeMethod(ctrl, [ctrl, cache]() {
                     ctrl->markChunkArrived();
                     cache->clearChunkArrivedFlag();
                 }, Qt::QueuedConnection);
-                // Track coarsest-level pin progress for status display
-                if (key.level == coarsestLevel) {
-                    QMetaObject::invokeMethod(qApp, [viewerGuard]() {
-                        if (!viewerGuard) return;
-                        if (viewerGuard->_pinTotal.load(std::memory_order_relaxed) > 0) {
-                            viewerGuard->_pinReceived++;
-                            viewerGuard->updateStatusLabel();
-                        }
-                    }, Qt::QueuedConnection);
-                }
+                QMetaObject::invokeMethod(qApp, [viewerGuard]() {
+                    if (viewerGuard) {
+                        viewerGuard->updateStatusLabel();
+                    }
+                }, Qt::QueuedConnection);
             });
-
-        // Compute total coarsest-level chunks for pin progress tracking
-        auto levelShape = cache->levelShape(coarsestLevel);
-        auto chunkShape = cache->chunkShape(coarsestLevel);
-        int gridZ = (levelShape[0] + chunkShape[0] - 1) / chunkShape[0];
-        int gridY = (levelShape[1] + chunkShape[1] - 1) / chunkShape[1];
-        int gridX = (levelShape[2] + chunkShape[2] - 1) / chunkShape[2];
-        _pinTotal = gridZ * gridY * gridX;
-        _pinLevel = coarsestLevel;
-        _pinReceived = 0;
-
-        // Pin coarsest level on a background thread so the UI stays responsive.
-        // Once pinning completes, post back to the main thread to finish setup.
-        // Use QPointer to guard against the viewer being destroyed before the
-        // background thread finishes.
-        auto vol = _volume;
-        QPointer<CTiledVolumeViewer> guard(this);
-        std::thread([guard, vol]() {
-            vol->pinCoarsestLevel(/*blocking=*/true);
-            QMetaObject::invokeMethod(qApp, [guard]() {
-                if (guard)
-                    guard->onPinComplete();
-            }, Qt::QueuedConnection);
-        }).detach();
     }
 
+    onPinComplete();
     updateStatusLabel();
 }
 
@@ -528,21 +499,13 @@ void CTiledVolumeViewer::onPinComplete()
 {
     if (!_volume) return;
 
-    _hadValidDataBounds = _volume->dataBounds().valid;
+    _hadValidDataBounds = false;
 
-    // For remote volumes with no surface, create a default PlaneSurface
-    // centered in the volume so the axis-aligned viewers can render.
+    // Create a default PlaneSurface immediately so remote volumes render
+    // without waiting for a coarsest-level bounds scan.
     if (!_surfWeak.lock() && _volume && isAxisAlignedView()) {
         auto shape = _volume->shape();  // {width, height, slices} = {x, y, z}
-        const auto& db = _volume->dataBounds();
-        cv::Vec3f center;
-        if (db.valid) {
-            center = cv::Vec3f((db.minX + db.maxX) * 0.5f,
-                               (db.minY + db.maxY) * 0.5f,
-                               (db.minZ + db.maxZ) * 0.5f);
-        } else {
-            center = cv::Vec3f(shape[0] * 0.5f, shape[1] * 0.5f, shape[2] * 0.5f);
-        }
+        cv::Vec3f center(shape[0] * 0.5f, shape[1] * 0.5f, shape[2] * 0.5f);
         cv::Vec3f normal;
         if (_surfName == "xy plane") normal = cv::Vec3f(0, 0, 1);
         else if (_surfName == "xz plane" || _surfName == "seg xz") normal = cv::Vec3f(0, 1, 0);

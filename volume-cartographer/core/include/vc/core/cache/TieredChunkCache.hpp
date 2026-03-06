@@ -126,9 +126,8 @@ public:
     // Full dataset shape at a given level, in {z, y, x} order.
     [[nodiscard]] std::array<int, 3> levelShape(int level) const;
 
-    // --- Logical data bounds (level-0 voxel coords, x/y/z order) ---
-    // Set by Volume after scanning the coarsest level for non-zero data.
-    // Used by CacheParams/ChunkSampler to skip chunks in zero-padded regions.
+    // --- Logical volume bounds (level-0 voxel coords, x/y/z order) ---
+    // Set by Volume from the physical volume shape.
     struct DataBoundsL0 {
         int minX = 0, maxX = 0;
         int minY = 0, maxY = 0;
@@ -144,16 +143,17 @@ public:
     // so callers should treat negative-cached chunks as available.
     [[nodiscard]] bool isNegativeCached(const ChunkKey& key) const;
 
-    // Batch check: are ALL chunks in a region ready for non-blocking access?
-    // This includes hot/warm tiers and negative-cached chunks, but excludes
-    // cold-disk-only entries that still need promotion before get() can serve
-    // them.
+    // Batch check: are ALL chunks in a region available without a remote fetch?
+    // This includes hot/warm tiers, cold-disk-only entries, and negative-cached
+    // chunks. Disk-only entries still need promotion before get() can serve
+    // them, but best-effort rendering can use them immediately by promoting
+    // from local disk.
     [[nodiscard]] bool areAllCachedInRegion(int level,
                               int iz0, int iy0, int ix0,
                               int iz1, int iy1, int ix1) const;
 
-    // Count how many of the given keys are ready for non-blocking access
-    // (hot/warm tiers or negative-cached).
+    // Count how many of the given keys are available without a remote fetch
+    // (hot/warm/cold tiers or negative-cached).
     [[nodiscard]] size_t countAvailable(const std::vector<ChunkKey>& keys) const;
 
     // --- Notifications ---
@@ -251,6 +251,9 @@ private:
 
     // Ready for non-blocking access by get(): hot/warm or negative-cached.
     [[nodiscard]] bool isReadyForNonBlockingRead(const ChunkKey& key) const;
+
+    // Available without hitting the remote source: hot/warm/cold or negative-cached.
+    [[nodiscard]] bool isAvailableWithoutRemoteFetch(const ChunkKey& key) const;
 
     mutable std::mutex callbackMutex_;
     std::vector<std::pair<ChunkReadyCallbackId, ChunkReadyCallback>> chunkReadyListeners_;

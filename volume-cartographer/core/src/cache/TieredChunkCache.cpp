@@ -545,7 +545,7 @@ bool TieredChunkCache::areAllCachedInRegion(
     if (missingBoth.empty()) return true;
 
     for (const auto& key : missingBoth) {
-        if (!isReadyForNonBlockingRead(key)) {
+        if (!isAvailableWithoutRemoteFetch(key)) {
             return false;
         }
     }
@@ -556,7 +556,7 @@ size_t TieredChunkCache::countAvailable(const std::vector<ChunkKey>& keys) const
 {
     size_t available = 0;
     for (const auto& key : keys) {
-        if (isReadyForNonBlockingRead(key)) {
+        if (isAvailableWithoutRemoteFetch(key)) {
             available++;
         }
     }
@@ -721,6 +721,13 @@ bool TieredChunkCache::isReadyForNonBlockingRead(const ChunkKey& key) const
         if (negativeCache_.count(key)) return true;
     }
 
+    return false;
+}
+
+bool TieredChunkCache::isAvailableWithoutRemoteFetch(const ChunkKey& key) const
+{
+    if (isReadyForNonBlockingRead(key)) return true;
+    if (diskStore_ && diskStore_->contains(config_.volumeId, key)) return true;
     return false;
 }
 

@@ -30,8 +30,8 @@ struct CompositeParams;
 class Volume
 {
 public:
-    // Bounding box of non-zero data in level-0 voxel coordinates (inclusive).
-    // Derived from the coarsest pyramid level.
+    // Bounding box of the physical volume in level-0 voxel coordinates
+    // (inclusive).
     struct DataBounds {
         int minX = 0, maxX = 0;  // level-0 voxel coords, inclusive
         int minY = 0, maxY = 0;
@@ -141,11 +141,11 @@ public:
 
     // --- Data bounds ---
 
-    // Return the bounding box of non-zero data (level-0 voxel coords).
-    // Computed lazily; retries if previous attempt found no data.
+    // Return the physical volume bounds in level-0 voxel coordinates.
+    // Computed lazily from the volume shape.
     [[nodiscard]] const DataBounds& dataBounds() const;
 
-    // Scan the coarsest pyramid level to find non-zero data extent.
+    // Populate physical volume bounds from the volume shape.
     void computeDataBounds();
 
     [[nodiscard]] static bool checkDir(std::filesystem::path path);
@@ -172,7 +172,7 @@ protected:
 
     void ensureTieredCache() const;
 
-    // Data bounds (lazy-computed, retryable if invalid)
+    // Data bounds (lazy-computed)
     mutable DataBounds dataBounds_;
     mutable std::atomic<bool> boundsComputed_{false};
     mutable std::mutex boundsMutex_;

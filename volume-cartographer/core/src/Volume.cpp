@@ -754,106 +754,21 @@ void Volume::pinCoarsestLevel(bool blocking)
 
 void Volume::computeDataBounds()
 {
-    ensureTieredCache();
-    if (!tieredCache_ || zarrDs_.empty()) return;
-
-    int coarsest = static_cast<int>(zarrDs_.size()) - 1;
-    auto levelShape = tieredCache_->levelShape(coarsest);   // {z, y, x}
-    auto chunkShape = tieredCache_->chunkShape(coarsest);   // {z, y, x}
-
-    int gridZ = (levelShape[0] + chunkShape[0] - 1) / chunkShape[0];
-    int gridY = (levelShape[1] + chunkShape[1] - 1) / chunkShape[1];
-    int gridX = (levelShape[2] + chunkShape[2] - 1) / chunkShape[2];
-
-    // Track min/max in coarsest-level voxel coordinates
-    int cMinX = std::numeric_limits<int>::max();
-    int cMinY = std::numeric_limits<int>::max();
-    int cMinZ = std::numeric_limits<int>::max();
-    int cMaxX = std::numeric_limits<int>::lowest();
-    int cMaxY = std::numeric_limits<int>::lowest();
-    int cMaxZ = std::numeric_limits<int>::lowest();
-    bool found = false;
-
-    for (int iz = 0; iz < gridZ; iz++) {
-        for (int iy = 0; iy < gridY; iy++) {
-            for (int ix = 0; ix < gridX; ix++) {
-                auto chunk = tieredCache_->get(
-                    vc::cache::ChunkKey{coarsest, iz, iy, ix});
-                if (!chunk) continue;  // nullptr = missing/all-zeros
-
-                const int cz = chunkShape[0];
-                const int cy = chunkShape[1];
-                const int cx = chunkShape[2];
-                const int strideZ = chunk->strideZ();
-                const int strideY = chunk->strideY();
-
-                // Clamp to actual level shape (edge chunks may be padded)
-                int maxLz = std::min(cz, levelShape[0] - iz * cz);
-                int maxLy = std::min(cy, levelShape[1] - iy * cy);
-                int maxLx = std::min(cx, levelShape[2] - ix * cx);
-
-                auto scanChunkVoxels = [&](const auto* ptr) {
-                    for (int lz = 0; lz < maxLz; lz++) {
-                        for (int ly = 0; ly < maxLy; ly++) {
-                            for (int lx = 0; lx < maxLx; lx++) {
-                                if (ptr[lz * strideZ + ly * strideY + lx] != 0) {
-                                    int gx = ix * cx + lx;
-                                    int gy = iy * cy + ly;
-                                    int gz = iz * cz + lz;
-                                    cMinX = std::min(cMinX, gx);
-                                    cMaxX = std::max(cMaxX, gx);
-                                    cMinY = std::min(cMinY, gy);
-                                    cMaxY = std::max(cMaxY, gy);
-                                    cMinZ = std::min(cMinZ, gz);
-                                    cMaxZ = std::max(cMaxZ, gz);
-                                    found = true;
-                                }
-                            }
-                        }
-                    }
-                };
-
-                if (chunk->elementSize == 2) {
-                    scanChunkVoxels(chunk->data<uint16_t>());
-                } else {
-                    scanChunkVoxels(chunk->data<uint8_t>());
-                }
-            }
-        }
-    }
-
-    if (!found) {
-        fprintf(stderr, "[Volume] dataBounds: no non-zero data found\n");
-        return;
-    }
-
-    // Scale back to level-0 coordinates.
-    // Dilate by 1 coarsest-level voxel on each side — downsampling can
-    // average boundary voxels to zero even when the full-resolution data
-    // is non-zero there.
-    int scaleFactor = 1 << coarsest;
-    dataBounds_.minX = std::max(0, cMinX - 1) * scaleFactor;
-    dataBounds_.minY = std::max(0, cMinY - 1) * scaleFactor;
-    dataBounds_.minZ = std::max(0, cMinZ - 1) * scaleFactor;
-    dataBounds_.maxX = std::min((cMaxX + 2) * scaleFactor - 1, _width - 1);
-    dataBounds_.maxY = std::min((cMaxY + 2) * scaleFactor - 1, _height - 1);
-    dataBounds_.maxZ = std::min((cMaxZ + 2) * scaleFactor - 1, _slices - 1);
+    dataBounds_.minX = 0;
+    dataBounds_.minY = 0;
+    dataBounds_.minZ = 0;
+    dataBounds_.maxX = std::max(0, _width - 1);
+    dataBounds_.maxY = std::max(0, _height - 1);
+    dataBounds_.maxZ = std::max(0, _slices - 1);
     dataBounds_.valid = true;
 
-    // Push to cache so ChunkSampler can skip chunks in zero-padded regions
+    ensureTieredCache();
     if (tieredCache_) {
         tieredCache_->setDataBounds(
             dataBounds_.minX, dataBounds_.maxX,
             dataBounds_.minY, dataBounds_.maxY,
             dataBounds_.minZ, dataBounds_.maxZ);
     }
-
-    fprintf(stderr, "[Volume] dataBounds: x=[%d, %d] y=[%d, %d] z=[%d, %d] "
-                    "(from level %d, scale %dx)\n",
-            dataBounds_.minX, dataBounds_.maxX,
-            dataBounds_.minY, dataBounds_.maxY,
-            dataBounds_.minZ, dataBounds_.maxZ,
-            coarsest, scaleFactor);
 }
 
 const Volume::DataBounds& Volume::dataBounds() const
@@ -865,7 +780,6 @@ const Volume::DataBounds& Volume::dataBounds() const
             if (dataBounds_.valid) {
                 boundsComputed_.store(true, std::memory_order_release);
             }
-            // If invalid, don't set flag — future calls will retry
         }
     }
     return dataBounds_;
