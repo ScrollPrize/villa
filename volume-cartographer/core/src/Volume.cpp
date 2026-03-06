@@ -748,6 +748,80 @@ void Volume::pinCoarsestLevel(bool blocking)
     }
 }
 
+bool Volume::needsRemoteLevel5Prime() const
+{
+    if (!isRemote_ || zarrDs_.size() <= 5) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(remoteLevel5PrimeMutex_);
+    return !remoteLevel5PrimeStarted_ && !remoteLevel5PrimeDone_;
+}
+
+void Volume::primeRemoteLevel5Blocking(
+    const std::function<void(size_t, size_t)>& progress)
+{
+    if (!isRemote_ || zarrDs_.size() <= 5) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(remoteLevel5PrimeMutex_);
+        if (remoteLevel5PrimeStarted_ || remoteLevel5PrimeDone_) {
+            return;
+        }
+        remoteLevel5PrimeStarted_ = true;
+    }
+
+    try {
+        ensureTieredCache();
+        if (!tieredCache_) {
+            throw std::runtime_error("Remote cache is unavailable for level-5 download");
+        }
+
+        constexpr int level = 5;
+        vc::VcDataset* ds = zarrDataset(level);
+        if (!ds) {
+            std::lock_guard<std::mutex> lock(remoteLevel5PrimeMutex_);
+            remoteLevel5PrimeStarted_ = false;
+            return;
+        }
+
+        const auto& shape = ds->shape();
+        const auto& chunks = ds->defaultChunkShape();
+        const int gridZ = static_cast<int>((shape[0] + chunks[0] - 1) / chunks[0]);
+        const int gridY = static_cast<int>((shape[1] + chunks[1] - 1) / chunks[1]);
+        const int gridX = static_cast<int>((shape[2] + chunks[2] - 1) / chunks[2]);
+        const size_t totalChunks =
+            static_cast<size_t>(gridZ) * static_cast<size_t>(gridY) * static_cast<size_t>(gridX);
+
+        if (progress) {
+            progress(0, totalChunks);
+        }
+
+        size_t completed = 0;
+        for (int iz = 0; iz < gridZ; iz++) {
+            for (int iy = 0; iy < gridY; iy++) {
+                for (int ix = 0; ix < gridX; ix++) {
+                    (void) tieredCache_->getBlocking(vc::cache::ChunkKey{level, iz, iy, ix});
+                    completed++;
+                    if (progress) {
+                        progress(completed, totalChunks);
+                    }
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(remoteLevel5PrimeMutex_);
+        remoteLevel5PrimeStarted_ = false;
+        remoteLevel5PrimeDone_ = true;
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(remoteLevel5PrimeMutex_);
+        remoteLevel5PrimeStarted_ = false;
+        throw;
+    }
+}
+
 // ============================================================================
 // Data bounds
 // ============================================================================

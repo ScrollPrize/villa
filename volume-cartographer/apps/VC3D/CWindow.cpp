@@ -27,6 +27,7 @@
 #include <QTextStream>
 #include <QFileInfo>
 #include <QDir>
+#include <QEventLoop>
 #include <QProgressDialog>
 #include <QMessageBox>
 #include <QInputDialog>
@@ -481,6 +482,61 @@ std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<Quad
     }
 
     return clone;
+}
+
+void primeRemoteLevel5WithDialog(CWindow* window, const std::shared_ptr<Volume>& volume)
+{
+    if (!window || !volume || !volume->needsRemoteLevel5Prime()) {
+        return;
+    }
+
+    QProgressDialog progress(window->tr("Downloading remote level 5 overview..."),
+                             QString(),
+                             0,
+                             0,
+                             window);
+    progress.setWindowTitle(window->tr("Caching Remote Overview"));
+    progress.setWindowModality(Qt::ApplicationModal);
+    progress.setMinimumDuration(0);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+    progress.setCancelButton(nullptr);
+    progress.show();
+
+    try {
+        volume->primeRemoteLevel5Blocking([&](size_t completed, size_t total) {
+            const int safeTotal = total > static_cast<size_t>(std::numeric_limits<int>::max())
+                                      ? std::numeric_limits<int>::max()
+                                      : static_cast<int>(total);
+            const int safeCompleted =
+                completed > static_cast<size_t>(safeTotal)
+                    ? safeTotal
+                    : static_cast<int>(completed);
+
+            progress.setMaximum(std::max(0, safeTotal));
+            progress.setValue(safeCompleted);
+            progress.setLabelText(
+                window->tr("Downloading remote level 5 overview (%1/%2 chunks)...")
+                    .arg(completed)
+                    .arg(total));
+            QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        });
+
+        progress.setValue(progress.maximum());
+        if (window->statusBar()) {
+            window->statusBar()->showMessage(
+                window->tr("Cached remote level 5 overview for '%1'.")
+                    .arg(QString::fromStdString(volume->id())),
+                5000);
+        }
+    } catch (const std::exception& e) {
+        progress.hide();
+        QMessageBox::warning(
+            window,
+            window->tr("Remote Overview Cache"),
+            window->tr("Attached the remote volume, but failed to cache level 5 locally:\n%1")
+                .arg(QString::fromUtf8(e.what())));
+    }
 }
 
 } // namespace
@@ -1826,6 +1882,10 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 
     // CState handles cache budget and volume ID resolution, and emits volumeChanged
     _state->setCurrentVolume(newvol);
+
+    if (newvol) {
+        primeRemoteLevel5WithDialog(this, newvol);
+    }
 
     if (previousVolume != newvol) {
         _focusHistory.clear();

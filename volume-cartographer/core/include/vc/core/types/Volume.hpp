@@ -4,6 +4,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -139,6 +140,15 @@ public:
     // Cancel all pending (not in-flight) async prefetch tasks.
     void cancelPendingPrefetch();
 
+    // Return true when this remote volume has a level-5 pyramid and that
+    // level has not yet been fully downloaded into the local cache.
+    [[nodiscard]] bool needsRemoteLevel5Prime() const;
+
+    // Download every chunk in remote pyramid level 5 on the current thread.
+    // The progress callback receives {completedChunks, totalChunks}.
+    void primeRemoteLevel5Blocking(
+        const std::function<void(size_t, size_t)>& progress = {});
+
     // --- Data bounds ---
 
     // Return the physical volume bounds in level-0 voxel coordinates.
@@ -176,6 +186,10 @@ protected:
     mutable DataBounds dataBounds_;
     mutable std::atomic<bool> boundsComputed_{false};
     mutable std::mutex boundsMutex_;
+
+    mutable std::mutex remoteLevel5PrimeMutex_;
+    mutable bool remoteLevel5PrimeStarted_{false};
+    mutable bool remoteLevel5PrimeDone_{false};
 
     // Bounding box of coords in chunk index space (helper for allChunksCached/prefetch)
     struct ChunkBBox {
