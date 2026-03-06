@@ -330,15 +330,8 @@ ChunkDataPtr TieredChunkCache::getBlocking(const ChunkKey& key)
 
 void TieredChunkCache::prefetch(const ChunkKey& key)
 {
-    // Already in hot or warm? No-op.
-    if (hotCache_.contains(key)) return;
-    if (warmCache_.contains(key)) return;
-
-    // Known non-existent? Don't waste an IO round-trip.
-    {
-        std::shared_lock lock(negativeMutex_);
-        if (negativeCache_.count(key)) return;
-    }
+    // Already available locally (or known sparse)? No-op.
+    if (isLocallyAvailable(key)) return;
 
     ioPool_.submit(key);
 }
@@ -367,9 +360,8 @@ void TieredChunkCache::prefetchRegion(
     std::vector<ChunkKey> keys;
     if (!missingBoth.empty()) {
         keys.reserve(missingBoth.size());
-        std::shared_lock lock(negativeMutex_);
         for (const auto& key : missingBoth) {
-            if (!negativeCache_.count(key)) {
+            if (!isLocallyAvailable(key)) {
                 keys.push_back(key);
             }
         }
@@ -534,10 +526,8 @@ bool TieredChunkCache::areAllCachedInRegion(
     auto missingBoth = warmCache_.missing_keys(missingHot.begin(), missingHot.end());
     if (missingBoth.empty()) return true;
 
-    // Check negative cache for remaining misses
-    std::shared_lock negLock(negativeMutex_);
     for (const auto& key : missingBoth) {
-        if (negativeCache_.count(key) == 0) {
+        if (!isLocallyAvailable(key)) {
             return false;
         }
     }
@@ -690,6 +680,23 @@ ChunkDataPtr TieredChunkCache::loadFull(const ChunkKey& key)
 
     // Try ice (remote/filesystem)
     return promoteFromIce(key);
+}
+
+bool TieredChunkCache::isLocallyAvailable(const ChunkKey& key) const
+{
+    if (hotCache_.contains(key)) return true;
+    if (warmCache_.contains(key)) return true;
+
+    {
+        std::shared_lock lock(negativeMutex_);
+        if (negativeCache_.count(key)) return true;
+    }
+
+    if (diskStore_ && diskStore_->contains(config_.volumeId, key)) {
+        return true;
+    }
+
+    return false;
 }
 
 // =============================================================================

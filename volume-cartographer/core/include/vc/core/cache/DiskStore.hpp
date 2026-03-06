@@ -43,6 +43,11 @@ public:
         const std::string& volumeId,
         const ChunkKey& key) const;
 
+    // Check whether compressed chunk bytes exist on disk for a key.
+    [[nodiscard]] bool contains(
+        const std::string& volumeId,
+        const ChunkKey& key) const;
+
     // Write compressed chunk bytes to disk. Creates directories as needed.
     void put(
         const std::string& volumeId,
@@ -104,7 +109,7 @@ private:
         std::filesystem::path path;
         size_t bytes;
     };
-    std::mutex indexMtx_;
+    mutable std::mutex indexMtx_;
     // mtime -> entry (oldest first via default ordering)
     std::multimap<std::filesystem::file_time_type, IndexEntry> timeIndex_;
     // path -> iterator into timeIndex_ for O(1) lookup/removal by path

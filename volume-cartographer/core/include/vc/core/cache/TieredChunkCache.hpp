@@ -142,9 +142,9 @@ public:
     // so callers should treat negative-cached chunks as available.
     [[nodiscard]] bool isNegativeCached(const ChunkKey& key) const;
 
-    // Batch check: are ALL chunks in a region either hot-cached, warm-cached,
-    // or negative-cached?  Acquires each lock only once, avoiding the
-    // per-chunk lock overhead of calling get()+isNegativeCached() in a loop.
+    // Batch check: are ALL chunks in a region available locally in hot, warm,
+    // cold disk, or negative cache? Acquires each lock only once for the RAM
+    // tiers and only probes disk for the remaining misses.
     [[nodiscard]] bool areAllCachedInRegion(int level,
                               int iz0, int iy0, int ix0,
                               int iz1, int iy1, int ix1) const;
@@ -241,6 +241,9 @@ private:
 
     // Full promotion chain (checks each tier in order).
     [[nodiscard]] ChunkDataPtr loadFull(const ChunkKey& key);
+
+    // Tier visibility helper for progressive rendering and prefetch gating.
+    [[nodiscard]] bool isLocallyAvailable(const ChunkKey& key) const;
 
     mutable std::mutex callbackMutex_;
     std::vector<std::pair<ChunkReadyCallbackId, ChunkReadyCallback>> chunkReadyListeners_;
