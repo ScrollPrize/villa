@@ -754,8 +754,43 @@ bool Volume::needsRemoteLevel5Prime() const
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(remoteLevel5PrimeMutex_);
-    return !remoteLevel5PrimeStarted_ && !remoteLevel5PrimeDone_;
+    {
+        std::lock_guard<std::mutex> lock(remoteLevel5PrimeMutex_);
+        if (remoteLevel5PrimeStarted_ || remoteLevel5PrimeDone_) {
+            return false;
+        }
+    }
+
+    ensureTieredCache();
+    if (!tieredCache_) {
+        return false;
+    }
+
+    constexpr int level = 5;
+    vc::VcDataset* ds = zarrDataset(level);
+    if (!ds) {
+        return false;
+    }
+
+    const auto& shape = ds->shape();
+    const auto& chunks = ds->defaultChunkShape();
+    const int gridZ = static_cast<int>((shape[0] + chunks[0] - 1) / chunks[0]);
+    const int gridY = static_cast<int>((shape[1] + chunks[1] - 1) / chunks[1]);
+    const int gridX = static_cast<int>((shape[2] + chunks[2] - 1) / chunks[2]);
+
+    if (gridZ <= 0 || gridY <= 0 || gridX <= 0) {
+        std::lock_guard<std::mutex> lock(remoteLevel5PrimeMutex_);
+        remoteLevel5PrimeDone_ = true;
+        return false;
+    }
+
+    if (tieredCache_->areAllCachedInRegion(level, 0, 0, 0, gridZ - 1, gridY - 1, gridX - 1)) {
+        std::lock_guard<std::mutex> lock(remoteLevel5PrimeMutex_);
+        remoteLevel5PrimeDone_ = true;
+        return false;
+    }
+
+    return true;
 }
 
 void Volume::primeRemoteLevel5Blocking(
@@ -794,6 +829,20 @@ void Volume::primeRemoteLevel5Blocking(
         const int gridX = static_cast<int>((shape[2] + chunks[2] - 1) / chunks[2]);
         const size_t totalChunks =
             static_cast<size_t>(gridZ) * static_cast<size_t>(gridY) * static_cast<size_t>(gridX);
+
+        if (gridZ <= 0 || gridY <= 0 || gridX <= 0) {
+            std::lock_guard<std::mutex> lock(remoteLevel5PrimeMutex_);
+            remoteLevel5PrimeStarted_ = false;
+            remoteLevel5PrimeDone_ = true;
+            return;
+        }
+
+        if (tieredCache_->areAllCachedInRegion(level, 0, 0, 0, gridZ - 1, gridY - 1, gridX - 1)) {
+            std::lock_guard<std::mutex> lock(remoteLevel5PrimeMutex_);
+            remoteLevel5PrimeStarted_ = false;
+            remoteLevel5PrimeDone_ = true;
+            return;
+        }
 
         if (progress) {
             progress(0, totalChunks);
