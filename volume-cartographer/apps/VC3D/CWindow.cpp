@@ -8,6 +8,7 @@
 #include <QKeySequence>
 #include <QHBoxLayout>
 #include <QGridLayout>
+#include <QCursor>
 #include <QKeyEvent>
 #include <QResizeEvent>
 #include <QWheelEvent>
@@ -731,11 +732,20 @@ CWindow::CWindow(size_t cacheSizeGB) :
             settings.sync();
         });
     }
+    // Ensure right-side tabified docks have a usable minimum size
+    for (QDockWidget* dock : { ui.dockWidgetSegmentation,
+                               ui.dockWidgetDistanceTransform,
+                               ui.dockWidgetDrawing }) {
+        if (dock) {
+            dock->setMinimumWidth(250);
+            dock->setMinimumHeight(120);
+        }
+    }
     if (!restoredState) {
         // No saved state - set sensible default sizes for dock widgets
-        // The Volume Package dock (left side) should have a reasonable width and height
         resizeDocks({ui.dockWidgetVolumes}, {300}, Qt::Horizontal);
         resizeDocks({ui.dockWidgetVolumes}, {400}, Qt::Vertical);
+        resizeDocks({ui.dockWidgetSegmentation}, {350}, Qt::Horizontal);
     }
 
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
@@ -1683,10 +1693,11 @@ bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume
         return false;
     }
 
+    const bool needSurfaceLoad = _surfacePanel && !_surfacePanel->hasSurfaces();
     refreshCurrentVolumePackageUi(preferredVolumeId.isEmpty()
                                       ? QString::fromStdString(volume->id())
                                       : preferredVolumeId,
-                                  false);
+                                  needSurfaceLoad);
     UpdateView();
     return true;
 }
@@ -1869,10 +1880,32 @@ bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, 
 
 bool CWindow::centerFocusOnCursor()
 {
-    if (!_state) {
+    if (!_state || !mdiArea) {
         return false;
     }
 
+    // Get fresh volume position from the active viewer's current cursor
+    // location, rather than relying on the stale "cursor" POI which is only
+    // updated on mouse move and becomes outdated after the view shifts.
+    auto* subWindow = mdiArea->activeSubWindow();
+    if (subWindow) {
+        if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
+            auto* gv = viewer->fGraphicsView;
+            if (gv && gv->viewport()) {
+                QPoint globalPos = QCursor::pos();
+                QPoint viewportPos = gv->viewport()->mapFromGlobal(globalPos);
+                if (gv->viewport()->rect().contains(viewportPos)) {
+                    QPointF scenePos = gv->mapToScene(viewportPos);
+                    cv::Vec3f p, n;
+                    if (viewer->sceneToVolumePN(p, n, scenePos)) {
+                        return centerFocusAt(p, n, viewer->surfName(), true);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback to stored cursor POI if no active viewer or cursor is outside
     POI* cursor = _state->poi("cursor");
     if (!cursor) {
         return false;
@@ -2104,6 +2137,11 @@ void CWindow::CreateWidgets(void)
             return;
         }
 
+        // Delete any existing widget from the .ui file to prevent ghosting
+        if (auto* oldWidget = dock->widget()) {
+            delete oldWidget;
+        }
+
         auto* container = new QWidget(dock);
         container->setObjectName(objectName);
         auto* layout = new QVBoxLayout(container);
@@ -2113,6 +2151,7 @@ void CWindow::CreateWidgets(void)
         layout->addStretch(1);
 
         auto* scrollArea = new QScrollArea(dock);
+        scrollArea->setFrameShape(QFrame::NoFrame);
         scrollArea->setWidgetResizable(true);
         scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
         scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
@@ -2131,6 +2170,7 @@ void CWindow::CreateWidgets(void)
         : tr("No volume package loaded.");
     _segmentationWidget->setNormalGridPathHint(initialHint);
     attachScrollAreaToDock(ui.dockWidgetSegmentation, _segmentationWidget, QStringLiteral("dockWidgetSegmentationContent"));
+
 
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
     _segmentationEdit->setViewerManager(_viewerManager.get());

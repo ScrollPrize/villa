@@ -105,6 +105,11 @@ void SurfacePanelController::clear()
     }
 }
 
+bool SurfacePanelController::hasSurfaces() const
+{
+    return _ui.treeWidget && _ui.treeWidget->topLevelItemCount() > 0;
+}
+
 void SurfacePanelController::loadSurfaces(bool reload)
 {
     if (!_volumePkg) {
