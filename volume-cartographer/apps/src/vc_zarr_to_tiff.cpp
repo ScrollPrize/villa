@@ -60,6 +60,31 @@ int main(int argc, char** argv)
 
     const uint16_t compression = parseCompression(compressionStr);
 
+    // Try to read voxelsize from meta.json to set TIFF DPI.
+    // meta.json stores the voxel size at level 0; pyramid levels are 2x/4x/8x
+    // downsampled, so the physical pixel size at `level` is vs * 2^level and
+    // the DPI scales by 1/2^level.
+    float dpi = 0.f;
+    {
+        fs::path metaPath = fs::path(inputPath) / "meta.json";
+        if (fs::exists(metaPath)) {
+            try {
+                auto meta = Json::parse_file(metaPath);
+                if (meta.contains("voxelsize")) {
+                    double vs = meta["voxelsize"].get_double();
+                    double vsLevel = vs * (1ULL << level);
+                    dpi = voxelSizeToDpi(vsLevel);
+                    if (dpi > 0.f) {
+                        std::cout << "Voxel size: " << vs << " µm"
+                                  << " (level " << level << ": "
+                                  << vsLevel << " µm) → DPI: " << dpi << "\n";
+                    }
+                }
+            } catch (...) {
+            }
+        }
+    }
+
     // Open zarr dataset
     fs::path inRoot(inputPath);
     std::string dsName = std::to_string(level);
@@ -110,11 +135,7 @@ int main(int argc, char** argv)
         fs::path outPath = outDir / fname.str();
 
         constexpr uint32_t tileSize = 256;
-        TiffWriter writer(outPath,
-                          static_cast<uint32_t>(X),
-                          static_cast<uint32_t>(Y),
-                          cvType, tileSize, tileSize,
-                          0.0f, compression);
+        TiffWriter writer(outPath, static_cast<uint32_t>(X), static_cast<uint32_t>(Y), cvType, tileSize, tileSize, 0.0f, compression, dpi);
 
         for (uint32_t ty = 0; ty < Y; ty += tileSize) {
             for (uint32_t tx = 0; tx < X; tx += tileSize) {

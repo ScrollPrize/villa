@@ -7,18 +7,28 @@
 #include <cstdint>
 #include <tiffio.h>
 
+// Convert voxel size in micrometers to DPI (dots per inch)
+// Returns 0 if voxelSize is <= 0
+inline float voxelSizeToDpi(double voxelSizeUm)
+{
+    return voxelSizeUm > 0 ? static_cast<float>(25400.0 / voxelSizeUm) : 0.f;
+}
+
 // Write single-channel image (8U, 16U, 32F) as tiled TIFF
 // cvType: output type (-1 = same as input). If different, values are scaled:
 //         8U↔16U: scale by 257, 8U↔32F: scale by 1/255, 16U↔32F: scale by 1/65535
 // compression: libtiff compression constant (e.g. COMPRESSION_LZW, COMPRESSION_PACKBITS)
 // padValue: value for padding partial tiles (default -1.0f, used for float; int types use 0)
-void writeTiff(const std::filesystem::path& outPath,
-               const cv::Mat& img,
-               int cvType = -1,
-               uint32_t tileW = 1024,
-               uint32_t tileH = 1024,
-               float padValue = -1.0f,
-               uint16_t compression = COMPRESSION_LZW);
+// dpi: resolution in dots per inch (0 = don't set). Use voxelSizeToDpi() to convert from µm.
+void writeTiff(
+    const std::filesystem::path& outPath,
+    const cv::Mat& img,
+    int cvType = -1,
+    uint32_t tileW = 1024,
+    uint32_t tileH = 1024,
+    float padValue = -1.0f,
+    uint16_t compression = COMPRESSION_LZW,
+    float dpi = 0.f);
 
 // Class for incremental tiled TIFF writing
 // Useful for writing tiles in parallel or from streaming data
@@ -27,13 +37,17 @@ public:
     // Open a new TIFF file for tiled writing
     // cvType: CV_8UC1, CV_16UC1, or CV_32FC1
     // padValue: value for padding partial tiles (used for float; int types use 0)
-    TiffWriter(const std::filesystem::path& path,
-               uint32_t width, uint32_t height,
-               int cvType,
-               uint32_t tileW = 1024,
-               uint32_t tileH = 1024,
-               float padValue = -1.0f,
-               uint16_t compression = COMPRESSION_LZW);
+    // dpi: resolution in dots per inch (0 = don't set). Use voxelSizeToDpi() to convert from µm.
+    TiffWriter(
+        const std::filesystem::path& path,
+        uint32_t width,
+        uint32_t height,
+        int cvType,
+        uint32_t tileW = 1024,
+        uint32_t tileH = 1024,
+        float padValue = -1.0f,
+        uint16_t compression = COMPRESSION_LZW,
+        float dpi = 0.f);
 
     ~TiffWriter();
 
