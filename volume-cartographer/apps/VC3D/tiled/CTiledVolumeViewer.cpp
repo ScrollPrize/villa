@@ -29,6 +29,7 @@
 #include <QScrollBar>
 #include <QGuiApplication>
 #include <QPointer>
+#include <QTimer>
 
 #include <algorithm>
 #include <array>
@@ -182,6 +183,11 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     _lbl->setStyleSheet("QLabel { color : #00FF00; background-color: rgba(0,0,0,128); padding: 2px 4px; }");
     _lbl->setMinimumWidth(300);
     _lbl->move(10, 5);
+
+    _interactionSettleTimer = new QTimer(this);
+    _interactionSettleTimer->setSingleShot(true);
+    _interactionSettleTimer->setInterval(125);
+    connect(_interactionSettleTimer, &QTimer::timeout, this, &CTiledVolumeViewer::settleInteractionRender);
 }
 
 CTiledVolumeViewer::~CTiledVolumeViewer()
@@ -299,6 +305,11 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
             previousSurf &&
             previousSurf.get() == surf.get() &&
             dynamic_cast<QuadSurface*>(surf.get()) != nullptr;
+        const bool isInPlacePlaneUpdate =
+            surf &&
+            previousSurf &&
+            previousSurf.get() == surf.get() &&
+            dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
 
         _surfWeak = surf;
         _surfBBoxCache = {};  // invalidate bounding box cache
@@ -320,6 +331,13 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
             if (isInPlaceQuadEditUpdate) {
                 ++_surfaceContentVersion;
                 updateParamsHash();
+            } else if (isInPlacePlaneUpdate) {
+                _surfaceContentVersion = 0;
+                updateParamsHash();
+                updateContentMinScale();
+                rebuildContentGrid();
+                centerViewport();
+                _renderController->setAtomicNextEpochSwap(true);
             } else {
                 _surfaceContentVersion = 0;
                 updateParamsHash();
@@ -429,6 +447,32 @@ void CTiledVolumeViewer::updateContentMinScale()
     // Scale at which content just fills viewport (fit, not cover)
     float fitScale = std::min(vpW / contentW, vpH / contentH);
     _contentMinScale = std::max(fitScale, TiledViewerCamera::MIN_SCALE);
+}
+
+void CTiledVolumeViewer::beginInteractionRender()
+{
+    _interactionQualityActive = true;
+    if (_interactionSettleTimer) {
+        _interactionSettleTimer->start();
+    }
+}
+
+void CTiledVolumeViewer::settleInteractionRender()
+{
+    if (_isPanning || !_interactionQualityActive) {
+        return;
+    }
+
+    _interactionQualityActive = false;
+    _camera.invalidate();
+    submitRender();
+    renderIntersections();
+    updateStatusLabel();
+}
+
+bool CTiledVolumeViewer::interactionRenderActive() const
+{
+    return _isPanning || _interactionQualityActive;
 }
 
 void CTiledVolumeViewer::rebuildContentGrid()
@@ -655,6 +699,7 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 
 void CTiledVolumeViewer::setSliceOffset(float dz)
 {
+    beginInteractionRender();
     _camera.zOff += dz;
     _camera.invalidate();
     submitRender();
@@ -761,6 +806,9 @@ void CTiledVolumeViewer::resetSurfaceOffsets()
 void CTiledVolumeViewer::onPanStart(Qt::MouseButton /*buttons*/, Qt::KeyboardModifiers /*modifiers*/)
 {
     _isPanning = true;
+    if (_interactionSettleTimer) {
+        _interactionSettleTimer->stop();
+    }
     // The view handles pan tracking with _last_pan_position internally,
     // but since we disabled scrollbars, its scroll-based panning won't work.
     // We need to intercept the mouse move deltas instead.
@@ -775,6 +823,10 @@ void CTiledVolumeViewer::onPanStart(Qt::MouseButton /*buttons*/, Qt::KeyboardMod
 void CTiledVolumeViewer::onPanRelease(Qt::MouseButton /*buttons*/, Qt::KeyboardModifiers /*modifiers*/)
 {
     _isPanning = false;
+    if (!_interactionQualityActive) {
+        _camera.invalidate();
+        submitRender();
+    }
     _renderController->markOverlaysDirty();
     renderIntersections();
 }
@@ -1019,7 +1071,11 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     TileRenderParams params;
     params.worldKey = wk;
     params.epoch = _camera.epoch;
-    params.cacheIdentity = _renderController ? _renderController->paramsHash() : 0;
+
+    const bool interactionActive = interactionRenderActive();
+    uint64_t cacheIdentity = _renderController ? _renderController->paramsHash() : 0;
+    cacheIdentity = utils::hash_combine_values(cacheIdentity, interactionActive);
+    params.cacheIdentity = cacheIdentity;
 
     // Surface parameter ROI from world tile coordinates
     params.surfaceROI.x = wk.worldCol * _contentBounds.worldTileSize;
@@ -1035,11 +1091,17 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     params.dsScaleIdx = _camera.dsScaleIdx;
     params.zOff = _camera.zOff;
 
+    if (interactionActive && _volume) {
+        const int maxLevel = std::max(0, static_cast<int>(_volume->numScales()) - 1);
+        params.dsScaleIdx = std::min(_camera.dsScaleIdx + 1, maxLevel);
+        params.dsScale = std::pow(2.0f, -params.dsScaleIdx);
+    }
+
     params.windowLow = _baseWindowLow;
     params.windowHigh = _baseWindowHigh;
     params.stretchValues = _stretchValues;
     params.colormapId = _baseColormapId;
-    params.useFastInterpolation = _useFastInterpolation;
+    params.useFastInterpolation = _useFastInterpolation || interactionActive;
     params.compositeSettings = _compositeSettings;
 
     return params;
@@ -1283,10 +1345,26 @@ void CTiledVolumeViewer::onPOIChanged(std::string name, POI* poi)
 
     if (name == "focus") {
         if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-            if (poi->p == plane->origin()) return;
-            plane->setOrigin(poi->p);
+            beginInteractionRender();
+            const bool originChanged = (poi->p != plane->origin());
+            if (originChanged) {
+                plane->setOrigin(poi->p);
+            }
+
+            // Plane viewers should center on the new focus point itself,
+            // not preserve the old pan offset from the previous plane origin.
+            _camera.surfacePtr[0] = 0.0f;
+            _camera.surfacePtr[1] = 0.0f;
+            centerViewport();
             scheduleOverlayUpdate();
-            _state->setSurface(_surfName, surf);
+            if (originChanged) {
+                _state->setSurface(_surfName, surf);
+            } else {
+                _camera.invalidate();
+                submitRender();
+                renderIntersections();
+                updateStatusLabel();
+            }
         } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
             cv::Vec3f ptr(0, 0, 0);
             auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
