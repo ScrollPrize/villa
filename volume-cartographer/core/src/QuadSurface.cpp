@@ -1595,15 +1595,26 @@ void QuadSurface::rotate(float angleDeg)
 
 void QuadSurface::resample(float factor, int interpolation)
 {
+    resample(factor, factor, interpolation);
+}
+
+void QuadSurface::resample(float factor_x, float factor_y, int interpolation)
+{
     ensureLoaded();
-    if (!_points || _points->empty() || std::abs(factor - 1.0f) < 0.001f) {
+    if (!_points || _points->empty()) {
+        return;
+    }
+    if (factor_x <= 0.0f || factor_y <= 0.0f) {
+        return;
+    }
+    if (std::abs(factor_x - 1.0f) < 0.001f && std::abs(factor_y - 1.0f) < 0.001f) {
         return;
     }
 
     // Calculate new size
     cv::Size newSize(
-        static_cast<int>(std::round(_points->cols * factor)),
-        static_cast<int>(std::round(_points->rows * factor))
+        std::max(1, static_cast<int>(std::round(_points->cols * factor_x))),
+        std::max(1, static_cast<int>(std::round(_points->rows * factor_y)))
     );
 
     // Resample points
@@ -1637,8 +1648,8 @@ void QuadSurface::resample(float factor, int interpolation)
     }
 
     // Update scale to maintain physical size
-    _scale[0] /= factor;
-    _scale[1] /= factor;
+    _scale[0] /= factor_x;
+    _scale[1] /= factor_y;
 
     // Invalidate cached bbox
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};

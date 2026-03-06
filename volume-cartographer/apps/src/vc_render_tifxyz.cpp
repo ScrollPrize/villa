@@ -1,4 +1,5 @@
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/cache/SimpleCacheFactory.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -422,13 +423,6 @@ static ChunkRegion computeChunkRegionForSamples(
     region.maxIz = std::min(int(std::ceil(hiZ / double(chunkShape[0]))),
                             int((shape[0] - 1) / chunkShape[0]));
     return region;
-}
-
-static std::string deriveRemoteVolumeId(std::string url)
-{
-    while (!url.empty() && url.back() == '/') url.pop_back();
-    auto slash = url.find_last_of('/');
-    return slash == std::string::npos ? url : url.substr(slash + 1);
 }
 
 static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
@@ -1307,7 +1301,7 @@ int main(int argc, char *argv[])
     vc::cache::TieredChunkCache* chunk_cache = nullptr;
 
     if (useRemoteCache) {
-        const std::string expectedId = deriveRemoteVolumeId(remoteUrl);
+        const std::string expectedId = vc::cache::deriveRemoteVolumeId(remoteUrl);
         if (expectedId.empty()) {
             logPrintf(stderr, "Error: could not derive remote volume id from --remote-url\n");
             return EXIT_FAILURE;
