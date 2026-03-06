@@ -35,6 +35,7 @@ add_executable(vc_add_ignore_label src/vc_add_ignore_label.cpp)
 target_link_libraries(vc_add_ignore_label
     vc_core
     Boost::program_options
+    CGAL::CGAL
     opencv_core
     opencv_imgproc
     opencv_imgcodecs

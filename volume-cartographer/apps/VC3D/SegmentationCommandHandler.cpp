@@ -2866,6 +2866,7 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
     QStringList args;
     args << params.volumePath
          << runOutputRootStr
+         << QStringLiteral("--mode") << QStringLiteral("legacy-slice")
          << QStringLiteral("--result-mode") << QStringLiteral("fast")
          << QStringLiteral("--algo-mode") << QStringLiteral("polar")
          << QStringLiteral("--verbose")

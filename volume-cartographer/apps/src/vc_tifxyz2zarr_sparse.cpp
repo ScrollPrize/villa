@@ -1,4 +1,5 @@
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/BinaryPyramid.hpp"
 #include "vc/core/util/Zarr.hpp"
 #include "vc/core/types/VcDataset.hpp"
 
@@ -620,28 +621,6 @@ static std::vector<ChunkIndex> buildTouchedParents(const std::vector<ChunkIndex>
     return result;
 }
 
-static void downsampleNearestBinary(const uint8_t* src,
-                                   size_t srcY, size_t srcX,
-                                   uint8_t* dst,
-                                   size_t dstZ, size_t dstY, size_t dstX,
-                                   size_t srcActualZ, size_t srcActualY, size_t srcActualX) {
-    if (srcActualZ == 0 || srcActualY == 0 || srcActualX == 0) return;
-    const size_t srcStrideY = srcX;
-    const size_t srcStrideZ = srcY * srcX;
-
-    for (size_t zz = 0; zz < dstZ; ++zz) {
-        if (2 * zz >= srcActualZ) break;
-        for (size_t yy = 0; yy < dstY; ++yy) {
-            if (2 * yy >= srcActualY) break;
-            for (size_t xx = 0; xx < dstX; ++xx) {
-                if (2 * xx >= srcActualX) break;
-                dst[zz * dstY * dstX + yy * dstX + xx] =
-                    src[(2 * zz) * srcStrideZ + (2 * yy) * srcStrideY + (2 * xx)];
-            }
-        }
-    }
-}
-
 struct SegmentPt {
     float x;
     float y;
@@ -962,9 +941,11 @@ static std::vector<ChunkIndex> buildIsotropicPyramidLevel(const fs::path& outDir
 
                 std::fill(dstBuf.begin(), dstBuf.end(), 0);
                 if (!srcBuf.empty()) {
-                    downsampleNearestBinary(srcBuf.data(), srcActualY, srcActualX,
-                                            dstBuf.data(), dstChunkZ, dstChunkY, dstChunkX,
-                                            srcActualZ, srcActualY, srcActualX);
+                    vc::core::util::downsampleBinaryOr(
+                        srcBuf.data(),
+                        vc::core::util::Shape3{srcActualZ, srcActualY, srcActualX},
+                        dstBuf.data(),
+                        vc::core::util::Shape3{dstChunkZ, dstChunkY, dstChunkX});
                 }
 
                 if (chunkHasAnyNonZero(dstBuf)) {

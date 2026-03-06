@@ -91,6 +91,9 @@ if(NOT OpenCV_FOUND)
     find_package(OpenCV 4 QUIET REQUIRED)
 endif()
 
+# ---- CGAL --------------------------------------------------------------------
+find_package(CGAL REQUIRED)
+
 # ---- OpenMP ------------------------------------------------------------------
 if (VC_USE_OPENMP)
     message(STATUS "OpenMP support enabled")

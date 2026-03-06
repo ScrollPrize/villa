@@ -1,7 +1,14 @@
 #include "vc/core/types/VcDataset.hpp"
+#include "vc/core/util/BinaryPyramid.hpp"
 #include "vc/core/util/Zarr.hpp"
 
 #include <boost/program_options.hpp>
+
+#include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
+#include <CGAL/Polygon_mesh_processing/bbox.h>
+#include <CGAL/Side_of_triangle_mesh.h>
+#include <CGAL/Surface_mesh.h>
+#include <CGAL/alpha_wrap_3.h>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -53,11 +60,19 @@ constexpr double kDefaultRamBudgetGb = 0.0;   // 0 => auto
 constexpr double kDefaultAutoRamFraction = 0.60;
 
 using Shape3 = std::array<std::size_t, 3>;
+using AlphaWrapKernel = CGAL::Exact_predicates_inexact_constructions_kernel;
+using AlphaWrapPoint = AlphaWrapKernel::Point_3;
+using AlphaWrapMesh = CGAL::Surface_mesh<AlphaWrapPoint>;
 
 enum class MapMode {
     legacy,
     exact,
     fast,
+};
+
+enum class ProcessingMode {
+    legacySlice,
+    chunkAlphaWrap,
 };
 
 enum class AlgoMode {
@@ -81,6 +96,11 @@ struct ChunkIndex {
     {
         return z == other.z && y == other.y && x == other.x;
     }
+};
+
+struct Box3 {
+    Shape3 origin = {0, 0, 0};
+    Shape3 shape = {0, 0, 0};
 };
 
 struct ChunkIndexHash {
@@ -111,8 +131,10 @@ static bool chunkIndexLess(const ChunkIndex& a, const ChunkIndex& b)
 struct Config {
     fs::path inputRoot;
     fs::path outputRoot;
+    ProcessingMode mode = ProcessingMode::chunkAlphaWrap;
     int ignoreValue = kDefaultIgnoreValue;
     double alpha = kDefaultAlpha;
+    double chunkAlpha = 0.0;
     int nAngleBins = kDefaultAngleBins;
     double shrinkFactor = kDefaultShrink;
     int computeLevel = kDefaultComputeLevel;
@@ -205,6 +227,9 @@ struct ProfileStats {
     std::size_t slicesTotal = 0;
     std::size_t slicesSkippedEmpty = 0;
     std::size_t nonzeroFgSlices = 0;
+    std::size_t computeChunksTotal = 0;
+    std::size_t computeChunksSkippedEmpty = 0;
+    std::size_t computeChunksWrapped = 0;
     std::size_t fgPixels = 0;
     std::size_t maskPixels = 0;
     std::size_t touchedChunksLevel0 = 0;
@@ -237,6 +262,9 @@ struct ProfileStats {
         slicesTotal += other.slicesTotal;
         slicesSkippedEmpty += other.slicesSkippedEmpty;
         nonzeroFgSlices += other.nonzeroFgSlices;
+        computeChunksTotal += other.computeChunksTotal;
+        computeChunksSkippedEmpty += other.computeChunksSkippedEmpty;
+        computeChunksWrapped += other.computeChunksWrapped;
         fgPixels += other.fgPixels;
         maskPixels += other.maskPixels;
         touchedChunksLevel0 += other.touchedChunksLevel0;
@@ -339,6 +367,18 @@ static std::string mapModeToString(MapMode mode)
     }
 }
 
+static std::string processingModeToString(ProcessingMode mode)
+{
+    switch (mode) {
+    case ProcessingMode::legacySlice:
+        return "legacy-slice";
+    case ProcessingMode::chunkAlphaWrap:
+        return "chunk-alpha-wrap";
+    default:
+        return "unknown";
+    }
+}
+
 static std::string algoModeToString(AlgoMode mode)
 {
     switch (mode) {
@@ -407,6 +447,18 @@ static ResultMode parseResultMode(const std::string& value)
         return ResultMode::fast;
     }
     throw std::runtime_error("invalid --result-mode: " + value + " (expected same|fast)");
+}
+
+static ProcessingMode parseProcessingMode(const std::string& value)
+{
+    if (value == "legacy-slice") {
+        return ProcessingMode::legacySlice;
+    }
+    if (value == "chunk-alpha-wrap") {
+        return ProcessingMode::chunkAlphaWrap;
+    }
+    throw std::runtime_error(
+        "invalid --mode: " + value + " (expected legacy-slice|chunk-alpha-wrap)");
 }
 
 static bool parseUIntToken(std::string_view token, std::size_t& value)
@@ -585,6 +637,75 @@ static std::size_t countNonZero(const cv::Mat1b& m)
         c += countNonZero(m.ptr<uint8_t>(y), static_cast<std::size_t>(m.cols));
     }
     return c;
+}
+
+static std::size_t volumeElements(const Shape3& shape)
+{
+    return shape[0] * shape[1] * shape[2];
+}
+
+static std::size_t linearIndex(const Shape3& shape,
+                               std::size_t z,
+                               std::size_t y,
+                               std::size_t x)
+{
+    return (z * shape[1] + y) * shape[2] + x;
+}
+
+static bool boxIntersectsZRange(const Box3& box, int zStart, int zStop)
+{
+    const std::size_t boxZ0 = box.origin[0];
+    const std::size_t boxZ1 = box.origin[0] + box.shape[0];
+    return boxZ0 < static_cast<std::size_t>(zStop) && static_cast<std::size_t>(zStart) < boxZ1;
+}
+
+static Box3 makeChunkBox(const ChunkIndex& chunk, const Shape3& chunkShape, const Shape3& volumeShape)
+{
+    const Shape3 origin = {
+        chunk.z * chunkShape[0],
+        chunk.y * chunkShape[1],
+        chunk.x * chunkShape[2],
+    };
+
+    return {
+        origin,
+        {
+            origin[0] < volumeShape[0] ? std::min(chunkShape[0], volumeShape[0] - origin[0]) : 0,
+            origin[1] < volumeShape[1] ? std::min(chunkShape[1], volumeShape[1] - origin[1]) : 0,
+            origin[2] < volumeShape[2] ? std::min(chunkShape[2], volumeShape[2] - origin[2]) : 0,
+        },
+    };
+}
+
+static Box3 expandAndClampBox(const Box3& box, std::size_t halo, const Shape3& volumeShape)
+{
+    const Shape3 origin = {
+        box.origin[0] > halo ? box.origin[0] - halo : 0,
+        box.origin[1] > halo ? box.origin[1] - halo : 0,
+        box.origin[2] > halo ? box.origin[2] - halo : 0,
+    };
+    const Shape3 end = {
+        std::min(volumeShape[0], box.origin[0] + box.shape[0] + halo),
+        std::min(volumeShape[1], box.origin[1] + box.shape[1] + halo),
+        std::min(volumeShape[2], box.origin[2] + box.shape[2] + halo),
+    };
+    return {
+        origin,
+        {
+            end[0] - origin[0],
+            end[1] - origin[1],
+            end[2] - origin[2],
+        },
+    };
+}
+
+static Shape3 relativeOrigin(const Box3& inner, const Box3& outer)
+{
+    return {
+        inner.origin[0] - outer.origin[0],
+        inner.origin[1] - outer.origin[1],
+        inner.origin[2] - outer.origin[2],
+    };
 }
 
 static int wrapIndex(int idx, int n)
@@ -1824,40 +1945,6 @@ static void validateReusableOutputTree(const fs::path& inputRoot,
     }
 }
 
-static void downsampleNearest(const uint8_t* src,
-                              std::size_t srcZ,
-                              std::size_t srcY,
-                              std::size_t srcX,
-                              uint8_t* dst,
-                              std::size_t dstZ,
-                              std::size_t dstY,
-                              std::size_t dstX)
-{
-    if (srcZ == 0 || srcY == 0 || srcX == 0) {
-        return;
-    }
-    const std::size_t srcStrideY = srcX;
-    const std::size_t srcStrideZ = srcY * srcX;
-
-    for (std::size_t zz = 0; zz < dstZ; ++zz) {
-        if (2 * zz >= srcZ) {
-            break;
-        }
-        for (std::size_t yy = 0; yy < dstY; ++yy) {
-            if (2 * yy >= srcY) {
-                break;
-            }
-            for (std::size_t xx = 0; xx < dstX; ++xx) {
-                if (2 * xx >= srcX) {
-                    break;
-                }
-                dst[zz * dstY * dstX + yy * dstX + xx] =
-                    src[(2 * zz) * srcStrideZ + (2 * yy) * srcStrideY + (2 * xx)];
-            }
-        }
-    }
-}
-
 static bool readAlignedSourceRegionByChunk(vc::VcDataset& src,
                                           const Shape3& srcShape,
                                           const Shape3& srcChunk,
@@ -1907,7 +1994,9 @@ static bool readAlignedSourceRegionByChunk(vc::VcDataset& src,
                     for (std::size_t xc = xChunkStart; xc < xChunkStart + xChunks; ++xc) {
                         const std::size_t dstX = (xc - xChunkStart) * srcChunk[2];
                         try {
-                            src.readChunk(zc, yc, xc, chunkBuf.data());
+                            if (!src.readChunk(zc, yc, xc, chunkBuf.data())) {
+                                std::fill(chunkBuf.begin(), chunkBuf.end(), uint8_t(0));
+                            }
                         } catch (...) {
                             return false;
                         }
@@ -1982,14 +2071,16 @@ static std::vector<ChunkIndex> buildTouchedParents(const std::vector<ChunkIndex>
     return result;
 }
 
-static std::vector<ChunkIndex> buildNearestPyramidLevelTouched(const fs::path& outputRoot,
-                                                               int level,
-                                                               const std::vector<ChunkIndex>& sourceTouched,
-                                                               std::size_t workers,
-                                                               const std::unordered_set<ChunkIndex, ChunkIndexHash>* existingDstChunks,
-                                                               bool existingChunksOnly,
-                                                               std::atomic<std::size_t>& skippedMissingChunks,
-                                                               ProfileStats* profile = nullptr)
+static std::vector<ChunkIndex> buildLabelPriorityPyramidLevelTouched(
+    const fs::path& outputRoot,
+    int level,
+    const std::vector<ChunkIndex>& sourceTouched,
+    std::size_t workers,
+    uint8_t ignoreValue,
+    const std::unordered_set<ChunkIndex, ChunkIndexHash>* existingDstChunks,
+    bool existingChunksOnly,
+    std::atomic<std::size_t>& skippedMissingChunks,
+    ProfileStats* profile = nullptr)
 {
     const fs::path srcPath = outputRoot / std::to_string(level - 1);
     const fs::path dstPath = outputRoot / std::to_string(level);
@@ -2098,10 +2189,12 @@ static std::vector<ChunkIndex> buildNearestPyramidLevelTouched(const fs::path& o
                     localProfile.bytesRead += srcElems * sizeof(uint8_t);
 
                     std::fill(dstBuf.begin(), dstBuf.end(), 0);
-                    downsampleNearest(srcBuf.data(),
-                                      srcActualZ, srcActualY, srcActualX,
-                                      dstBuf.data(),
-                                      dstChunk[0], dstChunk[1], dstChunk[2]);
+                    vc::core::util::downsampleLabelPriority(
+                        srcBuf.data(),
+                        vc::core::util::Shape3{srcActualZ, srcActualY, srcActualX},
+                        dstBuf.data(),
+                        vc::core::util::Shape3{dstChunk[0], dstChunk[1], dstChunk[2]},
+                        ignoreValue);
 
                     if (hasAnyNonZero(dstBuf)) {
                         auto tWriteStart = std::chrono::steady_clock::now();
@@ -2143,6 +2236,284 @@ static std::vector<ChunkIndex> buildNearestPyramidLevelTouched(const fs::path& o
     outputTouched.erase(std::unique(outputTouched.begin(), outputTouched.end()),
                         outputTouched.end());
     return outputTouched;
+}
+
+static bool hasForegroundInRelativeBox(const std::vector<uint8_t>& volume,
+                                       const Shape3& volumeShape,
+                                       const Shape3& relOrigin,
+                                       const Shape3& boxShape)
+{
+    if (boxShape[0] == 0 || boxShape[1] == 0 || boxShape[2] == 0) {
+        return false;
+    }
+    for (std::size_t z = 0; z < boxShape[0]; ++z) {
+        for (std::size_t y = 0; y < boxShape[1]; ++y) {
+            const std::size_t base = linearIndex(volumeShape,
+                                                 relOrigin[0] + z,
+                                                 relOrigin[1] + y,
+                                                 relOrigin[2]);
+            for (std::size_t x = 0; x < boxShape[2]; ++x) {
+                if (volume[base + x] != 0) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static std::size_t countNonZeroInRelativeBox(const std::vector<uint8_t>& volume,
+                                             const Shape3& volumeShape,
+                                             const Shape3& relOrigin,
+                                             const Shape3& boxShape)
+{
+    std::size_t count = 0;
+    for (std::size_t z = 0; z < boxShape[0]; ++z) {
+        for (std::size_t y = 0; y < boxShape[1]; ++y) {
+            const std::size_t base = linearIndex(volumeShape,
+                                                 relOrigin[0] + z,
+                                                 relOrigin[1] + y,
+                                                 relOrigin[2]);
+            count += countNonZero(volume.data() + base, boxShape[2]);
+        }
+    }
+    return count;
+}
+
+static AlphaWrapPoint voxelCenterPoint(std::size_t z, std::size_t y, std::size_t x)
+{
+    return AlphaWrapPoint(static_cast<double>(z) + 0.5,
+                          static_cast<double>(y) + 0.5,
+                          static_cast<double>(x) + 0.5);
+}
+
+static bool bboxContains(const CGAL::Bbox_3& bbox, const AlphaWrapPoint& p)
+{
+    return p.x() >= bbox.xmin() && p.x() <= bbox.xmax() &&
+           p.y() >= bbox.ymin() && p.y() <= bbox.ymax() &&
+           p.z() >= bbox.zmin() && p.z() <= bbox.zmax();
+}
+
+static std::vector<uint8_t> classifyOuterAlphaWrapCore(const std::vector<uint8_t>& halo,
+                                                       const Box3& haloBox,
+                                                       const Box3& coreBox,
+                                                       double alpha,
+                                                       double offset)
+{
+    std::vector<AlphaWrapPoint> points;
+    points.reserve(countNonZero(halo.data(), halo.size()));
+    for (std::size_t z = 0; z < haloBox.shape[0]; ++z) {
+        for (std::size_t y = 0; y < haloBox.shape[1]; ++y) {
+            const std::size_t base = linearIndex(haloBox.shape, z, y, 0);
+            for (std::size_t x = 0; x < haloBox.shape[2]; ++x) {
+                if (halo[base + x] == 0) {
+                    continue;
+                }
+                points.push_back(voxelCenterPoint(haloBox.origin[0] + z,
+                                                  haloBox.origin[1] + y,
+                                                  haloBox.origin[2] + x));
+            }
+        }
+    }
+
+    const Shape3 coreRel = relativeOrigin(coreBox, haloBox);
+    std::vector<uint8_t> ignore(volumeElements(coreBox.shape), 0);
+    if (points.size() < 4) {
+        return ignore;
+    }
+
+    AlphaWrapMesh wrap;
+    CGAL::alpha_wrap_3(points, alpha, offset, wrap);
+    if (num_faces(wrap) == 0) {
+        return ignore;
+    }
+
+    const CGAL::Bbox_3 bbox = CGAL::Polygon_mesh_processing::bbox(wrap);
+    CGAL::Side_of_triangle_mesh<AlphaWrapMesh, AlphaWrapKernel> sideOfMesh(wrap);
+
+    for (std::size_t z = 0; z < coreBox.shape[0]; ++z) {
+        for (std::size_t y = 0; y < coreBox.shape[1]; ++y) {
+            for (std::size_t x = 0; x < coreBox.shape[2]; ++x) {
+                const std::size_t haloIdx = linearIndex(haloBox.shape,
+                                                        coreRel[0] + z,
+                                                        coreRel[1] + y,
+                                                        coreRel[2] + x);
+                if (halo[haloIdx] != 0) {
+                    continue;
+                }
+
+                const AlphaWrapPoint p = voxelCenterPoint(coreBox.origin[0] + z,
+                                                          coreBox.origin[1] + y,
+                                                          coreBox.origin[2] + x);
+                if (!bboxContains(bbox, p) || sideOfMesh(p) == CGAL::ON_UNBOUNDED_SIDE) {
+                    ignore[linearIndex(coreBox.shape, z, y, x)] = 255;
+                }
+            }
+        }
+    }
+
+    return ignore;
+}
+
+static void writeReplicatedCoreMaskToLevel0(
+    vc::VcDataset& output,
+    const Shape3& outShape,
+    const Shape3& outChunk,
+    const Box3& coreBox,
+    int zStart,
+    int zStop,
+    std::size_t scale,
+    const std::vector<uint8_t>& ignoreCore,
+    const std::unordered_set<ChunkIndex, ChunkIndexHash>* existingLevel0Chunks,
+    bool existingChunksOnly,
+    uint8_t ignoreValue,
+    std::unordered_set<ChunkIndex, ChunkIndexHash>& touchedLevel0,
+    std::size_t& skippedMissingChunks,
+    ProfileStats* profile = nullptr)
+{
+    const std::size_t clipLocalZ0 = coreBox.origin[0] < static_cast<std::size_t>(zStart)
+        ? static_cast<std::size_t>(zStart) - coreBox.origin[0]
+        : 0;
+    const std::size_t clipLocalZ1 = coreBox.origin[0] + coreBox.shape[0] > static_cast<std::size_t>(zStop)
+        ? static_cast<std::size_t>(zStop) - coreBox.origin[0]
+        : coreBox.shape[0];
+    if (clipLocalZ0 >= clipLocalZ1) {
+        return;
+    }
+
+    const std::size_t outBaseZ = coreBox.origin[0] * scale;
+    const std::size_t outBaseY = coreBox.origin[1] * scale;
+    const std::size_t outBaseX = coreBox.origin[2] * scale;
+    const std::size_t regionZ0 = outBaseZ + clipLocalZ0 * scale;
+    const std::size_t regionZ1 = outBaseZ + clipLocalZ1 * scale;
+    const std::size_t regionY0 = outBaseY;
+    const std::size_t regionY1 = outBaseY + coreBox.shape[1] * scale;
+    const std::size_t regionX0 = outBaseX;
+    const std::size_t regionX1 = outBaseX + coreBox.shape[2] * scale;
+
+    if (regionZ0 >= regionZ1 || regionY0 >= regionY1 || regionX0 >= regionX1) {
+        return;
+    }
+
+    const std::size_t chunkElems = volumeElements(outChunk);
+    const std::size_t chunkBytes = chunkElems * sizeof(uint8_t);
+    const std::size_t cz0 = regionZ0 / outChunk[0];
+    const std::size_t cz1 = (regionZ1 - 1) / outChunk[0];
+    const std::size_t cy0 = regionY0 / outChunk[1];
+    const std::size_t cy1 = (regionY1 - 1) / outChunk[1];
+    const std::size_t cx0 = regionX0 / outChunk[2];
+    const std::size_t cx1 = (regionX1 - 1) / outChunk[2];
+
+    std::vector<uint8_t> chunkBuf(chunkElems, 0);
+    for (std::size_t cz = cz0; cz <= cz1; ++cz) {
+        for (std::size_t cy = cy0; cy <= cy1; ++cy) {
+            for (std::size_t cx = cx0; cx <= cx1; ++cx) {
+                const ChunkIndex chunk{cz, cy, cx};
+                if (existingChunksOnly &&
+                    existingLevel0Chunks != nullptr &&
+                    existingLevel0Chunks->find(chunk) == existingLevel0Chunks->end()) {
+                    ++skippedMissingChunks;
+                    continue;
+                }
+
+                const std::size_t chunkGlobalZ0 = cz * outChunk[0];
+                const std::size_t chunkGlobalY0 = cy * outChunk[1];
+                const std::size_t chunkGlobalX0 = cx * outChunk[2];
+                const std::size_t overlapZ0 = std::max(chunkGlobalZ0, regionZ0);
+                const std::size_t overlapZ1 = std::min(chunkGlobalZ0 + outChunk[0], regionZ1);
+                const std::size_t overlapY0 = std::max(chunkGlobalY0, regionY0);
+                const std::size_t overlapY1 = std::min(chunkGlobalY0 + outChunk[1], regionY1);
+                const std::size_t overlapX0 = std::max(chunkGlobalX0, regionX0);
+                const std::size_t overlapX1 = std::min(chunkGlobalX0 + outChunk[2], regionX1);
+                if (overlapZ0 >= overlapZ1 || overlapY0 >= overlapY1 || overlapX0 >= overlapX1) {
+                    continue;
+                }
+
+                if (profile) {
+                    ++profile->totalChunksInMasks;
+                }
+
+                auto readStart = std::chrono::steady_clock::now();
+                chunkBuf.assign(chunkElems, 0);
+                output.readChunk(cz, cy, cx, chunkBuf.data());
+                if (profile) {
+                    auto readEnd = std::chrono::steady_clock::now();
+                    profile->tChunkReadIo.add(std::chrono::duration<double>(readEnd - readStart).count());
+                    ++profile->chunkIoReads;
+                    profile->bytesRead += chunkBytes;
+                }
+
+                bool changed = false;
+                auto cpuStart = std::chrono::steady_clock::now();
+                for (std::size_t outZ = overlapZ0; outZ < overlapZ1; ++outZ) {
+                    const std::size_t srcLocalZ = (outZ - outBaseZ) / scale;
+                    const std::size_t dstLocalZ = outZ - chunkGlobalZ0;
+                    for (std::size_t outY = overlapY0; outY < overlapY1; ++outY) {
+                        const std::size_t srcLocalY = (outY - outBaseY) / scale;
+                        const std::size_t dstLocalY = outY - chunkGlobalY0;
+                        for (std::size_t outX = overlapX0; outX < overlapX1; ++outX) {
+                            const std::size_t srcLocalX = (outX - outBaseX) / scale;
+                            if (ignoreCore[linearIndex(coreBox.shape,
+                                                       srcLocalZ,
+                                                       srcLocalY,
+                                                       srcLocalX)] == 0) {
+                                continue;
+                            }
+                            const std::size_t dstIdx = linearIndex(outChunk,
+                                                                   dstLocalZ,
+                                                                   dstLocalY,
+                                                                   outX - chunkGlobalX0);
+                            if (chunkBuf[dstIdx] == 0) {
+                                chunkBuf[dstIdx] = ignoreValue;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if (profile) {
+                    auto cpuEnd = std::chrono::steady_clock::now();
+                    profile->tChunkApplyCpu.add(std::chrono::duration<double>(cpuEnd - cpuStart).count());
+                }
+
+                if (!changed) {
+                    continue;
+                }
+
+                auto writeStart = std::chrono::steady_clock::now();
+                output.writeChunk(cz, cy, cx, chunkBuf.data(), chunkBytes);
+                if (profile) {
+                    auto writeEnd = std::chrono::steady_clock::now();
+                    profile->tChunkWriteIo.add(std::chrono::duration<double>(writeEnd - writeStart).count());
+                    ++profile->chunkIoWrites;
+                    profile->bytesWritten += chunkBytes;
+                }
+                touchedLevel0.insert(chunk);
+            }
+        }
+    }
+}
+
+static std::vector<ChunkIndex> collectActiveComputeChunks(
+    const std::unordered_set<ChunkIndex, ChunkIndexHash>& existingComputeChunks,
+    const Shape3& computeShape,
+    const Shape3& computeChunk,
+    int zStart,
+    int zStop)
+{
+    std::vector<ChunkIndex> out;
+    out.reserve(existingComputeChunks.size());
+    for (const auto& chunk : existingComputeChunks) {
+        const Box3 box = makeChunkBox(chunk, computeChunk, computeShape);
+        if (box.shape[0] == 0 || box.shape[1] == 0 || box.shape[2] == 0) {
+            continue;
+        }
+        if (!boxIntersectsZRange(box, zStart, zStop)) {
+            continue;
+        }
+        out.push_back(chunk);
+    }
+    std::sort(out.begin(), out.end(), chunkIndexLess);
+    return out;
 }
 
 static bool valueIsRasterized(const nlohmann::json& meta)
@@ -2192,7 +2563,9 @@ static void writeOutputMetadata(const Config& cfg,
     meta["ignore_label_tool"] = "vc_add_ignore_label";
     meta["source_zarr"] = fs::weakly_canonical(cfg.inputRoot).string();
     meta["ignore_label_params"] = {
+        {"mode", processingModeToString(cfg.mode)},
         {"alpha", cfg.alpha},
+        {"chunk_alpha", cfg.chunkAlpha},
         {"n_angle_bins", cfg.nAngleBins},
         {"shrink_factor", cfg.shrinkFactor},
         {"compute_level", cfg.computeLevel},
@@ -2226,14 +2599,16 @@ static void writeProfileJson(const fs::path& path,
                             const Config& cfg,
                             bool reuseOutputTree,
                             const ProfileStats& profile,
-                            const std::size_t totalSlices)
+                            const std::size_t totalWorkItems)
 {
     nlohmann::json j;
     j["input"] = cfg.inputRoot.string();
     j["output"] = cfg.outputRoot.string();
     j["workers"] = static_cast<long long>(cfg.workers);
+    j["mode"] = processingModeToString(cfg.mode);
     j["compute_level"] = cfg.computeLevel;
     j["output_level"] = cfg.outputLevel;
+    j["chunk_alpha"] = cfg.chunkAlpha;
     j["map_mode"] = mapModeToString(cfg.mapMode);
     j["fast_atan2"] = cfg.fastAtan2;
     j["use_squared_dist"] = cfg.useSquaredDist;
@@ -2245,10 +2620,17 @@ static void writeProfileJson(const fs::path& path,
     j["algo_mode"] = algoModeToString(cfg.algoMode);
     j["z_min"] = cfg.zMin;
     j["z_max"] = cfg.zMax;
-    j["slice_total"] = static_cast<long long>(totalSlices);
+    if (cfg.mode == ProcessingMode::chunkAlphaWrap) {
+        j["chunk_total"] = static_cast<long long>(totalWorkItems);
+    } else {
+        j["slice_total"] = static_cast<long long>(totalWorkItems);
+    }
     j["slices_total"] = static_cast<long long>(profile.slicesTotal);
     j["slices_skipped_empty"] = static_cast<long long>(profile.slicesSkippedEmpty);
     j["slices_nonzero_fg"] = static_cast<long long>(profile.nonzeroFgSlices);
+    j["compute_chunks_total"] = static_cast<long long>(profile.computeChunksTotal);
+    j["compute_chunks_skipped_empty"] = static_cast<long long>(profile.computeChunksSkippedEmpty);
+    j["compute_chunks_wrapped"] = static_cast<long long>(profile.computeChunksWrapped);
     j["fg_pixels"] = static_cast<long long>(profile.fgPixels);
     j["mask_pixels"] = static_cast<long long>(profile.maskPixels);
     j["touched_chunks_level0"] = static_cast<long long>(profile.touchedChunksLevel0);
@@ -2278,7 +2660,7 @@ static void writeProfileJson(const fs::path& path,
         {"total", profile.totalSeconds()},
     };
 
-    if (totalSlices > 0) {
+    if (totalWorkItems > 0) {
         const double totalSec = std::max(1e-9, profile.totalSeconds());
         j["throughput"] = {
             {"input_voxels_per_sec", static_cast<double>(profile.inputVoxels) / totalSec},
@@ -2289,6 +2671,284 @@ static void writeProfileJson(const fs::path& path,
         };
     }
     writeJsonFile(path, j);
+}
+
+static int processChunkAlphaWrap(
+    const Config& cfg,
+    const std::vector<int>& levels,
+    const nlohmann::json& inputMeta,
+    const std::unordered_map<int, std::unordered_set<ChunkIndex, ChunkIndexHash>>& existingByLevel,
+    bool reuseOutputTree,
+    std::size_t workers,
+    const Shape3& computeShape,
+    const Shape3& outShape,
+    const Shape3& outChunk,
+    int zStart,
+    int zStop)
+{
+    vc::VcDataset computeDs(cfg.inputRoot / std::to_string(cfg.computeLevel));
+    vc::VcDataset out0(cfg.outputRoot / "0");
+    const Shape3 computeChunk = toShape3(computeDs.defaultChunkShape());
+    if (computeChunk != outChunk) {
+        throw std::runtime_error("chunk-alpha-wrap currently requires matching compute/output chunk shapes");
+    }
+
+    const std::size_t scale =
+        std::size_t{1} << static_cast<std::size_t>(cfg.computeLevel - cfg.outputLevel);
+    if ((outChunk[0] % scale) != 0 || (outChunk[1] % scale) != 0 || (outChunk[2] % scale) != 0) {
+        throw std::runtime_error("chunk-alpha-wrap requires output chunk sizes divisible by scale");
+    }
+
+    const auto itLevel0 = existingByLevel.find(0);
+    if (itLevel0 == existingByLevel.end()) {
+        throw std::runtime_error("missing existing chunk index for level 0");
+    }
+    const auto itComputeLevel = existingByLevel.find(cfg.computeLevel);
+    if (itComputeLevel == existingByLevel.end()) {
+        throw std::runtime_error("missing existing chunk index for compute level");
+    }
+    const auto& existingLevel0Chunks = itLevel0->second;
+    const auto activeComputeChunks = collectActiveComputeChunks(itComputeLevel->second,
+                                                               computeShape,
+                                                               computeChunk,
+                                                               zStart,
+                                                               zStop);
+
+    const std::size_t total = activeComputeChunks.size();
+    const std::size_t offsetVoxels =
+        std::max<std::size_t>(1, static_cast<std::size_t>(std::llround(cfg.chunkAlpha / 4.0)));
+    const std::size_t haloVoxels =
+        static_cast<std::size_t>(std::ceil(cfg.chunkAlpha + static_cast<double>(offsetVoxels)));
+
+    if (cfg.verbose) {
+        std::cerr << "[chunk-alpha-wrap] chunks=" << total
+                  << " alpha=" << cfg.chunkAlpha
+                  << " offset=" << offsetVoxels
+                  << " halo=" << haloVoxels
+                  << " scale=" << scale << '\n';
+    }
+
+    std::atomic<std::size_t> next{0};
+    std::atomic<std::size_t> done{0};
+    std::atomic<std::size_t> skippedMissingLevel0{0};
+    std::atomic<std::size_t> skippedMissingPyramid{0};
+    std::atomic<bool> hadError{false};
+    std::mutex ioMutex;
+    std::mutex touchedMutex;
+    std::mutex profileMutex;
+    std::mutex errMutex;
+    std::string firstError;
+    std::unordered_set<ChunkIndex, ChunkIndexHash> touchedLevel0Global;
+    ProfileStats profile;
+    std::vector<std::thread> threads;
+    threads.reserve(workers);
+
+    const auto progress = [&](std::size_t d) {
+        if (cfg.verbose && (d == 1 || (d % 16) == 0 || d == total)) {
+            std::lock_guard<std::mutex> lock(ioMutex);
+            std::cerr << "[ignore] " << d << "/" << total << " compute chunks\n";
+        }
+    };
+
+    for (std::size_t tid = 0; tid < workers; ++tid) {
+        threads.emplace_back([&, tid]() {
+            (void)tid;
+            vc::VcDataset localCompute(cfg.inputRoot / std::to_string(cfg.computeLevel));
+            vc::VcDataset localOut0(cfg.outputRoot / "0");
+            std::vector<uint8_t> haloBuf;
+            std::unordered_set<ChunkIndex, ChunkIndexHash> localTouchedLevel0;
+            localTouchedLevel0.reserve(128);
+            std::size_t localSkippedLevel0 = 0;
+            ProfileStats localProfile;
+
+            while (true) {
+                if (hadError.load()) {
+                    break;
+                }
+                const std::size_t idx = next.fetch_add(1);
+                if (idx >= total) {
+                    break;
+                }
+
+                try {
+                    const ChunkIndex chunk = activeComputeChunks[idx];
+                    const Box3 coreBox = makeChunkBox(chunk, computeChunk, computeShape);
+                    const std::size_t clipLocalZ0 = coreBox.origin[0] < static_cast<std::size_t>(zStart)
+                        ? static_cast<std::size_t>(zStart) - coreBox.origin[0]
+                        : 0;
+                    const std::size_t clipLocalZ1 =
+                        coreBox.origin[0] + coreBox.shape[0] > static_cast<std::size_t>(zStop)
+                            ? static_cast<std::size_t>(zStop) - coreBox.origin[0]
+                            : coreBox.shape[0];
+                    const Shape3 clippedShape = {
+                        clipLocalZ1 > clipLocalZ0 ? clipLocalZ1 - clipLocalZ0 : 0,
+                        coreBox.shape[1],
+                        coreBox.shape[2],
+                    };
+
+                    ++localProfile.computeChunksTotal;
+                    localProfile.inputVoxels += volumeElements(clippedShape);
+                    if (clippedShape[0] == 0 || clippedShape[1] == 0 || clippedShape[2] == 0) {
+                        const std::size_t d = done.fetch_add(1) + 1;
+                        progress(d);
+                        continue;
+                    }
+
+                    const Box3 haloBox = expandAndClampBox(coreBox, haloVoxels, computeShape);
+                    haloBuf.assign(volumeElements(haloBox.shape), 0);
+                    {
+                        ScopedTimer readTimer(localProfile.tSliceLoad);
+                        localCompute.readRegion({haloBox.origin[0], haloBox.origin[1], haloBox.origin[2]},
+                                                {haloBox.shape[0], haloBox.shape[1], haloBox.shape[2]},
+                                                haloBuf.data());
+                    }
+                    localProfile.bytesRead += haloBuf.size() * sizeof(uint8_t);
+
+                    const Shape3 coreRel = relativeOrigin(coreBox, haloBox);
+                    const Shape3 clippedRel = {coreRel[0] + clipLocalZ0, coreRel[1], coreRel[2]};
+                    if (!hasForegroundInRelativeBox(haloBuf, haloBox.shape, clippedRel, clippedShape)) {
+                        ++localProfile.computeChunksSkippedEmpty;
+                        const std::size_t d = done.fetch_add(1) + 1;
+                        progress(d);
+                        continue;
+                    }
+
+                    if (cfg.profileEnabled) {
+                        localProfile.fgPixels += countNonZeroInRelativeBox(haloBuf,
+                                                                           haloBox.shape,
+                                                                           clippedRel,
+                                                                           clippedShape);
+                    }
+
+                    std::vector<uint8_t> ignoreCore;
+                    {
+                        ScopedTimer wrapTimer(localProfile.tMaskBuild);
+                        ignoreCore = classifyOuterAlphaWrapCore(haloBuf,
+                                                                haloBox,
+                                                                coreBox,
+                                                                cfg.chunkAlpha,
+                                                                static_cast<double>(offsetVoxels));
+                    }
+                    ++localProfile.computeChunksWrapped;
+
+                    if (cfg.profileEnabled) {
+                        localProfile.maskPixels += countNonZeroInRelativeBox(ignoreCore,
+                                                                             coreBox.shape,
+                                                                             {clipLocalZ0, 0, 0},
+                                                                             clippedShape);
+                    }
+
+                    writeReplicatedCoreMaskToLevel0(localOut0,
+                                                    outShape,
+                                                    outChunk,
+                                                    coreBox,
+                                                    zStart,
+                                                    zStop,
+                                                    scale,
+                                                    ignoreCore,
+                                                    &existingLevel0Chunks,
+                                                    cfg.existingChunksOnly,
+                                                    static_cast<uint8_t>(cfg.ignoreValue),
+                                                    localTouchedLevel0,
+                                                    localSkippedLevel0,
+                                                    &localProfile);
+
+                    const std::size_t d = done.fetch_add(1) + 1;
+                    progress(d);
+                } catch (const std::exception& e) {
+                    hadError.store(true);
+                    std::lock_guard<std::mutex> lk(errMutex);
+                    if (firstError.empty()) {
+                        firstError = e.what();
+                    }
+                    break;
+                }
+            }
+
+            skippedMissingLevel0.fetch_add(localSkippedLevel0);
+            {
+                std::lock_guard<std::mutex> lock(touchedMutex);
+                touchedLevel0Global.insert(localTouchedLevel0.begin(), localTouchedLevel0.end());
+            }
+            {
+                std::lock_guard<std::mutex> lock(profileMutex);
+                profile.accumulate(localProfile);
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+    if (hadError.load()) {
+        throw std::runtime_error("failed while processing compute chunks: " + firstError);
+    }
+
+    std::vector<ChunkIndex> activeTouched;
+    activeTouched.reserve(touchedLevel0Global.size());
+    for (const auto& c : touchedLevel0Global) {
+        activeTouched.push_back(c);
+    }
+    std::sort(activeTouched.begin(), activeTouched.end(), chunkIndexLess);
+    profile.touchedChunksLevel0 = activeTouched.size();
+
+    if (cfg.rebuildPyramid) {
+        for (int level : levels) {
+            if (level == 0) {
+                continue;
+            }
+            if (activeTouched.empty()) {
+                break;
+            }
+            if (cfg.verbose) {
+                std::cerr << "[pyramid] building level " << level
+                          << " touched=" << activeTouched.size() << '\n';
+            }
+            const std::unordered_set<ChunkIndex, ChunkIndexHash>* existingDst = nullptr;
+            if (cfg.existingChunksOnly) {
+                auto it = existingByLevel.find(level);
+                if (it == existingByLevel.end()) {
+                    throw std::runtime_error("missing existing chunk index for pyramid level " +
+                                             std::to_string(level));
+                }
+                existingDst = &it->second;
+            }
+            activeTouched = buildLabelPriorityPyramidLevelTouched(cfg.outputRoot,
+                                                                  level,
+                                                                  activeTouched,
+                                                                  workers,
+                                                                  static_cast<uint8_t>(cfg.ignoreValue),
+                                                                  existingDst,
+                                                                  cfg.existingChunksOnly,
+                                                                  skippedMissingPyramid,
+                                                                  &profile);
+        }
+    } else if (cfg.verbose) {
+        std::cerr << "[pyramid] skipped (no-rebuild-pyramid)" << '\n';
+    }
+
+    ProcessingStats stats;
+    stats.skippedMissingLevel0 = skippedMissingLevel0.load();
+    stats.skippedMissingPyramid = skippedMissingPyramid.load();
+    stats.preloadedComputeBytes = 0;
+    stats.preloadedComputeSlices = 0;
+    stats.cacheBudgetBytes = 0;
+    stats.availableRamBytes = 0;
+    stats.cacheMode = "chunk-region";
+    stats.mapMode = "chunk-alpha-wrap";
+    stats.fastAtan2 = false;
+    stats.useSquaredDist = false;
+    stats.chunkZSlab = false;
+    stats.rebuildPyramid = cfg.rebuildPyramid;
+    stats.reuseOutputTree = reuseOutputTree;
+    stats.resultMode = resultModeToString(cfg.resultMode);
+
+    writeOutputMetadata(cfg, outShape, inputMeta, stats);
+    if (cfg.profileEnabled && !cfg.profileJsonPath.empty()) {
+        writeProfileJson(cfg.profileJsonPath, cfg, reuseOutputTree, profile, total);
+    }
+    std::cout << "vc_add_ignore_label completed\n";
+    return EXIT_SUCCESS;
 }
 
 static void visualizeSlice(const Config& cfg)
@@ -2313,6 +2973,63 @@ static void visualizeSlice(const Config& cfg)
                     static_cast<int>(computeShape[2]),
                     slice.data());
 
+    fs::create_directories(cfg.visualizeDir);
+
+    const fs::path outputLevel = cfg.outputRoot / std::to_string(cfg.computeLevel);
+    const bool hasOutputLevel = !cfg.outputRoot.empty() && fs::exists(outputLevel / ".zarray");
+    if (hasOutputLevel) {
+        vc::VcDataset outputDs(outputLevel);
+        if (toShape3(outputDs.shape()) != computeShape) {
+            throw std::runtime_error("visualize output level shape mismatch");
+        }
+
+        std::vector<uint8_t> outSlice(computeShape[1] * computeShape[2], 0);
+        outputDs.readRegion({static_cast<std::size_t>(z), 0, 0},
+                            {1, computeShape[1], computeShape[2]},
+                            outSlice.data());
+        cv::Mat1b outputIgnore(static_cast<int>(computeShape[1]),
+                               static_cast<int>(computeShape[2]),
+                               outSlice.data());
+        cv::Mat1b ignoreMask(outputIgnore.rows, outputIgnore.cols, uint8_t(0));
+        for (int y = 0; y < outputIgnore.rows; ++y) {
+            const uint8_t* outRow = outputIgnore.ptr<uint8_t>(y);
+            uint8_t* maskRow = ignoreMask.ptr<uint8_t>(y);
+            for (int x = 0; x < outputIgnore.cols; ++x) {
+                if (outRow[x] == static_cast<uint8_t>(cfg.ignoreValue)) {
+                    maskRow[x] = 255;
+                }
+            }
+        }
+
+        cv::imwrite((cfg.visualizeDir / ("slice_" + std::to_string(z) + "_input.png")).string(), label);
+        cv::imwrite((cfg.visualizeDir / ("slice_" + std::to_string(z) + "_ignore_mask.png")).string(),
+                    ignoreMask);
+        cv::imwrite((cfg.visualizeDir / ("slice_" + std::to_string(z) + "_output_ignore.png")).string(),
+                    outputIgnore);
+
+        cv::Mat3b vis(label.rows, label.cols, cv::Vec3b(0, 0, 0));
+        for (int y = 0; y < label.rows; ++y) {
+            const uint8_t* lrow = label.ptr<uint8_t>(y);
+            const uint8_t* maskRow = ignoreMask.ptr<uint8_t>(y);
+            cv::Vec3b* vrow = vis.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < label.cols; ++x) {
+                if (lrow[x] != 0) {
+                    vrow[x] = cv::Vec3b(255, 255, 255);
+                }
+                if (maskRow[x] != 0) {
+                    vrow[x] = cv::Vec3b(255, 0, 0);
+                }
+            }
+        }
+        cv::imwrite((cfg.visualizeDir / ("slice_" + std::to_string(z) + "_combined.png")).string(), vis);
+        return;
+    }
+
+    if (cfg.mode == ProcessingMode::chunkAlphaWrap) {
+        throw std::runtime_error(
+            "chunk-alpha-wrap visualization without an existing output zarr is not supported");
+    }
+
     const SliceMaskPair masks = detectIgnoreMasks(label,
                                                   cfg.nAngleBins,
                                                   cfg.alpha,
@@ -2326,8 +3043,6 @@ static void visualizeSlice(const Config& cfg)
                                                   cfg.algoMode);
     const cv::Mat1b& outer = masks.outer;
     const cv::Mat1b& inner = masks.inner;
-
-    fs::create_directories(cfg.visualizeDir);
 
     cv::imwrite((cfg.visualizeDir / ("slice_" + std::to_string(z) + "_original.png")).string(), label);
     cv::imwrite((cfg.visualizeDir / ("slice_" + std::to_string(z) + "_outer.png")).string(), outer);
@@ -2573,6 +3288,139 @@ static bool runSelfTest()
         }
     }
 
+    auto checkChunkAlphaWrapConsistency = [&]() {
+        const Shape3 volumeShape = {48, 48, 48};
+        const Shape3 chunkShape = {16, 16, 16};
+        const ChunkIndex centerChunk{1, 1, 1};
+        const Box3 coreBox = makeChunkBox(centerChunk, chunkShape, volumeShape);
+
+        std::vector<uint8_t> occ(volumeElements(volumeShape), 0);
+        for (std::size_t z = 0; z < volumeShape[0]; ++z) {
+            for (std::size_t y = 0; y < volumeShape[1]; ++y) {
+                for (std::size_t x = 0; x < volumeShape[2]; ++x) {
+                    const double dz = static_cast<double>(z) + 0.5 - 24.0;
+                    const double dy = static_cast<double>(y) + 0.5 - 24.0;
+                    const double dx = static_cast<double>(x) + 0.5 - 24.0;
+                    const double r = std::sqrt(dz * dz + dy * dy + dx * dx);
+                    if (std::abs(r - 12.0) <= 0.75) {
+                        occ[linearIndex(volumeShape, z, y, x)] = 255;
+                    }
+                }
+            }
+        }
+
+        auto extractBox = [&](const Box3& box) {
+            std::vector<uint8_t> out(volumeElements(box.shape), 0);
+            for (std::size_t z = 0; z < box.shape[0]; ++z) {
+                for (std::size_t y = 0; y < box.shape[1]; ++y) {
+                    for (std::size_t x = 0; x < box.shape[2]; ++x) {
+                        out[linearIndex(box.shape, z, y, x)] =
+                            occ[linearIndex(volumeShape,
+                                            box.origin[0] + z,
+                                            box.origin[1] + y,
+                                            box.origin[2] + x)];
+                    }
+                }
+            }
+            return out;
+        };
+
+        constexpr double alpha = 6.0;
+        constexpr double offset = 2.0;
+        const Box3 localHalo = expandAndClampBox(coreBox, 8, volumeShape);
+        const Box3 refHalo = expandAndClampBox(coreBox, 20, volumeShape);
+
+        const auto localIgnore = classifyOuterAlphaWrapCore(extractBox(localHalo),
+                                                            localHalo,
+                                                            coreBox,
+                                                            alpha,
+                                                            offset);
+        const auto refIgnore = classifyOuterAlphaWrapCore(extractBox(refHalo),
+                                                          refHalo,
+                                                          coreBox,
+                                                          alpha,
+                                                          offset);
+        if (localIgnore != refIgnore) {
+            std::cerr << "self-test failed: chunk-alpha-wrap local/reference mismatch\n";
+            return false;
+        }
+        return true;
+    };
+
+    auto checkAlignedReadMissingChunk = [&]() {
+        const fs::path tmpRoot = fs::temp_directory_path() / "vc_add_ignore_selftest_missing_chunk";
+        std::error_code ec;
+        fs::remove_all(tmpRoot, ec);
+        fs::create_directories(tmpRoot, ec);
+        if (ec) {
+            std::cerr << "self-test failed: unable to create temp root for missing-chunk test\n";
+            return false;
+        }
+
+        try {
+            auto ds = vc::createZarrDataset(tmpRoot,
+                                            "0",
+                                            {128, 128, 256},
+                                            {128, 128, 128},
+                                            vc::VcDtype::uint8,
+                                            "none");
+            std::vector<uint8_t> chunk(128 * 128 * 128, 11);
+            ds->writeChunk(0, 0, 0, chunk.data(), chunk.size() * sizeof(uint8_t));
+
+            std::vector<uint8_t> region;
+            const bool ok = readAlignedSourceRegionByChunk(*ds,
+                                                           {128, 128, 256},
+                                                           {128, 128, 128},
+                                                           0,
+                                                           0,
+                                                           0,
+                                                           128,
+                                                           128,
+                                                           256,
+                                                           region);
+            if (!ok) {
+                std::cerr << "self-test failed: aligned missing-chunk read returned false\n";
+                fs::remove_all(tmpRoot, ec);
+                return false;
+            }
+
+            for (std::size_t z = 0; z < 128; ++z) {
+                for (std::size_t y = 0; y < 128; ++y) {
+                    const std::size_t left = linearIndex({128, 128, 256}, z, y, 0);
+                    const std::size_t right = linearIndex({128, 128, 256}, z, y, 128);
+                    if (!std::all_of(region.begin() + static_cast<std::ptrdiff_t>(left),
+                                     region.begin() + static_cast<std::ptrdiff_t>(left + 128),
+                                     [](uint8_t v) { return v == 11; })) {
+                        std::cerr << "self-test failed: aligned read corrupted present chunk\n";
+                        fs::remove_all(tmpRoot, ec);
+                        return false;
+                    }
+                    if (!std::all_of(region.begin() + static_cast<std::ptrdiff_t>(right),
+                                     region.begin() + static_cast<std::ptrdiff_t>(right + 128),
+                                     [](uint8_t v) { return v == 0; })) {
+                        std::cerr << "self-test failed: aligned read duplicated missing chunk data\n";
+                        fs::remove_all(tmpRoot, ec);
+                        return false;
+                    }
+                }
+            }
+
+            fs::remove_all(tmpRoot, ec);
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "self-test failed in missing-chunk test: " << e.what() << '\n';
+            fs::remove_all(tmpRoot, ec);
+            return false;
+        }
+    };
+
+    if (!checkChunkAlphaWrapConsistency()) {
+        return false;
+    }
+    if (!checkAlignedReadMissingChunk()) {
+        return false;
+    }
+
     std::cout << "self-test passed\n";
     return true;
 }
@@ -2663,6 +3511,20 @@ static int process(const Config& cfg)
                               : static_cast<int>(computeShape[0]);
     if (zStart >= zStop) {
         throw std::runtime_error("empty z range after applying --z-min/--z-max");
+    }
+
+    if (cfg.mode == ProcessingMode::chunkAlphaWrap) {
+        return processChunkAlphaWrap(cfg,
+                                     levels,
+                                     inputMeta,
+                                     existingByLevel,
+                                     reuseOutputTree,
+                                     workers,
+                                     computeShape,
+                                     outShape,
+                                     outChunk,
+                                     zStart,
+                                     zStop);
     }
 
     const std::size_t zCount = static_cast<std::size_t>(zStop - zStart);
@@ -3196,14 +4058,15 @@ static int process(const Config& cfg)
                 }
                 existingDst = &it->second;
             }
-            activeTouched = buildNearestPyramidLevelTouched(cfg.outputRoot,
-                                                            level,
-                                                            activeTouched,
-                                                            workers,
-                                                            existingDst,
-                                                            cfg.existingChunksOnly,
-                                                            skippedMissingPyramid,
-                                                            &profile);
+            activeTouched = buildLabelPriorityPyramidLevelTouched(cfg.outputRoot,
+                                                                  level,
+                                                                  activeTouched,
+                                                                  workers,
+                                                                  static_cast<uint8_t>(cfg.ignoreValue),
+                                                                  existingDst,
+                                                                  cfg.existingChunksOnly,
+                                                                  skippedMissingPyramid,
+                                                                  &profile);
         }
     } else if (cfg.verbose) {
         std::cerr << "[pyramid] skipped (no-rebuild-pyramid)" << '\n';
@@ -3242,6 +4105,7 @@ int main(int argc, char* argv[])
 {
     try {
         Config cfg;
+        std::string modeArg = processingModeToString(Config{}.mode);
         std::string mapModeArg = mapModeToString(Config{}.mapMode);
         std::string algoModeArg = algoModeToString(Config{}.algoMode);
         std::string resultModeArg = resultModeToString(Config{}.resultMode);
@@ -3254,10 +4118,14 @@ int main(int argc, char* argv[])
             ("help,h", "Show help")
             ("input", po::value<std::string>(), "Input rasterized OME-Zarr root")
             ("output", po::value<std::string>(), "Output OME-Zarr root")
+            ("mode", po::value<std::string>(&modeArg)->default_value(processingModeToString(Config{}.mode)),
+             "Processing mode: chunk-alpha-wrap | legacy-slice")
             ("ignore-value", po::value<int>(&cfg.ignoreValue)->default_value(kDefaultIgnoreValue),
              "Ignore label value [1..254] (default 127)")
             ("alpha", po::value<double>(&cfg.alpha)->default_value(kDefaultAlpha),
-             "Outer boundary tightness parameter (default 0.005)")
+             "Legacy 2D alpha, or chunk alpha alias in chunk-alpha-wrap mode")
+            ("chunk-alpha", po::value<double>(&cfg.chunkAlpha)->default_value(0.0),
+             "Chunk alpha-wrap radius in compute-level voxels")
             ("n-angle-bins", po::value<int>(&cfg.nAngleBins)->default_value(kDefaultAngleBins),
              "Angular bins for polar boundary detection (default 72)")
             ("shrink-factor", po::value<double>(&cfg.shrinkFactor)->default_value(kDefaultShrink),
@@ -3357,6 +4225,7 @@ int main(int argc, char* argv[])
             cfg.profileJsonPath = vm["profile-json"].as<std::string>();
         }
 
+        cfg.mode = parseProcessingMode(modeArg);
         cfg.mapMode = parseMapMode(mapModeArg);
         cfg.algoMode = parseAlgoMode(algoModeArg);
         cfg.resultMode = parseResultMode(resultModeArg);
@@ -3376,6 +4245,21 @@ int main(int argc, char* argv[])
 
         const bool mapModeExplicit = vm.count("map-mode") > 0 && !vm["map-mode"].defaulted();
         const bool algoModeExplicit = vm.count("algo-mode") > 0 && !vm["algo-mode"].defaulted();
+        const bool resultModeExplicit =
+            vm.count("result-mode") > 0 && !vm["result-mode"].defaulted();
+        const bool alphaExplicit = vm.count("alpha") > 0 && !vm["alpha"].defaulted();
+        const bool chunkAlphaExplicit =
+            vm.count("chunk-alpha") > 0 && !vm["chunk-alpha"].defaulted();
+        const bool nAngleBinsExplicit =
+            vm.count("n-angle-bins") > 0 && !vm["n-angle-bins"].defaulted();
+        const bool shrinkFactorExplicit =
+            vm.count("shrink-factor") > 0 && !vm["shrink-factor"].defaulted();
+        const bool innerSmoothingExplicit =
+            vm.count("inner-smoothing-window") > 0 &&
+            !vm["inner-smoothing-window"].defaulted();
+        const bool outerSmoothingExplicit =
+            vm.count("outer-smoothing-window") > 0 &&
+            !vm["outer-smoothing-window"].defaulted();
         const bool fastAtan2Explicit =
             (vm.count("fast-atan2") > 0 && !vm["fast-atan2"].defaulted()) || fastAtan2LegacyAlias;
         const bool useSquaredDistExplicit =
@@ -3383,7 +4267,7 @@ int main(int argc, char* argv[])
         const bool chunkZSlabExplicit =
             (vm.count("chunk-z-slab") > 0 && !vm["chunk-z-slab"].defaulted()) || noChunkZSlab;
 
-        if (cfg.resultMode == ResultMode::fast) {
+        if (cfg.mode == ProcessingMode::legacySlice && cfg.resultMode == ResultMode::fast) {
             if (!fastAtan2Explicit) {
                 cfg.fastAtan2 = true;
             }
@@ -3399,10 +4283,40 @@ int main(int argc, char* argv[])
             if (!algoModeExplicit) {
                 cfg.algoMode = AlgoMode::polar;
             }
-        } else {
+        } else if (cfg.mode == ProcessingMode::legacySlice) {
             if (!chunkZSlabExplicit) {
                 cfg.chunkZSlab = true;
             }
+        }
+
+        if (!cfg.selfTest && cfg.mode == ProcessingMode::chunkAlphaWrap) {
+            if (cfg.skipOuter) {
+                throw std::runtime_error(
+                    "chunk-alpha-wrap supports only outer labeling; --skip-outer is not supported");
+            }
+            if (!cfg.skipInner) {
+                throw std::runtime_error(
+                    "chunk-alpha-wrap currently supports only outer labeling; pass --skip-inner");
+            }
+            if (nAngleBinsExplicit || shrinkFactorExplicit || innerSmoothingExplicit ||
+                outerSmoothingExplicit || algoModeExplicit || fastAtan2Explicit ||
+                useSquaredDistExplicit || mapModeExplicit || chunkZSlabExplicit ||
+                resultModeExplicit) {
+                throw std::runtime_error(
+                    "chunk-alpha-wrap does not support legacy 2D mask controls or mapping presets");
+            }
+            if (chunkAlphaExplicit && alphaExplicit &&
+                std::abs(cfg.chunkAlpha - cfg.alpha) > 1e-12) {
+                throw std::runtime_error(
+                    "--alpha and --chunk-alpha disagree in chunk-alpha-wrap mode");
+            }
+            if (!chunkAlphaExplicit && !alphaExplicit) {
+                throw std::runtime_error(
+                    "chunk-alpha-wrap requires --chunk-alpha (or --alpha as an alias)");
+            }
+            cfg.chunkAlpha = chunkAlphaExplicit ? cfg.chunkAlpha : cfg.alpha;
+        } else if (!cfg.selfTest && chunkAlphaExplicit) {
+            throw std::runtime_error("--chunk-alpha is only valid in chunk-alpha-wrap mode");
         }
 
         if (!cfg.selfTest) {
@@ -3420,17 +4334,22 @@ int main(int argc, char* argv[])
         if (cfg.ignoreValue <= 0 || cfg.ignoreValue >= 255) {
             throw std::runtime_error("--ignore-value must be in [1, 254]");
         }
-        if (cfg.nAngleBins < 8) {
+        if (cfg.mode == ProcessingMode::legacySlice && cfg.nAngleBins < 8) {
             throw std::runtime_error("--n-angle-bins must be >= 8");
         }
-        if (cfg.shrinkFactor <= 0.0 || cfg.shrinkFactor > 1.5) {
+        if (cfg.mode == ProcessingMode::legacySlice &&
+            (cfg.shrinkFactor <= 0.0 || cfg.shrinkFactor > 1.5)) {
             throw std::runtime_error("--shrink-factor must be in (0, 1.5]");
         }
         if (cfg.computeLevel < 0 || cfg.outputLevel < 0) {
             throw std::runtime_error("compute/output levels must be >= 0");
         }
-        if (cfg.innerSmoothingWindow < 1 || cfg.outerSmoothingWindow < 1) {
+        if (cfg.mode == ProcessingMode::legacySlice &&
+            (cfg.innerSmoothingWindow < 1 || cfg.outerSmoothingWindow < 1)) {
             throw std::runtime_error("smoothing windows must be >= 1");
+        }
+        if (!cfg.selfTest && cfg.mode == ProcessingMode::chunkAlphaWrap && cfg.chunkAlpha <= 0.0) {
+            throw std::runtime_error("--chunk-alpha must be > 0");
         }
         if (cfg.ramBudgetGb < 0.0) {
             throw std::runtime_error("--ram-budget-gb must be >= 0");
