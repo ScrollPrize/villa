@@ -288,7 +288,7 @@ private:
     // Called on the main thread when pinCoarsestLevel completes (background thread)
     void onPinComplete();
 
-    // Called when data bounds become valid after async coarsest-level load
+    // Called when volume bounds are available
     void onDataBoundsReady();
 
     // Center the viewport on the current surfacePtr
