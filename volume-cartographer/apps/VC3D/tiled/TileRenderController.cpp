@@ -182,7 +182,7 @@ void TileRenderController::drainResults()
         snapCamera.dsScaleIdx = result.actualLevel;
 
         SliceCacheKey cacheKey = SliceCacheKey::make(
-            result.worldKey, snapCamera, _paramsHash);
+            result.worldKey, snapCamera, result.cacheIdentity);
         _cache.put(cacheKey, pixmap);
 
         // Apply to scene directly via world key

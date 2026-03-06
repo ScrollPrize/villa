@@ -316,6 +316,7 @@ private:
 
     // --- Rendering state ---
     CompositeRenderSettings _compositeSettings;
+    uint64_t _surfaceContentVersion = 0;
     float _baseWindowLow = 0.0f;
     float _baseWindowHigh = 255.0f;
     bool _stretchValues = false;

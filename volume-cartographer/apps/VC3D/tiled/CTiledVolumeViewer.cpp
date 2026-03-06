@@ -332,6 +332,8 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
         _surfWeak = surf;
         _surfBBoxCache = {};  // invalidate bounding box cache
         if (!surf) {
+            _surfaceContentVersion = 0;
+            updateParamsHash();
             clearAllOverlayGroups();
             _tileScene->sceneCleared();
             _ov.cursor = nullptr;
@@ -344,16 +346,19 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
             // Grid will be rebuilt when new surface is set
         } else {
             invalidateVis();
-            if (!isEditUpdate) {
-                _camera.zOff = 0.0f;
-            }
+            if (isInPlaceQuadEditUpdate) {
+                ++_surfaceContentVersion;
+                updateParamsHash();
+            } else {
+                _surfaceContentVersion = 0;
+                updateParamsHash();
+                if (!isEditUpdate) {
+                    _camera.zOff = 0.0f;
+                }
 
-            // Clear rendered tile cache and visible tiles — the cache keys
-            // have no surface identifier so stale entries from the previous
-            // surface would be served as false hits.
-            _renderController->cancelAll();
-            _renderController->sliceCache().clear();
-            if (!isInPlaceQuadEditUpdate) {
+                // Full surface changes still need a full render reset.
+                _renderController->cancelAll();
+                _renderController->sliceCache().clear();
                 _tileScene->clearAll();
 
                 updateContentMinScale();
@@ -1018,6 +1023,7 @@ bool CTiledVolumeViewer::computeQuadPrefetchBBox(const std::shared_ptr<Surface>&
 void CTiledVolumeViewer::updateParamsHash()
 {
     auto h = utils::hash_combine_values(
+        _surfaceContentVersion,
         _baseWindowLow, _baseWindowHigh, _stretchValues,
         _baseColormapId, _useFastInterpolation,
         // Composite settings — all fields that affect rendered output
@@ -1050,6 +1056,7 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     TileRenderParams params;
     params.worldKey = wk;
     params.epoch = _camera.epoch;
+    params.cacheIdentity = _renderController ? _renderController->paramsHash() : 0;
 
     // Surface parameter ROI from world tile coordinates
     params.surfaceROI.x = wk.worldCol * _contentBounds.worldTileSize;
