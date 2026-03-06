@@ -576,19 +576,18 @@ void CTiledVolumeViewer::onDataBoundsReady()
         auto surf = _surfWeak.lock();
         auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
         if (plane) {
-            // Coordinate convention: Vec3f is (z, y, x)
-            cv::Vec3f center((db.minZ + db.maxZ) * 0.5f,
+            cv::Vec3f center((db.minX + db.maxX) * 0.5f,
                              (db.minY + db.maxY) * 0.5f,
-                             (db.minX + db.maxX) * 0.5f);
+                             (db.minZ + db.maxZ) * 0.5f);
             plane->setOrigin(center);
         }
 
         // Update focus POI — cascades to all axis-aligned viewers
         POI* focus = _state->poi("focus");
         if (focus) {
-            cv::Vec3f center((db.minZ + db.maxZ) * 0.5f,
+            cv::Vec3f center((db.minX + db.maxX) * 0.5f,
                              (db.minY + db.maxY) * 0.5f,
-                             (db.minX + db.maxX) * 0.5f);
+                             (db.minZ + db.maxZ) * 0.5f);
             focus->p = center;
             _state->setPOI("focus", focus);
         }
@@ -1112,24 +1111,16 @@ void CTiledVolumeViewer::onCursorMove(QPointF scene_loc)
     auto surf = _surfWeak.lock();
     if (!surf || !_state) return;
 
-    // Handle panning: if middle/right button is down, pan instead
-    if (_isPanning) {
-        QPoint currentPos = QCursor::pos();
-        QPoint delta = _lastPanPos - currentPos;
-        _lastPanPos = currentPos;
-        if (delta.x() != 0 || delta.y() != 0) {
-            panBy(-delta.x(), -delta.y());
+    auto updateCursorPoi = [this](const QPointF& cursorScenePos) {
+        cv::Vec3f p, n;
+        if (!sceneToVolumePN(p, n, cursorScenePos)) {
+            if (_ov.cursor) _ov.cursor->hide();
+            return;
         }
-        return;
-    }
 
-    cv::Vec3f p, n;
-    if (!sceneToVolumePN(p, n, scene_loc)) {
-        if (_ov.cursor) _ov.cursor->hide();
-    } else {
         if (_ov.cursor) {
             _ov.cursor->show();
-            _ov.cursor->setPos(scene_loc);
+            _ov.cursor->setPos(cursorScenePos);
         }
 
         POI* cursor = _state->poi("cursor");
@@ -1138,7 +1129,23 @@ void CTiledVolumeViewer::onCursorMove(QPointF scene_loc)
         cursor->n = n;
         cursor->surfaceId = _surfName;
         _state->setPOI("cursor", cursor);
+    };
+
+    // Handle panning: if middle/right button is down, pan instead
+    if (_isPanning) {
+        QPoint currentPos = QCursor::pos();
+        QPoint delta = _lastPanPos - currentPos;
+        _lastPanPos = currentPos;
+        if (delta.x() != 0 || delta.y() != 0) {
+            panBy(-delta.x(), -delta.y());
+        }
+
+        const QPoint viewportPos = fGraphicsView->viewport()->mapFromGlobal(currentPos);
+        updateCursorPoi(fGraphicsView->mapToScene(viewportPos));
+        return;
     }
+
+    updateCursorPoi(scene_loc);
 
     // Point highlight logic
     if (_pointCollection && _draggedPointId == 0) {
