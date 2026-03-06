@@ -238,6 +238,7 @@ void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
 
         _last_pan_position = QPoint(event->position().x(), event->position().y());
         event->accept();
+        return;
     }
 
     QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
