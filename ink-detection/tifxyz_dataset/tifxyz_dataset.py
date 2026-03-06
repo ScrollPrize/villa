@@ -567,6 +567,7 @@ if __name__ == "__main__":
     config_path = os.path.join(os.path.dirname(__file__), "example_config.json")
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
+    config["_config_dir"] = os.path.dirname(config_path)
 
     ds = TifxyzInkDataset(
         config,

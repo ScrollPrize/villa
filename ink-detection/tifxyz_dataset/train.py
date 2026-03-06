@@ -1,4 +1,5 @@
 import json
+import os
 import wandb
 import torch
 import numpy as np 
@@ -29,6 +30,7 @@ class TifxyzInkTrainer():
         
         with open(config_path, 'r') as f:
             config = json.load(f)
+        config["_config_dir"] = os.path.dirname(config_path)
 
         dynamo_plugin = TorchDynamoPlugin(
             backend   = "inductor",
@@ -72,4 +74,3 @@ class TifxyzInkTrainer():
         num_train   = num_patches - num_val
 
         raise NotImplementedError("Do not use this trainer, it is not done, it does nothing.")
-

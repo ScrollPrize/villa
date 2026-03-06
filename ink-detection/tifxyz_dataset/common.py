@@ -1,10 +1,58 @@
+import aiohttp
+import json
+import os
+
+import fsspec
 import numpy as np
+import zarr
 from vesuvius.neural_tracing.datasets.common import normalize_zscore
 
 try:
     from numba import njit
 except Exception:  # pragma: no cover - optional dependency
     njit = None
+
+
+def _resolve_auth_json_path(auth_json_path, config):
+    if auth_json_path is None:
+        return None
+
+    auth_json_path = os.path.expanduser(str(auth_json_path))
+    if os.path.isabs(auth_json_path):
+        return auth_json_path
+
+    config_dir = None if config is None else config.get("_config_dir")
+    if config_dir:
+        return os.path.join(str(config_dir), auth_json_path)
+    return os.path.abspath(auth_json_path)
+
+
+def load_volume_auth(auth_json_path, config=None):
+    resolved_path = _resolve_auth_json_path(auth_json_path, config)
+    if resolved_path is None:
+        return None, None
+
+    with open(resolved_path, "r", encoding="utf-8") as f:
+        auth = json.load(f)
+    return str(auth["username"]), str(auth["password"])
+
+
+def open_zarr(path, resolution, user, password):
+    if "volumes.aws.ash2txt.org" in path:
+        fs = fsspec.filesystem(
+            "https",
+            client_kwargs={"auth": aiohttp.BasicAuth(user, password)},
+        )
+        store = zarr.storage.FSStore(
+            path.rstrip("/"),
+            fs=fs,
+            mode="r",
+            check=False,
+            create=False,
+            exceptions=(KeyError, FileNotFoundError, PermissionError, OSError, aiohttp.ClientResponseError),
+        )
+        return zarr.open(store, path=str(resolution), mode="r")
+    return zarr.open(path, path=str(resolution), mode="r")
 
 
 def _empty_patch_generation_stats():

@@ -13,11 +13,12 @@ import vesuvius.tifxyz as tifxyz
 from .common import (
     _empty_patch_generation_stats,
     _fix_known_bottom_right_padding,
+    load_volume_auth,
+    open_zarr,
 )
 from vesuvius.neural_tracing.datasets.common import (
     _parse_z_range,
     _segment_overlaps_z_range,
-    open_zarr,
 )
 from vesuvius.neural_tracing.inference.generate_segment_cover_bboxes import (
     _generate_segment_cover_records,
@@ -216,11 +217,12 @@ def find_patches(
         volume_scale = dataset["volume_scale"]
 
         volume_auth_json = dataset.get("volume_auth_json", config.get("volume_auth_json"))
+        user, password = load_volume_auth(volume_auth_json, config=config)
         volume = open_zarr(
             volume_path,
-            scale=volume_scale,
-            auth_json_path=volume_auth_json,
-            config=config,
+            volume_scale,
+            user,
+            password,
         )
         segments_path = dataset["segments_path"]
         z_range = _parse_z_range(dataset.get("z_range", None))
