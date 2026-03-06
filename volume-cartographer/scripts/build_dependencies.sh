@@ -51,6 +51,7 @@ sudo dpkg-reconfigure -f noninteractive tzdata
 sudo apt-get install -y \
   build-essential git clang llvm ccache ninja-build lld cmake pkg-config \
   qt6-base-dev libboost-system-dev libboost-program-options-dev libceres-dev \
+  libcgal-dev \
   libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev \
   libcurl4-openssl-dev file curl unzip ca-certificates bzip2 wget fuse jq gimp \
   desktop-file-utils flex bison zlib1g-dev gfortran libopenblas-dev liblapack-dev \
