@@ -110,6 +110,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Render.hpp"
 #include "vc/core/util/NetworkFilesystem.hpp"
+#include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/cache/DiskStore.hpp"
 
 
@@ -123,6 +124,69 @@ using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 
 namespace
 {
+
+bool isRemoteTransformSource(const QString& source)
+{
+    const QString trimmed = source.trimmed();
+    return trimmed.startsWith("http://", Qt::CaseInsensitive) ||
+           trimmed.startsWith("https://", Qt::CaseInsensitive) ||
+           trimmed.startsWith("s3://", Qt::CaseInsensitive) ||
+           trimmed.startsWith("s3+", Qt::CaseInsensitive);
+}
+
+std::filesystem::path expandLocalTransformPath(const QString& source)
+{
+    QString path = source.trimmed();
+    if (path.startsWith("~/")) {
+        path.replace(0, 1, QDir::homePath());
+    } else if (path == "~") {
+        path = QDir::homePath();
+    }
+
+    std::filesystem::path fsPath = path.toStdString();
+    if (fsPath.is_relative()) {
+        fsPath = std::filesystem::absolute(fsPath);
+    }
+    return fsPath;
+}
+
+vc::cache::HttpAuth authForRemoteTransformSource(const QString& source)
+{
+    vc::cache::HttpAuth auth;
+    const auto resolved = vc::resolveRemoteUrl(source.trimmed().toStdString());
+    if (!resolved.useAwsSigv4) {
+        return auth;
+    }
+
+    auto getEnv = [](const char* name) -> std::string {
+        const char* value = std::getenv(name);
+        return value ? value : "";
+    };
+
+    auth.region = resolved.awsRegion;
+    auth.accessKey = getEnv("AWS_ACCESS_KEY_ID");
+    auth.secretKey = getEnv("AWS_SECRET_ACCESS_KEY");
+    auth.sessionToken = getEnv("AWS_SESSION_TOKEN");
+
+    if (auth.accessKey.empty() || auth.secretKey.empty()) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        const auto savedAccess = settings.value(vc3d::settings::aws::ACCESS_KEY).toString();
+        const auto savedSecret = settings.value(vc3d::settings::aws::SECRET_KEY).toString();
+        const auto savedToken = settings.value(vc3d::settings::aws::SESSION_TOKEN).toString();
+
+        if (!savedAccess.isEmpty() && !savedSecret.isEmpty()) {
+            auth.accessKey = savedAccess.toStdString();
+            auth.secretKey = savedSecret.toStdString();
+            auth.sessionToken = savedToken.toStdString();
+        }
+    }
+
+    if (!auth.accessKey.empty() && !auth.secretKey.empty()) {
+        auth.awsSigv4 = true;
+    }
+
+    return auth;
+}
 
 void ensureDockWidgetFeatures(QDockWidget* dock)
 {
@@ -1160,8 +1224,36 @@ std::shared_ptr<QuadSurface> CWindow::currentTransformSourceSurface() const
     return _transformPreviewSourceSurface;
 }
 
+QString CWindow::currentTransformSourceDescription() const
+{
+    if (!_customTransformSource.trimmed().isEmpty()) {
+        return _customTransformSource.trimmed();
+    }
+
+    const auto currentVolume = _state ? _state->currentVolume() : nullptr;
+    const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
+    if (currentVolume && currentVolume->isRemote() && !remoteTransformUrl.empty()) {
+        return QString::fromStdString(remoteTransformUrl);
+    }
+
+    if (currentVolume && !currentVolume->path().empty()) {
+        return QString::fromStdString((currentVolume->path() / "transform.json").string());
+    }
+
+    const auto localPath = localCurrentTransformJsonPath();
+    if (!localPath.empty()) {
+        return QString::fromStdString(localPath.string());
+    }
+
+    return {};
+}
+
 std::filesystem::path CWindow::localCurrentTransformJsonPath() const
 {
+    if (!_customTransformSource.trimmed().isEmpty()) {
+        return _customTransformLocalPath;
+    }
+
     if (!_state) {
         return {};
     }
@@ -1271,8 +1363,55 @@ void CWindow::ensureCurrentRemoteTransformJsonAsync()
         }));
 }
 
-std::filesystem::path CWindow::currentTransformJsonPath()
+bool CWindow::setCustomTransformSource(const QString& source, QString* errorMessage)
 {
+    const QString trimmed = source.trimmed();
+    if (trimmed.isEmpty()) {
+        _customTransformSource.clear();
+        _customTransformLocalPath.clear();
+        _customTransformTempDir.reset();
+        return true;
+    }
+
+    try {
+        std::filesystem::path resolvedPath;
+        if (isRemoteTransformSource(trimmed)) {
+            if (!_customTransformTempDir) {
+                _customTransformTempDir = std::make_unique<QTemporaryDir>();
+            }
+            if (!_customTransformTempDir || !_customTransformTempDir->isValid()) {
+                throw std::runtime_error("failed to create temporary directory for affine download");
+            }
+
+            const auto resolved = vc::resolveRemoteUrl(trimmed.toStdString());
+            const auto auth = authForRemoteTransformSource(trimmed);
+            const auto tempRoot = std::filesystem::path(_customTransformTempDir->path().toStdString());
+            resolvedPath = tempRoot / "custom_transform.json";
+            if (!vc::cache::httpDownloadFile(resolved.httpsUrl, resolvedPath, auth)) {
+                throw std::runtime_error("failed to download affine from the provided path");
+            }
+        } else {
+            resolvedPath = expandLocalTransformPath(trimmed);
+        }
+
+        loadAffineTransformMatrix(resolvedPath);
+        _customTransformSource = trimmed;
+        _customTransformLocalPath = std::move(resolvedPath);
+        return true;
+    } catch (const std::exception& ex) {
+        if (errorMessage) {
+            *errorMessage = QString::fromUtf8(ex.what());
+        }
+        return false;
+    }
+}
+
+std::filesystem::path CWindow::currentTransformJsonPath(bool allowRemoteFetch)
+{
+    if (!_customTransformSource.trimmed().isEmpty()) {
+        return _customTransformLocalPath;
+    }
+
     if (const auto localTransformPath = localCurrentTransformJsonPath();
         !localTransformPath.empty()) {
         const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
@@ -1302,6 +1441,10 @@ std::filesystem::path CWindow::currentTransformJsonPath()
 
     const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
     const auto localTransformPath = volumePath / "transform.json";
+
+    if (!allowRemoteFetch) {
+        return {};
+    }
 
     if (vc::cache::httpDownloadFile(remoteTransformUrl,
                                     localTransformPath,
@@ -1351,8 +1494,7 @@ bool CWindow::applyTransformPreview(bool allowRemoteFetch)
         return false;
     }
 
-    const auto transformPath = allowRemoteFetch ? currentTransformJsonPath()
-                                                : localCurrentTransformJsonPath();
+    const auto transformPath = currentTransformJsonPath(allowRemoteFetch);
     const int scale = _transformScaleSpin ? _transformScaleSpin->value() : 1;
     std::optional<cv::Matx44d> matrix;
     if (!transformPath.empty() && std::filesystem::exists(transformPath)) {
@@ -1387,7 +1529,7 @@ bool CWindow::applyTransformPreview(bool allowRemoteFetch)
 void CWindow::refreshTransformsPanelState()
 {
     if (!_previewTransformCheck || !_invertTransformCheck || !_transformScaleSpin ||
-        !_saveTransformedButton || !_transformStatusLabel) {
+        !_loadAffineButton || !_saveTransformedButton || !_transformStatusLabel) {
         return;
     }
 
@@ -1400,9 +1542,10 @@ void CWindow::refreshTransformsPanelState()
     const bool hasScaleOnlyTransform = scale != 1;
     const bool previewEnabled = sourceSurface && !editingEnabled && (hasTransform || hasScaleOnlyTransform);
     const bool saveEnabled = previewEnabled && sourceSurface && !sourceSurface->path.empty();
+    const bool hasCustomTransform = !_customTransformSource.trimmed().isEmpty();
     const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
     RemoteTransformFetchState remoteFetchState = RemoteTransformFetchState::Unknown;
-    if (currentVolume && currentVolume->isRemote() && !remoteTransformUrl.empty()) {
+    if (!hasCustomTransform && currentVolume && currentVolume->isRemote() && !remoteTransformUrl.empty()) {
         if (hasTransform) {
             _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
         } else {
@@ -1414,15 +1557,7 @@ void CWindow::refreshTransformsPanelState()
         }
     }
 
-    QString transformLocation;
-    if (currentVolume && !currentVolume->path().empty()) {
-        transformLocation = QString::fromStdString((currentVolume->path() / "transform.json").string());
-    } else if (!transformPath.empty()) {
-        transformLocation = QString::fromStdString(transformPath.string());
-    }
-    if (currentVolume && currentVolume->isRemote() && !remoteTransformUrl.empty()) {
-        transformLocation = QString::fromStdString(remoteTransformUrl);
-    }
+    const QString transformLocation = currentTransformSourceDescription();
 
     QString statusText;
     if (!_state || !_state->vpkg()) {
@@ -1444,18 +1579,30 @@ void CWindow::refreshTransformsPanelState()
         }
     } else if (!hasTransform) {
         if (hasScaleOnlyTransform) {
-            statusText = tr("Scaling points by %1 before affine transform. No transform.json found at %2.")
-                .arg(scale)
-                .arg(transformLocation);
+            statusText = hasCustomTransform
+                ? tr("Scaling points by %1. No affine was loaded from %2.")
+                      .arg(scale)
+                      .arg(transformLocation)
+                : tr("Scaling points by %1 before affine transform. No transform.json found at %2.")
+                      .arg(scale)
+                      .arg(transformLocation);
         } else {
-            statusText = tr("No transform.json found at %1")
-                .arg(transformLocation);
+            statusText = hasCustomTransform
+                ? tr("No affine was loaded from %1")
+                      .arg(transformLocation)
+                : tr("No transform.json found at %1")
+                      .arg(transformLocation);
         }
     } else {
-        statusText = tr("Using %1%2 with scale %3")
-            .arg(transformLocation,
-                 (_invertTransformCheck->isChecked() ? tr(" (inverted)") : QString()))
-            .arg(scale);
+        statusText = hasCustomTransform
+            ? tr("Using custom affine %1%2 with scale %3")
+                  .arg(transformLocation,
+                       (_invertTransformCheck->isChecked() ? tr(" (inverted)") : QString()))
+                  .arg(scale)
+            : tr("Using %1%2 with scale %3")
+                  .arg(transformLocation,
+                       (_invertTransformCheck->isChecked() ? tr(" (inverted)") : QString()))
+                  .arg(scale);
     }
 
     if (!previewEnabled && _previewTransformCheck->isChecked()) {
@@ -1481,6 +1628,7 @@ void CWindow::refreshTransformsPanelState()
     _previewTransformCheck->setEnabled(previewEnabled);
     _invertTransformCheck->setEnabled(!editingEnabled && hasTransform);
     _transformScaleSpin->setEnabled(sourceSurface && !editingEnabled);
+    _loadAffineButton->setEnabled(!editingEnabled);
     _saveTransformedButton->setEnabled(saveEnabled);
     _transformStatusLabel->setText(statusText);
 }
@@ -1539,7 +1687,9 @@ void CWindow::onSaveTransformedRequested()
     const bool hasTransform = !transformPath.empty() && std::filesystem::exists(transformPath);
     if (!hasTransform && scale == 1) {
         QMessageBox::warning(this, tr("Missing Transform"),
-                             tr("No transform.json was found for the current volume, and scale is set to 1."));
+                             _customTransformSource.trimmed().isEmpty()
+                                 ? tr("No transform.json was found for the current volume, and scale is set to 1.")
+                                 : tr("The selected affine could not be loaded, and scale is set to 1."));
         return;
     }
 
@@ -1628,6 +1778,43 @@ void CWindow::onSaveTransformedRequested()
     }
 
     statusBar()->showMessage(tr("Saved transformed surface as '%1'.").arg(newName), 5000);
+    refreshTransformsPanelState();
+}
+
+void CWindow::onLoadAffineRequested()
+{
+    const QString promptText = tr("Enter a local path or URL for an affine JSON (http://, https://, s3://).\n"
+                                  "Leave blank to use the current volume transform.json.");
+    bool accepted = false;
+    const QString source = QInputDialog::getText(this,
+                                                 tr("Load Affine"),
+                                                 promptText,
+                                                 QLineEdit::Normal,
+                                                 _customTransformSource,
+                                                 &accepted).trimmed();
+    if (!accepted) {
+        return;
+    }
+
+    QString errorMessage;
+    if (!setCustomTransformSource(source, &errorMessage)) {
+        QMessageBox::warning(this,
+                             tr("Load Affine Failed"),
+                             tr("Failed to load affine from %1: %2")
+                                 .arg(source.isEmpty() ? tr("(empty path)") : source, errorMessage));
+        return;
+    }
+
+    if (source.isEmpty() && _previewTransformCheck && _previewTransformCheck->isChecked()) {
+        currentTransformJsonPath();
+    }
+
+    if (source.isEmpty()) {
+        statusBar()->showMessage(tr("Using the current volume transform.json."), 5000);
+    } else {
+        statusBar()->showMessage(tr("Loaded affine from %1").arg(source), 5000);
+    }
+
     refreshTransformsPanelState();
 }
 
@@ -1884,23 +2071,60 @@ bool CWindow::centerFocusOnCursor()
         return false;
     }
 
-    // Get fresh volume position from the active viewer's current cursor
-    // location, rather than relying on the stale "cursor" POI which is only
-    // updated on mouse move and becomes outdated after the view shifts.
-    auto* subWindow = mdiArea->activeSubWindow();
-    if (subWindow) {
-        if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-            auto* gv = viewer->fGraphicsView;
-            if (gv && gv->viewport()) {
-                QPoint globalPos = QCursor::pos();
-                QPoint viewportPos = gv->viewport()->mapFromGlobal(globalPos);
-                if (gv->viewport()->rect().contains(viewportPos)) {
-                    QPointF scenePos = gv->mapToScene(viewportPos);
-                    cv::Vec3f p, n;
-                    if (viewer->sceneToVolumePN(p, n, scenePos)) {
-                        return centerFocusAt(p, n, viewer->surfName(), true);
-                    }
+    const QPoint globalPos = QCursor::pos();
+    auto tryCenterFromViewer = [&](CTiledVolumeViewer* viewer) -> bool {
+        if (!viewer || !viewer->isVisible()) {
+            return false;
+        }
+
+        auto* gv = viewer->fGraphicsView;
+        auto* viewport = gv ? gv->viewport() : nullptr;
+        if (!viewport) {
+            return false;
+        }
+
+        const QPoint viewportPos = viewport->mapFromGlobal(globalPos);
+        if (!viewport->rect().contains(viewportPos)) {
+            return false;
+        }
+
+        cv::Vec3f p, n;
+        const QPointF scenePos = gv->mapToScene(viewportPos);
+        if (!viewer->sceneToVolumePN(p, n, scenePos)) {
+            return false;
+        }
+
+        return centerFocusAt(p, n, viewer->surfName(), true);
+    };
+
+    // Prefer the viewer actually under the mouse cursor. With tiled MDI
+    // windows, the active subwindow can lag behind the hovered viewer, which
+    // makes the focus jump use the wrong scene transform.
+    if (QWidget* hoveredWidget = QApplication::widgetAt(globalPos)) {
+        for (QWidget* widget = hoveredWidget; widget; widget = widget->parentWidget()) {
+            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(widget)) {
+                if (tryCenterFromViewer(viewer)) {
+                    return true;
                 }
+                break;
+            }
+        }
+    }
+
+    if (_viewerManager) {
+        for (auto* viewer : _viewerManager->viewers()) {
+            if (tryCenterFromViewer(viewer)) {
+                return true;
+            }
+        }
+    }
+
+    // Fall back to the active viewer if the cursor isn't currently over any
+    // tiled viewport.
+    if (auto* subWindow = mdiArea->activeSubWindow()) {
+        if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
+            if (tryCenterFromViewer(viewer)) {
+                return true;
             }
         }
     }
@@ -2443,6 +2667,10 @@ void CWindow::CreateWidgets(void)
     transformScaleRow->addWidget(_transformScaleSpin);
     transformsLayout->addLayout(transformScaleRow);
 
+    _loadAffineButton = new QPushButton(tr("Load Affine"), transformsContainer);
+    _loadAffineButton->setToolTip(tr("Load an affine JSON from a local path or URL. Leave the dialog blank to return to the current volume transform."));
+    transformsLayout->addWidget(_loadAffineButton);
+
     _saveTransformedButton = new QPushButton(tr("Save Transformed"), transformsContainer);
     transformsLayout->addWidget(_saveTransformedButton);
 
@@ -2457,6 +2685,8 @@ void CWindow::CreateWidgets(void)
             this, [this](bool) { refreshTransformsPanelState(); });
     connect(_transformScaleSpin, QOverload<int>::of(&QSpinBox::valueChanged),
             this, [this](int) { refreshTransformsPanelState(); });
+    connect(_loadAffineButton, &QPushButton::clicked,
+            this, &CWindow::onLoadAffineRequested);
     connect(_saveTransformedButton, &QPushButton::clicked,
             this, &CWindow::onSaveTransformedRequested);
 

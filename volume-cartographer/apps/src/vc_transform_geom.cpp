@@ -12,6 +12,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -20,6 +21,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace po = boost::program_options;
 using json = nlohmann::json;
@@ -41,6 +43,104 @@ static int count_valid_points(const cv::Mat_<cv::Vec3f>& points)
         }
     }
     return valid_count;
+}
+
+static inline cv::Vec3d cast_to_double(const cv::Vec3f& value);
+
+struct GridAxisSpacing {
+    double x = std::numeric_limits<double>::quiet_NaN();
+    double y = std::numeric_limits<double>::quiet_NaN();
+    int x_count = 0;
+    int y_count = 0;
+};
+
+static inline bool is_valid_surface_point(const cv::Vec3f& p)
+{
+    return p[0] != -1.f
+        && std::isfinite(p[0])
+        && std::isfinite(p[1])
+        && std::isfinite(p[2]);
+}
+
+static double median_value(std::vector<double>& values)
+{
+    if (values.empty()) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    const auto mid = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
+    std::nth_element(values.begin(), mid, values.end());
+    double median = *mid;
+    if ((values.size() % 2) == 0) {
+        const auto left_mid = std::max_element(values.begin(), mid);
+        median = 0.5 * (median + *left_mid);
+    }
+    return median;
+}
+
+static GridAxisSpacing measure_grid_axis_spacing(const cv::Mat_<cv::Vec3f>& points)
+{
+    GridAxisSpacing spacing;
+    if (points.rows < 2 || points.cols < 2) {
+        return spacing;
+    }
+
+    int row_start = static_cast<int>(points.rows * 0.1);
+    int row_end = static_cast<int>(points.rows * 0.9);
+    int col_start = static_cast<int>(points.cols * 0.1);
+    int col_end = static_cast<int>(points.cols * 0.9);
+    int step = 4;
+
+    if (points.rows < 20 || points.cols < 20) {
+        row_start = 1;
+        row_end = points.rows;
+        col_start = 1;
+        col_end = points.cols;
+        step = 1;
+    } else {
+        row_start = std::max(1, row_start);
+        col_start = std::max(1, col_start);
+        row_end = std::max(row_start + 1, row_end);
+        col_end = std::max(col_start + 1, col_end);
+    }
+
+    std::vector<double> horizontal;
+    std::vector<double> vertical;
+    horizontal.reserve(static_cast<size_t>((row_end - row_start) * (col_end - col_start)) / 4 + 1);
+    vertical.reserve(horizontal.capacity());
+
+    for (int row = row_start; row < row_end; row += step) {
+        for (int col = col_start; col < col_end; col += step) {
+            const cv::Vec3f& p = points(row, col);
+            if (!is_valid_surface_point(p)) {
+                continue;
+            }
+
+            const cv::Vec3f& left = points(row, col - 1);
+            if (is_valid_surface_point(left)) {
+                const cv::Vec3d delta = cast_to_double(p) - cast_to_double(left);
+                const double dist = cv::norm(delta);
+                if (std::isfinite(dist) && dist > 0.0) {
+                    horizontal.push_back(dist);
+                }
+            }
+
+            const cv::Vec3f& up = points(row - 1, col);
+            if (is_valid_surface_point(up)) {
+                const cv::Vec3d delta = cast_to_double(p) - cast_to_double(up);
+                const double dist = cv::norm(delta);
+                if (std::isfinite(dist) && dist > 0.0) {
+                    vertical.push_back(dist);
+                }
+            }
+        }
+    }
+
+    spacing.x_count = static_cast<int>(horizontal.size());
+    spacing.y_count = static_cast<int>(vertical.size());
+    spacing.x = median_value(horizontal);
+    spacing.y = median_value(vertical);
+    return spacing;
 }
 
 static inline float clamp_to_float(double value, float fallback, int& replacement_count)
@@ -252,18 +352,18 @@ static int run_tifxyz(const std::filesystem::path& inDir,
     }
 
     const cv::Vec2f original_scale = surf->_scale;
+    cv::Mat_<cv::Vec3f>* P = surf->rawPointsPtr();
+    const GridAxisSpacing baseline_spacing = measure_grid_axis_spacing(*P);
     double affine_scale_factor = 1.0;
     const bool has_uniform_affine_scale = AA && affine_uniform_scale_factor(*AA, affine_scale_factor);
-    const double total_spacing_scale = scale_before_affine * scale_after_affine
-                                     * (has_uniform_affine_scale ? affine_scale_factor : 1.0);
     if (AA && !has_uniform_affine_scale) {
         std::cerr << "Warning: affine contains non-uniform scaling or shear; "
-                  << "preserving tifxyz sample spacing only accounts for the explicit "
-                  << "uniform scale-before/after factors." << std::endl;
+                  << "applying best-effort axis-wise tifxyz regridding from measured "
+                  << "neighbor spacing. tifxyz cannot encode shear/off-axis metric exactly."
+                  << std::endl;
     }
 
     int sanitize_replacements = 0;
-    cv::Mat_<cv::Vec3f>* P = surf->rawPointsPtr();
     for (int j = 0; j < P->rows; ++j) {
         for (int i = 0; i < P->cols; ++i) {
             cv::Vec3f& p = (*P)(j,i);
@@ -315,17 +415,51 @@ static int run_tifxyz(const std::filesystem::path& inDir,
         return 7;
     }
 
-    // Preserve tifxyz sample spacing across uniform scaling by resampling the grid
-    // instead of only moving the existing samples farther apart in 3D.
-    if (std::isfinite(total_spacing_scale) && total_spacing_scale > 0.0
-        && std::abs(total_spacing_scale - 1.0) > 1e-4) {
-        const float resample_factor = static_cast<float>(total_spacing_scale);
-        surf->resample(resample_factor);
+    const GridAxisSpacing transformed_spacing = measure_grid_axis_spacing(*P);
+    double spacing_scale_x = std::numeric_limits<double>::quiet_NaN();
+    double spacing_scale_y = std::numeric_limits<double>::quiet_NaN();
+    bool have_measured_spacing = false;
+    if (baseline_spacing.x_count > 0 && transformed_spacing.x_count > 0
+        && std::isfinite(baseline_spacing.x) && baseline_spacing.x > 0.0
+        && std::isfinite(transformed_spacing.x) && transformed_spacing.x > 0.0) {
+        spacing_scale_x = transformed_spacing.x / baseline_spacing.x;
+        have_measured_spacing = true;
+    }
+    if (baseline_spacing.y_count > 0 && transformed_spacing.y_count > 0
+        && std::isfinite(baseline_spacing.y) && baseline_spacing.y > 0.0
+        && std::isfinite(transformed_spacing.y) && transformed_spacing.y > 0.0) {
+        spacing_scale_y = transformed_spacing.y / baseline_spacing.y;
+        have_measured_spacing = true;
+    }
+
+    if (!std::isfinite(spacing_scale_x) || spacing_scale_x <= 0.0) {
+        const double fallback = scale_before_affine * scale_after_affine
+                              * (has_uniform_affine_scale ? affine_scale_factor : 1.0);
+        spacing_scale_x = fallback;
+    }
+    if (!std::isfinite(spacing_scale_y) || spacing_scale_y <= 0.0) {
+        const double fallback = scale_before_affine * scale_after_affine
+                              * (has_uniform_affine_scale ? affine_scale_factor : 1.0);
+        spacing_scale_y = fallback;
+    }
+
+    // Preserve tifxyz sample spacing by regridding the raster, not just moving
+    // the existing XYZ samples farther apart in 3D.
+    if (std::isfinite(spacing_scale_x) && spacing_scale_x > 0.0
+        && std::isfinite(spacing_scale_y) && spacing_scale_y > 0.0
+        && (std::abs(spacing_scale_x - 1.0) > 1e-4 || std::abs(spacing_scale_y - 1.0) > 1e-4)) {
+        surf->resample(static_cast<float>(spacing_scale_x), static_cast<float>(spacing_scale_y), cv::INTER_LINEAR);
         surf->_scale = original_scale;
         surf->invalidateCache();
-        std::cout << "Resampled tifxyz grid by " << total_spacing_scale
+        std::cout << "Resampled tifxyz grid by [" << spacing_scale_x << ", " << spacing_scale_y << "]"
                   << " to preserve original sample spacing metadata ["
-                  << original_scale[0] << ", " << original_scale[1] << "]" << std::endl;
+                  << original_scale[0] << ", " << original_scale[1] << "]";
+        if (have_measured_spacing) {
+            std::cout << " using measured neighbor spacing";
+        } else {
+            std::cout << " using affine fallback";
+        }
+        std::cout << std::endl;
     }
 
     // Points were modified in-place; invalidate cached derived geometry so bbox
