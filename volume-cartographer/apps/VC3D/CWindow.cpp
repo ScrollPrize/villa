@@ -2231,6 +2231,10 @@ void CWindow::CreateWidgets(void)
                 QApplication::clipboard()->setText(path);
                 statusBar()->showMessage(tr("Copied segment path to clipboard: %1").arg(path), 3000);
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::fetchRemoteChunksRequested,
+            this, [this](const QString& segmentId) {
+                _segmentationCommandHandler->onFetchRemoteChunks(segmentId.toStdString());
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::renderSegmentRequested,
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onRenderSegment(segmentId.toStdString());

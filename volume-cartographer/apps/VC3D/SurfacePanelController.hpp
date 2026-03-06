@@ -115,6 +115,7 @@ signals:
     void filtersApplied(int hiddenCount);
     void surfaceActivated(const QString& id, QuadSurface* surface);
     void copySegmentPathRequested(const QString& segmentId);
+    void fetchRemoteChunksRequested(const QString& segmentId);
     void renderSegmentRequested(const QString& segmentId);
     void growSegmentRequested(const QString& segmentId);
     void addOverlapRequested(const QString& segmentId);

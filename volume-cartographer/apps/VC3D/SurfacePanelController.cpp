@@ -721,6 +721,15 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit copySegmentPathRequested(segmentId);
     });
 
+    const bool canFetchRemoteChunks =
+        _state && _state->currentVolume() && _state->currentVolume()->isRemote();
+    if (canFetchRemoteChunks) {
+        QAction* fetchRemoteChunksAction = contextMenu.addAction(tr("Fetch remote chunks"));
+        connect(fetchRemoteChunksAction, &QAction::triggered, this, [this, segmentId]() {
+            emit fetchRemoteChunksRequested(segmentId);
+        });
+    }
+
     contextMenu.addSeparator();
 
     QMenu* seedMenu = contextMenu.addMenu(tr("Run Seed"));
