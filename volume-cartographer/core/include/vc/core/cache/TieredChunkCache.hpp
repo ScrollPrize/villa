@@ -90,6 +90,7 @@ public:
 
     // Schedule background fetch from cold/ice tier. No-op if already cached.
     void prefetch(const ChunkKey& key);
+    void prefetch(const std::vector<ChunkKey>& keys);
 
     // Prefetch all chunks needed for a region at a given level.
     void prefetchRegion(int level, int iz0, int iy0, int ix0,
@@ -148,6 +149,10 @@ public:
     [[nodiscard]] bool areAllCachedInRegion(int level,
                               int iz0, int iy0, int ix0,
                               int iz1, int iy1, int ix1) const;
+
+    // Count how many of the given keys are already available in hot/warm tiers
+    // or are negative-cached.
+    [[nodiscard]] size_t countAvailable(const std::vector<ChunkKey>& keys) const;
 
     // --- Notifications ---
 

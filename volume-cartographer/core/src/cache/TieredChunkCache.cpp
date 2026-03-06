@@ -336,6 +336,23 @@ void TieredChunkCache::prefetch(const ChunkKey& key)
     ioPool_.submit(key);
 }
 
+void TieredChunkCache::prefetch(const std::vector<ChunkKey>& keys)
+{
+    if (keys.empty()) return;
+
+    std::vector<ChunkKey> submitKeys;
+    submitKeys.reserve(keys.size());
+    for (const auto& key : keys) {
+        if (!isLocallyAvailable(key)) {
+            submitKeys.push_back(key);
+        }
+    }
+
+    if (!submitKeys.empty()) {
+        ioPool_.submit(submitKeys);
+    }
+}
+
 void TieredChunkCache::prefetchRegion(
     int level, int iz0, int iy0, int ix0, int iz1, int iy1, int ix1)
 {
@@ -532,6 +549,17 @@ bool TieredChunkCache::areAllCachedInRegion(
         }
     }
     return true;
+}
+
+size_t TieredChunkCache::countAvailable(const std::vector<ChunkKey>& keys) const
+{
+    size_t available = 0;
+    for (const auto& key : keys) {
+        if (isLocallyAvailable(key)) {
+            available++;
+        }
+    }
+    return available;
 }
 
 TieredChunkCache::ChunkReadyCallbackId

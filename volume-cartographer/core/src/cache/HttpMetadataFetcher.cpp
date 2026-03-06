@@ -13,6 +13,8 @@
 
 namespace vc::cache {
 
+static constexpr const char* kRemoteSourceFile = ".remote_source.json";
+
 // ---- curl helpers -----------------------------------------------------------
 
 #ifdef VC_USE_CURL
@@ -421,6 +423,15 @@ static std::string readFile(const std::filesystem::path& path)
     return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
 }
 
+static void writeRemoteSourceMarker(
+    const std::filesystem::path& stagingDir,
+    const std::string& baseUrl)
+{
+    nlohmann::json marker;
+    marker["url"] = baseUrl;
+    writeFile(stagingDir / kRemoteSourceFile, marker.dump(2));
+}
+
 // Check if staging dir already has valid cached metadata (meta.json + at least 0/.zarray).
 // If so, return the info without hitting the network.
 static std::optional<RemoteZarrInfo> tryLoadCachedMetadata(
@@ -494,6 +505,7 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
 
     // Try cached metadata first — avoids network round-trips on subsequent opens
     if (auto cached = tryLoadCachedMetadata(baseUrl, stagingDir)) {
+        writeRemoteSourceMarker(stagingDir, baseUrl);
         return *cached;
     }
 
@@ -606,6 +618,7 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
     meta["max"] = 255;
 
     writeFile(stagingDir / "meta.json", meta.dump(2));
+    writeRemoteSourceMarker(stagingDir, baseUrl);
 
     if (auto* log = cacheDebugLog())
         std::fprintf(log, "[REMOTE] Metadata complete: %d levels, shape=[%d, %d, %d] delimiter='%s'\n",
