@@ -2071,23 +2071,60 @@ bool CWindow::centerFocusOnCursor()
         return false;
     }
 
-    // Get fresh volume position from the active viewer's current cursor
-    // location, rather than relying on the stale "cursor" POI which is only
-    // updated on mouse move and becomes outdated after the view shifts.
-    auto* subWindow = mdiArea->activeSubWindow();
-    if (subWindow) {
-        if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-            auto* gv = viewer->fGraphicsView;
-            if (gv && gv->viewport()) {
-                QPoint globalPos = QCursor::pos();
-                QPoint viewportPos = gv->viewport()->mapFromGlobal(globalPos);
-                if (gv->viewport()->rect().contains(viewportPos)) {
-                    QPointF scenePos = gv->mapToScene(viewportPos);
-                    cv::Vec3f p, n;
-                    if (viewer->sceneToVolumePN(p, n, scenePos)) {
-                        return centerFocusAt(p, n, viewer->surfName(), true);
-                    }
+    const QPoint globalPos = QCursor::pos();
+    auto tryCenterFromViewer = [&](CTiledVolumeViewer* viewer) -> bool {
+        if (!viewer || !viewer->isVisible()) {
+            return false;
+        }
+
+        auto* gv = viewer->fGraphicsView;
+        auto* viewport = gv ? gv->viewport() : nullptr;
+        if (!viewport) {
+            return false;
+        }
+
+        const QPoint viewportPos = viewport->mapFromGlobal(globalPos);
+        if (!viewport->rect().contains(viewportPos)) {
+            return false;
+        }
+
+        cv::Vec3f p, n;
+        const QPointF scenePos = gv->mapToScene(viewportPos);
+        if (!viewer->sceneToVolumePN(p, n, scenePos)) {
+            return false;
+        }
+
+        return centerFocusAt(p, n, viewer->surfName(), true);
+    };
+
+    // Prefer the viewer actually under the mouse cursor. With tiled MDI
+    // windows, the active subwindow can lag behind the hovered viewer, which
+    // makes the focus jump use the wrong scene transform.
+    if (QWidget* hoveredWidget = QApplication::widgetAt(globalPos)) {
+        for (QWidget* widget = hoveredWidget; widget; widget = widget->parentWidget()) {
+            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(widget)) {
+                if (tryCenterFromViewer(viewer)) {
+                    return true;
                 }
+                break;
+            }
+        }
+    }
+
+    if (_viewerManager) {
+        for (auto* viewer : _viewerManager->viewers()) {
+            if (tryCenterFromViewer(viewer)) {
+                return true;
+            }
+        }
+    }
+
+    // Fall back to the active viewer if the cursor isn't currently over any
+    // tiled viewport.
+    if (auto* subWindow = mdiArea->activeSubWindow()) {
+        if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
+            if (tryCenterFromViewer(viewer)) {
+                return true;
             }
         }
     }
