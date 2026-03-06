@@ -550,6 +550,7 @@ static bool prefetchChunkKeys(
     auto start = std::chrono::steady_clock::now();
     auto lastPrint = start;
     size_t available = cache->countAvailable(keys);
+    size_t lastAvailable = available;
     size_t idleRetries = 0;
 
     cache->prefetch(keys);
@@ -579,7 +580,8 @@ static bool prefetchChunkKeys(
 
         if (available >= keys.size()) break;
 
-        if (cache->stats().ioPending == 0) {
+        auto stats = cache->stats();
+        if (stats.ioPending == 0 && available == lastAvailable) {
             idleRetries++;
             if (idleRetries > 3) {
                 if (!g_logFile) std::fprintf(stderr, "\n");
@@ -592,6 +594,8 @@ static bool prefetchChunkKeys(
         } else {
             idleRetries = 0;
         }
+
+        lastAvailable = available;
     }
 
     if (!g_logFile) std::fprintf(stderr, "\n");
