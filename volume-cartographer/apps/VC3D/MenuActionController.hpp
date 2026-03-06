@@ -12,6 +12,7 @@ class QDialog;
 class QMenu;
 class QMenuBar;
 class CWindow;
+class Volume;
 
 class MenuActionController : public QObject
 {
@@ -28,6 +29,7 @@ public:
     void removeRecentVolpkgEntry(const QString& path);
     void refreshRecentMenu();
     void openVolpkgAt(const QString& path);
+    void loadAttachedRemoteVolumesForCurrentPackage();
     void triggerTeleaInpaint();
 
 private slots:
@@ -35,6 +37,7 @@ private slots:
     void openRecentVolpkg();
     void openLocalZarr();
     void openRemoteVolume();
+    void attachRemoteZarr();
     void openRecentRemoteVolume();
     void showSettingsDialog();
     void showAboutDialog();
@@ -62,8 +65,16 @@ private:
     void refreshRecentRemoteMenu();
     void ensureRecentRemoteActions();
     void openRemoteUrl(const QString& url);
+    void attachRemoteZarrUrl(const QString& url, bool persistEntry = true);
     void openRemoteZarr(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
     void openRemoteScroll(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
+    bool tryResolveRemoteAuth(const QString& url,
+                              vc::cache::HttpAuth* authOut,
+                              bool allowPrompt,
+                              QString* errorMessage = nullptr) const;
+    QString remoteCacheDirectory() const;
+    QString remoteVolumeRegistryPath() const;
+    void persistAttachedRemoteVolume(const QString& url, const std::shared_ptr<Volume>& volume);
 
     CWindow* _window{nullptr};
 
@@ -79,6 +90,7 @@ private:
     QAction* _openAct{nullptr};
     QAction* _openLocalZarrAct{nullptr};
     QAction* _openRemoteAct{nullptr};
+    QAction* _attachRemoteZarrAct{nullptr};
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     std::array<QAction*, kMaxRecentRemote> _recentRemoteActs{};
     QAction* _settingsAct{nullptr};

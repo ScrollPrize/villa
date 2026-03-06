@@ -1010,6 +1010,25 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     _axisAlignedSliceController->applyOrientation(_state ? _state->surface("segmentation").get() : nullptr);
 }
 
+bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
+                                           const QString& preferredVolumeId)
+{
+    if (!_state || !_state->vpkg() || !volume) {
+        return false;
+    }
+
+    if (!_state->vpkg()->addVolume(volume)) {
+        return false;
+    }
+
+    refreshCurrentVolumePackageUi(preferredVolumeId.isEmpty()
+                                      ? QString::fromStdString(volume->id())
+                                      : preferredVolumeId,
+                                  false);
+    UpdateView();
+    return true;
+}
+
 void CWindow::setRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces)
 {
     if (surfaces.empty()) return;
@@ -1027,6 +1046,55 @@ void CWindow::setRemoteSurfaces(const std::vector<std::pair<std::string, std::sh
     }
 
     emit _state->surfacesLoaded();
+}
+
+void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
+                                            bool reloadSurfaces)
+{
+    if (!_state || !_state->vpkg()) {
+        return;
+    }
+
+    if (_segmentationWidget) {
+        _segmentationWidget->setVolumePackagePath(_state->vpkgPath());
+    }
+
+    refreshVolumeSelectionUi(preferredVolumeId);
+    if (!_state->vpkg()->hasVolumes()) {
+        Logger()->info("Opened volpkg '{}' with no volumes", _state->vpkgPath().toStdString());
+        statusBar()->showMessage(tr("Opened volume package with no volumes."), 5000);
+    }
+
+    if (_volumeOverlay) {
+        _volumeOverlay->setVolumePkg(_state->vpkg(), _state->vpkgPath());
+    }
+
+    {
+        const QSignalBlocker blocker{cmbSegmentationDir};
+        cmbSegmentationDir->clear();
+
+        auto availableDirs = _state->vpkg()->getAvailableSegmentationDirectories();
+        for (const auto& dirName : availableDirs) {
+            cmbSegmentationDir->addItem(QString::fromStdString(dirName));
+        }
+
+        int currentIndex = cmbSegmentationDir->findText(
+            QString::fromStdString(_state->vpkg()->getSegmentationDirectory()));
+        if (currentIndex >= 0) {
+            cmbSegmentationDir->setCurrentIndex(currentIndex);
+        }
+    }
+
+    if (_surfacePanel) {
+        _surfacePanel->setVolumePkg(_state->vpkg());
+        if (_viewerManager) {
+            _viewerManager->resetStrideUserOverride();
+        }
+        if (reloadSurfaces) {
+            _surfacePanel->loadSurfaces(false);
+            _surfacePanel->refreshPointSetFilterOptions();
+        }
+    }
 }
 
 void CWindow::updateNormalGridAvailability()
@@ -2990,52 +3058,10 @@ void CWindow::OpenVolume(const QString& path)
         return;
     }
 
-    if (_segmentationWidget) {
-        _segmentationWidget->setVolumePackagePath(aVpkgPath);
-    }
-
-    refreshVolumeSelectionUi(QString());
-    if (!_state->vpkg()->hasVolumes()) {
-        Logger()->info("Opened volpkg '{}' with no volumes", aVpkgPath.toStdString());
-        statusBar()->showMessage(tr("Opened volume package with no volumes."), 5000);
-    }
-
-    if (_volumeOverlay) {
-        _volumeOverlay->setVolumePkg(_state->vpkg(), _state->vpkgPath());
-    }
-
-    // Populate the segmentation directory dropdown
-    {
-        const QSignalBlocker blocker{cmbSegmentationDir};
-        cmbSegmentationDir->clear();
-
-        auto availableDirs = _state->vpkg()->getAvailableSegmentationDirectories();
-        for (const auto& dirName : availableDirs) {
-            cmbSegmentationDir->addItem(QString::fromStdString(dirName));
-        }
-
-        // Select the current directory (default is "paths")
-        int currentIndex = cmbSegmentationDir->findText(QString::fromStdString(_state->vpkg()->getSegmentationDirectory()));
-        if (currentIndex >= 0) {
-            cmbSegmentationDir->setCurrentIndex(currentIndex);
-        }
-    }
-
-    if (_surfacePanel) {
-        _surfacePanel->setVolumePkg(_state->vpkg());
-        // Reset stride user override so tiered defaults apply to new volume
-        if (_viewerManager) {
-            _viewerManager->resetStrideUserOverride();
-        }
-        _surfacePanel->loadSurfaces(false);
-    }
+    refreshCurrentVolumePackageUi(QString(), true);
     if (_menuController) {
         _menuController->updateRecentVolpkgList(aVpkgPath);
     }
-
-   if (_surfacePanel) {
-       _surfacePanel->refreshPointSetFilterOptions();
-   }
 
     if (_fileWatcher) {
         _fileWatcher->startWatching();

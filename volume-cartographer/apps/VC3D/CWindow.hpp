@@ -125,7 +125,11 @@ private:
 
 
     void setVolume(std::shared_ptr<Volume> newvol);
+    bool attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
+                                      const QString& preferredVolumeId = QString());
     void setRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces);
+    void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
+                                       bool reloadSurfaces = true);
     void updateNormalGridAvailability();
     void toggleVolumeOverlayVisibility();
     bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId, bool addToHistory = false);
