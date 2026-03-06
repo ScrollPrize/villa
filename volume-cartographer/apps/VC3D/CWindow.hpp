@@ -197,6 +197,8 @@ private:
     QSpinBox* _transformScaleSpin{nullptr};
     QPushButton* _saveTransformedButton{nullptr};
     QLabel* _transformStatusLabel{nullptr};
+    enum class RemoteTransformFetchState { Unknown, Pending, Available, Missing };
+    std::unordered_map<std::string, RemoteTransformFetchState> _remoteTransformFetchStates;
     WindowRangeWidget* _volumeWindowWidget{nullptr};
     WindowRangeWidget* _overlayWindowWidget{nullptr};
     QLabel* _segmentationGrowthWarning{nullptr};
@@ -277,10 +279,13 @@ private:
     void scheduleWindowStateSave();
     void saveWindowState();
     void refreshTransformsPanelState();
+    void ensureCurrentRemoteTransformJsonAsync();
     void clearTransformPreview(bool restoreDisplayedSurface = true);
-    bool applyTransformPreview();
+    bool applyTransformPreview(bool allowRemoteFetch = true);
     std::shared_ptr<QuadSurface> currentTransformSourceSurface() const;
-    std::filesystem::path currentTransformJsonPath() const;
+    std::filesystem::path localCurrentTransformJsonPath() const;
+    std::string currentRemoteTransformJsonUrl() const;
+    std::filesystem::path currentTransformJsonPath();
 
 
 };  // class CWindow

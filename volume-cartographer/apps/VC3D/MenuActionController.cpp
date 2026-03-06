@@ -515,7 +515,7 @@ void MenuActionController::openRecentRemoteVolume()
     if (auto* action = qobject_cast<QAction*>(sender())) {
         const QString url = action->data().toString();
         if (!url.isEmpty()) {
-            openRemoteUrl(url);
+            openRemoteUrl(url, false);
         }
     }
 }
@@ -539,7 +539,7 @@ void MenuActionController::openRemoteVolume()
 
     if (!ok || url.trimmed().isEmpty()) return;
 
-    openRemoteUrl(url.trimmed());
+    openRemoteUrl(url.trimmed(), false);
 }
 
 void MenuActionController::attachRemoteZarr()
@@ -951,9 +951,14 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url, bool persistE
     watcher->setFuture(future);
 }
 
-void MenuActionController::openRemoteUrl(const QString& url)
+void MenuActionController::openRemoteUrl(const QString& url, bool isRetry)
 {
     if (!_window || url.isEmpty()) return;
+
+    if (!isRetry) {
+        _remoteOpenAuthRetries = 0;
+        _remoteScrollAuthRetries = 0;
+    }
 
     auto urlStr = url.toStdString();
     auto resolved = vc::resolveRemoteUrl(urlStr);
@@ -1045,6 +1050,8 @@ void MenuActionController::openRemoteZarr(
 
             try {
                 auto vol = watcher->result();
+                _remoteOpenAuthRetries = 0;
+                _remoteScrollAuthRetries = 0;
                 _window->CloseVolume();
                 _window->setVolume(vol);
                 _window->UpdateView();
@@ -1081,23 +1088,26 @@ void MenuActionController::openRemoteZarr(
                         // Re-prompt for credentials by calling openRemoteUrl again.
                         // Use QTimer::singleShot to break the call stack and avoid
                         // deep recursion on repeated auth failures (Issue 31).
-                        static int authRetries = 0;
-                        if (authRetries >= 3) {
+                        if (_remoteOpenAuthRetries >= 3) {
                             if (_window->statusBar()) {
                                 _window->statusBar()->showMessage(
                                     QObject::tr("Authentication failed after 3 attempts"), 5000);
                             }
-                            authRetries = 0;
+                            _remoteOpenAuthRetries = 0;
                             return;
                         }
-                        authRetries++;
+                        ++_remoteOpenAuthRetries;
                         _openRemoteAct->setEnabled(false);
                         QTimer::singleShot(0, this, [this, httpsUrl]() {
-                            openRemoteUrl(QString::fromStdString(httpsUrl));
+                            openRemoteUrl(QString::fromStdString(httpsUrl), true);
                         });
                         return;
                     }
+
+                    _remoteOpenAuthRetries = 0;
                 } else {
+                    _remoteOpenAuthRetries = 0;
+                    _remoteScrollAuthRetries = 0;
                     QMessageBox::critical(
                         _window,
                         QObject::tr("Remote Volume Error"),
@@ -1156,6 +1166,7 @@ void MenuActionController::openRemoteScroll(
                     QObject::tr("AWS_ACCESS_KEY_ID:"),
                     QLineEdit::Normal, QString(), &credOk);
                 if (!credOk || accessKey.trimmed().isEmpty()) {
+                    _remoteScrollAuthRetries = 0;
                     _openRemoteAct->setEnabled(true);
                     if (_window->statusBar()) _window->statusBar()->clearMessage();
                     return;
@@ -1166,6 +1177,7 @@ void MenuActionController::openRemoteScroll(
                     QObject::tr("AWS_SECRET_ACCESS_KEY:"),
                     QLineEdit::Password, QString(), &credOk);
                 if (!credOk || secretKey.trimmed().isEmpty()) {
+                    _remoteScrollAuthRetries = 0;
                     _openRemoteAct->setEnabled(true);
                     if (_window->statusBar()) _window->statusBar()->clearMessage();
                     return;
@@ -1176,6 +1188,7 @@ void MenuActionController::openRemoteScroll(
                     QObject::tr("AWS_SESSION_TOKEN (optional):"),
                     QLineEdit::Normal, QString(), &credOk);
                 if (!credOk) {
+                    _remoteScrollAuthRetries = 0;
                     _openRemoteAct->setEnabled(true);
                     if (_window->statusBar()) _window->statusBar()->clearMessage();
                     return;
@@ -1197,22 +1210,23 @@ void MenuActionController::openRemoteScroll(
                 // Retry discovery with fresh credentials.
                 // Use QTimer::singleShot to break the call stack and limit
                 // recursive re-entry on repeated auth failures (Issue 31).
-                static int scrollAuthRetries = 0;
-                if (scrollAuthRetries >= 3) {
+                if (_remoteScrollAuthRetries >= 3) {
                     if (_window->statusBar()) {
                         _window->statusBar()->showMessage(
                             QObject::tr("Authentication failed after 3 attempts"), 5000);
                     }
-                    scrollAuthRetries = 0;
+                    _remoteScrollAuthRetries = 0;
                     _openRemoteAct->setEnabled(true);
                     return;
                 }
-                scrollAuthRetries++;
+                ++_remoteScrollAuthRetries;
                 QTimer::singleShot(0, this, [this, httpsUrl, freshAuth, cachePath]() {
                     openRemoteScroll(httpsUrl, freshAuth, cachePath);
                 });
                 return;
             }
+
+            _remoteScrollAuthRetries = 0;
 
             if (scrollInfo.volumeNames.empty()) {
                 // No volumes found — fall back to direct zarr open

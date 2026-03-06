@@ -1150,7 +1150,7 @@ std::shared_ptr<QuadSurface> CWindow::currentTransformSourceSurface() const
     return _transformPreviewSourceSurface;
 }
 
-std::filesystem::path CWindow::currentTransformJsonPath() const
+std::filesystem::path CWindow::localCurrentTransformJsonPath() const
 {
     if (!_state) {
         return {};
@@ -1171,7 +1171,17 @@ std::filesystem::path CWindow::currentTransformJsonPath() const
         return localTransformPath;
     }
 
-    if (!currentVolume->isRemote() || currentVolume->remoteUrl().empty()) {
+    return {};
+}
+
+std::string CWindow::currentRemoteTransformJsonUrl() const
+{
+    if (!_state) {
+        return {};
+    }
+
+    auto currentVolume = _state->currentVolume();
+    if (!currentVolume || !currentVolume->isRemote() || currentVolume->remoteUrl().empty()) {
         return {};
     }
 
@@ -1180,13 +1190,117 @@ std::filesystem::path CWindow::currentTransformJsonPath() const
         remoteTransformUrl.pop_back();
     }
     remoteTransformUrl += "/transform.json";
+    return remoteTransformUrl;
+}
+
+void CWindow::ensureCurrentRemoteTransformJsonAsync()
+{
+    if (!_state) {
+        return;
+    }
+
+    auto currentVolume = _state->currentVolume();
+    if (!currentVolume || !currentVolume->isRemote() || currentVolume->remoteUrl().empty()) {
+        return;
+    }
+
+    const auto volumePath = currentVolume->path();
+    if (volumePath.empty()) {
+        return;
+    }
+
+    const auto localTransformPath = volumePath / "transform.json";
+    if (std::filesystem::exists(localTransformPath)) {
+        const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
+        if (!remoteTransformUrl.empty()) {
+            _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
+        }
+        return;
+    }
+
+    const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
+    if (remoteTransformUrl.empty()) {
+        return;
+    }
+
+    auto& fetchState = _remoteTransformFetchStates[remoteTransformUrl];
+    if (fetchState == RemoteTransformFetchState::Available &&
+        !std::filesystem::exists(localTransformPath)) {
+        fetchState = RemoteTransformFetchState::Unknown;
+    }
+    if (fetchState != RemoteTransformFetchState::Unknown) {
+        return;
+    }
+
+    fetchState = RemoteTransformFetchState::Pending;
+    const auto auth = currentVolume->remoteAuth();
+    auto* watcher = new QFutureWatcher<bool>(this);
+    connect(watcher, &QFutureWatcher<bool>::finished, this,
+            [this, watcher, remoteTransformUrl, localTransformPath]() {
+                watcher->deleteLater();
+
+                bool downloaded = false;
+                try {
+                    downloaded = watcher->result();
+                } catch (const std::exception&) {
+                    downloaded = false;
+                }
+
+                _remoteTransformFetchStates[remoteTransformUrl] =
+                    (downloaded && std::filesystem::exists(localTransformPath))
+                        ? RemoteTransformFetchState::Available
+                        : RemoteTransformFetchState::Missing;
+
+                if (currentRemoteTransformJsonUrl() == remoteTransformUrl) {
+                    refreshTransformsPanelState();
+                }
+            });
+    watcher->setFuture(QtConcurrent::run(
+        [remoteTransformUrl, localTransformPath, auth]() {
+            return vc::cache::httpDownloadFile(remoteTransformUrl, localTransformPath, auth);
+        }));
+}
+
+std::filesystem::path CWindow::currentTransformJsonPath()
+{
+    if (const auto localTransformPath = localCurrentTransformJsonPath();
+        !localTransformPath.empty()) {
+        const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
+        if (!remoteTransformUrl.empty()) {
+            _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
+        }
+        return localTransformPath;
+    }
+
+    if (!_state) {
+        return {};
+    }
+
+    auto currentVolume = _state->currentVolume();
+    if (!currentVolume) {
+        return {};
+    }
+
+    const auto volumePath = currentVolume->path();
+    if (volumePath.empty()) {
+        return {};
+    }
+
+    if (!currentVolume->isRemote() || currentVolume->remoteUrl().empty()) {
+        return {};
+    }
+
+    const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
+    const auto localTransformPath = volumePath / "transform.json";
 
     if (vc::cache::httpDownloadFile(remoteTransformUrl,
                                     localTransformPath,
                                     currentVolume->remoteAuth())) {
+        _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
         return localTransformPath;
     }
 
+    _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Missing;
     return {};
 }
 
@@ -1216,7 +1330,7 @@ void CWindow::clearTransformPreview(bool restoreDisplayedSurface)
     _transformPreviewSourceSurface.reset();
 }
 
-bool CWindow::applyTransformPreview()
+bool CWindow::applyTransformPreview(bool allowRemoteFetch)
 {
     if (!_state || (_segmentationModule && _segmentationModule->editingEnabled())) {
         return false;
@@ -1227,7 +1341,8 @@ bool CWindow::applyTransformPreview()
         return false;
     }
 
-    const auto transformPath = currentTransformJsonPath();
+    const auto transformPath = allowRemoteFetch ? currentTransformJsonPath()
+                                                : localCurrentTransformJsonPath();
     const int scale = _transformScaleSpin ? _transformScaleSpin->value() : 1;
     std::optional<cv::Matx44d> matrix;
     if (!transformPath.empty() && std::filesystem::exists(transformPath)) {
@@ -1269,24 +1384,33 @@ void CWindow::refreshTransformsPanelState()
     const bool editingEnabled = _segmentationModule && _segmentationModule->editingEnabled();
     const auto sourceSurface = currentTransformSourceSurface();
     const auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    const auto transformPath = currentTransformJsonPath();
+    const auto transformPath = localCurrentTransformJsonPath();
     const bool hasTransform = !transformPath.empty() && std::filesystem::exists(transformPath);
     const int scale = _transformScaleSpin->value();
     const bool hasScaleOnlyTransform = scale != 1;
     const bool previewEnabled = sourceSurface && !editingEnabled && (hasTransform || hasScaleOnlyTransform);
     const bool saveEnabled = previewEnabled && sourceSurface && !sourceSurface->path.empty();
+    const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
+    RemoteTransformFetchState remoteFetchState = RemoteTransformFetchState::Unknown;
+    if (currentVolume && currentVolume->isRemote() && !remoteTransformUrl.empty()) {
+        if (hasTransform) {
+            _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
+        } else {
+            ensureCurrentRemoteTransformJsonAsync();
+            auto it = _remoteTransformFetchStates.find(remoteTransformUrl);
+            if (it != _remoteTransformFetchStates.end()) {
+                remoteFetchState = it->second;
+            }
+        }
+    }
+
     QString transformLocation;
     if (currentVolume && !currentVolume->path().empty()) {
         transformLocation = QString::fromStdString((currentVolume->path() / "transform.json").string());
     } else if (!transformPath.empty()) {
         transformLocation = QString::fromStdString(transformPath.string());
     }
-    if (currentVolume && currentVolume->isRemote() && !currentVolume->remoteUrl().empty()) {
-        std::string remoteTransformUrl = currentVolume->remoteUrl();
-        while (!remoteTransformUrl.empty() && remoteTransformUrl.back() == '/') {
-            remoteTransformUrl.pop_back();
-        }
-        remoteTransformUrl += "/transform.json";
+    if (currentVolume && currentVolume->isRemote() && !remoteTransformUrl.empty()) {
         transformLocation = QString::fromStdString(remoteTransformUrl);
     }
 
@@ -1299,6 +1423,15 @@ void CWindow::refreshTransformsPanelState()
         statusText = tr("Select a segmentation to preview or save its transform.");
     } else if (editingEnabled) {
         statusText = tr("Transform preview is unavailable while segmentation editing is enabled.");
+    } else if (!hasTransform && remoteFetchState == RemoteTransformFetchState::Pending) {
+        if (hasScaleOnlyTransform) {
+            statusText = tr("Scaling points by %1 while checking %2 for transform.json.")
+                .arg(scale)
+                .arg(transformLocation);
+        } else {
+            statusText = tr("Checking %1 for transform.json.")
+                .arg(transformLocation);
+        }
     } else if (!hasTransform) {
         if (hasScaleOnlyTransform) {
             statusText = tr("Scaling points by %1 before affine transform. No transform.json found at %2.")
@@ -1321,7 +1454,7 @@ void CWindow::refreshTransformsPanelState()
         clearTransformPreview(true);
     } else if (previewEnabled && _previewTransformCheck->isChecked()) {
         try {
-            if (!applyTransformPreview()) {
+            if (!applyTransformPreview(false)) {
                 clearTransformPreview(true);
             }
         } catch (const std::exception& ex) {

@@ -64,7 +64,7 @@ private:
     void updateRecentRemoteList(const QString& url);
     void refreshRecentRemoteMenu();
     void ensureRecentRemoteActions();
-    void openRemoteUrl(const QString& url);
+    void openRemoteUrl(const QString& url, bool isRetry = false);
     void attachRemoteZarrUrl(const QString& url, bool persistEntry = true);
     void openRemoteZarr(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
     void openRemoteScroll(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
@@ -106,6 +106,8 @@ private:
     QAction* _selectionClearAct{nullptr};
     QAction* _teleaAct{nullptr};
     QAction* _importObjAct{nullptr};
+    int _remoteOpenAuthRetries{0};
+    int _remoteScrollAuthRetries{0};
 
     QPointer<QDialog> _keybindsDialog;
 };
