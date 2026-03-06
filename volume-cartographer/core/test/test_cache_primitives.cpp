@@ -15,6 +15,7 @@
 #include "vc/core/cache/CacheUtils.hpp"
 #include "vc/core/cache/ChunkSource.hpp"
 #include "vc/core/cache/DiskStore.hpp"
+#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/cache/TieredChunkCache.hpp"
 
 namespace fs = std::filesystem;
@@ -326,6 +327,28 @@ TEST(CacheUtils, ReadFileToVectorEmptyFile)
     EXPECT_FALSE(result.has_value());  // empty files return nullopt
 
     fs::remove_all(tmpDir);
+}
+
+TEST(HttpMetadataFetcher, RemoteVolumeIdIncludesUrlHash)
+{
+    const std::string a = "https://example.com/a/foo.zarr";
+    const std::string b = "https://example.com/b/foo.zarr";
+
+    const auto aId = vc::cache::deriveRemoteVolumeId(a);
+    const auto bId = vc::cache::deriveRemoteVolumeId(b);
+
+    EXPECT_NE(aId, bId);
+    EXPECT_EQ(aId.rfind("foo.zarr-", 0), 0u);
+    EXPECT_EQ(bId.rfind("foo.zarr-", 0), 0u);
+}
+
+TEST(HttpMetadataFetcher, RemoteVolumeIdNormalizesTrailingSlash)
+{
+    const std::string a = "https://example.com/a/foo.zarr";
+    const std::string b = "https://example.com/a/foo.zarr/";
+
+    EXPECT_EQ(vc::cache::normalizeRemoteUrl(a), vc::cache::normalizeRemoteUrl(b));
+    EXPECT_EQ(vc::cache::deriveRemoteVolumeId(a), vc::cache::deriveRemoteVolumeId(b));
 }
 
 TEST(TieredChunkCache, DiskOnlyRegionIsNotReadyForNonBlockingRead)
