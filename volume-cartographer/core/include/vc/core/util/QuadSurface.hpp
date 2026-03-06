@@ -396,6 +396,10 @@ public:
     void refreshMaskTimestamp();
     static std::optional<std::filesystem::file_time_type> readMaskTimestamp(const std::filesystem::path& dir);
 
+    // DPI for TIFF output (0 = don't set). Set via setDpi() or voxelSizeToDpi().
+    float dpi() const { return dpi_; }
+    void setDpi(float d) { dpi_ = d; }
+
 protected:
     std::unordered_map<std::string, cv::Mat> _channels;
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _points;
@@ -404,6 +408,7 @@ protected:
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
     std::set<std::string> _overlappingIds;
     std::optional<std::filesystem::file_time_type> _maskTimestamp;
+    float dpi_ = 0.f;
 
 private:
     // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.

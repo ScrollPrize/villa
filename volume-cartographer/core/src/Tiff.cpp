@@ -79,13 +79,7 @@ cv::Mat convertWithScaling(const cv::Mat& img, int targetType) {
 // writeTiff implementation
 // ============================================================================
 
-void writeTiff(const std::filesystem::path& outPath,
-               const cv::Mat& img,
-               int cvType,
-               uint32_t tileW,
-               uint32_t tileH,
-               float padValue,
-               uint16_t compression)
+void writeTiff(const std::filesystem::path& outPath, const cv::Mat& img, int cvType, uint32_t tileW, uint32_t tileH, float padValue, uint16_t compression, float dpi)
 {
     if (img.empty())
         throw std::runtime_error("Empty image for " + outPath.string());
@@ -117,6 +111,11 @@ void writeTiff(const std::filesystem::path& outPath,
         TIFFSetField(tf, TIFFTAG_PREDICTOR,   PREDICTOR_HORIZONTAL);
     TIFFSetField(tf, TIFFTAG_TILEWIDTH,       tileW);
     TIFFSetField(tf, TIFFTAG_TILELENGTH,      tileH);
+    if (dpi > 0.f) {
+        TIFFSetField(tf, TIFFTAG_RESOLUTIONUNIT, RESUNIT_INCH);
+        TIFFSetField(tf, TIFFTAG_XRESOLUTION, dpi);
+        TIFFSetField(tf, TIFFTAG_YRESOLUTION, dpi);
+    }
 
     const size_t tileBytes = static_cast<size_t>(tileW) * tileH * params.elemSize;
     std::vector<uint8_t> tileBuf(tileBytes);
@@ -158,15 +157,8 @@ void writeTiff(const std::filesystem::path& outPath,
 // TiffWriter implementation
 // ============================================================================
 
-TiffWriter::TiffWriter(const std::filesystem::path& path,
-                       uint32_t width, uint32_t height,
-                       int cvType,
-                       uint32_t tileW,
-                       uint32_t tileH,
-                       float padValue,
-                       uint16_t compression)
-    : _width(width), _height(height), _tileW(tileW), _tileH(tileH),
-      _cvType(cvType), _padValue(padValue), _path(path)
+TiffWriter::TiffWriter(const std::filesystem::path& path, uint32_t width, uint32_t height, int cvType, uint32_t tileW, uint32_t tileH, float padValue, uint16_t compression, float dpi)
+    : _width(width), _height(height), _tileW(tileW), _tileH(tileH), _cvType(cvType), _padValue(padValue), _path(path)
 {
     const auto params = getTiffParams(cvType);
     _elemSize = params.elemSize;
@@ -187,6 +179,11 @@ TiffWriter::TiffWriter(const std::filesystem::path& path,
         TIFFSetField(_tiff, TIFFTAG_PREDICTOR,   PREDICTOR_HORIZONTAL);
     TIFFSetField(_tiff, TIFFTAG_TILEWIDTH,       tileW);
     TIFFSetField(_tiff, TIFFTAG_TILELENGTH,      tileH);
+    if (dpi > 0.f) {
+        TIFFSetField(_tiff, TIFFTAG_RESOLUTIONUNIT, RESUNIT_INCH);
+        TIFFSetField(_tiff, TIFFTAG_XRESOLUTION, dpi);
+        TIFFSetField(_tiff, TIFFTAG_YRESOLUTION, dpi);
+    }
 
     // Allocate reusable tile buffer
     _tileBuf.resize(static_cast<size_t>(tileW) * tileH * _elemSize);
@@ -298,6 +295,10 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
         TIFFGetField(first, TIFFTAG_SAMPLESPERPIXEL, &spp);
         TIFFGetField(first, TIFFTAG_SAMPLEFORMAT, &sf);
         TIFFGetField(first, TIFFTAG_COMPRESSION, &comp);
+        uint16_t resUnit = 0;
+        float xRes = 0, yRes = 0;
+        bool hasRes = TIFFGetField(first, TIFFTAG_RESOLUTIONUNIT, &resUnit) && TIFFGetField(first, TIFFTAG_XRESOLUTION, &xRes) &&
+                      TIFFGetField(first, TIFFTAG_YRESOLUTION, &yRes);
         TIFFClose(first);
 
         TIFF* out = TIFFOpen(finalPath.c_str(), "w");
@@ -307,6 +308,11 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
         TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, bps); TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, spp);
         TIFFSetField(out, TIFFTAG_SAMPLEFORMAT, sf); TIFFSetField(out, TIFFTAG_COMPRESSION, comp);
         TIFFSetField(out, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+        if (hasRes) {
+            TIFFSetField(out, TIFFTAG_RESOLUTIONUNIT, resUnit);
+            TIFFSetField(out, TIFFTAG_XRESOLUTION, xRes);
+            TIFFSetField(out, TIFFTAG_YRESOLUTION, yRes);
+        }
 
         tmsize_t tileBytes = TIFFTileSize(out);
         std::vector<uint8_t> buf(tileBytes, 0), zero(tileBytes, 0);

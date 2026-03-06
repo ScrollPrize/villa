@@ -1296,6 +1296,22 @@ int main(int argc, char *argv[])
         printMat4x4(affineTransform.matrix, "Final composed affine:");
     }
 
+    // Try to read voxelsize from meta.json to set TIFF DPI
+    float tifDpi = 0.f;
+    {
+        auto metaPath = vol_path / "meta.json";
+        if (std::filesystem::exists(metaPath)) {
+            try {
+                auto meta = nlohmann::json::parse(std::ifstream(metaPath));
+                if (meta.contains("voxelsize")) {
+                    double vs = meta["voxelsize"].get<double>();
+                    tifDpi = voxelSizeToDpi(vs);
+                }
+            } catch (...) {
+            }
+        }
+    }
+
     // --- Open source volume ---
     std::shared_ptr<Volume> remoteVolume;
     std::unique_ptr<vc::VcDataset> ownedDs;
@@ -1567,7 +1583,7 @@ int main(int argc, char *argv[])
                 uint32_t tiffTileW = (uint32_t(outW) + 15u) & ~15u;
                 uint16_t tifComp = quickTif ? COMPRESSION_PACKBITS : COMPRESSION_LZW;
                 for (int z = 0; z < tifSlices; z++)
-                    tifWriters.emplace_back(makePartPath(z), uint32_t(outW), uint32_t(outH), cvType, tiffTileW, tiffTileH, 0.0f, tifComp);
+                    tifWriters.emplace_back(makePartPath(z), uint32_t(outW), uint32_t(outH), cvType, tiffTileW, tiffTileH, 0.0f, tifComp, tifDpi);
             }
         }
 

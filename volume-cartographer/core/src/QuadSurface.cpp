@@ -363,7 +363,7 @@ void QuadSurface::writeValidMask(const cv::Mat& img)
     cv::Mat_<uint8_t> mask = validMask();
 
     if (img.empty()) {
-        writeTiff(maskPath, mask);
+        writeTiff(maskPath, mask, -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
     } else {
         std::vector<cv::Mat> layers = {mask, img};
         cv::imwritemulti(maskPath.string(), layers);
@@ -817,9 +817,9 @@ void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const s
     cv::split((*_points), xyz);
 
     // Write x/y/z as 32-bit float tiled TIFF with LZW
-    writeTiff(dir / "x.tif", xyz[0]);
-    writeTiff(dir / "y.tif", xyz[1]);
-    writeTiff(dir / "z.tif", xyz[2]);
+    writeTiff(dir / "x.tif", xyz[0], -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
+    writeTiff(dir / "y.tif", xyz[1], -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
+    writeTiff(dir / "z.tif", xyz[2], -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
 
     // OpenCV compression params for fallback
     std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, 5 };
@@ -834,7 +834,7 @@ void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const s
                 (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
             {
                 try {
-                    writeTiff(dir / (name + ".tif"), mat);
+                    writeTiff(dir / (name + ".tif"), mat, -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
                     wrote = true;
                 } catch (...) {
                     wrote = false; // Fall back to OpenCV
