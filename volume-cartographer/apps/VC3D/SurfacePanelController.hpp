@@ -82,6 +82,7 @@ public:
 
     void setVolumePkg(const std::shared_ptr<VolumePkg>& pkg);
     void clear();
+    bool hasSurfaces() const;
 
     void loadSurfaces(bool reload);
     void loadSurfacesIncremental();

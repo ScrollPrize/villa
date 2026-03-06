@@ -330,17 +330,28 @@ ChunkDataPtr TieredChunkCache::getBlocking(const ChunkKey& key)
 
 void TieredChunkCache::prefetch(const ChunkKey& key)
 {
-    // Already in hot or warm? No-op.
-    if (hotCache_.contains(key)) return;
-    if (warmCache_.contains(key)) return;
-
-    // Known non-existent? Don't waste an IO round-trip.
-    {
-        std::shared_lock lock(negativeMutex_);
-        if (negativeCache_.count(key)) return;
-    }
+    // Already ready for non-blocking use (or known sparse)? No-op.
+    // Cold-disk-only chunks still need promotion, so they must be submitted.
+    if (isReadyForNonBlockingRead(key)) return;
 
     ioPool_.submit(key);
+}
+
+void TieredChunkCache::prefetch(const std::vector<ChunkKey>& keys)
+{
+    if (keys.empty()) return;
+
+    std::vector<ChunkKey> submitKeys;
+    submitKeys.reserve(keys.size());
+    for (const auto& key : keys) {
+        if (!isReadyForNonBlockingRead(key)) {
+            submitKeys.push_back(key);
+        }
+    }
+
+    if (!submitKeys.empty()) {
+        ioPool_.submit(submitKeys);
+    }
 }
 
 void TieredChunkCache::prefetchRegion(
@@ -367,9 +378,8 @@ void TieredChunkCache::prefetchRegion(
     std::vector<ChunkKey> keys;
     if (!missingBoth.empty()) {
         keys.reserve(missingBoth.size());
-        std::shared_lock lock(negativeMutex_);
         for (const auto& key : missingBoth) {
-            if (!negativeCache_.count(key)) {
+            if (!isReadyForNonBlockingRead(key)) {
                 keys.push_back(key);
             }
         }
@@ -534,14 +544,23 @@ bool TieredChunkCache::areAllCachedInRegion(
     auto missingBoth = warmCache_.missing_keys(missingHot.begin(), missingHot.end());
     if (missingBoth.empty()) return true;
 
-    // Check negative cache for remaining misses
-    std::shared_lock negLock(negativeMutex_);
     for (const auto& key : missingBoth) {
-        if (negativeCache_.count(key) == 0) {
+        if (!isReadyForNonBlockingRead(key)) {
             return false;
         }
     }
     return true;
+}
+
+size_t TieredChunkCache::countAvailable(const std::vector<ChunkKey>& keys) const
+{
+    size_t available = 0;
+    for (const auto& key : keys) {
+        if (isReadyForNonBlockingRead(key)) {
+            available++;
+        }
+    }
+    return available;
 }
 
 TieredChunkCache::ChunkReadyCallbackId
@@ -690,6 +709,19 @@ ChunkDataPtr TieredChunkCache::loadFull(const ChunkKey& key)
 
     // Try ice (remote/filesystem)
     return promoteFromIce(key);
+}
+
+bool TieredChunkCache::isReadyForNonBlockingRead(const ChunkKey& key) const
+{
+    if (hotCache_.contains(key)) return true;
+    if (warmCache_.contains(key)) return true;
+
+    {
+        std::shared_lock lock(negativeMutex_);
+        if (negativeCache_.count(key)) return true;
+    }
+
+    return false;
 }
 
 // =============================================================================

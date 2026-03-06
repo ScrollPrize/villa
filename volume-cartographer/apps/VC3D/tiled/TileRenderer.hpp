@@ -22,6 +22,7 @@ struct TileRenderParams {
     // --- Tile identity ---
     WorldTileKey worldKey;
     uint64_t epoch = 0;
+    uint64_t cacheIdentity = 0;
 
     // --- Tile geometry ---
     // Surface parameter space ROI for this tile (same for both surface types)
@@ -49,6 +50,7 @@ struct TileRenderResult {
     WorldTileKey worldKey;
     QImage image;        // Format_RGB32 QImage (produced directly on worker thread)
     uint64_t epoch = 0;
+    uint64_t cacheIdentity = 0;
 
     // Camera state snapshot for cache key reconstruction
     float scale = 1.0f;

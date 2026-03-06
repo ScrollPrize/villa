@@ -187,6 +187,41 @@ static inline cv::Vec3f transform_normal(const cv::Vec3f& n, const AffineTransfo
     return n;
 }
 
+static bool affine_uniform_scale_factor(const AffineTransform& A, double& factor)
+{
+    cv::Mat Lin(3, 3, CV_64F);
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            Lin.at<double>(r, c) = A.M(r, c);
+        }
+    }
+
+    cv::SVD svd(Lin, cv::SVD::NO_UV);
+    if (svd.w.rows < 3) {
+        return false;
+    }
+
+    const double s0 = svd.w.at<double>(0, 0);
+    const double s1 = svd.w.at<double>(1, 0);
+    const double s2 = svd.w.at<double>(2, 0);
+    if (!(std::isfinite(s0) && std::isfinite(s1) && std::isfinite(s2))) {
+        return false;
+    }
+    if (s0 <= 0.0 || s1 <= 0.0 || s2 <= 0.0) {
+        return false;
+    }
+
+    const double mean = (s0 + s1 + s2) / 3.0;
+    const double max_dev = std::max({std::abs(s0 - mean), std::abs(s1 - mean), std::abs(s2 - mean)});
+    const double rel_dev = max_dev / mean;
+    if (!std::isfinite(rel_dev) || rel_dev > 1e-4) {
+        return false;
+    }
+
+    factor = mean;
+    return true;
+}
+
 static bool is_tifxyz_dir(const std::filesystem::path& p) {
     return std::filesystem::is_directory(p)
         && std::filesystem::exists(p/"x.tif")
@@ -214,6 +249,17 @@ static int run_tifxyz(const std::filesystem::path& inDir,
     try { surf = load_quad_from_tifxyz(inDir.string()); }
     catch (const std::exception& e) {
         std::cerr << "failed to load tifxyz: " << e.what() << std::endl; return 3;
+    }
+
+    const cv::Vec2f original_scale = surf->_scale;
+    double affine_scale_factor = 1.0;
+    const bool has_uniform_affine_scale = AA && affine_uniform_scale_factor(*AA, affine_scale_factor);
+    const double total_spacing_scale = scale_before_affine * scale_after_affine
+                                     * (has_uniform_affine_scale ? affine_scale_factor : 1.0);
+    if (AA && !has_uniform_affine_scale) {
+        std::cerr << "Warning: affine contains non-uniform scaling or shear; "
+                  << "preserving tifxyz sample spacing only accounts for the explicit "
+                  << "uniform scale-before/after factors." << std::endl;
     }
 
     int sanitize_replacements = 0;
@@ -267,6 +313,19 @@ static int run_tifxyz(const std::filesystem::path& inDir,
     if (final_valid_count == 0) {
         std::cerr << "No valid points remain after transform; aborting save" << std::endl;
         return 7;
+    }
+
+    // Preserve tifxyz sample spacing across uniform scaling by resampling the grid
+    // instead of only moving the existing samples farther apart in 3D.
+    if (std::isfinite(total_spacing_scale) && total_spacing_scale > 0.0
+        && std::abs(total_spacing_scale - 1.0) > 1e-4) {
+        const float resample_factor = static_cast<float>(total_spacing_scale);
+        surf->resample(resample_factor);
+        surf->_scale = original_scale;
+        surf->invalidateCache();
+        std::cout << "Resampled tifxyz grid by " << total_spacing_scale
+                  << " to preserve original sample spacing metadata ["
+                  << original_scale[0] << ", " << original_scale[1] << "]" << std::endl;
     }
 
     // Points were modified in-place; invalidate cached derived geometry so bbox

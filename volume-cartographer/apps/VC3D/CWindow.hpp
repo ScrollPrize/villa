@@ -56,6 +56,7 @@ class MenuActionController;
 class SegmentationGrower;
 class WindowRangeWidget;
 class QLabel;
+class QSpinBox;
 class QTemporaryFile;
 class QStandardItemModel;
 class FileWatcherService;
@@ -125,7 +126,11 @@ private:
 
 
     void setVolume(std::shared_ptr<Volume> newvol);
+    bool attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
+                                      const QString& preferredVolumeId = QString());
     void setRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces);
+    void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
+                                       bool reloadSurfaces = true);
     void updateNormalGridAvailability();
     void toggleVolumeOverlayVisibility();
     bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId, bool addToHistory = false);
@@ -162,6 +167,8 @@ private slots:
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
     void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
+    void onPreviewTransformToggled(bool enabled);
+    void onSaveTransformedRequested();
 
 private:
     CState* _state;
@@ -184,7 +191,14 @@ private:
     QDoubleSpinBox* spNorm[3];
     QPushButton* btnZoomIn;
    QPushButton* btnZoomOut;
-   QCheckBox* chkAxisAlignedSlices;
+    QCheckBox* chkAxisAlignedSlices;
+    QCheckBox* _previewTransformCheck{nullptr};
+    QCheckBox* _invertTransformCheck{nullptr};
+    QSpinBox* _transformScaleSpin{nullptr};
+    QPushButton* _saveTransformedButton{nullptr};
+    QLabel* _transformStatusLabel{nullptr};
+    enum class RemoteTransformFetchState { Unknown, Pending, Available, Missing };
+    std::unordered_map<std::string, RemoteTransformFetchState> _remoteTransformFetchStates;
     WindowRangeWidget* _volumeWindowWidget{nullptr};
     WindowRangeWidget* _overlayWindowWidget{nullptr};
     QLabel* _segmentationGrowthWarning{nullptr};
@@ -229,6 +243,8 @@ private:
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     FocusHistoryManager _focusHistory;
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
+    std::shared_ptr<QuadSurface> _transformPreviewSourceSurface;
+    std::shared_ptr<QuadSurface> _transformPreviewSurface;
 
     // Keyboard shortcuts
     QShortcut* fDrawingModeShortcut;
@@ -262,6 +278,14 @@ private:
     QTimer* _windowStateSaveTimer{nullptr};
     void scheduleWindowStateSave();
     void saveWindowState();
+    void refreshTransformsPanelState();
+    void ensureCurrentRemoteTransformJsonAsync();
+    void clearTransformPreview(bool restoreDisplayedSurface = true);
+    bool applyTransformPreview(bool allowRemoteFetch = true);
+    std::shared_ptr<QuadSurface> currentTransformSourceSurface() const;
+    std::filesystem::path localCurrentTransformJsonPath() const;
+    std::string currentRemoteTransformJsonUrl() const;
+    std::filesystem::path currentTransformJsonPath();
 
 
 };  // class CWindow

@@ -68,6 +68,8 @@ public:
     [[nodiscard]] bool isRemote() const noexcept { return isRemote_; }
     [[nodiscard]] std::string id() const;
     [[nodiscard]] std::string name() const;
+    [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
+    [[nodiscard]] const vc::cache::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
     void setName(const std::string& n);
     [[nodiscard]] std::filesystem::path path() const noexcept { return path_; }
     void saveMetadata();
