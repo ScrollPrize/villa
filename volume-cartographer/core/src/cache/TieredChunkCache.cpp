@@ -488,6 +488,11 @@ void TieredChunkCache::clearAll()
     }
 }
 
+void TieredChunkCache::flushPersistentState() const
+{
+    saveNegativeCache();
+}
+
 int TieredChunkCache::numLevels() const
 {
     return source_ ? source_->numLevels() : 0;

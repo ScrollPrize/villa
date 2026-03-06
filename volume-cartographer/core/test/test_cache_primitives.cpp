@@ -425,3 +425,29 @@ TEST(TieredChunkCache, MixedRegionTreatsDiskOnlyChunkAsLocallyAvailable)
     EXPECT_TRUE(harness.cache->areAllCachedInRegion(0, 0, 0, 0, 0, 0, 2));
     EXPECT_EQ(harness.source->fetchCount(), 0u);
 }
+
+TEST(TieredChunkCache, FlushPersistentStatePersistsNegativeCacheAcrossReopen)
+{
+    CacheFixture fixture;
+    const std::string volumeId = "test-volume";
+    vc::cache::ChunkKey diskOnlyKey{0, 0, 0, 1};
+    vc::cache::ChunkKey missingKey{0, 0, 0, 2};
+
+    auto writerStore = fixture.makeDiskStore();
+    writerStore->put(volumeId, diskOnlyKey, std::vector<uint8_t>{11});
+
+    {
+        auto harness = makeTestCache(fixture.makeDiskStore(), std::make_unique<FakeChunkSource>());
+        harness.source->markMissing(missingKey);
+
+        EXPECT_EQ(harness.cache->getBlocking(missingKey), nullptr);
+        harness.cache->flushPersistentState();
+    }
+
+    auto reopened = makeTestCache(fixture.makeDiskStore(), std::make_unique<FakeChunkSource>());
+    reopened.source->clearFetches();
+
+    EXPECT_TRUE(reopened.cache->areAllCachedInRegion(0, 0, 0, 1, 0, 0, 2));
+    EXPECT_EQ(reopened.cache->countAvailable({diskOnlyKey, missingKey}), 2u);
+    EXPECT_EQ(reopened.source->fetchCount(), 0u);
+}

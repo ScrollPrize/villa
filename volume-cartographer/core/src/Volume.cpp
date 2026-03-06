@@ -861,6 +861,11 @@ void Volume::primeRemoteLevel5Blocking(
             }
         }
 
+        // Persist negative-cached missing chunks immediately so reopening the
+        // same remote volume does not trigger another full level-5 prime
+        // before this cache instance is destroyed.
+        tieredCache_->flushPersistentState();
+
         std::lock_guard<std::mutex> lock(remoteLevel5PrimeMutex_);
         remoteLevel5PrimeStarted_ = false;
         remoteLevel5PrimeDone_ = true;

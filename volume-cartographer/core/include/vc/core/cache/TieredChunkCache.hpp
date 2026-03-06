@@ -117,6 +117,9 @@ public:
     // Clear everything including disk cache for this volume.
     void clearAll();
 
+    // Persist cache state needed across runs, such as negative-cached chunks.
+    void flushPersistentState() const;
+
     // Number of pyramid levels in the source.
     [[nodiscard]] int numLevels() const;
 
