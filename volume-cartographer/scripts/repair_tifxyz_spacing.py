@@ -58,7 +58,7 @@ def load_scale(meta_path: Path) -> tuple[float, float]:
     return sx, sy
 
 
-def measure_spacing(seg_dir: Path, input_root: Path, threshold: float) -> SegmentStats:
+def measure_spacing(seg_dir: Path, input_root: Path, target_spacing: float, threshold: float) -> SegmentStats:
     sx, sy = load_scale(seg_dir / "meta.json")
     x = tifffile.imread(seg_dir / "x.tif").astype(np.float32)
     y = tifffile.imread(seg_dir / "y.tif").astype(np.float32)
@@ -84,8 +84,8 @@ def measure_spacing(seg_dir: Path, input_root: Path, threshold: float) -> Segmen
     if right_vals.size == 0 or down_vals.size == 0:
         raise ValueError(f"No valid neighbor pairs in {seg_dir}")
 
-    expected_x = 1.0 / sx
-    expected_y = 1.0 / sy
+    expected_x = float(target_spacing)
+    expected_y = float(target_spacing)
     median_right = float(np.median(right_vals))
     median_down = float(np.median(down_vals))
     factor_x = median_right / expected_x
@@ -190,7 +190,7 @@ def main() -> int:
     if output_root.exists():
         raise SystemExit(f"Output root already exists: {output_root}")
 
-    stats = [measure_spacing(seg_dir, input_root, args.threshold) for seg_dir in tifxyz_dirs(input_root)]
+    stats = [measure_spacing(seg_dir, input_root, args.target_spacing, args.threshold) for seg_dir in tifxyz_dirs(input_root)]
     flagged = [s for s in stats if s.needs_repair]
 
     print(f"Found {len(stats)} tifxyz folders under {input_root}")
