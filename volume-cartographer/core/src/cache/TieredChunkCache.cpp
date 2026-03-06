@@ -330,8 +330,9 @@ ChunkDataPtr TieredChunkCache::getBlocking(const ChunkKey& key)
 
 void TieredChunkCache::prefetch(const ChunkKey& key)
 {
-    // Already available locally (or known sparse)? No-op.
-    if (isLocallyAvailable(key)) return;
+    // Already ready for non-blocking use (or known sparse)? No-op.
+    // Cold-disk-only chunks still need promotion, so they must be submitted.
+    if (isReadyForNonBlockingRead(key)) return;
 
     ioPool_.submit(key);
 }
@@ -343,7 +344,7 @@ void TieredChunkCache::prefetch(const std::vector<ChunkKey>& keys)
     std::vector<ChunkKey> submitKeys;
     submitKeys.reserve(keys.size());
     for (const auto& key : keys) {
-        if (!isLocallyAvailable(key)) {
+        if (!isReadyForNonBlockingRead(key)) {
             submitKeys.push_back(key);
         }
     }
@@ -378,7 +379,7 @@ void TieredChunkCache::prefetchRegion(
     if (!missingBoth.empty()) {
         keys.reserve(missingBoth.size());
         for (const auto& key : missingBoth) {
-            if (!isLocallyAvailable(key)) {
+            if (!isReadyForNonBlockingRead(key)) {
                 keys.push_back(key);
             }
         }
@@ -544,7 +545,7 @@ bool TieredChunkCache::areAllCachedInRegion(
     if (missingBoth.empty()) return true;
 
     for (const auto& key : missingBoth) {
-        if (!isLocallyAvailable(key)) {
+        if (!isReadyForNonBlockingRead(key)) {
             return false;
         }
     }
@@ -555,7 +556,7 @@ size_t TieredChunkCache::countAvailable(const std::vector<ChunkKey>& keys) const
 {
     size_t available = 0;
     for (const auto& key : keys) {
-        if (isLocallyAvailable(key)) {
+        if (isReadyForNonBlockingRead(key)) {
             available++;
         }
     }
@@ -710,7 +711,7 @@ ChunkDataPtr TieredChunkCache::loadFull(const ChunkKey& key)
     return promoteFromIce(key);
 }
 
-bool TieredChunkCache::isLocallyAvailable(const ChunkKey& key) const
+bool TieredChunkCache::isReadyForNonBlockingRead(const ChunkKey& key) const
 {
     if (hotCache_.contains(key)) return true;
     if (warmCache_.contains(key)) return true;
@@ -719,6 +720,13 @@ bool TieredChunkCache::isLocallyAvailable(const ChunkKey& key) const
         std::shared_lock lock(negativeMutex_);
         if (negativeCache_.count(key)) return true;
     }
+
+    return false;
+}
+
+bool TieredChunkCache::isPresentLocally(const ChunkKey& key) const
+{
+    if (isReadyForNonBlockingRead(key)) return true;
 
     if (diskStore_ && diskStore_->contains(config_.volumeId, key)) {
         return true;

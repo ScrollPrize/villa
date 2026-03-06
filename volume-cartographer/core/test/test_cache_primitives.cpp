@@ -81,6 +81,17 @@ struct CacheHarness {
     FakeChunkSource* source = nullptr;
 };
 
+template <typename Predicate>
+bool waitFor(Predicate&& pred, std::chrono::milliseconds timeout = std::chrono::milliseconds(500))
+{
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return pred();
+}
+
 CacheHarness makeTestCache(
     std::shared_ptr<vc::cache::DiskStore> diskStore,
     std::unique_ptr<FakeChunkSource> source)
@@ -317,7 +328,7 @@ TEST(CacheUtils, ReadFileToVectorEmptyFile)
     fs::remove_all(tmpDir);
 }
 
-TEST(TieredChunkCache, DiskOnlyRegionCountsAsCached)
+TEST(TieredChunkCache, DiskOnlyRegionIsNotReadyForNonBlockingRead)
 {
     CacheFixture fixture;
     auto diskStore = fixture.makeDiskStore();
@@ -327,11 +338,13 @@ TEST(TieredChunkCache, DiskOnlyRegionCountsAsCached)
 
     auto harness = makeTestCache(fixture.makeDiskStore(), std::make_unique<FakeChunkSource>());
 
-    EXPECT_TRUE(harness.cache->areAllCachedInRegion(0, 0, 0, 1, 0, 0, 1));
+    EXPECT_FALSE(harness.cache->areAllCachedInRegion(0, 0, 0, 1, 0, 0, 1));
+    EXPECT_EQ(harness.cache->countAvailable({cachedKey}), 0u);
+    EXPECT_EQ(harness.cache->get(cachedKey), nullptr);
     EXPECT_EQ(harness.source->fetchCount(), 0u);
 }
 
-TEST(TieredChunkCache, PrefetchSkipsDiskOnlyChunks)
+TEST(TieredChunkCache, PrefetchPromotesDiskOnlyChunksWithoutRemoteFetch)
 {
     CacheFixture fixture;
     auto diskStore = fixture.makeDiskStore();
@@ -342,26 +355,55 @@ TEST(TieredChunkCache, PrefetchSkipsDiskOnlyChunks)
     auto harness = makeTestCache(fixture.makeDiskStore(), std::make_unique<FakeChunkSource>());
 
     harness.cache->prefetchRegion(0, 0, 0, 2, 0, 0, 2);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_TRUE(waitFor([&] {
+        return harness.cache->countAvailable({cachedKey}) == 1u;
+    }));
 
-    EXPECT_EQ(harness.cache->stats().ioPending, 0u);
+    EXPECT_NE(harness.cache->get(cachedKey), nullptr);
     EXPECT_EQ(harness.source->fetchCount(), 0u);
 }
 
-TEST(TieredChunkCache, MixedRegionRequiresTrulyMissingChunk)
+TEST(TieredChunkCache, CountAvailableIgnoresDiskOnlyButIncludesNegativeCached)
 {
     CacheFixture fixture;
     const std::string volumeId = "test-volume";
     auto writerStore = fixture.makeDiskStore();
-    writerStore->put(volumeId, vc::cache::ChunkKey{0, 0, 0, 1}, std::vector<uint8_t>{11});
+    vc::cache::ChunkKey hotKey{0, 0, 0, 0};
+    vc::cache::ChunkKey diskOnlyKey{0, 0, 0, 1};
+    vc::cache::ChunkKey missingKey{0, 0, 0, 2};
+    writerStore->put(volumeId, diskOnlyKey, std::vector<uint8_t>{11});
 
     auto harness = makeTestCache(fixture.makeDiskStore(), std::make_unique<FakeChunkSource>());
-    harness.source->markMissing(vc::cache::ChunkKey{0, 0, 0, 2});
+    harness.source->markMissing(missingKey);
 
-    EXPECT_TRUE(harness.cache->getBlocking(vc::cache::ChunkKey{0, 0, 0, 0}) != nullptr);
-    EXPECT_TRUE(harness.cache->getBlocking(vc::cache::ChunkKey{0, 0, 0, 2}) == nullptr);
+    EXPECT_NE(harness.cache->getBlocking(hotKey), nullptr);
+    EXPECT_EQ(harness.cache->getBlocking(missingKey), nullptr);
+
+    EXPECT_EQ(harness.cache->countAvailable({hotKey, diskOnlyKey, missingKey}), 2u);
+}
+
+TEST(TieredChunkCache, MixedRegionRequiresPromotionOfDiskOnlyChunk)
+{
+    CacheFixture fixture;
+    const std::string volumeId = "test-volume";
+    auto writerStore = fixture.makeDiskStore();
+    vc::cache::ChunkKey hotKey{0, 0, 0, 0};
+    vc::cache::ChunkKey diskOnlyKey{0, 0, 0, 1};
+    vc::cache::ChunkKey missingKey{0, 0, 0, 2};
+    writerStore->put(volumeId, diskOnlyKey, std::vector<uint8_t>{11});
+
+    auto harness = makeTestCache(fixture.makeDiskStore(), std::make_unique<FakeChunkSource>());
+    harness.source->markMissing(missingKey);
+
+    EXPECT_NE(harness.cache->getBlocking(hotKey), nullptr);
+    EXPECT_EQ(harness.cache->getBlocking(missingKey), nullptr);
     harness.source->clearFetches();
 
-    EXPECT_FALSE(harness.cache->areAllCachedInRegion(0, 0, 0, 0, 0, 0, 3));
+    EXPECT_FALSE(harness.cache->areAllCachedInRegion(0, 0, 0, 0, 0, 0, 2));
+    harness.cache->prefetch(diskOnlyKey);
+    ASSERT_TRUE(waitFor([&] {
+        return harness.cache->countAvailable({diskOnlyKey}) == 1u;
+    }));
+    EXPECT_TRUE(harness.cache->areAllCachedInRegion(0, 0, 0, 0, 0, 0, 2));
     EXPECT_EQ(harness.source->fetchCount(), 0u);
 }

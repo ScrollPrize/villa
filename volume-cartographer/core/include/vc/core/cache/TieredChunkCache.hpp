@@ -88,7 +88,8 @@ public:
 
     // --- Async prefetch ---
 
-    // Schedule background fetch from cold/ice tier. No-op if already cached.
+    // Schedule background fetch/promotion from cold/ice tier. No-op if the
+    // chunk is already ready for non-blocking access.
     void prefetch(const ChunkKey& key);
     void prefetch(const std::vector<ChunkKey>& keys);
 
@@ -143,15 +144,16 @@ public:
     // so callers should treat negative-cached chunks as available.
     [[nodiscard]] bool isNegativeCached(const ChunkKey& key) const;
 
-    // Batch check: are ALL chunks in a region available locally in hot, warm,
-    // cold disk, or negative cache? Acquires each lock only once for the RAM
-    // tiers and only probes disk for the remaining misses.
+    // Batch check: are ALL chunks in a region ready for non-blocking access?
+    // This includes hot/warm tiers and negative-cached chunks, but excludes
+    // cold-disk-only entries that still need promotion before get() can serve
+    // them.
     [[nodiscard]] bool areAllCachedInRegion(int level,
                               int iz0, int iy0, int ix0,
                               int iz1, int iy1, int ix1) const;
 
-    // Count how many of the given keys are already available in hot/warm tiers
-    // or are negative-cached.
+    // Count how many of the given keys are ready for non-blocking access
+    // (hot/warm tiers or negative-cached).
     [[nodiscard]] size_t countAvailable(const std::vector<ChunkKey>& keys) const;
 
     // --- Notifications ---
@@ -247,8 +249,11 @@ private:
     // Full promotion chain (checks each tier in order).
     [[nodiscard]] ChunkDataPtr loadFull(const ChunkKey& key);
 
-    // Tier visibility helper for progressive rendering and prefetch gating.
-    [[nodiscard]] bool isLocallyAvailable(const ChunkKey& key) const;
+    // Ready for non-blocking access by get(): hot/warm or negative-cached.
+    [[nodiscard]] bool isReadyForNonBlockingRead(const ChunkKey& key) const;
+
+    // Present in any local tier: hot/warm, negative cache, or cold disk.
+    [[nodiscard]] bool isPresentLocally(const ChunkKey& key) const;
 
     mutable std::mutex callbackMutex_;
     std::vector<std::pair<ChunkReadyCallbackId, ChunkReadyCallback>> chunkReadyListeners_;
