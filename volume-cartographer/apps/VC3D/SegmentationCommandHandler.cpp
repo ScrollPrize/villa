@@ -202,6 +202,33 @@ static bool writeJsonObject(const QString& path, const QJsonObject& obj)
     return true;
 }
 
+static bool updateVolumeIdentityMetadata(const QString& volumePath)
+{
+    if (volumePath.isEmpty()) {
+        return false;
+    }
+
+    const QDir dir(volumePath);
+    if (!dir.exists()) {
+        return false;
+    }
+
+    const QString volumeId = QFileInfo(dir.path()).fileName();
+    if (volumeId.isEmpty()) {
+        return false;
+    }
+
+    const QString metaPath = dir.filePath(QStringLiteral("meta.json"));
+    QJsonObject meta = readJsonObject(metaPath);
+    if (meta.isEmpty()) {
+        return false;
+    }
+
+    meta.insert(QStringLiteral("uuid"), volumeId);
+    meta.insert(QStringLiteral("name"), volumeId);
+    return writeJsonObject(metaPath, meta);
+}
+
 static bool isRasterizedLabelVolumePath(const QString& volumePath)
 {
     if (volumePath.isEmpty()) {
@@ -3104,10 +3131,20 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
                 emit statusMessage(tr("Ignore label complete, but finalizing output failed"), 5000);
             } else {
                 finalized = true;
-                emit statusMessage(
-                    tr("Ignore label volume created -> %1")
-                        .arg(QDir::toNativeSeparators(finalOutputRootStr)),
-                    5000);
+                if (!updateVolumeIdentityMetadata(finalOutputRootStr)) {
+                    emit showWarning(
+                        tr("Warning"),
+                        tr("Ignore label volume created, but updating meta.json identity failed."));
+                    emit statusMessage(
+                        tr("Ignore label volume created, but metadata update failed -> %1")
+                            .arg(QDir::toNativeSeparators(finalOutputRootStr)),
+                        5000);
+                } else {
+                    emit statusMessage(
+                        tr("Ignore label volume created -> %1")
+                            .arg(QDir::toNativeSeparators(finalOutputRootStr)),
+                        5000);
+                }
             }
         } else {
             if (progressDialog) {
