@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -309,6 +310,52 @@ struct ScopedTimer {
         }
     }
 };
+
+using StageProgressCallback = std::function<void(std::size_t)>;
+
+static std::size_t progressCadence(const std::size_t total)
+{
+    return std::max<std::size_t>(1, total / 200);
+}
+
+static bool shouldEmitStructuredProgress(const std::size_t current,
+                                         const std::size_t total,
+                                         const std::size_t cadence)
+{
+    return current == 1 || current == total || (current % cadence) == 0;
+}
+
+static void emitStructuredStage(const bool enabled,
+                                const char* name,
+                                const std::size_t total,
+                                const std::optional<int>& level = std::nullopt)
+{
+    if (!enabled) {
+        return;
+    }
+    std::cerr << "VC_STAGE name=" << name;
+    if (level.has_value()) {
+        std::cerr << " level=" << *level;
+    }
+    std::cerr << " total=" << total << '\n';
+}
+
+static void emitStructuredProgress(const bool enabled,
+                                   const char* name,
+                                   const std::size_t current,
+                                   const std::size_t total,
+                                   const std::optional<int>& level = std::nullopt)
+{
+    if (!enabled) {
+        return;
+    }
+    std::cerr << "VC_PROGRESS name=" << name;
+    if (level.has_value()) {
+        std::cerr << " level=" << *level;
+    }
+    std::cerr << " current=" << current
+              << " total=" << total << '\n';
+}
 
 struct NearestNeighborMap {
     std::vector<std::uint32_t> dstToSrcY;
@@ -1818,7 +1865,9 @@ static void copyRootMetadata(const fs::path& inputRoot,
 static void copyLevelFromExisting(const fs::path& inputLevelPath,
                                   const fs::path& outputLevelPath,
                                   const std::unordered_set<ChunkIndex, ChunkIndexHash>& existingChunks,
-                                  std::size_t workers)
+                                  std::size_t workers,
+                                  std::atomic<std::size_t>* copiedChunks = nullptr,
+                                  const StageProgressCallback& progressCallback = {})
 {
     fs::create_directories(outputLevelPath);
 
@@ -1832,14 +1881,7 @@ static void copyLevelFromExisting(const fs::path& inputLevelPath,
             fs::copy_file(entry.path(),
                           outputLevelPath / entry.path().filename(),
                           fs::copy_options::overwrite_existing);
-            continue;
         }
-        if (existingChunks.find(c) == existingChunks.end()) {
-            continue;
-        }
-        fs::copy_file(entry.path(),
-                      outputLevelPath / entry.path().filename(),
-                      fs::copy_options::overwrite_existing);
     }
 
     std::vector<ChunkIndex> chunks;
@@ -1872,6 +1914,12 @@ static void copyLevelFromExisting(const fs::path& inputLevelPath,
                     const fs::path src = inputLevelPath / chunkFilename(chunks[idx]);
                     const fs::path dst = outputLevelPath / src.filename();
                     fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
+                    if (copiedChunks != nullptr) {
+                        const std::size_t done = copiedChunks->fetch_add(1) + 1;
+                        if (progressCallback) {
+                            progressCallback(done);
+                        }
+                    }
                 } catch (const std::exception& e) {
                     hadError.store(true);
                     std::lock_guard<std::mutex> lk(errMutex);
@@ -1896,20 +1944,45 @@ static void copyInputTreeChunkwise(
     const fs::path& outputRoot,
     const std::vector<int>& levels,
     const std::unordered_map<int, std::unordered_set<ChunkIndex, ChunkIndexHash>>& existingByLevel,
-    std::size_t workers)
+    std::size_t workers,
+    bool structuredProgress = false)
 {
     std::unordered_set<int> levelSet(levels.begin(), levels.end());
-    copyRootMetadata(inputRoot, outputRoot, levelSet);
-
+    std::size_t totalChunkCopies = 0;
     for (int level : levels) {
         const auto it = existingByLevel.find(level);
         if (it == existingByLevel.end()) {
             throw std::runtime_error("missing existing chunk index for level " + std::to_string(level));
         }
+        totalChunkCopies += it->second.size();
+    }
+
+    const std::size_t progressTotal = std::max<std::size_t>(1, totalChunkCopies);
+    const std::size_t cadence = progressCadence(progressTotal);
+    std::atomic<std::size_t> copiedChunks{0};
+    if (structuredProgress) {
+        emitStructuredStage(true, "copy", progressTotal);
+    }
+
+    copyRootMetadata(inputRoot, outputRoot, levelSet);
+
+    for (int level : levels) {
+        const auto it = existingByLevel.find(level);
         copyLevelFromExisting(inputRoot / std::to_string(level),
                               outputRoot / std::to_string(level),
                               it->second,
-                              workers);
+                              workers,
+                              &copiedChunks,
+                              [&](const std::size_t done) {
+            if (structuredProgress &&
+                shouldEmitStructuredProgress(done, progressTotal, cadence)) {
+                emitStructuredProgress(true, "copy", done, progressTotal);
+            }
+        });
+    }
+
+    if (structuredProgress && totalChunkCopies == 0) {
+        emitStructuredProgress(true, "copy", 1, progressTotal);
     }
 }
 
@@ -2080,6 +2153,7 @@ static std::vector<ChunkIndex> buildLabelPriorityPyramidLevelTouched(
     const std::unordered_set<ChunkIndex, ChunkIndexHash>* existingDstChunks,
     bool existingChunksOnly,
     std::atomic<std::size_t>& skippedMissingChunks,
+    bool structuredProgress = false,
     ProfileStats* profile = nullptr)
 {
     const fs::path srcPath = outputRoot / std::to_string(level - 1);
@@ -2115,11 +2189,20 @@ static std::vector<ChunkIndex> buildLabelPriorityPyramidLevelTouched(
         }
         touchedChunks.swap(filtered);
     }
+    const std::size_t progressTotal = std::max<std::size_t>(1, touchedChunks.size());
+    const std::size_t cadence = progressCadence(progressTotal);
+    if (structuredProgress) {
+        emitStructuredStage(true, "pyramid", progressTotal, level);
+    }
     if (touchedChunks.empty()) {
+        if (structuredProgress) {
+            emitStructuredProgress(true, "pyramid", 1, progressTotal, level);
+        }
         return {};
     }
 
     std::atomic<std::size_t> next{0};
+    std::atomic<std::size_t> done{0};
     std::atomic<bool> hadError{false};
     std::vector<std::thread> threads;
     threads.reserve(workers);
@@ -2159,6 +2242,11 @@ static std::vector<ChunkIndex> buildLabelPriorityPyramidLevelTouched(
                     const std::size_t srcX0 = cx * dstChunk[2] * 2;
 
                     if (srcZ0 >= srcShape[0] || srcY0 >= srcShape[1] || srcX0 >= srcShape[2]) {
+                        const std::size_t progressDone = done.fetch_add(1) + 1;
+                        if (structuredProgress &&
+                            shouldEmitStructuredProgress(progressDone, progressTotal, cadence)) {
+                            emitStructuredProgress(true, "pyramid", progressDone, progressTotal, level);
+                        }
                         continue;
                     }
 
@@ -2205,6 +2293,11 @@ static std::vector<ChunkIndex> buildLabelPriorityPyramidLevelTouched(
                         localProfile.bytesWritten += dstBuf.size() * sizeof(uint8_t);
                         std::lock_guard<std::mutex> lk(outTouchedMutex);
                         outputTouched.push_back(chunk);
+                    }
+                    const std::size_t progressDone = done.fetch_add(1) + 1;
+                    if (structuredProgress &&
+                        shouldEmitStructuredProgress(progressDone, progressTotal, cadence)) {
+                        emitStructuredProgress(true, "pyramid", progressDone, progressTotal, level);
                     }
                 } catch (const std::exception& e) {
                     hadError.store(true);
@@ -2679,6 +2772,7 @@ static int processChunkAlphaWrap(
     const nlohmann::json& inputMeta,
     const std::unordered_map<int, std::unordered_set<ChunkIndex, ChunkIndexHash>>& existingByLevel,
     bool reuseOutputTree,
+    double copyStageSeconds,
     std::size_t workers,
     const Shape3& computeShape,
     const Shape3& outShape,
@@ -2719,13 +2813,26 @@ static int processChunkAlphaWrap(
         std::max<std::size_t>(1, static_cast<std::size_t>(std::llround(cfg.chunkAlpha / 4.0)));
     const std::size_t haloVoxels =
         static_cast<std::size_t>(std::ceil(cfg.chunkAlpha + static_cast<double>(offsetVoxels)));
+    const std::size_t wrapProgressTotal = std::max<std::size_t>(1, total);
+    const std::size_t wrapCadence = progressCadence(wrapProgressTotal);
 
     if (cfg.verbose) {
+        std::cerr << "[config] mode=" << processingModeToString(cfg.mode)
+                  << " compute_level=" << cfg.computeLevel
+                  << " output_level=" << cfg.outputLevel
+                  << " chunk_alpha=" << cfg.chunkAlpha
+                  << " workers=" << workers
+                  << " output_tree=" << (reuseOutputTree ? "reuse" : "copy")
+                  << " z_range=[" << zStart << "," << zStop << ")\n";
         std::cerr << "[chunk-alpha-wrap] chunks=" << total
                   << " alpha=" << cfg.chunkAlpha
                   << " offset=" << offsetVoxels
                   << " halo=" << haloVoxels
                   << " scale=" << scale << '\n';
+        emitStructuredStage(true, "wrap", wrapProgressTotal);
+        if (total == 0) {
+            emitStructuredProgress(true, "wrap", 1, wrapProgressTotal);
+        }
     }
 
     std::atomic<std::size_t> next{0};
@@ -2744,11 +2851,16 @@ static int processChunkAlphaWrap(
     threads.reserve(workers);
 
     const auto progress = [&](std::size_t d) {
+        if (cfg.verbose && shouldEmitStructuredProgress(d, wrapProgressTotal, wrapCadence)) {
+            emitStructuredProgress(true, "wrap", d, wrapProgressTotal);
+        }
         if (cfg.verbose && (d == 1 || (d % 16) == 0 || d == total)) {
             std::lock_guard<std::mutex> lock(ioMutex);
             std::cerr << "[ignore] " << d << "/" << total << " compute chunks\n";
         }
     };
+
+    const auto wrapStageStart = std::chrono::steady_clock::now();
 
     for (std::size_t tid = 0; tid < workers; ++tid) {
         threads.emplace_back([&, tid]() {
@@ -2883,6 +2995,8 @@ static int processChunkAlphaWrap(
     if (hadError.load()) {
         throw std::runtime_error("failed while processing compute chunks: " + firstError);
     }
+    const double wrapStageSeconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - wrapStageStart).count();
 
     std::vector<ChunkIndex> activeTouched;
     activeTouched.reserve(touchedLevel0Global.size());
@@ -2892,6 +3006,7 @@ static int processChunkAlphaWrap(
     std::sort(activeTouched.begin(), activeTouched.end(), chunkIndexLess);
     profile.touchedChunksLevel0 = activeTouched.size();
 
+    double pyramidStageSeconds = 0.0;
     if (cfg.rebuildPyramid) {
         for (int level : levels) {
             if (level == 0) {
@@ -2913,6 +3028,7 @@ static int processChunkAlphaWrap(
                 }
                 existingDst = &it->second;
             }
+            const auto pyramidLevelStart = std::chrono::steady_clock::now();
             activeTouched = buildLabelPriorityPyramidLevelTouched(cfg.outputRoot,
                                                                   level,
                                                                   activeTouched,
@@ -2921,7 +3037,10 @@ static int processChunkAlphaWrap(
                                                                   existingDst,
                                                                   cfg.existingChunksOnly,
                                                                   skippedMissingPyramid,
+                                                                  cfg.verbose,
                                                                   &profile);
+            pyramidStageSeconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - pyramidLevelStart).count();
         }
     } else if (cfg.verbose) {
         std::cerr << "[pyramid] skipped (no-rebuild-pyramid)" << '\n';
@@ -2946,6 +3065,29 @@ static int processChunkAlphaWrap(
     writeOutputMetadata(cfg, outShape, inputMeta, stats);
     if (cfg.profileEnabled && !cfg.profileJsonPath.empty()) {
         writeProfileJson(cfg.profileJsonPath, cfg, reuseOutputTree, profile, total);
+    }
+    if (cfg.verbose) {
+        const double totalStageSeconds = copyStageSeconds + wrapStageSeconds + pyramidStageSeconds;
+        std::cerr << std::fixed << std::setprecision(3)
+                  << "[summary] mode=" << processingModeToString(cfg.mode)
+                  << " copy_seconds=" << copyStageSeconds
+                  << " wrap_seconds=" << wrapStageSeconds
+                  << " pyramid_seconds=" << pyramidStageSeconds
+                  << " total_seconds=" << totalStageSeconds
+                  << " wrapped_chunks=" << profile.computeChunksWrapped
+                  << " touched_level0=" << profile.touchedChunksLevel0
+                  << '\n';
+        std::cerr << "VC_SUMMARY mode=" << processingModeToString(cfg.mode)
+                  << " reuse_output_tree=" << (reuseOutputTree ? 1 : 0)
+                  << " copy_seconds=" << copyStageSeconds
+                  << " wrap_seconds=" << wrapStageSeconds
+                  << " pyramid_seconds=" << pyramidStageSeconds
+                  << " total_seconds=" << totalStageSeconds
+                  << " compute_chunks=" << total
+                  << " wrapped_chunks=" << profile.computeChunksWrapped
+                  << " touched_level0=" << profile.touchedChunksLevel0
+                  << '\n';
+        std::cerr.unsetf(std::ios::floatfield);
     }
     std::cout << "vc_add_ignore_label completed\n";
     return EXIT_SUCCESS;
@@ -3494,11 +3636,37 @@ static int process(const Config& cfg)
     }
 
     const auto existingByLevel = scanExistingChunksByLevel(cfg.inputRoot, levels);
+    const auto copyStageStart = std::chrono::steady_clock::now();
     if (reuseOutputTree && outputExisted) {
+        if (cfg.verbose) {
+            std::cerr << "[copy] mode=reuse validating existing output tree\n";
+            emitStructuredStage(true, "reuse", 1);
+        }
         validateReusableOutputTree(cfg.inputRoot, cfg.outputRoot, levels);
+        if (cfg.verbose) {
+            emitStructuredProgress(true, "reuse", 1, 1);
+        }
     } else {
-        copyInputTreeChunkwise(cfg.inputRoot, cfg.outputRoot, levels, existingByLevel, workers);
+        if (cfg.verbose) {
+            std::size_t totalCopyChunks = 0;
+            for (int level : levels) {
+                const auto it = existingByLevel.find(level);
+                if (it != existingByLevel.end()) {
+                    totalCopyChunks += it->second.size();
+                }
+            }
+            std::cerr << "[copy] mode=copy chunk_files=" << totalCopyChunks
+                      << " levels=" << levels.size() << '\n';
+        }
+        copyInputTreeChunkwise(cfg.inputRoot,
+                               cfg.outputRoot,
+                               levels,
+                               existingByLevel,
+                               workers,
+                               cfg.verbose);
     }
+    const double copyStageSeconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - copyStageStart).count();
 
     vc::VcDataset computeDs(cfg.inputRoot / std::to_string(cfg.computeLevel));
     vc::VcDataset out0(cfg.outputRoot / "0");
@@ -3519,6 +3687,7 @@ static int process(const Config& cfg)
                                      inputMeta,
                                      existingByLevel,
                                      reuseOutputTree,
+                                     copyStageSeconds,
                                      workers,
                                      computeShape,
                                      outShape,
@@ -3547,6 +3716,13 @@ static int process(const Config& cfg)
         profile.bytesRead += cachePlan.requiredBytes;
     }
     if (cfg.verbose) {
+        std::cerr << "[config] mode=" << processingModeToString(cfg.mode)
+                  << " compute_level=" << cfg.computeLevel
+                  << " output_level=" << cfg.outputLevel
+                  << " alpha=" << cfg.alpha
+                  << " workers=" << workers
+                  << " output_tree=" << (reuseOutputTree ? "reuse" : "copy")
+                  << " z_range=[" << zStart << "," << zStop << ")\n";
         std::cerr << "[cache] mode="
                   << (cachePlan.mode == ComputeCacheMode::preload ? "preload" : "stream")
                   << " required=" << cachePlan.requiredBytes
@@ -3720,13 +3896,27 @@ static int process(const Config& cfg)
     };
 
     const bool useChunkZSlab = !useLegacyMap && cfg.chunkZSlab;
+    const std::size_t sliceProgressTotal = std::max<std::size_t>(1, total);
+    const std::size_t sliceCadence = progressCadence(sliceProgressTotal);
 
     const auto processProgress = [&](std::size_t d) {
+        if (cfg.verbose && shouldEmitStructuredProgress(d, sliceProgressTotal, sliceCadence)) {
+            emitStructuredProgress(true, "slice", d, sliceProgressTotal);
+        }
         if (cfg.verbose && (d == 1 || (d % 32) == 0 || d == total)) {
             std::lock_guard<std::mutex> lock(ioMutex);
             std::cerr << "[ignore] " << d << "/" << total << " slices\n";
         }
     };
+
+    if (cfg.verbose) {
+        emitStructuredStage(true, "slice", sliceProgressTotal);
+        if (total == 0) {
+            emitStructuredProgress(true, "slice", 1, sliceProgressTotal);
+        }
+    }
+
+    const auto sliceStageStart = std::chrono::steady_clock::now();
 
     if (useChunkZSlab) {
         const std::size_t slabCount = (outShape[0] + outChunk[0] - 1) / outChunk[0];
@@ -4027,6 +4217,8 @@ static int process(const Config& cfg)
     if (hadError.load()) {
         throw std::runtime_error("failed while processing slices: " + firstError);
     }
+    const double sliceStageSeconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - sliceStageStart).count();
 
     std::vector<ChunkIndex> activeTouched;
     activeTouched.reserve(touchedLevel0Global.size());
@@ -4036,6 +4228,7 @@ static int process(const Config& cfg)
     std::sort(activeTouched.begin(), activeTouched.end(), chunkIndexLess);
     profile.touchedChunksLevel0 = activeTouched.size();
 
+    double pyramidStageSeconds = 0.0;
     // Rebuild only touched pyramid regions from output level-0 upwards.
     if (cfg.rebuildPyramid) {
         for (int level : levels) {
@@ -4058,6 +4251,7 @@ static int process(const Config& cfg)
                 }
                 existingDst = &it->second;
             }
+            const auto pyramidLevelStart = std::chrono::steady_clock::now();
             activeTouched = buildLabelPriorityPyramidLevelTouched(cfg.outputRoot,
                                                                   level,
                                                                   activeTouched,
@@ -4066,7 +4260,10 @@ static int process(const Config& cfg)
                                                                   existingDst,
                                                                   cfg.existingChunksOnly,
                                                                   skippedMissingPyramid,
+                                                                  cfg.verbose,
                                                                   &profile);
+            pyramidStageSeconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - pyramidLevelStart).count();
         }
     } else if (cfg.verbose) {
         std::cerr << "[pyramid] skipped (no-rebuild-pyramid)" << '\n';
@@ -4094,6 +4291,27 @@ static int process(const Config& cfg)
     writeOutputMetadata(cfg, shape0, inputMeta, stats);
     if (cfg.profileEnabled && !cfg.profileJsonPath.empty()) {
         writeProfileJson(cfg.profileJsonPath, cfg, reuseOutputTree, profile, total);
+    }
+    if (cfg.verbose) {
+        const double totalStageSeconds = copyStageSeconds + sliceStageSeconds + pyramidStageSeconds;
+        std::cerr << std::fixed << std::setprecision(3)
+                  << "[summary] mode=" << processingModeToString(cfg.mode)
+                  << " copy_seconds=" << copyStageSeconds
+                  << " slice_seconds=" << sliceStageSeconds
+                  << " pyramid_seconds=" << pyramidStageSeconds
+                  << " total_seconds=" << totalStageSeconds
+                  << " touched_level0=" << profile.touchedChunksLevel0
+                  << '\n';
+        std::cerr << "VC_SUMMARY mode=" << processingModeToString(cfg.mode)
+                  << " reuse_output_tree=" << (reuseOutputTree ? 1 : 0)
+                  << " copy_seconds=" << copyStageSeconds
+                  << " slice_seconds=" << sliceStageSeconds
+                  << " pyramid_seconds=" << pyramidStageSeconds
+                  << " total_seconds=" << totalStageSeconds
+                  << " slices=" << total
+                  << " touched_level0=" << profile.touchedChunksLevel0
+                  << '\n';
+        std::cerr.unsetf(std::ios::floatfield);
     }
     std::cout << "vc_add_ignore_label completed\n";
     return EXIT_SUCCESS;

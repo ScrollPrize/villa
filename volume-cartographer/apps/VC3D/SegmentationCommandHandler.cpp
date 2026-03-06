@@ -12,6 +12,7 @@
 #include <vector>
 #include <memory>
 #include <filesystem>
+#include <limits>
 
 #include <QSettings>
 #include <QMessageBox>
@@ -41,6 +42,7 @@
 #include <QPointer>
 #include <QTimer>
 #include <QTemporaryFile>
+#include <QHash>
 #include <QSet>
 #include <QVector>
 #include <QSpinBox>
@@ -214,16 +216,88 @@ struct IgnoreLabelDialogResult {
     QString volumePath;
     QString outputName;
     int ignoreValue{127};
-    double alpha{0.005};
-    int angleBins{72};
-    double shrinkFactor{0.95};
-    int computeLevel{2};
+    double chunkAlphaL0{64.0};
     int workers{0};
     int zMin{0};
     int zMax{-1};
-    bool skipOuter{false};
-    bool skipInner{false};
 };
+
+struct IgnoreLabelProgressState {
+    QString pendingOutput;
+    QString stageName;
+    int stageLevel{-1};
+    int totalSteps{0};
+};
+
+static bool parseStructuredProgressLine(const QString& line,
+                                        QString* kindOut,
+                                        QHash<QString, QString>* fieldsOut)
+{
+    if (!kindOut || !fieldsOut) {
+        return false;
+    }
+
+    const QString trimmed = line.trimmed();
+    if (!trimmed.startsWith(QStringLiteral("VC_"))) {
+        return false;
+    }
+
+    const QStringList tokens = trimmed.split(QChar::Space, Qt::SkipEmptyParts);
+    if (tokens.isEmpty()) {
+        return false;
+    }
+
+    *kindOut = tokens.front();
+    fieldsOut->clear();
+    for (int i = 1; i < tokens.size(); ++i) {
+        const QString& token = tokens.at(i);
+        const int eq = token.indexOf(QChar('='));
+        if (eq <= 0 || eq >= token.size() - 1) {
+            continue;
+        }
+        fieldsOut->insert(token.left(eq), token.mid(eq + 1));
+    }
+    return true;
+}
+
+static int clampProgressCount(qint64 value)
+{
+    if (value <= 0) {
+        return 0;
+    }
+    if (value > std::numeric_limits<int>::max()) {
+        return std::numeric_limits<int>::max();
+    }
+    return static_cast<int>(value);
+}
+
+static QString ignoreLabelStageText(const QString& stageName,
+                                    int stageLevel,
+                                    int current,
+                                    int total)
+{
+    QString base;
+    if (stageName == QStringLiteral("copy")) {
+        base = QObject::tr("Copying input tree");
+    } else if (stageName == QStringLiteral("reuse")) {
+        base = QObject::tr("Reusing existing output tree");
+    } else if (stageName == QStringLiteral("wrap")) {
+        base = QObject::tr("Wrapping level-0 chunks");
+    } else if (stageName == QStringLiteral("pyramid")) {
+        base = stageLevel >= 0
+            ? QObject::tr("Building pyramid level %1").arg(stageLevel)
+            : QObject::tr("Building pyramid");
+    } else if (stageName == QStringLiteral("slice")) {
+        base = QObject::tr("Processing slices");
+    } else {
+        base = QObject::tr("Running %1").arg(stageName);
+    }
+
+    if (total > 0 && current >= 0) {
+        return QObject::tr("%1 (%2 / %3)").arg(base).arg(current).arg(total);
+    }
+    return base;
+}
 
 bool selectIgnoreLabelParams(QWidget* parent,
                              const QVector<VolumeSelector::VolumeOption>& volumes,
@@ -265,29 +339,21 @@ bool selectIgnoreLabelParams(QWidget* parent,
     spIgnore->setValue(settings.value(QStringLiteral("tools/add_ignore_label_ignore_value"), 127).toInt());
     form->addRow(QObject::tr("Ignore value:"), spIgnore);
 
-    auto* spAlpha = new QDoubleSpinBox(&dlg);
-    spAlpha->setDecimals(4);
-    spAlpha->setSingleStep(0.001);
-    spAlpha->setRange(0.0, 0.1);
-    spAlpha->setValue(settings.value(QStringLiteral("tools/add_ignore_label_alpha"), 0.005).toDouble());
-    form->addRow(QObject::tr("Alpha:"), spAlpha);
+    auto* lblMode = new QLabel(
+        QObject::tr("Runs 3D chunk alpha-wrap on level 0 and labels only the outer region."),
+        &dlg);
+    lblMode->setWordWrap(true);
+    form->addRow(QString(), lblMode);
 
-    auto* spBins = new QSpinBox(&dlg);
-    spBins->setRange(8, 720);
-    spBins->setValue(settings.value(QStringLiteral("tools/add_ignore_label_angle_bins"), 72).toInt());
-    form->addRow(QObject::tr("Angle bins:"), spBins);
-
-    auto* spShrink = new QDoubleSpinBox(&dlg);
-    spShrink->setDecimals(3);
-    spShrink->setSingleStep(0.01);
-    spShrink->setRange(0.10, 1.50);
-    spShrink->setValue(settings.value(QStringLiteral("tools/add_ignore_label_shrink"), 0.95).toDouble());
-    form->addRow(QObject::tr("Shrink factor:"), spShrink);
-
-    auto* spCompute = new QSpinBox(&dlg);
-    spCompute->setRange(0, 10);
-    spCompute->setValue(settings.value(QStringLiteral("tools/add_ignore_label_compute_level"), 2).toInt());
-    form->addRow(QObject::tr("Compute level:"), spCompute);
+    auto* spChunkAlpha = new QDoubleSpinBox(&dlg);
+    spChunkAlpha->setDecimals(1);
+    spChunkAlpha->setSingleStep(1.0);
+    spChunkAlpha->setRange(1.0, 4096.0);
+    spChunkAlpha->setValue(
+        settings.value(QStringLiteral("tools/add_ignore_label_chunk_alpha_l0"), 64.0).toDouble());
+    spChunkAlpha->setToolTip(
+        QObject::tr("Absolute alpha-wrap radius in level-0 voxels."));
+    form->addRow(QObject::tr("Wrap radius (L0 voxels):"), spChunkAlpha);
 
     auto* spWorkers = new QSpinBox(&dlg);
     spWorkers->setRange(0, 256);
@@ -298,21 +364,13 @@ bool selectIgnoreLabelParams(QWidget* parent,
     auto* spZMin = new QSpinBox(&dlg);
     spZMin->setRange(0, 1000000000);
     spZMin->setValue(settings.value(QStringLiteral("tools/add_ignore_label_z_min"), 0).toInt());
-    form->addRow(QObject::tr("Z min:"), spZMin);
+    form->addRow(QObject::tr("Level-0 Z min:"), spZMin);
 
     auto* spZMax = new QSpinBox(&dlg);
     spZMax->setRange(-1, 1000000000);
     spZMax->setValue(settings.value(QStringLiteral("tools/add_ignore_label_z_max"), -1).toInt());
-    spZMax->setToolTip(QObject::tr("-1 means all remaining slices."));
-    form->addRow(QObject::tr("Z max (exclusive):"), spZMax);
-
-    auto* chkSkipOuter = new QCheckBox(QObject::tr("Skip outer region"), &dlg);
-    chkSkipOuter->setChecked(settings.value(QStringLiteral("tools/add_ignore_label_skip_outer"), false).toBool());
-    form->addRow(QString(), chkSkipOuter);
-
-    auto* chkSkipInner = new QCheckBox(QObject::tr("Skip inner region"), &dlg);
-    chkSkipInner->setChecked(settings.value(QStringLiteral("tools/add_ignore_label_skip_inner"), false).toBool());
-    form->addRow(QString(), chkSkipInner);
+    spZMax->setToolTip(QObject::tr("-1 means the end of the level-0 volume."));
+    form->addRow(QObject::tr("Level-0 Z max (exclusive):"), spZMax);
 
     main->addLayout(form);
 
@@ -325,23 +383,12 @@ bool selectIgnoreLabelParams(QWidget* parent,
                                  QObject::tr("Output folder name cannot be empty."));
             return;
         }
-        if (chkSkipInner->isChecked() && chkSkipOuter->isChecked()) {
-            QMessageBox::warning(&dlg,
-                                 QObject::tr("Error"),
-                                 QObject::tr("Both inner and outer detection are disabled."));
-            return;
-        }
         settings.setValue(QStringLiteral("tools/add_ignore_label_output_name"), outName);
         settings.setValue(QStringLiteral("tools/add_ignore_label_ignore_value"), spIgnore->value());
-        settings.setValue(QStringLiteral("tools/add_ignore_label_alpha"), spAlpha->value());
-        settings.setValue(QStringLiteral("tools/add_ignore_label_angle_bins"), spBins->value());
-        settings.setValue(QStringLiteral("tools/add_ignore_label_shrink"), spShrink->value());
-        settings.setValue(QStringLiteral("tools/add_ignore_label_compute_level"), spCompute->value());
+        settings.setValue(QStringLiteral("tools/add_ignore_label_chunk_alpha_l0"), spChunkAlpha->value());
         settings.setValue(QStringLiteral("tools/add_ignore_label_workers"), spWorkers->value());
         settings.setValue(QStringLiteral("tools/add_ignore_label_z_min"), spZMin->value());
         settings.setValue(QStringLiteral("tools/add_ignore_label_z_max"), spZMax->value());
-        settings.setValue(QStringLiteral("tools/add_ignore_label_skip_outer"), chkSkipOuter->isChecked());
-        settings.setValue(QStringLiteral("tools/add_ignore_label_skip_inner"), chkSkipInner->isChecked());
         dlg.accept();
     });
     QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -357,15 +404,10 @@ bool selectIgnoreLabelParams(QWidget* parent,
         out->outputName += QStringLiteral(".zarr");
     }
     out->ignoreValue = spIgnore->value();
-    out->alpha = spAlpha->value();
-    out->angleBins = spBins->value();
-    out->shrinkFactor = spShrink->value();
-    out->computeLevel = spCompute->value();
+    out->chunkAlphaL0 = spChunkAlpha->value();
     out->workers = spWorkers->value();
     out->zMin = spZMin->value();
     out->zMax = spZMax->value();
-    out->skipOuter = chkSkipOuter->isChecked();
-    out->skipInner = chkSkipInner->isChecked();
     return !out->volumePath.isEmpty();
 }
 
@@ -2868,16 +2910,13 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
     QStringList args;
     args << params.volumePath
          << runOutputRootStr
-         << QStringLiteral("--mode") << QStringLiteral("legacy-slice")
-         << QStringLiteral("--result-mode") << QStringLiteral("fast")
-         << QStringLiteral("--algo-mode") << QStringLiteral("polar")
+         << QStringLiteral("--mode") << QStringLiteral("chunk-alpha-wrap")
+         << QStringLiteral("--chunk-alpha") << QString::number(params.chunkAlphaL0, 'g', 10)
+         << QStringLiteral("--compute-level") << QStringLiteral("0")
+         << QStringLiteral("--output-level") << QStringLiteral("0")
+         << QStringLiteral("--skip-inner")
          << QStringLiteral("--verbose")
          << QStringLiteral("--ignore-value") << QString::number(params.ignoreValue)
-         << QStringLiteral("--alpha") << QString::number(params.alpha, 'g', 10)
-         << QStringLiteral("--n-angle-bins") << QString::number(params.angleBins)
-         << QStringLiteral("--shrink-factor") << QString::number(params.shrinkFactor, 'g', 10)
-         << QStringLiteral("--compute-level") << QString::number(params.computeLevel)
-         << QStringLiteral("--output-level") << QStringLiteral("0")
          << QStringLiteral("--z-min") << QString::number(params.zMin);
 
     if (params.zMax >= 0) {
@@ -2885,12 +2924,6 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
     }
     if (params.workers > 0) {
         args << QStringLiteral("--workers") << QString::number(params.workers);
-    }
-    if (params.skipOuter) {
-        args << QStringLiteral("--skip-outer");
-    }
-    if (params.skipInner) {
-        args << QStringLiteral("--skip-inner");
     }
     if (reuseExistingOutput) {
         args << QStringLiteral("--reuse-output-tree");
@@ -2902,33 +2935,164 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
         return;
     }
 
+    QPointer<QProgressDialog> progressDialog = new QProgressDialog(
+        tr("Preparing add ignore label..."),
+        tr("Cancel"),
+        0,
+        0,
+        _parentWidget);
+    progressDialog->setWindowTitle(tr("Add Ignore Label"));
+    progressDialog->setWindowModality(Qt::WindowModal);
+    progressDialog->setAutoClose(false);
+    progressDialog->setAutoReset(false);
+    progressDialog->setMinimumDuration(0);
+    progressDialog->setRange(0, 0);
+    progressDialog->setValue(0);
+    progressDialog->setAttribute(Qt::WA_DeleteOnClose);
+    progressDialog->show();
+
     QPointer<SegmentationCommandHandler> guard(this);
-    auto connection = std::make_shared<QMetaObject::Connection>();
-    *connection = connect(runner,
+    auto progressState = std::make_shared<IgnoreLabelProgressState>();
+    auto finishConnection = std::make_shared<QMetaObject::Connection>();
+    auto outputConnection = std::make_shared<QMetaObject::Connection>();
+
+    QObject::connect(progressDialog,
+                     &QProgressDialog::canceled,
+                     this,
+                     [this, runner, progressDialog]() {
+        if (progressDialog) {
+            progressDialog->setRange(0, 0);
+            progressDialog->setLabelText(tr("Canceling add ignore label..."));
+        }
+        runner->cancel();
+        emit statusMessage(tr("Canceling add ignore label..."), 0);
+    });
+
+    *outputConnection = connect(runner,
+                                &CommandLineToolRunner::consoleOutputReceived,
+                                this,
+                                [this, guard, progressDialog, progressState](const QString& output) {
+        if (!guard) {
+            return;
+        }
+        progressState->pendingOutput += output;
+
+        while (true) {
+            const int newline = progressState->pendingOutput.indexOf(QChar('\n'));
+            if (newline < 0) {
+                break;
+            }
+
+            QString line = progressState->pendingOutput.left(newline);
+            progressState->pendingOutput.remove(0, newline + 1);
+            line = line.trimmed();
+            if (line.isEmpty()) {
+                continue;
+            }
+
+            QString kind;
+            QHash<QString, QString> fields;
+            if (!parseStructuredProgressLine(line, &kind, &fields)) {
+                continue;
+            }
+
+            if (kind == QStringLiteral("VC_STAGE")) {
+                progressState->stageName = fields.value(QStringLiteral("name"));
+                progressState->stageLevel = fields.value(QStringLiteral("level"), QStringLiteral("-1")).toInt();
+                const int total = std::max(
+                    1,
+                    clampProgressCount(fields.value(QStringLiteral("total"), QStringLiteral("0")).toLongLong()));
+                progressState->totalSteps = total;
+
+                if (progressDialog) {
+                    progressDialog->setRange(0, total);
+                    progressDialog->setValue(0);
+                    progressDialog->setLabelText(
+                        ignoreLabelStageText(progressState->stageName,
+                                             progressState->stageLevel,
+                                             0,
+                                             total));
+                }
+                emit statusMessage(ignoreLabelStageText(progressState->stageName,
+                                                       progressState->stageLevel,
+                                                       0,
+                                                       total),
+                                   0);
+                continue;
+            }
+
+            if (kind == QStringLiteral("VC_PROGRESS")) {
+                const QString stageName =
+                    fields.value(QStringLiteral("name"), progressState->stageName);
+                const int stageLevel =
+                    fields.contains(QStringLiteral("level"))
+                        ? fields.value(QStringLiteral("level")).toInt()
+                        : progressState->stageLevel;
+                const int total = std::max(
+                    1,
+                    clampProgressCount(fields.value(QStringLiteral("total"),
+                                                    QString::number(progressState->totalSteps))
+                                           .toLongLong()));
+                const int current = std::clamp(
+                    clampProgressCount(fields.value(QStringLiteral("current"), QStringLiteral("0")).toLongLong()),
+                    0,
+                    total);
+
+                progressState->stageName = stageName;
+                progressState->stageLevel = stageLevel;
+                progressState->totalSteps = total;
+
+                if (progressDialog) {
+                    progressDialog->setRange(0, total);
+                    progressDialog->setValue(current);
+                    progressDialog->setLabelText(
+                        ignoreLabelStageText(stageName, stageLevel, current, total));
+                }
+                continue;
+            }
+
+            if (kind == QStringLiteral("VC_SUMMARY") && progressDialog) {
+                progressDialog->setRange(0, 0);
+                progressDialog->setLabelText(tr("Finalizing output..."));
+            }
+        }
+    });
+
+    *finishConnection = connect(runner,
                           &CommandLineToolRunner::toolFinished,
                           this,
-                          [this, guard, connection, useStaging, stagedOutputRootStr, finalOutputRootStr]
+                          [this, guard, finishConnection, outputConnection, progressDialog,
+                           useStaging, stagedOutputRootStr, finalOutputRootStr]
                           (CommandLineToolRunner::Tool tool,
                            bool success,
                            const QString& message,
                            const QString&,
                            bool) {
         if (!guard) {
-            disconnect(*connection);
+            disconnect(*finishConnection);
+            disconnect(*outputConnection);
             return;
         }
         if (tool != CommandLineToolRunner::Tool::CustomCommand) {
             return;
         }
-        disconnect(*connection);
+        disconnect(*finishConnection);
+        disconnect(*outputConnection);
 
         bool finalized = false;
         if (!success) {
+            if (progressDialog) {
+                progressDialog->close();
+            }
             QMessageBox::critical(_parentWidget,
                                   tr("Error"),
                                   tr("vc_add_ignore_label failed.\n%1").arg(message));
             emit statusMessage(tr("Add ignore label failed"), 3000);
         } else if (useStaging) {
+            if (progressDialog) {
+                progressDialog->setRange(0, 0);
+                progressDialog->setLabelText(tr("Finalizing output..."));
+            }
             std::error_code renameErr;
             std::filesystem::rename(stagedOutputRootStr.toStdString(),
                                     finalOutputRootStr.toStdString(),
@@ -2946,6 +3110,10 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
                     5000);
             }
         } else {
+            if (progressDialog) {
+                progressDialog->setRange(0, 0);
+                progressDialog->setLabelText(tr("Finishing..."));
+            }
             finalized = true;
             emit statusMessage(
                 tr("Ignore label volume updated -> %1")
@@ -2957,10 +3125,17 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
             std::error_code cleanupErr;
             std::filesystem::remove_all(std::filesystem::path(stagedOutputRootStr.toStdString()), cleanupErr);
         }
+        if (progressDialog) {
+            progressDialog->close();
+        }
     });
 
     if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_add_ignore_label"))) {
-        QObject::disconnect(*connection);
+        QObject::disconnect(*finishConnection);
+        QObject::disconnect(*outputConnection);
+        if (progressDialog) {
+            progressDialog->close();
+        }
         QMessageBox::critical(_parentWidget,
                               tr("Error"),
                               tr("Failed to start vc_add_ignore_label."));
@@ -2971,7 +3146,7 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
         return;
     }
 
-    emit statusMessage(tr("Add ignore label started..."), 0);
+    emit statusMessage(tr("Add ignore label started at level 0..."), 0);
 }
 
 void SegmentationCommandHandler::onExportWidthChunks(const std::string& segmentId)
