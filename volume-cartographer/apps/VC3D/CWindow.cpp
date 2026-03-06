@@ -2994,8 +2994,11 @@ void CWindow::OpenVolume(const QString& path)
         _segmentationWidget->setVolumePackagePath(aVpkgPath);
     }
 
-    setVolume(_state->vpkg()->volume());
     refreshVolumeSelectionUi(QString());
+    if (!_state->vpkg()->hasVolumes()) {
+        Logger()->info("Opened volpkg '{}' with no volumes", aVpkgPath.toStdString());
+        statusBar()->showMessage(tr("Opened volume package with no volumes."), 5000);
+    }
 
     if (_volumeOverlay) {
         _volumeOverlay->setVolumePkg(_state->vpkg(), _state->vpkgPath());
@@ -3160,12 +3163,14 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
                 // Ignore errors - neural growth path update is non-critical.
             }
         }
-    } else if (_segmentationWidget) {
-        _state->setCurrentVolume(nullptr);
+    } else {
+        setVolume(nullptr);
         _state->setSegmentationGrowthVolumeId({});
-        _segmentationWidget->setAvailableVolumes(QVector<QPair<QString, QString>>{}, {});
-        _segmentationWidget->setActiveVolume({});
-        _segmentationWidget->setVolumeZarrPath({});
+        if (_segmentationWidget) {
+            _segmentationWidget->setAvailableVolumes(QVector<QPair<QString, QString>>{}, {});
+            _segmentationWidget->setActiveVolume({});
+            _segmentationWidget->setVolumeZarrPath({});
+        }
     }
 }
 
