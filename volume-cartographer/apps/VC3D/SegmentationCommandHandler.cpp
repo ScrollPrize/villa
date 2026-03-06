@@ -2643,6 +2643,8 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
          << stagedOutputRootStr
          << QStringLiteral("--reference-zarr")
          << referenceZarr
+         << QStringLiteral("--raster-mode")
+         << QStringLiteral("zyx-integer")
          << QStringLiteral("--overwrite");
     for (const QString& segmentId : validIds) {
         args << QStringLiteral("--source-segment") << segmentId;
