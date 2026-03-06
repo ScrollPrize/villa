@@ -888,6 +888,11 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit rasterizeSegmentsRequested(rasterizeTargets);
     });
 
+    QAction* addIgnoreLabelAction = contextMenu.addAction(tr("Add ignore label"));
+    connect(addIgnoreLabelAction, &QAction::triggered, this, [this]() {
+        emit addIgnoreLabelRequested();
+    });
+
     contextMenu.addSeparator();
 
     QAction* inpaintTeleaAction = contextMenu.addAction(tr("Inpaint (Telea) && Rebuild Segment"));

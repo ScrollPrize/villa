@@ -129,6 +129,7 @@ signals:
     void exportTifxyzChunksRequested(const QString& segmentId);
     void alphaCompRefineRequested(const QString& segmentId);
     void rasterizeSegmentsRequested(const QStringList& segmentIds);
+    void addIgnoreLabelRequested();
     void statusMessageRequested(const QString& message, int timeoutMs);
     void moveToPathsRequested(const QString& segmentId);
     void renameSurfaceRequested(const QString& segmentId);

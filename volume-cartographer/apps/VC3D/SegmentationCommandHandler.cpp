@@ -12,6 +12,7 @@
 #include <vector>
 #include <memory>
 #include <filesystem>
+#include <limits>
 
 #include <QSettings>
 #include <QMessageBox>
@@ -26,6 +27,7 @@
 #include <QInputDialog>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QVBoxLayout>
@@ -40,10 +42,12 @@
 #include <QPointer>
 #include <QTimer>
 #include <QTemporaryFile>
+#include <QHash>
 #include <QSet>
 #include <QVector>
 #include <QSpinBox>
 #include <QLineEdit>
+#include <QCheckBox>
 #include <QtConcurrent/QtConcurrentRun>
 #if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
 #include <QStandardPaths>
@@ -196,6 +200,242 @@ static bool writeJsonObject(const QString& path, const QJsonObject& obj)
     if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
     f.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
     return true;
+}
+
+static bool updateVolumeIdentityMetadata(const QString& volumePath)
+{
+    if (volumePath.isEmpty()) {
+        return false;
+    }
+
+    const QDir dir(volumePath);
+    if (!dir.exists()) {
+        return false;
+    }
+
+    const QString volumeId = QFileInfo(dir.path()).fileName();
+    if (volumeId.isEmpty()) {
+        return false;
+    }
+
+    const QString metaPath = dir.filePath(QStringLiteral("meta.json"));
+    QJsonObject meta = readJsonObject(metaPath);
+    if (meta.isEmpty()) {
+        return false;
+    }
+
+    meta.insert(QStringLiteral("uuid"), volumeId);
+    meta.insert(QStringLiteral("name"), volumeId);
+    return writeJsonObject(metaPath, meta);
+}
+
+static bool isRasterizedLabelVolumePath(const QString& volumePath)
+{
+    if (volumePath.isEmpty()) {
+        return false;
+    }
+    const QString metaPath = QDir(volumePath).filePath(QStringLiteral("meta.json"));
+    const QJsonObject meta = readJsonObject(metaPath);
+    return meta.value(QStringLiteral("label_volume")).toString() == QStringLiteral("rasterized");
+}
+
+struct IgnoreLabelDialogResult {
+    QString volumePath;
+    QString outputName;
+    int ignoreValue{127};
+    double chunkAlphaL0{64.0};
+    int workers{0};
+    int zMin{0};
+    int zMax{-1};
+};
+
+struct IgnoreLabelProgressState {
+    QString pendingOutput;
+    QString stageName;
+    int stageLevel{-1};
+    int totalSteps{0};
+};
+
+static bool parseStructuredProgressLine(const QString& line,
+                                        QString* kindOut,
+                                        QHash<QString, QString>* fieldsOut)
+{
+    if (!kindOut || !fieldsOut) {
+        return false;
+    }
+
+    const QString trimmed = line.trimmed();
+    if (!trimmed.startsWith(QStringLiteral("VC_"))) {
+        return false;
+    }
+
+    const QStringList tokens = trimmed.split(QChar::Space, Qt::SkipEmptyParts);
+    if (tokens.isEmpty()) {
+        return false;
+    }
+
+    *kindOut = tokens.front();
+    fieldsOut->clear();
+    for (int i = 1; i < tokens.size(); ++i) {
+        const QString& token = tokens.at(i);
+        const int eq = token.indexOf(QChar('='));
+        if (eq <= 0 || eq >= token.size() - 1) {
+            continue;
+        }
+        fieldsOut->insert(token.left(eq), token.mid(eq + 1));
+    }
+    return true;
+}
+
+static int clampProgressCount(qint64 value)
+{
+    if (value <= 0) {
+        return 0;
+    }
+    if (value > std::numeric_limits<int>::max()) {
+        return std::numeric_limits<int>::max();
+    }
+    return static_cast<int>(value);
+}
+
+static QString ignoreLabelStageText(const QString& stageName,
+                                    int stageLevel,
+                                    int current,
+                                    int total)
+{
+    QString base;
+    if (stageName == QStringLiteral("copy")) {
+        base = QObject::tr("Copying input tree");
+    } else if (stageName == QStringLiteral("reuse")) {
+        base = QObject::tr("Reusing existing output tree");
+    } else if (stageName == QStringLiteral("wrap")) {
+        base = QObject::tr("Wrapping level-0 chunks");
+    } else if (stageName == QStringLiteral("pyramid")) {
+        base = stageLevel >= 0
+            ? QObject::tr("Building pyramid level %1").arg(stageLevel)
+            : QObject::tr("Building pyramid");
+    } else if (stageName == QStringLiteral("slice")) {
+        base = QObject::tr("Processing slices");
+    } else {
+        base = QObject::tr("Running %1").arg(stageName);
+    }
+
+    if (total > 0 && current >= 0) {
+        return QObject::tr("%1 (%2 / %3)").arg(base).arg(current).arg(total);
+    }
+    return base;
+}
+
+bool selectIgnoreLabelParams(QWidget* parent,
+                             const QVector<VolumeSelector::VolumeOption>& volumes,
+                             const QString& defaultVolumeId,
+                             IgnoreLabelDialogResult* out)
+{
+    if (!out) {
+        return false;
+    }
+
+    QDialog dlg(parent);
+    dlg.setWindowTitle(QObject::tr("Add Ignore Label"));
+
+    auto* main = new QVBoxLayout(&dlg);
+    auto* volumeSelector = new VolumeSelector(&dlg);
+    volumeSelector->setVolumes(volumes, defaultVolumeId);
+    main->addWidget(volumeSelector);
+
+    auto* form = new QFormLayout();
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMddHHmmss"));
+    QString defaultOut = settings.value(QStringLiteral("tools/add_ignore_label_output_name"),
+                                        QStringLiteral("labels_ignore_%1.zarr").arg(timestamp))
+                             .toString()
+                             .trimmed();
+    if (defaultOut.isEmpty()) {
+        defaultOut = QStringLiteral("labels_ignore_%1.zarr").arg(timestamp);
+    }
+    if (!defaultOut.endsWith(QStringLiteral(".zarr"), Qt::CaseInsensitive)) {
+        defaultOut += QStringLiteral(".zarr");
+    }
+
+    auto* edtOutput = new QLineEdit(defaultOut, &dlg);
+    form->addRow(QObject::tr("Output folder name:"), edtOutput);
+
+    auto* spIgnore = new QSpinBox(&dlg);
+    spIgnore->setRange(1, 254);
+    spIgnore->setValue(settings.value(QStringLiteral("tools/add_ignore_label_ignore_value"), 127).toInt());
+    form->addRow(QObject::tr("Ignore value:"), spIgnore);
+
+    auto* lblMode = new QLabel(
+        QObject::tr("Runs 3D chunk alpha-wrap on level 0 and labels only the outer region."),
+        &dlg);
+    lblMode->setWordWrap(true);
+    form->addRow(QString(), lblMode);
+
+    auto* spChunkAlpha = new QDoubleSpinBox(&dlg);
+    spChunkAlpha->setDecimals(1);
+    spChunkAlpha->setSingleStep(1.0);
+    spChunkAlpha->setRange(1.0, 4096.0);
+    spChunkAlpha->setValue(
+        settings.value(QStringLiteral("tools/add_ignore_label_chunk_alpha_l0"), 64.0).toDouble());
+    spChunkAlpha->setToolTip(
+        QObject::tr("Absolute alpha-wrap radius in level-0 voxels."));
+    form->addRow(QObject::tr("Wrap radius (L0 voxels):"), spChunkAlpha);
+
+    auto* spWorkers = new QSpinBox(&dlg);
+    spWorkers->setRange(0, 256);
+    spWorkers->setValue(settings.value(QStringLiteral("tools/add_ignore_label_workers"), 0).toInt());
+    spWorkers->setToolTip(QObject::tr("0 uses all available hardware threads."));
+    form->addRow(QObject::tr("Workers (0=auto):"), spWorkers);
+
+    auto* spZMin = new QSpinBox(&dlg);
+    spZMin->setRange(0, 1000000000);
+    spZMin->setValue(settings.value(QStringLiteral("tools/add_ignore_label_z_min"), 0).toInt());
+    form->addRow(QObject::tr("Level-0 Z min:"), spZMin);
+
+    auto* spZMax = new QSpinBox(&dlg);
+    spZMax->setRange(-1, 1000000000);
+    spZMax->setValue(settings.value(QStringLiteral("tools/add_ignore_label_z_max"), -1).toInt());
+    spZMax->setToolTip(QObject::tr("-1 means the end of the level-0 volume."));
+    form->addRow(QObject::tr("Level-0 Z max (exclusive):"), spZMax);
+
+    main->addLayout(form);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, [&]() {
+        const QString outName = edtOutput->text().trimmed();
+        if (outName.isEmpty()) {
+            QMessageBox::warning(&dlg,
+                                 QObject::tr("Error"),
+                                 QObject::tr("Output folder name cannot be empty."));
+            return;
+        }
+        settings.setValue(QStringLiteral("tools/add_ignore_label_output_name"), outName);
+        settings.setValue(QStringLiteral("tools/add_ignore_label_ignore_value"), spIgnore->value());
+        settings.setValue(QStringLiteral("tools/add_ignore_label_chunk_alpha_l0"), spChunkAlpha->value());
+        settings.setValue(QStringLiteral("tools/add_ignore_label_workers"), spWorkers->value());
+        settings.setValue(QStringLiteral("tools/add_ignore_label_z_min"), spZMin->value());
+        settings.setValue(QStringLiteral("tools/add_ignore_label_z_max"), spZMax->value());
+        dlg.accept();
+    });
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    main->addWidget(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) {
+        return false;
+    }
+
+    out->volumePath = volumeSelector->selectedVolumePath();
+    out->outputName = edtOutput->text().trimmed();
+    if (!out->outputName.endsWith(QStringLiteral(".zarr"), Qt::CaseInsensitive)) {
+        out->outputName += QStringLiteral(".zarr");
+    }
+    out->ignoreValue = spIgnore->value();
+    out->chunkAlphaL0 = spChunkAlpha->value();
+    out->workers = spWorkers->value();
+    out->zMin = spZMin->value();
+    out->zMax = spZMax->value();
+    return !out->volumePath.isEmpty();
 }
 
 bool selectResumeLocalTracerParams(QWidget* parent,
@@ -2472,6 +2712,8 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
          << stagedOutputRootStr
          << QStringLiteral("--reference-zarr")
          << referenceZarr
+         << QStringLiteral("--raster-mode")
+         << QStringLiteral("zyx-integer")
          << QStringLiteral("--overwrite");
     for (const QString& segmentId : validIds) {
         args << QStringLiteral("--source-segment") << segmentId;
@@ -2555,6 +2797,393 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
 
     emit statusMessage(
         tr("Rasterization started for %1 segment(s)...").arg(validIds.size()), 0);
+}
+
+void SegmentationCommandHandler::onAddIgnoreLabel()
+{
+    if (!_state || !_state->vpkg()) {
+        emit statusMessage(tr("No volume package loaded"), 3000);
+        return;
+    }
+
+    if (_cmdRunner && _cmdRunner->isRunning()) {
+        QMessageBox::warning(_parentWidget, tr("Warning"),
+                             tr("A command line tool is already running."));
+        return;
+    }
+
+    QVector<VolumeSelector::VolumeOption> rasterizedVolumes;
+    QString defaultVolumeId;
+    const QString currentVolumeId = QString::fromStdString(_state->currentVolumeId());
+
+    for (const auto& volumeId : _state->vpkg()->volumeIDs()) {
+        auto volume = _state->vpkg()->volume(volumeId);
+        if (!volume) {
+            continue;
+        }
+        const QString id = QString::fromStdString(volumeId);
+        const QString path = QString::fromStdString(volume->path().string());
+        if (!isRasterizedLabelVolumePath(path)) {
+            continue;
+        }
+
+        VolumeSelector::VolumeOption opt;
+        opt.id = id;
+        opt.name = QString::fromStdString(volume->name());
+        opt.path = path;
+        rasterizedVolumes.push_back(opt);
+
+        if (defaultVolumeId.isEmpty()) {
+            defaultVolumeId = id;
+        }
+        if (!currentVolumeId.isEmpty() && id == currentVolumeId) {
+            defaultVolumeId = id;
+        }
+    }
+
+    if (rasterizedVolumes.isEmpty()) {
+        QMessageBox::warning(_parentWidget,
+                             tr("Error"),
+                             tr("No rasterized label volumes found.\n"
+                                "Only volumes with meta.json field \"label_volume\": \"rasterized\" are supported."));
+        return;
+    }
+
+    IgnoreLabelDialogResult params;
+    if (!selectIgnoreLabelParams(_parentWidget, rasterizedVolumes, defaultVolumeId, &params)) {
+        emit statusMessage(tr("Add ignore label cancelled"), 3000);
+        return;
+    }
+
+    if (!isRasterizedLabelVolumePath(params.volumePath)) {
+        QMessageBox::warning(_parentWidget,
+                             tr("Error"),
+                             tr("Selected volume is not a rasterized label volume."));
+        return;
+    }
+
+    const QString executable = findVcTool("vc_add_ignore_label");
+    if (executable.isEmpty()) {
+        QMessageBox::warning(_parentWidget,
+                             tr("Error"),
+                             tr("vc_add_ignore_label tool not found. Configure tools/vc_add_ignore_label path."));
+        return;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path volpkgDir(_state->vpkg()->getVolpkgDirectory());
+    const std::filesystem::path volumesDir = volpkgDir / "volumes";
+    std::filesystem::create_directories(volumesDir, ec);
+    if (ec) {
+        QMessageBox::critical(_parentWidget,
+                              tr("Error"),
+                              tr("Cannot create volumes directory: %1")
+                                  .arg(QString::fromStdString(ec.message())));
+        return;
+    }
+
+    QString outName = QFileInfo(params.outputName).fileName().trimmed();
+    if (outName.isEmpty()) {
+        outName = QStringLiteral("labels_ignore_%1.zarr")
+                      .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMddHHmmss")));
+    }
+    if (!outName.endsWith(QStringLiteral(".zarr"), Qt::CaseInsensitive)) {
+        outName += QStringLiteral(".zarr");
+    }
+
+    const std::filesystem::path finalOutputRoot = volumesDir / outName.toStdString();
+    const bool outputExists = std::filesystem::exists(finalOutputRoot, ec);
+    if (ec) {
+        QMessageBox::critical(_parentWidget,
+                              tr("Error"),
+                              tr("Cannot inspect output path: %1")
+                                  .arg(QString::fromStdString(ec.message())));
+        return;
+    }
+    if (outputExists && !std::filesystem::is_directory(finalOutputRoot, ec)) {
+        QMessageBox::critical(_parentWidget,
+                              tr("Error"),
+                              tr("Output path exists and is not a directory: %1")
+                                  .arg(QString::fromStdString(finalOutputRoot.string())));
+        return;
+    }
+
+    const bool reuseExistingOutput = outputExists;
+    const bool useStaging = !reuseExistingOutput;
+
+    std::filesystem::path stagedOutputRoot;
+    if (useStaging) {
+        const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMddHHmmss"));
+        stagedOutputRoot = volumesDir / (".vc3d_ignore_" + timestamp.toStdString());
+        for (int idx = 1; std::filesystem::exists(stagedOutputRoot, ec) && idx < 1000; ++idx) {
+            const QString candidate = QStringLiteral(".vc3d_ignore_%1_%2").arg(timestamp).arg(idx);
+            stagedOutputRoot = volumesDir / candidate.toStdString();
+        }
+        if (std::filesystem::exists(stagedOutputRoot, ec)) {
+            QMessageBox::critical(_parentWidget,
+                                  tr("Error"),
+                                  tr("Unable to reserve staging directory after retries: %1")
+                                      .arg(QString::fromStdString(stagedOutputRoot.string())));
+            return;
+        }
+    }
+
+    const QString stagedOutputRootStr = useStaging
+        ? QString::fromStdString(stagedOutputRoot.string())
+        : QString();
+    const QString finalOutputRootStr = QString::fromStdString(finalOutputRoot.string());
+    const QString runOutputRootStr = useStaging ? stagedOutputRootStr : finalOutputRootStr;
+
+    QStringList args;
+    args << params.volumePath
+         << runOutputRootStr
+         << QStringLiteral("--mode") << QStringLiteral("chunk-alpha-wrap")
+         << QStringLiteral("--chunk-alpha") << QString::number(params.chunkAlphaL0, 'g', 10)
+         << QStringLiteral("--compute-level") << QStringLiteral("0")
+         << QStringLiteral("--output-level") << QStringLiteral("0")
+         << QStringLiteral("--skip-inner")
+         << QStringLiteral("--verbose")
+         << QStringLiteral("--ignore-value") << QString::number(params.ignoreValue)
+         << QStringLiteral("--z-min") << QString::number(params.zMin);
+
+    if (params.zMax >= 0) {
+        args << QStringLiteral("--z-max") << QString::number(params.zMax);
+    }
+    if (params.workers > 0) {
+        args << QStringLiteral("--workers") << QString::number(params.workers);
+    }
+    if (reuseExistingOutput) {
+        args << QStringLiteral("--reuse-output-tree");
+    }
+
+    auto* runner = _cmdRunner;
+    if (!runner) {
+        QMessageBox::critical(_parentWidget, tr("Error"), tr("Command runner is not available."));
+        return;
+    }
+
+    QPointer<QProgressDialog> progressDialog = new QProgressDialog(
+        tr("Preparing add ignore label..."),
+        tr("Cancel"),
+        0,
+        0,
+        _parentWidget);
+    progressDialog->setWindowTitle(tr("Add Ignore Label"));
+    progressDialog->setWindowModality(Qt::WindowModal);
+    progressDialog->setAutoClose(false);
+    progressDialog->setAutoReset(false);
+    progressDialog->setMinimumDuration(0);
+    progressDialog->setRange(0, 0);
+    progressDialog->setValue(0);
+    progressDialog->setAttribute(Qt::WA_DeleteOnClose);
+    progressDialog->show();
+
+    QPointer<SegmentationCommandHandler> guard(this);
+    auto progressState = std::make_shared<IgnoreLabelProgressState>();
+    auto finishConnection = std::make_shared<QMetaObject::Connection>();
+    auto outputConnection = std::make_shared<QMetaObject::Connection>();
+
+    QObject::connect(progressDialog,
+                     &QProgressDialog::canceled,
+                     this,
+                     [this, runner, progressDialog]() {
+        if (progressDialog) {
+            progressDialog->setRange(0, 0);
+            progressDialog->setLabelText(tr("Canceling add ignore label..."));
+        }
+        runner->cancel();
+        emit statusMessage(tr("Canceling add ignore label..."), 0);
+    });
+
+    *outputConnection = connect(runner,
+                                &CommandLineToolRunner::consoleOutputReceived,
+                                this,
+                                [this, guard, progressDialog, progressState](const QString& output) {
+        if (!guard) {
+            return;
+        }
+        progressState->pendingOutput += output;
+
+        while (true) {
+            const int newline = progressState->pendingOutput.indexOf(QChar('\n'));
+            if (newline < 0) {
+                break;
+            }
+
+            QString line = progressState->pendingOutput.left(newline);
+            progressState->pendingOutput.remove(0, newline + 1);
+            line = line.trimmed();
+            if (line.isEmpty()) {
+                continue;
+            }
+
+            QString kind;
+            QHash<QString, QString> fields;
+            if (!parseStructuredProgressLine(line, &kind, &fields)) {
+                continue;
+            }
+
+            if (kind == QStringLiteral("VC_STAGE")) {
+                progressState->stageName = fields.value(QStringLiteral("name"));
+                progressState->stageLevel = fields.value(QStringLiteral("level"), QStringLiteral("-1")).toInt();
+                const int total = std::max(
+                    1,
+                    clampProgressCount(fields.value(QStringLiteral("total"), QStringLiteral("0")).toLongLong()));
+                progressState->totalSteps = total;
+
+                if (progressDialog) {
+                    progressDialog->setRange(0, total);
+                    progressDialog->setValue(0);
+                    progressDialog->setLabelText(
+                        ignoreLabelStageText(progressState->stageName,
+                                             progressState->stageLevel,
+                                             0,
+                                             total));
+                }
+                emit statusMessage(ignoreLabelStageText(progressState->stageName,
+                                                       progressState->stageLevel,
+                                                       0,
+                                                       total),
+                                   0);
+                continue;
+            }
+
+            if (kind == QStringLiteral("VC_PROGRESS")) {
+                const QString stageName =
+                    fields.value(QStringLiteral("name"), progressState->stageName);
+                const int stageLevel =
+                    fields.contains(QStringLiteral("level"))
+                        ? fields.value(QStringLiteral("level")).toInt()
+                        : progressState->stageLevel;
+                const int total = std::max(
+                    1,
+                    clampProgressCount(fields.value(QStringLiteral("total"),
+                                                    QString::number(progressState->totalSteps))
+                                           .toLongLong()));
+                const int current = std::clamp(
+                    clampProgressCount(fields.value(QStringLiteral("current"), QStringLiteral("0")).toLongLong()),
+                    0,
+                    total);
+
+                progressState->stageName = stageName;
+                progressState->stageLevel = stageLevel;
+                progressState->totalSteps = total;
+
+                if (progressDialog) {
+                    progressDialog->setRange(0, total);
+                    progressDialog->setValue(current);
+                    progressDialog->setLabelText(
+                        ignoreLabelStageText(stageName, stageLevel, current, total));
+                }
+                continue;
+            }
+
+            if (kind == QStringLiteral("VC_SUMMARY") && progressDialog) {
+                progressDialog->setRange(0, 0);
+                progressDialog->setLabelText(tr("Finalizing output..."));
+            }
+        }
+    });
+
+    *finishConnection = connect(runner,
+                          &CommandLineToolRunner::toolFinished,
+                          this,
+                          [this, guard, finishConnection, outputConnection, progressDialog,
+                           useStaging, stagedOutputRootStr, finalOutputRootStr]
+                          (CommandLineToolRunner::Tool tool,
+                           bool success,
+                           const QString& message,
+                           const QString&,
+                           bool) {
+        if (!guard) {
+            disconnect(*finishConnection);
+            disconnect(*outputConnection);
+            return;
+        }
+        if (tool != CommandLineToolRunner::Tool::CustomCommand) {
+            return;
+        }
+        disconnect(*finishConnection);
+        disconnect(*outputConnection);
+
+        bool finalized = false;
+        if (!success) {
+            if (progressDialog) {
+                progressDialog->close();
+            }
+            QMessageBox::critical(_parentWidget,
+                                  tr("Error"),
+                                  tr("vc_add_ignore_label failed.\n%1").arg(message));
+            emit statusMessage(tr("Add ignore label failed"), 3000);
+        } else if (useStaging) {
+            if (progressDialog) {
+                progressDialog->setRange(0, 0);
+                progressDialog->setLabelText(tr("Finalizing output..."));
+            }
+            std::error_code renameErr;
+            std::filesystem::rename(stagedOutputRootStr.toStdString(),
+                                    finalOutputRootStr.toStdString(),
+                                    renameErr);
+            if (renameErr) {
+                emit showWarning(tr("Warning"),
+                                 tr("Ignore label generation completed, but finalizing output folder failed: %1")
+                                     .arg(QString::fromStdString(renameErr.message())));
+                emit statusMessage(tr("Ignore label complete, but finalizing output failed"), 5000);
+            } else {
+                finalized = true;
+                if (!updateVolumeIdentityMetadata(finalOutputRootStr)) {
+                    emit showWarning(
+                        tr("Warning"),
+                        tr("Ignore label volume created, but updating meta.json identity failed."));
+                    emit statusMessage(
+                        tr("Ignore label volume created, but metadata update failed -> %1")
+                            .arg(QDir::toNativeSeparators(finalOutputRootStr)),
+                        5000);
+                } else {
+                    emit statusMessage(
+                        tr("Ignore label volume created -> %1")
+                            .arg(QDir::toNativeSeparators(finalOutputRootStr)),
+                        5000);
+                }
+            }
+        } else {
+            if (progressDialog) {
+                progressDialog->setRange(0, 0);
+                progressDialog->setLabelText(tr("Finishing..."));
+            }
+            finalized = true;
+            emit statusMessage(
+                tr("Ignore label volume updated -> %1")
+                    .arg(QDir::toNativeSeparators(finalOutputRootStr)),
+                5000);
+        }
+
+        if (!finalized && useStaging) {
+            std::error_code cleanupErr;
+            std::filesystem::remove_all(std::filesystem::path(stagedOutputRootStr.toStdString()), cleanupErr);
+        }
+        if (progressDialog) {
+            progressDialog->close();
+        }
+    });
+
+    if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_add_ignore_label"))) {
+        QObject::disconnect(*finishConnection);
+        QObject::disconnect(*outputConnection);
+        if (progressDialog) {
+            progressDialog->close();
+        }
+        QMessageBox::critical(_parentWidget,
+                              tr("Error"),
+                              tr("Failed to start vc_add_ignore_label."));
+        if (useStaging) {
+            std::error_code cleanupErr;
+            std::filesystem::remove_all(stagedOutputRoot, cleanupErr);
+        }
+        return;
+    }
+
+    emit statusMessage(tr("Add ignore label started at level 0..."), 0);
 }
 
 void SegmentationCommandHandler::onExportWidthChunks(const std::string& segmentId)

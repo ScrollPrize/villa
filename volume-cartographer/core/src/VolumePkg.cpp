@@ -187,11 +187,11 @@ bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
 
     try {
         auto v = Volume::New(dirpath);
-        if (!addVolume(v)) {
+        if (hasVolume(v->id())) {
             Logger()->warn("Volume '{}' already exists in package under id '{}'", volumeDirName, v->id());
             return false;
         }
-        return true;
+        return addVolume(v);
     } catch (const std::exception& exc) {
         Logger()->warn("Failed to add volume '{}': {}", volumeDirName, exc.what());
         return false;

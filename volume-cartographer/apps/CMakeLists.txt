@@ -31,6 +31,16 @@ target_link_libraries(vc_tifxyz2obj vc_core)
 add_executable(vc_tifxyz2zarr_sparse src/vc_tifxyz2zarr_sparse.cpp)
 target_link_libraries(vc_tifxyz2zarr_sparse vc_core Boost::program_options)
 
+add_executable(vc_add_ignore_label src/vc_add_ignore_label.cpp)
+target_link_libraries(vc_add_ignore_label
+    vc_core
+    Boost::program_options
+    CGAL::CGAL
+    opencv_core
+    opencv_imgproc
+    opencv_imgcodecs
+)
+
 add_executable(vc_obj2tifxyz src/vc_obj2tifxyz.cpp)
 target_link_libraries(vc_obj2tifxyz vc_core)
 
@@ -168,6 +178,7 @@ if(VC_USE_PCH)
         vc_tifxyz_inp_mask
         vc_tifxyz_winding
         vc_tifxyz2zarr_sparse
+        vc_add_ignore_label
         vc_fill_quadmesh
         vc_tiffxyz_upscale_grounding
         vc_calc_surface_metrics

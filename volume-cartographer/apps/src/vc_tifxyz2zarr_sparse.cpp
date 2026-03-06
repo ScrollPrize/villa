@@ -1,4 +1,6 @@
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/BinaryPyramid.hpp"
+#include "vc/core/util/TriangleVoxelRaster.hpp"
 #include "vc/core/util/Zarr.hpp"
 #include "vc/core/types/VcDataset.hpp"
 
@@ -8,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -18,6 +21,7 @@
 #include <mutex>
 #include <numeric>
 #include <limits>
+#include <exception>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -36,12 +40,69 @@ namespace {
 
 constexpr size_t kPyramidLevels = 5;
 constexpr size_t kLocalSpoolFlushThreshold = 8192;
+constexpr int kQuadRowWorkBlock = 32;
 constexpr float kAxisPlaneEps = 1e-5f;
 constexpr float kSegmentEps2 = 1e-12f;
 constexpr uint8_t kSurfaceValue = 255;
 const char* kChunkSuffix = "vc_tifxyz2zarr_sparse";
 
 using Shape3 = std::array<size_t, 3>;
+
+enum class RasterMode {
+    ZHalf,
+    ZYXInteger
+};
+
+static const char* rasterModeName(RasterMode mode) {
+    switch (mode) {
+    case RasterMode::ZHalf: return "z-half";
+    case RasterMode::ZYXInteger: return "zyx-integer";
+    }
+    return "zyx-integer";
+}
+
+static RasterMode parseRasterMode(const std::string& mode) {
+    if (mode == "z-half") return RasterMode::ZHalf;
+    if (mode == "zyx-integer") return RasterMode::ZYXInteger;
+    throw std::runtime_error("unsupported --raster-mode: " + mode +
+                             " (expected z-half or zyx-integer)");
+}
+
+struct RunMetrics {
+    std::string rasterMode;
+    std::string inputPath;
+    std::string outputPath;
+    size_t meshCount = 0;
+    size_t touchedChunks = 0;
+    uint64_t uniqueLevel0Voxels = 0;
+    double rasterSeconds = 0.0;
+    double materializeSeconds = 0.0;
+    double pyramidSeconds = 0.0;
+    double totalSeconds = 0.0;
+};
+
+static void writeMetricsJson(const fs::path& path, const RunMetrics& metrics) {
+    nlohmann::json j;
+    j["raster_mode"] = metrics.rasterMode;
+    j["input"] = metrics.inputPath;
+    j["output"] = metrics.outputPath;
+    j["mesh_count"] = metrics.meshCount;
+    j["touched_chunks"] = metrics.touchedChunks;
+    j["unique_level0_voxels"] = metrics.uniqueLevel0Voxels;
+    j["raster_seconds"] = metrics.rasterSeconds;
+    j["materialize_seconds"] = metrics.materializeSeconds;
+    j["pyramid_seconds"] = metrics.pyramidSeconds;
+    j["total_seconds"] = metrics.totalSeconds;
+
+    std::ofstream out(path);
+    if (!out) {
+        throw std::runtime_error("failed creating metrics json: " + path.string());
+    }
+    out << j.dump(2) << "\n";
+    if (!out) {
+        throw std::runtime_error("failed writing metrics json: " + path.string());
+    }
+}
 
 struct ChunkIndex {
     uint32_t z;
@@ -620,28 +681,6 @@ static std::vector<ChunkIndex> buildTouchedParents(const std::vector<ChunkIndex>
     return result;
 }
 
-static void downsampleNearestBinary(const uint8_t* src,
-                                   size_t srcY, size_t srcX,
-                                   uint8_t* dst,
-                                   size_t dstZ, size_t dstY, size_t dstX,
-                                   size_t srcActualZ, size_t srcActualY, size_t srcActualX) {
-    if (srcActualZ == 0 || srcActualY == 0 || srcActualX == 0) return;
-    const size_t srcStrideY = srcX;
-    const size_t srcStrideZ = srcY * srcX;
-
-    for (size_t zz = 0; zz < dstZ; ++zz) {
-        if (2 * zz >= srcActualZ) break;
-        for (size_t yy = 0; yy < dstY; ++yy) {
-            if (2 * yy >= srcActualY) break;
-            for (size_t xx = 0; xx < dstX; ++xx) {
-                if (2 * xx >= srcActualX) break;
-                dst[zz * dstY * dstX + yy * dstX + xx] =
-                    src[(2 * zz) * srcStrideZ + (2 * yy) * srcStrideY + (2 * xx)];
-            }
-        }
-    }
-}
-
 struct SegmentPt {
     float x;
     float y;
@@ -756,17 +795,162 @@ static void rasterizeTriangleToSpool(const cv::Vec3f& a,
 }
 
 template<typename EmitVoxel>
+static void rasterizeQuadForMode(const cv::Vec3f& p00,
+                                 const cv::Vec3f& p01,
+                                 const cv::Vec3f& p10,
+                                 const cv::Vec3f& p11,
+                                 const Shape3& shape,
+                                 RasterMode rasterMode,
+                                 EmitVoxel&& emit) {
+    const auto emitRasterVoxel = [&](const auto& voxel) {
+        emit(static_cast<size_t>(voxel.z),
+             static_cast<size_t>(voxel.y),
+             static_cast<size_t>(voxel.x));
+    };
+
+    if (rasterMode == RasterMode::ZHalf) {
+        vc::core::util::rasterizeTriangleOnAxisSlices(
+            p00, p01, p10, vc::core::util::RasterSliceAxis::Z, 0.5f, shape, emitRasterVoxel);
+        vc::core::util::rasterizeTriangleOnAxisSlices(
+            p10, p01, p11, vc::core::util::RasterSliceAxis::Z, 0.5f, shape, emitRasterVoxel);
+        return;
+    }
+
+    rasterizeTriangleToSpool(p00, p01, p10, shape, emit);
+    rasterizeTriangleToSpool(p10, p01, p11, shape, emit);
+    vc::core::util::rasterizeTriangleOnAxisSlices(
+        p00, p01, p10, vc::core::util::RasterSliceAxis::Y, 0.0f, shape, emitRasterVoxel);
+    vc::core::util::rasterizeTriangleOnAxisSlices(
+        p10, p01, p11, vc::core::util::RasterSliceAxis::Y, 0.0f, shape, emitRasterVoxel);
+    vc::core::util::rasterizeTriangleOnAxisSlices(
+        p00, p01, p10, vc::core::util::RasterSliceAxis::X, 0.0f, shape, emitRasterVoxel);
+    vc::core::util::rasterizeTriangleOnAxisSlices(
+        p10, p01, p11, vc::core::util::RasterSliceAxis::X, 0.0f, shape, emitRasterVoxel);
+}
+
+template<typename EmitVoxel>
+static void rasterizePointGridRows(const cv::Mat_<cv::Vec3f>& pts,
+                                   int rowBegin,
+                                   int rowEnd,
+                                   const Shape3& shape,
+                                   RasterMode rasterMode,
+                                   EmitVoxel&& emit) {
+    if (pts.rows < 2 || pts.cols < 2) return;
+
+    rowBegin = std::max(0, rowBegin);
+    rowEnd = std::min(rowEnd, pts.rows - 1);
+    const int colLimit = pts.cols - 1;
+
+    for (int r = rowBegin; r < rowEnd; ++r) {
+        const cv::Vec3f* row0 = pts.ptr<cv::Vec3f>(r);
+        const cv::Vec3f* row1 = pts.ptr<cv::Vec3f>(r + 1);
+        for (int c = 0; c < colLimit; ++c) {
+            const cv::Vec3f& p00 = row0[c];
+            const cv::Vec3f& p01 = row0[c + 1];
+            const cv::Vec3f& p10 = row1[c];
+            const cv::Vec3f& p11 = row1[c + 1];
+            if (p00[0] == -1.f || p01[0] == -1.f || p10[0] == -1.f || p11[0] == -1.f) {
+                continue;
+            }
+            rasterizeQuadForMode(p00, p01, p10, p11, shape, rasterMode, emit);
+        }
+    }
+}
+
+template<typename EmitVoxel>
 static void rasterizeTifxyzMeshToSpool(const fs::path& meshPath,
                                        const Shape3& shape,
+                                       RasterMode rasterMode,
                                        EmitVoxel&& emit) {
     auto surf = load_quad_from_tifxyz(meshPath.string());
-    const auto& pts = surf->rawPoints();
+    const cv::Mat_<cv::Vec3f> pts = surf->rawPoints();
     if (pts.empty()) return;
+    rasterizePointGridRows(pts, 0, pts.rows - 1, shape, rasterMode, emit);
+}
 
-    for (auto [r, c, p00, p01, p10, p11] : surf->validQuads()) {
-        (void)r; (void)c;
-        rasterizeTriangleToSpool(p00, p01, p10, shape, emit);
-        rasterizeTriangleToSpool(p10, p01, p11, shape, emit);
+static void rasterizeSingleMeshIntraParallel(const fs::path& meshPath,
+                                             const Shape3& shape,
+                                             RasterMode rasterMode,
+                                             size_t numThreads,
+                                             SpoolManager& spool) {
+    auto surf = load_quad_from_tifxyz(meshPath.string());
+    const cv::Mat_<cv::Vec3f> pts = surf->rawPoints();
+    const int quadRows = pts.rows - 1;
+    if (pts.empty() || quadRows <= 0 || pts.cols < 2) return;
+
+    const size_t workerCount = std::min(numThreads, static_cast<size_t>(quadRows));
+    if (workerCount <= 1) {
+        ThreadSpoolBuffer buffer(spool, spool.chunkShape(), spool.volumeShape());
+        rasterizePointGridRows(pts, 0, quadRows, shape, rasterMode,
+            [&](size_t z, size_t y, size_t x) {
+                buffer.emit(z, y, x);
+            });
+        buffer.flushAll();
+        return;
+    }
+
+    std::atomic<int> nextRow{0};
+    std::exception_ptr firstError;
+    std::mutex errorMutex;
+    std::vector<std::thread> threads;
+    threads.reserve(workerCount);
+
+    for (size_t tid = 0; tid < workerCount; ++tid) {
+        threads.emplace_back([&, tid]() {
+            (void)tid;
+            ThreadSpoolBuffer buffer(spool, spool.chunkShape(), spool.volumeShape());
+            try {
+                while (true) {
+                    const int rowBegin = nextRow.fetch_add(kQuadRowWorkBlock);
+                    if (rowBegin >= quadRows) break;
+                    const int rowEnd = std::min(rowBegin + kQuadRowWorkBlock, quadRows);
+                    rasterizePointGridRows(pts, rowBegin, rowEnd, shape, rasterMode,
+                        [&](size_t z, size_t y, size_t x) {
+                            buffer.emit(z, y, x);
+                        });
+                }
+                buffer.flushAll();
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(errorMutex);
+                if (!firstError) {
+                    firstError = std::current_exception();
+                }
+            }
+        });
+    }
+
+    for (auto& t : threads) t.join();
+    if (firstError) {
+        std::rethrow_exception(firstError);
+    }
+}
+
+static void rasterizeSingleMeshPhase(const fs::path& meshPath,
+                                     const Shape3& shape,
+                                     RasterMode rasterMode,
+                                     size_t numThreads,
+                                     SpoolManager& spool,
+                                     std::atomic<bool>& hadError,
+                                     std::atomic<size_t>& rasterizedCount,
+                                     bool verbose,
+                                     std::mutex& outMutex) {
+    if (hadError.load()) return;
+
+    try {
+        rasterizeSingleMeshIntraParallel(meshPath, shape, rasterMode, numThreads, spool);
+    } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> lk(outMutex);
+        std::cerr << "mesh rasterization failed for " << meshPath
+                  << ": " << e.what() << "\n";
+        hadError.store(true);
+        return;
+    }
+
+    const size_t done = rasterizedCount.fetch_add(1) + 1;
+    if (verbose && done == 1) {
+        std::lock_guard<std::mutex> lk(outMutex);
+        std::cerr << "\r[rasterize] 1/1 meshes\n";
+        std::cerr << "\r[rasterize] complete\n";
     }
 }
 
@@ -774,6 +958,7 @@ static void rasterizePhase(const std::vector<fs::path>& meshes,
                           size_t start,
                           size_t stride,
                           const Shape3& shape,
+                          RasterMode rasterMode,
                           SpoolManager& spool,
                           std::atomic<bool>& hadError,
                           std::atomic<size_t>& rasterizedCount,
@@ -786,7 +971,7 @@ static void rasterizePhase(const std::vector<fs::path>& meshes,
         if (hadError.load()) return;
 
         try {
-            rasterizeTifxyzMeshToSpool(meshes[i], shape,
+            rasterizeTifxyzMeshToSpool(meshes[i], shape, rasterMode,
                 [&](size_t z, size_t y, size_t x) {
                     buffer.emit(z, y, x);
                 });
@@ -815,7 +1000,8 @@ static void materializeChunk(const ChunkIndex& chunk,
                             const Shape3& shape,
                             const Shape3& chunkShape,
                             const fs::path& level0Dir,
-                            SpoolManager& spool) {
+                            SpoolManager& spool,
+                            std::atomic<uint64_t>* uniqueLevel0Voxels) {
     const std::vector<size_t> chunkShapeVec = {chunkShape[0], chunkShape[1], chunkShape[2]};
     const size_t chunkElements = chunkShapeVec[0] * chunkShapeVec[1] * chunkShapeVec[2];
     std::vector<VoxelCoord32> coords;
@@ -828,16 +1014,39 @@ static void materializeChunk(const ChunkIndex& chunk,
     const size_t chunkBaseY = static_cast<size_t>(chunk.y) * chunkShape[1];
     const size_t chunkBaseX = static_cast<size_t>(chunk.x) * chunkShape[2];
 
-    for (const auto& p : coords) {
-        if (p.z >= shape[0] || p.y >= shape[1] || p.x >= shape[2]) {
-            continue;
-        }
-        const size_t lz = static_cast<size_t>(p.z) - chunkBaseZ;
-        const size_t ly = static_cast<size_t>(p.y) - chunkBaseY;
-        const size_t lx = static_cast<size_t>(p.x) - chunkBaseX;
+    uint64_t uniqueLocal = 0;
+    if (uniqueLevel0Voxels) {
+        for (const auto& p : coords) {
+            if (p.z >= shape[0] || p.y >= shape[1] || p.x >= shape[2]) {
+                continue;
+            }
+            const size_t lz = static_cast<size_t>(p.z) - chunkBaseZ;
+            const size_t ly = static_cast<size_t>(p.y) - chunkBaseY;
+            const size_t lx = static_cast<size_t>(p.x) - chunkBaseX;
 
-        if (lz < chunkShape[0] && ly < chunkShape[1] && lx < chunkShape[2]) {
-                    chunkBuf[lz * chunkShape[1] * chunkShape[2] + ly * chunkShape[2] + lx] = kSurfaceValue;
+            if (lz < chunkShape[0] && ly < chunkShape[1] && lx < chunkShape[2]) {
+                const size_t linear = lz * chunkShape[1] * chunkShape[2] + ly * chunkShape[2] + lx;
+                if (chunkBuf[linear] == 0) {
+                    chunkBuf[linear] = kSurfaceValue;
+                    ++uniqueLocal;
+                }
+            }
+        }
+        if (uniqueLocal > 0) {
+            uniqueLevel0Voxels->fetch_add(uniqueLocal, std::memory_order_relaxed);
+        }
+    } else {
+        for (const auto& p : coords) {
+            if (p.z >= shape[0] || p.y >= shape[1] || p.x >= shape[2]) {
+                continue;
+            }
+            const size_t lz = static_cast<size_t>(p.z) - chunkBaseZ;
+            const size_t ly = static_cast<size_t>(p.y) - chunkBaseY;
+            const size_t lx = static_cast<size_t>(p.x) - chunkBaseX;
+
+            if (lz < chunkShape[0] && ly < chunkShape[1] && lx < chunkShape[2]) {
+                chunkBuf[lz * chunkShape[1] * chunkShape[2] + ly * chunkShape[2] + lx] = kSurfaceValue;
+            }
         }
     }
 
@@ -854,7 +1063,8 @@ static void materializePhase(const std::vector<ChunkIndex>& touched,
                             const fs::path& level0Dir,
                             SpoolManager& spool,
                             size_t numThreads,
-                            std::atomic<bool>& hadError) {
+                            std::atomic<bool>& hadError,
+                            std::atomic<uint64_t>* uniqueLevel0Voxels) {
     if (touched.empty()) return;
 
     std::atomic<size_t> nextIndex{0};
@@ -869,7 +1079,7 @@ static void materializePhase(const std::vector<ChunkIndex>& touched,
                 if (idx >= touched.size()) break;
 
                 try {
-                    materializeChunk(touched[idx], shape, chunkShape, level0Dir, spool);
+                    materializeChunk(touched[idx], shape, chunkShape, level0Dir, spool, uniqueLevel0Voxels);
                 } catch (const std::exception& e) {
                     std::cerr << "materialization failed for chunk ["
                               << touched[idx].z << ", "
@@ -962,9 +1172,11 @@ static std::vector<ChunkIndex> buildIsotropicPyramidLevel(const fs::path& outDir
 
                 std::fill(dstBuf.begin(), dstBuf.end(), 0);
                 if (!srcBuf.empty()) {
-                    downsampleNearestBinary(srcBuf.data(), srcActualY, srcActualX,
-                                            dstBuf.data(), dstChunkZ, dstChunkY, dstChunkX,
-                                            srcActualZ, srcActualY, srcActualX);
+                    vc::core::util::downsampleBinaryOr(
+                        srcBuf.data(),
+                        vc::core::util::Shape3{srcActualZ, srcActualY, srcActualX},
+                        dstBuf.data(),
+                        vc::core::util::Shape3{dstChunkZ, dstChunkY, dstChunkX});
                 }
 
                 if (chunkHasAnyNonZero(dstBuf)) {
@@ -1119,6 +1331,8 @@ int main(int argc, char* argv[])
                   << "  --keep-spool               keep binary spool files\n"
                   << "  --overwrite                overwrite output directory if exists\n"
                   << "  --source-group IDX          optional source group for metadata\n"
+                  << "  --raster-mode MODE         zyx-integer (default) or z-half\n"
+                  << "  --metrics-json PATH        write timing + unique-voxel metrics json\n"
                   << "\n"
                   << "Note:\n"
                   << "  --chunk-size-z/x/y are intentionally not supported; use --chunk-size.\n";
@@ -1148,6 +1362,9 @@ int main(int argc, char* argv[])
             ("keep-spool", po::bool_switch()->default_value(false), "Keep binary spool directory")
             ("overwrite", po::bool_switch()->default_value(false), "Overwrite existing output path")
             ("verbose,v", po::bool_switch()->default_value(false), "Print progress")
+            ("raster-mode", po::value<std::string>()->default_value("zyx-integer"),
+             "Raster mode: zyx-integer or z-half")
+            ("metrics-json", po::value<std::string>(), "Write timing + unique-voxel metrics json")
             ("chunk-size-z", po::value<size_t>(), "DEPRECATED: ignored; use --chunk-size")
             ("chunk-size-y", po::value<size_t>(), "DEPRECATED: ignored; use --chunk-size")
             ("chunk-size-x", po::value<size_t>(), "DEPRECATED: ignored; use --chunk-size");
@@ -1183,6 +1400,10 @@ int main(int argc, char* argv[])
         const bool overwrite = vm["overwrite"].as<bool>();
         const bool keepSpool = vm["keep-spool"].as<bool>();
         const bool verbose = vm["verbose"].as<bool>();
+        const RasterMode rasterMode = parseRasterMode(vm["raster-mode"].as<std::string>());
+        const std::optional<fs::path> metricsJson = vm.count("metrics-json")
+                                                      ? std::optional<fs::path>(vm["metrics-json"].as<std::string>())
+                                                      : std::nullopt;
         const int sourceGroup = vm["source-group"].as<int>();
         const size_t spoolMemMB = vm["spool-memory-mb"].as<size_t>();
         const auto sourceSegments = vm.count("source-segment")
@@ -1282,18 +1503,33 @@ int main(int argc, char* argv[])
 
         std::atomic<bool> hadError{false};
         std::atomic<size_t> rasterizedCount{0};
+        std::atomic<uint64_t> uniqueLevel0Voxels{0};
         std::mutex ioMutex;
+        RunMetrics metrics;
+        metrics.rasterMode = rasterModeName(rasterMode);
+        metrics.inputPath = inputRoot.string();
+        metrics.outputPath = outRoot.string();
+        metrics.meshCount = meshes.size();
+        const auto totalStart = std::chrono::steady_clock::now();
+        const auto rasterStart = totalStart;
 
         std::vector<std::thread> rasterThreads;
-        rasterThreads.reserve(numThreads);
-        for (size_t tid = 0; tid < numThreads; ++tid) {
-            rasterThreads.emplace_back([&, tid]() {
-                rasterizePhase(meshes, tid, numThreads, shape,
-                              spool, hadError, rasterizedCount,
-                              verbose, ioMutex, meshes.size());
-            });
+        if (rasterMode == RasterMode::ZYXInteger && meshes.size() == 1 && numThreads > 1) {
+            rasterizeSingleMeshPhase(meshes.front(), shape, rasterMode, numThreads,
+                                     spool, hadError, rasterizedCount, verbose, ioMutex);
+        } else {
+            rasterThreads.reserve(numThreads);
+            for (size_t tid = 0; tid < numThreads; ++tid) {
+                rasterThreads.emplace_back([&, tid]() {
+                    rasterizePhase(meshes, tid, numThreads, shape, rasterMode,
+                                  spool, hadError, rasterizedCount,
+                                  verbose, ioMutex, meshes.size());
+                });
+            }
+            for (auto& t : rasterThreads) t.join();
         }
-        for (auto& t : rasterThreads) t.join();
+        metrics.rasterSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - rasterStart).count();
 
         if (hadError.load()) {
             throw std::runtime_error("rasterization phase failed");
@@ -1304,14 +1540,20 @@ int main(int argc, char* argv[])
             std::lock_guard<std::mutex> lk(ioMutex);
             std::cerr << "[rasterize] touched chunks: " << touched.size() << "\n";
         }
+        metrics.touchedChunks = touched.size();
 
+        const auto materializeStart = std::chrono::steady_clock::now();
         materializePhase(touched, shape, levelChunks[0], outRoot / "0",
-                        spool, numThreads, hadError);
+                        spool, numThreads, hadError, metricsJson ? &uniqueLevel0Voxels : nullptr);
+        metrics.materializeSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - materializeStart).count();
         if (hadError.load()) {
             throw std::runtime_error("materialization phase failed");
         }
+        metrics.uniqueLevel0Voxels = uniqueLevel0Voxels.load(std::memory_order_relaxed);
 
         auto activeTouched = touched;
+        const auto pyramidStart = std::chrono::steady_clock::now();
         for (size_t level = 1; level <= kPyramidLevels; ++level) {
             if (activeTouched.empty()) {
                 if (verbose) {
@@ -1337,6 +1579,10 @@ int main(int argc, char* argv[])
                 throw std::runtime_error("pyramid level " + std::to_string(level) + " failed");
             }
         }
+        metrics.pyramidSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pyramidStart).count();
+        metrics.totalSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - totalStart).count();
 
         writeSparseAttrs(outRoot, levelShape[0], levelChunks[0],
                         sourceRef ? &(*sourceRef) : nullptr,
@@ -1350,8 +1596,20 @@ int main(int argc, char* argv[])
             }
         }
 
+        if (metricsJson) {
+            writeMetricsJson(*metricsJson, metrics);
+        }
+
         std::cout << "vc_tifxyz2zarr_sparse completed\n";
+        std::cout << "raster mode: " << metrics.rasterMode << "\n";
         std::cout << "touched chunks: " << touched.size() << "\n";
+        if (metricsJson) {
+            std::cout << "unique level0 voxels: " << metrics.uniqueLevel0Voxels << "\n";
+            std::cout << "timings (s): raster=" << metrics.rasterSeconds
+                      << " materialize=" << metrics.materializeSeconds
+                      << " pyramid=" << metrics.pyramidSeconds
+                      << " total=" << metrics.totalSeconds << "\n";
+        }
         return EXIT_SUCCESS;
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << "\n";
