@@ -252,9 +252,6 @@ private:
     // Ready for non-blocking access by get(): hot/warm or negative-cached.
     [[nodiscard]] bool isReadyForNonBlockingRead(const ChunkKey& key) const;
 
-    // Present in any local tier: hot/warm, negative cache, or cold disk.
-    [[nodiscard]] bool isPresentLocally(const ChunkKey& key) const;
-
     mutable std::mutex callbackMutex_;
     std::vector<std::pair<ChunkReadyCallbackId, ChunkReadyCallback>> chunkReadyListeners_;
     std::atomic<ChunkReadyCallbackId> nextListenerId_{1};

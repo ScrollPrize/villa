@@ -724,17 +724,6 @@ bool TieredChunkCache::isReadyForNonBlockingRead(const ChunkKey& key) const
     return false;
 }
 
-bool TieredChunkCache::isPresentLocally(const ChunkKey& key) const
-{
-    if (isReadyForNonBlockingRead(key)) return true;
-
-    if (diskStore_ && diskStore_->contains(config_.volumeId, key)) {
-        return true;
-    }
-
-    return false;
-}
-
 // =============================================================================
 // Negative cache persistence
 // =============================================================================
