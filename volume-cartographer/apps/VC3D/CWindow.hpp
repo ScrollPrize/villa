@@ -7,6 +7,7 @@
 #include <QComboBox>
 #include <QCheckBox>
 #include <QPointF>
+#include <QString>
 #include <memory>
 #include <vector>
 #include "ui_VCMain.h"
@@ -58,6 +59,7 @@ class WindowRangeWidget;
 class QLabel;
 class QSpinBox;
 class QTemporaryFile;
+class QTemporaryDir;
 class QStandardItemModel;
 class FileWatcherService;
 class AxisAlignedSliceController;
@@ -169,6 +171,7 @@ private slots:
     void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
     void onPreviewTransformToggled(bool enabled);
     void onSaveTransformedRequested();
+    void onLoadAffineRequested();
 
 private:
     CState* _state;
@@ -195,6 +198,7 @@ private:
     QCheckBox* _previewTransformCheck{nullptr};
     QCheckBox* _invertTransformCheck{nullptr};
     QSpinBox* _transformScaleSpin{nullptr};
+    QPushButton* _loadAffineButton{nullptr};
     QPushButton* _saveTransformedButton{nullptr};
     QLabel* _transformStatusLabel{nullptr};
     enum class RemoteTransformFetchState { Unknown, Pending, Available, Missing };
@@ -245,6 +249,9 @@ private:
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
     std::shared_ptr<QuadSurface> _transformPreviewSourceSurface;
     std::shared_ptr<QuadSurface> _transformPreviewSurface;
+    QString _customTransformSource;
+    std::filesystem::path _customTransformLocalPath;
+    std::unique_ptr<QTemporaryDir> _customTransformTempDir;
 
     // Keyboard shortcuts
     QShortcut* fDrawingModeShortcut;
@@ -283,9 +290,11 @@ private:
     void clearTransformPreview(bool restoreDisplayedSurface = true);
     bool applyTransformPreview(bool allowRemoteFetch = true);
     std::shared_ptr<QuadSurface> currentTransformSourceSurface() const;
+    QString currentTransformSourceDescription() const;
+    bool setCustomTransformSource(const QString& source, QString* errorMessage = nullptr);
     std::filesystem::path localCurrentTransformJsonPath() const;
     std::string currentRemoteTransformJsonUrl() const;
-    std::filesystem::path currentTransformJsonPath();
+    std::filesystem::path currentTransformJsonPath(bool allowRemoteFetch = true);
 
 
 };  // class CWindow

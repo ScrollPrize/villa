@@ -1000,7 +1000,7 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
     const QString volumePath = getCurrentVolumePath();
     const QString segmentPath = QString::fromStdString(surf->path.string());
     const QString segmentOutDir = QString::fromStdString(surf->path.string());
-    const QString outputFormat = "%s/layers/%02d.tif";
+    const QString outputFormat = "%s/layers";
     const float scale = 1.0f;
     const int resolution = 0;
     const int layers = 31;
