@@ -321,6 +321,14 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
     }
 
     if (_surfName == name) {
+        auto previousSurf = _surfWeak.lock();
+        const bool isInPlaceQuadEditUpdate =
+            isEditUpdate &&
+            surf &&
+            previousSurf &&
+            previousSurf.get() == surf.get() &&
+            dynamic_cast<QuadSurface*>(surf.get()) != nullptr;
+
         _surfWeak = surf;
         _surfBBoxCache = {};  // invalidate bounding box cache
         if (!surf) {
@@ -345,13 +353,15 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
             // surface would be served as false hits.
             _renderController->cancelAll();
             _renderController->sliceCache().clear();
-            _tileScene->clearAll();
+            if (!isInPlaceQuadEditUpdate) {
+                _tileScene->clearAll();
 
-            updateContentMinScale();
-            rebuildContentGrid();
-            centerViewport();
-            if (name == "segmentation" && _resetViewOnSurfaceChange) {
-                fitSurfaceInView();
+                updateContentMinScale();
+                rebuildContentGrid();
+                centerViewport();
+                if (name == "segmentation" && _resetViewOnSurfaceChange) {
+                    fitSurfaceInView();
+                }
             }
         }
     }
