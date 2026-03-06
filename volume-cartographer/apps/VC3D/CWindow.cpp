@@ -33,6 +33,7 @@
 #include <QtConcurrent/QtConcurrent>
 #include <QComboBox>
 #include <QFutureWatcher>
+#include <QRegularExpression>
 #include <QRegularExpressionValidator>
 #include <QDockWidget>
 #include <QLabel>
@@ -67,6 +68,7 @@
 #include <algorithm>
 #include <utility>
 #include <filesystem>
+#include <fstream>
 #include <vector>
 #include <initializer_list>
 #include <opencv2/imgproc.hpp>
@@ -255,6 +257,132 @@ float signedAngleBetween(const cv::Vec3f& from, const cv::Vec3f& to, const cv::V
     float angle = std::atan2(cv::norm(cross), dot);
     float sign = cross.dot(axis) >= 0.0f ? 1.0f : -1.0f;
     return angle * sign;
+}
+
+cv::Matx44d loadAffineTransformMatrix(const std::filesystem::path& path)
+{
+    if (path.empty()) {
+        throw std::runtime_error("transform path is empty");
+    }
+    if (!std::filesystem::exists(path)) {
+        throw std::runtime_error("transform.json not found");
+    }
+
+    std::ifstream input(path);
+    if (!input.is_open()) {
+        throw std::runtime_error("failed to open transform.json");
+    }
+
+    nlohmann::json json;
+    input >> json;
+
+    if (!json.contains("transformation_matrix")) {
+        throw std::runtime_error("transform.json is missing transformation_matrix");
+    }
+
+    const auto& matrixJson = json.at("transformation_matrix");
+    if (!matrixJson.is_array() || (matrixJson.size() != 3 && matrixJson.size() != 4)) {
+        throw std::runtime_error("transformation_matrix must be 3x4 or 4x4");
+    }
+
+    cv::Matx44d matrix = cv::Matx44d::eye();
+    for (int row = 0; row < static_cast<int>(matrixJson.size()); ++row) {
+        const auto& rowJson = matrixJson.at(row);
+        if (!rowJson.is_array() || rowJson.size() != 4) {
+            throw std::runtime_error("each transformation_matrix row must have 4 values");
+        }
+        for (int col = 0; col < 4; ++col) {
+            matrix(row, col) = rowJson.at(col).get<double>();
+        }
+    }
+
+    if (matrixJson.size() == 4) {
+        if (std::abs(matrix(3, 0)) > 1e-12 ||
+            std::abs(matrix(3, 1)) > 1e-12 ||
+            std::abs(matrix(3, 2)) > 1e-12 ||
+            std::abs(matrix(3, 3) - 1.0) > 1e-12) {
+            throw std::runtime_error("transform.json bottom row must be [0, 0, 0, 1]");
+        }
+    }
+
+    return matrix;
+}
+
+cv::Matx44d invertAffineTransformMatrix(const cv::Matx44d& matrix)
+{
+    const cv::Matx33d linear(matrix(0, 0), matrix(0, 1), matrix(0, 2),
+                             matrix(1, 0), matrix(1, 1), matrix(1, 2),
+                             matrix(2, 0), matrix(2, 1), matrix(2, 2));
+    const double determinant = cv::determinant(linear);
+    if (!std::isfinite(determinant) || std::abs(determinant) < std::numeric_limits<double>::epsilon()) {
+        throw std::runtime_error("transform is not invertible");
+    }
+
+    cv::Mat linearMat(3, 3, CV_64F);
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            linearMat.at<double>(row, col) = matrix(row, col);
+        }
+    }
+    cv::Mat linearInvMat;
+    if (cv::invert(linearMat, linearInvMat, cv::DECOMP_SVD) <= 0.0) {
+        throw std::runtime_error("transform is not invertible");
+    }
+
+    cv::Matx33d linearInv;
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            linearInv(row, col) = linearInvMat.at<double>(row, col);
+        }
+    }
+
+    const cv::Vec3d translation(matrix(0, 3), matrix(1, 3), matrix(2, 3));
+    const cv::Vec3d inverseTranslation = -(linearInv * translation);
+
+    cv::Matx44d inverted = cv::Matx44d::eye();
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            inverted(row, col) = linearInv(row, col);
+        }
+    }
+    inverted(0, 3) = inverseTranslation[0];
+    inverted(1, 3) = inverseTranslation[1];
+    inverted(2, 3) = inverseTranslation[2];
+    return inverted;
+}
+
+cv::Vec3f applyAffineTransform(const cv::Vec3f& point, const cv::Matx44d& matrix)
+{
+    if (point[0] == -1.0f) {
+        return point;
+    }
+
+    const cv::Vec4d homogeneous(point[0], point[1], point[2], 1.0);
+    const cv::Vec4d transformed = matrix * homogeneous;
+    return cv::Vec3f(static_cast<float>(transformed[0]),
+                     static_cast<float>(transformed[1]),
+                     static_cast<float>(transformed[2]));
+}
+
+std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<QuadSurface>& source)
+{
+    if (!source) {
+        return nullptr;
+    }
+
+    auto clone = std::make_shared<QuadSurface>(source->rawPoints(), source->scale());
+    clone->meta = source->meta
+        ? std::make_unique<nlohmann::json>(*source->meta)
+        : std::make_unique<nlohmann::json>(nlohmann::json::object());
+    clone->id = source->id;
+    clone->path = source->path;
+    clone->setOverlappingIds(source->overlappingIds());
+
+    for (const auto& channelName : source->channelNames()) {
+        clone->setChannel(channelName, source->channel(channelName, SURF_CHANNEL_NORESIZE).clone());
+    }
+
+    return clone;
 }
 
 } // namespace
@@ -944,6 +1072,7 @@ CTiledVolumeViewer* CWindow::segmentationViewer() const
 
 void CWindow::clearSurfaceSelection()
 {
+    clearTransformPreview(true);
     _state->clearActiveSurface();
 
     if (_surfacePanel) {
@@ -957,6 +1086,371 @@ void CWindow::clearSurfaceSelection()
     if (treeWidgetSurfaces) {
         treeWidgetSurfaces->clearSelection();
     }
+
+    refreshTransformsPanelState();
+}
+
+std::shared_ptr<QuadSurface> CWindow::currentTransformSourceSurface() const
+{
+    if (!_state) {
+        return nullptr;
+    }
+
+    if (auto active = _state->activeSurface().lock()) {
+        return active;
+    }
+
+    if (_state->vpkg()) {
+        const std::string activeId = _state->activeSurfaceId();
+        if (!activeId.empty()) {
+            if (auto surface = _state->vpkg()->getSurface(activeId)) {
+                return surface;
+            }
+        }
+    }
+
+    auto segmentationSurface = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+    if (segmentationSurface && segmentationSurface != _transformPreviewSurface) {
+        return segmentationSurface;
+    }
+
+    return _transformPreviewSourceSurface;
+}
+
+std::filesystem::path CWindow::currentTransformJsonPath() const
+{
+    if (!_state) {
+        return {};
+    }
+
+    auto currentVolume = _state->currentVolume();
+    if (!currentVolume) {
+        return {};
+    }
+
+    const auto volumePath = currentVolume->path();
+    if (volumePath.empty()) {
+        return {};
+    }
+
+    const auto localTransformPath = volumePath / "transform.json";
+    if (std::filesystem::exists(localTransformPath)) {
+        return localTransformPath;
+    }
+
+    if (!currentVolume->isRemote() || currentVolume->remoteUrl().empty()) {
+        return {};
+    }
+
+    std::string remoteTransformUrl = currentVolume->remoteUrl();
+    while (!remoteTransformUrl.empty() && remoteTransformUrl.back() == '/') {
+        remoteTransformUrl.pop_back();
+    }
+    remoteTransformUrl += "/transform.json";
+
+    if (vc::cache::httpDownloadFile(remoteTransformUrl,
+                                    localTransformPath,
+                                    currentVolume->remoteAuth())) {
+        return localTransformPath;
+    }
+
+    return {};
+}
+
+void CWindow::clearTransformPreview(bool restoreDisplayedSurface)
+{
+    if (!_state) {
+        _transformPreviewSurface.reset();
+        _transformPreviewSourceSurface.reset();
+        return;
+    }
+
+    auto currentDisplayed = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+    const bool showingPreview = (_transformPreviewSurface && currentDisplayed == _transformPreviewSurface);
+
+    if (restoreDisplayedSurface && showingPreview) {
+        auto restoreSurface = currentTransformSourceSurface();
+        if (!restoreSurface) {
+            restoreSurface = _transformPreviewSourceSurface;
+        }
+        _state->setSurface("segmentation", restoreSurface, false, false);
+        if (_axisAlignedSliceController) {
+            _axisAlignedSliceController->applyOrientation(restoreSurface.get());
+        }
+    }
+
+    _transformPreviewSurface.reset();
+    _transformPreviewSourceSurface.reset();
+}
+
+bool CWindow::applyTransformPreview()
+{
+    if (!_state || (_segmentationModule && _segmentationModule->editingEnabled())) {
+        return false;
+    }
+
+    auto sourceSurface = currentTransformSourceSurface();
+    if (!sourceSurface) {
+        return false;
+    }
+
+    const auto transformPath = currentTransformJsonPath();
+    cv::Matx44d matrix = loadAffineTransformMatrix(transformPath);
+    if (_invertTransformCheck && _invertTransformCheck->isChecked()) {
+        matrix = invertAffineTransformMatrix(matrix);
+    }
+
+    auto previewSurface = cloneSurfaceForTransform(sourceSurface);
+    if (!previewSurface) {
+        return false;
+    }
+
+    previewSurface->path.clear();
+    previewSurface->id.clear();
+
+    if (auto* points = previewSurface->rawPointsPtr()) {
+        for (int row = 0; row < points->rows; ++row) {
+            for (int col = 0; col < points->cols; ++col) {
+                auto& point = (*points)(row, col);
+                if (point[0] == -1.0f) {
+                    continue;
+                }
+                point = applyAffineTransform(point, matrix);
+            }
+        }
+    }
+
+    clearTransformPreview(false);
+    _transformPreviewSourceSurface = sourceSurface;
+    _transformPreviewSurface = previewSurface;
+    _state->setSurface("segmentation", previewSurface, false, false);
+    if (_axisAlignedSliceController) {
+        _axisAlignedSliceController->applyOrientation(previewSurface.get());
+    }
+    return true;
+}
+
+void CWindow::refreshTransformsPanelState()
+{
+    if (!_previewTransformCheck || !_invertTransformCheck || !_saveTransformedButton || !_transformStatusLabel) {
+        return;
+    }
+
+    const bool editingEnabled = _segmentationModule && _segmentationModule->editingEnabled();
+    const auto sourceSurface = currentTransformSourceSurface();
+    const auto currentVolume = _state ? _state->currentVolume() : nullptr;
+    const auto transformPath = currentTransformJsonPath();
+    const bool hasTransform = !transformPath.empty() && std::filesystem::exists(transformPath);
+    const bool previewEnabled = sourceSurface && hasTransform && !editingEnabled;
+    const bool saveEnabled = previewEnabled && sourceSurface && !sourceSurface->path.empty();
+    QString transformLocation;
+    if (currentVolume && !currentVolume->path().empty()) {
+        transformLocation = QString::fromStdString((currentVolume->path() / "transform.json").string());
+    } else if (!transformPath.empty()) {
+        transformLocation = QString::fromStdString(transformPath.string());
+    }
+    if (currentVolume && currentVolume->isRemote() && !currentVolume->remoteUrl().empty()) {
+        std::string remoteTransformUrl = currentVolume->remoteUrl();
+        while (!remoteTransformUrl.empty() && remoteTransformUrl.back() == '/') {
+            remoteTransformUrl.pop_back();
+        }
+        remoteTransformUrl += "/transform.json";
+        transformLocation = QString::fromStdString(remoteTransformUrl);
+    }
+
+    QString statusText;
+    if (!_state || !_state->vpkg()) {
+        statusText = tr("Open a volume package to use transforms.");
+    } else if (!_state->currentVolume()) {
+        statusText = tr("Select a volume to load transform.json.");
+    } else if (!sourceSurface) {
+        statusText = tr("Select a segmentation to preview or save its transform.");
+    } else if (editingEnabled) {
+        statusText = tr("Transform preview is unavailable while segmentation editing is enabled.");
+    } else if (!hasTransform) {
+        statusText = tr("No transform.json found at %1")
+            .arg(transformLocation);
+    } else {
+        statusText = tr("Using %1%2")
+            .arg(transformLocation,
+                 (_invertTransformCheck->isChecked() ? tr(" (inverted)") : QString()));
+    }
+
+    if (!previewEnabled && _previewTransformCheck->isChecked()) {
+        const QSignalBlocker blocker(_previewTransformCheck);
+        _previewTransformCheck->setChecked(false);
+        clearTransformPreview(true);
+    } else if (previewEnabled && _previewTransformCheck->isChecked()) {
+        try {
+            if (!applyTransformPreview()) {
+                clearTransformPreview(true);
+            }
+        } catch (const std::exception& ex) {
+            clearTransformPreview(true);
+            const QSignalBlocker blocker(_previewTransformCheck);
+            _previewTransformCheck->setChecked(false);
+            statusText = tr("Failed to load transform.json: %1")
+                .arg(QString::fromUtf8(ex.what()));
+        }
+    } else if (!_previewTransformCheck->isChecked()) {
+        clearTransformPreview(true);
+    }
+
+    _previewTransformCheck->setEnabled(previewEnabled);
+    _invertTransformCheck->setEnabled(previewEnabled);
+    _saveTransformedButton->setEnabled(saveEnabled);
+    _transformStatusLabel->setText(statusText);
+}
+
+void CWindow::onPreviewTransformToggled(bool enabled)
+{
+    if (!_previewTransformCheck) {
+        return;
+    }
+
+    if (!enabled) {
+        clearTransformPreview(true);
+        refreshTransformsPanelState();
+        return;
+    }
+
+    try {
+        if (!applyTransformPreview()) {
+            throw std::runtime_error("transform preview is unavailable for the current selection");
+        }
+    } catch (const std::exception& ex) {
+        clearTransformPreview(true);
+        {
+            const QSignalBlocker blocker(_previewTransformCheck);
+            _previewTransformCheck->setChecked(false);
+        }
+        statusBar()->showMessage(tr("Failed to preview transform: %1")
+                                     .arg(QString::fromUtf8(ex.what())),
+                                 5000);
+    }
+
+    refreshTransformsPanelState();
+}
+
+void CWindow::onSaveTransformedRequested()
+{
+    if (!_state || !_state->vpkg()) {
+        return;
+    }
+
+    if (_segmentationModule && _segmentationModule->editingEnabled()) {
+        QMessageBox::warning(this, tr("Editing Active"),
+                             tr("Disable segmentation editing before saving a transformed surface."));
+        return;
+    }
+
+    auto sourceSurface = currentTransformSourceSurface();
+    if (!sourceSurface || sourceSurface->path.empty()) {
+        QMessageBox::warning(this, tr("No Segmentation"),
+                             tr("Select a segmentation with files on disk first."));
+        return;
+    }
+
+    const auto transformPath = currentTransformJsonPath();
+    if (transformPath.empty() || !std::filesystem::exists(transformPath)) {
+        QMessageBox::warning(this, tr("Missing Transform"),
+                             tr("No transform.json was found for the current volume."));
+        return;
+    }
+
+    const QString defaultName = QString::fromStdString(sourceSurface->id.empty()
+        ? sourceSurface->path.filename().string() + "_transformed"
+        : sourceSurface->id + "_transformed");
+    bool ok = false;
+    QString newName = QInputDialog::getText(this,
+                                            tr("Save Transformed"),
+                                            tr("New surface name:"),
+                                            QLineEdit::Normal,
+                                            defaultName,
+                                            &ok).trimmed();
+    if (!ok || newName.isEmpty()) {
+        return;
+    }
+
+    static const QRegularExpression validNameRegex(QStringLiteral("^[a-zA-Z0-9_-]+$"));
+    if (!validNameRegex.match(newName).hasMatch()) {
+        QMessageBox::warning(this, tr("Invalid Name"),
+                             tr("Surface name can only contain letters, numbers, underscores, and hyphens."));
+        return;
+    }
+
+    const std::string newId = newName.toStdString();
+    const std::filesystem::path sourcePath = sourceSurface->path;
+    const std::filesystem::path parentDir = sourcePath.parent_path();
+    const std::filesystem::path targetPath = parentDir / newId;
+    if (std::filesystem::exists(targetPath)) {
+        QMessageBox::warning(this, tr("Name Exists"),
+                             tr("A surface with the name '%1' already exists.").arg(newName));
+        return;
+    }
+
+    QTemporaryDir stagingRoot;
+    if (!stagingRoot.isValid()) {
+        QMessageBox::critical(this, tr("Temporary Directory Error"),
+                              tr("Failed to create a temporary staging directory."));
+        return;
+    }
+
+    try {
+        cv::Matx44d matrix = loadAffineTransformMatrix(transformPath);
+        if (_invertTransformCheck && _invertTransformCheck->isChecked()) {
+            matrix = invertAffineTransformMatrix(matrix);
+        }
+        auto transformedSurface = cloneSurfaceForTransform(sourceSurface);
+        if (!transformedSurface) {
+            throw std::runtime_error("failed to clone source surface");
+        }
+
+        if (auto* points = transformedSurface->rawPointsPtr()) {
+            for (int row = 0; row < points->rows; ++row) {
+                for (int col = 0; col < points->cols; ++col) {
+                    auto& point = (*points)(row, col);
+                    if (point[0] == -1.0f) {
+                        continue;
+                    }
+                    point = applyAffineTransform(point, matrix);
+                }
+            }
+        }
+
+        const std::filesystem::path stagingPath =
+            std::filesystem::path(stagingRoot.path().toStdString()) / newId;
+        transformedSurface->save(stagingPath.string(), newId, false);
+
+        std::filesystem::copy(sourcePath,
+                              targetPath,
+                              std::filesystem::copy_options::recursive);
+        std::filesystem::copy(stagingPath,
+                              targetPath,
+                              std::filesystem::copy_options::recursive |
+                                  std::filesystem::copy_options::overwrite_existing);
+    } catch (const std::exception& ex) {
+        std::error_code cleanupError;
+        std::filesystem::remove_all(targetPath, cleanupError);
+        QMessageBox::critical(this, tr("Save Failed"),
+                              tr("Failed to save transformed surface: %1")
+                                  .arg(QString::fromUtf8(ex.what())));
+        return;
+    }
+
+    if (_state->vpkg()->addSingleSegmentation(newId)) {
+        if (_surfacePanel) {
+            _surfacePanel->addSingleSegmentation(newId);
+        }
+    } else {
+        _state->vpkg()->refreshSegmentations();
+        if (_surfacePanel) {
+            _surfacePanel->reloadSurfacesFromDisk();
+        }
+    }
+
+    statusBar()->showMessage(tr("Saved transformed surface as '%1'.").arg(newName), 5000);
+    refreshTransformsPanelState();
 }
 
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
@@ -1046,6 +1540,7 @@ void CWindow::setRemoteSurfaces(const std::vector<std::pair<std::string, std::sh
     }
 
     emit _state->surfacesLoaded();
+    refreshTransformsPanelState();
 }
 
 void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
@@ -1095,6 +1590,8 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
             _surfacePanel->refreshPointSetFilterOptions();
         }
     }
+
+    refreshTransformsPanelState();
 }
 
 void CWindow::updateNormalGridAvailability()
@@ -1288,6 +1785,7 @@ void CWindow::CreateWidgets(void)
         emit _state->surfacesLoaded();
         // Update surface overlay dropdown when surfaces are loaded
         updateSurfaceOverlayDropdown();
+        refreshTransformsPanelState();
     });
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceSelectionCleared, this, [this]() {
         clearSurfaceSelection();
@@ -1625,6 +2123,8 @@ void CWindow::CreateWidgets(void)
     _seedingWidget->setState(_state);
     connect(_state, &CState::volumeChanged, _seedingWidget,
             static_cast<void (SeedingWidget::*)(std::shared_ptr<Volume>, const std::string&)>(&SeedingWidget::onVolumeChanged));
+    connect(_state, &CState::volumeChanged, this,
+            [this](std::shared_ptr<Volume>, const std::string&) { refreshTransformsPanelState(); });
     connect(_seedingWidget, &SeedingWidget::sendStatusMessageAvailable, this, &CWindow::onShowStatusMessage);
     connect(_state, &CState::surfacesLoaded, _seedingWidget, &SeedingWidget::onSurfacesLoaded);
 
@@ -1712,6 +2212,32 @@ void CWindow::CreateWidgets(void)
                         normalVisLayout,
                         normalVisContainer);
 
+    auto* transformsContainer = new QWidget(ui.dockWidgetViewerControlsContents);
+    auto* transformsLayout = new QVBoxLayout(transformsContainer);
+    transformsLayout->setContentsMargins(0, 0, 0, 0);
+    transformsLayout->setSpacing(8);
+
+    _previewTransformCheck = new QCheckBox(tr("Preview Transform"), transformsContainer);
+    transformsLayout->addWidget(_previewTransformCheck);
+
+    _invertTransformCheck = new QCheckBox(tr("Invert Transform"), transformsContainer);
+    transformsLayout->addWidget(_invertTransformCheck);
+
+    _saveTransformedButton = new QPushButton(tr("Save Transformed"), transformsContainer);
+    transformsLayout->addWidget(_saveTransformedButton);
+
+    _transformStatusLabel = new QLabel(transformsContainer);
+    _transformStatusLabel->setWordWrap(true);
+    _transformStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    transformsLayout->addWidget(_transformStatusLabel);
+
+    connect(_previewTransformCheck, &QCheckBox::toggled,
+            this, &CWindow::onPreviewTransformToggled);
+    connect(_invertTransformCheck, &QCheckBox::toggled,
+            this, [this](bool) { refreshTransformsPanelState(); });
+    connect(_saveTransformedButton, &QPushButton::clicked,
+            this, &CWindow::onSaveTransformedRequested);
+
     auto rememberGroupState = [this](CollapsibleSettingsGroup* group, const char* key) {
         if (!group) {
             return;
@@ -1764,6 +2290,10 @@ void CWindow::CreateWidgets(void)
                    detachScrollContents(ui.scrollAreaPostprocessing, ui.dockWidgetPostprocessingContents),
                    viewer::GROUP_POSTPROCESSING_EXPANDED,
                    viewer::GROUP_POSTPROCESSING_EXPANDED_DEFAULT);
+    addViewerGroup(tr("Transforms"),
+                   transformsContainer,
+                   viewer::GROUP_TRANSFORMS_EXPANDED,
+                   viewer::GROUP_TRANSFORMS_EXPANDED_DEFAULT);
     viewerControlsLayout->addStretch(1);
 
     addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetViewerControls);
@@ -1793,6 +2323,7 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onSurfaceActivated);
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivatedPreserveEditing,
             this, &CWindow::onSurfaceActivatedPreserveEditing);
+    refreshTransformsPanelState();
 
     // new and remove path buttons
     // connect(ui.btnNewPath, SIGNAL(clicked()), this, SLOT(OnNewPathClicked()));
@@ -3206,6 +3737,8 @@ void CWindow::CloseVolume(void)
         _fileWatcher->stopWatching();
     }
 
+    clearTransformPreview(false);
+
     // Tear down active segmentation editing before surfaces disappear to avoid
     // dangling pointers inside the edit manager when the underlying surfaces
     // are unloaded (reloading with editing enabled previously triggered a
@@ -3243,6 +3776,8 @@ void CWindow::CloseVolume(void)
     if (_volumeOverlay) {
         _volumeOverlay->clearVolumePkg();
     }
+
+    refreshTransformsPanelState();
 }
 
 // Handle open request
@@ -3337,6 +3872,8 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
     if (_surfacePanel && _surfacePanel->isCurrentOnlyFilterEnabled()) {
         _surfacePanel->refreshFiltersOnly();
     }
+
+    refreshTransformsPanelState();
 }
 
 void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface)
@@ -3388,6 +3925,8 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
     if (_surfacePanel && _surfacePanel->isCurrentOnlyFilterEnabled()) {
         _surfacePanel->refreshFiltersOnly();
     }
+
+    refreshTransformsPanelState();
 }
 
 void CWindow::onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf)
@@ -3870,6 +4409,7 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         ? tr("Segmentation editing enabled")
         : tr("Segmentation editing disabled");
     statusBar()->showMessage(message, 2000);
+    refreshTransformsPanelState();
 }
 
 void CWindow::onSegmentationStopToolsRequested()

@@ -166,6 +166,8 @@ private slots:
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
     void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
+    void onPreviewTransformToggled(bool enabled);
+    void onSaveTransformedRequested();
 
 private:
     CState* _state;
@@ -189,6 +191,10 @@ private:
     QPushButton* btnZoomIn;
    QPushButton* btnZoomOut;
    QCheckBox* chkAxisAlignedSlices;
+    QCheckBox* _previewTransformCheck{nullptr};
+    QCheckBox* _invertTransformCheck{nullptr};
+    QPushButton* _saveTransformedButton{nullptr};
+    QLabel* _transformStatusLabel{nullptr};
     WindowRangeWidget* _volumeWindowWidget{nullptr};
     WindowRangeWidget* _overlayWindowWidget{nullptr};
     QLabel* _segmentationGrowthWarning{nullptr};
@@ -233,6 +239,8 @@ private:
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     FocusHistoryManager _focusHistory;
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
+    std::shared_ptr<QuadSurface> _transformPreviewSourceSurface;
+    std::shared_ptr<QuadSurface> _transformPreviewSurface;
 
     // Keyboard shortcuts
     QShortcut* fDrawingModeShortcut;
@@ -266,6 +274,11 @@ private:
     QTimer* _windowStateSaveTimer{nullptr};
     void scheduleWindowStateSave();
     void saveWindowState();
+    void refreshTransformsPanelState();
+    void clearTransformPreview(bool restoreDisplayedSurface = true);
+    bool applyTransformPreview();
+    std::shared_ptr<QuadSurface> currentTransformSourceSurface() const;
+    std::filesystem::path currentTransformJsonPath() const;
 
 
 };  // class CWindow
