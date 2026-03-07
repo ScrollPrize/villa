@@ -260,6 +260,12 @@ def load_3d(
 		  f"z=[{z0v}:{z1v}] y=[{y0v}:{y1v}] x=[{x0v}:{x1v}], "
 		  f"origin={origin_fullres}, spacing={spacing}", flush=True)
 
+	n_voxels = (z1v - z0v) * (y1v - y0v) * (x1v - x0v)
+	n_channels = 4 + (1 if "pred_dt" in ci else 0)
+	est_bytes = n_voxels * n_channels * 4  # float32
+	print(f"[fit_data] estimated GPU memory for data: {est_bytes / 2**30:.2f} GiB "
+		  f"({n_channels} channels, {z1v-z0v}x{y1v-y0v}x{x1v-x0v} voxels)", flush=True)
+
 	def _read_ch(name: str) -> np.ndarray:
 		return np.asarray(zsrc[ci[name], z0v:z1v, y0v:y1v, x0v:x1v])
 
