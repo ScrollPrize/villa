@@ -34,12 +34,12 @@ def normal_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch
 		res.xyz_lr[:, :-1, :-1] + res.xyz_lr[:, 1:, :-1] +
 		res.xyz_lr[:, :-1, 1:] + res.xyz_lr[:, 1:, 1:]
 	)
-	data = res.data.grid_sample_fullres(face_centers)
+	data = res.data.grid_sample_fullres(face_centers.detach())
 
 	# Reconstruct data normal: stored (nx, ny) → nz = sqrt(1 - nx² - ny²)
 	data_nx = data.nx.squeeze(0).squeeze(0)  # (D, Hm-1, Wm-1)
 	data_ny = data.ny.squeeze(0).squeeze(0)
-	data_nz = torch.sqrt(torch.clamp(1.0 - data_nx * data_nx - data_ny * data_ny, min=0.0))
+	data_nz = torch.sqrt(torch.clamp(1.0 - data_nx * data_nx - data_ny * data_ny, min=1e-8))
 	target = torch.stack([data_nx, data_ny, data_nz], dim=-1)  # (D, Hm-1, Wm-1, 3)
 
 	# Loss: 1 - dot² = sin²(θ), sign-invariant, ≈ θ² for small angles
