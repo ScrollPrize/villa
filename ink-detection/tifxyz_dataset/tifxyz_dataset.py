@@ -279,7 +279,7 @@ class TifxyzInkDataset(Dataset):
         self._multi_wrap_candidate_segments_cache[int(idx)] = out
         return out
 
-    def _voxelize_full_surface_background_tolerance_from_sampled_grid(
+    def _voxelize_full_surface_background_projection_from_sampled_grid(
         self,
         segment,
         min_corner,
@@ -469,14 +469,14 @@ class TifxyzInkDataset(Dataset):
                             other_surface_vox,
                         )
 
-                    other_bg_tolerance_vox = self._voxelize_full_surface_background_tolerance_from_sampled_grid(
+                    other_bg_projection_vox = self._voxelize_full_surface_background_projection_from_sampled_grid(
                         other_segment,
                         min_corner=min_corner,
                         max_corner=max_corner,
                         crop_size=crop_size,
                         sampled_grid=other_sampled_grid,
                     )
-                    bg_mask = np.asarray(other_bg_tolerance_vox > 0.0, dtype=bool)
+                    bg_mask = np.asarray(other_bg_projection_vox > 0.0, dtype=bool)
                     projected_loss_mask[bg_mask & (projected_loss_mask != 1.0)] = 0.0
 
         labeled_vox_at_surface = _build_surface_label_volume(

@@ -419,7 +419,7 @@ def _voxelize_background_surface_labels_from_sampled_grid(
     return _points_to_voxels(sampled["local_grid"][background_mask], crop_size_tuple)
 
 
-def _voxelize_class_tolerance_band_from_sample(
+def _voxelize_class_projection_from_sample(
     dataset,
     sampled_grid,
     min_corner,
@@ -464,7 +464,7 @@ def _voxelize_class_tolerance_band_from_sample(
     )
 
 
-def _voxelize_label_tolerance_band(dataset, segment, min_corner, max_corner, crop_size, sampled_grid=None):
+def _voxelize_label_projection(dataset, segment, min_corner, max_corner, crop_size, sampled_grid=None):
     sampled = sampled_grid
     if sampled is None:
         sampled = _sample_patch_supervision_grid(
@@ -474,7 +474,7 @@ def _voxelize_label_tolerance_band(dataset, segment, min_corner, max_corner, cro
             max_corner=max_corner,
             extra_bbox_pad=float(dataset.label_distance_max) + 1.0,
         )
-    return _voxelize_class_tolerance_band_from_sample(
+    return _voxelize_class_projection_from_sample(
         dataset,
         sampled,
         min_corner=min_corner,
@@ -485,7 +485,7 @@ def _voxelize_label_tolerance_band(dataset, segment, min_corner, max_corner, cro
     )
 
 
-def _voxelize_background_tolerance_band(dataset, segment, min_corner, max_corner, crop_size, sampled_grid=None):
+def _voxelize_background_projection(dataset, segment, min_corner, max_corner, crop_size, sampled_grid=None):
     sampled = sampled_grid
     if sampled is None:
         sampled = _sample_patch_supervision_grid(
@@ -495,7 +495,7 @@ def _voxelize_background_tolerance_band(dataset, segment, min_corner, max_corner
             max_corner=max_corner,
             extra_bbox_pad=float(dataset.bg_distance_max) + 1.0,
         )
-    return _voxelize_class_tolerance_band_from_sample(
+    return _voxelize_class_projection_from_sample(
         dataset,
         sampled,
         min_corner=min_corner,
@@ -518,7 +518,7 @@ def _build_projected_loss_mask_volume(dataset, segment, min_corner, max_corner, 
             max_corner=max_corner,
             extra_bbox_pad=max(float(dataset.bg_distance_max), float(dataset.label_distance_max)) + 1.0,
         )
-    background_tolerance_vox = _voxelize_background_tolerance_band(
+    background_projection_vox = _voxelize_background_projection(
         dataset,
         segment,
         min_corner=min_corner,
@@ -526,9 +526,9 @@ def _build_projected_loss_mask_volume(dataset, segment, min_corner, max_corner, 
         crop_size=crop_size_tuple,
         sampled_grid=sampled,
     )
-    out[background_tolerance_vox > 0.0] = 0.0
+    out[background_projection_vox > 0.0] = 0.0
 
-    label_tolerance_vox = _voxelize_label_tolerance_band(
+    label_projection_vox = _voxelize_label_projection(
         dataset,
         segment,
         min_corner=min_corner,
@@ -536,7 +536,7 @@ def _build_projected_loss_mask_volume(dataset, segment, min_corner, max_corner, 
         crop_size=crop_size_tuple,
         sampled_grid=sampled,
     )
-    out[label_tolerance_vox > 0.0] = 1.0
+    out[label_projection_vox > 0.0] = 1.0
     return out
 
 
