@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,11 @@ from typing import Iterable, Iterator
 import numpy as np
 import tifffile
 import zarr
+
+# Allow direct execution via `python path/to/stack_composite_tifs.py` without
+# requiring an editable install or preconfigured PYTHONPATH.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from vesuvius.image_proc.run.workflow import gather_inputs, run_workflow
 
