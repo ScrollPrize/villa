@@ -6,9 +6,9 @@ from __future__ import annotations
 import argparse
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Iterator, Sequence
 
 import numpy as np
 import tifffile
@@ -35,6 +35,22 @@ class SegmentResult:
     issues: tuple[ShapeIssue, ...]
 
 
+@dataclass(slots=True)
+class SegmentState:
+    segment_dir: Path
+    zarr_path: Path
+    expected_shape: tuple[int, int] | None = None
+    target_tiffs: tuple[Path, ...] = ()
+    issues: list[ShapeIssue] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class TiffMetadata:
+    file_path: Path
+    raw_shape: tuple[int, ...]
+    spatial_shape: tuple[int, int]
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -53,7 +69,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--workers",
         type=int,
         default=max(1, min(32, os.cpu_count() or 1)),
-        help="Number of worker threads to use while reading metadata.",
+        help="Worker count for metadata checks and per-image tiled label validation.",
     )
     parser.add_argument(
         "--no-progress",
@@ -120,20 +136,26 @@ def _normalize_tiff_shape(shape: Sequence[int], source_path: Path) -> tuple[int,
     raise ValueError(f"Expected a 2D TIFF shape in {source_path}, got {tuple(shape)}")
 
 
-def _read_tiff_payload(path: Path) -> tuple[tuple[int, ...], np.ndarray]:
+def _read_tiff_series_shape(path: Path) -> tuple[int, ...]:
     with tifffile.TiffFile(path) as tif:
         if tif.series:
-            series = tif.series[0]
-            return tuple(int(dimension) for dimension in series.shape), np.asarray(series.asarray())
+            return tuple(int(dimension) for dimension in tif.series[0].shape)
         if tif.pages:
-            page = tif.pages[0]
-            return tuple(int(dimension) for dimension in page.shape), np.asarray(page.asarray())
+            return tuple(int(dimension) for dimension in tif.pages[0].shape)
         raise RuntimeError(f"No TIFF image data found in {path}")
 
 
+def read_tiff_metadata(path: Path) -> TiffMetadata:
+    raw_shape = _read_tiff_series_shape(path)
+    return TiffMetadata(
+        file_path=path,
+        raw_shape=raw_shape,
+        spatial_shape=_normalize_tiff_shape(raw_shape, path),
+    )
+
+
 def read_tiff_shape(path: Path) -> tuple[int, int]:
-    shape, _ = _read_tiff_payload(path)
-    return _normalize_tiff_shape(shape, path)
+    return read_tiff_metadata(path).spatial_shape
 
 
 def _label_channel_axis(shape: Sequence[int]) -> int | None:
@@ -147,16 +169,16 @@ def _label_channel_axis(shape: Sequence[int]) -> int | None:
     return None
 
 
-def _label_has_alpha_channel(image: np.ndarray) -> bool:
-    squeezed = np.squeeze(np.asarray(image))
-    channel_axis = _label_channel_axis(squeezed.shape)
+def _label_has_alpha_channel(shape: Sequence[int]) -> bool:
+    squeezed = tuple(int(dimension) for dimension in shape if int(dimension) != 1)
+    channel_axis = _label_channel_axis(squeezed)
     if channel_axis is None:
         return False
-    return int(squeezed.shape[channel_axis]) in {2, 4}
+    return int(squeezed[channel_axis]) in {2, 4}
 
 
-def _normalize_label_image(image: np.ndarray, source_path: Path) -> np.ndarray:
-    squeezed = np.squeeze(np.asarray(image))
+def _normalize_label_tile(tile: np.ndarray, source_path: Path) -> np.ndarray:
+    squeezed = np.squeeze(np.asarray(tile))
 
     if squeezed.ndim == 2:
         return np.ascontiguousarray(squeezed)
@@ -178,21 +200,54 @@ def _normalize_label_image(image: np.ndarray, source_path: Path) -> np.ndarray:
     return np.ascontiguousarray(np.max(color, axis=0))
 
 
-def validate_label_tiff(path: Path) -> tuple[str, ...]:
-    issues: list[str] = []
-    _, image = _read_tiff_payload(path)
+def _preview_invalid_values(values: set[int]) -> str:
+    ordered = sorted(values)
+    preview = ", ".join(str(value) for value in ordered[:8])
+    if len(ordered) > 8:
+        preview += ", ..."
+    return preview
 
-    if _label_has_alpha_channel(image):
+
+def _iter_label_tiles(path: Path, *, workers: int) -> Iterator[np.ndarray]:
+    with tifffile.TiffFile(path) as tif:
+        if tif.series:
+            page = tif.series[0].pages[0]
+        elif tif.pages:
+            page = tif.pages[0]
+        else:
+            raise RuntimeError(f"No TIFF image data found in {path}")
+
+        for tile, _, _ in page.segments(maxworkers=workers):
+            if tile is None:
+                continue
+            yield tile
+
+
+def validate_label_tiff(path: Path, *, workers: int, raw_shape: Sequence[int] | None = None) -> tuple[str, ...]:
+    issues: list[str] = []
+
+    if raw_shape is None:
+        raw_shape = _read_tiff_series_shape(path)
+    if _label_has_alpha_channel(raw_shape):
         issues.append("label image has an alpha channel")
 
-    normalized = _normalize_label_image(image, path)
-    unique_values = np.unique(normalized)
-    invalid_values = [int(value) for value in unique_values.tolist() if int(value) not in ALLOWED_BINARY_LABEL_VALUES]
-    if invalid_values:
-        preview = ", ".join(str(value) for value in invalid_values[:8])
+    invalid_values: set[int] = set()
+    for tile in _iter_label_tiles(path, workers=workers):
+        normalized = _normalize_label_tile(tile, path)
+        tile_values = np.unique(normalized)
+        invalid_values.update(
+            int(value)
+            for value in tile_values.tolist()
+            if int(value) not in ALLOWED_BINARY_LABEL_VALUES
+        )
         if len(invalid_values) > 8:
-            preview += ", ..."
-        issues.append(f"label values are not binary; found non-binary values: {preview}")
+            break
+
+    if invalid_values:
+        issues.append(
+            "label values are not binary; found non-binary values: "
+            f"{_preview_invalid_values(invalid_values)}"
+        )
 
     return tuple(issues)
 
@@ -228,63 +283,33 @@ def read_zarr_shape(path: Path) -> tuple[int, int]:
     return _normalize_zarr_shape(array.shape, path)
 
 
-def check_segment(segment_dir: Path) -> SegmentResult:
-    issues: list[ShapeIssue] = []
-    zarr_path = segment_dir / f"{segment_dir.name}.zarr"
-    if not zarr_path.is_dir():
-        issues.append(
-            ShapeIssue(
-                zarr_path,
-                f"Expected segment zarr directory is missing: {zarr_path.name}",
-            )
-        )
-        return SegmentResult(segment_dir=segment_dir, expected_shape=None, issues=tuple(issues))
-    try:
-        expected_shape = read_zarr_shape(zarr_path)
-    except Exception as exc:
-        issues.append(ShapeIssue(zarr_path, f"Failed to read Zarr shape: {exc}"))
-        return SegmentResult(segment_dir=segment_dir, expected_shape=None, issues=tuple(issues))
+def _run_parallel_map(
+    items: Sequence[object],
+    *,
+    workers: int,
+    fn,
+    desc: str,
+    unit: str,
+    show_progress: bool,
+) -> Iterator[tuple[object, object | Exception]]:
+    if not items:
+        return
 
-    target_tiffs = list(iter_target_tiffs(segment_dir))
-    present_label_tokens = {
-        token
-        for token in REQUIRED_LABEL_NAME_TOKENS
-        if any(token in tiff_path.name.lower() for tiff_path in target_tiffs)
-    }
-    missing_label_tokens = [
-        token for token in REQUIRED_LABEL_NAME_TOKENS if token not in present_label_tokens
-    ]
-    for token in missing_label_tokens:
-        issues.append(
-            ShapeIssue(
-                segment_dir,
-                f"missing required label TIFF containing '{token}'",
-            )
-        )
-
-    for tiff_path in target_tiffs:
+    worker_count = max(1, min(workers, len(items)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_item = {executor.submit(fn, item): item for item in items}
+        progress = tqdm(total=len(items), desc=desc, unit=unit, disable=not show_progress)
         try:
-            tiff_shape = read_tiff_shape(tiff_path)
-        except Exception as exc:
-            issues.append(ShapeIssue(tiff_path, f"Failed to read TIFF shape: {exc}"))
-            continue
-
-        if tiff_shape != expected_shape:
-            issues.append(
-                ShapeIssue(
-                    tiff_path,
-                    f"shape {tiff_shape[0]}x{tiff_shape[1]} does not match zarr {expected_shape[0]}x{expected_shape[1]}",
-                )
-            )
-
-        if _is_label_tiff(tiff_path):
-            try:
-                for message in validate_label_tiff(tiff_path):
-                    issues.append(ShapeIssue(tiff_path, message))
-            except Exception as exc:
-                issues.append(ShapeIssue(tiff_path, f"Failed to validate label contents: {exc}"))
-
-    return SegmentResult(segment_dir=segment_dir, expected_shape=expected_shape, issues=tuple(issues))
+            for future in as_completed(future_to_item):
+                item = future_to_item[future]
+                try:
+                    yield item, future.result()
+                except Exception as exc:
+                    yield item, exc
+                finally:
+                    progress.update(1)
+        finally:
+            progress.close()
 
 
 def validate_root(root: Path, *, workers: int, show_progress: bool = True) -> list[SegmentResult]:
@@ -292,34 +317,119 @@ def validate_root(root: Path, *, workers: int, show_progress: bool = True) -> li
     if not segment_dirs:
         raise FileNotFoundError(f"No segment directories found under {root}")
 
-    worker_count = max(1, min(workers, len(segment_dirs)))
-    results: list[SegmentResult] = []
+    states: dict[Path, SegmentState] = {}
+    for segment_dir in segment_dirs:
+        zarr_path = segment_dir / f"{segment_dir.name}.zarr"
+        state = SegmentState(segment_dir=segment_dir, zarr_path=zarr_path)
+        states[segment_dir] = state
+        if not zarr_path.is_dir():
+            state.issues.append(
+                ShapeIssue(
+                    zarr_path,
+                    f"Expected segment zarr directory is missing: {zarr_path.name}",
+                )
+            )
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_to_segment = {executor.submit(check_segment, segment_dir): segment_dir for segment_dir in segment_dirs}
-        progress = tqdm(
-            total=len(segment_dirs),
-            desc="Validating segments",
-            unit="segment",
-            disable=not show_progress,
-        )
-        try:
-            for future in as_completed(future_to_segment):
-                segment_dir = future_to_segment[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    result = SegmentResult(
-                        segment_dir=segment_dir,
-                        expected_shape=None,
-                        issues=(ShapeIssue(segment_dir, f"Unhandled worker failure: {exc}"),),
+    zarr_ready = [state for state in states.values() if state.zarr_path.is_dir()]
+    for item, result in _run_parallel_map(
+        zarr_ready,
+        workers=workers,
+        fn=lambda state: read_zarr_shape(state.zarr_path),
+        desc="Zarr metadata",
+        unit="segment",
+        show_progress=show_progress,
+    ):
+        state = item
+        if isinstance(result, Exception):
+            state.issues.append(ShapeIssue(state.zarr_path, f"Failed to read Zarr shape: {result}"))
+            continue
+        state.expected_shape = result
+
+    tiff_items: list[tuple[SegmentState, Path]] = []
+    label_stage_items: list[tuple[SegmentState, Path, tuple[int, ...]]] = []
+    for state in states.values():
+        state.target_tiffs = tuple(iter_target_tiffs(state.segment_dir))
+        present_label_tokens = {
+            token
+            for token in REQUIRED_LABEL_NAME_TOKENS
+            if any(token in tiff_path.name.lower() for tiff_path in state.target_tiffs)
+        }
+        for token in REQUIRED_LABEL_NAME_TOKENS:
+            if token not in present_label_tokens:
+                state.issues.append(
+                    ShapeIssue(
+                        state.segment_dir,
+                        f"missing required label TIFF containing '{token}'",
                     )
-                results.append(result)
-                progress.update(1)
-        finally:
-            progress.close()
+                )
+        for tiff_path in state.target_tiffs:
+            tiff_items.append((state, tiff_path))
 
-    results.sort(key=lambda result: result.segment_dir.as_posix())
+    for item, result in _run_parallel_map(
+        tiff_items,
+        workers=workers,
+        fn=lambda item: read_tiff_metadata(item[1]),
+        desc="TIFF metadata",
+        unit="file",
+        show_progress=show_progress,
+    ):
+        state, tiff_path = item
+        if isinstance(result, Exception):
+            state.issues.append(ShapeIssue(tiff_path, f"Failed to read TIFF shape: {result}"))
+            continue
+        metadata = result
+        if state.expected_shape is None:
+            continue
+        if metadata.spatial_shape != state.expected_shape:
+            state.issues.append(
+                ShapeIssue(
+                    tiff_path,
+                    "shape "
+                    f"{metadata.spatial_shape[0]}x{metadata.spatial_shape[1]} does not match zarr "
+                    f"{state.expected_shape[0]}x{state.expected_shape[1]}",
+                )
+            )
+        if _is_label_tiff(tiff_path) and _label_has_alpha_channel(metadata.raw_shape):
+            state.issues.append(ShapeIssue(tiff_path, "label image has an alpha channel"))
+        if _is_label_tiff(tiff_path):
+            label_stage_items.append((state, tiff_path, metadata.raw_shape))
+
+    if any(state.issues for state in states.values()):
+        return [
+            SegmentResult(
+                segment_dir=state.segment_dir,
+                expected_shape=state.expected_shape,
+                issues=tuple(state.issues),
+            )
+            for state in sorted(states.values(), key=lambda value: value.segment_dir.as_posix())
+        ]
+
+    progress = tqdm(total=len(label_stage_items), desc="Label contents", unit="file", disable=not show_progress)
+    try:
+        for state, label_path, raw_shape in label_stage_items:
+            try:
+                messages = [
+                    message
+                    for message in validate_label_tiff(label_path, workers=workers, raw_shape=raw_shape)
+                    if message != "label image has an alpha channel"
+                ]
+                for message in messages:
+                    state.issues.append(ShapeIssue(label_path, message))
+            except Exception as exc:
+                state.issues.append(ShapeIssue(label_path, f"Failed to validate label contents: {exc}"))
+            finally:
+                progress.update(1)
+    finally:
+        progress.close()
+
+    results = [
+        SegmentResult(
+            segment_dir=state.segment_dir,
+            expected_shape=state.expected_shape,
+            issues=tuple(state.issues),
+        )
+        for state in sorted(states.values(), key=lambda value: value.segment_dir.as_posix())
+    ]
     return results
 
 
