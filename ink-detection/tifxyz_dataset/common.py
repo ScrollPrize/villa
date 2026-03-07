@@ -46,6 +46,16 @@ def _normalize_patch_size_zyx(patch_size):
         )
     return patch_size_zyx
 
+def _normalize_vectors_last_axis(vectors, eps=1e-6):
+    vectors = np.asarray(vectors, dtype=np.float32)
+    norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
+    good = np.isfinite(vectors).all(axis=-1, keepdims=True)
+    good &= np.isfinite(norms) & (norms > float(eps))
+    out = np.zeros_like(vectors, dtype=np.float32)
+    good_mask = good[..., 0]
+    out[good_mask] = vectors[good_mask] / norms[good_mask]
+    return out, good_mask
+
 def _get_labels_and_mask(dataset, segment):
     import cv2
 
@@ -180,7 +190,8 @@ def _sample_patch_supervision_grid(dataset, segment, min_corner, max_corner, ext
     )
     normals_zyx = np.stack([nz_int, ny_int, nx_int], axis=-1).astype(np.float32, copy=False)
     normals_valid = np.asarray(normals_valid, dtype=bool)
-    normals_valid &= np.isfinite(normals_zyx).all(axis=-1)
+    normals_zyx, normals_nonzero = _normalize_vectors_last_axis(normals_zyx)
+    normals_valid &= normals_nonzero
 
     class_codes = np.full(query_y.shape, 100, dtype=np.uint8)
     ink_mask_full, supervision_mask_full = _get_labels_and_mask(dataset, segment)
