@@ -79,13 +79,10 @@ def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tens
 		mag_n = mag * signed_len.unsqueeze(-1)
 		lm = ((mag_n - 1.0) ** 2).mean(dim=-1)  # (D, He, We)
 
-		# Strip validity: all sample points must be valid
-		if sampled.valid is not None:
-			sv = (sampled.valid.squeeze(0).squeeze(0) > 0.5).to(dtype=dtype)
-			sv = sv.reshape(D, He, We, strip_samples)
-			strip_valid = sv.amin(dim=-1)  # (D, He, We)
-		else:
-			strip_valid = torch.ones(D, He, We, device=device, dtype=dtype)
+		# Strip validity: all sample points must have grad_mag > 0
+		sv = (sampled.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=dtype)
+		sv = sv.reshape(D, He, We, strip_samples)
+		strip_valid = sv.amin(dim=-1)  # (D, He, We)
 
 		return lm, strip_valid
 

@@ -77,21 +77,21 @@ def _decode_dir_angle(dir0: np.ndarray, dir1: np.ndarray) -> np.ndarray:
 	return np.arctan2(sin2t, cos2t) * 0.5
 
 
-def _estimate_normal_weights(
+def _estimate_normal(
 	dir0_z: np.ndarray, dir1_z: np.ndarray,
 	dir0_y: np.ndarray, dir1_y: np.ndarray,
 	dir0_x: np.ndarray, dir1_x: np.ndarray,
 	eps: float = 1e-12,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-	"""Estimate in-plane projection weights from three axis dir channel pairs.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+	"""Estimate 3D surface normal and fusion weights from three axis dir channel pairs.
 
-	Each axis's dir0/dir1 (in [0,1]) encodes a 2D gradient direction in the
-	slicing plane. The three constraints form a 3×3 system whose least-squares
-	normal is found via cross products of row pairs.
+	Uses iterative observation-weighted fitting:
+	  Pass 1: Score 3 cross-product candidates against observed dir channels,
+	          weighted average → initial estimate.
+	  Pass 2: Re-weight constraint rows by axis reliability from the estimate,
+	          sign-align, sum, normalize → final normal.
 
-	Returns (w_z, w_y, w_x) — in-plane projection magnitudes sqrt(1 - n_axis²),
-	each same shape as the input arrays.  These represent how edge-on the surface
-	is to each slicing axis (= how reliably that axis observes the sheet).
+	Returns (w_z, w_y, w_x, nx_n, ny_n, nz_n) — fusion weights and unit normal.
 	"""
 	theta_z = _decode_dir_angle(dir0_z, dir1_z)
 	theta_y = _decode_dir_angle(dir0_y, dir1_y)
@@ -101,23 +101,15 @@ def _estimate_normal_weights(
 	sy, cy = np.sin(theta_y), np.cos(theta_y)
 	sx, cx = np.sin(theta_x), np.cos(theta_x)
 
-	# Constraint rows (see lasagna_3d.md for derivation):
-	#   r1 = (sin θ_z, -cos θ_z, 0)       from z-slices
-	#   r2 = (sin θ_y,  0,      -cos θ_y)  from y-slices
-	#   r3 = (0,         sin θ_x, -cos θ_x) from x-slices
-	#
 	# Cross products (candidate normals):
-	# n1 = r1 × r2
 	n1_x = cz * cy
 	n1_y = sz * cy
-	n1_z = cz * sy  # note: cross product sign works out positive here
+	n1_z = cz * sy
 
-	# n2 = r1 × r3
 	n2_x = cz * cx
 	n2_y = sz * cx
 	n2_z = sz * sx
 
-	# n3 = r2 × r3
 	n3_x = cy * sx
 	n3_y = sy * cx
 	n3_z = sy * sx
@@ -135,25 +127,71 @@ def _estimate_normal_weights(
 	n3_y = n3_y * sign3
 	n3_z = n3_z * sign3
 
-	# Sum and normalize
-	nx = n1_x + n2_x + n3_x
-	ny = n1_y + n2_y + n3_y
-	nz = n1_z + n2_z + n3_z
-	norm = np.sqrt(nx * nx + ny * ny + nz * nz) + eps
+	# --- Pass 1: Score candidates against observed dir channels ---
+	def _enc(gx, gy):
+		r2 = gx * gx + gy * gy + eps
+		c2 = (gx * gx - gy * gy) / r2
+		s2 = 2.0 * gx * gy / r2
+		isq2 = 1.0 / np.sqrt(2.0)
+		return 0.5 + 0.5 * c2, 0.5 + 0.5 * (c2 - s2) * isq2
 
-	# Weights = in-plane projection magnitude for each slicing axis.
-	# The UNet outputs the in-plane gradient: gm_axis = G * sqrt(1 - n_axis²).
-	# Using sqrt(1 - n_axis²) as weight makes the fusion recover G correctly:
-	#   gm_fused = Σ(gm_axis) / Σ(w_axis) = G * Σw / Σw = G.
-	# Also weights cos by observation reliability (edge-on = clear line = reliable).
-	nx_n = nx / norm
-	ny_n = ny / norm
-	nz_n = nz / norm
-	w_z = np.sqrt(nx_n * nx_n + ny_n * ny_n + eps)  # sqrt(1 - nz²)
-	w_y = np.sqrt(nx_n * nx_n + nz_n * nz_n + eps)  # sqrt(1 - ny²)
-	w_x = np.sqrt(ny_n * ny_n + nz_n * nz_n + eps)  # sqrt(1 - nx²)
+	scores = []
+	for (ncx, ncy, ncz) in [(n1_x, n1_y, n1_z), (n2_x, n2_y, n2_z), (n3_x, n3_y, n3_z)]:
+		pz0, pz1 = _enc(ncx, ncy)
+		py0, py1 = _enc(ncx, ncz)
+		px0, px1 = _enc(ncy, ncz)
+		err_z = (pz0 - dir0_z) ** 2 + (pz1 - dir1_z) ** 2
+		err_y = (py0 - dir0_y) ** 2 + (py1 - dir1_y) ** 2
+		err_x = (px0 - dir0_x) ** 2 + (px1 - dir1_x) ** 2
+		wz_c = ncx ** 2 + ncy ** 2
+		wy_c = ncx ** 2 + ncz ** 2
+		wx_c = ncy ** 2 + ncz ** 2
+		total_err = wz_c * err_z + wy_c * err_y + wx_c * err_x
+		scores.append(1.0 / (total_err + eps))
 
-	return w_z, w_y, w_x
+	s1, s2_s, s3_s = scores
+	est_x = s1 * n1_x + s2_s * n2_x + s3_s * n3_x
+	est_y = s1 * n1_y + s2_s * n2_y + s3_s * n3_y
+	est_z = s1 * n1_z + s2_s * n2_z + s3_s * n3_z
+	norm_e = np.sqrt(est_x ** 2 + est_y ** 2 + est_z ** 2) + eps
+	est_x = est_x / norm_e
+	est_y = est_y / norm_e
+	est_z = est_z / norm_e
+
+	# --- Pass 2: Re-weight constraint rows ---
+	wz2 = np.sqrt(est_x ** 2 + est_y ** 2 + eps)
+	wy2 = np.sqrt(est_x ** 2 + est_z ** 2 + eps)
+	wx2 = np.sqrt(est_y ** 2 + est_z ** 2 + eps)
+
+	wzy = wz2 * wy2
+	wzx = wz2 * wx2
+	wyx = wy2 * wx2
+
+	rn1_x = wzy * n1_x; rn1_y = wzy * n1_y; rn1_z = wzy * n1_z
+	rn2_x = wzx * n2_x; rn2_y = wzx * n2_y; rn2_z = wzx * n2_z
+	rn3_x = wyx * n3_x; rn3_y = wyx * n3_y; rn3_z = wyx * n3_z
+
+	dot2r = rn1_x * rn2_x + rn1_y * rn2_y + rn1_z * rn2_z
+	s2r = np.where(dot2r >= 0, 1.0, -1.0)
+	rn2_x = rn2_x * s2r; rn2_y = rn2_y * s2r; rn2_z = rn2_z * s2r
+
+	dot3r = rn1_x * rn3_x + rn1_y * rn3_y + rn1_z * rn3_z
+	s3r = np.where(dot3r >= 0, 1.0, -1.0)
+	rn3_x = rn3_x * s3r; rn3_y = rn3_y * s3r; rn3_z = rn3_z * s3r
+
+	nx_f = rn1_x + rn2_x + rn3_x
+	ny_f = rn1_y + rn2_y + rn3_y
+	nz_f = rn1_z + rn2_z + rn3_z
+	norm_f = np.sqrt(nx_f ** 2 + ny_f ** 2 + nz_f ** 2) + eps
+	nx_n = nx_f / norm_f
+	ny_n = ny_f / norm_f
+	nz_n = nz_f / norm_f
+
+	w_z = np.sqrt(nx_n * nx_n + ny_n * ny_n + eps)
+	w_y = np.sqrt(nx_n * nx_n + nz_n * nz_n + eps)
+	w_x = np.sqrt(ny_n * ny_n + nz_n * nz_n + eps)
+
+	return w_z, w_y, w_x, nx_n, ny_n, nz_n
 
 
 def run_preprocess(
@@ -590,13 +628,14 @@ def _make_fuse_tile_3axis():
 		"""Fuse one spatial tile from 3 axis volumes.
 
 		z, y, x: (5, nz, ny, nx) float32 — [cos, grad_mag, dir0, dir1, valid]
-		out: (9, nz, ny, nx) uint8 — [cos, gm, dir0_z, dir1_z, valid, dir0_y, dir1_y, dir0_x, dir1_x]
+		out: (4, nz, ny, nx) uint8 — [cos, gm, nx_u8, ny_u8]
 		"""
 		nz = z.shape[1]
 		ny = z.shape[2]
 		nx = z.shape[3]
 		inv255 = np.float32(1.0 / 255.0)
 		sqrt2 = np.float32(np.sqrt(2.0))
+		inv_sqrt2 = np.float32(1.0 / np.sqrt(2.0))
 		for zi in range(nz):
 			for yi in range(ny):
 				for xi in range(nx):
@@ -605,7 +644,6 @@ def _make_fuse_tile_3axis():
 					z_gm = z[1, zi, yi, xi]
 					z_d0 = z[2, zi, yi, xi] * inv255
 					z_d1 = z[3, zi, yi, xi] * inv255
-					z_val = z[4, zi, yi, xi]
 
 					y_cos = y[0, zi, yi, xi]
 					y_gm = y[1, zi, yi, xi]
@@ -663,16 +701,99 @@ def _make_fuse_tile_3axis():
 						n3_y = -n3_y
 						n3_z = -n3_z
 
-					# Sum and normalize
-					nnx = n1_x + n2_x + n3_x
-					nny = n1_y + n2_y + n3_y
-					nnz = n1_z + n2_z + n3_z
+					# --- Pass 1: Score candidates against observations ---
+					# Inline encode_dir: (a,b) -> d0=0.5+0.5*c2, d1=0.5+0.5*(c2-s2)*inv_sqrt2
+					# where c2=(a²-b²)/(a²+b²+eps), s2=2ab/(a²+b²+eps)
+					total_err1 = np.float32(0.0)
+					total_err2 = np.float32(0.0)
+					total_err3 = np.float32(0.0)
+
+					# Score all 3 candidates against z-axis obs (nx, ny)
+					for ci in range(3):
+						if ci == 0:
+							ca = n1_x; cb = n1_y; cc = n1_z
+						elif ci == 1:
+							ca = n2_x; cb = n2_y; cc = n2_z
+						else:
+							ca = n3_x; cb = n3_y; cc = n3_z
+
+						# z-axis: encode(ca, cb)
+						r2 = ca * ca + cb * cb + eps
+						c2 = (ca * ca - cb * cb) / r2
+						s2 = np.float32(2.0) * ca * cb / r2
+						pz0 = np.float32(0.5) + np.float32(0.5) * c2
+						pz1 = np.float32(0.5) + np.float32(0.5) * (c2 - s2) * inv_sqrt2
+						ez = (pz0 - z_d0) ** 2 + (pz1 - z_d1) ** 2
+						wz_c = ca * ca + cb * cb
+
+						# y-axis: encode(ca, cc)
+						r2 = ca * ca + cc * cc + eps
+						c2 = (ca * ca - cc * cc) / r2
+						s2 = np.float32(2.0) * ca * cc / r2
+						py0 = np.float32(0.5) + np.float32(0.5) * c2
+						py1 = np.float32(0.5) + np.float32(0.5) * (c2 - s2) * inv_sqrt2
+						ey = (py0 - y_d0) ** 2 + (py1 - y_d1) ** 2
+						wy_c = ca * ca + cc * cc
+
+						# x-axis: encode(cb, cc)
+						r2 = cb * cb + cc * cc + eps
+						c2 = (cb * cb - cc * cc) / r2
+						s2 = np.float32(2.0) * cb * cc / r2
+						px0 = np.float32(0.5) + np.float32(0.5) * c2
+						px1 = np.float32(0.5) + np.float32(0.5) * (c2 - s2) * inv_sqrt2
+						ex = (px0 - x_d0) ** 2 + (px1 - x_d1) ** 2
+						wx_c = cb * cb + cc * cc
+
+						te = wz_c * ez + wy_c * ey + wx_c * ex
+						if ci == 0:
+							total_err1 = te
+						elif ci == 1:
+							total_err2 = te
+						else:
+							total_err3 = te
+
+					sc1 = np.float32(1.0) / (total_err1 + eps)
+					sc2 = np.float32(1.0) / (total_err2 + eps)
+					sc3 = np.float32(1.0) / (total_err3 + eps)
+
+					est_x = sc1 * n1_x + sc2 * n2_x + sc3 * n3_x
+					est_y = sc1 * n1_y + sc2 * n2_y + sc3 * n3_y
+					est_z = sc1 * n1_z + sc2 * n2_z + sc3 * n3_z
+					norm_e = np.sqrt(est_x * est_x + est_y * est_y + est_z * est_z) + eps
+					est_x = est_x / norm_e
+					est_y = est_y / norm_e
+					est_z = est_z / norm_e
+
+					# --- Pass 2: Re-weight constraint rows ---
+					wz2 = np.sqrt(est_x * est_x + est_y * est_y + eps)
+					wy2 = np.sqrt(est_x * est_x + est_z * est_z + eps)
+					wx2 = np.sqrt(est_y * est_y + est_z * est_z + eps)
+
+					wzy = wz2 * wy2
+					wzx = wz2 * wx2
+					wyx = wy2 * wx2
+
+					rn1_x = wzy * n1_x; rn1_y = wzy * n1_y; rn1_z = wzy * n1_z
+					rn2_x = wzx * n2_x; rn2_y = wzx * n2_y; rn2_z = wzx * n2_z
+					rn3_x = wyx * n3_x; rn3_y = wyx * n3_y; rn3_z = wyx * n3_z
+
+					dot2r = rn1_x * rn2_x + rn1_y * rn2_y + rn1_z * rn2_z
+					if dot2r < np.float32(0.0):
+						rn2_x = -rn2_x; rn2_y = -rn2_y; rn2_z = -rn2_z
+					dot3r = rn1_x * rn3_x + rn1_y * rn3_y + rn1_z * rn3_z
+					if dot3r < np.float32(0.0):
+						rn3_x = -rn3_x; rn3_y = -rn3_y; rn3_z = -rn3_z
+
+					nnx = rn1_x + rn2_x + rn3_x
+					nny = rn1_y + rn2_y + rn3_y
+					nnz = rn1_z + rn2_z + rn3_z
 					norm = np.sqrt(nnx * nnx + nny * nny + nnz * nnz) + eps
 
-					# In-plane projection weights: sqrt(1 - n_axis²)
 					nnx_n = nnx / norm
 					nny_n = nny / norm
 					nnz_n = nnz / norm
+
+					# In-plane projection weights
 					w_z = np.sqrt(nnx_n * nnx_n + nny_n * nny_n + eps)
 					w_y = np.sqrt(nnx_n * nnx_n + nnz_n * nnz_n + eps)
 					w_x = np.sqrt(nny_n * nny_n + nnz_n * nnz_n + eps)
@@ -682,16 +803,19 @@ def _make_fuse_tile_3axis():
 					cos_fused = (w_z * z_cos + w_y * y_cos + w_x * x_cos) / w_sum
 					gm_fused = (z_gm + y_gm + x_gm) / w_sum
 
-					# Clip and write uint8
+					# Flip to +z hemisphere
+					if nnz_n < np.float32(0.0):
+						nnx_n = -nnx_n
+						nny_n = -nny_n
+
+					# Encode normal as uint8
+					nx_val = nnx_n * np.float32(127.0) + np.float32(128.5)
+					ny_val = nny_n * np.float32(127.0) + np.float32(128.5)
+
 					out[0, zi, yi, xi] = np.uint8(min(np.float32(255.0), max(np.float32(0.0), cos_fused)))
 					out[1, zi, yi, xi] = np.uint8(min(np.float32(255.0), max(np.float32(0.0), gm_fused)))
-					out[2, zi, yi, xi] = np.uint8(z[2, zi, yi, xi])
-					out[3, zi, yi, xi] = np.uint8(z[3, zi, yi, xi])
-					out[4, zi, yi, xi] = np.uint8(z_val)
-					out[5, zi, yi, xi] = np.uint8(y[2, zi, yi, xi])
-					out[6, zi, yi, xi] = np.uint8(y[3, zi, yi, xi])
-					out[7, zi, yi, xi] = np.uint8(x[2, zi, yi, xi])
-					out[8, zi, yi, xi] = np.uint8(x[3, zi, yi, xi])
+					out[2, zi, yi, xi] = np.uint8(min(np.float32(255.0), max(np.float32(0.0), nx_val)))
+					out[3, zi, yi, xi] = np.uint8(min(np.float32(255.0), max(np.float32(0.0), ny_val)))
 
 	return _fuse_tile_3axis
 
@@ -708,39 +832,23 @@ def _fuse_tile_3axis_numpy(z, y, x, out, eps):
 	dir0_x = x[2] / 255.0
 	dir1_x = x[3] / 255.0
 
-	w_z, w_y, w_x = _estimate_normal_weights(
+	w_z, w_y, w_x, nx_n, ny_n, nz_n = _estimate_normal(
 		dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x, eps=eps)
 
 	w_sum = w_z + w_y + w_x + eps
 	cos_fused = (w_z * z[0] + w_y * y[0] + w_x * x[0]) / w_sum
 	gm_fused = (z[1] + y[1] + x[1]) / w_sum
 
+	# Flip to +z hemisphere
+	flip = np.where(nz_n < 0, -1.0, 1.0)
+	nx_n = nx_n * flip
+	ny_n = ny_n * flip
+
 	out[0] = np.clip(cos_fused, 0, 255).astype(np.uint8)
 	out[1] = np.clip(gm_fused, 0, 255).astype(np.uint8)
-	out[2] = z[2].astype(np.uint8)
-	out[3] = z[3].astype(np.uint8)
-	out[4] = z[4].astype(np.uint8)
-	out[5] = y[2].astype(np.uint8)
-	out[6] = y[3].astype(np.uint8)
-	out[7] = x[2].astype(np.uint8)
-	out[8] = x[3].astype(np.uint8)
+	out[2] = np.clip(np.round(nx_n * 127.0 + 128.0), 0, 255).astype(np.uint8)
+	out[3] = np.clip(np.round(ny_n * 127.0 + 128.0), 0, 255).astype(np.uint8)
 
-
-def _process_tile_2axis(z, y_data, x_data, out, have_y, have_x):
-	"""Process a tile when only 2 axes are available (no normal-weight fusion)."""
-	out[0] = z[0].astype(np.uint8)
-	out[1] = z[1].astype(np.uint8)
-	out[2] = z[2].astype(np.uint8)
-	out[3] = z[3].astype(np.uint8)
-	out[4] = z[4].astype(np.uint8)
-	ch = 5
-	if have_y:
-		out[ch] = np.clip(y_data[2], 0, 255).astype(np.uint8)
-		out[ch + 1] = np.clip(y_data[3], 0, 255).astype(np.uint8)
-		ch += 2
-	if have_x:
-		out[ch] = np.clip(x_data[2], 0, 255).astype(np.uint8)
-		out[ch + 1] = np.clip(x_data[3], 0, 255).astype(np.uint8)
 
 
 def _warmup_fuse_kernel():
@@ -748,13 +856,13 @@ def _warmup_fuse_kernel():
 	if _fuse_tile_3axis is None:
 		return
 	dummy = np.zeros((5, 1, 1, 1), dtype=np.float32)
-	out = np.zeros((9, 1, 1, 1), dtype=np.uint8)
+	out = np.zeros((4, 1, 1, 1), dtype=np.uint8)
 	_fuse_tile_3axis(dummy, dummy, dummy, out, np.float32(1e-7))
 
 
 def _run_integrate_tile_parallel(
 	*, z_vol, y_vol, x_vol, out,
-	have_y, have_x, have_all_3, n_out_ch, out_chunks, eps,
+	n_out_ch, out_chunks, eps,
 	zi_lo, zi_hi, yi_lo, yi_hi, xi_lo, xi_hi,
 ):
 	"""Tile-parallel path: numba fused kernel releases GIL, threads run in parallel."""
@@ -794,20 +902,17 @@ def _run_integrate_tile_parallel(
 		zs, ze, ys, ye, xs, xe = coords
 		t_r0 = time.time()
 		z_chunk = np.asarray(z_vol[:5, zs:ze, ys:ye, xs:xe]).astype(np.float32)
-		y_chunk = np.asarray(y_vol[:5, zs:ze, ys:ye, xs:xe]).astype(np.float32) if have_y else None
-		x_chunk = np.asarray(x_vol[:5, zs:ze, ys:ye, xs:xe]).astype(np.float32) if have_x else None
+		y_chunk = np.asarray(y_vol[:5, zs:ze, ys:ye, xs:xe]).astype(np.float32)
+		x_chunk = np.asarray(x_vol[:5, zs:ze, ys:ye, xs:xe]).astype(np.float32)
 		dt_read = time.time() - t_r0
 
 		t_c0 = time.time()
-		out_tile = np.empty((n_out_ch, ze - zs, ye - ys, xe - xs), dtype=np.uint8)
-		if have_all_3:
-			_fuse_tile_3axis(z_chunk, y_chunk, x_chunk, out_tile, eps)
-		else:
-			_process_tile_2axis(z_chunk, y_chunk, x_chunk, out_tile, have_y, have_x)
+		out_tile = np.empty((4, ze - zs, ye - ys, xe - xs), dtype=np.uint8)
+		_fuse_tile_3axis(z_chunk, y_chunk, x_chunk, out_tile, eps)
 		dt_compute = time.time() - t_c0
 
 		t_w0 = time.time()
-		for ch in range(n_out_ch):
+		for ch in range(4):
 			out[ch, zs:ze, ys:ye, xs:xe] = out_tile[ch]
 		dt_write = time.time() - t_w0
 
@@ -851,7 +956,7 @@ def _run_integrate_tile_parallel(
 
 def _run_integrate_slab(
 	*, z_vol, y_vol, x_vol, out,
-	have_y, have_x, have_all_3, n_out_ch, z_chunks, eps,
+	n_out_ch, z_chunks, eps,
 	zi_lo, zi_hi, yi_lo, yi_hi, xi_lo, xi_hi,
 	crop_z_count,
 ):
@@ -859,11 +964,7 @@ def _run_integrate_slab(
 	src_z_chunk = z_chunks[1]
 	batch_size = src_z_chunk
 
-	vols_to_read = [z_vol]
-	if have_y:
-		vols_to_read.append(y_vol)
-	if have_x:
-		vols_to_read.append(x_vol)
+	vols_to_read = [z_vol, y_vol, x_vol]
 
 	ys, ye, xs, xe = yi_lo, yi_hi, xi_lo, xi_hi
 	io_pool = ThreadPoolExecutor(max_workers=len(vols_to_read) + 1)
@@ -900,12 +1001,7 @@ def _run_integrate_slab(
 		read_results = [f.result() for f in read_futs]
 		t_read_wait += time.time() - t_rw0
 
-		ri = 0
-		z_batch = read_results[ri]; ri += 1
-		y_batch = read_results[ri] if have_y else None
-		if have_y:
-			ri += 1
-		x_batch = read_results[ri] if have_x else None
+		z_batch, y_batch, x_batch = read_results
 
 		if bi + 1 < len(batches):
 			read_futs = _submit_reads(*batches[bi + 1])
@@ -918,36 +1014,25 @@ def _run_integrate_slab(
 		t_c0 = time.time()
 		ch_data = []
 
-		if have_all_3:
-			dir0_z = z_batch[2] / 255.0
-			dir1_z = z_batch[3] / 255.0
-			dir0_y = y_batch[2] / 255.0
-			dir1_y = y_batch[3] / 255.0
-			dir0_x = x_batch[2] / 255.0
-			dir1_x = x_batch[3] / 255.0
-			w_z, w_y, w_x = _estimate_normal_weights(
-				dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x)
-			w_sum = w_z + w_y + w_x + eps
-			cos_fused = (w_z * z_batch[0] + w_y * y_batch[0] + w_x * x_batch[0]) / w_sum
-			gm_fused = (z_batch[1] + y_batch[1] + x_batch[1]) / w_sum
-			ch_data.append((0, np.clip(cos_fused, 0, 255).astype(np.uint8)))
-			ch_data.append((1, np.clip(gm_fused, 0, 255).astype(np.uint8)))
-		else:
-			ch_data.append((0, z_batch[0].astype(np.uint8)))
-			ch_data.append((1, z_batch[1].astype(np.uint8)))
+		dir0_z = z_batch[2] / 255.0
+		dir1_z = z_batch[3] / 255.0
+		dir0_y = y_batch[2] / 255.0
+		dir1_y = y_batch[3] / 255.0
+		dir0_x = x_batch[2] / 255.0
+		dir1_x = x_batch[3] / 255.0
+		w_z, w_y, w_x, nx_n, ny_n, nz_n = _estimate_normal(
+			dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x)
+		w_sum = w_z + w_y + w_x + eps
+		cos_fused = (w_z * z_batch[0] + w_y * y_batch[0] + w_x * x_batch[0]) / w_sum
+		gm_fused = (z_batch[1] + y_batch[1] + x_batch[1]) / w_sum
 
-		ch_data.append((2, z_batch[2].astype(np.uint8)))
-		ch_data.append((3, z_batch[3].astype(np.uint8)))
-		ch_data.append((4, z_batch[4].astype(np.uint8)))
-		ch_off = 5
-		if have_y:
-			ch_data.append((ch_off, np.clip(y_batch[2], 0, 255).astype(np.uint8)))
-			ch_data.append((ch_off + 1, np.clip(y_batch[3], 0, 255).astype(np.uint8)))
-			ch_off += 2
-		if have_x:
-			ch_data.append((ch_off, np.clip(x_batch[2], 0, 255).astype(np.uint8)))
-			ch_data.append((ch_off + 1, np.clip(x_batch[3], 0, 255).astype(np.uint8)))
-			ch_off += 2
+		flip = np.where(nz_n < 0, -1.0, 1.0)
+		nx_enc = nx_n * flip
+		ny_enc = ny_n * flip
+		ch_data.append((0, np.clip(cos_fused, 0, 255).astype(np.uint8)))
+		ch_data.append((1, np.clip(gm_fused, 0, 255).astype(np.uint8)))
+		ch_data.append((2, np.clip(np.round(nx_enc * 127.0 + 128.0), 0, 255).astype(np.uint8)))
+		ch_data.append((3, np.clip(np.round(ny_enc * 127.0 + 128.0), 0, 255).astype(np.uint8)))
 
 		t_compute_total += time.time() - t_c0
 
@@ -989,26 +1074,23 @@ def _run_integrate_slab(
 def run_integrate_directions(
 	*,
 	z_volume_path: str,
-	y_volume_path: str | None = None,
-	x_volume_path: str | None = None,
+	y_volume_path: str,
+	x_volume_path: str,
 	output_path: str,
 	batch_size: int = 32,
 	pred_dt_path: str | None = None,
 ) -> None:
-	"""Fuse cos/grad_mag from three axis volumes using normal-weighted fusion.
+	"""Fuse cos/grad_mag and estimate 3D normal from axis volumes.
 
-	All three axis volumes must be preprocessed with the same uniform scaledown.
-	The z-volume shape is the reference. Z-index mapping is 1:1 (uniform scaledown
-	means all volumes have the same grid spacing in every dimension).
+	All axis volumes must be preprocessed with the same uniform scaledown.
+	The z-volume shape is the reference.
 
-	When all three axes are available, cos and grad_mag are fused using estimated
-	3D surface normal weights. When only two axes are available, z-only cos/grad_mag
-	are used (no fusion).
+	The estimated normal is stored as hemisphere-encoded (nx, ny) uint8 pair.
+	nz is reconstructed as sqrt(1 - nx² - ny²) ≥ 0 by convention.
 
-	Dir channels are always stored separately per axis (no fusion).
+	grad_mag == 0 marks invalid voxels (no separate valid channel).
 
-	Output channels: [cos, grad_mag, dir0_z, dir1_z, valid, dir0_y, dir1_y, dir0_x, dir1_x]
-	(y/x pairs only present if the corresponding volume is provided; pred_dt appended if given)
+	Output channels: [cos, grad_mag, nx, ny] (pred_dt appended if given)
 	"""
 	z_vol = zarr.open(str(z_volume_path), mode="r")
 	z_shape = tuple(int(v) for v in z_vol.shape)
@@ -1034,28 +1116,10 @@ def run_integrate_directions(
 		xi_lo, xi_hi = 0, ref_x
 	crop_z_count = zi_hi - zi_lo
 
-	have_y = y_volume_path is not None
-	have_x = x_volume_path is not None
-	have_all_3 = have_y and have_x
+	y_vol = zarr.open(str(y_volume_path), mode="r")
+	x_vol = zarr.open(str(x_volume_path), mode="r")
 
-	y_vol = zarr.open(str(y_volume_path), mode="r") if have_y else None
-	x_vol = zarr.open(str(x_volume_path), mode="r") if have_x else None
-
-	if not have_y and not have_x:
-		raise ValueError("at least one of y_volume_path or x_volume_path must be provided")
-
-	if not have_all_3:
-		import warnings
-		warnings.warn(
-			"Only 2 axis volumes provided — using z-only cos/grad_mag (no fusion). "
-			"Provide all three (z, y, x) for normal-weighted fusion."
-		)
-
-	channel_names: list[str] = ["cos", "grad_mag", "dir0", "dir1", "valid"]
-	if have_y:
-		channel_names.extend(["dir0_y", "dir1_y"])
-	if have_x:
-		channel_names.extend(["dir0_x", "dir1_x"])
+	channel_names: list[str] = ["cos", "grad_mag", "nx", "ny"]
 
 	# Validate pred-dt early, before any heavy processing
 	if pred_dt_path:
@@ -1088,11 +1152,9 @@ def run_integrate_directions(
 	out.attrs["preprocess_params"] = out_params
 
 	print(f"[integrate_directions] z_volume={z_volume_path} shape={z_shape} scaledown={scaledown}")
-	if have_y:
-		print(f"[integrate_directions] y_volume shape={tuple(int(v) for v in y_vol.shape)}")
-	if have_x:
-		print(f"[integrate_directions] x_volume shape={tuple(int(v) for v in x_vol.shape)}")
-	print(f"[integrate_directions] fusion={'3-axis normal-weighted' if have_all_3 else 'z-only (no fusion)'}")
+	print(f"[integrate_directions] y_volume shape={tuple(int(v) for v in y_vol.shape)}")
+	print(f"[integrate_directions] x_volume shape={tuple(int(v) for v in x_vol.shape)}")
+	print(f"[integrate_directions] fusion=3-axis normal-weighted")
 	print(f"[integrate_directions] -> {output_path} shape=({n_out_ch}, {ref_z}, {ref_y}, {ref_x})")
 	if crop_param is not None:
 		print(f"[integrate_directions] crop z=[{zi_lo},{zi_hi}) y=[{yi_lo},{yi_hi}) x=[{xi_lo},{xi_hi}) "
@@ -1103,12 +1165,11 @@ def run_integrate_directions(
 	eps = np.float32(1e-7)
 
 	# Choose processing strategy: tile-parallel (numba releases GIL) vs slab-based (numpy)
-	use_numba = have_all_3 and _fuse_tile_3axis is not None
+	use_numba = _fuse_tile_3axis is not None
 
 	if use_numba:
 		_run_integrate_tile_parallel(
 			z_vol=z_vol, y_vol=y_vol, x_vol=x_vol, out=out,
-			have_y=have_y, have_x=have_x, have_all_3=have_all_3,
 			n_out_ch=n_out_ch, out_chunks=out_chunks, eps=eps,
 			zi_lo=zi_lo, zi_hi=zi_hi, yi_lo=yi_lo, yi_hi=yi_hi,
 			xi_lo=xi_lo, xi_hi=xi_hi,
@@ -1116,7 +1177,6 @@ def run_integrate_directions(
 	else:
 		_run_integrate_slab(
 			z_vol=z_vol, y_vol=y_vol, x_vol=x_vol, out=out,
-			have_y=have_y, have_x=have_x, have_all_3=have_all_3,
 			n_out_ch=n_out_ch, z_chunks=z_chunks, eps=eps,
 			zi_lo=zi_lo, zi_hi=zi_hi, yi_lo=yi_lo, yi_hi=yi_hi,
 			xi_lo=xi_lo, xi_hi=xi_hi,
@@ -1187,20 +1247,17 @@ def main_integrate(argv: list[str] | None = None) -> int:
 		description="Integrate direction channels from axis-y / axis-x preprocessed volumes into the axis-z reference volume."
 	)
 	p.add_argument("--z-volume", required=True, help="Axis-z preprocessed zarr (reference shape).")
-	p.add_argument("--y-volume", default=None, help="Axis-y preprocessed zarr (optional).")
-	p.add_argument("--x-volume", default=None, help="Axis-x preprocessed zarr (optional).")
+	p.add_argument("--y-volume", required=True, help="Axis-y preprocessed zarr.")
+	p.add_argument("--x-volume", required=True, help="Axis-x preprocessed zarr.")
 	p.add_argument("--output", required=True, help="Output zarr path.")
 	p.add_argument("--batch-size", type=int, default=32, help="Z-slices per batch for resize (default: 32).")
 	p.add_argument("--pred-dt", default=None, help="Surface prediction zarr for distance-to-skeleton channel.")
 	args = p.parse_args(argv)
 
-	if args.y_volume is None and args.x_volume is None:
-		p.error("at least one of --y-volume or --x-volume must be provided")
-
 	run_integrate_directions(
 		z_volume_path=str(args.z_volume),
-		y_volume_path=str(args.y_volume) if args.y_volume else None,
-		x_volume_path=str(args.x_volume) if args.x_volume else None,
+		y_volume_path=str(args.y_volume),
+		x_volume_path=str(args.x_volume),
 		output_path=str(args.output),
 		batch_size=int(args.batch_size),
 		pred_dt_path=str(args.pred_dt) if args.pred_dt else None,

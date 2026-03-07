@@ -21,13 +21,8 @@ class CorrPoints3D:
 class FitData3D:
 	cos: torch.Tensor              # (1, 1, Z, Y, X)
 	grad_mag: torch.Tensor         # (1, 1, Z, Y, X)
-	dir0_z: torch.Tensor           # (1, 1, Z, Y, X) — z-axis direction
-	dir1_z: torch.Tensor
-	dir0_y: torch.Tensor | None    # (1, 1, Z, Y, X) — y-axis direction
-	dir1_y: torch.Tensor | None
-	dir0_x: torch.Tensor | None    # (1, 1, Z, Y, X) — x-axis direction
-	dir1_x: torch.Tensor | None
-	valid: torch.Tensor | None     # (1, 1, Z, Y, X)
+	nx: torch.Tensor               # (1, 1, Z, Y, X) — hemisphere-encoded normal x
+	ny: torch.Tensor               # (1, 1, Z, Y, X) — hemisphere-encoded normal y
 	pred_dt: torch.Tensor | None
 	corr_points: CorrPoints3D | None
 	origin_fullres: tuple[float, float, float]  # (x0, y0, z0) in fullres voxels
@@ -67,13 +62,8 @@ class FitData3D:
 		return FitData3D(
 			cos=_gs(self.cos),
 			grad_mag=_gs(self.grad_mag),
-			dir0_z=_gs(self.dir0_z),
-			dir1_z=_gs(self.dir1_z),
-			dir0_y=_gs(self.dir0_y),
-			dir1_y=_gs(self.dir1_y),
-			dir0_x=_gs(self.dir0_x),
-			dir1_x=_gs(self.dir1_x),
-			valid=_gs(self.valid),
+			nx=_gs(self.nx),
+			ny=_gs(self.ny),
 			pred_dt=_gs(self.pred_dt),
 			corr_points=self.corr_points,
 			origin_fullres=self.origin_fullres,
@@ -137,10 +127,7 @@ def load_3d_for_model(
 
 
 def blur_3d(data: FitData3D, sigma: float) -> None:
-	"""Apply separable 3D Gaussian blur in-place to all data channels.
-
-	Erodes the valid mask by the blur radius so blurred edge artifacts are excluded.
-	"""
+	"""Apply separable 3D Gaussian blur in-place to all data channels."""
 	radius = int(math.ceil(2 * sigma))
 	ks = 2 * radius + 1
 	# 1D Gaussian kernel
@@ -164,17 +151,10 @@ def blur_3d(data: FitData3D, sigma: float) -> None:
 		return v
 
 	# Blur all signal channels in-place
-	for name in ("cos", "grad_mag", "dir0_z", "dir1_z",
-				 "dir0_y", "dir1_y", "dir0_x", "dir1_x"):
+	for name in ("cos", "grad_mag", "nx", "ny"):
 		t = getattr(data, name)
 		if t is not None:
 			t.copy_(_blur_separable(t))
-
-	# Erode valid mask by blur radius using 3D min-pool
-	if data.valid is not None:
-		data.valid.copy_(
-			-F.max_pool3d(-data.valid, kernel_size=ks, stride=1, padding=radius)
-		)
 
 
 def get_preprocessed_params(path: str) -> dict | None:
@@ -242,10 +222,10 @@ def load_3d(
 
 	channels = [str(v) for v in (params.get("channels", []) or [])]
 	if not channels:
-		channels = ["cos", "grad_mag", "dir0", "dir1"]
+		channels = ["cos", "grad_mag", "nx", "ny"]
 	ci = {name: i for i, name in enumerate(channels)}
 
-	req = ["cos", "grad_mag", "dir0", "dir1"]
+	req = ["cos", "grad_mag", "nx", "ny"]
 	miss = [k for k in req if k not in ci]
 	if miss:
 		raise ValueError(f"preprocessed zarr missing required channels: {miss}; available={channels}")
@@ -291,36 +271,26 @@ def load_3d(
 		t = torch.from_numpy(a.astype(np.float32) / scale).to(device=device, dtype=torch.float32)
 		return t.unsqueeze(0).unsqueeze(0)
 
-	def _u8_valid_to_t(a: np.ndarray) -> torch.Tensor:
-		t = torch.from_numpy((a > 0).astype(np.float32)).to(device=device, dtype=torch.float32)
-		return t.unsqueeze(0).unsqueeze(0)
-
 	def _u8_raw_to_t(a: np.ndarray) -> torch.Tensor:
 		t = torch.from_numpy(np.sqrt(a.astype(np.float32))).to(device=device, dtype=torch.float32)
 		return t.unsqueeze(0).unsqueeze(0)
 
 	cos_t = _u8_to_t(_read_ch("cos"))
 	mag_t = _u8_to_t_scaled(_read_ch("grad_mag"), scale=gmag_enc)
-	# dir0/dir1 are the z-axis direction channels
-	dir0_z_t = _u8_to_t(_read_ch("dir0"))
-	dir1_z_t = _u8_to_t(_read_ch("dir1"))
-	valid_t = _u8_valid_to_t(_read_ch("valid")) if "valid" in ci else None
-	dir0_y_t = _u8_to_t(_read_ch("dir0_y")) if "dir0_y" in ci else None
-	dir1_y_t = _u8_to_t(_read_ch("dir1_y")) if "dir1_y" in ci else None
-	dir0_x_t = _u8_to_t(_read_ch("dir0_x")) if "dir0_x" in ci else None
-	dir1_x_t = _u8_to_t(_read_ch("dir1_x")) if "dir1_x" in ci else None
+
+	def _u8_normal_to_t(a: np.ndarray) -> torch.Tensor:
+		t = torch.from_numpy((a.astype(np.float32) - 128.0) / 127.0).to(device=device, dtype=torch.float32)
+		return t.unsqueeze(0).unsqueeze(0)
+
+	nx_t = _u8_normal_to_t(_read_ch("nx"))
+	ny_t = _u8_normal_to_t(_read_ch("ny"))
 	pred_dt_t = _u8_raw_to_t(_read_ch("pred_dt")) if "pred_dt" in ci else None
 
 	return FitData3D(
 		cos=cos_t,
 		grad_mag=mag_t,
-		dir0_z=dir0_z_t,
-		dir1_z=dir1_z_t,
-		dir0_y=dir0_y_t,
-		dir1_y=dir1_y_t,
-		dir0_x=dir0_x_t,
-		dir1_x=dir1_x_t,
-		valid=valid_t,
+		nx=nx_t,
+		ny=ny_t,
 		pred_dt=pred_dt_t,
 		corr_points=None,
 		origin_fullres=origin_fullres,

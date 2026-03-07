@@ -422,19 +422,12 @@ class Model3D(nn.Module):
 			next_uv_ok = torch.cat([next_valid, zeros], dim=0)
 
 			# Connection masks: sample validity AND patch intersection validity
-			if data.valid is not None:
-				def _valid_mask(v: torch.Tensor | None) -> torch.Tensor:
-					if v is not None:
-						return (v.squeeze(0).squeeze(0) > 0.5).to(dtype=xyz_lr.dtype).unsqueeze(1)
-					return torch.ones(D, 1, Hm, Wm, device=device, dtype=xyz_lr.dtype)
+			def _valid_mask(gm: torch.Tensor) -> torch.Tensor:
+				return (gm.squeeze(0).squeeze(0) > 0.0).to(dtype=xyz_lr.dtype).unsqueeze(1)
 
-				mask_prev = _valid_mask(data.grid_sample_fullres(prev_full).valid)
-				mask_center = _valid_mask(data.grid_sample_fullres(xyz_lr).valid)
-				mask_next = _valid_mask(data.grid_sample_fullres(next_full).valid)
-			else:
-				mask_prev = torch.ones(D, 1, Hm, Wm, device=device, dtype=xyz_lr.dtype)
-				mask_center = torch.ones(D, 1, Hm, Wm, device=device, dtype=xyz_lr.dtype)
-				mask_next = torch.ones(D, 1, Hm, Wm, device=device, dtype=xyz_lr.dtype)
+			mask_prev = _valid_mask(data.grid_sample_fullres(prev_full).grad_mag)
+			mask_center = _valid_mask(data.grid_sample_fullres(xyz_lr).grad_mag)
+			mask_next = _valid_mask(data.grid_sample_fullres(next_full).grad_mag)
 
 			# Apply uv validity (also zeros boundary edges: d=0 prev, d=D-1 next)
 			mask_prev = mask_prev * prev_uv_ok.unsqueeze(1)
@@ -502,21 +495,9 @@ class Model3D(nn.Module):
 		bias_hr = F.interpolate(bias_lr, size=(He, We), mode="bilinear", align_corners=True)
 		target_mod = (bias_hr + amp_hr * (target_plain - 0.5)).clamp(0.0, 1.0)
 
-		# Masking via valid channel
-		if data.valid is not None:
-			mask_hr_s = data.grid_sample_fullres(xyz_hr).valid
-			if mask_hr_s is not None:
-				mask_hr = (mask_hr_s.squeeze(0).squeeze(0) > 0.5).to(dtype=torch.float32).unsqueeze(1)
-			else:
-				mask_hr = torch.ones(D, 1, He, We, device=xyz_lr.device, dtype=torch.float32)
-			mask_lr_s = data.grid_sample_fullres(xyz_lr).valid
-			if mask_lr_s is not None:
-				mask_lr = (mask_lr_s.squeeze(0).squeeze(0) > 0.5).to(dtype=torch.float32).unsqueeze(1)
-			else:
-				mask_lr = torch.ones(D, 1, Hm, Wm, device=xyz_lr.device, dtype=torch.float32)
-		else:
-			mask_hr = torch.ones(D, 1, He, We, device=xyz_lr.device, dtype=torch.float32)
-			mask_lr = torch.ones(D, 1, Hm, Wm, device=xyz_lr.device, dtype=torch.float32)
+		# Masking via grad_mag > 0
+		mask_hr = (data.grid_sample_fullres(xyz_hr).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
+		mask_lr = (data.grid_sample_fullres(xyz_lr).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
 
 		return FitResult3D(
 			xyz_lr=xyz_lr,
