@@ -1,5 +1,5 @@
 {
-    "volume_auth_json": "example_creds.json",
+    "volume_auth_json": "tifxyz_dataset/example_creds.json",
 
     "patch_size": [512, 512, 512],
     "bg_distance": 8,
@@ -7,8 +7,6 @@
     "bg_dilate_distance": 192,
     "normal_sample_step": 1.0,
     
-    "wrap_mode": "multi_wrap",
-
     "patch_cache_filename": "/home/sean/Documents/data/ink_030226/.tifxyz_patch_cache.json",
     "patch_cache_force_recompute": true,
 

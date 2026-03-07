@@ -11,7 +11,6 @@ from tqdm.auto import tqdm
 
 import vesuvius.tifxyz as tifxyz
 from .common import (
-    _empty_patch_generation_stats,
     load_volume_auth,
     open_zarr,
 )
@@ -207,7 +206,16 @@ def find_patches(
     patch_cache_filename,
 ):
     patches = []
-    patch_generation_stats = _empty_patch_generation_stats()
+    patch_generation_stats = {
+        "segments_considered": 0,
+        "segments_tried": 0,
+        "segments_missing_ink": 0,
+        "segments_without_positive_points": 0,
+        "candidate_bboxes": 0,
+        "rejected_positive_fraction": 0,
+        "rejected_span": 0,
+        "kept_patches": 0,
+    }
 
     datasets = config["datasets"]
     for dataset_idx, dataset in enumerate(datasets):
@@ -215,7 +223,7 @@ def find_patches(
         volume_scale = dataset["volume_scale"]
 
         volume_auth_json = dataset.get("volume_auth_json", config.get("volume_auth_json"))
-        user, password = load_volume_auth(volume_auth_json, config=config)
+        user, password = load_volume_auth(volume_auth_json)
         volume = open_zarr(
             volume_path,
             volume_scale,

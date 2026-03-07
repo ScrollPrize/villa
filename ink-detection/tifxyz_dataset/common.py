@@ -1,6 +1,5 @@
 import aiohttp
 import json
-import os
 
 import fsspec
 import numpy as np
@@ -9,26 +8,11 @@ from numba import njit
 from vesuvius.neural_tracing.datasets.common import normalize_zscore
 
 
-def _resolve_auth_json_path(auth_json_path, config):
+def load_volume_auth(auth_json_path):
     if auth_json_path is None:
-        return None
-
-    auth_json_path = os.path.expanduser(str(auth_json_path))
-    if os.path.isabs(auth_json_path):
-        return auth_json_path
-
-    config_dir = None if config is None else config.get("_config_dir")
-    if config_dir:
-        return os.path.join(str(config_dir), auth_json_path)
-    return os.path.abspath(auth_json_path)
-
-
-def load_volume_auth(auth_json_path, config=None):
-    resolved_path = _resolve_auth_json_path(auth_json_path, config)
-    if resolved_path is None:
         return None, None
 
-    with open(resolved_path, "r", encoding="utf-8") as f:
+    with open(str(auth_json_path), "r", encoding="utf-8") as f:
         auth = json.load(f)
     return str(auth["username"]), str(auth["password"])
 
@@ -50,20 +34,6 @@ def open_zarr(path, resolution, user, password):
         return zarr.open(store, path=str(resolution), mode="r")
     return zarr.open(path, path=str(resolution), mode="r")
 
-
-def _empty_patch_generation_stats():
-    return {
-        "segments_considered": 0,
-        "segments_tried": 0,
-        "segments_missing_ink": 0,
-        "segments_without_positive_points": 0,
-        "candidate_bboxes": 0,
-        "rejected_positive_fraction": 0,
-        "rejected_span": 0,
-        "kept_patches": 0,
-    }
-
-
 def _normalize_patch_size_zyx(patch_size):
     patch_size_zyx = np.asarray(patch_size, dtype=np.int32).reshape(-1)
     if patch_size_zyx.size == 1:
@@ -73,37 +43,6 @@ def _normalize_patch_size_zyx(patch_size):
             f"patch_size must be a positive int or [z, y, x], got {patch_size!r}"
         )
     return patch_size_zyx
-
-def _points_within_minmax(points_zyx, min_corner, max_corner):
-    points = np.asarray(points_zyx, dtype=np.float32)
-    min_corner = np.asarray(min_corner, dtype=np.float32).reshape(3)
-    max_corner = np.asarray(max_corner, dtype=np.float32).reshape(3)
-    return (
-        (points[:, 0] >= min_corner[0]) & (points[:, 0] < max_corner[0]) &
-        (points[:, 1] >= min_corner[1]) & (points[:, 1] < max_corner[1]) &
-        (points[:, 2] >= min_corner[2]) & (points[:, 2] < max_corner[2])
-    )
-
-
-def _points_to_voxels(points_local, crop_size):
-    crop_size_arr = np.asarray(crop_size, dtype=np.int64).reshape(3)
-    vox = np.zeros(tuple(int(v) for v in crop_size_arr.tolist()), dtype=np.float32)
-    points = np.asarray(points_local, dtype=np.float32)
-    finite = np.isfinite(points).all(axis=1)
-    coords = np.rint(points[finite]).astype(np.int64, copy=False)
-
-    in_bounds = (
-        (coords[:, 0] >= 0) & (coords[:, 0] < crop_size_arr[0]) &
-        (coords[:, 1] >= 0) & (coords[:, 1] < crop_size_arr[1]) &
-        (coords[:, 2] >= 0) & (coords[:, 2] < crop_size_arr[2])
-    )
-
-    if bool(np.any(in_bounds)):
-        coords = coords[in_bounds]
-        vox[coords[:, 0], coords[:, 1], coords[:, 2]] = 1.0
-
-    return vox
-
 
 def _get_labels_and_mask(dataset, segment):
     import cv2
@@ -150,36 +89,6 @@ def _get_labels_and_mask(dataset, segment):
     out = (ink_mask, np.asarray(supervision_mask & ~ink_mask, dtype=bool))
     dataset._segment_labels_and_mask_cache[segment_uuid] = out
     return out
-
-
-def _get_segment_positive_points_zyx(dataset, segment):
-    segment_uuid = str(segment.uuid)
-    cached = dataset._segment_positive_points_cache.get(segment_uuid)
-    if cached is not None:
-        return cached
-
-    grid = dataset._get_segment_stored_grid(segment)
-    ink_mask, _ = _get_labels_and_mask(dataset, segment)
-    row_idx, col_idx = np.where(grid["valid"] & ink_mask)
-
-    out = np.stack(
-        [
-            grid["z"][row_idx, col_idx],
-            grid["y"][row_idx, col_idx],
-            grid["x"][row_idx, col_idx],
-        ],
-        axis=-1,
-    ).astype(np.float32, copy=False)
-
-    dataset._segment_positive_points_cache[segment_uuid] = out
-    
-    return out
-
-
-def _normalize_distance_pair(value, name):
-    if np.isscalar(value):
-        return float(value), float(value)
-    return float(value[0]), float(value[1])
 
 def _sample_patch_supervision_grid(dataset, segment, min_corner, max_corner, extra_bbox_pad=0.0):
     from vesuvius.tifxyz import interpolate_at_points
@@ -314,85 +223,73 @@ def _sample_patch_supervision_grid(dataset, segment, min_corner, max_corner, ext
     }
 
 
-def _voxelize_points_from_sampled_grid(
+def _project_points_along_normals(
+    dataset,
+    points_world,
+    normals_zyx,
+    min_corner,
+    crop_size,
+    label_distance,
+    require_points=False,
+):
+    crop_size_tuple = tuple(int(v) for v in crop_size)
+    pos_distance = float(label_distance[0])
+    neg_distance = float(label_distance[1])
+    points_world = np.asarray(points_world, dtype=np.float32)
+    normals_zyx = np.asarray(normals_zyx, dtype=np.float32)
+
+    if require_points:
+        assert points_world.shape[0] > 0, "points_world must contain at least one point"
+
+    return _build_normal_offset_mask_from_labeled_points(
+        points_world,
+        normals_zyx,
+        min_corner=min_corner,
+        crop_size=crop_size_tuple,
+        label_distance=(pos_distance, neg_distance),
+        sample_step=float(dataset.normal_sample_step),
+        trilinear_threshold=float(dataset.normal_trilinear_threshold),
+    )
+
+
+def _project_label_from_sampled_grid(
     dataset,
     sampled_grid,
     min_corner,
     max_corner,
     crop_size,
-    class_value=None,
-    project_along_normals=False,
-    label_distance=None,
+    class_value,
+    label_distance,
     require_points=False,
 ):
-    from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
+    pos_distance = float(label_distance[0])
+    neg_distance = float(label_distance[1])
+    point_mask = (
+        sampled_grid["valid_interp"]
+        & sampled_grid["normals_valid"]
+        & (sampled_grid["class_codes"] == int(class_value))
+    )
+    points_world = sampled_grid["world_grid"][point_mask].astype(np.float32, copy=False)
+    normals_zyx = sampled_grid["normals_zyx"][point_mask].astype(np.float32, copy=False)
 
-    crop_size_tuple = tuple(int(v) for v in crop_size)
+    expand = max(pos_distance, neg_distance) + 1.0
+    expanded_min = np.asarray(min_corner, dtype=np.float32) - expand
+    expanded_max = np.asarray(max_corner, dtype=np.float32) + expand
+    in_expanded = (
+        (points_world[:, 0] >= expanded_min[0]) & (points_world[:, 0] < expanded_max[0]) &
+        (points_world[:, 1] >= expanded_min[1]) & (points_world[:, 1] < expanded_max[1]) &
+        (points_world[:, 2] >= expanded_min[2]) & (points_world[:, 2] < expanded_max[2])
+    )
 
-    if project_along_normals:
-        assert label_distance is not None, "label_distance is required for projected voxelization"
-        pos_distance, neg_distance = _normalize_distance_pair(
-            label_distance,
-            name="label_distance",
-        )
-
-        if class_value is None:
-            point_mask = sampled_grid["in_patch"] & sampled_grid["normals_valid"]
-            points_world = sampled_grid["world_grid"][point_mask].astype(np.float32, copy=False)
-            normals_zyx = sampled_grid["normals_zyx"][point_mask].astype(np.float32, copy=False)
-        else:
-            point_mask = (
-                sampled_grid["valid_interp"]
-                & sampled_grid["normals_valid"]
-                & (sampled_grid["class_codes"] == int(class_value))
-            )
-            points_world = sampled_grid["world_grid"][point_mask].astype(np.float32, copy=False)
-            normals_zyx = sampled_grid["normals_zyx"][point_mask].astype(np.float32, copy=False)
-            expand = max(pos_distance, neg_distance) + 1.0
-            expanded_min = np.asarray(min_corner, dtype=np.float32) - expand
-            expanded_max = np.asarray(max_corner, dtype=np.float32) + expand
-            in_expanded = _points_within_minmax(points_world, expanded_min, expanded_max)
-            points_world = points_world[in_expanded]
-            normals_zyx = normals_zyx[in_expanded]
-
-        if require_points:
-            assert points_world.shape[0] > 0, "sampled_grid must contain projected points"
-
-        return _build_normal_offset_mask_from_labeled_points(
-            points_world,
-            normals_zyx,
-            min_corner=min_corner,
-            crop_size=crop_size_tuple,
-            label_distance=(pos_distance, neg_distance),
-            sample_step=float(dataset.normal_sample_step),
-            trilinear_threshold=float(dataset.normal_trilinear_threshold),
-        )
-
-    if class_value is None:
-        point_mask = sampled_grid["in_patch"]
-        if require_points:
-            assert sampled_grid["local_grid"].size > 0 and bool(np.any(point_mask)), (
-                "sampled_grid must contain in-patch surface points"
-            )
-        return voxelize_surface_grid_masked(
-            sampled_grid["local_grid"],
-            crop_size_tuple,
-            point_mask,
-        ).astype(np.float32, copy=False)
-
-    point_mask = sampled_grid["in_patch"] & (sampled_grid["class_codes"] == int(class_value))
-    if require_points:
-        assert bool(np.any(point_mask)), "sampled_grid must contain labeled points inside the patch"
-    return _points_to_voxels(sampled_grid["local_grid"][point_mask], crop_size_tuple)
-
-
-def _build_surface_label_volume(positive_label_vox, background_label_vox, crop_size):
-    crop_size_tuple = tuple(int(v) for v in crop_size)
-    out = np.full(crop_size_tuple, 2.0, dtype=np.float32)
-    out[background_label_vox > 0.0] = 0.0
-    out[positive_label_vox > 0.0] = 1.0
-    return out
-
+    return _project_points_along_normals(
+        dataset,
+        points_world[in_expanded],
+        normals_zyx[in_expanded],
+        min_corner=min_corner,
+        crop_size=crop_size,
+        label_distance=(pos_distance, neg_distance),
+        require_points=require_points,
+    )
 
 @njit(cache=True)
 def _splat_points_trilinear_numba(points, size_z, size_y, size_x):
@@ -437,7 +334,7 @@ def _splat_points_trilinear_numba(points, size_z, size_y, size_x):
     return vox
 
 
-def _points_to_voxels_trilinear(points_local, crop_size, threshold=1e-4):
+def _points_to_voxels(points_local, crop_size, threshold=1e-4):
     crop_size_arr = np.asarray(crop_size, dtype=np.int64).reshape(3)
     crop_size_tuple = tuple(int(v) for v in crop_size_arr.tolist())
     points = np.asarray(points_local, dtype=np.float32)
@@ -537,13 +434,8 @@ def _build_normal_offset_mask_from_labeled_points(
         f"normals_zyx must match points_world_zyx shape {points.shape!r}, got {normals.shape!r}"
     )
 
-    if np.isscalar(label_distance):
-        pos_distance = float(label_distance)
-        neg_distance = float(label_distance)
-    else:
-        distance_arr = np.asarray(label_distance, dtype=np.float32).reshape(-1)
-        pos_distance = float(distance_arr[0])
-        neg_distance = float(distance_arr[1])
+    pos_distance = float(label_distance[0])
+    neg_distance = float(label_distance[1])
     pos_distance = max(0.0, pos_distance)
     neg_distance = max(0.0, neg_distance)
 
@@ -561,7 +453,7 @@ def _build_normal_offset_mask_from_labeled_points(
     offsets = np.linspace(-neg_distance, pos_distance, num=n_samples, dtype=np.float32)
     sampled = points[:, None, :] + offsets[None, :, None] * normals[:, None, :]
     local_points = sampled.reshape(-1, 3) - min_corner
-    return _points_to_voxels_trilinear(
+    return _points_to_voxels(
         local_points,
         crop_size_tuple,
         threshold=trilinear_threshold,

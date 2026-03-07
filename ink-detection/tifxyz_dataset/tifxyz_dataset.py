@@ -1,20 +1,19 @@
 import os
 import numpy as np
-import warnings
 import torch
 
 from torch.utils.data import Dataset
 
 from .common import (
-    _build_surface_label_volume,
-    _normalize_distance_pair,
     _normalize_patch_size_zyx,
+    _points_to_voxels,
+    _project_label_from_sampled_grid,
     _read_volume_crop_from_patch_dict,
     _sample_patch_supervision_grid,
-    _voxelize_points_from_sampled_grid,
 )
 from .patch_finding import _PATCH_CACHE_DEFAULT_FILENAME, find_patches
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
+from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
 
 class TifxyzInkDataset(Dataset):
     def __init__(
@@ -26,16 +25,18 @@ class TifxyzInkDataset(Dataset):
         self.apply_augmentation = apply_augmentation
         self.apply_perturbation = bool(apply_perturbation)
         self.patch_size = config["patch_size"]                                          # 3d vol crop / model input patch size
-        self.bg_distance = config["bg_distance"]                                        # accepts scalar or [positive, negative]
-        self.label_distance = config["label_distance"]                                  # accepts scalar or [positive, negative]
-        self.bg_distance_pos, self.bg_distance_neg = _normalize_distance_pair(
-            self.bg_distance,
-            name="bg_distance",
-        )
-        self.label_distance_pos, self.label_distance_neg = _normalize_distance_pair(
-            self.label_distance,
-            name="label_distance",
-        )
+        bg_distance = config["bg_distance"]                                             # accepts scalar or [positive, negative]
+        if np.isscalar(bg_distance):
+            self.bg_distance = (float(bg_distance), float(bg_distance))
+        else:
+            self.bg_distance = (float(bg_distance[0]), float(bg_distance[1]))
+        label_distance = config["label_distance"]                                       # accepts scalar or [positive, negative]
+        if np.isscalar(label_distance):
+            self.label_distance = (float(label_distance), float(label_distance))
+        else:
+            self.label_distance = (float(label_distance[0]), float(label_distance[1]))
+        self.bg_distance_pos, self.bg_distance_neg = self.bg_distance
+        self.label_distance_pos, self.label_distance_neg = self.label_distance
         self.bg_distance_max = max(self.bg_distance_pos, self.bg_distance_neg)
         self.label_distance_max = max(self.label_distance_pos, self.label_distance_neg)
         self.normal_sample_step = float(config.get("normal_sample_step", 0.5))
@@ -44,12 +45,6 @@ class TifxyzInkDataset(Dataset):
         if self.surface_bbox_pad < 0.0:
             self.surface_bbox_pad = 0.0
         self.surface_interp_method = str(config.get("surface_interp_method", "catmull_rom")).strip().lower()
-        self.wrap_mode = str(config.get("wrap_mode", "single_wrap")).strip().lower()
-        if self.wrap_mode not in {"single_wrap", "multi_wrap"}:
-            warnings.warn(
-                f"Unknown wrap_mode={self.wrap_mode!r}; falling back to 'single_wrap'."
-            )
-            self.wrap_mode = "single_wrap"
         self.patch_size_zyx = _normalize_patch_size_zyx(self.patch_size)        
         self.overlap_fraction = float(config.get("overlap_fraction", 0.25))             # amount of overlap (stride) in train/val patches, as a percentage of the patch size
         self.min_positive_fraction = float(config.get("min_positive_fraction", 0.01))   # minimum amount of labeled voxels in a candidate bbox to be added to our patches list, as a percentage of the total voxels
@@ -67,10 +62,6 @@ class TifxyzInkDataset(Dataset):
         self._segment_grid_cache = {}
         self._segment_labels_and_mask_cache = {}
         self._segment_normal_cache = {}
-        self._segment_world_bounds_cache = {}
-        self._segment_positive_points_cache = {}
-        self._multi_wrap_segments_by_dataset_idx = {}
-        self._multi_wrap_candidate_segments_cache = {}
 
         if apply_augmentation:                                                          # we'll use the vesuvius augmentation pipeline , see vesuvius/src/vesuvius/models/augmentation/pipelines/training_transforms.py
             self.augmentations = create_training_transforms(                            # for current defaults 
@@ -90,21 +81,6 @@ class TifxyzInkDataset(Dataset):
             patch_cache_force_recompute=self.patch_cache_force_recompute,               # see vesuvius/src/vesuvius/neural_tracing/inference/generate_segment_cover_bboxes.py  
             patch_cache_filename=self.patch_cache_filename,                             # for info on the bbox generation
         )
-        for patch in self.patches:
-            segment_uuid = str(patch.get("segment_uuid", ""))
-            dataset_idx = int(patch.get("dataset_idx", -1))
-            segment = patch.get("segment")
-            if segment is not None:
-                dataset_segments = self._multi_wrap_segments_by_dataset_idx.setdefault(
-                    dataset_idx,
-                    {},
-                )
-                dataset_segments.setdefault(segment_uuid, segment)
-
-        self._multi_wrap_segments_by_dataset_idx = {
-            int(dataset_idx): tuple(segment_map.values())
-            for dataset_idx, segment_map in self._multi_wrap_segments_by_dataset_idx.items()
-        }
 
 
 
@@ -184,95 +160,6 @@ class TifxyzInkDataset(Dataset):
         self._segment_grid_cache[segment_uuid] = cached
         return cached
 
-    @staticmethod
-    def _segment_bounds_intersect_crop(segment_bounds, min_corner, max_corner):
-        if segment_bounds is None:
-            return False
-
-        min_corner = np.asarray(min_corner, dtype=np.float32).reshape(3)
-        max_corner = np.asarray(max_corner, dtype=np.float32).reshape(3)
-        z_min, z_max, y_min, y_max, x_min, x_max = [float(v) for v in segment_bounds]
-        return not (
-            (z_max < float(min_corner[0])) or (z_min >= float(max_corner[0])) or
-            (y_max < float(min_corner[1])) or (y_min >= float(max_corner[1])) or
-            (x_max < float(min_corner[2])) or (x_min >= float(max_corner[2]))
-        )
-
-    def _get_segment_world_bounds(self, segment):
-        segment_uuid = str(segment.uuid)
-        if segment_uuid in self._segment_world_bounds_cache:
-            return self._segment_world_bounds_cache[segment_uuid]
-
-        grid = self._get_segment_stored_grid(segment)
-        valid = np.asarray(grid["valid"], dtype=bool)
-        if not bool(np.any(valid)):
-            self._segment_world_bounds_cache[segment_uuid] = None
-            return None
-
-        z_vals = np.asarray(grid["z"], dtype=np.float32)[valid]
-        y_vals = np.asarray(grid["y"], dtype=np.float32)[valid]
-        x_vals = np.asarray(grid["x"], dtype=np.float32)[valid]
-        bounds = (
-            float(np.min(z_vals)),
-            float(np.max(z_vals)),
-            float(np.min(y_vals)),
-            float(np.max(y_vals)),
-            float(np.min(x_vals)),
-            float(np.max(x_vals)),
-        )
-        self._segment_world_bounds_cache[segment_uuid] = bounds
-        return bounds
-
-    @staticmethod
-    def _merge_projected_loss_mask(combined_mask, segment_mask):
-        segment_bg = np.asarray(segment_mask == 0.0, dtype=bool)
-        segment_pos = np.asarray(segment_mask == 1.0, dtype=bool)
-        combined_mask[segment_bg & (combined_mask != 1.0)] = 0.0
-        combined_mask[segment_pos] = 1.0
-
-    @staticmethod
-    def _suppress_projected_mask_overlap_with_foreign_labels(
-        projected_mask,
-        foreign_labeled_surface_mask,
-        own_labeled_surface_mask=None,
-    ):
-        foreign_mask = np.asarray(foreign_labeled_surface_mask > 0.0, dtype=bool)
-        if own_labeled_surface_mask is not None:
-            own_mask = np.asarray(own_labeled_surface_mask > 0.0, dtype=bool)
-            foreign_mask &= ~own_mask
-        if bool(np.any(foreign_mask)):
-            projected_mask[foreign_mask] = 2.0
-
-    def _get_multi_wrap_candidate_segments(self, idx, patch, min_corner, max_corner):
-        cached = self._multi_wrap_candidate_segments_cache.get(int(idx))
-        if cached is not None:
-            return cached
-
-        if self.wrap_mode != "multi_wrap":
-            out = tuple()
-            self._multi_wrap_candidate_segments_cache[int(idx)] = out
-            return out
-
-        dataset_idx = int(patch.get("dataset_idx", -1))
-        patch_segment_uuid = str(patch.get("segment_uuid", ""))
-        patch_segment = patch.get("segment")
-        if patch_segment and not patch_segment_uuid:
-            patch_segment_uuid = str(patch_segment.uuid)
-
-        candidate_segments = []
-        for segment in self._multi_wrap_segments_by_dataset_idx.get(dataset_idx, ()):
-            segment_uuid = str(segment.uuid)
-            if segment_uuid == patch_segment_uuid:
-                continue
-            segment_bounds = self._get_segment_world_bounds(segment)
-            if not self._segment_bounds_intersect_crop(segment_bounds, min_corner, max_corner):
-                continue
-            candidate_segments.append(segment)
-
-        out = tuple(candidate_segments)
-        self._multi_wrap_candidate_segments_cache[int(idx)] = out
-        return out
-
     def __getitem__(self, idx):
         patch = self.patches[idx]
 
@@ -299,202 +186,58 @@ class TifxyzInkDataset(Dataset):
             extra_bbox_pad=max(float(self.bg_distance_max), float(self.label_distance_max)) + 1.0,
         )
 
-        positive_label_vox = _voxelize_points_from_sampled_grid(
-            self,
-            sampled_grid,
-            min_corner=min_corner,
-            max_corner=max_corner,
-            crop_size=crop_size,
-            class_value=1,
-            require_points=True,
+        positive_point_mask = sampled_grid["in_patch"] & (sampled_grid["class_codes"] == 1)
+        assert bool(np.any(positive_point_mask)), (
+            "sampled_grid must contain labeled points inside the patch"
         )
-        background_label_vox = _voxelize_points_from_sampled_grid(
-            self,
-            sampled_grid,
-            min_corner=min_corner,
-            max_corner=max_corner,
-            crop_size=crop_size,
-            class_value=0,
+        positive_label_vox = _points_to_voxels(
+            sampled_grid["local_grid"][positive_point_mask],
+            crop_size,
         )
-        surface_vox = _voxelize_points_from_sampled_grid(
-            self,
-            sampled_grid,
-            min_corner=min_corner,
-            max_corner=max_corner,
-            crop_size=crop_size,
-            require_points=True,
+
+        background_point_mask = sampled_grid["in_patch"] & (sampled_grid["class_codes"] == 0)
+        background_label_vox = _points_to_voxels(
+            sampled_grid["local_grid"][background_point_mask],
+            crop_size,
         )
+
+        surface_point_mask = sampled_grid["in_patch"]
+        assert sampled_grid["local_grid"].size > 0 and bool(np.any(surface_point_mask)), (
+            "sampled_grid must contain in-patch surface points"
+        )
+        surface_vox = voxelize_surface_grid_masked(
+            sampled_grid["local_grid"],
+            crop_size,
+            surface_point_mask,
+        ).astype(np.float32, copy=False)
+
         projected_loss_mask = np.full(crop_size, 2.0, dtype=np.float32)
-        background_projection_vox = _voxelize_points_from_sampled_grid(
+        background_projection_vox = _project_label_from_sampled_grid(
             self,
             sampled_grid,
             min_corner=min_corner,
             max_corner=max_corner,
             crop_size=crop_size,
             class_value=0,
-            project_along_normals=True,
-            label_distance=(self.bg_distance_pos, self.bg_distance_neg),
+            label_distance=self.bg_distance,
         )
         projected_loss_mask[background_projection_vox > 0.0] = 0.0
-        label_projection_vox = _voxelize_points_from_sampled_grid(
+        label_projection_vox = _project_label_from_sampled_grid(
             self,
             sampled_grid,
             min_corner=min_corner,
             max_corner=max_corner,
             crop_size=crop_size,
             class_value=1,
-            project_along_normals=True,
-            label_distance=(self.label_distance_pos, self.label_distance_neg),
+            label_distance=self.label_distance,
             require_points=True,
         )
         assert bool(np.any(label_projection_vox > 0.0)), "label projection must produce non-empty supervision"
         projected_loss_mask[label_projection_vox > 0.0] = 1.0
-        
-        if self.wrap_mode == "multi_wrap":
-            extra_bbox_pad = max(float(self.bg_distance_max), float(self.label_distance_max)) + 1.0
-            labeled_surface_vox_union = np.asarray(
-                (positive_label_vox > 0.0) | (background_label_vox > 0.0),
-                dtype=bool,
-            )
-            other_segments = self._get_multi_wrap_candidate_segments(
-                idx=idx,
-                patch=patch,
-                min_corner=min_corner,
-                max_corner=max_corner,
-            )
-            for other_segment in other_segments:
-                other_sampled_grid = _sample_patch_supervision_grid(
-                    self,
-                    other_segment,
-                    min_corner=min_corner,
-                    max_corner=max_corner,
-                    extra_bbox_pad=extra_bbox_pad,
-                )
-                if other_sampled_grid["local_grid"].size == 0 or not bool(np.any(other_sampled_grid["in_patch"])):
-                    continue
 
-                other_surface_vox = _voxelize_points_from_sampled_grid(
-                    self,
-                    other_sampled_grid,
-                    min_corner=min_corner,
-                    max_corner=max_corner,
-                    crop_size=crop_size,
-                )
-                if bool(np.any(other_surface_vox > 0.0)):
-                    surface_vox = np.maximum(surface_vox, other_surface_vox)
-
-                has_labels_in_crop = bool(
-                    np.any(other_sampled_grid["in_patch"] & (other_sampled_grid["class_codes"] == 1))
-                )
-                if has_labels_in_crop:
-                    other_positive_label_vox = _voxelize_points_from_sampled_grid(
-                        self,
-                        other_sampled_grid,
-                        min_corner=min_corner,
-                        max_corner=max_corner,
-                        crop_size=crop_size,
-                        class_value=1,
-                        require_points=True,
-                    )
-
-                    other_background_label_vox = _voxelize_points_from_sampled_grid(
-                        self,
-                        other_sampled_grid,
-                        min_corner=min_corner,
-                        max_corner=max_corner,
-                        crop_size=crop_size,
-                        class_value=0,
-                    )
-                    other_labeled_surface_vox = np.asarray(
-                        (other_positive_label_vox > 0.0) | (other_background_label_vox > 0.0),
-                        dtype=bool,
-                    )
-                    self._suppress_projected_mask_overlap_with_foreign_labels(
-                        projected_loss_mask,
-                        other_labeled_surface_vox,
-                        own_labeled_surface_mask=labeled_surface_vox_union,
-                    )
-
-                    if bool(np.any(other_background_label_vox > 0.0)):
-                        background_label_vox = np.maximum(
-                            background_label_vox,
-                            other_background_label_vox,
-                        )
-
-                    other_projected_loss_mask = np.full(crop_size, 2.0, dtype=np.float32)
-                    other_background_projection_vox = _voxelize_points_from_sampled_grid(
-                        self,
-                        other_sampled_grid,
-                        min_corner=min_corner,
-                        max_corner=max_corner,
-                        crop_size=crop_size,
-                        class_value=0,
-                        project_along_normals=True,
-                        label_distance=(self.bg_distance_pos, self.bg_distance_neg),
-                    )
-                    other_projected_loss_mask[other_background_projection_vox > 0.0] = 0.0
-                    other_label_projection_vox = _voxelize_points_from_sampled_grid(
-                        self,
-                        other_sampled_grid,
-                        min_corner=min_corner,
-                        max_corner=max_corner,
-                        crop_size=crop_size,
-                        class_value=1,
-                        project_along_normals=True,
-                        label_distance=(self.label_distance_pos, self.label_distance_neg),
-                        require_points=True,
-                    )
-                    assert bool(np.any(other_label_projection_vox > 0.0)), (
-                        "label projection must produce non-empty supervision"
-                    )
-                    other_projected_loss_mask[other_label_projection_vox > 0.0] = 1.0
-                    self._suppress_projected_mask_overlap_with_foreign_labels(
-                        other_projected_loss_mask,
-                        labeled_surface_vox_union,
-                        own_labeled_surface_mask=other_labeled_surface_vox,
-                    )
-                    self._merge_projected_loss_mask(
-                        projected_loss_mask,
-                        other_projected_loss_mask,
-                    )
-                    if bool(np.any(other_positive_label_vox > 0.0)):
-                        positive_label_vox = np.maximum(
-                            positive_label_vox,
-                            other_positive_label_vox,
-                        )
-                    labeled_surface_vox_union |= other_labeled_surface_vox
-                else:
-                    if bool(np.any(other_surface_vox > 0.0)):
-                        background_label_vox = np.maximum(
-                            background_label_vox,
-                            other_surface_vox,
-                        )
-
-                    other_bg_projection_vox = _voxelize_points_from_sampled_grid(
-                        self,
-                        other_sampled_grid,
-                        min_corner=min_corner,
-                        max_corner=max_corner,
-                        crop_size=crop_size,
-                        project_along_normals=True,
-                        label_distance=(self.bg_distance_pos, self.bg_distance_neg),
-                    )
-                    if not bool(np.any(other_bg_projection_vox > 0.0)):
-                        other_bg_projection_vox = _voxelize_points_from_sampled_grid(
-                            self,
-                            other_sampled_grid,
-                            min_corner=min_corner,
-                            max_corner=max_corner,
-                            crop_size=crop_size,
-                        )
-                    bg_mask = np.asarray(other_bg_projection_vox > 0.0, dtype=bool)
-                    projected_loss_mask[bg_mask & (projected_loss_mask != 1.0)] = 0.0
-
-        labeled_vox_at_surface = _build_surface_label_volume(
-            positive_label_vox=positive_label_vox,
-            background_label_vox=background_label_vox,
-            crop_size=crop_size,
-        )
+        labeled_vox_at_surface = np.full(crop_size, 2.0, dtype=np.float32)
+        labeled_vox_at_surface[background_label_vox > 0.0] = 0.0
+        labeled_vox_at_surface[positive_label_vox > 0.0] = 1.0
 
         if self.augmentations is not None:
             (
@@ -546,7 +289,6 @@ if __name__ == "__main__":
     config_path = os.path.join(os.path.dirname(__file__), "example_config.json")
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
-    config["_config_dir"] = os.path.dirname(config_path)
 
     ds = TifxyzInkDataset(
         config,

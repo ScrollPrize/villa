@@ -30,7 +30,6 @@ class TifxyzInkTrainer():
         
         with open(config_path, 'r') as f:
             config = json.load(f)
-        config["_config_dir"] = os.path.dirname(config_path)
 
         dynamo_plugin = TorchDynamoPlugin(
             backend   = "inductor",
