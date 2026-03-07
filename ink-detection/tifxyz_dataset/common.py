@@ -314,140 +314,76 @@ def _sample_patch_supervision_grid(dataset, segment, min_corner, max_corner, ext
     }
 
 
-def _voxelize_surface_from_sampled_grid(dataset, segment, min_corner, max_corner, crop_size, sampled_grid=None):
-    from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
-
-    crop_size_tuple = tuple(int(v) for v in crop_size)
-    sampled = sampled_grid
-    if sampled is None:
-        sampled = _sample_patch_supervision_grid(
-            dataset,
-            segment,
-            min_corner=min_corner,
-            max_corner=max_corner,
-            extra_bbox_pad=0.0,
-        )
-    local_grid = sampled["local_grid"]
-    in_patch = sampled["in_patch"]
-    assert local_grid.size > 0 and bool(np.any(in_patch)), (
-        "sampled_grid must contain in-patch surface points"
-    )
-    return voxelize_surface_grid_masked(local_grid, crop_size_tuple, in_patch).astype(
-        np.float32,
-        copy=False,
-    )
-
-
-def _voxelize_positive_labels_from_sampled_grid(dataset, segment, min_corner, max_corner, crop_size, sampled_grid=None):
-    crop_size_tuple = tuple(int(v) for v in crop_size)
-    sampled = sampled_grid
-    if sampled is None:
-        sampled = _sample_patch_supervision_grid(
-            dataset,
-            segment,
-            min_corner=min_corner,
-            max_corner=max_corner,
-            extra_bbox_pad=0.0,
-        )
-    positive_mask = sampled["in_patch"] & (sampled["class_codes"] == 1)
-    assert bool(np.any(positive_mask)), (
-        "sampled_grid must contain positive labels inside the patch"
-    )
-    return _points_to_voxels(sampled["local_grid"][positive_mask], crop_size_tuple)
-
-
-def _voxelize_background_surface_labels_from_sampled_grid(
-    dataset,
-    segment,
-    min_corner,
-    max_corner,
-    crop_size,
-    sampled_grid=None,
-):
-    crop_size_tuple = tuple(int(v) for v in crop_size)
-    sampled = sampled_grid
-    if sampled is None:
-        sampled = _sample_patch_supervision_grid(
-            dataset,
-            segment,
-            min_corner=min_corner,
-            max_corner=max_corner,
-            extra_bbox_pad=0.0,
-        )
-    background_mask = sampled["in_patch"] & (sampled["class_codes"] == 0)
-
-    return _points_to_voxels(sampled["local_grid"][background_mask], crop_size_tuple)
-
-
-def _voxelize_class_projection_from_sample(
+def _voxelize_points_from_sampled_grid(
     dataset,
     sampled_grid,
     min_corner,
     max_corner,
     crop_size,
-    class_value,
-    label_distance,
+    class_value=None,
+    project_along_normals=False,
+    label_distance=None,
+    require_points=False,
 ):
+    from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
+
     crop_size_tuple = tuple(int(v) for v in crop_size)
-    pos_distance, neg_distance = _normalize_distance_pair(label_distance, name="label_distance")
-    max_distance = max(pos_distance, neg_distance)
-    class_mask = sampled_grid["class_codes"] == int(class_value)
 
-    expanded_mask = sampled_grid["valid_interp"] & class_mask & sampled_grid["normals_valid"]
-
-    points_world = sampled_grid["world_grid"][expanded_mask].astype(np.float32, copy=False)
-    normals_zyx = sampled_grid["normals_zyx"][expanded_mask].astype(np.float32, copy=False)
-    expand = max_distance + 1.0
-    expanded_min = np.asarray(min_corner, dtype=np.float32) - expand
-    expanded_max = np.asarray(max_corner, dtype=np.float32) + expand
-    in_expanded = _points_within_minmax(points_world, expanded_min, expanded_max)
-    
-    return _build_normal_offset_mask_from_labeled_points(
-        points_world[in_expanded],
-        normals_zyx[in_expanded],
-        min_corner=min_corner,
-        crop_size=crop_size_tuple,
-        label_distance=(pos_distance, neg_distance),
-        sample_step=float(dataset.normal_sample_step),
-        trilinear_threshold=float(dataset.normal_trilinear_threshold),
-    )
-
-
-def _build_projected_loss_mask_volume(dataset, segment, min_corner, max_corner, crop_size, sampled_grid=None):
-    crop_size_tuple = tuple(int(v) for v in crop_size)
-    out = np.full(crop_size_tuple, 2.0, dtype=np.float32)
-    sampled = sampled_grid
-    if sampled is None:
-        sampled = _sample_patch_supervision_grid(
-            dataset,
-            segment,
-            min_corner=min_corner,
-            max_corner=max_corner,
-            extra_bbox_pad=max(float(dataset.bg_distance_max), float(dataset.label_distance_max)) + 1.0,
+    if project_along_normals:
+        assert label_distance is not None, "label_distance is required for projected voxelization"
+        pos_distance, neg_distance = _normalize_distance_pair(
+            label_distance,
+            name="label_distance",
         )
-    background_projection_vox = _voxelize_class_projection_from_sample(
-        dataset,
-        sampled,
-        min_corner=min_corner,
-        max_corner=max_corner,
-        crop_size=crop_size_tuple,
-        class_value=0,
-        label_distance=(dataset.bg_distance_pos, dataset.bg_distance_neg),
-    )
-    out[background_projection_vox > 0.0] = 0.0
 
-    label_projection_vox = _voxelize_class_projection_from_sample(
-        dataset,
-        sampled,
-        min_corner=min_corner,
-        max_corner=max_corner,
-        crop_size=crop_size_tuple,
-        class_value=1,
-        label_distance=(dataset.label_distance_pos, dataset.label_distance_neg),
-    )
-    assert bool(np.any(label_projection_vox > 0.0)), "label projection must produce non-empty supervision"
-    out[label_projection_vox > 0.0] = 1.0
-    return out
+        if class_value is None:
+            point_mask = sampled_grid["in_patch"] & sampled_grid["normals_valid"]
+            points_world = sampled_grid["world_grid"][point_mask].astype(np.float32, copy=False)
+            normals_zyx = sampled_grid["normals_zyx"][point_mask].astype(np.float32, copy=False)
+        else:
+            point_mask = (
+                sampled_grid["valid_interp"]
+                & sampled_grid["normals_valid"]
+                & (sampled_grid["class_codes"] == int(class_value))
+            )
+            points_world = sampled_grid["world_grid"][point_mask].astype(np.float32, copy=False)
+            normals_zyx = sampled_grid["normals_zyx"][point_mask].astype(np.float32, copy=False)
+            expand = max(pos_distance, neg_distance) + 1.0
+            expanded_min = np.asarray(min_corner, dtype=np.float32) - expand
+            expanded_max = np.asarray(max_corner, dtype=np.float32) + expand
+            in_expanded = _points_within_minmax(points_world, expanded_min, expanded_max)
+            points_world = points_world[in_expanded]
+            normals_zyx = normals_zyx[in_expanded]
+
+        if require_points:
+            assert points_world.shape[0] > 0, "sampled_grid must contain projected points"
+
+        return _build_normal_offset_mask_from_labeled_points(
+            points_world,
+            normals_zyx,
+            min_corner=min_corner,
+            crop_size=crop_size_tuple,
+            label_distance=(pos_distance, neg_distance),
+            sample_step=float(dataset.normal_sample_step),
+            trilinear_threshold=float(dataset.normal_trilinear_threshold),
+        )
+
+    if class_value is None:
+        point_mask = sampled_grid["in_patch"]
+        if require_points:
+            assert sampled_grid["local_grid"].size > 0 and bool(np.any(point_mask)), (
+                "sampled_grid must contain in-patch surface points"
+            )
+        return voxelize_surface_grid_masked(
+            sampled_grid["local_grid"],
+            crop_size_tuple,
+            point_mask,
+        ).astype(np.float32, copy=False)
+
+    point_mask = sampled_grid["in_patch"] & (sampled_grid["class_codes"] == int(class_value))
+    if require_points:
+        assert bool(np.any(point_mask)), "sampled_grid must contain labeled points inside the patch"
+    return _points_to_voxels(sampled_grid["local_grid"][point_mask], crop_size_tuple)
 
 
 def _build_surface_label_volume(positive_label_vox, background_label_vox, crop_size):

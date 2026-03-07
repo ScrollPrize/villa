@@ -6,16 +6,12 @@ import torch
 from torch.utils.data import Dataset
 
 from .common import (
-    _build_normal_offset_mask_from_labeled_points,
-    _build_projected_loss_mask_volume,
     _build_surface_label_volume,
     _normalize_distance_pair,
     _normalize_patch_size_zyx,
     _read_volume_crop_from_patch_dict,
     _sample_patch_supervision_grid,
-    _voxelize_background_surface_labels_from_sampled_grid,
-    _voxelize_positive_labels_from_sampled_grid,
-    _voxelize_surface_from_sampled_grid,
+    _voxelize_points_from_sampled_grid,
 )
 from .patch_finding import _PATCH_CACHE_DEFAULT_FILENAME, find_patches
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
@@ -277,35 +273,6 @@ class TifxyzInkDataset(Dataset):
         self._multi_wrap_candidate_segments_cache[int(idx)] = out
         return out
 
-    def _voxelize_full_surface_background_projection_from_sampled_grid(
-        self,
-        segment,
-        min_corner,
-        max_corner,
-        crop_size,
-        sampled_grid,
-    ):
-        in_patch_with_normals = sampled_grid["in_patch"] & sampled_grid["normals_valid"]
-        if bool(np.any(in_patch_with_normals)):
-            return _build_normal_offset_mask_from_labeled_points(
-                sampled_grid["world_grid"][in_patch_with_normals],
-                sampled_grid["normals_zyx"][in_patch_with_normals],
-                min_corner=min_corner,
-                crop_size=crop_size,
-                label_distance=(self.bg_distance_pos, self.bg_distance_neg),
-                sample_step=float(self.normal_sample_step),
-                trilinear_threshold=float(self.normal_trilinear_threshold),
-            )
-
-        return _voxelize_surface_from_sampled_grid(
-            self,
-            segment,
-            min_corner=min_corner,
-            max_corner=max_corner,
-            crop_size=crop_size,
-            sampled_grid=sampled_grid,
-        )
-
     def __getitem__(self, idx):
         patch = self.patches[idx]
 
@@ -332,38 +299,56 @@ class TifxyzInkDataset(Dataset):
             extra_bbox_pad=max(float(self.bg_distance_max), float(self.label_distance_max)) + 1.0,
         )
 
-        positive_label_vox = _voxelize_positive_labels_from_sampled_grid(
+        positive_label_vox = _voxelize_points_from_sampled_grid(
             self,
-            segment,
+            sampled_grid,
             min_corner=min_corner,
             max_corner=max_corner,
             crop_size=crop_size,
-            sampled_grid=sampled_grid,
+            class_value=1,
+            require_points=True,
         )
-        background_label_vox = _voxelize_background_surface_labels_from_sampled_grid(
+        background_label_vox = _voxelize_points_from_sampled_grid(
             self,
-            segment,
+            sampled_grid,
             min_corner=min_corner,
             max_corner=max_corner,
             crop_size=crop_size,
-            sampled_grid=sampled_grid,
+            class_value=0,
         )
-        surface_vox = _voxelize_surface_from_sampled_grid(
+        surface_vox = _voxelize_points_from_sampled_grid(
             self,
-            segment,
+            sampled_grid,
             min_corner=min_corner,
             max_corner=max_corner,
             crop_size=crop_size,
-            sampled_grid=sampled_grid,
+            require_points=True,
         )
-        projected_loss_mask = _build_projected_loss_mask_volume(
+        projected_loss_mask = np.full(crop_size, 2.0, dtype=np.float32)
+        background_projection_vox = _voxelize_points_from_sampled_grid(
             self,
-            segment,
+            sampled_grid,
             min_corner=min_corner,
             max_corner=max_corner,
             crop_size=crop_size,
-            sampled_grid=sampled_grid,
+            class_value=0,
+            project_along_normals=True,
+            label_distance=(self.bg_distance_pos, self.bg_distance_neg),
         )
+        projected_loss_mask[background_projection_vox > 0.0] = 0.0
+        label_projection_vox = _voxelize_points_from_sampled_grid(
+            self,
+            sampled_grid,
+            min_corner=min_corner,
+            max_corner=max_corner,
+            crop_size=crop_size,
+            class_value=1,
+            project_along_normals=True,
+            label_distance=(self.label_distance_pos, self.label_distance_neg),
+            require_points=True,
+        )
+        assert bool(np.any(label_projection_vox > 0.0)), "label projection must produce non-empty supervision"
+        projected_loss_mask[label_projection_vox > 0.0] = 1.0
         
         if self.wrap_mode == "multi_wrap":
             extra_bbox_pad = max(float(self.bg_distance_max), float(self.label_distance_max)) + 1.0
@@ -388,13 +373,12 @@ class TifxyzInkDataset(Dataset):
                 if other_sampled_grid["local_grid"].size == 0 or not bool(np.any(other_sampled_grid["in_patch"])):
                     continue
 
-                other_surface_vox = _voxelize_surface_from_sampled_grid(
+                other_surface_vox = _voxelize_points_from_sampled_grid(
                     self,
-                    other_segment,
+                    other_sampled_grid,
                     min_corner=min_corner,
                     max_corner=max_corner,
                     crop_size=crop_size,
-                    sampled_grid=other_sampled_grid,
                 )
                 if bool(np.any(other_surface_vox > 0.0)):
                     surface_vox = np.maximum(surface_vox, other_surface_vox)
@@ -403,22 +387,23 @@ class TifxyzInkDataset(Dataset):
                     np.any(other_sampled_grid["in_patch"] & (other_sampled_grid["class_codes"] == 1))
                 )
                 if has_labels_in_crop:
-                    other_positive_label_vox = _voxelize_positive_labels_from_sampled_grid(
+                    other_positive_label_vox = _voxelize_points_from_sampled_grid(
                         self,
-                        other_segment,
+                        other_sampled_grid,
                         min_corner=min_corner,
                         max_corner=max_corner,
                         crop_size=crop_size,
-                        sampled_grid=other_sampled_grid,
+                        class_value=1,
+                        require_points=True,
                     )
 
-                    other_background_label_vox = _voxelize_background_surface_labels_from_sampled_grid(
+                    other_background_label_vox = _voxelize_points_from_sampled_grid(
                         self,
-                        other_segment,
+                        other_sampled_grid,
                         min_corner=min_corner,
                         max_corner=max_corner,
                         crop_size=crop_size,
-                        sampled_grid=other_sampled_grid,
+                        class_value=0,
                     )
                     other_labeled_surface_vox = np.asarray(
                         (other_positive_label_vox > 0.0) | (other_background_label_vox > 0.0),
@@ -436,14 +421,33 @@ class TifxyzInkDataset(Dataset):
                             other_background_label_vox,
                         )
 
-                    other_projected_loss_mask = _build_projected_loss_mask_volume(
+                    other_projected_loss_mask = np.full(crop_size, 2.0, dtype=np.float32)
+                    other_background_projection_vox = _voxelize_points_from_sampled_grid(
                         self,
-                        other_segment,
+                        other_sampled_grid,
                         min_corner=min_corner,
                         max_corner=max_corner,
                         crop_size=crop_size,
-                        sampled_grid=other_sampled_grid,
+                        class_value=0,
+                        project_along_normals=True,
+                        label_distance=(self.bg_distance_pos, self.bg_distance_neg),
                     )
+                    other_projected_loss_mask[other_background_projection_vox > 0.0] = 0.0
+                    other_label_projection_vox = _voxelize_points_from_sampled_grid(
+                        self,
+                        other_sampled_grid,
+                        min_corner=min_corner,
+                        max_corner=max_corner,
+                        crop_size=crop_size,
+                        class_value=1,
+                        project_along_normals=True,
+                        label_distance=(self.label_distance_pos, self.label_distance_neg),
+                        require_points=True,
+                    )
+                    assert bool(np.any(other_label_projection_vox > 0.0)), (
+                        "label projection must produce non-empty supervision"
+                    )
+                    other_projected_loss_mask[other_label_projection_vox > 0.0] = 1.0
                     self._suppress_projected_mask_overlap_with_foreign_labels(
                         other_projected_loss_mask,
                         labeled_surface_vox_union,
@@ -466,13 +470,23 @@ class TifxyzInkDataset(Dataset):
                             other_surface_vox,
                         )
 
-                    other_bg_projection_vox = self._voxelize_full_surface_background_projection_from_sampled_grid(
-                        other_segment,
+                    other_bg_projection_vox = _voxelize_points_from_sampled_grid(
+                        self,
+                        other_sampled_grid,
                         min_corner=min_corner,
                         max_corner=max_corner,
                         crop_size=crop_size,
-                        sampled_grid=other_sampled_grid,
+                        project_along_normals=True,
+                        label_distance=(self.bg_distance_pos, self.bg_distance_neg),
                     )
+                    if not bool(np.any(other_bg_projection_vox > 0.0)):
+                        other_bg_projection_vox = _voxelize_points_from_sampled_grid(
+                            self,
+                            other_sampled_grid,
+                            min_corner=min_corner,
+                            max_corner=max_corner,
+                            crop_size=crop_size,
+                        )
                     bg_mask = np.asarray(other_bg_projection_vox > 0.0, dtype=bool)
                     projected_loss_mask[bg_mask & (projected_loss_mask != 1.0)] = 0.0
 
