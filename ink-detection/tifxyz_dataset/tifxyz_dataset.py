@@ -11,7 +11,7 @@ from .common import (
     _read_volume_crop_from_patch_dict,
     _sample_patch_supervision_grid,
 )
-from .patch_finding import _PATCH_CACHE_DEFAULT_FILENAME, find_patches
+from .patch_finding import find_patches
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
 
@@ -25,27 +25,17 @@ class TifxyzInkDataset(Dataset):
         self.apply_augmentation = apply_augmentation
         self.apply_perturbation = bool(apply_perturbation)
         self.patch_size = config["patch_size"]                                          # 3d vol crop / model input patch size
-        bg_distance = config["bg_distance"]                                             # accepts scalar or [positive, negative]
-        if np.isscalar(bg_distance):
-            self.bg_distance = (float(bg_distance), float(bg_distance))
-        else:
-            self.bg_distance = (float(bg_distance[0]), float(bg_distance[1]))
-        label_distance = config["label_distance"]                                       # accepts scalar or [positive, negative]
-        if np.isscalar(label_distance):
-            self.label_distance = (float(label_distance), float(label_distance))
-        else:
-            self.label_distance = (float(label_distance[0]), float(label_distance[1]))
-        self.bg_distance_pos, self.bg_distance_neg = self.bg_distance
-        self.label_distance_pos, self.label_distance_neg = self.label_distance
-        self.bg_distance_max = max(self.bg_distance_pos, self.bg_distance_neg)
-        self.label_distance_max = max(self.label_distance_pos, self.label_distance_neg)
+        self.patch_size_zyx = _normalize_patch_size_zyx(self.patch_size)  
+        
+        bg_distance = config["bg_distance"]                                             # [positive, negative]
+        self.bg_distance = (float(bg_distance[0]), float(bg_distance[1]))
+        
+        label_distance = config["label_distance"]                                       # [positive, negative]
+        self.label_distance = (float(label_distance[0]), float(label_distance[1]))
+
         self.normal_sample_step = float(config.get("normal_sample_step", 0.5))
-        self.normal_trilinear_threshold = float(config.get("normal_trilinear_threshold", 1e-4))
         self.surface_bbox_pad = float(config.get("surface_bbox_pad", 2.0))
-        if self.surface_bbox_pad < 0.0:
-            self.surface_bbox_pad = 0.0
-        self.surface_interp_method = str(config.get("surface_interp_method", "catmull_rom")).strip().lower()
-        self.patch_size_zyx = _normalize_patch_size_zyx(self.patch_size)        
+      
         self.overlap_fraction = float(config.get("overlap_fraction", 0.25))             # amount of overlap (stride) in train/val patches, as a percentage of the patch size
         self.min_positive_fraction = float(config.get("min_positive_fraction", 0.01))   # minimum amount of labeled voxels in a candidate bbox to be added to our patches list, as a percentage of the total voxels
         self.min_span_ratio = float(config.get("min_span_ratio", 0.50))                 # the "span" in this instance is how far across the principle "direction" axis the segment should span (bbox local)
@@ -55,9 +45,7 @@ class TifxyzInkDataset(Dataset):
         self.patch_cache_force_recompute = bool(
             config.get("patch_cache_force_recompute", False)
         )
-        self.patch_cache_filename = str(
-            config.get("patch_cache_filename", _PATCH_CACHE_DEFAULT_FILENAME)
-        )
+        self.patch_cache_filename = str(config["patch_cache_filename"])
 
         self._segment_grid_cache = {}
         self._segment_labels_and_mask_cache = {}
@@ -183,7 +171,7 @@ class TifxyzInkDataset(Dataset):
             segment,
             min_corner=min_corner,
             max_corner=max_corner,
-            extra_bbox_pad=max(float(self.bg_distance_max), float(self.label_distance_max)) + 1.0,
+            extra_bbox_pad=max(max(self.bg_distance), max(self.label_distance)) + 1.0,
         )
 
         positive_point_mask = sampled_grid["in_patch"] & (sampled_grid["class_codes"] == 1)

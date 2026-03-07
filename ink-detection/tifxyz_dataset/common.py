@@ -104,8 +104,7 @@ def _sample_patch_supervision_grid(dataset, segment, min_corner, max_corner, ext
     max_corner_f = np.asarray(max_corner, dtype=np.float32).reshape(3)
 
     bbox_pad = max(float(dataset.surface_bbox_pad), float(extra_bbox_pad))
-
-    interp_method = str(dataset.surface_interp_method).strip().lower()
+    interp_method = "catmull_rom"
 
     segment.use_stored_resolution()
     scale_y, scale_x = getattr(segment, "_scale", (1.0, 1.0))
@@ -248,7 +247,7 @@ def _project_points_along_normals(
         crop_size=crop_size_tuple,
         label_distance=(pos_distance, neg_distance),
         sample_step=float(dataset.normal_sample_step),
-        trilinear_threshold=float(dataset.normal_trilinear_threshold),
+        trilinear_threshold=1e-4,
     )
 
 

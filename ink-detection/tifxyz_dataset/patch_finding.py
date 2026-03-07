@@ -22,7 +22,6 @@ from vesuvius.neural_tracing.inference.generate_segment_cover_bboxes import (
     _generate_segment_cover_records,
 )
 
-_PATCH_CACHE_DEFAULT_FILENAME = ".tifxyz_patch_cache.json"
 _PATCH_EVAL_CONTEXT = None
 
 
@@ -263,7 +262,7 @@ def find_patches(
 
         cache_path = os.path.join(
             str(dataset["segments_path"]),
-            str(patch_cache_filename or _PATCH_CACHE_DEFAULT_FILENAME),
+            str(patch_cache_filename),
         )
         cache_keys = {
             "dataset": {
