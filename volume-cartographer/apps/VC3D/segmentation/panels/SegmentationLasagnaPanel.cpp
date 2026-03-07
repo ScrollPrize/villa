@@ -361,17 +361,22 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
 
     connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::datasetsReceived,
             this, [this](const QJsonArray& datasets) {
+        QString prevPath = _lasagnaDataInputPath;
         _datasetCombo->clear();
         if (datasets.isEmpty()) {
             _dataInputStack->setCurrentIndex(0);
             return;
         }
-        for (const auto& val : datasets) {
-            QJsonObject ds = val.toObject();
+        int restoreIdx = 0;
+        for (int i = 0; i < datasets.size(); ++i) {
+            QJsonObject ds = datasets[i].toObject();
             QString name = ds[QStringLiteral("name")].toString();
             QString path = ds[QStringLiteral("path")].toString();
             _datasetCombo->addItem(name, path);
+            if (path == prevPath)
+                restoreIdx = i;
         }
+        _datasetCombo->setCurrentIndex(restoreIdx);
         _dataInputStack->setCurrentIndex(1);
     });
 

@@ -386,7 +386,7 @@ private:
     static bool s_haveSession;
     static bool s_xy, s_xz, s_yz;
     static bool s_cos, s_gradMag;
-    static bool s_lDir, s_lStep, s_lSmooth, s_lWinding, s_lNormal;
+    static bool s_lStep, s_lSmooth, s_lWinding, s_lNormal;
     static bool s_mesh, s_conn;
 
     void applySessionDefaults();

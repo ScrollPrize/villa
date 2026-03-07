@@ -1479,7 +1479,6 @@ bool VisLasagnaObjDialog::s_xz = false;
 bool VisLasagnaObjDialog::s_yz = false;
 bool VisLasagnaObjDialog::s_cos = true;
 bool VisLasagnaObjDialog::s_gradMag = true;
-bool VisLasagnaObjDialog::s_lDir = true;
 bool VisLasagnaObjDialog::s_lStep = true;
 bool VisLasagnaObjDialog::s_lSmooth = true;
 bool VisLasagnaObjDialog::s_lWinding = true;
@@ -1593,7 +1592,6 @@ void VisLasagnaObjDialog::applySessionDefaults()
     chkYZ_->setChecked(s_yz);
     chkCos_->setChecked(s_cos);
     chkGradMag_->setChecked(s_gradMag);
-    chkLossDir_->setChecked(s_lDir);
     chkLossStep_->setChecked(s_lStep);
     chkLossSmooth_->setChecked(s_lSmooth);
     chkLossWinding_->setChecked(s_lWinding);
@@ -1610,7 +1608,6 @@ void VisLasagnaObjDialog::updateSessionFromUI()
     s_yz = chkYZ_->isChecked();
     s_cos = chkCos_->isChecked();
     s_gradMag = chkGradMag_->isChecked();
-    s_lDir = chkLossDir_->isChecked();
     s_lStep = chkLossStep_->isChecked();
     s_lSmooth = chkLossSmooth_->isChecked();
     s_lWinding = chkLossWinding_->isChecked();
