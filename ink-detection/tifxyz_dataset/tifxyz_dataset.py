@@ -9,7 +9,6 @@ from .common import (
     _build_normal_offset_mask_from_labeled_points,
     _build_projected_loss_mask_volume,
     _build_surface_label_volume,
-    _get_labels_and_mask,
     _normalize_distance_pair,
     _normalize_patch_size_zyx,
     _read_volume_crop_from_patch_dict,
