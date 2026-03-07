@@ -180,23 +180,8 @@ def _get_segment_positive_points_zyx(dataset, segment):
 
 def _normalize_distance_pair(value, name):
     if np.isscalar(value):
-        distance = float(value)
-        if not np.isfinite(distance):
-            raise ValueError(f"{name} must be finite, got {value!r}")
-        distance = max(0.0, distance)
-        return distance, distance
-
-    arr = np.asarray(value, dtype=np.float32).reshape(-1)
-    if int(arr.size) != 2:
-        raise ValueError(
-            f"{name} must be a scalar or a two-value sequence [positive, negative], got {value!r}"
-        )
-
-    pos_distance = float(arr[0])
-    neg_distance = float(arr[1])
-    if not np.isfinite(pos_distance) or not np.isfinite(neg_distance):
-        raise ValueError(f"{name} values must be finite, got {value!r}")
-    return max(0.0, pos_distance), max(0.0, neg_distance)
+        return float(value), float(value)
+    return float(value[0]), float(value[1])
 
 
 def _build_surface_supervision_from_ink_mask(ink_mask, bg_dilate_distance):
