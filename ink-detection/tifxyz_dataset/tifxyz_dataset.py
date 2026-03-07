@@ -9,7 +9,6 @@ from .common import (
     _build_normal_offset_mask_from_labeled_points,
     _build_projected_loss_mask_volume,
     _build_surface_label_volume,
-    _build_surface_supervision_from_ink_mask,
     _get_labels_and_mask,
     _normalize_distance_pair,
     _normalize_patch_size_zyx,
@@ -44,7 +43,6 @@ class TifxyzInkDataset(Dataset):
         )
         self.bg_distance_max = max(self.bg_distance_pos, self.bg_distance_neg)
         self.label_distance_max = max(self.label_distance_pos, self.label_distance_neg)
-        self.bg_dilate_distance = int(config.get("bg_dilate_distance", 192))            # 2d label EDT radius (pixels) used to define near-ink background
         self.normal_sample_step = float(config.get("normal_sample_step", 0.5))
         self.normal_trilinear_threshold = float(config.get("normal_trilinear_threshold", 1e-4))
         self.use_numba_for_normal_mask = bool(config.get("use_numba_for_normal_mask", True))
@@ -74,7 +72,6 @@ class TifxyzInkDataset(Dataset):
 
         self._segment_grid_cache = {}
         self._segment_labels_and_mask_cache = {}
-        self._segment_surface_supervision_cache = {}
         self._segment_normal_cache = {}
         self._segment_world_bounds_cache = {}
         self._segment_positive_points_cache = {}
@@ -192,21 +189,6 @@ class TifxyzInkDataset(Dataset):
         }
         self._segment_grid_cache[segment_uuid] = cached
         return cached
-
-    def _load_segment_surface_supervision(self, segment):
-        segment_uuid = str(segment.uuid)
-        cached = self._segment_surface_supervision_cache.get(segment_uuid)
-        if cached is not None:
-            return cached
-
-        ink_mask, _ = _get_labels_and_mask(self, segment)
-        surface_supervision = _build_surface_supervision_from_ink_mask(
-            ink_mask,
-            bg_dilate_distance=self.bg_dilate_distance,
-        )
-
-        self._segment_surface_supervision_cache[segment_uuid] = surface_supervision
-        return surface_supervision
 
     @staticmethod
     def _segment_bounds_intersect_crop(segment_bounds, min_corner, max_corner):
