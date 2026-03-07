@@ -2,8 +2,8 @@
 	"base": {
 		"normal": 10.0,
 		"step": 10.0,
-		"smooth": 0.0,
-		"winding_density": 0.0,
+		"smooth": 0.1,
+		"winding_density": 1.0,
 		"corr": 1.0
 	},
 	"stages": [
