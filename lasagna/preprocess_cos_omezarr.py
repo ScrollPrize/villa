@@ -1080,13 +1080,13 @@ def run_integrate_directions(
 	batch_size: int = 32,
 	pred_dt_path: str | None = None,
 ) -> None:
-	"""Fuse cos/grad_mag and estimate 3D normal from axis volumes.
+	"""Fuse cos/grad_mag and estimate 3D normal from three axis volumes (z, y, x).
 
-	All axis volumes must be preprocessed with the same uniform scaledown.
-	The z-volume shape is the reference.
+	All three axis volumes are required and must be preprocessed with the same
+	uniform scaledown. The z-volume shape is the reference.
 
 	The estimated normal is stored as hemisphere-encoded (nx, ny) uint8 pair.
-	nz is reconstructed as sqrt(1 - nx² - ny²) ≥ 0 by convention.
+	nz is reconstructed as sqrt(1 - nx² - ny²) >= 0 by convention.
 
 	grad_mag == 0 marks invalid voxels (no separate valid channel).
 
