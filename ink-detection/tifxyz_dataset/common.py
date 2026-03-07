@@ -127,9 +127,78 @@ def _points_to_voxels(points_local, crop_size):
     return vox
 
 
-def _load_segment_ink_mask(dataset, segment):
+def _read_segment_label_mask(label_path, expected_shape, segment_uuid, label_name):
     import cv2
 
+    if label_path is None:
+        return None
+
+    label = cv2.imread(str(label_path), cv2.IMREAD_UNCHANGED)
+    if label is None:
+        return None
+    if label.ndim == 3:
+        if label.shape[2] == 4:
+            label = cv2.cvtColor(label, cv2.COLOR_BGRA2GRAY)
+        else:
+            label = cv2.cvtColor(label, cv2.COLOR_BGR2GRAY)
+
+    actual_shape = tuple(int(v) for v in label.shape)
+    assert actual_shape == expected_shape, (
+        f"Segment {segment_uuid!r} {label_name} label shape {actual_shape} does not match "
+        f"tifxyz grid shape {expected_shape}."
+    )
+    return np.asarray(label > 0, dtype=bool)
+
+
+def _resolve_segment_supervision_mask_path(segment):
+    mask_meta = next((label for label in segment.list_labels() if label.get("name") == "mask"), None)
+    if mask_meta is None or mask_meta.get("path") is None:
+        return None
+
+    mask_path = str(mask_meta["path"])
+    for suffix in ("_mask.tif", "_mask.png"):
+        if not mask_path.endswith(suffix):
+            continue
+        prefix = mask_path[: -len(suffix)]
+        for ext in (".tif", ".png"):
+            candidate = f"{prefix}_supervision_mask{ext}"
+            if os.path.exists(candidate):
+                return candidate
+        return f"{prefix}_supervision_mask{os.path.splitext(mask_path)[1]}"
+    return None
+
+
+def _empty_segment_samples():
+    return {
+        "rows": np.empty((0,), dtype=np.int32),
+        "cols": np.empty((0,), dtype=np.int32),
+        "points_zyx": np.empty((0, 3), dtype=np.float32),
+    }
+
+
+def _segment_samples_from_mask(grid, mask):
+    sample_mask = np.asarray(grid["valid"] & mask, dtype=bool)
+    if not bool(np.any(sample_mask)):
+        return _empty_segment_samples()
+
+    row_idx, col_idx = np.where(sample_mask)
+    row_idx = np.asarray(row_idx, dtype=np.int32)
+    col_idx = np.asarray(col_idx, dtype=np.int32)
+    return {
+        "rows": row_idx,
+        "cols": col_idx,
+        "points_zyx": np.stack(
+            [
+                grid["z"][row_idx, col_idx],
+                grid["y"][row_idx, col_idx],
+                grid["x"][row_idx, col_idx],
+            ],
+            axis=-1,
+        ).astype(np.float32, copy=False),
+    }
+
+
+def _load_segment_ink_mask(dataset, segment):
     segment_uuid = str(segment.uuid)
     cached = dataset._segment_ink_mask_cache.get(segment_uuid)
     if cached is not None:
@@ -152,24 +221,16 @@ def _load_segment_ink_mask(dataset, segment):
         dataset._segment_ink_mask_cache[segment_uuid] = out
         return out
 
-    ink_label = cv2.imread(str(ink_label_path), cv2.IMREAD_UNCHANGED)
-    if ink_label is None:
+    out = _read_segment_label_mask(
+        ink_label_path,
+        expected_shape,
+        segment_uuid,
+        "ink",
+    )
+    if out is None:
         out = np.zeros(expected_shape, dtype=bool)
         dataset._segment_ink_mask_cache[segment_uuid] = out
         return out
-    if ink_label.ndim == 3:
-        if ink_label.shape[2] == 4:
-            ink_label = cv2.cvtColor(ink_label, cv2.COLOR_BGRA2GRAY)
-        else:
-            ink_label = cv2.cvtColor(ink_label, cv2.COLOR_BGR2GRAY)
-
-    actual_shape = tuple(int(v) for v in ink_label.shape)
-    assert actual_shape == expected_shape, (
-        f"Segment {segment_uuid!r} ink label shape {actual_shape} does not match "
-        f"tifxyz grid shape {expected_shape}."
-    )
-
-    out = np.asarray(ink_label > 0, dtype=bool)
     dataset._segment_ink_mask_cache[segment_uuid] = out
     return out
 
@@ -203,8 +264,6 @@ def _build_surface_supervision_from_ink_mask(ink_mask, bg_dilate_distance):
 
 
 def _get_segment_positive_samples(dataset, segment):
-    import cv2
-
     segment_uuid = str(segment.uuid)
     cached = dataset._segment_positive_samples_cache.get(segment_uuid)
     if cached is not None:
@@ -212,93 +271,32 @@ def _get_segment_positive_samples(dataset, segment):
 
     grid = dataset._get_segment_stored_grid(segment)
     ink_mask = _load_segment_ink_mask(dataset, segment)
-    if tuple(int(v) for v in ink_mask.shape) != tuple(int(v) for v in grid["shape"]):
-        ink_mask = (
-            cv2.resize(
-                ink_mask.astype(np.uint8),
-                (int(grid["shape"][1]), int(grid["shape"][0])),
-                interpolation=cv2.INTER_AREA,
-            )
-            > 0
-        )
-
-    positive_mask = np.asarray(grid["valid"] & ink_mask, dtype=bool)
-    if not bool(np.any(positive_mask)):
-        out = {
-            "rows": np.empty((0,), dtype=np.int32),
-            "cols": np.empty((0,), dtype=np.int32),
-            "points_zyx": np.empty((0, 3), dtype=np.float32),
-        }
-        dataset._segment_positive_samples_cache[segment_uuid] = out
-        dataset._segment_positive_points_cache[segment_uuid] = out["points_zyx"]
-        return out
-
-    row_idx, col_idx = np.where(positive_mask)
-    row_idx = np.asarray(row_idx, dtype=np.int32)
-    col_idx = np.asarray(col_idx, dtype=np.int32)
-    points_zyx = np.stack(
-        [
-            grid["z"][row_idx, col_idx],
-            grid["y"][row_idx, col_idx],
-            grid["x"][row_idx, col_idx],
-        ],
-        axis=-1,
-    ).astype(np.float32, copy=False)
-
-    out = {
-        "rows": row_idx,
-        "cols": col_idx,
-        "points_zyx": points_zyx,
-    }
+    out = _segment_samples_from_mask(grid, ink_mask)
     dataset._segment_positive_samples_cache[segment_uuid] = out
-    dataset._segment_positive_points_cache[segment_uuid] = points_zyx
+    dataset._segment_positive_points_cache[segment_uuid] = out["points_zyx"]
     return out
 
 
 def _get_segment_background_samples(dataset, segment):
-    import cv2
-
     segment_uuid = str(segment.uuid)
     cached = dataset._segment_background_samples_cache.get(segment_uuid)
     if cached is not None:
         return cached
 
     grid = dataset._get_segment_stored_grid(segment)
-    surface_supervision = dataset._load_segment_surface_supervision(segment)
-    if tuple(int(v) for v in surface_supervision.shape) != tuple(int(v) for v in grid["shape"]):
-        surface_supervision = cv2.resize(
-            surface_supervision.astype(np.uint8),
-            (int(grid["shape"][1]), int(grid["shape"][0])),
-            interpolation=cv2.INTER_NEAREST,
-        ).astype(np.uint8, copy=False)
-
-    background_mask = np.asarray(grid["valid"] & (surface_supervision == 0), dtype=bool)
-    if not bool(np.any(background_mask)):
-        out = {
-            "rows": np.empty((0,), dtype=np.int32),
-            "cols": np.empty((0,), dtype=np.int32),
-            "points_zyx": np.empty((0, 3), dtype=np.float32),
-        }
+    supervision_mask = _read_segment_label_mask(
+        _resolve_segment_supervision_mask_path(segment),
+        tuple(int(v) for v in grid["shape"]),
+        segment_uuid,
+        "supervision",
+    )
+    if supervision_mask is None:
+        out = _empty_segment_samples()
         dataset._segment_background_samples_cache[segment_uuid] = out
         return out
 
-    row_idx, col_idx = np.where(background_mask)
-    row_idx = np.asarray(row_idx, dtype=np.int32)
-    col_idx = np.asarray(col_idx, dtype=np.int32)
-    points_zyx = np.stack(
-        [
-            grid["z"][row_idx, col_idx],
-            grid["y"][row_idx, col_idx],
-            grid["x"][row_idx, col_idx],
-        ],
-        axis=-1,
-    ).astype(np.float32, copy=False)
-
-    out = {
-        "rows": row_idx,
-        "cols": col_idx,
-        "points_zyx": points_zyx,
-    }
+    background_mask = supervision_mask & ~_load_segment_ink_mask(dataset, segment)
+    out = _segment_samples_from_mask(grid, background_mask)
     dataset._segment_background_samples_cache[segment_uuid] = out
     return out
 
