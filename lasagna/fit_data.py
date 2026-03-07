@@ -19,14 +19,15 @@ class CorrPoints3D:
 
 @dataclass(frozen=True)
 class FitData3D:
-	cos: torch.Tensor              # (1, 1, Z, Y, X)
-	grad_mag: torch.Tensor         # (1, 1, Z, Y, X)
-	nx: torch.Tensor               # (1, 1, Z, Y, X) — hemisphere-encoded normal x
-	ny: torch.Tensor               # (1, 1, Z, Y, X) — hemisphere-encoded normal y
+	cos: torch.Tensor              # (1, 1, Z, Y, X) uint8 on GPU
+	grad_mag: torch.Tensor         # (1, 1, Z, Y, X) uint8 on GPU
+	nx: torch.Tensor               # (1, 1, Z, Y, X) uint8 on GPU — hemisphere-encoded normal x
+	ny: torch.Tensor               # (1, 1, Z, Y, X) uint8 on GPU — hemisphere-encoded normal y
 	pred_dt: torch.Tensor | None
 	corr_points: CorrPoints3D | None
 	origin_fullres: tuple[float, float, float]  # (x0, y0, z0) in fullres voxels
 	spacing: tuple[float, float, float]          # (sx, sy, sz) voxel size in fullres units
+	grad_mag_scale: float = 255.0                # encoding scale for grad_mag channel
 
 	@property
 	def size(self) -> tuple[int, int, int]:
@@ -37,37 +38,41 @@ class FitData3D:
 		return int(z), int(y), int(x)
 
 	def grid_sample_fullres(self, xyz_fullres: torch.Tensor) -> "FitData3D":
-		"""Sample at fullres positions. xyz: (D, H, W, 3) where last dim is (x, y, z)."""
-		Z, Y, X = self.size
-		grid = xyz_fullres.clone()
-		# Convert fullres -> volume voxel coords
-		grid[..., 0] = (grid[..., 0] - self.origin_fullres[0]) / self.spacing[0]
-		grid[..., 1] = (grid[..., 1] - self.origin_fullres[1]) / self.spacing[1]
-		grid[..., 2] = (grid[..., 2] - self.origin_fullres[2]) / self.spacing[2]
-		# Normalize to [-1, 1] for grid_sample
-		# PyTorch 5D grid_sample: input is (N,C,D_in,H_in,W_in), grid last dim is (x->W, y->H, z->D)
-		# Our volume is (1,C,Z,Y,X) -> D_in=Z, H_in=Y, W_in=X
-		# grid (x,y,z) maps to (W=X, H=Y, D=Z) which is correct order for PyTorch
-		grid[..., 0] = grid[..., 0] / max(1, X - 1) * 2 - 1  # x -> W
-		grid[..., 1] = grid[..., 1] / max(1, Y - 1) * 2 - 1  # y -> H
-		grid[..., 2] = grid[..., 2] / max(1, Z - 1) * 2 - 1  # z -> D
-		# grid_sample expects (N, D_out, H_out, W_out, 3)
-		grid_5d = grid.unsqueeze(0)  # (1, D, H, W, 3)
+		"""Sample at fullres positions using custom CUDA uint8 kernel.
 
-		def _gs(t: torch.Tensor | None) -> torch.Tensor | None:
+		xyz_fullres: (D, H, W, 3) where last dim is (x, y, z) in fullres coords.
+		Returns FitData3D with float32 decoded values in (1, 1, D, H, W).
+		"""
+		import importlib.util, os
+		_spec = importlib.util.spec_from_file_location(
+			"grid_sample_3d_u8",
+			os.path.join(os.path.dirname(__file__), "grid_sample_3d_u8.py"),
+		)
+		_mod = importlib.util.module_from_spec(_spec)
+		_spec.loader.exec_module(_mod)
+		grid_sample_3d_u8 = _mod.grid_sample_3d_u8
+
+		dev = xyz_fullres.device
+		offset = torch.tensor(self.origin_fullres, dtype=torch.float32, device=dev)
+		inv_scale = torch.tensor([1.0 / s for s in self.spacing], dtype=torch.float32, device=dev)
+
+		def _gs(t: torch.Tensor | None, decode) -> torch.Tensor | None:
 			if t is None:
 				return None
-			return F.grid_sample(t, grid_5d, mode="bilinear", padding_mode="zeros", align_corners=True)
+			vol = t.squeeze(0)  # (1, Z, Y, X) — C=1
+			out_u8 = grid_sample_3d_u8(vol, xyz_fullres, offset, inv_scale)  # (1, D, H, W) u8
+			return decode(out_u8.float()).unsqueeze(0)  # (1, 1, D, H, W) float32
 
 		return FitData3D(
-			cos=_gs(self.cos),
-			grad_mag=_gs(self.grad_mag),
-			nx=_gs(self.nx),
-			ny=_gs(self.ny),
-			pred_dt=_gs(self.pred_dt),
+			cos=_gs(self.cos, lambda t: t / 255.0),
+			grad_mag=_gs(self.grad_mag, lambda t: t / self.grad_mag_scale),
+			nx=_gs(self.nx, lambda t: (t - 128.0) / 127.0),
+			ny=_gs(self.ny, lambda t: (t - 128.0) / 127.0),
+			pred_dt=_gs(self.pred_dt, lambda t: t.sqrt()),
 			corr_points=self.corr_points,
 			origin_fullres=self.origin_fullres,
 			spacing=self.spacing,
+			grad_mag_scale=self.grad_mag_scale,
 		)
 
 
@@ -127,7 +132,7 @@ def load_3d_for_model(
 
 
 def blur_3d(data: FitData3D, sigma: float) -> None:
-	"""Apply separable 3D Gaussian blur in-place to all data channels."""
+	"""Apply separable 3D Gaussian blur in-place to all uint8 data channels."""
 	radius = int(math.ceil(2 * sigma))
 	ks = 2 * radius + 1
 	# 1D Gaussian kernel
@@ -136,25 +141,22 @@ def blur_3d(data: FitData3D, sigma: float) -> None:
 	k1d = k1d / k1d.sum()
 
 	def _blur_separable(t: torch.Tensor) -> torch.Tensor:
-		# t: (1, 1, Z, Y, X)
-		# Apply along Z (dim=2), Y (dim=3), X (dim=4) using conv3d with 1D kernels
+		# t: (1, 1, Z, Y, X) float32
 		v = t
-		# Z axis: kernel shape (1,1,ks,1,1)
 		kz = k1d.view(1, 1, ks, 1, 1)
 		v = F.conv3d(F.pad(v, (0, 0, 0, 0, radius, radius), mode='reflect'), kz)
-		# Y axis: kernel shape (1,1,1,ks,1)
 		ky = k1d.view(1, 1, 1, ks, 1)
 		v = F.conv3d(F.pad(v, (0, 0, radius, radius, 0, 0), mode='reflect'), ky)
-		# X axis: kernel shape (1,1,1,1,ks)
 		kx = k1d.view(1, 1, 1, 1, ks)
 		v = F.conv3d(F.pad(v, (radius, radius, 0, 0, 0, 0), mode='reflect'), kx)
 		return v
 
-	# Blur all signal channels in-place
+	# Blur all signal channels in-place (u8 -> float -> blur -> clamp -> u8)
 	for name in ("cos", "grad_mag", "nx", "ny"):
 		t = getattr(data, name)
 		if t is not None:
-			t.copy_(_blur_separable(t))
+			blurred = _blur_separable(t.float())
+			t.copy_(blurred.round().clamp(0, 255).to(torch.uint8))
 
 
 def get_preprocessed_params(path: str) -> dict | None:
@@ -262,35 +264,20 @@ def load_3d(
 
 	n_voxels = (z1v - z0v) * (y1v - y0v) * (x1v - x0v)
 	n_channels = 4 + (1 if "pred_dt" in ci else 0)
-	est_bytes = n_voxels * n_channels * 4  # float32
+	est_bytes = n_voxels * n_channels * 1  # uint8
 	print(f"[fit_data] estimated GPU memory for data: {est_bytes / 2**30:.2f} GiB "
-		  f"({n_channels} channels, {z1v-z0v}x{y1v-y0v}x{x1v-x0v} voxels)", flush=True)
+		  f"({n_channels} uint8 channels, {z1v-z0v}x{y1v-y0v}x{x1v-x0v} voxels)", flush=True)
 
-	def _read_ch(name: str) -> np.ndarray:
-		return np.asarray(zsrc[ci[name], z0v:z1v, y0v:y1v, x0v:x1v])
-
-	def _u8_to_t(a: np.ndarray) -> torch.Tensor:
-		t = torch.from_numpy(a.astype(np.float32) / 255.0).to(device=device, dtype=torch.float32)
+	def _read_ch(name: str) -> torch.Tensor:
+		a = np.asarray(zsrc[ci[name], z0v:z1v, y0v:y1v, x0v:x1v])
+		t = torch.from_numpy(a).to(device=device, dtype=torch.uint8)
 		return t.unsqueeze(0).unsqueeze(0)  # (1, 1, Z, Y, X)
 
-	def _u8_to_t_scaled(a: np.ndarray, *, scale: float) -> torch.Tensor:
-		t = torch.from_numpy(a.astype(np.float32) / scale).to(device=device, dtype=torch.float32)
-		return t.unsqueeze(0).unsqueeze(0)
-
-	def _u8_raw_to_t(a: np.ndarray) -> torch.Tensor:
-		t = torch.from_numpy(np.sqrt(a.astype(np.float32))).to(device=device, dtype=torch.float32)
-		return t.unsqueeze(0).unsqueeze(0)
-
-	cos_t = _u8_to_t(_read_ch("cos"))
-	mag_t = _u8_to_t_scaled(_read_ch("grad_mag"), scale=gmag_enc)
-
-	def _u8_normal_to_t(a: np.ndarray) -> torch.Tensor:
-		t = torch.from_numpy((a.astype(np.float32) - 128.0) / 127.0).to(device=device, dtype=torch.float32)
-		return t.unsqueeze(0).unsqueeze(0)
-
-	nx_t = _u8_normal_to_t(_read_ch("nx"))
-	ny_t = _u8_normal_to_t(_read_ch("ny"))
-	pred_dt_t = _u8_raw_to_t(_read_ch("pred_dt")) if "pred_dt" in ci else None
+	cos_t = _read_ch("cos")
+	mag_t = _read_ch("grad_mag")
+	nx_t = _read_ch("nx")
+	ny_t = _read_ch("ny")
+	pred_dt_t = _read_ch("pred_dt") if "pred_dt" in ci else None
 
 	return FitData3D(
 		cos=cos_t,
@@ -301,4 +288,5 @@ def load_3d(
 		corr_points=None,
 		origin_fullres=origin_fullres,
 		spacing=spacing,
+		grad_mag_scale=gmag_enc,
 	)
