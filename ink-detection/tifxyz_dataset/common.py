@@ -127,179 +127,90 @@ def _points_to_voxels(points_local, crop_size):
     return vox
 
 
-def _read_segment_label_mask(label_path, expected_shape, segment_uuid, label_name):
+def _get_labels_and_mask(dataset, segment):
     import cv2
 
-    if label_path is None:
-        return None
+    segment_uuid = str(segment.uuid)
+    cached = dataset._segment_labels_and_mask_cache.get(segment_uuid)
+    if cached is not None:
+        return cached
 
-    label = cv2.imread(str(label_path), cv2.IMREAD_UNCHANGED)
-    if label is None:
-        return None
-    if label.ndim == 3:
-        if label.shape[2] == 4:
-            label = cv2.cvtColor(label, cv2.COLOR_BGRA2GRAY)
-        else:
-            label = cv2.cvtColor(label, cv2.COLOR_BGR2GRAY)
+    shape = tuple(int(v) for v in dataset._get_segment_stored_grid(segment)["shape"])
 
-    actual_shape = tuple(int(v) for v in label.shape)
-    assert actual_shape == expected_shape, (
-        f"Segment {segment_uuid!r} {label_name} label shape {actual_shape} does not match "
-        f"tifxyz grid shape {expected_shape}."
+    def read_mask(path, label_name):
+        if not path:
+            return np.zeros(shape, dtype=bool)
+        mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            return np.zeros(shape, dtype=bool)
+        if mask.ndim == 3:
+            if mask.shape[2] == 4:
+                mask = cv2.cvtColor(mask, cv2.COLOR_BGRA2GRAY)
+            else:
+                mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+        actual_shape = tuple(int(v) for v in mask.shape)
+        assert actual_shape == shape, (
+            f"Segment {segment_uuid!r} {label_name} label shape {actual_shape} does not match "
+            f"tifxyz grid shape {shape}."
+        )
+        return np.asarray(mask > 0, dtype=bool)
+
+    ink_meta = next(
+        (label for label in segment.list_labels() if label.get("name") == "inklabels"),
+        None,
     )
-    return np.asarray(label > 0, dtype=bool)
+    ink_label_path = None if ink_meta is None else ink_meta.get("path")
+    assert ink_label_path is not None, f"Segment {segment_uuid!r} must contain inklabels."
+
+    ink_label_path = str(ink_label_path)
+    stem, ext = os.path.splitext(ink_label_path)
+    prefix = stem[:-len("_inklabels")] if stem.endswith("_inklabels") else stem
+    candidate_exts = []
+    for candidate_ext in (ext, ".png", ".tif", ".tiff"):
+        if candidate_ext and candidate_ext not in candidate_exts:
+            candidate_exts.append(candidate_ext)
+    supervision_path = None
+    for candidate_ext in candidate_exts:
+        candidate = f"{prefix}_supervision_mask{candidate_ext}"
+        if os.path.exists(candidate):
+            supervision_path = candidate
+            break
+
+    ink_mask = read_mask(ink_label_path, "ink")
+    supervision_mask = read_mask(supervision_path, "supervision")
+    out = (ink_mask, np.asarray(supervision_mask & ~ink_mask, dtype=bool))
+    dataset._segment_labels_and_mask_cache[segment_uuid] = out
+    return out
 
 
-def _resolve_segment_supervision_mask_path(segment):
-    mask_meta = next((label for label in segment.list_labels() if label.get("name") == "mask"), None)
-    if mask_meta is None or mask_meta.get("path") is None:
-        return None
+def _get_segment_positive_points_zyx(dataset, segment):
+    segment_uuid = str(segment.uuid)
+    cached = dataset._segment_positive_points_cache.get(segment_uuid)
+    if cached is not None:
+        return cached
 
-    mask_path = str(mask_meta["path"])
-    for suffix in ("_mask.tif", "_mask.png"):
-        if not mask_path.endswith(suffix):
-            continue
-        prefix = mask_path[: -len(suffix)]
-        for ext in (".tif", ".png"):
-            candidate = f"{prefix}_supervision_mask{ext}"
-            if os.path.exists(candidate):
-                return candidate
-        return f"{prefix}_supervision_mask{os.path.splitext(mask_path)[1]}"
-    return None
-
-
-def _empty_segment_samples():
-    return {
-        "rows": np.empty((0,), dtype=np.int32),
-        "cols": np.empty((0,), dtype=np.int32),
-        "points_zyx": np.empty((0, 3), dtype=np.float32),
-    }
-
-
-def _segment_samples_from_mask(grid, mask):
-    sample_mask = np.asarray(grid["valid"] & mask, dtype=bool)
-    if not bool(np.any(sample_mask)):
-        return _empty_segment_samples()
-
-    row_idx, col_idx = np.where(sample_mask)
-    row_idx = np.asarray(row_idx, dtype=np.int32)
-    col_idx = np.asarray(col_idx, dtype=np.int32)
-    return {
-        "rows": row_idx,
-        "cols": col_idx,
-        "points_zyx": np.stack(
+    grid = dataset._get_segment_stored_grid(segment)
+    ink_mask, _ = _get_labels_and_mask(dataset, segment)
+    row_idx, col_idx = np.where(grid["valid"] & ink_mask)
+    if row_idx.size == 0:
+        out = np.empty((0, 3), dtype=np.float32)
+    else:
+        out = np.stack(
             [
                 grid["z"][row_idx, col_idx],
                 grid["y"][row_idx, col_idx],
                 grid["x"][row_idx, col_idx],
             ],
             axis=-1,
-        ).astype(np.float32, copy=False),
-    }
-
-
-def _load_segment_ink_mask(dataset, segment):
-    segment_uuid = str(segment.uuid)
-    cached = dataset._segment_ink_mask_cache.get(segment_uuid)
-    if cached is not None:
-        return cached
-
-    grid = dataset._get_segment_stored_grid(segment)
-    expected_shape = tuple(int(v) for v in grid["shape"])
-    ink_label_path = None
-    ink_meta = next(
-        (label for label in segment.list_labels() if label.get("name") == "inklabels"),
-        None,
-    )
-    if ink_meta is not None and ink_meta.get("path") is not None:
-        ink_label_path = str(ink_meta["path"])
-    if ink_label_path is None:
-        path_map = getattr(dataset, "_segment_ink_label_path_by_uuid", {})
-        ink_label_path = path_map.get(segment_uuid)
-    if ink_label_path is None:
-        out = np.zeros(expected_shape, dtype=bool)
-        dataset._segment_ink_mask_cache[segment_uuid] = out
-        return out
-
-    out = _read_segment_label_mask(
-        ink_label_path,
-        expected_shape,
-        segment_uuid,
-        "ink",
-    )
-    if out is None:
-        out = np.zeros(expected_shape, dtype=bool)
-        dataset._segment_ink_mask_cache[segment_uuid] = out
-        return out
-    dataset._segment_ink_mask_cache[segment_uuid] = out
+        ).astype(np.float32, copy=False)
+    dataset._segment_positive_points_cache[segment_uuid] = out
     return out
-
-
-def _get_segment_positive_points_zyx(dataset, segment):
-    return _get_segment_positive_samples(dataset, segment)["points_zyx"]
 
 
 def _normalize_distance_pair(value, name):
     if np.isscalar(value):
         return float(value), float(value)
     return float(value[0]), float(value[1])
-
-
-def _build_surface_supervision_from_ink_mask(ink_mask, bg_dilate_distance):
-    import cv2
-
-    ink = np.asarray(ink_mask, dtype=bool)
-    out = np.full(ink.shape, 100, dtype=np.uint8)
-    out[ink] = 1
-
-    bg_radius = max(0, int(bg_dilate_distance))
-    if bg_radius <= 0 or not bool(np.any(ink)):
-        return out
-
-    background_src = (~ink).astype(np.uint8, copy=False)
-    distances = cv2.distanceTransform(background_src, cv2.DIST_L2, 5)
-    near_bg = (~ink) & np.isfinite(distances) & (distances <= float(bg_radius))
-    out[near_bg] = 0
-    return out
-
-
-def _get_segment_positive_samples(dataset, segment):
-    segment_uuid = str(segment.uuid)
-    cached = dataset._segment_positive_samples_cache.get(segment_uuid)
-    if cached is not None:
-        return cached
-
-    grid = dataset._get_segment_stored_grid(segment)
-    ink_mask = _load_segment_ink_mask(dataset, segment)
-    out = _segment_samples_from_mask(grid, ink_mask)
-    dataset._segment_positive_samples_cache[segment_uuid] = out
-    dataset._segment_positive_points_cache[segment_uuid] = out["points_zyx"]
-    return out
-
-
-def _get_segment_background_samples(dataset, segment):
-    segment_uuid = str(segment.uuid)
-    cached = dataset._segment_background_samples_cache.get(segment_uuid)
-    if cached is not None:
-        return cached
-
-    grid = dataset._get_segment_stored_grid(segment)
-    supervision_mask = _read_segment_label_mask(
-        _resolve_segment_supervision_mask_path(segment),
-        tuple(int(v) for v in grid["shape"]),
-        segment_uuid,
-        "supervision",
-    )
-    if supervision_mask is None:
-        out = _empty_segment_samples()
-        dataset._segment_background_samples_cache[segment_uuid] = out
-        return out
-
-    background_mask = supervision_mask & ~_load_segment_ink_mask(dataset, segment)
-    out = _segment_samples_from_mask(grid, background_mask)
-    dataset._segment_background_samples_cache[segment_uuid] = out
-    return out
-
 
 def _sample_patch_supervision_grid(dataset, segment, min_corner, max_corner, extra_bbox_pad=0.0):
     from vesuvius.tifxyz import interpolate_at_points
@@ -412,7 +323,7 @@ def _sample_patch_supervision_grid(dataset, segment, min_corner, max_corner, ext
     normals_valid &= np.isfinite(normals_zyx).all(axis=-1)
 
     class_codes = np.full(query_y.shape, 100, dtype=np.uint8)
-    ink_mask_full = _load_segment_ink_mask(dataset, segment)
+    ink_mask_full, supervision_mask_full = _get_labels_and_mask(dataset, segment)
     if ink_mask_full.size > 0:
         full_h, full_w = ink_mask_full.shape
         query_rows_full = query_y / scale_y
@@ -426,23 +337,19 @@ def _sample_patch_supervision_grid(dataset, segment, min_corner, max_corner, ext
             & (label_cols < int(full_w))
         )
         if bool(np.any(in_label_bounds)):
-            halo = max(0, int(dataset.bg_dilate_distance))
             rows_in = label_rows[in_label_bounds]
             cols_in = label_cols[in_label_bounds]
-            row_min = max(0, int(rows_in.min()) - halo)
-            row_max = min(int(full_h) - 1, int(rows_in.max()) + halo)
-            col_min = max(0, int(cols_in.min()) - halo)
-            col_max = min(int(full_w) - 1, int(cols_in.max()) + halo)
-
-            ink_local = ink_mask_full[row_min:row_max + 1, col_min:col_max + 1]
-            supervision_local = _build_surface_supervision_from_ink_mask(
-                ink_local,
-                bg_dilate_distance=dataset.bg_dilate_distance,
+            class_codes[in_label_bounds] = 100
+            class_codes[in_label_bounds] = np.where(
+                supervision_mask_full[rows_in, cols_in],
+                0,
+                class_codes[in_label_bounds],
             )
-            class_codes[in_label_bounds] = supervision_local[
-                rows_in - row_min,
-                cols_in - col_min,
-            ]
+            class_codes[in_label_bounds] = np.where(
+                ink_mask_full[rows_in, cols_in],
+                1,
+                class_codes[in_label_bounds],
+            )
 
     local_grid = world_grid - min_corner_f.reshape(1, 1, 3)
     return {

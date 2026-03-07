@@ -10,7 +10,7 @@ from .common import (
     _build_projected_loss_mask_volume,
     _build_surface_label_volume,
     _build_surface_supervision_from_ink_mask,
-    _load_segment_ink_mask,
+    _get_labels_and_mask,
     _normalize_distance_pair,
     _normalize_patch_size_zyx,
     _read_volume_crop_from_patch_dict,
@@ -73,13 +73,11 @@ class TifxyzInkDataset(Dataset):
         )
 
         self._segment_grid_cache = {}
-        self._segment_ink_mask_cache = {}
+        self._segment_labels_and_mask_cache = {}
         self._segment_surface_supervision_cache = {}
         self._segment_normal_cache = {}
         self._segment_world_bounds_cache = {}
         self._segment_positive_points_cache = {}
-        self._segment_positive_samples_cache = {}
-        self._segment_background_samples_cache = {}
         self._multi_wrap_segments_by_dataset_idx = {}
         self._multi_wrap_candidate_segments_cache = {}
 
@@ -101,7 +99,6 @@ class TifxyzInkDataset(Dataset):
             patch_cache_force_recompute=self.patch_cache_force_recompute,               # see vesuvius/src/vesuvius/neural_tracing/inference/generate_segment_cover_bboxes.py  
             patch_cache_filename=self.patch_cache_filename,                             # for info on the bbox generation
         )
-        self._segment_ink_label_path_by_uuid = {}
         for patch in self.patches:
             segment_uuid = str(patch.get("segment_uuid", ""))
             dataset_idx = int(patch.get("dataset_idx", -1))
@@ -112,14 +109,6 @@ class TifxyzInkDataset(Dataset):
                     {},
                 )
                 dataset_segments.setdefault(segment_uuid, segment)
-
-            ink_label_path = patch.get("ink_label_path")
-            if not ink_label_path:
-                warnings.warn(
-                    f"Unable to load ink labels for segment: {segment_uuid}"
-                )
-                continue
-            self._segment_ink_label_path_by_uuid[segment_uuid] = str(ink_label_path)
 
         self._multi_wrap_segments_by_dataset_idx = {
             int(dataset_idx): tuple(segment_map.values())
@@ -210,7 +199,7 @@ class TifxyzInkDataset(Dataset):
         if cached is not None:
             return cached
 
-        ink_mask = _load_segment_ink_mask(self, segment)
+        ink_mask, _ = _get_labels_and_mask(self, segment)
         surface_supervision = _build_surface_supervision_from_ink_mask(
             ink_mask,
             bg_dilate_distance=self.bg_dilate_distance,
