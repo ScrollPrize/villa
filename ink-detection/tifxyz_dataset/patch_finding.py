@@ -12,7 +12,6 @@ from tqdm.auto import tqdm
 import vesuvius.tifxyz as tifxyz
 from .common import (
     _empty_patch_generation_stats,
-    _fix_known_bottom_right_padding,
     load_volume_auth,
     open_zarr,
 )
@@ -206,7 +205,6 @@ def find_patches(
     patch_finding_workers,
     patch_cache_force_recompute,
     patch_cache_filename,
-    auto_fix_padding_multiples,
 ):
     patches = []
     patch_generation_stats = _empty_patch_generation_stats()
@@ -358,40 +356,12 @@ def find_patches(
                     ink_label = cv2.cvtColor(ink_label, cv2.COLOR_BGR2GRAY)
 
             stored_h, stored_w = original_seg.use_stored_resolution().shape
-            scale_y, scale_x = original_seg._scale
-            expected_label_shape = (
-                int(stored_h / scale_y),
-                int(stored_w / scale_x),
+            expected_label_shape = (int(stored_h), int(stored_w))
+            actual_label_shape = tuple(int(v) for v in ink_label.shape)
+            assert actual_label_shape == expected_label_shape, (
+                f"Segment {original_seg.uuid!r} ink label shape {actual_label_shape} does not match "
+                f"tifxyz grid shape {expected_label_shape}."
             )
-            if tuple(int(v) for v in ink_label.shape) != expected_label_shape:
-                fixed_label, matched_multiple = _fix_known_bottom_right_padding(
-                    ink_label,
-                    expected_label_shape,
-                    auto_fix_padding_multiples,
-                )
-                if fixed_label is not None:
-                    ink_label = fixed_label
-                    patch_generation_stats["segments_autofixed_padding"] += 1
-                    label_path = str(ink_meta["path"])
-                    if cv2.imwrite(label_path, ink_label):
-                        warnings.warn(
-                            f"Auto-fixed {original_seg.uuid!r} label shape mismatch "
-                            f"{tuple(int(v) for v in ink_label.shape)} using multiple={matched_multiple}; "
-                            f"saved to {label_path!r}."
-                        )
-                    else:
-                        warnings.warn(
-                            f"Auto-fixed {original_seg.uuid!r} in memory but failed to save {label_path!r}; "
-                            "continuing."
-                        )
-                else:
-                    patch_generation_stats["segments_missing_ink"] += 1
-                    warnings.warn(
-                        f"Skipping segment {original_seg.uuid!r}: label shape {ink_label.shape} "
-                        f"does not match segment full-resolution shape {expected_label_shape}, "
-                        "and does not match known bottom/right 256/64 padding."
-                    )
-                    continue
 
             original_seg.use_stored_resolution()
             x_stored, y_stored, z_stored, valid_stored = original_seg[:, :]
@@ -400,18 +370,7 @@ def find_patches(
             valid_mask &= np.isfinite(y_stored)
             valid_mask &= np.isfinite(x_stored)
 
-            if tuple(int(v) for v in ink_label.shape) == (int(stored_h), int(stored_w)):
-                positive_label_mask = (ink_label > 0)
-            else:
-                # Downsample full-res labels onto the stored tifxyz grid and keep any-positive cells.
-                positive_label_mask = (
-                    cv2.resize(
-                        (ink_label > 0).astype(np.uint8),
-                        (int(stored_w), int(stored_h)),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                    > 0
-                )
+            positive_label_mask = (ink_label > 0)
 
             positive_mask = valid_mask & positive_label_mask
             if not np.any(positive_mask):

@@ -7,8 +7,6 @@
     "bg_dilate_distance": 192,
     "normal_sample_step": 1.0,
     
-    "auto_fix_padding_multiples": [256, 64],
-
     "wrap_mode": "multi_wrap",
 
     "patch_cache_filename": "/home/sean/Documents/data/ink_030226/.tifxyz_patch_cache.json",

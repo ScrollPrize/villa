@@ -60,7 +60,6 @@ def _empty_patch_generation_stats():
         "segments_considered": 0,
         "segments_tried": 0,
         "segments_missing_ink": 0,
-        "segments_autofixed_padding": 0,
         "segments_without_positive_points": 0,
         "candidate_bboxes": 0,
         "rejected_positive_fraction": 0,
@@ -78,55 +77,6 @@ def _normalize_patch_size_zyx(patch_size):
             f"patch_size must be a positive int or [z, y, x], got {patch_size!r}"
         )
     return patch_size_zyx
-
-# we have two "known" padded sizes -- multiples of 64 or 256, which are leftover padding from old inference scripts
-# that were used to generate labels
-def _known_padded_size(base_size, multiple):
-    base_size = int(base_size)
-    multiple = int(multiple)
-    if base_size % multiple == 0:
-        return base_size + multiple
-    return ((base_size + multiple - 1) // multiple) * multiple
-
-
-def _dimension_matches_known_padding(actual, expected, multiple):
-    actual = int(actual)
-    expected = int(expected)
-    if actual == expected:
-        return True
-    if abs(actual - expected) == 1:
-        return True
-    small = min(actual, expected)
-    big = max(actual, expected)
-    return big == _known_padded_size(small, multiple)
-
-# if our dimension matches what we know are common padding multiples, we can remove it
-# though this is kind of risky because unless we actually look at the label every time we dont really know
-# if the padding is correctly removed or added...
-def _fix_known_bottom_right_padding(label, expected_shape, multiples):
-    expected_h, expected_w = int(expected_shape[0]), int(expected_shape[1])
-    actual_h, actual_w = int(label.shape[0]), int(label.shape[1])
-
-    for multiple in multiples:
-        if not _dimension_matches_known_padding(actual_h, expected_h, multiple):
-            continue
-        if not _dimension_matches_known_padding(actual_w, expected_w, multiple):
-            continue
-
-        if (actual_h - expected_h) > 1 and np.any(label[expected_h:actual_h, :] != 0):
-            continue
-        if (actual_w - expected_w) > 1 and np.any(label[:, expected_w:actual_w] != 0):
-            continue
-
-        fixed = label[: min(actual_h, expected_h), : min(actual_w, expected_w)]
-        pad_h = max(0, expected_h - fixed.shape[0])
-        pad_w = max(0, expected_w - fixed.shape[1])
-        if pad_h or pad_w:
-            fixed = np.pad(fixed, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=0)
-        return fixed, int(multiple)
-
-    return None, None
-
 
 def _points_within_bbox(points_zyx, bbox):
     z_min, z_max, y_min, y_max, x_min, x_max = bbox
@@ -186,15 +136,7 @@ def _load_segment_ink_mask(dataset, segment):
         return cached
 
     grid = dataset._get_segment_stored_grid(segment)
-    stored_h, stored_w = tuple(int(v) for v in grid["shape"])
-    segment.use_stored_resolution()
-    scale_y, scale_x = getattr(segment, "_scale", (1.0, 1.0))
-    scale_y = float(scale_y) if np.isfinite(scale_y) and float(scale_y) > 0.0 else 1.0
-    scale_x = float(scale_x) if np.isfinite(scale_x) and float(scale_x) > 0.0 else 1.0
-    expected_shape = (
-        int(stored_h / scale_y),
-        int(stored_w / scale_x),
-    )
+    expected_shape = tuple(int(v) for v in grid["shape"])
     ink_label_path = None
     ink_meta = next(
         (label for label in segment.list_labels() if label.get("name") == "inklabels"),
@@ -221,23 +163,11 @@ def _load_segment_ink_mask(dataset, segment):
         else:
             ink_label = cv2.cvtColor(ink_label, cv2.COLOR_BGR2GRAY)
 
-    if tuple(int(v) for v in ink_label.shape) != expected_shape:
-        fixed_label, _ = _fix_known_bottom_right_padding(
-            ink_label,
-            expected_shape,
-            dataset.auto_fix_padding_multiples,
-        )
-        if fixed_label is not None:
-            ink_label = fixed_label
-        else:
-            ink_label = (
-                cv2.resize(
-                    (ink_label > 0).astype(np.uint8),
-                    (int(expected_shape[1]), int(expected_shape[0])),
-                    interpolation=cv2.INTER_AREA,
-                )
-                > 0
-            ).astype(np.uint8)
+    actual_shape = tuple(int(v) for v in ink_label.shape)
+    assert actual_shape == expected_shape, (
+        f"Segment {segment_uuid!r} ink label shape {actual_shape} does not match "
+        f"tifxyz grid shape {expected_shape}."
+    )
 
     out = np.asarray(ink_label > 0, dtype=bool)
     dataset._segment_ink_mask_cache[segment_uuid] = out

@@ -72,8 +72,6 @@ class TifxyzInkDataset(Dataset):
             config.get("patch_cache_filename", _PATCH_CACHE_DEFAULT_FILENAME)
         )
 
-        self.auto_fix_padding_multiples = [64, 256]                                     # if we find these common leftover padding multiples, we'll remove them
-
         self._segment_grid_cache = {}
         self._segment_ink_mask_cache = {}
         self._segment_surface_supervision_cache = {}
@@ -102,7 +100,6 @@ class TifxyzInkDataset(Dataset):
             patch_finding_workers=self.patch_finding_workers,
             patch_cache_force_recompute=self.patch_cache_force_recompute,               # see vesuvius/src/vesuvius/neural_tracing/inference/generate_segment_cover_bboxes.py  
             patch_cache_filename=self.patch_cache_filename,                             # for info on the bbox generation
-            auto_fix_padding_multiples=self.auto_fix_padding_multiples,
         )
         self._segment_ink_label_path_by_uuid = {}
         for patch in self.patches:
