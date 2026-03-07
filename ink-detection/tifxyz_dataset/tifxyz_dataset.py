@@ -156,7 +156,7 @@ class TifxyzInkDataset(Dataset):
         max_corner = np.array([z1 + 1, y1 + 1, x1 + 1], dtype=np.int32)
         crop_size = tuple(int(v) for v in self.patch_size_zyx)
 
-        # zscore normalization is applied within this function , DO NOT MINMAX NORMALIZE AFTER WITHOUT CONSIDERING THIS
+        # robust normalization is applied within this function; avoid stacking a second intensity normalization on top.
         vol_crop = _read_volume_crop_from_patch_dict(
             patch,
             crop_size=crop_size,

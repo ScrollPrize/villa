@@ -5,7 +5,7 @@ import fsspec
 import numpy as np
 import zarr
 from numba import njit
-from vesuvius.neural_tracing.datasets.common import normalize_zscore
+from vesuvius.image_proc.intensity.normalization import normalize_robust
 
 
 def load_volume_auth(auth_json_path):
@@ -18,13 +18,15 @@ def load_volume_auth(auth_json_path):
 
 
 def open_zarr(path, resolution, user, password):
-    if "volumes.aws.ash2txt.org" in path:
+    path_str = str(path)
+    use_https_auth = path_str.startswith("https://") and bool(user) and bool(password)
+    if use_https_auth:
         fs = fsspec.filesystem(
             "https",
             client_kwargs={"auth": aiohttp.BasicAuth(user, password)},
         )
         store = zarr.storage.FSStore(
-            path.rstrip("/"),
+            path_str.rstrip("/"),
             fs=fs,
             mode="r",
             check=False,
@@ -32,7 +34,7 @@ def open_zarr(path, resolution, user, password):
             exceptions=(KeyError, FileNotFoundError, PermissionError, OSError, aiohttp.ClientResponseError),
         )
         return zarr.open(store, path=str(resolution), mode="r")
-    return zarr.open(path, path=str(resolution), mode="r")
+    return zarr.open(path_str, path=str(resolution), mode="r")
 
 def _normalize_patch_size_zyx(patch_size):
     patch_size_zyx = np.asarray(patch_size, dtype=np.int32).reshape(-1)
@@ -459,7 +461,7 @@ def _build_normal_offset_mask_from_labeled_points(
     )
 
 def _read_volume_crop_from_patch_dict(patch, crop_size, min_corner, max_corner):
-    """Read a [z, y, x] crop from a patch dict and z-score normalize it."""
+    """Read a [z, y, x] crop from a patch dict and robust-normalize it."""
     volume = patch["volume"]
     if not hasattr(volume, "shape"):
         volume = volume[str(int(patch["scale"]))]
@@ -485,4 +487,4 @@ def _read_volume_crop_from_patch_dict(patch, crop_size, min_corner, max_corner):
             src_starts[1]:src_ends[1],
             src_starts[2]:src_ends[2],
         ]
-    return normalize_zscore(vol_crop)
+    return normalize_robust(vol_crop)
