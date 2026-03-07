@@ -240,6 +240,15 @@ def main(argv: list[str] | None = None) -> int:
 
 	data = _load_data()
 
+	# Print loaded data summary
+	Z, Y, X = data.size
+	_data_bytes = sum(t.nbytes for t in [data.cos, data.grad_mag, data.nx, data.ny] if t is not None)
+	if data.pred_dt is not None:
+		_data_bytes += data.pred_dt.nbytes
+	print(f"[fit] data: size=({Z},{Y},{X}) origin={data.origin_fullres} spacing={data.spacing} "
+		  f"pred_dt={data.pred_dt is not None} corr_points={data.corr_points is not None} "
+		  f"mem={_data_bytes / 2**30:.2f} GiB", flush=True)
+
 	# Print initial mesh stats
 	with torch.no_grad():
 		xyz = mdl._grid_xyz()
@@ -285,6 +294,10 @@ def main(argv: list[str] | None = None) -> int:
 		progress_fn=_progress,
 		load_data_fn=_load_data,
 	)
+
+	if device.type == "cuda":
+		peak_gb = torch.cuda.max_memory_allocated(device) / 2**30
+		print(f"[fit] peak GPU memory: {peak_gb:.2f} GiB", flush=True)
 
 	# Save final model
 	if model_cfg.model_output is not None:

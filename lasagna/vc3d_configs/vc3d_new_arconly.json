@@ -1,6 +1,6 @@
 {
 	"base": {
-		"dir": 1.0,
+		"normal": 1.0,
 		"step": 0.0
 	},
 	"stages": [

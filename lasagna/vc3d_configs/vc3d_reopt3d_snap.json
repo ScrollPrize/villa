@@ -1,6 +1,5 @@
 {
 	"base": {
-		"dir": 0.0,
 		"normal": 10.0,
 		"step": 10.0,
 		"smooth": 0.0,

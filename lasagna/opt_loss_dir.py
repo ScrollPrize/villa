@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import torch
 
-import fit_data
 import model as fit_model
 
 
@@ -43,10 +42,9 @@ def normal_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch
 	data_nz = torch.sqrt(torch.clamp(1.0 - data_nx * data_nx - data_ny * data_ny, min=0.0))
 	target = torch.stack([data_nx, data_ny, data_nz], dim=-1)  # (D, Hm-1, Wm-1, 3)
 
-	# Loss: 1 - |dot(normal, target)| via detached sign for clean gradients
+	# Loss: 1 - dot² = sin²(θ), sign-invariant, ≈ θ² for small angles
 	dot = (normal * target).sum(dim=-1)
-	sign = torch.where(dot >= 0, torch.ones_like(dot), -torch.ones_like(dot)).detach()
-	lm = 1.0 - dot * sign
+	lm = 1.0 - dot * dot
 
 	# Mask: grad_mag > 0
 	mask = (data.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=normal.dtype)
@@ -62,11 +60,3 @@ def normal_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torc
 	return loss, (lm,), (mask,)
 
 
-def dir_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch.Tensor]:
-	"""Direction loss maps — delegates to normal_loss_maps."""
-	return normal_loss_maps(res=res)
-
-
-def dir_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Direction loss — delegates to normal_loss."""
-	return normal_loss(res=res)

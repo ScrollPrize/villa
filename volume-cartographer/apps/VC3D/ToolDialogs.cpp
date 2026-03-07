@@ -1523,12 +1523,10 @@ VisLasagnaObjDialog::VisLasagnaObjDialog(QWidget* parent, const QString& outputD
     // Losses
     auto lossGroup = new QGroupBox("Loss Maps", this);
     auto lossLayout = new QVBoxLayout(lossGroup);
-    chkLossDir_ = new QCheckBox("dir", this); chkLossDir_->setChecked(true);
     chkLossStep_ = new QCheckBox("step", this); chkLossStep_->setChecked(true);
     chkLossSmooth_ = new QCheckBox("smooth", this); chkLossSmooth_->setChecked(true);
     chkLossWinding_ = new QCheckBox("winding_density", this); chkLossWinding_->setChecked(true);
     chkLossNormal_ = new QCheckBox("normal", this); chkLossNormal_->setChecked(true);
-    lossLayout->addWidget(chkLossDir_);
     lossLayout->addWidget(chkLossStep_);
     lossLayout->addWidget(chkLossSmooth_);
     lossLayout->addWidget(chkLossWinding_);
@@ -1576,7 +1574,6 @@ QStringList VisLasagnaObjDialog::channels() const {
 
 QStringList VisLasagnaObjDialog::losses() const {
     QStringList r;
-    if (chkLossDir_->isChecked()) r << QStringLiteral("dir");
     if (chkLossStep_->isChecked()) r << QStringLiteral("step");
     if (chkLossSmooth_->isChecked()) r << QStringLiteral("smooth");
     if (chkLossWinding_->isChecked()) r << QStringLiteral("winding_density");

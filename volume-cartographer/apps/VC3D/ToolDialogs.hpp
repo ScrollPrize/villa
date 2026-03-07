@@ -398,7 +398,6 @@ private:
     QCheckBox* chkYZ_{nullptr};
     QCheckBox* chkCos_{nullptr};
     QCheckBox* chkGradMag_{nullptr};
-    QCheckBox* chkLossDir_{nullptr};
     QCheckBox* chkLossStep_{nullptr};
     QCheckBox* chkLossSmooth_{nullptr};
     QCheckBox* chkLossWinding_{nullptr};

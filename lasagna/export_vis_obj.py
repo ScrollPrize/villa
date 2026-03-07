@@ -293,7 +293,6 @@ def _slice_corners(plane: str, bbox_min: np.ndarray, bbox_max: np.ndarray,
 # ---------------------------------------------------------------------------
 
 _LOSS_FUNCS = {
-	"dir": opt_loss_dir.dir_loss,
 	"step": opt_loss_step.step_loss,
 	"smooth": opt_loss_smooth.smooth_loss,
 	"winding_density": opt_loss_winding_density.winding_density_loss,
