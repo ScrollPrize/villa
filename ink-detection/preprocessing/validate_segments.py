@@ -18,6 +18,7 @@ import zarr
 
 TIFF_SUFFIXES = {".tif", ".tiff"}
 LABEL_NAME_TOKENS = ("_inklabels", "_supervision_mask")
+REQUIRED_LABEL_NAME_TOKENS = ("_inklabels", "_supervision_mask")
 ALLOWED_BINARY_LABEL_VALUES = frozenset({0, 1, 255})
 
 
@@ -244,7 +245,24 @@ def check_segment(segment_dir: Path) -> SegmentResult:
         issues.append(ShapeIssue(zarr_path, f"Failed to read Zarr shape: {exc}"))
         return SegmentResult(segment_dir=segment_dir, expected_shape=None, issues=tuple(issues))
 
-    for tiff_path in iter_target_tiffs(segment_dir):
+    target_tiffs = list(iter_target_tiffs(segment_dir))
+    present_label_tokens = {
+        token
+        for token in REQUIRED_LABEL_NAME_TOKENS
+        if any(token in tiff_path.name.lower() for tiff_path in target_tiffs)
+    }
+    missing_label_tokens = [
+        token for token in REQUIRED_LABEL_NAME_TOKENS if token not in present_label_tokens
+    ]
+    for token in missing_label_tokens:
+        issues.append(
+            ShapeIssue(
+                segment_dir,
+                f"missing required label TIFF containing '{token}'",
+            )
+        )
+
+    for tiff_path in target_tiffs:
         try:
             tiff_shape = read_tiff_shape(tiff_path)
         except Exception as exc:
