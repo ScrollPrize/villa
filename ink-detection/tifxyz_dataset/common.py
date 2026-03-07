@@ -5,12 +5,8 @@ import os
 import fsspec
 import numpy as np
 import zarr
+from numba import njit
 from vesuvius.neural_tracing.datasets.common import normalize_zscore
-
-try:
-    from numba import njit
-except Exception:  # pragma: no cover - optional dependency
-    njit = None
 
 
 def _resolve_auth_json_path(auth_json_path, config):
@@ -460,7 +456,6 @@ def _voxelize_class_projection_from_sample(
         label_distance=(pos_distance, neg_distance),
         sample_step=float(dataset.normal_sample_step),
         trilinear_threshold=float(dataset.normal_trilinear_threshold),
-        use_numba=bool(dataset.use_numba_for_normal_mask),
     )
 
 
@@ -548,53 +543,50 @@ def _build_surface_label_volume(positive_label_vox, background_label_vox, crop_s
     return out
 
 
-if njit is not None:
-    @njit(cache=True)
-    def _splat_points_trilinear_numba(points, size_z, size_y, size_x):
-        vox = np.zeros((size_z, size_y, size_x), dtype=np.float32)
-        n_points = points.shape[0]
-        for i in range(n_points):
-            pz = points[i, 0]
-            py = points[i, 1]
-            px = points[i, 2]
-            if not (np.isfinite(pz) and np.isfinite(py) and np.isfinite(px)):
+@njit(cache=True)
+def _splat_points_trilinear_numba(points, size_z, size_y, size_x):
+    vox = np.zeros((size_z, size_y, size_x), dtype=np.float32)
+    n_points = points.shape[0]
+    for i in range(n_points):
+        pz = points[i, 0]
+        py = points[i, 1]
+        px = points[i, 2]
+        if not (np.isfinite(pz) and np.isfinite(py) and np.isfinite(px)):
+            continue
+
+        z0 = int(np.floor(pz))
+        y0 = int(np.floor(py))
+        x0 = int(np.floor(px))
+        dz = pz - z0
+        dy = py - y0
+        dx = px - x0
+
+        for oz in range(2):
+            zi = z0 + oz
+            if zi < 0 or zi >= size_z:
                 continue
-
-            z0 = int(np.floor(pz))
-            y0 = int(np.floor(py))
-            x0 = int(np.floor(px))
-            dz = pz - z0
-            dy = py - y0
-            dx = px - x0
-
-            for oz in range(2):
-                zi = z0 + oz
-                if zi < 0 or zi >= size_z:
+            wz = (1.0 - dz) if oz == 0 else dz
+            if wz <= 0.0:
+                continue
+            for oy in range(2):
+                yi = y0 + oy
+                if yi < 0 or yi >= size_y:
                     continue
-                wz = (1.0 - dz) if oz == 0 else dz
-                if wz <= 0.0:
+                wy = (1.0 - dy) if oy == 0 else dy
+                if wy <= 0.0:
                     continue
-                for oy in range(2):
-                    yi = y0 + oy
-                    if yi < 0 or yi >= size_y:
+                for ox in range(2):
+                    xi = x0 + ox
+                    if xi < 0 or xi >= size_x:
                         continue
-                    wy = (1.0 - dy) if oy == 0 else dy
-                    if wy <= 0.0:
+                    wx = (1.0 - dx) if ox == 0 else dx
+                    if wx <= 0.0:
                         continue
-                    for ox in range(2):
-                        xi = x0 + ox
-                        if xi < 0 or xi >= size_x:
-                            continue
-                        wx = (1.0 - dx) if ox == 0 else dx
-                        if wx <= 0.0:
-                            continue
-                        vox[zi, yi, xi] += wz * wy * wx
-        return vox
-else:  # pragma: no cover - only used when numba missing
-    _splat_points_trilinear_numba = None
+                    vox[zi, yi, xi] += wz * wy * wx
+    return vox
 
 
-def _points_to_voxels_trilinear(points_local, crop_size, threshold=1e-4, use_numba=True):
+def _points_to_voxels_trilinear(points_local, crop_size, threshold=1e-4):
     crop_size_arr = np.asarray(crop_size, dtype=np.int64).reshape(3)
     crop_size_tuple = tuple(int(v) for v in crop_size_arr.tolist())
     points = np.asarray(points_local, dtype=np.float32)
@@ -606,44 +598,12 @@ def _points_to_voxels_trilinear(points_local, crop_size, threshold=1e-4, use_num
         return np.zeros(crop_size_tuple, dtype=np.float32)
     points = points[finite]
 
-    if use_numba and _splat_points_trilinear_numba is not None:
-        vox_accum = _splat_points_trilinear_numba(
-            points,
-            int(crop_size_arr[0]),
-            int(crop_size_arr[1]),
-            int(crop_size_arr[2]),
-        )
-        return (vox_accum > float(threshold)).astype(np.float32, copy=False)
-
-    vox_accum = np.zeros(crop_size_tuple, dtype=np.float32)
-    base = np.floor(points).astype(np.int64, copy=False)
-    frac = points - base.astype(np.float32, copy=False)
-
-    for oz in (0, 1):
-        z_idx = base[:, 0] + oz
-        wz = (1.0 - frac[:, 0]) if oz == 0 else frac[:, 0]
-        for oy in (0, 1):
-            y_idx = base[:, 1] + oy
-            wy = (1.0 - frac[:, 1]) if oy == 0 else frac[:, 1]
-            for ox in (0, 1):
-                x_idx = base[:, 2] + ox
-                wx = (1.0 - frac[:, 2]) if ox == 0 else frac[:, 2]
-                w = wz * wy * wx
-                valid = (
-                    (w > 0.0)
-                    & (z_idx >= 0)
-                    & (z_idx < crop_size_arr[0])
-                    & (y_idx >= 0)
-                    & (y_idx < crop_size_arr[1])
-                    & (x_idx >= 0)
-                    & (x_idx < crop_size_arr[2])
-                )
-                if bool(np.any(valid)):
-                    np.add.at(
-                        vox_accum,
-                        (z_idx[valid], y_idx[valid], x_idx[valid]),
-                        w[valid].astype(np.float32, copy=False),
-                    )
+    vox_accum = _splat_points_trilinear_numba(
+        points,
+        int(crop_size_arr[0]),
+        int(crop_size_arr[1]),
+        int(crop_size_arr[2]),
+    )
     return (vox_accum > float(threshold)).astype(np.float32, copy=False)
 
 
@@ -816,30 +776,25 @@ def _build_normal_offset_mask_from_labeled_points(
     label_distance,
     sample_step=0.5,
     trilinear_threshold=1e-4,
-    use_numba=True,
 ):
     points = np.asarray(points_world_zyx, dtype=np.float32)
     normals = np.asarray(normals_zyx, dtype=np.float32)
     crop_size_arr = np.asarray(crop_size, dtype=np.int64).reshape(3)
     crop_size_tuple = tuple(int(v) for v in crop_size_arr.tolist())
-    if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
-        return np.zeros(crop_size_tuple, dtype=np.float32)
-    if normals.ndim != 2 or normals.shape != points.shape:
-        return np.zeros(crop_size_tuple, dtype=np.float32)
+    assert points.ndim == 2 and points.shape[1] == 3 and points.shape[0] > 0, (
+        f"points_world_zyx must have shape [n, 3] with n > 0, got {points.shape!r}"
+    )
+    assert normals.ndim == 2 and normals.shape == points.shape, (
+        f"normals_zyx must match points_world_zyx shape {points.shape!r}, got {normals.shape!r}"
+    )
 
     if np.isscalar(label_distance):
         pos_distance = float(label_distance)
         neg_distance = float(label_distance)
     else:
         distance_arr = np.asarray(label_distance, dtype=np.float32).reshape(-1)
-        if int(distance_arr.size) != 2:
-            raise ValueError(
-                f"label_distance must be a scalar or [positive, negative], got {label_distance!r}"
-            )
         pos_distance = float(distance_arr[0])
         neg_distance = float(distance_arr[1])
-    if not np.isfinite(pos_distance) or not np.isfinite(neg_distance):
-        raise ValueError(f"label_distance values must be finite, got {label_distance!r}")
     pos_distance = max(0.0, pos_distance)
     neg_distance = max(0.0, neg_distance)
 
@@ -849,8 +804,7 @@ def _build_normal_offset_mask_from_labeled_points(
 
     n_norm = np.linalg.norm(normals, axis=1)
     valid = np.isfinite(points).all(axis=1) & np.isfinite(normals).all(axis=1) & (n_norm > 1e-6)
-    if not bool(np.any(valid)):
-        return np.zeros(crop_size_tuple, dtype=np.float32)
+    assert bool(np.any(valid)), "points_world_zyx/normals_zyx must contain at least one finite point with a non-zero normal"
 
     points = points[valid]
     normals = normals[valid] / n_norm[valid, None]
@@ -869,7 +823,6 @@ def _build_normal_offset_mask_from_labeled_points(
         local_points,
         crop_size_tuple,
         threshold=trilinear_threshold,
-        use_numba=bool(use_numba),
     )
 
 # simple "dominant" span finder

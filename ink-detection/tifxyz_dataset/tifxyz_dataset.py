@@ -45,7 +45,6 @@ class TifxyzInkDataset(Dataset):
         self.label_distance_max = max(self.label_distance_pos, self.label_distance_neg)
         self.normal_sample_step = float(config.get("normal_sample_step", 0.5))
         self.normal_trilinear_threshold = float(config.get("normal_trilinear_threshold", 1e-4))
-        self.use_numba_for_normal_mask = bool(config.get("use_numba_for_normal_mask", True))
         self.surface_bbox_pad = float(config.get("surface_bbox_pad", 2.0))
         if self.surface_bbox_pad < 0.0:
             self.surface_bbox_pad = 0.0
@@ -297,7 +296,6 @@ class TifxyzInkDataset(Dataset):
                 label_distance=(self.bg_distance_pos, self.bg_distance_neg),
                 sample_step=float(self.normal_sample_step),
                 trilinear_threshold=float(self.normal_trilinear_threshold),
-                use_numba=bool(self.use_numba_for_normal_mask),
             )
 
         return _voxelize_surface_from_sampled_grid(
