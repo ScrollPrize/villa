@@ -138,11 +138,9 @@ def _get_labels_and_mask(dataset, segment):
     shape = tuple(int(v) for v in dataset._get_segment_stored_grid(segment)["shape"])
 
     def read_mask(path, label_name):
-        if not path:
-            return np.zeros(shape, dtype=bool)
+        assert path, f"Segment {segment_uuid!r} must contain {label_name} mask."
         mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-        if mask is None:
-            return np.zeros(shape, dtype=bool)
+        assert mask is not None, f"Segment {segment_uuid!r} failed to read {label_name} mask: {path}"
         if mask.ndim == 3:
             if mask.shape[2] == 4:
                 mask = cv2.cvtColor(mask, cv2.COLOR_BGRA2GRAY)
@@ -155,26 +153,19 @@ def _get_labels_and_mask(dataset, segment):
         )
         return np.asarray(mask > 0, dtype=bool)
 
-    ink_meta = next(
-        (label for label in segment.list_labels() if label.get("name") == "inklabels"),
+    ink_label_path = next(
+        (
+            str(label["path"])
+            for label in segment.list_labels()
+            if label.get("name") == "inklabels" and label.get("path") is not None
+        ),
         None,
     )
-    ink_label_path = None if ink_meta is None else ink_meta.get("path")
     assert ink_label_path is not None, f"Segment {segment_uuid!r} must contain inklabels."
-
-    ink_label_path = str(ink_label_path)
-    stem, ext = os.path.splitext(ink_label_path)
-    prefix = stem[:-len("_inklabels")] if stem.endswith("_inklabels") else stem
-    candidate_exts = []
-    for candidate_ext in (ext, ".png", ".tif", ".tiff"):
-        if candidate_ext and candidate_ext not in candidate_exts:
-            candidate_exts.append(candidate_ext)
-    supervision_path = None
-    for candidate_ext in candidate_exts:
-        candidate = f"{prefix}_supervision_mask{candidate_ext}"
-        if os.path.exists(candidate):
-            supervision_path = candidate
-            break
+    assert "_inklabels" in ink_label_path, (
+        f"Segment {segment_uuid!r} inklabels path has unexpected name: {ink_label_path}"
+    )
+    supervision_path = ink_label_path.replace("_inklabels", "_supervision_mask")
 
     ink_mask = read_mask(ink_label_path, "ink")
     supervision_mask = read_mask(supervision_path, "supervision")
