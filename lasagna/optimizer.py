@@ -261,6 +261,16 @@ def optimize(
 			if hasattr(model, "arc_enabled") and model.arc_enabled:
 				model.bake_arc_into_mesh()
 
+		# If min_scaledown > 0, reconstruct pyramid and zero fine levels
+		if "mesh_ms" in opt_cfg.params and opt_cfg.min_scaledown > 0:
+			k0 = opt_cfg.min_scaledown
+			with torch.no_grad():
+				flat = model._integrate_pyramid_3d(model.mesh_ms, pyramid_d=model.pyramid_d)
+				model.mesh_ms = model._construct_pyramid_from_flat_3d(
+					flat, len(model.mesh_ms), pyramid_d=model.pyramid_d)
+				for pi in range(min(k0, len(model.mesh_ms))):
+					model.mesh_ms[pi].zero_()
+
 		all_params = model.opt_params()
 		param_groups: list[dict] = []
 		for name in opt_cfg.params:

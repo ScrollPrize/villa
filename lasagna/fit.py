@@ -266,6 +266,12 @@ def main(argv: list[str] | None = None) -> int:
 		if mdl.arc_enabled:
 			mdl.bake_arc_into_mesh()
 		st = dict(mdl.state_dict())
+		# Store flat mesh instead of pyramid levels
+		ms_keys = [k for k in st if k.startswith("mesh_ms.")]
+		for k in ms_keys:
+			del st[k]
+		with torch.no_grad():
+			st["mesh_flat"] = mdl.mesh_coarse().detach().clone()
 		st["_model_params_"] = asdict(mdl.params)
 		st["_fit_config_"] = fit_config
 		corr_results = opt_loss_corr.get_last_results()

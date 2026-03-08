@@ -39,7 +39,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--arc-angle-start", type=float, default=-0.5)
 	g.add_argument("--arc-angle-end", type=float, default=0.5)
 	g.add_argument("--z-center", type=float, default=0.0)
-	g.add_argument("--pyramid-d", action="store_true", default=False)
+	g.add_argument("--pyramid-d", action="store_true", default=True)
 	g.add_argument("--model-input", default=None)
 	g.add_argument("--model-output", default=None)
 

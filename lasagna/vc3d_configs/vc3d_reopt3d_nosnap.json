@@ -1,6 +1,6 @@
 {
 	"base": {
-		"normal": 100.0,
+		"normal": 10.0,
 		"step": 10.0,
 		"smooth": 0.1,
 		"winding_density": 1.0,

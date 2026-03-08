@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -113,6 +114,7 @@ class Model3D(nn.Module):
 				shapes.append((max(2, (dp + 1) // 2), max(2, (hp + 1) // 2), max(2, (wp + 1) // 2)))
 			else:
 				shapes.append((dp, max(2, (hp + 1) // 2), max(2, (wp + 1) // 2)))
+		print(f"[model] pyramid levels (C={channels}, pyramid_d={pyramid_d}): {' -> '.join(f'{d}x{h}x{w}' for d,h,w in shapes)}")
 		return nn.ParameterList([
 			nn.Parameter(torch.zeros(channels, di, hi, wi, device=device, dtype=torch.float32))
 			for di, hi, wi in shapes
@@ -123,11 +125,11 @@ class Model3D(nn.Module):
 	@staticmethod
 	def _upsample_crop(src: torch.Tensor, d_t: int, h_t: int, w_t: int, *, pyramid_d: bool) -> torch.Tensor:
 		if pyramid_d:
-			up = F.interpolate(src.unsqueeze(0), scale_factor=2.0, mode='trilinear', align_corners=True).squeeze(0)
-			return up[:, :d_t, :h_t, :w_t]
+			return F.interpolate(src.unsqueeze(0), size=(d_t, h_t, w_t),
+								mode='trilinear', align_corners=True).squeeze(0)
 		else:
-			up = F.interpolate(src, scale_factor=2.0, mode='bilinear', align_corners=True)
-			return up[:, :, :h_t, :w_t]
+			return F.interpolate(src, size=(h_t, w_t),
+								mode='bilinear', align_corners=True)
 
 	@staticmethod
 	def _integrate_pyramid_3d(src: nn.ParameterList, *, pyramid_d: bool) -> torch.Tensor:
@@ -554,9 +556,20 @@ class Model3D(nn.Module):
 	def from_checkpoint(cls, state_dict: dict, *, device: torch.device) -> 'Model3D':
 		"""Construct a Model3D from a saved checkpoint state_dict."""
 		mp = state_dict["_model_params_"]
-		mesh0 = state_dict["mesh_ms.0"]
-		_c, D, H, W = (int(v) for v in mesh0.shape)
-		saved_pyramid_d = bool(mp.get("pyramid_d", False))
+		# Get flat mesh — either directly stored or integrated from old pyramid
+		if "mesh_flat" in state_dict:
+			flat = state_dict["mesh_flat"].to(device=device, dtype=torch.float32)
+		else:
+			# Legacy: integrate pyramid levels
+			saved_pyramid_d = bool(mp.get("pyramid_d", False))
+			n_levels = sum(1 for k in state_dict if k.startswith("mesh_ms.") and k[len("mesh_ms."):].isdigit())
+			old_levels = nn.ParameterList([
+				nn.Parameter(state_dict[f"mesh_ms.{i}"].to(device=device, dtype=torch.float32))
+				for i in range(n_levels)
+			])
+			flat = cls._integrate_pyramid_3d(old_levels, pyramid_d=saved_pyramid_d)
+			print(f"[model] integrated legacy pyramid ({n_levels} levels, pyramid_d={saved_pyramid_d}) to flat mesh")
+		_c, D, H, W = (int(v) for v in flat.shape)
 		mdl = cls(
 			device=device,
 			depth=D,
@@ -571,21 +584,12 @@ class Model3D(nn.Module):
 			volume_extent=mp.get("volume_extent"),
 			pyramid_d=True,
 		)
-		if not saved_pyramid_d:
-			# Checkpoint was saved with pyramid_d=False — D is constant across levels.
-			# Integrate old pyramid, then rebuild with pyramid_d=True.
-			n_levels = sum(1 for k in state_dict if k.startswith("mesh_ms.") and k[len("mesh_ms."):].isdigit())
-			old_levels = nn.ParameterList([
-				nn.Parameter(state_dict[f"mesh_ms.{i}"].to(device=device, dtype=torch.float32))
-				for i in range(n_levels)
-			])
-			flat = cls._integrate_pyramid_3d(old_levels, pyramid_d=False)
-			mdl.mesh_ms = cls._construct_pyramid_from_flat_3d(flat, n_levels, pyramid_d=True)
-			# Load remaining state (skip mesh_ms keys handled above)
-			st_rest = {k: v for k, v in state_dict.items() if not k.startswith("mesh_ms.")}
-			mdl.load_state_dict_compat(st_rest, strict=False)
-			print(f"[model] rebuilt mesh pyramid with pyramid_d=True from old pyramid_d=False checkpoint")
-		else:
-			mdl.load_state_dict_compat(state_dict, strict=False)
+		# Reconstruct pyramid from flat
+		n_scales = len(mdl.mesh_ms)
+		mdl.mesh_ms = cls._construct_pyramid_from_flat_3d(flat, n_scales, pyramid_d=True)
+		# Load remaining state (skip mesh keys)
+		st_rest = {k: v for k, v in state_dict.items()
+				   if not k.startswith("mesh_ms.") and k != "mesh_flat"}
+		mdl.load_state_dict_compat(st_rest, strict=False)
 		mdl.arc_enabled = False
 		return mdl

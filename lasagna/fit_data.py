@@ -170,6 +170,65 @@ def load_3d_for_model(
 	return data
 
 
+def _blur_normals_tensor(data: FitData3D, _blur_separable) -> None:
+	"""Smooth nx/ny in-place using sign-invariant outer-product tensor representation."""
+	nx_t = data.nx
+	ny_t = data.ny
+	if nx_t is None or ny_t is None:
+		return
+
+	Z, Y, X = nx_t.shape[2], nx_t.shape[3], nx_t.shape[4]
+	dev = nx_t.device
+
+	def _decode(t, zi, ze):
+		return (t[:, :, zi:ze].float() - 128.0) / 127.0
+
+	def _blur_product_to_cpu(chunk_fn):
+		"""Build product volume from uint8 chunks, blur on GPU, return float16 on CPU."""
+		vol = torch.empty(1, 1, Z, Y, X, dtype=torch.float32, device=dev)
+		for zi in range(0, Z, 16):
+			ze = min(zi + 16, Z)
+			vol[:, :, zi:ze] = chunk_fn(zi, ze)
+		_blur_separable(vol)
+		result = vol.half().cpu()
+		del vol
+		return result
+
+	def _nz(zi, ze):
+		nx_c = _decode(nx_t, zi, ze)
+		ny_c = _decode(ny_t, zi, ze)
+		return torch.sqrt((1.0 - nx_c * nx_c - ny_c * ny_c).clamp(min=0.0))
+
+	# Compute and blur 6 outer-product tensor components one at a time.
+	# Products are built from uint8 in chunks (no full float32 decoded volumes).
+	# Each blurred result is stored as float16 on CPU to free GPU memory.
+	xx = _blur_product_to_cpu(lambda zi, ze: _decode(nx_t, zi, ze) ** 2)
+	xy = _blur_product_to_cpu(lambda zi, ze: _decode(nx_t, zi, ze) * _decode(ny_t, zi, ze))
+	yy = _blur_product_to_cpu(lambda zi, ze: _decode(ny_t, zi, ze) ** 2)
+	xz = _blur_product_to_cpu(lambda zi, ze: _decode(nx_t, zi, ze) * _nz(zi, ze))
+	yz = _blur_product_to_cpu(lambda zi, ze: _decode(ny_t, zi, ze) * _nz(zi, ze))
+	zz = _blur_product_to_cpu(lambda zi, ze: _nz(zi, ze) ** 2)
+
+	# Extract dominant eigenvector per Z-slice via power iteration.
+	# Avoids cuSOLVER eigh which has huge workspace / internal errors for large batches.
+	for zi in range(Z):
+		# Load tensor components from CPU to GPU as float32
+		c0 = torch.stack([xx[0, 0, zi].reshape(-1), xy[0, 0, zi].reshape(-1), xz[0, 0, zi].reshape(-1)], dim=-1).to(dev, dtype=torch.float32)
+		c1 = torch.stack([xy[0, 0, zi].reshape(-1), yy[0, 0, zi].reshape(-1), yz[0, 0, zi].reshape(-1)], dim=-1).to(dev, dtype=torch.float32)
+		c2 = torch.stack([xz[0, 0, zi].reshape(-1), yz[0, 0, zi].reshape(-1), zz[0, 0, zi].reshape(-1)], dim=-1).to(dev, dtype=torch.float32)
+		# Power iteration: v ← M v / |M v|, 8 iters converges for 3x3 with separated eigenvalues
+		v = c0  # (N, 3) — initialize with first column
+		for _ in range(8):
+			Mv = v[:, 0:1] * c0 + v[:, 1:2] * c1 + v[:, 2:3] * c2  # (N, 3)
+			v = Mv / (Mv.norm(dim=-1, keepdim=True) + 1e-12)
+		# Hemisphere convention: flip if nz < 0
+		flip = (v[:, 2] < 0).unsqueeze(-1)
+		v = torch.where(flip, -v, v)
+		# Re-encode to uint8 directly into data tensors
+		nx_t[0, 0, zi] = (v[:, 0].view(Y, X) * 127.0 + 128.0).round().clamp(0, 255).to(torch.uint8)
+		ny_t[0, 0, zi] = (v[:, 1].view(Y, X) * 127.0 + 128.0).round().clamp(0, 255).to(torch.uint8)
+
+
 def blur_3d(data: FitData3D, sigma: float) -> None:
 	"""Apply separable 3D Gaussian blur in-place to all uint8 data channels."""
 	radius = int(math.ceil(2 * sigma))
@@ -180,22 +239,62 @@ def blur_3d(data: FitData3D, sigma: float) -> None:
 	k1d = k1d / k1d.sum()
 
 	def _blur_separable(t: torch.Tensor) -> torch.Tensor:
-		# t: (1, 1, Z, Y, X) float32
-		v = t
+		"""Separable 3D Gaussian blur with chunked conv3d to limit peak memory."""
+		v = t  # (1, 1, Z, Y, X) float32 — modified in-place
+		Z, Y, X = v.shape[2], v.shape[3], v.shape[4]
 		kz = k1d.view(1, 1, ks, 1, 1)
-		v = F.conv3d(F.pad(v, (0, 0, 0, 0, radius, radius), mode='reflect'), kz)
 		ky = k1d.view(1, 1, 1, ks, 1)
-		v = F.conv3d(F.pad(v, (0, 0, radius, radius, 0, 0), mode='reflect'), ky)
 		kx = k1d.view(1, 1, 1, 1, ks)
-		v = F.conv3d(F.pad(v, (radius, radius, 0, 0, 0, 0), mode='reflect'), kx)
+		# Z-blur: iterate over Y-chunks (each Y-row is independent along Z)
+		for yi in range(0, Y, 64):
+			ye = min(yi + 64, Y)
+			s = v[:, :, :, yi:ye, :].contiguous()
+			s = F.conv3d(F.pad(s, (0, 0, 0, 0, radius, radius), mode='reflect'), kz)
+			v[:, :, :, yi:ye, :] = s
+		# Y+X blur: iterate over Z-chunks (Y and X kernels don't cross Z)
+		for zi in range(0, Z, 16):
+			ze = min(zi + 16, Z)
+			s = v[:, :, zi:ze, :, :].contiguous()
+			s = F.conv3d(F.pad(s, (0, 0, radius, radius, 0, 0), mode='reflect'), ky)
+			s = F.conv3d(F.pad(s, (radius, radius, 0, 0, 0, 0), mode='reflect'), kx)
+			v[:, :, zi:ze, :, :] = s
 		return v
 
-	# Blur all signal channels in-place (u8 -> float -> blur -> clamp -> u8)
-	for name in ("cos", "grad_mag", "nx", "ny"):
-		t = getattr(data, name)
-		if t is not None:
-			blurred = _blur_separable(t.float())
-			t.copy_(blurred.round().clamp(0, 255).to(torch.uint8))
+	def _blur_to_u8(src_u8: torch.Tensor) -> None:
+		"""Blur float copy of src_u8 in-place and write back as uint8."""
+		blurred = _blur_separable(src_u8.float())
+		blurred.round_().clamp_(0, 255)
+		Z = blurred.shape[2]
+		for zi in range(0, Z, 16):
+			ze = min(zi + 16, Z)
+			src_u8[:, :, zi:ze] = blurred[:, :, zi:ze].byte()
+		del blurred
+
+	# Blur scalar channels
+	t_cos = data.cos
+	if t_cos is not None:
+		_blur_to_u8(t_cos)
+
+	t_gm = data.grad_mag
+	if t_gm is not None:
+		# grad_mag == 0 encodes invalid voxels; save mask before blur (uint8 to save memory)
+		invalid_u8 = (t_gm == 0).byte()
+		_blur_to_u8(t_gm)
+		# Dilate invalid region by blur radius, chunked along Z to limit memory
+		Z = t_gm.shape[2]
+		for zi in range(0, Z, 16):
+			ze = min(zi + 16, Z)
+			z0 = max(zi - radius, 0)
+			z1 = min(ze + radius, Z)
+			chunk_f = invalid_u8[:, :, z0:z1].float()
+			dilated = F.max_pool3d(chunk_f, kernel_size=ks, stride=1, padding=radius)
+			out_start = zi - z0
+			out_end = out_start + (ze - zi)
+			t_gm[:, :, zi:ze][dilated[:, :, out_start:out_end] > 0.5] = 0
+		del invalid_u8
+
+	# Blur normals with sign-invariant tensor method
+	_blur_normals_tensor(data, _blur_separable)
 
 
 def get_preprocessed_params(path: str) -> dict | None:
