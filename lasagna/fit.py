@@ -223,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
 	def _load_data() -> fit_data.FitData3D:
 		d = fit_data.load_3d_for_model(
 			path=str(data_cfg.input), device=device, model=mdl,
+			cuda_gridsample=data_cfg.cuda_gridsample,
 		)
 		Z, Y, X = d.size
 		volume_extent = (

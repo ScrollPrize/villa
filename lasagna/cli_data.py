@@ -16,6 +16,7 @@ class DataConfig:
 	crop: tuple[int, int, int, int, int, int] | None  # (x, y, z, w, h, d) fullres
 	bbox: tuple[int, int, int, int, int] | None        # (cx, cy, cz, w, h) fullres seed
 	z_size: int | None                                  # z extent in fullres voxels
+	cuda_gridsample: bool                               # use custom CUDA uint8 grid_sample kernel
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -31,6 +32,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
 		help="Seed bbox: center + XY size in fullres voxels")
 	g.add_argument("--z-size", type=int, default=None,
 		help="Z extent in fullres voxels (used with --bbox)")
+	g.add_argument("--cuda-gridsample", type=int, default=1,
+		help="Use custom CUDA uint8 grid_sample kernel (1=yes, 0=fallback to PyTorch F.grid_sample)")
 
 
 def from_args(args: argparse.Namespace) -> DataConfig:
@@ -54,6 +57,7 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		crop=crop,
 		bbox=bbox,
 		z_size=z_size,
+		cuda_gridsample=bool(int(getattr(args, "cuda_gridsample", 1))),
 	)
 
 
@@ -63,4 +67,5 @@ def load_fit_data(cfg: DataConfig) -> fit_data.FitData3D:
 		device=torch.device(cfg.device),
 		downscale=cfg.downscale,
 		crop=cfg.crop,
+		cuda_gridsample=cfg.cuda_gridsample,
 	)

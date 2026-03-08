@@ -28,6 +28,7 @@ class FitData3D:
 	origin_fullres: tuple[float, float, float]  # (x0, y0, z0) in fullres voxels
 	spacing: tuple[float, float, float]          # (sx, sy, sz) voxel size in fullres units
 	grad_mag_scale: float = 255.0                # encoding scale for grad_mag channel
+	cuda_gridsample: bool = True                  # use custom CUDA uint8 kernel vs PyTorch F.grid_sample
 
 	@property
 	def size(self) -> tuple[int, int, int]:
@@ -38,11 +39,17 @@ class FitData3D:
 		return int(z), int(y), int(x)
 
 	def grid_sample_fullres(self, xyz_fullres: torch.Tensor) -> "FitData3D":
-		"""Sample at fullres positions using custom CUDA uint8 kernel.
+		"""Sample at fullres positions.
 
 		xyz_fullres: (D, H, W, 3) where last dim is (x, y, z) in fullres coords.
 		Returns FitData3D with float32 decoded values in (1, 1, D, H, W).
+		Uses custom CUDA uint8 kernel when cuda_gridsample=True, else PyTorch F.grid_sample.
 		"""
+		if self.cuda_gridsample:
+			return self._grid_sample_cuda(xyz_fullres)
+		return self._grid_sample_torch(xyz_fullres)
+
+	def _grid_sample_cuda(self, xyz_fullres: torch.Tensor) -> "FitData3D":
 		import importlib.util, os
 		_spec = importlib.util.spec_from_file_location(
 			"grid_sample_3d_u8",
@@ -73,6 +80,37 @@ class FitData3D:
 			origin_fullres=self.origin_fullres,
 			spacing=self.spacing,
 			grad_mag_scale=self.grad_mag_scale,
+			cuda_gridsample=self.cuda_gridsample,
+		)
+
+	def _grid_sample_torch(self, xyz_fullres: torch.Tensor) -> "FitData3D":
+		Z, Y, X = self.size
+		grid = xyz_fullres.clone()
+		grid[..., 0] = (grid[..., 0] - self.origin_fullres[0]) / self.spacing[0]
+		grid[..., 1] = (grid[..., 1] - self.origin_fullres[1]) / self.spacing[1]
+		grid[..., 2] = (grid[..., 2] - self.origin_fullres[2]) / self.spacing[2]
+		grid[..., 0] = grid[..., 0] / max(1, X - 1) * 2 - 1
+		grid[..., 1] = grid[..., 1] / max(1, Y - 1) * 2 - 1
+		grid[..., 2] = grid[..., 2] / max(1, Z - 1) * 2 - 1
+		grid_5d = grid.unsqueeze(0)
+
+		def _gs(t: torch.Tensor | None, decode) -> torch.Tensor | None:
+			if t is None:
+				return None
+			t_f = decode(t.float())
+			return F.grid_sample(t_f, grid_5d, mode="bilinear", padding_mode="zeros", align_corners=True)
+
+		return FitData3D(
+			cos=_gs(self.cos, lambda t: t / 255.0),
+			grad_mag=_gs(self.grad_mag, lambda t: t / self.grad_mag_scale),
+			nx=_gs(self.nx, lambda t: (t - 128.0) / 127.0),
+			ny=_gs(self.ny, lambda t: (t - 128.0) / 127.0),
+			pred_dt=_gs(self.pred_dt, lambda t: t.sqrt()),
+			corr_points=self.corr_points,
+			origin_fullres=self.origin_fullres,
+			spacing=self.spacing,
+			grad_mag_scale=self.grad_mag_scale,
+			cuda_gridsample=self.cuda_gridsample,
 		)
 
 
@@ -109,6 +147,7 @@ def auto_crop_for_mesh(
 def load_3d_for_model(
 	*, path: str, device: torch.device, model: object,
 	blur_sigma: float = 0.0,
+	cuda_gridsample: bool = True,
 ) -> FitData3D:
 	"""Load 3D data auto-cropped around model mesh bbox. Optionally blurs."""
 	scaledown = float(model.params.scaledown)
@@ -124,7 +163,7 @@ def load_3d_for_model(
 	if crop is not None:
 		print(f"[fit_data] auto-crop: x={crop[0]} y={crop[1]} z={crop[2]} "
 			  f"w={crop[3]} h={crop[4]} d={crop[5]}", flush=True)
-	data = load_3d(path=path, device=device, downscale=scaledown, crop=crop)
+	data = load_3d(path=path, device=device, downscale=scaledown, crop=crop, cuda_gridsample=cuda_gridsample)
 	if blur_sigma > 0:
 		blur_3d(data, sigma=blur_sigma)
 		print(f"[fit_data] blurred data sigma={blur_sigma}", flush=True)
@@ -196,6 +235,7 @@ def load_3d(
 	device: torch.device,
 	downscale: float = 4.0,
 	crop: tuple[int, int, int, int, int, int] | None = None,
+	cuda_gridsample: bool = True,
 ) -> FitData3D:
 	"""Load 3D sub-volume from preprocessed zarr.
 
@@ -289,4 +329,5 @@ def load_3d(
 		origin_fullres=origin_fullres,
 		spacing=spacing,
 		grad_mag_scale=gmag_enc,
+		cuda_gridsample=cuda_gridsample,
 	)
