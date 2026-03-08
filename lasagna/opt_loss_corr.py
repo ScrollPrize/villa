@@ -16,7 +16,7 @@ def corr_loss(
 	"""3D correction point loss: point-to-quad nearest surface, collection-coupled winding error."""
 	global _dbg_call_count, _last_results
 	_dbg_call_count += 1
-	dbg = (_dbg_call_count <= 2) or (_dbg_call_count % 100 == 0)
+	dbg = (_dbg_call_count == 1)
 
 	dev = res.xyz_lr.device
 	dt = res.xyz_lr.dtype
@@ -230,9 +230,6 @@ def corr_loss(
 	for cid in uc.tolist():
 		m = (col == int(cid)) & valid
 		if not bool(m.any()):
-			if dbg:
-				n_total = (col == int(cid)).sum().item()
-				print(f"[corr] collection {cid}: {n_total} pts, 0 valid — skipped")
 			continue
 		obs_m = obs[m]
 		wa_m = winda[m]
@@ -245,38 +242,8 @@ def corr_loss(
 		use_neg = bool((mse_neg < mse_pos).item())
 		err[m] = err_neg if use_neg else err_pos
 		avg_per_point[col == int(cid)] = float(avg_neg.item()) if use_neg else float(avg_pos.item())
-		if dbg:
-			n_total = (col == int(cid)).sum().item()
-			sign_str = "neg" if use_neg else "pos"
-			avg_val = float(avg_neg.item()) if use_neg else float(avg_pos.item())
-			mse_val = float(mse_neg.item()) if use_neg else float(mse_pos.item())
-			print(f"[corr] collection {cid}: {n_total} pts, {m.sum().item()} valid, "
-				  f"sign={sign_str}, avg_offset={avg_val:.3f}, mse={mse_val:.6f}")
 
 	point_valid = torch.isfinite(err)
-
-	# --- Debug per-point table ---
-	if dbg:
-		print(f"[corr] per-point details:")
-		print(f"  {'pid':>5s}  {'col':>3s}  {'winda':>8s}  "
-			  f"{'pt_x':>9s} {'pt_y':>9s} {'pt_z':>9s}  "
-			  f"{'brk':>5s}  {'sd_lo':>8s} {'sd_hi':>8s}  "
-			  f"{'frac':>5s}  {'obs':>9s}  {'avg':>9s}  {'err':>9s}  {'ok':>2s}")
-		for i in range(K):
-			obs_i = obs[i].item()
-			avg_i = avg_per_point[i].item()
-			err_i = err[i].item() if point_valid[i] else float("nan")
-			bd_i = bracket_d[i].item()
-			brk_str = f"{bd_i},{bd_i+1}" if bracket_valid[i] else "---"
-			sd_lo_i = signed_dist_per_d[i, bd_i].item() if bracket_valid[i] else float("nan")
-			sd_hi_i = signed_dist_per_d[i, bd_i + 1].item() if bracket_valid[i] else float("nan")
-			frac_i = frac[i].item()
-			print(f"  {pt_ids[i].item():5d}  {col[i].item():3d}  {winda[i].item():8.3f}  "
-				  f"{P[i, 0].item():9.1f} {P[i, 1].item():9.1f} {P[i, 2].item():9.1f}  "
-				  f"{brk_str:>5s}  {sd_lo_i:8.2f} {sd_hi_i:8.2f}  "
-				  f"{frac_i:5.3f}  {obs_i:9.3f}  "
-				  f"{avg_i:9.3f}  {err_i:9.3f}  "
-				  f"{'Y' if valid[i] else 'N':>2s}")
 
 	if not bool(point_valid.any()):
 		if dbg:
@@ -307,6 +274,17 @@ def corr_loss(
 def get_last_results() -> dict | None:
 	"""Return the last corr_points_results dict (for saving to checkpoint)."""
 	return _last_results
+
+
+def print_summary():
+	"""Print a one-line corr summary (called at end of opt)."""
+	if _last_results is None:
+		return
+	pts = _last_results.get("points", {})
+	n_valid = sum(1 for p in pts.values() if p.get("valid"))
+	errs = [p["winding_err"] for p in pts.values() if p.get("winding_err") is not None]
+	rms = (sum(e * e for e in errs) / len(errs)) ** 0.5 if errs else float("nan")
+	print(f"[corr] final: valid={n_valid}/{len(pts)}, rms_err={rms:.4f}")
 
 
 def _build_results(
