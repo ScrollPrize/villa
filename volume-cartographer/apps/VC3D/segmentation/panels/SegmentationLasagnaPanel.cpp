@@ -343,9 +343,19 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         _externalHost = text.trimmed();
         writeSetting(QStringLiteral("lasagna_external_host"), _externalHost);
     });
+    connect(_hostEdit, &QLineEdit::editingFinished, this, [this]() {
+        if (_connectionMode == 1 && !_externalHost.isEmpty() && _externalPort > 0) {
+            LasagnaServiceManager::instance().connectToExternal(_externalHost, _externalPort);
+        }
+    });
     connect(_portEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         _externalPort = text.trimmed().toInt();
         writeSetting(QStringLiteral("lasagna_external_port"), _externalPort);
+    });
+    connect(_portEdit, &QLineEdit::editingFinished, this, [this]() {
+        if (_connectionMode == 1 && !_externalHost.isEmpty() && _externalPort > 0) {
+            LasagnaServiceManager::instance().connectToExternal(_externalHost, _externalPort);
+        }
     });
 
     // -- Data input --
@@ -364,7 +374,10 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         QString prevPath = _lasagnaDataInputPath;
         _datasetCombo->clear();
         if (datasets.isEmpty()) {
-            _dataInputStack->setCurrentIndex(0);
+            _datasetCombo->setEnabled(false);
+            if (_newModelBtn) _newModelBtn->setEnabled(false);
+            if (_reoptBtn) _reoptBtn->setEnabled(false);
+            if (_expandBtn) _expandBtn->setEnabled(false);
             return;
         }
         int restoreIdx = 0;
@@ -377,7 +390,11 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
                 restoreIdx = i;
         }
         _datasetCombo->setCurrentIndex(restoreIdx);
+        _datasetCombo->setEnabled(true);
         _dataInputStack->setCurrentIndex(1);
+        if (_newModelBtn) _newModelBtn->setEnabled(true);
+        if (_reoptBtn) _reoptBtn->setEnabled(true);
+        if (_expandBtn) _expandBtn->setEnabled(true);
     });
 
     connect(_dataInputEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
@@ -571,9 +588,17 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         }
         if (_stopBtn) _stopBtn->setEnabled(false);
         if (_stopServiceBtn) _stopServiceBtn->setEnabled(false);
-        if (_newModelBtn) _newModelBtn->setEnabled(true);
-        if (_reoptBtn) _reoptBtn->setEnabled(true);
-        if (_expandBtn) _expandBtn->setEnabled(true);
+        if (_connectionMode == 1) {
+            // External mode: clear datasets and disable controls
+            if (_datasetCombo) { _datasetCombo->clear(); _datasetCombo->setEnabled(false); }
+            if (_newModelBtn) _newModelBtn->setEnabled(false);
+            if (_reoptBtn) _reoptBtn->setEnabled(false);
+            if (_expandBtn) _expandBtn->setEnabled(false);
+        } else {
+            if (_newModelBtn) _newModelBtn->setEnabled(true);
+            if (_reoptBtn) _reoptBtn->setEnabled(true);
+            if (_expandBtn) _expandBtn->setEnabled(true);
+        }
     });
     connect(&mgr, &LasagnaServiceManager::serviceError, this, [this](const QString& err) {
         std::cerr << "[lasagna] service error: " << err.toStdString() << std::endl;
@@ -581,6 +606,12 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             _progressLabel->setText(tr("Error: %1").arg(err));
             _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
             _progressLabel->setVisible(true);
+        }
+        if (_connectionMode == 1) {
+            if (_datasetCombo) _datasetCombo->setEnabled(false);
+            if (_newModelBtn) _newModelBtn->setEnabled(false);
+            if (_reoptBtn) _reoptBtn->setEnabled(false);
+            if (_expandBtn) _expandBtn->setEnabled(false);
         }
     });
     connect(&mgr, &LasagnaServiceManager::optimizationStarted, this, [this]() {
@@ -1076,16 +1107,26 @@ void SegmentationLasagnaPanel::onConnectionModeChanged(int index)
 void SegmentationLasagnaPanel::updateConnectionWidgets()
 {
     bool external = (_connectionMode == 1);
-
-    // Show/hide external widgets (discovery + host/port)
     if (_externalWidget) _externalWidget->setVisible(external);
 
-    // Reset data input stack when switching to internal
-    if (!external) {
-        if (_dataInputStack) _dataInputStack->setCurrentIndex(0);
+    if (_dataInputStack) {
+        _dataInputStack->setCurrentIndex(external ? 1 : 0);
+    }
+    // When in external mode with no datasets yet, disable combo + action buttons
+    if (external && _datasetCombo) {
+        bool hasDatasets = (_datasetCombo->count() > 0);
+        _datasetCombo->setEnabled(hasDatasets);
+        if (_newModelBtn) _newModelBtn->setEnabled(hasDatasets);
+        if (_reoptBtn) _reoptBtn->setEnabled(hasDatasets);
+        if (_expandBtn) _expandBtn->setEnabled(hasDatasets);
+    } else {
+        // Internal mode: re-enable controls
+        if (_datasetCombo) _datasetCombo->setEnabled(true);
+        if (_newModelBtn) _newModelBtn->setEnabled(true);
+        if (_reoptBtn) _reoptBtn->setEnabled(true);
+        if (_expandBtn) _expandBtn->setEnabled(true);
     }
 
-    // When switching to external, try connecting (triggers dataset fetch via serviceStarted)
     if (external && !_restoringSettings && !_externalHost.isEmpty() && _externalPort > 0) {
         LasagnaServiceManager::instance().connectToExternal(_externalHost, _externalPort);
     }

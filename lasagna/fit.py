@@ -318,7 +318,11 @@ def main(argv: list[str] | None = None) -> int:
 	if model_out is not None and _out_dir is not None:
 		import fit2tifxyz
 		export_dir = str(Path(_out_dir) / "tifxyz")
-		fit2tifxyz.main(["--input", str(model_out), "--output", export_dir])
+		tifxyz_argv = ["--input", str(model_out), "--output", export_dir]
+		voxel_size_um = cfg.get("voxel_size_um")
+		if voxel_size_um is not None:
+			tifxyz_argv += ["--voxel-size-um", str(float(voxel_size_um))]
+		fit2tifxyz.main(tifxyz_argv)
 
 	return 0
 

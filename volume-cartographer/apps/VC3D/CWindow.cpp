@@ -2014,6 +2014,16 @@ void CWindow::CreateWidgets(void)
             }
         }
 
+        // Inject voxel_size_um from the current volume
+        if (currentVolume) {
+            try {
+                double vs = currentVolume->voxelSize();
+                if (std::isfinite(vs) && vs > 0.0) {
+                    config[QStringLiteral("voxel_size_um")] = vs;
+                }
+            } catch (...) {}
+        }
+
         // Build optimization request
         QJsonObject request;
         request[QStringLiteral("data_input")] = dataInput;

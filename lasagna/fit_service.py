@@ -375,6 +375,9 @@ def _run_optimization(body: dict[str, Any]) -> None:
         output_name = body.get("output_name")
         if output_name:
             export_argv.extend(["--output-name", str(output_name)])
+        voxel_size_um = config.get("voxel_size_um")
+        if voxel_size_um is not None:
+            export_argv.extend(["--voxel-size-um", str(float(voxel_size_um))])
         fit2tifxyz.main(export_argv)
 
         # Clean up intermediate files (but keep results_tmp for download)
