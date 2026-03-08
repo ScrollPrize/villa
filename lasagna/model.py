@@ -425,9 +425,9 @@ class Model3D(nn.Module):
 			def _valid_mask(gm: torch.Tensor) -> torch.Tensor:
 				return (gm.squeeze(0).squeeze(0) > 0.0).to(dtype=xyz_lr.dtype).unsqueeze(1)
 
-			mask_prev = _valid_mask(data.grid_sample_fullres(prev_full).grad_mag)
-			mask_center = _valid_mask(data.grid_sample_fullres(xyz_lr).grad_mag)
-			mask_next = _valid_mask(data.grid_sample_fullres(next_full).grad_mag)
+			mask_prev = _valid_mask(data.grid_sample_fullres(prev_full.detach()).grad_mag)
+			mask_center = _valid_mask(data.grid_sample_fullres(xyz_lr.detach()).grad_mag)
+			mask_next = _valid_mask(data.grid_sample_fullres(next_full.detach()).grad_mag)
 
 			# Apply uv validity (also zeros boundary edges: d=0 prev, d=D-1 next)
 			mask_prev = mask_prev * prev_uv_ok.unsqueeze(1)
@@ -496,8 +496,8 @@ class Model3D(nn.Module):
 		target_mod = (bias_hr + amp_hr * (target_plain - 0.5)).clamp(0.0, 1.0)
 
 		# Masking via grad_mag > 0
-		mask_hr = (data.grid_sample_fullres(xyz_hr).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
-		mask_lr = (data.grid_sample_fullres(xyz_lr).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
+		mask_hr = (data.grid_sample_fullres(xyz_hr.detach()).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
+		mask_lr = (data.grid_sample_fullres(xyz_lr.detach()).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
 
 		return FitResult3D(
 			xyz_lr=xyz_lr,
