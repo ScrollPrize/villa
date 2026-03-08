@@ -1953,7 +1953,7 @@ void CWindow::CreateWidgets(void)
         if (isNewModel) {
             int nmW = _segmentationWidget->newModelWidth();
             int nmH = _segmentationWidget->newModelHeight();
-            int nmD = _segmentationWidget->newModelDepth();
+            int nmN = _segmentationWidget->newModelWindings();
 
             // Get bbox center: use seed point if specified, otherwise focus
             int cx, cy, cz;
@@ -1982,16 +1982,17 @@ void CWindow::CreateWidgets(void)
                 cz = static_cast<int>(focus->p[2]);
             }
 
-            // Build/override the "args" section with --bbox CX CY CZ W H
-            // and --z-size for the full 3D extent (no grow stages needed)
+            // Build/override the "args" section with seed, model-w, model-h, windings
             QJsonObject args = config[QStringLiteral("args")].toObject();
-            args[QStringLiteral("bbox")] = QJsonArray{cx, cy, cz, nmW, nmH};
-            args[QStringLiteral("z-size")] = nmD;
+            args[QStringLiteral("seed")] = QJsonArray{cx, cy, cz};
+            args[QStringLiteral("model-w")] = nmW;
+            args[QStringLiteral("model-h")] = nmH;
+            args[QStringLiteral("windings")] = nmN;
             config[QStringLiteral("args")] = args;
 
-            std::cerr << "[lasagna] new model: bbox center=(" << cx << "," << cy
-                      << "," << cz << ") size=(" << nmW << "x" << nmH
-                      << "x" << nmD << ")" << std::endl;
+            std::cerr << "[lasagna] new model: seed=(" << cx << "," << cy
+                      << "," << cz << ") w=" << nmW << " h=" << nmH
+                      << " windings=" << nmN << std::endl;
         }
 
         // Inject loaded point collections as corr_points

@@ -170,13 +170,13 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         _heightSpin->setSingleStep(64);
         dimLayout->addWidget(_heightSpin, 1);
 
-        dimLayout->addWidget(new QLabel(tr("D:"), dimWidget));
-        _depthSpin = new QSpinBox(dimWidget);
-        _depthSpin->setRange(1, 999999);
-        _depthSpin->setValue(2048);
-        _depthSpin->setSingleStep(64);
-        _depthSpin->setToolTip(tr("Depth in full-resolution voxels"));
-        dimLayout->addWidget(_depthSpin, 1);
+        dimLayout->addWidget(new QLabel(tr("N:"), dimWidget));
+        _windingsSpin = new QSpinBox(dimWidget);
+        _windingsSpin->setRange(1, 999);
+        _windingsSpin->setValue(3);
+        _windingsSpin->setSingleStep(1);
+        _windingsSpin->setToolTip(tr("Number of windings"));
+        dimLayout->addWidget(_windingsSpin, 1);
 
         _newModelGroup->contentLayout()->addWidget(dimWidget);
     }
@@ -419,8 +419,8 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     connect(_heightSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
         writeSetting(QStringLiteral("lasagna_new_model_height"), v);
     });
-    connect(_depthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
-        writeSetting(QStringLiteral("lasagna_new_model_depth"), v);
+    connect(_windingsSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        writeSetting(QStringLiteral("lasagna_new_model_windings"), v);
     });
     connect(_seedEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         writeSetting(QStringLiteral("lasagna_seed_point"), text.trimmed());
@@ -806,9 +806,9 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
         const QSignalBlocker b(_heightSpin);
         _heightSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_height"), 2048).toInt());
     }
-    if (_depthSpin) {
-        const QSignalBlocker b(_depthSpin);
-        _depthSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_depth"), 2048).toInt());
+    if (_windingsSpin) {
+        const QSignalBlocker b(_windingsSpin);
+        _windingsSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_windings"), 3).toInt());
     }
 
     // Connection settings
@@ -1063,9 +1063,9 @@ int SegmentationLasagnaPanel::newModelHeight() const
     return _heightSpin ? _heightSpin->value() : 2048;
 }
 
-int SegmentationLasagnaPanel::newModelDepth() const
+int SegmentationLasagnaPanel::newModelWindings() const
 {
-    return _depthSpin ? _depthSpin->value() : 2048;
+    return _windingsSpin ? _windingsSpin->value() : 3;
 }
 
 QString SegmentationLasagnaPanel::seedPointText() const

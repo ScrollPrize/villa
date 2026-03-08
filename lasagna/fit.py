@@ -18,19 +18,19 @@ import opt_loss_corr
 import optimizer
 
 
-def _arc_params_from_bbox(
-	bbox: tuple[int, int, int, int, int],
-	z_size: int | None,
+def _arc_params_from_seed(
+	seed: tuple[int, int, int],
+	model_w: int,
 	volume_extent_fullres: tuple[int, int, int],
 ) -> dict:
-	"""Derive arc params from bbox seed point.
+	"""Derive arc params from seed point and model width.
 
-	bbox: (cx, cy, cz, w, h) in fullres voxels — seed center + XY extent
+	seed: (cx, cy, cz) in fullres voxels
+	model_w: model width in fullres voxels (circumferential extent)
 	volume_extent_fullres: (X_total, Y_total, Z_total) in fullres voxels
 	Returns dict with keys matching ModelConfig arc fields.
 	"""
-	seed_cx, seed_cy, seed_cz = float(bbox[0]), float(bbox[1]), float(bbox[2])
-	seed_w, seed_h = float(bbox[3]), float(bbox[4])
+	seed_cx, seed_cy, seed_cz = float(seed[0]), float(seed[1]), float(seed[2])
 	vol_x, vol_y, _vol_z = volume_extent_fullres
 
 	# Volume center XY = estimate of scroll axis
@@ -46,8 +46,8 @@ def _arc_params_from_bbox(
 	# Seed angle
 	seed_angle = math.atan2(dy, dx)
 
-	# Angular half-extent to cover bbox
-	half_angle = max(seed_w, seed_h) / (2.0 * arc_radius)
+	# Angular half-extent from model width
+	half_angle = float(model_w) / (2.0 * arc_radius)
 	half_angle = max(half_angle, 0.05)
 
 	return {
@@ -156,33 +156,23 @@ def main(argv: list[str] | None = None) -> int:
 		volume_extent_fullres = prep_params.get("volume_extent_fullres")
 		print(f"[fit] zarr scaledown={scaledown} volume_extent={volume_extent_fullres}", flush=True)
 
-	# --- Arc init from bbox (new model only) ---
+	# --- Arc init from seed (new model only) ---
 	is_new_model = model_cfg.model_input is None
-	if is_new_model and data_cfg.bbox is not None and volume_extent_fullres is not None:
-		arc = _arc_params_from_bbox(data_cfg.bbox, data_cfg.z_size, volume_extent_fullres)
+	if is_new_model and data_cfg.seed is not None and data_cfg.model_w is not None and volume_extent_fullres is not None:
+		arc = _arc_params_from_seed(data_cfg.seed, data_cfg.model_w, volume_extent_fullres)
 		model_cfg = dataclasses.replace(model_cfg, **arc)
-		print(f"[fit] arc from bbox: cx={arc['arc_cx']:.1f} cy={arc['arc_cy']:.1f} "
+		print(f"[fit] arc from seed: cx={arc['arc_cx']:.1f} cy={arc['arc_cy']:.1f} "
 			  f"r={arc['arc_radius']:.1f} a0={arc['arc_angle0']:.3f} a1={arc['arc_angle1']:.3f} "
 			  f"z={arc['z_center']:.1f}", flush=True)
 
-	# --- Auto-size mesh from bbox (new model only) ---
-	if is_new_model and data_cfg.bbox is not None:
-		seed_w, seed_h = float(data_cfg.bbox[3]), float(data_cfg.bbox[4])
-
-		# Radial extent → depth (number of windings)
-		radial_extent = min(seed_w, seed_h)
-		auto_depth = max(1, int(radial_extent / model_cfg.winding_step))
-
-		# Z extent → mesh_h
-		z_ext = float(data_cfg.z_size) if data_cfg.z_size is not None else (model_cfg.mesh_step * (model_cfg.mesh_h - 1))
-		auto_mesh_h = max(2, int(z_ext / model_cfg.mesh_step) + 1)
-
-		# Angular extent → mesh_w (match resolution to mesh_step)
-		arc_length = model_cfg.arc_radius * (model_cfg.arc_angle1 - model_cfg.arc_angle0)
-		auto_mesh_w = max(2, int(arc_length / model_cfg.mesh_step) + 1)
+	# --- Size mesh from model_w, model_h, windings (new model only) ---
+	if is_new_model and data_cfg.model_w is not None and data_cfg.model_h is not None and data_cfg.windings is not None:
+		auto_mesh_w = max(2, int(data_cfg.model_w / model_cfg.mesh_step) + 1)
+		auto_mesh_h = max(2, int(data_cfg.model_h / model_cfg.mesh_step) + 1)
+		auto_depth = max(1, data_cfg.windings)
 
 		model_cfg = dataclasses.replace(model_cfg, depth=auto_depth, mesh_h=auto_mesh_h, mesh_w=auto_mesh_w)
-		print(f"[fit] auto-sized: depth={auto_depth} mesh_h={auto_mesh_h} mesh_w={auto_mesh_w}", flush=True)
+		print(f"[fit] model size: depth={auto_depth} mesh_h={auto_mesh_h} mesh_w={auto_mesh_w}", flush=True)
 
 	# --- Construct / load model (before data, so we can compute bbox) ---
 	if is_new_model:

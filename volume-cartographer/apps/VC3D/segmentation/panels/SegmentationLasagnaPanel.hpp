@@ -49,7 +49,7 @@ public:
     [[nodiscard]] LasagnaMode lasagnaMode() const { return static_cast<LasagnaMode>(_lasagnaMode); }
     [[nodiscard]] int newModelWidth() const;
     [[nodiscard]] int newModelHeight() const;
-    [[nodiscard]] int newModelDepth() const;
+    [[nodiscard]] int newModelWindings() const;
     [[nodiscard]] QString seedPointText() const;
     [[nodiscard]] QString newModelOutputName() const;
 
@@ -106,7 +106,7 @@ private:
     // New model settings
     QSpinBox* _widthSpin{nullptr};
     QSpinBox* _heightSpin{nullptr};
-    QSpinBox* _depthSpin{nullptr};
+    QSpinBox* _windingsSpin{nullptr};
     QLineEdit* _seedEdit{nullptr};
     QPushButton* _seedFromFocusBtn{nullptr};
     QLineEdit* _outputNameEdit{nullptr};

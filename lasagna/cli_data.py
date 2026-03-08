@@ -14,9 +14,11 @@ class DataConfig:
 	device: str
 	downscale: float
 	crop: tuple[int, int, int, int, int, int] | None  # (x, y, z, w, h, d) fullres
-	bbox: tuple[int, int, int, int, int] | None        # (cx, cy, cz, w, h) fullres seed
-	z_size: int | None                                  # z extent in fullres voxels
-	cuda_gridsample: bool                               # use custom CUDA uint8 grid_sample kernel
+	seed: tuple[int, int, int] | None                   # (cx, cy, cz) fullres seed point
+	model_w: int | None                                  # model width in fullres voxels
+	model_h: int | None                                  # model height in fullres voxels
+	windings: int | None                                 # number of windings
+	cuda_gridsample: bool                                # use custom CUDA uint8 grid_sample kernel
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -27,11 +29,15 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--crop", type=int, nargs=6, default=None,
 		metavar=("X", "Y", "Z", "W", "H", "D"),
 		help="3D volume crop in fullres voxels: x y z w h d")
-	g.add_argument("--bbox", type=int, nargs=5, default=None,
-		metavar=("CX", "CY", "CZ", "W", "H"),
-		help="Seed bbox: center + XY size in fullres voxels")
-	g.add_argument("--z-size", type=int, default=None,
-		help="Z extent in fullres voxels (used with --bbox)")
+	g.add_argument("--seed", type=int, nargs=3, default=None,
+		metavar=("CX", "CY", "CZ"),
+		help="Seed point in fullres voxels")
+	g.add_argument("--model-w", type=int, default=None,
+		help="Model width in fullres voxels")
+	g.add_argument("--model-h", type=int, default=None,
+		help="Model height in fullres voxels")
+	g.add_argument("--windings", type=int, default=None,
+		help="Number of windings")
 	g.add_argument("--cuda-gridsample", type=int, default=1,
 		help="Use custom CUDA uint8 grid_sample kernel (1=yes, 0=fallback to PyTorch F.grid_sample)")
 
@@ -44,19 +50,23 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		crop = tuple(int(v) for v in args.crop)
 		if len(crop) != 6:
 			raise ValueError("--crop requires exactly 6 values: x y z w h d")
-	bbox = None
-	if getattr(args, "bbox", None) is not None:
-		bbox = tuple(int(v) for v in args.bbox)
-		if len(bbox) != 5:
-			raise ValueError("--bbox requires exactly 5 values: cx cy cz w h")
-	z_size = None if getattr(args, "z_size", None) is None else int(args.z_size)
+	seed = None
+	if getattr(args, "seed", None) is not None:
+		seed = tuple(int(v) for v in args.seed)
+		if len(seed) != 3:
+			raise ValueError("--seed requires exactly 3 values: cx cy cz")
+	model_w = None if getattr(args, "model_w", None) is None else int(args.model_w)
+	model_h = None if getattr(args, "model_h", None) is None else int(args.model_h)
+	windings = None if getattr(args, "windings", None) is None else int(args.windings)
 	return DataConfig(
 		input=str(args.input),
 		device=str(args.device),
 		downscale=float(args.downscale),
 		crop=crop,
-		bbox=bbox,
-		z_size=z_size,
+		seed=seed,
+		model_w=model_w,
+		model_h=model_h,
+		windings=windings,
 		cuda_gridsample=bool(int(getattr(args, "cuda_gridsample", 1))),
 	)
 
