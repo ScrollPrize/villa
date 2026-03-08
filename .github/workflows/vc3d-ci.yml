@@ -6,7 +6,6 @@ on:
 
 permissions:
   contents: read
-  packages: read
   pull-requests: read
 
 concurrency:
@@ -17,8 +16,6 @@ jobs:
   ci:
     name: CI
     runs-on: ubuntu-24.04
-    env:
-      REGISTRY_IMAGE_LC: ghcr.io/${{ github.repository_owner }}/villa/volume-cartographer
 
     steps:
       - name: Checkout
@@ -38,46 +35,67 @@ jobs:
         run: |
           echo "✅ No changes in volume-cartographer/ or the workflow file. Skipping build."
 
-      - name: Set up Docker Buildx
+      - name: Install build deps
         if: ${{ steps.changes.outputs.vc == 'true' }}
-        uses: docker/setup-buildx-action@v3
+        run: |
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git cmake ninja-build ccache \
+            qt6-base-dev libboost-system-dev libboost-program-options-dev \
+            libceres-dev libcgal-dev xtensor-dev libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev \
+            libgsl-dev libsdl2-dev libcurl4-openssl-dev
 
-      # Only log in when the PR is from the same repo (forks don't receive write tokens/secrets).
-      - name: Login to GHCR (same-repo PRs)
-        if: ${{ steps.changes.outputs.vc == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: docker/login-action@v3
+      - name: Restore ccache
+        if: ${{ steps.changes.outputs.vc == 'true' }}
+        uses: actions/cache/restore@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-vc3d-ci-${{ hashFiles('volume-cartographer/**/CMakeLists.txt','volume-cartographer/**/*.cmake','.github/workflows/vc3d-ci.yml') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-vc3d-ci-
 
-      # Fork PRs: read-only caches (GHA + public registry if available). No writes.
-      - name: Build (fork PRs; read-only caches)
-        if: ${{ steps.changes.outputs.vc == 'true' && github.event.pull_request.head.repo.full_name != github.repository }}
-        uses: docker/build-push-action@v6
-        with:
-          context: ./volume-cartographer
-          file: ./volume-cartographer/ubuntu-24.04-noble.Dockerfile
-          platforms: linux/amd64
-          push: false
-          tags: ${{ github.repository_owner }}/volume-cartographer:latest
-          cache-from: |
-            type=gha,scope=vc3d-${{ github.base_ref || github.ref_name }}
-            type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache
-          # no cache-to on fork PRs (read-only token)
+      - name: Enable ccache
+        if: ${{ steps.changes.outputs.vc == 'true' }}
+        run: |
+          mkdir -p ~/.ccache
+          echo 'max_size = 5G' >> ~/.ccache/ccache.conf || true
+          echo 'hash_dir = true' >> ~/.ccache/ccache.conf || true
+          echo 'compiler_check = content' >> ~/.ccache/ccache.conf || true
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE/volume-cartographer" >> $GITHUB_ENV
 
-      # Same-repo PRs: allow writing GHA cache for branch
-      - name: Build (same-repo PRs; writable cache)
-        if: ${{ steps.changes.outputs.vc == 'true' && github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: docker/build-push-action@v6
+      - name: Reset ccache stats
+        if: ${{ steps.changes.outputs.vc == 'true' }}
+        run: ccache -z || true
+
+      - name: Configure smoke build
+        if: ${{ steps.changes.outputs.vc == 'true' }}
+        working-directory: ./volume-cartographer
+        run: |
+          cmake -S . -B build -G Ninja \
+                -DVC_WITH_CUDA_SPARSE=off \
+                -DVC_WITH_PASTIX=OFF \
+                -DVC_BUILD_TESTS=OFF \
+                -DBUILD_TESTING=OFF \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_C_COMPILER=gcc \
+                -DCMAKE_CXX_COMPILER=g++ \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build smoke target set
+        if: ${{ steps.changes.outputs.vc == 'true' }}
+        working-directory: ./volume-cartographer
+        run: cmake --build build --parallel
+
+      - name: Show ccache stats
+        if: ${{ always() && steps.changes.outputs.vc == 'true' }}
+        run: ccache -s || true
+
+      - name: Save ccache
+        if: ${{ always() && steps.changes.outputs.vc == 'true' }}
+        uses: actions/cache/save@v4
         with:
-          context: ./volume-cartographer
-          file: ./volume-cartographer/ubuntu-24.04-noble.Dockerfile
-          platforms: linux/amd64
-          push: false
-          tags: ${{ github.repository_owner }}/volume-cartographer:latest
-          cache-from: |
-            type=gha,scope=vc3d-${{ github.base_ref || github.ref_name }}
-            type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache
-          cache-to: type=gha,mode=max,scope=vc3d-${{ github.ref_name }}
-          # load: true # uncomment if you want the image loaded into the runner for tests
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-vc3d-ci-${{ hashFiles('volume-cartographer/**/CMakeLists.txt','volume-cartographer/**/*.cmake','.github/workflows/vc3d-ci.yml') }}
