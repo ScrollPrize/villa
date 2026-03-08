@@ -75,9 +75,9 @@ def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tens
 		# Apply sign: wrong-side crossings produce negative integral (~-1.0 vs target +1.0)
 		signed_len = strip_len * sign
 
-		# mag_n = grad_mag * signed_strip_length; target is 1.0 (one winding traversed)
-		mag_n = mag * signed_len.unsqueeze(-1)
-		lm = ((mag_n - 1.0) ** 2).mean(dim=-1)  # (D, He, We)
+		# Midpoint-rule line integral; target is 1.0 (one winding traversed)
+		integral = mag.mean(dim=-1) * signed_len  # (D, He, We)
+		lm = torch.log(integral.clamp(min=1e-4)) ** 2  # (D, He, We) — log-space: symmetric in ratio
 
 		# Strip validity: all sample points must have grad_mag > 0
 		sv = (sampled.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=dtype)
