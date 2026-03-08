@@ -1022,10 +1022,13 @@ bool CTiledVolumeViewer::computeQuadPrefetchBBox(const std::shared_ptr<Surface>&
 
 void CTiledVolumeViewer::updateParamsHash()
 {
+    const std::string overlayId = _overlayVolume ? _overlayVolume->id() : std::string{};
     auto h = utils::hash_combine_values(
         _surfaceContentVersion,
         _baseWindowLow, _baseWindowHigh, _stretchValues,
         _baseColormapId, _useFastInterpolation,
+        overlayId, _overlayOpacity, _overlayColormapId,
+        _overlayWindowLow, _overlayWindowHigh,
         // Composite settings — all fields that affect rendered output
         _compositeSettings.enabled,
         _compositeSettings.layersFront, _compositeSettings.layersBehind,
@@ -1076,6 +1079,11 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     params.windowHigh = _baseWindowHigh;
     params.stretchValues = _stretchValues;
     params.colormapId = _baseColormapId;
+    params.overlayVolume = _overlayVolume;
+    params.overlayOpacity = _overlayOpacity;
+    params.overlayWindowLow = _overlayWindowLow;
+    params.overlayWindowHigh = _overlayWindowHigh;
+    params.overlayColormapId = _overlayColormapId;
     params.useFastInterpolation = _useFastInterpolation;
     params.compositeSettings = _compositeSettings;
 
@@ -1594,11 +1602,46 @@ void CTiledVolumeViewer::setStretchValues(bool enabled)
     if (_volume) renderVisible(true);
 }
 
-void CTiledVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> vol) { _overlayVolume = std::move(vol); }
-void CTiledVolumeViewer::setOverlayOpacity(float opacity) { _overlayOpacity = std::clamp(opacity, 0.0f, 1.0f); }
-void CTiledVolumeViewer::setOverlayColormap(const std::string& id) { _overlayColormapId = id; }
+void CTiledVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> vol)
+{
+    _overlayVolume = std::move(vol);
+    updateParamsHash();
+    if (_volume) renderVisible(true);
+}
+
+void CTiledVolumeViewer::setOverlayOpacity(float opacity)
+{
+    const float clamped = std::clamp(opacity, 0.0f, 1.0f);
+    if (std::abs(clamped - _overlayOpacity) < 1e-6f) return;
+    _overlayOpacity = clamped;
+    updateParamsHash();
+    if (_volume) renderVisible(true);
+}
+
+void CTiledVolumeViewer::setOverlayColormap(const std::string& id)
+{
+    if (_overlayColormapId == id) return;
+    _overlayColormapId = id;
+    updateParamsHash();
+    if (_volume) renderVisible(true);
+}
 void CTiledVolumeViewer::setOverlayThreshold(float threshold) { setOverlayWindow(std::max(threshold, 0.0f), _overlayWindowHigh); }
-void CTiledVolumeViewer::setOverlayWindow(float low, float high) { _overlayWindowLow = low; _overlayWindowHigh = high; }
+void CTiledVolumeViewer::setOverlayWindow(float low, float high)
+{
+    const float clampedLow = std::clamp(low, 0.0f, 255.0f);
+    float clampedHigh = std::clamp(high, 0.0f, 255.0f);
+    if (clampedHigh <= clampedLow) {
+        clampedHigh = std::min(255.0f, clampedLow + 1.0f);
+    }
+    if (std::abs(clampedLow - _overlayWindowLow) < 1e-6f &&
+        std::abs(clampedHigh - _overlayWindowHigh) < 1e-6f) {
+        return;
+    }
+    _overlayWindowLow = clampedLow;
+    _overlayWindowHigh = clampedHigh;
+    updateParamsHash();
+    if (_volume) renderVisible(true);
+}
 
 void CTiledVolumeViewer::setResetViewOnSurfaceChange(bool reset) { _resetViewOnSurfaceChange = reset; }
 void CTiledVolumeViewer::setSegmentationEditActive(bool active) { _segmentationEditActive = active; }

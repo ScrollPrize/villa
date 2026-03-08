@@ -10,6 +10,55 @@
 #include <algorithm>
 #include <cmath>
 
+namespace {
+
+void blendOverlayImage(QImage* base,
+                       const QImage& overlay,
+                       const cv::Mat_<uint8_t>& overlayMask,
+                       float opacity)
+{
+    if (!base || base->isNull() || overlay.isNull() || overlayMask.empty()) {
+        return;
+    }
+
+    const float alpha = std::clamp(opacity, 0.0f, 1.0f);
+    if (alpha <= 0.0f) {
+        return;
+    }
+
+    const int rows = std::min(base->height(), overlay.height());
+    const int cols = std::min(base->width(), overlay.width());
+    for (int y = 0; y < rows; ++y) {
+        auto* dst = reinterpret_cast<uint32_t*>(base->scanLine(y));
+        const auto* src = reinterpret_cast<const uint32_t*>(overlay.constScanLine(y));
+        const auto* mask = overlayMask.ptr<uint8_t>(y);
+        for (int x = 0; x < cols; ++x) {
+            if (mask[x] == 0) {
+                continue;
+            }
+
+            const uint32_t d = dst[x];
+            const uint32_t s = src[x];
+            const float ia = 1.0f - alpha;
+
+            const uint32_t dr = (d >> 16) & 0xFFu;
+            const uint32_t dg = (d >> 8) & 0xFFu;
+            const uint32_t db = d & 0xFFu;
+
+            const uint32_t sr = (s >> 16) & 0xFFu;
+            const uint32_t sg = (s >> 8) & 0xFFu;
+            const uint32_t sb = s & 0xFFu;
+
+            const uint32_t r = static_cast<uint32_t>(std::clamp(sr * alpha + dr * ia, 0.0f, 255.0f));
+            const uint32_t g = static_cast<uint32_t>(std::clamp(sg * alpha + dg * ia, 0.0f, 255.0f));
+            const uint32_t b = static_cast<uint32_t>(std::clamp(sb * alpha + db * ia, 0.0f, 255.0f));
+            dst[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+} // namespace
+
 TileRenderResult TileRenderer::renderTile(
     const TileRenderParams& params,
     const std::shared_ptr<Surface>& surface,
@@ -169,6 +218,28 @@ TileRenderResult TileRenderer::renderTile(
     pp.removeSmallComponents = params.compositeSettings.postRemoveSmallComponents;
     pp.minComponentSize = params.compositeSettings.postMinComponentSize;
     result.image = applyPostProcess(gray, pp);
+
+    if (params.overlayVolume && params.overlayOpacity > 0.0f) {
+        cv::Mat_<uint8_t> overlayGray;
+        vc::SampleParams overlaySp;
+        overlaySp.level = params.dsScaleIdx;
+        overlaySp.method = (params.useFastInterpolation || params.dsScaleIdx >= 3)
+                               ? vc::Sampling::Nearest
+                               : vc::Sampling::Trilinear;
+
+        params.overlayVolume->sampleBestEffort(overlayGray, coords, overlaySp);
+        if (!overlayGray.empty()) {
+            PostProcessParams overlayParams;
+            overlayParams.windowLow = params.overlayWindowLow;
+            overlayParams.windowHigh = params.overlayWindowHigh;
+            overlayParams.colormapId = params.overlayColormapId;
+            overlayParams.stretchValues = false;
+
+            QImage overlayImage = applyPostProcess(overlayGray, overlayParams);
+            blendOverlayImage(&result.image, overlayImage, overlayGray, params.overlayOpacity);
+        }
+    }
+
     return result;
 }
 
