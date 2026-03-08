@@ -60,7 +60,7 @@ class Model3D(nn.Module):
 		arc_angle0: float = -0.5,
 		arc_angle1: float = 0.5,
 		volume_extent: tuple[float, float, float, float, float, float] | None = None,
-		pyramid_d: bool = False,
+		pyramid_d: bool = True,
 	) -> None:
 		super().__init__()
 		self.depth = max(1, int(depth))
@@ -556,6 +556,7 @@ class Model3D(nn.Module):
 		mp = state_dict["_model_params_"]
 		mesh0 = state_dict["mesh_ms.0"]
 		_c, D, H, W = (int(v) for v in mesh0.shape)
+		saved_pyramid_d = bool(mp.get("pyramid_d", False))
 		mdl = cls(
 			device=device,
 			depth=D,
@@ -568,8 +569,23 @@ class Model3D(nn.Module):
 			scaledown=float(mp["scaledown"]),
 			z_step_eff=int(mp["z_step_eff"]),
 			volume_extent=mp.get("volume_extent"),
-			pyramid_d=bool(mp.get("pyramid_d", False)),
+			pyramid_d=True,
 		)
-		mdl.load_state_dict_compat(state_dict, strict=False)
+		if not saved_pyramid_d:
+			# Checkpoint was saved with pyramid_d=False — D is constant across levels.
+			# Integrate old pyramid, then rebuild with pyramid_d=True.
+			n_levels = sum(1 for k in state_dict if k.startswith("mesh_ms.") and k[len("mesh_ms."):].isdigit())
+			old_levels = nn.ParameterList([
+				nn.Parameter(state_dict[f"mesh_ms.{i}"].to(device=device, dtype=torch.float32))
+				for i in range(n_levels)
+			])
+			flat = cls._integrate_pyramid_3d(old_levels, pyramid_d=False)
+			mdl.mesh_ms = cls._construct_pyramid_from_flat_3d(flat, n_levels, pyramid_d=True)
+			# Load remaining state (skip mesh_ms keys handled above)
+			st_rest = {k: v for k, v in state_dict.items() if not k.startswith("mesh_ms.")}
+			mdl.load_state_dict_compat(st_rest, strict=False)
+			print(f"[model] rebuilt mesh pyramid with pyramid_d=True from old pyramid_d=False checkpoint")
+		else:
+			mdl.load_state_dict_compat(state_dict, strict=False)
 		mdl.arc_enabled = False
 		return mdl
