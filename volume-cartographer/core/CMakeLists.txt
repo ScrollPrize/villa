@@ -50,9 +50,10 @@ target_link_libraries(vc_core
         CURL::libcurl
 )
 
-# utils header-only library + vendored blosc1 compression
+# utils header-only library + vendored blosc1 compression + video codec
 target_link_libraries(vc_core PUBLIC
     $<BUILD_INTERFACE:utils>
+    $<BUILD_INTERFACE:utils_video_codec>
 )
 target_link_libraries(vc_core PRIVATE
     $<BUILD_INTERFACE:blosc_static>

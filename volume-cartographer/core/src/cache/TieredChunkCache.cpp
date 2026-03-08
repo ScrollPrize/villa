@@ -64,7 +64,7 @@ TieredChunkCache::TieredChunkCache(
     , diskStore_(std::move(diskStore))
     , source_(std::move(source))
     , decompress_(std::move(decompress))
-    , ioPool_(config_.ioThreads)
+    , ioPool_(config_.ioThreads, config_.ioQueueSize)
     , decompPool_(sharedDecompPool())
 {
     // Wire up the IO pool: fetch = check cold first, then ice
@@ -78,7 +78,7 @@ TieredChunkCache::TieredChunkCache(
             if (diskData && !diskData->empty()) {
                 auto n = statColdHits_.fetch_add(1, std::memory_order_relaxed);
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
-                if (n < 3)
+                if (n < 10 || (n < 1000 && n % 100 == 0))
                     std::fprintf(stderr, "[Cache] cold-hit #%lu lvl=%d (%d,%d,%d) bytes=%zu %ldms\n",
                                  n + 1, key.level, key.iz, key.iy, key.ix, diskData->size(), ms);
                 if (auto* log = cacheDebugLog())
@@ -111,10 +111,49 @@ TieredChunkCache::TieredChunkCache(
             return {};
         }
 
+        // Detect all-zero chunks (zarr fill_value=0 for non-existent chunks).
+        {
+            bool allZero = true;
+            const auto* p = reinterpret_cast<const uint64_t*>(data.data());
+            size_t n8 = data.size() / 8;
+            for (size_t i = 0; i < n8; i++) {
+                if (p[i] != 0) { allZero = false; break; }
+            }
+            if (allZero) {
+                for (size_t i = n8 * 8; i < data.size(); i++) {
+                    if (data[i] != 0) { allZero = false; break; }
+                }
+            }
+            if (allZero) {
+                if (auto* log = cacheDebugLog())
+                    std::fprintf(log, "FETCH ice-allzero lvl=%d (%d,%d,%d) bytes=%zu %ldms\n",
+                                 key.level, key.iz, key.iy, key.ix, data.size(), fetchMs);
+                return {};
+            }
+        }
+
         auto n = statIceFetches_.fetch_add(1, std::memory_order_relaxed);
-        if (n < 3)
+        if (n < 10 || (n < 1000 && n % 100 == 0))
             std::fprintf(stderr, "[Cache] ice-fetch #%lu lvl=%d (%d,%d,%d) bytes=%zu %ldms\n",
                          n + 1, key.level, key.iz, key.iy, key.ix, data.size(), fetchMs);
+
+        // Optionally recompress before storing to disk cache.
+        if (config_.recompress) {
+            try {
+                auto recompressed = config_.recompress(data, key);
+                if (!recompressed.empty()) {
+                    if (auto* log = cacheDebugLog())
+                        std::fprintf(log, "FETCH recompress lvl=%d (%d,%d,%d) %zu -> %zu bytes\n",
+                                     key.level, key.iz, key.iy, key.ix,
+                                     data.size(), recompressed.size());
+                    data = std::move(recompressed);
+                }
+            } catch (const std::exception& e) {
+                if (auto* log = cacheDebugLog())
+                    std::fprintf(log, "FETCH recompress-error lvl=%d (%d,%d,%d) %s\n",
+                                 key.level, key.iz, key.iy, key.ix, e.what());
+            }
+        }
 
         // Store to cold (disk cache) for persistence
         if (diskStore_) {
@@ -134,18 +173,9 @@ TieredChunkCache::TieredChunkCache(
     ioPool_.setCompletionCallback(
         [this](const ChunkKey& key, std::vector<uint8_t>&& compressed) {
             if (compressed.empty()) {
-                // Remember that this chunk doesn't exist so we never refetch
+                // Empty fetch result: negative cache (chunk doesn't exist)
                 {
                     std::unique_lock lock(negativeMutex_);
-                    constexpr size_t maxNegative = 500000;
-                    if (negativeCache_.size() >= maxNegative) {
-                        // Evict ~25% of entries (arbitrary iteration order is fine)
-                        size_t toEvict = maxNegative / 4;
-                        auto it = negativeCache_.begin();
-                        for (size_t i = 0; i < toEvict && it != negativeCache_.end(); i++) {
-                            it = negativeCache_.erase(it);
-                        }
-                    }
                     negativeCache_.insert(key);
                 }
                 if (auto* log = cacheDebugLog())
@@ -393,8 +423,68 @@ void TieredChunkCache::prefetchRegion(
         }
     }
     if (!keys.empty()) {
-        ioPool_.submit(keys);
+        ioPool_.submitBackground(keys);
     }
+}
+
+void TieredChunkCache::prefetchLevel(int level, PrefetchProgressCb progressCb)
+{
+    if (level < 0 || level >= numLevels()) return;
+
+    auto shape = levelShape(level);
+    auto chunks = chunkShape(level);
+    int gridZ = (shape[0] + chunks[0] - 1) / chunks[0];
+    int gridY = (shape[1] + chunks[1] - 1) / chunks[1];
+    int gridX = (shape[2] + chunks[2] - 1) / chunks[2];
+    int total = gridZ * gridY * gridX;
+
+    if (auto* log = cacheDebugLog())
+        std::fprintf(log, "prefetchLevel: level=%d grid=%dx%dx%d total=%d\n",
+                     level, gridZ, gridY, gridX, total);
+
+    // Drip-feed: submit in batches of ~1000, waiting for queue to drain
+    // between batches so we don't overwhelm the queue.
+    constexpr int BATCH_SIZE = 1000;
+    std::vector<ChunkKey> batch;
+    batch.reserve(BATCH_SIZE);
+    int submitted = 0;
+
+    for (int iz = 0; iz < gridZ; iz++) {
+        for (int iy = 0; iy < gridY; iy++) {
+            for (int ix = 0; ix < gridX; ix++) {
+                ChunkKey key{level, iz, iy, ix};
+                if (!isReadyForNonBlockingRead(key)) {
+                    batch.push_back(key);
+                } else {
+                    submitted++;  // already cached
+                }
+
+                if (batch.size() >= BATCH_SIZE) {
+                    ioPool_.submitBackground(batch);
+                    submitted += static_cast<int>(batch.size());
+                    batch.clear();
+
+                    if (progressCb)
+                        progressCb(submitted, total);
+
+                    // Wait for queue to drain below half capacity before
+                    // submitting the next batch.
+                    while (ioPool_.pendingCount() > config_.ioQueueSize / 2) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                }
+            }
+        }
+    }
+
+    // Submit remainder
+    if (!batch.empty()) {
+        ioPool_.submitBackground(batch);
+        submitted += static_cast<int>(batch.size());
+    }
+
+    if (progressCb)
+        progressCb(submitted, total);
 }
 
 void TieredChunkCache::cancelPendingPrefetch()
@@ -481,7 +571,6 @@ void TieredChunkCache::clearAll()
     }
     if (diskStore_) {
         diskStore_->clearVolume(config_.volumeId);
-        // Remove persisted negative cache file
         std::error_code ec;
         std::filesystem::remove(
             diskStore_->root() / (config_.volumeId + ".negative"), ec);
@@ -545,7 +634,7 @@ bool TieredChunkCache::areAllCachedInRegion(
     if (missingBoth.empty()) return true;
 
     for (const auto& key : missingBoth) {
-        if (!isReadyForNonBlockingRead(key)) {
+        if (!isAvailableWithoutRemoteFetch(key)) {
             return false;
         }
     }
@@ -556,7 +645,7 @@ size_t TieredChunkCache::countAvailable(const std::vector<ChunkKey>& keys) const
 {
     size_t available = 0;
     for (const auto& key : keys) {
-        if (isReadyForNonBlockingRead(key)) {
+        if (isAvailableWithoutRemoteFetch(key)) {
             available++;
         }
     }
@@ -602,6 +691,14 @@ auto TieredChunkCache::stats() const -> Stats
     s.hotBytes = hotCache_.byte_size();
     s.warmBytes = warmCache_.byte_size();
     s.ioPending = ioPool_.pendingCount();
+    if (diskStore_) {
+        s.diskFiles = diskStore_->fileCount();
+        s.diskBytes = diskStore_->totalBytes();
+    }
+    {
+        std::shared_lock lock(negativeMutex_);
+        s.negativeCount = negativeCache_.size();
+    }
     return s;
 }
 
@@ -651,7 +748,6 @@ ChunkDataPtr TieredChunkCache::promoteFromWarm(
 
     auto data = decompress_(warm.data, key);
     if (!data) return nullptr;
-
     hotPut(key, data);
     return data;
 }
@@ -665,14 +761,8 @@ ChunkDataPtr TieredChunkCache::promoteFromCold(const ChunkKey& key)
 
     statColdHits_.fetch_add(1, std::memory_order_relaxed);
 
-    // Keep a local copy for promotion before putting into warm cache,
-    // since another thread could evict from warm between put and get.
     CompressedChunk localCopy{*compressed};
-
-    // Store in warm
     warmPut(key, std::move(*compressed));
-
-    // Decompress and promote to hot using our local copy
     return promoteFromWarm(key, std::move(localCopy));
 }
 
@@ -684,6 +774,17 @@ ChunkDataPtr TieredChunkCache::promoteFromIce(const ChunkKey& key)
     if (compressed.empty()) return nullptr;
 
     statIceFetches_.fetch_add(1, std::memory_order_relaxed);
+
+    // Optionally recompress before storing to disk/warm
+    if (config_.recompress) {
+        try {
+            auto recompressed = config_.recompress(compressed, key);
+            if (!recompressed.empty())
+                compressed = std::move(recompressed);
+        } catch (...) {
+            // Fall through with original data
+        }
+    }
 
     // Store to cold (disk cache)
     if (diskStore_) {
@@ -724,6 +825,21 @@ bool TieredChunkCache::isReadyForNonBlockingRead(const ChunkKey& key) const
     return false;
 }
 
+bool TieredChunkCache::isAvailableWithoutRemoteFetch(const ChunkKey& key) const
+{
+    if (isReadyForNonBlockingRead(key)) return true;
+
+    // Check cold tier (disk): if on disk, no remote fetch needed.
+    if (diskStore_ && diskStore_->contains(config_.volumeId, key))
+        return true;
+    return false;
+}
+
+void TieredChunkCache::flushPersistentState()
+{
+    saveNegativeCache();
+}
+
 // =============================================================================
 // Negative cache persistence
 // =============================================================================
@@ -731,26 +847,9 @@ bool TieredChunkCache::isReadyForNonBlockingRead(const ChunkKey& key) const
 void TieredChunkCache::loadNegativeCache()
 {
     if (!diskStore_) return;
+    auto negRoot = diskStore_->root();
 
-    auto path = diskStore_->root() / (config_.volumeId + ".negative");
-
-    // Check file age — skip if older than 7 days
-    {
-        std::error_code ec;
-        auto ftime = std::filesystem::last_write_time(path, ec);
-        if (ec) return;  // file doesn't exist or can't stat
-
-        auto sctp = std::chrono::file_clock::to_sys(ftime);
-        auto age = std::chrono::system_clock::now() - sctp;
-        constexpr auto maxAge = std::chrono::hours(7 * 24);
-        if (age > maxAge) {
-            if (auto* log = cacheDebugLog())
-                std::fprintf(log, "Negative cache file older than 7 days, skipping load\n");
-            std::filesystem::remove(path, ec);
-            return;
-        }
-    }
-
+    auto path = negRoot / (config_.volumeId + ".negative");
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return;
 
@@ -771,9 +870,11 @@ void TieredChunkCache::loadNegativeCache()
 
 void TieredChunkCache::saveNegativeCache() const
 {
-    if (!diskStore_ || negativeCache_.empty()) return;
+    if (negativeCache_.empty()) return;
+    if (!diskStore_) return;
+    auto negRoot = diskStore_->root();
 
-    auto path = diskStore_->root() / (config_.volumeId + ".negative");
+    auto path = negRoot / (config_.volumeId + ".negative");
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f.is_open()) return;
 

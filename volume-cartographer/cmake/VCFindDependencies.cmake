@@ -95,6 +95,12 @@ endif()
 find_package(CGAL REQUIRED)
 
 # ---- OpenMP ------------------------------------------------------------------
+# Auto-disable OpenMP when using Clang (Clang's OpenMP support is often problematic)
+if (VC_USE_OPENMP AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(STATUS "Clang detected — disabling OpenMP (use GCC for OpenMP support)")
+    set(VC_USE_OPENMP OFF)
+endif()
+
 if (VC_USE_OPENMP)
     message(STATUS "OpenMP support enabled")
     if(APPLE)

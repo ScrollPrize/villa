@@ -33,6 +33,7 @@ class QGraphicsScene;
 class QGraphicsItem;
 class QGraphicsPixmapItem;
 class QLabel;
+class QTimer;
 struct POI;
 class CState;
 class ViewerManager;
@@ -262,6 +263,12 @@ private:
     // Recompute dynamic minimum scale so content never appears smaller than viewport
     void updateContentMinScale();
 
+    // Temporarily lower render quality during active interaction, then
+    // restore full quality after a short idle period.
+    void beginInteractionRender();
+    void settleInteractionRender();
+    bool interactionRenderActive() const;
+
     // Returns true for axis-aligned viewer slots (xy/xz/yz plane, seg xz/yz)
     bool isAxisAlignedView() const;
 
@@ -397,8 +404,9 @@ private:
     // --- Status ---
     QLabel* _lbl = nullptr;
     bool _dirtyWhileMinimized = false;
-    std::chrono::steady_clock::time_point _lastStatusUpdate;  // debounce status label
     bool _overlayUpdatePending = false;  // coalescing flag for scheduleOverlayUpdate()
+    bool _interactionQualityActive = false;
+    QTimer* _interactionSettleTimer = nullptr;
 
     // --- Zoom limits ---
     float _contentMinScale = TiledViewerCamera::MIN_SCALE;  // dynamic minimum so content fills viewport

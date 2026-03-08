@@ -628,6 +628,148 @@
            </property>
           </widget>
          </item>
+         <item row="3" column="0" colspan="3">
+          <widget class="QCheckBox" name="chkVideoRecompress">
+           <property name="text">
+            <string>Recompress remote chunks with video codec (reduces disk cache size)</string>
+           </property>
+           <property name="toolTip">
+            <string>When enabled, chunks fetched from remote volumes are re-encoded with a video codec before storing to the disk cache. This significantly reduces disk usage at the cost of some quality loss. Requires restart.</string>
+           </property>
+          </widget>
+         </item>
+         <item row="4" column="0">
+          <widget class="QLabel" name="labelVideoCodecType">
+           <property name="text">
+            <string>Video codec</string>
+           </property>
+          </widget>
+         </item>
+         <item row="4" column="1">
+          <widget class="QComboBox" name="cmbVideoCodecType">
+           <item>
+            <property name="text">
+             <string>H.264</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>H.265</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>C3D (3D DCT)</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item row="5" column="0">
+          <widget class="QLabel" name="labelVideoQualityPreset">
+           <property name="text">
+            <string>Compression level</string>
+           </property>
+          </widget>
+         </item>
+         <item row="5" column="1">
+          <widget class="QComboBox" name="cmbVideoQualityPreset">
+           <property name="toolTip">
+            <string>Controls quality vs compression ratio. Higher compression = more disk savings but lower fidelity.</string>
+           </property>
+           <item>
+            <property name="text">
+             <string>Lossless (1x–5x)</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>Near-lossless (4x–7x)</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>High quality (5x–10x)</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>Balanced (8x–15x)</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>Compact (15x–30x)</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>Maximum compression (30x–70x)</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item row="6" column="0" colspan="3">
+          <widget class="QCheckBox" name="chkRechunk32">
+           <property name="text">
+            <string>Force rechunk to 32³ blocks (optimal for C3D codec)</string>
+           </property>
+           <property name="toolTip">
+            <string>When enabled, chunks are split into 32×32×32 sub-blocks before compression. This is optimal for the C3D codec which natively operates on 32³ blocks, but may also benefit other codecs. Requires restart.</string>
+           </property>
+          </widget>
+         </item>
+         <item row="7" column="0">
+          <widget class="QLabel" name="lblPrefetchLevels">
+           <property name="text">
+            <string>Prefetch levels on open:</string>
+           </property>
+           <property name="toolTip">
+            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;How many of the coarsest pyramid levels to download when opening a remote volume.&lt;/p&gt;&lt;p&gt;E.g., with a volume that has levels 0/ through 5/:&lt;/p&gt;&lt;ul&gt;&lt;li&gt;0 = no prefetch (on-demand only)&lt;/li&gt;&lt;li&gt;1 = download 5/ (already happens by default)&lt;/li&gt;&lt;li&gt;2 = download 5/ and 4/&lt;/li&gt;&lt;li&gt;3 = download 5/, 4/, and 3/&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;Downloads go through the normal pipeline (recompression if enabled). Non-blocking.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+           </property>
+          </widget>
+         </item>
+         <item row="7" column="1">
+          <widget class="QSpinBox" name="spinPrefetchLevels">
+           <property name="minimum">
+            <number>0</number>
+           </property>
+           <property name="maximum">
+            <number>6</number>
+           </property>
+           <property name="value">
+            <number>0</number>
+           </property>
+           <property name="toolTip">
+            <string>Number of coarsest pyramid levels to prefetch (0 = disabled)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="8" column="0">
+          <widget class="QLabel" name="lblIOThreads">
+           <property name="text">
+            <string>Download threads</string>
+           </property>
+           <property name="toolTip">
+            <string>Number of background threads for downloading remote chunks. More threads = faster downloads but more network/CPU usage. Requires restart.</string>
+           </property>
+          </widget>
+         </item>
+         <item row="8" column="1">
+          <widget class="QSpinBox" name="spinIOThreads">
+           <property name="minimum">
+            <number>1</number>
+           </property>
+           <property name="maximum">
+            <number>100</number>
+           </property>
+           <property name="value">
+            <number>8</number>
+           </property>
+           <property name="toolTip">
+            <string>Number of background threads for downloading remote chunks (1-100). Requires restart.</string>
+           </property>
+          </widget>
+         </item>
         </layout>
        </widget>
       </item>

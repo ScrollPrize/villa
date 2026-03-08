@@ -893,6 +893,15 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit addIgnoreLabelRequested();
     });
 
+    // "Fetch remote chunks" — only shown when the current volume is remote
+    auto currentVol = _state ? _state->currentVolume() : nullptr;
+    if (currentVol && currentVol->isRemote()) {
+        QAction* fetchRemoteAction = contextMenu.addAction(tr("Fetch remote chunks"));
+        connect(fetchRemoteAction, &QAction::triggered, this, [this, segmentId]() {
+            emit fetchRemoteChunksRequested(segmentId);
+        });
+    }
+
     contextMenu.addSeparator();
 
     QAction* inpaintTeleaAction = contextMenu.addAction(tr("Inpaint (Telea) && Rebuild Segment"));

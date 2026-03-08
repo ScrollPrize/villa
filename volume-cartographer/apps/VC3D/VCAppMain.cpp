@@ -16,6 +16,11 @@
 #include <cstdlib>
 #ifndef _WIN32
 #include <dlfcn.h>
+#include <sys/resource.h>
+#endif
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 // Runs before main() AND before all shared-library constructors.
@@ -39,6 +44,7 @@ __attribute__((section(".preinit_array"), used))
 static auto preinitFn = &setThreadPoliciesEarly;
 #endif
 
+__attribute__((visibility("default")))
 auto main(int argc, char* argv[]) -> int
 {
 #ifndef __linux__
@@ -64,6 +70,16 @@ auto main(int argc, char* argv[]) -> int
     // later, blas_thread_init() will be called automatically.
     if (auto fn = reinterpret_cast<void(*)()>(dlsym(RTLD_DEFAULT, "blas_shutdown")))
         fn();
+#endif
+
+#ifndef _WIN32
+    // Lower CPU and IO priority so VC3D doesn't starve the rest of the system.
+    // nice 10 = low CPU priority; IOPRIO_CLASS_IDLE = only use IO when idle.
+    setpriority(PRIO_PROCESS, 0, 10);
+#endif
+#ifdef __linux__
+    // ioprio_set(IOPRIO_WHO_PROCESS, 0, IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0))
+    syscall(SYS_ioprio_set, 1 /*WHO_PROCESS*/, 0, (3 << 13) | 0);
 #endif
 
     omp_set_num_threads(1);  // All parallelism is explicit (QThreadPool, IOPool); OMP threads just spin-wait

@@ -30,8 +30,7 @@ struct CompositeParams;
 class Volume
 {
 public:
-    // Bounding box of non-zero data in level-0 voxel coordinates (inclusive).
-    // Derived from the coarsest pyramid level.
+    // Bounding box of the physical volume in level-0 voxel coordinates (inclusive).
     struct DataBounds {
         int minX = 0, maxX = 0;  // level-0 voxel coords, inclusive
         int minY = 0, maxY = 0;
@@ -105,6 +104,15 @@ public:
     // Must be called before first tieredCache() access.
     void setDiskCacheMaxBytes(size_t bytes);
 
+    // Enable video codec recompression for disk-cached remote chunks.
+    // codecType: 0=H264, 1=H265; qp: quantization parameter (0-51).
+    // Must be called before first tieredCache() access.
+    void setVideoRecompression(bool enabled, int codecType = 0, int qp = 26);
+
+    // Set the number of background IO threads for chunk fetching.
+    // Must be called before first tieredCache() access.
+    void setIOThreads(int count);
+
     // --- Sampling API ---
 
     // Single-slice blocking sample (uint8)
@@ -136,17 +144,34 @@ public:
     // lo/hi are in world (level 0) coordinates, (x, y, z).
     void prefetchWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level);
 
+    // Prefetch entire pyramid levels in the background. Levels are fetched
+    // from coarsest to finest (high level numbers first). Non-blocking.
+    // fromLevel/toLevel are inclusive. E.g., prefetchLevels(3, 5) fetches 5, 4, 3.
+    void prefetchLevels(int fromLevel, int toLevel);
+
     // Cancel all pending (not in-flight) async prefetch tasks.
     void cancelPendingPrefetch();
 
     // --- Data bounds ---
 
-    // Return the bounding box of non-zero data (level-0 voxel coords).
-    // Computed lazily; retries if previous attempt found no data.
+    // Return the bounding box of the volume (level-0 voxel coords).
+    // Computed lazily from the volume shape.
     [[nodiscard]] const DataBounds& dataBounds() const;
 
-    // Scan the coarsest pyramid level to find non-zero data extent.
+    // Set data bounds to the full volume shape.
     void computeDataBounds();
+
+    // --- Remote level-5 priming ---
+
+    // Returns true when the volume is remote, has >= 6 pyramid levels,
+    // and level 5 hasn't been fully downloaded yet.
+    [[nodiscard]] bool needsRemoteLevel5Prime() const;
+
+    // Download every chunk at pyramid level 5 synchronously.
+    // Calls progressCb(completed, total) periodically for UI updates.
+    // After completion, flushes persistent state so a reopen doesn't repeat.
+    void primeRemoteLevel5Blocking(
+        std::function<void(size_t completed, size_t total)> progressCb = nullptr);
 
     [[nodiscard]] static bool checkDir(std::filesystem::path path);
 
@@ -169,13 +194,23 @@ protected:
     size_t cacheBudgetWarm_ = 2ULL << 30;   // 2 GB default
     size_t diskCacheMaxBytes_ = 100ULL << 30; // 100 GB default
     std::shared_ptr<vc::cache::DiskStore> pendingDiskStore_;
+    bool videoRecompressEnabled_ = false;
+    int videoCodecType_ = 0;
+    int videoCodecQP_ = 26;
+    int ioThreads_ = 0;  // 0 = use default
+    std::atomic<bool> prefetchStarted_{false};
 
     void ensureTieredCache() const;
 
-    // Data bounds (lazy-computed, retryable if invalid)
+    // Data bounds (lazy-computed from volume shape)
     mutable DataBounds dataBounds_;
     mutable std::atomic<bool> boundsComputed_{false};
     mutable std::mutex boundsMutex_;
+
+    // Remote level-5 priming state
+    mutable std::mutex remoteLevel5PrimeMutex_;
+    bool remoteLevel5PrimeStarted_ = false;
+    bool remoteLevel5PrimeDone_ = false;
 
     // Bounding box of coords in chunk index space (helper for allChunksCached/prefetch)
     struct ChunkBBox {

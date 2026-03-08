@@ -59,6 +59,9 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/flattening/ABFFlattening.hpp"
+#include "vc/core/cache/TieredChunkCache.hpp"
+#include "vc/core/cache/ChunkKey.hpp"
+#include "vc/core/types/VcDataset.hpp"
 #include "ToolDialogs.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
@@ -1135,6 +1138,181 @@ private:
     QPointer<QProgressDialog> progress_;
 };
 
+// ---- Remote chunk fetch helpers ----
+
+struct RemoteChunkFetchProgress {
+    enum class Phase { Planning, Fetching };
+    std::atomic<Phase> phase{Phase::Planning};
+    std::atomic<int> planRowsDone{0};
+    std::atomic<int> planRowsTotal{0};
+    std::atomic<size_t> plannedKeys{0};
+    std::atomic<size_t> availableKeys{0};
+    std::atomic<size_t> totalKeys{0};
+    std::atomic<size_t> ioPending{0};
+};
+
+struct RemoteChunkFetchResult {
+    bool success{false};
+    QString error;
+    size_t totalKeys{0};
+    size_t initialAvailable{0};
+    size_t fetchedKeys{0};
+    int levels{0};
+};
+
+constexpr float kRemoteChunkFetchMarginVoxels = 2.0f;
+
+static void addChunkKeysForBounds(
+    std::unordered_set<vc::cache::ChunkKey, vc::cache::ChunkKeyHash>& keys,
+    vc::VcDataset* ds, int level,
+    const cv::Vec3f& lo, const cv::Vec3f& hi)
+{
+    if (!ds) return;
+    const double scale = (level > 0) ? (1.0 / static_cast<double>(1 << level)) : 1.0;
+    const auto& chunkShape = ds->defaultChunkShape();
+    const auto& shape = ds->shape();
+
+    const double loX = static_cast<double>(lo[0]) * scale - kRemoteChunkFetchMarginVoxels;
+    const double loY = static_cast<double>(lo[1]) * scale - kRemoteChunkFetchMarginVoxels;
+    const double loZ = static_cast<double>(lo[2]) * scale - kRemoteChunkFetchMarginVoxels;
+    const double hiX = static_cast<double>(hi[0]) * scale + kRemoteChunkFetchMarginVoxels;
+    const double hiY = static_cast<double>(hi[1]) * scale + kRemoteChunkFetchMarginVoxels;
+    const double hiZ = static_cast<double>(hi[2]) * scale + kRemoteChunkFetchMarginVoxels;
+
+    const int minIx = std::max(0, static_cast<int>(std::floor(loX / chunkShape[2])));
+    const int maxIx = std::min(static_cast<int>((shape[2] - 1) / chunkShape[2]),
+                               static_cast<int>(std::ceil(hiX / chunkShape[2])));
+    const int minIy = std::max(0, static_cast<int>(std::floor(loY / chunkShape[1])));
+    const int maxIy = std::min(static_cast<int>((shape[1] - 1) / chunkShape[1]),
+                               static_cast<int>(std::ceil(hiY / chunkShape[1])));
+    const int minIz = std::max(0, static_cast<int>(std::floor(loZ / chunkShape[0])));
+    const int maxIz = std::min(static_cast<int>((shape[0] - 1) / chunkShape[0]),
+                               static_cast<int>(std::ceil(hiZ / chunkShape[0])));
+
+    if (minIx > maxIx || minIy > maxIy || minIz > maxIz) return;
+
+    for (int iz = minIz; iz <= maxIz; ++iz)
+        for (int iy = minIy; iy <= maxIy; ++iy)
+            for (int ix = minIx; ix <= maxIx; ++ix)
+                keys.insert(vc::cache::ChunkKey{level, iz, iy, ix});
+}
+
+static std::vector<vc::cache::ChunkKey> collectRemoteChunkKeysForSurface(
+    const QuadSurface& surface,
+    const std::shared_ptr<Volume>& volume,
+    const std::shared_ptr<RemoteChunkFetchProgress>& progress)
+{
+    std::unordered_set<vc::cache::ChunkKey, vc::cache::ChunkKeyHash> keys;
+    const auto* points = surface.rawPointsPtr();
+    if (!points || points->empty() || !volume) return {};
+
+    const int numLevels = static_cast<int>(volume->numScales());
+    const int quadRows = std::max(0, points->rows - 1);
+    progress->phase.store(RemoteChunkFetchProgress::Phase::Planning, std::memory_order_relaxed);
+    progress->planRowsDone.store(0, std::memory_order_relaxed);
+    progress->planRowsTotal.store(quadRows + points->rows, std::memory_order_relaxed);
+
+    for (int row = 0; row < quadRows; ++row) {
+        for (int col = 0; col < points->cols - 1; ++col) {
+            if (!surface.isQuadValid(row, col)) continue;
+
+            const cv::Vec3f& p00 = (*points)(row, col);
+            const cv::Vec3f& p01 = (*points)(row, col + 1);
+            const cv::Vec3f& p10 = (*points)(row + 1, col);
+            const cv::Vec3f& p11 = (*points)(row + 1, col + 1);
+
+            cv::Vec3f lo = p00, hi = p00;
+            for (const cv::Vec3f& point : {p01, p10, p11}) {
+                lo[0] = std::min(lo[0], point[0]); lo[1] = std::min(lo[1], point[1]); lo[2] = std::min(lo[2], point[2]);
+                hi[0] = std::max(hi[0], point[0]); hi[1] = std::max(hi[1], point[1]); hi[2] = std::max(hi[2], point[2]);
+            }
+
+            for (int level = 0; level < numLevels; ++level)
+                addChunkKeysForBounds(keys, volume->zarrDataset(level), level, lo, hi);
+        }
+        progress->planRowsDone.store(row + 1, std::memory_order_relaxed);
+        if (((row + 1) % 8) == 0 || row + 1 == quadRows)
+            progress->plannedKeys.store(keys.size(), std::memory_order_relaxed);
+    }
+
+    for (int row = 0; row < points->rows; ++row) {
+        for (int col = 0; col < points->cols; ++col) {
+            const cv::Vec3f& point = (*points)(row, col);
+            if (!isValidSurfacePoint(point)) continue;
+            for (int level = 0; level < numLevels; ++level)
+                addChunkKeysForBounds(keys, volume->zarrDataset(level), level, point, point);
+        }
+        progress->planRowsDone.store(quadRows + row + 1, std::memory_order_relaxed);
+        if (((row + 1) % 8) == 0 || row + 1 == points->rows)
+            progress->plannedKeys.store(keys.size(), std::memory_order_relaxed);
+    }
+
+    std::vector<vc::cache::ChunkKey> orderedKeys(keys.begin(), keys.end());
+    std::sort(orderedKeys.begin(), orderedKeys.end(), [](const auto& a, const auto& b) {
+        if (a.level != b.level) return a.level < b.level;
+        if (a.iz != b.iz) return a.iz < b.iz;
+        if (a.iy != b.iy) return a.iy < b.iy;
+        return a.ix < b.ix;
+    });
+
+    progress->totalKeys.store(orderedKeys.size(), std::memory_order_relaxed);
+    return orderedKeys;
+}
+
+static RemoteChunkFetchResult fetchRemoteChunkKeys(
+    vc::cache::TieredChunkCache* cache,
+    const std::vector<vc::cache::ChunkKey>& keys,
+    const std::shared_ptr<RemoteChunkFetchProgress>& progress)
+{
+    RemoteChunkFetchResult result;
+    result.totalKeys = keys.size();
+    if (!cache) {
+        result.error = QObject::tr("Chunk cache is not available.");
+        return result;
+    }
+
+    progress->phase.store(RemoteChunkFetchProgress::Phase::Fetching, std::memory_order_relaxed);
+    progress->totalKeys.store(keys.size(), std::memory_order_relaxed);
+
+    if (keys.empty()) { result.success = true; return result; }
+
+    result.initialAvailable = cache->countAvailable(keys);
+    progress->availableKeys.store(result.initialAvailable, std::memory_order_relaxed);
+
+    cache->prefetch(keys);
+
+    size_t available = result.initialAvailable;
+    size_t lastAvailable = available;
+    int idleRetries = 0;
+
+    while (available < keys.size()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        available = cache->countAvailable(keys);
+        const auto stats = cache->stats();
+        progress->availableKeys.store(available, std::memory_order_relaxed);
+        progress->ioPending.store(stats.ioPending, std::memory_order_relaxed);
+
+        if (available >= keys.size()) break;
+
+        if (stats.ioPending == 0 && available == lastAvailable) {
+            ++idleRetries;
+            cache->prefetch(keys);
+            if (idleRetries > 3) {
+                result.error = QObject::tr("Remote chunk fetch stalled at %1 / %2 chunks.")
+                                   .arg(available).arg(keys.size());
+                return result;
+            }
+        } else {
+            idleRetries = 0;
+        }
+        lastAvailable = available;
+    }
+
+    result.success = true;
+    result.fetchedKeys = keys.size() - result.initialAvailable;
+    return result;
+}
+
 } // -------------------- end anonymous namespace ------------------------------
 
 // ====================== SegmentationCommandHandler ============================
@@ -1226,6 +1404,142 @@ SegmentationCommandHandler::buildVolumeOptionList(QString* defaultOut)
     }
 
     return options;
+}
+
+void SegmentationCommandHandler::onFetchRemoteChunks(const std::string& segmentId)
+{
+    if (!_state) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("Application state is not available."));
+        return;
+    }
+
+    const auto volume = _state->currentVolume();
+    if (!volume) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume is currently loaded."));
+        return;
+    }
+    if (!volume->isRemote()) {
+        QMessageBox::information(_parentWidget, tr("Fetch Remote Chunks"),
+                                 tr("The current volume is local, so there are no remote chunks to fetch."));
+        return;
+    }
+
+    std::shared_ptr<QuadSurface> surface = std::dynamic_pointer_cast<QuadSurface>(_state->surface(segmentId));
+    if (!surface && _state->vpkg()) {
+        surface = std::dynamic_pointer_cast<QuadSurface>(_state->vpkg()->getSurface(segmentId));
+    }
+    if (!surface) {
+        QMessageBox::warning(_parentWidget, tr("Error"),
+                             tr("Could not find surface '%1'.").arg(QString::fromStdString(segmentId)));
+        return;
+    }
+    surface->ensureLoaded();
+
+    auto* cache = volume->tieredCache();
+    if (!cache) {
+        QMessageBox::warning(_parentWidget, tr("Error"),
+                             tr("Chunk cache is not available for the current volume."));
+        return;
+    }
+
+    const QString segmentName = QString::fromStdString(segmentId);
+    auto progressState = std::make_shared<RemoteChunkFetchProgress>();
+
+    QProgressDialog progress(tr("Planning remote chunk fetch for %1...").arg(segmentName),
+                             QString(), 0, 0, _parentWidget);
+    progress.setWindowTitle(tr("Fetch Remote Chunks"));
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+    progress.setMinimumDuration(0);
+    progress.setCancelButton(nullptr);
+
+    QFutureWatcher<RemoteChunkFetchResult> watcher;
+    QTimer timer;
+
+    connect(&watcher, &QFutureWatcher<RemoteChunkFetchResult>::finished,
+            &progress, &QDialog::accept);
+    connect(&timer, &QTimer::timeout, &progress, [&progress, progressState, segmentName]() {
+        const auto phase = progressState->phase.load(std::memory_order_relaxed);
+        if (phase == RemoteChunkFetchProgress::Phase::Planning) {
+            const int totalRows = progressState->planRowsTotal.load(std::memory_order_relaxed);
+            const int doneRows = progressState->planRowsDone.load(std::memory_order_relaxed);
+            if (totalRows > 0) {
+                progress.setRange(0, totalRows);
+                progress.setValue(std::min(doneRows, totalRows));
+            } else {
+                progress.setRange(0, 0);
+            }
+            progress.setLabelText(
+                QObject::tr("Planning remote chunk fetch for %1...\nRows: %2 / %3\nChunks identified: %4")
+                    .arg(segmentName).arg(doneRows).arg(totalRows)
+                    .arg(QString::number(static_cast<qulonglong>(
+                        progressState->plannedKeys.load(std::memory_order_relaxed)))));
+            return;
+        }
+
+        const size_t totalKeys = progressState->totalKeys.load(std::memory_order_relaxed);
+        const size_t availableKeys = progressState->availableKeys.load(std::memory_order_relaxed);
+        const size_t ioPending = progressState->ioPending.load(std::memory_order_relaxed);
+        if (totalKeys > 0) {
+            const int safeTotal = totalKeys > static_cast<size_t>(std::numeric_limits<int>::max())
+                ? std::numeric_limits<int>::max() : static_cast<int>(totalKeys);
+            progress.setRange(0, safeTotal);
+            progress.setValue(std::min(static_cast<int>(availableKeys), safeTotal));
+        } else {
+            progress.setRange(0, 0);
+        }
+        progress.setLabelText(
+            QObject::tr("Fetching remote chunks for %1...\nChunks ready: %2 / %3\nPending I/O: %4")
+                .arg(segmentName)
+                .arg(QString::number(static_cast<qulonglong>(availableKeys)))
+                .arg(QString::number(static_cast<qulonglong>(totalKeys)))
+                .arg(QString::number(static_cast<qulonglong>(ioPending))));
+    });
+
+    timer.start(100);
+    watcher.setFuture(QtConcurrent::run([surface, volume, cache, progressState]() {
+        RemoteChunkFetchResult result;
+        result.levels = static_cast<int>(volume->numScales());
+        const auto keys = collectRemoteChunkKeysForSurface(*surface, volume, progressState);
+        auto fetchResult = fetchRemoteChunkKeys(cache, keys, progressState);
+        fetchResult.levels = result.levels;
+        return fetchResult;
+    }));
+
+    if (!watcher.isFinished()) {
+        progress.exec();
+    }
+    timer.stop();
+    watcher.waitForFinished();
+
+    const auto result = watcher.result();
+    if (!result.success) {
+        QMessageBox::warning(_parentWidget, tr("Fetch Remote Chunks"),
+                             result.error.isEmpty()
+                                 ? tr("Failed to fetch remote chunks for '%1'.").arg(segmentName)
+                                 : result.error);
+        return;
+    }
+
+    if (result.totalKeys == 0) {
+        emit statusMessage(tr("No remote chunks were needed for '%1'.").arg(segmentName), 5000);
+        return;
+    }
+
+    if (result.fetchedKeys == 0) {
+        emit statusMessage(
+            tr("All %1 remote chunk(s) for '%2' were already cached.")
+                .arg(QString::number(static_cast<qulonglong>(result.totalKeys)))
+                .arg(segmentName), 7000);
+        return;
+    }
+
+    emit statusMessage(
+        tr("Fetched %1 remote chunk(s) for '%2' across %3 scale level(s) (%4 already cached).")
+            .arg(QString::number(static_cast<qulonglong>(result.fetchedKeys)))
+            .arg(segmentName).arg(result.levels)
+            .arg(QString::number(static_cast<qulonglong>(result.initialAvailable))), 7000);
 }
 
 void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)

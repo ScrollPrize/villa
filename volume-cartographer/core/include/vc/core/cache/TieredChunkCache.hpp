@@ -53,6 +53,15 @@ public:
         size_t warmMaxBytes = 2ULL << 30;    // 2 GB
         std::string volumeId;                // for disk store keying
         int ioThreads = 8;
+        size_t ioQueueSize = 50000;  // max pending IO tasks
+
+        // Optional: recompress chunks before storing to disk cache.
+        // When set, chunks fetched from remote are decompressed first
+        // (using the normal decompress_ function), then recompressed
+        // with this function before writing to disk. The warm tier and
+        // disk cache store the recompressed format, so decompress_ must
+        // handle both the original and recompressed formats.
+        RecompressFn recompress;
     };
 
     // source: where to fetch chunks (filesystem, HTTP, etc.)
@@ -97,6 +106,13 @@ public:
     void prefetchRegion(int level, int iz0, int iy0, int ix0,
                         int iz1, int iy1, int ix1);
 
+    // Prefetch an entire pyramid level. Non-blocking — feeds chunks into
+    // the IO queue in batches from a background thread so the queue doesn't
+    // overflow. Calls progressCb(fetched, total) periodically from the
+    // background thread if provided.
+    using PrefetchProgressCb = std::function<void(int fetched, int total)>;
+    void prefetchLevel(int level, PrefetchProgressCb progressCb = nullptr);
+
     // Cancel all pending (not in-flight) prefetch tasks.
     void cancelPendingPrefetch();
 
@@ -126,8 +142,13 @@ public:
     // Full dataset shape at a given level, in {z, y, x} order.
     [[nodiscard]] std::array<int, 3> levelShape(int level) const;
 
+    // Persist negative-cache entries to disk without destroying the cache.
+    // Call after bulk operations (e.g. level-5 priming) so reopening the same
+    // remote volume doesn't re-download empty chunks.
+    void flushPersistentState();
+
     // --- Logical data bounds (level-0 voxel coords, x/y/z order) ---
-    // Set by Volume after scanning the coarsest level for non-zero data.
+    // Physical volume bounds set from volume shape.
     // Used by CacheParams/ChunkSampler to skip chunks in zero-padded regions.
     struct DataBoundsL0 {
         int minX = 0, maxX = 0;
@@ -144,16 +165,15 @@ public:
     // so callers should treat negative-cached chunks as available.
     [[nodiscard]] bool isNegativeCached(const ChunkKey& key) const;
 
-    // Batch check: are ALL chunks in a region ready for non-blocking access?
-    // This includes hot/warm tiers and negative-cached chunks, but excludes
-    // cold-disk-only entries that still need promotion before get() can serve
-    // them.
+    // Batch check: are ALL chunks in a region locally available (no remote
+    // fetch needed)?  Includes hot/warm tiers, negative-cached chunks, AND
+    // cold-disk-only entries.
     [[nodiscard]] bool areAllCachedInRegion(int level,
                               int iz0, int iy0, int ix0,
                               int iz1, int iy1, int ix1) const;
 
-    // Count how many of the given keys are ready for non-blocking access
-    // (hot/warm tiers or negative-cached).
+    // Count how many of the given keys are locally available (no remote
+    // fetch needed): hot/warm tiers, negative-cached, or on disk.
     [[nodiscard]] size_t countAvailable(const std::vector<ChunkKey>& keys) const;
 
     // --- Notifications ---
@@ -185,6 +205,9 @@ public:
         size_t hotBytes = 0;
         size_t warmBytes = 0;
         size_t ioPending = 0;   // pending + in-flight IO tasks
+        size_t diskFiles = 0;   // total chunk files on disk (all sessions)
+        size_t diskBytes = 0;   // total bytes on disk
+        size_t negativeCount = 0; // chunks known to be empty/missing
     };
 
     [[nodiscard]] Stats stats() const;
@@ -251,6 +274,10 @@ private:
 
     // Ready for non-blocking access by get(): hot/warm or negative-cached.
     [[nodiscard]] bool isReadyForNonBlockingRead(const ChunkKey& key) const;
+
+    // Locally available without a remote fetch: hot/warm, negative-cached,
+    // OR present on disk (cold tier).
+    [[nodiscard]] bool isAvailableWithoutRemoteFetch(const ChunkKey& key) const;
 
     mutable std::mutex callbackMutex_;
     std::vector<std::pair<ChunkReadyCallbackId, ChunkReadyCallback>> chunkReadyListeners_;
