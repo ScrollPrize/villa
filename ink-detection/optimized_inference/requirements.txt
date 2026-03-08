@@ -9,6 +9,8 @@ opencv-python-headless>=4.5.0
 boto3
 huggingface_hub>=0.23.0
 tifffile
+psutil
+nvidia-ml-py
 numcodecs>=0.16.3
 imagecodecs
 # Install zarr from git source to access CacheStore experimental feature (not yet in released version)

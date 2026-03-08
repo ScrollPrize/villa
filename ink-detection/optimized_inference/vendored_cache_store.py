@@ -13,6 +13,7 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Literal
 
 from zarr.abc.store import ByteRequest, Store
@@ -140,6 +141,14 @@ class CacheStore(WrapperStore[Store]):
         """Generate the cache key for a negative entry."""
         return f".neg.{key}"
 
+    @staticmethod
+    def _buffer_size(value: "Buffer | None") -> int:
+        if value is None:
+            return 0
+        with suppress(Exception):
+            return len(value)
+        return 0
+
     def _is_key_fresh(self, key: str) -> bool:
         """Check if a cached key is still fresh based on max_age_seconds.
 
@@ -241,10 +250,20 @@ class CacheStore(WrapperStore[Store]):
         self, key: str, prototype: BufferPrototype, byte_range: ByteRequest | None = None
     ) -> Buffer | None:
         """Try to get data from cache first, falling back to source store."""
+        from profiling import record_store_event
+
+        start_cache_get = time.monotonic()
         maybe_cached_result = await self._cache.get(key, prototype, byte_range)
+        cache_get_elapsed = time.monotonic() - start_cache_get
         if maybe_cached_result is not None:
             logger.debug("_get_try_cache: key %s found in cache (HIT)", key)
             self._hits += 1
+            record_store_event(
+                "local_read",
+                cache_get_elapsed,
+                num_bytes=self._buffer_size(maybe_cached_result),
+            )
+            record_store_event("cache_hit", 0.0)
             # Update access order for LRU
             await self._update_access_order(key)
             return maybe_cached_result
@@ -252,17 +271,24 @@ class CacheStore(WrapperStore[Store]):
         # Check for negative cache entry
         neg_key = self._negative_key(key)
         if self._is_key_fresh(neg_key):
+            start_negative_get = time.monotonic()
             neg_result = await self._cache.get(neg_key, prototype)
+            negative_elapsed = time.monotonic() - start_negative_get
             if neg_result is not None:
                 logger.debug("_get_try_cache: negative entry for key %s found in cache (NEGATIVE HIT)", key)
                 self._negative_hits += 1
+                record_store_event("local_read", negative_elapsed)
+                record_store_event("cache_negative_hit", 0.0)
                 return None
 
         logger.debug(
             "_get_try_cache: key %s not found in cache (MISS), fetching from store", key
         )
         self._misses += 1
+        record_store_event("cache_miss", 0.0)
+        start_remote_get = time.monotonic()
         maybe_fresh_result = await super().get(key, prototype, byte_range)
+        remote_elapsed = time.monotonic() - start_remote_get
         if maybe_fresh_result is None:
             # Key doesn't exist in source store - create negative cache entry
             await self._cache.delete(key)
@@ -274,17 +300,33 @@ class CacheStore(WrapperStore[Store]):
             await self._cache.set(neg_key, neg_buffer)
             self.key_insert_times[neg_key] = time.monotonic()
         else:
+            record_store_event(
+                "remote_read",
+                remote_elapsed,
+                num_bytes=self._buffer_size(maybe_fresh_result),
+            )
             # Cache the newly fetched value
+            start_cache_fill = time.monotonic()
             await self._cache.set(key, maybe_fresh_result)
             await self._cache_value(key, maybe_fresh_result)
+            record_store_event(
+                "cache_fill",
+                time.monotonic() - start_cache_fill,
+                num_bytes=self._buffer_size(maybe_fresh_result),
+            )
         return maybe_fresh_result
 
     async def _get_no_cache(
         self, key: str, prototype: BufferPrototype, byte_range: ByteRequest | None = None
     ) -> Buffer | None:
         """Get data directly from source store and update cache."""
+        from profiling import record_store_event
+
         self._misses += 1
+        record_store_event("cache_miss", 0.0)
+        start_remote_get = time.monotonic()
         maybe_fresh_result = await super().get(key, prototype, byte_range)
+        remote_elapsed = time.monotonic() - start_remote_get
         if maybe_fresh_result is None:
             # Key doesn't exist in source, remove from cache and tracking
             await self._cache.delete(key)
@@ -298,8 +340,19 @@ class CacheStore(WrapperStore[Store]):
             self.key_insert_times[neg_key] = time.monotonic()
         else:
             logger.debug("_get_no_cache: key %s found in store, setting in cache", key)
+            record_store_event(
+                "remote_read",
+                remote_elapsed,
+                num_bytes=self._buffer_size(maybe_fresh_result),
+            )
+            start_cache_fill = time.monotonic()
             await self._cache.set(key, maybe_fresh_result)
             await self._cache_value(key, maybe_fresh_result)
+            record_store_event(
+                "cache_fill",
+                time.monotonic() - start_cache_fill,
+                num_bytes=self._buffer_size(maybe_fresh_result),
+            )
         return maybe_fresh_result
 
     async def get(
@@ -344,7 +397,15 @@ class CacheStore(WrapperStore[Store]):
             The data to store
         """
         logger.debug("set: setting key %s in store", key)
+        from profiling import record_store_event
+
+        start_store_set = time.monotonic()
         await super().set(key, value)
+        record_store_event(
+            "local_write",
+            time.monotonic() - start_store_set,
+            num_bytes=self._buffer_size(value),
+        )
 
         # Delete any negative cache entry for this key
         neg_key = self._negative_key(key)
@@ -353,8 +414,14 @@ class CacheStore(WrapperStore[Store]):
 
         if self.cache_set_data:
             logger.debug("set: setting key %s in cache", key)
+            start_cache_fill = time.monotonic()
             await self._cache.set(key, value)
             await self._cache_value(key, value)
+            record_store_event(
+                "cache_fill",
+                time.monotonic() - start_cache_fill,
+                num_bytes=self._buffer_size(value),
+            )
         else:
             logger.debug("set: deleting key %s from cache", key)
             await self._cache.delete(key)
