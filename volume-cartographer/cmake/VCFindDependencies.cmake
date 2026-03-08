@@ -92,7 +92,14 @@ if(NOT OpenCV_FOUND)
 endif()
 
 # ---- CGAL --------------------------------------------------------------------
-find_package(CGAL REQUIRED)
+find_package(CGAL QUIET)
+if (NOT CGAL_FOUND)
+    message(FATAL_ERROR
+        "CGAL is required but was not found.\n"
+        "Please install it first (Ubuntu): sudo apt-get install -y libcgal-dev\n"
+        "If installed in a non-standard prefix, set CGAL_DIR to the directory containing\n"
+        "CGALConfig.cmake (or cgal-config.cmake), or add that directory to CMAKE_PREFIX_PATH.")
+endif()
 
 # ---- OpenMP ------------------------------------------------------------------
 if (VC_USE_OPENMP)
