@@ -400,11 +400,26 @@ def optimize(
 	_done_steps = [0]
 	_num_stages = len(stages)
 
+	# Debug: show corr status
+	has_corr_pts = data.corr_points is not None and data.corr_points.points_xyz_winda.shape[0] > 0
+	corr_weights = [(_need_term("corr", s.global_opt.eff), s.name) for s in stages if s.global_opt.steps > 0]
+	print(f"[optimizer] corr_points={has_corr_pts}"
+		  f" snap_mode={opt_loss_corr._snap_mode}"
+		  f" corr_weights={corr_weights}", flush=True)
+	if has_corr_pts:
+		cp = data.corr_points
+		n = cp.points_xyz_winda.shape[0]
+		print(f"[optimizer] {n} corr points", flush=True)
+		if all(w == 0.0 for w, _ in corr_weights):
+			print(f"[optimizer] WARNING: corr points loaded but corr weight is 0 in all stages!", flush=True)
+
 	for si, stage in enumerate(stages):
 		if stage.global_opt.steps > 0:
 			data = _run_opt(si=si, label=f"stage{si}", stage=stage, opt_cfg=stage.global_opt, data=data)
 
 	if any(_need_term("corr", stage.global_opt.eff) > 0 for stage in stages if stage.global_opt.steps > 0):
 		opt_loss_corr.print_summary()
+	elif has_corr_pts:
+		print("[optimizer] corr points present but corr weight=0, no corr loss computed", flush=True)
 
 	return data

@@ -63,18 +63,24 @@ def _arc_params_from_seed(
 def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D | None:
 	"""Parse a VC3D corr_points collections dict into CorrPoints3D."""
 	cols = obj.get("collections", {})
+	print(f"[fit] _parse_corr_points: {len(cols) if isinstance(cols, dict) else 0} collections in input", flush=True)
 	if not isinstance(cols, dict):
+		print(f"[fit] _parse_corr_points: collections is not a dict: {type(cols).__name__}", flush=True)
 		return None
 	rows: list[list[float]] = []
 	cids: list[int] = []
 	pids: list[int] = []
 	for _cid, col in cols.items():
 		if not isinstance(col, dict):
+			print(f"[fit] _parse_corr_points: col {_cid} is not a dict", flush=True)
 			continue
 		md = col.get("metadata", {})
 		if not isinstance(md, dict):
 			md = {}
 		if bool(md.get("winding_is_absolute", True)):
+			n_pts = len(col.get("points", {})) if isinstance(col.get("points"), dict) else 0
+			print(f"[fit] _parse_corr_points: skipping collection {_cid} "
+				  f"(winding_is_absolute={md.get('winding_is_absolute')}, {n_pts} points)", flush=True)
 			continue
 		pts = col.get("points", {})
 		if not isinstance(pts, dict):
@@ -84,14 +90,15 @@ def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D
 		except Exception:
 			cid_i = -1
 		for _pid, pd in pts.items():
-			if not isinstance(pd, dict) or "wind_a" not in pd:
-				continue
-			wa = pd["wind_a"]
-			if wa is None:
+			if not isinstance(pd, dict):
 				continue
 			pv = pd.get("p", None)
 			if not isinstance(pv, (list, tuple)) or len(pv) < 3:
 				continue
+			wa = pd.get("wind_a", None)
+			if wa is None:
+				raise ValueError(f"[fit] corr point {_pid} in collection {_cid} has no wind_a "
+								 f"— d.tif was not available when this point was placed")
 			try:
 				pid_i = int(_pid)
 			except Exception:
@@ -100,13 +107,15 @@ def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D
 			cids.append(cid_i)
 			pids.append(pid_i)
 	if not rows:
+		print(f"[fit] _parse_corr_points: no valid points found after parsing", flush=True)
 		return None
 	pts_t = torch.tensor(rows, dtype=torch.float32, device=device)
 	col_t = torch.tensor(cids, dtype=torch.int64, device=device)
 	pid_t = torch.tensor(pids, dtype=torch.int64, device=device)
 	print(f"[fit] loaded {pts_t.shape[0]} corr_points from config "
 		  f"({len(set(cids))} collections)")
-	return fit_data.CorrPoints3D(points_xyz_winda=pts_t, collection_idx=col_t, point_ids=pid_t)
+	return fit_data.CorrPoints3D(points_xyz_winda=pts_t, collection_idx=col_t,
+								 point_ids=pid_t)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -208,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
 	corr_points_3d: fit_data.CorrPoints3D | None = None
 	if isinstance(corr_points_obj, dict):
 		corr_points_3d = _parse_corr_points(corr_points_obj, device)
+	else:
+		print(f"[fit] corr_points: not found in config (type={type(corr_points_obj).__name__})", flush=True)
 
 	# --- Data loading (with auto-crop, blur, and reload support) ---
 	def _load_data() -> fit_data.FitData3D:
@@ -280,6 +291,9 @@ def main(argv: list[str] | None = None) -> int:
 	def _progress(*, step: int, total: int, loss: float, **_kw: object) -> None:
 		if progress_enabled:
 			print(f"PROGRESS {step} {total} {loss:.6f}", flush=True)
+
+	# Configure corr snap mode
+	opt_loss_corr.set_snap_mode(opt_cfg.corr_snap)
 
 	# Run optimization
 	optimizer.optimize(

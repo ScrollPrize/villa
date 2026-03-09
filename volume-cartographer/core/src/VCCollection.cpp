@@ -49,7 +49,7 @@ void to_json(json& j, const ColPoint& p) {
         j["wind_a"] = nullptr;
     }
 }
- 
+
 void from_json(const json& j, ColPoint& p) {
     j.at("p").get_to(p.p);
     if (j.contains("wind_a") && !j.at("wind_a").is_null()) {
@@ -130,16 +130,16 @@ uint64_t VCCollection::addCollection(const std::string& name)
 ColPoint VCCollection::addPoint(const std::string& collectionName, const cv::Vec3f& point)
 {
     uint64_t collection_id = findOrCreateCollectionByName(collectionName);
-    
+
     ColPoint new_point;
     new_point.id = getNextPointId();
     new_point.collectionId = collection_id;
     new_point.p = point;
     new_point.creation_time = QDateTime::currentMSecsSinceEpoch();
-    
+
     _collections[collection_id].points[new_point.id] = new_point;
     _points[new_point.id] = new_point;
-    
+
     emit pointAdded(new_point);
     return new_point;
 }

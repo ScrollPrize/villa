@@ -319,6 +319,9 @@ def _run_optimization(body: dict[str, Any]) -> None:
             args_section["out-dir"] = str(body["out_dir"])
         cfg["args"] = args_section
         cfg_path = str(Path(tmp_dir) / "fit_config.json")
+        has_corr = "corr_points" in cfg
+        n_corr_cols = len(cfg["corr_points"].get("collections", {})) if has_corr and isinstance(cfg.get("corr_points"), dict) else 0
+        print(f"[fit-service] writing config: corr_points={has_corr} ({n_corr_cols} collections)", flush=True)
         Path(cfg_path).write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
         # Monkey-patch the optimizer to report progress & check cancellation.

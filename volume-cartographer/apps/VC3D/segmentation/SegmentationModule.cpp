@@ -1220,9 +1220,29 @@ uint64_t SegmentationModule::createCorrectionCollection(bool announce)
 
 void SegmentationModule::handleCorrectionPointAdded(const cv::Vec3f& worldPos)
 {
-    if (_corrections) {
-        _corrections->handlePointAdded(worldPos);
+    if (!_corrections) return;
+
+    // Look up winding depth index from d.tif channel → store in winding_annotation
+    float wind_a = NAN;
+    auto* surface = activeBaseSurface();
+    if (surface && _editManager) {
+        auto gridIdx = _editManager->worldToGridIndex(worldPos);
+        if (gridIdx) {
+            cv::Mat dChannel = surface->channel("d");
+            if (!dChannel.empty()) {
+                int row = gridIdx->first;
+                int col = gridIdx->second;
+                if (row >= 0 && row < dChannel.rows && col >= 0 && col < dChannel.cols) {
+                    if (dChannel.type() == CV_32F) {
+                        wind_a = dChannel.at<float>(row, col);
+                    } else if (dChannel.type() == CV_64F) {
+                        wind_a = static_cast<float>(dChannel.at<double>(row, col));
+                    }
+                }
+            }
+        }
     }
+    _corrections->handlePointAdded(worldPos, wind_a);
 }
 
 void SegmentationModule::handleCorrectionPointRemove(const cv::Vec3f& worldPos)
@@ -1312,11 +1332,27 @@ void SegmentationModule::finishCorrectionDrag()
     cv::Vec2f anchor2d(static_cast<float>(anchorCol), static_cast<float>(anchorRow));
     _pointCollection->setCollectionAnchor2d(collectionId, anchor2d);
 
+    // Look up winding depth index from d.tif at the anchor position → store in winding_annotation
+    float wind_a = NAN;
+    auto* surface = activeBaseSurface();
+    if (surface) {
+        cv::Mat dChannel = surface->channel("d");
+        if (!dChannel.empty() && anchorRow >= 0 && anchorRow < dChannel.rows
+            && anchorCol >= 0 && anchorCol < dChannel.cols) {
+            if (dChannel.type() == CV_32F) {
+                wind_a = dChannel.at<float>(anchorRow, anchorCol);
+            } else if (dChannel.type() == CV_64F) {
+                wind_a = static_cast<float>(dChannel.at<double>(anchorRow, anchorCol));
+            }
+        }
+    }
+
     // Add the correction point (3D world target)
-    _corrections->handlePointAdded(targetWorld);
+    _corrections->handlePointAdded(targetWorld, wind_a);
 
     qCInfo(lcSegModule) << "Correction drag completed: anchor2d" << anchorCol << anchorRow
-                        << "target" << targetWorld[0] << targetWorld[1] << targetWorld[2];
+                        << "target" << targetWorld[0] << targetWorld[1] << targetWorld[2]
+                        << "wind_a" << wind_a;
 
     updateCorrectionsWidget();
 

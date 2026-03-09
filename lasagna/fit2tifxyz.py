@@ -68,7 +68,8 @@ def _print_area(area: dict) -> None:
 
 
 def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
-				  scale: float, model_source: Path | None = None,
+				  scale: float, d: np.ndarray | None = None,
+				  model_source: Path | None = None,
 				  copy_model: bool = False, fit_config: dict | None = None,
 				  area: dict | None = None) -> None:
 	out_dir.mkdir(parents=True, exist_ok=True)
@@ -101,6 +102,8 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 	tifffile.imwrite(str(out_dir / "x.tif"), xf, compression="lzw")
 	tifffile.imwrite(str(out_dir / "y.tif"), yf, compression="lzw")
 	tifffile.imwrite(str(out_dir / "z.tif"), zf, compression="lzw")
+	if d is not None:
+		tifffile.imwrite(str(out_dir / "d.tif"), d.astype(np.float32, copy=False), compression="lzw")
 
 	if model_source is not None:
 		dest = out_dir / "model.pt"
@@ -166,18 +169,20 @@ def main(argv: list[str] | None = None) -> int:
 		x_all = np.full((Hm, total_w), -1.0, dtype=np.float32)
 		y_all = np.full((Hm, total_w), -1.0, dtype=np.float32)
 		z_all = np.full((Hm, total_w), -1.0, dtype=np.float32)
+		d_all = np.full((Hm, total_w), -1.0, dtype=np.float32)
 
 		col = 0
 		for d in range(D):
 			x_all[:, col:col + Wm] = mesh_np[0, d]  # (Hm, Wm)
 			y_all[:, col:col + Wm] = mesh_np[1, d]
 			z_all[:, col:col + Wm] = mesh_np[2, d]
+			d_all[:, col:col + Wm] = float(d)
 			col += Wm + BORDER_W
 
 		seg_name = cfg.output_name if cfg.output_name else f"{cfg.prefix}.tifxyz"
 		out_dir = out_base / seg_name
 		area = _get_area(x_all, y_all, z_all, xy_step_fullres, cfg.voxel_size_um)
-		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, scale=meta_scale,
+		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, d=d_all, scale=meta_scale,
 					  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
 					  area=area)
 		_print_area(area)
@@ -194,12 +199,14 @@ def main(argv: list[str] | None = None) -> int:
 			x = mesh_np[0, d]  # (Hm, Wm) already in fullres
 			y = mesh_np[1, d]
 			z = mesh_np[2, d]
+			valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+			d_layer = np.where(valid, float(d), -1.0).astype(np.float32)
 			area = _get_area(x, y, z, xy_step_fullres, cfg.voxel_size_um)
 			total_area["area_vx2"] += area["area_vx2"]
 			if "area_cm2" in area:
 				total_area["area_cm2"] += area["area_cm2"]
 			out_dir = out_base / f"{cfg.prefix}{d:04d}.tifxyz"
-			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z, scale=meta_scale,
+			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z, d=d_layer, scale=meta_scale,
 						  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
 						  area=area)
 			if model_params is not None:
