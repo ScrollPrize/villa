@@ -86,3 +86,16 @@ void writeZarrAttrs(const std::filesystem::path& outFile,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
                     const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW);
+
+// Write a dense uint8 ZYX subregion into a freshly created dataset via
+// writeChunk(). Chunks overlapping the region are materialized; untouched
+// chunks are left absent and are expected to read back as the dataset's
+// configured fill value.
+//
+// Precondition: dsOut must refer to a new output dataset. This helper does not
+// preserve any prior chunk contents outside the written subregion.
+void writeZarrRegionU8ByChunk(vc::VcDataset* dsOut,
+                              const std::vector<size_t>& offset,
+                              const std::vector<size_t>& regionShape,
+                              const uint8_t* data,
+                              uint8_t fillValue = 0);

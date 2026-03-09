@@ -87,6 +87,7 @@ std::unique_ptr<VcDataset> createZarrDataset(
     const std::vector<size_t>& chunks,
     VcDtype dtype,
     const std::string& compressor = "blosc",
-    const std::string& dimensionSeparator = ".");
+    const std::string& dimensionSeparator = ".",
+    std::int64_t fillValue = 0);
 
 }  // namespace vc

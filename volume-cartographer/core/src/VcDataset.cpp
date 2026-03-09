@@ -260,6 +260,22 @@ std::vector<std::byte> compressBytes(const CompressorConfig& cfg,
 
 } // namespace
 
+static void fillTypedElements(uint8_t* dst,
+                              size_t count,
+                              const std::vector<uint8_t>& fillBytes)
+{
+    if (count == 0) return;
+    if (fillBytes.size() == 1) {
+        std::memset(dst, fillBytes[0], count);
+        return;
+    }
+
+    const size_t elemSize = fillBytes.size();
+    for (size_t i = 0; i < count; ++i) {
+        std::memcpy(dst + i * elemSize, fillBytes.data(), elemSize);
+    }
+}
+
 static CompressorConfig parseCompressor(const nlohmann::json& zarray, int dtypeSize)
 {
     CompressorConfig cfg;
@@ -329,10 +345,34 @@ struct VcDataset::Impl {
     size_t dtypeSize_ = 1;
     std::string delimiter_ = ".";
     CompressorConfig compressor_;
+    std::vector<uint8_t> fillValueBytes_;
 
     // utils zarr array for chunk I/O
     std::shared_ptr<utils::FileSystemStore> store_;
     std::unique_ptr<utils::ZarrArray> zarrArray_;
+
+    void parseFillValue(const nlohmann::json& zarray)
+    {
+        std::int64_t rawFill = 0;
+        if (zarray.contains("fill_value") && !zarray["fill_value"].is_null()) {
+            rawFill = zarray["fill_value"].get<std::int64_t>();
+        }
+
+        fillValueBytes_.assign(dtypeSize_, 0);
+        if (dtype_ == VcDtype::uint8) {
+            if (rawFill < 0 || rawFill > std::numeric_limits<uint8_t>::max()) {
+                throw std::runtime_error("uint8 zarr fill_value out of range");
+            }
+            fillValueBytes_[0] = static_cast<uint8_t>(rawFill);
+            return;
+        }
+
+        if (rawFill < 0 || rawFill > std::numeric_limits<uint16_t>::max()) {
+            throw std::runtime_error("uint16 zarr fill_value out of range");
+        }
+        const auto fill = static_cast<uint16_t>(rawFill);
+        std::memcpy(fillValueBytes_.data(), &fill, sizeof(fill));
+    }
 
     void parseZarray(const std::filesystem::path& path)
     {
@@ -372,6 +412,8 @@ struct VcDataset::Impl {
         } else {
             throw std::runtime_error("Unsupported zarr dtype: " + dtypeStr);
         }
+
+        parseFillValue(zarray);
 
         // Dimension separator
         if (zarray.contains("dimension_separator")) {
@@ -585,7 +627,7 @@ bool VcDataset::readRegion(const std::vector<size_t>& offset,
                     if (src) {
                         std::memcpy(outBytes + dstOff, src + srcOff, copySize[d] * elemSize);
                     } else {
-                        std::memset(outBytes + dstOff, 0, copySize[d] * elemSize);
+                        fillTypedElements(outBytes + dstOff, copySize[d], impl_->fillValueBytes_);
                     }
                     return;
                 }
@@ -778,7 +820,8 @@ std::unique_ptr<VcDataset> createZarrDataset(
     const std::vector<size_t>& chunks,
     VcDtype dtype,
     const std::string& compressor,
-    const std::string& dimensionSeparator)
+    const std::string& dimensionSeparator,
+    std::int64_t fillValue)
 {
     namespace fs = std::filesystem;
 
@@ -792,7 +835,7 @@ std::unique_ptr<VcDataset> createZarrDataset(
     zarray["shape"] = shape;
     zarray["chunks"] = chunks;
     zarray["dtype"] = (dtype == VcDtype::uint8) ? "|u1" : "<u2";
-    zarray["fill_value"] = 0;
+    zarray["fill_value"] = fillValue;
     zarray["order"] = "C";
     zarray["dimension_separator"] = dimensionSeparator;
 

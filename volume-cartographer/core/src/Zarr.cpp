@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 
 #include <nlohmann/json.hpp>
 #include <omp.h>
@@ -56,6 +57,96 @@ template void writeZarrBand<uint8_t>(vc::VcDataset*, const std::vector<cv::Mat>&
     uint32_t, const std::vector<size_t>&, size_t, size_t, int, int);
 template void writeZarrBand<uint16_t>(vc::VcDataset*, const std::vector<cv::Mat>&,
     uint32_t, const std::vector<size_t>&, size_t, size_t, int, int);
+
+void writeZarrRegionU8ByChunk(vc::VcDataset* dsOut,
+                              const std::vector<size_t>& offset,
+                              const std::vector<size_t>& regionShape,
+                              const uint8_t* data,
+                              uint8_t fillValue)
+{
+    if (!dsOut) {
+        throw std::runtime_error("writeZarrRegionU8ByChunk requires a dataset");
+    }
+    if (offset.size() != 3 || regionShape.size() != 3) {
+        throw std::runtime_error("writeZarrRegionU8ByChunk expects 3D ZYX inputs");
+    }
+    if (dsOut->shape().size() != 3 || dsOut->defaultChunkShape().size() != 3) {
+        throw std::runtime_error("writeZarrRegionU8ByChunk requires a 3D dataset");
+    }
+    if (dsOut->getDtype() != vc::VcDtype::uint8) {
+        throw std::runtime_error("writeZarrRegionU8ByChunk only supports uint8 datasets");
+    }
+    if ((regionShape[0] > 0 || regionShape[1] > 0 || regionShape[2] > 0) && !data) {
+        throw std::runtime_error("writeZarrRegionU8ByChunk requires input data");
+    }
+
+    const auto& datasetShape = dsOut->shape();
+    const auto& chunkShape = dsOut->defaultChunkShape();
+    for (size_t d = 0; d < 3; ++d) {
+        if (offset[d] > datasetShape[d] || regionShape[d] > (datasetShape[d] - offset[d])) {
+            throw std::runtime_error("writeZarrRegionU8ByChunk region exceeds dataset bounds");
+        }
+        if (regionShape[d] == 0) {
+            return;
+        }
+    }
+
+    const size_t chunkElems = chunkShape[0] * chunkShape[1] * chunkShape[2];
+    std::vector<uint8_t> chunkBuf(chunkElems, fillValue);
+
+    const size_t chunkZ0 = offset[0] / chunkShape[0];
+    const size_t chunkY0 = offset[1] / chunkShape[1];
+    const size_t chunkX0 = offset[2] / chunkShape[2];
+    const size_t chunkZ1 = (offset[0] + regionShape[0] - 1) / chunkShape[0];
+    const size_t chunkY1 = (offset[1] + regionShape[1] - 1) / chunkShape[1];
+    const size_t chunkX1 = (offset[2] + regionShape[2] - 1) / chunkShape[2];
+
+    for (size_t cz = chunkZ0; cz <= chunkZ1; ++cz) {
+        const size_t chunkBaseZ = cz * chunkShape[0];
+        for (size_t cy = chunkY0; cy <= chunkY1; ++cy) {
+            const size_t chunkBaseY = cy * chunkShape[1];
+            for (size_t cx = chunkX0; cx <= chunkX1; ++cx) {
+                const size_t chunkBaseX = cx * chunkShape[2];
+
+                const size_t overlapZ0 = std::max(chunkBaseZ, offset[0]);
+                const size_t overlapY0 = std::max(chunkBaseY, offset[1]);
+                const size_t overlapX0 = std::max(chunkBaseX, offset[2]);
+                const size_t overlapZ1 = std::min(chunkBaseZ + chunkShape[0], offset[0] + regionShape[0]);
+                const size_t overlapY1 = std::min(chunkBaseY + chunkShape[1], offset[1] + regionShape[1]);
+                const size_t overlapX1 = std::min(chunkBaseX + chunkShape[2], offset[2] + regionShape[2]);
+
+                if (overlapZ0 >= overlapZ1 || overlapY0 >= overlapY1 || overlapX0 >= overlapX1) {
+                    continue;
+                }
+
+                std::fill(chunkBuf.begin(), chunkBuf.end(), fillValue);
+
+                const size_t copyZ = overlapZ1 - overlapZ0;
+                const size_t copyY = overlapY1 - overlapY0;
+                const size_t copyX = overlapX1 - overlapX0;
+
+                const size_t srcBaseZ = overlapZ0 - offset[0];
+                const size_t srcBaseY = overlapY0 - offset[1];
+                const size_t srcBaseX = overlapX0 - offset[2];
+                const size_t dstBaseZ = overlapZ0 - chunkBaseZ;
+                const size_t dstBaseY = overlapY0 - chunkBaseY;
+                const size_t dstBaseX = overlapX0 - chunkBaseX;
+
+                for (size_t z = 0; z < copyZ; ++z) {
+                    for (size_t y = 0; y < copyY; ++y) {
+                        const size_t srcOff =
+                            ((srcBaseZ + z) * regionShape[1] + (srcBaseY + y)) * regionShape[2] + srcBaseX;
+                        const size_t dstOff =
+                            ((dstBaseZ + z) * chunkShape[1] + (dstBaseY + y)) * chunkShape[2] + dstBaseX;
+                        std::memcpy(chunkBuf.data() + dstOff, data + srcOff, copyX);
+                    }
+                }
+
+                dsOut->writeChunk(cz, cy, cx, chunkBuf.data(), chunkBuf.size());
+            }
+        }
+    }
+}
 
 // ============================================================
 // downsampleChunk

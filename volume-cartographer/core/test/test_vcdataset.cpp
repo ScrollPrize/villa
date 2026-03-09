@@ -7,11 +7,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <numeric>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "vc/core/types/VcDataset.hpp"
+#include "vc/core/util/Zarr.hpp"
 
 namespace {
 
@@ -51,6 +53,11 @@ std::vector<uint8_t> readBytes(const fs::path& path)
 {
     std::ifstream in(path, std::ios::binary);
     return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+size_t linearIndex(const std::vector<size_t>& shape, size_t z, size_t y, size_t x)
+{
+    return (z * shape[1] + y) * shape[2] + x;
 }
 
 } // namespace
@@ -100,5 +107,58 @@ TEST(VcDataset, BloscDatasetWritesCompressedChunksAndReadsBack)
     reopened.decompress(rawBytes, decompressed.data(), decompressed.size());
     for (size_t i = 0; i < chunk.size(); ++i) {
         EXPECT_EQ(decompressed[i], chunk[i]);
+    }
+}
+
+TEST(VcDataset, CreateZarrDatasetWritesConfiguredFillValue)
+{
+    ScopedTempDir tempDir;
+    const std::vector<size_t> shape = {8, 9, 10};
+    const std::vector<size_t> chunks = {3, 4, 5};
+
+    auto ds = vc::createZarrDataset(
+        tempDir.path(), "0", shape, chunks, vc::VcDtype::uint8, "none", ".", 128);
+    ASSERT_TRUE(ds != nullptr);
+
+    const auto zarray = readJson(tempDir.path() / "0" / ".zarray");
+    ASSERT_TRUE(zarray.contains("fill_value"));
+    EXPECT_EQ(zarray["fill_value"].get<int>(), 128);
+}
+
+TEST(VcDataset, WriteZarrRegionU8ByChunkPreservesSubregionAndFillPadding)
+{
+    ScopedTempDir tempDir;
+    const std::vector<size_t> shape = {8, 9, 10};
+    const std::vector<size_t> chunks = {3, 4, 5};
+    const std::vector<size_t> offset = {1, 2, 3};
+    const std::vector<size_t> regionShape = {3, 3, 3};
+
+    auto ds = vc::createZarrDataset(
+        tempDir.path(), "0", shape, chunks, vc::VcDtype::uint8, "none", ".", 128);
+    ASSERT_TRUE(ds != nullptr);
+
+    std::vector<uint8_t> region(regionShape[0] * regionShape[1] * regionShape[2], 0);
+    std::iota(region.begin(), region.end(), static_cast<uint8_t>(1));
+
+    writeZarrRegionU8ByChunk(ds.get(), offset, regionShape, region.data(), 128);
+
+    EXPECT_FALSE(ds->chunkExists(2, 2, 1));
+
+    std::vector<uint8_t> full(shape[0] * shape[1] * shape[2], 0);
+    EXPECT_TRUE(ds->readRegion({0, 0, 0}, shape, full.data()));
+
+    for (size_t z = 0; z < shape[0]; ++z) {
+        for (size_t y = 0; y < shape[1]; ++y) {
+            for (size_t x = 0; x < shape[2]; ++x) {
+                uint8_t expected = 128;
+                if (z >= offset[0] && z < offset[0] + regionShape[0] &&
+                    y >= offset[1] && y < offset[1] + regionShape[1] &&
+                    x >= offset[2] && x < offset[2] + regionShape[2]) {
+                    expected = region[linearIndex(
+                        regionShape, z - offset[0], y - offset[1], x - offset[2])];
+                }
+                EXPECT_EQ(full[linearIndex(shape, z, y, x)], expected);
+            }
+        }
     }
 }

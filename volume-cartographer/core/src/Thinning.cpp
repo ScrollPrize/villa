@@ -1,151 +1,296 @@
 #include "vc/core/util/Thinning.hpp"
-#include <opencv2/imgproc.hpp>
-#include <vector>
-#include <algorithm> // For std::min
-#include <cmath>
-#include <deque>
-#include <limits>
-#include <iostream>
 
-// Helper for non-maximum suppression
-static void nonMaximumSuppression(const cv::Mat& src, cv::Mat& dst, int size) {
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+#include <opencv2/imgproc.hpp>
+
+namespace {
+
+constexpr int kHistoryLength = 4;
+constexpr std::array<int, 8> kNeighborDx = {-1, 0, 1, -1, 1, -1, 0, 1};
+constexpr std::array<int, 8> kNeighborDy = {-1, -1, -1, 0, 0, 1, 1, 1};
+constexpr std::array<std::array<float, kHistoryLength>, kHistoryLength> kHistoryWeights = {{
+    {{1.0f, 0.0f, 0.0f, 0.0f}},
+    {{1.0f, 0.25f, 0.0f, 0.0f}},
+    {{1.0f, 0.625f, 0.25f, 0.0f}},
+    {{1.0f, 0.75f, 0.5f, 0.25f}},
+}};
+constexpr std::array<float, kHistoryLength> kHistoryWeightSums = {
+    1.0f,
+    1.25f,
+    1.875f,
+    2.5f,
+};
+
+struct PointHistory {
+    std::array<cv::Point, kHistoryLength> points{};
+    int count = 0;
+    int start = 0;
+
+    void push_back(const cv::Point& point)
+    {
+        if (count < kHistoryLength) {
+            points[(start + count) % kHistoryLength] = point;
+            ++count;
+            return;
+        }
+
+        points[start] = point;
+        start = (start + 1) % kHistoryLength;
+    }
+
+    const cv::Point& at(int idx) const
+    {
+        return points[(start + idx) % kHistoryLength];
+    }
+};
+
+struct TraceResult {
+    bool hasSecondPoint = false;
+    cv::Point secondPoint;
+    uint64_t steps = 0;
+    uint64_t candidateEvaluations = 0;
+};
+
+static void nonMaximumSuppression(const cv::Mat& src, cv::Mat& dst, int size)
+{
     cv::Mat dilated;
     cv::dilate(src, dilated, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(size, size)));
     cv::compare(src, dilated, dst, cv::CMP_EQ);
 }
 
-// Helper function to trace a path from a starting point
-static std::vector<cv::Point> tracePath(
-    cv::Point startPoint,
+template <bool StorePoints>
+static TraceResult tracePath(
+    const cv::Point& startPoint,
     const cv::Mat& distTransform,
-    cv::Mat& outputImage,
-    const std::deque<cv::Point>& initial_history,
-    const cv::Point& seedPoint)
+    cv::Mat& visited,
+    cv::Mat* outputImage,
+    PointHistory history,
+    const cv::Point& seedPoint,
+    std::vector<cv::Point>* tracedPoints)
 {
-    const int N = 4;
     cv::Point currentPoint = startPoint;
-    std::deque<cv::Point> path_history = initial_history;
-    std::vector<cv::Point> traced_points;
-    int i = 0;
+    int visitIndex = 0;
+    TraceResult result;
 
-    while(true) {
+    if constexpr (StorePoints) {
+        tracedPoints->clear();
+    }
+
+    while (true) {
         if (currentPoint != seedPoint) {
-            outputImage.at<uchar>(currentPoint) = std::min(i + 1, 255);
+            auto* visitedRow = visited.ptr<uint8_t>(currentPoint.y);
+            if (outputImage != nullptr) {
+                visitedRow[currentPoint.x] = static_cast<uint8_t>(std::min(visitIndex + 1, 255));
+            } else {
+                visitedRow[currentPoint.x] = 1;
+            }
         }
-        traced_points.push_back(currentPoint);
-        i++;
 
-        path_history.push_back(currentPoint);
-        if (path_history.size() > N) {
-            path_history.pop_front();
+        if constexpr (StorePoints) {
+            tracedPoints->push_back(currentPoint);
         }
+
+        ++result.steps;
+        if (!result.hasSecondPoint && result.steps == 2) {
+            result.hasSecondPoint = true;
+            result.secondPoint = currentPoint;
+        }
+        ++visitIndex;
+
+        history.push_back(currentPoint);
 
         float maxDist = -std::numeric_limits<float>::max();
         cv::Point nextPoint(-1, -1);
 
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                if (dx == 0 && dy == 0) continue;
-                cv::Point neighbor(currentPoint.x + dx, currentPoint.y + dy);
-                if (neighbor.x < 0 || neighbor.x >= distTransform.cols || neighbor.y < 0 || neighbor.y >= distTransform.rows) continue;
+        for (size_t ni = 0; ni < kNeighborDx.size(); ++ni) {
+            const int nx = currentPoint.x + kNeighborDx[ni];
+            const int ny = currentPoint.y + kNeighborDy[ni];
+            if (nx < 0 || nx >= distTransform.cols || ny < 0 || ny >= distTransform.rows) {
+                continue;
+            }
 
-                float dist = static_cast<float>(distTransform.at<uchar>(neighbor));
-                float penalty = 0.0f;
-                if (!path_history.empty()) {
-                    float total_weighted_distance = 0.0f;
-                    float total_weight = 0.0f;
-                    float history_size = static_cast<float>(path_history.size());
+            ++result.candidateEvaluations;
+            const auto* distRow = distTransform.ptr<uint8_t>(ny);
+            const float dist = static_cast<float>(distRow[nx]);
 
-                    for (size_t k = 0; k < path_history.size(); ++k) {
-                        const auto& p_hist = path_history[k];
-                        float dx_hist = static_cast<float>(neighbor.x - p_hist.x);
-                        float dy_hist = static_cast<float>(neighbor.y - p_hist.y);
-                        float d = std::sqrt(dx_hist * dx_hist + dy_hist * dy_hist);
-
-                        float weight = 1.0f;
-                        if (history_size > 1) {
-                            weight = 1.0f - (static_cast<float>(k) / (history_size - 1.0f)) * (1.0f - 1.0f/N);
-                            // std::cout << k << " " << weight << std::endl;
-                        }
-                        
-                        total_weighted_distance += weight * d;
-                        total_weight += weight;
-                    }
-                    penalty = total_weighted_distance/total_weight;
+            float penalty = 0.0f;
+            if (history.count > 0) {
+                const auto& weights = kHistoryWeights[history.count - 1];
+                float totalWeightedDistance = 0.0f;
+                for (int i = 0; i < history.count; ++i) {
+                    const auto& point = history.at(i);
+                    const float dx = static_cast<float>(nx - point.x);
+                    const float dy = static_cast<float>(ny - point.y);
+                    totalWeightedDistance += weights[i] * std::sqrt(dx * dx + dy * dy);
                 }
-                float effective_dist = dist + penalty;
-                if (effective_dist > maxDist) {
-                    maxDist = effective_dist;
-                    nextPoint = neighbor;
-                }
+                penalty = totalWeightedDistance / kHistoryWeightSums[history.count - 1];
+            }
+
+            const float effectiveDist = dist + penalty;
+            if (effectiveDist > maxDist) {
+                maxDist = effectiveDist;
+                nextPoint = cv::Point(nx, ny);
             }
         }
 
-        if (nextPoint.x == -1 || distTransform.at<uchar>(nextPoint) == 0 || (outputImage.at<uchar>(nextPoint) != 0 && nextPoint != seedPoint)) {
+        if (nextPoint.x == -1) {
             break;
         }
+
+        const auto* distRow = distTransform.ptr<uint8_t>(nextPoint.y);
+        const auto* visitedRow = visited.ptr<uint8_t>(nextPoint.y);
+        if (distRow[nextPoint.x] == 0 ||
+            (visitedRow[nextPoint.x] != 0 && nextPoint != seedPoint)) {
+            break;
+        }
+
         currentPoint = nextPoint;
     }
-    return traced_points;
+
+    return result;
 }
 
-void customThinning(const cv::Mat& inputImage, cv::Mat& outputImage, std::vector<std::vector<cv::Point>>* traces) {
+static void customThinningImpl(
+    const cv::Mat& inputImage,
+    cv::Mat* outputImage,
+    std::vector<std::vector<cv::Point>>* traces,
+    ThinningStats* stats)
+{
     if (inputImage.empty() || inputImage.type() != CV_8UC1) {
+        if (outputImage != nullptr) {
+            outputImage->release();
+        }
+        if (traces != nullptr) {
+            traces->clear();
+        }
         return;
     }
 
-    // 1. Distance Transform
+    ThinningStats localStats;
+
+    const auto dtStart = std::chrono::steady_clock::now();
     cv::Mat distTransform;
     cv::distanceTransform(inputImage, distTransform, cv::DIST_L1, cv::DIST_MASK_5, CV_8U);
     CV_Assert(distTransform.type() == CV_8U);
+    localStats.distanceTransformSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - dtStart).count();
 
-    // 2. Find seeds via non-maximum suppression
+    const auto seedStart = std::chrono::steady_clock::now();
     cv::Mat localMaxima;
-    nonMaximumSuppression(distTransform, localMaxima, 3); // 3x3 window
+    nonMaximumSuppression(distTransform, localMaxima, 3);
 
-    // Only consider maxima that are actually on the foreground
     cv::Mat seeds;
     cv::bitwise_and(localMaxima, inputImage, seeds);
 
     std::vector<cv::Point> seedPoints;
     cv::findNonZero(seeds, seedPoints);
+    localStats.seedCount = seedPoints.size();
+    localStats.seedDetectionSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - seedStart).count();
 
-    // Initialize output image
-    outputImage = cv::Mat::zeros(inputImage.size(), CV_8UC1);
-    if (traces) {
+    cv::Mat visited;
+    if (outputImage != nullptr) {
+        *outputImage = cv::Mat::zeros(inputImage.size(), CV_8UC1);
+        visited = *outputImage;
+    } else {
+        visited = cv::Mat::zeros(inputImage.size(), CV_8UC1);
+    }
+
+    if (traces != nullptr) {
         traces->clear();
+        traces->reserve(seedPoints.size());
     }
 
-    // 3. Trace from each seed
+    const auto traceStart = std::chrono::steady_clock::now();
+    std::vector<cv::Point> firstPath;
+    std::vector<cv::Point> secondPath;
+
     for (const auto& seed : seedPoints) {
-        if (outputImage.at<uchar>(seed) != 0) {
-            continue; // Already part of a traced path
+        auto* visitedRow = visited.ptr<uint8_t>(seed.y);
+        if (visitedRow[seed.x] != 0) {
+            continue;
         }
-        outputImage.at<uchar>(seed) = 1; // Mark seed as visited
+        visitedRow[seed.x] = 1;
 
-        // --- Trace in the first direction ---
-        std::vector<cv::Point> first_path = tracePath(seed, distTransform, outputImage, {}, seed);
+        PointHistory initialHistory;
 
-        // --- Trace in the second (opposite) direction ---
-        std::deque<cv::Point> initial_history;
-        if (first_path.size() > 1) {
-            initial_history.push_back(first_path[1]);
-        }
-        std::vector<cv::Point> second_path = tracePath(seed, distTransform, outputImage, initial_history, seed);
+        if (traces != nullptr) {
+            const auto firstResult = tracePath<true>(
+                seed, distTransform, visited, outputImage, initialHistory, seed, &firstPath);
+            localStats.traceSteps += firstResult.steps;
+            localStats.candidateEvaluations += firstResult.candidateEvaluations;
 
-        if (traces) {
-            // Combine paths: reverse the second path and append the first (skipping duplicate seed)
-            std::vector<cv::Point> full_trace;
-            full_trace.reserve(second_path.size() + first_path.size() - 1);
-            std::reverse(second_path.begin(), second_path.end());
-            full_trace.insert(full_trace.end(), second_path.begin(), second_path.end());
-            if (!first_path.empty()) {
-                full_trace.insert(full_trace.end(), first_path.begin() + 1, first_path.end());
+            PointHistory secondHistory;
+            if (firstResult.hasSecondPoint) {
+                secondHistory.push_back(firstResult.secondPoint);
             }
-            
-            if (!full_trace.empty()) {
-                traces->push_back(full_trace);
+            const auto secondResult = tracePath<true>(
+                seed, distTransform, visited, outputImage, secondHistory, seed, &secondPath);
+            localStats.traceSteps += secondResult.steps;
+            localStats.candidateEvaluations += secondResult.candidateEvaluations;
+
+            std::vector<cv::Point> fullTrace;
+            fullTrace.reserve(secondPath.size() + firstPath.size() - (firstPath.empty() ? 0 : 1));
+            fullTrace.insert(fullTrace.end(), secondPath.rbegin(), secondPath.rend());
+            if (!firstPath.empty()) {
+                fullTrace.insert(fullTrace.end(), firstPath.begin() + 1, firstPath.end());
             }
+            if (!fullTrace.empty()) {
+                traces->push_back(std::move(fullTrace));
+                ++localStats.traceCount;
+            }
+        } else {
+            const auto firstResult = tracePath<false>(
+                seed, distTransform, visited, outputImage, initialHistory, seed, nullptr);
+            localStats.traceSteps += firstResult.steps;
+            localStats.candidateEvaluations += firstResult.candidateEvaluations;
+
+            PointHistory secondHistory;
+            if (firstResult.hasSecondPoint) {
+                secondHistory.push_back(firstResult.secondPoint);
+            }
+            const auto secondResult = tracePath<false>(
+                seed, distTransform, visited, outputImage, secondHistory, seed, nullptr);
+            localStats.traceSteps += secondResult.steps;
+            localStats.candidateEvaluations += secondResult.candidateEvaluations;
         }
     }
+
+    localStats.tracePathsSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - traceStart).count();
+
+    if (stats != nullptr) {
+        stats->accumulate(localStats);
+    }
+}
+
+} // namespace
+
+void customThinning(const cv::Mat& inputImage,
+                    cv::Mat& outputImage,
+                    std::vector<std::vector<cv::Point>>* traces)
+{
+    customThinning(inputImage, outputImage, traces, nullptr);
+}
+
+void customThinning(const cv::Mat& inputImage,
+                    cv::Mat& outputImage,
+                    std::vector<std::vector<cv::Point>>* traces,
+                    ThinningStats* stats)
+{
+    customThinningImpl(inputImage, &outputImage, traces, stats);
+}
+
+void customThinningTraceOnly(const cv::Mat& inputImage,
+                             std::vector<std::vector<cv::Point>>& traces,
+                             ThinningStats* stats)
+{
+    customThinningImpl(inputImage, nullptr, &traces, stats);
 }
