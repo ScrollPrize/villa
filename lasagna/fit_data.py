@@ -146,7 +146,7 @@ def auto_crop_for_mesh(
 
 def load_3d_for_model(
 	*, path: str, device: torch.device, model: object,
-	blur_sigma: float = 0.0,
+	blur_sigma: float = 2.0,
 	cuda_gridsample: bool = True,
 ) -> FitData3D:
 	"""Load 3D data auto-cropped around model mesh bbox. Optionally blurs."""
