@@ -70,8 +70,6 @@ class TifxyzInkDataset(Dataset):
             patch_cache_filename=self.patch_cache_filename,                             # for info on the bbox generation
         )
 
-
-
     def _apply_sample_augmentation(
         self,
         vol_crop,

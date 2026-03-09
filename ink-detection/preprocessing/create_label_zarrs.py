@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 import tifffile
 import zarr
+from numcodecs import Blosc
 from tqdm.auto import tqdm
 
 
@@ -31,9 +32,12 @@ AXES = [
 ]
 ARRAY_DIMENSIONS = ["z", "y", "x"]
 DEFAULT_LEVELS = 6
-DEFAULT_CHUNKS = (1, 128, 128)
+DEFAULT_DEPTH = 65
+DEFAULT_LABEL_SLICE = 32
+DEFAULT_CHUNKS = (65, 128, 128)
 STREAM_BLOCK_SIZE = 1024
 SKIP_DIR_NAMES = {".git", "__pycache__"}
+LABEL_COMPRESSOR = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -155,6 +159,20 @@ def build_pyramid(image_2d: np.ndarray, levels: int = DEFAULT_LEVELS) -> List[np
     return build_pyramid_with_mode(image_2d, levels=levels, downsample_mode="nearest")
 
 
+def _embed_label_volume(
+    image_2d: np.ndarray,
+    *,
+    depth: int = DEFAULT_DEPTH,
+    label_slice: int = DEFAULT_LABEL_SLICE,
+) -> np.ndarray:
+    if not 0 <= label_slice < depth:
+        raise ValueError(f"label_slice must be within [0, {depth}), got {label_slice}")
+
+    volume = np.zeros((depth, image_2d.shape[0], image_2d.shape[1]), dtype=image_2d.dtype)
+    volume[label_slice, :, :] = image_2d
+    return volume
+
+
 def _downsample_mean(current: np.ndarray) -> np.ndarray:
     out_y = (current.shape[1] + 1) // 2
     out_x = (current.shape[2] + 1) // 2
@@ -189,7 +207,7 @@ def build_pyramid_with_mode(
     if downsample_mode not in {"nearest", "mean"}:
         raise ValueError(f"Unsupported downsample_mode: {downsample_mode}")
 
-    current = np.ascontiguousarray(image_2d[np.newaxis, :, :])
+    current = np.ascontiguousarray(_embed_label_volume(image_2d))
     pyramid = [current]
 
     for _ in range(1, levels):
@@ -227,7 +245,7 @@ def _pyramid_shapes(image_shape: tuple[int, int], levels: int) -> List[tuple[int
     height, width = image_shape
     shapes: List[tuple[int, int, int]] = []
     for _ in range(levels):
-        shapes.append((1, height, width))
+        shapes.append((DEFAULT_DEPTH, height, width))
         height = (height + 1) // 2
         width = (width + 1) // 2
     return shapes
@@ -258,12 +276,17 @@ def _multiscales_metadata(name: str, levels: int) -> Dict[str, object]:
     }
 
 
+def _select_compressor(*, use_compression: bool) -> Blosc | None:
+    return LABEL_COMPRESSOR if use_compression else None
+
+
 def write_ome_zarr(
     pyramid: Sequence[np.ndarray],
     output_path: Path,
     *,
     chunk_shape: Sequence[int] = DEFAULT_CHUNKS,
     overwrite: bool = False,
+    use_compression: bool = True,
 ) -> None:
     if not pyramid:
         raise ValueError("pyramid must contain at least one level")
@@ -275,6 +298,7 @@ def write_ome_zarr(
         levels=len(pyramid),
         chunk_shape=chunk_shape,
         overwrite=overwrite,
+        use_compression=use_compression,
     )
     for dataset, array in zip(datasets, pyramid):
         dataset[:] = array
@@ -288,6 +312,7 @@ def _create_ome_zarr_datasets(
     levels: int,
     chunk_shape: Sequence[int] = DEFAULT_CHUNKS,
     overwrite: bool = False,
+    use_compression: bool = True,
 ) -> List[zarr.Array]:
     if output_path.exists():
         if not overwrite:
@@ -299,14 +324,18 @@ def _create_ome_zarr_datasets(
     group.attrs.update(_multiscales_metadata(output_path.stem, len(shapes)))
 
     datasets: List[zarr.Array] = []
+    compressor = _select_compressor(use_compression=use_compression)
     for level, shape in enumerate(shapes):
         dataset = group.create_dataset(
             str(level),
             shape=shape,
             chunks=tuple(chunk_shape),
             dtype=dtype,
+            compressor=compressor,
+            fill_value=0,
             overwrite=True,
             dimension_separator="/",
+            write_empty_chunks=False,
         )
         dataset.attrs["_ARRAY_DIMENSIONS"] = ARRAY_DIMENSIONS
         datasets.append(dataset)
@@ -389,7 +418,7 @@ def _write_tiled_tiff_level_zero(
                         overlap_x0 - tile_x : overlap_x1 - tile_x,
                     ]
 
-            dataset[0, block_y : block_y + block_height, block_x : block_x + block_width] = block
+            dataset[DEFAULT_LABEL_SLICE, block_y : block_y + block_height, block_x : block_x + block_width] = block
 
 
 def _write_downsample_block(
@@ -463,6 +492,7 @@ def _convert_tiled_tiff(
     overwrite: bool,
     downsample_mode: Literal["nearest", "mean"],
     chunk_workers: int,
+    use_compression: bool,
 ) -> None:
     metadata = _get_tiled_tiff_metadata(input_path)
     if metadata is None:
@@ -475,6 +505,7 @@ def _convert_tiled_tiff(
         dtype=dtype,
         levels=levels,
         overwrite=overwrite,
+        use_compression=use_compression,
     )
     _write_tiled_tiff_level_zero(input_path, datasets[0])
     _build_downsample_levels_from_zarr(
@@ -501,6 +532,7 @@ def convert_image(
         }
 
     downsample_mode: Literal["nearest", "mean"] = "mean" if is_composite_image(input_path) else "nearest"
+    use_compression = True
     tiled_metadata = _get_tiled_tiff_metadata(input_path)
     if tiled_metadata is not None:
         _convert_tiled_tiff(
@@ -510,6 +542,7 @@ def convert_image(
             overwrite=overwrite,
             downsample_mode=downsample_mode,
             chunk_workers=chunk_workers,
+            use_compression=use_compression,
         )
     else:
         image = load_image(input_path)
@@ -518,7 +551,7 @@ def convert_image(
             levels=levels,
             downsample_mode=downsample_mode,
         )
-        write_ome_zarr(pyramid, output_path, overwrite=overwrite)
+        write_ome_zarr(pyramid, output_path, overwrite=overwrite, use_compression=use_compression)
 
     return {
         "status": "written",
