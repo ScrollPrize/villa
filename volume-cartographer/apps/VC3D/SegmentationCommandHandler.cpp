@@ -202,6 +202,36 @@ static bool writeJsonObject(const QString& path, const QJsonObject& obj)
     return true;
 }
 
+static bool selectRasterizeChunkSize(QWidget* parent, int* outChunkSize)
+{
+    if (!outChunkSize) {
+        return false;
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const int savedChunkSize = std::clamp(
+        settings.value(QStringLiteral("tools/rasterize_chunk_size"), 128).toInt(),
+        1, 4096);
+
+    bool ok = false;
+    const int chunkSize = QInputDialog::getInt(
+        parent,
+        QObject::tr("Rasterize"),
+        QObject::tr("Isotropic chunk size (voxels, applied to all pyramid levels):"),
+        savedChunkSize,
+        1,
+        4096,
+        1,
+        &ok);
+    if (!ok) {
+        return false;
+    }
+
+    settings.setValue(QStringLiteral("tools/rasterize_chunk_size"), chunkSize);
+    *outChunkSize = chunkSize;
+    return true;
+}
+
 static bool updateVolumeIdentityMetadata(const QString& volumePath)
 {
     if (volumePath.isEmpty()) {
@@ -2607,6 +2637,28 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
             3000);
     }
 
+    QString referenceZarr = !_normal3dZarrPathGetter ? QString() : _normal3dZarrPathGetter();
+    if (referenceZarr.isEmpty()) {
+        referenceZarr = getCurrentVolumePath();
+    }
+    if (referenceZarr.isEmpty()) {
+        QMessageBox::warning(_parentWidget, tr("Error"),
+                             tr("Missing reference OME-Zarr. Load a normal3d/volume first."));
+        return;
+    }
+
+    const QString executable = findVcTool("vc_tifxyz2zarr_sparse");
+    if (executable.isEmpty()) {
+        QMessageBox::warning(_parentWidget, tr("Error"),
+                             tr("vc_tifxyz2zarr_sparse tool not found. Configure tools/vc_tifxyz2zarr_sparse path."));
+        return;
+    }
+
+    int chunkSize = 128;
+    if (!selectRasterizeChunkSize(_parentWidget, &chunkSize)) {
+        return;
+    }
+
     const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMddHHmmss"));
     const auto baseOutputName = QStringLiteral("labels_%1.zarr").arg(timestamp);
 
@@ -2685,25 +2737,6 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         }
     }
 
-    QString referenceZarr = !_normal3dZarrPathGetter ? QString() : _normal3dZarrPathGetter();
-    if (referenceZarr.isEmpty()) {
-        referenceZarr = getCurrentVolumePath();
-    }
-    if (referenceZarr.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("Missing reference OME-Zarr. Load a normal3d/volume first."));
-        std::filesystem::remove_all(tempRoot);
-        return;
-    }
-
-    const QString executable = findVcTool("vc_tifxyz2zarr_sparse");
-    if (executable.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("vc_tifxyz2zarr_sparse tool not found. Configure tools/vc_tifxyz2zarr_sparse path."));
-        std::filesystem::remove_all(tempRoot);
-        return;
-    }
-
     const QString tempRootStr = QString::fromStdString(tempRoot.string());
     const QString stagedOutputRootStr = QString::fromStdString(stagedOutputRoot.string());
     const QString finalOutputRootStr = QString::fromStdString(finalOutputRoot.string());
@@ -2712,6 +2745,8 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
          << stagedOutputRootStr
          << QStringLiteral("--reference-zarr")
          << referenceZarr
+         << QStringLiteral("--chunk-size")
+         << QString::number(chunkSize)
          << QStringLiteral("--raster-mode")
          << QStringLiteral("zyx-integer")
          << QStringLiteral("--overwrite");
@@ -2769,12 +2804,22 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
                                      .arg(QString::fromStdString(renameErr.message())));
                 emit statusMessage(tr("Rasterize complete, but finalizing output failed"), 5000);
             } else {
-                emit statusMessage(
-                    tr("Rasterized %1 segment(s) -> %2")
-                        .arg(validIds.size())
-                        .arg(QDir::toNativeSeparators(finalOutputRootStr)),
-                    5000);
                 finalizeOutput = true;
+                if (!updateVolumeIdentityMetadata(finalOutputRootStr)) {
+                    emit showWarning(
+                        tr("Warning"),
+                        tr("Rasterized volume created, but updating meta.json identity failed."));
+                    emit statusMessage(
+                        tr("Rasterized volume created, but metadata update failed -> %1")
+                            .arg(QDir::toNativeSeparators(finalOutputRootStr)),
+                        5000);
+                } else {
+                    emit statusMessage(
+                        tr("Rasterized %1 segment(s) -> %2")
+                            .arg(validIds.size())
+                            .arg(QDir::toNativeSeparators(finalOutputRootStr)),
+                        5000);
+                }
             }
         }
 

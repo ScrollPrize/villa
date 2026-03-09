@@ -370,7 +370,8 @@ void VolumeOverlayController::populateColormapOptions()
         return;
     }
 
-    const auto& entries = volume_viewer_cmaps::entries();
+    const auto& entries = volume_viewer_cmaps::entries(
+        volume_viewer_cmaps::EntryScope::OverlayCompatible);
     const QSignalBlocker blocker(_ui.colormapSelect);
     _ui.colormapSelect->clear();
 

@@ -625,7 +625,9 @@ CWindow::CWindow(size_t cacheSizeGB) :
     connect(_fileWatcher.get(), &FileWatcherService::statusMessage,
             this, &CWindow::onShowStatusMessage);
     connect(_fileWatcher.get(), &FileWatcherService::volumeCatalogChanged,
-            this, &CWindow::refreshVolumeSelectionUi);
+            this, [this](const QString& preferredVolumeId) {
+                refreshCurrentVolumePackageUi(preferredVolumeId, false);
+            });
 
     _axisAlignedSliceController = std::make_unique<AxisAlignedSliceController>(_state, this);
 
@@ -2811,7 +2813,7 @@ void CWindow::CreateWidgets(void)
 
         // Setup base colormap selector
     {
-        const auto& entries = volume_viewer_cmaps::entries();
+        const auto& entries = volume_viewer_cmaps::entries(volume_viewer_cmaps::EntryScope::SharedOnly);
         ui.baseColormapSelect->clear();
         ui.baseColormapSelect->addItem(tr("None (Grayscale)"), QString());
         for (const auto& entry : entries) {

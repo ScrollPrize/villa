@@ -41,6 +41,11 @@ struct TileRenderParams {
     float windowHigh = 255.0f;         // window/level high bound
     bool stretchValues = false;         // auto-stretch intensity range
     std::string colormapId;             // colormap identifier (empty = grayscale)
+    std::shared_ptr<Volume> overlayVolume; // optional overlay volume sampled with the same coords
+    float overlayOpacity = 0.0f;        // overlay alpha in [0,1]
+    float overlayWindowLow = 0.0f;      // overlay threshold/window low
+    float overlayWindowHigh = 255.0f;   // overlay window high
+    std::string overlayColormapId;      // overlay colormap identifier
     bool useFastInterpolation = false;  // nearest-neighbor instead of trilinear
     CompositeRenderSettings compositeSettings;  // multi-layer composite params
 };
