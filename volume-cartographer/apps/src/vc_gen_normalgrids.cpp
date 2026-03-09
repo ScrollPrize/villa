@@ -53,8 +53,10 @@ struct DirectionMetrics {
     size_t chunkSizeTarget = 0;
     size_t bytesPerSlice = 0;
     size_t estimatedBatchBytes = 0;
+    size_t thinningCalls = 0;
     std::unordered_map<std::string, double> timingTotals;
     std::unordered_map<std::string, size_t> timingCounts;
+    ThinningStats thinningStats;
 };
 
 struct RunMetrics {
@@ -98,13 +100,14 @@ struct ThreadSliceStats {
     size_t totalSize = 0;
     size_t totalSegments = 0;
     size_t totalBuckets = 0;
+    size_t thinningCalls = 0;
     std::unordered_map<std::string, double> timingTotals;
     std::unordered_map<std::string, size_t> timingCounts;
+    ThinningStats thinningStats;
 };
 
 struct ThreadScratch {
     cv::Mat binarySlice;
-    cv::Mat thinnedSlice;
     std::vector<std::vector<cv::Point>> traces;
 };
 
@@ -172,6 +175,21 @@ static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) 
             t["count"] = count;
             t["avg_seconds"] = count > 0 ? total / static_cast<double>(count) : 0.0;
             d["timings"][name] = t;
+        }
+        if (dir.thinningCalls > 0) {
+            d["timings"]["thinning_detail"] = {
+                {"count", dir.thinningCalls},
+                {"distance_transform_seconds", dir.thinningStats.distanceTransformSeconds},
+                {"seed_detection_seconds", dir.thinningStats.seedDetectionSeconds},
+                {"trace_paths_seconds", dir.thinningStats.tracePathsSeconds},
+                {"avg_distance_transform_seconds", dir.thinningStats.distanceTransformSeconds / static_cast<double>(dir.thinningCalls)},
+                {"avg_seed_detection_seconds", dir.thinningStats.seedDetectionSeconds / static_cast<double>(dir.thinningCalls)},
+                {"avg_trace_paths_seconds", dir.thinningStats.tracePathsSeconds / static_cast<double>(dir.thinningCalls)},
+                {"seed_count", dir.thinningStats.seedCount},
+                {"trace_count", dir.thinningStats.traceCount},
+                {"trace_steps", dir.thinningStats.traceSteps},
+                {"candidate_evaluations", dir.thinningStats.candidateEvaluations},
+            };
         }
         out["directions"].push_back(std::move(d));
     }
@@ -662,10 +680,13 @@ void run_generate(const po::variables_map& vm) {
 
                     scratch.traces.clear();
                     const auto thinning_start = std::chrono::steady_clock::now();
-                    customThinning(scratch.binarySlice, scratch.thinnedSlice, &scratch.traces);
+                    ThinningStats thinning_stats;
+                    customThinningTraceOnly(scratch.binarySlice, scratch.traces, &thinning_stats);
                     local_stats.timingTotals["thinning"] += std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - thinning_start).count();
                     local_stats.timingCounts["thinning"] += 1;
+                    local_stats.thinningStats.accumulate(thinning_stats);
+                    ++local_stats.thinningCalls;
 
                     if (scratch.traces.empty()) {
                         std::ofstream ofs(task.outPath);
@@ -726,6 +747,8 @@ void run_generate(const po::variables_map& vm) {
                         dir_metrics.timingTotals[name] += total;
                         dir_metrics.timingCounts[name] += local_stats.timingCounts.at(name);
                     }
+                    dir_metrics.thinningStats.accumulate(local_stats.thinningStats);
+                    dir_metrics.thinningCalls += local_stats.thinningCalls;
                 }
 
                 run_metrics.totalProcessedAllDirs += chunk_size;
