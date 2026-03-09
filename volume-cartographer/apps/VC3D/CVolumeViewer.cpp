@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <optional>
 #include <cstdlib>
 #include <unordered_map>
@@ -668,21 +667,22 @@ void CVolumeViewer::onVolumeClicked(QPointF scene_loc, Qt::MouseButton buttons, 
                 emit sendCollectionSelected(_selected_collection_id);
             }
 
-            // Look up winding depth index from d.tif on the segmentation surface
+            // Look up winding depth index from d.tif using 2D click position
             if (newPt.id != 0) {
                 const auto& seg = activeSegmentationHandle();
-                if (seg.surface) {
-                    cv::Vec3f ptr = seg.surface->pointer();
-                    float dist = seg.surface->pointTo(ptr, p, std::numeric_limits<float>::max(), 400);
-                    if (dist >= 0.0f) {
-                        cv::Vec3f raw = seg.surface->loc_raw(ptr);
-                        int row = static_cast<int>(std::round(raw[1]));
-                        int col = static_cast<int>(std::round(raw[0]));
-                        float wind_a = lookupDepthIndex(seg.surface, row, col);
-                        if (!std::isnan(wind_a)) {
-                            newPt.winding_annotation = wind_a;
-                            _point_collection->updatePoint(newPt);
-                        }
+                if (seg.viewerIsSegmentationView && seg.surface) {
+                    // Compute grid position directly from 2D scene coordinates
+                    cv::Vec3f surf_loc = {static_cast<float>(scene_loc.x()/_scale),
+                                          static_cast<float>(scene_loc.y()/_scale), 0};
+                    cv::Vec2f ss = seg.surface->scale();
+                    cv::Vec3f fake_ptr(surf_loc[0] * ss[0], surf_loc[1] * ss[1], 0);
+                    cv::Vec3f raw = seg.surface->loc_raw(fake_ptr);
+                    int row = static_cast<int>(std::round(raw[1]));
+                    int col = static_cast<int>(std::round(raw[0]));
+                    float wind_a = lookupDepthIndex(seg.surface, row, col);
+                    if (!std::isnan(wind_a)) {
+                        newPt.winding_annotation = wind_a;
+                        _point_collection->updatePoint(newPt);
                     }
                 }
             }

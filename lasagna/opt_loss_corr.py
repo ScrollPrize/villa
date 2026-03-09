@@ -411,6 +411,9 @@ def _snap_brute_force(P: torch.Tensor, xyz_det: torch.Tensor, wind_d: torch.Tens
 	best_dir = torch.zeros(K, dtype=torch.long, device=dev)
 	best_dist = torch.full((K,), float("inf"), dtype=dt, device=dev)
 
+	h_q = torch.arange(Qh, device=dev).unsqueeze(1).expand(Qh, Qw).reshape(NQ)
+	w_q = torch.arange(Qw, device=dev).unsqueeze(0).expand(Qh, Qw).reshape(NQ)
+
 	unique_d = torch.unique(wind_d)
 	for d_val in unique_d.tolist():
 		d = int(d_val)
@@ -432,46 +435,43 @@ def _snap_brute_force(P: torch.Tensor, xyz_det: torch.Tensor, wind_d: torch.Tens
 		u_all, v_all = _bilinear_project(P_exp, v00, v10, v01, v11)  # (Ks, NQ)
 		Q = _bilinear_interp(v00, v10, v01, v11, u_all, v_all)  # (Ks, NQ, 3)
 
-		# Conn direction vectors at quad corners
-		# For each quad (h, w), interpolate conn vectors at (u, v)
-		h_q = torch.arange(Qh, device=dev).unsqueeze(1).expand(Qh, Qw).reshape(NQ)
-		w_q = torch.arange(Qw, device=dev).unsqueeze(0).expand(Qh, Qw).reshape(NQ)
+		# Euclidean distance to quad surface point
+		diff = P_exp - Q  # (Ks, NQ, 3)
+		dist_eucl = diff.norm(dim=-1)  # (Ks, NQ)
 
-		for dir_idx, conn_dir in enumerate([conn_prev, conn_next]):
-			# mask_conn indices: 0=prev, 2=next
-			mc_idx = 0 if dir_idx == 0 else 2
-			# Check validity at quad corners
-			mc = mask_conn[d, 0, :, :, mc_idx]  # (Hm, Wm)
-			mc_q = mc[:-1, :-1].reshape(NQ)  # (NQ,) — validity at v00 corner
-			valid_q = (mc_q > 0).unsqueeze(0).expand(Ks, NQ)  # (Ks, NQ)
+		min_dist, min_qi = dist_eucl.min(dim=1)  # (Ks,)
+		pidx = pmask.nonzero(as_tuple=True)[0]
+		better = min_dist < best_dist[pidx]
+		if better.any():
+			bi = better.nonzero(as_tuple=True)[0]
+			gi = pidx[bi]
+			qi = min_qi[bi]
+			best_h[gi] = h_q[qi]
+			best_w[gi] = w_q[qi]
+			best_u[gi] = u_all[bi, qi]
+			best_v[gi] = v_all[bi, qi]
+			best_dist[gi] = min_dist[bi]
 
-			# Interpolate conn direction at (u, v) within each quad
-			cn00 = conn_dir[d, :-1, :-1].reshape(NQ, 3).unsqueeze(0)  # (1, NQ, 3)
-			cn10 = conn_dir[d, 1:, :-1].reshape(NQ, 3).unsqueeze(0)
-			cn01 = conn_dir[d, :-1, 1:].reshape(NQ, 3).unsqueeze(0)
-			cn11 = conn_dir[d, 1:, 1:].reshape(NQ, 3).unsqueeze(0)
-			n_interp = _bilinear_interp(cn00, cn10, cn01, cn11, u_all, v_all)  # (Ks, NQ, 3)
-			n_len = n_interp.norm(dim=-1, keepdim=True).clamp(min=1e-12)
-			n_unit = n_interp / n_len
+	# Pick best conn direction per point at its best quad
+	v00_b = xyz_det[wind_d, best_h, best_w]
+	v10_b = xyz_det[wind_d, best_h + 1, best_w]
+	v01_b = xyz_det[wind_d, best_h, best_w + 1]
+	v11_b = xyz_det[wind_d, best_h + 1, best_w + 1]
+	Q_best = _bilinear_interp(v00_b, v10_b, v01_b, v11_b, best_u, best_v)
+	offset = P - Q_best
 
-			dist_signed = ((P_exp - Q) * n_unit).sum(-1)  # (Ks, NQ)
-			dist_abs = dist_signed.abs()
-			dist_abs = torch.where(valid_q, dist_abs, torch.full_like(dist_abs, float("inf")))
-
-			min_dist, min_qi = dist_abs.min(dim=1)  # (Ks,)
-			# Update best for these points
-			pidx = pmask.nonzero(as_tuple=True)[0]  # global indices
-			better = min_dist < best_dist[pidx]
-			if better.any():
-				bi = better.nonzero(as_tuple=True)[0]
-				gi = pidx[bi]
-				qi = min_qi[bi]
-				best_h[gi] = h_q[qi]
-				best_w[gi] = w_q[qi]
-				best_u[gi] = u_all[bi, qi]
-				best_v[gi] = v_all[bi, qi]
-				best_dir[gi] = dir_idx
-				best_dist[gi] = min_dist[bi]
+	best_dir_dist = torch.full((K,), float("inf"), dtype=dt, device=dev)
+	for dir_idx, conn_dir in enumerate([conn_prev, conn_next]):
+		cn00 = conn_dir[wind_d, best_h, best_w]
+		cn10 = conn_dir[wind_d, best_h + 1, best_w]
+		cn01 = conn_dir[wind_d, best_h, best_w + 1]
+		cn11 = conn_dir[wind_d, best_h + 1, best_w + 1]
+		n = _bilinear_interp(cn00, cn10, cn01, cn11, best_u, best_v)
+		n = n / (n.norm(dim=-1, keepdim=True) + 1e-12)
+		dist = (offset * n).sum(-1).abs()
+		use_this = dist < best_dir_dist
+		best_dir[use_this] = dir_idx
+		best_dir_dist[use_this] = dist[use_this]
 
 	return best_h, best_w, best_u, best_v, best_dir
 
@@ -485,61 +485,55 @@ def _snap_update_anchors(P: torch.Tensor, xyz_det: torch.Tensor, wind_d: torch.T
 						 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 	"""Local anchor update: re-project points onto current quads.
 
-	If (u, v) goes out of [0, 1], shift to adjacent quad.
+	Computes unclamped (u, v) to get full integer shift, then re-projects.
 	"""
 	K = P.shape[0]
 	dev = P.device
 	dt = P.dtype
 	D, Hm, Wm, _ = xyz_det.shape
 
-	h = anchor_h.clone()
-	w = anchor_w.clone()
+	h_old = anchor_h.clone()
+	w_old = anchor_w.clone()
 	d = wind_d
 
-	# Gather current quad corners (detached)
-	v00 = xyz_det[d, h, w]          # (K, 3)
-	v10 = xyz_det[d, h + 1, w]
-	v01 = xyz_det[d, h, w + 1]
-	v11 = xyz_det[d, h + 1, w + 1]
+	# --- Dist before update (for debug) ---
+	v00_old = xyz_det[d, h_old, w_old]
+	v10_old = xyz_det[d, h_old + 1, w_old]
+	v01_old = xyz_det[d, h_old, w_old + 1]
+	v11_old = xyz_det[d, h_old + 1, w_old + 1]
+	Q_old = _bilinear_interp(v00_old, v10_old, v01_old, v11_old, anchor_u, anchor_v)
+	dist_before = (P - Q_old).norm(dim=-1)
 
-	# Re-project
-	u_new, v_new = _bilinear_project(P, v00, v10, v01, v11)  # (K,)
+	# --- Unclamped bilinear project to get full shift ---
+	e1 = v10_old - v00_old
+	e2 = v01_old - v00_old
+	g = P - v00_old
+	e1e1 = (e1 * e1).sum(-1)
+	e1e2 = (e1 * e2).sum(-1)
+	e2e2 = (e2 * e2).sum(-1)
+	ge1 = (g * e1).sum(-1)
+	ge2 = (g * e2).sum(-1)
+	det = e1e1 * e2e2 - e1e2 * e1e2
+	det_safe = det + (det.abs() < 1e-20).float() * 1e-20
+	u_raw = (ge1 * e2e2 - ge2 * e1e2) / det_safe
+	v_raw = (ge2 * e1e1 - ge1 * e1e2) / det_safe
 
-	# Shift if out of bounds
-	h_shift = torch.zeros_like(h)
-	w_shift = torch.zeros_like(w)
-	h_shift[u_new > 1.0] = 1
-	h_shift[u_new < 0.0] = -1
-	w_shift[v_new > 1.0] = 1
-	w_shift[v_new < 0.0] = -1
+	# Full integer shift
+	h = (h_old + u_raw.floor().to(torch.long)).clamp(0, Qh - 1)
+	w = (w_old + v_raw.floor().to(torch.long)).clamp(0, Qw - 1)
 
-	h = (h + h_shift).clamp(0, Qh - 1)
-	w = (w + w_shift).clamp(0, Qw - 1)
-
-	# Re-project on shifted quads for points that moved
-	moved = (h_shift != 0) | (w_shift != 0)
-	if moved.any():
-		mi = moved.nonzero(as_tuple=True)[0]
-		v00_m = xyz_det[d[mi], h[mi], w[mi]]
-		v10_m = xyz_det[d[mi], h[mi] + 1, w[mi]]
-		v01_m = xyz_det[d[mi], h[mi], w[mi] + 1]
-		v11_m = xyz_det[d[mi], h[mi] + 1, w[mi] + 1]
-		u_m, v_m = _bilinear_project(P[mi], v00_m, v10_m, v01_m, v11_m)
-		u_new[mi] = u_m
-		v_new[mi] = v_m
-
-	u_new = u_new.clamp(0.0, 1.0)
-	v_new = v_new.clamp(0.0, 1.0)
-
-	# Re-check direction: pick the one with smaller |dist|
+	# Re-project on updated quads (clamped)
 	v00 = xyz_det[d, h, w]
 	v10 = xyz_det[d, h + 1, w]
 	v01 = xyz_det[d, h, w + 1]
 	v11 = xyz_det[d, h + 1, w + 1]
-	Q = _bilinear_interp(v00, v10, v01, v11, u_new, v_new)  # (K, 3)
-	offset = P - Q  # (K, 3)
+	u_new, v_new = _bilinear_project(P, v00, v10, v01, v11)  # clamped [0,1]
 
-	new_dir = torch.zeros(K, dtype=torch.long, device=dev)  # start with prev=0
+	# Re-check direction: pick the one with smaller |dist|
+	Q_new = _bilinear_interp(v00, v10, v01, v11, u_new, v_new)
+	offset = P - Q_new
+
+	new_dir = torch.zeros(K, dtype=torch.long, device=dev)
 	for dir_idx, conn_dir in enumerate([conn_prev, conn_next]):
 		cn00 = conn_dir[d, h, w]
 		cn10 = conn_dir[d, h + 1, w]
@@ -553,6 +547,19 @@ def _snap_update_anchors(P: torch.Tensor, xyz_det: torch.Tensor, wind_d: torch.T
 		else:
 			use_this = dist < best_dist
 			new_dir[use_this] = dir_idx
+
+	# --- Dist after update (for debug) ---
+	# dist_after = offset.norm(dim=-1)
+ #
+	# # Debug: print per-point distances and indices before/after
+	# def _fmt(t):
+	# 	return " ".join(f"{v:.2f}" for v in t.tolist())
+	# def _fmtpair(h_t, w_t):
+	# 	return " ".join(f"({int(hi)},{int(wi)})" for hi, wi in zip(h_t.tolist(), w_t.tolist()))
+	# print(f"[corr-snap-update] dist_before: {_fmt(dist_before)}")
+	# print(f"[corr-snap-update] dist_after:  {_fmt(dist_after)}")
+	# print(f"[corr-snap-update] idx_before:  {_fmtpair(h_old, w_old)}")
+	# print(f"[corr-snap-update] idx_after:   {_fmtpair(h, w)}")
 
 	return h, w, u_new, v_new, new_dir
 
@@ -623,6 +630,7 @@ def _corr_snap_loss(
 		_snap_anchors_h, _snap_anchors_w, _snap_anchors_u, _snap_anchors_v, _snap_anchors_dir = \
 			_snap_brute_force(P, xyz_det, wind_d, conn_prev, conn_next, mask_conn.detach(), Qh, Qw)
 		_snap_initialized = True
+
 	else:
 		# Local update
 		_snap_anchors_h, _snap_anchors_w, _snap_anchors_u, _snap_anchors_v, _snap_anchors_dir = \
