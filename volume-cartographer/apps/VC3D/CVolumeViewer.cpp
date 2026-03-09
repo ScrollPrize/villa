@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <cstdlib>
 #include <unordered_map>
@@ -651,19 +652,39 @@ void CVolumeViewer::onVolumeClicked(QPointF scene_loc, Qt::MouseButton buttons, 
         bool isShift = modifiers.testFlag(Qt::ShiftModifier);
 
         if (isShift && !_segmentationEditActive) {
+            ColPoint newPt;
             // If a collection is selected, add to it.
             if (_selected_collection_id != 0) {
                 const auto& collections = _point_collection->getAllCollections();
                 auto it = collections.find(_selected_collection_id);
                 if (it != collections.end()) {
-                    _point_collection->addPoint(it->second.name, p);
+                    newPt = _point_collection->addPoint(it->second.name, p);
                 }
             } else {
                 // Otherwise, create a new collection.
                 std::string new_name = _point_collection->generateNewCollectionName("col");
-                auto new_point = _point_collection->addPoint(new_name, p);
-                _selected_collection_id = new_point.collectionId;
+                newPt = _point_collection->addPoint(new_name, p);
+                _selected_collection_id = newPt.collectionId;
                 emit sendCollectionSelected(_selected_collection_id);
+            }
+
+            // Look up winding depth index from d.tif on the segmentation surface
+            if (newPt.id != 0) {
+                const auto& seg = activeSegmentationHandle();
+                if (seg.surface) {
+                    cv::Vec3f ptr = seg.surface->pointer();
+                    float dist = seg.surface->pointTo(ptr, p, std::numeric_limits<float>::max(), 400);
+                    if (dist >= 0.0f) {
+                        cv::Vec3f raw = seg.surface->loc_raw(ptr);
+                        int row = static_cast<int>(std::round(raw[1]));
+                        int col = static_cast<int>(std::round(raw[0]));
+                        float wind_a = lookupDepthIndex(seg.surface, row, col);
+                        if (!std::isnan(wind_a)) {
+                            newPt.winding_annotation = wind_a;
+                            _point_collection->updatePoint(newPt);
+                        }
+                    }
+                }
             }
         } else if (_highlighted_point_id != 0) {
             emit pointClicked(_highlighted_point_id);
