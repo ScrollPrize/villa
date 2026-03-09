@@ -2362,6 +2362,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                                /*inpaint=*/false, approved_weight_hr, prefer_approved_in_hr);
 
     auto surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
+    surf->setDpi(voxelSizeToDpi(voxelsize));
 
     auto gen_channel = surftrack_generation_channel(generations, used_area, step);
     if (!gen_channel.empty())
