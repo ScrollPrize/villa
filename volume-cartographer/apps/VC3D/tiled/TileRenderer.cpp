@@ -1,5 +1,6 @@
 #include "TileRenderer.hpp"
 #include "PostProcess.hpp"
+#include "VolumeViewerCmaps.hpp"
 
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -223,7 +224,11 @@ TileRenderResult TileRenderer::renderTile(
         cv::Mat_<uint8_t> overlayGray;
         vc::SampleParams overlaySp;
         overlaySp.level = params.dsScaleIdx;
-        overlaySp.method = (params.useFastInterpolation || params.dsScaleIdx >= 3)
+        const bool categoricalOverlay =
+            !params.overlayColormapId.empty() &&
+            volume_viewer_cmaps::resolve(params.overlayColormapId).kind ==
+                volume_viewer_cmaps::OverlayColormapKind::DiscreteLut;
+        overlaySp.method = (categoricalOverlay || params.useFastInterpolation || params.dsScaleIdx >= 3)
                                ? vc::Sampling::Nearest
                                : vc::Sampling::Trilinear;
 
