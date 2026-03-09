@@ -48,7 +48,7 @@ constexpr std::array<uint32_t, 256> kGlasbeyBlack0Lut = {
     0xFF6DDB00u, 0xFF922492u, 0xFFB6246Du, 0xFF6D9224u, 0xFF926D24u, 0xFF244992u, 0xFF249249u, 0xFF2424B6u,
     0xFF24B624u, 0xFF920049u, 0xFF494924u, 0xFF006D24u, 0xFFB6DBFFu, 0xFFB6FFDBu, 0xFF49FFFFu, 0xFF6DDBFFu,
     0xFF6DFFDBu, 0xFFB692DBu, 0xFF24DBFFu, 0xFF24FFDBu, 0xFFB649FFu, 0xFFDB24FFu, 0xFFFF24DBu, 0xFF6D92DBu,
-    0xFF00DBDBu, 0xFFDB00DBu, 0xFF6DFF49u, 0xFFFF246Du, 0xFF926D6Du, 0xFFB66D49u, 0xFFFF0049u, 0xFF6D24B6u,
+    0xFF00DBDBu, 0xFFDB00DBu, 0xFF6DFF49u, 0xFFFF246Du, 0xFF926D6Du, 0xFFB66D49u, 0xFFFF0049u, 0xFFFF8800u,
     0xFF6D496Du, 0xFF6D6D49u, 0xFF0024DBu, 0xFF00DB24u, 0xFF2400DBu, 0xFF24DB00u, 0xFF492492u, 0xFFB60024u,
     0xFF004949u, 0xFF490049u, 0xFF00246Du, 0xFF24006Du, 0xFF000049u, 0xFF002424u, 0xFF240024u, 0xFFB6B6FFu,
     0xFF92DBDBu, 0xFF9292FFu, 0xFF6DB6FFu, 0xFFB6B6B6u, 0xFFB66DDBu, 0xFF49B6DBu, 0xFF9249DBu, 0xFF49FF6Du,
@@ -64,7 +64,7 @@ constexpr std::array<uint32_t, 256> kGlasbeyBlack0Lut = {
     0xFF92DB92u, 0xFFDB9292u, 0xFFDBDB49u, 0xFF49B6FFu, 0xFF49FFB6u, 0xFF6D92FFu, 0xFF6DB6DBu, 0xFF6DFF92u,
     0xFF92B6B6u, 0xFFB692B6u, 0xFFB6B692u, 0xFFB6DB6Du, 0xFFB6FF49u, 0xFFDBB66Du, 0xFFDBFF24u, 0xFFFF49B6u,
     0xFFFF6D92u, 0xFFFF926Du, 0xFFFFB649u, 0xFFFFDB24u, 0xFF00DBFFu, 0xFF00FFDBu, 0xFF24DBDBu, 0xFF49DBB6u,
-    0xFF6DDB92u, 0xFF9249FFu, 0xFF926DDBu, 0xFF9292B6u, 0xFF92B692u, 0xFF92DB6Du, 0xFF92FF49u, 0xFFB649DBu,
+    0xFF6DDB92u, 0xFF9249FFu, 0xFF926DDBu, 0xFF9292B6u, 0xFF92B692u, 0xFF92DB6Du, 0xFF92FF49u, 0xFF00F0FFu,
 };
 
 std::vector<OverlayColormapEntry> buildEntries(const EntryScope scope)
@@ -91,7 +91,7 @@ const std::vector<OverlayColormapSpec>& buildSpecs()
         {"blue", QStringLiteral("Blue"), OverlayColormapKind::Tint, ColormapAudience::Shared, 0, cv::Vec3f(0.0f, 0.0f, 1.0f), nullptr},
         {"cyan", QStringLiteral("Cyan"), OverlayColormapKind::Tint, ColormapAudience::Shared, 0, cv::Vec3f(0.0f, 1.0f, 1.0f), nullptr},
         {"magenta", QStringLiteral("Magenta"), OverlayColormapKind::Tint, ColormapAudience::Shared, 0, cv::Vec3f(1.0f, 0.0f, 1.0f), nullptr},
-        {"glasbey_black0", QStringLiteral("Glasbey (0=Black)"), OverlayColormapKind::DiscreteLut, ColormapAudience::OverlayOnly, 0, {}, kGlasbeyBlack0Lut.data()},
+        {"glasbey_black0", QStringLiteral("Glasbey"), OverlayColormapKind::DiscreteLut, ColormapAudience::OverlayOnly, 0, {}, kGlasbeyBlack0Lut.data()},
     };
     return specs;
 }
