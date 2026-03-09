@@ -10,6 +10,10 @@ namespace vc::core::util {
 
 class GridStore {
 public:
+    struct SaveOptions {
+        bool verify_reload = true;
+    };
+
     struct CacheStats {
         uint64_t decodedPathHits = 0;
         uint64_t decodedPathMisses = 0;
@@ -35,6 +39,7 @@ public:
 
     nlohmann::json meta;
 
+    void save(const std::string& path, const SaveOptions& options) const;
     void save(const std::string& path) const;
     void load_mmap(const std::string& path);
 

@@ -130,3 +130,16 @@ TEST(GridStoreCache, ConcurrentRepeatedROIQueriesAreStable)
     const auto stats = reader.cacheStats();
     EXPECT_GT(stats.decodedPathHits, 0);
 }
+
+TEST(GridStoreCache, SaveWithoutVerificationStillReloadsIdentically)
+{
+    ScopedTempDir tempDir;
+    const auto gridPath = tempDir.path() / "sample.grid";
+
+    vc::core::util::GridStore writer(cv::Rect(0, 0, 256, 256), 16);
+    populateWriter(writer);
+    writer.save(gridPath.string(), vc::core::util::GridStore::SaveOptions{.verify_reload = false});
+
+    vc::core::util::GridStore reader(gridPath.string());
+    EXPECT_EQ(pathSignature(writer.get_all()), pathSignature(reader.get_all()));
+}

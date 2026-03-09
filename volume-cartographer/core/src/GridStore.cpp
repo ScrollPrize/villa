@@ -219,7 +219,7 @@ public:
         decoded_path_evictions_.store(0, std::memory_order_relaxed);
     }
 
-    void save(const std::string& path) const {
+    void save(const std::string& path, const GridStore::SaveOptions& options) const {
         if (read_only_) {
             throw std::runtime_error("Cannot save a read-only GridStore. Load the data into a new, writable GridStore instance first.");
         }
@@ -325,33 +325,35 @@ public:
         file.write(buffer.data(), buffer.size());
         file.close();
 
-        // 9. In-line verification by reloading the saved file
-        {
-            GridStore reloaded_store(path);
-            auto original_paths = this->get_all();
-            auto reloaded_paths = reloaded_store.get_all();
+        if (options.verify_reload) {
+            // 9. In-line verification by reloading the saved file
+            {
+                GridStore reloaded_store(path);
+                auto original_paths = this->get_all();
+                auto reloaded_paths = reloaded_store.get_all();
 
-            if (original_paths.size() != reloaded_paths.size()) {
-                throw std::runtime_error("Verification failed: path count mismatch. Original: " + std::to_string(original_paths.size()) + ", Reloaded: " + std::to_string(reloaded_paths.size()));
-            }
-
-            auto points_to_string_set = [](const std::vector<std::shared_ptr<std::vector<cv::Point>>>& paths) {
-                std::multiset<std::string> string_set;
-                for (const auto& path_ptr : paths) {
-                    std::stringstream ss;
-                    for (const auto& p : *path_ptr) {
-                        ss << p.x << "," << p.y << ";";
-                    }
-                    string_set.insert(ss.str());
+                if (original_paths.size() != reloaded_paths.size()) {
+                    throw std::runtime_error("Verification failed: path count mismatch. Original: " + std::to_string(original_paths.size()) + ", Reloaded: " + std::to_string(reloaded_paths.size()));
                 }
-                return string_set;
-            };
 
-            auto original_set = points_to_string_set(original_paths);
-            auto reloaded_set = points_to_string_set(reloaded_paths);
+                auto points_to_string_set = [](const std::vector<std::shared_ptr<std::vector<cv::Point>>>& paths) {
+                    std::multiset<std::string> string_set;
+                    for (const auto& path_ptr : paths) {
+                        std::stringstream ss;
+                        for (const auto& p : *path_ptr) {
+                            ss << p.x << "," << p.y << ";";
+                        }
+                        string_set.insert(ss.str());
+                    }
+                    return string_set;
+                };
 
-            if (original_set != reloaded_set) {
-                 throw std::runtime_error("Verification failed: path data mismatch after reload.");
+                auto original_set = points_to_string_set(original_paths);
+                auto reloaded_set = points_to_string_set(reloaded_paths);
+
+                if (original_set != reloaded_set) {
+                     throw std::runtime_error("Verification failed: path data mismatch after reload.");
+                }
             }
         }
     }
@@ -796,9 +798,13 @@ void GridStore::resetCacheStats() const {
     pimpl_->resetCacheStats();
 }
 
-void GridStore::save(const std::string& path) const {
+void GridStore::save(const std::string& path, const SaveOptions& options) const {
     pimpl_->meta_ = meta;
-    pimpl_->save(path);
+    pimpl_->save(path, options);
+}
+
+void GridStore::save(const std::string& path) const {
+    save(path, SaveOptions{});
 }
 
 void GridStore::load_mmap(const std::string& path) {
