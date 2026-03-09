@@ -196,6 +196,7 @@ private:
    QPushButton* btnZoomOut;
     QCheckBox* chkAxisAlignedSlices;
     QCheckBox* _previewTransformCheck{nullptr};
+    QCheckBox* _scaleOnlyTransformCheck{nullptr};
     QCheckBox* _invertTransformCheck{nullptr};
     QSpinBox* _transformScaleSpin{nullptr};
     QPushButton* _loadAffineButton{nullptr};
