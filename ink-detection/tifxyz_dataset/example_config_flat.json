@@ -1,0 +1,43 @@
+{
+    "volume_auth_json": "/home/sean/villa/ink-detection/tifxyz_dataset/example_creds.json",
+    "out_dir": "/home/sean/Desktop/ink_test",
+    "seed": 27,
+    "patch_size" : [65, 256, 256],
+    "batch_size": 2,
+    "patch_overlap": 0.5,
+    "patch_min_labeled_coverage": 0.10,
+    "num_iterations": 250000,
+    "val_every": 100,
+    "mixed_precision":"bf16",
+    "dataloader_workers": 10,
+    "warmup_steps": 25,
+
+    "model_type": "unet",
+    "step_count": 1,
+    "in_channels": 1,
+
+       "model_config": {
+        "autoconfigure": true,
+        "pool_op_kernel_sizes": [[1, 1, 1], [1, 2, 2], [1, 2, 2], [1, 2, 2], [1, 2, 2], [1, 2, 2], [1, 2, 2]],
+        "strides": [[1, 1, 1], [1, 2, 2], [1, 2, 2], [1, 2, 2], [1, 2, 2], [1, 2, 2], [1, 2, 2]]
+    },
+
+    "targets": {
+      "ink": {
+        "out_channels": 2,
+        "activation": "none",
+        "z_projection": {
+          "mode": "max"
+        }
+      }
+    },
+
+    "datasets": [
+        {
+            "volume_path": "https://volumes.aws.ash2txt.org/esrf/20251130/SCROLLS_HEL_2.399um_78keV_0.22m_PHerc_1667_TA_0001_masked.zarr/",
+            "volume_scale": 0,
+            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/1667"
+        }
+    ]
+
+}
