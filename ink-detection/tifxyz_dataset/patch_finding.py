@@ -10,7 +10,10 @@ import numpy as np
 from tqdm.auto import tqdm
 
 import vesuvius.tifxyz as tifxyz
-from .common import open_zarr
+from .common import (
+    load_volume_auth,
+    open_zarr,
+)
 from vesuvius.neural_tracing.datasets.common import (
     _parse_z_range,
     _segment_overlaps_z_range,
@@ -219,10 +222,12 @@ def find_patches(
         volume_scale = dataset["volume_scale"]
 
         volume_auth_json = dataset.get("volume_auth_json", config.get("volume_auth_json"))
+        user, password = load_volume_auth(volume_auth_json)
         volume = open_zarr(
             volume_path,
             volume_scale,
-            auth=volume_auth_json,
+            user,
+            password,
         )
         segments_path = dataset["segments_path"]
         z_range = _parse_z_range(dataset.get("z_range", None))

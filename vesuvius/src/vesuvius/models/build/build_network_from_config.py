@@ -45,7 +45,7 @@ https://github.com/MIC-DKFZ/nnUNet
 
 import torch
 import torch.nn as nn
-from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage, pad_shape
+from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage
 from .encoder import Encoder
 from .decoder import Decoder
 from .activations import SwiGLUBlock, GLUBlock
@@ -339,42 +339,16 @@ class NetworkFromConfig(nn.Module):
         # --------------------------------------------------------------------
         # Architecture parameters.
         # --------------------------------------------------------------------
-        # Check if we have stage-wise architecture settings specified in model_config
+        # Check if we have features_per_stage specified in model_config
         manual_features = model_config.get("features_per_stage", None)
-        manual_kernel_sizes = model_config.get("kernel_sizes", None)
-        manual_strides = model_config.get("strides", None)
-        manual_pool_op_kernel_sizes = model_config.get("pool_op_kernel_sizes", None)
-
-        manual_stage_specs = {
-            "features_per_stage": manual_features,
-            "kernel_sizes": manual_kernel_sizes,
-            "strides": manual_strides,
-            "pool_op_kernel_sizes": manual_pool_op_kernel_sizes,
-        }
-        explicit_stage_count = None
-        for spec_name, spec_value in manual_stage_specs.items():
-            if spec_value is None:
-                continue
-            spec_len = len(spec_value)
-            if explicit_stage_count is None:
-                explicit_stage_count = spec_len
-            elif spec_len != explicit_stage_count:
-                raise ValueError(
-                    "Provided stage-wise settings must agree on stage count. "
-                    f"Expected {explicit_stage_count} entries but {spec_name} has {spec_len}."
-                )
         
         if self.autoconfigure or manual_features is not None:
             if manual_features is not None:
-                print("--- Partial autoconfiguration: using provided stage-wise settings ---")
+                print("--- Partial autoconfiguration: using provided features_per_stage ---")
                 self.features_per_stage = manual_features
                 self.num_stages = len(self.features_per_stage)
                 print(f"Using provided features_per_stage: {self.features_per_stage}")
                 print(f"Detected {self.num_stages} stages from features_per_stage")
-            elif explicit_stage_count is not None:
-                print("--- Partial autoconfiguration: using provided stage layout ---")
-                self.num_stages = explicit_stage_count
-                print(f"Detected {self.num_stages} stages from provided stage-wise settings")
             else:
                 print("--- Full autoconfiguration from config ---")
             
@@ -382,89 +356,38 @@ class NetworkFromConfig(nn.Module):
             self.basic_decoder_block = model_config.get("basic_decoder_block", "ConvBlock")
             self.bottleneck_block = model_config.get("bottleneck_block", "BasicBlockD")
 
-            auto_num_pool_per_axis, auto_pool_op_kernel_sizes, auto_conv_kernel_sizes, auto_final_patch_size, auto_must_div = \
+            num_pool_per_axis, pool_op_kernel_sizes, conv_kernel_sizes, final_patch_size, must_div = \
                 get_pool_and_conv_props(
                     spacing=mgr.spacing,
                     patch_size=self.patch_size,
                     min_feature_map_size=4,
                     max_numpool=999999
                 )
-            auto_pool_op_kernel_sizes = [list(k) for k in auto_pool_op_kernel_sizes]
-            auto_conv_kernel_sizes = [list(k) for k in auto_conv_kernel_sizes]
-
-            user_controls_pooling = (
-                manual_strides is not None or manual_pool_op_kernel_sizes is not None
-            )
-
-            if user_controls_pooling:
-                effective_strides = manual_strides if manual_strides is not None else manual_pool_op_kernel_sizes
-                effective_pool_op_kernel_sizes = (
-                    manual_pool_op_kernel_sizes if manual_pool_op_kernel_sizes is not None else effective_strides
-                )
-                if len(effective_strides) != len(effective_pool_op_kernel_sizes):
-                    raise ValueError(
-                        "strides and pool_op_kernel_sizes must have the same number of stages "
-                        f"when both are provided. Got {len(effective_strides)} and {len(effective_pool_op_kernel_sizes)}."
-                    )
-                if explicit_stage_count is None:
-                    self.num_stages = len(effective_strides)
-
-                must_div = [1] * self.op_dims
-                num_pool_per_axis = [0] * self.op_dims
-                for stage_idx, stage_stride in enumerate(effective_strides):
-                    if len(stage_stride) != self.op_dims:
-                        raise ValueError(
-                            f"Stride at stage {stage_idx} has {len(stage_stride)} dimensions "
-                            f"but patch size indicates {self.op_dims}D operations. "
-                            f"Stride: {stage_stride}, Expected dimensions: {self.op_dims}"
-                        )
-                    for axis, stride_value in enumerate(stage_stride):
-                        stride_int = int(stride_value)
-                        if stride_int < 1:
-                            raise ValueError(
-                                f"Stride values must be >= 1. Found {stride_value} at "
-                                f"stage {stage_idx}, axis {axis}."
-                            )
-                        must_div[axis] *= stride_int
-                        stride_remainder = stride_int
-                        while stride_remainder > 1 and stride_remainder % 2 == 0:
-                            num_pool_per_axis[axis] += 1
-                            stride_remainder //= 2
-
-                pool_op_kernel_sizes = [list(k) for k in effective_pool_op_kernel_sizes]
-                conv_kernel_sizes = list(auto_conv_kernel_sizes)
-                final_patch_size = tuple(int(v) for v in pad_shape(self.patch_size, must_div))
-            else:
-                pool_op_kernel_sizes = auto_pool_op_kernel_sizes
-                conv_kernel_sizes = auto_conv_kernel_sizes
-                num_pool_per_axis = auto_num_pool_per_axis
-                must_div = auto_must_div
-                final_patch_size = auto_final_patch_size
-                if explicit_stage_count is None:
-                    self.num_stages = len(pool_op_kernel_sizes)
+            # Convert tuples from get_pool_and_conv_props to mutable lists so we can
+            # trim/extend and selectively override with user-provided settings.
+            pool_op_kernel_sizes = [list(k) for k in pool_op_kernel_sizes]
+            conv_kernel_sizes = [list(k) for k in conv_kernel_sizes]
 
             self.num_pool_per_axis = num_pool_per_axis
             self.must_be_divisible_by = must_div
             original_patch_size = self.patch_size
             self.patch_size = final_patch_size
-            print(
-                f"Patch size adjusted from {original_patch_size} to {final_patch_size} "
-                f"to ensure divisibility by pooling factors {must_div}"
-            )
+            print(f"Patch size adjusted from {original_patch_size} to {final_patch_size} to ensure divisibility by pooling factors {must_div}")
 
-            if len(conv_kernel_sizes) > self.num_stages:
-                conv_kernel_sizes = conv_kernel_sizes[:self.num_stages]
-            elif len(conv_kernel_sizes) < self.num_stages:
-                while len(conv_kernel_sizes) < self.num_stages:
-                    conv_kernel_sizes.append([3] * len(mgr.spacing))
-
-            if len(pool_op_kernel_sizes) > self.num_stages:
-                pool_op_kernel_sizes = pool_op_kernel_sizes[:self.num_stages]
-            elif len(pool_op_kernel_sizes) < self.num_stages:
-                while len(pool_op_kernel_sizes) < self.num_stages:
-                    pool_op_kernel_sizes.append(pool_op_kernel_sizes[-1])
-
-            if manual_features is None:
+            # If features_per_stage was manually specified, adjust the auto-configured values
+            if manual_features is not None:
+                # Trim or extend the auto-configured lists to match the number of stages
+                if len(pool_op_kernel_sizes) > self.num_stages:
+                    pool_op_kernel_sizes = pool_op_kernel_sizes[:self.num_stages]
+                    conv_kernel_sizes = conv_kernel_sizes[:self.num_stages]
+                elif len(pool_op_kernel_sizes) < self.num_stages:
+                    # Extend with reasonable defaults
+                    while len(pool_op_kernel_sizes) < self.num_stages:
+                        pool_op_kernel_sizes.append(pool_op_kernel_sizes[-1])
+                        conv_kernel_sizes.append([3] * len(mgr.spacing))
+            else:
+                # Full auto-configuration
+                self.num_stages = len(pool_op_kernel_sizes)
                 base_features = 32
                 max_features = 320
                 features = []
@@ -495,13 +418,9 @@ class NetworkFromConfig(nn.Module):
                 "n_conv_per_stage_decoder",
                 [1] * (self.num_stages - 1)
             )
-            self.strides = manual_strides if manual_strides is not None else pool_op_kernel_sizes
-            self.kernel_sizes = manual_kernel_sizes if manual_kernel_sizes is not None else conv_kernel_sizes
-            self.pool_op_kernel_sizes = (
-                manual_pool_op_kernel_sizes
-                if manual_pool_op_kernel_sizes is not None
-                else pool_op_kernel_sizes
-            )
+            self.strides = model_config.get("strides", pool_op_kernel_sizes)
+            self.kernel_sizes = model_config.get("kernel_sizes", conv_kernel_sizes)
+            self.pool_op_kernel_sizes = model_config.get("pool_op_kernel_sizes", pool_op_kernel_sizes)
 
             # Validate stage-wise list lengths in autoconfigure mode.
             if len(self.kernel_sizes) != self.num_stages:

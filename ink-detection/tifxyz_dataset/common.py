@@ -1,10 +1,8 @@
 import aiohttp
 import json
-from pathlib import Path
 
 import fsspec
 import numpy as np
-import tifffile
 import zarr
 from numba import njit
 from vesuvius.image_proc.intensity.normalization import normalize_robust
@@ -19,37 +17,8 @@ def load_volume_auth(auth_json_path):
     return str(auth["username"]), str(auth["password"])
 
 
-def flat_patch_cache_path(config):
-    return Path(config.get("out_dir", ".")) / "flat_ink_patches.json"
-
-
-def save_flat_patch_cache(path, patches):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(
-            [
-                {
-                    "image_volume": str(patch.segment.image_volume),
-                    "supervision_mask": str(patch.segment.supervision_mask),
-                    "inklabels": str(patch.segment.inklabels),
-                    "scale": patch.segment.scale,
-                    "bbox": list(patch.bbox),
-                }
-                for patch in patches
-            ],
-            f,
-        )
-
-
-def load_flat_patch_cache(path):
-    with open(Path(path), "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def open_zarr(path, resolution, auth=None):
+def open_zarr(path, resolution, user, password):
     path_str = str(path)
-    user, password = load_volume_auth(auth)
     use_https_auth = path_str.startswith("https://") and bool(user) and bool(password)
     if use_https_auth:
         fs = fsspec.filesystem(
@@ -66,51 +35,6 @@ def open_zarr(path, resolution, auth=None):
         )
         return zarr.open(store, path=str(resolution), mode="r")
     return zarr.open(path_str, path=str(resolution), mode="r")
-
-def to_uint8_image(image_2d):
-    image_2d = np.nan_to_num(np.asarray(image_2d, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-    min_value = float(image_2d.min())
-    max_value = float(image_2d.max())
-    if max_value > min_value:
-        image_2d = (image_2d - min_value) / (max_value - min_value)
-    else:
-        image_2d = np.zeros_like(image_2d, dtype=np.float32)
-    return np.clip(np.rint(image_2d * 255.0), 0, 255).astype(np.uint8)
-
-def to_uint8_label(label_2d):
-    label_2d = np.asarray(label_2d, dtype=np.float32)
-    label_vis = np.zeros(label_2d.shape, dtype=np.uint8)
-    label_vis[label_2d == 0] = 127
-    label_vis[label_2d > 0] = 255
-    return label_vis
-
-def to_uint8_probability(probability_2d):
-    probability_2d = np.nan_to_num(np.asarray(probability_2d, dtype=np.float32), nan=0.0, posinf=1.0, neginf=0.0)
-    probability_2d = np.clip(probability_2d, 0.0, 1.0)
-    return np.clip(np.rint(probability_2d * 255.0), 0, 255).astype(np.uint8)
-
-def save_val_preview_tif(output_path, input_tiles, label_tiles, probability_tiles, gap_size=4):
-    if not input_tiles:
-        return
-
-    rows = []
-    for input_tile, label_tile, probability_tile in zip(input_tiles, label_tiles, probability_tiles):
-        column_gap = np.zeros((input_tile.shape[0], gap_size), dtype=np.uint8)
-        rows.append(
-            np.concatenate(
-                [input_tile, column_gap, label_tile, column_gap, probability_tile],
-                axis=1,
-            )
-        )
-
-    row_gap = np.zeros((gap_size, rows[0].shape[1]), dtype=np.uint8)
-    montage = []
-    for row_idx, row in enumerate(rows):
-        if row_idx > 0:
-            montage.append(row_gap)
-        montage.append(row)
-
-    tifffile.imwrite(output_path, np.concatenate(montage, axis=0), compression="lzw")
 
 def _normalize_patch_size_zyx(patch_size):
     patch_size_zyx = np.asarray(patch_size, dtype=np.int32).reshape(-1)

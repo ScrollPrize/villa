@@ -143,9 +143,7 @@ def _config_dict_to_mgr(config_dict):
     else:
         mgr.in_channels = 1 + conditioning_channels + (1 if use_localiser else 0)  # volume + optional localiser + conditioning
     mgr.model_name = config_dict.get('model_name', 'neural_tracing')
-    mgr.autoconfigure = bool(
-        model_config.get('autoconfigure', config_dict.get('autoconfigure', True))
-    )
+    mgr.autoconfigure = True  # explicit per request
     mgr.spacing = model_config.get('spacing', [1, 1, 1])
     mgr.targets = targets
     mgr.enable_deep_supervision = bool(config_dict.get('enable_deep_supervision', False))
