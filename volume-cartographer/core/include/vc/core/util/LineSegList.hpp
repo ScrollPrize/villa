@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <limits>
 #include <mutex>
+#include <cstring>
 
  namespace vc {
  namespace core {
@@ -37,7 +38,7 @@
 
     std::shared_ptr<std::vector<cv::Point>> get() {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::shared_ptr<std::vector<cv::Point>> points_ptr = points_cache_.lock();
+        std::shared_ptr<std::vector<cv::Point>> points_ptr = points_cache_;
         if (!points_ptr) {
             points_ptr = std::make_shared<std::vector<cv::Point>>();
             points_ptr->push_back(start_point_);
@@ -50,6 +51,11 @@
             points_cache_ = points_ptr;
         }
         return points_ptr;
+    }
+
+    size_t decoded_cache_bytes() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return points_cache_ ? points_cache_->capacity() * sizeof(cv::Point) : 0;
     }
 
     const int8_t* compressed_data() const { return compressed_data_ptr_; }
@@ -75,7 +81,7 @@ private:
     std::vector<int8_t> compressed_data_; // Owns the data for non-views
     const int8_t* compressed_data_ptr_ = nullptr;
     size_t compressed_data_size_ = 0;
-    std::weak_ptr<std::vector<cv::Point>> points_cache_;
+    std::shared_ptr<std::vector<cv::Point>> points_cache_;
     mutable std::mutex mutex_;
 };
 

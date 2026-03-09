@@ -4,14 +4,18 @@
 #include <limits>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <string>
+#include <thread>
 #include <vector>
 #include <array>
 #include <random>
 
+#include <unordered_map>
 #include <unordered_set>
 
 #include <boost/program_options.hpp>
+#include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
 #include <opencv2/imgcodecs.hpp>
 
@@ -22,6 +26,8 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SparseChunkSpool.hpp"
+#include "vc/core/util/Zarr.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
 
@@ -29,6 +35,19 @@ namespace fs = std::filesystem;
 namespace po = boost::program_options;
 
 namespace {
+
+using json = nlohmann::json;
+
+static void write_metrics_json(const fs::path& path, const json& metrics) {
+    std::ofstream out(path);
+    if (!out) {
+        throw std::runtime_error("Failed to open metrics json for writing: " + path.string());
+    }
+    out << metrics.dump(2) << "\n";
+    if (!out) {
+        throw std::runtime_error("Failed writing metrics json: " + path.string());
+    }
+}
 
 static void print_usage() {
     std::cout
@@ -44,6 +63,7 @@ static void print_usage() {
         << "      --fit-normals       Estimate local 3D normals from segments (within crop)\n"
         << "      --vis-normals PATH  Write fitted normals as PLY line segments\n\n"
         << "      --output-zarr PATH  Write fitted normals to a zarr directory (direction-field encoding)\n\n"
+        << "      --metrics-json PATH Write structured run metrics json for fit/align modes\n\n"
         << "      --align-normals     Align normals in an existing normals zarr (requires --output-zarr)\n\n"
         << "Notes:\n"
         << "  - Input can be a directory created by vc_gen_normalgrids (contains metadata.json and xy/xz/yz).\n"
@@ -55,6 +75,164 @@ struct CropBox3i {
     cv::Vec3i min; // inclusive
     cv::Vec3i max; // exclusive
 };
+
+struct SliceGridCacheStats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t evictions = 0;
+};
+
+struct ThreadSliceGridCache {
+    explicit ThreadSliceGridCache(size_t maxEntries = 128) : maxEntries(maxEntries) {}
+
+    std::shared_ptr<const vc::core::util::GridStore> get(
+        vc::core::util::NormalGridVolume& ngv, int planeIdx, int sliceIdx)
+    {
+        const uint64_t key =
+            (static_cast<uint64_t>(static_cast<uint32_t>(planeIdx)) << 32) |
+            static_cast<uint32_t>(sliceIdx);
+        auto it = entries.find(key);
+        if (it != entries.end()) {
+            ++stats.hits;
+            return it->second;
+        }
+
+        ++stats.misses;
+        auto grid = ngv.get_grid(planeIdx, sliceIdx);
+        entries.emplace(key, grid);
+        order.push_back(key);
+        if (entries.size() > maxEntries && !order.empty()) {
+            const uint64_t victim = order.front();
+            order.pop_front();
+            const auto erased = entries.erase(victim);
+            if (erased > 0) {
+                ++stats.evictions;
+            }
+        }
+        return grid;
+    }
+
+    SliceGridCacheStats stats;
+    size_t maxEntries = 128;
+    std::unordered_map<uint64_t, std::shared_ptr<const vc::core::util::GridStore>> entries;
+    std::deque<uint64_t> order;
+};
+
+struct FitOutputMaterializeStats {
+    size_t touchedChunks = 0;
+    uint64_t records = 0;
+    size_t spillFiles = 0;
+    double materializeSeconds = 0.0;
+    size_t inMemoryBudgetBytes = 0;
+};
+
+static FitOutputMaterializeStats materialize_fit_output_spool(
+    const fs::path& out_zarr,
+    vc::core::util::SparseChunkSpool& spool,
+    size_t numThreads)
+{
+    FitOutputMaterializeStats stats;
+    const auto touched = spool.touchedChunks();
+    const auto spool_stats = spool.stats();
+    stats.touchedChunks = touched.size();
+    stats.records = spool_stats.appendedRecords;
+    stats.spillFiles = spool_stats.spillFiles;
+    stats.inMemoryBudgetBytes = spool_stats.inMemoryBudgetBytes;
+    if (touched.empty()) {
+        return stats;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto chunkShape = spool.chunkShape();
+    const size_t chunkElems = chunkShape[0] * chunkShape[1] * chunkShape[2];
+    std::atomic<size_t> nextIndex{0};
+    std::exception_ptr firstError;
+    std::mutex errorMutex;
+    std::vector<std::thread> threads;
+    threads.reserve(numThreads);
+
+    for (size_t tid = 0; tid < numThreads; ++tid) {
+        threads.emplace_back([&, tid]() {
+            (void)tid;
+            try {
+                vc::VcDataset dsx(out_zarr / "x" / "0");
+                vc::VcDataset dsy(out_zarr / "y" / "0");
+                vc::VcDataset dsz(out_zarr / "z" / "0");
+                vc::VcDataset ds_fit_rms(out_zarr / "fit_rms" / "0");
+                vc::VcDataset ds_fit_frac(out_zarr / "fit_frac_short_paths" / "0");
+                vc::VcDataset ds_fit_rad(out_zarr / "fit_used_radius" / "0");
+                vc::VcDataset ds_fit_sc(out_zarr / "fit_segment_count" / "0");
+
+                std::vector<uint8_t> buf_x(chunkElems, 128);
+                std::vector<uint8_t> buf_y(chunkElems, 128);
+                std::vector<uint8_t> buf_z(chunkElems, 128);
+                std::vector<uint8_t> buf_fit_rms(chunkElems, 0);
+                std::vector<uint8_t> buf_fit_frac(chunkElems, 0);
+                std::vector<uint8_t> buf_fit_rad(chunkElems, 0);
+                std::vector<uint8_t> buf_fit_sc(chunkElems, 0);
+                std::vector<vc::core::util::SparseChunkRecordU8x7> records;
+
+                while (true) {
+                    const size_t idx = nextIndex.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= touched.size()) {
+                        break;
+                    }
+
+                    const auto chunk = touched[idx];
+                    records.clear();
+                    if (!spool.readChunkRecords(chunk, records)) {
+                        continue;
+                    }
+
+                    std::fill(buf_x.begin(), buf_x.end(), 128);
+                    std::fill(buf_y.begin(), buf_y.end(), 128);
+                    std::fill(buf_z.begin(), buf_z.end(), 128);
+                    std::fill(buf_fit_rms.begin(), buf_fit_rms.end(), 0);
+                    std::fill(buf_fit_frac.begin(), buf_fit_frac.end(), 0);
+                    std::fill(buf_fit_rad.begin(), buf_fit_rad.end(), 0);
+                    std::fill(buf_fit_sc.begin(), buf_fit_sc.end(), 0);
+
+                    for (const auto& record : records) {
+                        const size_t lin =
+                            (static_cast<size_t>(record.z) * chunkShape[1] + static_cast<size_t>(record.y))
+                            * chunkShape[2] + static_cast<size_t>(record.x);
+                        buf_x[lin] = record.values[0];
+                        buf_y[lin] = record.values[1];
+                        buf_z[lin] = record.values[2];
+                        buf_fit_rms[lin] = record.values[3];
+                        buf_fit_frac[lin] = record.values[4];
+                        buf_fit_rad[lin] = record.values[5];
+                        buf_fit_sc[lin] = record.values[6];
+                    }
+
+                    dsx.writeChunk(chunk.z, chunk.y, chunk.x, buf_x.data(), buf_x.size());
+                    dsy.writeChunk(chunk.z, chunk.y, chunk.x, buf_y.data(), buf_y.size());
+                    dsz.writeChunk(chunk.z, chunk.y, chunk.x, buf_z.data(), buf_z.size());
+                    ds_fit_rms.writeChunk(chunk.z, chunk.y, chunk.x, buf_fit_rms.data(), buf_fit_rms.size());
+                    ds_fit_frac.writeChunk(chunk.z, chunk.y, chunk.x, buf_fit_frac.data(), buf_fit_frac.size());
+                    ds_fit_rad.writeChunk(chunk.z, chunk.y, chunk.x, buf_fit_rad.data(), buf_fit_rad.size());
+                    ds_fit_sc.writeChunk(chunk.z, chunk.y, chunk.x, buf_fit_sc.data(), buf_fit_sc.size());
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(errorMutex);
+                if (!firstError) {
+                    firstError = std::current_exception();
+                }
+            }
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    if (firstError) {
+        std::rethrow_exception(firstError);
+    }
+
+    stats.materializeSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    return stats;
+}
 
 static inline uint8_t encode_dir_component(float v) {
     // Match direction-field encoding used by Chunked3dVec3fFromUint8:
@@ -1183,7 +1361,18 @@ static void run_align_normals_zarr(
     const std::optional<CropBox3i>& crop_opt,
     int seed_samples = 100,
     int radius = 2,
-    int candidate_samples_per_iter = 100) {
+    int candidate_samples_per_iter = 100,
+    const std::optional<fs::path>& metrics_json_path = std::nullopt) {
+    const auto total_start = std::chrono::steady_clock::now();
+    json metrics;
+    metrics["mode"] = "align-normals";
+    metrics["input"] = zarr_root.string();
+    metrics["output"] = out_zarr.string();
+    metrics["omp_threads"] = std::max(1, omp_get_max_threads());
+    metrics["seed_samples"] = seed_samples;
+    metrics["radius"] = radius;
+    metrics["candidate_samples_per_iter"] = candidate_samples_per_iter;
+
     // Determine delimiter from x/0/.zarray (fallback "." to match other tools).
     std::string delim = ".";
     {
@@ -1268,6 +1457,7 @@ static void run_align_normals_zarr(
         throw std::runtime_error("--crop maps to empty region in normals zarr index space");
     }
 
+    const auto read_start = std::chrono::steady_clock::now();
     // Load the cropped normals into memory.
     std::vector<uint8_t> ax(CZ * CY * CX, 0);
     std::vector<uint8_t> ay(CZ * CY * CX, 0);
@@ -1279,6 +1469,8 @@ static void run_align_normals_zarr(
         dsy->readRegion(off, regionShape, ay.data());
         dsz->readRegion(off, regionShape, az.data());
     }
+    metrics["read_seconds"] = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - read_start).count();
 
     const size_t N = CZ * CY * CX;
     auto lin_of = [&](size_t iz, size_t iy, size_t ix) -> size_t {
@@ -1484,6 +1676,7 @@ static void run_align_normals_zarr(
 
     add_fringe_neighbors(seed_lin);
     size_t aligned_count = 1;
+    const auto align_start = std::chrono::steady_clock::now();
 
     // One RNG per OpenMP thread for the lifetime of this function.
     // Used for candidate sampling inside the OpenMP candidate loop.
@@ -1614,13 +1807,18 @@ static void run_align_normals_zarr(
 
     const std::vector<size_t> chunks = {std::min<size_t>(64, full_shape[0]), std::min<size_t>(64, full_shape[1]), std::min<size_t>(64, full_shape[2])};
 
-    auto out_dsx = vc::createZarrDataset(out_zarr / "x", "0", full_shape, chunks, vc::VcDtype::uint8, "blosc", "/");
-    auto out_dsy = vc::createZarrDataset(out_zarr / "y", "0", full_shape, chunks, vc::VcDtype::uint8, "blosc", "/");
-    auto out_dsz = vc::createZarrDataset(out_zarr / "z", "0", full_shape, chunks, vc::VcDtype::uint8, "blosc", "/");
+    auto out_dsx = vc::createZarrDataset(out_zarr / "x", "0", full_shape, chunks, vc::VcDtype::uint8, "blosc", "/", 128);
+    auto out_dsy = vc::createZarrDataset(out_zarr / "y", "0", full_shape, chunks, vc::VcDtype::uint8, "blosc", "/", 128);
+    auto out_dsz = vc::createZarrDataset(out_zarr / "z", "0", full_shape, chunks, vc::VcDtype::uint8, "blosc", "/", 128);
 
-    out_dsx->writeRegion(crop_zyx.off, crop_zyx.shape, ax.data());
-    out_dsy->writeRegion(crop_zyx.off, crop_zyx.shape, ay.data());
-    out_dsz->writeRegion(crop_zyx.off, crop_zyx.shape, az.data());
+    const std::vector<size_t> cropOff(crop_zyx.off.begin(), crop_zyx.off.end());
+    const std::vector<size_t> cropShape(crop_zyx.shape.begin(), crop_zyx.shape.end());
+    metrics["align_seconds"] = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - align_start).count();
+    const auto write_start = std::chrono::steady_clock::now();
+    writeZarrRegionU8ByChunk(out_dsx.get(), cropOff, cropShape, ax.data(), 128);
+    writeZarrRegionU8ByChunk(out_dsy.get(), cropOff, cropShape, ay.data(), 128);
+    writeZarrRegionU8ByChunk(out_dsz.get(), cropOff, cropShape, az.data(), 128);
 
     // Minimal attrs on root.
     nlohmann::json attrs;
@@ -1639,6 +1837,19 @@ static void run_align_normals_zarr(
     attrs["crop_off_zyx"] = {crop_zyx.off[0], crop_zyx.off[1], crop_zyx.off[2]};
     attrs["crop_shape_zyx"] = {crop_zyx.shape[0], crop_zyx.shape[1], crop_zyx.shape[2]};
     vc::writeZarrAttributes(out_zarr, attrs);
+
+    metrics["write_seconds"] = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - write_start).count();
+    metrics["total_seconds"] = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - total_start).count();
+    metrics["full_shape_zyx"] = {full_shape[0], full_shape[1], full_shape[2]};
+    metrics["crop_off_zyx"] = {crop_zyx.off[0], crop_zyx.off[1], crop_zyx.off[2]};
+    metrics["crop_shape_zyx"] = {crop_zyx.shape[0], crop_zyx.shape[1], crop_zyx.shape[2]};
+    metrics["valid_normals"] = valid_lin.size();
+    metrics["aligned_normals"] = aligned_count;
+    if (metrics_json_path.has_value()) {
+        write_metrics_json(*metrics_json_path, metrics);
+    }
 }
 
 static void run_fit_normals(
@@ -1648,8 +1859,20 @@ static void run_fit_normals(
     const std::optional<fs::path>& out_zarr_opt,
     int step = 16,
     float radius = 128.f,
-    bool dbg_tif = false) {
+    bool dbg_tif = false,
+    const std::optional<fs::path>& metrics_json_path = std::nullopt) {
+    const auto total_start = std::chrono::steady_clock::now();
+    json metrics;
+    metrics["mode"] = "fit-normals";
+    metrics["input"] = input_dir.string();
+    if (out_ply_opt.has_value()) metrics["output_ply"] = out_ply_opt->string();
+    if (out_zarr_opt.has_value()) metrics["output_zarr"] = out_zarr_opt->string();
+    metrics["step"] = step;
+    metrics["radius"] = radius;
+    metrics["omp_threads"] = std::max(1, omp_get_max_threads());
+
     vc::core::util::NormalGridVolume ngv(input_dir.string());
+    ngv.resetCacheStats();
     const int sparse_volume = ngv.metadata().value("sparse-volume", 1);
 
     // We only *output* samples within crop, but we must *read* enough context
@@ -1755,9 +1978,9 @@ static void run_fit_normals(
     const int sy0 = align_down(crop.min[1], step);
     const int sz0 = align_down(crop.min[2], step);
 
-    // When writing zarr, allocate a full-sized (downsampled) volume and only fill within crop.
-    // This way downstream tools can use global voxel coordinates without needing crop-origin offsets.
-    int nx = 0, ny = 0, nz = 0;
+    // When writing zarr, keep global lattice coordinates but only materialize
+    // the crop-sized subregion to the output datasets.
+    int full_nx = 0, full_ny = 0, full_nz = 0;
     if (out_zarr_opt.has_value()) {
         if (crop.max[0] > vol_xyz[0] || crop.max[1] > vol_xyz[1] || crop.max[2] > vol_xyz[2]) {
             std::stringstream msg;
@@ -1765,24 +1988,56 @@ static void run_fit_normals(
                 << ") vs inferred vol_xyz=(" << vol_xyz[0] << "," << vol_xyz[1] << "," << vol_xyz[2] << ")";
             throw std::runtime_error(msg.str());
         }
-        nx = (vol_xyz[0] + step - 1) / step;
-        ny = (vol_xyz[1] + step - 1) / step;
-        nz = (vol_xyz[2] + step - 1) / step;
-    } else {
-        // For PLY-only mode, only consider sample lattice in the crop.
-        nx = (crop.max[0] - sx0 + step - 1) / step;
-        ny = (crop.max[1] - sy0 + step - 1) / step;
-        nz = (crop.max[2] - sz0 + step - 1) / step;
+        full_nx = (vol_xyz[0] + step - 1) / step;
+        full_ny = (vol_xyz[1] + step - 1) / step;
+        full_nz = (vol_xyz[2] + step - 1) / step;
     }
 
     // Progress reporting should reflect *work done*, i.e. samples evaluated within the crop,
-    // not the size of the allocated output lattice.
+    // not the size of the full output lattice.
     const int crop_nx = (crop.max[0] - sx0 + step - 1) / step;
     const int crop_ny = (crop.max[1] - sy0 + step - 1) / step;
     const int crop_nz = (crop.max[2] - sz0 + step - 1) / step;
     const int64_t total_samples = static_cast<int64_t>(crop_nx) * static_cast<int64_t>(crop_ny) * static_cast<int64_t>(crop_nz);
+    const int crop_off_x = sx0 / step;
+    const int crop_off_y = sy0 / step;
+    const int crop_off_z = sz0 / step;
+    metrics["crop_min_xyz"] = {crop.min[0], crop.min[1], crop.min[2]};
+    metrics["crop_max_xyz"] = {crop.max[0], crop.max[1], crop.max[2]};
+    metrics["read_box_min_xyz"] = {read_box.min[0], read_box.min[1], read_box.min[2]};
+    metrics["read_box_max_xyz"] = {read_box.max[0], read_box.max[1], read_box.max[2]};
+    metrics["crop_shape_samples_zyx"] = {crop_nz, crop_ny, crop_nx};
+    metrics["crop_off_samples_zyx"] = {crop_off_z, crop_off_y, crop_off_x};
+    metrics["total_samples"] = total_samples;
 
-    const int64_t full_samples = static_cast<int64_t>(nx) * static_cast<int64_t>(ny) * static_cast<int64_t>(nz);
+    std::vector<size_t> output_shape_zyx;
+    std::vector<size_t> output_chunks_zyx;
+    fs::path spool_dir;
+    std::unique_ptr<vc::core::util::SparseChunkSpool> output_spool;
+    std::vector<std::unique_ptr<vc::core::util::SparseChunkSpoolBuffer>> output_spool_buffers;
+    if (out_zarr_opt.has_value()) {
+        output_shape_zyx = {
+            static_cast<size_t>(full_nz),
+            static_cast<size_t>(full_ny),
+            static_cast<size_t>(full_nx)};
+        output_chunks_zyx = {
+            std::min<size_t>(64, output_shape_zyx[0]),
+            std::min<size_t>(64, output_shape_zyx[1]),
+            std::min<size_t>(64, output_shape_zyx[2])};
+        spool_dir = *out_zarr_opt / ".vc_ngrids_fit_spool";
+        std::error_code ec;
+        fs::remove_all(spool_dir, ec);
+        output_spool = std::make_unique<vc::core::util::SparseChunkSpool>(
+            spool_dir,
+            vc::core::util::Shape3{output_chunks_zyx[0], output_chunks_zyx[1], output_chunks_zyx[2]},
+            vc::core::util::Shape3{output_shape_zyx[0], output_shape_zyx[1], output_shape_zyx[2]},
+            128ull * 1024ull * 1024ull);
+        output_spool_buffers.reserve(static_cast<size_t>(nthreads));
+        for (int t = 0; t < nthreads; ++t) {
+            output_spool_buffers.push_back(
+                std::make_unique<vc::core::util::SparseChunkSpoolBuffer>(*output_spool));
+        }
+    }
 
     // Stats: iterations-to-solved histogram and RMS histogram.
     // Note: we keep a coarse RMS bucket histogram for printing and a fine histogram for median estimation.
@@ -1866,6 +2121,7 @@ static void run_fit_normals(
     };
 
     std::vector<FitStats> stats = stats_of();
+    std::vector<ThreadSliceGridCache> thread_grid_cache(static_cast<size_t>(std::max(1, omp_get_max_threads())));
 
     auto gather_samples_for_radius = [&](
         const cv::Point3f& sample,
@@ -1919,7 +2175,7 @@ static void run_fit_normals(
                 const cv::Rect query(u0, v0, u1 - u0, v1 - v0);
 
                 const auto t_read0 = std::chrono::steady_clock::now();
-                auto grid = ngv.query_nearest(point_for_slice_query(sample, pc.plane_idx, slice), pc.plane_idx);
+                auto grid = thread_grid_cache[static_cast<size_t>(tid)].get(ngv, pc.plane_idx, slice);
                 if (!grid) continue;
 
                 const auto paths = grid->get(query);
@@ -2054,33 +2310,6 @@ static void run_fit_normals(
         const double bin_w = 1.0 / kFineRmsBins;
         return (idx + 0.5) * bin_w;
     };
-
-    // Optional output: store fitted normals on the sample lattice.
-    // Encoding matches direction-field zarrs: 3 uint8 volumes x,y,z, decoded as (v-128)/127.
-    std::vector<uint8_t> enc_x;
-    std::vector<uint8_t> enc_y;
-    std::vector<uint8_t> enc_z;
-    // Extra fit diagnostics (uint8 with simple linear mappings):
-    // - fit_rms: [0,1] -> [0..255] (failed fits store 255)
-    // - fit_frac_short_paths: [0,1] -> [0..255]
-    // - fit_used_radius: [2,512] -> [0..255]
-    // - fit_segment_count: [0,8192] -> [0..255]
-    std::vector<uint8_t> enc_fit_rms;
-    std::vector<uint8_t> enc_fit_frac_short_paths;
-    std::vector<uint8_t> enc_fit_used_radius;
-    std::vector<uint8_t> enc_fit_segment_count;
-    if (out_zarr_opt.has_value()) {
-        const size_t n = static_cast<size_t>(std::max<int64_t>(0, full_samples));
-        enc_x.assign(n, 128);
-        enc_y.assign(n, 128);
-        enc_z.assign(n, 128);
-
-        // Fill 0 means "unset" for diagnostics.
-        enc_fit_rms.assign(n, 0);
-        enc_fit_frac_short_paths.assign(n, 0);
-        enc_fit_used_radius.assign(n, 0);
-        enc_fit_segment_count.assign(n, 0);
-    }
 
     auto encode_u8_from_range = [](double v, double lo, double hi) -> uint8_t {
         if (!(hi > lo)) return 0;
@@ -2275,39 +2504,35 @@ static void run_fit_normals(
                     }
 
                     if (out_zarr_opt.has_value()) {
-                        const int ix = x / step;
-                        const int iy = y / step;
-                        const int iz = z / step;
+                        const int ix = (x - sx0) / step;
+                        const int iy = (y - sy0) / step;
+                        const int iz = (z - sz0) / step;
 
-                        if (ix < 0 || iy < 0 || iz < 0 || ix >= nx || iy >= ny || iz >= nz) {
+                        if (ix < 0 || iy < 0 || iz < 0 || ix >= crop_nx || iy >= crop_ny || iz >= crop_nz) {
                             std::stringstream msg;
-                            msg << "Output index out of range while writing normals zarr:"
+                            msg << "Crop-local output index out of range while writing normals zarr:"
                                 << " ix/iy/iz=(" << ix << "," << iy << "," << iz << ")"
-                                << " nx/ny/nz=(" << nx << "," << ny << "," << nz << ")"
+                                << " crop_nx/ny/nz=(" << crop_nx << "," << crop_ny << "," << crop_nz << ")"
                                 << " at xyz=(" << x << "," << y << "," << z << ") step=" << step;
                             throw std::runtime_error(msg.str());
                         }
 
-                        const size_t lin = (static_cast<size_t>(iz) * static_cast<size_t>(ny) + static_cast<size_t>(iy)) * static_cast<size_t>(nx) + static_cast<size_t>(ix);
-                        if (lin >= enc_x.size()) {
-                            std::stringstream msg;
-                            msg << "Linear index out of range while writing normals zarr:"
-                                << " lin=" << lin << " enc_size=" << enc_x.size()
-                                << " ix/iy/iz=(" << ix << "," << iy << "," << iz << ")"
-                                << " nx/ny/nz=(" << nx << "," << ny << "," << nz << ")";
-                            throw std::runtime_error(msg.str());
-                        }
-                        enc_x[lin] = encode_dir_component(n.x);
-                        enc_y[lin] = encode_dir_component(n.y);
-                        enc_z[lin] = encode_dir_component(n.z);
-
                         const double frac_short = (used_segments_total > 0)
                             ? (static_cast<double>(used_segments_short_paths) / static_cast<double>(used_segments_total))
                             : 0.0;
-                        enc_fit_rms[lin] = ok ? encode_u8_from_range(rms, 0.0, 1.0) : static_cast<uint8_t>(255);
-                        enc_fit_frac_short_paths[lin] = encode_u8_from_range(frac_short, 0.0, 1.0);
-                        enc_fit_used_radius[lin] = encode_u8_from_range(static_cast<double>(used_rad), 2.0, 512.0);
-                        enc_fit_segment_count[lin] = encode_u8_from_range(static_cast<double>(used_segments_total), 0.0, 8192.0);
+                        output_spool_buffers[static_cast<size_t>(tid)]->emit(
+                            static_cast<size_t>(crop_off_z + iz),
+                            static_cast<size_t>(crop_off_y + iy),
+                            static_cast<size_t>(crop_off_x + ix),
+                            std::array<uint8_t, 7>{
+                                encode_dir_component(n.x),
+                                encode_dir_component(n.y),
+                                encode_dir_component(n.z),
+                                encode_u8_from_range(rms, 0.0, 1.0),
+                                encode_u8_from_range(frac_short, 0.0, 1.0),
+                                encode_u8_from_range(static_cast<double>(used_rad), 2.0, 512.0),
+                                encode_u8_from_range(static_cast<double>(used_segments_total), 0.0, 8192.0),
+                            });
                     }
                 }
 
@@ -2344,6 +2569,14 @@ static void run_fit_normals(
     report_progress();
     report_stats();
 
+    SliceGridCacheStats slice_grid_cache_stats;
+    for (const auto& cache : thread_grid_cache) {
+        slice_grid_cache_stats.hits += cache.stats.hits;
+        slice_grid_cache_stats.misses += cache.stats.misses;
+        slice_grid_cache_stats.evictions += cache.stats.evictions;
+    }
+    const auto ngv_cache_stats = ngv.cacheStats();
+
     if (dbg_tif) {
         // Write float TIFFs into the current working directory.
         // NOTE: OpenCV will write 32-bit float TIFFs when passed CV_32F mats.
@@ -2354,6 +2587,12 @@ static void run_fit_normals(
         cv::imwrite((fs::path("dbg_fit_sample_count_xz.tif")).string(), dbg_nsamp_xz);
         cv::imwrite((fs::path("dbg_fit_sample_count_yz.tif")).string(), dbg_nsamp_yz);
         cv::imwrite((fs::path("dbg_fit_frac_used_short_paths.tif")).string(), dbg_frac_used_short_paths);
+    }
+
+    if (output_spool) {
+        for (auto& spool_buffer : output_spool_buffers) {
+            spool_buffer->flushAll();
+        }
     }
 
     if (out_ply_opt.has_value()) {
@@ -2391,6 +2630,7 @@ static void run_fit_normals(
         }
     }
 
+    FitOutputMaterializeStats materialize_stats;
     if (out_zarr_opt.has_value()) {
         const fs::path out_zarr = *out_zarr_opt;
 
@@ -2400,25 +2640,15 @@ static void run_fit_normals(
         // and will read the delimiter from that .zarray.
         std::filesystem::create_directories(out_zarr);
 
-        const std::vector<size_t> shape = {static_cast<size_t>(nz), static_cast<size_t>(ny), static_cast<size_t>(nx)}; // ZYX
-        const std::vector<size_t> chunks = {std::min<size_t>(64, shape[0]), std::min<size_t>(64, shape[1]), std::min<size_t>(64, shape[2])};
+        auto dsx = vc::createZarrDataset(out_zarr / "x", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/", 128);
+        auto dsy = vc::createZarrDataset(out_zarr / "y", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/", 128);
+        auto dsz = vc::createZarrDataset(out_zarr / "z", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/", 128);
+        auto ds_fit_rms = vc::createZarrDataset(out_zarr / "fit_rms", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
+        auto ds_fit_frac = vc::createZarrDataset(out_zarr / "fit_frac_short_paths", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
+        auto ds_fit_rad = vc::createZarrDataset(out_zarr / "fit_used_radius", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
+        auto ds_fit_sc = vc::createZarrDataset(out_zarr / "fit_segment_count", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
 
-        auto dsx = vc::createZarrDataset(out_zarr / "x", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
-        auto dsy = vc::createZarrDataset(out_zarr / "y", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
-        auto dsz = vc::createZarrDataset(out_zarr / "z", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
-        auto ds_fit_rms = vc::createZarrDataset(out_zarr / "fit_rms", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
-        auto ds_fit_frac = vc::createZarrDataset(out_zarr / "fit_frac_short_paths", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
-        auto ds_fit_rad = vc::createZarrDataset(out_zarr / "fit_used_radius", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
-        auto ds_fit_sc = vc::createZarrDataset(out_zarr / "fit_segment_count", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/");
-
-        std::vector<size_t> off = {0, 0, 0};
-        dsx->writeRegion(off, shape, enc_x.data());
-        dsy->writeRegion(off, shape, enc_y.data());
-        dsz->writeRegion(off, shape, enc_z.data());
-        ds_fit_rms->writeRegion(off, shape, enc_fit_rms.data());
-        ds_fit_frac->writeRegion(off, shape, enc_fit_frac_short_paths.data());
-        ds_fit_rad->writeRegion(off, shape, enc_fit_used_radius.data());
-        ds_fit_sc->writeRegion(off, shape, enc_fit_segment_count.data());
+        materialize_stats = materialize_fit_output_spool(out_zarr, *output_spool, static_cast<size_t>(nthreads));
 
         // Minimal attrs on root.
         nlohmann::json attrs;
@@ -2430,7 +2660,7 @@ static void run_fit_normals(
         attrs["radius"] = radius;
         attrs["crop_min_xyz"] = {crop.min[0], crop.min[1], crop.min[2]};
         attrs["crop_max_xyz"] = {crop.max[0], crop.max[1], crop.max[2]};
-        attrs["grid_shape_zyx"] = {shape[0], shape[1], shape[2]};
+        attrs["grid_shape_zyx"] = {output_shape_zyx[0], output_shape_zyx[1], output_shape_zyx[2]};
 
         // Diagnostics.
         attrs["fit_rms_group"] = "fit_rms/0";
@@ -2442,6 +2672,58 @@ static void run_fit_normals(
         attrs["fit_used_radius_decode"] = "2 + (v/255)*(512-2)";
         attrs["fit_segment_count_decode"] = "(v/255)*8192";
         vc::writeZarrAttributes(out_zarr, attrs);
+
+        std::error_code ec;
+        fs::remove_all(spool_dir, ec);
+    }
+
+    const FitStats final_stats = summarize_stats(stats);
+    metrics["total_seconds"] = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - total_start).count();
+    metrics["written_samples"] = written;
+    metrics["fit_ok_count"] = final_stats.ok_count;
+    metrics["fit_rms_avg"] = (final_stats.ok_count > 0)
+        ? (final_stats.rms_sum / static_cast<double>(final_stats.ok_count))
+        : 0.0;
+    metrics["fit_rms_median"] = estimate_median_from_fine(final_stats);
+    metrics["fit_rms_max"] = final_stats.rms_max;
+    metrics["thread_summed_seconds"] = {
+        {"ng_read", final_stats.t_ng_read_s},
+        {"preproc", final_stats.t_preproc_s},
+        {"solve", final_stats.t_solve_s},
+        {"solve_call", final_stats.t_solve_call_s},
+        {"overhead", final_stats.t_overhead_s},
+    };
+    metrics["distance_rejects"] = {
+        {"rejected", final_stats.dist_test_reject},
+        {"total", final_stats.dist_test_total},
+    };
+    metrics["normal_grid_volume_cache"] = {
+        {"grid_hits", ngv_cache_stats.gridHits},
+        {"grid_misses", ngv_cache_stats.gridMisses},
+        {"live_entries", ngv_cache_stats.liveGridEntries},
+        {"decoded_path_hits", ngv_cache_stats.decodedPathHits},
+        {"decoded_path_misses", ngv_cache_stats.decodedPathMisses},
+        {"decoded_path_evictions", ngv_cache_stats.decodedPathEvictions},
+        {"decoded_path_entries", ngv_cache_stats.decodedPathEntries},
+        {"decoded_path_bytes", ngv_cache_stats.decodedPathBytes},
+    };
+    metrics["thread_slice_grid_cache"] = {
+        {"hits", slice_grid_cache_stats.hits},
+        {"misses", slice_grid_cache_stats.misses},
+        {"evictions", slice_grid_cache_stats.evictions},
+    };
+    if (out_zarr_opt.has_value()) {
+        metrics["output_spool"] = {
+            {"touched_chunks", materialize_stats.touchedChunks},
+            {"records", materialize_stats.records},
+            {"spill_files", materialize_stats.spillFiles},
+            {"materialize_seconds", materialize_stats.materializeSeconds},
+            {"in_memory_budget_bytes", materialize_stats.inMemoryBudgetBytes},
+        };
+    }
+    if (metrics_json_path.has_value()) {
+        write_metrics_json(*metrics_json_path, metrics);
     }
 }
 
@@ -2460,6 +2742,7 @@ int main(int argc, char** argv) {
         ("vis-normals", po::value<std::string>(), "Write fitted normals as PLY line segments")
         ("dbg-tif", "Write debug float TIFFs for --fit-normals (workdir): rms, used radius, sample counts (first z layer only)")
         ("output-zarr", po::value<std::string>(), "Write fitted normals to a zarr directory (direction-field encoding)")
+        ("metrics-json", po::value<std::string>(), "Write structured fit/align metrics json")
         ("align-normals", "Align normals in an existing normals zarr (requires --input zarr and --output-zarr)");
 
     po::variables_map vm;
@@ -2494,6 +2777,9 @@ int main(int argc, char** argv) {
     }
 
     std::optional<fs::path> surf_path;
+    const std::optional<fs::path> metrics_json = vm.count("metrics-json")
+        ? std::optional<fs::path>(fs::path(vm["metrics-json"].as<std::string>()))
+        : std::nullopt;
     if (vm.count("surf")) {
         surf_path = fs::path(vm["surf"].as<std::string>());
         if (!fs::exists(*surf_path) || !fs::is_directory(*surf_path)) {
@@ -2540,7 +2826,13 @@ int main(int argc, char** argv) {
             std::cerr << "Error: --align-normals requires --output-zarr PATH\n";
             return 1;
         }
-        run_align_normals_zarr(input_dir, fs::path(vm["output-zarr"].as<std::string>()), crop);
+        run_align_normals_zarr(input_dir,
+                               fs::path(vm["output-zarr"].as<std::string>()),
+                               crop,
+                               100,
+                               2,
+                               100,
+                               metrics_json);
         return 0;
     }
 
@@ -2562,7 +2854,14 @@ int main(int argc, char** argv) {
         if (vm.count("vis-normals")) {
             out_ply = fs::path(vm["vis-normals"].as<std::string>());
         }
-        run_fit_normals(input_dir, out_ply, crop, out_zarr, /*step=*/16, /*radius=*/64.f, /*dbg_tif=*/vm.count("dbg-tif") > 0);
+        run_fit_normals(input_dir,
+                        out_ply,
+                        crop,
+                        out_zarr,
+                        /*step=*/16,
+                        /*radius=*/64.f,
+                        /*dbg_tif=*/vm.count("dbg-tif") > 0,
+                        metrics_json);
         return 0;
     }
 

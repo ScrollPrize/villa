@@ -1,7 +1,13 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/LineSegList.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <optional>
+#include <random>
+#include <limits>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 #include <fstream>
 #include <stdexcept>
@@ -33,6 +39,12 @@ struct MmappedData {
 
 class GridStore::GridStoreImpl {
 public:
+    struct SegCacheEntry {
+        std::shared_ptr<LineSegList> seglist;
+        size_t decoded_bytes = 0;
+        uint64_t generation = 0;
+    };
+
     GridStoreImpl(const cv::Rect& bounds, int cell_size)
         : bounds_(bounds), cell_size_(cell_size), read_only_(false) {
         grid_size_ = cv::Size(
@@ -86,7 +98,7 @@ public:
             }
             result.reserve(offsets.size());
             for (size_t offset : offsets) {
-                result.push_back(get_seglist_from_offset(offset)->get());
+                result.push_back(get_points_from_offset(offset));
             }
         } else {
             std::unordered_set<int> handles;
@@ -119,7 +131,7 @@ public:
             }
             result.reserve(all_offsets.size());
             for (const auto& offset : all_offsets) {
-                result.push_back(get_seglist_from_offset(offset)->get());
+                result.push_back(get_points_from_offset(offset));
             }
         } else {
             result.reserve(storage_.size());
@@ -141,8 +153,7 @@ public:
         }
         size_t storage_memory = 0;
         if (read_only_) {
-            // In read-only mode, storage is just offsets, which are part of grid_offsets_
-            storage_memory = 0;
+            storage_memory = seglist_cache_bytes_.load(std::memory_order_relaxed);
         } else {
             storage_memory = storage_.capacity() * sizeof(std::shared_ptr<LineSegList>);
             for (const auto& seg : storage_) {
@@ -191,7 +202,24 @@ public:
         return count;
     }
 
-    void save(const std::string& path) const {
+    GridStore::CacheStats cacheStats() const {
+        GridStore::CacheStats stats;
+        stats.decodedPathHits = decoded_path_hits_.load(std::memory_order_relaxed);
+        stats.decodedPathMisses = decoded_path_misses_.load(std::memory_order_relaxed);
+        stats.decodedPathEvictions = decoded_path_evictions_.load(std::memory_order_relaxed);
+        stats.decodedPathBytes = seglist_cache_bytes_.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(seglist_mutex_);
+        stats.decodedPathEntries = seglist_cache_.size();
+        return stats;
+    }
+
+    void resetCacheStats() const {
+        decoded_path_hits_.store(0, std::memory_order_relaxed);
+        decoded_path_misses_.store(0, std::memory_order_relaxed);
+        decoded_path_evictions_.store(0, std::memory_order_relaxed);
+    }
+
+    void save(const std::string& path, const GridStore::SaveOptions& options) const {
         if (read_only_) {
             throw std::runtime_error("Cannot save a read-only GridStore. Load the data into a new, writable GridStore instance first.");
         }
@@ -297,33 +325,35 @@ public:
         file.write(buffer.data(), buffer.size());
         file.close();
 
-        // 9. In-line verification by reloading the saved file
-        {
-            GridStore reloaded_store(path);
-            auto original_paths = this->get_all();
-            auto reloaded_paths = reloaded_store.get_all();
+        if (options.verify_reload) {
+            // 9. In-line verification by reloading the saved file
+            {
+                GridStore reloaded_store(path);
+                auto original_paths = this->get_all();
+                auto reloaded_paths = reloaded_store.get_all();
 
-            if (original_paths.size() != reloaded_paths.size()) {
-                throw std::runtime_error("Verification failed: path count mismatch. Original: " + std::to_string(original_paths.size()) + ", Reloaded: " + std::to_string(reloaded_paths.size()));
-            }
-
-            auto points_to_string_set = [](const std::vector<std::shared_ptr<std::vector<cv::Point>>>& paths) {
-                std::multiset<std::string> string_set;
-                for (const auto& path_ptr : paths) {
-                    std::stringstream ss;
-                    for (const auto& p : *path_ptr) {
-                        ss << p.x << "," << p.y << ";";
-                    }
-                    string_set.insert(ss.str());
+                if (original_paths.size() != reloaded_paths.size()) {
+                    throw std::runtime_error("Verification failed: path count mismatch. Original: " + std::to_string(original_paths.size()) + ", Reloaded: " + std::to_string(reloaded_paths.size()));
                 }
-                return string_set;
-            };
 
-            auto original_set = points_to_string_set(original_paths);
-            auto reloaded_set = points_to_string_set(reloaded_paths);
+                auto points_to_string_set = [](const std::vector<std::shared_ptr<std::vector<cv::Point>>>& paths) {
+                    std::multiset<std::string> string_set;
+                    for (const auto& path_ptr : paths) {
+                        std::stringstream ss;
+                        for (const auto& p : *path_ptr) {
+                            ss << p.x << "," << p.y << ";";
+                        }
+                        string_set.insert(ss.str());
+                    }
+                    return string_set;
+                };
 
-            if (original_set != reloaded_set) {
-                 throw std::runtime_error("Verification failed: path data mismatch after reload.");
+                auto original_set = points_to_string_set(original_paths);
+                auto reloaded_set = points_to_string_set(reloaded_paths);
+
+                if (original_set != reloaded_set) {
+                     throw std::runtime_error("Verification failed: path data mismatch after reload.");
+                }
             }
         }
     }
@@ -494,12 +524,106 @@ private:
         return current;
     }
 
-    std::shared_ptr<LineSegList> get_seglist_from_offset(size_t offset) const {
+    std::shared_ptr<LineSegList> load_seglist_from_offset(size_t offset) const {
         const char* paths_start = static_cast<const char*>(mmapped_data_->data) + paths_offset_in_file_;
         const char* end = static_cast<const char*>(mmapped_data_->data) + mmapped_data_->size;
         std::shared_ptr<LineSegList> seglist;
         read_seglist_header_and_data(paths_start + offset, end, seglist);
         return seglist;
+    }
+
+    std::shared_ptr<LineSegList> get_seglist_from_offset(size_t offset) const {
+        {
+            std::lock_guard<std::mutex> lock(seglist_mutex_);
+            auto it = seglist_cache_.find(offset);
+            if (it != seglist_cache_.end()) {
+                decoded_path_hits_.fetch_add(1, std::memory_order_relaxed);
+                it->second.generation = ++seglist_generation_counter_;
+                return it->second.seglist;
+            }
+        }
+
+        decoded_path_misses_.fetch_add(1, std::memory_order_relaxed);
+        auto seglist = load_seglist_from_offset(offset);
+
+        std::lock_guard<std::mutex> lock(seglist_mutex_);
+        auto it = seglist_cache_.find(offset);
+        if (it != seglist_cache_.end()) {
+            decoded_path_hits_.fetch_add(1, std::memory_order_relaxed);
+            it->second.generation = ++seglist_generation_counter_;
+            return it->second.seglist;
+        }
+
+        seglist_cache_.emplace(offset, SegCacheEntry{seglist, seglist->decoded_cache_bytes(), ++seglist_generation_counter_});
+        evict_seglist_cache_locked(offset);
+        return seglist;
+    }
+
+    std::shared_ptr<std::vector<cv::Point>> get_points_from_offset(size_t offset) const {
+        auto seglist = get_seglist_from_offset(offset);
+        auto points = seglist->get();
+
+        std::lock_guard<std::mutex> lock(seglist_mutex_);
+        auto it = seglist_cache_.find(offset);
+        if (it != seglist_cache_.end()) {
+            const size_t decoded_bytes = seglist->decoded_cache_bytes();
+            if (decoded_bytes > it->second.decoded_bytes) {
+                seglist_cache_bytes_.fetch_add(decoded_bytes - it->second.decoded_bytes, std::memory_order_relaxed);
+                it->second.decoded_bytes = decoded_bytes;
+            }
+            it->second.generation = ++seglist_generation_counter_;
+            evict_seglist_cache_locked(offset);
+        }
+        return points;
+    }
+
+    void evict_seglist_cache_locked(std::optional<size_t> protected_offset = std::nullopt) const {
+        auto current_bytes = seglist_cache_bytes_.load(std::memory_order_relaxed);
+        if (current_bytes <= max_seglist_cache_bytes_) {
+            return;
+        }
+        if (seglist_cache_.empty()) {
+            return;
+        }
+
+        while (current_bytes > max_seglist_cache_bytes_ && !seglist_cache_.empty()) {
+            std::vector<size_t> candidates;
+            candidates.reserve(seglist_cache_.size());
+            for (const auto& [offset, entry] : seglist_cache_) {
+                if (protected_offset.has_value() && offset == *protected_offset) {
+                    continue;
+                }
+                candidates.push_back(offset);
+            }
+            if (candidates.empty()) {
+                break;
+            }
+
+            auto sample_count = std::min(seglist_eviction_sample_size_, candidates.size());
+            size_t victim_offset = candidates.front();
+            uint64_t victim_generation = std::numeric_limits<uint64_t>::max();
+
+            std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+            for (size_t i = 0; i < sample_count; ++i) {
+                const size_t idx = (candidates.size() == sample_count) ? i : dist(seglist_eviction_rng_);
+                const size_t candidate_offset = candidates[idx];
+                const auto& candidate = seglist_cache_.at(candidate_offset);
+                if (candidate.generation < victim_generation) {
+                    victim_generation = candidate.generation;
+                    victim_offset = candidate_offset;
+                }
+            }
+
+            auto it = seglist_cache_.find(victim_offset);
+            if (it == seglist_cache_.end()) {
+                break;
+            }
+
+            const size_t victim_bytes = it->second.decoded_bytes;
+            seglist_cache_.erase(it);
+            decoded_path_evictions_.fetch_add(1, std::memory_order_relaxed);
+            current_bytes = seglist_cache_bytes_.fetch_sub(victim_bytes, std::memory_order_relaxed) - victim_bytes;
+        }
     }
 
     std::shared_ptr<std::vector<size_t>> get_bucket_offsets(int index) const {
@@ -609,6 +733,15 @@ private:
     std::unique_ptr<MmappedData> mmapped_data_;
     mutable std::mutex bucket_mutex_;
     mutable std::mutex seglist_mutex_;
+    mutable std::unordered_map<size_t, SegCacheEntry> seglist_cache_;
+    mutable std::atomic<size_t> seglist_cache_bytes_{0};
+    mutable std::atomic<uint64_t> decoded_path_hits_{0};
+    mutable std::atomic<uint64_t> decoded_path_misses_{0};
+    mutable std::atomic<uint64_t> decoded_path_evictions_{0};
+    mutable uint64_t seglist_generation_counter_ = 0;
+    mutable std::mt19937_64 seglist_eviction_rng_{0x5345474c495354ull};
+    size_t max_seglist_cache_bytes_ = 2ull * 1024ull * 1024ull;
+    size_t seglist_eviction_sample_size_ = 8;
 };
  
 GridStore::GridStore(const cv::Rect& bounds, int cell_size)
@@ -657,9 +790,21 @@ size_t GridStore::numNonEmptyBuckets() const {
     return pimpl_->numNonEmptyBuckets();
 }
 
-void GridStore::save(const std::string& path) const {
+GridStore::CacheStats GridStore::cacheStats() const {
+    return pimpl_->cacheStats();
+}
+
+void GridStore::resetCacheStats() const {
+    pimpl_->resetCacheStats();
+}
+
+void GridStore::save(const std::string& path, const SaveOptions& options) const {
     pimpl_->meta_ = meta;
-    pimpl_->save(path);
+    pimpl_->save(path, options);
+}
+
+void GridStore::save(const std::string& path) const {
+    save(path, SaveOptions{});
 }
 
 void GridStore::load_mmap(const std::string& path) {
