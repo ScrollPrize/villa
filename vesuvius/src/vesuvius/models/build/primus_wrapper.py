@@ -7,6 +7,7 @@ and task-specific decoders.
 """
 
 from typing import Tuple, Dict, Optional, List
+import math
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -14,12 +15,12 @@ from timm.layers import RotaryEmbeddingCat
 
 from .transformers.primus import _PRIMUS_CONFIGS
 from .transformers.eva import Eva
-from .transformers.patch_encode_decode import PatchEmbed, PatchDecode, LayerNormNd
+from .transformers.patch_encode_decode import PatchDecode, PatchEmbed_deeper, LayerNormNd
 
 
 class PrimusEncoder(nn.Module):
     """
-    Encoder wrapper for Primus that extracts features using PatchEmbed + EVA.
+    Encoder wrapper for Primus with v2-style deeper patch embedding + EVA.
     Compatible with NetworkFromConfig's encoder interface.
     """
     
@@ -58,6 +59,10 @@ class PrimusEncoder(nn.Module):
         
         # Check input shape compatibility
         assert len(input_shape) in (2, 3), "Only 2D and 3D inputs are supported"
+        assert len(patch_embed_size) == len(input_shape), "patch_embed_size dimensionality must match input_shape"
+        assert tuple(patch_embed_size) == tuple([8] * len(input_shape)), (
+            f"deeper patch embedding downsamples by 8x. Use patch_embed_size={tuple([8] * len(input_shape))}."
+        )
         assert all([j % i == 0 for i, j in zip(patch_embed_size, input_shape)]), \
             f"Input shape {input_shape} must be divisible by patch_embed_size {patch_embed_size}"
         self.ndim = len(input_shape)
@@ -65,8 +70,17 @@ class PrimusEncoder(nn.Module):
         # Calculate patch grid dimensions
         self.patch_grid = tuple([i // ds for i, ds in zip(input_shape, patch_embed_size)])
         
-        # Initialize patch embedding
-        self.patch_embed = PatchEmbed(patch_embed_size, input_channels, self.embed_dim)
+        # Initialize deeper patch embedding (Primus v2 style)
+        self.patch_embed = PatchEmbed_deeper(
+            input_channels=input_channels,
+            embed_dim=self.embed_dim,
+            base_features=32,
+            ndim=self.ndim,
+            depth_per_level=(1, 1, 1),
+            embed_proj_3x3x3=False,
+            embed_block_style="residual",
+            embed_block_type="basic",
+        )
         
         # Initialize EVA transformer
         self.eva = Eva(
@@ -152,6 +166,21 @@ class PrimusEncoder(nn.Module):
 
         Supports both 2D (B, C, H, W) and 3D (B, C, D, H, W) inputs.
         """
+        expected_ndim = self.ndim + 2
+        if x.ndim != expected_ndim:
+            raise ValueError(
+                f"PrimusEncoder expected input with {expected_ndim} dims "
+                f"(B, C, {', '.join(['spatial'] * self.ndim)}), got shape {tuple(x.shape)}."
+            )
+
+        spatial = tuple(x.shape[2:])
+        if spatial != tuple(self.input_shape):
+            raise ValueError(
+                "PrimusEncoder received a runtime spatial shape that does not match the configured input_shape. "
+                f"Expected {tuple(self.input_shape)}, got {spatial}. "
+                "Primus uses fixed positional embeddings and requires a consistent patch size."
+            )
+
         # Store original shape for mask expansion
         full_spatial = x.shape[2:]  # Full resolution spatial dims
 
@@ -159,7 +188,7 @@ class PrimusEncoder(nn.Module):
         x = self.patch_embed(x)
         B, C = x.shape[:2]
         spatial_shape = x.shape[2:]
-        num_patches = int(torch.tensor(spatial_shape).prod().item())
+        num_patches = math.prod(spatial_shape)
 
         # Rearrange to sequence format
         if self.ndim == 2:

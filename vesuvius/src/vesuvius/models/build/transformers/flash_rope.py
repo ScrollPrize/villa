@@ -113,10 +113,9 @@ class FlashRoPEAttention(nn.Module):
             v,
             attn_mask=attn_mask,
             dropout_p=self.attn_drop.p if self.training else 0.0,
-            scale=self.scale,
             is_causal=False,
         )
-        x = x.transpose(1, 2).reshape(B, N, C)
+        x = x.transpose(1, 2).contiguous().reshape(B, N, C)
         x = self.norm(x)
         x = self.proj(x)
         x = self.proj_drop(x)

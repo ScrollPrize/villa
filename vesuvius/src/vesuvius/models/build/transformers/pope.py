@@ -306,16 +306,17 @@ class PoPEAttention(nn.Module):
             q = q.type_as(v)
             k = k.type_as(v)
 
+        # Keep the historical PoPE attention scaling (sqrt(2) factor).
+        q = q * math.sqrt(2.0)
         x = F.scaled_dot_product_attention(
             q,
             k,
             v,
             attn_mask=attn_mask,
             dropout_p=self.attn_drop.p if self.training else 0.0,
-            scale=self.scale * math.sqrt(2.0),
             is_causal=False,
         )
-        x = x.transpose(1, 2).reshape(B, N, C)
+        x = x.transpose(1, 2).contiguous().reshape(B, N, C)
         x = self.norm(x)
         x = self.proj(x)
         x = self.proj_drop(x)
