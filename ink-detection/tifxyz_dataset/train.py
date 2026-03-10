@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 import accelerate
-from accelerate.utils import TorchDynamoPlugin, GradientAccumulationPlugin, set_seed
+from accelerate.utils import GradientAccumulationPlugin, set_seed
 import click
 from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.training.optimizers import create_optimizer
@@ -36,24 +36,14 @@ def train(config_path):
 
     out_dir = config['out_dir']
     os.makedirs(out_dir, exist_ok=True)
+    train_preview_dir = os.path.join(out_dir, 'train_previews')
+    os.makedirs(train_preview_dir, exist_ok=True)
     val_preview_dir = os.path.join(out_dir, 'val_previews')
     os.makedirs(val_preview_dir, exist_ok=True)
 
     set_seed(config['seed'])
 
-    dynamo_plugin = None
-    if config.get('use_accelerate_dynamo', False):
-        dynamo_plugin = TorchDynamoPlugin(
-            backend="inductor",
-            mode="default",
-            fullgraph=False,
-            dynamic=False,
-            use_regional_compilation=False,
-        )
-
-    dataloader_config = accelerate.DataLoaderConfiguration(
-        non_blocking = True
-    )
+    dataloader_config = accelerate.DataLoaderConfiguration(non_blocking = True)
 
     # The training loop reuses the dataloader indefinitely, so keep accumulation
     # boundaries independent of dataloader exhaustion.
@@ -65,7 +55,6 @@ def train(config_path):
     accelerator = accelerate.Accelerator(
         mixed_precision              = config.get('mixed_precision', "fp16"),
         gradient_accumulation_plugin = gradient_accumulation_plugin,
-        dynamo_plugin                = dynamo_plugin,
         dataloader_config            = dataloader_config
     )
 
@@ -78,17 +67,8 @@ def train(config_path):
 
         wandb.init(**wandb_kwargs)
 
-    shared_ds = FlatInkDataset(
-        config,
-        do_augmentations=False
-    )
-
-    train_ds = FlatInkDataset(
-        config,
-        do_augmentations=True,
-        patches=shared_ds.patches,
-    )
-
+    shared_ds = FlatInkDataset(config, do_augmentations=False)
+    train_ds = FlatInkDataset(config, do_augmentations=True, patches=shared_ds.patches)
     val_ds = shared_ds
 
     num_patches = len(train_ds)
@@ -110,10 +90,13 @@ def train(config_path):
         generator=torch.Generator().manual_seed(config['seed']),
         num_workers=dataloader_workers,
     )
+    # Validation only consumes a capped number of batches (`val_steps`), so
+    # shuffle to sample a different deterministic subset on each pass.
     val_dl = DataLoader(
         val_subset,
         batch_size=config['batch_size'],
-        shuffle=False,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(config['seed'] + 1),
         num_workers=dataloader_workers,
     )
 
@@ -150,13 +133,62 @@ def train(config_path):
     train_iterator = iter(train_dl)
     val_every = config.get('val_every', 500)
     log_every = config.get('log_every', 1)
-    val_preview_batches = config.get('val_preview_batches', 2)
+    val_preview_batches = config.get('val_preview_batches', 3)
 
     start_step = 0
     progress_bar = tqdm(
         range(start_step, config['num_iterations']),
         disable=not accelerator.is_main_process,
+        dynamic_ncols=True,
     )
+    latest_val_loss = None
+
+    def append_preview_tiles(preview_inputs, preview_labels, preview_probabilities, batch, preds, targets, ignore_mask):
+        input_mid_slice = batch['image'].float()[:, :, batch['image'].shape[2] // 2]
+        if input_mid_slice.shape[-2:] != preds.shape[-2:]:
+            input_mid_slice = F.interpolate(
+                input_mid_slice,
+                size=preds.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+
+        gathered_inputs = accelerator.gather_for_metrics(input_mid_slice)
+        gathered_targets = accelerator.gather_for_metrics(targets)
+        gathered_ignore_masks = accelerator.gather_for_metrics(ignore_mask)
+        gathered_probabilities = accelerator.gather_for_metrics(torch.sigmoid(preds.float()))
+
+        if not accelerator.is_main_process:
+            return
+
+        input_tiles = gathered_inputs[:, 0].detach().cpu().numpy()
+        label_tiles = gathered_targets[:, 0].detach().cpu().numpy()
+        ignore_mask_tiles = gathered_ignore_masks[:, 0].detach().cpu().numpy()
+        probability_tiles = gathered_probabilities[:, 0].detach().cpu().numpy()
+
+        for input_tile, label_tile, ignore_mask_tile, probability_tile in zip(
+            input_tiles,
+            label_tiles,
+            ignore_mask_tiles,
+            probability_tiles,
+        ):
+            preview_inputs.append(to_uint8_image(input_tile))
+            preview_labels.append(to_uint8_label(label_tile, ignore_mask_tile))
+            preview_probabilities.append(to_uint8_probability(probability_tile))
+
+    def refresh_progress_bar(current_train_loss, overflow_step_skipped):
+        if not accelerator.is_main_process:
+            return
+
+        postfix = {
+            'loss': f'{current_train_loss:.4f}',
+        }
+        if latest_val_loss is not None:
+            postfix['val_loss'] = f'{latest_val_loss:.4f}'
+        postfix['lr'] = f"{optimizer.param_groups[0]['lr']:.2e}"
+        progress_bar.set_postfix(postfix, refresh=False)
+        progress_bar.update(0)
+
     for step in progress_bar:
         model.train()
 
@@ -172,8 +204,8 @@ def train(config_path):
             targets = (torch.amax(batch['inklabels'].float(), dim=2) > 0).float()
             supervision_mask = torch.amax(batch['supervision_mask'].float(), dim=2)
             ignore_mask = (supervision_mask <= 0).float()
-            targets = torch.cat([targets, ignore_mask], dim=1)
-            l = loss(preds.float(), targets)
+            targets_with_ignore = torch.cat([targets, ignore_mask], dim=1)
+            l = loss(preds.float(), targets_with_ignore)
             if not torch.isfinite(l):
                 raise RuntimeError(f"Non-finite loss at step {step}")
             accelerator.backward(l)
@@ -188,11 +220,7 @@ def train(config_path):
 
         train_loss = l.item()
         if accelerator.is_main_process:
-            progress_bar.set_postfix(
-                loss=f'{train_loss:.4f}',
-                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
-                overflow=int(overflow_step_skipped),
-            )
+            refresh_progress_bar(train_loss, overflow_step_skipped)
             if overflow_step_skipped:
                 tqdm.write(f'step {step} | optimizer step skipped due to fp16 overflow')
 
@@ -207,6 +235,18 @@ def train(config_path):
                 wandb.log(log_dict, step=step)
 
         if step % val_every == 0 and step > 0:
+            train_preview_inputs = []
+            train_preview_labels = []
+            train_preview_probabilities = []
+            append_preview_tiles(
+                train_preview_inputs,
+                train_preview_labels,
+                train_preview_probabilities,
+                batch,
+                preds.detach(),
+                targets.detach(),
+                ignore_mask.detach(),
+            )
             model.eval()
             val_losses = []
             val_preview_inputs = []
@@ -215,17 +255,13 @@ def train(config_path):
             val_iterator = iter(val_dl)
             num_val_batches = min(len(val_dl), config.get('val_steps', 10))
             preview_batch_indices = set(
-                random.sample(
-                    range(num_val_batches),
-                    k=min(val_preview_batches, num_val_batches),
-                )
+                random.sample(range(num_val_batches), k=min(val_preview_batches, num_val_batches))
             )
             with torch.no_grad():
                 for val_batch_idx in range(num_val_batches):
                     val_batch = next(val_iterator)
                     with accelerator.autocast():
                         val_preds = model(val_batch['image'])['ink']
-                    val_probabilities = torch.sigmoid(val_preds.float())
                     val_targets = torch.amax(val_batch['inklabels'].float(), dim=2)
                     val_supervision_mask = torch.amax(val_batch['supervision_mask'].float(), dim=2)
                     val_targets = (val_targets > 0).float()
@@ -235,39 +271,26 @@ def train(config_path):
                     val_losses.append(val_l.item())
 
                     if val_batch_idx in preview_batch_indices:
-                        input_mid_slice = val_batch['image'].float()[:, :, val_batch['image'].shape[2] // 2]
-                        if input_mid_slice.shape[-2:] != val_preds.shape[-2:]:
-                            input_mid_slice = F.interpolate(
-                                input_mid_slice,
-                                size=val_preds.shape[-2:],
-                                mode='bilinear',
-                                align_corners=False,
-                            )
-
-                        gathered_inputs = accelerator.gather_for_metrics(input_mid_slice)
-                        gathered_targets = accelerator.gather_for_metrics(val_targets)
-                        gathered_ignore_masks = accelerator.gather_for_metrics(val_ignore_mask)
-                        gathered_probabilities = accelerator.gather_for_metrics(val_probabilities)
-
-                        if accelerator.is_main_process:
-                            input_tiles = gathered_inputs[:, 0].detach().cpu().numpy()
-                            label_tiles = gathered_targets[:, 0].detach().cpu().numpy()
-                            ignore_mask_tiles = gathered_ignore_masks[:, 0].detach().cpu().numpy()
-                            probability_tiles = gathered_probabilities[:, 0].detach().cpu().numpy()
-
-                            for input_tile, label_tile, ignore_mask_tile, probability_tile in zip(
-                                input_tiles,
-                                label_tiles,
-                                ignore_mask_tiles,
-                                probability_tiles,
-                            ):
-                                val_preview_inputs.append(to_uint8_image(input_tile))
-                                val_preview_labels.append(to_uint8_label(label_tile, ignore_mask_tile))
-                                val_preview_probabilities.append(to_uint8_probability(probability_tile))
+                        append_preview_tiles(
+                            val_preview_inputs,
+                            val_preview_labels,
+                            val_preview_probabilities,
+                            val_batch,
+                            val_preds.detach(),
+                            val_targets.detach(),
+                            val_ignore_mask.detach(),
+                        )
 
             mean_val_loss = np.mean(val_losses)
             if accelerator.is_main_process:
-                tqdm.write(f'step {step} | val_loss {mean_val_loss:.4f}')
+                latest_val_loss = float(mean_val_loss)
+                refresh_progress_bar(train_loss, overflow_step_skipped)
+                save_val_preview_tif(
+                    os.path.join(train_preview_dir, f'train_preview_{step:06}.tif'),
+                    train_preview_inputs,
+                    train_preview_labels,
+                    train_preview_probabilities,
+                )
                 save_val_preview_tif(
                     os.path.join(val_preview_dir, f'val_preview_{step:06}.tif'),
                     val_preview_inputs,
