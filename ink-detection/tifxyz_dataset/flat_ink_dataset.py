@@ -65,7 +65,11 @@ class Segment:
         labeled_patches = []
         for y0, x0 in patch_corners_top_left:
             patch_bbox = inklabels[surface, y0:y0+self.patch_size[1], x0:x0+self.patch_size[2]]
+            if patch_bbox.size == 0:
+                continue
             labeled_ys, labeled_xs = np.nonzero(patch_bbox)
+            if labeled_ys.size == 0:
+                continue
             labeled_area = (labeled_ys.max() - labeled_ys.min() + 1) * (labeled_xs.max() - labeled_xs.min() + 1)
             labeled_patch_coverage = labeled_area / patch_bbox.size
 

@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import wandb
 import numpy as np 
@@ -8,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 import accelerate
-from accelerate.utils import TorchDynamoPlugin, set_seed
+from accelerate.utils import TorchDynamoPlugin, GradientAccumulationPlugin, set_seed
 import click
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
@@ -25,7 +26,8 @@ def train(config_path):
 
     config['crop_size'] = config['patch_size']
     learning_rate = config.get('learning_rate', 0.01)
-    max_steps = config.get('max_steps', config['num_iterations'])
+    grad_acc_steps = int(config.get('grad_acc_steps', 1))
+    max_steps = config.get('max_steps', math.ceil(config['num_iterations'] / grad_acc_steps))
 
     out_dir = config['out_dir']
     os.makedirs(out_dir, exist_ok=True)
@@ -36,20 +38,25 @@ def train(config_path):
 
     dynamo_plugin = TorchDynamoPlugin(
         backend   = "inductor",
-        mode      = "default",
-        fullgraph = False,
-        dynamic   = False
+        mode      = "default"
     )
 
     dataloader_config = accelerate.DataLoaderConfiguration(
         non_blocking = True
     )
 
+    # The training loop reuses the dataloader indefinitely, so keep accumulation
+    # boundaries independent of dataloader exhaustion.
+    gradient_accumulation_plugin = GradientAccumulationPlugin(
+        num_steps=grad_acc_steps,
+        sync_with_dataloader=False,
+    )
+
     accelerator = accelerate.Accelerator(
-        mixed_precision             = config.get('mixed_precision', "fp16"),
-        gradient_accumulation_steps = config.get('grad_acc_steps', 1),
-        dynamo_plugin               = dynamo_plugin,
-        dataloader_config           = dataloader_config
+        mixed_precision              = config.get('mixed_precision', "fp16"),
+        gradient_accumulation_plugin = gradient_accumulation_plugin,
+        dynamo_plugin                = dynamo_plugin,
+        dataloader_config            = dataloader_config
     )
 
     if 'wandb_project' in config and accelerator.is_main_process:
@@ -101,7 +108,6 @@ def train(config_path):
     )
 
     model = make_model(config)
-    model = torch.compile(model)
 
     optimizer = create_optimizer({
                 'name': config.get('optimizer', 'sgd'),
