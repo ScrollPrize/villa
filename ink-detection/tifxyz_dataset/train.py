@@ -25,6 +25,7 @@ def train(config_path):
     with open(config_path, 'r') as f:
         config = json.load(f)
 
+    config.setdefault('volume_auth_json', None)
     config['crop_size'] = config['patch_size']
     config['targets']['ink']['out_channels'] = 1
     config['targets']['ink']['activation'] = 'none'
