@@ -11,9 +11,10 @@ from torch.utils.data import DataLoader, Subset
 import accelerate
 from accelerate.utils import TorchDynamoPlugin, GradientAccumulationPlugin, set_seed
 import click
+from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
-from vesuvius.models.training.loss.nnunet_losses import DC_and_CE_loss
+from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
 from vesuvius.neural_tracing.nets.models import make_model
 from common import save_val_preview_tif, to_uint8_image, to_uint8_label, to_uint8_probability
 from flat_ink_dataset import FlatInkDataset
@@ -25,8 +26,11 @@ def train(config_path):
         config = json.load(f)
 
     config['crop_size'] = config['patch_size']
+    config['targets']['ink']['out_channels'] = 1
+    config['targets']['ink']['activation'] = 'none'
     learning_rate = config.get('learning_rate', 0.01)
     grad_acc_steps = int(config.get('grad_acc_steps', 1))
+    grad_clip = config.get('grad_clip')
     max_steps = config.get('max_steps', math.ceil(config['num_iterations'] / grad_acc_steps))
 
     out_dir = config['out_dir']
@@ -36,10 +40,15 @@ def train(config_path):
 
     set_seed(config['seed'])
 
-    dynamo_plugin = TorchDynamoPlugin(
-        backend   = "inductor",
-        mode      = "default"
-    )
+    dynamo_plugin = None
+    if config.get('use_accelerate_dynamo', False):
+        dynamo_plugin = TorchDynamoPlugin(
+            backend="inductor",
+            mode="default",
+            fullgraph=False,
+            dynamic=False,
+            use_regional_compilation=False,
+        )
 
     dataloader_config = accelerate.DataLoaderConfiguration(
         non_blocking = True
@@ -123,12 +132,14 @@ def train(config_path):
         warmup_steps=config.get('warmup_steps', 1000),
     )
 
-    loss = DC_and_CE_loss(
+    model.apply(InitWeights_He(neg_slope=0.2))
+
+    loss = DC_and_BCE_loss(
+        bce_kwargs={},
         soft_dice_kwargs={},
-        ce_kwargs={'label_smoothing': 0.1},
         weight_dice=0.25,
         weight_ce=1.0,
-        ignore_label=-1,
+        use_ignore_label=True,
     )
 
     model, optimizer, train_dl, val_dl, lr_scheduler = accelerator.prepare(
@@ -141,7 +152,11 @@ def train(config_path):
     val_preview_batches = config.get('val_preview_batches', 2)
 
     start_step = 0
-    for step in tqdm(range(start_step, config['num_iterations']), disable=not accelerator.is_main_process):
+    progress_bar = tqdm(
+        range(start_step, config['num_iterations']),
+        disable=not accelerator.is_main_process,
+    )
+    for step in progress_bar:
         model.train()
 
         try:
@@ -150,21 +165,41 @@ def train(config_path):
             train_iterator = iter(train_dl)
             batch = next(train_iterator)
 
-        with accelerator.accumulate(model), accelerator.autocast():
-            preds = model(batch['image'])['ink']
-            targets = (torch.amax(batch['inklabels'].float(), dim=2) > 0).long()
+        with accelerator.accumulate(model):
+            with accelerator.autocast():
+                preds = model(batch['image'])['ink']
+            targets = (torch.amax(batch['inklabels'].float(), dim=2) > 0).float()
             supervision_mask = torch.amax(batch['supervision_mask'].float(), dim=2)
-            targets[supervision_mask <= 0] = -1
-            l = loss(preds, targets)
+            ignore_mask = (supervision_mask <= 0).float()
+            targets = torch.cat([targets, ignore_mask], dim=1)
+            l = loss(preds.float(), targets)
+            if not torch.isfinite(l):
+                raise RuntimeError(f"Non-finite loss at step {step}")
             accelerator.backward(l)
+            if grad_clip is not None and grad_clip > 0 and accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            overflow_step_skipped = bool(
+                accelerator.sync_gradients and getattr(optimizer, 'step_was_skipped', False)
+            )
             lr_scheduler.step()
             optimizer.zero_grad()
 
+        train_loss = l.item()
+        if accelerator.is_main_process:
+            progress_bar.set_postfix(
+                loss=f'{train_loss:.4f}',
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                overflow=int(overflow_step_skipped),
+            )
+            if overflow_step_skipped:
+                tqdm.write(f'step {step} | optimizer step skipped due to fp16 overflow')
+
         if accelerator.is_main_process and step % log_every == 0:
             log_dict = {
-                'train/loss': l.item(),
+                'train/loss': train_loss,
                 'train/lr': optimizer.param_groups[0]['lr'],
+                'train/overflow_step_skipped': int(overflow_step_skipped),
                 'step': step,
             }
             if wandb.run is not None:
@@ -178,25 +213,27 @@ def train(config_path):
             val_preview_probabilities = []
             val_iterator = iter(val_dl)
             num_val_batches = min(len(val_dl), config.get('val_steps', 10))
-            with torch.no_grad(), accelerator.autocast():
+            preview_batch_indices = set(
+                random.sample(
+                    range(num_val_batches),
+                    k=min(val_preview_batches, num_val_batches),
+                )
+            )
+            with torch.no_grad():
                 for val_batch_idx in range(num_val_batches):
                     val_batch = next(val_iterator)
-                    val_preds = model(val_batch['image'])['ink']
-                    if val_preds.shape[1] == 1:
-                        val_probabilities = torch.sigmoid(val_preds.float())
-                    else:
-                        val_probabilities = torch.softmax(val_preds.float(), dim=1)[:, 1:2]
+                    with accelerator.autocast():
+                        val_preds = model(val_batch['image'])['ink']
+                    val_probabilities = torch.sigmoid(val_preds.float())
                     val_targets = torch.amax(val_batch['inklabels'].float(), dim=2)
                     val_supervision_mask = torch.amax(val_batch['supervision_mask'].float(), dim=2)
-                    if val_targets.shape[-2:] != val_preds.shape[-2:]:
-                        val_targets = F.interpolate(val_targets, size=val_preds.shape[-2:], mode='nearest')
-                        val_supervision_mask = F.interpolate(val_supervision_mask, size=val_preds.shape[-2:], mode='nearest')
-                    val_targets = (val_targets > 0).long()
-                    val_targets[val_supervision_mask <= 0] = -1
-                    val_l = loss(val_preds, val_targets)
+                    val_targets = (val_targets > 0).float()
+                    val_ignore_mask = (val_supervision_mask <= 0).float()
+                    val_targets_with_ignore = torch.cat([val_targets, val_ignore_mask], dim=1)
+                    val_l = loss(val_preds.float(), val_targets_with_ignore)
                     val_losses.append(val_l.item())
 
-                    if val_batch_idx < val_preview_batches:
+                    if val_batch_idx in preview_batch_indices:
                         input_mid_slice = val_batch['image'].float()[:, :, val_batch['image'].shape[2] // 2]
                         if input_mid_slice.shape[-2:] != val_preds.shape[-2:]:
                             input_mid_slice = F.interpolate(
@@ -207,17 +244,24 @@ def train(config_path):
                             )
 
                         gathered_inputs = accelerator.gather_for_metrics(input_mid_slice)
-                        gathered_targets = accelerator.gather_for_metrics(val_targets.float())
+                        gathered_targets = accelerator.gather_for_metrics(val_targets)
+                        gathered_ignore_masks = accelerator.gather_for_metrics(val_ignore_mask)
                         gathered_probabilities = accelerator.gather_for_metrics(val_probabilities)
 
                         if accelerator.is_main_process:
                             input_tiles = gathered_inputs[:, 0].detach().cpu().numpy()
                             label_tiles = gathered_targets[:, 0].detach().cpu().numpy()
+                            ignore_mask_tiles = gathered_ignore_masks[:, 0].detach().cpu().numpy()
                             probability_tiles = gathered_probabilities[:, 0].detach().cpu().numpy()
 
-                            for input_tile, label_tile, probability_tile in zip(input_tiles, label_tiles, probability_tiles):
+                            for input_tile, label_tile, ignore_mask_tile, probability_tile in zip(
+                                input_tiles,
+                                label_tiles,
+                                ignore_mask_tiles,
+                                probability_tiles,
+                            ):
                                 val_preview_inputs.append(to_uint8_image(input_tile))
-                                val_preview_labels.append(to_uint8_label(label_tile))
+                                val_preview_labels.append(to_uint8_label(label_tile, ignore_mask_tile))
                                 val_preview_probabilities.append(to_uint8_probability(probability_tile))
 
             mean_val_loss = np.mean(val_losses)
@@ -229,17 +273,16 @@ def train(config_path):
                     val_preview_labels,
                     val_preview_probabilities,
                 )
+                torch.save({
+                        'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'config': config,
+                        'step': step,
+                        'wandb_run_id': wandb.run.id if wandb.run is not None else config.get('wandb_run_id'),
+                    }, f'{out_dir}/ckpt_{step:06}.pth')
                 if wandb.run is not None:
                     wandb.log({'val/loss': mean_val_loss}, step=step)
-                    
-                    torch.save({
-                            'model': model.state_dict(),
-                            'optimizer': optimizer.state_dict(),
-                            'lr_scheduler': lr_scheduler.state_dict(),
-                            'config': config,
-                            'step': step,
-                            'wandb_run_id': wandb.run.id if wandb.run is not None else config.get('wandb_run_id'),
-                        }, f'{out_dir}/ckpt_{step:06}.pth')
 
 if __name__ == '__main__':
     train()
