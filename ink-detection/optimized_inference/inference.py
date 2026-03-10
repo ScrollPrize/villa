@@ -347,8 +347,7 @@ def create_inference_dataloader(
         if CFG.tile_size != CFG.size:
             tfm_list.append(A.Resize(CFG.size, CFG.size))
         tfm_list += [
-            A.Normalize(mean=[0.0] * CFG.in_chans, std=[1.0] * CFG.in_chans,
-                        max_pixel_value=CFG.max_clip_value),
+            A.ToFloat(max_value=CFG.max_clip_value),
             ToTensorV2(),
         ]
         transform = A.Compose(tfm_list)
