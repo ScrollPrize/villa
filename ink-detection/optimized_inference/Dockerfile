@@ -1,6 +1,6 @@
 # Build separate images for different steps requiring GPU and CPU-only
 
-FROM pytorch/pytorch:2.8.0-cuda12.6-cudnn9-runtime AS gpu
+FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime AS gpu
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
