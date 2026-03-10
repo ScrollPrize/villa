@@ -38,6 +38,8 @@ class Segment:
             supervision_mask=None,
             inklabels=None,
             scale=None,
+            dataset_idx=None,
+            segment_relpath=None,
             ):
         
         self.config = config
@@ -45,11 +47,22 @@ class Segment:
         self.image_volume = image_volume
         self.supervision_mask = supervision_mask
         self.inklabels = inklabels
+        self.dataset_idx = dataset_idx
+        self.segment_relpath = segment_relpath
         self.patch_size = config['patch_size']
 
+    @property
+    def cache_key(self):
+        return (
+            int(self.dataset_idx),
+            str(self.segment_relpath),
+            self.scale,
+        )
+
     def _find_patches(self):
-        supervision_mask = open_zarr(self.supervision_mask, resolution=self.scale, auth=self.config['volume_auth_json'])
-        inklabels = open_zarr(self.inklabels, resolution=self.scale, auth=self.config['volume_auth_json'])
+        volume_auth = self.config.get('volume_auth_json')
+        supervision_mask = open_zarr(self.supervision_mask, resolution=self.scale, auth=volume_auth)
+        inklabels = open_zarr(self.inklabels, resolution=self.scale, auth=volume_auth)
         surface = supervision_mask.shape[0] // 2
         surface_slice = supervision_mask[surface]
         ys, xs = np.nonzero(surface_slice)
@@ -94,7 +107,7 @@ class FlatInkDataset(Dataset):
         self.config           = config
         self.patch_size       = config['patch_size']
         self.datasets         = config['datasets']
-        self.vol_auth         = config['volume_auth_json']
+        self.vol_auth         = config.get('volume_auth_json')
         self.num_workers      = config.get('dataloader_workers', 8)
         self.do_augmentations = do_augmentations
 
@@ -104,24 +117,24 @@ class FlatInkDataset(Dataset):
             segments = list(self._gather_segments())
             cache_path = flat_patch_cache_path(self.config)
             segments_by_key = {
-                (str(seg.image_volume), str(seg.supervision_mask), str(seg.inklabels), seg.scale): seg
+                seg.cache_key: seg
                 for seg in segments
             }
 
             if cache_path.exists():
+                cached_records = load_flat_patch_cache(cache_path)
                 self.patches = [
                     Patch(
                         segment=segments_by_key[
                             (
-                                record['image_volume'],
-                                record['supervision_mask'],
-                                record['inklabels'],
+                                int(record['dataset_idx']),
+                                str(record['segment_relpath']),
                                 record['scale'],
                             )
                         ],
                         bbox=tuple(record['bbox']),
                     )
-                    for record in load_flat_patch_cache(cache_path)
+                    for record in cached_records
                 ]
                 return
 
@@ -138,7 +151,7 @@ class FlatInkDataset(Dataset):
             self.patches = patches
 
     def _gather_segments(self):
-        for ds in self.datasets:
+        for dataset_idx, ds in enumerate(self.datasets):
 
             seg_path = Path(ds['segments_path'])
 
@@ -161,7 +174,9 @@ class FlatInkDataset(Dataset):
                         image_volume     = image_volume,
                         supervision_mask = supervision_mask,
                         inklabels        = inklabels,
-                        scale            = ds['volume_scale']
+                        scale            = ds['volume_scale'],
+                        dataset_idx      = dataset_idx,
+                        segment_relpath  = tifxyz_folder.relative_to(seg_path).as_posix(),
                     )
 
     def __len__(self):

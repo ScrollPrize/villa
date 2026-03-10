@@ -35,9 +35,8 @@ def save_flat_patch_cache(path, patches):
         json.dump(
             [
                 {
-                    "image_volume": str(patch.segment.image_volume),
-                    "supervision_mask": str(patch.segment.supervision_mask),
-                    "inklabels": str(patch.segment.inklabels),
+                    "dataset_idx": int(patch.segment.dataset_idx),
+                    "segment_relpath": str(patch.segment.segment_relpath),
                     "scale": patch.segment.scale,
                     "bbox": list(patch.bbox),
                 }
