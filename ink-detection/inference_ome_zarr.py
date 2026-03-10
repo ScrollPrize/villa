@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import math
 import shutil
@@ -10,15 +11,15 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 import tifffile
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import zarr
 from monai.data.utils import compute_importance_map
-from monai.inferers import SlidingWindowInferer
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
@@ -38,6 +39,40 @@ class Block:
     valid_w: int
 
 
+@dataclass
+class ConfiguredModel:
+    model: torch.nn.Module
+    roi_size: int
+    in_chans: int
+    preprocessing: str
+    source: str
+
+
+class TargetHeadWrapper(nn.Module):
+    def __init__(self, model: torch.nn.Module, *, target_name: str):
+        super().__init__()
+        self.model = model
+        self.target_name = str(target_name)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        outputs = self.model(x)
+        if not isinstance(outputs, dict):
+            raise TypeError(
+                f"Expected wrapped model to return a dict of targets, got {type(outputs).__name__}"
+            )
+        if self.target_name not in outputs:
+            raise KeyError(
+                f"Missing target {self.target_name!r} in model outputs. "
+                f"Available targets: {sorted(outputs.keys())!r}"
+            )
+        logits = outputs[self.target_name]
+        if isinstance(logits, (list, tuple)):
+            if len(logits) == 0:
+                raise ValueError(f"Target {self.target_name!r} returned an empty logits list")
+            logits = logits[0]
+        return logits
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Simple MONAI sliding-window inference for OME-Zarr volumes."
@@ -45,7 +80,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("input_zarr", type=Path, nargs="?", help="Input OME-Zarr path.")
     parser.add_argument("checkpoint", type=Path, nargs="?", help="Model checkpoint path.")
     parser.add_argument("output_tiff", type=Path, nargs="?", help="Output uint8 tiled TIFF path.")
-    parser.add_argument("--model-type", choices=("resnet3d", "residual_unet"), required=True)
+    parser.add_argument(
+        "--model-type",
+        choices=("auto", "resnet3d", "residual_unet", "tifxyz_unet"),
+        default="auto",
+    )
     parser.add_argument(
         "--folder",
         type=Path,
@@ -165,6 +204,7 @@ class OmeZarrPatchReader:
         height: int,
         width: int,
         layer_indices: np.ndarray,
+        preprocessing: str = "legacy_uint8",
     ):
         self.input_path = Path(input_path)
         self.resolution = str(resolution)
@@ -172,6 +212,7 @@ class OmeZarrPatchReader:
         self.height = int(height)
         self.width = int(width)
         self.layer_indices = np.asarray(layer_indices, dtype=np.int64)
+        self.preprocessing = str(preprocessing)
         self._array = None
         self._read_mode = "fancy"
         self._z_start = int(self.layer_indices[0])
@@ -226,13 +267,19 @@ class OmeZarrPatchReader:
         yy1 = min(self.height, y1)
         xx1 = min(self.width, x1)
 
-        out = np.zeros((out_h, out_w, self.layer_indices.size), dtype=np.uint8)
+        if self.preprocessing == "tifxyz_robust":
+            out = np.zeros((out_h, out_w, self.layer_indices.size), dtype=np.float32)
+        else:
+            out = np.zeros((out_h, out_w, self.layer_indices.size), dtype=np.uint8)
         if yy1 <= yy0 or xx1 <= xx0:
             return out
 
         block = self._read_raw(yy0, yy1, xx0, xx1)
-        block = convert_volume_dtype(block)
-        np.clip(block, 0, 200, out=block)
+        if self.preprocessing == "tifxyz_robust":
+            block = np.asarray(block, dtype=np.float32)
+        else:
+            block = convert_volume_dtype(block)
+            np.clip(block, 0, 200, out=block)
         out[yy0 - y0:yy1 - y0, xx0 - x0:xx1 - x0] = block
         return out
 
@@ -257,11 +304,13 @@ class OmeZarrBlockDataset(Dataset):
         reader: OmeZarrPatchReader,
         blocks: Sequence[Block],
         patch_size: int,
+        preprocessing: str = "legacy_uint8",
     ):
         self.reader = reader
         self.blocks = list(blocks)
         self.patch_h = int(patch_size)
         self.patch_w = int(patch_size)
+        self.preprocessing = str(preprocessing)
 
     def __len__(self) -> int:
         return len(self.blocks)
@@ -269,15 +318,133 @@ class OmeZarrBlockDataset(Dataset):
     def __getitem__(self, index: int):
         block = self.blocks[index]
         patch = self.reader.read(block.y0, block.x0, self.patch_h, self.patch_w)
-        patch = patch.astype(np.float32, copy=False) / 255.0
         patch = np.moveaxis(patch, -1, 0)
-        image = torch.from_numpy(np.ascontiguousarray(patch))
+        if self.preprocessing == "tifxyz_robust":
+            from vesuvius.image_proc.intensity.normalization import normalize_robust
+
+            patch = normalize_robust(patch)
+        else:
+            patch = patch.astype(np.float32, copy=False) / 255.0
+        # Models trained in this repo consume channel-first 3D volumes: [C, Z, Y, X].
+        image = torch.from_numpy(np.ascontiguousarray(patch)).unsqueeze(0)
         meta = torch.tensor([block.y0, block.x0, block.valid_h, block.valid_w], dtype=torch.int64)
         return image, meta
 
 
-def configure_model(args: argparse.Namespace):
-    from train_resnet3d_lib.checkpointing import load_state_dict_from_checkpoint
+def load_checkpoint_payload(checkpoint_path: Path | str) -> Any:
+    try:
+        return torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(str(checkpoint_path), map_location="cpu")
+
+
+def extract_state_dict_from_payload(payload: Any, checkpoint_path: Path | str) -> dict[str, torch.Tensor]:
+    if isinstance(payload, dict) and isinstance(payload.get("state_dict"), dict):
+        state_dict = payload["state_dict"]
+    elif isinstance(payload, dict) and isinstance(payload.get("model_state_dict"), dict):
+        state_dict = payload["model_state_dict"]
+    elif isinstance(payload, dict) and isinstance(payload.get("model"), dict):
+        state_dict = payload["model"]
+    elif isinstance(payload, dict) and all(isinstance(v, torch.Tensor) for v in payload.values()):
+        state_dict = payload
+    else:
+        raise ValueError(f"Unsupported checkpoint format for checkpoint={str(checkpoint_path)!r}")
+
+    if state_dict and all(k.startswith("module.") for k in state_dict.keys()):
+        state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
+    return state_dict
+
+
+def checkpoint_looks_like_tifxyz_training(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    config = payload.get("config")
+    model_state = payload.get("model")
+    if not isinstance(config, dict) or not isinstance(model_state, dict):
+        return False
+    model_type = str(config.get("model_type", "")).strip().lower()
+    patch_size = config.get("patch_size")
+    return model_type == "unet" and isinstance(patch_size, (list, tuple)) and len(patch_size) == 3
+
+
+def tifxyz_roi_size_from_config(config: dict[str, Any]) -> int:
+    patch_size = config.get("crop_size", config.get("patch_size"))
+    if not isinstance(patch_size, (list, tuple)) or len(patch_size) != 3:
+        raise ValueError(
+            "tifxyz checkpoint config must define crop_size or patch_size as [z, y, x], "
+            f"got {patch_size!r}"
+        )
+    roi_y = int(patch_size[1])
+    roi_x = int(patch_size[2])
+    if roi_y != roi_x:
+        raise ValueError(
+            "inference_ome_zarr.py currently requires square tifxyz patches for inference, "
+            f"got patch_size={tuple(int(v) for v in patch_size)}"
+        )
+    return roi_y
+
+
+def tifxyz_in_chans_from_config(config: dict[str, Any]) -> int:
+    patch_size = config.get("crop_size", config.get("patch_size"))
+    if isinstance(patch_size, (list, tuple)) and len(patch_size) == 3:
+        return int(patch_size[0])
+    raise ValueError(
+        "tifxyz checkpoint config must define crop_size or patch_size as [z, y, x] "
+        f"to determine inference depth, got {patch_size!r}"
+    )
+
+
+def build_tifxyz_model_bundle(payload: dict[str, Any], checkpoint_path: Path | str) -> ConfiguredModel:
+    from vesuvius.neural_tracing.nets.models import make_model
+
+    config = copy.deepcopy(payload["config"])
+    model_type = str(config.get("model_type", "")).strip().lower()
+    if model_type != "unet":
+        raise ValueError(
+            "inference_ome_zarr.py only supports tifxyz checkpoints trained with model_type='unet', "
+            f"got {model_type!r}"
+        )
+    config.setdefault("crop_size", config.get("patch_size"))
+    targets_cfg = config.setdefault("targets", {})
+    ink_cfg = targets_cfg.setdefault("ink", {})
+    ink_cfg["out_channels"] = 1
+    ink_cfg.setdefault("activation", "none")
+
+    base_model = make_model(config)
+    state_dict = extract_state_dict_from_payload(payload, checkpoint_path)
+    incompat = base_model.load_state_dict(state_dict, strict=False)
+    LOGGER.info(
+        "Loaded tifxyz checkpoint %s (missing_keys=%d unexpected_keys=%d)",
+        checkpoint_path,
+        len(incompat.missing_keys),
+        len(incompat.unexpected_keys),
+    )
+
+    model = TargetHeadWrapper(base_model, target_name="ink")
+    model.eval()
+    return ConfiguredModel(
+        model=model,
+        roi_size=tifxyz_roi_size_from_config(config),
+        in_chans=tifxyz_in_chans_from_config(config),
+        preprocessing="tifxyz_robust",
+        source="tifxyz_dataset/train.py",
+    )
+
+
+def configure_model(args: argparse.Namespace) -> ConfiguredModel:
+    checkpoint_payload = load_checkpoint_payload(args.checkpoint)
+    explicit_tifxyz = args.model_type == "tifxyz_unet"
+    auto_tifxyz = args.model_type in {"auto", "residual_unet"} and checkpoint_looks_like_tifxyz_training(checkpoint_payload)
+    if explicit_tifxyz or auto_tifxyz:
+        if args.metadata_json is not None:
+            LOGGER.info("Ignoring --metadata-json for tifxyz checkpoint %s", args.checkpoint)
+        return build_tifxyz_model_bundle(checkpoint_payload, args.checkpoint)
+    if args.model_type == "auto":
+        raise ValueError(
+            "Could not infer a supported model type from the checkpoint. "
+            "Pass --model-type resnet3d, residual_unet, or tifxyz_unet explicitly."
+        )
+
     from train_resnet3d_lib.config import CFG, apply_metadata_hyperparameters, load_metadata_json
     from train_resnet3d_lib.model import RegressionPLModel
 
@@ -285,7 +452,7 @@ def configure_model(args: argparse.Namespace):
     if args.metadata_json is not None:
         metadata = load_metadata_json(str(args.metadata_json))
         apply_metadata_hyperparameters(CFG, metadata)
-    elif args.model_type == "residual_unet":
+    elif args.model_type in {"residual_unet", "auto"}:
         LOGGER.warning(
             "No --metadata-json was provided for residual_unet. "
             "This will only work if the default CFG matches the checkpoint architecture."
@@ -312,7 +479,7 @@ def configure_model(args: argparse.Namespace):
         group_names=["inference"],
     )
 
-    state_dict = load_state_dict_from_checkpoint(str(args.checkpoint))
+    state_dict = extract_state_dict_from_payload(checkpoint_payload, args.checkpoint)
     incompat = model.load_state_dict(state_dict, strict=False)
     LOGGER.info(
         "Loaded checkpoint %s (missing_keys=%d unexpected_keys=%d)",
@@ -321,14 +488,19 @@ def configure_model(args: argparse.Namespace):
         len(incompat.unexpected_keys),
     )
     model.eval()
-    return model, CFG, metadata
+    return ConfiguredModel(
+        model=model,
+        roi_size=int(getattr(CFG, "size", 256)),
+        in_chans=int(getattr(CFG, "in_chans", 62)),
+        preprocessing="legacy_uint8",
+        source="train_resnet3d_lib",
+    )
 
 
 def run_block_inference(
     *,
     loader: DataLoader,
     model: torch.nn.Module,
-    inferer: SlidingWindowInferer,
     prob_sum_store,
     weight_sum_store,
     weight_map: np.ndarray,
@@ -347,7 +519,11 @@ def run_block_inference(
                 else nullcontext()
             )
             with amp_context:
-                logits = inferer(images, model)
+                logits = model(images)
+            if logits.ndim != 4:
+                raise ValueError(
+                    f"Expected model logits shaped [B, C, H, W], got {tuple(logits.shape)}"
+                )
             probs_t = torch.sigmoid(logits).to(dtype=torch.float32)
             if probs_t.shape[-2:] != images.shape[-2:]:
                 if not logged_resize:
@@ -438,8 +614,7 @@ def open_temp_zarr_array(
 def infer_single_zarr(
     *,
     args: argparse.Namespace,
-    model: torch.nn.Module,
-    cfg,
+    configured_model: ConfiguredModel,
     input_zarr: Path,
     output_tiff: Path,
 ) -> None:
@@ -490,7 +665,7 @@ def infer_single_zarr(
     occupancy_scale_y = max(1, int(round(height / max(1, occupancy_h))))
     occupancy_scale_x = max(1, int(round(width / max(1, occupancy_w))))
 
-    roi_size = int(getattr(cfg, "size", 256))
+    roi_size = int(configured_model.roi_size)
     patch_size = roi_size
     patch_stride = max(1, int(round(float(patch_size) * (1.0 - float(args.overlap)))))
 
@@ -498,7 +673,7 @@ def infer_single_zarr(
     if tiff_tile_shape[0] % 16 != 0 or tiff_tile_shape[1] % 16 != 0:
         tiff_tile_shape = (int(spatial_chunk_h), int(spatial_chunk_w))
 
-    in_chans = int(getattr(cfg, "in_chans", 62))
+    in_chans = int(configured_model.in_chans)
     layer_start = 0 if args.layer_start is None else int(args.layer_start)
     layer_end = depth if args.layer_end is None else int(args.layer_end)
     if layer_start < 0:
@@ -522,6 +697,7 @@ def infer_single_zarr(
         height=height,
         width=width,
         layer_indices=layer_indices,
+        preprocessing=configured_model.preprocessing,
     )
 
     layer_order = "reverse" if bool(args.reverse_layers) else "forward"
@@ -564,7 +740,12 @@ def infer_single_zarr(
     LOGGER.info("Selected %d patches for inference.", len(blocks))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset = OmeZarrBlockDataset(reader=reader, blocks=blocks, patch_size=patch_size)
+    dataset = OmeZarrBlockDataset(
+        reader=reader,
+        blocks=blocks,
+        patch_size=patch_size,
+        preprocessing=configured_model.preprocessing,
+    )
     loader_kwargs = {
         "dataset": dataset,
         "batch_size": int(args.batch_size),
@@ -577,19 +758,6 @@ def infer_single_zarr(
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = DEFAULT_PREFETCH_FACTOR
     loader = DataLoader(**loader_kwargs)
-
-    inferer = SlidingWindowInferer(
-        roi_size=(roi_size, roi_size),
-        sw_batch_size=DEFAULT_SW_BATCH_SIZE,
-        overlap=0.0,
-        mode="gaussian",
-        sigma_scale=0.125,
-        padding_mode="replicate",
-        sw_device=device,
-        device=device,
-        cache_roi_weight_map=True,
-        progress=False,
-    )
     weight_mode = "constant" if float(args.overlap) == 0.0 else "gaussian"
     weight_map = compute_importance_map(
         patch_size=(patch_size, patch_size),
@@ -621,8 +789,7 @@ def infer_single_zarr(
         if len(dataset) > 0:
             run_block_inference(
                 loader=loader,
-                model=model,
-                inferer=inferer,
+                model=configured_model.model,
                 prob_sum_store=prob_sum_store,
                 weight_sum_store=weight_sum_store,
                 weight_map=weight_map,
@@ -668,7 +835,7 @@ def resolve_segment_zarr_path(segment_dir: Path) -> Path:
     )
 
 
-def infer_folder(args: argparse.Namespace, model: torch.nn.Module, cfg) -> None:
+def infer_folder(args: argparse.Namespace, configured_model: ConfiguredModel) -> None:
     folder = Path(args.folder)
     if not folder.exists() or not folder.is_dir():
         raise NotADirectoryError(f"--folder is not a directory: {folder}")
@@ -701,8 +868,7 @@ def infer_folder(args: argparse.Namespace, model: torch.nn.Module, cfg) -> None:
         )
         infer_single_zarr(
             args=args,
-            model=model,
-            cfg=cfg,
+            configured_model=configured_model,
             input_zarr=input_zarr,
             output_tiff=output_tiff,
         )
@@ -746,16 +912,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
 
-    model, cfg, _metadata = configure_model(args)
+    configured_model = configure_model(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
+    configured_model.model = configured_model.model.to(device)
+    LOGGER.info(
+        "Configured model source=%s roi_size=%d in_chans=%d preprocessing=%s",
+        configured_model.source,
+        configured_model.roi_size,
+        configured_model.in_chans,
+        configured_model.preprocessing,
+    )
     if args.folder is not None:
-        infer_folder(args=args, model=model, cfg=cfg)
+        infer_folder(args=args, configured_model=configured_model)
     else:
         infer_single_zarr(
             args=args,
-            model=model,
-            cfg=cfg,
+            configured_model=configured_model,
             input_zarr=args.input_zarr,
             output_tiff=args.output_tiff,
         )
