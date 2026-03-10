@@ -77,16 +77,26 @@ def to_uint8_image(image_2d):
         image_2d = np.zeros_like(image_2d, dtype=np.float32)
     return np.clip(np.rint(image_2d * 255.0), 0, 255).astype(np.uint8)
 
-def to_uint8_label(label_2d):
+def to_uint8_label(label_2d, ignore_mask_2d=None):
     label_2d = np.asarray(label_2d, dtype=np.float32)
     label_vis = np.zeros(label_2d.shape, dtype=np.uint8)
+    if ignore_mask_2d is not None:
+        ignore_mask_2d = np.asarray(ignore_mask_2d, dtype=np.float32) > 0
+        label_vis[ignore_mask_2d] = 0
     label_vis[label_2d == 0] = 127
     label_vis[label_2d > 0] = 255
+    if ignore_mask_2d is not None:
+        label_vis[ignore_mask_2d] = 0
     return label_vis
 
-def to_uint8_probability(probability_2d):
+def to_uint8_probability(probability_2d, lower_percentile=1.0, upper_percentile=99.0):
     probability_2d = np.nan_to_num(np.asarray(probability_2d, dtype=np.float32), nan=0.0, posinf=1.0, neginf=0.0)
     probability_2d = np.clip(probability_2d, 0.0, 1.0)
+    lo = float(np.percentile(probability_2d, lower_percentile))
+    hi = float(np.percentile(probability_2d, upper_percentile))
+    if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+        probability_2d = np.clip(probability_2d, lo, hi)
+        probability_2d = (probability_2d - lo) / (hi - lo)
     return np.clip(np.rint(probability_2d * 255.0), 0, 255).astype(np.uint8)
 
 def save_val_preview_tif(output_path, input_tiles, label_tiles, probability_tiles, gap_size=4):

@@ -248,16 +248,23 @@ def train(config_path):
 
                         gathered_inputs = accelerator.gather_for_metrics(input_mid_slice)
                         gathered_targets = accelerator.gather_for_metrics(val_targets)
+                        gathered_ignore_masks = accelerator.gather_for_metrics(val_ignore_mask)
                         gathered_probabilities = accelerator.gather_for_metrics(val_probabilities)
 
                         if accelerator.is_main_process:
                             input_tiles = gathered_inputs[:, 0].detach().cpu().numpy()
                             label_tiles = gathered_targets[:, 0].detach().cpu().numpy()
+                            ignore_mask_tiles = gathered_ignore_masks[:, 0].detach().cpu().numpy()
                             probability_tiles = gathered_probabilities[:, 0].detach().cpu().numpy()
 
-                            for input_tile, label_tile, probability_tile in zip(input_tiles, label_tiles, probability_tiles):
+                            for input_tile, label_tile, ignore_mask_tile, probability_tile in zip(
+                                input_tiles,
+                                label_tiles,
+                                ignore_mask_tiles,
+                                probability_tiles,
+                            ):
                                 val_preview_inputs.append(to_uint8_image(input_tile))
-                                val_preview_labels.append(to_uint8_label(label_tile))
+                                val_preview_labels.append(to_uint8_label(label_tile, ignore_mask_tile))
                                 val_preview_probabilities.append(to_uint8_probability(probability_tile))
 
             mean_val_loss = np.mean(val_losses)
