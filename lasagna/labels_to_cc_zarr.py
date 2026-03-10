@@ -1,12 +1,15 @@
-"""Read a multi-layer binary TIFF, run 3D connected components, store as
-uint8 zarr (0=bg, 1..N=components) and render a slice-video with random
-per-component colours.
+"""Read a multi-layer label TIFF (0=bg, 1=pred/fg, 2=ignore), run 3D
+connected components on the foreground, store:
+  - cc zarr: uint8 (0=bg, 1..N=components)
+  - binary zarr: uint8 (0=bg+ignore, 1=fg)
+and render a slice-video with random per-component colours.
 
 Usage
 -----
   python labels_to_cc_zarr.py \
       --input labels.tif \
       --output cc.zarr \
+      --binary-zarr binary.zarr \
       --video cc_video.mp4 \
       --axis z \
       --connectivity 6
@@ -16,7 +19,6 @@ from __future__ import annotations
 import argparse
 import struct
 import subprocess
-import sys
 import zlib
 from pathlib import Path
 
@@ -139,8 +141,10 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="3D connected components from binary TIFF → uint8 zarr + video",
     )
-    p.add_argument("--input", required=True, help="Multi-layer binary TIFF (ZYX)")
-    p.add_argument("--output", required=True, help="Output zarr path")
+    p.add_argument("--input", required=True, help="Multi-layer label TIFF (ZYX): 0=bg, 1=pred, 2=ignore")
+    p.add_argument("--output", required=True, help="Output CC zarr path (0=bg, 1..N=components)")
+    p.add_argument("--binary-zarr", default=None,
+                    help="Output binary zarr path (0=bg+ignore, 1=fg)")
     p.add_argument("--video", default=None, help="Output video path (.mp4)")
     p.add_argument("--axis", choices=["z", "y", "x"], default="z",
                     help="Slice axis for video (default: z)")
@@ -164,8 +168,19 @@ def main(argv: list[str] | None = None) -> int:
     assert vol.ndim == 3, f"expected 3D volume, got shape {vol.shape}"
     print(f"[labels_to_cc] volume shape={vol.shape}  dtype={vol.dtype}", flush=True)
 
-    # binarise (anything > 0 is foreground)
-    binary = (vol > 0).astype(np.uint8)
+    # Label convention: 0=background, 1=pred/foreground, 2=ignore
+    # For CC: only label==1 is foreground; 0 and 2 are both background.
+    n_bg = int((vol == 0).sum())
+    n_fg = int((vol == 1).sum())
+    n_ign = int((vol == 2).sum())
+    n_other = vol.size - n_bg - n_fg - n_ign
+    print(f"[labels_to_cc] labels: bg(0)={n_bg}  pred(1)={n_fg}  "
+          f"ignore(2)={n_ign}  other={n_other}", flush=True)
+    if n_other > 0:
+        print(f"[labels_to_cc] WARNING: {n_other} voxels with unexpected label values "
+              f"(treating as background)", flush=True)
+
+    binary = (vol == 1).astype(np.uint8)
     fg_voxels = int(binary.sum())
     print(f"[labels_to_cc] foreground voxels: {fg_voxels} "
           f"({100*fg_voxels/binary.size:.1f}%)", flush=True)
@@ -216,6 +231,22 @@ def main(argv: list[str] | None = None) -> int:
     arr.attrs["connectivity"] = args.connectivity
     arr.attrs["min_voxels"] = args.min_voxels
     print(f"[labels_to_cc] zarr written  shape={arr.shape}  chunks={arr.chunks}", flush=True)
+
+    # -- binary zarr (for vc_gen_normalgrids) --------------------------------
+    if args.binary_zarr:
+        bin_path = Path(args.binary_zarr)
+        print(f"[labels_to_cc] writing binary zarr to {bin_path}", flush=True)
+        # vc_gen_normalgrids expects zarr Group with dataset "0" inside
+        store = zarr.DirectoryStore(str(bin_path), dimension_separator="/")
+        root = zarr.group(store, overwrite=True)
+        ds = root.create_dataset(
+            "0",
+            data=binary,
+            chunks=(cs, cs, cs),
+            dtype=np.uint8,
+            overwrite=True,
+        )
+        print(f"[labels_to_cc] binary zarr written  shape={ds.shape}  chunks={ds.chunks}", flush=True)
 
     # -- video --------------------------------------------------------------
     if args.video:
