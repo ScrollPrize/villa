@@ -227,9 +227,6 @@ def train(config_path):
                     val_probabilities = torch.sigmoid(val_preds.float())
                     val_targets = torch.amax(val_batch['inklabels'].float(), dim=2)
                     val_supervision_mask = torch.amax(val_batch['supervision_mask'].float(), dim=2)
-                    if val_targets.shape[-2:] != val_preds.shape[-2:]:
-                        val_targets = F.interpolate(val_targets, size=val_preds.shape[-2:], mode='nearest')
-                        val_supervision_mask = F.interpolate(val_supervision_mask, size=val_preds.shape[-2:], mode='nearest')
                     val_targets = (val_targets > 0).float()
                     val_ignore_mask = (val_supervision_mask <= 0).float()
                     val_targets_with_ignore = torch.cat([val_targets, val_ignore_mask], dim=1)
@@ -276,17 +273,16 @@ def train(config_path):
                     val_preview_labels,
                     val_preview_probabilities,
                 )
+                torch.save({
+                        'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'config': config,
+                        'step': step,
+                        'wandb_run_id': wandb.run.id if wandb.run is not None else config.get('wandb_run_id'),
+                    }, f'{out_dir}/ckpt_{step:06}.pth')
                 if wandb.run is not None:
                     wandb.log({'val/loss': mean_val_loss}, step=step)
-                    
-                    torch.save({
-                            'model': model.state_dict(),
-                            'optimizer': optimizer.state_dict(),
-                            'lr_scheduler': lr_scheduler.state_dict(),
-                            'config': config,
-                            'step': step,
-                            'wandb_run_id': wandb.run.id if wandb.run is not None else config.get('wandb_run_id'),
-                        }, f'{out_dir}/ckpt_{step:06}.pth')
 
 if __name__ == '__main__':
     train()

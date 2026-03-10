@@ -20,7 +20,12 @@ def load_volume_auth(auth_json_path):
 
 
 def flat_patch_cache_path(config):
-    return Path(config.get("out_dir", ".")) / "flat_ink_patches.json"
+    patch_size = config.get("patch_size", ())
+    if isinstance(patch_size, int):
+        patch_size_key = str(int(patch_size))
+    else:
+        patch_size_key = "x".join(str(int(v)) for v in patch_size)
+    return Path(config.get("out_dir", ".")) / f"flat_ink_patches_ps-{patch_size_key}.json"
 
 
 def save_flat_patch_cache(path, patches):
@@ -82,11 +87,11 @@ def to_uint8_label(label_2d, ignore_mask_2d=None):
     label_vis = np.zeros(label_2d.shape, dtype=np.uint8)
     if ignore_mask_2d is not None:
         ignore_mask_2d = np.asarray(ignore_mask_2d, dtype=np.float32) > 0
-        label_vis[ignore_mask_2d] = 0
-    label_vis[label_2d == 0] = 127
+        label_vis[ignore_mask_2d] = 127
+    label_vis[label_2d == 0] = 0
     label_vis[label_2d > 0] = 255
     if ignore_mask_2d is not None:
-        label_vis[ignore_mask_2d] = 0
+        label_vis[ignore_mask_2d] = 127
     return label_vis
 
 def to_uint8_probability(probability_2d, lower_percentile=1.0, upper_percentile=99.0):
