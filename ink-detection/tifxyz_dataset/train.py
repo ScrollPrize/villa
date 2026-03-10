@@ -18,6 +18,8 @@ from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
 from vesuvius.neural_tracing.nets.models import make_model
 from common import save_val_preview_tif, to_uint8_image, to_uint8_label, to_uint8_probability
 from flat_ink_dataset import FlatInkDataset
+from load_checkpoint import load_training_checkpoint, restore_training_state
+
 
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
@@ -129,12 +131,30 @@ def train(config_path):
             model, optimizer, train_dl, val_dl, lr_scheduler
         )
 
+    start_step = 0
+    ckpt_path = config.get('ckpt')
+    load_weights_only = bool(config.get('load_weights_only', False))
+    if ckpt_path:
+        checkpoint = load_training_checkpoint(ckpt_path)
+        start_step = restore_training_state(
+            model=model,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            checkpoint=checkpoint,
+            ckpt_path=ckpt_path,
+            load_weights_only=load_weights_only,
+        )
+
+        accelerator.print(
+            f"Loaded checkpoint {ckpt_path}"
+            + (" (weights only)" if load_weights_only else f" and resuming from step {start_step}")
+        )
+
     train_iterator = iter(train_dl)
     val_every = config.get('val_every', 500)
     log_every = config.get('log_every', 1)
     val_preview_batches = config.get('val_preview_batches', 3)
 
-    start_step = 0
     progress_bar = tqdm(
         range(start_step, config['num_iterations']),
         disable=not accelerator.is_main_process,
