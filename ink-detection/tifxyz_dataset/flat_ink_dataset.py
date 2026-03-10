@@ -149,7 +149,7 @@ class FlatInkDataset(Dataset):
                         print(supervision_mask)
                         print(inklabels)
 
-                    if not image_volume.exists() and supervision_mask.exists() and inklabels.exists():
+                    if not (image_volume.exists() and supervision_mask.exists() and inklabels.exists()):
                         raise ValueError(f"{tifxyz_folder.name} is missing required data. make sure the image volume, supervision mask, and labels exist")
 
                     yield Segment(
