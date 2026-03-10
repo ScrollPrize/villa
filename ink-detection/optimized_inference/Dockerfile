@@ -3,7 +3,6 @@
 FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime AS gpu
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
