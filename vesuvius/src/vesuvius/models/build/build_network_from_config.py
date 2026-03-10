@@ -791,7 +791,8 @@ class NetworkFromConfig(nn.Module):
         
         # Get Primus-specific parameters
         primus_kwargs = {
-            "drop_path_rate": model_config.get("drop_path_rate", 0.0),
+            # Align unspecified Primus configs with the MIC-DKFZ nnUNet Primus trainers.
+            "drop_path_rate": model_config.get("drop_path_rate", 0.2),
             "patch_drop_rate": model_config.get("patch_drop_rate", 0.0),
             "proj_drop_rate": model_config.get("proj_drop_rate", 0.0),
             "attn_drop_rate": model_config.get("attn_drop_rate", 0.0),
@@ -824,7 +825,8 @@ class NetworkFromConfig(nn.Module):
         self.task_activations = nn.ModuleDict()
         self.task_heads = nn.ModuleDict()
 
-        separate_decoders_default = model_config.get("separate_decoders", False)
+        # Default Primus to per-task decoders to mirror the direct Primus head layout.
+        separate_decoders_default = model_config.get("separate_decoders", True)
         decoder_head_channels = model_config.get("decoder_head_channels", 32)
 
         tasks_using_shared, tasks_using_separate = set(), set()

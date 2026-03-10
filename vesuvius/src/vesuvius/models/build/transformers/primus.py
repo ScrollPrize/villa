@@ -55,14 +55,14 @@ class Primus(AbstractDynamicNetworkArchitectures):
         use_abs_pos_embed: bool = True,
         pos_emb_type: str = "rope",
         mlp_ratio=4 * 2 / 3,
-        drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
+        drop_path_rate=0.2,  # nnUNet Primus trainer default stochastic depth
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
         proj_drop_rate: float = 0.0,  # drops out things related to the projection. That is in the MLP and at the end of EVA attention
         attn_drop_rate: float = 0.0,  # drops attention, meaning connections between patches may bebroken up at random
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
-        init_values=None,
-        scale_attn_inner=False,
+        init_values=0.1,
+        scale_attn_inner=True,
     ):
         """
         Architecture as proposed in the Primus paper (https://arxiv.org/pdf/2503.01835)
@@ -221,12 +221,12 @@ class PrimusX(Primus):
         config_name: str,
         patch_embed_size: Tuple[int, ...],
         input_shape: Tuple[int, ...] = None,
-        drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
+        drop_path_rate=0.2,  # nnUNet Primus trainer default stochastic depth
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
-        init_values=None,
-        scale_attn_inner=False,
+        init_values=0.1,
+        scale_attn_inner=True,
     ):
         conf = _PRIMUS_CONFIGS[config_name]
         super().__init__(
@@ -253,7 +253,7 @@ class PrimusS(PrimusX):
         output_channels: int,
         patch_embed_size: Tuple[int, ...],
         input_shape: Tuple[int, ...] = None,
-        drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
+        drop_path_rate=0.2,  # nnUNet Primus trainer default stochastic depth
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
@@ -288,7 +288,7 @@ class PrimusB(PrimusX):
         output_channels: int,
         patch_embed_size: Tuple[int, ...],
         input_shape: Tuple[int, ...] = None,
-        drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
+        drop_path_rate=0.2,  # nnUNet Primus trainer default stochastic depth
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
@@ -323,7 +323,7 @@ class PrimusM(PrimusX):
         output_channels: int,
         patch_embed_size: Tuple[int, ...],
         input_shape: Tuple[int, ...] = None,
-        drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
+        drop_path_rate=0.2,  # nnUNet Primus trainer default stochastic depth
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
@@ -358,7 +358,7 @@ class PrimusL(PrimusX):
         output_channels: int,
         patch_embed_size: Tuple[int, ...],
         input_shape: Tuple[int, ...] = None,
-        drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
+        drop_path_rate=0.2,  # nnUNet Primus trainer default stochastic depth
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
