@@ -411,14 +411,22 @@ def predict_fn(
                         unit="tile",
                         **get_tqdm_kwargs())
 
+            # Only sync CUDA for per-phase timing when detailed profiling is enabled;
+            # in production this avoids ~20s of GPU pipeline stalls per run.
+            detailed_sync = (
+                device.type == "cuda"
+                and profiler is not None
+                and getattr(profiler, "detailed_enabled", False)
+            )
+
             for (images, xys) in test_loader:
                 batch_count += 1
                 tile_count += int(images.size(0))
-                with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=device.type == "cuda"):
+                with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=detailed_sync):
                     images = images.to(device, non_blocking=True)
 
                 amp_device = "cuda" if device.type == "cuda" else "cpu"
-                with scoped_timer(profiler, "forward_seconds", cuda_sync=device.type == "cuda"):
+                with scoped_timer(profiler, "forward_seconds", cuda_sync=detailed_sync):
                     with torch.autocast(device_type=amp_device, enabled=True):
                         y_preds = model.forward(images)  # Model-specific forward
                     y_preds = torch.sigmoid(y_preds)
@@ -448,7 +456,7 @@ def predict_fn(
 
                 y_weighted = (y_preds_resized * weight_tensor).squeeze(1)  # (B,th,tw)
 
-                with scoped_timer(profiler, "device_to_host_seconds", cuda_sync=device.type == "cuda"):
+                with scoped_timer(profiler, "device_to_host_seconds", cuda_sync=detailed_sync):
                     y_cpu = y_weighted.cpu().numpy()
                     w_cpu = weight_tensor.detach().cpu().numpy().astype(np.float32)
 
