@@ -131,18 +131,14 @@ class DinoIBOTPretrainer:
         self.betas = tuple(self.config.get("betas", (0.9, 0.999)))
         self.clip_grad = float(self.config.get("clip_grad", 3.0))
         self.layer_decay = float(self.config.get("layer_decay", self.config.get("layerwise_decay", 1.0)))
-        self.patch_embed_lr_mult = float(self.config.get("patch_embed_lr_mult", 1.0))
+        self.patch_embed_lr_mult = float(self.config.get("patch_embed_lr_mult", 0.2))
 
         warmup_ratio = float(self.config.get("warmup_ratio", 0.1))
         default_warmup_steps = 0
         if self.total_steps > 0 and warmup_ratio > 0.0:
             default_warmup_steps = max(1, round(self.total_steps * warmup_ratio))
         self.warmup_steps = int(self.config["warmup_steps"]) if "warmup_steps" in self.config else default_warmup_steps
-        self.freeze_last_layer_steps = self._resolve_step_count(
-            "freeze_last_layer_steps",
-            "freeze_last_layer_epochs",
-            default=0,
-        )
+        self.freeze_last_layer_steps = self._resolve_freeze_last_layer_steps()
 
         self.model = DinoVitStudentTeacher(self.model_config).to(self.device)
         self.optimizer = self._build_optimizer()
@@ -241,6 +237,17 @@ class DinoIBOTPretrainer:
                 raise ValueError(f"{epochs_key} requires official_epoch_length or epoch_length in the config.")
             return int(self.config[epochs_key]) * int(epoch_length)
         return int(default)
+
+    def _resolve_freeze_last_layer_steps(self) -> int:
+        if "freeze_last_layer_steps" in self.config:
+            return int(self.config["freeze_last_layer_steps"])
+        if "freeze_last_layer_epochs" in self.config:
+            return self._resolve_step_count("freeze_last_layer_steps", "freeze_last_layer_epochs", default=0)
+
+        freeze_ratio = float(self.config.get("freeze_last_layer_ratio", 0.01))
+        if self.total_steps <= 0 or freeze_ratio <= 0.0:
+            return 0
+        return max(1, min(self.total_steps, round(self.total_steps * freeze_ratio)))
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         param_groups = self.model.get_params_groups(
