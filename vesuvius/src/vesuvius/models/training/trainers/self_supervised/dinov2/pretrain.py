@@ -148,6 +148,9 @@ class DinoIBOTPretrainer:
         self.log_every = int(self.config.get("log_every", 20))
         self.val_every_n = int(self.config.get("val_every_n", 0))
         self.save_every_n = int(self.config.get("save_every_n", self.config.get("save_every", 0)))
+        self.monitor_batch_size = int(self.config.get("monitor_batch_size", 2))
+        self.monitor_pool_size = max(1, int(self.config.get("monitor_pool_size", 5000)))
+        self.monitor_seed = int(self.config.get("monitor_seed", 0))
         self.output_dir = Path(self.config.get("output_dir", "./dinov2_pretrain_runs"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.monitor_dir = self.output_dir / "monitor"
@@ -155,6 +158,10 @@ class DinoIBOTPretrainer:
         self._warned_missing_val_dataset = False
         self.resume = bool(self.config.get("resume", False))
         self.auto_resume = bool(self.config.get("auto_resume", self.resume or bool(self.config.get("resume_from"))))
+        self._monitor_dataset: SSLZarrDataset | None = None
+        self._monitor_collate_fn: Any | None = None
+        self._monitor_seed_pool = tuple(self.monitor_seed + offset for offset in range(self.monitor_pool_size))
+        self._monitor_selection_rng = random.Random(self.monitor_seed)
 
     def _resolve_step_count(self, steps_key: str, epochs_key: str, *, default: int) -> int:
         if steps_key in self.config:
@@ -263,24 +270,39 @@ class DinoIBOTPretrainer:
             collate_fn=collate_fn,
         )
 
-    def build_monitor_batch(self) -> dict[str, Any]:
-        dataset = SSLZarrDataset(self.config["dataset"], do_augmentations=True)
-        collate_fn = build_dino_ibot_collate_fn(
-            {
-                "global_crop_size": dataset.global_crop_size,
-                "patch_size": self.model_config.get("patch_size", (8, 8, 8)),
-                "mask_ratio_min_max": _as_float_pair(self.config.get("mask_ratio_min_max"), (0.1, 0.5)),
-                "mask_sample_probability": float(self.config.get("mask_sample_probability", 0.5)),
-                "dtype": torch.float32,
-            }
-        )
-        monitor_batch_size = int(self.config.get("monitor_batch_size", 2))
+    def _get_monitor_source(self) -> tuple[SSLZarrDataset, Any]:
+        if self._monitor_dataset is None or self._monitor_collate_fn is None:
+            monitor_dataset_config = self.config.get("monitor_dataset")
+            if monitor_dataset_config is None:
+                monitor_dataset_config = self.config.get("val_dataset", self.config["dataset"])
+            dataset = SSLZarrDataset(monitor_dataset_config, do_augmentations=True)
+            collate_fn = build_dino_ibot_collate_fn(
+                {
+                    "global_crop_size": dataset.global_crop_size,
+                    "patch_size": self.model_config.get("patch_size", (8, 8, 8)),
+                    "mask_ratio_min_max": _as_float_pair(self.config.get("mask_ratio_min_max"), (0.1, 0.5)),
+                    "mask_sample_probability": float(self.config.get("mask_sample_probability", 0.5)),
+                    "dtype": torch.float32,
+                }
+            )
+            self._monitor_dataset = dataset
+            self._monitor_collate_fn = collate_fn
+        return self._monitor_dataset, self._monitor_collate_fn
+
+    def build_monitor_batch(self, seed: int | None = None) -> dict[str, Any]:
+        dataset, collate_fn = self._get_monitor_source()
         python_state = random.getstate()
         numpy_state = np.random.get_state()
         torch_state = torch.get_rng_state()
         cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         try:
-            samples = [dataset[i] for i in range(monitor_batch_size)]
+            if seed is not None:
+                random.seed(seed)
+                np.random.seed(seed % (2**32))
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+            samples = [dataset[i] for i in range(self.monitor_batch_size)]
             return collate_fn(samples)
         finally:
             random.setstate(python_state)
@@ -288,6 +310,12 @@ class DinoIBOTPretrainer:
             torch.set_rng_state(torch_state)
             if cuda_state is not None:
                 torch.cuda.set_rng_state_all(cuda_state)
+
+    def _next_monitor_seed(self) -> int:
+        return self._monitor_seed_pool[self._monitor_selection_rng.randrange(len(self._monitor_seed_pool))]
+
+    def sample_monitor_batch(self) -> dict[str, Any]:
+        return self.build_monitor_batch(seed=self._next_monitor_seed())
 
     def _teacher_temp(self, step: int) -> float:
         return self.teacher_temp_schedule[step]
@@ -850,17 +878,28 @@ class DinoIBOTPretrainer:
             return array[0].numpy()
         raise ValueError(f"unexpected tensor shape for visualization: {tuple(array.shape)}")
 
-    def _patch_norm_slice(self, patch_tokens: torch.Tensor, sample_index: int, target_hw: tuple[int, int]) -> np.ndarray:
+    def _patch_pca_slice(self, patch_tokens: torch.Tensor, sample_index: int, target_hw: tuple[int, int]) -> np.ndarray:
         patch_size = self.model_config.get("patch_size", (8, 8, 8))
         global_crop = self.config["dataset"].get("global_crop_size", self.config["dataset"].get("crop_size"))
         if isinstance(global_crop, int):
             global_crop = (global_crop, global_crop, global_crop)
         feature_shape = tuple(int(size) // int(patch) for size, patch in zip(global_crop, patch_size))
-        feature_map = patch_tokens[sample_index].reshape(*feature_shape, patch_tokens.shape[-1]).norm(dim=-1)
+        feature_map = patch_tokens[sample_index].reshape(*feature_shape, patch_tokens.shape[-1])
         depth = feature_map.shape[0] // 2
-        heatmap = feature_map[depth][None, None].float()
-        resized = F.interpolate(heatmap, size=target_hw, mode="bilinear", align_corners=False)
-        return resized[0, 0].detach().cpu().numpy()
+        slice_features = feature_map[depth].float()
+        h, w, c = slice_features.shape
+        flat = slice_features.reshape(h * w, c)
+        flat = flat - flat.mean(dim=0)
+        _, _, V = torch.pca_lowrank(flat, q=3)
+        projected = (flat @ V[:, :3]).reshape(h, w, 3).detach().cpu().numpy()
+        result = np.stack([self._normalize_image(projected[..., i]) for i in range(3)], axis=-1)
+        resized = F.interpolate(
+            torch.from_numpy(result).permute(2, 0, 1).float()[None],
+            size=target_hw,
+            mode="bilinear",
+            align_corners=False,
+        )
+        return resized[0].permute(1, 2, 0).numpy().astype(np.uint8)
 
     def save_monitor_image(self, monitor_batch: Mapping[str, Any], step: int, metrics: Mapping[str, float]) -> Path:
         self.model.eval()
@@ -883,16 +922,13 @@ class DinoIBOTPretrainer:
             for view_index in range(n_global_views):
                 tensor_index = view_index * batch_size + sample_index
                 center_slice = self._center_slice(global_views[tensor_index])
-                heatmap = self._patch_norm_slice(
+                pca_rgb = self._patch_pca_slice(
                     student_outputs["patch_tokens"],
                     tensor_index,
                     target_hw=center_slice.shape,
                 )
                 input_rgb = np.stack([self._normalize_image(center_slice)] * 3, axis=-1)
-                heatmap_rgb = np.zeros((*heatmap.shape, 3), dtype=np.uint8)
-                heatmap_rgb[..., 0] = self._normalize_image(heatmap)
-                heatmap_rgb[..., 1] = self._normalize_image(center_slice)
-                panels.extend([input_rgb, heatmap_rgb])
+                panels.extend([input_rgb, pca_rgb])
             rows.append(np.concatenate(panels, axis=1))
 
         canvas = np.concatenate(rows, axis=0) if rows else np.zeros((256, 256, 3), dtype=np.uint8)
@@ -1016,7 +1052,6 @@ class DinoIBOTPretrainer:
         dataloader_iter: Iterator[Any] = iter(dataloader)
         val_dataloader = self.build_val_dataloader()
         val_dataloader_iter: Iterator[Any] | None = iter(val_dataloader) if val_dataloader is not None else None
-        monitor_batch = self.build_monitor_batch() if self.val_every_n else None
         with tqdm(total=self.max_iterations, initial=start_step, desc="training", unit="iter") as progress:
             for step in range(start_step, self.max_iterations):
                 try:
@@ -1050,8 +1085,7 @@ class DinoIBOTPretrainer:
                             val_batch = next(val_dataloader_iter)
                         val_metrics = self.validate(val_batch, step)
                         print(f"step={step} val_loss={val_metrics['loss']:.4f}")
-                    if monitor_batch is not None:
-                        self.save_monitor_image(monitor_batch, step, metrics)
+                    self.save_monitor_image(self.sample_monitor_batch(), step, metrics)
                 if self.save_every_n and step > 0 and step % self.save_every_n == 0:
                     self.save_checkpoint(step)
 

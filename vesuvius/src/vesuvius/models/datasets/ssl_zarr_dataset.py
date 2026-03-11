@@ -218,13 +218,14 @@ class SSLZarrDataset(Dataset):
 
     def __getitem__(self, idx):
         vol_weights = [vol.weight for vol in self.volumes]
+        nonzero_threshold = float(self.config.get("nonzero_threshold", 0.30))
 
         while True:
             vol_idx = np.random.choice(len(self.volumes), p=vol_weights)
             vol = self.volumes[vol_idx]
             d_zarr = open_zarr(vol.path, vol.scale, self.volume_auth)
             source_crop = self._read_source_crop_3d(d_zarr, vol.usable_bbox)
-            if np.any(source_crop != 0):
+            if source_crop.size > 0 and (np.count_nonzero(source_crop) / source_crop.size) >= nonzero_threshold:
                 break
 
         if self.single_crop_only:
