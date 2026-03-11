@@ -162,7 +162,8 @@ class DINOHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.mlp(x)
-        x = F.normalize(x, dim=-1, p=2)
+        eps = 1e-6 if x.dtype == torch.float16 else 1e-12
+        x = F.normalize(x, dim=-1, p=2, eps=eps)
         return self.last_layer(x)
 
 
