@@ -59,11 +59,10 @@ def collate_dino_ibot_batch(
 
     collated_masks = torch.stack(masks_list).flatten(1)
     mask_indices_list = collated_masks.flatten().nonzero().flatten()
-    masks_weight = (
-        (1.0 / collated_masks.sum(-1).clamp(min=1.0))
-        .unsqueeze(-1)
-        .expand_as(collated_masks)[collated_masks]
-    )
+    tokens_per_sample = collated_masks.shape[1]
+    inverse_mask_counts = 1.0 / collated_masks.sum(-1).clamp(min=1.0)
+    masked_sample_indices = torch.div(mask_indices_list, tokens_per_sample, rounding_mode="floor")
+    masks_weight = inverse_mask_counts.index_select(0, masked_sample_indices)
 
     return {
         "collated_global_crops": global_crops,
