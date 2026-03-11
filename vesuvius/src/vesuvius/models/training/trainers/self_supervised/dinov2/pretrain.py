@@ -64,9 +64,10 @@ class DinoIBOTPretrainer:
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self.device.type == "cuda")
 
         dino_out_dim = int(self.model_config.get("dino_out_dim", 65536))
-        ibot_out_dim = int(self.model_config.get("ibot_out_dim", dino_out_dim))
+        if "ibot_out_dim" in self.model_config and int(self.model_config["ibot_out_dim"]) != dino_out_dim:
+            raise ValueError("Shared DINO/iBOT head requires ibot_out_dim to match dino_out_dim.")
         self.dino_loss = DINOLoss(dino_out_dim).to(self.device)
-        self.ibot_patch_loss = iBOTPatchLoss(ibot_out_dim).to(self.device)
+        self.ibot_patch_loss = iBOTPatchLoss(dino_out_dim).to(self.device)
         self.koleo_loss = KoLeoLoss().to(self.device)
 
         self.dino_loss_weight = float(self.config.get("dino_loss_weight", 1.0))
@@ -279,19 +280,37 @@ class DinoIBOTPretrainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-            teacher_outputs = self.model._forward_branch(self.model.teacher, global_crops, masks=None)
-            teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(teacher_outputs["cls_projections"], teacher_temp)
-            teacher_patch = self.model.project_masked_patch_tokens(
+            teacher_outputs = self.model._forward_branch(
                 self.model.teacher,
+                global_crops,
+                masks=None,
+                project_cls_tokens=False,
+            )
+            teacher_cls_projections, teacher_patch = self.model.project_cls_and_masked_patch_tokens(
+                self.model.teacher,
+                teacher_outputs["cls_tokens"],
                 teacher_outputs["patch_tokens"],
                 mask_indices,
                 n_masked_patches=n_masked,
             )
+            teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(teacher_cls_projections, teacher_temp)
             teacher_patch_targets = self._center_teacher_patch(teacher_patch, teacher_temp)
 
         with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-            student_global = self.model._forward_branch(self.model.student, global_crops, masks=masks)
-            global_cls_0, global_cls_1 = student_global["cls_projections"].chunk(2)
+            student_global = self.model._forward_branch(
+                self.model.student,
+                global_crops,
+                masks=masks,
+                project_cls_tokens=False,
+            )
+            student_global_cls, student_patch = self.model.project_cls_and_masked_patch_tokens(
+                self.model.student,
+                student_global["cls_tokens"],
+                student_global["patch_tokens"],
+                mask_indices,
+                n_masked_patches=n_masked,
+            )
+            global_cls_0, global_cls_1 = student_global_cls.chunk(2)
 
             total_terms = 2 + (2 * n_local_views if n_local_views else 0)
             dino_global_loss = (
@@ -307,12 +326,6 @@ class DinoIBOTPretrainer:
                 dino_local_loss = global_crops.new_zeros(())
 
             if self.ibot_loss_weight > 0.0 and n_masked > 0:
-                student_patch = self.model.project_masked_patch_tokens(
-                    self.model.student,
-                    student_global["patch_tokens"],
-                    mask_indices,
-                    n_masked_patches=n_masked,
-                )
                 ibot_loss = self.ibot_patch_loss.forward_masked(
                     student_patch,
                     teacher_patch_targets,
@@ -455,17 +468,23 @@ class DinoIBOTPretrainer:
         n_masked = int(batch["n_masked_patches"].item())
 
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-            teacher_outputs = self.model._forward_branch(self.model.teacher, global_crops, masks=None)
-            teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
-                teacher_outputs["cls_projections"],
-                teacher_temp,
-                update_centers=False,
-            )
-            teacher_patch = self.model.project_masked_patch_tokens(
+            teacher_outputs = self.model._forward_branch(
                 self.model.teacher,
+                global_crops,
+                masks=None,
+                project_cls_tokens=False,
+            )
+            teacher_cls_projections, teacher_patch = self.model.project_cls_and_masked_patch_tokens(
+                self.model.teacher,
+                teacher_outputs["cls_tokens"],
                 teacher_outputs["patch_tokens"],
                 mask_indices,
                 n_masked_patches=n_masked,
+            )
+            teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
+                teacher_cls_projections,
+                teacher_temp,
+                update_centers=False,
             )
             teacher_patch_targets = self._center_teacher_patch(
                 teacher_patch,
@@ -473,8 +492,20 @@ class DinoIBOTPretrainer:
                 update_centers=False,
             )
 
-            student_global = self.model._forward_branch(self.model.student, global_crops, masks=masks)
-            global_cls_0, global_cls_1 = student_global["cls_projections"].chunk(2)
+            student_global = self.model._forward_branch(
+                self.model.student,
+                global_crops,
+                masks=masks,
+                project_cls_tokens=False,
+            )
+            student_global_cls, student_patch = self.model.project_cls_and_masked_patch_tokens(
+                self.model.student,
+                student_global["cls_tokens"],
+                student_global["patch_tokens"],
+                mask_indices,
+                n_masked_patches=n_masked,
+            )
+            global_cls_0, global_cls_1 = student_global_cls.chunk(2)
 
             total_terms = 2 + (2 * n_local_views if n_local_views else 0)
             dino_global_loss = (
@@ -490,12 +521,6 @@ class DinoIBOTPretrainer:
                 dino_local_loss = global_crops.new_zeros(())
 
             if self.ibot_loss_weight > 0.0 and n_masked > 0:
-                student_patch = self.model.project_masked_patch_tokens(
-                    self.model.student,
-                    student_global["patch_tokens"],
-                    mask_indices,
-                    n_masked_patches=n_masked,
-                )
                 ibot_loss = self.ibot_patch_loss.forward_masked(
                     student_patch,
                     teacher_patch_targets,

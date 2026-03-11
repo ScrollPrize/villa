@@ -116,7 +116,8 @@ class DinoVitStudentTeacher(nn.Module):
     def __init__(self, config: Mapping[str, Any]) -> None:
         super().__init__()
         self.config = dict(config)
-        self.ibot_separate_head = bool(self.config.get("ibot_separate_head", False))
+        if bool(self.config.get("ibot_separate_head", False)):
+            raise ValueError("Shared DINO/iBOT head is required; separate iBOT heads are not supported.")
         student_backbone = self._build_backbone(self.config)
         teacher_backbone = deepcopy(student_backbone)
 
@@ -128,9 +129,6 @@ class DinoVitStudentTeacher(nn.Module):
             "backbone": teacher_backbone,
             "dino_head": self._build_head("dino"),
         }
-        if self.ibot_separate_head:
-            student_modules["ibot_head"] = self._build_head("ibot", fallback_prefix="dino")
-            teacher_modules["ibot_head"] = self._build_head("ibot", fallback_prefix="dino")
 
         self.student = nn.ModuleDict(student_modules)
         self.teacher = nn.ModuleDict(teacher_modules)
@@ -255,12 +253,11 @@ class DinoVitStudentTeacher(nn.Module):
             masked_tokens = masked_tokens[:n_masked_patches]
         return masked_tokens
 
-    @staticmethod
-    def _patch_head(branch: nn.ModuleDict) -> nn.Module:
-        return branch.ibot_head if "ibot_head" in branch else branch.dino_head
+    def project_cls_tokens(self, branch: nn.ModuleDict, cls_tokens: torch.Tensor) -> torch.Tensor:
+        return self._apply_head(branch.dino_head, cls_tokens)
 
     def project_patch_tokens(self, branch: nn.ModuleDict, patch_tokens: torch.Tensor) -> torch.Tensor:
-        return self._apply_head(self._patch_head(branch), patch_tokens)
+        return self._apply_head(branch.dino_head, patch_tokens)
 
     def project_masked_patch_tokens(
         self,
@@ -276,10 +273,32 @@ class DinoVitStudentTeacher(nn.Module):
         )
         return self.project_patch_tokens(branch, masked_tokens)
 
+    def project_cls_and_masked_patch_tokens(
+        self,
+        branch: nn.ModuleDict,
+        cls_tokens: torch.Tensor,
+        patch_tokens: torch.Tensor,
+        mask_indices_list: torch.Tensor,
+        n_masked_patches: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        masked_tokens = self.select_masked_patch_tokens(
+            patch_tokens,
+            mask_indices_list=mask_indices_list,
+            n_masked_patches=n_masked_patches,
+        )
+        flat_cls_tokens = cls_tokens.reshape(-1, cls_tokens.shape[-1])
+        joint_tokens = torch.cat((flat_cls_tokens, masked_tokens), dim=0)
+        joint_projections = branch.dino_head(joint_tokens)
+        cls_count = flat_cls_tokens.shape[0]
+        cls_projections = joint_projections[:cls_count].reshape(*cls_tokens.shape[:-1], -1)
+        patch_projections = joint_projections[cls_count:]
+        return cls_projections, patch_projections
+
     def _format_branch_outputs(
         self,
         branch: nn.ModuleDict,
         backbone_outputs: Mapping[str, torch.Tensor],
+        project_cls_tokens: bool = True,
         project_patch_tokens: bool = False,
     ) -> dict[str, torch.Tensor]:
         cls_tokens = backbone_outputs["x_norm_clstoken"]
@@ -288,9 +307,10 @@ class DinoVitStudentTeacher(nn.Module):
 
         outputs: dict[str, torch.Tensor] = {
             "cls_tokens": cls_tokens,
-            "cls_projections": self._apply_head(branch.dino_head, cls_tokens),
             "patch_tokens": backbone_outputs["x_norm_patchtokens"],
         }
+        if project_cls_tokens:
+            outputs["cls_projections"] = self.project_cls_tokens(branch, cls_tokens)
         if project_patch_tokens:
             outputs["patch_projections"] = self.project_patch_tokens(branch, backbone_outputs["x_norm_patchtokens"])
         return outputs
@@ -300,15 +320,26 @@ class DinoVitStudentTeacher(nn.Module):
         branch: nn.ModuleDict,
         x: torch.Tensor,
         masks: Optional[torch.Tensor] = None,
+        project_cls_tokens: bool = True,
         project_patch_tokens: bool = False,
     ) -> Mapping[str, torch.Tensor] | list[dict[str, torch.Tensor]]:
         backbone_outputs = branch.backbone(x, masks=masks, is_training=self.training)
         if isinstance(backbone_outputs, list):
             return [
-                self._format_branch_outputs(branch, output, project_patch_tokens=project_patch_tokens)
+                self._format_branch_outputs(
+                    branch,
+                    output,
+                    project_cls_tokens=project_cls_tokens,
+                    project_patch_tokens=project_patch_tokens,
+                )
                 for output in backbone_outputs
             ]
-        return self._format_branch_outputs(branch, backbone_outputs, project_patch_tokens=project_patch_tokens)
+        return self._format_branch_outputs(
+            branch,
+            backbone_outputs,
+            project_cls_tokens=project_cls_tokens,
+            project_patch_tokens=project_patch_tokens,
+        )
 
     def forward(
         self,
@@ -326,6 +357,7 @@ class DinoVitStudentTeacher(nn.Module):
                 self.student,
                 student_input,
                 masks=student_masks,
+                project_cls_tokens=True,
                 project_patch_tokens=project_student_patch_tokens,
             )
         }
@@ -337,6 +369,7 @@ class DinoVitStudentTeacher(nn.Module):
                     self.teacher,
                     teacher_source,
                     masks=teacher_masks,
+                    project_cls_tokens=True,
                     project_patch_tokens=project_teacher_patch_tokens,
                 )
         return outputs
