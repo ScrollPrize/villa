@@ -7,7 +7,7 @@ import sys
 from typing import Any, Mapping
 
 if __package__ in {None, ""}:
-    sys.path.append(str(Path(__file__).resolve().parents[6]))
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
     from dinovol_2.pretrain import DinoIBOTPretrainer
 else:
     from .pretrain import DinoIBOTPretrainer

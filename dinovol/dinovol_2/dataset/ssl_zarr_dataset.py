@@ -49,22 +49,42 @@ def load_volume_auth(auth_json_path):
     return str(auth["username"]), str(auth["password"])
 
 
-def open_zarr(path, resolution, auth=None):
+def open_zarr(path, resolution, auth=None, s3_storage_options=None):
     path_str = str(path)
     user, password = load_volume_auth(auth)
+    if path_str.startswith("s3://"):
+        storage_options = {"anon": True}
+        if s3_storage_options is not None:
+            storage_options.update(dict(s3_storage_options))
+        try:
+            return zarr.open(
+                path_str,
+                path=str(resolution),
+                mode="r",
+                storage_options=storage_options,
+            )
+        except ImportError as exc:
+            raise ModuleNotFoundError(
+                "Opening s3:// zarr volumes requires the optional dependency `s3fs`."
+            ) from exc
     use_https_auth = path_str.startswith("https://") and bool(user) and bool(password)
     if use_https_auth:
         fs = fsspec.filesystem(
             "https",
+            asynchronous=True,
             client_kwargs={"auth": aiohttp.BasicAuth(user, password)},
         )
-        store = zarr.storage.FSStore(
-            path_str.rstrip("/"),
+        store = zarr.storage.FsspecStore(
             fs=fs,
-            mode="r",
-            check=False,
-            create=False,
-            exceptions=(KeyError, FileNotFoundError, PermissionError, OSError, aiohttp.ClientResponseError),
+            path=path_str.rstrip("/"),
+            read_only=True,
+            allowed_exceptions=(
+                KeyError,
+                FileNotFoundError,
+                PermissionError,
+                OSError,
+                aiohttp.ClientResponseError,
+            ),
         )
         return zarr.open(store, path=str(resolution), mode="r")
     return zarr.open(path_str, path=str(resolution), mode="r")
@@ -85,6 +105,7 @@ class SSLZarrDataset(Dataset):
         self.local_crop_scale = _as_float_pair(self.config.get("local_crop_scale"), (0.05, 0.32))
         self.num_local_crops = self.config.get("num_local_crops", 8)
         self.volume_auth = self.config["volume_auth"] if "volume_auth" in self.config else None
+        self.s3_storage_options = self.config.get("s3_storage_options")
         self.vol_trim_pct = self.config.get("vol_trim_pct", 0.60)
         self.normalizer = get_normalization(self.config.get("normalization_scheme", "robust"))
         
@@ -109,7 +130,7 @@ class SSLZarrDataset(Dataset):
         for dataset in self.config["datasets"]:
             volume_path = dataset["volume_path"]
             volume_scale = dataset["volume_scale"]
-            d_zarr = open_zarr(volume_path, volume_scale, self.volume_auth)
+            d_zarr = open_zarr(volume_path, volume_scale, self.volume_auth, self.s3_storage_options)
             z, y, x = d_zarr.shape
             k_z = max(1, round(z * self.vol_trim_pct))
             k_y = max(1, round(y * self.vol_trim_pct))
@@ -228,7 +249,7 @@ class SSLZarrDataset(Dataset):
         while True:
             vol_idx = np.random.choice(len(self.volumes), p=vol_weights)
             vol = self.volumes[vol_idx]
-            d_zarr = open_zarr(vol.path, vol.scale, self.volume_auth)
+            d_zarr = open_zarr(vol.path, vol.scale, self.volume_auth, self.s3_storage_options)
             source_crop = self._read_source_crop_3d(d_zarr, vol.usable_bbox)
             if source_crop.size > 0 and (np.count_nonzero(source_crop) / source_crop.size) >= nonzero_threshold:
                 break
