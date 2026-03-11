@@ -219,40 +219,26 @@ def _mesh_uvs(D: int, H: int, W: int) -> np.ndarray:
 # Volume slice helpers
 # ---------------------------------------------------------------------------
 
-def _sample_slice_texture(data: fit_data.FitData3D, plane: str,
-						  bbox_min: np.ndarray, bbox_max: np.ndarray,
-						  center: np.ndarray, channel: str,
-						  tex_res: int, device: torch.device) -> np.ndarray:
-	"""Sample a volume slice and return an RGB uint8 texture.
+def _slice_texture(data: fit_data.FitData3D, plane: str,
+				   channel: str) -> np.ndarray:
+	"""Read a volume slice directly at native voxel resolution.
 
 	plane: "xy", "xz", or "yz"
-	Returns (tex_res, tex_res, 3) uint8.
+	Returns (H, W, 3) uint8 at exact data resolution (no interpolation).
 	"""
-	u = np.linspace(0.0, 1.0, tex_res, dtype=np.float32)
-	v = np.linspace(0.0, 1.0, tex_res, dtype=np.float32)
-	uu, vv = np.meshgrid(u, v, indexing="xy")
-
-	pts = np.zeros((tex_res, tex_res, 3), dtype=np.float32)
+	vol = getattr(data, channel)  # (1, 1, Z, Y, X) uint8
+	arr = vol.squeeze().cpu().numpy()  # (Z, Y, X)
+	Z, Y, X = arr.shape
+	cz, cy, cx = Z // 2, Y // 2, X // 2
 	if plane == "xy":
-		pts[..., 0] = bbox_min[0] + uu * (bbox_max[0] - bbox_min[0])
-		pts[..., 1] = bbox_min[1] + vv * (bbox_max[1] - bbox_min[1])
-		pts[..., 2] = center[2]
+		slc = arr[cz, :, :]      # (Y, X)
 	elif plane == "xz":
-		pts[..., 0] = bbox_min[0] + uu * (bbox_max[0] - bbox_min[0])
-		pts[..., 1] = center[1]
-		pts[..., 2] = bbox_min[2] + vv * (bbox_max[2] - bbox_min[2])
+		slc = arr[:, cy, :]      # (Z, X)
 	elif plane == "yz":
-		pts[..., 0] = center[0]
-		pts[..., 1] = bbox_min[1] + uu * (bbox_max[1] - bbox_min[1])
-		pts[..., 2] = bbox_min[2] + vv * (bbox_max[2] - bbox_min[2])
-
-	# Shape for grid_sample_fullres: (1, tex_res, tex_res, 3)
-	pts_t = torch.from_numpy(pts).unsqueeze(0).to(device=device)
-	sampled = data.grid_sample_fullres(pts_t)
-	ch_t = getattr(sampled, channel)  # (1, 1, tex_res, tex_res)
-	ch_np = ch_t.squeeze().detach().cpu().numpy()  # (tex_res, tex_res)
-	# Grayscale to RGB
-	gray = (np.clip(ch_np, 0, 1) * 255).astype(np.uint8)
+		slc = arr[:, :, cx]      # (Z, Y)
+	else:
+		raise ValueError(f"unknown plane: {plane}")
+	gray = slc.astype(np.uint8)
 	return np.stack([gray, gray, gray], axis=-1)[::-1]
 
 
@@ -328,7 +314,8 @@ def export_vis_obj(
 
 	# Load data (auto-crop around mesh bbox)
 	print(f"[export_vis] loading data from {data_path}", flush=True)
-	data = fit_data.load_3d_for_model(path=data_path, device=dev, model=mdl)
+	data = fit_data.load_3d_for_model(path=data_path, device=dev, model=mdl,
+									cuda_gridsample=dev.type == "cuda")
 
 	# Forward pass
 	print("[export_vis] running forward pass", flush=True)
@@ -343,6 +330,16 @@ def export_vis_obj(
 	bbox_min = xyz_lr.reshape(-1, 3).min(axis=0)
 	bbox_max = xyz_lr.reshape(-1, 3).max(axis=0)
 	center = 0.5 * (bbox_min + bbox_max)
+
+	# Data extent in fullres coords (for slice textures)
+	Z, Y, X = data.size
+	data_min = np.array(data.origin_fullres, dtype=np.float32)
+	data_max = data_min + np.array([
+		(X - 1) * data.spacing[0],
+		(Y - 1) * data.spacing[1],
+		(Z - 1) * data.spacing[2],
+	], dtype=np.float32)
+	data_center = 0.5 * (data_min + data_max)
 
 	# ------ Mesh ------
 	if include_mesh:
@@ -384,20 +381,18 @@ def export_vis_obj(
 			print("[export_vis] no valid connections to write", flush=True)
 
 	# ------ Volume slices ------
-	tex_res = 512
 	for plane in slices:
 		for channel in channels:
 			name = f"slice_{plane}_{channel}"
 			print(f"[export_vis] writing {name}", flush=True)
-			# Texture
-			tex = _sample_slice_texture(data, plane, bbox_min, bbox_max,
-										center, channel, tex_res, dev)
+			# Texture (native voxel resolution, no scaling)
+			tex = _slice_texture(data, plane, channel)
 			png_name = f"{name}.png"
 			_write_png(out / png_name, tex)
 			# MTL
 			_write_mtl(out / f"{name}.mtl", name, png_name)
 			# OBJ quad
-			corners = _slice_corners(plane, bbox_min, bbox_max, center)
+			corners = _slice_corners(plane, data_min, data_max, data_center)
 			_write_obj_quad(out / f"{name}.obj", corners, name)
 
 	# ------ Loss maps ------
@@ -443,3 +438,34 @@ def export_vis_obj(
 			_write_obj_mesh(out / f"{obj_name}.obj", verts_flat, faces, uvs, obj_name)
 
 	print(f"[export_vis] done. Output: {output_dir}", flush=True)
+
+
+if __name__ == "__main__":
+	import argparse
+
+	parser = argparse.ArgumentParser(description="Export OBJ visualization of a fitted model")
+	parser.add_argument("--model", required=True, help="Path to model.pt checkpoint")
+	parser.add_argument("--input", required=True, help="Path to lasagna normals zarr")
+	parser.add_argument("--output-dir", required=True, help="Output directory for OBJ/MTL/PNG files")
+	parser.add_argument("--slices", nargs="*", default=["xy", "xz", "yz"],
+						choices=["xy", "xz", "yz"], help="Volume slice planes (default: xy xz yz)")
+	parser.add_argument("--channels", nargs="*", default=["cos"],
+						help="Volume channels to slice (default: cos)")
+	parser.add_argument("--losses", nargs="*", default=["normal", "step"],
+						help="Loss maps to export (default: normal step)")
+	parser.add_argument("--no-mesh", action="store_true", help="Skip mesh export")
+	parser.add_argument("--no-connections", action="store_true", help="Skip connection lines")
+	parser.add_argument("--device", default="cpu", help="Torch device (default: cpu)")
+	args = parser.parse_args()
+
+	export_vis_obj(
+		model_path=args.model,
+		data_path=args.input,
+		output_dir=args.output_dir,
+		slices=args.slices,
+		channels=args.channels,
+		losses=args.losses,
+		include_mesh=not args.no_mesh,
+		include_connections=not args.no_connections,
+		device=args.device,
+	)

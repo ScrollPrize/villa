@@ -351,9 +351,12 @@ def load_3d(
 	if not is_omezarr:
 		raise ValueError(f"load_3d requires zarr input, got: {s}")
 
-	zsrc = zarr.open(s, mode="r")
+	try:
+		zsrc = zarr.open(s, mode="r")
+	except Exception as e:
+		raise ValueError(f"cannot open zarr at {p.resolve()}: {e}") from e
 	if not isinstance(zsrc, zarr.Array):
-		raise ValueError(f"expected zarr.Array, got {type(zsrc)}")
+		raise ValueError(f"expected zarr.Array at {p.resolve()}, got {type(zsrc)}")
 	if int(len(zsrc.shape)) != 4:
 		raise ValueError(f"expected 4D CZYX zarr, got shape={zsrc.shape}")
 
