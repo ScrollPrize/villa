@@ -30,6 +30,12 @@ def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, flo
         return default
     return float(value[0]), float(value[1])
 
+def _config_get(config: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        if key in config:
+            return config[key]
+    return default
+
 def dino_loss_term_count(n_local_views: int, n_global_views: int = 2) -> int:
     if n_local_views < 0:
         raise ValueError(f"n_local_views must be non-negative, got {n_local_views}")
@@ -91,17 +97,20 @@ class DinoIBOTPretrainer:
         self.local_rank = int(distributed_config["local_rank"])
         self.world_size = int(distributed_config["world_size"])
 
-        configured_device = self.config.get("device")
-        if torch.cuda.is_available():
-            if self.is_distributed:
-                torch.cuda.set_device(self.local_rank)
-                self.device = torch.device("cuda", self.local_rank)
-            else:
-                self.device = torch.device(configured_device or "cuda")
-                if self.device.type == "cuda" and self.device.index is not None:
-                    torch.cuda.set_device(self.device.index)
+        configured_device_name = self.config.get("device")
+        configured_device = torch.device(configured_device_name) if configured_device_name is not None else None
+        prefers_cuda = configured_device is None or configured_device.type == "cuda"
+        if self.is_distributed and prefers_cuda and torch.cuda.is_available():
+            torch.cuda.set_device(self.local_rank)
+            self.device = torch.device("cuda", self.local_rank)
+        elif configured_device is not None:
+            self.device = configured_device
+            if self.device.type == "cuda":
+                torch.cuda.set_device(0 if self.device.index is None else self.device.index)
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
         else:
-            self.device = torch.device(configured_device or "cpu")
+            self.device = torch.device("cpu")
 
         if self.is_distributed:
             if self.world_size < 2 and not dist.is_initialized():
@@ -191,13 +200,17 @@ class DinoIBOTPretrainer:
         self.log_every = int(self.config.get("log_every", 20))
         self.val_every_n = int(self.config.get("val_every_n", 0))
         self.save_every_n = int(self.config.get("save_every_n", self.config.get("save_every", 0)))
-        self.monitor_batch_size = int(self.config.get("monitor_batch_size", 2))
+        self.monitor_batch_size = max(5, int(self.config.get("monitor_batch_size", 5)))
         self.monitor_pool_size = max(1, int(self.config.get("monitor_pool_size", 5000)))
         self.monitor_seed = int(self.config.get("monitor_seed", 0))
         self.output_dir = Path(self.config.get("output_dir", "./dinov2_pretrain_runs"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.monitor_dir = self.output_dir / "monitor"
         self.monitor_dir.mkdir(parents=True, exist_ok=True)
+        self.wandb_project = _config_get(self.config, "wandb-project", "wandb_project")
+        self.wandb_entity = _config_get(self.config, "wandb-entity", "wandb_entity")
+        self.wandb_run_name = _config_get(self.config, "wandb-run-name", "wandb_run_name")
+        self._wandb: Any | None = None
         self._warned_missing_val_dataset = False
         self.resume = bool(self.config.get("resume", False))
         self.auto_resume = bool(self.config.get("auto_resume", self.resume or bool(self.config.get("resume_from"))))
@@ -207,6 +220,7 @@ class DinoIBOTPretrainer:
         self._monitor_selection_rng = random.Random(self.monitor_seed)
         self._train_sampler_epoch = 0
         self._val_sampler_epoch = 0
+        self._initialize_wandb()
 
     @property
     def is_main_process(self) -> bool:
@@ -357,6 +371,56 @@ class DinoIBOTPretrainer:
         values /= self.world_size
         return {key: float(values[index].item()) for index, key in enumerate(keys)}
 
+    def _initialize_wandb(self) -> None:
+        if not self.is_main_process or not self.wandb_project:
+            return
+        try:
+            import wandb
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "wandb logging requested via config but wandb is not installed. "
+                "Install the `vesuvius[models]` extra or `wandb[media]`."
+            ) from exc
+
+        init_kwargs: dict[str, Any] = {
+            "project": self.wandb_project,
+            "entity": self.wandb_entity,
+            "config": self.config,
+            "dir": str(self.output_dir),
+        }
+        if self.wandb_run_name:
+            init_kwargs["name"] = self.wandb_run_name
+        wandb.init(**init_kwargs)
+        self._wandb = wandb
+
+    def _wandb_enabled(self) -> bool:
+        return self._wandb is not None and getattr(self._wandb, "run", None) is not None
+
+    def _log_wandb_metrics(
+        self,
+        prefix: str,
+        metrics: Mapping[str, Any],
+        *,
+        step: int,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not self._wandb_enabled():
+            return
+
+        payload: dict[str, Any] = {}
+        for key, value in metrics.items():
+            if value is None:
+                continue
+            payload[f"{prefix}/{key}"] = float(value) if isinstance(value, (int, float, np.number)) else value
+        if extra:
+            payload.update(extra)
+        if payload:
+            self._wandb.log(payload, step=step)
+
+    def _finish_wandb(self) -> None:
+        if self._wandb_enabled():
+            self._wandb.finish()
+
     def _get_monitor_source(self) -> tuple[SSLZarrDataset, Any]:
         if self._monitor_dataset is None or self._monitor_collate_fn is None:
             monitor_dataset_config = self.config.get("monitor_dataset")
@@ -389,7 +453,8 @@ class DinoIBOTPretrainer:
                 torch.manual_seed(seed)
                 if torch.cuda.is_available():
                     torch.cuda.manual_seed_all(seed)
-            samples = [dataset[i] for i in range(self.monitor_batch_size)]
+            sample_count = min(len(dataset), self.monitor_batch_size)
+            samples = [dataset[i] for i in range(sample_count)]
             return collate_fn(samples)
         finally:
             random.setstate(python_state)
@@ -1014,7 +1079,8 @@ class DinoIBOTPretrainer:
         batch_size = int(monitor_batch["batch_size"])
 
         rows: list[np.ndarray] = []
-        for sample_index in range(min(batch_size, 2)):
+        sample_count = min(batch_size, self.monitor_batch_size)
+        for sample_index in range(sample_count):
             panels: list[np.ndarray] = []
             for view_index in range(n_global_views):
                 tensor_index = view_index * batch_size + sample_index
@@ -1030,7 +1096,7 @@ class DinoIBOTPretrainer:
 
         canvas = np.concatenate(rows, axis=0) if rows else np.zeros((256, 256, 3), dtype=np.uint8)
         image_path = self.monitor_dir / f"monitor_step_{step:06d}.jpg"
-        Image.fromarray(canvas, mode="RGB").save(image_path, quality=90)
+        Image.fromarray(canvas).save(image_path, quality=90)
         print(
             f"step={step} monitor_image={image_path.name} "
             f"loss={metrics['loss']:.4f} glob={metrics['dino_global_loss']:.4f} "
@@ -1161,6 +1227,8 @@ class DinoIBOTPretrainer:
                     )
                     progress.update(1)
 
+                if self.is_main_process:
+                    self._log_wandb_metrics("train", metrics, step=step)
                 if self.is_main_process and step % self.log_every == 0:
                     print(f"step={step} loss={metrics['loss']:.4f} lr={metrics['lr']:.2e}")
                 if self.val_every_n and step > 0 and step % self.val_every_n == 0:
@@ -1179,8 +1247,13 @@ class DinoIBOTPretrainer:
                         val_metrics = self._average_metrics(self.validate(val_batch, step))
                         if self.is_main_process:
                             print(f"step={step} val_loss={val_metrics['loss']:.4f}")
-                    if self.is_main_process:
-                        self.save_monitor_image(self.sample_monitor_batch(), step, metrics)
+                            image_path = self.save_monitor_image(val_batch, step, val_metrics)
+                            self._log_wandb_metrics(
+                                "val",
+                                val_metrics,
+                                step=step,
+                                extra={"val/monitor_image": self._wandb.Image(str(image_path))} if self._wandb_enabled() else None,
+                            )
                 if self.is_main_process and self.save_every_n and step > 0 and step % self.save_every_n == 0:
                     self.save_checkpoint(step)
         finally:
@@ -1213,6 +1286,7 @@ def main() -> None:
     try:
         trainer.fit()
     finally:
+        trainer._finish_wandb()
         if trainer.is_distributed and dist.is_initialized():
             dist.destroy_process_group()
 
