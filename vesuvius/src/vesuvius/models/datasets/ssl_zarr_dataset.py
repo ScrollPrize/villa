@@ -81,7 +81,7 @@ class SSLZarrDataset(Dataset):
         self.source_crop_size = _as_3tuple(self.config.get("source_crop_size", self.global_crop_size))
         self.global_crop_scale = _as_float_pair(self.config.get("global_crop_scale"), (0.32, 1.0))
         self.local_crop_scale = _as_float_pair(self.config.get("local_crop_scale"), (0.05, 0.32))
-        self.num_local_crops = self.config.get("num_local_crops", 2)
+        self.num_local_crops = self.config.get("num_local_crops", 8)
         self.volume_auth = self.config["volume_auth"] if "volume_auth" in self.config else None
         self.vol_trim_pct = self.config.get("vol_trim_pct", 0.60)
         self.normalizer = get_normalization(self.config.get("normalization_scheme", "robust"))
@@ -89,13 +89,15 @@ class SSLZarrDataset(Dataset):
         if not self.single_crop_only:
             if self.num_global_crops != 2:
                 raise ValueError(f"SSLZarrDataset currently expects exactly 2 global crops, got {self.num_global_crops}")
-            if self.local_crop_size is not None and self.num_local_crops != 2:
-                raise ValueError(f"SSLZarrDataset currently expects exactly 2 local crops, got {self.num_local_crops}")
+            if self.local_crop_size is not None and self.num_local_crops < 0:
+                raise ValueError(f"SSLZarrDataset expects a non-negative number of local crops, got {self.num_local_crops}")
 
-        self.global1_transforms = create_training_transforms(self.global_crop_size)
-        self.global2_transforms = create_training_transforms(self.global_crop_size)
-        self.local1_transforms = create_training_transforms(self.local_crop_size) if self.local_crop_size is not None else None
-        self.local2_transforms = create_training_transforms(self.local_crop_size) if self.local_crop_size is not None else None
+        self.global_transforms = [create_training_transforms(self.global_crop_size) for _ in range(self.num_global_crops)]
+        self.local_transforms = (
+            [create_training_transforms(self.local_crop_size) for _ in range(self.num_local_crops)]
+            if self.local_crop_size is not None
+            else []
+        )
 
         self.volumes = []
 
@@ -212,9 +214,7 @@ class SSLZarrDataset(Dataset):
         return self._finalize_crop(crop, target_size)
     
     def __len__(self):
-        return self.total_valid_crop_starts  # Approximate epoch length for random sampling.
-
-    
+        return self.total_valid_crop_starts
 
     def __getitem__(self, idx):
         vol_weights = [vol.weight for vol in self.volumes]
@@ -230,7 +230,7 @@ class SSLZarrDataset(Dataset):
                 self.global_crop_size,
             )
             if self.do_augmentations:
-                crop = self.global1_transforms(image=crop)["image"]
+                crop = self.global_transforms[0](image=crop)["image"]
             return crop
 
         source_crop = self._read_source_crop_3d(
@@ -238,37 +238,35 @@ class SSLZarrDataset(Dataset):
             vol.usable_bbox,
         )
 
-        global_view_1 = self._random_resized_crop_3d_from_array(
-            source_crop,
-            self.global_crop_scale,
-            self.global_crop_size,
-        )
-        global_view_2 = self._random_resized_crop_3d_from_array(
-            source_crop,
-            self.global_crop_scale,
-            self.global_crop_size,
-        )
+        global_views = [
+            self._random_resized_crop_3d_from_array(
+                source_crop,
+                self.global_crop_scale,
+                self.global_crop_size,
+            )
+            for _ in range(self.num_global_crops)
+        ]
         if self.do_augmentations:
-            global_view_1 = self.global1_transforms(image=global_view_1)["image"]
-            global_view_2 = self.global2_transforms(image=global_view_2)["image"]
-        global_views = [global_view_1, global_view_2]
+            global_views = [
+                transform(image=view)["image"]
+                for transform, view in zip(self.global_transforms, global_views)
+            ]
 
         local_views = []
         if self.local_crop_size is not None:
-            local_view_1 = self._random_resized_crop_3d_from_array(
-                source_crop,
-                self.local_crop_scale,
-                self.local_crop_size,
-            )
-            local_view_2 = self._random_resized_crop_3d_from_array(
-                source_crop,
-                self.local_crop_scale,
-                self.local_crop_size,
-            )
+            local_views = [
+                self._random_resized_crop_3d_from_array(
+                    source_crop,
+                    self.local_crop_scale,
+                    self.local_crop_size,
+                )
+                for _ in range(self.num_local_crops)
+            ]
             if self.do_augmentations:
-                local_view_1 = self.local1_transforms(image=local_view_1)["image"]
-                local_view_2 = self.local2_transforms(image=local_view_2)["image"]
-            local_views = [local_view_1, local_view_2]
+                local_views = [
+                    transform(image=view)["image"]
+                    for transform, view in zip(self.local_transforms, local_views)
+                ]
 
         return {
             "global_views": global_views,
