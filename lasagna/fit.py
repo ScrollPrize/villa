@@ -60,6 +60,24 @@ def _arc_params_from_seed(
 	}
 
 
+def _straight_params_from_seed(
+	seed: tuple[int, int, int],
+	model_w: int,
+) -> dict:
+	"""Derive straight params from seed point and model width.
+
+	The line is centered at the seed XY, oriented at angle 0 (along X),
+	with half-width = model_w / 2. The optimizer will adjust angle.
+	"""
+	return {
+		"straight_cx": float(seed[0]),
+		"straight_cy": float(seed[1]),
+		"straight_angle": 0.0,
+		"straight_half_w": float(model_w) / 2.0,
+		"z_center": float(seed[2]),
+	}
+
+
 def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D | None:
 	"""Parse a VC3D corr_points collections dict into CorrPoints3D."""
 	cols = obj.get("collections", {})
@@ -165,14 +183,21 @@ def main(argv: list[str] | None = None) -> int:
 		volume_extent_fullres = prep_params.get("volume_extent_fullres")
 		print(f"[fit] zarr scaledown={scaledown} volume_extent={volume_extent_fullres}", flush=True)
 
-	# --- Arc init from seed (new model only) ---
+	# --- Init from seed (new model only) ---
 	is_new_model = model_cfg.model_input is None
-	if is_new_model and data_cfg.seed is not None and data_cfg.model_w is not None and volume_extent_fullres is not None:
-		arc = _arc_params_from_seed(data_cfg.seed, data_cfg.model_w, volume_extent_fullres)
-		model_cfg = dataclasses.replace(model_cfg, **arc)
-		print(f"[fit] arc from seed: cx={arc['arc_cx']:.1f} cy={arc['arc_cy']:.1f} "
-			  f"r={arc['arc_radius']:.1f} a0={arc['arc_angle0']:.3f} a1={arc['arc_angle1']:.3f} "
-			  f"z={arc['z_center']:.1f}", flush=True)
+	if is_new_model and data_cfg.seed is not None and data_cfg.model_w is not None:
+		if model_cfg.init_mode == "straight":
+			sp = _straight_params_from_seed(data_cfg.seed, data_cfg.model_w)
+			model_cfg = dataclasses.replace(model_cfg, **sp)
+			print(f"[fit] straight from seed: cx={sp['straight_cx']:.1f} cy={sp['straight_cy']:.1f} "
+				  f"angle={sp['straight_angle']:.3f} half_w={sp['straight_half_w']:.1f} "
+				  f"z={sp['z_center']:.1f}", flush=True)
+		elif volume_extent_fullres is not None:
+			arc = _arc_params_from_seed(data_cfg.seed, data_cfg.model_w, volume_extent_fullres)
+			model_cfg = dataclasses.replace(model_cfg, **arc)
+			print(f"[fit] arc from seed: cx={arc['arc_cx']:.1f} cy={arc['arc_cy']:.1f} "
+				  f"r={arc['arc_radius']:.1f} a0={arc['arc_angle0']:.3f} a1={arc['arc_angle1']:.3f} "
+				  f"z={arc['z_center']:.1f}", flush=True)
 
 	# --- Size mesh from model_w, model_h, windings (new model only) ---
 	if is_new_model and data_cfg.model_w is not None and data_cfg.model_h is not None and data_cfg.windings is not None:
@@ -202,6 +227,11 @@ def main(argv: list[str] | None = None) -> int:
 			arc_radius=model_cfg.arc_radius,
 			arc_angle0=model_cfg.arc_angle0,
 			arc_angle1=model_cfg.arc_angle1,
+			straight_cx=model_cfg.straight_cx,
+			straight_cy=model_cfg.straight_cy,
+			straight_angle=model_cfg.straight_angle,
+			straight_half_w=model_cfg.straight_half_w,
+			init_mode=model_cfg.init_mode,
 			volume_extent=None,
 			pyramid_d=model_cfg.pyramid_d,
 		)
@@ -266,6 +296,8 @@ def main(argv: list[str] | None = None) -> int:
 	def _save_model(path: str) -> None:
 		if mdl.arc_enabled:
 			mdl.bake_arc_into_mesh()
+		if mdl.straight_enabled:
+			mdl.bake_straight_into_mesh()
 		st = dict(mdl.state_dict())
 		# Store flat mesh instead of pyramid levels
 		ms_keys = [k for k in st if k.startswith("mesh_ms.")]

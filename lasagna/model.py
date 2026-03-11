@@ -60,6 +60,11 @@ class Model3D(nn.Module):
 		arc_radius: float = 1000.0,
 		arc_angle0: float = -0.5,
 		arc_angle1: float = 0.5,
+		straight_cx: float = 0.0,
+		straight_cy: float = 0.0,
+		straight_angle: float = 0.0,
+		straight_half_w: float = 100.0,
+		init_mode: str = "arc",
 		volume_extent: tuple[float, float, float, float, float, float] | None = None,
 		pyramid_d: bool = True,
 	) -> None:
@@ -68,7 +73,9 @@ class Model3D(nn.Module):
 		self.mesh_h = max(2, int(mesh_h))
 		self.mesh_w = max(2, int(mesh_w))
 		self.z_center = float(z_center)
-		self.arc_enabled = True
+		self.init_mode = str(init_mode)  # "arc" or "straight"
+		self.arc_enabled = self.init_mode == "arc"
+		self.straight_enabled = self.init_mode == "straight"
 		self.pyramid_d = bool(pyramid_d)
 
 		self.params = ModelParams3D(
@@ -88,6 +95,12 @@ class Model3D(nn.Module):
 		self.arc_radius = nn.Parameter(torch.tensor(float(arc_radius), device=device, dtype=torch.float32))
 		self.arc_angle0 = nn.Parameter(torch.tensor(float(arc_angle0), device=device, dtype=torch.float32))
 		self.arc_angle1 = nn.Parameter(torch.tensor(float(arc_angle1), device=device, dtype=torch.float32))
+
+		# Straight parameters (fullres coordinates)
+		self.straight_cx = nn.Parameter(torch.tensor(float(straight_cx), device=device, dtype=torch.float32))
+		self.straight_cy = nn.Parameter(torch.tensor(float(straight_cy), device=device, dtype=torch.float32))
+		self.straight_angle = nn.Parameter(torch.tensor(float(straight_angle), device=device, dtype=torch.float32))
+		self.straight_half_w = nn.Parameter(torch.tensor(float(straight_half_w), device=device, dtype=torch.float32))
 
 		# Residual mesh pyramid: (3, D, H, W) per scale, 5 levels
 		n_scales = 5
@@ -202,6 +215,49 @@ class Model3D(nn.Module):
 
 		return torch.stack([x, y, z_grid], dim=0)  # (3, D, H, W)
 
+	# --- Straight base positions ---
+
+	def _straight_base_positions(self) -> torch.Tensor:
+		"""Compute (3, D, H, W) base positions from straight params. All fullres coords.
+
+		Width axis maps to positions along a line in XY defined by
+		(straight_cx, straight_cy) + t * (cos(angle), sin(angle)).
+		Depth axis maps to perpendicular offsets (windings).
+		"""
+		device = self.straight_cx.device
+		D = self.depth
+		H = self.mesh_h
+		W = self.mesh_w
+
+		# t: position along line direction (width axis)
+		t = torch.linspace(
+			-float(self.straight_half_w.detach()),
+			float(self.straight_half_w.detach()),
+			W, device=device, dtype=torch.float32,
+		)
+
+		# Line direction and perpendicular
+		cos_a = torch.cos(self.straight_angle)
+		sin_a = torch.sin(self.straight_angle)
+
+		# Depth offsets perpendicular to line (winding layers)
+		d_offsets = torch.arange(D, device=device, dtype=torch.float32) - (D - 1) / 2.0
+		perp = d_offsets * float(self.params.winding_step)  # (D,)
+
+		# Height: mesh along z axis
+		h_extent = float(self.params.mesh_step) * (H - 1)
+		z = self.z_center + torch.linspace(-h_extent / 2.0, h_extent / 2.0, H, device=device, dtype=torch.float32)
+
+		# x = cx + t * cos(a) + perp * (-sin(a))
+		# y = cy + t * sin(a) + perp * cos(a)
+		x = self.straight_cx + t.view(1, 1, W) * cos_a + perp.view(D, 1, 1) * (-sin_a)
+		y = self.straight_cy + t.view(1, 1, W) * sin_a + perp.view(D, 1, 1) * cos_a
+		x = x.expand(D, H, W)
+		y = y.expand(D, H, W)
+		z_grid = z.view(1, H, 1).expand(D, H, W)
+
+		return torch.stack([x, y, z_grid], dim=0)  # (3, D, H, W)
+
 	# --- Mesh access ---
 
 	def mesh_coarse(self) -> torch.Tensor:
@@ -213,6 +269,9 @@ class Model3D(nn.Module):
 		residuals = self.mesh_coarse()  # (3, D, H, W)
 		if self.arc_enabled:
 			base = self._arc_base_positions()
+			xyz = base + residuals
+		elif self.straight_enabled:
+			base = self._straight_base_positions()
 			xyz = base + residuals
 		else:
 			xyz = residuals
@@ -531,6 +590,11 @@ class Model3D(nn.Module):
 			out["arc_radius"] = [self.arc_radius]
 			out["arc_angle0"] = [self.arc_angle0]
 			out["arc_angle1"] = [self.arc_angle1]
+		if self.straight_enabled:
+			out["straight_cx"] = [self.straight_cx]
+			out["straight_cy"] = [self.straight_cy]
+			out["straight_angle"] = [self.straight_angle]
+			out["straight_half_w"] = [self.straight_half_w]
 		return out
 
 	def bake_arc_into_mesh(self) -> None:
@@ -539,6 +603,13 @@ class Model3D(nn.Module):
 			final = self._arc_base_positions() + self.mesh_coarse()
 			self.mesh_ms = self._construct_pyramid_from_flat_3d(final, len(self.mesh_ms), pyramid_d=self.pyramid_d)
 			self.arc_enabled = False
+
+	def bake_straight_into_mesh(self) -> None:
+		"""Absorb straight transform into mesh_ms, disable straight."""
+		with torch.no_grad():
+			final = self._straight_base_positions() + self.mesh_coarse()
+			self.mesh_ms = self._construct_pyramid_from_flat_3d(final, len(self.mesh_ms), pyramid_d=self.pyramid_d)
+			self.straight_enabled = False
 
 	def load_state_dict_compat(self, state_dict: dict, *, strict: bool = False) -> tuple[list[str], list[str]]:
 		st = dict(state_dict)

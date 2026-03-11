@@ -93,8 +93,9 @@ def _parse_opt_settings(
 	if not isinstance(params, list):
 		params = []
 	params = [str(p) for p in params]
-	valid = {"mesh_ms", "amp", "bias",
-			 "arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1"}
+	valid = {"mesh_ms", "conn_offset_ms", "amp", "bias",
+			 "arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1",
+			 "straight_cx", "straight_cy", "straight_angle", "straight_half_w"}
 	bad_params = sorted(set(params) - valid)
 	if bad_params:
 		raise ValueError(f"stages_json: stage '{stage_name}' opt.params: unknown name(s): {bad_params}")
@@ -255,11 +256,15 @@ def optimize(
 		if opt_cfg.steps <= 0:
 			return data
 
-		# If arc params not in optimized set, bake arc into mesh
+		# If arc/straight params not in optimized set, bake into mesh
 		arc_params_set = {"arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1"}
 		if not arc_params_set.intersection(opt_cfg.params):
 			if hasattr(model, "arc_enabled") and model.arc_enabled:
 				model.bake_arc_into_mesh()
+		straight_params_set = {"straight_cx", "straight_cy", "straight_angle", "straight_half_w"}
+		if not straight_params_set.intersection(opt_cfg.params):
+			if hasattr(model, "straight_enabled") and model.straight_enabled:
+				model.bake_straight_into_mesh()
 
 		# If min_scaledown > 0, reconstruct pyramid and zero fine levels
 		if "mesh_ms" in opt_cfg.params and opt_cfg.min_scaledown > 0:

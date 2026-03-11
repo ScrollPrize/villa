@@ -72,6 +72,9 @@ public:
 
         cv::Point start = (clamped_rect.tl() - bounds_.tl()) / cell_size_;
         cv::Point end = (clamped_rect.br() - bounds_.tl()) / cell_size_;
+        // Clamp to valid grid range — br() is exclusive so end can overshoot
+        end.x = std::min(end.x, grid_size_.width - 1);
+        end.y = std::min(end.y, grid_size_.height - 1);
 
         if (read_only_) {
             std::unordered_set<size_t> offsets;
@@ -534,27 +537,48 @@ private:
             }
         } else { // Version 3
             const char* data_start = static_cast<const char*>(mmapped_data_->data);
+            const char* data_end = data_start + mmapped_data_->size;
+            const uint32_t* header_ptr = reinterpret_cast<const uint32_t*>(data_start);
+            uint32_t num_buckets = ntohl(header_ptr[7]);
+
+            if (static_cast<uint32_t>(index + 1) > num_buckets) {
+                throw std::runtime_error("GridStore V3: bucket index " + std::to_string(index) +
+                    " out of range (num_buckets=" + std::to_string(num_buckets) + ")");
+            }
+
+            // Validate bucket_indices array fits in mmap
+            size_t bucket_indices_size = (static_cast<size_t>(num_buckets) + 1) * sizeof(uint32_t);
+            const char* bucket_indices_end = data_start + buckets_offset_in_file_ + bucket_indices_size;
+            if (bucket_indices_end > data_end) {
+                throw std::runtime_error("GridStore V3: bucket indices array extends past end of file (buckets_offset=" +
+                    std::to_string(buckets_offset_in_file_) + " array_size=" + std::to_string(bucket_indices_size) +
+                    " file_size=" + std::to_string(mmapped_data_->size) + ")");
+            }
+
             const uint32_t* bucket_indices = reinterpret_cast<const uint32_t*>(data_start + buckets_offset_in_file_);
-            
             uint32_t start_idx = ntohl(bucket_indices[index]);
             uint32_t end_idx = ntohl(bucket_indices[index + 1]);
             uint32_t count = end_idx - start_idx;
 
             if (count > 0) {
-                const uint32_t* header_ptr = reinterpret_cast<const uint32_t*>(data_start);
-                uint32_t num_buckets = ntohl(header_ptr[7]);
-                // In V3, header[8] is the total number of paths in the storage, not the number of paths in all buckets combined.
-                // The total number of path offsets in the flat list is given by the last element of the bucket_indices array.
-                const uint32_t* bucket_indices = reinterpret_cast<const uint32_t*>(data_start + buckets_offset_in_file_);
                 uint32_t total_path_indices = ntohl(bucket_indices[num_buckets]);
 
                 if (start_idx + count > total_path_indices) {
-                    throw std::runtime_error("Bucket data is out of bounds of the flat path offset list.");
+                    throw std::runtime_error("GridStore V3: bucket data out of bounds of flat path offset list "
+                        "(start=" + std::to_string(start_idx) + " count=" + std::to_string(count) +
+                        " total=" + std::to_string(total_path_indices) + ")");
                 }
 
-                size_t bucket_indices_size = (num_buckets + 1) * sizeof(uint32_t);
-                const uint32_t* path_offsets_flat = reinterpret_cast<const uint32_t*>(data_start + buckets_offset_in_file_ + bucket_indices_size);
+                // Validate path_offsets_flat access fits in mmap
+                const char* path_offsets_start = bucket_indices_end;  // flat list follows bucket indices
+                const char* path_access_end = path_offsets_start + (static_cast<size_t>(start_idx) + count) * sizeof(uint32_t);
+                if (path_access_end > data_end) {
+                    throw std::runtime_error("GridStore V3: path offsets access extends past end of file "
+                        "(access_end=" + std::to_string(path_access_end - data_start) +
+                        " file_size=" + std::to_string(mmapped_data_->size) + ")");
+                }
 
+                const uint32_t* path_offsets_flat = reinterpret_cast<const uint32_t*>(path_offsets_start);
                 bucket_ptr->reserve(count);
                 for (uint32_t i = 0; i < count; ++i) {
                     bucket_ptr->push_back(ntohl(path_offsets_flat[start_idx + i]));

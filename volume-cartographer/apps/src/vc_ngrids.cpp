@@ -50,7 +50,6 @@ static void print_usage() {
         << "      --vis-normals PATH  Write fitted normals as PLY line segments\n\n"
         << "      --output-zarr PATH  Write fitted normals to a zarr directory (direction-field encoding)\n"
         << "      --step N            Sample step for --fit-normals (default: 16)\n"
-        << "      --lasagna-format    Additionally write a lasagna-format (C,Z,Y,X) zarr (requires --output-zarr)\n\n"
         << "      --align-normals     Align normals in an existing normals zarr (requires --output-zarr)\n\n"
         << "Notes:\n"
         << "  - Input can be a directory created by vc_gen_normalgrids (contains metadata.json and xy/xz/yz).\n"
@@ -1672,8 +1671,7 @@ static void run_fit_normals(
     const std::optional<fs::path>& out_zarr_opt,
     int step = 16,
     float radius = 128.f,
-    bool dbg_tif = false,
-    bool lasagna_format = false) {
+    bool dbg_tif = false) {
     vc::core::util::NormalGridVolume ngv(input_dir.string());
     const int sparse_volume = ngv.metadata().value("sparse-volume", 1);
 
@@ -2495,80 +2493,6 @@ static void run_fit_normals(
         z5::filesystem::handle::Group root(outFile, "");
         z5::filesystem::writeAttributes(root, attrs);
 
-        // Optional: also write lasagna-format (C,Z,Y,X) zarr alongside.
-        // scaledown == step: the ngrids resolution IS the lasagna resolution.
-        if (lasagna_format) {
-            fs::path lasagna_path = out_zarr;
-            lasagna_path += ".lasagna.zarr";
-            std::cout << "Writing lasagna-format zarr to " << lasagna_path << std::endl;
-
-            z5::filesystem::handle::File lasFile(lasagna_path);
-            z5::createFile(lasFile, true);
-
-            // Lasagna expects flat 4D array (C, Z, Y, X) with C=4 channels:
-            //   0=cos, 1=grad_mag, 2=nx, 3=ny
-            // Since scaledown == step, las dimensions == ngrids dimensions.
-            const size_t snz = static_cast<size_t>(nz);
-            const size_t sny = static_cast<size_t>(ny);
-            const size_t snx = static_cast<size_t>(nx);
-            const std::vector<size_t> las_shape = {4, snz, sny, snx};
-            const std::vector<size_t> las_chunks = {1,
-                std::min<size_t>(64, snz),
-                std::min<size_t>(64, sny),
-                std::min<size_t>(64, snx)};
-
-            auto las_ds = z5::createDataset(lasFile, "0", "uint8", las_shape, las_chunks,
-                std::string("blosc"), compOpts, /*fillValue=*/0, /*zarrDelimiter=*/"/");
-
-            const size_t n_vox = snz * sny * snx;
-
-            // Build cos channel: 128 where valid, 0 elsewhere.
-            // Build grad_mag channel: 255 where valid, 0 elsewhere.
-            std::vector<uint8_t> cos_ch(n_vox);
-            std::vector<uint8_t> grad_mag_ch(n_vox);
-            for (size_t i = 0; i < n_vox; ++i) {
-                const bool valid = !(enc_x[i] == 128 && enc_y[i] == 128 && enc_z[i] == 128);
-                cos_ch[i] = valid ? 128 : 0;
-                grad_mag_ch[i] = valid ? 255 : 0;
-            }
-
-            // Write all 4 channels directly (no resampling needed).
-            const std::vector<size_t> ch_shape = {1, snz, sny, snx};
-            z5::types::ShapeType off0 = {0, 0, 0, 0};
-            z5::types::ShapeType off1 = {1, 0, 0, 0};
-            z5::types::ShapeType off2 = {2, 0, 0, 0};
-            z5::types::ShapeType off3 = {3, 0, 0, 0};
-
-            auto a_cos = xt::adapt(cos_ch, ch_shape);
-            z5::multiarray::writeSubarray<uint8_t>(las_ds, a_cos, off0.begin());
-            std::cout << "  channel 0 (cos) written" << std::endl;
-
-            auto a_gmag = xt::adapt(grad_mag_ch, ch_shape);
-            z5::multiarray::writeSubarray<uint8_t>(las_ds, a_gmag, off1.begin());
-            std::cout << "  channel 1 (grad_mag) written" << std::endl;
-
-            auto a_nx = xt::adapt(enc_x, ch_shape);
-            z5::multiarray::writeSubarray<uint8_t>(las_ds, a_nx, off2.begin());
-            std::cout << "  channel 2 (nx) written" << std::endl;
-
-            auto a_ny = xt::adapt(enc_y, ch_shape);
-            z5::multiarray::writeSubarray<uint8_t>(las_ds, a_ny, off3.begin());
-            std::cout << "  channel 3 (ny) written" << std::endl;
-
-            // Write lasagna preprocess_params metadata.
-            nlohmann::json las_attrs;
-            las_attrs["preprocess_params"] = {
-                {"scaledown", step},
-                {"channels", {"cos", "grad_mag", "nx", "ny"}},
-                {"grad_mag_encode_scale", 255.0},
-            };
-            z5::filesystem::handle::Group las_root(lasFile, "");
-            z5::filesystem::writeAttributes(las_root, las_attrs);
-
-            std::cout << "Lasagna zarr written: " << lasagna_path
-                      << " shape=(" << las_shape[0] << "," << las_shape[1]
-                      << "," << las_shape[2] << "," << las_shape[3] << ")" << std::endl;
-        }
     }
 }
 
@@ -2588,7 +2512,6 @@ int main(int argc, char** argv) {
         ("dbg-tif", "Write debug float TIFFs for --fit-normals (workdir): rms, used radius, sample counts (first z layer only)")
         ("output-zarr", po::value<std::string>(), "Write fitted normals to a zarr directory (direction-field encoding)")
         ("step", po::value<int>()->default_value(16), "Sample step for --fit-normals (default: 16)")
-        ("lasagna-format", "Additionally write a lasagna-format (C,Z,Y,X) zarr with channels [cos,grad_mag,nx,ny] (requires --output-zarr)")
         ("align-normals", "Align normals in an existing normals zarr (requires --input zarr and --output-zarr)");
 
     po::variables_map vm;
@@ -2691,14 +2614,9 @@ int main(int argc, char** argv) {
         if (vm.count("vis-normals")) {
             out_ply = fs::path(vm["vis-normals"].as<std::string>());
         }
-        const bool lasagna_fmt = vm.count("lasagna-format") > 0;
         const int step_val = vm["step"].as<int>();
-        if (lasagna_fmt && !out_zarr.has_value()) {
-            std::cerr << "Error: --lasagna-format requires --output-zarr PATH\n";
-            return 1;
-        }
         run_fit_normals(input_dir, out_ply, crop, out_zarr, step_val, /*radius=*/64.f,
-                        /*dbg_tif=*/vm.count("dbg-tif") > 0, lasagna_fmt);
+                        /*dbg_tif=*/vm.count("dbg-tif") > 0);
         return 0;
     }
 
