@@ -218,25 +218,24 @@ class SSLZarrDataset(Dataset):
 
     def __getitem__(self, idx):
         vol_weights = [vol.weight for vol in self.volumes]
-        vol_idx = np.random.choice(len(self.volumes), p=vol_weights)
-        vol = self.volumes[vol_idx]
-        d_zarr = open_zarr(vol.path, vol.scale, self.volume_auth)
+
+        while True:
+            vol_idx = np.random.choice(len(self.volumes), p=vol_weights)
+            vol = self.volumes[vol_idx]
+            d_zarr = open_zarr(vol.path, vol.scale, self.volume_auth)
+            source_crop = self._read_source_crop_3d(d_zarr, vol.usable_bbox)
+            if np.any(source_crop != 0):
+                break
 
         if self.single_crop_only:
-            crop = self._read_random_resized_crop_3d(
-                d_zarr,
-                vol.usable_bbox,
+            crop = self._random_resized_crop_3d_from_array(
+                source_crop,
                 self.global_crop_scale,
                 self.global_crop_size,
             )
             if self.do_augmentations:
                 crop = self.global_transforms[0](image=crop)["image"]
             return crop
-
-        source_crop = self._read_source_crop_3d(
-            d_zarr,
-            vol.usable_bbox,
-        )
 
         global_views = [
             self._random_resized_crop_3d_from_array(
