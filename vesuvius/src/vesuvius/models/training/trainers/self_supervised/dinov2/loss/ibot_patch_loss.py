@@ -28,14 +28,25 @@ try:
 except ImportError:
 
     def lossfunc(t, s, temp):
-        return torch.sum(t * F.log_softmax(s / temp, dim=-1), dim=-1)
+        teacher_targets = t.float()
+        student_logits = s.float()
+        return torch.sum(teacher_targets * F.log_softmax(student_logits / temp, dim=-1), dim=-1)
 
 
 class iBOTPatchLoss(nn.Module):
-    def __init__(self, patch_out_dim, student_temp=0.1, center_momentum=0.9):
+    def __init__(
+        self,
+        patch_out_dim,
+        student_temp=0.1,
+        center_momentum=0.9,
+        masked_loss_chunk_size: int | None = None,
+    ):
         super().__init__()
+        if masked_loss_chunk_size is not None and masked_loss_chunk_size <= 0:
+            raise ValueError("masked_loss_chunk_size must be positive when set.")
         self.student_temp = student_temp
         self.center_momentum = center_momentum
+        self.masked_loss_chunk_size = masked_loss_chunk_size
         self.register_buffer("center", torch.zeros(1, 1, patch_out_dim))
         self.updated = True
         self.reduce_handle = None
@@ -97,8 +108,8 @@ class iBOTPatchLoss(nn.Module):
         teacher_patch_tokens: (B, N, D) tensor
         student_masks_flat: (B, N) tensor
         """
-        t = teacher_patch_tokens
-        s = student_patch_tokens
+        t = teacher_patch_tokens.float()
+        s = student_patch_tokens.float()
         loss = torch.sum(t * F.log_softmax(s / self.student_temp, dim=-1), dim=-1)
         loss = torch.sum(loss * student_masks_flat.float(), dim=-1) / student_masks_flat.sum(dim=-1).clamp(min=1.0)
         return -loss.mean()
@@ -113,18 +124,27 @@ class iBOTPatchLoss(nn.Module):
     ):
         t = teacher_patch_tokens_masked
         s = student_patch_tokens_masked
-        # loss = torch.sum(t * F.log_softmax(s / self.student_temp, dim=-1), dim=-1)
-        loss = lossfunc(t, s, self.student_temp)
         if masks_weight is None:
-            masks_weight = (
-                (1 / student_masks_flat.sum(-1).clamp(min=1.0))
-                .unsqueeze(-1)
-                .expand_as(student_masks_flat)[student_masks_flat]
-            )
+            tokens_per_sample = student_masks_flat.shape[1]
+            masked_indices = student_masks_flat.flatten().nonzero().flatten()
+            masked_sample_indices = torch.div(masked_indices, tokens_per_sample, rounding_mode="floor")
+            inverse_mask_counts = 1 / student_masks_flat.sum(-1).clamp(min=1.0)
+            masks_weight = inverse_mask_counts.index_select(0, masked_sample_indices)
         if n_masked_patches is not None:
-            loss = loss[:n_masked_patches]
-        loss = loss * masks_weight
-        return -loss.sum() / student_masks_flat.shape[0]
+            t = t[:n_masked_patches]
+            s = s[:n_masked_patches]
+            masks_weight = masks_weight[:n_masked_patches]
+        chunk_size = self.masked_loss_chunk_size
+        if chunk_size is None or s.shape[0] <= chunk_size:
+            loss = lossfunc(t, s, self.student_temp)
+            return -(loss * masks_weight).sum() / student_masks_flat.shape[0]
+
+        total_loss = s.new_zeros((), dtype=torch.float32)
+        for start in range(0, s.shape[0], chunk_size):
+            end = min(start + chunk_size, s.shape[0])
+            chunk_loss = lossfunc(t[start:end], s[start:end], self.student_temp)
+            total_loss = total_loss + (chunk_loss * masks_weight[start:end]).sum()
+        return -total_loss / student_masks_flat.shape[0]
 
     @torch.no_grad()
     def update_center(self, teacher_patch_tokens):
