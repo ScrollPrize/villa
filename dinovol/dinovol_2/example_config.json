@@ -1,0 +1,26 @@
+{
+
+    "output_dir": "./dinov2_test/",
+    "volume_auth": "/path/to/some/credentials.json",
+    "ibot_masked_loss_chunk_size": 4096,
+    "max_iterations": 1000000,
+    "val_every_n": 50,
+    "save_every_n": 5000,
+    "batch_size": 2,
+    "model": {
+        "global_crops_size": [96, 96, 96],
+        "local_crops_size": [48, 48, 48]
+    },
+    "use_amp": true,
+    "dataset": {
+        "global_crop_size": [96, 96, 96],
+        "local_crop_size": [48, 48, 48],
+        "volume_auth": "/path/to/some/credentials.json",
+        "datasets": [
+            {
+                "volume_path": "https://somehttpsfileserver.com/someomezarrvolume.zarr",
+                "volume_scale": 0
+            }
+        ]
+    }
+}

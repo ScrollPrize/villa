@@ -1,0 +1,20 @@
+[project]
+name = "dinovol-2"
+version = "0.1.0"
+description = "3d adaptation of dinov2 pretraining for larger than memory ome-zarr arrays"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.13.3",
+    "einops",
+    "fft-conv-pytorch",
+    "fsspec>=2026.2.0",
+    "numpy>=2.4.3",
+    "pillow>=12.1.1",
+    "scikit-image",
+    "scipy",
+    "timm>=1.0.25",
+    "torch>=2.10.0",
+    "tqdm>=4.67.3",
+    "zarr>=3.1.5",
+]
