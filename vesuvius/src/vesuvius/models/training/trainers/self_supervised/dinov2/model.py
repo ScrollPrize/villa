@@ -179,10 +179,12 @@ class DinoVitStudentTeacher(nn.Module):
         student_modules = {
             "backbone": student_backbone,
             "dino_head": self._build_head("dino"),
+            "ibot_head": self._build_head("ibot", fallback_prefix="dino"),
         }
         teacher_modules = {
             "backbone": teacher_backbone,
             "dino_head": self._build_head("dino"),
+            "ibot_head": self._build_head("ibot", fallback_prefix="dino"),
         }
 
         self.student = nn.ModuleDict(student_modules)
@@ -361,7 +363,7 @@ class DinoVitStudentTeacher(nn.Module):
         return self._apply_head(branch.dino_head, cls_tokens)
 
     def project_patch_tokens(self, branch: nn.ModuleDict, patch_tokens: torch.Tensor) -> torch.Tensor:
-        return self._apply_head(branch.dino_head, patch_tokens)
+        return self._apply_head(branch.ibot_head, patch_tokens)
 
     def project_masked_patch_tokens(
         self,
@@ -377,7 +379,7 @@ class DinoVitStudentTeacher(nn.Module):
         )
         return self.project_patch_tokens(branch, masked_tokens)
 
-    def project_cls_and_masked_patch_tokens(
+    def project_global_cls_and_masked_patch_tokens(
         self,
         branch: nn.ModuleDict,
         cls_tokens: torch.Tensor,
@@ -390,12 +392,8 @@ class DinoVitStudentTeacher(nn.Module):
             mask_indices_list=mask_indices_list,
             n_masked_patches=n_masked_patches,
         )
-        flat_cls_tokens = cls_tokens.reshape(-1, cls_tokens.shape[-1])
-        joint_tokens = torch.cat((flat_cls_tokens, masked_tokens), dim=0)
-        joint_projections = branch.dino_head(joint_tokens)
-        cls_count = flat_cls_tokens.shape[0]
-        cls_projections = joint_projections[:cls_count].reshape(*cls_tokens.shape[:-1], -1)
-        patch_projections = joint_projections[cls_count:]
+        cls_projections = self.project_cls_tokens(branch, cls_tokens)
+        patch_projections = self.project_patch_tokens(branch, masked_tokens)
         return cls_projections, patch_projections
 
     def _format_branch_outputs(
@@ -473,7 +471,7 @@ class DinoVitStudentTeacher(nn.Module):
             }
         else:
             student_global = dict(student_outputs)
-            student_global_cls, student_patch = self.project_cls_and_masked_patch_tokens(
+            student_global_cls, student_patch = self.project_global_cls_and_masked_patch_tokens(
                 self.student,
                 student_global["cls_tokens"],
                 student_global["patch_tokens"],
@@ -508,7 +506,7 @@ class DinoVitStudentTeacher(nn.Module):
                     outputs["teacher"] = teacher_outputs
                 else:
                     teacher_global = dict(teacher_outputs)
-                    teacher_global_cls, teacher_patch = self.project_cls_and_masked_patch_tokens(
+                    teacher_global_cls, teacher_patch = self.project_global_cls_and_masked_patch_tokens(
                         self.teacher,
                         teacher_global["cls_tokens"],
                         teacher_global["patch_tokens"],
