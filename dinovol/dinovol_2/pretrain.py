@@ -165,14 +165,13 @@ class DinoIBOTPretrainer:
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self.device.type == "cuda")
         
         dino_out_dim = int(self.model_config.get("dino_out_dim", 65536))
-        if "ibot_out_dim" in self.model_config and int(self.model_config["ibot_out_dim"]) != dino_out_dim:
-            raise ValueError("Shared DINO/iBOT head requires ibot_out_dim to match dino_out_dim.")
+        ibot_out_dim = int(self.model_config.get("ibot_out_dim", dino_out_dim))
         self.dino_loss = DINOLoss(dino_out_dim).to(self.device)
         masked_loss_chunk_size = self.config.get("ibot_masked_loss_chunk_size")
         if masked_loss_chunk_size is not None:
             masked_loss_chunk_size = int(masked_loss_chunk_size)
         self.ibot_patch_loss = iBOTPatchLoss(
-            dino_out_dim,
+            ibot_out_dim,
             masked_loss_chunk_size=masked_loss_chunk_size,
         ).to(self.device)
         self.koleo_loss = KoLeoLoss().to(self.device)
