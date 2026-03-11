@@ -58,12 +58,10 @@ class DinoIBOTPretrainer:
 
         self.dino_loss_weight = float(self.config.get("dino_loss_weight", 1.0))
         self.ibot_loss_weight = float(self.config.get("ibot_loss_weight", 1.0))
-        self.koleo_loss_weight = float(self.config.get("koleo_loss_weight", 0.0))
+        self.koleo_loss_weight = float(self.config.get("koleo_loss_weight", 0.1))
         self.centering = str(self.config.get("centering", "centering"))
 
-        self.epochs = int(self.config.get("epochs", 1))
-        self.steps_per_epoch = int(self.config.get("steps_per_epoch", 100))
-        self.num_iterations = int(self.config.get("num_iterations", self.epochs * self.steps_per_epoch))
+        self.num_iterations = int(self.config.get("num_iterations", 100))
         self.warmup_steps = int(self.config.get("warmup_steps", 0))
         self.total_steps = self.num_iterations
         self.base_lr = float(self.config.get("lr", 1e-4))
@@ -71,9 +69,11 @@ class DinoIBOTPretrainer:
         self.clip_grad = float(self.config.get("clip_grad", 3.0))
 
         self.teacher_temp = float(self.config.get("teacher_temp", 0.07))
-        self.warmup_teacher_temp = float(self.config.get("warmup_teacher_temp", self.teacher_temp))
-        self.warmup_teacher_temp_steps = int(self.config.get("warmup_teacher_temp_steps", 0))
-        self.momentum_teacher = float(self.config.get("momentum_teacher", 0.996))
+        self.warmup_teacher_temp = float(self.config.get("warmup_teacher_temp", 0.04))
+        self.warmup_teacher_temp_steps = int(
+            self.config.get("warmup_teacher_temp_steps", round(self.total_steps * 0.3))
+        )
+        self.momentum_teacher = float(self.config.get("momentum_teacher", 0.992))
         self.final_momentum_teacher = float(self.config.get("final_momentum_teacher", 1.0))
 
         self.log_every = int(self.config.get("log_every", 20))
