@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import argparse
-from itertools import islice
 import json
-import math
 from pathlib import Path
+import random
 from typing import Any, Iterator, Mapping
 
 import numpy as np
@@ -21,10 +20,6 @@ from .collate import build_dino_ibot_collate_fn
 from .loss import DINOLoss, KoLeoLoss, iBOTPatchLoss
 from .model import DinoVitStudentTeacher
 
-try:
-    import yaml
-except ImportError:  # pragma: no cover
-    yaml = None
 
 def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
     if value is None:
@@ -32,11 +27,45 @@ def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, flo
     return float(value[0]), float(value[1])
 
 
-def _cosine_schedule(step: int, total_steps: int, start: float, end: float) -> float:
-    if total_steps <= 1:
-        return end
-    ratio = step / float(total_steps - 1)
-    return end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * ratio))
+class CosineScheduler:
+    def __init__(
+        self,
+        *,
+        base_value: float,
+        final_value: float,
+        total_iters: int,
+        warmup_iters: int = 0,
+        start_warmup_value: float = 0.0,
+        freeze_iters: int = 0,
+    ) -> None:
+        self.final_value = float(final_value)
+        self.total_iters = int(total_iters)
+
+        if self.total_iters <= 0:
+            self.schedule = np.zeros((0,), dtype=np.float64)
+            return
+
+        freeze_iters = max(0, min(int(freeze_iters), self.total_iters))
+        warmup_iters = max(0, min(int(warmup_iters), self.total_iters - freeze_iters))
+
+        freeze_schedule = np.zeros((freeze_iters,), dtype=np.float64)
+        warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters, dtype=np.float64)
+
+        cosine_iters = self.total_iters - warmup_iters - freeze_iters
+        if cosine_iters > 0:
+            iters = np.arange(cosine_iters, dtype=np.float64)
+            cosine_schedule = final_value + 0.5 * (base_value - final_value) * (1.0 + np.cos(np.pi * iters / len(iters)))
+        else:
+            cosine_schedule = np.zeros((0,), dtype=np.float64)
+
+        self.schedule = np.concatenate((freeze_schedule, warmup_schedule, cosine_schedule))
+        if len(self.schedule) != self.total_iters:
+            raise AssertionError("invalid scheduler length")
+
+    def __getitem__(self, step: int) -> float:
+        if step >= self.total_iters:
+            return self.final_value
+        return float(self.schedule[step])
 
 class DinoIBOTPretrainer:
     def __init__(self, config: Mapping[str, Any]) -> None:
@@ -52,12 +81,19 @@ class DinoIBOTPretrainer:
         self.final_weight_decay = float(self.config.get("weight_decay_end", 0.4))
         self.betas = tuple(self.config.get("betas", (0.9, 0.999)))
         self.clip_grad = float(self.config.get("clip_grad", 3.0))
+        self.layer_decay = float(self.config.get("layer_decay", self.config.get("layerwise_decay", 1.0)))
+        self.patch_embed_lr_mult = float(self.config.get("patch_embed_lr_mult", 1.0))
 
         warmup_ratio = float(self.config.get("warmup_ratio", 0.1))
         default_warmup_steps = 0
         if self.total_steps > 0 and warmup_ratio > 0.0:
             default_warmup_steps = max(1, round(self.total_steps * warmup_ratio))
         self.warmup_steps = int(self.config["warmup_steps"]) if "warmup_steps" in self.config else default_warmup_steps
+        self.freeze_last_layer_steps = self._resolve_step_count(
+            "freeze_last_layer_steps",
+            "freeze_last_layer_epochs",
+            default=0,
+        )
 
         self.model = DinoVitStudentTeacher(self.model_config).to(self.device)
         self.optimizer = self._build_optimizer()
@@ -82,6 +118,13 @@ class DinoIBOTPretrainer:
         )
         self.momentum_teacher = float(self.config.get("momentum_teacher", 0.992))
         self.final_momentum_teacher = float(self.config.get("final_momentum_teacher", 1.0))
+        (
+            self.lr_schedule,
+            self.wd_schedule,
+            self.momentum_schedule,
+            self.teacher_temp_schedule,
+            self.last_layer_lr_schedule,
+        ) = self._build_schedulers()
 
         self.log_every = int(self.config.get("log_every", 20))
         self.val_every_n = int(self.config.get("val_every_n", 0))
@@ -91,51 +134,69 @@ class DinoIBOTPretrainer:
         self.monitor_dir = self.output_dir / "monitor"
         self.monitor_dir.mkdir(parents=True, exist_ok=True)
         self._warned_missing_val_dataset = False
+        self.resume = bool(self.config.get("resume", False))
+        self.auto_resume = bool(self.config.get("auto_resume", self.resume or bool(self.config.get("resume_from"))))
 
-    def _student_no_weight_decay_names(self) -> set[str]:
-        no_decay_names: set[str] = set()
-        for module_name, module in self.model.student.named_modules():
-            if module is self.model.student or not hasattr(module, "no_weight_decay"):
-                continue
-            module_prefix = f"{module_name}." if module_name else ""
-            no_decay_names.update(module_prefix + name for name in module.no_weight_decay())
-        return no_decay_names
+    def _resolve_step_count(self, steps_key: str, epochs_key: str, *, default: int) -> int:
+        if steps_key in self.config:
+            return int(self.config[steps_key])
+        if epochs_key in self.config:
+            epoch_length = self.config.get("official_epoch_length", self.config.get("epoch_length"))
+            if epoch_length is None:
+                raise ValueError(f"{epochs_key} requires official_epoch_length or epoch_length in the config.")
+            return int(self.config[epochs_key]) * int(epoch_length)
+        return int(default)
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
-        no_decay_names = self._student_no_weight_decay_names()
-        decay_params: list[torch.nn.Parameter] = []
-        no_decay_params: list[torch.nn.Parameter] = []
-
-        for name, parameter in self.model.student.named_parameters():
-            if not parameter.requires_grad:
-                continue
-            if name in no_decay_names:
-                no_decay_params.append(parameter)
-            else:
-                decay_params.append(parameter)
-
-        param_groups: list[dict[str, Any]] = []
-        if decay_params:
-            param_groups.append(
-                {
-                    "params": decay_params,
-                    "weight_decay": self.base_weight_decay,
-                    "apply_weight_decay": True,
-                }
-            )
-        if no_decay_params:
-            param_groups.append(
-                {
-                    "params": no_decay_params,
-                    "weight_decay": 0.0,
-                    "apply_weight_decay": False,
-                }
-            )
-
+        param_groups = self.model.get_params_groups(
+            lr_decay_rate=self.layer_decay,
+            patch_embed_lr_mult=self.patch_embed_lr_mult,
+        )
         return torch.optim.AdamW(
             param_groups,
             lr=self.base_lr,
             betas=self.betas,
+        )
+
+    def _build_schedulers(self) -> tuple[CosineScheduler, CosineScheduler, CosineScheduler, CosineScheduler, CosineScheduler]:
+        lr_schedule = CosineScheduler(
+            base_value=self.base_lr,
+            final_value=self.min_lr,
+            total_iters=self.total_steps,
+            warmup_iters=self.warmup_steps,
+            start_warmup_value=0.0,
+        )
+        wd_schedule = CosineScheduler(
+            base_value=self.base_weight_decay,
+            final_value=self.final_weight_decay,
+            total_iters=self.total_steps,
+        )
+        momentum_schedule = CosineScheduler(
+            base_value=self.momentum_teacher,
+            final_value=self.final_momentum_teacher,
+            total_iters=self.total_steps,
+        )
+        teacher_temp_schedule = CosineScheduler(
+            base_value=self.teacher_temp,
+            final_value=self.teacher_temp,
+            total_iters=self.total_steps,
+            warmup_iters=self.warmup_teacher_temp_steps,
+            start_warmup_value=self.warmup_teacher_temp,
+        )
+        last_layer_lr_schedule = CosineScheduler(
+            base_value=self.base_lr,
+            final_value=self.min_lr,
+            total_iters=self.total_steps,
+            warmup_iters=self.warmup_steps,
+            start_warmup_value=0.0,
+        )
+        last_layer_lr_schedule.schedule[: self.freeze_last_layer_steps] = 0.0
+        return (
+            lr_schedule,
+            wd_schedule,
+            momentum_schedule,
+            teacher_temp_schedule,
+            last_layer_lr_schedule,
         )
 
     def build_dataloader(self) -> DataLoader:
@@ -195,39 +256,32 @@ class DinoIBOTPretrainer:
             }
         )
         monitor_batch_size = int(self.config.get("monitor_batch_size", 2))
-        samples = [dataset[i] for i in range(monitor_batch_size)]
-        return collate_fn(samples)
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        torch_state = torch.get_rng_state()
+        cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
+            samples = [dataset[i] for i in range(monitor_batch_size)]
+            return collate_fn(samples)
+        finally:
+            random.setstate(python_state)
+            np.random.set_state(numpy_state)
+            torch.set_rng_state(torch_state)
+            if cuda_state is not None:
+                torch.cuda.set_rng_state_all(cuda_state)
 
     def _teacher_temp(self, step: int) -> float:
-        if step < self.warmup_teacher_temp_steps:
-            return _cosine_schedule(
-                step,
-                max(self.warmup_teacher_temp_steps, 1),
-                self.warmup_teacher_temp,
-                self.teacher_temp,
-            )
-        return self.teacher_temp
+        return self.teacher_temp_schedule[step]
 
-    def _teacher_momentum(self, step: int) -> float:
-        return _cosine_schedule(step, self.total_steps, self.momentum_teacher, self.final_momentum_teacher)
-
-    def _set_lr(self, step: int) -> float:
-        if self.warmup_steps > 0 and step < self.warmup_steps:
-            lr = self.base_lr * float(step + 1) / float(self.warmup_steps)
-        else:
-            tail_step = max(step - self.warmup_steps, 0)
-            tail_total = max(self.total_steps - self.warmup_steps, 1)
-            lr = _cosine_schedule(tail_step, tail_total, self.base_lr, self.min_lr)
+    def _apply_optim_scheduler(self, step: int) -> tuple[float, float, float, float]:
+        lr = self.lr_schedule[step]
+        weight_decay = self.wd_schedule[step]
+        teacher_temp = self.teacher_temp_schedule[step]
+        last_layer_lr = self.last_layer_lr_schedule[step]
         for group in self.optimizer.param_groups:
-            group["lr"] = lr
-        return lr
-
-    def _set_weight_decay(self, step: int) -> float:
-        weight_decay = _cosine_schedule(step, self.total_steps, self.base_weight_decay, self.final_weight_decay)
-        for group in self.optimizer.param_groups:
-            if group.get("apply_weight_decay", True):
-                group["weight_decay"] = weight_decay
-        return weight_decay
+            group["weight_decay"] = weight_decay * group.get("wd_multiplier", 1.0)
+            group["lr"] = (last_layer_lr if group.get("is_last_layer", False) else lr) * group.get("lr_multiplier", 1.0)
+        return lr, weight_decay, self.momentum_schedule[step], teacher_temp
 
     def _center_teacher_cls(
         self,
@@ -264,9 +318,7 @@ class DinoIBOTPretrainer:
 
     def train_step(self, batch: Mapping[str, Any], step: int) -> dict[str, float]:
         self.model.train()
-        lr = self._set_lr(step)
-        weight_decay = self._set_weight_decay(step)
-        teacher_temp = self._teacher_temp(step)
+        lr, weight_decay, teacher_momentum, teacher_temp = self._apply_optim_scheduler(step)
 
         global_crops = batch["collated_global_crops"].to(self.device, non_blocking=True)
         local_crops = batch["collated_local_crops"].to(self.device, non_blocking=True)
@@ -352,7 +404,7 @@ class DinoIBOTPretrainer:
         clip_grad_norm_(self.model.student.parameters(), self.clip_grad)
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        self.model.update_teacher(self._teacher_momentum(step))
+        self.model.update_teacher(teacher_momentum)
 
         return {
             "loss": float(loss.detach()),
@@ -365,6 +417,34 @@ class DinoIBOTPretrainer:
             "teacher_temp": teacher_temp,
         }
 
+    @staticmethod
+    def _capture_rng_state() -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    @staticmethod
+    def _restore_rng_state(state: Mapping[str, Any]) -> None:
+        if "python" in state:
+            random.setstate(state["python"])
+        if "numpy" in state:
+            np.random.set_state(state["numpy"])
+        if "torch" in state:
+            torch.set_rng_state(state["torch"])
+        if "cuda" in state and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["cuda"])
+
+    def _optimizer_to_device(self) -> None:
+        for optimizer_state in self.optimizer.state.values():
+            for key, value in optimizer_state.items():
+                if torch.is_tensor(value):
+                    optimizer_state[key] = value.to(self.device)
+
     def save_checkpoint(self, step: int) -> Path:
         path = self.output_dir / f"checkpoint_step_{step:06d}.pt"
         torch.save(
@@ -374,10 +454,45 @@ class DinoIBOTPretrainer:
                 "student": self.model.student.state_dict(),
                 "teacher": self.model.teacher.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
+                "scaler": self.scaler.state_dict() if self.scaler.is_enabled() else None,
+                "dino_loss": self.dino_loss.state_dict(),
+                "ibot_patch_loss": self.ibot_patch_loss.state_dict(),
+                "rng_state": self._capture_rng_state(),
             },
             path,
         )
         return path
+
+    def load_checkpoint(self, checkpoint_path: str | Path) -> int:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        self.model.student.load_state_dict(checkpoint["student"])
+        self.model.teacher.load_state_dict(checkpoint["teacher"])
+        if "optimizer" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+            self._optimizer_to_device()
+        if checkpoint.get("scaler") is not None and self.scaler.is_enabled():
+            self.scaler.load_state_dict(checkpoint["scaler"])
+        if "dino_loss" in checkpoint:
+            self.dino_loss.load_state_dict(checkpoint["dino_loss"])
+        if "ibot_patch_loss" in checkpoint:
+            self.ibot_patch_loss.load_state_dict(checkpoint["ibot_patch_loss"])
+        if "rng_state" in checkpoint:
+            self._restore_rng_state(checkpoint["rng_state"])
+        return int(checkpoint.get("step", -1))
+
+    def _find_latest_checkpoint(self) -> Path | None:
+        checkpoints = sorted(self.output_dir.glob("checkpoint_step_*.pt"))
+        if not checkpoints:
+            return None
+        return checkpoints[-1]
+
+    def _resolve_resume_path(self) -> Path | None:
+        resume_from = self.config.get("resume_from")
+        if resume_from:
+            return Path(resume_from)
+        if self.auto_resume:
+            return self._find_latest_checkpoint()
+        return None
 
     @staticmethod
     def _normalize_image(array: np.ndarray) -> np.ndarray:
@@ -552,13 +667,18 @@ class DinoIBOTPretrainer:
         }
 
     def fit(self) -> None:
+        start_step = 0
+        resume_path = self._resolve_resume_path()
+        if resume_path is not None:
+            start_step = self.load_checkpoint(resume_path) + 1
+
         dataloader = self.build_dataloader()
         dataloader_iter: Iterator[Any] = iter(dataloader)
         val_dataloader = self.build_val_dataloader()
         val_dataloader_iter: Iterator[Any] | None = iter(val_dataloader) if val_dataloader is not None else None
         monitor_batch = self.build_monitor_batch() if self.val_every_n else None
-        with tqdm(total=self.max_iterations, desc="training", unit="iter") as progress:
-            for step in range(self.max_iterations):
+        with tqdm(total=self.max_iterations, initial=start_step, desc="training", unit="iter") as progress:
+            for step in range(start_step, self.max_iterations):
                 try:
                     batch = next(dataloader_iter)
                 except StopIteration:
@@ -599,10 +719,20 @@ class DinoIBOTPretrainer:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Minimal standalone 3D DINO+iBOT pretrainer")
     parser.add_argument("config", type=str)
+    parser.add_argument("--resume-from", type=str, default=None)
+    parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
     
     with open(args.config, 'r') as f:
         config = json.load(f)
+
+    if args.resume_from is not None:
+        config["resume_from"] = args.resume_from
+        config["resume"] = True
+    if args.no_resume:
+        config["resume"] = False
+        config["auto_resume"] = False
+        config.pop("resume_from", None)
         
     trainer = DinoIBOTPretrainer(config)
     trainer.fit()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from copy import deepcopy
 from typing import Any, Mapping, Optional, Tuple
 
@@ -65,6 +66,52 @@ def _config_value(
     if fallback_key is not None and fallback_key in config:
         return config[fallback_key]
     return default
+
+
+def _get_vit_lr_decay_rate(
+    name: str,
+    *,
+    lr_decay_rate: float,
+    num_layers: int,
+    chunked_blocks: bool,
+) -> float:
+    layer_id = num_layers + 1
+    if name.startswith("backbone"):
+        if any(
+            token in name
+            for token in (
+                ".pos_embed",
+                ".patch_embed",
+                ".down_projection",
+                ".mask_token",
+                ".cls_token",
+                ".reg_token",
+            )
+        ):
+            layer_id = 0
+        elif ".blocks." in name and ".residual." not in name:
+            block_path = name[name.find(".blocks.") + 1 :].split(".")
+            if chunked_blocks and len(block_path) > 2 and block_path[2].isdigit():
+                layer_id = int(block_path[2]) + 1
+            elif len(block_path) > 1 and block_path[1].isdigit():
+                layer_id = int(block_path[1]) + 1
+
+    return lr_decay_rate ** (num_layers + 1 - layer_id)
+
+
+def _fuse_params_groups(
+    all_params_groups: list[dict[str, Any]],
+    *,
+    keys: tuple[str, ...] = ("lr_multiplier", "wd_multiplier", "is_last_layer"),
+) -> list[dict[str, Any]]:
+    fused: dict[str, dict[str, Any]] = defaultdict(lambda: {"params": []})
+    for group in all_params_groups:
+        identifier = "_".join(f"{key}={group[key]}" for key in keys)
+        fused_group = fused[identifier]
+        for key in keys:
+            fused_group[key] = group[key]
+        fused_group["params"].append(group["params"])
+    return list(fused.values())
 
 
 class DINOHead(nn.Module):
@@ -198,6 +245,55 @@ class DinoVitStudentTeacher(nn.Module):
 
     def synchronize_teacher_from_student(self) -> None:
         self.teacher.load_state_dict(self.student.state_dict(), strict=True)
+
+    def get_params_groups(
+        self,
+        *,
+        lr_decay_rate: float = 1.0,
+        patch_embed_lr_mult: float = 1.0,
+    ) -> list[dict[str, Any]]:
+        no_decay_names: set[str] = set()
+        for module_name, module in self.student.named_modules():
+            if module is self.student or not hasattr(module, "no_weight_decay"):
+                continue
+            module_prefix = f"{module_name}." if module_name else ""
+            no_decay_names.update(module_prefix + name for name in module.no_weight_decay())
+
+        backbone = self.student.backbone
+        num_layers = int(self.config.get("depth", _BACKBONE_DEFAULTS["depth"]))
+        chunked_blocks = bool(getattr(backbone, "chunked_blocks", False))
+
+        params_groups: list[dict[str, Any]] = []
+        for name, parameter in self.student.named_parameters():
+            if not parameter.requires_grad:
+                continue
+
+            group = {
+                "params": parameter,
+                "is_last_layer": "last_layer" in name,
+                "lr_multiplier": _get_vit_lr_decay_rate(
+                    name,
+                    lr_decay_rate=lr_decay_rate,
+                    num_layers=num_layers,
+                    chunked_blocks=chunked_blocks,
+                ),
+                "wd_multiplier": 1.0,
+            }
+
+            if (
+                name in no_decay_names
+                or name.endswith(".bias")
+                or "norm" in name
+                or "gamma" in name
+            ):
+                group["wd_multiplier"] = 0.0
+
+            if "patch_embed" in name or "down_projection" in name:
+                group["lr_multiplier"] *= patch_embed_lr_mult
+
+            params_groups.append(group)
+
+        return _fuse_params_groups(params_groups)
 
     def load_pretrained_weights(self, checkpoint_path: str, *, backbone_only: bool = True, unchunk: bool = False) -> None:
         if backbone_only:
