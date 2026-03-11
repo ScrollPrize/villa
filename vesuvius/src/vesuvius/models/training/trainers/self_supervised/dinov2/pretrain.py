@@ -26,6 +26,16 @@ def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, flo
         return default
     return float(value[0]), float(value[1])
 
+def dino_loss_term_count(n_local_views: int, n_global_views: int = 2) -> int:
+    if n_local_views < 0:
+        raise ValueError(f"n_local_views must be non-negative, got {n_local_views}")
+    if n_global_views <= 0:
+        raise ValueError(f"n_global_views must be positive, got {n_global_views}")
+
+    n_local_terms = max(n_local_views * n_global_views, 1)
+    n_global_terms = (n_global_views - 1) * n_global_views
+    return n_global_terms + n_local_terms
+
 
 class CosineScheduler:
     def __init__(
@@ -109,6 +119,9 @@ class DinoIBOTPretrainer:
         self.dino_loss_weight = float(self.config.get("dino_loss_weight", 1.0))
         self.ibot_loss_weight = float(self.config.get("ibot_loss_weight", 1.0))
         self.koleo_loss_weight = float(self.config.get("koleo_loss_weight", 0.1))
+        self.do_dino = self.dino_loss_weight > 0.0
+        self.do_ibot = self.ibot_loss_weight > 0.0
+        self.do_koleo = self.koleo_loss_weight > 0.0 and self.do_dino
         self.centering = str(self.config.get("centering", "centering"))
 
         self.teacher_temp = float(self.config.get("teacher_temp", 0.07))
@@ -345,8 +358,10 @@ class DinoIBOTPretrainer:
                 mask_indices,
                 n_masked_patches=n_masked,
             )
-            teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(teacher_cls_projections, teacher_temp)
-            teacher_patch_targets = self._center_teacher_patch(teacher_patch, teacher_temp)
+            if self.do_dino:
+                teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(teacher_cls_projections, teacher_temp)
+            if self.do_ibot:
+                teacher_patch_targets = self._center_teacher_patch(teacher_patch, teacher_temp)
 
         with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
             student_global = self.model._forward_branch(
@@ -364,20 +379,24 @@ class DinoIBOTPretrainer:
             )
             global_cls_0, global_cls_1 = student_global_cls.chunk(2)
 
-            total_terms = 2 + (2 * n_local_views if n_local_views else 0)
-            dino_global_loss = (
-                self.dino_loss([global_cls_0], [teacher_cls_1]) +
-                self.dino_loss([global_cls_1], [teacher_cls_0])
-            ) / total_terms
+            total_terms = dino_loss_term_count(n_local_views)
+            if self.do_dino:
+                dino_global_loss = (
+                    self.dino_loss([global_cls_0], [teacher_cls_1]) +
+                    self.dino_loss([global_cls_1], [teacher_cls_0])
+                ) / total_terms
 
-            if n_local_views:
-                student_local = self.model._forward_branch(self.model.student, local_crops, masks=None)
-                local_cls_chunks = list(student_local["cls_projections"].chunk(n_local_views))
-                dino_local_loss = self.dino_loss(local_cls_chunks, [teacher_cls_0, teacher_cls_1]) / total_terms
+                if n_local_views:
+                    student_local = self.model._forward_branch(self.model.student, local_crops, masks=None)
+                    local_cls_chunks = list(student_local["cls_projections"].chunk(n_local_views))
+                    dino_local_loss = self.dino_loss(local_cls_chunks, [teacher_cls_0, teacher_cls_1]) / total_terms
+                else:
+                    dino_local_loss = global_crops.new_zeros(())
             else:
+                dino_global_loss = global_crops.new_zeros(())
                 dino_local_loss = global_crops.new_zeros(())
 
-            if self.ibot_loss_weight > 0.0 and n_masked > 0:
+            if self.do_ibot and n_masked > 0:
                 ibot_loss = self.ibot_patch_loss.forward_masked(
                     student_patch,
                     teacher_patch_targets,
@@ -388,7 +407,7 @@ class DinoIBOTPretrainer:
             else:
                 ibot_loss = global_crops.new_zeros(())
 
-            if self.koleo_loss_weight > 0.0:
+            if self.do_koleo:
                 koleo_loss = sum(self.koleo_loss(chunk) for chunk in student_global["cls_tokens"].chunk(2))
             else:
                 koleo_loss = global_crops.new_zeros(())
@@ -600,12 +619,12 @@ class DinoIBOTPretrainer:
                 teacher_cls_projections,
                 teacher_temp,
                 update_centers=False,
-            )
+            ) if self.do_dino else (None, None)
             teacher_patch_targets = self._center_teacher_patch(
                 teacher_patch,
                 teacher_temp,
                 update_centers=False,
-            )
+            ) if self.do_ibot else None
 
             student_global = self.model._forward_branch(
                 self.model.student,
@@ -622,20 +641,24 @@ class DinoIBOTPretrainer:
             )
             global_cls_0, global_cls_1 = student_global_cls.chunk(2)
 
-            total_terms = 2 + (2 * n_local_views if n_local_views else 0)
-            dino_global_loss = (
-                self.dino_loss([global_cls_0], [teacher_cls_1]) +
-                self.dino_loss([global_cls_1], [teacher_cls_0])
-            ) / total_terms
+            total_terms = dino_loss_term_count(n_local_views)
+            if self.do_dino:
+                dino_global_loss = (
+                    self.dino_loss([global_cls_0], [teacher_cls_1]) +
+                    self.dino_loss([global_cls_1], [teacher_cls_0])
+                ) / total_terms
 
-            if n_local_views:
-                student_local = self.model._forward_branch(self.model.student, local_crops, masks=None)
-                local_cls_chunks = list(student_local["cls_projections"].chunk(n_local_views))
-                dino_local_loss = self.dino_loss(local_cls_chunks, [teacher_cls_0, teacher_cls_1]) / total_terms
+                if n_local_views:
+                    student_local = self.model._forward_branch(self.model.student, local_crops, masks=None)
+                    local_cls_chunks = list(student_local["cls_projections"].chunk(n_local_views))
+                    dino_local_loss = self.dino_loss(local_cls_chunks, [teacher_cls_0, teacher_cls_1]) / total_terms
+                else:
+                    dino_local_loss = global_crops.new_zeros(())
             else:
+                dino_global_loss = global_crops.new_zeros(())
                 dino_local_loss = global_crops.new_zeros(())
 
-            if self.ibot_loss_weight > 0.0 and n_masked > 0:
+            if self.do_ibot and n_masked > 0:
                 ibot_loss = self.ibot_patch_loss.forward_masked(
                     student_patch,
                     teacher_patch_targets,
@@ -646,7 +669,7 @@ class DinoIBOTPretrainer:
             else:
                 ibot_loss = global_crops.new_zeros(())
 
-            if self.koleo_loss_weight > 0.0:
+            if self.do_koleo:
                 koleo_loss = sum(self.koleo_loss(chunk) for chunk in student_global["cls_tokens"].chunk(2))
             else:
                 koleo_loss = global_crops.new_zeros(())
