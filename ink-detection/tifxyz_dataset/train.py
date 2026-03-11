@@ -82,6 +82,12 @@ def train(config_path):
     val_subset = Subset(val_ds, val_indices)
 
     dataloader_workers = int(config.get('dataloader_workers', 0))
+    dataloader_kwargs = {}
+    if dataloader_workers > 0:
+        # CUDA is initialized before dataloader iteration via accelerate/model setup.
+        # Spawn workers instead of forking from a CUDA-initialized parent process.
+        dataloader_kwargs['multiprocessing_context'] = 'spawn'
+        dataloader_kwargs['persistent_workers'] = True
 
     train_dl = DataLoader(
         train_subset,
@@ -89,6 +95,7 @@ def train(config_path):
         shuffle=True,
         generator=torch.Generator().manual_seed(config['seed']),
         num_workers=dataloader_workers,
+        **dataloader_kwargs,
     )
     # Validation only consumes a capped number of batches (`val_steps`), so
     # shuffle to sample a different deterministic subset on each pass.
@@ -98,6 +105,7 @@ def train(config_path):
         shuffle=True,
         generator=torch.Generator().manual_seed(config['seed'] + 1),
         num_workers=dataloader_workers,
+        **dataloader_kwargs,
     )
 
     model = make_model(config)

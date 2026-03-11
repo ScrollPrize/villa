@@ -1,193 +1,525 @@
 import hashlib
 import json
-import multiprocessing as mp
 import os
 import warnings
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import product
 
-import cv2
 import numpy as np
 from tqdm.auto import tqdm
 
 import vesuvius.tifxyz as tifxyz
-from .common import open_zarr
+from .common import load_segment_label_masks, open_zarr
 from vesuvius.neural_tracing.datasets.common import (
     _parse_z_range,
     _segment_overlaps_z_range,
 )
-from vesuvius.neural_tracing.inference.generate_segment_cover_bboxes import (
-    _generate_segment_cover_records,
-)
-
-_PATCH_EVAL_CONTEXT = None
 
 
-def _step_from_scale(scale_value):
-    scale_value = float(scale_value)
-    if not np.isfinite(scale_value) or scale_value <= 0.0:
-        return 1.0
-    return max(1.0, 1.0 / scale_value)
+DEFAULT_STORED_GRID_PAD = 40
 
 
-def _prepare_patch_candidates(initial_patches):
-    parsed = []
-    for patch_idx, patch in enumerate(initial_patches):
-        bbox = tuple(int(v) for v in patch["bbox"])
-        parsed.append(
-            {
-                "patch_idx": int(patch_idx),
-                "bbox": bbox,
-                "z_key": (int(bbox[0]), int(bbox[1])),
-                "bbox_id": int(patch["bbox_id"]),
-                "z_band": int(patch["z_band"]),
-                "grid_index": tuple(int(v) for v in patch["grid_index"]),
-            }
-        )
-    return parsed
+def _empty_points():
+    return np.zeros((0, 3), dtype=np.float32)
 
 
-def _group_patches_by_z_key(parsed_patches):
-    if not parsed_patches:
-        return []
-    sorted_patches = sorted(
-        parsed_patches,
-        key=lambda patch: (
-            int(patch["z_key"][0]),
-            int(patch["z_key"][1]),
-            int(patch["patch_idx"]),
-        ),
-    )
-    grouped = []
-    current_group = [sorted_patches[0]]
-    current_z_key = sorted_patches[0]["z_key"]
-    for patch in sorted_patches[1:]:
-        if patch["z_key"] == current_z_key:
-            current_group.append(patch)
+def _scale_pair_or_default(segment):
+    segment.use_stored_resolution()
+    scale_y, scale_x = getattr(segment, "_scale", (1.0, 1.0))
+    scale_y = float(scale_y) if np.isfinite(scale_y) and float(scale_y) > 0.0 else 1.0
+    scale_x = float(scale_x) if np.isfinite(scale_x) and float(scale_x) > 0.0 else 1.0
+    return scale_y, scale_x
+
+
+def _points_from_mask(z_grid, y_grid, x_grid, mask, retarget_factor):
+    if not bool(np.any(mask)):
+        return _empty_points()
+    points = np.stack(
+        [z_grid[mask], y_grid[mask], x_grid[mask]],
+        axis=-1,
+    ).astype(np.float32, copy=False)
+    if retarget_factor != 1:
+        points /= float(retarget_factor)
+    return points
+
+
+def _inclusive_bbox_from_point_sets(point_sets):
+    mins = []
+    maxs = []
+    for points in point_sets:
+        if points.size == 0:
             continue
-        grouped.append(current_group)
-        current_group = [patch]
-        current_z_key = patch["z_key"]
-    grouped.append(current_group)
-    return grouped
+        mins.append(np.min(points, axis=0))
+        maxs.append(np.max(points, axis=0))
+    if not mins:
+        return None
 
-
-def _evaluate_patch_chunk(patch_chunk):
-    context = _PATCH_EVAL_CONTEXT
-    if not context:
-        raise RuntimeError("patch evaluation context is not initialized")
-
-    all_valid_z = context["all_valid_z"]
-    all_valid_y = context["all_valid_y"]
-    all_valid_x = context["all_valid_x"]
-    all_positive_z = context["all_positive_z"]
-    all_positive_y = context["all_positive_y"]
-    all_positive_x = context["all_positive_x"]
-    min_positive_fraction = float(context["min_positive_fraction"])
-    min_span_ratio = float(context["min_span_ratio"])
-    patch_size_zyx = context["patch_size_zyx"]
-    sample_step_zyx = np.asarray(context["sample_step_zyx"], dtype=np.float32).reshape(3)
-    # Spans are measured from sampled points (max-min), so allow one sampling step of slack.
-    required_span_z = float(min_span_ratio) * max(
-        0.0, (float(patch_size_zyx[0]) - 1.0) - float(sample_step_zyx[0])
-    )
-    required_span_y = float(min_span_ratio) * max(
-        0.0, (float(patch_size_zyx[1]) - 1.0) - float(sample_step_zyx[1])
-    )
-    required_span_x = float(min_span_ratio) * max(
-        0.0, (float(patch_size_zyx[2]) - 1.0) - float(sample_step_zyx[2])
+    overall_min = np.min(np.stack(mins, axis=0), axis=0)
+    overall_max = np.max(np.stack(maxs, axis=0), axis=0)
+    min_zyx = np.floor(overall_min).astype(np.int64, copy=False)
+    max_zyx = np.floor(overall_max).astype(np.int64, copy=False)
+    max_zyx = np.maximum(max_zyx, min_zyx)
+    return (
+        int(min_zyx[0]),
+        int(max_zyx[0]),
+        int(min_zyx[1]),
+        int(max_zyx[1]),
+        int(min_zyx[2]),
+        int(max_zyx[2]),
     )
 
-    kept = []
-    rejected_positive_fraction = 0
-    rejected_span = 0
-    z_band_cache = {}
 
-    for patch in patch_chunk:
-        z_key = patch["z_key"]
-        z_cache_entry = z_band_cache.get(z_key)
-        if z_cache_entry is None:
-            z_min, z_max = z_key
-            valid_in_band = (
-                (all_valid_z >= float(z_min))
-                & (all_valid_z < float(z_max) + 1.0)
+def _axis_patch_starts(axis_min, axis_max, patch_size, overlap_fraction):
+    axis_min = int(axis_min)
+    axis_max = int(axis_max)
+    patch_size = int(patch_size)
+    overlap_fraction = float(overlap_fraction)
+    if patch_size <= 0:
+        raise ValueError(f"patch_size must be positive, got {patch_size}")
+
+    last_start = axis_max - patch_size + 1
+    if last_start <= axis_min:
+        return [axis_min]
+
+    stride = max(1, int(round(float(patch_size) * (1.0 - overlap_fraction))))
+    starts = []
+    current = axis_min
+    while current < last_start:
+        starts.append(int(current))
+        current += stride
+    if not starts or starts[-1] != int(last_start):
+        starts.append(int(last_start))
+    return starts
+
+
+def _generate_sliding_bboxes(world_bbox, patch_size_zyx, overlap_fraction):
+    z0, z1, y0, y1, x0, x1 = (int(v) for v in world_bbox)
+    patch_size_zyx = np.asarray(patch_size_zyx, dtype=np.int64).reshape(3)
+
+    z_starts = _axis_patch_starts(z0, z1, int(patch_size_zyx[0]), overlap_fraction)
+    y_starts = _axis_patch_starts(y0, y1, int(patch_size_zyx[1]), overlap_fraction)
+    x_starts = _axis_patch_starts(x0, x1, int(patch_size_zyx[2]), overlap_fraction)
+
+    bboxes = []
+    for start_z, start_y, start_x in product(z_starts, y_starts, x_starts):
+        bboxes.append(
+            (
+                int(start_z),
+                int(start_z + int(patch_size_zyx[0]) - 1),
+                int(start_y),
+                int(start_y + int(patch_size_zyx[1]) - 1),
+                int(start_x),
+                int(start_x + int(patch_size_zyx[2]) - 1),
             )
-            positive_in_band = (
-                (all_positive_z >= float(z_min))
-                & (all_positive_z < float(z_max) + 1.0)
-            )
-            z_cache_entry = {
-                "valid_z": all_valid_z[valid_in_band],
-                "valid_y": all_valid_y[valid_in_band],
-                "valid_x": all_valid_x[valid_in_band],
-                "positive_y": all_positive_y[positive_in_band],
-                "positive_x": all_positive_x[positive_in_band],
-            }
-            z_band_cache[z_key] = z_cache_entry
-
-        _, _, y_min, y_max, x_min, x_max = patch["bbox"]
-        valid_y = z_cache_entry["valid_y"]
-        valid_x = z_cache_entry["valid_x"]
-        in_bbox_valid = (
-            (valid_y >= float(y_min))
-            & (valid_y < float(y_max) + 1.0)
-            & (valid_x >= float(x_min))
-            & (valid_x < float(x_max) + 1.0)
         )
-        valid_count = int(np.count_nonzero(in_bbox_valid))
-        if valid_count == 0:
-            continue
+    return bboxes
 
-        positive_y = z_cache_entry["positive_y"]
-        positive_x = z_cache_entry["positive_x"]
-        in_bbox_positive = (
-            (positive_y >= float(y_min))
-            & (positive_y < float(y_max) + 1.0)
-            & (positive_x >= float(x_min))
-            & (positive_x < float(x_max) + 1.0)
-        )
-        positive_count = int(np.count_nonzero(in_bbox_positive))
-        positive_fraction = float(positive_count) / float(valid_count)
-        if positive_fraction < min_positive_fraction:
-            rejected_positive_fraction += 1
-            continue
 
-        z_values = z_cache_entry["valid_z"][in_bbox_valid]
-        y_values = valid_y[in_bbox_valid]
-        x_values = valid_x[in_bbox_valid]
-        z_span = float(np.max(z_values) - np.min(z_values))
-        y_span = float(np.max(y_values) - np.min(y_values))
-        x_span = float(np.max(x_values) - np.min(x_values))
-        if y_span >= x_span:
-            dominant_span = y_span
-            required_dominant_span = required_span_y
-        else:
-            dominant_span = x_span
-            required_dominant_span = required_span_x
+def _points_in_world_bbox(points_zyx, world_bbox):
+    if points_zyx.size == 0:
+        return np.zeros((0,), dtype=bool)
+    z0, z1, y0, y1, x0, x1 = (float(v) for v in world_bbox)
+    return (
+        (points_zyx[:, 0] >= z0)
+        & (points_zyx[:, 0] < z1 + 1.0)
+        & (points_zyx[:, 1] >= y0)
+        & (points_zyx[:, 1] < y1 + 1.0)
+        & (points_zyx[:, 2] >= x0)
+        & (points_zyx[:, 2] < x1 + 1.0)
+    )
 
-        if z_span < required_span_z or dominant_span < required_dominant_span:
-            rejected_span += 1
-            continue
 
-        kept.append(
-            {
-                "patch_idx": int(patch["patch_idx"]),
-                "world_bbox": patch["bbox"],
-                "bbox_id": int(patch["bbox_id"]),
-                "z_band": int(patch["z_band"]),
-                "grid_index": patch["grid_index"],
-                "valid_point_count": valid_count,
-                "positive_point_count": positive_count,
-                "positive_fraction": positive_fraction,
-                "span_zyx": (z_span, y_span, x_span),
-            }
-        )
+def _slice_bounds_from_rows_cols(rows, cols, shape, pad):
+    row_count, col_count = (int(shape[0]), int(shape[1]))
+    pad = max(0, int(pad))
+    row_start = max(0, int(np.min(rows)) - pad)
+    row_stop = min(row_count, int(np.max(rows)) + pad + 1)
+    col_start = max(0, int(np.min(cols)) - pad)
+    col_stop = min(col_count, int(np.max(cols)) + pad + 1)
+    return (row_start, row_stop, col_start, col_stop)
 
+
+def _build_patch_segment_entry(segment_record, world_bbox, stored_grid_pad):
+    valid_in_bbox = _points_in_world_bbox(segment_record["valid_points_zyx"], world_bbox)
+    valid_count = int(np.count_nonzero(valid_in_bbox))
+    if valid_count == 0:
+        return None
+
+    rows = segment_record["valid_rows"][valid_in_bbox]
+    cols = segment_record["valid_cols"][valid_in_bbox]
+    stored_rowcol_bounds = _slice_bounds_from_rows_cols(
+        rows,
+        cols,
+        segment_record["grid_shape"],
+        stored_grid_pad,
+    )
+
+    positive_in_bbox = _points_in_world_bbox(segment_record["positive_points_zyx"], world_bbox)
+    positive_count = int(np.count_nonzero(positive_in_bbox))
     return {
-        "processed": int(len(patch_chunk)),
-        "rejected_positive_fraction": int(rejected_positive_fraction),
-        "rejected_span": int(rejected_span),
-        "kept": kept,
+        "segment_idx": int(segment_record["segment_idx"]),
+        "segment_uuid": str(segment_record["segment_uuid"]),
+        "segment": segment_record["segment"],
+        "ink_label_path": segment_record["ink_label_path"],
+        "stored_rowcol_bounds": tuple(int(v) for v in stored_rowcol_bounds),
+        "valid_point_count": int(valid_count),
+        "positive_point_count": int(positive_count),
+        "has_positive_points": bool(positive_count > 0),
     }
+
+
+def _build_patch_record_for_bbox(
+    *,
+    dataset_idx,
+    volume,
+    volume_scale,
+    world_bbox,
+    segment_records,
+    stored_grid_pad,
+):
+    patch_segments = []
+    supervised_segment_indices = []
+    for segment_record in segment_records:
+        patch_segment = _build_patch_segment_entry(
+            segment_record,
+            world_bbox,
+            stored_grid_pad,
+        )
+        if patch_segment is None:
+            continue
+        if patch_segment["has_positive_points"]:
+            supervised_segment_indices.append(len(patch_segments))
+        patch_segments.append(patch_segment)
+
+    if not patch_segments:
+        return None, "without_points"
+    if not supervised_segment_indices:
+        return None, "without_positive"
+
+    return (
+        {
+            "dataset_idx": int(dataset_idx),
+            "volume": volume,
+            "scale": int(volume_scale),
+            "world_bbox": tuple(int(v) for v in world_bbox),
+            "segments": patch_segments,
+            "supervised_segment_indices": tuple(int(v) for v in supervised_segment_indices),
+        },
+        None,
+    )
+
+
+def _evaluate_bbox_chunk(
+    *,
+    dataset_idx,
+    volume,
+    volume_scale,
+    world_bboxes,
+    segment_records,
+    stored_grid_pad,
+):
+    chunk_patches = []
+    chunk_stats = {
+        "rejected_without_points": 0,
+        "rejected_without_positive": 0,
+    }
+    for world_bbox in world_bboxes:
+        patch_record, rejection_reason = _build_patch_record_for_bbox(
+            dataset_idx=dataset_idx,
+            volume=volume,
+            volume_scale=volume_scale,
+            world_bbox=world_bbox,
+            segment_records=segment_records,
+            stored_grid_pad=stored_grid_pad,
+        )
+        if patch_record is not None:
+            chunk_patches.append(patch_record)
+            continue
+        if rejection_reason == "without_points":
+            chunk_stats["rejected_without_points"] += 1
+        elif rejection_reason == "without_positive":
+            chunk_stats["rejected_without_positive"] += 1
+        else:
+            raise ValueError(f"Unexpected bbox rejection reason: {rejection_reason!r}")
+
+    return chunk_patches, chunk_stats
+
+
+def _build_dataset_patch_records(
+    *,
+    dataset_idx,
+    volume,
+    volume_scale,
+    segment_records,
+    patch_size_zyx,
+    overlap_fraction,
+    patch_finding_workers,
+    stored_grid_pad,
+):
+    stats = {
+        "candidate_bboxes": 0,
+        "rejected_without_points": 0,
+        "rejected_without_positive": 0,
+        "kept_patches": 0,
+    }
+    union_bbox = _inclusive_bbox_from_point_sets(
+        record["labeled_points_zyx"] for record in segment_records
+    )
+    if union_bbox is None:
+        return [], stats
+
+    candidate_bboxes = _generate_sliding_bboxes(
+        union_bbox,
+        patch_size_zyx,
+        overlap_fraction,
+    )
+    stats["candidate_bboxes"] = int(len(candidate_bboxes))
+
+    dataset_patches = []
+    worker_count = max(1, int(patch_finding_workers))
+    if worker_count == 1 or len(candidate_bboxes) <= 1:
+        bbox_iter = tqdm(
+            candidate_bboxes,
+            total=len(candidate_bboxes),
+            desc=f"Filtering bboxes (dataset {dataset_idx + 1})",
+            unit="bbox",
+            leave=False,
+        )
+        for world_bbox in bbox_iter:
+            patch_record, rejection_reason = _build_patch_record_for_bbox(
+                dataset_idx=dataset_idx,
+                volume=volume,
+                volume_scale=volume_scale,
+                world_bbox=world_bbox,
+                segment_records=segment_records,
+                stored_grid_pad=stored_grid_pad,
+            )
+            if patch_record is not None:
+                dataset_patches.append(patch_record)
+                continue
+            if rejection_reason == "without_points":
+                stats["rejected_without_points"] += 1
+            elif rejection_reason == "without_positive":
+                stats["rejected_without_positive"] += 1
+            else:
+                raise ValueError(f"Unexpected bbox rejection reason: {rejection_reason!r}")
+    else:
+        chunk_size = max(1, len(candidate_bboxes) // (worker_count * 4))
+        bbox_chunks = [
+            candidate_bboxes[start : start + chunk_size]
+            for start in range(0, len(candidate_bboxes), chunk_size)
+        ]
+        completed_chunks = {}
+        bbox_progress = tqdm(
+            total=len(candidate_bboxes),
+            desc=f"Filtering bboxes (dataset {dataset_idx + 1})",
+            unit="bbox",
+            leave=False,
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=min(worker_count, len(bbox_chunks))) as executor:
+                future_to_chunk = {
+                    executor.submit(
+                        _evaluate_bbox_chunk,
+                        dataset_idx=dataset_idx,
+                        volume=volume,
+                        volume_scale=volume_scale,
+                        world_bboxes=tuple(world_bboxes),
+                        segment_records=segment_records,
+                        stored_grid_pad=stored_grid_pad,
+                    ): (chunk_idx, len(world_bboxes))
+                    for chunk_idx, world_bboxes in enumerate(bbox_chunks)
+                }
+                for future in as_completed(future_to_chunk):
+                    chunk_idx, processed_count = future_to_chunk[future]
+                    completed_chunks[chunk_idx] = future.result()
+                    bbox_progress.update(processed_count)
+        finally:
+            bbox_progress.close()
+
+        for chunk_idx in range(len(bbox_chunks)):
+            chunk_patches, chunk_stats = completed_chunks[chunk_idx]
+            dataset_patches.extend(chunk_patches)
+            stats["rejected_without_points"] += int(chunk_stats["rejected_without_points"])
+            stats["rejected_without_positive"] += int(chunk_stats["rejected_without_positive"])
+
+    stats["kept_patches"] = int(len(dataset_patches))
+    return dataset_patches, stats
+
+
+def _prepare_segment_records(
+    *,
+    dataset_idx,
+    dataset,
+    volume,
+    volume_scale,
+    patch_generation_stats,
+):
+    segments_path = dataset["segments_path"]
+    z_range = _parse_z_range(dataset.get("z_range", None))
+    dataset_segments = list(tifxyz.load_folder(segments_path))
+
+    retarget_factor = 2 ** int(volume_scale)
+    segment_records = []
+    segment_iter = tqdm(
+        enumerate(dataset_segments),
+        total=len(dataset_segments),
+        desc=f"Preparing segments (dataset {dataset_idx + 1})",
+        unit="segment",
+    )
+    for segment_idx, original_seg in segment_iter:
+        seg_scaled = original_seg.retarget(retarget_factor)
+        if not _segment_overlaps_z_range(seg_scaled, z_range):
+            continue
+
+        patch_generation_stats["segments_considered"] += 1
+        patch_generation_stats["segments_tried"] += 1
+        seg_scaled.volume = volume
+        segment_uuid = str(seg_scaled.uuid)
+
+        original_seg.use_stored_resolution()
+        x_stored, y_stored, z_stored, valid_stored = original_seg[:, :]
+        x_stored = np.asarray(x_stored, dtype=np.float32)
+        y_stored = np.asarray(y_stored, dtype=np.float32)
+        z_stored = np.asarray(z_stored, dtype=np.float32)
+        valid_mask = np.asarray(valid_stored, dtype=bool)
+        valid_mask &= np.isfinite(x_stored)
+        valid_mask &= np.isfinite(y_stored)
+        valid_mask &= np.isfinite(z_stored)
+        if not bool(np.any(valid_mask)):
+            patch_generation_stats["segments_without_points"] += 1
+            continue
+
+        grid_shape = (int(x_stored.shape[0]), int(x_stored.shape[1]))
+        valid_rows, valid_cols = np.where(valid_mask)
+        valid_points_zyx = _points_from_mask(
+            z_stored,
+            y_stored,
+            x_stored,
+            valid_mask,
+            retarget_factor,
+        )
+
+        positive_mask = np.zeros_like(valid_mask, dtype=bool)
+        labeled_mask = np.zeros_like(valid_mask, dtype=bool)
+        ink_label_path = None
+        try:
+            ink_mask, supervision_mask, ink_label_path = load_segment_label_masks(
+                original_seg,
+                grid_shape,
+            )
+            positive_mask = valid_mask & ink_mask
+            labeled_mask = valid_mask & (ink_mask | supervision_mask)
+        except AssertionError as exc:
+            patch_generation_stats["segments_missing_ink"] += 1
+            warnings.warn(f"Segment {segment_uuid!r} labels unavailable: {exc}")
+
+        labeled_points_zyx = _points_from_mask(
+            z_stored,
+            y_stored,
+            x_stored,
+            labeled_mask,
+            retarget_factor,
+        )
+        positive_points_zyx = _points_from_mask(
+            z_stored,
+            y_stored,
+            x_stored,
+            positive_mask,
+            retarget_factor,
+        )
+
+        if labeled_points_zyx.size == 0:
+            patch_generation_stats["segments_without_labels"] += 1
+        if positive_points_zyx.size == 0:
+            patch_generation_stats["segments_without_positive_points"] += 1
+
+        scale_y, scale_x = _scale_pair_or_default(seg_scaled)
+        segment_records.append(
+            {
+                "segment_idx": int(segment_idx),
+                "segment_uuid": segment_uuid,
+                "segment": seg_scaled,
+                "volume": volume,
+                "scale": int(volume_scale),
+                "grid_shape": grid_shape,
+                "scale_yx": (float(scale_y), float(scale_x)),
+                "ink_label_path": str(ink_label_path) if ink_label_path else None,
+                "valid_rows": np.asarray(valid_rows, dtype=np.int32),
+                "valid_cols": np.asarray(valid_cols, dtype=np.int32),
+                "valid_points_zyx": valid_points_zyx,
+                "labeled_points_zyx": labeled_points_zyx,
+                "positive_points_zyx": positive_points_zyx,
+            }
+        )
+
+    return segment_records
+
+
+def _serialize_patch_record(patch):
+    return {
+        "world_bbox": [int(v) for v in patch["world_bbox"]],
+        "supervised_segment_indices": [
+            int(v) for v in patch["supervised_segment_indices"]
+        ],
+        "segments": [
+            {
+                "segment_uuid": str(segment["segment_uuid"]),
+                "segment_idx": int(segment["segment_idx"]),
+                "stored_rowcol_bounds": [
+                    int(v) for v in segment["stored_rowcol_bounds"]
+                ],
+                "valid_point_count": int(segment["valid_point_count"]),
+                "positive_point_count": int(segment["positive_point_count"]),
+                "has_positive_points": bool(segment["has_positive_points"]),
+                "ink_label_path": segment["ink_label_path"],
+            }
+            for segment in patch["segments"]
+        ],
+    }
+
+
+def _load_cached_patches(cache_entry, *, dataset_idx, volume, volume_scale, segment_by_uuid):
+    cached_patches = []
+    for record in cache_entry.get("patches", []):
+        patch_segments = []
+        supervised_segment_indices = []
+        for cached_segment in record.get("segments", []):
+            segment_uuid = str(cached_segment["segment_uuid"])
+            runtime_segment = segment_by_uuid.get(segment_uuid)
+            if runtime_segment is None:
+                continue
+            patch_segment = {
+                "segment_idx": int(runtime_segment["segment_idx"]),
+                "segment_uuid": segment_uuid,
+                "segment": runtime_segment["segment"],
+                "ink_label_path": cached_segment.get("ink_label_path")
+                or runtime_segment.get("ink_label_path"),
+                "stored_rowcol_bounds": tuple(
+                    int(v) for v in cached_segment["stored_rowcol_bounds"]
+                ),
+                "valid_point_count": int(cached_segment["valid_point_count"]),
+                "positive_point_count": int(cached_segment["positive_point_count"]),
+                "has_positive_points": bool(cached_segment["has_positive_points"]),
+            }
+            if patch_segment["has_positive_points"]:
+                supervised_segment_indices.append(len(patch_segments))
+            patch_segments.append(patch_segment)
+
+        if not patch_segments or not supervised_segment_indices:
+            continue
+
+        cached_patches.append(
+            {
+                "dataset_idx": int(dataset_idx),
+                "volume": volume,
+                "scale": int(volume_scale),
+                "world_bbox": tuple(int(v) for v in record["world_bbox"]),
+                "segments": patch_segments,
+                "supervised_segment_indices": tuple(int(v) for v in supervised_segment_indices),
+            }
+        )
+    return cached_patches
 
 
 def find_patches(
@@ -195,65 +527,48 @@ def find_patches(
     *,
     patch_size_zyx,
     overlap_fraction,
-    min_positive_fraction,
-    min_span_ratio,
     patch_finding_workers,
     patch_cache_force_recompute,
     patch_cache_filename,
 ):
+    stored_grid_pad = int(config.get("stored_grid_pad", DEFAULT_STORED_GRID_PAD))
     patches = []
     patch_generation_stats = {
         "segments_considered": 0,
         "segments_tried": 0,
         "segments_missing_ink": 0,
+        "segments_without_points": 0,
+        "segments_without_labels": 0,
         "segments_without_positive_points": 0,
         "candidate_bboxes": 0,
-        "rejected_positive_fraction": 0,
-        "rejected_span": 0,
+        "rejected_without_points": 0,
+        "rejected_without_positive": 0,
         "kept_patches": 0,
+        "cache_hits": 0,
     }
 
     datasets = config["datasets"]
     for dataset_idx, dataset in enumerate(datasets):
         volume_path = dataset["volume_path"]
-        volume_scale = dataset["volume_scale"]
-
+        volume_scale = int(dataset["volume_scale"])
         volume_auth_json = dataset.get("volume_auth_json", config.get("volume_auth_json"))
         volume = open_zarr(
             volume_path,
             volume_scale,
             auth=volume_auth_json,
         )
-        segments_path = dataset["segments_path"]
-        z_range = _parse_z_range(dataset.get("z_range", None))
-        dataset_segments = list(tifxyz.load_folder(segments_path))
 
-        retarget_factor = 2 ** volume_scale
-        segment_pairs = []
-        for i, seg in enumerate(dataset_segments):
-            seg_scaled = seg.retarget(retarget_factor)
-            if not _segment_overlaps_z_range(seg_scaled, z_range):
-                continue
-            seg_scaled.volume = volume
-            segment_pairs.append((i, seg, seg_scaled))
-
-        patch_generation_stats["segments_considered"] += int(len(segment_pairs))
+        segment_records = _prepare_segment_records(
+            dataset_idx=dataset_idx,
+            dataset=dataset,
+            volume=volume,
+            volume_scale=volume_scale,
+            patch_generation_stats=patch_generation_stats,
+        )
         segment_by_uuid = {
-            str(seg_scaled.uuid): (int(segment_idx), seg_scaled)
-            for segment_idx, _, seg_scaled in segment_pairs
+            str(record["segment_uuid"]): record
+            for record in segment_records
         }
-        segment_ink_label_path_by_uuid = {}
-        for _, original_seg, seg_scaled in segment_pairs:
-            ink_meta = next(
-                (label for label in original_seg.list_labels() if label.get("name") == "inklabels"),
-                None,
-            )
-            if ink_meta is None:
-                continue
-            ink_path = ink_meta.get("path")
-            if ink_path is None:
-                continue
-            segment_ink_label_path_by_uuid[str(seg_scaled.uuid)] = str(ink_path)
 
         cache_path = os.path.join(
             str(dataset["segments_path"]),
@@ -267,9 +582,8 @@ def find_patches(
                 "z_range": dataset.get("z_range"),
             },
             "patch_size_zyx": [int(v) for v in patch_size_zyx],
-            "min_positive_fraction": float(min_positive_fraction),
-            "min_span_ratio": float(min_span_ratio),
             "overlap_fraction": float(overlap_fraction),
+            "stored_grid_pad": int(stored_grid_pad),
         }
         cache_key = hashlib.sha256(
             json.dumps(cache_keys, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -284,231 +598,37 @@ def find_patches(
 
             cache_entry = cache_entries.get(cache_key)
             if isinstance(cache_entry, dict):
-                cache_patches = []
-                for record in cache_entry.get("patches", []):
-                    segment_uuid = str(record["segment_uuid"])
-                    seg_payload = segment_by_uuid.get(segment_uuid)
-                    if seg_payload is None:
-                        continue
-                    ink_label_path = record.get("ink_label_path")
-                    if not ink_label_path:
-                        ink_label_path = segment_ink_label_path_by_uuid.get(segment_uuid)
-                    segment_idx_cached, seg_scaled_cached = seg_payload
-                    cache_patches.append(
-                        {
-                            "dataset_idx": int(dataset_idx),
-                            "segment_idx": int(segment_idx_cached),
-                            "segment_uuid": segment_uuid,
-                            "segment": seg_scaled_cached,
-                            "volume": volume,
-                            "scale": int(volume_scale),
-                            "world_bbox": tuple(int(v) for v in record["world_bbox"]),
-                            "bbox_id": int(record["bbox_id"]),
-                            "z_band": int(record["z_band"]),
-                            "grid_index": tuple(int(v) for v in record["grid_index"]),
-                            "valid_point_count": int(record["valid_point_count"]),
-                            "positive_point_count": int(record["positive_point_count"]),
-                            "positive_fraction": float(record["positive_fraction"]),
-                            "span_zyx": tuple(float(v) for v in record["span_zyx"]),
-                            "ink_label_path": str(ink_label_path) if ink_label_path else None,
-                        }
-                    )
+                cache_patches = _load_cached_patches(
+                    cache_entry,
+                    dataset_idx=dataset_idx,
+                    volume=volume,
+                    volume_scale=volume_scale,
+                    segment_by_uuid=segment_by_uuid,
+                )
                 patches.extend(cache_patches)
                 patch_generation_stats["kept_patches"] += int(len(cache_patches))
+                patch_generation_stats["cache_hits"] += 1
                 continue
 
-        dataset_patches = []
-
-        segment_pairs_iter = tqdm(
-            segment_pairs,
-            total=len(segment_pairs),
-            desc=f"Finding patches (dataset {dataset_idx + 1}/{len(datasets)})",
-            unit="segment",
+        dataset_patches, dataset_stats = _build_dataset_patch_records(
+            dataset_idx=dataset_idx,
+            volume=volume,
+            volume_scale=volume_scale,
+            segment_records=segment_records,
+            patch_size_zyx=patch_size_zyx,
+            overlap_fraction=overlap_fraction,
+            patch_finding_workers=patch_finding_workers,
+            stored_grid_pad=stored_grid_pad,
         )
-
-        for segment_ordinal, (segment_idx, original_seg, seg_scaled) in enumerate(
-            segment_pairs_iter,
-            start=1,
-        ):
-            patch_generation_stats["segments_tried"] += 1
-
-            ink_meta = next(
-                (label for label in original_seg.list_labels() if label.get("name") == "inklabels"),
-                None,
-            )
-            if ink_meta is None:
-                patch_generation_stats["segments_missing_ink"] += 1
-                warnings.warn(
-                    f"Skipping segment {original_seg.uuid!r}: unable to find 'inklabels'."
-                )
-                continue
-            segment_ink_label_path = str(ink_meta["path"])
-
-            ink_label = cv2.imread(str(ink_meta["path"]), cv2.IMREAD_UNCHANGED)
-            if ink_label is None:
-                patch_generation_stats["segments_missing_ink"] += 1
-                warnings.warn(
-                    f"Skipping segment {original_seg.uuid!r}: unable to read 'inklabels'."
-                )
-                continue
-            if ink_label.ndim == 3:
-                if ink_label.shape[2] == 4:
-                    ink_label = cv2.cvtColor(ink_label, cv2.COLOR_BGRA2GRAY)
-                else:
-                    ink_label = cv2.cvtColor(ink_label, cv2.COLOR_BGR2GRAY)
-
-            stored_h, stored_w = original_seg.use_stored_resolution().shape
-            expected_label_shape = (int(stored_h), int(stored_w))
-            actual_label_shape = tuple(int(v) for v in ink_label.shape)
-            assert actual_label_shape == expected_label_shape, (
-                f"Segment {original_seg.uuid!r} ink label shape {actual_label_shape} does not match "
-                f"tifxyz grid shape {expected_label_shape}."
-            )
-
-            original_seg.use_stored_resolution()
-            x_stored, y_stored, z_stored, valid_stored = original_seg[:, :]
-            valid_mask = np.asarray(valid_stored, dtype=bool).copy()
-            valid_mask &= np.isfinite(z_stored)
-            valid_mask &= np.isfinite(y_stored)
-            valid_mask &= np.isfinite(x_stored)
-
-            positive_label_mask = (ink_label > 0)
-
-            positive_mask = valid_mask & positive_label_mask
-            if not np.any(positive_mask):
-                patch_generation_stats["segments_without_positive_points"] += 1
-                warnings.warn(
-                    f"Skipping segment {original_seg.uuid!r}: No positive labels found"
-                )
-                continue
-
-            all_valid_points_zyx = np.stack(
-                [z_stored[valid_mask], y_stored[valid_mask], x_stored[valid_mask]],
-                axis=-1,
-            ).astype(np.float32, copy=False)
-
-            positive_points_zyx = np.stack(
-                [z_stored[positive_mask], y_stored[positive_mask], x_stored[positive_mask]],
-                axis=-1,
-            ).astype(np.float32, copy=False)
-
-            if retarget_factor != 1:
-                all_valid_points_zyx /= float(retarget_factor)
-                positive_points_zyx /= float(retarget_factor)
-
-            sample_step_y = _step_from_scale(scale_y)
-            sample_step_x = _step_from_scale(scale_x)
-            sample_step_zyx = np.asarray(
-                [max(sample_step_y, sample_step_x), sample_step_y, sample_step_x],
-                dtype=np.float32,
-            )
-            if retarget_factor != 1:
-                sample_step_zyx /= float(retarget_factor)
-
-            result = _generate_segment_cover_records(
-                points_zyx=positive_points_zyx,
-                crop_size_zyx=patch_size_zyx,
-                overlap=overlap_fraction,
-                prune_bboxes=True,
-                band_workers=patch_finding_workers,
-                show_progress=True,
-                progress_desc=(
-                    f"Optimizing z-bands (segment {segment_ordinal}/{len(segment_pairs)})"
-                ),
-            )
-
-            initial_patches = result["final_records"]
-            patch_generation_stats["candidate_bboxes"] += int(len(initial_patches))
-            parsed_patches = _prepare_patch_candidates(initial_patches)
-            if parsed_patches:
-                patch_chunks = _group_patches_by_z_key(parsed_patches)
-                chunk_results = []
-
-                global _PATCH_EVAL_CONTEXT
-                _PATCH_EVAL_CONTEXT = {
-                    "all_valid_z": all_valid_points_zyx[:, 0],
-                    "all_valid_y": all_valid_points_zyx[:, 1],
-                    "all_valid_x": all_valid_points_zyx[:, 2],
-                    "all_positive_z": positive_points_zyx[:, 0],
-                    "all_positive_y": positive_points_zyx[:, 1],
-                    "all_positive_x": positive_points_zyx[:, 2],
-                    "min_positive_fraction": float(min_positive_fraction),
-                    "min_span_ratio": float(min_span_ratio),
-                    "patch_size_zyx": np.asarray(patch_size_zyx, dtype=np.float32).reshape(3),
-                    "sample_step_zyx": sample_step_zyx,
-                }
-
-                bbox_eval_bar = tqdm(
-                    total=len(parsed_patches),
-                    desc=f"Filtering bboxes (segment {segment_ordinal}/{len(segment_pairs)})",
-                    unit="bbox",
-                    leave=False,
-                )
-                try:
-                    process_ctx = mp.get_context("fork")
-                    with ProcessPoolExecutor(
-                        max_workers=int(patch_finding_workers),
-                        mp_context=process_ctx,
-                    ) as pool:
-                        for chunk_result in pool.map(_evaluate_patch_chunk, patch_chunks):
-                            chunk_results.append(chunk_result)
-                            bbox_eval_bar.update(int(chunk_result["processed"]))
-                finally:
-                    bbox_eval_bar.close()
-                    _PATCH_EVAL_CONTEXT = None
-
-                kept_records = []
-                for chunk_result in chunk_results:
-                    patch_generation_stats["rejected_positive_fraction"] += int(
-                        chunk_result["rejected_positive_fraction"]
-                    )
-                    patch_generation_stats["rejected_span"] += int(
-                        chunk_result["rejected_span"]
-                    )
-                    kept_records.extend(chunk_result["kept"])
-
-                kept_records.sort(key=lambda record: int(record["patch_idx"]))
-                for kept in kept_records:
-                    dataset_patches.append(
-                        {
-                            "dataset_idx": int(dataset_idx),
-                            "segment_idx": int(segment_idx),
-                            "segment_uuid": str(seg_scaled.uuid),
-                            "segment": seg_scaled,
-                            "volume": volume,
-                            "scale": int(volume_scale),
-                            "world_bbox": tuple(int(v) for v in kept["world_bbox"]),
-                            "bbox_id": int(kept["bbox_id"]),
-                            "z_band": int(kept["z_band"]),
-                            "grid_index": tuple(int(v) for v in kept["grid_index"]),
-                            "valid_point_count": int(kept["valid_point_count"]),
-                            "positive_point_count": int(kept["positive_point_count"]),
-                            "positive_fraction": float(kept["positive_fraction"]),
-                            "span_zyx": tuple(float(v) for v in kept["span_zyx"]),
-                            "ink_label_path": segment_ink_label_path,
-                        }
-                    )
-                patch_generation_stats["kept_patches"] += int(len(kept_records))
-
         patches.extend(dataset_patches)
-        cache_entries[cache_key] = {
-            "patches": [
-                {
-                    "segment_uuid": str(p["segment_uuid"]),
-                    "world_bbox": list(p["world_bbox"]),
-                    "bbox_id": int(p["bbox_id"]),
-                    "z_band": int(p["z_band"]),
-                    "grid_index": list(p["grid_index"]),
-                    "valid_point_count": int(p["valid_point_count"]),
-                    "positive_point_count": int(p["positive_point_count"]),
-                    "positive_fraction": float(p["positive_fraction"]),
-                    "span_zyx": list(p["span_zyx"]),
-                    "ink_label_path": p.get("ink_label_path"),
-                }
-                for p in dataset_patches
-            ]
-        }
+        patch_generation_stats["candidate_bboxes"] += int(dataset_stats["candidate_bboxes"])
+        patch_generation_stats["rejected_without_points"] += int(dataset_stats["rejected_without_points"])
+        patch_generation_stats["rejected_without_positive"] += int(dataset_stats["rejected_without_positive"])
+        patch_generation_stats["kept_patches"] += int(dataset_stats["kept_patches"])
 
+        cache_entries[cache_key] = {
+            "patches": [_serialize_patch_record(patch) for patch in dataset_patches]
+        }
         cache_dir = os.path.dirname(cache_path)
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)

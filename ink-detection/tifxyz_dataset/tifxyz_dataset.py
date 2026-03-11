@@ -37,11 +37,9 @@ class TifxyzInkDataset(Dataset):
         self.surface_bbox_pad = float(config.get("surface_bbox_pad", 2.0))
       
         self.overlap_fraction = float(config.get("overlap_fraction", 0.25))             # amount of overlap (stride) in train/val patches, as a percentage of the patch size
-        self.min_positive_fraction = float(config.get("min_positive_fraction", 0.01))   # minimum amount of labeled voxels in a candidate bbox to be added to our patches list, as a percentage of the total voxels
-        self.min_span_ratio = float(config.get("min_span_ratio", 0.50))                 # the "span" in this instance is how far across the principle "direction" axis the segment should span (bbox local)
         self.patch_finding_workers = int(
             config.get("patch_finding_workers", 4)
-        )                                                                               # workers for both z-band generation and bbox filtering
+        )                                                                               # reserved for patch-finding parallelism
         self.patch_cache_force_recompute = bool(
             config.get("patch_cache_force_recompute", False)
         )
@@ -59,14 +57,12 @@ class TifxyzInkDataset(Dataset):
         else:
             self.augmentations = None
 
-        self.patches, self.patch_generation_stats = find_patches(                       # greedily add bboxes along the 2d tifxyz grid , adding a new patch any time we meet requirements for: 
+        self.patches, self.patch_generation_stats = find_patches(                       # compute shared dataset bboxes, then keep only bboxes with tifxyz points and positive supervision
             config,                                                                     
             patch_size_zyx=self.patch_size_zyx,                                         # - patch size (in 3d)       
             overlap_fraction=self.overlap_fraction,                                     # - 3d bbox overlap
-            min_positive_fraction=self.min_positive_fraction,                           # - label percentage  
-            min_span_ratio=self.min_span_ratio,                                         # - axis span
             patch_finding_workers=self.patch_finding_workers,
-            patch_cache_force_recompute=self.patch_cache_force_recompute,               # see vesuvius/src/vesuvius/neural_tracing/inference/generate_segment_cover_bboxes.py  
+            patch_cache_force_recompute=self.patch_cache_force_recompute,
             patch_cache_filename=self.patch_cache_filename,                             # for info on the bbox generation
         )
 
@@ -148,6 +144,12 @@ class TifxyzInkDataset(Dataset):
 
     def __getitem__(self, idx):
         patch = self.patches[idx]
+        supervised_segment_indices = tuple(int(v) for v in patch["supervised_segment_indices"])
+        assert supervised_segment_indices, "patch must contain at least one supervised segment"
+        chosen_segment_idx = int(
+            supervised_segment_indices[np.random.randint(len(supervised_segment_indices))]
+        )
+        patch_segment = patch["segments"][chosen_segment_idx]
 
         z0, z1, y0, y1, x0, x1 = patch['world_bbox']
         min_corner = np.array([z0, y0, x0], dtype=np.int32)
@@ -162,7 +164,7 @@ class TifxyzInkDataset(Dataset):
             max_corner=max_corner,
         )
         
-        segment = patch["segment"]
+        segment = patch_segment["segment"]
         
         sampled_grid = _sample_patch_supervision_grid(
             self,
@@ -170,6 +172,7 @@ class TifxyzInkDataset(Dataset):
             min_corner=min_corner,
             max_corner=max_corner,
             extra_bbox_pad=max(max(self.bg_distance), max(self.label_distance)) + 1.0,
+            stored_rowcol_bounds=patch_segment["stored_rowcol_bounds"],
         )
 
         positive_point_mask = sampled_grid["in_patch"] & (sampled_grid["class_codes"] == 1)
@@ -249,6 +252,7 @@ class TifxyzInkDataset(Dataset):
             "surface_vox": surface_vox,
             "projected_loss_mask": projected_loss_mask,
             "patch": patch,
+            "patch_segment": patch_segment,
             "idx": int(idx),
         }
 
@@ -258,7 +262,16 @@ if __name__ == "__main__":
     import argparse
     import json
 
+    default_config_path = os.path.join(
+        os.path.dirname(__file__),
+        "example_config.json",
+    )
     parser = argparse.ArgumentParser(description="Inspect the TifxyzInkDataset.")
+    parser.add_argument(
+        "--config",
+        default=default_config_path,
+        help="Path to the dataset config JSON.",
+    )
     parser.add_argument(
         "--napari",
         action="store_true",
@@ -272,8 +285,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    config_path = os.path.join(os.path.dirname(__file__), "example_config.json")
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(args.config, "r", encoding="utf-8") as f:
         config = json.load(f)
 
     ds = TifxyzInkDataset(
