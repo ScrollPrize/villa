@@ -116,8 +116,6 @@ class DinoVitStudentTeacher(nn.Module):
     def __init__(self, config: Mapping[str, Any]) -> None:
         super().__init__()
         self.config = dict(config)
-        if bool(self.config.get("ibot_separate_head", False)):
-            raise ValueError("Shared DINO/iBOT head is required; separate iBOT heads are not supported.")
         student_backbone = self._build_backbone(self.config)
         teacher_backbone = deepcopy(student_backbone)
 
