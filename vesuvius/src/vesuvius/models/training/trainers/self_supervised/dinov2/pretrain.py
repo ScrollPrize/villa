@@ -294,6 +294,28 @@ class DinoIBOTPretrainer:
             last_layer_lr_schedule,
         )
 
+    def _build_dataloader_kwargs(self) -> dict[str, Any]:
+        num_workers = int(_config_get(self.config, "dataloader-workers", "dataloader_workers", "num_workers", default=0))
+        if num_workers < 0:
+            raise ValueError(f"dataloader workers must be non-negative, got {num_workers}")
+
+        kwargs: dict[str, Any] = {
+            "num_workers": num_workers,
+            "pin_memory": self.device.type == "cuda",
+            "drop_last": True,
+        }
+
+        prefetch_factor = _config_get(self.config, "prefetch-factor", "prefetch_factor")
+        if prefetch_factor is not None:
+            prefetch_factor = int(prefetch_factor)
+            if prefetch_factor <= 0:
+                raise ValueError(f"prefetch factor must be positive, got {prefetch_factor}")
+            if num_workers <= 0:
+                raise ValueError("prefetch factor requires dataloader workers greater than zero")
+            kwargs["prefetch_factor"] = prefetch_factor
+
+        return kwargs
+
     def build_dataloader(self) -> DataLoader:
         dataset = SSLZarrDataset(self.config["dataset"], do_augmentations=True)
         collate_fn = build_dino_ibot_collate_fn(
@@ -318,10 +340,8 @@ class DinoIBOTPretrainer:
             batch_size=int(self.config.get("batch_size", 2)),
             shuffle=shuffle if sampler is None else False,
             sampler=sampler,
-            num_workers=int(self.config.get("num_workers", 0)),
-            pin_memory=self.device.type == "cuda",
-            drop_last=True,
             collate_fn=collate_fn,
+            **self._build_dataloader_kwargs(),
         )
 
     def build_val_dataloader(self) -> DataLoader | None:
@@ -350,10 +370,8 @@ class DinoIBOTPretrainer:
             batch_size=int(self.config.get("batch_size", 2)),
             shuffle=False,
             sampler=sampler,
-            num_workers=int(self.config.get("num_workers", 0)),
-            pin_memory=self.device.type == "cuda",
-            drop_last=True,
             collate_fn=collate_fn,
+            **self._build_dataloader_kwargs(),
         )
 
     @staticmethod
