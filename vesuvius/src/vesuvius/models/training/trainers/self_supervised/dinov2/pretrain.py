@@ -44,14 +44,23 @@ class DinoIBOTPretrainer:
         self.model_config = dict(self.config["model"])
         self.device = torch.device(self.config.get("device") or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.use_amp = bool(self.config.get("use_amp", self.device.type == "cuda"))
+        self.max_iterations = int(self.config.get("max_iterations", self.config.get("num_iterations", 1000000)))
+        self.total_steps = self.max_iterations
+        self.base_lr = float(self.config.get("lr", 1e-4))
+        self.min_lr = float(self.config.get("min_lr", 1e-6))
+        self.base_weight_decay = float(self.config.get("weight_decay", 0.04))
+        self.final_weight_decay = float(self.config.get("weight_decay_end", 0.4))
+        self.betas = tuple(self.config.get("betas", (0.9, 0.999)))
+        self.clip_grad = float(self.config.get("clip_grad", 3.0))
+
+        warmup_ratio = float(self.config.get("warmup_ratio", 0.1))
+        default_warmup_steps = 0
+        if self.total_steps > 0 and warmup_ratio > 0.0:
+            default_warmup_steps = max(1, round(self.total_steps * warmup_ratio))
+        self.warmup_steps = int(self.config["warmup_steps"]) if "warmup_steps" in self.config else default_warmup_steps
 
         self.model = DinoVitStudentTeacher(self.model_config).to(self.device)
-        self.optimizer = torch.optim.AdamW(
-            self.model.student.parameters(),
-            lr=float(self.config.get("lr", 1e-4)),
-            betas=tuple(self.config.get("betas", (0.9, 0.999))),
-            weight_decay=float(self.config.get("weight_decay", 0.04)),
-        )
+        self.optimizer = self._build_optimizer()
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self.device.type == "cuda")
 
         dino_out_dim = int(self.model_config.get("dino_out_dim", 65536))
@@ -64,13 +73,6 @@ class DinoIBOTPretrainer:
         self.ibot_loss_weight = float(self.config.get("ibot_loss_weight", 1.0))
         self.koleo_loss_weight = float(self.config.get("koleo_loss_weight", 0.1))
         self.centering = str(self.config.get("centering", "centering"))
-
-        self.max_iterations = int(self.config.get("max_iterations", self.config.get("num_iterations", 1000000)))
-        self.warmup_steps = int(self.config.get("warmup_steps", 0))
-        self.total_steps = self.max_iterations
-        self.base_lr = float(self.config.get("lr", 1e-4))
-        self.min_lr = float(self.config.get("min_lr", 1e-6))
-        self.clip_grad = float(self.config.get("clip_grad", 3.0))
 
         self.teacher_temp = float(self.config.get("teacher_temp", 0.07))
         self.warmup_teacher_temp = float(self.config.get("warmup_teacher_temp", 0.04))
@@ -88,6 +90,52 @@ class DinoIBOTPretrainer:
         self.monitor_dir = self.output_dir / "monitor"
         self.monitor_dir.mkdir(parents=True, exist_ok=True)
         self._warned_missing_val_dataset = False
+
+    def _student_no_weight_decay_names(self) -> set[str]:
+        no_decay_names: set[str] = set()
+        for module_name, module in self.model.student.named_modules():
+            if module is self.model.student or not hasattr(module, "no_weight_decay"):
+                continue
+            module_prefix = f"{module_name}." if module_name else ""
+            no_decay_names.update(module_prefix + name for name in module.no_weight_decay())
+        return no_decay_names
+
+    def _build_optimizer(self) -> torch.optim.Optimizer:
+        no_decay_names = self._student_no_weight_decay_names()
+        decay_params: list[torch.nn.Parameter] = []
+        no_decay_params: list[torch.nn.Parameter] = []
+
+        for name, parameter in self.model.student.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if name in no_decay_names:
+                no_decay_params.append(parameter)
+            else:
+                decay_params.append(parameter)
+
+        param_groups: list[dict[str, Any]] = []
+        if decay_params:
+            param_groups.append(
+                {
+                    "params": decay_params,
+                    "weight_decay": self.base_weight_decay,
+                    "apply_weight_decay": True,
+                }
+            )
+        if no_decay_params:
+            param_groups.append(
+                {
+                    "params": no_decay_params,
+                    "weight_decay": 0.0,
+                    "apply_weight_decay": False,
+                }
+            )
+
+        return torch.optim.AdamW(
+            param_groups,
+            lr=self.base_lr,
+            betas=self.betas,
+        )
 
     def build_dataloader(self) -> DataLoader:
         dataset = SSLZarrDataset(self.config["dataset"], do_augmentations=True)
@@ -173,6 +221,13 @@ class DinoIBOTPretrainer:
             group["lr"] = lr
         return lr
 
+    def _set_weight_decay(self, step: int) -> float:
+        weight_decay = _cosine_schedule(step, self.total_steps, self.base_weight_decay, self.final_weight_decay)
+        for group in self.optimizer.param_groups:
+            if group.get("apply_weight_decay", True):
+                group["weight_decay"] = weight_decay
+        return weight_decay
+
     def _center_teacher_cls(
         self,
         teacher_cls: torch.Tensor,
@@ -209,6 +264,7 @@ class DinoIBOTPretrainer:
     def train_step(self, batch: Mapping[str, Any], step: int) -> dict[str, float]:
         self.model.train()
         lr = self._set_lr(step)
+        weight_decay = self._set_weight_decay(step)
         teacher_temp = self._teacher_temp(step)
 
         global_crops = batch["collated_global_crops"].to(self.device, non_blocking=True)
@@ -292,6 +348,7 @@ class DinoIBOTPretrainer:
             "ibot_loss": float(ibot_loss.detach()),
             "koleo_loss": float(koleo_loss.detach()),
             "lr": lr,
+            "weight_decay": weight_decay,
             "teacher_temp": teacher_temp,
         }
 
