@@ -41,7 +41,7 @@ _HEAD_DEFAULTS = {
     "bottleneck_dim": 256,
     "nlayers": 3,
     "use_bn": False,
-    "norm_last_layer": True,
+    "norm_last_layer": False,
 }
 
 
@@ -123,7 +123,7 @@ class DINOHead(nn.Module):
         bottleneck_dim: int = 256,
         nlayers: int = 3,
         use_bn: bool = False,
-        norm_last_layer: bool = True,
+        norm_last_layer: bool = False,
     ) -> None:
         super().__init__()
         if nlayers < 1:
