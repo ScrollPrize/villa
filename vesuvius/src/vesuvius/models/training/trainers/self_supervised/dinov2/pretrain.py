@@ -52,9 +52,9 @@ class DinoIBOTPretrainer:
 
         dino_out_dim = int(self.model_config.get("dino_out_dim", 65536))
         ibot_out_dim = int(self.model_config.get("ibot_out_dim", dino_out_dim))
-        self.dino_loss = DINOLoss(dino_out_dim)
-        self.ibot_patch_loss = iBOTPatchLoss(ibot_out_dim)
-        self.koleo_loss = KoLeoLoss()
+        self.dino_loss = DINOLoss(dino_out_dim).to(self.device)
+        self.ibot_patch_loss = iBOTPatchLoss(ibot_out_dim).to(self.device)
+        self.koleo_loss = KoLeoLoss().to(self.device)
 
         self.dino_loss_weight = float(self.config.get("dino_loss_weight", 1.0))
         self.ibot_loss_weight = float(self.config.get("ibot_loss_weight", 1.0))
