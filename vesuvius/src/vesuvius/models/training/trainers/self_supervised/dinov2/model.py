@@ -31,6 +31,7 @@ _BACKBONE_DEFAULTS = {
     "init_values": None,
     "use_abs_pos_emb": True,
     "use_rot_pos_emb": True,
+    "num_reg_tokens": 0,
     "grad_checkpointing": False,
     "block_chunks": 0,
 }
@@ -148,6 +149,8 @@ class DinoVitStudentTeacher(nn.Module):
     @staticmethod
     def _build_backbone(config: Mapping[str, Any]) -> nn.Module:
         backbone_config = {key: config.get(key, default) for key, default in _BACKBONE_DEFAULTS.items()}
+        if "num_reg_tokens" not in config and "num_register_tokens" in config:
+            backbone_config["num_reg_tokens"] = int(config["num_register_tokens"])
         global_crops_size = _as_3tuple(backbone_config["global_crops_size"])
         local_crop_value = backbone_config["local_crops_size"] or global_crops_size
         local_crops_size = _as_3tuple(local_crop_value)

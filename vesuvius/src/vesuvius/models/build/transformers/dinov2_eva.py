@@ -439,8 +439,6 @@ class Eva(nn.Module):
             Tuple[torch.Tensor, Optional[torch.Tensor]]: Positionally encoded input.
         """
         pos_embed = self.pos_embed
-        
-        # Add CLS token to input before interpolation
         if self.cls_token is not None:
             x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
         
@@ -454,7 +452,7 @@ class Eva(nn.Module):
                     pos_embed,
                     source_size=source_size,
                     target_size=target_size,
-                    num_prefix_tokens=self.num_prefix_tokens
+                    num_prefix_tokens=self.num_class_tokens
                 )
             rot_pos_embed = self.local_rope.get_embed() if self.local_rope is not None else None
         else:
@@ -463,14 +461,13 @@ class Eva(nn.Module):
         # Add interpolated positional embeddings
         if pos_embed is not None:
             x = x + pos_embed
-        
-        # Handle register tokens if present
+
         if self.reg_token is not None:
-            to_cat = []
+            reg_tokens = self.reg_token.expand(x.shape[0], -1, -1)
             if self.cls_token is not None:
-                to_cat.append(self.cls_token.expand(x.shape[0], -1, -1))
-            to_cat.append(self.reg_token.expand(x.shape[0], -1, -1))
-            x = torch.cat(to_cat + [x], dim=1)
+                x = torch.cat((x[:, :1], reg_tokens, x[:, 1:]), dim=1)
+            else:
+                x = torch.cat((reg_tokens, x), dim=1)
         
         x = self.pos_drop(x)
         
