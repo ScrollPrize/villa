@@ -316,8 +316,19 @@ class DinoIBOTPretrainer:
 
         return kwargs
 
+    def _dataset_config(self, key: str) -> Mapping[str, Any] | None:
+        dataset_config = self.config.get(key)
+        if dataset_config is None:
+            return None
+        resolved_config = dict(dataset_config)
+        resolved_config.setdefault(
+            "epoch_length",
+            int(self.config.get("official_epoch_length", self.config.get("epoch_length", self.max_iterations))),
+        )
+        return resolved_config
+
     def build_dataloader(self) -> DataLoader:
-        dataset = SSLZarrDataset(self.config["dataset"], do_augmentations=True)
+        dataset = SSLZarrDataset(self._dataset_config("dataset"), do_augmentations=True)
         collate_fn = build_dino_ibot_collate_fn(
             {
                 "global_crop_size": dataset.global_crop_size,
@@ -345,7 +356,7 @@ class DinoIBOTPretrainer:
         )
 
     def build_val_dataloader(self) -> DataLoader | None:
-        val_dataset_config = self.config.get("val_dataset")
+        val_dataset_config = self._dataset_config("val_dataset")
         if val_dataset_config is None:
             return None
         dataset = SSLZarrDataset(val_dataset_config, do_augmentations=True)

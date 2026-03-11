@@ -71,18 +71,28 @@ def open_zarr(path, resolution, auth=None, s3_storage_options=None):
             asynchronous=True,
             client_kwargs={"auth": aiohttp.BasicAuth(user, password)},
         )
-        store = zarr.storage.FsspecStore(
-            fs=fs,
-            path=path_str.rstrip("/"),
-            read_only=True,
-            allowed_exceptions=(
-                KeyError,
-                FileNotFoundError,
-                PermissionError,
-                OSError,
-                aiohttp.ClientResponseError,
-            ),
-        )
+        if hasattr(zarr.storage, "FsspecStore"):
+            store = zarr.storage.FsspecStore(
+                fs=fs,
+                path=path_str.rstrip("/"),
+                read_only=True,
+                allowed_exceptions=(
+                    KeyError,
+                    FileNotFoundError,
+                    PermissionError,
+                    OSError,
+                    aiohttp.ClientResponseError,
+                ),
+            )
+        else:
+            store = zarr.storage.FSStore(
+                path_str.rstrip("/"),
+                fs=fs,
+                mode="r",
+                check=False,
+                create=False,
+                exceptions=(KeyError, FileNotFoundError, PermissionError, OSError, aiohttp.ClientResponseError),
+            )
         return zarr.open(store, path=str(resolution), mode="r")
     return zarr.open(path_str, path=str(resolution), mode="r")
 
@@ -93,6 +103,7 @@ class SSLZarrDataset(Dataset):
         self.config = config
         self.do_augmentations = do_augmentations
         self.single_crop_only = bool(self.config.get("single_crop_only", False) or single_crop_only)
+        self.epoch_length = int(self.config["epoch_length"]) if "epoch_length" in self.config else None
         self.global_crop_size = _as_3tuple(
             self.config["global_crop_size"] if "global_crop_size" in self.config else self.config["crop_size"]
         )
@@ -235,6 +246,8 @@ class SSLZarrDataset(Dataset):
         return self._finalize_crop(crop, target_size)
     
     def __len__(self):
+        if self.epoch_length is not None:
+            return self.epoch_length
         return self.total_valid_crop_starts
 
     def __getitem__(self, idx):
