@@ -8,15 +8,19 @@ from typing import Any, Iterator, Mapping
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 from PIL import Image
 
 from vesuvius.models.datasets.ssl_zarr_dataset import SSLZarrDataset
 
 from .collate import build_dino_ibot_collate_fn
+from .distributed_utils import build_distributed_sampler, resolve_distributed_config
 from .loss import DINOLoss, KoLeoLoss, iBOTPatchLoss
 from .model import DinoVitStudentTeacher
 
@@ -81,7 +85,33 @@ class DinoIBOTPretrainer:
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.config = dict(config)
         self.model_config = dict(self.config["model"])
-        self.device = torch.device(self.config.get("device") or ("cuda" if torch.cuda.is_available() else "cpu"))
+        distributed_config = resolve_distributed_config(self.config)
+        self.is_distributed = bool(distributed_config["use_ddp"])
+        self.rank = int(distributed_config["rank"])
+        self.local_rank = int(distributed_config["local_rank"])
+        self.world_size = int(distributed_config["world_size"])
+
+        configured_device = self.config.get("device")
+        if torch.cuda.is_available():
+            if self.is_distributed:
+                torch.cuda.set_device(self.local_rank)
+                self.device = torch.device("cuda", self.local_rank)
+            else:
+                self.device = torch.device(configured_device or "cuda")
+                if self.device.type == "cuda" and self.device.index is not None:
+                    torch.cuda.set_device(self.device.index)
+        else:
+            self.device = torch.device(configured_device or "cpu")
+
+        if self.is_distributed:
+            if self.world_size < 2 and not dist.is_initialized():
+                raise ValueError("DDP requested but WORLD_SIZE is 1. Launch with torchrun, for example: torchrun --nproc_per_node=NUM_GPUS pretrain.py ...")
+            if not dist.is_initialized():
+                backend = "nccl" if self.device.type == "cuda" else "gloo"
+                dist.init_process_group(backend=backend, init_method="env://")
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+
         self.use_amp = bool(self.config.get("use_amp", self.device.type == "cuda"))
         self.max_iterations = int(self.config.get("max_iterations", self.config.get("num_iterations", 1000000)))
         self.total_steps = self.max_iterations
@@ -107,6 +137,19 @@ class DinoIBOTPretrainer:
 
         self.model = DinoVitStudentTeacher(self.model_config).to(self.device)
         self.optimizer = self._build_optimizer()
+        if self.is_distributed:
+            ddp_kwargs: dict[str, Any] = {
+                "broadcast_buffers": False,
+                "find_unused_parameters": False,
+            }
+            if self.device.type == "cuda":
+                ddp_kwargs.update(
+                    {
+                        "device_ids": [self.device.index],
+                        "output_device": self.device.index,
+                    }
+                )
+            self.model = DDP(self.model, **ddp_kwargs)
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self.device.type == "cuda")
 
         dino_out_dim = int(self.model_config.get("dino_out_dim", 65536))
@@ -162,6 +205,18 @@ class DinoIBOTPretrainer:
         self._monitor_collate_fn: Any | None = None
         self._monitor_seed_pool = tuple(self.monitor_seed + offset for offset in range(self.monitor_pool_size))
         self._monitor_selection_rng = random.Random(self.monitor_seed)
+        self._train_sampler_epoch = 0
+        self._val_sampler_epoch = 0
+
+    @property
+    def is_main_process(self) -> bool:
+        return self.rank == 0
+
+    @property
+    def model_module(self) -> DinoVitStudentTeacher:
+        if isinstance(self.model, DDP):
+            return self.model.module
+        return self.model
 
     def _resolve_step_count(self, steps_key: str, epochs_key: str, *, default: int) -> int:
         if steps_key in self.config:
@@ -236,10 +291,19 @@ class DinoIBOTPretrainer:
                 "dtype": torch.float32,
             }
         )
+        shuffle = bool(self.config.get("shuffle", False))
+        sampler = build_distributed_sampler(
+            dataset,
+            is_distributed=self.is_distributed,
+            rank=self.rank,
+            world_size=self.world_size,
+            shuffle=shuffle,
+        )
         return DataLoader(
             dataset,
             batch_size=int(self.config.get("batch_size", 2)),
-            shuffle=False,
+            shuffle=shuffle if sampler is None else False,
+            sampler=sampler,
             num_workers=int(self.config.get("num_workers", 0)),
             pin_memory=self.device.type == "cuda",
             drop_last=True,
@@ -260,15 +324,38 @@ class DinoIBOTPretrainer:
                 "dtype": torch.float32,
             }
         )
+        sampler = build_distributed_sampler(
+            dataset,
+            is_distributed=self.is_distributed,
+            rank=self.rank,
+            world_size=self.world_size,
+            shuffle=False,
+        )
         return DataLoader(
             dataset,
             batch_size=int(self.config.get("batch_size", 2)),
             shuffle=False,
+            sampler=sampler,
             num_workers=int(self.config.get("num_workers", 0)),
             pin_memory=self.device.type == "cuda",
             drop_last=True,
             collate_fn=collate_fn,
         )
+
+    @staticmethod
+    def _set_sampler_epoch(dataloader: DataLoader, epoch: int) -> None:
+        if isinstance(dataloader.sampler, DistributedSampler):
+            dataloader.sampler.set_epoch(epoch)
+
+    def _average_metrics(self, metrics: Mapping[str, float]) -> dict[str, float]:
+        averaged = {key: float(value) for key, value in metrics.items()}
+        if not self.is_distributed:
+            return averaged
+        keys = list(averaged)
+        values = torch.tensor([averaged[key] for key in keys], device=self.device, dtype=torch.float64)
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+        values /= self.world_size
+        return {key: float(values[index].item()) for index, key in enumerate(keys)}
 
     def _get_monitor_source(self) -> tuple[SSLZarrDataset, Any]:
         if self._monitor_dataset is None or self._monitor_collate_fn is None:
@@ -394,6 +481,26 @@ class DinoIBOTPretrainer:
         stats["std"] = float(values.std(unbiased=False).item()) if values.numel() > 1 else 0.0
         return stats
 
+    def _forward_model(
+        self,
+        *,
+        global_crops: torch.Tensor,
+        local_crops: torch.Tensor | None,
+        masks: torch.Tensor,
+        mask_indices: torch.Tensor,
+        n_masked: int,
+        return_teacher: bool,
+    ) -> Mapping[str, Any]:
+        return self.model(
+            student_input=global_crops,
+            teacher_input=global_crops if return_teacher else None,
+            student_masks=masks,
+            local_student_input=local_crops,
+            mask_indices_list=mask_indices,
+            n_masked_patches=n_masked,
+            return_teacher=return_teacher,
+        )
+
     def verify_batch_pipeline(self, batch: Mapping[str, Any], step: int = 0) -> dict[str, Any]:
         teacher_temp = self._teacher_temp(step)
         global_crops = batch["collated_global_crops"].to(self.device, non_blocking=True)
@@ -408,20 +515,24 @@ class DinoIBOTPretrainer:
 
         self.model.eval()
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-            teacher_outputs = self.model._forward_branch(
-                self.model.teacher,
-                global_crops,
-                masks=None,
-                project_cls_tokens=False,
+            model_outputs = self._forward_model(
+                global_crops=global_crops,
+                local_crops=local_crops if n_local_views else None,
+                masks=masks,
+                mask_indices=mask_indices,
+                n_masked=n_masked,
+                return_teacher=self.do_dino or self.do_ibot,
             )
-            teacher_cls_projections, teacher_patch = self.model.project_cls_and_masked_patch_tokens(
-                self.model.teacher,
-                teacher_outputs["cls_tokens"],
-                teacher_outputs["patch_tokens"],
-                mask_indices,
-                n_masked_patches=n_masked,
-            )
-            if self.do_dino:
+            teacher_branch = model_outputs.get("teacher")
+            if teacher_branch is not None:
+                teacher_outputs = teacher_branch["global"]
+                teacher_cls_projections = teacher_branch["global_cls_projections"]
+                teacher_patch = teacher_branch["global_masked_patch_projections"]
+            else:
+                teacher_outputs = None
+                teacher_cls_projections = None
+                teacher_patch = global_crops.new_zeros((0,))
+            if self.do_dino and teacher_cls_projections is not None:
                 teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
                     teacher_cls_projections,
                     teacher_temp,
@@ -429,7 +540,7 @@ class DinoIBOTPretrainer:
                 )
             else:
                 teacher_cls_0 = teacher_cls_1 = None
-            if self.do_ibot:
+            if self.do_ibot and teacher_branch is not None:
                 teacher_patch_targets = self._center_teacher_patch(
                     teacher_patch,
                     teacher_temp,
@@ -438,23 +549,14 @@ class DinoIBOTPretrainer:
             else:
                 teacher_patch_targets = None
 
-            student_global = self.model._forward_branch(
-                self.model.student,
-                global_crops,
-                masks=masks,
-                project_cls_tokens=False,
-            )
-            student_global_cls, student_patch = self.model.project_cls_and_masked_patch_tokens(
-                self.model.student,
-                student_global["cls_tokens"],
-                student_global["patch_tokens"],
-                mask_indices,
-                n_masked_patches=n_masked,
-            )
+            student_branch = model_outputs["student"]
+            student_global = student_branch["global"]
+            student_global_cls = student_branch["global_cls_projections"]
+            student_patch = student_branch["global_masked_patch_projections"]
             global_cls_0, global_cls_1 = student_global_cls.chunk(n_global_views)
 
             if n_local_views:
-                student_local = self.model._forward_branch(self.model.student, local_crops, masks=None)
+                student_local = student_branch["local"]
                 local_cls_chunks = list(student_local["cls_projections"].chunk(n_local_views))
             else:
                 student_local = None
@@ -496,7 +598,7 @@ class DinoIBOTPretrainer:
                 self.koleo_loss_weight * koleo_loss
             )
 
-        backbone = self.model.student.backbone
+        backbone = self.model_module.student.backbone
         expected_global_shape = tuple(int(dim) for dim in global_crops.shape[2:])
         expected_local_shape = tuple(int(dim) for dim in local_crops.shape[2:]) if n_local_views else None
         global_config_shape = tuple(int(dim) for dim in backbone.global_crops_size)
@@ -565,9 +667,9 @@ class DinoIBOTPretrainer:
                 "masks_weight": self._tensor_stats(masks_weight),
             },
             "teacher": {
-                "cls_tokens": self._tensor_stats(teacher_outputs["cls_tokens"]),
-                "patch_tokens": self._tensor_stats(teacher_outputs["patch_tokens"]),
-                "cls_projections": self._tensor_stats(teacher_cls_projections),
+                "cls_tokens": self._tensor_stats(teacher_outputs["cls_tokens"]) if teacher_outputs is not None else None,
+                "patch_tokens": self._tensor_stats(teacher_outputs["patch_tokens"]) if teacher_outputs is not None else None,
+                "cls_projections": self._tensor_stats(teacher_cls_projections) if teacher_cls_projections is not None else None,
                 "masked_patch_projections": self._tensor_stats(teacher_patch),
                 "cls_target_row_sums": teacher_cls_row_sums,
                 "patch_target_row_sums": teacher_patch_row_sums,
@@ -594,15 +696,15 @@ class DinoIBOTPretrainer:
     def verify_train_step(self, batch: Mapping[str, Any], step: int = 0) -> dict[str, Any]:
         forward_report = self.verify_batch_pipeline(batch, step=step)
 
-        student_named_parameters = list(self.model.student.named_parameters())
-        teacher_named_parameters = list(self.model.teacher.named_parameters())
+        student_named_parameters = list(self.model_module.student.named_parameters())
+        teacher_named_parameters = list(self.model_module.teacher.named_parameters())
         student_before = [parameter.detach().clone() for _, parameter in student_named_parameters]
         teacher_before = [parameter.detach().clone() for _, parameter in teacher_named_parameters]
 
         metrics = self.train_step(batch, step)
 
-        student_after = [parameter.detach() for parameter in self.model.student.parameters()]
-        teacher_after = [parameter.detach() for parameter in self.model.teacher.parameters()]
+        student_after = [parameter.detach() for parameter in self.model_module.student.parameters()]
+        teacher_after = [parameter.detach() for parameter in self.model_module.teacher.parameters()]
 
         student_delta_norm_sq = 0.0
         teacher_delta_norm_sq = 0.0
@@ -689,39 +791,35 @@ class DinoIBOTPretrainer:
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-            teacher_outputs = self.model._forward_branch(
-                self.model.teacher,
-                global_crops,
-                masks=None,
-                project_cls_tokens=False,
-            )
-            teacher_cls_projections, teacher_patch = self.model.project_cls_and_masked_patch_tokens(
-                self.model.teacher,
-                teacher_outputs["cls_tokens"],
-                teacher_outputs["patch_tokens"],
-                mask_indices,
-                n_masked_patches=n_masked,
-            )
-            if self.do_dino:
-                teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(teacher_cls_projections, teacher_temp)
-            if self.do_ibot:
-                teacher_patch_targets = self._center_teacher_patch(teacher_patch, teacher_temp)
-
         with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-            student_global = self.model._forward_branch(
-                self.model.student,
-                global_crops,
+            model_outputs = self._forward_model(
+                global_crops=global_crops,
+                local_crops=local_crops if n_local_views else None,
                 masks=masks,
-                project_cls_tokens=False,
+                mask_indices=mask_indices,
+                n_masked=n_masked,
+                return_teacher=self.do_dino or self.do_ibot,
             )
-            student_global_cls, student_patch = self.model.project_cls_and_masked_patch_tokens(
-                self.model.student,
-                student_global["cls_tokens"],
-                student_global["patch_tokens"],
-                mask_indices,
-                n_masked_patches=n_masked,
-            )
+            teacher_branch = model_outputs.get("teacher")
+            if self.do_dino and teacher_branch is not None:
+                teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
+                    teacher_branch["global_cls_projections"],
+                    teacher_temp,
+                )
+            else:
+                teacher_cls_0 = teacher_cls_1 = None
+            if self.do_ibot and teacher_branch is not None:
+                teacher_patch_targets = self._center_teacher_patch(
+                    teacher_branch["global_masked_patch_projections"],
+                    teacher_temp,
+                )
+            else:
+                teacher_patch_targets = None
+
+            student_branch = model_outputs["student"]
+            student_global = student_branch["global"]
+            student_global_cls = student_branch["global_cls_projections"]
+            student_patch = student_branch["global_masked_patch_projections"]
             global_cls_0, global_cls_1 = student_global_cls.chunk(2)
 
             total_terms = dino_loss_term_count(n_local_views)
@@ -732,7 +830,7 @@ class DinoIBOTPretrainer:
                 ) / total_terms
 
                 if n_local_views:
-                    student_local = self.model._forward_branch(self.model.student, local_crops, masks=None)
+                    student_local = student_branch["local"]
                     local_cls_chunks = list(student_local["cls_projections"].chunk(n_local_views))
                     dino_local_loss = self.dino_loss(local_cls_chunks, [teacher_cls_0, teacher_cls_1]) / total_terms
                 else:
@@ -765,10 +863,10 @@ class DinoIBOTPretrainer:
 
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
-        clip_grad_norm_(self.model.student.parameters(), self.clip_grad)
+        clip_grad_norm_(self.model_module.student.parameters(), self.clip_grad)
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        self.model.update_teacher(teacher_momentum)
+        self.model_module.update_teacher(teacher_momentum)
 
         return {
             "loss": float(loss.detach()),
@@ -815,8 +913,8 @@ class DinoIBOTPretrainer:
             {
                 "step": step,
                 "config": self.config,
-                "student": self.model.student.state_dict(),
-                "teacher": self.model.teacher.state_dict(),
+                "student": self.model_module.student.state_dict(),
+                "teacher": self.model_module.teacher.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "scaler": self.scaler.state_dict() if self.scaler.is_enabled() else None,
                 "dino_loss": self.dino_loss.state_dict(),
@@ -829,8 +927,8 @@ class DinoIBOTPretrainer:
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> int:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        self.model.student.load_state_dict(checkpoint["student"])
-        self.model.teacher.load_state_dict(checkpoint["teacher"])
+        self.model_module.student.load_state_dict(checkpoint["student"])
+        self.model_module.teacher.load_state_dict(checkpoint["teacher"])
         if "optimizer" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             self._optimizer_to_device()
@@ -905,12 +1003,11 @@ class DinoIBOTPretrainer:
         self.model.eval()
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
             global_crops = monitor_batch["collated_global_crops"].to(self.device, non_blocking=True)
-            student_outputs = self.model._forward_branch(
-                self.model.student,
-                global_crops,
-                masks=None,
-                project_patch_tokens=False,
-            )
+            student_outputs = self.model(
+                student_input=global_crops,
+                student_masks=None,
+                return_teacher=False,
+            )["student"]
 
         global_views = monitor_batch["collated_global_crops"]
         n_global_views = int(monitor_batch["n_global_views"])
@@ -955,43 +1052,30 @@ class DinoIBOTPretrainer:
         n_masked = int(batch["n_masked_patches"].item())
 
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-            teacher_outputs = self.model._forward_branch(
-                self.model.teacher,
-                global_crops,
-                masks=None,
-                project_cls_tokens=False,
-            )
-            teacher_cls_projections, teacher_patch = self.model.project_cls_and_masked_patch_tokens(
-                self.model.teacher,
-                teacher_outputs["cls_tokens"],
-                teacher_outputs["patch_tokens"],
-                mask_indices,
-                n_masked_patches=n_masked,
-            )
-            teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
-                teacher_cls_projections,
-                teacher_temp,
-                update_centers=False,
-            ) if self.do_dino else (None, None)
-            teacher_patch_targets = self._center_teacher_patch(
-                teacher_patch,
-                teacher_temp,
-                update_centers=False,
-            ) if self.do_ibot else None
-
-            student_global = self.model._forward_branch(
-                self.model.student,
-                global_crops,
+            model_outputs = self._forward_model(
+                global_crops=global_crops,
+                local_crops=local_crops if n_local_views else None,
                 masks=masks,
-                project_cls_tokens=False,
+                mask_indices=mask_indices,
+                n_masked=n_masked,
+                return_teacher=self.do_dino or self.do_ibot,
             )
-            student_global_cls, student_patch = self.model.project_cls_and_masked_patch_tokens(
-                self.model.student,
-                student_global["cls_tokens"],
-                student_global["patch_tokens"],
-                mask_indices,
-                n_masked_patches=n_masked,
-            )
+            teacher_branch = model_outputs.get("teacher")
+            teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
+                teacher_branch["global_cls_projections"],
+                teacher_temp,
+                update_centers=False,
+            ) if self.do_dino and teacher_branch is not None else (None, None)
+            teacher_patch_targets = self._center_teacher_patch(
+                teacher_branch["global_masked_patch_projections"],
+                teacher_temp,
+                update_centers=False,
+            ) if self.do_ibot and teacher_branch is not None else None
+
+            student_branch = model_outputs["student"]
+            student_global = student_branch["global"]
+            student_global_cls = student_branch["global_cls_projections"]
+            student_patch = student_branch["global_masked_patch_projections"]
             global_cls_0, global_cls_1 = student_global_cls.chunk(2)
 
             total_terms = dino_loss_term_count(n_local_views)
@@ -1002,7 +1086,7 @@ class DinoIBOTPretrainer:
                 ) / total_terms
 
                 if n_local_views:
-                    student_local = self.model._forward_branch(self.model.student, local_crops, masks=None)
+                    student_local = student_branch["local"]
                     local_cls_chunks = list(student_local["cls_projections"].chunk(n_local_views))
                     dino_local_loss = self.dino_loss(local_cls_chunks, [teacher_cls_0, teacher_cls_1]) / total_terms
                 else:
@@ -1049,45 +1133,59 @@ class DinoIBOTPretrainer:
             start_step = self.load_checkpoint(resume_path) + 1
 
         dataloader = self.build_dataloader()
+        self._set_sampler_epoch(dataloader, self._train_sampler_epoch)
         dataloader_iter: Iterator[Any] = iter(dataloader)
         val_dataloader = self.build_val_dataloader()
+        if val_dataloader is not None:
+            self._set_sampler_epoch(val_dataloader, self._val_sampler_epoch)
         val_dataloader_iter: Iterator[Any] | None = iter(val_dataloader) if val_dataloader is not None else None
-        with tqdm(total=self.max_iterations, initial=start_step, desc="training", unit="iter") as progress:
+        progress = tqdm(total=self.max_iterations, initial=start_step, desc="training", unit="iter") if self.is_main_process else None
+        try:
             for step in range(start_step, self.max_iterations):
                 try:
                     batch = next(dataloader_iter)
                 except StopIteration:
+                    self._train_sampler_epoch += 1
+                    self._set_sampler_epoch(dataloader, self._train_sampler_epoch)
                     dataloader_iter = iter(dataloader)
                     batch = next(dataloader_iter)
 
-                metrics = self.train_step(batch, step)
-                progress.set_postfix(
-                    loss=f"{metrics['loss']:.4f}",
-                    glob_loss=f"{metrics['dino_global_loss']:.4f}",
-                    loc_loss=f"{metrics['dino_local_loss']:.4f}",
-                    ibot_loss=f"{metrics['ibot_loss']:.4f}",
-                    koleo_loss=f"{metrics['koleo_loss']:.4f}",
-                )
-                progress.update(1)
+                metrics = self._average_metrics(self.train_step(batch, step))
+                if progress is not None:
+                    progress.set_postfix(
+                        loss=f"{metrics['loss']:.4f}",
+                        glob_loss=f"{metrics['dino_global_loss']:.4f}",
+                        loc_loss=f"{metrics['dino_local_loss']:.4f}",
+                        ibot_loss=f"{metrics['ibot_loss']:.4f}",
+                        koleo_loss=f"{metrics['koleo_loss']:.4f}",
+                    )
+                    progress.update(1)
 
-                if step % self.log_every == 0:
+                if self.is_main_process and step % self.log_every == 0:
                     print(f"step={step} loss={metrics['loss']:.4f} lr={metrics['lr']:.2e}")
                 if self.val_every_n and step > 0 and step % self.val_every_n == 0:
                     if val_dataloader_iter is None:
-                        if not self._warned_missing_val_dataset:
+                        if self.is_main_process and not self._warned_missing_val_dataset:
                             print("val_every_n is set but no val_dataset is configured; skipping validation.")
                             self._warned_missing_val_dataset = True
                     else:
                         try:
                             val_batch = next(val_dataloader_iter)
                         except StopIteration:
+                            self._val_sampler_epoch += 1
+                            self._set_sampler_epoch(val_dataloader, self._val_sampler_epoch)
                             val_dataloader_iter = iter(val_dataloader)
                             val_batch = next(val_dataloader_iter)
-                        val_metrics = self.validate(val_batch, step)
-                        print(f"step={step} val_loss={val_metrics['loss']:.4f}")
-                    self.save_monitor_image(self.sample_monitor_batch(), step, metrics)
-                if self.save_every_n and step > 0 and step % self.save_every_n == 0:
+                        val_metrics = self._average_metrics(self.validate(val_batch, step))
+                        if self.is_main_process:
+                            print(f"step={step} val_loss={val_metrics['loss']:.4f}")
+                    if self.is_main_process:
+                        self.save_monitor_image(self.sample_monitor_batch(), step, metrics)
+                if self.is_main_process and self.save_every_n and step > 0 and step % self.save_every_n == 0:
                     self.save_checkpoint(step)
+        finally:
+            if progress is not None:
+                progress.close()
 
 
 def main() -> None:
@@ -1095,6 +1193,7 @@ def main() -> None:
     parser.add_argument("config", type=str)
     parser.add_argument("--resume-from", type=str, default=None)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--ddp", action="store_true")
     args = parser.parse_args()
     
     with open(args.config, 'r') as f:
@@ -1107,9 +1206,15 @@ def main() -> None:
         config["resume"] = False
         config["auto_resume"] = False
         config.pop("resume_from", None)
-        
+    if args.ddp:
+        config["use_ddp"] = True
+
     trainer = DinoIBOTPretrainer(config)
-    trainer.fit()
+    try:
+        trainer.fit()
+    finally:
+        if trainer.is_distributed and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

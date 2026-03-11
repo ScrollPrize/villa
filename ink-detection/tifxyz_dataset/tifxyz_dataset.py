@@ -256,8 +256,6 @@ class TifxyzInkDataset(Dataset):
             "idx": int(idx),
         }
 
-
-
 if __name__ == "__main__":
     import argparse
     import json

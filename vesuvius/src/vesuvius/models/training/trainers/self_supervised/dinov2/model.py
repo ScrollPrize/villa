@@ -451,29 +451,73 @@ class DinoVitStudentTeacher(nn.Module):
         teacher_input: Optional[torch.Tensor] = None,
         student_masks: Optional[torch.Tensor] = None,
         teacher_masks: Optional[torch.Tensor] = None,
+        local_student_input: Optional[torch.Tensor] = None,
+        mask_indices_list: Optional[torch.Tensor] = None,
+        n_masked_patches: Optional[int] = None,
         *,
         return_teacher: bool = True,
         project_student_patch_tokens: bool = False,
         project_teacher_patch_tokens: bool = False,
-    ) -> dict[str, Mapping[str, torch.Tensor]]:
-        outputs: dict[str, Mapping[str, torch.Tensor]] = {
-            "student": self._forward_branch(
+    ) -> dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]]:
+        project_cls_tokens = mask_indices_list is None
+        student_outputs = self._forward_branch(
+            self.student,
+            student_input,
+            masks=student_masks,
+            project_cls_tokens=project_cls_tokens,
+            project_patch_tokens=project_student_patch_tokens and mask_indices_list is None,
+        )
+        if mask_indices_list is None:
+            outputs: dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]] = {
+                "student": student_outputs
+            }
+        else:
+            student_global = dict(student_outputs)
+            student_global_cls, student_patch = self.project_cls_and_masked_patch_tokens(
                 self.student,
-                student_input,
-                masks=student_masks,
-                project_cls_tokens=True,
-                project_patch_tokens=project_student_patch_tokens,
+                student_global["cls_tokens"],
+                student_global["patch_tokens"],
+                mask_indices_list,
+                n_masked_patches=n_masked_patches,
             )
-        }
+            structured_student_outputs: dict[str, Mapping[str, torch.Tensor] | torch.Tensor] = {
+                "global": student_global,
+                "global_cls_projections": student_global_cls,
+                "global_masked_patch_projections": student_patch,
+            }
+            if local_student_input is not None:
+                structured_student_outputs["local"] = self._forward_branch(
+                    self.student,
+                    local_student_input,
+                    masks=None,
+                    project_cls_tokens=True,
+                )
+            outputs = {"student": structured_student_outputs}
 
         if return_teacher:
             teacher_source = student_input if teacher_input is None else teacher_input
             with torch.no_grad():
-                outputs["teacher"] = self._forward_branch(
+                teacher_outputs = self._forward_branch(
                     self.teacher,
                     teacher_source,
                     masks=teacher_masks,
-                    project_cls_tokens=True,
-                    project_patch_tokens=project_teacher_patch_tokens,
+                    project_cls_tokens=project_cls_tokens,
+                    project_patch_tokens=project_teacher_patch_tokens and mask_indices_list is None,
                 )
+                if mask_indices_list is None:
+                    outputs["teacher"] = teacher_outputs
+                else:
+                    teacher_global = dict(teacher_outputs)
+                    teacher_global_cls, teacher_patch = self.project_cls_and_masked_patch_tokens(
+                        self.teacher,
+                        teacher_global["cls_tokens"],
+                        teacher_global["patch_tokens"],
+                        mask_indices_list,
+                        n_masked_patches=n_masked_patches,
+                    )
+                    outputs["teacher"] = {
+                        "global": teacher_global,
+                        "global_cls_projections": teacher_global_cls,
+                        "global_masked_patch_projections": teacher_patch,
+                    }
         return outputs
