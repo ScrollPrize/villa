@@ -7,6 +7,7 @@ from typing import Any, Mapping, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.init import trunc_normal_
 
 from vesuvius.models.build.transformers.dinov2_eva import Eva, EvaWithChunking
 
@@ -146,10 +147,18 @@ class DINOHead(nn.Module):
             layers.append(nn.Linear(hidden_dim, bottleneck_dim))
             self.mlp = nn.Sequential(*layers)
 
+        self.apply(self._init_weights)
         self.last_layer = nn.utils.weight_norm(nn.Linear(bottleneck_dim, out_dim, bias=False))
         self.last_layer.weight_g.data.fill_(1.0)
         if norm_last_layer:
             self.last_layer.weight_g.requires_grad = False
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.mlp(x)
