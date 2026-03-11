@@ -64,6 +64,13 @@ def open_zarr(path, resolution, auth=None):
             exceptions=(KeyError, FileNotFoundError, PermissionError, OSError, aiohttp.ClientResponseError),
         )
         return zarr.open(store, path=str(resolution), mode="r")
+    if path_str.startswith("s3://"):
+        return zarr.open(
+            path_str,
+            path=str(resolution),
+            mode="r",
+            storage_options={"anon": False},
+        )
     return zarr.open(path_str, path=str(resolution), mode="r")
 
 
