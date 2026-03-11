@@ -2,15 +2,18 @@ from train_resnet3d_lib.data.augmentations import rebuild_augmentations
 
 
 MODEL_SCALARS = {
+    "model_name": str,
     "backbone": str,
     "backbone_pretrained_path": str,
     "resnet3d_model_depth": int,
     "in_chans": int,
+    "encoder_depth": int,
     "norm": str,
     "group_norm_groups": int,
+    "target_size": int,
 }
 
-TRAIN_HPARAM_SCALARS = {
+TRAINING_SCALARS = {
     "size": int,
     "tile_size": int,
     "stride": int,
@@ -57,9 +60,13 @@ TRAIN_HPARAM_SCALARS = {
     "layer_read_workers": int,
     "seed": int,
     "dataset_root": str,
+    "erm_group_topk": int,
+    "save_every_n_epochs": int,
+    "data_backend": str,
+    "dataset_cache_dir": str,
 }
 
-TRAIN_HPARAM_BOOLS = {
+TRAINING_BOOLS = {
     "use_amp",
     "sgd_nesterov",
     "exclude_weight_decay_bias_norm",
@@ -67,30 +74,13 @@ TRAIN_HPARAM_BOOLS = {
     "eval_enable_skeleton_metrics",
     "eval_stitch_full_region_metrics",
     "eval_save_stitch_debug_images",
-}
-
-TRAIN_CFG_SCALARS = {
-    "erm_group_topk": int,
-    "save_every_n_epochs": int,
-    "data_backend": str,
-    "dataset_root": str,
-    "dataset_cache_dir": str,
-    "stitch_log_only_segments": list,
-    "stitch_log_only_every_n_epochs": int,
-    "stitch_log_only_downsample": int,
-}
-
-TRAIN_CFG_BOOLS = {
     "save_every_epoch",
-    "stitch_all_val",
-    "stitch_train",
     "pretrained",
     "dataset_cache_enabled",
     "dataset_cache_check_hash",
-    "stitch_use_roi",
 }
 
-TRAIN_CFG_LOWER = {
+TRAINING_LOWER = {
     "objective",
     "sampler",
     "group_stratified_epoch_size_mode",
@@ -98,20 +88,11 @@ TRAIN_CFG_LOWER = {
     "loss_recipe",
 }
 
-VALID_OBJECTIVES = {"erm", "group_dro"}
-VALID_SAMPLERS = {"shuffle", "group_balanced", "group_stratified"}
-VALID_LOSS_MODES = {"batch", "per_sample"}
-VALID_LOSS_RECIPES = {"dice_bce", "bce_only"}
-VALID_DATA_BACKENDS = {"zarr", "tiff"}
-
-
 def _section(parent, key, *, key_prefix):
     value = parent.get(key)
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
+    if value is not None and not isinstance(value, dict):
         raise TypeError(f"{key_prefix}.{key} must be an object, got {type(value).__name__}")
-    return value
+    return {} if value is None else value
 
 
 def _apply_scalar_fields(cfg, source, *, casts):
@@ -137,44 +118,46 @@ def _apply_bool_fields(cfg, source, *, keys, parse_bool, key_prefix):
     for key in keys:
         if key not in source:
             continue
-        parsed = parse_bool(source[key], key=f"{key_prefix}.{key}")
-        if not isinstance(parsed, bool):
-            raise TypeError(
-                f"{key_prefix}.{key} parser must return bool, got {type(parsed).__name__}"
-            )
-        setattr(cfg, key, parsed)
+        setattr(cfg, key, parse_bool(source[key], key=f"{key_prefix}.{key}"))
 
 
-def _ensure_enum(value, *, key, allowed):
-    if value not in allowed:
-        raise ValueError(f"{key} must be one of {sorted(allowed)!r}, got {value!r}")
-
-
-def _ensure_positive_int(value, *, key):
-    ivalue = int(value)
-    if ivalue <= 0:
-        raise ValueError(f"{key} must be > 0, got {ivalue}")
-
-
-def _ensure_non_negative_int(value, *, key):
-    ivalue = int(value)
-    if ivalue < 0:
-        raise ValueError(f"{key} must be >= 0, got {ivalue}")
-
-
-def _ensure_number_list(value, *, key):
-    if not isinstance(value, list):
+def _normalize_string_list(value, *, key):
+    if not isinstance(value, (list, tuple)):
         raise ValueError(f"{key} must be a list")
-    for idx, item in enumerate(value):
-        if isinstance(item, bool) or not isinstance(item, (int, float)):
-            raise ValueError(f"{key}[{idx}] must be numeric, got {type(item).__name__}")
-
-
-def _ensure_float_range(value, *, key, min_value, max_value):
-    fvalue = float(value)
-    if fvalue < float(min_value) or fvalue > float(max_value):
-        raise ValueError(f"{key} must be in [{min_value}, {max_value}], got {fvalue}")
-    return fvalue
+    normalized = []
+    for item in value:
+        item_text = str(item).strip()
+        if not item_text:
+            continue
+        normalized.append(item_text)
+    return normalized
+def _apply_stitch_fields(cfg, stitch_cfg, *, parse_bool):
+    if "all_val" in stitch_cfg:
+        cfg.stitch_all_val = parse_bool(stitch_cfg["all_val"], key="stitch.all_val")
+    if "train" in stitch_cfg:
+        cfg.stitch_train = parse_bool(stitch_cfg["train"], key="stitch.train")
+    if "use_roi" in stitch_cfg:
+        cfg.stitch_use_roi = parse_bool(stitch_cfg["use_roi"], key="stitch.use_roi")
+    if "downsample" in stitch_cfg:
+        cfg.stitch_downsample = int(stitch_cfg["downsample"])
+    if "train_every_n_epochs" in stitch_cfg:
+        cfg.stitch_train_every_n_epochs = int(stitch_cfg["train_every_n_epochs"])
+    if "eval_every_n_epochs" in stitch_cfg:
+        cfg.eval_stitch_every_n_epochs = int(stitch_cfg["eval_every_n_epochs"])
+    if "eval_plus_one" in stitch_cfg:
+        cfg.eval_stitch_every_n_epochs_plus_one = parse_bool(
+            stitch_cfg["eval_plus_one"],
+            key="stitch.eval_plus_one",
+        )
+    if "log_only_segments" in stitch_cfg:
+        cfg.stitch_log_only_segments = _normalize_string_list(
+            stitch_cfg["log_only_segments"],
+            key="stitch.log_only_segments",
+        )
+    if "log_only_every_n_epochs" in stitch_cfg:
+        cfg.stitch_log_only_every_n_epochs = int(stitch_cfg["log_only_every_n_epochs"])
+    if "log_only_downsample" in stitch_cfg:
+        cfg.stitch_log_only_downsample = int(stitch_cfg["log_only_downsample"])
 
 
 def apply_metadata_hyperparameters(
@@ -189,36 +172,28 @@ def apply_metadata_hyperparameters(
     if not isinstance(metadata, dict):
         raise TypeError(f"metadata must be an object, got {type(metadata).__name__}")
 
-    hp = _section(metadata, "training_hyperparameters", key_prefix="metadata")
-    model_hp = _section(hp, "model", key_prefix="metadata.training_hyperparameters")
-    train_hp = _section(hp, "training", key_prefix="metadata.training_hyperparameters")
-    augmentation_hp = _section(hp, "augmentation", key_prefix="metadata.training_hyperparameters")
+    model_cfg = _section(metadata, "model", key_prefix="metadata")
     training_cfg = _section(metadata, "training", key_prefix="metadata")
+    augmentation_cfg = _section(metadata, "augmentation", key_prefix="metadata")
+    stitch_cfg = _section(metadata, "stitch", key_prefix="metadata")
 
-    _apply_scalar_fields(cfg, model_hp, casts=MODEL_SCALARS)
-    _apply_scalar_fields(cfg, train_hp, casts=TRAIN_HPARAM_SCALARS)
-    _apply_bool_fields(
-        cfg,
-        train_hp,
-        keys=TRAIN_HPARAM_BOOLS,
-        parse_bool=parse_bool,
-        key_prefix="training_hyperparameters.training",
-    )
-
-    for key in TRAIN_CFG_LOWER:
-        if key not in training_cfg:
-            continue
-        setattr(cfg, key, str(training_cfg[key]).strip().lower())
-    _apply_scalar_fields(cfg, training_cfg, casts=TRAIN_CFG_SCALARS)
+    _apply_scalar_fields(cfg, model_cfg, casts=MODEL_SCALARS)
+    _apply_scalar_fields(cfg, training_cfg, casts=TRAINING_SCALARS)
     _apply_bool_fields(
         cfg,
         training_cfg,
-        keys=TRAIN_CFG_BOOLS,
+        keys=TRAINING_BOOLS,
         parse_bool=parse_bool,
         key_prefix="training",
     )
+    for key in TRAINING_LOWER:
+        if key not in training_cfg:
+            continue
+        setattr(cfg, key, str(training_cfg[key]).strip().lower())
 
-    if "train_batch_size" in train_hp and "valid_batch_size" not in train_hp:
+    _apply_stitch_fields(cfg, stitch_cfg, parse_bool=parse_bool)
+
+    if "train_batch_size" in training_cfg and "valid_batch_size" not in training_cfg:
         cfg.valid_batch_size = int(cfg.train_batch_size)
 
     cfg.norm = str(cfg.norm).strip().lower()
@@ -228,70 +203,18 @@ def apply_metadata_hyperparameters(
     cfg.bce_smooth_factor = float(getattr(cfg, "bce_smooth_factor", 0.25))
     cfg.soft_label_positive = float(getattr(cfg, "soft_label_positive", 1.0))
     cfg.soft_label_negative = float(getattr(cfg, "soft_label_negative", 0.0))
-    # Allow sweeps to vary only soft_label_positive while keeping pairs complementary.
-    if "soft_label_positive" in train_hp and "soft_label_negative" not in train_hp:
+    if "soft_label_positive" in training_cfg and "soft_label_negative" not in training_cfg:
         cfg.soft_label_negative = 1.0 - float(cfg.soft_label_positive)
-    _ensure_enum(cfg.objective, key="training.objective", allowed=VALID_OBJECTIVES)
-    _ensure_enum(cfg.sampler, key="training.sampler", allowed=VALID_SAMPLERS)
-    _ensure_enum(cfg.loss_mode, key="training.loss_mode", allowed=VALID_LOSS_MODES)
-    _ensure_enum(cfg.loss_recipe, key="training.loss_recipe", allowed=VALID_LOSS_RECIPES)
-    _ensure_enum(cfg.data_backend, key="training.data_backend", allowed=VALID_DATA_BACKENDS)
-    if cfg.objective == "group_dro" and cfg.loss_mode != "per_sample":
-        raise ValueError("training.objective=group_dro requires training.loss_mode=per_sample")
-    _ensure_positive_int(cfg.train_batch_size, key="training_hyperparameters.training.train_batch_size")
-    _ensure_positive_int(cfg.valid_batch_size, key="training_hyperparameters.training.valid_batch_size")
-    _ensure_positive_int(cfg.epochs, key="training_hyperparameters.training.epochs")
-    _ensure_positive_int(cfg.stitch_downsample, key="stitch.downsample")
-    _ensure_non_negative_int(cfg.num_workers, key="training_hyperparameters.training.num_workers")
-    _ensure_non_negative_int(cfg.layer_read_workers, key="training_hyperparameters.training.layer_read_workers")
-    boundary_tols = getattr(cfg, "eval_boundary_tols", None)
-    if boundary_tols is not None:
-        _ensure_number_list(boundary_tols, key="training_hyperparameters.training.eval_boundary_tols")
-    stitch_log_only_segments = getattr(cfg, "stitch_log_only_segments", [])
-    if not isinstance(stitch_log_only_segments, list):
-        raise ValueError("training.stitch_log_only_segments must be a list")
-
-    cfg.bce_smooth_factor = _ensure_float_range(
-        cfg.bce_smooth_factor,
-        key="training_hyperparameters.training.bce_smooth_factor",
-        min_value=0.0,
-        max_value=0.5,
-    )
-    cfg.soft_label_positive = _ensure_float_range(
-        cfg.soft_label_positive,
-        key="training_hyperparameters.training.soft_label_positive",
-        min_value=0.0,
-        max_value=1.0,
-    )
-    cfg.soft_label_negative = _ensure_float_range(
-        cfg.soft_label_negative,
-        key="training_hyperparameters.training.soft_label_negative",
-        min_value=0.0,
-        max_value=1.0,
-    )
-    if cfg.soft_label_positive <= cfg.soft_label_negative:
-        raise ValueError(
-            "training_hyperparameters.training.soft_label_positive must be greater than "
-            f"soft_label_negative, got {cfg.soft_label_positive} <= {cfg.soft_label_negative}"
-        )
 
     cfg.max_clip_value = parse_optional_positive_int(
         cfg.max_clip_value,
-        key="training_hyperparameters.training.max_clip_value",
+        key="training.max_clip_value",
     )
     cfg.normalization_mode = parse_normalization_mode(
         cfg.normalization_mode,
-        key="training_hyperparameters.training.normalization_mode",
+        key="training.normalization_mode",
     )
     cfg.fold_label_foreground_percentile_clip_zscore_stats = None
-    if cfg.normalization_mode in {
-        "train_fold_fg_clip_zscore",
-        "train_fold_fg_clip_robust_zscore",
-    } and cfg.max_clip_value is not None:
-        raise ValueError(
-            "training_hyperparameters.training.max_clip_value must be null when "
-            "using train_fold_fg_clip_zscore/train_fold_fg_clip_robust_zscore"
-        )
 
     if "cv_fold" in training_cfg:
         cfg.cv_fold = normalize_cv_fold(training_cfg["cv_fold"])
@@ -318,5 +241,5 @@ def apply_metadata_hyperparameters(
         if "val_mask_suffix" not in training_cfg:
             cfg.val_mask_suffix = f"_val_{cfg.cv_fold}"
 
-    rebuild_augmentations(cfg, augmentation_hp)
+    rebuild_augmentations(cfg, augmentation_cfg)
     return cfg

@@ -11,7 +11,6 @@ from train_resnet3d_lib.runtime.checkpointing import resolve_checkpoint_path
 from train_resnet3d_lib.config import (
     CFG,
     apply_metadata_hyperparameters,
-    apply_top_level_stitch_to_cfg,
     cfg_init,
     load_and_validate_base_config,
     log,
@@ -36,7 +35,6 @@ def _resolve_run_dir(*, cfg, resume_ckpt_path, outputs_path, run_name, run_slug,
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--metadata_json", type=str, default=None)
-    parser.add_argument("--valid_id", type=str, default=None)
     parser.add_argument("--init_ckpt_path", type=str, default=None)
     parser.add_argument(
         "--resume_from_ckpt",
@@ -67,7 +65,7 @@ def log_startup(args):
     log(f"start pid={os.getpid()} cwd={os.getcwd()}")
     log(
         "args "
-        f"metadata_json={args.metadata_json!r} valid_id={args.valid_id!r} outputs_path={args.outputs_path!r} "
+        f"metadata_json={args.metadata_json!r} outputs_path={args.outputs_path!r} "
         f"devices={args.devices} accelerator={args.accelerator!r} precision={args.precision!r} "
         f"run_name={args.run_name!r} init_ckpt_path={args.init_ckpt_path!r} "
         f"resume_from_ckpt={args.resume_from_ckpt!r} stitch_only={args.stitch_only}"
@@ -87,7 +85,6 @@ def merge_config(base_config, wandb_logger, args, *, preinit_overrides=None):
     merged_config = merge_config_with_overrides(merged_config, wandb_overrides)
 
     apply_metadata_hyperparameters(CFG, merged_config)
-    apply_top_level_stitch_to_cfg(CFG, merged_config)
     log("cfg " + json.dumps(merged_config, sort_keys=True, default=str))
     log("args_json " + json.dumps(vars(args), sort_keys=True, default=str))
     if wandb_logger is not None:
@@ -123,7 +120,6 @@ def prepare_runtime_state(
     cfg,
     merged_config,
     *,
-    valid_id=None,
     outputs_path=None,
     run_name=None,
     init_ckpt_path=None,
@@ -154,7 +150,7 @@ def prepare_runtime_state(
     log(f"segments val_ids={val_fragment_ids}")
 
     group_dro_cfg = dict(merged_config["group_dro"])
-    group_key = group_dro_cfg["group_key"]
+    group_key = str(group_dro_cfg.get("group_key") or "").strip()
 
     requested_init_ckpt_path = init_ckpt_path or training_cfg.get("init_ckpt_path")
     if bool(getattr(cfg, "pretrained", True)):
@@ -174,28 +170,31 @@ def prepare_runtime_state(
         log("resume_from_ckpt is set; init_ckpt_path will be ignored (resume restores model weights).")
 
     robust_step_size = group_dro_cfg.get("robust_step_size")
-    group_dro_gamma = group_dro_cfg.get("gamma", 0.1)
+    group_dro_gamma = float(group_dro_cfg.get("gamma", 0.1))
     group_dro_btl = bool(group_dro_cfg.get("btl", False))
     group_dro_alpha = group_dro_cfg.get("alpha")
     group_dro_normalize_loss = bool(group_dro_cfg.get("normalize_loss", False))
-    group_dro_min_var_weight = group_dro_cfg.get("minimum_variational_weight", 0.0)
+    group_dro_min_var_weight = float(group_dro_cfg.get("minimum_variational_weight", 0.0))
     group_dro_adj = group_dro_cfg.get("adj")
     log(
         "group_dro "
         f"group_key={group_key!r} robust_step_size={robust_step_size!r} "
         f"gamma={group_dro_gamma} btl={group_dro_btl} alpha={group_dro_alpha!r} normalize_loss={group_dro_normalize_loss}"
     )
+    if cfg.objective == "group_dro" and str(cfg.loss_mode).strip().lower() != "per_sample":
+        raise ValueError("training.objective=group_dro requires training.loss_mode=per_sample")
     if cfg.objective == "group_dro" and robust_step_size is None:
         raise ValueError("group_dro.robust_step_size is required when training.objective is group_dro")
+    cfg.group_key = group_key
+    cfg.robust_step_size = robust_step_size
+    cfg.group_dro_gamma = group_dro_gamma
+    cfg.group_dro_btl = group_dro_btl
+    cfg.group_dro_alpha = group_dro_alpha
+    cfg.group_dro_normalize_loss = group_dro_normalize_loss
+    cfg.group_dro_min_var_weight = group_dro_min_var_weight
+    cfg.group_dro_adj = group_dro_adj
 
-    if valid_id is not None:
-        cfg.valid_id = valid_id
-    if cfg.valid_id is not None:
-        cfg.valid_id = str(cfg.valid_id)
-    if cfg.valid_id is None and val_fragment_ids:
-        cfg.valid_id = val_fragment_ids[0]
-    if cfg.valid_id not in val_fragment_ids and val_fragment_ids:
-        raise ValueError(f"--valid_id {cfg.valid_id!r} is not in training.val_segments")
+    cfg.valid_id = val_fragment_ids[0] if val_fragment_ids else None
 
     if outputs_path is not None:
         cfg.outputs_path = str(outputs_path)
@@ -254,7 +253,6 @@ def prepare_run(args, merged_config, wandb_logger):
     run_state = prepare_runtime_state(
         CFG,
         merged_config,
-        valid_id=args.valid_id,
         outputs_path=args.outputs_path,
         run_name=args.run_name,
         init_ckpt_path=args.init_ckpt_path,

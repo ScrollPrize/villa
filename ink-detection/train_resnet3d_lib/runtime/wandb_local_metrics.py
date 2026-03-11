@@ -127,13 +127,9 @@ def _contains_wandb_media(value):
 
 
 def _normalize_metrics(metrics):
-    if not isinstance(metrics, Mapping):
-        raise TypeError(f"metrics must be a mapping, got {type(metrics).__name__}")
     normalized = {}
     dropped_media_metric_keys = []
     for key, value in metrics.items():
-        if not isinstance(key, str):
-            raise TypeError(f"metrics keys must be strings, got {type(key).__name__}: {key!r}")
         try:
             normalized[key] = _to_json_value(value, key_path=f"metrics.{key}")
         except TypeError:
@@ -308,10 +304,9 @@ class LocalMetricsWandbLogger(WandbLogger):
 
     def log_metrics(self, metrics, step=None):
         normalized_metrics = _normalize_metrics(metrics)
-        normalized_step = _normalize_step(step)
         record = {
             "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "step": normalized_step,
+            "step": None if step is None else int(step),
             "metrics": normalized_metrics,
         }
         metrics_fh = self._require_local_metrics_file()

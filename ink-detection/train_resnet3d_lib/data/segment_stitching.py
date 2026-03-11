@@ -159,17 +159,22 @@ def build_train_stitch_outputs(
     train_groups_by_segment=None,
 ):
     backend = normalize_data_backend(data_backend)
-    train_stitch_builder = _train_stitch_builder_for_backend(backend=backend)
-    return train_stitch_builder(
-        train_fragment_ids=train_fragment_ids,
-        stitch_segment_id=stitch_segment_id,
+    if backend == "zarr":
+        return build_train_stitch_loaders_lazy(
+            train_fragment_ids,
+            train_volumes_by_segment,
+            train_masks_by_segment,
+            train_xyxys_by_segment,
+            train_sample_bbox_indices_by_segment,
+            train_groups_by_segment,
+            stitch_segment_id,
+            valid_transform=valid_transform,
+        )
+    return build_train_stitch_loaders(
+        train_fragment_ids,
+        train_stitch_candidates,
+        stitch_segment_id,
         valid_transform=valid_transform,
-        train_stitch_candidates=train_stitch_candidates,
-        train_volumes_by_segment=train_volumes_by_segment,
-        train_masks_by_segment=train_masks_by_segment,
-        train_xyxys_by_segment=train_xyxys_by_segment,
-        train_sample_bbox_indices_by_segment=train_sample_bbox_indices_by_segment,
-        train_groups_by_segment=train_groups_by_segment,
     )
 
 
@@ -315,105 +320,20 @@ def build_log_only_outputs(
         return [], [], [], {}
 
     backend = normalize_data_backend(data_backend)
-    log_only_builder = _log_only_builder_for_backend(backend=backend)
-    return log_only_builder(
-        log_only_segments=requested_segments,
-        segments_metadata=segments_metadata,
-        valid_transform=valid_transform,
-        mask_suffix=mask_suffix,
-        log_only_downsample=log_only_downsample,
-        layers_cache=layers_cache,
-        volume_cache=volume_cache,
-    )
-
-
-def _build_train_stitch_outputs_zarr(
-    *,
-    train_fragment_ids,
-    stitch_segment_id,
-    valid_transform,
-    train_volumes_by_segment,
-    train_masks_by_segment,
-    train_xyxys_by_segment,
-    train_sample_bbox_indices_by_segment,
-    train_groups_by_segment,
-    **_,
-):
-    return build_train_stitch_loaders_lazy(
-        train_fragment_ids,
-        train_volumes_by_segment,
-        train_masks_by_segment,
-        train_xyxys_by_segment,
-        train_sample_bbox_indices_by_segment,
-        train_groups_by_segment,
-        stitch_segment_id,
-        valid_transform=valid_transform,
-    )
-
-
-def _build_train_stitch_outputs_tiff(
-    *,
-    train_fragment_ids,
-    stitch_segment_id,
-    valid_transform,
-    train_stitch_candidates,
-    **_,
-):
-    return build_train_stitch_loaders(
-        train_fragment_ids,
-        train_stitch_candidates,
-        stitch_segment_id,
-        valid_transform=valid_transform,
-    )
-
-
-def _train_stitch_builder_for_backend(*, backend):
     if backend == "zarr":
-        return _build_train_stitch_outputs_zarr
-    return _build_train_stitch_outputs_tiff
-
-
-def _build_log_only_outputs_zarr(
-    *,
-    log_only_segments,
-    segments_metadata,
-    valid_transform,
-    mask_suffix,
-    log_only_downsample,
-    volume_cache,
-    **_,
-):
-    return build_log_only_stitch_loaders_lazy(
-        log_only_segments,
-        segments_metadata=segments_metadata,
-        volume_cache=volume_cache,
-        valid_transform=valid_transform,
-        mask_suffix=mask_suffix,
-        log_only_downsample=log_only_downsample,
-    )
-
-
-def _build_log_only_outputs_tiff(
-    *,
-    log_only_segments,
-    segments_metadata,
-    valid_transform,
-    mask_suffix,
-    log_only_downsample,
-    layers_cache,
-    **_,
-):
+        return build_log_only_stitch_loaders_lazy(
+            requested_segments,
+            segments_metadata=segments_metadata,
+            volume_cache=volume_cache,
+            valid_transform=valid_transform,
+            mask_suffix=mask_suffix,
+            log_only_downsample=log_only_downsample,
+        )
     return build_log_only_stitch_loaders(
-        log_only_segments,
+        requested_segments,
         segments_metadata=segments_metadata,
         layers_cache=layers_cache,
         valid_transform=valid_transform,
         mask_suffix=mask_suffix,
         log_only_downsample=log_only_downsample,
     )
-
-
-def _log_only_builder_for_backend(*, backend):
-    if backend == "zarr":
-        return _build_log_only_outputs_zarr
-    return _build_log_only_outputs_tiff

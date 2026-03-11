@@ -325,3 +325,19 @@ def prepare_fold_label_foreground_percentile_clip_zscore_stats(
         f"p99.5={stats['percentile_99_5']:.6f} "
         f"{stats_summary}"
     )
+
+
+def prepare_run_fold_normalization_stats(*, run_state, data_backend, volume_cache):
+    if not isinstance(run_state, dict):
+        raise TypeError(f"run_state must be a dict, got {type(run_state).__name__}")
+    if not isinstance(volume_cache, dict):
+        raise TypeError(f"volume_cache must be a dict, got {type(volume_cache).__name__}")
+
+    prepare_fold_label_foreground_percentile_clip_zscore_stats(
+        segments_metadata=run_state["segments_metadata"],
+        train_fragment_ids=run_state["train_fragment_ids"],
+        data_backend=data_backend,
+        train_label_suffix=getattr(CFG, "train_label_suffix", ""),
+        train_mask_suffix=getattr(CFG, "train_mask_suffix", ""),
+        volume_cache=volume_cache,
+    )

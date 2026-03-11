@@ -5,9 +5,9 @@ import torch.nn.functional as F
 
 def _pick_group_norm_groups(num_channels: int, desired_groups: int) -> int:
     num_channels = int(num_channels)
-    desired_groups = int(desired_groups)
     if num_channels <= 0:
-        raise ValueError(f"num_channels must be > 0, got {num_channels}")
+        raise ValueError(f"num_channels must be > 0, got {num_channels!r}")
+    desired_groups = int(desired_groups)
     desired_groups = max(1, min(desired_groups, num_channels))
     for groups in range(desired_groups, 0, -1):
         if num_channels % groups == 0:
@@ -65,5 +65,3 @@ class Decoder(nn.Module):
         x = self.logit(feature_maps[0])
         mask = self.up(x)
         return mask
-
-

@@ -147,18 +147,65 @@ def _empty_val_segment_result():
     }
 
 
-def load_train_segment(
+def load_train_segment_for_backend(
     fragment_id,
     seg_meta,
     group_idx,
     group_name,
     *,
-    overlap_segments,
-    layers_cache,
+    data_backend,
     include_train_xyxys,
     label_suffix,
     mask_suffix,
+    overlap_segments=None,
+    layers_cache=None,
+    volume_cache=None,
 ):
+    backend = normalize_data_backend(data_backend)
+    if backend == "zarr":
+        layer_range, reverse_layers = _segment_layer_settings(seg_meta, fragment_id)
+
+        t0 = time.time()
+        sid = str(fragment_id)
+        log(f"load train segment={sid} group={group_name} (zarr)")
+        sid, volume = _load_or_create_zarr_volume(
+            fragment_id,
+            seg_meta,
+            layer_range=layer_range,
+            reverse_layers=reverse_layers,
+            volume_cache=volume_cache,
+            split_name="train",
+        )
+        mask, fragment_mask, mask_store, xyxys, sample_bbox_indices = _build_zarr_patch_index(
+            sid=sid,
+            volume=volume,
+            split_name="train",
+            label_suffix=label_suffix,
+            mask_suffix=mask_suffix,
+        )
+        patch_count = int(len(xyxys))
+        log(
+            f"loaded train segment={sid} image={tuple(volume.shape)} label={tuple(mask.shape)} "
+            f"mask={tuple(fragment_mask.shape)} patches={patch_count} in {time.time() - t0:.1f}s"
+        )
+
+        mask_border, mask_bbox = _stitch_mask_geometry(
+            fragment_mask,
+            include_train_xyxys=include_train_xyxys,
+        )
+
+        return {
+            "sid": sid,
+            "group_idx": group_idx,
+            "patch_count": patch_count,
+            "volume": volume,
+            "mask_store": mask_store,
+            "xyxys": xyxys,
+            "sample_bbox_indices": sample_bbox_indices,
+            "mask_border": mask_border,
+            "mask_bbox": mask_bbox,
+        }
+
     t0 = time.time()
     log(f"load train segment={fragment_id} group={group_name}")
     layer_range, reverse_layers = _segment_layer_settings(seg_meta, fragment_id)
@@ -169,8 +216,8 @@ def load_train_segment(
         reverse_layers=reverse_layers,
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
-        layers_cache=layers_cache,
         overlap_segments=overlap_segments,
+        layers_cache=layers_cache,
         cache_for_overlap=True,
         reuse_layers_cache=False,
         split_name="train",
@@ -221,73 +268,75 @@ def load_train_segment(
     }
 
 
-def load_train_segment_lazy(
+def load_val_segment_for_backend(
     fragment_id,
     seg_meta,
     group_idx,
     group_name,
     *,
-    volume_cache,
-    include_train_xyxys,
-    label_suffix,
-    mask_suffix,
-):
-    layer_range, reverse_layers = _segment_layer_settings(seg_meta, fragment_id)
-
-    t0 = time.time()
-    sid = str(fragment_id)
-    log(f"load train segment={sid} group={group_name} (zarr)")
-    sid, volume = _load_or_create_zarr_volume(
-        fragment_id,
-        seg_meta,
-        layer_range=layer_range,
-        reverse_layers=reverse_layers,
-        volume_cache=volume_cache,
-        split_name="train",
-    )
-    mask, fragment_mask, mask_store, xyxys, sample_bbox_indices = _build_zarr_patch_index(
-        sid=sid,
-        volume=volume,
-        split_name="train",
-        label_suffix=label_suffix,
-        mask_suffix=mask_suffix,
-    )
-    patch_count = int(len(xyxys))
-    log(
-        f"loaded train segment={sid} image={tuple(volume.shape)} label={tuple(mask.shape)} "
-        f"mask={tuple(fragment_mask.shape)} patches={patch_count} in {time.time() - t0:.1f}s"
-    )
-
-    mask_border, mask_bbox = _stitch_mask_geometry(
-        fragment_mask,
-        include_train_xyxys=include_train_xyxys,
-    )
-
-    return {
-        "sid": sid,
-        "group_idx": group_idx,
-        "patch_count": patch_count,
-        "volume": volume,
-        "mask_store": mask_store,
-        "xyxys": xyxys,
-        "sample_bbox_indices": sample_bbox_indices,
-        "mask_border": mask_border,
-        "mask_bbox": mask_bbox,
-    }
-
-
-def load_val_segment(
-    fragment_id,
-    seg_meta,
-    group_idx,
-    group_name,
-    *,
-    layers_cache,
+    data_backend,
     include_train_xyxys,
     valid_transform,
     label_suffix,
     mask_suffix,
+    layers_cache=None,
+    volume_cache=None,
 ):
+    backend = normalize_data_backend(data_backend)
+    if backend == "zarr":
+        layer_range, reverse_layers = _segment_layer_settings(seg_meta, fragment_id)
+
+        t0 = time.time()
+        sid = str(fragment_id)
+        log(f"load val segment={sid} group={group_name} (zarr)")
+        sid, volume = _load_or_create_zarr_volume(
+            fragment_id,
+            seg_meta,
+            layer_range=layer_range,
+            reverse_layers=reverse_layers,
+            volume_cache=volume_cache,
+            split_name="val",
+        )
+        mask_val, fragment_mask_val, mask_store_val, val_xyxys, val_sample_bbox_indices = _build_zarr_patch_index(
+            sid=sid,
+            volume=volume,
+            split_name="val",
+            label_suffix=label_suffix,
+            mask_suffix=mask_suffix,
+        )
+        patch_count = int(len(val_xyxys))
+        log(
+            f"loaded val segment={sid} image={tuple(volume.shape)} label={tuple(mask_val.shape)} "
+            f"mask={tuple(fragment_mask_val.shape)} patches={patch_count} in {time.time() - t0:.1f}s"
+        )
+        if patch_count == 0:
+            return _empty_val_segment_result()
+
+        val_dataset = LazyZarrXyLabelDataset(
+            {sid: volume},
+            {sid: mask_store_val},
+            {sid: val_xyxys},
+            {sid: group_idx},
+            CFG,
+            transform=valid_transform,
+            sample_bbox_indices_by_segment={sid: val_sample_bbox_indices},
+        )
+        val_loader = build_eval_loader(val_dataset)
+        mask_shape = tuple(_mask_store_shape(mask_store_val))
+
+        mask_border, mask_bbox = _stitch_mask_geometry(
+            fragment_mask_val,
+            include_train_xyxys=include_train_xyxys,
+        )
+
+        return {
+            "patch_count": patch_count,
+            "val_loader": val_loader,
+            "mask_shape": mask_shape,
+            "mask_border": mask_border,
+            "mask_bbox": mask_bbox,
+        }
+
     t0 = time.time()
     log(f"load val segment={fragment_id} group={group_name}")
     layer_range, reverse_layers = _segment_layer_settings(seg_meta, fragment_id)
@@ -348,159 +397,3 @@ def load_val_segment(
         "mask_border": mask_border,
         "mask_bbox": mask_bbox,
     }
-
-
-def load_val_segment_lazy(
-    fragment_id,
-    seg_meta,
-    group_idx,
-    group_name,
-    *,
-    volume_cache,
-    include_train_xyxys,
-    valid_transform,
-    label_suffix,
-    mask_suffix,
-):
-    layer_range, reverse_layers = _segment_layer_settings(seg_meta, fragment_id)
-
-    t0 = time.time()
-    sid = str(fragment_id)
-    log(f"load val segment={sid} group={group_name} (zarr)")
-    sid, volume = _load_or_create_zarr_volume(
-        fragment_id,
-        seg_meta,
-        layer_range=layer_range,
-        reverse_layers=reverse_layers,
-        volume_cache=volume_cache,
-        split_name="val",
-    )
-    mask_val, fragment_mask_val, mask_store_val, val_xyxys, val_sample_bbox_indices = _build_zarr_patch_index(
-        sid=sid,
-        volume=volume,
-        split_name="val",
-        label_suffix=label_suffix,
-        mask_suffix=mask_suffix,
-    )
-    patch_count = int(len(val_xyxys))
-    log(
-        f"loaded val segment={sid} image={tuple(volume.shape)} label={tuple(mask_val.shape)} "
-        f"mask={tuple(fragment_mask_val.shape)} patches={patch_count} in {time.time() - t0:.1f}s"
-    )
-    if patch_count == 0:
-        return _empty_val_segment_result()
-
-    val_dataset = LazyZarrXyLabelDataset(
-        {sid: volume},
-        {sid: mask_store_val},
-        {sid: val_xyxys},
-        {sid: group_idx},
-        CFG,
-        transform=valid_transform,
-        sample_bbox_indices_by_segment={sid: val_sample_bbox_indices},
-    )
-    val_loader = build_eval_loader(val_dataset)
-    mask_shape = tuple(_mask_store_shape(mask_store_val))
-
-    mask_border, mask_bbox = _stitch_mask_geometry(
-        fragment_mask_val,
-        include_train_xyxys=include_train_xyxys,
-    )
-
-    return {
-        "patch_count": patch_count,
-        "val_loader": val_loader,
-        "mask_shape": mask_shape,
-        "mask_border": mask_border,
-        "mask_bbox": mask_bbox,
-    }
-
-
-def _backend_loader_fns(*, backend):
-    if backend == "zarr":
-        return load_train_segment_lazy, load_val_segment_lazy
-    return load_train_segment, load_val_segment
-
-
-def _backend_loader_kwargs(
-    *,
-    backend,
-    split,
-    overlap_segments=None,
-    layers_cache=None,
-    volume_cache=None,
-):
-    if backend == "zarr":
-        return {"volume_cache": volume_cache}
-    kwargs = {"layers_cache": layers_cache}
-    if split == "train":
-        kwargs["overlap_segments"] = overlap_segments
-    return kwargs
-
-
-def load_train_segment_for_backend(
-    fragment_id,
-    seg_meta,
-    group_idx,
-    group_name,
-    *,
-    data_backend,
-    include_train_xyxys,
-    label_suffix,
-    mask_suffix,
-    overlap_segments=None,
-    layers_cache=None,
-    volume_cache=None,
-):
-    backend = normalize_data_backend(data_backend)
-    train_loader_fn, _ = _backend_loader_fns(backend=backend)
-    return train_loader_fn(
-        fragment_id,
-        seg_meta,
-        group_idx,
-        group_name,
-        include_train_xyxys=include_train_xyxys,
-        label_suffix=label_suffix,
-        mask_suffix=mask_suffix,
-        **_backend_loader_kwargs(
-            backend=backend,
-            split="train",
-            overlap_segments=overlap_segments,
-            layers_cache=layers_cache,
-            volume_cache=volume_cache,
-        ),
-    )
-
-
-def load_val_segment_for_backend(
-    fragment_id,
-    seg_meta,
-    group_idx,
-    group_name,
-    *,
-    data_backend,
-    include_train_xyxys,
-    valid_transform,
-    label_suffix,
-    mask_suffix,
-    layers_cache=None,
-    volume_cache=None,
-):
-    backend = normalize_data_backend(data_backend)
-    _, val_loader_fn = _backend_loader_fns(backend=backend)
-    return val_loader_fn(
-        fragment_id,
-        seg_meta,
-        group_idx,
-        group_name,
-        include_train_xyxys=include_train_xyxys,
-        valid_transform=valid_transform,
-        label_suffix=label_suffix,
-        mask_suffix=mask_suffix,
-        **_backend_loader_kwargs(
-            backend=backend,
-            split="val",
-            layers_cache=layers_cache,
-            volume_cache=volume_cache,
-        ),
-    )

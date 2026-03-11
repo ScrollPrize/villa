@@ -82,8 +82,9 @@ def build_data_state(
     log_only_segment_ids,
     log_only_bboxes,
     tracking,
+    shared_volume_cache=None,
 ):
-    return {
+    state = {
         "train_loader": train_loader,
         "val_loaders": tracking["val_loaders"],
         "group_names": group_names,
@@ -108,6 +109,9 @@ def build_data_state(
         "val_stitch_shapes": tracking["val_stitch_shapes"],
         "val_stitch_segment_ids": tracking["val_stitch_segment_ids"],
     }
+    if shared_volume_cache is not None:
+        state["shared_volume_cache"] = shared_volume_cache
+    return state
 
 
 def summarize_patch_counts(split_name, fragment_ids_list, counts_by_segment, *, group_names, fragment_to_group_idx):
@@ -144,45 +148,6 @@ def _validate_group_universe_for_objective(group_names, train_group_counts):
             f"found zero-patch groups: {zero_groups}. "
             "Check effective training.train_segments/sweep overrides and segment masks."
         )
-
-
-def _collect_train_segments(train_fragment_ids, *, load_train_fn, consume_train_fn):
-    train_patch_counts_by_segment = {}
-    train_mask_borders = {}
-    train_mask_bboxes = {}
-    for fragment_id in train_fragment_ids:
-        result = load_train_fn(fragment_id)
-        patch_count = int(result["patch_count"])
-        train_patch_counts_by_segment[fragment_id] = patch_count
-
-        mask_border = result.get("mask_border")
-        if mask_border is not None:
-            train_mask_borders[str(fragment_id)] = mask_border
-        mask_bbox = result.get("mask_bbox")
-        if mask_bbox is not None:
-            train_mask_bboxes[str(fragment_id)] = mask_bbox
-
-        consume_train_fn(fragment_id, result)
-    return train_patch_counts_by_segment, train_mask_borders, train_mask_bboxes
-
-
-def _collect_val_segments(val_fragment_ids, *, load_val_fn, tracking):
-    val_patch_counts_by_segment = {}
-    for fragment_id in val_fragment_ids:
-        result = load_val_fn(fragment_id)
-        val_patch_counts_by_segment[fragment_id] = int(result["patch_count"])
-        if result["val_loader"] is None:
-            continue
-        append_val_entry(
-            tracking,
-            fragment_id=fragment_id,
-            val_loader=result["val_loader"],
-            mask_shape=result["mask_shape"],
-            mask_border=result["mask_border"],
-            mask_bbox=result.get("mask_bbox"),
-            valid_id=CFG.valid_id,
-        )
-    return val_patch_counts_by_segment
 
 
 def build_train_loader(train_images, train_masks, train_groups, group_names, *, train_transform):
@@ -298,13 +263,6 @@ def log_training_budget(train_loader):
     return steps_per_epoch
 
 
-def _load_with_group_context(fragment_id, *, segments_metadata, fragment_to_group_idx, group_names, loader_fn, **kwargs):
-    seg_meta = _segment_meta(segments_metadata, fragment_id)
-    group_idx = int(fragment_to_group_idx[fragment_id])
-    group_name = group_names[group_idx] if group_idx < len(group_names) else str(group_idx)
-    return loader_fn(fragment_id, seg_meta, group_idx, group_name, **kwargs)
-
-
 def _build_group_metadata_for_active_splits(
     *,
     segments_metadata,
@@ -391,13 +349,18 @@ def _build_datasets_for_backend(
             raise ValueError("shared_volume_cache is required when training.data_backend is 'zarr'")
     log(f"building datasets ({backend}{' lazy' if is_zarr else ''})")
 
-    def load_train_for_backend(fragment_id):
-        return _load_with_group_context(
+    train_patch_counts_by_segment = {}
+    train_mask_borders = {}
+    train_mask_bboxes = {}
+    for fragment_id in train_fragment_ids:
+        seg_meta = _segment_meta(segments_metadata, fragment_id)
+        group_idx = int(fragment_to_group_idx[fragment_id])
+        group_name = group_names[group_idx] if group_idx < len(group_names) else str(group_idx)
+        result = load_train_segment_for_backend(
             fragment_id,
-            segments_metadata=segments_metadata,
-            fragment_to_group_idx=fragment_to_group_idx,
-            group_names=group_names,
-            loader_fn=load_train_segment_for_backend,
+            seg_meta,
+            group_idx,
+            group_name,
             data_backend=backend,
             overlap_segments=overlap_segments,
             layers_cache=layers_cache,
@@ -407,13 +370,42 @@ def _build_datasets_for_backend(
             mask_suffix=train_mask_suffix,
         )
 
-    def load_val_for_backend(fragment_id):
-        return _load_with_group_context(
+        patch_count = int(result["patch_count"])
+        train_patch_counts_by_segment[fragment_id] = patch_count
+
+        mask_border = result.get("mask_border")
+        if mask_border is not None:
+            train_mask_borders[str(fragment_id)] = mask_border
+        mask_bbox = result.get("mask_bbox")
+        if mask_bbox is not None:
+            train_mask_bboxes[str(fragment_id)] = mask_bbox
+
+        if is_zarr:
+            if patch_count <= 0:
+                continue
+            sid = result["sid"]
+            train_volumes_by_segment[sid] = result["volume"]
+            train_masks_by_segment[sid] = result["mask_store"]
+            train_xyxys_by_segment[sid] = result["xyxys"]
+            train_sample_bbox_indices_by_segment[sid] = result["sample_bbox_indices"]
+            continue
+
+        if train_stitch_candidates is not None and result["stitch_candidate"] is not None:
+            train_stitch_candidates[str(fragment_id)] = result["stitch_candidate"]
+        train_images.extend(result["images"])
+        train_masks.extend(result["masks"])
+        train_groups.extend([int(result["group_idx"])] * len(result["images"]))
+
+    val_patch_counts_by_segment = {}
+    for fragment_id in val_fragment_ids:
+        seg_meta = _segment_meta(segments_metadata, fragment_id)
+        group_idx = int(fragment_to_group_idx[fragment_id])
+        group_name = group_names[group_idx] if group_idx < len(group_names) else str(group_idx)
+        result = load_val_segment_for_backend(
             fragment_id,
-            segments_metadata=segments_metadata,
-            fragment_to_group_idx=fragment_to_group_idx,
-            group_names=group_names,
-            loader_fn=load_val_segment_for_backend,
+            seg_meta,
+            group_idx,
+            group_name,
             data_backend=backend,
             layers_cache=layers_cache,
             volume_cache=shared_volume_cache,
@@ -422,35 +414,18 @@ def _build_datasets_for_backend(
             label_suffix=val_label_suffix,
             mask_suffix=val_mask_suffix,
         )
-
-    def consume_train_for_backend(fragment_id, result):
-        if is_zarr:
-            if int(result["patch_count"]) <= 0:
-                return
-            sid = result["sid"]
-            train_volumes_by_segment[sid] = result["volume"]
-            train_masks_by_segment[sid] = result["mask_store"]
-            train_xyxys_by_segment[sid] = result["xyxys"]
-            train_sample_bbox_indices_by_segment[sid] = result["sample_bbox_indices"]
-            return
-
-        if train_stitch_candidates is not None and result["stitch_candidate"] is not None:
-            train_stitch_candidates[str(fragment_id)] = result["stitch_candidate"]
-        train_images.extend(result["images"])
-        train_masks.extend(result["masks"])
-        train_groups.extend([int(result["group_idx"])] * len(result["images"]))
-
-    train_patch_counts_by_segment, train_mask_borders, train_mask_bboxes = _collect_train_segments(
-        train_fragment_ids,
-        load_train_fn=load_train_for_backend,
-        consume_train_fn=consume_train_for_backend,
-    )
-
-    val_patch_counts_by_segment = _collect_val_segments(
-        val_fragment_ids,
-        load_val_fn=load_val_for_backend,
-        tracking=tracking,
-    )
+        val_patch_counts_by_segment[fragment_id] = int(result["patch_count"])
+        if result["val_loader"] is None:
+            continue
+        append_val_entry(
+            tracking,
+            fragment_id=fragment_id,
+            val_loader=result["val_loader"],
+            mask_shape=result["mask_shape"],
+            mask_border=result["mask_border"],
+            mask_bbox=result.get("mask_bbox"),
+            valid_id=CFG.valid_id,
+        )
 
     summarize_patch_counts(
         "train",
@@ -500,42 +475,27 @@ def _build_datasets_for_backend(
         )
     steps_per_epoch = log_training_budget(train_loader)
 
-    train_stitch_kwargs = {
-        "data_backend": backend,
-        "train_fragment_ids": train_fragment_ids,
-        "stitch_segment_id": tracking["stitch_segment_id"],
-        "valid_transform": valid_transform,
-    }
-    if is_zarr:
-        train_stitch_kwargs.update(
-            {
-                "train_volumes_by_segment": train_volumes_by_segment,
-                "train_masks_by_segment": train_masks_by_segment,
-                "train_xyxys_by_segment": train_xyxys_by_segment,
-                "train_sample_bbox_indices_by_segment": train_sample_bbox_indices_by_segment,
-                "train_groups_by_segment": train_groups_by_segment,
-            }
-        )
-    else:
-        train_stitch_kwargs["train_stitch_candidates"] = train_stitch_candidates
     train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids = build_train_stitch_outputs(
-        **train_stitch_kwargs
+        data_backend=backend,
+        train_fragment_ids=train_fragment_ids,
+        stitch_segment_id=tracking["stitch_segment_id"],
+        valid_transform=valid_transform,
+        train_stitch_candidates=train_stitch_candidates,
+        train_volumes_by_segment=train_volumes_by_segment,
+        train_masks_by_segment=train_masks_by_segment,
+        train_xyxys_by_segment=train_xyxys_by_segment,
+        train_sample_bbox_indices_by_segment=train_sample_bbox_indices_by_segment,
+        train_groups_by_segment=train_groups_by_segment,
     )
-
-    log_only_kwargs = {
-        "data_backend": backend,
-        "log_only_segments": log_only_segments,
-        "segments_metadata": segments_metadata,
-        "valid_transform": valid_transform,
-        "mask_suffix": val_mask_suffix,
-        "log_only_downsample": log_only_downsample,
-    }
-    if is_zarr:
-        log_only_kwargs["volume_cache"] = shared_volume_cache
-    else:
-        log_only_kwargs["layers_cache"] = layers_cache
     log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes = build_log_only_outputs(
-        **log_only_kwargs
+        data_backend=backend,
+        log_only_segments=log_only_segments,
+        segments_metadata=segments_metadata,
+        valid_transform=valid_transform,
+        mask_suffix=val_mask_suffix,
+        log_only_downsample=log_only_downsample,
+        layers_cache=layers_cache,
+        volume_cache=shared_volume_cache,
     )
 
     return build_data_state(
@@ -554,6 +514,7 @@ def _build_datasets_for_backend(
         log_only_segment_ids=log_only_segment_ids,
         log_only_bboxes=log_only_bboxes,
         tracking=tracking,
+        shared_volume_cache=shared_volume_cache,
     )
 
 

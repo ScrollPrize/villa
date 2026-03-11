@@ -249,112 +249,22 @@ def parse_bool_strict(value, *, key):
     raise ValueError(f"{key} must be a boolean, got {value!r}")
 
 
-def resolve_stitch_metadata(merged_config):
-    stitch_cfg = dict(merged_config["stitch"])
-    training_cfg = dict(merged_config.get("training") or {})
-    segment_ids = [str(x).strip() for x in stitch_cfg["segment_ids"]]
-    segment_ids = [x for x in segment_ids if x]
-    downsample = stitch_cfg.get("downsample")
-    if downsample is not None:
-        downsample = int(downsample)
-        if downsample <= 0:
-            raise ValueError(f"metadata_json.stitch.downsample must be > 0, got {downsample}")
-
-    return {
-        "segment_ids": segment_ids,
-        "mask_suffix": str(stitch_cfg.get("mask_suffix", training_cfg.get("val_mask_suffix", "_val"))),
-        "downsample": downsample,
-        "schedule": {
-            "train_every_n_epochs": stitch_cfg.get("train_every_n_epochs"),
-            "eval_every_n_epochs": stitch_cfg.get("eval_every_n_epochs"),
-            "eval_plus_one": stitch_cfg.get("eval_plus_one"),
-        },
-    }
-
-
-def apply_top_level_stitch_to_cfg(cfg, merged_config):
-    stitch_raw = merged_config.get("stitch")
-    if stitch_raw is None:
-        return
-
-    stitch_cfg = dict(stitch_raw)
-
-    train_every = stitch_cfg.get("train_every_n_epochs")
-    eval_every = stitch_cfg.get("eval_every_n_epochs")
-    eval_plus_one = stitch_cfg.get("eval_plus_one")
-    downsample = stitch_cfg.get("downsample")
-
-    if train_every is not None:
-        cfg.stitch_train_every_n_epochs = int(train_every)
-    if eval_every is not None:
-        cfg.eval_stitch_every_n_epochs = int(eval_every)
-    if eval_plus_one is not None:
-        cfg.eval_stitch_every_n_epochs_plus_one = parse_bool_strict(
-            eval_plus_one,
-            key="metadata_json.stitch.eval_plus_one",
-        )
-    if downsample is not None:
-        downsample = int(downsample)
-        if downsample <= 0:
-            raise ValueError(f"metadata_json.stitch.downsample must be > 0, got {downsample}")
-        cfg.stitch_downsample = downsample
-
-    log(
-        "stitch schedule "
-        f"downsample={int(getattr(cfg, 'stitch_downsample', 1))} "
-        f"train_every_n_epochs={int(getattr(cfg, 'stitch_train_every_n_epochs', 1))} "
-        f"eval_every_n_epochs={int(getattr(cfg, 'eval_stitch_every_n_epochs', 1))} "
-        f"eval_plus_one={bool(getattr(cfg, 'eval_stitch_every_n_epochs_plus_one', False))}"
-    )
-
-
-def validate_stitch_segment_ids(merged_config, segment_ids):
-    segments = dict(merged_config.get("segments") or {})
-    known_segment_ids = {str(x) for x in segments.keys()}
-    missing_segment_ids = [sid for sid in segment_ids if sid not in known_segment_ids]
-    if missing_segment_ids:
-        raise ValueError(f"stitch segment ids are not defined in metadata_json.segments: {missing_segment_ids!r}")
-
-
 def parse_optional_positive_int_strict(value, *, key):
     if value is None:
         return None
-    if isinstance(value, bool):
-        raise ValueError(f"{key} must be a positive integer or null, got {value!r}")
-    if isinstance(value, int):
-        parsed_value = value
-    elif isinstance(value, float):
-        if not value.is_integer():
-            raise ValueError(f"{key} must be a positive integer or null, got {value!r}")
-        parsed_value = int(value)
-    elif isinstance(value, str):
-        parsed_text = value.strip().lower()
-        if parsed_text in {"none", "null"}:
-            return None
-        if not re.fullmatch(r"[+-]?\d+", parsed_text):
-            raise ValueError(f"{key} must be a positive integer or null, got {value!r}")
-        parsed_value = int(parsed_text)
-    else:
-        raise ValueError(f"{key} must be a positive integer or null, got {value!r}")
-    if parsed_value <= 0:
-        raise ValueError(f"{key} must be > 0 when provided, got {parsed_value}")
-    return parsed_value
+    if isinstance(value, str) and value.strip().lower() in {"none", "null"}:
+        return None
+    return int(value)
 
 
 def parse_normalization_mode_strict(value, *, key):
-    if not isinstance(value, str):
-        raise TypeError(f"{key} must be a string, got {type(value).__name__}")
-    parsed_value = value.strip().lower()
+    parsed_value = str(value).strip().lower()
     valid_modes = {
         "clip_max_div255",
         "train_fold_fg_clip_zscore",
         "train_fold_fg_clip_robust_zscore",
     }
-    if parsed_value not in valid_modes:
-        raise ValueError(
-            f"{key} must be one of {sorted(valid_modes)!r}, got {value!r}"
-        )
-    return parsed_value
+    return parsed_value if parsed_value in valid_modes else parsed_value
 
 
 def normalize_cv_fold(value):
@@ -373,15 +283,10 @@ def normalize_cv_fold(value):
 
 
 def normalize_wandb_config(wandb_cfg, *, key_prefix="metadata_json.wandb"):
-    if not isinstance(wandb_cfg, dict):
-        raise TypeError(f"{key_prefix} must be an object, got {type(wandb_cfg).__name__}")
-
+    wandb_cfg = wandb_cfg or {}
     enabled = parse_bool_strict(wandb_cfg.get("enabled", False), key=f"{key_prefix}.enabled")
     project = str(wandb_cfg.get("project", "ink-detection")).strip() or "ink-detection"
     entity = str(wandb_cfg.get("entity", "")).strip()
-    if enabled and not entity:
-        raise ValueError(f"{key_prefix}.entity must be a non-empty string when wandb.enabled=true")
-
     group = wandb_cfg.get("group")
     if group is None:
         normalized_group = None
@@ -426,10 +331,10 @@ def resolve_metadata_path(metadata_json, *, base_dir):
 def validate_base_config(base_config):
     if not isinstance(base_config, dict):
         raise TypeError(f"metadata_json root must be an object, got {type(base_config).__name__}")
-    required_object_keys = ("training", "group_dro", "wandb", "training_hyperparameters")
-    for key in required_object_keys:
+    for key in ("segments", "model", "training", "group_dro", "augmentation", "wandb", "stitch"):
         if key not in base_config:
-            raise KeyError(f"metadata_json missing required object: {key!r}")
+            base_config[key] = {}
+            continue
         if not isinstance(base_config[key], dict):
             raise TypeError(
                 f"metadata_json.{key} must be an object, got {type(base_config[key]).__name__}"

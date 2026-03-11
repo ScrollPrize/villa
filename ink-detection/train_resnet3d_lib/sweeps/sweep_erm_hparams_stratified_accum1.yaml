@@ -18,25 +18,25 @@ parameters:
     value: 0
 
 
-  training_hyperparameters.training.accumulate_grad_batches:
+  training.accumulate_grad_batches:
     value: 1
 
-  training_hyperparameters.training.epochs:
+  training.epochs:
     value: 30
 
-  training_hyperparameters.training.lr:
+  training.lr:
     distribution: log_uniform_values
     min: 1e-5
     max: 1e-3
 
-  training_hyperparameters.training.weight_decay:
+  training.weight_decay:
     distribution: log_uniform_values
     min: 1e-8
     max: 1e-2
 
-  training.stitch_all_val:
+  stitch.all_val:
     value: true
-  training.stitch_train:
+  stitch.train:
     value: true
   stitch.downsample:
     value: 1

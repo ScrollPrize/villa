@@ -244,11 +244,6 @@ def _load_patch_index_cache(
         return None
 
     with np.load(cache_path, allow_pickle=False) as npz_data:
-        required_keys = {"metadata_json", "xyxys", "sample_bbox_indices", "bboxes"}
-        missing_keys = required_keys - set(npz_data.files)
-        if missing_keys:
-            raise ValueError(f"cache file {cache_path!r} is missing keys: {sorted(missing_keys)!r}")
-
         raw_metadata = npz_data["metadata_json"]
         metadata_text = str(np.asarray(raw_metadata).item())
         metadata = json.loads(metadata_text)

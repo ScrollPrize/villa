@@ -131,9 +131,12 @@ def configure_optimizers(model):
         eta_min = float(getattr(CFG, "min_lr", 0.0))
 
         if warmup_steps > 0:
-            warmup_factor = float(getattr(CFG, "warmup_factor", 1.0) or 1.0)
-            if warmup_factor <= 0:
-                raise ValueError(f"warmup_factor must be > 0, got {warmup_factor}")
+            warmup_factor = getattr(CFG, "warmup_factor", 1.0)
+            if warmup_factor is None:
+                warmup_factor = 1.0
+            warmup_factor = float(warmup_factor)
+            if warmup_factor <= 0.0:
+                raise ValueError(f"warmup_factor must be > 0, got {warmup_factor!r}")
             start_factor = 1.0 / warmup_factor
 
             warmup = torch.optim.lr_scheduler.LinearLR(
@@ -174,5 +177,3 @@ def configure_optimizers(model):
             "interval": interval,
         },
     }
-
-

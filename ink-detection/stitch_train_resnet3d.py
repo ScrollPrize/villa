@@ -9,8 +9,6 @@ from torch.utils.data import Dataset
 from train_resnet3d_lib.config import (
     CFG,
     log,
-    resolve_stitch_metadata,
-    validate_stitch_segment_ids,
 )
 from train_resnet3d_lib.runtime import orchestration
 from train_resnet3d_lib import training as tr
@@ -18,7 +16,7 @@ from train_resnet3d_lib.data.patch_index_cache import (
     extract_infer_patch_coordinates_cached,
 )
 from train_resnet3d_lib.data.normalization_stats import (
-    prepare_fold_label_foreground_percentile_clip_zscore_stats,
+    prepare_run_fold_normalization_stats,
 )
 from train_resnet3d_lib.data.datasets_runtime import LazyZarrXyOnlyDataset, build_eval_loader
 from train_resnet3d_lib.data.augmentations import get_transforms
@@ -55,7 +53,6 @@ class StitchValidationDataset(Dataset):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--metadata_json", type=str, required=True)
-    parser.add_argument("--valid_id", type=str, default=None)
     parser.add_argument("--init_ckpt_path", type=str, default=None)
     parser.add_argument(
         "--resume_from_ckpt",
@@ -204,10 +201,11 @@ def resolve_checkpoint_jobs(args):
 
 
 def resolve_stitch_config(merged_config):
-    stitch_metadata = resolve_stitch_metadata(merged_config)
-    segment_ids = list(stitch_metadata["segment_ids"])
-    validate_stitch_segment_ids(merged_config, segment_ids)
-    return segment_ids, str(stitch_metadata["mask_suffix"])
+    stitch_cfg = dict(merged_config.get("stitch") or {})
+    segment_ids = [str(segment_id).strip() for segment_id in list(stitch_cfg.get("segment_ids") or [])]
+    segment_ids = [segment_id for segment_id in segment_ids if segment_id]
+    mask_suffix = str(stitch_cfg.get("mask_suffix", "_val"))
+    return segment_ids, mask_suffix
 
 
 def validate_stitch_eval_schedule():
@@ -364,24 +362,6 @@ def build_stitch_data_state(run_state, *, segment_ids, mask_suffix):
         "shared_volume_cache": shared_volume_cache,
     }
 
-
-def prepare_fold_zscore_stats_for_run(run_state, data_state):
-    shared_volume_cache = data_state["shared_volume_cache"]
-    if not isinstance(shared_volume_cache, dict):
-        raise TypeError(
-            "data_state.shared_volume_cache must be a dict, "
-            f"got {type(shared_volume_cache).__name__}"
-        )
-    prepare_fold_label_foreground_percentile_clip_zscore_stats(
-        segments_metadata=run_state["segments_metadata"],
-        train_fragment_ids=run_state["train_fragment_ids"],
-        data_backend="zarr",
-        train_label_suffix=getattr(CFG, "train_label_suffix", ""),
-        train_mask_suffix=getattr(CFG, "train_mask_suffix", ""),
-        volume_cache=shared_volume_cache,
-    )
-
-
 def main():
     args = parse_args()
     checkpoint_jobs = resolve_checkpoint_jobs(args)
@@ -437,6 +417,8 @@ def main():
             log(f"override valid_batch_size={CFG.valid_batch_size}")
 
         segment_ids, mask_suffix = resolve_stitch_config(merged_config)
+        if not segment_ids:
+            raise ValueError("metadata_json.stitch.segment_ids must contain at least one segment for stitch runs")
         if run_args.run_name is None:
             if len(segment_ids) == 1:
                 run_args.run_name = f"stitch_{segment_ids[0]}"
@@ -475,7 +457,11 @@ def main():
                 mask_suffix=mask_suffix,
             )
             log("stitch data state initialized once and will be reused for remaining checkpoints")
-        prepare_fold_zscore_stats_for_run(run_state, data_state)
+        prepare_run_fold_normalization_stats(
+            run_state=run_state,
+            data_backend="zarr",
+            volume_cache=data_state["shared_volume_cache"],
+        )
         model = tr.build_model(run_state, data_state, wandb_logger)
         trainer = tr.build_trainer(run_args, wandb_logger)
         tr.validate(trainer, model, data_state, run_state)

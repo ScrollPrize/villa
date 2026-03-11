@@ -44,14 +44,6 @@ def parse_tags(raw_tags):
 def normalize_optional_fold_for_tag(raw_fold):
     if raw_fold is None:
         return None
-    if isinstance(raw_fold, bool):
-        raise TypeError(f"cv_fold must not be boolean, got {raw_fold!r}")
-    if isinstance(raw_fold, int):
-        return raw_fold
-    if isinstance(raw_fold, float):
-        if not float(raw_fold).is_integer():
-            return str(raw_fold)
-        return int(raw_fold)
     if isinstance(raw_fold, str):
         stripped = raw_fold.strip()
         if stripped.lower() in {"", "none", "null"}:
@@ -59,45 +51,13 @@ def normalize_optional_fold_for_tag(raw_fold):
         if stripped.isdigit():
             return int(stripped)
         return stripped
+    if isinstance(raw_fold, float) and float(raw_fold).is_integer():
+        return int(raw_fold)
     return str(raw_fold)
 
 
 def normalize_accumulate_grad_batches_for_tag(raw_value):
-    if raw_value is None:
-        return 1
-    if isinstance(raw_value, bool):
-        raise TypeError(
-            "metadata.training_hyperparameters.training.accumulate_grad_batches must be a positive integer, "
-            f"got boolean {raw_value!r}"
-        )
-    if isinstance(raw_value, int):
-        value = raw_value
-    elif isinstance(raw_value, float):
-        if not float(raw_value).is_integer():
-            raise ValueError(
-                "metadata.training_hyperparameters.training.accumulate_grad_batches must be a positive integer, "
-                f"got {raw_value!r}"
-            )
-        value = int(raw_value)
-    elif isinstance(raw_value, str):
-        stripped = raw_value.strip()
-        if not stripped.isdigit():
-            raise ValueError(
-                "metadata.training_hyperparameters.training.accumulate_grad_batches must be a positive integer, "
-                f"got {raw_value!r}"
-            )
-        value = int(stripped)
-    else:
-        raise TypeError(
-            "metadata.training_hyperparameters.training.accumulate_grad_batches must be a positive integer, "
-            f"got {type(raw_value).__name__}"
-        )
-    if value < 1:
-        raise ValueError(
-            "metadata.training_hyperparameters.training.accumulate_grad_batches must be >= 1, "
-            f"got {value}"
-        )
-    return value
+    return 1 if raw_value is None else int(raw_value)
 
 
 def main():
@@ -135,19 +95,19 @@ def main():
         "--lr",
         type=float,
         default=None,
-        help="Optional override for training_hyperparameters.training.lr.",
+        help="Optional override for training.lr.",
     )
     parser.add_argument(
         "--weight_decay",
         type=float,
         default=None,
-        help="Optional override for training_hyperparameters.training.weight_decay.",
+        help="Optional override for training.weight_decay.",
     )
     parser.add_argument(
         "--epochs",
         type=int,
         default=None,
-        help="Optional override for training_hyperparameters.training.epochs (must be >= 1).",
+        help="Optional override for training.epochs (must be >= 1).",
     )
     parser.add_argument(
         "--wandb_tags",
@@ -219,8 +179,6 @@ def main():
 
                 md = json.loads(json.dumps(base_metadata))
                 md.setdefault("training", {})
-                if not isinstance(md["training"], dict):
-                    raise TypeError(f"metadata.training must be an object, got {type(md['training']).__name__}")
                 md["training"]["objective"] = "erm"
                 md["training"]["sampler"] = "shuffle"
                 md["training"]["loss_mode"] = "batch"
@@ -230,55 +188,31 @@ def main():
                     md["training"]["cv_fold"] = int(fold)
 
                 if args.lr is not None or args.weight_decay is not None or args.epochs is not None:
-                    md.setdefault("training_hyperparameters", {})
-                    if not isinstance(md["training_hyperparameters"], dict):
-                        raise TypeError(
-                            "metadata.training_hyperparameters must be an object, "
-                            f"got {type(md['training_hyperparameters']).__name__}"
-                        )
-                    md["training_hyperparameters"].setdefault("training", {})
-                    if not isinstance(md["training_hyperparameters"]["training"], dict):
-                        raise TypeError(
-                            "metadata.training_hyperparameters.training must be an object, "
-                            f"got {type(md['training_hyperparameters']['training']).__name__}"
-                        )
                     if args.lr is not None:
-                        md["training_hyperparameters"]["training"]["lr"] = float(args.lr)
+                        md["training"]["lr"] = float(args.lr)
                     if args.weight_decay is not None:
-                        md["training_hyperparameters"]["training"]["weight_decay"] = float(args.weight_decay)
+                        md["training"]["weight_decay"] = float(args.weight_decay)
                     if args.epochs is not None:
                         if int(args.epochs) < 1:
                             raise ValueError(f"--epochs must be >= 1, got {args.epochs}")
-                        md["training_hyperparameters"]["training"]["epochs"] = int(args.epochs)
+                        md["training"]["epochs"] = int(args.epochs)
 
                 md.setdefault("wandb", {})
-                if not isinstance(md["wandb"], dict):
-                    raise TypeError(f"metadata.wandb must be an object, got {type(md['wandb']).__name__}")
                 existing_tags = md["wandb"].get("tags", [])
                 if existing_tags is None:
                     existing_tags = []
-                if not isinstance(existing_tags, list):
-                    raise TypeError(
-                        "metadata.wandb.tags must be a list of strings, "
-                        f"got {type(existing_tags).__name__}"
-                    )
+                if not isinstance(existing_tags, (list, tuple)):
+                    existing_tags = [existing_tags]
                 normalized_existing_tags = []
-                for idx, tag in enumerate(existing_tags):
+                for tag in existing_tags:
                     if not isinstance(tag, str):
-                        raise TypeError(f"metadata.wandb.tags[{idx}] must be a string, got {type(tag).__name__}")
+                        tag = str(tag)
                     normalized_tag = tag.strip()
-                    if not normalized_tag:
-                        raise ValueError(f"metadata.wandb.tags[{idx}] must be non-empty")
-                    normalized_existing_tags.append(normalized_tag)
+                    if normalized_tag:
+                        normalized_existing_tags.append(normalized_tag)
 
-                if "training_hyperparameters" not in md or not isinstance(md["training_hyperparameters"], dict):
-                    raise KeyError("metadata must define an object at key 'training_hyperparameters'")
-                if "training" not in md["training_hyperparameters"] or not isinstance(
-                    md["training_hyperparameters"]["training"], dict
-                ):
-                    raise KeyError("metadata.training_hyperparameters must define an object at key 'training'")
                 effective_accumulate_grad_batches = normalize_accumulate_grad_batches_for_tag(
-                    md["training_hyperparameters"]["training"].get("accumulate_grad_batches")
+                    md["training"].get("accumulate_grad_batches")
                 )
                 effective_fold = normalize_optional_fold_for_tag(md["training"].get("cv_fold"))
 

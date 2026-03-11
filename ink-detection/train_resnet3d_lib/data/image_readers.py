@@ -442,4 +442,3 @@ def build_group_mappings(fragment_ids, segments_metadata, group_key="base_path")
     group_name_to_idx = {name: i for i, name in enumerate(group_names)}
     fragment_to_group_idx = {fid: group_name_to_idx[g] for fid, g in fragment_to_group_name.items()}
     return group_names, group_name_to_idx, fragment_to_group_idx
-

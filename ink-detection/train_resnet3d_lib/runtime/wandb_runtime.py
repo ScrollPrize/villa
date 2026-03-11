@@ -3,13 +3,13 @@ import os
 import os.path as osp
 import time
 
+import wandb
 import yaml
 
 from train_resnet3d_lib.config import (
     CFG,
     log,
     merge_config_with_overrides,
-    normalize_wandb_config,
     unflatten_dict,
 )
 from train_resnet3d_lib.runtime.wandb_local_metrics import LocalMetricsWandbLogger
@@ -97,7 +97,7 @@ def expand_wandb_metric_summary_keys(metric_summaries, *, segment_ids):
 
 def init_wandb_logger(args, base_config, *, preinit_overrides=None):
     init_config = merge_config_with_overrides(base_config, preinit_overrides or {})
-    wandb_cfg = normalize_wandb_config(init_config["wandb"], key_prefix="metadata_json.wandb")
+    wandb_cfg = dict(init_config["wandb"])
     wandb_enabled = wandb_cfg["enabled"]
     wandb_project = wandb_cfg["project"]
     wandb_entity = wandb_cfg["entity"]
@@ -177,7 +177,7 @@ def define_wandb_metric_summaries(wandb_logger, merged_config):
 
 
 def sync_wandb_run_config(wandb_logger, merged_config):
-    merged_wandb_cfg = normalize_wandb_config(merged_config["wandb"], key_prefix="merged_config.wandb")
+    merged_wandb_cfg = dict(merged_config["wandb"])
     merged_tags = tuple(merged_wandb_cfg["tags"])
     run = wandb_logger.experiment
     current_tags = tuple(run.tags) if run.tags is not None else ()
@@ -199,14 +199,29 @@ def configure_wandb_run(wandb_logger, *, run_state, cfg):
 
     wandb_logger.configure_local_persistence(log_dir=str(cfg.log_dir))
     run = wandb_logger.experiment
-    run_dir_name = osp.basename(str(run_state["run_dir"]).rstrip("/\\"))
+    run_dir = str(run_state["run_dir"])
+    run_dir_name = osp.basename(run_dir.rstrip("/\\"))
     if not run_dir_name:
-        raise ValueError(f"failed to derive run_dir basename from run_dir={run_state['run_dir']!r}")
+        raise ValueError(f"failed to derive run_dir basename from run_dir={run_dir!r}")
     desired_run_name = str(run_dir_name)
     current_run_name = str(run.name) if run.name is not None else None
     if current_run_name != desired_run_name:
         run.name = desired_run_name
         log(f"wandb run name updated current={current_run_name!r} merged={desired_run_name!r}")
-    run.summary["local/run_dir"] = str(run_state["run_dir"])
+    run.summary["local/run_dir"] = run_dir
     run.summary["local/checkpoints_dir"] = str(cfg.model_dir)
     run.summary["local/log_dir"] = str(cfg.log_dir)
+
+
+def finalize_wandb_logging(trainer):
+    logger = getattr(trainer, "logger", None)
+    if logger is False or logger is None:
+        return
+    if not isinstance(logger, LocalMetricsWandbLogger):
+        raise TypeError(
+            "trainer.logger must be LocalMetricsWandbLogger when W&B logging is active, "
+            f"got {type(logger).__name__}"
+        )
+    logger.persist_local_state()
+    if wandb.run is not None:
+        wandb.finish()

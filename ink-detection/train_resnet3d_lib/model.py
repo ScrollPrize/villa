@@ -1,6 +1,4 @@
 import os.path as osp
-from dataclasses import asdict, is_dataclass
-from types import SimpleNamespace
 
 import pytorch_lightning as pl
 import segmentation_models_pytorch as smp
@@ -15,102 +13,14 @@ from train_resnet3d_lib.modeling.architecture import Decoder, replace_batchnorm_
 from train_resnet3d_lib.modeling.group_dro import GroupDROComputer
 from train_resnet3d_lib.modeling.losses import build_bce_targets, compute_per_sample_loss_and_dice
 from train_resnet3d_lib.modeling.optimizers_runtime import configure_optimizers as configure_optimizers_runtime
-from train_resnet3d_lib.stitch_manager import StitchManager, coerce_stitch_manager_state
-
-def _cfg_to_dict(value, *, key):
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(value)
-    if is_dataclass(value):
-        return dict(asdict(value))
-    if hasattr(value, "__dict__"):
-        return dict(vars(value))
-    raise TypeError(f"{key} must be a dict/dataclass/object with attributes, got {type(value).__name__}")
+from train_resnet3d_lib.stitch_manager import StitchManager
 
 
-def _coerce_flat_model_state(state):
-    data = _cfg_to_dict(state, key="model_state")
-    n_groups = int(data.get("n_groups", 1) or 1)
-    group_names = data.get("group_names")
-    if group_names is None:
-        group_names = [str(i) for i in range(n_groups)]
-    else:
-        group_names = [str(x) for x in group_names]
-    stitch_group_idx_by_segment = {
-        str(segment_id): int(group_idx)
-        for segment_id, group_idx in dict(data.get("stitch_group_idx_by_segment") or {}).items()
-    }
-
-    return {
-        "with_norm": bool(data.get("with_norm", False)),
-        "total_steps": int(data.get("total_steps", 1)),
-        "n_groups": n_groups,
-        "group_names": group_names,
-        "stitch_group_idx_by_segment": stitch_group_idx_by_segment,
-        "norm": str(data.get("norm", "batch")),
-        "group_norm_groups": int(data.get("group_norm_groups", 32)),
-        "objective": str(data.get("objective", "erm")),
-        "loss_mode": str(data.get("loss_mode", "batch")),
-        "loss_recipe": str(data.get("loss_recipe", "dice_bce")).lower(),
-        "bce_smooth_factor": float(data.get("bce_smooth_factor", 0.25)),
-        "soft_label_positive": float(data.get("soft_label_positive", 1.0)),
-        "soft_label_negative": float(data.get("soft_label_negative", 0.0)),
-        "robust_step_size": data.get("robust_step_size"),
-        "group_counts": [int(x) for x in list(data.get("group_counts") or [])],
-        "group_dro_gamma": float(data.get("group_dro_gamma", 0.1)),
-        "group_dro_btl": bool(data.get("group_dro_btl", False)),
-        "group_dro_alpha": data.get("group_dro_alpha"),
-        "group_dro_normalize_loss": bool(data.get("group_dro_normalize_loss", False)),
-        "group_dro_min_var_weight": float(data.get("group_dro_min_var_weight", 0.0)),
-        "group_dro_adj": data.get("group_dro_adj"),
-        "erm_group_topk": int(data.get("erm_group_topk", 0)),
-        **coerce_stitch_manager_state(data),
-    }
-
-
-def _coerce_regression_model_state(
-    *,
-    model_state=None,
-):
-    if model_state is None:
-        return _coerce_flat_model_state({})
-    return _coerce_flat_model_state(_cfg_to_dict(model_state, key="model_state"))
-
-
-def save_regression_hyperparameters(model, *, state):
-    model.save_hyperparameters(
-        {
-            "model_state": {
-                "with_norm": bool(state.with_norm),
-                "total_steps": int(state.total_steps),
-                "n_groups": int(state.n_groups),
-                "group_names": list(state.group_names),
-                "norm": str(state.norm),
-                "group_norm_groups": int(state.group_norm_groups),
-                "objective": str(state.objective),
-                "loss_mode": str(state.loss_mode),
-                "loss_recipe": str(state.loss_recipe),
-                "bce_smooth_factor": float(state.bce_smooth_factor),
-                "soft_label_positive": float(state.soft_label_positive),
-                "soft_label_negative": float(state.soft_label_negative),
-                "robust_step_size": state.robust_step_size,
-                "group_counts": list(state.group_counts),
-                "group_dro_gamma": float(state.group_dro_gamma),
-                "group_dro_btl": bool(state.group_dro_btl),
-                "group_dro_alpha": state.group_dro_alpha,
-                "group_dro_normalize_loss": bool(state.group_dro_normalize_loss),
-                "group_dro_min_var_weight": float(state.group_dro_min_var_weight),
-                "erm_group_topk": int(state.erm_group_topk),
-                "stitch_all_val": bool(state.stitch_all_val),
-                "stitch_downsample": int(state.stitch_downsample),
-                "stitch_log_only_downsample": int(state.stitch_log_only_downsample),
-                "stitch_log_only_every_n_epochs": int(state.stitch_log_only_every_n_epochs),
-                "stitch_train": bool(state.stitch_train),
-                "stitch_train_every_n_epochs": int(state.stitch_train_every_n_epochs),
-            },
-        }
-    )
+_RESNET3D_ENCODER_DIMS = {
+    50: [256, 512, 1024, 2048],
+    101: [256, 512, 1024, 2048],
+    152: [256, 512, 1024, 2048],
+}
 
 
 def _normalize_stitch_group_idx_by_segment(stitch_group_idx_by_segment, *, n_groups):
@@ -133,41 +43,35 @@ def _normalize_stitch_group_idx_by_segment(stitch_group_idx_by_segment, *, n_gro
     return normalized_group_map
 
 
-def _init_group_dro_if_needed(model, *, state):
+def _init_group_dro_if_needed(model, *, group_counts):
     model.group_dro = None
     if model.objective != "group_dro":
         return
-    robust_step_size = state.robust_step_size
-    if robust_step_size is None:
-        raise ValueError("group_dro.robust_step_size is required when training.objective is group_dro")
-    group_counts = state.group_counts
-    if group_counts is None:
-        raise ValueError("group_counts is required when training.objective is group_dro")
 
     model.group_dro = GroupDROComputer(
         n_groups=model.n_groups,
         group_counts=group_counts,
-        alpha=state.group_dro_alpha,
-        gamma=state.group_dro_gamma,
-        adj=state.group_dro_adj,
-        min_var_weight=state.group_dro_min_var_weight,
-        step_size=robust_step_size,
-        normalize_loss=state.group_dro_normalize_loss,
-        btl=state.group_dro_btl,
+        alpha=getattr(CFG, "group_dro_alpha", None),
+        gamma=float(getattr(CFG, "group_dro_gamma", 0.1)),
+        adj=getattr(CFG, "group_dro_adj", None),
+        min_var_weight=float(getattr(CFG, "group_dro_min_var_weight", 0.0)),
+        step_size=getattr(CFG, "robust_step_size", None),
+        normalize_loss=bool(getattr(CFG, "group_dro_normalize_loss", False)),
+        btl=bool(getattr(CFG, "group_dro_btl", False)),
     )
 
 
-def _build_backbone_with_optional_pretrained(*, state):
-    resnet3d_model_depth = getattr(CFG, "resnet3d_model_depth", None)
-    if resnet3d_model_depth is None:
-        raise KeyError("CFG.resnet3d_model_depth is required")
-    resnet3d_model_depth = int(resnet3d_model_depth)
-    if resnet3d_model_depth not in {50, 101, 152}:
+def _resolve_resnet3d_depth():
+    resnet3d_model_depth = int(getattr(CFG, "resnet3d_model_depth", None))
+    if resnet3d_model_depth not in _RESNET3D_ENCODER_DIMS:
         raise ValueError(
-            "CFG.resnet3d_model_depth must be one of [50, 101, 152], "
-            f"got {resnet3d_model_depth}"
+            f"Unsupported resnet3d_model_depth={resnet3d_model_depth!r}. "
+            f"Expected one of {sorted(_RESNET3D_ENCODER_DIMS)!r}."
         )
+    return resnet3d_model_depth
 
+
+def _build_backbone_with_optional_pretrained(*, resnet3d_model_depth):
     backbone = generate_model(
         model_depth=resnet3d_model_depth,
         n_input_channels=1,
@@ -175,26 +79,16 @@ def _build_backbone_with_optional_pretrained(*, state):
         n_classes=1039,
     )
 
-    norm = str(state.norm).lower()
-    group_norm_groups = int(state.group_norm_groups)
+    norm = str(getattr(CFG, "norm", "batch")).lower()
+    group_norm_groups = int(getattr(CFG, "group_norm_groups", 32))
     init_ckpt_path = getattr(CFG, "init_ckpt_path", None)
     use_pretrained = bool(getattr(CFG, "pretrained", True))
     if use_pretrained and (not init_ckpt_path):
-        backbone_pretrained_path = getattr(CFG, "backbone_pretrained_path", None)
-        if not isinstance(backbone_pretrained_path, str):
-            raise TypeError(
-                "CFG.backbone_pretrained_path must be a string when init_ckpt_path is not provided, "
-                f"got {type(backbone_pretrained_path).__name__}"
-            )
-        backbone_pretrained_path = backbone_pretrained_path.strip()
-        if not backbone_pretrained_path:
-            raise ValueError(
-                "CFG.backbone_pretrained_path must be non-empty when init_ckpt_path is not provided"
-            )
+        backbone_pretrained_path = str(getattr(CFG, "backbone_pretrained_path", "")).strip()
         if not osp.exists(backbone_pretrained_path):
             raise FileNotFoundError(
                 f"Missing backbone pretrained weights: {backbone_pretrained_path}. "
-                "Set training_hyperparameters.model.backbone_pretrained_path to a valid file, "
+                "Set model.backbone_pretrained_path to a valid file, "
                 "or pass --init_ckpt_path to fine-tune from a previous run."
             )
         backbone_ckpt = torch.load(backbone_pretrained_path, map_location="cpu")
@@ -211,47 +105,36 @@ def _build_backbone_with_optional_pretrained(*, state):
 
 
 def _encoder_dims_for_resnet3d_depth(model_depth):
-    if model_depth is None:
-        raise KeyError("CFG.resnet3d_model_depth is required")
-    model_depth = int(model_depth)
-    if model_depth in {50, 101, 152}:
-        return [256, 512, 1024, 2048]
-    raise ValueError(
-        "CFG.resnet3d_model_depth must be one of [50, 101, 152], "
-        f"got {model_depth}"
-    )
+    return _RESNET3D_ENCODER_DIMS[model_depth]
 
 
-def _build_stitch_manager(state):
-    return StitchManager(**coerce_stitch_manager_state(_cfg_to_dict(state, key="model_state")))
+def initialize_regression_state(
+    model,
+    *,
+    total_steps,
+    group_names,
+    stitch_group_idx_by_segment,
+    group_counts,
+):
+    model.objective = str(getattr(CFG, "objective", "erm")).lower()
+    model.loss_mode = str(getattr(CFG, "loss_mode", "batch")).lower()
+    model.loss_recipe = str(getattr(CFG, "loss_recipe", "dice_bce")).lower()
+    model.bce_smooth_factor = float(getattr(CFG, "bce_smooth_factor", 0.25))
+    model.soft_label_positive = float(getattr(CFG, "soft_label_positive", 1.0))
+    model.soft_label_negative = float(getattr(CFG, "soft_label_negative", 0.0))
+    model.with_norm = False
+    model.total_steps = int(total_steps)
 
-
-def initialize_regression_state(model, *, state):
-    model.objective = state.objective.lower()
-    model.loss_mode = state.loss_mode.lower()
-    model.loss_recipe = state.loss_recipe.lower()
-    model.bce_smooth_factor = state.bce_smooth_factor
-    model.soft_label_positive = state.soft_label_positive
-    model.soft_label_negative = state.soft_label_negative
-    model.with_norm = state.with_norm
-    model.total_steps = state.total_steps
-
-    model.n_groups = int(state.n_groups)
-    model.group_names = list(state.group_names)
-    if len(model.group_names) == 0:
-        model.group_names = [str(i) for i in range(model.n_groups)]
-    if len(model.group_names) != model.n_groups:
-        raise ValueError(f"group_names length must be {model.n_groups}, got {len(model.group_names)}")
+    model.n_groups = int(len(group_names))
+    model.group_names = list(group_names)
     model._stitch_group_idx_by_segment = _normalize_stitch_group_idx_by_segment(
-        state.stitch_group_idx_by_segment,
+        stitch_group_idx_by_segment,
         n_groups=model.n_groups,
     )
 
-    _init_group_dro_if_needed(model, state=state)
+    _init_group_dro_if_needed(model, group_counts=group_counts)
 
-    model.erm_group_topk = int(state.erm_group_topk or 0)
-    if model.erm_group_topk < 0:
-        raise ValueError(f"erm_group_topk must be >= 0, got {model.erm_group_topk}")
+    model.erm_group_topk = int(getattr(CFG, "erm_group_topk", 0) or 0)
 
     model._ema_decay = float(getattr(CFG, "ema_decay", 0.9))
     model._ema_metrics = {}
@@ -261,11 +144,14 @@ def initialize_regression_state(model, *, state):
 
     model.loss_func1 = smp.losses.DiceLoss(mode="binary")
 
-    model.backbone = _build_backbone_with_optional_pretrained(state=state)
+    resnet3d_model_depth = _resolve_resnet3d_depth()
+    model.backbone = _build_backbone_with_optional_pretrained(
+        resnet3d_model_depth=resnet3d_model_depth,
+    )
 
-    norm = str(state.norm).lower()
-    group_norm_groups = int(state.group_norm_groups)
-    encoder_dims = _encoder_dims_for_resnet3d_depth(getattr(CFG, "resnet3d_model_depth", None))
+    norm = str(getattr(CFG, "norm", "batch")).lower()
+    group_norm_groups = int(getattr(CFG, "group_norm_groups", 32))
+    encoder_dims = _encoder_dims_for_resnet3d_depth(resnet3d_model_depth)
 
     model.decoder = Decoder(encoder_dims=encoder_dims, upscale=1, norm=norm, group_norm_groups=group_norm_groups)
 
@@ -274,8 +160,6 @@ def initialize_regression_state(model, *, state):
             model.normalization = nn.GroupNorm(num_groups=1, num_channels=1)
         else:
             model.normalization = nn.BatchNorm3d(num_features=1)
-
-    model._stitcher = _build_stitch_manager(state)
 
 
 def reset_train_epoch_accumulators(model):
@@ -413,7 +297,12 @@ def compute_objective_loss(
     loss_recipe = str(getattr(model, "loss_recipe", "dice_bce")).lower()
     group_idx = group_idx.long()
 
+    if loss_recipe not in {"dice_bce", "bce_only"}:
+        raise ValueError(f"Unknown training.loss_recipe: {loss_recipe!r}")
+
     if objective == "group_dro":
+        if loss_mode != "per_sample":
+            raise ValueError("training.objective=group_dro requires training.loss_mode=per_sample")
         if model.group_dro is None:
             raise RuntimeError("GroupDRO objective was set but group_dro computer was not initialized")
 
@@ -432,6 +321,9 @@ def compute_objective_loss(
 
         return robust_loss
 
+    if objective != "erm":
+        raise ValueError(f"Unknown training.objective: {objective!r}")
+
     if loss_mode == "batch":
         bce_targets = model.build_bce_targets(targets)
         bce_loss = F.binary_cross_entropy_with_logits(outputs, bce_targets)
@@ -444,6 +336,9 @@ def compute_objective_loss(
         model.log("train/dice_loss", dice_loss, on_step=True, on_epoch=True, prog_bar=False)
         model.log("train/bce_loss", bce_loss, on_step=True, on_epoch=True, prog_bar=False)
         return loss
+
+    if loss_mode != "per_sample":
+        raise ValueError(f"Unknown training.loss_mode: {loss_mode!r}")
 
     if model.erm_group_topk > 0:
         group_loss, group_count = compute_group_avg(model, per_sample_loss, group_idx)
@@ -624,29 +519,32 @@ class RegressionPLModel(pl.LightningModule):
     def __init__(
         self,
         *,
-        model_state: dict | None = None,
+        total_steps=0,
+        group_names=None,
+        stitch_group_idx_by_segment=None,
+        group_counts=None,
+        stitch_manager: StitchManager | None = None,
     ):
         super(RegressionPLModel, self).__init__()
-        state = SimpleNamespace(**_coerce_regression_model_state(
-            model_state=model_state,
-        ))
-        save_regression_hyperparameters(
-            self,
-            state=state,
+        group_names = [] if group_names is None else list(group_names)
+        stitch_group_idx_by_segment = {} if stitch_group_idx_by_segment is None else dict(stitch_group_idx_by_segment)
+        group_counts_hparams = list(group_counts) if group_counts is not None else None
+        self._stitcher = stitch_manager if stitch_manager is not None else StitchManager()
+        self.save_hyperparameters(
+            {
+                "total_steps": int(total_steps),
+                "group_names": group_names,
+                "stitch_group_idx_by_segment": stitch_group_idx_by_segment,
+                "group_counts": group_counts_hparams,
+            }
         )
         initialize_regression_state(
             self,
-            state=state,
+            total_steps=total_steps,
+            group_names=group_names,
+            stitch_group_idx_by_segment=stitch_group_idx_by_segment,
+            group_counts=group_counts,
         )
-
-    def set_stitch_borders(self, *, train_borders=None, val_borders=None):
-        self._stitcher.set_borders(train_borders=train_borders, val_borders=val_borders)
-
-    def set_train_stitch_loaders(self, loaders, segment_ids):
-        self._stitcher.set_train_loaders(loaders, segment_ids)
-
-    def set_log_only_stitch_loaders(self, loaders, segment_ids):
-        self._stitcher.set_log_only_loaders(loaders, segment_ids)
 
     def on_train_epoch_start(self):
         reset_train_epoch_accumulators(self)

@@ -8,7 +8,7 @@ This folder is organized around the main research edit loops.
 ## Core files
 - **Run setup + trainer wiring**: `training.py`
 - **Lightning module (init + train/val runtime)**: `model.py`
-- **Dataset pipeline (Zarr-primary backend adapter dispatch)**: `datasets_builder.py`
+- **Dataset pipeline (shared Zarr/TIFF dispatch)**: `datasets_builder.py`
 - **Stitch manager runtime**: `stitch_manager.py`
 - **Runtime orchestration + W&B + checkpointing**: `runtime/`
 - **Metadata/config validation (authoritative static checks)**: `config_metadata_apply.py`

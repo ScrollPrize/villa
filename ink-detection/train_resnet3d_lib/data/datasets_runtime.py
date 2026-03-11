@@ -14,10 +14,13 @@ SUPPORTED_DATA_BACKENDS = ("zarr", "tiff")
 
 
 def normalize_data_backend(data_backend):
-    backend = str(data_backend).strip().lower()
-    if backend not in SUPPORTED_DATA_BACKENDS:
-        raise ValueError(f"Unknown training.data_backend: {data_backend!r}. Expected 'zarr' or 'tiff'.")
-    return backend
+    normalized = str(data_backend).strip().lower()
+    if normalized not in SUPPORTED_DATA_BACKENDS:
+        raise ValueError(
+            f"Unknown training.data_backend: {data_backend!r}. "
+            f"Expected one of {SUPPORTED_DATA_BACKENDS!r}."
+        )
+    return normalized
 
 
 def build_eval_loader(dataset):

@@ -19,12 +19,13 @@ def _as_float(value, default=None):
 
 
 def get_transforms(data, cfg):
-    if data == "train":
+    split = str(data).strip().lower()
+    if split == "train":
         aug = A.Compose(cfg.train_aug_list)
-    elif data == "valid":
+    elif split == "valid":
         aug = A.Compose(cfg.valid_aug_list)
     else:
-        raise ValueError(f"unknown transform split: {data!r}")
+        raise ValueError(f"Unknown augmentation split: {data!r}. Expected 'train' or 'valid'.")
     return aug
 
 
@@ -74,28 +75,12 @@ def _xy_to_bounds(xy):
 
 def _fourth_augment(image, cfg):
     in_chans = int(cfg.in_chans)
-    if in_chans <= 0:
-        raise ValueError(f"in_chans must be > 0 for fourth augment, got {in_chans}")
-    if image.shape[-1] != in_chans:
-        raise ValueError(
-            f"fourth augment expected image with {in_chans} channels, got shape {tuple(image.shape)}"
-        )
-
     min_crop_ratio = float(cfg.fourth_augment_min_crop_ratio)
     max_crop_ratio = float(cfg.fourth_augment_max_crop_ratio)
-    if not (0.0 < min_crop_ratio <= max_crop_ratio <= 1.0):
-        raise ValueError(
-            "fourth augment crop ratios must satisfy 0 < min_crop_ratio <= max_crop_ratio <= 1, "
-            f"got min={min_crop_ratio}, max={max_crop_ratio}"
-        )
 
     image_tmp = np.zeros_like(image)
     min_crop = max(1, int(np.ceil(in_chans * min_crop_ratio)))
     max_crop = max(1, int(np.floor(in_chans * max_crop_ratio)))
-    if min_crop > max_crop:
-        raise ValueError(
-            f"invalid fourth augment crop window for in_chans={in_chans}: min_crop={min_crop}, max_crop={max_crop}"
-        )
     cropping_num = random.randint(min_crop, max_crop)
 
     max_start = max(0, in_chans - cropping_num)
@@ -108,16 +93,12 @@ def _fourth_augment(image, cfg):
     np.random.shuffle(tmp)
 
     cutout_max_count = int(cfg.fourth_augment_cutout_max_count)
-    if cutout_max_count < 0:
-        raise ValueError(f"fourth_augment_cutout_max_count must be >= 0, got {cutout_max_count}")
     cutout_idx = random.randint(0, min(cutout_max_count, cropping_num))
     temporal_random_cutout_idx = tmp[:cutout_idx]
 
     image_tmp[..., start_paste_idx:start_paste_idx + cropping_num] = image[..., crop_indices]
 
     cutout_p = float(cfg.fourth_augment_cutout_p)
-    if not (0.0 <= cutout_p <= 1.0):
-        raise ValueError(f"fourth_augment_cutout_p must be in [0, 1], got {cutout_p}")
     if random.random() < cutout_p:
         image_tmp[..., temporal_random_cutout_idx] = 0
     return image_tmp
@@ -125,8 +106,6 @@ def _fourth_augment(image, cfg):
 
 def _maybe_fourth_augment(image, cfg):
     p = float(cfg.fourth_augment_p)
-    if not (0.0 <= p <= 1.0):
-        raise ValueError(f"fourth_augment_p must be in [0, 1], got {p}")
     if random.random() < p:
         return _fourth_augment(image, cfg)
     return image
@@ -152,14 +131,13 @@ def _invert_augment(image):
 
 def _maybe_invert_augment(image, cfg):
     p = float(cfg.invert_augment_p)
-    if not (0.0 <= p <= 1.0):
-        raise ValueError(f"invert_augment_p must be in [0, 1], got {p}")
     if random.random() < p:
         return _invert_augment(image)
     return image
 
 
-def _apply_fold_label_foreground_percentile_clip_zscore(image, *, stats):
+def _apply_fold_label_foreground_percentile_clip_zscore(image, *, stats, **kwargs):
+    del kwargs
     if not isinstance(stats, dict):
         raise ValueError(
             "CFG.fold_label_foreground_percentile_clip_zscore_stats must be set before using "
@@ -176,7 +154,8 @@ def _apply_fold_label_foreground_percentile_clip_zscore(image, *, stats):
     return image
 
 
-def _apply_fold_label_foreground_percentile_clip_robust_zscore(image, *, stats):
+def _apply_fold_label_foreground_percentile_clip_robust_zscore(image, *, stats, **kwargs):
+    del kwargs
     if not isinstance(stats, dict):
         raise ValueError(
             "CFG.fold_label_foreground_percentile_clip_zscore_stats must be set before using "
@@ -194,26 +173,27 @@ def _apply_fold_label_foreground_percentile_clip_robust_zscore(image, *, stats):
 
 
 def build_intensity_normalization_transform(cfg, *, in_chans):
+    from functools import partial
+
     mode = str(getattr(cfg, "normalization_mode", "clip_max_div255")).strip().lower()
     if mode == "clip_max_div255":
         return A.Normalize(mean=[0] * in_chans, std=[1] * in_chans)
     if mode == "train_fold_fg_clip_zscore":
+        stats = getattr(cfg, "fold_label_foreground_percentile_clip_zscore_stats", None)
         return A.Lambda(
-            image=lambda image, **kwargs: _apply_fold_label_foreground_percentile_clip_zscore(
-                image,
-                stats=getattr(cfg, "fold_label_foreground_percentile_clip_zscore_stats", None),
-            ),
+            image=partial(_apply_fold_label_foreground_percentile_clip_zscore, stats=stats),
             p=1.0,
         )
     if mode == "train_fold_fg_clip_robust_zscore":
+        stats = getattr(cfg, "fold_label_foreground_percentile_clip_zscore_stats", None)
         return A.Lambda(
-            image=lambda image, **kwargs: _apply_fold_label_foreground_percentile_clip_robust_zscore(
-                image,
-                stats=getattr(cfg, "fold_label_foreground_percentile_clip_zscore_stats", None),
-            ),
+            image=partial(_apply_fold_label_foreground_percentile_clip_robust_zscore, stats=stats),
             p=1.0,
         )
-    raise ValueError(f"Unsupported normalization_mode: {mode!r}")
+    raise ValueError(
+        f"Unknown normalization_mode: {mode!r}. Expected 'clip_max_div255', "
+        "'train_fold_fg_clip_zscore', or 'train_fold_fg_clip_robust_zscore'."
+    )
 
 
 def rebuild_augmentations(cfg, augmentation_cfg=None):

@@ -13,12 +13,11 @@ def build_default_run_slug(*, objective, sampler, loss_mode, lr, weight_decay, c
 
 def build_default_run_slug_from_metadata(merged_config):
     training_cfg = merged_config["training"]
-    hp_train_cfg = merged_config["training_hyperparameters"]["training"]
     return build_default_run_slug(
         objective=str(training_cfg["objective"]).lower(),
         sampler=str(training_cfg["sampler"]).lower(),
         loss_mode=str(training_cfg["loss_mode"]).lower(),
-        lr=float(hp_train_cfg["lr"]),
-        weight_decay=float(hp_train_cfg["weight_decay"]),
+        lr=float(training_cfg["lr"]),
+        weight_decay=float(training_cfg["weight_decay"]),
         cv_fold=training_cfg.get("cv_fold"),
     )

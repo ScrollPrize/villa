@@ -96,7 +96,7 @@ Metadata keys to set (edit the existing `metadata.json` template):
 - `training.train_segments`, `training.val_segments`, optional `training.cv_fold`.
 - `training.objective`, `training.sampler`, `training.loss_mode`, `training.save_every_epoch`.
 - `stitch.segment_ids`, `stitch.mask_suffix`, `stitch.downsample`, `stitch.train_every_n_epochs`, `stitch.eval_every_n_epochs`, `stitch.eval_plus_one`.
-- `training_hyperparameters.model.backbone_pretrained_path`.
+- `model.backbone_pretrained_path`.
 
 Fold/suffix behavior:
 
@@ -107,7 +107,7 @@ Fold/suffix behavior:
 Pretrained 3D-ResNet checkpoint:
 
 - Download from `3D-ResNets-PyTorch` pretrained models and place it in this folder (or any path).
-- Set `training_hyperparameters.model.backbone_pretrained_path`, e.g. `r3d50_KM_200ep.pth`, `r3d101_KM_200ep.pth`, or `r3d152_KM_200ep.pth`.
+- Set `model.backbone_pretrained_path`, e.g. `r3d50_KM_200ep.pth`, `r3d101_KM_200ep.pth`, or `r3d152_KM_200ep.pth`.
 
 Run:
 
