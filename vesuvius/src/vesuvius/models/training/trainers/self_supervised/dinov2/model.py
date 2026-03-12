@@ -17,7 +17,7 @@ _BACKBONE_DEFAULTS = {
     "global_crops_size": (256, 256, 256),
     "local_crops_size": None,
     "embed_dim": 864,
-    "patch_size": (8, 8, 8),
+    "patch_size": (16, 16, 16),
     "depth": 24,
     "num_heads": 16,
     "qkv_bias": True,
@@ -33,7 +33,7 @@ _BACKBONE_DEFAULTS = {
     "init_values": None,
     "use_abs_pos_emb": True,
     "use_rot_pos_emb": True,
-    "num_reg_tokens": 0,
+    "num_reg_tokens": 4,
     "grad_checkpointing": False,
     "block_chunks": 0,
 }
@@ -43,6 +43,16 @@ _HEAD_DEFAULTS = {
     "nlayers": 3,
     "use_bn": False,
     "norm_last_layer": False,
+}
+_HEAD_PREFIX_DEFAULTS = {
+    "dino": {
+        "bottleneck_dim": 384,
+    },
+    "ibot": {},
+}
+_HEAD_OUT_DIM_DEFAULTS = {
+    "dino": 131072,
+    "ibot": 131072,
 }
 
 
@@ -225,19 +235,25 @@ class DinoVitStudentTeacher(nn.Module):
         return backbone_cls(**kwargs)
 
     def _build_head(self, prefix: str, fallback_prefix: Optional[str] = None) -> DINOHead:
+        prefix_defaults = {**_HEAD_DEFAULTS, **_HEAD_PREFIX_DEFAULTS.get(prefix, {})}
         kwargs = {
             suffix: _config_value(
                 self.config,
                 f"{prefix}_head_{suffix}",
-                default,
+                prefix_defaults[suffix],
                 fallback_key=f"{fallback_prefix}_head_{suffix}" if fallback_prefix else None,
             )
-            for suffix, default in _HEAD_DEFAULTS.items()
+            for suffix in _HEAD_DEFAULTS
         }
         out_dim = _config_value(
             self.config,
             f"{prefix}_out_dim",
-            self.config.get("dino_out_dim", 65536),
+            self.config.get(
+                "dino_out_dim",
+                _HEAD_OUT_DIM_DEFAULTS.get(fallback_prefix, _HEAD_OUT_DIM_DEFAULTS["dino"])
+                if fallback_prefix
+                else _HEAD_OUT_DIM_DEFAULTS[prefix],
+            ),
             fallback_key=f"{fallback_prefix}_out_dim" if fallback_prefix else None,
         )
         return DINOHead(
