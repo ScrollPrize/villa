@@ -250,6 +250,20 @@ class Eva(nn.Module):
 
     """
     
+    @staticmethod
+    def _assert_patch_aligned(
+            spatial_shape: Tuple[int, ...],
+            patch_size: Tuple[int, ...],
+            *,
+            context: str,
+    ) -> None:
+        remainders = [int(size) % int(patch) for size, patch in zip(spatial_shape, patch_size)]
+        if any(remainders):
+            raise AssertionError(
+                f"{context} must be divisible by patch_size for PatchEmbedDeeper, "
+                f"got spatial_shape={tuple(spatial_shape)} and patch_size={tuple(patch_size)}"
+            )
+
     def __init__(
             self,
             input_channels: int = 1,
@@ -304,6 +318,18 @@ class Eva(nn.Module):
         self.embedding_type = str(embedding_type).lower()
         self.global_crops_size = [global_crops_size] * 3 if isinstance(global_crops_size, int) else global_crops_size
         self.local_crops_size = [local_crops_size] * 3 if isinstance(local_crops_size, int) else local_crops_size
+
+        if self.embedding_type == "deeper":
+            self._assert_patch_aligned(
+                tuple(self.global_crops_size),
+                tuple(self.patch_size),
+                context="global_crops_size",
+            )
+            self._assert_patch_aligned(
+                tuple(self.local_crops_size),
+                tuple(self.patch_size),
+                context="local_crops_size",
+            )
 
         self.global_ref_feat_shape = tuple([i // ds for i, ds in zip(self.global_crops_size, self.patch_size)])
         self.local_ref_feat_shape = tuple([i // ds for i, ds in zip(self.local_crops_size, self.patch_size)])
@@ -552,6 +578,8 @@ class Eva(nn.Module):
     
     def prepare_tokens_with_masks(self, x, masks=None):
         spatial = tuple(x.shape[2:])
+        if self.embedding_type == "deeper":
+            self._assert_patch_aligned(spatial, tuple(self.patch_size), context="input shape")
         x = self.down_projection(x)
         if self.ndim == 2:
             x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
