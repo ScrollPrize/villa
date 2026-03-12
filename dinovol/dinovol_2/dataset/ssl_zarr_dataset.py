@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import zarr
+from fsspec.asyn import sync
 from torch.utils.data import Dataset
 
 from dinovol_2.augmentation.pipelines import create_training_transforms
@@ -37,12 +38,25 @@ class ZarrHandle:
         session = getattr(self.fs, "_session", None)
         if session is None:
             return
-        close_session = getattr(type(self.fs), "close_session", None)
-        if callable(close_session):
-            close_session(getattr(self.fs, "loop", None), session)
+        loop = getattr(self.fs, "loop", None)
+        if loop is not None and not loop.is_closed():
+            try:
+                sync(loop, session.close, timeout=1.0)
+            except Exception:
+                close_session = getattr(type(self.fs), "close_session", None)
+                if callable(close_session):
+                    close_session(loop, session)
+        else:
+            close_session = getattr(type(self.fs), "close_session", None)
+            if callable(close_session):
+                close_session(loop, session)
         connector = getattr(session, "_connector", None)
         if connector is not None and not connector.closed:
             connector._close()
+        try:
+            session._connector = None
+        except AttributeError:
+            pass
         try:
             self.fs._session = None
         except AttributeError:

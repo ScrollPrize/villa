@@ -411,6 +411,26 @@ class DinoIBOTPretrainer:
         if isinstance(dataloader.sampler, DistributedSampler):
             dataloader.sampler.set_epoch(epoch)
 
+    @staticmethod
+    def _close_dataloader(dataloader: DataLoader | None) -> None:
+        if dataloader is None:
+            return
+        iterator = getattr(dataloader, "_iterator", None)
+        shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown_workers):
+            shutdown_workers()
+        dataset = getattr(dataloader, "dataset", None)
+        close = getattr(dataset, "close", None)
+        if callable(close):
+            close()
+
+    def _close_auxiliary_datasets(self) -> None:
+        if self._monitor_dataset is None:
+            return
+        self._monitor_dataset.close()
+        self._monitor_dataset = None
+        self._monitor_collate_fn = None
+
     def _average_metrics(self, metrics: Mapping[str, float]) -> dict[str, float]:
         averaged = {key: float(value) for key, value in metrics.items()}
         if not self.is_distributed:
@@ -1308,6 +1328,9 @@ class DinoIBOTPretrainer:
         finally:
             if progress is not None:
                 progress.close()
+            self._close_dataloader(dataloader)
+            self._close_dataloader(val_dataloader)
+            self._close_auxiliary_datasets()
 
 
 def main() -> None:
