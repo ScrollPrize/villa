@@ -168,7 +168,8 @@ def create_training_transforms(
         #     )
         # )
 
-        # Rot90 for 3D (only if there are valid rotation axes), Mirror for 2D
+        # Rot90 for 3D (only if there are valid rotation axes). Mirror is enabled
+        # for both 2D and 3D so axis-wise flips remain part of the default spatial augmentation set.
         if dimension == 3 and rot90_allowed_axes:
             transforms.append(RandomTransform(
                 Rot90Transform(
@@ -178,8 +179,11 @@ def create_training_transforms(
                 ),
                 apply_probability=0.5
             ))
-        elif dimension == 2:
-            transforms.append(MirrorTransform(allowed_axes=mirror_axes))
+
+        transforms.append(RandomTransform(
+            MirrorTransform(allowed_axes=mirror_axes),
+            apply_probability=0.5
+        ))
 
         # # Single-axis low resolution simulation (3D only)
         # if dimension == 3:
