@@ -19,6 +19,7 @@ _BACKBONE_DEFAULTS = {
     "local_crops_size": None,
     "embed_dim": 864,
     "patch_size": (16, 16, 16),
+    "embedding_type": "default",
     "depth": 24,
     "num_heads": 16,
     "qkv_bias": True,

@@ -12,7 +12,7 @@ from torch.nn import LayerNorm
 from torch.utils.checkpoint import checkpoint
 from einops import rearrange
 
-from dinovol_2.model.patch_encode_decode import PatchEmbed
+from dinovol_2.model.patch_encode_decode import PatchEmbed, PatchEmbedDeeper
 
 class InitWeights_He(object):
     def __init__(self, neg_slope: float = 1e-2):
@@ -257,6 +257,7 @@ class Eva(nn.Module):
             local_crops_size: Tuple[int, ...] = None,
             embed_dim: int = 864,
             patch_size: Tuple[int, ...] = (8, 8, 8),
+            embedding_type: str = "default",
             depth: int = 24,
             num_heads: int = 12,
             qkv_bias: bool = True,
@@ -300,18 +301,29 @@ class Eva(nn.Module):
         self.input_channels = input_channels
         self.patch_size = [patch_size] * 3 if isinstance(patch_size, int) else patch_size
         self.ndim = len(self.patch_size)
+        self.embedding_type = str(embedding_type).lower()
         self.global_crops_size = [global_crops_size] * 3 if isinstance(global_crops_size, int) else global_crops_size
         self.local_crops_size = [local_crops_size] * 3 if isinstance(local_crops_size, int) else local_crops_size
 
         self.global_ref_feat_shape = tuple([i // ds for i, ds in zip(self.global_crops_size, self.patch_size)])
         self.local_ref_feat_shape = tuple([i // ds for i, ds in zip(self.local_crops_size, self.patch_size)])
-        
-        # Use simple non-overlapping patchification so token semantics stay closer to DINO-style SSL.
-        self.down_projection = PatchEmbed(
-            patch_size=tuple(self.patch_size),
-            input_channels=input_channels,
-            embed_dim=embed_dim,
-        )
+
+        if self.embedding_type == "default":
+            self.down_projection = PatchEmbed(
+                patch_size=tuple(self.patch_size),
+                input_channels=input_channels,
+                embed_dim=embed_dim,
+            )
+        elif self.embedding_type == "deeper":
+            self.down_projection = PatchEmbedDeeper(
+                patch_size=tuple(self.patch_size),
+                input_channels=input_channels,
+                embed_dim=embed_dim,
+            )
+        else:
+            raise ValueError(
+                f"unsupported embedding_type={embedding_type!r}; expected 'default' or 'deeper'"
+            )
         
         if rope_kwargs is None:
             rope_kwargs = {}
