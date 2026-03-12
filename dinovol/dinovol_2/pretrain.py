@@ -328,6 +328,13 @@ class DinoIBOTPretrainer:
                 raise ValueError("prefetch factor requires dataloader workers greater than zero")
             kwargs["prefetch_factor"] = prefetch_factor
 
+        persistent_workers = _config_get(self.config, "persistent-workers", "persistent_workers")
+        if persistent_workers is not None:
+            persistent_workers = bool(persistent_workers)
+            if persistent_workers and num_workers <= 0:
+                raise ValueError("persistent workers requires dataloader workers greater than zero")
+            kwargs["persistent_workers"] = persistent_workers
+
         return kwargs
 
     def _dataset_config(self, key: str) -> Mapping[str, Any] | None:
