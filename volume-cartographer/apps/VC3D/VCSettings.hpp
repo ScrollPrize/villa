@@ -179,8 +179,8 @@ namespace perf {
     constexpr int PRESET_COUNT = 6;
     // H.264/H.265/AV1 QP values (0=lossless uses 0)
     constexpr int PRESET_VIDEO_QP[PRESET_COUNT] = {0, 18, 22, 28, 35, 42};
-    // C3D quality values (101=lossless)
-    constexpr int PRESET_C3D_QUALITY[PRESET_COUNT] = {101, 80, 60, 40, 25, 10};
+    // C3D size divisor shift: 0=lossless, 1=lossless/2, 2=/4, 3=/8, 4=/16, 5=/32
+    constexpr int PRESET_C3D_QUALITY[PRESET_COUNT] = {0, 1, 2, 3, 4, 5};
 
     // Number of background IO (download) threads
     constexpr auto IO_THREADS = "perf/io_threads";

@@ -1511,7 +1511,7 @@ void CTiledVolumeViewer::updateStatusLabel()
         if (s.iceFetches > 0)
             status += QString(" dl%1").arg(s.iceFetches);
     } else if (_pinTotal > 0 && _pinReceived < _pinTotal) {
-        status += QString(" | downloading %1/%2").arg(_pinReceived).arg(_pinTotal);
+        status += QString(" | downloading %1/%2").arg(_pinReceived).arg(_pinTotal.load());
     }
 
     status += " [tiled]";

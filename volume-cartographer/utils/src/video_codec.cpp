@@ -547,8 +547,8 @@ static auto c3d_encode_chunk(std::span<const std::byte> raw, const VideoCodecPar
     -> std::vector<std::byte>
 {
     const int Z = params.depth, Y = params.height, X = params.width;
-    // Quality: map QP 0-51 to C3D quality 100-1
-    int quality = std::clamp(100 - params.qp * 2, 1, 100);
+    // qp encodes the size divisor shift: 0=lossless, 1=lossless/2, 2=/4, etc.
+    int sizeShift = std::clamp(params.qp, 0, 6);
 
     // Calculate number of 32³ blocks per axis (round up)
     const int bz = (Z + 31) / 32, by = (Y + 31) / 32, bx = (X + 31) / 32;
@@ -577,9 +577,22 @@ static auto c3d_encode_chunk(std::span<const std::byte> raw, const VideoCodecPar
                     }
                 }
 
-                auto result = c3d_compress(block_in, quality);
-                blocks[bi].data.assign(result.data, result.data + result.size);
-                free(result.data);
+                if (sizeShift == 0) {
+                    // Lossless
+                    auto result = c3d_compress(block_in, 101);
+                    blocks[bi].data.assign(result.data, result.data + result.size);
+                    free(result.data);
+                } else {
+                    // First compress lossless to get reference size
+                    auto lossless = c3d_compress(block_in, 101);
+                    size_t target = lossless.size >> sizeShift;
+                    if (target < 64) target = 64;  // floor to avoid degenerate sizes
+                    free(lossless.data);
+
+                    auto result = c3d_compress_target_size(block_in, target);
+                    blocks[bi].data.assign(result.data, result.data + result.size);
+                    free(result.data);
+                }
             }
         }
     }
@@ -595,7 +608,7 @@ static auto c3d_encode_chunk(std::span<const std::byte> raw, const VideoCodecPar
 
     // Header
     std::memcpy(out, C3T_MAGIC, 4);
-    out[4] = static_cast<std::byte>(quality);
+    out[4] = static_cast<std::byte>(sizeShift);
     out[5] = static_cast<std::byte>(0);
     write_le16(out + 6, static_cast<uint16_t>(Z));
     write_le16(out + 8, static_cast<uint16_t>(Y));

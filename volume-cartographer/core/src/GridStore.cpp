@@ -2,6 +2,7 @@
 #include "vc/core/util/LineSegList.hpp"
 
 #include <set>
+#include <sstream>
 #include <unordered_set>
 #include <fstream>
 #include <stdexcept>

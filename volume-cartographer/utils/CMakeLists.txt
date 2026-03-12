@@ -120,15 +120,18 @@ target_include_directories(utils_video_codec PUBLIC
 )
 target_compile_features(utils_video_codec PUBLIC cxx_std_23)
 
+# C3D (compress3d) is always available — no external deps.
+# UTILS_HAS_VIDEO_CODEC is always defined so the recompression/decompression
+# paths are compiled in. Individual codecs (H264/H265/AV1) are gated by their
+# own UTILS_HAS_H264 / UTILS_HAS_H265 / UTILS_HAS_AV1 defines.
+target_compile_definitions(utils_video_codec PUBLIC UTILS_HAS_VIDEO_CODEC=1)
+
 if(_VC_VIDEO_FOUND)
     target_link_libraries(utils_video_codec PUBLIC ${_VC_VIDEO_LIBS})
     target_include_directories(utils_video_codec PRIVATE ${_VC_VIDEO_INCS})
-    target_compile_definitions(utils_video_codec PUBLIC
-        UTILS_HAS_VIDEO_CODEC=1
-        ${_VC_VIDEO_DEFS}
-    )
+    target_compile_definitions(utils_video_codec PUBLIC ${_VC_VIDEO_DEFS})
 else()
-    message(STATUS "Video codec support: disabled (no codecs found or VC_WITH_VIDEO_CODEC=OFF)")
+    message(STATUS "External video codecs: none found (C3D always available)")
 endif()
 
 # Tests

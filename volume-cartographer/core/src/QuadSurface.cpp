@@ -1024,6 +1024,7 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
     // Atomically move the saved data to the final location
     bool replacedExisting = false;
     if (force_overwrite && std::filesystem::exists(final_path)) {
+#ifdef __linux__
         if (renameat2(AT_FDCWD, temp_path.c_str(), AT_FDCWD, final_path.c_str(), RENAME_EXCHANGE) != 0) {
             const int err = errno;
             if (err == ENOSYS || err == EINVAL) {
@@ -1048,6 +1049,12 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
             }
             replacedExisting = true;
         }
+#else
+        // renameat2/RENAME_EXCHANGE is Linux-only; use remove + rename fallback
+        std::filesystem::remove_all(final_path);
+        std::filesystem::rename(temp_path, final_path);
+        replacedExisting = true;
+#endif
     }
 
     if (!replacedExisting) {
