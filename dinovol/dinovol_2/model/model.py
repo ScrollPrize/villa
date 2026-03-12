@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.init import trunc_normal_
+from torch.nn.utils.parametrizations import weight_norm
 
 from dinovol_2.model.dinov2_eva import Eva, EvaWithChunking
 
@@ -125,6 +126,20 @@ def _fuse_params_groups(
     return list(fused.values())
 
 
+def _weight_norm_scale_parameter(module: nn.Module) -> nn.Parameter:
+    return module.parametrizations.weight.original0
+
+
+def _upgrade_weight_norm_state_dict_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]:
+    upgraded = dict(state_dict)
+    for key in list(upgraded):
+        if key.endswith(".last_layer.weight_g"):
+            upgraded[key.replace(".last_layer.weight_g", ".last_layer.parametrizations.weight.original0")] = upgraded.pop(key)
+        elif key.endswith(".last_layer.weight_v"):
+            upgraded[key.replace(".last_layer.weight_v", ".last_layer.parametrizations.weight.original1")] = upgraded.pop(key)
+    return upgraded
+
+
 class DINOHead(nn.Module):
     def __init__(
         self,
@@ -158,10 +173,11 @@ class DINOHead(nn.Module):
             self.mlp = nn.Sequential(*layers)
 
         self.apply(self._init_weights)
-        self.last_layer = nn.utils.weight_norm(nn.Linear(bottleneck_dim, out_dim, bias=False))
-        self.last_layer.weight_g.data.fill_(1.0)
+        self.last_layer = weight_norm(nn.Linear(bottleneck_dim, out_dim, bias=False))
+        last_layer_scale = _weight_norm_scale_parameter(self.last_layer)
+        last_layer_scale.data.fill_(1.0)
         if norm_last_layer:
-            self.last_layer.weight_g.requires_grad = False
+            last_layer_scale.requires_grad = False
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
@@ -337,7 +353,7 @@ class DinoVitStudentTeacher(nn.Module):
             state_dict = checkpoint["model"]
         else:
             state_dict = checkpoint
-        missing, unexpected = self.student.load_state_dict(state_dict, strict=False)
+        missing, unexpected = self.student.load_state_dict(_upgrade_weight_norm_state_dict_keys(state_dict), strict=False)
         if unexpected:
             raise RuntimeError(f"Unexpected keys in DINO checkpoint: {unexpected}")
         if missing:

@@ -22,7 +22,7 @@ from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset
 from dinovol_2.distributed_utils import build_distributed_sampler, resolve_distributed_config
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
 from dinovol_2.loss import DINOLoss, KoLeoLoss, iBOTPatchLoss
-from dinovol_2.model.model import DinoVitStudentTeacher
+from dinovol_2.model.model import DinoVitStudentTeacher, _upgrade_weight_norm_state_dict_keys
 
 
 def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
@@ -1034,8 +1034,8 @@ class DinoIBOTPretrainer:
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> int:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        self.model_module.student.load_state_dict(checkpoint["student"])
-        self.model_module.teacher.load_state_dict(checkpoint["teacher"])
+        self.model_module.student.load_state_dict(_upgrade_weight_norm_state_dict_keys(checkpoint["student"]))
+        self.model_module.teacher.load_state_dict(_upgrade_weight_norm_state_dict_keys(checkpoint["teacher"]))
         if "optimizer" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             self._optimizer_to_device()
