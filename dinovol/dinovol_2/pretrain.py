@@ -164,7 +164,7 @@ class DinoIBOTPretrainer:
             self.model = DDP(self.model, **ddp_kwargs)
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self.device.type == "cuda")
         
-        dino_out_dim = int(self.model_config.get("dino_out_dim", 65536))
+        dino_out_dim = int(self.model_config.get("dino_out_dim", 131072))
         ibot_out_dim = int(self.model_config.get("ibot_out_dim", dino_out_dim))
         self.dino_loss = DINOLoss(dino_out_dim).to(self.device)
         masked_loss_chunk_size = self.config.get("ibot_masked_loss_chunk_size")
@@ -182,7 +182,7 @@ class DinoIBOTPretrainer:
         self.do_dino = self.dino_loss_weight > 0.0
         self.do_ibot = self.ibot_loss_weight > 0.0
         self.do_koleo = self.koleo_loss_weight > 0.0 and self.do_dino
-        self.centering = str(self.config.get("centering", "centering"))
+        self.centering = str(self.config.get("centering", "sinkhorn_knopp"))
         
         self.teacher_temp = float(self.config.get("teacher_temp", 0.07))
         self.warmup_teacher_temp = float(self.config.get("warmup_teacher_temp", 0.04))
@@ -346,7 +346,7 @@ class DinoIBOTPretrainer:
         collate_fn = build_dino_ibot_collate_fn(
             {
                 "global_crop_size": dataset.global_crop_size,
-                "patch_size": self.model_config.get("patch_size", (8, 8, 8)),
+                "patch_size": self.model_config.get("patch_size", (16, 16, 16)),
                 "mask_ratio_min_max": _as_float_pair(self.config.get("mask_ratio_min_max"), (0.1, 0.5)),
                 "mask_sample_probability": float(self.config.get("mask_sample_probability", 0.5)),
                 "dtype": torch.float32,
@@ -377,7 +377,7 @@ class DinoIBOTPretrainer:
         collate_fn = build_dino_ibot_collate_fn(
             {
                 "global_crop_size": dataset.global_crop_size,
-                "patch_size": self.model_config.get("patch_size", (8, 8, 8)),
+                "patch_size": self.model_config.get("patch_size", (16, 16, 16)),
                 "mask_ratio_min_max": _as_float_pair(self.config.get("mask_ratio_min_max"), (0.1, 0.5)),
                 "mask_sample_probability": float(self.config.get("mask_sample_probability", 0.5)),
                 "dtype": torch.float32,
@@ -473,7 +473,7 @@ class DinoIBOTPretrainer:
             collate_fn = build_dino_ibot_collate_fn(
                 {
                     "global_crop_size": dataset.global_crop_size,
-                    "patch_size": self.model_config.get("patch_size", (8, 8, 8)),
+                    "patch_size": self.model_config.get("patch_size", (16, 16, 16)),
                     "mask_ratio_min_max": _as_float_pair(self.config.get("mask_ratio_min_max"), (0.1, 0.5)),
                     "mask_sample_probability": float(self.config.get("mask_sample_probability", 0.5)),
                     "dtype": torch.float32,
@@ -1084,7 +1084,7 @@ class DinoIBOTPretrainer:
         raise ValueError(f"unexpected tensor shape for visualization: {tuple(array.shape)}")
     
     def _patch_pca_slice(self, patch_tokens: torch.Tensor, sample_index: int, target_hw: tuple[int, int]) -> np.ndarray:
-        patch_size = self.model_config.get("patch_size", (8, 8, 8))
+        patch_size = self.model_config.get("patch_size", (16, 16, 16))
         global_crop = self.config["dataset"].get("global_crop_size", self.config["dataset"].get("crop_size"))
         if isinstance(global_crop, int):
             global_crop = (global_crop, global_crop, global_crop)
