@@ -485,14 +485,8 @@ int main(int argc, char** argv) {
             output->write_string(std::to_string(l) + "/zarr.json", meta_json);
         }
 
-        // List all chunk keys for this level
+        // Read input .zarray to determine compressor and chunk layout
         std::string level_prefix = std::to_string(l) + "/";
-        auto chunk_keys = input->list_chunks(level_prefix);
-        printf("  Found %zu chunks\n", chunk_keys.size());
-
-        if (chunk_keys.empty()) continue;
-
-        // Read input .zarray to determine compressor
         json zarray;
         try {
             zarray = json::parse(input->read_string(level_prefix + ".zarray"));
@@ -516,10 +510,28 @@ int main(int argc, char** argv) {
             dim_sep = zarray["dimension_separator"].get<std::string>();
         }
 
+        // Compute chunk keys from shape and chunk size (avoids S3 listing)
+        std::vector<std::string> chunk_keys;
+        if (shape.size() >= 3 && src_chunks.size() >= 3) {
+            size_t nz = (shape[0] + src_chunks[0] - 1) / src_chunks[0];
+            size_t ny = (shape[1] + src_chunks[1] - 1) / src_chunks[1];
+            size_t nx = (shape[2] + src_chunks[2] - 1) / src_chunks[2];
+            for (size_t iz = 0; iz < nz; iz++) {
+                for (size_t iy = 0; iy < ny; iy++) {
+                    for (size_t ix = 0; ix < nx; ix++) {
+                        chunk_keys.push_back(
+                            level_prefix + std::to_string(iz) + dim_sep +
+                            std::to_string(iy) + dim_sep + std::to_string(ix));
+                    }
+                }
+            }
+        }
+
         printf("  Source: chunks [%zu,%zu,%zu], compressor: %s, sep: '%s'\n",
                src_chunks[0], src_chunks[1], src_chunks[2],
                compressor_id.empty() ? "none" : compressor_id.c_str(),
                dim_sep.c_str());
+        printf("  Computed %zu chunk keys\n", chunk_keys.size());
 
         std::atomic<size_t> total_raw{0}, total_compressed{0};
         std::atomic<int> processed{0}, errs{0}, skipped{0};
