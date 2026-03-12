@@ -372,6 +372,101 @@ static std::string make_zarr_v3_group_with_multiscales(
 }
 
 // ============================================================================
+// Mask: use lowest-resolution level to skip empty chunks
+// ============================================================================
+
+// Build a 3D boolean mask indicating which chunks at `level` have nonzero data,
+// using the lowest-resolution pyramid level as a guide.
+// Returns an empty vector if mask cannot be built (caller should process all).
+static std::vector<bool> build_occupancy_mask(
+    IOBackend& io,
+    int level,                           // target level (e.g. 0)
+    const std::vector<size_t>& shape,    // target level shape
+    const std::vector<size_t>& chunks,   // target level chunk size (128,128,128)
+    int mask_level,                      // lowest-res level to use as mask
+    const std::vector<size_t>& mask_shape,
+    const std::vector<size_t>& mask_chunks)
+{
+    if (shape.size() < 3 || mask_shape.size() < 3) return {};
+
+    int scale = 1 << (mask_level - level);  // e.g. 2^5 = 32 for level 5 vs level 0
+
+    size_t nz = (shape[0] + chunks[0] - 1) / chunks[0];
+    size_t ny = (shape[1] + chunks[1] - 1) / chunks[1];
+    size_t nx = (shape[2] + chunks[2] - 1) / chunks[2];
+    size_t total = nz * ny * nx;
+
+    std::vector<bool> mask(total, false);
+
+    // How many target-level voxels does one mask-level voxel cover?
+    // Each mask voxel covers `scale` target voxels in each dim.
+    // Each target chunk is `chunks[d]` voxels.
+    // So each target chunk is `chunks[d] / scale` mask voxels wide.
+    // (e.g. 128 / 32 = 4 mask voxels per target chunk)
+
+    size_t mask_nz = (mask_shape[0] + mask_chunks[0] - 1) / mask_chunks[0];
+    size_t mask_ny = (mask_shape[1] + mask_chunks[1] - 1) / mask_chunks[1];
+    size_t mask_nx = (mask_shape[2] + mask_chunks[2] - 1) / mask_chunks[2];
+
+    printf("  Building occupancy mask from level %d (%zu chunks to scan)...\n",
+           mask_level, mask_nz * mask_ny * mask_nx);
+
+    // Read each mask-level chunk and check which target chunks have data
+    std::string mask_prefix = std::to_string(mask_level) + "/";
+    std::string dim_sep = "/";
+
+    for (size_t mz = 0; mz < mask_nz; mz++) {
+        for (size_t my = 0; my < mask_ny; my++) {
+            for (size_t mx = 0; mx < mask_nx; mx++) {
+                std::string key = mask_prefix + std::to_string(mz) + dim_sep +
+                                  std::to_string(my) + dim_sep + std::to_string(mx);
+
+                std::vector<std::byte> raw;
+                try {
+                    auto data = io.read(key);
+                    raw = decompress_blosc(data, mask_chunks[0] * mask_chunks[1] * mask_chunks[2]);
+                } catch (...) {
+                    continue;  // chunk doesn't exist = all zero
+                }
+
+                // For each voxel in this mask chunk, determine which target chunk it maps to
+                size_t cz = mask_chunks[0], cy = mask_chunks[1], cx = mask_chunks[2];
+                // Clamp to actual mask shape
+                size_t z0 = mz * cz, y0 = my * cy, x0 = mx * cx;
+                size_t z1 = std::min(z0 + cz, mask_shape[0]);
+                size_t y1 = std::min(y0 + cy, mask_shape[1]);
+                size_t x1 = std::min(x0 + cx, mask_shape[2]);
+
+                for (size_t z = z0; z < z1; z++) {
+                    for (size_t y = y0; y < y1; y++) {
+                        for (size_t x = x0; x < x1; x++) {
+                            size_t local_z = z - z0, local_y = y - y0, local_x = x - x0;
+                            size_t idx = local_z * cy * cx + local_y * cx + local_x;
+                            if (idx < raw.size() && raw[idx] != std::byte{0}) {
+                                // This mask voxel is nonzero. Mark the corresponding target chunk.
+                                size_t tz = (z * scale) / chunks[0];
+                                size_t ty = (y * scale) / chunks[1];
+                                size_t tx = (x * scale) / chunks[2];
+                                if (tz < nz && ty < ny && tx < nx) {
+                                    mask[tz * ny * nx + ty * nx + tx] = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    size_t occupied = 0;
+    for (auto b : mask) if (b) occupied++;
+    printf("  Mask: %zu / %zu chunks occupied (%.1f%% sparse)\n",
+           occupied, total, 100.0 * (1.0 - (double)occupied / total));
+
+    return mask;
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -516,14 +611,48 @@ int main(int argc, char** argv) {
             size_t nz = (shape[0] + src_chunks[0] - 1) / src_chunks[0];
             size_t ny = (shape[1] + src_chunks[1] - 1) / src_chunks[1];
             size_t nx = (shape[2] + src_chunks[2] - 1) / src_chunks[2];
+
+            // Build occupancy mask from lowest-res level to skip empty chunks
+            std::vector<bool> occ_mask;
+            int mask_level = -1;
+            for (int mi = (int)levels.size() - 1; mi >= 0; mi--) {
+                if (levels[mi] > l) {
+                    mask_level = levels[mi];
+                    break;
+                }
+            }
+            if (mask_level >= 0) {
+                // Find the mask level's shape
+                for (size_t mi = 0; mi < levels.size(); mi++) {
+                    if (levels[mi] == mask_level) {
+                        occ_mask = build_occupancy_mask(
+                            *input, l, shape, src_chunks,
+                            mask_level, shapes[mi], src_chunks);
+                        break;
+                    }
+                }
+            }
+
+            size_t skipped_by_mask = 0;
             for (size_t iz = 0; iz < nz; iz++) {
                 for (size_t iy = 0; iy < ny; iy++) {
                     for (size_t ix = 0; ix < nx; ix++) {
+                        // Check mask — if we have one and this position is empty, skip
+                        if (!occ_mask.empty()) {
+                            size_t flat = iz * ny * nx + iy * nx + ix;
+                            if (!occ_mask[flat]) {
+                                skipped_by_mask++;
+                                continue;
+                            }
+                        }
                         chunk_keys.push_back(
                             level_prefix + std::to_string(iz) + dim_sep +
                             std::to_string(iy) + dim_sep + std::to_string(ix));
                     }
                 }
+            }
+            if (!occ_mask.empty()) {
+                printf("  Mask skipped %zu empty chunk positions\n", skipped_by_mask);
             }
         }
 

@@ -177,6 +177,8 @@ private:
     void buildApprovalMaskOverlay(const State& state,
                                   VolumeViewerBase* viewer,
                                   ViewerOverlayControllerBase::OverlayBuilder& builder) const;
+    void buildSurfaceOverlapOverlay(VolumeViewerBase* viewer,
+                                    ViewerOverlayControllerBase::OverlayBuilder& builder) const;
 
     ViewerOverlayControllerBase::PathPrimitive buildMaskPrimitive(const State& state) const;
     bool shouldShowMask(const State& state) const;
@@ -232,6 +234,16 @@ private:
 
     // Approval mask overlay opacity (0-100, where 50 is default)
     int _approvalMaskOpacity{50};
+
+    // Surface overlap overlay cache
+    struct OverlapCache {
+        QImage image;                                       // ARGB32 overlap image (grid-sized)
+        std::map<std::string, cv::Vec3b> overlays;          // Overlay config when image was built
+        float threshold{0.0f};                              // Threshold when image was built
+        QuadSurface* surface{nullptr};                      // Current surface when image was built
+        uint64_t surfaceVersion{0};                         // Surface content version
+    };
+    mutable std::map<VolumeViewerBase*, OverlapCache> _overlapCaches;
 
     // Deferred refresh timer - fires after throttle window to apply pending state
     QTimer* _deferredRefreshTimer{nullptr};

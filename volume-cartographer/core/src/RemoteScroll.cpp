@@ -1,5 +1,6 @@
 #include "vc/core/util/RemoteScroll.hpp"
 
+#include <chrono>
 #include <fstream>
 
 #include "vc/core/util/LoadJson.hpp"
@@ -93,6 +94,14 @@ std::filesystem::path downloadRemoteSegment(
         return localDir;
     }
 
+    // Check for a previous download failure marker — skip retrying
+    auto failMarker = localDir / ".download_failed";
+    if (fs::exists(failMarker)) {
+        Logger()->debug("[RemoteScroll] Segment {} previously failed, skipping",
+                       segmentId);
+        return localDir;
+    }
+
     // Build remote base URL depending on source format
     std::string remoteBase;
     if (source == RemoteSegmentSource::Direct) {
@@ -124,8 +133,17 @@ std::filesystem::path downloadRemoteSegment(
         }
     }
 
-    // Patch meta.json if required fields are missing (safety net for lite format)
+    // If meta.json doesn't exist after download attempts, mark as failed
     auto metaPath = localDir / "meta.json";
+    if (!fs::exists(metaPath)) {
+        Logger()->warn("[RemoteScroll] Segment {} download failed, marking to skip future attempts",
+                      segmentId);
+        std::ofstream marker(failMarker);
+        marker << "Download failed at " << std::chrono::system_clock::now().time_since_epoch().count() << "\n";
+        return localDir;
+    }
+
+    // Patch meta.json if required fields are missing (safety net for lite format)
     if (fs::exists(metaPath)) {
         try {
             std::ifstream ifs(metaPath);

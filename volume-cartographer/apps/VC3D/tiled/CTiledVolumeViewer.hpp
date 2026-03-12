@@ -66,6 +66,7 @@ public:
     void invalidateIntersect(const std::string& name = "");
 
     // --- Accessors ---
+    TileScene* tileScene() const { return _tileScene; }
     std::string surfName() const { return _surfName; }
     std::shared_ptr<Volume> currentVolume() const { return _volume; }
     vc::cache::TieredChunkCache* chunkCachePtr() const override {
