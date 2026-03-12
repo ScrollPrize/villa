@@ -930,7 +930,7 @@ void CTiledVolumeViewer::submitRender()
             QPen(COLOR_FOCUS, 3, Qt::DashDotLine, Qt::RoundCap, Qt::RoundJoin));
         _ov.centerMarker->setZValue(11);
     }
-    QPointF centerScene = _tileScene->surfaceToScene(_camera.surfacePtr[0], _camera.surfacePtr[1]);
+    QPointF centerScene = _tileScene->surfaceToScene(_focusSurfacePos[0], _focusSurfacePos[1]);
     _ov.centerMarker->setPos(centerScene);
 
     // Submit to async render controller
@@ -1380,6 +1380,8 @@ void CTiledVolumeViewer::onPOIChanged(std::string name, POI* poi)
             // not preserve the old pan offset from the previous plane origin.
             _camera.surfacePtr[0] = 0.0f;
             _camera.surfacePtr[1] = 0.0f;
+            _focusSurfacePos[0] = 0.0f;
+            _focusSurfacePos[1] = 0.0f;
             centerViewport();
             scheduleOverlayUpdate();
             if (originChanged) {
@@ -1399,6 +1401,8 @@ void CTiledVolumeViewer::onPOIChanged(std::string name, POI* poi)
                 cv::Vec3f loc = quad->loc(ptr);
                 _camera.surfacePtr[0] = loc[0];
                 _camera.surfacePtr[1] = loc[1];
+                _focusSurfacePos[0] = loc[0];
+                _focusSurfacePos[1] = loc[1];
                 _camera.invalidate();
                 submitRender();
             }
@@ -1585,6 +1589,8 @@ void CTiledVolumeViewer::fitSurfaceInView()
     _camera.surfacePtr[0] = gridCenterX - pts.cols * 0.5f;
     _camera.surfacePtr[1] = gridCenterY - pts.rows * 0.5f;
     _camera.surfacePtr[2] = 0;
+    _focusSurfacePos[0] = _camera.surfacePtr[0];
+    _focusSurfacePos[1] = _camera.surfacePtr[1];
 
     if (_volume) _camera.recalcPyramidLevel(_volume->numScales());
     _camera.invalidate();

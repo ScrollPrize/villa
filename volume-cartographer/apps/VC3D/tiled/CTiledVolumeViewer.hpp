@@ -420,6 +420,10 @@ private:
     vc::cache::TieredChunkCache::ChunkReadyCallbackId _chunkCbId = 0;
     bool _hadValidDataBounds = false;
 
+    // --- Focus marker position (in surface coords) ---
+    // Tracks where the focus point is on the surface, independent of camera pan.
+    float _focusSurfacePos[2] = {0.0f, 0.0f};
+
     // --- Pan tracking ---
     // For tiled viewer, panning is tracked via delta signals from the view
     QPoint _lastPanPos;

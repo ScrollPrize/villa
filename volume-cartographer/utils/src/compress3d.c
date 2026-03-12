@@ -11,7 +11,7 @@
 #include <immintrin.h>
 
 static inline float hsum_ps_sse(__m128 v) {
-    __m128 shuf = _mm_movehdup_ps(v);
+    __m128 shuf = _mm_shuffle_ps(v, v, _MM_SHUFFLE(3, 3, 1, 1));
     __m128 sums = _mm_add_ps(v, shuf);
     shuf = _mm_movehl_ps(shuf, sums);
     sums = _mm_add_ps(sums, shuf);
