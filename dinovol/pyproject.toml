@@ -22,4 +22,5 @@ dependencies = [
     "torch>=2.10.0",
     "tqdm>=4.67.3",
     "zarr>=3.1.5",
+    "wandb>=0.25.1",
 ]
