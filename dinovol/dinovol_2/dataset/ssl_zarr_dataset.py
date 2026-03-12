@@ -1,6 +1,9 @@
+import atexit
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 import fsspec
@@ -21,6 +24,29 @@ class Volume:
     scale: int
     path: str
     weight: float = 0.0
+
+
+@dataclass
+class ZarrHandle:
+    array: Any
+    fs: Any | None = None
+
+    def close(self) -> None:
+        if self.fs is None:
+            return
+        session = getattr(self.fs, "_session", None)
+        if session is None:
+            return
+        close_session = getattr(type(self.fs), "close_session", None)
+        if callable(close_session):
+            close_session(getattr(self.fs, "loop", None), session)
+        connector = getattr(session, "_connector", None)
+        if connector is not None and not connector.closed:
+            connector._close()
+        try:
+            self.fs._session = None
+        except AttributeError:
+            pass
 
 
 def _as_3tuple(value):
@@ -49,7 +75,7 @@ def load_volume_auth(auth_json_path):
     return str(auth["username"]), str(auth["password"])
 
 
-def open_zarr(path, resolution, auth=None, s3_storage_options=None):
+def open_zarr_handle(path, resolution, auth=None, s3_storage_options=None):
     path_str = str(path)
     user, password = load_volume_auth(auth)
     if path_str.startswith("s3://"):
@@ -57,11 +83,13 @@ def open_zarr(path, resolution, auth=None, s3_storage_options=None):
         if s3_storage_options is not None:
             storage_options.update(dict(s3_storage_options))
         try:
-            return zarr.open(
-                path_str,
-                path=str(resolution),
-                mode="r",
-                storage_options=storage_options,
+            return ZarrHandle(
+                array=zarr.open(
+                    path_str,
+                    path=str(resolution),
+                    mode="r",
+                    storage_options=storage_options,
+                )
             )
         except ImportError as exc:
             raise ModuleNotFoundError(
@@ -96,8 +124,12 @@ def open_zarr(path, resolution, auth=None, s3_storage_options=None):
                 create=False,
                 exceptions=(KeyError, FileNotFoundError, PermissionError, OSError, aiohttp.ClientResponseError),
             )
-        return zarr.open(store, path=str(resolution), mode="r")
-    return zarr.open(path_str, path=str(resolution), mode="r")
+        return ZarrHandle(array=zarr.open(store, path=str(resolution), mode="r"), fs=fs)
+    return ZarrHandle(array=zarr.open(path_str, path=str(resolution), mode="r"))
+
+
+def open_zarr(path, resolution, auth=None, s3_storage_options=None):
+    return open_zarr_handle(path, resolution, auth=auth, s3_storage_options=s3_storage_options).array
 
 
 class SSLZarrDataset(Dataset):
@@ -119,6 +151,9 @@ class SSLZarrDataset(Dataset):
         self.s3_storage_options = self.config.get("s3_storage_options")
         self.vol_trim_pct = self.config.get("vol_trim_pct", 0.60)
         self.normalizer = get_normalization(self.config.get("normalization_scheme", "robust"))
+        self._volume_handles: dict[tuple[str, int], ZarrHandle] = {}
+        self._handle_pid: int | None = None
+        self._atexit_pid: int | None = None
         
         if not self.single_crop_only:
             if self.num_global_crops != 2:
@@ -141,30 +176,34 @@ class SSLZarrDataset(Dataset):
         for dataset in self.config["datasets"]:
             volume_path = dataset["volume_path"]
             volume_scale = dataset["volume_scale"]
-            d_zarr = open_zarr(volume_path, volume_scale, self.volume_auth, self.s3_storage_options)
-            z, y, x = d_zarr.shape
-            k_z = max(1, round(z * self.vol_trim_pct))
-            k_y = max(1, round(y * self.vol_trim_pct))
-            k_x = max(1, round(x * self.vol_trim_pct))
-            z0 = (z - k_z) // 2
-            y0 = (y - k_y) // 2
-            x0 = (x - k_x) // 2
-            z1 = (z0 + k_z)
-            y1 = (y0 + k_y)
-            x1 = (x0 + k_x)
-            usable_bbox = (z0, y0, x0, z1, y1, x1)
-            crop_z, crop_y, crop_x = self.source_crop_size
-            valid_z = max(0, (z1 - z0) - crop_z + 1)
-            valid_y = max(0, (y1 - y0) - crop_y + 1)
-            valid_x = max(0, (x1 - x0) - crop_x + 1)
-            valid_crop_starts = valid_z * valid_y * valid_x
-            
-            self.volumes.append(Volume(
-                path=str(volume_path),
-                scale=volume_scale,
-                usable_bbox=usable_bbox,
-                valid_crop_starts=valid_crop_starts,
-            ))
+            handle = open_zarr_handle(volume_path, volume_scale, self.volume_auth, self.s3_storage_options)
+            try:
+                d_zarr = handle.array
+                z, y, x = d_zarr.shape
+                k_z = max(1, round(z * self.vol_trim_pct))
+                k_y = max(1, round(y * self.vol_trim_pct))
+                k_x = max(1, round(x * self.vol_trim_pct))
+                z0 = (z - k_z) // 2
+                y0 = (y - k_y) // 2
+                x0 = (x - k_x) // 2
+                z1 = (z0 + k_z)
+                y1 = (y0 + k_y)
+                x1 = (x0 + k_x)
+                usable_bbox = (z0, y0, x0, z1, y1, x1)
+                crop_z, crop_y, crop_x = self.source_crop_size
+                valid_z = max(0, (z1 - z0) - crop_z + 1)
+                valid_y = max(0, (y1 - y0) - crop_y + 1)
+                valid_x = max(0, (x1 - x0) - crop_x + 1)
+                valid_crop_starts = valid_z * valid_y * valid_x
+                
+                self.volumes.append(Volume(
+                    path=str(volume_path),
+                    scale=volume_scale,
+                    usable_bbox=usable_bbox,
+                    valid_crop_starts=valid_crop_starts,
+                ))
+            finally:
+                handle.close()
         
         self.total_valid_crop_starts = sum(vol.valid_crop_starts for vol in self.volumes)
         if self.total_valid_crop_starts <= 0:
@@ -172,6 +211,49 @@ class SSLZarrDataset(Dataset):
         
         for volume in self.volumes:
             volume.weight = volume.valid_crop_starts / self.total_valid_crop_starts
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_volume_handles"] = {}
+        state["_handle_pid"] = None
+        state["_atexit_pid"] = None
+        return state
+
+    def _register_close_hook(self) -> None:
+        pid = os.getpid()
+        if self._atexit_pid == pid:
+            return
+        atexit.register(self.close)
+        self._atexit_pid = pid
+
+    def _ensure_process_local_handles(self) -> None:
+        pid = os.getpid()
+        if self._handle_pid == pid:
+            return
+        self.close()
+        self._volume_handles = {}
+        self._handle_pid = pid
+        self._register_close_hook()
+
+    def _get_volume_array(self, volume: Volume):
+        self._ensure_process_local_handles()
+        key = (volume.path, volume.scale)
+        handle = self._volume_handles.get(key)
+        if handle is None:
+            handle = open_zarr_handle(volume.path, volume.scale, self.volume_auth, self.s3_storage_options)
+            self._volume_handles[key] = handle
+        return handle.array
+
+    def close(self) -> None:
+        for handle in self._volume_handles.values():
+            handle.close()
+        self._volume_handles.clear()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
     
     def _sample_crop_shape(self, scale_range):
         ref_depth, ref_height, ref_width = self.source_crop_size
@@ -262,7 +344,7 @@ class SSLZarrDataset(Dataset):
         while True:
             vol_idx = np.random.choice(len(self.volumes), p=vol_weights)
             vol = self.volumes[vol_idx]
-            d_zarr = open_zarr(vol.path, vol.scale, self.volume_auth, self.s3_storage_options)
+            d_zarr = self._get_volume_array(vol)
             source_crop = self._read_source_crop_3d(d_zarr, vol.usable_bbox)
             if source_crop.size > 0 and (np.count_nonzero(source_crop) / source_crop.size) >= nonzero_threshold:
                 break
