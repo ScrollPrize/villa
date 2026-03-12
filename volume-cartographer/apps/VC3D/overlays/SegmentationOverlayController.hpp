@@ -76,8 +76,7 @@ public:
         QColor approvalBrushColor{0, 255, 0};  // Current painting color (default pure green)
         QuadSurface* surface{nullptr};
         std::optional<cv::Vec3f> approvalHoverWorld;  // Current hover position for brush circle
-        std::optional<QPointF> approvalHoverScenePos; // Scene position (avoids expensive pointTo)
-        float approvalHoverViewerScale{1.0f};         // Viewer scale for the hover position
+        std::optional<QPointF> approvalHoverSurfacePos; // Surface position (for dirty checking)
         std::optional<cv::Vec3f> approvalHoverPlaneNormal;  // Plane normal when hovering in XY/XZ/YZ viewers
 
         bool operator==(const State& rhs) const;

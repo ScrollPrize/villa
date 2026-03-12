@@ -42,10 +42,10 @@ public:
     [[nodiscard]] bool strokeActive() const { return _strokeActive; }
     [[nodiscard]] bool hasPendingStrokes() const { return !_pendingStrokes.empty(); }
 
-    // scenePos is the raw scene position, viewerScale is the viewer's current scale (_scale member)
-    // Grid position is computed as: (scenePos / viewerScale + surface_center) * surface_scale
-    void startStroke(const cv::Vec3f& worldPos, const QPointF& scenePos, float viewerScale);
-    void extendStroke(const cv::Vec3f& worldPos, const QPointF& scenePos, float viewerScale, bool forceSample);
+    // surfacePos is in surface parameter coordinates (from TileScene::sceneToSurface).
+    // Grid position is computed as: (surfacePos + surface_center) * surface_scale
+    void startStroke(const cv::Vec3f& worldPos, const QPointF& surfacePos);
+    void extendStroke(const cv::Vec3f& worldPos, const QPointF& surfacePos, bool forceSample);
     void finishStroke();
 
     // For plane viewers: paint approval based on 3D world position, plane normal, and radius
@@ -68,21 +68,20 @@ public:
     [[nodiscard]] float effectivePaintRadius() const { return _effectivePaintRadiusNative; }
     [[nodiscard]] std::optional<cv::Vec3f> hoverWorldPos() const { return _hoverWorldPos; }
     [[nodiscard]] float hoverEffectiveRadius() const { return _hoverEffectiveRadius; }
-    [[nodiscard]] std::optional<QPointF> hoverScenePos() const { return _hoverScenePos; }
-    [[nodiscard]] float hoverViewerScale() const { return _hoverViewerScale; }
+    [[nodiscard]] std::optional<QPointF> hoverSurfacePos() const { return _hoverSurfacePos; }
     [[nodiscard]] std::optional<cv::Vec3f> hoverPlaneNormal() const { return _hoverPlaneNormal; }
 
-    void setHoverWorldPos(const cv::Vec3f& pos, float brushRadius, const QPointF& scenePos, float viewerScale,
+    void setHoverWorldPos(const cv::Vec3f& pos, float brushRadius, const QPointF& surfacePos,
                           const std::optional<cv::Vec3f>& planeNormal = std::nullopt);
-    void clearHoverWorldPos() { _hoverWorldPos = std::nullopt; _hoverEffectiveRadius = 0.0f; _hoverScenePos = std::nullopt; _hoverViewerScale = 0.0f; _hoverPlaneNormal = std::nullopt; }
+    void clearHoverWorldPos() { _hoverWorldPos = std::nullopt; _hoverEffectiveRadius = 0.0f; _hoverSurfacePos = std::nullopt; _hoverPlaneNormal = std::nullopt; }
 
     void cancel() { clear(); }
     [[nodiscard]] bool isActive() const { return brushActive() || strokeActive(); }
 
 private:
-    // Convert scene position to integer grid indices using surface coordinate transform
-    // Formula: gridPos = (scenePos / viewerScale + center) * surfaceScale
-    std::optional<std::pair<int, int>> sceneToGridIndex(const QPointF& scenePos, float viewerScale) const;
+    // Convert surface parameter coordinates to integer grid indices.
+    // Formula: gridPos = (surfacePos + center) * surfaceScale
+    std::optional<std::pair<int, int>> surfaceToGridIndex(const QPointF& surfacePos) const;
 
     // Find all grid cells whose 3D world positions are within radius of the given world position
     std::vector<std::pair<int, int>> findGridCellsInSphere(const cv::Vec3f& worldPos, float radius) const;
@@ -132,8 +131,7 @@ private:
     // Current hover position for brush circle visualization
     std::optional<cv::Vec3f> _hoverWorldPos;
     float _hoverEffectiveRadius{0.0f};  // Cached effective radius for hover preview
-    std::optional<QPointF> _hoverScenePos;  // Cached scene position (avoids expensive pointTo)
-    float _hoverViewerScale{0.0f};          // Viewer scale for the cached scene position
+    std::optional<QPointF> _hoverSurfacePos;  // Cached surface position (for overlay state comparison)
     std::optional<cv::Vec3f> _hoverPlaneNormal;  // Plane normal when hovering in XY/XZ/YZ viewers
 
     // Cache for grid search optimization - avoids expensive pointTo calls during continuous painting

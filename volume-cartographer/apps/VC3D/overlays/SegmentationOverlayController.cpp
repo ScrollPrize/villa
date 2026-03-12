@@ -138,8 +138,7 @@ bool SegmentationOverlayController::State::operator==(const State& rhs) const
            paintingApproval == rhs.paintingApproval &&
            approvalBrushColor == rhs.approvalBrushColor &&
            surface == rhs.surface &&
-           approvalHoverScenePos == rhs.approvalHoverScenePos &&
-           floatEqual(approvalHoverViewerScale, rhs.approvalHoverViewerScale) &&
+           approvalHoverSurfacePos == rhs.approvalHoverSurfacePos &&
            vec3fOptEqual(approvalHoverPlaneNormal, rhs.approvalHoverPlaneNormal);
 }
 

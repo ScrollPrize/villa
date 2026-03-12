@@ -1159,6 +1159,11 @@ bool CTiledVolumeViewer::sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n,
     return tiledSceneToVolume(surf.get(), _tileScene, scenePos, p, n);
 }
 
+cv::Vec2f CTiledVolumeViewer::sceneToSurfaceCoords(const QPointF& scenePos) const
+{
+    return _tileScene->sceneToSurface(scenePos);
+}
+
 // ============================================================================
 // Mouse handlers
 // ============================================================================

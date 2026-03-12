@@ -175,6 +175,8 @@ public:
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const;
     // Scene-to-volume coordinate conversion (returns position + normal)
     bool sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n, const QPointF& scenePos) const;
+    // Transform from canvas scene coordinates to surface parameter coordinates
+    cv::Vec2f sceneToSurfaceCoords(const QPointF& scenePos) const;
     QPointF lastScenePosition() const { return _lastScenePos; }
 
     // --- BBox tool ---
