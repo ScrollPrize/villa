@@ -53,8 +53,17 @@ void main() {
 }
 """
 
+ERROR_POINTS_SHADER = """
+void main() {
+  float e = clamp(prop_error() / prop_max_error(), 0.0, 1.0);
+  setColor(vec4(e, 1.0 - e, 0.0, 1.0));
+  setPointMarkerSize(mix(5.0, 15.0, e));
+}
+"""
+
 FIXED_POINTS_LAYER_STR = "fixed_points"
 MOVING_POINTS_LAYER_STR = "moving_points"
+ERROR_POINTS_LAYER_STR = "landmark_errors"
 
 UNITLESS_DIMENSIONS = neuroglancer.CoordinateSpace(
     names=["z", "y", "x"],
@@ -307,6 +316,9 @@ def load_transform(
     for point in moving_landmarks:
         add_point_from_coords(viewer_state, point, "moving")
 
+    # Update error layer now that landmarks and transform are loaded
+    update_error_layer(viewer_state)
+
 
 def save_current_transform(
     state: neuroglancer.ViewerState, output_path: Optional[str], fixed_volume_path: str
@@ -483,6 +495,7 @@ def fine_align(_):
 
         # Apply the refined transform
         set_current_transform(state, refined_transform)
+        update_error_layer(state)
         print("Alignment complete - transform updated")
 
 
@@ -625,6 +638,7 @@ def update_transform_if_sufficient_points(state):
             )
             if transform is not None:
                 set_current_transform(state, transform)
+                update_error_layer(state)
                 print(
                     f"Automatically updated transform from {len(fixed_annotations)} point pairs"
                 )
@@ -647,6 +661,112 @@ def renumber_point_ids(state, point_type):
     annotations = state.layers[layer_name].layer.annotations
     for i, ann in enumerate(annotations):
         ann.id = f"{prefix}_{i + 1}"
+
+
+def compute_landmark_errors(state: neuroglancer.ViewerState):
+    """Compute per-landmark errors: distance between fixed point and transformed moving point.
+
+    Returns list of (index, fixed_point_zyx, error_distance) tuples, or empty list if
+    there aren't matched pairs.
+    """
+    if (
+        FIXED_POINTS_LAYER_STR not in state.layers
+        or MOVING_POINTS_LAYER_STR not in state.layers
+    ):
+        return []
+
+    fixed_annotations = state.layers[FIXED_POINTS_LAYER_STR].layer.annotations
+    moving_annotations = state.layers[MOVING_POINTS_LAYER_STR].layer.annotations
+
+    n_pairs = min(len(fixed_annotations), len(moving_annotations))
+    if n_pairs == 0:
+        return []
+
+    current_transform = get_current_transform(state)
+    errors = []
+    for i in range(n_pairs):
+        fixed_pt = np.array(fixed_annotations[i].point)
+        moving_pt = np.array(moving_annotations[i].point)
+        # Transform moving point to fixed space
+        transformed = (current_transform @ np.append(moving_pt, 1.0))[:3]
+        error = float(np.linalg.norm(fixed_pt - transformed))
+        errors.append((i, list(fixed_pt), error))
+    return errors
+
+
+def update_error_layer(state: neuroglancer.ViewerState):
+    """Rebuild the landmark error annotation layer with current errors."""
+    errors = compute_landmark_errors(state)
+
+    # Remove existing error layer
+    if ERROR_POINTS_LAYER_STR in state.layers:
+        del state.layers[ERROR_POINTS_LAYER_STR]
+
+    if not errors:
+        return
+
+    max_error = max(e for _, _, e in errors)
+    if max_error == 0:
+        max_error = 1.0  # avoid division by zero in shader
+
+    annotations = []
+    for i, fixed_pt, error in errors:
+        annotations.append(
+            neuroglancer.PointAnnotation(
+                point=fixed_pt,
+                id=f"err_{i + 1}",
+                description=f"#{i + 1}  error: {error:.1f}",
+                props=[error, max_error],
+            )
+        )
+
+    state.layers.append(
+        name=ERROR_POINTS_LAYER_STR,
+        layer=neuroglancer.LocalAnnotationLayer(
+            dimensions=UNITLESS_DIMENSIONS,
+            annotation_properties=[
+                neuroglancer.AnnotationPropertySpec(
+                    id="error",
+                    type="float32",
+                    description="Transform error (voxels)",
+                ),
+                neuroglancer.AnnotationPropertySpec(
+                    id="max_error",
+                    type="float32",
+                    description="Max error across all landmarks",
+                ),
+            ],
+            annotations=annotations,
+            shader=ERROR_POINTS_SHADER,
+        ),
+    )
+
+    # Print error summary to terminal
+    sorted_errors = sorted(errors, key=lambda x: x[2], reverse=True)
+    print(f"\n{'─' * 40}")
+    print(f"  Landmark errors ({len(errors)} pairs)")
+    print(f"{'─' * 40}")
+    print(f"  {'#':>3}  {'Error':>10}")
+    print(f"  {'─' * 3}  {'─' * 10}")
+    for i, _, error in sorted_errors:
+        print(f"  {i + 1:>3}  {error:>10.2f}")
+    rms = np.sqrt(np.mean([e ** 2 for _, _, e in errors]))
+    print(f"{'─' * 40}")
+    print(f"  RMS error: {rms:.2f}")
+    print(f"  Max error: {max_error:.2f}")
+    print(f"{'─' * 40}\n")
+
+
+def navigate_to_worst_landmark(_):
+    """Navigate the viewer to the landmark with the largest error."""
+    with viewer.txn() as state:
+        errors = compute_landmark_errors(state)
+        if not errors:
+            print("No landmark pairs to evaluate")
+            return
+        worst = max(errors, key=lambda x: x[2])
+        state.position = worst[1]
+        print(f"Navigated to landmark #{worst[0] + 1} (error: {worst[2]:.2f})")
 
 
 def perturb_nearest_fixed_point(action_state, axis, amount):
@@ -764,6 +884,7 @@ def add_actions_and_keybinds(
     viewer.actions.add("delete-nearest-point", delete_nearest_point)
     viewer.actions.add("previous-fixed-point", navigate_to_previous_fixed_point)
     viewer.actions.add("next-fixed-point", navigate_to_next_fixed_point)
+    viewer.actions.add("goto-worst-landmark", navigate_to_worst_landmark)
     viewer.actions.add("rot-x-plus-small", _make_rotator("x", small_rotate_deg))
     viewer.actions.add("rot-x-minus-small", _make_rotator("x", -small_rotate_deg))
     viewer.actions.add("rot-y-plus-small", _make_rotator("y", small_rotate_deg))
@@ -858,6 +979,7 @@ def add_actions_and_keybinds(
         s.input_event_bindings.viewer["alt+shift+keyo"] = "trans-z-minus-large"
         s.input_event_bindings.viewer["alt+bracketleft"] = "previous-fixed-point"
         s.input_event_bindings.viewer["alt+bracketright"] = "next-fixed-point"
+        s.input_event_bindings.viewer["alt+shift+bracketright"] = "goto-worst-landmark"
         s.input_event_bindings.viewer["shift+keyj"] = "perturb-fixed-point-x-plus"
         s.input_event_bindings.viewer["shift+keyu"] = "perturb-fixed-point-x-minus"
         s.input_event_bindings.viewer["shift+keyk"] = "perturb-fixed-point-y-plus"
@@ -981,6 +1103,7 @@ if __name__ == "__main__":
 
     init_volume_layers(viewer, args.fixed, args.moving, scale_factor)
 
+    print(f"Opening neuroglancer viewer... at URL: {viewer.get_viewer_url()}")
     webbrowser.open_new(viewer.get_viewer_url())
 
     set_initial_transform(viewer, args.initial_transform, args.invert_initial_transform)
