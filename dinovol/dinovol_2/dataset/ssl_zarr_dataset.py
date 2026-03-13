@@ -296,10 +296,8 @@ class SSLZarrDataset(Dataset):
         except Exception:
             pass
     
-    def _sample_crop_shape(self, scale_range, reference_size=None):
-        if reference_size is None:
-            reference_size = self.source_crop_size
-        ref_depth, ref_height, ref_width = reference_size
+    def _sample_crop_shape(self, scale_range):
+        ref_depth, ref_height, ref_width = self.source_crop_size
         min_scale, max_scale = scale_range
         scale = np.random.uniform(min_scale, max_scale)
         scale_per_dim = scale ** (1.0 / 3.0)
@@ -349,7 +347,9 @@ class SSLZarrDataset(Dataset):
         if reference_size is None:
             reference_size = target_size
         source_depth, source_height, source_width = source_crop.shape
-        crop_d, crop_h, crop_w = self._sample_crop_shape(scale_range, reference_size=reference_size)
+        # Match DINO-style RandomResizedCrop semantics: sample scale from the source image,
+        # then expand to the padded view size when a deeper-embed halo is requested.
+        crop_d, crop_h, crop_w = self._sample_crop_shape(scale_range)
         crop_d, crop_h, crop_w = self._expand_crop_shape(
             (crop_d, crop_h, crop_w),
             target_size,
@@ -376,7 +376,7 @@ class SSLZarrDataset(Dataset):
         bbox_depth = z1 - z0
         bbox_height = y1 - y0
         bbox_width = x1 - x0
-        crop_d, crop_h, crop_w = self._sample_crop_shape(scale_range, reference_size=reference_size)
+        crop_d, crop_h, crop_w = self._sample_crop_shape(scale_range)
         crop_d, crop_h, crop_w = self._expand_crop_shape(
             (crop_d, crop_h, crop_w),
             target_size,
