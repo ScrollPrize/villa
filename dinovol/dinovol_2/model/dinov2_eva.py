@@ -5,14 +5,14 @@ from typing import Callable, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from timm.layers import trunc_normal_, \
-    RotaryEmbeddingCat, use_fused_attn, apply_rot_embed_cat, DropPath, SwiGLU, GluMlp, Mlp
+from timm.layers import trunc_normal_, use_fused_attn, DropPath, SwiGLU, GluMlp, Mlp
 from torch import nn
 from torch.nn import LayerNorm
 from torch.utils.checkpoint import checkpoint
 from einops import rearrange
 
 from dinovol_2.model.patch_encode_decode import PatchEmbed, PatchEmbedDeeper
+from dinovol_2.model.rope import RopeEmbedding, RopePositionEmbedding, apply_rotary_embedding
 
 
 class InitWeights_He(object):
@@ -56,6 +56,8 @@ class EvaAttention(nn.Module):
         """
         super().__init__()
         self.num_heads = num_heads
+        if attn_head_dim is None and dim % num_heads != 0:
+            raise ValueError(f"dim must be divisible by num_heads, got dim={dim}, num_heads={num_heads}")
         head_dim = dim // num_heads
         if attn_head_dim is not None:
             head_dim = attn_head_dim
@@ -89,7 +91,7 @@ class EvaAttention(nn.Module):
     def forward(
             self,
             x,
-            rope: Optional[torch.Tensor] = None,
+            rope: Optional[RopeEmbedding] = None,
             attn_mask: Optional[torch.Tensor] = None,
     ):
         B, N, C = x.shape
@@ -112,9 +114,8 @@ class EvaAttention(nn.Module):
             v = self.v_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
         
         if rope is not None:
-            npt = self.num_prefix_tokens
-            q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope)], dim=2).type_as(v)
-            k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope)], dim=2).type_as(v)
+            q = apply_rotary_embedding(q, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
+            k = apply_rotary_embedding(k, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
         
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
@@ -231,7 +232,7 @@ class EvaBlock(nn.Module):
         self.gamma_2 = nn.Parameter(init_values * torch.ones(dim)) if init_values is not None else None
         self.drop_path2 = DropPath(drop_path, drop_path_scale) if drop_path > 0. else nn.Identity()
     
-    def forward(self, x, rope: Optional[torch.Tensor] = None, attn_mask: Optional[torch.Tensor] = None):
+    def forward(self, x, rope: Optional[RopeEmbedding] = None, attn_mask: Optional[torch.Tensor] = None):
         if self.gamma_1 is None:
             x = x + self.drop_path1(self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask))
             x = x + self.drop_path2(self.mlp(self.norm2(x)))
@@ -297,7 +298,7 @@ class Eva(nn.Module):
             dynamic_img_size: bool = False,
             num_reg_tokens: int = 0,
             drop_path_scale: bool = True,
-            rope_impl=RotaryEmbeddingCat,
+            rope_impl=RopePositionEmbedding,
             rope_kwargs=None,
             grad_checkpointing=False,
     ):
@@ -377,37 +378,22 @@ class Eva(nn.Module):
         self.pos_drop = nn.Dropout(p=pos_drop_rate)
         
         if use_rot_pos_emb:
-            if len(self.global_ref_feat_shape) == 3:
-                rope_dim = round(embed_dim // num_heads / 1.5)
-                assert rope_dim == embed_dim / num_heads / 1.5, 'rope dim must be divsible by (num_heads * 1.5)'
-                assert rope_dim % 4 == 0, 'rope dim must be divisible by 4'
-            else:
-                rope_dim = embed_dim // num_heads
-            self.global_rope = rope_impl(
-                rope_dim,
-                in_pixels=False,
-                feat_shape=self.global_ref_feat_shape,
-                ref_feat_shape=self.global_ref_feat_shape,
-                **rope_kwargs
-            )
-            self.local_rope = rope_impl(
-                rope_dim,
-                in_pixels=False,
-                feat_shape=self.local_ref_feat_shape,
-                ref_feat_shape=self.local_ref_feat_shape,
-                **rope_kwargs
-            )
-            # Keep a band-based generator for shapes outside the configured global/local crop grids.
-            self.dynamic_rope = rope_impl(
-                rope_dim,
-                in_pixels=False,
-                ref_feat_shape=self.global_ref_feat_shape,
-                **rope_kwargs
+            if embed_dim % num_heads != 0:
+                raise ValueError(
+                    f"embed_dim must be divisible by num_heads, got embed_dim={embed_dim}, num_heads={num_heads}"
+                )
+            head_dim = embed_dim // num_heads
+            if head_dim % (2 * self.ndim) != 0:
+                raise ValueError(
+                    f"RoPE requires head_dim divisible by 2 * ndim, got head_dim={head_dim}, ndim={self.ndim}"
+                )
+            self.rope_embed = rope_impl(
+                head_dim,
+                ndim=self.ndim,
+                **rope_kwargs,
             )
         else:
-            self.global_rope = None
-            self.local_rope = None
-            self.dynamic_rope = None
+            self.rope_embed = None
         
         if drop_path_uniform is True:
             dpr = [drop_path_rate] * depth
@@ -486,7 +472,7 @@ class Eva(nn.Module):
         )
         return matcher
     
-    def _pos_embed(self, x, *spatial) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _pos_embed(self, x, *spatial) -> Tuple[torch.Tensor, Optional[RopeEmbedding]]:
         """
         Computes positional embeddings with interpolation if needed.
 
@@ -530,14 +516,10 @@ class Eva(nn.Module):
         
         return x, rot_pos_embed
 
-    def _get_rot_pos_embed(self, target_size: Tuple[int, ...]) -> Optional[torch.Tensor]:
-        if self.global_rope is None:
+    def _get_rot_pos_embed(self, target_size: Tuple[int, ...]) -> Optional[RopeEmbedding]:
+        if self.rope_embed is None:
             return None
-        if target_size == tuple(self.global_ref_feat_shape):
-            return self.global_rope.get_embed()
-        if target_size == tuple(self.local_ref_feat_shape):
-            return self.local_rope.get_embed()
-        return self.dynamic_rope.get_embed(shape=target_size)
+        return self.rope_embed.get_embed(target_size)
     
     def interpolate_pos_encoding_nd(
             self,
@@ -632,8 +614,8 @@ class Eva(nn.Module):
     
     def prepare_tokens_with_masks(self, x, masks=None, *, view_kind: str = "global"):
         spatial = tuple(x.shape[2:])
+        self._assert_patch_aligned(spatial, tuple(self.patch_size), context="input shape")
         if self.embedding_type == "deeper":
-            self._assert_patch_aligned(spatial, tuple(self.patch_size), context="input shape")
             target_spatial = self._resolve_target_spatial_shape(spatial, view_kind=view_kind)
             x = self.down_projection(x)
             x = self._crop_embedded_grid(x, target_spatial)

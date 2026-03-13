@@ -565,11 +565,11 @@ class PatchEmbedDeeper(nn.Module):
             )
 
         conv_op = convert_dim_to_conv_op(self.ndim)
-        norm_op = nn.InstanceNorm2d if self.ndim == 2 else nn.InstanceNorm3d
+        norm_op = LayerNormNd
         kernel_size = [3] * self.ndim
         block = BottleneckD if embed_block_type == "bottleneck" else BasicBlockD
         nonlin = nn.LeakyReLU if embed_block_type == "bottleneck" else nn.ReLU
-        norm_op_kwargs = {"eps": 1e-5, "affine": True}
+        norm_op_kwargs = {"eps": 1e-5}
         nonlin_kwargs = {"inplace": True}
 
         if embed_block_style == "residual":
@@ -728,7 +728,7 @@ class PatchEmbedDeeper(nn.Module):
                 stride=module.stride,
                 padding=module.padding,
             )
-        if isinstance(module, (nn.Identity, nn.InstanceNorm2d, nn.InstanceNorm3d, nn.ReLU, nn.LeakyReLU)):
+        if isinstance(module, (nn.Identity, LayerNormNd, nn.ReLU, nn.LeakyReLU)):
             return support
         if isinstance(module, nn.Sequential):
             for submodule in module:
