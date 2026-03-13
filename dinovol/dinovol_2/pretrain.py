@@ -566,24 +566,45 @@ class DinoIBOTPretrainer:
             if update_centers:
                 self.dino_loss.update_center(teacher_cls)
         return teacher_targets.chunk(2)
-    
+
+    @staticmethod
+    def _patch_support_weights(masked_patch_support: torch.Tensor | None) -> torch.Tensor | None:
+        if masked_patch_support is None:
+            return None
+        return masked_patch_support.detach().float().clamp(0.0, 1.0)
+
+    @staticmethod
+    def _apply_patch_support_to_targets(
+            targets: torch.Tensor,
+            masked_patch_support: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if masked_patch_support is None or targets.numel() == 0:
+            return targets
+        support = masked_patch_support.to(device=targets.device, dtype=targets.dtype).unsqueeze(-1)
+        uniform_prob = 1.0 / targets.shape[-1]
+        return targets * support + (1.0 - support) * uniform_prob
+
     def _center_teacher_patch(
             self,
             teacher_patch: torch.Tensor,
             teacher_temp: float,
+            teacher_patch_support: torch.Tensor | None = None,
             *,
             update_centers: bool = True,
     ) -> torch.Tensor:
         if teacher_patch.numel() == 0:
             return teacher_patch
+        patch_support_weights = self._patch_support_weights(teacher_patch_support)
         if self.centering == "sinkhorn_knopp":
             n_masked = torch.tensor([teacher_patch.shape[0]], device=teacher_patch.device, dtype=torch.long)
-            return self.ibot_patch_loss.sinkhorn_knopp_teacher(teacher_patch, teacher_temp, n_masked)
+            targets = self.ibot_patch_loss.sinkhorn_knopp_teacher(teacher_patch, teacher_temp, n_masked)
+            return self._apply_patch_support_to_targets(targets, patch_support_weights)
         teacher_patch_batched = teacher_patch.unsqueeze(0)
+        patch_support_batched = patch_support_weights.unsqueeze(0) if patch_support_weights is not None else None
         targets = self.ibot_patch_loss.softmax_center_teacher(teacher_patch_batched, teacher_temp).squeeze(0)
         if update_centers:
-            self.ibot_patch_loss.update_center(teacher_patch_batched)
-        return targets
+            self.ibot_patch_loss.update_center(teacher_patch_batched, token_weights=patch_support_batched)
+        return self._apply_patch_support_to_targets(targets, patch_support_weights)
     
     @staticmethod
     def _tensor_stats(tensor: torch.Tensor) -> dict[str, Any]:
@@ -663,10 +684,12 @@ class DinoIBOTPretrainer:
                 teacher_outputs = teacher_branch["global"]
                 teacher_cls_projections = teacher_branch["global_cls_projections"]
                 teacher_patch = teacher_branch["global_masked_patch_projections"]
+                teacher_patch_support = teacher_branch.get("global_masked_patch_support")
             else:
                 teacher_outputs = None
                 teacher_cls_projections = None
                 teacher_patch = global_crops.new_zeros((0,))
+                teacher_patch_support = None
             if self.do_dino and teacher_cls_projections is not None:
                 teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
                     teacher_cls_projections,
@@ -679,6 +702,7 @@ class DinoIBOTPretrainer:
                 teacher_patch_targets = self._center_teacher_patch(
                     teacher_patch,
                     teacher_temp,
+                    teacher_patch_support=teacher_patch_support,
                     update_centers=False,
                 )
             else:
@@ -688,6 +712,7 @@ class DinoIBOTPretrainer:
             student_global = student_branch["global"]
             student_global_cls = student_branch["global_cls_projections"]
             student_patch = student_branch["global_masked_patch_projections"]
+            student_patch_support = student_branch.get("global_masked_patch_support")
             global_cls_0, global_cls_1 = student_global_cls.chunk(n_global_views)
 
             if n_local_views:
@@ -712,12 +737,19 @@ class DinoIBOTPretrainer:
                 dino_local_loss = global_crops.new_zeros(())
 
             if self.do_ibot and n_masked > 0:
+                ibot_masks_weight = masks_weight
+                support_weights = self._patch_support_weights(teacher_patch_support)
+                if support_weights is not None:
+                    ibot_masks_weight = ibot_masks_weight * support_weights.to(
+                        device=ibot_masks_weight.device,
+                        dtype=ibot_masks_weight.dtype,
+                    )
                 ibot_loss = self.ibot_patch_loss.forward_masked(
                     student_patch,
                     teacher_patch_targets,
                     student_masks_flat=masks,
                     n_masked_patches=n_masked,
-                    masks_weight=masks_weight,
+                    masks_weight=ibot_masks_weight,
                 )
             else:
                 ibot_loss = global_crops.new_zeros(())
@@ -806,6 +838,7 @@ class DinoIBOTPretrainer:
                 "patch_tokens": self._tensor_stats(teacher_outputs["patch_tokens"]) if teacher_outputs is not None else None,
                 "cls_projections": self._tensor_stats(teacher_cls_projections) if teacher_cls_projections is not None else None,
                 "masked_patch_projections": self._tensor_stats(teacher_patch),
+                "masked_patch_support": self._tensor_stats(teacher_patch_support) if teacher_patch_support is not None else None,
                 "cls_target_row_sums": teacher_cls_row_sums,
                 "patch_target_row_sums": teacher_patch_row_sums,
             },
@@ -814,6 +847,7 @@ class DinoIBOTPretrainer:
                 "global_patch_tokens": self._tensor_stats(student_global["patch_tokens"]),
                 "global_cls_projections": self._tensor_stats(student_global_cls),
                 "masked_patch_projections": self._tensor_stats(student_patch),
+                "masked_patch_support": self._tensor_stats(student_patch_support) if student_patch_support is not None else None,
                 "local_cls_projections": self._tensor_stats(student_local["cls_projections"]) if student_local else None,
             },
             "losses": {
@@ -946,6 +980,7 @@ class DinoIBOTPretrainer:
                 teacher_patch_targets = self._center_teacher_patch(
                     teacher_branch["global_masked_patch_projections"],
                     teacher_temp,
+                    teacher_patch_support=teacher_branch.get("global_masked_patch_support"),
                 )
             else:
                 teacher_patch_targets = None
@@ -954,6 +989,7 @@ class DinoIBOTPretrainer:
             student_global = student_branch["global"]
             student_global_cls = student_branch["global_cls_projections"]
             student_patch = student_branch["global_masked_patch_projections"]
+            teacher_patch_support = teacher_branch.get("global_masked_patch_support") if teacher_branch is not None else None
             global_cls_0, global_cls_1 = student_global_cls.chunk(2)
 
             total_terms = dino_loss_term_count(n_local_views)
@@ -974,12 +1010,19 @@ class DinoIBOTPretrainer:
                 dino_local_loss = global_crops.new_zeros(())
 
             if self.do_ibot and n_masked > 0:
+                ibot_masks_weight = masks_weight
+                support_weights = self._patch_support_weights(teacher_patch_support)
+                if support_weights is not None:
+                    ibot_masks_weight = ibot_masks_weight * support_weights.to(
+                        device=ibot_masks_weight.device,
+                        dtype=ibot_masks_weight.dtype,
+                    )
                 ibot_loss = self.ibot_patch_loss.forward_masked(
                     student_patch,
                     teacher_patch_targets,
                     student_masks_flat=masks,
                     n_masked_patches=n_masked,
-                    masks_weight=masks_weight,
+                    masks_weight=ibot_masks_weight,
                 )
             else:
                 ibot_loss = global_crops.new_zeros(())
@@ -1204,6 +1247,7 @@ class DinoIBOTPretrainer:
             teacher_patch_targets = self._center_teacher_patch(
                 teacher_branch["global_masked_patch_projections"],
                 teacher_temp,
+                teacher_patch_support=teacher_branch.get("global_masked_patch_support"),
                 update_centers=False,
             ) if self.do_ibot and teacher_branch is not None else None
 
@@ -1211,6 +1255,7 @@ class DinoIBOTPretrainer:
             student_global = student_branch["global"]
             student_global_cls = student_branch["global_cls_projections"]
             student_patch = student_branch["global_masked_patch_projections"]
+            teacher_patch_support = teacher_branch.get("global_masked_patch_support") if teacher_branch is not None else None
             global_cls_0, global_cls_1 = student_global_cls.chunk(2)
 
             total_terms = dino_loss_term_count(n_local_views)
@@ -1231,12 +1276,19 @@ class DinoIBOTPretrainer:
                 dino_local_loss = global_crops.new_zeros(())
 
             if self.do_ibot and n_masked > 0:
+                ibot_masks_weight = masks_weight
+                support_weights = self._patch_support_weights(teacher_patch_support)
+                if support_weights is not None:
+                    ibot_masks_weight = ibot_masks_weight * support_weights.to(
+                        device=ibot_masks_weight.device,
+                        dtype=ibot_masks_weight.dtype,
+                    )
                 ibot_loss = self.ibot_patch_loss.forward_masked(
                     student_patch,
                     teacher_patch_targets,
                     student_masks_flat=masks,
                     n_masked_patches=n_masked,
-                    masks_weight=masks_weight,
+                    masks_weight=ibot_masks_weight,
                 )
             else:
                 ibot_loss = global_crops.new_zeros(())

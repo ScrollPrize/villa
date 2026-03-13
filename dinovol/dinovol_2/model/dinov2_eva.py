@@ -580,18 +580,27 @@ class Eva(nn.Module):
         spatial = tuple(x.shape[2:])
         if self.embedding_type == "deeper":
             self._assert_patch_aligned(spatial, tuple(self.patch_size), context="input shape")
-        x = self.down_projection(x)
+            x, patch_support = self.down_projection.forward_with_support(x)
+        else:
+            x = self.down_projection(x)
+            patch_support = None
         if self.ndim == 2:
             x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
+            if patch_support is not None:
+                patch_support = patch_support.flatten(2).squeeze(1).contiguous()
         else:
             x = rearrange(x, 'b c d h w -> b (d h w) c').contiguous()
+            if patch_support is not None:
+                patch_support = patch_support.flatten(2).squeeze(1).contiguous()
+        if patch_support is not None:
+            patch_support = patch_support.expand(x.shape[0], -1).contiguous()
         
         if masks is not None:
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype), x)
         
         x, rot_pos_embed = self._pos_embed(x, *spatial)
         
-        return x, rot_pos_embed
+        return x, rot_pos_embed, patch_support
     
     def forward_features_list(self, x_list, masks_list):
         if not isinstance(x_list, list):
@@ -603,20 +612,23 @@ class Eva(nn.Module):
         return output
     
     def forward_features(self, x, masks=None):
-        x, rot_pos_embed = self.prepare_tokens_with_masks(x, masks)
+        x, rot_pos_embed, patch_support = self.prepare_tokens_with_masks(x, masks)
         for blk in self.blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
                 x = checkpoint(blk, x, rope=rot_pos_embed)
             else:
                 x = blk(x, rope=rot_pos_embed)
         x = self.norm(x)
-        return {
+        outputs = {
             "x_norm_clstoken": x[:, 0] if self.num_class_tokens > 0 else None,
             "x_norm_regtokens": x[:, self.num_class_tokens:self.num_prefix_tokens],
             "x_norm_patchtokens": x[:, self.num_prefix_tokens:],
             "x_prenorm": x,
             "masks": masks,
         }
+        if patch_support is not None:
+            outputs["x_patch_support"] = patch_support.to(x.dtype)
+        return outputs
     
     def forward(self, x, masks=None, is_training=True):
         return self.forward_features_list(x, masks)
@@ -708,7 +720,7 @@ class EvaWithChunking(Eva):
         self.blocks = nn.ModuleList(chunks)
     
     def forward_features(self, x, masks=None):
-        x, rot_pos_embed = self.prepare_tokens_with_masks(x, masks)
+        x, rot_pos_embed, patch_support = self.prepare_tokens_with_masks(x, masks)
         
         if self.chunked_blocks:
             for chunk in self.blocks:
@@ -724,13 +736,16 @@ class EvaWithChunking(Eva):
                     x = blk(x, rope=rot_pos_embed)
         
         x = self.norm(x)
-        return {
+        outputs = {
             "x_norm_clstoken": x[:, 0] if self.num_class_tokens > 0 else None,
             "x_norm_regtokens": x[:, self.num_class_tokens:self.num_prefix_tokens],
             "x_norm_patchtokens": x[:, self.num_prefix_tokens:],
             "x_prenorm": x,
             "masks": masks,
         }
+        if patch_support is not None:
+            outputs["x_patch_support"] = patch_support.to(x.dtype)
+        return outputs
     
     def forward(self, x, masks=None, is_training=True):
         return self.forward_features_list(x, masks)

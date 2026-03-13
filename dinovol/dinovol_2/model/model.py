@@ -378,19 +378,31 @@ class DinoVitStudentTeacher(nn.Module):
         return projections.reshape(*leading_shape, projections.shape[-1])
 
     @staticmethod
-    def select_masked_patch_tokens(
-        patch_tokens: torch.Tensor,
+    def select_masked_tokens(
+        tokens: torch.Tensor,
         mask_indices_list: torch.Tensor,
         n_masked_patches: Optional[int] = None,
     ) -> torch.Tensor:
         masked_tokens = torch.index_select(
-            patch_tokens.flatten(0, 1),
+            tokens.flatten(0, 1),
             dim=0,
             index=mask_indices_list,
         )
         if n_masked_patches is not None:
             masked_tokens = masked_tokens[:n_masked_patches]
         return masked_tokens
+
+    @staticmethod
+    def select_masked_patch_tokens(
+        patch_tokens: torch.Tensor,
+        mask_indices_list: torch.Tensor,
+        n_masked_patches: Optional[int] = None,
+    ) -> torch.Tensor:
+        return DinoVitStudentTeacher.select_masked_tokens(
+            patch_tokens,
+            mask_indices_list=mask_indices_list,
+            n_masked_patches=n_masked_patches,
+        )
 
     def project_cls_tokens(self, branch: nn.ModuleDict, cls_tokens: torch.Tensor) -> torch.Tensor:
         return self._apply_head(branch.dino_head, cls_tokens)
@@ -444,6 +456,9 @@ class DinoVitStudentTeacher(nn.Module):
             "cls_tokens": cls_tokens,
             "patch_tokens": backbone_outputs["x_norm_patchtokens"],
         }
+        patch_support = backbone_outputs.get("x_patch_support")
+        if patch_support is not None:
+            outputs["patch_token_support"] = patch_support
         if project_cls_tokens:
             outputs["cls_projections"] = self.project_cls_tokens(branch, cls_tokens)
         if project_patch_tokens:
@@ -516,6 +531,12 @@ class DinoVitStudentTeacher(nn.Module):
                 "global_cls_projections": student_global_cls,
                 "global_masked_patch_projections": student_patch,
             }
+            if "patch_token_support" in student_global:
+                structured_student_outputs["global_masked_patch_support"] = self.select_masked_tokens(
+                    student_global["patch_token_support"],
+                    mask_indices_list=mask_indices_list,
+                    n_masked_patches=n_masked_patches,
+                )
             if local_student_input is not None:
                 structured_student_outputs["local"] = self._forward_branch(
                     self.student,
@@ -546,9 +567,16 @@ class DinoVitStudentTeacher(nn.Module):
                         mask_indices_list,
                         n_masked_patches=n_masked_patches,
                     )
-                    outputs["teacher"] = {
+                    teacher_structured_outputs: dict[str, Mapping[str, torch.Tensor] | torch.Tensor] = {
                         "global": teacher_global,
                         "global_cls_projections": teacher_global_cls,
                         "global_masked_patch_projections": teacher_patch,
                     }
+                    if "patch_token_support" in teacher_global:
+                        teacher_structured_outputs["global_masked_patch_support"] = self.select_masked_tokens(
+                            teacher_global["patch_token_support"],
+                            mask_indices_list=mask_indices_list,
+                            n_masked_patches=n_masked_patches,
+                        )
+                    outputs["teacher"] = teacher_structured_outputs
         return outputs

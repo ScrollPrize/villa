@@ -147,14 +147,23 @@ class iBOTPatchLoss(nn.Module):
         return -total_loss / student_masks_flat.shape[0]
 
     @torch.no_grad()
-    def update_center(self, teacher_patch_tokens):
-        self.reduce_center_update(teacher_patch_tokens)
+    def update_center(self, teacher_patch_tokens, token_weights=None):
+        self.reduce_center_update(teacher_patch_tokens, token_weights=token_weights)
 
     @torch.no_grad()
-    def reduce_center_update(self, teacher_patch_tokens):
+    def reduce_center_update(self, teacher_patch_tokens, token_weights=None):
         self.updated = False
         self.len_teacher_patch_tokens = len(teacher_patch_tokens)
-        self.async_batch_center = torch.sum(teacher_patch_tokens.mean(1), dim=0, keepdim=True)
+        if token_weights is None:
+            batch_centers = teacher_patch_tokens.mean(1)
+        else:
+            weights = token_weights
+            if weights.ndim == teacher_patch_tokens.ndim - 1:
+                weights = weights.unsqueeze(-1)
+            weights = weights.to(dtype=teacher_patch_tokens.dtype, device=teacher_patch_tokens.device)
+            denom = weights.sum(dim=1).clamp(min=torch.finfo(teacher_patch_tokens.dtype).eps)
+            batch_centers = (teacher_patch_tokens * weights).sum(dim=1) / denom
+        self.async_batch_center = torch.sum(batch_centers, dim=0, keepdim=True)
         if dist.is_initialized():
             self.reduce_handle = dist.all_reduce(self.async_batch_center, async_op=True)
 
