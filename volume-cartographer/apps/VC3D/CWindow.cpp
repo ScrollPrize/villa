@@ -3374,6 +3374,8 @@ void CWindow::CreateWidgets(void)
             {"2x", 2},
             {"4x", 4},
             {"8x", 8},
+            {"16x", 16},
+            {"32x", 32},
         };
         comboIntersectionSampling->clear();
         for (const auto& opt : options) {
@@ -3413,6 +3415,21 @@ void CWindow::CreateWidgets(void)
                             comboIntersectionSampling->setCurrentIndex(index);
                         }
                     });
+        }
+    }
+
+    // Max intersection surfaces spinbox
+    if (auto* spinMaxSurfaces = ui.spinIntersectionMaxSurfaces) {
+        const int savedMax =
+            settings.value(vc3d::settings::viewer::INTERSECTION_MAX_SURFACES, vc3d::settings::viewer::INTERSECTION_MAX_SURFACES_DEFAULT).toInt();
+        spinMaxSurfaces->setValue(std::max(0, savedMax));
+        connect(spinMaxSurfaces, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+            if (_viewerManager) {
+                _viewerManager->setIntersectionMaxSurfaces(value);
+            }
+        });
+        if (_viewerManager) {
+            _viewerManager->setIntersectionMaxSurfaces(savedMax);
         }
     }
 

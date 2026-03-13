@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <iostream>
 
 #include <QDebug>
 #include "vc/core/cache/TieredChunkCache.hpp"
@@ -44,9 +45,58 @@ constexpr auto COLOR_CURSOR = Qt::cyan;
 #define COLOR_SEG_XZ Qt::red
 #define COLOR_SEG_XY QColor(255, 140, 0)
 
+static const QColor kIntersectionPalette[] = {
+    // Vibrant saturated colors
+    QColor(80, 180, 255),  // sky blue
+    QColor(180, 80, 220),  // violet
+    QColor(80, 220, 200),  // aqua/teal
+    QColor(220, 80, 180),  // magenta
+    QColor(80, 130, 255),  // medium blue
+    QColor(160, 80, 255),  // purple
+    QColor(80, 255, 220),  // cyan
+    QColor(255, 80, 200),  // hot pink
+    QColor(120, 220, 80),  // lime green
+    QColor(80, 180, 120),  // spring green
+    // Lighter/pastel variants
+    QColor(150, 200, 255),  // light sky blue
+    QColor(200, 150, 230),  // light violet
+    QColor(150, 230, 210),  // light aqua
+    QColor(230, 150, 200),  // light magenta
+    QColor(150, 170, 255),  // light blue
+    QColor(190, 150, 255),  // light purple
+    QColor(150, 255, 230),  // light cyan
+    QColor(255, 150, 210),  // light pink
+    QColor(180, 240, 150),  // light lime
+    QColor(150, 230, 170),  // light spring green
+    // Deeper/darker variants
+    QColor(50, 120, 200),  // deep blue
+    QColor(140, 50, 180),  // deep violet
+    QColor(50, 180, 160),  // deep teal
+    QColor(180, 50, 140),  // deep magenta
+    QColor(50, 90, 200),   // navy blue
+    QColor(120, 50, 200),  // deep purple
+    QColor(50, 200, 180),  // deep cyan
+    QColor(200, 50, 160),  // deep pink
+    QColor(80, 160, 60),   // forest green
+    QColor(50, 140, 100),  // deep sea green
+    // Extra variations with different saturation
+    QColor(100, 160, 220),  // muted blue
+    QColor(160, 100, 200),  // muted violet
+    QColor(100, 200, 180),  // muted teal
+    QColor(200, 100, 170),  // muted magenta
+    QColor(120, 180, 240),  // soft blue
+    QColor(180, 120, 220),  // soft purple
+    QColor(120, 220, 200),  // soft cyan
+    QColor(220, 120, 190),  // soft pink
+    QColor(140, 200, 100),  // soft lime
+    QColor(100, 180, 130),  // muted green
+};
+
 namespace
 {
 constexpr qreal kIntersectionZ = 18.0;
+constexpr qreal kActiveSegZ = 20.0;
+constexpr qreal kHighlightZ = 22.0;
 constexpr auto kIntersectionItemsKey = "__plane_intersections__";
 
 bool isFinitePoint(const QPointF& point)
@@ -1835,16 +1885,21 @@ void CTiledVolumeViewer::renderIntersections()
     auto surf = _surfWeak.lock();
     auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
     if (!plane || !_state || !_tileScene || !_viewerManager) {
+        std::cout << "[renderIntersections:" << _surfName << "] early return: plane=" << (plane != nullptr) << " state=" << (_state != nullptr)
+                  << " tileScene=" << (_tileScene != nullptr) << " viewerManager=" << (_viewerManager != nullptr) << std::endl;
         return;
     }
 
     auto* patchIndex = _viewerManager->surfacePatchIndex();
     if (!patchIndex || patchIndex->empty()) {
+        std::cout << "[renderIntersections:" << _surfName << "] early return: patchIndex=" << (patchIndex != nullptr)
+                  << " empty=" << (patchIndex ? patchIndex->empty() : true) << std::endl;
         return;
     }
 
     const QRectF sceneRect = viewportSceneRect();
     if (!sceneRect.isValid()) {
+        std::cout << "[renderIntersections:" << _surfName << "] early return: invalid sceneRect" << std::endl;
         return;
     }
 
@@ -1870,6 +1925,8 @@ void CTiledVolumeViewer::renderIntersections()
         addTarget(name);
     }
 
+    std::cout << "[renderIntersections:" << _surfName << "] intersectTgts=" << _intersectTgts.size() << " targets=" << targets.size() << std::endl;
+
     if (targets.empty()) {
         return;
     }
@@ -1885,22 +1942,59 @@ void CTiledVolumeViewer::renderIntersections()
     }
 
     const auto& activeSeg = activeSegmentationHandle();
-    const QColor defaultColor = activeSeg.accentColor.isValid() ? activeSeg.accentColor : QColor(COLOR_SEG_XY);
+    const QColor activeSegColor = activeSeg.accentColor.isValid() ? activeSeg.accentColor
+                                                                  : (_surfName == "seg yz"   ? QColor(COLOR_SEG_YZ)
+                                                                     : _surfName == "seg xz" ? QColor(COLOR_SEG_XZ)
+                                                                                             : QColor(COLOR_SEG_XY));
     auto activeSegShared = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
     auto* segOverlay = _viewerManager->segmentationOverlay();
     const bool useApprovalMask = segOverlay && segOverlay->hasApprovalMaskData() && activeSegShared;
 
-    std::unordered_map<QRgb, QPainterPath> groupedPaths;
-    std::unordered_map<QRgb, QColor> groupedColors;
+    // Group paths by (color, z-value) for efficient batching
+    struct StyleKey {
+        QRgb rgba;
+        int z;
+        bool operator==(const StyleKey& o) const { return rgba == o.rgba && z == o.z; }
+    };
+    struct StyleKeyHash {
+        size_t operator()(const StyleKey& k) const { return std::hash<uint64_t>{}((uint64_t(k.rgba) << 32) | k.z); }
+    };
+    std::unordered_map<StyleKey, QPainterPath, StyleKeyHash> groupedPaths;
+    std::unordered_map<StyleKey, QColor, StyleKeyHash> groupedColors;
 
     for (const auto& [targetSurface, segments] : intersections) {
         if (!targetSurface || segments.empty()) {
             continue;
         }
 
-        QColor baseColor = (activeSeg.surface && targetSurface.get() == activeSeg.surface)
-            ? defaultColor
-            : (_highlightedSurfaceIds.count(targetSurface->id) > 0 ? QColor(Qt::cyan) : defaultColor);
+        const bool isActiveSeg = activeSegShared && targetSurface == activeSegShared;
+        const bool isHighlighted = _highlightedSurfaceIds.count(targetSurface->id) > 0;
+
+        // Determine base color and z-value for this surface
+        QColor baseColor;
+        int zValue;
+        if (isActiveSeg) {
+            baseColor = activeSegColor;
+            zValue = static_cast<int>(kActiveSegZ);
+        } else if (isHighlighted) {
+            baseColor = QColor(0, 220, 255);  // cyan
+            zValue = static_cast<int>(kHighlightZ);
+        } else {
+            // Persistent palette color assignment
+            const auto& surfId = targetSurface->id;
+            size_t colorIndex;
+            auto colorIt = _surfaceColorAssignments.find(surfId);
+            if (colorIt != _surfaceColorAssignments.end()) {
+                colorIndex = colorIt->second;
+            } else if (_surfaceColorAssignments.size() < 500) {
+                colorIndex = _nextColorIndex++;
+                _surfaceColorAssignments[surfId] = colorIndex;
+            } else {
+                colorIndex = std::hash<std::string>{}(surfId);
+            }
+            baseColor = kIntersectionPalette[colorIndex % std::size(kIntersectionPalette)];
+            zValue = static_cast<int>(kIntersectionZ);
+        }
 
         for (const auto& segment : segments) {
             QPointF a = volumeToScene(segment.world[0]);
@@ -1911,14 +2005,16 @@ void CTiledVolumeViewer::renderIntersections()
 
             QColor color = baseColor;
             float alpha = _intersectionOpacity;
+            int segZ = zValue;
 
-            if (useApprovalMask && targetSurface.get() == activeSegShared.get()) {
+            if (useApprovalMask && isActiveSeg) {
                 const cv::Vec3f midParam = (segment.surfaceParams[0] + segment.surfaceParams[1]) * 0.5f;
                 const auto [row, col] = surfaceParamToGrid(targetSurface.get(), midParam);
                 const QColor approvalColor = segOverlay->queryApprovalColor(row, col);
                 if (approvalColor.isValid()) {
                     color = approvalColor;
                     alpha *= std::clamp(segOverlay->approvalMaskOpacity() / 100.0f, 0.0f, 1.0f);
+                    segZ += 5;
                 }
             }
 
@@ -1927,7 +2023,7 @@ void CTiledVolumeViewer::renderIntersections()
                 continue;
             }
 
-            const QRgb key = color.rgba();
+            StyleKey key{color.rgba(), segZ};
             QPainterPath& path = groupedPaths[key];
             path.moveTo(a);
             path.lineTo(b);
@@ -1948,7 +2044,7 @@ void CTiledVolumeViewer::renderIntersections()
         pen.setJoinStyle(Qt::RoundJoin);
         item->setPen(pen);
         item->setBrush(Qt::NoBrush);
-        item->setZValue(kIntersectionZ);
+        item->setZValue(key.z);
         _scene->addItem(item);
         items.push_back(item);
     }

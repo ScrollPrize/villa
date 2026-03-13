@@ -205,6 +205,9 @@ void SurfacePanelController::loadRemoteSurfaces(
     if (_filtersUpdated) {
         _filtersUpdated();
     }
+    if (_viewerManager) {
+        _viewerManager->primeSurfacePatchIndicesAsync();
+    }
     emit surfacesLoaded();
 }
 

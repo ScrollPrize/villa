@@ -367,6 +367,8 @@ private:
     int _surfacePatchSamplingStride = 1;
     std::set<std::string> _intersectTgts = {"visible_segmentation"};
     std::unordered_set<std::string> _highlightedSurfaceIds;
+    std::unordered_map<std::string, size_t> _surfaceColorAssignments;
+    size_t _nextColorIndex = 0;
 
     // --- Interaction state ---
     uint64_t _highlightedPointId = 0;
