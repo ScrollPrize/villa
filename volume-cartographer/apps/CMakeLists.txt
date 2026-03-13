@@ -172,8 +172,6 @@ target_include_directories(vc_zarr_recompress PRIVATE
     ${CMAKE_BINARY_DIR}/libs/c-blosc/blosc
 )
 
-add_executable(vc_zarr_compress_bench src/vc_zarr_compress_bench.cpp)
-target_link_libraries(vc_zarr_compress_bench vc_core)
 
 # Precompiled headers for CLI apps (reuse vc_core's PCH)
 if(VC_USE_PCH)
