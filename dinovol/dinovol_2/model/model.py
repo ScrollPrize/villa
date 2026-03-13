@@ -469,8 +469,10 @@ class DinoVitStudentTeacher(nn.Module):
         masks: Optional[torch.Tensor] = None,
         project_cls_tokens: bool = True,
         project_patch_tokens: bool = False,
+        *,
+        view_kind: str = "global",
     ) -> Mapping[str, torch.Tensor] | list[dict[str, torch.Tensor]]:
-        backbone_outputs = branch.backbone(x, masks=masks, is_training=self.training)
+        backbone_outputs = branch.backbone(x, masks=masks, is_training=self.training, view_kind=view_kind)
         if isinstance(backbone_outputs, list):
             return [
                 self._format_branch_outputs(
@@ -509,6 +511,7 @@ class DinoVitStudentTeacher(nn.Module):
             masks=student_masks,
             project_cls_tokens=project_cls_tokens,
             project_patch_tokens=project_student_patch_tokens and mask_indices_list is None,
+            view_kind="global",
         )
         if mask_indices_list is None:
             outputs: dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]] = {
@@ -534,6 +537,7 @@ class DinoVitStudentTeacher(nn.Module):
                     local_student_input,
                     masks=None,
                     project_cls_tokens=True,
+                    view_kind="local",
                 )
             outputs = {"student": structured_student_outputs}
 
@@ -546,6 +550,7 @@ class DinoVitStudentTeacher(nn.Module):
                     masks=teacher_masks,
                     project_cls_tokens=project_cls_tokens,
                     project_patch_tokens=project_teacher_patch_tokens and mask_indices_list is None,
+                    view_kind="global",
                 )
                 if mask_indices_list is None:
                     outputs["teacher"] = teacher_outputs
