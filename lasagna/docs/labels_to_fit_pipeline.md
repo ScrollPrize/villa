@@ -81,7 +81,8 @@ For scroll-like geometry with significant curvature, use `vc3d_labels_3d.json` i
 python lasagna/export_vis_obj.py \
     --model work/fit_output/model.pt \
     --input normals.zarr \
-    --output-dir work/vis
+    --output-dir work/vis \
+    --winding-volume winding.zarr
 ```
 
 This writes to `work/vis/`:
@@ -90,9 +91,15 @@ This writes to `work/vis/`:
 - `slice_xy_cos.obj` + `.png`, `slice_xz_cos.obj` + `.png` — volume cross-sections
 - `loss_normal.obj` + `.png`, `loss_step.obj` + `.png` — loss heatmaps on mesh
 
+When `--winding-volume` is provided, additional diagnostic layers are generated:
+- `slice_{plane}_winding.obj` + `.png` — center-plane slices of the winding volume field (viridis colormap)
+- `winding_value.obj` + `.png` — mesh colored by sampled winding volume value at each vertex (viridis, full range)
+- `winding_mask.obj` + `.png` — mesh colored by winding validity mask (green = valid, dark red = invalid)
+- `--losses winding_vol` becomes available — shows per-vertex `(sampled - target)^2` loss
+
 Open all `.obj` files as layers in MeshLab. Textured slices and loss maps use accompanying `.mtl`/`.png` files (loaded automatically).
 
-Optional flags: `--slices` (default: xy xz yz), `--channels` (default: cos pred_dt), `--losses` (default: normal step), `--no-mesh`, `--no-connections`, `--device` (default: cpu).
+Optional flags: `--slices` (default: xy xz yz), `--channels` (default: cos pred_dt), `--losses` (default: normal step), `--winding-volume` (path to winding zarr), `--no-mesh`, `--no-connections`, `--device` (default: cpu).
 
 ## Arguments
 

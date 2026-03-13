@@ -145,7 +145,7 @@ def run(
 
 	for ci, ch in enumerate(channels):
 		out_path = Path(f"{output_prefix}_{ch}.ome.zarr")
-		g = zarr.open_group(str(out_path), mode="w")
+		g = zarr.open_group(str(out_path), mode="w", zarr_format=2)
 
 		print(f"[convert_fit_zarr_to_vc3d_omezarr] loading channel={ch}", flush=True)
 		base = _load_channel_chunked(
@@ -164,7 +164,7 @@ def run(
 			else:
 				sh = _shape_div2(base_full_shape, int(lv) - int(first_filled_level))
 			if lv >= int(first_filled_level):
-				arrs[lv] = g.create_dataset(
+				arrs[lv] = g.create_array(
 					str(lv),
 					shape=sh,
 					chunks=(
@@ -175,7 +175,6 @@ def run(
 					dtype=np.uint8,
 					overwrite=True,
 					fill_value=0,
-					dimension_separator="/",
 				)
 
 		# Fill only lower levels (>= first_filled_level), writing crop into absolute position.

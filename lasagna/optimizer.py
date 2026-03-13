@@ -33,6 +33,7 @@ class OptSettings:
 	default_mul: float | None
 	w_fac: dict | None
 	eff: dict[str, float]
+	auto_offset: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,12 +104,14 @@ def _parse_opt_settings(
 	min_scaledown = max(0, int(opt_cfg.get("min_scaledown", 0)))
 	default_mul = opt_cfg.get("default_mul", None)
 	w_fac = opt_cfg.get("w_fac", None)
+	auto_offset = bool(opt_cfg.get("auto_offset", False))
 	opt_cfg.pop("steps", None)
 	opt_cfg.pop("lr", None)
 	opt_cfg.pop("params", None)
 	opt_cfg.pop("min_scaledown", None)
 	opt_cfg.pop("default_mul", None)
 	opt_cfg.pop("w_fac", None)
+	opt_cfg.pop("auto_offset", None)
 	_require_consumed_dict(where=f"stage '{stage_name}' opt", cfg=opt_cfg)
 	if default_mul is not None:
 		default_mul = float(default_mul)
@@ -127,6 +130,7 @@ def _parse_opt_settings(
 		default_mul=default_mul,
 		w_fac=w_fac,
 		eff=eff,
+		auto_offset=auto_offset,
 	)
 
 
@@ -135,7 +139,6 @@ lambda_global: dict[str, float] = {
 	"step": 0.0,
 	"smooth": 0.0,
 	"winding_density": 0.0,
-	"normal": 0.0,
 	"data": 0.0,
 	"data_plain": 0.0,
 	"pred_dt": 0.0,
@@ -311,6 +314,13 @@ def optimize(
 		if not param_groups:
 			return
 		opt = torch.optim.Adam(param_groups)
+
+		# Auto-offset: compute best (offset, direction) for winding volume alignment
+		if opt_cfg.auto_offset and _need_term("winding_vol", opt_cfg.eff) > 0:
+			with torch.no_grad():
+				res_ao = model(data)
+			ao_offset, ao_dir = opt_loss_winding_volume.compute_auto_offset(res=res_ao)
+			print(f"[optimizer] auto_offset: offset={ao_offset}, direction={ao_dir}", flush=True)
 
 		_status_rows = 0
 

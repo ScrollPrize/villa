@@ -41,15 +41,15 @@ def _run(cmd: list[str], label: str) -> None:
 
 def _write_binary_zarr(vol: np.ndarray, out_path: Path, chunk_size: int) -> None:
     """Write binary uint8 volume as zarr group with dataset '0'."""
-    store = zarr.DirectoryStore(str(out_path), dimension_separator="/")
-    root = zarr.group(store, overwrite=True)
-    root.create_dataset(
+    root = zarr.open_group(str(out_path), mode="w", zarr_format=2)
+    ds = root.create_array(
         "0",
-        data=vol,
+        shape=vol.shape,
         chunks=(chunk_size, chunk_size, chunk_size),
         dtype=np.uint8,
         overwrite=True,
     )
+    ds[:] = vol
     print(f"{TAG} binary zarr written: {out_path}  shape={vol.shape}", flush=True)
 
 
@@ -124,11 +124,27 @@ def _write_lasagna_zarr(
     chunk_size: int,
     pred_dt_u8: np.ndarray | None = None,
 ) -> None:
-    """Read ngrids x/0, y/0 + binary pred + ignore mask → write flat lasagna zarr.Array."""
-    # Read hemisphere-encoded normals from ngrids output
+    """Read ngrids x/0, y/0, z/0 + binary pred + ignore mask → write flat lasagna zarr.Array."""
+    # Read normals from ngrids output (raw, NOT hemisphere-encoded)
     ng = zarr.open(str(ngrids_zarr), mode="r")
     nx_vol = np.array(ng["x/0"])  # (Z_ds, Y_ds, X_ds) uint8
     ny_vol = np.array(ng["y/0"])
+    nz_vol = np.array(ng["z/0"])
+
+    # Apply +z hemisphere encoding: flip (nx, ny) where nz < 0
+    # vc_ngrids stores raw aligned normals; the optimizer expects hemisphere-encoded
+    # (nx, ny) with nz = sqrt(1 - nx² - ny²) >= 0.
+    nx_f = (nx_vol.astype(np.float32) - 128.0) / 127.0
+    ny_f = (ny_vol.astype(np.float32) - 128.0) / 127.0
+    nz_f = (nz_vol.astype(np.float32) - 128.0) / 127.0
+    flip = np.where(nz_f < 0, np.float32(-1.0), np.float32(1.0))
+    nx_f *= flip
+    ny_f *= flip
+    n_flipped = int((flip < 0).sum())
+    print(f"{TAG} hemisphere encoding: flipped {n_flipped}/{flip.size} normals "
+          f"({100.0*n_flipped/max(1,flip.size):.1f}%)", flush=True)
+    nx_vol = np.clip(np.round(nx_f * 127.0 + 128.0), 0, 255).astype(np.uint8)
+    ny_vol = np.clip(np.round(ny_f * 127.0 + 128.0), 0, 255).astype(np.uint8)
 
     # Downsample binary prediction to step resolution
     pred_ds = _downsample_any(binary, step)
@@ -165,13 +181,13 @@ def _write_lasagna_zarr(
     if output.exists():
         shutil.rmtree(output)
 
-    store = zarr.DirectoryStore(str(output), dimension_separator="/")
-    arr = zarr.open_array(
-        store,
+    arr = zarr.open(
+        str(output),
         mode="w",
         shape=out_vol.shape,
         chunks=(1, chunk_size, chunk_size, chunk_size),
         dtype=np.uint8,
+        zarr_format=2,
     )
     arr[:] = out_vol
     arr.attrs["preprocess_params"] = {

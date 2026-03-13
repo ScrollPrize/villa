@@ -292,7 +292,7 @@ def run_preprocess(
 		chunks=(1, chunk_sizes[0], chunk_sizes[1], chunk_sizes[2]),
 		dtype=np.uint8,
 		fill_value=0,
-		dimension_separator="/",
+		zarr_format=2,
 	)
 	arr.attrs["preprocess_params"] = {
 		"axis": axis,
@@ -1145,7 +1145,7 @@ def run_integrate_directions(
 		chunks=out_chunks,
 		dtype=np.uint8,
 		fill_value=0,
-		dimension_separator="/",
+		zarr_format=2,
 	)
 	out_params = dict(z_params)
 	out_params["channels"] = channel_names

@@ -223,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
         chunks=(cs, cs, cs),
         dtype=np.uint8,
         fill_value=0,
-        dimension_separator="/",
+        zarr_format=2,
     )
     arr[:] = labels_u8
     arr.attrs["n_components"] = n_final
@@ -237,15 +237,15 @@ def main(argv: list[str] | None = None) -> int:
         bin_path = Path(args.binary_zarr)
         print(f"[labels_to_cc] writing binary zarr to {bin_path}", flush=True)
         # vc_gen_normalgrids expects zarr Group with dataset "0" inside
-        store = zarr.DirectoryStore(str(bin_path), dimension_separator="/")
-        root = zarr.group(store, overwrite=True)
-        ds = root.create_dataset(
+        root = zarr.open_group(str(bin_path), mode="w", zarr_format=2)
+        ds = root.create_array(
             "0",
-            data=binary,
+            shape=binary.shape,
             chunks=(cs, cs, cs),
             dtype=np.uint8,
             overwrite=True,
         )
+        ds[:] = binary
         print(f"[labels_to_cc] binary zarr written  shape={ds.shape}  chunks={ds.chunks}", flush=True)
 
     # -- video --------------------------------------------------------------

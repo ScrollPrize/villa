@@ -278,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
         chunks=(cs, cs, cs),
         dtype=np.float32,
         fill_value=0.0,
-        dimension_separator="/",
+        zarr_format=2,
     )
     arr[:] = winding_ds
     arr.attrs["scaledown"] = step

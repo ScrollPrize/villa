@@ -17,6 +17,7 @@ import opt_loss_dir
 import opt_loss_smooth
 import opt_loss_step
 import opt_loss_winding_density
+import opt_loss_winding_volume
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +103,47 @@ def _write_obj_quad(path: Path, corners: np.ndarray, mtl_name: str) -> None:
 	path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _write_obj_multi_quad(path: Path,
+						  quads: list[tuple[np.ndarray, str]]) -> None:
+	"""Write multiple textured quads into a single OBJ, each with its own material.
+
+	quads: list of (corners(4,3), material_name) pairs.
+	Each material must have a corresponding .mtl file already written.
+	"""
+	stem = path.stem
+	lines = [f"mtllib {stem}.mtl"]
+	vi = 0  # running vertex count
+	for corners, mtl_name in quads:
+		lines.append(f"usemtl {mtl_name}")
+		for c in corners:
+			lines.append(f"v {c[0]:.6f} {c[1]:.6f} {c[2]:.6f}")
+		lines.append(f"vt 0.0 0.0")
+		lines.append(f"vt 1.0 0.0")
+		lines.append(f"vt 1.0 1.0")
+		lines.append(f"vt 0.0 1.0")
+		v1 = vi + 1  # OBJ is 1-indexed
+		lines.append(f"f {v1}/{v1} {v1+1}/{v1+1} {v1+2}/{v1+2}")
+		lines.append(f"f {v1}/{v1} {v1+2}/{v1+2} {v1+3}/{v1+3}")
+		vi += 4
+	path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_mtl_multi(path: Path,
+					 materials: list[tuple[str, str]]) -> None:
+	"""Write an MTL file with multiple materials.
+
+	materials: list of (material_name, texture_filename) pairs.
+	"""
+	blocks = []
+	for mat_name, tex_file in materials:
+		blocks.append(
+			f"newmtl {mat_name}\n"
+			f"Ka 1.0 1.0 1.0\nKd 1.0 1.0 1.0\nKs 0.0 0.0 0.0\n"
+			f"d 1.0\nillum 1\nmap_Kd {tex_file}"
+		)
+	path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # PNG writer (minimal, no PIL dependency)
 # ---------------------------------------------------------------------------
@@ -180,6 +222,32 @@ def _loss_to_png(path: Path, lm_2d: np.ndarray, mask_2d: np.ndarray | None) -> N
 # Mesh geometry helpers
 # ---------------------------------------------------------------------------
 
+def _filter_mesh(verts: np.ndarray, faces: np.ndarray,
+				 valid: np.ndarray, uvs: np.ndarray | None = None,
+				 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+	"""Remove faces with any invalid vertex and compact the index space.
+
+	verts: (V, 3), faces: (F, 3) 0-indexed, valid: (V,) bool, uvs: (V, 2)|None
+	Returns (verts', faces', uvs') with only valid geometry.
+	"""
+	# Keep faces where all 3 vertices are valid
+	face_ok = valid[faces[:, 0]] & valid[faces[:, 1]] & valid[faces[:, 2]]
+	faces = faces[face_ok]
+	if len(faces) == 0:
+		empty3 = np.zeros((0, 3), dtype=verts.dtype)
+		empty2 = np.zeros((0, 2), dtype=np.float32) if uvs is not None else None
+		return empty3, np.zeros((0, 3), dtype=np.int32), empty2
+	# Compact: remap old vertex indices → new contiguous indices
+	used = np.unique(faces.ravel())
+	remap = np.full(len(verts), -1, dtype=np.int32)
+	remap[used] = np.arange(len(used), dtype=np.int32)
+	return (
+		verts[used],
+		remap[faces],
+		uvs[used] if uvs is not None else None,
+	)
+
+
 def _triangulate_grid(D: int, H: int, W: int) -> np.ndarray:
 	"""Triangulate a D-layer (H, W) grid into triangle faces.
 
@@ -219,37 +287,71 @@ def _mesh_uvs(D: int, H: int, W: int) -> np.ndarray:
 # Volume slice helpers
 # ---------------------------------------------------------------------------
 
+def _slice_index(plane: str, shape_zyx: tuple[int, int, int],
+				 frac: float) -> int:
+	"""Return the voxel index along the sliced axis for a given fraction [0, 1]."""
+	Z, Y, X = shape_zyx
+	if plane == "xy":
+		return int(np.clip(frac * (Z - 1), 0, Z - 1))
+	elif plane == "xz":
+		return int(np.clip(frac * (Y - 1), 0, Y - 1))
+	elif plane == "yz":
+		return int(np.clip(frac * (X - 1), 0, X - 1))
+	raise ValueError(f"unknown plane: {plane}")
+
+
+def _take_slice(arr: np.ndarray, plane: str, idx: int) -> np.ndarray:
+	"""Extract a 2D slice from a (Z, Y, X) array at the given index."""
+	if plane == "xy":
+		return arr[idx, :, :]      # (Y, X)
+	elif plane == "xz":
+		return arr[:, idx, :]      # (Z, X)
+	elif plane == "yz":
+		return arr[:, :, idx]      # (Z, Y)
+	raise ValueError(f"unknown plane: {plane}")
+
+
 def _slice_texture(data: fit_data.FitData3D, plane: str,
-				   channel: str) -> np.ndarray:
+				   channel: str, frac: float = 0.5) -> np.ndarray:
 	"""Read a volume slice directly at native voxel resolution.
 
 	plane: "xy", "xz", or "yz"
+	frac: position along the sliced axis, 0.0 = start, 1.0 = end
 	Returns (H, W, 3) uint8 at exact data resolution (no interpolation).
 	"""
 	vol = getattr(data, channel)  # (1, 1, Z, Y, X) uint8
 	arr = vol.squeeze().cpu().numpy()  # (Z, Y, X)
-	Z, Y, X = arr.shape
-	cz, cy, cx = Z // 2, Y // 2, X // 2
-	if plane == "xy":
-		slc = arr[cz, :, :]      # (Y, X)
-	elif plane == "xz":
-		slc = arr[:, cy, :]      # (Z, X)
-	elif plane == "yz":
-		slc = arr[:, :, cx]      # (Z, Y)
-	else:
-		raise ValueError(f"unknown plane: {plane}")
+	idx = _slice_index(plane, arr.shape, frac)
+	slc = _take_slice(arr, plane, idx)
 	gray = slc.astype(np.uint8)
 	return np.stack([gray, gray, gray], axis=-1)[::-1]
 
 
+def _slice_winding_volume(data: fit_data.FitData3D, plane: str,
+						  frac: float = 0.5) -> np.ndarray:
+	"""Read a slice from the winding volume tensor and colormap to RGB."""
+	wv = data.winding_volume  # (1, 1, Z, Y, X) float32
+	arr = wv.squeeze().cpu().numpy()  # (Z, Y, X)
+	idx = _slice_index(plane, arr.shape, frac)
+	slc = _take_slice(arr, plane, idx)
+	# Normalize: winding values are typically in [0, D+1] range
+	vmin, vmax = float(slc.min()), float(slc.max())
+	if vmax - vmin < 1e-8:
+		vmax = vmin + 1.0
+	normed = (slc - vmin) / (vmax - vmin)
+	return _viridis(normed)[::-1]
+
+
 def _slice_corners(plane: str, bbox_min: np.ndarray, bbox_max: np.ndarray,
-				   center: np.ndarray) -> np.ndarray:
+				   frac: float = 0.5) -> np.ndarray:
 	"""Return 4 corners of a slice quad in 3D fullres coords.
 
+	frac: position along the sliced axis, 0.0 = bbox_min, 1.0 = bbox_max.
 	Order: (0,0), (1,0), (1,1), (0,1) for UV mapping.
 	"""
+	pos = bbox_min + frac * (bbox_max - bbox_min)
 	if plane == "xy":
-		z = center[2]
+		z = pos[2]
 		return np.array([
 			[bbox_min[0], bbox_min[1], z],
 			[bbox_max[0], bbox_min[1], z],
@@ -257,7 +359,7 @@ def _slice_corners(plane: str, bbox_min: np.ndarray, bbox_max: np.ndarray,
 			[bbox_min[0], bbox_max[1], z],
 		], dtype=np.float32)
 	elif plane == "xz":
-		y = center[1]
+		y = pos[1]
 		return np.array([
 			[bbox_min[0], y, bbox_min[2]],
 			[bbox_max[0], y, bbox_min[2]],
@@ -265,7 +367,7 @@ def _slice_corners(plane: str, bbox_min: np.ndarray, bbox_max: np.ndarray,
 			[bbox_min[0], y, bbox_max[2]],
 		], dtype=np.float32)
 	elif plane == "yz":
-		x = center[0]
+		x = pos[0]
 		return np.array([
 			[x, bbox_min[1], bbox_min[2]],
 			[x, bbox_max[1], bbox_min[2]],
@@ -282,6 +384,7 @@ _LOSS_FUNCS = {
 	"step": opt_loss_step.step_loss,
 	"smooth": opt_loss_smooth.smooth_loss,
 	"winding_density": opt_loss_winding_density.winding_density_loss,
+	"winding_vol": opt_loss_winding_volume.winding_volume_loss,
 	"normal": opt_loss_dir.normal_loss,
 }
 
@@ -300,6 +403,7 @@ def export_vis_obj(
 	losses: list[str],
 	include_mesh: bool,
 	include_connections: bool,
+	winding_volume_path: str | None = None,
 	device: str = "cuda",
 ) -> None:
 	"""Export multi-layer OBJ visualization files."""
@@ -317,6 +421,23 @@ def export_vis_obj(
 	data = fit_data.load_3d_for_model(path=data_path, device=dev, model=mdl,
 									cuda_gridsample=dev.type == "cuda")
 
+	# Load winding volume if provided
+	if winding_volume_path is not None:
+		import dataclasses
+		print(f"[export_vis] loading winding volume from {winding_volume_path}", flush=True)
+		# Derive crop from data's origin/spacing/size to match the loaded CT crop
+		Z_d, Y_d, X_d = data.size
+		ox, oy, oz = data.origin_fullres
+		sx, sy, sz = data.spacing
+		crop_wv = (int(ox), int(oy), int(oz),
+				   int(X_d * sx), int(Y_d * sy), int(Z_d * sz))
+		wv_t = fit_data.load_winding_volume(
+			path=winding_volume_path, device=dev,
+			crop=crop_wv, downscale=sx,
+		)
+		data = dataclasses.replace(data, winding_volume=wv_t)
+		print(f"[export_vis] winding volume shape: {wv_t.shape}", flush=True)
+
 	# Forward pass
 	print("[export_vis] running forward pass", flush=True)
 	with torch.no_grad():
@@ -325,6 +446,13 @@ def export_vis_obj(
 	xyz_lr = res.xyz_lr.detach().cpu().numpy()  # (D, Hm, Wm, 3)
 	D, Hm, Wm, _ = xyz_lr.shape
 	print(f"[export_vis] mesh shape: D={D}, Hm={Hm}, Wm={Wm}", flush=True)
+
+	# Per-vertex validity: grad_mag > 0 at vertex positions
+	with torch.no_grad():
+		sampled_gm = data.grid_sample_fullres(res.xyz_lr.detach()).grad_mag  # (D,1,Hm,Wm)
+	vert_valid = (sampled_gm.squeeze(1).cpu().numpy() > 0).reshape(-1)  # (D*Hm*Wm,)
+	n_valid = int(vert_valid.sum())
+	print(f"[export_vis] valid vertices: {n_valid}/{len(vert_valid)}", flush=True)
 
 	# Mesh bounding box in fullres coords
 	bbox_min = xyz_lr.reshape(-1, 3).min(axis=0)
@@ -346,19 +474,26 @@ def export_vis_obj(
 		print("[export_vis] writing mesh.obj", flush=True)
 		verts = xyz_lr.reshape(-1, 3)
 		faces = _triangulate_grid(D, Hm, Wm)
-		_write_obj_mesh(out / "mesh.obj", verts, faces, uvs=None, mtl_name=None)
+		verts_f, faces_f, _ = _filter_mesh(verts, faces, vert_valid)
+		_write_obj_mesh(out / "mesh.obj", verts_f, faces_f, uvs=None, mtl_name=None)
+		# Unfiltered mesh (all vertices, no validity masking)
+		print("[export_vis] writing mesh_full.obj", flush=True)
+		_write_obj_mesh(out / "mesh_full.obj", verts, faces, uvs=None, mtl_name=None)
 
 	# ------ Connections ------
 	if include_connections:
 		print("[export_vis] writing connections.obj", flush=True)
 		xy_conn = res.xy_conn.detach().cpu().numpy()  # (D, Hm, Wm, 3, 3)
 		mask_conn = res.mask_conn.detach().cpu().numpy()  # (D, 1, Hm, Wm, 3)
+		vv = vert_valid.reshape(D, Hm, Wm)
 		conn_verts: list[np.ndarray] = []
 		conn_lines: list[tuple[int, int]] = []
 		vi = 0
 		for d in range(D):
 			for h in range(Hm):
 				for w in range(Wm):
+					if not vv[d, h, w]:
+						continue
 					center_pt = xy_conn[d, h, w, :, 1]  # (3,) xyz of self
 					# prev connection
 					if mask_conn[d, 0, h, w, 0] > 0.5 and mask_conn[d, 0, h, w, 1] > 0.5:
@@ -380,30 +515,35 @@ def export_vis_obj(
 		else:
 			print("[export_vis] no valid connections to write", flush=True)
 
-	# ------ Volume slices ------
+	# ------ Volume slices (start, center, end in one OBJ per plane+channel) ------
+	_SLICE_POSITIONS = [("start", 0.1), ("mid", 0.5), ("end", 0.9)]
 	for plane in slices:
 		for channel in channels:
 			vol = getattr(data, channel, None)
 			if vol is None:
 				print(f"[export_vis] skipping slice {plane}/{channel} (not in data)", flush=True)
 				continue
-			name = f"slice_{plane}_{channel}"
-			print(f"[export_vis] writing {name}", flush=True)
-			# Texture (native voxel resolution, no scaling)
-			tex = _slice_texture(data, plane, channel)
-			png_name = f"{name}.png"
-			_write_png(out / png_name, tex)
-			# MTL
-			_write_mtl(out / f"{name}.mtl", name, png_name)
-			# OBJ quad
-			corners = _slice_corners(plane, data_min, data_max, data_center)
-			_write_obj_quad(out / f"{name}.obj", corners, name)
+			obj_name = f"slice_{plane}_{channel}"
+			print(f"[export_vis] writing {obj_name} (3 positions)", flush=True)
+			quads: list[tuple[np.ndarray, str]] = []
+			materials: list[tuple[str, str]] = []
+			for pos_label, frac in _SLICE_POSITIONS:
+				mat_name = f"{obj_name}_{pos_label}"
+				png_name = f"{mat_name}.png"
+				tex = _slice_texture(data, plane, channel, frac=frac)
+				_write_png(out / png_name, tex)
+				corners = _slice_corners(plane, data_min, data_max, frac=frac)
+				quads.append((corners, mat_name))
+				materials.append((mat_name, png_name))
+			_write_mtl_multi(out / f"{obj_name}.mtl", materials)
+			_write_obj_multi_quad(out / f"{obj_name}.obj", quads)
 
 	# ------ Loss maps ------
 	if losses:
 		verts_flat = xyz_lr.reshape(-1, 3)
 		faces = _triangulate_grid(D, Hm, Wm)
 		uvs = _mesh_uvs(D, Hm, Wm)
+		verts_flat, faces, uvs = _filter_mesh(verts_flat, faces, vert_valid, uvs)
 
 		for loss_name in losses:
 			print(f"[export_vis] computing loss: {loss_name}", flush=True)
@@ -441,6 +581,60 @@ def export_vis_obj(
 			_write_mtl(out / f"{obj_name}.mtl", obj_name, png_name)
 			_write_obj_mesh(out / f"{obj_name}.obj", verts_flat, faces, uvs, obj_name)
 
+	# ------ Winding volume diagnostics ------
+	if data.winding_volume is not None:
+		# Winding volume slices (start, center, end in one OBJ per plane)
+		for plane in slices:
+			obj_name = f"slice_{plane}_winding"
+			print(f"[export_vis] writing {obj_name} (3 positions)", flush=True)
+			quads: list[tuple[np.ndarray, str]] = []
+			materials: list[tuple[str, str]] = []
+			for pos_label, frac in _SLICE_POSITIONS:
+				mat_name = f"{obj_name}_{pos_label}"
+				png_name = f"{mat_name}.png"
+				tex = _slice_winding_volume(data, plane, frac=frac)
+				_write_png(out / png_name, tex)
+				corners = _slice_corners(plane, data_min, data_max, frac=frac)
+				quads.append((corners, mat_name))
+				materials.append((mat_name, png_name))
+			_write_mtl_multi(out / f"{obj_name}.mtl", materials)
+			_write_obj_multi_quad(out / f"{obj_name}.obj", quads)
+
+		# Diagnostic meshes: winding value and winding mask
+		print("[export_vis] computing winding diagnostics", flush=True)
+		with torch.no_grad():
+			sampled_wv = opt_loss_winding_volume._sample_winding_volume(res=res)  # (D, 1, Hm, Wm)
+
+		verts_flat = xyz_lr.reshape(-1, 3)
+		faces = _triangulate_grid(D, Hm, Wm)
+		uvs = _mesh_uvs(D, Hm, Wm)
+		verts_diag, faces_diag, uvs_diag = _filter_mesh(verts_flat, faces, vert_valid, uvs)
+
+		# Winding value map: viridis colormapped sampled winding volume
+		wv_vals = sampled_wv.squeeze(1).cpu().numpy()  # (D, Hm, Wm)
+		wv_stacked = wv_vals.reshape(-1, Wm)  # (D*Hm, Wm)
+		tex_h, tex_w = D * Hm, Wm
+		vmin_wv, vmax_wv = float(wv_stacked.min()), float(wv_stacked.max())
+		if vmax_wv - vmin_wv < 1e-8:
+			vmax_wv = vmin_wv + 1.0
+		normed_wv = (wv_stacked - vmin_wv) / (vmax_wv - vmin_wv)
+		rgb_wv = _viridis(normed_wv)
+		_write_png(out / "winding_value.png", rgb_wv)
+		_write_mtl(out / "winding_value.mtl", "winding_value", "winding_value.png")
+		_write_obj_mesh(out / "winding_value.obj", verts_diag, faces_diag, uvs_diag, "winding_value")
+		print(f"[export_vis] winding value range: [{vmin_wv:.2f}, {vmax_wv:.2f}]", flush=True)
+
+		# Winding mask map: green = valid (sampled >= 1 AND mask_lr), red = invalid
+		wv_valid = (sampled_wv.detach() >= 1.0).float()
+		mask_combined = (res.mask_lr * wv_valid).squeeze(1).cpu().numpy()  # (D, Hm, Wm)
+		mask_stacked = mask_combined.reshape(-1, Wm)  # (D*Hm, Wm)
+		rgb_mask = np.zeros((tex_h, tex_w, 3), dtype=np.uint8)
+		rgb_mask[mask_stacked > 0.5] = [0, 200, 0]    # green = valid
+		rgb_mask[mask_stacked <= 0.5] = [100, 0, 0]    # dark red = invalid
+		_write_png(out / "winding_mask.png", rgb_mask)
+		_write_mtl(out / "winding_mask.mtl", "winding_mask", "winding_mask.png")
+		_write_obj_mesh(out / "winding_mask.obj", verts_diag, faces_diag, uvs_diag, "winding_mask")
+
 	print(f"[export_vis] done. Output: {output_dir}", flush=True)
 
 
@@ -457,6 +651,8 @@ if __name__ == "__main__":
 						help="Volume channels to slice (default: cos pred_dt)")
 	parser.add_argument("--losses", nargs="*", default=["normal", "step"],
 						help="Loss maps to export (default: normal step)")
+	parser.add_argument("--winding-volume", default=None,
+						help="Path to winding volume zarr (enables winding diagnostics)")
 	parser.add_argument("--no-mesh", action="store_true", help="Skip mesh export")
 	parser.add_argument("--no-connections", action="store_true", help="Skip connection lines")
 	parser.add_argument("--device", default="cpu", help="Torch device (default: cpu)")
@@ -471,5 +667,6 @@ if __name__ == "__main__":
 		losses=args.losses,
 		include_mesh=not args.no_mesh,
 		include_connections=not args.no_connections,
+		winding_volume_path=args.winding_volume,
 		device=args.device,
 	)
