@@ -548,7 +548,6 @@ class PatchEmbedDeeper(nn.Module):
         super().__init__()
         self.patch_size = tuple(int(p) for p in patch_size)
         self.ndim = len(self.patch_size)
-        self._support_cache: dict[tuple[tuple[int, ...], str], torch.Tensor] = {}
         if self.ndim not in (2, 3):
             raise ValueError(f"PatchEmbedDeeper only supports 2D or 3D, got ndim={self.ndim}")
         if any(not _is_power_of_two(size) for size in self.patch_size):
@@ -672,6 +671,7 @@ class PatchEmbedDeeper(nn.Module):
             padding=final_pad,
             padding_mode="reflect",
         )
+        self._patch_halo: tuple[int, ...] | None = None
 
     def _avg_pool_support(
         self,
@@ -737,23 +737,30 @@ class PatchEmbedDeeper(nn.Module):
         raise TypeError(f"Unsupported support propagation module: {type(module).__name__}")
 
     @torch.no_grad()
-    def get_patch_support(self, x: torch.Tensor) -> torch.Tensor:
-        spatial_shape = tuple(int(dim) for dim in x.shape[2:])
-        cache_key = (spatial_shape, str(x.device))
-        cached = self._support_cache.get(cache_key)
-        if cached is None or cached.device != x.device:
-            support = torch.ones((1, 1, *spatial_shape), device=x.device, dtype=torch.float32)
+    def patch_halo(self) -> tuple[int, ...]:
+        if self._patch_halo is None:
+            probe_patch_shape = tuple(max(13, 2 * (len(self.stages) + 2) + 1) for _ in range(self.ndim))
+            probe_spatial_shape = tuple(
+                patch_count * patch_size for patch_count, patch_size in zip(probe_patch_shape, self.patch_size)
+            )
+            support = torch.ones((1, 1, *probe_spatial_shape), dtype=torch.float32)
             support = self._support_from_module(self.stem, support)
             for stage in self.stages:
                 support = self._support_from_module(stage, support)
             support = self._support_from_conv(support, self.final_proj)
             support = support / support.amax().clamp(min=torch.finfo(support.dtype).eps)
-            cached = support.detach().clamp_(0.0, 1.0)
-            self._support_cache[cache_key] = cached
-        return cached
+            full_support = support[0, 0] >= (1.0 - 1e-6)
+            indices = torch.nonzero(full_support, as_tuple=False)
+            if indices.numel() == 0:
+                raise RuntimeError("PatchEmbedDeeper could not determine a full-support interior patch region.")
 
-    def forward_with_support(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.forward(x), self.get_patch_support(x)
+            halo: list[int] = []
+            for axis, axis_size in enumerate(full_support.shape):
+                axis_min = int(indices[:, axis].min().item())
+                axis_max = int(indices[:, axis].max().item())
+                halo.append(min(axis_min, axis_size - axis_max - 1))
+            self._patch_halo = tuple(halo)
+        return self._patch_halo
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
