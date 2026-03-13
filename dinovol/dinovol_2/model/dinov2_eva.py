@@ -318,6 +318,9 @@ class Eva(nn.Module):
         self.embedding_type = str(embedding_type).lower()
         self.global_crops_size = [global_crops_size] * 3 if isinstance(global_crops_size, int) else global_crops_size
         self.local_crops_size = [local_crops_size] * 3 if isinstance(local_crops_size, int) else local_crops_size
+        self.global_input_size = tuple(int(size) for size in self.global_crops_size)
+        self.local_input_size = tuple(int(size) for size in self.local_crops_size)
+        self.deeper_embed_patch_halo = tuple(0 for _ in range(self.ndim))
 
         if self.embedding_type == "deeper":
             self._assert_patch_aligned(
@@ -393,9 +396,17 @@ class Eva(nn.Module):
                 ref_feat_shape=self.local_ref_feat_shape,
                 **rope_kwargs
             )
+            # Keep a band-based generator for shapes outside the configured global/local crop grids.
+            self.dynamic_rope = rope_impl(
+                rope_dim,
+                in_pixels=False,
+                ref_feat_shape=self.global_ref_feat_shape,
+                **rope_kwargs
+            )
         else:
             self.global_rope = None
             self.local_rope = None
+            self.dynamic_rope = None
         
         if drop_path_uniform is True:
             dpr = [drop_path_rate] * depth
@@ -501,9 +512,7 @@ class Eva(nn.Module):
                     target_size=target_size,
                     num_prefix_tokens=self.num_class_tokens
                 )
-            rot_pos_embed = self.local_rope.get_embed() if self.local_rope is not None else None
-        else:
-            rot_pos_embed = self.global_rope.get_embed() if self.global_rope is not None else None
+        rot_pos_embed = self._get_rot_pos_embed(target_size)
         
         # Add interpolated positional embeddings
         if pos_embed is not None:
@@ -519,6 +528,15 @@ class Eva(nn.Module):
         x = self.pos_drop(x)
         
         return x, rot_pos_embed
+
+    def _get_rot_pos_embed(self, target_size: Tuple[int, ...]) -> Optional[torch.Tensor]:
+        if self.global_rope is None:
+            return None
+        if target_size == tuple(self.global_ref_feat_shape):
+            return self.global_rope.get_embed()
+        if target_size == tuple(self.local_ref_feat_shape):
+            return self.local_rope.get_embed()
+        return self.dynamic_rope.get_embed(shape=target_size)
     
     def interpolate_pos_encoding_nd(
             self,
@@ -575,44 +593,75 @@ class Eva(nn.Module):
         pos_embed = pos_embed.to(previous_dtype)
 
         return pos_embed
+
+    def _resolve_target_spatial_shape(self, spatial: tuple[int, ...], *, view_kind: str) -> tuple[int, ...]:
+        spatial = tuple(int(dim) for dim in spatial)
+        if view_kind == "global":
+            target = tuple(int(dim) for dim in self.global_crops_size)
+            input_size = tuple(int(dim) for dim in self.global_input_size)
+        elif view_kind == "local":
+            target = tuple(int(dim) for dim in self.local_crops_size)
+            input_size = tuple(int(dim) for dim in self.local_input_size)
+        else:
+            raise ValueError(f"unknown view_kind={view_kind!r}")
+
+        if spatial == input_size or spatial == target:
+            return target
+        raise ValueError(
+            f"unexpected input shape {spatial} for embedding_type={self.embedding_type!r} and view_kind={view_kind!r}; "
+            f"expected {input_size} or {target}"
+        )
+
+    def _crop_embedded_grid(self, x: torch.Tensor, target_spatial: tuple[int, ...]) -> torch.Tensor:
+        target_patch_shape = tuple(int(size) // int(patch) for size, patch in zip(target_spatial, self.patch_size))
+        current_patch_shape = tuple(int(dim) for dim in x.shape[2:])
+        if current_patch_shape == target_patch_shape:
+            return x
+
+        starts = []
+        for current, target in zip(current_patch_shape, target_patch_shape):
+            delta = current - target
+            if delta < 0 or delta % 2 != 0:
+                raise ValueError(
+                    f"cannot center-crop embedded grid from {current_patch_shape} to {target_patch_shape}"
+                )
+            starts.append(delta // 2)
+        slices = tuple(slice(start, start + size) for start, size in zip(starts, target_patch_shape))
+        return x[(slice(None), slice(None), *slices)]
     
-    def prepare_tokens_with_masks(self, x, masks=None):
+    def prepare_tokens_with_masks(self, x, masks=None, *, view_kind: str = "global"):
         spatial = tuple(x.shape[2:])
         if self.embedding_type == "deeper":
             self._assert_patch_aligned(spatial, tuple(self.patch_size), context="input shape")
-            x, patch_support = self.down_projection.forward_with_support(x)
+            target_spatial = self._resolve_target_spatial_shape(spatial, view_kind=view_kind)
+            x = self.down_projection(x)
+            x = self._crop_embedded_grid(x, target_spatial)
         else:
             x = self.down_projection(x)
-            patch_support = None
+            target_spatial = spatial
         if self.ndim == 2:
             x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
-            if patch_support is not None:
-                patch_support = patch_support.flatten(2).squeeze(1).contiguous()
         else:
             x = rearrange(x, 'b c d h w -> b (d h w) c').contiguous()
-            if patch_support is not None:
-                patch_support = patch_support.flatten(2).squeeze(1).contiguous()
-        if patch_support is not None:
-            patch_support = patch_support.expand(x.shape[0], -1).contiguous()
         
         if masks is not None:
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype), x)
         
-        x, rot_pos_embed = self._pos_embed(x, *spatial)
+        x, rot_pos_embed = self._pos_embed(x, *target_spatial)
         
-        return x, rot_pos_embed, patch_support
+        return x, rot_pos_embed
     
-    def forward_features_list(self, x_list, masks_list):
+    def forward_features_list(self, x_list, masks_list, *, view_kind: str = "global"):
         if not isinstance(x_list, list):
-            return self.forward_features(x_list, masks_list)
+            return self.forward_features(x_list, masks_list, view_kind=view_kind)
         output = []
         for x, masks in zip(x_list, masks_list):
-            x_out = self.forward_features(x, masks)
+            x_out = self.forward_features(x, masks, view_kind=view_kind)
             output.append(x_out)
         return output
     
-    def forward_features(self, x, masks=None):
-        x, rot_pos_embed, patch_support = self.prepare_tokens_with_masks(x, masks)
+    def forward_features(self, x, masks=None, *, view_kind: str = "global"):
+        x, rot_pos_embed = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
         for blk in self.blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
                 x = checkpoint(blk, x, rope=rot_pos_embed)
@@ -626,12 +675,10 @@ class Eva(nn.Module):
             "x_prenorm": x,
             "masks": masks,
         }
-        if patch_support is not None:
-            outputs["x_patch_support"] = patch_support.to(x.dtype)
         return outputs
     
-    def forward(self, x, masks=None, is_training=True):
-        return self.forward_features_list(x, masks)
+    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
+        return self.forward_features_list(x, masks, view_kind=view_kind)
     
     def load_pretrained_weights(self, state_dict, backbone_only=False, unchunk=False):
         if isinstance(state_dict, str):
@@ -719,8 +766,8 @@ class EvaWithChunking(Eva):
             chunks.append(block_chunk)
         self.blocks = nn.ModuleList(chunks)
     
-    def forward_features(self, x, masks=None):
-        x, rot_pos_embed, patch_support = self.prepare_tokens_with_masks(x, masks)
+    def forward_features(self, x, masks=None, *, view_kind: str = "global"):
+        x, rot_pos_embed = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
         
         if self.chunked_blocks:
             for chunk in self.blocks:
@@ -743,12 +790,10 @@ class EvaWithChunking(Eva):
             "x_prenorm": x,
             "masks": masks,
         }
-        if patch_support is not None:
-            outputs["x_patch_support"] = patch_support.to(x.dtype)
         return outputs
     
-    def forward(self, x, masks=None, is_training=True):
-        return self.forward_features_list(x, masks)
+    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
+        return self.forward_features_list(x, masks, view_kind=view_kind)
 
 
 class Dinov2PrimusEncL(Eva):
