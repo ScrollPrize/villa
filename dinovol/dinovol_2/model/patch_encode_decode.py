@@ -2,6 +2,7 @@ from typing import Literal, Optional, Tuple, List, Union, Type
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.nn.modules.conv import _ConvNd, _ConvTransposeNd
 from torch.nn.modules.dropout import _DropoutNd
@@ -547,6 +548,7 @@ class PatchEmbedDeeper(nn.Module):
         super().__init__()
         self.patch_size = tuple(int(p) for p in patch_size)
         self.ndim = len(self.patch_size)
+        self._support_cache: dict[tuple[tuple[int, ...], str], torch.Tensor] = {}
         if self.ndim not in (2, 3):
             raise ValueError(f"PatchEmbedDeeper only supports 2D or 3D, got ndim={self.ndim}")
         if any(not _is_power_of_two(size) for size in self.patch_size):
@@ -670,6 +672,88 @@ class PatchEmbedDeeper(nn.Module):
             padding=final_pad,
             padding_mode="reflect",
         )
+
+    def _avg_pool_support(
+        self,
+        support: torch.Tensor,
+        *,
+        kernel_size: Union[int, tuple[int, ...], list[int]],
+        stride: Union[int, tuple[int, ...], list[int]],
+        padding: Union[int, tuple[int, ...], list[int]],
+    ) -> torch.Tensor:
+        pool = F.avg_pool2d if self.ndim == 2 else F.avg_pool3d
+        return pool(
+            support,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            ceil_mode=False,
+            count_include_pad=True,
+        )
+
+    def _support_from_conv(self, support: torch.Tensor, conv: _ConvNd) -> torch.Tensor:
+        return self._avg_pool_support(
+            support,
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=conv.padding,
+        )
+
+    def _support_from_module(self, module: nn.Module, support: torch.Tensor) -> torch.Tensor:
+        if isinstance(module, ConvDropoutNormReLU):
+            return self._support_from_conv(support, module.conv)
+        if isinstance(module, StackedConvBlocks):
+            for block in module.convs:
+                support = self._support_from_module(block, support)
+            return support
+        if isinstance(module, BasicBlockD):
+            residual = self._support_from_module(module.skip, support)
+            main = self._support_from_module(module.conv1, support)
+            main = self._support_from_module(module.conv2, main)
+            return 0.5 * (main + residual)
+        if isinstance(module, BottleneckD):
+            residual = self._support_from_module(module.skip, support)
+            main = self._support_from_module(module.conv1, support)
+            main = self._support_from_module(module.conv2, main)
+            main = self._support_from_module(module.conv3, main)
+            return 0.5 * (main + residual)
+        if isinstance(module, StackedResidualBlocks):
+            for block in module.blocks:
+                support = self._support_from_module(block, support)
+            return support
+        if isinstance(module, (nn.AvgPool2d, nn.AvgPool3d)):
+            return self._avg_pool_support(
+                support,
+                kernel_size=module.kernel_size,
+                stride=module.stride,
+                padding=module.padding,
+            )
+        if isinstance(module, (nn.Identity, nn.InstanceNorm2d, nn.InstanceNorm3d, nn.ReLU, nn.LeakyReLU)):
+            return support
+        if isinstance(module, nn.Sequential):
+            for submodule in module:
+                support = self._support_from_module(submodule, support)
+            return support
+        raise TypeError(f"Unsupported support propagation module: {type(module).__name__}")
+
+    @torch.no_grad()
+    def get_patch_support(self, x: torch.Tensor) -> torch.Tensor:
+        spatial_shape = tuple(int(dim) for dim in x.shape[2:])
+        cache_key = (spatial_shape, str(x.device))
+        cached = self._support_cache.get(cache_key)
+        if cached is None or cached.device != x.device:
+            support = torch.ones((1, 1, *spatial_shape), device=x.device, dtype=torch.float32)
+            support = self._support_from_module(self.stem, support)
+            for stage in self.stages:
+                support = self._support_from_module(stage, support)
+            support = self._support_from_conv(support, self.final_proj)
+            support = support / support.amax().clamp(min=torch.finfo(support.dtype).eps)
+            cached = support.detach().clamp_(0.0, 1.0)
+            self._support_cache[cache_key] = cached
+        return cached
+
+    def forward_with_support(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward(x), self.get_patch_support(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
