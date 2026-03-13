@@ -18,6 +18,7 @@ class DataConfig:
 	model_w: int | None                                  # model width in fullres voxels
 	model_h: int | None                                  # model height in fullres voxels
 	windings: int | None                                 # number of windings
+	winding_volume: str | None                           # path to winding volume zarr
 	cuda_gridsample: bool                                # use custom CUDA uint8 grid_sample kernel
 
 
@@ -38,6 +39,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
 		help="Model height in fullres voxels")
 	g.add_argument("--windings", type=int, default=None,
 		help="Number of windings")
+	g.add_argument("--winding-volume", default=None,
+		help="Path to winding volume zarr (float32, from labels_to_winding_volume.py)")
 	g.add_argument("--cuda-gridsample", type=int, default=1,
 		help="Use custom CUDA uint8 grid_sample kernel (1=yes, 0=fallback to PyTorch F.grid_sample)")
 
@@ -58,6 +61,9 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 	model_w = None if getattr(args, "model_w", None) is None else int(args.model_w)
 	model_h = None if getattr(args, "model_h", None) is None else int(args.model_h)
 	windings = None if getattr(args, "windings", None) is None else int(args.windings)
+	winding_volume = getattr(args, "winding_volume", None)
+	if winding_volume is not None:
+		winding_volume = str(winding_volume)
 	return DataConfig(
 		input=str(args.input),
 		device=str(args.device),
@@ -67,6 +73,7 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		model_w=model_w,
 		model_h=model_h,
 		windings=windings,
+		winding_volume=winding_volume,
 		cuda_gridsample=bool(int(getattr(args, "cuda_gridsample", 1))),
 	)
 

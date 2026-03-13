@@ -25,6 +25,7 @@ class FitData3D:
 	ny: torch.Tensor               # (1, 1, Z, Y, X) uint8 on GPU — hemisphere-encoded normal y
 	pred_dt: torch.Tensor | None
 	corr_points: CorrPoints3D | None
+	winding_volume: torch.Tensor | None  # (1, 1, Z, Y, X) float32 on GPU
 	origin_fullres: tuple[float, float, float]  # (x0, y0, z0) in fullres voxels
 	spacing: tuple[float, float, float]          # (sx, sy, sz) voxel size in fullres units
 	grad_mag_scale: float = 255.0                # encoding scale for grad_mag channel
@@ -77,6 +78,7 @@ class FitData3D:
 			ny=_gs(self.ny, lambda t: (t - 128.0) / 127.0),
 			pred_dt=_gs(self.pred_dt, lambda t: t.sqrt()),
 			corr_points=self.corr_points,
+			winding_volume=self.winding_volume,
 			origin_fullres=self.origin_fullres,
 			spacing=self.spacing,
 			grad_mag_scale=self.grad_mag_scale,
@@ -107,11 +109,48 @@ class FitData3D:
 			ny=_gs(self.ny, lambda t: (t - 128.0) / 127.0),
 			pred_dt=_gs(self.pred_dt, lambda t: t.sqrt()),
 			corr_points=self.corr_points,
+			winding_volume=self.winding_volume,
 			origin_fullres=self.origin_fullres,
 			spacing=self.spacing,
 			grad_mag_scale=self.grad_mag_scale,
 			cuda_gridsample=self.cuda_gridsample,
 		)
+
+
+def load_winding_volume(
+	*,
+	path: str,
+	device: torch.device,
+	crop: tuple[int, int, int, int, int, int] | None,
+	downscale: float,
+) -> torch.Tensor:
+	"""Load winding volume zarr, apply crop, return (1, 1, Z, Y, X) float32 tensor."""
+	p = Path(path)
+	zsrc = zarr.open(str(p), mode="r")
+	wv_scaledown = int(zsrc.attrs.get("scaledown", 1))
+	ds_i = max(1, int(round(downscale)))
+
+	Z_all, Y_all, X_all = (int(v) for v in zsrc.shape)
+
+	if crop is not None:
+		x0, y0, z0, cw, ch, cd = (int(v) for v in crop)
+		x0v = max(0, x0 // ds_i)
+		y0v = max(0, y0 // ds_i)
+		z0v = max(0, z0 // ds_i)
+		x1v = min(X_all, (x0 + cw + ds_i - 1) // ds_i)
+		y1v = min(Y_all, (y0 + ch + ds_i - 1) // ds_i)
+		z1v = min(Z_all, (z0 + cd + ds_i - 1) // ds_i)
+	else:
+		x0v, y0v, z0v = 0, 0, 0
+		x1v, y1v, z1v = X_all, Y_all, Z_all
+
+	print(f"[fit_data] load_winding_volume: zarr shape=({Z_all},{Y_all},{X_all}) "
+		  f"scaledown={wv_scaledown} reading z=[{z0v}:{z1v}] y=[{y0v}:{y1v}] x=[{x0v}:{x1v}]",
+		  flush=True)
+
+	arr = np.asarray(zsrc[z0v:z1v, y0v:y1v, x0v:x1v])
+	t = torch.from_numpy(arr).to(device=device, dtype=torch.float32)
+	return t.unsqueeze(0).unsqueeze(0)  # (1, 1, Z, Y, X)
 
 
 def auto_crop_for_mesh(
@@ -428,6 +467,7 @@ def load_3d(
 		ny=ny_t,
 		pred_dt=pred_dt_t,
 		corr_points=None,
+		winding_volume=None,
 		origin_fullres=origin_fullres,
 		spacing=spacing,
 		grad_mag_scale=gmag_enc,

@@ -268,6 +268,15 @@ def main(argv: list[str] | None = None) -> int:
 		mdl.params = dataclasses.replace(mdl.params, volume_extent=volume_extent)
 		if corr_points_3d is not None:
 			d = dataclasses.replace(d, corr_points=corr_points_3d)
+		if data_cfg.winding_volume is not None:
+			ox, oy, oz = d.origin_fullres
+			sx, sy, sz = d.spacing
+			wv_crop = (int(ox), int(oy), int(oz),
+					   int(X * sx), int(Y * sy), int(Z * sz))
+			wv_t = fit_data.load_winding_volume(
+				path=data_cfg.winding_volume, device=device,
+				crop=wv_crop, downscale=scaledown)
+			d = dataclasses.replace(d, winding_volume=wv_t)
 		return d
 
 	data = _load_data()
@@ -277,8 +286,11 @@ def main(argv: list[str] | None = None) -> int:
 	_data_bytes = sum(t.nbytes for t in [data.cos, data.grad_mag, data.nx, data.ny] if t is not None)
 	if data.pred_dt is not None:
 		_data_bytes += data.pred_dt.nbytes
+	if data.winding_volume is not None:
+		_data_bytes += data.winding_volume.nbytes
 	print(f"[fit] data: size=({Z},{Y},{X}) origin={data.origin_fullres} spacing={data.spacing} "
-		  f"pred_dt={data.pred_dt is not None} corr_points={data.corr_points is not None} "
+		  f"pred_dt={data.pred_dt is not None} winding_volume={data.winding_volume is not None} "
+		  f"corr_points={data.corr_points is not None} "
 		  f"mem={_data_bytes / 2**30:.2f} GiB", flush=True)
 
 	# Print initial mesh stats

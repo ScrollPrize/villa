@@ -31,6 +31,26 @@ This runs five substeps internally:
 
 Optional flags: `--step` (default 4), `--density` (default 128), `--skip-gen-normalgrids`, `--skip-fit-normals`, `--no-pred-dt`.
 
+## Step 1b — Winding volume (optional)
+
+```bash
+python lasagna/labels_to_winding_volume.py \
+    --input labels.tif \
+    --output winding.zarr
+```
+
+Computes a per-voxel winding number volume from the label TIFF:
+
+1. Extracts foreground (`==1`) and runs 3D connected components.
+2. Computes pairwise average distances between CCs via distance transforms.
+3. Orders CCs into a winding chain (greedy: start with most isolated, append nearest unused).
+4. Interpolates per-voxel winding numbers from the two nearest CCs (inverse-distance weighting).
+5. Downsamples via mean-pooling and writes a float32 zarr with attrs `scaledown`, `n_components`, `winding_map`.
+
+The output zarr has smooth values ranging from 1 to N (number of CCs), with integer values at CC centers and fractional values in between.
+
+Optional flags: `--step` (default 4), `--connectivity` (6 or 26), `--min-voxels` (default 0), `--chunk-size` (default 64).
+
 ## Step 2 — Fitting
 
 ```bash
@@ -43,6 +63,22 @@ python lasagna/fit.py \
     --out-dir work/fit_output \
     --model-output work/fit_output/model.pt
 ```
+
+To use the winding volume constraint, add `--winding-volume winding.zarr` and set `"winding_vol"` weight in the stages config:
+
+```bash
+python lasagna/fit.py \
+    lasagna/vc3d_configs/vc3d_labels_3d_straight.json \
+    --input normals.zarr \
+    --winding-volume winding.zarr \
+    --seed <cx> <cy> <cz> \
+    --model-w <width> --model-h <height> \
+    --windings <n> \
+    --out-dir work/fit_output \
+    --model-output work/fit_output/model.pt
+```
+
+The `winding_vol` loss penalizes deviation of each mesh depth layer from its expected winding number (depth d → winding d+1). Set the weight in the stages JSON `base` or per-stage `w_fac`, e.g. `"winding_vol": 1.0`.
 
 The straight config models the sheet as a line in XY (center + angle + half-width) with perpendicular winding offsets — appropriate for small or flat regions. It runs two stages:
 1. **straight_only** (1000 steps) — fits straight parameters (cx, cy, angle, half_w).
