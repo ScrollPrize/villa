@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from dataset import DatasetConfig, IndexedInkCropDataset, build_eval_augmentations
+from dataset import DatasetConfig, IndexedInkCropDataset, build_train_augmentations
 from model import PCAEmbedder, create_frozen_dino_backbone, normalize_for_backbone
 
 
@@ -57,7 +57,7 @@ def build_dataset(image_dir: Path, split: str, samples: int, config: dict[str, A
         foreground_threshold=float(config["foreground_threshold"]),
         cache_images=True,
     )
-    return IndexedInkCropDataset(dataset_cfg, build_eval_augmentations(dataset_cfg.crop_size))
+    return IndexedInkCropDataset(dataset_cfg, build_train_augmentations(dataset_cfg.crop_size))
 
 
 def fit_pca_embedder(
