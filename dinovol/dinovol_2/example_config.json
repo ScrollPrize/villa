@@ -1,6 +1,13 @@
 {
 
     "output_dir": "./dinov2_test/",
+    "resume": true,
+    "auto_resume": true,
+    "wandb_project": "dinovol_2",
+    "wandb_entity": null,
+    "wandb_run_name": "example-pretrain",
+    "wandb_resume": "allow",
+    "wandb_run_id": null,
     "volume_auth": "/path/to/some/credentials.json",
     "lr": 2.5e-5,
     "min_lr": 1e-6,
