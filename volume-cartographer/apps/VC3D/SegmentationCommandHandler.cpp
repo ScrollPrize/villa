@@ -69,6 +69,35 @@
 
 // --------- locate executables (unified helper) --------------------------------
 
+static bool isExecutableFile(const QString& path)
+{
+    QFileInfo fi(path);
+    return fi.exists() && fi.isFile() && fi.isExecutable();
+}
+
+static QStringList applicationRelativeExecutablePaths(const QString& name)
+{
+#ifdef _WIN32
+    const QString executableName = name.endsWith(QStringLiteral(".exe"), Qt::CaseInsensitive)
+        ? name
+        : name + QStringLiteral(".exe");
+#else
+    const QString executableName = name;
+#endif
+
+    const QString appDir = QCoreApplication::applicationDirPath();
+    QStringList candidates{
+        QDir(appDir).filePath(executableName),
+        QDir(appDir).filePath(QStringLiteral("../") + executableName),
+        QDir(appDir).filePath(QStringLiteral("../bin/") + executableName),
+        QDir(appDir).filePath(QStringLiteral("../../bin/") + executableName),
+        QDir(appDir).filePath(QStringLiteral("../libexec/") + executableName),
+        QDir(appDir).filePath(QStringLiteral("../Resources/bin/") + executableName),
+    };
+    candidates.removeDuplicates();
+    return candidates;
+}
+
 static QString findExecutable(
     const QString& name,
     const QStringList& extraPaths = {},
@@ -78,9 +107,9 @@ static QString findExecutable(
     if (!envVar.isEmpty()) {
         const QByteArray envVal = qgetenv(envVar.toUtf8().constData());
         if (!envVal.isEmpty()) {
-            QFileInfo fi(QString::fromLocal8Bit(envVal));
-            if (fi.exists() && fi.isFile() && fi.isExecutable())
-                return fi.absoluteFilePath();
+            const QString envPath = QString::fromLocal8Bit(envVal);
+            if (isExecutableFile(envPath))
+                return QFileInfo(envPath).absoluteFilePath();
         }
     }
 
@@ -91,21 +120,24 @@ static QString findExecutable(
         const QString key2 = QStringLiteral("tools/%1").arg(name);
         const QString iniPath =
             settings.value(key1, settings.value(key2)).toString().trimmed();
-        if (!iniPath.isEmpty()) {
-            QFileInfo fi(iniPath);
-            if (fi.exists() && fi.isFile() && fi.isExecutable())
-                return fi.absoluteFilePath();
+        if (!iniPath.isEmpty() && isExecutableFile(iniPath)) {
+            return QFileInfo(iniPath).absoluteFilePath();
         }
     }
 
     // 3. Extra hard-coded paths (caller-supplied)
     for (const QString& p : extraPaths) {
-        QFileInfo fi(p);
-        if (fi.exists() && fi.isFile() && fi.isExecutable())
-            return fi.absoluteFilePath();
+        if (isExecutableFile(p))
+            return QFileInfo(p).absoluteFilePath();
     }
 
-    // 4. QStandardPaths / manual PATH walk
+    // 4. Binaries colocated with the GUI app or common install layouts
+    for (const QString& p : applicationRelativeExecutablePaths(name)) {
+        if (isExecutableFile(p))
+            return QFileInfo(p).absoluteFilePath();
+    }
+
+    // 5. QStandardPaths / manual PATH walk
 #if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
     const QString onPath = QStandardPaths::findExecutable(name);
     if (!onPath.isEmpty()) return onPath;
