@@ -16,7 +16,7 @@ import wandb
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from dataset import DatasetConfig, InkCropDataset, build_eval_augmentations, build_train_augmentations
+from dataset import DatasetConfig, InkCropDataset, build_train_augmentations
 from model import InkPatchEmbedder, create_frozen_dino_backbone, normalize_for_backbone
 
 
@@ -423,7 +423,7 @@ def main(config_path: Path) -> None:
     )
 
     train_dataset = InkCropDataset(train_cfg, build_train_augmentations(crop_size))
-    test_dataset = InkCropDataset(test_cfg, build_eval_augmentations(crop_size))
+    test_dataset = InkCropDataset(test_cfg, build_train_augmentations(crop_size))
 
     train_loader = DataLoader(
         train_dataset,

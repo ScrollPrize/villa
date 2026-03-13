@@ -149,10 +149,6 @@ def build_train_augmentations(crop_size: int) -> Compose:
     )
 
 
-def build_eval_augmentations(crop_size: int) -> Compose:
-    return Compose([Lambda(image=lambda image, **_: cv2.resize(image, (crop_size, crop_size), interpolation=cv2.INTER_LINEAR))])
-
-
 @dataclass
 class DatasetConfig:
     image_dir: Path

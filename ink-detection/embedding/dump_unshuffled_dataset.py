@@ -7,7 +7,7 @@ from pathlib import Path
 import click
 import cv2
 
-from dataset import DatasetConfig, IndexedInkCropDataset, build_eval_augmentations, build_train_augmentations
+from dataset import DatasetConfig, IndexedInkCropDataset, build_train_augmentations
 
 
 def build_dataset(
@@ -35,12 +35,7 @@ def build_dataset(
         foreground_threshold=foreground_threshold,
         cache_images=True,
     )
-    augmentation = (
-        build_train_augmentations(config.crop_size)
-        if split == "train"
-        else build_eval_augmentations(config.crop_size)
-    )
-    return IndexedInkCropDataset(config, augmentation)
+    return IndexedInkCropDataset(config, build_train_augmentations(config.crop_size))
 
 
 def dump_split(
