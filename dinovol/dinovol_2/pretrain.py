@@ -212,10 +212,16 @@ class DinoIBOTPretrainer:
         self.wandb_project = _config_get(self.config, "wandb-project", "wandb_project")
         self.wandb_entity = _config_get(self.config, "wandb-entity", "wandb_entity")
         self.wandb_run_name = _config_get(self.config, "wandb-run-name", "wandb_run_name")
+        self.wandb_run_id = _config_get(self.config, "wandb-run-id", "wandb_run_id")
         self._wandb: Any | None = None
         self._warned_missing_val_dataset = False
         self.resume = bool(self.config.get("resume", False))
         self.auto_resume = bool(self.config.get("auto_resume", self.resume or bool(self.config.get("resume_from"))))
+        self.resume_path = self._resolve_resume_path()
+        configured_wandb_resume = _config_get(self.config, "wandb-resume", "wandb_resume")
+        self.wandb_resume = self._normalize_wandb_resume_mode(
+            configured_wandb_resume if configured_wandb_resume is not None else ("allow" if self.resume_path is not None else None)
+        )
         self._monitor_dataset: SSLZarrDataset | None = None
         self._monitor_collate_fn: Any | None = None
         self._monitor_seed_pool = tuple(self.monitor_seed + offset for offset in range(self.monitor_pool_size))
@@ -254,6 +260,84 @@ class DinoIBOTPretrainer:
         if self.total_steps <= 0 or freeze_ratio <= 0.0:
             return 0
         return max(1, min(self.total_steps, round(self.total_steps * freeze_ratio)))
+
+    @staticmethod
+    def _normalize_wandb_resume_mode(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return "allow" if value else None
+
+        normalized = str(value).strip().lower()
+        if normalized in {"", "false", "none", "off"}:
+            return None
+        if normalized == "true":
+            return "allow"
+        if normalized not in {"allow", "must", "never", "auto"}:
+            raise ValueError(
+                "wandb_resume must be one of allow, must, never, auto, true, false, or null."
+            )
+        return normalized
+
+    def _wandb_metadata_path(self) -> Path:
+        return self.output_dir / "wandb_run.json"
+
+    def _read_wandb_metadata(self) -> Mapping[str, Any]:
+        metadata_path = self._wandb_metadata_path()
+        if not metadata_path.exists():
+            return {}
+
+        try:
+            with metadata_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            if self.is_main_process:
+                print(f"warning: failed to read wandb metadata from {metadata_path}: {exc}")
+            return {}
+
+        return payload if isinstance(payload, dict) else {}
+
+    def _current_wandb_run_id(self) -> str | None:
+        if self._wandb_enabled():
+            run_id = getattr(self._wandb.run, "id", None)
+            if run_id:
+                return str(run_id)
+        if self.wandb_run_id:
+            return str(self.wandb_run_id)
+        return None
+
+    def _write_wandb_metadata(self) -> None:
+        if not self.is_main_process:
+            return
+
+        run_id = self._current_wandb_run_id()
+        if not run_id:
+            return
+
+        run = getattr(self._wandb, "run", None) if self._wandb is not None else None
+        payload = {
+            "id": run_id,
+            "name": getattr(run, "name", None) or self.wandb_run_name,
+            "project": self.wandb_project,
+            "entity": self.wandb_entity,
+            "resume": self.wandb_resume,
+        }
+        metadata_path = self._wandb_metadata_path()
+        with metadata_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+
+    def _resolve_wandb_run_id(self) -> str | None:
+        if self.wandb_run_id:
+            return str(self.wandb_run_id)
+        if self.resume_path is None:
+            return None
+
+        metadata = self._read_wandb_metadata()
+        run_id = metadata.get("id")
+        if run_id:
+            return str(run_id)
+        return None
     
     def _build_optimizer(self) -> torch.optim.Optimizer:
         param_groups = self.model.get_params_groups(
@@ -452,6 +536,12 @@ class DinoIBOTPretrainer:
                 "Install `wandb[media]` to enable it."
             ) from exc
 
+        run_id = self._resolve_wandb_run_id()
+        if run_id:
+            self.config["wandb_run_id"] = run_id
+        if self.wandb_resume is not None:
+            self.config["wandb_resume"] = self.wandb_resume
+
         init_kwargs: dict[str, Any] = {
             "project": self.wandb_project,
             "entity": self.wandb_entity,
@@ -460,8 +550,18 @@ class DinoIBOTPretrainer:
         }
         if self.wandb_run_name:
             init_kwargs["name"] = self.wandb_run_name
+        if run_id:
+            init_kwargs["id"] = run_id
+        if self.wandb_resume is not None:
+            init_kwargs["resume"] = self.wandb_resume
+        elif run_id:
+            init_kwargs["resume"] = "allow"
         wandb.init(**init_kwargs)
         self._wandb = wandb
+        self.wandb_run_id = self._current_wandb_run_id()
+        if self.wandb_run_id is not None:
+            self.config["wandb_run_id"] = self.wandb_run_id
+        self._write_wandb_metadata()
 
     def _wandb_enabled(self) -> bool:
         return self._wandb is not None and getattr(self._wandb, "run", None) is not None
@@ -1090,6 +1190,7 @@ class DinoIBOTPretrainer:
             {
                 "step": step,
                 "config": self.config,
+                "wandb_run_id": self._current_wandb_run_id(),
                 "student": self.model_module.student.state_dict(),
                 "teacher": self.model_module.teacher.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
@@ -1117,6 +1218,9 @@ class DinoIBOTPretrainer:
             self.ibot_patch_loss.load_state_dict(checkpoint["ibot_patch_loss"])
         if "rng_state" in checkpoint:
             self._restore_rng_state(checkpoint["rng_state"])
+        if checkpoint.get("wandb_run_id") and not self.wandb_run_id:
+            self.wandb_run_id = str(checkpoint["wandb_run_id"])
+            self.config["wandb_run_id"] = self.wandb_run_id
         return int(checkpoint.get("step", -1))
     
     def _find_latest_checkpoint(self) -> Path | None:
@@ -1315,7 +1419,7 @@ class DinoIBOTPretrainer:
     
     def fit(self) -> None:
         start_step = 0
-        resume_path = self._resolve_resume_path()
+        resume_path = self.resume_path
         if resume_path is not None:
             start_step = self.load_checkpoint(resume_path) + 1
         
