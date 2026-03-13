@@ -170,6 +170,42 @@
             return grid_store;
         }
 
+        NormalGridVolume::CacheStats cacheStats() const {
+            NormalGridVolume::CacheStats stats;
+            stats.gridHits = cache_hits.load(std::memory_order_relaxed);
+            stats.gridMisses = cache_misses.load(std::memory_order_relaxed);
+
+            std::shared_lock<std::shared_mutex> lock(mutex);
+            stats.liveGridEntries = grid_cache.size();
+            for (const auto& [key, entry] : grid_cache) {
+                (void)key;
+                if (!entry.grid_store) {
+                    continue;
+                }
+                const auto grid_stats = entry.grid_store->cacheStats();
+                stats.decodedPathHits += grid_stats.decodedPathHits;
+                stats.decodedPathMisses += grid_stats.decodedPathMisses;
+                stats.decodedPathEvictions += grid_stats.decodedPathEvictions;
+                stats.decodedPathEntries += grid_stats.decodedPathEntries;
+                stats.decodedPathBytes += grid_stats.decodedPathBytes;
+            }
+            return stats;
+        }
+
+        void resetCacheStats() const {
+            cache_hits.store(0, std::memory_order_relaxed);
+            cache_misses.store(0, std::memory_order_relaxed);
+            last_stat_time = std::chrono::steady_clock::now();
+
+            std::shared_lock<std::shared_mutex> lock(mutex);
+            for (const auto& [key, entry] : grid_cache) {
+                (void)key;
+                if (entry.grid_store) {
+                    entry.grid_store->resetCacheStats();
+                }
+            }
+        }
+
         void check_print_stats() const {
             if (generation_counter % 1000 == 0) {
                 auto now = std::chrono::steady_clock::now();
@@ -196,6 +232,18 @@
 
     std::shared_ptr<const GridStore> NormalGridVolume::query_nearest(const cv::Point3f& point, int plane_idx) const {
         return pimpl_->query_nearest(point, plane_idx);
+    }
+
+    std::shared_ptr<const GridStore> NormalGridVolume::get_grid(int plane_idx, int slice_idx) const {
+        return pimpl_->get_grid(plane_idx, slice_idx);
+    }
+
+    NormalGridVolume::CacheStats NormalGridVolume::cacheStats() const {
+        return pimpl_->cacheStats();
+    }
+
+    void NormalGridVolume::resetCacheStats() const {
+        pimpl_->resetCacheStats();
     }
 
     NormalGridVolume::~NormalGridVolume() = default;

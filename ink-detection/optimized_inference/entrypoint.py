@@ -21,6 +21,19 @@ import concurrent.futures
 import zarr
 import tifffile as tiff
 from huggingface_hub import snapshot_download
+from contextlib import suppress
+
+from profiling import (
+    FLAG_APPROXIMATE,
+    FLAG_ESTIMATED,
+    TransferTracker,
+    WorkflowProfiler,
+    aggregate_workflow_profiling,
+    build_runtime_parameters,
+    collect_env_metadata,
+    dir_size_bytes,
+    scoped_timer,
+)
 
 # WebKnossos imports
 try:
@@ -46,7 +59,7 @@ class Inputs:
     force_reverse: bool = False
     wk_inference: bool = False
     wk_dataset_id: str = ""
-    step: str = "inference"  # "prepare", "inference", or "reduce"
+    step: str = "inference"  # "prepare", "inference", "reduce", or "aggregate-profiling"
     num_parts: int = 1
     part_id: int = 0
     zarr_output_dir: str = "/tmp/partitions"
@@ -62,6 +75,14 @@ class Inputs:
     pixel_resolution_um: Optional[float] = None  # Real-world pixel resolution in micrometers (µm), None to omit
     add_scale_bar: bool = False  # Whether to add scale bar overlay to output
     scale_bar_length_um: float = 10000.0  # Scale bar length in micrometers (default 1cm)
+    segment_id: str = ""
+    profiling_level: str = "basic"
+    profiling_sample_interval_ms: int = 1000
+    profiling_detailed_partitions: str = "first"
+    profiling_keep_raw_traces: bool = False
+    profiling_output_prefix: str = ""
+    profiling_raw_root: str = ""
+    profiling_local_root: str = "/tmp/profiling"
 
 def parse_env() -> Inputs:
     try:
@@ -94,6 +115,14 @@ def parse_env() -> Inputs:
         batch_size = int(os.getenv("BATCH_SIZE", "256"))
         prefetch_factor = int(os.getenv("PREFETCH_FACTOR", "8"))
         output_path = os.getenv("OUTPUT_PATH", "").strip()
+        segment_id = os.getenv("SEGMENT_ID", "").strip()
+        profiling_level = os.getenv("PROFILING_LEVEL", "basic").strip().lower()
+        profiling_sample_interval_ms = int(os.getenv("PROFILING_SAMPLE_INTERVAL_MS", "1000"))
+        profiling_detailed_partitions = os.getenv("PROFILING_DETAILED_PARTITIONS", "first").strip()
+        profiling_keep_raw_traces = os.getenv("PROFILING_KEEP_RAW_TRACES", "false").lower() == "true"
+        profiling_output_prefix = os.getenv("PROFILING_OUTPUT_PREFIX", "").strip()
+        profiling_raw_root = os.getenv("PROFILING_RAW_ROOT", "").strip()
+        profiling_local_root = os.getenv("PROFILING_LOCAL_ROOT", "/tmp/profiling").strip()
 
         # Optional pixel resolution - only parse if provided
         pixel_resolution_str = os.getenv("PIXEL_RESOLUTION_UM", "").strip()
@@ -120,8 +149,8 @@ def parse_env() -> Inputs:
             raise ValueError(f"SCALE_BAR_LENGTH_UM must be positive, got {scale_bar_length_um}")
 
         # Validate step parameter
-        if step not in ("prepare", "inference", "reduce"):
-            raise ValueError(f"STEP must be 'prepare', 'inference', or 'reduce', got '{step}'")
+        if step not in ("prepare", "inference", "reduce", "aggregate-profiling"):
+            raise ValueError(f"STEP must be 'prepare', 'inference', 'reduce', or 'aggregate-profiling', got '{step}'")
 
         # Validate NUM_PARTS upfront
         if num_parts < 1:
@@ -140,6 +169,8 @@ def parse_env() -> Inputs:
             # Inference step requires surface_volume_zarr
             if not surface_volume_zarr:
                 raise ValueError("STEP=inference requires SURFACE_VOLUME_ZARR (run STEP=prepare first)")
+        elif step == "aggregate-profiling" and not profiling_raw_root:
+            raise ValueError("STEP=aggregate-profiling requires PROFILING_RAW_ROOT")
         # reduce step doesn't require these
 
         wk_inference = bool(wk_dataset_id)
@@ -171,6 +202,14 @@ def parse_env() -> Inputs:
             pixel_resolution_um=pixel_resolution_um,
             add_scale_bar=add_scale_bar,
             scale_bar_length_um=scale_bar_length_um,
+            segment_id=segment_id,
+            profiling_level=profiling_level,
+            profiling_sample_interval_ms=profiling_sample_interval_ms,
+            profiling_detailed_partitions=profiling_detailed_partitions,
+            profiling_keep_raw_traces=profiling_keep_raw_traces,
+            profiling_output_prefix=profiling_output_prefix,
+            profiling_raw_root=profiling_raw_root,
+            profiling_local_root=profiling_local_root,
         )
     except KeyError as e:
         raise RuntimeError(f"Missing required env var: {e.args[0]}") from e
@@ -192,39 +231,122 @@ def ensure_clean_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def build_profiler(inputs: Inputs, template_name: str) -> WorkflowProfiler:
+    metadata = collect_env_metadata(
+        {
+            "segment_id": inputs.segment_id,
+            "model": inputs.model_key,
+            "model_type": inputs.model_type,
+        }
+    )
+    runtime_parameters = build_runtime_parameters(
+        s3_path=inputs.s3_path,
+        start_layer=inputs.start_layer,
+        end_layer=inputs.end_layer,
+        num_parts=inputs.num_parts,
+        part_id=inputs.part_id,
+        tile_size=inputs.tile_size,
+        stride=inputs.stride,
+        batch_size=inputs.batch_size,
+        surface_volume_zarr=inputs.surface_volume_zarr,
+        zarr_output_dir=inputs.zarr_output_dir,
+        profiling_level=inputs.profiling_level,
+        profiling_keep_raw_traces=inputs.profiling_keep_raw_traces,
+    )
+    profiler = WorkflowProfiler(
+        level=inputs.profiling_level,
+        sample_interval_ms=inputs.profiling_sample_interval_ms,
+        raw_root=inputs.profiling_raw_root or None,
+        local_root=inputs.profiling_local_root,
+        step_name=inputs.step,
+        template_name=template_name,
+        part_id=inputs.part_id if inputs.step == "inference" else None,
+        metadata=metadata,
+        runtime_parameters=runtime_parameters,
+        detailed_selector=inputs.profiling_detailed_partitions,
+    )
+    return profiler
+
+
+def profiled_s3_download_file(
+    s3_client,
+    bucket: str,
+    key: str,
+    output_path: str,
+    profiler: Optional[WorkflowProfiler],
+    metric_name: str = "download_seconds",
+    bytes_metric: str = "s3_download_bytes",
+) -> None:
+    tracker = TransferTracker()
+    start = time.monotonic()
+    s3_client.download_file(bucket, key, output_path, Callback=tracker)
+    elapsed = time.monotonic() - start
+    if profiler is not None:
+        profiler.add_duration(metric_name, elapsed)
+        profiler.increment_counter(bytes_metric, tracker.bytes_transferred)
+
+
+def profiled_s3_upload_file(
+    s3_client,
+    local_path: str,
+    bucket: str,
+    key: str,
+    profiler: Optional[WorkflowProfiler],
+    metric_name: str = "upload_seconds",
+    bytes_metric: str = "s3_upload_bytes",
+) -> None:
+    tracker = TransferTracker()
+    start = time.monotonic()
+    s3_client.upload_file(local_path, bucket, key, Callback=tracker)
+    elapsed = time.monotonic() - start
+    if profiler is not None:
+        profiler.add_duration(metric_name, elapsed)
+        profiler.increment_counter(bytes_metric, tracker.bytes_transferred)
+
+
+def write_aggregate_output_parameters(results: Dict[str, str]) -> None:
+    parameter_dir = "/tmp/outputs/parameters"
+    os.makedirs(parameter_dir, exist_ok=True)
+    for name, path in results.items():
+        target = os.path.join(parameter_dir, f"{name}.txt")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(path)
+
+
 def list_layers_objects(
-    s3_client, bucket: str, prefix: str, start_layer: int, end_layer: int
+    s3_client, bucket: str, prefix: str, start_layer: int, end_layer: int, profiler: Optional[WorkflowProfiler] = None
 ) -> List[Tuple[str, str]]:
     # Return list of (key, basename) for .tif/.tiff/.png/.jpeg/.jpg files inside any "layers/" folder under prefix
     # OR directly under prefix for surface-volumes (e.g., paths ending in .tifs/)
     paginator = s3_client.get_paginator("list_objects_v2")
     keys: List[Tuple[str, str]] = []
     SUPPORTED_IMAGE_FORMATS = {'.tif', '.tiff', '.png', '.jpeg', '.jpg'}
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
+    with scoped_timer(profiler, "s3_list_seconds"):
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
 
-            # Check if it's a layer file with supported format
-            # Support both: paths with "/layers/" subdirectory AND surface-volumes with .tifs/ directory
-            if "/layers/" not in key.lower() and not prefix.endswith(".tifs/"):
-                continue
+                # Check if it's a layer file with supported format
+                # Support both: paths with "/layers/" subdirectory AND surface-volumes with .tifs/ directory
+                if "/layers/" not in key.lower() and not prefix.endswith(".tifs/"):
+                    continue
 
-            base = os.path.basename(key)
-            name, ext = os.path.splitext(base)
+                base = os.path.basename(key)
+                name, ext = os.path.splitext(base)
 
-            # Check if the file extension is supported
-            if ext.lower() not in SUPPORTED_IMAGE_FORMATS:
-                continue
+                # Check if the file extension is supported
+                if ext.lower() not in SUPPORTED_IMAGE_FORMATS:
+                    continue
 
-            try:
-                # Tolerate leading zeros, e.g., 01, 02, ...
-                layer_idx = int(name)
-            except ValueError:
-                continue
+                try:
+                    # Tolerate leading zeros, e.g., 01, 02, ...
+                    layer_idx = int(name)
+                except ValueError:
+                    continue
 
-            # Check if layer index is within range (exclusive end) -> [start_layer, end_layer)
-            if start_layer <= layer_idx < end_layer:
-                keys.append((key, base))
+                # Check if layer index is within range (exclusive end) -> [start_layer, end_layer)
+                if start_layer <= layer_idx < end_layer:
+                    keys.append((key, base))
     if not keys:
         raise RuntimeError(
             f"No layers found within range [{start_layer}, {end_layer}) under s3://{bucket}/{prefix}"
@@ -235,7 +357,7 @@ def list_layers_objects(
 
 
 def download_layers(
-    s3_client, bucket: str, objects: List[Tuple[str, str]], out_dir: str
+    s3_client, bucket: str, objects: List[Tuple[str, str]], out_dir: str, profiler: Optional[WorkflowProfiler] = None
 ) -> List[str]:
     os.makedirs(out_dir, exist_ok=True)
 
@@ -248,8 +370,8 @@ def download_layers(
     def _download_one(args):
         idx, key, base, bucket, out_dir = args
         out_path = os.path.join(out_dir, base)
-        # Each thread needs its own s3_client, so we pass it in the outer scope
-        session.client("s3", config=config).download_file(bucket, key, out_path)
+        client = session.client("s3", config=config)
+        profiled_s3_download_file(client, bucket, key, out_path, profiler)
         logger.info(f"Finished downloading layer {idx}: {out_path}")
         return out_path
 
@@ -295,7 +417,7 @@ def load_layers_to_numpy(layer_paths: List[str]) -> np.ndarray:
     return stacked_layers
 
 
-def download_model_weights(model_name: str, dest_dir: str, s3_client) -> str:
+def download_model_weights(model_name: str, dest_dir: str, s3_client, profiler: Optional[WorkflowProfiler] = None) -> str:
     """
     Resolve model weights by checking S3 registry first, then fall back to Hugging Face.
 
@@ -323,18 +445,19 @@ def download_model_weights(model_name: str, dest_dir: str, s3_client) -> str:
     try:
         paginator = s3_client.get_paginator("list_objects_v2")
         found_keys: List[str] = []
-        for page in paginator.paginate(Bucket=registry_bucket, Prefix=registry_prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                lower = key.lower()
-                if lower.endswith(".ckpt") or lower.endswith(".safetensors") or lower.endswith(".bin") or lower.endswith(".pt"):
-                    found_keys.append(key)
+        with scoped_timer(profiler, "s3_list_seconds"):
+            for page in paginator.paginate(Bucket=registry_bucket, Prefix=registry_prefix):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    lower = key.lower()
+                    if lower.endswith(".ckpt") or lower.endswith(".safetensors") or lower.endswith(".bin") or lower.endswith(".pt"):
+                        found_keys.append(key)
 
         chosen_key = _prefer(found_keys)
         if chosen_key:
             logger.info(f"Found weights in S3 registry: s3://{registry_bucket}/{chosen_key}")
             local_path = os.path.join(dest_dir, os.path.basename(chosen_key))
-            s3_client.download_file(registry_bucket, chosen_key, local_path)
+            profiled_s3_download_file(s3_client, registry_bucket, chosen_key, local_path, profiler)
             logger.info(f"Downloaded weights from S3 to: {local_path}")
             return local_path
         else:
@@ -344,7 +467,8 @@ def download_model_weights(model_name: str, dest_dir: str, s3_client) -> str:
 
     # 2) Fall back to Hugging Face
     logger.info(f"Downloading model from Hugging Face: {model_name}")
-    local_dir = snapshot_download(repo_id=model_name, local_dir=dest_dir, local_dir_use_symlinks=False)
+    with scoped_timer(profiler, "download_seconds", flag=FLAG_ESTIMATED):
+        local_dir = snapshot_download(repo_id=model_name, local_dir=dest_dir, local_dir_use_symlinks=False)
     candidates = []
     for root, _, files in os.walk(local_dir):
         for f in files:
@@ -354,6 +478,8 @@ def download_model_weights(model_name: str, dest_dir: str, s3_client) -> str:
     if not candidates:
         raise RuntimeError("No model weight files (.ckpt/.safetensors/.bin/.pt) found in downloaded repo")
     chosen = _prefer(candidates)
+    if profiler is not None:
+        profiler.add_note("Hugging Face weight download byte accounting is unavailable; only wall time is recorded.")
     logger.info(f"Using model weights: {chosen}")
     return chosen
 
@@ -492,7 +618,7 @@ def save_and_upload_prediction(
     return final_output_path
 
 
-def run_prepare_step(inputs: Inputs) -> None:
+def run_prepare_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None) -> None:
     """Execute the prepare step to create surface volume zarr from S3 layers."""
     # Import torch-free processing utilities
     from processing import create_surface_volume_zarr, path_exists
@@ -513,7 +639,7 @@ def run_prepare_step(inputs: Inputs) -> None:
 
     logger.info(f"Listing layer objects in S3 bucket '{bucket}' with prefix '{prefix}' for layers [{inputs.start_layer}, {inputs.end_layer})")
     layer_objects = list_layers_objects(
-        s3_client, bucket, prefix, inputs.start_layer, inputs.end_layer
+        s3_client, bucket, prefix, inputs.start_layer, inputs.end_layer, profiler=profiler
     )
     logger.info(f"Found {len(layer_objects)} layer objects to download")
 
@@ -524,7 +650,7 @@ def run_prepare_step(inputs: Inputs) -> None:
     ensure_clean_dir(os.path.join(work_dir, "input"))
 
     logger.info(f"Downloading layer files to {input_dir} ...")
-    layer_paths = download_layers(s3_client, bucket, layer_objects, input_dir)
+    layer_paths = download_layers(s3_client, bucket, layer_objects, input_dir, profiler=profiler)
     logger.info(f"Downloaded {len(layer_paths)} layer files")
 
     if inputs.surface_volume_zarr:
@@ -537,7 +663,8 @@ def run_prepare_step(inputs: Inputs) -> None:
         layer_paths,
         output_path,
         chunk_size=inputs.chunk_size,
-        use_compression=inputs.use_zarr_compression
+        use_compression=inputs.use_zarr_compression,
+        profiler=profiler,
     )
 
     # Write output path to file for next step
@@ -549,7 +676,7 @@ def run_prepare_step(inputs: Inputs) -> None:
     logger.info(f"Zarr path written to: {output_file}")
 
 
-def run_inference_step(inputs: Inputs) -> None:
+def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None) -> None:
     """Execute the inference step (either standard or partitioned mode)."""
     # Import torch and related dependencies only when doing inference
     import torch
@@ -619,11 +746,12 @@ def run_inference_step(inputs: Inputs) -> None:
     # Resolve and download model weights (S3-first, then HF fallback)
     logger.info(f"Resolving model for key: {inputs.model_key}")
     logger.info(f"Looking for weights in S3 registry, else HF repo: {inputs.model_key}")
-    weight_path = download_model_weights(inputs.model_key, models_dir, s3_client)
+    weight_path = download_model_weights(inputs.model_key, models_dir, s3_client, profiler=profiler)
     logger.info(f"Loading model from weights at: {weight_path}")
 
     # Load model with dynamic number of frames
-    model = load_model(weight_path, device, num_frames=CFG.in_chans)
+    with scoped_timer(profiler, "model_load_seconds", cuda_sync=device.type == "cuda"):
+        model = load_model(weight_path, device, num_frames=CFG.in_chans)
 
     # -------- Performance toggles ------------------------------------------------
     # TF32 on Ampere+ gives fast GEMMs with tiny accuracy impact for this task.
@@ -636,34 +764,35 @@ def run_inference_step(inputs: Inputs) -> None:
     COMPILE = os.getenv("COMPILE", "1") == "1" and hasattr(torch, "compile")
     COMPILE_MODE = os.getenv("COMPILE_MODE", "reduce-overhead")  # <- default changed
     if COMPILE:
-        # Persist Inductor cache across runs (huge win after the first run)
-        os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.abspath("./inductor_cache"))
-        # If not doing max tuning, disable heavy autotuning to avoid OOM spam & overhead
-        if COMPILE_MODE != "max-autotune":
-            os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "0")
-            os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM", "0")
-            os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE", "0")
-        # Optional: CUDA graphs (static shapes); enable if you don’t hit driver bugs
-        if os.getenv("CUDAGRAPHS", "0") == "1":
-            os.environ.setdefault("TORCHINDUCTOR_CUDAGRAPHS", "1")
-        # Compile
-        # Access the underlying model from the wrapper
-        target = model.model.module if isinstance(model.model, DataParallel) else model.model
-        model_compiled = torch.compile(target, mode=COMPILE_MODE, fullgraph=True, dynamic=False)
-        if isinstance(model.model, DataParallel):
-            model.model.module = model_compiled
-        else:
-            model.model = model_compiled
-        logger.info(f"Enabled torch.compile (mode={COMPILE_MODE})")
-        # Tiny warmup to trigger compilation before the big loop (hides first-iter cost)
-        try:
-            dummy = torch.zeros((1, 1, CFG.in_chans, CFG.size, CFG.size), device=device)
-            with torch.inference_mode():
-                with torch.autocast(device_type=("cuda" if device.type == "cuda" else "cpu"), enabled=True):
-                    _ = model.forward(dummy)
-            del dummy
-        except Exception as e:
-            logger.warning(f"Warmup after compile failed (continuing un-warmed): {e}")
+        with scoped_timer(profiler, "compile_warmup_seconds", cuda_sync=device.type == "cuda"):
+            # Persist Inductor cache across runs (huge win after the first run)
+            os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.abspath("./inductor_cache"))
+            # If not doing max tuning, disable heavy autotuning to avoid OOM spam & overhead
+            if COMPILE_MODE != "max-autotune":
+                os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "0")
+                os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM", "0")
+                os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE", "0")
+            # Optional: CUDA graphs (static shapes); enable if you don’t hit driver bugs
+            if os.getenv("CUDAGRAPHS", "0") == "1":
+                os.environ.setdefault("TORCHINDUCTOR_CUDAGRAPHS", "1")
+            # Compile
+            # Access the underlying model from the wrapper
+            target = model.model.module if isinstance(model.model, DataParallel) else model.model
+            model_compiled = torch.compile(target, mode=COMPILE_MODE, fullgraph=True, dynamic=False)
+            if isinstance(model.model, DataParallel):
+                model.model.module = model_compiled
+            else:
+                model.model = model_compiled
+            logger.info(f"Enabled torch.compile (mode={COMPILE_MODE})")
+            # Tiny warmup to trigger compilation before the big loop (hides first-iter cost)
+            try:
+                dummy = torch.zeros((1, 1, CFG.in_chans, CFG.size, CFG.size), device=device)
+                with torch.inference_mode():
+                    with torch.autocast(device_type=("cuda" if device.type == "cuda" else "cpu"), enabled=True):
+                        _ = model.forward(dummy)
+                del dummy
+            except Exception as e:
+                logger.warning(f"Warmup after compile failed (continuing un-warmed): {e}")
 
     # Determine reverse option similar to local test
     if inputs.force_reverse:
@@ -684,9 +813,19 @@ def run_inference_step(inputs: Inputs) -> None:
         device,
         is_reverse_segment=is_reverse_segment,
         start_z=inputs.start_layer,
-        end_z=inputs.end_layer
+        end_z=inputs.end_layer,
+        profiler=profiler,
     )
-    logger.info(f"Inference completed in {time.time() - start_infer_time:.2f} seconds")
+    infer_elapsed = time.time() - start_infer_time
+    logger.info(f"Inference completed in {infer_elapsed:.2f} seconds")
+    if profiler is not None:
+        partition_tiles = result.get("partition_tiles") or result.get("partition_info", {}).get("partition_tiles")
+        if partition_tiles:
+            profiler.set_metric(
+                "partition_throughput_tiles_per_second",
+                float(partition_tiles) / max(infer_elapsed, 1e-6),
+                flag=FLAG_ESTIMATED,
+            )
 
     # Zarr files written, log and exit
     # Result is a dict with zarr paths: {"mask_pred": path, "mask_count": path}
@@ -694,7 +833,7 @@ def run_inference_step(inputs: Inputs) -> None:
     logger.info("Inference step complete. Run STEP=reduce after all partitions finish to blend and upload results.")
 
 
-def run_reduce_step(inputs: Inputs) -> None:
+def run_reduce_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None) -> None:
     """Execute the reduce step to blend all partitions."""
     # Import torch-free processing utilities
     from processing import reduce_partitions, write_tiled_tiff
@@ -716,8 +855,11 @@ def run_reduce_step(inputs: Inputs) -> None:
         raise RuntimeError(f"Partition 0 not found at {mask_pred_path}. Ensure all inference partitions completed.")
 
     logger.info(f"Reading prediction shape from {mask_pred_path}")
-    z = zarr.open(mask_pred_path, mode='r')
-    pred_shape = z.shape
+    with scoped_timer(profiler, "local_read_seconds", flag=FLAG_APPROXIMATE):
+        z = zarr.open(mask_pred_path, mode='r')
+        pred_shape = z.shape
+    if profiler is not None:
+        profiler.increment_counter("local_read_bytes", dir_size_bytes(mask_pred_path), flag=FLAG_APPROXIMATE)
     logger.info(f"Prediction shape: {pred_shape}")
 
     # Run reduce/blend (creates lazy tile iterator)
@@ -730,7 +872,8 @@ def run_reduce_step(inputs: Inputs) -> None:
         tile_size,
         add_scale_bar=inputs.add_scale_bar,
         pixel_resolution_um=inputs.pixel_resolution_um,
-        scale_bar_length_um=inputs.scale_bar_length_um
+        scale_bar_length_um=inputs.scale_bar_length_um,
+        profiler=profiler,
     )
 
     # Log scale bar status
@@ -758,20 +901,23 @@ def run_reduce_step(inputs: Inputs) -> None:
     # Write to local tiled TIFF first (this is when the lazy reduction actually happens)
     local_tiff_path = f"/tmp/prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif"
     start_reduce_time = time.time()
-    write_tiled_tiff(tile_iterator, shape, local_tiff_path, tile_size, inputs.pixel_resolution_um)
+    write_tiled_tiff(tile_iterator, shape, local_tiff_path, tile_size, inputs.pixel_resolution_um, profiler=profiler)
     logger.info(f"Reduce and TIFF write completed in {time.time() - start_reduce_time:.2f} seconds")
 
     # Handle S3 upload or local save
     if final_output_path.startswith("s3://"):
         output_bucket, output_key = parse_s3_uri(final_output_path)
         logger.info(f"Uploading tiled TIFF to S3: {final_output_path}")
-        s3_client.upload_file(local_tiff_path, output_bucket, output_key)
+        profiled_s3_upload_file(s3_client, local_tiff_path, output_bucket, output_key, profiler)
         result_uri = final_output_path
     else:
         # Local file path
         os.makedirs(os.path.dirname(final_output_path), exist_ok=True)
         logger.info(f"Copying tiled TIFF to local path: {final_output_path}")
-        shutil.copy2(local_tiff_path, final_output_path)
+        with scoped_timer(profiler, "local_write_seconds", flag=FLAG_APPROXIMATE):
+            shutil.copy2(local_tiff_path, final_output_path)
+        if profiler is not None:
+            profiler.increment_counter("local_write_bytes", os.path.getsize(local_tiff_path))
         result_uri = final_output_path
 
     logger.info(f"Saved result to: {result_uri}")
@@ -785,7 +931,10 @@ def run_reduce_step(inputs: Inputs) -> None:
         logger.info("Uploading prediction to WebKnossos dataset...")
         # Read the TIFF back as numpy array for WebKnossos upload
         logger.info(f"Reading TIFF for WebKnossos upload: {local_tiff_path}")
-        prediction = tiff.imread(local_tiff_path)
+        with scoped_timer(profiler, "local_read_seconds", flag=FLAG_APPROXIMATE):
+            prediction = tiff.imread(local_tiff_path)
+        if profiler is not None:
+            profiler.increment_counter("local_read_bytes", os.path.getsize(local_tiff_path), flag=FLAG_APPROXIMATE)
         # Convert uint8 back to float32 [0, 1] as expected by upload_to_webknossos
         prediction = prediction.astype(np.float32) / 255.0
 
@@ -802,25 +951,84 @@ def run_reduce_step(inputs: Inputs) -> None:
         logger.info(f"Reduce completed successfully - S3: {result_uri}")
 
 
+def run_aggregate_profiling_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None) -> None:
+    output_dir = "/tmp/profiling-outputs"
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        with scoped_timer(profiler, "reduce_seconds", flag=FLAG_APPROXIMATE):
+            results = aggregate_workflow_profiling(
+                inputs.profiling_raw_root,
+                output_dir,
+                output_prefix=inputs.profiling_output_prefix,
+            )
+        write_aggregate_output_parameters(results)
+    except Exception as exc:
+        logger.exception("Profiling aggregation failed: %s", exc)
+        if profiler is not None:
+            profiler.add_note(f"Aggregation failed: {type(exc).__name__}: {exc}")
+        failure_summary = {
+            "schema_version": "1.0",
+            "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "raw_root": inputs.profiling_raw_root,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        summary_json = os.path.join(output_dir, "workflow-profiling-summary.json")
+        summary_md = os.path.join(output_dir, "workflow-profiling-summary.md")
+        partitions_csv = os.path.join(output_dir, "workflow-profiling-partitions.csv")
+        partitions_jsonl = os.path.join(output_dir, "workflow-profiling-partitions.jsonl")
+        with open(summary_json, "w", encoding="utf-8") as handle:
+            json.dump(failure_summary, handle, indent=2)
+            handle.write("\n")
+        with open(summary_md, "w", encoding="utf-8") as handle:
+            handle.write("# Workflow Profiling Summary\n\n")
+            handle.write(f"Aggregation failed: `{type(exc).__name__}: {exc}`\n")
+        with open(partitions_csv, "w", encoding="utf-8") as handle:
+            handle.write("part_id,pod_name,total_wall_seconds,dominant_phase,classification\n")
+        with open(partitions_jsonl, "w", encoding="utf-8") as handle:
+            handle.write("")
+        write_aggregate_output_parameters(
+            {
+                "summary_json": summary_json,
+                "summary_md": summary_md,
+                "partitions_csv": partitions_csv,
+                "partitions_jsonl": partitions_jsonl,
+            }
+        )
+
+
 def main() -> None:
     """Main entrypoint with step dispatch."""
     logger.info("Parsing environment variables for input configuration...")
     inputs = parse_env()
+    template_name = os.getenv("PROFILING_TEMPLATE_NAME", inputs.step)
+    profiler = build_profiler(inputs, template_name)
+    workflow_error: Optional[BaseException] = None
+    profiler_status = "succeeded"
 
     logger.info(
         f"Starting optimized inference: step={inputs.step}, model={inputs.model_key}, "
         f"s3_path={inputs.s3_path}, layers=[{inputs.start_layer}, {inputs.end_layer}]"
     )
 
-    # Dispatch to appropriate step
-    if inputs.step == "prepare":
-        run_prepare_step(inputs)
-    elif inputs.step == "inference":
-        run_inference_step(inputs)
-    elif inputs.step == "reduce":
-        run_reduce_step(inputs)
-    else:
-        raise ValueError(f"Unknown step: {inputs.step}")
+    try:
+        # Dispatch to appropriate step
+        if inputs.step == "prepare":
+            run_prepare_step(inputs, profiler=profiler)
+        elif inputs.step == "inference":
+            run_inference_step(inputs, profiler=profiler)
+        elif inputs.step == "reduce":
+            run_reduce_step(inputs, profiler=profiler)
+        elif inputs.step == "aggregate-profiling":
+            run_aggregate_profiling_step(inputs, profiler=profiler)
+        else:
+            raise ValueError(f"Unknown step: {inputs.step}")
+    except Exception as exc:
+        workflow_error = exc
+        profiler_status = "failed"
+        raise
+    finally:
+        with suppress(Exception):
+            profiler.flush(profiler_status, error=workflow_error)
 
 
 if __name__ == "__main__":

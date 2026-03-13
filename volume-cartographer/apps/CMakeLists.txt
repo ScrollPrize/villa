@@ -156,6 +156,9 @@ target_link_libraries(vc_telea_inpaint
 add_executable(vc_thinning src/vc_thinning.cpp)
 target_link_libraries(vc_thinning vc_core opencv_ximgproc)
 
+add_executable(vc_thinning_bench src/vc_thinning_bench.cpp)
+target_link_libraries(vc_thinning_bench vc_core Boost::program_options opencv_core opencv_imgcodecs)
+
 add_executable(vc_tifxyz src/vc_tifxyz.cpp)
 target_link_libraries(vc_tifxyz vc_core Boost::program_options opencv_core)
 
@@ -206,6 +209,7 @@ if(VC_USE_PCH)
         vc_rgb2tifxyz
         vc_telea_inpaint
         vc_thinning
+        vc_thinning_bench
         vc_tifxyz
         vc_zarr_to_tiff
     )

@@ -7,6 +7,7 @@ boto3>=1.26.0,<1.35.0
 botocore>=1.29.0,<1.35.0
 huggingface_hub>=0.23.0
 tifffile
+psutil
 numcodecs>=0.16.3
 imagecodecs
 # Install zarr from git source to access CacheStore experimental feature (not yet in released version)

@@ -10,6 +10,7 @@ add_library(vc_core
         src/SurfacePatchIndex.cpp
         src/PointIndex.cpp
         src/Logging.cpp
+        src/SparseChunkSpool.cpp
         src/Slicing.cpp
         src/Compositing.cpp
         src/PlaneSurface.cpp
@@ -151,4 +152,3 @@ target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs
 if(VC_USE_PCH)
     target_precompile_headers(vc_tracer REUSE_FROM vc_core)
 endif()
-

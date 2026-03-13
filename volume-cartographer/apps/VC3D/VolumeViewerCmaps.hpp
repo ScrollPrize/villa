@@ -4,21 +4,26 @@
 #include <QString>
 #include <opencv2/core.hpp>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace volume_viewer_cmaps
 {
 
-enum class OverlayColormapKind { OpenCv, Tint };
+enum class OverlayColormapKind { OpenCv, Tint, DiscreteLut };
+enum class ColormapAudience { Shared, OverlayOnly };
+enum class EntryScope { SharedOnly, OverlayCompatible };
 
 struct OverlayColormapSpec
 {
     std::string id;
     QString label;
     OverlayColormapKind kind;
+    ColormapAudience audience;
     int opencvCode;
     cv::Vec3f tint; // R, G, B in [0,1]
+    const uint32_t* discreteLut;
 };
 
 struct OverlayColormapEntry
@@ -34,6 +39,6 @@ const OverlayColormapSpec& resolve(const std::string& id);
 // Avoids intermediate cv::Mat BGR and eliminates cvtColor conversions.
 QImage makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec);
 
-const std::vector<OverlayColormapEntry>& entries();
+const std::vector<OverlayColormapEntry>& entries(EntryScope scope = EntryScope::OverlayCompatible);
 
 } // namespace volume_viewer_cmaps

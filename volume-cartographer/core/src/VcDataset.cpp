@@ -3,8 +3,11 @@
 #include <utils/zarr.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
+#include <mutex>
 #include <optional>
 #include <numeric>
 #include <stdexcept>
@@ -33,6 +36,245 @@ struct CompressorConfig {
     // Zstd/Gzip level
     int level = 3;
 };
+
+namespace {
+
+constexpr int kCompressionThreads = 1;
+
+void ensureBloscInitialized()
+{
+    static std::once_flag once;
+    std::call_once(once, []() {
+        blosc_init();
+        std::atexit([]() { blosc_destroy(); });
+    });
+}
+
+int checkedInt(size_t value, const char* name)
+{
+    if (value > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error(std::string(name) + " exceeds supported size");
+    }
+    return static_cast<int>(value);
+}
+
+uInt checkedUInt(size_t value, const char* name)
+{
+    if (value > static_cast<size_t>(std::numeric_limits<uInt>::max())) {
+        throw std::runtime_error(std::string(name) + " exceeds supported size");
+    }
+    return static_cast<uInt>(value);
+}
+
+std::vector<std::byte> bloscCompress(std::span<const std::byte> input,
+                                     const CompressorConfig& cfg)
+{
+    ensureBloscInitialized();
+
+    std::vector<std::byte> output(input.size() + BLOSC_MAX_OVERHEAD);
+    const int rc = blosc_compress_ctx(cfg.blosc_clevel,
+                                      cfg.blosc_shuffle,
+                                      cfg.blosc_typesize,
+                                      input.size(),
+                                      input.data(),
+                                      output.data(),
+                                      output.size(),
+                                      cfg.blosc_cname.c_str(),
+                                      cfg.blosc_blocksize,
+                                      kCompressionThreads);
+    if (rc <= 0) {
+        throw std::runtime_error("blosc_compress_ctx failed with code " + std::to_string(rc));
+    }
+    output.resize(static_cast<size_t>(rc));
+    return output;
+}
+
+std::vector<std::byte> bloscDecompress(std::span<const std::byte> input, size_t outputSize)
+{
+    ensureBloscInitialized();
+
+    std::vector<std::byte> output(outputSize);
+    const int rc = blosc_decompress(input.data(), output.data(), outputSize);
+    if (rc < 0) {
+        if (input.size() == outputSize) {
+            std::memcpy(output.data(), input.data(), outputSize);
+            return output;
+        }
+        throw std::runtime_error("blosc_decompress failed with code " + std::to_string(rc));
+    }
+    return output;
+}
+
+std::vector<std::byte> zstdCompress(std::span<const std::byte> input, const CompressorConfig& cfg)
+{
+    const size_t bound = ZSTD_compressBound(input.size());
+    std::vector<std::byte> output(bound);
+    const size_t rc = ZSTD_compress(output.data(), bound, input.data(), input.size(), cfg.level);
+    if (ZSTD_isError(rc)) {
+        throw std::runtime_error(std::string("ZSTD_compress failed: ") + ZSTD_getErrorName(rc));
+    }
+    output.resize(rc);
+    return output;
+}
+
+std::vector<std::byte> zstdDecompress(std::span<const std::byte> input, size_t outputSize)
+{
+    std::vector<std::byte> output(outputSize);
+    const size_t rc = ZSTD_decompress(output.data(), outputSize, input.data(), input.size());
+    if (ZSTD_isError(rc)) {
+        throw std::runtime_error(std::string("ZSTD_decompress failed: ") + ZSTD_getErrorName(rc));
+    }
+    if (rc != outputSize) {
+        throw std::runtime_error("ZSTD_decompress returned unexpected byte count");
+    }
+    return output;
+}
+
+std::vector<std::byte> lz4Compress(std::span<const std::byte> input, const CompressorConfig& cfg)
+{
+    const int inputSize = checkedInt(input.size(), "LZ4 input");
+    const int bound = LZ4_compressBound(inputSize);
+    std::vector<std::byte> output(sizeof(uint32_t) + static_cast<size_t>(bound));
+
+    const uint32_t originalSize = static_cast<uint32_t>(input.size());
+    std::memcpy(output.data(), &originalSize, sizeof(originalSize));
+
+    const int rc = LZ4_compress_fast(reinterpret_cast<const char*>(input.data()),
+                                     reinterpret_cast<char*>(output.data() + sizeof(uint32_t)),
+                                     inputSize,
+                                     bound,
+                                     std::max(cfg.level, 1));
+    if (rc <= 0) {
+        throw std::runtime_error("LZ4_compress_fast failed");
+    }
+    output.resize(sizeof(uint32_t) + static_cast<size_t>(rc));
+    return output;
+}
+
+std::vector<std::byte> lz4Decompress(std::span<const std::byte> input, size_t outputSize)
+{
+    if (input.size() < sizeof(uint32_t)) {
+        throw std::runtime_error("LZ4 compressed data too short");
+    }
+
+    uint32_t originalSize = 0;
+    std::memcpy(&originalSize, input.data(), sizeof(originalSize));
+    if (originalSize > outputSize) {
+        throw std::runtime_error("LZ4 original size exceeds output buffer");
+    }
+
+    std::vector<std::byte> output(outputSize);
+    const int rc = LZ4_decompress_safe(
+        reinterpret_cast<const char*>(input.data() + sizeof(uint32_t)),
+        reinterpret_cast<char*>(output.data()),
+        checkedInt(input.size() - sizeof(uint32_t), "LZ4 compressed payload"),
+        checkedInt(originalSize, "LZ4 output"));
+    if (rc < 0) {
+        throw std::runtime_error("LZ4_decompress_safe failed");
+    }
+    return output;
+}
+
+std::vector<std::byte> gzipCompress(std::span<const std::byte> input, const CompressorConfig& cfg)
+{
+    z_stream stream{};
+    if (deflateInit2(&stream, cfg.level, Z_DEFLATED, 16 + MAX_WBITS, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        throw std::runtime_error("deflateInit2 failed");
+    }
+
+    std::vector<std::byte> output(deflateBound(&stream, checkedUInt(input.size(), "gzip input")));
+    stream.avail_in = checkedUInt(input.size(), "gzip input");
+    stream.next_in = reinterpret_cast<Bytef*>(const_cast<std::byte*>(input.data()));
+    stream.avail_out = checkedUInt(output.size(), "gzip output");
+    stream.next_out = reinterpret_cast<Bytef*>(output.data());
+
+    const int rc = deflate(&stream, Z_FINISH);
+    deflateEnd(&stream);
+    if (rc != Z_STREAM_END) {
+        throw std::runtime_error("deflate failed with code " + std::to_string(rc));
+    }
+
+    output.resize(stream.total_out);
+    return output;
+}
+
+std::vector<std::byte> gzipDecompress(std::span<const std::byte> input, size_t outputSize)
+{
+    z_stream stream{};
+    if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK) {
+        throw std::runtime_error("inflateInit2 failed");
+    }
+
+    std::vector<std::byte> output(outputSize);
+    stream.avail_in = checkedUInt(input.size(), "gzip input");
+    stream.next_in = reinterpret_cast<Bytef*>(const_cast<std::byte*>(input.data()));
+    stream.avail_out = checkedUInt(output.size(), "gzip output");
+    stream.next_out = reinterpret_cast<Bytef*>(output.data());
+
+    const int rc = inflate(&stream, Z_FINISH);
+    inflateEnd(&stream);
+    if (rc != Z_STREAM_END && rc != Z_OK) {
+        throw std::runtime_error("gzip inflate failed with code " + std::to_string(rc));
+    }
+    return output;
+}
+
+std::vector<std::byte> decompressBytes(const CompressorConfig& cfg,
+                                       std::span<const std::byte> input,
+                                       size_t outputSize)
+{
+    switch (cfg.id) {
+    case CompressorId::None:
+        return std::vector<std::byte>(input.begin(), input.end());
+    case CompressorId::Blosc:
+        return bloscDecompress(input, outputSize);
+    case CompressorId::Zstd:
+        return zstdDecompress(input, outputSize);
+    case CompressorId::Lz4:
+        return lz4Decompress(input, outputSize);
+    case CompressorId::Gzip:
+        return gzipDecompress(input, outputSize);
+    }
+
+    throw std::runtime_error("unsupported zarr compressor");
+}
+
+std::vector<std::byte> compressBytes(const CompressorConfig& cfg,
+                                     std::span<const std::byte> input)
+{
+    switch (cfg.id) {
+    case CompressorId::None:
+        return std::vector<std::byte>(input.begin(), input.end());
+    case CompressorId::Blosc:
+        return bloscCompress(input, cfg);
+    case CompressorId::Zstd:
+        return zstdCompress(input, cfg);
+    case CompressorId::Lz4:
+        return lz4Compress(input, cfg);
+    case CompressorId::Gzip:
+        return gzipCompress(input, cfg);
+    }
+
+    throw std::runtime_error("unsupported zarr compressor");
+}
+
+} // namespace
+
+static void fillTypedElements(uint8_t* dst,
+                              size_t count,
+                              const std::vector<uint8_t>& fillBytes)
+{
+    if (count == 0) return;
+    if (fillBytes.size() == 1) {
+        std::memset(dst, fillBytes[0], count);
+        return;
+    }
+
+    const size_t elemSize = fillBytes.size();
+    for (size_t i = 0; i < count; ++i) {
+        std::memcpy(dst + i * elemSize, fillBytes.data(), elemSize);
+    }
+}
 
 static CompressorConfig parseCompressor(const nlohmann::json& zarray, int dtypeSize)
 {
@@ -74,25 +316,21 @@ static CompressorConfig parseCompressor(const nlohmann::json& zarray, int dtypeS
     return cfg;
 }
 
-#if UTILS_HAS_COMPRESSION
 static utils::ZarrArray::Codec codecFromConfig(const CompressorConfig& cfg)
 {
-    switch (cfg.id) {
-    case CompressorId::Blosc:
-        return utils::make_zarr_codec("blosc", cfg.blosc_clevel);
-    case CompressorId::Zstd:
-        return utils::make_zarr_codec("zstd", cfg.level);
-    case CompressorId::Lz4:
-        return utils::make_zarr_codec("lz4", cfg.level);
-    case CompressorId::Gzip:
-        return utils::make_zarr_codec("gzip", cfg.level);
-    case CompressorId::None:
-        throw std::runtime_error("zarr codec requested for uncompressed array");
+    if (cfg.id == CompressorId::None) {
+        return {};
     }
 
-    throw std::runtime_error("unsupported zarr compressor");
+    utils::ZarrArray::Codec codec;
+    codec.compress = [cfg](std::span<const std::byte> data) {
+        return compressBytes(cfg, data);
+    };
+    codec.decompress = [cfg](std::span<const std::byte> data, std::size_t outSize) {
+        return decompressBytes(cfg, data, outSize);
+    };
+    return codec;
 }
-#endif
 
 // ============================================================================
 // VcDataset::Impl
@@ -107,10 +345,34 @@ struct VcDataset::Impl {
     size_t dtypeSize_ = 1;
     std::string delimiter_ = ".";
     CompressorConfig compressor_;
+    std::vector<uint8_t> fillValueBytes_;
 
     // utils zarr array for chunk I/O
     std::shared_ptr<utils::FileSystemStore> store_;
     std::unique_ptr<utils::ZarrArray> zarrArray_;
+
+    void parseFillValue(const nlohmann::json& zarray)
+    {
+        std::int64_t rawFill = 0;
+        if (zarray.contains("fill_value") && !zarray["fill_value"].is_null()) {
+            rawFill = zarray["fill_value"].get<std::int64_t>();
+        }
+
+        fillValueBytes_.assign(dtypeSize_, 0);
+        if (dtype_ == VcDtype::uint8) {
+            if (rawFill < 0 || rawFill > std::numeric_limits<uint8_t>::max()) {
+                throw std::runtime_error("uint8 zarr fill_value out of range");
+            }
+            fillValueBytes_[0] = static_cast<uint8_t>(rawFill);
+            return;
+        }
+
+        if (rawFill < 0 || rawFill > std::numeric_limits<uint16_t>::max()) {
+            throw std::runtime_error("uint16 zarr fill_value out of range");
+        }
+        const auto fill = static_cast<uint16_t>(rawFill);
+        std::memcpy(fillValueBytes_.data(), &fill, sizeof(fill));
+    }
 
     void parseZarray(const std::filesystem::path& path)
     {
@@ -151,6 +413,8 @@ struct VcDataset::Impl {
             throw std::runtime_error("Unsupported zarr dtype: " + dtypeStr);
         }
 
+        parseFillValue(zarray);
+
         // Dimension separator
         if (zarray.contains("dimension_separator")) {
             delimiter_ = zarray["dimension_separator"].get<std::string>();
@@ -169,14 +433,9 @@ struct VcDataset::Impl {
             return;
         }
 
-#if UTILS_HAS_COMPRESSION
         auto codec = codecFromConfig(compressor_);
         zarrArray_ = std::make_unique<utils::ZarrArray>(
             utils::ZarrArray::open(fsPath, std::move(codec)));
-#else
-        zarrArray_ = std::make_unique<utils::ZarrArray>(
-            utils::ZarrArray::open(fsPath));
-#endif
     }
 };
 
@@ -208,7 +467,9 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
                             void* output, size_t nElements) const
 {
     const size_t outBytes = nElements * impl_->dtypeSize_;
-    const auto* src = reinterpret_cast<const char*>(compressed.data());
+    const auto input = std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(compressed.data()),
+        compressed.size());
 
     switch (impl_->compressor_.id) {
         case CompressorId::None:
@@ -216,7 +477,8 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
             break;
 
         case CompressorId::Blosc: {
-            int ret = blosc_decompress(src, output, outBytes);
+            ensureBloscInitialized();
+            int ret = blosc_decompress(compressed.data(), output, outBytes);
             if (ret < 0) {
                 if (compressed.size() == outBytes) {
                     std::memcpy(output, compressed.data(), outBytes);
@@ -229,8 +491,7 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
         }
 
         case CompressorId::Zstd: {
-            size_t ret = ZSTD_decompress(output, outBytes,
-                                          compressed.data(), compressed.size());
+            size_t ret = ZSTD_decompress(output, outBytes, compressed.data(), compressed.size());
             if (ZSTD_isError(ret)) {
                 throw std::runtime_error(
                     std::string("ZSTD_decompress failed: ") + ZSTD_getErrorName(ret));
@@ -239,44 +500,14 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
         }
 
         case CompressorId::Lz4: {
-            // numcodecs lz4 format: 4-byte LE original size prefix, then lz4 block
-            if (compressed.size() < 4) {
-                throw std::runtime_error("LZ4 compressed data too short");
-            }
-            uint32_t origSize;
-            std::memcpy(&origSize, compressed.data(), 4);
-            if (origSize > outBytes) {
-                throw std::runtime_error(
-                    "LZ4 origSize (" + std::to_string(origSize) +
-                    ") exceeds output buffer (" + std::to_string(outBytes) + ")");
-            }
-            int ret = LZ4_decompress_safe(
-                src + 4,
-                static_cast<char*>(output),
-                static_cast<int>(compressed.size() - 4),
-                static_cast<int>(origSize));
-            if (ret < 0) {
-                throw std::runtime_error("LZ4_decompress_safe failed");
-            }
+            const auto bytes = decompressBytes(impl_->compressor_, input, outBytes);
+            std::memcpy(output, bytes.data(), outBytes);
             break;
         }
 
         case CompressorId::Gzip: {
-            z_stream strm{};
-            if (inflateInit2(&strm, 16 + MAX_WBITS) != Z_OK) {
-                throw std::runtime_error("inflateInit2 failed");
-            }
-            strm.avail_in = static_cast<uInt>(compressed.size());
-            strm.next_in = const_cast<Bytef*>(
-                reinterpret_cast<const Bytef*>(compressed.data()));
-            strm.avail_out = static_cast<uInt>(outBytes);
-            strm.next_out = static_cast<Bytef*>(output);
-            int ret = inflate(&strm, Z_FINISH);
-            inflateEnd(&strm);
-            if (ret != Z_STREAM_END && ret != Z_OK) {
-                throw std::runtime_error("gzip inflate failed with code " +
-                                          std::to_string(ret));
-            }
+            const auto bytes = decompressBytes(impl_->compressor_, input, outBytes);
+            std::memcpy(output, bytes.data(), outBytes);
             break;
         }
     }
@@ -396,7 +627,7 @@ bool VcDataset::readRegion(const std::vector<size_t>& offset,
                     if (src) {
                         std::memcpy(outBytes + dstOff, src + srcOff, copySize[d] * elemSize);
                     } else {
-                        std::memset(outBytes + dstOff, 0, copySize[d] * elemSize);
+                        fillTypedElements(outBytes + dstOff, copySize[d], impl_->fillValueBytes_);
                     }
                     return;
                 }
@@ -589,7 +820,8 @@ std::unique_ptr<VcDataset> createZarrDataset(
     const std::vector<size_t>& chunks,
     VcDtype dtype,
     const std::string& compressor,
-    const std::string& dimensionSeparator)
+    const std::string& dimensionSeparator,
+    std::int64_t fillValue)
 {
     namespace fs = std::filesystem;
 
@@ -603,31 +835,23 @@ std::unique_ptr<VcDataset> createZarrDataset(
     zarray["shape"] = shape;
     zarray["chunks"] = chunks;
     zarray["dtype"] = (dtype == VcDtype::uint8) ? "|u1" : "<u2";
-    zarray["fill_value"] = 0;
+    zarray["fill_value"] = fillValue;
     zarray["order"] = "C";
     zarray["dimension_separator"] = dimensionSeparator;
 
     if (compressor == "blosc") {
-#if UTILS_HAS_COMPRESSION
         zarray["compressor"] = {
             {"id", "blosc"},
-            {"cname", "lz4"},
-            {"clevel", 5},
+            {"cname", "zstd"},
+            {"clevel", 3},
             {"shuffle", 1},
             {"blocksize", 0}
         };
-#else
-        zarray["compressor"] = nullptr;
-#endif
     } else if (compressor == "zstd") {
-#if UTILS_HAS_COMPRESSION
         zarray["compressor"] = {
             {"id", "zstd"},
             {"level", 3}
         };
-#else
-        zarray["compressor"] = nullptr;
-#endif
     } else if (compressor.empty() || compressor == "none") {
         zarray["compressor"] = nullptr;
     } else {
