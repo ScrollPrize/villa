@@ -13,12 +13,13 @@ python lasagna/labels_to_lasagna_normals.py \
     --output normals.zarr
 ```
 
-This runs four substeps internally:
+This runs five substeps internally:
 
 1. **Read TIFF, write binary zarr** — extracts the `==1` mask into a zarr Group with dataset `"0"`, consumed by vc_gen_normalgrids.
 2. **vc_gen_normalgrids** — generates normal grid volumes from the binary mask.
 3. **vc_ngrids --fit-normals** — fits local 3D normals, writes ngrids zarr with `x/0`, `y/0`, `z/0` (hemisphere-encoded uint8 normals).
-4. **Assemble lasagna zarr** — Python reads ngrids `x/0`, `y/0` + binary prediction, writes a flat `zarr.Array` (4, Z, Y, X) uint8:
+4. **Compute pred_dt** — euclidean distance transform of inverted binary mask at full resolution (distance from each voxel to nearest foreground surface; 0 on surface, increasing away), mean-pooled to step resolution, raw distance clamped to 255 uint8.
+5. **Assemble lasagna zarr** — Python reads ngrids `x/0`, `y/0` + binary prediction + pred_dt, writes a flat `zarr.Array` (5, Z, Y, X) uint8:
 
 | Channel | Name     | Value                                              |
 |---------|----------|----------------------------------------------------|
@@ -26,8 +27,9 @@ This runs four substeps internally:
 | 1       | grad_mag | density (default 128) where pred, 0 elsewhere      |
 | 2       | nx       | ngrids `x/0` (hemisphere-encoded)                  |
 | 3       | ny       | ngrids `y/0` (hemisphere-encoded)                  |
+| 4       | pred_dt  | distance to nearest foreground surface in voxels, clamped to 255 |
 
-Optional flags: `--step` (default 4), `--density` (default 128), `--skip-gen-normalgrids`, `--skip-fit-normals`.
+Optional flags: `--step` (default 4), `--density` (default 128), `--skip-gen-normalgrids`, `--skip-fit-normals`, `--no-pred-dt`.
 
 ## Step 2 — Fitting
 
@@ -67,7 +69,7 @@ This writes to `work/vis/`:
 
 Open all `.obj` files as layers in MeshLab. Textured slices and loss maps use accompanying `.mtl`/`.png` files (loaded automatically).
 
-Optional flags: `--slices` (default: xy xz), `--channels` (default: cos), `--losses` (default: normal step), `--no-mesh`, `--no-connections`, `--device` (default: cpu).
+Optional flags: `--slices` (default: xy xz yz), `--channels` (default: cos pred_dt), `--losses` (default: normal step), `--no-mesh`, `--no-connections`, `--device` (default: cpu).
 
 ## Arguments
 

@@ -383,6 +383,10 @@ def export_vis_obj(
 	# ------ Volume slices ------
 	for plane in slices:
 		for channel in channels:
+			vol = getattr(data, channel, None)
+			if vol is None:
+				print(f"[export_vis] skipping slice {plane}/{channel} (not in data)", flush=True)
+				continue
 			name = f"slice_{plane}_{channel}"
 			print(f"[export_vis] writing {name}", flush=True)
 			# Texture (native voxel resolution, no scaling)
@@ -449,8 +453,8 @@ if __name__ == "__main__":
 	parser.add_argument("--output-dir", required=True, help="Output directory for OBJ/MTL/PNG files")
 	parser.add_argument("--slices", nargs="*", default=["xy", "xz", "yz"],
 						choices=["xy", "xz", "yz"], help="Volume slice planes (default: xy xz yz)")
-	parser.add_argument("--channels", nargs="*", default=["cos"],
-						help="Volume channels to slice (default: cos)")
+	parser.add_argument("--channels", nargs="*", default=["cos", "pred_dt"],
+						help="Volume channels to slice (default: cos pred_dt)")
 	parser.add_argument("--losses", nargs="*", default=["normal", "step"],
 						help="Loss maps to export (default: normal step)")
 	parser.add_argument("--no-mesh", action="store_true", help="Skip mesh export")

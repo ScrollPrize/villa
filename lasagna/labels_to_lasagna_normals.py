@@ -1,8 +1,8 @@
 """Pipeline: binary label TIFF → binary zarr → vc_gen_normalgrids →
 vc_ngrids --fit-normals → Python lasagna zarr assembly → fit.py.
 
-The lasagna-format zarr is a flat zarr.Array (4, Z, Y, X) uint8 with channels
-[cos, grad_mag, nx, ny] and preprocess_params metadata,
+The lasagna-format zarr is a flat zarr.Array (C, Z, Y, X) uint8 with channels
+[cos, grad_mag, nx, ny, pred_dt] and preprocess_params metadata,
 ready to be consumed by fit_data.load_3d().
 
 Usage
@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import tifffile
 import zarr
+from scipy.ndimage import distance_transform_edt
 
 
 TAG = "[labels_to_lasagna_normals]"
@@ -73,15 +74,57 @@ def _downsample_any(vol: np.ndarray, step: int) -> np.ndarray:
     )
 
 
+def _downsample_mean(vol: np.ndarray, step: int) -> np.ndarray:
+    """Downsample a 3D float volume by *step* using mean-pooling."""
+    if step == 1:
+        return vol
+    z, y, x = vol.shape
+    pz = -z % step
+    py = -y % step
+    px = -x % step
+    if pz or py or px:
+        vol = np.pad(vol, ((0, pz), (0, py), (0, px)))
+    z2, y2, x2 = vol.shape
+    return (
+        vol.reshape(z2 // step, step, y2 // step, step, x2 // step, step)
+        .mean(axis=(1, 3, 5))
+    )
+
+
+def _compute_pred_dt(binary: np.ndarray, step: int) -> np.ndarray:
+    """Compute distance-transform of inverted binary mask at full res, downscale, encode uint8.
+
+    DT = distance from each voxel to the nearest foreground (label=1) surface.
+    0 on the surface, increasing away from it.
+    Stored as raw distance in voxels, clamped to 255 (matching preprocess_cos_omezarr.py).
+    """
+    print(f"{TAG} computing distance transform at full res {binary.shape}...", flush=True)
+    dt = distance_transform_edt(~binary.astype(bool)).astype(np.float32)
+    dt_max = float(dt.max())
+    print(f"{TAG} DT max = {dt_max:.1f} voxels", flush=True)
+
+    # Downscale to step resolution via mean-pooling
+    dt_ds = _downsample_mean(dt, step).astype(np.float32)
+
+    # Encode: raw distance clamped to 255 (same as preprocess_cos_omezarr.py)
+    dt_u8 = np.clip(dt_ds, 0, 255).astype(np.uint8)
+
+    print(f"{TAG} pred_dt downsampled shape={dt_u8.shape}  "
+          f"max_dist={float(dt_ds.max()):.1f}", flush=True)
+    return dt_u8
+
+
 def _write_lasagna_zarr(
     ngrids_zarr: Path,
     binary: np.ndarray,
+    ignore: np.ndarray,
     output: Path,
     step: int,
     density: int,
     chunk_size: int,
+    pred_dt_u8: np.ndarray | None = None,
 ) -> None:
-    """Read ngrids x/0, y/0 + binary pred → write flat lasagna zarr.Array."""
+    """Read ngrids x/0, y/0 + binary pred + ignore mask → write flat lasagna zarr.Array."""
     # Read hemisphere-encoded normals from ngrids output
     ng = zarr.open(str(ngrids_zarr), mode="r")
     nx_vol = np.array(ng["x/0"])  # (Z_ds, Y_ds, X_ds) uint8
@@ -89,22 +132,35 @@ def _write_lasagna_zarr(
 
     # Downsample binary prediction to step resolution
     pred_ds = _downsample_any(binary, step)
+    # Downsample ignore mask with max-pooling (conservative: any ignore voxel → block invalid)
+    ignore_ds = _downsample_any(ignore, step)
 
     # Ensure shapes match (ngrids may be full-volume sized)
     dz, dy, dx = pred_ds.shape
     nx_vol = nx_vol[:dz, :dy, :dx]
     ny_vol = ny_vol[:dz, :dy, :dx]
+    ignore_ds = ignore_ds[:dz, :dy, :dx]
 
     mask = pred_ds > 0
+    valid = ignore_ds == 0  # valid where NOT ignore (bg + pred are valid)
 
-    # Build 4 channels
+    # Build channels
+    # cos: 255 where prediction, 0 elsewhere
     cos_ch = np.where(mask, np.uint8(255), np.uint8(0))
-    grad_mag_ch = np.where(mask, np.uint8(density), np.uint8(0))
-    # normals: keep raw ngrids values (hemisphere-encoded)
+    # grad_mag: density where valid (bg + pred), 0 where ignore (encodes invalid)
+    grad_mag_ch = np.where(valid, np.uint8(density), np.uint8(0))
     nx_ch = nx_vol.astype(np.uint8)
     ny_ch = ny_vol.astype(np.uint8)
 
-    out_vol = np.stack([cos_ch, grad_mag_ch, nx_ch, ny_ch], axis=0)  # (4, Z, Y, X)
+    channels = [cos_ch, grad_mag_ch, nx_ch, ny_ch]
+    channel_names = ["cos", "grad_mag", "nx", "ny"]
+
+    if pred_dt_u8 is not None:
+        pred_dt_u8 = pred_dt_u8[:dz, :dy, :dx]
+        channels.append(pred_dt_u8)
+        channel_names.append("pred_dt")
+
+    out_vol = np.stack(channels, axis=0)  # (C, Z, Y, X)
 
     if output.exists():
         shutil.rmtree(output)
@@ -120,7 +176,7 @@ def _write_lasagna_zarr(
     arr[:] = out_vol
     arr.attrs["preprocess_params"] = {
         "scaledown": step,
-        "channels": ["cos", "grad_mag", "nx", "ny"],
+        "channels": channel_names,
         "grad_mag_encode_scale": float(density),
     }
     print(
@@ -152,6 +208,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="Skip vc_gen_normalgrids (reuse existing grids in work-dir)")
     p.add_argument("--skip-fit-normals", action="store_true",
                     help="Skip vc_ngrids --fit-normals (reuse existing ngrids zarr)")
+    p.add_argument("--no-pred-dt", action="store_true",
+                    help="Skip computing pred_dt channel (distance transform)")
     args = p.parse_args(argv)
 
     input_path = Path(args.input)
@@ -176,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{TAG} volume shape={vol.shape}  bg={n_bg}  pred={n_fg}  ignore={n_ign}", flush=True)
 
     binary = (vol == 1).astype(np.uint8)
+    ignore = (vol == 2).astype(np.uint8)
 
     if not args.skip_gen_normalgrids:
         _write_binary_zarr(binary, binary_zarr_path, args.chunk_size)
@@ -209,10 +268,18 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"{TAG} step 3: skipping vc_ngrids --fit-normals (--skip-fit-normals)", flush=True)
 
-    # -- Step 4: Assemble lasagna zarr from ngrids + binary ------------------
+    # -- Step 4: Compute pred_dt (distance transform) ------------------------
+    if not args.no_pred_dt:
+        pred_dt_u8 = _compute_pred_dt(binary, args.step)
+    else:
+        pred_dt_u8 = None
+        print(f"{TAG} step 4: skipping pred_dt (--no-pred-dt)", flush=True)
+
+    # -- Step 5: Assemble lasagna zarr from ngrids + binary ------------------
     _write_lasagna_zarr(
-        ngrids_zarr_path, binary, output_path,
+        ngrids_zarr_path, binary, ignore, output_path,
         args.step, args.density, args.chunk_size,
+        pred_dt_u8=pred_dt_u8,
     )
 
     print(f"{TAG} pipeline complete: {output_path}", flush=True)
