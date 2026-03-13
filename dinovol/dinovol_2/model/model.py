@@ -33,7 +33,7 @@ _BACKBONE_DEFAULTS = {
     "drop_path_rate": 0.0,
     "drop_path_uniform": False,
     "init_values": None,
-    "use_abs_pos_emb": True,
+    "use_abs_pos_emb": False,
     "use_rot_pos_emb": True,
     "num_reg_tokens": 4,
     "grad_checkpointing": False,

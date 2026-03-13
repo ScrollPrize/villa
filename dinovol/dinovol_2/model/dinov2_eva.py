@@ -14,6 +14,7 @@ from einops import rearrange
 
 from dinovol_2.model.patch_encode_decode import PatchEmbed, PatchEmbedDeeper
 
+
 class InitWeights_He(object):
     def __init__(self, neg_slope: float = 1e-2):
         self.neg_slope = neg_slope
@@ -291,7 +292,7 @@ class Eva(nn.Module):
             norm_layer: Callable = LayerNorm,
             init_values: Optional[float] = None,
             class_token: bool = True,
-            use_abs_pos_emb: bool = True,
+            use_abs_pos_emb: bool = False,
             use_rot_pos_emb: bool = True,
             dynamic_img_size: bool = False,
             num_reg_tokens: int = 0,
@@ -685,10 +686,10 @@ class Eva(nn.Module):
             state_dict = torch.load(state_dict)['teacher']
             new_state_dict = {}
             for k, v in state_dict.items():
-                new_key = k.replace("backbone.", "")  # Strip 'backbone.' prefix
+                if not k.startswith("backbone."):
+                    continue
+                new_key = k.replace("backbone.", "", 1)
                 new_state_dict[new_key] = v
-            if backbone_only:
-                new_state_dict = {k: v for k, v in new_state_dict.items() if not k.startswith("dino_head.")}
             state_dict = new_state_dict
         
         if unchunk:
