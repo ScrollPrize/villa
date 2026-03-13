@@ -277,7 +277,7 @@ static bool isRasterizedLabelVolumePath(const QString& volumePath)
 struct IgnoreLabelDialogResult {
     QString volumePath;
     QString outputName;
-    int ignoreValue{127};
+    int ignoreValue{2};
     double chunkAlphaL0{64.0};
     int workers{0};
     int zMin{0};
@@ -398,7 +398,7 @@ bool selectIgnoreLabelParams(QWidget* parent,
 
     auto* spIgnore = new QSpinBox(&dlg);
     spIgnore->setRange(1, 254);
-    spIgnore->setValue(settings.value(QStringLiteral("tools/add_ignore_label_ignore_value"), 127).toInt());
+    spIgnore->setValue(settings.value(QStringLiteral("tools/add_ignore_label_ignore_value"), 2).toInt());
     form->addRow(QObject::tr("Ignore value:"), spIgnore);
 
     auto* lblMode = new QLabel(
