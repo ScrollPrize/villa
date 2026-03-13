@@ -226,11 +226,37 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{TAG} winding chain: {chain}", flush=True)
     print(f"{TAG} winding_map: {winding_map_dict}", flush=True)
 
+    # -- Envelope mask (mark exterior voxels) -------------------------------
+    first_cc_id = chain[0] + 1   # 1-indexed CC label
+    last_cc_id = chain[-1] + 1
+    print(f"{TAG} computing envelope mask (first_cc={first_cc_id}, last_cc={last_cc_id})", flush=True)
+
+    dt_first = distance_transform_edt(cc_labels != first_cc_id).astype(np.float32)
+    dt_last = distance_transform_edt(cc_labels != last_cc_id).astype(np.float32)
+
+    # Dot product of gradients, one axis at a time to limit memory
+    dot = np.zeros(shape, dtype=np.float32)
+    for axis in range(3):
+        g1 = np.gradient(dt_first, axis=axis)
+        g2 = np.gradient(dt_last, axis=axis)
+        dot += g1 * g2
+        del g1, g2
+    del dt_first, dt_last
+
+    outside_mask = (dot > 0) & (fg == 0)   # never zero out foreground voxels
+    del dot
+    n_outside = int(outside_mask.sum())
+    print(f"{TAG} outside envelope: {n_outside} voxels "
+          f"({100 * n_outside / outside_mask.size:.1f}%) will be zeroed", flush=True)
+
     # -- Per-voxel winding interpolation ------------------------------------
     w1 = winding_map_arr[idx_1]  # (Z, Y, X) float32
     w2 = winding_map_arr[idx_2]  # (Z, Y, X) float32
     total = np.maximum(dist_1 + dist_2, 1e-8)
     winding_vol = (w1 * dist_2 + w2 * dist_1) / total
+
+    winding_vol[outside_mask] = 0.0
+    del outside_mask
 
     # Free large arrays
     del dist_1, dist_2, idx_1, idx_2, w1, w2, total

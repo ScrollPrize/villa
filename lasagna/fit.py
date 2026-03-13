@@ -348,6 +348,7 @@ def main(argv: list[str] | None = None) -> int:
 		snapshot_fn=_snapshot,
 		progress_fn=_progress,
 		load_data_fn=_load_data,
+		volume_extent_fullres=volume_extent_fullres,
 	)
 
 	if device.type == "cuda":

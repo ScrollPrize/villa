@@ -210,8 +210,12 @@ def _lr_scalespace(*, lr: float | list[float], scale_i: int) -> float:
 	return float(lr[0])
 
 
-def check_data_bounds(model, data: fit_data.FitData3D, margin: float = 100.0) -> bool:
-	"""Return True if any mesh vertex is within `margin` fullres voxels of the data border."""
+def check_data_bounds(model, data: fit_data.FitData3D, margin: float = 100.0,
+					  volume_extent_fullres: tuple[int, int, int] | None = None) -> bool:
+	"""Return True if any mesh vertex is within `margin` fullres voxels of the data border.
+
+	Skips edges where the loaded data already reaches the volume boundary.
+	"""
 	with torch.no_grad():
 		xyz = model._grid_xyz()  # (D, Hm, Wm, 3)
 		mesh_min = [float(xyz[..., i].min()) for i in range(3)]
@@ -224,10 +228,20 @@ def check_data_bounds(model, data: fit_data.FitData3D, margin: float = 100.0) ->
 		data.origin_fullres[1] + (Y - 1) * data.spacing[1],
 		data.origin_fullres[2] + (Z - 1) * data.spacing[2],
 	]
+	# Full volume max per axis (x, y, z)
+	if volume_extent_fullres is not None:
+		vol_max = [float(volume_extent_fullres[0]),
+				   float(volume_extent_fullres[1]),
+				   float(volume_extent_fullres[2])]
+	else:
+		vol_max = None
 	for i in range(3):
-		if mesh_min[i] - data_min[i] < margin:
+		# Near min edge — but skip if data already starts at volume origin
+		if data_min[i] > 0 and mesh_min[i] - data_min[i] < margin:
 			return True
-		if data_max[i] - mesh_max[i] < margin:
+		# Near max edge — but skip if data already reaches volume edge
+		at_vol_max = vol_max is not None and data_max[i] >= vol_max[i] - data.spacing[i]
+		if not at_vol_max and data_max[i] - mesh_max[i] < margin:
 			return True
 	return False
 
@@ -241,6 +255,7 @@ def optimize(
 	snapshot_fn,
 	progress_fn=None,
 	load_data_fn=None,
+	volume_extent_fullres: tuple[int, int, int] | None = None,
 ) -> fit_data.FitData3D:
 
 	terms = {
@@ -390,7 +405,7 @@ def optimize(
 				_t_steps_acc = 0
 				_t_wall_start = _t_wall_now
 
-			if load_data_fn is not None and (step1 % 100) == 0 and check_data_bounds(model, data):
+			if load_data_fn is not None and (step1 % 100) == 0 and check_data_bounds(model, data, volume_extent_fullres=volume_extent_fullres):
 				print(f"[optimizer] mesh near data border at step {step1}, reloading data", flush=True)
 				data = load_data_fn()
 

@@ -31,7 +31,7 @@ This runs five substeps internally:
 
 Optional flags: `--step` (default 4), `--density` (default 128), `--skip-gen-normalgrids`, `--skip-fit-normals`, `--no-pred-dt`.
 
-## Step 1b — Winding volume (optional)
+## Step 2 — Winding volume
 
 ```bash
 python lasagna/labels_to_winding_volume.py \
@@ -51,20 +51,7 @@ The output zarr has smooth values ranging from 1 to N (number of CCs), with inte
 
 Optional flags: `--step` (default 4), `--connectivity` (6 or 26), `--min-voxels` (default 0), `--chunk-size` (default 64).
 
-## Step 2 — Fitting
-
-```bash
-python lasagna/fit.py \
-    lasagna/vc3d_configs/vc3d_labels_3d_straight.json \
-    --input normals.zarr \
-    --seed <cx> <cy> <cz> \
-    --model-w <width> --model-h <height> \
-    --windings <n> \
-    --out-dir work/fit_output \
-    --model-output work/fit_output/model.pt
-```
-
-To use the winding volume constraint, add `--winding-volume winding.zarr` and set `"winding_vol"` weight in the stages config:
+## Step 3 — Fitting
 
 ```bash
 python lasagna/fit.py \
@@ -78,17 +65,17 @@ python lasagna/fit.py \
     --model-output work/fit_output/model.pt
 ```
 
-The `winding_vol` loss penalizes deviation of each mesh depth layer from its expected winding number (depth d → winding d+1). Set the weight in the stages JSON `base` or per-stage `w_fac`, e.g. `"winding_vol": 1.0`.
+The `winding_vol` loss (weight 1.0 in the config) penalizes deviation of each mesh depth layer from its expected winding number (depth d → winding d+1). The weight can be adjusted in the stages JSON `base` or per-stage `w_fac`.
 
 The straight config models the sheet as a line in XY (center + angle + half-width) with perpendicular winding offsets — appropriate for small or flat regions. It runs two stages:
-1. **straight_only** (1000 steps) — fits straight parameters (cx, cy, angle, half_w).
+1. **straight_only** (100 steps) — fits straight parameters (cx, cy, angle, half_w).
 2. **opt** (2000 steps) — optimizes mesh and connectivity offsets.
 
 The straight representation is baked into the mesh on save, so downstream steps are identical regardless of init mode.
 
 For scroll-like geometry with significant curvature, use `vc3d_labels_3d.json` instead (arc init).
 
-## Step 3 — Visualization (model → OBJ for MeshLab)
+## Step 4 — Visualization (model → OBJ for MeshLab)
 
 ```bash
 python lasagna/export_vis_obj.py \
