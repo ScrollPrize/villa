@@ -296,10 +296,10 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
                 const cv::Vec3f planeNormal = planeSurf->normal({0, 0, 0});
                 _approvalTool->startStrokeFromPlane(worldPos, planeNormal, worldRadius);
             } else {
-                // Flattened view - use scene coordinates
+                // Flattened view - convert scene coordinates to surface coordinates
                 const QPointF scenePos = viewer->lastScenePosition();
-                const float viewerScale = viewer->getCurrentScale();
-                _approvalTool->startStroke(worldPos, scenePos, viewerScale);
+                const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
+                _approvalTool->startStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]));
             }
         }
         return;
@@ -428,10 +428,10 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
                     const cv::Vec3f planeNormal = planeSurf->normal({0, 0, 0});
                     _approvalTool->extendStrokeFromPlane(worldPos, planeNormal, worldRadius, false);
                 } else {
-                    // Pass scene position and viewerScale for proper grid coordinate computation
+                    // Convert scene coordinates to surface coordinates for grid mapping
                     const QPointF scenePos = viewer->lastScenePosition();
-                    const float viewerScale = viewer->getCurrentScale();
-                    _approvalTool->extendStroke(worldPos, scenePos, viewerScale, false);
+                    const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
+                    _approvalTool->extendStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]), false);
                 }
             }
         } else {
@@ -461,7 +461,7 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
         }
         if (shouldUpdate) {
             const QPointF scenePos = viewer->lastScenePosition();
-            const float viewerScale = viewer->getCurrentScale();
+            const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
 
             // Get plane normal if this is a plane viewer (XY/XZ/YZ)
             std::optional<cv::Vec3f> planeNormal;
@@ -470,7 +470,7 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
                 planeNormal = planeSurf->normal({0, 0, 0});
             }
 
-            _approvalTool->setHoverWorldPos(worldPos, _approvalMaskBrushRadius, scenePos, viewerScale, planeNormal);
+            _approvalTool->setHoverWorldPos(worldPos, _approvalMaskBrushRadius, QPointF(surfCoords[0], surfCoords[1]), planeNormal);
             refreshOverlay();
         }
     }
@@ -530,10 +530,10 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
                 _approvalTool->extendStrokeFromPlane(worldPos, planeNormal, worldRadius, true);
                 _approvalTool->finishStrokeFromPlane();
             } else {
-                // Pass scene position and viewerScale for proper grid coordinate computation
+                // Convert scene coordinates to surface coordinates for grid mapping
                 const QPointF scenePos = viewer->lastScenePosition();
-                const float viewerScale = viewer->getCurrentScale();
-                _approvalTool->extendStroke(worldPos, scenePos, viewerScale, true);
+                const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
+                _approvalTool->extendStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]), true);
                 _approvalTool->finishStroke();
             }
             // Don't apply immediately - wait for user to press Apply button

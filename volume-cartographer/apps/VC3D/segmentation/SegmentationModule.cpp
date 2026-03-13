@@ -1074,8 +1074,7 @@ void SegmentationModule::refreshOverlay()
             state.approvalCurrentStroke = _approvalTool->overlayPoints();
             state.paintingApproval = (_approvalTool->paintMode() == ApprovalMaskBrushTool::PaintMode::Approve);
             state.approvalHoverWorld = _approvalTool->hoverWorldPos();
-            state.approvalHoverScenePos = _approvalTool->hoverScenePos();
-            state.approvalHoverViewerScale = _approvalTool->hoverViewerScale();
+            state.approvalHoverSurfacePos = _approvalTool->hoverSurfacePos();
             state.approvalHoverPlaneNormal = _approvalTool->hoverPlaneNormal();
             if (_approvalTool->strokeActive() && _approvalTool->effectivePaintRadius() > 0.0f) {
                 state.approvalEffectiveRadius = _approvalTool->effectivePaintRadius();

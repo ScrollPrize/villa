@@ -85,6 +85,8 @@ public:
 
     void setSurfacePatchSamplingStride(int stride, bool userInitiated = true);
     int surfacePatchSamplingStride() const { return _surfacePatchSamplingStride; }
+    void setIntersectionMaxSurfaces(int limit);
+    int intersectionMaxSurfaces() const { return _intersectionMaxSurfaces; }
     void primeSurfacePatchIndicesAsync();
     void resetStrideUserOverride() { _surfacePatchStrideUserSet = false; }
 
@@ -155,6 +157,7 @@ private:
     int _surfacePatchSamplingStride{1};
     bool _surfacePatchStrideUserSet{false};
     int _targetRefinedStride{0};  // 0 = no refinement pending
+    int _intersectionMaxSurfaces{0};  // 0 = unlimited
 
     VolumeOverlayController* _volumeOverlay{nullptr};
     SurfacePatchIndex _surfacePatchIndex;

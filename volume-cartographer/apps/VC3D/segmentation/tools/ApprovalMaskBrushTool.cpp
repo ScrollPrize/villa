@@ -91,10 +91,10 @@ void ApprovalMaskBrushTool::setActive(bool active)
     _module.refreshOverlay();
 }
 
-void ApprovalMaskBrushTool::startStroke(const cv::Vec3f& worldPos, const QPointF& scenePos, float viewerScale)
+void ApprovalMaskBrushTool::startStroke(const cv::Vec3f& worldPos, const QPointF& surfacePos)
 {
     qCDebug(lcApprovalMask) << "Starting approval stroke at:" << worldPos[0] << worldPos[1] << worldPos[2]
-                           << "scenePos:" << scenePos.x() << scenePos.y() << "viewerScale:" << viewerScale;
+                           << "surfacePos:" << surfacePos.x() << surfacePos.y();
     _strokeActive = true;
     _currentStroke.clear();
     _currentStroke.push_back(worldPos);
@@ -124,8 +124,8 @@ void ApprovalMaskBrushTool::startStroke(const cv::Vec3f& worldPos, const QPointF
     _hoverWorldPos = worldPos;
     _hoverEffectiveRadius = _module.approvalMaskBrushRadius();
 
-    // Add the starting point for painting - compute grid position from scene coordinates
-    auto gridIdx = sceneToGridIndex(scenePos, viewerScale);
+    // Add the starting point for painting - compute grid position from surface coordinates
+    auto gridIdx = surfaceToGridIndex(surfacePos);
     if (gridIdx) {
         qCDebug(lcApprovalMask) << "  Grid index:" << gridIdx->first << gridIdx->second;
         const uint64_t hash = (static_cast<uint64_t>(gridIdx->first) << 32) | static_cast<uint64_t>(gridIdx->second);
@@ -141,14 +141,14 @@ void ApprovalMaskBrushTool::startStroke(const cv::Vec3f& worldPos, const QPointF
     // Note: paintAccumulatedPointsToImage already calls refreshOverlay
 }
 
-void ApprovalMaskBrushTool::extendStroke(const cv::Vec3f& worldPos, const QPointF& scenePos, float viewerScale, bool forceSample)
+void ApprovalMaskBrushTool::extendStroke(const cv::Vec3f& worldPos, const QPointF& surfacePos, bool forceSample)
 {
     if (!_strokeActive) {
         return;
     }
 
-    // Check if position is within valid surface bounds using scene coordinates
-    auto gridIdx = sceneToGridIndex(scenePos, viewerScale);
+    // Check if position is within valid surface bounds using surface coordinates
+    auto gridIdx = surfaceToGridIndex(surfacePos);
     if (!gridIdx) {
         // Outside valid surface area - break the current stroke segment
         // but keep stroke active so we can start a new segment when back in bounds
@@ -813,11 +813,11 @@ void ApprovalMaskBrushTool::finishStrokeFromWorld()
     }
 }
 
-std::optional<std::pair<int, int>> ApprovalMaskBrushTool::sceneToGridIndex(const QPointF& scenePos, float viewerScale) const
+std::optional<std::pair<int, int>> ApprovalMaskBrushTool::surfaceToGridIndex(const QPointF& surfacePos) const
 {
-    // Convert scene coordinates to grid indices
-    // The overlay rendering uses: scenePos = (gridPos/surfScale - center) * viewerScale
-    // Inverting: gridPos = (scenePos/viewerScale + center) * surfScale
+    // Convert surface parameter coordinates to grid indices.
+    // Surface coords come from TileScene::sceneToSurface() and range from
+    // -center to +center. Grid indices = (surfacePos + center) * scale.
     if (!_surface) {
         return std::nullopt;
     }
@@ -831,11 +831,9 @@ std::optional<std::pair<int, int>> ApprovalMaskBrushTool::sceneToGridIndex(const
     const cv::Vec3f center = _surface->center();
     const cv::Vec2f surfScale = _surface->scale();
 
-    // Compute grid position: (scenePos / viewerScale + center) * surfaceScale
-    const float surfLocX = static_cast<float>(scenePos.x()) / viewerScale;
-    const float surfLocY = static_cast<float>(scenePos.y()) / viewerScale;
-    const float gridX = (surfLocX + center[0]) * surfScale[0];
-    const float gridY = (surfLocY + center[1]) * surfScale[1];
+    // Compute grid position: (surfacePos + center) * surfaceScale
+    const float gridX = (static_cast<float>(surfacePos.x()) + center[0]) * surfScale[0];
+    const float gridY = (static_cast<float>(surfacePos.y()) + center[1]) * surfScale[1];
 
     const int col = static_cast<int>(std::round(gridX));
     const int row = static_cast<int>(std::round(gridY));
@@ -867,12 +865,11 @@ std::optional<std::pair<int, int>> ApprovalMaskBrushTool::sceneToGridIndex(const
     return std::make_pair(row, col);
 }
 
-void ApprovalMaskBrushTool::setHoverWorldPos(const cv::Vec3f& pos, float brushRadius, const QPointF& scenePos, float viewerScale,
+void ApprovalMaskBrushTool::setHoverWorldPos(const cv::Vec3f& pos, float brushRadius, const QPointF& surfacePos,
                                              const std::optional<cv::Vec3f>& planeNormal)
 {
     _hoverWorldPos = pos;
-    _hoverScenePos = scenePos;
-    _hoverViewerScale = viewerScale;
+    _hoverSurfacePos = surfacePos;
     _hoverPlaneNormal = planeNormal;
 
     // For flat cylinder model: always use full brush radius
