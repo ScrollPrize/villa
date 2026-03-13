@@ -269,6 +269,19 @@ def _process_copy_request(request, state):
 
     if not isinstance(outputs, dict):
         return {"error": "Displacement copy returned invalid outputs payload."}
+    if str(outputs.get("mode", "")) == "save_tifs":
+        return {
+            "ok": True,
+            "mode": "save_tifs",
+            "saved_tifs": outputs,
+            "resolved": {
+                "volume_path": copy_args.get("volume_path"),
+                "volume_scale": int(copy_args.get("volume_scale")),
+                "checkpoint_path": copy_args.get("checkpoint_path"),
+                "tifxyz_path": copy_args.get("tifxyz_path"),
+                "out_dir": copy_args.get("out_dir"),
+            },
+        }
     front_path = outputs.get("front")
     back_path = outputs.get("back")
     if not isinstance(front_path, str) or not front_path:
