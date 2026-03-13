@@ -322,6 +322,11 @@ def main(argv: list[str] | None = None) -> int:
 		corr_results = opt_loss_corr.get_last_results()
 		if corr_results is not None:
 			st["_corr_points_results_"] = corr_results
+		# Store winding volume auto-offset if computed
+		from opt_loss_winding_volume import _winding_offset, _winding_direction
+		if _winding_offset is not None:
+			st["_winding_offset_"] = _winding_offset
+			st["_winding_direction_"] = _winding_direction
 		torch.save(st, path)
 
 	def _snapshot(*, stage: str, step: int, loss: float, data, res=None) -> None:

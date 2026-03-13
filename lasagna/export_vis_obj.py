@@ -199,8 +199,11 @@ def _viridis(vals: np.ndarray) -> np.ndarray:
 
 
 def _loss_to_png(path: Path, lm_2d: np.ndarray, mask_2d: np.ndarray | None) -> None:
-	"""Colormap a 2D loss map and write as PNG."""
-	# Normalize to [0, 1] using robust percentile
+	"""Colormap a 2D loss map as grayscale and write as PNG.
+
+	White = high loss, black = zero loss or masked out.
+	"""
+	# Normalize to [0, 1] using robust percentile of valid region
 	valid = lm_2d[mask_2d > 0.5] if mask_2d is not None else lm_2d.ravel()
 	if len(valid) == 0:
 		vmin, vmax = 0.0, 1.0
@@ -209,13 +212,12 @@ def _loss_to_png(path: Path, lm_2d: np.ndarray, mask_2d: np.ndarray | None) -> N
 		vmax = float(np.percentile(valid, 98))
 	if vmax - vmin < 1e-8:
 		vmax = vmin + 1.0
-	normed = (lm_2d - vmin) / (vmax - vmin)
-	rgb = _viridis(normed)
-	# Dim masked-out regions
+	normed = np.clip((lm_2d - vmin) / (vmax - vmin), 0.0, 1.0)
+	gray = (normed * 255).astype(np.uint8)
+	# Black out masked regions
 	if mask_2d is not None:
-		dark = (mask_2d < 0.5)
-		rgb[dark] = (rgb[dark] * 0.3).astype(np.uint8)
-	_write_png(path, rgb)
+		gray[mask_2d < 0.5] = 0
+	_write_png(path, np.stack([gray, gray, gray], axis=-1))
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +418,13 @@ def export_vis_obj(
 	st = torch.load(model_path, map_location=dev, weights_only=False)
 	mdl = fit_model.Model3D.from_checkpoint(st, device=dev)
 
+	# Restore winding auto-offset from checkpoint if available
+	if "_winding_offset_" in st:
+		opt_loss_winding_volume._winding_offset = float(st["_winding_offset_"])
+		opt_loss_winding_volume._winding_direction = int(st["_winding_direction_"])
+		print(f"[export_vis] restored winding auto_offset={opt_loss_winding_volume._winding_offset}, "
+			  f"direction={opt_loss_winding_volume._winding_direction}", flush=True)
+
 	# Load data (auto-crop around mesh bbox)
 	print(f"[export_vis] loading data from {data_path}", flush=True)
 	data = fit_data.load_3d_for_model(path=data_path, device=dev, model=mdl,
@@ -437,6 +446,8 @@ def export_vis_obj(
 		)
 		data = dataclasses.replace(data, winding_volume=wv_t)
 		print(f"[export_vis] winding volume shape: {wv_t.shape}", flush=True)
+		if "winding_vol" not in losses:
+			losses = list(losses) + ["winding_vol"]
 
 	# Forward pass
 	print("[export_vis] running forward pass", flush=True)
