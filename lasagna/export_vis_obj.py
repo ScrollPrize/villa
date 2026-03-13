@@ -148,6 +148,17 @@ def _write_mtl_multi(path: Path,
 # PNG writer (minimal, no PIL dependency)
 # ---------------------------------------------------------------------------
 
+def _write_pfm(path: Path, data: np.ndarray) -> None:
+	"""Write a 2D float32 array as a grayscale PFM (Portable FloatMap) file."""
+	h, w = data.shape[:2]
+	with open(path, 'wb') as f:
+		f.write(b'Pf\n')
+		f.write(f'{w} {h}\n'.encode())
+		f.write(b'-1.0\n')  # negative = little-endian
+		# PFM stores bottom-to-top
+		f.write(np.ascontiguousarray(data[::-1]).astype(np.float32).tobytes())
+
+
 def _write_png(path: Path, img: np.ndarray) -> None:
 	"""Write an RGB uint8 image as PNG using only zlib (no PIL/matplotlib)."""
 	import zlib
@@ -543,6 +554,9 @@ def export_vis_obj(
 				png_name = f"{mat_name}.png"
 				tex = _slice_texture(data, plane, channel, frac=frac)
 				_write_png(out / png_name, tex)
+				vol_arr = getattr(data, channel).squeeze().cpu().numpy()
+				sl_idx = _slice_index(plane, vol_arr.shape, frac)
+				_write_pfm(out / f"{mat_name}.pfm", _take_slice(vol_arr, plane, sl_idx).astype(np.float32))
 				corners = _slice_corners(plane, data_min, data_max, frac=frac)
 				quads.append((corners, mat_name))
 				materials.append((mat_name, png_name))
@@ -605,6 +619,9 @@ def export_vis_obj(
 				png_name = f"{mat_name}.png"
 				tex = _slice_winding_volume(data, plane, frac=frac)
 				_write_png(out / png_name, tex)
+				wv_arr = data.winding_volume.squeeze().cpu().numpy()
+				sl_idx = _slice_index(plane, wv_arr.shape, frac)
+				_write_pfm(out / f"{mat_name}.pfm", _take_slice(wv_arr, plane, sl_idx).astype(np.float32))
 				corners = _slice_corners(plane, data_min, data_max, frac=frac)
 				quads.append((corners, mat_name))
 				materials.append((mat_name, png_name))
@@ -614,7 +631,7 @@ def export_vis_obj(
 		# Diagnostic meshes: winding value and winding mask
 		print("[export_vis] computing winding diagnostics", flush=True)
 		with torch.no_grad():
-			sampled_wv = opt_loss_winding_volume._sample_winding_volume(res=res)  # (D, 1, Hm, Wm)
+			sampled_wv, sampled_wv_mask = opt_loss_winding_volume._sample_winding_volume(res=res)  # (D, 1, Hm, Wm)
 
 		verts_flat = xyz_lr.reshape(-1, 3)
 		faces = _triangulate_grid(D, Hm, Wm)
@@ -635,9 +652,8 @@ def export_vis_obj(
 		_write_obj_mesh(out / "winding_value.obj", verts_diag, faces_diag, uvs_diag, "winding_value")
 		print(f"[export_vis] winding value range: [{vmin_wv:.2f}, {vmax_wv:.2f}]", flush=True)
 
-		# Winding mask map: green = valid (sampled >= 1 AND mask_lr), red = invalid
-		wv_valid = (sampled_wv.detach() >= 1.0).float()
-		mask_combined = (res.mask_lr * wv_valid).squeeze(1).cpu().numpy()  # (D, Hm, Wm)
+		# Winding mask map: green = valid (eroded winding mask AND mask_lr), red = invalid
+		mask_combined = (res.mask_lr * sampled_wv_mask).squeeze(1).cpu().numpy()  # (D, Hm, Wm)
 		mask_stacked = mask_combined.reshape(-1, Wm)  # (D*Hm, Wm)
 		rgb_mask = np.zeros((tex_h, tex_w, 3), dtype=np.uint8)
 		rgb_mask[mask_stacked > 0.5] = [0, 200, 0]    # green = valid

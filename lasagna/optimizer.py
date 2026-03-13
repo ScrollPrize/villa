@@ -412,6 +412,8 @@ def optimize(
 				_its = _t_steps_acc / _t_wall_elapsed if _t_wall_elapsed > 0 else None
 				_print_status(step_label=f"{label} {step1}/{opt_cfg.steps}",
 							  loss_val=loss.item(), tv=term_vals, pv=param_vals, its=_its)
+				if _need_term("winding_vol", opt_cfg.eff) > 0:
+					opt_loss_winding_volume.print_per_winding_error(res=res)
 				_t_steps_acc = 0
 				_t_wall_start = _t_wall_now
 

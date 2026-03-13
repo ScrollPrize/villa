@@ -255,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
     total = np.maximum(dist_1 + dist_2, 1e-8)
     winding_vol = (w1 * dist_2 + w2 * dist_1) / total
 
+    valid_mask = (~outside_mask).astype(np.float32)
     winding_vol[outside_mask] = 0.0
     del outside_mask
 
@@ -265,8 +266,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{TAG} winding volume: min={wv_min:.3f} max={wv_max:.3f}", flush=True)
 
     # -- Downsample ---------------------------------------------------------
-    winding_ds = _downsample_mean(winding_vol, step).astype(np.float32)
+    valid_ds = _downsample_mean(valid_mask, step)
+    del valid_mask
+    winding_ds_raw = _downsample_mean(winding_vol, step)
     del winding_vol
+    # Divide by valid fraction to get proper weighted average; zero where no valid voxels
+    winding_ds = np.where(valid_ds > 0, winding_ds_raw / valid_ds, 0.0).astype(np.float32)
+    del valid_ds, winding_ds_raw
     print(f"{TAG} downsampled: {shape} → {winding_ds.shape} (step={step})", flush=True)
 
     # -- Write zarr ---------------------------------------------------------

@@ -20,8 +20,13 @@ def reset_auto_offset() -> None:
 	_winding_direction = 1
 
 
-def _sample_winding_volume(*, res: fit_model.FitResult3D) -> torch.Tensor:
-	"""Sample the winding volume at coarse mesh positions. Returns (D, 1, Hm, Wm)."""
+def _sample_winding_volume(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Sample the winding volume at coarse mesh positions.
+
+	Returns (sampled_values, sampled_mask), both (D, 1, Hm, Wm).
+	The mask is built by eroding the valid region (wv >= 1) so that bilinear
+	interpolation footprints never touch invalid voxels.
+	"""
 	wv = res.data.winding_volume
 	if wv is None:
 		raise RuntimeError("winding_vol loss requested but FitData3D.winding_volume is None")
@@ -43,7 +48,34 @@ def _sample_winding_volume(*, res: fit_model.FitResult3D) -> torch.Tensor:
 	)
 	# sampled: (1, 1, D, Hm, Wm) → (D, 1, Hm, Wm)
 	sampled = sampled[0].permute(1, 0, 2, 3)
-	return sampled
+
+	# Build eroded validity mask: erode valid region so bilinear footprints
+	# never touch invalid voxels, including at the volume boundary.
+	with torch.no_grad():
+		valid = (wv >= 1.0).float()  # (1, 1, Z, Y, X)
+		# Mark volume boundary as invalid — DTs and envelope detection are
+		# unreliable at edges, and cropping can place valid values right at
+		# the boundary where padding_mode='border' would repeat them.
+		valid[:, :, [0, -1], :, :] = 0
+		valid[:, :, :, [0, -1], :] = 0
+		valid[:, :, :, :, [0, -1]] = 0
+		# Dilate the *invalid* region by 1 voxel in all directions
+		invalid_dilated = F.max_pool3d(1.0 - valid, kernel_size=3, padding=1, stride=1)
+		eroded_valid = 1.0 - invalid_dilated  # (1, 1, Z, Y, X)
+
+		# Sample eroded mask at mesh positions with nearest-neighbor
+		sampled_mask = F.grid_sample(
+			eroded_valid, grid.unsqueeze(0),
+			mode='nearest', padding_mode='zeros', align_corners=True,
+		)
+		# (1, 1, D, Hm, Wm) → (D, 1, Hm, Wm)
+		sampled_mask = sampled_mask[0].permute(1, 0, 2, 3)
+
+	# Erode sampled mask by 1 mesh pixel so bilinear value footprints
+	# never reach into the invalid volume region.
+	sampled_mask = -F.max_pool2d(-sampled_mask, kernel_size=3, padding=1, stride=1)
+
+	return sampled, sampled_mask
 
 
 def compute_auto_offset(*, res: fit_model.FitResult3D) -> tuple[float, int]:
@@ -57,13 +89,12 @@ def compute_auto_offset(*, res: fit_model.FitResult3D) -> tuple[float, int]:
 	"""
 	global _winding_offset, _winding_direction
 
-	sampled = _sample_winding_volume(res=res)
+	sampled, wv_mask = _sample_winding_volume(res=res)
 	D = sampled.shape[0]
 	dev = sampled.device
 
-	# Mask: valid positions
-	wv_valid = (sampled.detach() >= 1.0).float()
-	mask = res.mask_lr * wv_valid  # (D, 1, Hm, Wm)
+	# Mask: valid positions (eroded winding mask AND mesh mask)
+	mask = res.mask_lr * wv_mask  # (D, 1, Hm, Wm)
 
 	wsum = mask.sum().item()
 	if wsum < 1:
@@ -118,6 +149,42 @@ def compute_auto_offset(*, res: fit_model.FitResult3D) -> tuple[float, int]:
 	return _winding_offset, _winding_direction
 
 
+@torch.no_grad()
+def print_per_winding_error(*, res: fit_model.FitResult3D) -> None:
+	"""Print per-winding mean error for diagnostics."""
+	sampled, wv_mask = _sample_winding_volume(res=res)
+	D = sampled.shape[0]
+
+	mask = res.mask_lr * wv_mask  # (D, 1, Hm, Wm)
+
+	offset = _winding_offset if _winding_offset is not None else 1.0
+	direction = _winding_direction if _winding_offset is not None else 1
+
+	# Volume winding range (raw values where wv >= 1)
+	wv = res.data.winding_volume
+	valid_wv = wv[wv >= 1]
+	if valid_wv.numel() > 0:
+		vol_min = float(valid_wv.min())
+		vol_max = float(valid_wv.max())
+		vol_tag = f"vol=[{vol_min:.1f}, {vol_max:.1f}]"
+	else:
+		vol_tag = "vol=[empty]"
+
+	parts = []
+	for d in range(D):
+		m = mask[d]  # (1, Hm, Wm)
+		cnt = int(m.sum().item())
+		if cnt == 0:
+			continue
+		target = offset + d * direction
+		mean_err = float(((sampled[d] - target) * m).sum().item() / cnt)
+		mean_val = float((sampled[d] * m).sum().item() / cnt)
+		parts.append(f"w{target:.0f}={mean_err:+.2f}/{mean_val:.2f}({cnt})")
+
+	if parts:
+		print(f"[winding_vol] {vol_tag} per-winding err: {' '.join(parts)}", flush=True)
+
+
 def winding_volume_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""Loss penalizing mesh winding deviation from ground-truth winding volume.
 
@@ -129,7 +196,7 @@ def winding_volume_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tu
 
 	Returns (loss, (lm,), (mask,)).
 	"""
-	sampled = _sample_winding_volume(res=res)
+	sampled, wv_mask = _sample_winding_volume(res=res)
 	D = sampled.shape[0]
 	dev = sampled.device
 
@@ -142,9 +209,8 @@ def winding_volume_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tu
 
 	lm = (sampled - target) ** 2
 
-	# Mask: mesh validity AND winding >= 1 (0 = out-of-bounds / invalid from padding_mode='zeros')
-	wv_valid = (sampled.detach() >= 1.0).float()
-	mask = res.mask_lr * wv_valid
+	# Mask: mesh validity AND eroded winding validity
+	mask = res.mask_lr * wv_mask
 
 	wsum = mask.sum().clamp(min=1)
 	loss = (lm * mask).sum() / wsum
