@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dataset import DatasetConfig, IndexedInkCropDataset, build_train_augmentations
-from model import PCAEmbedder, InkPatchEmbedder, create_frozen_dino_backbone, normalize_for_backbone
+from model import PCAEmbedder, InkPatchEmbedder, create_backbone_with_mode, normalize_for_backbone
 
 
 def seed_everything(seed: int) -> None:
@@ -56,9 +56,16 @@ def load_adapted_model(checkpoint_path: Path, device: torch.device) -> tuple[Ink
     checkpoint_method = str(config.get("adaptation_method", "trained"))
     hidden_dim = int(config.get("hidden_dim", embedding_dim))
     dropout = float(config.get("dropout", 0.0 if checkpoint_method == "pca" else 0.1))
+    freeze_backbone = bool(config.get("freeze_backbone", True))
 
     backbone_ckpt_path = Path(backbone_checkpoint) if backbone_checkpoint else None
-    backbone, backbone_dim = create_frozen_dino_backbone(backbone_name, backbone_ckpt_path, crop_size, device)
+    backbone, backbone_dim = create_backbone_with_mode(
+        backbone_name,
+        backbone_ckpt_path,
+        crop_size,
+        device,
+        freeze_backbone=freeze_backbone,
+    )
     if checkpoint_method == "pca":
         head = PCAEmbedder(backbone_dim, embedding_dim)
         model = InkPatchEmbedder(backbone, backbone_dim, embedding_dim, embedding_dim, 0.0, head=head).to(device)
@@ -68,8 +75,11 @@ def load_adapted_model(checkpoint_path: Path, device: torch.device) -> tuple[Ink
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     head_state = checkpoint.get("model") if isinstance(checkpoint, dict) else None
     if not isinstance(head_state, dict):
-        raise ValueError(f"Checkpoint {checkpoint_path} does not contain a saved embedding head")
-    missing, unexpected = model.head.load_state_dict(head_state, strict=True)
+        raise ValueError(f"Checkpoint {checkpoint_path} does not contain a saved model state")
+    if freeze_backbone:
+        missing, unexpected = model.head.load_state_dict(head_state, strict=True)
+    else:
+        missing, unexpected = model.load_state_dict(head_state, strict=True)
     if missing or unexpected:
         raise ValueError(f"Unexpected head state mismatch: missing={missing}, unexpected={unexpected}")
 
@@ -86,12 +96,14 @@ def make_plain_config(
     min_foreground_fraction: float,
     foreground_threshold: float,
     max_crop_attempts: int,
+    freeze_backbone: bool,
     seed: int | None,
 ) -> dict[str, Any]:
     return {
         "image_dir": str(image_dir.resolve()),
         "backbone_name": backbone_name,
         "backbone_checkpoint": str(backbone_checkpoint.resolve()) if backbone_checkpoint is not None else None,
+        "freeze_backbone": freeze_backbone,
         "crop_size": crop_size,
         "downsample_factor": downsample_factor,
         "test_fraction": test_fraction,
@@ -108,12 +120,14 @@ def build_plain_model(
     device: torch.device,
 ) -> tuple[InkPatchEmbedder, dict[str, Any]]:
     backbone_checkpoint = config.get("backbone_checkpoint")
+    freeze_backbone = bool(config.get("freeze_backbone", True))
     backbone_ckpt_path = Path(backbone_checkpoint) if backbone_checkpoint else None
-    backbone, backbone_dim = create_frozen_dino_backbone(
+    backbone, backbone_dim = create_backbone_with_mode(
         str(config["backbone_name"]),
         backbone_ckpt_path,
         int(config["crop_size"]),
         device,
+        freeze_backbone=freeze_backbone,
     )
     model = InkPatchEmbedder(
         backbone=backbone,
@@ -288,6 +302,7 @@ def load_cache(cache_path: Path) -> tuple[torch.Tensor, list[dict[str, Any]], di
 @click.option("--cache-path", type=click.Path(dir_okay=False, path_type=Path), default=None)
 @click.option("--backbone-name", default="vit_small_patch14_dinov2.lvd142m", show_default=True)
 @click.option("--backbone-checkpoint", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None)
+@click.option("--freeze-backbone/--train-backbone", default=True, show_default=True)
 @click.option("--crop-size", type=click.IntRange(min=32), default=224, show_default=True)
 @click.option("--downsample-factor", type=click.IntRange(min=1), default=2, show_default=True)
 @click.option("--test-fraction", type=click.FloatRange(min=0.05, max=0.5), default=0.15, show_default=True)
@@ -313,6 +328,7 @@ def main(
     cache_path: Path | None,
     backbone_name: str,
     backbone_checkpoint: Path | None,
+    freeze_backbone: bool,
     crop_size: int,
     downsample_factor: int,
     test_fraction: float,
@@ -335,6 +351,7 @@ def main(
                 image_dir=image_dir,
                 backbone_name=backbone_name,
                 backbone_checkpoint=backbone_checkpoint,
+                freeze_backbone=freeze_backbone,
                 crop_size=crop_size,
                 downsample_factor=downsample_factor,
                 test_fraction=test_fraction,

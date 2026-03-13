@@ -59,8 +59,7 @@ class InkPatchEmbedder(nn.Module):
         self.head = TinyEmbedder(backbone_dim, embedding_dim, hidden_dim, dropout) if head is None else head
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        with torch.no_grad():
-            features = self.backbone(x)
+        features = self.backbone(x)
         embeddings = self.head(features)
         return embeddings, features
 
@@ -97,15 +96,30 @@ def extract_backbone_features(model: nn.Module, images: torch.Tensor) -> torch.T
     return features
 
 
-class FrozenBackbone(nn.Module):
+class BackboneAdapter(nn.Module):
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
-        self.model = model.eval()
-        for parameter in self.model.parameters():
-            parameter.requires_grad_(False)
+        self.model = model
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         return extract_backbone_features(self.model, images)
+
+
+class FrozenBackbone(BackboneAdapter):
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__(model.eval())
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(False)
+
+    def train(self, mode: bool = True) -> "FrozenBackbone":
+        super().train(False)
+        self.model.eval()
+        return self
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            return super().forward(images)
+
 
 def load_checkpoint_state(checkpoint_path: Path) -> dict[str, Any]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -133,26 +147,39 @@ def load_checkpoint_state(checkpoint_path: Path) -> dict[str, Any]:
     return cleaned
 
 
-def create_frozen_dino_backbone(
+def _build_timm_backbone(backbone_name: str, checkpoint_path: Path | None, image_size: int) -> nn.Module:
+    kwargs: dict[str, Any] = {"pretrained": checkpoint_path is None}
+
+    try:
+        return create_model(backbone_name, num_classes=0, img_size=image_size, **kwargs)
+    except TypeError:
+        return create_model(backbone_name, num_classes=0, **kwargs)
+    except RuntimeError as exc:
+        suggestions = sorted(name for name in list_models(f"*{backbone_name.split('.')[0]}*") if backbone_name.split(".")[0] in name)
+        raise RuntimeError(
+            f"Failed to create backbone {backbone_name!r}. "
+            f"Example matching timm models: {suggestions[:20]!r}"
+        ) from exc
+
+
+def create_backbone(
     backbone_name: str,
     checkpoint_path: Path | None,
     image_size: int,
     device: torch.device,
-) -> tuple[FrozenBackbone, int]:
-    kwargs: dict[str, Any] = {"img_size": image_size}
-    if checkpoint_path is None:
-        kwargs["pretrained"] = True
-    else:
-        kwargs["pretrained"] = False
+) -> tuple[nn.Module, int]:
+    return create_backbone_with_mode(backbone_name, checkpoint_path, image_size, device, freeze_backbone=True)
 
-    try:
-        model = create_model(backbone_name, num_classes=0, **kwargs)
-    except RuntimeError as exc:
-        available = sorted(name for name in list_models("*dino*") if "dino" in name)
-        raise RuntimeError(
-            f"Failed to create backbone {backbone_name!r}. "
-            f"Available timm DINO-like models: {available[:20]!r}"
-        ) from exc
+
+def create_backbone_with_mode(
+    backbone_name: str,
+    checkpoint_path: Path | None,
+    image_size: int,
+    device: torch.device,
+    *,
+    freeze_backbone: bool,
+) -> tuple[nn.Module, int]:
+    model = _build_timm_backbone(backbone_name, checkpoint_path, image_size)
 
     if checkpoint_path is not None:
         state_dict = load_checkpoint_state(checkpoint_path)
@@ -162,8 +189,23 @@ def create_frozen_dino_backbone(
         if unexpected:
             print(f"checkpoint unexpected keys ({len(unexpected)}): {unexpected[:8]}")
 
-    frozen = FrozenBackbone(model).to(device)
+    backbone = (FrozenBackbone(model) if freeze_backbone else BackboneAdapter(model)).to(device)
     with torch.no_grad():
         dummy = torch.zeros(1, 3, image_size, image_size, device=device)
-        dim = int(frozen(dummy).shape[-1])
-    return frozen, dim
+        dim = int(backbone(dummy).shape[-1])
+    return backbone, dim
+
+
+def create_frozen_dino_backbone(
+    backbone_name: str,
+    checkpoint_path: Path | None,
+    image_size: int,
+    device: torch.device,
+) -> tuple[nn.Module, int]:
+    return create_backbone_with_mode(
+        backbone_name,
+        checkpoint_path,
+        image_size,
+        device,
+        freeze_backbone=True,
+    )

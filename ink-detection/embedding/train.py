@@ -17,13 +17,14 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dataset import DatasetConfig, InkCropDataset, build_train_augmentations
-from model import InkPatchEmbedder, create_frozen_dino_backbone, normalize_for_backbone
+from model import InkPatchEmbedder, create_backbone_with_mode, normalize_for_backbone
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "output_dir": Path("embedding_runs/latest"),
     "backbone_name": "vit_small_patch14_dinov2.lvd142m",
     "backbone_checkpoint": None,
+    "freeze_backbone": True,
     "crop_size": 224,
     "downsample_factor": 1,
     "embedding_dim": 96,
@@ -188,6 +189,7 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "output_dir": output_dir,
         "backbone_name": _optional_str(merged["backbone_name"], "backbone_name") or DEFAULT_CONFIG["backbone_name"],
         "backbone_checkpoint": backbone_checkpoint,
+        "freeze_backbone": _require_bool(merged["freeze_backbone"], "freeze_backbone"),
         "crop_size": _require_int(merged["crop_size"], "crop_size", min_value=32),
         "downsample_factor": _require_int(merged["downsample_factor"], "downsample_factor", min_value=1),
         "embedding_dim": _require_int(merged["embedding_dim"], "embedding_dim", min_value=8),
@@ -337,11 +339,12 @@ def save_checkpoint(
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / name
+    freeze_backbone = bool(config.get("freeze_backbone", True))
     state = {
         "epoch": epoch,
         "step": step,
         "best_val_loss": best_val_loss,
-        "model": model.head.state_dict(),
+        "model": model.head.state_dict() if freeze_backbone else model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "config": safe_json_config(config),
     }
@@ -357,6 +360,7 @@ def main(config_path: Path) -> None:
     output_dir = loaded_config["output_dir"]
     backbone_name = loaded_config["backbone_name"]
     backbone_checkpoint = loaded_config["backbone_checkpoint"]
+    freeze_backbone = loaded_config["freeze_backbone"]
     crop_size = loaded_config["crop_size"]
     downsample_factor = loaded_config["downsample_factor"]
     embedding_dim = loaded_config["embedding_dim"]
@@ -446,10 +450,17 @@ def main(config_path: Path) -> None:
         worker_init_fn=worker_init_fn,
     )
 
-    backbone, backbone_dim = create_frozen_dino_backbone(backbone_name, backbone_checkpoint, crop_size, resolved_device)
+    backbone, backbone_dim = create_backbone_with_mode(
+        backbone_name,
+        backbone_checkpoint,
+        crop_size,
+        resolved_device,
+        freeze_backbone=freeze_backbone,
+    )
     model = InkPatchEmbedder(backbone, backbone_dim, embedding_dim, hidden_dim, dropout).to(resolved_device)
 
-    optimizer = torch.optim.AdamW(model.head.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizable_parameters = list(model.head.parameters() if freeze_backbone else model.parameters())
+    optimizer = torch.optim.AdamW(optimizable_parameters, lr=learning_rate, weight_decay=weight_decay)
     steps_per_epoch = len(train_loader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs * steps_per_epoch))
 
@@ -458,6 +469,8 @@ def main(config_path: Path) -> None:
         "output_dir": output_dir.resolve(),
         "backbone_name": backbone_name,
         "backbone_checkpoint": backbone_checkpoint,
+        "freeze_backbone": freeze_backbone,
+        "adaptation_method": "trained",
         "crop_size": crop_size,
         "downsample_factor": downsample_factor,
         "embedding_dim": embedding_dim,
@@ -524,8 +537,8 @@ def main(config_path: Path) -> None:
 
             loss.backward()
             if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.head.parameters(), max_norm=grad_clip)
-            grad_norm = compute_grad_norm(model.head.parameters())
+                torch.nn.utils.clip_grad_norm_(optimizable_parameters, max_norm=grad_clip)
+            grad_norm = compute_grad_norm(optimizable_parameters)
             optimizer.step()
             scheduler.step()
 
