@@ -30,7 +30,7 @@ from train_resnet3d_lib.data.image_readers import (
 from train_resnet3d_lib.data.zarr_volume import ZarrSegmentVolume
 
 
-__all__ = ["parse_args", "main"]
+__all__ = ["parse_args", "run_stitch_jobs", "main"]
 
 
 class StitchValidationDataset(Dataset):
@@ -362,8 +362,7 @@ def build_stitch_data_state(run_state, *, segment_ids, mask_suffix):
         "shared_volume_cache": shared_volume_cache,
     }
 
-def main():
-    args = parse_args()
+def run_stitch_jobs(args):
     checkpoint_jobs = resolve_checkpoint_jobs(args)
 
     log(f"start pid={os.getpid()} cwd={os.getcwd()}")
@@ -382,7 +381,7 @@ def main():
         f"device_count={device_count}"
     )
 
-    base_config, preinit_overrides = orchestration.load_base_config_and_preinit(
+    base_config, preinit_overrides, metadata_path = orchestration.load_base_config_and_preinit(
         metadata_json=args.metadata_json,
         base_dir=osp.dirname(orchestration.__file__),
     )
@@ -449,7 +448,12 @@ def main():
 
         validate_stitch_eval_schedule()
         CFG.stitch_all_val = True
-        run_state = orchestration.prepare_run(run_args, merged_config, wandb_logger)
+        run_state = orchestration.prepare_run(
+            run_args,
+            merged_config,
+            wandb_logger,
+            metadata_path=metadata_path,
+        )
         if data_state is None:
             data_state = build_stitch_data_state(
                 run_state,
@@ -465,6 +469,11 @@ def main():
         model = tr.build_model(run_state, data_state, wandb_logger)
         trainer = tr.build_trainer(run_args, wandb_logger)
         tr.validate(trainer, model, data_state, run_state)
+
+
+def main():
+    args = parse_args()
+    run_stitch_jobs(args)
 
 
 if __name__ == "__main__":

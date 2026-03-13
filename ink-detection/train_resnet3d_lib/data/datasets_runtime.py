@@ -34,6 +34,81 @@ def build_eval_loader(dataset):
     )
 
 
+def build_stitch_train_loader(dataset):
+    return DataLoader(
+        dataset,
+        batch_size=int(getattr(CFG, "stitch_patch_batch_size", getattr(CFG, "valid_batch_size", 1))),
+        shuffle=False,
+        num_workers=CFG.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+
+def _first_item(batch):
+    if not isinstance(batch, (list, tuple)) or len(batch) != 1:
+        raise ValueError(f"expected a single-item batch, got {type(batch).__name__} len={len(batch) if hasattr(batch, '__len__') else 'n/a'}")
+    return batch[0]
+
+
+def _identity_batch(batch):
+    return list(batch)
+
+
+class SegmentIdDataset(Dataset):
+    def __init__(self, segment_ids):
+        self.segment_ids = [str(segment_id) for segment_id in (segment_ids or [])]
+        if not self.segment_ids:
+            raise ValueError("SegmentIdDataset requires at least one segment id")
+
+    def __len__(self):
+        return len(self.segment_ids)
+
+    def __getitem__(self, idx):
+        return self.segment_ids[int(idx)]
+
+
+class ComponentKeyDataset(Dataset):
+    def __init__(self, component_keys):
+        self.component_keys = []
+        for item in (component_keys or []):
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError(f"component key must be a pair (segment_id, component_idx), got {item!r}")
+            self.component_keys.append((str(item[0]), int(item[1])))
+        if not self.component_keys:
+            raise ValueError("ComponentKeyDataset requires at least one component key")
+
+    def __len__(self):
+        return len(self.component_keys)
+
+    def __getitem__(self, idx):
+        return self.component_keys[int(idx)]
+
+
+def build_segment_id_train_loader(segment_ids):
+    return DataLoader(
+        SegmentIdDataset(segment_ids),
+        batch_size=1,
+        shuffle=str(getattr(CFG, "sampler", "shuffle")).strip().lower() == "shuffle",
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+        collate_fn=_first_item,
+    )
+
+
+def build_component_id_train_loader(component_keys):
+    return DataLoader(
+        ComponentKeyDataset(component_keys),
+        batch_size=int(getattr(CFG, "train_batch_size", 1)),
+        shuffle=str(getattr(CFG, "sampler", "shuffle")).strip().lower() == "shuffle",
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+        collate_fn=_identity_batch,
+    )
+
+
 def _require_dict(value, *, name):
     if not isinstance(value, dict):
         raise TypeError(f"{name} must be a dict, got {type(value).__name__}")

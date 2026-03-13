@@ -73,6 +73,9 @@ Zarr setup
   - `dataset_root/<segment_id>/<segment_id>_inklabels_val.png` (or `.tif`/`.tiff`)
   - `dataset_root/<segment_id>/<segment_id>_mask_val.png` (or `.tif`/`.tiff`)
 - Set `training.data_backend: zarr` and `training.dataset_root` (default: `train_scrolls`).
+- Nested grouped layouts are also accepted when `segments.<segment_id>.base_path` points at the group folder.
+  Example: `dataset_root/<group>/<segment_dir>/...`
+- In nested layouts, labels may use the segment directory/file stem instead of `<segment_id>`, and masks may be named either `*_mask.*` or `*_supervision_mask.*`.
 
 Tiff setup
 

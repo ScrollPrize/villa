@@ -10,6 +10,7 @@ from train_resnet3d_lib.config import CFG, log
 from train_resnet3d_lib.data.datasets_runtime import (
     CustomDataset,
     LazyZarrTrainDataset,
+    build_component_id_train_loader,
     normalize_data_backend,
 )
 from train_resnet3d_lib.data.augmentations import get_transforms
@@ -22,6 +23,7 @@ from train_resnet3d_lib.data.segment_trainval import (
     load_val_segment_for_backend,
 )
 from train_resnet3d_lib.data.segment_stitching import (
+    build_train_component_outputs,
     build_train_stitch_outputs,
     build_log_only_outputs,
 )
@@ -75,6 +77,10 @@ def build_data_state(
     train_stitch_loaders,
     train_stitch_shapes,
     train_stitch_segment_ids,
+    train_component_datasets,
+    train_component_shapes,
+    train_component_keys,
+    train_component_bboxes,
     train_mask_borders,
     train_mask_bboxes,
     log_only_loaders,
@@ -94,6 +100,10 @@ def build_data_state(
         "train_stitch_loaders": train_stitch_loaders,
         "train_stitch_shapes": train_stitch_shapes,
         "train_stitch_segment_ids": train_stitch_segment_ids,
+        "train_component_datasets": train_component_datasets,
+        "train_component_shapes": train_component_shapes,
+        "train_component_keys": train_component_keys,
+        "train_component_bboxes": train_component_bboxes,
         "train_mask_borders": train_mask_borders,
         "train_mask_bboxes": train_mask_bboxes,
         "val_mask_borders": tracking["val_mask_borders"],
@@ -131,6 +141,13 @@ def summarize_patch_counts(split_name, fragment_ids_list, counts_by_segment, *, 
         log(f"  {split_name} segment={fid} group={gname} patches={n}")
     log(f"{split_name} patch counts by group {counts_by_group}")
 
+
+def _count_components_by_group(component_keys, *, group_idx_by_segment, n_groups):
+    counts = [0] * int(n_groups)
+    for segment_id, _component_idx in component_keys:
+        group_idx = int(group_idx_by_segment[str(segment_id)])
+        counts[group_idx] += 1
+    return counts
 
 def _validate_group_universe_for_objective(group_names, train_group_counts):
     zero_groups = [
@@ -328,12 +345,14 @@ def _build_datasets_for_backend(
 ):
     backend = normalize_data_backend(data_backend)
     is_zarr = backend == "zarr"
-    include_train_xyxys = bool(getattr(CFG, "stitch_train", False))
+    stitch_loss_training_enabled = float(getattr(CFG, "stitch_loss_weight", 0.0) or 0.0) > 0.0
+    include_train_xyxys = bool(getattr(CFG, "stitch_train", False) or stitch_loss_training_enabled)
     tracking = init_dataset_tracking(include_train_xyxys=include_train_xyxys)
 
     train_groups_by_segment = {str(fid): int(fragment_to_group_idx[fid]) for fid in train_fragment_ids}
     train_volumes_by_segment = {}
     train_masks_by_segment = {}
+    train_label_masks_by_segment = {}
     train_xyxys_by_segment = {}
     train_sample_bbox_indices_by_segment = {}
 
@@ -386,15 +405,18 @@ def _build_datasets_for_backend(
             sid = result["sid"]
             train_volumes_by_segment[sid] = result["volume"]
             train_masks_by_segment[sid] = result["mask_store"]
+            if stitch_loss_training_enabled:
+                train_label_masks_by_segment[sid] = result["label_mask"]
             train_xyxys_by_segment[sid] = result["xyxys"]
             train_sample_bbox_indices_by_segment[sid] = result["sample_bbox_indices"]
             continue
 
         if train_stitch_candidates is not None and result["stitch_candidate"] is not None:
             train_stitch_candidates[str(fragment_id)] = result["stitch_candidate"]
-        train_images.extend(result["images"])
-        train_masks.extend(result["masks"])
-        train_groups.extend([int(result["group_idx"])] * len(result["images"]))
+        if not stitch_loss_training_enabled:
+            train_images.extend(result["images"])
+            train_masks.extend(result["masks"])
+            train_groups.extend([int(result["group_idx"])] * len(result["images"]))
 
     val_patch_counts_by_segment = {}
     for fragment_id in val_fragment_ids:
@@ -442,10 +464,7 @@ def _build_datasets_for_backend(
         fragment_to_group_idx=fragment_to_group_idx,
     )
 
-    if is_zarr:
-        train_patches_total = int(sum(int(v) for v in train_patch_counts_by_segment.values()))
-    else:
-        train_patches_total = int(len(train_images))
+    train_patches_total = int(sum(int(v) for v in train_patch_counts_by_segment.values()))
     log(
         f"dataset built ({backend}) "
         f"train_patches={train_patches_total} val_loaders={len(tracking['val_loaders'])}"
@@ -455,7 +474,52 @@ def _build_datasets_for_backend(
     if len(tracking["val_loaders"]) == 0:
         raise ValueError("No validation data was built (all segments produced 0 validation patches).")
 
-    if is_zarr:
+    train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids = build_train_stitch_outputs(
+        data_backend=backend,
+        train_fragment_ids=train_fragment_ids,
+        stitch_segment_id=tracking["stitch_segment_id"],
+        valid_transform=valid_transform,
+        train_stitch_candidates=train_stitch_candidates,
+        train_volumes_by_segment=train_volumes_by_segment,
+        train_masks_by_segment=train_masks_by_segment,
+        train_xyxys_by_segment=train_xyxys_by_segment,
+        train_sample_bbox_indices_by_segment=train_sample_bbox_indices_by_segment,
+        train_groups_by_segment=train_groups_by_segment,
+    )
+    train_component_datasets = []
+    train_component_shapes = []
+    train_component_keys = []
+    train_component_bboxes = {}
+    if stitch_loss_training_enabled:
+        train_component_datasets, train_component_shapes, train_component_keys, train_component_bboxes = (
+            build_train_component_outputs(
+                data_backend=backend,
+                train_fragment_ids=train_fragment_ids,
+                train_volumes_by_segment=train_volumes_by_segment,
+                train_masks_by_segment=train_masks_by_segment,
+                train_label_masks_by_segment=train_label_masks_by_segment,
+                train_xyxys_by_segment=train_xyxys_by_segment,
+                train_sample_bbox_indices_by_segment=train_sample_bbox_indices_by_segment,
+                train_groups_by_segment=train_groups_by_segment,
+                valid_transform=valid_transform,
+            )
+        )
+        if not train_component_keys:
+            raise ValueError("training.stitch_loss_weight > 0 requires stitched train components, but none were built.")
+        train_loader = build_component_id_train_loader(train_component_keys)
+        train_group_counts = _count_components_by_group(
+            train_component_keys,
+            group_idx_by_segment=group_idx_by_segment,
+            n_groups=len(group_names),
+        )
+        log(
+            "stitched train sampling mode=component "
+            f"components={len(train_component_keys)} "
+            f"component_batch_size={int(getattr(CFG, 'train_batch_size', 1))} "
+            f"patch_batch_size={int(getattr(CFG, 'stitch_patch_batch_size', getattr(CFG, 'valid_batch_size', 1)))} "
+            f"group_counts={dict(zip(group_names, train_group_counts))}"
+        )
+    elif is_zarr:
         train_loader, train_group_counts = build_train_loader_lazy(
             train_volumes_by_segment,
             train_masks_by_segment,
@@ -474,19 +538,6 @@ def _build_datasets_for_backend(
             train_transform=train_transform,
         )
     steps_per_epoch = log_training_budget(train_loader)
-
-    train_stitch_loaders, train_stitch_shapes, train_stitch_segment_ids = build_train_stitch_outputs(
-        data_backend=backend,
-        train_fragment_ids=train_fragment_ids,
-        stitch_segment_id=tracking["stitch_segment_id"],
-        valid_transform=valid_transform,
-        train_stitch_candidates=train_stitch_candidates,
-        train_volumes_by_segment=train_volumes_by_segment,
-        train_masks_by_segment=train_masks_by_segment,
-        train_xyxys_by_segment=train_xyxys_by_segment,
-        train_sample_bbox_indices_by_segment=train_sample_bbox_indices_by_segment,
-        train_groups_by_segment=train_groups_by_segment,
-    )
     log_only_loaders, log_only_shapes, log_only_segment_ids, log_only_bboxes = build_log_only_outputs(
         data_backend=backend,
         log_only_segments=log_only_segments,
@@ -507,6 +558,10 @@ def _build_datasets_for_backend(
         train_stitch_loaders=train_stitch_loaders,
         train_stitch_shapes=train_stitch_shapes,
         train_stitch_segment_ids=train_stitch_segment_ids,
+        train_component_datasets=train_component_datasets,
+        train_component_shapes=train_component_shapes,
+        train_component_keys=train_component_keys,
+        train_component_bboxes=train_component_bboxes,
         train_mask_borders=train_mask_borders,
         train_mask_bboxes=train_mask_bboxes,
         log_only_loaders=log_only_loaders,

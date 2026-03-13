@@ -261,6 +261,7 @@ def prepare_fold_label_foreground_percentile_clip_zscore_stats(
                 volume.shape[:2],
                 label_suffix=train_label_suffix,
                 mask_suffix=train_mask_suffix,
+                seg_meta=seg_meta,
             )
             foreground = _label_foreground_mask(label_mask) & (np.asarray(fragment_mask) > 0)
             if not bool(foreground.any()):
@@ -284,6 +285,7 @@ def prepare_fold_label_foreground_percentile_clip_zscore_stats(
                 reverse_layers=reverse_layers,
                 label_suffix=train_label_suffix,
                 mask_suffix=train_mask_suffix,
+                seg_meta=seg_meta,
             )
             foreground = _label_foreground_mask(label_mask) & (np.asarray(fragment_mask) > 0)
             if not bool(foreground.any()):

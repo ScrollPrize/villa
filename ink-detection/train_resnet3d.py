@@ -16,7 +16,7 @@ def parse_args():
 def main():
     args = parse_args()
     orchestration.log_startup(args)
-    base_config, preinit_overrides = orchestration.load_base_config_and_preinit(
+    base_config, preinit_overrides, metadata_path = orchestration.load_base_config_and_preinit(
         metadata_json=args.metadata_json,
         base_dir=osp.dirname(orchestration.__file__),
     )
@@ -25,7 +25,17 @@ def main():
         base_config,
         preinit_overrides=preinit_overrides,
     )
-    run_state = orchestration.prepare_run(args, merged_config, wandb_logger)
+    run_state = orchestration.prepare_run(
+        args,
+        merged_config,
+        wandb_logger,
+        metadata_path=metadata_path,
+    )
+    orchestration.persist_run_snapshots(
+        run_state=run_state,
+        merged_config=merged_config,
+        args=args,
+    )
     data_state = build_datasets(run_state)
     model = tr.build_model(run_state, data_state, wandb_logger)
     trainer = tr.build_trainer(args, wandb_logger)

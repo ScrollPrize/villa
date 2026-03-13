@@ -1,45 +1,12 @@
-import os.path as osp
-
 import numpy as np
 import zarr
 
-from train_resnet3d_lib.config import CFG
 from train_resnet3d_lib.data.image_readers import (
     _clip_intensity_inplace,
     _compute_selected_layer_indices,
     _require_dict,
 )
-
-
-def _looks_like_zarr_store(path: str) -> bool:
-    if not osp.exists(path):
-        return False
-    if osp.isfile(path):
-        return path.endswith(".zarr")
-    if osp.isdir(path):
-        if osp.exists(osp.join(path, ".zarray")):
-            return True
-        if osp.exists(osp.join(path, ".zgroup")):
-            return True
-        if osp.exists(osp.join(path, "0", ".zarray")):
-            return True
-    return False
-
-
-def resolve_segment_zarr_path(fragment_id):
-    fragment_id = str(fragment_id)
-    dataset_root = str(getattr(CFG, "dataset_root", "train_scrolls"))
-    if not fragment_id:
-        raise ValueError("segment id must be a non-empty string")
-
-    candidate = osp.normpath(osp.join(dataset_root, f"{fragment_id}.zarr"))
-    if _looks_like_zarr_store(candidate):
-        return candidate
-
-    raise FileNotFoundError(
-        f"Could not resolve zarr volume path for segment={fragment_id}. "
-        f"Expected zarr store at {candidate!r}."
-    )
+from train_resnet3d_lib.data.segment_layout import resolve_segment_zarr_path
 
 
 def _ensure_zarr_v2():
@@ -80,7 +47,7 @@ class ZarrSegmentVolume:
 
         self.fragment_id = str(fragment_id)
         _require_dict(seg_meta, name=f"segments[{self.fragment_id!r}]")
-        self.path = resolve_segment_zarr_path(self.fragment_id)
+        self.path = resolve_segment_zarr_path(self.fragment_id, seg_meta=seg_meta)
 
         idxs = _compute_selected_layer_indices(self.fragment_id, layer_range=layer_range)
         if reverse_layers:
@@ -95,6 +62,7 @@ class ZarrSegmentVolume:
         self._base_h = int(meta["base_h"])
         self._base_w = int(meta["base_w"])
         self._layer_indices = np.asarray(meta["layer_indices"], dtype=np.int64)
+        self._in_chans = int(self._layer_indices.size)
         self._layer_read_mode = str(meta["layer_read_mode"])
         self._z_slice_start = int(meta["z_slice_start"])
         self._z_slice_stop = int(meta["z_slice_stop"])
@@ -173,7 +141,7 @@ class ZarrSegmentVolume:
 
     @property
     def shape(self):
-        return (int(self._out_h), int(self._out_w), int(CFG.in_chans))
+        return (int(self._out_h), int(self._out_w), int(self._in_chans))
 
     def _ensure_zarr_array(self):
         if self._zarr_array is None:
@@ -209,7 +177,7 @@ class ZarrSegmentVolume:
     def _read_patch_unflipped(self, y1, y2, x1, x2):
         out_h = int(y2 - y1)
         out_w = int(x2 - x1)
-        out = np.zeros((out_h, out_w, int(CFG.in_chans)), dtype=self._dtype)
+        out = np.zeros((out_h, out_w, int(self._in_chans)), dtype=self._dtype)
         yy1 = max(0, int(y1))
         yy2 = min(int(self._base_h), int(y2))
         xx1 = max(0, int(x1))
@@ -234,12 +202,10 @@ class ZarrSegmentVolume:
         patch = _from_uint16_to_uint8(patch, fragment_id=self.fragment_id)
         _clip_intensity_inplace(patch)
 
-        expected = (int(y2 - y1), int(x2 - x1), int(CFG.in_chans))
+        expected = (int(y2 - y1), int(x2 - x1), int(self._in_chans))
         if patch.shape != expected:
             raise ValueError(
                 f"{self.fragment_id}: patch shape mismatch, got {patch.shape}, expected {expected} "
                 f"for coords={(x1, y1, x2, y2)}"
             )
         return patch
-
-

@@ -65,6 +65,58 @@ def compose_segment_from_roi_buffers(roi_buffers, full_shape):
     return np.clip(base, 0, 1), has
 
 
+def resolve_buffer_crop(*, xyxy, downsample, offset=(0, 0), buffer_shape):
+    ds = int(downsample)
+    x1_i, y1_i, x2_i, y2_i = [int(v) for v in xyxy]
+    if ds > 1 and ((x1_i % ds) or (y1_i % ds) or (x2_i % ds) or (y2_i % ds)):
+        raise ValueError("stitch coordinates are not aligned with stitch_downsample")
+
+    x1_ds = x1_i // ds
+    y1_ds = y1_i // ds
+    x2_ds = (x2_i + ds - 1) // ds
+    y2_ds = (y2_i + ds - 1) // ds
+
+    off_y, off_x = [int(v) for v in offset]
+    x1_ds -= off_x
+    x2_ds -= off_x
+    y1_ds -= off_y
+    y2_ds -= off_y
+
+    target_h = y2_ds - y1_ds
+    target_w = x2_ds - x1_ds
+    if target_h <= 0 or target_w <= 0:
+        return None
+
+    buf_h, buf_w = [int(v) for v in buffer_shape[:2]]
+    if x2_ds <= 0 or y2_ds <= 0 or x1_ds >= buf_w or y1_ds >= buf_h:
+        return None
+
+    y1_clamped = max(0, y1_ds)
+    x1_clamped = max(0, x1_ds)
+    y2_clamped = min(buf_h, y2_ds)
+    x2_clamped = min(buf_w, x2_ds)
+
+    py0 = y1_clamped - y1_ds
+    px0 = x1_clamped - x1_ds
+    py1 = py0 + (y2_clamped - y1_clamped)
+    px1 = px0 + (x2_clamped - x1_clamped)
+    if py1 <= py0 or px1 <= px0:
+        return None
+
+    return {
+        "target_h": int(target_h),
+        "target_w": int(target_w),
+        "y1": int(y1_clamped),
+        "y2": int(y2_clamped),
+        "x1": int(x1_clamped),
+        "x2": int(x2_clamped),
+        "py0": int(py0),
+        "py1": int(py1),
+        "px0": int(px0),
+        "px1": int(px1),
+    }
+
+
 def accumulate_to_buffers(
     *,
     outputs,
@@ -79,67 +131,36 @@ def accumulate_to_buffers(
 ):
     ds = int(downsample)
     y_logits = outputs.detach().to("cpu", dtype=torch.float32)
-    buf_h, buf_w = pred_buf.shape[:2]
-    off_y, off_x = offset
     for i, (x1, y1, x2, y2) in enumerate(xyxys):
-        x1_i = int(x1)
-        y1_i = int(y1)
-        x2_i = int(x2)
-        y2_i = int(y2)
-
-        if ds > 1 and ((x1_i % ds) or (y1_i % ds) or (x2_i % ds) or (y2_i % ds)):
-            raise ValueError("stitch coordinates are not aligned with stitch_downsample")
-
-        x1_ds = x1_i // ds
-        y1_ds = y1_i // ds
-        x2_ds = (x2_i + ds - 1) // ds
-        y2_ds = (y2_i + ds - 1) // ds
-
-        x1_ds -= int(off_x)
-        x2_ds -= int(off_x)
-        y1_ds -= int(off_y)
-        y2_ds -= int(off_y)
-
-        target_h = y2_ds - y1_ds
-        target_w = x2_ds - x1_ds
-        if target_h <= 0 or target_w <= 0:
+        crop = resolve_buffer_crop(
+            xyxy=(x1, y1, x2, y2),
+            downsample=ds,
+            offset=offset,
+            buffer_shape=pred_buf.shape,
+        )
+        if crop is None:
             continue
 
         pred_patch = y_logits[i].unsqueeze(0)
-        if pred_patch.shape[-2:] != (target_h, target_w):
+        if pred_patch.shape[-2:] != (crop["target_h"], crop["target_w"]):
             pred_patch = F.interpolate(
                 pred_patch,
-                size=(target_h, target_w),
+                size=(crop["target_h"], crop["target_w"]),
                 mode="bilinear",
                 align_corners=False,
             )
 
-        if x2_ds <= 0 or y2_ds <= 0 or x1_ds >= buf_w or y1_ds >= buf_h:
-            continue
-
-        y1_clamped = max(0, y1_ds)
-        x1_clamped = max(0, x1_ds)
-        y2_clamped = min(buf_h, y2_ds)
-        x2_clamped = min(buf_w, x2_ds)
-
-        py0 = y1_clamped - y1_ds
-        px0 = x1_clamped - x1_ds
-        py1 = py0 + (y2_clamped - y1_clamped)
-        px1 = px0 + (x2_clamped - x1_clamped)
-        if py1 <= py0 or px1 <= px0:
-            continue
-
         patch_weights = gaussian_weights(
             gaussian_cache,
-            h=target_h,
-            w=target_w,
+            h=crop["target_h"],
+            w=crop["target_w"],
             sigma_scale=gaussian_sigma_scale,
             min_weight=gaussian_min_weight,
         )
-        pred_crop = pred_patch[..., py0:py1, px0:px1]
-        weight_crop = patch_weights[py0:py1, px0:px1]
+        pred_crop = pred_patch[..., crop["py0"]:crop["py1"], crop["px0"]:crop["px1"]]
+        weight_crop = patch_weights[crop["py0"]:crop["py1"], crop["px0"]:crop["px1"]]
 
-        pred_buf[y1_clamped:y2_clamped, x1_clamped:x2_clamped] += (
+        pred_buf[crop["y1"]:crop["y2"], crop["x1"]:crop["x2"]] += (
             pred_crop.squeeze(0).squeeze(0).numpy() * weight_crop
         )
-        count_buf[y1_clamped:y2_clamped, x1_clamped:x2_clamped] += weight_crop
+        count_buf[crop["y1"]:crop["y2"], crop["x1"]:crop["x2"]] += weight_crop

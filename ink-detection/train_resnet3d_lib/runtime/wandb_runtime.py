@@ -154,6 +154,8 @@ def define_wandb_metric_summaries(wandb_logger, merged_config):
         "train/dice_ema": "max",
         "train/worst_group_loss_ema": "min",
         "metrics/val/dice": "max",
+        "metrics/val/dice_hist_thr_96_255": "max",
+        "metrics/val/balanced_accuracy_hist_thr_96_255": "max",
     }
     overlap = set(metric_summaries) & set(val_stitch_metric_summaries)
     if overlap:

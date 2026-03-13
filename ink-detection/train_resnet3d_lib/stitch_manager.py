@@ -11,12 +11,19 @@ from train_resnet3d_lib.stitching.buffer_ops import (
     compose_segment_from_roi_buffers as _compose_segment_from_roi_buffers,
 )
 from train_resnet3d_lib.stitching.epoch_passes import (
+    compute_train_stitch_loss as _compute_train_stitch_loss,
     run_log_only_stitch_pass as _run_log_only_stitch_pass,
     run_train_stitch_pass as _run_train_stitch_pass,
 )
 from train_resnet3d_lib.stitching.metrics_runtime import log_stitched_validation_metrics
 from train_resnet3d_lib.stitching.roi_layout import allocate_segment_buffers, build_segment_roi_meta
 from train_resnet3d_lib.stitching.wandb_media import log_stitched_wandb_media
+
+
+def _normalize_component_key(component_key):
+    if not isinstance(component_key, (list, tuple)) or len(component_key) != 2:
+        raise ValueError(f"component_key must be a pair (segment_id, component_idx), got {component_key!r}")
+    return str(component_key[0]), int(component_key[1])
 
 
 class StitchManager:
@@ -32,9 +39,12 @@ class StitchManager:
         stitch_all_val_segment_ids=None,
         stitch_train_shapes=None,
         stitch_train_segment_ids=None,
+        train_component_shapes=None,
+        train_component_keys=None,
         stitch_use_roi=None,
         stitch_val_bboxes=None,
         stitch_train_bboxes=None,
+        train_component_bboxes=None,
         stitch_log_only_shapes=None,
         stitch_log_only_segment_ids=None,
         stitch_log_only_bboxes=None,
@@ -43,6 +53,7 @@ class StitchManager:
         stitch_train=None,
         stitch_train_every_n_epochs=None,
         train_loaders=None,
+        train_component_datasets=None,
         log_only_loaders=None,
         train_borders=None,
         val_borders=None,
@@ -74,7 +85,10 @@ class StitchManager:
         self.stitch_all_val_segment_ids = [str(x) for x in (stitch_all_val_segment_ids or [])]
         self.stitch_train_shapes = list(stitch_train_shapes or [])
         self.stitch_train_segment_ids = [str(x) for x in (stitch_train_segment_ids or [])]
-        self.train_enabled = bool(getattr(cfg, "stitch_train", False) if stitch_train is None else stitch_train)
+        self.train_component_shapes = list(train_component_shapes or [])
+        self.train_component_keys = [_normalize_component_key(x) for x in (train_component_keys or [])]
+        self.train_viz_enabled = bool(getattr(cfg, "stitch_train", False) if stitch_train is None else stitch_train)
+        self.train_enabled = self.train_viz_enabled
         self.train_every_n_epochs = int(
             getattr(cfg, "stitch_train_every_n_epochs", 1)
             if stitch_train_every_n_epochs is None
@@ -84,6 +98,8 @@ class StitchManager:
         self.stitch_log_only_segment_ids = [str(x) for x in (stitch_log_only_segment_ids or [])]
         self.train_segment_ids = list(self.stitch_train_segment_ids)
         self.train_loaders = list(train_loaders or [])
+        self.train_component_datasets = list(train_component_datasets or [])
+        self._train_component_dataset_map = {}
         self.log_only_segment_ids = list(self.stitch_log_only_segment_ids)
         self.log_only_loaders = list(log_only_loaders or [])
         self.log_only_every_n_epochs = int(
@@ -98,14 +114,23 @@ class StitchManager:
         }
         self.val_bboxes = dict(stitch_val_bboxes or {})
         self.train_bboxes = dict(stitch_train_bboxes or {})
+        self.train_component_bboxes = {
+            _normalize_component_key(key): value for key, value in dict(train_component_bboxes or {}).items()
+        }
         self.log_only_bboxes = dict(stitch_log_only_bboxes or {})
 
         self._gaussian_cache = {}
+        self._torch_gaussian_cache = {}
+        self._train_boundary_dist_maps_cpu = {}
+        self._train_boundary_dist_maps_torch = {}
+        self._train_component_meta = {}
         self._gaussian_sigma_scale = 1.0 / 8.0
         self._gaussian_min_weight = 1e-6
 
         self._validate_segment_shape_pairs()
+        self._validate_train_component_shape_pairs()
         self._register_initial_segments()
+        self.set_train_component_datasets(self.train_component_datasets, self.train_component_keys)
 
     def _validate_segment_shape_pairs(self) -> None:
         segment_shape_pairs = (
@@ -119,9 +144,17 @@ class StitchManager:
                     f"{name} segment ids/shapes length mismatch: ids={len(segment_ids)} shapes={len(shapes)}"
                 )
 
+    def _validate_train_component_shape_pairs(self) -> None:
+        if len(self.train_component_keys) != len(self.train_component_shapes):
+            raise ValueError(
+                "train component keys/shapes length mismatch: "
+                f"keys={len(self.train_component_keys)} shapes={len(self.train_component_shapes)}"
+            )
+
     def _register_initial_segments(self) -> None:
         self._register_val_segments()
         self._register_train_segments()
+        self._register_train_components()
         self._register_log_only_segments()
         self.enabled = len(self._roi_buffers_by_split["val"]) > 0
 
@@ -190,6 +223,19 @@ class StitchManager:
                 self.downsample,
             )
 
+    def _register_train_components(self) -> None:
+        for component_key, shape in zip(self.train_component_keys, self.train_component_shapes):
+            key = _normalize_component_key(component_key)
+            if key in self._train_component_meta:
+                raise ValueError(f"duplicate train component key: {key!r}")
+            bbox = self.train_component_bboxes.get(key)
+            self._train_component_meta[key] = build_segment_roi_meta(
+                shape,
+                bbox,
+                self.downsample,
+                use_roi=True,
+            )
+
     def _register_log_only_segments(self) -> None:
         for segment_id, shape in zip(
             self.stitch_log_only_segment_ids,
@@ -215,6 +261,27 @@ class StitchManager:
     def set_train_loaders(self, loaders, segment_ids):
         self.train_loaders = list(loaders or [])
         self.train_segment_ids = [str(x) for x in (segment_ids or [])]
+        self._train_boundary_dist_maps_cpu.clear()
+        self._train_boundary_dist_maps_torch.clear()
+
+    def set_train_component_datasets(self, datasets, component_keys):
+        self.train_component_datasets = list(datasets or [])
+        self.train_component_keys = [_normalize_component_key(x) for x in (component_keys or [])]
+        self._train_component_dataset_map = {
+            key: dataset for key, dataset in zip(self.train_component_keys, self.train_component_datasets)
+        }
+        self._train_boundary_dist_maps_cpu.clear()
+        self._train_boundary_dist_maps_torch.clear()
+
+    def train_loader_for_segment(self, segment_id):
+        sid = str(segment_id)
+        for loader, candidate_id in zip(self.train_loaders, self.train_segment_ids):
+            if str(candidate_id) == sid:
+                return loader
+        return None
+
+    def train_dataset_for_component(self, component_key):
+        return self._train_component_dataset_map.get(_normalize_component_key(component_key))
 
     def set_log_only_loaders(self, loaders, segment_ids):
         self.log_only_loaders = list(loaders or [])
@@ -276,9 +343,7 @@ class StitchManager:
         sanity_checking = bool(trainer is not None and getattr(trainer, "sanity_checking", False))
         is_global_zero = bool(trainer is None or trainer.is_global_zero)
 
-        train_configured = bool(self.train_loaders) and bool(self.train_segment_ids) and bool(
-            self._roi_meta_by_split["train"]
-        )
+        train_configured = self._train_stitch_is_configured()
         log_only_configured = bool(self.log_only_loaders) and bool(self.log_only_segment_ids) and bool(
             self._roi_buffers_by_split["log_only"]
         )
@@ -286,7 +351,7 @@ class StitchManager:
         return {
             "sanity_checking": sanity_checking,
             "is_global_zero": is_global_zero,
-            "stitch_train_mode": bool(self.train_enabled and train_configured),
+            "stitch_train_mode": bool(self.train_viz_enabled and train_configured),
             "log_only_mode": bool(log_only_configured),
         }
 
@@ -338,6 +403,9 @@ class StitchManager:
             return True
         return False
 
+    def _train_stitch_is_configured(self) -> bool:
+        return bool(self.train_loaders) and bool(self.train_segment_ids) and bool(self._roi_meta_by_split["train"])
+
     def _reset_epoch_end_buffers(self, *, log_only_mode: bool) -> None:
         self._reset_buffers_for_split("val")
         if log_only_mode:
@@ -375,6 +443,9 @@ class StitchManager:
 
     def run_train_stitch_pass(self, model):
         return _run_train_stitch_pass(self, model)
+
+    def compute_train_stitch_loss(self, model, *, component_key):
+        return _compute_train_stitch_loss(self, model, component_key=component_key)
 
     def run_log_only_stitch_pass(self, model):
         return _run_log_only_stitch_pass(self, model)

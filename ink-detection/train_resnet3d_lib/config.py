@@ -90,6 +90,17 @@ class CFG:
     group_stratified_epoch_size_mode = "dataset"  # "dataset" | "min_group"
     loss_mode = "batch"  # "batch" | "per_sample"
     loss_recipe = "dice_bce"  # "dice_bce" | "bce_only"
+    patch_loss_weight = 1.0
+    stitch_loss_weight = 0.0
+    stitch_boundary_loss_weight = 0.0
+    stitch_cldice_loss_weight = 0.0
+    stitch_cldice_mask_mode = "pre_skeleton"
+    stitch_betti_matching_loss_weight = 0.0
+    stitch_betti_matching_filtration_type = "superlevel"
+    stitch_betti_matching_num_processes = 1
+    stitch_patch_batch_size = valid_batch_size
+    stitch_gradient_checkpointing = False
+    stitch_save_on_cpu = False
     bce_smooth_factor = 0.25
     soft_label_positive = 1.0
     soft_label_negative = 0.0
@@ -101,6 +112,8 @@ class CFG:
     # ============== eval metrics cfg (validation-only) =============
     # Threshold for confusion-based metrics.
     eval_threshold = 0.5
+    # Histogram-style binarization threshold used for extra validation metrics (96/255 ~= 0.3765).
+    eval_histogram_threshold = 96.0 / 255.0
     # Extra "stitched segment" metrics (expensive, but more faithful for topology/document metrics).
     eval_stitch_metrics = True
     eval_stitch_every_n_epochs = 1

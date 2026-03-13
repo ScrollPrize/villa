@@ -1,0 +1,112 @@
+program: train_resnet3d.py
+project: ink-2um-experiments
+entity: vesuvius-challenge
+method: grid
+
+metric:
+  name: metrics/val_stitch/global/components/betti_match_err/mean
+  goal: minimize
+
+parameters:
+  training.objective:
+    value: erm
+  training.loss_mode:
+    value: batch
+  training.loss_recipe:
+    value: dice_bce
+  training.sampler:
+    value: shuffle
+  training.cv_fold:
+    value: 0
+  training.train_segments:
+    value:
+      - "20250806145318"
+      - "l2_0_crop"
+      - "658"
+      - "500p2a"
+      - "-1"
+      - "20250910185200"
+      - "20250919125754-auto_grown_20250919055754487_inp_hr"
+  training.val_segments:
+    value:
+      - "20250806145318"
+      - "l2_0_crop"
+      - "658"
+      - "500p2a"
+      - "-1"
+      - "20250910185200"
+      - "20250919125754-auto_grown_20250919055754487_inp_hr"
+  training.train_batch_size:
+    value: 2
+  training.valid_batch_size:
+    value: 2
+  training.stitch_patch_batch_size:
+    value: 16
+  training.accumulate_grad_batches:
+    value: 2
+  training.epochs:
+    value: 30
+  training.lr:
+    value: 1.17e-04
+  training.weight_decay:
+    value: 1.54e-04
+  training.max_clip_value:
+    value: null
+  training.normalization_mode:
+    value: train_fold_fg_clip_robust_zscore
+  training.patch_loss_weight:
+    values:
+      - 0.25
+      - 0.5
+  training.stitch_loss_weight:
+    value: 1.0
+  training.stitch_boundary_loss_weight:
+    value: 0.0
+  training.stitch_cldice_loss_weight:
+    value: 0.0
+  training.stitch_betti_matching_loss_weight:
+    values:
+      - 0.05
+      - 0.1
+      - 0.2
+  training.stitch_betti_matching_filtration_type:
+    value: superlevel
+  training.stitch_betti_matching_num_processes:
+    value: 1
+  training.eval_threshold_grid:
+    value:
+      - 0.35
+      - 0.4
+      - 0.45
+      - 0.5
+      - 0.55
+      - 0.6
+      - 0.65
+  training.stitch_gradient_checkpointing:
+    value: true
+  training.stitch_save_on_cpu:
+    value: false
+
+  stitch.all_val:
+    value: true
+  stitch.use_roi:
+    value: true
+  stitch.train:
+    value: false
+
+  wandb.tags:
+    value:
+      - ink-2um
+      - erm
+      - stitch_betti_matching
+      - betti_matching_tune
+      - stitch_ckpt
+      - fold0
+      - train_fold_fg_clip_robust_zscore
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --metadata_json
+  - metadata.json

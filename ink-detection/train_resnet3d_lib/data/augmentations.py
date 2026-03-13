@@ -18,6 +18,104 @@ def _as_float(value, default=None):
     return float(value)
 
 
+def _as_bool(value, default=None):
+    if value is None:
+        value = default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y"}:
+            return True
+        if normalized in {"0", "false", "no", "n"}:
+            return False
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    raise ValueError(f"expected boolean-compatible value, got {value!r}")
+
+
+def _as_scalar_or_pair(value, default=None, *, caster=float):
+    if value is None:
+        value = default
+    if isinstance(value, (list, tuple)):
+        if len(value) != 2:
+            raise ValueError(f"expected exactly 2 values, got {value!r}")
+        return tuple(caster(v) for v in value)
+    return caster(value)
+
+
+def _std_range_to_var_limit(std_range):
+    if isinstance(std_range, tuple):
+        return tuple(float(max(v, 0.0) * 255.0) ** 2 for v in std_range)
+    return float(max(std_range, 0.0) * 255.0) ** 2
+
+
+def _build_gauss_noise_transform(blur_cfg):
+    gauss_noise_std_range = _as_scalar_or_pair(
+        blur_cfg.get("gauss_noise_std_range"),
+        default=(
+            float(np.sqrt(10.0) / 255.0),
+            float(np.sqrt(50.0) / 255.0),
+        ),
+        caster=float,
+    )
+    try:
+        return A.GaussNoise(std_range=gauss_noise_std_range)
+    except TypeError:
+        gauss_noise_var_limit = _as_scalar_or_pair(
+            blur_cfg.get("gauss_noise_var_limit"),
+            default=_std_range_to_var_limit(gauss_noise_std_range),
+            caster=float,
+        )
+        return A.GaussNoise(var_limit=gauss_noise_var_limit)
+
+
+def _build_random_brightness_contrast(brightness_contrast_cfg):
+    p = _as_float(brightness_contrast_cfg.get("p"), 0.75)
+    if p <= 0.0:
+        return None
+    return A.RandomBrightnessContrast(
+        brightness_limit=_as_scalar_or_pair(
+            brightness_contrast_cfg.get("brightness_limit"),
+            default=0.2,
+            caster=float,
+        ),
+        contrast_limit=_as_scalar_or_pair(
+            brightness_contrast_cfg.get("contrast_limit"),
+            default=0.2,
+            caster=float,
+        ),
+        brightness_by_max=_as_bool(brightness_contrast_cfg.get("brightness_by_max"), True),
+        p=p,
+    )
+
+
+def _build_random_gamma(gamma_cfg):
+    p = _as_float(gamma_cfg.get("p"), 0.0)
+    if p <= 0.0:
+        return None
+    return A.RandomGamma(
+        gamma_limit=_as_scalar_or_pair(gamma_cfg.get("gamma_limit"), default=(80, 120), caster=int),
+        p=p,
+    )
+
+
+def _build_multiplicative_noise(multiplicative_noise_cfg):
+    p = _as_float(multiplicative_noise_cfg.get("p"), 0.0)
+    if p <= 0.0:
+        return None
+    return A.MultiplicativeNoise(
+        multiplier=_as_scalar_or_pair(
+            multiplicative_noise_cfg.get("multiplier"),
+            default=(0.9, 1.1),
+            caster=float,
+        ),
+        per_channel=_as_bool(multiplicative_noise_cfg.get("per_channel"), False),
+        elementwise=_as_bool(multiplicative_noise_cfg.get("elementwise"), False),
+        p=p,
+    )
+
+
 def get_transforms(data, cfg):
     split = str(data).strip().lower()
     if split == "train":
@@ -172,6 +270,11 @@ def _apply_fold_label_foreground_percentile_clip_robust_zscore(image, *, stats, 
     return image
 
 
+def _apply_fold_label_foreground_percentile_clip_from_cfg(image, *, cfg, apply_fn, **kwargs):
+    stats = getattr(cfg, "fold_label_foreground_percentile_clip_zscore_stats", None)
+    return apply_fn(image, stats=stats, **kwargs)
+
+
 def build_intensity_normalization_transform(cfg, *, in_chans):
     from functools import partial
 
@@ -179,15 +282,21 @@ def build_intensity_normalization_transform(cfg, *, in_chans):
     if mode == "clip_max_div255":
         return A.Normalize(mean=[0] * in_chans, std=[1] * in_chans)
     if mode == "train_fold_fg_clip_zscore":
-        stats = getattr(cfg, "fold_label_foreground_percentile_clip_zscore_stats", None)
         return A.Lambda(
-            image=partial(_apply_fold_label_foreground_percentile_clip_zscore, stats=stats),
+            image=partial(
+                _apply_fold_label_foreground_percentile_clip_from_cfg,
+                cfg=cfg,
+                apply_fn=_apply_fold_label_foreground_percentile_clip_zscore,
+            ),
             p=1.0,
         )
     if mode == "train_fold_fg_clip_robust_zscore":
-        stats = getattr(cfg, "fold_label_foreground_percentile_clip_zscore_stats", None)
         return A.Lambda(
-            image=partial(_apply_fold_label_foreground_percentile_clip_robust_zscore, stats=stats),
+            image=partial(
+                _apply_fold_label_foreground_percentile_clip_from_cfg,
+                cfg=cfg,
+                apply_fn=_apply_fold_label_foreground_percentile_clip_robust_zscore,
+            ),
             p=1.0,
         )
     raise ValueError(
@@ -226,6 +335,9 @@ def rebuild_augmentations(cfg, augmentation_cfg=None):
     shift_scale_rotate = dict(augmentation_cfg.get("shift_scale_rotate") or {})
     blur_cfg = dict(augmentation_cfg.get("blur") or {})
     coarse_dropout_cfg = dict(augmentation_cfg.get("coarse_dropout") or {})
+    brightness_contrast_cfg = dict(augmentation_cfg.get("brightness_contrast") or {})
+    gamma_cfg = dict(augmentation_cfg.get("random_gamma") or {})
+    multiplicative_noise_cfg = dict(augmentation_cfg.get("multiplicative_noise") or {})
 
     raw_blur_types = blur_cfg.get("types", ["GaussNoise", "GaussianBlur", "MotionBlur"])
     if isinstance(raw_blur_types, str):
@@ -234,18 +346,18 @@ def rebuild_augmentations(cfg, augmentation_cfg=None):
 
     blur_transforms = []
     if "GaussNoise" in blur_types:
-        gauss_noise_std_range = (
-            float(np.sqrt(10.0) / 255.0),
-            float(np.sqrt(50.0) / 255.0),
-        )
-        try:
-            blur_transforms.append(A.GaussNoise(std_range=gauss_noise_std_range))
-        except TypeError:
-            blur_transforms.append(A.GaussNoise(var_limit=(10, 50)))
+        blur_transforms.append(_build_gauss_noise_transform(blur_cfg))
     if "GaussianBlur" in blur_types:
         blur_transforms.append(A.GaussianBlur())
     if "MotionBlur" in blur_types:
         blur_transforms.append(A.MotionBlur())
+
+    intensity_transforms = [
+        _build_random_brightness_contrast(brightness_contrast_cfg),
+        _build_random_gamma(gamma_cfg),
+        _build_multiplicative_noise(multiplicative_noise_cfg),
+    ]
+    intensity_transforms = [transform for transform in intensity_transforms if transform is not None]
 
     max_holes = _as_int(coarse_dropout_cfg.get("max_holes"), 2)
     max_width_ratio = _as_float(coarse_dropout_cfg.get("max_width_ratio"), 0.2)
@@ -275,7 +387,7 @@ def rebuild_augmentations(cfg, augmentation_cfg=None):
         A.Resize(size, size),
         A.HorizontalFlip(p=_as_float(augmentation_cfg.get("horizontal_flip"), 0.5)),
         A.VerticalFlip(p=_as_float(augmentation_cfg.get("vertical_flip"), 0.5)),
-        A.RandomBrightnessContrast(p=0.75),
+        *intensity_transforms,
         A.ShiftScaleRotate(
             rotate_limit=_as_int(shift_scale_rotate.get("rotate_limit"), 360),
             shift_limit=_as_float(shift_scale_rotate.get("shift_limit"), 0.15),

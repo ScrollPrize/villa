@@ -5,6 +5,11 @@ import numpy as np
 import PIL.Image
 
 from train_resnet3d_lib.config import CFG
+from train_resnet3d_lib.data.segment_layout import (
+    resolve_segment_label_path,
+    resolve_segment_layers_dir,
+    resolve_segment_mask_path,
+)
 
 
 def _require_dict(value, *, name):
@@ -106,9 +111,9 @@ def read_image_layers(
     fragment_id,
     *,
     layer_range,
+    seg_meta=None,
 ):
-    dataset_root = str(getattr(CFG, "dataset_root", "train_scrolls"))
-    layers_dir = osp.join(dataset_root, fragment_id, "layers")
+    layers_dir = resolve_segment_layers_dir(fragment_id, seg_meta=seg_meta)
     layer_exts = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
 
     def _iter_layer_paths(layer_idx):
@@ -206,34 +211,27 @@ def read_image_mask(
     label_suffix="",
     mask_suffix="",
     images=None,
+    seg_meta=None,
 ):
     if images is None:
         images = read_image_layers(
             fragment_id,
             layer_range=layer_range,
+            seg_meta=seg_meta,
         )
 
     if reverse_layers:
         images = images[:, :, ::-1]
 
-    dataset_root = str(getattr(CFG, "dataset_root", "train_scrolls"))
-    label_base = osp.join(dataset_root, str(fragment_id), f"{fragment_id}_inklabels{label_suffix}")
-    mask = _read_gray(f"{label_base}.png")
+    label_path = resolve_segment_label_path(fragment_id, seg_meta=seg_meta, suffix=label_suffix)
+    mask_path = resolve_segment_mask_path(fragment_id, seg_meta=seg_meta, suffix=mask_suffix)
+    mask = _read_gray(label_path)
     if mask is None:
-        mask = _read_gray(f"{label_base}.tiff")
-    if mask is None:
-        mask = _read_gray(f"{label_base}.tif")
-    if mask is None:
-        raise FileNotFoundError(f"Could not read label for {fragment_id}: {label_base}.png/.tif/.tiff")
+        raise FileNotFoundError(f"Could not read label for {fragment_id}: {label_path}")
 
-    mask_base = osp.join(dataset_root, str(fragment_id), f"{fragment_id}_mask{mask_suffix}")
-    fragment_mask = _read_gray(f"{mask_base}.png")
+    fragment_mask = _read_gray(mask_path)
     if fragment_mask is None:
-        fragment_mask = _read_gray(f"{mask_base}.tiff")
-    if fragment_mask is None:
-        fragment_mask = _read_gray(f"{mask_base}.tif")
-    if fragment_mask is None:
-        raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png/.tif/.tiff")
+        raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_path}")
 
     def _assert_bottom_right_pad_compatible(a_name, a_hw, b_name, b_hw, multiple):
         _assert_bottom_right_pad_compatible_global(fragment_id, a_name, a_hw, b_name, b_hw, multiple)
@@ -275,25 +273,22 @@ def read_image_fragment_mask(
     reverse_layers=False,
     mask_suffix="",
     images=None,
+    seg_meta=None,
 ):
     if images is None:
         images = read_image_layers(
             fragment_id,
             layer_range=layer_range,
+            seg_meta=seg_meta,
         )
 
     if reverse_layers:
         images = images[:, :, ::-1]
 
-    dataset_root = str(getattr(CFG, "dataset_root", "train_scrolls"))
-    mask_base = osp.join(dataset_root, str(fragment_id), f"{fragment_id}_mask{mask_suffix}")
-    fragment_mask = _read_gray(f"{mask_base}.png")
+    mask_path = resolve_segment_mask_path(fragment_id, seg_meta=seg_meta, suffix=mask_suffix)
+    fragment_mask = _read_gray(mask_path)
     if fragment_mask is None:
-        fragment_mask = _read_gray(f"{mask_base}.tiff")
-    if fragment_mask is None:
-        fragment_mask = _read_gray(f"{mask_base}.tif")
-    if fragment_mask is None:
-        raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png/.tif/.tiff")
+        raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_path}")
 
     pad_multiple = 256
     _assert_bottom_right_pad_compatible_global(
@@ -317,28 +312,20 @@ def read_label_and_fragment_mask_for_shape(
     *,
     label_suffix="",
     mask_suffix="",
+    seg_meta=None,
 ):
     image_h = int(image_shape_hw[0])
     image_w = int(image_shape_hw[1])
-    dataset_root = str(getattr(CFG, "dataset_root", "train_scrolls"))
+    label_path = resolve_segment_label_path(fragment_id, seg_meta=seg_meta, suffix=label_suffix)
+    mask_path = resolve_segment_mask_path(fragment_id, seg_meta=seg_meta, suffix=mask_suffix)
 
-    label_base = osp.join(dataset_root, str(fragment_id), f"{fragment_id}_inklabels{label_suffix}")
-    mask = _read_gray(f"{label_base}.png")
+    mask = _read_gray(label_path)
     if mask is None:
-        mask = _read_gray(f"{label_base}.tiff")
-    if mask is None:
-        mask = _read_gray(f"{label_base}.tif")
-    if mask is None:
-        raise FileNotFoundError(f"Could not read label for {fragment_id}: {label_base}.png/.tif/.tiff")
+        raise FileNotFoundError(f"Could not read label for {fragment_id}: {label_path}")
 
-    mask_base = osp.join(dataset_root, str(fragment_id), f"{fragment_id}_mask{mask_suffix}")
-    fragment_mask = _read_gray(f"{mask_base}.png")
+    fragment_mask = _read_gray(mask_path)
     if fragment_mask is None:
-        fragment_mask = _read_gray(f"{mask_base}.tiff")
-    if fragment_mask is None:
-        fragment_mask = _read_gray(f"{mask_base}.tif")
-    if fragment_mask is None:
-        raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png/.tif/.tiff")
+        raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_path}")
 
     pad_multiple = 256
     _assert_bottom_right_pad_compatible_global(
@@ -392,19 +379,14 @@ def read_fragment_mask_for_shape(
     image_shape_hw,
     *,
     mask_suffix="",
+    seg_meta=None,
 ):
     image_h = int(image_shape_hw[0])
     image_w = int(image_shape_hw[1])
-    dataset_root = str(getattr(CFG, "dataset_root", "train_scrolls"))
-
-    mask_base = osp.join(dataset_root, str(fragment_id), f"{fragment_id}_mask{mask_suffix}")
-    fragment_mask = _read_gray(f"{mask_base}.png")
+    mask_path = resolve_segment_mask_path(fragment_id, seg_meta=seg_meta, suffix=mask_suffix)
+    fragment_mask = _read_gray(mask_path)
     if fragment_mask is None:
-        fragment_mask = _read_gray(f"{mask_base}.tiff")
-    if fragment_mask is None:
-        fragment_mask = _read_gray(f"{mask_base}.tif")
-    if fragment_mask is None:
-        raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_base}.png/.tif/.tiff")
+        raise FileNotFoundError(f"Could not read mask for {fragment_id}: {mask_path}")
 
     pad_multiple = 256
     _assert_bottom_right_pad_compatible_global(

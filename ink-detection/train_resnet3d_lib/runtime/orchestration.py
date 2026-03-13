@@ -15,6 +15,7 @@ from train_resnet3d_lib.config import (
     load_and_validate_base_config,
     log,
     merge_config_with_overrides,
+    resolve_metadata_path,
     slugify,
     unflatten_dict,
 )
@@ -93,12 +94,13 @@ def merge_config(base_config, wandb_logger, args, *, preinit_overrides=None):
 
 
 def load_base_config_and_preinit(*, metadata_json, base_dir):
+    metadata_path = resolve_metadata_path(metadata_json, base_dir=base_dir)
     base_config = load_and_validate_base_config(
         metadata_json,
         base_dir=base_dir,
     )
     preinit_overrides = wandb_runtime.load_wandb_preinit_overrides()
-    return base_config, preinit_overrides
+    return base_config, preinit_overrides, metadata_path
 
 
 def prepare_wandb_and_merged_config(args, base_config, *, preinit_overrides=None):
@@ -124,6 +126,7 @@ def prepare_runtime_state(
     run_name=None,
     init_ckpt_path=None,
     resume_from_ckpt=None,
+    metadata_path=None,
 ):
     segments_metadata = dict(merged_config["segments"])
     if not segments_metadata:
@@ -246,10 +249,43 @@ def prepare_runtime_state(
         "run_slug": run_slug,
         "run_id": run_id,
         "run_dir": run_dir,
+        "metadata_path": metadata_path,
     }
 
 
-def prepare_run(args, merged_config, wandb_logger):
+def _write_json_file(path, payload):
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True, default=str)
+        f.write("\n")
+
+
+def persist_run_snapshots(*, run_state, merged_config, args):
+    run_dir = str(run_state["run_dir"])
+    if not osp.isdir(run_dir):
+        raise FileNotFoundError(f"run_dir not found while persisting snapshots: {run_dir}")
+
+    metadata_path = run_state.get("metadata_path")
+    if metadata_path:
+        metadata_path = str(metadata_path)
+        if not osp.isfile(metadata_path):
+            raise FileNotFoundError(f"metadata path not found while persisting snapshots: {metadata_path}")
+        metadata_snapshot_path = osp.join(run_dir, "metadata.snapshot.json")
+        with open(metadata_path, "r") as src:
+            metadata_snapshot_contents = src.read()
+        with open(metadata_snapshot_path, "w") as dst:
+            dst.write(metadata_snapshot_contents)
+        log(f"saved metadata snapshot: {metadata_snapshot_path}")
+
+    merged_config_snapshot_path = osp.join(run_dir, "merged_config.snapshot.json")
+    _write_json_file(merged_config_snapshot_path, merged_config)
+    log(f"saved merged config snapshot: {merged_config_snapshot_path}")
+
+    cli_args_snapshot_path = osp.join(run_dir, "cli_args.snapshot.json")
+    _write_json_file(cli_args_snapshot_path, vars(args))
+    log(f"saved CLI args snapshot: {cli_args_snapshot_path}")
+
+
+def prepare_run(args, merged_config, wandb_logger, *, metadata_path=None):
     run_state = prepare_runtime_state(
         CFG,
         merged_config,
@@ -257,6 +293,7 @@ def prepare_run(args, merged_config, wandb_logger):
         run_name=args.run_name,
         init_ckpt_path=args.init_ckpt_path,
         resume_from_ckpt=args.resume_from_ckpt,
+        metadata_path=metadata_path,
     )
     wandb_runtime.configure_wandb_run(wandb_logger, run_state=run_state, cfg=CFG)
     return run_state

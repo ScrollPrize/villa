@@ -55,6 +55,7 @@ def _segment_layer_settings(seg_meta, fragment_id):
 def _read_tiff_segment(
     fragment_id,
     *,
+    seg_meta,
     layer_range,
     reverse_layers,
     label_suffix,
@@ -75,6 +76,7 @@ def _read_tiff_segment(
         layers = read_image_layers(
             fragment_id,
             layer_range=layer_range,
+            seg_meta=seg_meta,
         )
         if cache_for_overlap and layers_cache is not None and fragment_id in (overlap_segments or set()):
             layers_cache[fragment_id] = layers
@@ -85,6 +87,7 @@ def _read_tiff_segment(
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
         images=layers,
+        seg_meta=seg_meta,
     )
 
 
@@ -115,6 +118,7 @@ def _load_or_create_zarr_volume(
 def _build_zarr_patch_index(
     *,
     sid,
+    seg_meta,
     volume,
     split_name,
     label_suffix,
@@ -125,6 +129,7 @@ def _build_zarr_patch_index(
         volume.shape[:2],
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
+        seg_meta=seg_meta,
     )
     mask_store, xyxys, sample_bbox_indices = build_mask_store_and_patch_index_cached(
         mask,
@@ -178,6 +183,7 @@ def load_train_segment_for_backend(
         )
         mask, fragment_mask, mask_store, xyxys, sample_bbox_indices = _build_zarr_patch_index(
             sid=sid,
+            seg_meta=seg_meta,
             volume=volume,
             split_name="train",
             label_suffix=label_suffix,
@@ -199,6 +205,7 @@ def load_train_segment_for_backend(
             "group_idx": group_idx,
             "patch_count": patch_count,
             "volume": volume,
+            "label_mask": mask,
             "mask_store": mask_store,
             "xyxys": xyxys,
             "sample_bbox_indices": sample_bbox_indices,
@@ -212,6 +219,7 @@ def load_train_segment_for_backend(
 
     image, mask, fragment_mask = _read_tiff_segment(
         fragment_id,
+        seg_meta=seg_meta,
         layer_range=layer_range,
         reverse_layers=reverse_layers,
         label_suffix=label_suffix,
@@ -299,6 +307,7 @@ def load_val_segment_for_backend(
         )
         mask_val, fragment_mask_val, mask_store_val, val_xyxys, val_sample_bbox_indices = _build_zarr_patch_index(
             sid=sid,
+            seg_meta=seg_meta,
             volume=volume,
             split_name="val",
             label_suffix=label_suffix,
@@ -343,6 +352,7 @@ def load_val_segment_for_backend(
 
     image_val, mask_val, fragment_mask_val = _read_tiff_segment(
         fragment_id,
+        seg_meta=seg_meta,
         layer_range=layer_range,
         reverse_layers=reverse_layers,
         label_suffix=label_suffix,

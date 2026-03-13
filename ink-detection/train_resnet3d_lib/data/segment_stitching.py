@@ -27,6 +27,8 @@ def _resolve_requested_train_stitch_ids(train_fragment_ids, available_segment_id
     available = {str(x) for x in available_segment_ids}
     if bool(getattr(CFG, "stitch_all_val", False)):
         return [str(fid) for fid in train_fragment_ids if str(fid) in available]
+    if float(getattr(CFG, "stitch_loss_weight", 0.0) or 0.0) > 0.0:
+        return [str(fid) for fid in train_fragment_ids if str(fid) in available]
 
     requested_ids = []
     if stitch_segment_id is not None and str(stitch_segment_id) in available:
@@ -66,7 +68,7 @@ def _build_train_stitch_common(
     *,
     build_segment_loader,
 ):
-    if not bool(getattr(CFG, "stitch_train", False)):
+    if not bool(getattr(CFG, "stitch_train", False) or (float(getattr(CFG, "stitch_loss_weight", 0.0) or 0.0) > 0.0)):
         return [], [], []
     requested_ids = _resolve_requested_train_stitch_ids(
         train_fragment_ids,
@@ -178,6 +180,113 @@ def build_train_stitch_outputs(
     )
 
 
+def _label_component_bboxes(label_mask):
+    if label_mask is None:
+        return np.zeros((0, 4), dtype=np.int32)
+    return _mask_component_bboxes_downsample(np.asarray(label_mask), 1)
+
+
+def _full_mask_store_from_label_mask(label_mask):
+    mask_arr = np.asarray(label_mask)
+    if mask_arr.ndim != 2:
+        raise ValueError(f"label mask must be 2D, got shape={tuple(mask_arr.shape)}")
+    if mask_arr.dtype != np.uint8:
+        mask_arr = np.clip(mask_arr, 0, 255).astype(np.uint8, copy=False)
+    return {
+        "mode": "full",
+        "shape": tuple(mask_arr.shape),
+        "mask": mask_arr,
+    }
+
+
+def _xyxys_overlapping_bbox(xyxys, bbox):
+    xy_arr = np.asarray(xyxys, dtype=np.int64)
+    if xy_arr.ndim != 2 or xy_arr.shape[1] != 4:
+        raise ValueError(f"xyxys must have shape (N, 4), got {tuple(xy_arr.shape)}")
+    y0, y1, x0, x1 = [int(v) for v in np.asarray(bbox, dtype=np.int64).tolist()]
+    return (
+        (xy_arr[:, 0] < x1)
+        & (xy_arr[:, 2] > x0)
+        & (xy_arr[:, 1] < y1)
+        & (xy_arr[:, 3] > y0)
+    )
+
+
+def build_train_component_outputs(
+    *,
+    data_backend,
+    train_fragment_ids,
+    train_volumes_by_segment=None,
+    train_masks_by_segment=None,
+    train_label_masks_by_segment=None,
+    train_xyxys_by_segment=None,
+    train_sample_bbox_indices_by_segment=None,
+    train_groups_by_segment=None,
+    valid_transform,
+):
+    backend = normalize_data_backend(data_backend)
+    if backend != "zarr":
+        raise ValueError("component-wise stitched training currently requires training.data_backend='zarr'")
+
+    component_datasets = []
+    component_shapes = []
+    component_keys = []
+    component_bboxes = {}
+    component_patch_counts = []
+
+    for fragment_id in train_fragment_ids:
+        sid = str(fragment_id)
+        xy = train_xyxys_by_segment.get(sid)
+        label_mask = train_label_masks_by_segment.get(sid)
+        volume = train_volumes_by_segment.get(sid)
+        if xy is None or label_mask is None or volume is None:
+            continue
+
+        xy_arr = np.asarray(xy, dtype=np.int64)
+        if xy_arr.ndim != 2 or xy_arr.shape[1] != 4:
+            raise ValueError(f"{sid}: expected xyxys shape (N, 4), got {tuple(xy_arr.shape)}")
+
+        bboxes = _label_component_bboxes(label_mask)
+        if int(bboxes.shape[0]) <= 0:
+            continue
+
+        mask_store = _full_mask_store_from_label_mask(label_mask)
+        mask_shape = tuple(_mask_store_shape(mask_store))
+        group_idx = int(train_groups_by_segment.get(sid, 0))
+        for component_idx in range(int(bboxes.shape[0])):
+            component_bbox = np.asarray(bboxes[int(component_idx)], dtype=np.int32)
+            component_mask = _xyxys_overlapping_bbox(xy_arr, component_bbox)
+            if not bool(component_mask.any()):
+                continue
+
+            component_xy = xy_arr[component_mask]
+            dataset = LazyZarrXyLabelDataset(
+                {sid: volume},
+                {sid: mask_store},
+                {sid: component_xy},
+                {sid: group_idx},
+                CFG,
+                transform=valid_transform,
+            )
+            component_key = (sid, int(component_idx))
+            component_datasets.append(dataset)
+            component_shapes.append(mask_shape)
+            component_keys.append(component_key)
+            component_bboxes[component_key] = component_bbox
+            component_patch_counts.append(int(component_xy.shape[0]))
+
+    if component_patch_counts:
+        component_counts_arr = np.asarray(component_patch_counts, dtype=np.int64)
+        log(
+            "built stitched train label components "
+            f"components={len(component_keys)} "
+            f"patches_min={int(component_counts_arr.min())} "
+            f"patches_median={int(np.median(component_counts_arr))} "
+            f"patches_max={int(component_counts_arr.max())}"
+        )
+    return component_datasets, component_shapes, component_keys, component_bboxes
+
+
 def _collect_log_only_outputs(log_only_segments, *, build_segment_output):
     log_only_loaders = []
     log_only_shapes = []
@@ -217,6 +326,7 @@ def build_log_only_stitch_loaders(
             layers = read_image_layers(
                 fragment_id,
                 layer_range=layer_range,
+                seg_meta=seg_meta,
             )
         else:
             log(f"reuse layers cache for log-only segment={fragment_id}")
@@ -226,6 +336,7 @@ def build_log_only_stitch_loaders(
             reverse_layers=reverse_layers,
             mask_suffix=mask_suffix,
             images=layers,
+            seg_meta=seg_meta,
         )
 
         log(f"extract log-only patches segment={fragment_id}")
@@ -277,6 +388,7 @@ def build_log_only_stitch_loaders_lazy(
             sid,
             volume.shape[:2],
             mask_suffix=mask_suffix,
+            seg_meta=seg_meta,
         )
         xyxys = extract_infer_patch_coordinates_cached(
             fragment_mask=fragment_mask,

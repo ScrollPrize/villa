@@ -37,6 +37,15 @@ TRAINING_SCALARS = {
     "max_clip_value": object,
     "normalization_mode": str,
     "max_grad_norm": float,
+    "patch_loss_weight": float,
+    "stitch_loss_weight": float,
+    "stitch_boundary_loss_weight": float,
+    "stitch_cldice_loss_weight": float,
+    "stitch_cldice_mask_mode": str,
+    "stitch_betti_matching_loss_weight": float,
+    "stitch_betti_matching_filtration_type": str,
+    "stitch_betti_matching_num_processes": int,
+    "stitch_patch_batch_size": int,
     "bce_smooth_factor": float,
     "soft_label_positive": float,
     "soft_label_negative": float,
@@ -78,6 +87,8 @@ TRAINING_BOOLS = {
     "pretrained",
     "dataset_cache_enabled",
     "dataset_cache_check_hash",
+    "stitch_gradient_checkpointing",
+    "stitch_save_on_cpu",
 }
 
 TRAINING_LOWER = {
@@ -86,6 +97,8 @@ TRAINING_LOWER = {
     "group_stratified_epoch_size_mode",
     "loss_mode",
     "loss_recipe",
+    "stitch_cldice_mask_mode",
+    "stitch_betti_matching_filtration_type",
 }
 
 def _section(parent, key, *, key_prefix):
@@ -195,6 +208,8 @@ def apply_metadata_hyperparameters(
 
     if "train_batch_size" in training_cfg and "valid_batch_size" not in training_cfg:
         cfg.valid_batch_size = int(cfg.train_batch_size)
+    if "stitch_patch_batch_size" not in training_cfg:
+        cfg.stitch_patch_batch_size = int(cfg.valid_batch_size)
 
     cfg.norm = str(cfg.norm).strip().lower()
     cfg.optimizer = str(cfg.optimizer).strip().lower()

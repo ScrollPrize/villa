@@ -21,6 +21,9 @@ _RESNET3D_ENCODER_DIMS = {
     101: [256, 512, 1024, 2048],
     152: [256, 512, 1024, 2048],
 }
+_EVAL_HISTOGRAM_THRESHOLD_DEFAULT = 96.0 / 255.0
+_VAL_DICE_HIST_METRIC_KEY = "metrics/val/dice_hist_thr_96_255"
+_VAL_BALANCED_ACCURACY_HIST_METRIC_KEY = "metrics/val/balanced_accuracy_hist_thr_96_255"
 
 
 def _normalize_stitch_group_idx_by_segment(stitch_group_idx_by_segment, *, n_groups):
@@ -119,6 +122,58 @@ def initialize_regression_state(
     model.objective = str(getattr(CFG, "objective", "erm")).lower()
     model.loss_mode = str(getattr(CFG, "loss_mode", "batch")).lower()
     model.loss_recipe = str(getattr(CFG, "loss_recipe", "dice_bce")).lower()
+    model.patch_loss_weight = float(getattr(CFG, "patch_loss_weight", 1.0))
+    model.stitch_loss_weight = float(getattr(CFG, "stitch_loss_weight", 0.0))
+    model.stitch_boundary_loss_weight = float(getattr(CFG, "stitch_boundary_loss_weight", 0.0))
+    model.stitch_cldice_loss_weight = float(getattr(CFG, "stitch_cldice_loss_weight", 0.0))
+    model.stitch_cldice_mask_mode = str(getattr(CFG, "stitch_cldice_mask_mode", "pre_skeleton")).strip().lower()
+    model.stitch_betti_matching_loss_weight = float(getattr(CFG, "stitch_betti_matching_loss_weight", 0.0))
+    model.stitch_betti_matching_filtration_type = str(
+        getattr(CFG, "stitch_betti_matching_filtration_type", "superlevel")
+    ).strip().lower()
+    model.stitch_betti_matching_num_processes = int(getattr(CFG, "stitch_betti_matching_num_processes", 1) or 1)
+    model.stitch_gradient_checkpointing = bool(getattr(CFG, "stitch_gradient_checkpointing", False))
+    model.stitch_save_on_cpu = bool(getattr(CFG, "stitch_save_on_cpu", False))
+    if (
+        model.patch_loss_weight < 0.0
+        or model.stitch_loss_weight < 0.0
+        or model.stitch_boundary_loss_weight < 0.0
+        or model.stitch_cldice_loss_weight < 0.0
+        or model.stitch_betti_matching_loss_weight < 0.0
+    ):
+        raise ValueError(
+            "training.patch_loss_weight, training.stitch_loss_weight, and "
+            "training.stitch_boundary_loss_weight, training.stitch_cldice_loss_weight, and "
+            "training.stitch_betti_matching_loss_weight must be >= 0, "
+            "got "
+            f"{model.patch_loss_weight}, {model.stitch_loss_weight}, "
+            f"{model.stitch_boundary_loss_weight}, {model.stitch_cldice_loss_weight}, "
+            f"and {model.stitch_betti_matching_loss_weight}"
+        )
+    if model.patch_loss_weight == 0.0 and model.stitch_loss_weight == 0.0:
+        raise ValueError("training.patch_loss_weight and training.stitch_loss_weight cannot both be zero")
+    if model.stitch_cldice_loss_weight > 0.0 and model.stitch_loss_weight == 0.0:
+        raise ValueError("training.stitch_cldice_loss_weight > 0 requires training.stitch_loss_weight > 0")
+    if model.stitch_betti_matching_loss_weight > 0.0 and model.stitch_loss_weight == 0.0:
+        raise ValueError("training.stitch_betti_matching_loss_weight > 0 requires training.stitch_loss_weight > 0")
+    if model.stitch_cldice_mask_mode not in {"pre_skeleton", "post_skeleton"}:
+        raise ValueError(
+            "training.stitch_cldice_mask_mode must be 'pre_skeleton' or 'post_skeleton', "
+            f"got {model.stitch_cldice_mask_mode!r}"
+        )
+    if model.stitch_betti_matching_filtration_type not in {"superlevel", "sublevel", "bothlevels"}:
+        raise ValueError(
+            "training.stitch_betti_matching_filtration_type must be 'superlevel', 'sublevel', or 'bothlevels', "
+            f"got {model.stitch_betti_matching_filtration_type!r}"
+        )
+    if model.stitch_betti_matching_num_processes < 1:
+        raise ValueError(
+            "training.stitch_betti_matching_num_processes must be >= 1, "
+            f"got {model.stitch_betti_matching_num_processes}"
+        )
+    model.use_stitched_training = model.stitch_loss_weight > 0.0
+    if model.use_stitched_training and model.objective != "erm":
+        raise ValueError("training.stitch_loss_weight > 0 currently supports only training.objective='erm'")
     model.bce_smooth_factor = float(getattr(CFG, "bce_smooth_factor", 0.25))
     model.soft_label_positive = float(getattr(CFG, "soft_label_positive", 1.0))
     model.soft_label_negative = float(getattr(CFG, "soft_label_negative", 0.0))
@@ -140,7 +195,14 @@ def initialize_regression_state(
     model._ema_metrics = {}
 
     model._eval_threshold = float(getattr(CFG, "eval_threshold", 0.5))
+    model._eval_hist_threshold = float(getattr(CFG, "eval_histogram_threshold", _EVAL_HISTOGRAM_THRESHOLD_DEFAULT))
+    if not (0.0 <= model._eval_hist_threshold <= 1.0):
+        raise ValueError(
+            "training.eval_histogram_threshold must be in [0, 1], "
+            f"got {model._eval_hist_threshold}"
+        )
     model._val_eval_metrics = None
+    model._val_hist_eval_metrics = None
 
     model.loss_func1 = smp.losses.DiceLoss(mode="binary")
 
@@ -371,7 +433,8 @@ def finalize_training_batch(model, *, loss, per_sample_loss, per_sample_dice, gr
     accumulate_train_stats(model, per_sample_loss, per_sample_dice, group_idx)
     if torch.isnan(loss).any():
         raise FloatingPointError("NaN loss encountered during training_step")
-    model.log("train/total_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+    batch_size = int(per_sample_loss.shape[0]) if hasattr(per_sample_loss, "shape") and len(per_sample_loss.shape) > 0 else 1
+    model.log("train/total_loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
 
 
 def log_train_epoch_metrics(model):
@@ -434,6 +497,10 @@ def initialize_validation_metrics(model):
         threshold=model._eval_threshold,
         device=model.device,
     )
+    model._val_hist_eval_metrics = StreamingBinarySegmentationMetrics(
+        threshold=model._eval_hist_threshold,
+        device=model.device,
+    )
 
 
 def accumulate_validation_stats(
@@ -462,6 +529,8 @@ def accumulate_validation_stats(
 def update_validation_stream_metrics(model, *, outputs, targets):
     if model._val_eval_metrics is not None:
         model._val_eval_metrics.update(logits=outputs, targets=targets)
+    if model._val_hist_eval_metrics is not None:
+        model._val_hist_eval_metrics.update(logits=outputs, targets=targets)
 
 
 def log_validation_epoch_metrics(model):
@@ -503,8 +572,19 @@ def log_validation_epoch_metrics(model):
 
     if model._val_eval_metrics is not None:
         eval_metrics = model._val_eval_metrics.compute()
-        for metric_name, metric_value in eval_metrics.items():
-            model.log(f"metrics/val/{metric_name}", metric_value, on_epoch=True, prog_bar=False)
+        if "dice" in eval_metrics:
+            model.log("metrics/val/dice", eval_metrics["dice"], on_epoch=True, prog_bar=False)
+    if model._val_hist_eval_metrics is not None:
+        hist_eval_metrics = model._val_hist_eval_metrics.compute()
+        if "dice" in hist_eval_metrics:
+            model.log(_VAL_DICE_HIST_METRIC_KEY, hist_eval_metrics["dice"], on_epoch=True, prog_bar=False)
+        if "balanced_accuracy" in hist_eval_metrics:
+            model.log(
+                _VAL_BALANCED_ACCURACY_HIST_METRIC_KEY,
+                hist_eval_metrics["balanced_accuracy"],
+                on_epoch=True,
+                prog_bar=False,
+            )
 
     for group_i, group_name in enumerate(model.group_names):
         safe_group_name = str(group_name).replace("/", "_")
@@ -513,6 +593,174 @@ def log_validation_epoch_metrics(model):
         model.log(f"val/group_{group_i}_{safe_group_name}/bce_loss", group_bce[group_i], on_epoch=True)
         model.log(f"val/group_{group_i}_{safe_group_name}/dice_loss", group_dice_loss[group_i], on_epoch=True)
         model.log(f"val/group_{group_i}_{safe_group_name}/count", group_count[group_i], on_epoch=True)
+
+
+def _component_keys_from_training_batch(batch):
+    if isinstance(batch, (list, tuple)) and len(batch) == 2 and not isinstance(batch[0], (list, tuple)):
+        return [(str(batch[0]), int(batch[1]))]
+    if isinstance(batch, (list, tuple)):
+        component_keys = []
+        for item in batch:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError(f"stitched training batch items must be (segment_id, component_idx), got {item!r}")
+            component_keys.append((str(item[0]), int(item[1])))
+        if not component_keys:
+            raise ValueError("stitched training batch must contain at least one component key")
+        return component_keys
+    raise ValueError(f"unsupported stitched training batch type: {type(batch).__name__}")
+
+
+def _training_step_stitched(model, batch):
+    component_keys = _component_keys_from_training_batch(batch)
+    component_batch_size = int(max(1, len(component_keys)))
+    stitch_metrics_list = [
+        model._stitcher.compute_train_stitch_loss(model, component_key=component_key)
+        for component_key in component_keys
+    ]
+
+    patch_loss_terms = torch.stack([metrics["patch_loss"] for metrics in stitch_metrics_list])
+    stitch_loss_terms = torch.stack([metrics["stitch_loss"] for metrics in stitch_metrics_list])
+    total_loss_terms = model.patch_loss_weight * patch_loss_terms + model.stitch_loss_weight * stitch_loss_terms
+    total_loss = total_loss_terms.mean()
+
+    patch_dice_terms = torch.stack([metrics["patch_dice"] for metrics in stitch_metrics_list])
+    stitch_dice_terms = torch.stack([metrics["stitch_dice"] for metrics in stitch_metrics_list])
+    reported_dice_terms = stitch_dice_terms if model.stitch_loss_weight > 0.0 else patch_dice_terms
+    group_idx = torch.tensor(
+        [int(metrics["group_idx"]) for metrics in stitch_metrics_list],
+        device=model.device,
+        dtype=torch.long,
+    )
+
+    model.log(
+        "train/patch_loss",
+        patch_loss_terms.mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/patch_dice",
+        patch_dice_terms.mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/patch_bce_loss",
+        torch.stack([metrics["patch_bce"] for metrics in stitch_metrics_list]).mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/patch_dice_loss",
+        torch.stack([metrics["patch_dice_loss"] for metrics in stitch_metrics_list]).mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/stitch_loss",
+        stitch_loss_terms.mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/stitch_region_loss",
+        torch.stack([metrics["stitch_region_loss"] for metrics in stitch_metrics_list]).mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/stitch_boundary_loss",
+        torch.stack([metrics["stitch_boundary_loss"] for metrics in stitch_metrics_list]).mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/stitch_cldice_loss",
+        torch.stack([metrics["stitch_cldice_loss"] for metrics in stitch_metrics_list]).mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/stitch_betti_matching_loss",
+        torch.stack([metrics["stitch_betti_matching_loss"] for metrics in stitch_metrics_list]).mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/stitch_dice",
+        stitch_dice_terms.mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/stitch_bce_loss",
+        torch.stack([metrics["stitch_bce"] for metrics in stitch_metrics_list]).mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/stitch_dice_loss",
+        torch.stack([metrics["stitch_dice_loss"] for metrics in stitch_metrics_list]).mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/dice",
+        reported_dice_terms.mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/stitch_components",
+        float(sum(int(metrics["component_count"]) for metrics in stitch_metrics_list)),
+        on_step=True,
+        on_epoch=False,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/stitch_patch_count",
+        float(sum(int(metrics["patch_count"]) for metrics in stitch_metrics_list)),
+        on_step=True,
+        on_epoch=False,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+
+    finalize_training_batch(
+        model,
+        loss=total_loss,
+        per_sample_loss=total_loss_terms,
+        per_sample_dice=reported_dice_terms,
+        group_idx=group_idx,
+    )
+    return {"loss": total_loss}
 
 
 class RegressionPLModel(pl.LightningModule):
@@ -549,7 +797,7 @@ class RegressionPLModel(pl.LightningModule):
     def on_train_epoch_start(self):
         reset_train_epoch_accumulators(self)
 
-    def forward(self, x):
+    def _forward_impl(self, x):
         if x.ndim == 4:
             x = x[:, None]
         if self.with_norm:
@@ -558,6 +806,9 @@ class RegressionPLModel(pl.LightningModule):
         feat_maps_pooled = [torch.max(f, dim=2)[0] for f in feat_maps]
         pred_mask = self.decoder(feat_maps_pooled)
         return pred_mask
+
+    def forward(self, x):
+        return self._forward_impl(x)
 
     def compute_per_sample_loss_and_dice(self, logits, targets):
         return compute_per_sample_loss_and_dice(
@@ -578,6 +829,9 @@ class RegressionPLModel(pl.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
+        if self.use_stitched_training:
+            return _training_step_stitched(self, batch)
+
         x, y, group_idx = batch
         outputs = self(x)
         per_sample_loss, per_sample_dice, per_sample_bce, per_sample_dice_loss = self.compute_per_sample_loss_and_dice(
