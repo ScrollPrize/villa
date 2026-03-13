@@ -484,6 +484,7 @@ class DinoIBOTPretrainer:
             return {}
 
         backbone = self.model_module.student.backbone
+        global_crop_size = _as_3tuple(dataset_config.get("global_crop_size", dataset_config.get("crop_size")))
         global_view_size = tuple(int(dim) for dim in backbone.global_input_size)
         local_crop_size = _as_3tuple(dataset_config.get("local_crop_size"))
         local_view_size = tuple(int(dim) for dim in backbone.local_input_size) if local_crop_size is not None else None
@@ -493,10 +494,12 @@ class DinoIBOTPretrainer:
         }
         if local_view_size is not None:
             overrides["local_view_size"] = local_view_size
-        source_crop_size = _as_3tuple(dataset_config.get("source_crop_size"))
-        required_source_crop = _max_3tuple(global_view_size, local_view_size, source_crop_size)
-        if required_source_crop is not None:
-            overrides["source_crop_size"] = required_source_crop
+        source_sampling_size = _as_3tuple(
+            dataset_config.get("source_sampling_size", dataset_config.get("source_crop_size"))
+        )
+        required_source_sampling_size = _max_3tuple(global_crop_size, local_crop_size, source_sampling_size)
+        if required_source_sampling_size is not None:
+            overrides["source_sampling_size"] = required_source_sampling_size
         return overrides
     
     def build_dataloader(self) -> DataLoader:
