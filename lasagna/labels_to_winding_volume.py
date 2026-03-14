@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 import tifffile
 import zarr
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, gaussian_filter, maximum_filter
 
 
 TAG = "[labels_to_winding_volume]"
@@ -102,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="Discard components with fewer voxels (0=keep all)")
     p.add_argument("--chunk-size", type=int, default=64,
                     help="Zarr chunk size per axis")
+    p.add_argument("--no-skeleton", action="store_true",
+                    help="Skip skeletonization, use raw CC masks (debug)")
     args = p.parse_args(argv)
 
     input_path = Path(args.input)
@@ -116,34 +118,29 @@ def main(argv: list[str] | None = None) -> int:
     assert vol.ndim == 3, f"expected 3D volume, got shape {vol.shape}"
     print(f"{TAG} volume shape={vol.shape}  dtype={vol.dtype}", flush=True)
 
-    # -- Crop pure-background border -----------------------------------------
-    # Label volumes often have a border of bg (0) voxels on all faces.  This
-    # border connects non-ignore regions around ignore strips, defeating the
-    # disconnected-segment detection below.  Detect and crop it off.
-    non_bg = vol != 0  # fg or ignore
-    crops = []  # (lo, hi) per axis — hi is from the end
+    # -- Mark pure-background border as ignore --------------------------------
+    # Background (0) border connects non-ignore regions around ignore strips,
+    # defeating disconnected-segment detection.  Set border bg to ignore (2).
+    non_bg = vol != 0
     for ax in range(3):
-        # Collapse other axes: True if any non-bg voxel in that slice
         other_axes = tuple(a for a in range(3) if a != ax)
-        has_content = non_bg.any(axis=other_axes)  # (size_along_ax,)
+        has_content = non_bg.any(axis=other_axes)
         lo = 0
         while lo < len(has_content) and not has_content[lo]:
             lo += 1
-        hi = 0
-        while hi < len(has_content) and not has_content[len(has_content) - 1 - hi]:
-            hi += 1
-        crops.append((lo, hi))
+        hi = len(has_content) - 1
+        while hi >= 0 and not has_content[hi]:
+            hi -= 1
+        # Set border slices to ignore
+        slices_lo = [slice(None)] * 3
+        slices_lo[ax] = slice(0, lo)
+        vol[tuple(slices_lo)] = 2
+        slices_hi = [slice(None)] * 3
+        slices_hi[ax] = slice(hi + 1, vol.shape[ax])
+        vol[tuple(slices_hi)] = 2
     del non_bg
-    axis_names = ["Z", "Y", "X"]
-    crop_msg = "  ".join(f"{axis_names[i]}: -{crops[i][0]}...-{crops[i][1]}" for i in range(3))
-    print(f"{TAG} bg border crop: {crop_msg}", flush=True)
-    if any(lo > 0 or hi > 0 for lo, hi in crops):
-        sz, sy, sx = vol.shape
-        z0, z1 = crops[0][0], sz - crops[0][1]
-        y0, y1 = crops[1][0], sy - crops[1][1]
-        x0, x1 = crops[2][0], sx - crops[2][1]
-        vol = vol[z0:z1, y0:y1, x0:x1]
-        print(f"{TAG} cropped volume shape={vol.shape}", flush=True)
+    n_border_ignore = int((vol == 2).sum())
+    print(f"{TAG} border bg → ignore: {n_border_ignore} voxels", flush=True)
 
     fg = (vol == 1).astype(np.uint8)
     fg_count = int(fg.sum())
@@ -207,6 +204,35 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{TAG} processing {N} components", flush=True)
     shape = cc_labels.shape
 
+    # -- Skeletonize each CC to medial surface --------------------------------
+    skel_vol = np.zeros(shape, dtype=np.uint8)
+    for i in range(N):
+        cc_id = i + 1
+        mask = cc_labels == cc_id
+        dt_i = distance_transform_edt(mask).astype(np.float32)
+        dt_smooth = gaussian_filter(dt_i, sigma=1.0)
+        ridge = (dt_i > 0) & (dt_smooth >= maximum_filter(dt_smooth, size=3) - 0.35)
+        skel_vol[ridge] = cc_id
+        n_orig = int(mask.sum())
+        n_skel = int(ridge.sum())
+        print(f"{TAG} medial surface {i+1}/{N}: {n_orig} → {n_skel} voxels", flush=True)
+        del mask, dt_i, ridge
+
+    # Save center XY skeleton slice for debug
+    zc = shape[0] // 2
+    skel_dbg_path = output_path.parent / (output_path.stem + "_skel_dbg.tif")
+    tifffile.imwrite(str(skel_dbg_path), skel_vol[zc, :, :].astype(np.float32))
+    print(f"{TAG} skeleton debug slice: {skel_dbg_path} (z={zc})", flush=True)
+
+    if args.no_skeleton:
+        skel = cc_labels
+        del skel_vol
+        print(f"{TAG} using raw CC masks (--no-skeleton)", flush=True)
+    else:
+        skel = skel_vol
+        del cc_labels
+    del fg
+
     # -- Pass 1: distance transforms for nearest CC + pairwise distances ----
     dist_1 = np.full(shape, np.inf, dtype=np.float32)  # nearest CC distance
     idx_1 = np.zeros(shape, dtype=np.int32)             # CC index of nearest (0-based)
@@ -215,13 +241,13 @@ def main(argv: list[str] | None = None) -> int:
     for i in range(N):
         cc_id = i + 1  # 1-indexed CC label
         print(f"{TAG} DT pass 1: {i+1}/{N} (cc_id={cc_id})", flush=True)
-        dt_i = distance_transform_edt(cc_labels != cc_id).astype(np.float32)
+        dt_i = distance_transform_edt(skel != cc_id).astype(np.float32)
 
         # Accumulate pairwise average distances
         for j in range(N):
             if i != j:
                 cc_j = j + 1
-                mask_j = cc_labels == cc_j
+                mask_j = skel == cc_j
                 n_j = int(mask_j.sum())
                 if n_j > 0:
                     avg_dist[i, j] = float(dt_i[mask_j].mean())
@@ -295,7 +321,7 @@ def main(argv: list[str] | None = None) -> int:
     def _get_dt(cc_0idx):
         if cc_0idx not in dt_cache:
             dt_cache[cc_0idx] = distance_transform_edt(
-                cc_labels != (cc_0idx + 1)).astype(np.float32)
+                skel != (cc_0idx + 1)).astype(np.float32)
         return dt_cache[cc_0idx]
 
     for k in range(N):
@@ -338,8 +364,8 @@ def main(argv: list[str] | None = None) -> int:
     last_cc_id = chain[-1] + 1
     print(f"{TAG} computing envelope mask (first_cc={first_cc_id}, last_cc={last_cc_id})", flush=True)
 
-    dt_first = distance_transform_edt(cc_labels != first_cc_id).astype(np.float32)
-    dt_last = distance_transform_edt(cc_labels != last_cc_id).astype(np.float32)
+    dt_first = distance_transform_edt(skel != first_cc_id).astype(np.float32)
+    dt_last = distance_transform_edt(skel != last_cc_id).astype(np.float32)
 
     # Dot product of gradients, one axis at a time to limit memory
     dot = np.zeros(shape, dtype=np.float32)
@@ -350,8 +376,8 @@ def main(argv: list[str] | None = None) -> int:
         del g1, g2
     del dt_first, dt_last
 
-    outside_mask = (dot > 0) & (fg == 0)   # never zero out foreground voxels
-    del dot
+    outside_mask = (dot > 0) & (skel == 0)  # never zero out skeleton voxels
+    del dot, skel
 
     # Per-voxel fringe: outside voxels within half a local winding spacing.
     # Use chain-adjacent distance as the spacing reference.
