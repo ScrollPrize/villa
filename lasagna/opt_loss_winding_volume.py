@@ -149,42 +149,6 @@ def compute_auto_offset(*, res: fit_model.FitResult3D) -> tuple[float, int]:
 	return _winding_offset, _winding_direction
 
 
-@torch.no_grad()
-def print_per_winding_error(*, res: fit_model.FitResult3D) -> None:
-	"""Print per-winding mean error for diagnostics."""
-	sampled, wv_mask = _sample_winding_volume(res=res)
-	D = sampled.shape[0]
-
-	mask = res.mask_lr * wv_mask  # (D, 1, Hm, Wm)
-
-	offset = _winding_offset if _winding_offset is not None else 1.0
-	direction = _winding_direction if _winding_offset is not None else 1
-
-	# Volume winding range (raw values where wv >= 1)
-	wv = res.data.winding_volume
-	valid_wv = wv[wv >= 1]
-	if valid_wv.numel() > 0:
-		vol_min = float(valid_wv.min())
-		vol_max = float(valid_wv.max())
-		vol_tag = f"vol=[{vol_min:.1f}, {vol_max:.1f}]"
-	else:
-		vol_tag = "vol=[empty]"
-
-	parts = []
-	for d in range(D):
-		m = mask[d]  # (1, Hm, Wm)
-		cnt = int(m.sum().item())
-		if cnt == 0:
-			continue
-		target = offset + d * direction
-		mean_err = float(((sampled[d] - target) * m).sum().item() / cnt)
-		mean_val = float((sampled[d] * m).sum().item() / cnt)
-		parts.append(f"w{target:.0f}={mean_err:+.2f}/{mean_val:.2f}({cnt})")
-
-	if parts:
-		print(f"[winding_vol] {vol_tag} per-winding err: {' '.join(parts)}", flush=True)
-
-
 def winding_volume_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""Loss penalizing mesh winding deviation from ground-truth winding volume.
 

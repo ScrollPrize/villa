@@ -123,6 +123,7 @@ def _write_lasagna_zarr(
     density: int,
     chunk_size: int,
     pred_dt_u8: np.ndarray | None = None,
+    winding_volume_path: Path | None = None,
 ) -> None:
     """Read ngrids x/0, y/0, z/0 + binary pred + ignore mask → write flat lasagna zarr.Array."""
     # Read normals from ngrids output (raw, NOT hemisphere-encoded)
@@ -165,6 +166,22 @@ def _write_lasagna_zarr(
     cos_ch = np.where(mask, np.uint8(255), np.uint8(0))
     # grad_mag: density where valid (bg + pred), 0 where ignore (encodes invalid)
     grad_mag_ch = np.where(valid, np.uint8(density), np.uint8(0))
+
+    # Restrict grad_mag to winding volume region
+    if winding_volume_path is not None:
+        wv_arr = zarr.open(str(winding_volume_path), mode="r")
+        wv = np.asarray(wv_arr)
+        if wv.shape != (dz, dy, dx):
+            raise ValueError(
+                f"winding volume shape {wv.shape} != lasagna spatial shape "
+                f"({dz}, {dy}, {dx}) — both must be at step={step}"
+            )
+        wv_mask = wv < 1
+        n_zeroed = int(wv_mask.sum())
+        print(f"{TAG} winding volume mask: zeroing grad_mag at {n_zeroed}/{wv_mask.size} "
+              f"voxels ({100.0*n_zeroed/max(1,wv_mask.size):.1f}%) where wv < 1", flush=True)
+        grad_mag_ch[wv_mask] = 0
+
     nx_ch = nx_vol.astype(np.uint8)
     ny_ch = ny_vol.astype(np.uint8)
 
@@ -226,6 +243,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="Skip vc_ngrids --fit-normals (reuse existing ngrids zarr)")
     p.add_argument("--no-pred-dt", action="store_true",
                     help="Skip computing pred_dt channel (distance transform)")
+    p.add_argument("--winding-volume", default=None,
+                    help="Winding volume zarr (ZYX float32 at --step resolution); "
+                         "grad_mag is zeroed where wv < 1")
     args = p.parse_args(argv)
 
     input_path = Path(args.input)
@@ -292,10 +312,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{TAG} step 4: skipping pred_dt (--no-pred-dt)", flush=True)
 
     # -- Step 5: Assemble lasagna zarr from ngrids + binary ------------------
+    wv_path = Path(args.winding_volume) if args.winding_volume else None
     _write_lasagna_zarr(
         ngrids_zarr_path, binary, ignore, output_path,
         args.step, args.density, args.chunk_size,
         pred_dt_u8=pred_dt_u8,
+        winding_volume_path=wv_path,
     )
 
     print(f"{TAG} pipeline complete: {output_path}", flush=True)

@@ -4,34 +4,7 @@
 
 A label TIFF (ZYX, uint8): 0=background, 1=prediction, 2=ignore.
 
-## Step 1 — Preprocessing (labels → lasagna normals zarr)
-
-```bash
-python lasagna/labels_to_lasagna_normals.py \
-    --input labels.tif \
-    --work-dir work \
-    --output normals.zarr
-```
-
-This runs five substeps internally:
-
-1. **Read TIFF, write binary zarr** — extracts the `==1` mask into a zarr Group with dataset `"0"`, consumed by vc_gen_normalgrids.
-2. **vc_gen_normalgrids** — generates normal grid volumes from the binary mask.
-3. **vc_ngrids --fit-normals** — fits local 3D normals, writes ngrids zarr with `x/0`, `y/0`, `z/0` (hemisphere-encoded uint8 normals).
-4. **Compute pred_dt** — euclidean distance transform of inverted binary mask at full resolution (distance from each voxel to nearest foreground surface; 0 on surface, increasing away), mean-pooled to step resolution, raw distance clamped to 255 uint8.
-5. **Assemble lasagna zarr** — Python reads ngrids `x/0`, `y/0` + binary prediction + pred_dt, writes a flat `zarr.Array` (5, Z, Y, X) uint8:
-
-| Channel | Name     | Value                                              |
-|---------|----------|----------------------------------------------------|
-| 0       | cos      | 255 where binary pred at step resolution, 0 elsewhere |
-| 1       | grad_mag | density (default 128) where pred, 0 elsewhere      |
-| 2       | nx       | ngrids `x/0` (hemisphere-encoded)                  |
-| 3       | ny       | ngrids `y/0` (hemisphere-encoded)                  |
-| 4       | pred_dt  | distance to nearest foreground surface in voxels, clamped to 255 |
-
-Optional flags: `--step` (default 4), `--density` (default 128), `--skip-gen-normalgrids`, `--skip-fit-normals`, `--no-pred-dt`.
-
-## Step 2 — Winding volume
+## Step 1 — Winding volume
 
 ```bash
 python lasagna/labels_to_winding_volume.py \
@@ -50,6 +23,34 @@ Computes a per-voxel winding number volume from the label TIFF:
 The output zarr has smooth values ranging from 1 to N (number of CCs), with integer values at CC centers and fractional values in between.
 
 Optional flags: `--step` (default 4), `--connectivity` (6 or 26), `--min-voxels` (default 0), `--chunk-size` (default 64).
+
+## Step 2 — Preprocessing (labels → lasagna normals zarr)
+
+```bash
+python lasagna/labels_to_lasagna_normals.py \
+    --input labels.tif \
+    --work-dir work \
+    --output normals.zarr \
+    --winding-volume winding.zarr
+```
+
+This runs five substeps internally:
+
+1. **Read TIFF, write binary zarr** — extracts the `==1` mask into a zarr Group with dataset `"0"`, consumed by vc_gen_normalgrids.
+2. **vc_gen_normalgrids** — generates normal grid volumes from the binary mask.
+3. **vc_ngrids --fit-normals** — fits local 3D normals, writes ngrids zarr with `x/0`, `y/0`, `z/0` (hemisphere-encoded uint8 normals).
+4. **Compute pred_dt** — euclidean distance transform of inverted binary mask at full resolution (distance from each voxel to nearest foreground surface; 0 on surface, increasing away), mean-pooled to step resolution, raw distance clamped to 255 uint8.
+5. **Assemble lasagna zarr** — Python reads ngrids `x/0`, `y/0` + binary prediction + pred_dt, writes a flat `zarr.Array` (5, Z, Y, X) uint8:
+
+| Channel | Name     | Value                                              |
+|---------|----------|----------------------------------------------------|
+| 0       | cos      | 255 where binary pred at step resolution, 0 elsewhere |
+| 1       | grad_mag | density (default 128) where valid, 0 where ignore or outside winding volume |
+| 2       | nx       | ngrids `x/0` (hemisphere-encoded)                  |
+| 3       | ny       | ngrids `y/0` (hemisphere-encoded)                  |
+| 4       | pred_dt  | distance to nearest foreground surface in voxels, clamped to 255 |
+
+Optional flags: `--step` (default 4), `--density` (default 128), `--skip-gen-normalgrids`, `--skip-fit-normals`, `--no-pred-dt`, `--winding-volume` (path to winding zarr at `--step` resolution; zeroes grad_mag where wv < 1).
 
 ## Step 3 — Fitting
 
