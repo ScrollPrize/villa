@@ -17,6 +17,7 @@ import opt_loss_dir
 import opt_loss_smooth
 import opt_loss_step
 import opt_loss_winding_density
+import opt_loss_pred_dt
 import opt_loss_winding_volume
 
 
@@ -399,6 +400,7 @@ _LOSS_FUNCS = {
 	"winding_density": opt_loss_winding_density.winding_density_loss,
 	"winding_vol": opt_loss_winding_volume.winding_volume_loss,
 	"normal": opt_loss_dir.normal_loss,
+	"pred_dt": opt_loss_pred_dt.pred_dt_loss,
 }
 
 
@@ -676,8 +678,8 @@ if __name__ == "__main__":
 						choices=["xy", "xz", "yz"], help="Volume slice planes (default: xy xz yz)")
 	parser.add_argument("--channels", nargs="*", default=["cos", "pred_dt"],
 						help="Volume channels to slice (default: cos pred_dt)")
-	parser.add_argument("--losses", nargs="*", default=["normal", "step"],
-						help="Loss maps to export (default: normal step)")
+	parser.add_argument("--losses", nargs="*", default=["normal", "step", "pred_dt"],
+						help="Loss maps to export (default: normal step pred_dt)")
 	parser.add_argument("--winding-volume", default=None,
 						help="Path to winding volume zarr (enables winding diagnostics)")
 	parser.add_argument("--no-mesh", action="store_true", help="Skip mesh export")

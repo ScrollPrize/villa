@@ -149,6 +149,39 @@ def compute_auto_offset(*, res: fit_model.FitResult3D) -> tuple[float, int]:
 	return _winding_offset, _winding_direction
 
 
+def compute_depth_crop_range(
+	offset: float, direction: int, D: int, winding_volume: torch.Tensor,
+) -> tuple[int, int]:
+	"""Return (d_lo, d_hi) slice of depth indices whose winding target is within valid range.
+
+	Valid winding values are those where the winding volume >= 1.
+	For each d in 0..D-1, target = offset + d * direction.
+	Returns the maximal contiguous [d_lo, d_hi) range at the edges where targets
+	fall within [min_wv, max_wv].
+	"""
+	# Get min/max valid winding values from the volume
+	valid_mask = winding_volume >= 1.0
+	if not valid_mask.any():
+		return 0, D
+	valid_vals = winding_volume[valid_mask]
+	min_wv = float(valid_vals.min())
+	max_wv = float(valid_vals.max())
+
+	d_lo = 0
+	d_hi = D
+	for d in range(D):
+		target = offset + d * direction
+		if min_wv <= target <= max_wv:
+			d_lo = d
+			break
+	for d in range(D - 1, -1, -1):
+		target = offset + d * direction
+		if min_wv <= target <= max_wv:
+			d_hi = d + 1
+			break
+	return d_lo, d_hi
+
+
 def winding_volume_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""Loss penalizing mesh winding deviation from ground-truth winding volume.
 

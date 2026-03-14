@@ -61,4 +61,33 @@ def grid_sample_3d_u8_diff(
     Returns:
         (C, D, H, W) float32 CUDA — raw interpolated values (not decoded)
     """
+    if volume.device.type != "cuda":
+        return _grid_sample_3d_u8_diff_cpu(volume, grid, offset, inv_scale)
     return _GridSample3DU8Diff.apply(volume, grid, offset, inv_scale)
+
+
+def _grid_sample_3d_u8_diff_cpu(
+    volume: torch.Tensor,
+    grid: torch.Tensor,
+    offset: torch.Tensor,
+    inv_scale: torch.Tensor,
+) -> torch.Tensor:
+    """CPU fallback: convert uint8 to float32 and use F.grid_sample."""
+    import torch.nn.functional as F
+    C, Z, Y, X = volume.shape
+    vol_f = volume.float().unsqueeze(0)  # (1, C, Z, Y, X)
+    # Convert fullres coords to grid_sample [-1, 1] range
+    g = grid.clone()  # (D, H, W, 3) — (x, y, z)
+    g[..., 0] = (g[..., 0] - offset[0]) * inv_scale[0] / max(1, X - 1) * 2 - 1
+    g[..., 1] = (g[..., 1] - offset[1]) * inv_scale[1] / max(1, Y - 1) * 2 - 1
+    g[..., 2] = (g[..., 2] - offset[2]) * inv_scale[2] / max(1, Z - 1) * 2 - 1
+    # grid_sample expects (N, C, D_in, H_in, W_in) and grid (N, D_out, H_out, W_out, 3) with (x,y,z)→(X,Y,Z)
+    # but F.grid_sample 5D grid order is (d, h, w) mapping to (D_in, H_in, W_in)
+    # Our grid (x,y,z) maps to (X, Y, Z) dims, so reorder to (z, y, x) for grid_sample
+    g = g[..., [2, 1, 0]]
+    out = F.grid_sample(
+        vol_f, g.unsqueeze(0),
+        mode='bilinear', padding_mode='zeros', align_corners=True,
+    )
+    # (1, C, D, H, W) → (C, D, H, W)
+    return out.squeeze(0)

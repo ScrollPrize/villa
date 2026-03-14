@@ -597,6 +597,37 @@ class Model3D(nn.Module):
 			out["straight_half_w"] = [self.straight_half_w]
 		return out
 
+	def crop_depth(self, d_lo: int, d_hi: int) -> None:
+		"""Crop the model to only keep depth layers [d_lo, d_hi).
+
+		Integrates the mesh pyramid to flat, slices along depth, rebuilds
+		the pyramid, and slices conn_offsets, amp, bias accordingly.
+		"""
+		d_lo = max(0, int(d_lo))
+		d_hi = min(self.depth, int(d_hi))
+		if d_lo == 0 and d_hi == self.depth:
+			return
+		new_depth = d_hi - d_lo
+		if new_depth < 1:
+			raise ValueError(f"crop_depth: empty range [{d_lo}, {d_hi})")
+		print(f"[model] crop_depth: [{d_lo}, {d_hi}) — {self.depth} -> {new_depth} layers")
+
+		with torch.no_grad():
+			# Integrate pyramid to flat, slice, rebuild
+			flat = self._integrate_pyramid_3d(self.mesh_ms, pyramid_d=self.pyramid_d)  # (3, D, H, W)
+			flat = flat[:, d_lo:d_hi]
+			n_scales = len(self.mesh_ms)
+			self.mesh_ms = self._construct_pyramid_from_flat_3d(flat, n_scales, pyramid_d=self.pyramid_d)
+
+			# Slice conn_offsets
+			self.conn_offsets = self.conn_offsets[:, d_lo:d_hi].contiguous()
+
+			# Slice amp and bias
+			self.amp = nn.Parameter(self.amp.data[d_lo:d_hi].contiguous())
+			self.bias = nn.Parameter(self.bias.data[d_lo:d_hi].contiguous())
+
+		self.depth = new_depth
+
 	def bake_arc_into_mesh(self) -> None:
 		"""Absorb arc transform into mesh_ms, disable arc."""
 		with torch.no_grad():

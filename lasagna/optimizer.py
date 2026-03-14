@@ -33,7 +33,7 @@ class OptSettings:
 	default_mul: float | None
 	w_fac: dict | None
 	eff: dict[str, float]
-	auto_offset: bool = False
+	args: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -104,7 +104,13 @@ def _parse_opt_settings(
 	min_scaledown = max(0, int(opt_cfg.get("min_scaledown", 0)))
 	default_mul = opt_cfg.get("default_mul", None)
 	w_fac = opt_cfg.get("w_fac", None)
-	auto_offset = bool(opt_cfg.get("auto_offset", False))
+	args_raw = opt_cfg.get("args", None)
+	# Back-compat: translate old "auto_offset": true → args dict
+	if args_raw is None and opt_cfg.get("auto_offset", False):
+		args_raw = {"winding_offset_autocrop": True}
+	if args_raw is not None and not isinstance(args_raw, dict):
+		raise ValueError(f"stages_json: stage '{stage_name}' opt 'args' must be an object or null")
+	args = dict(args_raw) if args_raw else {}
 	opt_cfg.pop("steps", None)
 	opt_cfg.pop("lr", None)
 	opt_cfg.pop("params", None)
@@ -112,6 +118,7 @@ def _parse_opt_settings(
 	opt_cfg.pop("default_mul", None)
 	opt_cfg.pop("w_fac", None)
 	opt_cfg.pop("auto_offset", None)
+	opt_cfg.pop("args", None)
 	_require_consumed_dict(where=f"stage '{stage_name}' opt", cfg=opt_cfg)
 	if default_mul is not None:
 		default_mul = float(default_mul)
@@ -130,7 +137,7 @@ def _parse_opt_settings(
 		default_mul=default_mul,
 		w_fac=w_fac,
 		eff=eff,
-		auto_offset=auto_offset,
+		args=args,
 	)
 
 
@@ -315,12 +322,38 @@ def optimize(
 			return
 		opt = torch.optim.Adam(param_groups)
 
-		# Auto-offset: compute best (offset, direction) for winding volume alignment
-		if opt_cfg.auto_offset and _need_term("winding_vol", opt_cfg.eff) > 0:
+		# winding_offset_autocrop: compute offset/direction then crop invalid depth layers
+		if opt_cfg.args and opt_cfg.args.get("winding_offset_autocrop") and _need_term("winding_vol", opt_cfg.eff) > 0:
 			with torch.no_grad():
 				res_ao = model(data)
 			ao_offset, ao_dir = opt_loss_winding_volume.compute_auto_offset(res=res_ao)
 			print(f"[optimizer] auto_offset: offset={ao_offset}, direction={ao_dir}", flush=True)
+			d_lo, d_hi = opt_loss_winding_volume.compute_depth_crop_range(
+				ao_offset, ao_dir, model.depth, data.winding_volume,
+			)
+			if d_lo != 0 or d_hi != model.depth:
+				model.crop_depth(d_lo, d_hi)
+				# Update winding offset to account for removed leading layers
+				opt_loss_winding_volume._winding_offset = ao_offset + d_lo * ao_dir
+				print(f"[optimizer] adjusted offset after crop: {opt_loss_winding_volume._winding_offset}", flush=True)
+				# Rebuild optimizer param groups since model shape changed
+				all_params = model.opt_params()
+				param_groups = []
+				for name in opt_cfg.params:
+					group = all_params.get(name, [])
+					if name in {"mesh_ms"}:
+						k0 = max(0, int(opt_cfg.min_scaledown))
+						for pi, p in enumerate(group):
+							if pi < k0:
+								continue
+							param_groups.append({"params": [p], "lr": _lr_scalespace(lr=opt_cfg.lr, scale_i=pi)})
+					else:
+						lr_last = _lr_last(opt_cfg.lr)
+						for p in group:
+							param_groups.append({"params": [p], "lr": lr_last})
+				if not param_groups:
+					return data
+				opt = torch.optim.Adam(param_groups)
 
 		_status_rows = 0
 
