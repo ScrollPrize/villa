@@ -266,6 +266,39 @@ class Eva(nn.Module):
                 f"got spatial_shape={tuple(spatial_shape)} and patch_size={tuple(patch_size)}"
             )
 
+    @staticmethod
+    def _normalize_optional_chunk_shape(
+            value: Optional[int | Tuple[int, ...]],
+            *,
+            ndim: int,
+            name: str,
+    ) -> Optional[Tuple[int, ...]]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+            return tuple([int(value)] * ndim)
+        result = tuple(int(v) for v in value)
+        if len(result) != ndim:
+            raise ValueError(f"{name} must provide {ndim} values, got {result}")
+        if any(v <= 0 for v in result):
+            raise ValueError(f"{name} must be positive, got {result}")
+        return result
+
+    @staticmethod
+    def _normalize_optional_positive_int(
+            value: Optional[int],
+            *,
+            name: str,
+    ) -> Optional[int]:
+        if value is None:
+            return None
+        value = int(value)
+        if value <= 0:
+            raise ValueError(f"{name} must be positive, got {value}")
+        return value
+
     def __init__(
             self,
             input_channels: int = 1,
@@ -301,6 +334,8 @@ class Eva(nn.Module):
             rope_impl=RopePositionEmbedding,
             rope_kwargs=None,
             grad_checkpointing=False,
+            deeper_embed_patch_chunk_size: Optional[int | Tuple[int, ...]] = None,
+            deeper_embed_batch_chunk_size: Optional[int] = None,
     ):
         """
         Diff to timm implementation
@@ -323,6 +358,15 @@ class Eva(nn.Module):
         self.global_input_size = tuple(int(size) for size in self.global_crops_size)
         self.local_input_size = tuple(int(size) for size in self.local_crops_size)
         self.deeper_embed_patch_halo = tuple(0 for _ in range(self.ndim))
+        self.deeper_embed_patch_chunk_size = self._normalize_optional_chunk_shape(
+            deeper_embed_patch_chunk_size,
+            ndim=self.ndim,
+            name="deeper_embed_patch_chunk_size",
+        )
+        self.deeper_embed_batch_chunk_size = self._normalize_optional_positive_int(
+            deeper_embed_batch_chunk_size,
+            name="deeper_embed_batch_chunk_size",
+        )
 
         if self.embedding_type == "deeper":
             self._assert_patch_aligned(
@@ -617,8 +661,20 @@ class Eva(nn.Module):
         self._assert_patch_aligned(spatial, tuple(self.patch_size), context="input shape")
         if self.embedding_type == "deeper":
             target_spatial = self._resolve_target_spatial_shape(spatial, view_kind=view_kind)
-            x = self.down_projection(x)
-            x = self._crop_embedded_grid(x, target_spatial)
+            target_patch_shape = tuple(int(size) // int(patch) for size, patch in zip(target_spatial, self.patch_size))
+            if (
+                    self.deeper_embed_patch_chunk_size is not None
+                    or self.deeper_embed_batch_chunk_size is not None
+            ):
+                x = self.down_projection.forward_tiled(
+                    x,
+                    target_patch_shape=target_patch_shape,
+                    patch_chunk_size=self.deeper_embed_patch_chunk_size,
+                    batch_chunk_size=self.deeper_embed_batch_chunk_size,
+                )
+            else:
+                x = self.down_projection(x)
+                x = self._crop_embedded_grid(x, target_spatial)
         else:
             x = self.down_projection(x)
             target_spatial = spatial
