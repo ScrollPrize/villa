@@ -74,7 +74,7 @@ def _downsample_mean(vol: np.ndarray, step: int) -> np.ndarray:
     py = -y % step
     px = -x % step
     if pz or py or px:
-        vol = np.pad(vol, ((0, pz), (0, py), (0, px)))
+        vol = np.pad(vol, ((0, pz), (0, py), (0, px)), mode='edge')
     z2, y2, x2 = vol.shape
     return (
         vol.reshape(z2 // step, step, y2 // step, step, x2 // step, step)
@@ -374,22 +374,17 @@ def main(argv: list[str] | None = None) -> int:
         g2 = np.gradient(dt_last, axis=axis)
         dot += g1 * g2
         del g1, g2
+
+    # Classify outside voxels: closer to last CC = "above" (higher winding)
+    is_above_center = dt_first > dt_last
     del dt_first, dt_last
 
     outside_mask = (dot > 0) & (skel == 0)  # never zero out skeleton voxels
     del dot, skel
 
-    # Per-voxel fringe: outside voxels within half a local winding spacing.
-    # Use chain-adjacent distance as the spacing reference.
-    near_boundary = (idx_1 == chain[0]) | (idx_1 == chain[-1])
-    dist_adj = np.minimum(dist_prev, dist_next)
-    fringe_mask = outside_mask & (3 * dist_1 <= dist_adj) & near_boundary
-    del dist_adj
-    far_outside = outside_mask & ~fringe_mask
-    n_fringe = int(fringe_mask.sum())
-    print(f"{TAG} outside envelope: {int(outside_mask.sum())} voxels "
-          f"({100 * outside_mask.sum() / outside_mask.size:.1f}%), "
-          f"fringe kept: {n_fringe}", flush=True)
+    n_outside = int(outside_mask.sum())
+    print(f"{TAG} outside envelope: {n_outside} voxels "
+          f"({100 * n_outside / outside_mask.size:.1f}%)", flush=True)
 
     # -- Per-voxel winding interpolation (chain-adjacent) -------------------
     w_near = winding_map_arr[idx_1]
@@ -408,8 +403,6 @@ def main(argv: list[str] | None = None) -> int:
     dbg = {}
     dbg["d_lo"] = np.where(use_prev_side, dist_prev, dist_1)[:, :, xc].copy()
     dbg["d_hi"] = np.where(use_prev_side, dist_1, dist_next)[:, :, xc].copy()
-    dbg["fringe"] = fringe_mask[:, :, xc].astype(np.float32)
-    dbg["interior"] = (~outside_mask & ~fringe_mask)[:, :, xc].astype(np.float32)
     dbg["w_hi"] = np.where(use_prev_side, w_near, w_next)[:, :, xc].copy()
     dbg["w_lo"] = np.where(use_prev_side, w_prev, w_near)[:, :, xc].copy()
 
@@ -424,24 +417,13 @@ def main(argv: list[str] | None = None) -> int:
     winding_vol = np.where(use_prev_side, interp_1, interp_2)
     del total_1, total_2, interp_1, interp_2, use_prev_side
 
-    # Fringe: extrapolate using chain-adjacent spacing
-    is_first = idx_1[fringe_mask] == chain[0]
-    fringe_d_adj = np.where(is_first, dist_next[fringe_mask], dist_prev[fringe_mask])
-    fringe_w_adj = np.where(is_first, w_next[fringe_mask], w_prev[fringe_mask])
-    fringe_spacing = np.maximum(fringe_d_adj - dist_1[fringe_mask], 1e-8)
-    winding_vol[fringe_mask] = (
-        w_near[fringe_mask]
-        + (w_near[fringe_mask] - fringe_w_adj) * dist_1[fringe_mask] / fringe_spacing
-    )
-    del fringe_d_adj, fringe_w_adj, fringe_spacing, is_first, outside_mask
-
-    winding_vol[far_outside] = 0.0
-    valid_mask = (~far_outside).astype(np.float32)
-    del far_outside, fringe_mask
-
-    # Shift all non-zero values up by 1 so the minimum valid value is ~1.5
-    # (truly invalid stays 0, well below the >= 1 threshold)
-    winding_vol[winding_vol > 0] += 1.0
+    # -- Outside: extrapolate using fixed winding spacing -------------------
+    WINDING_SPACING = 20.0
+    outside_above = outside_mask & is_above_center
+    outside_below = outside_mask & ~is_above_center
+    winding_vol[outside_above] = (w_near + dist_1 / WINDING_SPACING)[outside_above]
+    winding_vol[outside_below] = (w_near - dist_1 / WINDING_SPACING)[outside_below]
+    del outside_above, outside_below, is_above_center, outside_mask
 
     # Debug: final winding slice
     dbg["winding"] = winding_vol[:, :, xc].copy()
@@ -464,14 +446,10 @@ def main(argv: list[str] | None = None) -> int:
     del dbg
 
     # -- Downsample ---------------------------------------------------------
-    valid_ds = _downsample_mean(valid_mask, step)
-    del valid_mask
-    winding_ds_raw = _downsample_mean(winding_vol, step)
+    winding_ds = _downsample_mean(winding_vol, step).astype(np.float32)
     del winding_vol
-    # Divide by valid fraction to get proper weighted average; zero where no valid voxels
-    winding_ds = np.where(valid_ds > 0, winding_ds_raw / valid_ds, 0.0).astype(np.float32)
-    del valid_ds, winding_ds_raw
-    print(f"{TAG} downsampled: {shape} → {winding_ds.shape} (step={step})", flush=True)
+    print(f"{TAG} downsampled: {shape} → {winding_ds.shape} (step={step})"
+          f"  min={float(winding_ds.min()):.3f} max={float(winding_ds.max()):.3f}", flush=True)
 
     # -- Write zarr ---------------------------------------------------------
     cs = args.chunk_size
@@ -489,6 +467,8 @@ def main(argv: list[str] | None = None) -> int:
     arr.attrs["n_components"] = N
     arr.attrs["winding_map"] = winding_map_dict
     arr.attrs["winding_chain"] = [int(v) for v in chain]
+    arr.attrs["min_winding"] = 1.0
+    arr.attrs["max_winding"] = float(N)
     print(f"{TAG} zarr written: {output_path}  shape={arr.shape}  "
           f"chunks={arr.chunks}", flush=True)
 

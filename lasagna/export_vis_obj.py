@@ -365,15 +365,6 @@ def _slice_winding_volume(data: fit_data.FitData3D, plane: str,
 	return _viridis(normed)[::-1]
 
 
-def _slice_winding_mask(data: fit_data.FitData3D, plane: str,
-						frac: float = 0.5) -> np.ndarray:
-	"""Slice of winding volume validity mask (>= 1.0) as RGB."""
-	wv = data.winding_volume.squeeze().cpu().numpy()
-	idx = _slice_index(plane, wv.shape, frac)
-	slc = _take_slice(wv, plane, idx)
-	gray = (slc >= 1.0).astype(np.uint8) * 255
-	return np.stack([gray, gray, gray], axis=-1)[::-1]
-
 
 def _slice_corners(plane: str, bbox_min: np.ndarray, bbox_max: np.ndarray,
 				   frac: float = 0.5) -> np.ndarray:
@@ -472,12 +463,16 @@ def export_vis_obj(
 		sx, sy, sz = data.spacing
 		crop_wv = (int(ox), int(oy), int(oz),
 				   int(X_d * sx), int(Y_d * sy), int(Z_d * sz))
-		wv_t = fit_data.load_winding_volume(
+		wv_t, wv_min, wv_max = fit_data.load_winding_volume(
 			path=winding_volume_path, device=dev,
 			crop=crop_wv, downscale=sx,
 		)
-		data = dataclasses.replace(data, winding_volume=wv_t)
-		print(f"[export_vis] winding volume shape: {wv_t.shape}", flush=True)
+		data = dataclasses.replace(data, winding_volume=wv_t,
+					winding_min=wv_min, winding_max=wv_max)
+		wv_np = wv_t.squeeze().cpu().numpy()
+		print(f"[export_vis] winding volume shape: {wv_t.shape}"
+			  f"  min={float(wv_np.min()):.3f} max={float(wv_np.max()):.3f}", flush=True)
+		del wv_np
 		if "winding_vol" not in losses:
 			losses = list(losses) + ["winding_vol"]
 
@@ -649,27 +644,10 @@ def export_vis_obj(
 			_write_mtl_multi(out / f"{obj_name}.mtl", materials)
 			_write_obj_multi_quad(out / f"{obj_name}.obj", quads)
 
-		# Winding mask slices (valid >= 1.0)
-		for plane in slices:
-			obj_name = f"slice_{plane}_winding_mask"
-			print(f"[export_vis] writing {obj_name} (3 positions)", flush=True)
-			quads: list[tuple[np.ndarray, str]] = []
-			materials: list[tuple[str, str]] = []
-			for pos_label, frac in _SLICE_POSITIONS:
-				mat_name = f"{obj_name}_{pos_label}"
-				png_name = f"{mat_name}.png"
-				tex = _slice_winding_mask(data, plane, frac=frac)
-				_write_png(out / png_name, tex)
-				corners = _slice_corners(plane, data_min, data_max, frac=frac)
-				quads.append((corners, mat_name))
-				materials.append((mat_name, png_name))
-			_write_mtl_multi(out / f"{obj_name}.mtl", materials)
-			_write_obj_multi_quad(out / f"{obj_name}.obj", quads)
-
 		# Diagnostic meshes: winding value and winding mask
 		print("[export_vis] computing winding diagnostics", flush=True)
 		with torch.no_grad():
-			sampled_wv, sampled_wv_mask = opt_loss_winding_volume._sample_winding_volume(res=res)  # (D, 1, Hm, Wm)
+			sampled_wv = opt_loss_winding_volume._sample_winding_volume(res=res)  # (D, 1, Hm, Wm)
 
 		verts_flat = xyz_lr.reshape(-1, 3)
 		faces = _triangulate_grid(D, Hm, Wm)
@@ -690,8 +668,8 @@ def export_vis_obj(
 		_write_obj_mesh(out / "winding_value.obj", verts_diag, faces_diag, uvs_diag, "winding_value")
 		print(f"[export_vis] winding value range: [{vmin_wv:.2f}, {vmax_wv:.2f}]", flush=True)
 
-		# Winding mask map: green = valid (eroded winding mask AND mask_lr), red = invalid
-		mask_combined = (res.mask_lr * sampled_wv_mask).squeeze(1).cpu().numpy()  # (D, Hm, Wm)
+		# Winding mask map: green = valid (mask_lr), red = invalid
+		mask_combined = res.mask_lr.squeeze(1).cpu().numpy()  # (D, Hm, Wm)
 		mask_stacked = mask_combined.reshape(-1, Wm)  # (D*Hm, Wm)
 		rgb_mask = np.zeros((tex_h, tex_w, 3), dtype=np.uint8)
 		rgb_mask[mask_stacked > 0.5] = [0, 200, 0]    # green = valid

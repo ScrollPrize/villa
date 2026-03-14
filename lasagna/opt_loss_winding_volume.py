@@ -20,12 +20,12 @@ def reset_auto_offset() -> None:
 	_winding_direction = 1
 
 
-def _sample_winding_volume(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch.Tensor]:
+def _sample_winding_volume(*, res: fit_model.FitResult3D) -> torch.Tensor:
 	"""Sample the winding volume at coarse mesh positions.
 
-	Returns (sampled_values, sampled_mask), both (D, 1, Hm, Wm).
-	The mask is built by eroding the valid region (wv >= 1) so that bilinear
-	interpolation footprints never touch invalid voxels.
+	Returns sampled_values (D, 1, Hm, Wm).
+	The entire winding volume is valid (filled by extrapolation outside the
+	interpolated interior), so no validity mask is needed.
 	"""
 	wv = res.data.winding_volume
 	if wv is None:
@@ -47,35 +47,7 @@ def _sample_winding_volume(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor,
 		mode='bilinear', padding_mode='zeros', align_corners=True,
 	)
 	# sampled: (1, 1, D, Hm, Wm) → (D, 1, Hm, Wm)
-	sampled = sampled[0].permute(1, 0, 2, 3)
-
-	# Build eroded validity mask: erode valid region so bilinear footprints
-	# never touch invalid voxels, including at the volume boundary.
-	with torch.no_grad():
-		valid = (wv >= 1.0).float()  # (1, 1, Z, Y, X)
-		# Mark volume boundary as invalid — DTs and envelope detection are
-		# unreliable at edges, and cropping can place valid values right at
-		# the boundary where padding_mode='border' would repeat them.
-		valid[:, :, [0, -1], :, :] = 0
-		valid[:, :, :, [0, -1], :] = 0
-		valid[:, :, :, :, [0, -1]] = 0
-		# Dilate the *invalid* region by 1 voxel in all directions
-		invalid_dilated = F.max_pool3d(1.0 - valid, kernel_size=3, padding=1, stride=1)
-		eroded_valid = 1.0 - invalid_dilated  # (1, 1, Z, Y, X)
-
-		# Sample eroded mask at mesh positions with nearest-neighbor
-		sampled_mask = F.grid_sample(
-			eroded_valid, grid.unsqueeze(0),
-			mode='nearest', padding_mode='zeros', align_corners=True,
-		)
-		# (1, 1, D, Hm, Wm) → (D, 1, Hm, Wm)
-		sampled_mask = sampled_mask[0].permute(1, 0, 2, 3)
-
-	# Erode sampled mask by 1 mesh pixel so bilinear value footprints
-	# never reach into the invalid volume region.
-	sampled_mask = -F.max_pool2d(-sampled_mask, kernel_size=3, padding=1, stride=1)
-
-	return sampled, sampled_mask
+	return sampled[0].permute(1, 0, 2, 3)
 
 
 def compute_auto_offset(*, res: fit_model.FitResult3D) -> tuple[float, int]:
@@ -89,16 +61,14 @@ def compute_auto_offset(*, res: fit_model.FitResult3D) -> tuple[float, int]:
 	"""
 	global _winding_offset, _winding_direction
 
-	sampled, wv_mask = _sample_winding_volume(res=res)
+	sampled = _sample_winding_volume(res=res)
 	D = sampled.shape[0]
 	dev = sampled.device
 
-	# Mask: valid positions (eroded winding mask AND mesh mask)
-	mask = res.mask_lr * wv_mask  # (D, 1, Hm, Wm)
+	mask = res.mask_lr  # (D, 1, Hm, Wm)
 
 	wsum = mask.sum().item()
 	if wsum < 1:
-		# No valid points — default to offset=1, direction=+1
 		_winding_offset = 1.0
 		_winding_direction = 1
 		return _winding_offset, _winding_direction
@@ -151,21 +121,27 @@ def compute_auto_offset(*, res: fit_model.FitResult3D) -> tuple[float, int]:
 
 def compute_depth_crop_range(
 	offset: float, direction: int, D: int, winding_volume: torch.Tensor,
+	*, winding_min: float | None = None, winding_max: float | None = None,
 ) -> tuple[int, int]:
 	"""Return (d_lo, d_hi) slice of depth indices whose winding target is within valid range.
 
-	Valid winding values are those where the winding volume >= 1.
+	Uses min/max winding metadata if available, otherwise falls back to
+	scanning the volume for values >= 1.
 	For each d in 0..D-1, target = offset + d * direction.
 	Returns the maximal contiguous [d_lo, d_hi) range at the edges where targets
 	fall within [min_wv, max_wv].
 	"""
-	# Get min/max valid winding values from the volume
-	valid_mask = winding_volume >= 1.0
-	if not valid_mask.any():
-		return 0, D
-	valid_vals = winding_volume[valid_mask]
-	min_wv = float(valid_vals.min())
-	max_wv = float(valid_vals.max())
+	if winding_min is not None and winding_max is not None:
+		min_wv = winding_min
+		max_wv = winding_max
+	else:
+		# Fallback for old zarr files without metadata
+		valid_mask = winding_volume >= 1.0
+		if not valid_mask.any():
+			return 0, D
+		valid_vals = winding_volume[valid_mask]
+		min_wv = float(valid_vals.min())
+		max_wv = float(valid_vals.max())
 
 	d_lo = 0
 	d_hi = D
@@ -193,7 +169,7 @@ def winding_volume_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tu
 
 	Returns (loss, (lm,), (mask,)).
 	"""
-	sampled, wv_mask = _sample_winding_volume(res=res)
+	sampled = _sample_winding_volume(res=res)
 	D = sampled.shape[0]
 	dev = sampled.device
 
@@ -206,8 +182,7 @@ def winding_volume_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tu
 
 	lm = (sampled - target) ** 2
 
-	# Mask: mesh validity AND eroded winding validity
-	mask = res.mask_lr * wv_mask
+	mask = res.mask_lr
 
 	wsum = mask.sum().clamp(min=1)
 	loss = (lm * mask).sum() / wsum

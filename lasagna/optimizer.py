@@ -333,6 +333,7 @@ def optimize(
 			print(f"[optimizer] auto_offset: offset={ao_offset}, direction={ao_dir}", flush=True)
 			d_lo, d_hi = opt_loss_winding_volume.compute_depth_crop_range(
 				ao_offset, ao_dir, model.depth, data.winding_volume,
+				winding_min=data.winding_min, winding_max=data.winding_max,
 			)
 			if d_lo != 0 or d_hi != model.depth:
 				model.crop_depth(d_lo, d_hi)

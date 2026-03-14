@@ -28,6 +28,8 @@ class FitData3D:
 	winding_volume: torch.Tensor | None  # (1, 1, Z, Y, X) float32 on GPU
 	origin_fullres: tuple[float, float, float]  # (x0, y0, z0) in fullres voxels
 	spacing: tuple[float, float, float]          # (sx, sy, sz) voxel size in fullres units
+	winding_min: float | None = None     # min valid winding value (from zarr metadata)
+	winding_max: float | None = None     # max valid winding value (from zarr metadata)
 	grad_mag_scale: float = 255.0                # encoding scale for grad_mag channel
 	cuda_gridsample: bool = True                  # use custom CUDA uint8 kernel vs PyTorch F.grid_sample
 
@@ -81,6 +83,8 @@ class FitData3D:
 			winding_volume=self.winding_volume,
 			origin_fullres=self.origin_fullres,
 			spacing=self.spacing,
+			winding_min=self.winding_min,
+			winding_max=self.winding_max,
 			grad_mag_scale=self.grad_mag_scale,
 			cuda_gridsample=self.cuda_gridsample,
 		)
@@ -112,6 +116,8 @@ class FitData3D:
 			winding_volume=self.winding_volume,
 			origin_fullres=self.origin_fullres,
 			spacing=self.spacing,
+			winding_min=self.winding_min,
+			winding_max=self.winding_max,
 			grad_mag_scale=self.grad_mag_scale,
 			cuda_gridsample=self.cuda_gridsample,
 		)
@@ -123,11 +129,13 @@ def load_winding_volume(
 	device: torch.device,
 	crop: tuple[int, int, int, int, int, int] | None,
 	downscale: float,
-) -> torch.Tensor:
-	"""Load winding volume zarr, apply crop, return (1, 1, Z, Y, X) float32 tensor."""
+) -> tuple[torch.Tensor, float, float]:
+	"""Load winding volume zarr, apply crop, return ((1,1,Z,Y,X) tensor, min_winding, max_winding)."""
 	p = Path(path)
 	zsrc = zarr.open(str(p), mode="r")
 	wv_scaledown = int(zsrc.attrs.get("scaledown", 1))
+	wv_min = float(zsrc.attrs.get("min_winding", 1.0))
+	wv_max = float(zsrc.attrs.get("max_winding", 1.0))
 	ds_i = max(1, int(round(downscale)))
 
 	Z_all, Y_all, X_all = (int(v) for v in zsrc.shape)
@@ -145,12 +153,15 @@ def load_winding_volume(
 		x1v, y1v, z1v = X_all, Y_all, Z_all
 
 	print(f"[fit_data] load_winding_volume: zarr shape=({Z_all},{Y_all},{X_all}) "
-		  f"scaledown={wv_scaledown} reading z=[{z0v}:{z1v}] y=[{y0v}:{y1v}] x=[{x0v}:{x1v}]",
+		  f"scaledown={wv_scaledown} winding=[{wv_min:.2f}, {wv_max:.2f}] "
+		  f"reading z=[{z0v}:{z1v}] y=[{y0v}:{y1v}] x=[{x0v}:{x1v}]",
 		  flush=True)
 
 	arr = np.asarray(zsrc[z0v:z1v, y0v:y1v, x0v:x1v])
+	print(f"[fit_data] load_winding_volume: loaded min={float(arr.min()):.3f} max={float(arr.max()):.3f}",
+		  flush=True)
 	t = torch.from_numpy(arr).to(device=device, dtype=torch.float32)
-	return t.unsqueeze(0).unsqueeze(0)  # (1, 1, Z, Y, X)
+	return t.unsqueeze(0).unsqueeze(0), wv_min, wv_max  # (1, 1, Z, Y, X)
 
 
 def auto_crop_for_mesh(

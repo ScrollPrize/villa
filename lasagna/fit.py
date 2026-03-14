@@ -273,10 +273,11 @@ def main(argv: list[str] | None = None) -> int:
 			sx, sy, sz = d.spacing
 			wv_crop = (int(ox), int(oy), int(oz),
 					   int(X * sx), int(Y * sy), int(Z * sz))
-			wv_t = fit_data.load_winding_volume(
+			wv_t, wv_min, wv_max = fit_data.load_winding_volume(
 				path=data_cfg.winding_volume, device=device,
 				crop=wv_crop, downscale=scaledown)
-			d = dataclasses.replace(d, winding_volume=wv_t)
+			d = dataclasses.replace(d, winding_volume=wv_t,
+						winding_min=wv_min, winding_max=wv_max)
 		return d
 
 	data = _load_data()
