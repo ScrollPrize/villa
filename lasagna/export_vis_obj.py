@@ -325,6 +325,11 @@ def _take_slice(arr: np.ndarray, plane: str, idx: int) -> np.ndarray:
 	raise ValueError(f"unknown plane: {plane}")
 
 
+_CHANNEL_VIS_MAX: dict[str, float] = {
+	"pred_dt": 10.0,
+}
+
+
 def _slice_texture(data: fit_data.FitData3D, plane: str,
 				   channel: str, frac: float = 0.5) -> np.ndarray:
 	"""Read a volume slice directly at native voxel resolution.
@@ -336,8 +341,12 @@ def _slice_texture(data: fit_data.FitData3D, plane: str,
 	vol = getattr(data, channel)  # (1, 1, Z, Y, X) uint8
 	arr = vol.squeeze().cpu().numpy()  # (Z, Y, X)
 	idx = _slice_index(plane, arr.shape, frac)
-	slc = _take_slice(arr, plane, idx)
-	gray = slc.astype(np.uint8)
+	slc = _take_slice(arr, plane, idx).astype(np.float32)
+	vis_max = _CHANNEL_VIS_MAX.get(channel)
+	if vis_max is not None:
+		gray = np.clip(slc / vis_max * 255.0, 0.0, 255.0).astype(np.uint8)
+	else:
+		gray = slc.astype(np.uint8)
 	return np.stack([gray, gray, gray], axis=-1)[::-1]
 
 
@@ -354,6 +363,16 @@ def _slice_winding_volume(data: fit_data.FitData3D, plane: str,
 		vmax = vmin + 1.0
 	normed = (slc - vmin) / (vmax - vmin)
 	return _viridis(normed)[::-1]
+
+
+def _slice_winding_mask(data: fit_data.FitData3D, plane: str,
+						frac: float = 0.5) -> np.ndarray:
+	"""Slice of winding volume validity mask (>= 1.0) as RGB."""
+	wv = data.winding_volume.squeeze().cpu().numpy()
+	idx = _slice_index(plane, wv.shape, frac)
+	slc = _take_slice(wv, plane, idx)
+	gray = (slc >= 1.0).astype(np.uint8) * 255
+	return np.stack([gray, gray, gray], axis=-1)[::-1]
 
 
 def _slice_corners(plane: str, bbox_min: np.ndarray, bbox_max: np.ndarray,
@@ -624,6 +643,23 @@ def export_vis_obj(
 				wv_arr = data.winding_volume.squeeze().cpu().numpy()
 				sl_idx = _slice_index(plane, wv_arr.shape, frac)
 				_write_pfm(out / f"{mat_name}.pfm", _take_slice(wv_arr, plane, sl_idx).astype(np.float32))
+				corners = _slice_corners(plane, data_min, data_max, frac=frac)
+				quads.append((corners, mat_name))
+				materials.append((mat_name, png_name))
+			_write_mtl_multi(out / f"{obj_name}.mtl", materials)
+			_write_obj_multi_quad(out / f"{obj_name}.obj", quads)
+
+		# Winding mask slices (valid >= 1.0)
+		for plane in slices:
+			obj_name = f"slice_{plane}_winding_mask"
+			print(f"[export_vis] writing {obj_name} (3 positions)", flush=True)
+			quads: list[tuple[np.ndarray, str]] = []
+			materials: list[tuple[str, str]] = []
+			for pos_label, frac in _SLICE_POSITIONS:
+				mat_name = f"{obj_name}_{pos_label}"
+				png_name = f"{mat_name}.png"
+				tex = _slice_winding_mask(data, plane, frac=frac)
+				_write_png(out / png_name, tex)
 				corners = _slice_corners(plane, data_min, data_max, frac=frac)
 				quads.append((corners, mat_name))
 				materials.append((mat_name, png_name))

@@ -171,12 +171,12 @@ def compute_depth_crop_range(
 	d_hi = D
 	for d in range(D):
 		target = offset + d * direction
-		if min_wv <= target <= max_wv:
+		if math.ceil(min_wv) <= target <= math.floor(max_wv):
 			d_lo = d
 			break
 	for d in range(D - 1, -1, -1):
 		target = offset + d * direction
-		if min_wv <= target <= max_wv:
+		if math.ceil(min_wv) <= target <= math.floor(max_wv):
 			d_hi = d + 1
 			break
 	return d_lo, d_hi

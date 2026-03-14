@@ -16,6 +16,7 @@ import opt_loss_smooth
 import opt_loss_winding_density
 import opt_loss_corr
 import opt_loss_winding_volume
+import opt_loss_station
 
 
 def _require_consumed_dict(*, where: str, cfg: dict) -> None:
@@ -151,6 +152,7 @@ lambda_global: dict[str, float] = {
 	"pred_dt": 0.0,
 	"corr": 0.0,
 	"winding_vol": 0.0,
+	"station": 0.0,
 }
 
 
@@ -278,6 +280,7 @@ def optimize(
 		"pred_dt": {"loss": opt_loss_pred_dt.pred_dt_loss},
 		"corr": {"loss": opt_loss_corr.corr_loss},
 		"winding_vol": {"loss": opt_loss_winding_volume.winding_volume_loss},
+		"station": {"loss": opt_loss_station.station_loss},
 	}
 
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:
@@ -376,6 +379,12 @@ def optimize(
 			for k in pv_keys:
 				row += f"  {pv[k]:10.4f}"
 			print(row)
+
+		# Station-keeping: snapshot center-of-mass reference for this stage
+		if _need_term("station", opt_cfg.eff) > 0:
+			with torch.no_grad():
+				res_st = model(data)
+			opt_loss_station.set_station_ref(res=res_st)
 
 		# Initial evaluation
 		with torch.no_grad():

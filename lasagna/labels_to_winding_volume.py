@@ -207,17 +207,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{TAG} processing {N} components", flush=True)
     shape = cc_labels.shape
 
-    # -- Single pass through distance transforms ----------------------------
-    # Track two nearest CCs per voxel + pairwise average distances
+    # -- Pass 1: distance transforms for nearest CC + pairwise distances ----
     dist_1 = np.full(shape, np.inf, dtype=np.float32)  # nearest CC distance
-    dist_2 = np.full(shape, np.inf, dtype=np.float32)  # second-nearest
     idx_1 = np.zeros(shape, dtype=np.int32)             # CC index of nearest (0-based)
-    idx_2 = np.zeros(shape, dtype=np.int32)             # CC index of second-nearest
     avg_dist = np.zeros((N, N), dtype=np.float64)       # pairwise avg distances
 
     for i in range(N):
         cc_id = i + 1  # 1-indexed CC label
-        print(f"{TAG} DT {i+1}/{N} (cc_id={cc_id})", flush=True)
+        print(f"{TAG} DT pass 1: {i+1}/{N} (cc_id={cc_id})", flush=True)
         dt_i = distance_transform_edt(cc_labels != cc_id).astype(np.float32)
 
         # Accumulate pairwise average distances
@@ -229,23 +226,14 @@ def main(argv: list[str] | None = None) -> int:
                 if n_j > 0:
                     avg_dist[i, j] = float(dt_i[mask_j].mean())
 
-        # Update two-nearest tracking
+        # Update nearest tracking
         closer = dt_i < dist_1
-        second = (~closer) & (dt_i < dist_2)
-
-        # Where dt_i is closer than current nearest: push nearest → second
-        dist_2[closer] = dist_1[closer]
-        idx_2[closer] = idx_1[closer]
         dist_1[closer] = dt_i[closer]
         idx_1[closer] = i
 
-        # Where dt_i is between nearest and second-nearest
-        dist_2[second] = dt_i[second]
-        idx_2[second] = i
-
         del dt_i
 
-    print(f"{TAG} distance transforms complete", flush=True)
+    print(f"{TAG} pass 1 complete", flush=True)
 
     # -- Greedy chain winding assignment ------------------------------------
     # total_avg[i] = mean distance from CC i to all other CCs
@@ -286,6 +274,65 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{TAG} winding chain: {chain}", flush=True)
     print(f"{TAG} winding_map: {winding_map_dict}", flush=True)
 
+    # -- Pass 2: chain-adjacent distances + dot-product side detection ------
+    prev_in_chain = np.full(N, -1, dtype=np.int32)
+    next_in_chain = np.full(N, -1, dtype=np.int32)
+    for k in range(N):
+        if k > 0:
+            prev_in_chain[chain[k]] = chain[k - 1]
+        if k < N - 1:
+            next_in_chain[chain[k]] = chain[k + 1]
+
+    need_prev = prev_in_chain[idx_1]
+    need_next = next_in_chain[idx_1]
+
+    dist_prev = np.full(shape, np.inf, dtype=np.float32)
+    dist_next = np.full(shape, np.inf, dtype=np.float32)
+    dot_prev = np.zeros(shape, dtype=np.float32)
+
+    dt_cache = {}
+
+    def _get_dt(cc_0idx):
+        if cc_0idx not in dt_cache:
+            dt_cache[cc_0idx] = distance_transform_edt(
+                cc_labels != (cc_0idx + 1)).astype(np.float32)
+        return dt_cache[cc_0idx]
+
+    for k in range(N):
+        cc_idx = chain[k]
+        is_nearest = (idx_1 == cc_idx)
+        if not np.any(is_nearest):
+            continue
+        print(f"{TAG} DT pass 2: chain[{k}]={cc_idx}", flush=True)
+
+        dt_near = _get_dt(cc_idx)
+
+        # Prev: distance + dot product of gradients
+        if k > 0:
+            prev_idx = chain[k - 1]
+            dt_prev_cc = _get_dt(prev_idx)
+            dist_prev[is_nearest] = dt_prev_cc[is_nearest]
+
+            for ax in range(3):
+                gn = np.gradient(dt_near, axis=ax)
+                gp = np.gradient(dt_prev_cc, axis=ax)
+                dot_prev[is_nearest] += gn[is_nearest] * gp[is_nearest]
+                del gn, gp
+
+        # Next: distance only
+        if k < N - 1:
+            next_idx = chain[k + 1]
+            dt_next_cc = _get_dt(next_idx)
+            dist_next[is_nearest] = dt_next_cc[is_nearest]
+
+        # Evict DTs no longer needed
+        if k >= 1 and chain[k - 1] in dt_cache:
+            del dt_cache[chain[k - 1]]
+
+    del dt_cache
+
+    print(f"{TAG} pass 2 complete", flush=True)
+
     # -- Envelope mask (mark exterior voxels) -------------------------------
     first_cc_id = chain[0] + 1   # 1-indexed CC label
     last_cc_id = chain[-1] + 1
@@ -305,25 +352,90 @@ def main(argv: list[str] | None = None) -> int:
 
     outside_mask = (dot > 0) & (fg == 0)   # never zero out foreground voxels
     del dot
-    n_outside = int(outside_mask.sum())
-    print(f"{TAG} outside envelope: {n_outside} voxels "
-          f"({100 * n_outside / outside_mask.size:.1f}%) will be zeroed", flush=True)
 
-    # -- Per-voxel winding interpolation ------------------------------------
-    w1 = winding_map_arr[idx_1]  # (Z, Y, X) float32
-    w2 = winding_map_arr[idx_2]  # (Z, Y, X) float32
-    total = np.maximum(dist_1 + dist_2, 1e-8)
-    winding_vol = (w1 * dist_2 + w2 * dist_1) / total
+    # Per-voxel fringe: outside voxels within half a local winding spacing.
+    # Use chain-adjacent distance as the spacing reference.
+    near_boundary = (idx_1 == chain[0]) | (idx_1 == chain[-1])
+    dist_adj = np.minimum(dist_prev, dist_next)
+    fringe_mask = outside_mask & (3 * dist_1 <= dist_adj) & near_boundary
+    del dist_adj
+    far_outside = outside_mask & ~fringe_mask
+    n_fringe = int(fringe_mask.sum())
+    print(f"{TAG} outside envelope: {int(outside_mask.sum())} voxels "
+          f"({100 * outside_mask.sum() / outside_mask.size:.1f}%), "
+          f"fringe kept: {n_fringe}", flush=True)
 
-    valid_mask = (~outside_mask).astype(np.float32)
-    winding_vol[outside_mask] = 0.0
-    del outside_mask
+    # -- Per-voxel winding interpolation (chain-adjacent) -------------------
+    w_near = winding_map_arr[idx_1]
+    w_prev = winding_map_arr[np.clip(need_prev, 0, N - 1)]
+    w_next = winding_map_arr[np.clip(need_next, 0, N - 1)]
+
+    use_prev_side = dot_prev < 0
+    use_prev_side[need_next < 0] = True   # last CC: no next, must use prev side
+    # dot < 0 → gradients oppose → CC prev on opposite side → between prev and nearest
+    # dot >= 0 → same side → between nearest and next
+    # need_prev == -1 → dot_prev stays 0 → use_prev_side=False → always next side ✓
+    del dot_prev
+
+    # -- Debug slices (center YZ plane) ------------------------------------
+    xc = shape[2] // 2
+    dbg = {}
+    dbg["d_lo"] = np.where(use_prev_side, dist_prev, dist_1)[:, :, xc].copy()
+    dbg["d_hi"] = np.where(use_prev_side, dist_1, dist_next)[:, :, xc].copy()
+    dbg["fringe"] = fringe_mask[:, :, xc].astype(np.float32)
+    dbg["interior"] = (~outside_mask & ~fringe_mask)[:, :, xc].astype(np.float32)
+    dbg["w_hi"] = np.where(use_prev_side, w_near, w_next)[:, :, xc].copy()
+    dbg["w_lo"] = np.where(use_prev_side, w_prev, w_near)[:, :, xc].copy()
+
+    # Case 1: between prev and nearest
+    total_1 = np.maximum(dist_prev + dist_1, 1e-8)
+    interp_1 = (w_prev * dist_1 + w_near * dist_prev) / total_1
+
+    # Case 2: between nearest and next
+    total_2 = np.maximum(dist_1 + dist_next, 1e-8)
+    interp_2 = (w_near * dist_next + w_next * dist_1) / total_2
+
+    winding_vol = np.where(use_prev_side, interp_1, interp_2)
+    del total_1, total_2, interp_1, interp_2, use_prev_side
+
+    # Fringe: extrapolate using chain-adjacent spacing
+    is_first = idx_1[fringe_mask] == chain[0]
+    fringe_d_adj = np.where(is_first, dist_next[fringe_mask], dist_prev[fringe_mask])
+    fringe_w_adj = np.where(is_first, w_next[fringe_mask], w_prev[fringe_mask])
+    fringe_spacing = np.maximum(fringe_d_adj - dist_1[fringe_mask], 1e-8)
+    winding_vol[fringe_mask] = (
+        w_near[fringe_mask]
+        + (w_near[fringe_mask] - fringe_w_adj) * dist_1[fringe_mask] / fringe_spacing
+    )
+    del fringe_d_adj, fringe_w_adj, fringe_spacing, is_first, outside_mask
+
+    winding_vol[far_outside] = 0.0
+    valid_mask = (~far_outside).astype(np.float32)
+    del far_outside, fringe_mask
+
+    # Shift all non-zero values up by 1 so the minimum valid value is ~1.5
+    # (truly invalid stays 0, well below the >= 1 threshold)
+    winding_vol[winding_vol > 0] += 1.0
+
+    # Debug: final winding slice
+    dbg["winding"] = winding_vol[:, :, xc].copy()
 
     # Free large arrays
-    del dist_1, dist_2, idx_1, idx_2, w1, w2, total
+    del dist_1, dist_prev, dist_next, idx_1, w_near, w_prev, w_next
+    del need_prev, need_next
 
     wv_min, wv_max = float(winding_vol.min()), float(winding_vol.max())
     print(f"{TAG} winding volume: min={wv_min:.3f} max={wv_max:.3f}", flush=True)
+
+    # -- Debug TIFF (center YZ plane) --------------------------------------
+    dbg_path = output_path.parent / (output_path.stem + "_dbg.tif")
+    dbg_names = sorted(dbg)
+    with tifffile.TiffWriter(str(dbg_path)) as tw:
+        for name in dbg_names:
+            tw.write(dbg[name].astype(np.float32),
+                     extratags=[(285, 's', 0, name, False)])
+    print(f"{TAG} debug TIFF: {dbg_path}  layers={dbg_names}", flush=True)
+    del dbg
 
     # -- Downsample ---------------------------------------------------------
     valid_ds = _downsample_mean(valid_mask, step)
