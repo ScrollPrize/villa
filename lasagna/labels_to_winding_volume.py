@@ -116,9 +116,69 @@ def main(argv: list[str] | None = None) -> int:
     assert vol.ndim == 3, f"expected 3D volume, got shape {vol.shape}"
     print(f"{TAG} volume shape={vol.shape}  dtype={vol.dtype}", flush=True)
 
+    # -- Crop pure-background border -----------------------------------------
+    # Label volumes often have a border of bg (0) voxels on all faces.  This
+    # border connects non-ignore regions around ignore strips, defeating the
+    # disconnected-segment detection below.  Detect and crop it off.
+    non_bg = vol != 0  # fg or ignore
+    crops = []  # (lo, hi) per axis — hi is from the end
+    for ax in range(3):
+        # Collapse other axes: True if any non-bg voxel in that slice
+        other_axes = tuple(a for a in range(3) if a != ax)
+        has_content = non_bg.any(axis=other_axes)  # (size_along_ax,)
+        lo = 0
+        while lo < len(has_content) and not has_content[lo]:
+            lo += 1
+        hi = 0
+        while hi < len(has_content) and not has_content[len(has_content) - 1 - hi]:
+            hi += 1
+        crops.append((lo, hi))
+    del non_bg
+    axis_names = ["Z", "Y", "X"]
+    crop_msg = "  ".join(f"{axis_names[i]}: -{crops[i][0]}...-{crops[i][1]}" for i in range(3))
+    print(f"{TAG} bg border crop: {crop_msg}", flush=True)
+    if any(lo > 0 or hi > 0 for lo, hi in crops):
+        sz, sy, sx = vol.shape
+        z0, z1 = crops[0][0], sz - crops[0][1]
+        y0, y1 = crops[1][0], sy - crops[1][1]
+        x0, x1 = crops[2][0], sx - crops[2][1]
+        vol = vol[z0:z1, y0:y1, x0:x1]
+        print(f"{TAG} cropped volume shape={vol.shape}", flush=True)
+
     fg = (vol == 1).astype(np.uint8)
     fg_count = int(fg.sum())
     print(f"{TAG} foreground voxels: {fg_count} ({100*fg_count/fg.size:.1f}%)", flush=True)
+
+    # -- Filter disconnected non-ignore regions -----------------------------
+    # If ignore labels split the volume into disconnected regions, keep only
+    # the largest connected non-ignore region and treat the rest as ignore.
+    # This prevents winding jumps across ignore boundaries.
+    n_ignore = int((vol == 2).sum())
+    print(f"{TAG} ignore voxels: {n_ignore} ({100*n_ignore/vol.size:.1f}%)", flush=True)
+    non_ignore = (vol != 2).astype(np.uint8)
+    ni_labels, ni_count = _connected_components(non_ignore, args.connectivity)
+    del non_ignore
+    ni_sizes = np.bincount(ni_labels.ravel())
+    ni_sizes[0] = 0  # background of CC (i.e. ignore voxels) doesn't count
+    # Print all detected non-ignore segments
+    ni_order = np.argsort(-ni_sizes)  # largest first
+    ni_order = ni_order[ni_sizes[ni_order] > 0]
+    print(f"{TAG} non-ignore connected components: {ni_count}", flush=True)
+    for rank, cc_id in enumerate(ni_order):
+        n_fg_in = int((fg[ni_labels == cc_id] > 0).sum())
+        print(f"{TAG}   segment {rank+1}: cc={cc_id}  size={int(ni_sizes[cc_id])}  fg={n_fg_in}", flush=True)
+    if ni_count > 1:
+        largest = int(ni_order[0])
+        discard_mask = (ni_labels > 0) & (ni_labels != largest)
+        n_discard_fg = int((fg[discard_mask] > 0).sum())
+        print(f"{TAG} keeping largest segment (cc={largest}, {int(ni_sizes[largest])} voxels), "
+              f"discarding {n_discard_fg} fg voxels from {ni_count - 1} smaller parts",
+              flush=True)
+        fg[discard_mask] = 0
+        del discard_mask
+        fg_count = int(fg.sum())
+        print(f"{TAG} foreground voxels after filtering: {fg_count}", flush=True)
+    del ni_labels
 
     # -- Connected components -----------------------------------------------
     print(f"{TAG} running connected components (connectivity={args.connectivity})", flush=True)
