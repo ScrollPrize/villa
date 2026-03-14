@@ -20,6 +20,8 @@ _BACKBONE_DEFAULTS = {
     "embed_dim": 864,
     "patch_size": (16, 16, 16),
     "embedding_type": "default",
+    "deeper_embed_patch_chunk_size": None,
+    "deeper_embed_batch_chunk_size": 1,
     "depth": 24,
     "num_heads": 16,
     "qkv_bias": True,

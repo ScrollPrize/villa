@@ -1,3 +1,4 @@
+from itertools import product
 from typing import Literal, Optional, Tuple, List, Union, Type
 
 import numpy as np
@@ -673,6 +674,28 @@ class PatchEmbedDeeper(nn.Module):
         )
         self._patch_halo: tuple[int, ...] | None = None
 
+    def _normalize_patch_chunk_size(
+        self,
+        patch_chunk_size: Optional[Union[int, tuple[int, ...], list[int]]],
+        *,
+        full_patch_shape: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        if patch_chunk_size is None:
+            return full_patch_shape
+        if isinstance(patch_chunk_size, int):
+            if patch_chunk_size <= 0:
+                raise ValueError(f"patch_chunk_size must be positive, got {patch_chunk_size}")
+            normalized = (int(patch_chunk_size),) * self.ndim
+        else:
+            normalized = tuple(int(v) for v in patch_chunk_size)
+            if len(normalized) != self.ndim:
+                raise ValueError(
+                    f"patch_chunk_size must provide {self.ndim} values, got {normalized}"
+                )
+            if any(v <= 0 for v in normalized):
+                raise ValueError(f"patch_chunk_size must be positive, got {normalized}")
+        return tuple(min(chunk, full) for chunk, full in zip(normalized, full_patch_shape))
+
     def _avg_pool_support(
         self,
         support: torch.Tensor,
@@ -761,6 +784,142 @@ class PatchEmbedDeeper(nn.Module):
                 halo.append(min(axis_min, axis_size - axis_max - 1))
             self._patch_halo = tuple(halo)
         return self._patch_halo
+
+    def forward_tiled(
+        self,
+        x: torch.Tensor,
+        *,
+        target_patch_shape: Optional[Union[int, tuple[int, ...], list[int]]] = None,
+        patch_chunk_size: Optional[Union[int, tuple[int, ...], list[int]]] = None,
+        batch_chunk_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        full_patch_shape = tuple(int(dim) // int(patch) for dim, patch in zip(x.shape[2:], self.patch_size))
+        if any(int(dim) % int(patch) != 0 for dim, patch in zip(x.shape[2:], self.patch_size)):
+            raise ValueError(
+                f"PatchEmbedDeeper input shape must be divisible by patch_size, got shape={tuple(x.shape[2:])} "
+                f"and patch_size={self.patch_size}"
+            )
+
+        if batch_chunk_size is None:
+            batch_chunk_size = x.shape[0]
+        batch_chunk_size = int(batch_chunk_size)
+        if batch_chunk_size <= 0:
+            raise ValueError(f"batch_chunk_size must be positive, got {batch_chunk_size}")
+
+        if target_patch_shape is None:
+            target_patch_shape_normalized = full_patch_shape
+        elif isinstance(target_patch_shape, int):
+            if target_patch_shape <= 0:
+                raise ValueError(f"target_patch_shape must be positive, got {target_patch_shape}")
+            target_patch_shape_normalized = (int(target_patch_shape),) * self.ndim
+        else:
+            target_patch_shape_normalized = tuple(int(v) for v in target_patch_shape)
+            if len(target_patch_shape_normalized) != self.ndim:
+                raise ValueError(
+                    f"target_patch_shape must provide {self.ndim} values, got {target_patch_shape_normalized}"
+                )
+            if any(v <= 0 for v in target_patch_shape_normalized):
+                raise ValueError(
+                    f"target_patch_shape must be positive, got {target_patch_shape_normalized}"
+                )
+        if any(target > full for target, full in zip(target_patch_shape_normalized, full_patch_shape)):
+            raise ValueError(
+                f"target_patch_shape={target_patch_shape_normalized} cannot exceed full patch shape {full_patch_shape}"
+            )
+
+        patch_chunk_shape = self._normalize_patch_chunk_size(
+            patch_chunk_size,
+            full_patch_shape=target_patch_shape_normalized,
+        )
+        if (
+            batch_chunk_size >= x.shape[0]
+            and patch_chunk_shape == target_patch_shape_normalized
+            and target_patch_shape_normalized == full_patch_shape
+        ):
+            return self.forward(x)
+
+        crop_starts = []
+        for full, target in zip(full_patch_shape, target_patch_shape_normalized):
+            delta = full - target
+            if delta < 0 or delta % 2 != 0:
+                raise ValueError(
+                    f"cannot center-crop patch grid from {full_patch_shape} to {target_patch_shape_normalized}"
+                )
+            crop_starts.append(delta // 2)
+
+        crop_starts = tuple(crop_starts)
+        halo = self.patch_halo()
+        if patch_chunk_size is not None and target_patch_shape_normalized == full_patch_shape:
+            raise ValueError(
+                "PatchEmbedDeeper spatial chunking requires a smaller centered target_patch_shape; "
+                "set patch_chunk_size=None to use batch-only chunking."
+            )
+        if patch_chunk_size is not None:
+            required_halo = tuple(min(start, full - (start + target)) for start, target, full in zip(
+                crop_starts,
+                target_patch_shape_normalized,
+                full_patch_shape,
+            ))
+            if any(available < needed for available, needed in zip(required_halo, halo)):
+                raise ValueError(
+                    "PatchEmbedDeeper spatial chunking requires centered overscan at least as large as patch_halo; "
+                    f"got available={required_halo} and required={halo}"
+                )
+
+        if patch_chunk_size is None:
+            outputs = []
+            crop_stops = tuple(start + size for start, size in zip(crop_starts, target_patch_shape_normalized))
+            output_slices = tuple(slice(start, stop) for start, stop in zip(crop_starts, crop_stops))
+            for batch_start in range(0, x.shape[0], batch_chunk_size):
+                batch_end = min(batch_start + batch_chunk_size, x.shape[0])
+                batch_y = self.forward(x[batch_start:batch_end])
+                outputs.append(batch_y[(slice(None), slice(None), *output_slices)])
+            return torch.cat(outputs, dim=0)
+
+        outputs: list[torch.Tensor] = []
+        tile_starts = [range(0, size, chunk) for size, chunk in zip(target_patch_shape_normalized, patch_chunk_shape)]
+        for batch_start in range(0, x.shape[0], batch_chunk_size):
+            batch_end = min(batch_start + batch_chunk_size, x.shape[0])
+            batch_x = x[batch_start:batch_end]
+            batch_output: torch.Tensor | None = None
+
+            for starts in product(*tile_starts):
+                tile_shape = tuple(
+                    min(chunk, full - start)
+                    for start, chunk, full in zip(starts, patch_chunk_shape, target_patch_shape_normalized)
+                )
+                target_starts = tuple(crop_start + start for crop_start, start in zip(crop_starts, starts))
+                context_starts = tuple(target_start - axis_halo for target_start, axis_halo in zip(target_starts, halo))
+                context_stops = tuple(
+                    target_start + size + axis_halo
+                    for target_start, size, axis_halo in zip(target_starts, tile_shape, halo)
+                )
+                input_slices = tuple(
+                    slice(start * patch, stop * patch)
+                    for start, stop, patch in zip(context_starts, context_stops, self.patch_size)
+                )
+                tile_x = batch_x[(slice(None), slice(None), *input_slices)]
+                tile_y = self.forward(tile_x)
+
+                output_slices = tuple(
+                    slice(target_start - context_start, target_start - context_start + size)
+                    for target_start, context_start, size in zip(target_starts, context_starts, tile_shape)
+                )
+                tile_output = tile_y[(slice(None), slice(None), *output_slices)]
+                if batch_output is None:
+                    batch_output = torch.empty(
+                        (batch_x.shape[0], tile_output.shape[1], *target_patch_shape_normalized),
+                        device=tile_output.device,
+                        dtype=tile_output.dtype,
+                    )
+                destination_slices = tuple(slice(start, start + size) for start, size in zip(starts, tile_shape))
+                batch_output[(slice(None), slice(None), *destination_slices)] = tile_output
+
+            if batch_output is None:
+                raise RuntimeError("PatchEmbedDeeper.forward_tiled produced no output tiles.")
+            outputs.append(batch_output)
+
+        return torch.cat(outputs, dim=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
