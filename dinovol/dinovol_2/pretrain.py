@@ -1244,8 +1244,6 @@ class DinoIBOTPretrainer:
             self.dino_loss.load_state_dict(checkpoint["dino_loss"])
         if "ibot_patch_loss" in checkpoint:
             self.ibot_patch_loss.load_state_dict(checkpoint["ibot_patch_loss"])
-        if "rng_state" in checkpoint:
-            self._restore_rng_state(checkpoint["rng_state"])
         if checkpoint.get("wandb_run_id") and not self.wandb_run_id:
             self.wandb_run_id = str(checkpoint["wandb_run_id"])
             self.config["wandb_run_id"] = self.wandb_run_id
