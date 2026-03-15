@@ -20,6 +20,7 @@ class DataConfig:
 	windings: int | None                                 # number of windings
 	winding_volume: str | None                           # path to winding volume zarr
 	cuda_gridsample: bool                                # use custom CUDA uint8 grid_sample kernel
+	erode_valid_mask: int                                # erode grad_mag validity mask by N voxels
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -43,6 +44,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
 		help="Path to winding volume zarr (float32, from labels_to_winding_volume.py)")
 	g.add_argument("--cuda-gridsample", type=int, default=1,
 		help="Use custom CUDA uint8 grid_sample kernel (1=yes, 0=fallback to PyTorch F.grid_sample)")
+	g.add_argument("--erode-valid-mask", type=int, default=0,
+		help="Erode grad_mag validity mask inward by N voxels (excludes noisy borders from all losses)")
 
 
 def from_args(args: argparse.Namespace) -> DataConfig:
@@ -75,6 +78,7 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		windings=windings,
 		winding_volume=winding_volume,
 		cuda_gridsample=bool(int(getattr(args, "cuda_gridsample", 1))),
+		erode_valid_mask=int(getattr(args, "erode_valid_mask", 0)),
 	)
 
 

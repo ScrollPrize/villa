@@ -518,6 +518,17 @@ def export_vis_obj(
 		print("[export_vis] writing mesh_full.obj", flush=True)
 		_write_obj_mesh(out / "mesh_full.obj", verts, faces, uvs=None, mtl_name=None)
 
+		# Validity mask on full mesh: green = valid (grad_mag > 0), red = invalid
+		print("[export_vis] writing mesh_validity.obj", flush=True)
+		uvs_full = _mesh_uvs(D, Hm, Wm)
+		validity_stacked = vert_valid.reshape(D * Hm, Wm).astype(np.uint8)
+		rgb_validity = np.zeros((D * Hm, Wm, 3), dtype=np.uint8)
+		rgb_validity[validity_stacked > 0] = [0, 200, 0]     # green = valid
+		rgb_validity[validity_stacked == 0] = [200, 0, 0]     # red = invalid
+		_write_png(out / "mesh_validity.png", rgb_validity)
+		_write_mtl(out / "mesh_validity.mtl", "mesh_validity", "mesh_validity.png")
+		_write_obj_mesh(out / "mesh_validity.obj", verts, faces, uvs_full, "mesh_validity")
+
 	# ------ Connections ------
 	if include_connections:
 		print("[export_vis] writing connections.obj", flush=True)
@@ -578,6 +589,61 @@ def export_vis_obj(
 				materials.append((mat_name, png_name))
 			_write_mtl_multi(out / f"{obj_name}.mtl", materials)
 			_write_obj_multi_quad(out / f"{obj_name}.obj", quads)
+
+	# ------ Normal direction slices (nx, ny as RGB normal map) ------
+	nx_arr = data.nx.squeeze().cpu().numpy().astype(np.float32)   # (Z, Y, X) uint8
+	ny_arr = data.ny.squeeze().cpu().numpy().astype(np.float32)   # (Z, Y, X) uint8
+	for plane in slices:
+		obj_name = f"slice_{plane}_normals"
+		print(f"[export_vis] writing {obj_name} (3 positions)", flush=True)
+		quads: list[tuple[np.ndarray, str]] = []
+		materials: list[tuple[str, str]] = []
+		for pos_label, frac in _SLICE_POSITIONS:
+			mat_name = f"{obj_name}_{pos_label}"
+			png_name = f"{mat_name}.png"
+			idx = _slice_index(plane, nx_arr.shape, frac)
+			nx_slc = _take_slice(nx_arr, plane, idx)  # (H, W) 0-255, 128=zero
+			ny_slc = _take_slice(ny_arr, plane, idx)
+			# Decode to [-1, 1]
+			nxf = (nx_slc - 128.0) / 127.0
+			nyf = (ny_slc - 128.0) / 127.0
+			nzf = np.sqrt(np.clip(1.0 - nxf**2 - nyf**2, 0.0, 1.0))
+			# Standard normal map encoding: [0,1] → [0,255]
+			rgb = np.stack([
+				((nxf * 0.5 + 0.5) * 255.0).clip(0, 255).astype(np.uint8),
+				((nyf * 0.5 + 0.5) * 255.0).clip(0, 255).astype(np.uint8),
+				((nzf * 0.5 + 0.5) * 255.0).clip(0, 255).astype(np.uint8),
+			], axis=-1)
+			_write_png(out / png_name, rgb[::-1])
+			_write_pfm(out / f"{mat_name}_nx.pfm", nxf.astype(np.float32))
+			_write_pfm(out / f"{mat_name}_ny.pfm", nyf.astype(np.float32))
+			corners = _slice_corners(plane, data_min, data_max, frac=frac)
+			quads.append((corners, mat_name))
+			materials.append((mat_name, png_name))
+		_write_mtl_multi(out / f"{obj_name}.mtl", materials)
+		_write_obj_multi_quad(out / f"{obj_name}.obj", quads)
+
+	# ------ Validity mask slices (grad_mag > 0 as green/red) ------
+	gm_arr = data.grad_mag.squeeze().cpu().numpy()  # (Z, Y, X)
+	for plane in slices:
+		obj_name = f"slice_{plane}_validity"
+		print(f"[export_vis] writing {obj_name} (3 positions)", flush=True)
+		quads: list[tuple[np.ndarray, str]] = []
+		materials: list[tuple[str, str]] = []
+		for pos_label, frac in _SLICE_POSITIONS:
+			mat_name = f"{obj_name}_{pos_label}"
+			png_name = f"{mat_name}.png"
+			idx = _slice_index(plane, gm_arr.shape, frac)
+			slc = _take_slice(gm_arr, plane, idx)  # (H, W)
+			rgb = np.zeros((*slc.shape, 3), dtype=np.uint8)
+			rgb[slc > 0] = [0, 200, 0]      # green = valid
+			rgb[slc == 0] = [200, 0, 0]      # red = invalid
+			_write_png(out / png_name, rgb[::-1])
+			corners = _slice_corners(plane, data_min, data_max, frac=frac)
+			quads.append((corners, mat_name))
+			materials.append((mat_name, png_name))
+		_write_mtl_multi(out / f"{obj_name}.mtl", materials)
+		_write_obj_multi_quad(out / f"{obj_name}.obj", quads)
 
 	# ------ Loss maps ------
 	if losses:

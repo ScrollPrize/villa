@@ -4,6 +4,13 @@ import torch
 
 import model as fit_model
 
+_mask_zero_normals: bool = False
+
+
+def set_mask_zero_normals(enabled: bool) -> None:
+	global _mask_zero_normals
+	_mask_zero_normals = enabled
+
 
 def _vertex_normals(xyz_lr: torch.Tensor) -> torch.Tensor:
 	"""Compute unit vertex normals from quad mesh grid.
@@ -54,7 +61,10 @@ def normal_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch
 	lm = 1.0 - dot * dot
 
 	# Mask: grad_mag > 0
-	mask = (data.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=normal.dtype)
+	mask = data.grad_mag.squeeze(0).squeeze(0) > 0.0
+	if _mask_zero_normals:
+		mask = mask & ((data_nx != 0.0) | (data_ny != 0.0))
+	mask = mask.to(dtype=normal.dtype)
 
 	return lm.unsqueeze(1), mask.unsqueeze(1)
 

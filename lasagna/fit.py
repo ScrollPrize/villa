@@ -15,6 +15,7 @@ import cli_opt
 import fit_data
 import model
 import opt_loss_corr
+import opt_loss_dir
 import optimizer
 
 
@@ -255,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
 		d = fit_data.load_3d_for_model(
 			path=str(data_cfg.input), device=device, model=mdl,
 			cuda_gridsample=data_cfg.cuda_gridsample,
+			erode_valid_mask=data_cfg.erode_valid_mask,
 		)
 		Z, Y, X = d.size
 		volume_extent = (
@@ -344,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
 
 	# Configure corr snap mode
 	opt_loss_corr.set_snap_mode(opt_cfg.corr_snap)
+	opt_loss_dir.set_mask_zero_normals(opt_cfg.normal_mask_zero)
 
 	# Run optimization
 	optimizer.optimize(

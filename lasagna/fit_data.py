@@ -194,9 +194,34 @@ def auto_crop_for_mesh(
 	return (x0, y0, z0, x1 - x0, y1 - y0, z1 - z0)
 
 
+def erode_grad_mag(data: FitData3D, radius: int) -> None:
+	"""Erode grad_mag validity mask in-place by dilating the invalid (==0) region."""
+	if radius <= 0:
+		return
+	t_gm = data.grad_mag
+	if t_gm is None:
+		return
+	ks = 2 * radius + 1
+	invalid_u8 = (t_gm == 0).byte()
+	Z = t_gm.shape[2]
+	for zi in range(0, Z, 16):
+		ze = min(zi + 16, Z)
+		z0 = max(zi - radius, 0)
+		z1 = min(ze + radius, Z)
+		chunk_f = invalid_u8[:, :, z0:z1].float()
+		# Pad volume boundaries with 1.0 (=invalid) so erosion works from edges
+		pad_z_before = radius - (zi - z0)
+		pad_z_after = radius - (z1 - ze)
+		chunk_f = F.pad(chunk_f, (radius, radius, radius, radius, pad_z_before, pad_z_after), value=1.0)
+		dilated = F.max_pool3d(chunk_f, kernel_size=ks, stride=1, padding=0)
+		t_gm[:, :, zi:ze][dilated > 0.5] = 0
+	del invalid_u8
+
+
 def load_3d_for_model(
 	*, path: str, device: torch.device, model: object,
 	blur_sigma: float = 0.0,
+	erode_valid_mask: int = 0,
 	cuda_gridsample: bool = True,
 ) -> FitData3D:
 	"""Load 3D data auto-cropped around model mesh bbox. Optionally blurs."""
@@ -217,6 +242,9 @@ def load_3d_for_model(
 	if blur_sigma > 0:
 		blur_3d(data, sigma=blur_sigma)
 		print(f"[fit_data] blurred data sigma={blur_sigma}", flush=True)
+	if erode_valid_mask > 0:
+		erode_grad_mag(data, radius=erode_valid_mask)
+		print(f"[fit_data] eroded valid mask by {erode_valid_mask} voxels", flush=True)
 	return data
 
 

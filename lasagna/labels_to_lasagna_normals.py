@@ -117,7 +117,6 @@ def _compute_pred_dt(binary: np.ndarray, step: int) -> np.ndarray:
 def _write_lasagna_zarr(
     ngrids_zarr: Path,
     binary: np.ndarray,
-    ignore: np.ndarray,
     output: Path,
     step: int,
     density: int,
@@ -148,23 +147,19 @@ def _write_lasagna_zarr(
 
     # Downsample binary prediction to step resolution
     pred_ds = _downsample_any(binary, step)
-    # Downsample ignore mask with max-pooling (conservative: any ignore voxel → block invalid)
-    ignore_ds = _downsample_any(ignore, step)
 
     # Ensure shapes match (ngrids may be full-volume sized)
     dz, dy, dx = pred_ds.shape
     nx_vol = nx_vol[:dz, :dy, :dx]
     ny_vol = ny_vol[:dz, :dy, :dx]
-    ignore_ds = ignore_ds[:dz, :dy, :dx]
 
     mask = pred_ds > 0
-    valid = ignore_ds == 0  # valid where NOT ignore (bg + pred are valid)
 
     # Build channels
     # cos: 255 where prediction, 0 elsewhere
     cos_ch = np.where(mask, np.uint8(255), np.uint8(0))
-    # grad_mag: density where valid (bg + pred), 0 where ignore (encodes invalid)
-    grad_mag_ch = np.where(valid, np.uint8(density), np.uint8(0))
+    # grad_mag: density everywhere — ignore label only affects loss, not mesh validity
+    grad_mag_ch = np.full_like(cos_ch, density, dtype=np.uint8)
 
     nx_ch = nx_vol.astype(np.uint8)
     ny_ch = ny_vol.astype(np.uint8)
@@ -251,7 +246,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{TAG} volume shape={vol.shape}  bg={n_bg}  pred={n_fg}  ignore={n_ign}", flush=True)
 
     binary = (vol == 1).astype(np.uint8)
-    ignore = (vol == 2).astype(np.uint8)
 
     if not args.skip_gen_normalgrids:
         _write_binary_zarr(binary, binary_zarr_path, args.chunk_size)
@@ -294,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- Step 5: Assemble lasagna zarr from ngrids + binary ------------------
     _write_lasagna_zarr(
-        ngrids_zarr_path, binary, ignore, output_path,
+        ngrids_zarr_path, binary, output_path,
         args.step, args.density, args.chunk_size,
         pred_dt_u8=pred_dt_u8,
     )
