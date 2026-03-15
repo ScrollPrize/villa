@@ -1,0 +1,60 @@
+{
+	"args": {
+		"init-mode": "straight"
+	},
+	"base": {
+		"normal": 1.0,
+		"step": 100.0,
+		"smooth": 1.0,
+		"winding_density": 0.0,
+		"winding_vol": 10.0,
+		"pred_dt": 0.1,
+		"station": 0.0
+	},
+	"stages": [
+		{
+			"name": "straight_only",
+			"steps": 100,
+			"lr": 1.0,
+			"params": ["straight_cx", "straight_cy", "straight_angle", "straight_half_w"],
+			"w_fac": {
+				"winding_vol": 0.0,
+				"pred_dt": 0.0
+			}
+		},
+		{
+			"name": "normals",
+			"steps": 1000,
+			"lr": [1.0, 0.1, 0.01, 0.001],
+			"params": ["mesh_ms", "conn_offset_ms"],
+			"w_fac": {
+				"winding_vol": 0.0,
+				"pred_dt": 0.0
+			}
+		},
+		{
+			"name": "winding",
+			"steps": 1000,
+			"lr": [1.0, 0.1, 0.01, 0.001],
+			"params": ["mesh_ms", "conn_offset_ms"],
+			"w_fac": {
+              "pred_dt": 0.0,
+              "normal": 0.01,
+              "smooth": 0.1
+			},
+			"args": {
+				"winding_offset_autocrop": true
+			}
+		},
+		{
+			"name": "winding",
+			"steps": 10000,
+			"lr": [1.0, 0.1, 0.01, 0.001],
+			"w_fac": {
+              "normal": 0.0,
+              "smooth": 0.1
+              },
+			"params": ["mesh_ms", "conn_offset_ms"]
+		}
+	]
+}
