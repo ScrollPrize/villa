@@ -5,6 +5,7 @@ import torch
 import model as fit_model
 
 _mask_zero_normals: bool = False
+_norm_warn_counter: int = 0
 
 
 def set_mask_zero_normals(enabled: bool) -> None:
@@ -55,6 +56,15 @@ def normal_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch
 	data_ny = data.ny.squeeze(0).squeeze(0)
 	data_nz = torch.sqrt(torch.clamp(1.0 - data_nx * data_nx - data_ny * data_ny, min=1e-8))
 	target = torch.stack([data_nx, data_ny, data_nz], dim=-1)  # (D, Hm, Wm, 3)
+
+	# Re-normalize: interpolated normals may not be unit length
+	global _norm_warn_counter
+	target_norm = torch.sqrt((target * target).sum(dim=-1, keepdim=True).clamp(min=1e-12))
+	max_norm = float(target_norm.max())
+	if abs(max_norm - 1.0) > 0.1 and _norm_warn_counter % 100 == 0:
+		print(f"[normal_loss] WARNING: max target normal norm {max_norm:.4f} deviates from 1.0 by >{0.1}")
+	_norm_warn_counter += 1
+	target = target / target_norm
 
 	# Loss: 1 - dot² = sin²(θ), sign-invariant
 	dot = (normal * target).sum(dim=-1)

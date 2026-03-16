@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 import model as fit_model
+from opt_loss_dir import _vertex_normals
 
 
 # Module-level state set by compute_auto_offset(), persists for rest of optimization.
@@ -37,7 +38,14 @@ def _sample_winding_volume(*, res: fit_model.FitResult3D) -> torch.Tensor:
 	ox, oy, oz = res.data.origin_fullres
 	sx, sy, sz = res.data.spacing
 
-	grid = res.xyz_lr.clone()  # (D, Hm, Wm, 3) — (x, y, z) in fullres
+	# Project gradients onto surface normal only (prevents tangential crimping)
+	n = _vertex_normals(res.xyz_lr.detach())  # (D, Hm, Wm, 3) unit normals
+	proj_len = (res.xyz_lr * n).sum(dim=-1, keepdim=True)
+	xyz_normal = proj_len * n
+	xyz_tangential = res.xyz_lr - xyz_normal
+	xyz = xyz_normal + xyz_tangential.detach()  # same value, grad only along normal
+
+	grid = xyz.clone()  # (D, Hm, Wm, 3) — (x, y, z) in fullres
 	grid[..., 0] = (grid[..., 0] - ox) / sx / max(1, X - 1) * 2 - 1
 	grid[..., 1] = (grid[..., 1] - oy) / sy / max(1, Y - 1) * 2 - 1
 	grid[..., 2] = (grid[..., 2] - oz) / sz / max(1, Z - 1) * 2 - 1

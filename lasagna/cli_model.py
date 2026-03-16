@@ -49,7 +49,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--straight-half-w", type=float, default=100.0)
 	g.add_argument("--init-mode", default="arc", choices=["arc", "straight"])
 	g.add_argument("--z-center", type=float, default=0.0)
-	g.add_argument("--pyramid-d", action="store_true", default=True)
+	g.add_argument("--pyramid-d", action=argparse.BooleanOptionalAction, default=True)
 	g.add_argument("--model-input", default=None)
 	g.add_argument("--model-output", default=None)
 

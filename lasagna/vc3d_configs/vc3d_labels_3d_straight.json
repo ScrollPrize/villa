@@ -7,9 +7,9 @@
 		"step": 100.0,
 		"smooth": 1.0,
 		"winding_density": 0.0,
-		"winding_vol": 10.0,
+		"winding_vol": 100.0,
 		"pred_dt": 0.1,
-		"station": 0.0
+		"station": 0.0001
 	},
 	"stages": [
 		{
@@ -33,26 +33,43 @@
 			}
 		},
 		{
-			"name": "winding",
-			"steps": 1000,
+			"name": "winding1",
+			"steps": 500,
 			"lr": [1.0, 0.1, 0.01, 0.001],
 			"params": ["mesh_ms", "conn_offset_ms"],
 			"w_fac": {
+              "winding_vol": 0.1,
               "pred_dt": 0.0,
-              "normal": 0.01,
+              "normal": 0.0,
               "smooth": 0.1
 			},
 			"args": {
 				"winding_offset_autocrop": true
 			}
 		},
+        {
+          "name": "winding2",
+          "steps": 5000,
+          "lr": [0.1, 0.01, 0.001, 0.0001],
+          "params": ["mesh_ms", "conn_offset_ms"],
+          "w_fac": {
+            "winding_vol": 0.2,
+            "pred_dt": 0.0,
+            "normal": 0.0,
+            "smooth": 0.01,
+            "step": 0.2
+            }
+          },
 		{
-			"name": "winding",
-			"steps": 10000,
-			"lr": [1.0, 0.1, 0.01, 0.001],
+			"name": "predt",
+			"steps": 5000,
+			"lr": [0.1, 0.01, 0.001, 0.0001],
 			"w_fac": {
+              "winding_vol": 0.2,
+              "pred_dt": 0.1,
               "normal": 0.0,
-              "smooth": 0.1
+              "smooth": 0.01,
+              "step": 0.2
               },
 			"params": ["mesh_ms", "conn_offset_ms"]
 		}
