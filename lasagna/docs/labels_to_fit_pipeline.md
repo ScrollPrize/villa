@@ -79,7 +79,7 @@ For scroll-like geometry with significant curvature, use `vc3d_labels_3d.json` i
 ## Step 4 — Visualization (model → OBJ for MeshLab)
 
 ```bash
-python lasagna/export_vis_obj.py \
+python lasagna/lasagna_analyze.py \
     --model work/fit_output/model.pt \
     --input normals.zarr \
     --output-dir work/vis \

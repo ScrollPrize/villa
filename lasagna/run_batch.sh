@@ -97,7 +97,7 @@ run_sample() {
 
     # Step 4: analyze (vis + stats)
     echo "[${label}] Step 4/4: analyze"
-    python "${SRC}/lasagna/export_vis_obj.py" \
+    python "${SRC}/lasagna/lasagna_analyze.py" \
         --model "${outdir}/fit_output/model.pt" \
         --input "${outdir}/normals.zarr" \
         --output-dir "${outdir}/vis" \

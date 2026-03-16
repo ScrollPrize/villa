@@ -81,10 +81,8 @@ def _grid_sample_3d_u8_diff_cpu(
     g[..., 0] = (g[..., 0] - offset[0]) * inv_scale[0] / max(1, X - 1) * 2 - 1
     g[..., 1] = (g[..., 1] - offset[1]) * inv_scale[1] / max(1, Y - 1) * 2 - 1
     g[..., 2] = (g[..., 2] - offset[2]) * inv_scale[2] / max(1, Z - 1) * 2 - 1
-    # grid_sample expects (N, C, D_in, H_in, W_in) and grid (N, D_out, H_out, W_out, 3) with (x,y,z)→(X,Y,Z)
-    # but F.grid_sample 5D grid order is (d, h, w) mapping to (D_in, H_in, W_in)
-    # Our grid (x,y,z) maps to (X, Y, Z) dims, so reorder to (z, y, x) for grid_sample
-    g = g[..., [2, 1, 0]]
+    # F.grid_sample 5D: grid[...,0]→W, grid[...,1]→H, grid[...,2]→D
+    # Our (x,y,z) already maps to (W=X, H=Y, D=Z) — no reorder needed
     out = F.grid_sample(
         vol_f, g.unsqueeze(0),
         mode='bilinear', padding_mode='zeros', align_corners=True,

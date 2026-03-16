@@ -546,8 +546,8 @@ class _Handler(BaseHTTPRequestHandler):
                     if candidate.exists():
                         data_input = str(candidate)
 
-            import export_vis_obj
-            export_vis_obj.export_vis_obj(
+            import lasagna_analyze
+            lasagna_analyze.export_vis_obj(
                 model_path=str(model_input),
                 data_path=str(data_input),
                 output_dir=tmp_dir,
