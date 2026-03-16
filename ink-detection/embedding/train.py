@@ -278,6 +278,22 @@ def compute_grad_norm(parameters: Any) -> float:
     return math.sqrt(total_sq)
 
 
+def forward_for_training(
+    model: InkPatchEmbedder,
+    images: torch.Tensor,
+    *,
+    freeze_backbone: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    inputs = normalize_for_backbone(images)
+    if not freeze_backbone:
+        return model(inputs)
+
+    with torch.no_grad():
+        features = model.backbone(inputs)
+    embeddings = model.head(features)
+    return embeddings, features
+
+
 def evaluate(
     model: InkPatchEmbedder,
     dataloader: DataLoader,
@@ -523,6 +539,8 @@ def main(config_path: Path) -> None:
 
     for epoch in progress:
         model.train()
+        if freeze_backbone:
+            model.backbone.eval()
         for batch_idx, batch in enumerate(train_loader):
             view1 = batch["view1"].to(resolved_device, non_blocking=True)
             view2 = batch["view2"].to(resolved_device, non_blocking=True)
@@ -531,8 +549,8 @@ def main(config_path: Path) -> None:
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(**autocast_kwargs):
-                z1, f1 = model(normalize_for_backbone(view1))
-                z2, f2 = model(normalize_for_backbone(view2))
+                z1, f1 = forward_for_training(model, view1, freeze_backbone=freeze_backbone)
+                z2, f2 = forward_for_training(model, view2, freeze_backbone=freeze_backbone)
                 loss, diagnostics = vicreg_loss(z1.float(), z2.float(), sim_coeff, std_coeff, cov_coeff)
 
             loss.backward()

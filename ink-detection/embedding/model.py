@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -105,20 +106,10 @@ class BackboneAdapter(nn.Module):
         return extract_backbone_features(self.model, images)
 
 
-class FrozenBackbone(BackboneAdapter):
-    def __init__(self, model: nn.Module) -> None:
-        super().__init__(model.eval())
-        for parameter in self.model.parameters():
-            parameter.requires_grad_(False)
-
-    def train(self, mode: bool = True) -> "FrozenBackbone":
-        super().train(False)
-        self.model.eval()
-        return self
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            return super().forward(images)
+def freeze_module_parameters(module: nn.Module) -> nn.Module:
+    for parameter in module.parameters():
+        parameter.requires_grad_(False)
+    return module
 
 
 def load_checkpoint_state(checkpoint_path: Path) -> dict[str, Any]:
@@ -189,7 +180,10 @@ def create_backbone_with_mode(
         if unexpected:
             print(f"checkpoint unexpected keys ({len(unexpected)}): {unexpected[:8]}")
 
-    backbone = (FrozenBackbone(model) if freeze_backbone else BackboneAdapter(model)).to(device)
+    backbone = BackboneAdapter(model).to(device)
+    if freeze_backbone:
+        freeze_module_parameters(backbone)
+        backbone.eval()
     with torch.no_grad():
         dummy = torch.zeros(1, 3, image_size, image_size, device=device)
         dim = int(backbone(dummy).shape[-1])
@@ -208,4 +202,135 @@ def create_frozen_dino_backbone(
         image_size,
         device,
         freeze_backbone=True,
+    )
+
+
+def resolve_checkpoint_config(checkpoint_path: Path) -> tuple[Path, dict[str, Any]]:
+    checkpoint_path = checkpoint_path.resolve()
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    config = checkpoint.get("config") if isinstance(checkpoint, dict) else None
+    if isinstance(config, dict):
+        return checkpoint_path, config
+
+    config_path = checkpoint_path.parent / "config.json"
+    if not config_path.exists():
+        raise ValueError(f"Could not find config in checkpoint or at {config_path}")
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    if not isinstance(config, dict):
+        raise ValueError(f"Expected JSON object at {config_path}, got {type(config).__name__}")
+    return checkpoint_path, config
+
+
+def build_embedder_from_config(
+    config: dict[str, Any],
+    *,
+    device: torch.device,
+    checkpoint_path: Path | None = None,
+    freeze_parameters: bool | None = None,
+) -> tuple[InkPatchEmbedder, dict[str, Any]]:
+    checkpoint_method = str(config.get("adaptation_method", "trained")).strip().lower()
+    backbone_name = str(config["backbone_name"])
+    backbone_checkpoint = config.get("backbone_checkpoint")
+    crop_size = int(config["crop_size"])
+    embedding_dim = int(config.get("embedding_dim", 0) or 0)
+    hidden_dim = int(config.get("hidden_dim", embedding_dim or 0) or 0)
+    dropout = float(config.get("dropout", 0.0 if checkpoint_method in {"pca", "plain"} else 0.1))
+    freeze_backbone = bool(config.get("freeze_backbone", True))
+
+    backbone_checkpoint_path = Path(backbone_checkpoint).expanduser().resolve() if backbone_checkpoint else None
+    backbone, backbone_dim = create_backbone_with_mode(
+        backbone_name,
+        backbone_checkpoint_path,
+        crop_size,
+        device,
+        freeze_backbone=freeze_backbone,
+    )
+
+    if checkpoint_method == "plain":
+        model = InkPatchEmbedder(
+            backbone=backbone,
+            backbone_dim=backbone_dim,
+            embedding_dim=backbone_dim,
+            hidden_dim=backbone_dim,
+            dropout=0.0,
+            head=nn.Identity(),
+        ).to(device)
+        runtime_config = {
+            **config,
+            "crop_size": crop_size,
+            "embedding_dim": backbone_dim,
+            "hidden_dim": backbone_dim,
+            "dropout": 0.0,
+            "freeze_backbone": freeze_backbone,
+            "adaptation_method": checkpoint_method,
+        }
+    elif checkpoint_method == "pca":
+        model = InkPatchEmbedder(
+            backbone=backbone,
+            backbone_dim=backbone_dim,
+            embedding_dim=embedding_dim,
+            hidden_dim=max(1, embedding_dim),
+            dropout=0.0,
+            head=PCAEmbedder(backbone_dim, embedding_dim),
+        ).to(device)
+        runtime_config = {
+            **config,
+            "crop_size": crop_size,
+            "freeze_backbone": freeze_backbone,
+            "adaptation_method": checkpoint_method,
+        }
+    else:
+        model = InkPatchEmbedder(
+            backbone=backbone,
+            backbone_dim=backbone_dim,
+            embedding_dim=embedding_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+        ).to(device)
+        runtime_config = {
+            **config,
+            "crop_size": crop_size,
+            "freeze_backbone": freeze_backbone,
+            "adaptation_method": checkpoint_method,
+        }
+
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        state = checkpoint.get("model") if isinstance(checkpoint, dict) else None
+        if not isinstance(state, dict):
+            raise ValueError(f"Checkpoint {checkpoint_path} does not contain a saved model state")
+        if checkpoint_method == "plain":
+            pass
+        elif checkpoint_method == "pca":
+            missing, unexpected = model.head.load_state_dict(state, strict=True)
+            if missing or unexpected:
+                raise ValueError(f"Unexpected PCA head state mismatch: missing={missing}, unexpected={unexpected}")
+        elif freeze_backbone:
+            missing, unexpected = model.head.load_state_dict(state, strict=True)
+            if missing or unexpected:
+                raise ValueError(f"Unexpected head state mismatch: missing={missing}, unexpected={unexpected}")
+        else:
+            missing, unexpected = model.load_state_dict(state, strict=True)
+            if missing or unexpected:
+                raise ValueError(f"Unexpected model state mismatch: missing={missing}, unexpected={unexpected}")
+
+    if freeze_parameters:
+        freeze_module_parameters(model)
+    model.eval()
+    return model, runtime_config
+
+
+def load_adapted_model(
+    checkpoint_path: Path,
+    device: torch.device,
+    *,
+    freeze_parameters: bool = False,
+) -> tuple[InkPatchEmbedder, dict[str, Any]]:
+    checkpoint_path, config = resolve_checkpoint_config(checkpoint_path)
+    return build_embedder_from_config(
+        config,
+        device=device,
+        checkpoint_path=checkpoint_path,
+        freeze_parameters=freeze_parameters,
     )
