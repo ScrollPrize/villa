@@ -98,6 +98,10 @@ class CFG:
     stitch_betti_matching_loss_weight = 0.0
     stitch_betti_matching_filtration_type = "superlevel"
     stitch_betti_matching_num_processes = 1
+    stitch_embedding_loss_weight = 0.0
+    stitch_embedding_model_config_path = None
+    stitch_embedding_model_checkpoint_path = None
+    stitch_embedding_downsample_factor = 8
     stitch_patch_batch_size = valid_batch_size
     stitch_gradient_checkpointing = False
     stitch_save_on_cpu = False

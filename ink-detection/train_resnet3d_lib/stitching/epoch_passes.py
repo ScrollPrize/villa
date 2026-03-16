@@ -16,6 +16,11 @@ from train_resnet3d_lib.modeling.losses import (
     compute_region_loss_and_dice,
 )
 from train_resnet3d_lib.stitching.buffer_ops import gaussian_weights, resolve_buffer_crop
+from train_resnet3d_lib.stitching.embedding_loss import (
+    build_embedding_model_for_similarity,
+    compute_stitch_embedding_similarity,
+    resolve_embedding_runtime_config,
+)
 
 
 def _validate_train_stitch_inputs(manager):
@@ -166,7 +171,51 @@ def _accumulate_train_loss_roi_buffers(manager, *, outputs, targets, xyxys, roi_
             roi_buffer["count"][target_slice] += patch_weight_crop
 
 
-def _compute_stitched_component_loss(model, *, stitched_logits, stitched_targets, valid_mask, boundary_dist_map=None):
+def _get_stitch_embedding_bundle(model):
+    weight = float(getattr(model, "stitch_embedding_loss_weight", 0.0) or 0.0)
+    if weight <= 0.0:
+        return None
+
+    device = model.device
+    cache_key = (str(device.type), getattr(device, "index", None))
+    cache = getattr(model, "_stitch_embedding_runtime_cache", None)
+    if cache is None:
+        cache = {}
+        model._stitch_embedding_runtime_cache = cache
+    bundle = cache.get(cache_key)
+    if bundle is not None:
+        return bundle
+
+    config_path, checkpoint_path, config = resolve_embedding_runtime_config(
+        config_path=getattr(model, "stitch_embedding_model_config_path", None),
+        checkpoint_path=getattr(model, "stitch_embedding_model_checkpoint_path", None),
+    )
+    embedding_model, runtime_config = build_embedding_model_for_similarity(
+        config=config,
+        checkpoint_path=checkpoint_path,
+        device=device,
+    )
+    bundle = {
+        "model": embedding_model,
+        "config": runtime_config,
+        "config_path": str(config_path) if config_path is not None else None,
+        "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
+        "crop_size": int(runtime_config["crop_size"]),
+        "downsample_factor": int(getattr(model, "stitch_embedding_downsample_factor", 8) or 1),
+    }
+    cache[cache_key] = bundle
+    return bundle
+
+
+def _compute_stitched_component_loss(
+    model,
+    *,
+    stitched_logits,
+    stitched_targets,
+    valid_mask,
+    boundary_dist_map=None,
+    embedding_bundle=None,
+):
     # Keep stitched-train objectives centralized here so topology terms can be added later
     # without scattering component-loss logic across the training loop.
     region_loss, dice, bce, dice_loss = compute_region_loss_and_dice(
@@ -210,17 +259,33 @@ def _compute_stitched_component_loss(model, *, stitched_logits, stitched_targets
             filtration_type=getattr(model, "stitch_betti_matching_filtration_type", "superlevel"),
             num_processes=getattr(model, "stitch_betti_matching_num_processes", 1),
         )
+    embedding_loss = torch.zeros_like(region_loss)
+    embedding_weight = float(getattr(model, "stitch_embedding_loss_weight", 0.0) or 0.0)
+    if embedding_weight > 0.0:
+        if embedding_bundle is None:
+            raise RuntimeError("stitch embedding bundle is required when stitch_embedding_loss_weight > 0")
+        embedding_loss_value = compute_stitch_embedding_similarity(
+            embedding_model=embedding_bundle["model"],
+            embedding_crop_size=embedding_bundle["crop_size"],
+            input_downsample_factor=embedding_bundle["downsample_factor"],
+            stitched_logits=stitched_logits,
+            stitched_targets=stitched_targets,
+            valid_mask=valid_mask,
+        )
+        embedding_loss = embedding_loss + embedding_loss_value
     return {
         "loss": (
             region_loss[0]
             + boundary_weight * boundary_loss[0]
             + cldice_weight * cldice_loss[0]
             + betti_matching_weight * betti_matching_loss[0]
+            + embedding_weight * embedding_loss[0]
         ),
         "region_loss": region_loss[0],
         "boundary_loss": boundary_loss[0],
         "cldice_loss": cldice_loss[0],
         "betti_matching_loss": betti_matching_loss[0],
+        "embedding_loss": embedding_loss[0],
         "dice": dice[0],
         "bce": bce[0],
         "dice_loss": dice_loss[0],
@@ -309,10 +374,12 @@ def compute_train_stitch_loss(manager, model, *, component_key):
     stitch_boundary_loss_terms = []
     stitch_cldice_loss_terms = []
     stitch_betti_matching_loss_terms = []
+    stitch_embedding_loss_terms = []
     stitch_dice_terms = []
     stitch_bce_terms = []
     stitch_dice_loss_terms = []
     covered_px_total = 0
+    embedding_bundle = _get_stitch_embedding_bundle(model)
     for roi_index, roi_buffer in enumerate(roi_buffers):
         valid_mask = roi_buffer["count"] > 0
         if not bool(valid_mask.any().detach().item()):
@@ -342,12 +409,14 @@ def compute_train_stitch_loss(manager, model, *, component_key):
             stitched_targets=stitched_targets,
             valid_mask=valid_mask,
             boundary_dist_map=boundary_dist_map,
+            embedding_bundle=embedding_bundle,
         )
         stitch_loss_terms.append(component_metrics["loss"])
         stitch_region_loss_terms.append(component_metrics["region_loss"])
         stitch_boundary_loss_terms.append(component_metrics["boundary_loss"])
         stitch_cldice_loss_terms.append(component_metrics["cldice_loss"])
         stitch_betti_matching_loss_terms.append(component_metrics["betti_matching_loss"])
+        stitch_embedding_loss_terms.append(component_metrics["embedding_loss"])
         stitch_dice_terms.append(component_metrics["dice"])
         stitch_bce_terms.append(component_metrics["bce"])
         stitch_dice_loss_terms.append(component_metrics["dice_loss"])
@@ -361,6 +430,7 @@ def compute_train_stitch_loss(manager, model, *, component_key):
     stitch_boundary_loss = torch.stack(stitch_boundary_loss_terms).mean()
     stitch_cldice_loss = torch.stack(stitch_cldice_loss_terms).mean()
     stitch_betti_matching_loss = torch.stack(stitch_betti_matching_loss_terms).mean()
+    stitch_embedding_loss = torch.stack(stitch_embedding_loss_terms).mean()
     stitch_dice = torch.stack(stitch_dice_terms).mean()
     stitch_bce = torch.stack(stitch_bce_terms).mean()
     stitch_dice_loss = torch.stack(stitch_dice_loss_terms).mean()
@@ -378,6 +448,7 @@ def compute_train_stitch_loss(manager, model, *, component_key):
         "stitch_boundary_loss": stitch_boundary_loss,
         "stitch_cldice_loss": stitch_cldice_loss,
         "stitch_betti_matching_loss": stitch_betti_matching_loss,
+        "stitch_embedding_loss": stitch_embedding_loss,
         "stitch_dice": stitch_dice,
         "stitch_bce": stitch_bce,
         "stitch_dice_loss": stitch_dice_loss,

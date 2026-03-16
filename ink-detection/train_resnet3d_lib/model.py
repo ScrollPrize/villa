@@ -132,6 +132,10 @@ def initialize_regression_state(
         getattr(CFG, "stitch_betti_matching_filtration_type", "superlevel")
     ).strip().lower()
     model.stitch_betti_matching_num_processes = int(getattr(CFG, "stitch_betti_matching_num_processes", 1) or 1)
+    model.stitch_embedding_loss_weight = float(getattr(CFG, "stitch_embedding_loss_weight", 0.0))
+    model.stitch_embedding_model_config_path = getattr(CFG, "stitch_embedding_model_config_path", None)
+    model.stitch_embedding_model_checkpoint_path = getattr(CFG, "stitch_embedding_model_checkpoint_path", None)
+    model.stitch_embedding_downsample_factor = int(getattr(CFG, "stitch_embedding_downsample_factor", 8) or 1)
     model.stitch_gradient_checkpointing = bool(getattr(CFG, "stitch_gradient_checkpointing", False))
     model.stitch_save_on_cpu = bool(getattr(CFG, "stitch_save_on_cpu", False))
     if (
@@ -140,15 +144,16 @@ def initialize_regression_state(
         or model.stitch_boundary_loss_weight < 0.0
         or model.stitch_cldice_loss_weight < 0.0
         or model.stitch_betti_matching_loss_weight < 0.0
+        or model.stitch_embedding_loss_weight < 0.0
     ):
         raise ValueError(
             "training.patch_loss_weight, training.stitch_loss_weight, and "
             "training.stitch_boundary_loss_weight, training.stitch_cldice_loss_weight, and "
-            "training.stitch_betti_matching_loss_weight must be >= 0, "
+            "training.stitch_betti_matching_loss_weight, and training.stitch_embedding_loss_weight must be >= 0, "
             "got "
             f"{model.patch_loss_weight}, {model.stitch_loss_weight}, "
             f"{model.stitch_boundary_loss_weight}, {model.stitch_cldice_loss_weight}, "
-            f"and {model.stitch_betti_matching_loss_weight}"
+            f"{model.stitch_betti_matching_loss_weight}, and {model.stitch_embedding_loss_weight}"
         )
     if model.patch_loss_weight == 0.0 and model.stitch_loss_weight == 0.0:
         raise ValueError("training.patch_loss_weight and training.stitch_loss_weight cannot both be zero")
@@ -156,6 +161,8 @@ def initialize_regression_state(
         raise ValueError("training.stitch_cldice_loss_weight > 0 requires training.stitch_loss_weight > 0")
     if model.stitch_betti_matching_loss_weight > 0.0 and model.stitch_loss_weight == 0.0:
         raise ValueError("training.stitch_betti_matching_loss_weight > 0 requires training.stitch_loss_weight > 0")
+    if model.stitch_embedding_loss_weight > 0.0 and model.stitch_loss_weight == 0.0:
+        raise ValueError("training.stitch_embedding_loss_weight > 0 requires training.stitch_loss_weight > 0")
     if model.stitch_cldice_mask_mode not in {"pre_skeleton", "post_skeleton"}:
         raise ValueError(
             "training.stitch_cldice_mask_mode must be 'pre_skeleton' or 'post_skeleton', "
@@ -170,6 +177,20 @@ def initialize_regression_state(
         raise ValueError(
             "training.stitch_betti_matching_num_processes must be >= 1, "
             f"got {model.stitch_betti_matching_num_processes}"
+        )
+    if model.stitch_embedding_downsample_factor < 1:
+        raise ValueError(
+            "training.stitch_embedding_downsample_factor must be >= 1, "
+            f"got {model.stitch_embedding_downsample_factor}"
+        )
+    if (
+        model.stitch_embedding_loss_weight > 0.0
+        and model.stitch_embedding_model_config_path is None
+        and model.stitch_embedding_model_checkpoint_path is None
+    ):
+        raise ValueError(
+            "training.stitch_embedding_loss_weight > 0 requires "
+            "training.stitch_embedding_model_config_path or training.stitch_embedding_model_checkpoint_path"
         )
     model.use_stitched_training = model.stitch_loss_weight > 0.0
     if model.use_stitched_training and model.objective != "erm":
@@ -699,6 +720,14 @@ def _training_step_stitched(model, batch):
     model.log(
         "train/stitch_betti_matching_loss",
         torch.stack([metrics["stitch_betti_matching_loss"] for metrics in stitch_metrics_list]).mean(),
+        on_step=True,
+        on_epoch=True,
+        prog_bar=False,
+        batch_size=component_batch_size,
+    )
+    model.log(
+        "train/stitch_embedding_loss",
+        torch.stack([metrics["stitch_embedding_loss"] for metrics in stitch_metrics_list]).mean(),
         on_step=True,
         on_epoch=True,
         prog_bar=False,
