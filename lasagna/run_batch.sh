@@ -13,12 +13,12 @@
 #     ├── normals.zarr
 #     ├── work/           (intermediate files from prep2)
 #     ├── fit_output/     (model.pt, snapshots)
-#     ├── vis/            (OBJ/MTL/PNG visualization)
+#     ├── vis/            (OBJ/MTL/PNG visualization + stats.json)
 #     └── logs/
 #         ├── prep1.log
 #         ├── prep2.log
 #         ├── fit.log
-#         └── vis.log
+#         └── analyze.log
 
 set -euo pipefail
 
@@ -95,15 +95,16 @@ run_sample() {
             echo "[${label}] FAILED at fit"; return 1
         }
 
-    # Step 4: vis
-    echo "[${label}] Step 4/4: export vis"
+    # Step 4: analyze (vis + stats)
+    echo "[${label}] Step 4/4: analyze"
     python "${SRC}/lasagna/export_vis_obj.py" \
         --model "${outdir}/fit_output/model.pt" \
         --input "${outdir}/normals.zarr" \
         --output-dir "${outdir}/vis" \
+        --stats-json "${outdir}/stats.json" \
         --winding-volume "${outdir}/winding.zarr" \
-        > "${logdir}/vis.log" 2>&1 || {
-            echo "[${label}] FAILED at vis"; return 1
+        > "${logdir}/analyze.log" 2>&1 || {
+            echo "[${label}] FAILED at analyze"; return 1
         }
 
     echo "[${label}] Done."

@@ -5,6 +5,7 @@ Each file can be loaded as a separate layer in MeshLab.
 """
 from __future__ import annotations
 
+import json
 import struct
 from pathlib import Path
 
@@ -421,7 +422,7 @@ _LOSS_FUNCS = {
 def export_vis_obj(
 	model_path: str,
 	data_path: str,
-	output_dir: str,
+	output_dir: str | None = None,
 	*,
 	slices: list[str],
 	channels: list[str],
@@ -429,12 +430,14 @@ def export_vis_obj(
 	include_mesh: bool,
 	include_connections: bool,
 	winding_volume_path: str | None = None,
+	stats_json: str | None = None,
 	device: str = "cuda",
 ) -> None:
-	"""Export multi-layer OBJ visualization files."""
+	"""Export multi-layer OBJ visualization files and/or loss statistics."""
 	dev = torch.device(device)
-	out = Path(output_dir)
-	out.mkdir(parents=True, exist_ok=True)
+	out = Path(output_dir) if output_dir is not None else None
+	if out is not None:
+		out.mkdir(parents=True, exist_ok=True)
 
 	# Load model
 	print(f"[export_vis] loading model from {model_path}", flush=True)
@@ -508,7 +511,7 @@ def export_vis_obj(
 	data_center = 0.5 * (data_min + data_max)
 
 	# ------ Mesh ------
-	if include_mesh:
+	if include_mesh and out is not None:
 		print("[export_vis] writing mesh.obj", flush=True)
 		verts = xyz_lr.reshape(-1, 3)
 		faces = _triangulate_grid(D, Hm, Wm)
@@ -530,7 +533,7 @@ def export_vis_obj(
 		_write_obj_mesh(out / "mesh_validity.obj", verts, faces, uvs_full, "mesh_validity")
 
 	# ------ Connections ------
-	if include_connections:
+	if include_connections and out is not None:
 		print("[export_vis] writing connections.obj", flush=True)
 		xy_conn = res.xy_conn.detach().cpu().numpy()  # (D, Hm, Wm, 3, 3)
 		mask_conn = res.mask_conn.detach().cpu().numpy()  # (D, 1, Hm, Wm, 3)
@@ -566,91 +569,95 @@ def export_vis_obj(
 
 	# ------ Volume slices (start, center, end in one OBJ per plane+channel) ------
 	_SLICE_POSITIONS = [("start", 0.1), ("mid", 0.5), ("end", 0.9)]
-	for plane in slices:
-		for channel in channels:
-			vol = getattr(data, channel, None)
-			if vol is None:
-				print(f"[export_vis] skipping slice {plane}/{channel} (not in data)", flush=True)
-				continue
-			obj_name = f"slice_{plane}_{channel}"
+	if out is not None:
+		for plane in slices:
+			for channel in channels:
+				vol = getattr(data, channel, None)
+				if vol is None:
+					print(f"[export_vis] skipping slice {plane}/{channel} (not in data)", flush=True)
+					continue
+				obj_name = f"slice_{plane}_{channel}"
+				print(f"[export_vis] writing {obj_name} (3 positions)", flush=True)
+				quads: list[tuple[np.ndarray, str]] = []
+				materials: list[tuple[str, str]] = []
+				for pos_label, frac in _SLICE_POSITIONS:
+					mat_name = f"{obj_name}_{pos_label}"
+					png_name = f"{mat_name}.png"
+					tex = _slice_texture(data, plane, channel, frac=frac)
+					_write_png(out / png_name, tex)
+					vol_arr = getattr(data, channel).squeeze().cpu().numpy()
+					sl_idx = _slice_index(plane, vol_arr.shape, frac)
+					_write_pfm(out / f"{mat_name}.pfm", _take_slice(vol_arr, plane, sl_idx).astype(np.float32))
+					corners = _slice_corners(plane, data_min, data_max, frac=frac)
+					quads.append((corners, mat_name))
+					materials.append((mat_name, png_name))
+				_write_mtl_multi(out / f"{obj_name}.mtl", materials)
+				_write_obj_multi_quad(out / f"{obj_name}.obj", quads)
+
+		# ------ Normal direction slices (nx, ny as RGB normal map) ------
+		nx_arr = data.nx.squeeze().cpu().numpy().astype(np.float32)   # (Z, Y, X) uint8
+		ny_arr = data.ny.squeeze().cpu().numpy().astype(np.float32)   # (Z, Y, X) uint8
+		for plane in slices:
+			obj_name = f"slice_{plane}_normals"
 			print(f"[export_vis] writing {obj_name} (3 positions)", flush=True)
 			quads: list[tuple[np.ndarray, str]] = []
 			materials: list[tuple[str, str]] = []
 			for pos_label, frac in _SLICE_POSITIONS:
 				mat_name = f"{obj_name}_{pos_label}"
 				png_name = f"{mat_name}.png"
-				tex = _slice_texture(data, plane, channel, frac=frac)
-				_write_png(out / png_name, tex)
-				vol_arr = getattr(data, channel).squeeze().cpu().numpy()
-				sl_idx = _slice_index(plane, vol_arr.shape, frac)
-				_write_pfm(out / f"{mat_name}.pfm", _take_slice(vol_arr, plane, sl_idx).astype(np.float32))
+				idx = _slice_index(plane, nx_arr.shape, frac)
+				nx_slc = _take_slice(nx_arr, plane, idx)  # (H, W) 0-255, 128=zero
+				ny_slc = _take_slice(ny_arr, plane, idx)
+				# Decode to [-1, 1]
+				nxf = (nx_slc - 128.0) / 127.0
+				nyf = (ny_slc - 128.0) / 127.0
+				nzf = np.sqrt(np.clip(1.0 - nxf**2 - nyf**2, 0.0, 1.0))
+				# Standard normal map encoding: [0,1] → [0,255]
+				rgb = np.stack([
+					((nxf * 0.5 + 0.5) * 255.0).clip(0, 255).astype(np.uint8),
+					((nyf * 0.5 + 0.5) * 255.0).clip(0, 255).astype(np.uint8),
+					((nzf * 0.5 + 0.5) * 255.0).clip(0, 255).astype(np.uint8),
+				], axis=-1)
+				_write_png(out / png_name, rgb[::-1])
+				_write_pfm(out / f"{mat_name}_nx.pfm", nxf.astype(np.float32))
+				_write_pfm(out / f"{mat_name}_ny.pfm", nyf.astype(np.float32))
 				corners = _slice_corners(plane, data_min, data_max, frac=frac)
 				quads.append((corners, mat_name))
 				materials.append((mat_name, png_name))
 			_write_mtl_multi(out / f"{obj_name}.mtl", materials)
 			_write_obj_multi_quad(out / f"{obj_name}.obj", quads)
 
-	# ------ Normal direction slices (nx, ny as RGB normal map) ------
-	nx_arr = data.nx.squeeze().cpu().numpy().astype(np.float32)   # (Z, Y, X) uint8
-	ny_arr = data.ny.squeeze().cpu().numpy().astype(np.float32)   # (Z, Y, X) uint8
-	for plane in slices:
-		obj_name = f"slice_{plane}_normals"
-		print(f"[export_vis] writing {obj_name} (3 positions)", flush=True)
-		quads: list[tuple[np.ndarray, str]] = []
-		materials: list[tuple[str, str]] = []
-		for pos_label, frac in _SLICE_POSITIONS:
-			mat_name = f"{obj_name}_{pos_label}"
-			png_name = f"{mat_name}.png"
-			idx = _slice_index(plane, nx_arr.shape, frac)
-			nx_slc = _take_slice(nx_arr, plane, idx)  # (H, W) 0-255, 128=zero
-			ny_slc = _take_slice(ny_arr, plane, idx)
-			# Decode to [-1, 1]
-			nxf = (nx_slc - 128.0) / 127.0
-			nyf = (ny_slc - 128.0) / 127.0
-			nzf = np.sqrt(np.clip(1.0 - nxf**2 - nyf**2, 0.0, 1.0))
-			# Standard normal map encoding: [0,1] → [0,255]
-			rgb = np.stack([
-				((nxf * 0.5 + 0.5) * 255.0).clip(0, 255).astype(np.uint8),
-				((nyf * 0.5 + 0.5) * 255.0).clip(0, 255).astype(np.uint8),
-				((nzf * 0.5 + 0.5) * 255.0).clip(0, 255).astype(np.uint8),
-			], axis=-1)
-			_write_png(out / png_name, rgb[::-1])
-			_write_pfm(out / f"{mat_name}_nx.pfm", nxf.astype(np.float32))
-			_write_pfm(out / f"{mat_name}_ny.pfm", nyf.astype(np.float32))
-			corners = _slice_corners(plane, data_min, data_max, frac=frac)
-			quads.append((corners, mat_name))
-			materials.append((mat_name, png_name))
-		_write_mtl_multi(out / f"{obj_name}.mtl", materials)
-		_write_obj_multi_quad(out / f"{obj_name}.obj", quads)
+		# ------ Validity mask slices (grad_mag > 0 as green/red) ------
+		gm_arr = data.grad_mag.squeeze().cpu().numpy()  # (Z, Y, X)
+		for plane in slices:
+			obj_name = f"slice_{plane}_validity"
+			print(f"[export_vis] writing {obj_name} (3 positions)", flush=True)
+			quads: list[tuple[np.ndarray, str]] = []
+			materials: list[tuple[str, str]] = []
+			for pos_label, frac in _SLICE_POSITIONS:
+				mat_name = f"{obj_name}_{pos_label}"
+				png_name = f"{mat_name}.png"
+				idx = _slice_index(plane, gm_arr.shape, frac)
+				slc = _take_slice(gm_arr, plane, idx)  # (H, W)
+				rgb = np.zeros((*slc.shape, 3), dtype=np.uint8)
+				rgb[slc > 0] = [0, 200, 0]      # green = valid
+				rgb[slc == 0] = [200, 0, 0]      # red = invalid
+				_write_png(out / png_name, rgb[::-1])
+				corners = _slice_corners(plane, data_min, data_max, frac=frac)
+				quads.append((corners, mat_name))
+				materials.append((mat_name, png_name))
+			_write_mtl_multi(out / f"{obj_name}.mtl", materials)
+			_write_obj_multi_quad(out / f"{obj_name}.obj", quads)
 
-	# ------ Validity mask slices (grad_mag > 0 as green/red) ------
-	gm_arr = data.grad_mag.squeeze().cpu().numpy()  # (Z, Y, X)
-	for plane in slices:
-		obj_name = f"slice_{plane}_validity"
-		print(f"[export_vis] writing {obj_name} (3 positions)", flush=True)
-		quads: list[tuple[np.ndarray, str]] = []
-		materials: list[tuple[str, str]] = []
-		for pos_label, frac in _SLICE_POSITIONS:
-			mat_name = f"{obj_name}_{pos_label}"
-			png_name = f"{mat_name}.png"
-			idx = _slice_index(plane, gm_arr.shape, frac)
-			slc = _take_slice(gm_arr, plane, idx)  # (H, W)
-			rgb = np.zeros((*slc.shape, 3), dtype=np.uint8)
-			rgb[slc > 0] = [0, 200, 0]      # green = valid
-			rgb[slc == 0] = [200, 0, 0]      # red = invalid
-			_write_png(out / png_name, rgb[::-1])
-			corners = _slice_corners(plane, data_min, data_max, frac=frac)
-			quads.append((corners, mat_name))
-			materials.append((mat_name, png_name))
-		_write_mtl_multi(out / f"{obj_name}.mtl", materials)
-		_write_obj_multi_quad(out / f"{obj_name}.obj", quads)
-
-	# ------ Loss maps ------
+	# ------ Loss maps & stats ------
+	loss_stats = {}
 	if losses:
-		verts_flat = xyz_lr.reshape(-1, 3)
-		faces = _triangulate_grid(D, Hm, Wm)
-		uvs = _mesh_uvs(D, Hm, Wm)
-		verts_flat, faces, uvs = _filter_mesh(verts_flat, faces, vert_valid, uvs)
+		if out is not None:
+			verts_flat_loss = xyz_lr.reshape(-1, 3)
+			faces_loss = _triangulate_grid(D, Hm, Wm)
+			uvs_loss = _mesh_uvs(D, Hm, Wm)
+			verts_flat_loss, faces_loss, uvs_loss = _filter_mesh(
+				verts_flat_loss, faces_loss, vert_valid, uvs_loss)
 
 		for loss_name in losses:
 			print(f"[export_vis] computing loss: {loss_name}", flush=True)
@@ -661,35 +668,56 @@ def export_vis_obj(
 			lm = lms[0].detach().cpu().numpy()  # (D, 1, H', W')
 			mask = masks[0].detach().cpu().numpy()
 
-			# Loss maps may be smaller than mesh grid (e.g. Hm-1, Wm-1 for face-based losses)
-			# Resize all to (D*Hm, Wm) for the texture
-			lm_sq = lm.squeeze(1)  # (D, H', W')
-			mask_sq = mask.squeeze(1)  # (D, H', W')
+			# Collect stats from raw loss map
+			lm_raw = lm.squeeze()
+			mask_raw = mask.squeeze()
+			valid_vals = lm_raw[mask_raw > 0.5]
+			if len(valid_vals) > 0:
+				loss_stats[loss_name] = {
+					"scalar": float(_lv),
+					"avg": float(valid_vals.mean()),
+					"max": float(valid_vals.max()),
+					"n_valid": int(len(valid_vals)),
+				}
+			else:
+				loss_stats[loss_name] = {
+					"scalar": float(_lv),
+					"avg": 0.0,
+					"max": 0.0,
+					"n_valid": 0,
+				}
 
-			# Stack along height for texture: (D*H', W') -> resize to (D*Hm, Wm)
-			lm_stacked = lm_sq.reshape(-1, lm_sq.shape[-1])  # (D*H', W')
-			mask_stacked = mask_sq.reshape(-1, mask_sq.shape[-1])
+			# Visual output
+			if out is not None:
+				# Loss maps may be smaller than mesh grid (e.g. Hm-1, Wm-1 for face-based losses)
+				# Resize all to (D*Hm, Wm) for the texture
+				lm_sq = lm.squeeze(1)  # (D, H', W')
+				mask_sq = mask.squeeze(1)  # (D, H', W')
 
-			# Resize via bilinear to match mesh UV layout
-			tex_h, tex_w = D * Hm, Wm
-			if lm_stacked.shape != (tex_h, tex_w):
-				lm_t = torch.from_numpy(lm_stacked).unsqueeze(0).unsqueeze(0).float()
-				lm_t = torch.nn.functional.interpolate(lm_t, size=(tex_h, tex_w),
-													   mode="bilinear", align_corners=True)
-				lm_stacked = lm_t.squeeze().numpy()
-				mask_t = torch.from_numpy(mask_stacked).unsqueeze(0).unsqueeze(0).float()
-				mask_t = torch.nn.functional.interpolate(mask_t, size=(tex_h, tex_w),
-														 mode="nearest")
-				mask_stacked = mask_t.squeeze().numpy()
+				# Stack along height for texture: (D*H', W') -> resize to (D*Hm, Wm)
+				lm_stacked = lm_sq.reshape(-1, lm_sq.shape[-1])  # (D*H', W')
+				mask_stacked = mask_sq.reshape(-1, mask_sq.shape[-1])
 
-			obj_name = f"loss_{loss_name}"
-			png_name = f"{obj_name}.png"
-			_loss_to_png(out / png_name, lm_stacked, mask_stacked)
-			_write_mtl(out / f"{obj_name}.mtl", obj_name, png_name)
-			_write_obj_mesh(out / f"{obj_name}.obj", verts_flat, faces, uvs, obj_name)
+				# Resize via bilinear to match mesh UV layout
+				tex_h, tex_w = D * Hm, Wm
+				if lm_stacked.shape != (tex_h, tex_w):
+					lm_t = torch.from_numpy(lm_stacked).unsqueeze(0).unsqueeze(0).float()
+					lm_t = torch.nn.functional.interpolate(lm_t, size=(tex_h, tex_w),
+														   mode="bilinear", align_corners=True)
+					lm_stacked = lm_t.squeeze().numpy()
+					mask_t = torch.from_numpy(mask_stacked).unsqueeze(0).unsqueeze(0).float()
+					mask_t = torch.nn.functional.interpolate(mask_t, size=(tex_h, tex_w),
+															 mode="nearest")
+					mask_stacked = mask_t.squeeze().numpy()
+
+				obj_name = f"loss_{loss_name}"
+				png_name = f"{obj_name}.png"
+				_loss_to_png(out / png_name, lm_stacked, mask_stacked)
+				_write_mtl(out / f"{obj_name}.mtl", obj_name, png_name)
+				_write_obj_mesh(out / f"{obj_name}.obj", verts_flat_loss, faces_loss, uvs_loss, obj_name)
 
 	# ------ Winding volume diagnostics ------
-	if data.winding_volume is not None:
+	if data.winding_volume is not None and out is not None:
 		# Winding volume slices (start, center, end in one OBJ per plane)
 		for plane in slices:
 			obj_name = f"slice_{plane}_winding"
@@ -744,7 +772,24 @@ def export_vis_obj(
 		_write_mtl(out / "winding_mask.mtl", "winding_mask", "winding_mask.png")
 		_write_obj_mesh(out / "winding_mask.obj", verts_diag, faces_diag, uvs_diag, "winding_mask")
 
-	print(f"[export_vis] done. Output: {output_dir}", flush=True)
+	# ------ Stats JSON ------
+	if stats_json is not None:
+		stats = {
+			"losses": loss_stats,
+			"mesh": {
+				"D": D,
+				"Hm": Hm,
+				"Wm": Wm,
+				"n_valid_verts": n_valid,
+				"n_total_verts": int(D * Hm * Wm),
+			},
+		}
+		stats_path = Path(stats_json)
+		stats_path.parent.mkdir(parents=True, exist_ok=True)
+		stats_path.write_text(json.dumps(stats, indent=2))
+		print(f"[export_vis] wrote stats to {stats_json}", flush=True)
+
+	print(f"[export_vis] done.", flush=True)
 
 
 if __name__ == "__main__":
@@ -753,7 +798,8 @@ if __name__ == "__main__":
 	parser = argparse.ArgumentParser(description="Export OBJ visualization of a fitted model")
 	parser.add_argument("--model", required=True, help="Path to model.pt checkpoint")
 	parser.add_argument("--input", required=True, help="Path to lasagna normals zarr")
-	parser.add_argument("--output-dir", required=True, help="Output directory for OBJ/MTL/PNG files")
+	parser.add_argument("--output-dir", default=None, help="Output directory for OBJ/MTL/PNG files")
+	parser.add_argument("--stats-json", default=None, help="Write per-loss statistics to this JSON file")
 	parser.add_argument("--slices", nargs="*", default=["xy", "xz", "yz"],
 						choices=["xy", "xz", "yz"], help="Volume slice planes (default: xy xz yz)")
 	parser.add_argument("--channels", nargs="*", default=["cos", "pred_dt"],
@@ -767,6 +813,9 @@ if __name__ == "__main__":
 	parser.add_argument("--device", default="cpu", help="Torch device (default: cpu)")
 	args = parser.parse_args()
 
+	if args.output_dir is None and args.stats_json is None:
+		parser.error("At least one of --output-dir or --stats-json must be given")
+
 	export_vis_obj(
 		model_path=args.model,
 		data_path=args.input,
@@ -777,5 +826,6 @@ if __name__ == "__main__":
 		include_mesh=not args.no_mesh,
 		include_connections=not args.no_connections,
 		winding_volume_path=args.winding_volume,
+		stats_json=args.stats_json,
 		device=args.device,
 	)
