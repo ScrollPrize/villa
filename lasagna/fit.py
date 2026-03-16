@@ -162,6 +162,9 @@ def main(argv: list[str] | None = None) -> int:
 	fit_config = copy.deepcopy(cfg)
 	cli_json.apply_defaults_from_cfg_args(parser, cfg)
 	args = parser.parse_args(argv_rest or [])
+	# Merge final parsed args into fit_config so checkpoint has all values
+	fit_config.setdefault("args", {}).update(
+		{k.replace("_", "-"): v for k, v in vars(args).items()})
 
 	data_cfg = cli_data.from_args(args)
 	model_cfg = cli_model.from_args(args)
