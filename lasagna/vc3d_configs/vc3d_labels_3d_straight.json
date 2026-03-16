@@ -47,29 +47,14 @@
 				"winding_offset_autocrop": true
 			}
 		},
-        {
-          "name": "winding2",
-          "steps": 5000,
-          "lr": [0.1, 0.01, 0.001, 0.0001],
-          "params": ["mesh_ms", "conn_offset_ms"],
-          "w_fac": {
-            "winding_vol": 0.2,
-            "pred_dt": 0.0,
-            "normal": 0.0,
-            "smooth": 0.01,
-            "step": 0.2
-            }
-          },
 		{
 			"name": "predt",
-			"steps": 5000,
-			"lr": [0.1, 0.01, 0.001, 0.0001],
+			"steps": 500,
+			"lr": [1.0, 0.1, 0.01, 0.001],
 			"w_fac": {
-              "winding_vol": 0.2,
-              "pred_dt": 0.1,
+              "winding_vol": 0.1,
               "normal": 0.0,
-              "smooth": 0.01,
-              "step": 0.2
+              "smooth": 0.1
               },
 			"params": ["mesh_ms", "conn_offset_ms"]
 		}
