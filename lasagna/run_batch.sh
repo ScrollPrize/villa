@@ -23,8 +23,8 @@
 set -euo pipefail
 
 # --- Configuration -----------------------------------------------------------
-MAX_JOBS=16
-OMP_THREADS=2          # threads per vc_ngrids/vc_gen_normalgrids call
+MAX_JOBS=24
+OMP_THREADS=1          # threads per vc_ngrids/vc_gen_normalgrids call
 SRC="${SRC:-$(cd "$(dirname "$0")/.." && pwd)}"
 
 # --- Args ---------------------------------------------------------------------
@@ -90,7 +90,8 @@ run_sample() {
         --model-output "${outdir}/fit_output/model.pt" \
         --winding-volume "${outdir}/winding.zarr" \
         --normal-mask-zero 1 \
-        --erode-valid-mask 1 \
+        --erode-valid-mask 4 \
+        --no-pyramid-d \
         > "${logdir}/fit.log" 2>&1 || {
             echo "[${label}] FAILED at fit"; return 1
         }
@@ -103,6 +104,7 @@ run_sample() {
         --output-dir "${outdir}/vis" \
         --stats-json "${outdir}/stats.json" \
         --winding-volume "${outdir}/winding.zarr" \
+        --erode-valid-mask 4 \
         > "${logdir}/analyze.log" 2>&1 || {
             echo "[${label}] FAILED at analyze"; return 1
         }
