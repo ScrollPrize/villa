@@ -11,13 +11,12 @@ import click
 import cv2
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dataset import DatasetConfig, IndexedInkCropDataset, build_train_augmentations
-from model import PCAEmbedder, InkPatchEmbedder, create_backbone_with_mode, normalize_for_backbone
+from model import InkPatchEmbedder, build_embedder_from_config, load_adapted_model, normalize_for_backbone
 
 
 def seed_everything(seed: int) -> None:
@@ -32,59 +31,6 @@ def worker_init_fn(worker_id: int) -> None:
     random.seed(worker_seed + worker_id)
     np.random.seed(worker_seed + worker_id)
 
-
-def resolve_checkpoint_config(checkpoint_path: Path) -> tuple[Path, dict[str, Any]]:
-    checkpoint_path = checkpoint_path.resolve()
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    config = checkpoint.get("config") if isinstance(checkpoint, dict) else None
-    if isinstance(config, dict):
-        return checkpoint_path, config
-
-    config_path = checkpoint_path.parent / "config.json"
-    if not config_path.exists():
-        raise ValueError(f"Could not find config in checkpoint or at {config_path}")
-    with config_path.open("r", encoding="utf-8") as handle:
-        return checkpoint_path, json.load(handle)
-
-
-def load_adapted_model(checkpoint_path: Path, device: torch.device) -> tuple[InkPatchEmbedder, dict[str, Any]]:
-    checkpoint_path, config = resolve_checkpoint_config(checkpoint_path)
-    backbone_name = str(config["backbone_name"])
-    backbone_checkpoint = config.get("backbone_checkpoint")
-    crop_size = int(config["crop_size"])
-    embedding_dim = int(config["embedding_dim"])
-    checkpoint_method = str(config.get("adaptation_method", "trained"))
-    hidden_dim = int(config.get("hidden_dim", embedding_dim))
-    dropout = float(config.get("dropout", 0.0 if checkpoint_method == "pca" else 0.1))
-    freeze_backbone = bool(config.get("freeze_backbone", True))
-
-    backbone_ckpt_path = Path(backbone_checkpoint) if backbone_checkpoint else None
-    backbone, backbone_dim = create_backbone_with_mode(
-        backbone_name,
-        backbone_ckpt_path,
-        crop_size,
-        device,
-        freeze_backbone=freeze_backbone,
-    )
-    if checkpoint_method == "pca":
-        head = PCAEmbedder(backbone_dim, embedding_dim)
-        model = InkPatchEmbedder(backbone, backbone_dim, embedding_dim, embedding_dim, 0.0, head=head).to(device)
-    else:
-        model = InkPatchEmbedder(backbone, backbone_dim, embedding_dim, hidden_dim, dropout).to(device)
-
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    head_state = checkpoint.get("model") if isinstance(checkpoint, dict) else None
-    if not isinstance(head_state, dict):
-        raise ValueError(f"Checkpoint {checkpoint_path} does not contain a saved model state")
-    if freeze_backbone:
-        missing, unexpected = model.head.load_state_dict(head_state, strict=True)
-    else:
-        missing, unexpected = model.load_state_dict(head_state, strict=True)
-    if missing or unexpected:
-        raise ValueError(f"Unexpected head state mismatch: missing={missing}, unexpected={unexpected}")
-
-    model.eval()
-    return model, config
 
 def make_plain_config(
     image_dir: Path,
@@ -119,32 +65,7 @@ def build_plain_model(
     config: dict[str, Any],
     device: torch.device,
 ) -> tuple[InkPatchEmbedder, dict[str, Any]]:
-    backbone_checkpoint = config.get("backbone_checkpoint")
-    freeze_backbone = bool(config.get("freeze_backbone", True))
-    backbone_ckpt_path = Path(backbone_checkpoint) if backbone_checkpoint else None
-    backbone, backbone_dim = create_backbone_with_mode(
-        str(config["backbone_name"]),
-        backbone_ckpt_path,
-        int(config["crop_size"]),
-        device,
-        freeze_backbone=freeze_backbone,
-    )
-    model = InkPatchEmbedder(
-        backbone=backbone,
-        backbone_dim=backbone_dim,
-        embedding_dim=backbone_dim,
-        hidden_dim=backbone_dim,
-        dropout=0.0,
-        head=nn.Identity(),
-    ).to(device)
-    model.eval()
-    config = {
-        **config,
-        "embedding_dim": backbone_dim,
-        "hidden_dim": backbone_dim,
-        "dropout": 0.0,
-    }
-    return model, config
+    return build_embedder_from_config(config, device=device)
 
 
 def build_dataset(image_dir: Path, split: str, samples: int, config: dict[str, Any], seed: int | None) -> IndexedInkCropDataset:
