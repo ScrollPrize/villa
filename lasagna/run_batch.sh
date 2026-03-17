@@ -23,7 +23,7 @@
 set -euo pipefail
 
 # --- Configuration -----------------------------------------------------------
-MAX_JOBS=24
+MAX_JOBS=4
 OMP_THREADS=1          # threads per vc_ngrids/vc_gen_normalgrids call
 SRC="${SRC:-$(cd "$(dirname "$0")/.." && pwd)}"
 
@@ -57,10 +57,35 @@ run_sample() {
     local logdir="${outdir}/logs"
     mkdir -p "$logdir" "${outdir}/work"
 
+    # Skip logic: two-tier
+    if [[ -f "${outdir}/fitted_tif/winding.tif" ]]; then
+        echo "[${label}] already complete (fit_data done), skipping."
+        return 0
+    fi
+
+    if [[ -f "${outdir}/stats.json" ]]; then
+        echo "[${label}] steps 1-4 done, running fit_data only..."
+        # Jump straight to step 5
+        echo "[${label}] Step 5/5: fit_data"
+        python "${SRC}/lasagna/lasagna_fit_data.py" \
+            --model "${outdir}/fit_output/model_final.pt" \
+            --input "${outdir}/normals.zarr" \
+            --output "${outdir}/fitted.zarr" \
+            --tif-output "${outdir}/fitted_tif" \
+            --normal-vis-dir "${outdir}/normal_vis" \
+            --labels "$input_tif" \
+            --stats-json "${outdir}/fit_data_stats.json" \
+            > "${logdir}/fit_data.log" 2>&1 || {
+                echo "[${label}] FAILED at fit_data"; return 1
+            }
+        echo "[${label}] Done."
+        return 0
+    fi
+
     echo "[${label}] Starting pipeline..."
 
     # Step 1: prep1 — labels_to_winding_volume
-    echo "[${label}] Step 1/4: winding volume"
+    echo "[${label}] Step 1/5: winding volume"
     python "${SRC}/lasagna/labels_to_winding_volume.py" \
         --input "$input_tif" \
         --output "${outdir}/winding.zarr" \
@@ -69,7 +94,7 @@ run_sample() {
         }
 
     # Step 2: prep2 — labels_to_lasagna_normals
-    echo "[${label}] Step 2/4: lasagna normals"
+    echo "[${label}] Step 2/5: lasagna normals"
     python "${SRC}/lasagna/labels_to_lasagna_normals.py" \
         --input "$input_tif" \
         --work-dir "${outdir}/work" \
@@ -79,7 +104,7 @@ run_sample() {
         }
 
     # Step 3: fit
-    echo "[${label}] Step 3/4: fit"
+    echo "[${label}] Step 3/5: fit"
     python "${SRC}/lasagna/fit.py" \
         "${SRC}/lasagna/vc3d_configs/vc3d_labels_3d_straight.json" \
         --input "${outdir}/normals.zarr" \
@@ -97,7 +122,7 @@ run_sample() {
         }
 
     # Step 4: analyze (vis + stats)
-    echo "[${label}] Step 4/4: analyze"
+    echo "[${label}] Step 4/5: analyze"
     python "${SRC}/lasagna/lasagna_analyze.py" \
         --model "${outdir}/fit_output/model.pt" \
         --input "${outdir}/normals.zarr" \
@@ -107,6 +132,20 @@ run_sample() {
         --erode-valid-mask 4 \
         > "${logdir}/analyze.log" 2>&1 || {
             echo "[${label}] FAILED at analyze"; return 1
+        }
+
+    # Step 5: fit_data — dense volumes + TIFs + normal vis
+    echo "[${label}] Step 5/5: fit_data"
+    python "${SRC}/lasagna/lasagna_fit_data.py" \
+        --model "${outdir}/fit_output/model_final.pt" \
+        --input "${outdir}/normals.zarr" \
+        --output "${outdir}/fitted.zarr" \
+        --tif-output "${outdir}/fitted_tif" \
+        --normal-vis-dir "${outdir}/normal_vis" \
+        --labels "$input_tif" \
+        --stats-json "${outdir}/fit_data_stats.json" \
+        > "${logdir}/fit_data.log" 2>&1 || {
+            echo "[${label}] FAILED at fit_data"; return 1
         }
 
     echo "[${label}] Done."

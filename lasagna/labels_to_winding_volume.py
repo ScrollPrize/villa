@@ -233,15 +233,21 @@ def main(argv: list[str] | None = None) -> int:
         del cc_labels
     del fg
 
-    # -- Pass 1: distance transforms for nearest CC + pairwise distances ----
+    # -- Compute all complement DTs once --------------------------------------
+    print(f"{TAG} computing {N} distance transforms", flush=True)
+    dt_all: list[np.ndarray] = []
+    for i in range(N):
+        cc_id = i + 1
+        print(f"{TAG} DT {i+1}/{N} (cc_id={cc_id})", flush=True)
+        dt_all.append(distance_transform_edt(skel != cc_id).astype(np.float32))
+
+    # -- Nearest CC + pairwise distances (using cached DTs) -----------------
     dist_1 = np.full(shape, np.inf, dtype=np.float32)  # nearest CC distance
     idx_1 = np.zeros(shape, dtype=np.int32)             # CC index of nearest (0-based)
     avg_dist = np.zeros((N, N), dtype=np.float64)       # pairwise avg distances
 
     for i in range(N):
-        cc_id = i + 1  # 1-indexed CC label
-        print(f"{TAG} DT pass 1: {i+1}/{N} (cc_id={cc_id})", flush=True)
-        dt_i = distance_transform_edt(skel != cc_id).astype(np.float32)
+        dt_i = dt_all[i]
 
         # Accumulate pairwise average distances
         for j in range(N):
@@ -257,9 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         dist_1[closer] = dt_i[closer]
         idx_1[closer] = i
 
-        del dt_i
-
-    print(f"{TAG} pass 1 complete", flush=True)
+    print(f"{TAG} nearest CC + pairwise distances complete", flush=True)
 
     # -- Greedy chain winding assignment ------------------------------------
     # total_avg[i] = mean distance from CC i to all other CCs
@@ -300,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{TAG} winding chain: {chain}", flush=True)
     print(f"{TAG} winding_map: {winding_map_dict}", flush=True)
 
-    # -- Pass 2: chain-adjacent distances + dot-product side detection ------
+    # -- Chain-adjacent distances + dot-product side detection (using cached DTs)
     prev_in_chain = np.full(N, -1, dtype=np.int32)
     next_in_chain = np.full(N, -1, dtype=np.int32)
     for k in range(N):
@@ -316,27 +320,18 @@ def main(argv: list[str] | None = None) -> int:
     dist_next = np.full(shape, np.inf, dtype=np.float32)
     dot_prev = np.zeros(shape, dtype=np.float32)
 
-    dt_cache = {}
-
-    def _get_dt(cc_0idx):
-        if cc_0idx not in dt_cache:
-            dt_cache[cc_0idx] = distance_transform_edt(
-                skel != (cc_0idx + 1)).astype(np.float32)
-        return dt_cache[cc_0idx]
-
     for k in range(N):
         cc_idx = chain[k]
         is_nearest = (idx_1 == cc_idx)
         if not np.any(is_nearest):
             continue
-        print(f"{TAG} DT pass 2: chain[{k}]={cc_idx}", flush=True)
 
-        dt_near = _get_dt(cc_idx)
+        dt_near = dt_all[cc_idx]
 
         # Prev: distance + dot product of gradients
         if k > 0:
             prev_idx = chain[k - 1]
-            dt_prev_cc = _get_dt(prev_idx)
+            dt_prev_cc = dt_all[prev_idx]
             dist_prev[is_nearest] = dt_prev_cc[is_nearest]
 
             for ax in range(3):
@@ -348,24 +343,14 @@ def main(argv: list[str] | None = None) -> int:
         # Next: distance only
         if k < N - 1:
             next_idx = chain[k + 1]
-            dt_next_cc = _get_dt(next_idx)
-            dist_next[is_nearest] = dt_next_cc[is_nearest]
+            dist_next[is_nearest] = dt_all[next_idx][is_nearest]
 
-        # Evict DTs no longer needed
-        if k >= 1 and chain[k - 1] in dt_cache:
-            del dt_cache[chain[k - 1]]
-
-    del dt_cache
-
-    print(f"{TAG} pass 2 complete", flush=True)
+    print(f"{TAG} chain-adjacent distances complete", flush=True)
 
     # -- Envelope mask (mark exterior voxels) -------------------------------
-    first_cc_id = chain[0] + 1   # 1-indexed CC label
-    last_cc_id = chain[-1] + 1
-    print(f"{TAG} computing envelope mask (first_cc={first_cc_id}, last_cc={last_cc_id})", flush=True)
-
-    dt_first = distance_transform_edt(skel != first_cc_id).astype(np.float32)
-    dt_last = distance_transform_edt(skel != last_cc_id).astype(np.float32)
+    dt_first = dt_all[chain[0]]
+    dt_last = dt_all[chain[-1]]
+    print(f"{TAG} computing envelope mask (first_cc={chain[0]+1}, last_cc={chain[-1]+1})", flush=True)
 
     # Dot product of gradients, one axis at a time to limit memory
     dot = np.zeros(shape, dtype=np.float32)
@@ -377,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Classify outside voxels: closer to last CC = "above" (higher winding)
     is_above_center = dt_first > dt_last
-    del dt_first, dt_last
+    del dt_all
 
     outside_mask = (dot > 0) & (skel == 0)  # never zero out skeleton voxels
     del dot, skel
