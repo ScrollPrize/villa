@@ -1,6 +1,7 @@
 import json
 import math
 import os
+from copy import deepcopy
 import wandb
 import numpy as np 
 import random
@@ -18,6 +19,8 @@ from vesuvius.models.training.loss.nnunet_losses import LabelSmoothedDCAndBCELos
 from vesuvius.neural_tracing.nets.models import make_model
 from common import save_val_preview_tif, to_uint8_image, to_uint8_label, to_uint8_probability
 from flat_ink_dataset import FlatInkDataset
+from stitching import resolve_model_and_loader_patch_sizes, run_stitched_model_forward
+
 
 
 @click.command()
@@ -27,10 +30,19 @@ def train(config_path):
         config = json.load(f)
 
     config.setdefault('volume_auth_json', None)
-    model_crop_size, loader_patch_size, stitch_factor = resolve_model_and_loader_patch_sizes(config)
+    requested_stitch_factor = int(config.get('stitch_factor', 1))
+    use_stitched_forward = bool(
+        config.get('use_stitched_forward', requested_stitch_factor > 1)
+    )
+    model_crop_size = tuple(config['patch_size'])
+    loader_patch_size = model_crop_size
+    stitch_factor = 1
+    if use_stitched_forward:
+        model_crop_size, loader_patch_size, stitch_factor = resolve_model_and_loader_patch_sizes(config)
     config['crop_size'] = list(model_crop_size)
     config['patch_size'] = list(model_crop_size)
     config['stitch_factor'] = stitch_factor
+    config['use_stitched_forward'] = use_stitched_forward
     config['targets']['ink']['out_channels'] = 1
     config['targets']['ink']['activation'] = 'none'
     learning_rate = config.get('learning_rate', 0.01)
@@ -71,8 +83,11 @@ def train(config_path):
 
     set_seed(config['seed'])
 
-    shared_ds = FlatInkDataset(config, do_augmentations=False)
-    train_ds = FlatInkDataset(config, do_augmentations=True, patches=shared_ds.patches)
+    dataset_config = deepcopy(config)
+    dataset_config['patch_size'] = list(loader_patch_size)
+
+    shared_ds = FlatInkDataset(dataset_config, do_augmentations=False)
+    train_ds = FlatInkDataset(dataset_config, do_augmentations=True, patches=shared_ds.patches)
     val_ds = shared_ds
 
     num_patches = len(train_ds)
@@ -158,6 +173,11 @@ def train(config_path):
     )
     latest_val_loss = None
 
+    def forward_ink(image):
+        if use_stitched_forward:
+            return run_stitched_model_forward(model, image, model_crop_size)['ink']
+        return model(image)['ink']
+
     def append_preview_tiles(preview_inputs, preview_labels, preview_probabilities, batch, preds, targets, ignore_mask):
         input_mid_slice = batch['image'].float()[:, :, batch['image'].shape[2] // 2]
         if input_mid_slice.shape[-2:] != preds.shape[-2:]:
@@ -215,7 +235,7 @@ def train(config_path):
 
         with accelerator.accumulate(model):
             with accelerator.autocast():
-                preds = model(batch['image'])['ink']
+                preds = forward_ink(batch['image'])
             targets = (torch.amax(batch['inklabels'].float(), dim=2) > 0).float()
             supervision_mask = torch.amax(batch['supervision_mask'].float(), dim=2)
             ignore_mask = (supervision_mask <= 0).float()
@@ -276,7 +296,7 @@ def train(config_path):
                 for val_batch_idx in range(num_val_batches):
                     val_batch = next(val_iterator)
                     with accelerator.autocast():
-                        val_preds = model(val_batch['image'])['ink']
+                        val_preds = forward_ink(val_batch['image'])
                     val_targets = torch.amax(val_batch['inklabels'].float(), dim=2)
                     val_supervision_mask = torch.amax(val_batch['supervision_mask'].float(), dim=2)
                     val_targets = (val_targets > 0).float()
