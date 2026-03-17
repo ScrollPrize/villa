@@ -1,6 +1,7 @@
 import json
 import math
 import os
+from copy import deepcopy
 import wandb
 import numpy as np 
 import random
@@ -18,6 +19,8 @@ from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
 from vesuvius.neural_tracing.nets.models import make_model
 from common import save_val_preview_tif, to_uint8_image, to_uint8_label, to_uint8_probability
 from flat_ink_dataset import FlatInkDataset
+from stitching import resolve_model_and_loader_patch_sizes, run_stitched_model_forward
+
 
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
@@ -26,7 +29,10 @@ def train(config_path):
         config = json.load(f)
 
     config.setdefault('volume_auth_json', None)
-    config['crop_size'] = config['patch_size']
+    model_crop_size, loader_patch_size, stitch_factor = resolve_model_and_loader_patch_sizes(config)
+    config['crop_size'] = list(model_crop_size)
+    config['patch_size'] = list(model_crop_size)
+    config['stitch_factor'] = stitch_factor
     config['targets']['ink']['out_channels'] = 1
     config['targets']['ink']['activation'] = 'none'
     learning_rate = config.get('learning_rate', 0.01)
@@ -67,8 +73,11 @@ def train(config_path):
 
         wandb.init(**wandb_kwargs)
 
-    shared_ds = FlatInkDataset(config, do_augmentations=False)
-    train_ds = FlatInkDataset(config, do_augmentations=True, patches=shared_ds.patches)
+    dataset_config = deepcopy(config)
+    dataset_config['patch_size'] = list(loader_patch_size)
+
+    shared_ds = FlatInkDataset(dataset_config, do_augmentations=False)
+    train_ds = FlatInkDataset(dataset_config, do_augmentations=True, patches=shared_ds.patches)
     val_ds = shared_ds
 
     num_patches = len(train_ds)
@@ -208,7 +217,7 @@ def train(config_path):
 
         with accelerator.accumulate(model):
             with accelerator.autocast():
-                preds = model(batch['image'])['ink']
+                preds = run_stitched_model_forward(model, batch['image'], model_crop_size)['ink']
             targets = (torch.amax(batch['inklabels'].float(), dim=2) > 0).float()
             supervision_mask = torch.amax(batch['supervision_mask'].float(), dim=2)
             ignore_mask = (supervision_mask <= 0).float()
@@ -269,7 +278,7 @@ def train(config_path):
                 for val_batch_idx in range(num_val_batches):
                     val_batch = next(val_iterator)
                     with accelerator.autocast():
-                        val_preds = model(val_batch['image'])['ink']
+                        val_preds = run_stitched_model_forward(model, val_batch['image'], model_crop_size)['ink']
                     val_targets = torch.amax(val_batch['inklabels'].float(), dim=2)
                     val_supervision_mask = torch.amax(val_batch['supervision_mask'].float(), dim=2)
                     val_targets = (val_targets > 0).float()
