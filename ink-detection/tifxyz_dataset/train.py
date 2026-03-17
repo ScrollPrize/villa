@@ -15,10 +15,10 @@ import click
 from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
-from vesuvius.models.training.loss.nnunet_losses import LabelSmoothedDCAndBCELoss
 from vesuvius.neural_tracing.nets.models import make_model
 from common import save_val_preview_tif, to_uint8_image, to_uint8_label, to_uint8_probability
 from flat_ink_dataset import FlatInkDataset
+from losses import create_loss_from_config
 from stitching import resolve_model_and_loader_patch_sizes, run_stitched_model_forward
 
 
@@ -145,16 +145,7 @@ def train(config_path):
 
     model.apply(InitWeights_He(neg_slope=0.2))
 
-    loss = LabelSmoothedDCAndBCELoss(
-        bce_kwargs={},
-        soft_dice_kwargs={
-            'label_smoothing': float(config.get('dice_label_smoothing', 0.0)),
-        },
-        weight_dice=0.25,
-        weight_ce=1.0,
-        use_ignore_label=True,
-        bce_label_smoothing=float(config.get('bce_label_smoothing', 0.0)),
-    )
+    loss = create_loss_from_config(config)
 
     model, optimizer, train_dl, val_dl, lr_scheduler = accelerator.prepare(
             model, optimizer, train_dl, val_dl, lr_scheduler
@@ -211,7 +202,7 @@ def train(config_path):
             preview_labels.append(to_uint8_label(label_tile, ignore_mask_tile))
             preview_probabilities.append(to_uint8_probability(probability_tile))
 
-    def refresh_progress_bar(current_train_loss, overflow_step_skipped):
+    def refresh_progress_bar(current_train_loss):
         if not accelerator.is_main_process:
             return
 
@@ -255,7 +246,7 @@ def train(config_path):
 
         train_loss = l.item()
         if accelerator.is_main_process:
-            refresh_progress_bar(train_loss, overflow_step_skipped)
+            refresh_progress_bar(train_loss)
             if overflow_step_skipped:
                 tqdm.write(f'step {step} | optimizer step skipped due to fp16 overflow')
 
@@ -266,6 +257,9 @@ def train(config_path):
                 'train/overflow_step_skipped': int(overflow_step_skipped),
                 'step': step,
             }
+            latest_loss_metrics = getattr(loss, 'latest_metrics', None)
+            if isinstance(latest_loss_metrics, dict):
+                log_dict.update(latest_loss_metrics)
             if wandb.run is not None:
                 wandb.log(log_dict, step=step)
 
@@ -319,7 +313,7 @@ def train(config_path):
             mean_val_loss = np.mean(val_losses)
             if accelerator.is_main_process:
                 latest_val_loss = float(mean_val_loss)
-                refresh_progress_bar(train_loss, overflow_step_skipped)
+                refresh_progress_bar(train_loss)
                 save_val_preview_tif(
                     os.path.join(train_preview_dir, f'train_preview_{step:06}.tif'),
                     train_preview_inputs,
