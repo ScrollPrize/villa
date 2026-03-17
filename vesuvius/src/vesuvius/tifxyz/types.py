@@ -964,6 +964,7 @@ class Tifxyz:
             interp_method=self.interp_method,
             resolution=self.resolution,
             volume=new_volume,
+            _labels=self.list_labels(),
         )
 
     def _get_volume_level(self, factor: float) -> Optional["zarr.Array"]:

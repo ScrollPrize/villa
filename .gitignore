@@ -36,3 +36,5 @@ vesuvius/AGENTS.md
 /vesuvius/src/vesuvius/neural_tracing/tests/test_band_filtering
 ink-detection/tifxyz_dataset/example_creds.json
 ink-detection/tifxyz_dataset/example_config_flat.json
+/ink-detection/scratch
+ink-detection/scratch/config.json

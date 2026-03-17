@@ -2,8 +2,8 @@
     "volume_auth_json": "tifxyz_dataset/example_creds.json",
 
     "patch_size": [512, 512, 512],
+    "fg_distance": [8, 8],
     "bg_distance": [8, 8],
-    "label_distance": [8, 8],
     "bg_dilate_distance": 192,
     "normal_sample_step": 1.0,
     

@@ -1,5 +1,6 @@
 import aiohttp
 import json
+import warnings
 from pathlib import Path
 
 import fsspec
@@ -146,6 +147,48 @@ def _normalize_vectors_last_axis(vectors, eps=1e-6):
     out[good_mask] = vectors[good_mask] / norms[good_mask]
     return out, good_mask
 
+
+def _reconcile_label_mask_shape(
+    mask,
+    expected_shape,
+    *,
+    segment_uuid,
+    label_name,
+    max_axis_mismatch=1,
+):
+    expected_shape = tuple(int(v) for v in expected_shape)
+    actual_shape = tuple(int(v) for v in mask.shape[:2])
+    if actual_shape == expected_shape:
+        return mask
+
+    axis_mismatches = tuple(
+        int(actual - expected)
+        for actual, expected in zip(actual_shape, expected_shape)
+    )
+    if any(abs(mismatch) > int(max_axis_mismatch) for mismatch in axis_mismatches):
+        raise AssertionError(
+            f"Segment {segment_uuid!r} {label_name} label shape {actual_shape} does not match "
+            f"tifxyz full-resolution shape {expected_shape}."
+        )
+
+    row_extent = min(actual_shape[0], expected_shape[0])
+    col_extent = min(actual_shape[1], expected_shape[1])
+    mask = np.asarray(mask[:row_extent, :col_extent])
+
+    pad_rows = expected_shape[0] - row_extent
+    pad_cols = expected_shape[1] - col_extent
+    if pad_rows > 0 or pad_cols > 0:
+        pad_width = [(0, pad_rows), (0, pad_cols)]
+        pad_width.extend([(0, 0)] * max(0, mask.ndim - 2))
+        mask = np.pad(mask, pad_width, mode="constant", constant_values=0)
+
+    warnings.warn(
+        f"Segment {segment_uuid!r} {label_name} label shape {actual_shape} adjusted to "
+        f"{expected_shape} to absorb a <=1 pixel edge mismatch.",
+        stacklevel=2,
+    )
+    return mask
+
 def load_segment_label_masks(segment, shape):
     import cv2
 
@@ -161,10 +204,11 @@ def load_segment_label_masks(segment, shape):
                 mask = cv2.cvtColor(mask, cv2.COLOR_BGRA2GRAY)
             else:
                 mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
-        actual_shape = tuple(int(v) for v in mask.shape)
-        assert actual_shape == shape, (
-            f"Segment {segment_uuid!r} {label_name} label shape {actual_shape} does not match "
-            f"tifxyz grid shape {shape}."
+        mask = _reconcile_label_mask_shape(
+            mask,
+            shape,
+            segment_uuid=segment_uuid,
+            label_name=label_name,
         )
         return np.asarray(mask > 0, dtype=bool)
 
@@ -192,7 +236,7 @@ def _get_labels_and_mask(dataset, segment):
     if cached is not None:
         return cached
 
-    shape = tuple(int(v) for v in dataset._get_segment_stored_grid(segment)["shape"])
+    shape = tuple(int(v) for v in segment.full_resolution_shape)
     ink_mask, supervision_mask, _ = load_segment_label_masks(segment, shape)
     out = (ink_mask, supervision_mask)
     dataset._segment_labels_and_mask_cache[segment_uuid] = out
@@ -314,7 +358,7 @@ def _sample_patch_supervision_grid(
     normals_zyx, normals_nonzero = _normalize_vectors_last_axis(normals_zyx)
     normals_valid &= normals_nonzero
 
-    class_codes = np.full(query_y.shape, 100, dtype=np.uint8)
+    class_codes = np.full(query_y_global.shape, 100, dtype=np.uint8)
     ink_mask_full, supervision_mask_full = _get_labels_and_mask(dataset, segment)
     if ink_mask_full.size > 0:
         full_h, full_w = ink_mask_full.shape

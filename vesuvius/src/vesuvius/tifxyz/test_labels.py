@@ -106,6 +106,20 @@ def test_load_label_uses_stored_shape_even_in_full_resolution_mode(tmp_path: Pat
         segment.load_label("surface")
 
 
+def test_retarget_preserves_discovered_labels(tmp_path: Path) -> None:
+    segment_dir = _write_segment(tmp_path / "segment", (6, 7))
+    _write_label(segment_dir / "foo_inklabels.png", np.ones((6, 7), dtype=np.uint8))
+    _write_label(segment_dir / "foo_supervision_mask.png", np.ones((6, 7), dtype=np.uint8))
+
+    segment = read_tifxyz(segment_dir)
+    retargeted = segment.retarget(2.0)
+
+    assert [label["filename"] for label in retargeted.list_labels()] == [
+        "foo_inklabels.png",
+        "foo_supervision_mask.png",
+    ]
+
+
 def test_load_label_rejects_non_grayscale(tmp_path: Path) -> None:
     segment_dir = _write_segment(tmp_path / "segment", (5, 6))
     rgb = np.zeros((5, 6, 3), dtype=np.uint8)

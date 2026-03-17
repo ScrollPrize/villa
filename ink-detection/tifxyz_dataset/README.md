@@ -33,7 +33,8 @@ for a given dataset idx , we generate the training data like so:
 - on the chosen tifxyz segment points which fall within the `world_bbox` , we upsample them to obtain a dense grid
 - continuing to operate on 2d points within the `world_bbox` , we compute an EDT on the labeled voxels, and any voxels within `bg_dilate_distance` that do not contain the label are set to value 100 
 - we project the bg label of 100 along the segmentations surface normals, up to `bg_distance`, setting any voxels it intersects to 0
-- we project the ink label of value 1 along the segmentations surface normals, up to `label_distance`, setting any intersecting voxels to value 1
+- we project the ink label of value 1 along the segmentations surface normals, up to `fg_distance`, setting any intersecting voxels to value 1
+- `fg_distance` defaults to `10`; if `bg_distance` is omitted, it reuses `fg_distance`
 - any untouched voxels remain the ignore value (2)
 
 ___
