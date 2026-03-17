@@ -152,7 +152,8 @@ def train(config_path):
         )
 
     train_iterator = iter(train_dl)
-    val_every = config.get('val_every', 500)
+    val_every = int(config.get('val_every', 500))
+    save_every = int(config.get('save_every', val_every))
     log_every = config.get('log_every', 1)
     val_preview_batches = config.get('val_preview_batches', 3)
 
@@ -326,16 +327,18 @@ def train(config_path):
                     val_preview_labels,
                     val_preview_probabilities,
                 )
-                torch.save({
-                        'model': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'config': config,
-                        'step': step,
-                        'wandb_run_id': wandb.run.id if wandb.run is not None else config.get('wandb_run_id'),
-                    }, f'{out_dir}/ckpt_{step:06}.pth')
                 if wandb.run is not None:
                     wandb.log({'val/loss': mean_val_loss}, step=step)
+
+        if accelerator.is_main_process and step % save_every == 0 and step > 0:
+            torch.save({
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
+                    'config': config,
+                    'step': step,
+                    'wandb_run_id': wandb.run.id if wandb.run is not None else config.get('wandb_run_id'),
+                }, f'{out_dir}/ckpt_{step:06}.pth')
 
 if __name__ == '__main__':
     train()
