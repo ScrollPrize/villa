@@ -16,18 +16,6 @@ from vesuvius.models.augmentation.pipelines.training_transforms import create_tr
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
 
 class TifxyzInkDataset(Dataset):
-    @staticmethod
-    def _parse_distance_config(value, *, key):
-        if value is None:
-            raise ValueError(f"{key} must not be None")
-        if np.isscalar(value):
-            distance = float(value)
-            return (distance, distance)
-
-        if len(value) != 2:
-            raise ValueError(f"{key} must be a number or a length-2 sequence, got {value!r}")
-        return (float(value[0]), float(value[1]))
-
     def __init__(
         self,
         config,
@@ -40,15 +28,26 @@ class TifxyzInkDataset(Dataset):
         self.patch_size_zyx = _normalize_patch_size_zyx(self.patch_size)  
         
         fg_distance_value = config.get("fg_distance", config.get("label_distance", 10))
-        self.fg_distance = self._parse_distance_config(
-            fg_distance_value,
-            key="fg_distance",
+        if fg_distance_value is None:
+            raise ValueError("fg_distance must not be None")
+        self.fg_distance = (
+            (float(fg_distance_value), float(fg_distance_value))
+            if np.isscalar(fg_distance_value)
+            else tuple(float(v) for v in fg_distance_value)
         )
+        if len(self.fg_distance) != 2:
+            raise ValueError(f"fg_distance must be a number or a length-2 sequence, got {fg_distance_value!r}")
+
         bg_distance_value = config.get("bg_distance", self.fg_distance)
-        self.bg_distance = self._parse_distance_config(
-            bg_distance_value,
-            key="bg_distance",
+        if bg_distance_value is None:
+            raise ValueError("bg_distance must not be None")
+        self.bg_distance = (
+            (float(bg_distance_value), float(bg_distance_value))
+            if np.isscalar(bg_distance_value)
+            else tuple(float(v) for v in bg_distance_value)
         )
+        if len(self.bg_distance) != 2:
+            raise ValueError(f"bg_distance must be a number or a length-2 sequence, got {bg_distance_value!r}")
 
         self.normal_sample_step = float(config.get("normal_sample_step", 0.5))
         self.surface_bbox_pad = float(config.get("surface_bbox_pad", 2.0))

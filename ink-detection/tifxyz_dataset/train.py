@@ -27,7 +27,10 @@ def train(config_path):
         config = json.load(f)
 
     config.setdefault('volume_auth_json', None)
-    config['crop_size'] = config['patch_size']
+    model_crop_size, loader_patch_size, stitch_factor = resolve_model_and_loader_patch_sizes(config)
+    config['crop_size'] = list(model_crop_size)
+    config['patch_size'] = list(model_crop_size)
+    config['stitch_factor'] = stitch_factor
     config['targets']['ink']['out_channels'] = 1
     config['targets']['ink']['activation'] = 'none'
     learning_rate = config.get('learning_rate', 0.01)
