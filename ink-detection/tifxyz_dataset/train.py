@@ -14,10 +14,11 @@ import click
 from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
-from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
+from vesuvius.models.training.loss.nnunet_losses import LabelSmoothedDCAndBCELoss
 from vesuvius.neural_tracing.nets.models import make_model
 from common import save_val_preview_tif, to_uint8_image, to_uint8_label, to_uint8_probability
 from flat_ink_dataset import FlatInkDataset
+
 
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
@@ -33,15 +34,6 @@ def train(config_path):
     grad_acc_steps = int(config.get('grad_acc_steps', 1))
     grad_clip = config.get('grad_clip')
     max_steps = config.get('max_steps', math.ceil(config['num_iterations'] / grad_acc_steps))
-
-    out_dir = config['out_dir']
-    os.makedirs(out_dir, exist_ok=True)
-    train_preview_dir = os.path.join(out_dir, 'train_previews')
-    os.makedirs(train_preview_dir, exist_ok=True)
-    val_preview_dir = os.path.join(out_dir, 'val_previews')
-    os.makedirs(val_preview_dir, exist_ok=True)
-
-    set_seed(config['seed'])
 
     dataloader_config = accelerate.DataLoaderConfiguration(non_blocking = True)
 
@@ -66,6 +58,15 @@ def train(config_path):
         }
 
         wandb.init(**wandb_kwargs)
+
+    out_dir = config['out_dir']
+    os.makedirs(out_dir, exist_ok=True)
+    train_preview_dir = os.path.join(out_dir, 'train_previews')
+    os.makedirs(train_preview_dir, exist_ok=True)
+    val_preview_dir = os.path.join(out_dir, 'val_previews')
+    os.makedirs(val_preview_dir, exist_ok=True)
+
+    set_seed(config['seed'])
 
     shared_ds = FlatInkDataset(config, do_augmentations=False)
     train_ds = FlatInkDataset(config, do_augmentations=True, patches=shared_ds.patches)
@@ -126,12 +127,15 @@ def train(config_path):
 
     model.apply(InitWeights_He(neg_slope=0.2))
 
-    loss = DC_and_BCE_loss(
+    loss = LabelSmoothedDCAndBCELoss(
         bce_kwargs={},
-        soft_dice_kwargs={},
+        soft_dice_kwargs={
+            'label_smoothing': float(config.get('dice_label_smoothing', 0.0)),
+        },
         weight_dice=0.25,
         weight_ce=1.0,
         use_ignore_label=True,
+        bce_label_smoothing=float(config.get('bce_label_smoothing', 0.0)),
     )
 
     model, optimizer, train_dl, val_dl, lr_scheduler = accelerator.prepare(
