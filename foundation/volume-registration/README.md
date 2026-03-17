@@ -80,6 +80,17 @@ After there are 4+ pairs of landmark points, the transform is automatically fit 
 - `Shift + l` - Perturb fixed point +Z
 - `Shift + o` - Perturb fixed point -Z
 
+#### Reviewing landmark errors
+
+After the transform is fit from landmarks, a **landmark errors** layer appears in the neuroglancer viewer showing the registration error for each landmark pair. The error is the distance (in voxels) between the fixed landmark and the corresponding moving landmark after transformation.
+
+- Points are **color-coded** from green (low error) to red (high error), with marker size scaling with error magnitude.
+- The neuroglancer **side panel** (click the `landmark_errors` layer) shows a table of all points with their error values. Click a column header to sort, and click a row to navigate to that point.
+- A **summary table** is also printed to the terminal each time errors update, showing all landmarks sorted by error along with RMS and max error.
+- `Alt + Shift + ]` - Navigate to the landmark with the largest error
+
+This is useful for identifying landmarks that may need adjustment, or for spotting regions where a non-affine transform might be needed.
+
 #### Automatically refining the transform
 > **_NOTE:_**  Not particularly recommended, as the current implementation uses low-resolution levels of the Zarr input volumes, and does not result in precise transforms.
 
