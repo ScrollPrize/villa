@@ -21,6 +21,10 @@ def load_volume_auth(auth_json_path):
 
 
 def flat_patch_cache_path(config):
+    explicit_cache_path = config.get("patch_cache_filename")
+    if explicit_cache_path not in (None, ""):
+        return Path(str(explicit_cache_path))
+
     patch_size = config.get("patch_size", ())
     if isinstance(patch_size, int):
         patch_size_key = str(int(patch_size))

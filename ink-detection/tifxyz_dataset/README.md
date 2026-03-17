@@ -22,7 +22,7 @@ the final patch list is a list of per-patch dictionaries, where each dict contai
 
 at `__getitem__` time, one segment is chosen randomly from the supervised subset for that patch, and sampling/projection proceeds from that single tifxyz.
 
-patch computation can be cached to disk , and reused with the `patch_cache_filename` key. patches can be forced to recompute by setting `"patch_cache_force_recompute": true`
+patch computation can be cached to disk , and reused with the `patch_cache_filename` key. for the flat dataset training path, this key is used as an explicit cache path override; otherwise it defaults to `<out_dir>/flat_ink_patches_ps-<patch_size>.json`. patches can be forced to recompute by setting `"patch_cache_force_recompute": true`
 ___ 
 
 **sampling**
@@ -70,4 +70,53 @@ you can run the dataset inspect entrypoint with a specific config file:
 
 ```bash
 python -m tifxyz_dataset.tifxyz_dataset --config /path/to/config.json
+```
+
+___
+
+**configurable losses**
+
+the local training script now reads a `loss.terms` list from the config and sums the weighted terms.
+only terms listed in `loss.terms` are added. if `loss.terms` is omitted, training falls back to the base BCE + Dice term only.
+
+```json
+"loss": {
+  "terms": [
+    {
+      "name": "LabelSmoothedDCAndBCELoss",
+      "metric_name": "base",
+      "weight": 1.0,
+      "weight_dice": 0.25,
+      "weight_ce": 1.0
+    },
+    {
+      "name": "MaskedBettiMatchingLoss",
+      "metric_name": "betti",
+      "weight": 0.05,
+      "filtration": "superlevel",
+      "include_unmatched_target": false,
+      "push_unmatched_to": "diagonal"
+    },
+    {
+      "name": "BoundaryLoss",
+      "metric_name": "boundary",
+      "weight": 0.1,
+      "kernel_size": 3,
+      "weight_bce": 1.0,
+      "weight_dice": 1.0
+    }
+  ]
+}
+```
+
+the current local registry supports:
+
+- `LabelSmoothedDCAndBCELoss`
+- `MaskedBettiMatchingLoss`
+- `BoundaryLoss`
+
+to build the required `betti_matching` extension locally, run:
+
+```bash
+python tifxyz_dataset/build_betti.py
 ```
