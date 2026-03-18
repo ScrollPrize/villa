@@ -23,4 +23,5 @@ dependencies = [
     "tqdm>=4.67.3",
     "zarr>=3.1.5",
     "wandb>=0.25.1",
+    "tifffile>=2026.3.3",
 ]

@@ -721,7 +721,7 @@ class Eva(nn.Module):
     
     def load_pretrained_weights(self, state_dict, backbone_only=False, unchunk=False):
         if isinstance(state_dict, str):
-            state_dict = torch.load(state_dict)['teacher']
+            state_dict = torch.load(state_dict, map_location="cpu", weights_only=False)['teacher']
             new_state_dict = {}
             for k, v in state_dict.items():
                 if not k.startswith("backbone."):

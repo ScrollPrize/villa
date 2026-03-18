@@ -9,3 +9,4 @@ wheels/
 # Virtual environments
 .venv
 /.idea
+/dinovol_2/eval/data/fibers

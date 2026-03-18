@@ -19,6 +19,7 @@ from PIL import Image
 
 from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset
 
+from dinovol_2.eval.task_eval import TaskEvalRunner
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
 from dinovol_2.ops.distributed_utils import build_distributed_sampler, resolve_distributed_config
 from dinovol_2.loss import DINOLoss, KoLeoLoss, iBOTPatchLoss
@@ -247,6 +248,17 @@ class DinoIBOTPretrainer:
         self._monitor_selection_rng = random.Random(self.monitor_seed)
         self._train_sampler_epoch = 0
         self._val_sampler_epoch = 0
+        self.task_eval_every = int(self.config.get("task_eval_every", 0))
+        self._task_evaluator = (
+            TaskEvalRunner(
+                self.config,
+                output_dir=self.output_dir,
+                device=self.device,
+                use_amp=self.use_amp,
+            )
+            if self.is_main_process and self.task_eval_every > 0
+            else None
+        )
         self._initialize_wandb()
 
     @property
@@ -580,10 +592,13 @@ class DinoIBOTPretrainer:
 
     def _close_auxiliary_datasets(self) -> None:
         if self._monitor_dataset is None:
-            return
-        self._monitor_dataset.close()
-        self._monitor_dataset = None
-        self._monitor_collate_fn = None
+            pass
+        else:
+            self._monitor_dataset.close()
+            self._monitor_dataset = None
+            self._monitor_collate_fn = None
+        if self._task_evaluator is not None:
+            self._task_evaluator.close()
 
     def _average_metrics(self, metrics: Mapping[str, float]) -> dict[str, float]:
         averaged = {key: float(value) for key, value in metrics.items()}
@@ -1433,6 +1448,43 @@ class DinoIBOTPretrainer:
             "koleo_loss": float(koleo_loss.detach()),
             "teacher_temp": teacher_temp,
         }
+
+    def _run_task_evals(self, step: int) -> None:
+        if self._task_evaluator is None:
+            return
+
+        rng_state = self._capture_rng_state()
+        try:
+            results = self._task_evaluator.run(
+                teacher_backbone=self.model_module.teacher.backbone,
+                step=step,
+            )
+        finally:
+            self._restore_rng_state(rng_state)
+
+        for task_name, result in results.items():
+            image_path = result.get("image_path")
+            metrics_to_log = {
+                key: value
+                for key, value in result.items()
+                if key not in {"image_path", "val_sample"}
+            }
+            print(
+                f"step={step} task_eval={task_name} "
+                f"val_loss={result['val_loss']:.4f} "
+                f"val_fg_dice={result['val_fg_dice']:.4f} "
+                f"sample={result['val_sample']}"
+            )
+            self._log_wandb_metrics(
+                f"task_eval/{task_name}",
+                metrics_to_log,
+                step=step,
+                extra=(
+                    {f"task_eval/{task_name}/validation_image": self._wandb.Image(str(image_path))}
+                    if image_path is not None and self._wandb_enabled()
+                    else None
+                ),
+            )
     
     def fit(self) -> None:
         start_step = 0
@@ -1496,6 +1548,13 @@ class DinoIBOTPretrainer:
                                 step=step,
                                 extra={"val/monitor_image": self._wandb.Image(str(image_path))} if self._wandb_enabled() else None,
                             )
+                if self.task_eval_every and step > 0 and step % self.task_eval_every == 0:
+                    if self.is_distributed:
+                        dist.barrier()
+                    if self.is_main_process:
+                        self._run_task_evals(step)
+                    if self.is_distributed:
+                        dist.barrier()
                 if self.is_main_process and self.save_every_n and step > 0 and step % self.save_every_n == 0:
                     self.save_checkpoint(step)
         finally:

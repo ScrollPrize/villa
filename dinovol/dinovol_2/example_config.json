@@ -25,6 +25,11 @@
     "max_iterations": 1000000,
     "val_every_n": 50,
     "save_every_n": 5000,
+    "task_eval_every": 0,
+    "eval_task": "both",
+    "eval_task_train_iters": 500,
+    "eval_task_decoder_type": "simple",
+    "resize_task_data": 0,
     "batch_size": 2,
     "model": {
         "embedding_type": "default",
