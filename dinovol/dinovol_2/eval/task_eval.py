@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from tifffile import memmap
 from torch import nn
+from tqdm.auto import tqdm
 
 from dinovol_2.eval.download_data import download_tasks
 from dinovol_2.model.patch_encode_decode import LayerNormNd, PatchDecode
@@ -450,19 +451,28 @@ class TaskEvalRunner:
         train_loss_total = 0.0
         model.train()
         model.backbone.eval()
-        for _ in range(self.train_iters):
-            image, target, _ = dataset.sample_training_crop(rng)
-            image = image.unsqueeze(0).to(self.device, non_blocking=True)
-            target = target.unsqueeze(0).to(self.device, non_blocking=True)
+        with tqdm(
+            range(self.train_iters),
+            desc=f"task_eval/{task_name} step={step}",
+            unit="iter",
+            leave=False,
+            disable=self.train_iters <= 0,
+        ) as progress:
+            for _ in progress:
+                image, target, _ = dataset.sample_training_crop(rng)
+                image = image.unsqueeze(0).to(self.device, non_blocking=True)
+                target = target.unsqueeze(0).to(self.device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-                logits = model(image)
-                loss = F.cross_entropy(logits, target)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            train_loss_total += float(loss.detach().item())
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                    logits = model(image)
+                    loss = F.cross_entropy(logits, target)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                loss_value = float(loss.detach().item())
+                train_loss_total += loss_value
+                progress.set_postfix(loss=f"{loss_value:.4f}")
 
         val_image, val_target, val_name = dataset.validation_crop()
         val_batch = val_image.unsqueeze(0).to(self.device, non_blocking=True)
