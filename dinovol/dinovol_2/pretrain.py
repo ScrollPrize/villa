@@ -259,8 +259,6 @@ class DinoIBOTPretrainer:
             if self.is_main_process and self.task_eval_every > 0
             else None
         )
-        self._initialize_wandb()
-
     @property
     def is_main_process(self) -> bool:
         return self.rank == 0
@@ -611,7 +609,7 @@ class DinoIBOTPretrainer:
         return {key: float(values[index].item()) for index, key in enumerate(keys)}
 
     def _initialize_wandb(self) -> None:
-        if not self.is_main_process or not self.wandb_project:
+        if self._wandb_enabled() or not self.is_main_process or not self.wandb_project:
             return
         try:
             import wandb
@@ -632,6 +630,7 @@ class DinoIBOTPretrainer:
             "entity": self.wandb_entity,
             "config": self.config,
             "dir": str(self.output_dir),
+            "settings": wandb.Settings(start_method="thread"),
         }
         if self.wandb_run_name:
             init_kwargs["name"] = self.wandb_run_name
@@ -643,6 +642,10 @@ class DinoIBOTPretrainer:
             init_kwargs["resume"] = "allow"
         wandb.init(**init_kwargs)
         self._wandb = wandb
+        self._wandb.define_metric("trainer/step", hidden=True)
+        self._wandb.define_metric("train/*", step_metric="trainer/step")
+        self._wandb.define_metric("val/*", step_metric="trainer/step")
+        self._wandb.define_metric("task_eval/*", step_metric="trainer/step")
         self.wandb_run_id = self._current_wandb_run_id()
         if self.wandb_run_id is not None:
             self.config["wandb_run_id"] = self.wandb_run_id
@@ -670,7 +673,8 @@ class DinoIBOTPretrainer:
         if extra:
             payload.update(extra)
         if payload:
-            self._wandb.log(payload, step=step)
+            payload["trainer/step"] = int(step)
+            self._wandb.log(payload)
 
     def _finish_wandb(self) -> None:
         if self._wandb_enabled():
@@ -1499,6 +1503,7 @@ class DinoIBOTPretrainer:
         if val_dataloader is not None:
             self._set_sampler_epoch(val_dataloader, self._val_sampler_epoch)
         val_dataloader_iter: Iterator[Any] | None = iter(val_dataloader) if val_dataloader is not None else None
+        self._initialize_wandb()
         progress = tqdm(total=self.max_iterations, initial=start_step, desc="training", unit="iter") if self.is_main_process else None
         try:
             for step in range(start_step, self.max_iterations):
