@@ -19,8 +19,8 @@ from PIL import Image
 
 from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset
 
-from dinovol_2.distributed_utils import build_distributed_sampler, resolve_distributed_config
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
+from dinovol_2.ops.distributed_utils import build_distributed_sampler, resolve_distributed_config
 from dinovol_2.loss import DINOLoss, KoLeoLoss, iBOTPatchLoss
 from dinovol_2.model.model import DinoVitStudentTeacher, _upgrade_weight_norm_state_dict_keys
 
