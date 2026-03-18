@@ -951,7 +951,7 @@ if _QT_AVAILABLE:
             form_layout.addRow("Otsu Foreground Mask", self.otsu_mask_checkbox)
             form_layout.addRow("Mask Dilation", self.mask_dilation_spinbox)
 
-            button_layout = QVBoxLayout()
+            button_layout = QHBoxLayout()
             button_layout.addWidget(refresh_button)
             button_layout.addWidget(cache_button)
             button_layout.addWidget(pca_button)
