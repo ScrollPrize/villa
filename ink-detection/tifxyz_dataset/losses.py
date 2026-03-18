@@ -258,6 +258,48 @@ def _compute_loss_from_result_with_mask(
     return total.reshape(1), aux
 
 
+def _zero_betti_aux(template: torch.Tensor, *, include_unmatched_target: bool) -> Dict[str, torch.Tensor]:
+    zero = template.new_zeros((1,))
+    aux = {
+        "betti/matched": zero.detach(),
+        "betti/unmatched_pred": zero.detach(),
+    }
+    if include_unmatched_target:
+        aux["betti/unmatched_target"] = zero.detach()
+    return aux
+
+
+def _crop_fields_to_valid_mask_bbox(
+    pred_field: torch.Tensor,
+    tgt_field: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    threshold: float = 0.5,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], bool]:
+    if mask is None:
+        return pred_field, tgt_field, mask, True
+    if mask.ndim != 2:
+        raise ValueError(f"Mask-aware projected Betti loss expects 2D masks, got shape {tuple(mask.shape)}")
+
+    valid_coords = torch.nonzero(mask >= threshold, as_tuple=False)
+    if valid_coords.numel() == 0:
+        return pred_field, tgt_field, mask, False
+
+    row_min = int(valid_coords[:, 0].min().item())
+    row_max = int(valid_coords[:, 0].max().item()) + 1
+    col_min = int(valid_coords[:, 1].min().item())
+    col_max = int(valid_coords[:, 1].max().item()) + 1
+
+    if row_min == 0 and row_max == mask.shape[0] and col_min == 0 and col_max == mask.shape[1]:
+        return pred_field, tgt_field, mask, True
+
+    return (
+        pred_field[row_min:row_max, col_min:col_max].contiguous(),
+        tgt_field[row_min:row_max, col_min:col_max].contiguous(),
+        mask[row_min:row_max, col_min:col_max].contiguous(),
+        True,
+    )
+
+
 def _aggregate_aux(aux_parts: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     aux_agg: Dict[str, torch.Tensor] = {}
     if not aux_parts:
@@ -448,6 +490,20 @@ class BettiMatchingLoss(nn.Module):
 
 
 class MaskedBettiMatchingLoss(BettiMatchingLoss):
+    def __init__(
+        self,
+        filtration: str = "superlevel",
+        include_unmatched_target: bool = False,
+        push_unmatched_to: str = "diagonal",
+        crop_to_valid_bbox: bool = True,
+    ):
+        super().__init__(
+            filtration=filtration,
+            include_unmatched_target=include_unmatched_target,
+            push_unmatched_to=push_unmatched_to,
+        )
+        self.crop_to_valid_bbox = bool(crop_to_valid_bbox)
+
     def _split_target_and_mask(
         self,
         input: torch.Tensor,
@@ -462,17 +518,53 @@ class MaskedBettiMatchingLoss(BettiMatchingLoss):
         tgt_fields: List[torch.Tensor],
         valid_masks: List[Optional[torch.Tensor]],
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        bm = _get_betti_module()
-        results = bm.compute_matching(
-            _to_numpy(pred_fields),
-            _to_numpy(tgt_fields),
-            include_input1_unmatched_pairs=True,
-            include_input2_unmatched_pairs=self.include_unmatched_target,
-        )
+        sample_infos = []
+        active_pred_fields: List[torch.Tensor] = []
+        active_tgt_fields: List[torch.Tensor] = []
+
+        for pred_field, tgt_field, valid_mask in zip(pred_fields, tgt_fields, valid_masks):
+            if self.crop_to_valid_bbox:
+                pred_field, tgt_field, valid_mask, has_valid = _crop_fields_to_valid_mask_bbox(
+                    pred_field,
+                    tgt_field,
+                    valid_mask,
+                )
+                if not has_valid:
+                    sample_infos.append(None)
+                    continue
+
+            sample_infos.append((pred_field, tgt_field, valid_mask))
+            active_pred_fields.append(pred_field)
+            active_tgt_fields.append(tgt_field)
+
+        results_iter = iter(())
+        if active_pred_fields:
+            bm = _get_betti_module()
+            results_iter = iter(
+                bm.compute_matching(
+                    _to_numpy(active_pred_fields),
+                    _to_numpy(active_tgt_fields),
+                    include_input1_unmatched_pairs=True,
+                    include_input2_unmatched_pairs=self.include_unmatched_target,
+                )
+            )
 
         losses: List[torch.Tensor] = []
         aux_parts: List[Dict[str, torch.Tensor]] = []
-        for pred_field, tgt_field, valid_mask, result in zip(pred_fields, tgt_fields, valid_masks, results):
+        for sample_info in sample_infos:
+            if sample_info is None:
+                zero = pred_fields[0].new_zeros((1,))
+                losses.append(zero)
+                aux_parts.append(
+                    _zero_betti_aux(
+                        pred_fields[0],
+                        include_unmatched_target=self.include_unmatched_target,
+                    )
+                )
+                continue
+
+            pred_field, tgt_field, valid_mask = sample_info
+            result = next(results_iter)
             loss_part, aux_part = _compute_loss_from_result_with_mask(
                 pred_field,
                 tgt_field,
@@ -664,6 +756,7 @@ def _build_masked_betti_matching_term(term_cfg: dict, _config: dict) -> nn.Modul
         filtration=str(term_cfg.get("filtration", "superlevel")),
         include_unmatched_target=bool(term_cfg.get("include_unmatched_target", False)),
         push_unmatched_to=str(term_cfg.get("push_unmatched_to", "diagonal")),
+        crop_to_valid_bbox=bool(term_cfg.get("crop_to_valid_bbox", True)),
     )
 
 
