@@ -292,7 +292,7 @@ class Dinov2TaskModel(nn.Module):
         super().__init__()
         self.backbone = deepcopy(teacher_backbone)
         for parameter in self.backbone.parameters():
-            parameter.requires_grad = True
+            parameter.requires_grad = False
 
         self.patch_size = tuple(int(v) for v in self.backbone.patch_size)
         self.target_spatial = tuple(int(v) for v in self.backbone.global_crops_size)
@@ -441,7 +441,7 @@ class TaskEvalRunner:
             torch.cuda.manual_seed_all(task_seed)
         model = Dinov2TaskModel(teacher_backbone, dataset.num_classes, self.decoder_type).to(self.device)
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            model.decoder.parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
@@ -449,6 +449,7 @@ class TaskEvalRunner:
 
         train_loss_total = 0.0
         model.train()
+        model.backbone.eval()
         for _ in range(self.train_iters):
             image, target, _ = dataset.sample_training_crop(rng)
             image = image.unsqueeze(0).to(self.device, non_blocking=True)
