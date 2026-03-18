@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+import traceback
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -507,10 +508,14 @@ class TaskEvalRunner:
         results: dict[str, dict[str, Any]] = {}
         for task_name in self.tasks:
             dataset = self._dataset_for(task_name, crop_size)
-            results[task_name] = self._run_single_task(
-                task_name=task_name,
-                dataset=dataset,
-                teacher_backbone=teacher_backbone,
-                step=step,
-            )
+            try:
+                results[task_name] = self._run_single_task(
+                    task_name=task_name,
+                    dataset=dataset,
+                    teacher_backbone=teacher_backbone,
+                    step=step,
+                )
+            except Exception:
+                print(f"task_eval failed for {task_name} at step={step}")
+                traceback.print_exc()
         return results
