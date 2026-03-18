@@ -16,7 +16,13 @@ from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.nets.models import make_model
-from common import save_val_preview_tif, to_uint8_image, to_uint8_label, to_uint8_probability
+from common import (
+    build_preview_montage,
+    save_val_preview_tif,
+    to_uint8_image,
+    to_uint8_label,
+    to_uint8_probability,
+)
 from flat_ink_dataset import FlatInkDataset
 from losses import create_loss_from_config
 from stitching import resolve_model_and_loader_patch_sizes, run_stitched_model_forward
@@ -315,6 +321,16 @@ def train(config_path):
             if accelerator.is_main_process:
                 latest_val_loss = float(mean_val_loss)
                 refresh_progress_bar(train_loss)
+                train_preview_montage = build_preview_montage(
+                    train_preview_inputs,
+                    train_preview_labels,
+                    train_preview_probabilities,
+                )
+                val_preview_montage = build_preview_montage(
+                    val_preview_inputs,
+                    val_preview_labels,
+                    val_preview_probabilities,
+                )
                 save_val_preview_tif(
                     os.path.join(train_preview_dir, f'train_preview_{step:06}.tif'),
                     train_preview_inputs,
@@ -328,7 +344,18 @@ def train(config_path):
                     val_preview_probabilities,
                 )
                 if wandb.run is not None:
-                    wandb.log({'val/loss': mean_val_loss}, step=step)
+                    log_dict = {'val/loss': mean_val_loss}
+                    if train_preview_montage is not None:
+                        log_dict['train/preview'] = wandb.Image(
+                            train_preview_montage,
+                            caption=f"step {step} train preview",
+                        )
+                    if val_preview_montage is not None:
+                        log_dict['val/preview'] = wandb.Image(
+                            val_preview_montage,
+                            caption=f"step {step} val preview",
+                        )
+                    wandb.log(log_dict, step=step)
 
         if accelerator.is_main_process and step % save_every == 0 and step > 0:
             torch.save({

@@ -108,9 +108,9 @@ def to_uint8_probability(probability_2d, lower_percentile=1.0, upper_percentile=
         probability_2d = (probability_2d - lo) / (hi - lo)
     return np.clip(np.rint(probability_2d * 255.0), 0, 255).astype(np.uint8)
 
-def save_val_preview_tif(output_path, input_tiles, label_tiles, probability_tiles, gap_size=4):
+def build_preview_montage(input_tiles, label_tiles, probability_tiles, gap_size=4):
     if not input_tiles:
-        return
+        return None
 
     rows = []
     for input_tile, label_tile, probability_tile in zip(input_tiles, label_tiles, probability_tiles):
@@ -128,8 +128,18 @@ def save_val_preview_tif(output_path, input_tiles, label_tiles, probability_tile
         if row_idx > 0:
             montage.append(row_gap)
         montage.append(row)
+    return np.concatenate(montage, axis=0)
 
-    tifffile.imwrite(output_path, np.concatenate(montage, axis=0), compression="lzw")
+def save_val_preview_tif(output_path, input_tiles, label_tiles, probability_tiles, gap_size=4):
+    montage = build_preview_montage(
+        input_tiles,
+        label_tiles,
+        probability_tiles,
+        gap_size=gap_size,
+    )
+    if montage is None:
+        return
+    tifffile.imwrite(output_path, montage, compression="lzw")
 
 def _normalize_patch_size_zyx(patch_size):
     patch_size_zyx = np.asarray(patch_size, dtype=np.int32).reshape(-1)
