@@ -256,7 +256,7 @@ class DinoIBOTPretrainer:
                 device=self.device,
                 use_amp=self.use_amp,
             )
-            if self.is_main_process and self.task_eval_every > 0
+            if self.task_eval_every > 0
             else None
         )
     @property
@@ -1466,6 +1466,9 @@ class DinoIBOTPretrainer:
         finally:
             self._restore_rng_state(rng_state)
 
+        if not self.is_main_process:
+            return
+
         for task_name, result in results.items():
             image_path = result.get("image_path")
             metrics_to_log = {
@@ -1554,12 +1557,7 @@ class DinoIBOTPretrainer:
                                 extra={"val/monitor_image": self._wandb.Image(str(image_path))} if self._wandb_enabled() else None,
                             )
                 if self.task_eval_every and step > 0 and step % self.task_eval_every == 0:
-                    if self.is_distributed:
-                        dist.barrier()
-                    if self.is_main_process:
-                        self._run_task_evals(step)
-                    if self.is_distributed:
-                        dist.barrier()
+                    self._run_task_evals(step)
                 if self.is_main_process and self.save_every_n and step > 0 and step % self.save_every_n == 0:
                     self.save_checkpoint(step)
         finally:

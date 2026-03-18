@@ -3,15 +3,18 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+import time
 import traceback
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from tifffile import imread
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm.auto import tqdm
 
 from dinovol_2.eval.download_data import download_tasks
@@ -25,6 +28,7 @@ _DECODER_ALIASES = {
     "patch_encode_decode": "patch_encode_decode",
     "primus_patch_decode": "patch_encode_decode",
 }
+_IGNORE_LABEL = 2
 _LABEL_PALETTE = np.asarray(
     [
         [0, 0, 0],
@@ -344,9 +348,14 @@ class TaskEvalRunner:
         self.weight_decay = float(self.config.get("eval_task_weight_decay", 0.0))
         self.seed = int(self.config.get("eval_task_seed", 0))
         self.resize_task_data = resolve_resize_task_data(self.config.get("resize_task_data", 0))
+        self.download_timeout_s = float(self.config.get("eval_task_download_timeout_s", 3600.0))
+        if self.download_timeout_s <= 0:
+            raise ValueError(f"eval_task_download_timeout_s must be positive, got {self.download_timeout_s}")
         self.data_root = Path(
             self.config.get("eval_task_data_root", Path(__file__).resolve().parent / "data")
         )
+        self.rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        self.world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
         self._downloaded = False
         self._datasets: dict[tuple[str, tuple[int, int, int]], TaskVolumeSet] = {}
 
@@ -355,10 +364,47 @@ class TaskEvalRunner:
             dataset.close()
         self._datasets.clear()
 
+    def _download_sentinel_path(self) -> Path:
+        task_key = "_".join(sorted(self.tasks))
+        return self.data_root / f".task_eval_ready_{task_key}"
+
+    def _task_data_ready(self) -> bool:
+        for task_name in self.tasks:
+            task_root = self.data_root / task_name
+            image_dir = task_root / "images"
+            label_dir = task_root / "labels"
+            if not image_dir.exists() or not label_dir.exists():
+                return False
+            if next(image_dir.glob("*.tif"), None) is None:
+                return False
+            if next(label_dir.glob("*.tif"), None) is None:
+                return False
+        return True
+
     def _ensure_data(self) -> None:
         if self._downloaded:
             return
-        download_tasks(self.tasks, data_root=self.data_root)
+        if self._task_data_ready():
+            self._downloaded = True
+            return
+
+        sentinel_path = self._download_sentinel_path()
+        if self.world_size <= 1:
+            download_tasks(self.tasks, data_root=self.data_root)
+        elif self.rank == 0:
+            sentinel_path.unlink(missing_ok=True)
+            download_tasks(self.tasks, data_root=self.data_root)
+            sentinel_path.write_text("ready\n", encoding="utf-8")
+        else:
+            deadline = time.monotonic() + self.download_timeout_s
+            while True:
+                if self._task_data_ready() and sentinel_path.exists():
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out after {self.download_timeout_s:.0f}s waiting for task-eval data in {self.data_root}"
+                    )
+                time.sleep(1.0)
         self._downloaded = True
 
     def _dataset_for(self, task_name: str, crop_size: tuple[int, int, int]) -> TaskVolumeSet:
@@ -380,20 +426,52 @@ class TaskEvalRunner:
         return int(base_seed + 1009 * step + task_offset)
 
     @staticmethod
-    def _foreground_mean_dice(prediction: torch.Tensor, target: torch.Tensor, num_classes: int) -> float:
+    def _binary_target_and_mask(target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        target = target.detach()
+        valid_mask = target != _IGNORE_LABEL
+        binary_target = (target == 1).to(dtype=torch.float32)
+        return binary_target, valid_mask
+
+    @staticmethod
+    def _task_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        binary_target, valid_mask = TaskEvalRunner._binary_target_and_mask(target)
+        masked_logits = logits[:, 0][valid_mask]
+        masked_target = binary_target[valid_mask]
+        if masked_target.numel() == 0:
+            return logits.sum() * 0.0
+        return F.binary_cross_entropy_with_logits(masked_logits, masked_target)
+
+    @staticmethod
+    def _ddp_kwargs(device: torch.device) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "broadcast_buffers": False,
+            "find_unused_parameters": False,
+        }
+        if device.type == "cuda":
+            kwargs["device_ids"] = [device.index]
+            kwargs["output_device"] = device.index
+        return kwargs
+
+    def _distributed_mean(self, *values: float) -> tuple[float, ...]:
+        if self.world_size <= 1:
+            return tuple(float(value) for value in values)
+        tensor = torch.tensor(values, device=self.device, dtype=torch.float64)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor /= self.world_size
+        return tuple(float(value.item()) for value in tensor)
+
+    @staticmethod
+    def _foreground_mean_dice(prediction: torch.Tensor, target: torch.Tensor) -> float:
         prediction = prediction.detach()
         target = target.detach()
-        dice_scores: list[float] = []
-        for class_index in range(1, num_classes):
-            pred_mask = prediction == class_index
-            target_mask = target == class_index
-            denom = int(pred_mask.sum().item() + target_mask.sum().item())
-            if denom == 0:
-                dice_scores.append(1.0)
-                continue
-            intersection = int((pred_mask & target_mask).sum().item())
-            dice_scores.append((2.0 * intersection) / denom)
-        return float(sum(dice_scores) / len(dice_scores)) if dice_scores else 0.0
+        valid_mask = target != _IGNORE_LABEL
+        pred_mask = (prediction == 1) & valid_mask
+        target_mask = (target == 1) & valid_mask
+        denom = int(pred_mask.sum().item() + target_mask.sum().item())
+        if denom == 0:
+            return 1.0
+        intersection = int((pred_mask & target_mask).sum().item())
+        return (2.0 * intersection) / denom
 
     @staticmethod
     def _center_slice_image(image: torch.Tensor) -> np.ndarray:
@@ -437,11 +515,14 @@ class TaskEvalRunner:
         step: int,
     ) -> dict[str, Any]:
         task_seed = self._task_seed(self.seed, task_name, step)
-        rng = np.random.default_rng(task_seed)
         torch.manual_seed(task_seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(task_seed)
-        model = Dinov2TaskModel(teacher_backbone, dataset.num_classes, self.decoder_type).to(self.device)
+        rng = np.random.default_rng(task_seed + 1000003 * self.rank)
+        model = Dinov2TaskModel(teacher_backbone, 1, self.decoder_type).to(self.device)
+        ddp_model: nn.Module = model
+        if self.world_size > 1:
+            ddp_model = DDP(model, **self._ddp_kwargs(self.device))
         optimizer = torch.optim.AdamW(
             model.decoder.parameters(),
             lr=self.learning_rate,
@@ -450,14 +531,14 @@ class TaskEvalRunner:
         scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         train_loss_total = 0.0
-        model.train()
+        ddp_model.train()
         model.backbone.eval()
         with tqdm(
             range(self.train_iters),
             desc=f"task_eval/{task_name} step={step}",
             unit="iter",
             leave=False,
-            disable=self.train_iters <= 0,
+            disable=self.train_iters <= 0 or self.rank != 0,
         ) as progress:
             for _ in progress:
                 image, target, _ = dataset.sample_training_crop(rng)
@@ -466,8 +547,8 @@ class TaskEvalRunner:
 
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-                    logits = model(image)
-                    loss = F.cross_entropy(logits, target)
+                    logits = ddp_model(image)
+                    loss = self._task_loss(logits, target)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -482,22 +563,32 @@ class TaskEvalRunner:
         model.eval()
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
             val_logits = model(val_batch)
-            val_loss = F.cross_entropy(val_logits, val_target_batch)
-        val_prediction = val_logits.argmax(dim=1).detach().cpu()
-        image_path = self._save_validation_image(
-            task_name,
-            step,
-            val_image,
-            val_target,
-            val_prediction[0],
+            val_loss = self._task_loss(val_logits, val_target_batch)
+        val_prediction = (val_logits[:, 0] > 0).to(dtype=torch.int64).detach().cpu()
+        image_path = (
+            self._save_validation_image(
+                task_name,
+                step,
+                val_image,
+                val_target,
+                val_prediction[0],
+            )
+            if self.rank == 0
+            else None
         )
-        foreground_dice = self._foreground_mean_dice(val_prediction, val_target_batch.cpu(), dataset.num_classes)
+        foreground_dice = self._foreground_mean_dice(val_prediction, val_target_batch.cpu())
+        train_loss_mean = train_loss_total / max(1, self.train_iters)
+        train_loss_mean, val_loss_mean, foreground_dice = self._distributed_mean(
+            train_loss_mean,
+            float(val_loss.detach().item()),
+            foreground_dice,
+        )
 
         return {
-            "train_loss_mean": train_loss_total / max(1, self.train_iters),
-            "val_loss": float(val_loss.detach().item()),
+            "train_loss_mean": train_loss_mean,
+            "val_loss": val_loss_mean,
             "val_fg_dice": foreground_dice,
-            "num_classes": dataset.num_classes,
+            "ignore_label": _IGNORE_LABEL,
             "val_sample": val_name,
             "image_path": image_path,
         }
@@ -516,6 +607,6 @@ class TaskEvalRunner:
                     step=step,
                 )
             except Exception:
-                print(f"task_eval failed for {task_name} at step={step}")
+                print(f"task_eval failed for {task_name} at step={step} rank={self.rank}")
                 traceback.print_exc()
         return results
