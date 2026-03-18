@@ -1224,15 +1224,15 @@ def main() -> None:
 						help="Validity data loss weight")
 	parser.add_argument("--w-smooth-v", type=float, default=10.0,
 						help="Validity smoothing weight")
-	parser.add_argument("--w-density", type=float, default=1.0,
+	parser.add_argument("--w-density", type=float, default=0.1,
 						help="Density integral loss weight")
-	parser.add_argument("--w-smooth-d", type=float, default=10.0,
+	parser.add_argument("--w-smooth-d", type=float, default=1.0,
 						help="Density smoothing weight")
-	parser.add_argument("--w-curv-d", type=float, default=1.0,
+	parser.add_argument("--w-curv-d", type=float, default=0.1,
 						help="Density curvature penalty")
-	parser.add_argument("--w-pos-d", type=float, default=1.0,
+	parser.add_argument("--w-pos-d", type=float, default=0.1,
 						help="Density positivity penalty")
-	parser.add_argument("--w-avg-d", type=float, default=1.0,
+	parser.add_argument("--w-avg-d", type=float, default=0.1,
 						help="Density uniformity (average) penalty")
 	parser.add_argument("--lr-exponent", type=float, default=4.0,
 						help="LR multiplier per pyramid level (coarser=higher LR)")
