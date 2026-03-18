@@ -7,6 +7,18 @@ an attempt at a faithful implementation of dinov2-style pretraining on 3d volume
 
 this implementation is still incomplete. pretraining works but no finetuning yet written. 
 
+## Optional Task Eval During Pretraining
+
+`pretrain.py` can optionally run small downstream segmentation trainings during pretraining.
+
+- set `task_eval_every` to a positive step cadence to enable it
+- choose `eval_task` as `both`, `fibers`, or `surfaces`
+- set `eval_task_train_iters` to control the mini-training length, default `500`
+- set `eval_task_decoder_type` to `simple` or `patch_encode_decode`
+- set `resize_task_data` to a scale factor before cropping task samples, with `0` meaning disabled
+
+The task data is downloaded with `python -m dinovol_2.eval.download_data --task both` and the first sorted sample for each task is reserved as the deterministic validation case.
+
 ## Napari visualizer
 
 There is a small napari helper for checkpoint inspection at `dinovol_2/eval/napari_visualizer.py`.
