@@ -491,15 +491,15 @@ class TaskEvalRunner:
         step: int,
         image: torch.Tensor,
         label: torch.Tensor,
-        prediction: torch.Tensor,
+        prediction_probability: torch.Tensor,
     ) -> Path:
         image_slice = self._center_slice_image(image)
         label_slice = self._center_slice_label(label)
-        prediction_slice = self._center_slice_label(prediction)
+        prediction_slice = self._center_slice_image(prediction_probability.unsqueeze(0))
 
         image_rgb = np.stack([_normalize_image(image_slice)] * 3, axis=-1)
         label_rgb = _colorize_labels(label_slice)
-        prediction_rgb = _colorize_labels(prediction_slice)
+        prediction_rgb = np.stack([_normalize_image(prediction_slice)] * 3, axis=-1)
         canvas = np.concatenate([image_rgb, label_rgb, prediction_rgb], axis=1)
 
         path = self.output_dir / f"{task_name}_step_{step:06d}.png"
@@ -564,6 +564,7 @@ class TaskEvalRunner:
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
             val_logits = model(val_batch)
             val_loss = self._task_loss(val_logits, val_target_batch)
+        val_probability = torch.sigmoid(val_logits[:, 0]).detach().cpu()
         val_prediction = (val_logits[:, 0] > 0).to(dtype=torch.int64).detach().cpu()
         image_path = (
             self._save_validation_image(
@@ -571,7 +572,7 @@ class TaskEvalRunner:
                 step,
                 val_image,
                 val_target,
-                val_prediction[0],
+                val_probability[0],
             )
             if self.rank == 0
             else None
