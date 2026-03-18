@@ -8,11 +8,13 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+import zarr
 from skimage.filters import threshold_otsu
 from skimage.morphology import ball
 from skimage.morphology.binary import binary_dilation
 
 from dinovol_2.dataset.normalization import NORMALIZATION_SCHEMES, get_normalization
+from dinovol_2.dataset.ssl_zarr_dataset import open_zarr_handle
 from dinovol_2.model.model import DinoVitStudentTeacher, _upgrade_weight_norm_state_dict_keys
 
 DEFAULT_NORMALIZATION_SCHEME = "robust"
@@ -40,6 +42,206 @@ class EmbeddingCache:
     padded_shape: tuple[int, int, int]
     patch_size: tuple[int, int, int]
     normalized_patch_embeddings: np.ndarray
+    source_bbox: tuple[int, int, int, int, int, int]
+    bbox_layer_name: str | None
+
+
+@dataclass(frozen=True)
+class OmeZarrScale:
+    index: int
+    path: str
+    axes: tuple[str, ...]
+    shape: tuple[int, ...]
+    spatial_shape: tuple[int, int, int]
+    spatial_scale: tuple[float, float, float]
+    spatial_translate: tuple[float, float, float]
+    channel_axis: int | None
+
+
+@dataclass(frozen=True)
+class OmeZarrSpec:
+    path: str
+    scales: tuple[OmeZarrScale, ...]
+
+
+@dataclass(frozen=True)
+class SpatialCrop:
+    start_zyx: tuple[int, int, int]
+    stop_zyx: tuple[int, int, int]
+    bbox_layer_name: str | None = None
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return tuple(int(stop) - int(start) for start, stop in zip(self.start_zyx, self.stop_zyx))
+
+    @property
+    def bounds(self) -> tuple[int, int, int, int, int, int]:
+        return (*self.start_zyx, *self.stop_zyx)
+
+
+def _normalize_path_string(path: str | Path) -> str:
+    path_str = str(path).strip()
+    if "://" in path_str:
+        return path_str
+    return str(Path(path_str).expanduser().resolve())
+
+
+def _default_ome_axes(ndim: int) -> tuple[str, ...]:
+    if ndim == 3:
+        return ("z", "y", "x")
+    if ndim == 4:
+        return ("c", "z", "y", "x")
+    raise ValueError(f"unsupported OME-Zarr dimensionality {ndim}; expected 3D or 4D arrays")
+
+
+def _normalize_ome_axes(raw_axes: Any, *, ndim: int) -> tuple[str, ...]:
+    if raw_axes is None:
+        return _default_ome_axes(ndim)
+
+    axes: list[str] = []
+    for axis in raw_axes:
+        if isinstance(axis, dict):
+            axis_name = str(axis.get("name", "")).strip().lower()
+        else:
+            axis_name = str(axis).strip().lower()
+        if not axis_name:
+            raise ValueError(f"invalid OME-Zarr axes metadata: {raw_axes!r}")
+        axes.append(axis_name)
+
+    normalized = tuple(axes)
+    if len(normalized) != ndim:
+        raise ValueError(f"OME-Zarr axes {normalized} do not match array dimensionality {ndim}")
+    return normalized
+
+
+def _resolve_ome_channel_axis(axes: tuple[str, ...]) -> int | None:
+    allowed_axes = {"c", "z", "y", "x"}
+    unsupported_axes = sorted(set(axes) - allowed_axes)
+    if unsupported_axes:
+        raise ValueError(
+            "unsupported OME-Zarr axes "
+            f"{unsupported_axes}; expected only channel/spatial axes from {{'c', 'z', 'y', 'x'}}"
+        )
+    for required_axis in ("z", "y", "x"):
+        if required_axis not in axes:
+            raise ValueError(f"OME-Zarr axes {axes} must include {required_axis!r}")
+    return axes.index("c") if "c" in axes else None
+
+
+def _combine_coordinate_transforms(
+    coordinate_transformations: Any,
+    *,
+    axis_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    scale = np.ones(axis_count, dtype=np.float64)
+    translation = np.zeros(axis_count, dtype=np.float64)
+    if not isinstance(coordinate_transformations, list):
+        return scale, translation
+
+    for transformation in coordinate_transformations:
+        if not isinstance(transformation, dict):
+            continue
+        transformation_type = str(transformation.get("type", "")).strip().lower()
+        if transformation_type == "scale":
+            values = transformation.get("scale")
+            if isinstance(values, (list, tuple)) and len(values) == axis_count:
+                scale *= np.asarray(values, dtype=np.float64)
+        elif transformation_type == "translation":
+            values = transformation.get("translation")
+            if isinstance(values, (list, tuple)) and len(values) == axis_count:
+                translation += np.asarray(values, dtype=np.float64)
+    return scale, translation
+
+
+def load_ome_zarr_spec(path: str | Path) -> OmeZarrSpec:
+    path_str = _normalize_path_string(path)
+    root = zarr.open_group(path_str, mode="r")
+    multiscales = root.attrs.get("multiscales")
+    if not isinstance(multiscales, list) or not multiscales:
+        raise ValueError("OME-Zarr root is missing multiscales metadata")
+
+    primary_multiscale = multiscales[0]
+    if not isinstance(primary_multiscale, dict):
+        raise ValueError("OME-Zarr multiscales metadata is invalid")
+
+    dataset_entries = primary_multiscale.get("datasets")
+    if not isinstance(dataset_entries, list) or not dataset_entries:
+        raise ValueError("OME-Zarr multiscales metadata does not contain any datasets")
+
+    first_dataset_entry = dataset_entries[0]
+    first_dataset_path = (
+        str(first_dataset_entry.get("path", 0))
+        if isinstance(first_dataset_entry, dict)
+        else "0"
+    )
+    first_dataset_shape = tuple(int(v) for v in root[first_dataset_path].shape)
+    multiscale_axes = primary_multiscale.get("axes")
+    first_axes = _normalize_ome_axes(multiscale_axes, ndim=len(first_dataset_shape))
+    multiscale_scale, multiscale_translate = _combine_coordinate_transforms(
+        primary_multiscale.get("coordinateTransformations"),
+        axis_count=len(first_axes),
+    )
+
+    resolved_scales: list[OmeZarrScale] = []
+    for dataset_index, dataset_entry in enumerate(dataset_entries):
+        if not isinstance(dataset_entry, dict):
+            raise ValueError(f"OME-Zarr dataset entry {dataset_index} is invalid")
+
+        dataset_path = str(dataset_entry.get("path", dataset_index))
+        node = root[dataset_path]
+        if not hasattr(node, "shape"):
+            raise ValueError(f"OME-Zarr path {dataset_path!r} is not an array dataset")
+
+        shape = tuple(int(v) for v in node.shape)
+        axes = _normalize_ome_axes(multiscale_axes, ndim=len(shape))
+        channel_axis = _resolve_ome_channel_axis(axes)
+
+        dataset_scale, dataset_translate = _combine_coordinate_transforms(
+            dataset_entry.get("coordinateTransformations"),
+            axis_count=len(axes),
+        )
+        total_scale = multiscale_scale * dataset_scale
+        total_translate = multiscale_translate + dataset_translate
+
+        spatial_indices = tuple(axes.index(axis_name) for axis_name in ("z", "y", "x"))
+        resolved_scales.append(
+            OmeZarrScale(
+                index=dataset_index,
+                path=dataset_path,
+                axes=axes,
+                shape=shape,
+                spatial_shape=tuple(int(shape[index]) for index in spatial_indices),
+                spatial_scale=tuple(float(total_scale[index]) for index in spatial_indices),
+                spatial_translate=tuple(float(total_translate[index]) for index in spatial_indices),
+                channel_axis=channel_axis,
+            )
+        )
+
+    return OmeZarrSpec(path=path_str, scales=tuple(resolved_scales))
+
+
+def _reorder_ome_zarr_array(array: np.ndarray, *, axes: tuple[str, ...]) -> np.ndarray:
+    channel_axis = _resolve_ome_channel_axis(axes)
+    target_axes = ("c", "z", "y", "x") if channel_axis is not None else ("z", "y", "x")
+    permutation = tuple(axes.index(axis_name) for axis_name in target_axes)
+    if permutation == tuple(range(len(target_axes))):
+        return np.asarray(array)
+    return np.transpose(np.asarray(array), axes=permutation)
+
+
+def load_ome_zarr_array(path: str | Path, scale: OmeZarrScale) -> np.ndarray:
+    handle = open_zarr_handle(_normalize_path_string(path), scale.path)
+    try:
+        array = np.asarray(handle.array)
+    finally:
+        handle.close()
+    return _reorder_ome_zarr_array(array, axes=scale.axes)
+
+
+def ome_zarr_layer_transform(scale: OmeZarrScale) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    if scale.channel_axis is None:
+        return scale.spatial_scale, scale.spatial_translate
+    return (1.0, *scale.spatial_scale), (0.0, *scale.spatial_translate)
 
 
 def _as_3tuple(value: Any, *, name: str) -> tuple[int, int, int]:
@@ -180,6 +382,75 @@ def prepare_volume_array(image: np.ndarray, *, input_channels: int) -> np.ndarra
     if volume.ndim != 4:
         raise ValueError(f"expected a `(c, z, y, x)` array after conversion, got shape {volume.shape}")
     return volume.astype(np.float32, copy=False)
+
+
+def infer_image_spatial_shape(
+    image: np.ndarray,
+    *,
+    input_channels: int,
+) -> tuple[int, int, int]:
+    image_shape = tuple(int(v) for v in np.asarray(image).shape)
+    if len(image_shape) == 3:
+        if input_channels != 1:
+            raise ValueError(
+                f"checkpoint expects {input_channels} input channels but the image layer is single-channel"
+            )
+        return image_shape
+    if len(image_shape) == 4 and image_shape[0] == input_channels:
+        return image_shape[-3:]
+    if len(image_shape) == 4 and image_shape[-1] == input_channels:
+        return image_shape[:3]
+    raise ValueError(
+        "image layer must be either 3D `(z, y, x)` or 4D with channel axis matching the checkpoint input channels"
+    )
+
+
+def crop_image_to_spatial_bbox(
+    image: np.ndarray,
+    spatial_bbox: tuple[int, int, int, int, int, int],
+    *,
+    input_channels: int,
+) -> np.ndarray:
+    z0, y0, x0, z1, y1, x1 = (int(v) for v in spatial_bbox)
+    spatial_slices = (slice(z0, z1), slice(y0, y1), slice(x0, x1))
+    volume = np.asarray(image)
+    if volume.ndim == 3:
+        if input_channels != 1:
+            raise ValueError(
+                f"checkpoint expects {input_channels} input channels but the image layer is single-channel"
+            )
+        return volume[spatial_slices]
+    if volume.ndim == 4 and volume.shape[0] == input_channels:
+        return volume[(slice(None), *spatial_slices)]
+    if volume.ndim == 4 and volume.shape[-1] == input_channels:
+        return volume[(*spatial_slices, slice(None))]
+    raise ValueError(
+        "image layer must be either 3D `(z, y, x)` or 4D with channel axis matching the checkpoint input channels"
+    )
+
+
+def cropped_spatial_translate(
+    image_layer: Any,
+    *,
+    crop_start_zyx: tuple[int, int, int],
+) -> tuple[float, float, float]:
+    spatial_scale = np.asarray(image_layer.scale, dtype=np.float64)[-3:]
+    spatial_translate = np.asarray(image_layer.translate, dtype=np.float64)[-3:]
+    return tuple(
+        float(translation + start * scale)
+        for translation, start, scale in zip(spatial_translate, crop_start_zyx, spatial_scale)
+    )
+
+
+def point_within_spatial_bbox(
+    point_zyx: np.ndarray | tuple[float, float, float],
+    *,
+    spatial_bbox: tuple[int, int, int, int, int, int],
+) -> bool:
+    point = np.asarray(point_zyx, dtype=np.float64)
+    lower = np.asarray(spatial_bbox[:3], dtype=np.float64)
+    upper = np.asarray(spatial_bbox[3:], dtype=np.float64)
+    return bool(np.all(point >= lower) and np.all(point < upper))
 
 
 def normalize_volume(
@@ -609,8 +880,11 @@ if _QT_AVAILABLE:
             self.viewer = viewer
             self.loaded_backbone: LoadedBackbone | None = None
             self.embedding_cache: EmbeddingCache | None = None
+            self.ome_zarr_spec: OmeZarrSpec | None = None
 
             self.setWindowTitle("DINO Cosine Similarity")
+            self.zarr_path_edit = QLineEdit()
+            self.zarr_scale_combo = QComboBox()
             self.checkpoint_path_edit = QLineEdit()
             self.normalization_combo = QComboBox()
             for scheme in NORMALIZATION_SCHEMES:
@@ -623,10 +897,21 @@ if _QT_AVAILABLE:
             self.mask_dilation_spinbox = QSpinBox()
             self.mask_dilation_spinbox.setRange(0, 1024)
             self.mask_dilation_spinbox.setValue(0)
-            self.status_label = QLabel("Select a checkpoint, image layer, and points layer.")
+            self.status_label = QLabel(
+                "Select a checkpoint, then open an OME-Zarr or choose an existing image layer."
+            )
 
-            browse_button = QPushButton("Browse")
-            browse_button.clicked.connect(self._browse_checkpoint)
+            browse_zarr_button = QPushButton("Browse Zarr")
+            browse_zarr_button.clicked.connect(self._browse_zarr_directory)
+
+            load_scales_button = QPushButton("Load Scales")
+            load_scales_button.clicked.connect(self._load_zarr_scales)
+
+            open_zarr_button = QPushButton("Open Zarr")
+            open_zarr_button.clicked.connect(self._open_zarr)
+
+            browse_checkpoint_button = QPushButton("Browse")
+            browse_checkpoint_button.clicked.connect(self._browse_checkpoint)
 
             refresh_button = QPushButton("Refresh Layers")
             refresh_button.clicked.connect(self.refresh_layer_choices)
@@ -643,11 +928,22 @@ if _QT_AVAILABLE:
             all_button = QPushButton("Similarity For All Points")
             all_button.clicked.connect(self._create_layers_for_all_points)
 
+            zarr_path_row = QHBoxLayout()
+            zarr_path_row.addWidget(self.zarr_path_edit)
+            zarr_path_row.addWidget(browse_zarr_button)
+
+            zarr_scale_row = QHBoxLayout()
+            zarr_scale_row.addWidget(self.zarr_scale_combo)
+            zarr_scale_row.addWidget(load_scales_button)
+            zarr_scale_row.addWidget(open_zarr_button)
+
             checkpoint_row = QHBoxLayout()
             checkpoint_row.addWidget(self.checkpoint_path_edit)
-            checkpoint_row.addWidget(browse_button)
+            checkpoint_row.addWidget(browse_checkpoint_button)
 
             form_layout = QFormLayout()
+            form_layout.addRow("OME-Zarr", zarr_path_row)
+            form_layout.addRow("Zarr Scale", zarr_scale_row)
             form_layout.addRow("Checkpoint", checkpoint_row)
             form_layout.addRow("Normalization", self.normalization_combo)
             form_layout.addRow("Image Layer", self.image_layer_combo)
@@ -668,10 +964,28 @@ if _QT_AVAILABLE:
             layout.addWidget(self.status_label)
             self.setLayout(layout)
 
+            self.normalization_combo.currentTextChanged.connect(self._invalidate_cache)
+            self.image_layer_combo.currentTextChanged.connect(self._invalidate_cache)
+            self.zarr_scale_combo.currentIndexChanged.connect(self._invalidate_cache)
+
             self.refresh_layer_choices()
 
         def _set_status(self, message: str) -> None:
             self.status_label.setText(message)
+
+        def _invalidate_cache(self, *_args: Any) -> None:
+            self.embedding_cache = None
+
+        def _browse_zarr_directory(self) -> None:
+            directory = QFileDialog.getExistingDirectory(
+                self,
+                "Select OME-Zarr directory",
+                str(Path.cwd()),
+            )
+            if not directory:
+                return
+            self.zarr_path_edit.setText(directory)
+            self._load_zarr_scales()
 
         def _browse_checkpoint(self) -> None:
             filename, _ = QFileDialog.getOpenFileName(
@@ -684,8 +998,86 @@ if _QT_AVAILABLE:
                 return
             self.checkpoint_path_edit.setText(filename)
             self.loaded_backbone = None
-            self.embedding_cache = None
+            self._invalidate_cache()
             self._set_status("Checkpoint updated.")
+
+        def _load_zarr_scales(self) -> None:
+            path_text = self.zarr_path_edit.text().strip()
+            current_index = self.zarr_scale_combo.currentIndex()
+            self.zarr_scale_combo.clear()
+            self.ome_zarr_spec = None
+            if not path_text:
+                return
+
+            spec = load_ome_zarr_spec(path_text)
+            self.ome_zarr_spec = spec
+            for scale in spec.scales:
+                label = (
+                    f"{scale.index}: {scale.path} | shape={scale.spatial_shape} | "
+                    f"voxel={tuple(round(v, 6) for v in scale.spatial_scale)}"
+                )
+                self.zarr_scale_combo.addItem(label)
+
+            if spec.scales:
+                self.zarr_scale_combo.setCurrentIndex(max(0, min(current_index, len(spec.scales) - 1)))
+            self._set_status(f"Loaded {len(spec.scales)} OME-Zarr scale(s) from {spec.path}.")
+
+        def _selected_zarr_scale(self) -> OmeZarrScale:
+            if self.ome_zarr_spec is None:
+                self._load_zarr_scales()
+            if self.ome_zarr_spec is None or not self.ome_zarr_spec.scales:
+                raise ValueError("load an OME-Zarr before opening a scale")
+
+            scale_index = self.zarr_scale_combo.currentIndex()
+            if scale_index < 0:
+                scale_index = 0
+            return self.ome_zarr_spec.scales[scale_index]
+
+        def _open_zarr(self) -> None:
+            selected_scale = self._selected_zarr_scale()
+            if self.ome_zarr_spec is None:
+                raise RuntimeError("OME-Zarr metadata was not loaded")
+
+            self._set_status(
+                f"Opening {Path(self.ome_zarr_spec.path.rstrip('/')).name or self.ome_zarr_spec.path} "
+                f"scale {selected_scale.index}..."
+            )
+            image_data = load_ome_zarr_array(self.ome_zarr_spec.path, selected_scale)
+            layer_scale, layer_translate = ome_zarr_layer_transform(selected_scale)
+            layer_basename = Path(self.ome_zarr_spec.path.rstrip("/")).name or self.ome_zarr_spec.path.rstrip("/").split("/")[-1]
+            layer_name = f"{layer_basename}_s{selected_scale.index}"
+            bbox_layer_name = f"{layer_name}_bbox"
+            metadata = {
+                "ome_zarr_path": self.ome_zarr_spec.path,
+                "ome_zarr_scale_index": int(selected_scale.index),
+                "ome_zarr_scale_path": selected_scale.path,
+                "ome_zarr_axes": list(selected_scale.axes),
+                "bbox_layer_name": bbox_layer_name,
+            }
+
+            if layer_name in self.viewer.layers:
+                image_layer = self.viewer.layers[layer_name]
+                image_layer.data = image_data
+                image_layer.scale = layer_scale
+                image_layer.translate = layer_translate
+                image_layer.metadata = metadata
+            else:
+                image_layer = self.viewer.add_image(
+                    image_data,
+                    name=layer_name,
+                    scale=layer_scale,
+                    translate=layer_translate,
+                    metadata=metadata,
+                )
+
+            bbox_layer = self._ensure_bbox_layer_for_image(image_layer)
+            self._invalidate_cache()
+            self.refresh_layer_choices()
+            self._restore_combo_text(self.image_layer_combo, image_layer.name)
+            self._set_status(
+                f"Opened {layer_name}. Draw a rectangle in {bbox_layer.name}; embeddings use that YX bbox "
+                f"across the full Z span of scale {selected_scale.index}."
+            )
 
         def refresh_layer_choices(self) -> None:
             from napari.layers import Image, Points
@@ -732,6 +1124,7 @@ if _QT_AVAILABLE:
 
             checkpoint_path = Path(checkpoint_text).expanduser().resolve()
             if self.loaded_backbone is not None and self.loaded_backbone.checkpoint_path == checkpoint_path:
+                self.loaded_backbone.normalization_scheme = self.normalization_combo.currentText()
                 return self.loaded_backbone
 
             self._set_status("Loading checkpoint...")
@@ -739,22 +1132,135 @@ if _QT_AVAILABLE:
             combo_index = self.normalization_combo.findText(loaded_backbone.normalization_scheme)
             if combo_index >= 0:
                 self.normalization_combo.setCurrentIndex(combo_index)
+            loaded_backbone.normalization_scheme = self.normalization_combo.currentText()
             self.loaded_backbone = loaded_backbone
-            self.embedding_cache = None
+            self._invalidate_cache()
             self._set_status(
                 f"Loaded {loaded_backbone.source_branch} backbone from {checkpoint_path.name} on "
                 f"{loaded_backbone.device.type} with patch size {loaded_backbone.patch_size}."
             )
             return loaded_backbone
 
+        def _bbox_layer_for_image(self, image_layer: Any) -> Any | None:
+            from napari.layers import Shapes
+
+            bbox_layer_name = str((getattr(image_layer, "metadata", {}) or {}).get("bbox_layer_name", "")).strip()
+            if not bbox_layer_name:
+                return None
+            if bbox_layer_name not in self.viewer.layers:
+                raise ValueError(
+                    f"bbox layer {bbox_layer_name!r} is missing; reopen the OME-Zarr to recreate it"
+                )
+            bbox_layer = self.viewer.layers[bbox_layer_name]
+            if not isinstance(bbox_layer, Shapes):
+                raise ValueError(f"bbox layer {bbox_layer_name!r} is not a Shapes layer")
+            return bbox_layer
+
+        def _ensure_bbox_layer_for_image(self, image_layer: Any) -> Any:
+            from napari.layers import Shapes
+
+            metadata = dict(getattr(image_layer, "metadata", {}) or {})
+            bbox_layer_name = str(metadata.get("bbox_layer_name", f"{image_layer.name}_bbox")).strip()
+            metadata["bbox_layer_name"] = bbox_layer_name
+            image_layer.metadata = metadata
+
+            image_scale = tuple(float(v) for v in np.asarray(image_layer.scale, dtype=np.float64))
+            image_translate = tuple(float(v) for v in np.asarray(image_layer.translate, dtype=np.float64))
+            bbox_metadata = {
+                "target_image_layer": image_layer.name,
+                "ome_zarr_path": metadata.get("ome_zarr_path"),
+                "ome_zarr_scale_index": metadata.get("ome_zarr_scale_index"),
+            }
+
+            if bbox_layer_name in self.viewer.layers:
+                bbox_layer = self.viewer.layers[bbox_layer_name]
+                if not isinstance(bbox_layer, Shapes):
+                    raise ValueError(f"existing layer {bbox_layer_name!r} is not a Shapes layer")
+                bbox_layer.scale = image_scale
+                bbox_layer.translate = image_translate
+                bbox_layer.metadata = bbox_metadata
+                return bbox_layer
+
+            return self.viewer.add_shapes(
+                ndim=np.asarray(image_layer.data).ndim,
+                name=bbox_layer_name,
+                scale=image_scale,
+                translate=image_translate,
+                edge_color="yellow",
+                face_color=[0.0, 0.0, 0.0, 0.0],
+                edge_width=2.0,
+                metadata=bbox_metadata,
+            )
+
+        def _primary_rectangle_index(self, bbox_layer: Any) -> int:
+            shape_types = [str(shape_type).strip().lower() for shape_type in getattr(bbox_layer, "shape_type", [])]
+            rectangle_indices = [index for index, shape_type in enumerate(shape_types) if shape_type == "rectangle"]
+            if not rectangle_indices:
+                raise ValueError(f"draw a rectangle in {bbox_layer.name} to define the active bbox")
+
+            selected_rectangles = [
+                int(index)
+                for index in sorted(int(index) for index in getattr(bbox_layer, "selected_data", set()))
+                if index in rectangle_indices
+            ]
+            if len(selected_rectangles) == 1:
+                return selected_rectangles[0]
+            if len(rectangle_indices) == 1:
+                return rectangle_indices[0]
+            raise ValueError(f"select exactly one rectangle in {bbox_layer.name}")
+
+        def _spatial_crop_for_image(
+            self,
+            *,
+            image_layer: Any,
+            loaded_backbone: LoadedBackbone,
+        ) -> SpatialCrop:
+            source_shape = infer_image_spatial_shape(
+                np.asarray(image_layer.data),
+                input_channels=loaded_backbone.input_channels,
+            )
+            bbox_layer = self._bbox_layer_for_image(image_layer)
+            if bbox_layer is None:
+                return SpatialCrop((0, 0, 0), source_shape, None)
+
+            rectangle_index = self._primary_rectangle_index(bbox_layer)
+            rectangle_vertices = np.asarray(bbox_layer.data[rectangle_index], dtype=np.float64)
+            world_vertices = np.asarray(
+                [bbox_layer.data_to_world(vertex) for vertex in rectangle_vertices],
+                dtype=np.float64,
+            )
+            image_vertices = np.asarray(
+                [image_layer.world_to_data(vertex) for vertex in world_vertices],
+                dtype=np.float64,
+            )
+            spatial_vertices = image_vertices[:, -3:]
+
+            y0 = max(0, int(np.floor(np.min(spatial_vertices[:, 1]))))
+            x0 = max(0, int(np.floor(np.min(spatial_vertices[:, 2]))))
+            y1 = min(source_shape[1], int(np.ceil(np.max(spatial_vertices[:, 1]))))
+            x1 = min(source_shape[2], int(np.ceil(np.max(spatial_vertices[:, 2]))))
+            if y1 <= y0 or x1 <= x0:
+                raise ValueError(f"bbox rectangle in {bbox_layer.name} collapses after scaling; redraw it")
+
+            return SpatialCrop(
+                start_zyx=(0, y0, x0),
+                stop_zyx=(source_shape[0], y1, x1),
+                bbox_layer_name=bbox_layer.name,
+            )
+
         def _cache_embeddings(self) -> None:
             loaded_backbone = self._load_backbone()
             image_layer = self._selected_image_layer()
-            self._set_status(f"Computing patch embeddings for {image_layer.name}...")
+            spatial_crop = self._spatial_crop_for_image(image_layer=image_layer, loaded_backbone=loaded_backbone)
+            self._set_status(f"Computing patch embeddings for {image_layer.name} within bbox {spatial_crop.bounds}...")
 
-            loaded_backbone.normalization_scheme = self.normalization_combo.currentText()
-            patch_embeddings, source_shape, padded_shape = compute_patch_embedding_grid(
+            cropped_volume = crop_image_to_spatial_bbox(
                 np.asarray(image_layer.data),
+                spatial_crop.bounds,
+                input_channels=loaded_backbone.input_channels,
+            )
+            patch_embeddings, source_shape, padded_shape = compute_patch_embedding_grid(
+                cropped_volume,
                 loaded_backbone,
             )
             self.embedding_cache = EmbeddingCache(
@@ -764,19 +1270,25 @@ if _QT_AVAILABLE:
                 padded_shape=padded_shape,
                 patch_size=loaded_backbone.patch_size,
                 normalized_patch_embeddings=patch_embeddings,
+                source_bbox=spatial_crop.bounds,
+                bbox_layer_name=spatial_crop.bbox_layer_name,
             )
             patch_grid_shape = patch_embeddings.shape[:3]
             self._set_status(
-                f"Cached embeddings for {image_layer.name}: patch grid {patch_grid_shape}, source shape {source_shape}."
+                f"Cached embeddings for {image_layer.name}: patch grid {patch_grid_shape}, "
+                f"crop shape {source_shape}, crop bbox {spatial_crop.bounds}."
             )
 
         def _ensure_embedding_cache(self) -> tuple[LoadedBackbone, EmbeddingCache]:
             loaded_backbone = self._load_backbone()
             image_layer = self._selected_image_layer()
+            spatial_crop = self._spatial_crop_for_image(image_layer=image_layer, loaded_backbone=loaded_backbone)
             if (
                 self.embedding_cache is None
                 or self.embedding_cache.checkpoint_path != loaded_backbone.checkpoint_path
                 or self.embedding_cache.image_layer_name != image_layer.name
+                or self.embedding_cache.source_bbox != spatial_crop.bounds
+                or self.embedding_cache.bbox_layer_name != spatial_crop.bbox_layer_name
             ):
                 self._cache_embeddings()
             if self.embedding_cache is None:
@@ -803,10 +1315,14 @@ if _QT_AVAILABLE:
             layer_name: str,
             similarity_volume: np.ndarray,
             image_layer: Any,
+            spatial_bbox: tuple[int, int, int, int, int, int],
             metadata: dict[str, Any],
         ) -> None:
             spatial_scale = tuple(float(v) for v in np.asarray(image_layer.scale, dtype=np.float64)[-3:])
-            spatial_translate = tuple(float(v) for v in np.asarray(image_layer.translate, dtype=np.float64)[-3:])
+            spatial_translate = cropped_spatial_translate(
+                image_layer,
+                crop_start_zyx=tuple(int(v) for v in spatial_bbox[:3]),
+            )
             if layer_name in self.viewer.layers:
                 layer = self.viewer.layers[layer_name]
                 layer.data = similarity_volume
@@ -834,10 +1350,14 @@ if _QT_AVAILABLE:
             layer_name: str,
             pca_volume: np.ndarray,
             image_layer: Any,
+            spatial_bbox: tuple[int, int, int, int, int, int],
             metadata: dict[str, Any],
         ) -> None:
             spatial_scale = tuple(float(v) for v in np.asarray(image_layer.scale, dtype=np.float64)[-3:])
-            spatial_translate = tuple(float(v) for v in np.asarray(image_layer.translate, dtype=np.float64)[-3:])
+            spatial_translate = cropped_spatial_translate(
+                image_layer,
+                crop_start_zyx=tuple(int(v) for v in spatial_bbox[:3]),
+            )
             if layer_name in self.viewer.layers:
                 layer = self.viewer.layers[layer_name]
                 layer.data = pca_volume
@@ -870,8 +1390,13 @@ if _QT_AVAILABLE:
                 return None, None
 
             dilation_radius = int(self.mask_dilation_spinbox.value())
-            foreground_mask = compute_otsu_foreground_mask(
+            cropped_image = crop_image_to_spatial_bbox(
                 np.asarray(image_layer.data),
+                embedding_cache.source_bbox,
+                input_channels=loaded_backbone.input_channels,
+            )
+            foreground_mask = compute_otsu_foreground_mask(
+                cropped_image,
                 input_channels=loaded_backbone.input_channels,
                 dilation_radius=dilation_radius,
             )
@@ -887,11 +1412,19 @@ if _QT_AVAILABLE:
             image_layer = self._selected_image_layer()
             points_layer = self._selected_points_layer()
             patch_grid_shape = embedding_cache.normalized_patch_embeddings.shape[:3]
+            crop_origin = np.asarray(embedding_cache.source_bbox[:3], dtype=np.float64)
 
+            created_count = 0
+            skipped_points: list[int] = []
             for point_index in point_indices:
                 image_coords = self._point_image_coordinates(image_layer, points_layer, point_index)
+                if not point_within_spatial_bbox(image_coords, spatial_bbox=embedding_cache.source_bbox):
+                    skipped_points.append(int(point_index))
+                    continue
+
+                local_image_coords = image_coords - crop_origin
                 reference_patch_index = point_to_patch_index(
-                    image_coords,
+                    local_image_coords,
                     source_shape=embedding_cache.source_shape,
                     patch_size=embedding_cache.patch_size,
                     patch_grid_shape=patch_grid_shape,
@@ -910,21 +1443,32 @@ if _QT_AVAILABLE:
                     "checkpoint_path": str(embedding_cache.checkpoint_path),
                     "reference_point_index": int(point_index),
                     "reference_point_zyx": image_coords.tolist(),
+                    "reference_point_local_zyx": local_image_coords.tolist(),
                     "reference_patch_index": list(reference_patch_index),
+                    "source_bbox_zyxzyx": list(embedding_cache.source_bbox),
+                    "bbox_layer_name": embedding_cache.bbox_layer_name,
                 }
                 self._replace_or_add_similarity_layer(
                     layer_name=layer_name,
                     similarity_volume=dense_similarity,
                     image_layer=image_layer,
+                    spatial_bbox=embedding_cache.source_bbox,
                     metadata=metadata,
                 )
+                created_count += 1
 
-            self._set_status(f"Created {len(point_indices)} cosine similarity layer(s).")
+            if created_count == 0:
+                raise ValueError("no requested points fall inside the active bbox")
+
+            status = f"Created {created_count} cosine similarity layer(s) within bbox {embedding_cache.source_bbox}."
+            if skipped_points:
+                status += f" Skipped points outside bbox: {skipped_points}."
+            self._set_status(status)
 
         def _show_feature_pca(self) -> None:
             loaded_backbone, embedding_cache = self._ensure_embedding_cache()
             image_layer = self._selected_image_layer()
-            self._set_status(f"Computing PCA visualization for {image_layer.name}...")
+            self._set_status(f"Computing PCA visualization for {image_layer.name} within bbox...")
 
             foreground_mask, patch_mask = self._foreground_mask_for_pca(
                 image_layer=image_layer,
@@ -948,11 +1492,14 @@ if _QT_AVAILABLE:
                 "checkpoint_path": str(embedding_cache.checkpoint_path),
                 "mask_method": "otsu" if foreground_mask is not None else "none",
                 "mask_dilation_radius": int(self.mask_dilation_spinbox.value()) if foreground_mask is not None else 0,
+                "source_bbox_zyxzyx": list(embedding_cache.source_bbox),
+                "bbox_layer_name": embedding_cache.bbox_layer_name,
             }
             self._replace_or_add_pca_layer(
                 layer_name=layer_name,
                 pca_volume=pca_volume,
                 image_layer=image_layer,
+                spatial_bbox=embedding_cache.source_bbox,
                 metadata=metadata,
             )
 
@@ -961,7 +1508,10 @@ if _QT_AVAILABLE:
                 if foreground_mask is not None
                 else ""
             )
-            self._set_status(f"Created PCA feature layer for {image_layer.name}{mask_suffix}.")
+            self._set_status(
+                f"Created PCA feature layer for {image_layer.name} within bbox {embedding_cache.source_bbox}"
+                f"{mask_suffix}."
+            )
 
         def _create_layers_for_selected_points(self) -> None:
             points_layer = self._selected_points_layer()
@@ -984,7 +1534,7 @@ def add_cosine_similarity_widget(viewer: Any) -> Any:
     if not _QT_AVAILABLE or CosineSimilarityWidget is None:
         raise ImportError("qtpy is required to create the cosine similarity widget")
     widget = CosineSimilarityWidget(viewer)
-    viewer.window.add_dock_widget(widget, area="right", name="DINO Cosine Similarity")
+    viewer.window.add_dock_widget(widget, area="bottom", name="DINO Cosine Similarity")
     return widget
 
 

@@ -26,12 +26,13 @@ There is a small napari helper for checkpoint inspection at `dinovol_2/eval/napa
 Run it with:
 
 ```bash
-python -m dinovol_2.eval.napari_cosine_similarity
+python -m dinovol_2.eval.napari_visualizer
 ```
 
 Workflow:
 
-- load a volume into napari
+- open an OME-Zarr from the widget, click `Load Scales`, choose the desired scale, and click `Open Zarr`
+- draw a rectangle in the generated `*_bbox` shapes layer; this 2D YX bbox is applied across the full Z span of the selected scale
 - add one or more points in a `Points` layer
 - choose a `pretrain.py` checkpoint, image layer, and points layer in the dock widget
 - click `Cache Embeddings`
@@ -39,4 +40,4 @@ Workflow:
 - optionally enable `Otsu Foreground Mask` and set `Mask Dilation` before creating the PCA layer
 - click `Similarity For Selected Points` or `Similarity For All Points`
 
-The widget rebuilds the teacher backbone from the saved checkpoint config, computes a patch embedding grid for the selected volume, and creates one cosine-similarity image layer per reference point across the full volume.
+The widget rebuilds the teacher backbone from the saved checkpoint config, computes a patch embedding grid only inside the active bbox for the selected OME-Zarr scale, and limits the PCA and cosine-similarity outputs to that same crop. The dock widget opens on the bottom of the napari window.
