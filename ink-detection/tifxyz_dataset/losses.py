@@ -312,7 +312,34 @@ def _max_pool_spatial(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
 
 
 def _min_pool_spatial(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
-    return -_max_pool_spatial(-x, kernel_size)
+    if kernel_size == 1:
+        return x
+    if x.device.type == "cuda":
+        return -_max_pool_spatial(-x, kernel_size)
+    return _min_pool_spatial_unfold(x, kernel_size)
+
+
+def _pad_spatial_dim_constant(x: torch.Tensor, dim: int, padding: int, value: float) -> torch.Tensor:
+    spatial_dims = x.ndim - 2
+    spatial_index = dim - 2
+    pad = [0] * (2 * spatial_dims)
+    pad_offset = 2 * (spatial_dims - spatial_index - 1)
+    pad[pad_offset] = padding
+    pad[pad_offset + 1] = padding
+    return F.pad(x, pad, mode="constant", value=value)
+
+
+def _min_pool_spatial_unfold(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    if not torch.is_floating_point(x):
+        raise TypeError(f"Expected floating point tensor for boundary loss, got {x.dtype}")
+
+    out = x
+    padding = kernel_size // 2
+    pad_value = torch.finfo(out.dtype).max
+    for dim in range(2, out.ndim):
+        out = _pad_spatial_dim_constant(out, dim, padding, pad_value)
+        out = out.unfold(dim, kernel_size, 1).amin(dim=-1)
+    return out
 
 
 def _erode_spatial(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
@@ -540,22 +567,15 @@ class BoundaryLoss(nn.Module):
             return zero, aux
 
         target_regions, valid_mask = _extract_target_regions_and_valid_mask(input, target, loss_mask=loss_mask)
-        pred_fg = _foreground_probabilities(input).float()
-        tgt_fg = target_regions.float()
+        pred_fg = _foreground_probabilities(input)
+        tgt_fg = target_regions.to(device=pred_fg.device, dtype=pred_fg.dtype)
 
         pred_boundary = _boundary_map(pred_fg, self.kernel_size)
         tgt_boundary = _boundary_map(tgt_fg, self.kernel_size)
 
         boundary_valid_mask = None
         if valid_mask is not None:
-            boundary_valid_mask = _erode_spatial(valid_mask.float(), self.kernel_size)
-            if torch.count_nonzero(boundary_valid_mask) == 0:
-                zero = input.new_tensor(0.0)
-                aux = {
-                    "boundary/bce": zero.reshape(1),
-                    "boundary/dice": zero.reshape(1),
-                }
-                return zero, aux
+            boundary_valid_mask = _erode_spatial(valid_mask.to(device=pred_fg.device, dtype=pred_fg.dtype), self.kernel_size)
 
         bce_loss = input.new_zeros(())
         if self.weight_bce > 0.0:
