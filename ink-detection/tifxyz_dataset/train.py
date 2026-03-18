@@ -285,6 +285,8 @@ def train(config_path):
 
     progress_bar = tqdm(
         range(start_step, config['num_iterations']),
+        total=config['num_iterations'],
+        initial=start_step,
         disable=not accelerator.is_main_process,
         dynamic_ncols=True,
     )
