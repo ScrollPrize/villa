@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
-from tifffile import memmap
+from tifffile import imread
 from torch import nn
 from tqdm.auto import tqdm
 
@@ -74,7 +74,7 @@ def resolve_resize_task_data(value: Any) -> float:
 
 
 def _read_volume(path: Path) -> np.ndarray:
-    return np.asarray(memmap(path))
+    return np.asarray(imread(path))
 
 
 def _scaled_shape(shape: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
