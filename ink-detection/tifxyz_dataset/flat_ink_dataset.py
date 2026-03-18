@@ -9,7 +9,13 @@ from torch.utils.data import Dataset
 import zarr
 import numpy as np 
 import tifffile
-from common import flat_patch_cache_path, load_flat_patch_cache, open_zarr, save_flat_patch_cache
+from common import (
+    _read_bbox_with_padding,
+    flat_patch_cache_path,
+    load_flat_patch_cache,
+    open_zarr,
+    save_flat_patch_cache,
+)
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.image_proc.intensity.normalization import normalize_robust
 
@@ -185,16 +191,44 @@ class FlatInkDataset(Dataset):
     def __getitem__(self, idx):
         patch = self.patches[idx]
         z0, y0, x0, z1, y1, x1 = patch.bbox
+        expected_shape = tuple(int(v) for v in self.patch_size)
 
         image_vol = open_zarr(patch.image_volume, resolution=patch.segment.scale, auth=self.vol_auth)
         supervision_mask = open_zarr(patch.supervision_mask, resolution=patch.segment.scale, auth=self.vol_auth)
         inklabels = open_zarr(patch.inklabels, resolution=patch.segment.scale, auth=self.vol_auth)
 
-        image_crop = image_vol[z0:z1, y0:y1, x0:x1]
-        supervision_crop = supervision_mask[z0:z1, y0:y1, x0:x1]
-        inklabels_crop = inklabels[z0:z1, y0:y1, x0:x1]
+        image_crop, image_valid_slices = _read_bbox_with_padding(
+            image_vol,
+            patch.bbox,
+            fill_value=0,
+        )
+        supervision_crop, _ = _read_bbox_with_padding(
+            supervision_mask,
+            patch.bbox,
+            fill_value=0,
+        )
+        inklabels_crop, _ = _read_bbox_with_padding(
+            inklabels,
+            patch.bbox,
+            fill_value=0,
+        )
 
-        image_crop = normalize_robust(image_crop)
+        if image_valid_slices is not None:
+            image_crop = image_crop.astype(np.float32, copy=False)
+            image_crop[image_valid_slices] = normalize_robust(image_crop[image_valid_slices])
+        else:
+            image_crop = image_crop.astype(np.float32, copy=False)
+
+        for name, array in (
+            ("image", image_crop),
+            ("supervision_mask", supervision_crop),
+            ("inklabels", inklabels_crop),
+        ):
+            if tuple(int(v) for v in array.shape) != expected_shape:
+                raise AssertionError(
+                    f"{name} crop shape {tuple(int(v) for v in array.shape)} does not match "
+                    f"requested patch size {expected_shape} for bbox {patch.bbox!r}"
+                )
 
         surface_mask = None
         if self.config.get('show_surface_mask', False):

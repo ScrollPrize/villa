@@ -151,6 +151,48 @@ def _normalize_patch_size_zyx(patch_size):
         )
     return patch_size_zyx
 
+
+def _read_bbox_with_padding(volume, bbox, *, fill_value=0):
+    z0, y0, x0, z1, y1, x1 = (int(v) for v in bbox)
+    expected_shape = (z1 - z0, y1 - y0, x1 - x0)
+    if any(size <= 0 for size in expected_shape):
+        raise ValueError(f"bbox must define a positive crop, got {bbox!r}")
+
+    volume_shape = tuple(int(v) for v in volume.shape[:3])
+    src_starts = (
+        max(0, z0),
+        max(0, y0),
+        max(0, x0),
+    )
+    src_stops = (
+        min(volume_shape[0], z1),
+        min(volume_shape[1], y1),
+        min(volume_shape[2], x1),
+    )
+
+    dtype = np.asarray(volume[(slice(0, 1),) * 3]).dtype
+    output = np.full(expected_shape, fill_value, dtype=dtype)
+
+    if any(stop <= start for start, stop in zip(src_starts, src_stops)):
+        return output, None
+
+    crop = np.asarray(
+        volume[
+            src_starts[0]:src_stops[0],
+            src_starts[1]:src_stops[1],
+            src_starts[2]:src_stops[2],
+        ]
+    )
+    dst_starts = (
+        src_starts[0] - z0,
+        src_starts[1] - y0,
+        src_starts[2] - x0,
+    )
+    dst_stops = tuple(dst_start + size for dst_start, size in zip(dst_starts, crop.shape))
+    dst_slices = tuple(slice(start, stop) for start, stop in zip(dst_starts, dst_stops))
+    output[dst_slices] = crop
+    return output, dst_slices
+
 def _normalize_vectors_last_axis(vectors, eps=1e-6):
     vectors = np.asarray(vectors, dtype=np.float32)
     norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
