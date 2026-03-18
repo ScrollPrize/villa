@@ -854,6 +854,7 @@ def project_patch_embeddings_to_pca_rgb(
 
 
 try:
+    from qtpy.QtCore import Qt
     from qtpy.QtWidgets import (
         QCheckBox,
         QFileDialog,
@@ -862,6 +863,7 @@ try:
         QLabel,
         QLineEdit,
         QPushButton,
+        QScrollArea,
         QSpinBox,
         QVBoxLayout,
         QWidget,
@@ -958,10 +960,20 @@ if _QT_AVAILABLE:
             button_layout.addWidget(selected_button)
             button_layout.addWidget(all_button)
 
+            content_widget = QWidget()
+            content_layout = QVBoxLayout()
+            content_layout.addLayout(form_layout)
+            content_layout.addLayout(button_layout)
+            content_layout.addWidget(self.status_label)
+            content_widget.setLayout(content_layout)
+
+            scroll_area = QScrollArea()
+            scroll_area.setWidgetResizable(True)
+            scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll_area.setWidget(content_widget)
+
             layout = QVBoxLayout()
-            layout.addLayout(form_layout)
-            layout.addLayout(button_layout)
-            layout.addWidget(self.status_label)
+            layout.addWidget(scroll_area)
             self.setLayout(layout)
 
             self.normalization_combo.currentTextChanged.connect(self._invalidate_cache)
