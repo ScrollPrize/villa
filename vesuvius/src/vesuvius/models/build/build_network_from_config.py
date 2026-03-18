@@ -50,6 +50,7 @@ from .encoder import Encoder
 from .decoder import Decoder
 from .activations import SwiGLUBlock, GLUBlock
 from .primus_wrapper import PrimusEncoder, PrimusDecoder
+from .pretrained_backbones.dinov2 import build_dinov2_backbone, build_dinov2_decoder
 
 
 class LearnedMLPZProjection(nn.Module):
@@ -243,8 +244,19 @@ class NetworkFromConfig(nn.Module):
         self.save_config = False
         
         self.architecture_type = model_config.get("architecture_type", "unet")
+        self.pretrained_backbone = model_config.get("pretrained_backbone")
         # Determine if deep supervision is requested
         ds_enabled = bool(getattr(mgr, 'enable_deep_supervision', False))
+
+        if self.pretrained_backbone:
+            if ds_enabled:
+                print(
+                    "Warning: Deep supervision is enabled but the selected pretrained backbone path does not "
+                    "support multi-scale logits. Disabling deep supervision for this run."
+                )
+                setattr(mgr, "enable_deep_supervision", False)
+            self._init_pretrained_backbone(mgr, model_config)
+            return
 
         # Primus decoders do not emit multi-scale logits; block DS to avoid silent misconfiguration
         if self.architecture_type.lower().startswith("primus"):
@@ -754,6 +766,83 @@ class NetworkFromConfig(nn.Module):
         for k, v in self.final_config.items():
             print(f"  {k}: {v}")
     
+    def _init_pretrained_backbone(self, mgr, model_config):
+        print(f"--- Initializing pretrained backbone '{self.pretrained_backbone}' ---")
+        input_shape = tuple(model_config.get("input_shape", self.patch_size))
+        decoder_type = model_config.get("pretrained_decoder_type", "primus_patch_decode")
+
+        self.shared_encoder = build_dinov2_backbone(
+            self.pretrained_backbone,
+            input_channels=self.in_channels,
+            input_shape=input_shape,
+        )
+        self.task_decoders = nn.ModuleDict()
+        self.task_activations = nn.ModuleDict()
+        self.task_heads = nn.ModuleDict()
+
+        separate_decoders_default = model_config.get("separate_decoders", True)
+        decoder_head_channels = model_config.get("decoder_head_channels", 32)
+        tasks_using_shared, tasks_using_separate = set(), set()
+
+        for target_name, target_info in self.targets.items():
+            if 'out_channels' in target_info:
+                out_channels = target_info['out_channels']
+            elif 'channels' in target_info:
+                out_channels = target_info['channels']
+            else:
+                out_channels = self.in_channels
+                print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels")
+            target_info["out_channels"] = out_channels
+            self._register_target_projection(target_name, target_info, model_config)
+
+            use_separate = target_info.get("separate_decoder", separate_decoders_default)
+            if use_separate:
+                tasks_using_separate.add(target_name)
+            else:
+                tasks_using_shared.add(target_name)
+
+        if len(tasks_using_shared) > 0:
+            self.shared_decoder = build_dinov2_decoder(decoder_type, self.shared_encoder, decoder_head_channels)
+            head_conv = nn.Conv2d if self.shared_encoder.ndim == 2 else nn.Conv3d
+            for target_name in sorted(tasks_using_shared):
+                out_ch = self.targets[target_name]["out_channels"]
+                self.task_heads[target_name] = head_conv(
+                    decoder_head_channels, out_ch, kernel_size=1, stride=1, padding=0, bias=True
+                )
+                activation_str = self.targets[target_name].get("activation", "none")
+                self.task_activations[target_name] = get_activation_module(activation_str)
+                print(
+                    f"Pretrained task '{target_name}' configured with shared {decoder_type} decoder + head ({out_ch} channels)"
+                )
+
+        for target_name in sorted(tasks_using_separate):
+            out_channels = self.targets[target_name]["out_channels"]
+            activation_str = self.targets[target_name].get("activation", "none")
+            self.task_decoders[target_name] = build_dinov2_decoder(
+                decoder_type,
+                self.shared_encoder,
+                out_channels,
+            )
+            self.task_activations[target_name] = get_activation_module(activation_str)
+            print(f"Pretrained task '{target_name}' configured with separate {decoder_type} decoder ({out_channels} channels)")
+
+        self.final_config = {
+            "model_name": self.mgr.model_name,
+            "architecture_type": self.architecture_type,
+            "pretrained_backbone": self.pretrained_backbone,
+            "pretrained_decoder_type": decoder_type,
+            "input_shape": input_shape,
+            "in_channels": self.in_channels,
+            "targets": self.targets,
+            "target_z_projection": self.task_z_projection_cfg,
+            "separate_decoders": len(tasks_using_separate) > 0,
+            "decoder_head_channels": decoder_head_channels,
+        }
+
+        print("Pretrained backbone network initialized with configuration:")
+        for k, v in self.final_config.items():
+            print(f"  {k}: {v}")
+
     def _init_primus(self, mgr, model_config):
         """
         Initialize Primus transformer architecture.
