@@ -22,14 +22,13 @@ from numcodecs import LZ4
 from tqdm.auto import tqdm
 import fsspec
 from vendored_cache_store import CacheStore
-from zarr.storage import LocalStore, FsspecStore
+from zarr.storage import LocalStore, FsspecStore, MemoryStore
 
 from k8s import get_tqdm_kwargs
 from profiling import dir_size_bytes, get_active_profiler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 def path_exists(path: str) -> bool:
     """Check if path exists (supports local paths and S3 URLs)."""
@@ -98,6 +97,18 @@ def get_cached_zarr_store(path: str):
             f"  Cache size limit: {cache_size_gb} GB\n"
             f"  Cache max age: {cache_max_age}"
         )
+
+        # Optional in-memory layer on top of disk cache to avoid repeated
+        # pathlib read_bytes/open calls during sliding window inference.
+        mem_cache_mb = int(os.environ.get("ZARR_MEM_CACHE_MB", "512"))
+        if mem_cache_mb > 0:
+            cached_store = CacheStore(
+                store=cached_store,
+                cache_store=MemoryStore(),
+                max_size=mem_cache_mb * 1024 * 1024,
+                max_age_seconds="infinity",
+            )
+            logger.info(f"  In-memory cache layer: {mem_cache_mb} MB")
 
         return cached_store
 

@@ -1,9 +1,27 @@
 import os
 import io
 import sys
+import logging as _logging
+import warnings
 
 # Allow huge images before anything imports cv2 (and before importing inference_timesformer)
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
+
+# Suppress harmless "Unclosed client session / connector" noise from aiohttp.
+# s3fs/fsspec create aiohttp sessions that aren't explicitly closed when
+# DataLoader worker processes exit.  aiohttp.__del__ emits these via two paths:
+#   1) warnings.warn(..., ResourceWarning)  — suppressed by the filter below
+#   2) loop.call_exception_handler()        — suppressed by the asyncio log filter
+warnings.filterwarnings("ignore", message="Unclosed", category=ResourceWarning)
+
+
+class _FilterUnclosed(_logging.Filter):
+    def filter(self, record: _logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "Unclosed client session" not in msg and "Unclosed connector" not in msg
+
+
+_logging.getLogger("asyncio").addFilter(_FilterUnclosed())
 
 import json
 import time
