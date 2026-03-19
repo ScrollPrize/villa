@@ -272,7 +272,14 @@ def compute_targets_3d(
         cos, grad_mag,
         dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x,
     ], dim=1)
-    return targets, validity
+
+    # Per-direction-pair relevance: normal's projection magnitude into slice plane
+    w_dir_z = torch.sqrt(nx ** 2 + ny ** 2 + 1e-8)  # XY plane
+    w_dir_y = torch.sqrt(nx ** 2 + nz ** 2 + 1e-8)  # XZ plane
+    w_dir_x = torch.sqrt(ny ** 2 + nz ** 2 + 1e-8)  # YZ plane
+    dir_weight = torch.cat([w_dir_z, w_dir_z, w_dir_y, w_dir_y, w_dir_x, w_dir_x], dim=1)
+
+    return targets, validity, dir_weight
 
 
 # ---------------------------------------------------------------------------
@@ -379,14 +386,16 @@ class MaskedMSE(nn.Module):
         pred: torch.Tensor,
         target: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         diff = (pred - target) ** 2
         if mask is None:
             return diff.mean()
         if mask.ndim == pred.ndim - 1:
             mask = mask.unsqueeze(1)
-        diff = diff * mask
-        denom = mask.sum()
+        effective = mask * weight if weight is not None else mask
+        diff = diff * effective
+        denom = effective.sum()
         return diff.sum() / denom.clamp(min=1.0)
 
 
@@ -412,6 +421,7 @@ class ScaleSpaceLoss3D(nn.Module):
         pred: torch.Tensor,
         target: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x, y = pred, target
         m = None
@@ -420,10 +430,11 @@ class ScaleSpaceLoss3D(nn.Module):
             if m.ndim == 4:
                 m = m.unsqueeze(1)
             m = (m > 0.5).float()
+        w = weight
 
         total = torch.zeros((), device=pred.device, dtype=pred.dtype)
         for scale in range(self.num_scales):
-            total = total + self.base_loss(x, y, mask=m)
+            total = total + self.base_loss(x, y, mask=m, weight=w)
 
             if scale < self.num_scales - 1:
                 if x.size(2) < 2 or x.size(3) < 2 or x.size(4) < 2:
@@ -434,6 +445,8 @@ class ScaleSpaceLoss3D(nn.Module):
                     invalid = 1.0 - m
                     invalid_pooled = F.max_pool3d(invalid, kernel_size=2, stride=2)
                     m = 1.0 - invalid_pooled
+                if w is not None:
+                    w = -F.max_pool3d(-w, kernel_size=2, stride=2)  # min_pool
 
         return total
 
@@ -611,7 +624,7 @@ def train(
             image = augment_intensity(image)
 
             # Compute 8-channel targets on GPU
-            targets, mask = compute_targets_3d(normal, winding, validity, density)
+            targets, mask, dir_weight = compute_targets_3d(normal, winding, validity, density)
 
             if mask.sum() == 0:
                 print(f"WARNING: zero-validity batch, skipping: {batch['name']}")
@@ -628,11 +641,12 @@ def train(
                 targets = F.interpolate(targets, scale_factor=step, mode='trilinear', align_corners=False)
                 mask_up = F.interpolate(mask.float(), scale_factor=step, mode='trilinear', align_corners=False)
                 mask = (mask_up >= 1.0 - 1e-6).float()
+                dir_weight = F.interpolate(dir_weight, scale_factor=step, mode='trilinear', align_corners=False)
 
             # Per-channel-group losses with multi-scale
             loss_cos = scale_loss(pred[:, 0:1], targets[:, 0:1], mask=mask)
             loss_mag = scale_loss(pred[:, 1:2], targets[:, 1:2], mask=mask)
-            loss_dir = scale_loss(pred[:, 2:8], targets[:, 2:8], mask=mask)
+            loss_dir = scale_loss(pred[:, 2:8], targets[:, 2:8], mask=mask, weight=dir_weight)
             loss = w_cos * loss_cos + w_mag * loss_mag + w_dir * loss_dir
 
             optimizer.zero_grad(set_to_none=True)
@@ -705,7 +719,7 @@ def _evaluate(
             validity = batch["validity"].to(device)
             density = batch["density"].to(device)
 
-            targets, mask = compute_targets_3d(normal, winding, validity, density)
+            targets, mask, dir_weight = compute_targets_3d(normal, winding, validity, density)
             results = model(image)
             pred_full = results["output"]
             pred = torch.sigmoid(pred_full)
@@ -715,10 +729,11 @@ def _evaluate(
                 targets = F.interpolate(targets, scale_factor=step, mode='trilinear', align_corners=False)
                 mask_up = F.interpolate(mask.float(), scale_factor=step, mode='trilinear', align_corners=False)
                 mask = (mask_up >= 1.0 - 1e-6).float()
+                dir_weight = F.interpolate(dir_weight, scale_factor=step, mode='trilinear', align_corners=False)
 
             loss_cos = scale_loss(pred[:, 0:1], targets[:, 0:1], mask=mask)
             loss_mag = scale_loss(pred[:, 1:2], targets[:, 1:2], mask=mask)
-            loss_dir = scale_loss(pred[:, 2:8], targets[:, 2:8], mask=mask)
+            loss_dir = scale_loss(pred[:, 2:8], targets[:, 2:8], mask=mask, weight=dir_weight)
             loss = w_cos * loss_cos + w_mag * loss_mag + w_dir * loss_dir
             losses.append(loss.item())
             losses_cos.append(loss_cos.item())
