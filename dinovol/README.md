@@ -12,12 +12,17 @@ this implementation is still incomplete. pretraining works but no finetuning yet
 `pretrain.py` can optionally run small downstream segmentation trainings during pretraining.
 
 - set `task_eval_every` to a positive step cadence to enable it
-- choose `eval_task` as `both`, `fibers`, or `surfaces`
+- choose `eval_task` as `both`, `surfaces`, or `ink`
 - set `eval_task_train_iters` to control the mini-training length, default `500`
 - set `eval_task_decoder_type` to `simple` or `patch_encode_decode`
-- set `resize_task_data` to a scale factor before cropping task samples, with `0` meaning disabled
 
-The task data is downloaded with `python -m dinovol_2.eval.download_data --task both` and the first sorted sample for each task is reserved as the deterministic validation case.
+The task data is downloaded with `python -m dinovol_2.eval.download_data --task both`.
+
+- `both` now means `surfaces` plus `ink`
+- `surfaces` is resized 2x before crops are drawn
+- `ink` uses the first 5 sorted samples as the deterministic validation set
+- `ink` is not resized before crops are drawn
+- for `ink`, voxels with `supervision_mask == 0` are ignored and supervised unlabeled voxels are treated as background
 
 ## Napari visualizer
 

@@ -1,44 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import html
+import json
 from pathlib import Path
+import re
 from urllib.request import urlopen
 
 
 DATA_ROOT = Path(__file__).resolve().parent / "data"
-
-FIBER_IMAGE_URLS = [
-    "https://dl.ash2txt.org/datasets/fiber-skeletons/Dataset004_sk-fibers-binary-20250728/imagesTr/s1_00497_01497_03997_256_0000.tif",
-    "https://dl.ash2txt.org/datasets/fiber-skeletons/Dataset004_sk-fibers-binary-20250728/imagesTr/s1_08997_02997_02497_256_0000.tif",
-    "https://dl.ash2txt.org/datasets/fiber-skeletons/Dataset004_sk-fibers-binary-20250728/imagesTr/s3_01994_01494_00994_512_0000.tif",
-    "https://dl.ash2txt.org/datasets/fiber-skeletons/Dataset004_sk-fibers-binary-20250728/imagesTr/s5_06494_01994_03994_512_0000.tif",
-]
-
-FIBER_LABEL_URLS = [
-    "https://dl.ash2txt.org/datasets/fiber-skeletons/Dataset004_sk-fibers-binary-20250728/labelsTr/s1_00497_01497_03997_256.tif",
-    "https://dl.ash2txt.org/datasets/fiber-skeletons/Dataset004_sk-fibers-binary-20250728/labelsTr/s1_08997_02997_02497_256.tif",
-    "https://dl.ash2txt.org/datasets/fiber-skeletons/Dataset004_sk-fibers-binary-20250728/labelsTr/s3_01994_01494_00994_512.tif",
-    "https://dl.ash2txt.org/datasets/fiber-skeletons/Dataset004_sk-fibers-binary-20250728/labelsTr/s5_06494_01994_03994_512.tif",
-]
-
-SURFACE_STEMS = [
-    "sample_00807",
-    "sample_00808",
-    "sample_00809",
-    "sample_00810",
-    "sample_00908",
-    "sample_00909",
-    "sample_00910",
-    "sample_00911",
-    "sample_00912",
-    "sample_00913",
-    "sample_00914",
-    "sample_00915",
-    "sample_00916",
-]
-
-SURFACE_IMAGE_BASE = "https://dl.ash2txt.org/community-uploads/bruniss/labels/kds/images"
-SURFACE_LABEL_BASE = "https://dl.ash2txt.org/community-uploads/bruniss/labels/kds/labels"
+SURFACE_EVAL_BASE = "https://dl.ash2txt.org/community-uploads/bruniss/labels/surfaces/train_surf_eval"
+INK_EVAL_BASE = "https://dl.ash2txt.org/community-uploads/bruniss/labels/ink/train_ink_eval"
+INK_MANIFEST_URL = f"{INK_EVAL_BASE}/manifest.json"
 
 
 def _download(url: str, destination: Path) -> None:
@@ -53,49 +26,85 @@ def _download(url: str, destination: Path) -> None:
     print(f"wrote  {destination}")
 
 
-def _fiber_name(url: str) -> str:
-    return Path(url).name.replace("_0000.tif", ".tif")
-
-
-def download_fibers(*, data_root: Path = DATA_ROOT) -> None:
-    for url in FIBER_IMAGE_URLS:
-        _download(url, data_root / "fibers" / "images" / _fiber_name(url))
-
-    for url in FIBER_LABEL_URLS:
-        _download(url, data_root / "fibers" / "labels" / _fiber_name(url))
+def _list_remote_tifs(url: str) -> list[str]:
+    with urlopen(url) as response:
+        page = response.read().decode("utf-8", errors="replace")
+    names = {
+        html.unescape(match)
+        for match in re.findall(r'href="([^"]+\.tif)"', page, flags=re.IGNORECASE)
+    }
+    return sorted(names)
 
 
 def download_surfaces(*, data_root: Path = DATA_ROOT) -> None:
-    for stem in SURFACE_STEMS:
+    image_names = _list_remote_tifs(f"{SURFACE_EVAL_BASE}/images/")
+    label_names = set(_list_remote_tifs(f"{SURFACE_EVAL_BASE}/labels/"))
+    if not image_names:
+        raise ValueError(f"No surface task-eval images found at {SURFACE_EVAL_BASE}/images/")
+
+    missing_labels = [name for name in image_names if name not in label_names]
+    if missing_labels:
+        raise ValueError(
+            f"Missing surface task-eval labels for: {', '.join(missing_labels[:5])}"
+        )
+
+    for name in image_names:
         _download(
-            f"{SURFACE_IMAGE_BASE}/{stem}.tif",
-            data_root / "surfaces" / "images" / f"{stem}.tif",
+            f"{SURFACE_EVAL_BASE}/images/{name}",
+            data_root / "surfaces" / "images" / name,
         )
         _download(
-            f"{SURFACE_LABEL_BASE}/{stem}_surf.tif",
-            data_root / "surfaces" / "labels" / f"{stem}.tif",
+            f"{SURFACE_EVAL_BASE}/labels/{name}",
+            data_root / "surfaces" / "labels" / name,
+        )
+
+
+def download_ink(*, data_root: Path = DATA_ROOT) -> None:
+    task_root = Path(data_root) / "ink"
+    manifest_path = task_root / "manifest.json"
+    _download(INK_MANIFEST_URL, manifest_path)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    crops = manifest.get("crops")
+    if not isinstance(crops, list) or not crops:
+        raise ValueError(f"Ink task manifest at {manifest_path} does not contain any crops")
+
+    for crop in crops:
+        image_name = str(crop["image_tif"])
+        label_name = str(crop.get("label_tif", image_name))
+        _download(
+            f"{INK_EVAL_BASE}/images/{image_name}",
+            task_root / "images" / image_name,
+        )
+        _download(
+            f"{INK_EVAL_BASE}/labels/{label_name}",
+            task_root / "labels" / image_name,
+        )
+        _download(
+            f"{INK_EVAL_BASE}/supervision_masks/{image_name}",
+            task_root / "supervision_masks" / image_name,
         )
 
 
 def download_tasks(tasks: str | tuple[str, ...] | list[str] = "both", *, data_root: Path = DATA_ROOT) -> None:
     if isinstance(tasks, str):
         normalized = tasks.strip().lower()
-        if normalized in {"", "both", "all"}:
-            selected = ("fibers", "surfaces")
+        if normalized in {"", "both"}:
+            selected = ("surfaces", "ink")
         else:
             selected = (normalized,)
     else:
         selected = tuple(str(task).strip().lower() for task in tasks)
 
-    if "fibers" in selected:
-        download_fibers(data_root=Path(data_root))
     if "surfaces" in selected:
         download_surfaces(data_root=Path(data_root))
+    if "ink" in selected:
+        download_ink(data_root=Path(data_root))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download packaged task-eval data.")
-    parser.add_argument("--task", default="both", choices=("both", "fibers", "surfaces"))
+    parser.add_argument("--task", default="both", choices=("both", "surfaces", "ink"))
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
     args = parser.parse_args()
     download_tasks(args.task, data_root=args.data_root)
