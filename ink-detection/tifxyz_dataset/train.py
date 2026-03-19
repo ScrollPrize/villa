@@ -20,6 +20,11 @@ from vesuvius.neural_tracing.nets.models import make_model
 from common import save_val_preview_tif, to_uint8_image, to_uint8_label, to_uint8_probability
 from flat_ink_dataset import FlatInkDataset
 from stitching import resolve_model_and_loader_patch_sizes, run_stitched_model_forward
+from train_resnet3d_lib.embedding_loss import (
+    resolve_embedding_runtime_config,
+    build_embedding_model_for_similarity,
+    compute_stitch_embedding_similarity,
+)
 
 
 @click.command()
@@ -38,6 +43,7 @@ def train(config_path):
     learning_rate = config.get('learning_rate', 0.01)
     grad_acc_steps = int(config.get('grad_acc_steps', 1))
     grad_clip = config.get('grad_clip')
+    embedding_loss_weight = float(config.get('embedding_loss_weight', 0.0))
     max_steps = config.get('max_steps', math.ceil(config['num_iterations'] / grad_acc_steps))
 
     out_dir = config['out_dir']
@@ -138,14 +144,55 @@ def train(config_path):
     loss = DC_and_BCE_loss(
         bce_kwargs={},
         soft_dice_kwargs={},
-        weight_dice=0.25,
-        weight_ce=1.0,
+        weight_dice=float(config.get('dice_loss_weight', 0.25)),
+        weight_ce=float(config.get('ce_loss_weight', 1.0)),
         use_ignore_label=True,
     )
 
     model, optimizer, train_dl, val_dl, lr_scheduler = accelerator.prepare(
             model, optimizer, train_dl, val_dl, lr_scheduler
         )
+
+    # embedding similarity loss
+    embedding_model = None
+    embedding_crop_size = None
+    embedding_input_downsample_factor = int(config.get('embedding_input_downsample_factor', 1))
+    if embedding_loss_weight > 0:
+        emb_cfg_path = config.get('embedding_model_config_path')
+        emb_ckpt_path = config.get('embedding_model_checkpoint_path')
+        _, emb_ckpt, emb_config = resolve_embedding_runtime_config(
+            config_path=emb_cfg_path,
+            checkpoint_path=emb_ckpt_path,
+        )
+        embedding_model, emb_runtime_config = build_embedding_model_for_similarity(
+            config=emb_config,
+            checkpoint_path=emb_ckpt,
+            device=accelerator.device,
+        )
+        embedding_crop_size = int(emb_runtime_config['crop_size'])
+
+    def compute_batch_embedding_loss(preds, targets, supervision_mask_2d):
+        """Average embedding cosine-distance loss over valid samples in the batch."""
+        losses = []
+        for i in range(preds.shape[0]):
+            valid_2d = supervision_mask_2d[i, 0] > 0
+            if not valid_2d.any():
+                continue
+            try:
+                loss_i = compute_stitch_embedding_similarity(
+                    embedding_model=embedding_model,
+                    embedding_crop_size=embedding_crop_size,
+                    input_downsample_factor=embedding_input_downsample_factor,
+                    stitched_logits=preds[i, 0],
+                    stitched_targets=targets[i, 0],
+                    valid_mask=valid_2d,
+                )
+                losses.append(loss_i)
+            except ValueError:
+                continue
+        if not losses:
+            return preds.new_zeros(())
+        return torch.stack(losses).mean()
 
     train_iterator = iter(train_dl)
     val_every = config.get('val_every', 500)
@@ -223,6 +270,11 @@ def train(config_path):
             ignore_mask = (supervision_mask <= 0).float()
             targets_with_ignore = torch.cat([targets, ignore_mask], dim=1)
             l = loss(preds.float(), targets_with_ignore)
+            train_emb_loss = None
+            if embedding_loss_weight > 0 and embedding_model is not None:
+                emb_l = compute_batch_embedding_loss(preds, targets, supervision_mask)
+                train_emb_loss = emb_l.item()
+                l = l + embedding_loss_weight * emb_l
             if not torch.isfinite(l):
                 raise RuntimeError(f"Non-finite loss at step {step}")
             accelerator.backward(l)
@@ -248,6 +300,8 @@ def train(config_path):
                 'train/overflow_step_skipped': int(overflow_step_skipped),
                 'step': step,
             }
+            if train_emb_loss is not None:
+                log_dict['train/embedding_loss'] = train_emb_loss
             if wandb.run is not None:
                 wandb.log(log_dict, step=step)
 
@@ -266,6 +320,7 @@ def train(config_path):
             )
             model.eval()
             val_losses = []
+            val_emb_losses = []
             val_preview_inputs = []
             val_preview_labels = []
             val_preview_probabilities = []
@@ -286,6 +341,9 @@ def train(config_path):
                     val_targets_with_ignore = torch.cat([val_targets, val_ignore_mask], dim=1)
                     val_l = loss(val_preds.float(), val_targets_with_ignore)
                     val_losses.append(val_l.item())
+                    if embedding_loss_weight > 0 and embedding_model is not None:
+                        val_emb_l = compute_batch_embedding_loss(val_preds, val_targets, val_supervision_mask)
+                        val_emb_losses.append(val_emb_l.item())
 
                     if val_batch_idx in preview_batch_indices:
                         append_preview_tiles(
@@ -323,7 +381,10 @@ def train(config_path):
                         'wandb_run_id': wandb.run.id if wandb.run is not None else config.get('wandb_run_id'),
                     }, f'{out_dir}/ckpt_{step:06}.pth')
                 if wandb.run is not None:
-                    wandb.log({'val/loss': mean_val_loss}, step=step)
+                    val_log = {'val/loss': mean_val_loss}
+                    if val_emb_losses:
+                        val_log['val/embedding_loss'] = float(np.mean(val_emb_losses))
+                    wandb.log(val_log, step=step)
 
 if __name__ == '__main__':
     train()
