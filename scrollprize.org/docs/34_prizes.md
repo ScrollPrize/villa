@@ -135,7 +135,7 @@ Submissions are evaluated monthly, and multiple submissions/awards per month are
    * Designed for modular integration
 </details>
 
-[Submission Form](https://forms.gle/LZ7N2GB8X1rX8fyR7)
+[Submission Form](https://forms.gle/x4Gzeu6zUAEEXPz2A)
 
 ***
 
