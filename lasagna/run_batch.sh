@@ -14,11 +14,16 @@
 #     ├── work/           (intermediate files from prep2)
 #     ├── fit_output/     (model.pt, snapshots)
 #     ├── vis/            (OBJ/MTL/PNG visualization + stats.json)
+#     ├── fitted.zarr     (dense normal/winding/validity/density volumes)
+#     ├── fitted_tif/     (same as fitted.zarr but as multi-layer TIFs)
+#     ├── unet_labels/    (UNet training labels: cos, grad_mag, dir_{z,y,x}, validity)
 #     └── logs/
 #         ├── prep1.log
 #         ├── prep2.log
 #         ├── fit.log
-#         └── analyze.log
+#         ├── analyze.log
+#         ├── fit_data.log
+#         └── unet_labels.log
 
 set -euo pipefail
 
@@ -57,16 +62,30 @@ run_sample() {
     local logdir="${outdir}/logs"
     mkdir -p "$logdir" "${outdir}/work"
 
-    # Skip logic: two-tier
+    # Skip logic: three-tier
+    if [[ -f "${outdir}/unet_labels/validity.tif" ]]; then
+        echo "[${label}] already complete (unet_labels done), skipping."
+        return 0
+    fi
+
     if [[ -f "${outdir}/fitted_tif/winding.tif" ]]; then
-        echo "[${label}] already complete (fit_data done), skipping."
+        echo "[${label}] steps 1-5 done, running unet_labels only..."
+        # Jump straight to step 6
+        echo "[${label}] Step 6/6: unet_labels"
+        python "${SRC}/lasagna/fitted_to_unet_labels.py" \
+            --input "${outdir}/fitted.zarr" \
+            --output-dir "${outdir}/unet_labels" \
+            > "${logdir}/unet_labels.log" 2>&1 || {
+                echo "[${label}] FAILED at unet_labels"; return 1
+            }
+        echo "[${label}] Done."
         return 0
     fi
 
     if [[ -f "${outdir}/stats.json" ]]; then
-        echo "[${label}] steps 1-4 done, running fit_data only..."
+        echo "[${label}] steps 1-4 done, running fit_data + unet_labels..."
         # Jump straight to step 5
-        echo "[${label}] Step 5/5: fit_data"
+        echo "[${label}] Step 5/6: fit_data"
         python "${SRC}/lasagna/lasagna_fit_data.py" \
             --model "${outdir}/fit_output/model_final.pt" \
             --input "${outdir}/normals.zarr" \
@@ -78,6 +97,13 @@ run_sample() {
             > "${logdir}/fit_data.log" 2>&1 || {
                 echo "[${label}] FAILED at fit_data"; return 1
             }
+        echo "[${label}] Step 6/6: unet_labels"
+        python "${SRC}/lasagna/fitted_to_unet_labels.py" \
+            --input "${outdir}/fitted.zarr" \
+            --output-dir "${outdir}/unet_labels" \
+            > "${logdir}/unet_labels.log" 2>&1 || {
+                echo "[${label}] FAILED at unet_labels"; return 1
+            }
         echo "[${label}] Done."
         return 0
     fi
@@ -85,7 +111,7 @@ run_sample() {
     echo "[${label}] Starting pipeline..."
 
     # Step 1: prep1 — labels_to_winding_volume
-    echo "[${label}] Step 1/5: winding volume"
+    echo "[${label}] Step 1/6: winding volume"
     python "${SRC}/lasagna/labels_to_winding_volume.py" \
         --input "$input_tif" \
         --output "${outdir}/winding.zarr" \
@@ -94,7 +120,7 @@ run_sample() {
         }
 
     # Step 2: prep2 — labels_to_lasagna_normals
-    echo "[${label}] Step 2/5: lasagna normals"
+    echo "[${label}] Step 2/6: lasagna normals"
     python "${SRC}/lasagna/labels_to_lasagna_normals.py" \
         --input "$input_tif" \
         --work-dir "${outdir}/work" \
@@ -104,7 +130,7 @@ run_sample() {
         }
 
     # Step 3: fit
-    echo "[${label}] Step 3/5: fit"
+    echo "[${label}] Step 3/6: fit"
     python "${SRC}/lasagna/fit.py" \
         "${SRC}/lasagna/vc3d_configs/vc3d_labels_3d_straight.json" \
         --input "${outdir}/normals.zarr" \
@@ -122,7 +148,7 @@ run_sample() {
         }
 
     # Step 4: analyze (vis + stats)
-    echo "[${label}] Step 4/5: analyze"
+    echo "[${label}] Step 4/6: analyze"
     python "${SRC}/lasagna/lasagna_analyze.py" \
         --model "${outdir}/fit_output/model.pt" \
         --input "${outdir}/normals.zarr" \
@@ -135,7 +161,7 @@ run_sample() {
         }
 
     # Step 5: fit_data — dense volumes + TIFs + normal vis
-    echo "[${label}] Step 5/5: fit_data"
+    echo "[${label}] Step 5/6: fit_data"
     python "${SRC}/lasagna/lasagna_fit_data.py" \
         --model "${outdir}/fit_output/model_final.pt" \
         --input "${outdir}/normals.zarr" \
@@ -146,6 +172,15 @@ run_sample() {
         --stats-json "${outdir}/fit_data_stats.json" \
         > "${logdir}/fit_data.log" 2>&1 || {
             echo "[${label}] FAILED at fit_data"; return 1
+        }
+
+    # Step 6: unet_labels — convert fitted.zarr to UNet training labels
+    echo "[${label}] Step 6/6: unet_labels"
+    python "${SRC}/lasagna/fitted_to_unet_labels.py" \
+        --input "${outdir}/fitted.zarr" \
+        --output-dir "${outdir}/unet_labels" \
+        > "${logdir}/unet_labels.log" 2>&1 || {
+            echo "[${label}] FAILED at unet_labels"; return 1
         }
 
     echo "[${label}] Done."
