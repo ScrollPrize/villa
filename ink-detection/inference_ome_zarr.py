@@ -49,6 +49,7 @@ class ConfiguredModel:
     in_chans: int
     preprocessing: str
     source: str
+    amp_dtype: torch.dtype | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--layer-start", type=int, default=None)
     parser.add_argument("--layer-end", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("auto", "default", "fp16", "bf16"),
+        default="auto",
+        help=(
+            "Autocast dtype for CUDA inference. "
+            "'auto' reads checkpoint config.mixed_precision when available; "
+            "'default' uses PyTorch's default autocast dtype."
+        ),
+    )
     parser.add_argument("--reverse-layers", "--reverse", dest="reverse_layers", action="store_true")
     parser.add_argument("--tta-mirror", action="store_true", help="Average mirror-based TTA over training-eligible axes.")
     parser.add_argument(
@@ -715,6 +726,70 @@ def checkpoint_looks_like_tifxyz_training(payload: Any) -> bool:
     return model_type == "unet" and isinstance(patch_size, (list, tuple)) and len(patch_size) == 3
 
 
+def checkpoint_amp_dtype(payload: Any, checkpoint_path: Path | str) -> torch.dtype | None:
+    if not isinstance(payload, dict):
+        return None
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        return None
+
+    mixed_precision = config.get("mixed_precision")
+    if mixed_precision is None:
+        LOGGER.info(
+            "Checkpoint %s config does not define mixed_precision; using default CUDA autocast dtype.",
+            checkpoint_path,
+        )
+        return None
+
+    mixed_precision = str(mixed_precision).strip().lower()
+    if mixed_precision in {"fp16", "float16", "half"}:
+        LOGGER.info(
+            "Checkpoint %s requested AMP dtype=float16 from config.mixed_precision=%r.",
+            checkpoint_path,
+            mixed_precision,
+        )
+        return torch.float16
+    if mixed_precision in {"bf16", "bfloat16"}:
+        LOGGER.info(
+            "Checkpoint %s requested AMP dtype=bfloat16 from config.mixed_precision=%r.",
+            checkpoint_path,
+            mixed_precision,
+        )
+        return torch.bfloat16
+    if mixed_precision in {"no", "none", "false", "off", "disabled"}:
+        LOGGER.info(
+            "Checkpoint %s config.mixed_precision=%r does not specify an AMP dtype; using default CUDA autocast dtype.",
+            checkpoint_path,
+            mixed_precision,
+        )
+        return None
+
+    LOGGER.warning(
+        "Checkpoint %s has unsupported config.mixed_precision=%r; using default CUDA autocast dtype.",
+        checkpoint_path,
+        mixed_precision,
+    )
+    return None
+
+
+def resolve_amp_dtype(
+    *,
+    amp_dtype_arg: str,
+    checkpoint_payload: Any,
+    checkpoint_path: Path | str,
+) -> torch.dtype | None:
+    amp_dtype_arg = str(amp_dtype_arg).strip().lower()
+    if amp_dtype_arg == "default":
+        return None
+    if amp_dtype_arg == "fp16":
+        return torch.float16
+    if amp_dtype_arg == "bf16":
+        return torch.bfloat16
+    if amp_dtype_arg != "auto":
+        raise ValueError(f"Unsupported --amp-dtype value: {amp_dtype_arg!r}")
+    return checkpoint_amp_dtype(checkpoint_payload, checkpoint_path)
+
+
 def tifxyz_roi_size_from_config(config: dict[str, Any]) -> int:
     patch_size = config.get("crop_size", config.get("patch_size"))
     if not isinstance(patch_size, (list, tuple)) or len(patch_size) != 3:
@@ -776,17 +851,25 @@ def build_tifxyz_model_bundle(payload: dict[str, Any], checkpoint_path: Path | s
         in_chans=tifxyz_in_chans_from_config(config),
         preprocessing="tifxyz_robust",
         source="tifxyz_dataset/train.py",
+        amp_dtype=None,
     )
 
 
 def configure_model(args: argparse.Namespace) -> ConfiguredModel:
     checkpoint_payload = load_checkpoint_payload(args.checkpoint)
+    resolved_amp_dtype = resolve_amp_dtype(
+        amp_dtype_arg=args.amp_dtype,
+        checkpoint_payload=checkpoint_payload,
+        checkpoint_path=args.checkpoint,
+    )
     explicit_tifxyz = args.model_type == "tifxyz_unet"
     auto_tifxyz = args.model_type in {"auto", "residual_unet"} and checkpoint_looks_like_tifxyz_training(checkpoint_payload)
     if explicit_tifxyz or auto_tifxyz:
         if args.metadata_json is not None:
             LOGGER.info("Ignoring --metadata-json for tifxyz checkpoint %s", args.checkpoint)
-        return build_tifxyz_model_bundle(checkpoint_payload, args.checkpoint)
+        configured_model = build_tifxyz_model_bundle(checkpoint_payload, args.checkpoint)
+        configured_model.amp_dtype = resolved_amp_dtype
+        return configured_model
     if args.model_type == "auto":
         raise ValueError(
             "Could not infer a supported model type from the checkpoint. "
@@ -842,6 +925,7 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
         in_chans=int(getattr(CFG, "in_chans", 62)),
         preprocessing="legacy_uint8",
         source="train_resnet3d_lib",
+        amp_dtype=resolved_amp_dtype,
     )
 
 
@@ -876,6 +960,7 @@ def run_block_inference(
     mask: np.ndarray | None,
     device: torch.device,
     amp: bool,
+    amp_dtype: torch.dtype | None = None,
     tta_axes: Sequence[int] = (),
     tta_batch_size: int | None = None,
 ) -> None:
@@ -883,7 +968,13 @@ def run_block_inference(
     logged_resize = False
     tta_axes = tuple(int(axis) for axis in tta_axes)
     if autocast_enabled:
-        LOGGER.info("CUDA autocast enabled for inference.")
+        if amp_dtype is None:
+            LOGGER.info("CUDA autocast enabled for inference with default dtype.")
+        else:
+            LOGGER.info(
+                "CUDA autocast enabled for inference with dtype=%s.",
+                str(amp_dtype).replace("torch.", ""),
+            )
     else:
         LOGGER.info("Autocast disabled for inference (device=%s).", device.type)
     if tta_axes:
@@ -899,7 +990,7 @@ def run_block_inference(
         for images, meta in tqdm(loader, desc="Infer", unit="block"):
             images = images.to(device, non_blocking=True)
             amp_context = (
-                torch.autocast(device_type="cuda", enabled=True)
+                torch.autocast(device_type="cuda", enabled=True, dtype=amp_dtype)
                 if autocast_enabled
                 else nullcontext()
             )
@@ -1179,6 +1270,7 @@ def infer_single_zarr(
                 mask=mask,
                 device=device,
                 amp=True,
+                amp_dtype=configured_model.amp_dtype,
                 tta_axes=tta_axes,
                 tta_batch_size=args.tta_batch_size,
             )
