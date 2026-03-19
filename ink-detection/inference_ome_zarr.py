@@ -127,6 +127,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--layer-end", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
+        "--direction",
+        choices=("forward", "reverse", "both"),
+        default="forward",
+        help="Inference direction to run. Use 'both' to emit forward and reverse outputs.",
+    )
+    parser.add_argument(
         "--amp-dtype",
         choices=("auto", "default", "fp16", "bf16"),
         default="auto",
@@ -136,7 +142,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "'default' uses PyTorch's default autocast dtype."
         ),
     )
-    parser.add_argument("--reverse-layers", "--reverse", dest="reverse_layers", action="store_true")
+    parser.add_argument(
+        "--reverse-layers",
+        "--reverse",
+        dest="reverse_layers",
+        action="store_true",
+        help="Legacy alias for --direction both.",
+    )
     parser.add_argument("--tta-mirror", action="store_true", help="Average mirror-based TTA over training-eligible axes.")
     parser.add_argument(
         "--tta-batch-size",
@@ -153,6 +165,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if int(args.prefetch_factor) <= 0:
         parser.error("--prefetch-factor must be a positive integer")
     return args
+
+
+def normalize_direction_value(direction: str, *, reverse_flag: bool) -> str:
+    normalized = str(direction).strip().lower()
+    if reverse_flag:
+        return "both"
+    return normalized
+
+
+def resolve_run_directions(direction: str) -> tuple[str, ...]:
+    normalized = str(direction).strip().lower()
+    if normalized == "both":
+        return ("forward", "reverse")
+    return (normalized,)
+
+
+def append_direction_suffix(path: Path, direction: str) -> Path:
+    return path.with_name(f"{path.stem}_{direction}{path.suffix}")
+
+
+def resolve_single_output_path(output_tiff: Path, *, direction: str, requested_direction: str) -> Path:
+    if str(requested_direction) != "both":
+        return output_tiff
+    if str(direction) == "forward":
+        return output_tiff
+    return append_direction_suffix(output_tiff, str(direction))
 
 
 def configure_logging(level: str) -> None:
@@ -1090,6 +1128,7 @@ def infer_single_zarr(
     input_zarr: str | Path,
     configured_model: ConfiguredModel,
     output_tiff: Path,
+    layer_direction: str = "forward",
 ) -> None:
     resolution = str(args.resolution)
     root = open_zarr_readonly(input_zarr)
@@ -1135,7 +1174,7 @@ def infer_single_zarr(
     if layer_indices.size > in_chans:
         start_offset = (layer_indices.size - in_chans) // 2
         layer_indices = layer_indices[start_offset:start_offset + in_chans]
-    if bool(args.reverse_layers):
+    if str(layer_direction) == "reverse":
         layer_indices = layer_indices[::-1]
     reader = OmeZarrPatchReader(
         input_path=input_zarr,
@@ -1147,7 +1186,7 @@ def infer_single_zarr(
         preprocessing=configured_model.preprocessing,
     )
 
-    layer_order = "reverse" if bool(args.reverse_layers) else "forward"
+    layer_order = str(layer_direction)
     LOGGER.info(
         "Input level=%s shape=(depth=%d, height=%d, width=%d) chunks=(%d, %d) patch=%d stride=%d blend=%.3f tiff_tile=%s in_chans=%d layer_order=%s tta_axes=%s",
         resolution,
@@ -1319,7 +1358,7 @@ def infer_folder(args: argparse.Namespace, configured_model: ConfiguredModel) ->
         raise NotADirectoryError(f"--folder is not a directory: {folder}")
 
     checkpoint_stem = Path(args.checkpoint).stem
-    direction = "reverse" if bool(args.reverse_layers) else "forward"
+    run_directions = resolve_run_directions(args.direction)
     date_str = datetime.now().strftime("%d%m%y")
     output_prefix = f"{str(args.output_prefix)}_" if str(args.output_prefix) else ""
 
@@ -1338,24 +1377,27 @@ def infer_folder(args: argparse.Namespace, configured_model: ConfiguredModel) ->
             skipped_count += 1
             continue
 
-        output_tiff = (
-            segment_dir
-            / "preds"
-            / f"{output_prefix}{segment_name}_{checkpoint_stem}_{direction}_{date_str}.tif"
-        )
-        LOGGER.info(
-            "Running segment=%s input=%s output=%s",
-            segment_name,
-            input_zarr,
-            output_tiff,
-        )
-        infer_single_zarr(
-            args=args,
-            configured_model=configured_model,
-            input_zarr=input_zarr,
-            output_tiff=output_tiff,
-        )
-        ran_count += 1
+        for direction in run_directions:
+            output_tiff = (
+                segment_dir
+                / "preds"
+                / f"{output_prefix}{segment_name}_{checkpoint_stem}_{direction}_{date_str}.tif"
+            )
+            LOGGER.info(
+                "Running segment=%s input=%s output=%s direction=%s",
+                segment_name,
+                input_zarr,
+                output_tiff,
+                direction,
+            )
+            infer_single_zarr(
+                args=args,
+                configured_model=configured_model,
+                input_zarr=input_zarr,
+                output_tiff=output_tiff,
+                layer_direction=direction,
+            )
+            ran_count += 1
 
     LOGGER.info("Folder run complete. segments_ran=%d segments_skipped=%d", ran_count, skipped_count)
 
@@ -1369,6 +1411,8 @@ def normalize_inference_paths(args: argparse.Namespace) -> argparse.Namespace:
 
     if args.checkpoint_path is not None:
         args.checkpoint = args.checkpoint_path
+
+    args.direction = normalize_direction_value(args.direction, reverse_flag=bool(args.reverse_layers))
 
     # Convenience: allow "--folder <dir> <checkpoint>" without --checkpoint-path.
     if args.folder is not None and args.checkpoint is None and args.input_zarr is not None and args.output_tiff is None:
@@ -1414,12 +1458,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.folder is not None:
         infer_folder(args=args, configured_model=configured_model)
     else:
-        infer_single_zarr(
-            args=args,
-            configured_model=configured_model,
-            input_zarr=args.input_zarr,
-            output_tiff=args.output_tiff,
-        )
+        for direction in resolve_run_directions(args.direction):
+            output_tiff = resolve_single_output_path(
+                args.output_tiff,
+                direction=direction,
+                requested_direction=args.direction,
+            )
+            LOGGER.info("Running input=%s output=%s direction=%s", args.input_zarr, output_tiff, direction)
+            infer_single_zarr(
+                args=args,
+                configured_model=configured_model,
+                input_zarr=args.input_zarr,
+                output_tiff=output_tiff,
+                layer_direction=direction,
+            )
 
     return 0
 

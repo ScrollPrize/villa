@@ -17,7 +17,13 @@ def resolve_model_and_loader_patch_sizes(config):
     return model_crop_size, loader_patch_size, stitch_factor
 
 
-def run_stitched_model_forward(model, image, model_crop_size):
+def run_stitched_model_forward(
+    model,
+    image,
+    model_crop_size,
+    *,
+    use_gradient_checkpointing=True,
+):
     assert image.ndim == 5, image.shape
 
     _, _, depth, height, width = image.shape
@@ -43,7 +49,10 @@ def run_stitched_model_forward(model, image, model_crop_size):
             def forward_ink(tile):
                 model_output = model(tile)
                 return model_output['ink']
-            tile_pred = checkpoint(forward_ink, image_tile, use_reentrant=False)
+            if use_gradient_checkpointing:
+                tile_pred = checkpoint(forward_ink, image_tile, use_reentrant=False)
+            else:
+                tile_pred = forward_ink(image_tile)
             assert tile_pred.shape[-2:] == (crop_height, crop_width), (
                 tile_pred.shape,
                 (crop_height, crop_width),

@@ -86,6 +86,9 @@ def train(config_path):
     use_stitched_forward = bool(
         config.get('use_stitched_forward', requested_stitch_factor > 1)
     )
+    stitched_gradient_checkpointing = bool(
+        config.get('stitched_gradient_checkpointing', True)
+    )
     model_crop_size = tuple(config['patch_size'])
     loader_patch_size = model_crop_size
     stitch_factor = 1
@@ -95,6 +98,7 @@ def train(config_path):
     config['patch_size'] = list(model_crop_size)
     config['stitch_factor'] = stitch_factor
     config['use_stitched_forward'] = use_stitched_forward
+    config['stitched_gradient_checkpointing'] = stitched_gradient_checkpointing
     config['targets']['ink']['out_channels'] = 1
     config['targets']['ink']['activation'] = 'none'
     learning_rate = config.get('learning_rate', 0.01)
@@ -296,7 +300,12 @@ def train(config_path):
     def forward_ink(image, active_model=None):
         active_model = model if active_model is None else active_model
         if use_stitched_forward:
-            return run_stitched_model_forward(active_model, image, model_crop_size)['ink']
+            return run_stitched_model_forward(
+                active_model,
+                image,
+                model_crop_size,
+                use_gradient_checkpointing=stitched_gradient_checkpointing,
+            )['ink']
         return active_model(image)['ink']
 
     def append_preview_tiles(preview_inputs, preview_labels, preview_probabilities, batch, preds, targets, ignore_mask):
