@@ -194,6 +194,18 @@ def train(config_path):
             return preds.new_zeros(())
         return torch.stack(losses).mean()
 
+    def compute_balanced_accuracy_components(preds, targets, ignore_mask, threshold=0.3):
+        probabilities = torch.sigmoid(preds.float())
+        predicted_positive = probabilities >= threshold
+        target_positive = targets > 0.5
+        valid_mask = ignore_mask <= 0.5
+
+        true_positive = (predicted_positive & target_positive & valid_mask).sum(dtype=torch.float64)
+        true_negative = ((~predicted_positive) & (~target_positive) & valid_mask).sum(dtype=torch.float64)
+        positive_count = (target_positive & valid_mask).sum(dtype=torch.float64)
+        negative_count = ((~target_positive) & valid_mask).sum(dtype=torch.float64)
+        return true_positive, true_negative, positive_count, negative_count
+
     train_iterator = iter(train_dl)
     val_every = config.get('val_every', 500)
     log_every = config.get('log_every', 1)
@@ -206,6 +218,7 @@ def train(config_path):
         dynamic_ncols=True,
     )
     latest_val_loss = None
+    latest_val_balanced_accuracy = None
 
     def append_preview_tiles(preview_inputs, preview_labels, preview_probabilities, batch, preds, targets, ignore_mask):
         input_mid_slice = batch['image'].float()[:, :, batch['image'].shape[2] // 2]
@@ -249,6 +262,8 @@ def train(config_path):
         }
         if latest_val_loss is not None:
             postfix['val_loss'] = f'{latest_val_loss:.4f}'
+        if latest_val_balanced_accuracy is not None:
+            postfix['val_bal_acc@0.3'] = f'{latest_val_balanced_accuracy:.4f}'
         postfix['lr'] = f"{optimizer.param_groups[0]['lr']:.2e}"
         progress_bar.set_postfix(postfix, refresh=False)
         progress_bar.update(0)
@@ -305,7 +320,7 @@ def train(config_path):
             if wandb.run is not None:
                 wandb.log(log_dict, step=step)
 
-        if step % val_every == 0 and step > 0:
+        if step % val_every == 0:
             train_preview_inputs = []
             train_preview_labels = []
             train_preview_probabilities = []
@@ -321,6 +336,10 @@ def train(config_path):
             model.eval()
             val_losses = []
             val_emb_losses = []
+            val_tp = 0.0
+            val_tn = 0.0
+            val_pos = 0.0
+            val_neg = 0.0
             val_preview_inputs = []
             val_preview_labels = []
             val_preview_probabilities = []
@@ -341,6 +360,19 @@ def train(config_path):
                     val_targets_with_ignore = torch.cat([val_targets, val_ignore_mask], dim=1)
                     val_l = loss(val_preds.float(), val_targets_with_ignore)
                     val_losses.append(val_l.item())
+                    batch_tp, batch_tn, batch_pos, batch_neg = compute_balanced_accuracy_components(
+                        val_preds,
+                        val_targets,
+                        val_ignore_mask,
+                        threshold=0.3,
+                    )
+                    gathered_counts = accelerator.gather_for_metrics(
+                        torch.stack([batch_tp, batch_tn, batch_pos, batch_neg]).unsqueeze(0)
+                    )
+                    val_tp += gathered_counts[:, 0].sum().item()
+                    val_tn += gathered_counts[:, 1].sum().item()
+                    val_pos += gathered_counts[:, 2].sum().item()
+                    val_neg += gathered_counts[:, 3].sum().item()
                     if embedding_loss_weight > 0 and embedding_model is not None:
                         val_emb_l = compute_batch_embedding_loss(val_preds, val_targets, val_supervision_mask)
                         val_emb_losses.append(val_emb_l.item())
@@ -357,8 +389,15 @@ def train(config_path):
                         )
 
             mean_val_loss = np.mean(val_losses)
+            if val_pos > 0 and val_neg > 0:
+                val_positive_recall = val_tp / val_pos
+                val_negative_recall = val_tn / val_neg
+                mean_val_balanced_accuracy = 0.5 * (val_positive_recall + val_negative_recall)
+            else:
+                mean_val_balanced_accuracy = float('nan')
             if accelerator.is_main_process:
                 latest_val_loss = float(mean_val_loss)
+                latest_val_balanced_accuracy = mean_val_balanced_accuracy
                 refresh_progress_bar(train_loss, overflow_step_skipped)
                 save_val_preview_tif(
                     os.path.join(train_preview_dir, f'train_preview_{step:06}.tif'),
@@ -381,7 +420,10 @@ def train(config_path):
                         'wandb_run_id': wandb.run.id if wandb.run is not None else config.get('wandb_run_id'),
                     }, f'{out_dir}/ckpt_{step:06}.pth')
                 if wandb.run is not None:
-                    val_log = {'val/loss': mean_val_loss}
+                    val_log = {
+                        'val/loss': mean_val_loss,
+                        'val/balanced_accuracy@0.3': mean_val_balanced_accuracy,
+                    }
                     if val_emb_losses:
                         val_log['val/embedding_loss'] = float(np.mean(val_emb_losses))
                     wandb.log(val_log, step=step)
