@@ -621,8 +621,13 @@ def train(
             results = model(image)
             pred_full = results["output"]  # (B, 8, D, H, W) at full res
 
-            # Pool predictions to label resolution and apply sigmoid
-            pred = torch.sigmoid(F.avg_pool3d(pred_full, step, step))
+            pred = torch.sigmoid(pred_full)
+
+            # Upsample targets and mask to full resolution
+            if step > 1:
+                targets = F.interpolate(targets, scale_factor=step, mode='trilinear', align_corners=False)
+                mask_up = F.interpolate(mask.float(), scale_factor=step, mode='trilinear', align_corners=False)
+                mask = (mask_up >= 1.0 - 1e-6).float()
 
             # Per-channel-group losses with multi-scale
             loss_cos = scale_loss(pred[:, 0:1], targets[:, 0:1], mask=mask)
@@ -687,6 +692,9 @@ def _evaluate(
 ) -> float:
     model.eval()
     losses: List[float] = []
+    losses_cos: List[float] = []
+    losses_mag: List[float] = []
+    losses_dir: List[float] = []
     vis_done = False
 
     with torch.no_grad():
@@ -700,23 +708,33 @@ def _evaluate(
             targets, mask = compute_targets_3d(normal, winding, validity, density)
             results = model(image)
             pred_full = results["output"]
-            pred = torch.sigmoid(F.avg_pool3d(pred_full, step, step))
+            pred = torch.sigmoid(pred_full)
+
+            # Upsample targets and mask to full resolution
+            if step > 1:
+                targets = F.interpolate(targets, scale_factor=step, mode='trilinear', align_corners=False)
+                mask_up = F.interpolate(mask.float(), scale_factor=step, mode='trilinear', align_corners=False)
+                mask = (mask_up >= 1.0 - 1e-6).float()
 
             loss_cos = scale_loss(pred[:, 0:1], targets[:, 0:1], mask=mask)
             loss_mag = scale_loss(pred[:, 1:2], targets[:, 1:2], mask=mask)
             loss_dir = scale_loss(pred[:, 2:8], targets[:, 2:8], mask=mask)
             loss = w_cos * loss_cos + w_mag * loss_mag + w_dir * loss_dir
             losses.append(loss.item())
+            losses_cos.append(loss_cos.item())
+            losses_mag.append(loss_mag.item())
+            losses_dir.append(loss_dir.item())
 
             if not vis_done:
                 _log_vis(writer, "val", image, pred, targets, mask, global_step)
                 vis_done = True
 
-    mean_loss = sum(losses) / max(len(losses), 1)
+    n = max(len(losses), 1)
+    mean_loss = sum(losses) / n
     writer.add_scalar("val/loss", mean_loss, global_step)
-    writer.add_scalar("val/loss_cos", loss_cos.item(), global_step)
-    writer.add_scalar("val/loss_mag", loss_mag.item(), global_step)
-    writer.add_scalar("val/loss_dir", loss_dir.item(), global_step)
+    writer.add_scalar("val/loss_cos", sum(losses_cos) / n, global_step)
+    writer.add_scalar("val/loss_mag", sum(losses_mag) / n, global_step)
+    writer.add_scalar("val/loss_dir", sum(losses_dir) / n, global_step)
     return mean_loss
 
 
