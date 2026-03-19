@@ -29,7 +29,6 @@
     "eval_task": "both",
     "eval_task_train_iters": 500,
     "eval_task_decoder_type": "simple",
-    "resize_task_data": 0,
     "batch_size": 2,
     "model": {
         "embedding_type": "default",

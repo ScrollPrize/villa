@@ -21,7 +21,7 @@ from dinovol_2.eval.download_data import download_tasks
 from dinovol_2.model.patch_encode_decode import LayerNormNd, PatchDecode
 
 
-_TASK_NAMES = ("fibers", "surfaces")
+_DEFAULT_TASK_NAMES = ("surfaces", "ink")
 _DECODER_ALIASES = {
     "simple": "simple",
     "minimal": "simple",
@@ -42,13 +42,28 @@ _LABEL_PALETTE = np.asarray(
 )
 
 
+@dataclass(frozen=True)
+class TaskSpec:
+    name: str
+    validation_count: int = 1
+    resize_factor: float = 1.0
+    supervision_subdir: str | None = None
+
+
+_TASK_SPECS = {
+    "surfaces": TaskSpec("surfaces", validation_count=5, resize_factor=2.0),
+    "ink": TaskSpec("ink", validation_count=5, resize_factor=1.0, supervision_subdir="supervision_masks"),
+}
+_TASK_NAMES = tuple(_TASK_SPECS)
+
+
 def resolve_eval_tasks(value: Any) -> tuple[str, ...]:
     if value is None:
-        return _TASK_NAMES
+        return _DEFAULT_TASK_NAMES
     if isinstance(value, str):
         normalized = value.strip().lower()
-        if normalized in {"", "both", "all"}:
-            return _TASK_NAMES
+        if normalized in {"", "both"}:
+            return _DEFAULT_TASK_NAMES
         tasks = (normalized,)
     elif isinstance(value, Sequence):
         tasks = tuple(str(item).strip().lower() for item in value)
@@ -57,7 +72,8 @@ def resolve_eval_tasks(value: Any) -> tuple[str, ...]:
 
     invalid = [task for task in tasks if task not in _TASK_NAMES]
     if invalid:
-        raise ValueError(f"eval_task must be one of both, fibers, or surfaces. Got {invalid}")
+        expected = ", ".join(("both", *_TASK_NAMES))
+        raise ValueError(f"eval_task must be one of {expected}. Got {invalid}")
     return tasks
 
 
@@ -67,15 +83,6 @@ def resolve_eval_decoder_type(value: Any) -> str:
         expected = ", ".join(sorted(_DECODER_ALIASES))
         raise ValueError(f"Unknown eval_task_decoder_type {value!r}. Expected one of: {expected}")
     return _DECODER_ALIASES[normalized]
-
-
-def resolve_resize_task_data(value: Any) -> float:
-    if value is None:
-        return 0.0
-    factor = float(value)
-    if factor < 0.0:
-        raise ValueError(f"resize_task_data must be non-negative, got {factor}")
-    return factor
 
 
 def _read_volume(path: Path) -> np.ndarray:
@@ -125,49 +132,80 @@ class TaskSample:
     name: str
     image_path: Path
     label_path: Path
+    supervision_mask_path: Path | None = None
 
 
 class TaskVolumeSet:
     def __init__(
         self,
-        task_name: str,
+        task_spec: TaskSpec,
         data_root: Path,
         crop_size: tuple[int, int, int],
-        *,
-        resize_factor: float = 0.0,
     ) -> None:
-        self.task_name = task_name
+        self.task_spec = task_spec
+        self.task_name = task_spec.name
         self.data_root = Path(data_root)
         self.crop_size = tuple(int(dim) for dim in crop_size)
-        self.resize_factor = float(resize_factor)
-        task_root = self.data_root / task_name
+        self.resize_factor = float(task_spec.resize_factor)
+        task_root = self.data_root / self.task_name
         image_dir = task_root / "images"
         label_dir = task_root / "labels"
+        supervision_dir = (
+            task_root / task_spec.supervision_subdir
+            if task_spec.supervision_subdir is not None
+            else None
+        )
         image_paths = sorted(image_dir.glob("*.tif"))
         if not image_paths:
             raise FileNotFoundError(f"No task-eval images found in {image_dir}")
 
         label_paths = {path.name: path for path in sorted(label_dir.glob("*.tif"))}
+        supervision_paths = (
+            {path.name: path for path in sorted(supervision_dir.glob("*.tif"))}
+            if supervision_dir is not None
+            else {}
+        )
         samples: list[TaskSample] = []
         missing_labels: list[str] = []
+        missing_supervision: list[str] = []
         for image_path in image_paths:
             label_path = label_paths.get(image_path.name)
             if label_path is None:
                 missing_labels.append(image_path.name)
                 continue
-            samples.append(TaskSample(image_path.stem, image_path, label_path))
+            supervision_mask_path = None
+            if supervision_dir is not None:
+                supervision_mask_path = supervision_paths.get(image_path.name)
+                if supervision_mask_path is None:
+                    missing_supervision.append(image_path.name)
+                    continue
+            samples.append(
+                TaskSample(
+                    image_path.stem,
+                    image_path,
+                    label_path,
+                    supervision_mask_path=supervision_mask_path,
+                )
+            )
 
         if missing_labels:
             raise FileNotFoundError(
-                f"Missing task-eval labels for {task_name}: {', '.join(missing_labels[:5])}"
+                f"Missing task-eval labels for {self.task_name}: {', '.join(missing_labels[:5])}"
             )
-        if len(samples) < 2:
+        if missing_supervision:
+            raise FileNotFoundError(
+                f"Missing task-eval supervision masks for {self.task_name}: "
+                f"{', '.join(missing_supervision[:5])}"
+            )
+        validation_count = int(task_spec.validation_count)
+        if len(samples) <= validation_count:
             raise ValueError(
-                f"Task {task_name!r} needs at least 2 samples so the first can be validation and the rest training."
+                f"Task {self.task_name!r} needs more than {validation_count} samples so the first "
+                f"{validation_count} can be validation and the rest training."
             )
 
-        self.validation_sample = samples[0]
-        self.training_samples = tuple(samples[1:])
+        self.validation_samples = tuple(samples[:validation_count])
+        self.training_samples = tuple(samples[validation_count:])
         self._cache: dict[tuple[Path, bool], np.ndarray] = {}
         self._num_classes: int | None = None
 
@@ -185,12 +223,34 @@ class TaskVolumeSet:
             self._cache[cache_key] = cached
         return cached
 
+    @staticmethod
+    def _apply_supervision_mask(label: np.ndarray, supervision_mask: np.ndarray) -> np.ndarray:
+        if label.shape != supervision_mask.shape:
+            raise ValueError(
+                f"Label/supervision mask shape mismatch: label={label.shape}, "
+                f"supervision_mask={supervision_mask.shape}"
+            )
+        valid_supervision = np.asarray(supervision_mask) > 0
+        target = np.full(label.shape, _IGNORE_LABEL, dtype=np.int64)
+        target[valid_supervision] = (np.asarray(label)[valid_supervision] > 0).astype(np.int64)
+        return target
+
+    def _load_target(self, sample: TaskSample) -> np.ndarray:
+        label = self._load_cached(sample.label_path, is_label=True)
+        if sample.supervision_mask_path is None:
+            return label
+        supervision_mask = self._load_cached(sample.supervision_mask_path, is_label=True)
+        return self._apply_supervision_mask(label, supervision_mask)
+
     @property
     def num_classes(self) -> int:
         if self._num_classes is None:
             max_label = 0
-            for sample in (self.validation_sample, *self.training_samples):
-                max_label = max(max_label, int(self._load_cached(sample.label_path, is_label=True).max()))
+            for sample in (*self.validation_samples, *self.training_samples):
+                target = self._load_target(sample)
+                valid_target = target[target != _IGNORE_LABEL]
+                if valid_target.size:
+                    max_label = max(max_label, int(valid_target.max()))
             self._num_classes = max_label + 1
         return self._num_classes
 
@@ -231,7 +291,7 @@ class TaskVolumeSet:
         rng: np.random.Generator | None,
     ) -> tuple[torch.Tensor, torch.Tensor, str]:
         image = self._load_cached(sample.image_path, is_label=False)
-        label = self._load_cached(sample.label_path, is_label=True)
+        label = self._load_target(sample)
         if image.shape != label.shape:
             raise ValueError(
                 f"Image/label shape mismatch for {sample.name}: image={image.shape}, label={label.shape}"
@@ -251,8 +311,8 @@ class TaskVolumeSet:
         sample_index = int(rng.integers(0, len(self.training_samples)))
         return self._materialize_sample(self.training_samples[sample_index], rng=rng)
 
-    def validation_crop(self) -> tuple[torch.Tensor, torch.Tensor, str]:
-        return self._materialize_sample(self.validation_sample, rng=None)
+    def validation_crops(self) -> list[tuple[torch.Tensor, torch.Tensor, str]]:
+        return [self._materialize_sample(sample, rng=None) for sample in self.validation_samples]
 
 
 class MinimalTaskDecoder(nn.Module):
@@ -347,7 +407,6 @@ class TaskEvalRunner:
         self.learning_rate = float(self.config.get("eval_task_lr", 1e-4))
         self.weight_decay = float(self.config.get("eval_task_weight_decay", 0.0))
         self.seed = int(self.config.get("eval_task_seed", 0))
-        self.resize_task_data = resolve_resize_task_data(self.config.get("resize_task_data", 0))
         self.download_timeout_s = float(self.config.get("eval_task_download_timeout_s", 3600.0))
         if self.download_timeout_s <= 0:
             raise ValueError(f"eval_task_download_timeout_s must be positive, got {self.download_timeout_s}")
@@ -370,15 +429,16 @@ class TaskEvalRunner:
 
     def _task_data_ready(self) -> bool:
         for task_name in self.tasks:
+            task_spec = _TASK_SPECS[task_name]
             task_root = self.data_root / task_name
-            image_dir = task_root / "images"
-            label_dir = task_root / "labels"
-            if not image_dir.exists() or not label_dir.exists():
-                return False
-            if next(image_dir.glob("*.tif"), None) is None:
-                return False
-            if next(label_dir.glob("*.tif"), None) is None:
-                return False
+            required_dirs = [task_root / "images", task_root / "labels"]
+            if task_spec.supervision_subdir is not None:
+                required_dirs.append(task_root / task_spec.supervision_subdir)
+            for directory in required_dirs:
+                if not directory.exists():
+                    return False
+                if next(directory.glob("*.tif"), None) is None:
+                    return False
         return True
 
     def _ensure_data(self) -> None:
@@ -412,10 +472,9 @@ class TaskEvalRunner:
         dataset = self._datasets.get(key)
         if dataset is None:
             dataset = TaskVolumeSet(
-                task_name,
+                _TASK_SPECS[task_name],
                 self.data_root,
                 crop_size,
-                resize_factor=self.resize_task_data,
             )
             self._datasets[key] = dataset
         return dataset
@@ -556,33 +615,39 @@ class TaskEvalRunner:
                 train_loss_total += loss_value
                 progress.set_postfix(loss=f"{loss_value:.4f}")
 
-        val_image, val_target, val_name = dataset.validation_crop()
-        val_batch = val_image.unsqueeze(0).to(self.device, non_blocking=True)
-        val_target_batch = val_target.unsqueeze(0).to(self.device, non_blocking=True)
-
         model.eval()
+        validation_crops = dataset.validation_crops()
+        val_loss_total = 0.0
+        foreground_dice_total = 0.0
+        val_names: list[str] = []
+        image_path: Path | None = None
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-            val_logits = model(val_batch)
-            val_loss = self._task_loss(val_logits, val_target_batch)
-        val_probability = torch.sigmoid(val_logits[:, 0]).detach().cpu()
-        val_prediction = (val_logits[:, 0] > 0).to(dtype=torch.int64).detach().cpu()
-        image_path = (
-            self._save_validation_image(
-                task_name,
-                step,
-                val_image,
-                val_target,
-                val_probability[0],
-            )
-            if self.rank == 0
-            else None
-        )
-        foreground_dice = self._foreground_mean_dice(val_prediction, val_target_batch.cpu())
+            for val_index, (val_image, val_target, val_name) in enumerate(validation_crops):
+                val_names.append(val_name)
+                val_batch = val_image.unsqueeze(0).to(self.device, non_blocking=True)
+                val_target_batch = val_target.unsqueeze(0).to(self.device, non_blocking=True)
+                val_logits = model(val_batch)
+                val_loss = self._task_loss(val_logits, val_target_batch)
+                val_probability = torch.sigmoid(val_logits[:, 0]).detach().cpu()
+                val_prediction = (val_logits[:, 0] > 0).to(dtype=torch.int64).detach().cpu()
+                val_loss_total += float(val_loss.detach().item())
+                foreground_dice_total += self._foreground_mean_dice(val_prediction, val_target_batch.cpu())
+                if self.rank == 0 and val_index == 0:
+                    image_path = self._save_validation_image(
+                        task_name,
+                        step,
+                        val_image,
+                        val_target,
+                        val_probability[0],
+                    )
+        val_count = max(1, len(validation_crops))
+        val_loss_mean_local = val_loss_total / val_count
+        foreground_dice_local = foreground_dice_total / val_count
         train_loss_mean = train_loss_total / max(1, self.train_iters)
         train_loss_mean, val_loss_mean, foreground_dice = self._distributed_mean(
             train_loss_mean,
-            float(val_loss.detach().item()),
-            foreground_dice,
+            val_loss_mean_local,
+            foreground_dice_local,
         )
 
         return {
@@ -590,7 +655,8 @@ class TaskEvalRunner:
             "val_loss": val_loss_mean,
             "val_fg_dice": foreground_dice,
             "ignore_label": _IGNORE_LABEL,
-            "val_sample": val_name,
+            "val_sample": ",".join(val_names),
+            "val_sample_count": val_count,
             "image_path": image_path,
         }
 
