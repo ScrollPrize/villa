@@ -50,29 +50,6 @@ Vesuvius Challenge is ongoing and **YOU** can win the below prizes and help us m
 
 ***
 
-## 3D Surface Detection Challenge (hosted on Kaggle)
-
-We are holding a $200,000 prize pool competition for detection of the recto papyrus surfaces in the 3D CT scans.
-The contest is currently hosted on Kaggle on [this page](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection).
-
-### Prizes
-- 1st place: $60,000
-- 2nd place: $40,000
-- 3rd place: $30,000
-- 4th place: $20,000
-- 5th place: $15,000
-- 6th place: $10,000
-- 7th place: $10,000
-- 8th–10th: $5,000
-
-### Timeline
-- November 13, 2025 - Start Date.
-- February 6, 2026 - Entry Deadline. You must accept the competition rules before this date in order to compete.
-- February 6, 2026 - Team Merger Deadline. This is the last day participants may join or merge teams.
-- February 13, 2026 - Final Submission Deadline.
-
-***
-
 ## First Letters and Title Prizes
 
 One of the frontiers of Vesuvius Challenge is finding techniques that work across multiple scrolls.
@@ -139,7 +116,7 @@ We maintain a [public wishlist](https://github.com/ScrollPrize/villa/issues?q=is
 [Improvements to VC3D](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3AVC3D) can be also considered for progress prizes!
 Some are additionally labeled as [good first issues](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for newcomers!
 
-Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, February 28th, 2026!
+Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, March 31th, 2026!
 
 <details>
 <summary>Submission criteria and requirements</summary>
