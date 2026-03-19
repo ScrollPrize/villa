@@ -1,7 +1,8 @@
 {
-    "out_dir": "/home/sean/Desktop/ink_test",
+    "out_dir": "/home/paul/projects/vesuvius-scrolls/villa_ink/ink-detection/embedding/trainer_test",
     "seed": 27,
-    "patch_size" : [64, 256, 256],
+    "patch_size" : [64, 128, 128],
+    "stitch_factor": 3,
     "batch_size": 2,
     "patch_overlap": 0.5,
     "patch_min_labeled_coverage": 0.10,
@@ -17,7 +18,7 @@
 
    "model_config": {
      "autoconfigure": true,
-     "architecture_type": "primus_l"
+     "architecture_type": "resnet3d"
     },
 
     "targets": {
@@ -30,30 +31,16 @@
       }
     },
 
+    "dice_loss_weight": 0.0,
+    "ce_loss_weight": 0.0,
+    "embedding_loss_weight": 1.0,
+    "embedding_model_checkpoint_path": "/mnt/bcache/projects/vesuvius-scrolls/villa_ink/ink-detection/embedding/embedding_runs/latest/best.pt",
+    "embedding_input_downsample_factor": 8,
+
     "datasets": [
         {
             "volume_scale": 0,
-            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/0009b"
-        },
-        {
-            "volume_scale": 0,
-            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/0139"
-        },
-        {
-            "volume_scale": 0,
-            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/0500p2"
-        },
-        {
-            "volume_scale": 0,
-            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/814"
-        },
-        {
-            "volume_scale": 0,
-            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/841"
-        },
-        {
-            "volume_scale": 0,
-            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/1667"
+            "segments_path": "/home/paul/projects/vesuvius-scrolls/data/ink/ink_030927/0009b"
         }
     ]
 
