@@ -9,7 +9,13 @@ from torch.utils.data import Dataset
 import zarr
 import numpy as np 
 import tifffile
-from common import flat_patch_cache_path, load_flat_patch_cache, open_zarr, save_flat_patch_cache
+from common import (
+    _read_bbox_with_padding,
+    flat_patch_cache_path,
+    load_flat_patch_cache,
+    open_zarr,
+    save_flat_patch_cache,
+)
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.image_proc.intensity.normalization import normalize_robust
 
@@ -38,6 +44,8 @@ class Segment:
             supervision_mask=None,
             inklabels=None,
             scale=None,
+            dataset_idx=None,
+            segment_relpath=None,
             ):
         
         self.config = config
@@ -45,11 +53,22 @@ class Segment:
         self.image_volume = image_volume
         self.supervision_mask = supervision_mask
         self.inklabels = inklabels
+        self.dataset_idx = dataset_idx
+        self.segment_relpath = segment_relpath
         self.patch_size = config['patch_size']
 
+    @property
+    def cache_key(self):
+        return (
+            int(self.dataset_idx),
+            str(self.segment_relpath),
+            self.scale,
+        )
+
     def _find_patches(self):
-        supervision_mask = open_zarr(self.supervision_mask, resolution=self.scale, auth=self.config['volume_auth_json'])
-        inklabels = open_zarr(self.inklabels, resolution=self.scale, auth=self.config['volume_auth_json'])
+        volume_auth = self.config.get('volume_auth_json')
+        supervision_mask = open_zarr(self.supervision_mask, resolution=self.scale, auth=volume_auth)
+        inklabels = open_zarr(self.inklabels, resolution=self.scale, auth=volume_auth)
         surface = supervision_mask.shape[0] // 2
         surface_slice = supervision_mask[surface]
         ys, xs = np.nonzero(surface_slice)
@@ -94,7 +113,7 @@ class FlatInkDataset(Dataset):
         self.config           = config
         self.patch_size       = config['patch_size']
         self.datasets         = config['datasets']
-        self.vol_auth         = config['volume_auth_json']
+        self.vol_auth         = config.get('volume_auth_json')
         self.num_workers      = config.get('dataloader_workers', 8)
         self.do_augmentations = do_augmentations
 
@@ -104,24 +123,24 @@ class FlatInkDataset(Dataset):
             segments = list(self._gather_segments())
             cache_path = flat_patch_cache_path(self.config)
             segments_by_key = {
-                (str(seg.image_volume), str(seg.supervision_mask), str(seg.inklabels), seg.scale): seg
+                seg.cache_key: seg
                 for seg in segments
             }
 
             if cache_path.exists():
+                cached_records = load_flat_patch_cache(cache_path)
                 self.patches = [
                     Patch(
                         segment=segments_by_key[
                             (
-                                record['image_volume'],
-                                record['supervision_mask'],
-                                record['inklabels'],
+                                int(record['dataset_idx']),
+                                str(record['segment_relpath']),
                                 record['scale'],
                             )
                         ],
                         bbox=tuple(record['bbox']),
                     )
-                    for record in load_flat_patch_cache(cache_path)
+                    for record in cached_records
                 ]
                 return
 
@@ -138,7 +157,7 @@ class FlatInkDataset(Dataset):
             self.patches = patches
 
     def _gather_segments(self):
-        for ds in self.datasets:
+        for dataset_idx, ds in enumerate(self.datasets):
 
             seg_path = Path(ds['segments_path'])
 
@@ -161,7 +180,9 @@ class FlatInkDataset(Dataset):
                         image_volume     = image_volume,
                         supervision_mask = supervision_mask,
                         inklabels        = inklabels,
-                        scale            = ds['volume_scale']
+                        scale            = ds['volume_scale'],
+                        dataset_idx      = dataset_idx,
+                        segment_relpath  = tifxyz_folder.relative_to(seg_path).as_posix(),
                     )
 
     def __len__(self):
@@ -170,16 +191,44 @@ class FlatInkDataset(Dataset):
     def __getitem__(self, idx):
         patch = self.patches[idx]
         z0, y0, x0, z1, y1, x1 = patch.bbox
+        expected_shape = tuple(int(v) for v in self.patch_size)
 
         image_vol = open_zarr(patch.image_volume, resolution=patch.segment.scale, auth=self.vol_auth)
         supervision_mask = open_zarr(patch.supervision_mask, resolution=patch.segment.scale, auth=self.vol_auth)
         inklabels = open_zarr(patch.inklabels, resolution=patch.segment.scale, auth=self.vol_auth)
 
-        image_crop = image_vol[z0:z1, y0:y1, x0:x1]
-        supervision_crop = supervision_mask[z0:z1, y0:y1, x0:x1]
-        inklabels_crop = inklabels[z0:z1, y0:y1, x0:x1]
+        image_crop, image_valid_slices = _read_bbox_with_padding(
+            image_vol,
+            patch.bbox,
+            fill_value=0,
+        )
+        supervision_crop, _ = _read_bbox_with_padding(
+            supervision_mask,
+            patch.bbox,
+            fill_value=0,
+        )
+        inklabels_crop, _ = _read_bbox_with_padding(
+            inklabels,
+            patch.bbox,
+            fill_value=0,
+        )
 
-        image_crop = normalize_robust(image_crop)
+        if image_valid_slices is not None:
+            image_crop = image_crop.astype(np.float32, copy=False)
+            image_crop[image_valid_slices] = normalize_robust(image_crop[image_valid_slices])
+        else:
+            image_crop = image_crop.astype(np.float32, copy=False)
+
+        for name, array in (
+            ("image", image_crop),
+            ("supervision_mask", supervision_crop),
+            ("inklabels", inklabels_crop),
+        ):
+            if tuple(int(v) for v in array.shape) != expected_shape:
+                raise AssertionError(
+                    f"{name} crop shape {tuple(int(v) for v in array.shape)} does not match "
+                    f"requested patch size {expected_shape} for bbox {patch.bbox!r}"
+                )
 
         surface_mask = None
         if self.config.get('show_surface_mask', False):

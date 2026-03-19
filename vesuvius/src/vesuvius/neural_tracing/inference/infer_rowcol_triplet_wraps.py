@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 from scipy import ndimage
 import torch
+import tifffile
 import zarr
 from tqdm import tqdm
 
@@ -21,7 +22,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency at runtime
     njit = None
 
-from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
+from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid, voxelize_surface_grid_masked
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 from vesuvius.neural_tracing.inference.common import (
     _bbox_to_min_corner_and_bounds_array,
@@ -96,6 +97,8 @@ _DENSE_PROJECTION_INTERP_METHOD = "catmull_rom"
 _DENSE_PROJECTION_NEIGHBORHOOD_RADIUS = 5
 _DENSE_PROJECTION_REJECT_OUTLIER_FRACTION = 0.25
 _DENSE_PROJECTION_REJECT_MIN_KEEP = 4
+_SAVE_TIFS_BBOX_COUNT = 3
+_SURFACE_WINDOW_STORED_PAD = 1
 
 
 def parse_args(argv=None):
@@ -156,6 +159,16 @@ def parse_args(argv=None):
     parser.add_argument("--save-original-copy", dest="save_original_copy", action="store_true")
     parser.add_argument("--no-save-original-copy", dest="save_original_copy", action="store_false")
     parser.set_defaults(save_original_copy=False)
+    parser.add_argument(
+        "--save-tifs",
+        dest="save_tifs",
+        action="store_true",
+        help=(
+            "Debug mode: run displacement inference on "
+            f"{_SAVE_TIFS_BBOX_COUNT} representative middle bbox crops and save TIFF stacks "
+            "for the predicted displacement field, input crop, and voxelized conditioning sheet."
+        ),
+    )
     parser.add_argument(
         "--iterations",
         type=int,
@@ -218,6 +231,8 @@ def parse_args(argv=None):
         parser.error("--iter-direction is required when --iterations is provided.")
     if args.iterations is None and args.iter_direction is not None:
         parser.error("--iter-direction requires --iterations.")
+    if args.save_tifs and args.iterations is not None:
+        parser.error("--save-tifs does not support --iterations.")
     if args.dp_radius < 0:
         parser.error("--dp-radius must be >= 0")
     if args.dp_reject_frac < 0.0 or args.dp_reject_frac > 1.0:
@@ -265,6 +280,8 @@ def _copy_args_to_argv(copy_args):
         argv.append("--no-bbox-prune")
     if "save_original_copy" in copy_args and bool(copy_args.get("save_original_copy")):
         argv.append("--save-original-copy")
+    if "save_tifs" in copy_args and bool(copy_args.get("save_tifs")):
+        argv.append("--save-tifs")
     if "keep_previous_wrap" in copy_args and bool(copy_args.get("keep_previous_wrap")) is False:
         argv.append("--no-keep-previous-wrap")
     if "verbose" in copy_args and bool(copy_args.get("verbose")):
@@ -362,6 +379,363 @@ def _split_triplet_displacement_channels(disp_batch):
     branch_a = disp_batch[:, 0:3]
     branch_b = disp_batch[:, 3:6]
     return branch_a, branch_b
+
+
+def _resolve_triplet_direction_prior_state(model_state, input_normals, input_normals_valid, shape_hw):
+    h, w = int(shape_hw[0]), int(shape_hw[1])
+    normals_arr = np.asarray(input_normals, dtype=np.float32)
+    normals_valid_arr = np.asarray(input_normals_valid, dtype=bool)
+    if normals_arr.shape != (h, w, 3):
+        raise RuntimeError(
+            f"input_normals shape {tuple(normals_arr.shape)} does not match expected {(h, w, 3)}"
+        )
+    if normals_valid_arr.shape != (h, w):
+        raise RuntimeError(
+            f"input_normals_valid shape {tuple(normals_valid_arr.shape)} does not match expected {(h, w)}"
+        )
+    global_unit_normal = _estimate_global_unit_normal(normals_arr, normals_valid_arr)
+    orientation_global_normals_points = int(np.count_nonzero(normals_valid_arr))
+
+    expected_in_channels = int(model_state["expected_in_channels"])
+    if expected_in_channels != 8:
+        raise RuntimeError(
+            "Triplet wrap inference requires direction-conditioned checkpoints with in_channels=8 "
+            "(volume + conditioning + 6 direction-prior channels); "
+            f"checkpoint expects in_channels={expected_in_channels}."
+        )
+    model_config = dict(model_state.get("model_config") or {})
+    triplet_direction_prior_mask = str(model_config.get("triplet_direction_prior_mask", "cond")).lower()
+    if triplet_direction_prior_mask not in {"cond", "full"}:
+        raise RuntimeError(
+            "triplet_direction_prior_mask in checkpoint config must be 'cond' or 'full', "
+            f"got {triplet_direction_prior_mask!r}."
+        )
+    return {
+        "input_normals": normals_arr,
+        "input_normals_valid": normals_valid_arr,
+        "global_unit_normal": global_unit_normal,
+        "orientation_global_normals_points": int(orientation_global_normals_points),
+        "triplet_direction_prior_mask": str(triplet_direction_prior_mask),
+    }
+
+
+def _estimate_local_unit_normal(input_normals, input_normals_valid, uv_rc, fallback_unit_normal):
+    normals = np.asarray(input_normals, dtype=np.float32)
+    valid = np.asarray(input_normals_valid, dtype=bool)
+    uv_arr = np.asarray(uv_rc, dtype=np.int64)
+    fallback = np.asarray(fallback_unit_normal, dtype=np.float32).reshape(3)
+    if uv_arr.ndim != 2 or uv_arr.shape[1] != 2:
+        raise RuntimeError(f"Expected uv_rc shape [N,2], got {tuple(uv_arr.shape)}")
+    if normals.ndim != 3 or normals.shape[2] != 3:
+        raise RuntimeError(f"Expected input_normals shape [H,W,3], got {tuple(normals.shape)}")
+    if valid.shape != normals.shape[:2]:
+        raise RuntimeError(
+            f"input_normals_valid shape {tuple(valid.shape)} does not match normals shape {tuple(normals.shape[:2])}"
+        )
+    if uv_arr.shape[0] == 0:
+        return fallback, 0
+
+    rr = uv_arr[:, 0]
+    cc = uv_arr[:, 1]
+    in_bounds = (
+        (rr >= 0)
+        & (rr < normals.shape[0])
+        & (cc >= 0)
+        & (cc < normals.shape[1])
+    )
+    if not bool(in_bounds.any()):
+        return fallback, 0
+
+    rr = rr[in_bounds]
+    cc = cc[in_bounds]
+    local_valid = valid[rr, cc]
+    if not bool(local_valid.any()):
+        return fallback, 0
+
+    vecs = normals[rr[local_valid], cc[local_valid]]
+    finite = np.isfinite(vecs).all(axis=1)
+    vecs = vecs[finite]
+    if vecs.shape[0] == 0:
+        return fallback, 0
+
+    mags = np.linalg.norm(vecs, axis=1)
+    vecs = vecs[mags > 1e-6]
+    if vecs.shape[0] == 0:
+        return fallback, 0
+
+    unit_vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True).clip(min=1e-6)
+    mean_vec = np.mean(unit_vecs, axis=0, dtype=np.float64).astype(np.float32, copy=False)
+    mean_norm = float(np.linalg.norm(mean_vec))
+    if not np.isfinite(mean_norm) or mean_norm <= 1e-6:
+        return fallback, 0
+    return (mean_vec / mean_norm).astype(np.float32, copy=False), int(vecs.shape[0])
+
+
+def _build_triplet_model_batch(items, crop_size, mask_mode):
+    d, h_c, w_c = crop_size
+    batch_np = np.empty((len(items), 8, d, h_c, w_c), dtype=np.float32)
+    for i, item in enumerate(items):
+        batch_np[i, 0] = item["volume"]
+        batch_np[i, 1] = item["cond_vox"]
+        batch_np[i, 2:8] = _build_triplet_direction_priors_for_crop(
+            crop_size=crop_size,
+            cond_vox=item["cond_vox"],
+            global_unit_normal=item["prior_unit_normal"],
+            mask_mode=mask_mode,
+        )
+    return batch_np
+
+
+def _select_middle_bbox_records(records, count=_SAVE_TIFS_BBOX_COUNT):
+    if count <= 0 or len(records) == 0:
+        return []
+    if len(records) <= count:
+        return list(records)
+    start = max(0, (len(records) - int(count)) // 2)
+    end = min(len(records), start + int(count))
+    start = max(0, end - int(count))
+    return list(records[start:end])
+
+
+def _save_debug_tif(path, array):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(
+        str(path),
+        np.ascontiguousarray(array),
+        compression="zlib",
+        photometric="minisblack",
+    )
+
+
+def _normalize_triplet_prior_unit_normal(prior_unit_normal):
+    if prior_unit_normal is None:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    prior = np.asarray(prior_unit_normal, dtype=np.float32).reshape(-1)
+    if prior.size != 3:
+        raise RuntimeError(f"Expected prior_unit_normal with 3 values, got shape {tuple(np.shape(prior_unit_normal))}")
+
+    if not np.isfinite(prior).all():
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    norm = float(np.linalg.norm(prior))
+    if norm <= 1e-8:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    return (prior / norm).astype(np.float32, copy=False)
+
+
+def _build_triplet_debug_visualizations(disp_field, prior_unit_normal):
+    disp_arr = np.asarray(disp_field, dtype=np.float32)
+    if disp_arr.ndim != 4 or disp_arr.shape[0] < 6:
+        raise RuntimeError(
+            "Triplet debug visualization expects displacement field with shape [6+, D, H, W], "
+            f"got {tuple(disp_arr.shape)}"
+        )
+
+    front_vec = disp_arr[0:3].astype(np.float32, copy=False)
+    back_vec = disp_arr[3:6].astype(np.float32, copy=False)
+    prior = _normalize_triplet_prior_unit_normal(prior_unit_normal)
+
+    front_axis = prior[:, None, None, None]
+    back_axis = (-prior)[:, None, None, None]
+
+    front_mag = np.linalg.norm(front_vec, axis=0).astype(np.float32, copy=False)
+    back_mag = np.linalg.norm(back_vec, axis=0).astype(np.float32, copy=False)
+    front_signed = np.sum(front_vec * front_axis, axis=0, dtype=np.float32).astype(np.float32, copy=False)
+    back_signed = np.sum(back_vec * back_axis, axis=0, dtype=np.float32).astype(np.float32, copy=False)
+
+    return {
+        "front_vector": front_vec,
+        "back_vector": back_vec,
+        "front_magnitude": front_mag,
+        "back_magnitude": back_mag,
+        "front_signed_along_prior": front_signed,
+        "back_signed_along_prior": back_signed,
+        "prior_unit_normal": prior,
+    }
+
+
+def _save_selected_bbox_tifs(out_dir, out_prefix, items, disp_pred_np):
+    debug_dir = Path(out_dir) / f"{out_prefix}_save_tifs"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_items = []
+    for index, (item, disp_field) in enumerate(zip(items, disp_pred_np), start=1):
+        bbox_id = int(item.get("bbox_id", -1))
+        stem = f"{out_prefix}_bbox_{index:02d}_id_{bbox_id:04d}"
+        crop_path = debug_dir / f"{stem}_input_crop.tif"
+        cond_path = debug_dir / f"{stem}_voxelized_input_sheet.tif"
+        disp_path = debug_dir / f"{stem}_displacement_field.tif"
+        front_vec_path = debug_dir / f"{stem}_front_displacement_vector.tif"
+        back_vec_path = debug_dir / f"{stem}_back_displacement_vector.tif"
+        front_mag_path = debug_dir / f"{stem}_front_displacement_magnitude.tif"
+        back_mag_path = debug_dir / f"{stem}_back_displacement_magnitude.tif"
+        front_signed_path = debug_dir / f"{stem}_front_signed_displacement_along_prior.tif"
+        back_signed_path = debug_dir / f"{stem}_back_signed_displacement_along_prior.tif"
+
+        vis = _build_triplet_debug_visualizations(
+            disp_field=disp_field,
+            prior_unit_normal=item.get("prior_unit_normal"),
+        )
+
+        _save_debug_tif(crop_path, np.asarray(item["volume"], dtype=np.float32))
+        _save_debug_tif(cond_path, np.asarray(item["cond_vox"], dtype=np.float32))
+        _save_debug_tif(disp_path, np.asarray(disp_field, dtype=np.float32))
+        _save_debug_tif(front_vec_path, vis["front_vector"])
+        _save_debug_tif(back_vec_path, vis["back_vector"])
+        _save_debug_tif(front_mag_path, vis["front_magnitude"])
+        _save_debug_tif(back_mag_path, vis["back_magnitude"])
+        _save_debug_tif(front_signed_path, vis["front_signed_along_prior"])
+        _save_debug_tif(back_signed_path, vis["back_signed_along_prior"])
+
+        saved_items.append(
+            {
+                "bbox_id": bbox_id,
+                "min_corner": [int(v) for v in np.asarray(item["min_corner"], dtype=np.int32).tolist()],
+                "input_crop_tif": str(crop_path),
+                "voxelized_input_sheet_tif": str(cond_path),
+                "displacement_field_tif": str(disp_path),
+                "displacement_field_shape": [int(v) for v in np.asarray(disp_field).shape],
+                "front_displacement_vector_tif": str(front_vec_path),
+                "back_displacement_vector_tif": str(back_vec_path),
+                "front_displacement_magnitude_tif": str(front_mag_path),
+                "back_displacement_magnitude_tif": str(back_mag_path),
+                "front_signed_displacement_along_prior_tif": str(front_signed_path),
+                "back_signed_displacement_along_prior_tif": str(back_signed_path),
+                "prior_unit_normal_zyx": [float(v) for v in vis["prior_unit_normal"].tolist()],
+                "triplet_slot_to_output": {"A": "front", "B": "back"},
+            }
+        )
+
+    manifest = {
+        "mode": "save_tifs",
+        "bbox_count": int(len(saved_items)),
+        "saved_items": saved_items,
+        "displacement_field_channel_layout": {
+            "0:3": "front_dz_dy_dx",
+            "3:6": "back_dz_dy_dx",
+        },
+        "visualization_tifs": {
+            "front_displacement_vector_tif": "front branch raw dz/dy/dx vector stack (3,D,H,W)",
+            "back_displacement_vector_tif": "back branch raw dz/dy/dx vector stack (3,D,H,W)",
+            "front_displacement_magnitude_tif": "front branch Euclidean distance from zero displacement (D,H,W)",
+            "back_displacement_magnitude_tif": "back branch Euclidean distance from zero displacement (D,H,W)",
+            "front_signed_displacement_along_prior_tif": (
+                "front branch signed scalar projection onto the local front prior normal; zero is no displacement"
+            ),
+            "back_signed_displacement_along_prior_tif": (
+                "back branch signed scalar projection onto the local back prior normal; zero is no displacement"
+            ),
+        },
+    }
+    manifest_path = debug_dir / f"{out_prefix}_save_tifs_manifest.json"
+    with manifest_path.open("w", encoding="utf-8") as fp:
+        json.dump(manifest, fp, indent=2)
+    manifest["manifest_path"] = str(manifest_path)
+    manifest["output_dir"] = str(debug_dir)
+    return manifest
+
+
+def _prepare_iteration_context(args, input_grid, input_valid, retarget_factor, input_uuid, crop_size):
+    world_points, uv_points = _extract_surface_points_for_iteration(
+        input_grid=input_grid,
+        input_valid=input_valid,
+        retarget_factor=retarget_factor,
+        verbose=bool(args.verbose),
+    )
+    input_normals, input_normals_valid = _compute_surface_normals_from_input_grid(input_grid, input_valid)
+    records = _generate_cover_bboxes_from_points(
+        world_points,
+        tifxyz_uuid=input_uuid,
+        crop_size=crop_size,
+        overlap=float(args.bbox_overlap),
+        prune_bboxes=bool(args.bbox_prune),
+        prune_max_remove_per_band=args.bbox_prune_max_remove_per_band,
+        band_workers=int(args.bbox_band_workers),
+    )
+    _log(args.verbose, f"generated bboxes (retargeted coords): {len(records)}")
+    return {
+        "world_points": world_points,
+        "uv_points": uv_points,
+        "input_normals": input_normals,
+        "input_normals_valid": input_normals_valid,
+        "records": records,
+    }
+
+
+def _run_save_tifs_mode(
+    args,
+    model_state,
+    crop_size,
+    volume_arr,
+    surface,
+    input_grid,
+    input_valid,
+    input_uuid,
+    retarget_factor,
+    out_dir,
+    out_prefix,
+):
+    context = _prepare_iteration_context(
+        args=args,
+        input_grid=input_grid,
+        input_valid=input_valid,
+        retarget_factor=retarget_factor,
+        input_uuid=input_uuid,
+        crop_size=crop_size,
+    )
+    records = context["records"]
+    if len(records) == 0:
+        raise RuntimeError("No bbox records available for --save-tifs.")
+
+    selected_records = _select_middle_bbox_records(records, count=_SAVE_TIFS_BBOX_COUNT)
+    if len(selected_records) == 0:
+        raise RuntimeError("Could not select bbox records for --save-tifs.")
+
+    prior_state = _resolve_triplet_direction_prior_state(
+        model_state=model_state,
+        input_normals=context["input_normals"],
+        input_normals_valid=context["input_normals_valid"],
+        shape_hw=input_valid.shape,
+    )
+    items = _gather_batch_items(
+        batch_records=selected_records,
+        crop_size=crop_size,
+        world_points=context["world_points"],
+        uv_points=context["uv_points"],
+        volume_arr=volume_arr,
+        surface=surface,
+        input_grid=input_grid,
+        input_valid=input_valid,
+        input_normals=context["input_normals"],
+        input_normals_valid=context["input_normals_valid"],
+        fallback_unit_normal=prior_state["global_unit_normal"],
+        num_workers=min(int(args.crop_input_workers), max(1, len(selected_records))),
+    )
+    if len(items) == 0:
+        raise RuntimeError("Selected bbox records did not produce any crop inputs for --save-tifs.")
+
+    batch_np = _build_triplet_model_batch(
+        items,
+        crop_size=crop_size,
+        mask_mode=prior_state["triplet_direction_prior_mask"],
+    )
+
+    model_inputs = torch.from_numpy(batch_np).to(args.device, non_blocking=True)
+    disp_pred = predict_displacement(args, model_state, model_inputs, use_tta=bool(args.tta), profiler=None)
+    if disp_pred is None:
+        raise RuntimeError("Model output did not contain 'displacement'.")
+    disp_pred_np = disp_pred.detach().to(dtype=torch.float32).cpu().numpy().astype(np.float32, copy=False)
+
+    manifest = _save_selected_bbox_tifs(out_dir, out_prefix, items, disp_pred_np)
+    manifest["selected_bbox_ids"] = [int(item["bbox_id"]) for item in items]
+    manifest["selected_bbox_count"] = int(len(items))
+    manifest["bbox_selection"] = "middle_slice"
+    manifest["total_bbox_count"] = int(len(records))
+    with Path(manifest["manifest_path"]).open("w", encoding="utf-8") as fp:
+        json.dump(manifest, fp, indent=2)
+    return manifest
 
 
 def _estimate_global_unit_normal(input_normals, input_normals_valid):
@@ -824,47 +1198,95 @@ def _iter_bbox_batches(records, batch_size):
         yield start, records[start:start + batch_size]
 
 
-def _voxelize_local_surface_from_uv_points(local_points, uv_points, crop_size):
-    crop_size_arr = np.asarray(crop_size, dtype=np.int64)
-    vox = np.zeros(tuple(crop_size_arr.tolist()), dtype=np.float32)
-    if local_points is None or uv_points is None:
-        return vox
+def _extract_local_surface_grid_for_bbox(surface, input_grid, input_valid, min_corner, crop_size):
+    crop_arr = np.asarray(crop_size, dtype=np.int32)
+    max_corner = np.asarray(min_corner, dtype=np.int32) + crop_arr
+    grid_arr = np.asarray(input_grid, dtype=np.float32)
+    valid_arr = np.asarray(input_valid, dtype=bool)
+    if grid_arr.ndim != 3 or grid_arr.shape[2] != 3 or valid_arr.shape != grid_arr.shape[:2]:
+        raise RuntimeError(
+            "input lattice shapes do not match expected (H, W, 3)/(H, W): "
+            f"grid={tuple(grid_arr.shape)}, valid={tuple(valid_arr.shape)}"
+        )
 
-    local_arr = np.asarray(local_points, dtype=np.float64)
-    uv_arr = np.asarray(uv_points, dtype=np.int64)
-    if local_arr.ndim != 2 or local_arr.shape[1] != 3 or uv_arr.ndim != 2 or uv_arr.shape[1] != 2:
-        return vox
-    if local_arr.shape[0] == 0 or uv_arr.shape[0] == 0 or local_arr.shape[0] != uv_arr.shape[0]:
-        return vox
+    in_bounds = valid_arr & (
+        (grid_arr[:, :, 0] >= float(min_corner[0]))
+        & (grid_arr[:, :, 0] < float(max_corner[0]))
+        & (grid_arr[:, :, 1] >= float(min_corner[1]))
+        & (grid_arr[:, :, 1] < float(max_corner[1]))
+        & (grid_arr[:, :, 2] >= float(min_corner[2]))
+        & (grid_arr[:, :, 2] < float(max_corner[2]))
+    )
+    if not bool(in_bounds.any()):
+        return None, None
 
-    finite = np.isfinite(local_arr).all(axis=1)
-    if not bool(finite.any()):
-        return vox
-    local_arr = local_arr[finite]
-    uv_arr = uv_arr[finite]
+    row_idx = np.flatnonzero(np.any(in_bounds, axis=1))
+    col_idx = np.flatnonzero(np.any(in_bounds, axis=0))
+    stored_pad = int(max(0, _SURFACE_WINDOW_STORED_PAD))
+    r0_s = max(0, int(row_idx[0]) - stored_pad)
+    r1_s = min(grid_arr.shape[0] - 1, int(row_idx[-1]) + stored_pad)
+    c0_s = max(0, int(col_idx[0]) - stored_pad)
+    c1_s = min(grid_arr.shape[1] - 1, int(col_idx[-1]) + stored_pad)
 
-    r_min = int(uv_arr[:, 0].min())
-    c_min = int(uv_arr[:, 1].min())
-    r_max = int(uv_arr[:, 0].max())
-    c_max = int(uv_arr[:, 1].max())
-    h = int(r_max - r_min + 1)
-    w = int(c_max - c_min + 1)
-    if h <= 0 or w <= 0:
-        return vox
+    sub_r = _scale_to_subsample_stride(float(surface._scale[0]))
+    sub_c = _scale_to_subsample_stride(float(surface._scale[1]))
+    full_h, full_w = surface.full_resolution_shape
+    r0_full = max(0, r0_s * sub_r)
+    r1_full = min(full_h, (r1_s + 1) * sub_r)
+    c0_full = max(0, c0_s * sub_c)
+    c1_full = min(full_w, (c1_s + 1) * sub_c)
+    if r1_full <= r0_full or c1_full <= c0_full:
+        return None, None
 
-    grid_local = np.zeros((h, w, 3), dtype=np.float64)
-    grid_valid = np.zeros((h, w), dtype=bool)
-    rr = (uv_arr[:, 0] - r_min).astype(np.int64, copy=False)
-    cc = (uv_arr[:, 1] - c_min).astype(np.int64, copy=False)
-    grid_local[rr, cc] = local_arr
-    grid_valid[rr, cc] = True
-    return voxelize_surface_grid_masked(grid_local, tuple(int(v) for v in crop_size_arr.tolist()), grid_valid).astype(
+    x_full, y_full, z_full, valid_full = surface[r0_full:r1_full, c0_full:c1_full]
+    full_grid = np.stack([z_full, y_full, x_full], axis=-1).astype(np.float32, copy=False)
+    full_valid = np.asarray(valid_full, dtype=bool) & np.isfinite(full_grid).all(axis=2)
+    local_grid = (full_grid - np.asarray(min_corner, dtype=np.float32)[None, None, :]).astype(
         np.float32,
         copy=False,
     )
+    return local_grid, full_valid
 
 
-def _prepare_bbox_item(record, crop_size, world_points, uv_points, volume_arr):
+def _voxelize_local_surface_from_input_surface(surface, input_grid, input_valid, min_corner, crop_size):
+    crop_size_arr = np.asarray(crop_size, dtype=np.int64)
+    vox = np.zeros(tuple(crop_size_arr.tolist()), dtype=np.float32)
+    surface.use_full_resolution()
+    local_grid, local_valid = _extract_local_surface_grid_for_bbox(
+        surface=surface,
+        input_grid=input_grid,
+        input_valid=input_valid,
+        min_corner=min_corner,
+        crop_size=crop_size,
+    )
+    if local_grid is None or local_valid is None:
+        return vox
+    crop_shape = tuple(int(v) for v in crop_size_arr.tolist())
+    if bool(np.all(local_valid)):
+        return voxelize_surface_grid(local_grid.astype(np.float64, copy=False), crop_shape).astype(
+            np.float32,
+            copy=False,
+        )
+    return voxelize_surface_grid_masked(
+        local_grid.astype(np.float64, copy=False),
+        crop_shape,
+        local_valid.astype(bool, copy=False),
+    ).astype(np.float32, copy=False)
+
+
+def _prepare_bbox_item(
+    record,
+    crop_size,
+    world_points,
+    uv_points,
+    volume_arr,
+    surface,
+    input_grid,
+    input_valid,
+    input_normals,
+    input_normals_valid,
+    fallback_unit_normal,
+):
     bbox = tuple(record["bbox"])
     min_corner, _ = _bbox_to_min_corner_and_bounds_array(bbox)
     crop_arr = np.asarray(crop_size, dtype=np.int32)
@@ -884,8 +1306,20 @@ def _prepare_bbox_item(record, crop_size, world_points, uv_points, volume_arr):
     uv_sel = uv_points[in_bounds].astype(np.int32, copy=False)
     world_sel = world_points[in_bounds].astype(np.float32, copy=False)
     local_sel = (world_sel - min_corner[None, :].astype(np.float32, copy=False)).astype(np.float32, copy=False)
+    local_unit_normal, local_normal_points = _estimate_local_unit_normal(
+        input_normals=input_normals,
+        input_normals_valid=input_normals_valid,
+        uv_rc=uv_sel,
+        fallback_unit_normal=fallback_unit_normal,
+    )
 
-    cond_vox = _voxelize_local_surface_from_uv_points(local_sel, uv_sel, crop_size).astype(np.float32, copy=False)
+    cond_vox = _voxelize_local_surface_from_input_surface(
+        surface=surface,
+        input_grid=input_grid,
+        input_valid=input_valid,
+        min_corner=min_corner,
+        crop_size=crop_size,
+    ).astype(np.float32, copy=False)
     vol_crop = _crop_volume_from_min_corner(volume_arr, min_corner, crop_size)
     vol_crop = normalize_zscore(vol_crop).astype(np.float32, copy=False)
 
@@ -895,6 +1329,8 @@ def _prepare_bbox_item(record, crop_size, world_points, uv_points, volume_arr):
         "uv": uv_sel,
         "world": world_sel,
         "local": local_sel,
+        "prior_unit_normal": local_unit_normal.astype(np.float32, copy=False),
+        "local_normal_points": int(local_normal_points),
         "cond_vox": cond_vox,
         "volume": vol_crop,
     }
@@ -906,14 +1342,33 @@ def _gather_batch_items(
     world_points,
     uv_points,
     volume_arr,
+    surface,
+    input_grid,
+    input_valid,
+    input_normals,
+    input_normals_valid,
+    fallback_unit_normal,
     num_workers,
 ):
     if len(batch_records) == 0:
         return []
+    surface.use_full_resolution()
     if int(num_workers) <= 1 or len(batch_records) == 1:
         items = []
         for rec in batch_records:
-            item = _prepare_bbox_item(rec, crop_size, world_points, uv_points, volume_arr)
+            item = _prepare_bbox_item(
+                rec,
+                crop_size,
+                world_points,
+                uv_points,
+                volume_arr,
+                surface,
+                input_grid,
+                input_valid,
+                input_normals,
+                input_normals_valid,
+                fallback_unit_normal,
+            )
             if item is not None:
                 items.append(item)
         return items
@@ -927,6 +1382,12 @@ def _gather_batch_items(
             [world_points] * len(batch_records),
             [uv_points] * len(batch_records),
             [volume_arr] * len(batch_records),
+            [surface] * len(batch_records),
+            [input_grid] * len(batch_records),
+            [input_valid] * len(batch_records),
+            [input_normals] * len(batch_records),
+            [input_normals_valid] * len(batch_records),
+            [fallback_unit_normal] * len(batch_records),
         )
         return [item for item in prepared if item is not None]
 
@@ -939,6 +1400,9 @@ def _run_triplet_inference(
     world_points,
     uv_points,
     volume_arr,
+    surface,
+    input_grid,
+    input_valid,
     shape_hw,
     dense_subsample_stride,
     input_normals,
@@ -949,37 +1413,22 @@ def _run_triplet_inference(
     sum_front = np.zeros((h, w, 3), dtype=np.float32)
     count_back = np.zeros((h, w), dtype=np.uint32)
     count_front = np.zeros((h, w), dtype=np.uint32)
-    normals_arr = np.asarray(input_normals, dtype=np.float32)
-    normals_valid_arr = np.asarray(input_normals_valid, dtype=bool)
-    if normals_arr.shape != (h, w, 3):
-        raise RuntimeError(
-            f"input_normals shape {tuple(normals_arr.shape)} does not match expected {(h, w, 3)}"
-        )
-    if normals_valid_arr.shape != (h, w):
-        raise RuntimeError(
-            f"input_normals_valid shape {tuple(normals_valid_arr.shape)} does not match expected {(h, w)}"
-        )
-    global_unit_normal = _estimate_global_unit_normal(normals_arr, normals_valid_arr)
-    orientation_global_normals_points = int(np.count_nonzero(normals_valid_arr))
+    prior_state = _resolve_triplet_direction_prior_state(
+        model_state=model_state,
+        input_normals=input_normals,
+        input_normals_valid=input_normals_valid,
+        shape_hw=shape_hw,
+    )
+    global_unit_normal = prior_state["global_unit_normal"]
+    orientation_global_normals_points = prior_state["orientation_global_normals_points"]
+    input_normals_arr = prior_state["input_normals"]
+    input_normals_valid_arr = prior_state["input_normals_valid"]
 
     volume_shape = np.asarray(np.shape(volume_arr), dtype=np.float64)
     if volume_shape.size < 3:
         raise RuntimeError(f"Expected 3D volume for triplet inference, got shape={tuple(np.shape(volume_arr))}")
 
-    expected_in_channels = int(model_state["expected_in_channels"])
-    if expected_in_channels != 8:
-        raise RuntimeError(
-            "Triplet wrap inference requires direction-conditioned checkpoints with in_channels=8 "
-            "(volume + conditioning + 6 direction-prior channels); "
-            f"checkpoint expects in_channels={expected_in_channels}."
-        )
-    model_config = dict(model_state.get("model_config") or {})
-    triplet_direction_prior_mask = str(model_config.get("triplet_direction_prior_mask", "cond")).lower()
-    if triplet_direction_prior_mask not in {"cond", "full"}:
-        raise RuntimeError(
-            "triplet_direction_prior_mask in checkpoint config must be 'cond' or 'full', "
-            f"got {triplet_direction_prior_mask!r}."
-        )
+    triplet_direction_prior_mask = prior_state["triplet_direction_prior_mask"]
 
     n_total = len(records)
     n_batches = (n_total + int(args.batch_size) - 1) // int(args.batch_size)
@@ -997,6 +1446,12 @@ def _run_triplet_inference(
             world_points=world_points,
             uv_points=uv_points,
             volume_arr=volume_arr,
+            surface=surface,
+            input_grid=input_grid,
+            input_valid=input_valid,
+            input_normals=input_normals_arr,
+            input_normals_valid=input_normals_valid_arr,
+            fallback_unit_normal=global_unit_normal,
             num_workers=int(args.crop_input_workers),
         )
 
@@ -1005,17 +1460,11 @@ def _run_triplet_inference(
             continue
 
         kept_bboxes += len(items)
-        d, h_c, w_c = crop_size
-        batch_np = np.empty((len(items), 8, d, h_c, w_c), dtype=np.float32)
-        for i, item in enumerate(items):
-            batch_np[i, 0] = item["volume"]
-            batch_np[i, 1] = item["cond_vox"]
-            batch_np[i, 2:8] = _build_triplet_direction_priors_for_crop(
-                crop_size=crop_size,
-                cond_vox=item["cond_vox"],
-                global_unit_normal=global_unit_normal,
-                mask_mode=triplet_direction_prior_mask,
-            )
+        batch_np = _build_triplet_model_batch(
+            items,
+            crop_size=crop_size,
+            mask_mode=triplet_direction_prior_mask,
+        )
 
         model_inputs = torch.from_numpy(batch_np).to(args.device, non_blocking=True)
         disp_pred = predict_displacement(args, model_state, model_inputs, use_tta=bool(args.tta), profiler=None)
@@ -1530,29 +1979,25 @@ def _run_single_iteration(
     preloaded_input=None,
 ):
     if preloaded_input is None:
-        _, input_grid, input_valid = _load_input_grid(input_tifxyz_path, retarget_factor=retarget_factor)
+        surface, input_grid, input_valid = _load_input_grid(input_tifxyz_path, retarget_factor=retarget_factor)
     else:
-        _, input_grid, input_valid = preloaded_input
+        surface, input_grid, input_valid = preloaded_input
     input_path_resolved = Path(input_tifxyz_path).resolve()
     input_uuid = input_path_resolved.name
 
-    world_points, uv_points = _extract_surface_points_for_iteration(
+    context = _prepare_iteration_context(
+        args=args,
         input_grid=input_grid,
         input_valid=input_valid,
         retarget_factor=retarget_factor,
-        verbose=bool(args.verbose),
-    )
-    input_normals, input_normals_valid = _compute_surface_normals_from_input_grid(input_grid, input_valid)
-    records = _generate_cover_bboxes_from_points(
-        world_points,
-        tifxyz_uuid=input_uuid,
+        input_uuid=input_uuid,
         crop_size=crop_size,
-        overlap=float(args.bbox_overlap),
-        prune_bboxes=bool(args.bbox_prune),
-        prune_max_remove_per_band=args.bbox_prune_max_remove_per_band,
-        band_workers=int(args.bbox_band_workers),
     )
-    _log(args.verbose, f"generated bboxes (retargeted coords): {len(records)}")
+    world_points = context["world_points"]
+    uv_points = context["uv_points"]
+    input_normals = context["input_normals"]
+    input_normals_valid = context["input_normals_valid"]
+    records = context["records"]
 
     infer_out = _run_triplet_inference(
         args=args,
@@ -1562,6 +2007,9 @@ def _run_single_iteration(
         world_points=world_points,
         uv_points=uv_points,
         volume_arr=volume_arr,
+        surface=surface,
+        input_grid=input_grid,
+        input_valid=input_valid,
         shape_hw=input_valid.shape,
         dense_subsample_stride=dense_subsample_stride,
         input_normals=input_normals,
@@ -1735,6 +2183,21 @@ def run(args):
 
     out_dir = str(Path(args.out_dir).resolve()) if args.out_dir else str(Path(args.tifxyz_path).resolve().parent)
     os.makedirs(out_dir, exist_ok=True)
+    if bool(args.save_tifs):
+        return _run_save_tifs_mode(
+            args=args,
+            model_state=model_state,
+            crop_size=crop_size,
+            volume_arr=volume_arr,
+            surface=surface,
+            input_grid=input_grid,
+            input_valid=input_valid,
+            input_uuid=input_uuid,
+            retarget_factor=retarget_factor,
+            out_dir=out_dir,
+            out_prefix=out_prefix,
+        )
+
     save_scale_factor = int(2 ** int(args.volume_scale))
     iterative_mode = args.iterations is not None
     iterations_requested = int(args.iterations) if iterative_mode else 1

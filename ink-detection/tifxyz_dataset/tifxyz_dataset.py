@@ -27,25 +27,46 @@ class TifxyzInkDataset(Dataset):
         self.patch_size = config["patch_size"]                                          # 3d vol crop / model input patch size
         self.patch_size_zyx = _normalize_patch_size_zyx(self.patch_size)  
         
-        bg_distance = config["bg_distance"]                                             # [positive, negative]
-        self.bg_distance = (float(bg_distance[0]), float(bg_distance[1]))
-        
-        label_distance = config["label_distance"]                                       # [positive, negative]
-        self.label_distance = (float(label_distance[0]), float(label_distance[1]))
+        fg_distance_value = config.get("fg_distance", config.get("label_distance", 10))
+        if fg_distance_value is None:
+            raise ValueError("fg_distance must not be None")
+        self.fg_distance = (
+            (float(fg_distance_value), float(fg_distance_value))
+            if np.isscalar(fg_distance_value)
+            else tuple(float(v) for v in fg_distance_value)
+        )
+        if len(self.fg_distance) != 2:
+            raise ValueError(f"fg_distance must be a number or a length-2 sequence, got {fg_distance_value!r}")
+
+        bg_distance_value = config.get("bg_distance", self.fg_distance)
+        if bg_distance_value is None:
+            raise ValueError("bg_distance must not be None")
+        self.bg_distance = (
+            (float(bg_distance_value), float(bg_distance_value))
+            if np.isscalar(bg_distance_value)
+            else tuple(float(v) for v in bg_distance_value)
+        )
+        if len(self.bg_distance) != 2:
+            raise ValueError(f"bg_distance must be a number or a length-2 sequence, got {bg_distance_value!r}")
 
         self.normal_sample_step = float(config.get("normal_sample_step", 0.5))
         self.surface_bbox_pad = float(config.get("surface_bbox_pad", 2.0))
       
         self.overlap_fraction = float(config.get("overlap_fraction", 0.25))             # amount of overlap (stride) in train/val patches, as a percentage of the patch size
-        self.min_positive_fraction = float(config.get("min_positive_fraction", 0.01))   # minimum amount of labeled voxels in a candidate bbox to be added to our patches list, as a percentage of the total voxels
-        self.min_span_ratio = float(config.get("min_span_ratio", 0.50))                 # the "span" in this instance is how far across the principle "direction" axis the segment should span (bbox local)
         self.patch_finding_workers = int(
             config.get("patch_finding_workers", 4)
-        )                                                                               # workers for both z-band generation and bbox filtering
+        )                                                                               # reserved for patch-finding parallelism
         self.patch_cache_force_recompute = bool(
             config.get("patch_cache_force_recompute", False)
         )
-        self.patch_cache_filename = str(config["patch_cache_filename"])
+        patch_cache_filename = config.get("patch_cache_filename")
+        if patch_cache_filename in (None, ""):
+            self.patch_cache_filename = os.path.join(
+                str(config.get("out_dir", ".")),
+                ".tifxyz_patch_cache.json",
+            )
+        else:
+            self.patch_cache_filename = str(patch_cache_filename)
 
         self._segment_grid_cache = {}
         self._segment_labels_and_mask_cache = {}
@@ -59,14 +80,12 @@ class TifxyzInkDataset(Dataset):
         else:
             self.augmentations = None
 
-        self.patches, self.patch_generation_stats = find_patches(                       # greedily add bboxes along the 2d tifxyz grid , adding a new patch any time we meet requirements for: 
+        self.patches, self.patch_generation_stats = find_patches(                       # compute shared dataset bboxes, then keep only bboxes with tifxyz points and positive supervision
             config,                                                                     
             patch_size_zyx=self.patch_size_zyx,                                         # - patch size (in 3d)       
             overlap_fraction=self.overlap_fraction,                                     # - 3d bbox overlap
-            min_positive_fraction=self.min_positive_fraction,                           # - label percentage  
-            min_span_ratio=self.min_span_ratio,                                         # - axis span
             patch_finding_workers=self.patch_finding_workers,
-            patch_cache_force_recompute=self.patch_cache_force_recompute,               # see vesuvius/src/vesuvius/neural_tracing/inference/generate_segment_cover_bboxes.py  
+            patch_cache_force_recompute=self.patch_cache_force_recompute,
             patch_cache_filename=self.patch_cache_filename,                             # for info on the bbox generation
         )
 
@@ -148,6 +167,12 @@ class TifxyzInkDataset(Dataset):
 
     def __getitem__(self, idx):
         patch = self.patches[idx]
+        supervised_segment_indices = tuple(int(v) for v in patch["supervised_segment_indices"])
+        assert supervised_segment_indices, "patch must contain at least one supervised segment"
+        chosen_segment_idx = int(
+            supervised_segment_indices[np.random.randint(len(supervised_segment_indices))]
+        )
+        patch_segment = patch["segments"][chosen_segment_idx]
 
         z0, z1, y0, y1, x0, x1 = patch['world_bbox']
         min_corner = np.array([z0, y0, x0], dtype=np.int32)
@@ -162,14 +187,15 @@ class TifxyzInkDataset(Dataset):
             max_corner=max_corner,
         )
         
-        segment = patch["segment"]
+        segment = patch_segment["segment"]
         
         sampled_grid = _sample_patch_supervision_grid(
             self,
             segment,
             min_corner=min_corner,
             max_corner=max_corner,
-            extra_bbox_pad=max(max(self.bg_distance), max(self.label_distance)) + 1.0,
+            extra_bbox_pad=max(max(self.bg_distance), max(self.fg_distance)) + 1.0,
+            stored_rowcol_bounds=patch_segment["stored_rowcol_bounds"],
         )
 
         positive_point_mask = sampled_grid["in_patch"] & (sampled_grid["class_codes"] == 1)
@@ -215,7 +241,7 @@ class TifxyzInkDataset(Dataset):
             max_corner=max_corner,
             crop_size=crop_size,
             class_value=1,
-            label_distance=self.label_distance,
+            label_distance=self.fg_distance,
             require_points=True,
         )
         assert bool(np.any(label_projection_vox > 0.0)), "label projection must produce non-empty supervision"
@@ -249,16 +275,24 @@ class TifxyzInkDataset(Dataset):
             "surface_vox": surface_vox,
             "projected_loss_mask": projected_loss_mask,
             "patch": patch,
+            "patch_segment": patch_segment,
             "idx": int(idx),
         }
-
-
 
 if __name__ == "__main__":
     import argparse
     import json
 
+    default_config_path = os.path.join(
+        os.path.dirname(__file__),
+        "example_config.json",
+    )
     parser = argparse.ArgumentParser(description="Inspect the TifxyzInkDataset.")
+    parser.add_argument(
+        "--config",
+        default=default_config_path,
+        help="Path to the dataset config JSON.",
+    )
     parser.add_argument(
         "--napari",
         action="store_true",
@@ -272,8 +306,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    config_path = os.path.join(os.path.dirname(__file__), "example_config.json")
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(args.config, "r", encoding="utf-8") as f:
         config = json.load(f)
 
     ds = TifxyzInkDataset(
@@ -309,7 +342,9 @@ if __name__ == "__main__":
         if len(ds) == 0:
             raise RuntimeError("Dataset produced no samples to visualize.")
 
-        from qtpy.QtWidgets import QPushButton
+        from napari.qt.threading import thread_worker
+        from qtpy.QtCore import QTimer
+        from qtpy.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 
         print(f"Napari spatial downsample factor: {napari_downsample}")
 
@@ -350,50 +385,52 @@ if __name__ == "__main__":
             print(f"background_label_vox sample nonzero: {sample_data['background_total']}")
 
         sample_cursor = {"idx": 0}
-        initial_sample_data = _build_napari_sample_data(ds[sample_cursor["idx"]])
-        _log_sample_stats(initial_sample_data)
+        load_state = {"request_id": 0, "worker": None}
+        empty_image = np.zeros((1, 1, 1), dtype=np.float32)
+        empty_labels = np.zeros((1, 1, 1), dtype=np.uint8)
 
         viewer = napari.Viewer(ndisplay=3)
         vol_layer = viewer.add_image(
-            initial_sample_data["vol_3d"],
+            empty_image,
             name="vol",
             rendering="mip",
             interpolation3d="nearest",
         )
         surface_layer = viewer.add_labels(
-            initial_sample_data["surface_3d"],
+            empty_labels,
             name="surface_vox",
             opacity=0.2,
             blending="additive",
         )
         positive_layer = viewer.add_labels(
-            initial_sample_data["positive_3d"],
+            empty_labels,
             name="positive_label_vox",
             opacity=0.9,
             blending="additive",
         )
         background_layer = viewer.add_labels(
-            initial_sample_data["background_3d"],
+            empty_labels,
             name="background_label_vox",
             opacity=0.7,
             blending="additive",
         )
         surface_label_layer = viewer.add_labels(
-            initial_sample_data["surface_label_vis"],
+            empty_labels,
             name="labeled_vox_at_surface",
             opacity=0.5,
             blending="additive",
         )
         projected_loss_layer = viewer.add_labels(
-            initial_sample_data["projected_loss_mask_vis"],
+            empty_labels,
             name="projected_loss_mask",
             opacity=0.5,
             blending="additive",
         )
-        viewer.title = f"TifxyzInkDataset sample {initial_sample_data['sample_idx']}"
+        viewer.title = "TifxyzInkDataset loading..."
 
-        def _show_sample_at_cursor():
-            sample_data = _build_napari_sample_data(ds[sample_cursor["idx"]])
+        def _apply_sample_data(sample_data, request_id):
+            if request_id != load_state["request_id"]:
+                return
             vol_layer.data = sample_data["vol_3d"]
             surface_layer.data = sample_data["surface_3d"]
             positive_layer.data = sample_data["positive_3d"]
@@ -401,15 +438,58 @@ if __name__ == "__main__":
             surface_label_layer.data = sample_data["surface_label_vis"]
             projected_loss_layer.data = sample_data["projected_loss_mask_vis"]
             viewer.title = f"TifxyzInkDataset sample {sample_data['sample_idx']}"
+            status_label.setText(
+                f"sample {sample_data['sample_idx']} loaded "
+                f"(pos={sample_data['positive_total']}, bg={sample_data['background_total']})"
+            )
+            next_button.setEnabled(True)
             _log_sample_stats(sample_data)
 
+        def _handle_sample_error(exc, request_id):
+            if request_id != load_state["request_id"]:
+                return
+            viewer.title = "TifxyzInkDataset load failed"
+            status_label.setText(f"load failed: {exc}")
+            next_button.setEnabled(True)
+            print(f"napari sample load failed: {exc}")
+
+        def _request_sample_load(idx):
+            request_id = int(load_state["request_id"]) + 1
+            load_state["request_id"] = request_id
+            sample_cursor["idx"] = int(idx)
+            viewer.title = f"TifxyzInkDataset loading sample {sample_cursor['idx']}..."
+            status_label.setText(f"loading sample {sample_cursor['idx']}...")
+            next_button.setEnabled(False)
+
+            @thread_worker
+            def _load_sample():
+                return _build_napari_sample_data(ds[sample_cursor["idx"]])
+
+            worker = _load_sample()
+            load_state["worker"] = worker
+            worker.returned.connect(
+                lambda sample_data, request_id=request_id: _apply_sample_data(sample_data, request_id)
+            )
+            worker.errored.connect(
+                lambda exc, request_id=request_id: _handle_sample_error(exc, request_id)
+            )
+            worker.start()
+
         next_button = QPushButton("next")
+        next_button.setEnabled(False)
+        status_label = QLabel("waiting for initial sample...")
+        controls = QWidget()
+        controls_layout = QVBoxLayout()
+        controls_layout.addWidget(status_label)
+        controls_layout.addWidget(next_button)
+        controls.setLayout(controls_layout)
 
         def _on_next_clicked():
-            sample_cursor["idx"] = (sample_cursor["idx"] + 1) % len(ds)
-            _show_sample_at_cursor()
+            _request_sample_load((sample_cursor["idx"] + 1) % len(ds))
 
         next_button.clicked.connect(_on_next_clicked)
-        viewer.window.add_dock_widget(next_button, area="right", name="next")
+        viewer.window.add_dock_widget(controls, area="right", name="sample")
+
+        QTimer.singleShot(0, lambda: _request_sample_load(sample_cursor["idx"]))
 
         napari.run()

@@ -1,5 +1,6 @@
 import aiohttp
 import json
+import warnings
 from pathlib import Path
 
 import fsspec
@@ -20,6 +21,10 @@ def load_volume_auth(auth_json_path):
 
 
 def flat_patch_cache_path(config):
+    explicit_cache_path = config.get("patch_cache_filename")
+    if explicit_cache_path not in (None, ""):
+        return Path(str(explicit_cache_path))
+
     patch_size = config.get("patch_size", ())
     if isinstance(patch_size, int):
         patch_size_key = str(int(patch_size))
@@ -35,9 +40,8 @@ def save_flat_patch_cache(path, patches):
         json.dump(
             [
                 {
-                    "image_volume": str(patch.segment.image_volume),
-                    "supervision_mask": str(patch.segment.supervision_mask),
-                    "inklabels": str(patch.segment.inklabels),
+                    "dataset_idx": int(patch.segment.dataset_idx),
+                    "segment_relpath": str(patch.segment.segment_relpath),
                     "scale": patch.segment.scale,
                     "bbox": list(patch.bbox),
                 }
@@ -104,9 +108,9 @@ def to_uint8_probability(probability_2d, lower_percentile=1.0, upper_percentile=
         probability_2d = (probability_2d - lo) / (hi - lo)
     return np.clip(np.rint(probability_2d * 255.0), 0, 255).astype(np.uint8)
 
-def save_val_preview_tif(output_path, input_tiles, label_tiles, probability_tiles, gap_size=4):
+def build_preview_montage(input_tiles, label_tiles, probability_tiles, gap_size=4):
     if not input_tiles:
-        return
+        return None
 
     rows = []
     for input_tile, label_tile, probability_tile in zip(input_tiles, label_tiles, probability_tiles):
@@ -124,8 +128,18 @@ def save_val_preview_tif(output_path, input_tiles, label_tiles, probability_tile
         if row_idx > 0:
             montage.append(row_gap)
         montage.append(row)
+    return np.concatenate(montage, axis=0)
 
-    tifffile.imwrite(output_path, np.concatenate(montage, axis=0), compression="lzw")
+def save_val_preview_tif(output_path, input_tiles, label_tiles, probability_tiles, gap_size=4):
+    montage = build_preview_montage(
+        input_tiles,
+        label_tiles,
+        probability_tiles,
+        gap_size=gap_size,
+    )
+    if montage is None:
+        return
+    tifffile.imwrite(output_path, montage, compression="lzw")
 
 def _normalize_patch_size_zyx(patch_size):
     patch_size_zyx = np.asarray(patch_size, dtype=np.int32).reshape(-1)
@@ -137,6 +151,48 @@ def _normalize_patch_size_zyx(patch_size):
         )
     return patch_size_zyx
 
+
+def _read_bbox_with_padding(volume, bbox, *, fill_value=0):
+    z0, y0, x0, z1, y1, x1 = (int(v) for v in bbox)
+    expected_shape = (z1 - z0, y1 - y0, x1 - x0)
+    if any(size <= 0 for size in expected_shape):
+        raise ValueError(f"bbox must define a positive crop, got {bbox!r}")
+
+    volume_shape = tuple(int(v) for v in volume.shape[:3])
+    src_starts = (
+        max(0, z0),
+        max(0, y0),
+        max(0, x0),
+    )
+    src_stops = (
+        min(volume_shape[0], z1),
+        min(volume_shape[1], y1),
+        min(volume_shape[2], x1),
+    )
+
+    dtype = np.asarray(volume[(slice(0, 1),) * 3]).dtype
+    output = np.full(expected_shape, fill_value, dtype=dtype)
+
+    if any(stop <= start for start, stop in zip(src_starts, src_stops)):
+        return output, None
+
+    crop = np.asarray(
+        volume[
+            src_starts[0]:src_stops[0],
+            src_starts[1]:src_stops[1],
+            src_starts[2]:src_stops[2],
+        ]
+    )
+    dst_starts = (
+        src_starts[0] - z0,
+        src_starts[1] - y0,
+        src_starts[2] - x0,
+    )
+    dst_stops = tuple(dst_start + size for dst_start, size in zip(dst_starts, crop.shape))
+    dst_slices = tuple(slice(start, stop) for start, stop in zip(dst_starts, dst_stops))
+    output[dst_slices] = crop
+    return output, dst_slices
+
 def _normalize_vectors_last_axis(vectors, eps=1e-6):
     vectors = np.asarray(vectors, dtype=np.float32)
     norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
@@ -147,15 +203,53 @@ def _normalize_vectors_last_axis(vectors, eps=1e-6):
     out[good_mask] = vectors[good_mask] / norms[good_mask]
     return out, good_mask
 
-def _get_labels_and_mask(dataset, segment):
+
+def _reconcile_label_mask_shape(
+    mask,
+    expected_shape,
+    *,
+    segment_uuid,
+    label_name,
+    max_axis_mismatch=1,
+):
+    expected_shape = tuple(int(v) for v in expected_shape)
+    actual_shape = tuple(int(v) for v in mask.shape[:2])
+    if actual_shape == expected_shape:
+        return mask
+
+    axis_mismatches = tuple(
+        int(actual - expected)
+        for actual, expected in zip(actual_shape, expected_shape)
+    )
+    if any(abs(mismatch) > int(max_axis_mismatch) for mismatch in axis_mismatches):
+        raise AssertionError(
+            f"Segment {segment_uuid!r} {label_name} label shape {actual_shape} does not match "
+            f"tifxyz full-resolution shape {expected_shape}."
+        )
+
+    row_extent = min(actual_shape[0], expected_shape[0])
+    col_extent = min(actual_shape[1], expected_shape[1])
+    mask = np.asarray(mask[:row_extent, :col_extent])
+
+    pad_rows = expected_shape[0] - row_extent
+    pad_cols = expected_shape[1] - col_extent
+    if pad_rows > 0 or pad_cols > 0:
+        pad_width = [(0, pad_rows), (0, pad_cols)]
+        pad_width.extend([(0, 0)] * max(0, mask.ndim - 2))
+        mask = np.pad(mask, pad_width, mode="constant", constant_values=0)
+
+    warnings.warn(
+        f"Segment {segment_uuid!r} {label_name} label shape {actual_shape} adjusted to "
+        f"{expected_shape} to absorb a <=1 pixel edge mismatch.",
+        stacklevel=2,
+    )
+    return mask
+
+def load_segment_label_masks(segment, shape):
     import cv2
 
     segment_uuid = str(segment.uuid)
-    cached = dataset._segment_labels_and_mask_cache.get(segment_uuid)
-    if cached is not None:
-        return cached
-
-    shape = tuple(int(v) for v in dataset._get_segment_stored_grid(segment)["shape"])
+    shape = tuple(int(v) for v in shape)
 
     def read_mask(path, label_name):
         assert path, f"Segment {segment_uuid!r} must contain {label_name} mask."
@@ -166,10 +260,11 @@ def _get_labels_and_mask(dataset, segment):
                 mask = cv2.cvtColor(mask, cv2.COLOR_BGRA2GRAY)
             else:
                 mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
-        actual_shape = tuple(int(v) for v in mask.shape)
-        assert actual_shape == shape, (
-            f"Segment {segment_uuid!r} {label_name} label shape {actual_shape} does not match "
-            f"tifxyz grid shape {shape}."
+        mask = _reconcile_label_mask_shape(
+            mask,
+            shape,
+            segment_uuid=segment_uuid,
+            label_name=label_name,
         )
         return np.asarray(mask > 0, dtype=bool)
 
@@ -189,11 +284,28 @@ def _get_labels_and_mask(dataset, segment):
 
     ink_mask = read_mask(ink_label_path, "ink")
     supervision_mask = read_mask(supervision_path, "supervision")
-    out = (ink_mask, np.asarray(supervision_mask & ~ink_mask, dtype=bool))
+    return ink_mask, np.asarray(supervision_mask & ~ink_mask, dtype=bool), ink_label_path
+
+def _get_labels_and_mask(dataset, segment):
+    segment_uuid = str(segment.uuid)
+    cached = dataset._segment_labels_and_mask_cache.get(segment_uuid)
+    if cached is not None:
+        return cached
+
+    shape = tuple(int(v) for v in segment.full_resolution_shape)
+    ink_mask, supervision_mask, _ = load_segment_label_masks(segment, shape)
+    out = (ink_mask, supervision_mask)
     dataset._segment_labels_and_mask_cache[segment_uuid] = out
     return out
 
-def _sample_patch_supervision_grid(dataset, segment, min_corner, max_corner, extra_bbox_pad=0.0):
+def _sample_patch_supervision_grid(
+    dataset,
+    segment,
+    min_corner,
+    max_corner,
+    extra_bbox_pad=0.0,
+    stored_rowcol_bounds=None,
+):
     from vesuvius.tifxyz import interpolate_at_points
 
     grid = dataset._get_segment_stored_grid(segment)
@@ -214,42 +326,60 @@ def _sample_patch_supervision_grid(dataset, segment, min_corner, max_corner, ext
     scale_y = float(scale_y) if np.isfinite(scale_y) and float(scale_y) > 0.0 else 1.0
     scale_x = float(scale_x) if np.isfinite(scale_x) and float(scale_x) > 0.0 else 1.0
 
-    expanded_min = min_corner_f - bbox_pad
-    expanded_max = max_corner_f + bbox_pad
-    in_bbox = (
-        valid_mask
-        & (z_stored >= expanded_min[0])
-        & (z_stored < expanded_max[0])
-        & (y_stored >= expanded_min[1])
-        & (y_stored < expanded_max[1])
-        & (x_stored >= expanded_min[2])
-        & (x_stored < expanded_max[2])
-    )
-
-    rows, cols = np.where(in_bbox)
-    row_min, row_max = int(rows.min()), int(rows.max())
-    col_min, col_max = int(cols.min()), int(cols.max())
     kernel_pad = 2 if interp_method in {"catmull_rom", "bspline"} else 1
-    row_min = max(0, row_min - kernel_pad)
-    row_max = min(n_rows_stored - 1, row_max + kernel_pad)
-    col_min = max(0, col_min - kernel_pad)
-    col_max = min(n_cols_stored - 1, col_max + kernel_pad)
+    if stored_rowcol_bounds is None:
+        expanded_min = min_corner_f - bbox_pad
+        expanded_max = max_corner_f + bbox_pad
+        in_bbox = (
+            valid_mask
+            & (z_stored >= expanded_min[0])
+            & (z_stored < expanded_max[0])
+            & (y_stored >= expanded_min[1])
+            & (y_stored < expanded_max[1])
+            & (x_stored >= expanded_min[2])
+            & (x_stored < expanded_max[2])
+        )
+        rows, cols = np.where(in_bbox)
+        assert rows.size > 0 and cols.size > 0, "patch must intersect stored tifxyz points"
+        row_start = max(0, int(rows.min()) - kernel_pad)
+        row_stop = min(n_rows_stored, int(rows.max()) + kernel_pad + 1)
+        col_start = max(0, int(cols.min()) - kernel_pad)
+        col_stop = min(n_cols_stored, int(cols.max()) + kernel_pad + 1)
+    else:
+        row_start, row_stop, col_start, col_stop = (
+            int(stored_rowcol_bounds[0]),
+            int(stored_rowcol_bounds[1]),
+            int(stored_rowcol_bounds[2]),
+            int(stored_rowcol_bounds[3]),
+        )
+        row_start = max(0, row_start - kernel_pad)
+        row_stop = min(n_rows_stored, row_stop + kernel_pad)
+        col_start = max(0, col_start - kernel_pad)
+        col_stop = min(n_cols_stored, col_stop + kernel_pad)
+        assert row_stop > row_start and col_stop > col_start, "stored_rowcol_bounds must define a non-empty slice"
 
-    n_rows_local = row_max - row_min + 1
-    n_cols_local = col_max - col_min + 1
+    x_local = x_stored[row_start:row_stop, col_start:col_stop]
+    y_local = y_stored[row_start:row_stop, col_start:col_stop]
+    z_local = z_stored[row_start:row_stop, col_start:col_stop]
+    valid_local = valid_mask[row_start:row_stop, col_start:col_stop]
+
+    n_rows_local = row_stop - row_start
+    n_cols_local = col_stop - col_start
     query_h = 1 if n_rows_local <= 1 else max(n_rows_local, int(round(n_rows_local / scale_y)))
     query_w = 1 if n_cols_local <= 1 else max(n_cols_local, int(round(n_cols_local / scale_x)))
-    query_rows = np.linspace(row_min, row_max, query_h, dtype=np.float32)
-    query_cols = np.linspace(col_min, col_max, query_w, dtype=np.float32)
-    query_y, query_x = np.meshgrid(query_rows, query_cols, indexing="ij")
+    query_rows_global = np.linspace(row_start, row_stop - 1, query_h, dtype=np.float32)
+    query_cols_global = np.linspace(col_start, col_stop - 1, query_w, dtype=np.float32)
+    query_y_global, query_x_global = np.meshgrid(query_rows_global, query_cols_global, indexing="ij")
+    query_y_local = query_y_global - float(row_start)
+    query_x_local = query_x_global - float(col_start)
 
     x_int, y_int, z_int, int_valid = interpolate_at_points(
-        x_stored,
-        y_stored,
-        z_stored,
-        valid_mask,
-        query_y,
-        query_x,
+        x_local,
+        y_local,
+        z_local,
+        valid_local,
+        query_y_local,
+        query_x_local,
         scale=(1.0, 1.0),
         method=interp_method,
         invalid_value=-1.0,
@@ -269,12 +399,12 @@ def _sample_patch_supervision_grid(dataset, segment, min_corner, max_corner, ext
 
     normals_grid = _get_segment_normals_zyx(dataset, segment)
     nz_int, ny_int, nx_int, normals_valid = interpolate_at_points(
-        normals_grid[..., 0],
-        normals_grid[..., 1],
-        normals_grid[..., 2],
-        valid_mask,
-        query_y,
-        query_x,
+        normals_grid[row_start:row_stop, col_start:col_stop, 0],
+        normals_grid[row_start:row_stop, col_start:col_stop, 1],
+        normals_grid[row_start:row_stop, col_start:col_stop, 2],
+        valid_local,
+        query_y_local,
+        query_x_local,
         scale=(1.0, 1.0),
         method=interp_method,
         invalid_value=np.nan,
@@ -284,12 +414,12 @@ def _sample_patch_supervision_grid(dataset, segment, min_corner, max_corner, ext
     normals_zyx, normals_nonzero = _normalize_vectors_last_axis(normals_zyx)
     normals_valid &= normals_nonzero
 
-    class_codes = np.full(query_y.shape, 100, dtype=np.uint8)
+    class_codes = np.full(query_y_global.shape, 100, dtype=np.uint8)
     ink_mask_full, supervision_mask_full = _get_labels_and_mask(dataset, segment)
     if ink_mask_full.size > 0:
         full_h, full_w = ink_mask_full.shape
-        query_rows_full = query_y / scale_y
-        query_cols_full = query_x / scale_x
+        query_rows_full = query_y_global / scale_y
+        query_cols_full = query_x_global / scale_x
         label_rows = np.rint(query_rows_full).astype(np.int64, copy=False)
         label_cols = np.rint(query_cols_full).astype(np.int64, copy=False)
         in_label_bounds = (
