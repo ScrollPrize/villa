@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Sequence
+from urllib.parse import urlparse
 
 import numpy as np
 import tifffile
@@ -42,7 +43,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Simple MONAI sliding-window inference for OME-Zarr volumes."
     )
-    parser.add_argument("input_zarr", type=Path, nargs="?", help="Input OME-Zarr path.")
+    parser.add_argument("input_zarr", nargs="?", help="Input OME-Zarr path or URL.")
     parser.add_argument("checkpoint", type=Path, nargs="?", help="Model checkpoint path.")
     parser.add_argument("output_tiff", type=Path, nargs="?", help="Output uint8 tiled TIFF path.")
     parser.add_argument("--model-type", choices=("resnet3d", "residual_unet"), required=True)
@@ -75,6 +76,29 @@ def configure_logging(level: str) -> None:
         level=getattr(logging, level.upper()),
         format="[%(asctime)s] %(levelname)s %(message)s",
     )
+
+
+def is_url_like_path(path: str | Path) -> bool:
+    parsed = urlparse(str(path))
+    return bool(parsed.scheme and parsed.netloc)
+
+
+def normalize_input_zarr_arg(path: str | Path | None) -> str | Path | None:
+    if path is None:
+        return None
+    path_str = str(path)
+    if is_url_like_path(path_str):
+        return path_str
+    return Path(path_str)
+
+
+def open_zarr_readonly(path: str | Path):
+    path_str = str(path)
+    if is_url_like_path(path_str):
+        import fsspec
+
+        return zarr.open(fsspec.get_mapper(path_str.rstrip("/")), mode="r")
+    return zarr.open(path_str, mode="r")
 
 
 def load_grayscale_mask(path: Path, target_shape: tuple[int, int]) -> np.ndarray:
@@ -159,14 +183,14 @@ class OmeZarrPatchReader:
     def __init__(
         self,
         *,
-        input_path: Path,
+        input_path: str | Path,
         resolution: str,
         depth_axis_first: bool,
         height: int,
         width: int,
         layer_indices: np.ndarray,
     ):
-        self.input_path = Path(input_path)
+        self.input_path = input_path if is_url_like_path(input_path) else Path(input_path)
         self.resolution = str(resolution)
         self.depth_axis_first = bool(depth_axis_first)
         self.height = int(height)
@@ -190,7 +214,7 @@ class OmeZarrPatchReader:
 
     def _ensure_array(self):
         if self._array is None:
-            root = zarr.open(str(self.input_path), mode="r")
+            root = open_zarr_readonly(self.input_path)
             self._array = root if isinstance(root, zarr.Array) else root[self.resolution]
         return self._array
 
@@ -440,11 +464,11 @@ def infer_single_zarr(
     args: argparse.Namespace,
     model: torch.nn.Module,
     cfg,
-    input_zarr: Path,
+    input_zarr: str | Path,
     output_tiff: Path,
 ) -> None:
     resolution = str(args.resolution)
-    root = zarr.open(str(input_zarr), mode="r")
+    root = open_zarr_readonly(input_zarr)
     if isinstance(root, zarr.Array):
         resolution = "0"
         volume_arr = root
@@ -712,7 +736,7 @@ def infer_folder(args: argparse.Namespace, model: torch.nn.Module, cfg) -> None:
 
 
 def normalize_inference_paths(args: argparse.Namespace) -> argparse.Namespace:
-    args.input_zarr = Path(args.input_zarr) if args.input_zarr is not None else None
+    args.input_zarr = normalize_input_zarr_arg(args.input_zarr)
     args.output_tiff = Path(args.output_tiff) if args.output_tiff is not None else None
     args.folder = Path(args.folder) if args.folder is not None else None
     args.checkpoint = Path(args.checkpoint) if args.checkpoint is not None else None
@@ -723,7 +747,7 @@ def normalize_inference_paths(args: argparse.Namespace) -> argparse.Namespace:
 
     # Convenience: allow "--folder <dir> <checkpoint>" without --checkpoint-path.
     if args.folder is not None and args.checkpoint is None and args.input_zarr is not None and args.output_tiff is None:
-        args.checkpoint = args.input_zarr
+        args.checkpoint = Path(str(args.input_zarr))
         args.input_zarr = None
 
     if args.checkpoint is None:
