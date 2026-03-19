@@ -142,13 +142,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "'default' uses PyTorch's default autocast dtype."
         ),
     )
-    parser.add_argument(
-        "--reverse-layers",
-        "--reverse",
-        dest="reverse_layers",
-        action="store_true",
-        help="Legacy alias for --direction both.",
-    )
     parser.add_argument("--tta-mirror", action="store_true", help="Average mirror-based TTA over training-eligible axes.")
     parser.add_argument(
         "--tta-batch-size",
@@ -167,11 +160,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def normalize_direction_value(direction: str, *, reverse_flag: bool) -> str:
-    normalized = str(direction).strip().lower()
-    if reverse_flag:
-        return "both"
-    return normalized
+def normalize_direction_value(direction: str) -> str:
+    return str(direction).strip().lower()
 
 
 def resolve_run_directions(direction: str) -> tuple[str, ...]:
@@ -1412,7 +1402,7 @@ def normalize_inference_paths(args: argparse.Namespace) -> argparse.Namespace:
     if args.checkpoint_path is not None:
         args.checkpoint = args.checkpoint_path
 
-    args.direction = normalize_direction_value(args.direction, reverse_flag=bool(args.reverse_layers))
+    args.direction = normalize_direction_value(args.direction)
 
     # Convenience: allow "--folder <dir> <checkpoint>" without --checkpoint-path.
     if args.folder is not None and args.checkpoint is None and args.input_zarr is not None and args.output_tiff is None:
