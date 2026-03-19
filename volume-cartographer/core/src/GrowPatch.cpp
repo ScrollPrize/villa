@@ -3157,6 +3157,7 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache 
         cv::Mat_<uint16_t> generations_crop = generations(used_area_safe);
 
         auto surf = new QuadSurface(points_crop, {1/T, 1/T});
+        surf->setDpi(voxelSizeToDpi(voxelsize));
         surf->setChannel("generations", generations_crop);
 
         if (params.value("vis_losses", false)) {
