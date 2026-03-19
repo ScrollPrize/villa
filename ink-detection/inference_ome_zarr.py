@@ -106,10 +106,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Checkpoint path override (useful with --folder mode).",
     )
+    parser.add_argument(
+        "--output-prefix",
+        default="",
+        help="Optional prefix added to folder-mode output TIFF filenames.",
+    )
     parser.add_argument("--metadata-json", type=Path, default=None)
     parser.add_argument("--mask-path", type=Path, default=None)
     parser.add_argument("--resolution", default="0")
     parser.add_argument("--num-workers", "--workers", dest="num_workers", type=int, default=4)
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=DEFAULT_PREFETCH_FACTOR,
+        help="Number of batches prefetched per worker when --num-workers > 0.",
+    )
     parser.add_argument("--overlap", type=float, default=DEFAULT_OVERLAP)
     parser.add_argument("--layer-start", type=int, default=None)
     parser.add_argument("--layer-end", type=int, default=None)
@@ -128,6 +139,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.tta_batch_size is not None and int(args.tta_batch_size) <= 0:
         parser.error("--tta-batch-size must be a positive integer")
+    if int(args.prefetch_factor) <= 0:
+        parser.error("--prefetch-factor must be a positive integer")
     return args
 
 
@@ -1116,7 +1129,7 @@ def infer_single_zarr(
     }
     if int(args.num_workers) > 0:
         loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = DEFAULT_PREFETCH_FACTOR
+        loader_kwargs["prefetch_factor"] = int(args.prefetch_factor)
     loader = DataLoader(**loader_kwargs)
     weight_mode = "constant" if float(args.overlap) == 0.0 else "gaussian"
     weight_map = compute_importance_map(
@@ -1216,6 +1229,7 @@ def infer_folder(args: argparse.Namespace, configured_model: ConfiguredModel) ->
     checkpoint_stem = Path(args.checkpoint).stem
     direction = "reverse" if bool(args.reverse_layers) else "forward"
     date_str = datetime.now().strftime("%d%m%y")
+    output_prefix = f"{str(args.output_prefix)}_" if str(args.output_prefix) else ""
 
     segment_dirs = sorted(path for path in folder.iterdir() if path.is_dir())
     if not segment_dirs:
@@ -1232,7 +1246,11 @@ def infer_folder(args: argparse.Namespace, configured_model: ConfiguredModel) ->
             skipped_count += 1
             continue
 
-        output_tiff = segment_dir / "preds" / f"{segment_name}_{checkpoint_stem}_{direction}_{date_str}.tif"
+        output_tiff = (
+            segment_dir
+            / "preds"
+            / f"{output_prefix}{segment_name}_{checkpoint_stem}_{direction}_{date_str}.tif"
+        )
         LOGGER.info(
             "Running segment=%s input=%s output=%s",
             segment_name,
