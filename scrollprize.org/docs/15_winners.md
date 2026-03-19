@@ -42,6 +42,44 @@ Vesuvius Challenge has awarded **\$1,781,500** in prizes!
 
 This page lists all the prizes awarded so far:
 
+### \$200,000 Kaggle Surface Detection (March, 2026) {#surface-detection-kaggle-winners}
+
+**Goal:** Optimize topologically accurate papyrus surface detection methods.<br/>
+**Announcement:** <a href="https://scrollprize.substack.com/p/we-are-cooking">Blog post</a> / <a href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/overview">Kaggle competition</a> / <a href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard">Kaggle leaderboard</a><br/>
+
+<div className="flex flex-row flex-wrap">
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/1st-place-solution-for-the-vesuvius-challenge-su">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$60,000</div><span className="font-bold">1st: Vesuvius Team</span></div>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/2nd-place-solution-vesuvius-challenge-a-postproc">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$40,000</div><span className="font-bold">2nd: risk of overfitting</span></div>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/quick-preview-of-the-3rd-place">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$30,000</div><span className="font-bold">3rd: W &amp; A</span></div>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/4-th-place-solution">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$20,000</div><span className="font-bold">4th: Starry</span></div>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/5th-place-solution">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$15,000</div><span className="font-bold">5th: Dieter</span></div>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/6-th-place-solution">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$10,000</div><span className="font-bold">6th: #hui</span></div>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/7st-place-solution-for-the-vesuvius-challenge">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$10,000</div><span className="font-bold">7th: DECEM</span></div>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/8th-place-solution">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$5,000</div><span className="font-bold">8th: lingyundev</span></div>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/9th-place-solution">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$5,000</div><span className="font-bold">9th: 阿對對對對隊</span></div>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/10th-place-solution">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$5,000</div><span className="font-bold">10th: Vibes &amp; Scrolls Trade-off</span></div>
+  </a>
+</div>
+
 ### \$1,000 Open Source (March, 2026)
 
 **Goal:** Improve virtual unwrapping for the Surface Detection challenge.<br/>
@@ -51,45 +89,6 @@ This page lists all the prizes awarded so far:
   <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/Paul-G2/ScrollSlabViewer">
     <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$1,000</div><span className="font-bold">Scroll Slab Viewer</span>: Paul Geiger / @PaulG</div>
     <div className="text-sm text-gray-300">A user-friendly 3D viewer tailored to the Kaggle Surface Detection challenge.</div>
-  </a>
-</div>
-
-<a id="surface-detection-kaggle-winners" />
-### \$200,000 Kaggle Surface Detection (March, 2026)
-
-**Goal:** Optimize topologically accurate papyrus surface detection methods.<br/>
-**Announcement:** <a href="https://scrollprize.substack.com/p/we-are-cooking">Blog post</a> / <a href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/overview">Kaggle competition</a> / <a href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard">Kaggle leaderboard</a><br/>
-
-<div className="flex flex-row flex-wrap">
-  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard">
-    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$60,000</div><span className="font-bold">1st: DKFZ joined</span> (winning team included Paul Geiger)</div>
-  </a>
-  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard">
-    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$40,000</div><span className="font-bold">2nd: MOONMOON</span> / kevin1742064161</div>
-  </a>
-  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard">
-    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$30,000</div><span className="font-bold">3rd: Đăng</span> / dangnh0611</div>
-  </a>
-  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard">
-    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$20,000</div><span className="font-bold">4th: Racing driver</span> / cudacoding</div>
-  </a>
-  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard">
-    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$15,000</div><span className="font-bold">5th: MIC-DKFZ</span> / st3v3d, fabianisensee, benjaminhamm, yankir, maxrok</div>
-  </a>
-  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard">
-    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$10,000</div><span className="font-bold">6th: Vibes &amp; Scrolls Trade-off</span> / p4rallax, tom99763, cody11null</div>
-  </a>
-  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard">
-    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$10,000</div><span className="font-bold">7th: Savy</span> / savchenko</div>
-  </a>
-  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard">
-    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$5,000</div><span className="font-bold">8th: ryches</span> / ryches</div>
-  </a>
-  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard">
-    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$5,000</div><span className="font-bold">9th: Ousagi</span> / enzowalter</div>
-  </a>
-  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/leaderboard">
-    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$5,000</div><span className="font-bold">10th: TWEAK</span> / tweakai</div>
   </a>
 </div>
 
