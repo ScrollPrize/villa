@@ -518,11 +518,15 @@ def _log_vis(
     with torch.no_grad():
         b = min(4, image.size(0))
 
-        # Mid Z-slice of CT input (full res)
+        # Mid-slice CT input in all 3 planes
         mid_z_img = image.size(2) // 2
+        mid_y_img = image.size(3) // 2
+        mid_x_img = image.size(4) // 2
         writer.add_images(f"{tag}/input_z", image[:b, :, mid_z_img], step)
+        writer.add_images(f"{tag}/input_y", image[:b, :, :, mid_y_img], step)
+        writer.add_images(f"{tag}/input_x", image[:b, :, :, :, mid_x_img], step)
 
-        # Mid Z-slice of predictions and targets (label res)
+        # Mid Z-slice of predictions and targets
         mid_z = pred.size(2) // 2
         m = mask[:b, :, mid_z]  # (b, 1, h, w)
 
@@ -771,7 +775,7 @@ def main() -> None:
                         help="Short name for the run subdirectory.")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--patch-size", type=int, default=128,
                         help="Full-res patch size (must be divisible by step).")
     parser.add_argument("--w-cos", type=float, default=1.0)
