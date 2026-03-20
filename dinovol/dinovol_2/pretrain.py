@@ -23,7 +23,7 @@ from dinovol_2.eval.task_eval import TaskEvalRunner
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
 from dinovol_2.ops.distributed_utils import build_distributed_sampler, resolve_distributed_config
 from dinovol_2.loss import DINOLoss, KoLeoLoss, iBOTPatchLoss
-from dinovol_2.model.model import DinoVitStudentTeacher, _upgrade_weight_norm_state_dict_keys
+from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config, _upgrade_weight_norm_state_dict_keys
 
 
 def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
@@ -113,7 +113,8 @@ class CosineScheduler:
 class DinoIBOTPretrainer:
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.config = dict(config)
-        self.model_config = dict(self.config["model"])
+        self.model_config = _materialize_backbone_config(self.config["model"])
+        self.config["model"] = self.model_config
         distributed_config = resolve_distributed_config(self.config)
         self.is_distributed = bool(distributed_config["use_ddp"])
         self.rank = int(distributed_config["rank"])

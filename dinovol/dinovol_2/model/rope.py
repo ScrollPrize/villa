@@ -262,7 +262,7 @@ class MixedRopePositionEmbedding(_BaseRopePositionEmbedding):
             device=self.periods.device,
         )
         self.periods.data.copy_(periods)
-        self.reset_mixed_frequencies_to_axial()
+        self.reset_mixed_frequencies_to_random_oriented()
 
     @torch.no_grad()
     def reset_mixed_frequencies_to_axial(self) -> None:
@@ -273,6 +273,51 @@ class MixedRopePositionEmbedding(_BaseRopePositionEmbedding):
             end = start + self.freqs_per_axis
             mix_frequencies[:, start:end, axis] = inv_periods
         self.mix_frequencies.copy_(mix_frequencies)
+
+    @torch.no_grad()
+    def reset_mixed_frequencies_to_random_oriented(self) -> None:
+        mix_frequencies = torch.empty_like(self.mix_frequencies)
+        inv_periods = self.periods.reciprocal()
+
+        if self.ndim == 2:
+            angles = torch.empty(self.num_heads, device=self.periods.device, dtype=self.periods.dtype).uniform_(
+                0.0, 2.0 * math.pi
+            )
+            cos = torch.cos(angles)
+            sin = torch.sin(angles)
+            basis = torch.stack(
+                (
+                    torch.stack((cos, sin), dim=-1),
+                    torch.stack((-sin, cos), dim=-1),
+                ),
+                dim=-1,
+            )
+        else:
+            basis = torch.randn(
+                self.num_heads,
+                self.ndim,
+                self.ndim,
+                device=self.periods.device,
+                dtype=self.periods.dtype,
+            )
+            basis, r = torch.linalg.qr(basis)
+            diag = torch.diagonal(r, dim1=-2, dim2=-1)
+            signs = torch.where(diag < 0, -torch.ones_like(diag), torch.ones_like(diag))
+            basis = basis * signs.unsqueeze(-2)
+            negative_det = torch.linalg.det(basis) < 0
+            if negative_det.any():
+                basis[negative_det, :, 0] *= -1
+
+        for axis in range(self.ndim):
+            start = axis * self.freqs_per_axis
+            end = start + self.freqs_per_axis
+            mix_frequencies[:, start:end, :] = inv_periods[None, :, None] * basis[:, None, :, axis]
+
+        self.mix_frequencies.copy_(mix_frequencies)
+
+    @torch.jit.ignore
+    def no_weight_decay(self) -> set[str]:
+        return {"mix_frequencies"}
 
     def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
         coords = self._get_coords(shape)
