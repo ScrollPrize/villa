@@ -596,7 +596,7 @@ class TaskEvalRunner:
             return cls._project_ink_target(target)
         return target.detach()
 
-    @classmethod
+    @staticmethod
     def _binary_target_and_mask(target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         target = target.detach()
         valid_mask = target != _IGNORE_LABEL
