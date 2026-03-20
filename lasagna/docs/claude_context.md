@@ -14,7 +14,7 @@ PyTorch-based optimizer that fits multi-winding cylindrical meshes to preprocess
 
 | File | Purpose |
 |---|---|
-| `preprocess_cos_omezarr.py` | Runs 2D UNet inference per axis, produces 5-channel uint8 zarr (cos, grad_mag, dir0, dir1, valid). `integrate` mode fuses 3-axis results. |
+| `preprocess_cos_omezarr.py` | UNet inference on CT volumes. Three modes: default (2D per-axis), `integrate` (fuse 3-axis results), `predict3d` (3D UNet single-pass). |
 | `model.py` | `Model3D`: cylindrical mesh with arc parameterization, 5-level residual pyramid (x,y,z), amplitude/bias modulation. `bake_arc_into_mesh()` absorbs arc params. |
 | `fit_data.py` | `FitData3D`: loads preprocessed OME-Zarr to GPU. `CorrPoints3D`: correction points as (x,y,z,winda) in fullres. Custom CUDA uint8 sampling kernel. |
 | `optimizer.py` | Stage-based Adam optimization from JSON configs. Per-scale LRs, automatic arc baking, parameter groups (mesh_ms, amp, bias, arc_*). |

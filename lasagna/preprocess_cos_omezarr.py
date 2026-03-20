@@ -615,6 +615,340 @@ def _compute_pred_dt_channel(
 	print(f"[pred_dt] done in {time.time() - t0:.1f}s", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# 3D UNet predict mode
+# ---------------------------------------------------------------------------
+
+def _infer_tiled_3d(
+	model,
+	volume_u8: np.ndarray,
+	*,
+	device: torch.device,
+	tile_size: int = 256,
+	overlap: int = 64,
+	border: int = 16,
+	out_channels: int = 8,
+) -> np.ndarray:
+	"""Run 3D UNet inference on a volume using overlapping tiles with linear blending.
+
+	Args:
+		model: 3D UNet model in eval mode.
+		volume_u8: (Z, Y, X) uint8 numpy array.
+		device: torch device for inference.
+		tile_size: cube tile edge length.
+		overlap: tile overlap in voxels.
+		border: hard-discard border at tile edges.
+		out_channels: number of model output channels.
+
+	Returns:
+		(out_channels, Z, Y, X) float32 numpy array of raw logits.
+	"""
+	Z0, Y0, X0 = volume_u8.shape
+
+	pad0 = max(0, int(border))
+	if pad0 > 0:
+		volume_u8 = np.pad(volume_u8, pad0, mode="reflect")
+	Z, Y, X = volume_u8.shape
+
+	stride = max(1, tile_size - overlap)
+	ov_eff = max(0, overlap - 2 * border)
+
+	def _build_positions(size, tile, s):
+		if size <= tile:
+			return [0]
+		positions = list(range(0, size - tile + 1, s))
+		last = size - tile
+		if positions[-1] != last:
+			positions.append(last)
+		return positions
+
+	z_positions = _build_positions(Z, tile_size, stride)
+	y_positions = _build_positions(Y, tile_size, stride)
+	x_positions = _build_positions(X, tile_size, stride)
+
+	def _blend_ramp(length, ov, b):
+		ramp = np.zeros(length, dtype=np.float32)
+		if length <= 0:
+			return ramp
+		core_start = min(b, length)
+		core_end = max(core_start, length - b)
+		core_len = core_end - core_start
+		if core_len <= 0:
+			return ramp
+		core = np.ones(core_len, dtype=np.float32)
+		if ov > 0:
+			ov_core = min(ov, core_len // 2)
+			if ov_core > 0:
+				edges = np.linspace(0.0, 1.0, ov_core + 1, dtype=np.float32)[1:]
+				core[:ov_core] = edges
+				core[-ov_core:] = edges[::-1]
+		ramp[core_start:core_end] = core
+		return ramp
+
+	acc = np.zeros((out_channels, Z, Y, X), dtype=np.float32)
+	wsum = np.zeros((1, Z, Y, X), dtype=np.float32)
+
+	total_tiles = len(z_positions) * len(y_positions) * len(x_positions)
+	done = 0
+	t0 = time.time()
+
+	for tz in z_positions:
+		for ty in y_positions:
+			for tx in x_positions:
+				tz1 = min(tz + tile_size, Z)
+				ty1 = min(ty + tile_size, Y)
+				tx1 = min(tx + tile_size, X)
+				pz, py, px = tz1 - tz, ty1 - ty, tx1 - tx
+
+				tile_np = volume_u8[tz:tz1, ty:ty1, tx:tx1].astype(np.float32) / 255.0
+				tile_t = torch.from_numpy(tile_np).unsqueeze(0).unsqueeze(0)  # (1, 1, pz, py, px)
+
+				with torch.inference_mode(), torch.autocast(device_type=device.type):
+					pred = model(tile_t.to(device))
+				pred_np = pred.float().cpu().numpy()[0]  # (C, pz, py, px)
+
+				rz = _blend_ramp(pz, ov_eff, border)
+				ry = _blend_ramp(py, ov_eff, border)
+				rx = _blend_ramp(px, ov_eff, border)
+				w = rz[:, None, None] * ry[None, :, None] * rx[None, None, :]
+
+				acc[:, tz:tz1, ty:ty1, tx:tx1] += pred_np * w[None]
+				wsum[0, tz:tz1, ty:ty1, tx:tx1] += w
+
+				done += 1
+				elapsed = max(1e-6, time.time() - t0)
+				per = elapsed / done
+				eta = max(0.0, per * (total_tiles - done))
+				bar_w = 30
+				fill = int(round(done / max(1, total_tiles) * bar_w))
+				bar = "#" * fill + "-" * (bar_w - fill)
+				print(
+					f"\r[predict3d] [{bar}] {done}/{total_tiles} tiles "
+					f"({100.0 * done / max(1, total_tiles):.1f}%) "
+					f"eta {int(eta // 60):02d}:{int(eta % 60):02d} "
+					f"avg={1000.0 * per:.0f}ms/tile",
+					end="", flush=True,
+				)
+
+	print("", flush=True)
+	print(f"[predict3d] inference done in {time.time() - t0:.1f}s ({total_tiles} tiles)", flush=True)
+
+	result = acc / np.maximum(wsum, 1e-7)
+	if pad0 > 0:
+		result = result[:, pad0:pad0 + Z0, pad0:pad0 + Y0, pad0:pad0 + X0]
+
+	return result
+
+
+def run_preprocess_3d(
+	*,
+	input_path: str,
+	output_path: str,
+	unet3d_checkpoint: str,
+	device: str | None,
+	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
+	tile_size: int,
+	overlap: int,
+	border: int,
+	scaledown: int,
+	pred_dt_path: str | None = None,
+	chunk_z: int = 32,
+	chunk_yx: int = 32,
+) -> None:
+	"""Run 3D UNet inference on a volume and write preprocessed zarr.
+
+	Output format matches fit_data.load_3d(): channels [cos, grad_mag, nx, ny]
+	(+ optional pred_dt) as uint8 with preprocess_params metadata.
+	"""
+	import torch.nn.functional as F
+	from train_unet_3d import build_model as build_model_3d
+
+	a_in = zarr.open(str(input_path), mode="r")
+	if not hasattr(a_in, "shape"):
+		raise ValueError(f"input must point to a zarr array, got: {input_path}")
+	sh = tuple(int(v) for v in a_in.shape)
+	if len(sh) != 3:
+		raise ValueError(f"input array must be (Z,Y,X), got shape {sh}")
+
+	z0, z1, y0, y1, x0, x1 = _crop_xyzwhd_bounds(shape_zyx=sh, crop_xyzwhd=crop_xyzwhd)
+	nz = z1 - z0
+	ny = y1 - y0
+	nx_dim = x1 - x0
+	if nz <= 0 or ny <= 0 or nx_dim <= 0:
+		raise ValueError(f"empty crop: x=[{x0},{x1}) y=[{y0},{y1}) z=[{z0},{z1}) in shape={sh}")
+	if scaledown <= 0:
+		raise ValueError("scaledown must be >= 1")
+
+	if device is None:
+		device = "cuda" if torch.cuda.is_available() else "cpu"
+	torch_device = torch.device(device)
+
+	# Load model
+	model = build_model_3d(tile_size, str(torch_device), weights=str(unet3d_checkpoint))
+	model.eval()
+
+	# Read input volume
+	print(
+		f"[predict3d] input={input_path} shape={sh} "
+		f"crop=({x0},{y0},{z0},{nx_dim},{ny},{nz}) scaledown={scaledown}",
+		flush=True,
+	)
+	volume_u8 = np.asarray(a_in[z0:z1, y0:y1, x0:x1])
+	if volume_u8.dtype == np.uint16:
+		volume_u8 = (volume_u8 // 257).astype(np.uint8)
+	elif volume_u8.dtype != np.uint8:
+		volume_u8 = volume_u8.astype(np.uint8)
+
+	# Memory estimate for accumulator
+	nz_p = nz + 2 * border
+	ny_p = ny + 2 * border
+	nx_p = nx_dim + 2 * border
+	acc_gb = 9.0 * nz_p * ny_p * nx_p * 4.0 / (1024.0 ** 3)
+	print(f"[predict3d] padded volume ({nz_p},{ny_p},{nx_p}), accumulator ~{acc_gb:.1f} GiB", flush=True)
+
+	# Run tiled 3D inference
+	logits = _infer_tiled_3d(
+		model, volume_u8,
+		device=torch_device,
+		tile_size=tile_size,
+		overlap=overlap,
+		border=border,
+	)  # (8, nz, ny, nx_dim) float32
+	del volume_u8
+
+	# Sigmoid activation
+	print("[predict3d] applying sigmoid...", flush=True)
+	pred = 1.0 / (1.0 + np.exp(-np.clip(logits, -88.0, 88.0)))
+	del logits
+
+	# Downsample
+	if scaledown > 1:
+		ds_z = nz // scaledown
+		ds_y = ny // scaledown
+		ds_x = nx_dim // scaledown
+		print(f"[predict3d] downsampling {scaledown}x: ({nz},{ny},{nx_dim}) -> ({ds_z},{ds_y},{ds_x})", flush=True)
+		pred_ds = np.empty((8, ds_z, ds_y, ds_x), dtype=np.float32)
+		chunk = 64
+		for zi in range(0, nz, chunk * scaledown):
+			ze = min(nz, zi + chunk * scaledown)
+			block = torch.from_numpy(pred[None, :, zi:ze])  # (1, 8, cz, ny, nx)
+			block_ds = F.avg_pool3d(block, scaledown, scaledown).numpy()[0]
+			out_zi = zi // scaledown
+			pred_ds[:, out_zi:out_zi + block_ds.shape[1]] = block_ds
+		del pred
+		pred = pred_ds
+		out_nz, out_ny, out_nx = ds_z, ds_y, ds_x
+	else:
+		out_nz, out_ny, out_nx = nz, ny, nx_dim
+
+	# Convert 8 channels -> 4 output channels via normal estimation
+	print("[predict3d] estimating normals...", flush=True)
+	cos = pred[0]
+	grad_mag = pred[1]
+	dir0_z, dir1_z = pred[2], pred[3]
+	dir0_y, dir1_y = pred[4], pred[5]
+	dir0_x, dir1_x = pred[6], pred[7]
+	del pred
+
+	_, _, _, nx_n, ny_n, nz_n = _estimate_normal(
+		dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x)
+
+	# Flip to +z hemisphere
+	flip = np.where(nz_n < 0, -1.0, 1.0)
+	nx_n = nx_n * flip
+	ny_n = ny_n * flip
+
+	# Encode to uint8
+	cos_u8 = np.clip(cos * 255.0, 0.0, 255.0).astype(np.uint8)
+	gm_u8 = np.clip(grad_mag * 1000.0, 0.0, 255.0).astype(np.uint8)
+	nx_u8 = np.clip(np.round(nx_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
+	ny_u8 = np.clip(np.round(ny_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
+	del cos, grad_mag, dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x
+	del nx_n, ny_n, nz_n
+
+	# Output zarr — full scaled volume dimensions
+	full_out_z = _ds_size(sh[0], scaledown)
+	full_out_y = _ds_size(sh[1], scaledown)
+	full_out_x = _ds_size(sh[2], scaledown)
+
+	channel_names: list[str] = ["cos", "grad_mag", "nx", "ny"]
+
+	# Validate pred-dt early
+	if pred_dt_path:
+		pred_dt_path = pred_dt_path.rstrip("/")
+		_pred_check = zarr.open(str(pred_dt_path), mode="r")
+		if not hasattr(_pred_check, "shape"):
+			raise ValueError(f"pred-dt must point to a zarr array, got group: {pred_dt_path}")
+		_pred_shape = tuple(int(v) for v in _pred_check.shape)
+		if len(_pred_shape) != 3:
+			raise ValueError(f"pred-dt array must be 3D (Z,Y,X), got shape {_pred_shape}")
+		print(f"[predict3d] pred-dt={pred_dt_path} shape={_pred_shape}", flush=True)
+		del _pred_check, _pred_shape
+		channel_names.append("pred_dt")
+
+	n_ch = len(channel_names)
+	chunk_sizes = (
+		1,
+		min(full_out_z, max(1, chunk_z)),
+		min(full_out_y, max(1, chunk_yx)),
+		min(full_out_x, max(1, chunk_yx)),
+	)
+
+	arr = zarr.open(
+		str(output_path),
+		mode="w",
+		shape=(n_ch, full_out_z, full_out_y, full_out_x),
+		chunks=chunk_sizes,
+		dtype=np.uint8,
+		fill_value=0,
+		zarr_format=2,
+	)
+	arr.attrs["preprocess_params"] = {
+		"scaledown": int(scaledown),
+		"grad_mag_encode_scale": 1000.0,
+		"channels": channel_names,
+		"crop_xyzwhd": [int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz)],
+		"output_full_scaled": True,
+		"source": "predict3d",
+	}
+
+	# Write at crop offset
+	oz0 = _ds_index(z0, scaledown)
+	oy0 = _ds_index(y0, scaledown)
+	ox0 = _ds_index(x0, scaledown)
+	oz1 = min(full_out_z, oz0 + out_nz)
+	oy1 = min(full_out_y, oy0 + out_ny)
+	ox1 = min(full_out_x, ox0 + out_nx)
+	wz = oz1 - oz0
+	wy = oy1 - oy0
+	wx = ox1 - ox0
+
+	print(
+		f"[predict3d] writing {output_path} shape=({n_ch},{full_out_z},{full_out_y},{full_out_x}) "
+		f"crop=[{oz0}:{oz1},{oy0}:{oy1},{ox0}:{ox1}]",
+		flush=True,
+	)
+
+	arr[0, oz0:oz1, oy0:oy1, ox0:ox1] = cos_u8[:wz, :wy, :wx]
+	arr[1, oz0:oz1, oy0:oy1, ox0:ox1] = gm_u8[:wz, :wy, :wx]
+	arr[2, oz0:oz1, oy0:oy1, ox0:ox1] = nx_u8[:wz, :wy, :wx]
+	arr[3, oz0:oz1, oy0:oy1, ox0:ox1] = ny_u8[:wz, :wy, :wx]
+
+	if pred_dt_path:
+		pred_dt_ch = channel_names.index("pred_dt")
+		_compute_pred_dt_channel(
+			pred_path=pred_dt_path,
+			output_arr=arr,
+			channel_idx=pred_dt_ch,
+			ref_z=full_out_z, ref_y=full_out_y, ref_x=full_out_x,
+			scaledown=scaledown,
+			crop_xyzwhd=[int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz)]
+				if crop_xyzwhd is not None else None,
+		)
+
+	print("[predict3d] done.", flush=True)
+
+
 _N_WORKERS = min(16, os.cpu_count() or 4)
 
 
@@ -1265,8 +1599,47 @@ def main_integrate(argv: list[str] | None = None) -> int:
 	return 0
 
 
+def main_predict3d(argv: list[str] | None = None) -> int:
+	p = argparse.ArgumentParser(
+		description="Run 3D UNet inference on a volume and write preprocessed zarr with cos/grad_mag/nx/ny channels."
+	)
+	p.add_argument("--input", required=True, help="Input zarr array (3D ZYX).")
+	p.add_argument("--output", required=True, help="Output zarr path.")
+	p.add_argument("--unet3d-checkpoint", required=True, help="3D UNet checkpoint (.pt).")
+	p.add_argument("--patch-size", type=int, default=256,
+		help="Tile size (default: 256, must be compatible with model architecture).")
+	p.add_argument("--overlap", type=int, default=64, help="Tile overlap (default: 64).")
+	p.add_argument("--border", type=int, default=16, help="Hard discard border (default: 16).")
+	p.add_argument("--scaledown", type=int, default=4, help="Output downsample factor (default: 4).")
+	p.add_argument("--crop-xyzwhd", "--crop", dest="crop_xyzwhd", type=int, nargs=6, default=None,
+		help="Crop region: x y z w h d.")
+	p.add_argument("--pred-dt", default=None, help="Prediction zarr for distance-to-surface channel.")
+	p.add_argument("--device", default=None, help='Device, e.g. "cuda" or "cpu".')
+	p.add_argument("--chunk-z", type=int, default=32, help="Output chunk size along Z.")
+	p.add_argument("--chunk-yx", type=int, default=32, help="Output chunk size for Y and X.")
+	args = p.parse_args(argv)
+
+	run_preprocess_3d(
+		input_path=str(args.input),
+		output_path=str(args.output),
+		unet3d_checkpoint=str(args.unet3d_checkpoint),
+		device=args.device,
+		crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
+		tile_size=int(args.patch_size),
+		overlap=int(args.overlap),
+		border=int(args.border),
+		scaledown=int(args.scaledown),
+		pred_dt_path=str(args.pred_dt) if args.pred_dt else None,
+		chunk_z=int(args.chunk_z),
+		chunk_yx=int(args.chunk_yx),
+	)
+	return 0
+
+
 if __name__ == "__main__":
 	import sys
 	if len(sys.argv) > 1 and sys.argv[1] == "integrate":
 		raise SystemExit(main_integrate(sys.argv[2:]))
+	if len(sys.argv) > 1 and sys.argv[1] == "predict3d":
+		raise SystemExit(main_predict3d(sys.argv[2:]))
 	raise SystemExit(main())
