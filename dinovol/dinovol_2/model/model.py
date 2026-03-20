@@ -42,6 +42,36 @@ _BACKBONE_DEFAULTS = {
     "grad_checkpointing": False,
     "block_chunks": 0,
 }
+
+_BACKBONE_DEFAULTS_V2 = {
+    "input_channels": 1,
+    "global_crops_size": (256, 256, 256),
+    "local_crops_size": None,
+    "embed_dim": 864,
+    "patch_size": (16, 16, 16),
+    "embedding_type": "default",
+    "deeper_embed_patch_chunk_size": None,
+    "deeper_embed_batch_chunk_size": 1,
+    "depth": 24,
+    "num_heads": 16,
+    "qkv_bias": True,
+    "qkv_fused": True,
+    "mlp_ratio": 8.0 / 3.0,
+    "swiglu_mlp": True,
+    "scale_mlp": True,
+    "scale_attn_inner": False,
+    "proj_drop_rate": 0.0,
+    "attn_drop_rate": 0.0,
+    "drop_path_rate": 0.3,
+    "drop_path_uniform": False,
+    "init_values": 1e-5,
+    "use_abs_pos_emb": False,
+    "use_rot_pos_emb": True,
+    "num_reg_tokens": 4,
+    "grad_checkpointing": False,
+    "block_chunks": 0,
+}
+
 _ROPE_KWARG_CONFIG_KEYS = {
     "base": "rope_base",
     "min_period": "rope_min_period",
@@ -98,6 +128,20 @@ _HEAD_OUT_DIM_DEFAULTS = {
     "dino": 131072,
     "ibot": 131072,
 }
+
+
+def _resolve_backbone_defaults(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    model_type = config.get("model_type")
+    if isinstance(model_type, str) and model_type.strip().lower() == "v2":
+        return _BACKBONE_DEFAULTS_V2
+    return _BACKBONE_DEFAULTS
+
+
+def _resolve_default_rope_type(config: Mapping[str, Any]) -> str:
+    model_type = config.get("model_type")
+    if isinstance(model_type, str) and model_type.strip().lower() == "v2":
+        return "mixed"
+    return "axial"
 
 
 def _as_3tuple(value: int | Tuple[int, int, int]) -> Tuple[int, int, int]:
@@ -158,7 +202,7 @@ def _resolve_rope_impl(
     resolved_kwargs = dict(rope_kwargs)
     rope_type = _config_value(config, "rope_type", None, fallback_key="pos_embed_rope_type")
     if rope_type is None:
-        rope_type = resolved_kwargs.pop("type", resolved_kwargs.pop("rope_type", "axial"))
+        rope_type = resolved_kwargs.pop("type", resolved_kwargs.pop("rope_type", _resolve_default_rope_type(config)))
 
     if isinstance(rope_type, str):
         normalized = rope_type.strip().lower()
@@ -172,6 +216,39 @@ def _resolve_rope_impl(
         return rope_type, resolved_kwargs
 
     raise ValueError(f"unsupported rope_type value: {rope_type!r}")
+
+
+def _materialize_backbone_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    backbone_defaults = _resolve_backbone_defaults(config)
+    backbone_config = {key: config.get(key, default) for key, default in backbone_defaults.items()}
+    if "num_reg_tokens" not in config and "num_register_tokens" in config:
+        backbone_config["num_reg_tokens"] = int(config["num_register_tokens"])
+
+    rope_kwargs = _resolve_rope_kwargs(config)
+    rope_impl, rope_kwargs = _resolve_rope_impl(config, rope_kwargs)
+    rope_type = next(
+        name
+        for name, impl_cls in _ROPE_IMPL_ALIASES.items()
+        if impl_cls is rope_impl
+    )
+
+    global_crops_size = _as_3tuple(backbone_config["global_crops_size"])
+    local_crop_value = backbone_config["local_crops_size"] or global_crops_size
+    local_crops_size = _as_3tuple(local_crop_value)
+
+    materialized = dict(backbone_config)
+    materialized.update(
+        {
+            "global_crops_size": global_crops_size,
+            "local_crops_size": local_crops_size,
+            "patch_size": _as_3tuple(backbone_config["patch_size"]),
+            "rope_type": rope_type,
+            "rope_kwargs": dict(rope_kwargs),
+        }
+    )
+    if "model_type" in config:
+        materialized["model_type"] = config["model_type"]
+    return materialized
 
 
 def _get_vit_lr_decay_rate(
@@ -323,14 +400,10 @@ class DinoVitStudentTeacher(nn.Module):
 
     @staticmethod
     def _build_backbone(config: Mapping[str, Any]) -> nn.Module:
-        backbone_config = {key: config.get(key, default) for key, default in _BACKBONE_DEFAULTS.items()}
-        if "num_reg_tokens" not in config and "num_register_tokens" in config:
-            backbone_config["num_reg_tokens"] = int(config["num_register_tokens"])
-        rope_kwargs = _resolve_rope_kwargs(config)
-        rope_impl, rope_kwargs = _resolve_rope_impl(config, rope_kwargs)
+        backbone_config = _materialize_backbone_config(config)
+        rope_impl, rope_kwargs = _resolve_rope_impl(config, backbone_config["rope_kwargs"])
         global_crops_size = _as_3tuple(backbone_config["global_crops_size"])
-        local_crop_value = backbone_config["local_crops_size"] or global_crops_size
-        local_crops_size = _as_3tuple(local_crop_value)
+        local_crops_size = _as_3tuple(backbone_config["local_crops_size"])
         block_chunks = int(backbone_config["block_chunks"])
         backbone_cls = EvaWithChunking if block_chunks > 0 else Eva
         kwargs = dict(backbone_config)
@@ -349,6 +422,7 @@ class DinoVitStudentTeacher(nn.Module):
         return backbone_cls(**kwargs)
 
     def _build_head(self, prefix: str, fallback_prefix: Optional[str] = None) -> DINOHead:
+        backbone_defaults = _resolve_backbone_defaults(self.config)
         prefix_defaults = {**_HEAD_DEFAULTS, **_HEAD_PREFIX_DEFAULTS.get(prefix, {})}
         kwargs = {
             suffix: _config_value(
@@ -371,7 +445,7 @@ class DinoVitStudentTeacher(nn.Module):
             fallback_key=f"{fallback_prefix}_out_dim" if fallback_prefix else None,
         )
         return DINOHead(
-            in_dim=int(self.config.get("embed_dim", _BACKBONE_DEFAULTS["embed_dim"])),
+            in_dim=int(self.config.get("embed_dim", backbone_defaults["embed_dim"])),
             out_dim=int(out_dim),
             **kwargs,
         )
@@ -402,7 +476,8 @@ class DinoVitStudentTeacher(nn.Module):
             no_decay_names.update(module_prefix + name for name in module.no_weight_decay())
 
         backbone = self.student.backbone
-        num_layers = int(self.config.get("depth", _BACKBONE_DEFAULTS["depth"]))
+        backbone_defaults = _resolve_backbone_defaults(self.config)
+        num_layers = int(self.config.get("depth", backbone_defaults["depth"]))
         chunked_blocks = bool(getattr(backbone, "chunked_blocks", False))
 
         params_groups: list[dict[str, Any]] = []
