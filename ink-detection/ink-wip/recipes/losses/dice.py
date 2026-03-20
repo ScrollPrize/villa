@@ -4,16 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-def resolve_valid_mask(targets: torch.Tensor, valid_mask) -> torch.Tensor:
-    if valid_mask is None:
-        return torch.ones_like(targets, dtype=torch.float32)
-
-    valid_mask = valid_mask.to(device=targets.device, dtype=torch.float32)
-    if tuple(valid_mask.shape) != tuple(targets.shape):
-        raise ValueError(
-            f"valid_mask shape must match targets shape, got {tuple(valid_mask.shape)} vs {tuple(targets.shape)}"
-        )
-    return valid_mask
+from ink.recipes.losses.masking import resolve_valid_mask
 
 
 def compute_per_sample_dice_values(
@@ -67,9 +58,6 @@ def compute_batch_dice_loss(
 
 @dataclass(frozen=True)
 class DiceBatch:
-    smooth_factor: float = 0.25
-    soft_label_positive: float = 1.0
-    soft_label_negative: float = 0.0
     eps: float = 1e-7
 
     def __call__(self, logits: torch.Tensor, targets: torch.Tensor, *, valid_mask=None) -> torch.Tensor:
@@ -91,9 +79,6 @@ class DiceBatch:
 
 @dataclass(frozen=True)
 class DicePerSample:
-    smooth_factor: float = 0.25
-    soft_label_positive: float = 1.0
-    soft_label_negative: float = 0.0
     eps: float = 1e-7
 
     def __call__(self, logits: torch.Tensor, targets: torch.Tensor, *, valid_mask=None) -> torch.Tensor:

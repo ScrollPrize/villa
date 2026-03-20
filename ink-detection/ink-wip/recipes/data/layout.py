@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from pathlib import Path
 
 
@@ -36,6 +37,7 @@ class NestedZarrLayout:
         object.__setattr__(self, "_index_built", True)
 
     def resolve_segment_dir(self, segment_id: str) -> Path:
+        """Resolve a segment id across grouped dataset folders."""
         segment_id = str(segment_id).strip()
         if not segment_id:
             raise ValueError("segment id must be a non-empty string")
@@ -61,6 +63,7 @@ class NestedZarrLayout:
         label_suffix: str = "",
         mask_suffix: str = "",
     ) -> SegmentPaths:
+        """Resolve the canonical volume, label, and mask paths for one segment."""
         segment_id = str(segment_id).strip()
         segment_dir = self.resolve_segment_dir(segment_id)
         volume_path = segment_dir / f"{segment_id}.zarr"
@@ -90,5 +93,96 @@ class NestedZarrLayout:
             inklabels_path=inklabels_path,
             supervision_mask_path=supervision_mask_path,
         )
+
+    def label_mask_fingerprint(
+        self,
+        segment_id: str,
+        *,
+        label_suffix: str = "",
+        mask_suffix: str = "",
+    ) -> str:
+        """Hash label and supervision-mask contents so caches can detect dataset changes."""
+        paths = self.resolve_paths(
+            segment_id,
+            label_suffix=label_suffix,
+            mask_suffix=mask_suffix,
+        )
+        payload = (
+            ("segment_id", str(segment_id)),
+            ("label_suffix", str(label_suffix)),
+            ("mask_suffix", str(mask_suffix)),
+            ("inklabels", _path_tree_signature(paths.inklabels_path)),
+            ("supervision_mask", _path_tree_signature(paths.supervision_mask_path)),
+        )
+        return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
+
+    def segment_source_fingerprint(
+        self,
+        segment_id: str,
+        *,
+        label_suffix: str = "",
+        mask_suffix: str = "",
+    ) -> str:
+        """Hash the canonical volume, label, and supervision-mask sources for one segment."""
+        paths = self.resolve_paths(
+            segment_id,
+            label_suffix=label_suffix,
+            mask_suffix=mask_suffix,
+        )
+        payload = (
+            ("segment_id", str(segment_id)),
+            ("label_suffix", str(label_suffix)),
+            ("mask_suffix", str(mask_suffix)),
+            ("volume", _path_tree_signature(paths.volume_path)),
+            ("inklabels", _path_tree_signature(paths.inklabels_path)),
+            ("supervision_mask", _path_tree_signature(paths.supervision_mask_path)),
+        )
+        return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
+
+
+def _hash_file_contents(path: Path) -> str:
+    digest = hashlib.sha1()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _path_tree_signature(path: Path) -> tuple[str, int, int, str]:
+    """Summarize a path tree by name, size, file count, and content hash."""
+    root = Path(path)
+    if root.is_file():
+        stat = root.stat()
+        return (
+            root.name,
+            int(stat.st_size),
+            1,
+            _hash_file_contents(root),
+        )
+    if not root.exists():
+        return (root.name, -1, 0, "missing")
+
+    digest = hashlib.sha1()
+    total_size = 0
+    file_count = 0
+    for child in sorted(root.rglob("*"), key=lambda candidate: candidate.as_posix()):
+        if not child.is_file():
+            continue
+        relative_name = child.relative_to(root).as_posix()
+        stat = child.stat()
+        digest.update(relative_name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(int(stat.st_size)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_hash_file_contents(child).encode("utf-8"))
+        digest.update(b"\0")
+        total_size += int(stat.st_size)
+        file_count += 1
+    return (
+        root.name,
+        int(total_size),
+        int(file_count),
+        digest.hexdigest(),
+    )
 
 __all__ = ["NestedZarrLayout", "SegmentPaths"]

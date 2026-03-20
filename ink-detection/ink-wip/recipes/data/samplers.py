@@ -29,12 +29,14 @@ class ShuffleSampler:
         if len(dataset) > 0 and bool(shuffle):
             generator = torch.Generator()
             generator.manual_seed(int(self.seed))
+        persistent_workers = int(num_workers) > 0
         return DataLoader(
             dataset,
             batch_size=int(batch_size),
             shuffle=False if len(dataset) <= 0 else bool(shuffle),
             drop_last=True,
             num_workers=int(num_workers),
+            persistent_workers=persistent_workers,
             pin_memory=bool(pin_memory),
             collate_fn=collate_fn,
             generator=generator,
@@ -60,12 +62,14 @@ class GroupBalancedSampler:
     ) -> DataLoader:
         del shuffle
         if len(dataset) <= 0:
+            persistent_workers = int(num_workers) > 0
             return DataLoader(
                 dataset,
                 batch_size=int(batch_size),
                 shuffle=False,
                 drop_last=True,
                 num_workers=int(num_workers),
+                persistent_workers=persistent_workers,
                 pin_memory=bool(pin_memory),
                 collate_fn=collate_fn,
             )
@@ -83,6 +87,7 @@ class GroupBalancedSampler:
             replacement=True,
             generator=generator,
         )
+        persistent_workers = int(num_workers) > 0
         return DataLoader(
             dataset,
             batch_size=int(batch_size),
@@ -90,6 +95,7 @@ class GroupBalancedSampler:
             sampler=weighted_sampler,
             drop_last=True,
             num_workers=int(num_workers),
+            persistent_workers=persistent_workers,
             pin_memory=bool(pin_memory),
             collate_fn=collate_fn,
         )
@@ -116,12 +122,14 @@ class GroupStratifiedSampler:
     ) -> DataLoader:
         del batch_size, shuffle
         if len(dataset) <= 0:
+            persistent_workers = int(num_workers) > 0
             return DataLoader(
                 dataset,
                 batch_size=int(self.batch_size),
                 shuffle=False,
                 drop_last=True,
                 num_workers=int(num_workers),
+                persistent_workers=persistent_workers,
                 pin_memory=bool(pin_memory),
                 collate_fn=collate_fn,
             )
@@ -178,10 +186,12 @@ class GroupStratifiedSampler:
                     self._rng.shuffle(batch)
                     yield batch
 
+        persistent_workers = int(num_workers) > 0
         return DataLoader(
             dataset,
             batch_sampler=_BatchSampler(),
             num_workers=int(num_workers),
+            persistent_workers=persistent_workers,
             pin_memory=bool(pin_memory),
             collate_fn=collate_fn,
         )

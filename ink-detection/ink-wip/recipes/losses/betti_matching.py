@@ -93,11 +93,11 @@ class StitchBettiMatchingLoss:
     filtration_type: str = "superlevel"
     num_processes: int = 1
 
-    def compute(self, stitched_logits, stitched_targets, *, valid_mask, **_kwargs):
+    def compute(self, batch):
         betti_matching_loss = compute_binary_betti_matching_loss(
-            stitched_logits[None, None],
-            stitched_targets[None, None],
-            valid_mask=valid_mask[None, None],
+            batch.logits[None, None],
+            batch.targets[None, None],
+            valid_mask=batch.valid_mask[None, None],
             filtration_type=self.filtration_type,
             num_processes=self.num_processes,
         )[0]

@@ -6,11 +6,7 @@ from functools import partial
 import albumentations as A
 import numpy as np
 
-from ink.core.types import DataBundle
-
-
-def _stats_from_bundle(data: DataBundle):
-    stats = data.extras.get("normalization_stats")
+def _copy_stats(stats):
     if stats is None:
         return None
     return dict(stats)
@@ -42,8 +38,8 @@ def _apply_fold_foreground_clip_robust_zscore(image, *, normalization, **kwargs)
 
 @dataclass(frozen=True)
 class ClipMaxDiv255Normalization:
-    def build(self, *, data: DataBundle):
-        del data
+    def build(self, *, normalization_stats=None):
+        del normalization_stats
         return self
 
 
@@ -51,20 +47,20 @@ class ClipMaxDiv255Normalization:
 class FoldForegroundClipZScoreNormalization:
     stats: dict[str, float] | None = None
 
-    def build(self, *, data: DataBundle):
+    def build(self, *, normalization_stats=None):
         if self.stats is not None:
             return self
-        return replace(self, stats=_stats_from_bundle(data))
+        return replace(self, stats=_copy_stats(normalization_stats))
 
 
 @dataclass(frozen=True)
 class FoldForegroundClipRobustZScoreNormalization:
     stats: dict[str, float] | None = None
 
-    def build(self, *, data: DataBundle):
+    def build(self, *, normalization_stats=None):
         if self.stats is not None:
             return self
-        return replace(self, stats=_stats_from_bundle(data))
+        return replace(self, stats=_copy_stats(normalization_stats))
 
 
 def build_normalization_transform(normalization, *, in_channels: int):

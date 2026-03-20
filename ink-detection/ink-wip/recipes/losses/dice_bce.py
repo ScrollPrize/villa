@@ -89,7 +89,7 @@ class DiceBCEBatch:
         )
         return {
             "loss": 0.5 * batch_dice_loss + 0.5 * batch_bce,
-            "metrics": {
+            "components": {
                 "dice_loss": batch_dice_loss,
                 "bce_loss": batch_bce,
             },
@@ -114,7 +114,7 @@ class DiceBCEPerSample:
         per_sample_dice_loss = 1.0 - per_sample_dice
         return {
             "loss": 0.5 * per_sample_dice_loss + 0.5 * per_sample_bce,
-            "metrics": {
+            "components": {
                 "dice_loss": per_sample_dice_loss,
                 "bce_loss": per_sample_bce,
             },

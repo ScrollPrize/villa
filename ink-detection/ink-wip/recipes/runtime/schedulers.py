@@ -7,6 +7,7 @@ import torch
 
 
 def _resolve_max_lr(optimizer, max_lr: float | None):
+    """Default OneCycle max_lr to the optimizer's current group learning rates."""
     if max_lr is not None:
         return float(max_lr)
     if len(optimizer.param_groups) == 1:

@@ -2,6 +2,7 @@
 
 from ink.recipes.stitch.data import (
     EvalStitchConfig,
+    LogOnlyStitchConfig,
     StitchComponentSpec,
     StitchData,
     StitchLayout,
@@ -20,26 +21,27 @@ from ink.recipes.stitch.ops import (
     resolve_buffer_crop,
     stitch_prob_map,
 )
+from ink.recipes.stitch.inference import StitchInference, StitchInferenceRecipe
 from ink.recipes.stitch.runtime import (
-    EvalStitchRuntime,
-    StitchExecutionContext,
+    SegmentLayout,
     StitchRuntime,
     StitchRuntimeRecipe,
-    TrainStitchRuntime,
-    accumulate_val,
-    compute_stitched_component_loss,
-    compute_train_stitch_loss,
-    finalize_validation_epoch,
-    run_train_stitch_pass,
+    compute_stitched_loss_components,
 )
+from ink.recipes.stitch.terms import StitchLossBatch
+from ink.recipes.stitch.train_runtime import TrainStitchRuntime
+from ink.recipes.stitch.store import ZarrStitchStore
 
 __all__ = [
     "EvalStitchConfig",
-    "EvalStitchRuntime",
+    "LogOnlyStitchConfig",
+    "SegmentLayout",
     "StitchComponentSpec",
     "StitchData",
-    "StitchExecutionContext",
+    "StitchInference",
+    "StitchInferenceRecipe",
     "StitchLayout",
+    "StitchLossBatch",
     "StitchRuntime",
     "StitchRuntimeRecipe",
     "StitchSegmentSpec",
@@ -47,17 +49,14 @@ __all__ = [
     "TrainStitchLossConfig",
     "TrainStitchRuntime",
     "TrainStitchVizConfig",
+    "ZarrStitchStore",
     "accumulate_to_buffers",
-    "accumulate_val",
     "allocate_segment_buffers",
     "build_segment_roi_meta",
     "compose_segment_from_roi_buffers",
-    "compute_stitched_component_loss",
-    "compute_train_stitch_loss",
-    "finalize_validation_epoch",
+    "compute_stitched_loss_components",
     "gaussian_weights",
     "normalize_component_key",
     "resolve_buffer_crop",
-    "run_train_stitch_pass",
     "stitch_prob_map",
 ]

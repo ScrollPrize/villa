@@ -7,6 +7,7 @@ from torch.optim import SGD as TorchSGD
 
 
 def _build_parameter_groups(model, *, weight_decay: float, exclude_weight_decay_bias_norm: bool):
+    """Split parameters so bias/norm-like tensors can skip weight decay when requested."""
     weight_decay = float(weight_decay)
     if not exclude_weight_decay_bias_norm or weight_decay <= 0.0:
         return model.parameters(), weight_decay

@@ -11,8 +11,11 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from torch.utils.data._utils.collate import default_collate
 
 from ink.recipes.losses.reporting import resolve_train_output as resolve_train_loss_output
+from ink.recipes.stitch.artifact_primitives import binary_mask_to_signed_distance_map
 from ink.recipes.stitch.data import StitchData, normalize_component_key
-from ink.recipes.stitch.ops import gaussian_weights, resolve_buffer_crop
+from ink.recipes.stitch.ops import gaussian_weights, normalize_xyxy_rows, resolve_buffer_crop
+from ink.recipes.stitch.runtime import _log
+from ink.recipes.stitch.terms import StitchLossBatch, _requires_boundary_dist_map, compute_stitched_loss_components
 
 
 def stitch_saved_tensors_context(owner, *, log: Callable[[Any, str], None]):
@@ -34,87 +37,19 @@ def stitch_saved_tensors_context(owner, *, log: Callable[[Any, str], None]):
     return save_on_cpu(pin_memory=True)
 
 
-def compute_train_stitch_loss(
-    owner,
-    model,
-    *,
-    component_key,
-    terms,
-    normalize_xyxys: Callable[[Any], list[tuple[int, int, int, int]]],
-    resolve_boundary_dist_map: Callable[..., torch.Tensor],
-    compute_stitched_component_loss: Callable[..., dict[str, Any]],
-    requires_boundary_dist_map: Callable[[object], bool],
-    stitch_saved_tensors_context: Callable[[object], Any],
-):
-    data = getattr(owner, "data", None)
-    if not isinstance(data, StitchData):
-        raise TypeError("stitch runtime requires an owner with .data: StitchData")
-    state = getattr(owner, "state", None)
-    if state is None:
-        raise TypeError("stitch runtime requires an owner with .state")
+def _resolve_boundary_dist_map(state, *, cache_key, stitched_targets, device):
+    dist_map_np = state._boundary_dist_maps_cpu.get(cache_key)
+    if dist_map_np is None:
+        target_mask = stitched_targets.detach().cpu().numpy() > 0.5
+        dist_map_np = binary_mask_to_signed_distance_map(target_mask)
+        state._boundary_dist_maps_cpu[cache_key] = dist_map_np
 
-    _validate_train_component_inputs(owner, data=data)
-    component_ctx = _resolve_train_component_context(owner, state=state, data=data, component_key=component_key)
-    roi_buffers = _allocate_train_loss_roi_buffers(component_ctx["meta"], device=model.device)
-
-    patch_metrics = _run_component_patch_pass(
-        owner,
-        model,
-        data=data,
-        state=state,
-        dataset=component_ctx["dataset"],
-        component_key=component_ctx["component_key"],
-        batch_size=component_ctx["batch_size"],
-        roi_buffers=roi_buffers,
-        normalize_xyxys=normalize_xyxys,
-        stitch_saved_tensors_context=stitch_saved_tensors_context,
-    )
-    stitch_metrics = _summarize_train_stitched_component_losses(
-        owner,
-        terms=terms,
-        component_key=component_ctx["component_key"],
-        roi_buffers=roi_buffers,
-        resolve_boundary_dist_map=resolve_boundary_dist_map,
-        requires_boundary_dist_map=requires_boundary_dist_map,
-        compute_stitched_component_loss=compute_stitched_component_loss,
-    )
-    return _build_train_component_report(
-        component_ctx,
-        patch_metrics=patch_metrics,
-        stitch_metrics=stitch_metrics,
-    )
-
-
-def _validate_train_component_inputs(owner, *, data: StitchData) -> None:
-    if not owner.component_datasets or not data.train.component_keys:
-        raise RuntimeError("train component stitch datasets are not configured")
-    if len(owner.component_datasets) != len(data.train.component_keys):
-        raise ValueError(
-            "train component datasets/keys length mismatch "
-            f"({len(owner.component_datasets)} vs {len(data.train.component_keys)})"
-        )
-
-
-def _resolve_train_component_context(owner, *, state, data: StitchData, component_key):
-    component_key = normalize_component_key(component_key)
-    dataset = owner.dataset_for_component(component_key)
-    if dataset is None:
-        raise KeyError(f"missing train component stitch dataset for component_key={component_key!r}")
-
-    meta = state.train_component_meta.get(component_key)
-    if meta is None:
-        raise KeyError(f"missing train component ROI metadata for component_key={component_key!r}")
-
-    segment_id, component_idx = component_key
-    return {
-        "component_key": component_key,
-        "segment_id": segment_id,
-        "component_idx": component_idx,
-        "group_idx": _dataset_component_group_idx(dataset, component_key=component_key),
-        "dataset": dataset,
-        "meta": meta,
-        "batch_size": int(data.train.loss.patch_batch_size or data.train.loss.valid_batch_size or 1),
-    }
+    device_key = (cache_key, str(device.type), getattr(device, "index", None))
+    dist_map_t = state._boundary_dist_maps_torch.get(device_key)
+    if dist_map_t is None:
+        dist_map_t = torch.from_numpy(dist_map_np).to(device=device, dtype=torch.float32)
+        state._boundary_dist_maps_torch[device_key] = dist_map_t
+    return dist_map_t
 
 
 def _dataset_component_group_idx(dataset, *, component_key):
@@ -136,6 +71,31 @@ def _dataset_component_group_idx(dataset, *, component_key):
     if int(raw_arr.size) != 1:
         raise ValueError("train component stitch dataset group_idx sample must be scalar")
     return int(raw_arr.reshape(-1)[0])
+
+
+def _resolve_model_device(model) -> torch.device:
+    explicit_device = getattr(model, "device", None)
+    if explicit_device is not None:
+        try:
+            return torch.device(explicit_device)
+        except (RuntimeError, TypeError, ValueError):
+            pass
+
+    parameters = getattr(model, "parameters", None)
+    if callable(parameters):
+        try:
+            return next(parameters()).device
+        except (StopIteration, TypeError):
+            pass
+
+    buffers = getattr(model, "buffers", None)
+    if callable(buffers):
+        try:
+            return next(buffers()).device
+        except (StopIteration, TypeError):
+            pass
+
+    return torch.device("cpu")
 
 
 def _allocate_train_loss_roi_buffers(meta, *, device):
@@ -163,15 +123,14 @@ def _run_component_patch_pass(
     component_key,
     batch_size,
     roi_buffers,
-    normalize_xyxys: Callable[[Any], list[tuple[int, int, int, int]]],
-    stitch_saved_tensors_context: Callable[[object], Any],
 ):
-    metrics_enabled = bool(float(owner.patch_loss_weight) > 0.0)
+    components_enabled = bool(float(owner.patch_loss_weight) > 0.0)
+    model_device = _resolve_model_device(model)
     patch_totals = {}
-    if metrics_enabled:
+    if components_enabled:
         patch_totals = {
-            "loss": torch.zeros((), device=model.device, dtype=torch.float32),
-            "metrics": {},
+            "loss": torch.zeros((), device=model_device, dtype=torch.float32),
+            "components": {},
         }
 
     patch_count = 0
@@ -182,10 +141,9 @@ def _run_component_patch_pass(
             data=data,
             state=state,
             batch=batch,
+            model_device=model_device,
             roi_buffers=roi_buffers,
             patch_totals=patch_totals,
-            normalize_xyxys=normalize_xyxys,
-            stitch_saved_tensors_context=stitch_saved_tensors_context,
         )
 
     if patch_count <= 0:
@@ -193,15 +151,15 @@ def _run_component_patch_pass(
 
     out = {
         "count": int(patch_count),
-        "metrics": {},
+        "components": {},
     }
-    if metrics_enabled:
+    if components_enabled:
         patch_denom = float(max(1, patch_count))
-        out["metrics"] = {
+        out["components"] = {
             "loss": patch_totals["loss"] / patch_denom,
             **{
                 key: value / patch_denom
-                for key, value in patch_totals["metrics"].items()
+                for key, value in patch_totals["components"].items()
             },
         }
     return out
@@ -224,26 +182,28 @@ def _run_component_batch(
     data: StitchData,
     state,
     batch,
+    model_device,
     roi_buffers,
     patch_totals,
-    normalize_xyxys: Callable[[Any], list[tuple[int, int, int, int]]],
-    stitch_saved_tensors_context: Callable[[object], Any],
 ):
     x, y, xyxys, _group_idx = batch
-    xyxys = normalize_xyxys(xyxys)
-    x = x.to(model.device, non_blocking=True)
-    y = y.to(model.device, non_blocking=True)
-    with stitch_saved_tensors_context(owner):
-        outputs = _stitch_component_forward(owner, model, x)
-        _accumulate_patch_metrics(owner, outputs=outputs, targets=y, patch_totals=patch_totals)
-        _accumulate_train_loss_roi_buffers(
-            data=data,
-            state=state,
-            outputs=outputs,
-            targets=y,
-            xyxys=xyxys,
-            roi_buffers=roi_buffers,
-        )
+    xyxys = normalize_xyxy_rows(xyxys)
+    x = x.to(model_device, non_blocking=True)
+    y = y.to(model_device, non_blocking=True)
+    precision_context = getattr(owner, "precision_context", None)
+    context = precision_context(device=x.device) if callable(precision_context) else nullcontext()
+    with context:
+        with stitch_saved_tensors_context(owner, log=_log):
+            outputs = _stitch_component_forward(owner, model, x)
+            _accumulate_patch_components(owner, outputs=outputs, targets=y, patch_totals=patch_totals)
+            _accumulate_train_loss_roi_buffers(
+                data=data,
+                state=state,
+                outputs=outputs,
+                targets=y,
+                xyxys=xyxys,
+                roi_buffers=roi_buffers,
+            )
     return int(outputs.shape[0])
 
 
@@ -256,32 +216,32 @@ def _stitch_component_forward(owner, model, x):
     return torch_checkpoint(forward_impl, x, use_reentrant=False)
 
 
-def _accumulate_patch_metrics(owner, *, outputs, targets, patch_totals):
+def _accumulate_patch_components(owner, *, outputs, targets, patch_totals):
     if not patch_totals:
         return
     loss_output = _compute_patch_loss_output(owner, outputs=outputs, targets=targets)
     batch_size = int(outputs.shape[0])
-    patch_totals["loss"] = patch_totals["loss"] + (_metric_value(loss_output.loss, device=outputs.device) * batch_size)
+    patch_totals["loss"] = patch_totals["loss"] + (_component_value(loss_output.loss, device=outputs.device) * batch_size)
 
-    metric_totals = patch_totals["metrics"]
-    for key, value in loss_output.metrics.items():
+    component_totals = patch_totals["components"]
+    for key, value in loss_output.components.items():
         key = str(key)
         if key.startswith("train/"):
             key = key.split("/", maxsplit=1)[1]
-        current = metric_totals.get(key)
+        current = component_totals.get(key)
         if current is None:
             current = torch.zeros((), device=outputs.device, dtype=torch.float32)
-        metric_totals[key] = current + (_metric_value(value, device=outputs.device) * batch_size)
+        component_totals[key] = current + (_component_value(value, device=outputs.device) * batch_size)
 
 
 def _compute_patch_loss_output(owner, *, outputs, targets):
     patch_loss = owner.patch_loss
     if not callable(patch_loss):
-        raise RuntimeError("stitched patch metrics require owner.patch_loss as the experiment loss recipe")
+        raise RuntimeError("stitched patch components require owner.patch_loss as the experiment loss recipe")
     return resolve_train_loss_output(patch_loss, outputs, targets)
 
 
-def _metric_value(value, *, device):
+def _component_value(value, *, device):
     if isinstance(value, torch.Tensor):
         tensor = value.to(device=device, dtype=torch.float32)
     else:
@@ -360,17 +320,15 @@ def _torch_gaussian_weights(state, *, h, w, device):
 def _summarize_train_stitched_component_losses(
     owner,
     *,
+    state,
     terms,
     component_key,
     roi_buffers,
-    resolve_boundary_dist_map: Callable[..., torch.Tensor],
-    requires_boundary_dist_map: Callable[[object], bool],
-    compute_stitched_component_loss: Callable[..., dict[str, Any]],
 ):
-    metric_terms = {}
+    component_terms = {}
     covered_px_total = 0
     component_count = 0
-    needs_boundary_dist_map = bool(requires_boundary_dist_map(terms))
+    needs_boundary_dist_map = bool(_requires_boundary_dist_map(terms))
 
     for roi_index, roi_buffer in enumerate(roi_buffers):
         valid_mask = roi_buffer["count"] > 0
@@ -391,25 +349,27 @@ def _summarize_train_stitched_component_losses(
 
         boundary_dist_map = None
         if needs_boundary_dist_map:
-            boundary_dist_map = resolve_boundary_dist_map(
-                owner,
+            boundary_dist_map = _resolve_boundary_dist_map(
+                state,
                 cache_key=("component", normalize_component_key(component_key), int(roi_index)),
                 stitched_targets=stitched_targets,
                 device=stitched_logits.device,
             )
 
-        component_metrics = compute_stitched_component_loss(
+        component_outputs = compute_stitched_loss_components(
             terms,
-            stitched_logits,
-            stitched_targets,
-            valid_mask=valid_mask,
-            boundary_dist_map=boundary_dist_map,
+            StitchLossBatch(
+                logits=stitched_logits,
+                targets=stitched_targets,
+                valid_mask=valid_mask,
+                boundary_dist_map=boundary_dist_map,
+            ),
         )
-        for key, value in component_metrics.items():
+        for key, value in component_outputs.items():
             if key == "covered_px":
                 continue
-            metric_terms.setdefault(key, []).append(value)
-        covered_px_total += int(component_metrics["covered_px"])
+            component_terms.setdefault(key, []).append(value)
+        covered_px_total += int(component_outputs["covered_px"])
         component_count += 1
 
     if component_count <= 0:
@@ -418,16 +378,5 @@ def _summarize_train_stitched_component_losses(
     return {
         "component_count": int(component_count),
         "covered_px": int(covered_px_total),
-        "metrics": {key: torch.stack(values).mean() for key, values in metric_terms.items()},
-    }
-
-
-def _build_train_component_report(component_ctx, *, patch_metrics, stitch_metrics):
-    return {
-        "component_key": component_ctx["component_key"],
-        "segment_id": component_ctx["segment_id"],
-        "component_idx": component_ctx["component_idx"],
-        "group_idx": int(component_ctx["group_idx"]),
-        "patch": patch_metrics,
-        "stitch": stitch_metrics,
+        "components": {key: torch.stack(values).mean() for key, values in component_terms.items()},
     }

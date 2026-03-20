@@ -22,20 +22,17 @@ class OptimizerSetup:
 
 @dataclass(frozen=True)
 class TrainRuntime:
-    epochs: int = 30
     grad_accum: int = 1
     use_amp: bool = True
     precision: str | int | None = None
-    eval_every: int = 1
     grad_clip_norm: float | None = 100.0
-    init_ckpt_path: str | None = None
-    resume_ckpt_path: str | None = None
     wandb: WandbLogger | None = None
     steps_per_epoch: int | None = None
     optimizer: Any = field(default_factory=AdamWOptimizer)
     scheduler: Any = field(default_factory=OneCycleScheduler)
 
     def resolve_steps_per_epoch(self, data: DataBundle) -> int | None:
+        """Infer scheduler steps per epoch after gradient accumulation is applied."""
         if self.steps_per_epoch is not None:
             return int(self.steps_per_epoch)
 
@@ -48,6 +45,7 @@ class TrainRuntime:
         return int(math.ceil(int(loader_length) / accum))
 
     def build(self, *, data: DataBundle, augment=None) -> TrainRuntime:
+        """Bind runtime fields that depend on the prepared data bundle."""
         del augment
         assert self.wandb is None or isinstance(self.wandb, WandbLogger)
         return replace(
@@ -56,9 +54,10 @@ class TrainRuntime:
             steps_per_epoch=self.resolve_steps_per_epoch(data),
         )
 
-    def build_optimizer_setup(self, model) -> OptimizerSetup:
+    def build_optimizer_setup(self, model, *, epochs: int) -> OptimizerSetup:
+        """Instantiate the optimizer and scheduler pair expected by the trainer."""
         optimizer = self._build_optimizer(model)
-        scheduler_setup = self._build_scheduler(optimizer)
+        scheduler_setup = self._build_scheduler(optimizer, epochs=int(epochs))
         return OptimizerSetup(
             optimizer=optimizer,
             scheduler=scheduler_setup.scheduler,
@@ -68,11 +67,11 @@ class TrainRuntime:
     def _build_optimizer(self, model):
         return self.optimizer.build(model)
 
-    def _build_scheduler(self, optimizer):
+    def _build_scheduler(self, optimizer, *, epochs: int):
         setup = self.scheduler.build(
             optimizer,
             steps_per_epoch=self._require_steps_per_epoch(),
-            epochs=int(self.epochs),
+            epochs=int(epochs),
         )
         assert isinstance(setup, SchedulerSetup)
         return setup
@@ -83,6 +82,7 @@ class TrainRuntime:
         return int(self.steps_per_epoch)
 
     def precision_context(self, *, device=None):
+        """Return the autocast context for the configured precision and device."""
         precision = str(self.precision).strip().lower()
         if precision in {"", "32", "32-true"}:
             return nullcontext()
@@ -100,6 +100,7 @@ class TrainRuntime:
 
 
 def _resolve_training_precision(precision: str | int | None, *, use_amp: bool) -> str | int | None:
+    """Map legacy use_amp behavior onto an explicit precision setting."""
     if precision is not None:
         precision_text = str(precision).strip().lower()
         if precision_text and precision_text != "auto":

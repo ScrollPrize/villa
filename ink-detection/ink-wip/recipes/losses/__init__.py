@@ -17,7 +17,7 @@ from ink.recipes.losses.dice_bce import DiceBCEBatch, DiceBCEPerSample
 from ink.recipes.losses.reporting import (
     loss_values,
     resolve_train_output,
-    train_metrics,
+    train_components,
 )
 from ink.recipes.losses.stitch_region import StitchRegionLoss
 
@@ -41,5 +41,5 @@ __all__ = [
     "compute_binary_soft_cldice_loss",
     "loss_values",
     "resolve_train_output",
-    "train_metrics",
+    "train_components",
 ]
