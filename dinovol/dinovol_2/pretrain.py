@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 from pathlib import Path
 import random
@@ -22,7 +23,8 @@ from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset
 from dinovol_2.eval.task_eval import TaskEvalRunner
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
 from dinovol_2.ops.distributed_utils import build_distributed_sampler, resolve_distributed_config
-from dinovol_2.loss import DINOLoss, KoLeoLoss, iBOTPatchLoss
+from dinovol_2.ops.weighted_loader import WeightedCombinedLoader
+from dinovol_2.loss import DINOLoss, GramLoss, KoLeoLoss, iBOTPatchLoss
 from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config, _upgrade_weight_norm_state_dict_keys
 
 
@@ -196,14 +198,39 @@ class DinoIBOTPretrainer:
             masked_loss_chunk_size=masked_loss_chunk_size,
         ).to(self.device)
         self.koleo_loss = KoLeoLoss().to(self.device)
+        self.gram_config = dict(self.config.get("gram") or {})
+        self.do_gram = bool(self.gram_config.get("enabled", False))
+        self.gram_loss = (
+            GramLoss(
+                apply_norm=bool(self.gram_config.get("normalized", True)),
+                remove_neg=bool(self.gram_config.get("remove_neg", False)),
+                remove_only_teacher_neg=bool(self.gram_config.get("remove_only_teacher_neg", False)),
+            ).to(self.device)
+            if self.do_gram
+            else None
+        )
         
         self.dino_loss_weight = float(self.config.get("dino_loss_weight", 1.0))
         self.ibot_loss_weight = float(self.config.get("ibot_loss_weight", 1.0))
         self.koleo_loss_weight = float(self.config.get("koleo_loss_weight", 0.1))
+        self.gram_loss_weight = float(self.gram_config.get("loss_weight", 2.0))
         self.do_dino = self.dino_loss_weight > 0.0
         self.do_ibot = self.ibot_loss_weight > 0.0
         self.do_koleo = self.koleo_loss_weight > 0.0 and self.do_dino
         self.centering = str(self.config.get("centering", "sinkhorn_knopp"))
+        self.gram_img_level = bool(self.gram_config.get("img_level", True))
+        self.gram_teacher_checkpoint = self.gram_config.get("teacher_checkpoint")
+        self.gram_teacher_refresh_every = int(self.gram_config.get("teacher_refresh_every", 10000))
+        self.gram_teacher_refresh_start_step = int(self.gram_config.get("teacher_refresh_start_step", 0))
+        self.gram_teacher_backbone = None
+        if self.do_gram:
+            self.gram_teacher_backbone = deepcopy(self.model_module.teacher.backbone).to(self.device)
+            self.gram_teacher_backbone.requires_grad_(False)
+            if self.gram_teacher_checkpoint:
+                self._load_gram_teacher_from_checkpoint(self.gram_teacher_checkpoint)
+            else:
+                self._refresh_gram_teacher_from_teacher()
+            self.gram_teacher_backbone.eval()
         
         self.teacher_temp = float(self.config.get("teacher_temp", 0.07))
         self.warmup_teacher_temp = float(self.config.get("warmup_teacher_temp", 0.04))
@@ -269,6 +296,45 @@ class DinoIBOTPretrainer:
         if isinstance(self.model, DDP):
             return self.model.module
         return self.model
+
+    def _extract_backbone_state_dict(self, state_dict: Mapping[str, Any]) -> dict[str, Any]:
+        state_dict = dict(state_dict)
+        if any(key.startswith("backbone.") for key in state_dict):
+            return {key.replace("backbone.", "", 1): value for key, value in state_dict.items() if key.startswith("backbone.")}
+        return state_dict
+
+    def _load_gram_teacher_from_checkpoint(self, checkpoint_path: str | Path) -> None:
+        if self.gram_teacher_backbone is None:
+            return
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if checkpoint.get("gram_teacher_backbone") is not None:
+            state_dict = checkpoint["gram_teacher_backbone"]
+        elif "teacher" in checkpoint:
+            state_dict = self._extract_backbone_state_dict(checkpoint["teacher"])
+        elif "model" in checkpoint:
+            state_dict = self._extract_backbone_state_dict(checkpoint["model"])
+        else:
+            state_dict = self._extract_backbone_state_dict(checkpoint)
+        self.gram_teacher_backbone.load_state_dict(state_dict, strict=True)
+
+    @torch.no_grad()
+    def _refresh_gram_teacher_from_teacher(self) -> None:
+        if self.gram_teacher_backbone is None:
+            return
+        self.gram_teacher_backbone.load_state_dict(self.model_module.teacher.backbone.state_dict(), strict=True)
+        self.gram_teacher_backbone.requires_grad_(False)
+        self.gram_teacher_backbone.eval()
+
+    def _maybe_refresh_gram_teacher(self, step: int) -> None:
+        if self.gram_teacher_backbone is None:
+            return
+        if self.gram_teacher_refresh_every <= 0:
+            return
+        if (step + 1) < self.gram_teacher_refresh_start_step:
+            return
+        if ((step + 1) - self.gram_teacher_refresh_start_step) % self.gram_teacher_refresh_every != 0:
+            return
+        self._refresh_gram_teacher_from_teacher()
     
     def _resolve_step_count(self, steps_key: str, epochs_key: str, *, default: int) -> int:
         if steps_key in self.config:
@@ -451,19 +517,55 @@ class DinoIBOTPretrainer:
 
         return kwargs
 
-    def _dataset_config(self, key: str) -> Mapping[str, Any] | None:
-        dataset_config = self.config.get(key)
-        if dataset_config is None:
-            return None
+    def _prepare_dataset_config(self, dataset_config: Mapping[str, Any]) -> dict[str, Any]:
         resolved_config = dict(dataset_config)
         resolved_config.setdefault(
             "epoch_length",
             int(self.config.get("official_epoch_length", self.config.get("epoch_length", self.max_iterations))),
         )
+        if self.do_gram:
+            resolved_config.setdefault(
+                "gram_teacher_crop_size",
+                resolved_config.get("global_crop_size", resolved_config.get("crop_size")),
+            )
+            resolved_config.setdefault("gram_teacher_no_augmentations", True)
         deeper_overrides = self._deeper_embed_dataset_overrides(resolved_config)
         if deeper_overrides:
             resolved_config.update(deeper_overrides)
         return resolved_config
+
+    def _resolved_dataset_configs(self, key: str) -> list[dict[str, Any]] | None:
+        dataset_config = self.config.get(key)
+        if dataset_config is None:
+            return None
+
+        base_config = dict(dataset_config)
+        variants = base_config.pop("variants", None)
+        if not variants:
+            return [self._prepare_dataset_config(base_config)]
+
+        resolved_configs: list[dict[str, Any]] = []
+        for variant in variants:
+            variant_overrides = {name: value for name, value in dict(variant).items() if name != "ratio"}
+            merged_config = dict(base_config)
+            merged_config.update(variant_overrides)
+            resolved_configs.append(self._prepare_dataset_config(merged_config))
+        return resolved_configs
+
+    def _dataset_variant_weights(self, key: str) -> tuple[float, ...] | None:
+        dataset_config = self.config.get(key)
+        if dataset_config is None:
+            return None
+        variants = dataset_config.get("variants")
+        if not variants:
+            return None
+        return tuple(float(dict(variant).get("ratio", 1.0)) for variant in variants)
+
+    def _dataset_config(self, key: str) -> Mapping[str, Any] | None:
+        resolved_configs = self._resolved_dataset_configs(key)
+        if resolved_configs is None:
+            return None
+        return dict(resolved_configs[0])
 
     def _configure_deeper_embed_overscan(self) -> None:
         if str(self.model_config.get("embedding_type", "default")).lower() != "deeper":
@@ -495,26 +597,42 @@ class DinoIBOTPretrainer:
             return {}
 
         backbone = self.model_module.student.backbone
+        halo_voxels = tuple(int(tokens) * int(size) for tokens, size in zip(backbone.deeper_embed_patch_halo, backbone.patch_size))
+
+        def _view_size(crop_size: tuple[int, int, int] | None) -> tuple[int, int, int] | None:
+            if crop_size is None:
+                return None
+            return tuple(int(dim) + 2 * int(halo) for dim, halo in zip(crop_size, halo_voxels))
+
         global_crop_size = _as_3tuple(dataset_config.get("global_crop_size", dataset_config.get("crop_size")))
-        global_view_size = tuple(int(dim) for dim in backbone.global_input_size)
+        global_view_size = _view_size(global_crop_size)
         local_crop_size = _as_3tuple(dataset_config.get("local_crop_size"))
-        local_view_size = tuple(int(dim) for dim in backbone.local_input_size) if local_crop_size is not None else None
+        local_view_size = _view_size(local_crop_size)
+        gram_teacher_crop_size = _as_3tuple(dataset_config.get("gram_teacher_crop_size"))
+        gram_teacher_view_size = _view_size(gram_teacher_crop_size)
 
         overrides: dict[str, Any] = {
             "global_view_size": global_view_size,
         }
         if local_view_size is not None:
             overrides["local_view_size"] = local_view_size
+        if gram_teacher_view_size is not None:
+            overrides["gram_teacher_view_size"] = gram_teacher_view_size
         source_sampling_size = _as_3tuple(
             dataset_config.get("source_sampling_size", dataset_config.get("source_crop_size"))
         )
-        required_source_sampling_size = _max_3tuple(global_crop_size, local_crop_size, source_sampling_size)
+        required_source_sampling_size = _max_3tuple(
+            global_crop_size,
+            local_crop_size,
+            gram_teacher_crop_size,
+            source_sampling_size,
+        )
         if required_source_sampling_size is not None:
             overrides["source_sampling_size"] = required_source_sampling_size
         return overrides
-    
-    def build_dataloader(self) -> DataLoader:
-        dataset = SSLZarrDataset(self._dataset_config("dataset"), do_augmentations=True)
+
+    def _build_ssl_dataloader(self, dataset_config: Mapping[str, Any], *, shuffle: bool) -> DataLoader:
+        dataset = SSLZarrDataset(dataset_config, do_augmentations=True)
         collate_fn = build_dino_ibot_collate_fn(
             {
                 "global_crop_size": dataset.global_crop_size,
@@ -540,45 +658,65 @@ class DinoIBOTPretrainer:
             collate_fn=collate_fn,
             **self._build_dataloader_kwargs(),
         )
-    
-    def build_val_dataloader(self) -> DataLoader | None:
-        val_dataset_config = self._dataset_config("val_dataset")
-        if val_dataset_config is None:
-            return None
-        dataset = SSLZarrDataset(val_dataset_config, do_augmentations=True)
-        collate_fn = build_dino_ibot_collate_fn(
-            {
-                "global_crop_size": dataset.global_crop_size,
-                "patch_size": self.model_config.get("patch_size", (16, 16, 16)),
-                "mask_ratio_min_max": _as_float_pair(self.config.get("mask_ratio_min_max"), (0.1, 0.5)),
-                "mask_sample_probability": float(self.config.get("mask_sample_probability", 0.5)),
-                "dtype": torch.float32,
-            }
+
+    def _build_loader_from_configs(
+        self,
+        dataset_configs: list[dict[str, Any]],
+        *,
+        shuffle: bool,
+        weights: tuple[float, ...] | None = None,
+    ) -> DataLoader | WeightedCombinedLoader:
+        if len(dataset_configs) == 1:
+            return self._build_ssl_dataloader(dataset_configs[0], shuffle=shuffle)
+
+        dataloaders = [self._build_ssl_dataloader(dataset_config, shuffle=shuffle) for dataset_config in dataset_configs]
+        return WeightedCombinedLoader(
+            dataloaders,
+            weights=weights if weights is not None else tuple(1.0 for _ in dataloaders),
+            seed=int(self.config.get("seed", 0)),
         )
-        sampler = build_distributed_sampler(
-            dataset,
-            is_distributed=self.is_distributed,
-            rank=self.rank,
-            world_size=self.world_size,
-            shuffle=False,
+
+    def build_dataloader(self) -> DataLoader | WeightedCombinedLoader:
+        dataset_configs = self._resolved_dataset_configs("dataset")
+        if dataset_configs is None:
+            raise ValueError("dataset configuration is required")
+        return self._build_loader_from_configs(
+            dataset_configs,
+            shuffle=bool(self.config.get("shuffle", False)),
+            weights=self._dataset_variant_weights("dataset"),
         )
-        return DataLoader(
-            dataset,
-            batch_size=int(self.config.get("batch_size", 2)),
+
+    def build_val_dataloader(self) -> DataLoader | WeightedCombinedLoader | None:
+        val_dataset_configs = self._resolved_dataset_configs("val_dataset")
+        val_weights = self._dataset_variant_weights("val_dataset")
+        if val_dataset_configs is None:
+            train_dataset_configs = self._resolved_dataset_configs("dataset")
+            if train_dataset_configs is None or len(train_dataset_configs) <= 1:
+                return None
+            val_dataset_configs = [dict(train_dataset_configs[0])]
+            val_weights = None
+        return self._build_loader_from_configs(
+            val_dataset_configs,
             shuffle=False,
-            sampler=sampler,
-            collate_fn=collate_fn,
-            **self._build_dataloader_kwargs(),
+            weights=val_weights,
         )
 
     @staticmethod
-    def _set_sampler_epoch(dataloader: DataLoader, epoch: int) -> None:
+    def _set_sampler_epoch(dataloader: DataLoader | WeightedCombinedLoader, epoch: int) -> None:
+        set_epoch = getattr(dataloader, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
+            return
         if isinstance(dataloader.sampler, DistributedSampler):
             dataloader.sampler.set_epoch(epoch)
 
     @staticmethod
-    def _close_dataloader(dataloader: DataLoader | None) -> None:
+    def _close_dataloader(dataloader: DataLoader | WeightedCombinedLoader | None) -> None:
         if dataloader is None:
+            return
+        close_loader = getattr(dataloader, "close", None)
+        if callable(close_loader):
+            close_loader()
             return
         iterator = getattr(dataloader, "_iterator", None)
         shutdown_workers = getattr(iterator, "_shutdown_workers", None)
@@ -775,6 +913,106 @@ class DinoIBOTPretrainer:
         if update_centers:
             self.ibot_patch_loss.update_center(teacher_patch_batched)
         return targets
+
+    def _backbone_output_spatial_shape(
+        self,
+        backbone: Any,
+        input_spatial_shape: tuple[int, int, int],
+        *,
+        view_kind: str,
+    ) -> tuple[int, int, int]:
+        resolve_output_shape = getattr(backbone, "resolve_output_spatial_shape", None)
+        if callable(resolve_output_shape):
+            return tuple(int(dim) for dim in resolve_output_shape(input_spatial_shape, view_kind=view_kind))
+        return tuple(int(dim) for dim in input_spatial_shape)
+
+    def _feature_map_shape(
+        self,
+        backbone: Any,
+        input_spatial_shape: tuple[int, int, int],
+        *,
+        view_kind: str,
+    ) -> tuple[int, int, int]:
+        output_spatial_shape = self._backbone_output_spatial_shape(backbone, input_spatial_shape, view_kind=view_kind)
+        patch_size = tuple(int(size) for size in backbone.patch_size)
+        return tuple(int(size) // int(patch) for size, patch in zip(output_spatial_shape, patch_size))
+
+    @staticmethod
+    def _patch_tokens_to_grid(
+        patch_tokens: torch.Tensor,
+        feature_map_shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        if len(feature_map_shape) != 3:
+            raise ValueError(f"expected a 3D feature map shape, got {feature_map_shape}")
+        batch_size, _, channels = patch_tokens.shape
+        return patch_tokens.reshape(batch_size, *feature_map_shape, channels).permute(0, 4, 1, 2, 3).contiguous()
+
+    @staticmethod
+    def _grid_to_patch_tokens(feature_grid: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, depth, height, width = feature_grid.shape
+        return feature_grid.permute(0, 2, 3, 4, 1).reshape(batch_size, depth * height * width, channels).contiguous()
+
+    def _resize_patch_tokens(
+        self,
+        patch_tokens: torch.Tensor,
+        source_feature_map_shape: tuple[int, int, int],
+        target_feature_map_shape: tuple[int, int, int],
+    ) -> torch.Tensor:
+        if source_feature_map_shape == target_feature_map_shape:
+            return patch_tokens
+        feature_grid = self._patch_tokens_to_grid(patch_tokens, source_feature_map_shape)
+        feature_grid = F.interpolate(
+            feature_grid,
+            size=target_feature_map_shape,
+            mode="trilinear",
+            align_corners=False,
+        )
+        return self._grid_to_patch_tokens(feature_grid)
+
+    def _gram_teacher_patch_tokens(self, gram_teacher_crops: torch.Tensor | None) -> torch.Tensor | None:
+        if self.gram_teacher_backbone is None or gram_teacher_crops is None:
+            return None
+        with torch.no_grad():
+            outputs = self.gram_teacher_backbone(gram_teacher_crops, is_training=self.model.training, view_kind="global")
+        return outputs["x_norm_patchtokens"]
+
+    def _compute_gram_loss(
+        self,
+        *,
+        student_patch_tokens: torch.Tensor,
+        global_crops: torch.Tensor,
+        gram_teacher_crops: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        if not self.do_gram:
+            return global_crops.new_zeros(()), None, None
+        if gram_teacher_crops is None:
+            raise ValueError("Gram loss is enabled but the batch does not contain collated_gram_teacher_crops.")
+        gram_teacher_patch_tokens = self._gram_teacher_patch_tokens(gram_teacher_crops)
+        if gram_teacher_patch_tokens is None:
+            return global_crops.new_zeros(()), None, None
+
+        student_backbone = self.model_module.student.backbone
+        student_feature_map_shape = self._feature_map_shape(
+            student_backbone,
+            tuple(int(dim) for dim in global_crops.shape[2:]),
+            view_kind="global",
+        )
+        gram_teacher_feature_map_shape = self._feature_map_shape(
+            self.gram_teacher_backbone,
+            tuple(int(dim) for dim in gram_teacher_crops.shape[2:]),
+            view_kind="global",
+        )
+        resized_teacher_patch_tokens = self._resize_patch_tokens(
+            gram_teacher_patch_tokens,
+            gram_teacher_feature_map_shape,
+            student_feature_map_shape,
+        )
+        gram_loss = self.gram_loss(
+            student_patch_tokens,
+            resized_teacher_patch_tokens,
+            img_level=self.gram_img_level,
+        )
+        return gram_loss, gram_teacher_patch_tokens, resized_teacher_patch_tokens
     
     @staticmethod
     def _tensor_stats(tensor: torch.Tensor) -> dict[str, Any]:
@@ -831,6 +1069,9 @@ class DinoIBOTPretrainer:
         teacher_temp = self._teacher_temp(step)
         global_crops = batch["collated_global_crops"].to(self.device, non_blocking=True)
         local_crops = batch["collated_local_crops"].to(self.device, non_blocking=True)
+        gram_teacher_crops = batch.get("collated_gram_teacher_crops")
+        if gram_teacher_crops is not None:
+            gram_teacher_crops = gram_teacher_crops.to(self.device, non_blocking=True)
         masks = batch["collated_masks"].to(self.device, non_blocking=True)
         mask_indices = batch["mask_indices_list"].to(self.device, non_blocking=True)
         masks_weight = batch["masks_weight"].to(self.device, non_blocking=True)
@@ -917,18 +1158,38 @@ class DinoIBOTPretrainer:
                 koleo_loss = sum(self.koleo_loss(chunk) for chunk in student_global["cls_tokens"].chunk(n_global_views))
             else:
                 koleo_loss = global_crops.new_zeros(())
+            gram_loss, gram_teacher_patch_tokens, resized_gram_teacher_patch_tokens = self._compute_gram_loss(
+                student_patch_tokens=student_global["patch_tokens"],
+                global_crops=global_crops,
+                gram_teacher_crops=gram_teacher_crops,
+            )
 
             loss = (
                 self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
                 self.ibot_loss_weight * ibot_loss +
-                self.koleo_loss_weight * koleo_loss
+                self.koleo_loss_weight * koleo_loss +
+                self.gram_loss_weight * gram_loss
             )
 
         backbone = self.model_module.student.backbone
         expected_global_shape = tuple(int(dim) for dim in global_crops.shape[2:])
         expected_local_shape = tuple(int(dim) for dim in local_crops.shape[2:]) if n_local_views else None
-        global_config_shape = tuple(int(dim) for dim in getattr(backbone, "global_input_size", backbone.global_crops_size))
-        local_config_shape = tuple(int(dim) for dim in getattr(backbone, "local_input_size", backbone.local_crops_size))
+        try:
+            global_feature_map_shape = self._feature_map_shape(backbone, expected_global_shape, view_kind="global")
+            global_input_supported = True
+        except ValueError:
+            global_feature_map_shape = None
+            global_input_supported = False
+        try:
+            local_feature_map_shape = (
+                self._feature_map_shape(backbone, expected_local_shape, view_kind="local")
+                if expected_local_shape is not None
+                else None
+            )
+            local_input_supported = True
+        except ValueError:
+            local_feature_map_shape = None
+            local_input_supported = False
         
         checks = {
             "global_rows_match_views": global_crops.shape[0] == batch_size * n_global_views,
@@ -937,13 +1198,29 @@ class DinoIBOTPretrainer:
             "mask_width_matches_patch_tokens": masks.shape[1] == student_global["patch_tokens"].shape[1],
             "mask_indices_match_masked_count": mask_indices.numel() == n_masked,
             "mask_weights_match_masked_count": masks_weight.numel() == n_masked,
-            "global_input_matches_model_config": expected_global_shape == global_config_shape,
-            "local_input_matches_model_config": expected_local_shape is None or expected_local_shape == local_config_shape,
+            "global_input_supported_by_model": global_input_supported,
+            "local_input_supported_by_model": expected_local_shape is None or local_input_supported,
             "teacher_patch_count_matches_masked_count": teacher_patch.shape[0] == n_masked,
             "student_patch_count_matches_masked_count": student_patch.shape[0] == n_masked,
             "global_cls_chunks_match_batch": global_cls_0.shape[0] == batch_size and global_cls_1.shape[0] == batch_size,
             "loss_is_finite": bool(torch.isfinite(loss).item()),
         }
+        if global_feature_map_shape is not None:
+            checks["global_patch_grid_matches_resolved_shape"] = student_global["patch_tokens"].shape[1] == int(np.prod(global_feature_map_shape))
+        else:
+            checks["global_patch_grid_matches_resolved_shape"] = False
+        if local_feature_map_shape is not None and student_local is not None:
+            checks["local_patch_grid_matches_resolved_shape"] = student_local["patch_tokens"].shape[1] == int(np.prod(local_feature_map_shape))
+        else:
+            checks["local_patch_grid_matches_resolved_shape"] = student_local is None
+        if self.do_gram:
+            checks["gram_teacher_rows_match_views"] = (
+                gram_teacher_crops is not None and gram_teacher_crops.shape[0] == batch_size * n_global_views
+            )
+            checks["gram_loss_is_finite"] = bool(torch.isfinite(gram_loss).item())
+        else:
+            checks["gram_teacher_rows_match_views"] = True
+            checks["gram_loss_is_finite"] = True
         
         teacher_cls_row_sums = None
         teacher_patch_row_sums = None
@@ -988,6 +1265,7 @@ class DinoIBOTPretrainer:
                 "n_masked_patches": n_masked,
                 "global_crops": self._tensor_stats(global_crops),
                 "local_crops": self._tensor_stats(local_crops),
+                "gram_teacher_crops": self._tensor_stats(gram_teacher_crops) if gram_teacher_crops is not None else None,
                 "masks": self._tensor_stats(masks),
                 "mask_indices": self._tensor_stats(mask_indices),
                 "masks_weight": self._tensor_stats(masks_weight),
@@ -1006,6 +1284,13 @@ class DinoIBOTPretrainer:
                 "global_cls_projections": self._tensor_stats(student_global_cls),
                 "masked_patch_projections": self._tensor_stats(student_patch),
                 "local_cls_projections": self._tensor_stats(student_local["cls_projections"]) if student_local else None,
+                "local_patch_tokens": self._tensor_stats(student_local["patch_tokens"]) if student_local else None,
+            },
+            "gram": {
+                "enabled": self.do_gram,
+                "loss_weight": float(self.gram_loss_weight),
+                "raw_teacher_patch_tokens": self._tensor_stats(gram_teacher_patch_tokens) if gram_teacher_patch_tokens is not None else None,
+                "resized_teacher_patch_tokens": self._tensor_stats(resized_gram_teacher_patch_tokens) if resized_gram_teacher_patch_tokens is not None else None,
             },
             "losses": {
                 "total": float(loss.detach().item()),
@@ -1013,6 +1298,7 @@ class DinoIBOTPretrainer:
                 "dino_local": float(dino_local_loss.detach().item()),
                 "ibot": float(ibot_loss.detach().item()),
                 "koleo": float(koleo_loss.detach().item()),
+                "gram": float(gram_loss.detach().item()),
                 "term_count": total_terms,
             },
             "checks": checks,
@@ -1108,9 +1394,13 @@ class DinoIBOTPretrainer:
 
         global_crops = batch["collated_global_crops"].to(self.device, non_blocking=True)
         local_crops = batch["collated_local_crops"].to(self.device, non_blocking=True)
+        gram_teacher_crops = batch.get("collated_gram_teacher_crops")
+        if gram_teacher_crops is not None:
+            gram_teacher_crops = gram_teacher_crops.to(self.device, non_blocking=True)
         masks = batch["collated_masks"].to(self.device, non_blocking=True)
         mask_indices = batch["mask_indices_list"].to(self.device, non_blocking=True)
         masks_weight = batch["masks_weight"].to(self.device, non_blocking=True)
+        n_global_views = int(batch["n_global_views"])
         n_local_views = int(batch["n_local_views"])
         n_masked = int(batch["n_masked_patches"].item())
 
@@ -1145,9 +1435,9 @@ class DinoIBOTPretrainer:
             student_global = student_branch["global"]
             student_global_cls = student_branch["global_cls_projections"]
             student_patch = student_branch["global_masked_patch_projections"]
-            global_cls_0, global_cls_1 = student_global_cls.chunk(2)
+            global_cls_0, global_cls_1 = student_global_cls.chunk(n_global_views)
 
-            total_terms = dino_loss_term_count(n_local_views)
+            total_terms = dino_loss_term_count(n_local_views, n_global_views=n_global_views)
             if self.do_dino:
                 dino_global_loss = (
                     self.dino_loss([global_cls_0], [teacher_cls_1]) +
@@ -1176,14 +1466,20 @@ class DinoIBOTPretrainer:
                 ibot_loss = global_crops.new_zeros(())
 
             if self.do_koleo:
-                koleo_loss = sum(self.koleo_loss(chunk) for chunk in student_global["cls_tokens"].chunk(2))
+                koleo_loss = sum(self.koleo_loss(chunk) for chunk in student_global["cls_tokens"].chunk(n_global_views))
             else:
                 koleo_loss = global_crops.new_zeros(())
+            gram_loss, _, _ = self._compute_gram_loss(
+                student_patch_tokens=student_global["patch_tokens"],
+                global_crops=global_crops,
+                gram_teacher_crops=gram_teacher_crops,
+            )
 
             loss = (
                 self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
                 self.ibot_loss_weight * ibot_loss +
-                self.koleo_loss_weight * koleo_loss
+                self.koleo_loss_weight * koleo_loss +
+                self.gram_loss_weight * gram_loss
             )
 
         self.scaler.scale(loss).backward()
@@ -1192,6 +1488,7 @@ class DinoIBOTPretrainer:
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.model_module.update_teacher(teacher_momentum)
+        self._maybe_refresh_gram_teacher(step)
 
         return {
             "loss": float(loss.detach()),
@@ -1199,6 +1496,8 @@ class DinoIBOTPretrainer:
             "dino_local_loss": float(dino_local_loss.detach()),
             "ibot_loss": float(ibot_loss.detach()),
             "koleo_loss": float(koleo_loss.detach()),
+            "gram_loss": float(gram_loss.detach()),
+            "gram_loss_weight": float(self.gram_loss_weight),
             "lr": lr,
             "weight_decay": weight_decay,
             "teacher_temp": teacher_temp,
@@ -1245,6 +1544,9 @@ class DinoIBOTPretrainer:
                 "scaler": self.scaler.state_dict() if self.scaler.is_enabled() else None,
                 "dino_loss": self.dino_loss.state_dict(),
                 "ibot_patch_loss": self.ibot_patch_loss.state_dict(),
+                "gram_teacher_backbone": (
+                    self.gram_teacher_backbone.state_dict() if self.gram_teacher_backbone is not None else None
+                ),
                 "rng_state": self._capture_rng_state(),
             },
             path,
@@ -1264,6 +1566,10 @@ class DinoIBOTPretrainer:
             self.dino_loss.load_state_dict(checkpoint["dino_loss"])
         if "ibot_patch_loss" in checkpoint:
             self.ibot_patch_loss.load_state_dict(checkpoint["ibot_patch_loss"])
+        if checkpoint.get("gram_teacher_backbone") is not None and self.gram_teacher_backbone is not None:
+            self.gram_teacher_backbone.load_state_dict(checkpoint["gram_teacher_backbone"])
+            self.gram_teacher_backbone.requires_grad_(False)
+            self.gram_teacher_backbone.eval()
         if checkpoint.get("wandb_run_id") and not self.wandb_run_id:
             self.wandb_run_id = str(checkpoint["wandb_run_id"])
             self.config["wandb_run_id"] = self.wandb_run_id
@@ -1303,12 +1609,18 @@ class DinoIBOTPretrainer:
             return array[0].numpy()
         raise ValueError(f"unexpected tensor shape for visualization: {tuple(array.shape)}")
     
-    def _patch_pca_slice(self, patch_tokens: torch.Tensor, sample_index: int, target_hw: tuple[int, int]) -> np.ndarray:
-        patch_size = self.model_config.get("patch_size", (16, 16, 16))
-        global_crop = self.config["dataset"].get("global_crop_size", self.config["dataset"].get("crop_size"))
-        if isinstance(global_crop, int):
-            global_crop = (global_crop, global_crop, global_crop)
-        feature_shape = tuple(int(size) // int(patch) for size, patch in zip(global_crop, patch_size))
+    def _patch_pca_slice(
+        self,
+        patch_tokens: torch.Tensor,
+        sample_index: int,
+        target_hw: tuple[int, int],
+        input_spatial_shape: tuple[int, int, int],
+    ) -> np.ndarray:
+        feature_shape = self._feature_map_shape(
+            self.model_module.student.backbone,
+            input_spatial_shape,
+            view_kind="global",
+        )
         feature_map = patch_tokens[sample_index].reshape(*feature_shape, patch_tokens.shape[-1])
         depth = feature_map.shape[0] // 2
         slice_features = feature_map[depth].float()
@@ -1351,6 +1663,7 @@ class DinoIBOTPretrainer:
                     student_outputs["patch_tokens"],
                     tensor_index,
                     target_hw=center_slice.shape,
+                    input_spatial_shape=tuple(int(dim) for dim in global_views[tensor_index].shape[1:]),
                 )
                 input_rgb = np.stack([self._normalize_image(center_slice)] * 3, axis=-1)
                 panels.extend([input_rgb, pca_rgb])
@@ -1363,7 +1676,7 @@ class DinoIBOTPretrainer:
             f"step={step} monitor_image={image_path.name} "
             f"loss={metrics['loss']:.4f} glob={metrics['dino_global_loss']:.4f} "
             f"loc={metrics['dino_local_loss']:.4f} ibot={metrics['ibot_loss']:.4f} "
-            f"koleo={metrics['koleo_loss']:.4f}"
+            f"koleo={metrics['koleo_loss']:.4f} gram={metrics['gram_loss']:.4f}"
         )
         return image_path
     
@@ -1373,9 +1686,13 @@ class DinoIBOTPretrainer:
 
         global_crops = batch["collated_global_crops"].to(self.device, non_blocking=True)
         local_crops = batch["collated_local_crops"].to(self.device, non_blocking=True)
+        gram_teacher_crops = batch.get("collated_gram_teacher_crops")
+        if gram_teacher_crops is not None:
+            gram_teacher_crops = gram_teacher_crops.to(self.device, non_blocking=True)
         masks = batch["collated_masks"].to(self.device, non_blocking=True)
         mask_indices = batch["mask_indices_list"].to(self.device, non_blocking=True)
         masks_weight = batch["masks_weight"].to(self.device, non_blocking=True)
+        n_global_views = int(batch["n_global_views"])
         n_local_views = int(batch["n_local_views"])
         n_masked = int(batch["n_masked_patches"].item())
 
@@ -1404,9 +1721,9 @@ class DinoIBOTPretrainer:
             student_global = student_branch["global"]
             student_global_cls = student_branch["global_cls_projections"]
             student_patch = student_branch["global_masked_patch_projections"]
-            global_cls_0, global_cls_1 = student_global_cls.chunk(2)
+            global_cls_0, global_cls_1 = student_global_cls.chunk(n_global_views)
 
-            total_terms = dino_loss_term_count(n_local_views)
+            total_terms = dino_loss_term_count(n_local_views, n_global_views=n_global_views)
             if self.do_dino:
                 dino_global_loss = (
                     self.dino_loss([global_cls_0], [teacher_cls_1]) +
@@ -1435,14 +1752,20 @@ class DinoIBOTPretrainer:
                 ibot_loss = global_crops.new_zeros(())
 
             if self.do_koleo:
-                koleo_loss = sum(self.koleo_loss(chunk) for chunk in student_global["cls_tokens"].chunk(2))
+                koleo_loss = sum(self.koleo_loss(chunk) for chunk in student_global["cls_tokens"].chunk(n_global_views))
             else:
                 koleo_loss = global_crops.new_zeros(())
+            gram_loss, _, _ = self._compute_gram_loss(
+                student_patch_tokens=student_global["patch_tokens"],
+                global_crops=global_crops,
+                gram_teacher_crops=gram_teacher_crops,
+            )
 
             loss = (
                 self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
                 self.ibot_loss_weight * ibot_loss +
-                self.koleo_loss_weight * koleo_loss
+                self.koleo_loss_weight * koleo_loss +
+                self.gram_loss_weight * gram_loss
             )
 
         return {
@@ -1451,6 +1774,8 @@ class DinoIBOTPretrainer:
             "dino_local_loss": float(dino_local_loss.detach()),
             "ibot_loss": float(ibot_loss.detach()),
             "koleo_loss": float(koleo_loss.detach()),
+            "gram_loss": float(gram_loss.detach()),
+            "gram_loss_weight": float(self.gram_loss_weight),
             "teacher_temp": teacher_temp,
         }
 
@@ -1527,13 +1852,17 @@ class DinoIBOTPretrainer:
                         loc_loss=f"{metrics['dino_local_loss']:.4f}",
                         ibot_loss=f"{metrics['ibot_loss']:.4f}",
                         koleo_loss=f"{metrics['koleo_loss']:.4f}",
+                        gram_loss=f"{metrics['gram_loss']:.4f}",
                     )
                     progress.update(1)
                 if self.is_main_process:
                     self._log_wandb_metrics("train", metrics, step=step)
                 
                 if self.is_main_process and step % self.log_every == 0:
-                    print(f"step={step} loss={metrics['loss']:.4f} lr={metrics['lr']:.2e}")
+                    print(
+                        f"step={step} loss={metrics['loss']:.4f} lr={metrics['lr']:.2e} "
+                        f"gram={metrics['gram_loss']:.4f}"
+                    )
                 if self.val_every_n and step > 0 and step % self.val_every_n == 0:
                     if val_dataloader_iter is None:
                         if self.is_main_process and not self._warned_missing_val_dataset:

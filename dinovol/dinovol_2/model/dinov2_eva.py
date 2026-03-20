@@ -652,8 +652,10 @@ class Eva(nn.Module):
 
         return pos_embed
 
-    def _resolve_target_spatial_shape(self, spatial: tuple[int, ...], *, view_kind: str) -> tuple[int, ...]:
+    def resolve_output_spatial_shape(self, spatial: tuple[int, ...], *, view_kind: str) -> tuple[int, ...]:
         spatial = tuple(int(dim) for dim in spatial)
+        if self.embedding_type != "deeper":
+            return spatial
         if view_kind == "global":
             target = tuple(int(dim) for dim in self.global_crops_size)
             input_size = tuple(int(dim) for dim in self.global_input_size)
@@ -665,10 +667,22 @@ class Eva(nn.Module):
 
         if spatial == input_size or spatial == target:
             return target
+        if self.embedding_type == "deeper":
+            halo_voxels = tuple(int(tokens) * int(size) for tokens, size in zip(self.deeper_embed_patch_halo, self.patch_size))
+            dynamic_target = tuple(int(dim) - 2 * int(halo) for dim, halo in zip(spatial, halo_voxels))
+            if (
+                any(halo_voxels)
+                and all(dim > 0 for dim in dynamic_target)
+                and all(dim % patch == 0 for dim, patch in zip(dynamic_target, self.patch_size))
+            ):
+                return dynamic_target
         raise ValueError(
             f"unexpected input shape {spatial} for embedding_type={self.embedding_type!r} and view_kind={view_kind!r}; "
             f"expected {input_size} or {target}"
         )
+
+    def _resolve_target_spatial_shape(self, spatial: tuple[int, ...], *, view_kind: str) -> tuple[int, ...]:
+        return self.resolve_output_spatial_shape(spatial, view_kind=view_kind)
 
     def _crop_embedded_grid(self, x: torch.Tensor, target_spatial: tuple[int, ...]) -> torch.Tensor:
         target_patch_shape = tuple(int(size) // int(patch) for size, patch in zip(target_spatial, self.patch_size))

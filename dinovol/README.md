@@ -22,6 +22,93 @@ To select the newer defaults explicitly, set `model.model_type` to `v2` in the c
 }
 ```
 
+## Gram Anchoring And HR Adaptation
+
+`pretrain.py` now supports the three-stage DINOv3-style workflow:
+
+- base pretraining with DINO + iBOT + KoLeo
+- late dense-feature refinement with Gram anchoring
+- short mixed-resolution HR adaptation with Gram anchoring kept on
+
+The new config surface is:
+
+- top-level `gram`
+  - `enabled`
+  - `loss_weight`
+  - `teacher_checkpoint`
+  - `teacher_refresh_every`
+  - `teacher_refresh_start_step`
+  - `normalized`
+  - `img_level`
+  - `remove_neg`
+  - `remove_only_teacher_neg`
+- dataset keys
+  - `gram_teacher_crop_size`
+  - `gram_teacher_no_augmentations`
+  - `variants`
+
+When `gram.enabled=true`, the trainer builds a frozen Gram teacher backbone, loads it from `gram.teacher_checkpoint` when provided, refreshes it from the live EMA teacher on the configured cadence, and adds an image-level Gram loss on patch features. Gram-teacher crops are paired with each global crop from the exact same sampled 3D region, and default to normalization-only.
+
+Mixed-resolution HR adaptation is enabled by adding `dataset.variants`, where each variant defines its own crop sizes and sampling ratio. The trainer builds one dataloader per variant and samples them with the configured weights. For `embedding_type=deeper`, the dataset automatically derives the needed overscanned `*_view_size` values from the patch halo.
+
+`dinovol_2/example_config.json` remains runnable as a base-pretraining config and also includes a `recipes` object with three complete examples:
+
+- `recipes.base_pretrain`
+- `recipes.gram_refinement`
+- `recipes.hr_adaptation`
+
+The important stage-specific overrides are:
+
+```json
+{
+  "gram": {
+    "enabled": true,
+    "loss_weight": 2.0,
+    "teacher_checkpoint": "/path/to/previous/checkpoint.pt",
+    "teacher_refresh_every": 10000
+  },
+  "model": {
+    "pretrained_weights": "/path/to/previous/checkpoint.pt",
+    "pretrained_backbone_only": false
+  }
+}
+```
+
+For HR adaptation, add weighted crop variants:
+
+```json
+{
+  "dataset": {
+    "variants": [
+      {
+        "ratio": 0.3,
+        "global_crop_size": [128, 128, 128],
+        "local_crop_size": [48, 48, 48],
+        "gram_teacher_crop_size": [160, 160, 160]
+      },
+      {
+        "ratio": 0.7,
+        "global_crop_size": [160, 160, 160],
+        "local_crop_size": [80, 80, 80],
+        "gram_teacher_crop_size": [192, 192, 192]
+      }
+    ]
+  }
+}
+```
+
+To sanity-check one batch end to end:
+
+```bash
+uv run python -m dinovol_2.verify dinovol_2/example_config.json --no-amp
+```
+
+To run the synthetic smoke suite:
+
+```bash
+uv run python -m unittest tests.test_pretrain_smoke -v
+```
+
 ## Optional Task Eval During Pretraining
 
 `pretrain.py` can optionally run small downstream segmentation trainings during pretraining.

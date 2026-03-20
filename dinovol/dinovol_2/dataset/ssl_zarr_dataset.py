@@ -1,6 +1,7 @@
 import atexit
 import json
 import os
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,12 @@ class ZarrHandle:
             self.fs._session = None
         except AttributeError:
             pass
+
+
+@dataclass(frozen=True)
+class SampledCropRegion:
+    starts: tuple[int, int, int]
+    shape: tuple[int, int, int]
 
 
 def _as_3tuple(value):
@@ -166,7 +173,16 @@ class SSLZarrDataset(Dataset):
         self.local_crop_size = _as_3tuple(self.config["local_crop_size"] if "local_crop_size" in self.config else None)
         self.global_view_size = _as_3tuple(self.config.get("global_view_size", self.global_crop_size))
         self.local_view_size = _as_3tuple(self.config.get("local_view_size", self.local_crop_size))
-        double_global = tuple(2 * int(d) for d in self.global_crop_size)
+        self.gram_teacher_crop_size = _as_3tuple(self.config.get("gram_teacher_crop_size"))
+        if self.gram_teacher_crop_size is not None and self.single_crop_only:
+            raise ValueError("gram_teacher_crop_size is not supported with single_crop_only datasets.")
+        self.gram_teacher_view_size = _as_3tuple(
+            self.config.get("gram_teacher_view_size", self.gram_teacher_crop_size)
+        )
+        self.gram_teacher_no_augmentations = bool(self.config.get("gram_teacher_no_augmentations", True))
+        self.paired_global_crop_size = _max_3tuple(self.global_crop_size, self.gram_teacher_crop_size)
+        self.paired_global_view_size = _max_3tuple(self.global_view_size, self.gram_teacher_view_size)
+        double_global = tuple(2 * int(d) for d in self.paired_global_crop_size)
         default_source_sampling_size = _max_3tuple(double_global, self.global_crop_size, self.local_crop_size)
         self.source_sampling_size = _as_3tuple(
             self.config.get("source_sampling_size", self.config.get("source_crop_size", default_source_sampling_size))
@@ -198,7 +214,17 @@ class SSLZarrDataset(Dataset):
                 raise ValueError(
                     f"local_view_size must be at least local_crop_size, got {self.local_view_size} < {self.local_crop_size}"
                 )
-        required_source_sampling_size = _max_3tuple(self.global_crop_size, self.local_crop_size)
+        if self.gram_teacher_crop_size is not None and self.gram_teacher_view_size is not None:
+            if any(view < crop for view, crop in zip(self.gram_teacher_view_size, self.gram_teacher_crop_size)):
+                raise ValueError(
+                    "gram_teacher_view_size must be at least gram_teacher_crop_size, "
+                    f"got {self.gram_teacher_view_size} < {self.gram_teacher_crop_size}"
+                )
+        required_source_sampling_size = _max_3tuple(
+            self.global_crop_size,
+            self.local_crop_size,
+            self.gram_teacher_crop_size,
+        )
         if required_source_sampling_size is not None and any(
             source < required for source, required in zip(self.source_sampling_size, required_source_sampling_size)
         ):
@@ -207,7 +233,7 @@ class SSLZarrDataset(Dataset):
                 f"got source_sampling_size={self.source_sampling_size} and required={required_source_sampling_size}"
             )
         self.source_read_window_size = self._required_read_window_size(self.source_sampling_size)
-        required_read_window_size = _max_3tuple(self.global_view_size, self.local_view_size)
+        required_read_window_size = _max_3tuple(self.paired_global_view_size, self.local_view_size)
         if required_read_window_size is not None and any(
             source < required for source, required in zip(self.source_read_window_size, required_read_window_size)
         ):
@@ -378,7 +404,7 @@ class SSLZarrDataset(Dataset):
     def _required_read_window_size(self, source_sampling_size):
         required_sizes = [tuple(int(size) for size in source_sampling_size)]
         required_sizes.append(
-            self._expand_crop_shape(source_sampling_size, self.global_view_size, self.global_crop_size)
+            self._expand_crop_shape(source_sampling_size, self.paired_global_view_size, self.paired_global_crop_size)
         )
         if self.local_crop_size is not None and self.local_view_size is not None:
             required_sizes.append(
@@ -386,10 +412,10 @@ class SSLZarrDataset(Dataset):
             )
         return _max_3tuple(*required_sizes)
 
-    def _random_resized_crop_3d_from_array(self, source_crop, scale_range, target_size, *, reference_size=None):
+    def _sample_random_resized_crop_region(self, source_shape, scale_range, target_size, *, reference_size=None):
         if reference_size is None:
             reference_size = target_size
-        source_depth, source_height, source_width = source_crop.shape
+        source_depth, source_height, source_width = source_shape
         nominal_crop_shape = self._sample_crop_shape(scale_range)
         # Sample the nominal DINO crop inside source_sampling_size, then expand around it when
         # a deeper-embed halo is requested.
@@ -440,12 +466,29 @@ class SSLZarrDataset(Dataset):
             raw_starts.append(raw_start)
 
         z_start, y_start, x_start = raw_starts
+        return SampledCropRegion(
+            starts=(int(z_start), int(y_start), int(x_start)),
+            shape=(int(crop_d), int(crop_h), int(crop_w)),
+        )
+
+    def _materialize_crop_from_region(self, source_crop, crop_region, target_size):
+        z_start, y_start, x_start = crop_region.starts
+        crop_d, crop_h, crop_w = crop_region.shape
         crop = source_crop[
             z_start:z_start + crop_d,
             y_start:y_start + crop_h,
             x_start:x_start + crop_w,
         ]
         return self._finalize_crop(crop, target_size)
+
+    def _random_resized_crop_3d_from_array(self, source_crop, scale_range, target_size, *, reference_size=None):
+        crop_region = self._sample_random_resized_crop_region(
+            source_crop.shape,
+            scale_range,
+            target_size,
+            reference_size=reference_size,
+        )
+        return self._materialize_crop_from_region(source_crop, crop_region, target_size)
     
     def _read_random_resized_crop_3d(self, d_zarr, usable_bbox, scale_range, target_size, *, reference_size=None):
         if reference_size is None:
@@ -457,6 +500,37 @@ class SSLZarrDataset(Dataset):
             target_size,
             reference_size=reference_size,
         )
+
+    @staticmethod
+    def _capture_rng_state():
+        state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    @staticmethod
+    def _restore_rng_state(state):
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"])
+        if "cuda" in state and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["cuda"])
+
+    def _apply_paired_global_transform(self, transform, global_view, gram_teacher_view):
+        if gram_teacher_view is None or self.gram_teacher_no_augmentations:
+            return transform(image=global_view)["image"], gram_teacher_view
+
+        state_before = self._capture_rng_state()
+        augmented_global = transform(image=global_view)["image"]
+        state_after = self._capture_rng_state()
+        self._restore_rng_state(state_before)
+        augmented_gram_teacher = transform(image=gram_teacher_view)["image"]
+        self._restore_rng_state(state_after)
+        return augmented_global, augmented_gram_teacher
     
     def __len__(self):
         if self.epoch_length is not None:
@@ -486,21 +560,35 @@ class SSLZarrDataset(Dataset):
             if self.do_augmentations:
                 crop = self.global_transforms[0](image=crop)["image"]
             return crop
-        
-        global_views = [
-            self._random_resized_crop_3d_from_array(
-                source_crop,
+
+        global_views = []
+        gram_teacher_views = []
+        for transform in self.global_transforms:
+            # Sample one shared region so the student and Gram teacher observe the
+            # exact same 3D field of view, optionally at different resolutions.
+            crop_region = self._sample_random_resized_crop_region(
+                source_crop.shape,
                 self.global_crop_scale,
-                self.global_view_size,
-                reference_size=self.global_crop_size,
+                self.paired_global_view_size,
+                reference_size=self.paired_global_crop_size,
             )
-            for _ in range(self.num_global_crops)
-        ]
-        if self.do_augmentations:
-            global_views = [
-                transform(image=view)["image"]
-                for transform, view in zip(self.global_transforms, global_views)
-            ]
+            global_view = self._materialize_crop_from_region(source_crop, crop_region, self.global_view_size)
+            gram_teacher_view = None
+            if self.gram_teacher_view_size is not None:
+                gram_teacher_view = self._materialize_crop_from_region(
+                    source_crop,
+                    crop_region,
+                    self.gram_teacher_view_size,
+                )
+            if self.do_augmentations:
+                global_view, gram_teacher_view = self._apply_paired_global_transform(
+                    transform,
+                    global_view,
+                    gram_teacher_view,
+                )
+            global_views.append(global_view)
+            if gram_teacher_view is not None:
+                gram_teacher_views.append(gram_teacher_view)
         
         local_views = []
         if self.local_crop_size is not None:
@@ -519,7 +607,10 @@ class SSLZarrDataset(Dataset):
                     for transform, view in zip(self.local_transforms, local_views)
                 ]
         
-        return {
+        sample = {
             "global_views": global_views,
             "local_views": local_views,
         }
+        if gram_teacher_views:
+            sample["gram_teacher_views"] = gram_teacher_views
+        return sample

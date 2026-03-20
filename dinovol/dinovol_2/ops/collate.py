@@ -40,6 +40,13 @@ def collate_dino_ibot_batch(
         local_shape = samples[0]["global_views"][0].shape
         local_crops = torch.empty((0, *local_shape), dtype=dtype)
 
+    if samples[0].get("gram_teacher_views"):
+        collated_gram_teacher_crops = torch.stack(
+            [sample["gram_teacher_views"][i] for i in range(n_global_views) for sample in samples]
+        ).to(dtype)
+    else:
+        collated_gram_teacher_crops = None
+
     n_masked_samples = int(global_crops.shape[0] * mask_sample_probability)
     masks_list: list[torch.Tensor] = []
     upperbound = 0
@@ -64,7 +71,7 @@ def collate_dino_ibot_batch(
     masked_sample_indices = torch.div(mask_indices_list, tokens_per_sample, rounding_mode="floor")
     masks_weight = inverse_mask_counts.index_select(0, masked_sample_indices)
 
-    return {
+    batch = {
         "collated_global_crops": global_crops,
         "collated_local_crops": local_crops,
         "collated_masks": collated_masks,
@@ -76,6 +83,9 @@ def collate_dino_ibot_batch(
         "n_local_views": n_local_views,
         "batch_size": len(samples),
     }
+    if collated_gram_teacher_crops is not None:
+        batch["collated_gram_teacher_crops"] = collated_gram_teacher_crops
+    return batch
 
 
 def build_dino_ibot_collate_fn(config: Mapping[str, Any]) -> partial:
