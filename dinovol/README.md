@@ -25,6 +25,7 @@ The task data is downloaded with `python -m dinovol_2.eval.download_data --task 
 - train and validation crops are taken from precomputed chunks that contain some foreground and at least 50% background in supervised voxels
 - the saved validation image contains one row per validation sample, with image / label / prediction panels
 - for `ink`, voxels with `supervision_mask == 0` are ignored and supervised unlabeled voxels are treated as background
+- for `ink`, loss/metrics and saved previews use a max projection across Z to match the flat ink trainer
 
 ## Napari visualizer
 

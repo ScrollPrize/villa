@@ -127,6 +127,14 @@ def _colorize_labels(array: np.ndarray) -> np.ndarray:
     return np.stack([grayscale, grayscale, grayscale], axis=-1)
 
 
+def _render_binary_label_with_ignore(array: np.ndarray) -> np.ndarray:
+    labels = np.asarray(array, dtype=np.int64)
+    rendered = np.zeros(labels.shape, dtype=np.uint8)
+    rendered[labels == _IGNORE_LABEL] = 127
+    rendered[labels == 1] = 255
+    return np.stack([rendered, rendered, rendered], axis=-1)
+
+
 @dataclass(frozen=True)
 class TaskSample:
     name: str
@@ -558,16 +566,49 @@ class TaskEvalRunner:
         return int(base_seed + 1009 * step + task_offset)
 
     @staticmethod
+    def _project_ink_target(target: torch.Tensor) -> torch.Tensor:
+        target = target.detach()
+        depth_dim = 1 if target.ndim == 4 else 0
+        valid_mask = target != _IGNORE_LABEL
+        foreground_mask = (target == 1) & valid_mask
+        projected_valid = torch.any(valid_mask, dim=depth_dim)
+        projected_foreground = torch.any(foreground_mask, dim=depth_dim)
+        projected = torch.full(
+            projected_valid.shape,
+            _IGNORE_LABEL,
+            dtype=target.dtype,
+            device=target.device,
+        )
+        projected[projected_valid] = 0
+        projected[projected_foreground] = 1
+        return projected
+
+    @staticmethod
+    def _task_logits(task_name: str, logits: torch.Tensor) -> torch.Tensor:
+        logits = logits[:, 0]
+        if task_name == "ink":
+            return torch.amax(logits, dim=1)
+        return logits
+
+    @classmethod
+    def _task_target(cls, task_name: str, target: torch.Tensor) -> torch.Tensor:
+        if task_name == "ink":
+            return cls._project_ink_target(target)
+        return target.detach()
+
+    @classmethod
     def _binary_target_and_mask(target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         target = target.detach()
         valid_mask = target != _IGNORE_LABEL
         binary_target = (target == 1).to(dtype=torch.float32)
         return binary_target, valid_mask
 
-    @staticmethod
-    def _task_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        binary_target, valid_mask = TaskEvalRunner._binary_target_and_mask(target)
-        masked_logits = logits[:, 0][valid_mask]
+    @classmethod
+    def _task_loss(cls, task_name: str, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        task_target = cls._task_target(task_name, target)
+        task_logits = cls._task_logits(task_name, logits)
+        binary_target, valid_mask = cls._binary_target_and_mask(task_target)
+        masked_logits = task_logits[valid_mask]
         masked_target = binary_target[valid_mask]
         if masked_target.numel() == 0:
             return logits.sum() * 0.0
@@ -617,6 +658,23 @@ class TaskEvalRunner:
         depth_index = volume.shape[0] // 2
         return volume[depth_index].numpy()
 
+    @classmethod
+    def _label_preview(cls, task_name: str, label: torch.Tensor) -> np.ndarray:
+        if task_name == "ink":
+            label_2d = cls._project_ink_target(label).detach().cpu().numpy()
+            return _render_binary_label_with_ignore(label_2d)
+        label_slice = cls._center_slice_label(label)
+        return _colorize_labels(label_slice)
+
+    @classmethod
+    def _probability_preview(cls, prediction_probability: torch.Tensor) -> np.ndarray:
+        prediction = prediction_probability.detach().cpu()
+        if prediction.ndim == 2:
+            prediction_slice = prediction.numpy()
+        else:
+            prediction_slice = cls._center_slice_image(prediction.unsqueeze(0))
+        return np.stack([_normalize_image(prediction_slice)] * 3, axis=-1)
+
     def _save_validation_image(
         self,
         task_name: str,
@@ -626,12 +684,9 @@ class TaskEvalRunner:
         canvas_rows: list[np.ndarray] = []
         for image, label, prediction_probability in rows:
             image_slice = self._center_slice_image(image)
-            label_slice = self._center_slice_label(label)
-            prediction_slice = self._center_slice_image(prediction_probability.unsqueeze(0))
-
             image_rgb = np.stack([_normalize_image(image_slice)] * 3, axis=-1)
-            label_rgb = _colorize_labels(label_slice)
-            prediction_rgb = np.stack([_normalize_image(prediction_slice)] * 3, axis=-1)
+            label_rgb = self._label_preview(task_name, label)
+            prediction_rgb = self._probability_preview(prediction_probability)
             canvas_rows.append(np.concatenate([image_rgb, label_rgb, prediction_rgb], axis=1))
 
         canvas = np.concatenate(canvas_rows, axis=0)
@@ -682,7 +737,7 @@ class TaskEvalRunner:
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
                     logits = ddp_model(image)
-                    loss = self._task_loss(logits, target)
+                    loss = self._task_loss(task_name, logits, target)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -703,11 +758,13 @@ class TaskEvalRunner:
                 val_batch = val_image.unsqueeze(0).to(self.device, non_blocking=True)
                 val_target_batch = val_target.unsqueeze(0).to(self.device, non_blocking=True)
                 val_logits = model(val_batch)
-                val_loss = self._task_loss(val_logits, val_target_batch)
-                val_probability = torch.sigmoid(val_logits[:, 0]).detach().cpu()
-                val_prediction = (val_logits[:, 0] > 0).to(dtype=torch.int64).detach().cpu()
+                val_loss = self._task_loss(task_name, val_logits, val_target_batch)
+                val_task_logits = self._task_logits(task_name, val_logits)
+                val_probability = torch.sigmoid(val_task_logits).detach().cpu()
+                val_prediction = (val_task_logits > 0).to(dtype=torch.int64).detach().cpu()
+                val_metric_target = self._task_target(task_name, val_target_batch).cpu()
                 val_loss_total += float(val_loss.detach().item())
-                foreground_dice_total += self._foreground_mean_dice(val_prediction, val_target_batch.cpu())
+                foreground_dice_total += self._foreground_mean_dice(val_prediction, val_metric_target)
                 if self.rank == 0:
                     validation_image_rows.append((val_image, val_target, val_probability[0]))
         if self.rank == 0 and validation_image_rows:
