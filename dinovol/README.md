@@ -20,8 +20,9 @@ The task data is downloaded with `python -m dinovol_2.eval.download_data --task 
 
 - `both` now means `surfaces` plus `ink`
 - `surfaces` is resized 2x before crops are drawn
-- `ink` uses the first 5 sorted samples as the deterministic validation set
+- `surfaces` and `ink` each use the first 10 sorted samples as the deterministic validation set
 - `ink` is not resized before crops are drawn
+- the saved validation image contains one row per validation sample, with image / label / prediction panels
 - for `ink`, voxels with `supervision_mask == 0` are ignored and supervised unlabeled voxels are treated as background
 
 ## Napari visualizer

@@ -11,6 +11,7 @@ from torch.nn.init import trunc_normal_
 from torch.nn.utils.parametrizations import weight_norm
 
 from dinovol_2.model.dinov2_eva import Eva, EvaWithChunking
+from dinovol_2.model.rope import MixedRopePositionEmbedding, RopePositionEmbedding
 
 
 _BACKBONE_DEFAULTS = {
@@ -73,6 +74,12 @@ _ROPE_DTYPE_ALIASES = {
     "float16": torch.float16,
     "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
+}
+_ROPE_IMPL_ALIASES = {
+    "axial": RopePositionEmbedding,
+    "default": RopePositionEmbedding,
+    "mixed": MixedRopePositionEmbedding,
+    "mixed_learnable": MixedRopePositionEmbedding,
 }
 _HEAD_DEFAULTS = {
     "hidden_dim": 2048,
@@ -142,6 +149,29 @@ def _resolve_rope_kwargs(config: Mapping[str, Any]) -> dict[str, Any]:
         rope_kwargs["dtype"] = _resolve_rope_dtype(rope_kwargs["dtype"])
 
     return rope_kwargs
+
+
+def _resolve_rope_impl(
+    config: Mapping[str, Any],
+    rope_kwargs: Mapping[str, Any],
+) -> tuple[type[nn.Module], dict[str, Any]]:
+    resolved_kwargs = dict(rope_kwargs)
+    rope_type = _config_value(config, "rope_type", None, fallback_key="pos_embed_rope_type")
+    if rope_type is None:
+        rope_type = resolved_kwargs.pop("type", resolved_kwargs.pop("rope_type", "axial"))
+
+    if isinstance(rope_type, str):
+        normalized = rope_type.strip().lower()
+        if normalized not in _ROPE_IMPL_ALIASES:
+            raise ValueError(
+                f"unsupported rope_type={rope_type!r}; expected one of {sorted(_ROPE_IMPL_ALIASES)}"
+            )
+        return _ROPE_IMPL_ALIASES[normalized], resolved_kwargs
+
+    if isinstance(rope_type, type) and issubclass(rope_type, nn.Module):
+        return rope_type, resolved_kwargs
+
+    raise ValueError(f"unsupported rope_type value: {rope_type!r}")
 
 
 def _get_vit_lr_decay_rate(
@@ -297,6 +327,7 @@ class DinoVitStudentTeacher(nn.Module):
         if "num_reg_tokens" not in config and "num_register_tokens" in config:
             backbone_config["num_reg_tokens"] = int(config["num_register_tokens"])
         rope_kwargs = _resolve_rope_kwargs(config)
+        rope_impl, rope_kwargs = _resolve_rope_impl(config, rope_kwargs)
         global_crops_size = _as_3tuple(backbone_config["global_crops_size"])
         local_crop_value = backbone_config["local_crops_size"] or global_crops_size
         local_crops_size = _as_3tuple(local_crop_value)
@@ -308,6 +339,7 @@ class DinoVitStudentTeacher(nn.Module):
                 "global_crops_size": global_crops_size,
                 "local_crops_size": local_crops_size,
                 "patch_size": _as_3tuple(backbone_config["patch_size"]),
+                "rope_impl": rope_impl,
                 "rope_kwargs": rope_kwargs,
             }
         )
