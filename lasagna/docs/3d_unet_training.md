@@ -637,23 +637,83 @@ implemented in the training loop, not in the vesuvius config.
               fit.py (surface optimization)
 ```
 
-### 6.6 Inference Pipeline
+### 6.6 Inference — `predict3d` mode
 
-At inference time, the 3D UNet replaces the 2D UNet + fusion pipeline:
+The `predict3d` mode of `preprocess_cos_omezarr.py` runs a trained 3D UNet on
+a raw CT zarr volume and writes a preprocessed zarr ready for `fit.py`. It
+replaces the 2D pipeline (3 per-axis runs + `integrate` fusion) with a single
+pass.
 
-1. Load raw CT scroll region at **full resolution**
-2. Run 3D UNet → 8 float32 channels at full resolution
-3. Average-pool by step factor → 8 channels at step resolution
-4. Fuse 3×2 direction channels into 3D normal (nx, ny, nz) via cross-product
-   algorithm (same as `preprocess_cos_omezarr.py`)
-5. Hemisphere-encode normals: flip so nz ≥ 0, store nx/ny as uint8
-6. Encode cos and grad_mag as uint8
-7. Add pred_dt from separate surface prediction UNet
-8. Write lasagna-format zarr with `preprocess_params` metadata
-9. Feed into `fit.py` as before
+The pipeline: tiled 3D inference with per-tile sigmoid and avg_pool3d
+downscaling on GPU, linear-blended into a disk-backed memmap accumulator
+→ chunked normal estimation from 3×2 direction channels → uint8 encoding
+→ zarr output. Input tiles are read lazily from zarr (no full-crop load).
+Uses CUDA by default when available.
 
-For large volumes, use sliding-window inference with overlap (the vesuvius
-`VCDataset` supports this). Pool the reassembled full-res output.
+#### Basic usage
+
+```bash
+python lasagna/preprocess_cos_omezarr.py predict3d \
+    --input /path/to/volume.zarr \
+    --output /path/to/preprocessed.zarr \
+    --unet-checkpoint /path/to/model.pt
+```
+
+#### With crop and pred-dt
+
+```bash
+python lasagna/preprocess_cos_omezarr.py predict3d \
+    --input /path/to/volume.zarr \
+    --output /path/to/preprocessed.zarr \
+    --unet-checkpoint /path/to/model.pt \
+    --crop-xyzwhd 100 200 300 500 400 600 \
+    --pred-dt /path/to/prediction.zarr
+```
+
+#### Options
+
+| Flag | Description |
+|------|-------------|
+| `--input` | Input zarr array (3D, ZYX layout). Required. |
+| `--output` | Output zarr path. Required. |
+| `--unet-checkpoint` | Path to trained 3D UNet `.pt` checkpoint. Required. |
+| `--tile-size` | Cube tile size for tiled inference (default 256). Must be compatible with the model architecture. |
+| `--overlap` | Overlap between adjacent tiles in voxels (default 64). |
+| `--border` | Hard-discard border at tile edges before linear blending (default 16). |
+| `--scaledown` | Output downsample factor (default 4). The output zarr voxels represent `scaledown` fullres voxels in each dimension. |
+| `--crop-xyzwhd` | Process only a sub-region: `x y z w h d` in fullres input coordinates. |
+| `--pred-dt` | Path to a surface prediction zarr. Adds a `pred_dt` distance-to-surface channel to the output. |
+| `--device` | Compute device (default: `cuda` if available, otherwise `cpu`). |
+| `--chunk-z` | Zarr chunk size along Z in the output (default 32). |
+| `--chunk-yx` | Zarr chunk size along Y and X in the output (default 32). |
+
+#### Output format
+
+The output zarr has shape `(C, Z, Y, X)` with dtype uint8, where C is 4
+(cos, grad_mag, nx, ny) or 5 if `--pred-dt` is given. The zarr covers the
+full scaled volume dimensions; data is written at the crop offset (unprocessed
+regions are zero-filled).
+
+Metadata is stored in `preprocess_params` with keys: `scaledown`,
+`grad_mag_encode_scale` (1000), `channels`, `crop_xyzwhd`, `source`
+("predict3d"). This is directly consumed by `fit_data.load_3d()`.
+
+#### Memory considerations
+
+The accumulator is a disk-backed numpy memmap at **downscaled** resolution
+(crop dims // scaledown). Input tiles are read lazily from the zarr — the
+full crop is never loaded into RAM.
+
+| Component            | RAM usage (2000³ crop, sd=4) |
+|----------------------|-----------------------------|
+| Input                | ~0 (lazy zarr reads)         |
+| Memmap accumulator   | ~4.5 GiB (fits in page cache)|
+| Post-processing      | ~0.5 GiB (Z-chunked)         |
+| **Total**            | **~5 GiB**                   |
+
+For very large volumes the memmap spills to disk (e.g. ~1.1 TiB temp for a
+full 2 TB volume at sd=1), but RSS stays at a few GiB. The process sets
+`oom_score_adj=1000` so the OOM killer targets it before the parent session.
 
 
 ---

@@ -4,6 +4,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from pathlib import Path
+import tempfile
 import threading
 import time
 
@@ -619,38 +620,125 @@ def _compute_pred_dt_channel(
 # 3D UNet predict mode
 # ---------------------------------------------------------------------------
 
+def _read_tile_zarr(
+	zarr_arr,
+	volume_shape: tuple[int, int, int],
+	crop_offset: tuple[int, int, int],
+	tz: int, ty: int, tx: int,
+	tile_size: int,
+	border: int,
+) -> np.ndarray:
+	"""Read a single tile from zarr, using reflect-padding only at volume boundaries.
+
+	The tile grid is defined in padded-crop space (crop + border on each side).
+	We map tile coords back to zarr coords: zarr_coord = tile_coord + crop_offset - border.
+	Where zarr coords fall outside [0, vol_dim), we reflect-pad.
+	"""
+	Zv, Yv, Xv = volume_shape
+	oz, oy, ox = crop_offset
+
+	# Map tile position in padded space to zarr coordinates
+	src_z0 = tz + oz - border
+	src_y0 = ty + oy - border
+	src_x0 = tx + ox - border
+
+	src_z1 = src_z0 + tile_size
+	src_y1 = src_y0 + tile_size
+	src_x1 = src_x0 + tile_size
+
+	# Clamp to valid zarr range
+	rz0 = max(0, src_z0)
+	ry0 = max(0, src_y0)
+	rx0 = max(0, src_x0)
+	rz1 = min(Zv, src_z1)
+	ry1 = min(Yv, src_y1)
+	rx1 = min(Xv, src_x1)
+
+	if rz1 <= rz0 or ry1 <= ry0 or rx1 <= rx0:
+		return np.zeros((tile_size, tile_size, tile_size), dtype=np.uint8)
+
+	chunk = np.asarray(zarr_arr[rz0:rz1, ry0:ry1, rx0:rx1])
+
+	# Pad if we went out of bounds
+	pad_before = (rz0 - src_z0, ry0 - src_y0, rx0 - src_x0)
+	pad_after = (src_z1 - rz1, src_y1 - ry1, src_x1 - rx1)
+	needs_pad = any(p > 0 for p in pad_before + pad_after)
+	if needs_pad:
+		chunk = np.pad(
+			chunk,
+			[(pad_before[0], pad_after[0]),
+			 (pad_before[1], pad_after[1]),
+			 (pad_before[2], pad_after[2])],
+			mode="reflect",
+		)
+	return chunk
+
+
 def _infer_tiled_3d(
 	model,
-	volume_u8: np.ndarray,
+	zarr_arr,
 	*,
+	crop_slices: tuple[int, int, int, int, int, int],
 	device: torch.device,
 	tile_size: int = 256,
 	overlap: int = 64,
 	border: int = 16,
 	out_channels: int = 8,
+	scaledown: int = 1,
 ) -> np.ndarray:
 	"""Run 3D UNet inference on a volume using overlapping tiles with linear blending.
 
+	Lazy zarr reads per tile, memmap accumulator on disk, sigmoid + optional
+	downscale applied per tile on GPU.
+
 	Args:
 		model: 3D UNet model in eval mode.
-		volume_u8: (Z, Y, X) uint8 numpy array.
+		zarr_arr: zarr array (Z, Y, X), read lazily per tile.
+		crop_slices: (z0, z1, y0, y1, x0, x1) crop region in zarr coords.
 		device: torch device for inference.
 		tile_size: cube tile edge length.
 		overlap: tile overlap in voxels.
 		border: hard-discard border at tile edges.
 		out_channels: number of model output channels.
+		scaledown: spatial downscale factor applied per tile (must divide
+			tile_size, stride, and border evenly).
 
 	Returns:
-		(out_channels, Z, Y, X) float32 numpy array of raw logits.
+		(out_channels, Z_out, Y_out, X_out) float32 numpy array of
+		sigmoid-activated (and optionally downscaled) predictions.
 	"""
-	Z0, Y0, X0 = volume_u8.shape
+	import torch.nn.functional as F
 
-	pad0 = max(0, int(border))
-	if pad0 > 0:
-		volume_u8 = np.pad(volume_u8, pad0, mode="reflect")
-	Z, Y, X = volume_u8.shape
+	z0, z1, y0, y1, x0, x1 = crop_slices
+	nz, ny, nx = z1 - z0, y1 - y0, x1 - x0
+	volume_shape = tuple(int(v) for v in zarr_arr.shape)
 
+	sd = max(1, int(scaledown))
 	stride = max(1, tile_size - overlap)
+
+	# Validate alignment
+	if sd > 1:
+		for name, val in [("tile_size", tile_size), ("stride", stride), ("border", border)]:
+			if val % sd != 0:
+				raise ValueError(f"{name}={val} must be divisible by scaledown={sd}")
+
+	# Padded crop dimensions (border on each side)
+	pad0 = max(0, int(border))
+	Zp = nz + 2 * pad0
+	Yp = ny + 2 * pad0
+	Xp = nx + 2 * pad0
+
+	# Round up to scaledown-multiple
+	if sd > 1:
+		Zp = ((Zp + sd - 1) // sd) * sd
+		Yp = ((Yp + sd - 1) // sd) * sd
+		Xp = ((Xp + sd - 1) // sd) * sd
+
+	# Output dimensions
+	Zo = Zp // sd
+	Yo = Yp // sd
+	Xo = Xp // sd
+
 	ov_eff = max(0, overlap - 2 * border)
 
 	def _build_positions(size, tile, s):
@@ -662,9 +750,9 @@ def _infer_tiled_3d(
 			positions.append(last)
 		return positions
 
-	z_positions = _build_positions(Z, tile_size, stride)
-	y_positions = _build_positions(Y, tile_size, stride)
-	x_positions = _build_positions(X, tile_size, stride)
+	z_positions = _build_positions(Zp, tile_size, stride)
+	y_positions = _build_positions(Yp, tile_size, stride)
+	x_positions = _build_positions(Xp, tile_size, stride)
 
 	def _blend_ramp(length, ov, b):
 		ramp = np.zeros(length, dtype=np.float32)
@@ -685,35 +773,98 @@ def _infer_tiled_3d(
 		ramp[core_start:core_end] = core
 		return ramp
 
-	acc = np.zeros((out_channels, Z, Y, X), dtype=np.float32)
-	wsum = np.zeros((1, Z, Y, X), dtype=np.float32)
+	# Precompute full-tile blend weight on GPU
+	rz_full = _blend_ramp(tile_size, ov_eff, border)
+	ry_full = _blend_ramp(tile_size, ov_eff, border)
+	rx_full = _blend_ramp(tile_size, ov_eff, border)
+	w_full = torch.from_numpy(
+		rz_full[:, None, None] * ry_full[None, :, None] * rx_full[None, None, :]
+	).to(device)  # (tile, tile, tile)
+
+	# Precompute downscaled weight (or full-res weight) as numpy for accumulation
+	if sd > 1:
+		w_lr = F.avg_pool3d(
+			w_full.unsqueeze(0).unsqueeze(0), sd, sd
+		).squeeze(0).squeeze(0).cpu().numpy()  # (tile//sd, tile//sd, tile//sd)
+	else:
+		w_lr = w_full.cpu().numpy()  # (tile, tile, tile)
+
+	# Memmap accumulators
+	acc_file = tempfile.NamedTemporaryFile(suffix=".acc", delete=False)
+	wsum_file = tempfile.NamedTemporaryFile(suffix=".wsum", delete=False)
+	acc_path = acc_file.name
+	wsum_path = wsum_file.name
+	acc_file.close()
+	wsum_file.close()
+
+	acc_shape = (out_channels, Zo, Yo, Xo)
+	wsum_shape = (1, Zo, Yo, Xo)
+	print(
+		f"[predict3d] memmap accumulator shape={acc_shape} "
+		f"({np.prod(acc_shape) * 4 / (1024**3):.2f} GiB) + wsum "
+		f"({np.prod(wsum_shape) * 4 / (1024**3):.2f} GiB)",
+		flush=True,
+	)
+	acc = np.memmap(acc_path, dtype=np.float32, mode="w+", shape=acc_shape)
+	wsum = np.memmap(wsum_path, dtype=np.float32, mode="w+", shape=wsum_shape)
+
+	# Delete temp files immediately — memmap keeps them open, OS cleans up after
+	try:
+		os.unlink(acc_path)
+		os.unlink(wsum_path)
+	except OSError:
+		pass
 
 	total_tiles = len(z_positions) * len(y_positions) * len(x_positions)
 	done = 0
 	t0 = time.time()
+	crop_offset = (z0, y0, x0)
 
 	for tz in z_positions:
 		for ty in y_positions:
 			for tx in x_positions:
-				tz1 = min(tz + tile_size, Z)
-				ty1 = min(ty + tile_size, Y)
-				tx1 = min(tx + tile_size, X)
-				pz, py, px = tz1 - tz, ty1 - ty, tx1 - tx
+				# Read tile from zarr (lazy)
+				tile_np = _read_tile_zarr(
+					zarr_arr, volume_shape, crop_offset,
+					tz, ty, tx, tile_size, border,
+				)
+				if tile_np.dtype == np.uint16:
+					tile_np = (tile_np // 257).astype(np.uint8)
 
-				tile_np = volume_u8[tz:tz1, ty:ty1, tx:tx1].astype(np.float32) / 255.0
-				tile_t = torch.from_numpy(tile_np).unsqueeze(0).unsqueeze(0)  # (1, 1, pz, py, px)
+				tile_f = tile_np.astype(np.float32) / 255.0
+				tile_t = torch.from_numpy(tile_f).unsqueeze(0).unsqueeze(0).to(device)
 
 				with torch.inference_mode(), torch.autocast(device_type=device.type):
-					pred = model(tile_t.to(device))
-				pred_np = pred.float().cpu().numpy()[0]  # (C, pz, py, px)
+					pred = model(tile_t)
+				# Model returns dict {"output": tensor} or plain tensor
+				if isinstance(pred, dict):
+					pred = pred["output"]
+				# Sigmoid on GPU
+				pred = torch.sigmoid(pred.float())  # (1, C, tz, ty, tx)
 
-				rz = _blend_ramp(pz, ov_eff, border)
-				ry = _blend_ramp(py, ov_eff, border)
-				rx = _blend_ramp(px, ov_eff, border)
-				w = rz[:, None, None] * ry[None, :, None] * rx[None, None, :]
+				# Apply blend weight on GPU
+				pred_w = pred[0] * w_full  # (C, tz, ty, tx)
 
-				acc[:, tz:tz1, ty:ty1, tx:tx1] += pred_np * w[None]
-				wsum[0, tz:tz1, ty:ty1, tx:tx1] += w
+				# Downscale on GPU if needed
+				if sd > 1:
+					pred_w = F.avg_pool3d(pred_w.unsqueeze(0), sd, sd)[0]  # (C, tz/sd, ty/sd, tx/sd)
+
+				pred_np = pred_w.cpu().numpy()  # (C, tz_out, ty_out, tx_out)
+
+				# Accumulator coords in output space
+				azl = tz // sd
+				ayl = ty // sd
+				axl = tx // sd
+				ts_out = tile_size // sd
+				azr = min(azl + ts_out, Zo)
+				ayr = min(ayl + ts_out, Yo)
+				axr = min(axl + ts_out, Xo)
+				pzo = azr - azl
+				pyo = ayr - ayl
+				pxo = axr - axl
+
+				acc[:, azl:azr, ayl:ayr, axl:axr] += pred_np[:, :pzo, :pyo, :pxo]
+				wsum[0, azl:azr, ayl:ayr, axl:axr] += w_lr[:pzo, :pyo, :pxo]
 
 				done += 1
 				elapsed = max(1e-6, time.time() - t0)
@@ -733,9 +884,18 @@ def _infer_tiled_3d(
 	print("", flush=True)
 	print(f"[predict3d] inference done in {time.time() - t0:.1f}s ({total_tiles} tiles)", flush=True)
 
-	result = acc / np.maximum(wsum, 1e-7)
-	if pad0 > 0:
-		result = result[:, pad0:pad0 + Z0, pad0:pad0 + Y0, pad0:pad0 + X0]
+	# Normalize
+	acc /= np.maximum(wsum, 1e-7)
+
+	# Trim padding (border // sd on each side) back to crop-sized output
+	b_out = pad0 // sd
+	nz_out = nz // sd if sd > 1 else nz
+	ny_out = ny // sd if sd > 1 else ny
+	nx_out = nx // sd if sd > 1 else nx
+	result = np.array(acc[:, b_out:b_out + nz_out, b_out:b_out + ny_out, b_out:b_out + nx_out])
+
+	# Clean up memmaps
+	del acc, wsum
 
 	return result
 
@@ -759,8 +919,10 @@ def run_preprocess_3d(
 
 	Output format matches fit_data.load_3d(): channels [cos, grad_mag, nx, ny]
 	(+ optional pred_dt) as uint8 with preprocess_params metadata.
+
+	Memory-efficient: reads tiles lazily from zarr, accumulates in a
+	disk-backed memmap, and post-processes in Z-chunks.
 	"""
-	import torch.nn.functional as F
 	from train_unet_3d import build_model as build_model_3d
 
 	a_in = zarr.open(str(input_path), mode="r")
@@ -787,84 +949,26 @@ def run_preprocess_3d(
 	model = build_model_3d(tile_size, str(torch_device), weights=str(unet3d_checkpoint))
 	model.eval()
 
-	# Read input volume
 	print(
 		f"[predict3d] input={input_path} shape={sh} "
 		f"crop=({x0},{y0},{z0},{nx_dim},{ny},{nz}) scaledown={scaledown}",
 		flush=True,
 	)
-	volume_u8 = np.asarray(a_in[z0:z1, y0:y1, x0:x1])
-	if volume_u8.dtype == np.uint16:
-		volume_u8 = (volume_u8 // 257).astype(np.uint8)
-	elif volume_u8.dtype != np.uint8:
-		volume_u8 = volume_u8.astype(np.uint8)
 
-	# Memory estimate for accumulator
-	nz_p = nz + 2 * border
-	ny_p = ny + 2 * border
-	nx_p = nx_dim + 2 * border
-	acc_gb = 9.0 * nz_p * ny_p * nx_p * 4.0 / (1024.0 ** 3)
-	print(f"[predict3d] padded volume ({nz_p},{ny_p},{nx_p}), accumulator ~{acc_gb:.1f} GiB", flush=True)
-
-	# Run tiled 3D inference
-	logits = _infer_tiled_3d(
-		model, volume_u8,
+	# Run tiled 3D inference — lazy zarr reads, memmap accumulator, per-tile sigmoid+ds
+	pred = _infer_tiled_3d(
+		model, a_in,
+		crop_slices=(z0, z1, y0, y1, x0, x1),
 		device=torch_device,
 		tile_size=tile_size,
 		overlap=overlap,
 		border=border,
-	)  # (8, nz, ny, nx_dim) float32
-	del volume_u8
+		scaledown=scaledown,
+	)  # (8, out_nz, out_ny, out_nx) float32, sigmoid already applied
+	del model
+	torch.cuda.empty_cache()
 
-	# Sigmoid activation
-	print("[predict3d] applying sigmoid...", flush=True)
-	pred = 1.0 / (1.0 + np.exp(-np.clip(logits, -88.0, 88.0)))
-	del logits
-
-	# Downsample
-	if scaledown > 1:
-		ds_z = nz // scaledown
-		ds_y = ny // scaledown
-		ds_x = nx_dim // scaledown
-		print(f"[predict3d] downsampling {scaledown}x: ({nz},{ny},{nx_dim}) -> ({ds_z},{ds_y},{ds_x})", flush=True)
-		pred_ds = np.empty((8, ds_z, ds_y, ds_x), dtype=np.float32)
-		chunk = 64
-		for zi in range(0, nz, chunk * scaledown):
-			ze = min(nz, zi + chunk * scaledown)
-			block = torch.from_numpy(pred[None, :, zi:ze])  # (1, 8, cz, ny, nx)
-			block_ds = F.avg_pool3d(block, scaledown, scaledown).numpy()[0]
-			out_zi = zi // scaledown
-			pred_ds[:, out_zi:out_zi + block_ds.shape[1]] = block_ds
-		del pred
-		pred = pred_ds
-		out_nz, out_ny, out_nx = ds_z, ds_y, ds_x
-	else:
-		out_nz, out_ny, out_nx = nz, ny, nx_dim
-
-	# Convert 8 channels -> 4 output channels via normal estimation
-	print("[predict3d] estimating normals...", flush=True)
-	cos = pred[0]
-	grad_mag = pred[1]
-	dir0_z, dir1_z = pred[2], pred[3]
-	dir0_y, dir1_y = pred[4], pred[5]
-	dir0_x, dir1_x = pred[6], pred[7]
-	del pred
-
-	_, _, _, nx_n, ny_n, nz_n = _estimate_normal(
-		dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x)
-
-	# Flip to +z hemisphere
-	flip = np.where(nz_n < 0, -1.0, 1.0)
-	nx_n = nx_n * flip
-	ny_n = ny_n * flip
-
-	# Encode to uint8
-	cos_u8 = np.clip(cos * 255.0, 0.0, 255.0).astype(np.uint8)
-	gm_u8 = np.clip(grad_mag * 1000.0, 0.0, 255.0).astype(np.uint8)
-	nx_u8 = np.clip(np.round(nx_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
-	ny_u8 = np.clip(np.round(ny_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
-	del cos, grad_mag, dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x
-	del nx_n, ny_n, nz_n
+	out_nz, out_ny, out_nx = pred.shape[1], pred.shape[2], pred.shape[3]
 
 	# Output zarr — full scaled volume dimensions
 	full_out_z = _ds_size(sh[0], scaledown)
@@ -929,10 +1033,36 @@ def run_preprocess_3d(
 		flush=True,
 	)
 
-	arr[0, oz0:oz1, oy0:oy1, ox0:ox1] = cos_u8[:wz, :wy, :wx]
-	arr[1, oz0:oz1, oy0:oy1, ox0:ox1] = gm_u8[:wz, :wy, :wx]
-	arr[2, oz0:oz1, oy0:oy1, ox0:ox1] = nx_u8[:wz, :wy, :wx]
-	arr[3, oz0:oz1, oy0:oy1, ox0:ox1] = ny_u8[:wz, :wy, :wx]
+	# Chunked post-processing: iterate Z-slabs to avoid full-volume temporaries
+	post_chunk_z = max(1, chunk_z)
+	for zs in range(0, wz, post_chunk_z):
+		ze = min(wz, zs + post_chunk_z)
+		# Channels 0-1: cos, grad_mag — simple uint8 encode
+		cos_slab = pred[0, zs:ze, :wy, :wx]
+		gm_slab = pred[1, zs:ze, :wy, :wx]
+		arr[0, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
+			cos_slab * 255.0, 0.0, 255.0).astype(np.uint8)
+		arr[1, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
+			gm_slab * 1000.0, 0.0, 255.0).astype(np.uint8)
+
+		# Channels 2-7: dir channels -> normal estimation -> nx, ny uint8
+		d0z = pred[2, zs:ze, :wy, :wx]
+		d1z = pred[3, zs:ze, :wy, :wx]
+		d0y = pred[4, zs:ze, :wy, :wx]
+		d1y = pred[5, zs:ze, :wy, :wx]
+		d0x = pred[6, zs:ze, :wy, :wx]
+		d1x = pred[7, zs:ze, :wy, :wx]
+		_, _, _, nx_n, ny_n, nz_n = _estimate_normal(d0z, d1z, d0y, d1y, d0x, d1x)
+		# Flip to +z hemisphere
+		flip = np.where(nz_n < 0, -1.0, 1.0)
+		nx_n = nx_n * flip
+		ny_n = ny_n * flip
+		arr[2, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
+			np.round(nx_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
+		arr[3, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
+			np.round(ny_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
+
+	del pred
 
 	if pred_dt_path:
 		pred_dt_ch = channel_names.index("pred_dt")
@@ -1535,21 +1665,56 @@ def run_integrate_directions(
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
+	class _Fmt(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+		pass
+
 	p = argparse.ArgumentParser(
-		description="Run tiled UNet cos inference on an OME-Zarr volume and write 8-bit OME-Zarr."
+		description="Run tiled 2D UNet inference on an OME-Zarr volume (per-axis slicing).",
+		epilog=(
+			"─── integrate mode ───────────────────────────────────────────────\n"
+			"Fuse 3-axis 2D results into cos/grad_mag/nx/ny.\n"
+			"  preprocess_cos_omezarr.py integrate [options]\n"
+			"\n"
+			"  --z-volume PATH       Axis-z preprocessed zarr (reference shape). Required.\n"
+			"  --y-volume PATH       Axis-y preprocessed zarr. Required.\n"
+			"  --x-volume PATH       Axis-x preprocessed zarr. Required.\n"
+			"  --output PATH         Output zarr path. Required.\n"
+			"  --batch-size N        Z-slices per batch for resize (default: 32).\n"
+			"  --pred-dt PATH        Surface prediction zarr for distance-to-skeleton channel.\n"
+			"\n"
+			"─── predict3d mode ───────────────────────────────────────────────\n"
+			"3D UNet single-pass inference → cos/grad_mag/nx/ny zarr.\n"
+			"Uses CUDA by default when available.\n"
+			"  preprocess_cos_omezarr.py predict3d [options]\n"
+			"\n"
+			"  --input PATH          Input zarr array (3D ZYX). Required.\n"
+			"  --output PATH         Output zarr path. Required.\n"
+			"  --unet-checkpoint P   3D UNet checkpoint (.pt). Required.\n"
+			"  --tile-size N         Tile cube size (default: 256).\n"
+			"  --overlap N           Tile overlap in voxels (default: 64).\n"
+			"  --border N            Hard discard border at tile edges (default: 16).\n"
+			"  --scaledown N         Output downsample factor (default: 4).\n"
+			"  --crop X Y Z W H D   Crop region in absolute input coordinates.\n"
+			"  --pred-dt PATH        Prediction zarr for distance-to-surface channel.\n"
+			"  --device DEV          Device, e.g. cuda or cpu (default: cuda if available).\n"
+			"  --chunk-z N           Output zarr chunk size along Z (default: 32).\n"
+			"  --chunk-yx N          Output zarr chunk size for Y and X (default: 32)."
+		),
+		formatter_class=_Fmt,
 	)
 	p.add_argument("--input", required=True, help="Input OME-Zarr array path (must be Z,Y,X array).")
 	p.add_argument("--output", required=True, help="Output OME-Zarr group path.")
 	p.add_argument("--unet-checkpoint", required=True, help="UNet checkpoint path (.pt).")
-	p.add_argument("--device", default=None, help='Device, e.g. "cuda" or "cpu".')
+	p.add_argument("--device", default=None, help='Device, e.g. "cuda" or "cpu" (default: cuda if available).')
 	p.add_argument("--axis", choices=["z", "y", "x"], default="z",
-		help="Dimension to slice along (default: z). The 2D plane perpendicular to this axis is processed by the UNet.")
-	p.add_argument("--crop-xyzwhd", "--crop", dest="crop_xyzwhd", type=int, nargs=6, default=None, help="Crop in absolute input coordinates: x y z w h d.")
+		help="Dimension to slice along.")
+	p.add_argument("--crop", "--crop-xyzwhd", dest="crop_xyzwhd", type=int, nargs=6, default=None,
+		metavar=("X", "Y", "Z", "W", "H", "D"), help="Crop in absolute input coordinates: x y z w h d.")
 	p.add_argument("--tile-size", type=int, default=2048, help="Tile size.")
 	p.add_argument("--overlap", type=int, default=128, help="Tile overlap.")
 	p.add_argument("--border", type=int, default=32, help="Tile border discard width.")
 	p.add_argument("--scaledown", type=int, default=4,
-		help="Uniform downscale factor for all three dimensions (default: 4).")
+		help="Uniform downscale factor for all three dimensions.")
 	p.add_argument("--chunk-z", "--chunk-slice", dest="chunk_z", type=int, default=32,
 		help="Output chunk size along the slice axis.")
 	p.add_argument("--chunk-yx", "--chunk-plane", dest="chunk_yx", type=int, default=32,
@@ -1578,13 +1743,14 @@ def main(argv: list[str] | None = None) -> int:
 
 def main_integrate(argv: list[str] | None = None) -> int:
 	p = argparse.ArgumentParser(
-		description="Integrate direction channels from axis-y / axis-x preprocessed volumes into the axis-z reference volume."
+		description="Integrate direction channels from axis-y / axis-x preprocessed volumes into the axis-z reference volume.",
+		formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 	)
 	p.add_argument("--z-volume", required=True, help="Axis-z preprocessed zarr (reference shape).")
 	p.add_argument("--y-volume", required=True, help="Axis-y preprocessed zarr.")
 	p.add_argument("--x-volume", required=True, help="Axis-x preprocessed zarr.")
 	p.add_argument("--output", required=True, help="Output zarr path.")
-	p.add_argument("--batch-size", type=int, default=32, help="Z-slices per batch for resize (default: 32).")
+	p.add_argument("--batch-size", type=int, default=32, help="Z-slices per batch for resize.")
 	p.add_argument("--pred-dt", default=None, help="Surface prediction zarr for distance-to-skeleton channel.")
 	args = p.parse_args(argv)
 
@@ -1600,32 +1766,40 @@ def main_integrate(argv: list[str] | None = None) -> int:
 
 
 def main_predict3d(argv: list[str] | None = None) -> int:
+	# Make this process the OOM killer's first target so the parent session survives
+	try:
+		with open("/proc/self/oom_score_adj", "w") as f:
+			f.write("1000")
+	except (OSError, PermissionError):
+		pass
+
 	p = argparse.ArgumentParser(
-		description="Run 3D UNet inference on a volume and write preprocessed zarr with cos/grad_mag/nx/ny channels."
+		description="Run 3D UNet inference on a volume and write preprocessed zarr with cos/grad_mag/nx/ny channels.",
+		formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 	)
 	p.add_argument("--input", required=True, help="Input zarr array (3D ZYX).")
 	p.add_argument("--output", required=True, help="Output zarr path.")
-	p.add_argument("--unet3d-checkpoint", required=True, help="3D UNet checkpoint (.pt).")
-	p.add_argument("--patch-size", type=int, default=256,
-		help="Tile size (default: 256, must be compatible with model architecture).")
-	p.add_argument("--overlap", type=int, default=64, help="Tile overlap (default: 64).")
-	p.add_argument("--border", type=int, default=16, help="Hard discard border (default: 16).")
-	p.add_argument("--scaledown", type=int, default=4, help="Output downsample factor (default: 4).")
-	p.add_argument("--crop-xyzwhd", "--crop", dest="crop_xyzwhd", type=int, nargs=6, default=None,
-		help="Crop region: x y z w h d.")
+	p.add_argument("--unet-checkpoint", required=True, help="3D UNet checkpoint (.pt).")
+	p.add_argument("--tile-size", type=int, default=256,
+		help="Tile size, must be compatible with model architecture.")
+	p.add_argument("--overlap", type=int, default=64, help="Tile overlap in voxels.")
+	p.add_argument("--border", type=int, default=16, help="Hard discard border at tile edges.")
+	p.add_argument("--scaledown", type=int, default=4, help="Output downsample factor.")
+	p.add_argument("--crop", "--crop-xyzwhd", dest="crop_xyzwhd", type=int, nargs=6, default=None,
+		metavar=("X", "Y", "Z", "W", "H", "D"), help="Crop region: x y z w h d.")
 	p.add_argument("--pred-dt", default=None, help="Prediction zarr for distance-to-surface channel.")
-	p.add_argument("--device", default=None, help='Device, e.g. "cuda" or "cpu".')
-	p.add_argument("--chunk-z", type=int, default=32, help="Output chunk size along Z.")
-	p.add_argument("--chunk-yx", type=int, default=32, help="Output chunk size for Y and X.")
+	p.add_argument("--device", default=None, help='Device, e.g. "cuda" or "cpu" (default: cuda if available).')
+	p.add_argument("--chunk-z", type=int, default=32, help="Output zarr chunk size along Z.")
+	p.add_argument("--chunk-yx", type=int, default=32, help="Output zarr chunk size for Y and X.")
 	args = p.parse_args(argv)
 
 	run_preprocess_3d(
 		input_path=str(args.input),
 		output_path=str(args.output),
-		unet3d_checkpoint=str(args.unet3d_checkpoint),
+		unet3d_checkpoint=str(args.unet_checkpoint),
 		device=args.device,
 		crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
-		tile_size=int(args.patch_size),
+		tile_size=int(args.tile_size),
 		overlap=int(args.overlap),
 		border=int(args.border),
 		scaledown=int(args.scaledown),
@@ -1638,6 +1812,8 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
 	import sys
+	if "--help" in sys.argv or "-h" in sys.argv:
+		raise SystemExit(main(["--help"]))
 	if len(sys.argv) > 1 and sys.argv[1] == "integrate":
 		raise SystemExit(main_integrate(sys.argv[2:]))
 	if len(sys.argv) > 1 and sys.argv[1] == "predict3d":

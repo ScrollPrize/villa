@@ -27,6 +27,38 @@ PyTorch-based optimizer that fits multi-winding cylindrical meshes to preprocess
 | `fit_service.py` | HTTP REST API for VC3D integration (/optimize, /status, /stop, /export_vis). mDNS discovery via ~/.fit_services/*.json. |
 | `fit.py` | Main fitting orchestrator — loads data/model/config, runs optimizer stages, manages losses. |
 
+### Preprocessing Modes (`preprocess_cos_omezarr.py`)
+
+Three CLI modes, all producing uint8 zarr with `preprocess_params` metadata for `fit_data.load_3d()`:
+
+**Default (2D per-axis)** — Runs a 2D UNet on each slice along a chosen axis (z/y/x). Produces 5 channels: cos, grad_mag, dir0, dir1, valid. Must be run 3 times (once per axis) then fused with `integrate`.
+
+```
+python lasagna/preprocess_cos_omezarr.py \
+    --input volume.zarr --output preprocessed_z.zarr \
+    --unet-checkpoint model_2d.pt --axis z
+```
+
+**`integrate`** — Fuses three 2D per-axis volumes into a single 4-channel output (cos, grad_mag, nx, ny) via `_estimate_normal()` weighted normal estimation. Optionally adds a pred_dt channel.
+
+```
+python lasagna/preprocess_cos_omezarr.py integrate \
+    --z-volume preprocessed_z.zarr --y-volume preprocessed_y.zarr \
+    --x-volume preprocessed_x.zarr --output fused.zarr
+```
+
+**`predict3d`** — Single-pass 3D UNet inference. Predicts all 8 channels (cos, grad_mag, 3x2 dir encoding) at once, then converts to 4-channel output (cos, grad_mag, nx, ny) matching the `integrate` output format. Replaces the 3-axis + fusion pipeline. Uses CUDA by default when available.
+
+```
+python lasagna/preprocess_cos_omezarr.py predict3d \
+    --input volume.zarr --output preprocessed.zarr \
+    --unet-checkpoint model_3d.pt
+```
+
+Key `predict3d` options: `--tile-size` (tile cube size), `--overlap` (tile overlap), `--border` (hard-discard border), `--scaledown` (output downsample factor), `--crop-xyzwhd` (process a sub-region), `--pred-dt` (add distance-to-surface channel).
+
+The 3D pipeline: tiled inference with 3D linear blending → sigmoid → avg_pool3d downsample → `_estimate_normal()` → uint8 encoding → zarr. The accumulator lives on CPU; for large volumes use `--crop-xyzwhd` to bound memory.
+
 ### Coordinate Spaces
 
 - **Fullres**: raw voxel coordinates from the original volume
