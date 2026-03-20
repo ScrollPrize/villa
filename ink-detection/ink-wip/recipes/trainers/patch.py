@@ -17,6 +17,7 @@ from ink.recipes.trainers.support.run_state import (
 )
 from ink.core.types import Batch, DataBundle, EvalReport
 from ink.recipes.losses.reporting import resolve_train_output as resolve_train_loss_output
+from ink.recipes.metrics import flatten_eval_report
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,11 @@ class PatchTraining:
     experiment: Any
     train_loader: Any
     val_loader: Any
+
+    def _logged_eval_report(self, report: EvalReport) -> EvalReport:
+        evaluator = getattr(self.experiment, "evaluator", None)
+        stage_prefix = getattr(evaluator, "stage_prefix", "")
+        return flatten_eval_report(report, stage_prefix=stage_prefix)
 
     def run_step(self, batch) -> TrainStepOutput:
         if not isinstance(batch, Batch):
@@ -227,9 +233,10 @@ class PatchTraining:
                     wandb_session.log_train_epoch(epoch, train_epoch.metrics)
 
                 if evaluator is not None and ((epoch + 1) % eval_every) == 0:
-                    report = evaluator.evaluate(model, self.val_loader, device=device)
-                    if not isinstance(report, EvalReport):
+                    raw_report = evaluator.evaluate(model, self.val_loader, device=device)
+                    if not isinstance(raw_report, EvalReport):
                         raise TypeError("evaluator must return EvalReport")
+                    report = self._logged_eval_report(raw_report)
 
                     eval_epoch = EvalEpochResult(epoch=epoch, report=report)
                     eval_epochs.append(eval_epoch)

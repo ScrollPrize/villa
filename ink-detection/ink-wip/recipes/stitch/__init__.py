@@ -26,12 +26,11 @@ from ink.recipes.stitch.runtime import (
     StitchRuntime,
     StitchRuntimeRecipe,
     TrainStitchRuntime,
-    accumulate_val,
     compute_stitched_component_loss,
     compute_train_stitch_loss,
-    finalize_validation_epoch,
     run_train_stitch_pass,
 )
+from ink.recipes.stitch.store import ZarrStitchStore
 
 __all__ = [
     "EvalStitchConfig",
@@ -47,14 +46,13 @@ __all__ = [
     "TrainStitchLossConfig",
     "TrainStitchRuntime",
     "TrainStitchVizConfig",
+    "ZarrStitchStore",
     "accumulate_to_buffers",
-    "accumulate_val",
     "allocate_segment_buffers",
     "build_segment_roi_meta",
     "compose_segment_from_roi_buffers",
     "compute_stitched_component_loss",
     "compute_train_stitch_loss",
-    "finalize_validation_epoch",
     "gaussian_weights",
     "normalize_component_key",
     "resolve_buffer_crop",

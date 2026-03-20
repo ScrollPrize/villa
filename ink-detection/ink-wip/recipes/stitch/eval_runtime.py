@@ -4,9 +4,6 @@ import importlib
 from collections.abc import Callable
 from typing import Any
 
-import numpy as np
-import torch
-
 from ink.recipes.stitch.ops import compose_segment_from_roi_buffers
 
 
@@ -69,23 +66,6 @@ def accumulate_val(
         )
 
 
-def sync_eval_buffers_distributed(owner, *, state, model) -> bool:
-    execution = _owner_execution(owner)
-    if int(execution.distributed_world_size) <= 1:
-        return False
-
-    device = model.device
-    for roi_buffers in state.roi_buffers_by_split["eval"].values():
-        for pred_buf, count_buf, _offset in roi_buffers:
-            pred_tensor = torch.from_numpy(np.ascontiguousarray(pred_buf)).to(device=device, dtype=torch.float32)
-            count_tensor = torch.from_numpy(np.ascontiguousarray(count_buf)).to(device=device, dtype=torch.float32)
-            pred_tensor = execution.reduce_sum(pred_tensor)
-            count_tensor = execution.reduce_sum(count_tensor)
-            pred_buf[...] = pred_tensor.detach().cpu().numpy()
-            count_buf[...] = count_tensor.detach().cpu().numpy()
-    return True
-
-
 def collect_eval_segments_for_logging(*, data, state):
     segment_to_val = {}
     segment_to_val_meta = {}
@@ -113,19 +93,12 @@ def finalize_validation_epoch(owner, model):
         return
 
     sanity_checking = bool(execution.sanity_checking)
-    is_global_zero = bool(execution.is_global_zero)
     train_segment_viz = _resolve_train_segment_viz(
         owner,
         data=data,
         sanity_checking=sanity_checking,
-        is_global_zero=is_global_zero,
         model=model,
     )
-
-    did_sync = sync_eval_buffers_distributed(owner, state=state, model=model)
-    if did_sync and not is_global_zero:
-        state.reset_split_buffers("eval")
-        return
 
     segment_to_val, segment_to_val_meta = collect_eval_segments_for_logging(data=data, state=state)
     _log_eval_media(
@@ -145,12 +118,12 @@ def finalize_validation_epoch(owner, model):
     state.reset_split_buffers("eval")
 
 
-def _resolve_train_segment_viz(owner, *, data, sanity_checking: bool, is_global_zero: bool, model):
+def _resolve_train_segment_viz(owner, *, data, sanity_checking: bool, model):
     if owner.train is None:
         return {}
     if not data.train.viz.enabled:
         return {}
-    if not is_global_zero or sanity_checking:
+    if sanity_checking:
         return {}
     return owner.train.run_viz_pass(model) or {}
 

@@ -35,3 +35,4 @@ class EvalReport:
     summary: dict[str, float]
     by_group: dict[str, dict[str, float]] = field(default_factory=dict)
     by_segment: dict[str, dict[str, float]] = field(default_factory=dict)
+    stages: dict[str, "EvalReport"] = field(default_factory=dict)

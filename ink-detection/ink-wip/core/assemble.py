@@ -32,7 +32,6 @@ def assemble_experiment(experiment: Experiment, bundle: DataBundle, *, logger=No
             runtime=bound_runtime,
             stitch=bound_stitch,
             logger=logger,
-            patch_loss=experiment.loss,
         )
 
     bound_experiment = replace(
