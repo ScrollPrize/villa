@@ -417,6 +417,8 @@ class DinoVitStudentTeacher(nn.Module):
             }
         )
         kwargs.pop("block_chunks")
+        kwargs.pop("model_type", None)
+        kwargs.pop("rope_type", None)
         if backbone_cls is EvaWithChunking:
             kwargs["block_chunks"] = block_chunks
         return backbone_cls(**kwargs)
