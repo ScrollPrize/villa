@@ -38,3 +38,5 @@ ink-detection/tifxyz_dataset/example_creds.json
 ink-detection/tifxyz_dataset/example_config_flat.json
 /ink-detection/scratch
 ink-detection/scratch/config.json
+/ink-detection/external
+/ink-detection/scratch
