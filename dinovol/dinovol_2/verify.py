@@ -28,10 +28,15 @@ def build_verification_report(
         resolved_config["use_amp"] = bool(use_amp)
     trainer = DinoIBOTPretrainer(resolved_config)
     dataloader = trainer.build_dataloader()
-    batch = next(iter(dataloader))
-    report = trainer.verify_train_step(batch, step=step)
-    report["config_path"] = None
-    return report
+    try:
+        batch = next(iter(dataloader))
+        report = trainer.verify_train_step(batch, step=step)
+        report["config_path"] = None
+        return report
+    finally:
+        trainer._close_dataloader(dataloader)
+        trainer._close_auxiliary_datasets()
+        trainer._finish_wandb()
 
 
 def main() -> None:
