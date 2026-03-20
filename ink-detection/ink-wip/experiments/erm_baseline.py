@@ -5,13 +5,12 @@ from ink.recipes.augment import TrainAugment
 from ink.recipes.data.normalization import ClipMaxDiv255Normalization
 from ink.recipes.data.zarr_data import ZarrPatchDataRecipe
 from ink.recipes.eval import (
-    PatchConfusionMetric,
-    PatchRegionBySegmentCountMetric,
-    PatchRegionBySegmentMetric,
-    PatchValidationEvaluator,
-    balanced_accuracy_from_counts,
-    dice_from_counts,
-    loss_values,
+    PatchEval,
+    ValidationEvaluator,
+)
+from ink.recipes.metrics import (
+    BalancedAccuracy,
+    Dice,
 )
 from ink.recipes.losses.dice_bce import DiceBCEBatch
 from ink.recipes.models import ResNet3D
@@ -41,30 +40,14 @@ EXPERIMENT = Experiment(
     augment=TrainAugment(),
     stitch=None,
     trainer=PatchTrainer(),
-    evaluator=PatchValidationEvaluator(
-        metrics=(
-            PatchRegionBySegmentMetric(key="val/loss", value_fn=loss_values),
-            PatchRegionBySegmentCountMetric(key="val/count"),
-            PatchConfusionMetric(
-                key="metrics/val/dice",
-                threshold=0.5,
-                score_fn=dice_from_counts,
+    evaluator=ValidationEvaluator(
+        patch=PatchEval(
+            metrics=(
+                Dice(),
+                BalancedAccuracy(),
+                Dice(threshold=96.0 / 255.0),
+                BalancedAccuracy(threshold=96.0 / 255.0),
             ),
-            PatchConfusionMetric(
-                key="metrics/val/balanced_accuracy",
-                threshold=0.5,
-                score_fn=balanced_accuracy_from_counts,
-            ),
-            PatchConfusionMetric(
-                key="metrics/val/dice_hist_thr_96_255",
-                threshold=96.0 / 255.0,
-                score_fn=dice_from_counts,
-            ),
-            PatchConfusionMetric(
-                key="metrics/val/balanced_accuracy_hist_thr_96_255",
-                threshold=96.0 / 255.0,
-                score_fn=balanced_accuracy_from_counts,
-            ),
-        ),
+        )
     ),
 )

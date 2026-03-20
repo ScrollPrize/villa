@@ -117,18 +117,9 @@ class _StitchState:
 class StitchExecutionContext:
     precision_context_factory: object = _null_precision_context
     sanity_checking: bool = False
-    is_global_zero: bool = True
-    distributed_world_size: int = 1
-    distributed_reduce_sum: object = None
 
     def __post_init__(self) -> None:
         self.sanity_checking = bool(self.sanity_checking)
-        self.is_global_zero = bool(self.is_global_zero)
-        self.distributed_world_size = int(self.distributed_world_size)
-        if self.distributed_world_size < 1:
-            raise ValueError(
-                f"stitch execution distributed_world_size must be >= 1, got {self.distributed_world_size!r}"
-            )
 
     def forward_context(self):
         factory = self.precision_context_factory
@@ -137,12 +128,3 @@ class StitchExecutionContext:
             if context is not None:
                 return context
         return nullcontext()
-
-    def reduce_sum(self, tensor):
-        reducer = self.distributed_reduce_sum
-        if not callable(reducer):
-            raise RuntimeError(
-                "distributed stitch reduction requested but "
-                "execution.distributed_reduce_sum is unavailable"
-            )
-        return reducer(tensor)
