@@ -51,8 +51,8 @@ class TaskSpec:
 
 
 _TASK_SPECS = {
-    "surfaces": TaskSpec("surfaces", validation_count=5, resize_factor=2.0),
-    "ink": TaskSpec("ink", validation_count=5, resize_factor=1.0, supervision_subdir="supervision_masks"),
+    "surfaces": TaskSpec("surfaces", validation_count=10, resize_factor=2.0),
+    "ink": TaskSpec("ink", validation_count=10, resize_factor=1.0, supervision_subdir="supervision_masks"),
 }
 _TASK_NAMES = tuple(_TASK_SPECS)
 
@@ -548,18 +548,20 @@ class TaskEvalRunner:
         self,
         task_name: str,
         step: int,
-        image: torch.Tensor,
-        label: torch.Tensor,
-        prediction_probability: torch.Tensor,
+        rows: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     ) -> Path:
-        image_slice = self._center_slice_image(image)
-        label_slice = self._center_slice_label(label)
-        prediction_slice = self._center_slice_image(prediction_probability.unsqueeze(0))
+        canvas_rows: list[np.ndarray] = []
+        for image, label, prediction_probability in rows:
+            image_slice = self._center_slice_image(image)
+            label_slice = self._center_slice_label(label)
+            prediction_slice = self._center_slice_image(prediction_probability.unsqueeze(0))
 
-        image_rgb = np.stack([_normalize_image(image_slice)] * 3, axis=-1)
-        label_rgb = _colorize_labels(label_slice)
-        prediction_rgb = np.stack([_normalize_image(prediction_slice)] * 3, axis=-1)
-        canvas = np.concatenate([image_rgb, label_rgb, prediction_rgb], axis=1)
+            image_rgb = np.stack([_normalize_image(image_slice)] * 3, axis=-1)
+            label_rgb = _colorize_labels(label_slice)
+            prediction_rgb = np.stack([_normalize_image(prediction_slice)] * 3, axis=-1)
+            canvas_rows.append(np.concatenate([image_rgb, label_rgb, prediction_rgb], axis=1))
+
+        canvas = np.concatenate(canvas_rows, axis=0)
 
         path = self.output_dir / f"{task_name}_step_{step:06d}.png"
         Image.fromarray(canvas).save(path)
@@ -621,8 +623,9 @@ class TaskEvalRunner:
         foreground_dice_total = 0.0
         val_names: list[str] = []
         image_path: Path | None = None
+        validation_image_rows: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-            for val_index, (val_image, val_target, val_name) in enumerate(validation_crops):
+            for val_image, val_target, val_name in validation_crops:
                 val_names.append(val_name)
                 val_batch = val_image.unsqueeze(0).to(self.device, non_blocking=True)
                 val_target_batch = val_target.unsqueeze(0).to(self.device, non_blocking=True)
@@ -632,14 +635,14 @@ class TaskEvalRunner:
                 val_prediction = (val_logits[:, 0] > 0).to(dtype=torch.int64).detach().cpu()
                 val_loss_total += float(val_loss.detach().item())
                 foreground_dice_total += self._foreground_mean_dice(val_prediction, val_target_batch.cpu())
-                if self.rank == 0 and val_index == 0:
-                    image_path = self._save_validation_image(
-                        task_name,
-                        step,
-                        val_image,
-                        val_target,
-                        val_probability[0],
-                    )
+                if self.rank == 0:
+                    validation_image_rows.append((val_image, val_target, val_probability[0]))
+        if self.rank == 0 and validation_image_rows:
+            image_path = self._save_validation_image(
+                task_name,
+                step,
+                validation_image_rows,
+            )
         val_count = max(1, len(validation_crops))
         val_loss_mean_local = val_loss_total / val_count
         foreground_dice_local = foreground_dice_total / val_count
