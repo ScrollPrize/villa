@@ -11,17 +11,13 @@ from ink.core.types import Batch, BatchMeta, DataBundle
 from ink.recipes.data.layout import NestedZarrLayout
 from ink.recipes.data.normalization import ClipMaxDiv255Normalization
 from ink.recipes.data.patching import extract_patch_coordinates
-from ink.recipes.data.samplers import (
-    GroupBalancedSampler,
-    GroupStratifiedSampler,
-    ShuffleSampler,
-)
+from ink.recipes.data.samplers import ShuffleSampler
 from ink.recipes.data.transforms import (
     apply_eval_sample_transforms,
     apply_train_sample_transforms,
     build_joint_transform,
 )
-from ink.recipes.data.zarr import (
+from ink.recipes.data.zarr_io import (
     ZarrSegmentVolume,
     parse_layer_range_value,
     read_label_and_supervision_mask_for_shape,
@@ -48,13 +44,12 @@ def _read_mask_patch(mask, *, y1: int, y2: int, x1: int, x2: int) -> np.ndarray:
 
 
 def _collate_batch(samples) -> Batch:
-    images, labels, valid_masks, xyxys, segment_ids, group_idxs = zip(*samples)
+    images, labels, valid_masks, xyxys, segment_ids = zip(*samples)
 
     meta = BatchMeta(
         segment_ids=[str(segment_id) for segment_id in segment_ids],
         valid_mask=torch.stack([torch.as_tensor(mask) for mask in valid_masks], dim=0),
         patch_xyxy=torch.as_tensor(np.asarray(xyxys), dtype=torch.long),
-        group_idx=torch.as_tensor(group_idxs, dtype=torch.long),
     )
 
     return Batch(
@@ -68,7 +63,6 @@ def _build_samples_from_segments(
     layout: NestedZarrLayout,
     segments,
     segment_ids: tuple[str, ...],
-    group_name_to_idx: dict[str, int],
     in_channels: int,
     patch_size: int,
     tile_size: int,
@@ -77,7 +71,7 @@ def _build_samples_from_segments(
     mask_suffix: str,
     volume_cache: dict[Any, ZarrSegmentVolume],
     mask_cache: dict[Any, tuple[np.ndarray, np.ndarray]],
-) -> list[tuple[str, tuple[int, int], bool, tuple[int, int, int, int], int]]:
+) -> list[tuple[str, tuple[int, int], bool, tuple[int, int, int, int]]]:
     split_samples = []
     for segment_id in segment_ids:
         segment_spec = segments[segment_id]
@@ -112,14 +106,12 @@ def _build_samples_from_segments(
             mask_cache[mask_key] = masks
         label_mask, supervision_mask = masks
 
-        group_idx = int(group_name_to_idx[layout.resolve_group_name(segment_id)])
         split_samples.extend(
             (
                 segment_id,
                 layer_range,
                 reverse_layers,
                 tuple(int(value) for value in xyxy),
-                group_idx,
             )
             for xyxy in extract_patch_coordinates(
                 label_mask,
@@ -166,9 +158,8 @@ class ZarrPatchDataset(Dataset):
                 tuple(int(value) for value in layer_range),
                 bool(reverse_layers),
                 tuple(int(value) for value in xyxy),
-                int(group_idx),
             )
-            for segment_id, layer_range, reverse_layers, xyxy, group_idx in samples
+            for segment_id, layer_range, reverse_layers, xyxy in samples
         ]
 
         self._volume_cache = {} if volume_cache is None else volume_cache
@@ -183,10 +174,6 @@ class ZarrPatchDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self._samples)
-
-    @property
-    def sample_groups(self) -> list[int]:
-        return [group_idx for _, _, _, _, group_idx in self._samples]
 
     def _segment_volume(self, segment_id: str, layer_range, reverse_layers) -> ZarrSegmentVolume:
         segment_id = str(segment_id)
@@ -222,7 +209,7 @@ class ZarrPatchDataset(Dataset):
 
     def _load_item(self, idx):
         idx = int(idx)
-        segment_id, layer_range, reverse_layers, (x1, y1, x2, y2), _group_idx = self._samples[idx]
+        segment_id, layer_range, reverse_layers, (x1, y1, x2, y2) = self._samples[idx]
 
         volume = self._segment_volume(segment_id, layer_range, reverse_layers)
         label_mask, supervision_mask = self._segment_masks(segment_id, image_shape_hw=volume.image_shape_hw)
@@ -250,9 +237,9 @@ class ZarrPatchDataset(Dataset):
     def __getitem__(self, idx):
         idx = int(idx)
         image, label, valid_mask = self._load_item(idx)
-        segment_id, _layer_range, _reverse_layers, (x1, y1, x2, y2), group_idx = self._samples[idx]
+        segment_id, _layer_range, _reverse_layers, (x1, y1, x2, y2) = self._samples[idx]
         xyxy = np.asarray((x1, y1, x2, y2), dtype=np.int64)
-        return image, label, valid_mask, xyxy, segment_id, group_idx
+        return image, label, valid_mask, xyxy, segment_id
 
 
 @dataclass(frozen=True)
@@ -271,7 +258,7 @@ class ZarrPatchDataRecipe:
     valid_batch_size: int | None = None
     num_workers: int = 0
     shuffle: bool = True
-    sampler: ShuffleSampler | GroupBalancedSampler | GroupStratifiedSampler = field(default_factory=ShuffleSampler)
+    sampler: ShuffleSampler = field(default_factory=ShuffleSampler)
     normalization: Any = field(default_factory=ClipMaxDiv255Normalization)
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -286,12 +273,6 @@ class ZarrPatchDataRecipe:
         train_segment_ids = tuple(str(segment_id).strip() for segment_id in self.train_segment_ids)
         val_segment_ids = tuple(str(segment_id).strip() for segment_id in self.val_segment_ids)
         layout = NestedZarrLayout(self.dataset_root)
-        group_name_to_idx = {
-            group_name: idx
-            for idx, group_name in enumerate(
-                sorted({layout.resolve_group_name(segment_id) for segment_id in train_segment_ids + val_segment_ids})
-            )
-        }
         volume_cache: dict[Any, ZarrSegmentVolume] = {}
         mask_cache: dict[Any, tuple[np.ndarray, np.ndarray]] = {}
         split_segment_ids = {
@@ -303,7 +284,6 @@ class ZarrPatchDataRecipe:
                 layout=layout,
                 segments=segments,
                 segment_ids=segment_ids,
-                group_name_to_idx=group_name_to_idx,
                 in_channels=in_channels,
                 patch_size=patch_size,
                 tile_size=tile_size,
@@ -315,17 +295,10 @@ class ZarrPatchDataRecipe:
             )
             for split, segment_ids in split_segment_ids.items()
         }
-        train_samples = samples_by_split["train"]
 
         valid_batch_size = self.train_batch_size if self.valid_batch_size is None else self.valid_batch_size
         extras = dict(self.extras or {})
         extras["patch_size"] = patch_size
-        if "group_counts" not in extras:
-            group_counts = [0] * len(group_name_to_idx)
-            for _, _, _, _, group_idx in train_samples:
-                group_counts[int(group_idx)] += 1
-            if group_counts:
-                extras["group_counts"] = group_counts
 
         normalization = self.normalization
         bind_context = DataBundle(
@@ -342,6 +315,7 @@ class ZarrPatchDataRecipe:
             extras={**extras, "normalization": normalization},
         )
         augment_recipe = augment_recipe.build(data=bind_context, runtime=runtime)
+        bundle_extras = {**bind_context.extras, "augment": augment_recipe}
 
         dataset_kwargs = {
             "layout": layout,
@@ -384,7 +358,7 @@ class ZarrPatchDataRecipe:
             train_loader=train_loader,
             val_loader=val_loader,
             in_channels=in_channels,
-            extras=dict(bind_context.extras),
+            extras=bundle_extras,
         )
 
 

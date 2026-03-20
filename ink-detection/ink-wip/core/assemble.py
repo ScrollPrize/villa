@@ -15,8 +15,9 @@ def build_experiment_data(data, *, runtime=None, augment=None) -> DataBundle:
 
 
 def assemble_experiment(experiment: Experiment, bundle: DataBundle, *, logger=None) -> Experiment:
-    bound_runtime = experiment.runtime.build(data=bundle, augment=experiment.augment)
-    bound_augment = experiment.augment.build(data=bundle, runtime=bound_runtime)
+    assert "augment" in bundle.extras
+    bound_augment = bundle.extras["augment"]
+    bound_runtime = experiment.runtime.build(data=bundle, augment=bound_augment)
     bound_model = experiment.model.build(data=bundle, runtime=bound_runtime, augment=bound_augment)
     bound_objective = experiment.objective.build(bundle)
 
