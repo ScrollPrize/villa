@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import os.path as osp
-
-import cv2
 import numpy as np
-import PIL.Image
 import zarr
 
 from ink.recipes.data.layout import NestedZarrLayout
@@ -19,24 +15,21 @@ def parse_layer_range_value(layer_range, *, context: str) -> tuple[int, int]:
     return start_idx, end_idx
 
 
-def _read_gray(path: str) -> np.ndarray:
-    if not osp.exists(path):
-        raise FileNotFoundError(path)
+def _open_zarr_array(path: str):
+    root = zarr.open(path, mode="r")
+    if hasattr(root, "shape"):
+        return root
+    return root["0"]
 
-    if path.lower().endswith(".png"):
-        try:
-            with PIL.Image.open(path) as image:
-                return np.array(image.convert("L"))
-        except (OSError, ValueError) as exc:
-            raise RuntimeError(f"Could not read PNG image via PIL: {path}") from exc
 
-    try:
-        image = cv2.imread(path, 0)
-    except cv2.error as exc:
-        raise RuntimeError(f"Could not read image via OpenCV: {path}") from exc
-    if image is None:
-        raise RuntimeError(f"Could not read image via OpenCV (returned None): {path}")
-    return image
+def _read_xy_zarr(path: str) -> np.ndarray:
+    array = _open_zarr_array(path)
+    shape = tuple(int(x) for x in array.shape)
+    if len(shape) == 2:
+        return np.asarray(array)
+    if len(shape) == 3:
+        return np.asarray(array[int(shape[0] // 2)])
+    raise ValueError(f"expected 2D or 3D zarr array at {path!r}, got shape={shape}")
 
 
 def read_label_and_supervision_mask_for_shape(
@@ -54,8 +47,8 @@ def read_label_and_supervision_mask_for_shape(
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
     )
-    label = _read_gray(str(paths.inklabels_path))
-    supervision_mask = _read_gray(str(paths.supervision_mask_path))
+    label = _read_xy_zarr(str(paths.inklabels_path))
+    supervision_mask = _read_xy_zarr(str(paths.supervision_mask_path))
     label_hw = tuple(int(x) for x in label.shape[:2])
     supervision_mask_hw = tuple(int(x) for x in supervision_mask.shape[:2])
     image_hw = (image_h, image_w)
@@ -145,10 +138,7 @@ class ZarrSegmentVolume:
 
     @staticmethod
     def _open_zarr_array(path: str):
-        root = zarr.open(path, mode="r")
-        if hasattr(root, "shape"):
-            return root
-        return root["0"]
+        return _open_zarr_array(path)
 
     @property
     def shape(self) -> tuple[int, int, int]:

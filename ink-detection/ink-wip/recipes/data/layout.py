@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import os.path as osp
 from dataclasses import dataclass, field
 from pathlib import Path
-
-
-_IMAGE_EXTENSIONS = (".png", ".tiff", ".tif")
 
 
 @dataclass(frozen=True)
@@ -74,31 +70,25 @@ class NestedZarrLayout:
                 f"Expected {str(volume_path)!r}."
             )
 
-        inklabel_matches = [
-            segment_dir / f"{segment_id}_inklabels{str(label_suffix)}{ext}"
-            for ext in _IMAGE_EXTENSIONS
-            if (segment_dir / f"{segment_id}_inklabels{str(label_suffix)}{ext}").is_file()
-        ]
-        if len(inklabel_matches) != 1:
+        inklabels_path = segment_dir / f"{segment_id}_inklabels{str(label_suffix)}.zarr"
+        if not inklabels_path.exists():
             raise FileNotFoundError(
-                f"Could not resolve inklabels file for {segment_id!r} inside {str(segment_dir)!r}."
+                f"Could not resolve inklabels zarr for {segment_id!r} inside {str(segment_dir)!r}. "
+                f"Expected {str(inklabels_path)!r}."
             )
 
-        supervision_mask_matches = [
-            segment_dir / f"{segment_id}_supervision_mask{str(mask_suffix)}{ext}"
-            for ext in _IMAGE_EXTENSIONS
-            if (segment_dir / f"{segment_id}_supervision_mask{str(mask_suffix)}{ext}").is_file()
-        ]
-        if len(supervision_mask_matches) != 1:
+        supervision_mask_path = segment_dir / f"{segment_id}_supervision_mask{str(mask_suffix)}.zarr"
+        if not supervision_mask_path.exists():
             raise FileNotFoundError(
-                f"Could not resolve supervision_mask file for {segment_id!r} inside {str(segment_dir)!r}."
+                f"Could not resolve supervision_mask zarr for {segment_id!r} inside {str(segment_dir)!r}. "
+                f"Expected {str(supervision_mask_path)!r}."
             )
 
         return SegmentPaths(
             segment_dir=Path(segment_dir),
             volume_path=volume_path,
-            inklabels_path=inklabel_matches[0],
-            supervision_mask_path=supervision_mask_matches[0],
+            inklabels_path=inklabels_path,
+            supervision_mask_path=supervision_mask_path,
         )
 
 __all__ = ["NestedZarrLayout", "SegmentPaths"]

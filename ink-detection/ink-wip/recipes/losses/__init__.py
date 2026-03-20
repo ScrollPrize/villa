@@ -11,6 +11,7 @@ from ink.recipes.losses.boundary import (
     compute_binary_boundary_loss,
 )
 from ink.recipes.losses.cldice import StitchCLDiceLoss, compute_binary_soft_cldice_loss
+from ink.recipes.losses.composer import LossComposer, LossTerm
 from ink.recipes.losses.dice import DiceBatch, DicePerSample
 from ink.recipes.losses.dice_bce import DiceBCEBatch, DiceBCEPerSample
 from ink.recipes.losses.reporting import (
@@ -27,6 +28,8 @@ __all__ = [
     "DicePerSample",
     "DiceBCEBatch",
     "DiceBCEPerSample",
+    "LossComposer",
+    "LossTerm",
     "StitchBettiMatchingLoss",
     "StitchBoundaryLoss",
     "StitchCLDiceLoss",

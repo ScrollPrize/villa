@@ -2,6 +2,7 @@
 
 from ink.core.assemble import assemble_experiment, build_experiment_data
 from ink.core.experiment import Experiment
+from ink.core.run import run_experiment
 from ink.core.run_fs import RunFS, to_plain
 from ink.core.run_layout import build_run_dir, build_run_id, slugify_name
 from ink.core.types import Batch, BatchMeta, DataBundle, EvalReport
@@ -17,6 +18,7 @@ __all__ = [
     "build_experiment_data",
     "build_run_dir",
     "build_run_id",
+    "run_experiment",
     "slugify_name",
     "to_plain",
 ]

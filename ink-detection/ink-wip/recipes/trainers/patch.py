@@ -54,8 +54,6 @@ class PatchTraining:
     val_loader: Any
 
     def run_step(self, batch) -> TrainStepOutput:
-        if self.experiment.stitch is not None:
-            raise TypeError("PatchTraining requires experiment.stitch is None")
         if not isinstance(batch, Batch):
             raise TypeError("training batch must be Batch")
         if batch.y is None:
@@ -102,9 +100,6 @@ class PatchTraining:
         )
 
     def run_epoch(self, *, optimizer_setup=None, device=None) -> TrainEpochResult:
-        if self.experiment.stitch is not None:
-            raise TypeError("PatchTraining requires experiment.stitch is None")
-
         model = self.experiment.model
         runtime = self.experiment.runtime
         if optimizer_setup is None:
@@ -188,9 +183,6 @@ class PatchTraining:
         save_best_higher_is_better: bool = True,
         checkpoint_extra_state: Mapping[str, Any] | Callable[[int], Mapping[str, Any] | None] | None = None,
     ) -> TrainingRunResult:
-        if self.experiment.stitch is not None:
-            raise TypeError("PatchTraining requires experiment.stitch is None")
-
         runtime = self.experiment.runtime
         model = self.experiment.model
         if optimizer_setup is None:
