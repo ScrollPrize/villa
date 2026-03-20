@@ -4,10 +4,11 @@ an attempt at a faithful implementation of dinov2-style pretraining on 3d volume
 - the augmentation library is a loosely modified [batchgeneratorsv2](https://github.com/MIC-DKFZ/batchgeneratorsv2)
 - normalization is mostly borrowed from [nnunetv2](https://github.com/MIC-DKFZ/nnUNet)
 - rope is from the [dinov3 impl](https://github.com/facebookresearch/dinov3/blob/main/dinov3/layers/rope_position_encoding.py), extended to support 3d
-- a newer `v2` backbone config exists and should generally be preferred for new runs, but the default remains the older config so older checkpoints continue to load without config changes
+
 
 this implementation is still incomplete. pretraining works but no finetuning yet written. 
 
+NOTE: a newer `v2` backbone config exists and should generally be preferred for new runs, but the default remains the older config so older checkpoints continue to load without config changes
 To select the newer defaults explicitly, set `model.model_type` to `v2` in the config:
 
 ```json
