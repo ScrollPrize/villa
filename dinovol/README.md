@@ -22,6 +22,7 @@ The task data is downloaded with `python -m dinovol_2.eval.download_data --task 
 - `surfaces` is resized 2x before crops are drawn
 - `surfaces` and `ink` each use the first 10 sorted samples as the deterministic validation set
 - `ink` is not resized before crops are drawn
+- train and validation crops are taken from precomputed chunks that contain some foreground and at least 50% background in supervised voxels
 - the saved validation image contains one row per validation sample, with image / label / prediction panels
 - for `ink`, voxels with `supervision_mask == 0` are ignored and supervised unlabeled voxels are treated as background
 
