@@ -9,7 +9,7 @@ import torch
 @dataclass(frozen=True)
 class TrainLossOutput:
     loss: torch.Tensor
-    metrics: dict[str, torch.Tensor]
+    components: dict[str, torch.Tensor]
 
 
 def _to_tensor(value, *, device) -> torch.Tensor:
@@ -50,9 +50,9 @@ def _call_value_method(loss, method_name: str, logits, targets, *, valid_mask=No
     return _to_tensor(_call_with_valid_mask(method, logits, targets, valid_mask=valid_mask), device=logits.device)
 
 
-def _normalize_metrics(raw_metrics: Mapping[str, Any], *, device) -> dict[str, torch.Tensor]:
+def _normalize_components(raw_components: Mapping[str, Any], *, device) -> dict[str, torch.Tensor]:
     out: dict[str, torch.Tensor] = {}
-    for key, value in raw_metrics.items():
+    for key, value in raw_components.items():
         out[str(key)] = _to_tensor(value, device=device)
     return out
 
@@ -62,23 +62,25 @@ def _parse_train_output(raw_output, *, device) -> TrainLossOutput:
         if "loss" not in raw_output:
             raise TypeError("loss.training_outputs(...) must include a 'loss' key")
         loss_tensor = _to_tensor(raw_output["loss"], device=device)
-        metrics: dict[str, torch.Tensor] = {}
+        components: dict[str, torch.Tensor] = {}
 
-        nested_metrics = raw_output.get("metrics")
-        if nested_metrics is not None:
-            if not isinstance(nested_metrics, Mapping):
-                raise TypeError("loss.training_outputs(...)[\"metrics\"] must be a mapping")
-            metrics.update(_normalize_metrics(nested_metrics, device=device))
+        nested_components = raw_output.get("components")
+        if nested_components is not None:
+            if not isinstance(nested_components, Mapping):
+                raise TypeError("loss.training_outputs(...)[\"components\"] must be a mapping")
+            components.update(_normalize_components(nested_components, device=device))
 
         for key, value in raw_output.items():
             key = str(key)
-            if key in {"loss", "metrics"}:
+            if key in {"loss", "components"}:
                 continue
-            metrics[key] = _to_tensor(value, device=device)
+            if isinstance(value, Mapping):
+                raise TypeError("loss.training_outputs(...) nested mappings must live under 'components'")
+            components[key] = _to_tensor(value, device=device)
 
-        return TrainLossOutput(loss=loss_tensor, metrics=metrics)
+        return TrainLossOutput(loss=loss_tensor, components=components)
 
-    return TrainLossOutput(loss=_to_tensor(raw_output, device=device), metrics={})
+    return TrainLossOutput(loss=_to_tensor(raw_output, device=device), components={})
 
 
 def resolve_train_output(loss, logits, targets, *, valid_mask=None) -> TrainLossOutput:
@@ -91,23 +93,7 @@ def resolve_train_output(loss, logits, targets, *, valid_mask=None) -> TrainLoss
         raise TypeError("loss recipe must be callable")
 
     raw_loss = _call_with_valid_mask(loss, logits, targets, valid_mask=valid_mask)
-    output = _parse_train_output(raw_loss, device=logits.device)
-
-    if output.metrics:
-        return output
-
-    metrics_method = getattr(loss, "metrics", None)
-    if not callable(metrics_method):
-        return output
-
-    raw_metrics = _call_with_valid_mask(metrics_method, logits, targets, valid_mask=valid_mask)
-    if not isinstance(raw_metrics, Mapping):
-        raise TypeError("loss.metrics(...) must return a mapping")
-
-    return TrainLossOutput(
-        loss=output.loss,
-        metrics=_normalize_metrics(raw_metrics, device=logits.device),
-    )
+    return _parse_train_output(raw_loss, device=logits.device)
 
 
 def loss_values(loss, logits, targets, *, valid_mask=None) -> torch.Tensor:
@@ -117,12 +103,12 @@ def loss_values(loss, logits, targets, *, valid_mask=None) -> torch.Tensor:
     return _coerce_per_sample(values, batch_size=int(targets.shape[0]), name="loss_values")
 
 
-def train_metrics(loss, logits, targets, *, valid_mask=None) -> dict[str, torch.Tensor]:
+def train_components(loss, logits, targets, *, valid_mask=None) -> dict[str, torch.Tensor]:
     output = resolve_train_output(loss, logits, targets, valid_mask=valid_mask)
-    metrics: dict[str, torch.Tensor] = {}
-    for key, value in output.metrics.items():
+    components: dict[str, torch.Tensor] = {}
+    for key, value in output.components.items():
         tensor = _to_tensor(value, device=logits.device)
         if tensor.ndim > 0:
             tensor = tensor.reshape(-1).mean()
-        metrics[str(key)] = tensor.detach()
-    return metrics
+        components[str(key)] = tensor.detach()
+    return components

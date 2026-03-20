@@ -1,192 +1,192 @@
 from __future__ import annotations
 
-import torch
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
 
-from ink.core.types import DataBundle
-from ink.recipes.stitch.data import StitchData, stitch_data_to_config
-from ink.recipes.stitch.eval_runtime import (
-    accumulate_val as _accumulate_val_impl,
-    finalize_validation_epoch as _finalize_validation_epoch_impl,
-    sync_eval_buffers_distributed as _sync_eval_buffers_distributed_impl,
-)
-from ink.recipes.stitch.state import (
-    StitchExecutionContext,
-    _StitchState,
-    _UNSET,
-    _deep_merge_dicts,
-    _log,
-    _noop_log,
-)
-from ink.recipes.stitch.terms import compute_stitched_component_loss
-from ink.recipes.stitch.train_component_runtime import (
-    stitch_saved_tensors_context as _stitch_saved_tensors_context_impl,
-)
-from ink.recipes.stitch.train_runtime import (
-    TrainStitchRuntime,
-    _accumulate_to_buffers as _accumulate_to_buffers_impl,
-    _normalize_xyxys,
-    compute_train_stitch_loss,
-    run_train_stitch_pass,
-)
+from ink.recipes.stitch.data import StitchData, normalize_component_key
+from ink.recipes.stitch.ops import allocate_segment_buffers, build_segment_roi_meta
+from ink.recipes.stitch.terms import compute_stitched_loss_components
+from ink.recipes.stitch.zarr_prep import prepare_stitch_data_for_bundle
+
+
+def _noop_log(*_args, **_kwargs) -> None:
+    return None
+
+
+def _log(owner, message) -> None:
+    logger = getattr(owner, "log", None)
+    if callable(logger):
+        logger(message)
 
 
 @dataclass
-class EvalStitchRuntime:
+class StitchRuntimeState:
     data: StitchData
-    state: _StitchState
-    execution: StitchExecutionContext
-    train: TrainStitchRuntime | None = None
-    log: object = _noop_log
+    roi_meta_by_split: dict[str, dict[str, dict]] = field(init=False)
+    roi_buffers_by_split: dict[str, dict[str, list]] = field(init=False)
+    train_component_meta: dict[tuple[str, int], dict] = field(init=False)
+    _gaussian_cache: dict = field(default_factory=dict)
+    _torch_gaussian_cache: dict = field(default_factory=dict)
+    _boundary_dist_maps_cpu: dict = field(default_factory=dict)
+    _boundary_dist_maps_torch: dict = field(default_factory=dict)
+    _gaussian_sigma_scale: float = 1.0 / 8.0
+    _gaussian_min_weight: float = 1e-6
 
-    def accumulate_val(self, *, outputs, xyxys, dataloader_idx):
-        return accumulate_val(self, outputs=outputs, xyxys=xyxys, dataloader_idx=dataloader_idx)
+    def __post_init__(self) -> None:
+        assert isinstance(self.data, StitchData)
+        self.rebuild()
 
-    def finalize_epoch(self, model):
-        return finalize_validation_epoch(self, model)
+    def clear_boundary_caches(self) -> None:
+        self._boundary_dist_maps_cpu.clear()
+        self._boundary_dist_maps_torch.clear()
+
+    def rebuild(self) -> None:
+        self.roi_meta_by_split = {"eval": {}, "train": {}, "log_only": {}}
+        self.roi_buffers_by_split = {"eval": {}}
+        self.train_component_meta = {}
+        self.clear_boundary_caches()
+
+        self._register_split_segments("eval", self.data.eval.segments)
+        self._register_split_segments("train", self.data.train.segments)
+        self._register_split_segments("log_only", self.data.log_only.segments)
+        self._register_train_components()
+
+    def eval_segment_meta(self, segment_id: str) -> dict | None:
+        return self.roi_meta_by_split["eval"].get(str(segment_id))
+
+    def train_segment_meta(self, segment_id: str) -> dict | None:
+        return self.roi_meta_by_split["train"].get(str(segment_id))
+
+    def component_meta_for(self, component_key) -> dict | None:
+        return self.train_component_meta.get(normalize_component_key(component_key))
+
+    def log_only_segment_meta(self, segment_id: str) -> dict | None:
+        return self.roi_meta_by_split["log_only"].get(str(segment_id))
+
+    def _register_split_segments(self, split: str, segment_specs) -> None:
+        downsample = int(self.data.layout.downsample)
+        for spec in segment_specs:
+            self._register_segment(split, spec.segment_id, spec.shape, spec.bbox, downsample)
+
+    def _register_train_components(self) -> None:
+        downsample = int(self.data.layout.downsample)
+        for spec in self.data.train.components:
+            self.train_component_meta[spec.component_key] = build_segment_roi_meta(
+                spec.shape,
+                spec.bbox,
+                downsample,
+                use_roi=True,
+            )
+
+    def _register_segment(self, split: str, segment_id: str, shape, bbox, downsample: int) -> None:
+        split_name = str(split)
+        sid = str(segment_id)
+        self.roi_meta_by_split[split_name][sid] = build_segment_roi_meta(
+            shape,
+            bbox,
+            downsample,
+            use_roi=self.data.layout.use_roi,
+        )
+        if split_name == "eval":
+            self.roi_buffers_by_split["eval"][sid] = allocate_segment_buffers(self.roi_meta_by_split["eval"][sid])
+
+
+def _segment_rois_from_meta(meta: dict) -> tuple[tuple[int, int, int, int], ...]:
+    return tuple(
+        (
+            int(roi["offset"][0]),
+            int(roi["offset"][0] + roi["buffer_shape"][0]),
+            int(roi["offset"][1]),
+            int(roi["offset"][1] + roi["buffer_shape"][1]),
+        )
+        for roi in meta.get("rois", ())
+    )
+
+
+@dataclass(frozen=True)
+class SegmentLayout:
+    segment_shapes: dict[str, tuple[int, int]]
+    segment_rois: dict[str, tuple[tuple[int, int, int, int], ...]]
+    downsample: int
 
 
 @dataclass
 class StitchRuntime:
     data: StitchData
-    state: _StitchState
-    execution: StitchExecutionContext
-    train: TrainStitchRuntime
-    eval: EvalStitchRuntime
+    state: StitchRuntimeState
+    train: "TrainStitchRuntime"
     log: object = _noop_log
 
-    @property
-    def enabled(self) -> bool:
-        return self.state.enabled
+    def segment_layout(self) -> SegmentLayout:
+        segment_shapes: dict[str, tuple[int, int]] = {}
+        segment_rois: dict[str, tuple[tuple[int, int, int, int], ...]] = {}
 
-    def set_execution_context(
-        self,
-        *,
-        precision_context_factory=_UNSET,
-        sanity_checking=_UNSET,
-        is_global_zero=_UNSET,
-        distributed_world_size=_UNSET,
-        distributed_reduce_sum=_UNSET,
-    ) -> None:
-        if precision_context_factory is not _UNSET:
-            self.execution.precision_context_factory = precision_context_factory
-        if sanity_checking is not _UNSET:
-            self.execution.sanity_checking = bool(sanity_checking)
-        if is_global_zero is not _UNSET:
-            self.execution.is_global_zero = bool(is_global_zero)
-        if distributed_world_size is not _UNSET:
-            world_size = int(distributed_world_size)
-            if world_size < 1:
-                raise ValueError(f"distributed_world_size must be >= 1, got {world_size!r}")
-            self.execution.distributed_world_size = world_size
-        if distributed_reduce_sum is not _UNSET:
-            self.execution.distributed_reduce_sum = distributed_reduce_sum
+        for spec in self.data.eval.segments:
+            segment_id = str(spec.segment_id)
+            segment_shapes[segment_id] = tuple(int(v) for v in spec.shape)
+            meta = self.state.eval_segment_meta(segment_id)
+            if meta is None:
+                raise KeyError(f"stitch state is missing eval ROI metadata for segment_id={segment_id!r}")
+            segment_rois[segment_id] = _segment_rois_from_meta(meta)
 
-    def set_borders(self, *, train_borders=None, eval_borders=None, val_borders=None) -> None:
-        resolved_eval_borders = eval_borders if eval_borders is not None else val_borders
-        if train_borders is not None:
-            self.data.layout.borders_by_split["train"] = dict(train_borders)
-        if resolved_eval_borders is not None:
-            self.data.layout.borders_by_split["eval"] = dict(resolved_eval_borders)
+        if not segment_shapes:
+            raise ValueError("stitch runtime requires stitch.eval.segments with segment shapes")
 
-    def set_train_loaders(self, loaders, segment_ids=None) -> None:
-        self.train.set_loaders(loaders, segment_ids=segment_ids)
-
-    def set_train_component_datasets(self, datasets, component_keys=None) -> None:
-        self.train.set_component_datasets(datasets, component_keys=component_keys)
-
-    def train_loader_for_segment(self, segment_id):
-        return self.train.loader_for_segment(segment_id)
-
-    def train_dataset_for_component(self, component_key):
-        return self.train.dataset_for_component(component_key)
+        return SegmentLayout(
+            segment_shapes=segment_shapes,
+            segment_rois=segment_rois,
+            downsample=int(self.data.layout.downsample),
+        )
 
     @classmethod
-    def from_config(cls, stitch_data: StitchData | dict | None = None, *, logger=None, patch_loss=None) -> StitchRuntime:
+    def _from_config(
+        cls,
+        stitch_data: StitchData | dict | None = None,
+        *,
+        logger=None,
+        patch_loss=None,
+    ) -> "StitchRuntime":
+        from ink.recipes.stitch.train_runtime import TrainStitchRuntime
+
         data = StitchData.from_config(stitch_data or {})
-        state = _StitchState(data)
-        execution = StitchExecutionContext()
+        state = StitchRuntimeState(data)
         log = logger or _noop_log
         train = TrainStitchRuntime(
             data=data,
             state=state,
-            execution=execution,
             patch_loss=patch_loss,
             patch_loss_weight=float(data.train.loss.patch_loss_weight),
             gradient_checkpointing=bool(data.train.loss.gradient_checkpointing),
             save_on_cpu=bool(data.train.loss.save_on_cpu),
             log=log,
         )
-        eval_runtime = EvalStitchRuntime(data=data, state=state, execution=execution, train=train, log=log)
         return cls(
             data=data,
             state=state,
-            execution=execution,
             train=train,
-            eval=eval_runtime,
             log=log,
         )
-
-    @classmethod
-    def from_bundle(cls, bundle: DataBundle, *, logger=None, patch_loss=None) -> StitchRuntime:
-        return cls.from_config(StitchData.from_bundle(bundle), logger=logger, patch_loss=patch_loss)
 
 
 @dataclass(frozen=True)
 class StitchRuntimeRecipe:
-    config: StitchData | None = None
+    config: StitchData | dict | None = None
 
-    def build(self, bundle: DataBundle, *, logger=None, patch_loss=None) -> StitchRuntime:
-        bundle_cfg = stitch_data_to_config(StitchData.from_bundle(bundle))
-        if self.config is None:
-            merged_cfg = bundle_cfg
-        else:
-            merged_cfg = _deep_merge_dicts(bundle_cfg, stitch_data_to_config(self.config))
-        return StitchRuntime.from_config(merged_cfg, logger=logger, patch_loss=patch_loss)
-
-
-def _accumulate_to_buffers(
-    owner,
-    *,
-    outputs,
-    xyxys,
-    pred_buf,
-    count_buf,
-    offset=(0, 0),
-):
-    return _accumulate_to_buffers_impl(
-        owner,
-        outputs=outputs,
-        xyxys=xyxys,
-        pred_buf=pred_buf,
-        count_buf=count_buf,
-        offset=offset,
-    )
+    def build(self, bundle, *, runtime=None, logger=None, patch_loss=None) -> StitchRuntime:
+        stitch_runtime = StitchRuntime._from_config(
+            prepare_stitch_data_for_bundle(bundle, config=self.config),
+            logger=logger,
+            patch_loss=patch_loss,
+        )
+        precision_context = getattr(runtime, "precision_context", None)
+        if callable(precision_context):
+            stitch_runtime.train.precision_context = precision_context
+        return stitch_runtime
 
 
-def _stitch_saved_tensors_context(owner):
-    return _stitch_saved_tensors_context_impl(owner, log=_log)
-
-
-def accumulate_val(owner, *, outputs, xyxys, dataloader_idx):
-    return _accumulate_val_impl(
-        owner,
-        outputs=outputs,
-        xyxys=xyxys,
-        dataloader_idx=dataloader_idx,
-        normalize_xyxys=_normalize_xyxys,
-        accumulate_to_buffers=_accumulate_to_buffers,
-    )
-
-
-def _sync_eval_buffers_distributed(owner, state, model) -> bool:
-    return _sync_eval_buffers_distributed_impl(
-        owner,
-        state=state,
-        model=model,
-    )
-
-
-def finalize_validation_epoch(owner, model):
-    return _finalize_validation_epoch_impl(owner, model)
+__all__ = [
+    "SegmentLayout",
+    "StitchRuntime",
+    "StitchRuntimeRecipe",
+    "StitchRuntimeState",
+    "compute_stitched_loss_components",
+]

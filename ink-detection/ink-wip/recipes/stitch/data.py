@@ -2,36 +2,31 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from ink.core.types import DataBundle
+from typing import Any
 
 
 _STITCH_CONFIG_KEYS = {
     "downsample",
     "use_roi",
     "eval",
+    "log_only",
     "train",
 }
 _STITCH_TRAIN_CONFIG_KEYS = {
+    "segment_ids",
     "segments",
     "components",
-    "borders",
     "viz",
     "loss",
 }
 _STITCH_EVAL_CONFIG_KEYS = {
+    "segment_ids",
     "segments",
-    "loader_to_segment",
-    "metrics",
-    "borders",
 }
 _STITCH_TRAIN_VIZ_CONFIG_KEYS = {
     "enabled",
     "every_n_epochs",
-    "segment_ids",
-    "metrics",
+    "loss_components",
 }
 _STITCH_TRAIN_LOSS_CONFIG_KEYS = {
     "patch_batch_size",
@@ -40,6 +35,11 @@ _STITCH_TRAIN_LOSS_CONFIG_KEYS = {
     "gradient_checkpointing",
     "save_on_cpu",
     "terms",
+}
+_STITCH_LOG_ONLY_CONFIG_KEYS = {
+    "segments",
+    "segment_ids",
+    "every_n_epochs",
 }
 
 
@@ -83,13 +83,13 @@ def _ensure_unique(name: str, values) -> None:
         seen.add(value)
 
 
-def _coerce_metric_names(raw_names) -> tuple[str, ...]:
+def _coerce_loss_component_names(raw_names) -> tuple[str, ...]:
     if raw_names is None:
         return ()
     if isinstance(raw_names, (str, bytes, bytearray)):
         return (str(raw_names),)
     if not isinstance(raw_names, Sequence):
-        raise TypeError("stitch metrics must be a list or tuple of metric names")
+        raise TypeError("stitch train viz loss_components must be a list or tuple of names")
     return tuple(str(name) for name in raw_names)
 
 
@@ -101,6 +101,39 @@ def _coerce_stitch_terms(raw_terms) -> tuple[object, ...]:
     if isinstance(raw_terms, list):
         return tuple(raw_terms)
     return (raw_terms,)
+
+
+def _coerce_segment_ids(raw_segment_ids) -> list[str]:
+    if raw_segment_ids is None:
+        return []
+    if isinstance(raw_segment_ids, (str, bytes, bytearray)):
+        return [str(raw_segment_ids)]
+    if not isinstance(raw_segment_ids, Sequence):
+        raise TypeError("stitch segment_ids must be a list or tuple of segment ids")
+    return [str(segment_id) for segment_id in raw_segment_ids]
+
+
+def _validated_stitch_config(
+    stitch_cfg,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    stitch_cfg = _coerce_mapping(stitch_cfg, "stitch")
+    if not stitch_cfg:
+        return {}, {}, {}, {}, {}, {}
+
+    _raise_on_unknown_keys("stitch", stitch_cfg, _STITCH_CONFIG_KEYS)
+
+    train_cfg = _coerce_mapping(stitch_cfg.get("train"), "stitch.train")
+    eval_cfg = _coerce_mapping(stitch_cfg.get("eval"), "stitch.eval")
+    log_only_cfg = _coerce_mapping(stitch_cfg.get("log_only"), "stitch.log_only")
+    _raise_on_unknown_keys("stitch.train", train_cfg, _STITCH_TRAIN_CONFIG_KEYS)
+    _raise_on_unknown_keys("stitch.eval", eval_cfg, _STITCH_EVAL_CONFIG_KEYS)
+    _raise_on_unknown_keys("stitch.log_only", log_only_cfg, _STITCH_LOG_ONLY_CONFIG_KEYS)
+
+    train_viz_cfg = _coerce_mapping(train_cfg.get("viz"), "stitch.train.viz")
+    train_loss_cfg = _coerce_mapping(train_cfg.get("loss"), "stitch.train.loss")
+    _raise_on_unknown_keys("stitch.train.viz", train_viz_cfg, _STITCH_TRAIN_VIZ_CONFIG_KEYS)
+    _raise_on_unknown_keys("stitch.train.loss", train_loss_cfg, _STITCH_TRAIN_LOSS_CONFIG_KEYS)
+    return stitch_cfg, eval_cfg, train_cfg, train_viz_cfg, train_loss_cfg, log_only_cfg
 
 
 @dataclass
@@ -191,46 +224,46 @@ def coerce_component_specs(raw_specs) -> list[StitchComponentSpec]:
 class StitchLayout:
     downsample: int = 1
     use_roi: bool = False
-    borders_by_split: dict[str, dict[str, Any]] = field(
-        default_factory=lambda: {"train": {}, "eval": {}}
-    )
 
     def __post_init__(self) -> None:
         self.downsample = int(self.downsample)
         self.use_roi = bool(self.use_roi)
-        self.borders_by_split = {
-            "train": dict((self.borders_by_split or {}).get("train", {})),
-            "eval": dict((self.borders_by_split or {}).get("eval", {})),
-        }
 
 
 @dataclass
 class EvalStitchConfig:
+    segment_ids: list[str] = field(default_factory=list)
     segments: list[StitchSegmentSpec] = field(default_factory=list)
-    loader_to_segment: dict[int, str] = field(default_factory=dict)
-    metrics: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        self.segment_ids = _coerce_segment_ids(self.segment_ids)
+        self.segments = coerce_segment_specs(self.segments)
+
+
+@dataclass
+class LogOnlyStitchConfig:
+    segments: list[StitchSegmentSpec] = field(default_factory=list)
+    segment_ids: list[str] = field(default_factory=list)
+    every_n_epochs: int = 1
 
     def __post_init__(self) -> None:
         self.segments = coerce_segment_specs(self.segments)
-        self.loader_to_segment = {
-            int(loader_idx): str(segment_id)
-            for loader_idx, segment_id in dict(self.loader_to_segment or {}).items()
-        }
-        self.metrics = _coerce_metric_names(self.metrics)
+        self.segment_ids = _coerce_segment_ids(self.segment_ids)
+        self.every_n_epochs = int(self.every_n_epochs)
+        if not self.segment_ids and self.segments:
+            self.segment_ids = [spec.segment_id for spec in self.segments]
 
 
 @dataclass
 class TrainStitchVizConfig:
     enabled: bool = False
     every_n_epochs: int = 1
-    segment_ids: list[str] = field(default_factory=list)
-    metrics: tuple[str, ...] = ()
+    loss_components: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
         self.every_n_epochs = int(self.every_n_epochs)
-        self.segment_ids = [str(segment_id) for segment_id in (self.segment_ids or [])]
-        self.metrics = _coerce_metric_names(self.metrics)
+        self.loss_components = _coerce_loss_component_names(self.loss_components)
 
 
 @dataclass
@@ -255,12 +288,14 @@ class TrainStitchLossConfig:
 
 @dataclass
 class TrainStitchConfig:
+    segment_ids: list[str] = field(default_factory=list)
     segments: list[StitchSegmentSpec] = field(default_factory=list)
     components: list[StitchComponentSpec] = field(default_factory=list)
     viz: TrainStitchVizConfig = field(default_factory=TrainStitchVizConfig)
     loss: TrainStitchLossConfig = field(default_factory=TrainStitchLossConfig)
 
     def __post_init__(self) -> None:
+        self.segment_ids = _coerce_segment_ids(self.segment_ids)
         self.segments = coerce_segment_specs(self.segments)
         self.components = coerce_component_specs(self.components)
         if not isinstance(self.viz, TrainStitchVizConfig):
@@ -273,11 +308,83 @@ class TrainStitchConfig:
         return [spec.component_key for spec in self.components]
 
 
+def _build_layout_config(stitch_cfg: Mapping[str, Any], *, base: StitchLayout | None = None) -> StitchLayout:
+    return StitchLayout(
+        downsample=int(stitch_cfg.get("downsample", 1 if base is None else base.downsample)),
+        use_roi=bool(stitch_cfg.get("use_roi", False if base is None else base.use_roi)),
+    )
+
+
+def _build_eval_stitch_config(eval_cfg: Mapping[str, Any], *, base: EvalStitchConfig | None = None) -> EvalStitchConfig:
+    return EvalStitchConfig(
+        segment_ids=eval_cfg.get("segment_ids", [] if base is None else base.segment_ids),
+        segments=eval_cfg.get("segments", [] if base is None else base.segments),
+    )
+
+
+def _build_train_viz_config(
+    train_viz_cfg: Mapping[str, Any],
+    *,
+    base: TrainStitchVizConfig | None = None,
+) -> TrainStitchVizConfig:
+    return TrainStitchVizConfig(
+        enabled=bool(train_viz_cfg.get("enabled", False if base is None else base.enabled)),
+        every_n_epochs=int(train_viz_cfg.get("every_n_epochs", 1 if base is None else base.every_n_epochs)),
+        loss_components=train_viz_cfg.get("loss_components", () if base is None else base.loss_components),
+    )
+
+
+def _build_train_loss_config(
+    train_loss_cfg: Mapping[str, Any],
+    *,
+    base: TrainStitchLossConfig | None = None,
+) -> TrainStitchLossConfig:
+    return TrainStitchLossConfig(
+        patch_batch_size=int(train_loss_cfg.get("patch_batch_size", 1 if base is None else base.patch_batch_size)),
+        valid_batch_size=int(train_loss_cfg.get("valid_batch_size", 1 if base is None else base.valid_batch_size)),
+        patch_loss_weight=float(train_loss_cfg.get("patch_loss_weight", 1.0 if base is None else base.patch_loss_weight)),
+        gradient_checkpointing=bool(
+            train_loss_cfg.get("gradient_checkpointing", False if base is None else base.gradient_checkpointing)
+        ),
+        save_on_cpu=bool(train_loss_cfg.get("save_on_cpu", False if base is None else base.save_on_cpu)),
+        terms=train_loss_cfg.get("terms", () if base is None else base.terms),
+    )
+
+
+def _build_train_stitch_config(
+    train_cfg: Mapping[str, Any],
+    train_viz_cfg: Mapping[str, Any],
+    train_loss_cfg: Mapping[str, Any],
+    *,
+    base: TrainStitchConfig | None = None,
+) -> TrainStitchConfig:
+    return TrainStitchConfig(
+        segment_ids=train_cfg.get("segment_ids", [] if base is None else base.segment_ids),
+        segments=train_cfg.get("segments", [] if base is None else base.segments),
+        components=train_cfg.get("components", [] if base is None else base.components),
+        viz=_build_train_viz_config(train_viz_cfg, base=None if base is None else base.viz),
+        loss=_build_train_loss_config(train_loss_cfg, base=None if base is None else base.loss),
+    )
+
+
+def _build_log_only_stitch_config(
+    log_only_cfg: Mapping[str, Any],
+    *,
+    base: LogOnlyStitchConfig | None = None,
+) -> LogOnlyStitchConfig:
+    return LogOnlyStitchConfig(
+        segments=log_only_cfg.get("segments", [] if base is None else base.segments),
+        segment_ids=log_only_cfg.get("segment_ids", [] if base is None else base.segment_ids),
+        every_n_epochs=int(log_only_cfg.get("every_n_epochs", 1 if base is None else base.every_n_epochs)),
+    )
+
+
 @dataclass
 class StitchData:
     layout: StitchLayout = field(default_factory=StitchLayout)
     eval: EvalStitchConfig = field(default_factory=EvalStitchConfig)
     train: TrainStitchConfig = field(default_factory=TrainStitchConfig)
+    log_only: LogOnlyStitchConfig = field(default_factory=LogOnlyStitchConfig)
 
     def __post_init__(self) -> None:
         if not isinstance(self.layout, StitchLayout):
@@ -286,123 +393,42 @@ class StitchData:
             self.eval = EvalStitchConfig(**dict(self.eval or {}))
         if not isinstance(self.train, TrainStitchConfig):
             self.train = TrainStitchConfig(**dict(self.train or {}))
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self.eval.segments or self.train.segments or self.train.components)
-
-    @classmethod
-    def from_bundle(cls, bundle: DataBundle) -> StitchData:
-        extras = dict(bundle.extras or {})
-        return cls.from_config(extras.get("stitch") or {})
+        if not isinstance(self.log_only, LogOnlyStitchConfig):
+            self.log_only = LogOnlyStitchConfig(**dict(self.log_only or {}))
 
     @classmethod
     def from_config(cls, stitch_cfg) -> StitchData:
         if isinstance(stitch_cfg, StitchData):
             return stitch_cfg
 
-        stitch_cfg = _coerce_mapping(stitch_cfg, "stitch")
+        stitch_cfg, eval_cfg, train_cfg, train_viz_cfg, train_loss_cfg, log_only_cfg = _validated_stitch_config(
+            stitch_cfg
+        )
         if not stitch_cfg:
             return cls()
 
-        _raise_on_unknown_keys("stitch", stitch_cfg, _STITCH_CONFIG_KEYS)
-
-        train_cfg = _coerce_mapping(stitch_cfg.get("train"), "stitch.train")
-        eval_cfg = _coerce_mapping(stitch_cfg.get("eval"), "stitch.eval")
-        _raise_on_unknown_keys("stitch.train", train_cfg, _STITCH_TRAIN_CONFIG_KEYS)
-        _raise_on_unknown_keys("stitch.eval", eval_cfg, _STITCH_EVAL_CONFIG_KEYS)
-
-        train_viz_cfg = _coerce_mapping(train_cfg.get("viz"), "stitch.train.viz")
-        train_loss_cfg = _coerce_mapping(train_cfg.get("loss"), "stitch.train.loss")
-        _raise_on_unknown_keys("stitch.train.viz", train_viz_cfg, _STITCH_TRAIN_VIZ_CONFIG_KEYS)
-        _raise_on_unknown_keys("stitch.train.loss", train_loss_cfg, _STITCH_TRAIN_LOSS_CONFIG_KEYS)
-
         return cls(
-            layout=StitchLayout(
-                downsample=int(stitch_cfg.get("downsample", 1)),
-                use_roi=bool(stitch_cfg.get("use_roi", False)),
-                borders_by_split={
-                    "train": dict(train_cfg.get("borders") or {}),
-                    "eval": dict(eval_cfg.get("borders") or {}),
-                },
-            ),
-            eval=EvalStitchConfig(
-                segments=coerce_segment_specs(eval_cfg.get("segments")),
-                loader_to_segment={
-                    int(loader_idx): str(segment_id)
-                    for loader_idx, segment_id in dict(eval_cfg.get("loader_to_segment") or {}).items()
-                },
-                metrics=eval_cfg.get("metrics"),
-            ),
-            train=TrainStitchConfig(
-                segments=coerce_segment_specs(train_cfg.get("segments")),
-                components=coerce_component_specs(train_cfg.get("components")),
-                viz=TrainStitchVizConfig(
-                    enabled=bool(train_viz_cfg.get("enabled", False)),
-                    every_n_epochs=int(train_viz_cfg.get("every_n_epochs", 1)),
-                    segment_ids=train_viz_cfg.get("segment_ids") or [],
-                    metrics=train_viz_cfg.get("metrics"),
-                ),
-                loss=TrainStitchLossConfig(
-                    patch_batch_size=int(train_loss_cfg.get("patch_batch_size", 1)),
-                    valid_batch_size=int(train_loss_cfg.get("valid_batch_size", 1)),
-                    patch_loss_weight=float(train_loss_cfg.get("patch_loss_weight", 1.0)),
-                    gradient_checkpointing=bool(train_loss_cfg.get("gradient_checkpointing", False)),
-                    save_on_cpu=bool(train_loss_cfg.get("save_on_cpu", False)),
-                    terms=train_loss_cfg.get("terms"),
-                ),
-            ),
+            layout=_build_layout_config(stitch_cfg),
+            eval=_build_eval_stitch_config(eval_cfg),
+            train=_build_train_stitch_config(train_cfg, train_viz_cfg, train_loss_cfg),
+            log_only=_build_log_only_stitch_config(log_only_cfg),
         )
 
 
-def _segment_spec_to_config(spec: StitchSegmentSpec) -> dict[str, Any]:
-    out = {
-        "segment_id": spec.segment_id,
-        "shape": tuple(spec.shape),
-    }
-    if spec.bbox is not None:
-        out["bbox"] = spec.bbox
-    return out
+def merge_stitch_data(base: StitchData, overlay) -> StitchData:
+    base = StitchData.from_config(base)
+    if overlay is None:
+        return base
+    if isinstance(overlay, StitchData):
+        return overlay
 
+    overlay_cfg, eval_cfg, train_cfg, train_viz_cfg, train_loss_cfg, log_only_cfg = _validated_stitch_config(overlay)
+    if not overlay_cfg:
+        return base
 
-def _component_spec_to_config(spec: StitchComponentSpec) -> dict[str, Any]:
-    out = {
-        "component_key": tuple(spec.component_key),
-        "shape": tuple(spec.shape),
-    }
-    if spec.bbox is not None:
-        out["bbox"] = spec.bbox
-    return out
-
-
-def stitch_data_to_config(stitch_data: StitchData | dict | None) -> dict[str, Any]:
-    data = StitchData.from_config(stitch_data or {})
-    return {
-        "downsample": int(data.layout.downsample),
-        "use_roi": bool(data.layout.use_roi),
-        "eval": {
-            "segments": [_segment_spec_to_config(spec) for spec in data.eval.segments],
-            "loader_to_segment": dict(data.eval.loader_to_segment),
-            "metrics": list(data.eval.metrics),
-            "borders": dict(data.layout.borders_by_split["eval"]),
-        },
-        "train": {
-            "segments": [_segment_spec_to_config(spec) for spec in data.train.segments],
-            "components": [_component_spec_to_config(spec) for spec in data.train.components],
-            "borders": dict(data.layout.borders_by_split["train"]),
-            "viz": {
-                "enabled": bool(data.train.viz.enabled),
-                "every_n_epochs": int(data.train.viz.every_n_epochs),
-                "segment_ids": list(data.train.viz.segment_ids),
-                "metrics": list(data.train.viz.metrics),
-            },
-            "loss": {
-                "patch_batch_size": int(data.train.loss.patch_batch_size),
-                "valid_batch_size": int(data.train.loss.valid_batch_size),
-                "patch_loss_weight": float(data.train.loss.patch_loss_weight),
-                "gradient_checkpointing": bool(data.train.loss.gradient_checkpointing),
-                "save_on_cpu": bool(data.train.loss.save_on_cpu),
-                "terms": tuple(data.train.loss.terms),
-            },
-        },
-    }
+    return StitchData(
+        layout=_build_layout_config(overlay_cfg, base=base.layout),
+        eval=_build_eval_stitch_config(eval_cfg, base=base.eval),
+        train=_build_train_stitch_config(train_cfg, train_viz_cfg, train_loss_cfg, base=base.train),
+        log_only=_build_log_only_stitch_config(log_only_cfg, base=base.log_only),
+    )

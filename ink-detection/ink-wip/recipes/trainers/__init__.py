@@ -6,14 +6,15 @@ from ink.recipes.trainers.patch import (
     TrainStepOutput,
     TrainingRunResult,
 )
-from ink.recipes.trainers.stitch import StitchTrainer, StitchTraining
+from ink.recipes.trainers.stitch import StitchInferenceResult, StitchInferenceRun, StitchInferenceTrainer
 
 __all__ = [
     "EvalEpochResult",
     "PatchTrainer",
     "PatchTraining",
-    "StitchTrainer",
-    "StitchTraining",
+    "StitchInferenceResult",
+    "StitchInferenceRun",
+    "StitchInferenceTrainer",
     "TrainEpochResult",
     "TrainStepOutput",
     "TrainingRunResult",

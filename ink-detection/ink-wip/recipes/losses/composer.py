@@ -31,18 +31,18 @@ class LossComposer:
 
     def training_outputs(self, logits: torch.Tensor, targets: torch.Tensor, *, valid_mask=None) -> dict[str, Any]:
         total_loss = None
-        metrics: dict[str, torch.Tensor] = {}
+        components: dict[str, torch.Tensor] = {}
         for term in self.terms:
             output = resolve_train_output(term.loss, logits, targets, valid_mask=valid_mask)
             weighted_loss = float(term.weight) * output.loss
             total_loss = weighted_loss if total_loss is None else total_loss + weighted_loss
-            metrics[f"{term.name}_loss"] = output.loss
-            for key, value in output.metrics.items():
-                metrics[f"{term.name}/{key}"] = value
+            components[f"{term.name}_loss"] = output.loss
+            for key, value in output.components.items():
+                components[f"{term.name}/{key}"] = value
         assert total_loss is not None
         return {
             "loss": total_loss,
-            "metrics": metrics,
+            "components": components,
         }
 
     def loss_values(self, logits: torch.Tensor, targets: torch.Tensor, *, valid_mask=None) -> torch.Tensor:

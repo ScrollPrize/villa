@@ -6,9 +6,6 @@ from dataclasses import dataclass, replace
 import albumentations as A
 import numpy as np
 
-from ink.core.types import DataBundle
-
-
 _DEFAULT_GAUSS_NOISE_STD_RANGE = (
     0.012403473458920844,
     0.027729677693590096,
@@ -101,9 +98,8 @@ class TrainAugment:
     fourth_augment_cutout_p: float = 0.6
     invert_p: float = 0.0
 
-    def build(self, *, data: DataBundle, runtime=None):
+    def build(self, *, patch_size: int | None = None, runtime=None):
         del runtime
-        patch_size = data.extras.get("patch_size", data.extras.get("size"))
         if self.size is not None or patch_size is None:
             return self
         return replace(self, size=int(patch_size))

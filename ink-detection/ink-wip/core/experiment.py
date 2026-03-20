@@ -13,6 +13,5 @@ class Experiment:
     objective: Any
     runtime: Any
     augment: Any
-    stitch: Any
     trainer: Any = None
     evaluator: Any = None

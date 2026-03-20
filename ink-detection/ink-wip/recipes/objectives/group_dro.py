@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from ink.recipes.objectives.common import compute_group_avg
+
 
 class GroupDROComputer(nn.Module):
     requires_group_idx = True
@@ -50,14 +52,6 @@ class GroupDROComputer(nn.Module):
         self.register_buffer("adv_probs", torch.ones(self.n_groups, dtype=torch.float) / self.n_groups)
         self.register_buffer("exp_avg_loss", torch.zeros(self.n_groups, dtype=torch.float))
         self.register_buffer("exp_avg_initialized", torch.zeros(self.n_groups, dtype=torch.bool))
-
-    def compute_group_avg(self, losses, group_idx):
-        group_idx = group_idx.long()
-        group_map = (group_idx == torch.arange(self.n_groups, device=group_idx.device).unsqueeze(1).long()).float()
-        group_count = group_map.sum(1)
-        group_denom = group_count + (group_count == 0).float()
-        group_loss = (group_map @ losses.view(-1)) / group_denom
-        return group_loss, group_count
 
     def update_exp_avg_loss(self, group_loss, group_count):
         prev_weights = (1 - self.gamma * (group_count > 0).float()) * self.exp_avg_initialized.float()
@@ -108,7 +102,11 @@ class GroupDROComputer(nn.Module):
         return robust_loss, unsorted_weights
 
     def loss(self, per_sample_losses, group_idx):
-        group_loss, group_count = self.compute_group_avg(per_sample_losses, group_idx)
+        group_loss, group_count = compute_group_avg(
+            per_sample_losses,
+            group_idx,
+            n_groups=self.n_groups,
+        )
         self.update_exp_avg_loss(group_loss, group_count)
 
         if self.btl:
@@ -149,14 +147,13 @@ class GroupDROObjective:
     btl: bool = False
 
     def build(self, bundle):
-        extras = getattr(bundle, "extras", None) or {}
-        group_counts = extras.get("group_counts")
+        group_counts = getattr(bundle, "group_counts", None)
         if group_counts is None:
-            raise ValueError("GroupDRO objective requires DataBundle.extras['group_counts']")
+            raise ValueError("GroupDRO objective requires DataBundle.group_counts")
 
         group_counts = list(group_counts)
         if not group_counts:
-            raise ValueError("GroupDRO objective requires at least one entry in DataBundle.extras['group_counts']")
+            raise ValueError("GroupDRO objective requires at least one entry in DataBundle.group_counts")
 
         return GroupDROComputer(
             n_groups=len(group_counts),

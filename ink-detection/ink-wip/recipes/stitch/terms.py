@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+
+@dataclass(frozen=True)
+class StitchLossBatch:
+    logits: torch.Tensor
+    targets: torch.Tensor
+    valid_mask: torch.Tensor
+    boundary_dist_map: torch.Tensor | None = None
 
 
 def _stitch_loss_terms(recipe) -> tuple[object, ...]:
@@ -19,45 +28,38 @@ def _requires_boundary_dist_map(recipe) -> bool:
     return any(bool(getattr(term, "requires_boundary_dist_map", False)) for term in _stitch_loss_terms(recipe))
 
 
-def _merge_stitch_term_metrics(out, term_metrics):
-    loss = term_metrics.get("loss")
+def _merge_stitch_term_components(out, term_components):
+    loss = term_components.get("loss")
     if loss is None:
-        raise TypeError("stitched component loss terms must return a 'loss' metric")
+        raise TypeError("stitched loss component terms must return a 'loss' entry")
     out["loss"] = out["loss"] + loss
 
-    for key, value in term_metrics.items():
+    for key, value in term_components.items():
         if key == "loss":
             continue
         out[key] = value
 
 
-def compute_stitched_component_loss(
+def compute_stitched_loss_components(
     recipe,
-    stitched_logits,
-    stitched_targets,
-    *,
-    valid_mask,
-    boundary_dist_map=None,
+    batch: StitchLossBatch,
 ):
     terms = _stitch_loss_terms(recipe)
     if len(terms) <= 0:
-        raise TypeError("stitched component loss requires at least one stitched loss term")
+        raise TypeError("stitched loss components require at least one stitched loss term")
+    if not isinstance(batch, StitchLossBatch):
+        raise TypeError("stitched loss components require StitchLossBatch")
 
-    zero = torch.zeros((), device=stitched_logits.device, dtype=stitched_logits.dtype)
+    zero = torch.zeros((), device=batch.logits.device, dtype=batch.logits.dtype)
     out = {
         "loss": zero.clone(),
-        "covered_px": int(valid_mask.sum().detach().item()),
+        "covered_px": int(batch.valid_mask.sum().detach().item()),
     }
 
     for term in terms:
         compute = getattr(term, "compute", None)
         if not callable(compute):
-            raise TypeError("stitched component loss terms must provide compute(...)")
-        term_metrics = compute(
-            stitched_logits,
-            stitched_targets,
-            valid_mask=valid_mask,
-            boundary_dist_map=boundary_dist_map,
-        )
-        _merge_stitch_term_metrics(out, term_metrics)
+            raise TypeError("stitched loss component terms must provide compute(...)")
+        term_components = compute(batch)
+        _merge_stitch_term_components(out, term_components)
     return out

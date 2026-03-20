@@ -6,9 +6,12 @@ import zarr
 from ink.recipes.data.layout import NestedZarrLayout
 
 
-def parse_layer_range_value(layer_range, *, context: str) -> tuple[int, int]:
+def parse_layer_range_value(layer_range, *, context: str, total_layers: int | None = None) -> tuple[int, int]:
+    """Validate a [start, end) layer range and normalize it to integers."""
     if layer_range is None:
-        raise KeyError(f"{context} requires layer_range")
+        if total_layers is None:
+            raise KeyError(f"{context} requires layer_range")
+        return 0, int(total_layers)
     start_idx, end_idx = [int(v) for v in layer_range]
     if end_idx <= start_idx:
         raise ValueError(f"{context} requires end_idx > start_idx")
@@ -23,6 +26,7 @@ def _open_zarr_array(path: str):
 
 
 def _read_xy_zarr(path: str) -> np.ndarray:
+    """Read a 2D zarr array, or the center slice of a 3D array, as an XY plane."""
     array = _open_zarr_array(path)
     shape = tuple(int(x) for x in array.shape)
     if len(shape) == 2:
@@ -30,6 +34,53 @@ def _read_xy_zarr(path: str) -> np.ndarray:
     if len(shape) == 3:
         return np.asarray(array[int(shape[0] // 2)])
     raise ValueError(f"expected 2D or 3D zarr array at {path!r}, got shape={shape}")
+
+
+def _xy_shape_from_array(array) -> tuple[int, int]:
+    shape = tuple(int(x) for x in array.shape)
+    if len(shape) == 2:
+        return shape
+    if len(shape) == 3:
+        return int(shape[1]), int(shape[2])
+    raise ValueError(f"expected 2D or 3D zarr array, got shape={shape}")
+
+
+def _read_xy_zarr_region(path: str, bbox: tuple[int, int, int, int]) -> np.ndarray:
+    y0, y1, x0, x1 = [int(v) for v in bbox]
+    array = _open_zarr_array(path)
+    shape = tuple(int(x) for x in array.shape)
+    if len(shape) == 2:
+        return np.asarray(array[y0:y1, x0:x1])
+    if len(shape) == 3:
+        return np.asarray(array[int(shape[0] // 2), y0:y1, x0:x1])
+    raise ValueError(f"expected 2D or 3D zarr array at {path!r}, got shape={shape}")
+
+
+def _resolve_label_and_mask_paths(layout: NestedZarrLayout, segment_id: str, *, label_suffix: str = "", mask_suffix: str = ""):
+    return layout.resolve_paths(
+        segment_id,
+        label_suffix=label_suffix,
+        mask_suffix=mask_suffix,
+    )
+
+
+def _validate_label_and_mask_shapes(
+    *,
+    segment_id: str,
+    image_shape_hw,
+    label_array,
+    supervision_mask_array,
+) -> None:
+    image_h = int(image_shape_hw[0])
+    image_w = int(image_shape_hw[1])
+    image_hw = (image_h, image_w)
+    label_hw = _xy_shape_from_array(label_array)
+    supervision_mask_hw = _xy_shape_from_array(supervision_mask_array)
+    if image_hw != label_hw or image_hw != supervision_mask_hw:
+        raise ValueError(
+            f"{segment_id}: image, inklabels, and supervision_mask must have the same shape; "
+            f"got image={image_hw}, inklabels={label_hw}, supervision_mask={supervision_mask_hw}"
+        )
 
 
 def read_label_and_supervision_mask_for_shape(
@@ -40,23 +91,101 @@ def read_label_and_supervision_mask_for_shape(
     label_suffix: str = "",
     mask_suffix: str = "",
 ) -> tuple[np.ndarray, np.ndarray]:
-    image_h = int(image_shape_hw[0])
-    image_w = int(image_shape_hw[1])
-    paths = layout.resolve_paths(
+    """Load full-resolution label and supervision masks after validating their shape."""
+    paths = _resolve_label_and_mask_paths(
+        layout,
         segment_id,
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
     )
+    label_array = _open_zarr_array(str(paths.inklabels_path))
+    supervision_mask_array = _open_zarr_array(str(paths.supervision_mask_path))
+    _validate_label_and_mask_shapes(
+        segment_id=segment_id,
+        image_shape_hw=image_shape_hw,
+        label_array=label_array,
+        supervision_mask_array=supervision_mask_array,
+    )
+
     label = _read_xy_zarr(str(paths.inklabels_path))
     supervision_mask = _read_xy_zarr(str(paths.supervision_mask_path))
-    label_hw = tuple(int(x) for x in label.shape[:2])
-    supervision_mask_hw = tuple(int(x) for x in supervision_mask.shape[:2])
-    image_hw = (image_h, image_w)
-    if image_hw != label_hw or image_hw != supervision_mask_hw:
+
+    label = np.asarray(label)
+    if label.dtype != np.uint8:
+        label = np.clip(label, 0, 255).astype(np.uint8, copy=False)
+
+    supervision_mask = np.asarray(supervision_mask)
+    if supervision_mask.dtype != np.uint8:
+        supervision_mask = np.clip(supervision_mask, 0, 255).astype(np.uint8, copy=False)
+    return label, supervision_mask
+
+
+def read_optional_supervision_mask_for_shape(
+    layout: NestedZarrLayout,
+    segment_id: str,
+    image_shape_hw,
+    *,
+    mask_suffix: str = "",
+) -> np.ndarray | None:
+    """Load a full-resolution supervision mask if present, otherwise return None."""
+    segment_dir = layout.resolve_segment_dir(segment_id)
+    mask_path = segment_dir / f"{str(segment_id)}_supervision_mask{str(mask_suffix)}.zarr"
+    if not mask_path.exists():
+        return None
+
+    supervision_mask_array = _open_zarr_array(str(mask_path))
+    supervision_mask_hw = _xy_shape_from_array(supervision_mask_array)
+    image_hw = (int(image_shape_hw[0]), int(image_shape_hw[1]))
+    if image_hw != supervision_mask_hw:
         raise ValueError(
-            f"{segment_id}: image, inklabels, and supervision_mask must have the same shape; "
-            f"got image={image_hw}, inklabels={label_hw}, supervision_mask={supervision_mask_hw}"
+            f"{segment_id}: image and supervision_mask must have the same shape; "
+            f"got image={image_hw} and supervision_mask={supervision_mask_hw}"
         )
+
+    supervision_mask = _read_xy_zarr(str(mask_path))
+    supervision_mask = np.asarray(supervision_mask)
+    if supervision_mask.dtype != np.uint8:
+        supervision_mask = np.clip(supervision_mask, 0, 255).astype(np.uint8, copy=False)
+    return supervision_mask
+
+
+def read_label_and_supervision_mask_region(
+    layout: NestedZarrLayout,
+    segment_id: str,
+    image_shape_hw,
+    bbox,
+    *,
+    label_suffix: str = "",
+    mask_suffix: str = "",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load a clipped label/mask window, returning empty arrays for empty regions."""
+    paths = _resolve_label_and_mask_paths(
+        layout,
+        segment_id,
+        label_suffix=label_suffix,
+        mask_suffix=mask_suffix,
+    )
+    label_array = _open_zarr_array(str(paths.inklabels_path))
+    supervision_mask_array = _open_zarr_array(str(paths.supervision_mask_path))
+    _validate_label_and_mask_shapes(
+        segment_id=segment_id,
+        image_shape_hw=image_shape_hw,
+        label_array=label_array,
+        supervision_mask_array=supervision_mask_array,
+    )
+
+    image_h = int(image_shape_hw[0])
+    image_w = int(image_shape_hw[1])
+    y0, y1, x0, x1 = [int(v) for v in bbox]
+    y0 = max(0, min(y0, image_h))
+    y1 = max(0, min(y1, image_h))
+    x0 = max(0, min(x0, image_w))
+    x1 = max(0, min(x1, image_w))
+    if y1 <= y0 or x1 <= x0:
+        return np.zeros((0, 0), dtype=np.uint8), np.zeros((0, 0), dtype=np.uint8)
+
+    label = _read_xy_zarr_region(str(paths.inklabels_path), (y0, y1, x0, x1))
+    supervision_mask = _read_xy_zarr_region(str(paths.supervision_mask_path), (y0, y1, x0, x1))
 
     label = np.asarray(label)
     if label.dtype != np.uint8:
@@ -69,6 +198,7 @@ def read_label_and_supervision_mask_for_shape(
 
 
 def _from_uint16_to_uint8(array: np.ndarray, *, segment_id: str) -> np.ndarray:
+    """Downcast uint16 volumes by dropping the low byte for the 8-bit pipeline."""
     array = np.asarray(array)
     if array.dtype == np.uint8:
         return array
@@ -92,17 +222,25 @@ class ZarrSegmentVolume:
     ):
         self.layout = layout
         self.segment_id = str(segment_id)
-        self.layer_range = parse_layer_range_value(
-            layer_range,
-            context=f"segments[{self.segment_id!r}].layer_range",
-        )
-        self.reverse_layers = bool(reverse_layers)
-        self.path = str(self.layout.resolve_paths(self.segment_id).volume_path)
+        segment_dir = self.layout.resolve_segment_dir(self.segment_id)
+        volume_path = segment_dir / f"{self.segment_id}.zarr"
+        if not volume_path.exists():
+            raise FileNotFoundError(
+                f"Could not resolve zarr volume for {self.segment_id!r} inside {str(segment_dir)!r}. "
+                f"Expected {str(volume_path)!r}."
+            )
+        self.path = str(volume_path)
         self._zarr_array = None
         array = self._open_zarr_array(self.path)
         raw_shape = tuple(int(x) for x in array.shape)
         if len(raw_shape) != 3:
             raise ValueError(f"{self.segment_id}: expected 3D zarr volume, got shape={raw_shape} at {self.path}")
+        self.layer_range = parse_layer_range_value(
+            layer_range,
+            context=f"segments[{self.segment_id!r}].layer_range",
+            total_layers=int(raw_shape[0]),
+        )
+        self.reverse_layers = bool(reverse_layers)
         self._dtype = np.dtype(array.dtype)
         self._base_h = int(raw_shape[1])
         self._base_w = int(raw_shape[2])
@@ -149,6 +287,7 @@ class ZarrSegmentVolume:
         return int(self._base_h), int(self._base_w)
 
     def read_patch(self, y1: int, y2: int, x1: int, x2: int) -> np.ndarray:
+        """Read an HWC patch and zero-pad any area outside the stored volume."""
         y1 = int(y1)
         y2 = int(y2)
         x1 = int(x1)
@@ -174,5 +313,7 @@ class ZarrSegmentVolume:
 __all__ = [
     "parse_layer_range_value",
     "read_label_and_supervision_mask_for_shape",
+    "read_label_and_supervision_mask_region",
+    "read_optional_supervision_mask_for_shape",
     "ZarrSegmentVolume",
 ]

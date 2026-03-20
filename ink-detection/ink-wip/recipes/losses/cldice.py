@@ -94,11 +94,11 @@ class StitchCLDiceLoss:
     weight: float = 1.0
     mask_mode: str = "pre_skeleton"
 
-    def compute(self, stitched_logits, stitched_targets, *, valid_mask, **_kwargs):
+    def compute(self, batch):
         cldice_loss = compute_binary_soft_cldice_loss(
-            stitched_logits[None, None],
-            stitched_targets[None, None],
-            valid_mask=valid_mask[None, None],
+            batch.logits[None, None],
+            batch.targets[None, None],
+            valid_mask=batch.valid_mask[None, None],
             mask_mode=self.mask_mode,
             reduction_dims=(1, 2, 3),
         )[0]
