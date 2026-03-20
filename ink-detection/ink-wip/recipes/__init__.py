@@ -1,0 +1,1 @@
+"""Recipe-owned standalone modules."""
