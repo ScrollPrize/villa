@@ -12,7 +12,7 @@ from torch.utils.checkpoint import checkpoint
 from einops import rearrange
 
 from dinovol_2.model.patch_encode_decode import PatchEmbed, PatchEmbedDeeper
-from dinovol_2.model.rope import RopeEmbedding, RopePositionEmbedding, apply_rotary_embedding
+from dinovol_2.model.rope import MixedRopePositionEmbedding, RopeEmbedding, RopePositionEmbedding, apply_rotary_embedding
 
 
 class InitWeights_He(object):
@@ -163,7 +163,10 @@ class EvaBlock(nn.Module):
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
             attn_head_dim: Optional[int] = None,
-            drop_path_scale: bool = True
+            drop_path_scale: bool = True,
+            rope_impl=None,
+            rope_kwargs=None,
+            ndim: Optional[int] = None,
     ):
         """
 
@@ -185,6 +188,8 @@ class EvaBlock(nn.Module):
             attn_head_dim:
         """
         super().__init__()
+        if rope_kwargs is None:
+            rope_kwargs = {}
         self.norm1 = norm_layer(dim)
         self.attn = EvaAttention(
             dim,
@@ -197,6 +202,18 @@ class EvaBlock(nn.Module):
             attn_head_dim=attn_head_dim,
             norm_layer=norm_layer if scale_attn_inner else None,
         )
+        self.rope_embed = None
+        if rope_impl is not None:
+            if attn_head_dim is None and dim % num_heads != 0:
+                raise ValueError(f"dim must be divisible by num_heads, got dim={dim}, num_heads={num_heads}")
+            head_dim = attn_head_dim if attn_head_dim is not None else dim // num_heads
+            rope_kwargs_local = dict(rope_kwargs)
+            self.rope_embed = rope_impl(
+                head_dim,
+                ndim=ndim,
+                num_heads=num_heads,
+                **rope_kwargs_local,
+            )
         self.gamma_1 = nn.Parameter(init_values * torch.ones(dim)) if init_values is not None else None
         self.drop_path1 = DropPath(drop_path, drop_path_scale) if drop_path > 0. else nn.Identity()
         
@@ -232,7 +249,17 @@ class EvaBlock(nn.Module):
         self.gamma_2 = nn.Parameter(init_values * torch.ones(dim)) if init_values is not None else None
         self.drop_path2 = DropPath(drop_path, drop_path_scale) if drop_path > 0. else nn.Identity()
     
-    def forward(self, x, rope: Optional[RopeEmbedding] = None, attn_mask: Optional[torch.Tensor] = None):
+    def forward(
+            self,
+            x,
+            rope: Optional[RopeEmbedding] = None,
+            attn_mask: Optional[torch.Tensor] = None,
+            rope_shape: Optional[Tuple[int, ...]] = None,
+    ):
+        if rope is None and self.rope_embed is not None:
+            if rope_shape is None:
+                raise ValueError("rope_shape must be provided when using per-block RoPE")
+            rope = self.rope_embed.get_embed(rope_shape)
         if self.gamma_1 is None:
             x = x + self.drop_path1(self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask))
             x = x + self.drop_path2(self.mlp(self.norm2(x)))
@@ -420,20 +447,21 @@ class Eva(nn.Module):
         self.pos_embed = nn.Parameter(
             torch.zeros(1, num_patches + self.num_class_tokens, embed_dim)) if use_abs_pos_emb else None
         self.pos_drop = nn.Dropout(p=pos_drop_rate)
-        
-        if use_rot_pos_emb:
-            if embed_dim % num_heads != 0:
-                raise ValueError(
-                    f"embed_dim must be divisible by num_heads, got embed_dim={embed_dim}, num_heads={num_heads}"
-                )
-            head_dim = embed_dim // num_heads
-            if head_dim % (2 * self.ndim) != 0:
-                raise ValueError(
-                    f"RoPE requires head_dim divisible by 2 * ndim, got head_dim={head_dim}, ndim={self.ndim}"
-                )
+        self.use_per_block_rope = bool(use_rot_pos_emb and rope_impl is MixedRopePositionEmbedding)
+        if use_rot_pos_emb and embed_dim % num_heads != 0:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads, got embed_dim={embed_dim}, num_heads={num_heads}"
+            )
+        head_dim = embed_dim // num_heads
+        if use_rot_pos_emb and head_dim % (2 * self.ndim) != 0:
+            raise ValueError(
+                f"RoPE requires head_dim divisible by 2 * ndim, got head_dim={head_dim}, ndim={self.ndim}"
+            )
+        if use_rot_pos_emb and not self.use_per_block_rope:
             self.rope_embed = rope_impl(
                 head_dim,
                 ndim=self.ndim,
+                num_heads=num_heads,
                 **rope_kwargs,
             )
         else:
@@ -461,7 +489,10 @@ class Eva(nn.Module):
                 norm_layer=norm_layer,
                 init_values=init_values,
                 num_prefix_tokens=self.num_prefix_tokens,
-                drop_path_scale=drop_path_scale
+                drop_path_scale=drop_path_scale,
+                rope_impl=rope_impl if self.use_per_block_rope else None,
+                rope_kwargs=rope_kwargs if self.use_per_block_rope else None,
+                ndim=self.ndim,
             )
             for i in range(depth)])
         
@@ -686,9 +717,10 @@ class Eva(nn.Module):
         if masks is not None:
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype), x)
         
+        target_patch_shape = tuple(dim // patch for dim, patch in zip(target_spatial, self.patch_size))
         x, rot_pos_embed = self._pos_embed(x, *target_spatial)
         
-        return x, rot_pos_embed
+        return x, rot_pos_embed, target_patch_shape
     
     def forward_features_list(self, x_list, masks_list, *, view_kind: str = "global"):
         if not isinstance(x_list, list):
@@ -700,12 +732,12 @@ class Eva(nn.Module):
         return output
     
     def forward_features(self, x, masks=None, *, view_kind: str = "global"):
-        x, rot_pos_embed = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
+        x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
         for blk in self.blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint(blk, x, rope=rot_pos_embed)
+                x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape)
             else:
-                x = blk(x, rope=rot_pos_embed)
+                x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape)
         x = self.norm(x)
         outputs = {
             "x_norm_clstoken": x[:, 0] if self.num_class_tokens > 0 else None,
@@ -732,7 +764,41 @@ class Eva(nn.Module):
         
         if unchunk:
             state_dict = self.unchunk_state_dict(state_dict)
-        return self.load_state_dict(state_dict)
+        state_dict = dict(state_dict)
+        if self.rope_embed is None:
+            for key in [key for key in state_dict if key.startswith("rope_embed.")]:
+                state_dict.pop(key)
+        load_result = self.load_state_dict(state_dict, strict=False)
+
+        missing_keys = list(load_result.missing_keys)
+        unexpected_keys = list(load_result.unexpected_keys)
+        allowed_missing_keys = set()
+
+        if self.rope_embed is not None and hasattr(self.rope_embed, "reset_mixed_frequencies_to_axial"):
+            allowed_missing_keys.add("rope_embed.mix_frequencies")
+            if "rope_embed.mix_frequencies" in missing_keys:
+                self.rope_embed.reset_mixed_frequencies_to_axial()
+
+        for module_name, module in self.named_modules():
+            if not module_name or not hasattr(module, "rope_embed") or module.rope_embed is None:
+                continue
+            prefix = f"{module_name}.rope_embed"
+            if hasattr(module.rope_embed, "reset_mixed_frequencies_to_axial"):
+                allowed_missing_keys.add(f"{prefix}.mix_frequencies")
+                if f"{prefix}.mix_frequencies" in missing_keys:
+                    module.rope_embed.reset_mixed_frequencies_to_axial()
+            allowed_missing_keys.add(f"{prefix}.periods")
+
+        disallowed_missing = [key for key in missing_keys if key not in allowed_missing_keys]
+        if disallowed_missing or unexpected_keys:
+            details = []
+            if disallowed_missing:
+                details.append(f"missing keys: {disallowed_missing}")
+            if unexpected_keys:
+                details.append(f"unexpected keys: {unexpected_keys}")
+            raise RuntimeError("failed to load pretrained backbone weights cleanly: " + "; ".join(details))
+
+        return load_result
     
     def unchunk_state_dict(self, state_dict):
         """
@@ -780,9 +846,9 @@ class Eva(nn.Module):
 
 
 class BlockChunk(nn.ModuleList):
-    def forward(self, x, rope=None, attn_mask=None):
+    def forward(self, x, rope=None, attn_mask=None, rope_shape=None):
         for blk in self:
-            x = blk(x, rope=rope, attn_mask=attn_mask)
+            x = blk(x, rope=rope, attn_mask=attn_mask, rope_shape=rope_shape)
         return x
 
 
@@ -806,20 +872,20 @@ class EvaWithChunking(Eva):
         self.blocks = nn.ModuleList(chunks)
     
     def forward_features(self, x, masks=None, *, view_kind: str = "global"):
-        x, rot_pos_embed = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
+        x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
         
         if self.chunked_blocks:
             for chunk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(chunk, x, rope=rot_pos_embed)
+                    x = checkpoint(chunk, x, rope=rot_pos_embed, rope_shape=rope_shape)
                 else:
-                    x = chunk(x, rope=rot_pos_embed)
+                    x = chunk(x, rope=rot_pos_embed, rope_shape=rope_shape)
         else:
             for blk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(blk, x, rope=rot_pos_embed)
+                    x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape)
                 else:
-                    x = blk(x, rope=rot_pos_embed)
+                    x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape)
         
         x = self.norm(x)
         outputs = {

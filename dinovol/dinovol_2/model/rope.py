@@ -37,7 +37,7 @@ def apply_rotary_embedding(x: Tensor, rope: RopeEmbedding, *, prefix_tokens: int
     return torch.cat((x_prefix, x_suffix), dim=-2)
 
 
-class RopePositionEmbedding(nn.Module):
+class _BaseRopePositionEmbedding(nn.Module):
     def __init__(
         self,
         head_dim: int,
@@ -56,10 +56,6 @@ class RopePositionEmbedding(nn.Module):
         super().__init__()
         if ndim not in (2, 3):
             raise ValueError(f"RopePositionEmbedding only supports 2D or 3D inputs, got ndim={ndim}")
-        if head_dim % (2 * ndim) != 0:
-            raise ValueError(
-                f"head_dim must be divisible by 2 * ndim for RoPE, got head_dim={head_dim}, ndim={ndim}"
-            )
 
         both_periods = min_period is not None and max_period is not None
         if (base is None and not both_periods) or (base is not None and both_periods):
@@ -75,31 +71,6 @@ class RopePositionEmbedding(nn.Module):
         self.jitter_coords = jitter_coords
         self.rescale_coords = rescale_coords
         self.dtype = dtype or torch.float32
-        self.freqs_per_axis = self.head_dim // (2 * self.ndim)
-        self.axis_dim = self.head_dim // self.ndim
-
-        self.register_buffer(
-            "periods",
-            torch.empty(self.freqs_per_axis, device=device, dtype=self.dtype),
-            persistent=True,
-        )
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        if self.base is not None:
-            periods = self.base ** (
-                2 * torch.arange(self.freqs_per_axis, device=self.periods.device, dtype=self.periods.dtype)
-                / self.axis_dim
-            )
-        else:
-            assert self.min_period is not None
-            assert self.max_period is not None
-            base = self.max_period / self.min_period
-            exponents = torch.linspace(0, 1, self.freqs_per_axis, device=self.periods.device, dtype=self.periods.dtype)
-            periods = base**exponents
-            periods = periods / base
-            periods = periods * self.max_period
-        self.periods.data.copy_(periods)
 
     def _normalized_axes(self, shape: tuple[int, ...]) -> list[Tensor]:
         device = self.periods.device
@@ -139,7 +110,23 @@ class RopePositionEmbedding(nn.Module):
 
         return coords
 
-    def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
+    def _build_periods(self, count: int, denominator_dim: int, *, device: torch.device | None = None) -> Tensor:
+        device = device or torch.device("cpu")
+        if self.base is not None:
+            return self.base ** (
+                2 * torch.arange(count, device=device, dtype=self.dtype) / denominator_dim
+            )
+
+        assert self.min_period is not None
+        assert self.max_period is not None
+        base = self.max_period / self.min_period
+        exponents = torch.linspace(0, 1, count, device=device, dtype=self.dtype)
+        periods = base**exponents
+        periods = periods / base
+        periods = periods * self.max_period
+        return periods
+
+    def _get_coords(self, shape: Sequence[int]) -> Tensor:
         spatial_shape = tuple(int(size) for size in shape)
         if len(spatial_shape) != self.ndim:
             raise ValueError(f"expected a {self.ndim}D shape and got {spatial_shape}")
@@ -150,9 +137,147 @@ class RopePositionEmbedding(nn.Module):
         coords = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).reshape(-1, self.ndim)
         coords = (2.0 * coords) - 1.0
         coords = self._apply_coord_augmentations(coords)
+        return coords
 
+
+class RopePositionEmbedding(_BaseRopePositionEmbedding):
+    def __init__(
+        self,
+        head_dim: int,
+        *,
+        ndim: int,
+        num_heads: int | None = None,
+        base: float | None = 100.0,
+        min_period: float | None = None,
+        max_period: float | None = None,
+        normalize_coords: Literal["min", "max", "separate"] = "separate",
+        shift_coords: float | None = None,
+        jitter_coords: float | None = None,
+        rescale_coords: float | None = 2.0,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+    ) -> None:
+        if head_dim % (2 * ndim) != 0:
+            raise ValueError(
+                f"head_dim must be divisible by 2 * ndim for RoPE, got head_dim={head_dim}, ndim={ndim}"
+            )
+        super().__init__(
+            head_dim,
+            ndim=ndim,
+            base=base,
+            min_period=min_period,
+            max_period=max_period,
+            normalize_coords=normalize_coords,
+            shift_coords=shift_coords,
+            jitter_coords=jitter_coords,
+            rescale_coords=rescale_coords,
+            dtype=dtype,
+            device=device,
+        )
+
+        self.freqs_per_axis = self.head_dim // (2 * self.ndim)
+        self.axis_dim = self.head_dim // self.ndim
+        self.register_buffer(
+            "periods",
+            torch.empty(self.freqs_per_axis, device=device, dtype=self.dtype),
+            persistent=True,
+        )
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        periods = self._build_periods(
+            self.freqs_per_axis,
+            self.axis_dim,
+            device=self.periods.device,
+        )
+        self.periods.data.copy_(periods)
+
+    def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
+        coords = self._get_coords(shape)
         angles = 2 * math.pi * coords[:, :, None] / self.periods[None, None, :]
         angles = angles.flatten(1, 2).tile(2)
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
+        return sin, cos
+
+    def forward(self, shape: Sequence[int]) -> RopeEmbedding:
+        return self.get_embed(shape)
+
+
+class MixedRopePositionEmbedding(_BaseRopePositionEmbedding):
+    def __init__(
+        self,
+        head_dim: int,
+        *,
+        ndim: int,
+        num_heads: int,
+        base: float | None = 100.0,
+        min_period: float | None = None,
+        max_period: float | None = None,
+        normalize_coords: Literal["min", "max", "separate"] = "separate",
+        shift_coords: float | None = None,
+        jitter_coords: float | None = None,
+        rescale_coords: float | None = 2.0,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+    ) -> None:
+        if head_dim % (2 * ndim) != 0:
+            raise ValueError(
+                f"mixed RoPE warm-start requires head_dim divisible by 2 * ndim, got head_dim={head_dim}, ndim={ndim}"
+            )
+        if num_heads <= 0:
+            raise ValueError(f"num_heads must be positive for mixed RoPE, got {num_heads}")
+        super().__init__(
+            head_dim,
+            ndim=ndim,
+            base=base,
+            min_period=min_period,
+            max_period=max_period,
+            normalize_coords=normalize_coords,
+            shift_coords=shift_coords,
+            jitter_coords=jitter_coords,
+            rescale_coords=rescale_coords,
+            dtype=dtype,
+            device=device,
+        )
+
+        self.num_heads = int(num_heads)
+        self.freqs_per_axis = self.head_dim // (2 * self.ndim)
+        self.axis_dim = self.head_dim // self.ndim
+        self.num_pairs = self.head_dim // 2
+        self.register_buffer(
+            "periods",
+            torch.empty(self.freqs_per_axis, device=device, dtype=self.dtype),
+            persistent=True,
+        )
+        self.mix_frequencies = nn.Parameter(
+            torch.empty(self.num_heads, self.num_pairs, self.ndim, device=device, dtype=self.dtype)
+        )
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        periods = self._build_periods(
+            self.freqs_per_axis,
+            self.axis_dim,
+            device=self.periods.device,
+        )
+        self.periods.data.copy_(periods)
+        self.reset_mixed_frequencies_to_axial()
+
+    @torch.no_grad()
+    def reset_mixed_frequencies_to_axial(self) -> None:
+        mix_frequencies = torch.zeros_like(self.mix_frequencies)
+        inv_periods = self.periods.reciprocal()
+        for axis in range(self.ndim):
+            start = axis * self.freqs_per_axis
+            end = start + self.freqs_per_axis
+            mix_frequencies[:, start:end, axis] = inv_periods
+        self.mix_frequencies.copy_(mix_frequencies)
+
+    def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
+        coords = self._get_coords(shape)
+        angles = 2 * math.pi * torch.einsum("td,hpd->htp", coords, self.mix_frequencies)
+        angles = angles.tile(2)
         cos = torch.cos(angles)
         sin = torch.sin(angles)
         return sin, cos
