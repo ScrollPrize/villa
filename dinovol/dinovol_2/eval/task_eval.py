@@ -135,6 +135,15 @@ class TaskSample:
     supervision_mask_path: Path | None = None
 
 
+@dataclass(frozen=True)
+class TaskChunk:
+    sample: TaskSample
+    starts: tuple[int, int, int]
+    valid_count: int
+    foreground_count: int
+    background_count: int
+
+
 class TaskVolumeSet:
     def __init__(
         self,
@@ -197,16 +206,29 @@ class TaskVolumeSet:
                 f"Missing task-eval supervision masks for {self.task_name}: "
                 f"{', '.join(missing_supervision[:5])}"
             )
-        validation_count = int(task_spec.validation_count)
-        if len(samples) <= validation_count:
-            raise ValueError(
-                f"Task {self.task_name!r} needs more than {validation_count} samples so the first "
-                f"{validation_count} can be validation and the rest training."
-            )
-
-        self.validation_samples = tuple(samples[:validation_count])
-        self.training_samples = tuple(samples[validation_count:])
         self._cache: dict[tuple[Path, bool], np.ndarray] = {}
+        candidate_chunks: list[list[TaskChunk]] = []
+        for sample in samples:
+            sample_chunks = self._chunk_candidates(sample)
+            if sample_chunks:
+                candidate_chunks.append(sample_chunks)
+
+        validation_count = int(task_spec.validation_count)
+        if len(candidate_chunks) <= validation_count:
+            raise ValueError(
+                f"Task {self.task_name!r} needs more than {validation_count} eligible chunked samples "
+                f"with >=50% background so the first {validation_count} can be validation and the rest training."
+            )
+        self.validation_chunks = tuple(sample_chunks[0] for sample_chunks in candidate_chunks[:validation_count])
+        self.training_chunks = tuple(
+            chunk
+            for sample_chunks in candidate_chunks[validation_count:]
+            for chunk in sample_chunks
+        )
+        if not self.training_chunks:
+            raise ValueError(
+                f"Task {self.task_name!r} has no eligible training chunks after filtering for >=50% background."
+            )
         self._num_classes: int | None = None
 
     def close(self) -> None:
@@ -242,28 +264,82 @@ class TaskVolumeSet:
         supervision_mask = self._load_cached(sample.supervision_mask_path, is_label=True)
         return self._apply_supervision_mask(label, supervision_mask)
 
+    @staticmethod
+    def _chunk_name(chunk: TaskChunk) -> str:
+        start_str = ",".join(str(int(value)) for value in chunk.starts)
+        return f"{chunk.sample.name}@{start_str}"
+
+    @staticmethod
+    def _axis_chunk_starts(dim_size: int, crop_dim: int) -> list[int]:
+        if dim_size <= crop_dim:
+            return [0]
+        max_start = dim_size - crop_dim
+        starts = list(range(0, max_start + 1, crop_dim))
+        if starts[-1] != max_start:
+            starts.append(max_start)
+        return starts
+
+    @staticmethod
+    def _chunk_counts(label_crop: np.ndarray) -> tuple[int, int, int]:
+        valid_mask = np.asarray(label_crop) != _IGNORE_LABEL
+        valid_count = int(valid_mask.sum())
+        if valid_count == 0:
+            return 0, 0, 0
+        foreground_count = int(((np.asarray(label_crop) == 1) & valid_mask).sum())
+        background_count = valid_count - foreground_count
+        return valid_count, foreground_count, background_count
+
+    @staticmethod
+    def _chunk_sort_key(chunk: TaskChunk) -> tuple[int, int, int, tuple[int, int, int]]:
+        return (
+            -chunk.foreground_count,
+            chunk.background_count - chunk.foreground_count,
+            -chunk.valid_count,
+            chunk.starts,
+        )
+
+    def _chunk_candidates(self, sample: TaskSample) -> list[TaskChunk]:
+        label = self._load_target(sample)
+        axis_starts = [
+            self._axis_chunk_starts(int(dim_size), int(crop_dim))
+            for dim_size, crop_dim in zip(label.shape, self.crop_size)
+        ]
+        chunks: list[TaskChunk] = []
+        for z_start in axis_starts[0]:
+            for y_start in axis_starts[1]:
+                for x_start in axis_starts[2]:
+                    starts = (z_start, y_start, x_start)
+                    label_crop = self._crop_or_pad(label, starts)
+                    valid_count, foreground_count, background_count = self._chunk_counts(label_crop)
+                    if valid_count == 0 or foreground_count == 0 or background_count < foreground_count:
+                        continue
+                    chunks.append(
+                        TaskChunk(
+                            sample=sample,
+                            starts=starts,
+                            valid_count=valid_count,
+                            foreground_count=foreground_count,
+                            background_count=background_count,
+                        )
+                    )
+        chunks.sort(key=self._chunk_sort_key)
+        return chunks
+
     @property
     def num_classes(self) -> int:
         if self._num_classes is None:
             max_label = 0
-            for sample in (*self.validation_samples, *self.training_samples):
-                target = self._load_target(sample)
+            seen_samples: set[TaskSample] = set()
+            for chunk in (*self.validation_chunks, *self.training_chunks):
+                if chunk.sample in seen_samples:
+                    continue
+                seen_samples.add(chunk.sample)
+                target = self._load_target(chunk.sample)
                 valid_target = target[target != _IGNORE_LABEL]
                 if valid_target.size:
                     max_label = max(max_label, int(valid_target.max()))
             self._num_classes = max_label + 1
         return self._num_classes
-
-    def _crop_starts(self, shape: tuple[int, int, int], rng: np.random.Generator | None) -> tuple[int, int, int]:
-        starts: list[int] = []
-        for dim_size, crop_dim in zip(shape, self.crop_size):
-            if dim_size <= crop_dim:
-                starts.append(0)
-            elif rng is None:
-                starts.append((dim_size - crop_dim) // 2)
-            else:
-                starts.append(int(rng.integers(0, dim_size - crop_dim + 1)))
-        return tuple(starts)
 
     def _crop_or_pad(self, volume: np.ndarray, starts: tuple[int, int, int]) -> np.ndarray:
         slices = []
@@ -284,35 +360,32 @@ class TaskVolumeSet:
             cropped = np.pad(cropped, pad_width=pad_width, mode="constant")
         return cropped
 
-    def _materialize_sample(
+    def _materialize_chunk(
         self,
-        sample: TaskSample,
-        *,
-        rng: np.random.Generator | None,
+        chunk: TaskChunk,
     ) -> tuple[torch.Tensor, torch.Tensor, str]:
-        image = self._load_cached(sample.image_path, is_label=False)
-        label = self._load_target(sample)
+        image = self._load_cached(chunk.sample.image_path, is_label=False)
+        label = self._load_target(chunk.sample)
         if image.shape != label.shape:
             raise ValueError(
-                f"Image/label shape mismatch for {sample.name}: image={image.shape}, label={label.shape}"
+                f"Image/label shape mismatch for {chunk.sample.name}: image={image.shape}, label={label.shape}"
             )
 
-        starts = self._crop_starts(tuple(int(dim) for dim in image.shape), rng)
-        image_crop = self._crop_or_pad(image, starts).astype(np.float32, copy=False)
-        label_crop = self._crop_or_pad(label, starts).astype(np.int64, copy=False)
+        image_crop = self._crop_or_pad(image, chunk.starts).astype(np.float32, copy=False)
+        label_crop = self._crop_or_pad(label, chunk.starts).astype(np.int64, copy=False)
         if image_crop.max() > 1.0:
             image_crop = image_crop / 255.0
 
         image_tensor = torch.from_numpy(np.ascontiguousarray(image_crop[None]))
         label_tensor = torch.from_numpy(np.ascontiguousarray(label_crop))
-        return image_tensor, label_tensor, sample.name
+        return image_tensor, label_tensor, self._chunk_name(chunk)
 
     def sample_training_crop(self, rng: np.random.Generator) -> tuple[torch.Tensor, torch.Tensor, str]:
-        sample_index = int(rng.integers(0, len(self.training_samples)))
-        return self._materialize_sample(self.training_samples[sample_index], rng=rng)
+        chunk_index = int(rng.integers(0, len(self.training_chunks)))
+        return self._materialize_chunk(self.training_chunks[chunk_index])
 
     def validation_crops(self) -> list[tuple[torch.Tensor, torch.Tensor, str]]:
-        return [self._materialize_sample(sample, rng=None) for sample in self.validation_samples]
+        return [self._materialize_chunk(chunk) for chunk in self.validation_chunks]
 
 
 class MinimalTaskDecoder(nn.Module):
