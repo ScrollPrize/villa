@@ -28,6 +28,16 @@ from losses import create_loss_from_config
 from stitching import resolve_model_and_loader_patch_sizes, run_stitched_model_forward
 
 
+class _OptimizerParamGroupTarget:
+    """Adapter for create_optimizer(), which expects an object with parameters()."""
+
+    def __init__(self, param_groups):
+        self._param_groups = param_groups
+
+    def parameters(self):
+        return self._param_groups
+
+
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
 def train(config_path):
@@ -228,7 +238,7 @@ def train(config_path):
                 'name': config.get('optimizer', 'sgd'),
                 'learning_rate': learning_rate,
                 'weight_decay': config.get('weight_decay', 3e-5),
-                }, optimizer_target)
+                }, _OptimizerParamGroupTarget(optimizer_target) if isinstance(optimizer_target, list) else optimizer_target)
 
     lr_scheduler = get_scheduler(
         'diffusers_cosine_warmup',
