@@ -1,8 +1,8 @@
 # Volume registration
 
-This directory contains a script (`find_transform.py`) to find a transform between two volumes.
-It runs a local [neuroglancer](https://github.com/google/neuroglancer) instance to display the volumes, and adds functionality to find a transform between them.
-Live visual overlay allows the transform to be found by manually aligning the volumes.
+This directory contains a script (`find_transform.py`) to find a transform between a fixed Zarr volume and a moving source.
+The moving source can be either another Zarr volume or a Neuroglancer-loadable VTK mesh.
+It runs a local [neuroglancer](https://github.com/google/neuroglancer) instance to display the data and adds functionality to find a transform by manual alignment.
 
 ## Installation
 
@@ -23,12 +23,29 @@ python -i find_transform.py \
 --initial-transform initial_transform.json
 ```
 
+### Example invocation with a moving mesh:
+
+```bash
+python -i find_transform.py \
+--fixed SCROLLS_HEL_4.681um_113keV_1.2m_binmean_2_PHerc_0500P2_HA_0001_masked.zarr/ \
+--fixed-voxel-size 9.362 \
+--moving /absolute/path/to/MAN5_scaled.vtk \
+--moving-type mesh \
+--moving-source-unit-size 1000 \
+--output-transform output_transform.json
+```
+
+If `--moving` points to a local `.vtk` file, the script automatically serves its directory over a local HTTP server with CORS enabled and passes the resulting `vtk://http://127.0.0.1:<port>/...` URL to Neuroglancer.
+In mesh mode, the tool also overlays live intersection contours of the moving mesh in the orthogonal slice views using annotation lines in fixed-space coordinates.
+Use `--mesh-slice-max-segments` to reduce the number of contour segments kept in that overlay if you want a lighter-weight slice rendering path. The default is `256`.
+Live pan/slice tracking for that mesh slice overlay is enabled when `numba` is available.
+
 ### Overview
 
 Typically one finds a transform by following these steps (details below):
 
-- Performing a coarse initial alignment by rotating, translating, and flipping the moving volume using keybinds until it roughly aligns with the fixed volume.
-- Adding manual landmark points to each volume based on visual features, refining the alignment.
+- Performing a coarse initial alignment by rotating, translating, and flipping the moving source using keybinds until it roughly aligns with the fixed volume.
+- Adding manual landmark points to each source based on visual features, refining the alignment.
 - (Optional and not recommended at this time) Using SimpleITK to fit a transform. The current implementation uses low-resolution levels of the Zarr input volumes, and does not result in precise transforms.
 
 [Overview video](https://drive.google.com/file/d/1d05znwDmNCJdOsLd8VlH0clRorNhtcKg/view?usp=drive_link)
@@ -39,7 +56,7 @@ Typically one finds a transform by following these steps (details below):
 
 #### Coarse initial alignment
 
-First one roughly positions the moving volume using the following commands:
+First one roughly positions the moving source using the following commands:
 
 - Step sizes can be customized via `--small-rotate-deg`, `--large-rotate-deg`, `--small-translate-voxels`, and `--large-translate-voxels`.
 - `Alt + a` - Rotate +X (`+ Shift` for bigger step)
@@ -60,7 +77,7 @@ First one roughly positions the moving volume using the following commands:
 
 #### Adding landmark points
 
-Next, landmark points are added to each volume based on visual features.
+Next, landmark points are added to each source based on visual features.
 These refine the transform.
 After there are 4+ pairs of landmark points, the transform is automatically fit to the landmark points each time a point pair is added.
 
@@ -95,6 +112,7 @@ This is useful for identifying landmarks that may need adjustment, or for spotti
 > **_NOTE:_**  Not particularly recommended, as the current implementation uses low-resolution levels of the Zarr input volumes, and does not result in precise transforms.
 
 The transform can be automatically refined using image registration via SimpleITK.
+This is only available when the moving source is also a Zarr volume.
 The registration method uses the lower resolution Zarr levels and the Mattes mutual information metric to register the volumes.
 
 - `f` - Fit the transform to the landmark points using SimpleITK

@@ -21,7 +21,7 @@
     },
     "transformation_matrix": {
       "type": "array",
-      "description": "3x4 affine transformation matrix in XYZ coordinate order (homogeneous coordinate row omitted). First 3x3 is the rotation matrix, last column is the translation vector. Applied as p_fixed = M @ p_moving after the homogeneous row is added to the matrix.",
+      "description": "3x4 affine transformation matrix in XYZ coordinate order (homogeneous coordinate row omitted). First 3x3 is the affine linear component, last column is the translation vector. Applied as p_fixed = M @ p_moving after the homogeneous row is added to the matrix. The fixed side is always the fixed volume's XYZ coordinate system. The moving side is the moving source's native XYZ coordinate system: moving-volume voxel coordinates for zarr-to-zarr registration, or native mesh XYZ coordinates for zarr-to-mesh registration.",
       "items": {
         "type": "array",
         "items": {
@@ -47,7 +47,7 @@
     },
     "moving_landmarks": {
       "type": "array",
-      "description": "Corresponding (x, y, z) points in the moving volume (voxel coordinates)",
+      "description": "Corresponding (x, y, z) points in the moving source's native XYZ coordinate system. For moving zarr volumes these are moving-volume voxel coordinates; for moving meshes these are native mesh XYZ coordinates.",
       "items": {
         "type": "array",
         "items": {
