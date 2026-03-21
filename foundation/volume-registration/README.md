@@ -38,6 +38,7 @@ python -i find_transform.py \
 If `--moving` points to a local `.vtk` file, the script automatically serves its directory over a local HTTP server with CORS enabled and passes the resulting `vtk://http://127.0.0.1:<port>/...` URL to Neuroglancer.
 In mesh mode, the tool also overlays live intersection contours of the moving mesh in the orthogonal slice views using annotation lines in fixed-space coordinates.
 Use `--mesh-slice-max-segments` to reduce the number of contour segments kept in that overlay if you want a lighter-weight slice rendering path. The default is `256`.
+Live pan/slice tracking for that mesh slice overlay is enabled when `numba` is available.
 
 ### Overview
 

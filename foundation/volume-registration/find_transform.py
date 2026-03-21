@@ -1925,5 +1925,10 @@ if __name__ == "__main__":
     set_initial_transform(viewer, args.initial_transform, args.invert_initial_transform)
 
     if moving_source.source_type == "mesh":
-        viewer.shared_state.add_changed_callback(request_mesh_slice_overlay_update)
         request_mesh_slice_overlay_update()
+        if NUMBA_AVAILABLE:
+            viewer.shared_state.add_changed_callback(request_mesh_slice_overlay_update)
+        else:
+            print(
+                "Mesh slice overlay live pan/slice updates are disabled because numba is unavailable in this environment"
+            )
