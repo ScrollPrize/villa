@@ -29,9 +29,11 @@ except ImportError:
 	numba = None
 	_HAS_NUMBA = False
 import torch
+import torch.nn.functional as F
 import zarr
 
 from common import load_unet, unet_infer_tiled
+from train_unet_3d import build_model as build_model_3d
 
 
 def _crop_xyzwhd_bounds(*, shape_zyx: tuple[int, int, int], crop_xyzwhd: tuple[int, int, int, int, int, int] | None) -> tuple[int, int, int, int, int, int]:
@@ -453,9 +455,9 @@ def _compute_pred_dt_channel(
 	ref_z: int, ref_y: int, ref_x: int,
 	scaledown: int,
 	crop_xyzwhd: list[int] | None,
-	chunk_depth: int = 1000,
-	chunk_yx: int = 1024,
-	overlap: int = 255,
+	chunk_depth: int = 256,
+	chunk_yx: int = 256,
+	overlap: int = 64,
 ) -> None:
 	"""Compute distance-to-surface channel from a prediction zarr and write into output_arr."""
 	pred = zarr.open(str(pred_path), mode="r")
@@ -545,12 +547,44 @@ def _compute_pred_dt_channel(
 
 				# Binarize and compute distance transform
 				binary = chunk_np > 0
+				del chunk_np
 				if _HAS_CUPY:
-					print(f"[pred_dt] chunk {chunk_i}/{n_chunks}  distance_transform_edt (GPU) ...", end="", flush=True)
+					cp.get_default_memory_pool().free_all_blocks()
+					mempool = cp.get_default_memory_pool()
+					nvoxels = binary.size
+					# PBA 3D needs ~24 bytes/voxel (bool input + int64 encoded + int64 working + float64 output)
+					est_bytes = nvoxels * 24
+					gpu_free = cp.cuda.Device().mem_info[0]
+					print(
+						f"[pred_dt] chunk {chunk_i}/{n_chunks}  distance_transform_edt (GPU) "
+						f"voxels={nvoxels:,} est={est_bytes / 2**30:.1f}GiB "
+						f"free={gpu_free / 2**30:.1f}GiB pool_used={mempool.used_bytes() / 2**30:.2f}GiB ...",
+						end="", flush=True,
+					)
 					t_edt = time.time()
-					binary_gpu = cp.asarray(binary)
-					dt_gpu = cnd.distance_transform_edt(~binary_gpu)
-					dt = cp.asnumpy(dt_gpu).astype(np.float32)
+					try:
+						binary_gpu = cp.asarray(binary)
+						dt_gpu = cnd.distance_transform_edt(~binary_gpu)
+						dt = cp.asnumpy(dt_gpu).astype(np.float32)
+						del binary_gpu, dt_gpu
+						cp.get_default_memory_pool().free_all_blocks()
+					except cp.cuda.memory.OutOfMemoryError as e:
+						cp.get_default_memory_pool().free_all_blocks()
+						gpu_free2 = cp.cuda.Device().mem_info[0]
+						gpu_total = cp.cuda.Device().mem_info[1]
+						print(flush=True)
+						print(
+							f"[pred_dt] GPU OOM!\n"
+							f"  chunk shape     : {binary.shape}\n"
+							f"  voxels          : {nvoxels:,}\n"
+							f"  est. GPU need   : {est_bytes / 2**30:.1f} GiB\n"
+							f"  GPU free/total  : {gpu_free2 / 2**30:.1f} / {gpu_total / 2**30:.1f} GiB\n"
+							f"  pool used       : {mempool.used_bytes() / 2**30:.2f} GiB\n"
+							f"  overlap={overlap} \u2192 max padded side = chunk + 2*overlap\n"
+							f"  Try reducing --edt-chunk-depth / --edt-chunk-yx or overlap.",
+							flush=True,
+						)
+						raise
 				elif _HAS_EDT:
 					print(f"[pred_dt] chunk {chunk_i}/{n_chunks}  distance_transform_edt (CPU) ...", end="", flush=True)
 					t_edt = time.time()
@@ -707,8 +741,6 @@ def _infer_tiled_3d(
 		(out_channels, Z_out, Y_out, X_out) float32 numpy array of
 		sigmoid-activated (and optionally downscaled) predictions.
 	"""
-	import torch.nn.functional as F
-
 	z0, z1, y0, y1, x0, x1 = crop_slices
 	nz, ny, nx = z1 - z0, y1 - y0, x1 - x0
 	volume_shape = tuple(int(v) for v in zarr_arr.shape)
@@ -834,11 +866,26 @@ def _infer_tiled_3d(
 				tile_f = tile_np.astype(np.float32) / 255.0
 				tile_t = torch.from_numpy(tile_f).unsqueeze(0).unsqueeze(0).to(device)
 
-				with torch.inference_mode(), torch.autocast(device_type=device.type):
+				with torch.inference_mode():
 					pred = model(tile_t)
 				# Model returns dict {"output": tensor} or plain tensor
 				if isinstance(pred, dict):
 					pred = pred["output"]
+
+				# Diagnostics: check for NaN at each stage
+				raw_nan = torch.isnan(pred).sum().item()
+				if raw_nan > 0 or done == 0:
+					print(flush=True)
+					print(
+						f"  tile {done}/{total_tiles} "
+						f"pos=({tz},{ty},{tx}) "
+						f"input: min={tile_f.min():.4f} max={tile_f.max():.4f} "
+						f"raw_out: min={pred.min().item():.4f} max={pred.max().item():.4f} "
+						f"nan={raw_nan}/{pred.numel()} "
+						f"dtype={pred.dtype}",
+						flush=True,
+					)
+
 				# Sigmoid on GPU
 				pred = torch.sigmoid(pred.float())  # (1, C, tz, ty, tx)
 
@@ -914,6 +961,8 @@ def run_preprocess_3d(
 	pred_dt_path: str | None = None,
 	chunk_z: int = 32,
 	chunk_yx: int = 32,
+	edt_chunk_depth: int = 448,
+	edt_chunk_yx: int = 448,
 ) -> None:
 	"""Run 3D UNet inference on a volume and write preprocessed zarr.
 
@@ -923,8 +972,6 @@ def run_preprocess_3d(
 	Memory-efficient: reads tiles lazily from zarr, accumulates in a
 	disk-backed memmap, and post-processes in Z-chunks.
 	"""
-	from train_unet_3d import build_model as build_model_3d
-
 	a_in = zarr.open(str(input_path), mode="r")
 	if not hasattr(a_in, "shape"):
 		raise ValueError(f"input must point to a zarr array, got: {input_path}")
@@ -945,39 +992,33 @@ def run_preprocess_3d(
 		device = "cuda" if torch.cuda.is_available() else "cpu"
 	torch_device = torch.device(device)
 
-	# Load model
-	model = build_model_3d(tile_size, str(torch_device), weights=str(unet3d_checkpoint))
-	model.eval()
-
 	print(
 		f"[predict3d] input={input_path} shape={sh} "
 		f"crop=({x0},{y0},{z0},{nx_dim},{ny},{nz}) scaledown={scaledown}",
 		flush=True,
 	)
 
-	# Run tiled 3D inference — lazy zarr reads, memmap accumulator, per-tile sigmoid+ds
-	pred = _infer_tiled_3d(
-		model, a_in,
-		crop_slices=(z0, z1, y0, y1, x0, x1),
-		device=torch_device,
-		tile_size=tile_size,
-		overlap=overlap,
-		border=border,
-		scaledown=scaledown,
-	)  # (8, out_nz, out_ny, out_nx) float32, sigmoid already applied
-	del model
-	torch.cuda.empty_cache()
-
-	out_nz, out_ny, out_nx = pred.shape[1], pred.shape[2], pred.shape[3]
-
-	# Output zarr — full scaled volume dimensions
+	# Output dimensions
 	full_out_z = _ds_size(sh[0], scaledown)
 	full_out_y = _ds_size(sh[1], scaledown)
 	full_out_x = _ds_size(sh[2], scaledown)
 
+	oz0 = _ds_index(z0, scaledown)
+	oy0 = _ds_index(y0, scaledown)
+	ox0 = _ds_index(x0, scaledown)
+	out_nz = _ds_size(nz, scaledown)
+	out_ny = _ds_size(ny, scaledown)
+	out_nx = _ds_size(nx_dim, scaledown)
+	oz1 = min(full_out_z, oz0 + out_nz)
+	oy1 = min(full_out_y, oy0 + out_ny)
+	ox1 = min(full_out_x, ox0 + out_nx)
+	wz = oz1 - oz0
+	wy = oy1 - oy0
+	wx = ox1 - ox0
+
 	channel_names: list[str] = ["cos", "grad_mag", "nx", "ny"]
 
-	# Validate pred-dt early
+	# Validate pred-dt
 	if pred_dt_path:
 		pred_dt_path = pred_dt_path.rstrip("/")
 		_pred_check = zarr.open(str(pred_dt_path), mode="r")
@@ -1016,24 +1057,58 @@ def run_preprocess_3d(
 		"source": "predict3d",
 	}
 
-	# Write at crop offset
-	oz0 = _ds_index(z0, scaledown)
-	oy0 = _ds_index(y0, scaledown)
-	ox0 = _ds_index(x0, scaledown)
-	oz1 = min(full_out_z, oz0 + out_nz)
-	oy1 = min(full_out_y, oy0 + out_ny)
-	ox1 = min(full_out_x, ox0 + out_nx)
-	wz = oz1 - oz0
-	wy = oy1 - oy0
-	wx = ox1 - ox0
-
 	print(
 		f"[predict3d] writing {output_path} shape=({n_ch},{full_out_z},{full_out_y},{full_out_x}) "
 		f"crop=[{oz0}:{oz1},{oy0}:{oy1},{ox0}:{ox1}]",
 		flush=True,
 	)
 
-	# Chunked post-processing: iterate Z-slabs to avoid full-volume temporaries
+	# --- Phase 1: pred_dt (runs first so GPU OOM fails fast) ---
+	if pred_dt_path:
+		pred_dt_ch = channel_names.index("pred_dt")
+		_compute_pred_dt_channel(
+			pred_path=pred_dt_path,
+			output_arr=arr,
+			channel_idx=pred_dt_ch,
+			ref_z=full_out_z, ref_y=full_out_y, ref_x=full_out_x,
+			scaledown=scaledown,
+			crop_xyzwhd=[int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz)]
+				if crop_xyzwhd is not None else None,
+			chunk_depth=edt_chunk_depth,
+			chunk_yx=edt_chunk_yx,
+		)
+
+	# --- Phase 2: tiled 3D inference ---
+	model = build_model_3d(tile_size, str(torch_device), weights=str(unet3d_checkpoint))
+	model.eval()
+
+	pred = _infer_tiled_3d(
+		model, a_in,
+		crop_slices=(z0, z1, y0, y1, x0, x1),
+		device=torch_device,
+		tile_size=tile_size,
+		overlap=overlap,
+		border=border,
+		scaledown=scaledown,
+	)  # (8, out_nz, out_ny, out_nx) float32, sigmoid already applied
+	del model
+	torch.cuda.empty_cache()
+
+	# Diagnostic: verify inference produced meaningful data
+	print(
+		f"[predict3d] inference result shape={pred.shape} "
+		f"min={pred.min():.4f} max={pred.max():.4f} mean={pred.mean():.4f}",
+		flush=True,
+	)
+	for ci in range(min(pred.shape[0], 8)):
+		ch = pred[ci]
+		print(
+			f"  ch{ci}: min={ch.min():.4f} max={ch.max():.4f} "
+			f"mean={ch.mean():.4f} nonzero={np.count_nonzero(ch)}/{ch.size}",
+			flush=True,
+		)
+
+	# --- Phase 3: post-process and write channels 0–3 ---
 	post_chunk_z = max(1, chunk_z)
 	for zs in range(0, wz, post_chunk_z):
 		ze = min(wz, zs + post_chunk_z)
@@ -1063,18 +1138,6 @@ def run_preprocess_3d(
 			np.round(ny_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
 
 	del pred
-
-	if pred_dt_path:
-		pred_dt_ch = channel_names.index("pred_dt")
-		_compute_pred_dt_channel(
-			pred_path=pred_dt_path,
-			output_arr=arr,
-			channel_idx=pred_dt_ch,
-			ref_z=full_out_z, ref_y=full_out_y, ref_x=full_out_x,
-			scaledown=scaledown,
-			crop_xyzwhd=[int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz)]
-				if crop_xyzwhd is not None else None,
-		)
 
 	print("[predict3d] done.", flush=True)
 
@@ -1791,6 +1854,8 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 	p.add_argument("--device", default=None, help='Device, e.g. "cuda" or "cpu" (default: cuda if available).')
 	p.add_argument("--chunk-z", type=int, default=32, help="Output zarr chunk size along Z.")
 	p.add_argument("--chunk-yx", type=int, default=32, help="Output zarr chunk size for Y and X.")
+	p.add_argument("--edt-chunk-depth", type=int, default=256, help="EDT chunk depth in Z (default 256).")
+	p.add_argument("--edt-chunk-yx", type=int, default=256, help="EDT chunk size in Y/X (default 256).")
 	args = p.parse_args(argv)
 
 	run_preprocess_3d(
@@ -1806,6 +1871,8 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		pred_dt_path=str(args.pred_dt) if args.pred_dt else None,
 		chunk_z=int(args.chunk_z),
 		chunk_yx=int(args.chunk_yx),
+		edt_chunk_depth=int(args.edt_chunk_depth),
+		edt_chunk_yx=int(args.edt_chunk_yx),
 	)
 	return 0
 
