@@ -244,6 +244,12 @@ size_t DiskStore::totalBytes() const
     return totalBytes_.load(std::memory_order_relaxed);
 }
 
+size_t DiskStore::fileCount() const
+{
+    std::lock_guard<std::mutex> lk(indexMtx_);
+    return pathIndex_.size();
+}
+
 void DiskStore::initTotalBytes()
 {
     if (config_.root.empty() || !std::filesystem::exists(config_.root)) {
