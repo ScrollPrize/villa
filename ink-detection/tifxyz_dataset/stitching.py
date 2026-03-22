@@ -30,7 +30,7 @@ def run_stitched_model_forward(model, image, model_crop_size):
     assert height >= crop_height and width >= crop_width
 
     if height == crop_height and width == crop_width:
-        return model(image)['ink']
+        return model(image)
 
     stitched_output = None
     output_key = None
