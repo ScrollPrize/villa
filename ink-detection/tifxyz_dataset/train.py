@@ -469,6 +469,7 @@ def train(config_path):
                     val_batch = next(val_iterator)
                     with accelerator.autocast():
                         val_preds = forward_ink(val_batch['image'])
+                    preview_preds = val_preds
                     val_targets = torch.amax(val_batch['inklabels'].float(), dim=2)
                     val_supervision_mask = torch.amax(val_batch['supervision_mask'].float(), dim=2)
                     val_targets = (val_targets > 0).float()
@@ -481,6 +482,7 @@ def train(config_path):
                             ema_val_preds = forward_ink(val_batch['image'], active_model=ema_model)
                         ema_val_l = loss(ema_val_preds.float(), val_targets_with_ignore)
                         ema_val_losses.append(ema_val_l.item())
+                        preview_preds = ema_val_preds
 
                     if val_batch_idx in preview_batch_indices:
                         append_preview_tiles(
@@ -488,7 +490,7 @@ def train(config_path):
                             val_preview_labels,
                             val_preview_probabilities,
                             val_batch,
-                            val_preds.detach(),
+                            preview_preds.detach(),
                             val_targets.detach(),
                             val_ignore_mask.detach(),
                         )
