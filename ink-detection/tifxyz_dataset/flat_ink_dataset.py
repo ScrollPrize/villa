@@ -176,7 +176,7 @@ class FlatInkDataset(Dataset):
                 return seg.patches
 
             self.patches = []
-            with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+            with ThreadPoolExecutor(max_workers=self.patch_finding_workers) as pool:
                 for patches in tqdm(pool.map(_process_segment, segments), total=len(segments), desc='Finding patches'):
                     self.patches.extend(patches)
             save_flat_patch_cache(cache_path, self.patches)
