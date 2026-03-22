@@ -719,6 +719,7 @@ def _infer_tiled_3d(
 	border: int = 16,
 	out_channels: int = 8,
 	scaledown: int = 1,
+	tmp_dir: str | None = None,
 ) -> np.ndarray:
 	"""Run 3D UNet inference on a volume using overlapping tiles with linear blending.
 
@@ -821,13 +822,13 @@ def _infer_tiled_3d(
 	else:
 		w_lr = w_full.cpu().numpy()  # (tile, tile, tile)
 
-	# Memmap accumulators
-	acc_file = tempfile.NamedTemporaryFile(suffix=".acc", delete=False)
-	wsum_file = tempfile.NamedTemporaryFile(suffix=".wsum", delete=False)
-	acc_path = acc_file.name
-	wsum_path = wsum_file.name
-	acc_file.close()
-	wsum_file.close()
+	# Memmap accumulators — place next to output to avoid /tmp (often tmpfs) overflow
+	if tmp_dir:
+		acc_path = os.path.join(tmp_dir, ".predict3d_acc.tmp")
+		wsum_path = os.path.join(tmp_dir, ".predict3d_wsum.tmp")
+	else:
+		acc_path = tempfile.mktemp(suffix=".acc")
+		wsum_path = tempfile.mktemp(suffix=".wsum")
 
 	acc_shape = (out_channels, Zo, Yo, Xo)
 	wsum_shape = (1, Zo, Yo, Xo)
@@ -1032,6 +1033,7 @@ def run_preprocess_3d(
 		channel_names.append("pred_dt")
 
 	n_ch = len(channel_names)
+	expected_shape = (n_ch, full_out_z, full_out_y, full_out_x)
 	chunk_sizes = (
 		1,
 		min(full_out_z, max(1, chunk_z)),
@@ -1039,32 +1041,63 @@ def run_preprocess_3d(
 		min(full_out_x, max(1, chunk_yx)),
 	)
 
-	arr = zarr.open(
-		str(output_path),
-		mode="w",
-		shape=(n_ch, full_out_z, full_out_y, full_out_x),
-		chunks=chunk_sizes,
-		dtype=np.uint8,
-		fill_value=0,
-		zarr_format=2,
-	)
-	arr.attrs["preprocess_params"] = {
-		"scaledown": int(scaledown),
-		"grad_mag_encode_scale": 1000.0,
-		"channels": channel_names,
-		"crop_xyzwhd": [int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz)],
-		"output_full_scaled": True,
-		"source": "predict3d",
-	}
+	# --- Resume logic: reuse existing zarr if shape matches ---
+	arr = None
+	skip_pred_dt = False
+	skip_inference = False
+	if os.path.exists(output_path):
+		try:
+			arr = zarr.open(str(output_path), mode="r+")
+			if hasattr(arr, "shape") and tuple(int(v) for v in arr.shape) == expected_shape:
+				print(f"[predict3d] resuming: existing zarr matches shape {expected_shape}", flush=True)
+				# Check pred_dt: sample middle Z-slab in crop region
+				if pred_dt_path:
+					pred_dt_ch = channel_names.index("pred_dt")
+					sample_z = (oz0 + oz1) // 2
+					sample = np.asarray(arr[pred_dt_ch, sample_z, oy0:oy1, ox0:ox1])
+					if np.any(sample != 0):
+						skip_pred_dt = True
+						print(f"[predict3d] resuming: pred_dt (ch{pred_dt_ch}) has data, skipping Phase 1", flush=True)
+				# Check inference: sample cos channel in crop region
+				sample_z = (oz0 + oz1) // 2
+				sample = np.asarray(arr[0, sample_z, oy0:oy1, ox0:ox1])
+				if np.any(sample != 0):
+					skip_inference = True
+					print(f"[predict3d] resuming: cos (ch0) has data, skipping Phase 2+3", flush=True)
+			else:
+				existing_shape = tuple(int(v) for v in arr.shape) if hasattr(arr, "shape") else "group"
+				print(f"[predict3d] existing zarr shape {existing_shape} != {expected_shape}, recreating", flush=True)
+				arr = None
+		except Exception:
+			arr = None
+
+	if arr is None:
+		arr = zarr.open(
+			str(output_path),
+			mode="w",
+			shape=expected_shape,
+			chunks=chunk_sizes,
+			dtype=np.uint8,
+			fill_value=0,
+			zarr_format=2,
+		)
+		arr.attrs["preprocess_params"] = {
+			"scaledown": int(scaledown),
+			"grad_mag_encode_scale": 1000.0,
+			"channels": channel_names,
+			"crop_xyzwhd": [int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz)],
+			"output_full_scaled": True,
+			"source": "predict3d",
+		}
 
 	print(
-		f"[predict3d] writing {output_path} shape=({n_ch},{full_out_z},{full_out_y},{full_out_x}) "
+		f"[predict3d] output {output_path} shape={expected_shape} "
 		f"crop=[{oz0}:{oz1},{oy0}:{oy1},{ox0}:{ox1}]",
 		flush=True,
 	)
 
 	# --- Phase 1: pred_dt (runs first so GPU OOM fails fast) ---
-	if pred_dt_path:
+	if pred_dt_path and not skip_pred_dt:
 		pred_dt_ch = channel_names.index("pred_dt")
 		_compute_pred_dt_channel(
 			pred_path=pred_dt_path,
@@ -1079,65 +1112,68 @@ def run_preprocess_3d(
 		)
 
 	# --- Phase 2: tiled 3D inference ---
-	model = build_model_3d(tile_size, str(torch_device), weights=str(unet3d_checkpoint))
-	model.eval()
+	if not skip_inference:
+		model = build_model_3d(tile_size, str(torch_device), weights=str(unet3d_checkpoint))
+		model.eval()
 
-	pred = _infer_tiled_3d(
-		model, a_in,
-		crop_slices=(z0, z1, y0, y1, x0, x1),
-		device=torch_device,
-		tile_size=tile_size,
-		overlap=overlap,
-		border=border,
-		scaledown=scaledown,
-	)  # (8, out_nz, out_ny, out_nx) float32, sigmoid already applied
-	del model
-	torch.cuda.empty_cache()
+		out_dir = os.path.dirname(os.path.abspath(output_path))
+		pred = _infer_tiled_3d(
+			model, a_in,
+			crop_slices=(z0, z1, y0, y1, x0, x1),
+			device=torch_device,
+			tile_size=tile_size,
+			overlap=overlap,
+			border=border,
+			scaledown=scaledown,
+			tmp_dir=out_dir,
+		)  # (8, out_nz, out_ny, out_nx) float32, sigmoid already applied
+		del model
+		torch.cuda.empty_cache()
 
-	# Diagnostic: verify inference produced meaningful data
-	print(
-		f"[predict3d] inference result shape={pred.shape} "
-		f"min={pred.min():.4f} max={pred.max():.4f} mean={pred.mean():.4f}",
-		flush=True,
-	)
-	for ci in range(min(pred.shape[0], 8)):
-		ch = pred[ci]
+		# Diagnostic: verify inference produced meaningful data
 		print(
-			f"  ch{ci}: min={ch.min():.4f} max={ch.max():.4f} "
-			f"mean={ch.mean():.4f} nonzero={np.count_nonzero(ch)}/{ch.size}",
+			f"[predict3d] inference result shape={pred.shape} "
+			f"min={pred.min():.4f} max={pred.max():.4f} mean={pred.mean():.4f}",
 			flush=True,
 		)
+		for ci in range(min(pred.shape[0], 8)):
+			ch = pred[ci]
+			print(
+				f"  ch{ci}: min={ch.min():.4f} max={ch.max():.4f} "
+				f"mean={ch.mean():.4f} nonzero={np.count_nonzero(ch)}/{ch.size}",
+				flush=True,
+			)
 
-	# --- Phase 3: post-process and write channels 0–3 ---
-	post_chunk_z = max(1, chunk_z)
-	for zs in range(0, wz, post_chunk_z):
-		ze = min(wz, zs + post_chunk_z)
-		# Channels 0-1: cos, grad_mag — simple uint8 encode
-		cos_slab = pred[0, zs:ze, :wy, :wx]
-		gm_slab = pred[1, zs:ze, :wy, :wx]
-		arr[0, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
-			cos_slab * 255.0, 0.0, 255.0).astype(np.uint8)
-		arr[1, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
-			gm_slab * 1000.0, 0.0, 255.0).astype(np.uint8)
+		# --- Phase 3: post-process and write channels 0–3 ---
+		post_chunk_z = max(1, chunk_z)
+		for zs in range(0, wz, post_chunk_z):
+			ze = min(wz, zs + post_chunk_z)
+			# Channels 0-1: cos, grad_mag — simple uint8 encode
+			cos_slab = pred[0, zs:ze, :wy, :wx]
+			gm_slab = pred[1, zs:ze, :wy, :wx]
+			arr[0, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
+				cos_slab * 255.0, 0.0, 255.0).astype(np.uint8)
+			arr[1, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
+				gm_slab * 1000.0, 0.0, 255.0).astype(np.uint8)
 
-		# Channels 2-7: dir channels -> normal estimation -> nx, ny uint8
-		d0z = pred[2, zs:ze, :wy, :wx]
-		d1z = pred[3, zs:ze, :wy, :wx]
-		d0y = pred[4, zs:ze, :wy, :wx]
-		d1y = pred[5, zs:ze, :wy, :wx]
-		d0x = pred[6, zs:ze, :wy, :wx]
-		d1x = pred[7, zs:ze, :wy, :wx]
-		_, _, _, nx_n, ny_n, nz_n = _estimate_normal(d0z, d1z, d0y, d1y, d0x, d1x)
-		# Flip to +z hemisphere
-		flip = np.where(nz_n < 0, -1.0, 1.0)
-		nx_n = nx_n * flip
-		ny_n = ny_n * flip
-		arr[2, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
-			np.round(nx_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
-		arr[3, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
-			np.round(ny_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
+			# Channels 2-7: dir channels -> normal estimation -> nx, ny uint8
+			d0z = pred[2, zs:ze, :wy, :wx]
+			d1z = pred[3, zs:ze, :wy, :wx]
+			d0y = pred[4, zs:ze, :wy, :wx]
+			d1y = pred[5, zs:ze, :wy, :wx]
+			d0x = pred[6, zs:ze, :wy, :wx]
+			d1x = pred[7, zs:ze, :wy, :wx]
+			_, _, _, nx_n, ny_n, nz_n = _estimate_normal(d0z, d1z, d0y, d1y, d0x, d1x)
+			# Flip to +z hemisphere
+			flip = np.where(nz_n < 0, -1.0, 1.0)
+			nx_n = nx_n * flip
+			ny_n = ny_n * flip
+			arr[2, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
+				np.round(nx_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
+			arr[3, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
+				np.round(ny_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
 
-	del pred
+		del pred
 
 	print("[predict3d] done.", flush=True)
 
@@ -1761,7 +1797,9 @@ def main(argv: list[str] | None = None) -> int:
 			"  --pred-dt PATH        Prediction zarr for distance-to-surface channel.\n"
 			"  --device DEV          Device, e.g. cuda or cpu (default: cuda if available).\n"
 			"  --chunk-z N           Output zarr chunk size along Z (default: 32).\n"
-			"  --chunk-yx N          Output zarr chunk size for Y and X (default: 32)."
+			"  --chunk-yx N          Output zarr chunk size for Y and X (default: 32).\n"
+			"  --edt-chunk-depth N   EDT chunk depth in Z (default: 256).\n"
+			"  --edt-chunk-yx N      EDT chunk size in Y/X (default: 256)."
 		),
 		formatter_class=_Fmt,
 	)
