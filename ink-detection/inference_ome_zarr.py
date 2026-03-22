@@ -742,6 +742,116 @@ def extract_state_dict_from_payload(payload: Any, checkpoint_path: Path | str) -
     return state_dict
 
 
+def pretrained_backbone_looks_like_checkpoint(value: Any) -> bool:
+    if not isinstance(value, (str, Path)):
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    if text.startswith(("~", ".", "/")):
+        return True
+    if "/" in text or "\\" in text:
+        return True
+    return Path(text).suffix.lower() in {".pt", ".pth"}
+
+
+def resolve_checkpoint_reference_path(
+    reference: str | Path,
+    *,
+    relative_to: Path | str | None,
+) -> Path:
+    reference_path = Path(str(reference)).expanduser()
+    candidates: list[Path] = []
+    if reference_path.is_absolute():
+        candidates.append(reference_path)
+    else:
+        if relative_to is not None:
+            base_path = Path(str(relative_to)).expanduser()
+            if base_path.suffix:
+                base_path = base_path.parent
+            candidates.append(base_path / reference_path)
+        candidates.append(reference_path)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve(strict=False)
+
+
+def resolve_tifxyz_pretrained_backbone_config(
+    config: dict[str, Any],
+    *,
+    checkpoint_path: Path | str,
+    seen_paths: set[Path] | None = None,
+) -> dict[str, Any]:
+    model_config = config.get("model_config")
+    if not isinstance(model_config, dict):
+        return config
+
+    pretrained_backbone = model_config.get("pretrained_backbone")
+    if not pretrained_backbone_looks_like_checkpoint(pretrained_backbone):
+        return config
+
+    resolved_backbone_ckpt = resolve_checkpoint_reference_path(
+        pretrained_backbone,
+        relative_to=checkpoint_path,
+    )
+    if seen_paths is None:
+        seen_paths = set()
+    if resolved_backbone_ckpt in seen_paths:
+        chain = " -> ".join(str(path) for path in [*seen_paths, resolved_backbone_ckpt])
+        raise ValueError(f"Detected recursive pretrained_backbone checkpoint chain: {chain}")
+    if not resolved_backbone_ckpt.exists():
+        raise FileNotFoundError(
+            f"Resolved pretrained_backbone checkpoint does not exist: {resolved_backbone_ckpt}"
+        )
+
+    backbone_payload = load_checkpoint_payload(resolved_backbone_ckpt)
+    backbone_config = backbone_payload.get("config") if isinstance(backbone_payload, dict) else None
+    if not isinstance(backbone_config, dict):
+        raise ValueError(
+            "Checkpoint-backed pretrained_backbone must point to a training checkpoint "
+            f"with a dict config, got {resolved_backbone_ckpt}"
+        )
+
+    nested_seen_paths = set(seen_paths)
+    nested_seen_paths.add(resolved_backbone_ckpt)
+    resolved_backbone_config = resolve_tifxyz_pretrained_backbone_config(
+        copy.deepcopy(backbone_config),
+        checkpoint_path=resolved_backbone_ckpt,
+        seen_paths=nested_seen_paths,
+    )
+
+    resolved_model_config = resolved_backbone_config.get("model_config")
+    resolved_pretrained_backbone = (
+        resolved_model_config.get("pretrained_backbone")
+        if isinstance(resolved_model_config, dict)
+        else None
+    )
+    if not resolved_pretrained_backbone:
+        raise ValueError(
+            "Checkpoint-backed pretrained_backbone must ultimately resolve to a concrete backbone name, "
+            f"but {resolved_backbone_ckpt} did not define model_config.pretrained_backbone"
+        )
+
+    if pretrained_backbone_looks_like_checkpoint(resolved_pretrained_backbone):
+        raise ValueError(
+            "Checkpoint-backed pretrained_backbone resolution did not terminate in a concrete backbone name: "
+            f"{resolved_pretrained_backbone!r}"
+        )
+
+    updated_config = copy.deepcopy(config)
+    updated_model_config = dict(updated_config.get("model_config") or {})
+    updated_model_config["pretrained_backbone"] = resolved_pretrained_backbone
+    updated_config["model_config"] = updated_model_config
+    LOGGER.info(
+        "Resolved checkpoint-backed pretrained_backbone %r via %s -> %r",
+        pretrained_backbone,
+        resolved_backbone_ckpt,
+        resolved_pretrained_backbone,
+    )
+    return updated_config
+
+
 def checkpoint_looks_like_tifxyz_training(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -849,6 +959,7 @@ def build_tifxyz_model_bundle(payload: dict[str, Any], checkpoint_path: Path | s
     from vesuvius.neural_tracing.nets.models import make_model
 
     config = copy.deepcopy(payload["config"])
+    config = resolve_tifxyz_pretrained_backbone_config(config, checkpoint_path=checkpoint_path)
     model_type = str(config.get("model_type", "")).strip().lower()
     if model_type != "unet":
         raise ValueError(
