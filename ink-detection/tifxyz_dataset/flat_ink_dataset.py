@@ -51,6 +51,27 @@ class Segment:
         self.segment_relpath = segment_relpath
         self.patch_size = config['patch_size']
 
+    @staticmethod
+    def _map_image_z_index(image_z, image_depth, annotation_depth):
+        if image_depth <= 0 or annotation_depth <= 0:
+            raise ValueError(f"z depths must be positive, got image_depth={image_depth}, annotation_depth={annotation_depth}")
+        if image_depth == annotation_depth:
+            return int(image_z)
+        mapped = ((float(image_z) + 0.5) * float(annotation_depth) / float(image_depth)) - 0.5
+        return int(np.clip(np.rint(mapped), 0, annotation_depth - 1))
+
+    @classmethod
+    def _extract_annotation_crop(cls, annotation, z0, z1, y0, y1, x0, x1, image_depth):
+        annotation_depth = int(annotation.shape[0])
+        if annotation_depth == int(image_depth):
+            return annotation[z0:z1, y0:y1, x0:x1]
+
+        z_indices = [
+            cls._map_image_z_index(z, image_depth=int(image_depth), annotation_depth=annotation_depth)
+            for z in range(int(z0), int(z1))
+        ]
+        return np.stack([annotation[z, y0:y1, x0:x1] for z in z_indices], axis=0)
+
     @property
     def cache_key(self):
         return (
@@ -61,10 +82,22 @@ class Segment:
 
     def _find_patches(self):
         volume_auth = self.config.get('volume_auth_json')
+        image_volume = open_zarr(self.image_volume, resolution=self.scale, auth=volume_auth)
         supervision_mask = open_zarr(self.supervision_mask, resolution=self.scale, auth=volume_auth)
         inklabels = open_zarr(self.inklabels, resolution=self.scale, auth=volume_auth)
-        surface = supervision_mask.shape[0] // 2
-        surface_slice = supervision_mask[surface]
+        image_depth = int(image_volume.shape[0])
+        surface = image_depth // 2
+        supervision_surface = self._map_image_z_index(
+            surface,
+            image_depth=image_depth,
+            annotation_depth=int(supervision_mask.shape[0]),
+        )
+        inklabels_surface = self._map_image_z_index(
+            surface,
+            image_depth=image_depth,
+            annotation_depth=int(inklabels.shape[0]),
+        )
+        surface_slice = supervision_mask[supervision_surface]
         ys, xs = np.nonzero(surface_slice)
         if len(ys) == 0:
             raise ValueError(f"{self.supervision_mask} contains no nonzero voxels")
@@ -77,7 +110,7 @@ class Segment:
 
         labeled_patches = []
         for y0, x0 in patch_corners_top_left:
-            patch_bbox = inklabels[surface, y0:y0+self.patch_size[1], x0:x0+self.patch_size[2]]
+            patch_bbox = inklabels[inklabels_surface, y0:y0+self.patch_size[1], x0:x0+self.patch_size[2]]
             if patch_bbox.size == 0:
                 continue
             labeled_ys, labeled_xs = np.nonzero(patch_bbox)
@@ -108,7 +141,7 @@ class FlatInkDataset(Dataset):
         self.patch_size       = config['patch_size']
         self.datasets         = config['datasets']
         self.vol_auth         = config.get('volume_auth_json')
-        self.num_workers      = config.get('dataloader_workers', 8)
+        self.patch_finding_workers = config.get('patch_finding_workers', config.get('dataloader_workers', 8))
         self.do_augmentations = do_augmentations
 
         self.augmentations = create_training_transforms(self.patch_size) if self.do_augmentations else None
@@ -191,8 +224,13 @@ class FlatInkDataset(Dataset):
         inklabels = open_zarr(patch.inklabels, resolution=patch.segment.scale, auth=self.vol_auth)
 
         image_crop = image_vol[z0:z1, y0:y1, x0:x1]
-        supervision_crop = supervision_mask[z0:z1, y0:y1, x0:x1]
-        inklabels_crop = inklabels[z0:z1, y0:y1, x0:x1]
+        image_depth = int(image_vol.shape[0])
+        supervision_crop = patch.segment._extract_annotation_crop(
+            supervision_mask, z0, z1, y0, y1, x0, x1, image_depth=image_depth
+        )
+        inklabels_crop = patch.segment._extract_annotation_crop(
+            inklabels, z0, z1, y0, y1, x0, x1, image_depth=image_depth
+        )
 
         image_crop = normalize_robust(image_crop)
 
