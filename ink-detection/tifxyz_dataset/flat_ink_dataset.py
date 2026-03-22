@@ -51,26 +51,15 @@ class Segment:
         self.segment_relpath = segment_relpath
         self.patch_size = config['patch_size']
 
-    @staticmethod
-    def _map_image_z_index(image_z, image_depth, annotation_depth):
-        if image_depth <= 0 or annotation_depth <= 0:
-            raise ValueError(f"z depths must be positive, got image_depth={image_depth}, annotation_depth={annotation_depth}")
-        if image_depth == annotation_depth:
-            return int(image_z)
-        mapped = ((float(image_z) + 0.5) * float(annotation_depth) / float(image_depth)) - 0.5
-        return int(np.clip(np.rint(mapped), 0, annotation_depth - 1))
-
     @classmethod
     def _extract_annotation_crop(cls, annotation, z0, z1, y0, y1, x0, x1, image_depth):
         annotation_depth = int(annotation.shape[0])
         if annotation_depth == int(image_depth):
             return annotation[z0:z1, y0:y1, x0:x1]
 
-        z_indices = [
-            cls._map_image_z_index(z, image_depth=int(image_depth), annotation_depth=annotation_depth)
-            for z in range(int(z0), int(z1))
-        ]
-        return np.stack([annotation[z, y0:y1, x0:x1] for z in z_indices], axis=0)
+        annotation_crop = annotation[:, y0:y1, x0:x1]
+        flattened = np.max(annotation_crop, axis=0)
+        return np.broadcast_to(flattened, (int(z1) - int(z0),) + flattened.shape).copy()
 
     @property
     def cache_key(self):
@@ -87,17 +76,7 @@ class Segment:
         inklabels = open_zarr(self.inklabels, resolution=self.scale, auth=volume_auth)
         image_depth = int(image_volume.shape[0])
         surface = image_depth // 2
-        supervision_surface = self._map_image_z_index(
-            surface,
-            image_depth=image_depth,
-            annotation_depth=int(supervision_mask.shape[0]),
-        )
-        inklabels_surface = self._map_image_z_index(
-            surface,
-            image_depth=image_depth,
-            annotation_depth=int(inklabels.shape[0]),
-        )
-        surface_slice = supervision_mask[supervision_surface]
+        surface_slice = np.max(supervision_mask, axis=0)
         ys, xs = np.nonzero(surface_slice)
         if len(ys) == 0:
             raise ValueError(f"{self.supervision_mask} contains no nonzero voxels")
@@ -110,7 +89,7 @@ class Segment:
 
         labeled_patches = []
         for y0, x0 in patch_corners_top_left:
-            patch_bbox = inklabels[inklabels_surface, y0:y0+self.patch_size[1], x0:x0+self.patch_size[2]]
+            patch_bbox = np.max(inklabels[:, y0:y0+self.patch_size[1], x0:x0+self.patch_size[2]], axis=0)
             if patch_bbox.size == 0:
                 continue
             labeled_ys, labeled_xs = np.nonzero(patch_bbox)
