@@ -206,6 +206,7 @@ def train(config_path):
     model = make_model(config)
     optimizer_target = model
     pretrained_backbone = (config.get('model_config') or {}).get('pretrained_backbone')
+    freeze_encoder = False
     if pretrained_backbone:
         freeze_encoder = bool(config.get('freeze_encoder', False))
         encoder_lr_mult = float(config.get('encoder_lr_mult', 1.0))
@@ -307,6 +308,18 @@ def train(config_path):
     latest_val_loss = None
     latest_ema_val_loss = None
 
+    def set_frozen_encoder_eval(active_model):
+        if not (pretrained_backbone and freeze_encoder):
+            return
+
+        shared_encoder = getattr(active_model, 'shared_encoder', None)
+        if shared_encoder is None:
+            shared_encoder = getattr(getattr(active_model, 'module', None), 'shared_encoder', None)
+        if shared_encoder is not None:
+            shared_encoder.eval()
+
+    set_frozen_encoder_eval(model)
+
     def forward_ink(image, active_model=None):
         active_model = model if active_model is None else active_model
         if use_stitched_forward:
@@ -368,6 +381,7 @@ def train(config_path):
 
     for step in progress_bar:
         model.train()
+        set_frozen_encoder_eval(model)
 
         try:
             batch = next(train_iterator)
