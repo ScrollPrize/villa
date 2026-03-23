@@ -97,7 +97,6 @@ class TifxyzInkDataset(Dataset):
         if apply_augmentation:                                                          # we'll use the vesuvius augmentation pipeline , see vesuvius/src/vesuvius/models/augmentation/pipelines/training_transforms.py
             self.augmentations = create_training_transforms(                            # for current defaults 
                 patch_size=tuple(int(v) for v in self.patch_size_zyx),                  # TODO: make these configurable
-                no_spatial=self.use_normal_pooled_3d,
             )
         else:
             self.augmentations = None
@@ -154,14 +153,44 @@ class TifxyzInkDataset(Dataset):
             segmentation_out[2].to(dtype=torch.float32).cpu(),
         )
 
-    def _apply_image_only_augmentation(self, vol_crop):
+    def _apply_normal_pooled_augmentation(self, vol_crop, sampled_grid):
         image = torch.as_tensor(
             np.asarray(vol_crop, dtype=np.float32),
             dtype=torch.float32,
         ).unsqueeze(0)
-        augmented = self.augmentations(image=image)
-        image_out = augmented["image"]
-        return image_out[0].to(dtype=torch.float32).cpu()
+        local_grid = np.asarray(sampled_grid["local_grid"], dtype=np.float32)
+        normals_zyx = np.asarray(sampled_grid["normals_zyx"], dtype=np.float32)
+
+        augmented = self.augmentations(
+            image=image,
+            keypoints=torch.as_tensor(
+                local_grid.reshape(-1, local_grid.shape[-1]),
+                dtype=torch.float32,
+            ),
+            surface_normals=torch.as_tensor(
+                normals_zyx.reshape(-1, normals_zyx.shape[-1]),
+                dtype=torch.float32,
+            ),
+            vector_keys=("surface_normals",),
+            crop_shape=tuple(int(v) for v in self.patch_size_zyx),
+        )
+
+        augmented_grid = dict(sampled_grid)
+        augmented_grid["local_grid"] = (
+            augmented["keypoints"]
+            .reshape(local_grid.shape)
+            .to(dtype=torch.float32)
+            .cpu()
+            .numpy()
+        )
+        augmented_grid["normals_zyx"] = (
+            augmented["surface_normals"]
+            .reshape(normals_zyx.shape)
+            .to(dtype=torch.float32)
+            .cpu()
+            .numpy()
+        )
+        return augmented["image"][0].to(dtype=torch.float32).cpu(), augmented_grid
 
     @staticmethod
     def _resize_surface_array(array, size_yx, *, mode):
@@ -282,7 +311,10 @@ class TifxyzInkDataset(Dataset):
 
         if self.use_normal_pooled_3d:
             if self.augmentations is not None:
-                vol_crop = self._apply_image_only_augmentation(vol_crop)
+                vol_crop, sampled_grid = self._apply_normal_pooled_augmentation(
+                    vol_crop,
+                    sampled_grid,
+                )
             out = {
                 "vol": self._to_float32_tensor(vol_crop),
                 "patch_segment": patch_segment,
