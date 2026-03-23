@@ -15,7 +15,7 @@ from common import (
     _read_volume_crop_from_patch_dict,
     _sample_patch_supervision_grid,
 )
-from .patch_finding import find_patches
+from patch_finding import find_patches
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
 
