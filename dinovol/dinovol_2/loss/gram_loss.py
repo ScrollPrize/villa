@@ -32,6 +32,10 @@ class GramLoss(nn.Module):
     ) -> torch.Tensor:
         if img_level and (student_features.ndim != 3 or teacher_features.ndim != 3):
             raise ValueError("img_level Gram loss expects (B, N, D) student and teacher features.")
+        if student_features.ndim != teacher_features.ndim:
+            raise ValueError(
+                f"student and teacher features must have the same rank, got {student_features.ndim} and {teacher_features.ndim}."
+            )
 
         student = student_features.float()
         teacher = teacher_features.float()
@@ -40,10 +44,15 @@ class GramLoss(nn.Module):
             student = F.normalize(student, dim=-1)
             teacher = F.normalize(teacher, dim=-1)
 
-        if not img_level and student.ndim == 3:
-            student = student.flatten(0, 1)
-        if not img_level and teacher.ndim == 3:
-            teacher = teacher.flatten(0, 1)
+        if not img_level:
+            if student.ndim == 3:
+                # Preserve per-sample independence by forming feature-feature
+                # Gram matrices for each sample instead of mixing tokens across
+                # the whole batch.
+                student = student.transpose(-1, -2)
+                teacher = teacher.transpose(-1, -2)
+            elif student.ndim != 2:
+                raise ValueError("non-img-level Gram loss expects (N, D) or (B, N, D) features.")
 
         teacher_sim = torch.matmul(teacher, teacher.transpose(-1, -2))
         student_sim = torch.matmul(student, student.transpose(-1, -2))

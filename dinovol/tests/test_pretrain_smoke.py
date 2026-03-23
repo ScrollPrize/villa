@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import zarr
 
+from dinovol_2.loss import GramLoss
 from dinovol_2.pretrain import DinoIBOTPretrainer
 from dinovol_2.verify import build_verification_report
 
@@ -229,6 +230,49 @@ class PretrainSmokeTests(unittest.TestCase):
             resumed._close_dataloader(resumed_dataloader)
             resumed._close_auxiliary_datasets()
             resumed._finish_wandb()
+
+    def test_resume_from_base_checkpoint_refreshes_gram_teacher_from_loaded_teacher(self) -> None:
+        checkpoint = self._checkpoint_for("default")
+        config = self._base_config(output_name="gram_resume_from_base")
+        config["gram"] = {
+            "enabled": True,
+            "loss_weight": 2.0,
+            "teacher_refresh_every": 10000,
+        }
+        config["resume"] = True
+        config["auto_resume"] = False
+        config["resume_from"] = str(checkpoint)
+        trainer = DinoIBOTPretrainer(config)
+        try:
+            loaded_step = trainer.load_checkpoint(checkpoint)
+            self.assertEqual(loaded_step, 0)
+            self.assertLess(_state_dict_l1_diff(trainer.gram_teacher_backbone, trainer.model_module.teacher.backbone), 1e-6)
+        finally:
+            trainer._close_auxiliary_datasets()
+            trainer._finish_wandb()
+
+    def test_gram_loss_non_img_level_is_per_sample(self) -> None:
+        loss_fn = GramLoss(apply_norm=False)
+        student = torch.tensor(
+            [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[2.0, 1.0], [0.5, 1.5]],
+            ],
+            dtype=torch.float32,
+        )
+        teacher = torch.tensor(
+            [
+                [[1.5, 2.5], [2.5, 3.5]],
+                [[1.0, 0.0], [1.0, 2.0]],
+            ],
+            dtype=torch.float32,
+        )
+
+        actual = loss_fn(student, teacher, img_level=False)
+        student_grams = torch.matmul(student.transpose(-1, -2), student)
+        teacher_grams = torch.matmul(teacher.transpose(-1, -2), teacher)
+        expected = torch.nn.functional.mse_loss(student_grams, teacher_grams)
+        self.assertAlmostEqual(float(actual), float(expected), places=6)
 
 
 if __name__ == "__main__":

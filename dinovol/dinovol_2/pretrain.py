@@ -1566,10 +1566,17 @@ class DinoIBOTPretrainer:
             self.dino_loss.load_state_dict(checkpoint["dino_loss"])
         if "ibot_patch_loss" in checkpoint:
             self.ibot_patch_loss.load_state_dict(checkpoint["ibot_patch_loss"])
-        if checkpoint.get("gram_teacher_backbone") is not None and self.gram_teacher_backbone is not None:
-            self.gram_teacher_backbone.load_state_dict(checkpoint["gram_teacher_backbone"])
-            self.gram_teacher_backbone.requires_grad_(False)
-            self.gram_teacher_backbone.eval()
+        if self.gram_teacher_backbone is not None:
+            if checkpoint.get("gram_teacher_backbone") is not None:
+                self.gram_teacher_backbone.load_state_dict(checkpoint["gram_teacher_backbone"])
+                self.gram_teacher_backbone.requires_grad_(False)
+                self.gram_teacher_backbone.eval()
+            else:
+                # Older or base-pretraining checkpoints do not carry a
+                # dedicated Gram teacher. On resume, align the frozen Gram
+                # teacher with the just-restored EMA teacher state instead of
+                # keeping any stale initialization from __init__.
+                self._refresh_gram_teacher_from_teacher()
         if checkpoint.get("wandb_run_id") and not self.wandb_run_id:
             self.wandb_run_id = str(checkpoint["wandb_run_id"])
             self.config["wandb_run_id"] = self.wandb_run_id
