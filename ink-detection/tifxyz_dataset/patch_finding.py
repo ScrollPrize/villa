@@ -9,7 +9,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 import vesuvius.tifxyz as tifxyz
-from .common import load_segment_label_masks, open_zarr
+from common import load_segment_label_masks, open_zarr
 from vesuvius.neural_tracing.datasets.common import (
     _parse_z_range,
     _segment_overlaps_z_range,
