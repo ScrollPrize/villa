@@ -26,11 +26,8 @@ from common import (
 from flat_ink_dataset import FlatInkDataset
 from losses import create_loss_from_config
 from stitching import resolve_model_and_loader_patch_sizes, run_stitched_model_forward
+from tifxyz_dataset import TifxyzInkDataset
 
-try:
-    from tifxyz_dataset import TifxyzInkDataset
-except ImportError:
-    from tifxyz_dataset.tifxyz_dataset import TifxyzInkDataset
 
 
 class _OptimizerParamGroupTarget:
