@@ -868,6 +868,7 @@ def _prepare_segment_records(
         )
 
         positive_mask = np.zeros_like(valid_mask, dtype=bool)
+        supervision_only_mask = np.zeros_like(valid_mask, dtype=bool)
         labeled_mask = np.zeros_like(valid_mask, dtype=bool)
         ink_label_path = None
         try:
@@ -893,6 +894,7 @@ def _prepare_segment_records(
             ink_mask = ink_mask[row_idx[:, None], col_idx[None, :]]
             supervision_mask = supervision_mask[row_idx[:, None], col_idx[None, :]]
             positive_mask = valid_mask & ink_mask
+            supervision_only_mask = valid_mask & supervision_mask
             labeled_mask = valid_mask & (ink_mask | supervision_mask)
         except AssertionError as exc:
             patch_generation_stats["segments_missing_ink"] += 1
@@ -912,9 +914,17 @@ def _prepare_segment_records(
             positive_mask,
             retarget_factor,
         )
+        supervision_points_zyx = _points_from_mask(
+            z_stored,
+            y_stored,
+            x_stored,
+            supervision_only_mask,
+            retarget_factor,
+        )
         valid_world_bbox = _inclusive_bbox_from_point_sets((valid_points_zyx,))
         labeled_world_bbox = _inclusive_bbox_from_point_sets((labeled_points_zyx,))
         positive_world_bbox = _inclusive_bbox_from_point_sets((positive_points_zyx,))
+        supervision_world_bbox = _inclusive_bbox_from_point_sets((supervision_points_zyx,))
 
         if labeled_points_zyx.size == 0:
             patch_generation_stats["segments_without_labels"] += 1
@@ -937,8 +947,10 @@ def _prepare_segment_records(
                 "valid_world_bbox": valid_world_bbox,
                 "labeled_world_bbox": labeled_world_bbox,
                 "positive_world_bbox": positive_world_bbox,
+                "supervision_world_bbox": supervision_world_bbox,
                 "valid_points_zyx": valid_points_zyx,
                 "positive_points_zyx": positive_points_zyx,
+                "supervision_points_zyx": supervision_points_zyx,
             }
         )
 

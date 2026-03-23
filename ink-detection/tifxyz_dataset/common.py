@@ -152,6 +152,34 @@ def _normalize_patch_size_zyx(patch_size):
     return patch_size_zyx
 
 
+def _get_segment_stored_grid(dataset, segment):
+    segment_uuid = str(segment.uuid)
+    cached = dataset._segment_grid_cache.get(segment_uuid)
+    if cached is not None:
+        return cached
+
+    segment.use_stored_resolution()
+    x_stored, y_stored, z_stored, valid_stored = segment[:, :]
+
+    x_stored = np.asarray(x_stored, dtype=np.float32)
+    y_stored = np.asarray(y_stored, dtype=np.float32)
+    z_stored = np.asarray(z_stored, dtype=np.float32)
+    valid_mask = np.asarray(valid_stored, dtype=bool)
+    valid_mask &= np.isfinite(x_stored)
+    valid_mask &= np.isfinite(y_stored)
+    valid_mask &= np.isfinite(z_stored)
+
+    cached = {
+        "x": x_stored,
+        "y": y_stored,
+        "z": z_stored,
+        "valid": valid_mask,
+        "shape": (int(x_stored.shape[0]), int(x_stored.shape[1])),
+    }
+    dataset._segment_grid_cache[segment_uuid] = cached
+    return cached
+
+
 def _read_bbox_with_padding(volume, bbox, *, fill_value=0):
     z0, y0, x0, z1, y1, x1 = (int(v) for v in bbox)
     expected_shape = (z1 - z0, y1 - y0, x1 - x0)
@@ -308,7 +336,7 @@ def _sample_patch_supervision_grid(
 ):
     from vesuvius.tifxyz import interpolate_at_points
 
-    grid = dataset._get_segment_stored_grid(segment)
+    grid = _get_segment_stored_grid(dataset, segment)
     x_stored = grid["x"]
     y_stored = grid["y"]
     z_stored = grid["z"]
@@ -636,7 +664,7 @@ def _get_segment_normals_zyx(dataset, segment):
     if cached is not None:
         return cached
 
-    grid = dataset._get_segment_stored_grid(segment)
+    grid = _get_segment_stored_grid(dataset, segment)
     normals = _estimate_surface_normals_zyx(
         grid["x"],
         grid["y"],

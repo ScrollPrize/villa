@@ -27,6 +27,11 @@ from flat_ink_dataset import FlatInkDataset
 from losses import create_loss_from_config
 from stitching import resolve_model_and_loader_patch_sizes, run_stitched_model_forward
 
+try:
+    from tifxyz_dataset import TifxyzInkDataset
+except ImportError:
+    from tifxyz_dataset.tifxyz_dataset import TifxyzInkDataset
+
 
 class _OptimizerParamGroupTarget:
     """Adapter for create_optimizer(), which expects an object with parameters()."""
@@ -38,11 +43,103 @@ class _OptimizerParamGroupTarget:
         return self._param_groups
 
 
+def _normalize_distance_pair(value):
+    if value is None:
+        raise ValueError("distance configuration must not be None")
+    if np.isscalar(value):
+        scalar = float(value)
+        return (scalar, scalar)
+    pair = tuple(float(v) for v in value)
+    if len(pair) != 2:
+        raise ValueError(f"distance configuration must be a number or length-2 sequence, got {value!r}")
+    return pair
+
+
+def _build_normal_pool_offsets(distance_pair, sample_step, *, device, dtype):
+    pos_distance = max(0.0, float(distance_pair[0]))
+    neg_distance = max(0.0, float(distance_pair[1]))
+    sample_step = float(sample_step)
+    if sample_step <= 0.0:
+        raise ValueError(f"normal_pool_step must be > 0, got {sample_step}")
+
+    offsets = np.arange(-neg_distance, pos_distance + (0.5 * sample_step), sample_step, dtype=np.float32)
+    anchors = np.asarray([-neg_distance, 0.0, pos_distance], dtype=np.float32)
+    offsets = np.unique(np.round(np.concatenate([offsets, anchors], axis=0), decimals=6))
+    offsets.sort()
+    return torch.as_tensor(offsets, device=device, dtype=dtype)
+
+
+def _pool_logits_along_surface_normals(
+    logits,
+    surface_points_zyx,
+    surface_normals_zyx,
+    offsets,
+    *,
+    reduction,
+    temperature,
+):
+    if logits.ndim != 5:
+        raise ValueError(
+            f"mode='normal_pooled_3d' expects 3D logits with shape [B, C, Z, Y, X], got {tuple(logits.shape)}"
+        )
+    if surface_points_zyx.ndim != 4 or surface_points_zyx.shape[-1] != 3:
+        raise ValueError(
+            f"Expected surface_points_zyx shape [B, H, W, 3], got {tuple(surface_points_zyx.shape)}"
+        )
+    if surface_normals_zyx.shape != surface_points_zyx.shape:
+        raise ValueError(
+            f"surface_normals_zyx shape {tuple(surface_normals_zyx.shape)} must match surface_points_zyx "
+            f"{tuple(surface_points_zyx.shape)}"
+        )
+
+    logits = logits.float()
+    surface_points_zyx = surface_points_zyx.to(device=logits.device, dtype=logits.dtype)
+    surface_normals_zyx = surface_normals_zyx.to(device=logits.device, dtype=logits.dtype)
+    offsets = offsets.to(device=logits.device, dtype=logits.dtype)
+
+    ray_points = (
+        surface_points_zyx[..., None, :]
+        + (surface_normals_zyx[..., None, :] * offsets.view(1, 1, 1, -1, 1))
+    )
+    z = ray_points[..., 0]
+    y = ray_points[..., 1]
+    x = ray_points[..., 2]
+
+    size_z, size_y, size_x = logits.shape[-3:]
+    denom_z = max(size_z - 1, 1)
+    denom_y = max(size_y - 1, 1)
+    denom_x = max(size_x - 1, 1)
+    z_norm = (2.0 * z / denom_z) - 1.0
+    y_norm = (2.0 * y / denom_y) - 1.0
+    x_norm = (2.0 * x / denom_x) - 1.0
+    grid = torch.stack([x_norm, y_norm, z_norm], dim=-1).permute(0, 3, 1, 2, 4)
+
+    ray_logits = F.grid_sample(
+        logits,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    if reduction == "max":
+        return ray_logits.amax(dim=2)
+    if reduction == "logsumexp":
+        if temperature <= 0.0:
+            raise ValueError(
+                f"normal_pool_temperature must be > 0 when using logsumexp pooling, got {temperature}"
+            )
+        return temperature * torch.logsumexp(ray_logits / temperature, dim=2)
+    raise ValueError(
+        f"Unsupported normal_pool_reduction {reduction!r}; expected 'logsumexp' or 'max'"
+    )
+
+
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
 def train(config_path):
     with open(config_path, 'r') as f:
         config = json.load(f)
+    training_mode = str(config.get('mode', 'default')).strip().lower()
 
     checkpoint_path = config.get('checkpoint')
     checkpoint = None
@@ -96,6 +193,8 @@ def train(config_path):
     use_stitched_forward = bool(
         config.get('use_stitched_forward', requested_stitch_factor > 1)
     )
+    if training_mode == 'normal_pooled_3d' and use_stitched_forward:
+        raise ValueError("mode='normal_pooled_3d' does not support stitched forward")
     stitched_gradient_checkpointing = bool(
         config.get('stitched_gradient_checkpointing', True)
     )
@@ -161,9 +260,19 @@ def train(config_path):
 
     dataset_config = deepcopy(config)
     dataset_config['patch_size'] = list(loader_patch_size)
-
-    shared_ds = FlatInkDataset(dataset_config, do_augmentations=False)
-    train_ds = FlatInkDataset(dataset_config, do_augmentations=True, patches=shared_ds.patches)
+    input_key = 'image'
+    if training_mode == 'normal_pooled_3d':
+        shared_ds = TifxyzInkDataset(dataset_config, apply_augmentation=False)
+        train_ds = TifxyzInkDataset(
+            dataset_config,
+            apply_augmentation=True,
+            patches=shared_ds.patches,
+            patch_generation_stats=shared_ds.patch_generation_stats,
+        )
+        input_key = 'vol'
+    else:
+        shared_ds = FlatInkDataset(dataset_config, do_augmentations=False)
+        train_ds = FlatInkDataset(dataset_config, do_augmentations=True, patches=shared_ds.patches)
     val_ds = shared_ds
 
     num_patches = len(train_ds)
@@ -307,6 +416,19 @@ def train(config_path):
     )
     latest_val_loss = None
     latest_ema_val_loss = None
+    normal_pool_distance = _normalize_distance_pair(
+        config.get(
+            'normal_pool_distance',
+            config.get('fg_distance', config.get('label_distance', 10)),
+        )
+    )
+    normal_pool_step = float(
+        config.get('normal_pool_step', config.get('normal_sample_step', 0.5))
+    )
+    normal_pool_reduction = str(
+        config.get('normal_pool_reduction', 'max')
+    ).strip().lower()
+    normal_pool_temperature = float(config.get('normal_pool_temperature', 1.0))
 
     def set_frozen_encoder_eval(active_model):
         if not (pretrained_backbone and freeze_encoder):
@@ -331,8 +453,45 @@ def train(config_path):
             )['ink']
         return active_model(image)['ink']
 
+    def get_model_input(batch):
+        image = batch[input_key].float()
+        if image.ndim == 4:
+            image = image.unsqueeze(1)
+        if image.ndim != 5:
+            raise ValueError(
+                f"Expected {input_key!r} batch tensor with 4 or 5 dims, got shape {tuple(image.shape)}"
+            )
+        return image
+
+    def prepare_loss_inputs(preds, batch):
+        if training_mode == 'normal_pooled_3d':
+            offsets = _build_normal_pool_offsets(
+                normal_pool_distance,
+                normal_pool_step,
+                device=preds.device,
+                dtype=preds.dtype,
+            )
+            pooled_preds = _pool_logits_along_surface_normals(
+                preds,
+                batch['surface_points_zyx'],
+                batch['surface_normals_zyx'],
+                offsets,
+                reduction=normal_pool_reduction,
+                temperature=normal_pool_temperature,
+            )
+            targets = batch['surface_targets_2d'].float().unsqueeze(1)
+            valid_mask = batch['surface_valid_2d'].float().unsqueeze(1)
+            ignore_mask = (valid_mask <= 0).float()
+            return pooled_preds, targets, ignore_mask
+
+        targets = (torch.amax(batch['inklabels'].float(), dim=2) > 0).float()
+        supervision_mask = torch.amax(batch['supervision_mask'].float(), dim=2)
+        ignore_mask = (supervision_mask <= 0).float()
+        return preds, targets, ignore_mask
+
     def append_preview_tiles(preview_inputs, preview_labels, preview_probabilities, batch, preds, targets, ignore_mask):
-        input_mid_slice = batch['image'].float()[:, :, batch['image'].shape[2] // 2]
+        input_batch = get_model_input(batch)
+        input_mid_slice = input_batch[:, :, input_batch.shape[2] // 2]
         if input_mid_slice.shape[-2:] != preds.shape[-2:]:
             input_mid_slice = F.interpolate(
                 input_mid_slice,
@@ -391,12 +550,10 @@ def train(config_path):
 
         with accelerator.accumulate(model):
             with accelerator.autocast():
-                preds = forward_ink(batch['image'])
-            targets = (torch.amax(batch['inklabels'].float(), dim=2) > 0).float()
-            supervision_mask = torch.amax(batch['supervision_mask'].float(), dim=2)
-            ignore_mask = (supervision_mask <= 0).float()
+                preds = forward_ink(get_model_input(batch))
+            loss_preds, targets, ignore_mask = prepare_loss_inputs(preds, batch)
             targets_with_ignore = torch.cat([targets, ignore_mask], dim=1)
-            l = loss(preds.float(), targets_with_ignore)
+            l = loss(loss_preds.float(), targets_with_ignore)
             if not torch.isfinite(l):
                 raise RuntimeError(f"Non-finite loss at step {step}")
             accelerator.backward(l)
@@ -449,7 +606,7 @@ def train(config_path):
                 train_preview_labels,
                 train_preview_probabilities,
                 batch,
-                preds.detach(),
+                loss_preds.detach(),
                 targets.detach(),
                 ignore_mask.detach(),
             )
@@ -468,21 +625,25 @@ def train(config_path):
                 for val_batch_idx in range(num_val_batches):
                     val_batch = next(val_iterator)
                     with accelerator.autocast():
-                        val_preds = forward_ink(val_batch['image'])
-                    preview_preds = val_preds
-                    val_targets = torch.amax(val_batch['inklabels'].float(), dim=2)
-                    val_supervision_mask = torch.amax(val_batch['supervision_mask'].float(), dim=2)
-                    val_targets = (val_targets > 0).float()
-                    val_ignore_mask = (val_supervision_mask <= 0).float()
+                        val_preds = forward_ink(get_model_input(val_batch))
+                    val_loss_preds, val_targets, val_ignore_mask = prepare_loss_inputs(
+                        val_preds,
+                        val_batch,
+                    )
+                    preview_preds = val_loss_preds
                     val_targets_with_ignore = torch.cat([val_targets, val_ignore_mask], dim=1)
-                    val_l = loss(val_preds.float(), val_targets_with_ignore)
+                    val_l = loss(val_loss_preds.float(), val_targets_with_ignore)
                     val_losses.append(val_l.item())
                     if ema_model is not None and ema_validate:
                         with accelerator.autocast():
-                            ema_val_preds = forward_ink(val_batch['image'], active_model=ema_model)
-                        ema_val_l = loss(ema_val_preds.float(), val_targets_with_ignore)
+                            ema_val_preds = forward_ink(
+                                get_model_input(val_batch),
+                                active_model=ema_model,
+                            )
+                        ema_val_loss_preds, _, _ = prepare_loss_inputs(ema_val_preds, val_batch)
+                        ema_val_l = loss(ema_val_loss_preds.float(), val_targets_with_ignore)
                         ema_val_losses.append(ema_val_l.item())
-                        preview_preds = ema_val_preds
+                        preview_preds = ema_val_loss_preds
 
                     if val_batch_idx in preview_batch_indices:
                         append_preview_tiles(
