@@ -310,7 +310,10 @@ class TifxyzInkDataset(Dataset):
             torch.as_tensor(
                 np.stack(
                     [
-                        np.asarray(class_codes == 1, dtype=np.float32),
+                        np.asarray(
+                            (class_codes == 1) & geometry_valid_src,
+                            dtype=np.float32,
+                        ),
                         np.asarray(supervision_valid_src, dtype=np.float32),
                     ],
                     axis=0,
