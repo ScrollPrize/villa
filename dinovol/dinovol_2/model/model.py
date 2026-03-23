@@ -521,7 +521,7 @@ class DinoVitStudentTeacher(nn.Module):
             self._freeze_teacher()
             return
 
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         if "teacher" in checkpoint:
             state_dict = checkpoint["teacher"]
         elif "model" in checkpoint:
