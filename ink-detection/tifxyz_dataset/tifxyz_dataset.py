@@ -410,7 +410,6 @@ class TifxyzInkDataset(Dataset):
             )
             out = {
                 "vol": self._to_float32_tensor(vol_input),
-                "patch_segment": patch_segment,
             }
             out.update(self._build_normal_pooled_surface_sample(sampled_grid))
             return out
@@ -462,7 +461,6 @@ class TifxyzInkDataset(Dataset):
             "labeled_vox_at_surface": self._to_float32_tensor(labeled_vox_at_surface),
             "surface_vox": self._to_float32_tensor(surface_vox),
             "projected_loss_mask": self._to_float32_tensor(projected_loss_mask),
-            "patch_segment": patch_segment,
         }
 
     def __getitem__(self, idx):
@@ -501,9 +499,6 @@ class TifxyzInkDataset(Dataset):
             sample = segment_samples[0]
             sample.update(
                 {
-                    "patch": patch,
-                    "patch_segments": selected_patch_segments,
-                    "selected_segment_indices": selected_segment_indices,
                     "wrap_mode": self.wrap_mode,
                     "idx": int(idx),
                 }
@@ -524,10 +519,6 @@ class TifxyzInkDataset(Dataset):
                 [sample["projected_loss_mask"] for sample in segment_samples],
                 dim=0,
             ),
-            "patch": patch,
-            "patch_segment": None,
-            "patch_segments": selected_patch_segments,
-            "selected_segment_indices": selected_segment_indices,
             "wrap_mode": self.wrap_mode,
             "idx": int(idx),
         }
