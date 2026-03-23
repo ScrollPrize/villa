@@ -306,30 +306,34 @@ class TifxyzInkDataset(Dataset):
             torch.zeros_like(resized_geometry),
         )
 
+        label_tensor = torch.as_tensor(
+            np.stack(
+                [
+                    np.asarray(
+                        (class_codes == 1) & geometry_valid_src,
+                        dtype=np.float32,
+                    ),
+                    np.asarray(supervision_valid_src, dtype=np.float32),
+                ],
+                axis=0,
+            ),
+            dtype=torch.float32,
+        ).unsqueeze(0)
         resized_labels = F.interpolate(
-            torch.as_tensor(
-                np.stack(
-                    [
-                        np.asarray(
-                            (class_codes == 1) & geometry_valid_src,
-                            dtype=np.float32,
-                        ),
-                        np.asarray(supervision_valid_src, dtype=np.float32),
-                    ],
-                    axis=0,
-                ),
-                dtype=torch.float32,
-            ).unsqueeze(0),
+            label_tensor,
             size=size_yx,
-            mode="nearest",
+            mode="bilinear",
+            align_corners=False,
         )[0]
+        positive_support = resized_labels[0] > float(eps)
+        supervision_support = resized_labels[1] > float(eps)
 
         return (
             resized_geometry[:3].permute(1, 2, 0).cpu().numpy(),
             resized_geometry[3:].permute(1, 2, 0).cpu().numpy(),
             support.cpu().numpy(),
-            (resized_labels[0].cpu().numpy() > 0.5).astype(np.float32, copy=False),
-            resized_labels[1].cpu().numpy() > 0.5,
+            positive_support.cpu().numpy().astype(np.float32, copy=False),
+            supervision_support.cpu().numpy(),
         )
 
     def _build_normal_pooled_surface_sample(self, sampled_grid):
