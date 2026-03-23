@@ -1,4 +1,5 @@
 import os
+import warnings
 import cc3d
 import numpy as np
 import torch
@@ -463,7 +464,15 @@ class TifxyzInkDataset(Dataset):
             "projected_loss_mask": self._to_float32_tensor(projected_loss_mask),
         }
 
-    def __getitem__(self, idx):
+    @staticmethod
+    def _is_resampleable_normal_pooled_error(exc):
+        message = str(exc)
+        return message in {
+            "normal_pooled_3d supervision must contain at least one valid surface sample",
+            "normal_pooled_3d supervision must contain at least one positive surface label",
+        }
+
+    def _build_sample_for_index(self, idx):
         patch = self.patches[idx]
         selected_segment_indices = self._select_patch_segment_indices(patch)
         selected_patch_segments = [
@@ -522,6 +531,32 @@ class TifxyzInkDataset(Dataset):
             "wrap_mode": self.wrap_mode,
             "idx": int(idx),
         }
+
+    def __getitem__(self, idx):
+        idx = int(idx)
+        if not self.use_normal_pooled_3d:
+            return self._build_sample_for_index(idx)
+
+        attempt_idx = 0
+        num_patches = len(self.patches)
+        candidate_idx = idx
+        while True:
+            try:
+                return self._build_sample_for_index(candidate_idx)
+            except AssertionError as exc:
+                if not self._is_resampleable_normal_pooled_error(exc):
+                    raise
+                attempt_idx += 1
+                warnings.warn(
+                    (
+                        "Resampling invalid normal_pooled_3d sample "
+                        f"(requested_idx={idx}, sampled_idx={int(candidate_idx)}, "
+                        f"attempt={attempt_idx}): {exc}"
+                    ),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                candidate_idx = int(np.random.randint(num_patches))
 
 if __name__ == "__main__":
     import argparse
