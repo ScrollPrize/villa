@@ -284,6 +284,7 @@ def train(config_path):
             patch_generation_stats=shared_ds.patch_generation_stats,
         )
         input_key = 'vol'
+        config['in_channels'] = int(getattr(shared_ds, 'input_channels', 1))
     else:
         shared_ds = FlatInkDataset(dataset_config, do_augmentations=False)
         train_ds = FlatInkDataset(dataset_config, do_augmentations=True, patches=shared_ds.patches)

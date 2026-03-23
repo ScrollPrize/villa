@@ -3,6 +3,7 @@ import cc3d
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.ndimage import distance_transform_edt
 
 from torch.utils.data import Dataset
 
@@ -69,6 +70,12 @@ class TifxyzInkDataset(Dataset):
 
         self.normal_sample_step = float(config.get("normal_sample_step", 0.5))
         self.surface_bbox_pad = float(config.get("surface_bbox_pad", 2.0))
+        self.surface_distance_clip = float(config.get("surface_distance_clip", 10.0))
+        if self.surface_distance_clip <= 0.0:
+            raise ValueError(
+                f"surface_distance_clip must be > 0, got {self.surface_distance_clip}"
+            )
+        self.input_channels = 2 if self.use_normal_pooled_3d else 1
       
         self.overlap_fraction = float(config.get("overlap_fraction", 0.25))             # amount of overlap (stride) in train/val patches, as a percentage of the patch size
         self.patch_finding_workers = int(
@@ -265,6 +272,80 @@ class TifxyzInkDataset(Dataset):
         }
 
     @staticmethod
+    def _compute_surface_point_mask(local_grid, crop_size, base_mask):
+        local_grid = np.asarray(local_grid, dtype=np.float32)
+        surface_point_mask = np.asarray(base_mask, dtype=bool).copy()
+        surface_point_mask &= np.isfinite(local_grid).all(axis=-1)
+        for axis, axis_size in enumerate(tuple(int(v) for v in crop_size)):
+            coords = local_grid[..., axis]
+            surface_point_mask &= coords >= 0.0
+            surface_point_mask &= coords < float(axis_size)
+        return surface_point_mask
+
+    def _build_surface_voxels_and_labels(self, sampled_grid, crop_size):
+        local_grid = np.asarray(sampled_grid["local_grid"], dtype=np.float32)
+        crop_size = tuple(int(v) for v in crop_size)
+        surface_point_mask = self._compute_surface_point_mask(
+            local_grid,
+            crop_size,
+            sampled_grid["in_patch"],
+        )
+        assert local_grid.size > 0 and bool(np.any(surface_point_mask)), (
+            "sampled_grid must contain in-patch surface points"
+        )
+
+        positive_point_mask = surface_point_mask & (sampled_grid["class_codes"] == 1)
+        assert bool(np.any(positive_point_mask)), (
+            "sampled_grid must contain labeled points inside the patch"
+        )
+        positive_label_vox = _points_to_voxels(
+            local_grid[positive_point_mask],
+            crop_size,
+        )
+
+        background_point_mask = surface_point_mask & (sampled_grid["class_codes"] == 0)
+        background_label_vox = _points_to_voxels(
+            local_grid[background_point_mask],
+            crop_size,
+        )
+
+        surface_vox = voxelize_surface_grid_masked(
+            local_grid,
+            crop_size,
+            surface_point_mask,
+        ).astype(np.float32, copy=False)
+
+        labeled_vox_at_surface = np.full(crop_size, 2.0, dtype=np.float32)
+        labeled_vox_at_surface[background_label_vox > 0.0] = 0.0
+        labeled_vox_at_surface[positive_label_vox > 0.0] = 1.0
+        surface_component_labels = cc3d.connected_components(
+            (surface_vox > 0.0).astype(np.uint8),
+            connectivity=26,
+        )
+        keep_component_ids = np.unique(
+            surface_component_labels[
+                (labeled_vox_at_surface != 2.0) & (surface_vox > 0.0)
+            ]
+        )
+        keep_component_ids = keep_component_ids[keep_component_ids != 0]
+        surface_vox = np.isin(
+            surface_component_labels,
+            keep_component_ids,
+        ).astype(np.float32, copy=False)
+
+        return labeled_vox_at_surface, surface_vox
+
+    def _build_surface_distance_channel(self, surface_vox):
+        surface_mask = np.asarray(surface_vox, dtype=np.float32) > 0.0
+        if not bool(np.any(surface_mask)):
+            return np.zeros(surface_mask.shape, dtype=np.float32)
+
+        distance = distance_transform_edt(~surface_mask).astype(np.float32, copy=False)
+        distance = np.minimum(distance, float(self.surface_distance_clip))
+        distance /= float(self.surface_distance_clip)
+        return (1.0 - distance).astype(np.float32, copy=False)
+
+    @staticmethod
     def _to_float32_tensor(value):
         if isinstance(value, torch.Tensor):
             return value.to(dtype=torch.float32)
@@ -315,37 +396,29 @@ class TifxyzInkDataset(Dataset):
                     vol_crop,
                     sampled_grid,
                 )
+            _, surface_vox = self._build_surface_voxels_and_labels(
+                sampled_grid,
+                crop_size,
+            )
+            surface_distance = self._build_surface_distance_channel(surface_vox)
+            vol_input = np.stack(
+                (
+                    np.asarray(vol_crop, dtype=np.float32),
+                    surface_distance,
+                ),
+                axis=0,
+            )
             out = {
-                "vol": self._to_float32_tensor(vol_crop),
+                "vol": self._to_float32_tensor(vol_input),
                 "patch_segment": patch_segment,
             }
             out.update(self._build_normal_pooled_surface_sample(sampled_grid))
             return out
 
-        positive_point_mask = sampled_grid["in_patch"] & (sampled_grid["class_codes"] == 1)
-        assert bool(np.any(positive_point_mask)), (
-            "sampled_grid must contain labeled points inside the patch"
-        )
-        positive_label_vox = _points_to_voxels(
-            sampled_grid["local_grid"][positive_point_mask],
+        labeled_vox_at_surface, surface_vox = self._build_surface_voxels_and_labels(
+            sampled_grid,
             crop_size,
         )
-
-        background_point_mask = sampled_grid["in_patch"] & (sampled_grid["class_codes"] == 0)
-        background_label_vox = _points_to_voxels(
-            sampled_grid["local_grid"][background_point_mask],
-            crop_size,
-        )
-
-        surface_point_mask = sampled_grid["in_patch"]
-        assert sampled_grid["local_grid"].size > 0 and bool(np.any(surface_point_mask)), (
-            "sampled_grid must contain in-patch surface points"
-        )
-        surface_vox = voxelize_surface_grid_masked(
-            sampled_grid["local_grid"],
-            crop_size,
-            surface_point_mask,
-        ).astype(np.float32, copy=False)
 
         projected_loss_mask = np.full(crop_size, 2.0, dtype=np.float32)
         background_projection_vox = _project_label_from_sampled_grid(
@@ -370,24 +443,6 @@ class TifxyzInkDataset(Dataset):
         )
         assert bool(np.any(label_projection_vox > 0.0)), "label projection must produce non-empty supervision"
         projected_loss_mask[label_projection_vox > 0.0] = 1.0
-
-        labeled_vox_at_surface = np.full(crop_size, 2.0, dtype=np.float32)
-        labeled_vox_at_surface[background_label_vox > 0.0] = 0.0
-        labeled_vox_at_surface[positive_label_vox > 0.0] = 1.0
-        surface_component_labels = cc3d.connected_components(
-            (surface_vox > 0.0).astype(np.uint8),
-            connectivity=26,
-        )
-        keep_component_ids = np.unique(
-            surface_component_labels[
-                (labeled_vox_at_surface != 2.0) & (surface_vox > 0.0)
-            ]
-        )
-        keep_component_ids = keep_component_ids[keep_component_ids != 0]
-        surface_vox = np.isin(
-            surface_component_labels,
-            keep_component_ids,
-        ).astype(np.float32, copy=False)
 
         if self.augmentations is not None:
             (
