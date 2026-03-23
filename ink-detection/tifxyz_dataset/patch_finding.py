@@ -45,7 +45,11 @@ class _LazyRetargetedTifxyzSegment:
         self._loaded = None
 
     def _ensure_loaded(self):
-        loaded = self._loaded
+        try:
+            loaded = object.__getattribute__(self, "_loaded")
+        except AttributeError:
+            loaded = None
+            object.__setattr__(self, "_loaded", None)
         if loaded is not None:
             return loaded
 
@@ -61,29 +65,41 @@ class _LazyRetargetedTifxyzSegment:
         else:
             loaded.use_stored_resolution()
 
-        self._loaded = loaded
-        self.bbox = loaded.bbox
-        self._scale = getattr(loaded, "_scale", self._scale)
+        object.__setattr__(self, "_loaded", loaded)
+        object.__setattr__(self, "bbox", loaded.bbox)
+        object.__setattr__(self, "_scale", getattr(loaded, "_scale", self._scale))
         return loaded
 
     def use_stored_resolution(self):
-        self.resolution = "stored"
-        loaded = self._loaded
+        object.__setattr__(self, "resolution", "stored")
+        loaded = object.__getattribute__(self, "_loaded")
         if loaded is not None:
             loaded.use_stored_resolution()
         return self
 
     def use_full_resolution(self):
-        self.resolution = "full"
-        loaded = self._loaded
+        object.__setattr__(self, "resolution", "full")
+        loaded = object.__getattribute__(self, "_loaded")
         if loaded is not None:
             loaded.use_full_resolution()
         return self
+
+    def __getstate__(self):
+        state = dict(object.__getattribute__(self, "__dict__"))
+        state["_loaded"] = None
+        return state
+
+    def __setstate__(self, state):
+        object.__getattribute__(self, "__dict__").update(state)
 
     def __getitem__(self, key):
         return self._ensure_loaded()[key]
 
     def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(
+                f"{type(self).__name__!s} object has no attribute {name!r}"
+            )
         return getattr(self._ensure_loaded(), name)
 
 
