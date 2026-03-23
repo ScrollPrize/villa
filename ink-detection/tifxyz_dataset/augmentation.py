@@ -4,6 +4,7 @@ from itertools import combinations
 from typing import Sequence
 
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
+from vesuvius.models.augmentation.transforms.noise.gaussian_blur import GaussianBlurTransform
 from vesuvius.models.augmentation.transforms.spatial.mirroring import MirrorTransform
 from vesuvius.models.augmentation.transforms.utils.random import RandomTransform
 
@@ -38,6 +39,10 @@ def create_tifxyz_training_transforms(patch_size: Sequence[int]):
     insert_at = 0
     for transform in transforms.transforms:
         inner = getattr(transform, "transform", None)
+        if isinstance(inner, GaussianBlurTransform):
+            # Avoid the fft_conv_pytorch backend here: its internal list-based
+            # multidimensional indexing emits a PyTorch 2.9 deprecation warning.
+            inner.benchmark = False
         if isinstance(inner, MirrorTransform):
             continue
         retained.append(transform)
