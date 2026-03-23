@@ -106,6 +106,11 @@ def _pool_logits_along_surface_normals(
     x = ray_points[..., 2]
 
     size_z, size_y, size_x = logits.shape[-3:]
+    ray_valid = (
+        (z >= 0.0) & (z <= float(size_z - 1))
+        & (y >= 0.0) & (y <= float(size_y - 1))
+        & (x >= 0.0) & (x <= float(size_x - 1))
+    )
     denom_z = max(size_z - 1, 1)
     denom_y = max(size_y - 1, 1)
     denom_x = max(size_x - 1, 1)
@@ -121,14 +126,23 @@ def _pool_logits_along_surface_normals(
         padding_mode="zeros",
         align_corners=True,
     )
+    ray_valid = ray_valid.permute(0, 3, 1, 2).unsqueeze(1)
+    masked_ray_logits = torch.where(
+        ray_valid,
+        ray_logits,
+        torch.full_like(ray_logits, float("-inf")),
+    )
+    any_valid = ray_valid.any(dim=2)
     if reduction == "max":
-        return ray_logits.amax(dim=2)
+        pooled = masked_ray_logits.amax(dim=2)
+        return torch.where(any_valid, pooled, torch.zeros_like(pooled))
     if reduction == "logsumexp":
         if temperature <= 0.0:
             raise ValueError(
                 f"normal_pool_temperature must be > 0 when using logsumexp pooling, got {temperature}"
             )
-        return temperature * torch.logsumexp(ray_logits / temperature, dim=2)
+        pooled = temperature * torch.logsumexp(masked_ray_logits / temperature, dim=2)
+        return torch.where(any_valid, pooled, torch.zeros_like(pooled))
     raise ValueError(
         f"Unsupported normal_pool_reduction {reduction!r}; expected 'logsumexp' or 'max'"
     )
