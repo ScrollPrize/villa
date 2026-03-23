@@ -53,33 +53,47 @@ class _LazyRetargetedTifxyzSegment:
         if loaded is not None:
             return loaded
 
-        loaded = tifxyz.read_tifxyz(self.path)
-        loaded.volume = self._volume
-        if self._retarget_factor != 1.0:
-            loaded = loaded.retarget(self._retarget_factor)
-        elif getattr(loaded, "volume", None) is None:
-            loaded.volume = self._volume
+        path = object.__getattribute__(self, "path")
+        volume = object.__getattribute__(self, "_volume")
+        retarget_factor = object.__getattribute__(self, "_retarget_factor")
+        resolution = object.__getattribute__(self, "resolution")
+        scale = object.__getattribute__(self, "_scale")
 
-        if self.resolution == "full":
+        loaded = tifxyz.read_tifxyz(path)
+        loaded.volume = volume
+        if retarget_factor != 1.0:
+            loaded = loaded.retarget(retarget_factor)
+        elif getattr(loaded, "volume", None) is None:
+            loaded.volume = volume
+
+        if resolution == "full":
             loaded.use_full_resolution()
         else:
             loaded.use_stored_resolution()
 
         object.__setattr__(self, "_loaded", loaded)
         object.__setattr__(self, "bbox", loaded.bbox)
-        object.__setattr__(self, "_scale", getattr(loaded, "_scale", self._scale))
+        object.__setattr__(self, "_scale", getattr(loaded, "_scale", scale))
         return loaded
 
     def use_stored_resolution(self):
         object.__setattr__(self, "resolution", "stored")
-        loaded = object.__getattribute__(self, "_loaded")
+        try:
+            loaded = object.__getattribute__(self, "_loaded")
+        except AttributeError:
+            loaded = None
+            object.__setattr__(self, "_loaded", None)
         if loaded is not None:
             loaded.use_stored_resolution()
         return self
 
     def use_full_resolution(self):
         object.__setattr__(self, "resolution", "full")
-        loaded = object.__getattribute__(self, "_loaded")
+        try:
+            loaded = object.__getattribute__(self, "_loaded")
+        except AttributeError:
+            loaded = None
+            object.__setattr__(self, "_loaded", None)
         if loaded is not None:
             loaded.use_full_resolution()
         return self
