@@ -221,40 +221,147 @@ class TifxyzInkDataset(Dataset):
             return resized[0].cpu().numpy()
         return resized.permute(1, 2, 0).cpu().numpy()
 
-    def _build_normal_pooled_surface_sample(self, sampled_grid):
-        surface_points_zyx = self._resize_surface_array(
-            sampled_grid["local_grid"],
-            self.surface_target_size_yx,
+    @staticmethod
+    def _resize_masked_surface_array(array, valid_mask, size_yx, *, mode, eps=1e-6):
+        array_np = np.asarray(array, dtype=np.float32)
+        valid_np = np.asarray(valid_mask, dtype=np.float32)
+        if array_np.shape[:2] != valid_np.shape:
+            raise ValueError(
+                f"Masked surface resize expects array shape[:2] {array_np.shape[:2]} to match "
+                f"valid_mask shape {valid_np.shape}"
+            )
+
+        tensor = torch.as_tensor(array_np, dtype=torch.float32)
+        mask_tensor = torch.as_tensor(valid_np, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(0).unsqueeze(0)
+        elif tensor.ndim == 3:
+            tensor = tensor.permute(2, 0, 1).unsqueeze(0)
+        else:
+            raise ValueError(
+                f"Expected 2D or 3D array for masked surface resize, got shape {tuple(array_np.shape)}"
+            )
+
+        kwargs = {}
+        if mode in {"linear", "bilinear", "bicubic", "trilinear"}:
+            kwargs["align_corners"] = False
+
+        weighted = F.interpolate(tensor * mask_tensor, size=size_yx, mode=mode, **kwargs)[0]
+        weights = F.interpolate(mask_tensor, size=size_yx, mode=mode, **kwargs)[0, 0]
+        support = weights > float(eps)
+        safe_weights = torch.where(support, weights, torch.ones_like(weights))
+        resized = weighted / safe_weights.unsqueeze(0)
+        resized = torch.where(support.unsqueeze(0), resized, torch.zeros_like(resized))
+
+        if array_np.ndim == 2:
+            return resized[0].cpu().numpy(), support.cpu().numpy()
+        return resized.permute(1, 2, 0).cpu().numpy(), support.cpu().numpy()
+
+    @staticmethod
+    def _resize_normal_pooled_surface_arrays(
+        *,
+        local_grid,
+        normals_zyx,
+        geometry_valid_src,
+        class_codes,
+        supervision_valid_src,
+        size_yx,
+        eps=1e-6,
+    ):
+        local_grid_tensor = torch.as_tensor(
+            np.asarray(local_grid, dtype=np.float32),
+            dtype=torch.float32,
+        ).permute(2, 0, 1).unsqueeze(0)
+        normals_tensor = torch.as_tensor(
+            np.asarray(normals_zyx, dtype=np.float32),
+            dtype=torch.float32,
+        ).permute(2, 0, 1).unsqueeze(0)
+        mask_tensor = torch.as_tensor(
+            np.asarray(geometry_valid_src, dtype=np.float32),
+            dtype=torch.float32,
+        ).unsqueeze(0).unsqueeze(0)
+
+        weighted_geometry = torch.cat(
+            [local_grid_tensor, normals_tensor],
+            dim=1,
+        ) * mask_tensor
+        resized_geometry = F.interpolate(
+            weighted_geometry,
+            size=size_yx,
             mode="bilinear",
+            align_corners=False,
+        )[0]
+        weights = F.interpolate(
+            mask_tensor,
+            size=size_yx,
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0]
+        support = weights > float(eps)
+        safe_weights = torch.where(support, weights, torch.ones_like(weights))
+        resized_geometry = resized_geometry / safe_weights.unsqueeze(0)
+        resized_geometry = torch.where(
+            support.unsqueeze(0),
+            resized_geometry,
+            torch.zeros_like(resized_geometry),
         )
-        surface_normals_zyx = self._resize_surface_array(
-            sampled_grid["normals_zyx"],
-            self.surface_target_size_yx,
-            mode="bilinear",
+
+        resized_labels = F.interpolate(
+            torch.as_tensor(
+                np.stack(
+                    [
+                        np.asarray(class_codes == 1, dtype=np.float32),
+                        np.asarray(supervision_valid_src, dtype=np.float32),
+                    ],
+                    axis=0,
+                ),
+                dtype=torch.float32,
+            ).unsqueeze(0),
+            size=size_yx,
+            mode="nearest",
+        )[0]
+
+        return (
+            resized_geometry[:3].permute(1, 2, 0).cpu().numpy(),
+            resized_geometry[3:].permute(1, 2, 0).cpu().numpy(),
+            support.cpu().numpy(),
+            (resized_labels[0].cpu().numpy() > 0.5).astype(np.float32, copy=False),
+            resized_labels[1].cpu().numpy() > 0.5,
+        )
+
+    def _build_normal_pooled_surface_sample(self, sampled_grid):
+        geometry_valid_src = (
+            sampled_grid["in_patch"]
+            & sampled_grid["valid_interp"]
+            & sampled_grid["normals_valid"]
+        )
+        supervision_valid_src = geometry_valid_src & (sampled_grid["class_codes"] != 100)
+
+        (
+            surface_points_zyx,
+            surface_normals_zyx,
+            geometry_supported,
+            surface_targets_2d,
+            surface_valid_2d,
+        ) = self._resize_normal_pooled_surface_arrays(
+            local_grid=sampled_grid["local_grid"],
+            normals_zyx=sampled_grid["normals_zyx"],
+            geometry_valid_src=geometry_valid_src,
+            class_codes=sampled_grid["class_codes"],
+            supervision_valid_src=supervision_valid_src,
+            size_yx=self.surface_target_size_yx,
         )
         surface_normals_zyx, normals_nonzero = _normalize_vectors_last_axis(
             surface_normals_zyx
         )
 
-        surface_targets_2d = self._resize_surface_array(
-            (sampled_grid["class_codes"] == 1).astype(np.float32, copy=False),
-            self.surface_target_size_yx,
-            mode="nearest",
-        )
-        surface_valid_2d = self._resize_surface_array(
-            (
-                sampled_grid["in_patch"]
-                & sampled_grid["valid_interp"]
-                & sampled_grid["normals_valid"]
-                & (sampled_grid["class_codes"] != 100)
-            ).astype(np.float32, copy=False),
-            self.surface_target_size_yx,
-            mode="nearest",
-        )
-
-        surface_targets_2d = (surface_targets_2d > 0.5).astype(np.float32, copy=False)
-        surface_valid_2d = (surface_valid_2d > 0.5)
+        surface_valid_2d &= geometry_supported
         surface_valid_2d &= normals_nonzero
+        surface_valid_2d &= self._compute_surface_point_mask(
+            surface_points_zyx,
+            sampled_grid.get("crop_size", self.patch_size_zyx),
+            np.ones(self.surface_target_size_yx, dtype=bool),
+        )
         assert bool(np.any(surface_valid_2d)), (
             "normal_pooled_3d supervision must contain at least one valid surface sample"
         )
@@ -262,6 +369,7 @@ class TifxyzInkDataset(Dataset):
             "normal_pooled_3d supervision must contain at least one positive surface label"
         )
 
+        surface_targets_2d[~surface_valid_2d] = 0.0
         surface_points_zyx[~surface_valid_2d] = 0.0
         surface_normals_zyx[~surface_valid_2d] = 0.0
 
@@ -558,6 +666,325 @@ class TifxyzInkDataset(Dataset):
                 )
                 candidate_idx = int(np.random.randint(num_patches))
 
+
+def _downsample_spatial_3d(arr, factor):
+    if factor <= 1:
+        return arr
+    if arr.ndim != 3:
+        return arr
+    return arr[
+        ::factor,
+        ::factor,
+        ::factor,
+    ]
+
+
+def _downsample_spatial_2d(arr, factor):
+    if factor <= 1:
+        return arr
+    if arr.ndim != 2:
+        return arr
+    return arr[
+        ::factor,
+        ::factor,
+    ]
+
+
+def _ensure_wrap_axis(arr):
+    arr = np.asarray(arr)
+    if arr.ndim == 3:
+        return arr[np.newaxis, ...]
+    if arr.ndim == 4:
+        return arr
+    raise ValueError(f"Expected a 3D or 4D array for visualization, got shape {arr.shape!r}")
+
+
+def _voxelize_points_for_napari(points, crop_size):
+    """Build a lightweight occupancy volume for visualization only."""
+    crop_size = tuple(int(v) for v in crop_size)
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    vox = np.zeros(crop_size, dtype=np.uint8)
+    if points.size == 0:
+        return vox
+
+    finite_mask = np.isfinite(points).all(axis=1)
+    points = points[finite_mask]
+    if points.size == 0:
+        return vox
+
+    voxel_indices = np.rint(points).astype(np.int64, copy=False)
+    in_bounds = (
+        (voxel_indices[:, 0] >= 0)
+        & (voxel_indices[:, 0] < crop_size[0])
+        & (voxel_indices[:, 1] >= 0)
+        & (voxel_indices[:, 1] < crop_size[1])
+        & (voxel_indices[:, 2] >= 0)
+        & (voxel_indices[:, 2] < crop_size[2])
+    )
+    voxel_indices = voxel_indices[in_bounds]
+    if voxel_indices.size == 0:
+        return vox
+
+    vox[
+        voxel_indices[:, 0],
+        voxel_indices[:, 1],
+        voxel_indices[:, 2],
+    ] = 1
+    return vox
+
+
+def _downsample_points_zyx(points, factor):
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    if factor <= 1 or points.size == 0:
+        return points
+    return points / float(factor)
+
+
+def _sample_surface_volume_for_napari(volume_3d, surface_points_zyx, surface_valid_2d):
+    volume_3d = np.asarray(volume_3d, dtype=np.float32)
+    surface_points_zyx = np.asarray(surface_points_zyx, dtype=np.float32)
+    surface_valid_2d = np.asarray(surface_valid_2d, dtype=bool)
+
+    sampled = np.full(surface_valid_2d.shape, np.nan, dtype=np.float32)
+    if sampled.size == 0 or not bool(np.any(surface_valid_2d)):
+        return sampled
+
+    valid_ys, valid_xs = np.nonzero(surface_valid_2d)
+    valid_points = surface_points_zyx[surface_valid_2d]
+    finite_mask = np.isfinite(valid_points).all(axis=1)
+    if not bool(np.any(finite_mask)):
+        return sampled
+
+    valid_ys = valid_ys[finite_mask]
+    valid_xs = valid_xs[finite_mask]
+    valid_points = valid_points[finite_mask]
+
+    voxel_indices = np.rint(valid_points).astype(np.int64, copy=False)
+    in_bounds = (
+        (voxel_indices[:, 0] >= 0)
+        & (voxel_indices[:, 0] < volume_3d.shape[0])
+        & (voxel_indices[:, 1] >= 0)
+        & (voxel_indices[:, 1] < volume_3d.shape[1])
+        & (voxel_indices[:, 2] >= 0)
+        & (voxel_indices[:, 2] < volume_3d.shape[2])
+    )
+    if not bool(np.any(in_bounds)):
+        return sampled
+
+    valid_ys = valid_ys[in_bounds]
+    valid_xs = valid_xs[in_bounds]
+    voxel_indices = voxel_indices[in_bounds]
+    sampled[valid_ys, valid_xs] = volume_3d[
+        voxel_indices[:, 0],
+        voxel_indices[:, 1],
+        voxel_indices[:, 2],
+    ]
+    return sampled
+
+
+def _build_surface_depth_map_for_napari(surface_points_zyx, surface_valid_2d):
+    surface_points_zyx = np.asarray(surface_points_zyx, dtype=np.float32)
+    surface_valid_2d = np.asarray(surface_valid_2d, dtype=bool)
+
+    depth_map = np.full(surface_valid_2d.shape, np.nan, dtype=np.float32)
+    if depth_map.size == 0 or not bool(np.any(surface_valid_2d)):
+        return depth_map
+
+    valid_points = surface_points_zyx[surface_valid_2d]
+    finite_mask = np.isfinite(valid_points[:, 0])
+    if not bool(np.any(finite_mask)):
+        return depth_map
+
+    valid_ys, valid_xs = np.nonzero(surface_valid_2d)
+    depth_map[valid_ys[finite_mask], valid_xs[finite_mask]] = valid_points[finite_mask, 0]
+    return depth_map
+
+
+def _compute_napari_contrast_limits(image):
+    image = np.asarray(image, dtype=np.float32)
+    finite_values = image[np.isfinite(image)]
+    if finite_values.size == 0:
+        return (0.0, 1.0)
+
+    low = float(np.min(finite_values))
+    high = float(np.max(finite_values))
+    if low == high:
+        return (low, low + 1.0)
+
+    percentile_low, percentile_high = np.percentile(finite_values, (1.0, 99.0))
+    percentile_low = float(percentile_low)
+    percentile_high = float(percentile_high)
+    if percentile_low == percentile_high:
+        return (low, high)
+    return (percentile_low, percentile_high)
+
+
+def _build_dense_napari_sample_data(sample, napari_downsample):
+    sample_idx = int(sample.get("idx", -1))
+    wrap_mode = str(sample.get("wrap_mode", "single"))
+    vol_4d = _ensure_wrap_axis(np.asarray(sample["vol"], dtype=np.float32))
+    surface_label_4d = _ensure_wrap_axis(
+        np.asarray(sample["labeled_vox_at_surface"]).astype(np.int16, copy=False)
+    )
+    projected_loss_mask_4d = _ensure_wrap_axis(
+        np.asarray(sample["projected_loss_mask"]).astype(np.int16, copy=False)
+    )
+    surface_vox_4d = _ensure_wrap_axis(np.asarray(sample["surface_vox"], dtype=np.float32))
+
+    wrap_samples = []
+    positive_totals = []
+    background_totals = []
+
+    for wrap_idx in range(int(vol_4d.shape[0])):
+        vol_3d = vol_4d[wrap_idx]
+        surface_label_raw = surface_label_4d[wrap_idx]
+        projected_loss_mask_raw = projected_loss_mask_4d[wrap_idx]
+        positive_3d = (surface_label_raw == 1).astype(np.uint8)
+        background_3d = (surface_label_raw == 0).astype(np.uint8)
+        surface_3d = (surface_vox_4d[wrap_idx] > 0.0).astype(np.uint8)
+
+        # For visualization, map ignore=2 to 0 (transparent) so only labeled classes remain visible.
+        surface_label_vis = np.zeros_like(surface_label_raw, dtype=np.uint8)
+        surface_label_vis[surface_label_raw == 1] = 1
+        surface_label_vis[surface_label_raw == 0] = 2
+
+        projected_loss_mask_vis = np.zeros_like(projected_loss_mask_raw, dtype=np.uint8)
+        projected_loss_mask_vis[projected_loss_mask_raw == 1] = 1
+        projected_loss_mask_vis[projected_loss_mask_raw == 0] = 2
+
+        positive_totals.append(int(np.count_nonzero(surface_label_raw == 1)))
+        background_totals.append(int(np.count_nonzero(surface_label_raw == 0)))
+        wrap_samples.append(
+            {
+                "vol_3d": _downsample_spatial_3d(vol_3d, napari_downsample),
+                "aux_3d": None,
+                "surface_3d": _downsample_spatial_3d(surface_3d, napari_downsample),
+                "positive_3d": _downsample_spatial_3d(positive_3d, napari_downsample),
+                "background_3d": _downsample_spatial_3d(background_3d, napari_downsample),
+                "surface_label_vis": _downsample_spatial_3d(surface_label_vis, napari_downsample),
+                "projected_loss_mask_vis": _downsample_spatial_3d(projected_loss_mask_vis, napari_downsample),
+            }
+        )
+
+    return {
+        "sample_idx": sample_idx,
+        "wrap_mode": wrap_mode,
+        "wrap_count": int(len(wrap_samples)),
+        "positive_total": int(sum(positive_totals)),
+        "background_total": int(sum(background_totals)),
+        "positive_totals": positive_totals,
+        "background_totals": background_totals,
+        "wrap_samples": wrap_samples,
+        "schema": "dense_3d",
+    }
+
+
+def _build_normal_pooled_napari_sample_data(sample, napari_downsample):
+    sample_idx = int(sample.get("idx", -1))
+    wrap_mode = str(sample.get("wrap_mode", "single"))
+    vol = np.asarray(sample["vol"], dtype=np.float32)
+    if vol.ndim == 4:
+        vol_3d = vol[0]
+        aux_3d = vol[1] if vol.shape[0] > 1 else np.zeros_like(vol[0], dtype=np.float32)
+    elif vol.ndim == 3:
+        vol_3d = vol
+        aux_3d = np.zeros_like(vol_3d, dtype=np.float32)
+    else:
+        raise ValueError(
+            f"Expected normal_pooled_3d volume with shape [C, Z, Y, X] or [Z, Y, X], got {vol.shape!r}"
+        )
+
+    surface_points_zyx = np.asarray(sample["surface_points_zyx"], dtype=np.float32)
+    surface_targets_2d = np.asarray(sample["surface_targets_2d"], dtype=np.float32) > 0.5
+    surface_valid_2d = np.asarray(sample["surface_valid_2d"], dtype=np.float32) > 0.5
+    positive_mask_2d = surface_valid_2d & surface_targets_2d
+    background_mask_2d = surface_valid_2d & ~surface_targets_2d
+
+    crop_size = tuple(int(v) for v in vol_3d.shape)
+    surface_intensity_2d = _sample_surface_volume_for_napari(
+        vol_3d,
+        surface_points_zyx,
+        surface_valid_2d,
+    )
+    surface_distance_2d = _sample_surface_volume_for_napari(
+        aux_3d,
+        surface_points_zyx,
+        surface_valid_2d,
+    )
+    surface_depth_2d = _build_surface_depth_map_for_napari(
+        surface_points_zyx,
+        surface_valid_2d,
+    )
+    surface_3d = _voxelize_points_for_napari(surface_points_zyx[surface_valid_2d], crop_size)
+    positive_3d = _voxelize_points_for_napari(surface_points_zyx[positive_mask_2d], crop_size)
+    background_3d = _voxelize_points_for_napari(surface_points_zyx[background_mask_2d], crop_size)
+
+    surface_label_vis = np.zeros(crop_size, dtype=np.uint8)
+    surface_label_vis[positive_3d > 0] = 1
+    surface_label_vis[background_3d > 0] = 2
+
+    projected_loss_mask_vis = np.zeros(crop_size, dtype=np.uint8)
+    projected_loss_mask_vis[surface_3d > 0] = 1
+
+    surface_labels_2d = np.zeros(surface_valid_2d.shape, dtype=np.uint8)
+    surface_labels_2d[background_mask_2d] = 2
+    surface_labels_2d[positive_mask_2d] = 1
+
+    surface_valid_vis_2d = surface_valid_2d.astype(np.uint8, copy=False)
+    valid_surface_points_zyx = _downsample_points_zyx(
+        surface_points_zyx[surface_valid_2d],
+        napari_downsample,
+    )
+    positive_surface_points_zyx = _downsample_points_zyx(
+        surface_points_zyx[positive_mask_2d],
+        napari_downsample,
+    )
+    background_surface_points_zyx = _downsample_points_zyx(
+        surface_points_zyx[background_mask_2d],
+        napari_downsample,
+    )
+
+    return {
+        "sample_idx": sample_idx,
+        "wrap_mode": wrap_mode,
+        "wrap_count": 1,
+        "positive_total": int(np.count_nonzero(positive_mask_2d)),
+        "background_total": int(np.count_nonzero(background_mask_2d)),
+        "positive_totals": [int(np.count_nonzero(positive_mask_2d))],
+        "background_totals": [int(np.count_nonzero(background_mask_2d))],
+        "wrap_samples": [
+            {
+                "vol_3d": _downsample_spatial_3d(vol_3d, napari_downsample),
+                "aux_3d": _downsample_spatial_3d(aux_3d, napari_downsample),
+                "surface_3d": _downsample_spatial_3d(surface_3d, napari_downsample),
+                "positive_3d": _downsample_spatial_3d(positive_3d, napari_downsample),
+                "background_3d": _downsample_spatial_3d(background_3d, napari_downsample),
+                "surface_label_vis": _downsample_spatial_3d(surface_label_vis, napari_downsample),
+                "projected_loss_mask_vis": _downsample_spatial_3d(projected_loss_mask_vis, napari_downsample),
+                "surface_intensity_2d": _downsample_spatial_2d(surface_intensity_2d, napari_downsample),
+                "surface_distance_2d": _downsample_spatial_2d(surface_distance_2d, napari_downsample),
+                "surface_depth_2d": _downsample_spatial_2d(surface_depth_2d, napari_downsample),
+                "surface_labels_2d": _downsample_spatial_2d(surface_labels_2d, napari_downsample),
+                "surface_valid_vis_2d": _downsample_spatial_2d(surface_valid_vis_2d, napari_downsample),
+                "surface_points_zyx": valid_surface_points_zyx,
+                "positive_points_zyx": positive_surface_points_zyx,
+                "background_points_zyx": background_surface_points_zyx,
+            }
+        ],
+        "schema": "normal_pooled_3d",
+    }
+
+
+def _build_napari_sample_data(sample, napari_downsample):
+    if "labeled_vox_at_surface" in sample:
+        return _build_dense_napari_sample_data(sample, napari_downsample)
+    if "surface_points_zyx" in sample:
+        return _build_normal_pooled_napari_sample_data(sample, napari_downsample)
+    raise KeyError(
+        "sample does not contain a napari-supported supervision schema"
+    )
+
+
 if __name__ == "__main__":
     import argparse
     import json
@@ -614,17 +1041,6 @@ if __name__ == "__main__":
 
         napari_downsample = max(1, int(args.napari_downsample))
 
-        def _downsample_spatial_3d(arr, factor):
-            if factor <= 1:
-                return arr
-            if arr.ndim != 3:
-                return arr
-            return arr[
-                ::factor,
-                ::factor,
-                ::factor,
-            ]
-
         if len(ds) == 0:
             raise RuntimeError("Dataset produced no samples to visualize.")
 
@@ -634,74 +1050,19 @@ if __name__ == "__main__":
 
         print(f"Napari spatial downsample factor: {napari_downsample}")
 
-        def _ensure_wrap_axis(arr):
-            arr = np.asarray(arr)
-            if arr.ndim == 3:
-                return arr[np.newaxis, ...]
-            if arr.ndim == 4:
-                return arr
-            raise ValueError(f"Expected a 3D or 4D array for visualization, got shape {arr.shape!r}")
-
-        def _build_napari_sample_data(sample):
-            sample_idx = int(sample.get("idx", -1))
-            wrap_mode = str(sample.get("wrap_mode", "single"))
-            vol_4d = _ensure_wrap_axis(np.asarray(sample["vol"], dtype=np.float32))
-            surface_label_4d = _ensure_wrap_axis(
-                np.asarray(sample["labeled_vox_at_surface"]).astype(np.int16, copy=False)
-            )
-            projected_loss_mask_4d = _ensure_wrap_axis(
-                np.asarray(sample["projected_loss_mask"]).astype(np.int16, copy=False)
-            )
-            surface_vox_4d = _ensure_wrap_axis(np.asarray(sample["surface_vox"], dtype=np.float32))
-
-            wrap_samples = []
-            positive_totals = []
-            background_totals = []
-
-            for wrap_idx in range(int(vol_4d.shape[0])):
-                vol_3d = vol_4d[wrap_idx]
-                surface_label_raw = surface_label_4d[wrap_idx]
-                projected_loss_mask_raw = projected_loss_mask_4d[wrap_idx]
-                positive_3d = (surface_label_raw == 1).astype(np.uint8)
-                background_3d = (surface_label_raw == 0).astype(np.uint8)
-                surface_3d = (surface_vox_4d[wrap_idx] > 0.0).astype(np.uint8)
-
-                # For visualization, map ignore=2 to 0 (transparent) so only labeled classes remain visible.
-                surface_label_vis = np.zeros_like(surface_label_raw, dtype=np.uint8)
-                surface_label_vis[surface_label_raw == 1] = 1
-                surface_label_vis[surface_label_raw == 0] = 2
-
-                projected_loss_mask_vis = np.zeros_like(projected_loss_mask_raw, dtype=np.uint8)
-                projected_loss_mask_vis[projected_loss_mask_raw == 1] = 1
-                projected_loss_mask_vis[projected_loss_mask_raw == 0] = 2
-
-                positive_totals.append(int(np.count_nonzero(surface_label_raw == 1)))
-                background_totals.append(int(np.count_nonzero(surface_label_raw == 0)))
-                wrap_samples.append(
-                    {
-                        "vol_3d": _downsample_spatial_3d(vol_3d, napari_downsample),
-                        "surface_3d": _downsample_spatial_3d(surface_3d, napari_downsample),
-                        "positive_3d": _downsample_spatial_3d(positive_3d, napari_downsample),
-                        "background_3d": _downsample_spatial_3d(background_3d, napari_downsample),
-                        "surface_label_vis": _downsample_spatial_3d(surface_label_vis, napari_downsample),
-                        "projected_loss_mask_vis": _downsample_spatial_3d(projected_loss_mask_vis, napari_downsample),
-                    }
-                )
-
-            return {
-                "sample_idx": sample_idx,
-                "wrap_mode": wrap_mode,
-                "wrap_count": int(len(wrap_samples)),
-                "positive_total": int(sum(positive_totals)),
-                "background_total": int(sum(background_totals)),
-                "positive_totals": positive_totals,
-                "background_totals": background_totals,
-                "wrap_samples": wrap_samples,
-            }
-
         def _log_sample_stats(sample_data):
             print(f"napari sample idx: {sample_data['sample_idx']}")
             print(f"wrap mode: {sample_data['wrap_mode']} (visualizing all {sample_data['wrap_count']})")
+            if sample_data["schema"] == "normal_pooled_3d":
+                print(
+                    "positive surface samples: "
+                    f"{sample_data['positive_total']} per-wrap={sample_data['positive_totals']}"
+                )
+                print(
+                    "background surface samples: "
+                    f"{sample_data['background_total']} per-wrap={sample_data['background_totals']}"
+                )
+                return
             print(f"positive_label_vox sample nonzero: {sample_data['positive_total']} per-wrap={sample_data['positive_totals']}")
             print(f"background_label_vox sample nonzero: {sample_data['background_total']} per-wrap={sample_data['background_totals']}")
 
@@ -713,86 +1074,237 @@ if __name__ == "__main__":
             if len(tuple(int(v) for v in patch["supervised_segment_indices"])) > 1
         )
         empty_image = np.zeros((1, 1, 1), dtype=np.float32)
+        empty_image_2d = np.zeros((1, 1), dtype=np.float32)
         empty_labels = np.zeros((1, 1, 1), dtype=np.uint8)
+        empty_labels_2d = np.zeros((1, 1), dtype=np.uint8)
+        empty_points = np.zeros((0, 3), dtype=np.float32)
 
-        viewer = napari.Viewer(ndisplay=3)
-        wrap_layers = []
+        viewer_3d = napari.Viewer(ndisplay=3)
+        viewer_3d.dims.axis_labels = ("z", "y", "x")
+        viewer_3d.title = "TifxyzInkDataset 3D loading..."
+        viewer_2d = None
+        if ds.use_normal_pooled_3d:
+            viewer_2d = napari.Viewer()
+            viewer_2d.dims.axis_labels = ("y", "x")
+            viewer_2d.title = "TifxyzInkDataset 2D loading..."
+        wrap_layers_3d = []
+        wrap_layers_2d = []
 
-        def _create_wrap_layers(wrap_idx):
+        def _create_3d_wrap_layers(wrap_idx):
             wrap_num = int(wrap_idx) + 1
             return {
-                "vol": viewer.add_image(
+                "vol": viewer_3d.add_image(
                     empty_image,
                     name=f"vol wrap {wrap_num}",
                     rendering="mip",
                     interpolation3d="nearest",
                 ),
-                "surface": viewer.add_labels(
+                "aux": viewer_3d.add_image(
+                    empty_image,
+                    name=f"aux wrap {wrap_num}",
+                    rendering="mip",
+                    interpolation3d="nearest",
+                    visible=False,
+                    opacity=0.6,
+                ),
+                "surface": viewer_3d.add_labels(
                     empty_labels,
                     name=f"surface_vox wrap {wrap_num}",
                     opacity=0.2,
                     blending="additive",
                 ),
-                "positive": viewer.add_labels(
+                "positive": viewer_3d.add_labels(
                     empty_labels,
                     name=f"positive_label_vox wrap {wrap_num}",
                     opacity=0.9,
                     blending="additive",
                 ),
-                "background": viewer.add_labels(
+                "background": viewer_3d.add_labels(
                     empty_labels,
                     name=f"background_label_vox wrap {wrap_num}",
                     opacity=0.7,
                     blending="additive",
                 ),
-                "surface_label": viewer.add_labels(
+                "surface_label": viewer_3d.add_labels(
                     empty_labels,
                     name=f"labeled_vox_at_surface wrap {wrap_num}",
                     opacity=0.5,
                     blending="additive",
                 ),
-                "projected_loss": viewer.add_labels(
+                "projected_loss": viewer_3d.add_labels(
                     empty_labels,
                     name=f"projected_loss_mask wrap {wrap_num}",
                     opacity=0.5,
                     blending="additive",
                 ),
+                "surface_points": viewer_3d.add_points(
+                    empty_points,
+                    name=f"surface_points wrap {wrap_num}",
+                    size=2,
+                    face_color="white",
+                    border_color="white",
+                    opacity=0.7,
+                    visible=False,
+                ),
+                "positive_points": viewer_3d.add_points(
+                    empty_points,
+                    name=f"positive_points wrap {wrap_num}",
+                    size=4,
+                    face_color="lime",
+                    border_color="lime",
+                    opacity=0.9,
+                    visible=False,
+                ),
+                "background_points": viewer_3d.add_points(
+                    empty_points,
+                    name=f"background_points wrap {wrap_num}",
+                    size=3,
+                    face_color="magenta",
+                    border_color="magenta",
+                    opacity=0.7,
+                    visible=False,
+                ),
             }
 
-        def _ensure_wrap_layers(wrap_count):
-            while len(wrap_layers) < int(wrap_count):
-                wrap_layers.append(_create_wrap_layers(len(wrap_layers)))
+        def _create_2d_wrap_layers(wrap_idx):
+            wrap_num = int(wrap_idx) + 1
+            assert viewer_2d is not None
+            return {
+                "surface_intensity_2d": viewer_2d.add_image(
+                    empty_image_2d,
+                    name=f"surface_intensity_yx wrap {wrap_num}",
+                    colormap="gray",
+                ),
+                "surface_distance_2d": viewer_2d.add_image(
+                    empty_image_2d,
+                    name=f"surface_distance_yx wrap {wrap_num}",
+                    colormap="magma",
+                    visible=False,
+                ),
+                "surface_depth_2d": viewer_2d.add_image(
+                    empty_image_2d,
+                    name=f"surface_depth_yx wrap {wrap_num}",
+                    colormap="turbo",
+                    visible=False,
+                ),
+                "surface_labels_2d": viewer_2d.add_labels(
+                    empty_labels_2d,
+                    name=f"surface_labels_yx wrap {wrap_num}",
+                    opacity=0.5,
+                ),
+                "surface_valid_2d": viewer_2d.add_labels(
+                    empty_labels_2d,
+                    name=f"surface_valid_yx wrap {wrap_num}",
+                    opacity=0.25,
+                    visible=False,
+                ),
+            }
 
-        viewer.title = "TifxyzInkDataset loading..."
+        def _ensure_3d_wrap_layers(wrap_count):
+            while len(wrap_layers_3d) < int(wrap_count):
+                wrap_layers_3d.append(_create_3d_wrap_layers(len(wrap_layers_3d)))
+
+        def _ensure_2d_wrap_layers(wrap_count):
+            if viewer_2d is None:
+                return
+            while len(wrap_layers_2d) < int(wrap_count):
+                wrap_layers_2d.append(_create_2d_wrap_layers(len(wrap_layers_2d)))
+
+        def _set_image_layer_data(layer, image):
+            layer.data = image
+            layer.contrast_limits = _compute_napari_contrast_limits(image)
+
+        def _configure_3d_wrap_layer_visibility(layer_group, *, is_normal_pooled):
+            layer_group["vol"].visible = True
+            layer_group["aux"].visible = False
+            layer_group["surface"].visible = not is_normal_pooled
+            layer_group["positive"].visible = not is_normal_pooled
+            layer_group["background"].visible = not is_normal_pooled
+            layer_group["surface_label"].visible = not is_normal_pooled
+            layer_group["projected_loss"].visible = not is_normal_pooled
+            layer_group["surface_points"].visible = is_normal_pooled
+            layer_group["positive_points"].visible = is_normal_pooled
+            layer_group["background_points"].visible = is_normal_pooled
+
+        def _configure_2d_wrap_layer_visibility(layer_group):
+            layer_group["surface_intensity_2d"].visible = True
+            layer_group["surface_distance_2d"].visible = False
+            layer_group["surface_depth_2d"].visible = False
+            layer_group["surface_labels_2d"].visible = True
+            layer_group["surface_valid_2d"].visible = False
 
         def _apply_sample_data(sample_data, request_id):
             if request_id != load_state["request_id"]:
                 return
             wrap_samples = sample_data["wrap_samples"]
-            _ensure_wrap_layers(len(wrap_samples))
+            is_normal_pooled = sample_data["schema"] == "normal_pooled_3d"
+            _ensure_3d_wrap_layers(len(wrap_samples))
+            if is_normal_pooled:
+                _ensure_2d_wrap_layers(len(wrap_samples))
             for wrap_idx, wrap_sample in enumerate(wrap_samples):
-                layer_group = wrap_layers[wrap_idx]
-                layer_group["vol"].data = wrap_sample["vol_3d"]
-                layer_group["surface"].data = wrap_sample["surface_3d"]
-                layer_group["positive"].data = wrap_sample["positive_3d"]
-                layer_group["background"].data = wrap_sample["background_3d"]
-                layer_group["surface_label"].data = wrap_sample["surface_label_vis"]
-                layer_group["projected_loss"].data = wrap_sample["projected_loss_mask_vis"]
-                for layer in layer_group.values():
-                    layer.visible = True
+                layer_group_3d = wrap_layers_3d[wrap_idx]
+                _set_image_layer_data(layer_group_3d["vol"], wrap_sample["vol_3d"])
+                if wrap_sample["aux_3d"] is None:
+                    _set_image_layer_data(layer_group_3d["aux"], empty_image)
+                    layer_group_3d["aux"].visible = False
+                else:
+                    _set_image_layer_data(layer_group_3d["aux"], wrap_sample["aux_3d"])
+                layer_group_3d["surface"].data = wrap_sample["surface_3d"]
+                layer_group_3d["positive"].data = wrap_sample["positive_3d"]
+                layer_group_3d["background"].data = wrap_sample["background_3d"]
+                layer_group_3d["surface_label"].data = wrap_sample["surface_label_vis"]
+                layer_group_3d["projected_loss"].data = wrap_sample["projected_loss_mask_vis"]
+                layer_group_3d["surface_points"].data = wrap_sample.get("surface_points_zyx", empty_points)
+                layer_group_3d["positive_points"].data = wrap_sample.get("positive_points_zyx", empty_points)
+                layer_group_3d["background_points"].data = wrap_sample.get("background_points_zyx", empty_points)
+                _configure_3d_wrap_layer_visibility(layer_group_3d, is_normal_pooled=is_normal_pooled)
 
-            for wrap_idx in range(len(wrap_samples), len(wrap_layers)):
-                layer_group = wrap_layers[wrap_idx]
-                layer_group["vol"].data = empty_image
-                layer_group["surface"].data = empty_labels
-                layer_group["positive"].data = empty_labels
-                layer_group["background"].data = empty_labels
-                layer_group["surface_label"].data = empty_labels
-                layer_group["projected_loss"].data = empty_labels
-                for layer in layer_group.values():
+                if is_normal_pooled and viewer_2d is not None:
+                    layer_group_2d = wrap_layers_2d[wrap_idx]
+                    _set_image_layer_data(
+                        layer_group_2d["surface_intensity_2d"],
+                        wrap_sample.get("surface_intensity_2d", empty_image_2d),
+                    )
+                    _set_image_layer_data(
+                        layer_group_2d["surface_distance_2d"],
+                        wrap_sample.get("surface_distance_2d", empty_image_2d),
+                    )
+                    _set_image_layer_data(
+                        layer_group_2d["surface_depth_2d"],
+                        wrap_sample.get("surface_depth_2d", empty_image_2d),
+                    )
+                    layer_group_2d["surface_labels_2d"].data = wrap_sample.get("surface_labels_2d", empty_labels_2d)
+                    layer_group_2d["surface_valid_2d"].data = wrap_sample.get("surface_valid_vis_2d", empty_labels_2d)
+                    _configure_2d_wrap_layer_visibility(layer_group_2d)
+
+            for wrap_idx in range(len(wrap_samples), len(wrap_layers_3d)):
+                layer_group_3d = wrap_layers_3d[wrap_idx]
+                _set_image_layer_data(layer_group_3d["vol"], empty_image)
+                _set_image_layer_data(layer_group_3d["aux"], empty_image)
+                layer_group_3d["surface"].data = empty_labels
+                layer_group_3d["positive"].data = empty_labels
+                layer_group_3d["background"].data = empty_labels
+                layer_group_3d["surface_label"].data = empty_labels
+                layer_group_3d["projected_loss"].data = empty_labels
+                layer_group_3d["surface_points"].data = empty_points
+                layer_group_3d["positive_points"].data = empty_points
+                layer_group_3d["background_points"].data = empty_points
+                for layer in layer_group_3d.values():
                     layer.visible = False
 
-            viewer.title = f"TifxyzInkDataset sample {sample_data['sample_idx']}"
+            for wrap_idx in range(len(wrap_samples), len(wrap_layers_2d)):
+                layer_group_2d = wrap_layers_2d[wrap_idx]
+                _set_image_layer_data(layer_group_2d["surface_intensity_2d"], empty_image_2d)
+                _set_image_layer_data(layer_group_2d["surface_distance_2d"], empty_image_2d)
+                _set_image_layer_data(layer_group_2d["surface_depth_2d"], empty_image_2d)
+                layer_group_2d["surface_labels_2d"].data = empty_labels_2d
+                layer_group_2d["surface_valid_2d"].data = empty_labels_2d
+                for layer in layer_group_2d.values():
+                    layer.visible = False
+
+            viewer_3d.title = f"TifxyzInkDataset 3D sample {sample_data['sample_idx']}"
+            if viewer_2d is not None:
+                viewer_2d.title = f"TifxyzInkDataset 2D sample {sample_data['sample_idx']}"
             status_label.setText(
                 f"sample {sample_data['sample_idx']} loaded "
                 f"(wraps={sample_data['wrap_count']}, pos={sample_data['positive_total']}, "
@@ -805,7 +1317,9 @@ if __name__ == "__main__":
         def _handle_sample_error(exc, request_id):
             if request_id != load_state["request_id"]:
                 return
-            viewer.title = "TifxyzInkDataset load failed"
+            viewer_3d.title = "TifxyzInkDataset 3D load failed"
+            if viewer_2d is not None:
+                viewer_2d.title = "TifxyzInkDataset 2D load failed"
             status_label.setText(f"load failed: {exc}")
             next_button.setEnabled(True)
             next_multi_wrap_button.setEnabled(bool(multi_wrap_indices))
@@ -815,14 +1329,19 @@ if __name__ == "__main__":
             request_id = int(load_state["request_id"]) + 1
             load_state["request_id"] = request_id
             sample_cursor["idx"] = int(idx)
-            viewer.title = f"TifxyzInkDataset loading sample {sample_cursor['idx']}..."
+            viewer_3d.title = f"TifxyzInkDataset 3D loading sample {sample_cursor['idx']}..."
+            if viewer_2d is not None:
+                viewer_2d.title = f"TifxyzInkDataset 2D loading sample {sample_cursor['idx']}..."
             status_label.setText(f"loading sample {sample_cursor['idx']}...")
             next_button.setEnabled(False)
             next_multi_wrap_button.setEnabled(False)
 
             @thread_worker
             def _load_sample():
-                return _build_napari_sample_data(ds[sample_cursor["idx"]])
+                return _build_napari_sample_data(
+                    ds[sample_cursor["idx"]],
+                    napari_downsample,
+                )
 
             worker = _load_sample()
             load_state["worker"] = worker
@@ -868,7 +1387,7 @@ if __name__ == "__main__":
 
         next_button.clicked.connect(_on_next_clicked)
         next_multi_wrap_button.clicked.connect(_on_next_multi_wrap_clicked)
-        viewer.window.add_dock_widget(controls, area="right", name="sample")
+        viewer_3d.window.add_dock_widget(controls, area="right", name="sample")
 
         QTimer.singleShot(0, lambda: _request_sample_load(sample_cursor["idx"]))
 

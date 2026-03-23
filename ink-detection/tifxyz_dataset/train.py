@@ -66,6 +66,35 @@ def _build_normal_pool_offsets(distance_pair, sample_step, *, device, dtype):
     return torch.as_tensor(offsets, device=device, dtype=dtype)
 
 
+def _get_normal_pool_offsets(offset_cache, distance_pair, sample_step, *, device, dtype):
+    cache_key = (device.type, device.index, dtype)
+    offsets = offset_cache.get(cache_key)
+    if offsets is None:
+        offsets = _build_normal_pool_offsets(
+            distance_pair,
+            sample_step,
+            device=device,
+            dtype=dtype,
+        )
+        offset_cache[cache_key] = offsets
+    return offsets
+
+
+def _resolve_normal_pool_distance(config):
+    explicit = config.get('normal_pool_distance')
+    if explicit is not None:
+        return _normalize_distance_pair(explicit)
+
+    fg_distance = _normalize_distance_pair(
+        config.get('fg_distance', config.get('label_distance', 10))
+    )
+    bg_distance = _normalize_distance_pair(config.get('bg_distance', fg_distance))
+    return (
+        max(float(fg_distance[0]), float(bg_distance[0])),
+        max(float(fg_distance[1]), float(bg_distance[1])),
+    )
+
+
 def _pool_logits_along_surface_normals(
     logits,
     surface_points_zyx,
@@ -132,14 +161,16 @@ def _pool_logits_along_surface_normals(
     any_valid = ray_valid.any(dim=2)
     if reduction == "max":
         pooled = masked_ray_logits.amax(dim=2)
-        return torch.where(any_valid, pooled, torch.zeros_like(pooled))
+        pooled = torch.where(any_valid, pooled, torch.zeros_like(pooled))
+        return pooled, any_valid
     if reduction == "logsumexp":
         if temperature <= 0.0:
             raise ValueError(
                 f"normal_pool_temperature must be > 0 when using logsumexp pooling, got {temperature}"
             )
         pooled = temperature * torch.logsumexp(masked_ray_logits / temperature, dim=2)
-        return torch.where(any_valid, pooled, torch.zeros_like(pooled))
+        pooled = torch.where(any_valid, pooled, torch.zeros_like(pooled))
+        return pooled, any_valid
     raise ValueError(
         f"Unsupported normal_pool_reduction {reduction!r}; expected 'logsumexp' or 'max'"
     )
@@ -428,12 +459,7 @@ def train(config_path):
     )
     latest_val_loss = None
     latest_ema_val_loss = None
-    normal_pool_distance = _normalize_distance_pair(
-        config.get(
-            'normal_pool_distance',
-            config.get('fg_distance', config.get('label_distance', 10)),
-        )
-    )
+    normal_pool_distance = _resolve_normal_pool_distance(config)
     normal_pool_step = float(
         config.get('normal_pool_step', config.get('normal_sample_step', 0.5))
     )
@@ -441,6 +467,7 @@ def train(config_path):
         config.get('normal_pool_reduction', 'max')
     ).strip().lower()
     normal_pool_temperature = float(config.get('normal_pool_temperature', 1.0))
+    normal_pool_offsets_cache = {}
 
     def set_frozen_encoder_eval(active_model):
         if not (pretrained_backbone and freeze_encoder):
@@ -477,13 +504,14 @@ def train(config_path):
 
     def prepare_loss_inputs(preds, batch):
         if training_mode == 'normal_pooled_3d':
-            offsets = _build_normal_pool_offsets(
+            offsets = _get_normal_pool_offsets(
+                normal_pool_offsets_cache,
                 normal_pool_distance,
                 normal_pool_step,
                 device=preds.device,
                 dtype=preds.dtype,
             )
-            pooled_preds = _pool_logits_along_surface_normals(
+            pooled_preds, pooled_valid_mask = _pool_logits_along_surface_normals(
                 preds,
                 batch['surface_points_zyx'],
                 batch['surface_normals_zyx'],
@@ -493,7 +521,9 @@ def train(config_path):
             )
             targets = batch['surface_targets_2d'].float().unsqueeze(1)
             valid_mask = batch['surface_valid_2d'].float().unsqueeze(1)
+            valid_mask = valid_mask * pooled_valid_mask.float()
             ignore_mask = (valid_mask <= 0).float()
+            targets = torch.where(valid_mask > 0, targets, torch.zeros_like(targets))
             return pooled_preds, targets, ignore_mask
 
         targets = (torch.amax(batch['inklabels'].float(), dim=2) > 0).float()

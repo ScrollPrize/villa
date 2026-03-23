@@ -657,6 +657,29 @@ def _build_patch_segment_entry(segment_record, world_bbox, stored_grid_pad):
     }
 
 
+def _resolve_min_positive_point_count(config):
+    value = config.get("min_positive_point_count", 1)
+    min_positive_point_count = int(value)
+    if min_positive_point_count < 1:
+        raise ValueError(
+            f"min_positive_point_count must be >= 1, got {value!r}"
+        )
+    return min_positive_point_count
+
+
+def _supervised_segment_indices_for_patch_segments(
+    patch_segments,
+    *,
+    min_positive_point_count,
+):
+    min_positive_point_count = int(min_positive_point_count)
+    return tuple(
+        patch_segment_idx
+        for patch_segment_idx, patch_segment in enumerate(patch_segments)
+        if int(patch_segment.get("positive_point_count", 0)) >= min_positive_point_count
+    )
+
+
 def _build_patch_record_for_bbox(
     *,
     dataset_idx,
@@ -665,6 +688,7 @@ def _build_patch_record_for_bbox(
     world_bbox,
     segment_records,
     stored_grid_pad,
+    min_positive_point_count,
     segment_indices=None,
     has_positive_candidate=True,
 ):
@@ -680,7 +704,6 @@ def _build_patch_record_for_bbox(
         )
 
     patch_segments = []
-    supervised_segment_indices = []
     for segment_record in candidate_segment_records:
         patch_segment = _build_patch_segment_entry(
             segment_record,
@@ -689,12 +712,14 @@ def _build_patch_record_for_bbox(
         )
         if patch_segment is None:
             continue
-        if patch_segment["has_positive_points"]:
-            supervised_segment_indices.append(len(patch_segments))
         patch_segments.append(patch_segment)
 
     if not patch_segments:
         return None, "without_points"
+    supervised_segment_indices = _supervised_segment_indices_for_patch_segments(
+        patch_segments,
+        min_positive_point_count=min_positive_point_count,
+    )
     if not supervised_segment_indices:
         return None, "without_positive"
 
@@ -719,6 +744,7 @@ def _evaluate_bbox_chunk(
     world_bboxes,
     segment_records,
     stored_grid_pad,
+    min_positive_point_count,
     segment_indices_by_bbox,
     has_positive_candidates,
 ):
@@ -739,6 +765,7 @@ def _evaluate_bbox_chunk(
             world_bbox=world_bbox,
             segment_records=segment_records,
             stored_grid_pad=stored_grid_pad,
+            min_positive_point_count=min_positive_point_count,
             segment_indices=segment_indices,
             has_positive_candidate=has_positive_candidate,
         )
@@ -766,6 +793,7 @@ def _build_dataset_patch_records(
     overlap_fraction,
     patch_finding_workers,
     stored_grid_pad,
+    min_positive_point_count,
 ):
     stats = {
         "candidate_bboxes": 0,
@@ -814,10 +842,9 @@ def _build_dataset_patch_records(
     stats["rejected_without_points"] = int(stats["candidate_bboxes"] - len(bbox_to_segments))
     for flat_idx in sorted(bbox_to_segments):
         patch_segments = bbox_to_segments[flat_idx]
-        supervised_segment_indices = tuple(
-            patch_segment_idx
-            for patch_segment_idx, patch_segment in enumerate(patch_segments)
-            if patch_segment["has_positive_points"]
+        supervised_segment_indices = _supervised_segment_indices_for_patch_segments(
+            patch_segments,
+            min_positive_point_count=min_positive_point_count,
         )
         if not supervised_segment_indices:
             stats["rejected_without_positive"] += 1
@@ -1056,11 +1083,18 @@ def _serialize_patch_record(patch):
     }
 
 
-def _load_cached_patches(cache_entry, *, dataset_idx, volume, volume_scale, segment_by_uuid):
+def _load_cached_patches(
+    cache_entry,
+    *,
+    dataset_idx,
+    volume,
+    volume_scale,
+    segment_by_uuid,
+    min_positive_point_count,
+):
     cached_patches = []
     for record in cache_entry.get("patches", []):
         patch_segments = []
-        supervised_segment_indices = []
         for cached_segment in record.get("segments", []):
             segment_uuid = str(cached_segment["segment_uuid"])
             runtime_segment = segment_by_uuid.get(segment_uuid)
@@ -1079,10 +1113,12 @@ def _load_cached_patches(cache_entry, *, dataset_idx, volume, volume_scale, segm
                 "positive_point_count": int(cached_segment["positive_point_count"]),
                 "has_positive_points": bool(cached_segment["has_positive_points"]),
             }
-            if patch_segment["has_positive_points"]:
-                supervised_segment_indices.append(len(patch_segments))
             patch_segments.append(patch_segment)
 
+        supervised_segment_indices = _supervised_segment_indices_for_patch_segments(
+            patch_segments,
+            min_positive_point_count=min_positive_point_count,
+        )
         if not patch_segments or not supervised_segment_indices:
             continue
 
@@ -1109,6 +1145,7 @@ def find_patches(
     patch_cache_filename,
 ):
     stored_grid_pad = int(config.get("stored_grid_pad", DEFAULT_STORED_GRID_PAD))
+    min_positive_point_count = _resolve_min_positive_point_count(config)
     patches = []
     patch_generation_stats = {
         "segments_considered": 0,
@@ -1175,6 +1212,7 @@ def find_patches(
                     volume=volume,
                     volume_scale=volume_scale,
                     segment_by_uuid=segment_by_uuid,
+                    min_positive_point_count=min_positive_point_count,
                 )
                 patches.extend(cache_patches)
                 patch_generation_stats["kept_patches"] += int(len(cache_patches))
@@ -1199,6 +1237,7 @@ def find_patches(
             overlap_fraction=overlap_fraction,
             patch_finding_workers=patch_finding_workers,
             stored_grid_pad=stored_grid_pad,
+            min_positive_point_count=min_positive_point_count,
         )
         patches.extend(dataset_patches)
         patch_generation_stats["candidate_bboxes"] += int(dataset_stats["candidate_bboxes"])
