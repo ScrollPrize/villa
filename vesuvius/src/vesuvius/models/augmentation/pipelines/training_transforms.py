@@ -260,7 +260,7 @@ def create_training_transforms(
                         synchronize_channels=False,
                         synchronize_axes=False,
                         p_per_channel=0.5,
-                        benchmark=True,
+                        benchmark=False,
                     ),
                     apply_probability=0.3,
                 ),
