@@ -7,7 +7,7 @@ from scipy.ndimage import distance_transform_edt
 
 from torch.utils.data import Dataset
 
-from .common import (
+from common import (
     _normalize_patch_size_zyx,
     _normalize_vectors_last_axis,
     _points_to_voxels,
