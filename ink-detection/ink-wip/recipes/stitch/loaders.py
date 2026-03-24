@@ -22,7 +22,7 @@ from ink.recipes.stitch.infer_dataset import ZarrInferDataset
 
 def build_stitch_runtime_loaders(*, stitch_data: StitchData, train_loader, eval_loader) -> tuple[list[DataLoader], list[DataLoader]]:
     train_dataset = getattr(train_loader, "dataset", None)
-    if not isinstance(train_dataset, ZarrPatchDataset) and not callable(getattr(train_dataset, "build_segment_eval_loaders", None)):
+    if not isinstance(train_dataset, ZarrPatchDataset):
         return [], []
 
     batch_size, num_workers = _resolve_loader_build_settings(train_loader=train_loader, eval_loader=eval_loader)
@@ -30,19 +30,12 @@ def build_stitch_runtime_loaders(*, stitch_data: StitchData, train_loader, eval_
     train_segment_ids = _segment_spec_ids(getattr(getattr(stitch_data, "train", None), "segments", ()))
     train_viz_loaders: list[DataLoader] = []
     if bool(getattr(train_viz, "enabled", False)) and train_segment_ids:
-        if isinstance(train_dataset, ZarrPatchDataset):
-            train_viz_loaders = build_zarr_segment_eval_loaders(
-                train_dataset,
-                segment_ids=train_segment_ids,
-                batch_size=batch_size,
-                num_workers=num_workers,
-            )
-        else:
-            train_viz_loaders = train_dataset.build_segment_eval_loaders(
-                segment_ids=train_segment_ids,
-                batch_size=batch_size,
-                num_workers=num_workers,
-            )
+        train_viz_loaders = build_zarr_segment_eval_loaders(
+            train_dataset,
+            segment_ids=train_segment_ids,
+            batch_size=batch_size,
+            num_workers=num_workers,
+        )
 
     log_only_segment_ids = tuple(
         str(segment_id)
@@ -50,22 +43,12 @@ def build_stitch_runtime_loaders(*, stitch_data: StitchData, train_loader, eval_
     )
     log_only_loaders: list[DataLoader] = []
     if log_only_segment_ids:
-        if isinstance(train_dataset, ZarrPatchDataset):
-            log_only_loaders = build_zarr_segment_infer_loaders(
-                train_dataset,
-                segment_ids=log_only_segment_ids,
-                batch_size=batch_size,
-                num_workers=num_workers,
-            )
-        else:
-            build_infer_loaders = getattr(train_dataset, "build_segment_infer_loaders", None)
-            if not callable(build_infer_loaders):
-                raise ValueError(f"{type(train_dataset).__name__} does not support log_only stitch loaders")
-            log_only_loaders = build_infer_loaders(
-                segment_ids=log_only_segment_ids,
-                batch_size=batch_size,
-                num_workers=num_workers,
-            )
+        log_only_loaders = build_zarr_segment_infer_loaders(
+            train_dataset,
+            segment_ids=log_only_segment_ids,
+            batch_size=batch_size,
+            num_workers=num_workers,
+        )
     return train_viz_loaders, log_only_loaders
 
 

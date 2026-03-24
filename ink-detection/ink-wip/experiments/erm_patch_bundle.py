@@ -15,11 +15,5 @@ EXPERIMENT = replace(
     data=GeneratedPatchBundleDataRecipe(
         bundle_root=_BUNDLE_ROOT,
         source=_SOURCE_DATA,
-        train_batch_size=int(_SOURCE_DATA.train_batch_size),
-        valid_batch_size=_SOURCE_DATA.valid_batch_size,
-        num_workers=int(_SOURCE_DATA.num_workers),
-        shuffle=bool(_SOURCE_DATA.shuffle),
-        normalization=_SOURCE_DATA.normalization,
-        extras=dict(_SOURCE_DATA.extras or {}),
     ),
 )
