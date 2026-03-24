@@ -1,0 +1,136 @@
+diff --git a/ink/recipes/trainers/patch.py b/ink/recipes/trainers/patch.py
+index a6a972f..1837799 100644
+--- a/ink/recipes/trainers/patch.py
++++ b/ink/recipes/trainers/patch.py
+@@ -216,7 +216,10 @@ class PatchTraining:
+         total_batches = len(self.train_loader)
+         window_batches = 0
+         window_loss_sum: torch.Tensor | None = None
++        window_data_wait_s = 0.0
++        window_step_s = 0.0
+         window_started_at = time.perf_counter()
++        last_batch_finished_at = window_started_at
+         log_every_n_steps = None if self.log_every_n_steps is None else max(1, int(self.log_every_n_steps))
+         step_component_sums: dict[str, torch.Tensor] = {}
+         step_component_batches = 0
+@@ -248,7 +251,7 @@ class PatchTraining:
+             step_component_batches = 0
+ 
+         def maybe_log_progress(*, force: bool = False) -> None:
+-            nonlocal window_batches, window_loss_sum, window_started_at
++            nonlocal window_batches, window_loss_sum, window_data_wait_s, window_step_s, window_started_at
+             if not callable(self.log):
+                 return
+             if log_every_n_steps is None:
+@@ -267,17 +270,25 @@ class PatchTraining:
+                 f"[train] epoch={epoch + 1}/{end_epoch} "
+                 f"step={batch_count}/{total_batches} "
+                 f"loss={avg_loss:.4f} "
+-                f"it_s={window_batches / elapsed:.2f}"
++                f"it_s={window_batches / elapsed:.2f} "
++                f"data_s={window_data_wait_s / float(window_batches):.3f} "
++                f"step_s={window_step_s / float(window_batches):.3f}"
+             )
+             _log(self.log, message)
+             window_batches = 0
+             window_loss_sum = None
++            window_data_wait_s = 0.0
++            window_step_s = 0.0
+             window_started_at = time.perf_counter()
+ 
+         for batch in self.train_loader:
++            batch_ready_at = time.perf_counter()
++            window_data_wait_s += max(0.0, batch_ready_at - last_batch_finished_at)
++            step_started_at = time.perf_counter()
+             batch = move_batch_to_device(batch, device=device)
+             step_output = self.run_step(batch)
+             (step_output.loss / grad_accum).backward()
++            window_step_s += max(0.0, time.perf_counter() - step_started_at)
+ 
+             batch_count += 1
+             pending_batches += 1
+@@ -298,6 +309,7 @@ class PatchTraining:
+                 flush_optimizer_step()
+             if log_every_n_steps is not None and (batch_count % log_every_n_steps) == 0:
+                 maybe_log_progress()
++            last_batch_finished_at = time.perf_counter()
+ 
+         flush_optimizer_step()
+         maybe_log_progress(force=True)
+@@ -395,6 +407,13 @@ class PatchTraining:
+                 )
+                 if run_fs is not None:
+                     run_fs.log_train_epoch(epoch, train_epoch.components)
++                    _log(
++                        self.log,
++                        "[runfs] "
++                        f"epoch={epoch + 1}/{start_epoch + total_epochs} "
++                        f"split=train "
++                        f"history_path={run_fs.history_path}",
++                    )
+                 if wandb_session is not None:
+                     wandb_session.log_train_epoch(epoch, train_epoch.components)
+ 
+@@ -434,7 +453,17 @@ class PatchTraining:
+                         f"{' '.join(eval_parts)}".rstrip(),
+                     )
+                     if run_fs is not None:
++                        previous_best_metric = run_fs.best_metric
+                         run_fs.log_eval_epoch(epoch, report)
++                        _log(
++                            self.log,
++                            "[runfs] "
++                            f"epoch={epoch + 1}/{start_epoch + total_epochs} "
++                            f"split=val "
++                            f"history_path={run_fs.history_path} "
++                            f"summary_path={run_fs.summary_path} "
++                            f"latest_eval_path={run_fs.eval_dir / 'latest.yaml'}",
++                        )
+                         if save_best_on is not None:
+                             maybe_save_best_checkpoint(
+                                 run_fs,
+@@ -446,6 +475,16 @@ class PatchTraining:
+                                 checkpoint_extra_state=checkpoint_extra_state,
+                                 higher_is_better=bool(save_best_higher_is_better),
+                             )
++                            if run_fs.best_metric != previous_best_metric:
++                                _log(
++                                    self.log,
++                                    "[runfs] "
++                                    f"epoch={epoch + 1}/{start_epoch + total_epochs} "
++                                    f"checkpoint=best "
++                                    f"path={run_fs.ckpt_dir / 'best.pt'} "
++                                    f"metric={save_best_on} "
++                                    f"value={run_fs.best_metric}",
++                                )
+                     if wandb_session is not None:
+                         wandb_session.log_eval_epoch(epoch, report)
+ 
+@@ -458,6 +497,13 @@ class PatchTraining:
+                             epoch=epoch,
+                             checkpoint_extra_state=checkpoint_extra_state,
+                         )
++                        _log(
++                            self.log,
++                            "[runfs] "
++                            f"epoch={epoch + 1}/{start_epoch + total_epochs} "
++                            f"checkpoint=epoch "
++                            f"path={run_fs.ckpt_dir / f'epoch_{int(epoch):04d}.pt'}",
++                        )
+                     save_last_checkpoint(
+                         run_fs,
+                         model=model,
+@@ -465,6 +511,13 @@ class PatchTraining:
+                         epoch=epoch,
+                         checkpoint_extra_state=checkpoint_extra_state,
+                     )
++                    _log(
++                        self.log,
++                        "[runfs] "
++                        f"epoch={epoch + 1}/{start_epoch + total_epochs} "
++                        f"checkpoint=last "
++                        f"path={run_fs.ckpt_dir / 'last.pt'}",
++                    )
+ 
+             return TrainingRunResult(
+                 train_epochs=tuple(train_epochs),
