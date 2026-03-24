@@ -7,32 +7,23 @@ from ink.core.types import DataBundle
 
 
 def build_experiment_data(data, *, runtime=None, augment=None) -> DataBundle:
-    if isinstance(data, DataBundle):
-        return data
+    """Build the shared data bundle before binding the rest of the experiment."""
     bundle = data.build(runtime=runtime, augment=augment)
     assert isinstance(bundle, DataBundle)
     return bundle
 
 
 def assemble_experiment(experiment: Experiment, bundle: DataBundle, *, logger=None) -> Experiment:
-    assert "augment" in bundle.extras
-    bound_augment = bundle.extras["augment"]
+    """Bind runtime, model, evaluator, and trainer against one prepared data bundle."""
+    bound_augment = bundle.augment
     bound_runtime = experiment.runtime.build(data=bundle, augment=bound_augment)
     bound_model = experiment.model.build(data=bundle, runtime=bound_runtime, augment=bound_augment)
-    bound_objective = experiment.objective.build(bundle)
-
-    bound_stitch = None
-    if experiment.stitch is not None:
-        bound_stitch = experiment.stitch.build(bundle, logger=logger, patch_loss=experiment.loss)
-
-    bound_evaluator = None
-    if experiment.evaluator is not None:
-        bound_evaluator = experiment.evaluator.build(
-            data=bundle,
-            runtime=bound_runtime,
-            stitch=bound_stitch,
-            logger=logger,
-        )
+    bound_objective = None if experiment.objective is None else experiment.objective.build(bundle)
+    bound_evaluator = None if experiment.evaluator is None else experiment.evaluator.build(
+        data=bundle,
+        runtime=bound_runtime,
+        logger=logger,
+    )
 
     bound_experiment = replace(
         experiment,
@@ -40,7 +31,6 @@ def assemble_experiment(experiment: Experiment, bundle: DataBundle, *, logger=No
         augment=bound_augment,
         model=bound_model,
         objective=bound_objective,
-        stitch=bound_stitch,
         evaluator=bound_evaluator,
     )
 

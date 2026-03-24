@@ -3,8 +3,8 @@ from __future__ import annotations
 from ink.core.assemble import assemble_experiment, build_experiment_data
 from ink.core.experiment import Experiment
 
-
 def run_experiment(experiment: Experiment, *, logger=None, **trainer_kwargs):
+    """Build the bound experiment graph and delegate execution to the trainer."""
     bundle = build_experiment_data(
         experiment.data,
         runtime=experiment.runtime,

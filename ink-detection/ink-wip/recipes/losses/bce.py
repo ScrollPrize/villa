@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from ink.recipes.losses.masking import resolve_valid_mask
+
 
 def build_bce_targets(
     targets,
@@ -21,18 +23,6 @@ def build_bce_targets(
     if smooth_factor != 0.0:
         soft_targets = (1.0 - soft_targets) * smooth_factor + soft_targets * (1.0 - smooth_factor)
     return soft_targets
-
-
-def resolve_valid_mask(targets: torch.Tensor, valid_mask) -> torch.Tensor:
-    if valid_mask is None:
-        return torch.ones_like(targets, dtype=torch.float32)
-
-    valid_mask = valid_mask.to(device=targets.device, dtype=torch.float32)
-    if tuple(valid_mask.shape) != tuple(targets.shape):
-        raise ValueError(
-            f"valid_mask shape must match targets shape, got {tuple(valid_mask.shape)} vs {tuple(targets.shape)}"
-        )
-    return valid_mask
 
 
 def compute_per_sample_bce_values(
@@ -85,7 +75,6 @@ class BCEBatch:
     smooth_factor: float = 0.25
     soft_label_positive: float = 1.0
     soft_label_negative: float = 0.0
-    eps: float = 1e-7
 
     def __call__(self, logits: torch.Tensor, targets: torch.Tensor, *, valid_mask=None) -> torch.Tensor:
         return compute_batch_bce_loss(
@@ -113,7 +102,6 @@ class BCEPerSample:
     smooth_factor: float = 0.25
     soft_label_positive: float = 1.0
     soft_label_negative: float = 0.0
-    eps: float = 1e-7
 
     def __call__(self, logits: torch.Tensor, targets: torch.Tensor, *, valid_mask=None) -> torch.Tensor:
         return compute_per_sample_bce_values(

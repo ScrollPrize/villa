@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -8,65 +9,58 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ink.recipes.losses.boundary import binary_mask_to_signed_distance_map
-from ink.recipes.stitch.data import StitchData, normalize_component_key
+from ink.core.types import Batch
+from ink.recipes.stitch.config import StitchData, normalize_component_key
 from ink.recipes.stitch.ops import (
     accumulate_to_buffers as _accumulate_to_buffers_impl,
     allocate_segment_buffers,
     compose_segment_from_roi_buffers,
     gaussian_weights,
+    normalize_xyxy_rows,
     resolve_buffer_crop,
 )
-from ink.recipes.stitch.state import (
-    StitchExecutionContext,
-    _StitchState,
-    _coerce_component_dataset_map,
+from ink.recipes.stitch.runtime import (
+    StitchRuntimeState,
     _log,
     _noop_log,
 )
 from ink.recipes.stitch.terms import (
+    StitchLossBatch,
     _requires_boundary_dist_map,
     _stitch_loss_terms,
-    compute_stitched_component_loss,
+    compute_stitched_loss_components,
 )
 from ink.recipes.stitch.train_component_runtime import (
-    compute_train_stitch_loss as _compute_train_stitch_loss_impl,
-    stitch_saved_tensors_context as _stitch_saved_tensors_context_impl,
+    _allocate_train_loss_roi_buffers,
+    _dataset_component_group_idx,
+    _resolve_model_device,
+    _resolve_boundary_dist_map,
+    _run_component_patch_pass,
+    _summarize_train_stitched_component_losses,
 )
 
 
-def _owner_data(owner) -> StitchData:
-    data = getattr(owner, "data", None)
-    if not isinstance(data, StitchData):
-        raise TypeError("stitch runtime requires an owner with .data: StitchData")
-    return data
-
-
-def _owner_state(owner) -> _StitchState:
-    state = getattr(owner, "state", None)
-    if not isinstance(state, _StitchState):
-        raise TypeError("stitch runtime requires an owner with .state")
-    return state
-
-
-def _owner_execution(owner) -> StitchExecutionContext:
-    execution = getattr(owner, "execution", None)
-    if not isinstance(execution, StitchExecutionContext):
-        raise TypeError("stitch runtime requires an owner with .execution")
-    return execution
+def _coerce_component_dataset_map(raw_datasets) -> dict[tuple[str, int], Any]:
+    if raw_datasets is None:
+        return {}
+    return {
+        normalize_component_key(component_key): dataset
+        for component_key, dataset in dict(raw_datasets).items()
+    }
 
 
 @dataclass
 class TrainStitchRuntime:
     data: StitchData
-    state: _StitchState
-    execution: StitchExecutionContext
+    state: StitchRuntimeState
     patch_loss: object = None
     patch_loss_weight: float = 1.0
     gradient_checkpointing: bool = False
     save_on_cpu: bool = False
     log: object = _noop_log
+    precision_context: object = None
     loaders: list[Any] = field(default_factory=list)
+    log_only_loaders: list[Any] = field(default_factory=list)
     component_datasets: dict[tuple[str, int], Any] = field(default_factory=dict)
     _warned_checkpoint_vs_offload: bool = False
 
@@ -76,23 +70,151 @@ class TrainStitchRuntime:
         self.save_on_cpu = bool(self.save_on_cpu)
         self.component_datasets = _coerce_component_dataset_map(self.component_datasets)
 
-    def run_viz_pass(self, model):
-        return run_train_stitch_pass(self, model)
+    def _run_segment_viz_pass(
+        self,
+        model,
+        *,
+        epoch: int,
+        enabled: bool,
+        every_n_epochs: int,
+        loaders,
+        segment_ids,
+        meta_for_segment,
+        loss_component_names=(),
+        mode_name: str,
+    ):
+        if not enabled:
+            return None
+        normalized_ids = tuple(str(segment_id) for segment_id in (segment_ids or ()))
+        normalized_loaders = tuple(loaders or ())
+        if len(normalized_loaders) != len(normalized_ids):
+            raise ValueError(
+                f"{mode_name} stitch loaders/segment_ids length mismatch "
+                f"({len(normalized_loaders)} vs {len(normalized_ids)})"
+            )
+        segment_pairs = tuple(zip(normalized_loaders, normalized_ids))
+        if not segment_pairs:
+            return None
+        cadence = max(1, int(every_n_epochs))
+        if cadence != 1 and ((int(epoch) + 1) % cadence) != 0:
+            return None
+
+        t0 = time.perf_counter()
+        _log(self, f"{mode_name} stitch pass start epoch={epoch}")
+        segment_viz = {}
+
+        was_training = model.training
+        try:
+            model.eval()
+            with torch.inference_mode():
+                for loader, sid in segment_pairs:
+                    meta = meta_for_segment(sid)
+                    if meta is None:
+                        continue
+                    segment_entry = _run_train_segment(
+                        self,
+                        model,
+                        data=self.data,
+                        state=self.state,
+                        precision_context=self.precision_context,
+                        loader=loader,
+                        segment_id=sid,
+                        meta=meta,
+                        loss_component_names=loss_component_names,
+                    )
+                    if segment_entry is not None:
+                        segment_viz[sid] = segment_entry
+        finally:
+            if was_training:
+                model.train()
+
+        _log(self, f"{mode_name} stitch pass done epoch={epoch} elapsed={time.perf_counter() - t0:.1f}s")
+        return segment_viz
+
+    def run_viz_pass(self, model, *, epoch: int):
+        return self._run_segment_viz_pass(
+            model,
+            epoch=int(epoch),
+            enabled=bool(self.data.train.viz.enabled),
+            every_n_epochs=int(self.data.train.viz.every_n_epochs),
+            loaders=self.loaders,
+            segment_ids=tuple(str(spec.segment_id) for spec in (self.data.train.segments or ())),
+            meta_for_segment=self.state.train_segment_meta,
+            loss_component_names=tuple(self.data.train.viz.loss_components),
+            mode_name="train",
+        )
+
+    def run_log_only_viz_pass(self, model, *, epoch: int):
+        return self._run_segment_viz_pass(
+            model,
+            epoch=int(epoch),
+            enabled=bool(self.data.log_only.segment_ids),
+            every_n_epochs=int(self.data.log_only.every_n_epochs),
+            loaders=self.log_only_loaders,
+            segment_ids=self.data.log_only.segment_ids,
+            meta_for_segment=self.state.log_only_segment_meta,
+            loss_component_names=(),
+            mode_name="log_only",
+        )
 
     def compute_component_loss(self, model, *, component_key):
-        return compute_train_stitch_loss(self, model, component_key=component_key)
+        terms = _stitch_loss_terms(self.data.train.loss.terms)
+        if len(terms) <= 0:
+            raise RuntimeError("stitched training requires stitch.train.loss.terms")
 
-    def set_loaders(self, loaders, segment_ids=None) -> None:
+        if not self.component_datasets or not self.data.train.component_keys:
+            raise RuntimeError("train component stitch datasets are not configured")
+        if len(self.component_datasets) != len(self.data.train.component_keys):
+            raise ValueError(
+                "train component datasets/keys length mismatch "
+                f"({len(self.component_datasets)} vs {len(self.data.train.component_keys)})"
+            )
+
+        component_key = normalize_component_key(component_key)
+        dataset = self.dataset_for_component(component_key)
+        if dataset is None:
+            raise KeyError(f"missing train component stitch dataset for component_key={component_key!r}")
+
+        meta = self.state.component_meta_for(component_key)
+        if meta is None:
+            raise KeyError(f"missing train component ROI metadata for component_key={component_key!r}")
+
+        segment_id, component_idx = component_key
+        group_idx = _dataset_component_group_idx(dataset, component_key=component_key)
+        batch_size = int(self.data.train.loss.patch_batch_size or self.data.train.loss.valid_batch_size or 1)
+        roi_buffers = _allocate_train_loss_roi_buffers(meta, device=_resolve_model_device(model))
+
+        patch_components = _run_component_patch_pass(
+            self,
+            model,
+            data=self.data,
+            state=self.state,
+            dataset=dataset,
+            component_key=component_key,
+            batch_size=batch_size,
+            roi_buffers=roi_buffers,
+        )
+        stitch_components = _summarize_train_stitched_component_losses(
+            self,
+            state=self.state,
+            terms=terms,
+            component_key=component_key,
+            roi_buffers=roi_buffers,
+        )
+        return {
+            "component_key": component_key,
+            "segment_id": segment_id,
+            "component_idx": component_idx,
+            "group_idx": int(group_idx),
+            "patch": patch_components,
+            "stitch": stitch_components,
+        }
+
+    def set_loaders(self, loaders) -> None:
         self.loaders[:] = list(loaders or [])
-        if segment_ids is not None:
-            self.data.train.viz.segment_ids[:] = [str(segment_id) for segment_id in (segment_ids or [])]
 
-    def loader_for_segment(self, segment_id):
-        sid = str(segment_id)
-        for loader, candidate_id in zip(self.loaders, self.data.train.viz.segment_ids):
-            if str(candidate_id) == sid:
-                return loader
-        return None
+    def set_log_only_loaders(self, loaders) -> None:
+        self.log_only_loaders[:] = list(loaders or [])
 
     def set_component_datasets(self, datasets, component_keys=None) -> None:
         normalized_keys = [normalize_component_key(key) for key in (component_keys or [])]
@@ -116,16 +238,15 @@ class TrainStitchRuntime:
 
 
 def _accumulate_to_buffers(
-    owner,
     *,
+    data,
+    state,
     outputs,
     xyxys,
     pred_buf,
     count_buf,
     offset=(0, 0),
 ):
-    state = _owner_state(owner)
-    data = _owner_data(owner)
     return _accumulate_to_buffers_impl(
         outputs=outputs,
         xyxys=xyxys,
@@ -139,57 +260,10 @@ def _accumulate_to_buffers(
     )
 
 
-def _normalize_xyxys(xyxys) -> list[tuple[int, int, int, int]]:
-    if isinstance(xyxys, torch.Tensor):
-        if xyxys.ndim == 1:
-            if int(xyxys.numel()) != 4:
-                raise ValueError(f"stitch xyxys tensor must have 4 values, got shape={tuple(xyxys.shape)}")
-            return [tuple(int(v) for v in xyxys.tolist())]
-        if xyxys.ndim != 2 or int(xyxys.shape[1]) != 4:
-            raise ValueError(f"stitch xyxys tensor must have shape (N,4), got shape={tuple(xyxys.shape)}")
-        return [tuple(int(v) for v in row.tolist()) for row in xyxys]
-
-    if isinstance(xyxys, (list, tuple)):
-        if len(xyxys) == 4 and all(isinstance(value, torch.Tensor) for value in xyxys):
-            columns = [value.detach().reshape(-1) for value in xyxys]
-            batch_size = int(columns[0].numel())
-            return [
-                tuple(int(column[row_idx].item()) for column in columns)
-                for row_idx in range(batch_size)
-            ]
-
-        if len(xyxys) == 4 and all(not isinstance(value, (list, tuple)) for value in xyxys):
-            return [
-                tuple(
-                    int(value.item()) if isinstance(value, torch.Tensor) else int(value)
-                    for value in xyxys
-                )
-            ]
-
-        normalized = []
-        for item in xyxys:
-            if isinstance(item, torch.Tensor):
-                flat = item.detach().reshape(-1)
-                if int(flat.numel()) != 4:
-                    raise ValueError("stitch xyxy tensor entries must have 4 values")
-                normalized.append(tuple(int(v.item()) for v in flat))
-                continue
-            if not isinstance(item, (list, tuple)) or len(item) != 4:
-                raise ValueError("stitch xyxy entries must have 4 values")
-            normalized.append(
-                tuple(
-                    int(value.item()) if isinstance(value, torch.Tensor) else int(value)
-                    for value in item
-                )
-            )
-        return normalized
-
-    raise TypeError(f"unsupported stitch xyxys value: {xyxys!r}")
-
-
 def _accumulate_tensor_to_numpy_buffers(
-    owner,
     *,
+    downsample,
+    state,
     values,
     xyxys,
     pred_buf,
@@ -197,9 +271,7 @@ def _accumulate_tensor_to_numpy_buffers(
     offset=(0, 0),
     mode: str,
 ):
-    data = _owner_data(owner)
-    state = _owner_state(owner)
-    ds = int(data.layout.downsample)
+    ds = int(downsample)
     values = values.detach().to("cpu", dtype=torch.float32)
     for i, xyxy in enumerate(xyxys):
         crop = resolve_buffer_crop(
@@ -239,6 +311,16 @@ def _accumulate_tensor_to_numpy_buffers(
         count_buf[crop["y1"]:crop["y2"], crop["x1"]:crop["x2"]] += weight_crop
 
 
+def _unpack_segment_batch(batch):
+    if isinstance(batch, Batch):
+        if batch.meta.patch_xyxy is None:
+            raise ValueError("stitch segment batch requires meta.patch_xyxy")
+        return batch.x, batch.y, batch.meta.patch_xyxy, batch.meta.group_idx
+    if isinstance(batch, (list, tuple)) and len(batch) == 4:
+        return batch
+    raise ValueError("stitch segment batch must be Batch or (x, y, xyxys, group_idx)")
+
+
 def _compose_average_from_roi_buffers(roi_buffers, *, full_shape):
     full_shape = tuple(int(v) for v in full_shape)
     full_sum = np.zeros(full_shape, dtype=np.float32)
@@ -258,70 +340,22 @@ def _compose_average_from_roi_buffers(roi_buffers, *, full_shape):
     return averaged, covered
 
 
-def _resolve_boundary_dist_map(owner, *, cache_key, stitched_targets, device):
-    state = _owner_state(owner)
-
-    dist_map_np = state._boundary_dist_maps_cpu.get(cache_key)
-    if dist_map_np is None:
-        target_mask = stitched_targets.detach().cpu().numpy() > 0.5
-        dist_map_np = binary_mask_to_signed_distance_map(target_mask)
-        state._boundary_dist_maps_cpu[cache_key] = dist_map_np
-
-    device_key = (cache_key, str(device.type), getattr(device, "index", None))
-    dist_map_t = state._boundary_dist_maps_torch.get(device_key)
-    if dist_map_t is None:
-        dist_map_t = torch.from_numpy(dist_map_np).to(device=device, dtype=torch.float32)
-        state._boundary_dist_maps_torch[device_key] = dist_map_t
-    return dist_map_t
-
-
-def _stitch_saved_tensors_context(owner):
-    return _stitch_saved_tensors_context_impl(owner, log=_log)
-
-
-def compute_train_stitch_loss(owner, model, *, component_key):
-    data = _owner_data(owner)
-    terms = _stitch_loss_terms(data.train.loss.terms)
-    if len(terms) <= 0:
-        raise RuntimeError("stitched training requires stitch.train.loss.terms")
-
-    return _compute_train_stitch_loss_impl(
-        owner,
-        model,
-        component_key=component_key,
-        terms=terms,
-        normalize_xyxys=_normalize_xyxys,
-        resolve_boundary_dist_map=_resolve_boundary_dist_map,
-        compute_stitched_component_loss=compute_stitched_component_loss,
-        requires_boundary_dist_map=_requires_boundary_dist_map,
-        stitch_saved_tensors_context=_stitch_saved_tensors_context,
-    )
-
-
-def _should_run_train_viz(owner, model):
-    data = _owner_data(owner)
-    if not data.train.viz.enabled:
-        return False, int(getattr(model, "current_epoch", 0))
-    if not owner.loaders or not data.train.viz.segment_ids:
-        return False, int(getattr(model, "current_epoch", 0))
-    if len(owner.loaders) != len(data.train.viz.segment_ids):
-        raise ValueError(
-            "train stitch loaders/segment_ids length mismatch "
-            f"({len(owner.loaders)} vs {len(data.train.viz.segment_ids)})"
-        )
-    epoch = int(getattr(model, "current_epoch", 0))
-    if data.train.viz.every_n_epochs > 1 and ((epoch + 1) % data.train.viz.every_n_epochs) != 0:
-        return False, epoch
-    return True, epoch
-
-
-def _compute_train_viz_metrics(owner, *, data, segment_id, pred_buffers, target_buffers, full_shape, metric_names):
-    if not metric_names:
+def _compute_train_viz_loss_components(
+    *,
+    data,
+    state,
+    segment_id,
+    pred_buffers,
+    target_buffers,
+    full_shape,
+    loss_component_names,
+):
+    if not loss_component_names:
         return {}
 
     terms = _stitch_loss_terms(data.train.loss.terms)
     if len(terms) <= 0:
-        raise RuntimeError("train stitch viz metrics require stitch.train.loss.terms")
+        raise RuntimeError("train stitch viz loss components require stitch.train.loss.terms")
 
     logits_np, valid_np = _compose_average_from_roi_buffers(pred_buffers, full_shape=full_shape)
     targets_np, _ = _compose_average_from_roi_buffers(target_buffers, full_shape=full_shape)
@@ -334,22 +368,24 @@ def _compute_train_viz_metrics(owner, *, data, segment_id, pred_buffers, target_
     boundary_dist_map = None
     if _requires_boundary_dist_map(terms):
         boundary_dist_map = _resolve_boundary_dist_map(
-            owner,
+            state,
             cache_key=("viz", str(segment_id)),
             stitched_targets=stitched_targets,
             device=torch.device("cpu"),
         )
-    metrics = compute_stitched_component_loss(
+    components = compute_stitched_loss_components(
         terms,
-        stitched_logits,
-        stitched_targets,
-        valid_mask=valid_mask,
-        boundary_dist_map=boundary_dist_map,
+        StitchLossBatch(
+            logits=stitched_logits,
+            targets=stitched_targets,
+            valid_mask=valid_mask,
+            boundary_dist_map=boundary_dist_map,
+        ),
     )
-    requested = {str(name) for name in metric_names}
+    requested = {str(name) for name in loss_component_names}
     return {
         key: value
-        for key, value in metrics.items()
+        for key, value in components.items()
         if key == "covered_px" or key in requested
     }
 
@@ -359,27 +395,33 @@ def _run_train_segment(
     model,
     *,
     data,
+    state,
+    precision_context,
     loader,
     segment_id,
     meta,
-    metric_names,
+    loss_component_names,
 ):
     full_shape = tuple(int(v) for v in meta.get("full_shape", (0, 0)))
     pred_buffers = allocate_segment_buffers(meta)
     if not pred_buffers:
         return None
 
-    needs_metrics = bool(metric_names)
-    target_buffers = allocate_segment_buffers(meta) if needs_metrics else None
+    needs_loss_components = bool(loss_component_names)
+    target_buffers = allocate_segment_buffers(meta) if needs_loss_components else None
+    model_device = _resolve_model_device(model)
 
     for batch in loader:
-        x, y, xyxys, _group_idx = batch
-        xyxys = _normalize_xyxys(xyxys)
-        x = x.to(model.device, non_blocking=True)
-        outputs = model(x)
+        x, y, xyxys, _group_idx = _unpack_segment_batch(batch)
+        xyxys = normalize_xyxy_rows(xyxys)
+        x = x.to(model_device, non_blocking=True)
+        context = precision_context(device=x.device) if callable(precision_context) else nullcontext()
+        with context:
+            outputs = model(x)
         for pred_buf, count_buf, offset in pred_buffers:
             _accumulate_to_buffers(
-                owner,
+                data=data,
+                state=state,
                 outputs=outputs,
                 xyxys=xyxys,
                 pred_buf=pred_buf,
@@ -388,9 +430,12 @@ def _run_train_segment(
             )
         if target_buffers is None:
             continue
+        if y is None:
+            raise ValueError("train stitch viz loss components require targets")
         for pred_buf, count_buf, offset in target_buffers:
             _accumulate_tensor_to_numpy_buffers(
-                owner,
+                downsample=data.layout.downsample,
+                state=state,
                 values=y,
                 xyxys=xyxys,
                 pred_buf=pred_buf,
@@ -414,7 +459,8 @@ def _run_train_segment(
     _log(
         owner,
         f"train stitch summary segment={segment_id} "
-        f"coverage={coverage:.4f} covered_px={covered_px}/{total_px} "
+        f"coverage={coverage:.4f} "
+        f"covered_px={covered_px}/{total_px} "
         f"prob_mean={prob_mean:.4f} prob_max={prob_max:.4f}",
     )
 
@@ -427,56 +473,15 @@ def _run_train_segment(
         },
     }
     if target_buffers is not None:
-        segment_metrics = _compute_train_viz_metrics(
-            owner,
+        segment_loss_components = _compute_train_viz_loss_components(
             data=data,
+            state=state,
             segment_id=segment_id,
             pred_buffers=pred_buffers,
             target_buffers=target_buffers,
             full_shape=full_shape,
-            metric_names=metric_names,
+            loss_component_names=loss_component_names,
         )
-        if segment_metrics:
-            segment_viz["metrics"] = segment_metrics
-    return segment_viz
-
-
-def run_train_stitch_pass(owner, model):
-    should_run, epoch = _should_run_train_viz(owner, model)
-    if not should_run:
-        return None
-
-    data = _owner_data(owner)
-    state = _owner_state(owner)
-    metric_names = tuple(data.train.viz.metrics)
-
-    t0 = time.perf_counter()
-    _log(owner, f"train stitch pass start epoch={epoch}")
-    segment_viz = {}
-
-    was_training = model.training
-    try:
-        model.eval()
-        with torch.inference_mode(), _owner_execution(owner).forward_context():
-            for loader, segment_id in zip(owner.loaders, data.train.viz.segment_ids):
-                sid = str(segment_id)
-                meta = state.roi_meta_by_split["train"].get(sid)
-                if meta is None:
-                    continue
-                segment_entry = _run_train_segment(
-                    owner,
-                    model,
-                    data=data,
-                    loader=loader,
-                    segment_id=sid,
-                    meta=meta,
-                    metric_names=metric_names,
-                )
-                if segment_entry is not None:
-                    segment_viz[sid] = segment_entry
-    finally:
-        if was_training:
-            model.train()
-
-    _log(owner, f"train stitch pass done epoch={epoch} elapsed={time.perf_counter() - t0:.1f}s")
+        if segment_loss_components:
+            segment_viz["loss_components"] = segment_loss_components
     return segment_viz
