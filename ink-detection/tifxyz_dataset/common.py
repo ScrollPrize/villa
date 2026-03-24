@@ -218,6 +218,11 @@ def resolve_local_label_paths(segment_dir, segment_name, *, label_version=None, 
     normalized_extension = str(extension).lower()
     requested_version = normalize_label_version(label_version)
     candidates_by_version = {}
+    candidates_by_kind = {
+        "inklabels": {},
+        "supervision_mask": {},
+        "validation_mask": {},
+    }
 
     for path in segment_dir.iterdir():
         parsed = parse_label_asset_path(path.name)
@@ -227,32 +232,41 @@ def resolve_local_label_paths(segment_dir, segment_name, *, label_version=None, 
             continue
         if parsed["extension"].lower() != normalized_extension:
             continue
-        version_entry = candidates_by_version.setdefault(int(parsed["version_num"]), {})
+        version_num = int(parsed["version_num"])
+        version_entry = candidates_by_version.setdefault(version_num, {})
         version_entry[parsed["label_kind"]] = path
+        candidates_by_kind[parsed["label_kind"]][version_num] = path
 
-    available_versions = sorted(
-        version_num
-        for version_num, record in candidates_by_version.items()
-        if "inklabels" in record and "supervision_mask" in record
-    )
-    assert available_versions, (
-        f"{segment_dir} must contain matching inklabels and supervision_mask {normalized_extension} assets."
-    )
-
-    if requested_version is None:
-        chosen_version = available_versions[-1]
-    else:
+    if requested_version is not None:
+        chosen_version = int(requested_version)
+        available_versions = sorted(
+            version_num
+            for version_num, record in candidates_by_version.items()
+            if "inklabels" in record and "supervision_mask" in record
+        )
         chosen_version = int(requested_version)
         requested_name = "base" if chosen_version <= 1 else f"v{chosen_version}"
         assert chosen_version in available_versions, (
             f"{segment_dir} does not contain matching {normalized_extension} labels for version {requested_name}."
         )
+        selected = candidates_by_version[chosen_version]
+        return (
+            selected["inklabels"],
+            selected["supervision_mask"],
+            selected.get("validation_mask"),
+        )
 
-    selected = candidates_by_version[chosen_version]
+    assert candidates_by_kind["inklabels"], (
+        f"{segment_dir} must contain at least one inklabels {normalized_extension} asset."
+    )
+    assert candidates_by_kind["supervision_mask"], (
+        f"{segment_dir} must contain at least one supervision_mask {normalized_extension} asset."
+    )
+    validation_candidates = candidates_by_kind["validation_mask"]
     return (
-        selected["inklabels"],
-        selected["supervision_mask"],
-        selected.get("validation_mask"),
+        candidates_by_kind["inklabels"][max(candidates_by_kind["inklabels"])],
+        candidates_by_kind["supervision_mask"][max(candidates_by_kind["supervision_mask"])],
+        validation_candidates[max(validation_candidates)] if validation_candidates else None,
     )
 
 def to_uint8_image(image_2d):
