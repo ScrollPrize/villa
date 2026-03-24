@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ from metrics.embedding_neighbors import (
     EmbeddingNeighborEvaluator,
     EmbeddingNeighborRuntimeConfig,
 )
+from train_resnet3d_lib.embedding_loss import resolve_embedding_runtime_config
 
 
 DEFAULT_COMPARISON_ROOT = Path("/mnt/bcache/projects/vesuvius-scrolls/comparison-website-final")
@@ -124,6 +126,27 @@ def _format_pct(numerator: int, denominator: int) -> float:
     return 100.0 * float(numerator) / float(denominator)
 
 
+def _write_original_dino_config(
+    *,
+    embedding_config_path: Path | None,
+    embedding_checkpoint_path: Path | None,
+    temp_dir: Path,
+) -> Path:
+    _, _, base_config = resolve_embedding_runtime_config(
+        config_path=embedding_config_path,
+        checkpoint_path=embedding_checkpoint_path,
+    )
+    config = dict(base_config)
+    config["adaptation_method"] = "plain"
+    config["backbone_checkpoint"] = None
+    config["freeze_backbone"] = True
+    config["dropout"] = 0.0
+
+    output_path = temp_dir / "original_dino_config.json"
+    output_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return output_path
+
+
 @click.command()
 @click.option(
     "--comparison-root",
@@ -151,6 +174,12 @@ def _format_pct(numerator: int, denominator: int) -> float:
     default=DEFAULT_EMBEDDING_CHECKPOINT,
     show_default=True,
 )
+@click.option(
+    "--embedding-original-dino/--no-embedding-original-dino",
+    default=False,
+    show_default=True,
+    help="Ignore the learned embedding head and use the original HF/timm DINO backbone implied by the embedding config.",
+)
 @click.option("--dataset-split", type=click.Choice(["train", "test"]), default="train", show_default=True)
 @click.option("--dataset-samples", type=click.IntRange(min=1), default=2048, show_default=True)
 @click.option("--dataset-seed", type=int, default=None)
@@ -174,6 +203,7 @@ def main(
     limit: int | None,
     embedding_config_path: Path | None,
     embedding_checkpoint_path: Path | None,
+    embedding_original_dino: bool,
     dataset_split: str,
     dataset_samples: int,
     dataset_seed: int | None,
@@ -206,157 +236,179 @@ def main(
         raise click.ClickException("No preference rows matched the requested filters")
 
     model_device = _resolve_device(device)
-    runtime_config = EmbeddingNeighborRuntimeConfig(
-        config_path=embedding_config_path.expanduser().resolve() if embedding_config_path is not None else None,
-        checkpoint_path=(
-            embedding_checkpoint_path.expanduser().resolve()
-            if embedding_checkpoint_path is not None
-            else None
-        ),
-        dataset_split=dataset_split,
-        dataset_samples=dataset_samples,
-        dataset_seed=dataset_seed,
-        dataset_batch_size=dataset_batch_size,
-        dataset_num_workers=dataset_num_workers,
-        neighbors_k=neighbors_k,
-        query_crop_size=query_crop_size,
-        query_stride=query_stride,
-        query_downsample_factor=downsample_factor,
-        query_batch_size=query_batch_size,
-        search_chunk_size=search_chunk_size,
+    resolved_embedding_config_path = (
+        embedding_config_path.expanduser().resolve() if embedding_config_path is not None else None
     )
-    evaluator = EmbeddingNeighborEvaluator.from_runtime_config(
-        runtime_config=runtime_config,
-        model_device=model_device,
+    resolved_embedding_checkpoint_path = (
+        embedding_checkpoint_path.expanduser().resolve()
+        if embedding_checkpoint_path is not None
+        else None
     )
+    with tempfile.TemporaryDirectory(prefix="embedding-original-dino-") as temp_dir_str:
+        if embedding_original_dino:
+            if resolved_embedding_checkpoint_path is not None:
+                click.echo(
+                    (
+                        "Warning: --embedding-checkpoint-path is used only to resolve embedding config; "
+                        "model weights come from the original pretrained DINO backbone."
+                    ),
+                    err=True,
+                )
+            resolved_embedding_config_path = _write_original_dino_config(
+                embedding_config_path=resolved_embedding_config_path,
+                embedding_checkpoint_path=resolved_embedding_checkpoint_path,
+                temp_dir=Path(temp_dir_str),
+            )
+            resolved_embedding_checkpoint_path = None
 
-    # Collect votes and image paths per pair (one pass, no scoring yet)
-    per_pair_votes: dict[str, list[str]] = defaultdict(list)
-    per_pair_images: dict[str, tuple[Path, Path]] = {}
-    for row in rows:
-        left_path = (resolved_images_dir / row.left_image).resolve()
-        right_path = (resolved_images_dir / row.right_image).resolve()
-        if not left_path.exists():
-            raise click.ClickException(f"Missing left image for pair {row.pair_id}: {left_path}")
-        if not right_path.exists():
-            raise click.ClickException(f"Missing right image for pair {row.pair_id}: {right_path}")
-        per_pair_votes[row.pair_id].append(row.preference)
-        per_pair_images[row.pair_id] = (left_path, right_path)
-
-    # Score each unique pair once
-    score_cache: dict[tuple[Path, float | None], dict[str, float]] = {}
-    per_pair_predictions: dict[str, str] = {}
-    for pair_id, (left_path, right_path) in tqdm(per_pair_images.items(), desc="Scoring pairs", unit="pair"):
-        left_scores = _score_image(
-            evaluator=evaluator,
-            image_path=left_path,
-            score_cache=score_cache,
-            threshold=threshold,
+        runtime_config = EmbeddingNeighborRuntimeConfig(
+            config_path=resolved_embedding_config_path,
+            checkpoint_path=resolved_embedding_checkpoint_path,
+            dataset_split=dataset_split,
+            dataset_samples=dataset_samples,
+            dataset_seed=dataset_seed,
+            dataset_batch_size=dataset_batch_size,
+            dataset_num_workers=dataset_num_workers,
+            neighbors_k=neighbors_k,
+            query_crop_size=query_crop_size,
+            query_stride=query_stride,
+            query_downsample_factor=downsample_factor,
+            query_batch_size=query_batch_size,
+            search_chunk_size=search_chunk_size,
         )
-        right_scores = _score_image(
-            evaluator=evaluator,
-            image_path=right_path,
-            score_cache=score_cache,
-            threshold=threshold,
+        evaluator = EmbeddingNeighborEvaluator.from_runtime_config(
+            runtime_config=runtime_config,
+            model_device=model_device,
         )
-        left_distance = float(left_scores["topk_distance_mean"])
-        right_distance = float(right_scores["topk_distance_mean"])
-        if left_distance < right_distance:
-            per_pair_predictions[pair_id] = "left"
-        elif right_distance < left_distance:
-            per_pair_predictions[pair_id] = "right"
-        else:
-            per_pair_predictions[pair_id] = "tie"
 
-    # Compute row-level metrics by joining predictions back to individual ratings
-    row_correct = 0
-    row_incorrect = 0
-    row_ties = 0
-    for row in rows:
-        predicted_preference = per_pair_predictions[row.pair_id]
-        if predicted_preference == "tie":
-            row_ties += 1
-        elif predicted_preference == row.preference:
-            row_correct += 1
-        else:
-            row_incorrect += 1
+        # Collect votes and image paths per pair (one pass, no scoring yet)
+        per_pair_votes: dict[str, list[str]] = defaultdict(list)
+        per_pair_images: dict[str, tuple[Path, Path]] = {}
+        for row in rows:
+            left_path = (resolved_images_dir / row.left_image).resolve()
+            right_path = (resolved_images_dir / row.right_image).resolve()
+            if not left_path.exists():
+                raise click.ClickException(f"Missing left image for pair {row.pair_id}: {left_path}")
+            if not right_path.exists():
+                raise click.ClickException(f"Missing right image for pair {row.pair_id}: {right_path}")
+            per_pair_votes[row.pair_id].append(row.preference)
+            per_pair_images[row.pair_id] = (left_path, right_path)
 
-    pair_majority_correct = 0
-    pair_majority_incorrect = 0
-    pair_majority_ties = 0
-    pair_prediction_ties = 0
-    for pair_id, votes in per_pair_votes.items():
-        predicted_preference = per_pair_predictions[pair_id]
-        if predicted_preference == "tie":
-            pair_prediction_ties += 1
-            continue
+        # Score each unique pair once
+        score_cache: dict[tuple[Path, float | None], dict[str, float]] = {}
+        per_pair_predictions: dict[str, str] = {}
+        for pair_id, (left_path, right_path) in tqdm(per_pair_images.items(), desc="Scoring pairs", unit="pair"):
+            left_scores = _score_image(
+                evaluator=evaluator,
+                image_path=left_path,
+                score_cache=score_cache,
+                threshold=threshold,
+            )
+            right_scores = _score_image(
+                evaluator=evaluator,
+                image_path=right_path,
+                score_cache=score_cache,
+                threshold=threshold,
+            )
+            left_distance = float(left_scores["topk_distance_mean"])
+            right_distance = float(right_scores["topk_distance_mean"])
+            if left_distance < right_distance:
+                per_pair_predictions[pair_id] = "left"
+            elif right_distance < left_distance:
+                per_pair_predictions[pair_id] = "right"
+            else:
+                per_pair_predictions[pair_id] = "tie"
 
-        counts = Counter(votes)
-        left_votes = int(counts.get("left", 0))
-        right_votes = int(counts.get("right", 0))
-        if left_votes == right_votes:
-            pair_majority_ties += 1
-            continue
-        majority_preference = "left" if left_votes > right_votes else "right"
-        if predicted_preference == majority_preference:
-            pair_majority_correct += 1
-        else:
-            pair_majority_incorrect += 1
+        # Compute row-level metrics by joining predictions back to individual ratings
+        row_correct = 0
+        row_incorrect = 0
+        row_ties = 0
+        for row in rows:
+            predicted_preference = per_pair_predictions[row.pair_id]
+            if predicted_preference == "tie":
+                row_ties += 1
+            elif predicted_preference == row.preference:
+                row_correct += 1
+            else:
+                row_incorrect += 1
 
-    summary = {
-        "db_path": str(resolved_db_path),
-        "images_dir": str(resolved_images_dir),
-        "filters": {
-            "fold": fold,
-            "sample": sample,
-            "limit": limit,
-        },
-        "embedding_runtime": {
-            "config_path": str(runtime_config.config_path) if runtime_config.config_path is not None else None,
-            "checkpoint_path": (
-                str(runtime_config.checkpoint_path) if runtime_config.checkpoint_path is not None else None
-            ),
-            "dataset_split": runtime_config.dataset_split,
-            "dataset_samples": runtime_config.dataset_samples,
-            "dataset_seed": runtime_config.dataset_seed,
-            "dataset_batch_size": runtime_config.dataset_batch_size,
-            "dataset_num_workers": runtime_config.dataset_num_workers,
-            "neighbors_k": runtime_config.neighbors_k,
-            "query_crop_size": runtime_config.query_crop_size,
-            "query_stride": runtime_config.query_stride,
-            "downsample_factor": runtime_config.query_downsample_factor,
-            "threshold": threshold,
-            "query_batch_size": runtime_config.query_batch_size,
-            "search_chunk_size": runtime_config.search_chunk_size,
-            "device": str(model_device),
-        },
-        "row_metrics": {
-            "total": len(rows),
-            "correct": row_correct,
-            "incorrect": row_incorrect,
-            "ties": row_ties,
-            "accuracy_percent": _format_pct(row_correct, len(rows)),
-            "decisive_accuracy_percent": _format_pct(row_correct, row_correct + row_incorrect),
-        },
-        "pair_majority_metrics": {
-            "total_pairs": len(per_pair_votes),
-            "correct": pair_majority_correct,
-            "incorrect": pair_majority_incorrect,
-            "human_majority_ties": pair_majority_ties,
-            "metric_prediction_ties": pair_prediction_ties,
-            "accuracy_percent": _format_pct(pair_majority_correct, len(per_pair_votes)),
-            "decisive_accuracy_percent": _format_pct(
-                pair_majority_correct,
-                pair_majority_correct + pair_majority_incorrect,
-            ),
-        },
-        "unique_images_scored": len(score_cache),
-    }
+        pair_majority_correct = 0
+        pair_majority_incorrect = 0
+        pair_majority_ties = 0
+        pair_prediction_ties = 0
+        for pair_id, votes in per_pair_votes.items():
+            predicted_preference = per_pair_predictions[pair_id]
+            if predicted_preference == "tie":
+                pair_prediction_ties += 1
+                continue
 
-    click.echo(json.dumps(summary, indent=2, sort_keys=True))
-    if json_output is not None:
-        json_output.parent.mkdir(parents=True, exist_ok=True)
-        json_output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            counts = Counter(votes)
+            left_votes = int(counts.get("left", 0))
+            right_votes = int(counts.get("right", 0))
+            if left_votes == right_votes:
+                pair_majority_ties += 1
+                continue
+            majority_preference = "left" if left_votes > right_votes else "right"
+            if predicted_preference == majority_preference:
+                pair_majority_correct += 1
+            else:
+                pair_majority_incorrect += 1
+
+        summary = {
+            "db_path": str(resolved_db_path),
+            "images_dir": str(resolved_images_dir),
+            "filters": {
+                "fold": fold,
+                "sample": sample,
+                "limit": limit,
+            },
+            "embedding_runtime": {
+                "config_path": str(runtime_config.config_path) if runtime_config.config_path is not None else None,
+                "checkpoint_path": (
+                    str(runtime_config.checkpoint_path) if runtime_config.checkpoint_path is not None else None
+                ),
+                "original_dino": embedding_original_dino,
+                "dataset_split": runtime_config.dataset_split,
+                "dataset_samples": runtime_config.dataset_samples,
+                "dataset_seed": runtime_config.dataset_seed,
+                "dataset_batch_size": runtime_config.dataset_batch_size,
+                "dataset_num_workers": runtime_config.dataset_num_workers,
+                "neighbors_k": runtime_config.neighbors_k,
+                "query_crop_size": runtime_config.query_crop_size,
+                "query_stride": runtime_config.query_stride,
+                "downsample_factor": runtime_config.query_downsample_factor,
+                "threshold": threshold,
+                "query_batch_size": runtime_config.query_batch_size,
+                "search_chunk_size": runtime_config.search_chunk_size,
+                "device": str(model_device),
+            },
+            "row_metrics": {
+                "total": len(rows),
+                "correct": row_correct,
+                "incorrect": row_incorrect,
+                "ties": row_ties,
+                "accuracy_percent": _format_pct(row_correct, len(rows)),
+                "decisive_accuracy_percent": _format_pct(row_correct, row_correct + row_incorrect),
+            },
+            "pair_majority_metrics": {
+                "total_pairs": len(per_pair_votes),
+                "correct": pair_majority_correct,
+                "incorrect": pair_majority_incorrect,
+                "human_majority_ties": pair_majority_ties,
+                "metric_prediction_ties": pair_prediction_ties,
+                "accuracy_percent": _format_pct(pair_majority_correct, len(per_pair_votes)),
+                "decisive_accuracy_percent": _format_pct(
+                    pair_majority_correct,
+                    pair_majority_correct + pair_majority_incorrect,
+                ),
+            },
+            "unique_images_scored": len(score_cache),
+        }
+
+        click.echo(json.dumps(summary, indent=2, sort_keys=True))
+        if json_output is not None:
+            json_output.parent.mkdir(parents=True, exist_ok=True)
+            json_output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
