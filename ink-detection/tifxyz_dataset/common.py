@@ -1,5 +1,6 @@
 import aiohttp
 import json
+import re
 import warnings
 from pathlib import Path
 
@@ -30,7 +31,8 @@ def flat_patch_cache_path(config):
         patch_size_key = str(int(patch_size))
     else:
         patch_size_key = "x".join(str(int(v)) for v in patch_size)
-    return Path(config.get("out_dir", ".")) / f"flat_ink_patches_ps-{patch_size_key}.json"
+    version_key = label_version_cache_token(config.get("label_version"))
+    return Path(config.get("out_dir", ".")) / f"flat_ink_patches_ps-{patch_size_key}_labels-{version_key}.json"
 
 
 def save_flat_patch_cache(path, patches):
@@ -43,6 +45,14 @@ def save_flat_patch_cache(path, patches):
                     "dataset_idx": int(patch.segment.dataset_idx),
                     "segment_relpath": str(patch.segment.segment_relpath),
                     "scale": patch.segment.scale,
+                    "inklabels_path": str(patch.segment.inklabels),
+                    "supervision_mask_path": str(patch.segment.supervision_mask),
+                    "validation_mask_path": (
+                        "" if getattr(patch.segment, "validation_mask", None) is None
+                        else str(patch.segment.validation_mask)
+                    ),
+                    "active_supervision_mask_path": str(patch.supervision_mask),
+                    "is_validation": bool(getattr(patch, "is_validation", False)),
                     "bbox": list(patch.bbox),
                 }
                 for patch in patches
@@ -75,6 +85,175 @@ def open_zarr(path, resolution, auth=None):
         )
         return zarr.open(store, path=str(resolution), mode="r")
     return zarr.open(path_str, path=str(resolution), mode="r")
+
+
+_LABEL_ASSET_NAME_RE = re.compile(
+    r"^(?P<prefix>.*)_(?P<label_kind>inklabels|supervision_mask|validation_mask)"
+    r"(?:_v(?P<version_num>\d+))?(?P<extension>\.(?:tif|tiff|zarr))$",
+    re.IGNORECASE,
+)
+
+
+def normalize_label_version(label_version):
+    if label_version in (None, ""):
+        return None
+    if isinstance(label_version, str):
+        value = label_version.strip().lower()
+        if value in {"", "auto", "latest"}:
+            return None
+        if value in {"base", "unversioned", "v1"}:
+            return 1
+        if value.startswith("v") and value[1:].isdigit():
+            version_num = int(value[1:])
+            if version_num < 1:
+                raise ValueError(f"label_version must be >= v1, got {label_version!r}")
+            return version_num
+        raise ValueError(
+            f"label_version must be one of None/'auto', 'base', or 'vN', got {label_version!r}"
+        )
+    if isinstance(label_version, (int, np.integer)):
+        version_num = int(label_version)
+        if version_num < 1:
+            raise ValueError(f"label_version must be >= 1, got {label_version!r}")
+        return version_num
+    raise ValueError(
+        f"label_version must be None, a string like 'v2', or an integer, got {type(label_version).__name__}"
+    )
+
+
+def label_version_cache_token(label_version):
+    version_num = normalize_label_version(label_version)
+    if version_num is None:
+        return "auto"
+    if version_num <= 1:
+        return "base"
+    return f"v{version_num}"
+
+
+def _split_path_dir_and_name(path):
+    path_str = str(path).rstrip("/")
+    last_sep = max(path_str.rfind("/"), path_str.rfind("\\"))
+    if last_sep < 0:
+        return "", path_str
+    return path_str[: last_sep + 1], path_str[last_sep + 1 :]
+
+
+def parse_label_asset_path(path):
+    dir_prefix, name = _split_path_dir_and_name(path)
+    match = _LABEL_ASSET_NAME_RE.match(name)
+    if match is None:
+        return None
+    version_num_raw = match.group("version_num")
+    version_num = 1 if version_num_raw is None else int(version_num_raw)
+    return {
+        "path": str(path),
+        "dir_prefix": dir_prefix,
+        "name": name,
+        "prefix": match.group("prefix"),
+        "label_kind": match.group("label_kind").lower(),
+        "version_num": version_num,
+        "extension": match.group("extension"),
+    }
+
+
+def build_matching_label_asset_path(path, *, label_kind):
+    parsed = parse_label_asset_path(path)
+    assert parsed is not None, f"Label path has unexpected format: {path}"
+    version_suffix = "" if int(parsed["version_num"]) <= 1 else f"_v{int(parsed['version_num'])}"
+    return (
+        f"{parsed['dir_prefix']}{parsed['prefix']}_{str(label_kind)}"
+        f"{version_suffix}{parsed['extension']}"
+    )
+
+
+def resolve_versioned_label_path(paths, *, label_kind, label_version=None, context="labels"):
+    requested_version = normalize_label_version(label_version)
+    candidates = {}
+    for path in paths:
+        parsed = parse_label_asset_path(path)
+        if parsed is None or parsed["label_kind"] != str(label_kind):
+            continue
+        candidates[int(parsed["version_num"])] = str(path)
+
+    assert candidates, f"{context} must contain at least one {label_kind} path."
+
+    if requested_version is not None:
+        resolved = candidates.get(int(requested_version))
+        requested_name = "base" if int(requested_version) <= 1 else f"v{int(requested_version)}"
+        assert resolved is not None, (
+            f"{context} does not contain {label_kind} version {requested_name}."
+        )
+        return resolved
+
+    return candidates[max(candidates)]
+
+
+def resolve_segment_inklabel_path(segment, *, label_version=None):
+    segment_uuid = str(segment.uuid)
+    ink_label_paths = [
+        str(label["path"])
+        for label in segment.list_labels()
+        if label.get("name") == "inklabels" and label.get("path") is not None
+    ]
+    return resolve_versioned_label_path(
+        ink_label_paths,
+        label_kind="inklabels",
+        label_version=label_version,
+        context=f"Segment {segment_uuid!r}",
+    )
+
+
+def resolve_local_label_pair_paths(segment_dir, segment_name, *, label_version=None, extension=".zarr"):
+    inklabels, supervision_mask, _ = resolve_local_label_paths(
+        segment_dir,
+        segment_name,
+        label_version=label_version,
+        extension=extension,
+    )
+    return inklabels, supervision_mask
+
+
+def resolve_local_label_paths(segment_dir, segment_name, *, label_version=None, extension=".zarr"):
+    segment_dir = Path(segment_dir)
+    normalized_extension = str(extension).lower()
+    requested_version = normalize_label_version(label_version)
+    candidates_by_version = {}
+
+    for path in segment_dir.iterdir():
+        parsed = parse_label_asset_path(path.name)
+        if parsed is None:
+            continue
+        if parsed["prefix"] != str(segment_name):
+            continue
+        if parsed["extension"].lower() != normalized_extension:
+            continue
+        version_entry = candidates_by_version.setdefault(int(parsed["version_num"]), {})
+        version_entry[parsed["label_kind"]] = path
+
+    available_versions = sorted(
+        version_num
+        for version_num, record in candidates_by_version.items()
+        if "inklabels" in record and "supervision_mask" in record
+    )
+    assert available_versions, (
+        f"{segment_dir} must contain matching inklabels and supervision_mask {normalized_extension} assets."
+    )
+
+    if requested_version is None:
+        chosen_version = available_versions[-1]
+    else:
+        chosen_version = int(requested_version)
+        requested_name = "base" if chosen_version <= 1 else f"v{chosen_version}"
+        assert chosen_version in available_versions, (
+            f"{segment_dir} does not contain matching {normalized_extension} labels for version {requested_name}."
+        )
+
+    selected = candidates_by_version[chosen_version]
+    return (
+        selected["inklabels"],
+        selected["supervision_mask"],
+        selected.get("validation_mask"),
+    )
 
 def to_uint8_image(image_2d):
     image_2d = np.nan_to_num(np.asarray(image_2d, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
@@ -273,7 +452,7 @@ def _reconcile_label_mask_shape(
     )
     return mask
 
-def load_segment_label_masks(segment, shape):
+def load_segment_label_masks(segment, shape, label_version=None):
     import cv2
 
     segment_uuid = str(segment.uuid)
@@ -296,19 +475,14 @@ def load_segment_label_masks(segment, shape):
         )
         return np.asarray(mask > 0, dtype=bool)
 
-    ink_label_path = next(
-        (
-            str(label["path"])
-            for label in segment.list_labels()
-            if label.get("name") == "inklabels" and label.get("path") is not None
-        ),
-        None,
+    ink_label_path = resolve_segment_inklabel_path(
+        segment,
+        label_version=label_version,
     )
-    assert ink_label_path is not None, f"Segment {segment_uuid!r} must contain inklabels."
-    assert "_inklabels" in ink_label_path, (
-        f"Segment {segment_uuid!r} inklabels path has unexpected name: {ink_label_path}"
+    supervision_path = build_matching_label_asset_path(
+        ink_label_path,
+        label_kind="supervision_mask",
     )
-    supervision_path = ink_label_path.replace("_inklabels", "_supervision_mask")
 
     ink_mask = read_mask(ink_label_path, "ink")
     supervision_mask = read_mask(supervision_path, "supervision")
@@ -321,7 +495,11 @@ def _get_labels_and_mask(dataset, segment):
         return cached
 
     shape = tuple(int(v) for v in segment.full_resolution_shape)
-    ink_mask, supervision_mask, _ = load_segment_label_masks(segment, shape)
+    ink_mask, supervision_mask, _ = load_segment_label_masks(
+        segment,
+        shape,
+        label_version=getattr(dataset, "label_version", None),
+    )
     out = (ink_mask, supervision_mask)
     dataset._segment_labels_and_mask_cache[segment_uuid] = out
     return out

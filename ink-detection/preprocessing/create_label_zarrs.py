@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import os
+import re
 import shutil
 from pathlib import Path
 from multiprocessing.process import BaseProcess
@@ -21,9 +22,17 @@ TARGET_SUFFIXES = (
     "_supervision_mask.tif",
     "_supervision_mask.tiff",
     "_supervision_mask.png",
+    "_validation_mask.tif",
+    "_validation_mask.tiff",
+    "_validation_mask.png",
     "_inklabels.tif",
     "_inklabels.tiff",
     "_inklabels.png",
+)
+TARGET_IMAGE_RE = re.compile(
+    r"^(?P<prefix>.*)_(?P<label_kind>supervision_mask|validation_mask|inklabels)"
+    r"(?:_v(?P<version_num>\d+))?(?P<extension>\.(?:tif|tiff|png))$",
+    re.IGNORECASE,
 )
 AXES = [
     {"name": "z", "type": "space"},
@@ -37,13 +46,13 @@ DEFAULT_LABEL_SLICE = 32
 DEFAULT_CHUNKS = (65, 128, 128)
 STREAM_BLOCK_SIZE = 1024
 SKIP_DIR_NAMES = {".git", "__pycache__"}
-LABEL_COMPRESSOR = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
+LABEL_COMPRESSOR = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Recursively convert supervision-mask and inklabel images into "
+            "Recursively convert supervision-mask, validation-mask, and inklabel images into "
             "six-level OME-Zarr pyramids."
         )
     )
@@ -72,8 +81,57 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def parse_target_image(path: Path) -> dict[str, object] | None:
+    if not path.is_file():
+        return None
+
+    match = TARGET_IMAGE_RE.match(path.name)
+    if match is None:
+        return None
+
+    version_num_raw = match.group("version_num")
+    return {
+        "prefix": match.group("prefix"),
+        "label_kind": match.group("label_kind").lower(),
+        "version_num": None if version_num_raw is None else int(version_num_raw),
+        "extension": match.group("extension"),
+    }
+
+
 def is_target_image(path: Path) -> bool:
-    return path.is_file() and path.name.lower().endswith(TARGET_SUFFIXES)
+    return parse_target_image(path) is not None
+
+
+def _build_matching_target_path(
+    path: Path,
+    *,
+    label_kind: str,
+    extension: str,
+) -> Path:
+    parsed = parse_target_image(path)
+    if parsed is None:
+        raise ValueError(f"Unsupported target image path: {path}")
+
+    version_num = parsed["version_num"]
+    version_suffix = "" if version_num is None else f"_v{int(version_num)}"
+    return path.with_name(
+        f"{parsed['prefix']}_{str(label_kind)}{version_suffix}{str(extension)}"
+    )
+
+
+def _output_paths_for_input(input_path: Path) -> tuple[Path, list[Path]]:
+    primary_output_path = input_path.with_suffix(".zarr")
+    parsed = parse_target_image(input_path)
+    validation_outputs: list[Path] = []
+    if parsed is not None and parsed["label_kind"] == "supervision_mask":
+        validation_outputs.append(
+            _build_matching_target_path(
+                input_path,
+                label_kind="validation_mask",
+                extension=".zarr",
+            )
+        )
+    return primary_output_path, validation_outputs
 
 
 def is_composite_image(path: Path) -> bool:
@@ -484,6 +542,16 @@ def _build_downsample_levels_from_zarr(
                 future.result()
 
 
+def _copy_zarr_tree(source_path: Path, output_path: Path, *, overwrite: bool) -> str:
+    if output_path.exists():
+        if not overwrite:
+            return "skipped"
+        shutil.rmtree(output_path)
+
+    shutil.copytree(source_path, output_path)
+    return "written"
+
+
 def _convert_tiled_tiff(
     input_path: Path,
     output_path: Path,
@@ -522,41 +590,60 @@ def convert_image(
     overwrite: bool = False,
     chunk_workers: int = 1,
 ) -> Dict[str, str]:
-    output_path = input_path.with_suffix(".zarr")
+    output_path, additional_output_paths = _output_paths_for_input(input_path)
+    all_output_paths = [output_path, *additional_output_paths]
 
-    if output_path.exists() and not overwrite:
+    if not overwrite and all(path.exists() for path in all_output_paths):
         return {
             "status": "skipped",
             "input": str(input_path),
             "output": str(output_path),
+            "additional_outputs": ",".join(str(path) for path in additional_output_paths),
         }
 
     downsample_mode: Literal["nearest", "mean"] = "mean" if is_composite_image(input_path) else "nearest"
     use_compression = True
     tiled_metadata = _get_tiled_tiff_metadata(input_path)
-    if tiled_metadata is not None:
-        _convert_tiled_tiff(
-            input_path,
-            output_path,
-            levels=levels,
-            overwrite=overwrite,
-            downsample_mode=downsample_mode,
-            chunk_workers=chunk_workers,
-            use_compression=use_compression,
-        )
-    else:
-        image = load_image(input_path)
-        pyramid = build_pyramid_with_mode(
-            image,
-            levels=levels,
-            downsample_mode=downsample_mode,
-        )
-        write_ome_zarr(pyramid, output_path, overwrite=overwrite, use_compression=use_compression)
+    wrote_primary = False
 
+    if overwrite or not output_path.exists():
+        if tiled_metadata is not None:
+            _convert_tiled_tiff(
+                input_path,
+                output_path,
+                levels=levels,
+                overwrite=overwrite,
+                downsample_mode=downsample_mode,
+                chunk_workers=chunk_workers,
+                use_compression=use_compression,
+            )
+        else:
+            image = load_image(input_path)
+            pyramid = build_pyramid_with_mode(
+                image,
+                levels=levels,
+                downsample_mode=downsample_mode,
+            )
+            write_ome_zarr(
+                pyramid,
+                output_path,
+                overwrite=overwrite,
+                use_compression=use_compression,
+            )
+        wrote_primary = True
+
+    additional_statuses: list[str] = []
+    for extra_output_path in additional_output_paths:
+        additional_statuses.append(
+            _copy_zarr_tree(output_path, extra_output_path, overwrite=overwrite)
+        )
+
+    wrote_additional = any(status == "written" for status in additional_statuses)
     return {
-        "status": "written",
+        "status": "written" if wrote_primary or wrote_additional else "skipped",
         "input": str(input_path),
         "output": str(output_path),
+        "additional_outputs": ",".join(str(path) for path in additional_output_paths),
         "downsample_mode": downsample_mode,
         "streamed_tiled_tiff": str(tiled_metadata is not None).lower(),
     }

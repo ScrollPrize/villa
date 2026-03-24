@@ -32,6 +32,7 @@ class TifxyzInkDataset(Dataset):
     ):
         self.apply_augmentation = apply_augmentation
         self.apply_perturbation = bool(apply_perturbation)
+        self.label_version = config.get("label_version")
         self.mode = str(config.get("mode", "default")).strip().lower()
         self.use_normal_pooled_3d = self.mode == "normal_pooled_3d"
         self.patch_size = config["patch_size"]                                          # 3d vol crop / model input patch size

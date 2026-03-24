@@ -14,6 +14,7 @@ from common import (
     flat_patch_cache_path,
     load_flat_patch_cache,
     open_zarr,
+    resolve_local_label_paths,
     save_flat_patch_cache,
 )
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
@@ -23,6 +24,8 @@ from vesuvius.image_proc.intensity.normalization import normalize_robust
 class Patch:
     segment: 'Segment'
     bbox: tuple  # (z0, y0, x0, z1, y1, x1)
+    is_validation: bool = False
+    supervision_mask_override: object = None
 
     @property
     def image_volume(self):
@@ -30,6 +33,8 @@ class Patch:
 
     @property
     def supervision_mask(self):
+        if self.supervision_mask_override is not None:
+            return self.supervision_mask_override
         return self.segment.supervision_mask
     
     @property
@@ -42,6 +47,7 @@ class Segment:
             config,
             image_volume=None,
             supervision_mask=None,
+            validation_mask=None,
             inklabels=None,
             scale=None,
             dataset_idx=None,
@@ -52,6 +58,7 @@ class Segment:
         self.scale = scale
         self.image_volume = image_volume
         self.supervision_mask = supervision_mask
+        self.validation_mask = validation_mask
         self.inklabels = inklabels
         self.dataset_idx = dataset_idx
         self.segment_relpath = segment_relpath
@@ -63,12 +70,18 @@ class Segment:
             int(self.dataset_idx),
             str(self.segment_relpath),
             self.scale,
+            str(self.inklabels),
+            str(self.supervision_mask),
+            "" if self.validation_mask is None else str(self.validation_mask),
         )
 
     def _find_patches(self):
         volume_auth = self.config.get('volume_auth_json')
         supervision_mask = open_zarr(self.supervision_mask, resolution=self.scale, auth=volume_auth)
         inklabels = open_zarr(self.inklabels, resolution=self.scale, auth=volume_auth)
+        validation_mask = None
+        if self.validation_mask is not None:
+            validation_mask = open_zarr(self.validation_mask, resolution=self.scale, auth=volume_auth)
         surface = supervision_mask.shape[0] // 2
         surface_slice = supervision_mask[surface]
         ys, xs = np.nonzero(surface_slice)
@@ -81,8 +94,31 @@ class Segment:
             axis=0
         )
 
-        labeled_patches = []
+        training_patches = []
+        validation_patches = []
         for y0, x0 in patch_corners_top_left:
+            z0 = surface - self.patch_size[0] // 2
+            patch_bbox_zyx = (
+                z0,
+                int(y0),
+                int(x0),
+                z0 + self.patch_size[0],
+                int(y0) + self.patch_size[1],
+                int(x0) + self.patch_size[2],
+            )
+            has_validation_supervision = False
+            if validation_mask is not None:
+                validation_patch = validation_mask[surface, y0:y0+self.patch_size[1], x0:x0+self.patch_size[2]]
+                has_validation_supervision = bool(validation_patch.size > 0 and np.any(validation_patch))
+            if has_validation_supervision:
+                validation_patches.append(Patch(
+                    segment=self,
+                    bbox=patch_bbox_zyx,
+                    is_validation=True,
+                    supervision_mask_override=self.validation_mask,
+                ))
+                continue
+
             patch_bbox = inklabels[surface, y0:y0+self.patch_size[1], x0:x0+self.patch_size[2]]
             if patch_bbox.size == 0:
                 continue
@@ -93,17 +129,17 @@ class Segment:
             labeled_patch_coverage = labeled_area / patch_bbox.size
 
             if labeled_patch_coverage >= self.config['patch_min_labeled_coverage']:
-                z0 = surface - self.patch_size[0] // 2
-                labeled_patches.append(Patch(
+                training_patches.append(Patch(
                     segment=self,
-                    bbox=(z0, int(y0), int(x0),
-                          z0 + self.patch_size[0], int(y0) + self.patch_size[1], int(x0) + self.patch_size[2]),
+                    bbox=patch_bbox_zyx,
                 ))
 
-        if len(labeled_patches) == 0:
+        if len(training_patches) == 0 and len(validation_patches) == 0:
             raise ValueError(f"{self.inklabels} produced no valid patches")
 
-        self.patches = labeled_patches
+        self.training_patches = training_patches
+        self.validation_patches = validation_patches
+        self.patches = training_patches + validation_patches
     
 
 class FlatInkDataset(Dataset):
@@ -116,6 +152,8 @@ class FlatInkDataset(Dataset):
         self.vol_auth         = config.get('volume_auth_json')
         self.num_workers      = config.get('dataloader_workers', 8)
         self.do_augmentations = do_augmentations
+        self.training_patches = []
+        self.validation_patches = []
 
         self.augmentations = create_training_transforms(self.patch_size) if self.do_augmentations else None
 
@@ -129,32 +167,51 @@ class FlatInkDataset(Dataset):
 
             if cache_path.exists():
                 cached_records = load_flat_patch_cache(cache_path)
-                self.patches = [
-                    Patch(
-                        segment=segments_by_key[
-                            (
-                                int(record['dataset_idx']),
-                                str(record['segment_relpath']),
-                                record['scale'],
-                            )
-                        ],
-                        bbox=tuple(record['bbox']),
+                cached_patches = []
+                cache_valid = True
+                for record in cached_records:
+                    cache_key = (
+                        int(record['dataset_idx']),
+                        str(record['segment_relpath']),
+                        record['scale'],
+                        str(record.get('inklabels_path', '')),
+                        str(record.get('supervision_mask_path', '')),
+                        str(record.get('validation_mask_path', '')),
                     )
-                    for record in cached_records
-                ]
-                return
+                    segment = segments_by_key.get(cache_key)
+                    if segment is None:
+                        cache_valid = False
+                        break
+                    patch = Patch(
+                        segment=segment,
+                        bbox=tuple(record['bbox']),
+                        is_validation=bool(record.get('is_validation', False)),
+                        supervision_mask_override=record.get('active_supervision_mask_path') or None,
+                    )
+                    cached_patches.append(patch)
+                    if patch.is_validation:
+                        self.validation_patches.append(patch)
+                    else:
+                        self.training_patches.append(patch)
+                if cache_valid:
+                    self.patches = cached_patches
+                    return
 
             def _process_segment(seg):
                 seg._find_patches()
-                return seg.patches
+                return seg.training_patches, seg.validation_patches
 
             self.patches = []
             with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
-                for patches in tqdm(pool.map(_process_segment, segments), total=len(segments), desc='Finding patches'):
-                    self.patches.extend(patches)
+                for training_patches, validation_patches in tqdm(pool.map(_process_segment, segments), total=len(segments), desc='Finding patches'):
+                    self.training_patches.extend(training_patches)
+                    self.validation_patches.extend(validation_patches)
+            self.patches = self.training_patches + self.validation_patches
             save_flat_patch_cache(cache_path, self.patches)
         else:
-            self.patches = patches
+            self.patches = list(patches)
+            self.training_patches = [patch for patch in self.patches if not getattr(patch, 'is_validation', False)]
+            self.validation_patches = [patch for patch in self.patches if getattr(patch, 'is_validation', False)]
 
     def _gather_segments(self):
         for dataset_idx, ds in enumerate(self.datasets):
@@ -164,13 +221,18 @@ class FlatInkDataset(Dataset):
             for tifxyz_folder in sorted(seg_path.iterdir()):
                 if tifxyz_folder.is_dir() and any(tifxyz_folder.rglob('x.tif')) and tifxyz_folder.name != 'unused':
                     image_volume     = Path(str(tifxyz_folder) + "/" + tifxyz_folder.name + '.zarr')
-                    supervision_mask = Path(str(tifxyz_folder) + "/" + tifxyz_folder.name + '_supervision_mask.zarr')
-                    inklabels        = Path(str(tifxyz_folder) + "/" + tifxyz_folder.name + '_inklabels.zarr')
+                    inklabels, supervision_mask, validation_mask = resolve_local_label_paths(
+                        tifxyz_folder,
+                        tifxyz_folder.name,
+                        label_version=self.config.get('label_version'),
+                        extension='.zarr',
+                    )
 
                     if self.debug:
                         print(image_volume)
                         print(supervision_mask)
                         print(inklabels)
+                        print(validation_mask)
 
                     if not (image_volume.exists() and supervision_mask.exists() and inklabels.exists()):
                         raise ValueError(f"{tifxyz_folder.name} is missing required data. make sure the image volume, supervision mask, and labels exist")
@@ -179,6 +241,7 @@ class FlatInkDataset(Dataset):
                         config           = self.config,
                         image_volume     = image_volume,
                         supervision_mask = supervision_mask,
+                        validation_mask  = validation_mask,
                         inklabels        = inklabels,
                         scale            = ds['volume_scale'],
                         dataset_idx      = dataset_idx,

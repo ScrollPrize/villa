@@ -9,7 +9,12 @@ import numpy as np
 from tqdm.auto import tqdm
 
 import vesuvius.tifxyz as tifxyz
-from common import load_segment_label_masks, open_zarr
+from common import (
+    label_version_cache_token,
+    load_segment_label_masks,
+    open_zarr,
+    resolve_segment_inklabel_path,
+)
 from vesuvius.neural_tracing.datasets.common import (
     _parse_z_range,
     _segment_overlaps_z_range,
@@ -933,6 +938,7 @@ def _prepare_segment_records(
             ink_mask, supervision_mask, ink_label_path = load_segment_label_masks(
                 original_seg,
                 tuple(int(v) for v in original_seg.full_resolution_shape),
+                label_version=label_version,
             )
             row_idx = np.rint(
                 np.arange(grid_shape[0], dtype=np.float32) / label_scale_y
@@ -1028,6 +1034,7 @@ def _build_cached_segment_records(
     volume,
     volume_scale,
     cache_entry,
+    label_version,
 ):
     required_segment_uuids = _cached_segment_uuids(cache_entry)
     if not required_segment_uuids:
@@ -1044,18 +1051,27 @@ def _build_cached_segment_records(
         if segment_uuid not in required_segment_uuids:
             continue
 
+        lazy_segment = _LazyRetargetedTifxyzSegment(
+            path=segment_info.path,
+            uuid=segment_uuid,
+            scale_yx=segment_info.scale,
+            bbox=segment_info.bbox,
+            retarget_factor=retarget_factor,
+            volume=volume,
+        )
+        try:
+            ink_label_path = resolve_segment_inklabel_path(
+                lazy_segment,
+                label_version=label_version,
+            )
+        except AssertionError:
+            ink_label_path = None
+
         segment_by_uuid[segment_uuid] = {
             "segment_idx": int(segment_idx),
             "segment_uuid": segment_uuid,
-            "segment": _LazyRetargetedTifxyzSegment(
-                path=segment_info.path,
-                uuid=segment_uuid,
-                scale_yx=segment_info.scale,
-                bbox=segment_info.bbox,
-                retarget_factor=retarget_factor,
-                volume=volume,
-            ),
-            "ink_label_path": None,
+            "segment": lazy_segment,
+            "ink_label_path": ink_label_path,
         }
     return segment_by_uuid
 
@@ -1100,12 +1116,22 @@ def _load_cached_patches(
             runtime_segment = segment_by_uuid.get(segment_uuid)
             if runtime_segment is None:
                 continue
+            cached_ink_label_path = cached_segment.get("ink_label_path")
+            runtime_ink_label_path = runtime_segment.get("ink_label_path")
+            if (
+                cached_ink_label_path is not None
+                and runtime_ink_label_path is not None
+                and str(cached_ink_label_path) != str(runtime_ink_label_path)
+            ):
+                continue
+            resolved_ink_label_path = runtime_ink_label_path or cached_ink_label_path
+            if resolved_ink_label_path is None:
+                continue
             patch_segment = {
                 "segment_idx": int(runtime_segment["segment_idx"]),
                 "segment_uuid": segment_uuid,
                 "segment": runtime_segment["segment"],
-                "ink_label_path": cached_segment.get("ink_label_path")
-                or runtime_segment.get("ink_label_path"),
+                "ink_label_path": resolved_ink_label_path,
                 "stored_rowcol_bounds": tuple(
                     int(v) for v in cached_segment["stored_rowcol_bounds"]
                 ),
@@ -1145,6 +1171,7 @@ def find_patches(
     patch_cache_filename,
 ):
     stored_grid_pad = int(config.get("stored_grid_pad", DEFAULT_STORED_GRID_PAD))
+    label_version = config.get("label_version")
     min_positive_point_count = _resolve_min_positive_point_count(config)
     patches = []
     patch_generation_stats = {
@@ -1186,6 +1213,7 @@ def find_patches(
             "patch_size_zyx": [int(v) for v in patch_size_zyx],
             "overlap_fraction": float(overlap_fraction),
             "stored_grid_pad": int(stored_grid_pad),
+            "label_version": label_version_cache_token(label_version),
         }
         cache_key = hashlib.sha256(
             json.dumps(cache_keys, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1205,6 +1233,7 @@ def find_patches(
                     volume=volume,
                     volume_scale=volume_scale,
                     cache_entry=cache_entry,
+                    label_version=label_version,
                 )
                 cache_patches = _load_cached_patches(
                     cache_entry,

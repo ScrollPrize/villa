@@ -313,20 +313,25 @@ def train(config_path):
         )
         input_key = 'vol'
         config['in_channels'] = int(getattr(shared_ds, 'input_channels', 1))
+        val_ds = shared_ds
+
+        num_patches = len(train_ds)
+        num_val     = int(max(1, num_patches * config.get('val_fraction', 0.1)))
+        num_train   = num_patches - num_val
+
+        indices = torch.randperm(num_patches, generator=torch.Generator().manual_seed(config['seed'])).tolist()
+        train_indices = indices[:num_train]
+        val_indices = indices[num_train:]
+        train_subset = Subset(train_ds, train_indices)
+        val_subset = Subset(val_ds, val_indices)
     else:
         shared_ds = FlatInkDataset(dataset_config, do_augmentations=False)
-        train_ds = FlatInkDataset(dataset_config, do_augmentations=True, patches=shared_ds.patches)
-    val_ds = shared_ds
-
-    num_patches = len(train_ds)
-    num_val     = int(max(1, num_patches * config.get('val_fraction', 0.1)))
-    num_train   = num_patches - num_val
-    
-    indices = torch.randperm(num_patches, generator=torch.Generator().manual_seed(config['seed'])).tolist()
-    train_indices = indices[:num_train]
-    val_indices = indices[num_train:]
-    train_subset = Subset(train_ds, train_indices)
-    val_subset = Subset(val_ds, val_indices)
+        if len(shared_ds.training_patches) == 0:
+            raise ValueError("FlatInkDataset produced no training patches after excluding validation_mask chunks")
+        train_ds = FlatInkDataset(dataset_config, do_augmentations=True, patches=shared_ds.training_patches)
+        val_ds = FlatInkDataset(dataset_config, do_augmentations=False, patches=shared_ds.validation_patches)
+        train_subset = train_ds
+        val_subset = val_ds
 
     dataloader_workers = int(config.get('dataloader_workers', 0))
     dataloader_kwargs = {}
@@ -349,7 +354,7 @@ def train(config_path):
     val_dl = DataLoader(
         val_subset,
         batch_size=config['batch_size'],
-        shuffle=True,
+        shuffle=len(val_subset) > 0,
         generator=torch.Generator().manual_seed(config['seed'] + 1),
         num_workers=dataloader_workers,
         **dataloader_kwargs,
@@ -658,8 +663,14 @@ def train(config_path):
             val_preview_inputs = []
             val_preview_labels = []
             val_preview_probabilities = []
-            val_iterator = iter(val_dl)
             num_val_batches = min(len(val_dl), config.get('val_steps', 10))
+            if num_val_batches == 0:
+                if accelerator.is_main_process:
+                    latest_val_loss = None
+                    latest_ema_val_loss = None
+                    refresh_progress_bar(train_loss)
+                continue
+            val_iterator = iter(val_dl)
             preview_batch_indices = set(
                 random.sample(range(num_val_batches), k=min(val_preview_batches, num_val_batches))
             )
