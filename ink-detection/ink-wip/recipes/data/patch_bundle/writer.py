@@ -10,8 +10,14 @@ from typing import Any
 import yaml
 import zarr
 
-from ink.recipes.data.grouped_zarr_data import GroupedZarrPatchDataRecipe
-from ink.recipes.data.zarr_data import ZarrPatchDataRecipe, _load_raw_patch_sample
+from ink.recipes.data.grouped_zarr_data import GroupedZarrPatchDataRecipe, group_samples_by_split
+from ink.recipes.data.zarr_data import (
+    ZarrDataContext,
+    ZarrPatchDataRecipe,
+    build_zarr_split_samples,
+    count_group_idxs,
+    load_raw_zarr_patch,
+)
 
 _PROGRESS_LOG = logging.getLogger("ink.progress")
 _PATCH_BUNDLE_SCHEMA_VERSION = 1
@@ -35,6 +41,30 @@ def _bundle_exists(bundle_root: str | Path) -> bool:
         if not _bundle_manifest_path(root, split=split).exists():
             return False
         if not _bundle_patches_root(root, split=split).exists():
+            return False
+    return True
+
+
+def _bundle_matches_source(
+    *,
+    bundle_root: str | Path,
+    recipe: ZarrPatchDataRecipe | GroupedZarrPatchDataRecipe,
+) -> bool:
+    if not _bundle_exists(bundle_root):
+        return False
+    context = ZarrDataContext.from_recipe(recipe)
+    split_segment_ids = recipe.split_segment_ids()
+    expected_family = "grouped_patch" if isinstance(recipe, GroupedZarrPatchDataRecipe) else "patch"
+    for split_name in ("train", "valid"):
+        manifest = load_patch_bundle_manifest(bundle_root, split=split_name)
+        if str(manifest.get("recipe_family")) != expected_family:
+            return False
+        expected_fingerprint = _source_fingerprint(
+            layout=context.layout,
+            recipe=recipe,
+            split_segment_ids=split_segment_ids[split_name],
+        )
+        if str(manifest.get("source_fingerprint")) != expected_fingerprint:
             return False
     return True
 
@@ -108,12 +138,14 @@ class PatchBundleWriter:
 
     def ensure(self, *, out_root: str | Path) -> dict[str, str]:
         out_root = Path(out_root).expanduser().resolve()
-        if _bundle_exists(out_root):
+        if _bundle_matches_source(bundle_root=out_root, recipe=self.source):
             _log(f"[bundle] reuse out={out_root}")
             return {
                 "train": str(out_root / "train"),
                 "valid": str(out_root / "valid"),
             }
+        if _bundle_exists(out_root):
+            _log(f"[bundle] rebuild stale out={out_root}")
         return self.write(out_root=out_root)
 
     def write(self, *, out_root: str | Path) -> dict[str, str]:
@@ -121,33 +153,37 @@ class PatchBundleWriter:
         if not isinstance(recipe, (ZarrPatchDataRecipe, GroupedZarrPatchDataRecipe)):
             raise TypeError("PatchBundleWriter source must be ZarrPatchDataRecipe or GroupedZarrPatchDataRecipe")
 
-        layout = recipe._build_layout()
-        segments = recipe.segments
         patch_size = int(recipe.patch_size)
-        in_channels = int(recipe.in_channels)
         tile_size = patch_size if recipe.tile_size is None else int(recipe.tile_size)
         stride = patch_size if recipe.stride is None else int(recipe.stride)
-        volume_cache = {}
-        mask_cache = {}
-        samples_by_split = recipe._build_samples_by_split(
-            layout=layout,
-            segments=segments,
-            in_channels=in_channels,
-            patch_size=patch_size,
-            tile_size=tile_size,
-            stride=stride,
-            volume_cache=volume_cache,
-            mask_cache=mask_cache,
-        )
-        split_segment_ids = recipe._split_segment_ids()
+        context = ZarrDataContext.from_recipe(recipe)
+        split_segment_ids = recipe.split_segment_ids()
+        base_samples_by_split = {
+            split: build_zarr_split_samples(
+                context,
+                segment_ids=segment_ids,
+                patch_size=patch_size,
+                tile_size=tile_size,
+                stride=stride,
+                split_name=split,
+                build_workers=max(0, int(recipe.num_workers)),
+            )
+            for split, segment_ids in split_segment_ids.items()
+        }
+        if isinstance(recipe, GroupedZarrPatchDataRecipe):
+            samples_by_split = group_samples_by_split(
+                layout=context.layout,
+                split_segment_ids=split_segment_ids,
+                base_samples_by_split=base_samples_by_split,
+            )
+        else:
+            samples_by_split = base_samples_by_split
         out_root = Path(out_root).expanduser().resolve()
         out_root.mkdir(parents=True, exist_ok=True)
         recipe_family = "grouped_patch" if isinstance(recipe, GroupedZarrPatchDataRecipe) else "patch"
-        train_group_counts = (
-            recipe._build_group_counts(samples_by_split=samples_by_split)
-            if isinstance(recipe, GroupedZarrPatchDataRecipe)
-            else None
-        )
+        train_group_counts = None
+        if isinstance(recipe, GroupedZarrPatchDataRecipe):
+            train_group_counts = count_group_idxs(sample[3] for sample in samples_by_split["train"])
 
         written = {}
         for split_name, samples in samples_by_split.items():
@@ -158,7 +194,12 @@ class PatchBundleWriter:
             _log(f"[bundle] writing split={split_name} samples={len(samples)} out={split_dir}")
 
             store = zarr.open_group(str(patches_root), mode="w")
-            x_arr = _create_array(store, "x", shape=(len(samples), patch_size, patch_size, in_channels), dtype="u1")
+            x_arr = _create_array(
+                store,
+                "x",
+                shape=(len(samples), patch_size, patch_size, int(context.in_channels)),
+                dtype="u1",
+            )
             y_arr = _create_array(store, "y", shape=(len(samples), patch_size, patch_size, 1), dtype="u1")
             valid_arr = _create_array(store, "valid_mask", shape=(len(samples), patch_size, patch_size, 1), dtype="u1")
             xyxy_arr = _create_array(store, "xyxy", shape=(len(samples), 4), dtype="i8")
@@ -170,15 +211,10 @@ class PatchBundleWriter:
             ordered_segment_ids = tuple(str(segment_id) for segment_id in split_segment_ids[split_name])
             segment_index_by_id = {segment_id: idx for idx, segment_id in enumerate(ordered_segment_ids)}
             for idx, sample in enumerate(samples):
-                image, label, valid_mask, xyxy, segment_id = _load_raw_patch_sample(
-                    layout=layout,
-                    segments=segments,
+                image, label, valid_mask, xyxy, segment_id = load_raw_zarr_patch(
+                    context,
                     sample=sample,
-                    in_channels=in_channels,
-                    label_suffix=recipe.label_suffix,
-                    mask_suffix=recipe.mask_suffix,
-                    volume_cache=volume_cache,
-                    mask_cache=mask_cache,
+                    include_valid_mask=True,
                 )
                 x_arr[idx] = image
                 y_arr[idx] = label
@@ -186,14 +222,14 @@ class PatchBundleWriter:
                 xyxy_arr[idx] = xyxy
                 segment_index_arr[idx] = int(segment_index_by_id[segment_id])
                 if group_idx_arr is not None:
-                    group_idx_arr[idx] = int(sample[4])
+                    group_idx_arr[idx] = int(sample[3])
 
             manifest = {
                 "schema_version": int(_PATCH_BUNDLE_SCHEMA_VERSION),
                 "recipe_family": recipe_family,
                 "split": str(split_name),
                 "source_fingerprint": _source_fingerprint(
-                    layout=layout,
+                    layout=context.layout,
                     recipe=recipe,
                     split_segment_ids=split_segment_ids[split_name],
                 ),
@@ -204,7 +240,7 @@ class PatchBundleWriter:
                     "segments": int(len(ordered_segment_ids)),
                 },
                 "extraction": {
-                    "in_channels": in_channels,
+                    "in_channels": int(context.in_channels),
                     "patch_size": patch_size,
                     "tile_size": tile_size,
                     "stride": stride,

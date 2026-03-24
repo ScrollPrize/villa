@@ -51,11 +51,10 @@ class StitchEval:
         stitch_runtime = inference.stitch_runtime
         if not isinstance(stitch_runtime, StitchRuntime):
             raise ValueError("StitchEval requires bound StitchInference with stitch_runtime")
-        layout_info = stitch_runtime.segment_layout()
+        layout_info = stitch_runtime.eval_segment_layout()
         component_catalog = StitchComponentCatalog.build(
             raw_components=self.components,
             segment_ids=layout_info.segment_shapes.keys(),
-            downsample=layout_info.downsample,
             connectivity=int(self.component_connectivity),
         )
         dataset = getattr(getattr(data, "eval_loader", None), "dataset", None)
@@ -78,10 +77,15 @@ class StitchEval:
             raise ValueError("StitchEval requires already-bound StitchInference from ValidationEvaluator.build(...)")
         region_reader = StitchEvalRegionReader(
             layout=layout,
-            downsample=int(bound_inference.downsample),
+            label_suffix=str(getattr(dataset, "label_suffix", "")),
+            mask_suffix=str(getattr(dataset, "mask_suffix", "")),
+            cache_root=self.prepared_cache_root,
             segment_shapes=dict(bound_inference.segment_shapes),
+            _bbox_label_cache={},
+            _bbox_supervision_cache={},
             _bbox_mask_cache={},
             _source_fingerprint_cache={},
+            _detected_component_cache={},
         )
         prepared_store = StitchEvalArtifactStore(cache_root=self.prepared_cache_root)
 
@@ -101,6 +105,7 @@ class StitchEval:
         items = component_catalog.iter_items(
             store=inference.store,
             read_bbox_label_and_supervision=region_reader.read_label_and_supervision,
+            detected_segment_components=region_reader.detected_segment_components,
         )
         for item in items:
             stitch_batch = self._metric_batch_for_item(

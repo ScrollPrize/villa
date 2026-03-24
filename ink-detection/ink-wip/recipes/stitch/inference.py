@@ -10,7 +10,6 @@ from ink.recipes.stitch.store import ZarrStitchStore
 @dataclass(kw_only=True)
 class StitchInference:
     store: ZarrStitchStore
-    downsample: int
     segment_shapes: dict[str, tuple[int, int]] = field(repr=False)
     stitch_runtime: StitchRuntime = field(repr=False)
 
@@ -45,7 +44,7 @@ class StitchInferenceRecipe:
             raise TypeError("StitchInferenceRecipe stitch_runtime must build to StitchRuntime")
         if not stitch_runtime.data.eval.segments:
             raise ValueError("stitched evaluation requires stitch.eval.segments when StitchInferenceRecipe is configured")
-        layout = stitch_runtime.segment_layout()
+        layout = stitch_runtime.eval_segment_layout()
         bound_store = self.store.build(
             segment_shapes=layout.segment_shapes,
             downsample=layout.downsample,
@@ -53,7 +52,6 @@ class StitchInferenceRecipe:
         )
         return StitchInference(
             store=bound_store,
-            downsample=layout.downsample,
             segment_shapes=layout.segment_shapes,
             stitch_runtime=stitch_runtime,
         )

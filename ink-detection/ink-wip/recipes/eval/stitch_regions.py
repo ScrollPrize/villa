@@ -1,32 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
+import os
+import uuid
 
 import numpy as np
 import torch
 
 from ink.core.types import ModelOutputBatch
-from ink.recipes.data.zarr_io import read_label_and_supervision_mask_region
-from ink.recipes.eval.stitch_components import ComponentEvalItem, DetectedComponentRegion
+from ink.recipes.data.zarr_io import (
+    read_label_and_supervision_mask_region,
+    read_label_region,
+    read_supervision_mask_region,
+)
+from ink.recipes.eval.stitch_components import (
+    ComponentEvalItem,
+    DetectedComponentRegion,
+    detect_component_regions,
+)
 from ink.recipes.eval.stitch_prepared import StitchEvalArtifactKey, StitchEvalArtifactStore
 from ink.recipes.metrics.stitching import StitchMetricBatch
-
-
-def fullres_bbox_from_ds_bbox(
-    bbox: tuple[int, int, int, int],
-    *,
-    downsample: int,
-    full_shape: tuple[int, int],
-) -> tuple[int, int, int, int]:
-    y0, y1, x0, x1 = [int(v) for v in bbox]
-    ds = max(1, int(downsample))
-    full_h, full_w = [int(v) for v in full_shape]
-    return (
-        max(0, min(y0 * ds, full_h)),
-        max(0, min(y1 * ds, full_h)),
-        max(0, min(x0 * ds, full_w)),
-        max(0, min(x1 * ds, full_w)),
-    )
+from ink.recipes.stitch.store import segment_store_key
 
 
 def expand_component_bbox(
@@ -44,28 +39,6 @@ def expand_component_bbox(
         max(0, x0 - pad_i),
         min(max_x, x1 + pad_i),
     )
-
-
-def downsample_binary_mask_any(
-    mask: np.ndarray,
-    *,
-    downsample: int,
-    out_shape: tuple[int, int],
-) -> np.ndarray:
-    out_h, out_w = [int(v) for v in out_shape]
-    ds = max(1, int(downsample))
-    mask_bool = np.asarray(mask) > 0
-    if ds == 1 and tuple(mask_bool.shape) == (out_h, out_w):
-        return mask_bool
-
-    target_h = out_h * ds
-    target_w = out_w * ds
-    mask_bool = mask_bool[: min(int(mask_bool.shape[0]), target_h), : min(int(mask_bool.shape[1]), target_w)]
-    pad_h = max(0, target_h - int(mask_bool.shape[0]))
-    pad_w = max(0, target_w - int(mask_bool.shape[1]))
-    if pad_h or pad_w:
-        mask_bool = np.pad(mask_bool, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=False)
-    return mask_bool.reshape(out_h, ds, out_w, ds).any(axis=(1, 3))
 
 
 def project_component_mask(
@@ -101,16 +74,69 @@ def project_component_mask(
     return out
 
 
+def _save_detected_components(path: Path, components: tuple[DetectedComponentRegion, ...]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bbox_rows = np.asarray([region.bbox for region in components], dtype=np.int32)
+    arrays = {"bbox_rows": bbox_rows}
+    for idx, region in enumerate(components):
+        arrays[f"mask_{idx:05d}"] = np.asarray(region.mask, dtype=np.uint8)
+    tmp_path = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
+    try:
+        with tmp_path.open("wb") as handle:
+            np.savez_compressed(handle, **arrays)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _load_detected_components(path: Path) -> tuple[DetectedComponentRegion, ...]:
+    with np.load(path, allow_pickle=False) as loaded:
+        bbox_rows = np.asarray(loaded["bbox_rows"], dtype=np.int32)
+        components: list[DetectedComponentRegion] = []
+        for idx, bbox_row in enumerate(bbox_rows):
+            components.append(
+                DetectedComponentRegion(
+                    bbox=tuple(int(value) for value in bbox_row.tolist()),
+                    mask=np.asarray(loaded[f"mask_{idx:05d}"], dtype=bool),
+                )
+            )
+    return tuple(components)
+
+
 @dataclass
 class StitchEvalRegionReader:
     layout: object
-    downsample: int = 1
+    label_suffix: str = ""
+    mask_suffix: str = ""
+    cache_root: str | Path | None = None
     segment_shapes: dict[str, tuple[int, int]] = field(default_factory=dict, repr=False)
-    _bbox_mask_cache: dict[tuple[str, tuple[int, int, int, int], int], tuple[np.ndarray, np.ndarray]] = field(
+    _bbox_label_cache: dict[tuple[str, tuple[int, int, int, int]], np.ndarray] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    _bbox_supervision_cache: dict[tuple[str, tuple[int, int, int, int]], np.ndarray] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    _bbox_mask_cache: dict[tuple[str, tuple[int, int, int, int]], tuple[np.ndarray, np.ndarray]] = field(
         default_factory=dict,
         repr=False,
     )
     _source_fingerprint_cache: dict[str, str] = field(default_factory=dict, repr=False)
+    _detected_component_cache: dict[tuple[str, int], tuple[DetectedComponentRegion, ...]] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        self.label_suffix = str(self.label_suffix)
+        self.mask_suffix = str(self.mask_suffix)
+        if self.cache_root is None:
+            return
+        root = Path(self.cache_root).expanduser().resolve() / "components"
+        root.mkdir(parents=True, exist_ok=True)
+        self.cache_root = root
 
     def _segment_portable_source_fingerprint(self, segment_id: str) -> str:
         segment_id = str(segment_id)
@@ -118,13 +144,107 @@ class StitchEvalRegionReader:
         if cached is not None:
             return cached
 
-        layout_fingerprint = getattr(self.layout, "label_mask_fingerprint", None)
+        layout_fingerprint = getattr(self.layout, "label_mask_metadata_fingerprint", None)
+        fingerprint_kwargs = {
+            "label_suffix": self.label_suffix,
+            "mask_suffix": self.mask_suffix,
+        }
+        if not callable(layout_fingerprint):
+            layout_fingerprint = getattr(self.layout, "label_mask_fingerprint", None)
         if not callable(layout_fingerprint):
             raise TypeError("StitchEvalRegionReader layout must provide label_mask_fingerprint(segment_id)")
-        fingerprint = str(layout_fingerprint(segment_id))
+        fingerprint = str(layout_fingerprint(segment_id, **fingerprint_kwargs))
 
         self._source_fingerprint_cache[segment_id] = fingerprint
         return fingerprint
+
+    def _cache_key(self, *, segment_id: str, bbox: tuple[int, int, int, int]) -> tuple[str, tuple[int, int, int, int]]:
+        return (str(segment_id), tuple(int(v) for v in bbox))
+
+    def _segment_full_shape(self, segment_id: str) -> tuple[int, int]:
+        full_shape = self.segment_shapes.get(str(segment_id))
+        if full_shape is None:
+            raise KeyError(f"missing stitched segment shape for {segment_id!r}")
+        return (int(full_shape[0]), int(full_shape[1]))
+
+    def _read_metric_label_and_supervision(
+        self,
+        *,
+        segment_id: str,
+        bbox: tuple[int, int, int, int],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        full_shape = self._segment_full_shape(segment_id)
+        raw_labels, raw_supervision = read_label_and_supervision_mask_region(
+            self.layout,
+            str(segment_id),
+            full_shape,
+            bbox,
+            label_suffix=self.label_suffix,
+            mask_suffix=self.mask_suffix,
+        )
+        return (
+            np.asarray(raw_labels, dtype=bool),
+            np.asarray(raw_supervision, dtype=bool),
+        )
+
+    def _component_cache_path(self, *, segment_id: str, connectivity: int) -> Path | None:
+        if self.cache_root is None:
+            return None
+        filename = f"components_{self._segment_portable_source_fingerprint(segment_id)}_c{int(connectivity)}.npz"
+        return Path(self.cache_root) / segment_store_key(segment_id) / filename
+
+    def detected_segment_components(
+        self,
+        *,
+        segment_id: str,
+        store,
+        connectivity: int,
+    ) -> tuple[DetectedComponentRegion, ...]:
+        segment_id = str(segment_id)
+        cache_key = (segment_id, int(connectivity))
+        cached = self._detected_component_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        cache_path = self._component_cache_path(segment_id=segment_id, connectivity=int(connectivity))
+        if cache_path is not None and cache_path.exists():
+            try:
+                detected = _load_detected_components(cache_path)
+                self._detected_component_cache[cache_key] = detected
+                return detected
+            except Exception:
+                pass
+
+        segment_ds_shape = store.segment_ds_shape(segment_id)
+        full_segment_bbox = (0, int(segment_ds_shape[0]), 0, int(segment_ds_shape[1]))
+        supervision = self.read_supervision(segment_id=segment_id, bbox=full_segment_bbox, cache=False)
+
+        components: list[DetectedComponentRegion] = []
+        supervision_rois = detect_component_regions(
+            supervision,
+            connectivity=int(connectivity),
+        )
+        for roi_region in supervision_rois:
+            y0, y1, x0, x1 = [int(v) for v in roi_region.bbox]
+            roi_labels = self.read_label(
+                segment_id=segment_id,
+                bbox=roi_region.bbox,
+                cache=False,
+            )
+            component_source = np.asarray(roi_labels, dtype=bool) & np.asarray(roi_region.mask, dtype=bool)
+            components.extend(
+                detect_component_regions(
+                    component_source,
+                    connectivity=int(connectivity),
+                    offset=(y0, x0),
+                )
+            )
+
+        detected = tuple(components)
+        if cache_path is not None:
+            _save_detected_components(cache_path, detected)
+        self._detected_component_cache[cache_key] = detected
+        return detected
 
     def read_label_and_supervision(
         self,
@@ -133,42 +253,83 @@ class StitchEvalRegionReader:
         bbox: tuple[int, int, int, int],
         cache: bool = True,
     ) -> tuple[np.ndarray, np.ndarray]:
-        cache_key = (str(segment_id), tuple(int(v) for v in bbox), int(self.downsample))
+        cache_key = self._cache_key(segment_id=str(segment_id), bbox=bbox)
         if cache:
             cached = self._bbox_mask_cache.get(cache_key)
             if cached is not None:
                 return cached
 
-        full_shape = self.segment_shapes.get(str(segment_id))
-        if full_shape is None:
-            raise KeyError(f"missing stitched segment shape for {segment_id!r}")
-
-        raw_bbox = fullres_bbox_from_ds_bbox(
-            bbox,
-            downsample=int(self.downsample),
-            full_shape=full_shape,
+        out = self._read_metric_label_and_supervision(
+            segment_id=segment_id,
+            bbox=bbox,
         )
-        raw_labels, raw_supervision = read_label_and_supervision_mask_region(
-            self.layout,
-            str(segment_id),
-            full_shape,
-            raw_bbox,
-        )
-        out_shape = (int(bbox[1] - bbox[0]), int(bbox[3] - bbox[2]))
-        labels = downsample_binary_mask_any(
-            raw_labels,
-            downsample=int(self.downsample),
-            out_shape=out_shape,
-        )
-        supervision = downsample_binary_mask_any(
-            raw_supervision,
-            downsample=int(self.downsample),
-            out_shape=out_shape,
-        )
-        out = (np.asarray(labels, dtype=bool), np.asarray(supervision, dtype=bool))
         if cache:
             self._bbox_mask_cache[cache_key] = out
+            self._bbox_label_cache[cache_key] = out[0]
+            self._bbox_supervision_cache[cache_key] = out[1]
         return out
+
+    def read_label(
+        self,
+        *,
+        segment_id: str,
+        bbox: tuple[int, int, int, int],
+        cache: bool = True,
+    ) -> np.ndarray:
+        cache_key = self._cache_key(segment_id=str(segment_id), bbox=bbox)
+        if cache:
+            cached = self._bbox_label_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            pair_cached = self._bbox_mask_cache.get(cache_key)
+            if pair_cached is not None:
+                return pair_cached[0]
+
+        full_shape = self._segment_full_shape(segment_id)
+        labels = np.asarray(
+            read_label_region(
+                self.layout,
+                str(segment_id),
+                full_shape,
+                bbox,
+                label_suffix=self.label_suffix,
+            ),
+            dtype=bool,
+        )
+        if cache:
+            self._bbox_label_cache[cache_key] = labels
+        return labels
+
+    def read_supervision(
+        self,
+        *,
+        segment_id: str,
+        bbox: tuple[int, int, int, int],
+        cache: bool = True,
+    ) -> np.ndarray:
+        cache_key = self._cache_key(segment_id=str(segment_id), bbox=bbox)
+        if cache:
+            cached = self._bbox_supervision_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            pair_cached = self._bbox_mask_cache.get(cache_key)
+            if pair_cached is not None:
+                return pair_cached[1]
+
+        full_shape = self._segment_full_shape(segment_id)
+        supervision = np.asarray(
+            read_supervision_mask_region(
+                self.layout,
+                str(segment_id),
+                full_shape,
+                bbox,
+                mask_suffix=self.mask_suffix,
+            ),
+            dtype=bool,
+        )
+        if cache:
+            self._bbox_supervision_cache[cache_key] = supervision
+        return supervision
 
     def read_component_arrays(
         self,
@@ -247,7 +408,6 @@ class StitchEvalRegionReader:
                 source_fingerprint=self._segment_portable_source_fingerprint(item.segment_id),
                 metric_bbox=metric_bbox,
                 component_bbox=bbox,
-                downsample=int(self.downsample),
                 connectivity=int(connectivity),
                 component_pad=int(component_pad),
             ),

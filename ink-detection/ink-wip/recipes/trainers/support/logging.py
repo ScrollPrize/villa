@@ -20,6 +20,7 @@ class WandbLogger:
     mode: str | None = None
     dir: str | None = None
     media_downsample: int = 1
+    log_train_every_n_steps: int = 10
     log_eval_by_group: bool = False
     log_eval_by_segment: bool = False
 
@@ -36,6 +37,12 @@ class WandbLogger:
         if media_downsample < 1:
             raise ValueError(f"wandb media_downsample must be >= 1, got {self.media_downsample!r}")
         object.__setattr__(self, "media_downsample", media_downsample)
+        log_train_every_n_steps = int(self.log_train_every_n_steps)
+        if log_train_every_n_steps < 1:
+            raise ValueError(
+                f"wandb log_train_every_n_steps must be >= 1, got {self.log_train_every_n_steps!r}"
+            )
+        object.__setattr__(self, "log_train_every_n_steps", log_train_every_n_steps)
         object.__setattr__(self, "log_eval_by_group", bool(self.log_eval_by_group))
         object.__setattr__(self, "log_eval_by_segment", bool(self.log_eval_by_segment))
 
@@ -83,6 +90,18 @@ def _prefixed_scalar_payload(values: Mapping[str, Any], *, prefix: str) -> dict[
     return {f"{str(prefix)}{str(key)}": float(value) for key, value in payload.items()}
 
 
+def _train_epoch_scalar_payload(values: Mapping[str, Any]) -> dict[str, float]:
+    payload = _wandb_scalar_payload(values)
+    train_epoch_payload: dict[str, float] = {}
+    for key, value in payload.items():
+        key = str(key)
+        if key.startswith("train/"):
+            train_epoch_payload[f"train_epoch/{key[len('train/') :]}"] = float(value)
+        else:
+            train_epoch_payload[f"train_epoch/{key}"] = float(value)
+    return train_epoch_payload
+
+
 def _eval_report_scalar_payload(
     report: EvalReport,
     *,
@@ -114,12 +133,45 @@ class WandbSession:
     run: Any
     image_factory: Any = None
     media_downsample: int = 1
+    log_train_every_n_steps: int = 10
     log_eval_by_group: bool = False
     log_eval_by_segment: bool = False
 
     def log_train_epoch(self, epoch: int, components: Mapping[str, Any]) -> None:
-        payload = {"trainer/epoch": int(epoch), **_wandb_scalar_payload(components)}
+        payload = {"trainer/epoch": int(epoch), **_train_epoch_scalar_payload(components)}
         self.run.log(payload, step=int(epoch))
+
+    def log_train_step(self, *, global_step: int, epoch: int, components: Mapping[str, Any]) -> None:
+        if (int(global_step) % int(self.log_train_every_n_steps)) != 0:
+            return
+        payload = {
+            "trainer/epoch": int(epoch),
+            "trainer/global_step": int(global_step),
+            **_wandb_scalar_payload(components),
+        }
+        self.run.log(payload, step=int(global_step))
+
+    def log_averaged_train_step(
+        self,
+        *,
+        global_step: int,
+        epoch: int,
+        component_sums: Mapping[str, Any],
+        component_batches: int,
+        lr: float,
+    ) -> None:
+        if int(component_batches) <= 0:
+            return
+        components = {
+            str(key): value / float(component_batches)
+            for key, value in dict(component_sums).items()
+        }
+        components["train/lr"] = float(lr)
+        self.log_train_step(
+            global_step=int(global_step),
+            epoch=int(epoch),
+            components=components,
+        )
 
     def log_eval_epoch(self, epoch: int, report: EvalReport) -> None:
         if not isinstance(report, EvalReport):
@@ -211,6 +263,7 @@ def init_wandb_session(experiment, *, run_fs=None) -> WandbSession | None:
         run=run,
         image_factory=getattr(wandb, "Image", None),
         media_downsample=int(config.media_downsample),
+        log_train_every_n_steps=int(config.log_train_every_n_steps),
         log_eval_by_group=bool(config.log_eval_by_group),
         log_eval_by_segment=bool(config.log_eval_by_segment),
     )

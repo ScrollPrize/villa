@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 import hashlib
 from pathlib import Path
 
-
 @dataclass(frozen=True)
 class SegmentPaths:
     segment_dir: Path
@@ -116,6 +115,28 @@ class NestedZarrLayout:
         )
         return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
 
+    def label_mask_metadata_fingerprint(
+        self,
+        segment_id: str,
+        *,
+        label_suffix: str = "",
+        mask_suffix: str = "",
+    ) -> str:
+        """Hash only zarr metadata files for label and supervision-mask sources."""
+        paths = self.resolve_paths(
+            segment_id,
+            label_suffix=label_suffix,
+            mask_suffix=mask_suffix,
+        )
+        payload = (
+            ("segment_id", str(segment_id)),
+            ("label_suffix", str(label_suffix)),
+            ("mask_suffix", str(mask_suffix)),
+            ("inklabels", _zarr_metadata_signature(paths.inklabels_path)),
+            ("supervision_mask", _zarr_metadata_signature(paths.supervision_mask_path)),
+        )
+        return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
+
     def segment_source_fingerprint(
         self,
         segment_id: str,
@@ -146,6 +167,23 @@ def _hash_file_contents(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+def _zarr_metadata_signature(path: Path) -> tuple[str, tuple[tuple[str, int, str], ...]]:
+    """Summarize the zarr metadata files we actually use, never chunk payloads."""
+    root = Path(path)
+    if not root.exists():
+        return (root.name, (("missing", -1, "missing"),))
+
+    entries = []
+    for child in (
+        root / ".zattrs",
+        root / ".zgroup",
+        root / "0" / ".zarray",
+        root / "0" / ".zattrs",
+    ):
+        if child.is_file():
+            entries.append((child.relative_to(root).as_posix(), int(child.stat().st_size), _hash_file_contents(child)))
+    return (root.name, tuple(entries))
 
 
 def _path_tree_signature(path: Path) -> tuple[str, int, int, str]:

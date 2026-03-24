@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 import zarr
 
 from ink.core.types import DataBundle
@@ -17,19 +17,12 @@ from ink.recipes.data.transforms import (
     apply_train_sample_transforms,
     build_joint_transform,
 )
-from ink.recipes.data.zarr_data import _batch_from_parts, _collate_batch
-
-
-def _collate_grouped_batch(samples):
-    images, labels, valid_masks, xyxys, segment_ids, group_idxs = zip(*samples)
-    return _batch_from_parts(
-        images=images,
-        labels=labels,
-        valid_masks=valid_masks,
-        xyxys=xyxys,
-        segment_ids=segment_ids,
-        group_idxs=group_idxs,
-    )
+from ink.recipes.data.zarr_data import (
+    build_patch_data_bundle,
+    collate_grouped_batch,
+    collate_patch_batch,
+    count_group_idxs,
+)
 
 
 def _manifest_value(manifest: dict[str, Any], *path: str) -> Any:
@@ -65,6 +58,7 @@ class PatchBundleDataset(Dataset):
         if not patches_root.exists():
             raise FileNotFoundError(f"Could not resolve patch bundle arrays at {str(patches_root)!r}")
         store = zarr.open_group(str(patches_root), mode="r")
+        self._store = store
         self._x = store["x"]
         self._y = store["y"]
         self._valid_mask = store["valid_mask"]
@@ -116,11 +110,9 @@ class PatchBundleDataset(Dataset):
 class GroupedPatchBundleDataset(PatchBundleDataset):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        patches_root = self.bundle_root / self.split / "patches.zarr"
-        store = zarr.open_group(str(patches_root), mode="r")
-        if "group_idx" not in store:
+        if "group_idx" not in self._store:
             raise ValueError("grouped patch bundle requires group_idx array")
-        self._group_idx = store["group_idx"]
+        self._group_idx = self._store["group_idx"]
 
     @property
     def sample_groups(self) -> list[int]:
@@ -169,16 +161,6 @@ class PatchBundleDataRecipe:
             )
         return train_in_channels, train_patch_size
 
-    def _dataset_class(self):
-        return PatchBundleDataset
-
-    def _collate_fn(self):
-        return _collate_batch
-
-    def _build_group_counts(self, *, train_dataset, train_manifest: dict[str, Any]) -> list[int] | None:
-        del train_dataset, train_manifest
-        return None
-
     def build(self, *, runtime=None, augment=None) -> DataBundle:
         assert augment is not None
         train_manifest, valid_manifest = self._load_manifests()
@@ -187,6 +169,8 @@ class PatchBundleDataRecipe:
         valid_batch_size = self.train_batch_size if self.valid_batch_size is None else self.valid_batch_size
         extras = dict(self.extras or {})
         normalization_stats = extras.pop("normalization_stats", None)
+        if normalization_stats is None:
+            normalization_stats = dict(train_manifest.get("normalization_stats") or {})
         normalization = self.normalization.build(normalization_stats=normalization_stats)
         augment_recipe = augment.build(patch_size=patch_size, runtime=runtime)
 
@@ -195,41 +179,23 @@ class PatchBundleDataRecipe:
             "augment": augment_recipe,
             "normalization": normalization,
         }
-        dataset_class = self._dataset_class()
-        collate_fn = self._collate_fn()
-        train_dataset = dataset_class(split="train", **dataset_kwargs)
-        val_dataset = dataset_class(split="valid", **dataset_kwargs)
+        train_dataset = PatchBundleDataset(split="train", **dataset_kwargs)
+        val_dataset = PatchBundleDataset(split="valid", **dataset_kwargs)
         num_workers = max(0, int(self.num_workers))
-        train_loader = self.sampler.build_loader(
-            train_dataset,
-            batch_size=int(self.train_batch_size),
+        return build_patch_data_bundle(
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            train_batch_size=int(self.train_batch_size),
+            valid_batch_size=int(valid_batch_size),
             num_workers=num_workers,
-            pin_memory=True,
-            collate_fn=collate_fn,
             shuffle=bool(self.shuffle),
-        )
-        eval_loader = DataLoader(
-            val_dataset,
-            batch_size=int(valid_batch_size),
-            shuffle=False,
-            num_workers=num_workers,
-            persistent_workers=bool(num_workers > 0),
-            pin_memory=True,
-            drop_last=False,
-            collate_fn=collate_fn,
-        )
-        group_counts = self._build_group_counts(train_dataset=train_dataset, train_manifest=train_manifest)
-        return DataBundle(
-            train_loader=train_loader,
-            eval_loader=eval_loader,
+            sampler=self.sampler,
+            collate_fn=collate_patch_batch,
             in_channels=int(in_channels),
-            augment=augment_recipe,
-            group_counts=group_counts,
+            augment_recipe=augment_recipe,
+            group_counts=None,
             extras=extras,
         )
-
-
-__all__ = ["PatchBundleDataRecipe"]
 
 
 @dataclass(frozen=True)
@@ -241,22 +207,48 @@ class GroupedPatchBundleDataRecipe(PatchBundleDataRecipe):
         if family != "grouped_patch":
             raise ValueError(f"GroupedPatchBundleDataRecipe requires recipe_family='grouped_patch', got {family!r}")
 
-    def _dataset_class(self):
-        return GroupedPatchBundleDataset
+    def build(self, *, runtime=None, augment=None) -> DataBundle:
+        assert augment is not None
+        train_manifest, valid_manifest = self._load_manifests()
+        in_channels, patch_size = self._validate_split_contract(train_manifest, valid_manifest)
 
-    def _collate_fn(self):
-        return _collate_grouped_batch
+        valid_batch_size = self.train_batch_size if self.valid_batch_size is None else self.valid_batch_size
+        extras = dict(self.extras or {})
+        normalization_stats = extras.pop("normalization_stats", None)
+        if normalization_stats is None:
+            normalization_stats = dict(train_manifest.get("normalization_stats") or {})
+        normalization = self.normalization.build(normalization_stats=normalization_stats)
+        augment_recipe = augment.build(patch_size=patch_size, runtime=runtime)
 
-    def _build_group_counts(self, *, train_dataset, train_manifest) -> list[int] | None:
-        group_counts = list(train_manifest.get("group_counts") or [])
-        if group_counts:
-            return [int(value) for value in group_counts]
-        counts = [0]
-        for group_idx in train_dataset.sample_groups:
-            while int(group_idx) >= len(counts):
-                counts.append(0)
-            counts[int(group_idx)] += 1
-        return counts if any(counts) else None
+        dataset_kwargs = {
+            "bundle_root": Path(self.bundle_root).expanduser().resolve(),
+            "augment": augment_recipe,
+            "normalization": normalization,
+        }
+        train_dataset = GroupedPatchBundleDataset(split="train", **dataset_kwargs)
+        val_dataset = GroupedPatchBundleDataset(split="valid", **dataset_kwargs)
+        manifest_group_counts = train_manifest.get("group_counts")
+        if manifest_group_counts is None:
+            group_counts = count_group_idxs(train_dataset.sample_groups)
+        else:
+            group_counts = [int(value) for value in manifest_group_counts]
+            if not group_counts:
+                group_counts = None
+
+        return build_patch_data_bundle(
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            train_batch_size=int(self.train_batch_size),
+            valid_batch_size=int(valid_batch_size),
+            num_workers=max(0, int(self.num_workers)),
+            shuffle=bool(self.shuffle),
+            sampler=self.sampler,
+            collate_fn=collate_grouped_batch,
+            in_channels=int(in_channels),
+            augment_recipe=augment_recipe,
+            group_counts=group_counts,
+            extras=extras,
+        )
 
 
 __all__ = [

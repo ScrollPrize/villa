@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import importlib
 import logging
+from pathlib import Path
 import sys
 
-from ink.core import run_experiment
+from ink.core import RunFS, build_run_dir, run_experiment
 
 
 def _configure_progress_logger():
@@ -15,12 +16,7 @@ def _configure_progress_logger():
         logger.addHandler(handler)
         logger.propagate = False
     logger.setLevel(logging.INFO)
-    return logger
-
-
-def _progress_log(message: str) -> None:
-    logger = _configure_progress_logger()
-    logger.info(str(message))
+    return logger.info
 
 
 def main(argv=None):
@@ -38,8 +34,9 @@ def main(argv=None):
     experiment = getattr(module, "EXPERIMENT", None)
     if experiment is None:
         raise SystemExit(f"experiment module {experiment_name!r} must define EXPERIMENT")
-    _configure_progress_logger()
-    return run_experiment(experiment, logger=_progress_log)
+    run_dir = build_run_dir(Path("runs"), experiment.name)
+    run_fs = RunFS(run_dir, experiment)
+    return run_experiment(experiment, logger=_configure_progress_logger(), run_fs=run_fs)
 
 
 if __name__ == "__main__":

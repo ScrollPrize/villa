@@ -1,6 +1,6 @@
 """Standalone stitching helpers."""
 
-from ink.recipes.stitch.data import (
+from ink.recipes.stitch.config import (
     EvalStitchConfig,
     LogOnlyStitchConfig,
     StitchComponentSpec,
