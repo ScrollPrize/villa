@@ -1,0 +1,258 @@
+diff --git a/ink/experiments/run.py b/ink/experiments/run.py
+index f65c32e..9929c0e 100644
+--- a/ink/experiments/run.py
++++ b/ink/experiments/run.py
+@@ -1,11 +1,14 @@
+ from __future__ import annotations
+ 
++from dataclasses import replace
+ import importlib
+ import logging
++import os
+ from pathlib import Path
+ import sys
+ 
+ from ink.core import RunFS, build_run_dir, run_experiment
++import torch
+ 
+ 
+ def _configure_progress_logger():
+@@ -19,6 +22,63 @@ def _configure_progress_logger():
+     return logger.info
+ 
+ 
++def _apply_batch_size_overrides(experiment):
++    batch_size = os.environ.get("INK_BATCH_SIZE")
++    train_batch_size = os.environ.get("INK_TRAIN_BATCH_SIZE")
++    valid_batch_size = os.environ.get("INK_VALID_BATCH_SIZE")
++
++    if batch_size is not None:
++        if train_batch_size is None:
++            train_batch_size = batch_size
++        if valid_batch_size is None:
++            valid_batch_size = batch_size
++
++    if train_batch_size is None and valid_batch_size is None:
++        return experiment
++
++    data = getattr(experiment, "data", None)
++    if data is None:
++        raise SystemExit("batch size overrides require experiment.data")
++
++    train_value = int(data.train_batch_size if train_batch_size is None else train_batch_size)
++    valid_default = data.train_batch_size if data.valid_batch_size is None else data.valid_batch_size
++    valid_value = int(valid_default if valid_batch_size is None else valid_batch_size)
++
++    return replace(
++        experiment,
++        data=replace(
++            data,
++            train_batch_size=train_value,
++            valid_batch_size=valid_value,
++        ),
++    )
++
++
++def _apply_trainer_overrides(experiment):
++    log_every_n_steps = os.environ.get("INK_LOG_EVERY_N_STEPS")
++    if log_every_n_steps is None:
++        return experiment
++
++    trainer = getattr(experiment, "trainer", None)
++    if trainer is None:
++        raise SystemExit("trainer overrides require experiment.trainer")
++
++    return replace(
++        experiment,
++        trainer=replace(
++            trainer,
++            log_every_n_steps=int(log_every_n_steps),
++        ),
++    )
++
++
++def _resolve_device() -> str:
++    explicit_device = os.environ.get("INK_DEVICE")
++    if explicit_device is not None and str(explicit_device).strip():
++        return str(explicit_device).strip()
++    return "cuda" if torch.cuda.is_available() else "cpu"
++
++
+ def main(argv=None):
+     args = list(sys.argv[1:] if argv is None else argv)
+     if len(args) != 1:
+@@ -34,9 +94,22 @@ def main(argv=None):
+     experiment = getattr(module, "EXPERIMENT", None)
+     if experiment is None:
+         raise SystemExit(f"experiment module {experiment_name!r} must define EXPERIMENT")
++    experiment = _apply_batch_size_overrides(experiment)
++    experiment = _apply_trainer_overrides(experiment)
++    device = _resolve_device()
++    logger = _configure_progress_logger()
++    logger(
++        "[run] "
++        f"experiment={experiment.name} "
++        f"train_batch_size={getattr(experiment.data, 'train_batch_size', 'unknown')} "
++        f"valid_batch_size={getattr(experiment.data, 'valid_batch_size', 'unknown')} "
++        f"log_every_n_steps={getattr(experiment.trainer, 'log_every_n_steps', 'unknown')} "
++        f"device={device}"
++    )
+     run_dir = build_run_dir(Path("runs"), experiment.name)
++    logger(f"[run] run_dir={run_dir}")
+     run_fs = RunFS(run_dir, experiment)
+-    return run_experiment(experiment, logger=_configure_progress_logger(), run_fs=run_fs)
++    return run_experiment(experiment, logger=logger, device=device, run_fs=run_fs)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/ink/recipes/trainers/patch.py b/ink/recipes/trainers/patch.py
+index a6a972f..65d7ddb 100644
+--- a/ink/recipes/trainers/patch.py
++++ b/ink/recipes/trainers/patch.py
+@@ -216,7 +216,10 @@ class PatchTraining:
+         total_batches = len(self.train_loader)
+         window_batches = 0
+         window_loss_sum: torch.Tensor | None = None
++        window_data_wait_s = 0.0
++        window_step_s = 0.0
+         window_started_at = time.perf_counter()
++        last_batch_finished_at = window_started_at
+         log_every_n_steps = None if self.log_every_n_steps is None else max(1, int(self.log_every_n_steps))
+         step_component_sums: dict[str, torch.Tensor] = {}
+         step_component_batches = 0
+@@ -248,7 +251,7 @@ class PatchTraining:
+             step_component_batches = 0
+ 
+         def maybe_log_progress(*, force: bool = False) -> None:
+-            nonlocal window_batches, window_loss_sum, window_started_at
++            nonlocal window_batches, window_loss_sum, window_data_wait_s, window_step_s, window_started_at
+             if not callable(self.log):
+                 return
+             if log_every_n_steps is None:
+@@ -267,17 +270,25 @@ class PatchTraining:
+                 f"[train] epoch={epoch + 1}/{end_epoch} "
+                 f"step={batch_count}/{total_batches} "
+                 f"loss={avg_loss:.4f} "
+-                f"it_s={window_batches / elapsed:.2f}"
++                f"it_s={window_batches / elapsed:.2f} "
++                f"data_s={window_data_wait_s / float(window_batches):.3f} "
++                f"step_s={window_step_s / float(window_batches):.3f}"
+             )
+             _log(self.log, message)
+             window_batches = 0
+             window_loss_sum = None
++            window_data_wait_s = 0.0
++            window_step_s = 0.0
+             window_started_at = time.perf_counter()
+ 
+         for batch in self.train_loader:
++            batch_ready_at = time.perf_counter()
++            window_data_wait_s += max(0.0, batch_ready_at - last_batch_finished_at)
++            step_started_at = time.perf_counter()
+             batch = move_batch_to_device(batch, device=device)
+             step_output = self.run_step(batch)
+             (step_output.loss / grad_accum).backward()
++            window_step_s += max(0.0, time.perf_counter() - step_started_at)
+ 
+             batch_count += 1
+             pending_batches += 1
+@@ -298,6 +309,7 @@ class PatchTraining:
+                 flush_optimizer_step()
+             if log_every_n_steps is not None and (batch_count % log_every_n_steps) == 0:
+                 maybe_log_progress()
++            last_batch_finished_at = time.perf_counter()
+ 
+         flush_optimizer_step()
+         maybe_log_progress(force=True)
+diff --git a/tests/test_erm_experiment_behavior.py b/tests/test_erm_experiment_behavior.py
+index dba81ff..7b869d3 100644
+--- a/tests/test_erm_experiment_behavior.py
++++ b/tests/test_erm_experiment_behavior.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ from dataclasses import replace
++import os
+ import tempfile
+ import unittest
+ from pathlib import Path
+@@ -182,6 +183,47 @@ class ERMExperimentAssemblyTests(unittest.TestCase):
+         build_run_dir_mock.assert_called_once_with(Path("runs"), ERM_PATCH_BUNDLE_EXPERIMENT.name)
+         run_fs_mock.assert_called_once_with(Path("runs/erm_patch_bundle_test"), ERM_PATCH_BUNDLE_EXPERIMENT)
+ 
++    def test_run_module_main_applies_env_overrides_for_batch_size_and_log_cadence(self):
++        run_fs = object()
++        with (
++            mock.patch.dict(
++                os.environ,
++                {
++                    "INK_BATCH_SIZE": "24",
++                    "INK_LOG_EVERY_N_STEPS": "1",
++                },
++                clear=False,
++            ),
++            mock.patch("ink.experiments.run.build_run_dir", return_value=Path("runs/erm_test")) as build_run_dir_mock,
++            mock.patch("ink.experiments.run.RunFS", return_value=run_fs) as run_fs_mock,
++            mock.patch("ink.experiments.run.run_experiment") as run_experiment_mock,
++        ):
++            experiment_run.main(["erm"])
++
++        args, kwargs = run_experiment_mock.call_args
++        experiment = args[0]
++        self.assertEqual(experiment.data.train_batch_size, 24)
++        self.assertEqual(experiment.data.valid_batch_size, 24)
++        self.assertEqual(experiment.trainer.log_every_n_steps, 1)
++        self.assertTrue(callable(kwargs["logger"]))
++        self.assertIs(kwargs["run_fs"], run_fs)
++        build_run_dir_mock.assert_called_once_with(Path("runs"), experiment.name)
++        run_fs_mock.assert_called_once_with(Path("runs/erm_test"), experiment)
++
++    def test_run_module_main_defaults_to_cuda_when_available(self):
++        run_fs = object()
++        with (
++            mock.patch("ink.experiments.run.torch.cuda.is_available", return_value=True),
++            mock.patch("ink.experiments.run.build_run_dir", return_value=Path("runs/erm_test")),
++            mock.patch("ink.experiments.run.RunFS", return_value=run_fs),
++            mock.patch("ink.experiments.run.run_experiment") as run_experiment_mock,
++        ):
++            experiment_run.main(["erm"])
++
++        _args, kwargs = run_experiment_mock.call_args
++        self.assertEqual(kwargs["device"], "cuda")
++        self.assertIs(kwargs["run_fs"], run_fs)
++
+     def test_run_module_main_rejects_unknown_experiment_name(self):
+         with self.assertRaisesRegex(SystemExit, "unknown experiment"):
+             experiment_run.main(["erm_stitch_only"])
+diff --git a/tests/test_model_recipe_behavior.py b/tests/test_model_recipe_behavior.py
+index b9ad34a..4dd4f6d 100644
+--- a/tests/test_model_recipe_behavior.py
++++ b/tests/test_model_recipe_behavior.py
+@@ -75,12 +75,12 @@ class ResNet3DRecipeContractTests(unittest.TestCase):
+         with self.assertRaisesRegex(FileNotFoundError, "Missing backbone pretrained weights"):
+             recipe.build(data=_bundle(), runtime=SimpleNamespace(steps_per_epoch=7))
+ 
+-    def test_default_pretrained_path_is_standalone_not_villa_layout(self):
++    def test_default_pretrained_path_is_repo_local_weights_path_not_villa_layout(self):
+         recipe = ResNet3D()
+ 
+         self.assertNotIn("villa", recipe.backbone_pretrained_path)
+-        self.assertIn("ink-detection", recipe.backbone_pretrained_path)
+         self.assertIn("weights", recipe.backbone_pretrained_path)
++        self.assertTrue(recipe.backbone_pretrained_path.endswith("r3d50_KM_200ep.pth"))
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_training_runtime_behavior.py b/tests/test_training_runtime_behavior.py
+index 935caaf..b753a64 100644
+--- a/tests/test_training_runtime_behavior.py
++++ b/tests/test_training_runtime_behavior.py
+@@ -900,6 +900,8 @@ class TrainingLoopOrchestrationTests(unittest.TestCase):
+ 
+         self.assertTrue(any("step=2/3" in message for message in messages))
+         self.assertTrue(any("it_s=" in message for message in messages))
++        self.assertTrue(any("data_s=" in message for message in messages))
++        self.assertTrue(any("step_s=" in message for message in messages))
+ 
+     def test_run_training_can_log_eval_group_and_segment_metrics_to_wandb(self):
+         runtime, model, _objective = self._make_runtime(grad_accum=1, epochs=1, eval_every=1)
