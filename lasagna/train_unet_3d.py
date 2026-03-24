@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -459,15 +460,47 @@ def build_model(
     patch_size: int,
     device: str,
     weights: Optional[str] = None,
+    norm_type: Optional[str] = None,
+    upsample_mode: Optional[str] = None,
+    batch_size: int = 2,
 ) -> nn.Module:
-    """Build 3D UNet via vesuvius NetworkFromConfig."""
+    """Build 3D UNet via vesuvius NetworkFromConfig.
+
+    Args:
+        norm_type: "instance", "group", or "none".
+            If None and weights is provided, auto-detects from checkpoint metadata.
+        upsample_mode: "transpconv", "trilinear", or "pixelshuffle".
+            If None and weights is provided, auto-detects from checkpoint metadata.
+    """
+    # Auto-detect from checkpoint if not specified
+    ckpt = None
+    if weights is not None:
+        ckpt = torch.load(weights, map_location=device, weights_only=False)
+        if isinstance(ckpt, dict):
+            if norm_type is None:
+                norm_type = ckpt.get("norm_type", "instance")
+            if upsample_mode is None:
+                upsample_mode = ckpt.get("upsample_mode", "transpconv")
+    if norm_type is None:
+        norm_type = "instance"
+    if upsample_mode is None:
+        upsample_mode = "transpconv"
+
     mgr = SimpleNamespace()
-    mgr.model_config = {"autoconfigure": True, "architecture_type": "unet"}
+    model_config = {"autoconfigure": True, "architecture_type": "unet"}
+    if norm_type == "group":
+        model_config["norm_op"] = "nn.GroupNorm"
+        model_config["norm_op_kwargs"] = {"num_groups": 32, "affine": True, "eps": 1e-5}
+    elif norm_type == "none":
+        model_config["norm_op"] = None
+    # else "instance" — keep defaults (InstanceNorm3d)
+    model_config["upsample_mode"] = upsample_mode
+    mgr.model_config = model_config
     # activation='none' so we apply sigmoid ourselves (consistently in
     # both train and eval: pool full-res logits to label-res, then sigmoid).
     mgr.targets = {"output": {"out_channels": 8, "activation": "none"}}
     mgr.train_patch_size = (patch_size, patch_size, patch_size)
-    mgr.train_batch_size = 2
+    mgr.train_batch_size = batch_size
     mgr.in_channels = 1
     mgr.autoconfigure = True
     mgr.spacing = [1, 1, 1]
@@ -475,8 +508,7 @@ def build_model(
 
     model = NetworkFromConfig(mgr).to(device)
 
-    if weights is not None:
-        ckpt = torch.load(weights, map_location=device, weights_only=False)
+    if ckpt is not None:
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
             state_dict = ckpt["state_dict"]
         else:
@@ -486,13 +518,16 @@ def build_model(
         filtered = {k: v for k, v in state_dict.items()
                     if k in model_state and model_state[k].shape == v.shape}
         missing = [k for k in model_state if k not in filtered]
+        skipped = [k for k in state_dict if k not in filtered]
         model_state.update(filtered)
         model.load_state_dict(model_state)
         print(f"[model] loaded {len(filtered)}/{len(model_state)} params from {weights}")
+        if skipped:
+            print(f"[model] skipped from checkpoint: {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
         if missing:
             print(f"[model] randomly initialized: {missing[:5]}{'...' if len(missing) > 5 else ''}")
 
-    return model
+    return model, norm_type, upsample_mode
 
 
 # ---------------------------------------------------------------------------
@@ -561,10 +596,28 @@ def train(
     weights: Optional[str] = None,
     stats_filter: Optional[str] = "losses.pred_dt.max",
     stats_threshold: float = 5.0,
+    norm_type: str = "instance",
+    upsample_mode: str = "trilinear",
+    precision: str = "bf16",
 ) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path(log_dir) / f"{timestamp}_{run_name}"
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save run config
+    config = {
+        "images_dir": images_dir, "label_dir": label_dir,
+        "epochs": epochs, "batch_size": batch_size, "lr": lr,
+        "patch_size": patch_size, "w_cos": w_cos, "w_mag": w_mag, "w_dir": w_dir,
+        "num_workers": num_workers, "val_fraction": val_fraction,
+        "device": device, "weights": weights,
+        "stats_filter": stats_filter, "stats_threshold": stats_threshold,
+        "norm_type": norm_type,
+        "upsample_mode": upsample_mode,
+        "precision": precision,
+        "cmd": " ".join(sys.argv),
+    }
+    (run_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
     # Datasets
     full_dataset = FittedZarrDataset(
@@ -597,9 +650,36 @@ def train(
     print(f"[train] {n_train} train / {n_val} val samples, step={step}")
 
     # Model
-    model = build_model(patch_size, device, weights)
+    model, norm_type, upsample_mode = build_model(
+        patch_size, device, weights, norm_type=norm_type,
+        upsample_mode=upsample_mode, batch_size=batch_size,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    # LR warmup + cosine decay
+    warmup_steps = 200
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        return 1.0
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    # Precision config
+    if precision == "bf16":
+        assert device == "cpu" or torch.cuda.is_bf16_supported(), \
+            "bf16 requested but not supported on this GPU"
+        amp_dtype = torch.bfloat16
+        use_autocast = True
+        scaler = torch.amp.GradScaler(enabled=False)
+    elif precision == "fp16":
+        amp_dtype = torch.float16
+        use_autocast = True
+        scaler = torch.amp.GradScaler(enabled=(device != "cpu"))
+    else:  # fp32
+        amp_dtype = torch.float32
+        use_autocast = False
+        scaler = torch.amp.GradScaler(enabled=False)
+    print(f"[train] precision: {precision}, upsample: {upsample_mode}, warmup: {warmup_steps} steps")
 
     # Losses
     masked_mse = MaskedMSE()
@@ -634,62 +714,77 @@ def train(
                 print(f"WARNING: zero-validity batch, skipping: {batch['name']}")
                 continue
 
-            # Forward pass
-            results = model(image)
-            pred_full = results["output"]  # (B, 8, D, H, W) at full res
+            # Forward pass (mixed precision)
+            with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_autocast):
+                results = model(image)
+                pred_full = results["output"]  # (B, 8, D, H, W) at full res
 
-            pred = torch.sigmoid(pred_full)
+                pred = torch.sigmoid(pred_full)
 
-            # Upsample targets and mask to full resolution
-            if step > 1:
-                targets = F.interpolate(targets, scale_factor=step, mode='trilinear', align_corners=False)
-                mask_up = F.interpolate(mask.float(), scale_factor=step, mode='trilinear', align_corners=False)
-                mask = (mask_up >= 1.0 - 1e-6).float()
-                dir_weight = F.interpolate(dir_weight, scale_factor=step, mode='trilinear', align_corners=False)
+                # Upsample targets and mask to full resolution
+                if step > 1:
+                    targets = F.interpolate(targets, scale_factor=step, mode='trilinear', align_corners=False)
+                    mask_up = F.interpolate(mask.float(), scale_factor=step, mode='trilinear', align_corners=False)
+                    mask = (mask_up >= 1.0 - 1e-6).float()
+                    dir_weight = F.interpolate(dir_weight, scale_factor=step, mode='trilinear', align_corners=False)
 
-            # Per-channel-group losses with multi-scale
-            loss_cos = scale_loss(pred[:, 0:1], targets[:, 0:1], mask=mask)
-            loss_mag = scale_loss(pred[:, 1:2], targets[:, 1:2], mask=mask)
-            loss_dir = scale_loss(pred[:, 2:8], targets[:, 2:8], mask=mask, weight=dir_weight)
-            loss = w_cos * loss_cos + w_mag * loss_mag + w_dir * loss_dir
+                # Per-channel-group losses with multi-scale
+                loss_cos = scale_loss(pred[:, 0:1], targets[:, 0:1], mask=mask)
+                loss_mag = scale_loss(pred[:, 1:2], targets[:, 1:2], mask=mask)
+                loss_dir = scale_loss(pred[:, 2:8], targets[:, 2:8], mask=mask, weight=dir_weight)
+                loss = w_cos * loss_cos + w_mag * loss_mag + w_dir * loss_dir
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            if global_step < warmup_steps:
+                warmup_scheduler.step()
 
             epoch_losses.append(loss.item())
+            if not math.isfinite(loss.item()):
+                print(f"  NaN/Inf at step {global_step}: loss={loss.item()}  cos={loss_cos.item()}  mag={loss_mag.item()}  dir={loss_dir.item()}")
 
-            writer.add_scalar("train/loss", loss.item(), global_step)
-            writer.add_scalar("train/loss_cos", loss_cos.item(), global_step)
-            writer.add_scalar("train/loss_mag", loss_mag.item(), global_step)
-            writer.add_scalar("train/loss_dir", loss_dir.item(), global_step)
-            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+            if global_step % 10 == 0:
+                writer.add_scalar("train/loss", loss.item(), global_step)
+                writer.add_scalar("train/loss_cos", loss_cos.item(), global_step)
+                writer.add_scalar("train/loss_mag", loss_mag.item(), global_step)
+                writer.add_scalar("train/loss_dir", loss_dir.item(), global_step)
+                writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
 
-            if global_step % 50 == 0:
+            if global_step % 100 == 0:
                 _log_vis(writer, "train", image, pred, targets, mask, global_step)
 
             global_step += 1
 
-        scheduler.step()
+        cosine_scheduler.step()
 
         # Validation
         val_loss = _evaluate(
             model, eval_loader, scale_loss, step, device, writer, global_step,
-            w_cos, w_mag, w_dir,
+            w_cos, w_mag, w_dir, amp_dtype=amp_dtype, use_autocast=use_autocast,
         )
 
         mean_train = sum(epoch_losses) / max(len(epoch_losses), 1)
         print(
             f"epoch {epoch + 1}/{epochs}  "
             f"train={mean_train:.4f}  val={val_loss:.4f}  "
-            f"lr={scheduler.get_last_lr()[0]:.2e}"
+            f"lr={optimizer.param_groups[0]['lr']:.2e}"
         )
 
         # Checkpoints
-        torch.save(model.state_dict(), run_dir / "model_current.pt")
+        ckpt_data = {
+            "state_dict": model.state_dict(),
+            "norm_type": norm_type,
+            "upsample_mode": upsample_mode,
+            "precision": precision,
+        }
+        torch.save(ckpt_data, run_dir / "model_current.pt")
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), run_dir / "model_best.pt")
+            torch.save(ckpt_data, run_dir / "model_best.pt")
             print(f"  -> new best val loss: {val_loss:.4f}")
 
     writer.close()
@@ -707,6 +802,8 @@ def _evaluate(
     w_cos: float,
     w_mag: float,
     w_dir: float,
+    amp_dtype: torch.dtype = torch.bfloat16,
+    use_autocast: bool = True,
 ) -> float:
     model.eval()
     losses: List[float] = []
@@ -715,7 +812,7 @@ def _evaluate(
     losses_dir: List[float] = []
     vis_done = False
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_autocast):
         for batch in loader:
             image = batch["image"].to(device)
             normal = batch["normal"].to(device)
@@ -792,6 +889,17 @@ def main() -> None:
                              "(set to empty string to disable).")
     parser.add_argument("--stats-threshold", type=float, default=5.0,
                         help="Skip samples where stats-filter value >= this.")
+    parser.add_argument("--norm-type", type=str, default="instance",
+                        choices=["instance", "group", "none"],
+                        help="Normalization type (default: instance). "
+                             "Saved in checkpoint for auto-detection at inference.")
+    parser.add_argument("--upsample-mode", type=str, default="trilinear",
+                        choices=["transpconv", "trilinear", "pixelshuffle"],
+                        help="Decoder upsample mode (default: trilinear). "
+                             "Saved in checkpoint for auto-detection at inference.")
+    parser.add_argument("--precision", type=str, default="bf16",
+                        choices=["bf16", "fp16", "fp32"],
+                        help="Training precision (default: bf16).")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -813,6 +921,9 @@ def main() -> None:
         weights=args.weights,
         stats_filter=args.stats_filter or None,
         stats_threshold=args.stats_threshold,
+        norm_type=args.norm_type,
+        upsample_mode=args.upsample_mode,
+        precision=args.precision,
     )
 
 

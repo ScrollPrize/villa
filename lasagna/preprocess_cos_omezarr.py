@@ -708,6 +708,63 @@ def _read_tile_zarr(
 	return chunk
 
 
+def _calibrate_instance_norm(
+	model,
+	zarr_arr,
+	*,
+	crop_slices: tuple[int, int, int, int, int, int],
+	device: torch.device,
+	tile_size: int,
+	n_tiles: int = 16,
+) -> None:
+	"""Calibrate InstanceNorm3d running statistics from representative tiles.
+
+	Enables track_running_stats on all InstanceNorm layers, runs a few forward
+	passes in train mode to accumulate running mean/var, then switches back to
+	eval mode so inference uses fixed statistics instead of per-tile stats.
+	"""
+	# Find all InstanceNorm layers
+	in_layers = [m for m in model.modules() if isinstance(m, torch.nn.InstanceNorm3d)]
+	if not in_layers:
+		print("[calibrate_norm] no InstanceNorm3d layers found, skipping")
+		return
+
+	print(f"[calibrate_norm] calibrating {len(in_layers)} InstanceNorm3d layers with {n_tiles} tiles")
+
+	# Enable running stats
+	for m in in_layers:
+		m.track_running_stats = True
+		m.num_batches_tracked = torch.tensor(0, dtype=torch.long, device=device)
+		n = m.num_features
+		m.running_mean = torch.zeros(n, device=device)
+		m.running_var = torch.ones(n, device=device)
+
+	z0, z1, y0, y1, x0, x1 = crop_slices
+	volume_shape = tuple(int(v) for v in zarr_arr.shape)
+	crop_offset = (z0, y0, x0)
+
+	# Sample random tile positions within the crop
+	rng = np.random.default_rng(42)
+	nz, ny, nx = z1 - z0, y1 - y0, x1 - x0
+	max_tz = max(0, nz - tile_size)
+	max_ty = max(0, ny - tile_size)
+	max_tx = max(0, nx - tile_size)
+
+	model.train()
+	with torch.inference_mode():
+		for i in range(n_tiles):
+			tz = int(rng.integers(0, max_tz + 1)) if max_tz > 0 else 0
+			ty = int(rng.integers(0, max_ty + 1)) if max_ty > 0 else 0
+			tx = int(rng.integers(0, max_tx + 1)) if max_tx > 0 else 0
+			tile_np = _read_tile_zarr(zarr_arr, volume_shape, crop_offset, tz, ty, tx, tile_size, 0)
+			if tile_np.dtype == np.uint16:
+				tile_np = (tile_np // 257).astype(np.uint8)
+			tile_t = torch.from_numpy(tile_np.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
+			model(tile_t)
+	model.eval()
+	print("[calibrate_norm] done")
+
+
 def _infer_tiled_3d(
 	model,
 	zarr_arr,
@@ -964,6 +1021,7 @@ def run_preprocess_3d(
 	chunk_yx: int = 32,
 	edt_chunk_depth: int = 448,
 	edt_chunk_yx: int = 448,
+	calibrate_norm: bool = False,
 ) -> None:
 	"""Run 3D UNet inference on a volume and write preprocessed zarr.
 
@@ -1113,8 +1171,16 @@ def run_preprocess_3d(
 
 	# --- Phase 2: tiled 3D inference ---
 	if not skip_inference:
-		model = build_model_3d(tile_size, str(torch_device), weights=str(unet3d_checkpoint))
+		model, _norm_type, _upsample_mode = build_model_3d(tile_size, str(torch_device), weights=str(unet3d_checkpoint))
 		model.eval()
+
+		if calibrate_norm:
+			_calibrate_instance_norm(
+				model, a_in,
+				crop_slices=(z0, z1, y0, y1, x0, x1),
+				device=torch_device,
+				tile_size=tile_size,
+			)
 
 		out_dir = os.path.dirname(os.path.abspath(output_path))
 		pred = _infer_tiled_3d(
@@ -1894,6 +1960,8 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 	p.add_argument("--chunk-yx", type=int, default=32, help="Output zarr chunk size for Y and X.")
 	p.add_argument("--edt-chunk-depth", type=int, default=256, help="EDT chunk depth in Z (default 256).")
 	p.add_argument("--edt-chunk-yx", type=int, default=256, help="EDT chunk size in Y/X (default 256).")
+	p.add_argument("--calibrate-norm", action="store_true", default=False,
+		help="Calibrate InstanceNorm running stats before inference for tile consistency.")
 	args = p.parse_args(argv)
 
 	run_preprocess_3d(
@@ -1911,6 +1979,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		chunk_yx=int(args.chunk_yx),
 		edt_chunk_depth=int(args.edt_chunk_depth),
 		edt_chunk_yx=int(args.edt_chunk_yx),
+		calibrate_norm=bool(args.calibrate_norm),
 	)
 	return 0
 
