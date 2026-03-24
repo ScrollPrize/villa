@@ -120,18 +120,7 @@ def _build_matching_target_path(
 
 
 def _output_paths_for_input(input_path: Path) -> tuple[Path, list[Path]]:
-    primary_output_path = input_path.with_suffix(".zarr")
-    parsed = parse_target_image(input_path)
-    validation_outputs: list[Path] = []
-    if parsed is not None and parsed["label_kind"] == "supervision_mask":
-        validation_outputs.append(
-            _build_matching_target_path(
-                input_path,
-                label_kind="validation_mask",
-                extension=".zarr",
-            )
-        )
-    return primary_output_path, validation_outputs
+    return input_path.with_suffix(".zarr"), []
 
 
 def is_composite_image(path: Path) -> bool:

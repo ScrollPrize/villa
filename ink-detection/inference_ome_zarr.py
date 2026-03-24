@@ -725,20 +725,50 @@ def load_checkpoint_payload(checkpoint_path: Path | str) -> Any:
         return torch.load(str(checkpoint_path), map_location="cpu")
 
 
-def extract_state_dict_from_payload(payload: Any, checkpoint_path: Path | str) -> dict[str, torch.Tensor]:
-    if isinstance(payload, dict) and isinstance(payload.get("state_dict"), dict):
-        state_dict = payload["state_dict"]
-    elif isinstance(payload, dict) and isinstance(payload.get("model_state_dict"), dict):
-        state_dict = payload["model_state_dict"]
-    elif isinstance(payload, dict) and isinstance(payload.get("model"), dict):
-        state_dict = payload["model"]
-    elif isinstance(payload, dict) and all(isinstance(v, torch.Tensor) for v in payload.values()):
-        state_dict = payload
+def extract_state_dict_entry_from_payload(
+    payload: Any,
+    checkpoint_path: Path | str,
+    *,
+    prefer_ema: bool = False,
+) -> tuple[str, dict[str, torch.Tensor]]:
+    if isinstance(payload, dict):
+        candidate_keys: list[str] = []
+        if prefer_ema:
+            candidate_keys.append("ema_model")
+        candidate_keys.extend(["state_dict", "model_state_dict", "model"])
+        for candidate_key in candidate_keys:
+            state_dict = payload.get(candidate_key)
+            if isinstance(state_dict, dict):
+                break
+        else:
+            state_dict = None
+
+        if state_dict is not None:
+            selected_key = str(candidate_keys[candidate_keys.index(candidate_key)])
+        elif all(isinstance(v, torch.Tensor) for v in payload.values()):
+            selected_key = "<root>"
+            state_dict = payload
+        else:
+            raise ValueError(f"Unsupported checkpoint format for checkpoint={str(checkpoint_path)!r}")
     else:
         raise ValueError(f"Unsupported checkpoint format for checkpoint={str(checkpoint_path)!r}")
 
     if state_dict and all(k.startswith("module.") for k in state_dict.keys()):
         state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
+    return selected_key, state_dict
+
+
+def extract_state_dict_from_payload(
+    payload: Any,
+    checkpoint_path: Path | str,
+    *,
+    prefer_ema: bool = False,
+) -> dict[str, torch.Tensor]:
+    _, state_dict = extract_state_dict_entry_from_payload(
+        payload,
+        checkpoint_path,
+        prefer_ema=prefer_ema,
+    )
     return state_dict
 
 
@@ -973,11 +1003,16 @@ def build_tifxyz_model_bundle(payload: dict[str, Any], checkpoint_path: Path | s
     ink_cfg.setdefault("activation", "none")
 
     base_model = make_model(config)
-    state_dict = extract_state_dict_from_payload(payload, checkpoint_path)
+    selected_state_key, state_dict = extract_state_dict_entry_from_payload(
+        payload,
+        checkpoint_path,
+        prefer_ema=True,
+    )
     incompat = base_model.load_state_dict(state_dict, strict=False)
     LOGGER.info(
-        "Loaded tifxyz checkpoint %s (missing_keys=%d unexpected_keys=%d)",
+        "Loaded tifxyz checkpoint %s using %s weights (missing_keys=%d unexpected_keys=%d)",
         checkpoint_path,
+        selected_state_key,
         len(incompat.missing_keys),
         len(incompat.unexpected_keys),
     )
