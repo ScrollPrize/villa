@@ -10,12 +10,10 @@ from typing import Any
 import yaml
 import zarr
 
-from ink.recipes.data.grouped_zarr_data import GroupedZarrPatchDataRecipe, group_samples_by_split
 from ink.recipes.data.zarr_data import (
     ZarrDataContext,
     ZarrPatchDataRecipe,
     build_zarr_split_samples,
-    count_group_idxs,
     load_raw_zarr_patch,
 )
 
@@ -48,19 +46,19 @@ def _bundle_exists(bundle_root: str | Path) -> bool:
 def _bundle_matches_source(
     *,
     bundle_root: str | Path,
-    recipe: ZarrPatchDataRecipe | GroupedZarrPatchDataRecipe,
+    recipe: ZarrPatchDataRecipe,
 ) -> bool:
     if not _bundle_exists(bundle_root):
         return False
-    context = ZarrDataContext.from_recipe(recipe)
     split_segment_ids = recipe.split_segment_ids()
-    expected_family = "grouped_patch" if isinstance(recipe, GroupedZarrPatchDataRecipe) else "patch"
     for split_name in ("train", "valid"):
+        context = ZarrDataContext.from_recipe_split(recipe, split_name=split_name)
         manifest = load_patch_bundle_manifest(bundle_root, split=split_name)
-        if str(manifest.get("recipe_family")) != expected_family:
+        if str(manifest.get("recipe_family")) != "patch":
             return False
         expected_fingerprint = _source_fingerprint(
             layout=context.layout,
+            context=context,
             recipe=recipe,
             split_segment_ids=split_segment_ids[split_name],
         )
@@ -86,15 +84,16 @@ def _normalization_manifest(recipe) -> dict[str, Any]:
     }
 
 
-def _source_fingerprint(*, layout, recipe, split_segment_ids: tuple[str, ...]) -> str:
+def _source_fingerprint(*, layout, context: ZarrDataContext, recipe, split_segment_ids: tuple[str, ...]) -> str:
     payload = {
         "schema_version": int(_PATCH_BUNDLE_SCHEMA_VERSION),
         "dataset_root": str(recipe.dataset_root),
         "segments": {
             str(segment_id): layout.segment_source_fingerprint(
                 str(segment_id),
-                label_suffix=str(recipe.label_suffix),
-                mask_suffix=str(recipe.mask_suffix),
+                label_suffix=str(context.label_suffix),
+                mask_suffix=str(context.mask_suffix),
+                mask_names=context.mask_names_for_segment(segment_id),
             )
             for segment_id in split_segment_ids
         },
@@ -103,8 +102,10 @@ def _source_fingerprint(*, layout, recipe, split_segment_ids: tuple[str, ...]) -
             "patch_size": int(recipe.patch_size),
             "tile_size": int(recipe.patch_size if recipe.tile_size is None else recipe.tile_size),
             "stride": int(recipe.patch_size if recipe.stride is None else recipe.stride),
-            "label_suffix": str(recipe.label_suffix),
-            "mask_suffix": str(recipe.mask_suffix),
+            "label_suffix": str(context.label_suffix),
+            "mask_suffix": str(context.mask_suffix),
+            "mask_name": str(context.mask_name),
+            "train_segment_ids": sorted(str(segment_id) for segment_id in context.train_segment_ids),
             "segments": {
                 str(segment_id): dict(recipe.segments[str(segment_id)])
                 for segment_id in split_segment_ids
@@ -134,7 +135,7 @@ def _create_array(root, name: str, *, shape: tuple[int, ...], dtype) -> Any:
 
 @dataclass(frozen=True)
 class PatchBundleWriter:
-    source: ZarrPatchDataRecipe | GroupedZarrPatchDataRecipe
+    source: ZarrPatchDataRecipe
 
     def ensure(self, *, out_root: str | Path) -> dict[str, str]:
         out_root = Path(out_root).expanduser().resolve()
@@ -150,43 +151,56 @@ class PatchBundleWriter:
 
     def write(self, *, out_root: str | Path) -> dict[str, str]:
         recipe = self.source
-        if not isinstance(recipe, (ZarrPatchDataRecipe, GroupedZarrPatchDataRecipe)):
-            raise TypeError("PatchBundleWriter source must be ZarrPatchDataRecipe or GroupedZarrPatchDataRecipe")
+        if not isinstance(recipe, ZarrPatchDataRecipe):
+            raise TypeError("PatchBundleWriter source must be ZarrPatchDataRecipe")
 
         patch_size = int(recipe.patch_size)
         tile_size = patch_size if recipe.tile_size is None else int(recipe.tile_size)
         stride = patch_size if recipe.stride is None else int(recipe.stride)
-        context = ZarrDataContext.from_recipe(recipe)
         split_segment_ids = recipe.split_segment_ids()
-        base_samples_by_split = {
-            split: build_zarr_split_samples(
-                context,
-                segment_ids=segment_ids,
+        all_segment_ids = tuple(
+            str(segment_id)
+            for segment_ids in split_segment_ids.values()
+            for segment_id in segment_ids
+        )
+        layout = ZarrDataContext.from_recipe_split(recipe, split_name="train").layout
+        shared_volume_cache = {}
+        shared_label_mask_store_cache = {}
+        contexts = {
+            split_name: ZarrDataContext.from_recipe_split(
+                recipe,
+                split_name=split_name,
+                layout=layout,
+                volume_cache=shared_volume_cache,
+                label_mask_store_cache=shared_label_mask_store_cache,
+            )
+            for split_name in ("train", "valid")
+        }
+        samples_by_split = {
+            split_name: build_zarr_split_samples(
+                contexts[split_name],
+                segment_ids=split_segment_ids[split_name],
                 patch_size=patch_size,
                 tile_size=tile_size,
                 stride=stride,
-                split_name=split,
+                split_name=split_name,
                 build_workers=max(0, int(recipe.num_workers)),
+                group_segment_ids=all_segment_ids,
             )
-            for split, segment_ids in split_segment_ids.items()
+            for split_name in ("train", "valid")
         }
-        if isinstance(recipe, GroupedZarrPatchDataRecipe):
-            samples_by_split = group_samples_by_split(
-                layout=context.layout,
-                split_segment_ids=split_segment_ids,
-                base_samples_by_split=base_samples_by_split,
-            )
-        else:
-            samples_by_split = base_samples_by_split
         out_root = Path(out_root).expanduser().resolve()
         out_root.mkdir(parents=True, exist_ok=True)
-        recipe_family = "grouped_patch" if isinstance(recipe, GroupedZarrPatchDataRecipe) else "patch"
-        train_group_counts = None
-        if isinstance(recipe, GroupedZarrPatchDataRecipe):
-            train_group_counts = count_group_idxs(sample[3] for sample in samples_by_split["train"])
+        recipe_family = "patch"
+        train_group_counts = (recipe.extras or {}).get("group_counts")
+        if train_group_counts is not None:
+            train_group_counts = [int(value) for value in train_group_counts]
+            if not train_group_counts:
+                train_group_counts = None
 
         written = {}
         for split_name, samples in samples_by_split.items():
+            context = contexts[split_name]
             split_dir = out_root / str(split_name)
             patches_root = _bundle_patches_root(out_root, split=split_name)
             manifest_path = _bundle_manifest_path(out_root, split=split_name)
@@ -204,9 +218,7 @@ class PatchBundleWriter:
             valid_arr = _create_array(store, "valid_mask", shape=(len(samples), patch_size, patch_size, 1), dtype="u1")
             xyxy_arr = _create_array(store, "xyxy", shape=(len(samples), 4), dtype="i8")
             segment_index_arr = _create_array(store, "segment_index", shape=(len(samples),), dtype="i4")
-            group_idx_arr = None
-            if recipe_family == "grouped_patch":
-                group_idx_arr = _create_array(store, "group_idx", shape=(len(samples),), dtype="i8")
+            group_idx_arr = _create_array(store, "group_idx", shape=(len(samples),), dtype="i8")
 
             ordered_segment_ids = tuple(str(segment_id) for segment_id in split_segment_ids[split_name])
             segment_index_by_id = {segment_id: idx for idx, segment_id in enumerate(ordered_segment_ids)}
@@ -221,8 +233,7 @@ class PatchBundleWriter:
                 valid_arr[idx] = valid_mask
                 xyxy_arr[idx] = xyxy
                 segment_index_arr[idx] = int(segment_index_by_id[segment_id])
-                if group_idx_arr is not None:
-                    group_idx_arr[idx] = int(sample[3])
+                group_idx_arr[idx] = int(sample[3])
 
             manifest = {
                 "schema_version": int(_PATCH_BUNDLE_SCHEMA_VERSION),
@@ -230,6 +241,7 @@ class PatchBundleWriter:
                 "split": str(split_name),
                 "source_fingerprint": _source_fingerprint(
                     layout=context.layout,
+                    context=context,
                     recipe=recipe,
                     split_segment_ids=split_segment_ids[split_name],
                 ),
@@ -244,8 +256,10 @@ class PatchBundleWriter:
                     "patch_size": patch_size,
                     "tile_size": tile_size,
                     "stride": stride,
-                    "label_suffix": str(recipe.label_suffix),
-                    "mask_suffix": str(recipe.mask_suffix),
+                    "label_suffix": str(context.label_suffix),
+                    "mask_suffix": str(context.mask_suffix),
+                    "mask_name": str(context.mask_name),
+                    "train_segment_ids": sorted(str(segment_id) for segment_id in context.train_segment_ids),
                 },
                 "normalization": _normalization_manifest(recipe.normalization),
                 "normalization_stats": dict((recipe.extras or {}).get("normalization_stats") or {}),
@@ -256,13 +270,9 @@ class PatchBundleWriter:
                     "valid_mask": {"shape": list(valid_arr.shape), "dtype": str(valid_arr.dtype)},
                     "xyxy": {"shape": list(xyxy_arr.shape), "dtype": str(xyxy_arr.dtype)},
                     "segment_index": {"shape": list(segment_index_arr.shape), "dtype": str(segment_index_arr.dtype)},
+                    "group_idx": {"shape": list(group_idx_arr.shape), "dtype": str(group_idx_arr.dtype)},
                 },
             }
-            if group_idx_arr is not None:
-                manifest["arrays"]["group_idx"] = {
-                    "shape": list(group_idx_arr.shape),
-                    "dtype": str(group_idx_arr.dtype),
-                }
             _write_manifest(manifest_path, manifest)
             written[split_name] = str(split_dir)
         return written

@@ -73,6 +73,10 @@ def build_zarr_segment_eval_loaders(
             patch_size=int(dataset.patch_size),
             tile_size=int(dataset.tile_size),
             stride=int(dataset.stride),
+            group_segment_ids=tuple(
+                str(segment_id)
+                for segment_id in (*getattr(dataset, "segment_ids", ()), *missing_segment_ids)
+            ),
         )
         rebuilt_samples_by_segment = _samples_by_segment(rebuilt_samples, segment_ids=missing_segment_ids)
         for segment_id in missing_segment_ids:
@@ -132,34 +136,42 @@ def _build_segment_loaders(
     include_tile_config: bool,
 ) -> list[DataLoader]:
     context = dataset.data_context()
-    common_kwargs = {
-        "layout": context.layout,
-        "segments": context.segments,
-        "augment": dataset.augment,
-        "normalization": dataset.normalization,
-        "patch_size": int(dataset.patch_size),
-        "in_channels": int(dataset.in_channels),
-        "volume_cache": context.volume_cache,
-    }
     if include_tile_config:
-        common_kwargs.update(
-            {
-                "split": "valid",
-                "tile_size": int(dataset.tile_size),
-                "stride": int(dataset.stride),
-                "label_suffix": context.label_suffix,
-                "mask_suffix": context.mask_suffix,
-                "label_mask_store_cache": context.label_mask_store_cache,
-                "patch_index_cache_dir": context.patch_index_cache_dir,
-            }
-        )
+        dataset_kwargs = {
+            "layout": context.layout,
+            "segments": context.segments,
+            "split": "valid",
+            "augment": dataset.augment,
+            "normalization": dataset.normalization,
+            "patch_size": int(dataset.patch_size),
+            "tile_size": int(dataset.tile_size),
+            "stride": int(dataset.stride),
+            "in_channels": int(dataset.in_channels),
+            "label_suffix": context.label_suffix,
+            "mask_suffix": context.mask_suffix,
+            "mask_name": context.mask_name,
+            "train_segment_ids": tuple(str(segment_id) for segment_id in getattr(dataset, "train_segment_ids", ())),
+            "volume_cache": context.volume_cache,
+            "label_mask_store_cache": context.label_mask_store_cache,
+            "patch_index_cache_dir": context.patch_index_cache_dir,
+        }
+    else:
+        dataset_kwargs = {
+            "layout": context.layout,
+            "segments": context.segments,
+            "augment": dataset.augment,
+            "normalization": dataset.normalization,
+            "patch_size": int(dataset.patch_size),
+            "in_channels": int(dataset.in_channels),
+            "volume_cache": context.volume_cache,
+        }
 
     return [
         DataLoader(
             dataset_cls(
                 samples_by_segment.get(str(segment_id), ()),
                 segment_ids=(str(segment_id),),
-                **common_kwargs,
+                **dataset_kwargs,
             ),
             batch_size=max(1, int(batch_size)),
             shuffle=False,
@@ -187,7 +199,11 @@ def _build_infer_samples_from_segments(
             in_channels=int(context.in_channels),
             volume_cache=context.volume_cache,
         )
-        supervision_mask = _optional_supervision_mask(dataset, segment_id, volume.image_shape_hw)
+        supervision_mask = _optional_supervision_mask(
+            dataset,
+            segment_id=segment_id,
+            image_shape_hw=volume.image_shape_hw,
+        )
         if supervision_mask is None or not bool(np.asarray(supervision_mask).any()):
             supervision_mask = np.full(volume.image_shape_hw, 255, dtype=np.uint8)
         bbox_rows, xyxys, _sample_bbox_indices = build_patch_index(
@@ -199,12 +215,16 @@ def _build_infer_samples_from_segments(
             filter_empty_tile=False,
         )
         if int(bbox_rows.shape[0]) > 0:
-            context.label_mask_store_cache[(segment_id, context.label_suffix, context.mask_suffix)] = ZarrSegmentLabelMaskStore(
+            mask_names = context.mask_names_for_segment(segment_id)
+            context.label_mask_store_cache[
+                (segment_id, context.label_suffix, context.mask_suffix, mask_names)
+            ] = ZarrSegmentLabelMaskStore(
                 layout=context.layout,
                 segment_id=str(segment_id),
                 image_shape_hw=volume.image_shape_hw,
                 label_suffix=context.label_suffix,
                 mask_suffix=context.mask_suffix,
+                mask_names=mask_names,
                 bbox_rows=bbox_rows,
             )
         split_samples.extend(
@@ -250,17 +270,18 @@ def _split_existing_and_missing_segment_samples(
     return samples_by_segment, missing_segment_ids
 
 
-def _optional_supervision_mask(dataset: ZarrPatchDataset, segment_id: str, image_shape_hw) -> np.ndarray | None:
+def _ordered_segment_ids(dataset: ZarrPatchDataset) -> tuple[str, ...]:
+    return tuple(str(segment_id) for segment_id in getattr(dataset, "segment_ids", ()) or ())
+
+
+def _optional_supervision_mask(dataset: ZarrPatchDataset, *, segment_id: str, image_shape_hw) -> np.ndarray | None:
     return read_optional_supervision_mask_for_shape(
         dataset.layout,
         str(segment_id),
         image_shape_hw,
         mask_suffix=dataset.mask_suffix,
+        mask_names=dataset.mask_names_for_segment(segment_id),
     )
-
-
-def _ordered_segment_ids(dataset: ZarrPatchDataset) -> tuple[str, ...]:
-    return tuple(str(segment_id) for segment_id in getattr(dataset, "segment_ids", ()) or ())
 
 
 def _segment_spec_ids(segment_specs) -> tuple[str, ...]:

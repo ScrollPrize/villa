@@ -9,6 +9,7 @@ from ink.recipes.data.layout import NestedZarrLayout
 from ink.recipes.eval.stitch_components import StitchComponentCatalog
 from ink.recipes.eval.stitch_prepared import StitchEvalArtifactStore
 from ink.recipes.eval.stitch_regions import StitchEvalRegionReader
+from ink.recipes.data.masks import SUPERVISION_MASK_NAME
 from ink.recipes.metrics import merge_metric_reports
 from ink.recipes.stitch import StitchInference, StitchRuntime
 
@@ -79,6 +80,8 @@ class StitchEval:
             layout=layout,
             label_suffix=str(getattr(dataset, "label_suffix", "")),
             mask_suffix=str(getattr(dataset, "mask_suffix", "")),
+            train_segment_ids=frozenset(str(segment_id) for segment_id in getattr(dataset, "train_segment_ids", ())),
+            mask_name=str(getattr(dataset, "mask_name", SUPERVISION_MASK_NAME)),
             cache_root=self.prepared_cache_root,
             segment_shapes=dict(bound_inference.segment_shapes),
             _bbox_label_cache={},

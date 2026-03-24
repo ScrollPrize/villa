@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from ink.core.types import ModelOutputBatch
+from ink.recipes.data.masks import SUPERVISION_MASK_NAME, resolve_segment_mask_names
 from ink.recipes.data.zarr_io import (
     read_label_and_supervision_mask_region,
     read_label_region,
@@ -109,6 +110,8 @@ class StitchEvalRegionReader:
     layout: object
     label_suffix: str = ""
     mask_suffix: str = ""
+    train_segment_ids: frozenset[str] = field(default_factory=frozenset)
+    mask_name: str = SUPERVISION_MASK_NAME
     cache_root: str | Path | None = None
     segment_shapes: dict[str, tuple[int, int]] = field(default_factory=dict, repr=False)
     _bbox_label_cache: dict[tuple[str, tuple[int, int, int, int]], np.ndarray] = field(
@@ -132,11 +135,23 @@ class StitchEvalRegionReader:
     def __post_init__(self) -> None:
         self.label_suffix = str(self.label_suffix)
         self.mask_suffix = str(self.mask_suffix)
+        self.train_segment_ids = frozenset(str(segment_id) for segment_id in self.train_segment_ids)
+        self.mask_name = str(self.mask_name).strip()
+        if not self.mask_name:
+            raise ValueError("mask_name must be a non-empty string")
         if self.cache_root is None:
             return
         root = Path(self.cache_root).expanduser().resolve() / "components"
         root.mkdir(parents=True, exist_ok=True)
         self.cache_root = root
+
+    def _mask_names_for_segment(self, segment_id: str) -> tuple[str, ...]:
+        return resolve_segment_mask_names(
+            split_name="valid",
+            segment_id=segment_id,
+            train_segment_ids=self.train_segment_ids,
+            default_mask_name=self.mask_name,
+        )
 
     def _segment_portable_source_fingerprint(self, segment_id: str) -> str:
         segment_id = str(segment_id)
@@ -148,6 +163,7 @@ class StitchEvalRegionReader:
         fingerprint_kwargs = {
             "label_suffix": self.label_suffix,
             "mask_suffix": self.mask_suffix,
+            "mask_names": self._mask_names_for_segment(segment_id),
         }
         if not callable(layout_fingerprint):
             layout_fingerprint = getattr(self.layout, "label_mask_fingerprint", None)
@@ -181,6 +197,7 @@ class StitchEvalRegionReader:
             bbox,
             label_suffix=self.label_suffix,
             mask_suffix=self.mask_suffix,
+            mask_names=self._mask_names_for_segment(segment_id),
         )
         return (
             np.asarray(raw_labels, dtype=bool),
@@ -324,6 +341,7 @@ class StitchEvalRegionReader:
                 full_shape,
                 bbox,
                 mask_suffix=self.mask_suffix,
+                mask_names=self._mask_names_for_segment(segment_id),
             ),
             dtype=bool,
         )

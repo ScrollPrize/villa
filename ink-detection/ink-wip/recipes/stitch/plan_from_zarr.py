@@ -7,7 +7,11 @@ import numpy as np
 from ink.core.types import DataBundle
 from ink.recipes.components import component_bboxes
 from ink.recipes.data.zarr_data import ZarrPatchDataset
-from ink.recipes.data.zarr_io import read_optional_supervision_mask_for_shape, read_supervision_mask_for_shape, resolve_segment_volume
+from ink.recipes.data.zarr_io import (
+    read_optional_supervision_mask_for_shape,
+    read_supervision_mask_for_shape,
+    resolve_segment_volume,
+)
 from ink.recipes.stitch.config import StitchData, StitchSegmentSpec
 
 
@@ -116,7 +120,8 @@ def _stitch_segment_bbox_rows(
     fallback_to_full_segment: bool,
 ) -> tuple[tuple[int, int, int, int], ...] | None:
     context = dataset.data_context()
-    cache_key = (str(segment_id), context.label_suffix, context.mask_suffix)
+    mask_names = context.mask_names_for_segment(segment_id)
+    cache_key = (str(segment_id), context.label_suffix, context.mask_suffix, mask_names)
     cached = context.label_mask_store_cache.get(cache_key)
     if int(downsample) == 1 and cached is not None and getattr(cached, "bbox_rows", None):
         return tuple(tuple(int(value) for value in row) for row in cached.bbox_rows)
@@ -128,10 +133,15 @@ def _stitch_segment_bbox_rows(
             str(segment_id),
             image_shape_hw,
             mask_suffix=context.mask_suffix,
+            mask_names=mask_names,
         )
 
     if supervision_mask is None:
-        supervision_mask = _optional_supervision_mask(dataset, str(segment_id), image_shape_hw)
+        supervision_mask = _optional_supervision_mask(
+            dataset,
+            segment_id=str(segment_id),
+            image_shape_hw=image_shape_hw,
+        )
 
     if supervision_mask is None:
         if fallback_to_full_segment:
@@ -146,12 +156,17 @@ def _stitch_segment_bbox_rows(
     raise ValueError(f"{segment_id}: stitch requires at least one supervision-mask ROI component")
 
 
-def _optional_supervision_mask(dataset: ZarrPatchDataset, segment_id: str, image_shape_hw) -> np.ndarray | None:
+def _ordered_segment_ids(dataset: ZarrPatchDataset) -> tuple[str, ...]:
+    return tuple(str(segment_id) for segment_id in getattr(dataset, "segment_ids", ()) or ())
+
+
+def _optional_supervision_mask(dataset: ZarrPatchDataset, *, segment_id: str, image_shape_hw) -> np.ndarray | None:
     return read_optional_supervision_mask_for_shape(
         dataset.layout,
         str(segment_id),
         image_shape_hw,
         mask_suffix=dataset.mask_suffix,
+        mask_names=dataset.mask_names_for_segment(segment_id),
     )
 
 
@@ -182,10 +197,6 @@ def _bbox_rows_or_none(bboxes) -> tuple[tuple[int, int, int, int], ...] | None:
     if bboxes_arr.ndim != 2 or int(bboxes_arr.shape[1]) != 4 or int(bboxes_arr.shape[0]) <= 0:
         return None
     return tuple(tuple(int(value) for value in row) for row in bboxes_arr.tolist())
-
-
-def _ordered_segment_ids(dataset: ZarrPatchDataset) -> tuple[str, ...]:
-    return tuple(str(segment_id) for segment_id in getattr(dataset, "segment_ids", ()) or ())
 
 
 def _cfg_has_key(stitch_cfg, key: str) -> bool:
