@@ -40,6 +40,8 @@ def _cache_metadata(
     label_suffix: str,
     mask_suffix: str,
     mask_names,
+    label_artifact: str = "",
+    mask_artifacts=(),
 ) -> dict[str, object]:
     return {
         "schema_version": int(_PATCH_INDEX_CACHE_SCHEMA_VERSION),
@@ -51,6 +53,8 @@ def _cache_metadata(
         "label_suffix": str(label_suffix),
         "mask_suffix": str(mask_suffix),
         "mask_names": [str(mask_name) for mask_name in tuple(mask_names or ())],
+        "label_artifact": str(label_artifact),
+        "mask_artifacts": [str(mask_artifact) for mask_artifact in tuple(mask_artifacts or ())],
     }
 
 
@@ -96,6 +100,8 @@ def load_cached_patch_index(
     label_suffix: str,
     mask_suffix: str,
     mask_names,
+    label_artifact: str = "",
+    mask_artifacts=(),
     log=None,
 ) -> CachedPatchIndex | None:
     if cache_dir is None:
@@ -109,6 +115,8 @@ def load_cached_patch_index(
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
         mask_names=mask_names,
+        label_artifact=label_artifact,
+        mask_artifacts=mask_artifacts,
     )
     base_path = _cache_file_path(cache_dir, metadata=metadata)
     metadata_path = base_path.with_suffix(".json")
@@ -167,6 +175,8 @@ def save_cached_patch_index(
     label_suffix: str,
     mask_suffix: str,
     mask_names,
+    label_artifact: str = "",
+    mask_artifacts=(),
     xyxys: np.ndarray,
     bbox_rows: np.ndarray,
     sample_bbox_indices: np.ndarray,
@@ -182,6 +192,8 @@ def save_cached_patch_index(
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
         mask_names=mask_names,
+        label_artifact=label_artifact,
+        mask_artifacts=mask_artifacts,
     )
     base_path = _cache_file_path(cache_dir, metadata=metadata)
     _save_json_atomic(base_path.with_suffix(".json"), payload=metadata)

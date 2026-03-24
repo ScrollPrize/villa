@@ -23,7 +23,9 @@ def derive_stitch_data_from_bundle(
 ) -> StitchData:
     train_dataset = getattr(getattr(bundle, "train_loader", None), "dataset", None)
     eval_dataset = getattr(getattr(bundle, "eval_loader", None), "dataset", None)
-    if not isinstance(train_dataset, ZarrPatchDataset) or not isinstance(eval_dataset, ZarrPatchDataset):
+    supports_train = isinstance(train_dataset, ZarrPatchDataset) or callable(getattr(train_dataset, "stitch_segment_specs", None))
+    supports_eval = isinstance(eval_dataset, ZarrPatchDataset) or callable(getattr(eval_dataset, "stitch_segment_specs", None))
+    if not supports_train or not supports_eval:
         return stitch_data
 
     if not _cfg_has_key(authored_config, "use_roi"):
@@ -34,55 +36,80 @@ def derive_stitch_data_from_bundle(
         if not train_segment_ids:
             train_segment_ids = _ordered_segment_ids(train_dataset)
         if train_segment_ids:
-            stitch_data.train.segments = _derive_segment_specs(
-                train_dataset,
-                segment_ids=train_segment_ids,
-                downsample=int(stitch_data.layout.downsample),
-                require_supervision_mask=bool(stitch_data.layout.use_roi),
-                fallback_to_full_segment=not bool(stitch_data.layout.use_roi),
-                use_roi=bool(stitch_data.layout.use_roi),
-            )
+            if isinstance(train_dataset, ZarrPatchDataset):
+                stitch_data.train.segments = build_zarr_stitch_segment_specs(
+                    train_dataset,
+                    segment_ids=train_segment_ids,
+                    downsample=int(stitch_data.layout.downsample),
+                    mode="train",
+                    use_roi=bool(stitch_data.layout.use_roi),
+                )
+            else:
+                stitch_data.train.segments = train_dataset.stitch_segment_specs(
+                    segment_ids=train_segment_ids,
+                    downsample=int(stitch_data.layout.downsample),
+                    mode="train",
+                    use_roi=bool(stitch_data.layout.use_roi),
+                )
 
     if not _cfg_has_segment_specs(authored_config, "eval"):
         eval_segment_ids = tuple(str(segment_id) for segment_id in (stitch_data.eval.segment_ids or ()))
         if not eval_segment_ids:
             eval_segment_ids = _ordered_segment_ids(eval_dataset)
         if eval_segment_ids:
-            stitch_data.eval.segments = _derive_segment_specs(
-                eval_dataset,
-                segment_ids=eval_segment_ids,
-                downsample=int(stitch_data.layout.downsample),
-                require_supervision_mask=bool(stitch_data.layout.use_roi),
-                fallback_to_full_segment=not bool(stitch_data.layout.use_roi),
-                use_roi=bool(stitch_data.layout.use_roi),
-            )
+            if isinstance(eval_dataset, ZarrPatchDataset):
+                stitch_data.eval.segments = build_zarr_stitch_segment_specs(
+                    eval_dataset,
+                    segment_ids=eval_segment_ids,
+                    downsample=int(stitch_data.layout.downsample),
+                    mode="eval",
+                    use_roi=bool(stitch_data.layout.use_roi),
+                )
+            else:
+                stitch_data.eval.segments = eval_dataset.stitch_segment_specs(
+                    segment_ids=eval_segment_ids,
+                    downsample=int(stitch_data.layout.downsample),
+                    mode="eval",
+                    use_roi=bool(stitch_data.layout.use_roi),
+                )
 
     if not _cfg_has_segment_specs(authored_config, "log_only") and stitch_data.log_only.segment_ids:
         log_only_segment_ids = tuple(str(segment_id) for segment_id in stitch_data.log_only.segment_ids)
-        stitch_data.log_only.segments = _derive_segment_specs(
-            train_dataset,
-            segment_ids=log_only_segment_ids,
-            downsample=int(stitch_data.layout.downsample),
-            require_supervision_mask=False,
-            fallback_to_full_segment=True,
-            use_roi=bool(stitch_data.layout.use_roi),
-        )
+        if isinstance(train_dataset, ZarrPatchDataset):
+            stitch_data.log_only.segments = build_zarr_stitch_segment_specs(
+                train_dataset,
+                segment_ids=log_only_segment_ids,
+                downsample=int(stitch_data.layout.downsample),
+                mode="log_only",
+                use_roi=bool(stitch_data.layout.use_roi),
+            )
+        else:
+            stitch_data.log_only.segments = train_dataset.stitch_segment_specs(
+                segment_ids=log_only_segment_ids,
+                downsample=int(stitch_data.layout.downsample),
+                mode="log_only",
+                use_roi=bool(stitch_data.layout.use_roi),
+            )
 
     return stitch_data
 
 
-def _derive_segment_specs(
+def build_zarr_stitch_segment_specs(
     dataset: ZarrPatchDataset,
     *,
     segment_ids,
     downsample: int,
-    require_supervision_mask: bool,
-    fallback_to_full_segment: bool,
+    mode: str,
     use_roi: bool,
 ) -> list[StitchSegmentSpec]:
+    mode_name = str(mode).strip().lower()
+    if mode_name not in {"train", "eval", "log_only"}:
+        raise ValueError(f"unknown stitch mode: {mode!r}")
+    require_supervision_mask = bool(use_roi) and mode_name in {"train", "eval"}
+    fallback_to_full_segment = mode_name == "log_only" or not bool(use_roi)
     context = dataset.data_context()
     segment_specs = []
-    for segment_id in segment_ids:
+    for segment_id in tuple(str(segment_id) for segment_id in (segment_ids or ())):
         volume = resolve_segment_volume(
             layout=context.layout,
             segments=context.segments,
@@ -156,7 +183,7 @@ def _stitch_segment_bbox_rows(
     raise ValueError(f"{segment_id}: stitch requires at least one supervision-mask ROI component")
 
 
-def _ordered_segment_ids(dataset: ZarrPatchDataset) -> tuple[str, ...]:
+def _ordered_segment_ids(dataset) -> tuple[str, ...]:
     return tuple(str(segment_id) for segment_id in getattr(dataset, "segment_ids", ()) or ())
 
 
@@ -214,4 +241,4 @@ def _cfg_has_segment_specs(stitch_cfg, split_name: str) -> bool:
     return isinstance(split_cfg, Mapping) and "segments" in split_cfg
 
 
-__all__ = ["derive_stitch_data_from_bundle"]
+__all__ = ["build_zarr_stitch_segment_specs", "derive_stitch_data_from_bundle"]

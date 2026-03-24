@@ -4,20 +4,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-from torch.utils.data import Dataset
-import zarr
-
 from ink.core.types import DataBundle
 from ink.recipes.data.normalization import ClipMaxDiv255Normalization
-from ink.recipes.data.patch_bundle.writer import load_patch_bundle_manifest
+from ink.recipes.data.patch_bundle.dataset import PatchBundleDataset
+from ink.recipes.data.patch_bundle.writer import PatchBundleWriter, load_patch_bundle_manifest
 from ink.recipes.data.samplers import ShuffleSampler
-from ink.recipes.data.transforms import (
-    apply_eval_sample_transforms,
-    apply_train_sample_transforms,
-    build_joint_transform,
-)
 from ink.recipes.data.zarr_data import (
+    ZarrPatchDataRecipe,
     build_patch_data_bundle,
     collate_patch_batch,
 )
@@ -30,88 +23,6 @@ def _manifest_value(manifest: dict[str, Any], *path: str) -> Any:
             raise KeyError(f"patch bundle manifest missing key path {path!r}")
         current = current[part]
     return current
-
-
-class PatchBundleDataset(Dataset):
-    def __init__(
-        self,
-        *,
-        bundle_root: str | Path,
-        split: str,
-        augment,
-        normalization,
-    ):
-        self.bundle_root = Path(bundle_root).expanduser().resolve()
-        self.split = str(split).strip().lower()
-        if self.split not in {"train", "valid"}:
-            raise ValueError(f"unknown split: {split!r}")
-        self.manifest = load_patch_bundle_manifest(self.bundle_root, split=self.split)
-        self.augment = augment
-        self.normalization = normalization
-        self.patch_size = int(self.manifest["extraction"]["patch_size"])
-        self.in_channels = int(self.manifest["extraction"]["in_channels"])
-        self.segment_ids = tuple(str(segment_id) for segment_id in self.manifest["segment_ids"])
-
-        patches_root = self.bundle_root / self.split / "patches.zarr"
-        if not patches_root.exists():
-            raise FileNotFoundError(f"Could not resolve patch bundle arrays at {str(patches_root)!r}")
-        store = zarr.open_group(str(patches_root), mode="r")
-        self._store = store
-        self._x = store["x"]
-        self._y = store["y"]
-        self._valid_mask = store["valid_mask"]
-        self._xyxy = store["xyxy"]
-        self._segment_index = store["segment_index"]
-        self._group_idx = store["group_idx"] if "group_idx" in store else None
-        self.transform = build_joint_transform(
-            self.split,
-            augment=self.augment,
-            normalization=self.normalization,
-            patch_size=self.patch_size,
-            in_channels=self.in_channels,
-        )
-
-    @property
-    def sample_groups(self) -> list[int]:
-        if self._group_idx is None:
-            raise ValueError("patch bundle does not provide group_idx")
-        return [int(np.asarray(self._group_idx[idx]).item()) for idx in range(len(self))]
-
-    def __len__(self) -> int:
-        return int(self._x.shape[0])
-
-    def _raw_item(self, idx: int):
-        idx = int(idx)
-        image = np.asarray(self._x[idx], dtype=np.uint8)
-        label = np.asarray(self._y[idx], dtype=np.uint8)
-        valid_mask = np.asarray(self._valid_mask[idx], dtype=np.uint8)
-        xyxy = np.asarray(self._xyxy[idx], dtype=np.int64)
-        segment_idx = int(np.asarray(self._segment_index[idx]).item())
-        segment_id = self.segment_ids[segment_idx]
-        return image, label, valid_mask, xyxy, segment_id
-
-    def __getitem__(self, idx):
-        image, label, valid_mask, xyxy, segment_id = self._raw_item(int(idx))
-        if self.split == "train":
-            image, label, valid_mask = apply_train_sample_transforms(
-                image,
-                label,
-                augment=self.augment,
-                patch_size=self.patch_size,
-                transform=self.transform,
-                valid_mask=valid_mask,
-            )
-        else:
-            image, label, valid_mask = apply_eval_sample_transforms(
-                image,
-                label,
-                patch_size=self.patch_size,
-                transform=self.transform,
-                valid_mask=valid_mask,
-            )
-        if self._group_idx is None:
-            return image, label, valid_mask, xyxy, segment_id
-        return image, label, valid_mask, xyxy, segment_id, int(np.asarray(self._group_idx[int(idx)]).item())
 
 
 @dataclass(frozen=True)
@@ -193,7 +104,18 @@ class PatchBundleDataRecipe:
         )
 
 
+@dataclass(frozen=True)
+class GeneratedPatchBundleDataRecipe(PatchBundleDataRecipe):
+    source: ZarrPatchDataRecipe = field(default=None)
+
+    def build(self, *, runtime=None, augment=None) -> DataBundle:
+        if not isinstance(self.source, ZarrPatchDataRecipe):
+            raise TypeError("GeneratedPatchBundleDataRecipe.source must be ZarrPatchDataRecipe")
+        PatchBundleWriter(self.source).ensure(out_root=Path(self.bundle_root).expanduser().resolve())
+        return super().build(runtime=runtime, augment=augment)
+
+
 __all__ = [
+    "GeneratedPatchBundleDataRecipe",
     "PatchBundleDataRecipe",
-    "PatchBundleDataset",
 ]
