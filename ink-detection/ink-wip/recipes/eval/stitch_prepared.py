@@ -14,6 +14,7 @@ from ink.recipes.stitch.artifact_primitives import (
     pseudo_weight_maps,
     skeletonize_binary,
 )
+from ink.recipes.stitch.store import segment_store_key
 
 STITCH_EVAL_ARTIFACT_SCHEMA_VERSION = 1
 
@@ -38,18 +39,12 @@ def _readonly_float32(array: np.ndarray) -> np.ndarray:
     out.setflags(write=False)
     return out
 
-
-def _segment_store_key(segment_id: str) -> str:
-    return str(segment_id).replace("/", "__")
-
-
 @dataclass(frozen=True)
 class StitchEvalArtifactKey:
     segment_id: str
     source_fingerprint: str
     metric_bbox: tuple[int, int, int, int]
     component_bbox: tuple[int, int, int, int]
-    downsample: int
     connectivity: int
     component_pad: int
 
@@ -61,7 +56,6 @@ def _stitch_eval_artifact_key_payload(key: StitchEvalArtifactKey) -> dict[str, o
         "source_fingerprint": str(key.source_fingerprint),
         "metric_bbox": [int(v) for v in key.metric_bbox],
         "component_bbox": [int(v) for v in key.component_bbox],
-        "downsample": int(key.downsample),
         "connectivity": int(key.connectivity),
         "component_pad": int(key.component_pad),
     }
@@ -122,7 +116,7 @@ class StitchEvalArtifactStore:
     def _artifact_path(self, *, key: StitchEvalArtifactKey, artifact_name: str, ext: str) -> Path | None:
         if self.cache_root is None:
             return None
-        return Path(self.cache_root) / _segment_store_key(key.segment_id) / _stitch_eval_artifact_key_digest(key) / (
+        return Path(self.cache_root) / segment_store_key(key.segment_id) / _stitch_eval_artifact_key_digest(key) / (
             f"{artifact_name}.{ext}"
         )
 

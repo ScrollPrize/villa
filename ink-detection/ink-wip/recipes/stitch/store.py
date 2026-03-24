@@ -18,7 +18,7 @@ from ink.recipes.stitch.ops import (
 )
 
 
-def _segment_store_key(segment_id: str) -> str:
+def segment_store_key(segment_id: str) -> str:
     return str(segment_id).replace("/", "__")
 
 
@@ -186,7 +186,7 @@ def _clamp_bbox(
 
 
 def _segment_array_paths(root_dir: Path, segment_id: str) -> tuple[Path, Path]:
-    key = _segment_store_key(segment_id)
+    key = segment_store_key(segment_id)
     return (
         root_dir / f"{key}__logit_sum.zarr",
         root_dir / f"{key}__weight_sum.zarr",
@@ -194,7 +194,7 @@ def _segment_array_paths(root_dir: Path, segment_id: str) -> tuple[Path, Path]:
 
 
 def _segment_preview_path(root_dir: Path, segment_id: str) -> Path:
-    return root_dir / f"{_segment_store_key(segment_id)}__prob.png"
+    return root_dir / f"{segment_store_key(segment_id)}__prob.png"
 
 
 def _prepare_patch_logits(patch_logits: torch.Tensor, *, target_h: int, target_w: int) -> torch.Tensor:
@@ -235,7 +235,7 @@ def _roi_patch_slices(
 
 @dataclass
 class ZarrStitchStore:
-    root_dir: str | Path = ".tmp/stitch_eval"
+    root_dir: str | Path | None = None
     downsample: int = 1
     gaussian_sigma_scale: float = 1.0 / 8.0
     gaussian_min_weight: float = 1e-6
@@ -259,10 +259,12 @@ class ZarrStitchStore:
             gaussian_sigma_scale=float(self.gaussian_sigma_scale),
             gaussian_min_weight=float(self.gaussian_min_weight),
         )
-        built._init_arrays(segment_shapes, segment_rois=segment_rois)
+        built._configure_segments(segment_shapes, segment_rois=segment_rois)
+        if built.root_dir is not None:
+            built.reset()
         return built
 
-    def _init_arrays(
+    def _configure_segments(
         self,
         segment_shapes: dict[str, tuple[int, int]],
         *,
@@ -279,12 +281,21 @@ class ZarrStitchStore:
             )
             for segment_id, ds_shape in self._segment_shapes.items()
         }
-
-        root_dir = Path(self.root_dir).resolve()
-        root_dir.mkdir(parents=True, exist_ok=True)
-
         self._sum_arrays = {}
         self._weight_arrays = {}
+
+    def _resolved_root_dir(self) -> Path:
+        root_dir = self.root_dir
+        if root_dir is None:
+            raise ValueError("stitch store root_dir must be set before stitched inference begins")
+        return Path(root_dir).resolve()
+
+    def _require_configured_segments(self) -> None:
+        if self._segment_shapes:
+            return
+        raise ValueError("stitch store must be built with segment shapes before use")
+
+    def _open_root_arrays(self, root_dir: Path) -> None:
         for segment_id, ds_shape in self._segment_shapes.items():
             self._sum_arrays[segment_id], self._weight_arrays[segment_id] = self._open_segment_arrays(
                 root_dir,
@@ -293,14 +304,12 @@ class ZarrStitchStore:
             )
 
     def reset(self) -> None:
-        root_dir = Path(self.root_dir).resolve()
+        self._require_configured_segments()
+        root_dir = self._resolved_root_dir()
         root_dir.mkdir(parents=True, exist_ok=True)
-        for segment_id, ds_shape in self._segment_shapes.items():
-            self._sum_arrays[segment_id], self._weight_arrays[segment_id] = self._open_segment_arrays(
-                root_dir,
-                segment_id=segment_id,
-                shape=ds_shape,
-            )
+        self._sum_arrays = {}
+        self._weight_arrays = {}
+        self._open_root_arrays(root_dir)
 
     def _open_segment_arrays(self, root_dir: Path, *, segment_id: str, shape: tuple[int, int]) -> tuple[Any, Any]:
         sum_path, weight_path = _segment_array_paths(root_dir, segment_id)
@@ -308,6 +317,8 @@ class ZarrStitchStore:
 
     def _segment_arrays(self, segment_id: str) -> tuple[Any, Any]:
         segment_id = str(segment_id)
+        if not self._sum_arrays or not self._weight_arrays:
+            raise RuntimeError("stitch store arrays are not initialized; set root_dir and call reset() before use")
         sum_arr = self._sum_arrays.get(segment_id)
         weight_arr = self._weight_arrays.get(segment_id)
         if sum_arr is None or weight_arr is None:
@@ -439,7 +450,7 @@ class ZarrStitchStore:
     def write_full_segment_probs(self, *, segment_id: str, out_path: str | Path | None = None) -> str:
         segment_id = str(segment_id)
         if out_path is None:
-            out_path = Path(self.root_dir).resolve() / f"{_segment_store_key(segment_id)}__prob.zarr"
+            out_path = Path(self.root_dir).resolve() / f"{segment_store_key(segment_id)}__prob.zarr"
         out_path = Path(out_path).resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
 

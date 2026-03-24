@@ -12,7 +12,7 @@ from torch.utils.data._utils.collate import default_collate
 
 from ink.recipes.losses.reporting import resolve_train_output as resolve_train_loss_output
 from ink.recipes.stitch.artifact_primitives import binary_mask_to_signed_distance_map
-from ink.recipes.stitch.data import StitchData, normalize_component_key
+from ink.recipes.stitch.config import StitchData, normalize_component_key
 from ink.recipes.stitch.ops import gaussian_weights, normalize_xyxy_rows, resolve_buffer_crop
 from ink.recipes.stitch.runtime import _log
 from ink.recipes.stitch.terms import StitchLossBatch, _requires_boundary_dist_map, compute_stitched_loss_components

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ink.recipes.stitch.data import StitchData, normalize_component_key
+from ink.recipes.stitch.config import StitchData, normalize_component_key
 from ink.recipes.stitch.ops import allocate_segment_buffers, build_segment_roi_meta
+from ink.recipes.stitch.plan_from_zarr import derive_stitch_data_from_bundle
 from ink.recipes.stitch.terms import compute_stitched_loss_components
-from ink.recipes.stitch.zarr_prep import prepare_stitch_data_for_bundle
 
 
 def _noop_log(*_args, **_kwargs) -> None:
@@ -137,6 +137,30 @@ class StitchRuntime:
             downsample=int(self.data.layout.downsample),
         )
 
+    def eval_segment_layout(self) -> SegmentLayout:
+        segment_shapes: dict[str, tuple[int, int]] = {}
+        segment_rois: dict[str, tuple[tuple[int, int, int, int], ...]] = {}
+
+        for spec in self.data.eval.segments:
+            segment_id = str(spec.segment_id)
+            segment_shapes[segment_id] = tuple(int(v) for v in spec.shape)
+            meta = build_segment_roi_meta(
+                spec.shape,
+                spec.bbox,
+                1,
+                use_roi=self.data.layout.use_roi,
+            )
+            segment_rois[segment_id] = _segment_rois_from_meta(meta)
+
+        if not segment_shapes:
+            raise ValueError("stitch runtime requires stitch.eval.segments with segment shapes")
+
+        return SegmentLayout(
+            segment_shapes=segment_shapes,
+            segment_rois=segment_rois,
+            downsample=1,
+        )
+
     @classmethod
     def _from_config(
         cls,
@@ -145,9 +169,19 @@ class StitchRuntime:
         logger=None,
         patch_loss=None,
     ) -> "StitchRuntime":
+        data = StitchData.from_config(stitch_data or {})
+        return cls._from_data(data, logger=logger, patch_loss=patch_loss)
+
+    @classmethod
+    def _from_data(
+        cls,
+        data: StitchData,
+        *,
+        logger=None,
+        patch_loss=None,
+    ) -> "StitchRuntime":
         from ink.recipes.stitch.train_runtime import TrainStitchRuntime
 
-        data = StitchData.from_config(stitch_data or {})
         state = StitchRuntimeState(data)
         log = logger or _noop_log
         train = TrainStitchRuntime(
@@ -172,14 +206,18 @@ class StitchRuntimeRecipe:
     config: StitchData | dict | None = None
 
     def build(self, bundle, *, runtime=None, logger=None, patch_loss=None) -> StitchRuntime:
-        stitch_runtime = StitchRuntime._from_config(
-            prepare_stitch_data_for_bundle(bundle, config=self.config),
+        authored_config = {} if self.config is None else self.config
+        authored_stitch_data = StitchData.from_config(authored_config)
+        stitch_data = derive_stitch_data_from_bundle(
+            bundle,
+            authored_config=authored_config,
+            stitch_data=authored_stitch_data,
+        )
+        stitch_runtime = StitchRuntime._from_data(
+            stitch_data,
             logger=logger,
             patch_loss=patch_loss,
         )
-        precision_context = getattr(runtime, "precision_context", None)
-        if callable(precision_context):
-            stitch_runtime.train.precision_context = precision_context
         return stitch_runtime
 
 

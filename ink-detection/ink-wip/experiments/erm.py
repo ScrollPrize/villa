@@ -78,6 +78,8 @@ EXPERIMENT = Experiment(
             "/pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/villa/ink-detection/ink-0309"
             "/.patch_index_cache/erm"
         ),
+        cache_train_patches_in_memory=True,
+        include_train_valid_mask=False,
         normalization=ClipMaxDiv255Normalization(),
     ),
     model=ResNet3D(
@@ -96,11 +98,14 @@ EXPERIMENT = Experiment(
             group="ink-2um",
             tags=("ink-2um",),
             media_downsample=1,
+            log_train_every_n_steps=10,
         ),
     ),
     augment=TrainAugment(),
     trainer=PatchTrainer(
         stitch_runtime=_STITCH_RUNTIME,
+        log_every_n_steps=100,
+        save_every_n_epochs=1,
     ),
     evaluator=ValidationEvaluator(
         patch=PatchEval(

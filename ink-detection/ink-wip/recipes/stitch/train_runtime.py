@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from ink.core.types import Batch
-from ink.recipes.stitch.data import StitchData, normalize_component_key
+from ink.recipes.stitch.config import StitchData, normalize_component_key
 from ink.recipes.stitch.ops import (
     accumulate_to_buffers as _accumulate_to_buffers_impl,
     allocate_segment_buffers,
@@ -49,26 +49,6 @@ def _coerce_component_dataset_map(raw_datasets) -> dict[tuple[str, int], Any]:
     }
 
 
-def _segment_spec_ids(segment_specs) -> tuple[str, ...]:
-    return tuple(str(spec.segment_id) for spec in (segment_specs or ()))
-
-
-def _should_run_every_n_epochs(*, epoch: int, every_n_epochs: int) -> bool:
-    cadence = max(1, int(every_n_epochs))
-    return cadence == 1 or ((int(epoch) + 1) % cadence) == 0
-
-
-def _segment_loader_pairs(*, loaders, segment_ids, mode_name: str) -> tuple[tuple[Any, str], ...]:
-    normalized_ids = tuple(str(segment_id) for segment_id in (segment_ids or ()))
-    normalized_loaders = tuple(loaders or ())
-    if len(normalized_loaders) != len(normalized_ids):
-        raise ValueError(
-            f"{mode_name} stitch loaders/segment_ids length mismatch "
-            f"({len(normalized_loaders)} vs {len(normalized_ids)})"
-        )
-    return tuple(zip(normalized_loaders, normalized_ids))
-
-
 @dataclass
 class TrainStitchRuntime:
     data: StitchData
@@ -105,14 +85,18 @@ class TrainStitchRuntime:
     ):
         if not enabled:
             return None
-        segment_pairs = _segment_loader_pairs(
-            loaders=loaders,
-            segment_ids=segment_ids,
-            mode_name=mode_name,
-        )
+        normalized_ids = tuple(str(segment_id) for segment_id in (segment_ids or ()))
+        normalized_loaders = tuple(loaders or ())
+        if len(normalized_loaders) != len(normalized_ids):
+            raise ValueError(
+                f"{mode_name} stitch loaders/segment_ids length mismatch "
+                f"({len(normalized_loaders)} vs {len(normalized_ids)})"
+            )
+        segment_pairs = tuple(zip(normalized_loaders, normalized_ids))
         if not segment_pairs:
             return None
-        if not _should_run_every_n_epochs(epoch=int(epoch), every_n_epochs=int(every_n_epochs)):
+        cadence = max(1, int(every_n_epochs))
+        if cadence != 1 and ((int(epoch) + 1) % cadence) != 0:
             return None
 
         t0 = time.perf_counter()
@@ -154,7 +138,7 @@ class TrainStitchRuntime:
             enabled=bool(self.data.train.viz.enabled),
             every_n_epochs=int(self.data.train.viz.every_n_epochs),
             loaders=self.loaders,
-            segment_ids=_segment_spec_ids(self.data.train.segments),
+            segment_ids=tuple(str(spec.segment_id) for spec in (self.data.train.segments or ())),
             meta_for_segment=self.state.train_segment_meta,
             loss_component_names=tuple(self.data.train.viz.loss_components),
             mode_name="train",

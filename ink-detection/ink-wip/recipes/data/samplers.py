@@ -24,23 +24,27 @@ class ShuffleSampler:
         pin_memory: bool,
         collate_fn,
         shuffle: bool,
+        multiprocessing_context=None,
     ) -> DataLoader:
         generator = None
         if len(dataset) > 0 and bool(shuffle):
             generator = torch.Generator()
             generator.manual_seed(int(self.seed))
         persistent_workers = int(num_workers) > 0
-        return DataLoader(
-            dataset,
-            batch_size=int(batch_size),
-            shuffle=False if len(dataset) <= 0 else bool(shuffle),
-            drop_last=True,
-            num_workers=int(num_workers),
-            persistent_workers=persistent_workers,
-            pin_memory=bool(pin_memory),
-            collate_fn=collate_fn,
-            generator=generator,
-        )
+        loader_kwargs = {
+            "dataset": dataset,
+            "batch_size": int(batch_size),
+            "shuffle": False if len(dataset) <= 0 else bool(shuffle),
+            "drop_last": True,
+            "num_workers": int(num_workers),
+            "persistent_workers": persistent_workers,
+            "pin_memory": bool(pin_memory),
+            "collate_fn": collate_fn,
+            "generator": generator,
+        }
+        if multiprocessing_context is not None:
+            loader_kwargs["multiprocessing_context"] = multiprocessing_context
+        return DataLoader(**loader_kwargs)
 
 
 @dataclass(frozen=True)
@@ -59,20 +63,24 @@ class GroupBalancedSampler:
         pin_memory: bool,
         collate_fn,
         shuffle: bool,
+        multiprocessing_context=None,
     ) -> DataLoader:
         del shuffle
         if len(dataset) <= 0:
             persistent_workers = int(num_workers) > 0
-            return DataLoader(
-                dataset,
-                batch_size=int(batch_size),
-                shuffle=False,
-                drop_last=True,
-                num_workers=int(num_workers),
-                persistent_workers=persistent_workers,
-                pin_memory=bool(pin_memory),
-                collate_fn=collate_fn,
-            )
+            loader_kwargs = {
+                "dataset": dataset,
+                "batch_size": int(batch_size),
+                "shuffle": False,
+                "drop_last": True,
+                "num_workers": int(num_workers),
+                "persistent_workers": persistent_workers,
+                "pin_memory": bool(pin_memory),
+                "collate_fn": collate_fn,
+            }
+            if multiprocessing_context is not None:
+                loader_kwargs["multiprocessing_context"] = multiprocessing_context
+            return DataLoader(**loader_kwargs)
 
         group_array = torch.as_tensor(dataset.sample_groups, dtype=torch.long)
         n_groups = int(group_array.max().item()) + 1
@@ -88,17 +96,20 @@ class GroupBalancedSampler:
             generator=generator,
         )
         persistent_workers = int(num_workers) > 0
-        return DataLoader(
-            dataset,
-            batch_size=int(batch_size),
-            shuffle=False,
-            sampler=weighted_sampler,
-            drop_last=True,
-            num_workers=int(num_workers),
-            persistent_workers=persistent_workers,
-            pin_memory=bool(pin_memory),
-            collate_fn=collate_fn,
-        )
+        loader_kwargs = {
+            "dataset": dataset,
+            "batch_size": int(batch_size),
+            "shuffle": False,
+            "sampler": weighted_sampler,
+            "drop_last": True,
+            "num_workers": int(num_workers),
+            "persistent_workers": persistent_workers,
+            "pin_memory": bool(pin_memory),
+            "collate_fn": collate_fn,
+        }
+        if multiprocessing_context is not None:
+            loader_kwargs["multiprocessing_context"] = multiprocessing_context
+        return DataLoader(**loader_kwargs)
 
 
 @dataclass(frozen=True)
@@ -119,20 +130,24 @@ class GroupStratifiedSampler:
         pin_memory: bool,
         collate_fn,
         shuffle: bool,
+        multiprocessing_context=None,
     ) -> DataLoader:
         del batch_size, shuffle
         if len(dataset) <= 0:
             persistent_workers = int(num_workers) > 0
-            return DataLoader(
-                dataset,
-                batch_size=int(self.batch_size),
-                shuffle=False,
-                drop_last=True,
-                num_workers=int(num_workers),
-                persistent_workers=persistent_workers,
-                pin_memory=bool(pin_memory),
-                collate_fn=collate_fn,
-            )
+            loader_kwargs = {
+                "dataset": dataset,
+                "batch_size": int(self.batch_size),
+                "shuffle": False,
+                "drop_last": True,
+                "num_workers": int(num_workers),
+                "persistent_workers": persistent_workers,
+                "pin_memory": bool(pin_memory),
+                "collate_fn": collate_fn,
+            }
+            if multiprocessing_context is not None:
+                loader_kwargs["multiprocessing_context"] = multiprocessing_context
+            return DataLoader(**loader_kwargs)
         group_indices = [int(group_idx) for group_idx in dataset.sample_groups]
         batch_size = int(self.batch_size)
         seed = int(self.seed)
@@ -187,14 +202,17 @@ class GroupStratifiedSampler:
                     yield batch
 
         persistent_workers = int(num_workers) > 0
-        return DataLoader(
-            dataset,
-            batch_sampler=_BatchSampler(),
-            num_workers=int(num_workers),
-            persistent_workers=persistent_workers,
-            pin_memory=bool(pin_memory),
-            collate_fn=collate_fn,
-        )
+        loader_kwargs = {
+            "dataset": dataset,
+            "batch_sampler": _BatchSampler(),
+            "num_workers": int(num_workers),
+            "persistent_workers": persistent_workers,
+            "pin_memory": bool(pin_memory),
+            "collate_fn": collate_fn,
+        }
+        if multiprocessing_context is not None:
+            loader_kwargs["multiprocessing_context"] = multiprocessing_context
+        return DataLoader(**loader_kwargs)
 
 
 __all__ = [

@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+import torch
+
 from ink.core.types import Batch, BatchMeta
+
+
+def resolve_runtime_device(device=None):
+    if device is not None:
+        return device
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def move_batch_to_device(batch: Batch, *, device=None) -> Batch:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
+import time
 
 import torch
 
@@ -32,7 +33,9 @@ class ValidationEvaluator:
     patch: PatchEval | None = None
     stitch_inference: StitchInference | StitchInferenceRecipe | None = None
     stitch: StitchEval | None = None
+    log_every_n_steps: int = 100
     _precision_context: object = field(default=None, repr=False, compare=False)
+    _logger: object = field(default=None, repr=False, compare=False)
     stage_prefix: str = field(default="val", init=False)
 
     def build(self, *, data, runtime=None, logger=None) -> ValidationEvaluator:
@@ -74,14 +77,19 @@ class ValidationEvaluator:
             stitch_inference=bound_stitch_inference,
             stitch=bound_stitch,
             _precision_context=precision_context,
+            _logger=logger,
         )
 
-    def prepare_run_artifacts(self, *, run_fs=None) -> None:
+    def prepare_run_artifacts(self, *, run_fs=None, epoch: int | None = None) -> None:
         if run_fs is None:
             return
-        stitch_inference = self.stitch_inference
-        if stitch_inference is not None:
-            stitch_inference.store.root_dir = run_fs.artifacts_dir / "stitch_eval"
+        store = getattr(self.stitch_inference, "store", None)
+        if store is None:
+            return
+        root_dir = run_fs.artifacts_dir / "stitch_eval"
+        if epoch is not None:
+            root_dir = root_dir / f"epoch_{int(epoch):04d}"
+        store.root_dir = root_dir
 
     def export_logged_images(self, *, media_downsample: int) -> dict[str, dict[str, object]]:
         _preview_paths, logged_images = export_store_preview_artifacts(
@@ -113,6 +121,15 @@ class ValidationEvaluator:
             model.eval()
 
         try:
+            total_batches = len(eval_loader)
+        except TypeError:
+            total_batches = None
+        batch_count = 0
+        window_batches = 0
+        window_started_at = time.perf_counter()
+        log_every_n_steps = max(1, int(self.log_every_n_steps))
+
+        try:
             with torch.inference_mode():
                 for batch in eval_loader:
                     if not isinstance(batch, Batch):
@@ -132,9 +149,24 @@ class ValidationEvaluator:
                         patch.observe_batch(output_batch)
                     if stitch_inference is not None:
                         stitch_inference.observe_batch(output_batch)
+                    batch_count += 1
+                    window_batches += 1
+                    if callable(self._logger) and (batch_count % log_every_n_steps) == 0:
+                        elapsed = max(1e-9, time.perf_counter() - window_started_at)
+                        total_suffix = "" if total_batches is None else f"/{int(total_batches)}"
+                        self._logger(
+                            f"[eval] step={batch_count}{total_suffix} it_s={window_batches / elapsed:.2f}"
+                        )
+                        window_batches = 0
+                        window_started_at = time.perf_counter()
         finally:
             if was_training and callable(getattr(model, "train", None)):
                 model.train()
+
+        if callable(self._logger) and window_batches > 0:
+            elapsed = max(1e-9, time.perf_counter() - window_started_at)
+            total_suffix = "" if total_batches is None else f"/{int(total_batches)}"
+            self._logger(f"[eval] step={batch_count}{total_suffix} it_s={window_batches / elapsed:.2f}")
 
         stages = {}
         if patch is not None:

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ink.core.device import move_batch_to_device
+from ink.core.device import move_batch_to_device, resolve_runtime_device
 from ink.core.types import Batch, DataBundle, ModelOutputBatch
 from ink.recipes.stitch.artifacts import export_store_artifacts, resolve_media_downsample
 from ink.recipes.stitch import StitchInference, StitchInferenceRecipe
@@ -36,6 +36,7 @@ class StitchInferenceRun:
     resume_ckpt_path: str | None = None
 
     def run(self, *, device=None, run_fs=None) -> StitchInferenceResult:
+        device = resolve_runtime_device(device)
         model = self.experiment.model
         if not callable(model):
             raise TypeError("stitch inference model must be callable")
