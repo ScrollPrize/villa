@@ -1,0 +1,235 @@
+diff --git a/ink/recipes/data/layout.py b/ink/recipes/data/layout.py
+index a236a4d..2c27909 100644
+--- a/ink/recipes/data/layout.py
++++ b/ink/recipes/data/layout.py
+@@ -116,6 +116,28 @@ class NestedZarrLayout:
+         )
+         return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
+ 
++    def label_mask_metadata_fingerprint(
++        self,
++        segment_id: str,
++        *,
++        label_suffix: str = "",
++        mask_suffix: str = "",
++    ) -> str:
++        """Hash label/mask tree metadata without reading every chunk body."""
++        paths = self.resolve_paths(
++            segment_id,
++            label_suffix=label_suffix,
++            mask_suffix=mask_suffix,
++        )
++        payload = (
++            ("segment_id", str(segment_id)),
++            ("label_suffix", str(label_suffix)),
++            ("mask_suffix", str(mask_suffix)),
++            ("inklabels", _path_tree_metadata_signature(paths.inklabels_path)),
++            ("supervision_mask", _path_tree_metadata_signature(paths.supervision_mask_path)),
++        )
++        return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
++
+     def segment_source_fingerprint(
+         self,
+         segment_id: str,
+@@ -185,4 +207,47 @@ def _path_tree_signature(path: Path) -> tuple[str, int, int, str]:
+         digest.hexdigest(),
+     )
+ 
++
++def _path_tree_metadata_signature(path: Path) -> tuple[str, int, int, int, str]:
++    """Summarize a path tree by metadata only, without hashing file contents."""
++    root = Path(path)
++    if root.is_file():
++        stat = root.stat()
++        return (
++            root.name,
++            int(stat.st_size),
++            1,
++            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
++            hashlib.sha1(f"{root.name}\0{int(stat.st_size)}\0{int(getattr(stat, 'st_mtime_ns', int(stat.st_mtime * 1_000_000_000)))}".encode("utf-8")).hexdigest(),
++        )
++    if not root.exists():
++        return (root.name, -1, 0, -1, "missing")
++
++    digest = hashlib.sha1()
++    total_size = 0
++    file_count = 0
++    latest_mtime_ns = -1
++    for child in sorted(root.rglob("*"), key=lambda candidate: candidate.as_posix()):
++        if not child.is_file():
++            continue
++        relative_name = child.relative_to(root).as_posix()
++        stat = child.stat()
++        mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
++        digest.update(relative_name.encode("utf-8"))
++        digest.update(b"\0")
++        digest.update(str(int(stat.st_size)).encode("utf-8"))
++        digest.update(b"\0")
++        digest.update(str(mtime_ns).encode("utf-8"))
++        digest.update(b"\0")
++        total_size += int(stat.st_size)
++        file_count += 1
++        latest_mtime_ns = max(latest_mtime_ns, mtime_ns)
++    return (
++        root.name,
++        int(total_size),
++        int(file_count),
++        int(latest_mtime_ns),
++        digest.hexdigest(),
++    )
++
+ __all__ = ["NestedZarrLayout", "SegmentPaths"]
+diff --git a/ink/recipes/eval/stitch_regions.py b/ink/recipes/eval/stitch_regions.py
+index 6321218..90da33c 100644
+--- a/ink/recipes/eval/stitch_regions.py
++++ b/ink/recipes/eval/stitch_regions.py
+@@ -6,7 +6,11 @@ import numpy as np
+ import torch
+ 
+ from ink.core.types import ModelOutputBatch
+-from ink.recipes.data.zarr_io import read_label_and_supervision_mask_region
++from ink.recipes.data.zarr_io import (
++    read_label_and_supervision_mask_region,
++    read_label_region,
++    read_supervision_mask_region,
++)
+ from ink.recipes.eval.stitch_components import ComponentEvalItem, DetectedComponentRegion
+ from ink.recipes.eval.stitch_prepared import StitchEvalArtifactKey, StitchEvalArtifactStore
+ from ink.recipes.metrics.stitching import StitchMetricBatch
+@@ -106,6 +110,14 @@ class StitchEvalRegionReader:
+     layout: object
+     downsample: int = 1
+     segment_shapes: dict[str, tuple[int, int]] = field(default_factory=dict, repr=False)
++    _bbox_label_cache: dict[tuple[str, tuple[int, int, int, int], int], np.ndarray] = field(
++        default_factory=dict,
++        repr=False,
++    )
++    _bbox_supervision_cache: dict[tuple[str, tuple[int, int, int, int], int], np.ndarray] = field(
++        default_factory=dict,
++        repr=False,
++    )
+     _bbox_mask_cache: dict[tuple[str, tuple[int, int, int, int], int], tuple[np.ndarray, np.ndarray]] = field(
+         default_factory=dict,
+         repr=False,
+@@ -118,7 +130,9 @@ class StitchEvalRegionReader:
+         if cached is not None:
+             return cached
+ 
+-        layout_fingerprint = getattr(self.layout, "label_mask_fingerprint", None)
++        layout_fingerprint = getattr(self.layout, "label_mask_metadata_fingerprint", None)
++        if not callable(layout_fingerprint):
++            layout_fingerprint = getattr(self.layout, "label_mask_fingerprint", None)
+         if not callable(layout_fingerprint):
+             raise TypeError("StitchEvalRegionReader layout must provide label_mask_fingerprint(segment_id)")
+         fingerprint = str(layout_fingerprint(segment_id))
+@@ -139,6 +153,30 @@ class StitchEvalRegionReader:
+             if cached is not None:
+                 return cached
+ 
++        out = (
++            self.read_label(segment_id=segment_id, bbox=bbox, cache=cache),
++            self.read_supervision(segment_id=segment_id, bbox=bbox, cache=cache),
++        )
++        if cache:
++            self._bbox_mask_cache[cache_key] = out
++        return out
++
++    def read_label(
++        self,
++        *,
++        segment_id: str,
++        bbox: tuple[int, int, int, int],
++        cache: bool = True,
++    ) -> np.ndarray:
++        cache_key = (str(segment_id), tuple(int(v) for v in bbox), int(self.downsample))
++        if cache:
++            cached = self._bbox_label_cache.get(cache_key)
++            if cached is not None:
++                return cached
++            pair_cached = self._bbox_mask_cache.get(cache_key)
++            if pair_cached is not None:
++                return pair_cached[0]
++
+         full_shape = self.segment_shapes.get(str(segment_id))
+         if full_shape is None:
+             raise KeyError(f"missing stitched segment shape for {segment_id!r}")
+@@ -148,27 +186,68 @@ class StitchEvalRegionReader:
+             downsample=int(self.downsample),
+             full_shape=full_shape,
+         )
+-        raw_labels, raw_supervision = read_label_and_supervision_mask_region(
++        raw_labels = read_label_region(
+             self.layout,
+             str(segment_id),
+             full_shape,
+             raw_bbox,
+         )
+         out_shape = (int(bbox[1] - bbox[0]), int(bbox[3] - bbox[2]))
+-        labels = downsample_binary_mask_any(
+-            raw_labels,
+-            downsample=int(self.downsample),
+-            out_shape=out_shape,
++        labels = np.asarray(
++            downsample_binary_mask_any(
++                raw_labels,
++                downsample=int(self.downsample),
++                out_shape=out_shape,
++            ),
++            dtype=bool,
+         )
+-        supervision = downsample_binary_mask_any(
+-            raw_supervision,
++        if cache:
++            self._bbox_label_cache[cache_key] = labels
++        return labels
++
++    def read_supervision(
++        self,
++        *,
++        segment_id: str,
++        bbox: tuple[int, int, int, int],
++        cache: bool = True,
++    ) -> np.ndarray:
++        cache_key = (str(segment_id), tuple(int(v) for v in bbox), int(self.downsample))
++        if cache:
++            cached = self._bbox_supervision_cache.get(cache_key)
++            if cached is not None:
++                return cached
++            pair_cached = self._bbox_mask_cache.get(cache_key)
++            if pair_cached is not None:
++                return pair_cached[1]
++
++        full_shape = self.segment_shapes.get(str(segment_id))
++        if full_shape is None:
++            raise KeyError(f"missing stitched segment shape for {segment_id!r}")
++
++        raw_bbox = fullres_bbox_from_ds_bbox(
++            bbox,
+             downsample=int(self.downsample),
+-            out_shape=out_shape,
++            full_shape=full_shape,
++        )
++        raw_supervision = read_supervision_mask_region(
++            self.layout,
++            str(segment_id),
++            full_shape,
++            raw_bbox,
++        )
++        out_shape = (int(bbox[1] - bbox[0]), int(bbox[3] - bbox[2]))
++        supervision = np.asarray(
++            downsample_binary_mask_any(
++                raw_supervision,
++                downsample=int(self.downsample),
++                out_shape=out_shape,
++            ),
++            dtype=bool,
+         )
+-        out = (np.asarray(labels, dtype=bool), np.asarray(supervision, dtype=bool))
+         if cache:
+-            self._bbox_mask_cache[cache_key] = out
+-        return out
++            self._bbox_supervision_cache[cache_key] = supervision
++        return supervision
+ 
+     def read_component_arrays(
+         self,
