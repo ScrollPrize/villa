@@ -10,37 +10,37 @@ from ink.recipes.losses.reporting import resolve_train_output
 class StitchRegionLoss:
     patch_loss: object = field(default_factory=DiceBCEBatch)
 
-    def compute(self, stitched_logits, stitched_targets, *, valid_mask, **_kwargs):
+    def compute(self, batch):
         if not callable(self.patch_loss):
             raise TypeError("patch_loss must be callable")
         output = resolve_train_output(
             self.patch_loss,
-            stitched_logits[None, None],
-            stitched_targets[None, None],
-            valid_mask=valid_mask[None, None],
+            batch.logits[None, None],
+            batch.targets[None, None],
+            valid_mask=batch.valid_mask[None, None],
         )
         loss = output.loss
         if getattr(loss, "ndim", 0) > 0:
             loss = loss.reshape(-1).mean()
-        metrics = output.metrics
+        components = output.components
 
-        def _metric_value(*keys: str):
+        def _component_value(*keys: str):
             for key in keys:
-                if key not in metrics:
+                if key not in components:
                     continue
-                value = metrics[key]
+                value = components[key]
                 if getattr(value, "ndim", 0) > 0:
                     value = value.reshape(-1).mean()
                 return value.detach()
             return None
 
-        dice_loss = _metric_value("dice_loss")
+        dice_loss = _component_value("dice_loss")
         if dice_loss is None:
             dice_loss = loss.new_tensor(0.0)
-        dice = _metric_value("dice")
+        dice = _component_value("dice")
         if dice is None:
             dice = 1.0 - dice_loss
-        bce = _metric_value("bce", "bce_loss")
+        bce = _component_value("bce", "bce_loss")
         if bce is None:
             bce = loss.new_tensor(0.0)
 

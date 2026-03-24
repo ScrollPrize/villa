@@ -1,8 +1,58 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+
+def normalize_xyxy_rows(xyxys: Any) -> list[tuple[int, int, int, int]]:
+    if isinstance(xyxys, torch.Tensor):
+        if xyxys.ndim == 1:
+            if int(xyxys.numel()) != 4:
+                raise ValueError(f"stitch xyxys tensor must have 4 values, got shape={tuple(xyxys.shape)}")
+            return [tuple(int(v) for v in xyxys.tolist())]
+        if xyxys.ndim != 2 or int(xyxys.shape[1]) != 4:
+            raise ValueError(f"stitch xyxys tensor must have shape (N,4), got shape={tuple(xyxys.shape)}")
+        return [tuple(int(v) for v in row.tolist()) for row in xyxys]
+
+    if isinstance(xyxys, (list, tuple)):
+        if len(xyxys) == 4 and all(isinstance(value, torch.Tensor) for value in xyxys):
+            columns = [value.detach().reshape(-1) for value in xyxys]
+            batch_size = int(columns[0].numel())
+            return [
+                tuple(int(column[row_idx].item()) for column in columns)
+                for row_idx in range(batch_size)
+            ]
+
+        if len(xyxys) == 4 and all(not isinstance(value, (list, tuple)) for value in xyxys):
+            return [
+                tuple(
+                    int(value.item()) if isinstance(value, torch.Tensor) else int(value)
+                    for value in xyxys
+                )
+            ]
+
+        rows = []
+        for item in xyxys:
+            if isinstance(item, torch.Tensor):
+                flat = item.detach().reshape(-1)
+                if int(flat.numel()) != 4:
+                    raise ValueError("stitch xyxy tensor entries must have 4 values")
+                rows.append(tuple(int(v.item()) for v in flat))
+                continue
+            if not isinstance(item, (list, tuple)) or len(item) != 4:
+                raise ValueError("stitch xyxy entries must have 4 values")
+            rows.append(
+                tuple(
+                    int(value.item()) if isinstance(value, torch.Tensor) else int(value)
+                    for value in item
+                )
+            )
+        return rows
+
+    raise TypeError(f"unsupported stitch xyxys value: {xyxys!r}")
 
 
 def gaussian_weights(
@@ -40,7 +90,7 @@ def _sigmoid_numpy(arr: np.ndarray) -> np.ndarray:
     return (1.0 / (1.0 + np.exp(-arr_clipped))).astype(np.float32)
 
 
-def stitch_prob_map(pred_buf: np.ndarray, count_buf: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def stitch_logit_map(pred_buf: np.ndarray, count_buf: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     covered = count_buf != 0
     stitched_logits = np.divide(
         pred_buf.astype(np.float32),
@@ -48,8 +98,13 @@ def stitch_prob_map(pred_buf: np.ndarray, count_buf: np.ndarray) -> tuple[np.nda
         out=np.zeros_like(pred_buf, dtype=np.float32),
         where=covered,
     )
+    return stitched_logits, covered
+
+
+def stitch_prob_map(pred_buf: np.ndarray, count_buf: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    stitched_logits, covered = stitch_logit_map(pred_buf, count_buf)
     stitched_probs = np.zeros_like(stitched_logits, dtype=np.float32)
-    if covered.any():
+    if bool(covered.any()):
         stitched_probs[covered] = _sigmoid_numpy(stitched_logits[covered])
     return stitched_probs, covered
 

@@ -1,86 +1,63 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
-import torch
-
-from ink.core.device import move_batch_to_device
-from ink.core.types import Batch, DataBundle, EvalReport
-from ink.recipes.metrics import MetricBatch, merge_metric_reports
+from ink.core.types import EvalReport, ModelOutputBatch
+from ink.recipes.metrics import merge_metric_reports
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class PatchEval:
     metrics: tuple[Any, ...] = ()
     n_groups: int | None = None
+    _states: tuple[Any, ...] | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "metrics", tuple(self.metrics))
+        self.metrics = tuple(self.metrics)
         if self.n_groups is not None:
-            object.__setattr__(self, "n_groups", int(self.n_groups))
+            self.n_groups = int(self.n_groups)
 
-    def build(self, *, data: DataBundle, runtime=None, stitch=None, logger=None) -> PatchEval:
+    def build(self, *, data, runtime=None, logger=None) -> PatchEval:
         if not self.metrics:
             raise ValueError("PatchEval requires at least one metric")
-        group_counts = dict(getattr(data, "extras", {}) or {}).get("group_counts")
-        metrics = tuple(
-            metric.build(
-                data=data,
-                runtime=runtime,
-                stitch=stitch,
-                logger=logger,
-            )
-            for metric in self.metrics
-        )
+        group_counts = getattr(data, "group_counts", None)
         return replace(
             self,
-            metrics=metrics,
+            metrics=tuple(
+                metric.build(data=data, runtime=runtime, logger=logger)
+                if callable(getattr(metric, "build", None))
+                else metric
+                for metric in self.metrics
+            ),
             n_groups=None if group_counts is None else int(len(group_counts)),
         )
 
-    def evaluate(self, model, val_loader, *, device=None, batch_observer=None) -> EvalReport:
-        if not callable(model):
-            raise TypeError("evaluation model must be callable")
+    def _require_states(self) -> tuple[Any, ...]:
+        states = self._states
+        if states is None:
+            raise ValueError("PatchEval requires begin_epoch() before observe_batch/finalize_epoch")
+        return states
+
+    def begin_epoch(self) -> None:
         if not self.metrics:
             raise ValueError("PatchEval requires at least one metric")
-        if batch_observer is not None and not callable(batch_observer):
-            raise TypeError("batch_observer must be callable")
-        if device is not None and hasattr(model, "to"):
-            model.to(device)
+        self._states = tuple(metric.empty_state(n_groups=self.n_groups) for metric in self.metrics)
 
-        states = [metric.empty_state(n_groups=self.n_groups) for metric in self.metrics]
+    def observe_batch(self, batch: ModelOutputBatch) -> None:
+        if not isinstance(batch, ModelOutputBatch):
+            raise TypeError("PatchEval requires ModelOutputBatch")
+        if batch.targets is None:
+            raise ValueError("patch evaluation requires batch.y")
+        states = self._require_states()
+        shared = {}
+        next_states = []
+        for metric, state in zip(self.metrics, states):
+            next_states.append(metric.update(state, batch, shared=shared))
+        self._states = tuple(next_states)
 
-        was_training = bool(getattr(model, "training", False))
-        if callable(getattr(model, "eval", None)):
-            model.eval()
-
-        try:
-            with torch.inference_mode():
-                for batch in val_loader:
-                    if not isinstance(batch, Batch):
-                        raise TypeError("validation batch must be Batch")
-                    batch = move_batch_to_device(batch, device=device)
-                    if batch.y is None:
-                        raise ValueError("validation batch requires batch.y")
-
-                    logits = model(batch.x)
-                    metric_batch = MetricBatch(
-                        logits=logits,
-                        targets=batch.y,
-                        valid_mask=batch.meta.valid_mask,
-                        group_idx=batch.meta.group_idx,
-                        segment_ids=tuple(batch.meta.segment_ids),
-                        patch_xyxy=batch.meta.patch_xyxy,
-                    )
-                    if batch_observer is not None:
-                        batch_observer(metric_batch)
-                    shared = {}
-                    for idx, metric in enumerate(self.metrics):
-                        states[idx] = metric.update(states[idx], metric_batch, shared=shared)
-        finally:
-            if was_training and callable(getattr(model, "train", None)):
-                model.train()
-
+    def finalize_epoch(self) -> EvalReport:
+        states = self._require_states()
         reports = [metric.finalize(state) for metric, state in zip(self.metrics, states)]
+        self._states = None
         return merge_metric_reports(reports)

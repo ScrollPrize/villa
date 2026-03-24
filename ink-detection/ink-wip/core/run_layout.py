@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 def slugify_name(name: str, *, max_len: int = 80) -> str:
+    """Normalize a user-facing name into a filesystem-safe run slug."""
     slug = re.sub(r"\s+", "_", str(name).strip())
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", slug)
     slug = slug.strip("._-")
@@ -22,6 +23,7 @@ def build_run_id(
     suffix: str | None = None,
     suffix_length: int = 6,
 ) -> str:
+    """Create a dated run id with either a provided suffix or a random one."""
     timestamp = (now or datetime.now()).strftime("%Y-%m-%d")
     run_name = slugify_name(experiment_name)
     run_suffix = slugify_name(suffix, max_len=suffix_length) if suffix is not None else uuid.uuid4().hex[:suffix_length]
@@ -36,6 +38,7 @@ def build_run_dir(
     suffix: str | None = None,
     suffix_length: int = 6,
 ) -> Path:
+    """Return the run directory path for an experiment without creating it."""
     return Path(root) / build_run_id(
         experiment_name,
         now=now,

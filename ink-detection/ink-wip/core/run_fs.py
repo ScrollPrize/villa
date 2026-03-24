@@ -12,6 +12,7 @@ from ink.core.types import EvalReport
 
 
 def to_plain(value: Any) -> Any:
+    """Recursively coerce values into JSON/YAML-friendly Python primitives."""
     if is_dataclass(value):
         return to_plain(asdict(value))
     if isinstance(value, Path):
@@ -63,6 +64,7 @@ def _save_checkpoint(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def load_checkpoint(path: str | Path) -> dict[str, Any]:
+    """Load a checkpoint with torch when available, otherwise fall back to pickle."""
     path = Path(path)
     try:
         import torch  # type: ignore
@@ -105,21 +107,14 @@ class RunFS:
             "artifacts_dir": str(self.artifacts_dir),
         }
 
-    def append_history(self, event: Mapping[str, Any]) -> None:
+    def log_train_epoch(self, epoch: int, components: Mapping[str, Any]) -> None:
+        payload = {
+            "epoch": int(epoch),
+            "split": "train",
+            "components": dict(components),
+        }
         with self.history_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(to_plain(dict(event)), sort_keys=False) + "\n")
-
-    def write_summary(self, summary: Mapping[str, Any]) -> None:
-        _write_yaml(self.summary_path, dict(summary))
-
-    def log_train_epoch(self, epoch: int, metrics: Mapping[str, Any]) -> None:
-        self.append_history(
-            {
-                "epoch": int(epoch),
-                "split": "train",
-                "metrics": dict(metrics),
-            }
-        )
+            handle.write(json.dumps(to_plain(payload), sort_keys=False) + "\n")
 
     def log_eval_epoch(self, epoch: int, report: EvalReport) -> None:
         report_summary = dict(report.summary)
@@ -128,8 +123,9 @@ class RunFS:
             "split": "val",
             "summary": report_summary,
         }
-        self.append_history(payload)
-        self.write_summary(payload)
+        with self.history_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(to_plain(payload), sort_keys=False) + "\n")
+        _write_yaml(self.summary_path, payload)
         _write_yaml(self.eval_dir / "latest.yaml", report_summary)
 
     def save_last(
@@ -141,6 +137,26 @@ class RunFS:
         extra_state: Mapping[str, Any] | None = None,
     ) -> Path:
         path = self.ckpt_dir / "last.pt"
+        _save_checkpoint(
+            path,
+            _checkpoint_payload(
+                model_state=model_state,
+                optimizer_state=optimizer_state,
+                epoch=epoch,
+                extra_state=extra_state,
+            ),
+        )
+        return path
+
+    def save_epoch(
+        self,
+        *,
+        model_state: Any,
+        optimizer_state: Any = None,
+        epoch: int,
+        extra_state: Mapping[str, Any] | None = None,
+    ) -> Path:
+        path = self.ckpt_dir / f"epoch_{int(epoch):04d}.pt"
         _save_checkpoint(
             path,
             _checkpoint_payload(

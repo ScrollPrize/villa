@@ -2,23 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
 import torch
-from scipy import ndimage
 
-
-def binary_mask_to_signed_distance_map(mask, *, dtype=np.float32):
-    mask_np = np.asarray(mask, dtype=np.bool_)
-    if mask_np.ndim != 2:
-        raise ValueError(f"binary_mask_to_signed_distance_map expects a 2D mask, got shape={tuple(mask_np.shape)}")
-    if not bool(mask_np.any()):
-        return np.zeros(mask_np.shape, dtype=dtype)
-
-    negmask = ~mask_np
-    dist_out = ndimage.distance_transform_edt(negmask)
-    dist_in = ndimage.distance_transform_edt(mask_np)
-    signed_dist = dist_out * negmask - (dist_in - 1.0) * mask_np
-    return np.asarray(signed_dist, dtype=dtype)
+from ink.recipes.stitch.artifact_primitives import binary_mask_to_signed_distance_map
 
 
 def compute_binary_boundary_loss(
@@ -55,13 +41,14 @@ class StitchBoundaryLoss:
     def requires_boundary_dist_map(self) -> bool:
         return True
 
-    def compute(self, stitched_logits, _stitched_targets, *, valid_mask, boundary_dist_map=None, **_kwargs):
+    def compute(self, batch):
+        boundary_dist_map = batch.boundary_dist_map
         if boundary_dist_map is None:
             raise RuntimeError("boundary_dist_map is required when StitchBoundaryLoss is enabled")
         boundary_loss = compute_binary_boundary_loss(
-            stitched_logits[None, None],
+            batch.logits[None, None],
             boundary_dist_map[None, None],
-            valid_mask=valid_mask[None, None],
+            valid_mask=batch.valid_mask[None, None],
             reduction_dims=(1, 2, 3),
         )[0]
         return {
