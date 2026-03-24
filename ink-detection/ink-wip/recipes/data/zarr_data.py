@@ -528,6 +528,23 @@ def build_zarr_split_samples(
     def _build_one(segment_id: str):
         log_data_progress(f"[data] {split_name} loading segment={segment_id}")
         mask_names = context.mask_names_for_segment(segment_id)
+        resolved_paths = context.layout.resolve_paths(
+            segment_id,
+            label_suffix=context.label_suffix,
+            mask_suffix=context.mask_suffix,
+            mask_name=mask_names[0],
+        )
+        mask_artifacts = tuple(
+            str(
+                context.layout.resolve_paths(
+                    segment_id,
+                    label_suffix=context.label_suffix,
+                    mask_suffix=context.mask_suffix,
+                    mask_name=current_mask_name,
+                ).mask_path.name
+            )
+            for current_mask_name in mask_names
+        )
         volume = resolve_segment_volume(
             layout=context.layout,
             segments=context.segments,
@@ -545,6 +562,8 @@ def build_zarr_split_samples(
             label_suffix=context.label_suffix,
             mask_suffix=context.mask_suffix,
             mask_names=mask_names,
+            label_artifact=str(resolved_paths.inklabels_path.name),
+            mask_artifacts=mask_artifacts,
             log=log_data_progress,
         )
         if cached_index is None:
@@ -573,6 +592,8 @@ def build_zarr_split_samples(
                 label_suffix=context.label_suffix,
                 mask_suffix=context.mask_suffix,
                 mask_names=mask_names,
+                label_artifact=str(resolved_paths.inklabels_path.name),
+                mask_artifacts=mask_artifacts,
                 xyxys=xyxys,
                 bbox_rows=bbox_rows,
                 sample_bbox_indices=sample_bbox_indices,

@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 import zarr
 
+from ink.recipes.data.zarr_io import resolve_segment_volume
 from ink.recipes.data.zarr_data import (
     ZarrDataContext,
     ZarrPatchDataRecipe,
@@ -18,7 +19,7 @@ from ink.recipes.data.zarr_data import (
 )
 
 _PROGRESS_LOG = logging.getLogger("ink.progress")
-_PATCH_BUNDLE_SCHEMA_VERSION = 1
+_PATCH_BUNDLE_SCHEMA_VERSION = 2
 
 
 def _log(message: str) -> None:
@@ -89,7 +90,7 @@ def _source_fingerprint(*, layout, context: ZarrDataContext, recipe, split_segme
         "schema_version": int(_PATCH_BUNDLE_SCHEMA_VERSION),
         "dataset_root": str(recipe.dataset_root),
         "segments": {
-            str(segment_id): layout.segment_source_fingerprint(
+            str(segment_id): layout.segment_source_metadata_fingerprint(
                 str(segment_id),
                 label_suffix=str(context.label_suffix),
                 mask_suffix=str(context.mask_suffix),
@@ -113,6 +114,36 @@ def _source_fingerprint(*, layout, context: ZarrDataContext, recipe, split_segme
         },
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _segment_specs_for_manifest(*, context: ZarrDataContext, split_segment_ids: tuple[str, ...]) -> list[dict[str, Any]]:
+    segment_specs: list[dict[str, Any]] = []
+    for segment_id in split_segment_ids:
+        volume = resolve_segment_volume(
+            layout=context.layout,
+            segments=context.segments,
+            segment_id=str(segment_id),
+            in_channels=int(context.in_channels),
+            volume_cache=context.volume_cache,
+        )
+        mask_names = context.mask_names_for_segment(segment_id)
+        label_mask_store = context.label_mask_store_cache.get(
+            (str(segment_id), str(context.label_suffix), str(context.mask_suffix), mask_names)
+        )
+        bbox_rows = None
+        if label_mask_store is not None and getattr(label_mask_store, "bbox_rows", None):
+            bbox_rows = [
+                [int(value) for value in row]
+                for row in tuple(getattr(label_mask_store, "bbox_rows") or ())
+            ]
+        segment_specs.append(
+            {
+                "segment_id": str(segment_id),
+                "shape": [int(value) for value in volume.image_shape_hw],
+                "bbox": bbox_rows,
+            }
+        )
+    return segment_specs
 
 
 def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
@@ -247,6 +278,10 @@ class PatchBundleWriter:
                 ),
                 "dataset_root": str(recipe.dataset_root),
                 "segment_ids": [str(segment_id) for segment_id in ordered_segment_ids],
+                "segment_specs": _segment_specs_for_manifest(
+                    context=context,
+                    split_segment_ids=ordered_segment_ids,
+                ),
                 "counts": {
                     "samples": int(len(samples)),
                     "segments": int(len(ordered_segment_ids)),

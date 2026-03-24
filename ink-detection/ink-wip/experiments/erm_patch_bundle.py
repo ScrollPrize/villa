@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from ink.experiments.erm import EXPERIMENT as _ERM_EXPERIMENT
-from ink.recipes.data.patch_bundle import PatchBundleDataRecipe
+from ink.recipes.data.patch_bundle import GeneratedPatchBundleDataRecipe
 
 _BUNDLE_ROOT = ".tmp/patch_bundles/erm"
 _SOURCE_DATA = _ERM_EXPERIMENT.data
@@ -12,8 +12,9 @@ _SOURCE_DATA = _ERM_EXPERIMENT.data
 EXPERIMENT = replace(
     _ERM_EXPERIMENT,
     name="erm_patch_bundle",
-    data=PatchBundleDataRecipe(
+    data=GeneratedPatchBundleDataRecipe(
         bundle_root=_BUNDLE_ROOT,
+        source=_SOURCE_DATA,
         train_batch_size=int(_SOURCE_DATA.train_batch_size),
         valid_batch_size=_SOURCE_DATA.valid_batch_size,
         num_workers=int(_SOURCE_DATA.num_workers),

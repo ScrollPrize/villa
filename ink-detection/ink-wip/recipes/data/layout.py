@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 from pathlib import Path
+import re
 
 from ink.recipes.data.masks import SUPERVISION_MASK_NAME, normalize_mask_names
 
@@ -28,7 +29,14 @@ def resolve_segment_artifact_path(
     required: bool = True,
 ) -> Path:
     segment_dir = Path(segment_dir)
-    path = segment_dir / f"{str(segment_id)}_{str(artifact_name)}{str(suffix)}.zarr"
+    if str(suffix):
+        path = segment_dir / f"{str(segment_id)}_{str(artifact_name)}{str(suffix)}.zarr"
+    else:
+        path = _resolve_latest_segment_artifact_path(
+            segment_dir,
+            segment_id,
+            artifact_name=artifact_name,
+        )
     if required and not path.exists():
         raise FileNotFoundError(
             f"Could not resolve {artifact_name} zarr for {segment_id!r} inside {str(segment_dir)!r}. "
@@ -222,6 +230,44 @@ class NestedZarrLayout:
         mask_names=None,
     ) -> str:
         """Hash the canonical volume, label, and supervision-mask sources for one segment."""
+        return self._segment_source_fingerprint(
+            segment_id,
+            label_suffix=label_suffix,
+            mask_suffix=mask_suffix,
+            mask_name=mask_name,
+            mask_names=mask_names,
+            signature_fn=_path_tree_signature,
+        )
+
+    def segment_source_metadata_fingerprint(
+        self,
+        segment_id: str,
+        *,
+        label_suffix: str = "",
+        mask_suffix: str = "",
+        mask_name: str = SUPERVISION_MASK_NAME,
+        mask_names=None,
+    ) -> str:
+        """Hash only zarr metadata for the canonical volume, label, and mask sources."""
+        return self._segment_source_fingerprint(
+            segment_id,
+            label_suffix=label_suffix,
+            mask_suffix=mask_suffix,
+            mask_name=mask_name,
+            mask_names=mask_names,
+            signature_fn=_zarr_metadata_signature,
+        )
+
+    def _segment_source_fingerprint(
+        self,
+        segment_id: str,
+        *,
+        label_suffix: str = "",
+        mask_suffix: str = "",
+        mask_name: str = SUPERVISION_MASK_NAME,
+        mask_names=None,
+        signature_fn,
+    ) -> str:
         resolved_mask_names = normalize_mask_names(mask_name=mask_name, mask_names=mask_names)
         paths = self.resolve_paths(
             segment_id,
@@ -234,19 +280,47 @@ class NestedZarrLayout:
             ("label_suffix", str(label_suffix)),
             ("mask_suffix", str(mask_suffix)),
             ("mask_names", resolved_mask_names),
-            ("volume", _path_tree_signature(paths.volume_path)),
-            ("inklabels", _path_tree_signature(paths.inklabels_path)),
+            ("volume", signature_fn(paths.volume_path)),
+            ("inklabels", signature_fn(paths.inklabels_path)),
             (
                 "masks",
                 self._mask_signature_payload(
                     segment_id,
                     mask_suffix=mask_suffix,
                     mask_names=resolved_mask_names,
-                    signature_fn=_path_tree_signature,
+                    signature_fn=signature_fn,
                 ),
             ),
         )
         return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
+
+
+def _resolve_latest_segment_artifact_path(
+    segment_dir: Path,
+    segment_id: str,
+    *,
+    artifact_name: str,
+) -> Path:
+    segment_id = str(segment_id)
+    artifact_name = str(artifact_name)
+    exact_name = f"{segment_id}_{artifact_name}.zarr"
+    version_pattern = re.compile(
+        rf"^{re.escape(segment_id)}_{re.escape(artifact_name)}_v(?P<version>\d+)\.zarr$"
+    )
+
+    best_path = segment_dir / exact_name
+    best_version = 0 if best_path.exists() else -1
+    for candidate in segment_dir.iterdir():
+        if not candidate.is_dir():
+            continue
+        match = version_pattern.match(candidate.name)
+        if match is None:
+            continue
+        version = int(match.group("version"))
+        if version > best_version:
+            best_path = candidate
+            best_version = version
+    return best_path
 
 
 def _hash_file_contents(path: Path) -> str:
