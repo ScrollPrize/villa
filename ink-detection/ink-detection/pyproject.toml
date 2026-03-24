@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ink-detection"
+version = "0.1.0"
+description = "Standalone ink-detection rewrite package."
+requires-python = ">=3.10"
+dependencies = [
+    "torch==2.10.0",
+    "torchvision==0.25.0",
+    "timm==1.0.25",
+    "numpy==2.4.3",
+    "scipy==1.17.1",
+    "zarr==2.18.7",
+    "numcodecs==0.15.1",
+    "albumentations==2.0.8",
+    "opencv-contrib-python-headless==4.11.0.86",
+    "pillow==12.1.1",
+    "PyYAML==6.0.3",
+    "wandb==0.25.1",
+    "tqdm==4.67.3",
+]
+
+[project.optional-dependencies]
+topology = ["topolosses==0.2.0"]
+
+[tool.setuptools.packages.find]
+include = ["ink*", "tests*"]
