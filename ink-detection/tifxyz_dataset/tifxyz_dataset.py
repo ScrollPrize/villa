@@ -199,6 +199,21 @@ class TifxyzInkDataset(Dataset):
             .cpu()
             .numpy()
         )
+
+        # Recompute in_patch from augmented local_grid so downstream
+        # geometry_valid_src does not include points that moved outside
+        # the crop, which would corrupt the weighted resize and cause
+        # surface-target / surface-valid misalignment.
+        aug_local = augmented_grid["local_grid"]
+        crop_size_tuple = tuple(
+            int(v) for v in sampled_grid.get("crop_size", self.patch_size_zyx)
+        )
+        in_bounds = np.isfinite(aug_local).all(axis=-1)
+        for axis in range(3):
+            in_bounds &= aug_local[..., axis] >= 0.0
+            in_bounds &= aug_local[..., axis] < float(crop_size_tuple[axis])
+        augmented_grid["in_patch"] = sampled_grid["valid_interp"] & in_bounds
+
         return augmented["image"][0].to(dtype=torch.float32).cpu(), augmented_grid
 
     @staticmethod
@@ -311,7 +326,7 @@ class TifxyzInkDataset(Dataset):
             np.stack(
                 [
                     np.asarray(
-                        (class_codes == 1) & geometry_valid_src,
+                        (class_codes == 1) & supervision_valid_src,
                         dtype=np.float32,
                     ),
                     np.asarray(supervision_valid_src, dtype=np.float32),
@@ -343,7 +358,16 @@ class TifxyzInkDataset(Dataset):
             & sampled_grid["valid_interp"]
             & sampled_grid["normals_valid"]
         )
-        supervision_valid_src = geometry_valid_src & (sampled_grid["class_codes"] != 100)
+        # Labels are spatial properties and should not be gated by normals
+        # validity.  Normals can be invalid at boundary grid points where
+        # tangent vectors cannot be computed, but ink/supervision labels are
+        # still meaningful there.  Using the broader mask lets the label
+        # signal from normals-invalid positions leak into nearby
+        # normals-valid positions during bilinear resize, preventing
+        # patches whose positive labels cluster near the valid-geometry
+        # boundary from being falsely rejected.
+        label_valid_src = sampled_grid["in_patch"] & sampled_grid["valid_interp"]
+        supervision_valid_src = label_valid_src & (sampled_grid["class_codes"] != 100)
 
         (
             surface_points_zyx,
