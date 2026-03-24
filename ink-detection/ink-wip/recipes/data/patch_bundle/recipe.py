@@ -11,7 +11,7 @@ import zarr
 from ink.core.types import DataBundle
 from ink.recipes.data.normalization import ClipMaxDiv255Normalization
 from ink.recipes.data.patch_bundle.writer import load_patch_bundle_manifest
-from ink.recipes.data.samplers import GroupBalancedSampler, GroupStratifiedSampler, ShuffleSampler
+from ink.recipes.data.samplers import ShuffleSampler
 from ink.recipes.data.transforms import (
     apply_eval_sample_transforms,
     apply_train_sample_transforms,
@@ -19,9 +19,7 @@ from ink.recipes.data.transforms import (
 )
 from ink.recipes.data.zarr_data import (
     build_patch_data_bundle,
-    collate_grouped_batch,
     collate_patch_batch,
-    count_group_idxs,
 )
 
 
@@ -64,6 +62,7 @@ class PatchBundleDataset(Dataset):
         self._valid_mask = store["valid_mask"]
         self._xyxy = store["xyxy"]
         self._segment_index = store["segment_index"]
+        self._group_idx = store["group_idx"] if "group_idx" in store else None
         self.transform = build_joint_transform(
             self.split,
             augment=self.augment,
@@ -71,6 +70,12 @@ class PatchBundleDataset(Dataset):
             patch_size=self.patch_size,
             in_channels=self.in_channels,
         )
+
+    @property
+    def sample_groups(self) -> list[int]:
+        if self._group_idx is None:
+            raise ValueError("patch bundle does not provide group_idx")
+        return [int(np.asarray(self._group_idx[idx]).item()) for idx in range(len(self))]
 
     def __len__(self) -> int:
         return int(self._x.shape[0])
@@ -104,22 +109,8 @@ class PatchBundleDataset(Dataset):
                 transform=self.transform,
                 valid_mask=valid_mask,
             )
-        return image, label, valid_mask, xyxy, segment_id
-
-
-class GroupedPatchBundleDataset(PatchBundleDataset):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        if "group_idx" not in self._store:
-            raise ValueError("grouped patch bundle requires group_idx array")
-        self._group_idx = self._store["group_idx"]
-
-    @property
-    def sample_groups(self) -> list[int]:
-        return [int(np.asarray(self._group_idx[idx]).item()) for idx in range(len(self))]
-
-    def __getitem__(self, idx):
-        image, label, valid_mask, xyxy, segment_id = super().__getitem__(int(idx))
+        if self._group_idx is None:
+            return image, label, valid_mask, xyxy, segment_id
         return image, label, valid_mask, xyxy, segment_id, int(np.asarray(self._group_idx[int(idx)]).item())
 
 
@@ -137,14 +128,7 @@ class PatchBundleDataRecipe:
     def _load_manifests(self) -> tuple[dict[str, Any], dict[str, Any]]:
         train_manifest = load_patch_bundle_manifest(self.bundle_root, split="train")
         valid_manifest = load_patch_bundle_manifest(self.bundle_root, split="valid")
-        self._validate_recipe_family(train_manifest)
-        self._validate_recipe_family(valid_manifest)
         return train_manifest, valid_manifest
-
-    def _validate_recipe_family(self, manifest: dict[str, Any]) -> None:
-        family = str(manifest.get("recipe_family"))
-        if family != "patch":
-            raise ValueError(f"PatchBundleDataRecipe requires recipe_family='patch', got {family!r}")
 
     def _validate_split_contract(self, train_manifest: dict[str, Any], valid_manifest: dict[str, Any]) -> tuple[int, int]:
         train_in_channels = int(_manifest_value(train_manifest, "extraction", "in_channels"))
@@ -168,6 +152,11 @@ class PatchBundleDataRecipe:
 
         valid_batch_size = self.train_batch_size if self.valid_batch_size is None else self.valid_batch_size
         extras = dict(self.extras or {})
+        group_counts = extras.pop("group_counts", None)
+        if group_counts is not None:
+            group_counts = [int(value) for value in group_counts]
+            if not group_counts:
+                group_counts = None
         normalization_stats = extras.pop("normalization_stats", None)
         if normalization_stats is None:
             normalization_stats = dict(train_manifest.get("normalization_stats") or {})
@@ -180,11 +169,17 @@ class PatchBundleDataRecipe:
             "normalization": normalization,
         }
         train_dataset = PatchBundleDataset(split="train", **dataset_kwargs)
-        val_dataset = PatchBundleDataset(split="valid", **dataset_kwargs)
+        valid_dataset = PatchBundleDataset(split="valid", **dataset_kwargs)
+        if group_counts is None:
+            manifest_group_counts = train_manifest.get("group_counts")
+            if manifest_group_counts is not None:
+                group_counts = [int(value) for value in manifest_group_counts]
+                if not group_counts:
+                    group_counts = None
         num_workers = max(0, int(self.num_workers))
         return build_patch_data_bundle(
             train_dataset=train_dataset,
-            eval_dataset=val_dataset,
+            valid_dataset=valid_dataset,
             train_batch_size=int(self.train_batch_size),
             valid_batch_size=int(valid_batch_size),
             num_workers=num_workers,
@@ -193,67 +188,12 @@ class PatchBundleDataRecipe:
             collate_fn=collate_patch_batch,
             in_channels=int(in_channels),
             augment_recipe=augment_recipe,
-            group_counts=None,
-            extras=extras,
-        )
-
-
-@dataclass(frozen=True)
-class GroupedPatchBundleDataRecipe(PatchBundleDataRecipe):
-    sampler: ShuffleSampler | GroupBalancedSampler | GroupStratifiedSampler = field(default_factory=ShuffleSampler)
-
-    def _validate_recipe_family(self, manifest) -> None:
-        family = str(manifest.get("recipe_family"))
-        if family != "grouped_patch":
-            raise ValueError(f"GroupedPatchBundleDataRecipe requires recipe_family='grouped_patch', got {family!r}")
-
-    def build(self, *, runtime=None, augment=None) -> DataBundle:
-        assert augment is not None
-        train_manifest, valid_manifest = self._load_manifests()
-        in_channels, patch_size = self._validate_split_contract(train_manifest, valid_manifest)
-
-        valid_batch_size = self.train_batch_size if self.valid_batch_size is None else self.valid_batch_size
-        extras = dict(self.extras or {})
-        normalization_stats = extras.pop("normalization_stats", None)
-        if normalization_stats is None:
-            normalization_stats = dict(train_manifest.get("normalization_stats") or {})
-        normalization = self.normalization.build(normalization_stats=normalization_stats)
-        augment_recipe = augment.build(patch_size=patch_size, runtime=runtime)
-
-        dataset_kwargs = {
-            "bundle_root": Path(self.bundle_root).expanduser().resolve(),
-            "augment": augment_recipe,
-            "normalization": normalization,
-        }
-        train_dataset = GroupedPatchBundleDataset(split="train", **dataset_kwargs)
-        val_dataset = GroupedPatchBundleDataset(split="valid", **dataset_kwargs)
-        manifest_group_counts = train_manifest.get("group_counts")
-        if manifest_group_counts is None:
-            group_counts = count_group_idxs(train_dataset.sample_groups)
-        else:
-            group_counts = [int(value) for value in manifest_group_counts]
-            if not group_counts:
-                group_counts = None
-
-        return build_patch_data_bundle(
-            train_dataset=train_dataset,
-            eval_dataset=val_dataset,
-            train_batch_size=int(self.train_batch_size),
-            valid_batch_size=int(valid_batch_size),
-            num_workers=max(0, int(self.num_workers)),
-            shuffle=bool(self.shuffle),
-            sampler=self.sampler,
-            collate_fn=collate_grouped_batch,
-            in_channels=int(in_channels),
-            augment_recipe=augment_recipe,
             group_counts=group_counts,
             extras=extras,
         )
 
 
 __all__ = [
-    "GroupedPatchBundleDataRecipe",
-    "GroupedPatchBundleDataset",
     "PatchBundleDataRecipe",
     "PatchBundleDataset",
 ]

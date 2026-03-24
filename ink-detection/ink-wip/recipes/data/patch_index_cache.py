@@ -39,6 +39,7 @@ def _cache_metadata(
     stride: int,
     label_suffix: str,
     mask_suffix: str,
+    mask_names,
 ) -> dict[str, object]:
     return {
         "schema_version": int(_PATCH_INDEX_CACHE_SCHEMA_VERSION),
@@ -49,6 +50,7 @@ def _cache_metadata(
         "stride": int(stride),
         "label_suffix": str(label_suffix),
         "mask_suffix": str(mask_suffix),
+        "mask_names": [str(mask_name) for mask_name in tuple(mask_names or ())],
     }
 
 
@@ -93,6 +95,7 @@ def load_cached_patch_index(
     stride: int,
     label_suffix: str,
     mask_suffix: str,
+    mask_names,
     log=None,
 ) -> CachedPatchIndex | None:
     if cache_dir is None:
@@ -105,6 +108,7 @@ def load_cached_patch_index(
         stride=stride,
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
+        mask_names=mask_names,
     )
     base_path = _cache_file_path(cache_dir, metadata=metadata)
     metadata_path = base_path.with_suffix(".json")
@@ -162,6 +166,7 @@ def save_cached_patch_index(
     stride: int,
     label_suffix: str,
     mask_suffix: str,
+    mask_names,
     xyxys: np.ndarray,
     bbox_rows: np.ndarray,
     sample_bbox_indices: np.ndarray,
@@ -176,6 +181,7 @@ def save_cached_patch_index(
         stride=stride,
         label_suffix=label_suffix,
         mask_suffix=mask_suffix,
+        mask_names=mask_names,
     )
     base_path = _cache_file_path(cache_dir, metadata=metadata)
     _save_json_atomic(base_path.with_suffix(".json"), payload=metadata)

@@ -5,7 +5,8 @@ from typing import Any
 import numpy as np
 import zarr
 
-from ink.recipes.data.layout import NestedZarrLayout
+from ink.recipes.data.layout import NestedZarrLayout, resolve_segment_artifact_path
+from ink.recipes.data.masks import normalize_mask_names
 
 
 def parse_layer_range_value(layer_range, *, context: str, total_layers: int | None = None) -> tuple[int, int]:
@@ -64,13 +65,13 @@ def _segment_array_path(
     required: bool = True,
 ):
     segment_dir = layout.resolve_segment_dir(segment_id)
-    path = segment_dir / f"{str(segment_id)}_{str(array_name)}{str(suffix)}.zarr"
-    if required and not path.exists():
-        raise FileNotFoundError(
-            f"Could not resolve {array_name} zarr for {segment_id!r} inside {str(segment_dir)!r}. "
-            f"Expected {str(path)!r}."
-        )
-    return path
+    return resolve_segment_artifact_path(
+        segment_dir,
+        segment_id,
+        artifact_name=array_name,
+        suffix=suffix,
+        required=required,
+    )
 
 
 def _image_hw(image_shape_hw) -> tuple[int, int]:
@@ -132,6 +133,17 @@ def _as_uint8(array) -> np.ndarray:
     return array
 
 
+def _combine_masks(mask_names, *, load_mask) -> np.ndarray | None:
+    combined_mask = None
+    for current_mask_name in mask_names:
+        current_mask = load_mask(current_mask_name)
+        if current_mask is None:
+            return None
+        current_mask = _as_uint8(current_mask)
+        combined_mask = current_mask if combined_mask is None else np.maximum(combined_mask, current_mask)
+    return None if combined_mask is None else np.asarray(combined_mask, dtype=np.uint8)
+
+
 def _read_clipped_xy_region(array, bbox, *, image_shape_hw) -> np.ndarray:
     y0, y1, x0, x1 = _clip_bbox_to_image(bbox, image_shape_hw=image_shape_hw)
     if y1 <= y0 or x1 <= x0:
@@ -145,16 +157,22 @@ def read_supervision_mask_for_shape(
     image_shape_hw,
     *,
     mask_suffix: str = "",
+    mask_names,
 ) -> np.ndarray:
     """Load the full-resolution supervision mask after validating its XY shape."""
-    supervision_mask_array = _open_validated_xy_array(
-        layout,
-        segment_id,
-        image_shape_hw,
-        array_name="supervision_mask",
-        suffix=mask_suffix,
+    combined_mask = _combine_masks(
+        normalize_mask_names(mask_names=mask_names),
+        load_mask=lambda current_mask_name: _read_xy_array(
+            _open_validated_xy_array(
+                layout,
+                segment_id,
+                image_shape_hw,
+                array_name=current_mask_name,
+                suffix=mask_suffix,
+            )
+        ),
     )
-    return _as_uint8(_read_xy_array(supervision_mask_array))
+    return np.asarray(combined_mask, dtype=np.uint8)
 
 
 def read_optional_supervision_mask_for_shape(
@@ -163,19 +181,27 @@ def read_optional_supervision_mask_for_shape(
     image_shape_hw,
     *,
     mask_suffix: str = "",
+    mask_names,
 ) -> np.ndarray | None:
     """Load a full-resolution supervision mask if present, otherwise return None."""
-    supervision_mask_array = _open_validated_xy_array(
-        layout,
-        segment_id,
-        image_shape_hw,
-        array_name="supervision_mask",
-        suffix=mask_suffix,
-        required=False,
+    return _combine_masks(
+        normalize_mask_names(mask_names=mask_names),
+        load_mask=lambda current_mask_name: (
+            None
+            if (
+                supervision_mask_array := _open_validated_xy_array(
+                    layout,
+                    segment_id,
+                    image_shape_hw,
+                    array_name=current_mask_name,
+                    suffix=mask_suffix,
+                    required=False,
+                )
+            )
+            is None
+            else _read_xy_array(supervision_mask_array)
+        ),
     )
-    if supervision_mask_array is None:
-        return None
-    return _as_uint8(_read_xy_array(supervision_mask_array))
 
 
 def read_label_and_supervision_mask_region(
@@ -186,6 +212,7 @@ def read_label_and_supervision_mask_region(
     *,
     label_suffix: str = "",
     mask_suffix: str = "",
+    mask_names,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Load a clipped label/mask window, returning empty arrays for empty regions."""
     label_array = _open_validated_xy_array(
@@ -195,16 +222,23 @@ def read_label_and_supervision_mask_region(
         array_name="inklabels",
         suffix=label_suffix,
     )
-    supervision_mask_array = _open_validated_xy_array(
-        layout,
-        segment_id,
-        image_shape_hw,
-        array_name="supervision_mask",
-        suffix=mask_suffix,
+    combined_mask = _combine_masks(
+        normalize_mask_names(mask_names=mask_names),
+        load_mask=lambda current_mask_name: _read_clipped_xy_region(
+            _open_validated_xy_array(
+                layout,
+                segment_id,
+                image_shape_hw,
+                array_name=current_mask_name,
+                suffix=mask_suffix,
+            ),
+            bbox,
+            image_shape_hw=image_shape_hw,
+        ),
     )
     return (
         _read_clipped_xy_region(label_array, bbox, image_shape_hw=image_shape_hw),
-        _read_clipped_xy_region(supervision_mask_array, bbox, image_shape_hw=image_shape_hw),
+        np.asarray(combined_mask, dtype=np.uint8),
     )
 
 
@@ -234,16 +268,24 @@ def read_supervision_mask_region(
     bbox,
     *,
     mask_suffix: str = "",
+    mask_names,
 ) -> np.ndarray:
     """Load a clipped supervision-mask window, returning an empty array for empty regions."""
-    supervision_mask_array = _open_validated_xy_array(
-        layout,
-        segment_id,
-        image_shape_hw,
-        array_name="supervision_mask",
-        suffix=mask_suffix,
+    combined_mask = _combine_masks(
+        normalize_mask_names(mask_names=mask_names),
+        load_mask=lambda current_mask_name: _read_clipped_xy_region(
+            _open_validated_xy_array(
+                layout,
+                segment_id,
+                image_shape_hw,
+                array_name=current_mask_name,
+                suffix=mask_suffix,
+            ),
+            bbox,
+            image_shape_hw=image_shape_hw,
+        ),
     )
-    return _read_clipped_xy_region(supervision_mask_array, bbox, image_shape_hw=image_shape_hw)
+    return np.asarray(combined_mask, dtype=np.uint8)
 
 
 def _from_uint16_to_uint8(array: np.ndarray, *, segment_id: str) -> np.ndarray:
@@ -376,6 +418,7 @@ class ZarrSegmentLabelMaskStore:
         image_shape_hw: tuple[int, int],
         label_suffix: str = "",
         mask_suffix: str = "",
+        mask_names,
         bbox_rows=(),
     ):
         self.layout = layout
@@ -383,6 +426,8 @@ class ZarrSegmentLabelMaskStore:
         self.image_shape_hw = (int(image_shape_hw[0]), int(image_shape_hw[1]))
         self.label_suffix = str(label_suffix)
         self.mask_suffix = str(mask_suffix)
+        self.mask_names = normalize_mask_names(mask_names=mask_names)
+        self.mask_name = self.mask_names[-1]
         self.bbox_rows = self._normalize_bbox_rows(bbox_rows)
         self._label_bbox_cache: dict[int, np.ndarray] = {}
         self._bbox_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
@@ -432,6 +477,7 @@ class ZarrSegmentLabelMaskStore:
                 bbox,
                 label_suffix=self.label_suffix,
                 mask_suffix=self.mask_suffix,
+                mask_names=self.mask_names,
             )
             self._bbox_cache[int(bbox_index)] = cached
         return cached
@@ -472,6 +518,7 @@ class ZarrSegmentLabelMaskStore:
                 (int(y1), int(y2), int(x1), int(x2)),
                 label_suffix=self.label_suffix,
                 mask_suffix=self.mask_suffix,
+                mask_names=self.mask_names,
             )
         bbox_index, local_y1, local_y2, local_x1, local_x2 = bbox_query
         label_crop, supervision_crop = self._label_and_mask_bbox_crops(bbox_index)
@@ -561,10 +608,12 @@ def resolve_segment_label_mask_store(
     image_shape_hw: tuple[int, int],
     label_suffix: str,
     mask_suffix: str,
+    mask_names,
     label_mask_store_cache: dict[Any, ZarrSegmentLabelMaskStore],
     bbox_rows=(),
 ) -> ZarrSegmentLabelMaskStore:
-    cache_key = (str(segment_id), str(label_suffix), str(mask_suffix))
+    resolved_mask_names = normalize_mask_names(mask_names=mask_names)
+    cache_key = (str(segment_id), str(label_suffix), str(mask_suffix), resolved_mask_names)
     label_mask_store = label_mask_store_cache.get(cache_key)
     if label_mask_store is None:
         label_mask_store = ZarrSegmentLabelMaskStore(
@@ -573,6 +622,7 @@ def resolve_segment_label_mask_store(
             image_shape_hw=image_shape_hw,
             label_suffix=label_suffix,
             mask_suffix=mask_suffix,
+            mask_names=resolved_mask_names,
             bbox_rows=bbox_rows,
         )
         label_mask_store_cache[cache_key] = label_mask_store

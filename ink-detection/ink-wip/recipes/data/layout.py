@@ -4,12 +4,37 @@ from dataclasses import dataclass, field
 import hashlib
 from pathlib import Path
 
+from ink.recipes.data.masks import SUPERVISION_MASK_NAME, normalize_mask_names
+
+
 @dataclass(frozen=True)
 class SegmentPaths:
     segment_dir: Path
     volume_path: Path
     inklabels_path: Path
-    supervision_mask_path: Path
+    mask_path: Path
+
+    @property
+    def supervision_mask_path(self) -> Path:
+        return self.mask_path
+
+
+def resolve_segment_artifact_path(
+    segment_dir: str | Path,
+    segment_id: str,
+    *,
+    artifact_name: str,
+    suffix: str = "",
+    required: bool = True,
+) -> Path:
+    segment_dir = Path(segment_dir)
+    path = segment_dir / f"{str(segment_id)}_{str(artifact_name)}{str(suffix)}.zarr"
+    if required and not path.exists():
+        raise FileNotFoundError(
+            f"Could not resolve {artifact_name} zarr for {segment_id!r} inside {str(segment_dir)!r}. "
+            f"Expected {str(path)!r}."
+        )
+    return path
 
 
 @dataclass(frozen=True)
@@ -61,6 +86,7 @@ class NestedZarrLayout:
         *,
         label_suffix: str = "",
         mask_suffix: str = "",
+        mask_name: str = SUPERVISION_MASK_NAME,
     ) -> SegmentPaths:
         """Resolve the canonical volume, label, and mask paths for one segment."""
         segment_id = str(segment_id).strip()
@@ -72,25 +98,48 @@ class NestedZarrLayout:
                 f"Expected {str(volume_path)!r}."
             )
 
-        inklabels_path = segment_dir / f"{segment_id}_inklabels{str(label_suffix)}.zarr"
-        if not inklabels_path.exists():
-            raise FileNotFoundError(
-                f"Could not resolve inklabels zarr for {segment_id!r} inside {str(segment_dir)!r}. "
-                f"Expected {str(inklabels_path)!r}."
-            )
-
-        supervision_mask_path = segment_dir / f"{segment_id}_supervision_mask{str(mask_suffix)}.zarr"
-        if not supervision_mask_path.exists():
-            raise FileNotFoundError(
-                f"Could not resolve supervision_mask zarr for {segment_id!r} inside {str(segment_dir)!r}. "
-                f"Expected {str(supervision_mask_path)!r}."
-            )
+        inklabels_path = resolve_segment_artifact_path(
+            segment_dir,
+            segment_id,
+            artifact_name="inklabels",
+            suffix=label_suffix,
+        )
+        mask_path = resolve_segment_artifact_path(
+            segment_dir,
+            segment_id,
+            artifact_name=mask_name,
+            suffix=mask_suffix,
+        )
 
         return SegmentPaths(
             segment_dir=Path(segment_dir),
             volume_path=volume_path,
             inklabels_path=inklabels_path,
-            supervision_mask_path=supervision_mask_path,
+            mask_path=mask_path,
+        )
+
+    def _mask_signature_payload(
+        self,
+        segment_id: str,
+        *,
+        mask_suffix: str,
+        mask_names,
+        signature_fn,
+    ) -> tuple[tuple[str, object], ...]:
+        segment_dir = self.resolve_segment_dir(segment_id)
+        return tuple(
+            (
+                str(current_mask_name),
+                signature_fn(
+                    resolve_segment_artifact_path(
+                        segment_dir,
+                        segment_id,
+                        artifact_name=current_mask_name,
+                        suffix=mask_suffix,
+                    )
+                ),
+            )
+            for current_mask_name in mask_names
         )
 
     def label_mask_fingerprint(
@@ -99,19 +148,32 @@ class NestedZarrLayout:
         *,
         label_suffix: str = "",
         mask_suffix: str = "",
+        mask_name: str = SUPERVISION_MASK_NAME,
+        mask_names=None,
     ) -> str:
         """Hash label and supervision-mask contents so caches can detect dataset changes."""
+        resolved_mask_names = normalize_mask_names(mask_name=mask_name, mask_names=mask_names)
         paths = self.resolve_paths(
             segment_id,
             label_suffix=label_suffix,
             mask_suffix=mask_suffix,
+            mask_name=resolved_mask_names[0],
         )
         payload = (
             ("segment_id", str(segment_id)),
             ("label_suffix", str(label_suffix)),
             ("mask_suffix", str(mask_suffix)),
+            ("mask_names", resolved_mask_names),
             ("inklabels", _path_tree_signature(paths.inklabels_path)),
-            ("supervision_mask", _path_tree_signature(paths.supervision_mask_path)),
+            (
+                "masks",
+                self._mask_signature_payload(
+                    segment_id,
+                    mask_suffix=mask_suffix,
+                    mask_names=resolved_mask_names,
+                    signature_fn=_path_tree_signature,
+                ),
+            ),
         )
         return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
 
@@ -121,19 +183,32 @@ class NestedZarrLayout:
         *,
         label_suffix: str = "",
         mask_suffix: str = "",
+        mask_name: str = SUPERVISION_MASK_NAME,
+        mask_names=None,
     ) -> str:
         """Hash only zarr metadata files for label and supervision-mask sources."""
+        resolved_mask_names = normalize_mask_names(mask_name=mask_name, mask_names=mask_names)
         paths = self.resolve_paths(
             segment_id,
             label_suffix=label_suffix,
             mask_suffix=mask_suffix,
+            mask_name=resolved_mask_names[0],
         )
         payload = (
             ("segment_id", str(segment_id)),
             ("label_suffix", str(label_suffix)),
             ("mask_suffix", str(mask_suffix)),
+            ("mask_names", resolved_mask_names),
             ("inklabels", _zarr_metadata_signature(paths.inklabels_path)),
-            ("supervision_mask", _zarr_metadata_signature(paths.supervision_mask_path)),
+            (
+                "masks",
+                self._mask_signature_payload(
+                    segment_id,
+                    mask_suffix=mask_suffix,
+                    mask_names=resolved_mask_names,
+                    signature_fn=_zarr_metadata_signature,
+                ),
+            ),
         )
         return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
 
@@ -143,20 +218,33 @@ class NestedZarrLayout:
         *,
         label_suffix: str = "",
         mask_suffix: str = "",
+        mask_name: str = SUPERVISION_MASK_NAME,
+        mask_names=None,
     ) -> str:
         """Hash the canonical volume, label, and supervision-mask sources for one segment."""
+        resolved_mask_names = normalize_mask_names(mask_name=mask_name, mask_names=mask_names)
         paths = self.resolve_paths(
             segment_id,
             label_suffix=label_suffix,
             mask_suffix=mask_suffix,
+            mask_name=resolved_mask_names[0],
         )
         payload = (
             ("segment_id", str(segment_id)),
             ("label_suffix", str(label_suffix)),
             ("mask_suffix", str(mask_suffix)),
+            ("mask_names", resolved_mask_names),
             ("volume", _path_tree_signature(paths.volume_path)),
             ("inklabels", _path_tree_signature(paths.inklabels_path)),
-            ("supervision_mask", _path_tree_signature(paths.supervision_mask_path)),
+            (
+                "masks",
+                self._mask_signature_payload(
+                    segment_id,
+                    mask_suffix=mask_suffix,
+                    mask_names=resolved_mask_names,
+                    signature_fn=_path_tree_signature,
+                ),
+            ),
         )
         return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
 
@@ -223,4 +311,4 @@ def _path_tree_signature(path: Path) -> tuple[str, int, int, str]:
         digest.hexdigest(),
     )
 
-__all__ = ["NestedZarrLayout", "SegmentPaths"]
+__all__ = ["NestedZarrLayout", "SegmentPaths", "resolve_segment_artifact_path"]
