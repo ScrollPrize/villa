@@ -79,7 +79,7 @@ First one roughly positions the moving source using the following commands:
 
 Next, landmark points are added to each source based on visual features.
 These refine the transform.
-After there are 4+ pairs of landmark points, the transform is automatically fit to the landmark points each time a point pair is added.
+After there are sufficient pairs of landmark points (4+ in unconstrained mode, 3+ in constrained mode), the transform is automatically fit to the landmark points each time a point pair is added.
 
 - `Alt + 1` - Add landmark point to fixed volume at cursor position
 - `Alt + 2` - Add landmark point to moving volume at cursor position
@@ -107,6 +107,13 @@ After the transform is fit from landmarks, a **landmark errors** layer appears i
 - `Alt + Shift + ]` - Navigate to the landmark with the largest error
 
 This is useful for identifying landmarks that may need adjustment, or for spotting regions where a non-affine transform might be needed.
+
+#### Constrained fit mode
+
+By default, landmark fitting uses an unconstrained 12 DOF affine (requires 4+ point pairs). For volumes that share physical constraints — roughly aligned z-axis, isotropic scaling, rotation mainly around z — a **constrained fit mode** is available that fits only 5 continuous parameters: isotropic scale, z-rotation angle, and 3D translation. It additionally tries all 8 axis flip combinations (independent ±1 on each axis) and picks the best. This requires only 3+ point pairs.
+
+- `m` - Toggle between constrained and unconstrained fit mode
+- `--constrained-fit` - Start in constrained fit mode
 
 #### Automatically refining the transform
 > **_NOTE:_**  Not particularly recommended, as the current implementation uses low-resolution levels of the Zarr input volumes, and does not result in precise transforms.

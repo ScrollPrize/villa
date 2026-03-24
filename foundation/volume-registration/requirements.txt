@@ -32,6 +32,7 @@ referencing==0.36.2
 requests==2.32.4
 rpds-py==0.27.0
 rsa==4.9.1
+scipy==1.15.3
 simpleitk==2.5.2
 six==1.17.0
 tornado==6.5.1
