@@ -5,7 +5,6 @@ from pathlib import Path
 
 import fsspec
 import numpy as np
-import tifffile
 import zarr
 from numba import njit
 from vesuvius.image_proc.intensity.normalization import normalize_robust
@@ -115,71 +114,6 @@ def label_version_cache_token(label_version):
     if label_version in (None, ""):
         return "auto"
     return str(label_version).strip()
-
-def to_uint8_image(image_2d):
-    image_2d = np.nan_to_num(np.asarray(image_2d, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-    min_value = float(image_2d.min())
-    max_value = float(image_2d.max())
-    if max_value > min_value:
-        image_2d = (image_2d - min_value) / (max_value - min_value)
-    else:
-        image_2d = np.zeros_like(image_2d, dtype=np.float32)
-    return np.clip(np.rint(image_2d * 255.0), 0, 255).astype(np.uint8)
-
-def to_uint8_label(label_2d, ignore_mask_2d=None):
-    label_2d = np.asarray(label_2d, dtype=np.float32)
-    label_vis = np.zeros(label_2d.shape, dtype=np.uint8)
-    if ignore_mask_2d is not None:
-        ignore_mask_2d = np.asarray(ignore_mask_2d, dtype=np.float32) > 0
-        label_vis[ignore_mask_2d] = 127
-    label_vis[label_2d == 0] = 0
-    label_vis[label_2d > 0] = 255
-    if ignore_mask_2d is not None:
-        label_vis[ignore_mask_2d] = 127
-    return label_vis
-
-def to_uint8_probability(probability_2d, lower_percentile=1.0, upper_percentile=99.0):
-    probability_2d = np.nan_to_num(np.asarray(probability_2d, dtype=np.float32), nan=0.0, posinf=1.0, neginf=0.0)
-    probability_2d = np.clip(probability_2d, 0.0, 1.0)
-    lo = float(np.percentile(probability_2d, lower_percentile))
-    hi = float(np.percentile(probability_2d, upper_percentile))
-    if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
-        probability_2d = np.clip(probability_2d, lo, hi)
-        probability_2d = (probability_2d - lo) / (hi - lo)
-    return np.clip(np.rint(probability_2d * 255.0), 0, 255).astype(np.uint8)
-
-def build_preview_montage(input_tiles, label_tiles, probability_tiles, gap_size=4):
-    if not input_tiles:
-        return None
-
-    rows = []
-    for input_tile, label_tile, probability_tile in zip(input_tiles, label_tiles, probability_tiles):
-        column_gap = np.zeros((input_tile.shape[0], gap_size), dtype=np.uint8)
-        rows.append(
-            np.concatenate(
-                [input_tile, column_gap, label_tile, column_gap, probability_tile],
-                axis=1,
-            )
-        )
-
-    row_gap = np.zeros((gap_size, rows[0].shape[1]), dtype=np.uint8)
-    montage = []
-    for row_idx, row in enumerate(rows):
-        if row_idx > 0:
-            montage.append(row_gap)
-        montage.append(row)
-    return np.concatenate(montage, axis=0)
-
-def save_val_preview_tif(output_path, input_tiles, label_tiles, probability_tiles, gap_size=4):
-    montage = build_preview_montage(
-        input_tiles,
-        label_tiles,
-        probability_tiles,
-        gap_size=gap_size,
-    )
-    if montage is None:
-        return
-    tifffile.imwrite(output_path, montage, compression="lzw")
 
 def _normalize_patch_size_zyx(patch_size):
     patch_size_zyx = np.asarray(patch_size, dtype=np.int32).reshape(-1)

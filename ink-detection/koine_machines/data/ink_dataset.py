@@ -15,16 +15,13 @@ from koine_machines.common.common import (
 )
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.image_proc.intensity.normalization import normalize_robust
-try:
-    from .patch import Patch
-    from .segment import Segment
-except ImportError:
-    from patch import Patch
-    from segment import Segment
+import vesuvius.tifxyz as tifxyz
+from koine_machines.data.patch import Patch
+from koine_machines.data.segment import Segment
     
 
 class FlatInkDataset(Dataset):
-    def __init__(self, config, do_augmentations=True, debug=False, patches=None):
+    def __init__(self, config, do_augmentations=True, debug=False, patches=None, mode="flat"):
         
         self.debug            = debug
         self.config           = config
@@ -32,9 +29,12 @@ class FlatInkDataset(Dataset):
         self.datasets         = config['datasets']
         self.vol_auth         = config.get('volume_auth_json')
         self.num_workers      = config.get('dataloader_workers', 8)
+        self.mode             = config.get('mode', 'flat')
+        self.do_augmentations = do_augmentations
         self.do_augmentations = do_augmentations
         self.training_patches = []
         self.validation_patches = []
+  
 
         self.augmentations = create_training_transforms(self.patch_size) if self.do_augmentations else None
 
@@ -105,7 +105,10 @@ class FlatInkDataset(Dataset):
 
             for tifxyz_folder in sorted(seg_path.iterdir()):
                 if tifxyz_folder.is_dir() and any(tifxyz_folder.rglob('x.tif')) and tifxyz_folder.name != 'unused':
-                    image_volume = Path(str(tifxyz_folder) + "/" + tifxyz_folder.name + '.zarr')
+                    if self.mode == "normal_pooled_3d":
+                        image_volume = ds['volume_path']
+                    else:
+                        image_volume = Path(str(tifxyz_folder) + "/" + tifxyz_folder.name + '.zarr')
                     segment = Segment(
                         config=self.config,
                         image_volume=image_volume,
@@ -135,26 +138,85 @@ class FlatInkDataset(Dataset):
         patch = self.patches[idx]
         z0, y0, x0, z1, y1, x1 = patch.bbox
         expected_shape = tuple(int(v) for v in self.patch_size)
+        crop_bbox = patch.bbox
+    
+        if self.mode == "normal_pooled_3d":
+            image_vol = open_zarr(patch.image_volume, resolution=patch.segment.scale, auth=self.vol_auth)
+            supervision_mask = open_zarr(patch.supervision_mask, resolution=patch.segment.scale, auth=self.vol_auth)
+            inklabels = open_zarr(patch.inklabels, resolution=patch.segment.scale, auth=self.vol_auth)
 
-        image_vol = open_zarr(patch.image_volume, resolution=patch.segment.scale, auth=self.vol_auth)
-        supervision_mask = open_zarr(patch.supervision_mask, resolution=patch.segment.scale, auth=self.vol_auth)
-        inklabels = open_zarr(patch.inklabels, resolution=patch.segment.scale, auth=self.vol_auth)
+            patch_tifxyz = tifxyz.read_tifxyz(patch.segment_dir)
+            patch_tifxyz.use_full_resolution()
+            x, y, z, valid = patch_tifxyz[y0:y1, x0:x1]
+            patch_zyxs = np.stack([z, y, x], axis=-1)
+            valid_pts = patch_zyxs[valid]
+            if valid_pts.size == 0:
+                raise ValueError(f"No valid tifxyz points found for bbox {patch.bbox!r}")
 
-        image_crop, image_valid_slices = _read_bbox_with_padding(
-            image_vol,
-            patch.bbox,
-            fill_value=0,
-        )
-        supervision_crop, _ = _read_bbox_with_padding(
-            supervision_mask,
-            patch.bbox,
-            fill_value=0,
-        )
-        inklabels_crop, _ = _read_bbox_with_padding(
-            inklabels,
-            patch.bbox,
-            fill_value=0,
-        )
+            mins = valid_pts.min(axis=0).astype(int)
+            maxs = valid_pts.max(axis=0).astype(int)
+            target_zyx_shape = np.asarray(expected_shape, dtype=int)
+            actual_zyx_shape = (maxs - mins + 1).astype(int)
+            shape_diff = target_zyx_shape - actual_zyx_shape
+
+            # center before crop when the occupied extent is larger than the target.
+            trim_before = np.maximum(-shape_diff, 0) // 2
+            trim_after = np.maximum(-shape_diff, 0) - trim_before
+            mins = mins + trim_before
+            maxs = maxs - trim_after
+
+            adjusted_shape = (maxs - mins + 1).astype(int)
+            remaining_diff = target_zyx_shape - adjusted_shape
+
+            pad_before = np.maximum(remaining_diff, 0) // 2
+            pad_after = np.maximum(remaining_diff, 0) - pad_before
+            mins = mins - pad_before
+            maxs = maxs + pad_after
+
+            crop_bbox = (
+                int(mins[0]),
+                int(mins[1]),
+                int(mins[2]),
+                int(maxs[0] + 1),
+                int(maxs[1] + 1),
+                int(maxs[2] + 1),
+            )
+
+            image_crop, image_valid_slices = _read_bbox_with_padding(
+                image_vol,
+                crop_bbox,
+                fill_value=0,
+            )
+            supervision_crop, _ = _read_bbox_with_padding(
+                supervision_mask,
+                crop_bbox,
+                fill_value=0,
+            )
+            inklabels_crop, _ = _read_bbox_with_padding(
+                inklabels,
+                crop_bbox,
+                fill_value=0,
+            )
+        else:
+            image_vol = open_zarr(patch.image_volume, resolution=patch.segment.scale, auth=self.vol_auth)
+            supervision_mask = open_zarr(patch.supervision_mask, resolution=patch.segment.scale, auth=self.vol_auth)
+            inklabels = open_zarr(patch.inklabels, resolution=patch.segment.scale, auth=self.vol_auth)
+
+            image_crop, image_valid_slices = _read_bbox_with_padding(
+                image_vol,
+                patch.bbox,
+                fill_value=0,
+            )
+            supervision_crop, _ = _read_bbox_with_padding(
+                supervision_mask,
+                patch.bbox,
+                fill_value=0,
+            )
+            inklabels_crop, _ = _read_bbox_with_padding(
+                inklabels,
+                patch.bbox,
+                fill_value=0,
+            )
 
         if image_valid_slices is not None:
             image_crop = image_crop.astype(np.float32, copy=False)
@@ -170,7 +232,7 @@ class FlatInkDataset(Dataset):
             if tuple(int(v) for v in array.shape) != expected_shape:
                 raise AssertionError(
                     f"{name} crop shape {tuple(int(v) for v in array.shape)} does not match "
-                    f"requested patch size {expected_shape} for bbox {patch.bbox!r}"
+                    f"requested patch size {expected_shape} for bbox {crop_bbox!r}"
                 )
 
         surface_mask = None
