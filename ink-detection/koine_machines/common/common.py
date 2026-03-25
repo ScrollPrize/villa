@@ -322,13 +322,22 @@ def load_segment_label_masks(segment, shape, label_version=None):
 
     def read_mask(path, label_name):
         assert path, f"Segment {segment_uuid!r} must contain {label_name} mask."
-        mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-        assert mask is not None, f"Segment {segment_uuid!r} failed to read {label_name} mask: {path}"
-        if mask.ndim == 3:
-            if mask.shape[2] == 4:
-                mask = cv2.cvtColor(mask, cv2.COLOR_BGRA2GRAY)
-            else:
-                mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+        path = Path(path)
+        if path.suffix.lower() == ".zarr":
+            mask_zarr = zarr.open(str(path), path="0", mode="r")
+            assert mask_zarr.ndim == 3, (
+                f"Segment {segment_uuid!r} expected 3D zarr {label_name} mask, got shape "
+                f"{getattr(mask_zarr, 'shape', None)}"
+            )
+            mask = np.asarray(mask_zarr[int(mask_zarr.shape[0] // 2)])
+        else:
+            mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            assert mask is not None, f"Segment {segment_uuid!r} failed to read {label_name} mask: {path}"
+            if mask.ndim == 3:
+                if mask.shape[2] == 4:
+                    mask = cv2.cvtColor(mask, cv2.COLOR_BGRA2GRAY)
+                else:
+                    mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
         mask = _reconcile_label_mask_shape(
             mask,
             shape,

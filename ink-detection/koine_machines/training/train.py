@@ -449,31 +449,18 @@ def train(config_path):
                 latest_val_loss = float(mean_val_loss)
                 latest_ema_val_loss = (float(mean_ema_val_loss) if mean_ema_val_loss is not None else None)
                 refresh_progress_bar(train_loss)
+                log_dict = build_validation_preview_log(
+                    step=step,
+                    train_preview=train_preview,
+                    val_preview=val_preview,
+                    train_preview_dir=train_preview_dir,
+                    val_preview_dir=val_preview_dir,
+                    mean_val_loss=mean_val_loss,
+                    mean_ema_val_loss=mean_ema_val_loss,
+                    include_wandb_images=wandb.run is not None,
+                )
                 if wandb.run is not None:
-                    wandb.log(
-                        build_validation_preview_log(
-                            step=step,
-                            train_preview=train_preview,
-                            val_preview=val_preview,
-                            train_preview_dir=train_preview_dir,
-                            val_preview_dir=val_preview_dir,
-                            mean_val_loss=mean_val_loss,
-                            mean_ema_val_loss=mean_ema_val_loss,
-                            include_wandb_images=True,
-                        ),
-                        step=step,
-                    )
-                else:
-                    build_validation_preview_log(
-                        step=step,
-                        train_preview=train_preview,
-                        val_preview=val_preview,
-                        train_preview_dir=train_preview_dir,
-                        val_preview_dir=val_preview_dir,
-                        mean_val_loss=mean_val_loss,
-                        mean_ema_val_loss=mean_ema_val_loss,
-                        include_wandb_images=False,
-                    )
+                    wandb.log(log_dict, step=step)
 
         if accelerator.is_main_process and step % save_every == 0 and step > 0:
             checkpoint = {
