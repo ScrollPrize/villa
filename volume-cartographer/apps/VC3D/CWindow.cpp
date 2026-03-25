@@ -3569,8 +3569,8 @@ cv::Mat CWindow::generateOverlapMaskLayer(QuadSurface* currentSurf)
         return {};
     }
 
-    // Create BGR image for the overlap visualization
-    cv::Mat_<cv::Vec3b> overlapImg(rows, cols, cv::Vec3b(0, 0, 0));
+    // Create grayscale image for the overlap visualization (255 = overlap, 0 = none)
+    cv::Mat_<uint8_t> overlapImg(rows, cols, static_cast<uint8_t>(0));
 
     int hitCount = 0;
     for (int r = 0; r < rows; ++r) {
@@ -3583,13 +3583,11 @@ cv::Mat CWindow::generateOverlapMaskLayer(QuadSurface* currentSurf)
             const int cz = static_cast<int>(std::floor(pt[2] * invThreshold));
 
             bool found = false;
-            cv::Vec3b hitColor{0, 0, 0};
             for (int dz = -1; dz <= 1 && !found; ++dz) {
                 for (int dy = -1; dy <= 1 && !found; ++dy) {
                     for (int dx = -1; dx <= 1 && !found; ++dx) {
                         auto it = spatialHash.find({cx + dx, cy + dy, cz + dz});
                         if (it != spatialHash.end()) {
-                            hitColor = it->second;
                             found = true;
                         }
                     }
@@ -3598,7 +3596,7 @@ cv::Mat CWindow::generateOverlapMaskLayer(QuadSurface* currentSurf)
 
             if (found) {
                 hitCount++;
-                overlapImg(r, c) = hitColor;
+                overlapImg(r, c) = 255;
             }
         }
     }
