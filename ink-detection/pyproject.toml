@@ -31,6 +31,7 @@ dependencies = [
     "napari>=0.7.0",
     "einops>=0.8.2",
     "pyqt6>=6.10.2",
+    "pytorch-optimizer>=3.10.0",
 ]
 
 [tool.setuptools.packages.find]
