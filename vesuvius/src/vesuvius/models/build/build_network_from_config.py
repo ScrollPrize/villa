@@ -45,11 +45,12 @@ https://github.com/MIC-DKFZ/nnUNet
 
 import torch
 import torch.nn as nn
-from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage
+from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage, pad_shape
 from .encoder import Encoder
 from .decoder import Decoder
 from .activations import SwiGLUBlock, GLUBlock
 from .primus_wrapper import PrimusEncoder, PrimusDecoder
+from .pretrained_backbones.dinov2 import build_dinov2_backbone, build_dinov2_decoder
 
 
 class LearnedMLPZProjection(nn.Module):
@@ -243,8 +244,19 @@ class NetworkFromConfig(nn.Module):
         self.save_config = False
         
         self.architecture_type = model_config.get("architecture_type", "unet")
+        self.pretrained_backbone = model_config.get("pretrained_backbone")
         # Determine if deep supervision is requested
         ds_enabled = bool(getattr(mgr, 'enable_deep_supervision', False))
+
+        if self.pretrained_backbone:
+            if ds_enabled:
+                print(
+                    "Warning: Deep supervision is enabled but the selected pretrained backbone path does not "
+                    "support multi-scale logits. Disabling deep supervision for this run."
+                )
+                setattr(mgr, "enable_deep_supervision", False)
+            self._init_pretrained_backbone(mgr, model_config)
+            return
 
         # Primus decoders do not emit multi-scale logits; block DS to avoid silent misconfiguration
         if self.architecture_type.lower().startswith("primus"):
@@ -339,16 +351,42 @@ class NetworkFromConfig(nn.Module):
         # --------------------------------------------------------------------
         # Architecture parameters.
         # --------------------------------------------------------------------
-        # Check if we have features_per_stage specified in model_config
+        # Check if we have stage-wise architecture settings specified in model_config
         manual_features = model_config.get("features_per_stage", None)
+        manual_kernel_sizes = model_config.get("kernel_sizes", None)
+        manual_strides = model_config.get("strides", None)
+        manual_pool_op_kernel_sizes = model_config.get("pool_op_kernel_sizes", None)
+
+        manual_stage_specs = {
+            "features_per_stage": manual_features,
+            "kernel_sizes": manual_kernel_sizes,
+            "strides": manual_strides,
+            "pool_op_kernel_sizes": manual_pool_op_kernel_sizes,
+        }
+        explicit_stage_count = None
+        for spec_name, spec_value in manual_stage_specs.items():
+            if spec_value is None:
+                continue
+            spec_len = len(spec_value)
+            if explicit_stage_count is None:
+                explicit_stage_count = spec_len
+            elif spec_len != explicit_stage_count:
+                raise ValueError(
+                    "Provided stage-wise settings must agree on stage count. "
+                    f"Expected {explicit_stage_count} entries but {spec_name} has {spec_len}."
+                )
         
         if self.autoconfigure or manual_features is not None:
             if manual_features is not None:
-                print("--- Partial autoconfiguration: using provided features_per_stage ---")
+                print("--- Partial autoconfiguration: using provided stage-wise settings ---")
                 self.features_per_stage = manual_features
                 self.num_stages = len(self.features_per_stage)
                 print(f"Using provided features_per_stage: {self.features_per_stage}")
                 print(f"Detected {self.num_stages} stages from features_per_stage")
+            elif explicit_stage_count is not None:
+                print("--- Partial autoconfiguration: using provided stage layout ---")
+                self.num_stages = explicit_stage_count
+                print(f"Detected {self.num_stages} stages from provided stage-wise settings")
             else:
                 print("--- Full autoconfiguration from config ---")
             
@@ -356,38 +394,89 @@ class NetworkFromConfig(nn.Module):
             self.basic_decoder_block = model_config.get("basic_decoder_block", "ConvBlock")
             self.bottleneck_block = model_config.get("bottleneck_block", "BasicBlockD")
 
-            num_pool_per_axis, pool_op_kernel_sizes, conv_kernel_sizes, final_patch_size, must_div = \
+            auto_num_pool_per_axis, auto_pool_op_kernel_sizes, auto_conv_kernel_sizes, auto_final_patch_size, auto_must_div = \
                 get_pool_and_conv_props(
                     spacing=mgr.spacing,
                     patch_size=self.patch_size,
                     min_feature_map_size=4,
                     max_numpool=999999
                 )
-            # Convert tuples from get_pool_and_conv_props to mutable lists so we can
-            # trim/extend and selectively override with user-provided settings.
-            pool_op_kernel_sizes = [list(k) for k in pool_op_kernel_sizes]
-            conv_kernel_sizes = [list(k) for k in conv_kernel_sizes]
+            auto_pool_op_kernel_sizes = [list(k) for k in auto_pool_op_kernel_sizes]
+            auto_conv_kernel_sizes = [list(k) for k in auto_conv_kernel_sizes]
+
+            user_controls_pooling = (
+                manual_strides is not None or manual_pool_op_kernel_sizes is not None
+            )
+
+            if user_controls_pooling:
+                effective_strides = manual_strides if manual_strides is not None else manual_pool_op_kernel_sizes
+                effective_pool_op_kernel_sizes = (
+                    manual_pool_op_kernel_sizes if manual_pool_op_kernel_sizes is not None else effective_strides
+                )
+                if len(effective_strides) != len(effective_pool_op_kernel_sizes):
+                    raise ValueError(
+                        "strides and pool_op_kernel_sizes must have the same number of stages "
+                        f"when both are provided. Got {len(effective_strides)} and {len(effective_pool_op_kernel_sizes)}."
+                    )
+                if explicit_stage_count is None:
+                    self.num_stages = len(effective_strides)
+
+                must_div = [1] * self.op_dims
+                num_pool_per_axis = [0] * self.op_dims
+                for stage_idx, stage_stride in enumerate(effective_strides):
+                    if len(stage_stride) != self.op_dims:
+                        raise ValueError(
+                            f"Stride at stage {stage_idx} has {len(stage_stride)} dimensions "
+                            f"but patch size indicates {self.op_dims}D operations. "
+                            f"Stride: {stage_stride}, Expected dimensions: {self.op_dims}"
+                        )
+                    for axis, stride_value in enumerate(stage_stride):
+                        stride_int = int(stride_value)
+                        if stride_int < 1:
+                            raise ValueError(
+                                f"Stride values must be >= 1. Found {stride_value} at "
+                                f"stage {stage_idx}, axis {axis}."
+                            )
+                        must_div[axis] *= stride_int
+                        stride_remainder = stride_int
+                        while stride_remainder > 1 and stride_remainder % 2 == 0:
+                            num_pool_per_axis[axis] += 1
+                            stride_remainder //= 2
+
+                pool_op_kernel_sizes = [list(k) for k in effective_pool_op_kernel_sizes]
+                conv_kernel_sizes = list(auto_conv_kernel_sizes)
+                final_patch_size = tuple(int(v) for v in pad_shape(self.patch_size, must_div))
+            else:
+                pool_op_kernel_sizes = auto_pool_op_kernel_sizes
+                conv_kernel_sizes = auto_conv_kernel_sizes
+                num_pool_per_axis = auto_num_pool_per_axis
+                must_div = auto_must_div
+                final_patch_size = auto_final_patch_size
+                if explicit_stage_count is None:
+                    self.num_stages = len(pool_op_kernel_sizes)
 
             self.num_pool_per_axis = num_pool_per_axis
             self.must_be_divisible_by = must_div
             original_patch_size = self.patch_size
             self.patch_size = final_patch_size
-            print(f"Patch size adjusted from {original_patch_size} to {final_patch_size} to ensure divisibility by pooling factors {must_div}")
+            print(
+                f"Patch size adjusted from {original_patch_size} to {final_patch_size} "
+                f"to ensure divisibility by pooling factors {must_div}"
+            )
 
-            # If features_per_stage was manually specified, adjust the auto-configured values
-            if manual_features is not None:
-                # Trim or extend the auto-configured lists to match the number of stages
-                if len(pool_op_kernel_sizes) > self.num_stages:
-                    pool_op_kernel_sizes = pool_op_kernel_sizes[:self.num_stages]
-                    conv_kernel_sizes = conv_kernel_sizes[:self.num_stages]
-                elif len(pool_op_kernel_sizes) < self.num_stages:
-                    # Extend with reasonable defaults
-                    while len(pool_op_kernel_sizes) < self.num_stages:
-                        pool_op_kernel_sizes.append(pool_op_kernel_sizes[-1])
-                        conv_kernel_sizes.append([3] * len(mgr.spacing))
-            else:
-                # Full auto-configuration
-                self.num_stages = len(pool_op_kernel_sizes)
+            if len(conv_kernel_sizes) > self.num_stages:
+                conv_kernel_sizes = conv_kernel_sizes[:self.num_stages]
+            elif len(conv_kernel_sizes) < self.num_stages:
+                while len(conv_kernel_sizes) < self.num_stages:
+                    conv_kernel_sizes.append([3] * len(mgr.spacing))
+
+            if len(pool_op_kernel_sizes) > self.num_stages:
+                pool_op_kernel_sizes = pool_op_kernel_sizes[:self.num_stages]
+            elif len(pool_op_kernel_sizes) < self.num_stages:
+                while len(pool_op_kernel_sizes) < self.num_stages:
+                    pool_op_kernel_sizes.append(pool_op_kernel_sizes[-1])
+
+            if manual_features is None:
                 base_features = 32
                 max_features = 320
                 features = []
@@ -418,9 +507,13 @@ class NetworkFromConfig(nn.Module):
                 "n_conv_per_stage_decoder",
                 [1] * (self.num_stages - 1)
             )
-            self.strides = model_config.get("strides", pool_op_kernel_sizes)
-            self.kernel_sizes = model_config.get("kernel_sizes", conv_kernel_sizes)
-            self.pool_op_kernel_sizes = model_config.get("pool_op_kernel_sizes", pool_op_kernel_sizes)
+            self.strides = manual_strides if manual_strides is not None else pool_op_kernel_sizes
+            self.kernel_sizes = manual_kernel_sizes if manual_kernel_sizes is not None else conv_kernel_sizes
+            self.pool_op_kernel_sizes = (
+                manual_pool_op_kernel_sizes
+                if manual_pool_op_kernel_sizes is not None
+                else pool_op_kernel_sizes
+            )
 
             # Validate stage-wise list lengths in autoconfigure mode.
             if len(self.kernel_sizes) != self.num_stages:
@@ -673,6 +766,83 @@ class NetworkFromConfig(nn.Module):
         for k, v in self.final_config.items():
             print(f"  {k}: {v}")
     
+    def _init_pretrained_backbone(self, mgr, model_config):
+        print(f"--- Initializing pretrained backbone '{self.pretrained_backbone}' ---")
+        input_shape = tuple(model_config.get("input_shape", self.patch_size))
+        decoder_type = model_config.get("pretrained_decoder_type", "primus_patch_decode")
+
+        self.shared_encoder = build_dinov2_backbone(
+            self.pretrained_backbone,
+            input_channels=self.in_channels,
+            input_shape=input_shape,
+        )
+        self.task_decoders = nn.ModuleDict()
+        self.task_activations = nn.ModuleDict()
+        self.task_heads = nn.ModuleDict()
+
+        separate_decoders_default = model_config.get("separate_decoders", True)
+        decoder_head_channels = model_config.get("decoder_head_channels", 32)
+        tasks_using_shared, tasks_using_separate = set(), set()
+
+        for target_name, target_info in self.targets.items():
+            if 'out_channels' in target_info:
+                out_channels = target_info['out_channels']
+            elif 'channels' in target_info:
+                out_channels = target_info['channels']
+            else:
+                out_channels = self.in_channels
+                print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels")
+            target_info["out_channels"] = out_channels
+            self._register_target_projection(target_name, target_info, model_config)
+
+            use_separate = target_info.get("separate_decoder", separate_decoders_default)
+            if use_separate:
+                tasks_using_separate.add(target_name)
+            else:
+                tasks_using_shared.add(target_name)
+
+        if len(tasks_using_shared) > 0:
+            self.shared_decoder = build_dinov2_decoder(decoder_type, self.shared_encoder, decoder_head_channels)
+            head_conv = nn.Conv2d if self.shared_encoder.ndim == 2 else nn.Conv3d
+            for target_name in sorted(tasks_using_shared):
+                out_ch = self.targets[target_name]["out_channels"]
+                self.task_heads[target_name] = head_conv(
+                    decoder_head_channels, out_ch, kernel_size=1, stride=1, padding=0, bias=True
+                )
+                activation_str = self.targets[target_name].get("activation", "none")
+                self.task_activations[target_name] = get_activation_module(activation_str)
+                print(
+                    f"Pretrained task '{target_name}' configured with shared {decoder_type} decoder + head ({out_ch} channels)"
+                )
+
+        for target_name in sorted(tasks_using_separate):
+            out_channels = self.targets[target_name]["out_channels"]
+            activation_str = self.targets[target_name].get("activation", "none")
+            self.task_decoders[target_name] = build_dinov2_decoder(
+                decoder_type,
+                self.shared_encoder,
+                out_channels,
+            )
+            self.task_activations[target_name] = get_activation_module(activation_str)
+            print(f"Pretrained task '{target_name}' configured with separate {decoder_type} decoder ({out_channels} channels)")
+
+        self.final_config = {
+            "model_name": self.mgr.model_name,
+            "architecture_type": self.architecture_type,
+            "pretrained_backbone": self.pretrained_backbone,
+            "pretrained_decoder_type": decoder_type,
+            "input_shape": input_shape,
+            "in_channels": self.in_channels,
+            "targets": self.targets,
+            "target_z_projection": self.task_z_projection_cfg,
+            "separate_decoders": len(tasks_using_separate) > 0,
+            "decoder_head_channels": decoder_head_channels,
+        }
+
+        print("Pretrained backbone network initialized with configuration:")
+        for k, v in self.final_config.items():
+            print(f"  {k}: {v}")
+
     def _init_primus(self, mgr, model_config):
         """
         Initialize Primus transformer architecture.
@@ -710,7 +880,8 @@ class NetworkFromConfig(nn.Module):
         
         # Get Primus-specific parameters
         primus_kwargs = {
-            "drop_path_rate": model_config.get("drop_path_rate", 0.0),
+            # Align unspecified Primus configs with the MIC-DKFZ nnUNet Primus trainers.
+            "drop_path_rate": model_config.get("drop_path_rate", 0.2),
             "patch_drop_rate": model_config.get("patch_drop_rate", 0.0),
             "proj_drop_rate": model_config.get("proj_drop_rate", 0.0),
             "attn_drop_rate": model_config.get("attn_drop_rate", 0.0),
@@ -743,7 +914,8 @@ class NetworkFromConfig(nn.Module):
         self.task_activations = nn.ModuleDict()
         self.task_heads = nn.ModuleDict()
 
-        separate_decoders_default = model_config.get("separate_decoders", False)
+        # Default Primus to per-task decoders to mirror the direct Primus head layout.
+        separate_decoders_default = model_config.get("separate_decoders", True)
         decoder_head_channels = model_config.get("decoder_head_channels", 32)
 
         tasks_using_shared, tasks_using_separate = set(), set()

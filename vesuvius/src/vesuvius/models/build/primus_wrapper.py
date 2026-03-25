@@ -30,7 +30,7 @@ class PrimusEncoder(nn.Module):
         config_name: str,  # 'S', 'B', 'M', or 'L'
         patch_embed_size: Tuple[int, ...],
         input_shape: Tuple[int, ...],
-        drop_path_rate: float = 0.0,
+        drop_path_rate: float = 0.2,
         patch_drop_rate: float = 0.0,
         proj_drop_rate: float = 0.0,
         attn_drop_rate: float = 0.0,
@@ -41,8 +41,8 @@ class PrimusEncoder(nn.Module):
         mlp_ratio=4 * 2 / 3,
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
-        init_values=None,
-        scale_attn_inner=False,
+        init_values=0.1,
+        scale_attn_inner=True,
     ):
         super().__init__()
         

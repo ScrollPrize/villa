@@ -56,14 +56,14 @@ class Primus(AbstractDynamicNetworkArchitectures):
         use_abs_pos_embed: bool = True,
         pos_emb_type: str = "rope",
         mlp_ratio=4 * 2 / 3,
-        drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
+        drop_path_rate=0.2,  # nnUNet Primus trainer default stochastic depth
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
         proj_drop_rate: float = 0.0,  # drops out things related to the projection. That is in the MLP and at the end of EVA attention
         attn_drop_rate: float = 0.0,  # drops attention, meaning connections between patches may bebroken up at random
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
-        init_values=None,
-        scale_attn_inner=False,
+        init_values=0.1,
+        scale_attn_inner=True,
     ):
         """
         Architecture as proposed in the Primus paper (https://arxiv.org/pdf/2503.01835)
@@ -253,12 +253,12 @@ class PrimusX(Primus):
         config_name: str,
         patch_embed_size: Tuple[int, ...],
         input_shape: Tuple[int, ...] = None,
-        drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
+        drop_path_rate=0.2,  # nnUNet Primus trainer default stochastic depth
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
-        init_values=None,
-        scale_attn_inner=False,
+        init_values=0.1,
+        scale_attn_inner=True,
     ):
         conf = _PRIMUS_CONFIGS[config_name]
         super().__init__(
@@ -285,7 +285,7 @@ class PrimusS(PrimusX):
         output_channels: int,
         patch_embed_size: Tuple[int, ...],
         input_shape: Tuple[int, ...] = None,
-        drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
+        drop_path_rate=0.2,  # nnUNet Primus trainer default stochastic depth
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
@@ -320,7 +320,7 @@ class PrimusB(PrimusX):
         output_channels: int,
         patch_embed_size: Tuple[int, ...],
         input_shape: Tuple[int, ...] = None,
-        drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
+        drop_path_rate=0.2,  # nnUNet Primus trainer default stochastic depth
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
@@ -355,7 +355,7 @@ class PrimusM(PrimusX):
         output_channels: int,
         patch_embed_size: Tuple[int, ...],
         input_shape: Tuple[int, ...] = None,
-        drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
+        drop_path_rate=0.2,  # nnUNet Primus trainer default stochastic depth
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
@@ -390,7 +390,7 @@ class PrimusL(PrimusX):
         output_channels: int,
         patch_embed_size: Tuple[int, ...],
         input_shape: Tuple[int, ...] = None,
-        drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
+        drop_path_rate=0.2,  # nnUNet Primus trainer default stochastic depth
         patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
         rope_impl=RotaryEmbeddingCat,
         rope_kwargs=None,
@@ -462,3 +462,23 @@ if __name__ == "__main__":
 
     test_submodules_loadable(model)
     time.sleep(5)
+
+    # 2D tests
+    print("\n" + "="*50)
+    print("2D TESTS")
+    print("="*50)
+
+    print("\nPrimus S (2D)")
+    x_2d = torch.rand([1, 1, 96, 96], device="cuda", dtype=torch.float32)
+    model_2d = PrimusS(1, 2, (8, 8), (96, 96)).cuda()
+    out = model_2d(x_2d)
+    print(f"Input shape: {x_2d.shape}, Output shape: {out.shape}")
+    print(f"Parameter count: {parameter_count(model_2d)[''] / 1e6:.2f}M")
+    test_submodules_loadable(model_2d)
+
+    print("\nPrimus B (2D)")
+    model_2d = PrimusB(1, 2, (8, 8), (96, 96)).cuda()
+    out = model_2d(x_2d)
+    print(f"Input shape: {x_2d.shape}, Output shape: {out.shape}")
+    print(f"Parameter count: {parameter_count(model_2d)[''] / 1e6:.2f}M")
+    test_submodules_loadable(model_2d)
