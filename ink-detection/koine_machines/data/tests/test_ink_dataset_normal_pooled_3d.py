@@ -1,8 +1,8 @@
 import numpy as np
 import torch
 
-from koine_machines.data.ink_dataset import _build_normal_pooled_flat_metadata
-from koine_machines.data.ink_dataset import (
+from koine_machines.data.normal_pooled_sample import _build_normal_pooled_flat_metadata
+from koine_machines.data.normal_pooled_sample import (
     _pack_normal_pooled_augmentation_data,
     _restore_normal_pooled_augmentation_data,
 )
