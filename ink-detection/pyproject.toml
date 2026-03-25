@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ink-detection"
 version = "0.1.0"
-description = "Standalone ink-detection rewrite package."
+description = "Machine learning package for ink detection on herculaneum scrolls"
 requires-python = ">=3.11"
 dependencies = [
     "torch==2.10.0",
