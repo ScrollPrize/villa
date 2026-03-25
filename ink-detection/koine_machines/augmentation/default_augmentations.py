@@ -1,30 +1,42 @@
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
+from typing import Dict, List, Optional, Set, Tuple
 
 from vesuvius.models.augmentation.transforms.intensity.brightness import (
     BrightnessAdditiveTransform,
+    MultiplicativeBrightnessTransform,
 )
 from vesuvius.models.augmentation.transforms.intensity.contrast import (
     BGContrast,
     ContrastTransform,
 )
+from vesuvius.models.augmentation.transforms.intensity.gamma import GammaTransform
 from vesuvius.models.augmentation.transforms.intensity.gaussian_noise import (
     GaussianNoiseTransform,
 )
+from vesuvius.models.augmentation.transforms.intensity.illumination import (
+    InhomogeneousSliceIlluminationTransform,
+)
+from vesuvius.models.augmentation.transforms.intensity.inversion import (
+    InvertImageTransform,
+)
+from vesuvius.models.augmentation.transforms.noise import SharpeningTransform
 from vesuvius.models.augmentation.transforms.noise.extranoisetransforms import (
     BlankRectangleTransform,
 )
 from vesuvius.models.augmentation.transforms.noise.gaussian_blur import (
     GaussianBlurTransform,
 )
-from vesuvius.models.augmentation.transforms.noise.layer_mix_dropout import (
-    LayerMixDropoutTransform,
+from vesuvius.models.augmentation.transforms.spatial.low_resolution import (
+    SimulateLowResolutionTransform,
 )
-from vesuvius.models.augmentation.transforms.spatial.mirroring import MirrorTransform
+from vesuvius.models.augmentation.transforms.spatial.mirroring import (
+    MirrorTransform,
+)
+from vesuvius.models.augmentation.transforms.spatial.rot90 import Rot90Transform
 from vesuvius.models.augmentation.transforms.spatial.spatial import SpatialTransform
 from vesuvius.models.augmentation.transforms.utils.compose import ComposeTransforms
-from vesuvius.models.augmentation.transforms.utils.oneoftransform import OneOfTransform
+from vesuvius.models.augmentation.transforms.utils.oneoftransform import (
+    OneOfTransform,
+)
 from vesuvius.models.augmentation.transforms.utils.random import RandomTransform
 
 _DEFAULT_GAUSS_NOISE_STD_RANGE = (
@@ -34,7 +46,6 @@ _DEFAULT_GAUSS_NOISE_STD_RANGE = (
 _BRIGHTNESS_LIMIT_RANGE = (-0.2, 0.2)
 _CONTRAST_MULTIPLIER_RANGE = (0.8, 1.2)
 _GAUSSIAN_BLUR_SIGMA_RANGE = (0.5, 3.0)
-_ROTATION_RANGE_RADIANS = (-2.0 * np.pi, 2.0 * np.pi)
 _SCALE_RANGE = (0.9, 1.1)
 
 
@@ -47,15 +58,35 @@ def _mirror_axes_for_dimension(dimension: int) -> Tuple[int, ...]:
     raise ValueError(f"Invalid patch size dimension: {dimension}. Expected 2 or 3.")
 
 
-def _rotation_axes_for_dimension(
-    dimension: int,
+def _rot90_allowed_axes_for_patch(
+    patch_size: Tuple[int, ...],
     allowed_rotation_axes: Optional[List[int]],
-) -> Optional[Tuple[int, ...]]:
-    if allowed_rotation_axes is not None:
-        return tuple(sorted({int(axis) for axis in allowed_rotation_axes}))
+) -> Optional[Set[int]]:
+    dimension = len(patch_size)
+    if dimension == 2:
+        return {0, 1} if patch_size[0] == patch_size[1] else None
+
     if dimension == 3:
-        # Rotate around z only to match 2D ShiftScaleRotate behavior on y/x slices.
-        return (0,)
+        rotation_axis_to_plane = {
+            0: {1, 2},
+            1: {0, 2},
+            2: {0, 1},
+        }
+        requested_axes = (
+            {int(axis) for axis in allowed_rotation_axes}
+            if allowed_rotation_axes is not None
+            else {0}
+        )
+        allowed_axes: Set[int] = set()
+        for rotation_axis in requested_axes:
+            plane_axes = rotation_axis_to_plane.get(rotation_axis)
+            if plane_axes is None:
+                continue
+            axis_a, axis_b = sorted(plane_axes)
+            if patch_size[axis_a] == patch_size[axis_b]:
+                allowed_axes.update(plane_axes)
+        return allowed_axes or None
+
     return None
 
 
@@ -88,6 +119,21 @@ def create_training_transforms(
 
     if not no_spatial:
         transforms.append(MirrorTransform(allowed_axes=_mirror_axes_for_dimension(dimension)))
+        rot90_allowed_axes = _rot90_allowed_axes_for_patch(
+            patch_size,
+            allowed_rotation_axes,
+        )
+        if rot90_allowed_axes is not None:
+            transforms.append(
+                RandomTransform(
+                    Rot90Transform(
+                        num_axis_combinations=1,
+                        num_rot_per_combination=(1, 2, 3),
+                        allowed_axes=rot90_allowed_axes,
+                    ),
+                    apply_probability=0.3,
+                )
+            )
         transforms.append(
             RandomTransform(
                 SpatialTransform(
@@ -95,34 +141,101 @@ def create_training_transforms(
                     patch_center_dist_from_border=0,
                     random_crop=False,
                     p_elastic_deform=0,
-                    p_rotation=1.0,
-                    rotation=_ROTATION_RANGE_RADIANS,
+                    p_rotation=0.0,
                     p_scaling=0.0 if no_scaling else 1.0,
                     scaling=_SCALE_RANGE,
                     p_synchronize_scaling_across_axes=1.0,
                     bg_style_seg_sampling=False,
                     mode_seg="nearest",
-                    allowed_rotation_axes=_rotation_axes_for_dimension(
-                        dimension,
-                        allowed_rotation_axes,
-                    ),
                 ),
-                apply_probability=0.75,
+                apply_probability=0.3,
             )
         )
 
     transforms.append(
         RandomTransform(
-            LayerMixDropoutTransform(
-                min_crop_ratio=0.9,
-                max_crop_ratio=1.0,
-                cutout_max_count=2,
-                cutout_probability=0.6,
+            SharpeningTransform(
+                strength=(0.1, 1.5),
+                p_same_for_each_channel=0.5,
+                p_per_channel=0.5,
+                p_clamp_intensities=0.5,
             ),
-            apply_probability=0.6,
+            apply_probability=0.2,
         )
     )
-
+    transforms.append(
+        RandomTransform(
+            MultiplicativeBrightnessTransform(
+                multiplier_range=BGContrast((0.75, 1.25)),
+                synchronize_channels=False,
+                p_per_channel=0.5,
+            ),
+            apply_probability=0.2,
+        )
+    )
+    transforms.append(
+        RandomTransform(
+            SimulateLowResolutionTransform(
+                scale=(0.25, 1),
+                synchronize_channels=False,
+                synchronize_axes=True,
+                ignore_axes=None,
+                allowed_channels=None,
+                p_per_channel=0.5,
+            ),
+            apply_probability=0.1,
+        )
+    )
+    transforms.append(
+        RandomTransform(
+            GammaTransform(
+                gamma=BGContrast((0.7, 1.5)),
+                p_invert_image=1,
+                synchronize_channels=False,
+                p_per_channel=1,
+                p_retain_stats=1,
+            ),
+            apply_probability=0.2,
+        )
+    )
+    transforms.append(
+        RandomTransform(
+            GammaTransform(
+                gamma=BGContrast((0.7, 1.5)),
+                p_invert_image=0,
+                synchronize_channels=False,
+                p_per_channel=1,
+                p_retain_stats=1,
+            ),
+            apply_probability=0.3,
+        )
+    )
+    transforms.append(
+        RandomTransform(
+            InvertImageTransform(
+                p_invert_image=1,
+                p_synchronize_channels=0.5,
+                p_per_channel=0.5,
+            ),
+            apply_probability=0.2,
+        )
+    )
+    if dimension == 3:
+        transforms.append(
+            RandomTransform(
+                InhomogeneousSliceIlluminationTransform(
+                    num_defects=(2, 5),
+                    defect_width=(25, 50),
+                    mult_brightness_reduction_at_defect=(0.3, 1.5),
+                    base_p=(0.2, 0.4),
+                    base_red=(0.5, 0.9),
+                    p_per_sample=1.0,
+                    per_channel=True,
+                    p_per_channel=0.5,
+                ),
+                apply_probability=0.3,
+            )
+        )
     transforms.append(
         RandomTransform(
             ComposeTransforms(
@@ -141,45 +254,42 @@ def create_training_transforms(
                     ),
                 ]
             ),
-            apply_probability=0.75,
+            apply_probability=0.4,
         )
     )
-
-    if not only_spatial_and_intensity:
-        # No direct MotionBlur equivalent exists in the Vesuvius library.
-        transforms.append(
-            RandomTransform(
-                OneOfTransform(
-                    [
-                        GaussianNoiseTransform(
-                            noise_variance=_DEFAULT_GAUSS_NOISE_STD_RANGE,
-                            p_per_channel=1.0,
-                            synchronize_channels=True,
-                        ),
-                        GaussianBlurTransform(
-                            blur_sigma=_GAUSSIAN_BLUR_SIGMA_RANGE,
-                            synchronize_channels=True,
-                            synchronize_axes=False,
-                            p_per_channel=1.0,
-                        ),
-                    ]
-                ),
-                apply_probability=0.4,
-            )
+    transforms.append(
+        RandomTransform(
+            OneOfTransform(
+                [
+                    GaussianNoiseTransform(
+                        noise_variance=_DEFAULT_GAUSS_NOISE_STD_RANGE,
+                        p_per_channel=1.0,
+                        synchronize_channels=True,
+                    ),
+                    GaussianBlurTransform(
+                        blur_sigma=_GAUSSIAN_BLUR_SIGMA_RANGE,
+                        synchronize_channels=True,
+                        synchronize_axes=False,
+                        p_per_channel=1.0,
+                    ),
+                ]
+            ),
+            apply_probability=0.4,
         )
-        transforms.append(
-            RandomTransform(
-                BlankRectangleTransform(
-                    rectangle_size=_coarse_dropout_size_ranges(patch_size),
-                    rectangle_value=0,
-                    num_rectangles=(1, 2),
-                    force_square=False,
-                    p_per_sample=1.0,
-                    p_per_channel=1.0,
-                ),
-                apply_probability=0.5,
-            )
+    )
+    transforms.append(
+        RandomTransform(
+            BlankRectangleTransform(
+                rectangle_size=_coarse_dropout_size_ranges(patch_size),
+                rectangle_value=0,
+                num_rectangles=(1, 2),
+                force_square=False,
+                p_per_sample=1.0,
+                p_per_channel=1.0,
+            ),
+            apply_probability=0.2,
         )
+    )
 
     if skeleton_targets:
         from vesuvius.models.augmentation.transforms.utils.skeleton_transform import (

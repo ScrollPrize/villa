@@ -288,8 +288,8 @@ def train(config_path):
                 batch['flat_points_local_zyx'].float(),
                 batch['flat_normals_local_zyx'].float(),
                 batch['flat_valid'].float(),
-                neg_dist=float(pooling_config.get('neg_dist', 4.0)),
-                pos_dist=float(pooling_config.get('pos_dist', 4.0)),
+                neg_dist=float(pooling_config.get('neg_dist', 10.0)),
+                pos_dist=float(pooling_config.get('pos_dist', 10.0)),
                 sample_step=float(pooling_config.get('sample_step', 1.0)),
                 align_corners=True,
             )

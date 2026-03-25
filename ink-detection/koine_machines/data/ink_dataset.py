@@ -61,6 +61,68 @@ def _select_flat_pixels_for_native_crop(patch_zyxs, valid_mask, crop_bbox):
     )
 
 
+def _select_flat_pixels_for_native_crop_via_stored_resolution(
+    patch_tifxyz,
+    crop_bbox,
+    *,
+    coarse_native_pad=20,
+):
+    coarse_native_pad = int(coarse_native_pad)
+    coarse_crop_bbox = (
+        int(crop_bbox[0]) - coarse_native_pad,
+        int(crop_bbox[1]) - coarse_native_pad,
+        int(crop_bbox[2]) - coarse_native_pad,
+        int(crop_bbox[3]) + coarse_native_pad,
+        int(crop_bbox[4]) + coarse_native_pad,
+        int(crop_bbox[5]) + coarse_native_pad,
+    )
+
+    coarse_patch_zyxs = np.asarray(
+        patch_tifxyz.get_zyxs(stored_resolution=True),
+        dtype=np.float32,
+    )
+    coarse_valid = np.isfinite(coarse_patch_zyxs).all(axis=-1)
+    coarse_valid &= (coarse_patch_zyxs >= 0).all(axis=-1)
+    (coarse_y0, coarse_y1, coarse_x0, coarse_x1), _, _ = _select_flat_pixels_for_native_crop(
+        coarse_patch_zyxs,
+        coarse_valid,
+        coarse_crop_bbox,
+    )
+
+    stored_h, stored_w = (int(v) for v in coarse_patch_zyxs.shape[:2])
+    full_h, full_w = (int(v) for v in patch_tifxyz.full_resolution_shape)
+    if stored_h <= 0 or stored_w <= 0:
+        raise ValueError(f"stored-resolution tifxyz grid must have positive shape, got {(stored_h, stored_w)!r}")
+
+    factor_y = full_h / float(stored_h)
+    factor_x = full_w / float(stored_w)
+
+    # Expand by one stored cell before mapping back to full resolution so the
+    # exact full-res refinement can't miss intersections near a coarse edge.
+    coarse_y0 = max(0, coarse_y0 - 1)
+    coarse_y1 = min(stored_h, coarse_y1 + 1)
+    coarse_x0 = max(0, coarse_x0 - 1)
+    coarse_x1 = min(stored_w, coarse_x1 + 1)
+
+    full_y0 = max(0, int(np.floor(coarse_y0 * factor_y)))
+    full_y1 = min(full_h, int(np.ceil(coarse_y1 * factor_y)))
+    full_x0 = max(0, int(np.floor(coarse_x0 * factor_x)))
+    full_x1 = min(full_w, int(np.ceil(coarse_x1 * factor_x)))
+
+    full_x, full_y, full_z, full_valid = patch_tifxyz[full_y0:full_y1, full_x0:full_x1]
+    full_patch_zyxs = np.stack([full_z, full_y, full_x], axis=-1)
+    (local_y0, local_y1, local_x0, local_x1), support_patch_zyxs, support_valid = _select_flat_pixels_for_native_crop(
+        full_patch_zyxs,
+        full_valid,
+        crop_bbox,
+    )
+    return (
+        (full_y0 + local_y0, full_y0 + local_y1, full_x0 + local_x0, full_x0 + local_x1),
+        support_patch_zyxs,
+        support_valid,
+    )
+
+
 def _project_flat_patch_to_native_crop(flat_patch, patch_zyxs, valid_mask, crop_bbox):
     z0, y0, x0, z1, y1, x1 = (int(v) for v in crop_bbox)
     output = np.zeros((z1 - z0, y1 - y0, x1 - x0), dtype=np.asarray(flat_patch).dtype)
@@ -134,6 +196,12 @@ def _build_normal_pooled_flat_metadata(
     flat_valid = np.asarray(support_valid, dtype=bool)
     flat_valid &= np.isfinite(flat_points_local_zyx).all(axis=-1)
     flat_valid &= np.isfinite(normals_local_zyx).all(axis=-1)
+    crop_shape_zyx = (
+        np.asarray(crop_bbox[3:], dtype=np.float32)
+        - np.asarray(crop_bbox[:3], dtype=np.float32)
+    )
+    flat_valid &= (flat_points_local_zyx >= 0.0).all(axis=-1)
+    flat_valid &= (flat_points_local_zyx <= (crop_shape_zyx - 1.0)).all(axis=-1)
 
     normal_magnitudes = np.linalg.norm(normals_local_zyx, axis=-1)
     flat_valid &= normal_magnitudes > 1e-6
@@ -361,11 +429,8 @@ class InkDataset(Dataset):
                     flat_valid,
                     supervision_flat_patch,
                 )
-            full_x, full_y, full_z, full_valid = patch_tifxyz[:, :]
-            full_patch_zyxs = np.stack([full_z, full_y, full_x], axis=-1)
-            (support_y0, support_y1, support_x0, support_x1), support_patch_zyxs, support_valid = _select_flat_pixels_for_native_crop(
-                full_patch_zyxs,
-                full_valid,
+            (support_y0, support_y1, support_x0, support_x1), support_patch_zyxs, support_valid = _select_flat_pixels_for_native_crop_via_stored_resolution(
+                patch_tifxyz,
                 crop_bbox,
             )
             support_supervision_flat_patch = _read_flat_surface_patch(
