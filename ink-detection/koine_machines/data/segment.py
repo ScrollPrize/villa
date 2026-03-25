@@ -36,6 +36,7 @@ class Segment:
         self,
         config,
         image_volume=None,
+        image_volume_3d=None,
         supervision_mask=None,
         validation_mask=None,
         inklabels=None,

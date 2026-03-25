@@ -18,8 +18,7 @@ from vesuvius.models.training.optimizers import (
 )
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.nets.models import make_model
-from koine_machines.data.flat_ink_dataset import FlatInkDataset
-from koine_machines.data.tifxyz_dataset import TifxyzInkDataset
+from koine_machines.data.ink_dataset import FlatInkDataset
 from koine_machines.training.loss.pool_along_normal import _get_normal_pool_offsets, _pool_logits_along_surface_normals
 from koine_machines.models.load_checkpoint import load_training_checkpoint_from_config, restore_training_state
 from koine_machines.training.visualization import PreviewAccumulator, build_validation_preview_log
@@ -129,10 +128,10 @@ def train(config_path):
     input_key = 'image'
     
     if training_mode == 'normal_pooled_3d':
-        shared_ds = TifxyzInkDataset(dataset_config, apply_augmentation=False)
-        train_ds = TifxyzInkDataset(
+        shared_ds = FlatInkDataset(dataset_config, apply_augmentation=False)
+        train_ds = FlatInkDataset(
             dataset_config,
-            apply_augmentation=True,
+            do_augmentations=True,
             patches=shared_ds.patches,
             patch_generation_stats=shared_ds.patch_generation_stats,
         )
