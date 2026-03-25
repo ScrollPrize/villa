@@ -11,7 +11,7 @@ from vesuvius.image_proc.geometry.structure_tensor import (
 
 # Import nnUNet losses
 from vesuvius.models.training.loss.nnunet_losses import (
-    DC_and_CE_loss, DC_and_BCE_loss, MemoryEfficientSoftDiceLoss,
+    DC_and_CE_loss, DC_and_BCE_loss, LabelSmoothedDCAndBCELoss, MemoryEfficientSoftDiceLoss,
     DeepSupervisionWrapper
 )
 from vesuvius.models.training.loss.ect_loss import ECTLoss
@@ -1141,6 +1141,32 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
             weight_dice=weight_dice,
             use_ignore_label=use_ignore_label,
             dice_class=MemoryEfficientSoftDiceLoss
+        )
+
+    elif name == 'LabelSmoothedDCAndBCELoss':
+        soft_dice_kwargs = {
+            'batch_dice': loss_config.get('batch_dice', False),
+            'smooth': loss_config.get('smooth', 1e-5),
+            'do_bg': loss_config.get('do_bg', True),
+            'ddp': loss_config.get('ddp', False)
+        }
+
+        if 'soft_dice_kwargs' in loss_config:
+            soft_dice_kwargs.update(loss_config['soft_dice_kwargs'])
+
+        bce_kwargs = loss_config.get('bce_kwargs', {})
+        weight_ce = loss_config.get('weight_ce', 1)
+        weight_dice = loss_config.get('weight_dice', 1)
+        use_ignore_label = ignore_index is not None
+
+        base_loss = LabelSmoothedDCAndBCELoss(
+            bce_kwargs=bce_kwargs,
+            soft_dice_kwargs=soft_dice_kwargs,
+            weight_ce=weight_ce,
+            weight_dice=weight_dice,
+            use_ignore_label=use_ignore_label,
+            dice_class=MemoryEfficientSoftDiceLoss,
+            bce_label_smoothing=loss_config.get('bce_label_smoothing', 0.0),
         )
     
     elif name == 'MemoryEfficientSoftDiceLoss':

@@ -17,8 +17,9 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         # Split input in half along the channel dimension
         x1, x2 = x.chunk(2, dim=self.dim)
-        # Match timm SwiGLU gate behavior (plain SiLU without clamping)
-        gate = F.silu(x1)
+        # Apply Swish (SiLU) to first half with clamping for stability
+        # Clamp prevents numerical overflow that can cause NaN
+        gate = F.silu(x1.clamp(min=-10, max=10))
         return gate * x2
 
 
@@ -26,7 +27,7 @@ class SwiGLUBlock(nn.Module):
     """
     Linear(d → 2×hidden) → SwiGLU → Linear(hidden → d)
     """
-    def __init__(self, channels, conv_op, bias=True, expansion_factor=16/3):
+    def __init__(self, channels, conv_op, bias=True, expansion_factor=1.5):
         super().__init__()
         hidden_channels = int(channels * expansion_factor)
         # Ensure hidden_channels is even for the split in SwiGLU

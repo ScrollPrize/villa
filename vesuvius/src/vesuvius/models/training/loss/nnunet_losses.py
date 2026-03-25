@@ -353,6 +353,45 @@ class DC_and_BCE_loss(nn.Module):
         return result
 
 
+class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
+    """
+    DC_and_BCE_loss with optional label smoothing applied to BCE targets.
+    """
+    def __init__(self, *args, bce_label_smoothing: float = 0.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not 0.0 <= bce_label_smoothing <= 1.0:
+            raise ValueError(
+                f"bce_label_smoothing must be between 0 and 1, got {bce_label_smoothing}"
+            )
+        self.bce_label_smoothing = float(bce_label_smoothing)
+
+    def _smooth_bce_targets(self, target_regions: torch.Tensor) -> torch.Tensor:
+        target_regions = target_regions.float()
+        if self.bce_label_smoothing == 0.0:
+            return target_regions
+        return target_regions * (1.0 - self.bce_label_smoothing) + 0.5 * self.bce_label_smoothing
+
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor, loss_mask: torch.Tensor = None):
+        if self.use_ignore_label:
+            if target.dtype == torch.bool:
+                mask = ~target[:, -1:]
+            else:
+                mask = (1 - target[:, -1:]).bool()
+            target_regions = target[:, :-1]
+        else:
+            target_regions = target
+            mask = loss_mask
+
+        dc_loss = self.dc(net_output, target_regions, loss_mask=mask)
+        smoothed_targets = self._smooth_bce_targets(target_regions)
+        if mask is not None:
+            denom = torch.clip(mask.sum(), min=1e-8)
+            ce_loss = (self.ce(net_output, smoothed_targets) * mask).sum() / denom
+        else:
+            ce_loss = self.ce(net_output, smoothed_targets)
+        return self.weight_ce * ce_loss + self.weight_dice * dc_loss
+
+
 class DeepSupervisionWrapper(nn.Module):
     """
     Wrapper for deep supervision as used in nnUNetv2.
