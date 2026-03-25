@@ -3687,13 +3687,17 @@ void CWindow::onAppendMaskPressed(void)
             // Append the new image layer to existing layers
             existing_layers.push_back(img);
 
+            // Generate overlap visual layer if surface overlays are selected
+            cv::Mat overlapLayer = generateOverlapMaskLayer(surf.get());
+            if (!overlapLayer.empty()) {
+                existing_layers.push_back(overlapLayer);
+            }
+
             // Save all layers
             imwritemulti(path.string(), existing_layers);
 
-            QString message = useComposite ?
-                tr("Appended composite surface image to existing mask (now %1 layers)").arg(existing_layers.size()) :
-                tr("Appended surface image to existing mask (now %1 layers)").arg(existing_layers.size());
-            statusBar()->showMessage(message, 3000);
+            statusBar()->showMessage(
+                tr("Appended surface image to existing mask (now %1 layers)").arg(existing_layers.size()), 3000);
 
         } else {
             // No existing mask, generate both mask and image at raw points resolution
@@ -3712,20 +3716,16 @@ void CWindow::onAppendMaskPressed(void)
 
             // Save as new multi-layer TIFF
             std::vector<cv::Mat> layers = {mask, img};
+
+            cv::Mat overlapLayer = generateOverlapMaskLayer(surf.get());
+            if (!overlapLayer.empty()) {
+                layers.push_back(overlapLayer);
+            }
+
             imwritemulti(path.string(), layers);
 
-            QString message = useComposite ?
-                tr("Created new surface mask with composite image data") :
-                tr("Created new surface mask with image data");
-            statusBar()->showMessage(message, 3000);
-        }
-
-        // Generate overlap visual as separate file if surface overlays are selected
-        cv::Mat overlapLayer = generateOverlapMaskLayer(surf.get());
-        if (!overlapLayer.empty()) {
-            std::filesystem::path overlapPath = surf->path / "overlap.tif";
-            cv::imwrite(overlapPath.string(), overlapLayer);
-            statusBar()->showMessage(statusBar()->currentMessage() + tr(" + overlap.tif"), 3000);
+            statusBar()->showMessage(
+                tr("Created new surface mask with image data (%1 layers)").arg(layers.size()), 3000);
         }
 
         // Update metadata
