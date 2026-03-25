@@ -1,6 +1,5 @@
 import aiohttp
 import json
-import re
 import warnings
 from pathlib import Path
 
@@ -112,121 +111,10 @@ def open_zarr(path, resolution, auth=None):
         return zarr.open(store, path=str(resolution), mode="r")
     return zarr.open(path_str, path=str(resolution), mode="r")
 
-
-_LABEL_ASSET_NAME_RE = re.compile(
-    r"^(?P<prefix>.*)_(?P<label_kind>inklabels|supervision_mask|validation_mask)"
-    r"(?:_v(?P<version_num>\d+))?(?P<extension>\.(?:tif|tiff|zarr))$",
-    re.IGNORECASE,
-)
-
-
-def normalize_label_version(label_version):
-    if label_version in (None, ""):
-        return None
-    if isinstance(label_version, str):
-        value = label_version.strip().lower()
-        if value in {"", "auto", "latest"}:
-            return None
-        if value in {"base", "unversioned", "v1"}:
-            return 1
-        if value.startswith("v") and value[1:].isdigit():
-            version_num = int(value[1:])
-            if version_num < 1:
-                raise ValueError(f"label_version must be >= v1, got {label_version!r}")
-            return version_num
-        raise ValueError(
-            f"label_version must be one of None/'auto', 'base', or 'vN', got {label_version!r}"
-        )
-    if isinstance(label_version, (int, np.integer)):
-        version_num = int(label_version)
-        if version_num < 1:
-            raise ValueError(f"label_version must be >= 1, got {label_version!r}")
-        return version_num
-    raise ValueError(
-        f"label_version must be None, a string like 'v2', or an integer, got {type(label_version).__name__}"
-    )
-
-
 def label_version_cache_token(label_version):
-    version_num = normalize_label_version(label_version)
-    if version_num is None:
+    if label_version in (None, ""):
         return "auto"
-    if version_num <= 1:
-        return "base"
-    return f"v{version_num}"
-
-
-def _split_path_dir_and_name(path):
-    path_str = str(path).rstrip("/")
-    last_sep = max(path_str.rfind("/"), path_str.rfind("\\"))
-    if last_sep < 0:
-        return "", path_str
-    return path_str[: last_sep + 1], path_str[last_sep + 1 :]
-
-
-def parse_label_asset_path(path):
-    dir_prefix, name = _split_path_dir_and_name(path)
-    match = _LABEL_ASSET_NAME_RE.match(name)
-    if match is None:
-        return None
-    version_num_raw = match.group("version_num")
-    version_num = 1 if version_num_raw is None else int(version_num_raw)
-    return {
-        "path": str(path),
-        "dir_prefix": dir_prefix,
-        "name": name,
-        "prefix": match.group("prefix"),
-        "label_kind": match.group("label_kind").lower(),
-        "version_num": version_num,
-        "extension": match.group("extension"),
-    }
-
-
-def build_matching_label_asset_path(path, *, label_kind):
-    parsed = parse_label_asset_path(path)
-    assert parsed is not None, f"Label path has unexpected format: {path}"
-    version_suffix = "" if int(parsed["version_num"]) <= 1 else f"_v{int(parsed['version_num'])}"
-    return (
-        f"{parsed['dir_prefix']}{parsed['prefix']}_{str(label_kind)}"
-        f"{version_suffix}{parsed['extension']}"
-    )
-
-
-def resolve_versioned_label_path(paths, *, label_kind, label_version=None, context="labels"):
-    requested_version = normalize_label_version(label_version)
-    candidates = {}
-    for path in paths:
-        parsed = parse_label_asset_path(path)
-        if parsed is None or parsed["label_kind"] != str(label_kind):
-            continue
-        candidates[int(parsed["version_num"])] = str(path)
-
-    assert candidates, f"{context} must contain at least one {label_kind} path."
-
-    if requested_version is not None:
-        resolved = candidates.get(int(requested_version))
-        requested_name = "base" if int(requested_version) <= 1 else f"v{int(requested_version)}"
-        assert resolved is not None, (
-            f"{context} does not contain {label_kind} version {requested_name}."
-        )
-        return resolved
-
-    return candidates[max(candidates)]
-
-
-def resolve_segment_inklabel_path(segment, *, label_version=None):
-    segment_uuid = str(segment.uuid)
-    ink_label_paths = [
-        str(label["path"])
-        for label in segment.list_labels()
-        if label.get("name") == "inklabels" and label.get("path") is not None
-    ]
-    return resolve_versioned_label_path(
-        ink_label_paths,
-        label_kind="inklabels",
-        label_version=label_version,
-        context=f"Segment {segment_uuid!r}",
-    )
+    return str(label_version).strip()
 
 def to_uint8_image(image_2d):
     image_2d = np.nan_to_num(np.asarray(image_2d, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
@@ -427,6 +315,7 @@ def _reconcile_label_mask_shape(
 
 def load_segment_label_masks(segment, shape, label_version=None):
     import cv2
+    from koine_machines.data.segment import Segment
 
     segment_uuid = str(segment.uuid)
     shape = tuple(int(v) for v in shape)
@@ -448,11 +337,11 @@ def load_segment_label_masks(segment, shape, label_version=None):
         )
         return np.asarray(mask > 0, dtype=bool)
 
-    ink_label_path = resolve_segment_inklabel_path(
+    ink_label_path = Segment.resolve_segment_inklabel_path(
         segment,
         label_version=label_version,
     )
-    supervision_path = build_matching_label_asset_path(
+    supervision_path = Segment.build_matching_label_asset_path(
         ink_label_path,
         label_kind="supervision_mask",
     )

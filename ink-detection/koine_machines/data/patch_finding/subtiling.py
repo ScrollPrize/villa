@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from common import open_zarr
+from koine_machines.common.common import open_zarr
 from ink.recipes.components import component_bboxes
 
 

@@ -8,32 +8,6 @@ _LABEL_SUFFIXES = (
 _LABEL_EXTENSIONS = {".tif", ".tiff", ".zarr"}
 
 
-def _normalize_label_version(label_version):
-    if label_version in (None, ""):
-        return None
-    if isinstance(label_version, str):
-        value = label_version.strip().lower()
-        if value in {"", "auto", "latest"}:
-            return None
-        if value in {"base", "unversioned", "v1"}:
-            return 1
-        if value.startswith("v") and value[1:].isdigit():
-            version_num = int(value[1:])
-            if version_num < 1:
-                raise ValueError(f"label_version must be >= v1, got {label_version!r}")
-            return version_num
-        raise ValueError(
-            f"label_version must be one of None/'auto', 'base', or 'vN', got {label_version!r}"
-        )
-    if isinstance(label_version, int):
-        if label_version < 1:
-            raise ValueError(f"label_version must be >= 1, got {label_version!r}")
-        return label_version
-    raise ValueError(
-        f"label_version must be None, a string like 'v2', or an integer, got {type(label_version).__name__}"
-    )
-
-
 def _parse_label_asset_path(name):
     path = Path(name)
     extension = path.suffix.lower()
@@ -83,6 +57,76 @@ class Segment:
         self.segment_name = segment_name
         self.patch_size = config["patch_size"]
 
+    @staticmethod
+    def parse_label_asset_path(path):
+        path = Path(path)
+        parsed = _parse_label_asset_path(path.name)
+        if parsed is None:
+            return None
+        return {
+            "path": path,
+            "dir_prefix": path.parent,
+            "name": path.name,
+            **parsed,
+        }
+
+    @classmethod
+    def build_matching_label_asset_path(cls, path, *, label_kind):
+        parsed = cls.parse_label_asset_path(path)
+        assert parsed is not None, f"Label path has unexpected format: {path}"
+        version_suffix = (
+            "" if int(parsed["version_num"]) <= 1 else f"_v{int(parsed['version_num'])}"
+        )
+        return parsed["dir_prefix"] / (
+            f"{parsed['prefix']}_{str(label_kind)}{version_suffix}{parsed['extension']}"
+        )
+
+    @classmethod
+    def resolve_versioned_label_path(
+        cls,
+        paths,
+        *,
+        label_kind,
+        label_version=None,
+        context="labels",
+    ):
+        requested_version = (
+            None if label_version in (None, "") else str(label_version).strip()
+        )
+        candidates = {}
+        for path in paths:
+            parsed = cls.parse_label_asset_path(path)
+            if parsed is None or parsed["label_kind"] != str(label_kind):
+                continue
+            candidates[int(parsed["version_num"])] = Path(path)
+
+        assert candidates, f"{context} must contain at least one {label_kind} path."
+
+        if requested_version:
+            for version_num, candidate_path in candidates.items():
+                if f"v{version_num}" == requested_version:
+                    return candidate_path
+            raise AssertionError(
+                f"{context} does not contain {label_kind} version {requested_version}."
+            )
+
+        return candidates[max(candidates)]
+
+    @classmethod
+    def resolve_segment_inklabel_path(cls, segment, *, label_version=None):
+        segment_uuid = str(segment.uuid)
+        ink_label_paths = [
+            Path(str(label["path"]))
+            for label in segment.list_labels()
+            if label.get("name") == "inklabels" and label.get("path") is not None
+        ]
+        return cls.resolve_versioned_label_path(
+            ink_label_paths,
+            label_kind="inklabels",
+            label_version=label_version,
+            context=f"Segment {segment_uuid!r}",
+        )
+
     @property
     def cache_key(self):
         return (
@@ -101,7 +145,9 @@ class Segment:
         segment_name = self.segment_name or self.segment_dir.name
         resolved_label_version = self.config.get("label_version") if label_version is None else label_version
         normalized_extension = str(extension).lower()
-        requested_version = _normalize_label_version(resolved_label_version)
+        requested_version = (
+            None if resolved_label_version in (None, "") else str(resolved_label_version).strip()
+        )
         candidates_by_version = {}
         candidates_by_kind = {
             "inklabels": {},
@@ -110,7 +156,7 @@ class Segment:
         }
 
         for path in self.segment_dir.iterdir():
-            parsed = _parse_label_asset_path(path.name)
+            parsed = self.parse_label_asset_path(path)
             if parsed is None:
                 continue
             if parsed["prefix"] != str(segment_name):
@@ -122,18 +168,18 @@ class Segment:
             version_entry[parsed["label_kind"]] = path
             candidates_by_kind[parsed["label_kind"]][version_num] = path
 
-        if requested_version is not None:
-            available_versions = sorted(
-                version_num
-                for version_num, record in candidates_by_version.items()
-                if "inklabels" in record and "supervision_mask" in record
-            )
-            requested_name = "base" if requested_version <= 1 else f"v{requested_version}"
-            assert requested_version in available_versions, (
+        if requested_version:
+            selected = None
+            for version_num, record in candidates_by_version.items():
+                if "inklabels" not in record or "supervision_mask" not in record:
+                    continue
+                if f"v{version_num}" == requested_version:
+                    selected = record
+                    break
+            assert selected is not None, (
                 f"{self.segment_dir} does not contain matching {normalized_extension} labels "
-                f"for version {requested_name}."
+                f"for version {requested_version}."
             )
-            selected = candidates_by_version[requested_version]
             inklabels = selected["inklabels"]
             supervision_mask = selected["supervision_mask"]
             validation_mask = selected.get("validation_mask")
@@ -157,15 +203,8 @@ class Segment:
         return inklabels, supervision_mask, validation_mask
     
     def _find_patches(self):
-        try:
-            from koine_machines.data.patch_finding.default import find_segment_patches
-        except ImportError:
-            from data.patch_finding.default import find_segment_patches
-
-        try:
-            from .patch import Patch
-        except ImportError:
-            from patch import Patch
+        from koine_machines.data.patch_finding.default import find_segment_patches
+        from koine_machines.data.patch import Patch
 
         training_patches, validation_patches = find_segment_patches(self, Patch)
         self.training_patches = training_patches

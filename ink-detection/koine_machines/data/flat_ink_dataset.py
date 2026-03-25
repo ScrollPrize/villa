@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 from torch.utils.data import Dataset
 import numpy as np 
-from common import (
+from koine_machines.common.common import (
     _read_bbox_with_padding,
     flat_patch_cache_path,
     flat_patch_finding_cache_token,

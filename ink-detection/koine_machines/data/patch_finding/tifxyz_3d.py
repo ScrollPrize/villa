@@ -9,12 +9,12 @@ import numpy as np
 from tqdm.auto import tqdm
 
 import vesuvius.tifxyz as tifxyz
-from common import (
+from koine_machines.common.common import (
     label_version_cache_token,
     load_segment_label_masks,
     open_zarr,
-    resolve_segment_inklabel_path,
 )
+from koine_machines.data.segment import Segment
 from vesuvius.neural_tracing.datasets.common import (
     _parse_z_range,
     _segment_overlaps_z_range,
@@ -1060,7 +1060,7 @@ def _build_cached_segment_records(
             volume=volume,
         )
         try:
-            ink_label_path = resolve_segment_inklabel_path(
+            ink_label_path = Segment.resolve_segment_inklabel_path(
                 lazy_segment,
                 label_version=label_version,
             )
