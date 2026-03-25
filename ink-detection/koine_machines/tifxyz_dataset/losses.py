@@ -7,7 +7,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from vesuvius.models.training.loss.nnunet_losses import LabelSmoothedDCAndBCELoss
 
@@ -116,11 +115,15 @@ def _compute_loss_from_result(
     pred_field: torch.Tensor,
     tgt_field: torch.Tensor,
     result,
+    mask: Optional[torch.Tensor] = None,
     *,
     include_unmatched_target: bool,
     push_to: str,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     ndim = pred_field.ndim
+    if mask is not None and ndim != 2:
+        raise ValueError("Mask-aware projected Betti loss only supports 2D fields")
+
     pred_birth_coords = _concat_result_arrays(result.input1_matched_birth_coordinates, ndim)
     pred_death_coords = _concat_result_arrays(result.input1_matched_death_coordinates, ndim)
     tgt_birth_coords = _concat_result_arrays(result.input2_matched_birth_coordinates, ndim)
@@ -131,6 +134,16 @@ def _compute_loss_from_result(
     tgt_unmatched_birth = _concat_result_arrays(result.input2_unmatched_birth_coordinates, ndim)
     tgt_unmatched_death = _concat_result_arrays(result.input2_unmatched_death_coordinates, ndim)
 
+    matched_keep = _filter_coords_by_mask(pred_birth_coords, mask)
+    matched_keep &= _filter_coords_by_mask(pred_death_coords, mask)
+    matched_keep &= _filter_coords_by_mask(tgt_birth_coords, mask)
+    matched_keep &= _filter_coords_by_mask(tgt_death_coords, mask)
+
+    pred_birth_coords = pred_birth_coords[matched_keep]
+    pred_death_coords = pred_death_coords[matched_keep]
+    tgt_birth_coords = tgt_birth_coords[matched_keep]
+    tgt_death_coords = tgt_death_coords[matched_keep]
+
     pred_birth_vals = _tensor_values_at_coords(pred_field, pred_birth_coords)
     pred_death_vals = _tensor_values_at_coords(pred_field, pred_death_coords)
     tgt_birth_vals = _tensor_values_at_coords(tgt_field, tgt_birth_coords)
@@ -140,6 +153,11 @@ def _compute_loss_from_result(
     tgt_matched_pairs = _stack_pairs(tgt_birth_vals, tgt_death_vals)
     loss_matched = 2.0 * ((pred_matched_pairs - tgt_matched_pairs) ** 2).sum()
 
+    pred_unmatched_keep = _filter_coords_by_mask(pred_unmatched_birth, mask)
+    pred_unmatched_keep &= _filter_coords_by_mask(pred_unmatched_death, mask)
+    pred_unmatched_birth = pred_unmatched_birth[pred_unmatched_keep]
+    pred_unmatched_death = pred_unmatched_death[pred_unmatched_keep]
+
     pred_unmatched_birth_vals = _tensor_values_at_coords(pred_field, pred_unmatched_birth)
     pred_unmatched_death_vals = _tensor_values_at_coords(pred_field, pred_unmatched_death)
     pred_unmatched_pairs = _stack_pairs(pred_unmatched_birth_vals, pred_unmatched_death_vals)
@@ -147,7 +165,12 @@ def _compute_loss_from_result(
 
     total = loss_matched + loss_unmatched_pred
     loss_unmatched_tgt = pred_field.new_zeros(())
-    if include_unmatched_target and tgt_unmatched_birth.size > 0:
+    if include_unmatched_target:
+        tgt_unmatched_keep = _filter_coords_by_mask(tgt_unmatched_birth, mask)
+        tgt_unmatched_keep &= _filter_coords_by_mask(tgt_unmatched_death, mask)
+        tgt_unmatched_birth = tgt_unmatched_birth[tgt_unmatched_keep]
+        tgt_unmatched_death = tgt_unmatched_death[tgt_unmatched_keep]
+
         tgt_unmatched_birth_vals = _tensor_values_at_coords(tgt_field, tgt_unmatched_birth)
         tgt_unmatched_death_vals = _tensor_values_at_coords(tgt_field, tgt_unmatched_death)
         tgt_unmatched_pairs = _stack_pairs(tgt_unmatched_birth_vals, tgt_unmatched_death_vals)
@@ -180,126 +203,6 @@ def _filter_coords_by_mask(
     return mask_np[row, col] >= threshold
 
 
-def _compute_loss_from_result_with_mask(
-    pred_field: torch.Tensor,
-    tgt_field: torch.Tensor,
-    result,
-    mask: Optional[torch.Tensor],
-    *,
-    include_unmatched_target: bool,
-    push_to: str,
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    ndim = pred_field.ndim
-    if mask is not None and ndim != 2:
-        raise ValueError("Mask-aware projected Betti loss only supports 2D fields")
-
-    def _filtered_coords(list_of_arrays) -> np.ndarray:
-        return _concat_result_arrays(list_of_arrays, ndim)
-
-    pred_birth_coords = _filtered_coords(result.input1_matched_birth_coordinates)
-    pred_death_coords = _filtered_coords(result.input1_matched_death_coordinates)
-    tgt_birth_coords = _filtered_coords(result.input2_matched_birth_coordinates)
-    tgt_death_coords = _filtered_coords(result.input2_matched_death_coordinates)
-
-    matched_keep = _filter_coords_by_mask(pred_birth_coords, mask)
-    matched_keep &= _filter_coords_by_mask(pred_death_coords, mask)
-    matched_keep &= _filter_coords_by_mask(tgt_birth_coords, mask)
-    matched_keep &= _filter_coords_by_mask(tgt_death_coords, mask)
-
-    pred_birth_coords = pred_birth_coords[matched_keep]
-    pred_death_coords = pred_death_coords[matched_keep]
-    tgt_birth_coords = tgt_birth_coords[matched_keep]
-    tgt_death_coords = tgt_death_coords[matched_keep]
-
-    pred_birth_vals = _tensor_values_at_coords(pred_field, pred_birth_coords)
-    pred_death_vals = _tensor_values_at_coords(pred_field, pred_death_coords)
-    tgt_birth_vals = _tensor_values_at_coords(tgt_field, tgt_birth_coords)
-    tgt_death_vals = _tensor_values_at_coords(tgt_field, tgt_death_coords)
-
-    pred_matched_pairs = _stack_pairs(pred_birth_vals, pred_death_vals)
-    tgt_matched_pairs = _stack_pairs(tgt_birth_vals, tgt_death_vals)
-    loss_matched = 2.0 * ((pred_matched_pairs - tgt_matched_pairs) ** 2).sum()
-
-    pred_unmatched_birth = _filtered_coords(result.input1_unmatched_birth_coordinates)
-    pred_unmatched_death = _filtered_coords(result.input1_unmatched_death_coordinates)
-    pred_unmatched_keep = _filter_coords_by_mask(pred_unmatched_birth, mask)
-    pred_unmatched_keep &= _filter_coords_by_mask(pred_unmatched_death, mask)
-    pred_unmatched_birth = pred_unmatched_birth[pred_unmatched_keep]
-    pred_unmatched_death = pred_unmatched_death[pred_unmatched_keep]
-
-    pred_unmatched_birth_vals = _tensor_values_at_coords(pred_field, pred_unmatched_birth)
-    pred_unmatched_death_vals = _tensor_values_at_coords(pred_field, pred_unmatched_death)
-    pred_unmatched_pairs = _stack_pairs(pred_unmatched_birth_vals, pred_unmatched_death_vals)
-    loss_unmatched_pred = _loss_unmatched(pred_unmatched_pairs, push_to=push_to)
-
-    total = loss_matched + loss_unmatched_pred
-    loss_unmatched_tgt = pred_field.new_zeros(())
-
-    if include_unmatched_target:
-        tgt_unmatched_birth = _filtered_coords(result.input2_unmatched_birth_coordinates)
-        tgt_unmatched_death = _filtered_coords(result.input2_unmatched_death_coordinates)
-        tgt_unmatched_keep = _filter_coords_by_mask(tgt_unmatched_birth, mask)
-        tgt_unmatched_keep &= _filter_coords_by_mask(tgt_unmatched_death, mask)
-        tgt_unmatched_birth = tgt_unmatched_birth[tgt_unmatched_keep]
-        tgt_unmatched_death = tgt_unmatched_death[tgt_unmatched_keep]
-
-        tgt_unmatched_birth_vals = _tensor_values_at_coords(tgt_field, tgt_unmatched_birth)
-        tgt_unmatched_death_vals = _tensor_values_at_coords(tgt_field, tgt_unmatched_death)
-        tgt_unmatched_pairs = _stack_pairs(tgt_unmatched_birth_vals, tgt_unmatched_death_vals)
-        loss_unmatched_tgt = _loss_unmatched(tgt_unmatched_pairs, push_to=push_to)
-        total = total + loss_unmatched_tgt
-
-    aux = {
-        "betti/matched": loss_matched.reshape(1).detach(),
-        "betti/unmatched_pred": loss_unmatched_pred.reshape(1).detach(),
-    }
-    if include_unmatched_target:
-        aux["betti/unmatched_target"] = loss_unmatched_tgt.reshape(1).detach()
-    return total.reshape(1), aux
-
-
-def _zero_betti_aux(template: torch.Tensor, *, include_unmatched_target: bool) -> Dict[str, torch.Tensor]:
-    zero = template.new_zeros((1,))
-    aux = {
-        "betti/matched": zero.detach(),
-        "betti/unmatched_pred": zero.detach(),
-    }
-    if include_unmatched_target:
-        aux["betti/unmatched_target"] = zero.detach()
-    return aux
-
-
-def _crop_fields_to_valid_mask_bbox(
-    pred_field: torch.Tensor,
-    tgt_field: torch.Tensor,
-    mask: Optional[torch.Tensor],
-    threshold: float = 0.5,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], bool]:
-    if mask is None:
-        return pred_field, tgt_field, mask, True
-    if mask.ndim != 2:
-        raise ValueError(f"Mask-aware projected Betti loss expects 2D masks, got shape {tuple(mask.shape)}")
-
-    valid_coords = torch.nonzero(mask >= threshold, as_tuple=False)
-    if valid_coords.numel() == 0:
-        return pred_field, tgt_field, mask, False
-
-    row_min = int(valid_coords[:, 0].min().item())
-    row_max = int(valid_coords[:, 0].max().item()) + 1
-    col_min = int(valid_coords[:, 1].min().item())
-    col_max = int(valid_coords[:, 1].max().item()) + 1
-
-    if row_min == 0 and row_max == mask.shape[0] and col_min == 0 and col_max == mask.shape[1]:
-        return pred_field, tgt_field, mask, True
-
-    return (
-        pred_field[row_min:row_max, col_min:col_max].contiguous(),
-        tgt_field[row_min:row_max, col_min:col_max].contiguous(),
-        mask[row_min:row_max, col_min:col_max].contiguous(),
-        True,
-    )
-
-
 def _aggregate_aux(aux_parts: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     aux_agg: Dict[str, torch.Tensor] = {}
     if not aux_parts:
@@ -330,66 +233,6 @@ def _extract_target_regions_and_valid_mask(
         valid_mask = loss_mask.float() if loss_mask is not None else None
 
     return target_regions, valid_mask
-
-
-def _foreground_probabilities(input: torch.Tensor) -> torch.Tensor:
-    num_channels = int(input.shape[1])
-    if num_channels == 2:
-        return torch.softmax(input, dim=1)[:, 1:2]
-    if num_channels == 1:
-        if bool((input.min() >= 0).item()) and bool((input.max() <= 1).item()):
-            return input
-        return torch.sigmoid(input)
-    raise ValueError(f"Boundary-style losses expect 1 or 2 output channels, got {num_channels}")
-
-
-def _max_pool_spatial(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
-    padding = kernel_size // 2
-    spatial_dims = x.ndim - 2
-    if spatial_dims == 2:
-        return F.max_pool2d(x, kernel_size=kernel_size, stride=1, padding=padding)
-    if spatial_dims == 3:
-        return F.max_pool3d(x, kernel_size=kernel_size, stride=1, padding=padding)
-    raise ValueError(f"Expected 2D or 3D tensors for boundary loss, got shape {tuple(x.shape)}")
-
-
-def _min_pool_spatial(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
-    if kernel_size == 1:
-        return x
-    if x.device.type == "cuda":
-        return -_max_pool_spatial(-x, kernel_size)
-    return _min_pool_spatial_unfold(x, kernel_size)
-
-
-def _pad_spatial_dim_constant(x: torch.Tensor, dim: int, padding: int, value: float) -> torch.Tensor:
-    spatial_dims = x.ndim - 2
-    spatial_index = dim - 2
-    pad = [0] * (2 * spatial_dims)
-    pad_offset = 2 * (spatial_dims - spatial_index - 1)
-    pad[pad_offset] = padding
-    pad[pad_offset + 1] = padding
-    return F.pad(x, pad, mode="constant", value=value)
-
-
-def _min_pool_spatial_unfold(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
-    if not torch.is_floating_point(x):
-        raise TypeError(f"Expected floating point tensor for boundary loss, got {x.dtype}")
-
-    out = x
-    padding = kernel_size // 2
-    pad_value = torch.finfo(out.dtype).max
-    for dim in range(2, out.ndim):
-        out = _pad_spatial_dim_constant(out, dim, padding, pad_value)
-        out = out.unfold(dim, kernel_size, 1).amin(dim=-1)
-    return out
-
-
-def _erode_spatial(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
-    return _min_pool_spatial(x, kernel_size)
-
-
-def _boundary_map(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
-    return torch.clamp(x - _erode_spatial(x, kernel_size), min=0.0, max=1.0)
 
 
 class BettiMatchingLoss(nn.Module):
@@ -430,10 +273,19 @@ class BettiMatchingLoss(nn.Module):
         tgts_fields = [tgt_fg[b, 0].contiguous() for b in range(batch_size)]
         return preds_fields, tgts_fields
 
+    def _split_target_and_mask(
+        self,
+        input: torch.Tensor,
+        target: torch.Tensor,
+        loss_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return _extract_target_regions_and_valid_mask(input, target, loss_mask=loss_mask)
+
     def _compute_loss_batch(
         self,
         pred_fields: List[torch.Tensor],
         tgt_fields: List[torch.Tensor],
+        valid_masks: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         bm = _get_betti_module()
         results = bm.compute_matching(
@@ -445,131 +297,15 @@ class BettiMatchingLoss(nn.Module):
 
         losses: List[torch.Tensor] = []
         aux_parts: List[Dict[str, torch.Tensor]] = []
-        for pred_field, tgt_field, result in zip(pred_fields, tgt_fields, results):
+        if valid_masks is None:
+            valid_masks = [None] * len(pred_fields)
+
+        for pred_field, tgt_field, valid_mask, result in zip(pred_fields, tgt_fields, valid_masks, results):
             loss_part, aux_part = _compute_loss_from_result(
                 pred_field,
                 tgt_field,
                 result,
-                include_unmatched_target=self.include_unmatched_target,
-                push_to=self.push_unmatched_to,
-            )
-            losses.append(loss_part)
-            aux_parts.append(aux_part)
-
-        return torch.mean(torch.cat(losses)), _aggregate_aux(aux_parts)
-
-    def forward(self, input: torch.Tensor, target: torch.Tensor):
-        if input.shape[0] == 0:
-            zero = input.new_tensor(0.0)
-            return zero, {}
-
-        pred_fields, tgt_fields = self._prepare_fields(input, target)
-
-        if self.filtration == "bothlevel":
-            loss_super, aux_super = self._compute_loss_batch(
-                [1.0 - field for field in pred_fields],
-                [1.0 - field for field in tgt_fields],
-            )
-            loss_sub, aux_sub = self._compute_loss_batch(pred_fields, tgt_fields)
-            loss = 0.5 * (loss_super + loss_sub)
-            aux = {}
-            for key in set(aux_super) | set(aux_sub):
-                if key in aux_super and key in aux_sub:
-                    aux[key] = 0.5 * (aux_super[key] + aux_sub[key])
-                elif key in aux_super:
-                    aux[key] = 0.5 * aux_super[key]
-                else:
-                    aux[key] = 0.5 * aux_sub[key]
-            return loss, aux
-
-        if self.filtration == "superlevel":
-            pred_fields = [1.0 - field for field in pred_fields]
-            tgt_fields = [1.0 - field for field in tgt_fields]
-
-        return self._compute_loss_batch(pred_fields, tgt_fields)
-
-
-class MaskedBettiMatchingLoss(BettiMatchingLoss):
-    def __init__(
-        self,
-        filtration: str = "superlevel",
-        include_unmatched_target: bool = False,
-        push_unmatched_to: str = "diagonal",
-        crop_to_valid_bbox: bool = True,
-    ):
-        super().__init__(
-            filtration=filtration,
-            include_unmatched_target=include_unmatched_target,
-            push_unmatched_to=push_unmatched_to,
-        )
-        self.crop_to_valid_bbox = bool(crop_to_valid_bbox)
-
-    def _split_target_and_mask(
-        self,
-        input: torch.Tensor,
-        target: torch.Tensor,
-        loss_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return _extract_target_regions_and_valid_mask(input, target, loss_mask=loss_mask)
-
-    def _compute_loss_batch_masked(
-        self,
-        pred_fields: List[torch.Tensor],
-        tgt_fields: List[torch.Tensor],
-        valid_masks: List[Optional[torch.Tensor]],
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        sample_infos = []
-        active_pred_fields: List[torch.Tensor] = []
-        active_tgt_fields: List[torch.Tensor] = []
-
-        for pred_field, tgt_field, valid_mask in zip(pred_fields, tgt_fields, valid_masks):
-            if self.crop_to_valid_bbox:
-                pred_field, tgt_field, valid_mask, has_valid = _crop_fields_to_valid_mask_bbox(
-                    pred_field,
-                    tgt_field,
-                    valid_mask,
-                )
-                if not has_valid:
-                    sample_infos.append(None)
-                    continue
-
-            sample_infos.append((pred_field, tgt_field, valid_mask))
-            active_pred_fields.append(pred_field)
-            active_tgt_fields.append(tgt_field)
-
-        results_iter = iter(())
-        if active_pred_fields:
-            bm = _get_betti_module()
-            results_iter = iter(
-                bm.compute_matching(
-                    _to_numpy(active_pred_fields),
-                    _to_numpy(active_tgt_fields),
-                    include_input1_unmatched_pairs=True,
-                    include_input2_unmatched_pairs=self.include_unmatched_target,
-                )
-            )
-
-        losses: List[torch.Tensor] = []
-        aux_parts: List[Dict[str, torch.Tensor]] = []
-        for sample_info in sample_infos:
-            if sample_info is None:
-                zero = pred_fields[0].new_zeros((1,))
-                losses.append(zero)
-                aux_parts.append(
-                    _zero_betti_aux(
-                        pred_fields[0],
-                        include_unmatched_target=self.include_unmatched_target,
-                    )
-                )
-                continue
-
-            pred_field, tgt_field, valid_mask = sample_info
-            result = next(results_iter)
-            loss_part, aux_part = _compute_loss_from_result_with_mask(
-                pred_field,
-                tgt_field,
-                result,
-                valid_mask,
+                mask=valid_mask,
                 include_unmatched_target=self.include_unmatched_target,
                 push_to=self.push_unmatched_to,
             )
@@ -585,19 +321,17 @@ class MaskedBettiMatchingLoss(BettiMatchingLoss):
 
         target_regions, valid_mask = self._split_target_and_mask(input, target, loss_mask=loss_mask)
         pred_fields, tgt_fields = self._prepare_fields(input, target_regions)
-        valid_masks = None
+        valid_masks = [None] * input.shape[0]
         if valid_mask is not None:
             valid_masks = [valid_mask[b, 0].contiguous() for b in range(valid_mask.shape[0])]
-        else:
-            valid_masks = [None] * input.shape[0]
 
         if self.filtration == "bothlevel":
-            loss_super, aux_super = self._compute_loss_batch_masked(
+            loss_super, aux_super = self._compute_loss_batch(
                 [1.0 - field for field in pred_fields],
                 [1.0 - field for field in tgt_fields],
                 valid_masks,
             )
-            loss_sub, aux_sub = self._compute_loss_batch_masked(pred_fields, tgt_fields, valid_masks)
+            loss_sub, aux_sub = self._compute_loss_batch(pred_fields, tgt_fields, valid_masks)
             loss = 0.5 * (loss_super + loss_sub)
             aux = {}
             for key in set(aux_super) | set(aux_sub):
@@ -613,91 +347,7 @@ class MaskedBettiMatchingLoss(BettiMatchingLoss):
             pred_fields = [1.0 - field for field in pred_fields]
             tgt_fields = [1.0 - field for field in tgt_fields]
 
-        return self._compute_loss_batch_masked(pred_fields, tgt_fields, valid_masks)
-
-
-class BoundaryLoss(nn.Module):
-    def __init__(
-        self,
-        kernel_size: int = 3,
-        weight_bce: float = 1.0,
-        weight_dice: float = 1.0,
-        smooth: float = 1.0,
-        eps: float = 1e-6,
-    ):
-        super().__init__()
-        kernel_size = int(kernel_size)
-        if kernel_size < 1 or (kernel_size % 2) != 1:
-            raise ValueError(f"BoundaryLoss kernel_size must be odd and >= 1, got {kernel_size}")
-        if weight_bce < 0.0 or weight_dice < 0.0:
-            raise ValueError("BoundaryLoss weights must be non-negative")
-        if weight_bce == 0.0 and weight_dice == 0.0:
-            raise ValueError("BoundaryLoss requires at least one non-zero component weight")
-        if smooth <= 0.0:
-            raise ValueError(f"BoundaryLoss smooth must be > 0, got {smooth}")
-        if eps <= 0.0:
-            raise ValueError(f"BoundaryLoss eps must be > 0, got {eps}")
-
-        self.kernel_size = kernel_size
-        self.weight_bce = float(weight_bce)
-        self.weight_dice = float(weight_dice)
-        self.smooth = float(smooth)
-        self.eps = float(eps)
-
-    def forward(
-        self,
-        input: torch.Tensor,
-        target: torch.Tensor,
-        loss_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if input.shape[0] == 0:
-            zero = input.new_tensor(0.0)
-            aux = {
-                "boundary/bce": zero.reshape(1),
-                "boundary/dice": zero.reshape(1),
-            }
-            return zero, aux
-
-        target_regions, valid_mask = _extract_target_regions_and_valid_mask(input, target, loss_mask=loss_mask)
-        pred_fg = _foreground_probabilities(input)
-        tgt_fg = target_regions.to(device=pred_fg.device, dtype=pred_fg.dtype)
-
-        pred_boundary = _boundary_map(pred_fg, self.kernel_size)
-        tgt_boundary = _boundary_map(tgt_fg, self.kernel_size)
-
-        boundary_valid_mask = None
-        if valid_mask is not None:
-            boundary_valid_mask = _erode_spatial(valid_mask.to(device=pred_fg.device, dtype=pred_fg.dtype), self.kernel_size)
-
-        bce_loss = input.new_zeros(())
-        if self.weight_bce > 0.0:
-            pred_boundary_clamped = pred_boundary.clamp(min=self.eps, max=1.0 - self.eps)
-            bce_map = F.binary_cross_entropy(pred_boundary_clamped, tgt_boundary, reduction="none")
-            if boundary_valid_mask is None:
-                bce_loss = bce_map.mean()
-            else:
-                denom = torch.clamp(boundary_valid_mask.sum(), min=self.eps)
-                bce_loss = (bce_map * boundary_valid_mask).sum() / denom
-
-        if boundary_valid_mask is None:
-            pred_for_dice = pred_boundary
-            tgt_for_dice = tgt_boundary
-        else:
-            pred_for_dice = pred_boundary * boundary_valid_mask
-            tgt_for_dice = tgt_boundary * boundary_valid_mask
-
-        dice_loss = input.new_zeros(())
-        if self.weight_dice > 0.0:
-            intersection = (pred_for_dice * tgt_for_dice).sum()
-            denom = pred_for_dice.sum() + tgt_for_dice.sum()
-            dice_loss = 1.0 - ((2.0 * intersection + self.smooth) / (denom + self.smooth))
-
-        total = (self.weight_bce * bce_loss) + (self.weight_dice * dice_loss)
-        aux = {
-            "boundary/bce": bce_loss.reshape(1).detach(),
-            "boundary/dice": dice_loss.reshape(1).detach(),
-        }
-        return total.reshape(()), aux
+        return self._compute_loss_batch(pred_fields, tgt_fields, valid_masks)
 
 
 class WeightedLossTerm(nn.Module):
@@ -751,30 +401,17 @@ def _build_label_smoothed_dice_bce_term(term_cfg: dict, config: dict) -> nn.Modu
     )
 
 
-def _build_masked_betti_matching_term(term_cfg: dict, _config: dict) -> nn.Module:
-    return MaskedBettiMatchingLoss(
+def _build_betti_matching_term(term_cfg: dict, _config: dict) -> nn.Module:
+    return BettiMatchingLoss(
         filtration=str(term_cfg.get("filtration", "superlevel")),
         include_unmatched_target=bool(term_cfg.get("include_unmatched_target", False)),
         push_unmatched_to=str(term_cfg.get("push_unmatched_to", "diagonal")),
-        crop_to_valid_bbox=bool(term_cfg.get("crop_to_valid_bbox", True)),
-    )
-
-
-def _build_boundary_term(term_cfg: dict, _config: dict) -> nn.Module:
-    return BoundaryLoss(
-        kernel_size=int(term_cfg.get("kernel_size", 3)),
-        weight_bce=float(term_cfg.get("weight_bce", 1.0)),
-        weight_dice=float(term_cfg.get("weight_dice", 1.0)),
-        smooth=float(term_cfg.get("smooth", 1.0)),
-        eps=float(term_cfg.get("eps", 1e-6)),
     )
 
 
 LOSS_TERM_BUILDERS = {
     "LabelSmoothedDCAndBCELoss": _build_label_smoothed_dice_bce_term,
-    "MaskedBettiMatchingLoss": _build_masked_betti_matching_term,
-    "BettiMatchingLoss": _build_masked_betti_matching_term,
-    "BoundaryLoss": _build_boundary_term,
+    "BettiMatchingLoss": _build_betti_matching_term,
 }
 
 
