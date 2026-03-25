@@ -1,11 +1,11 @@
 from pathlib import Path
-import re
 
-_LABEL_ASSET_NAME_RE = re.compile(
-    r"^(?P<prefix>.*)_(?P<label_kind>inklabels|supervision_mask|validation_mask)"
-    r"(?:_v(?P<version_num>\d+))?(?P<extension>\.(?:tif|tiff|zarr))$",
-    re.IGNORECASE,
+_LABEL_SUFFIXES = (
+    ("_inklabels", "inklabels"),
+    ("_supervision_mask", "supervision_mask"),
+    ("_validation_mask", "validation_mask"),
 )
+_LABEL_EXTENSIONS = {".tif", ".tiff", ".zarr"}
 
 
 def _normalize_label_version(label_version):
@@ -35,16 +35,27 @@ def _normalize_label_version(label_version):
 
 
 def _parse_label_asset_path(name):
-    match = _LABEL_ASSET_NAME_RE.match(name)
-    if match is None:
+    path = Path(name)
+    extension = path.suffix.lower()
+    if extension not in _LABEL_EXTENSIONS:
         return None
-    version_num_raw = match.group("version_num")
-    return {
-        "prefix": match.group("prefix"),
-        "label_kind": match.group("label_kind").lower(),
-        "version_num": 1 if version_num_raw is None else int(version_num_raw),
-        "extension": match.group("extension"),
-    }
+
+    stem = path.stem
+    version_num = 1
+    stem_parts = stem.rsplit("_", 1)
+    if len(stem_parts) == 2 and stem_parts[1].startswith("v") and stem_parts[1][1:].isdigit():
+        version_num = int(stem_parts[1][1:])
+        stem = stem_parts[0]
+
+    for suffix, label_kind in _LABEL_SUFFIXES:
+        if stem.endswith(suffix):
+            return {
+                "prefix": stem[: -len(suffix)],
+                "label_kind": label_kind,
+                "version_num": version_num,
+                "extension": extension,
+            }
+    return None
 
 class Segment:
     def __init__(
