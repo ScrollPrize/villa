@@ -161,7 +161,6 @@ def create_training_transforms(
                             synchronize_channels=True,
                             synchronize_axes=False,
                             p_per_channel=1.0,
-                            benchmark=True,
                         ),
                     ]
                 ),
