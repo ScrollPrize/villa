@@ -1,4 +1,8 @@
 from vesuvius.models.augmentation.transforms.noise.gaussian_blur import GaussianBlurTransform
+from vesuvius.models.augmentation.transforms.noise.layer_mix_dropout import (
+    LayerMixDropoutTransform,
+    layer_mix_dropout,
+)
 from vesuvius.models.augmentation.transforms.noise.extranoisetransforms import (
     BlankRectangleTransform,
     RicianNoiseTransform,
@@ -9,6 +13,8 @@ from vesuvius.models.augmentation.transforms.noise.median_filter import MedianFi
 
 __all__ = [
     'GaussianBlurTransform',
+    'LayerMixDropoutTransform',
+    'layer_mix_dropout',
     'BlankRectangleTransform',
     'RicianNoiseTransform',
     'SmearTransform',
