@@ -441,17 +441,34 @@ class InkDataset(Dataset):
 
 if __name__ == "__main__":
     import argparse
-    import napari
+    import time
     from qtpy.QtWidgets import QPushButton
 
     parser = argparse.ArgumentParser(description="Visualize an InkDataset sample in napari.")
     parser.add_argument("config_path", help="Path to the dataset config JSON.")
+    parser.add_argument(
+        "--profile",
+        type=int,
+        default=None,
+        help="Load the given number of dataset samples and print the total elapsed time.",
+    )
     args = parser.parse_args()
 
     with open(args.config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
     ds = InkDataset(config, do_augmentations=False)
+    if args.profile is not None:
+        num_samples = max(0, min(int(args.profile), len(ds)))
+        start = time.perf_counter()
+        for index in tqdm(range(num_samples), desc="Profiling dataset samples"):
+            _ = ds[index]
+        elapsed = time.perf_counter() - start
+        print(f"Profiled {num_samples} samples in {elapsed:.3f}s")
+        raise SystemExit(0)
+
+    import napari
+
     viewer = napari.Viewer()
 
     state = {"current_index": 0}
