@@ -134,23 +134,8 @@ def create_training_transforms(
                     apply_probability=0.3,
                 )
             )
-        transforms.append(
-            RandomTransform(
-                SpatialTransform(
-                    patch_size=patch_size,
-                    patch_center_dist_from_border=0,
-                    random_crop=False,
-                    p_elastic_deform=0,
-                    p_rotation=0.0,
-                    p_scaling=0.0 if no_scaling else 1.0,
-                    scaling=_SCALE_RANGE,
-                    p_synchronize_scaling_across_axes=1.0,
-                    bg_style_seg_sampling=False,
-                    mode_seg="nearest",
-                ),
-                apply_probability=0.3,
-            )
-        )
+        # Disabled because SpatialTransform currently leaves keypoints/vectors
+        # unchanged, which breaks normal-pooled 3D geometry alignment.
 
     transforms.append(
         RandomTransform(
