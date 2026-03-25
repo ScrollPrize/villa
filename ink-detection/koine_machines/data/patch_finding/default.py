@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from common import open_zarr
+from koine_machines.common.common import open_zarr
 
 
 def _surface_patch_bbox(surface: int, y0: int, x0: int, patch_size) -> tuple[int, int, int, int, int, int]:
