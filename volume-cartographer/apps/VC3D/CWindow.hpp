@@ -90,6 +90,7 @@ public slots:
     void onRenderSegment(const std::string& segmentId);
     void onGrowSegmentFromSegment(const std::string& segmentId);
     void onAddOverlap(const std::string& segmentId);
+    cv::Mat generateOverlapMaskLayer(QuadSurface* currentSurf);
     void onConvertToObj(const std::string& segmentId);
     void onCropSurfaceToValidRegion(const std::string& segmentId);
     void onFlipSurface(const std::string& segmentId, bool flipU);

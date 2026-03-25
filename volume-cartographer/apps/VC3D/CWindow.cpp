@@ -3486,6 +3486,133 @@ void CWindow::onEditMaskPressed(void)
     QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
 }
 
+cv::Mat CWindow::generateOverlapMaskLayer(QuadSurface* currentSurf)
+{
+    if (!currentSurf || !_surfaceOverlayModel || !_surf_col) {
+        return {};
+    }
+
+    // Gather selected overlay surfaces from the UI model
+    std::map<std::string, cv::Vec3b> selectedOverlays;
+    for (int row = 1; row < _surfaceOverlayModel->rowCount(); ++row) {
+        QStandardItem* item = _surfaceOverlayModel->item(row);
+        if (!item || item->checkState() != Qt::Checked) continue;
+        std::string name = item->data(Qt::UserRole).toString().toStdString();
+        size_t colorIdx = _surfaceOverlayColorAssignments[name];
+        selectedOverlays[name] = getOverlayColorBGR(colorIdx);
+    }
+
+    if (selectedOverlays.empty()) {
+        return {};
+    }
+
+    const cv::Mat_<cv::Vec3f>* currentPts = currentSurf->rawPointsPtr();
+    if (!currentPts || currentPts->empty()) {
+        return {};
+    }
+
+    const int rows = currentPts->rows;
+    const int cols = currentPts->cols;
+
+    // Read the overlap threshold from the UI spinner
+    const float threshold = static_cast<float>(ui.spinOverlapThreshold->value());
+    const float invThreshold = 1.0f / threshold;
+
+    std::cout << "[AppendMask Overlap] threshold=" << threshold
+              << " overlays=" << selectedOverlays.size() << std::endl;
+
+    // Spatial hash: discretize 3D space into cells of size `threshold`
+    struct CellKey {
+        int x, y, z;
+        bool operator==(const CellKey& o) const { return x == o.x && y == o.y && z == o.z; }
+    };
+    struct CellKeyHash {
+        size_t operator()(const CellKey& k) const {
+            size_t h = std::hash<int>()(k.x);
+            h ^= std::hash<int>()(k.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<int>()(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+
+    std::unordered_map<CellKey, cv::Vec3b, CellKeyHash> spatialHash;
+
+    for (const auto& [surfId, color] : selectedOverlays) {
+        auto surfBase = _surf_col->surface(surfId);
+        auto overlaySurf = std::dynamic_pointer_cast<QuadSurface>(surfBase);
+        if (!overlaySurf) continue;
+
+        const cv::Mat_<cv::Vec3f>* overlayPts = overlaySurf->rawPointsPtr();
+        if (!overlayPts || overlayPts->empty()) continue;
+
+        int validPts = 0;
+        for (int r = 0; r < overlayPts->rows; ++r) {
+            for (int c = 0; c < overlayPts->cols; ++c) {
+                const cv::Vec3f& pt = (*overlayPts)(r, c);
+                if (pt[0] == -1.f) continue;
+                validPts++;
+                CellKey key{
+                    static_cast<int>(std::floor(pt[0] * invThreshold)),
+                    static_cast<int>(std::floor(pt[1] * invThreshold)),
+                    static_cast<int>(std::floor(pt[2] * invThreshold))
+                };
+                spatialHash.try_emplace(key, color);
+            }
+        }
+        std::cout << "[AppendMask Overlap] overlay '" << surfId << "': "
+                  << overlayPts->rows << "x" << overlayPts->cols
+                  << " validPts=" << validPts << std::endl;
+    }
+
+    if (spatialHash.empty()) {
+        std::cout << "[AppendMask Overlap] no valid overlay points, skipping overlap layer" << std::endl;
+        return {};
+    }
+
+    // Create BGR image for the overlap visualization
+    cv::Mat_<cv::Vec3b> overlapImg(rows, cols, cv::Vec3b(0, 0, 0));
+
+    int hitCount = 0;
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const cv::Vec3f& pt = (*currentPts)(r, c);
+            if (pt[0] == -1.f) continue;
+
+            const int cx = static_cast<int>(std::floor(pt[0] * invThreshold));
+            const int cy = static_cast<int>(std::floor(pt[1] * invThreshold));
+            const int cz = static_cast<int>(std::floor(pt[2] * invThreshold));
+
+            bool found = false;
+            cv::Vec3b hitColor{0, 0, 0};
+            for (int dz = -1; dz <= 1 && !found; ++dz) {
+                for (int dy = -1; dy <= 1 && !found; ++dy) {
+                    for (int dx = -1; dx <= 1 && !found; ++dx) {
+                        auto it = spatialHash.find({cx + dx, cy + dy, cz + dz});
+                        if (it != spatialHash.end()) {
+                            hitColor = it->second;
+                            found = true;
+                        }
+                    }
+                }
+            }
+
+            if (found) {
+                hitCount++;
+                overlapImg(r, c) = hitColor;
+            }
+        }
+    }
+
+    std::cout << "[AppendMask Overlap] hits=" << hitCount
+              << " out of " << rows << "x" << cols << " pixels" << std::endl;
+
+    if (hitCount == 0) {
+        return {};
+    }
+
+    return overlapImg;
+}
+
 void CWindow::onAppendMaskPressed(void)
 {
     auto surf = _surf_weak.lock();
@@ -3562,12 +3689,20 @@ void CWindow::onAppendMaskPressed(void)
             // Append the new image layer to existing layers
             existing_layers.push_back(img);
 
+            // Generate overlap visual layer if surface overlays are selected
+            cv::Mat overlapLayer = generateOverlapMaskLayer(surf.get());
+            if (!overlapLayer.empty()) {
+                existing_layers.push_back(overlapLayer);
+            }
+
             // Save all layers
             imwritemulti(path.string(), existing_layers);
 
-            QString message = useComposite ?
-                tr("Appended composite surface image to existing mask (now %1 layers)").arg(existing_layers.size()) :
-                tr("Appended surface image to existing mask (now %1 layers)").arg(existing_layers.size());
+            QString message = overlapLayer.empty() ?
+                (useComposite ?
+                    tr("Appended composite surface image to existing mask (now %1 layers)").arg(existing_layers.size()) :
+                    tr("Appended surface image to existing mask (now %1 layers)").arg(existing_layers.size())) :
+                tr("Appended surface image + overlap visual to existing mask (now %1 layers)").arg(existing_layers.size());
             statusBar()->showMessage(message, 3000);
 
         } else {
@@ -3585,13 +3720,22 @@ void CWindow::onAppendMaskPressed(void)
             }
             cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
 
-            // Save as new multi-layer TIFF
+            // Start with mask and image layers
             std::vector<cv::Mat> layers = {mask, img};
+
+            // Generate overlap visual layer if surface overlays are selected
+            cv::Mat overlapLayer = generateOverlapMaskLayer(surf.get());
+            if (!overlapLayer.empty()) {
+                layers.push_back(overlapLayer);
+            }
+
             imwritemulti(path.string(), layers);
 
-            QString message = useComposite ?
-                tr("Created new surface mask with composite image data") :
-                tr("Created new surface mask with image data");
+            QString message = overlapLayer.empty() ?
+                (useComposite ?
+                    tr("Created new surface mask with composite image data") :
+                    tr("Created new surface mask with image data")) :
+                tr("Created new surface mask with image data + overlap visual");
             statusBar()->showMessage(message, 3000);
         }
 
