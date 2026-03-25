@@ -1,5 +1,5 @@
-from .default import find_segment_patches as find_default_segment_patches
-from .subtiling import (
+from koine_machines.data.patch_finding.default import find_segment_patches as find_default_segment_patches
+from koine_machines.data.patch_finding.subtiling import (
     build_patch_index,
     find_segment_patches as find_subtiling_segment_patches,
 )
