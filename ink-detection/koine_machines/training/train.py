@@ -7,7 +7,8 @@ import numpy as np
 import random
 from tqdm import tqdm
 import torch
-from torch.utils.data import DataLoader, Subset
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 import accelerate
 from accelerate.utils import GradientAccumulationPlugin, set_seed
 import click
@@ -17,10 +18,10 @@ from vesuvius.models.training.optimizers import (
     create_optimizer,
 )
 from vesuvius.models.training.lr_schedulers import get_scheduler
-from vesuvius.neural_tracing.nets.models import make_model
-from koine_machines.data.ink_dataset import FlatInkDataset
-from koine_machines.training.loss.pool_along_normal import _get_normal_pool_offsets, _pool_logits_along_surface_normals
+from koine_machines.models.make_model import make_model
+from koine_machines.data.ink_dataset import InkDataset
 from koine_machines.models.load_checkpoint import load_training_checkpoint_from_config, restore_training_state
+from koine_machines.training.normal_pooling import collate_normal_pooled_batch, pool_logits_along_normals
 from koine_machines.training.visualization import PreviewAccumulator, build_validation_preview_log
 from koine_machines.training.loss.losses import create_loss_from_config
 from stitching import resolve_model_and_loader_patch_sizes, run_model_forward
@@ -30,7 +31,6 @@ from stitching import resolve_model_and_loader_patch_sizes, run_model_forward
 def train(config_path):
     with open(config_path, 'r') as f:
         config = json.load(f)
-    training_mode = str(config.get('mode', 'default')).strip().lower()
 
     checkpoint_path, checkpoint, weights_only = load_training_checkpoint_from_config(config, config_path)
     resume_full_state = checkpoint is not None and not weights_only
@@ -46,7 +46,7 @@ def train(config_path):
                 "model_type='dinov2' requires model_config.pretrained_backbone "
                 "or a top-level pretrained_backbone entry"
             )
-        config['model_type'] = 'unet'
+        config['model_type'] = 'vesuvius_unet'
 
     ema_config = config.get('ema') or {}
     ema_enabled = bool(ema_config.get('enabled', False))
@@ -65,9 +65,18 @@ def train(config_path):
         'save_in_checkpoint': ema_save_in_checkpoint,
     }
 
+    mode = str(config.get('mode', 'flat'))
+    model_type = str(config.get('model_type', '')).strip().lower()
+    if mode == 'normal_pooled_3d' and model_type.startswith('resnet3d'):
+        raise ValueError("normal_pooled_3d is currently only supported with the vesuvius_unet model path")
+    if mode == 'normal_pooled_3d':
+        config['in_channels'] = 2
+
     config.setdefault('volume_auth_json', None)
     requested_stitch_factor = int(config.get('stitch_factor', 1))
     use_stitched_forward = bool(config.get('use_stitched_forward', requested_stitch_factor > 1))
+    if mode == 'normal_pooled_3d':
+        use_stitched_forward = False
     stitched_gradient_checkpointing = bool(config.get('stitched_gradient_checkpointing', True))
     model_crop_size = tuple(config['patch_size'])
     loader_patch_size = model_crop_size
@@ -89,11 +98,6 @@ def train(config_path):
     save_every = int(config.get('save_every', val_every))
     log_every = config.get('log_every', 1)
     val_preview_batches = config.get('val_preview_batches', 3)
-    
-    normal_pool_distance = tuple(float(v) for v in config['normal_pool_distance'])
-    normal_pool_step = float(config.get('normal_pool_step', config.get('normal_sample_step', 0.5)))
-    normal_pool_reduction = str(config.get('normal_pool_reduction', 'max')).strip().lower()
-    normal_pool_temperature = float(config.get('normal_pool_temperature', 1.0))
 
     dataloader_config = accelerate.DataLoaderConfiguration(non_blocking = True)
 
@@ -125,43 +129,22 @@ def train(config_path):
     set_seed(config['seed'])
     dataset_config = deepcopy(config)
     dataset_config['patch_size'] = list(loader_patch_size)
-    input_key = 'image'
-    
-    if training_mode == 'normal_pooled_3d':
-        shared_ds = FlatInkDataset(dataset_config, apply_augmentation=False)
-        train_ds = FlatInkDataset(
-            dataset_config,
-            do_augmentations=True,
-            patches=shared_ds.patches,
-            patch_generation_stats=shared_ds.patch_generation_stats,
-        )
-        input_key = 'vol'
-        config['in_channels'] = int(getattr(shared_ds, 'input_channels', 1))
-        val_ds = shared_ds
 
-        num_patches = len(train_ds)
-        num_val     = int(max(1, num_patches * config.get('val_fraction', 0.1)))
-        num_train   = num_patches - num_val
-
-        indices = torch.randperm(num_patches, generator=torch.Generator().manual_seed(config['seed'])).tolist()
-        train_indices = indices[:num_train]
-        val_indices = indices[num_train:]
-        train_subset = Subset(train_ds, train_indices)
-        val_subset = Subset(val_ds, val_indices)
-    else:
-        shared_ds = FlatInkDataset(dataset_config, do_augmentations=False)
-        if len(shared_ds.training_patches) == 0:
-            raise ValueError("FlatInkDataset produced no training patches after excluding validation_mask chunks")
-        train_ds = FlatInkDataset(dataset_config, do_augmentations=True, patches=shared_ds.training_patches)
-        val_ds = FlatInkDataset(dataset_config, do_augmentations=False, patches=shared_ds.validation_patches)
-        train_subset = train_ds
-        val_subset = val_ds
+    shared_ds = InkDataset(dataset_config, do_augmentations=False)
+    if len(shared_ds.training_patches) == 0:
+        raise ValueError("FlatInkDataset produced no training patches after excluding validation_mask chunks")
+    train_ds = InkDataset(dataset_config, do_augmentations=True, patches=shared_ds.training_patches)
+    val_ds = InkDataset(dataset_config, do_augmentations=False, patches=shared_ds.validation_patches)
+    train_subset = train_ds
+    val_subset = val_ds
 
     dataloader_workers = int(config.get('dataloader_workers', 0))
     dataloader_kwargs = {}
     if dataloader_workers > 0:
         dataloader_kwargs['multiprocessing_context'] = 'spawn'
         dataloader_kwargs['persistent_workers'] = True
+    if mode == 'normal_pooled_3d':
+        dataloader_kwargs['collate_fn'] = collate_normal_pooled_batch
 
     train_dl = DataLoader(
         train_subset,
@@ -259,7 +242,6 @@ def train(config_path):
     train_iterator = iter(train_dl)
     latest_val_loss = None
     latest_ema_val_loss = None
-    normal_pool_offsets_cache = {}
     
     progress_bar = tqdm(
         range(start_step, config['num_iterations']),
@@ -270,38 +252,54 @@ def train(config_path):
     )
 
     def get_model_input(batch):
-        image = batch[input_key].float()
+        image = batch['image'].float()
         if image.ndim == 4:
             image = image.unsqueeze(1)
         if image.ndim != 5:
             raise ValueError(
-                f"Expected {input_key!r} batch tensor with 4 or 5 dims, got shape {tuple(image.shape)}"
+                f"Expected 'image' batch tensor with 4 or 5 dims, got shape {tuple(image.shape)}"
             )
+        if mode == 'normal_pooled_3d':
+            surface_mask = batch['surface_mask'].float()
+            if surface_mask.ndim == 4:
+                surface_mask = surface_mask.unsqueeze(1)
+            if surface_mask.shape != image.shape:
+                raise ValueError(
+                    f"Expected 'surface_mask' to match 'image' shape, got {tuple(surface_mask.shape)} "
+                    f"vs {tuple(image.shape)}"
+                )
+            return torch.cat([image, surface_mask], dim=1)
         return image
 
     def prepare_loss_inputs(preds, batch):
-        if training_mode == 'normal_pooled_3d':
-            offsets = _get_normal_pool_offsets(
-                normal_pool_offsets_cache,
-                normal_pool_distance,
-                normal_pool_step,
-                device=preds.device,
-                dtype=preds.dtype,
+        if mode == 'normal_pooled_3d':
+            crop_shape = tuple(int(v) for v in batch['image'].shape[-3:])
+            if tuple(int(v) for v in preds.shape[-3:]) != crop_shape:
+                preds = F.interpolate(
+                    preds,
+                    size=crop_shape,
+                    mode='trilinear',
+                    align_corners=True,
+                )
+
+            pooling_config = config.get('normal_pooling') or {}
+            pooled_logits, pooled_valid = pool_logits_along_normals(
+                preds.float(),
+                batch['flat_points_local_zyx'].float(),
+                batch['flat_normals_local_zyx'].float(),
+                batch['flat_valid'].float(),
+                neg_dist=float(pooling_config.get('neg_dist', 4.0)),
+                pos_dist=float(pooling_config.get('pos_dist', 4.0)),
+                sample_step=float(pooling_config.get('sample_step', 1.0)),
+                align_corners=True,
             )
-            pooled_preds, pooled_valid_mask = _pool_logits_along_surface_normals(
-                preds,
-                batch['surface_points_zyx'],
-                batch['surface_normals_zyx'],
-                offsets,
-                reduction=normal_pool_reduction,
-                temperature=normal_pool_temperature,
-            )
-            targets = batch['surface_targets_2d'].float().unsqueeze(1)
-            valid_mask = batch['surface_valid_2d'].float().unsqueeze(1)
-            valid_mask = valid_mask * pooled_valid_mask.float()
-            ignore_mask = (valid_mask <= 0).float()
-            targets = torch.where(valid_mask > 0, targets, torch.zeros_like(targets))
-            return pooled_preds, targets, ignore_mask
+            targets = batch['flat_target'].float()
+            ignore_mask = (
+                (batch['flat_supervision'].float() <= 0)
+                | (batch['flat_valid'].float() <= 0)
+                | (pooled_valid <= 0)
+            ).float()
+            return pooled_logits, targets, ignore_mask
 
         targets = (torch.amax(batch['inklabels'].float(), dim=2) > 0).float()
         supervision_mask = torch.amax(batch['supervision_mask'].float(), dim=2)

@@ -28,3 +28,7 @@ class Patch:
     @property
     def inklabels(self):
         return self.segment.inklabels
+
+    @property
+    def segment_dir(self):
+        return self.segment.segment_dir
