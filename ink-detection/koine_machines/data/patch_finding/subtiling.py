@@ -3,8 +3,6 @@ from __future__ import annotations
 import numpy as np
 
 from koine_machines.common.common import open_zarr
-from ink.recipes.components import component_bboxes
-
 
 def _label_tile_is_empty(label_tile) -> bool:
     tile = np.asarray(label_tile)
