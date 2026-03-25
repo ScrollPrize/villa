@@ -12,36 +12,19 @@ import accelerate
 from accelerate.utils import GradientAccumulationPlugin, set_seed
 import click
 from vesuvius.models.utils import InitWeights_He
-from vesuvius.models.training.optimizers import create_optimizer
+from vesuvius.models.training.optimizers import (
+    OptimizerParamGroupTarget,
+    create_optimizer,
+)
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.nets.models import make_model
 from koine_machines.data.flat_ink_dataset import FlatInkDataset
 from koine_machines.data.tifxyz_dataset import TifxyzInkDataset
-from koine_machines.loss.pool_along_normal import (
-    _get_normal_pool_offsets,
-    _pool_logits_along_surface_normals,
-)
-from koine_machines.models.load_checkpoint import (
-    load_training_checkpoint_from_config,
-    restore_training_state,
-)
-from koine_machines.training.visualization import (
-    PreviewAccumulator,
-    build_validation_preview_log,
-)
-from losses import create_loss_from_config
-from stitching import resolve_model_and_loader_patch_sizes, run_stitched_model_forward
-
-
-class _OptimizerParamGroupTarget:
-    """Adapter for create_optimizer(), which expects an object with parameters()."""
-
-    def __init__(self, param_groups):
-        self._param_groups = param_groups
-
-    def parameters(self):
-        return self._param_groups
-
+from koine_machines.training.loss.pool_along_normal import _get_normal_pool_offsets, _pool_logits_along_surface_normals
+from koine_machines.models.load_checkpoint import load_training_checkpoint_from_config, restore_training_state
+from koine_machines.training.visualization import PreviewAccumulator, build_validation_preview_log
+from koine_machines.training.loss.losses import create_loss_from_config
+from stitching import resolve_model_and_loader_patch_sizes, run_model_forward
 
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
@@ -50,20 +33,16 @@ def train(config_path):
         config = json.load(f)
     training_mode = str(config.get('mode', 'default')).strip().lower()
 
-    checkpoint_path, checkpoint, weights_only = load_training_checkpoint_from_config(
-        config,
-        config_path,
-    )
+    checkpoint_path, checkpoint, weights_only = load_training_checkpoint_from_config(config, config_path)
     resume_full_state = checkpoint is not None and not weights_only
     start_step = 0
 
     if str(config.get('model_type', '')).strip().lower() == 'dinov2':
-        config.setdefault('model_config', {})
-        if 'pretrained_backbone' in config:
-            config['model_config'].setdefault('pretrained_backbone', config['pretrained_backbone'])
-        if 'pretrained_decoder_type' in config:
-            config['model_config'].setdefault('pretrained_decoder_type', config['pretrained_decoder_type'])
-        if not config['model_config'].get('pretrained_backbone'):
+        model_config = config.setdefault('model_config', {})
+        for key in ('pretrained_backbone', 'pretrained_decoder_type'):
+            if key in config:
+                model_config.setdefault(key, config[key])
+        if not model_config.get('pretrained_backbone'):
             raise ValueError(
                 "model_type='dinov2' requires model_config.pretrained_backbone "
                 "or a top-level pretrained_backbone entry"
@@ -77,6 +56,7 @@ def train(config_path):
     ema_update_every_steps = int(ema_config.get('update_every_steps', 1))
     ema_validate = bool(ema_config.get('validate', ema_enabled))
     ema_save_in_checkpoint = bool(ema_config.get('save_in_checkpoint', ema_enabled))
+    
     config['ema'] = {
         'enabled': ema_enabled,
         'decay': ema_decay,
@@ -88,14 +68,8 @@ def train(config_path):
 
     config.setdefault('volume_auth_json', None)
     requested_stitch_factor = int(config.get('stitch_factor', 1))
-    use_stitched_forward = bool(
-        config.get('use_stitched_forward', requested_stitch_factor > 1)
-    )
-    if training_mode == 'normal_pooled_3d' and use_stitched_forward:
-        raise ValueError("mode='normal_pooled_3d' does not support stitched forward")
-    stitched_gradient_checkpointing = bool(
-        config.get('stitched_gradient_checkpointing', True)
-    )
+    use_stitched_forward = bool(config.get('use_stitched_forward', requested_stitch_factor > 1))
+    stitched_gradient_checkpointing = bool(config.get('stitched_gradient_checkpointing', True))
     model_crop_size = tuple(config['patch_size'])
     loader_patch_size = model_crop_size
     stitch_factor = 1
@@ -112,28 +86,24 @@ def train(config_path):
     grad_acc_steps = int(config.get('grad_acc_steps', 1))
     grad_clip = config.get('grad_clip')
     max_steps = config.get('max_steps', math.ceil(config['num_iterations'] / grad_acc_steps))
+    val_every = int(config.get('val_every', 500))
+    save_every = int(config.get('save_every', val_every))
+    log_every = config.get('log_every', 1)
+    val_preview_batches = config.get('val_preview_batches', 3)
+    
+    normal_pool_distance = tuple(float(v) for v in config['normal_pool_distance'])
+    normal_pool_step = float(config.get('normal_pool_step', config.get('normal_sample_step', 0.5)))
+    normal_pool_reduction = str(config.get('normal_pool_reduction', 'max')).strip().lower()
+    normal_pool_temperature = float(config.get('normal_pool_temperature', 1.0))
 
     dataloader_config = accelerate.DataLoaderConfiguration(non_blocking = True)
 
-    # The training loop reuses the dataloader indefinitely, so keep accumulation
-    # boundaries independent of dataloader exhaustion.
-    gradient_accumulation_plugin = GradientAccumulationPlugin(
-        num_steps=grad_acc_steps,
-        sync_with_dataloader=False,
-    )
-
-    accelerator = accelerate.Accelerator(
-        mixed_precision              = config.get('mixed_precision', "fp16"),
-        gradient_accumulation_plugin = gradient_accumulation_plugin,
-        dataloader_config            = dataloader_config
-    )
+    # The training loop reuses the dataloader indefinitely, so keep accumulation boundaries independent of dataloader exhaustion.
+    gradient_accumulation_plugin = GradientAccumulationPlugin(num_steps=grad_acc_steps, sync_with_dataloader=False)
+    accelerator = accelerate.Accelerator(mixed_precision=config.get('mixed_precision', "fp16"), gradient_accumulation_plugin=gradient_accumulation_plugin, dataloader_config=dataloader_config)
 
     if 'wandb_project' in config and accelerator.is_main_process:
-        wandb_kwargs = {
-            'project' : config['wandb_project'],
-            'entity'  : config['wandb_entity'],
-            'config'  : config
-        }
+        wandb_kwargs = { 'project' : config['wandb_project'], 'entity'  : config['wandb_entity'], 'config'  : config}
         if config.get('wandb_resume', False):
             wandb_run_id = config.get('wandb_run_id')
             if not wandb_run_id and checkpoint is not None:
@@ -144,7 +114,7 @@ def train(config_path):
                 )
             wandb_kwargs['id'] = wandb_run_id
             wandb_kwargs['resume'] = 'must'
-
+            
         wandb.init(**wandb_kwargs)
 
     out_dir = config['out_dir']
@@ -153,12 +123,11 @@ def train(config_path):
     os.makedirs(train_preview_dir, exist_ok=True)
     val_preview_dir = os.path.join(out_dir, 'val_previews')
     os.makedirs(val_preview_dir, exist_ok=True)
-
     set_seed(config['seed'])
-
     dataset_config = deepcopy(config)
     dataset_config['patch_size'] = list(loader_patch_size)
     input_key = 'image'
+    
     if training_mode == 'normal_pooled_3d':
         shared_ds = TifxyzInkDataset(dataset_config, apply_augmentation=False)
         train_ds = TifxyzInkDataset(
@@ -221,8 +190,6 @@ def train(config_path):
     if pretrained_backbone:
         freeze_encoder = bool(config.get('freeze_encoder', False))
         encoder_lr_mult = float(config.get('encoder_lr_mult', 1.0))
-        if not 0.0 <= encoder_lr_mult <= 1.0:
-            raise ValueError(f"encoder_lr_mult must be between 0 and 1 inclusive, got {encoder_lr_mult}")
 
         encoder_params = list(model.shared_encoder.parameters())
         if freeze_encoder:
@@ -250,7 +217,7 @@ def train(config_path):
                 'name': config.get('optimizer', 'sgd'),
                 'learning_rate': learning_rate,
                 'weight_decay': config.get('weight_decay', 3e-5),
-                }, _OptimizerParamGroupTarget(optimizer_target) if isinstance(optimizer_target, list) else optimizer_target)
+                }, OptimizerParamGroupTarget(optimizer_target) if isinstance(optimizer_target, list) else optimizer_target)
 
     lr_scheduler = get_scheduler(
         'diffusers_cosine_warmup',
@@ -269,6 +236,7 @@ def train(config_path):
             model, optimizer, train_dl, val_dl, lr_scheduler
         )
     unwrapped_model = accelerator.unwrap_model(model)
+    frozen_encoder = unwrapped_model.shared_encoder if pretrained_backbone and freeze_encoder else None
     ema_model = deepcopy(unwrapped_model) if ema_enabled else None
     if ema_model is not None:
         ema_model.eval()
@@ -287,17 +255,13 @@ def train(config_path):
             ema_model=ema_model,
         )
 
-        accelerator.print(
-            f"Loaded checkpoint '{checkpoint_path}'"
-            + (f" and resuming from step {start_step}" if resume_full_state else " (weights only)")
-        )
-
+        accelerator.print(f"Loaded checkpoint '{checkpoint_path}'"+ (f" and resuming from step {start_step}" if resume_full_state else " (weights only)"))
+        
     train_iterator = iter(train_dl)
-    val_every = int(config.get('val_every', 500))
-    save_every = int(config.get('save_every', val_every))
-    log_every = config.get('log_every', 1)
-    val_preview_batches = config.get('val_preview_batches', 3)
-
+    latest_val_loss = None
+    latest_ema_val_loss = None
+    normal_pool_offsets_cache = {}
+    
     progress_bar = tqdm(
         range(start_step, config['num_iterations']),
         total=config['num_iterations'],
@@ -305,40 +269,6 @@ def train(config_path):
         disable=not accelerator.is_main_process,
         dynamic_ncols=True,
     )
-    latest_val_loss = None
-    latest_ema_val_loss = None
-    normal_pool_distance = tuple(float(v) for v in config['normal_pool_distance'])
-    normal_pool_step = float(
-        config.get('normal_pool_step', config.get('normal_sample_step', 0.5))
-    )
-    normal_pool_reduction = str(
-        config.get('normal_pool_reduction', 'max')
-    ).strip().lower()
-    normal_pool_temperature = float(config.get('normal_pool_temperature', 1.0))
-    normal_pool_offsets_cache = {}
-
-    def set_frozen_encoder_eval(active_model):
-        if not (pretrained_backbone and freeze_encoder):
-            return
-
-        shared_encoder = getattr(active_model, 'shared_encoder', None)
-        if shared_encoder is None:
-            shared_encoder = getattr(getattr(active_model, 'module', None), 'shared_encoder', None)
-        if shared_encoder is not None:
-            shared_encoder.eval()
-
-    set_frozen_encoder_eval(model)
-
-    def forward_ink(image, active_model=None):
-        active_model = model if active_model is None else active_model
-        if use_stitched_forward:
-            return run_stitched_model_forward(
-                active_model,
-                image,
-                model_crop_size,
-                use_gradient_checkpointing=stitched_gradient_checkpointing,
-            )['ink']
-        return active_model(image)['ink']
 
     def get_model_input(batch):
         image = batch[input_key].float()
@@ -383,9 +313,7 @@ def train(config_path):
         if not accelerator.is_main_process:
             return
 
-        postfix = {
-            'loss': f'{current_train_loss:.4f}',
-        }
+        postfix = {'loss': f'{current_train_loss:.4f}'}
         if latest_val_loss is not None:
             postfix['val_loss'] = f'{latest_val_loss:.4f}'
         if latest_ema_val_loss is not None:
@@ -396,7 +324,8 @@ def train(config_path):
 
     for step in progress_bar:
         model.train()
-        set_frozen_encoder_eval(model)
+        if frozen_encoder is not None:
+            frozen_encoder.eval()
 
         try:
             batch = next(train_iterator)
@@ -406,7 +335,13 @@ def train(config_path):
 
         with accelerator.accumulate(model):
             with accelerator.autocast():
-                preds = forward_ink(get_model_input(batch))
+                preds = run_model_forward(
+                    model,
+                    get_model_input(batch),
+                    model_crop_size,
+                    stitched=use_stitched_forward,
+                    use_gradient_checkpointing=stitched_gradient_checkpointing,
+                )
             loss_preds, targets, ignore_mask = prepare_loss_inputs(preds, batch)
             targets_with_ignore = torch.cat([targets, ignore_mask], dim=1)
             l = loss(loss_preds.float(), targets_with_ignore)
@@ -416,12 +351,9 @@ def train(config_path):
             if grad_clip is not None and grad_clip > 0 and accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-            overflow_step_skipped = bool(
-                accelerator.sync_gradients and getattr(optimizer, 'step_was_skipped', False)
-            )
             lr_scheduler.step()
             optimizer.zero_grad()
-            if accelerator.sync_gradients and not overflow_step_skipped:
+            if accelerator.sync_gradients:
                 optimizer_step += 1
                 if ema_model is not None and optimizer_step >= ema_start_step:
                     if (optimizer_step - ema_start_step) % ema_update_every_steps == 0:
@@ -442,7 +374,6 @@ def train(config_path):
             log_dict = {
                 'train/loss': train_loss,
                 'train/lr': optimizer.param_groups[0]['lr'],
-                'train/overflow_step_skipped': int(overflow_step_skipped),
                 'step': step,
             }
             latest_loss_metrics = getattr(loss, 'latest_metrics', None)
@@ -452,10 +383,7 @@ def train(config_path):
                 wandb.log(log_dict, step=step)
 
         if step % val_every == 0 and step > 0:
-            train_preview = PreviewAccumulator(
-                accelerator=accelerator,
-                get_model_input=get_model_input,
-            )
+            train_preview = PreviewAccumulator(accelerator=accelerator, get_model_input=get_model_input)
             train_preview.add_batch(
                 batch,
                 loss_preds.detach(),
@@ -465,10 +393,7 @@ def train(config_path):
             model.eval()
             val_losses = []
             ema_val_losses = []
-            val_preview = PreviewAccumulator(
-                accelerator=accelerator,
-                get_model_input=get_model_input,
-            )
+            val_preview = PreviewAccumulator(accelerator=accelerator, get_model_input=get_model_input)
             num_val_batches = min(len(val_dl), config.get('val_steps', 10))
             if num_val_batches == 0:
                 if accelerator.is_main_process:
@@ -484,20 +409,26 @@ def train(config_path):
                 for val_batch_idx in range(num_val_batches):
                     val_batch = next(val_iterator)
                     with accelerator.autocast():
-                        val_preds = forward_ink(get_model_input(val_batch))
-                    val_loss_preds, val_targets, val_ignore_mask = prepare_loss_inputs(
-                        val_preds,
-                        val_batch,
-                    )
+                        val_preds = run_model_forward(
+                            model,
+                            get_model_input(val_batch),
+                            model_crop_size,
+                            stitched=use_stitched_forward,
+                            use_gradient_checkpointing=stitched_gradient_checkpointing,
+                        )
+                    val_loss_preds, val_targets, val_ignore_mask = prepare_loss_inputs(val_preds, val_batch)
                     preview_preds = val_loss_preds
                     val_targets_with_ignore = torch.cat([val_targets, val_ignore_mask], dim=1)
                     val_l = loss(val_loss_preds.float(), val_targets_with_ignore)
                     val_losses.append(val_l.item())
                     if ema_model is not None and ema_validate:
                         with accelerator.autocast():
-                            ema_val_preds = forward_ink(
+                            ema_val_preds = run_model_forward(
+                                ema_model,
                                 get_model_input(val_batch),
-                                active_model=ema_model,
+                                model_crop_size,
+                                stitched=use_stitched_forward,
+                                use_gradient_checkpointing=stitched_gradient_checkpointing,
                             )
                         ema_val_loss_preds, _, _ = prepare_loss_inputs(ema_val_preds, val_batch)
                         ema_val_l = loss(ema_val_loss_preds.float(), val_targets_with_ignore)
@@ -516,9 +447,7 @@ def train(config_path):
             mean_ema_val_loss = np.mean(ema_val_losses) if ema_val_losses else None
             if accelerator.is_main_process:
                 latest_val_loss = float(mean_val_loss)
-                latest_ema_val_loss = (
-                    float(mean_ema_val_loss) if mean_ema_val_loss is not None else None
-                )
+                latest_ema_val_loss = (float(mean_ema_val_loss) if mean_ema_val_loss is not None else None)
                 refresh_progress_bar(train_loss)
                 if wandb.run is not None:
                     wandb.log(
