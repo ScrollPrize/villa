@@ -27,7 +27,7 @@ from koine_machines.evaluation.metrics.confusion import Confusion, ConfusionCoun
 from koine_machines.training.normal_pooling import collate_normal_pooled_batch, pool_logits_along_normals
 from koine_machines.training.visualization import PreviewAccumulator, build_validation_preview_log
 from koine_machines.training.loss.losses import create_loss_from_config
-from stitching import resolve_model_and_loader_patch_sizes, run_model_forward
+from koine_machines.training.stitching import resolve_model_and_loader_patch_sizes, run_model_forward
 
 
 @dataclass
@@ -38,6 +38,22 @@ class ValidationMetricBatch:
 
     def require_targets(self):
         return self.targets
+
+
+def _disable_z_projection_for_normal_pooled_3d(config):
+    if str(config.get('mode', 'flat')).strip().lower() != 'normal_pooled_3d':
+        return
+
+    model_config = config.setdefault('model_config', {})
+    model_config['z_projection_mode'] = 'none'
+
+    targets = config.get('targets') or {}
+    for target_info in targets.values():
+        if not isinstance(target_info, dict):
+            continue
+        target_info['z_projection_mode'] = 'none'
+        if isinstance(target_info.get('z_projection'), dict):
+            target_info['z_projection']['mode'] = 'none'
 
 
 @click.command()
@@ -84,6 +100,7 @@ def train(config_path):
     if mode == 'normal_pooled_3d' and model_type.startswith('resnet3d'):
         raise ValueError("normal_pooled_3d is currently only supported with the vesuvius_unet model path")
     if mode == 'normal_pooled_3d':
+        _disable_z_projection_for_normal_pooled_3d(config)
         config['in_channels'] = 2
 
     config.setdefault('volume_auth_json', None)

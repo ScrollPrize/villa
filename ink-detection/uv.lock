@@ -1405,6 +1405,7 @@ dependencies = [
     { name = "pillow" },
     { name = "pyqt6" },
     { name = "pytest" },
+    { name = "pytorch-optimizer" },
     { name = "pyyaml" },
     { name = "scipy" },
     { name = "tifffile" },
@@ -1432,6 +1433,7 @@ requires-dist = [
     { name = "pillow", specifier = "==12.1.1" },
     { name = "pyqt6", specifier = ">=6.10.2" },
     { name = "pytest", specifier = ">=9.0.2" },
+    { name = "pytorch-optimizer", specifier = ">=3.10.0" },
     { name = "pyyaml", specifier = "==6.0.3" },
     { name = "scipy", specifier = "==1.17.1" },
     { name = "tifffile", specifier = ">=2026.3.3" },
@@ -2941,6 +2943,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/82/ed/0301aeeac3e5353ef3d94b6ec08bbcabd04a72018415dcb29e588514bba8/python_dotenv-1.2.2.tar.gz", hash = "sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3", size = 50135, upload-time = "2026-03-01T16:00:26.196Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0b/d7/1959b9648791274998a9c3526f6d0ec8fd2233e4d4acce81bbae76b44b2a/python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a", size = 22101, upload-time = "2026-03-01T16:00:25.09Z" },
+]
+
+[[package]]
+name = "pytorch-optimizer"
+version = "3.10.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/89/fc/313e6ad458114f3b5ad982c72343f88ef686a238787bcc39cad866a39282/pytorch_optimizer-3.10.0.tar.gz", hash = "sha256:da50f3700e403ac0ce774cbbfdfe94a3f39162eca65eea79d67cfde28ead642b", size = 21314846, upload-time = "2026-03-01T06:20:11.622Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bd/e3/bfc6f22bbcccf2b824c3e9d84a094d1ca9151a5d8a6c0b7990aeefa5cbb6/pytorch_optimizer-3.10.0-py3-none-any.whl", hash = "sha256:931b0c85d665fa635c8cd4d04f9a7fd8f23b915a8e19a23b2c07341f783c5799", size = 287433, upload-time = "2026-03-01T06:20:09.107Z" },
 ]
 
 [[package]]
