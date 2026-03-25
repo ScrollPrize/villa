@@ -2,6 +2,7 @@ import json
 import math
 import os
 from copy import deepcopy
+from dataclasses import dataclass
 import wandb
 import numpy as np 
 import random
@@ -21,10 +22,23 @@ from vesuvius.models.training.lr_schedulers import get_scheduler
 from koine_machines.models.make_model import make_model
 from koine_machines.data.ink_dataset import InkDataset
 from koine_machines.models.load_checkpoint import load_training_checkpoint_from_config, restore_training_state
+from koine_machines.evaluation.metrics.balanced_accuracy import BalancedAccuracy
+from koine_machines.evaluation.metrics.confusion import Confusion, ConfusionCounts
 from koine_machines.training.normal_pooling import collate_normal_pooled_batch, pool_logits_along_normals
 from koine_machines.training.visualization import PreviewAccumulator, build_validation_preview_log
 from koine_machines.training.loss.losses import create_loss_from_config
 from stitching import resolve_model_and_loader_patch_sizes, run_model_forward
+
+
+@dataclass
+class ValidationMetricBatch:
+    logits: torch.Tensor
+    targets: torch.Tensor
+    valid_mask: torch.Tensor | None = None
+
+    def require_targets(self):
+        return self.targets
+
 
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
@@ -242,6 +256,8 @@ def train(config_path):
     train_iterator = iter(train_dl)
     latest_val_loss = None
     latest_ema_val_loss = None
+    validation_confusion_metric = Confusion()
+    validation_balanced_accuracy_metric = BalancedAccuracy()
     
     progress_bar = tqdm(
         range(start_step, config['num_iterations']),
@@ -290,7 +306,7 @@ def train(config_path):
                 batch['flat_valid'].float(),
                 neg_dist=float(pooling_config.get('neg_dist', 10.0)),
                 pos_dist=float(pooling_config.get('pos_dist', 10.0)),
-                sample_step=float(pooling_config.get('sample_step', 1.0)),
+                sample_step=float(pooling_config.get('sample_step', 0.5)),
                 align_corners=True,
             )
             targets = batch['flat_target'].float()
@@ -390,6 +406,7 @@ def train(config_path):
             model.eval()
             val_losses = []
             ema_val_losses = []
+            validation_counts = Confusion.zero_counts(device=accelerator.device)
             val_preview = PreviewAccumulator(accelerator=accelerator, get_model_input=get_model_input)
             num_val_batches = min(len(val_dl), config.get('val_steps', 10))
             if num_val_batches == 0:
@@ -418,6 +435,27 @@ def train(config_path):
                     val_targets_with_ignore = torch.cat([val_targets, val_ignore_mask], dim=1)
                     val_l = loss(val_loss_preds.float(), val_targets_with_ignore)
                     val_losses.append(val_l.item())
+                    batch_counts = validation_confusion_metric.compute_batch(
+                        ValidationMetricBatch(
+                            logits=val_loss_preds.detach(),
+                            targets=val_targets.detach(),
+                            valid_mask=(val_ignore_mask <= 0).detach(),
+                        )
+                    )
+                    gathered_batch_counts = accelerator.gather_for_metrics(
+                        torch.stack(
+                            (batch_counts.tp, batch_counts.fp, batch_counts.fn, batch_counts.tn)
+                        ).unsqueeze(0)
+                    )
+                    validation_counts = Confusion.add_counts(
+                        validation_counts,
+                        ConfusionCounts(
+                            tp=gathered_batch_counts[:, 0].sum(),
+                            fp=gathered_batch_counts[:, 1].sum(),
+                            fn=gathered_batch_counts[:, 2].sum(),
+                            tn=gathered_batch_counts[:, 3].sum(),
+                        ),
+                    )
                     if ema_model is not None and ema_validate:
                         with accelerator.autocast():
                             ema_val_preds = run_model_forward(
@@ -446,6 +484,9 @@ def train(config_path):
                 latest_val_loss = float(mean_val_loss)
                 latest_ema_val_loss = (float(mean_ema_val_loss) if mean_ema_val_loss is not None else None)
                 refresh_progress_bar(train_loss)
+                balanced_accuracy = float(
+                    validation_balanced_accuracy_metric._from_counts(validation_counts).item()
+                )
                 log_dict = build_validation_preview_log(
                     step=step,
                     train_preview=train_preview,
@@ -455,6 +496,15 @@ def train(config_path):
                     mean_val_loss=mean_val_loss,
                     mean_ema_val_loss=mean_ema_val_loss,
                     include_wandb_images=wandb.run is not None,
+                )
+                log_dict.update(
+                    {
+                        'val/balanced_accuracy': balanced_accuracy,
+                        'val/tp': float(validation_counts.tp.item()),
+                        'val/fp': float(validation_counts.fp.item()),
+                        'val/fn': float(validation_counts.fn.item()),
+                        'val/tn': float(validation_counts.tn.item()),
+                    }
                 )
                 if wandb.run is not None:
                     wandb.log(log_dict, step=step)
