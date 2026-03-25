@@ -38,3 +38,4 @@ vesuvius/AGENTS.md
 build/
 *.log
 /ink-detection/tifxyz_dataset/wandb
+/ink-detection/scratch/
