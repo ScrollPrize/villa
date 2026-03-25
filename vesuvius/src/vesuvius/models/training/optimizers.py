@@ -3,6 +3,15 @@
 from torch import optim
 
 
+class OptimizerParamGroupTarget:
+    """Adapter for optimizers that accept an object exposing parameters()."""
+
+    def __init__(self, param_groups):
+        self._param_groups = param_groups
+
+    def parameters(self):
+        return self._param_groups
+
 
 def create_optimizer(optimizer_config, model):
     optim_name = optimizer_config.get('name', 'Adam')

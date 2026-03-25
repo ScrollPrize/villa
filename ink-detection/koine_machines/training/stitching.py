@@ -17,13 +17,17 @@ def resolve_model_and_loader_patch_sizes(config):
     return model_crop_size, loader_patch_size, stitch_factor
 
 
-def run_stitched_model_forward(
+def run_model_forward(
     model,
     image,
     model_crop_size,
     *,
+    stitched=True,
     use_gradient_checkpointing=True,
 ):
+    if not stitched:
+        return model(image)['ink']
+
     assert image.ndim == 5, image.shape
 
     _, _, depth, height, width = image.shape
@@ -39,7 +43,6 @@ def run_stitched_model_forward(
         return model(image)['ink']
 
     stitched_output = None
-    output_key = None
     for y0 in range(0, height, crop_height):
         y1 = y0 + crop_height
         for x0 in range(0, width, crop_width):
@@ -65,7 +68,6 @@ def run_stitched_model_forward(
                     height,
                     width,
                 )
-                output_key = 'ink'
             stitched_output[:, :, y0:y1, x0:x1] = tile_pred
 
-    return {output_key: stitched_output}
+    return stitched_output
