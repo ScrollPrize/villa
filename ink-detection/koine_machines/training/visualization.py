@@ -62,6 +62,8 @@ class PreviewAccumulator:
         return build_preview_montage(self.inputs, self.labels, self.probabilities)
 
     def save(self, output_path):
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         save_val_preview_tif(str(output_path), self.inputs, self.labels, self.probabilities)
 
     def wandb_image(self, caption):

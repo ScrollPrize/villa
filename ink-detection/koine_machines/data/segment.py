@@ -115,6 +115,24 @@ class Segment:
     @classmethod
     def resolve_segment_inklabel_path(cls, segment, *, label_version=None):
         segment_uuid = str(segment.uuid)
+        segment_path = getattr(segment, "path", None)
+        if segment_path is not None:
+            segment_dir = Path(str(segment_path))
+            if segment_dir.is_dir():
+                local_segment = cls(
+                    config={
+                        "patch_size": [1, 1, 1],
+                        "label_version": label_version,
+                    },
+                    segment_dir=segment_dir,
+                    segment_name=segment_dir.name,
+                )
+                inklabels, _, _ = local_segment.discover_labels(
+                    label_version=label_version,
+                    extension=".zarr",
+                )
+                return inklabels
+
         ink_label_paths = [
             Path(str(label["path"]))
             for label in segment.list_labels()
