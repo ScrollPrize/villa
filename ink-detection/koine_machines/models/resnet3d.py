@@ -7,8 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ink.core.types import DataBundle
-
 
 _RESNET3D_ENCODER_DIMS = {
     50: [256, 512, 1024, 2048],
@@ -323,12 +321,16 @@ class ResNet3DSegmentationModel(nn.Module):
             group_norm_groups=group_norm_groups,
         )
 
+    @property
+    def shared_encoder(self):
+        return self.backbone
+
     def forward(self, x):
         if x.ndim == 4:
             x = x[:, None]
         feature_maps = self.backbone(x)
         pooled_feature_maps = [torch.max(feature_map, dim=2)[0] for feature_map in feature_maps]
-        return self.decoder(pooled_feature_maps)
+        return {"ink": self.decoder(pooled_feature_maps)}
 
 
 @dataclass(frozen=True)
@@ -339,7 +341,7 @@ class ResNet3D:
     pretrained: bool = True
     backbone_pretrained_path: str = field(default_factory=_default_backbone_pretrained_path)
 
-    def build(self, *, data: DataBundle, runtime=None, augment=None):
+    def build(self, *, data=None, runtime=None, augment=None):
         del data, runtime, augment
         return ResNet3DSegmentationModel(
             depth=self.depth,
