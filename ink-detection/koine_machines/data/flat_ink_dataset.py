@@ -1,87 +1,26 @@
-import os
 from pathlib import Path
 import json
-from dataclasses import dataclass
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import torch
 from torch.utils.data import Dataset
-import zarr
 import numpy as np 
-import tifffile
 from common import (
     _read_bbox_with_padding,
     flat_patch_cache_path,
     flat_patch_finding_cache_token,
     load_flat_patch_cache,
     open_zarr,
-    resolve_local_label_paths,
     save_flat_patch_cache,
 )
-from patch_finding import find_segment_patches
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.image_proc.intensity.normalization import normalize_robust
-
-@dataclass
-class Patch:
-    segment: 'Segment'
-    bbox: tuple  # (z0, y0, x0, z1, y1, x1)
-    is_validation: bool = False
-    supervision_mask_override: object = None
-
-    @property
-    def image_volume(self):
-        return self.segment.image_volume
-
-    @property
-    def supervision_mask(self):
-        if self.supervision_mask_override is not None:
-            return self.supervision_mask_override
-        return self.segment.supervision_mask
-    
-    @property
-    def inklabels(self):
-        return self.segment.inklabels
-    
-class Segment:
-    def __init__(
-            self,
-            config,
-            image_volume=None,
-            supervision_mask=None,
-            validation_mask=None,
-            inklabels=None,
-            scale=None,
-            dataset_idx=None,
-            segment_relpath=None,
-            ):
-        
-        self.config = config
-        self.scale = scale
-        self.image_volume = image_volume
-        self.supervision_mask = supervision_mask
-        self.validation_mask = validation_mask
-        self.inklabels = inklabels
-        self.dataset_idx = dataset_idx
-        self.segment_relpath = segment_relpath
-        self.patch_size = config['patch_size']
-
-    @property
-    def cache_key(self):
-        return (
-            int(self.dataset_idx),
-            str(self.segment_relpath),
-            self.scale,
-            str(self.inklabels),
-            str(self.supervision_mask),
-            "" if self.validation_mask is None else str(self.validation_mask),
-        )
-
-    def _find_patches(self):
-        training_patches, validation_patches = find_segment_patches(self, Patch)
-        self.training_patches = training_patches
-        self.validation_patches = validation_patches
-        self.patches = training_patches + validation_patches
+try:
+    from .patch import Patch
+    from .segment import Segment
+except ImportError:
+    from patch import Patch
+    from segment import Segment
     
 
 class FlatInkDataset(Dataset):
@@ -166,13 +105,17 @@ class FlatInkDataset(Dataset):
 
             for tifxyz_folder in sorted(seg_path.iterdir()):
                 if tifxyz_folder.is_dir() and any(tifxyz_folder.rglob('x.tif')) and tifxyz_folder.name != 'unused':
-                    image_volume     = Path(str(tifxyz_folder) + "/" + tifxyz_folder.name + '.zarr')
-                    inklabels, supervision_mask, validation_mask = resolve_local_label_paths(
-                        tifxyz_folder,
-                        tifxyz_folder.name,
-                        label_version=self.config.get('label_version'),
-                        extension='.zarr',
+                    image_volume = Path(str(tifxyz_folder) + "/" + tifxyz_folder.name + '.zarr')
+                    segment = Segment(
+                        config=self.config,
+                        image_volume=image_volume,
+                        scale=ds['volume_scale'],
+                        dataset_idx=dataset_idx,
+                        segment_relpath=tifxyz_folder.relative_to(seg_path).as_posix(),
+                        segment_dir=tifxyz_folder,
+                        segment_name=tifxyz_folder.name,
                     )
+                    inklabels, supervision_mask, validation_mask = segment.discover_labels(extension='.zarr')
 
                     if self.debug:
                         print(image_volume)
@@ -183,16 +126,7 @@ class FlatInkDataset(Dataset):
                     if not (image_volume.exists() and supervision_mask.exists() and inklabels.exists()):
                         raise ValueError(f"{tifxyz_folder.name} is missing required data. make sure the image volume, supervision mask, and labels exist")
 
-                    yield Segment(
-                        config           = self.config,
-                        image_volume     = image_volume,
-                        supervision_mask = supervision_mask,
-                        validation_mask  = validation_mask,
-                        inklabels        = inklabels,
-                        scale            = ds['volume_scale'],
-                        dataset_idx      = dataset_idx,
-                        segment_relpath  = tifxyz_folder.relative_to(seg_path).as_posix(),
-                    )
+                    yield segment
 
     def __len__(self):
         return len(self.patches)
