@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from common import open_zarr
 from ink.recipes.components import component_bboxes
 
 
@@ -192,4 +193,109 @@ def build_patch_index(
         np.asarray(bbox_indices, dtype=np.int32),
     )
 
-__all__ = ["build_patch_index"]
+
+def _surface_patch_bbox(surface: int, y0: int, x0: int, patch_size) -> tuple[int, int, int, int, int, int]:
+    depth, height, width = (int(v) for v in patch_size)
+    z0 = int(surface - depth // 2)
+    return (
+        z0,
+        int(y0),
+        int(x0),
+        z0 + depth,
+        int(y0) + height,
+        int(x0) + width,
+    )
+
+
+def _labeled_patch_coverage(label_patch) -> float:
+    patch = np.asarray(label_patch)
+    if patch.size == 0:
+        return 0.0
+
+    labeled_ys, labeled_xs = np.nonzero(patch)
+    if labeled_ys.size == 0:
+        return 0.0
+
+    labeled_area = (
+        (int(labeled_ys.max()) - int(labeled_ys.min()) + 1)
+        * (int(labeled_xs.max()) - int(labeled_xs.min()) + 1)
+    )
+    return float(labeled_area) / float(patch.size)
+
+
+def find_segment_patches(segment, patch_cls):
+    patch_size = tuple(int(v) for v in segment.patch_size)
+    if int(patch_size[1]) != int(patch_size[2]):
+        raise ValueError(
+            "subtiling patch finding requires square y/x patch_size, "
+            f"got {tuple(int(v) for v in patch_size)}"
+        )
+
+    volume_auth = segment.config.get("volume_auth_json")
+    supervision_mask = open_zarr(segment.supervision_mask, resolution=segment.scale, auth=volume_auth)
+    inklabels = open_zarr(segment.inklabels, resolution=segment.scale, auth=volume_auth)
+    validation_mask = None
+    if segment.validation_mask is not None:
+        validation_mask = open_zarr(segment.validation_mask, resolution=segment.scale, auth=volume_auth)
+
+    surface = int(supervision_mask.shape[0] // 2)
+    patch_size_yx = int(patch_size[1])
+    default_stride = int(patch_size_yx * float(segment.config["patch_overlap"]))
+    tile_size = int(segment.config.get("patch_finding_tile_size", patch_size_yx))
+    stride = int(segment.config.get("patch_finding_stride", default_stride))
+    filter_empty_tile = bool(segment.config.get("patch_finding_filter_empty_tile", False))
+
+    _, xyxys, _ = build_patch_index(
+        mask=inklabels[surface],
+        fragment_mask=supervision_mask[surface],
+        size=patch_size_yx,
+        tile_size=tile_size,
+        stride=stride,
+        filter_empty_tile=filter_empty_tile,
+    )
+
+    training_patches = []
+    validation_patches = []
+    for x1, y1, x2, y2 in xyxys.tolist():
+        del x2, y2
+        patch_bbox_zyx = _surface_patch_bbox(surface, int(y1), int(x1), patch_size)
+
+        has_validation_supervision = False
+        if validation_mask is not None:
+            validation_patch = validation_mask[
+                surface,
+                int(y1):int(y1) + patch_size[1],
+                int(x1):int(x1) + patch_size[2],
+            ]
+            has_validation_supervision = bool(validation_patch.size > 0 and np.any(validation_patch))
+        if has_validation_supervision:
+            validation_patches.append(
+                patch_cls(
+                    segment=segment,
+                    bbox=patch_bbox_zyx,
+                    is_validation=True,
+                    supervision_mask_override=segment.validation_mask,
+                )
+            )
+            continue
+
+        label_patch = inklabels[
+            surface,
+            int(y1):int(y1) + patch_size[1],
+            int(x1):int(x1) + patch_size[2],
+        ]
+        if _labeled_patch_coverage(label_patch) >= float(segment.config["patch_min_labeled_coverage"]):
+            training_patches.append(
+                patch_cls(
+                    segment=segment,
+                    bbox=patch_bbox_zyx,
+                )
+            )
+
+    if len(training_patches) == 0 and len(validation_patches) == 0:
+        raise ValueError(f"{segment.inklabels} produced no valid patches")
+
+    return training_patches, validation_patches
+
+
+__all__ = ["build_patch_index", "find_segment_patches"]

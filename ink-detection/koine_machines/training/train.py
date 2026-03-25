@@ -7,7 +7,6 @@ import numpy as np
 import random
 from tqdm import tqdm
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 import accelerate
 from accelerate.utils import GradientAccumulationPlugin, set_seed
@@ -16,18 +15,22 @@ from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.nets.models import make_model
-from common import (
-    build_preview_montage,
-    save_val_preview_tif,
-    to_uint8_image,
-    to_uint8_label,
-    to_uint8_probability,
+from koine_machines.data.flat_ink_dataset import FlatInkDataset
+from koine_machines.data.tifxyz_dataset import TifxyzInkDataset
+from koine_machines.loss.pool_along_normal import (
+    _get_normal_pool_offsets,
+    _pool_logits_along_surface_normals,
 )
-from flat_ink_dataset import FlatInkDataset
+from koine_machines.models.load_checkpoint import (
+    load_training_checkpoint_from_config,
+    restore_training_state,
+)
+from koine_machines.training.visualization import (
+    PreviewAccumulator,
+    build_validation_preview_log,
+)
 from losses import create_loss_from_config
 from stitching import resolve_model_and_loader_patch_sizes, run_stitched_model_forward
-from tifxyz_dataset import TifxyzInkDataset
-
 
 
 class _OptimizerParamGroupTarget:
@@ -40,142 +43,6 @@ class _OptimizerParamGroupTarget:
         return self._param_groups
 
 
-def _normalize_distance_pair(value):
-    if value is None:
-        raise ValueError("distance configuration must not be None")
-    if np.isscalar(value):
-        scalar = float(value)
-        return (scalar, scalar)
-    pair = tuple(float(v) for v in value)
-    if len(pair) != 2:
-        raise ValueError(f"distance configuration must be a number or length-2 sequence, got {value!r}")
-    return pair
-
-
-def _build_normal_pool_offsets(distance_pair, sample_step, *, device, dtype):
-    pos_distance = max(0.0, float(distance_pair[0]))
-    neg_distance = max(0.0, float(distance_pair[1]))
-    sample_step = float(sample_step)
-    if sample_step <= 0.0:
-        raise ValueError(f"normal_pool_step must be > 0, got {sample_step}")
-
-    offsets = np.arange(-neg_distance, pos_distance + (0.5 * sample_step), sample_step, dtype=np.float32)
-    anchors = np.asarray([-neg_distance, 0.0, pos_distance], dtype=np.float32)
-    offsets = np.unique(np.round(np.concatenate([offsets, anchors], axis=0), decimals=6))
-    offsets.sort()
-    return torch.as_tensor(offsets, device=device, dtype=dtype)
-
-
-def _get_normal_pool_offsets(offset_cache, distance_pair, sample_step, *, device, dtype):
-    cache_key = (device.type, device.index, dtype)
-    offsets = offset_cache.get(cache_key)
-    if offsets is None:
-        offsets = _build_normal_pool_offsets(
-            distance_pair,
-            sample_step,
-            device=device,
-            dtype=dtype,
-        )
-        offset_cache[cache_key] = offsets
-    return offsets
-
-
-def _resolve_normal_pool_distance(config):
-    explicit = config.get('normal_pool_distance')
-    if explicit is not None:
-        return _normalize_distance_pair(explicit)
-
-    fg_distance = _normalize_distance_pair(
-        config.get('fg_distance', config.get('label_distance', 10))
-    )
-    bg_distance = _normalize_distance_pair(config.get('bg_distance', fg_distance))
-    return (
-        max(float(fg_distance[0]), float(bg_distance[0])),
-        max(float(fg_distance[1]), float(bg_distance[1])),
-    )
-
-
-def _pool_logits_along_surface_normals(
-    logits,
-    surface_points_zyx,
-    surface_normals_zyx,
-    offsets,
-    *,
-    reduction,
-    temperature,
-):
-    if logits.ndim != 5:
-        raise ValueError(
-            f"mode='normal_pooled_3d' expects 3D logits with shape [B, C, Z, Y, X], got {tuple(logits.shape)}"
-        )
-    if surface_points_zyx.ndim != 4 or surface_points_zyx.shape[-1] != 3:
-        raise ValueError(
-            f"Expected surface_points_zyx shape [B, H, W, 3], got {tuple(surface_points_zyx.shape)}"
-        )
-    if surface_normals_zyx.shape != surface_points_zyx.shape:
-        raise ValueError(
-            f"surface_normals_zyx shape {tuple(surface_normals_zyx.shape)} must match surface_points_zyx "
-            f"{tuple(surface_points_zyx.shape)}"
-        )
-
-    logits = logits.float()
-    surface_points_zyx = surface_points_zyx.to(device=logits.device, dtype=logits.dtype)
-    surface_normals_zyx = surface_normals_zyx.to(device=logits.device, dtype=logits.dtype)
-    offsets = offsets.to(device=logits.device, dtype=logits.dtype)
-
-    ray_points = (
-        surface_points_zyx[..., None, :]
-        + (surface_normals_zyx[..., None, :] * offsets.view(1, 1, 1, -1, 1))
-    )
-    z = ray_points[..., 0]
-    y = ray_points[..., 1]
-    x = ray_points[..., 2]
-
-    size_z, size_y, size_x = logits.shape[-3:]
-    ray_valid = (
-        (z >= 0.0) & (z <= float(size_z - 1))
-        & (y >= 0.0) & (y <= float(size_y - 1))
-        & (x >= 0.0) & (x <= float(size_x - 1))
-    )
-    denom_z = max(size_z - 1, 1)
-    denom_y = max(size_y - 1, 1)
-    denom_x = max(size_x - 1, 1)
-    z_norm = (2.0 * z / denom_z) - 1.0
-    y_norm = (2.0 * y / denom_y) - 1.0
-    x_norm = (2.0 * x / denom_x) - 1.0
-    grid = torch.stack([x_norm, y_norm, z_norm], dim=-1).permute(0, 3, 1, 2, 4)
-
-    ray_logits = F.grid_sample(
-        logits,
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )
-    ray_valid = ray_valid.permute(0, 3, 1, 2).unsqueeze(1)
-    masked_ray_logits = torch.where(
-        ray_valid,
-        ray_logits,
-        torch.full_like(ray_logits, float("-inf")),
-    )
-    any_valid = ray_valid.any(dim=2)
-    if reduction == "max":
-        pooled = masked_ray_logits.amax(dim=2)
-        pooled = torch.where(any_valid, pooled, torch.zeros_like(pooled))
-        return pooled, any_valid
-    if reduction == "logsumexp":
-        if temperature <= 0.0:
-            raise ValueError(
-                f"normal_pool_temperature must be > 0 when using logsumexp pooling, got {temperature}"
-            )
-        pooled = temperature * torch.logsumexp(masked_ray_logits / temperature, dim=2)
-        pooled = torch.where(any_valid, pooled, torch.zeros_like(pooled))
-        return pooled, any_valid
-    raise ValueError(
-        f"Unsupported normal_pool_reduction {reduction!r}; expected 'logsumexp' or 'max'"
-    )
-
-
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
 def train(config_path):
@@ -183,23 +50,12 @@ def train(config_path):
         config = json.load(f)
     training_mode = str(config.get('mode', 'default')).strip().lower()
 
-    checkpoint_path = config.get('checkpoint')
-    checkpoint = None
-    weights_only = bool(config.get('weights_only', False))
-    resume_full_state = False
+    checkpoint_path, checkpoint, weights_only = load_training_checkpoint_from_config(
+        config,
+        config_path,
+    )
+    resume_full_state = checkpoint is not None and not weights_only
     start_step = 0
-    if checkpoint_path:
-        if not os.path.isabs(checkpoint_path):
-            checkpoint_path = os.path.join(os.path.dirname(config_path), checkpoint_path)
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        resume_full_state = not weights_only
-        if resume_full_state:
-            checkpoint_step = checkpoint.get('step')
-            if checkpoint_step is None:
-                raise ValueError(
-                    f"Checkpoint '{checkpoint_path}' is missing 'step', cannot resume training state"
-                )
-            start_step = int(checkpoint_step) + 1
 
     if str(config.get('model_type', '')).strip().lower() == 'dinov2':
         config.setdefault('model_config', {})
@@ -336,8 +192,6 @@ def train(config_path):
     dataloader_workers = int(config.get('dataloader_workers', 0))
     dataloader_kwargs = {}
     if dataloader_workers > 0:
-        # CUDA is initialized before dataloader iteration via accelerate/model setup.
-        # Spawn workers instead of forking from a CUDA-initialized parent process.
         dataloader_kwargs['multiprocessing_context'] = 'spawn'
         dataloader_kwargs['persistent_workers'] = True
 
@@ -423,26 +277,15 @@ def train(config_path):
 
     optimizer_step = 0
     if checkpoint is not None:
-        model_state = checkpoint.get('model')
-        if model_state is None:
-            raise ValueError(f"Checkpoint '{checkpoint_path}' is missing 'model'")
-        model.load_state_dict(model_state)
-
-        if resume_full_state:
-            optimizer_state = checkpoint.get('optimizer')
-            lr_scheduler_state = checkpoint.get('lr_scheduler')
-            if optimizer_state is None or lr_scheduler_state is None:
-                raise ValueError(
-                    f"Checkpoint '{checkpoint_path}' is missing optimizer or lr_scheduler state"
-                )
-            optimizer.load_state_dict(optimizer_state)
-            lr_scheduler.load_state_dict(lr_scheduler_state)
-
-            if ema_model is not None:
-                ema_model_state = checkpoint.get('ema_model')
-                if ema_model_state is not None:
-                    ema_model.load_state_dict(ema_model_state)
-                    optimizer_step = int(checkpoint.get('ema_optimizer_step', 0))
+        start_step, optimizer_step = restore_training_state(
+            model,
+            optimizer,
+            lr_scheduler,
+            checkpoint,
+            checkpoint_path,
+            load_weights_only=weights_only,
+            ema_model=ema_model,
+        )
 
         accelerator.print(
             f"Loaded checkpoint '{checkpoint_path}'"
@@ -464,7 +307,7 @@ def train(config_path):
     )
     latest_val_loss = None
     latest_ema_val_loss = None
-    normal_pool_distance = _resolve_normal_pool_distance(config)
+    normal_pool_distance = tuple(float(v) for v in config['normal_pool_distance'])
     normal_pool_step = float(
         config.get('normal_pool_step', config.get('normal_sample_step', 0.5))
     )
@@ -536,40 +379,6 @@ def train(config_path):
         ignore_mask = (supervision_mask <= 0).float()
         return preds, targets, ignore_mask
 
-    def append_preview_tiles(preview_inputs, preview_labels, preview_probabilities, batch, preds, targets, ignore_mask):
-        input_batch = get_model_input(batch)
-        input_mid_slice = input_batch[:, :, input_batch.shape[2] // 2]
-        if input_mid_slice.shape[-2:] != preds.shape[-2:]:
-            input_mid_slice = F.interpolate(
-                input_mid_slice,
-                size=preds.shape[-2:],
-                mode='bilinear',
-                align_corners=False,
-            )
-
-        gathered_inputs = accelerator.gather_for_metrics(input_mid_slice)
-        gathered_targets = accelerator.gather_for_metrics(targets)
-        gathered_ignore_masks = accelerator.gather_for_metrics(ignore_mask)
-        gathered_probabilities = accelerator.gather_for_metrics(torch.sigmoid(preds.float()))
-
-        if not accelerator.is_main_process:
-            return
-
-        input_tiles = gathered_inputs[:, 0].detach().cpu().numpy()
-        label_tiles = gathered_targets[:, 0].detach().cpu().numpy()
-        ignore_mask_tiles = gathered_ignore_masks[:, 0].detach().cpu().numpy()
-        probability_tiles = gathered_probabilities[:, 0].detach().cpu().numpy()
-
-        for input_tile, label_tile, ignore_mask_tile, probability_tile in zip(
-            input_tiles,
-            label_tiles,
-            ignore_mask_tiles,
-            probability_tiles,
-        ):
-            preview_inputs.append(to_uint8_image(input_tile))
-            preview_labels.append(to_uint8_label(label_tile, ignore_mask_tile))
-            preview_probabilities.append(to_uint8_probability(probability_tile))
-
     def refresh_progress_bar(current_train_loss):
         if not accelerator.is_main_process:
             return
@@ -628,8 +437,6 @@ def train(config_path):
         train_loss = l.item()
         if accelerator.is_main_process:
             refresh_progress_bar(train_loss)
-            if overflow_step_skipped:
-                tqdm.write(f'step {step} | optimizer step skipped due to fp16 overflow')
 
         if accelerator.is_main_process and step % log_every == 0:
             log_dict = {
@@ -645,13 +452,11 @@ def train(config_path):
                 wandb.log(log_dict, step=step)
 
         if step % val_every == 0 and step > 0:
-            train_preview_inputs = []
-            train_preview_labels = []
-            train_preview_probabilities = []
-            append_preview_tiles(
-                train_preview_inputs,
-                train_preview_labels,
-                train_preview_probabilities,
+            train_preview = PreviewAccumulator(
+                accelerator=accelerator,
+                get_model_input=get_model_input,
+            )
+            train_preview.add_batch(
                 batch,
                 loss_preds.detach(),
                 targets.detach(),
@@ -660,9 +465,10 @@ def train(config_path):
             model.eval()
             val_losses = []
             ema_val_losses = []
-            val_preview_inputs = []
-            val_preview_labels = []
-            val_preview_probabilities = []
+            val_preview = PreviewAccumulator(
+                accelerator=accelerator,
+                get_model_input=get_model_input,
+            )
             num_val_batches = min(len(val_dl), config.get('val_steps', 10))
             if num_val_batches == 0:
                 if accelerator.is_main_process:
@@ -699,10 +505,7 @@ def train(config_path):
                         preview_preds = ema_val_loss_preds
 
                     if val_batch_idx in preview_batch_indices:
-                        append_preview_tiles(
-                            val_preview_inputs,
-                            val_preview_labels,
-                            val_preview_probabilities,
+                        val_preview.add_batch(
                             val_batch,
                             preview_preds.detach(),
                             val_targets.detach(),
@@ -717,43 +520,31 @@ def train(config_path):
                     float(mean_ema_val_loss) if mean_ema_val_loss is not None else None
                 )
                 refresh_progress_bar(train_loss)
-                train_preview_montage = build_preview_montage(
-                    train_preview_inputs,
-                    train_preview_labels,
-                    train_preview_probabilities,
-                )
-                val_preview_montage = build_preview_montage(
-                    val_preview_inputs,
-                    val_preview_labels,
-                    val_preview_probabilities,
-                )
-                save_val_preview_tif(
-                    os.path.join(train_preview_dir, f'train_preview_{step:06}.tif'),
-                    train_preview_inputs,
-                    train_preview_labels,
-                    train_preview_probabilities,
-                )
-                save_val_preview_tif(
-                    os.path.join(val_preview_dir, f'val_preview_{step:06}.tif'),
-                    val_preview_inputs,
-                    val_preview_labels,
-                    val_preview_probabilities,
-                )
                 if wandb.run is not None:
-                    log_dict = {'val/loss': mean_val_loss}
-                    if mean_ema_val_loss is not None:
-                        log_dict['val/loss_ema'] = mean_ema_val_loss
-                    if train_preview_montage is not None:
-                        log_dict['train/preview'] = wandb.Image(
-                            train_preview_montage,
-                            caption=f"step {step} train preview",
-                        )
-                    if val_preview_montage is not None:
-                        log_dict['val/preview'] = wandb.Image(
-                            val_preview_montage,
-                            caption=f"step {step} val preview",
-                        )
-                    wandb.log(log_dict, step=step)
+                    wandb.log(
+                        build_validation_preview_log(
+                            step=step,
+                            train_preview=train_preview,
+                            val_preview=val_preview,
+                            train_preview_dir=train_preview_dir,
+                            val_preview_dir=val_preview_dir,
+                            mean_val_loss=mean_val_loss,
+                            mean_ema_val_loss=mean_ema_val_loss,
+                            include_wandb_images=True,
+                        ),
+                        step=step,
+                    )
+                else:
+                    build_validation_preview_log(
+                        step=step,
+                        train_preview=train_preview,
+                        val_preview=val_preview,
+                        train_preview_dir=train_preview_dir,
+                        val_preview_dir=val_preview_dir,
+                        mean_val_loss=mean_val_loss,
+                        mean_ema_val_loss=mean_ema_val_loss,
+                        include_wandb_images=False,
+                    )
 
         if accelerator.is_main_process and step % save_every == 0 and step > 0:
             checkpoint = {

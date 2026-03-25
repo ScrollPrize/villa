@@ -12,11 +12,13 @@ import tifffile
 from common import (
     _read_bbox_with_padding,
     flat_patch_cache_path,
+    flat_patch_finding_cache_token,
     load_flat_patch_cache,
     open_zarr,
     resolve_local_label_paths,
     save_flat_patch_cache,
 )
+from patch_finding import find_segment_patches
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 from vesuvius.image_proc.intensity.normalization import normalize_robust
 
@@ -76,67 +78,7 @@ class Segment:
         )
 
     def _find_patches(self):
-        volume_auth = self.config.get('volume_auth_json')
-        supervision_mask = open_zarr(self.supervision_mask, resolution=self.scale, auth=volume_auth)
-        inklabels = open_zarr(self.inklabels, resolution=self.scale, auth=volume_auth)
-        validation_mask = None
-        if self.validation_mask is not None:
-            validation_mask = open_zarr(self.validation_mask, resolution=self.scale, auth=volume_auth)
-        surface = supervision_mask.shape[0] // 2
-        surface_slice = supervision_mask[surface]
-        ys, xs = np.nonzero(surface_slice)
-        if len(ys) == 0:
-            raise ValueError(f"{self.supervision_mask} contains no nonzero voxels")
-
-        stride = int(self.patch_size[1] * self.config['patch_overlap'])
-        patch_corners_top_left = np.unique(
-            np.stack([ys // stride * stride, xs // stride * stride], axis=1),
-            axis=0
-        )
-
-        training_patches = []
-        validation_patches = []
-        for y0, x0 in patch_corners_top_left:
-            z0 = surface - self.patch_size[0] // 2
-            patch_bbox_zyx = (
-                z0,
-                int(y0),
-                int(x0),
-                z0 + self.patch_size[0],
-                int(y0) + self.patch_size[1],
-                int(x0) + self.patch_size[2],
-            )
-            has_validation_supervision = False
-            if validation_mask is not None:
-                validation_patch = validation_mask[surface, y0:y0+self.patch_size[1], x0:x0+self.patch_size[2]]
-                has_validation_supervision = bool(validation_patch.size > 0 and np.any(validation_patch))
-            if has_validation_supervision:
-                validation_patches.append(Patch(
-                    segment=self,
-                    bbox=patch_bbox_zyx,
-                    is_validation=True,
-                    supervision_mask_override=self.validation_mask,
-                ))
-                continue
-
-            patch_bbox = inklabels[surface, y0:y0+self.patch_size[1], x0:x0+self.patch_size[2]]
-            if patch_bbox.size == 0:
-                continue
-            labeled_ys, labeled_xs = np.nonzero(patch_bbox)
-            if labeled_ys.size == 0:
-                continue
-            labeled_area = (labeled_ys.max() - labeled_ys.min() + 1) * (labeled_xs.max() - labeled_xs.min() + 1)
-            labeled_patch_coverage = labeled_area / patch_bbox.size
-
-            if labeled_patch_coverage >= self.config['patch_min_labeled_coverage']:
-                training_patches.append(Patch(
-                    segment=self,
-                    bbox=patch_bbox_zyx,
-                ))
-
-        if len(training_patches) == 0 and len(validation_patches) == 0:
-            raise ValueError(f"{self.inklabels} produced no valid patches")
-
+        training_patches, validation_patches = find_segment_patches(self, Patch)
         self.training_patches = training_patches
         self.validation_patches = validation_patches
         self.patches = training_patches + validation_patches
@@ -160,6 +102,7 @@ class FlatInkDataset(Dataset):
         if patches is None:
             segments = list(self._gather_segments())
             cache_path = flat_patch_cache_path(self.config)
+            expected_patch_finding_key = flat_patch_finding_cache_token(self.config)
             segments_by_key = {
                 seg.cache_key: seg
                 for seg in segments
@@ -170,6 +113,9 @@ class FlatInkDataset(Dataset):
                 cached_patches = []
                 cache_valid = True
                 for record in cached_records:
+                    if record.get('patch_finding_key') != expected_patch_finding_key:
+                        cache_valid = False
+                        break
                     cache_key = (
                         int(record['dataset_idx']),
                         str(record['segment_relpath']),

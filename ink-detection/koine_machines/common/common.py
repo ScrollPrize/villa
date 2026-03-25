@@ -32,7 +32,30 @@ def flat_patch_cache_path(config):
     else:
         patch_size_key = "x".join(str(int(v)) for v in patch_size)
     version_key = label_version_cache_token(config.get("label_version"))
-    return Path(config.get("out_dir", ".")) / f"flat_ink_patches_ps-{patch_size_key}_labels-{version_key}.json"
+    patch_finding_key = flat_patch_finding_cache_token(config)
+    return Path(config.get("out_dir", ".")) / (
+        f"flat_ink_patches_pf-{patch_finding_key}_ps-{patch_size_key}_labels-{version_key}.json"
+    )
+
+
+def flat_patch_finding_cache_token(config):
+    patch_finding_type = str(config.get("patch_finding_type", "default")).strip().lower() or "default"
+    patch_size = config.get("patch_size", ())
+    if isinstance(patch_size, int):
+        patch_dims = [int(patch_size)]
+    else:
+        patch_dims = [int(v) for v in patch_size]
+
+    patch_size_y = patch_dims[1] if len(patch_dims) >= 2 else (patch_dims[0] if patch_dims else 0)
+    default_stride = int(patch_size_y * float(config.get("patch_overlap", 0)))
+
+    if patch_finding_type == "subtiling":
+        tile_size = int(config.get("patch_finding_tile_size", patch_size_y))
+        stride = int(config.get("patch_finding_stride", default_stride))
+        filter_empty_tile = int(bool(config.get("patch_finding_filter_empty_tile", False)))
+        return f"subtiling-ts-{tile_size}_st-{stride}_fe-{filter_empty_tile}"
+
+    return f"default-po-{config.get('patch_overlap', '')}"
 
 
 def save_flat_patch_cache(path, patches):
@@ -53,6 +76,9 @@ def save_flat_patch_cache(path, patches):
                     ),
                     "active_supervision_mask_path": str(patch.supervision_mask),
                     "is_validation": bool(getattr(patch, "is_validation", False)),
+                    "patch_finding_key": flat_patch_finding_cache_token(
+                        getattr(patch.segment, "config", {})
+                    ),
                     "bbox": list(patch.bbox),
                 }
                 for patch in patches
