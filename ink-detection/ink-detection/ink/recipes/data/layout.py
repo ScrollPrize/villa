@@ -5,7 +5,13 @@ import hashlib
 from pathlib import Path
 import re
 
-from ink.recipes.data.masks import SUPERVISION_MASK_NAME, normalize_mask_names
+from ink.recipes.data.masks import (
+    SUPERVISION_MASK_NAME,
+    VALIDATION_MASK_NAME,
+    normalize_mask_names,
+    resolve_segment_mask_names,
+    resolve_stitch_roi_mask_names,
+)
 
 
 @dataclass(frozen=True)
@@ -43,6 +49,43 @@ def resolve_segment_artifact_path(
             f"Expected {str(path)!r}."
         )
     return path
+
+
+def resolve_layout_mask_names_for_segment(
+    *,
+    layout: "NestedZarrLayout",
+    segment_id: str,
+    split_name: str,
+    train_segment_ids=(),
+    default_mask_name: str = SUPERVISION_MASK_NAME,
+    mask_suffix: str = "",
+) -> tuple[str, ...]:
+    return resolve_segment_mask_names(
+        split_name=split_name,
+        segment_id=segment_id,
+        train_segment_ids=train_segment_ids,
+        default_mask_name=default_mask_name,
+        available_mask_names=layout.resolve_existing_artifact_names(
+            segment_id,
+            artifact_names=(SUPERVISION_MASK_NAME, VALIDATION_MASK_NAME),
+            suffix=mask_suffix,
+        ),
+    )
+
+
+def resolve_layout_stitch_roi_mask_names(
+    *,
+    layout: "NestedZarrLayout",
+    segment_id: str,
+    mask_suffix: str = "",
+) -> tuple[str, ...]:
+    return resolve_stitch_roi_mask_names(
+        available_mask_names=layout.resolve_existing_artifact_names(
+            segment_id,
+            artifact_names=(SUPERVISION_MASK_NAME, VALIDATION_MASK_NAME),
+            suffix=mask_suffix,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -87,6 +130,27 @@ class NestedZarrLayout:
         if not group_name:
             raise ValueError(f"could not resolve group name for segment_id={str(segment_id)!r}")
         return group_name
+
+    def resolve_existing_artifact_names(
+        self,
+        segment_id: str,
+        *,
+        artifact_names,
+        suffix: str = "",
+    ) -> tuple[str, ...]:
+        segment_id = str(segment_id).strip()
+        segment_dir = self.resolve_segment_dir(segment_id)
+        return tuple(
+            str(artifact_name)
+            for artifact_name in tuple(artifact_names or ())
+            if resolve_segment_artifact_path(
+                segment_dir,
+                segment_id,
+                artifact_name=str(artifact_name),
+                suffix=suffix,
+                required=False,
+            ).exists()
+        )
 
     def resolve_paths(
         self,

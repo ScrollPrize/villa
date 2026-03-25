@@ -35,8 +35,12 @@ def _apply_joint_transform_with_valid_mask(transform, image, label, *, patch_siz
     return image, label, valid_mask
 
 
-def build_joint_transform(split: str, *, augment, normalization, patch_size: int, in_channels: int):
-    """Build the shared Albumentations pipeline for the requested split."""
+def _apply_image_only_transform(transform, image):
+    data = transform(image=image)
+    return data["image"].unsqueeze(0)
+
+
+def _build_common_transform_ops(split: str, *, augment, normalization, patch_size: int, in_channels: int):
     split = str(split).strip().lower()
     patch_size = int(patch_size)
     in_channels = int(in_channels)
@@ -48,8 +52,33 @@ def build_joint_transform(split: str, *, augment, normalization, patch_size: int
     else:
         raise ValueError(f"Unknown augmentation split: {split!r}. Expected 'train' or 'valid'.")
     transforms.append(build_normalization_transform(normalization, in_channels=in_channels))
+    return transforms
+
+
+def build_joint_transform(split: str, *, augment, normalization, patch_size: int, in_channels: int):
+    """Build the shared Albumentations pipeline for the requested split."""
+    transforms = _build_common_transform_ops(
+        split,
+        augment=augment,
+        normalization=normalization,
+        patch_size=patch_size,
+        in_channels=in_channels,
+    )
     transforms.append(ToTensorV2(transpose_mask=True))
     return A.Compose(transforms, additional_targets={"valid_mask": "mask"})
+
+
+def build_image_transform(split: str, *, augment, normalization, patch_size: int, in_channels: int):
+    """Build the image-only Albumentations pipeline for inference-style datasets."""
+    transforms = _build_common_transform_ops(
+        split,
+        augment=augment,
+        normalization=normalization,
+        patch_size=patch_size,
+        in_channels=in_channels,
+    )
+    transforms.append(ToTensorV2())
+    return A.Compose(transforms)
 
 
 def apply_train_sample_transforms(
@@ -106,8 +135,22 @@ def apply_eval_sample_transforms(
     )
 
 
+def apply_infer_sample_transforms(
+    image,
+    *,
+    transform,
+):
+    """Apply the eval transform path for image-only inference samples."""
+    return _apply_image_only_transform(
+        transform,
+        image,
+    )
+
+
 __all__ = [
     "apply_eval_sample_transforms",
+    "apply_infer_sample_transforms",
     "apply_train_sample_transforms",
+    "build_image_transform",
     "build_joint_transform",
 ]

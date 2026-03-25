@@ -21,6 +21,7 @@ from ink.recipes.data.patch_bundle import GeneratedPatchBundleDataRecipe
 from ink.recipes.data.zarr_data import ZarrPatchDataRecipe
 from ink.recipes import stitch as stitch_pkg
 from ink.recipes.stitch import loaders as stitch_loaders
+from ink.recipes.stitch.plan_from_zarr import build_zarr_stitch_segment_specs
 from ink.recipes.stitch import train_component_runtime as stitch_train_component_runtime
 from ink.recipes.stitch import train_runtime as stitch_train_runtime
 from ink.recipes.stitch import (
@@ -112,15 +113,17 @@ def _make_canonical_segment(
     label: np.ndarray,
     supervision_mask: np.ndarray,
     validation_mask: np.ndarray | None = None,
+    write_validation_mask: bool = True,
 ) -> dict[str, object]:
     segment_dir = root / group_name / segment_id
     _write_zarr_array(segment_dir / f"{segment_id}.zarr", np.asarray(volume))
     _write_zarr_array(segment_dir / f"{segment_id}_inklabels.zarr", np.asarray(label))
     _write_zarr_array(segment_dir / f"{segment_id}_supervision_mask.zarr", np.asarray(supervision_mask))
-    _write_zarr_array(
-        segment_dir / f"{segment_id}_validation_mask.zarr",
-        np.asarray(supervision_mask if validation_mask is None else validation_mask),
-    )
+    if write_validation_mask:
+        _write_zarr_array(
+            segment_dir / f"{segment_id}_validation_mask.zarr",
+            np.asarray(supervision_mask if validation_mask is None else validation_mask),
+        )
     return {
         "layer_range": (0, int(volume.shape[0] if volume.shape[0] <= volume.shape[-1] else volume.shape[-1])),
         "reverse_layers": False,
@@ -376,6 +379,7 @@ class StitchRuntimeDataTests(unittest.TestCase):
                 volume=np.stack([np.full((8, 8), value, dtype=np.uint8) for value in (10, 20, 30, 40)], axis=0),
                 label=np.full((8, 8), 255, dtype=np.uint8),
                 supervision_mask=np.full((8, 8), 255, dtype=np.uint8),
+                write_validation_mask=False,
             )
             seg_b = _make_canonical_segment(
                 root,
@@ -414,6 +418,53 @@ class StitchRuntimeDataTests(unittest.TestCase):
             batch = next(iter(train_viz_loaders[0]))
             self.assertEqual(batch.meta.segment_ids, ["segA"])
             self.assertEqual(batch.meta.patch_xyxy[0].tolist(), [0, 0, 8, 8])
+
+    def test_build_stitch_runtime_loaders_train_viz_uses_train_mask_policy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            seg_a = _make_canonical_segment(
+                root,
+                group_name="group_a",
+                segment_id="segA",
+                volume=np.stack([np.full((8, 8), value, dtype=np.uint8) for value in (10, 20, 30, 40)], axis=0),
+                label=np.full((8, 8), 255, dtype=np.uint8),
+                supervision_mask=np.full((8, 8), 255, dtype=np.uint8),
+                write_validation_mask=False,
+            )
+            seg_b = _make_canonical_segment(
+                root,
+                group_name="group_a",
+                segment_id="segB",
+                volume=np.stack([np.full((8, 8), value, dtype=np.uint8) for value in (50, 60, 70, 80)], axis=0),
+                label=np.full((8, 8), 255, dtype=np.uint8),
+                supervision_mask=np.full((8, 8), 255, dtype=np.uint8),
+            )
+            bundle = ZarrPatchDataRecipe(
+                dataset_root=str(root),
+                segments={"segA": seg_a, "segB": seg_b},
+                train_segment_ids=("segA",),
+                val_segment_ids=("segB",),
+                in_channels=4,
+                patch_size=8,
+                train_batch_size=1,
+                valid_batch_size=1,
+                shuffle=False,
+                normalization=ClipMaxDiv255Normalization(),
+            ).build(augment=_neutral_augment())
+
+            runtime = StitchRuntimeRecipe(config={"train": {"viz": {"enabled": True}}}).build(bundle)
+            train_viz_loaders, _log_only_loaders = stitch_loaders.build_stitch_runtime_loaders(
+                stitch_data=runtime.data,
+                train_loader=bundle.train_loader,
+                eval_loader=bundle.eval_loader,
+            )
+
+            self.assertEqual(len(train_viz_loaders), 1)
+            self.assertEqual(train_viz_loaders[0].dataset.split, "valid")
+            self.assertEqual(train_viz_loaders[0].dataset.mask_split_name, "train")
+            self.assertEqual(train_viz_loaders[0].dataset.mask_names_for_segment("segA"), ("supervision_mask",))
+            batch = next(iter(train_viz_loaders[0]))
+            self.assertEqual(batch.meta.segment_ids, ["segA"])
 
     def test_stitch_runtime_recipe_uses_explicit_train_and_eval_segment_id_overrides(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -616,6 +667,211 @@ class StitchRuntimeDataTests(unittest.TestCase):
 
 
 class ZarrStitchLoaderPrepTests(unittest.TestCase):
+    def test_build_stitch_inference_loaders_use_union_of_supervision_and_validation_masks_when_roi_enabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            seg_a = _make_canonical_segment(
+                root,
+                group_name="group_a",
+                segment_id="segA",
+                volume=np.stack([np.full((12, 12), value, dtype=np.uint8) for value in (10, 20, 30, 40)], axis=0),
+                label=np.full((12, 12), 255, dtype=np.uint8),
+                supervision_mask=np.pad(
+                    np.full((4, 4), 255, dtype=np.uint8),
+                    ((0, 8), (0, 8)),
+                    mode="constant",
+                    constant_values=0,
+                ),
+                validation_mask=np.pad(
+                    np.full((4, 4), 255, dtype=np.uint8),
+                    ((8, 0), (8, 0)),
+                    mode="constant",
+                    constant_values=0,
+                ),
+            )
+            bundle = ZarrPatchDataRecipe(
+                dataset_root=str(root),
+                segments={"segA": seg_a},
+                train_segment_ids=("segA",),
+                val_segment_ids=("segA",),
+                in_channels=4,
+                patch_size=4,
+                tile_size=4,
+                stride=4,
+                train_batch_size=1,
+                valid_batch_size=1,
+                shuffle=False,
+                normalization=ClipMaxDiv255Normalization(),
+            ).build(augment=_neutral_augment(size=4))
+
+            loaders = stitch_loaders.build_stitch_inference_loaders(
+                stitch_data=StitchData.from_config(
+                    {
+                        "use_roi": True,
+                        "eval": {"segment_ids": ["segA"]},
+                    }
+                ),
+                eval_loader=bundle.eval_loader,
+            )
+
+            self.assertEqual(len(loaders), 1)
+            self.assertEqual(
+                {
+                    (str(segment_id), tuple(int(value) for value in xyxy))
+                    for segment_id, xyxy in loaders[0].dataset._samples
+                },
+                {
+                    ("segA", (0, 0, 4, 4)),
+                    ("segA", (8, 8, 12, 12)),
+                },
+            )
+
+    def test_build_stitch_inference_loaders_use_full_grid_when_roi_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            seg_a = _make_canonical_segment(
+                root,
+                group_name="group_a",
+                segment_id="segA",
+                volume=np.stack([np.full((8, 8), value, dtype=np.uint8) for value in (10, 20, 30, 40)], axis=0),
+                label=np.full((8, 8), 255, dtype=np.uint8),
+                supervision_mask=np.pad(
+                    np.full((4, 4), 255, dtype=np.uint8),
+                    ((0, 4), (0, 4)),
+                    mode="constant",
+                    constant_values=0,
+                ),
+            )
+            bundle = ZarrPatchDataRecipe(
+                dataset_root=str(root),
+                segments={"segA": seg_a},
+                train_segment_ids=("segA",),
+                val_segment_ids=("segA",),
+                in_channels=4,
+                patch_size=4,
+                tile_size=4,
+                stride=4,
+                train_batch_size=1,
+                valid_batch_size=1,
+                shuffle=False,
+                normalization=ClipMaxDiv255Normalization(),
+            ).build(augment=_neutral_augment(size=4))
+
+            loaders = stitch_loaders.build_stitch_inference_loaders(
+                stitch_data=StitchData.from_config(
+                    {
+                        "use_roi": False,
+                        "eval": {"segment_ids": ["segA"]},
+                    }
+                ),
+                eval_loader=bundle.eval_loader,
+            )
+
+            self.assertEqual(len(loaders), 1)
+            self.assertEqual(len(loaders[0].dataset), 4)
+            batch = next(iter(loaders[0]))
+            self.assertIsNone(batch.y)
+            self.assertIsNone(batch.meta.valid_mask)
+            self.assertEqual(batch.meta.segment_ids, ["segA"])
+            self.assertEqual(batch.meta.patch_xyxy[0].tolist(), [0, 0, 4, 4])
+
+    def test_build_stitch_inference_loaders_skip_empty_volume_patches_when_roi_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            volume = np.zeros((4, 8, 8), dtype=np.uint8)
+            volume[:, 0:4, 0:4] = 64
+            seg_a = _make_canonical_segment(
+                root,
+                group_name="group_a",
+                segment_id="segA",
+                volume=volume,
+                label=np.zeros((8, 8), dtype=np.uint8),
+                supervision_mask=np.full((8, 8), 255, dtype=np.uint8),
+            )
+            bundle = ZarrPatchDataRecipe(
+                dataset_root=str(root),
+                segments={"segA": seg_a},
+                train_segment_ids=("segA",),
+                val_segment_ids=("segA",),
+                in_channels=4,
+                patch_size=4,
+                tile_size=4,
+                stride=4,
+                train_batch_size=1,
+                valid_batch_size=1,
+                shuffle=False,
+                normalization=ClipMaxDiv255Normalization(),
+            ).build(augment=_neutral_augment(size=4))
+
+            loaders = stitch_loaders.build_stitch_inference_loaders(
+                stitch_data=StitchData.from_config(
+                    {
+                        "use_roi": False,
+                        "eval": {"segment_ids": ["segA"]},
+                    }
+                ),
+                eval_loader=bundle.eval_loader,
+            )
+
+            self.assertEqual(len(loaders), 1)
+            non_empty_batches = [batch for batch in loaders[0] if batch is not None]
+            self.assertEqual(len(non_empty_batches), 1)
+            self.assertEqual(non_empty_batches[0].meta.patch_xyxy[0].tolist(), [0, 0, 4, 4])
+
+    def test_build_zarr_stitch_segment_specs_use_union_of_supervision_and_validation_masks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            seg_a = _make_canonical_segment(
+                root,
+                group_name="group_a",
+                segment_id="segA",
+                volume=np.stack([np.full((12, 12), value, dtype=np.uint8) for value in (10, 20, 30, 40)], axis=0),
+                label=np.full((12, 12), 255, dtype=np.uint8),
+                supervision_mask=np.pad(
+                    np.full((4, 4), 255, dtype=np.uint8),
+                    ((0, 8), (0, 8)),
+                    mode="constant",
+                    constant_values=0,
+                ),
+                validation_mask=np.pad(
+                    np.full((4, 4), 255, dtype=np.uint8),
+                    ((8, 0), (8, 0)),
+                    mode="constant",
+                    constant_values=0,
+                ),
+            )
+            bundle = ZarrPatchDataRecipe(
+                dataset_root=str(root),
+                segments={"segA": seg_a},
+                train_segment_ids=("segA",),
+                val_segment_ids=("segA",),
+                in_channels=4,
+                patch_size=4,
+                tile_size=4,
+                stride=4,
+                train_batch_size=1,
+                valid_batch_size=1,
+                shuffle=False,
+                normalization=ClipMaxDiv255Normalization(),
+            ).build(augment=_neutral_augment(size=4))
+
+            segment_specs = build_zarr_stitch_segment_specs(
+                bundle.eval_loader.dataset,
+                segment_ids=("segA",),
+                downsample=1,
+                mode="eval",
+                use_roi=True,
+            )
+
+            self.assertEqual(len(segment_specs), 1)
+            self.assertEqual(
+                segment_specs[0].bbox,
+                (
+                    (0, 4, 0, 4),
+                    (8, 12, 8, 12),
+                ),
+            )
+
     def test_build_zarr_segment_eval_loaders_reuses_existing_dataset_samples(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

@@ -15,3 +15,4 @@ class Experiment:
     augment: Any
     trainer: Any = None
     evaluator: Any = None
+    seed: int | None = None

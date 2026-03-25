@@ -6,6 +6,7 @@ import numpy as np
 
 from ink.core.types import DataBundle
 from ink.recipes.components import component_bboxes
+from ink.recipes.data.layout import resolve_layout_stitch_roi_mask_names
 from ink.recipes.data.zarr_data import ZarrPatchDataset
 from ink.recipes.data.zarr_io import (
     read_optional_supervision_mask_for_shape,
@@ -121,7 +122,7 @@ def _stitch_segment_bbox_rows(
     fallback_to_full_segment: bool,
 ) -> tuple[tuple[int, int, int, int], ...] | None:
     context = dataset.data_context()
-    mask_names = context.mask_names_for_segment(segment_id)
+    mask_names = _stitch_roi_mask_names(dataset, segment_id=segment_id)
     cache_key = (str(segment_id), context.label_suffix, context.mask_suffix, mask_names)
     cached = context.label_mask_store_cache.get(cache_key)
     if int(downsample) == 1 and cached is not None and getattr(cached, "bbox_rows", None):
@@ -167,7 +168,15 @@ def _optional_supervision_mask(dataset: ZarrPatchDataset, *, segment_id: str, im
         str(segment_id),
         image_shape_hw,
         mask_suffix=dataset.mask_suffix,
-        mask_names=dataset.mask_names_for_segment(segment_id),
+        mask_names=_stitch_roi_mask_names(dataset, segment_id=segment_id),
+    )
+
+
+def _stitch_roi_mask_names(dataset: ZarrPatchDataset, *, segment_id: str) -> tuple[str, ...]:
+    return resolve_layout_stitch_roi_mask_names(
+        layout=dataset.layout,
+        segment_id=str(segment_id),
+        mask_suffix=dataset.mask_suffix,
     )
 
 

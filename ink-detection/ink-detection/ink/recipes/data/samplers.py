@@ -10,9 +10,11 @@ from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler
 
 @dataclass(frozen=True)
 class ShuffleSampler:
-    seed: int = 0
+    seed: int | None = None
 
     def __post_init__(self) -> None:
+        if self.seed is None:
+            return
         object.__setattr__(self, "seed", int(self.seed))
 
     def build_loader(
@@ -27,7 +29,7 @@ class ShuffleSampler:
         multiprocessing_context=None,
     ) -> DataLoader:
         generator = None
-        if len(dataset) > 0 and bool(shuffle):
+        if len(dataset) > 0 and bool(shuffle) and self.seed is not None:
             generator = torch.Generator()
             generator.manual_seed(int(self.seed))
         persistent_workers = int(num_workers) > 0
@@ -49,9 +51,11 @@ class ShuffleSampler:
 
 @dataclass(frozen=True)
 class GroupBalancedSampler:
-    seed: int = 0
+    seed: int | None = None
 
     def __post_init__(self) -> None:
+        if self.seed is None:
+            return
         object.__setattr__(self, "seed", int(self.seed))
 
     def build_loader(
@@ -87,8 +91,10 @@ class GroupBalancedSampler:
         group_counts = torch.bincount(group_array, minlength=n_groups).float()
         group_weights = len(dataset) / group_counts.clamp_min(1)
         sample_weights = group_weights[group_array]
-        generator = torch.Generator()
-        generator.manual_seed(int(self.seed))
+        generator = None
+        if self.seed is not None:
+            generator = torch.Generator()
+            generator.manual_seed(int(self.seed))
         weighted_sampler = WeightedRandomSampler(
             sample_weights,
             len(dataset),
@@ -115,10 +121,12 @@ class GroupBalancedSampler:
 @dataclass(frozen=True)
 class GroupStratifiedSampler:
     batch_size: int
-    seed: int = 0
+    seed: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "batch_size", int(self.batch_size))
+        if self.seed is None:
+            return
         object.__setattr__(self, "seed", int(self.seed))
 
     def build_loader(
@@ -150,13 +158,13 @@ class GroupStratifiedSampler:
             return DataLoader(**loader_kwargs)
         group_indices = [int(group_idx) for group_idx in dataset.sample_groups]
         batch_size = int(self.batch_size)
-        seed = int(self.seed)
+        seed = None if self.seed is None else int(self.seed)
 
         class _BatchSampler(Sampler[list[int]]):
             def __init__(self):
                 self.batch_size = batch_size
                 self.drop_last = True
-                self._rng = random.Random(seed)
+                self._rng = random if seed is None else random.Random(seed)
 
                 indices_by_group: dict[int, list[int]] = {}
                 for sample_idx, group_idx in enumerate(group_indices):

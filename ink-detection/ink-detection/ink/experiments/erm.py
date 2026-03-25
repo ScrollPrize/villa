@@ -10,6 +10,8 @@ from ink.recipes.metrics import BalancedAccuracy, Dice
 from ink.recipes.models import ResNet3D
 from ink.recipes.objectives import ERMBatch
 from ink.recipes.runtime import TrainRuntime
+from ink.recipes.runtime.optimizers import AdamWOptimizer
+from ink.recipes.runtime.schedulers import OneCycleScheduler
 from ink.recipes.stitch import (
     StitchInferenceRecipe,
     StitchRuntimeRecipe,
@@ -59,6 +61,7 @@ _STITCH_RUNTIME = StitchRuntimeRecipe(
 
 EXPERIMENT = Experiment(
     name="erm",
+    seed=130697,
     data=ZarrPatchDataRecipe(
         dataset_root="/pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/villa/ink-detection/ink-0309",
         segments=_SEGMENTS,
@@ -70,8 +73,8 @@ EXPERIMENT = Experiment(
         stride=128,
         label_suffix="",
         mask_suffix="",
-        train_batch_size=1,
-        valid_batch_size=1,
+        train_batch_size=24,
+        valid_batch_size=32,
         num_workers=12,
         shuffle=True,
         patch_index_cache_dir=(
@@ -83,6 +86,8 @@ EXPERIMENT = Experiment(
         normalization=ClipMaxDiv255Normalization(),
     ),
     model=ResNet3D(
+        depth=50,
+        norm="batch",
         pretrained=True,
         backbone_pretrained_path=(
             "/pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/villa/ink-detection/r3d50_KM_200ep.pth"
@@ -91,6 +96,18 @@ EXPERIMENT = Experiment(
     loss=DiceBCEBatch(),
     objective=ERMBatch(),
     runtime=TrainRuntime(
+        use_amp=True,
+        grad_clip_norm=100.0,
+        optimizer=AdamWOptimizer(
+            lr=2.20e-04,
+            weight_decay=1.79e-07,
+            exclude_weight_decay_bias_norm=True,
+        ),
+        scheduler=OneCycleScheduler(
+            pct_start=0.15,
+            div_factor=25.0,
+            final_div_factor=8.8,
+        ),
         wandb=WandbLogger(
             enabled=True,
             project="ink-2um-experiments",
@@ -104,6 +121,7 @@ EXPERIMENT = Experiment(
     augment=TrainAugment(),
     trainer=PatchTrainer(
         stitch_runtime=_STITCH_RUNTIME,
+        epochs=30,
         log_every_n_steps=100,
         save_every_n_epochs=1,
     ),

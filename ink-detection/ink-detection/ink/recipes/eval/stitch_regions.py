@@ -9,7 +9,8 @@ import numpy as np
 import torch
 
 from ink.core.types import ModelOutputBatch
-from ink.recipes.data.masks import SUPERVISION_MASK_NAME, resolve_segment_mask_names
+from ink.recipes.data.layout import resolve_layout_mask_names_for_segment
+from ink.recipes.data.masks import SUPERVISION_MASK_NAME
 from ink.recipes.data.zarr_io import (
     read_label_and_supervision_mask_region,
     read_label_region,
@@ -146,11 +147,13 @@ class StitchEvalRegionReader:
         self.cache_root = root
 
     def _mask_names_for_segment(self, segment_id: str) -> tuple[str, ...]:
-        return resolve_segment_mask_names(
+        return resolve_layout_mask_names_for_segment(
+            layout=self.layout,
             split_name="valid",
             segment_id=segment_id,
             train_segment_ids=self.train_segment_ids,
             default_mask_name=self.mask_name,
+            mask_suffix=self.mask_suffix,
         )
 
     def _segment_portable_source_fingerprint(self, segment_id: str) -> str:

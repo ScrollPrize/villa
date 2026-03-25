@@ -17,7 +17,7 @@ from ink.recipes.data.masks import SUPERVISION_MASK_NAME, VALIDATION_MASK_NAME
 from ink.recipes.data.zarr_data import ZarrPatchDataRecipe
 from ink.recipes.data.zarr_io import (
     read_label_region,
-    read_supervision_mask_for_shape,
+    read_optional_supervision_mask_for_shape,
     resolve_segment_volume,
 )
 
@@ -68,6 +68,7 @@ def _source_segment_fingerprint(
     layout: NestedZarrLayout,
     recipe: ZarrPatchDataRecipe,
     segment_id: str,
+    mask_names,
 ) -> str:
     payload = {
         "schema_version": int(_PATCH_BUNDLE_SCHEMA_VERSION),
@@ -77,28 +78,47 @@ def _source_segment_fingerprint(
         "in_channels": int(recipe.in_channels),
         "label_suffix": str(recipe.label_suffix),
         "mask_suffix": str(recipe.mask_suffix),
+        "mask_names": [str(mask_name) for mask_name in tuple(mask_names or ())],
         "source_metadata": layout.segment_source_metadata_fingerprint(
             str(segment_id),
             label_suffix=str(recipe.label_suffix),
             mask_suffix=str(recipe.mask_suffix),
-            mask_names=(SUPERVISION_MASK_NAME, VALIDATION_MASK_NAME),
+            mask_names=mask_names,
         ),
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def _segment_meta_by_id(recipe: ZarrPatchDataRecipe, *, layout: NestedZarrLayout, segment_ids) -> dict[str, dict[str, str]]:
-    return {
-        str(segment_id): {
+def _segment_meta_by_id(
+    recipe: ZarrPatchDataRecipe,
+    *,
+    layout: NestedZarrLayout,
+    segment_ids,
+) -> dict[str, dict[str, Any]]:
+    segment_meta: dict[str, dict[str, Any]] = {}
+    for segment_id in segment_ids:
+        segment_id = str(segment_id)
+        available_mask_names = layout.resolve_existing_artifact_names(
+            segment_id,
+            artifact_names=(SUPERVISION_MASK_NAME, VALIDATION_MASK_NAME),
+            suffix=str(recipe.mask_suffix),
+        )
+        if not available_mask_names:
+            raise FileNotFoundError(
+                f"{segment_id}: expected at least one of "
+                f"{SUPERVISION_MASK_NAME!r} or {VALIDATION_MASK_NAME!r}"
+            )
+        segment_meta[segment_id] = {
             "group_name": str(layout.resolve_group_name(segment_id)),
+            "available_mask_names": available_mask_names,
             "source_fingerprint": _source_segment_fingerprint(
                 layout=layout,
                 recipe=recipe,
-                segment_id=str(segment_id),
+                segment_id=segment_id,
+                mask_names=available_mask_names,
             ),
         }
-        for segment_id in segment_ids
-    }
+    return segment_meta
 
 
 def _chunk_hw(shape_hw: tuple[int, int]) -> tuple[int, int]:
@@ -153,12 +173,19 @@ def _load_segment_manifest(path: Path) -> dict[str, Any]:
     return dict(loaded) if isinstance(loaded, dict) else {}
 
 
-def _expected_segment_files(segment_dir: Path, *, segment_id: str) -> tuple[Path, ...]:
+def _expected_segment_files(
+    segment_dir: Path,
+    *,
+    segment_id: str,
+    available_mask_names,
+) -> tuple[Path, ...]:
     return (
         segment_dir / f"{segment_id}.zarr",
         segment_dir / f"{segment_id}_inklabels.zarr",
-        segment_dir / f"{segment_id}_supervision_mask.zarr",
-        segment_dir / f"{segment_id}_validation_mask.zarr",
+        *(
+            segment_dir / f"{segment_id}_{mask_name}.zarr"
+            for mask_name in tuple(available_mask_names or ())
+        ),
         segment_dir / "manifest.yaml",
     )
 
@@ -197,14 +224,17 @@ class PatchBundleWriter:
         reused = 0
         written = 0
         for segment_id in segment_ids:
-            group_name = str(segment_meta[str(segment_id)]["group_name"])
-            source_fingerprint = str(segment_meta[str(segment_id)]["source_fingerprint"])
+            current_segment_meta = segment_meta[str(segment_id)]
+            group_name = str(current_segment_meta["group_name"])
+            available_mask_names = tuple(str(name) for name in tuple(current_segment_meta["available_mask_names"]))
+            source_fingerprint = str(current_segment_meta["source_fingerprint"])
             segment_dir = _segment_dir(out_root, group_name=group_name, segment_id=segment_id)
             desired_dirs[str(segment_id)] = segment_dir
             if self._segment_matches_source(
                 out_root=out_root,
                 segment_id=str(segment_id),
                 group_name=group_name,
+                available_mask_names=available_mask_names,
                 source_fingerprint=source_fingerprint,
             ):
                 reused += 1
@@ -215,6 +245,7 @@ class PatchBundleWriter:
                 layout=layout,
                 segment_id=str(segment_id),
                 group_name=group_name,
+                available_mask_names=available_mask_names,
                 source_fingerprint=source_fingerprint,
                 volume_cache=volume_cache,
             )
@@ -245,10 +276,18 @@ class PatchBundleWriter:
         out_root: Path,
         segment_id: str,
         group_name: str,
+        available_mask_names,
         source_fingerprint: str,
     ) -> bool:
         segment_dir = _segment_dir(out_root, group_name=group_name, segment_id=segment_id)
-        if not all(path.exists() for path in _expected_segment_files(segment_dir, segment_id=segment_id)):
+        if not all(
+            path.exists()
+            for path in _expected_segment_files(
+                segment_dir,
+                segment_id=segment_id,
+                available_mask_names=available_mask_names,
+            )
+        ):
             return False
         manifest = _load_segment_manifest(_segment_manifest_path(out_root, group_name=group_name, segment_id=segment_id))
         return (
@@ -256,6 +295,7 @@ class PatchBundleWriter:
             and str(manifest.get("recipe_family")) == "masked_zarr_segment"
             and str(manifest.get("segment_id")) == str(segment_id)
             and str(manifest.get("group_name")) == str(group_name)
+            and tuple(str(name) for name in tuple(manifest.get("available_mask_names") or ())) == tuple(available_mask_names)
             and str(manifest.get("source_fingerprint")) == str(source_fingerprint)
         )
 
@@ -266,6 +306,7 @@ class PatchBundleWriter:
         layout: NestedZarrLayout,
         segment_id: str,
         group_name: str,
+        available_mask_names,
         source_fingerprint: str,
         volume_cache,
     ) -> None:
@@ -294,27 +335,34 @@ class PatchBundleWriter:
             ),
             dtype=np.uint8,
         )
-        supervision_mask = np.asarray(
-            read_supervision_mask_for_shape(
-                layout,
-                str(segment_id),
-                image_shape_hw,
-                mask_suffix=str(recipe.mask_suffix),
-                mask_names=(SUPERVISION_MASK_NAME,),
-            ),
-            dtype=np.uint8,
+        supervision_mask = read_optional_supervision_mask_for_shape(
+            layout,
+            str(segment_id),
+            image_shape_hw,
+            mask_suffix=str(recipe.mask_suffix),
+            mask_names=(SUPERVISION_MASK_NAME,),
         )
-        validation_mask = np.asarray(
-            read_supervision_mask_for_shape(
-                layout,
-                str(segment_id),
-                image_shape_hw,
-                mask_suffix=str(recipe.mask_suffix),
-                mask_names=(VALIDATION_MASK_NAME,),
-            ),
-            dtype=np.uint8,
+        validation_mask = read_optional_supervision_mask_for_shape(
+            layout,
+            str(segment_id),
+            image_shape_hw,
+            mask_suffix=str(recipe.mask_suffix),
+            mask_names=(VALIDATION_MASK_NAME,),
         )
-        bundle_region = np.maximum(supervision_mask, validation_mask)
+        if supervision_mask is None and validation_mask is None:
+            raise FileNotFoundError(
+                f"{segment_id}: expected at least one of "
+                f"{SUPERVISION_MASK_NAME!r} or {VALIDATION_MASK_NAME!r}"
+            )
+        if supervision_mask is not None:
+            supervision_mask = np.asarray(supervision_mask, dtype=np.uint8)
+        if validation_mask is not None:
+            validation_mask = np.asarray(validation_mask, dtype=np.uint8)
+        bundle_region = np.zeros(image_shape_hw, dtype=np.uint8)
+        if supervision_mask is not None:
+            bundle_region = np.maximum(bundle_region, supervision_mask)
+        if validation_mask is not None:
+            bundle_region = np.maximum(bundle_region, validation_mask)
         chunk_h, chunk_w = _chunk_hw(image_shape_hw)
 
         volume_arr = _create_zarr_array(
@@ -329,18 +377,22 @@ class PatchBundleWriter:
             chunks=(int(chunk_h), int(chunk_w)),
             dtype=np.uint8,
         )
-        supervision_arr = _create_zarr_array(
-            segment_dir / f"{segment_id}_supervision_mask.zarr",
-            shape=(int(image_shape_hw[0]), int(image_shape_hw[1])),
-            chunks=(int(chunk_h), int(chunk_w)),
-            dtype=np.uint8,
-        )
-        validation_arr = _create_zarr_array(
-            segment_dir / f"{segment_id}_validation_mask.zarr",
-            shape=(int(image_shape_hw[0]), int(image_shape_hw[1])),
-            chunks=(int(chunk_h), int(chunk_w)),
-            dtype=np.uint8,
-        )
+        supervision_arr = None
+        if supervision_mask is not None:
+            supervision_arr = _create_zarr_array(
+                segment_dir / f"{segment_id}_supervision_mask.zarr",
+                shape=(int(image_shape_hw[0]), int(image_shape_hw[1])),
+                chunks=(int(chunk_h), int(chunk_w)),
+                dtype=np.uint8,
+            )
+        validation_arr = None
+        if validation_mask is not None:
+            validation_arr = _create_zarr_array(
+                segment_dir / f"{segment_id}_validation_mask.zarr",
+                shape=(int(image_shape_hw[0]), int(image_shape_hw[1])),
+                chunks=(int(chunk_h), int(chunk_w)),
+                dtype=np.uint8,
+            )
 
         for y0, y1, x0, x1 in _iter_chunk_windows(image_shape_hw, chunk_hw=(chunk_h, chunk_w), bbox=_mask_bbox(bundle_region)):
             region_mask = np.asarray(bundle_region[y0:y1, x0:x1] > 0, dtype=np.uint8)
@@ -350,8 +402,10 @@ class PatchBundleWriter:
             image_patch *= region_mask[..., None]
             volume_arr[:, y0:y1, x0:x1] = np.transpose(image_patch, (2, 0, 1))
             label_arr[y0:y1, x0:x1] = np.asarray(label[y0:y1, x0:x1], dtype=np.uint8) * region_mask
-            supervision_arr[y0:y1, x0:x1] = np.asarray(supervision_mask[y0:y1, x0:x1], dtype=np.uint8)
-            validation_arr[y0:y1, x0:x1] = np.asarray(validation_mask[y0:y1, x0:x1], dtype=np.uint8)
+            if supervision_arr is not None and supervision_mask is not None:
+                supervision_arr[y0:y1, x0:x1] = np.asarray(supervision_mask[y0:y1, x0:x1], dtype=np.uint8)
+            if validation_arr is not None and validation_mask is not None:
+                validation_arr[y0:y1, x0:x1] = np.asarray(validation_mask[y0:y1, x0:x1], dtype=np.uint8)
 
         _write_manifest(
             segment_dir / "manifest.yaml",
@@ -360,6 +414,7 @@ class PatchBundleWriter:
                 "recipe_family": "masked_zarr_segment",
                 "segment_id": str(segment_id),
                 "group_name": str(group_name),
+                "available_mask_names": [str(mask_name) for mask_name in tuple(available_mask_names or ())],
                 "source_dataset_root": str(recipe.dataset_root),
                 "source_fingerprint": str(source_fingerprint),
                 "source_segment_config": _source_segment_config(recipe, segment_id),

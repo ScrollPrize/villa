@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import random
 import tempfile
 import unittest
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+
+import numpy as np
+import torch
 
 from ink.core import (
     BatchMeta,
@@ -15,9 +19,11 @@ from ink.core import (
     RunFS,
     build_run_dir,
     build_run_id,
+    set_global_seed,
     slugify_name,
     to_plain,
 )
+from ink.recipes.data.samplers import ShuffleSampler
 
 
 def _load_yamlish(path: Path):
@@ -73,6 +79,51 @@ class CoreTypesTests(unittest.TestCase):
 
         self.assertEqual(plain["experiment"]["model"]["kind"], "model")
         self.assertEqual(plain["path"], "runs/demo")
+
+    def test_set_global_seed_reseeds_python_numpy_and_torch(self):
+        set_global_seed(1234)
+        first = (
+            random.random(),
+            float(np.random.rand()),
+            float(torch.rand(1).item()),
+        )
+
+        set_global_seed(1234)
+        second = (
+            random.random(),
+            float(np.random.rand()),
+            float(torch.rand(1).item()),
+        )
+
+        self.assertEqual(first, second)
+
+    def test_set_global_seed_drives_default_shuffle_sampler(self):
+        dataset = list(range(8))
+        sampler = ShuffleSampler()
+
+        set_global_seed(77)
+        first_loader = sampler.build_loader(
+            dataset,
+            batch_size=8,
+            num_workers=0,
+            pin_memory=False,
+            collate_fn=lambda batch: list(batch),
+            shuffle=True,
+        )
+        first_order = next(iter(first_loader))
+
+        set_global_seed(77)
+        second_loader = sampler.build_loader(
+            dataset,
+            batch_size=8,
+            num_workers=0,
+            pin_memory=False,
+            collate_fn=lambda batch: list(batch),
+            shuffle=True,
+        )
+        second_order = next(iter(second_loader))
+
+        self.assertEqual(first_order, second_order)
 
 
 class RunFSTests(unittest.TestCase):

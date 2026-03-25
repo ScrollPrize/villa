@@ -27,6 +27,7 @@ def resolve_segment_mask_names(
     segment_id: str,
     train_segment_ids=(),
     default_mask_name: str = SUPERVISION_MASK_NAME,
+    available_mask_names=None,
 ) -> tuple[str, ...]:
     default_mask_names = normalize_mask_names(mask_name=default_mask_name)
     split = str(split_name).strip().lower()
@@ -41,7 +42,35 @@ def resolve_segment_mask_names(
         return default_mask_names
     if str(segment_id) in train_ids:
         return (VALIDATION_MASK_NAME,)
-    return (SUPERVISION_MASK_NAME, VALIDATION_MASK_NAME)
+    preferred_mask_names = (SUPERVISION_MASK_NAME, VALIDATION_MASK_NAME)
+    normalized_available_mask_names = tuple(
+        str(mask_name).strip()
+        for mask_name in tuple(available_mask_names or ())
+        if str(mask_name).strip()
+    )
+    if not normalized_available_mask_names:
+        return preferred_mask_names
+    available_mask_name_set = frozenset(normalized_available_mask_names)
+    selected_mask_names = tuple(
+        mask_name for mask_name in preferred_mask_names if mask_name in available_mask_name_set
+    )
+    return selected_mask_names or preferred_mask_names
+
+
+def resolve_stitch_roi_mask_names(*, available_mask_names=None) -> tuple[str, ...]:
+    preferred_mask_names = (SUPERVISION_MASK_NAME, VALIDATION_MASK_NAME)
+    normalized_available_mask_names = tuple(
+        str(mask_name).strip()
+        for mask_name in tuple(available_mask_names or ())
+        if str(mask_name).strip()
+    )
+    if not normalized_available_mask_names:
+        return preferred_mask_names
+    available_mask_name_set = frozenset(normalized_available_mask_names)
+    selected_mask_names = tuple(
+        mask_name for mask_name in preferred_mask_names if mask_name in available_mask_name_set
+    )
+    return selected_mask_names or preferred_mask_names
 
 
 __all__ = [
@@ -50,4 +79,5 @@ __all__ = [
     "default_mask_name_for_split",
     "normalize_mask_names",
     "resolve_segment_mask_names",
+    "resolve_stitch_roi_mask_names",
 ]

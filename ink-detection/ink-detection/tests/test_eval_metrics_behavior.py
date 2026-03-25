@@ -1795,7 +1795,7 @@ class ValidationEvaluatorTests(unittest.TestCase):
                     model=_FixedLogitModel(logits),
                     runtime=SimpleNamespace(init_ckpt_path=None, resume_ckpt_path=None, wandb=None),
                 ),
-                inference_loader=eval_loader,
+                inference_loaders=(eval_loader,),
                 stitch_inference=stitch_inference,
             ).run()
 
@@ -1805,6 +1805,56 @@ class ValidationEvaluatorTests(unittest.TestCase):
         self.assertTrue(str((run.segment_prob_paths or {})["segA"]).endswith("segA__prob.zarr"))
         self.assertEqual(set((run.segment_preview_paths or {}).keys()), {"segA"})
         self.assertTrue(str((run.segment_preview_paths or {})["segA"]).endswith("segA__prob.png"))
+
+    def test_stitch_inference_run_skips_none_batches_from_infer_collate(self):
+        logits = torch.full((1, 1, 2, 2), 10.0, dtype=torch.float32)
+        batch = Batch(
+            x=torch.zeros_like(logits),
+            y=None,
+            meta=BatchMeta(
+                segment_ids=["segA"],
+                patch_xyxy=torch.tensor([[0, 0, 2, 2]], dtype=torch.long),
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            segment_dir = root / "group_a" / "segA"
+            _write_zarr_array(segment_dir / "segA.zarr", np.zeros((2, 2, 2), dtype=np.uint8))
+            _write_zarr_array(segment_dir / "segA_inklabels.zarr", np.zeros((2, 2), dtype=np.uint8))
+            _write_zarr_array(segment_dir / "segA_supervision_mask.zarr", np.full((2, 2), 255, dtype=np.uint8))
+
+            layout = NestedZarrLayout(root)
+            eval_loader = _StaticLoader([None, batch], dataset=SimpleNamespace(layout=layout))
+            stitch = StitchRuntime._from_config(
+                {
+                    "downsample": 1,
+                    "eval": {
+                        "segments": [{"segment_id": "segA", "shape": (2, 2)}],
+                    },
+                }
+            )
+            layout_info = stitch.eval_segment_layout()
+            stitch_inference = StitchInference(
+                store=ZarrStitchStore(root_dir=root / ".tmp" / "stitch_eval").build(
+                    segment_shapes=layout_info.segment_shapes,
+                    downsample=layout_info.downsample,
+                    segment_rois=layout_info.segment_rois,
+                ),
+                segment_shapes=layout_info.segment_shapes,
+                stitch_runtime=stitch,
+            )
+
+            run = StitchInferenceRun(
+                experiment=SimpleNamespace(
+                    model=_FixedLogitModel(logits),
+                    runtime=SimpleNamespace(init_ckpt_path=None, resume_ckpt_path=None, wandb=None),
+                ),
+                inference_loaders=(eval_loader,),
+                stitch_inference=stitch_inference,
+            ).run()
+
+        self.assertEqual(run.batches, 1)
 
 
 if __name__ == "__main__":

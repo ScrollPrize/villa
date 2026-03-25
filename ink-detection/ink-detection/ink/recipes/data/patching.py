@@ -16,22 +16,21 @@ def _label_tile_is_empty(label_tile) -> bool:
     return bool(np.all(tile.astype(np.float32, copy=False) < 0.01))
 
 
-def _candidate_patch_starts(limit: int, *, size: int, tile_size: int, stride: int) -> np.ndarray:
+def candidate_patch_starts(limit: int, *, size: int, tile_size: int, stride: int) -> np.ndarray:
     max_tile_start = int(limit) - int(tile_size)
     max_patch_start = int(limit) - int(size)
     if max_tile_start < 0 or max_patch_start < 0:
         return np.zeros((0,), dtype=np.int32)
 
-    starts = set()
-    for tile_start in range(0, max_tile_start + 1, int(stride)):
-        for offset in range(0, int(tile_size), int(size)):
-            patch_start = int(tile_start + offset)
-            if patch_start > max_patch_start:
-                continue
-            starts.add(patch_start)
-    if not starts:
+    tile_starts = np.arange(0, max_tile_start + 1, int(stride), dtype=np.int32)
+    offsets = np.arange(0, int(tile_size), int(size), dtype=np.int32)
+    if int(tile_starts.size) == 0 or int(offsets.size) == 0:
         return np.zeros((0,), dtype=np.int32)
-    return np.asarray(sorted(starts), dtype=np.int32)
+    patch_starts = (tile_starts[:, None] + offsets[None, :]).reshape(-1)
+    patch_starts = patch_starts[patch_starts <= max_patch_start]
+    if int(patch_starts.size) == 0:
+        return np.zeros((0,), dtype=np.int32)
+    return np.unique(patch_starts).astype(np.int32, copy=False)
 
 
 def _extract_patch_coordinates_full_grid(
@@ -131,8 +130,8 @@ def build_patch_index(
             np.full((int(xyxys.shape[0]),), -1, dtype=np.int32),
         )
 
-    x_starts = _candidate_patch_starts(valid_mask.shape[1], size=size, tile_size=tile_size, stride=stride)
-    y_starts = _candidate_patch_starts(valid_mask.shape[0], size=size, tile_size=tile_size, stride=stride)
+    x_starts = candidate_patch_starts(valid_mask.shape[1], size=size, tile_size=tile_size, stride=stride)
+    y_starts = candidate_patch_starts(valid_mask.shape[0], size=size, tile_size=tile_size, stride=stride)
     if int(x_starts.size) == 0 or int(y_starts.size) == 0 or not bool(valid_mask.any()):
         return (
             np.zeros((0, 4), dtype=np.int32),
@@ -192,4 +191,7 @@ def build_patch_index(
         np.asarray(bbox_indices, dtype=np.int32),
     )
 
-__all__ = ["build_patch_index"]
+__all__ = [
+    "build_patch_index",
+    "candidate_patch_starts",
+]

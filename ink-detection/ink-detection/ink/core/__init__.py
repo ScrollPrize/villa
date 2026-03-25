@@ -5,6 +5,7 @@ from ink.core.experiment import Experiment
 from ink.core.run import run_experiment
 from ink.core.run_fs import RunFS, to_plain
 from ink.core.run_layout import build_run_dir, build_run_id, slugify_name
+from ink.core.seed import set_global_seed
 from ink.core.types import Batch, BatchMeta, DataBundle, EvalReport, ModelOutputBatch
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "build_run_dir",
     "build_run_id",
     "run_experiment",
+    "set_global_seed",
     "slugify_name",
     "to_plain",
 ]

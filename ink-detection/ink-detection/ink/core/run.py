@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from ink.core.assemble import assemble_experiment, build_experiment_data
 from ink.core.experiment import Experiment
+from ink.core.seed import set_global_seed
+
 
 def run_experiment(experiment: Experiment, *, logger=None, **trainer_kwargs):
     """Build the bound experiment graph and delegate execution to the trainer."""
+    set_global_seed(experiment.seed)
     bundle = build_experiment_data(
         experiment.data,
         runtime=experiment.runtime,

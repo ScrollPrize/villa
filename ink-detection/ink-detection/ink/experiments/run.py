@@ -34,9 +34,11 @@ def main(argv=None):
     experiment = getattr(module, "EXPERIMENT", None)
     if experiment is None:
         raise SystemExit(f"experiment module {experiment_name!r} must define EXPERIMENT")
+    logger = _configure_progress_logger()
     run_dir = build_run_dir(Path("runs"), experiment.name)
+    logger(f"[run] run_dir={run_dir}")
     run_fs = RunFS(run_dir, experiment)
-    return run_experiment(experiment, logger=_configure_progress_logger(), run_fs=run_fs)
+    return run_experiment(experiment, logger=logger, run_fs=run_fs)
 
 
 if __name__ == "__main__":

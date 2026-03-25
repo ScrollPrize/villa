@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import replace
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +13,9 @@ import torch
 import zarr
 
 from ink.core import Batch, BatchMeta, DataBundle, Experiment, assemble_experiment, build_experiment_data, run_experiment
+from ink.recipes.augment import TrainAugment
 from ink.recipes.data.layout import NestedZarrLayout
+from ink.recipes.data.zarr_data import ZarrPatchDataRecipe
 from ink.recipes.eval import PatchEval, StitchEval, ValidationEvaluator
 from ink.recipes.metrics import Dice
 from ink.recipes.objectives import ERMGroupTopK, ERMObjective, GroupDROComputer, GroupDROObjective
@@ -48,6 +51,22 @@ def _write_zarr_array(path: Path, array: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     store = zarr.open(str(path), mode="w", shape=tuple(array.shape), dtype=array.dtype)
     store[:] = array
+
+
+def _neutral_augment(size: int = 8) -> TrainAugment:
+    return TrainAugment(
+        size=size,
+        horizontal_flip_p=0.0,
+        vertical_flip_p=0.0,
+        brightness_contrast_p=0.0,
+        random_gamma_p=0.0,
+        multiplicative_noise_p=0.0,
+        shift_scale_rotate_p=0.0,
+        blur_p=0.0,
+        coarse_dropout_p=0.0,
+        fourth_augment_p=0.0,
+        invert_p=0.0,
+    )
 
 
 class ExperimentRuntimeBindingTests(unittest.TestCase):
@@ -368,7 +387,7 @@ class ExperimentRuntimeBindingTests(unittest.TestCase):
         self.assertIs(recipe.calls[0]["logger"], logger)
         self.assertEqual(recipe.calls[0]["patch_loss"], "loss")
         self.assertIsInstance(bound.trainer.stitch_inference.stitch_runtime, StitchRuntime)
-        self.assertEqual(bound.trainer.inference_loader, bundle.eval_loader)
+        self.assertEqual(bound.trainer.inference_loaders, (bundle.eval_loader,))
 
     def test_patch_eval_requires_metrics(self):
         with self.assertRaisesRegex(ValueError, "at least one metric"):
@@ -525,6 +544,48 @@ class ExperimentDataContractTests(unittest.TestCase):
         self.assertEqual(kwargs, {"device": "cpu"})
         self.assertTrue(callable(passed_logger))
 
+    def test_run_experiment_applies_experiment_seed_before_data_build(self):
+        captures = []
+
+        class DataRecipe:
+            def build(self, *, runtime=None, augment=None):
+                del runtime, augment
+                captures.append(
+                    (
+                        random.random(),
+                        float(np.random.rand()),
+                        float(torch.rand(1).item()),
+                    )
+                )
+                return _bundle()
+
+        class TrainerRecipe:
+            def build(self, *, experiment, data, logger=None):
+                del experiment, data, logger
+                return SimpleNamespace(run=lambda **kwargs: ("ran", kwargs))
+
+        experiment = Experiment(
+            name="seeded_runner",
+            data=DataRecipe(),
+            model=StaticBuildRecipe(SimpleNamespace(kind="model")),
+            loss="loss",
+            objective=ERMObjective(),
+            runtime=StaticBuildRecipe(SimpleNamespace(kind="runtime")),
+            augment=StaticBuildRecipe("augment_recipe"),
+            trainer=TrainerRecipe(),
+            seed=4242,
+        )
+
+        first_status, first_kwargs = run_experiment(experiment, device="cpu")
+        second_status, second_kwargs = run_experiment(experiment, device="cpu")
+
+        self.assertEqual(first_status, "ran")
+        self.assertEqual(first_kwargs, {"device": "cpu"})
+        self.assertEqual(second_status, "ran")
+        self.assertEqual(second_kwargs, {"device": "cpu"})
+        self.assertEqual(len(captures), 2)
+        self.assertEqual(captures[0], captures[1])
+
     def test_run_experiment_supports_stitch_inference_only_workflow(self):
         logits = torch.full((1, 1, 4, 4), 10.0, dtype=torch.float32)
         batch = Batch(
@@ -605,6 +666,86 @@ class ExperimentDataContractTests(unittest.TestCase):
         self.assertTrue(str((run.segment_prob_paths or {})["segA"]).endswith("segA__prob.zarr"))
         self.assertEqual(set((run.segment_preview_paths or {}).keys()), {"segA"})
         self.assertTrue(str((run.segment_preview_paths or {})["segA"]).endswith("segA__prob.png"))
+
+    def test_stitch_inference_trainer_builds_full_grid_loaders_from_stitch_eval_segments(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            seg_a_dir = root / "group_a" / "segA"
+            _write_zarr_array(seg_a_dir / "segA.zarr", np.zeros((2, 4, 4), dtype=np.uint8))
+            _write_zarr_array(seg_a_dir / "segA_inklabels.zarr", np.zeros((4, 4), dtype=np.uint8))
+            _write_zarr_array(seg_a_dir / "segA_supervision_mask.zarr", np.full((4, 4), 255, dtype=np.uint8))
+
+            seg_b_dir = root / "group_a" / "segB"
+            seg_b_volume = np.zeros((2, 4, 4), dtype=np.uint8)
+            seg_b_volume[:, 0:2, 0:2] = 64
+            _write_zarr_array(seg_b_dir / "segB.zarr", seg_b_volume)
+            _write_zarr_array(seg_b_dir / "segB_inklabels.zarr", np.zeros((4, 4), dtype=np.uint8))
+            _write_zarr_array(
+                seg_b_dir / "segB_supervision_mask.zarr",
+                np.pad(
+                    np.full((2, 2), 255, dtype=np.uint8),
+                    ((0, 2), (0, 2)),
+                    mode="constant",
+                    constant_values=0,
+                ),
+            )
+
+            source_experiment = Experiment(
+                name="stitch_loader_source",
+                data=ZarrPatchDataRecipe(
+                    dataset_root=str(root),
+                    segments={
+                        "segA": {"layer_range": (0, 2), "reverse_layers": False},
+                        "segB": {"layer_range": (0, 2), "reverse_layers": False},
+                    },
+                    train_segment_ids=("segA",),
+                    val_segment_ids=(),
+                    in_channels=1,
+                    patch_size=4,
+                    train_batch_size=1,
+                    valid_batch_size=1,
+                    shuffle=False,
+                ),
+                model=StaticBuildRecipe(SimpleNamespace()),
+                loss=None,
+                objective=None,
+                runtime=StaticBuildRecipe(SimpleNamespace()),
+                augment=StaticBuildRecipe(None),
+            )
+            bundle = build_experiment_data(
+                source_experiment.data,
+                augment=StaticBuildRecipe(_neutral_augment(size=4)),
+            )
+
+            trainer = StitchInferenceTrainer(
+                stitch_inference=StitchInferenceRecipe(
+                    stitch_runtime=StitchRuntimeRecipe(
+                        config={
+                            "use_roi": False,
+                            "eval": {"segment_ids": ["segB"]},
+                        }
+                    ),
+                    store=ZarrStitchStore(root_dir=root / ".tmp" / "stitch_eval"),
+                ),
+            )
+            run = trainer.build(
+                experiment=Experiment(
+                    name="stitch_loader_target",
+                    data="unused",
+                    model=StaticBuildRecipe(SimpleNamespace()),
+                    loss=None,
+                    objective=None,
+                    runtime=StaticBuildRecipe(SimpleNamespace()),
+                    augment=StaticBuildRecipe(None),
+                ),
+                data=bundle,
+            )
+
+            self.assertEqual(len(run.inference_loaders), 1)
+            batch = next(batch for batch in run.inference_loaders[0] if batch is not None)
+            self.assertIsNone(batch.y)
+            self.assertIsNone(batch.meta.valid_mask)
+            self.assertEqual(batch.meta.segment_ids, ["segB"])
 
 
 if __name__ == "__main__":

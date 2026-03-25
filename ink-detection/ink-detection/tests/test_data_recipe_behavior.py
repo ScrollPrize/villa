@@ -59,17 +59,21 @@ def _make_canonical_segment(
     label: np.ndarray,
     supervision_mask: np.ndarray,
     validation_mask: np.ndarray | None = None,
+    write_validation_mask: bool = True,
     dataset_suffix: str = "",
 ) -> dict[str, object]:
     segment_dir = root / group_name / segment_id
     _write_zarr_array(segment_dir / f"{segment_id}.zarr", np.asarray(volume))
     _write_zarr_array(segment_dir / f"{segment_id}_inklabels{dataset_suffix}.zarr", np.asarray(label))
     _write_zarr_array(segment_dir / f"{segment_id}_supervision_mask{dataset_suffix}.zarr", np.asarray(supervision_mask))
-    _write_zarr_array(
-        segment_dir / f"{segment_id}_validation_mask{dataset_suffix}.zarr",
-        np.asarray(supervision_mask if validation_mask is None else validation_mask),
-    )
+    if write_validation_mask:
+        _write_zarr_array(
+            segment_dir / f"{segment_id}_validation_mask{dataset_suffix}.zarr",
+            np.asarray(supervision_mask if validation_mask is None else validation_mask),
+        )
     return {}
+
+
 class ZarrPatchDataRecipeTests(unittest.TestCase):
     def test_zarr_patch_data_uses_dataset_version_for_labels_and_split_specific_masks(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -146,6 +150,47 @@ class ZarrPatchDataRecipeTests(unittest.TestCase):
                     mode="constant",
                     constant_values=0,
                 ),
+            )
+
+            bundle = ZarrPatchDataRecipe(
+                dataset_root=str(root),
+                segments={
+                    "segTrain": train_segment,
+                    "segVal": val_segment,
+                },
+                train_segment_ids=("segTrain",),
+                val_segment_ids=("segVal",),
+                in_channels=4,
+                patch_size=4,
+                tile_size=4,
+                stride=4,
+                train_batch_size=1,
+                valid_batch_size=1,
+                shuffle=False,
+                normalization=ClipMaxDiv255Normalization(),
+            ).build(augment=_neutral_augment(size=4))
+
+            self.assertEqual(len(bundle.eval_loader.dataset), 4)
+
+    def test_zarr_patch_data_val_only_segment_without_validation_mask_uses_supervision_mask(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            train_segment = _make_canonical_segment(
+                root,
+                group_name="group_a",
+                segment_id="segTrain",
+                volume=np.stack([np.full((8, 8), value, dtype=np.uint8) for value in (10, 20, 30, 40)], axis=0),
+                label=np.full((8, 8), 255, dtype=np.uint8),
+                supervision_mask=np.full((8, 8), 255, dtype=np.uint8),
+            )
+            val_segment = _make_canonical_segment(
+                root,
+                group_name="group_a",
+                segment_id="segVal",
+                volume=np.stack([np.full((8, 8), value, dtype=np.uint8) for value in (50, 60, 70, 80)], axis=0),
+                label=np.full((8, 8), 255, dtype=np.uint8),
+                supervision_mask=np.full((8, 8), 255, dtype=np.uint8),
+                write_validation_mask=False,
             )
 
             bundle = ZarrPatchDataRecipe(
@@ -1094,6 +1139,50 @@ class ZarrPatchDataRecipeTests(unittest.TestCase):
 
             self.assertEqual(train_batch.meta.segment_ids, ["segB"])
             self.assertEqual(eval_batch.meta.segment_ids, ["segA"])
+
+    def test_generated_patch_bundle_val_only_segment_without_validation_mask_uses_supervision_mask(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_root = root / "bundle"
+            train_segment = _make_canonical_segment(
+                root,
+                group_name="group_a",
+                segment_id="segTrain",
+                volume=np.stack([np.full((8, 8), value, dtype=np.uint8) for value in (10, 20, 30, 40)], axis=0),
+                label=np.full((8, 8), 255, dtype=np.uint8),
+                supervision_mask=np.full((8, 8), 255, dtype=np.uint8),
+            )
+            val_segment = _make_canonical_segment(
+                root,
+                group_name="group_a",
+                segment_id="segVal",
+                volume=np.stack([np.full((8, 8), value, dtype=np.uint8) for value in (50, 60, 70, 80)], axis=0),
+                label=np.full((8, 8), 255, dtype=np.uint8),
+                supervision_mask=np.full((8, 8), 255, dtype=np.uint8),
+                write_validation_mask=False,
+            )
+            source_recipe = ZarrPatchDataRecipe(
+                dataset_root=str(root),
+                segments={"segTrain": train_segment, "segVal": val_segment},
+                train_segment_ids=("segTrain",),
+                val_segment_ids=("segVal",),
+                in_channels=4,
+                patch_size=4,
+                tile_size=4,
+                stride=4,
+                train_batch_size=1,
+                valid_batch_size=1,
+                shuffle=False,
+            )
+
+            bundle = GeneratedPatchBundleDataRecipe(
+                bundle_root=str(bundle_root),
+                source=source_recipe,
+            ).build(augment=_neutral_augment(size=4))
+
+            self.assertTrue((bundle_root / "group_a" / "segVal" / "segVal_supervision_mask.zarr").exists())
+            self.assertFalse((bundle_root / "group_a" / "segVal" / "segVal_validation_mask.zarr").exists())
+            self.assertEqual(len(bundle.eval_loader.dataset), 4)
 
     def test_patch_bundle_writer_round_trips_patch_recipe_with_group_idx(self):
         with tempfile.TemporaryDirectory() as tmpdir:
