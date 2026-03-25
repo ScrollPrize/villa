@@ -3,9 +3,7 @@ from typing import Tuple, List, Union, Optional, Iterable
 
 import math
 
-import SimpleITK
 import numpy as np
-import pandas as pd
 import torch
 from scipy.ndimage import fourier_gaussian
 from torch import Tensor
@@ -480,6 +478,8 @@ def _convert_my_grid_to_grid_sample_grid(my_grid: torch.Tensor, original_shape: 
 
 
 if __name__ == '__main__':
+    import SimpleITK
+
     # torch.set_num_threads(1)
     #
     # shape = (128, 128, 128)
