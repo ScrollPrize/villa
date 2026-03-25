@@ -3,7 +3,7 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ink-detection"
+name = "koine_machines"
 version = "0.1.0"
 description = "Machine learning package for ink detection on herculaneum scrolls"
 requires-python = ">=3.11"
