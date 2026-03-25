@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Machine learning package for ink detection on herculaneum scrolls"
 requires-python = ">=3.11"
 dependencies = [
+    "vesuvius",
     "torch==2.10.0",
     "torchvision==0.25.0",
     "timm==1.0.25",
@@ -30,3 +31,6 @@ topology = ["topolosses==0.2.0"]
 
 [tool.setuptools.packages.find]
 include = ["koine_machines*"]
+
+[tool.uv.sources]
+vesuvius = { path = "../vesuvius", editable = true }
