@@ -27,6 +27,10 @@ dependencies = [
     "numba>=0.64.0",
     "tifffile>=2026.3.3",
     "imagecodecs>=2026.3.6",
+    "pytest>=9.0.2",
+    "napari>=0.7.0",
+    "einops>=0.8.2",
+    "pyqt6>=6.10.2",
 ]
 
 [tool.setuptools.packages.find]
