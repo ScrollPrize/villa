@@ -211,7 +211,7 @@ class PreviewAccumulator:
         flat_max_crop = torch.where(flat_max_valid > 0, flat_max_crop, torch.zeros_like(flat_max_crop))
         return flat_crop, flat_max_crop
 
-    def _add_normal_pooled_batch(self, batch, pooled_logits, volume_logits):
+    def _add_normal_pooled_batch(self, batch, pooled_logits, targets, ignore_mask, volume_logits):
         image_batch = batch["image"].float()
         if image_batch.ndim == 4:
             image_batch = image_batch.unsqueeze(1)
@@ -251,6 +251,8 @@ class PreviewAccumulator:
         gathered_pooled_logits = self.accelerator.gather_for_metrics(pooled_logits)
         gathered_flat_crops = self.accelerator.gather_for_metrics(flat_crop)
         gathered_flat_max_crops = self.accelerator.gather_for_metrics(flat_max_crop)
+        gathered_targets = self.accelerator.gather_for_metrics(targets)
+        gathered_ignore_masks = self.accelerator.gather_for_metrics(ignore_mask)
 
         if not self.accelerator.is_main_process:
             return
@@ -260,13 +262,17 @@ class PreviewAccumulator:
         pooled_logit_tiles = gathered_pooled_logits[:, 0].detach().cpu().numpy()
         flat_crop_tiles = gathered_flat_crops[:, 0].detach().cpu().numpy()
         flat_max_crop_tiles = gathered_flat_max_crops[:, 0].detach().cpu().numpy()
+        label_tiles = gathered_targets[:, 0].detach().cpu().numpy()
+        ignore_mask_tiles = gathered_ignore_masks[:, 0].detach().cpu().numpy()
 
-        for volume_logit_tile, volume_crop_tile, pooled_logit_tile, flat_crop_tile, flat_max_crop_tile in zip(
+        for volume_logit_tile, volume_crop_tile, pooled_logit_tile, flat_crop_tile, flat_max_crop_tile, label_tile, ignore_mask_tile in zip(
             volume_logit_tiles,
             volume_crop_tiles,
             pooled_logit_tiles,
             flat_crop_tiles,
             flat_max_crop_tiles,
+            label_tiles,
+            ignore_mask_tiles,
         ):
             sample_tile = build_panel_grid(
                 [
@@ -277,6 +283,7 @@ class PreviewAccumulator:
                     [
                         to_uint8_image(pooled_logit_tile),
                         composite_uint8_images(flat_crop_tile, flat_max_crop_tile),
+                        to_uint8_label(label_tile, ignore_mask_tile),
                     ],
                 ],
                 gap_size=self.gap_size,
@@ -286,7 +293,7 @@ class PreviewAccumulator:
 
     def add_batch(self, batch, preds, targets, ignore_mask, *, volume_logits=None):
         if "flat_points_local_zyx" in batch and "flat_valid" in batch:
-            self._add_normal_pooled_batch(batch, preds, volume_logits)
+            self._add_normal_pooled_batch(batch, preds, targets, ignore_mask, volume_logits)
             return
         self._add_standard_batch(batch, preds, targets, ignore_mask)
 
