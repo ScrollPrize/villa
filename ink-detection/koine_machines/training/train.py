@@ -512,6 +512,7 @@ def train(config_path, profile_steps):
                 loss_preds.detach(),
                 targets.detach(),
                 ignore_mask.detach(),
+                volume_logits=preds.detach(),
             )
             model.eval()
             val_losses = []
@@ -542,6 +543,7 @@ def train(config_path, profile_steps):
                         )
                     val_loss_preds, val_targets, val_ignore_mask = prepare_loss_inputs(val_preds, val_batch)
                     preview_preds = val_loss_preds
+                    preview_volume_preds = val_preds
                     val_targets_with_ignore = torch.cat([val_targets, val_ignore_mask], dim=1)
                     val_l = loss(val_loss_preds.float(), val_targets_with_ignore.float())
                     val_losses.append(val_l.item())
@@ -579,6 +581,7 @@ def train(config_path, profile_steps):
                         ema_val_l = loss(ema_val_loss_preds.float(), val_targets_with_ignore.float())
                         ema_val_losses.append(ema_val_l.item())
                         preview_preds = ema_val_loss_preds
+                        preview_volume_preds = ema_val_preds
 
                     if val_batch_idx in preview_batch_indices:
                         val_preview.add_batch(
@@ -586,6 +589,7 @@ def train(config_path, profile_steps):
                             preview_preds.detach(),
                             val_targets.detach(),
                             val_ignore_mask.detach(),
+                            volume_logits=preview_volume_preds.detach(),
                         )
 
             mean_val_loss = np.mean(val_losses)
