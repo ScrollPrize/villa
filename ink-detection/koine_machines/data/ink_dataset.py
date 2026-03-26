@@ -792,13 +792,19 @@ class InkDataset(Dataset):
                             (support_y0, support_y1, support_x0, support_x1),
                         )
 
-                    support_grid_area = int(support_valid.shape[0] * support_valid.shape[1])
-                    support_grid_area_limit = int(expected_shape[1] * expected_shape[2] * 2)
-                    if support_grid_area > support_grid_area_limit:
+                    support_grid_shape = tuple(int(v) for v in support_valid.shape)
+                    support_grid_side_limits = (
+                        int(expected_shape[1] * 4),
+                        int(expected_shape[2] * 4),
+                    )
+                    if (
+                        support_grid_shape[0] > support_grid_side_limits[0]
+                        or support_grid_shape[1] > support_grid_side_limits[1]
+                    ):
                         if attempt >= max_resample_attempts:
                             raise RuntimeError(
-                                f"Oversized normal pooled support grid {tuple(int(v) for v in support_valid.shape)!r} "
-                                f"(area={support_grid_area}) exceeded limit {support_grid_area_limit} "
+                                f"Oversized normal pooled support grid {support_grid_shape!r} "
+                                f"exceeded side limits {support_grid_side_limits!r} "
                                 f"for patch {patch.segment.segment_name} bbox {patch.bbox!r} after {attempt + 1} attempts"
                             )
                         oversize_retry_idx = self._choose_replacement_patch_index(
@@ -889,8 +895,8 @@ class InkDataset(Dataset):
 
             if oversize_retry_idx is not None:
                 warnings.warn(
-                    f"Oversized normal pooled support grid {tuple(int(v) for v in support_valid.shape)!r} "
-                    f"(area={support_grid_area}) exceeded limit {support_grid_area_limit} "
+                    f"Oversized normal pooled support grid {support_grid_shape!r} "
+                    f"exceeded side limits {support_grid_side_limits!r} "
                     f"for requested idx {requested_idx}, patch idx {current_idx}, "
                     f"segment {patch.segment.segment_name}; resampling idx {oversize_retry_idx}",
                     RuntimeWarning,
