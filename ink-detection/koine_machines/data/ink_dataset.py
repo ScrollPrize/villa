@@ -2,6 +2,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 import random
+import warnings
 import cc3d
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
@@ -221,6 +222,46 @@ def _project_valid_surface_mask_to_native_crop(patch_zyxs, valid_mask, crop_bbox
     return surface_distance_field.astype(np.float32, copy=False)
 
 
+def _project_supervised_crop_coverage(
+    support_patch_zyxs,
+    support_valid,
+    support_supervision_flat_patch,
+    crop_bbox,
+):
+    return _project_flat_patch_to_native_crop(
+        (np.asarray(support_supervision_flat_patch) > 0).astype(np.uint8, copy=False),
+        support_patch_zyxs,
+        support_valid,
+        crop_bbox,
+    ) > 0
+
+
+def _supervised_crop_coverage_is_preserved(
+    *,
+    support_patch_zyxs,
+    support_supervision_flat_patch,
+    crop_bbox,
+    before_valid,
+    after_valid,
+):
+    before_coverage = _project_supervised_crop_coverage(
+        support_patch_zyxs,
+        before_valid,
+        support_supervision_flat_patch,
+        crop_bbox,
+    )
+    if not np.any(before_coverage):
+        return True
+
+    after_coverage = _project_supervised_crop_coverage(
+        support_patch_zyxs,
+        after_valid,
+        support_supervision_flat_patch,
+        crop_bbox,
+    )
+    return not np.any(before_coverage & ~after_coverage)
+
+
 def _tighten_support_window(
     support_bbox,
     support_patch_zyxs,
@@ -426,11 +467,19 @@ def _filter_support_components_by_active_supervision(
     filtered_valid = np.zeros_like(support_valid, dtype=bool)
     filtered_valid[row_indices[keep_flat], col_indices[keep_flat]] = True
     if max_supervision_grid_distance is not None:
-        filtered_valid = _filter_support_by_2d_distance_from_supervision(
+        distance_filtered_valid = _filter_support_by_2d_distance_from_supervision(
             filtered_valid,
             support_supervision_flat_patch,
             max_grid_distance=max_supervision_grid_distance,
         )
+        if _supervised_crop_coverage_is_preserved(
+            support_patch_zyxs=support_patch_zyxs,
+            support_supervision_flat_patch=support_supervision_flat_patch,
+            crop_bbox=crop_bbox,
+            before_valid=filtered_valid,
+            after_valid=distance_filtered_valid,
+        ):
+            filtered_valid = distance_filtered_valid
     return _tighten_support_window(
         support_bbox,
         support_patch_zyxs,
@@ -617,197 +666,247 @@ class InkDataset(Dataset):
 
     def __len__(self):
         return len(self.patches)
+
+    def _choose_replacement_patch_index(self, *, requested_idx, current_idx, attempt):
+        if len(self.patches) <= 1:
+            raise RuntimeError("Cannot resample an oversized normal pooled patch from a dataset with <= 1 patch")
+
+        seed = int(self.config.get('seed', 0))
+        rng = random.Random(seed + (int(requested_idx) * 1000003) + (int(attempt) * 7919))
+        for _ in range(8):
+            replacement_idx = rng.randrange(len(self.patches))
+            if replacement_idx != int(current_idx):
+                return replacement_idx
+        return (int(current_idx) + 1) % len(self.patches)
     
     def __getitem__(self, idx):
-        patch = self.patches[idx]
-        sample_profiler = DatasetSampleProfiler(self.profile_enabled)
-        z0, y0, x0, z1, y1, x1 = patch.bbox
-        expected_shape = tuple(int(v) for v in self.patch_size)
-        crop_bbox = patch.bbox
-        use_surface_mask = self.mode == "normal_pooled_3d"
-        surface_mask = None
-        normal_pooled_metadata = None
+        requested_idx = int(idx)
+        current_idx = requested_idx
+        max_resample_attempts = int(self.config.get('normal_pooled_oversize_resample_attempts', 8))
 
-        with sample_profiler.section('dataset/total'):
-            if self.mode == "normal_pooled_3d":
-                with sample_profiler.section('dataset/get_cached_inputs'):
-                    image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
-                    supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
-                    inklabels = self._get_cached_zarr(patch.inklabels, resolution=patch.segment.scale)
-                    patch_tifxyz = self._get_cached_tifxyz(patch.segment_dir)
-                    coarse_patch_zyxs, coarse_valid = self._get_cached_stored_resolution_zyxs(
-                        patch.segment_dir,
-                        patch_tifxyz=patch_tifxyz,
-                    )
-                with sample_profiler.section('dataset/read_patch_tifxyz'):
-                    flat_x, flat_y, flat_z, flat_valid = patch_tifxyz[y0:y1, x0:x1]
-                    patch_zyxs = np.stack([flat_z, flat_y, flat_x], axis=-1)
-                with sample_profiler.section('dataset/compute_crop_bbox'):
-                    crop_bbox = compute_native_crop_bbox_from_patch_points(
-                        patch_zyxs,
-                        flat_valid,
-                        expected_shape,
-                    )
-                with sample_profiler.section('dataset/read_seed_supervision'):
-                    supervision_flat_patch = _read_flat_surface_patch(
-                        supervision_mask,
-                        y0=y0,
-                        y1=y1,
-                        x0=x0,
-                        x1=x1,
-                    )
-                if self.do_augmentations:
-                    with sample_profiler.section('dataset/translate_crop_bbox'):
-                        crop_bbox = maybe_translate_normal_pooled_crop_bbox(
-                            crop_bbox,
+        for attempt in range(max_resample_attempts + 1):
+            patch = self.patches[current_idx]
+            sample_profiler = DatasetSampleProfiler(self.profile_enabled)
+            z0, y0, x0, z1, y1, x1 = patch.bbox
+            expected_shape = tuple(int(v) for v in self.patch_size)
+            crop_bbox = patch.bbox
+            use_surface_mask = self.mode == "normal_pooled_3d"
+            surface_mask = None
+            normal_pooled_metadata = None
+            oversize_retry_idx = None
+
+            with sample_profiler.section('dataset/total'):
+                if self.mode == "normal_pooled_3d":
+                    with sample_profiler.section('dataset/get_cached_inputs'):
+                        image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
+                        supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
+                        inklabels = self._get_cached_zarr(patch.inklabels, resolution=patch.segment.scale)
+                        patch_tifxyz = self._get_cached_tifxyz(patch.segment_dir)
+                        coarse_patch_zyxs, coarse_valid = self._get_cached_stored_resolution_zyxs(
+                            patch.segment_dir,
+                            patch_tifxyz=patch_tifxyz,
+                        )
+                    with sample_profiler.section('dataset/read_patch_tifxyz'):
+                        flat_x, flat_y, flat_z, flat_valid = patch_tifxyz[y0:y1, x0:x1]
+                        patch_zyxs = np.stack([flat_z, flat_y, flat_x], axis=-1)
+                    with sample_profiler.section('dataset/compute_crop_bbox'):
+                        crop_bbox = compute_native_crop_bbox_from_patch_points(
                             patch_zyxs,
                             flat_valid,
-                            supervision_flat_patch,
+                            expected_shape,
                         )
-                with sample_profiler.section('dataset/select_support_window'):
-                    (
-                        base_support_bbox,
-                        support_patch_zyxs,
-                        support_valid,
-                        support_patch_zyxs_halo,
-                        support_valid_halo,
-                        trim_slices,
-                    ) = _select_flat_pixels_for_native_crop_via_stored_resolution(
-                        patch_tifxyz,
-                        crop_bbox,
-                        coarse_patch_zyxs=coarse_patch_zyxs,
-                        coarse_valid=coarse_valid,
-                        return_halo=True,
-                    )
-                    support_y0, support_y1, support_x0, support_x1 = base_support_bbox
-                with sample_profiler.section('dataset/read_support_labels'):
-                    support_supervision_flat_patch = _read_flat_surface_patch(
-                        supervision_mask,
-                        y0=support_y0,
-                        y1=support_y1,
-                        x0=support_x0,
-                        x1=support_x1,
-                    )
-                    support_inklabels_flat_patch = _read_flat_surface_patch(
-                        inklabels,
-                        y0=support_y0,
-                        y1=support_y1,
-                        x0=support_x0,
-                        x1=support_x1,
-                    )
-                with sample_profiler.section('dataset/filter_support_components'):
-                    pooling_config = self.config.get('normal_pooling') or {}
-                    (
-                        (support_y0, support_y1, support_x0, support_x1),
-                        support_patch_zyxs,
-                        support_valid,
-                        support_inklabels_flat_patch,
-                        support_supervision_flat_patch,
-                    ) = _filter_support_components_by_active_supervision(
-                        support_bbox=(support_y0, support_y1, support_x0, support_x1),
-                        support_patch_zyxs=support_patch_zyxs,
-                        support_valid=support_valid,
-                        support_inklabels_flat_patch=support_inklabels_flat_patch,
-                        support_supervision_flat_patch=support_supervision_flat_patch,
-                        crop_bbox=crop_bbox,
-                        max_supervision_grid_distance=pooling_config.get('support_grid_max_distance'),
-                    )
-                    (
-                        support_patch_zyxs_halo,
-                        support_valid_halo,
-                        trim_slices,
-                    ) = _slice_support_halo_for_subwindow(
-                        support_patch_zyxs_halo,
-                        support_valid_halo,
-                        trim_slices,
-                        base_support_bbox,
-                        (support_y0, support_y1, support_x0, support_x1),
-                    )
-                with sample_profiler.section('dataset/read_image_crop'):
-                    image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, crop_bbox, fill_value=0)
-                with sample_profiler.section('dataset/project_surface_mask'):
-                    surface_mask = _project_valid_surface_mask_to_native_crop(
-                        support_patch_zyxs,
-                        support_valid,
-                        crop_bbox,
-                    )
-                with sample_profiler.section('dataset/build_metadata'):
-                    normal_pooled_metadata = _build_normal_pooled_flat_metadata(
-                        support_patch_zyxs=support_patch_zyxs,
-                        support_valid=support_valid,
-                        support_patch_zyxs_halo=support_patch_zyxs_halo,
-                        support_valid_halo=support_valid_halo,
-                        trim_slices=trim_slices,
-                        support_inklabels_flat_patch=support_inklabels_flat_patch,
-                        support_supervision_flat_patch=support_supervision_flat_patch,
-                        crop_bbox=crop_bbox,
-                    )
-            else:
-                with sample_profiler.section('dataset/get_cached_inputs'):
-                    image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
-                    supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
-                    inklabels = self._get_cached_zarr(patch.inklabels, resolution=patch.segment.scale)
-                with sample_profiler.section('dataset/read_supervised_crops'):
-                    image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, patch.bbox, fill_value=0)
-                    supervision_crop, _ = _read_bbox_with_padding(supervision_mask, patch.bbox, fill_value=0)
-                    inklabels_crop, _ = _read_bbox_with_padding(inklabels, patch.bbox, fill_value=0)
-
-            with sample_profiler.section('dataset/normalize_image'):
-                image_crop = image_crop.astype(np.float32, copy=False)
-                if image_valid_slices is not None:
-                    image_crop[image_valid_slices] = normalize_robust(image_crop[image_valid_slices])
-
-            arrays_to_validate = [("image", image_crop)]
-            if self.mode != "normal_pooled_3d":
-                arrays_to_validate.extend(
-                    [
-                        ("supervision_mask", supervision_crop),
-                        ("inklabels", inklabels_crop),
-                    ]
-                )
-            with sample_profiler.section('dataset/validate_shapes'):
-                for name, array in arrays_to_validate:
-                    if tuple(int(v) for v in array.shape) != expected_shape:
-                        raise AssertionError(
-                            f"{name} crop shape {tuple(int(v) for v in array.shape)} does not match "
-                            f"requested patch size {expected_shape} for bbox {crop_bbox!r}"
+                    with sample_profiler.section('dataset/read_seed_supervision'):
+                        supervision_flat_patch = _read_flat_surface_patch(
+                            supervision_mask,
+                            y0=y0,
+                            y1=y1,
+                            x0=x0,
+                            x1=x1,
+                        )
+                    if self.do_augmentations:
+                        with sample_profiler.section('dataset/translate_crop_bbox'):
+                            crop_bbox = maybe_translate_normal_pooled_crop_bbox(
+                                crop_bbox,
+                                patch_zyxs,
+                                flat_valid,
+                                supervision_flat_patch,
+                            )
+                    with sample_profiler.section('dataset/select_support_window'):
+                        (
+                            base_support_bbox,
+                            support_patch_zyxs,
+                            support_valid,
+                            support_patch_zyxs_halo,
+                            support_valid_halo,
+                            trim_slices,
+                        ) = _select_flat_pixels_for_native_crop_via_stored_resolution(
+                            patch_tifxyz,
+                            crop_bbox,
+                            coarse_patch_zyxs=coarse_patch_zyxs,
+                            coarse_valid=coarse_valid,
+                            return_halo=True,
+                        )
+                        support_y0, support_y1, support_x0, support_x1 = base_support_bbox
+                    with sample_profiler.section('dataset/read_support_labels'):
+                        support_supervision_flat_patch = _read_flat_surface_patch(
+                            supervision_mask,
+                            y0=support_y0,
+                            y1=support_y1,
+                            x0=support_x0,
+                            x1=support_x1,
+                        )
+                        support_inklabels_flat_patch = _read_flat_surface_patch(
+                            inklabels,
+                            y0=support_y0,
+                            y1=support_y1,
+                            x0=support_x0,
+                            x1=support_x1,
+                        )
+                    with sample_profiler.section('dataset/filter_support_components'):
+                        pooling_config = self.config.get('normal_pooling') or {}
+                        max_support_grid_distance = pooling_config.get('support_grid_max_distance', 64.0)
+                        (
+                            (support_y0, support_y1, support_x0, support_x1),
+                            support_patch_zyxs,
+                            support_valid,
+                            support_inklabels_flat_patch,
+                            support_supervision_flat_patch,
+                        ) = _filter_support_components_by_active_supervision(
+                            support_bbox=(support_y0, support_y1, support_x0, support_x1),
+                            support_patch_zyxs=support_patch_zyxs,
+                            support_valid=support_valid,
+                            support_inklabels_flat_patch=support_inklabels_flat_patch,
+                            support_supervision_flat_patch=support_supervision_flat_patch,
+                            crop_bbox=crop_bbox,
+                            max_supervision_grid_distance=max_support_grid_distance,
+                        )
+                        (
+                            support_patch_zyxs_halo,
+                            support_valid_halo,
+                            trim_slices,
+                        ) = _slice_support_halo_for_subwindow(
+                            support_patch_zyxs_halo,
+                            support_valid_halo,
+                            trim_slices,
+                            base_support_bbox,
+                            (support_y0, support_y1, support_x0, support_x1),
                         )
 
-            with sample_profiler.section('dataset/to_torch'):
-                image_crop = torch.from_numpy(image_crop).float().unsqueeze(0)
-                data = {'image': image_crop}
-
-                if self.mode == "normal_pooled_3d":
-                    assert normal_pooled_metadata is not None
-                    data.update(normal_pooled_metadata)
-                else:
-                    inklabels_crop = torch.from_numpy(inklabels_crop).float().unsqueeze(0)
-                    supervision_crop = torch.from_numpy(supervision_crop).float().unsqueeze(0)
-                    data.update({
-                        'inklabels': inklabels_crop,
-                        'supervision_mask': supervision_crop,
-                    })
-
-                if use_surface_mask and surface_mask is not None:
-                    data['surface_mask'] = torch.from_numpy(surface_mask).float().unsqueeze(0)
-
-            if self.do_augmentations and self.augmentations is not None:
-                with sample_profiler.section('dataset/augment'):
-                    if self.mode == "normal_pooled_3d":
-                        augmentation_data, flat_valid_mask = _pack_normal_pooled_augmentation_data(data)
-                        augmented = self.augmentations(**augmentation_data)
-                        result = _restore_normal_pooled_augmentation_data(augmented, data, flat_valid_mask)
+                    support_grid_area = int(support_valid.shape[0] * support_valid.shape[1])
+                    support_grid_area_limit = int(expected_shape[1] * expected_shape[2] * 2)
+                    if support_grid_area > support_grid_area_limit:
+                        if attempt >= max_resample_attempts:
+                            raise RuntimeError(
+                                f"Oversized normal pooled support grid {tuple(int(v) for v in support_valid.shape)!r} "
+                                f"(area={support_grid_area}) exceeded limit {support_grid_area_limit} "
+                                f"for patch {patch.segment.segment_name} bbox {patch.bbox!r} after {attempt + 1} attempts"
+                            )
+                        oversize_retry_idx = self._choose_replacement_patch_index(
+                            requested_idx=requested_idx,
+                            current_idx=current_idx,
+                            attempt=attempt,
+                        )
                     else:
-                        result = self.augmentations(**data)
-            else:
-                result = data
+                        with sample_profiler.section('dataset/read_image_crop'):
+                            image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, crop_bbox, fill_value=0)
+                        with sample_profiler.section('dataset/project_surface_mask'):
+                            surface_mask = _project_valid_surface_mask_to_native_crop(
+                                support_patch_zyxs,
+                                support_valid,
+                                crop_bbox,
+                            )
+                        with sample_profiler.section('dataset/build_metadata'):
+                            normal_pooled_metadata = _build_normal_pooled_flat_metadata(
+                                support_patch_zyxs=support_patch_zyxs,
+                                support_valid=support_valid,
+                                support_patch_zyxs_halo=support_patch_zyxs_halo,
+                                support_valid_halo=support_valid_halo,
+                                trim_slices=trim_slices,
+                                support_inklabels_flat_patch=support_inklabels_flat_patch,
+                                support_supervision_flat_patch=support_supervision_flat_patch,
+                                crop_bbox=crop_bbox,
+                            )
+                else:
+                    with sample_profiler.section('dataset/get_cached_inputs'):
+                        image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
+                        supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
+                        inklabels = self._get_cached_zarr(patch.inklabels, resolution=patch.segment.scale)
+                    with sample_profiler.section('dataset/read_supervised_crops'):
+                        image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, patch.bbox, fill_value=0)
+                        supervision_crop, _ = _read_bbox_with_padding(supervision_mask, patch.bbox, fill_value=0)
+                        inklabels_crop, _ = _read_bbox_with_padding(inklabels, patch.bbox, fill_value=0)
 
-        profile_timings = sample_profiler.as_dict()
-        self._record_profile_timings(profile_timings)
-        if self.profile_enabled:
-            result = dict(result)
-            result['profile_timings'] = profile_timings
-        return result
+                if oversize_retry_idx is None:
+                    with sample_profiler.section('dataset/normalize_image'):
+                        image_crop = image_crop.astype(np.float32, copy=False)
+                        if image_valid_slices is not None:
+                            image_crop[image_valid_slices] = normalize_robust(image_crop[image_valid_slices])
+
+                    arrays_to_validate = [("image", image_crop)]
+                    if self.mode != "normal_pooled_3d":
+                        arrays_to_validate.extend(
+                            [
+                                ("supervision_mask", supervision_crop),
+                                ("inklabels", inklabels_crop),
+                            ]
+                        )
+                    with sample_profiler.section('dataset/validate_shapes'):
+                        for name, array in arrays_to_validate:
+                            if tuple(int(v) for v in array.shape) != expected_shape:
+                                raise AssertionError(
+                                    f"{name} crop shape {tuple(int(v) for v in array.shape)} does not match "
+                                    f"requested patch size {expected_shape} for bbox {crop_bbox!r}"
+                                )
+
+                    with sample_profiler.section('dataset/to_torch'):
+                        image_crop = torch.from_numpy(image_crop).float().unsqueeze(0)
+                        data = {'image': image_crop}
+
+                        if self.mode == "normal_pooled_3d":
+                            assert normal_pooled_metadata is not None
+                            data.update(normal_pooled_metadata)
+                        else:
+                            inklabels_crop = torch.from_numpy(inklabels_crop).float().unsqueeze(0)
+                            supervision_crop = torch.from_numpy(supervision_crop).float().unsqueeze(0)
+                            data.update({
+                                'inklabels': inklabels_crop,
+                                'supervision_mask': supervision_crop,
+                            })
+
+                        if use_surface_mask and surface_mask is not None:
+                            data['surface_mask'] = torch.from_numpy(surface_mask).float().unsqueeze(0)
+
+                    if self.do_augmentations and self.augmentations is not None:
+                        with sample_profiler.section('dataset/augment'):
+                            if self.mode == "normal_pooled_3d":
+                                augmentation_data, flat_valid_mask = _pack_normal_pooled_augmentation_data(data)
+                                augmented = self.augmentations(**augmentation_data)
+                                result = _restore_normal_pooled_augmentation_data(augmented, data, flat_valid_mask)
+                            else:
+                                result = self.augmentations(**data)
+                    else:
+                        result = data
+
+            if oversize_retry_idx is not None:
+                warnings.warn(
+                    f"Oversized normal pooled support grid {tuple(int(v) for v in support_valid.shape)!r} "
+                    f"(area={support_grid_area}) exceeded limit {support_grid_area_limit} "
+                    f"for requested idx {requested_idx}, patch idx {current_idx}, "
+                    f"segment {patch.segment.segment_name}; resampling idx {oversize_retry_idx}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                current_idx = oversize_retry_idx
+                continue
+
+            profile_timings = sample_profiler.as_dict()
+            self._record_profile_timings(profile_timings)
+            if self.profile_enabled:
+                result = dict(result)
+                result['profile_timings'] = profile_timings
+            return result
+
+        raise RuntimeError(f"Failed to fetch a normal pooled sample after {max_resample_attempts + 1} attempts")
 
 if __name__ == "__main__":
     import argparse
