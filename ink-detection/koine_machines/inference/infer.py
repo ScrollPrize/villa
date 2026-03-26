@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import itertools
 import logging
 import math
 import shutil
@@ -20,11 +21,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import zarr
-from monai.data.utils import compute_importance_map
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
-
-from tifxyz_dataset.augmentation import compute_equal_length_mirror_axes, iter_mirror_axes
 
 
 LOGGER = logging.getLogger("inference_ome_zarr")
@@ -81,6 +79,171 @@ class TargetHeadWrapper(nn.Module):
                 raise ValueError(f"Target {self.target_name!r} returned an empty logits list")
             logits = logits[0]
         return logits
+
+
+def compute_equal_length_mirror_axes(shape: Sequence[int]) -> tuple[int, ...]:
+    normalized_shape = tuple(int(length) for length in shape)
+    if any(length <= 0 for length in normalized_shape):
+        raise ValueError(f"Shape dimensions must be positive, got {normalized_shape!r}")
+
+    axes_by_length: dict[int, list[int]] = {}
+    for axis, length in enumerate(normalized_shape):
+        axes_by_length.setdefault(length, []).append(axis)
+
+    allowed_axes: list[int] = []
+    for axes in axes_by_length.values():
+        if len(axes) > 1:
+            allowed_axes.extend(axes)
+    return tuple(allowed_axes)
+
+
+def iter_mirror_axes(allowed_axes: Sequence[int]) -> list[tuple[int, ...]]:
+    allowed_axes = tuple(int(axis) for axis in allowed_axes)
+    return [
+        axes
+        for count in range(len(allowed_axes) + 1)
+        for axes in itertools.combinations(allowed_axes, count)
+    ]
+
+
+def disable_z_projection_for_normal_pooled_3d(config: dict[str, Any]) -> None:
+    if str(config.get("mode", "flat")).strip().lower() != "normal_pooled_3d":
+        return
+
+    model_config = config.setdefault("model_config", {})
+    model_config["z_projection_mode"] = "none"
+
+    targets = config.get("targets") or {}
+    for target_info in targets.values():
+        if not isinstance(target_info, dict):
+            continue
+        target_info["z_projection_mode"] = "none"
+        if isinstance(target_info.get("z_projection"), dict):
+            target_info["z_projection"]["mode"] = "none"
+
+
+def normalize_training_config_for_inference(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = copy.deepcopy(config)
+    model_type = str(normalized.get("model_type", "")).strip().lower()
+
+    if model_type == "dinov2":
+        model_config = normalized.setdefault("model_config", {})
+        for key in ("pretrained_backbone", "pretrained_decoder_type"):
+            if key in normalized:
+                model_config.setdefault(key, normalized[key])
+        if not model_config.get("pretrained_backbone"):
+            raise ValueError(
+                "model_type='dinov2' requires model_config.pretrained_backbone "
+                "or a top-level pretrained_backbone entry"
+            )
+        normalized["model_type"] = "vesuvius_unet"
+        model_type = "vesuvius_unet"
+
+    mode = str(normalized.get("mode", "flat")).strip().lower()
+    if mode == "normal_pooled_3d":
+        if model_type.startswith("resnet3d"):
+            raise ValueError(
+                "infer.py does not support mode='normal_pooled_3d' with resnet3d checkpoints."
+            )
+        disable_z_projection_for_normal_pooled_3d(normalized)
+        normalized["in_channels"] = 2
+
+    patch_size = normalized.get("crop_size", normalized.get("patch_size"))
+    if not isinstance(patch_size, (list, tuple)) or len(patch_size) != 3:
+        raise ValueError(
+            "Checkpoint config must define crop_size or patch_size as [z, y, x], "
+            f"got {patch_size!r}"
+        )
+
+    normalized["crop_size"] = [int(value) for value in patch_size]
+    normalized["patch_size"] = [int(value) for value in patch_size]
+    normalized.setdefault("model_config", {})
+    targets_cfg = normalized.setdefault("targets", {})
+    ink_cfg = targets_cfg.setdefault("ink", {})
+    ink_cfg["out_channels"] = 1
+    ink_cfg.setdefault("activation", "none")
+    return normalized
+
+
+def supported_repo_model_type(model_type: str) -> bool:
+    normalized = str(model_type).strip().lower()
+    return normalized in {"unet", "vesuvius_unet", "dinov2", "resnet3d"} or normalized.startswith(
+        "resnet3d-"
+    )
+
+
+def checkpoint_looks_like_repo_training(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    config = payload.get("config")
+    model_state = payload.get("model")
+    if not isinstance(config, dict) or not isinstance(model_state, dict):
+        return False
+    return supported_repo_model_type(config.get("model_type", ""))
+
+
+def infer_target_name_from_config(config: dict[str, Any]) -> str:
+    targets = config.get("targets")
+    if isinstance(targets, dict) and targets:
+        if "ink" in targets:
+            return "ink"
+        return str(next(iter(targets)))
+    return "ink"
+
+
+def roi_size_from_config(config: dict[str, Any]) -> int:
+    patch_size = config.get("crop_size", config.get("patch_size"))
+    if not isinstance(patch_size, (list, tuple)) or len(patch_size) != 3:
+        raise ValueError(
+            "Checkpoint config must define crop_size or patch_size as [z, y, x], "
+            f"got {patch_size!r}"
+        )
+    roi_y = int(patch_size[1])
+    roi_x = int(patch_size[2])
+    if roi_y != roi_x:
+        raise ValueError(
+            "infer.py currently requires square patches for inference, "
+            f"got patch_size={tuple(int(v) for v in patch_size)}"
+        )
+    return roi_y
+
+
+def inference_depth_from_config(config: dict[str, Any]) -> int:
+    patch_size = config.get("crop_size", config.get("patch_size"))
+    if isinstance(patch_size, (list, tuple)) and len(patch_size) == 3:
+        return int(patch_size[0])
+    raise ValueError(
+        "Checkpoint config must define crop_size or patch_size as [z, y, x] "
+        f"to determine inference depth, got {patch_size!r}"
+    )
+
+
+def compute_importance_map_2d(
+    *,
+    patch_size: tuple[int, int],
+    mode: str,
+    sigma_scale: float,
+) -> torch.Tensor:
+    patch_h, patch_w = (int(patch_size[0]), int(patch_size[1]))
+    if patch_h <= 0 or patch_w <= 0:
+        raise ValueError(f"patch_size must be positive, got {patch_size!r}")
+
+    normalized_mode = str(mode).strip().lower()
+    if normalized_mode == "constant":
+        return torch.ones((patch_h, patch_w), dtype=torch.float32)
+    if normalized_mode != "gaussian":
+        raise ValueError(f"Unsupported importance map mode: {mode!r}")
+
+    sigma_y = max(float(patch_h) * float(sigma_scale), 1e-6)
+    sigma_x = max(float(patch_w) * float(sigma_scale), 1e-6)
+    coords_y = torch.arange(patch_h, dtype=torch.float32) - ((patch_h - 1) / 2.0)
+    coords_x = torch.arange(patch_w, dtype=torch.float32) - ((patch_w - 1) / 2.0)
+    grid_y, grid_x = torch.meshgrid(coords_y, coords_x, indexing="ij")
+    weight_map = torch.exp(
+        -0.5 * ((grid_y / sigma_y) ** 2 + (grid_x / sigma_x) ** 2)
+    )
+    weight_map /= torch.clamp(weight_map.max(), min=torch.finfo(weight_map.dtype).eps)
+    return torch.clamp(weight_map, min=torch.finfo(weight_map.dtype).eps)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -744,7 +907,7 @@ def extract_state_dict_entry_from_payload(
             state_dict = None
 
         if state_dict is not None:
-            selected_key = str(candidate_keys[candidate_keys.index(candidate_key)])
+            selected_key = str(candidate_key)
         elif all(isinstance(v, torch.Tensor) for v in payload.values()):
             selected_key = "<root>"
             state_dict = payload
@@ -882,18 +1045,6 @@ def resolve_tifxyz_pretrained_backbone_config(
     return updated_config
 
 
-def checkpoint_looks_like_tifxyz_training(payload: Any) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    config = payload.get("config")
-    model_state = payload.get("model")
-    if not isinstance(config, dict) or not isinstance(model_state, dict):
-        return False
-    model_type = str(config.get("model_type", "")).strip().lower()
-    patch_size = config.get("patch_size")
-    return model_type == "unet" and isinstance(patch_size, (list, tuple)) and len(patch_size) == 3
-
-
 def checkpoint_amp_dtype(payload: Any, checkpoint_path: Path | str) -> torch.dtype | None:
     if not isinstance(payload, dict):
         return None
@@ -958,50 +1109,11 @@ def resolve_amp_dtype(
     return checkpoint_amp_dtype(checkpoint_payload, checkpoint_path)
 
 
-def tifxyz_roi_size_from_config(config: dict[str, Any]) -> int:
-    patch_size = config.get("crop_size", config.get("patch_size"))
-    if not isinstance(patch_size, (list, tuple)) or len(patch_size) != 3:
-        raise ValueError(
-            "tifxyz checkpoint config must define crop_size or patch_size as [z, y, x], "
-            f"got {patch_size!r}"
-        )
-    roi_y = int(patch_size[1])
-    roi_x = int(patch_size[2])
-    if roi_y != roi_x:
-        raise ValueError(
-            "inference_ome_zarr.py currently requires square tifxyz patches for inference, "
-            f"got patch_size={tuple(int(v) for v in patch_size)}"
-        )
-    return roi_y
+def build_repo_training_model_bundle(payload: dict[str, Any], checkpoint_path: Path | str) -> ConfiguredModel:
+    from koine_machines.models.make_model import make_model
 
-
-def tifxyz_in_chans_from_config(config: dict[str, Any]) -> int:
-    patch_size = config.get("crop_size", config.get("patch_size"))
-    if isinstance(patch_size, (list, tuple)) and len(patch_size) == 3:
-        return int(patch_size[0])
-    raise ValueError(
-        "tifxyz checkpoint config must define crop_size or patch_size as [z, y, x] "
-        f"to determine inference depth, got {patch_size!r}"
-    )
-
-
-def build_tifxyz_model_bundle(payload: dict[str, Any], checkpoint_path: Path | str) -> ConfiguredModel:
-    from vesuvius.neural_tracing.nets.models import make_model
-
-    config = copy.deepcopy(payload["config"])
+    config = normalize_training_config_for_inference(payload["config"])
     config = resolve_tifxyz_pretrained_backbone_config(config, checkpoint_path=checkpoint_path)
-    model_type = str(config.get("model_type", "")).strip().lower()
-    if model_type != "unet":
-        raise ValueError(
-            "inference_ome_zarr.py only supports tifxyz checkpoints trained with model_type='unet', "
-            f"got {model_type!r}"
-        )
-    config.setdefault("crop_size", config.get("patch_size"))
-    targets_cfg = config.setdefault("targets", {})
-    ink_cfg = targets_cfg.setdefault("ink", {})
-    ink_cfg["out_channels"] = 1
-    ink_cfg.setdefault("activation", "none")
-
     base_model = make_model(config)
     selected_state_key, state_dict = extract_state_dict_entry_from_payload(
         payload,
@@ -1010,21 +1122,21 @@ def build_tifxyz_model_bundle(payload: dict[str, Any], checkpoint_path: Path | s
     )
     incompat = base_model.load_state_dict(state_dict, strict=False)
     LOGGER.info(
-        "Loaded tifxyz checkpoint %s using %s weights (missing_keys=%d unexpected_keys=%d)",
+        "Loaded checkpoint %s using %s weights (missing_keys=%d unexpected_keys=%d)",
         checkpoint_path,
         selected_state_key,
         len(incompat.missing_keys),
         len(incompat.unexpected_keys),
     )
 
-    model = TargetHeadWrapper(base_model, target_name="ink")
+    model = TargetHeadWrapper(base_model, target_name=infer_target_name_from_config(config))
     model.eval()
     return ConfiguredModel(
         model=model,
-        roi_size=tifxyz_roi_size_from_config(config),
-        in_chans=tifxyz_in_chans_from_config(config),
+        roi_size=roi_size_from_config(config),
+        in_chans=inference_depth_from_config(config),
         preprocessing="tifxyz_robust",
-        source="tifxyz_dataset/train.py",
+        source="koine_machines.training.train",
         amp_dtype=None,
     )
 
@@ -1036,70 +1148,23 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
         checkpoint_payload=checkpoint_payload,
         checkpoint_path=args.checkpoint,
     )
-    explicit_tifxyz = args.model_type == "tifxyz_unet"
-    auto_tifxyz = args.model_type in {"auto", "residual_unet"} and checkpoint_looks_like_tifxyz_training(checkpoint_payload)
-    if explicit_tifxyz or auto_tifxyz:
+    explicit_repo_model = args.model_type in {"tifxyz_unet", "residual_unet", "resnet3d"}
+    auto_repo_model = args.model_type == "auto" and checkpoint_looks_like_repo_training(checkpoint_payload)
+    if auto_repo_model or (
+        explicit_repo_model
+        and checkpoint_looks_like_repo_training(checkpoint_payload)
+    ):
         if args.metadata_json is not None:
-            LOGGER.info("Ignoring --metadata-json for tifxyz checkpoint %s", args.checkpoint)
-        configured_model = build_tifxyz_model_bundle(checkpoint_payload, args.checkpoint)
+            LOGGER.info(
+                "Ignoring --metadata-json for config-backed checkpoint %s; the model will be rebuilt from checkpoint['config'].",
+                args.checkpoint,
+            )
+        configured_model = build_repo_training_model_bundle(checkpoint_payload, args.checkpoint)
         configured_model.amp_dtype = resolved_amp_dtype
         return configured_model
-    if args.model_type == "auto":
-        raise ValueError(
-            "Could not infer a supported model type from the checkpoint. "
-            "Pass --model-type resnet3d, residual_unet, or tifxyz_unet explicitly."
-        )
-
-    from train_resnet3d_lib.config import CFG, apply_metadata_hyperparameters, load_metadata_json
-    from train_resnet3d_lib.model import RegressionPLModel
-
-    metadata = None
-    if args.metadata_json is not None:
-        metadata = load_metadata_json(str(args.metadata_json))
-        apply_metadata_hyperparameters(CFG, metadata)
-    elif args.model_type in {"residual_unet", "auto"}:
-        LOGGER.warning(
-            "No --metadata-json was provided for residual_unet. "
-            "This will only work if the default CFG matches the checkpoint architecture."
-        )
-
-    CFG.init_ckpt_path = str(args.checkpoint)
-    CFG.model_impl = "resnet3d_hybrid" if args.model_type == "resnet3d" else "vesuvius_resunet_hybrid"
-
-    model = RegressionPLModel(
-        size=int(getattr(CFG, "size", 256)),
-        norm=str(getattr(CFG, "norm", "batch")),
-        group_norm_groups=int(getattr(CFG, "group_norm_groups", 32)),
-        model_impl=str(getattr(CFG, "model_impl", "resnet3d_hybrid")),
-        vesuvius_model_config=getattr(CFG, "vesuvius_model_config", {}),
-        vesuvius_target_name=str(getattr(CFG, "vesuvius_target_name", "ink")),
-        vesuvius_z_projection_mode=str(getattr(CFG, "vesuvius_z_projection_mode", "logsumexp")),
-        vesuvius_z_projection_lse_tau=float(getattr(CFG, "vesuvius_z_projection_lse_tau", 1.0)),
-        vesuvius_z_projection_mlp_hidden=int(getattr(CFG, "vesuvius_z_projection_mlp_hidden", 64)),
-        vesuvius_z_projection_mlp_dropout=float(getattr(CFG, "vesuvius_z_projection_mlp_dropout", 0.0)),
-        vesuvius_z_projection_mlp_depth=int(
-            getattr(CFG, "vesuvius_z_projection_mlp_depth", None) or getattr(CFG, "in_chans", 1)
-        ),
-        n_groups=1,
-        group_names=["inference"],
-    )
-
-    state_dict = extract_state_dict_from_payload(checkpoint_payload, args.checkpoint)
-    incompat = model.load_state_dict(state_dict, strict=False)
-    LOGGER.info(
-        "Loaded checkpoint %s (missing_keys=%d unexpected_keys=%d)",
-        args.checkpoint,
-        len(incompat.missing_keys),
-        len(incompat.unexpected_keys),
-    )
-    model.eval()
-    return ConfiguredModel(
-        model=model,
-        roi_size=int(getattr(CFG, "size", 256)),
-        in_chans=int(getattr(CFG, "in_chans", 62)),
-        preprocessing="legacy_uint8",
-        source="train_resnet3d_lib",
-        amp_dtype=resolved_amp_dtype,
+    raise ValueError(
+        "Unsupported checkpoint format for infer.py after the refactor. "
+        "Expected checkpoint['config'] and checkpoint['model'] for a koine_machines training checkpoint."
     )
 
 
@@ -1398,11 +1463,10 @@ def infer_single_zarr(
         loader_kwargs["prefetch_factor"] = int(args.prefetch_factor)
     loader = DataLoader(**loader_kwargs)
     weight_mode = "constant" if float(args.overlap) == 0.0 else "gaussian"
-    weight_map = compute_importance_map(
+    weight_map = compute_importance_map_2d(
         patch_size=(patch_size, patch_size),
         mode=weight_mode,
         sigma_scale=0.125,
-        device="cpu",
     ).cpu().numpy().astype(np.float32, copy=False)
 
     temp_parent = Path(tempfile.mkdtemp(prefix="ome_zarr_infer_"))
