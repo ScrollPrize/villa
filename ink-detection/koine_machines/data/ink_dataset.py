@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 from torch.utils.data import Dataset
 import numpy as np 
+from scipy import ndimage
 from scipy.ndimage import distance_transform_edt
 from koine_machines.augmentation.translation import maybe_translate_normal_pooled_crop_bbox
 from koine_machines.common.common import (
@@ -222,44 +223,60 @@ def _project_valid_surface_mask_to_native_crop(patch_zyxs, valid_mask, crop_bbox
     return surface_distance_field.astype(np.float32, copy=False)
 
 
-def _project_supervised_crop_coverage(
-    support_patch_zyxs,
+def _filter_support_by_flat_seeded_component(
+    *,
+    support_bbox,
     support_valid,
     support_supervision_flat_patch,
-    crop_bbox,
+    patch_bbox,
+    max_grid_distance=None,
 ):
-    return _project_flat_patch_to_native_crop(
-        (np.asarray(support_supervision_flat_patch) > 0).astype(np.uint8, copy=False),
-        support_patch_zyxs,
+    support_valid = np.asarray(support_valid, dtype=bool)
+    if not np.any(support_valid):
+        return support_valid
+
+    support_y0, support_y1, support_x0, support_x1 = (int(v) for v in support_bbox)
+    patch_y0, patch_y1, patch_x0, patch_x1 = (
+        int(patch_bbox[1]),
+        int(patch_bbox[4]),
+        int(patch_bbox[2]),
+        int(patch_bbox[5]),
+    )
+
+    row0 = max(0, patch_y0 - support_y0)
+    row1 = min(support_y1 - support_y0, patch_y1 - support_y0)
+    col0 = max(0, patch_x0 - support_x0)
+    col1 = min(support_x1 - support_x0, patch_x1 - support_x0)
+
+    seed_mask = np.zeros_like(support_valid, dtype=bool)
+    if row1 > row0 and col1 > col0:
+        seed_mask[row0:row1, col0:col1] = (
+            np.asarray(support_supervision_flat_patch)[row0:row1, col0:col1] > 0
+        )
+    seed_mask &= support_valid
+
+    if not np.any(seed_mask):
+        seed_mask = (np.asarray(support_supervision_flat_patch) > 0) & support_valid
+    if not np.any(seed_mask):
+        return support_valid
+
+    labeled_components, _ = ndimage.label(
         support_valid,
-        crop_bbox,
-    ) > 0
-
-
-def _supervised_crop_coverage_is_preserved(
-    *,
-    support_patch_zyxs,
-    support_supervision_flat_patch,
-    crop_bbox,
-    before_valid,
-    after_valid,
-):
-    before_coverage = _project_supervised_crop_coverage(
-        support_patch_zyxs,
-        before_valid,
-        support_supervision_flat_patch,
-        crop_bbox,
+        structure=np.ones((3, 3), dtype=np.uint8),
     )
-    if not np.any(before_coverage):
-        return True
+    kept_component_ids = np.unique(labeled_components[seed_mask])
+    kept_component_ids = kept_component_ids[kept_component_ids > 0]
+    if kept_component_ids.size == 0:
+        return support_valid
 
-    after_coverage = _project_supervised_crop_coverage(
-        support_patch_zyxs,
-        after_valid,
-        support_supervision_flat_patch,
-        crop_bbox,
-    )
-    return not np.any(before_coverage & ~after_coverage)
+    filtered_valid = np.isin(labeled_components, kept_component_ids)
+    if max_grid_distance is not None:
+        filtered_valid &= _filter_support_by_2d_distance_from_supervision(
+            filtered_valid,
+            seed_mask.astype(np.uint8, copy=False),
+            max_grid_distance=max_grid_distance,
+        )
+    return filtered_valid
 
 
 def _tighten_support_window(
@@ -364,6 +381,7 @@ def _filter_support_components_by_active_supervision(
     support_inklabels_flat_patch,
     support_supervision_flat_patch,
     crop_bbox,
+    patch_bbox,
     max_supervision_grid_distance=None,
 ):
     support_valid = np.asarray(support_valid, dtype=bool)
@@ -466,20 +484,13 @@ def _filter_support_components_by_active_supervision(
 
     filtered_valid = np.zeros_like(support_valid, dtype=bool)
     filtered_valid[row_indices[keep_flat], col_indices[keep_flat]] = True
-    if max_supervision_grid_distance is not None:
-        distance_filtered_valid = _filter_support_by_2d_distance_from_supervision(
-            filtered_valid,
-            support_supervision_flat_patch,
-            max_grid_distance=max_supervision_grid_distance,
-        )
-        if _supervised_crop_coverage_is_preserved(
-            support_patch_zyxs=support_patch_zyxs,
-            support_supervision_flat_patch=support_supervision_flat_patch,
-            crop_bbox=crop_bbox,
-            before_valid=filtered_valid,
-            after_valid=distance_filtered_valid,
-        ):
-            filtered_valid = distance_filtered_valid
+    filtered_valid = _filter_support_by_flat_seeded_component(
+        support_bbox=support_bbox,
+        support_valid=filtered_valid,
+        support_supervision_flat_patch=support_supervision_flat_patch,
+        patch_bbox=patch_bbox,
+        max_grid_distance=max_supervision_grid_distance,
+    )
     return _tighten_support_window(
         support_bbox,
         support_patch_zyxs,
@@ -778,6 +789,7 @@ class InkDataset(Dataset):
                             support_inklabels_flat_patch=support_inklabels_flat_patch,
                             support_supervision_flat_patch=support_supervision_flat_patch,
                             crop_bbox=crop_bbox,
+                            patch_bbox=patch.bbox,
                             max_supervision_grid_distance=max_support_grid_distance,
                         )
                         (
