@@ -486,8 +486,6 @@ class TifxyzReader:
         y[invalid] = -1.0
         z[invalid] = -1.0
 
-        labels = self.discover_labels(expected_shape=x.shape)
-
         return Tifxyz(
             _x=x,
             _y=y,
@@ -499,7 +497,7 @@ class TifxyzReader:
             extra=meta["extra"],
             _mask=mask,
             path=self.path,
-            _labels=labels,
+            _labels_loaded=False,
         )
 
     def list_extra_channels(self) -> list[str]:
