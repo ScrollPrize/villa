@@ -36,6 +36,8 @@ vesuvius/AGENTS.md
 /vesuvius/src/vesuvius/neural_tracing/tests/test_band_filtering
 
 build/
+!vesuvius/src/vesuvius/models/build/
+!vesuvius/src/vesuvius/models/build/**
 *.log
 /ink-detection/tifxyz_dataset/wandb
 /ink-detection/scratch/
