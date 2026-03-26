@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 import wandb
 
+from koine_machines.training.normal_pooling import local_points_zyx_to_normalized_grid
+
 
 def to_uint8_image(image_2d):
     image_2d = np.nan_to_num(np.asarray(image_2d, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
@@ -44,27 +46,59 @@ def to_uint8_probability(probability_2d, lower_percentile=1.0, upper_percentile=
     return np.clip(np.rint(probability_2d * 255.0), 0, 255).astype(np.uint8)
 
 
+def _pad_image_bottom_right(image_2d, *, target_height=None, target_width=None):
+    image_2d = np.asarray(image_2d, dtype=np.uint8)
+    height, width = image_2d.shape
+    if target_height is None:
+        target_height = height
+    if target_width is None:
+        target_width = width
+    pad_h = max(0, int(target_height) - height)
+    pad_w = max(0, int(target_width) - width)
+    if pad_h == 0 and pad_w == 0:
+        return image_2d
+    return np.pad(image_2d, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=0)
+
+
+def stack_preview_tiles(tiles, gap_size=4):
+    if not tiles:
+        return None
+
+    max_width = max(int(tile.shape[1]) for tile in tiles)
+    stacked_tiles = []
+    row_gap = np.zeros((gap_size, max_width), dtype=np.uint8)
+    for tile_idx, tile in enumerate(tiles):
+        padded_tile = _pad_image_bottom_right(tile, target_width=max_width)
+        if tile_idx > 0:
+            stacked_tiles.append(row_gap)
+        stacked_tiles.append(padded_tile)
+    return np.concatenate(stacked_tiles, axis=0)
+
+
+def build_panel_grid(rows, gap_size=4):
+    row_tiles = []
+    for row in rows:
+        if not row:
+            continue
+        row_height = max(int(tile.shape[0]) for tile in row)
+        padded_row_tiles = []
+        for tile_idx, tile in enumerate(row):
+            padded_row_tiles.append(_pad_image_bottom_right(tile, target_height=row_height))
+            if tile_idx + 1 < len(row):
+                padded_row_tiles.append(np.zeros((row_height, gap_size), dtype=np.uint8))
+        row_tiles.append(np.concatenate(padded_row_tiles, axis=1))
+    return stack_preview_tiles(row_tiles, gap_size=gap_size)
+
+
 def build_preview_montage(input_tiles, label_tiles, probability_tiles, gap_size=4):
     if not input_tiles:
         return None
 
-    rows = []
-    for input_tile, label_tile, probability_tile in zip(input_tiles, label_tiles, probability_tiles):
-        column_gap = np.zeros((input_tile.shape[0], gap_size), dtype=np.uint8)
-        rows.append(
-            np.concatenate(
-                [input_tile, column_gap, label_tile, column_gap, probability_tile],
-                axis=1,
-            )
-        )
-
-    row_gap = np.zeros((gap_size, rows[0].shape[1]), dtype=np.uint8)
-    montage = []
-    for row_idx, row in enumerate(rows):
-        if row_idx > 0:
-            montage.append(row_gap)
-        montage.append(row)
-    return np.concatenate(montage, axis=0)
+    sample_tiles = [
+        build_panel_grid([[input_tile, label_tile, probability_tile]], gap_size=gap_size)
+        for input_tile, label_tile, probability_tile in zip(input_tiles, label_tiles, probability_tiles)
+    ]
+    return stack_preview_tiles(sample_tiles, gap_size=gap_size)
 
 
 def save_val_preview_tif(output_path, input_tiles, label_tiles, probability_tiles, gap_size=4):
@@ -83,13 +117,12 @@ def save_val_preview_tif(output_path, input_tiles, label_tiles, probability_tile
 class PreviewAccumulator:
     accelerator: object
     get_model_input: Callable[[dict], torch.Tensor]
-    inputs: list[np.ndarray] = field(default_factory=list)
-    labels: list[np.ndarray] = field(default_factory=list)
-    probabilities: list[np.ndarray] = field(default_factory=list)
+    sample_tiles: list[np.ndarray] = field(default_factory=list)
+    gap_size: int = 4
 
-    def add_batch(self, batch, preds, targets, ignore_mask):
+    def _add_standard_batch(self, batch, preds, targets, ignore_mask):
         input_batch = self.get_model_input(batch)
-        input_mid_slice = input_batch[:, :, input_batch.shape[2] // 2]
+        input_mid_slice = input_batch[:, :1, input_batch.shape[2] // 2]
         if input_mid_slice.shape[-2:] != preds.shape[-2:]:
             input_mid_slice = F.interpolate(
                 input_mid_slice,
@@ -117,17 +150,127 @@ class PreviewAccumulator:
             ignore_mask_tiles,
             probability_tiles,
         ):
-            self.inputs.append(to_uint8_image(input_tile))
-            self.labels.append(to_uint8_label(label_tile, ignore_mask_tile))
-            self.probabilities.append(to_uint8_probability(probability_tile))
+            sample_tile = build_panel_grid(
+                [
+                    [
+                        to_uint8_image(input_tile),
+                        to_uint8_label(label_tile, ignore_mask_tile),
+                        to_uint8_probability(probability_tile),
+                    ]
+                ],
+                gap_size=self.gap_size,
+            )
+            if sample_tile is not None:
+                self.sample_tiles.append(sample_tile)
+
+    def _sample_flat_crop(self, image_batch, batch):
+        flat_points_local_zyx = batch["flat_points_local_zyx"].to(
+            device=image_batch.device,
+            dtype=image_batch.dtype,
+        )
+        flat_grid = local_points_zyx_to_normalized_grid(
+            flat_points_local_zyx,
+            image_batch.shape[-3:],
+            align_corners=True,
+        ).unsqueeze(1)
+        flat_crop = F.grid_sample(
+            image_batch,
+            flat_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        ).squeeze(2)
+        flat_valid = batch["flat_valid"].to(device=image_batch.device) > 0
+        if flat_valid.ndim == 3:
+            flat_valid = flat_valid.unsqueeze(1)
+        return torch.where(flat_valid, flat_crop, torch.zeros_like(flat_crop))
+
+    def _add_normal_pooled_batch(self, batch, pooled_logits, volume_logits):
+        image_batch = batch["image"].float()
+        if image_batch.ndim == 4:
+            image_batch = image_batch.unsqueeze(1)
+        if image_batch.ndim != 5:
+            raise ValueError(f"Expected 'image' with shape [B, 1, Z, Y, X], got {tuple(image_batch.shape)}")
+
+        if volume_logits is None:
+            raise ValueError("normal pooled previews require raw volume logits")
+        volume_logits = volume_logits.float()
+        if volume_logits.ndim != 5:
+            raise ValueError(
+                f"Expected raw volume_logits with shape [B, 1, Z, Y, X], got {tuple(volume_logits.shape)}"
+            )
+        if tuple(int(v) for v in volume_logits.shape[-3:]) != tuple(int(v) for v in image_batch.shape[-3:]):
+            volume_logits = F.interpolate(
+                volume_logits,
+                size=image_batch.shape[-3:],
+                mode="trilinear",
+                align_corners=True,
+            )
+
+        pooled_logits = pooled_logits.float()
+        if pooled_logits.ndim == 3:
+            pooled_logits = pooled_logits.unsqueeze(1)
+        if pooled_logits.ndim != 4:
+            raise ValueError(
+                f"Expected pooled_logits with shape [B, 1, H, W] or [B, H, W], got {tuple(pooled_logits.shape)}"
+            )
+
+        flat_crop = self._sample_flat_crop(image_batch, batch)
+        mid_slice_idx = int(image_batch.shape[2] // 2)
+        volume_crop_mid = image_batch[:, :1, mid_slice_idx]
+        volume_logits_mid = volume_logits[:, :1, mid_slice_idx]
+
+        gathered_volume_logits = self.accelerator.gather_for_metrics(volume_logits_mid)
+        gathered_volume_crops = self.accelerator.gather_for_metrics(volume_crop_mid)
+        gathered_pooled_logits = self.accelerator.gather_for_metrics(pooled_logits)
+        gathered_flat_crops = self.accelerator.gather_for_metrics(flat_crop)
+
+        if not self.accelerator.is_main_process:
+            return
+
+        volume_logit_tiles = gathered_volume_logits[:, 0].detach().cpu().numpy()
+        volume_crop_tiles = gathered_volume_crops[:, 0].detach().cpu().numpy()
+        pooled_logit_tiles = gathered_pooled_logits[:, 0].detach().cpu().numpy()
+        flat_crop_tiles = gathered_flat_crops[:, 0].detach().cpu().numpy()
+
+        for volume_logit_tile, volume_crop_tile, pooled_logit_tile, flat_crop_tile in zip(
+            volume_logit_tiles,
+            volume_crop_tiles,
+            pooled_logit_tiles,
+            flat_crop_tiles,
+        ):
+            sample_tile = build_panel_grid(
+                [
+                    [
+                        to_uint8_image(volume_logit_tile),
+                        to_uint8_image(volume_crop_tile),
+                    ],
+                    [
+                        to_uint8_image(pooled_logit_tile),
+                        to_uint8_image(flat_crop_tile),
+                    ],
+                ],
+                gap_size=self.gap_size,
+            )
+            if sample_tile is not None:
+                self.sample_tiles.append(sample_tile)
+
+    def add_batch(self, batch, preds, targets, ignore_mask, *, volume_logits=None):
+        if "flat_points_local_zyx" in batch and "flat_valid" in batch:
+            self._add_normal_pooled_batch(batch, preds, volume_logits)
+            return
+        self._add_standard_batch(batch, preds, targets, ignore_mask)
 
     def montage(self):
-        return build_preview_montage(self.inputs, self.labels, self.probabilities)
+        return stack_preview_tiles(self.sample_tiles, gap_size=self.gap_size)
 
     def save(self, output_path):
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        save_val_preview_tif(str(output_path), self.inputs, self.labels, self.probabilities)
+        montage = self.montage()
+        if montage is None:
+            return
+        tifffile.imwrite(str(output_path), montage, compression="lzw")
 
     def wandb_image(self, caption):
         montage = self.montage()
