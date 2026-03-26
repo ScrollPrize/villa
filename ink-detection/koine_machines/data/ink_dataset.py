@@ -1,4 +1,7 @@
 import json
+import time
+from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 import random
 from tqdm import tqdm
@@ -27,6 +30,27 @@ from koine_machines.data.normal_pooled_sample import (
 )
 from koine_machines.data.native_crop import compute_native_crop_bbox_from_patch_points
 from koine_machines.data.segment import Segment
+
+
+class DatasetSampleProfiler:
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.section_totals = defaultdict(float)
+
+    @contextmanager
+    def section(self, name: str):
+        if not self.enabled:
+            yield
+            return
+
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.section_totals[name] += time.perf_counter() - start
+
+    def as_dict(self) -> dict[str, float]:
+        return dict(self.section_totals)
 
 def _read_flat_surface_patch(volume, *, y0, y1, x0, x1):
     surface = int(volume.shape[0] // 2)
@@ -72,6 +96,8 @@ def _select_flat_pixels_for_native_crop_via_stored_resolution(
     crop_bbox,
     *,
     coarse_native_pad=20,
+    coarse_patch_zyxs=None,
+    coarse_valid=None,
 ):
     coarse_native_pad = int(coarse_native_pad)
     coarse_crop_bbox = (
@@ -83,12 +109,20 @@ def _select_flat_pixels_for_native_crop_via_stored_resolution(
         int(crop_bbox[5]) + coarse_native_pad,
     )
 
-    coarse_patch_zyxs = np.asarray(
-        patch_tifxyz.get_zyxs(stored_resolution=True),
-        dtype=np.float32,
-    )
-    coarse_valid = np.isfinite(coarse_patch_zyxs).all(axis=-1)
-    coarse_valid &= (coarse_patch_zyxs >= 0).all(axis=-1)
+    if coarse_patch_zyxs is None:
+        coarse_patch_zyxs = np.asarray(
+            patch_tifxyz.get_zyxs(stored_resolution=True),
+            dtype=np.float32,
+        )
+    else:
+        coarse_patch_zyxs = np.asarray(coarse_patch_zyxs, dtype=np.float32)
+
+    if coarse_valid is None:
+        coarse_valid = np.isfinite(coarse_patch_zyxs).all(axis=-1)
+        coarse_valid &= (coarse_patch_zyxs >= 0).all(axis=-1)
+    else:
+        coarse_valid = np.asarray(coarse_valid, dtype=bool)
+
     (coarse_y0, coarse_y1, coarse_x0, coarse_x1), _, _ = _select_flat_pixels_for_native_crop(
         coarse_patch_zyxs,
         coarse_valid,
@@ -191,6 +225,12 @@ class InkDataset(Dataset):
         self.input_channels   = 1 + int(self.mode == "normal_pooled_3d")
         self.training_patches = []
         self.validation_patches = []
+        self.profile_enabled  = bool(config.get('profile_dataset', False))
+        self.profile_section_totals = defaultdict(float)
+        self.profile_sample_count = 0
+        self._zarr_cache = {}
+        self._tifxyz_cache = {}
+        self._stored_resolution_zyx_cache = {}
   
 
         if self.do_augmentations:
@@ -258,6 +298,56 @@ class InkDataset(Dataset):
             self.training_patches = [patch for patch in self.patches if not getattr(patch, 'is_validation', False)]
             self.validation_patches = [patch for patch in self.patches if getattr(patch, 'is_validation', False)]
 
+    def _record_profile_timings(self, profile_timings: dict[str, float]):
+        if not self.profile_enabled:
+            return
+        self.profile_sample_count += 1
+        for name, duration_seconds in profile_timings.items():
+            self.profile_section_totals[name] += float(duration_seconds)
+
+    def profile_summary_lines(self) -> list[str]:
+        if not self.profile_enabled or self.profile_sample_count == 0:
+            return []
+
+        lines = [f"[profile] dataset timings across {self.profile_sample_count} samples"]
+        for name, total_seconds in sorted(self.profile_section_totals.items(), key=lambda item: item[1], reverse=True):
+            avg_ms = (total_seconds / self.profile_sample_count) * 1000.0
+            lines.append(f"[profile] {name}: total={total_seconds:.6f}s avg_sample={avg_ms:.3f}ms")
+        return lines
+
+    def _get_cached_zarr(self, path, *, resolution):
+        cache_key = (str(path), str(resolution), str(self.vol_auth))
+        volume = self._zarr_cache.get(cache_key)
+        if volume is None:
+            volume = open_zarr(path, resolution=resolution, auth=self.vol_auth)
+            self._zarr_cache[cache_key] = volume
+        return volume
+
+    def _get_cached_tifxyz(self, segment_dir):
+        cache_key = str(segment_dir)
+        patch_tifxyz = self._tifxyz_cache.get(cache_key)
+        if patch_tifxyz is None:
+            patch_tifxyz = tifxyz.read_tifxyz(segment_dir)
+            patch_tifxyz.use_full_resolution()
+            self._tifxyz_cache[cache_key] = patch_tifxyz
+        return patch_tifxyz
+
+    def _get_cached_stored_resolution_zyxs(self, segment_dir, *, patch_tifxyz=None):
+        cache_key = str(segment_dir)
+        cached = self._stored_resolution_zyx_cache.get(cache_key)
+        if cached is None:
+            if patch_tifxyz is None:
+                patch_tifxyz = self._get_cached_tifxyz(segment_dir)
+            coarse_patch_zyxs = np.asarray(
+                patch_tifxyz.get_zyxs(stored_resolution=True),
+                dtype=np.float32,
+            )
+            coarse_valid = np.isfinite(coarse_patch_zyxs).all(axis=-1)
+            coarse_valid &= (coarse_patch_zyxs >= 0).all(axis=-1)
+            cached = (coarse_patch_zyxs, coarse_valid)
+            self._stored_resolution_zyx_cache[cache_key] = cached
+        return cached
+
     def _gather_segments(self):
         for dataset_idx, ds in enumerate(self.datasets):
 
@@ -301,128 +391,159 @@ class InkDataset(Dataset):
     
     def __getitem__(self, idx):
         patch = self.patches[idx]
+        sample_profiler = DatasetSampleProfiler(self.profile_enabled)
         z0, y0, x0, z1, y1, x1 = patch.bbox
         expected_shape = tuple(int(v) for v in self.patch_size)
         crop_bbox = patch.bbox
         use_surface_mask = self.mode == "normal_pooled_3d"
         surface_mask = None
         normal_pooled_metadata = None
-    
-        if self.mode == "normal_pooled_3d":
-            image_vol = open_zarr(patch.image_volume, resolution=patch.segment.scale, auth=self.vol_auth)
-            supervision_mask = open_zarr(patch.supervision_mask, resolution=patch.segment.scale, auth=self.vol_auth)
-            inklabels = open_zarr(patch.inklabels, resolution=patch.segment.scale, auth=self.vol_auth)
 
-            patch_tifxyz = tifxyz.read_tifxyz(patch.segment_dir)
-            patch_tifxyz.use_full_resolution()
-            flat_x, flat_y, flat_z, flat_valid = patch_tifxyz[y0:y1, x0:x1]
-            patch_zyxs = np.stack([flat_z, flat_y, flat_x], axis=-1)
-            crop_bbox = compute_native_crop_bbox_from_patch_points(
-                patch_zyxs,
-                flat_valid,
-                expected_shape,
-            )
-            supervision_flat_patch = _read_flat_surface_patch(supervision_mask, y0=y0, y1=y1, x0=x0, x1=x1)
-            if self.do_augmentations:
-                crop_bbox = maybe_translate_normal_pooled_crop_bbox(
-                    crop_bbox,
-                    patch_zyxs,
-                    flat_valid,
-                    supervision_flat_patch,
-                )
-            (support_y0, support_y1, support_x0, support_x1), support_patch_zyxs, support_valid = _select_flat_pixels_for_native_crop_via_stored_resolution(
-                patch_tifxyz,
-                crop_bbox,
-            )
-            support_supervision_flat_patch = _read_flat_surface_patch(
-                supervision_mask,
-                y0=support_y0,
-                y1=support_y1,
-                x0=support_x0,
-                x1=support_x1,
-            )
-            support_inklabels_flat_patch = _read_flat_surface_patch(
-                inklabels,
-                y0=support_y0,
-                y1=support_y1,
-                x0=support_x0,
-                x1=support_x1,
-            )
-            image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, crop_bbox, fill_value=0)
-            surface_mask = _project_valid_surface_mask_to_native_crop(
-                support_patch_zyxs,
-                support_valid,
-                crop_bbox,
-            )
-            normal_pooled_metadata = _build_normal_pooled_flat_metadata(
-                patch_tifxyz=patch_tifxyz,
-                support_bbox=(support_y0, support_y1, support_x0, support_x1),
-                support_patch_zyxs=support_patch_zyxs,
-                support_valid=support_valid,
-                support_inklabels_flat_patch=support_inklabels_flat_patch,
-                support_supervision_flat_patch=support_supervision_flat_patch,
-                crop_bbox=crop_bbox,
-            )
-            
-        else:
-            image_vol = open_zarr(patch.image_volume, resolution=patch.segment.scale, auth=self.vol_auth)
-            supervision_mask = open_zarr(patch.supervision_mask, resolution=patch.segment.scale, auth=self.vol_auth)
-            inklabels = open_zarr(patch.inklabels, resolution=patch.segment.scale, auth=self.vol_auth)
-            image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, patch.bbox, fill_value=0)
-            supervision_crop, _ = _read_bbox_with_padding(supervision_mask,patch.bbox, fill_value=0)
-            inklabels_crop, _ = _read_bbox_with_padding(inklabels, patch.bbox, fill_value=0)
-
-        
-        image_crop = image_crop.astype(np.float32, copy=False)
-        if image_valid_slices is not None:
-            image_crop[image_valid_slices] = normalize_robust(image_crop[image_valid_slices])
-
-        arrays_to_validate = [("image", image_crop)]
-        if self.mode != "normal_pooled_3d":
-            arrays_to_validate.extend(
-                [
-                    ("supervision_mask", supervision_crop),
-                    ("inklabels", inklabels_crop),
-                ]
-            )
-        for name, array in arrays_to_validate:
-            if tuple(int(v) for v in array.shape) != expected_shape:
-                raise AssertionError(
-                    f"{name} crop shape {tuple(int(v) for v in array.shape)} does not match "
-                    f"requested patch size {expected_shape} for bbox {crop_bbox!r}"
-                )
-
-
-        image_crop = torch.from_numpy(image_crop).float().unsqueeze(0)
-        data = {'image': image_crop}
-
-        if self.mode == "normal_pooled_3d":
-            assert normal_pooled_metadata is not None
-            data.update(normal_pooled_metadata)
-        else:
-            inklabels_crop = torch.from_numpy(inklabels_crop).float().unsqueeze(0)
-            supervision_crop = torch.from_numpy(supervision_crop).float().unsqueeze(0)
-            data.update({
-                'inklabels': inklabels_crop,
-                'supervision_mask': supervision_crop,
-            })
-
-        if use_surface_mask and surface_mask is not None:
-            data['surface_mask'] = torch.from_numpy(surface_mask).float().unsqueeze(0)
-
-        if self.do_augmentations and self.augmentations is not None:  
+        with sample_profiler.section('dataset/total'):
             if self.mode == "normal_pooled_3d":
-                augmentation_data, flat_valid_mask = _pack_normal_pooled_augmentation_data(data)
-                augmented = self.augmentations(**augmentation_data)
-                return _restore_normal_pooled_augmentation_data(augmented, data, flat_valid_mask)
-            augmented = self.augmentations(**data)
-            return augmented
-        
-        return data
+                with sample_profiler.section('dataset/get_cached_inputs'):
+                    image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
+                    supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
+                    inklabels = self._get_cached_zarr(patch.inklabels, resolution=patch.segment.scale)
+                    patch_tifxyz = self._get_cached_tifxyz(patch.segment_dir)
+                    coarse_patch_zyxs, coarse_valid = self._get_cached_stored_resolution_zyxs(
+                        patch.segment_dir,
+                        patch_tifxyz=patch_tifxyz,
+                    )
+                with sample_profiler.section('dataset/read_patch_tifxyz'):
+                    flat_x, flat_y, flat_z, flat_valid = patch_tifxyz[y0:y1, x0:x1]
+                    patch_zyxs = np.stack([flat_z, flat_y, flat_x], axis=-1)
+                with sample_profiler.section('dataset/compute_crop_bbox'):
+                    crop_bbox = compute_native_crop_bbox_from_patch_points(
+                        patch_zyxs,
+                        flat_valid,
+                        expected_shape,
+                    )
+                with sample_profiler.section('dataset/read_seed_supervision'):
+                    supervision_flat_patch = _read_flat_surface_patch(
+                        supervision_mask,
+                        y0=y0,
+                        y1=y1,
+                        x0=x0,
+                        x1=x1,
+                    )
+                if self.do_augmentations:
+                    with sample_profiler.section('dataset/translate_crop_bbox'):
+                        crop_bbox = maybe_translate_normal_pooled_crop_bbox(
+                            crop_bbox,
+                            patch_zyxs,
+                            flat_valid,
+                            supervision_flat_patch,
+                        )
+                with sample_profiler.section('dataset/select_support_window'):
+                    (support_y0, support_y1, support_x0, support_x1), support_patch_zyxs, support_valid = _select_flat_pixels_for_native_crop_via_stored_resolution(
+                        patch_tifxyz,
+                        crop_bbox,
+                        coarse_patch_zyxs=coarse_patch_zyxs,
+                        coarse_valid=coarse_valid,
+                    )
+                with sample_profiler.section('dataset/read_support_labels'):
+                    support_supervision_flat_patch = _read_flat_surface_patch(
+                        supervision_mask,
+                        y0=support_y0,
+                        y1=support_y1,
+                        x0=support_x0,
+                        x1=support_x1,
+                    )
+                    support_inklabels_flat_patch = _read_flat_surface_patch(
+                        inklabels,
+                        y0=support_y0,
+                        y1=support_y1,
+                        x0=support_x0,
+                        x1=support_x1,
+                    )
+                with sample_profiler.section('dataset/read_image_crop'):
+                    image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, crop_bbox, fill_value=0)
+                with sample_profiler.section('dataset/project_surface_mask'):
+                    surface_mask = _project_valid_surface_mask_to_native_crop(
+                        support_patch_zyxs,
+                        support_valid,
+                        crop_bbox,
+                    )
+                with sample_profiler.section('dataset/build_metadata'):
+                    normal_pooled_metadata = _build_normal_pooled_flat_metadata(
+                        patch_tifxyz=patch_tifxyz,
+                        support_bbox=(support_y0, support_y1, support_x0, support_x1),
+                        support_patch_zyxs=support_patch_zyxs,
+                        support_valid=support_valid,
+                        support_inklabels_flat_patch=support_inklabels_flat_patch,
+                        support_supervision_flat_patch=support_supervision_flat_patch,
+                        crop_bbox=crop_bbox,
+                    )
+            else:
+                with sample_profiler.section('dataset/get_cached_inputs'):
+                    image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
+                    supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
+                    inklabels = self._get_cached_zarr(patch.inklabels, resolution=patch.segment.scale)
+                with sample_profiler.section('dataset/read_supervised_crops'):
+                    image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, patch.bbox, fill_value=0)
+                    supervision_crop, _ = _read_bbox_with_padding(supervision_mask, patch.bbox, fill_value=0)
+                    inklabels_crop, _ = _read_bbox_with_padding(inklabels, patch.bbox, fill_value=0)
+
+            with sample_profiler.section('dataset/normalize_image'):
+                image_crop = image_crop.astype(np.float32, copy=False)
+                if image_valid_slices is not None:
+                    image_crop[image_valid_slices] = normalize_robust(image_crop[image_valid_slices])
+
+            arrays_to_validate = [("image", image_crop)]
+            if self.mode != "normal_pooled_3d":
+                arrays_to_validate.extend(
+                    [
+                        ("supervision_mask", supervision_crop),
+                        ("inklabels", inklabels_crop),
+                    ]
+                )
+            with sample_profiler.section('dataset/validate_shapes'):
+                for name, array in arrays_to_validate:
+                    if tuple(int(v) for v in array.shape) != expected_shape:
+                        raise AssertionError(
+                            f"{name} crop shape {tuple(int(v) for v in array.shape)} does not match "
+                            f"requested patch size {expected_shape} for bbox {crop_bbox!r}"
+                        )
+
+            with sample_profiler.section('dataset/to_torch'):
+                image_crop = torch.from_numpy(image_crop).float().unsqueeze(0)
+                data = {'image': image_crop}
+
+                if self.mode == "normal_pooled_3d":
+                    assert normal_pooled_metadata is not None
+                    data.update(normal_pooled_metadata)
+                else:
+                    inklabels_crop = torch.from_numpy(inklabels_crop).float().unsqueeze(0)
+                    supervision_crop = torch.from_numpy(supervision_crop).float().unsqueeze(0)
+                    data.update({
+                        'inklabels': inklabels_crop,
+                        'supervision_mask': supervision_crop,
+                    })
+
+                if use_surface_mask and surface_mask is not None:
+                    data['surface_mask'] = torch.from_numpy(surface_mask).float().unsqueeze(0)
+
+            if self.do_augmentations and self.augmentations is not None:
+                with sample_profiler.section('dataset/augment'):
+                    if self.mode == "normal_pooled_3d":
+                        augmentation_data, flat_valid_mask = _pack_normal_pooled_augmentation_data(data)
+                        augmented = self.augmentations(**augmentation_data)
+                        result = _restore_normal_pooled_augmentation_data(augmented, data, flat_valid_mask)
+                    else:
+                        result = self.augmentations(**data)
+            else:
+                result = data
+
+        profile_timings = sample_profiler.as_dict()
+        self._record_profile_timings(profile_timings)
+        if self.profile_enabled:
+            result = dict(result)
+            result['profile_timings'] = profile_timings
+        return result
 
 if __name__ == "__main__":
     import argparse
-    import time
     from qtpy.QtWidgets import QPushButton
 
     parser = argparse.ArgumentParser(description="Visualize an InkDataset sample in napari.")
@@ -437,6 +558,7 @@ if __name__ == "__main__":
 
     with open(args.config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
+    config['profile_dataset'] = args.profile is not None
 
     ds = InkDataset(config, do_augmentations=False)
     if args.profile is not None:
@@ -446,6 +568,8 @@ if __name__ == "__main__":
             _ = ds[index]
         elapsed = time.perf_counter() - start
         print(f"Profiled {num_samples} samples in {elapsed:.3f}s")
+        for line in ds.profile_summary_lines():
+            print(line)
         raise SystemExit(0)
 
     import napari
