@@ -27,7 +27,10 @@ from koine_machines.models.load_checkpoint import load_training_checkpoint_from_
 from koine_machines.evaluation.metrics.balanced_accuracy import BalancedAccuracy
 from koine_machines.evaluation.metrics.confusion import Confusion, ConfusionCounts
 from koine_machines.training.normal_pooling import collate_normal_pooled_batch, pool_logits_along_normals
-from koine_machines.training.profiling import NormalPoolingProfiler
+from koine_machines.training.profiling import (
+    NormalPoolingProfiler,
+    _BackwardProfileMarkers,
+)
 from koine_machines.training.visualization import PreviewAccumulator, build_validation_preview_log
 from koine_machines.training.loss.losses import create_loss_from_config
 from koine_machines.training.stitching import resolve_model_and_loader_patch_sizes, run_model_forward
@@ -41,7 +44,6 @@ class ValidationMetricBatch:
 
     def require_targets(self):
         return self.targets
-
 
 def _disable_z_projection_for_normal_pooled_3d(config):
     if str(config.get('mode', 'flat')).strip().lower() != 'normal_pooled_3d':
@@ -87,7 +89,6 @@ def _record_dataset_profile_batch(profiler, batch):
     for name, durations in grouped.items():
         if durations:
             profiler.add_duration(name, sum(durations) / len(durations))
-
 
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
@@ -453,9 +454,21 @@ def train(config_path, profile_steps):
                 l = loss(loss_preds.float(), targets_with_ignore.float())
             if not torch.isfinite(l):
                 raise RuntimeError(f"Non-finite loss at step {step}")
-            backward_section = normal_pooling_profiler.section('normal_pooling/backward', preds.device) if normal_pooling_profiler.enabled else nullcontext()
-            with backward_section:
-                accelerator.backward(l)
+            backward_markers = _BackwardProfileMarkers.create(
+                normal_pooling_profiler if normal_pooling_profiler.enabled else None,
+                preds=preds,
+                loss_preds=loss_preds,
+            )
+            if backward_markers is None:
+                backward_section = normal_pooling_profiler.section('train/backward_total', preds.device) if normal_pooling_profiler.enabled else nullcontext()
+                with backward_section:
+                    accelerator.backward(l)
+            else:
+                backward_markers.start()
+                try:
+                    accelerator.backward(l)
+                finally:
+                    backward_markers.finish()
             optimizer_section = normal_pooling_profiler.section('train/optimizer_step', accelerator.device) if normal_pooling_profiler.enabled else nullcontext()
             with optimizer_section:
                 if grad_clip is not None and grad_clip > 0 and accelerator.sync_gradients:
