@@ -13,8 +13,12 @@ from tqdm.auto import tqdm
 
 import aiohttp
 import fsspec
+import vesuvius.tifxyz as tifxyz
 
-from tifxyz_dataset.common import load_volume_auth, open_zarr
+from koine_machines.common.common import load_volume_auth, open_zarr
+from koine_machines.data.patch_finding import build_patch_index, resolve_patch_finding_type
+from koine_machines.data.native_crop import compute_native_crop_bbox_from_patch_points
+from koine_machines.data.segment import Segment
 
 
 DEFAULT_PATCH_SIZE_ZYX = (512, 512, 512)
@@ -97,43 +101,6 @@ def compressor_from_recompress_preset(preset: str):
     raise ValueError(f"Unsupported recompress preset: {preset!r}")
 
 
-def _build_patch_generation_stats() -> dict[str, int]:
-    return {
-        "segments_considered": 0,
-        "segments_tried": 0,
-        "segments_missing_ink": 0,
-        "segments_without_points": 0,
-        "segments_without_labels": 0,
-        "segments_without_positive_points": 0,
-        "candidate_bboxes": 0,
-        "rejected_without_points": 0,
-        "rejected_without_positive": 0,
-        "kept_patches": 0,
-        "cache_hits": 0,
-    }
-
-
-def _segment_records_for_patch_filter(
-    segment_records: Iterable[dict],
-    *,
-    patch_filter: str,
-) -> list[dict]:
-    patch_filter = str(patch_filter).strip().lower()
-    if patch_filter == "positive":
-        return list(segment_records)
-    if patch_filter != "supervision":
-        raise ValueError(f"Unsupported patch filter: {patch_filter!r}")
-
-    filtered_records = []
-    for segment_record in segment_records:
-        filtered_record = dict(segment_record)
-        filtered_record["labeled_world_bbox"] = segment_record.get("supervision_world_bbox")
-        filtered_record["positive_world_bbox"] = segment_record.get("supervision_world_bbox")
-        filtered_record["positive_points_zyx"] = segment_record.get("supervision_points_zyx")
-        filtered_records.append(filtered_record)
-    return filtered_records
-
-
 def _normalize_mapping_entry(dataset_name: str, entry) -> DatasetSourceSpec:
     if isinstance(entry, str):
         return DatasetSourceSpec(dataset_name=dataset_name, volume_path=entry)
@@ -187,19 +154,10 @@ def _bbox_to_chunk_ids(
     chunk_shape_zyx: tuple[int, int, int],
     array_shape_zyx: tuple[int, int, int],
 ) -> Iterable[tuple[int, int, int]]:
-    z0, z1, y0, y1, x0, x1 = (int(v) for v in world_bbox)
-    src_starts = (
-        max(0, z0),
-        max(0, y0),
-        max(0, x0),
-    )
-    src_ends = (
-        min(int(array_shape_zyx[0]), z1 + 1),
-        min(int(array_shape_zyx[1]), y1 + 1),
-        min(int(array_shape_zyx[2]), x1 + 1),
-    )
-    if any(start >= end for start, end in zip(src_starts, src_ends)):
+    clipped_bounds = _clip_world_bbox_to_array(world_bbox, array_shape_zyx)
+    if clipped_bounds is None:
         return ()
+    src_starts, src_ends = clipped_bounds
 
     z_chunk_start = src_starts[0] // int(chunk_shape_zyx[0])
     z_chunk_stop = (src_ends[0] - 1) // int(chunk_shape_zyx[0])
@@ -216,6 +174,26 @@ def _bbox_to_chunk_ids(
     )
 
 
+def _clip_world_bbox_to_array(
+    world_bbox: tuple[int, int, int, int, int, int],
+    array_shape_zyx: tuple[int, int, int],
+) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    z0, y0, x0, z1, y1, x1 = (int(v) for v in world_bbox)
+    starts = (
+        max(0, z0),
+        max(0, y0),
+        max(0, x0),
+    )
+    stops = (
+        min(int(array_shape_zyx[0]), z1),
+        min(int(array_shape_zyx[1]), y1),
+        min(int(array_shape_zyx[2]), x1),
+    )
+    if any(start >= stop for start, stop in zip(starts, stops)):
+        return None
+    return starts, stops
+
+
 def collect_unique_chunk_ids(
     patches: Iterable[dict],
     *,
@@ -224,9 +202,10 @@ def collect_unique_chunk_ids(
 ) -> tuple[tuple[int, int, int], ...]:
     chunk_ids = set()
     for patch in patches:
+        world_bbox = patch["world_bbox"]
         chunk_ids.update(
             _bbox_to_chunk_ids(
-                tuple(int(v) for v in patch["world_bbox"]),
+                tuple(int(v) for v in world_bbox),
                 chunk_shape_zyx=chunk_shape_zyx,
                 array_shape_zyx=array_shape_zyx,
             )
@@ -488,6 +467,276 @@ def copy_chunks_to_output(
     }
 
 
+def _surface_patch_bbox(surface: int, y0: int, x0: int, patch_size) -> tuple[int, int, int, int, int, int]:
+    depth, height, width = (int(v) for v in patch_size)
+    z0 = int(surface - depth // 2)
+    return (
+        z0,
+        int(y0),
+        int(x0),
+        z0 + depth,
+        int(y0) + height,
+        int(x0) + width,
+    )
+
+
+def _labeled_patch_coverage(label_patch) -> float:
+    patch = np.asarray(label_patch)
+    if patch.size == 0:
+        return 0.0
+
+    labeled_ys, labeled_xs = np.nonzero(patch)
+    if labeled_ys.size == 0:
+        return 0.0
+
+    labeled_area = (
+        (int(labeled_ys.max()) - int(labeled_ys.min()) + 1)
+        * (int(labeled_xs.max()) - int(labeled_xs.min()) + 1)
+    )
+    return float(labeled_area) / float(patch.size)
+
+
+def _iter_segment_dirs(dataset_dir: Path) -> Iterable[Path]:
+    for segment_dir in sorted(dataset_dir.iterdir()):
+        if not segment_dir.is_dir() or segment_dir.name == "unused":
+            continue
+        if not any(segment_dir.rglob("x.tif")):
+            continue
+        yield segment_dir
+
+
+def _segment_patch_candidates(
+    segment: Segment,
+    *,
+    patch_filter: str,
+) -> tuple[list[tuple[int, int]], int]:
+    patch_filter = str(patch_filter).strip().lower()
+    if patch_filter not in {"positive", "supervision"}:
+        raise ValueError(f"Unsupported patch filter: {patch_filter!r}")
+
+    volume_auth = segment.config.get("volume_auth_json")
+    supervision_mask = open_zarr(segment.supervision_mask, resolution=segment.scale, auth=volume_auth)
+    inklabels = open_zarr(segment.inklabels, resolution=segment.scale, auth=volume_auth)
+
+    surface = int(supervision_mask.shape[0] // 2)
+    patch_size = tuple(int(v) for v in segment.patch_size)
+    patch_finding_type = resolve_patch_finding_type(segment.config)
+
+    if patch_finding_type == "default":
+        ys, xs = np.nonzero(np.asarray(supervision_mask[surface]))
+        if int(ys.size) == 0:
+            raise ValueError(f"{segment.supervision_mask} contains no nonzero voxels")
+
+        stride = int(patch_size[1] * float(segment.config["patch_overlap"]))
+        if stride <= 0:
+            raise ValueError(f"patch_overlap produced non-positive stride={stride}")
+
+        patch_starts_yx = np.unique(
+            np.stack([ys // stride * stride, xs // stride * stride], axis=1),
+            axis=0,
+        )
+        candidates = [(int(y0), int(x0)) for y0, x0 in patch_starts_yx.tolist()]
+        return candidates, int(len(candidates))
+
+    patch_size_yx = int(patch_size[1])
+    default_stride = int(patch_size_yx * float(segment.config["patch_overlap"]))
+    tile_size = int(segment.config.get("patch_finding_tile_size", patch_size_yx))
+    stride = int(segment.config.get("patch_finding_stride", default_stride))
+    filter_empty_tile = bool(segment.config.get("patch_finding_filter_empty_tile", False))
+    tile_mask = inklabels[surface] if patch_filter == "positive" else supervision_mask[surface]
+    _, xyxys, _ = build_patch_index(
+        mask=tile_mask,
+        fragment_mask=supervision_mask[surface],
+        size=patch_size_yx,
+        tile_size=tile_size,
+        stride=stride,
+        filter_empty_tile=filter_empty_tile,
+    )
+    candidates = [(int(y1), int(x1)) for x1, y1, _, _ in xyxys.tolist()]
+    return candidates, int(len(candidates))
+
+
+def _build_segment_download_patches(
+    segment: Segment,
+    *,
+    patch_filter: str,
+) -> tuple[list[dict], int]:
+    patch_filter = str(patch_filter).strip().lower()
+    candidates, candidate_count = _segment_patch_candidates(segment, patch_filter=patch_filter)
+
+    volume_auth = segment.config.get("volume_auth_json")
+    supervision_mask = open_zarr(segment.supervision_mask, resolution=segment.scale, auth=volume_auth)
+    inklabels = open_zarr(segment.inklabels, resolution=segment.scale, auth=volume_auth)
+    validation_mask = None
+    if segment.validation_mask is not None:
+        validation_mask = open_zarr(segment.validation_mask, resolution=segment.scale, auth=volume_auth)
+
+    surface = int(supervision_mask.shape[0] // 2)
+    patch_size = tuple(int(v) for v in segment.patch_size)
+    min_labeled_coverage = float(segment.config.get("patch_min_labeled_coverage", 0.0))
+    patch_tifxyz = tifxyz.read_tifxyz(segment.segment_dir)
+    patch_tifxyz.use_full_resolution()
+
+    kept_patches: list[dict] = []
+    for y0, x0 in candidates:
+        patch_bbox_zyx = _surface_patch_bbox(surface, y0, x0, patch_size)
+        flat_x, flat_y, flat_z, flat_valid = patch_tifxyz[
+            int(y0):int(y0) + patch_size[1],
+            int(x0):int(x0) + patch_size[2],
+        ]
+        patch_zyxs = np.stack([flat_z, flat_y, flat_x], axis=-1)
+        native_world_bbox = compute_native_crop_bbox_from_patch_points(
+            patch_zyxs,
+            flat_valid,
+            patch_size,
+        )
+
+        if validation_mask is not None:
+            validation_patch = validation_mask[
+                surface,
+                int(y0):int(y0) + patch_size[1],
+                int(x0):int(x0) + patch_size[2],
+            ]
+            if bool(validation_patch.size > 0 and np.any(validation_patch)):
+                kept_patches.append(
+                    {
+                        "segment_relpath": str(segment.segment_relpath),
+                        "world_bbox": native_world_bbox,
+                        "flat_bbox": patch_bbox_zyx,
+                        "is_validation": True,
+                    }
+                )
+                continue
+
+        if patch_filter == "supervision":
+            supervision_patch = supervision_mask[
+                surface,
+                int(y0):int(y0) + patch_size[1],
+                int(x0):int(x0) + patch_size[2],
+            ]
+            if bool(supervision_patch.size > 0 and np.any(supervision_patch)):
+                kept_patches.append(
+                    {
+                        "segment_relpath": str(segment.segment_relpath),
+                        "world_bbox": native_world_bbox,
+                        "flat_bbox": patch_bbox_zyx,
+                        "is_validation": False,
+                    }
+                )
+            continue
+
+        label_patch = inklabels[
+            surface,
+            int(y0):int(y0) + patch_size[1],
+            int(x0):int(x0) + patch_size[2],
+        ]
+        if _labeled_patch_coverage(label_patch) >= min_labeled_coverage:
+            kept_patches.append(
+                {
+                    "segment_relpath": str(segment.segment_relpath),
+                    "world_bbox": native_world_bbox,
+                    "flat_bbox": patch_bbox_zyx,
+                    "is_validation": False,
+                }
+            )
+
+    return kept_patches, int(candidate_count)
+
+
+def _build_dataset_download_patches(
+    *,
+    dataset_dir: Path,
+    source_spec: DatasetSourceSpec,
+    patch_size_zyx: tuple[int, int, int],
+    overlap_fraction: float,
+    patch_filter: str,
+    patch_finding_type: str,
+    patch_min_labeled_coverage: float,
+    patch_finding_tile_size: int | None,
+    patch_finding_stride: int | None,
+    patch_finding_filter_empty_tile: bool,
+    label_version: str | None,
+) -> tuple[list[dict], int]:
+    config = {
+        "patch_size": [int(v) for v in patch_size_zyx],
+        "patch_overlap": float(overlap_fraction),
+        "patch_finding_type": str(patch_finding_type),
+        "patch_min_labeled_coverage": float(patch_min_labeled_coverage),
+        "volume_auth_json": source_spec.volume_auth_json,
+        "label_version": label_version,
+    }
+    if patch_finding_tile_size is not None:
+        config["patch_finding_tile_size"] = int(patch_finding_tile_size)
+    if patch_finding_stride is not None:
+        config["patch_finding_stride"] = int(patch_finding_stride)
+    if bool(patch_finding_filter_empty_tile):
+        config["patch_finding_filter_empty_tile"] = True
+
+    patches: list[dict] = []
+    candidate_bbox_count = 0
+    for segment_dir in _iter_segment_dirs(dataset_dir):
+        segment = Segment(
+            config=config,
+            image_volume=Path(str(source_spec.volume_path)),
+            scale=int(source_spec.volume_scale),
+            dataset_idx=0,
+            segment_relpath=segment_dir.relative_to(dataset_dir).as_posix(),
+            segment_dir=segment_dir,
+            segment_name=segment_dir.name,
+        )
+        segment.discover_labels(label_version=label_version, extension=".zarr")
+        segment_patches, segment_candidate_count = _build_segment_download_patches(
+            segment,
+            patch_filter=patch_filter,
+        )
+        patches.extend(segment_patches)
+        candidate_bbox_count += int(segment_candidate_count)
+
+    return patches, int(candidate_bbox_count)
+
+
+def _debug_patch_chunk_mapping(
+    *,
+    dataset_name: str,
+    volume_path: str,
+    array_shape_zyx: tuple[int, int, int],
+    chunk_shape_zyx: tuple[int, int, int],
+    patches: list[dict],
+    limit: int,
+) -> None:
+    limit = max(0, int(limit))
+    if limit <= 0:
+        return
+
+    intersecting = 0
+    for patch in patches:
+        if _clip_world_bbox_to_array(tuple(int(v) for v in patch["world_bbox"]), array_shape_zyx) is not None:
+            intersecting += 1
+
+    print(
+        f"[{dataset_name}] debug source={volume_path} array_shape={array_shape_zyx} "
+        f"chunk_shape={chunk_shape_zyx} intersecting_patches={intersecting}/{len(patches)}"
+    )
+    for idx, patch in enumerate(patches[:limit]):
+        world_bbox = tuple(int(v) for v in patch["world_bbox"])
+        clipped_bounds = _clip_world_bbox_to_array(world_bbox, array_shape_zyx)
+        chunk_ids = tuple(
+            _bbox_to_chunk_ids(
+                world_bbox,
+                chunk_shape_zyx=chunk_shape_zyx,
+                array_shape_zyx=array_shape_zyx,
+            )
+        )
+        print(
+            f"[{dataset_name}] debug patch[{idx}] "
+            f"segment={patch.get('segment_relpath', '?')} "
+            f"flat_bbox={patch.get('flat_bbox')} "
+            f"native_bbox={world_bbox} "
+            f"clipped={clipped_bounds} "
+            f"chunks={len(chunk_ids)}"
+        )
+
+
 def build_dataset_chunk_plan(
     *,
     datasets_root: Path,
@@ -498,9 +747,14 @@ def build_dataset_chunk_plan(
     stored_grid_pad: int,
     patch_finding_workers: int,
     patch_filter: str,
+    patch_finding_type: str,
+    patch_min_labeled_coverage: float,
+    patch_finding_tile_size: int | None,
+    patch_finding_stride: int | None,
+    patch_finding_filter_empty_tile: bool,
+    label_version: str | None,
+    debug_patches: int = 0,
 ) -> DatasetChunkPlan:
-    from tifxyz_dataset.patch_finding import _build_dataset_patch_records, _prepare_segment_records
-
     dataset_dir = datasets_root / source_spec.dataset_name
     if not dataset_dir.is_dir():
         raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
@@ -514,33 +768,20 @@ def build_dataset_chunk_plan(
             f"Requested scale {source_spec.volume_scale} is missing from source group {source_spec.volume_path!r}."
         )
 
-    dataset = {
-        "segments_path": str(dataset_dir),
-        "volume_path": str(source_spec.volume_path),
-        "volume_scale": int(source_spec.volume_scale),
-    }
-    patch_generation_stats = _build_patch_generation_stats()
-    segment_records = _prepare_segment_records(
-        dataset_idx=0,
-        dataset=dataset,
-        volume=None,
-        volume_scale=int(source_spec.volume_scale),
-        patch_generation_stats=patch_generation_stats,
-    )
-    segment_records = _segment_records_for_patch_filter(
-        segment_records,
-        patch_filter=patch_filter,
-    )
-    patches, stats = _build_dataset_patch_records(
-        dataset_idx=0,
-        dataset=dataset,
-        volume=None,
-        volume_scale=int(source_spec.volume_scale),
-        segment_records=segment_records,
+    del stored_grid_pad, patch_finding_workers
+
+    patches, candidate_bbox_count = _build_dataset_download_patches(
+        dataset_dir=dataset_dir,
+        source_spec=source_spec,
         patch_size_zyx=patch_size_zyx,
         overlap_fraction=float(overlap_fraction),
-        patch_finding_workers=int(patch_finding_workers),
-        stored_grid_pad=int(stored_grid_pad),
+        patch_filter=patch_filter,
+        patch_finding_type=patch_finding_type,
+        patch_min_labeled_coverage=float(patch_min_labeled_coverage),
+        patch_finding_tile_size=patch_finding_tile_size,
+        patch_finding_stride=patch_finding_stride,
+        patch_finding_filter_empty_tile=bool(patch_finding_filter_empty_tile),
+        label_version=label_version,
     )
 
     requested_scale_array = source_group[str(int(source_spec.volume_scale))]
@@ -552,6 +793,14 @@ def build_dataset_chunk_plan(
         int(scale): tuple(int(v) for v in source_group[str(int(scale))].shape)
         for scale in scale_keys
     }
+    _debug_patch_chunk_mapping(
+        dataset_name=source_spec.dataset_name,
+        volume_path=str(source_spec.volume_path),
+        array_shape_zyx=tuple(int(v) for v in requested_scale_array.shape),
+        chunk_shape_zyx=tuple(int(v) for v in requested_scale_array.chunks),
+        patches=patches,
+        limit=int(debug_patches),
+    )
     requested_scale_chunk_ids = collect_unique_chunk_ids(
         patches,
         chunk_shape_zyx=tuple(int(v) for v in requested_scale_array.chunks),
@@ -571,7 +820,7 @@ def build_dataset_chunk_plan(
         volume_scale=int(source_spec.volume_scale),
         volume_auth_json=source_spec.volume_auth_json,
         patch_count=int(len(patches)),
-        candidate_bbox_count=int(stats["candidate_bboxes"]),
+        candidate_bbox_count=int(candidate_bbox_count),
         chunk_shapes_by_scale=chunk_shapes_by_scale,
         array_shapes_by_scale=array_shapes_by_scale,
         chunk_ids_by_scale=chunk_ids_by_scale,
@@ -647,7 +896,47 @@ def parse_args() -> argparse.Namespace:
         "--patch-finding-workers",
         type=int,
         default=4,
-        help="Reserved patchfinding worker count to match the tifxyz config.",
+        help="Compatibility no-op kept for existing invocations.",
+    )
+    parser.add_argument(
+        "--patch-finding-type",
+        choices=("default", "subtiling"),
+        default="default",
+        help="Current shared patch-finding implementation to mirror.",
+    )
+    parser.add_argument(
+        "--patch-min-labeled-coverage",
+        type=float,
+        default=0.0,
+        help="Minimum labeled coverage when --patch-filter=positive.",
+    )
+    parser.add_argument(
+        "--patch-finding-tile-size",
+        type=int,
+        default=None,
+        help="Subtiling tile size. Leave unset to use the patch height.",
+    )
+    parser.add_argument(
+        "--patch-finding-stride",
+        type=int,
+        default=None,
+        help="Subtiling tile stride. Leave unset to derive it from patch overlap.",
+    )
+    parser.add_argument(
+        "--patch-finding-filter-empty-tile",
+        action="store_true",
+        help="Mirror the subtiling empty-tile pruning used by training.",
+    )
+    parser.add_argument(
+        "--label-version",
+        default=None,
+        help="Optional label version such as v2. Defaults to the latest labels in each segment.",
+    )
+    parser.add_argument(
+        "--debug-patches",
+        type=int,
+        default=0,
+        help="Print the first N flat-to-native bbox mappings and their source chunk intersections.",
     )
     parser.add_argument(
         "--download-workers",
@@ -717,6 +1006,13 @@ def main() -> int:
             stored_grid_pad=int(args.stored_grid_pad),
             patch_finding_workers=int(args.patch_finding_workers),
             patch_filter=str(args.patch_filter),
+            patch_finding_type=str(args.patch_finding_type),
+            patch_min_labeled_coverage=float(args.patch_min_labeled_coverage),
+            patch_finding_tile_size=args.patch_finding_tile_size,
+            patch_finding_stride=args.patch_finding_stride,
+            patch_finding_filter_empty_tile=bool(args.patch_finding_filter_empty_tile),
+            label_version=None if args.label_version in (None, "") else str(args.label_version),
+            debug_patches=int(args.debug_patches),
         )
         plans.append(plan)
         scale_counts = ", ".join(

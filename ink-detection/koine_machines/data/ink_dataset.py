@@ -25,6 +25,7 @@ from koine_machines.data.normal_pooled_sample import (
     _pack_normal_pooled_augmentation_data,
     _restore_normal_pooled_augmentation_data,
 )
+from koine_machines.data.native_crop import compute_native_crop_bbox_from_patch_points
 from koine_machines.data.segment import Segment
 
 def _read_flat_surface_patch(volume, *, y0, y1, x0, x1):
@@ -316,31 +317,11 @@ class InkDataset(Dataset):
             patch_tifxyz.use_full_resolution()
             flat_x, flat_y, flat_z, flat_valid = patch_tifxyz[y0:y1, x0:x1]
             patch_zyxs = np.stack([flat_z, flat_y, flat_x], axis=-1)
-            valid_pts = patch_zyxs[flat_valid]
-            if valid_pts.size == 0:
-                raise ValueError(f"No valid tifxyz points found for bbox {patch.bbox!r}")
-
-            mins = valid_pts.min(axis=0).astype(int)
-            maxs = valid_pts.max(axis=0).astype(int)
-            target_zyx_shape = np.asarray(expected_shape, dtype=int)
-            actual_zyx_shape = (maxs - mins + 1).astype(int)
-            shape_diff = target_zyx_shape - actual_zyx_shape
-
-            # center before crop when the occupied extent is larger than the target.
-            trim_before = np.maximum(-shape_diff, 0) // 2
-            trim_after = np.maximum(-shape_diff, 0) - trim_before
-            mins = mins + trim_before
-            maxs = maxs - trim_after
-
-            adjusted_shape = (maxs - mins + 1).astype(int)
-            remaining_diff = target_zyx_shape - adjusted_shape
-
-            pad_before = np.maximum(remaining_diff, 0) // 2
-            pad_after = np.maximum(remaining_diff, 0) - pad_before
-            mins = mins - pad_before
-            maxs = maxs + pad_after
-
-            crop_bbox = (int(mins[0]), int(mins[1]), int(mins[2]), int(maxs[0] + 1), int(maxs[1] + 1), int(maxs[2] + 1))
+            crop_bbox = compute_native_crop_bbox_from_patch_points(
+                patch_zyxs,
+                flat_valid,
+                expected_shape,
+            )
             supervision_flat_patch = _read_flat_surface_patch(supervision_mask, y0=y0, y1=y1, x0=x0, x1=x1)
             if self.do_augmentations:
                 crop_bbox = maybe_translate_normal_pooled_crop_bbox(
