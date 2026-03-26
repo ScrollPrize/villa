@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 import wandb
 
-from koine_machines.training.normal_pooling import local_points_zyx_to_normalized_grid
+from koine_machines.training.normal_pooling import local_points_zyx_to_normalized_grid, pool_logits_along_normals
 
 
 def to_uint8_image(image_2d):
@@ -44,6 +44,13 @@ def to_uint8_probability(probability_2d, lower_percentile=1.0, upper_percentile=
         probability_2d = np.clip(probability_2d, lo, hi)
         probability_2d = (probability_2d - lo) / (hi - lo)
     return np.clip(np.rint(probability_2d * 255.0), 0, 255).astype(np.uint8)
+
+
+def composite_uint8_images(*images):
+    if not images:
+        raise ValueError("composite_uint8_images requires at least one image")
+    stacked = np.stack([to_uint8_image(image) for image in images], axis=0).astype(np.float32)
+    return np.clip(np.rint(stacked.mean(axis=0)), 0, 255).astype(np.uint8)
 
 
 def _pad_image_bottom_right(image_2d, *, target_height=None, target_width=None):
@@ -119,6 +126,7 @@ class PreviewAccumulator:
     get_model_input: Callable[[dict], torch.Tensor]
     sample_tiles: list[np.ndarray] = field(default_factory=list)
     gap_size: int = 4
+    normal_pooling_config: dict | None = None
 
     def _add_standard_batch(self, batch, preds, targets, ignore_mask):
         input_batch = self.get_model_input(batch)
@@ -183,7 +191,25 @@ class PreviewAccumulator:
         flat_valid = batch["flat_valid"].to(device=image_batch.device) > 0
         if flat_valid.ndim == 3:
             flat_valid = flat_valid.unsqueeze(1)
-        return torch.where(flat_valid, flat_crop, torch.zeros_like(flat_crop))
+        flat_crop = torch.where(flat_valid, flat_crop, torch.zeros_like(flat_crop))
+
+        flat_normals_local_zyx = batch["flat_normals_local_zyx"].to(
+            device=image_batch.device,
+            dtype=image_batch.dtype,
+        )
+        pooling_config = self.normal_pooling_config or {}
+        flat_max_crop, flat_max_valid = pool_logits_along_normals(
+            image_batch,
+            flat_points_local_zyx,
+            flat_normals_local_zyx,
+            batch["flat_valid"].to(device=image_batch.device, dtype=image_batch.dtype),
+            neg_dist=float(pooling_config.get("neg_dist", 10.0)),
+            pos_dist=float(pooling_config.get("pos_dist", 10.0)),
+            sample_step=float(pooling_config.get("sample_step", 0.5)),
+            align_corners=True,
+        )
+        flat_max_crop = torch.where(flat_max_valid > 0, flat_max_crop, torch.zeros_like(flat_max_crop))
+        return flat_crop, flat_max_crop
 
     def _add_normal_pooled_batch(self, batch, pooled_logits, volume_logits):
         image_batch = batch["image"].float()
@@ -215,7 +241,7 @@ class PreviewAccumulator:
                 f"Expected pooled_logits with shape [B, 1, H, W] or [B, H, W], got {tuple(pooled_logits.shape)}"
             )
 
-        flat_crop = self._sample_flat_crop(image_batch, batch)
+        flat_crop, flat_max_crop = self._sample_flat_crop(image_batch, batch)
         mid_slice_idx = int(image_batch.shape[2] // 2)
         volume_crop_mid = image_batch[:, :1, mid_slice_idx]
         volume_logits_mid = volume_logits[:, :1, mid_slice_idx]
@@ -224,6 +250,7 @@ class PreviewAccumulator:
         gathered_volume_crops = self.accelerator.gather_for_metrics(volume_crop_mid)
         gathered_pooled_logits = self.accelerator.gather_for_metrics(pooled_logits)
         gathered_flat_crops = self.accelerator.gather_for_metrics(flat_crop)
+        gathered_flat_max_crops = self.accelerator.gather_for_metrics(flat_max_crop)
 
         if not self.accelerator.is_main_process:
             return
@@ -232,12 +259,14 @@ class PreviewAccumulator:
         volume_crop_tiles = gathered_volume_crops[:, 0].detach().cpu().numpy()
         pooled_logit_tiles = gathered_pooled_logits[:, 0].detach().cpu().numpy()
         flat_crop_tiles = gathered_flat_crops[:, 0].detach().cpu().numpy()
+        flat_max_crop_tiles = gathered_flat_max_crops[:, 0].detach().cpu().numpy()
 
-        for volume_logit_tile, volume_crop_tile, pooled_logit_tile, flat_crop_tile in zip(
+        for volume_logit_tile, volume_crop_tile, pooled_logit_tile, flat_crop_tile, flat_max_crop_tile in zip(
             volume_logit_tiles,
             volume_crop_tiles,
             pooled_logit_tiles,
             flat_crop_tiles,
+            flat_max_crop_tiles,
         ):
             sample_tile = build_panel_grid(
                 [
@@ -247,7 +276,7 @@ class PreviewAccumulator:
                     ],
                     [
                         to_uint8_image(pooled_logit_tile),
-                        to_uint8_image(flat_crop_tile),
+                        composite_uint8_images(flat_crop_tile, flat_max_crop_tile),
                     ],
                 ],
                 gap_size=self.gap_size,

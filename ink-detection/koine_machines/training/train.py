@@ -506,7 +506,11 @@ def train(config_path, profile_steps):
                 wandb.log(log_dict, step=step)
 
         if step % val_every == 0 and step > 0:
-            train_preview = PreviewAccumulator(accelerator=accelerator, get_model_input=get_model_input)
+            train_preview = PreviewAccumulator(
+                accelerator=accelerator,
+                get_model_input=get_model_input,
+                normal_pooling_config=(config.get('normal_pooling') if mode == 'normal_pooled_3d' else None),
+            )
             train_preview.add_batch(
                 batch,
                 loss_preds.detach(),
@@ -518,7 +522,11 @@ def train(config_path, profile_steps):
             val_losses = []
             ema_val_losses = []
             validation_counts = Confusion.zero_counts(device=accelerator.device)
-            val_preview = PreviewAccumulator(accelerator=accelerator, get_model_input=get_model_input)
+            val_preview = PreviewAccumulator(
+                accelerator=accelerator,
+                get_model_input=get_model_input,
+                normal_pooling_config=(config.get('normal_pooling') if mode == 'normal_pooled_3d' else None),
+            )
             num_val_batches = min(len(val_dl), config.get('val_steps', 10))
             if num_val_batches == 0:
                 if accelerator.is_main_process:
