@@ -33,6 +33,7 @@ dependencies = [
     "pyqt6>=6.10.2",
     "pytorch-optimizer>=3.10.0",
     "connected-components-3d>=3.26.1",
+    "pybind11>=3.0.2",
 ]
 
 [tool.setuptools.packages.find]
