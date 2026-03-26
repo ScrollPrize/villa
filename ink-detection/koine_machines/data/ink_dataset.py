@@ -2,6 +2,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 import random
+import cc3d
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import torch
@@ -80,6 +81,7 @@ def _select_flat_pixels_for_native_crop_via_stored_resolution(
     coarse_native_pad=20,
     coarse_patch_zyxs=None,
     coarse_valid=None,
+    return_halo=False,
 ):
     coarse_native_pad = int(coarse_native_pad)
     coarse_crop_bbox = (
@@ -138,10 +140,36 @@ def _select_flat_pixels_for_native_crop_via_stored_resolution(
         full_valid,
         crop_bbox,
     )
+    support_bbox = (
+        full_y0 + local_y0,
+        full_y0 + local_y1,
+        full_x0 + local_x0,
+        full_x0 + local_x1,
+    )
+    if not return_halo:
+        return (
+            support_bbox,
+            support_patch_zyxs,
+            support_valid,
+        )
+
+    halo_local_y0 = max(0, local_y0 - 1)
+    halo_local_y1 = min(full_patch_zyxs.shape[0], local_y1 + 1)
+    halo_local_x0 = max(0, local_x0 - 1)
+    halo_local_x1 = min(full_patch_zyxs.shape[1], local_x1 + 1)
+    support_patch_zyxs_halo = full_patch_zyxs[halo_local_y0:halo_local_y1, halo_local_x0:halo_local_x1]
+    support_valid_halo = full_valid[halo_local_y0:halo_local_y1, halo_local_x0:halo_local_x1]
+    trim_slices = (
+        slice(local_y0 - halo_local_y0, local_y1 - halo_local_y0),
+        slice(local_x0 - halo_local_x0, local_x1 - halo_local_x0),
+    )
     return (
-        (full_y0 + local_y0, full_y0 + local_y1, full_x0 + local_x0, full_x0 + local_x1),
+        support_bbox,
         support_patch_zyxs,
         support_valid,
+        support_patch_zyxs_halo,
+        support_valid_halo,
+        trim_slices,
     )
 
 
@@ -191,6 +219,194 @@ def _project_valid_surface_mask_to_native_crop(patch_zyxs, valid_mask, crop_bbox
     distance = distance_transform_edt(~surface_occupancy)
     surface_distance_field = np.clip(1.0 - (distance / max_distance_voxels), 0.0, 1.0)
     return surface_distance_field.astype(np.float32, copy=False)
+
+
+def _tighten_support_window(
+    support_bbox,
+    support_patch_zyxs,
+    support_valid,
+    support_inklabels_flat_patch,
+    support_supervision_flat_patch,
+):
+    support_valid = np.asarray(support_valid, dtype=bool)
+    if not np.any(support_valid):
+        return (
+            support_bbox,
+            support_patch_zyxs,
+            support_valid,
+            support_inklabels_flat_patch,
+            support_supervision_flat_patch,
+        )
+
+    row_hits = np.any(support_valid, axis=1)
+    col_hits = np.any(support_valid, axis=0)
+    row_indices = np.flatnonzero(row_hits)
+    col_indices = np.flatnonzero(col_hits)
+    row_start = int(row_indices[0])
+    row_stop = int(row_indices[-1]) + 1
+    col_start = int(col_indices[0])
+    col_stop = int(col_indices[-1]) + 1
+    support_y0, _, support_x0, _ = (int(v) for v in support_bbox)
+    tightened_bbox = (
+        support_y0 + row_start,
+        support_y0 + row_stop,
+        support_x0 + col_start,
+        support_x0 + col_stop,
+    )
+    return (
+        tightened_bbox,
+        np.asarray(support_patch_zyxs)[row_start:row_stop, col_start:col_stop],
+        support_valid[row_start:row_stop, col_start:col_stop],
+        np.asarray(support_inklabels_flat_patch)[row_start:row_stop, col_start:col_stop],
+        np.asarray(support_supervision_flat_patch)[row_start:row_stop, col_start:col_stop],
+    )
+
+
+def _slice_support_halo_for_subwindow(
+    support_patch_zyxs_halo,
+    support_valid_halo,
+    trim_slices,
+    base_support_bbox,
+    subwindow_bbox,
+):
+    base_support_y0, _, base_support_x0, _ = (int(v) for v in base_support_bbox)
+    subwindow_y0, subwindow_y1, subwindow_x0, subwindow_x1 = (int(v) for v in subwindow_bbox)
+    row_start = subwindow_y0 - base_support_y0
+    row_stop = subwindow_y1 - base_support_y0
+    col_start = subwindow_x0 - base_support_x0
+    col_stop = subwindow_x1 - base_support_x0
+
+    halo_row_start = max(0, int(trim_slices[0].start) + row_start - 1)
+    halo_row_stop = min(support_patch_zyxs_halo.shape[0], int(trim_slices[0].start) + row_stop + 1)
+    halo_col_start = max(0, int(trim_slices[1].start) + col_start - 1)
+    halo_col_stop = min(support_patch_zyxs_halo.shape[1], int(trim_slices[1].start) + col_stop + 1)
+
+    return (
+        np.asarray(support_patch_zyxs_halo)[halo_row_start:halo_row_stop, halo_col_start:halo_col_stop],
+        np.asarray(support_valid_halo)[halo_row_start:halo_row_stop, halo_col_start:halo_col_stop],
+        (
+            slice(int(trim_slices[0].start) + row_start - halo_row_start, int(trim_slices[0].start) + row_stop - halo_row_start),
+            slice(int(trim_slices[1].start) + col_start - halo_col_start, int(trim_slices[1].start) + col_stop - halo_col_start),
+        ),
+    )
+
+
+def _filter_support_components_by_active_supervision(
+    *,
+    support_bbox,
+    support_patch_zyxs,
+    support_valid,
+    support_inklabels_flat_patch,
+    support_supervision_flat_patch,
+    crop_bbox,
+):
+    support_valid = np.asarray(support_valid, dtype=bool)
+    if not np.any(support_valid):
+        return (
+            support_bbox,
+            support_patch_zyxs,
+            support_valid,
+            support_inklabels_flat_patch,
+            support_supervision_flat_patch,
+        )
+
+    occupancy = _project_flat_patch_to_native_crop(
+        np.ones(np.asarray(support_valid).shape, dtype=np.uint8),
+        support_patch_zyxs,
+        support_valid,
+        crop_bbox,
+    )
+    occupancy = occupancy > 0
+    if not np.any(occupancy):
+        return (
+            support_bbox,
+            support_patch_zyxs,
+            support_valid,
+            support_inklabels_flat_patch,
+            support_supervision_flat_patch,
+        )
+
+    components = cc3d.connected_components(
+        occupancy.astype(np.uint8, copy=False),
+        connectivity=26,
+    )
+    supervision_native = _project_flat_patch_to_native_crop(
+        (np.asarray(support_supervision_flat_patch) > 0).astype(np.uint8, copy=False),
+        support_patch_zyxs,
+        support_valid,
+        crop_bbox,
+    )
+    kept_component_ids = np.unique(components[supervision_native > 0])
+    kept_component_ids = kept_component_ids[kept_component_ids > 0]
+    if kept_component_ids.size == 0:
+        return (
+            support_bbox,
+            support_patch_zyxs,
+            support_valid,
+            support_inklabels_flat_patch,
+            support_supervision_flat_patch,
+        )
+
+    patch_zyxs = np.asarray(support_patch_zyxs)
+    finite_mask = np.isfinite(patch_zyxs).all(axis=-1)
+    flat_valid = support_valid & finite_mask
+    if not np.any(flat_valid):
+        return (
+            support_bbox,
+            support_patch_zyxs,
+            support_valid,
+            support_inklabels_flat_patch,
+            support_supervision_flat_patch,
+        )
+
+    z0, y0, x0, z1, y1, x1 = (int(v) for v in crop_bbox)
+    mapped_zyxs = patch_zyxs[flat_valid].astype(np.int64, copy=False)
+    local_zyxs = mapped_zyxs - np.asarray((z0, y0, x0), dtype=np.int64)
+    within_crop = (
+        (local_zyxs[:, 0] >= 0)
+        & (local_zyxs[:, 0] < (z1 - z0))
+        & (local_zyxs[:, 1] >= 0)
+        & (local_zyxs[:, 1] < (y1 - y0))
+        & (local_zyxs[:, 2] >= 0)
+        & (local_zyxs[:, 2] < (x1 - x0))
+    )
+    if not np.any(within_crop):
+        return (
+            support_bbox,
+            support_patch_zyxs,
+            support_valid,
+            support_inklabels_flat_patch,
+            support_supervision_flat_patch,
+        )
+
+    row_indices, col_indices = np.nonzero(flat_valid)
+    row_indices = row_indices[within_crop]
+    col_indices = col_indices[within_crop]
+    local_zyxs = local_zyxs[within_crop]
+    component_ids = components[
+        local_zyxs[:, 0],
+        local_zyxs[:, 1],
+        local_zyxs[:, 2],
+    ]
+    keep_flat = np.isin(component_ids, kept_component_ids)
+    if not np.any(keep_flat):
+        return (
+            support_bbox,
+            support_patch_zyxs,
+            support_valid,
+            support_inklabels_flat_patch,
+            support_supervision_flat_patch,
+        )
+
+    filtered_valid = np.zeros_like(support_valid, dtype=bool)
+    filtered_valid[row_indices[keep_flat], col_indices[keep_flat]] = True
+    return _tighten_support_window(
+        support_bbox,
+        support_patch_zyxs,
+        filtered_valid,
+        support_inklabels_flat_patch,
+        support_supervision_flat_patch,
+    )
 
 
 class InkDataset(Dataset):
@@ -418,12 +634,21 @@ class InkDataset(Dataset):
                             supervision_flat_patch,
                         )
                 with sample_profiler.section('dataset/select_support_window'):
-                    (support_y0, support_y1, support_x0, support_x1), support_patch_zyxs, support_valid = _select_flat_pixels_for_native_crop_via_stored_resolution(
+                    (
+                        base_support_bbox,
+                        support_patch_zyxs,
+                        support_valid,
+                        support_patch_zyxs_halo,
+                        support_valid_halo,
+                        trim_slices,
+                    ) = _select_flat_pixels_for_native_crop_via_stored_resolution(
                         patch_tifxyz,
                         crop_bbox,
                         coarse_patch_zyxs=coarse_patch_zyxs,
                         coarse_valid=coarse_valid,
+                        return_halo=True,
                     )
+                    support_y0, support_y1, support_x0, support_x1 = base_support_bbox
                 with sample_profiler.section('dataset/read_support_labels'):
                     support_supervision_flat_patch = _read_flat_surface_patch(
                         supervision_mask,
@@ -439,6 +664,32 @@ class InkDataset(Dataset):
                         x0=support_x0,
                         x1=support_x1,
                     )
+                with sample_profiler.section('dataset/filter_support_components'):
+                    (
+                        (support_y0, support_y1, support_x0, support_x1),
+                        support_patch_zyxs,
+                        support_valid,
+                        support_inklabels_flat_patch,
+                        support_supervision_flat_patch,
+                    ) = _filter_support_components_by_active_supervision(
+                        support_bbox=(support_y0, support_y1, support_x0, support_x1),
+                        support_patch_zyxs=support_patch_zyxs,
+                        support_valid=support_valid,
+                        support_inklabels_flat_patch=support_inklabels_flat_patch,
+                        support_supervision_flat_patch=support_supervision_flat_patch,
+                        crop_bbox=crop_bbox,
+                    )
+                    (
+                        support_patch_zyxs_halo,
+                        support_valid_halo,
+                        trim_slices,
+                    ) = _slice_support_halo_for_subwindow(
+                        support_patch_zyxs_halo,
+                        support_valid_halo,
+                        trim_slices,
+                        base_support_bbox,
+                        (support_y0, support_y1, support_x0, support_x1),
+                    )
                 with sample_profiler.section('dataset/read_image_crop'):
                     image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, crop_bbox, fill_value=0)
                 with sample_profiler.section('dataset/project_surface_mask'):
@@ -449,10 +700,11 @@ class InkDataset(Dataset):
                     )
                 with sample_profiler.section('dataset/build_metadata'):
                     normal_pooled_metadata = _build_normal_pooled_flat_metadata(
-                        patch_tifxyz=patch_tifxyz,
-                        support_bbox=(support_y0, support_y1, support_x0, support_x1),
                         support_patch_zyxs=support_patch_zyxs,
                         support_valid=support_valid,
+                        support_patch_zyxs_halo=support_patch_zyxs_halo,
+                        support_valid_halo=support_valid_halo,
+                        trim_slices=trim_slices,
                         support_inklabels_flat_patch=support_inklabels_flat_patch,
                         support_supervision_flat_patch=support_supervision_flat_patch,
                         crop_bbox=crop_bbox,

@@ -2,19 +2,82 @@ import numpy as np
 import torch
 
 
+def _compute_normals_local_zyx_from_position_halo(
+    support_patch_zyxs_halo,
+    support_valid_halo,
+    trim_slices,
+):
+    support_patch_zyxs_halo = np.asarray(support_patch_zyxs_halo, dtype=np.float32)
+    support_valid_halo = np.asarray(support_valid_halo, dtype=bool)
+
+    z = support_patch_zyxs_halo[..., 0]
+    y = support_patch_zyxs_halo[..., 1]
+    x = support_patch_zyxs_halo[..., 2]
+
+    halo_h, halo_w = z.shape
+    nx = np.full((halo_h, halo_w), np.nan, dtype=np.float32)
+    ny = np.full((halo_h, halo_w), np.nan, dtype=np.float32)
+    nz = np.full((halo_h, halo_w), np.nan, dtype=np.float32)
+
+    if halo_h >= 3 and halo_w >= 3:
+        interior_valid = (
+            support_valid_halo[1:-1, 1:-1]
+            & support_valid_halo[1:-1, :-2]
+            & support_valid_halo[1:-1, 2:]
+            & support_valid_halo[:-2, 1:-1]
+            & support_valid_halo[2:, 1:-1]
+        )
+
+        tx_x = x[1:-1, 2:] - x[1:-1, :-2]
+        tx_y = y[1:-1, 2:] - y[1:-1, :-2]
+        tx_z = z[1:-1, 2:] - z[1:-1, :-2]
+
+        ty_x = x[2:, 1:-1] - x[:-2, 1:-1]
+        ty_y = y[2:, 1:-1] - y[:-2, 1:-1]
+        ty_z = z[2:, 1:-1] - z[:-2, 1:-1]
+
+        n_x = ty_y * tx_z - ty_z * tx_y
+        n_y = ty_z * tx_x - ty_x * tx_z
+        n_z = ty_x * tx_y - ty_y * tx_x
+
+        norm = np.sqrt(n_x**2 + n_y**2 + n_z**2)
+        norm = np.where(norm > 1e-10, norm, np.nan)
+
+        n_x = np.where(interior_valid, n_x / norm, np.nan)
+        n_y = np.where(interior_valid, n_y / norm, np.nan)
+        n_z = np.where(interior_valid, n_z / norm, np.nan)
+
+        nx[1:-1, 1:-1] = n_x.astype(np.float32, copy=False)
+        ny[1:-1, 1:-1] = n_y.astype(np.float32, copy=False)
+        nz[1:-1, 1:-1] = n_z.astype(np.float32, copy=False)
+
+    row_slice, col_slice = trim_slices
+    return np.stack(
+        [
+            nz[row_slice, col_slice],
+            ny[row_slice, col_slice],
+            nx[row_slice, col_slice],
+        ],
+        axis=-1,
+    ).astype(np.float32, copy=False)
+
+
 def _build_normal_pooled_flat_metadata(
     *,
-    patch_tifxyz,
-    support_bbox,
     support_patch_zyxs,
     support_valid,
+    support_patch_zyxs_halo,
+    support_valid_halo,
+    trim_slices,
     support_inklabels_flat_patch,
     support_supervision_flat_patch,
     crop_bbox,
 ):
-    support_y0, support_y1, support_x0, support_x1 = (int(v) for v in support_bbox)
-    nx, ny, nz = patch_tifxyz.get_normals(support_y0, support_y1, support_x0, support_x1)
-    normals_local_zyx = np.stack([nz, ny, nx], axis=-1).astype(np.float32, copy=False)
+    normals_local_zyx = _compute_normals_local_zyx_from_position_halo(
+        support_patch_zyxs_halo,
+        support_valid_halo,
+        trim_slices,
+    )
 
     flat_points_local_zyx = (
         np.asarray(support_patch_zyxs, dtype=np.float32)
