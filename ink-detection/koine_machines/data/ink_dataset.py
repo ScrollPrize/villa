@@ -1,7 +1,5 @@
 import json
-import time
 from collections import defaultdict
-from contextlib import contextmanager
 from pathlib import Path
 import random
 from tqdm import tqdm
@@ -30,27 +28,7 @@ from koine_machines.data.normal_pooled_sample import (
 )
 from koine_machines.data.native_crop import compute_native_crop_bbox_from_patch_points
 from koine_machines.data.segment import Segment
-
-
-class DatasetSampleProfiler:
-    def __init__(self, enabled: bool):
-        self.enabled = enabled
-        self.section_totals = defaultdict(float)
-
-    @contextmanager
-    def section(self, name: str):
-        if not self.enabled:
-            yield
-            return
-
-        start = time.perf_counter()
-        try:
-            yield
-        finally:
-            self.section_totals[name] += time.perf_counter() - start
-
-    def as_dict(self) -> dict[str, float]:
-        return dict(self.section_totals)
+from koine_machines.training.profiling import DatasetSampleProfiler
 
 def _read_flat_surface_patch(volume, *, y0, y1, x0, x1):
     surface = int(volume.shape[0] // 2)
