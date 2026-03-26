@@ -90,6 +90,19 @@ def downsample_stitched_ink_map(image: torch.Tensor, factor: int) -> torch.Tenso
     )[0, 0]
 
 
+def resize_stitched_ink_map(image: torch.Tensor, size: int) -> torch.Tensor:
+    if image.ndim != 2:
+        raise ValueError(f"Expected 2D image, got shape={tuple(image.shape)!r}")
+    size = int(size)
+    if size < 1:
+        raise ValueError(f"size must be >= 1, got {size}")
+    if tuple(image.shape) == (size, size):
+        return image
+    mode = "area" if int(image.shape[0]) >= size and int(image.shape[1]) >= size else "bilinear"
+    kwargs = {} if mode == "area" else {"align_corners": False}
+    return F.interpolate(image[None, None], size=(size, size), mode=mode, **kwargs)[0, 0]
+
+
 def extract_covering_embedding_patches(image: torch.Tensor, crop_size: int) -> torch.Tensor:
     if image.ndim != 2:
         raise ValueError(f"Expected 2D image, got shape={tuple(image.shape)!r}")
@@ -135,14 +148,18 @@ def compute_stitch_embedding_similarity(
     target = stitched_targets.float().clamp_(0.0, 1.0)
     valid = valid_mask.to(dtype=pred.dtype)
 
-    pred = _crop_to_valid_bbox(pred * valid, valid_mask)
-    target = _crop_to_valid_bbox(target * valid, valid_mask)
-
-    pred = downsample_stitched_ink_map(pred, input_downsample_factor)
-    target = downsample_stitched_ink_map(target, input_downsample_factor)
-
-    pred_patches = extract_covering_embedding_patches(pred, embedding_crop_size)
-    target_patches = extract_covering_embedding_patches(target, embedding_crop_size)
+    if int(input_downsample_factor) == -1:
+        pred = pred * valid
+        target = target * valid
+        pred_patches = resize_stitched_ink_map(pred, embedding_crop_size)[None, None]
+        target_patches = resize_stitched_ink_map(target, embedding_crop_size)[None, None]
+    else:
+        pred = _crop_to_valid_bbox(pred * valid, valid_mask)
+        target = _crop_to_valid_bbox(target * valid, valid_mask)
+        pred = downsample_stitched_ink_map(pred, input_downsample_factor)
+        target = downsample_stitched_ink_map(target, input_downsample_factor)
+        pred_patches = extract_covering_embedding_patches(pred, embedding_crop_size)
+        target_patches = extract_covering_embedding_patches(target, embedding_crop_size)
 
     pred_inputs = normalize_for_backbone(pred_patches)
     target_inputs = normalize_for_backbone(target_patches)
