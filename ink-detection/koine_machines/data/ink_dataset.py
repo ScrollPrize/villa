@@ -262,6 +262,30 @@ def _tighten_support_window(
     )
 
 
+def _filter_support_by_2d_distance_from_supervision(
+    support_valid,
+    support_supervision_flat_patch,
+    *,
+    max_grid_distance,
+):
+    support_valid = np.asarray(support_valid, dtype=bool)
+    if not np.any(support_valid):
+        return support_valid
+
+    max_grid_distance = float(max_grid_distance)
+    if not np.isfinite(max_grid_distance) or max_grid_distance < 0:
+        raise ValueError(
+            f"max_grid_distance must be a finite value >= 0, got {max_grid_distance!r}"
+        )
+
+    supervision_seed_mask = (np.asarray(support_supervision_flat_patch) > 0) & support_valid
+    if not np.any(supervision_seed_mask):
+        return support_valid
+
+    grid_distance = distance_transform_edt(~supervision_seed_mask)
+    return support_valid & (grid_distance <= max_grid_distance)
+
+
 def _slice_support_halo_for_subwindow(
     support_patch_zyxs_halo,
     support_valid_halo,
@@ -299,6 +323,7 @@ def _filter_support_components_by_active_supervision(
     support_inklabels_flat_patch,
     support_supervision_flat_patch,
     crop_bbox,
+    max_supervision_grid_distance=None,
 ):
     support_valid = np.asarray(support_valid, dtype=bool)
     if not np.any(support_valid):
@@ -400,6 +425,12 @@ def _filter_support_components_by_active_supervision(
 
     filtered_valid = np.zeros_like(support_valid, dtype=bool)
     filtered_valid[row_indices[keep_flat], col_indices[keep_flat]] = True
+    if max_supervision_grid_distance is not None:
+        filtered_valid = _filter_support_by_2d_distance_from_supervision(
+            filtered_valid,
+            support_supervision_flat_patch,
+            max_grid_distance=max_supervision_grid_distance,
+        )
     return _tighten_support_window(
         support_bbox,
         support_patch_zyxs,
@@ -665,6 +696,7 @@ class InkDataset(Dataset):
                         x1=support_x1,
                     )
                 with sample_profiler.section('dataset/filter_support_components'):
+                    pooling_config = self.config.get('normal_pooling') or {}
                     (
                         (support_y0, support_y1, support_x0, support_x1),
                         support_patch_zyxs,
@@ -678,6 +710,7 @@ class InkDataset(Dataset):
                         support_inklabels_flat_patch=support_inklabels_flat_patch,
                         support_supervision_flat_patch=support_supervision_flat_patch,
                         crop_bbox=crop_bbox,
+                        max_supervision_grid_distance=pooling_config.get('support_grid_max_distance'),
                     )
                     (
                         support_patch_zyxs_halo,
