@@ -55,6 +55,7 @@ class Tifxyz:
     area: Optional[float] = None
     extra: Dict[str, Any] = field(default_factory=dict)
     _mask: Optional[NDArray[np.bool_]] = None
+    _mask_raw: Optional[NDArray[Any]] = field(default=None, repr=False)
     path: Optional[Path] = None
     interp_method: InterpolationMethod = "catmull_rom"
     resolution: Literal["stored", "full"] = "stored"
@@ -116,10 +117,11 @@ class Tifxyz:
         """
         # Stored mode: direct array access, no interpolation
         if self.resolution == "stored":
-            x = self._x[key]
-            y = self._y[key]
-            z = self._z[key]
-            valid = self._valid_mask[key]
+            z = np.asarray(self._z[key], dtype=np.float32)
+            valid = self._valid_mask_slice(key, z_slice=z)
+            x = np.where(valid, np.asarray(self._x[key], dtype=np.float32), -1.0)
+            y = np.where(valid, np.asarray(self._y[key], dtype=np.float32), -1.0)
+            z = np.where(valid, z, -1.0)
             return x, y, z, valid
 
         # Full mode: interpolate to full resolution
@@ -331,7 +333,34 @@ class Tifxyz:
         """Return internal validity mask."""
         if self._mask is not None:
             return self._mask
-        return (self._z > 0) & np.isfinite(self._z)
+        if self._mask_raw is not None:
+            self._mask = self._coerce_mask_to_bool(self._mask_raw)
+            return self._mask
+        self._mask = (self._z > 0) & np.isfinite(self._z)
+        return self._mask
+
+    @staticmethod
+    def _coerce_mask_to_bool(mask: NDArray[Any]) -> NDArray[np.bool_]:
+        mask_array = np.asarray(mask)
+        if mask_array.dtype == np.bool_:
+            return mask_array.astype(np.bool_, copy=False)
+        if mask_array.dtype == np.uint8:
+            return mask_array > 0
+        return mask_array != 0
+
+    def _valid_mask_slice(
+        self,
+        key,
+        *,
+        z_slice: Optional[NDArray[np.float32]] = None,
+    ) -> NDArray[np.bool_]:
+        if self._mask is not None:
+            return np.asarray(self._mask[key], dtype=np.bool_)
+        if self._mask_raw is not None:
+            return self._coerce_mask_to_bool(self._mask_raw[key])
+        if z_slice is None:
+            z_slice = np.asarray(self._z[key], dtype=np.float32)
+        return np.isfinite(z_slice) & (z_slice > 0)
 
     def compute_centroid(self) -> Tuple[float, float, float]:
         """Compute the centroid of all valid points.
@@ -774,7 +803,15 @@ class Tifxyz:
             use_stored = stored_resolution
 
         if use_stored:
-            result = np.stack([self._z, self._y, self._x], axis=-1)
+            valid = self._valid_mask
+            result = np.stack(
+                [
+                    np.where(valid, self._z, -1.0),
+                    np.where(valid, self._y, -1.0),
+                    np.where(valid, self._x, -1.0),
+                ],
+                axis=-1,
+            )
         else:
             # Get full resolution coordinates via interpolation
             # Temporarily switch to full resolution for this operation
@@ -976,6 +1013,7 @@ class Tifxyz:
             area=None,  # Computed lazily via quad_area
             extra=dict(self.extra),
             _mask=valid.copy(),
+            _mask_raw=None,
             path=self.path,
             interp_method=self.interp_method,
             resolution=self.resolution,

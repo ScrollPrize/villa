@@ -340,30 +340,24 @@ class TifxyzReader:
         if not tif_path.exists():
             raise FileNotFoundError(f"Coordinate file not found: {tif_path}")
 
-        data = tifffile.imread(str(tif_path))
+        data = tifffile.memmap(str(tif_path), mode="r")
+        if data.dtype == np.float32:
+            return data
         return data.astype(np.float32)
 
     def read_mask(self) -> Optional[np.ndarray]:
-        """Read the mask if present, otherwise return None.
+        """Open the mask lazily if present, otherwise return None.
 
         Returns
         -------
         Optional[np.ndarray]
-            Boolean mask array, or None if mask.tif doesn't exist.
+            Mask-backed array, or None if mask.tif doesn't exist.
         """
         mask_path = self.path / "mask.tif"
         if not mask_path.exists():
             return None
 
-        mask_data = tifffile.imread(str(mask_path))
-
-        # Convert to boolean: assume non-zero means valid
-        if mask_data.dtype == np.bool_:
-            return mask_data
-        elif mask_data.dtype == np.uint8:
-            return mask_data > 0
-        else:
-            return mask_data != 0
+        return tifffile.memmap(str(mask_path), mode="r")
 
     def _read_label_shape(self, path: Path) -> Tuple[int, int]:
         """Read label shape using OpenCV."""
@@ -464,27 +458,12 @@ class TifxyzReader:
                     f"x={x.shape}, y={y.shape}, z={z.shape}"
                 )
 
-        # Load or derive mask
+        # Load mask lazily if requested.
         mask = None
         if load_mask:
             mask = self.read_mask()
             if mask is not None and mask.shape != x.shape:
-                # Mask might be at different resolution - derive from z > 0 instead
-                # logger.warning(
-                #     f"Mask shape {mask.shape} differs from coordinate shape {x.shape}. "
-                #     "Mask will be derived from z > 0."
-                # )
                 mask = None
-
-        # If no mask, derive from z > 0
-        if mask is None:
-            mask = (z > 0) & np.isfinite(z)
-
-        # Mark invalid points (z <= 0) with sentinel value
-        invalid = ~mask
-        x[invalid] = -1.0
-        y[invalid] = -1.0
-        z[invalid] = -1.0
 
         return Tifxyz(
             _x=x,
@@ -495,7 +474,7 @@ class TifxyzReader:
             bbox=meta["bbox"],
             area=meta["area"],
             extra=meta["extra"],
-            _mask=mask,
+            _mask_raw=mask,
             path=self.path,
             _labels_loaded=False,
         )
