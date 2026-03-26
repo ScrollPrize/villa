@@ -32,6 +32,7 @@ dependencies = [
     "einops>=0.8.2",
     "pyqt6>=6.10.2",
     "pytorch-optimizer>=3.10.0",
+    "connected-components-3d>=3.26.1",
 ]
 
 [tool.setuptools.packages.find]
