@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -107,6 +108,104 @@ def _concat_result_arrays(list_of_arrays, ndim: int) -> np.ndarray:
     if not flat:
         return np.zeros((0, ndim), dtype=np.int64)
     return np.ascontiguousarray(np.concatenate(flat, axis=0))
+
+
+def _sum_aux_parts(aux_parts: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    aux_sum: Dict[str, torch.Tensor] = {}
+    if not aux_parts:
+        return aux_sum
+    all_keys = set().union(*(part.keys() for part in aux_parts))
+    for key in all_keys:
+        values = [part[key].reshape(1) for part in aux_parts if key in part]
+        aux_sum[key] = torch.sum(torch.cat(values)).reshape(1)
+    return aux_sum
+
+
+def _iter_connected_component_masks(mask: torch.Tensor) -> List[Tuple[slice, slice, np.ndarray]]:
+    if mask.ndim != 2:
+        raise ValueError(f"Mask-aware projected Betti loss expects 2D masks, got shape {tuple(mask.shape)}")
+
+    mask_np = mask.detach().cpu().numpy() >= 0.5
+    if not np.any(mask_np):
+        return []
+
+    height, width = mask_np.shape
+    visited = np.zeros_like(mask_np, dtype=bool)
+    components: List[Tuple[slice, slice, np.ndarray]] = []
+
+    for start_row, start_col in np.argwhere(mask_np):
+        start_row = int(start_row)
+        start_col = int(start_col)
+        if visited[start_row, start_col]:
+            continue
+
+        queue = deque([(start_row, start_col)])
+        visited[start_row, start_col] = True
+        coords: List[Tuple[int, int]] = []
+        min_row = max_row = start_row
+        min_col = max_col = start_col
+
+        while queue:
+            row, col = queue.pop()
+            coords.append((row, col))
+            min_row = min(min_row, row)
+            max_row = max(max_row, row)
+            min_col = min(min_col, col)
+            max_col = max(max_col, col)
+
+            for row_offset, col_offset in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                next_row = row + row_offset
+                next_col = col + col_offset
+                if next_row < 0 or next_row >= height or next_col < 0 or next_col >= width:
+                    continue
+                if visited[next_row, next_col] or not mask_np[next_row, next_col]:
+                    continue
+                visited[next_row, next_col] = True
+                queue.append((next_row, next_col))
+
+        component_mask = np.zeros((max_row - min_row + 1, max_col - min_col + 1), dtype=bool)
+        for row, col in coords:
+            component_mask[row - min_row, col - min_col] = True
+
+        components.append(
+            (
+                slice(min_row, max_row + 1),
+                slice(min_col, max_col + 1),
+                component_mask,
+            )
+        )
+
+    return components
+
+
+def _masked_component_fields(
+    pred_field: torch.Tensor,
+    tgt_field: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
+) -> List[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+    if valid_mask is None:
+        return [(pred_field, tgt_field, None)]
+
+    if pred_field.ndim != 2 or tgt_field.ndim != 2:
+        raise ValueError("Mask-aware projected Betti loss only supports 2D fields")
+
+    component_specs = _iter_connected_component_masks(valid_mask)
+    if not component_specs:
+        return []
+
+    components: List[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]] = []
+    for row_slice, col_slice, component_mask_np in component_specs:
+        pred_crop = pred_field[row_slice, col_slice].clone()
+        tgt_crop = tgt_field[row_slice, col_slice].clone()
+        component_mask = torch.from_numpy(component_mask_np).to(device=pred_field.device, dtype=torch.bool)
+
+        if not bool(component_mask.all()):
+            pred_crop = pred_crop.masked_fill(~component_mask, 1.0)
+            tgt_crop = tgt_crop.masked_fill(~component_mask, 1.0)
+
+        components.append((pred_crop.contiguous(), tgt_crop.contiguous(), component_mask.contiguous()))
+
+    return components
 
 
 def _compute_loss_from_result(
@@ -286,31 +385,52 @@ class BettiMatchingLoss(nn.Module):
         valid_masks: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         bm = _get_betti_module()
-        results = bm.compute_matching(
-            _to_numpy(pred_fields),
-            _to_numpy(tgt_fields),
-            include_input1_unmatched_pairs=True,
-            include_input2_unmatched_pairs=self.include_unmatched_target,
-        )
-
-        losses: List[torch.Tensor] = []
-        aux_parts: List[Dict[str, torch.Tensor]] = []
         if valid_masks is None:
             valid_masks = [None] * len(pred_fields)
 
-        for pred_field, tgt_field, valid_mask, result in zip(pred_fields, tgt_fields, valid_masks, results):
-            loss_part, aux_part = _compute_loss_from_result(
-                pred_field,
-                tgt_field,
-                result,
-                mask=valid_mask,
-                include_unmatched_target=self.include_unmatched_target,
-                push_to=self.push_unmatched_to,
-            )
-            losses.append(loss_part)
-            aux_parts.append(aux_part)
+        sample_losses: List[torch.Tensor] = []
+        sample_aux_parts: List[Dict[str, torch.Tensor]] = []
 
-        return torch.mean(torch.cat(losses)), _aggregate_aux(aux_parts)
+        for pred_field, tgt_field, valid_mask in zip(pred_fields, tgt_fields, valid_masks):
+            component_fields = _masked_component_fields(pred_field, tgt_field, valid_mask)
+            if not component_fields:
+                sample_losses.append(pred_field.new_zeros((1,)))
+                sample_aux_parts.append({})
+                continue
+
+            masked_pred_fields = [part[0] for part in component_fields]
+            masked_tgt_fields = [part[1] for part in component_fields]
+            component_masks = [part[2] for part in component_fields]
+            results = bm.compute_matching(
+                _to_numpy(masked_pred_fields),
+                _to_numpy(masked_tgt_fields),
+                include_input1_unmatched_pairs=True,
+                include_input2_unmatched_pairs=self.include_unmatched_target,
+            )
+
+            component_losses: List[torch.Tensor] = []
+            component_aux_parts: List[Dict[str, torch.Tensor]] = []
+            for masked_pred, masked_tgt, component_mask, result in zip(
+                masked_pred_fields,
+                masked_tgt_fields,
+                component_masks,
+                results,
+            ):
+                loss_part, aux_part = _compute_loss_from_result(
+                    masked_pred,
+                    masked_tgt,
+                    result,
+                    mask=component_mask,
+                    include_unmatched_target=self.include_unmatched_target,
+                    push_to=self.push_unmatched_to,
+                )
+                component_losses.append(loss_part)
+                component_aux_parts.append(aux_part)
+
+            sample_losses.append(torch.sum(torch.cat(component_losses)).reshape(1))
+            sample_aux_parts.append(_sum_aux_parts(component_aux_parts))
+
+        return torch.mean(torch.cat(sample_losses)), _aggregate_aux(sample_aux_parts)
 
     def forward(self, input: torch.Tensor, target: torch.Tensor, loss_mask: Optional[torch.Tensor] = None):
         if input.shape[0] == 0:
