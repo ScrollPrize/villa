@@ -214,7 +214,9 @@ def train(config_path, profile_steps):
     val_subset = val_ds
 
     dataloader_workers = int(config.get('dataloader_workers', 0))
-    dataloader_kwargs = {}
+    dataloader_kwargs = {
+        'pin_memory': bool(config.get('pin_memory', accelerator.device.type == 'cuda')),
+    }
     if dataloader_workers > 0:
         dataloader_kwargs['multiprocessing_context'] = 'spawn'
         dataloader_kwargs['persistent_workers'] = True

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import tifffile
 
-from vesuvius.tifxyz import read_tifxyz
+from vesuvius.tifxyz import TifxyzReader, read_tifxyz
 
 
 def _write_segment(path: Path, shape: tuple[int, int], scale: tuple[float, float] = (1.0, 1.0)) -> Path:
@@ -57,6 +57,28 @@ def test_list_labels_discovers_paths_shapes_and_status(tmp_path: Path) -> None:
     assert c_ink["shape"] == (5, 8)
     assert c_ink["matches_stored_shape"] is False
     assert "Shape mismatch" in str(c_ink["error"])
+
+
+def test_read_tifxyz_defers_label_discovery_until_requested(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    segment_dir = _write_segment(tmp_path / "segment", (6, 8))
+    _write_label(segment_dir / "a_ink.tif", np.full((6, 8), 7, dtype=np.uint8))
+
+    discover_calls = 0
+    original_discover_labels = TifxyzReader.discover_labels
+
+    def wrapped_discover_labels(self, expected_shape):
+        nonlocal discover_calls
+        discover_calls += 1
+        return original_discover_labels(self, expected_shape)
+
+    monkeypatch.setattr(TifxyzReader, "discover_labels", wrapped_discover_labels)
+
+    segment = read_tifxyz(segment_dir)
+    assert discover_calls == 0
+
+    labels = segment.list_labels()
+    assert discover_calls == 1
+    assert [label["filename"] for label in labels] == ["a_ink.tif"]
 
 
 def test_load_label_by_index_filename_and_suffix(tmp_path: Path) -> None:

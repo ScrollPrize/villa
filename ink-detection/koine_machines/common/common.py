@@ -131,7 +131,7 @@ def _read_bbox_with_padding(volume, bbox, *, fill_value=0):
         min(volume_shape[2], x1),
     )
 
-    dtype = np.asarray(volume[(slice(0, 1),) * 3]).dtype
+    dtype = np.dtype(volume.dtype)
     output = np.full(expected_shape, fill_value, dtype=dtype)
 
     if any(stop <= start for start, stop in zip(src_starts, src_stops)):

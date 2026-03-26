@@ -65,6 +65,7 @@ class Tifxyz:
     _normals_cache: Optional[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]] = field(default=None, repr=False)
     _patches_cache: Optional[List[Tuple[Tuple[int, int, int, int], Tuple[float, ...]]]] = field(default=None, repr=False)
     _labels: List[Dict[str, Any]] = field(default_factory=list, repr=False)
+    _labels_loaded: bool = field(default=True, repr=False)
 
     def __post_init__(self) -> None:
         """Validate shapes and ensure arrays are float32."""
@@ -201,12 +202,27 @@ class Tifxyz:
         """Return the internal storage shape (implementation detail)."""
         return self._x.shape  # type: ignore[return-value]
 
+    def _ensure_labels_loaded(self) -> List[Dict[str, Any]]:
+        if self._labels_loaded:
+            return self._labels
+
+        if self.path is None:
+            self._labels_loaded = True
+            return self._labels
+
+        from .reader import TifxyzReader
+
+        reader = TifxyzReader(self.path)
+        self._labels = reader.discover_labels(expected_shape=self._stored_shape)
+        self._labels_loaded = True
+        return self._labels
+
     def list_labels(self) -> List[Dict[str, Any]]:
         """List discovered label metadata."""
-        return [dict(label) for label in self._labels]
+        return [dict(label) for label in self._ensure_labels_loaded()]
 
     def _resolve_label_selector(self, selector: Union[int, str]) -> Dict[str, Any]:
-        labels = self._labels
+        labels = self._ensure_labels_loaded()
         if not labels:
             raise ValueError("No labels were discovered for this segment")
 
@@ -964,7 +980,8 @@ class Tifxyz:
             interp_method=self.interp_method,
             resolution=self.resolution,
             volume=new_volume,
-            _labels=self.list_labels(),
+            _labels=[dict(label) for label in self._labels],
+            _labels_loaded=self._labels_loaded,
         )
 
     def _get_volume_level(self, factor: float) -> Optional["zarr.Array"]:
