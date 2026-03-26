@@ -81,6 +81,39 @@ def test_read_tifxyz_defers_label_discovery_until_requested(tmp_path: Path, monk
     assert [label["filename"] for label in labels] == ["a_ink.tif"]
 
 
+def test_read_tifxyz_uses_lazy_coordinate_memmaps_and_slice_local_invalids(tmp_path: Path) -> None:
+    segment_dir = _write_segment(tmp_path / "segment", (4, 5))
+
+    x = tifffile.memmap(str(segment_dir / "x.tif"), mode="r+")
+    y = tifffile.memmap(str(segment_dir / "y.tif"), mode="r+")
+    z = tifffile.memmap(str(segment_dir / "z.tif"), mode="r+")
+    x[1, 2] = 123.0
+    y[1, 2] = 456.0
+    z[1, 2] = 0.0
+    x.flush()
+    y.flush()
+    z.flush()
+
+    segment = read_tifxyz(segment_dir)
+
+    assert isinstance(segment._x, np.memmap)
+    assert isinstance(segment._y, np.memmap)
+    assert isinstance(segment._z, np.memmap)
+    assert segment._mask is None
+
+    sx, sy, sz, valid = segment[1:2, 2:3]
+    assert valid.shape == (1, 1)
+    assert bool(valid[0, 0]) is False
+    assert float(sx[0, 0]) == -1.0
+    assert float(sy[0, 0]) == -1.0
+    assert float(sz[0, 0]) == -1.0
+
+    zyxs = segment.get_zyxs(stored_resolution=True)
+    assert float(zyxs[1, 2, 0]) == -1.0
+    assert float(zyxs[1, 2, 1]) == -1.0
+    assert float(zyxs[1, 2, 2]) == -1.0
+
+
 def test_load_label_by_index_filename_and_suffix(tmp_path: Path) -> None:
     segment_dir = _write_segment(tmp_path / "segment", (4, 5))
     ink_u16 = (np.arange(20, dtype=np.uint16).reshape(4, 5) * 200)

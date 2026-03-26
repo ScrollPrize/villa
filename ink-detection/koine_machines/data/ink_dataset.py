@@ -79,11 +79,15 @@ def _select_flat_pixels_for_native_crop(patch_zyxs, valid_mask, crop_bbox):
     if not np.any(within):
         raise ValueError(f"crop_bbox {crop_bbox!r} does not intersect any valid flat tifxyz pixels")
 
-    rows, cols = np.where(within)
-    support_y0 = int(rows.min())
-    support_y1 = int(rows.max()) + 1
-    support_x0 = int(cols.min())
-    support_x1 = int(cols.max()) + 1
+    # We only need the enclosing row/column span, not every matching index.
+    row_hits = np.any(within, axis=1)
+    col_hits = np.any(within, axis=0)
+    row_indices = np.flatnonzero(row_hits)
+    col_indices = np.flatnonzero(col_hits)
+    support_y0 = int(row_indices[0])
+    support_y1 = int(row_indices[-1]) + 1
+    support_x0 = int(col_indices[0])
+    support_x1 = int(col_indices[-1]) + 1
     return (
         (support_y0, support_y1, support_x0, support_x1),
         patch_zyxs[support_y0:support_y1, support_x0:support_x1],
