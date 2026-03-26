@@ -570,6 +570,47 @@ wheels = [
 ]
 
 [[package]]
+name = "connected-components-3d"
+version = "3.26.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/db/f5/7d2f66ef47b8496460e0738fdb349c7daa88ea6d39047a840a57364f8bb3/connected_components_3d-3.26.1.tar.gz", hash = "sha256:2f558954c3f732d404fc9b380a36a934ba9216c54e387e3d32439fd35ed48bbb", size = 78353, upload-time = "2025-11-03T17:20:37.337Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d4/7f/d832e2f0cfe8476cfadb3f9d0e2e152c35d21f7dd6e30a96d865ddfbc189/connected_components_3d-3.26.1-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:a1819fbcd034f96a995066d5020a5a29b99fb5f3d9b373e3e4e52f9abb0e4808", size = 789472, upload-time = "2025-11-03T17:19:43.165Z" },
+    { url = "https://files.pythonhosted.org/packages/de/68/e8bd3a5434a6f2cec234446693e3f491c1cc6f704b2e76505c62f9a0fcd0/connected_components_3d-3.26.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:9127d142dd8d161612fb0ca899cfc19d83fb14c67596446428932f4dce178094", size = 690644, upload-time = "2025-11-03T17:19:44.143Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/77/1f9528dc38cedcb1cd0036c8c2fc9ba951d8009c09fd0aa0738b3faa8075/connected_components_3d-3.26.1-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:08c281f9eae37221ba8eeab4feb80aad8acd478461d104c7e052b21def7e4816", size = 4363718, upload-time = "2025-11-03T17:19:45.942Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/bd/6266ce161a2030c0173cfa0da4d3efe7cd599cc70e3758167cb3b7947180/connected_components_3d-3.26.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:cd0ffb1e5dd5f3a86f72241db45b670b3bbc7b06d1f1b3950e135091766d68be", size = 4685381, upload-time = "2025-11-03T17:19:47.974Z" },
+    { url = "https://files.pythonhosted.org/packages/1f/38/6042c6d8c0118c6a53c83434fc6804a2d2bcb18485854368bb971ee2b584/connected_components_3d-3.26.1-cp311-cp311-win32.whl", hash = "sha256:497de338400befa1a60e4a27cca7cc1393a52140a4790aba248b5b21fbb1428d", size = 568133, upload-time = "2025-11-03T17:19:51.891Z" },
+    { url = "https://files.pythonhosted.org/packages/bb/d7/0335fc9e969091e8c3e38bad059b622b0009c779aca44faa29095b78bc0d/connected_components_3d-3.26.1-cp311-cp311-win_amd64.whl", hash = "sha256:ae86c2e195836750facbbbe88414370e711cf17e68ae110f66b7bd98ea90611f", size = 518515, upload-time = "2025-11-03T17:19:50.181Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/66/d6a66ae3407af69dcf1a6ecd94c333c14b15725850b565d3554332c99b86/connected_components_3d-3.26.1-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:bbe80992b0c3f991888b378d19399d60c4eabc08995478ca40216993d8d234bf", size = 784912, upload-time = "2025-11-03T17:19:52.931Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/a8/d8e77ca1369fd83180da509cfd57811652595806719ae9abd1ee14fa2381/connected_components_3d-3.26.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:af13eb0bed323583dfdb67e8e2a5eded21974e5fc82f8a53a389ab6ffa978433", size = 689204, upload-time = "2025-11-03T17:19:54.07Z" },
+    { url = "https://files.pythonhosted.org/packages/1a/a6/1f0121dbf45470a53ef38a4e09584febfc4145f752abc8dce1d6b9d86be9/connected_components_3d-3.26.1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f17ed51e348012413da666d948e39c27e1d33a7080ee6024a70c2814673d319e", size = 4277918, upload-time = "2025-11-03T17:19:56.117Z" },
+    { url = "https://files.pythonhosted.org/packages/db/57/85198a0581cd49d115adce771bd948a8279c9c04935f85a252c5b93014d3/connected_components_3d-3.26.1-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5351d52b3e0247b29c2aada10eddbf96dcd0b997640cd35db6c77e4bb5b79c06", size = 4650295, upload-time = "2025-11-03T17:19:58.729Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/da/2e63bcc11fd8f852ec9b74c6fa6603e96f87c5f643c8a1d2bb394ba2ec08/connected_components_3d-3.26.1-cp312-cp312-win32.whl", hash = "sha256:404394c08ff3bdfca24fb1ed104151ba849b595875505bda9e1459ec97804300", size = 555979, upload-time = "2025-11-03T17:20:02.956Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/89/9a0ed460042c4ad3f3bc2ab2c047ecf70841cae20d97861af6713395a109/connected_components_3d-3.26.1-cp312-cp312-win_amd64.whl", hash = "sha256:7f43e869891c520feccec617b26655216a3acc1acd2db1b0e94022fcd19750d9", size = 506449, upload-time = "2025-11-03T17:20:01.719Z" },
+    { url = "https://files.pythonhosted.org/packages/04/41/ccccab8f6f05589b976949da7339cab50aae09c8811b4de58d3f1992e192/connected_components_3d-3.26.1-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:9cb881c1f37eab5799d23cd0862e785bf6959faea3208db6ceb9fe27c45e7a6b", size = 783994, upload-time = "2025-11-03T17:20:04.063Z" },
+    { url = "https://files.pythonhosted.org/packages/ce/31/ee3c1c6db9d10ae327eca541c0ac10be216dbc82d3784c52f11b313e509d/connected_components_3d-3.26.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:f3785336f2b902a05dd01fcfb8c91ff2f8a4667d4ffa47a74e668540d1abe902", size = 687834, upload-time = "2025-11-03T17:20:05.968Z" },
+    { url = "https://files.pythonhosted.org/packages/10/c3/0428e93f457cb4684235e36a49dc925761b3a653df419f025338bf92c4fd/connected_components_3d-3.26.1-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a540449af682485182b50da50a98423e43468bc7142f0ad221d70399065be1f0", size = 4280603, upload-time = "2025-11-03T17:20:08.13Z" },
+    { url = "https://files.pythonhosted.org/packages/da/40/528021d88e156c2139d6880274ebc82e8d43c2ce496f7a149b2d1a65aac1/connected_components_3d-3.26.1-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:53e4d22e7305dc274091fa3297d5c1957a513be75cfe8bcd018fad1c7695b9e0", size = 4622449, upload-time = "2025-11-03T17:20:09.88Z" },
+    { url = "https://files.pythonhosted.org/packages/94/1c/7a15d08a6086e807d7eeea7ad44d54e2a2947e3228d5157a3231f73f003c/connected_components_3d-3.26.1-cp313-cp313-win32.whl", hash = "sha256:de38f0b09a17e37c9fb20311fcc5304a7c5b4945a895fba6577a174cc8725c89", size = 557265, upload-time = "2025-11-03T17:20:12.088Z" },
+    { url = "https://files.pythonhosted.org/packages/be/bf/95b4e3fe0e79d08c4a41b6c203162bce8a2eed146a3b627ce9d142415fb6/connected_components_3d-3.26.1-cp313-cp313-win_amd64.whl", hash = "sha256:bbec98b651ec453be053b3d2b188cdb2e050e61e1d7f4cad6b221490d96ae9ce", size = 506237, upload-time = "2025-11-03T17:20:11.068Z" },
+    { url = "https://files.pythonhosted.org/packages/79/a0/0845a78f197a791191cd6822c380016c530447ee79e2700c9e554bbef964/connected_components_3d-3.26.1-cp314-cp314-macosx_10_13_x86_64.whl", hash = "sha256:e7583d0d7043be5aa247d49aedb24ee6f5d3d0804661b6bec1d916243fa5d3e1", size = 784198, upload-time = "2025-11-03T17:20:13.1Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/fb/271046c3a9e6961965065c8dbbea1c8f42fd557808c59fc441e3bef6443c/connected_components_3d-3.26.1-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:ff2b1fa9ca9ea98befcdbc267f8aff31d48065044f0e0ecdd21e408f5d16dd5b", size = 692675, upload-time = "2025-11-03T17:20:14.297Z" },
+    { url = "https://files.pythonhosted.org/packages/64/ee/d3038d21ed2cdbbd62c89dc8ebdff47ee761f67c484ecaa6e9068da07b7b/connected_components_3d-3.26.1-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b7fe75a7be6f7c61b697033eed6ad09b5d459f9173c2c8b21e4aed0610f53465", size = 4269537, upload-time = "2025-11-03T17:20:15.931Z" },
+    { url = "https://files.pythonhosted.org/packages/c7/69/add0ee2b3e9beab866db66694492119d29ef2a4a49189bbb618e6fffef55/connected_components_3d-3.26.1-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3e185ddcc9f1c2e3f1e5a87b49fa7cee45218009072920d6e2e533ab22830fc3", size = 4597941, upload-time = "2025-11-03T17:20:17.446Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/46/a059c8d003b426901fb659c53b3399630136a6de8a241a8e44aaf2e88316/connected_components_3d-3.26.1-cp314-cp314-win32.whl", hash = "sha256:593968c3fad3ffd562e425e8bc317aca2e354ddd76ca5294580fb5eefbfb1cca", size = 566617, upload-time = "2025-11-03T17:20:19.67Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/cb/76ad906c2341a73ed761ee76af638b5f4beca48a244969ebad84b745f7b9/connected_components_3d-3.26.1-cp314-cp314-win_amd64.whl", hash = "sha256:bff4e40cd8f8f064f018fa0175b10c7bacb76f2b777f34f6385b84cdc3bfd6e1", size = 515908, upload-time = "2025-11-03T17:20:18.653Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/2a/90b5aa5a2705ea243fb4d4126b818e701406583640856d8aba2755460c6a/connected_components_3d-3.26.1-cp314-cp314t-macosx_10_13_x86_64.whl", hash = "sha256:2f86f5efc3de68bf0a7bb4af19ef04887390b78ca3415c1380878612040f9757", size = 806872, upload-time = "2025-11-03T17:20:20.824Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/9f/85ca273e266d61732560661985b78330463f2f10a18bb3bcf02ea43babc5/connected_components_3d-3.26.1-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:488b028a57dc9d9dc90b05b0d8c60f56f5050bb8467f1c140324c0f7fe3e0410", size = 717277, upload-time = "2025-11-03T17:20:21.924Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/8b/55cdc7c5a3b2335b48115ece12d8a2c70f773872585fdba0964b9bccdeb7/connected_components_3d-3.26.1-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:cef3969410133260923cd70a7f04f774b31d814cd2c3d8487184290b6fcd59f2", size = 4367237, upload-time = "2025-11-03T17:20:23.549Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/2b/4e6246cfec615185667c2f3174ce3cd7ff3f903f6fe62e008b5b74a24ef9/connected_components_3d-3.26.1-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:05c9a31c658cf1834d928f58887203447ba7390824238325ee533c93deb2f76b", size = 4594743, upload-time = "2025-11-03T17:20:25.303Z" },
+    { url = "https://files.pythonhosted.org/packages/28/cc/11f1485a13bfc9a3ed58375dd7eb76392aca09479c3589988c75e758c26d/connected_components_3d-3.26.1-cp314-cp314t-win32.whl", hash = "sha256:6ee949e00d3768327f39d6d6f0c69b7535a160de625480705d9c061c559c05ea", size = 605047, upload-time = "2025-11-03T17:20:28.097Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/81/c358dc5ccb392c1eb25e4baced217cf53ed7971039a47bab2d441ffb24bc/connected_components_3d-3.26.1-cp314-cp314t-win_amd64.whl", hash = "sha256:0fa737b147081200df93f90af7684435e699f97691fbb2b278e212223e4a7892", size = 568723, upload-time = "2025-11-03T17:20:26.875Z" },
+]
+
+[[package]]
 name = "cuda-bindings"
 version = "12.9.4"
 source = { registry = "https://pypi.org/simple" }
@@ -1394,6 +1435,7 @@ source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
     { name = "albumentations" },
+    { name = "connected-components-3d" },
     { name = "diffusers" },
     { name = "einops" },
     { name = "imagecodecs" },
@@ -1422,6 +1464,7 @@ dependencies = [
 requires-dist = [
     { name = "accelerate", specifier = ">=1.13.0" },
     { name = "albumentations", specifier = "==2.0.8" },
+    { name = "connected-components-3d", specifier = ">=3.26.1" },
     { name = "diffusers", specifier = ">=0.37.0" },
     { name = "einops", specifier = ">=0.8.2" },
     { name = "imagecodecs", specifier = ">=2026.3.6" },
