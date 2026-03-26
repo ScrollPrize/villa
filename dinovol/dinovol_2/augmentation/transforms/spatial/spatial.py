@@ -192,7 +192,7 @@ class SpatialTransform(BasicTransform):
                 # Device-native separable Gaussian blur along all spatial axes
                 t = offsets[d].unsqueeze(0)  # [1, *patch]
                 for axis in range(dim):
-                    t = blur_dimension(t, sigmas[d], axis, force_use_fft=False, truncate=6)
+                    t = blur_dimension(t, sigmas[d], axis, truncate=6)
                 t = t.squeeze(0)
                 # Normalize magnitude to requested scale
                 mx = torch.max(torch.abs(t))
