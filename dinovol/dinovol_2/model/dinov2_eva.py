@@ -12,7 +12,13 @@ from torch.utils.checkpoint import checkpoint
 from einops import rearrange
 
 from dinovol_2.model.patch_encode_decode import PatchEmbed, PatchEmbedDeeper
-from dinovol_2.model.rope import MixedRopePositionEmbedding, RopeEmbedding, RopePositionEmbedding, apply_rotary_embedding
+from dinovol_2.model.rope import (
+    MixedRopePositionEmbedding,
+    RopeCoords,
+    RopeEmbedding,
+    RopePositionEmbedding,
+    apply_rotary_embedding,
+)
 
 
 class InitWeights_He(object):
@@ -255,11 +261,15 @@ class EvaBlock(nn.Module):
             rope: Optional[RopeEmbedding] = None,
             attn_mask: Optional[torch.Tensor] = None,
             rope_shape: Optional[Tuple[int, ...]] = None,
+            rope_coords: Optional[RopeCoords] = None,
     ):
         if rope is None and self.rope_embed is not None:
-            if rope_shape is None:
-                raise ValueError("rope_shape must be provided when using per-block RoPE")
-            rope = self.rope_embed.get_embed(rope_shape)
+            if rope_coords is not None:
+                rope = self.rope_embed.get_embed_from_coords(rope_coords)
+            else:
+                if rope_shape is None:
+                    raise ValueError("rope_shape must be provided when using per-block RoPE")
+                rope = self.rope_embed.get_embed(rope_shape)
         if self.gamma_1 is None:
             x = x + self.drop_path1(self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask))
             x = x + self.drop_path2(self.mlp(self.norm2(x)))
@@ -518,7 +528,7 @@ class Eva(nn.Module):
         if self.reg_token is not None:
             trunc_normal_(self.reg_token, std=.02)
         if self.mask_token is not None:
-            trunc_normal_(self.mask_token, std=.02)
+            nn.init.zeros_(self.mask_token)
         
         # Inline fix_init_weight
         def rescale(param, layer_id):
@@ -595,6 +605,18 @@ class Eva(nn.Module):
         if self.rope_embed is None:
             return None
         return self.rope_embed.get_embed(target_size)
+
+    def _get_shared_per_block_rope_coords(self, target_size: Tuple[int, ...]) -> Optional[RopeCoords]:
+        if not self.use_per_block_rope:
+            return None
+        for block in self.blocks:
+            if hasattr(block, "rope_embed") and block.rope_embed is not None:
+                return block.rope_embed.get_coords(target_size)
+            if isinstance(block, nn.ModuleList):
+                for inner_block in block:
+                    if hasattr(inner_block, "rope_embed") and inner_block.rope_embed is not None:
+                        return inner_block.rope_embed.get_coords(target_size)
+        return None
     
     def interpolate_pos_encoding_nd(
             self,
@@ -747,11 +769,12 @@ class Eva(nn.Module):
     
     def forward_features(self, x, masks=None, *, view_kind: str = "global"):
         x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
+        rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
         for blk in self.blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape)
+                x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
             else:
-                x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape)
+                x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         x = self.norm(x)
         outputs = {
             "x_norm_clstoken": x[:, 0] if self.num_class_tokens > 0 else None,
@@ -860,9 +883,9 @@ class Eva(nn.Module):
 
 
 class BlockChunk(nn.ModuleList):
-    def forward(self, x, rope=None, attn_mask=None, rope_shape=None):
+    def forward(self, x, rope=None, attn_mask=None, rope_shape=None, rope_coords=None):
         for blk in self:
-            x = blk(x, rope=rope, attn_mask=attn_mask, rope_shape=rope_shape)
+            x = blk(x, rope=rope, attn_mask=attn_mask, rope_shape=rope_shape, rope_coords=rope_coords)
         return x
 
 
@@ -887,19 +910,20 @@ class EvaWithChunking(Eva):
     
     def forward_features(self, x, masks=None, *, view_kind: str = "global"):
         x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
+        rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
         
         if self.chunked_blocks:
             for chunk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(chunk, x, rope=rot_pos_embed, rope_shape=rope_shape)
+                    x = checkpoint(chunk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
                 else:
-                    x = chunk(x, rope=rot_pos_embed, rope_shape=rope_shape)
+                    x = chunk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         else:
             for blk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape)
+                    x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
                 else:
-                    x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape)
+                    x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         
         x = self.norm(x)
         outputs = {
