@@ -47,6 +47,15 @@ A vast library of papyrus scrolls in ancient Herculaneum was buried beneath volc
 
 Our goal is to **virtually unwrap** the scrolls from their 3D X‑ray volumes and recover ink that is invisible to the naked eye. Detached fragments include exposed ink and serve as **ground truth** for improving machine‑learning approaches to ink detection.
 
+## Multiple datasets
+
+This portal aggregates multiple released datasets under one Vesuvius Challenge data portal.
+
+- **EduceLab-Scrolls**: the legacy dataset. Scrolls 1-4 and Fragments 1-6 belong to this dataset.
+- **Vesuvius Challenge - CT Scans of Herculaneum Papyri**: newer scans released directly by Vesuvius Challenge. Most current releases on this portal belong to this dataset.
+
+If you are publishing or presenting results, make sure you cite the dataset that corresponds to the scans you used.
+
 ## Data repositories
 
 We host the dataset in **two repositories** (with the **same folder layout**):
@@ -114,6 +123,24 @@ Looking for scroll-only or fragment-only views? Use the same browser row-by-row 
 - [EduceLab Data Sheet (2023)](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing): technical description of more recent scans added to the dataset.
 - [Scan at ESRF Draft Info Sheet (2025)](https://docs.google.com/document/d/1CDPgx7XhNsnLJw6uErT8Z5tgY3wnETQdvXpR5Kwu9K4/edit?usp=sharing)
 
+## How to Cite
+
+If you use Vesuvius Challenge data in a publication or presentation, cite the dataset that corresponds to the scans you used.
+
+### Vesuvius Challenge - CT Scans of Herculaneum Papyri
+
+Use this citation for newer scans released directly by Vesuvius Challenge:
+
+> Giorgio Angelotti, Stephen Parsons, Sean Johnson, Elian Rafael Dal Prà, Johannes Rudolph, Paul Tafforeau, Alessandro Mirone, Paul Henderson, Hendrik Schilling, Forrest McDonald, David Josey, Youssef Nader, C. Seth Parker, W. Brent Seales. *Vesuvius Challenge - CT Scans of Herculaneum Papyri*. Vesuvius Challenge.
+
+### EduceLab-Scrolls
+
+Scrolls 1-4 and Fragments 1-6 belong to the legacy EduceLab-Scrolls dataset.
+
+- In any published abstract, cite `EduceLab-Scrolls` as the source of the data.
+- In any published manuscripts using data from EduceLab-Scrolls, reference: Parsons, S., Parker, C. S., Chapman, C., Hayashida, M., & Seales, W. B. (2023). *EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT*. ArXiv [Cs.CV]. https://doi.org/10.48550/arXiv.2304.02084.
+- Include language similar to the following in the methods section: "Data used in the preparation of this article were obtained from the EduceLab-Scrolls dataset [above citation]."
+
 ## Support
 
 - GitHub Issues: [Vesuvius Challenge repository](https://github.com/scrollprize/villa)
@@ -122,8 +149,4 @@ Looking for scroll-only or fragment-only views? Use the same browser row-by-row 
 ## Licenses
 
 - [CC‑BY‑NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (unless otherwise noted for specific assets)
-- Scrolls 1-4 and Fragments 1-6 are from the EduceLab-Scrolls Dataset, copyrighted by EduceLab/The University of Kentucky. Permission to use the data linked herein according to the terms outlined above is granted to Vesuvius Challenge, with the following additional terms:
-  - I agree all publications and presentations resulting from any use of the EduceLab-Scrolls Dataset must cite use of the EduceLab-Scrolls Dataset as follows.
-  - In any published abstract, I will cite "EduceLab-Scrolls" as the source of the data in the abstract.
-  - In any published manuscripts using data from EduceLab-Scrolls, I will reference the following paper: Parsons, S., Parker, C. S., Chapman, C., Hayashida, M., & Seales, W. B. (2023). EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT. ArXiv [Cs.CV]. https://doi.org/10.48550/arXiv.2304.02084.
-  - I will include language similar to the following in the methods section of my manuscripts in order to accurately acknowledge the data source: "Data used in the preparation of this article were obtained from the EduceLab-Scrolls dataset [above citation]."
+- Scrolls 1-4 and Fragments 1-6 are from the EduceLab-Scrolls Dataset, copyrighted by EduceLab/The University of Kentucky. Permission to use the data linked herein according to the terms outlined above is granted to Vesuvius Challenge, with additional citation requirements listed in [How to Cite](#how-to-cite).
