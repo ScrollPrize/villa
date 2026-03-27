@@ -156,14 +156,19 @@ target_link_libraries(vc_telea_inpaint
 add_executable(vc_thinning src/vc_thinning.cpp)
 target_link_libraries(vc_thinning vc_core opencv_ximgproc)
 
-add_executable(vc_thinning_bench src/vc_thinning_bench.cpp)
-target_link_libraries(vc_thinning_bench vc_core Boost::program_options opencv_core opencv_imgcodecs)
-
 add_executable(vc_tifxyz src/vc_tifxyz.cpp)
 target_link_libraries(vc_tifxyz vc_core Boost::program_options opencv_core)
 
 add_executable(vc_zarr_to_tiff src/vc_zarr_to_tiff.cpp)
 target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
+
+add_executable(vc_zarr_recompress src/vc_zarr_recompress.cpp)
+target_link_libraries(vc_zarr_recompress vc_core)
+target_include_directories(vc_zarr_recompress PRIVATE
+    ${CMAKE_SOURCE_DIR}/libs/c-blosc/blosc
+    ${CMAKE_BINARY_DIR}/libs/c-blosc/blosc
+)
+
 
 # Precompiled headers for CLI apps (reuse vc_core's PCH)
 if(VC_USE_PCH)

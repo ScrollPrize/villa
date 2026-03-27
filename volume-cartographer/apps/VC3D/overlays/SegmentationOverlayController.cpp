@@ -17,6 +17,7 @@
 #include <chrono>
 #include <filesystem>
 #include <limits>
+#include <unordered_set>
 
 #include <opencv2/imgcodecs.hpp>
 
@@ -41,6 +42,7 @@ constexpr qreal kMarkerPenWidth = 2.0;
 constexpr qreal kActivePenWidth = 2.5;
 constexpr qreal kMaskZ = 60.0;
 constexpr qreal kApprovalMaskZ = 50.0;  // Below mask path (60) but above most other overlays
+constexpr qreal kSurfaceOverlapZ = 45.0;  // Below approval mask
 constexpr qreal kMarkerZ = 95.0;
 constexpr qreal kRadiusCircleZ = 80.0;
 
@@ -138,8 +140,7 @@ bool SegmentationOverlayController::State::operator==(const State& rhs) const
            paintingApproval == rhs.paintingApproval &&
            approvalBrushColor == rhs.approvalBrushColor &&
            surface == rhs.surface &&
-           approvalHoverScenePos == rhs.approvalHoverScenePos &&
-           floatEqual(approvalHoverViewerScale, rhs.approvalHoverViewerScale) &&
+           approvalHoverSurfacePos == rhs.approvalHoverSurfacePos &&
            vec3fOptEqual(approvalHoverPlaneNormal, rhs.approvalHoverPlaneNormal);
 }
 
@@ -209,6 +210,7 @@ void SegmentationOverlayController::applyState(const State& state)
 void SegmentationOverlayController::detachViewer(VolumeViewerBase* viewer)
 {
     _viewerCaches.erase(viewer);
+    _overlapCaches.erase(viewer);
     ViewerOverlayControllerBase::detachViewer(viewer);
 }
 
@@ -638,17 +640,31 @@ void SegmentationOverlayController::performDebouncedApprovalSave()
 
 bool SegmentationOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
-    Q_UNUSED(viewer);
     // Enable overlay rendering if editing is enabled OR if approval mask mode is active
     // (approval mask can be viewed without editing enabled)
     const bool approvalMaskActive = _currentState && _currentState->approvalMaskMode;
-    return _editingEnabled || approvalMaskActive;
+
+    // Also enable if surface overlap overlay is active on this viewer
+    bool surfaceOverlapActive = false;
+    if (auto* tiledViewer = dynamic_cast<CTiledVolumeViewer*>(viewer)) {
+        surfaceOverlapActive = tiledViewer->surfaceOverlayEnabled() &&
+                               !tiledViewer->surfaceOverlays().empty();
+    }
+
+    return _editingEnabled || approvalMaskActive || surfaceOverlapActive;
 }
 
 void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                                                       ViewerOverlayControllerBase::OverlayBuilder& builder)
 {
-    if (!viewer || !_currentState) {
+    if (!viewer) {
+        return;
+    }
+
+    // Render surface overlap overlay (independent of editing mode and state)
+    buildSurfaceOverlapOverlay(viewer, builder);
+
+    if (!_currentState) {
         return;
     }
 
@@ -1243,8 +1259,6 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
     }
 
     // For segmentation view (QuadSurface), render as image overlay
-    QElapsedTimer buildTimer;
-    buildTimer.start();
 
     // Check if we need to rebuild the COMPOSITE IMAGE (only when masks change, not when view changes)
     auto it = _viewerCaches.find(viewer);
@@ -1265,26 +1279,23 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
 
     const ViewerImageCache& cache = it->second;
 
-    // Get surface parameters for direct grid-to-scene coordinate conversion
-    // The rendering uses viewerScale, so we need to use that for overlay positioning
-    const cv::Vec3f center = state.surface->center();
+    // Use the tiled viewer's TileScene for coordinate conversion (the correct system)
     const cv::Vec2f surfScale = state.surface->scale();
-    const float viewerScale = viewer->getCurrentScale();
+    auto* tiledViewer = dynamic_cast<CTiledVolumeViewer*>(viewer);
+    TileScene* tileScene = tiledViewer ? tiledViewer->tileScene() : nullptr;
 
-    // Find valid reference points and calculate the current grid-to-scene scale dynamically
-    const cv::Mat_<cv::Vec3f>* points = state.surface->rawPointsPtr();
-    if (!points || points->empty()) {
+    if (!tileScene) {
         return;
     }
 
-    const int gridCols = points->cols;
-
-    // Lambda to convert grid index directly to scene position (no pointTo!)
-    // Formula: scenePos = (gridPos/surfScale - center) * viewerScale
+    // Grid index (row, col) -> surface coords, then to scene coords.
+    // Surface space is centered: grid center = (0,0) in surface space.
+    // Grid (0,0) maps to (-center.x, -center.y) in surface space.
+    const cv::Vec3f center = state.surface->center();
     auto gridToScene = [&](int row, int col) -> QPointF {
-        const float sceneX = (static_cast<float>(col) / surfScale[0] - center[0]) * viewerScale;
-        const float sceneY = (static_cast<float>(row) / surfScale[1] - center[1]) * viewerScale;
-        return QPointF(sceneX, sceneY);
+        const float surfX = static_cast<float>(col) / surfScale[0] - center[0];
+        const float surfY = static_cast<float>(row) / surfScale[1] - center[1];
+        return tileScene->surfaceToScene(surfX, surfY);
     };
 
     // Calculate grid-to-scene scale from adjacent cells
@@ -1297,8 +1308,217 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
     }
 
     // Render the composite image as a single scaled image overlay
-    // This is much faster than rendering individual rectangles
     QPointF topLeft = gridToScene(0, 0);
     const qreal opacity = static_cast<qreal>(_approvalMaskOpacity) / 100.0;
+
     builder.addImage(cache.compositeImage, topLeft, gridToSceneScale, opacity, kApprovalMaskZ);
+}
+
+void SegmentationOverlayController::buildSurfaceOverlapOverlay(
+    VolumeViewerBase* viewer,
+    ViewerOverlayControllerBase::OverlayBuilder& builder) const
+{
+    auto* tiledViewer = dynamic_cast<CTiledVolumeViewer*>(viewer);
+    if (!tiledViewer) {
+        return;
+    }
+    if (!tiledViewer->surfaceOverlayEnabled()) {
+        qDebug() << "[OverlapOverlay] overlay not enabled";
+        return;
+    }
+
+    const auto& overlays = tiledViewer->surfaceOverlays();
+    if (overlays.empty()) {
+        qDebug() << "[OverlapOverlay] no overlays selected";
+        return;
+    }
+
+    // Get the current surface
+    Surface* viewerSurf = viewer->currentSurface();
+    auto* currentQuad = dynamic_cast<QuadSurface*>(viewerSurf);
+    if (!currentQuad) {
+        qDebug() << "[OverlapOverlay] no QuadSurface on viewer";
+        return;
+    }
+
+    TileScene* tileScene = tiledViewer->tileScene();
+    if (!tileScene) {
+        qDebug() << "[OverlapOverlay] no TileScene";
+        return;
+    }
+
+    const float threshold = tiledViewer->surfaceOverlapThreshold();
+    qDebug() << "[OverlapOverlay] threshold=" << threshold
+             << "overlays=" << overlays.size()
+             << "surface=" << currentQuad;
+
+    // Check cache validity
+    auto cacheIt = _overlapCaches.find(viewer);
+    bool needsRebuild = (cacheIt == _overlapCaches.end()) ||
+                        (cacheIt->second.surface != currentQuad) ||
+                        (cacheIt->second.overlays != overlays) ||
+                        (std::abs(cacheIt->second.threshold - threshold) > 0.01f);
+
+    if (needsRebuild) {
+        qDebug() << "[OverlapOverlay] rebuilding overlap image...";
+        // Build the overlap image
+        OverlapCache newCache;
+        newCache.surface = currentQuad;
+        newCache.overlays = overlays;
+        newCache.threshold = threshold;
+
+        const cv::Mat_<cv::Vec3f>* currentPts = currentQuad->rawPointsPtr();
+        if (!currentPts || currentPts->empty()) {
+            qDebug() << "[OverlapOverlay] current surface has no points";
+            return;
+        }
+
+        const int rows = currentPts->rows;
+        const int cols = currentPts->cols;
+
+        // Create ARGB32 image for the overlap colors
+        QImage overlapImage(cols, rows, QImage::Format_ARGB32);
+        overlapImage.fill(Qt::transparent);
+
+        // Spatial hash: discretize 3D space into cells of size `threshold`
+        // Key: (ix, iy, iz) -> list of (overlay color)
+        struct CellKey {
+            int x, y, z;
+            bool operator==(const CellKey& o) const { return x == o.x && y == o.y && z == o.z; }
+        };
+        struct CellKeyHash {
+            size_t operator()(const CellKey& k) const {
+                size_t h = std::hash<int>()(k.x);
+                h ^= std::hash<int>()(k.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= std::hash<int>()(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                return h;
+            }
+        };
+
+        // For each overlay surface, insert its points into the spatial hash
+        // Store the BGR color per cell
+        std::unordered_map<CellKey, cv::Vec3b, CellKeyHash> spatialHash;
+
+        if (!_state) {
+            qDebug() << "[OverlapOverlay] no _state";
+            return;
+        }
+
+        const float invThreshold = 1.0f / threshold;
+
+        for (const auto& [surfId, color] : overlays) {
+            qDebug() << "[OverlapOverlay] loading overlay surface:" << QString::fromStdString(surfId);
+            auto surfBase = _state->surface(surfId);
+            auto overlaySurf = std::dynamic_pointer_cast<QuadSurface>(surfBase);
+            if (!overlaySurf) {
+                qDebug() << "[OverlapOverlay]   surface not found or not QuadSurface";
+                continue;
+            }
+
+            const cv::Mat_<cv::Vec3f>* overlayPts = overlaySurf->rawPointsPtr();
+            if (!overlayPts || overlayPts->empty()) {
+                qDebug() << "[OverlapOverlay]   no points in overlay surface";
+                continue;
+            }
+
+            int validPts = 0;
+            for (int r = 0; r < overlayPts->rows; ++r) {
+                for (int c = 0; c < overlayPts->cols; ++c) {
+                    const cv::Vec3f& pt = (*overlayPts)(r, c);
+                    if (pt[0] == -1.f) continue;
+                    validPts++;
+
+                    CellKey key{
+                        static_cast<int>(std::floor(pt[0] * invThreshold)),
+                        static_cast<int>(std::floor(pt[1] * invThreshold)),
+                        static_cast<int>(std::floor(pt[2] * invThreshold))
+                    };
+                    spatialHash.try_emplace(key, color);
+                }
+            }
+            qDebug() << "[OverlapOverlay]   " << overlayPts->rows << "x" << overlayPts->cols
+                     << " validPts=" << validPts;
+        }
+
+        qDebug() << "[OverlapOverlay] spatial hash size:" << spatialHash.size();
+
+        if (spatialHash.empty()) {
+            _overlapCaches[viewer] = std::move(newCache);
+            return;
+        }
+
+        // For each point in the current surface, check if any nearby cell is occupied
+        int hitCount = 0;
+        int validCurrentPts = 0;
+        for (int r = 0; r < rows; ++r) {
+            auto* scanline = reinterpret_cast<QRgb*>(overlapImage.scanLine(r));
+            for (int c = 0; c < cols; ++c) {
+                const cv::Vec3f& pt = (*currentPts)(r, c);
+                if (pt[0] == -1.f) continue;
+                validCurrentPts++;
+
+                // Check the cell this point is in and its 26 neighbors
+                const int cx = static_cast<int>(std::floor(pt[0] * invThreshold));
+                const int cy = static_cast<int>(std::floor(pt[1] * invThreshold));
+                const int cz = static_cast<int>(std::floor(pt[2] * invThreshold));
+
+                cv::Vec3b hitColor{0, 0, 0};
+                bool found = false;
+
+                for (int dz = -1; dz <= 1 && !found; ++dz) {
+                    for (int dy = -1; dy <= 1 && !found; ++dy) {
+                        for (int dx = -1; dx <= 1 && !found; ++dx) {
+                            auto it = spatialHash.find({cx + dx, cy + dy, cz + dz});
+                            if (it != spatialHash.end()) {
+                                hitColor = it->second;
+                                found = true;
+                            }
+                        }
+                    }
+                }
+
+                if (found) {
+                    hitCount++;
+                    // BGR -> RGB for QImage
+                    scanline[c] = qRgba(hitColor[2], hitColor[1], hitColor[0], 200);
+                }
+            }
+        }
+
+        qDebug() << "[OverlapOverlay] current surface:" << rows << "x" << cols
+                 << "validPts=" << validCurrentPts << "hits=" << hitCount;
+
+        newCache.image = std::move(overlapImage);
+        _overlapCaches[viewer] = std::move(newCache);
+        cacheIt = _overlapCaches.find(viewer);
+    }
+
+    const OverlapCache& cache = cacheIt->second;
+    if (cache.image.isNull()) {
+        return;
+    }
+
+    // Position using the same coordinate math as the approval mask overlay
+    const cv::Vec2f surfScale = currentQuad->scale();
+    const cv::Vec3f center = currentQuad->center();
+
+    auto gridToScene = [&](int row, int col) -> QPointF {
+        const float surfX = static_cast<float>(col) / surfScale[0] - center[0];
+        const float surfY = static_cast<float>(row) / surfScale[1] - center[1];
+        return tileScene->surfaceToScene(surfX, surfY);
+    };
+
+    QPointF p0 = gridToScene(0, 0);
+    QPointF p1 = gridToScene(0, 1);
+    qreal gridToSceneScale = std::hypot(p1.x() - p0.x(), p1.y() - p0.y());
+
+    if (gridToSceneScale < 1e-6) {
+        return;
+    }
+
+    QPointF topLeft = gridToScene(0, 0);
+    qDebug() << "[OverlapOverlay] ADDING IMAGE at" << topLeft
+             << "scale=" << gridToSceneScale
+             << "imageSize=" << cache.image.size();
+    builder.addImage(cache.image, topLeft, gridToSceneScale, 0.6, kSurfaceOverlapZ);
 }

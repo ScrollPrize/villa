@@ -16,6 +16,11 @@
 #include <cstdlib>
 #ifndef _WIN32
 #include <dlfcn.h>
+#include <sys/resource.h>
+#endif
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 // Runs before main() AND before all shared-library constructors.
@@ -39,6 +44,7 @@ __attribute__((section(".preinit_array"), used))
 static auto preinitFn = &setThreadPoliciesEarly;
 #endif
 
+__attribute__((visibility("default")))
 auto main(int argc, char* argv[]) -> int
 {
 #ifndef __linux__

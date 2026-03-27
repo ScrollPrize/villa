@@ -88,9 +88,12 @@ namespace viewer {
     constexpr auto INTERSECTION_THICKNESS = "viewer/intersection_thickness";
     constexpr auto INTERSECTION_SAMPLING_STRIDE = "viewer/intersection_sampling_stride";
 
+    constexpr auto INTERSECTION_MAX_SURFACES = "viewer/intersection_max_surfaces";
+
     constexpr int INTERSECTION_OPACITY_DEFAULT = 100;
     constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;
     constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 1;
+    constexpr int INTERSECTION_MAX_SURFACES_DEFAULT = 0;  // 0 = unlimited
 
     // Axis Overlays
     constexpr auto SHOW_AXIS_OVERLAYS = "viewer/show_axis_overlays";
@@ -161,6 +164,35 @@ namespace perf {
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
     constexpr int DISK_CACHE_SIZE_GB_DEFAULT = 100;
+
+    // Video codec recompression for remote streaming
+    constexpr auto VIDEO_RECOMPRESS_ENABLED = "perf/video_recompress_enabled";
+    constexpr auto VIDEO_CODEC_TYPE = "perf/video_codec_type";  // 0=H264, 1=H265, 3=C3D
+    constexpr auto VIDEO_QUALITY_PRESET = "perf/video_quality_preset";
+
+    constexpr auto VIDEO_RECHUNK_32 = "perf/video_rechunk_32";
+
+    constexpr bool VIDEO_RECOMPRESS_ENABLED_DEFAULT = false;
+    constexpr int VIDEO_CODEC_TYPE_DEFAULT = 0;  // H264
+    constexpr int VIDEO_QUALITY_PRESET_DEFAULT = 3;  // Balanced
+    constexpr bool VIDEO_RECHUNK_32_DEFAULT = false;
+
+    // Quality preset → per-codec QP mapping
+    // Index: 0=Lossless, 1=Near-lossless, 2=High, 3=Balanced, 4=Compact, 5=Max compression
+    constexpr int PRESET_COUNT = 6;
+    // H.264/H.265/AV1 QP values (0=lossless uses 0)
+    constexpr int PRESET_VIDEO_QP[PRESET_COUNT] = {0, 18, 22, 28, 35, 42};
+    // C3D size divisor shift: 0=lossless, 1=lossless/2, 2=/4, 3=/8, 4=/16, 5=/32
+    constexpr int PRESET_C3D_QUALITY[PRESET_COUNT] = {0, 1, 2, 3, 4, 5};
+
+    // Number of background IO (download) threads
+    constexpr auto IO_THREADS = "perf/io_threads";
+    constexpr int IO_THREADS_DEFAULT = 8;
+
+    // Prefetch pyramid levels on remote volume open
+    // 0 = none, 1 = coarsest only (already pinned), 2 = coarsest 2, etc.
+    constexpr auto PREFETCH_LEVELS = "perf/prefetch_levels";
+    constexpr int PREFETCH_LEVELS_DEFAULT = 0;  // disabled
 }
 
 // -----------------------------------------------------------------------------

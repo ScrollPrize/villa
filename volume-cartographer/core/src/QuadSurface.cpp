@@ -65,6 +65,57 @@ void normalizeMaskChannel(cv::Mat& mask)
     mask = singleChannel;
 }
 
+inline bool isValidPointSample(const cv::Vec3f& point)
+{
+    return point[0] != -1.0f && point[1] != -1.0f && point[2] != -1.0f
+        && std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+
+cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
+    const cv::Mat_<cv::Vec3f>& points,
+    const cv::Size& newSize)
+{
+    cv::Mat_<cv::Vec3f> resampled(newSize.height, newSize.width,
+                                  cv::Vec3f(-1.0f, -1.0f, -1.0f));
+    if (points.empty()) {
+        return resampled;
+    }
+
+    const float xScale = static_cast<float>(points.cols) / static_cast<float>(newSize.width);
+    const float yScale = static_cast<float>(points.rows) / static_cast<float>(newSize.height);
+
+    for (int dstY = 0; dstY < newSize.height; ++dstY) {
+        float srcY = (static_cast<float>(dstY) + 0.5f) * yScale - 0.5f;
+        srcY = std::clamp(srcY, 0.0f, static_cast<float>(points.rows - 1));
+        const int y0 = static_cast<int>(std::floor(srcY));
+        const int y1 = std::min(y0 + 1, points.rows - 1);
+        const float fy = srcY - static_cast<float>(y0);
+
+        for (int dstX = 0; dstX < newSize.width; ++dstX) {
+            float srcX = (static_cast<float>(dstX) + 0.5f) * xScale - 0.5f;
+            srcX = std::clamp(srcX, 0.0f, static_cast<float>(points.cols - 1));
+            const int x0 = static_cast<int>(std::floor(srcX));
+            const int x1 = std::min(x0 + 1, points.cols - 1);
+            const float fx = srcX - static_cast<float>(x0);
+
+            const cv::Vec3f& p00 = points(y0, x0);
+            const cv::Vec3f& p01 = points(y0, x1);
+            const cv::Vec3f& p10 = points(y1, x0);
+            const cv::Vec3f& p11 = points(y1, x1);
+            if (!isValidPointSample(p00) || !isValidPointSample(p01)
+                || !isValidPointSample(p10) || !isValidPointSample(p11)) {
+                continue;
+            }
+
+            const cv::Vec3f top = p00 * (1.0f - fx) + p01 * fx;
+            const cv::Vec3f bottom = p10 * (1.0f - fx) + p11 * fx;
+            resampled(dstY, dstX) = top * (1.0f - fy) + bottom * fy;
+        }
+    }
+
+    return resampled;
+}
+
 } // namespace
 
 //NOTE we have 3 coordiante systems. Nominal (voxel volume) coordinates, internal relative (ptr) coords (where _center is at 0/0) and internal absolute (_points) coordinates where the upper left corner is at 0/0.
@@ -1024,6 +1075,7 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
     // Atomically move the saved data to the final location
     bool replacedExisting = false;
     if (force_overwrite && std::filesystem::exists(final_path)) {
+#ifdef __linux__
         if (renameat2(AT_FDCWD, temp_path.c_str(), AT_FDCWD, final_path.c_str(), RENAME_EXCHANGE) != 0) {
             const int err = errno;
             if (err == ENOSYS || err == EINVAL) {
@@ -1048,6 +1100,12 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
             }
             replacedExisting = true;
         }
+#else
+        // renameat2/RENAME_EXCHANGE is Linux-only; use remove + rename fallback
+        std::filesystem::remove_all(final_path);
+        std::filesystem::rename(temp_path, final_path);
+        replacedExisting = true;
+#endif
     }
 
     if (!replacedExisting) {
@@ -1617,20 +1675,13 @@ void QuadSurface::resample(float factor_x, float factor_y, int interpolation)
         std::max(1, static_cast<int>(std::round(_points->rows * factor_y)))
     );
 
-    // Resample points
-    cv::Mat resampledMat;
-    cv::resize(*_points, resampledMat, newSize, 0, 0, interpolation);
-
-    // Clean up edge artifacts: invalidate points near original invalid regions
-    cv::Mat origMask;
-    cv::inRange(*_points, cv::Scalar(-1, -1, -1), cv::Scalar(-1, -1, -1), origMask);
-    cv::Mat scaledMask;
-    cv::resize(origMask, scaledMask, newSize, 0, 0, cv::INTER_NEAREST);
-
-    // Dilate invalid mask to clean interpolation artifacts at boundaries
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-    cv::dilate(scaledMask, scaledMask, kernel, cv::Point(-1, -1), 1);
-    resampledMat.setTo(cv::Scalar(-1.f, -1.f, -1.f), scaledMask);
+    // Resample points without blending across invalid markers.
+    cv::Mat_<cv::Vec3f> resampledMat;
+    if (interpolation == cv::INTER_LINEAR) {
+        resampledMat = resamplePointsLinearPreservingInvalids(*_points, newSize);
+    } else {
+        cv::resize(*_points, resampledMat, newSize, 0, 0, interpolation);
+    }
 
     // Update points
     *_points = resampledMat;

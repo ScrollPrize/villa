@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 #include "SliceCache.hpp"
 #include "RenderPool.hpp"
@@ -77,6 +78,10 @@ public:
     void setProgressiveEnabled(bool enabled) { _progressiveEnabled = enabled; }
     bool progressiveEnabled() const { return _progressiveEnabled; }
 
+    // For the next epoch-changing render, keep the old frame visible until the
+    // visible tile set for the new epoch has been resolved.
+    void setAtomicNextEpochSwap(bool enabled) { _atomicNextEpochSwap = enabled; }
+
     // --- Dirty flags (set by viewer, processed each tick) ---
     void markOverlaysDirty();
     void markChunkArrived();
@@ -102,6 +107,13 @@ private slots:
     void ensureTickRunning();
 
 private:
+    struct PendingSwapTile {
+        bool ready = false;
+        bool hasPixmap = false;
+        QPixmap pixmap;
+        int8_t level = -1;
+    };
+
     TileScene* _tileScene;
     SliceCache _cache;
     RenderPool* _renderPool;  // shared, not owned
@@ -113,6 +125,7 @@ private:
     uint64_t _paramsHash = 0;
     QRectF _lastViewportRect;
     bool _progressiveEnabled = true;
+    bool _atomicNextEpochSwap = false;
 
     // Desired pyramid level for current render pass
     int _desiredLevel = 0;
@@ -140,4 +153,15 @@ private:
     // Callbacks to notify the viewer
     std::function<void()> _overlayCallback;
     std::function<void()> _zoomSettleCallback;
+
+    // Atomic epoch swap: collect all tiles for a new epoch before displaying
+    bool _pendingSwapActive = false;
+    uint64_t _pendingSwapEpoch = 0;
+    std::unordered_map<WorldTileKey, PendingSwapTile, WorldTileKeyHash> _pendingSwapTiles;
+
+    void beginPendingSwap(uint64_t epoch, const std::vector<WorldTileKey>& keys);
+    void stagePendingSwapTile(const WorldTileKey& wk, const QPixmap& pixmap,
+                              int8_t level, bool hasPixmap);
+    bool tryCommitPendingSwap();
+    static QPixmap placeholderPixmap();
 };

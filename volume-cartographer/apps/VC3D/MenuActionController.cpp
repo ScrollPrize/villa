@@ -889,60 +889,84 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url, bool persistE
                     _attachRemoteZarrAct->setEnabled(true);
                 }
 
-                try {
-                    auto volume = watcher->result();
-                    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-                        return;
-                    }
+                auto future = watcher->future();
+                QString errorMsg;
+                bool success = false;
 
-                    if (!_window->attachVolumeToCurrentPackage(volume)) {
-                        QMessageBox::warning(
-                            _window,
-                            QObject::tr("Attach Remote Zarr"),
-                            QObject::tr("A volume with id '%1' is already present in this volume package.")
-                                .arg(QString::fromStdString(volume->id())));
-                        return;
-                    }
-
-                    if (persistEntry) {
-                        persistAttachedRemoteVolume(url, volume);
-                    }
-
-                    if (_window->statusBar()) {
-                        _window->statusBar()->showMessage(
-                            QObject::tr("Attached remote zarr: %1")
-                                .arg(QString::fromStdString(volume->id())),
-                            5000);
-                    }
-                } catch (const std::exception& e) {
-                    const QString msg = extractExceptionMessage(e);
-
-                    if (isAuthError(msg)) {
-                        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                        settings.remove(vc3d::settings::aws::ACCESS_KEY);
-                        settings.remove(vc3d::settings::aws::SECRET_KEY);
-                        settings.remove(vc3d::settings::aws::SESSION_TOKEN);
-
-                        const auto reply = QMessageBox::warning(
-                            _window,
-                            QObject::tr("Authentication Error"),
-                            QObject::tr("Failed to attach remote zarr:\n%1\n\n"
-                                        "Would you like to enter new AWS credentials and retry?")
-                                .arg(msg),
-                            QMessageBox::Yes | QMessageBox::No);
-                        if (reply == QMessageBox::Yes) {
-                            QTimer::singleShot(0, this, [this, url, persistEntry]() {
-                                attachRemoteZarrUrl(url, persistEntry);
-                            });
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+                if (future.isValid() && !future.isCanceled() && future.isResultReadyAt(0)) {
+#else
+                if (future.isFinished() && !future.isCanceled()) {
+#endif
+                    try {
+                        auto volume = future.result();
+                        if (!_window || !_window->_state || !_window->_state->vpkg()) {
                             return;
                         }
-                    }
 
-                    QMessageBox::critical(
-                        _window,
-                        QObject::tr("Attach Remote Zarr Error"),
-                        QObject::tr("Failed to attach remote zarr:\n%1").arg(msg));
+                        if (!_window->attachVolumeToCurrentPackage(volume)) {
+                            QMessageBox::warning(
+                                _window,
+                                QObject::tr("Attach Remote Zarr"),
+                                QObject::tr("A volume with id '%1' is already present in this volume package.")
+                                    .arg(QString::fromStdString(volume->id())));
+                            return;
+                        }
+
+                        if (persistEntry) {
+                            persistAttachedRemoteVolume(url, volume);
+                        }
+
+                        if (_window->statusBar()) {
+                            _window->statusBar()->showMessage(
+                                QObject::tr("Attached remote zarr: %1")
+                                    .arg(QString::fromStdString(volume->id())),
+                                5000);
+                        }
+                        success = true;
+                    } catch (const std::exception& e) {
+                        errorMsg = extractExceptionMessage(e);
+                    } catch (...) {
+                        errorMsg = QObject::tr("Unknown error attaching remote zarr");
+                    }
+                } else {
+                    try {
+                        future.waitForFinished();
+                        future.result();
+                    } catch (const std::exception& e) {
+                        errorMsg = extractExceptionMessage(e);
+                    } catch (...) {
+                        errorMsg = QObject::tr("Unknown error attaching remote zarr");
+                    }
                 }
+
+                if (success) return;
+
+                if (isAuthError(errorMsg)) {
+                    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                    settings.remove(vc3d::settings::aws::ACCESS_KEY);
+                    settings.remove(vc3d::settings::aws::SECRET_KEY);
+                    settings.remove(vc3d::settings::aws::SESSION_TOKEN);
+
+                    const auto reply = QMessageBox::warning(
+                        _window,
+                        QObject::tr("Authentication Error"),
+                        QObject::tr("Failed to attach remote zarr:\n%1\n\n"
+                                    "Would you like to enter new AWS credentials and retry?")
+                            .arg(errorMsg),
+                        QMessageBox::Yes | QMessageBox::No);
+                    if (reply == QMessageBox::Yes) {
+                        QTimer::singleShot(0, this, [this, url, persistEntry]() {
+                            attachRemoteZarrUrl(url, persistEntry);
+                        });
+                        return;
+                    }
+                }
+
+                QMessageBox::critical(
+                    _window,
+                    QObject::tr("Attach Remote Zarr Error"),
+                    QObject::tr("Failed to attach remote zarr:\n%1").arg(errorMsg));
             });
 
     auto future = QtConcurrent::run([url, auth, cacheDir]() -> std::shared_ptr<Volume> {
@@ -1048,71 +1072,98 @@ void MenuActionController::openRemoteZarr(
             watcher->deleteLater();
             _openRemoteAct->setEnabled(true);
 
-            try {
-                auto vol = watcher->result();
-                _remoteOpenAuthRetries = 0;
-                _remoteScrollAuthRetries = 0;
-                _window->CloseVolume();
-                _window->setVolume(vol);
-                _window->UpdateView();
+            // Check for exception before calling result() — Qt wraps
+            // task exceptions in QUnhandledException which can bypass
+            // catch(std::exception&) in signal/slot dispatch and call
+            // std::terminate instead.
+            auto future = watcher->future();
+            QString errorMsg;
 
-                if (_window->statusBar()) {
-                    _window->statusBar()->showMessage(
-                        QObject::tr("Opened remote volume: %1")
-                            .arg(QString::fromStdString(vol->id())),
-                        5000);
-                }
-            } catch (const std::exception& e) {
-                QString msg = extractExceptionMessage(e);
-
-                if (_window->statusBar()) {
-                    _window->statusBar()->clearMessage();
-                }
-
-                // If it looks like an auth error, offer to re-enter credentials
-                if (isAuthError(msg)) {
-                    // Clear stale saved credentials
-                    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                    settings.remove(vc3d::settings::aws::ACCESS_KEY);
-                    settings.remove(vc3d::settings::aws::SECRET_KEY);
-                    settings.remove(vc3d::settings::aws::SESSION_TOKEN);
-
-                    auto reply = QMessageBox::warning(
-                        _window,
-                        QObject::tr("Authentication Error"),
-                        QObject::tr("Failed to open remote volume:\n%1\n\n"
-                                    "Would you like to enter new AWS credentials and retry?").arg(msg),
-                        QMessageBox::Yes | QMessageBox::No);
-
-                    if (reply == QMessageBox::Yes) {
-                        // Re-prompt for credentials by calling openRemoteUrl again.
-                        // Use QTimer::singleShot to break the call stack and avoid
-                        // deep recursion on repeated auth failures (Issue 31).
-                        if (_remoteOpenAuthRetries >= 3) {
-                            if (_window->statusBar()) {
-                                _window->statusBar()->showMessage(
-                                    QObject::tr("Authentication failed after 3 attempts"), 5000);
-                            }
-                            _remoteOpenAuthRetries = 0;
-                            return;
-                        }
-                        ++_remoteOpenAuthRetries;
-                        _openRemoteAct->setEnabled(false);
-                        QTimer::singleShot(0, this, [this, httpsUrl]() {
-                            openRemoteUrl(QString::fromStdString(httpsUrl), true);
-                        });
-                        return;
-                    }
-
-                    _remoteOpenAuthRetries = 0;
-                } else {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+            if (future.isValid() && !future.isCanceled() && future.isResultReadyAt(0)) {
+#else
+            if (future.isFinished() && !future.isCanceled()) {
+#endif
+                try {
+                    auto vol = future.result();
                     _remoteOpenAuthRetries = 0;
                     _remoteScrollAuthRetries = 0;
-                    QMessageBox::critical(
-                        _window,
-                        QObject::tr("Remote Volume Error"),
-                        QObject::tr("Failed to open remote volume:\n%1").arg(msg));
+                    _window->CloseVolume();
+                    _window->setVolume(vol);
+                    _window->UpdateView();
+
+                    if (_window->statusBar()) {
+                        _window->statusBar()->showMessage(
+                            QObject::tr("Opened remote volume: %1")
+                                .arg(QString::fromStdString(vol->id())),
+                            5000);
+                    }
+                    return;
+                } catch (const std::exception& e) {
+                    errorMsg = extractExceptionMessage(e);
+                } catch (...) {
+                    errorMsg = QObject::tr("Unknown error opening remote volume");
                 }
+            } else {
+                // Future finished but no result ready — exception was stored
+                try {
+                    future.waitForFinished();
+                    future.result(); // will re-throw
+                } catch (const std::exception& e) {
+                    errorMsg = extractExceptionMessage(e);
+                } catch (...) {
+                    errorMsg = QObject::tr("Unknown error opening remote volume");
+                }
+            }
+
+            // Error path
+            if (_window->statusBar()) {
+                _window->statusBar()->clearMessage();
+            }
+
+            // If it looks like an auth error, offer to re-enter credentials
+            if (isAuthError(errorMsg)) {
+                // Clear stale saved credentials
+                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                settings.remove(vc3d::settings::aws::ACCESS_KEY);
+                settings.remove(vc3d::settings::aws::SECRET_KEY);
+                settings.remove(vc3d::settings::aws::SESSION_TOKEN);
+
+                auto reply = QMessageBox::warning(
+                    _window,
+                    QObject::tr("Authentication Error"),
+                    QObject::tr("Failed to open remote volume:\n%1\n\n"
+                                "Would you like to enter new AWS credentials and retry?").arg(errorMsg),
+                    QMessageBox::Yes | QMessageBox::No);
+
+                if (reply == QMessageBox::Yes) {
+                    // Re-prompt for credentials by calling openRemoteUrl again.
+                    // Use QTimer::singleShot to break the call stack and avoid
+                    // deep recursion on repeated auth failures (Issue 31).
+                    if (_remoteOpenAuthRetries >= 3) {
+                        if (_window->statusBar()) {
+                            _window->statusBar()->showMessage(
+                                QObject::tr("Authentication failed after 3 attempts"), 5000);
+                        }
+                        _remoteOpenAuthRetries = 0;
+                        return;
+                    }
+                    ++_remoteOpenAuthRetries;
+                    _openRemoteAct->setEnabled(false);
+                    QTimer::singleShot(0, this, [this, httpsUrl]() {
+                        openRemoteUrl(QString::fromStdString(httpsUrl), true);
+                    });
+                    return;
+                }
+
+                _remoteOpenAuthRetries = 0;
+            } else {
+                _remoteOpenAuthRetries = 0;
+                _remoteScrollAuthRetries = 0;
+                QMessageBox::critical(
+                    _window,
+                    QObject::tr("Remote Volume Error"),
+                    QObject::tr("Failed to open remote volume:\n%1").arg(errorMsg));
             }
         });
 

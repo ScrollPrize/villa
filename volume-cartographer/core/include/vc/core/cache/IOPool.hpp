@@ -51,7 +51,12 @@ public:
     void submit(const ChunkKey& key);
 
     // Submit multiple keys at once (batch, reduces lock contention).
+    // Uses backpressure: cancels pending tasks if queue would overflow.
     void submit(const std::vector<ChunkKey>& keys);
+
+    // Submit keys without cancel-on-overflow (for background prefetch).
+    // Silently drops keys that don't fit in the queue.
+    void submitBackground(const std::vector<ChunkKey>& keys);
 
     // Cancel all pending (not in-flight) tasks.
     void cancelPending();

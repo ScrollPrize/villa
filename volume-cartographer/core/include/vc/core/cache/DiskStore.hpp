@@ -74,6 +74,9 @@ public:
     // Returns the incrementally tracked value (fast, no scan).
     [[nodiscard]] size_t totalBytes() const;
 
+    // Total number of chunk files on disk.
+    [[nodiscard]] size_t fileCount() const;
+
     // Perform initial directory scan to populate totalBytes_.
     // Called automatically by the constructor if the cache directory exists.
     void initTotalBytes();
