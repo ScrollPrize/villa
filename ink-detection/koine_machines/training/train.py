@@ -45,8 +45,16 @@ class ValidationMetricBatch:
     def require_targets(self):
         return self.targets
 
-def _disable_z_projection_for_normal_pooled_3d(config):
-    if str(config.get('mode', 'flat')).strip().lower() != 'normal_pooled_3d':
+
+_NATIVE_3D_TRAINING_MODES = {"normal_pooled_3d", "full_3d"}
+
+
+def _is_native_3d_training_mode(mode):
+    return str(mode).strip().lower() in _NATIVE_3D_TRAINING_MODES
+
+
+def _disable_z_projection_for_3d_training_modes(config):
+    if not _is_native_3d_training_mode(config.get('mode', 'flat')):
         return
 
     model_config = config.setdefault('model_config', {})
@@ -59,6 +67,67 @@ def _disable_z_projection_for_normal_pooled_3d(config):
         target_info['z_projection_mode'] = 'none'
         if isinstance(target_info.get('z_projection'), dict):
             target_info['z_projection']['mode'] = 'none'
+
+
+def _disable_z_projection_for_normal_pooled_3d(config):
+    _disable_z_projection_for_3d_training_modes(config)
+
+
+def _select_full_3d_preview_z_index(supervision_mask: torch.Tensor) -> int:
+    if supervision_mask.ndim == 4:
+        supervision_mask = supervision_mask.unsqueeze(1)
+    elif supervision_mask.ndim != 5:
+        raise ValueError(
+            f"Expected supervision_mask with shape [B, 1, Z, Y, X] or [B, Z, Y, X], got {tuple(supervision_mask.shape)}"
+        )
+
+    if int(supervision_mask.shape[2]) <= 0:
+        raise ValueError("supervision_mask must have positive depth for preview selection")
+
+    per_slice_supervision = supervision_mask.float().sum(dim=(0, 1, 3, 4))
+    best_index = int(torch.argmax(per_slice_supervision).item())
+    if float(per_slice_supervision[best_index].item()) <= 0.0:
+        return int(supervision_mask.shape[2] // 2)
+    return best_index
+
+
+def _build_full_3d_preview_batch(
+    batch: dict,
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_mask: torch.Tensor,
+) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if preds.ndim != 5 or targets.ndim != 5 or ignore_mask.ndim != 5:
+        raise ValueError(
+            "full_3d previews expect preds, targets, and ignore_mask with shape [B, 1, Z, Y, X]"
+        )
+
+    z_index = _select_full_3d_preview_z_index(batch['supervision_mask'])
+
+    preview_batch = dict(batch)
+    image = batch['image']
+    if image.ndim == 4:
+        image = image.unsqueeze(1)
+    if image.ndim != 5:
+        raise ValueError(f"Expected image with shape [B, 1, Z, Y, X] or [B, Z, Y, X], got {tuple(image.shape)}")
+    preview_batch['image'] = image[:, :, z_index:z_index + 1]
+
+    surface_mask = batch.get('surface_mask')
+    if isinstance(surface_mask, torch.Tensor):
+        if surface_mask.ndim == 4:
+            surface_mask = surface_mask.unsqueeze(1)
+        if surface_mask.ndim != 5:
+            raise ValueError(
+                f"Expected surface_mask with shape [B, 1, Z, Y, X] or [B, Z, Y, X], got {tuple(surface_mask.shape)}"
+            )
+        preview_batch['surface_mask'] = surface_mask[:, :, z_index:z_index + 1]
+
+    return (
+        preview_batch,
+        preds[:, :, z_index],
+        targets[:, :, z_index],
+        ignore_mask[:, :, z_index],
+    )
 
 
 def _resolve_training_step_window(
@@ -171,18 +240,20 @@ def train(config_path, profile_steps):
         'save_in_checkpoint': ema_save_in_checkpoint,
     }
 
-    mode = str(config.get('mode', 'flat'))
+    mode = str(config.get('mode', 'flat')).strip().lower()
+    native_3d_mode = _is_native_3d_training_mode(mode)
+    normal_pooled_mode = mode == 'normal_pooled_3d'
     model_type = str(config.get('model_type', '')).strip().lower()
-    if mode == 'normal_pooled_3d' and model_type.startswith('resnet3d'):
+    if normal_pooled_mode and model_type.startswith('resnet3d'):
         raise ValueError("normal_pooled_3d is currently only supported with the vesuvius_unet model path")
-    if mode == 'normal_pooled_3d':
-        _disable_z_projection_for_normal_pooled_3d(config)
+    if native_3d_mode:
+        _disable_z_projection_for_3d_training_modes(config)
         config['in_channels'] = 2
 
     config.setdefault('volume_auth_json', None)
     requested_stitch_factor = int(config.get('stitch_factor', 1))
     use_stitched_forward = bool(config.get('use_stitched_forward', requested_stitch_factor > 1))
-    if mode == 'normal_pooled_3d':
+    if native_3d_mode:
         use_stitched_forward = False
     stitched_gradient_checkpointing = bool(config.get('stitched_gradient_checkpointing', True))
     model_crop_size = tuple(config['patch_size'])
@@ -212,7 +283,7 @@ def train(config_path, profile_steps):
     gradient_accumulation_plugin = GradientAccumulationPlugin(num_steps=grad_acc_steps, sync_with_dataloader=False)
     accelerator = accelerate.Accelerator(mixed_precision=config.get('mixed_precision', "fp16"), gradient_accumulation_plugin=gradient_accumulation_plugin, dataloader_config=dataloader_config)
     normal_pooling_profiler = NormalPoolingProfiler(
-        enabled=profile_steps is not None and mode == 'normal_pooled_3d'
+        enabled=profile_steps is not None and normal_pooled_mode
     )
 
     if 'wandb_project' in config and accelerator.is_main_process:
@@ -239,7 +310,7 @@ def train(config_path, profile_steps):
     set_seed(config['seed'])
     dataset_config = deepcopy(config)
     dataset_config['patch_size'] = list(loader_patch_size)
-    dataset_config['profile_dataset'] = profile_steps is not None and mode == 'normal_pooled_3d'
+    dataset_config['profile_dataset'] = profile_steps is not None and normal_pooled_mode
 
     shared_ds = InkDataset(dataset_config, do_augmentations=False)
     if len(shared_ds.training_patches) == 0:
@@ -256,7 +327,7 @@ def train(config_path, profile_steps):
     if dataloader_workers > 0:
         dataloader_kwargs['multiprocessing_context'] = 'spawn'
         dataloader_kwargs['persistent_workers'] = True
-    if mode == 'normal_pooled_3d':
+    if normal_pooled_mode:
         dataloader_kwargs['collate_fn'] = collate_normal_pooled_batch
 
     train_dl = DataLoader(
@@ -379,7 +450,7 @@ def train(config_path, profile_steps):
             raise ValueError(
                 f"Expected 'image' batch tensor with 4 or 5 dims, got shape {tuple(image.shape)}"
             )
-        if mode == 'normal_pooled_3d':
+        if native_3d_mode:
             surface_mask = batch['surface_mask'].float()
             if surface_mask.ndim == 4:
                 surface_mask = surface_mask.unsqueeze(1)
@@ -392,7 +463,7 @@ def train(config_path, profile_steps):
         return image
 
     def prepare_loss_inputs(preds, batch, profiler=None):
-        if mode == 'normal_pooled_3d':
+        if normal_pooled_mode:
             total_section = profiler.section('normal_pooling/total', preds.device) if profiler is not None else nullcontext()
             with total_section:
                 crop_shape = tuple(int(v) for v in batch['image'].shape[-3:])
@@ -436,6 +507,23 @@ def train(config_path, profile_steps):
                         | (pooled_valid <= 0)
                     ).to(dtype=targets.dtype)
                 return pooled_logits, targets, ignore_mask, outside_bg_loss
+
+        if mode == 'full_3d':
+            crop_shape = tuple(int(v) for v in batch['image'].shape[-3:])
+            if preds.ndim != 5:
+                raise ValueError(
+                    f"full_3d mode expects volumetric logits with shape [B, 1, Z, Y, X], got {tuple(preds.shape)}"
+                )
+            if tuple(int(v) for v in preds.shape[-3:]) != crop_shape:
+                preds = F.interpolate(
+                    preds,
+                    size=crop_shape,
+                    mode='trilinear',
+                    align_corners=True,
+                )
+            targets = batch['inklabels']
+            ignore_mask = (batch['supervision_mask'] <= 0).to(dtype=targets.dtype)
+            return preds, targets, ignore_mask, preds.new_zeros(())
 
         targets = (torch.amax(batch['inklabels'], dim=2) > 0).to(dtype=batch['inklabels'].dtype)
         supervision_mask = torch.amax(batch['supervision_mask'], dim=2)
@@ -541,7 +629,7 @@ def train(config_path, profile_steps):
                 'train/lr': optimizer.param_groups[0]['lr'],
                 'step': step,
             }
-            if mode == 'normal_pooled_3d':
+            if normal_pooled_mode:
                 log_dict['train/outside_bg_loss'] = float(outside_bg_loss.detach().item())
             latest_loss_metrics = getattr(loss, 'latest_metrics', None)
             if isinstance(latest_loss_metrics, dict):
@@ -553,14 +641,31 @@ def train(config_path, profile_steps):
             train_preview = PreviewAccumulator(
                 accelerator=accelerator,
                 get_model_input=get_model_input,
-                normal_pooling_config=(config.get('normal_pooling') if mode == 'normal_pooled_3d' else None),
+                normal_pooling_config=(config.get('normal_pooling') if normal_pooled_mode else None),
             )
+            train_preview_batch = batch
+            train_preview_preds = loss_preds.detach()
+            train_preview_targets = targets.detach()
+            train_preview_ignore_mask = ignore_mask.detach()
+            train_preview_volume_logits = preds.detach() if normal_pooled_mode else None
+            if mode == 'full_3d':
+                (
+                    train_preview_batch,
+                    train_preview_preds,
+                    train_preview_targets,
+                    train_preview_ignore_mask,
+                ) = _build_full_3d_preview_batch(
+                    batch,
+                    train_preview_preds,
+                    train_preview_targets,
+                    train_preview_ignore_mask,
+                )
             train_preview.add_batch(
-                batch,
-                loss_preds.detach(),
-                targets.detach(),
-                ignore_mask.detach(),
-                volume_logits=preds.detach(),
+                train_preview_batch,
+                train_preview_preds,
+                train_preview_targets,
+                train_preview_ignore_mask,
+                volume_logits=train_preview_volume_logits,
             )
             model.eval()
             val_losses = []
@@ -569,7 +674,7 @@ def train(config_path, profile_steps):
             val_preview = PreviewAccumulator(
                 accelerator=accelerator,
                 get_model_input=get_model_input,
-                normal_pooling_config=(config.get('normal_pooling') if mode == 'normal_pooled_3d' else None),
+                normal_pooling_config=(config.get('normal_pooling') if normal_pooled_mode else None),
             )
             num_val_batches = min(len(val_dl), config.get('val_steps', 10))
             if num_val_batches == 0:
@@ -636,12 +741,29 @@ def train(config_path, profile_steps):
                         preview_volume_preds = ema_val_preds
 
                     if val_batch_idx in preview_batch_indices:
+                        val_preview_batch = val_batch
+                        val_preview_preds = preview_preds.detach()
+                        val_preview_targets = val_targets.detach()
+                        val_preview_ignore = val_ignore_mask.detach()
+                        val_preview_volume_logits = preview_volume_preds.detach() if normal_pooled_mode else None
+                        if mode == 'full_3d':
+                            (
+                                val_preview_batch,
+                                val_preview_preds,
+                                val_preview_targets,
+                                val_preview_ignore,
+                            ) = _build_full_3d_preview_batch(
+                                val_batch,
+                                val_preview_preds,
+                                val_preview_targets,
+                                val_preview_ignore,
+                            )
                         val_preview.add_batch(
-                            val_batch,
-                            preview_preds.detach(),
-                            val_targets.detach(),
-                            val_ignore_mask.detach(),
-                            volume_logits=preview_volume_preds.detach(),
+                            val_preview_batch,
+                            val_preview_preds,
+                            val_preview_targets,
+                            val_preview_ignore,
+                            volume_logits=val_preview_volume_logits,
                         )
 
             mean_val_loss = np.mean(val_losses)

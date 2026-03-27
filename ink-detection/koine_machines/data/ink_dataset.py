@@ -33,6 +33,14 @@ from koine_machines.data.native_crop import compute_native_crop_bbox_from_patch_
 from koine_machines.data.segment import Segment
 from koine_machines.training.profiling import DatasetSampleProfiler
 
+
+_NATIVE_3D_MODES = {"normal_pooled_3d", "full_3d"}
+
+
+def _is_native_3d_mode(mode):
+    return str(mode).strip().lower() in _NATIVE_3D_MODES
+
+
 def _read_flat_surface_patch(volume, *, y0, y1, x0, x1):
     surface = int(volume.shape[0] // 2)
     patch, _ = _read_bbox_with_padding(
@@ -221,6 +229,32 @@ def _project_valid_surface_mask_to_native_crop(patch_zyxs, valid_mask, crop_bbox
     distance = distance_transform_edt(~surface_occupancy)
     surface_distance_field = np.clip(1.0 - (distance / max_distance_voxels), 0.0, 1.0)
     return surface_distance_field.astype(np.float32, copy=False)
+
+
+def _project_flat_labels_and_supervision_to_native_crop(
+    *,
+    support_patch_zyxs,
+    support_valid,
+    support_inklabels_flat_patch,
+    support_supervision_flat_patch,
+    crop_bbox,
+):
+    inklabels_crop = _project_flat_patch_to_native_crop(
+        (np.asarray(support_inklabels_flat_patch) > 0).astype(np.uint8, copy=False),
+        support_patch_zyxs,
+        support_valid,
+        crop_bbox,
+    )
+    supervision_crop = _project_flat_patch_to_native_crop(
+        (np.asarray(support_supervision_flat_patch) > 0).astype(np.uint8, copy=False),
+        support_patch_zyxs,
+        support_valid,
+        crop_bbox,
+    )
+    return (
+        (inklabels_crop > 0).astype(np.float32, copy=False),
+        (supervision_crop > 0).astype(np.float32, copy=False),
+    )
 
 
 def _filter_support_by_flat_seeded_component(
@@ -509,9 +543,9 @@ class InkDataset(Dataset):
         self.datasets         = config['datasets']
         self.vol_auth         = config.get('volume_auth_json')
         self.num_workers      = config.get('dataloader_workers', 8)
-        self.mode             = config.get('mode', 'flat')
+        self.mode             = str(config.get('mode', 'flat')).strip().lower()
         self.do_augmentations = bool(do_augmentations)
-        self.input_channels   = 1 + int(self.mode == "normal_pooled_3d")
+        self.input_channels   = 1 + int(_is_native_3d_mode(self.mode))
         self.training_patches = []
         self.validation_patches = []
         self.profile_enabled  = bool(config.get('profile_dataset', False))
@@ -648,7 +682,7 @@ class InkDataset(Dataset):
                 if not any(tifxyz_folder.rglob('x.tif')):
                     continue
 
-                if self.mode == "normal_pooled_3d":
+                if _is_native_3d_mode(self.mode):
                     image_volume = Path(ds['volume_path'])
                 else:
                     image_volume = Path(str(tifxyz_folder) + "/" + tifxyz_folder.name + '.zarr')
@@ -701,14 +735,16 @@ class InkDataset(Dataset):
             z0, y0, x0, z1, y1, x1 = patch.bbox
             expected_shape = tuple(int(v) for v in self.patch_size)
             crop_bbox = patch.bbox
-            use_surface_mask = self.mode == "normal_pooled_3d"
+            use_surface_mask = _is_native_3d_mode(self.mode)
             surface_mask = None
             normal_pooled_metadata = None
+            inklabels_crop = None
+            supervision_crop = None
             resample_idx = None
             resample_warning_message = None
 
             with sample_profiler.section('dataset/total'):
-                if self.mode == "normal_pooled_3d":
+                if _is_native_3d_mode(self.mode):
                     with sample_profiler.section('dataset/get_cached_inputs'):
                         image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
                         supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
@@ -861,16 +897,25 @@ class InkDataset(Dataset):
                                     crop_bbox,
                                 )
                             with sample_profiler.section('dataset/build_metadata'):
-                                normal_pooled_metadata = _build_normal_pooled_flat_metadata(
-                                    support_patch_zyxs=support_patch_zyxs,
-                                    support_valid=support_valid,
-                                    support_patch_zyxs_halo=support_patch_zyxs_halo,
-                                    support_valid_halo=support_valid_halo,
-                                    trim_slices=trim_slices,
-                                    support_inklabels_flat_patch=support_inklabels_flat_patch,
-                                    support_supervision_flat_patch=support_supervision_flat_patch,
-                                    crop_bbox=crop_bbox,
-                                )
+                                if self.mode == "normal_pooled_3d":
+                                    normal_pooled_metadata = _build_normal_pooled_flat_metadata(
+                                        support_patch_zyxs=support_patch_zyxs,
+                                        support_valid=support_valid,
+                                        support_patch_zyxs_halo=support_patch_zyxs_halo,
+                                        support_valid_halo=support_valid_halo,
+                                        trim_slices=trim_slices,
+                                        support_inklabels_flat_patch=support_inklabels_flat_patch,
+                                        support_supervision_flat_patch=support_supervision_flat_patch,
+                                        crop_bbox=crop_bbox,
+                                    )
+                                else:
+                                    inklabels_crop, supervision_crop = _project_flat_labels_and_supervision_to_native_crop(
+                                        support_patch_zyxs=support_patch_zyxs,
+                                        support_valid=support_valid,
+                                        support_inklabels_flat_patch=support_inklabels_flat_patch,
+                                        support_supervision_flat_patch=support_supervision_flat_patch,
+                                        crop_bbox=crop_bbox,
+                                    )
                 else:
                     with sample_profiler.section('dataset/get_cached_inputs'):
                         image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
@@ -911,6 +956,8 @@ class InkDataset(Dataset):
                             assert normal_pooled_metadata is not None
                             data.update(normal_pooled_metadata)
                         else:
+                            assert inklabels_crop is not None
+                            assert supervision_crop is not None
                             inklabels_crop = torch.from_numpy(inklabels_crop).float().unsqueeze(0)
                             supervision_crop = torch.from_numpy(supervision_crop).float().unsqueeze(0)
                             data.update({
@@ -928,7 +975,11 @@ class InkDataset(Dataset):
                                 augmented = self.augmentations(**augmentation_data)
                                 result = _restore_normal_pooled_augmentation_data(augmented, data, flat_valid_mask)
                             else:
-                                result = self.augmentations(**data)
+                                augmentation_data = data
+                                if self.mode == "full_3d" and 'surface_mask' in data:
+                                    augmentation_data = dict(data)
+                                    augmentation_data['regression_keys'] = ['surface_mask']
+                                result = self.augmentations(**augmentation_data)
                     else:
                         result = data
 
