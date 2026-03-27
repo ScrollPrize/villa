@@ -262,7 +262,7 @@ class RayFeatureHead(nn.Module):
         in_channels: int,
         bottleneck_channels: int = 16,
         hidden_channels: int = 32,
-        pool_mode: str = "logsumexp",
+        pool_mode: str = "max",
         pool_temperature: float = 1.0,
     ) -> None:
         super().__init__()

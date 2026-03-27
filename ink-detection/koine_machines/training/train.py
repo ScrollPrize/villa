@@ -365,7 +365,7 @@ def train(config_path, profile_steps):
             in_channels=feature_in_channels,
             bottleneck_channels=int(feature_head_config.get('bottleneck_channels', 16)),
             hidden_channels=int(feature_head_config.get('hidden_channels', 32)),
-            pool_mode=str(feature_head_config.get('pool_mode', 'logsumexp')),
+            pool_mode=str(feature_head_config.get('pool_mode', 'max')),
             pool_temperature=float(feature_head_config.get('pool_temperature', 1.0)),
         )
         model.return_shared_features = True
