@@ -26,7 +26,11 @@ from koine_machines.data.ink_dataset import InkDataset
 from koine_machines.models.load_checkpoint import load_training_checkpoint_from_config, restore_training_state
 from koine_machines.evaluation.metrics.balanced_accuracy import BalancedAccuracy
 from koine_machines.evaluation.metrics.confusion import Confusion, ConfusionCounts
-from koine_machines.training.normal_pooling import collate_normal_pooled_batch, pool_logits_along_normals
+from koine_machines.training.normal_pooling import (
+    RayFeatureHead,
+    collate_normal_pooled_batch,
+    pool_logits_along_normals,
+)
 from koine_machines.training.profiling import (
     NormalPoolingProfiler,
     _BackwardProfileMarkers,
@@ -243,6 +247,9 @@ def train(config_path, profile_steps):
     mode = str(config.get('mode', 'flat')).strip().lower()
     native_3d_mode = _is_native_3d_training_mode(mode)
     normal_pooled_mode = mode == 'normal_pooled_3d'
+    pooling_config = config.get('normal_pooling') or {}
+    feature_head_config = pooling_config.get('feature_head') or {}
+    use_feature_head = normal_pooled_mode and bool(feature_head_config.get('enabled', False))
     model_type = str(config.get('model_type', '')).strip().lower()
     if normal_pooled_mode and model_type.startswith('resnet3d'):
         raise ValueError("normal_pooled_3d is currently only supported with the vesuvius_unet model path")
@@ -350,6 +357,18 @@ def train(config_path, profile_steps):
     )
 
     model = make_model(config)
+    if use_feature_head:
+        if not hasattr(model, 'shared_encoder'):
+            raise ValueError("normal_pooling.feature_head requires a model with shared_encoder output channels")
+        feature_in_channels = int(model.shared_encoder.output_channels[0])
+        model.normal_pooling_ray_head = RayFeatureHead(
+            in_channels=feature_in_channels,
+            bottleneck_channels=int(feature_head_config.get('bottleneck_channels', 16)),
+            hidden_channels=int(feature_head_config.get('hidden_channels', 32)),
+            pool_mode=str(feature_head_config.get('pool_mode', 'logsumexp')),
+            pool_temperature=float(feature_head_config.get('pool_temperature', 1.0)),
+        )
+        model.return_shared_features = True
     optimizer_target = model
     pretrained_backbone = (config.get('model_config') or {}).get('pretrained_backbone')
     freeze_encoder = False
@@ -462,7 +481,7 @@ def train(config_path, profile_steps):
             return torch.cat([image, surface_mask], dim=1)
         return image
 
-    def prepare_loss_inputs(preds, batch, profiler=None):
+    def prepare_loss_inputs(preds, batch, profiler=None, feature_volume=None):
         if normal_pooled_mode:
             total_section = profiler.section('normal_pooling/total', preds.device) if profiler is not None else nullcontext()
             with total_section:
@@ -476,8 +495,6 @@ def train(config_path, profile_steps):
                             mode='trilinear',
                             align_corners=True,
                         )
-
-                pooling_config = config.get('normal_pooling') or {}
                 outside_bg_loss = _compute_normal_pooled_3d_background_loss(
                     preds,
                     batch['surface_mask'].to(device=preds.device, dtype=preds.dtype),
@@ -487,17 +504,34 @@ def train(config_path, profile_steps):
                 pool_section = profiler.section('normal_pooling/pool_logits_along_normals', preds.device) if profiler is not None else nullcontext()
                 with pool_section:
                     pooling_dtype = preds.dtype
-                    pooled_logits, pooled_valid = pool_logits_along_normals(
-                        preds,
-                        batch['flat_points_local_zyx'].to(dtype=pooling_dtype),
-                        batch['flat_normals_local_zyx'].to(dtype=pooling_dtype),
-                        batch['flat_valid'],
-                        neg_dist=float(pooling_config.get('neg_dist', 10.0)),
-                        pos_dist=float(pooling_config.get('pos_dist', 10.0)),
-                        sample_step=float(pooling_config.get('sample_step', 0.5)),
-                        align_corners=True,
-                        timer=(profiler.section if profiler is not None else None),
-                    )
+                    flat_points = batch['flat_points_local_zyx'].to(dtype=pooling_dtype)
+                    flat_normals = batch['flat_normals_local_zyx'].to(dtype=pooling_dtype)
+                    if use_feature_head:
+                        if feature_volume is None:
+                            raise ValueError("normal_pooling.feature_head is enabled but feature_volume was not returned by the model")
+                        pooled_logits, pooled_valid = model.normal_pooling_ray_head(
+                            feature_volume.to(dtype=pooling_dtype),
+                            flat_points,
+                            flat_normals,
+                            batch['flat_valid'],
+                            neg_dist=float(pooling_config.get('neg_dist', 10.0)),
+                            pos_dist=float(pooling_config.get('pos_dist', 10.0)),
+                            sample_step=float(pooling_config.get('sample_step', 0.5)),
+                            align_corners=True,
+                            timer=(profiler.section if profiler is not None else None),
+                        )
+                    else:
+                        pooled_logits, pooled_valid = pool_logits_along_normals(
+                            preds,
+                            flat_points,
+                            flat_normals,
+                            batch['flat_valid'],
+                            neg_dist=float(pooling_config.get('neg_dist', 10.0)),
+                            pos_dist=float(pooling_config.get('pos_dist', 10.0)),
+                            sample_step=float(pooling_config.get('sample_step', 0.5)),
+                            align_corners=True,
+                            timer=(profiler.section if profiler is not None else None),
+                        )
                 targets_section = profiler.section('normal_pooling/build_targets_and_ignore_mask', preds.device) if profiler is not None else nullcontext()
                 with targets_section:
                     targets = batch['flat_target']
@@ -565,17 +599,24 @@ def train(config_path, profile_steps):
             forward_section = normal_pooling_profiler.section('model/forward', accelerator.device) if normal_pooling_profiler.enabled else nullcontext()
             with forward_section:
                 with accelerator.autocast():
-                    preds = run_model_forward(
-                        model,
-                        get_model_input(batch),
-                        model_crop_size,
-                        stitched=use_stitched_forward,
-                        use_gradient_checkpointing=stitched_gradient_checkpointing,
-                    )
+                    feature_volume = None
+                    if use_feature_head:
+                        model_output = model(get_model_input(batch))
+                        preds = model_output['ink']
+                        feature_volume = model_output.get('shared_features')
+                    else:
+                        preds = run_model_forward(
+                            model,
+                            get_model_input(batch),
+                            model_crop_size,
+                            stitched=use_stitched_forward,
+                            use_gradient_checkpointing=stitched_gradient_checkpointing,
+                        )
             loss_preds, targets, ignore_mask, outside_bg_loss = prepare_loss_inputs(
                 preds,
                 batch,
                 profiler=normal_pooling_profiler if normal_pooling_profiler.enabled else None,
+                feature_volume=feature_volume,
             )
             loss_section = normal_pooling_profiler.section('normal_pooling/loss', preds.device) if normal_pooling_profiler.enabled else nullcontext()
             with loss_section:
