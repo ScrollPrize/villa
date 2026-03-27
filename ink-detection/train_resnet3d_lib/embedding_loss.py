@@ -135,6 +135,23 @@ def _crop_to_valid_bbox(image: torch.Tensor, valid_mask: torch.Tensor) -> torch.
     return image[y0:y1, x0:x1]
 
 
+def prepare_prediction_for_embedding(
+    stitched_logits: torch.Tensor,
+    *,
+    prediction_type: str = "sigmoid",
+    clamped_logit_bound: float = 3.0,
+) -> torch.Tensor:
+    logits = stitched_logits.float()
+    if prediction_type == "sigmoid":
+        return torch.sigmoid(logits)
+    if prediction_type == "logit":
+        bound = float(clamped_logit_bound)
+        if bound <= 0.0:
+            raise ValueError(f"clamped_logit_bound must be > 0, got {bound}")
+        return (logits / (2.0 * bound)) + 0.5
+    raise ValueError(f"Unsupported embedding prediction type: {prediction_type!r}")
+
+
 def compute_stitch_embedding_similarity(
     *,
     embedding_model: InkPatchEmbedder,
@@ -143,8 +160,14 @@ def compute_stitch_embedding_similarity(
     stitched_logits: torch.Tensor,
     stitched_targets: torch.Tensor,
     valid_mask: torch.Tensor,
+    prediction_type: str = "sigmoid",
+    prediction_clamped_logit_bound: float = 3.0,
 ) -> torch.Tensor:
-    pred = torch.sigmoid(stitched_logits.float())
+    pred = prepare_prediction_for_embedding(
+        stitched_logits,
+        prediction_type=prediction_type,
+        clamped_logit_bound=prediction_clamped_logit_bound,
+    )
     target = stitched_targets.float().clamp_(0.0, 1.0)
     valid = valid_mask.to(dtype=pred.dtype)
 
