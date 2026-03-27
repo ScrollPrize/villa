@@ -145,29 +145,6 @@ def create_training_transforms(
                 p_per_channel=0.5,
                 p_clamp_intensities=0.5,
             ),
-            apply_probability=0.2,
-        )
-    )
-    transforms.append(
-        RandomTransform(
-            MultiplicativeBrightnessTransform(
-                multiplier_range=BGContrast((0.75, 1.25)),
-                synchronize_channels=False,
-                p_per_channel=0.5,
-            ),
-            apply_probability=0.2,
-        )
-    )
-    transforms.append(
-        RandomTransform(
-            SimulateLowResolutionTransform(
-                scale=(0.25, 1),
-                synchronize_channels=False,
-                synchronize_axes=True,
-                ignore_axes=None,
-                allowed_channels=None,
-                p_per_channel=0.5,
-            ),
             apply_probability=0.1,
         )
     )
@@ -192,7 +169,7 @@ def create_training_transforms(
                 p_per_channel=1,
                 p_retain_stats=1,
             ),
-            apply_probability=0.3,
+            apply_probability=0.1,
         )
     )
     transforms.append(
@@ -202,7 +179,7 @@ def create_training_transforms(
                 p_synchronize_channels=0.5,
                 p_per_channel=0.5,
             ),
-            apply_probability=0.2,
+            apply_probability=0.1,
         )
     )
     if dimension == 3:
@@ -239,7 +216,7 @@ def create_training_transforms(
                     ),
                 ]
             ),
-            apply_probability=0.4,
+            apply_probability=0.1,
         )
     )
     transforms.append(
@@ -259,7 +236,7 @@ def create_training_transforms(
                     ),
                 ]
             ),
-            apply_probability=0.4,
+            apply_probability=0.2,
         )
     )
     transforms.append(
@@ -272,7 +249,7 @@ def create_training_transforms(
                 p_per_sample=1.0,
                 p_per_channel=1.0,
             ),
-            apply_probability=0.2,
+            apply_probability=0.1,
         )
     )
 
