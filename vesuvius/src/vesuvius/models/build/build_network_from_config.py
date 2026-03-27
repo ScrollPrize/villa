@@ -1090,6 +1090,8 @@ class NetworkFromConfig(nn.Module):
                     else:
                         logits = activation_fn(logits)
                 results[task_name] = logits
+        if getattr(self, 'return_shared_features', False) and shared_features is not None:
+            results['shared_features'] = shared_features
         
         # Return MAE mask if requested (for MAE training)
         if return_mae_mask:
