@@ -159,7 +159,6 @@ def pool_logits_along_normals(
     batch_size, _, depth, height, width = logits_3d.shape
     if flat_points_local_zyx.shape[0] != batch_size or flat_normals_local_zyx.shape[0] != batch_size:
         raise ValueError("Batch size mismatch between logits and flat geometry tensors")
-
     def timed(section_name: str):
         if timer is None:
             return nullcontext()

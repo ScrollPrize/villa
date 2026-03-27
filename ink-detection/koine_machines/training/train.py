@@ -90,6 +90,41 @@ def _record_dataset_profile_batch(profiler, batch):
         if durations:
             profiler.add_duration(name, sum(durations) / len(durations))
 
+
+def _compute_normal_pooled_3d_background_loss(
+    volume_logits: torch.Tensor,
+    surface_mask: torch.Tensor,
+    *,
+    outside_threshold: float = 0.0,
+    loss_weight: float = 1.0,
+) -> torch.Tensor:
+    if volume_logits.ndim != 5:
+        raise ValueError(
+            f"Expected volume_logits with shape [B, 1, Z, Y, X], got {tuple(volume_logits.shape)}"
+        )
+    if surface_mask.ndim == 4:
+        surface_mask = surface_mask.unsqueeze(1)
+    elif surface_mask.ndim != 5:
+        raise ValueError(
+            f"Expected surface_mask with shape [B, 1, Z, Y, X] or [B, Z, Y, X], got {tuple(surface_mask.shape)}"
+        )
+    if tuple(int(v) for v in surface_mask.shape) != tuple(int(v) for v in volume_logits.shape):
+        raise ValueError(
+            f"surface_mask must match volume_logits shape, got {tuple(surface_mask.shape)} vs {tuple(volume_logits.shape)}"
+        )
+
+    loss_weight = float(loss_weight)
+    if loss_weight <= 0.0:
+        return volume_logits.new_zeros(())
+
+    outside_mask = surface_mask <= float(outside_threshold)
+    if not torch.any(outside_mask):
+        return volume_logits.new_zeros(())
+
+    outside_bg_loss = F.softplus(volume_logits.float())
+    outside_bg_loss = outside_bg_loss.masked_select(outside_mask).mean()
+    return outside_bg_loss * loss_weight
+
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
 @click.option(
@@ -372,6 +407,12 @@ def train(config_path, profile_steps):
                         )
 
                 pooling_config = config.get('normal_pooling') or {}
+                outside_bg_loss = _compute_normal_pooled_3d_background_loss(
+                    preds,
+                    batch['surface_mask'].to(device=preds.device, dtype=preds.dtype),
+                    outside_threshold=float(pooling_config.get('outside_bg_threshold', 0.0)),
+                    loss_weight=float(pooling_config.get('outside_bg_loss_weight', 1.0)),
+                )
                 pool_section = profiler.section('normal_pooling/pool_logits_along_normals', preds.device) if profiler is not None else nullcontext()
                 with pool_section:
                     pooling_dtype = preds.dtype
@@ -394,12 +435,12 @@ def train(config_path, profile_steps):
                         | (batch['flat_valid'] <= 0)
                         | (pooled_valid <= 0)
                     ).to(dtype=targets.dtype)
-                return pooled_logits, targets, ignore_mask
+                return pooled_logits, targets, ignore_mask, outside_bg_loss
 
         targets = (torch.amax(batch['inklabels'], dim=2) > 0).to(dtype=batch['inklabels'].dtype)
         supervision_mask = torch.amax(batch['supervision_mask'], dim=2)
         ignore_mask = (supervision_mask <= 0).to(dtype=targets.dtype)
-        return preds, targets, ignore_mask
+        return preds, targets, ignore_mask, preds.new_zeros(())
 
     def refresh_progress_bar(current_train_loss):
         if not accelerator.is_main_process:
@@ -443,7 +484,7 @@ def train(config_path, profile_steps):
                         stitched=use_stitched_forward,
                         use_gradient_checkpointing=stitched_gradient_checkpointing,
                     )
-            loss_preds, targets, ignore_mask = prepare_loss_inputs(
+            loss_preds, targets, ignore_mask, outside_bg_loss = prepare_loss_inputs(
                 preds,
                 batch,
                 profiler=normal_pooling_profiler if normal_pooling_profiler.enabled else None,
@@ -452,6 +493,7 @@ def train(config_path, profile_steps):
             with loss_section:
                 targets_with_ignore = torch.cat([targets, ignore_mask], dim=1)
                 l = loss(loss_preds.float(), targets_with_ignore.float())
+                l = l + outside_bg_loss
             if not torch.isfinite(l):
                 raise RuntimeError(f"Non-finite loss at step {step}")
             backward_markers = _BackwardProfileMarkers.create(
@@ -499,6 +541,8 @@ def train(config_path, profile_steps):
                 'train/lr': optimizer.param_groups[0]['lr'],
                 'step': step,
             }
+            if mode == 'normal_pooled_3d':
+                log_dict['train/outside_bg_loss'] = float(outside_bg_loss.detach().item())
             latest_loss_metrics = getattr(loss, 'latest_metrics', None)
             if isinstance(latest_loss_metrics, dict):
                 log_dict.update(latest_loss_metrics)
@@ -549,11 +593,11 @@ def train(config_path, profile_steps):
                             stitched=use_stitched_forward,
                             use_gradient_checkpointing=stitched_gradient_checkpointing,
                         )
-                    val_loss_preds, val_targets, val_ignore_mask = prepare_loss_inputs(val_preds, val_batch)
+                    val_loss_preds, val_targets, val_ignore_mask, val_outside_bg_loss = prepare_loss_inputs(val_preds, val_batch)
                     preview_preds = val_loss_preds
                     preview_volume_preds = val_preds
                     val_targets_with_ignore = torch.cat([val_targets, val_ignore_mask], dim=1)
-                    val_l = loss(val_loss_preds.float(), val_targets_with_ignore.float())
+                    val_l = loss(val_loss_preds.float(), val_targets_with_ignore.float()) + val_outside_bg_loss
                     val_losses.append(val_l.item())
                     batch_counts = validation_confusion_metric.compute_batch(
                         ValidationMetricBatch(
@@ -585,8 +629,8 @@ def train(config_path, profile_steps):
                                 stitched=use_stitched_forward,
                                 use_gradient_checkpointing=stitched_gradient_checkpointing,
                             )
-                        ema_val_loss_preds, _, _ = prepare_loss_inputs(ema_val_preds, val_batch)
-                        ema_val_l = loss(ema_val_loss_preds.float(), val_targets_with_ignore.float())
+                        ema_val_loss_preds, _, _, ema_val_outside_bg_loss = prepare_loss_inputs(ema_val_preds, val_batch)
+                        ema_val_l = loss(ema_val_loss_preds.float(), val_targets_with_ignore.float()) + ema_val_outside_bg_loss
                         ema_val_losses.append(ema_val_l.item())
                         preview_preds = ema_val_loss_preds
                         preview_volume_preds = ema_val_preds
