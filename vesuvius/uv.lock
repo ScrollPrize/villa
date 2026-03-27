@@ -6414,6 +6414,8 @@ all = [
 ]
 blending = [
     { name = "nest-asyncio" },
+    { name = "numba" },
+    { name = "scikit-image" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.16.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "tqdm" },
@@ -6545,6 +6547,7 @@ requires-dist = [
     { name = "nnunetv2", marker = "extra == 'all'", directory = "../segmentation/models/arch/nnunet" },
     { name = "nnunetv2", marker = "extra == 'models'", directory = "../segmentation/models/arch/nnunet" },
     { name = "numba", marker = "extra == 'all'", specifier = ">=0.60.0" },
+    { name = "numba", marker = "extra == 'blending'", specifier = ">=0.60.0" },
     { name = "numba", marker = "extra == 'models'", specifier = ">=0.60.0" },
     { name = "numcodecs", specifier = ">=0.12.1" },
     { name = "numcodecs", marker = "extra == 'volume-only'", specifier = ">=0.12.1" },
@@ -6580,6 +6583,7 @@ requires-dist = [
     { name = "s3fs", specifier = ">=2025.9.0" },
     { name = "s3fs", marker = "extra == 'volume-only'", specifier = ">=2025.9.0" },
     { name = "scikit-image", marker = "extra == 'all'", specifier = ">=0.24.0" },
+    { name = "scikit-image", marker = "extra == 'blending'", specifier = ">=0.24.0" },
     { name = "scikit-image", marker = "extra == 'models'", specifier = ">=0.24.0" },
     { name = "scipy", marker = "extra == 'all'", specifier = ">=1.13.1" },
     { name = "scipy", marker = "extra == 'blending'", specifier = ">=1.13.1" },
