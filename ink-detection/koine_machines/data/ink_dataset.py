@@ -231,6 +231,15 @@ def _project_valid_surface_mask_to_native_crop(patch_zyxs, valid_mask, crop_bbox
     return surface_distance_field.astype(np.float32, copy=False)
 
 
+def _dilate_binary_mask_via_distance_transform(mask, *, max_distance_voxels):
+    mask = np.asarray(mask, dtype=bool)
+    max_distance_voxels = float(max_distance_voxels)
+    if max_distance_voxels <= 0.0 or not np.any(mask):
+        return mask
+    distance = distance_transform_edt(~mask)
+    return distance <= max_distance_voxels
+
+
 def _project_flat_labels_and_supervision_to_native_crop(
     *,
     support_patch_zyxs,
@@ -238,22 +247,36 @@ def _project_flat_labels_and_supervision_to_native_crop(
     support_inklabels_flat_patch,
     support_supervision_flat_patch,
     crop_bbox,
+    label_dilation_distance=0.0,
+    supervision_dilation_distance=0.0,
 ):
     inklabels_crop = _project_flat_patch_to_native_crop(
         (np.asarray(support_inklabels_flat_patch) > 0).astype(np.uint8, copy=False),
         support_patch_zyxs,
         support_valid,
         crop_bbox,
-    )
+    ) > 0
     supervision_crop = _project_flat_patch_to_native_crop(
         (np.asarray(support_supervision_flat_patch) > 0).astype(np.uint8, copy=False),
         support_patch_zyxs,
         support_valid,
         crop_bbox,
+    ) > 0
+
+    inklabels_crop = _dilate_binary_mask_via_distance_transform(
+        inklabels_crop,
+        max_distance_voxels=label_dilation_distance,
     )
+    supervision_background = supervision_crop & ~inklabels_crop
+    supervision_background = _dilate_binary_mask_via_distance_transform(
+        supervision_background,
+        max_distance_voxels=supervision_dilation_distance,
+    )
+    supervision_background &= ~inklabels_crop
+    supervision_crop = inklabels_crop | supervision_background
     return (
-        (inklabels_crop > 0).astype(np.float32, copy=False),
-        (supervision_crop > 0).astype(np.float32, copy=False),
+        inklabels_crop.astype(np.float32, copy=False),
+        supervision_crop.astype(np.float32, copy=False),
     )
 
 
@@ -909,12 +932,19 @@ class InkDataset(Dataset):
                                         crop_bbox=crop_bbox,
                                     )
                                 else:
+                                    full_3d_config = self.config.get('full_3d') or {}
                                     inklabels_crop, supervision_crop = _project_flat_labels_and_supervision_to_native_crop(
                                         support_patch_zyxs=support_patch_zyxs,
                                         support_valid=support_valid,
                                         support_inklabels_flat_patch=support_inklabels_flat_patch,
                                         support_supervision_flat_patch=support_supervision_flat_patch,
                                         crop_bbox=crop_bbox,
+                                        label_dilation_distance=float(
+                                            full_3d_config.get('label_dilation_distance', 0.0)
+                                        ),
+                                        supervision_dilation_distance=float(
+                                            full_3d_config.get('supervision_dilation_distance', 0.0)
+                                        ),
                                     )
                 else:
                     with sample_profiler.section('dataset/get_cached_inputs'):
