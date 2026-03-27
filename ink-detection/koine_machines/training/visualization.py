@@ -35,15 +35,20 @@ def to_uint8_label(label_2d, ignore_mask_2d=None):
     return label_vis
 
 
-def to_uint8_probability(probability_2d, lower_percentile=1.0, upper_percentile=99.0):
+def to_uint8_probability(probability_2d):
     probability_2d = np.nan_to_num(np.asarray(probability_2d, dtype=np.float32), nan=0.0, posinf=1.0, neginf=0.0)
     probability_2d = np.clip(probability_2d, 0.0, 1.0)
-    lo = float(np.percentile(probability_2d, lower_percentile))
-    hi = float(np.percentile(probability_2d, upper_percentile))
-    if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
-        probability_2d = np.clip(probability_2d, lo, hi)
-        probability_2d = (probability_2d - lo) / (hi - lo)
     return np.clip(np.rint(probability_2d * 255.0), 0, 255).astype(np.uint8)
+
+
+def to_uint8_logit(logit_2d, *, clip_value=8.0):
+    logit_2d = np.nan_to_num(np.asarray(logit_2d, dtype=np.float32), nan=0.0, posinf=float(clip_value), neginf=-float(clip_value))
+    clip_value = float(clip_value)
+    if clip_value <= 0:
+        raise ValueError(f"clip_value must be > 0, got {clip_value}")
+    logit_2d = np.clip(logit_2d, -clip_value, clip_value)
+    logit_2d = (logit_2d + clip_value) / (2.0 * clip_value)
+    return np.clip(np.rint(logit_2d * 255.0), 0, 255).astype(np.uint8)
 
 
 def composite_uint8_images(*images):
@@ -277,11 +282,11 @@ class PreviewAccumulator:
             sample_tile = build_panel_grid(
                 [
                     [
-                        to_uint8_image(volume_logit_tile),
+                        to_uint8_logit(volume_logit_tile),
                         to_uint8_image(volume_crop_tile),
                     ],
                     [
-                        to_uint8_image(pooled_logit_tile),
+                        to_uint8_logit(pooled_logit_tile),
                         composite_uint8_images(flat_crop_tile, flat_max_crop_tile),
                         to_uint8_label(label_tile, ignore_mask_tile),
                     ],
