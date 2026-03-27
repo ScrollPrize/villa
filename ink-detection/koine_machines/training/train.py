@@ -198,6 +198,31 @@ def _compute_normal_pooled_3d_background_loss(
     outside_bg_loss = outside_bg_loss.masked_select(outside_mask).mean()
     return outside_bg_loss * loss_weight
 
+
+def _forward_model_with_optional_shared_features(
+    model,
+    image: torch.Tensor,
+    model_crop_size,
+    *,
+    capture_shared_features: bool,
+    stitched: bool = True,
+    use_gradient_checkpointing: bool = True,
+):
+    if capture_shared_features:
+        model_output = model(image)
+        return model_output['ink'], model_output.get('shared_features')
+
+    return (
+        run_model_forward(
+            model,
+            image,
+            model_crop_size,
+            stitched=stitched,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+        ),
+        None,
+    )
+
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
 @click.option(
@@ -599,19 +624,14 @@ def train(config_path, profile_steps):
             forward_section = normal_pooling_profiler.section('model/forward', accelerator.device) if normal_pooling_profiler.enabled else nullcontext()
             with forward_section:
                 with accelerator.autocast():
-                    feature_volume = None
-                    if use_feature_head:
-                        model_output = model(get_model_input(batch))
-                        preds = model_output['ink']
-                        feature_volume = model_output.get('shared_features')
-                    else:
-                        preds = run_model_forward(
-                            model,
-                            get_model_input(batch),
-                            model_crop_size,
-                            stitched=use_stitched_forward,
-                            use_gradient_checkpointing=stitched_gradient_checkpointing,
-                        )
+                    preds, feature_volume = _forward_model_with_optional_shared_features(
+                        model,
+                        get_model_input(batch),
+                        model_crop_size,
+                        capture_shared_features=use_feature_head,
+                        stitched=use_stitched_forward,
+                        use_gradient_checkpointing=stitched_gradient_checkpointing,
+                    )
             loss_preds, targets, ignore_mask, outside_bg_loss = prepare_loss_inputs(
                 preds,
                 batch,
@@ -732,14 +752,19 @@ def train(config_path, profile_steps):
                 for val_batch_idx in range(num_val_batches):
                     val_batch = next(val_iterator)
                     with accelerator.autocast():
-                        val_preds = run_model_forward(
+                        val_preds, val_feature_volume = _forward_model_with_optional_shared_features(
                             model,
                             get_model_input(val_batch),
                             model_crop_size,
+                            capture_shared_features=use_feature_head,
                             stitched=use_stitched_forward,
                             use_gradient_checkpointing=stitched_gradient_checkpointing,
                         )
-                    val_loss_preds, val_targets, val_ignore_mask, val_outside_bg_loss = prepare_loss_inputs(val_preds, val_batch)
+                    val_loss_preds, val_targets, val_ignore_mask, val_outside_bg_loss = prepare_loss_inputs(
+                        val_preds,
+                        val_batch,
+                        feature_volume=val_feature_volume,
+                    )
                     preview_preds = val_loss_preds
                     preview_volume_preds = val_preds
                     val_targets_with_ignore = torch.cat([val_targets, val_ignore_mask], dim=1)
@@ -768,14 +793,19 @@ def train(config_path, profile_steps):
                     )
                     if ema_model is not None and ema_validate:
                         with accelerator.autocast():
-                            ema_val_preds = run_model_forward(
+                            ema_val_preds, ema_val_feature_volume = _forward_model_with_optional_shared_features(
                                 ema_model,
                                 get_model_input(val_batch),
                                 model_crop_size,
+                                capture_shared_features=use_feature_head,
                                 stitched=use_stitched_forward,
                                 use_gradient_checkpointing=stitched_gradient_checkpointing,
                             )
-                        ema_val_loss_preds, _, _, ema_val_outside_bg_loss = prepare_loss_inputs(ema_val_preds, val_batch)
+                        ema_val_loss_preds, _, _, ema_val_outside_bg_loss = prepare_loss_inputs(
+                            ema_val_preds,
+                            val_batch,
+                            feature_volume=ema_val_feature_volume,
+                        )
                         ema_val_l = loss(ema_val_loss_preds.float(), val_targets_with_ignore.float()) + ema_val_outside_bg_loss
                         ema_val_losses.append(ema_val_l.item())
                         preview_preds = ema_val_loss_preds

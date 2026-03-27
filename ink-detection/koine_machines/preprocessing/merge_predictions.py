@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import multiprocessing as mp
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ SUPPORTED_SUFFIXES = {".png", ".tif", ".tiff"}
 DEFAULT_MAX_WORKERS = 2
 DEFAULT_TARGET_CHUNK_MB = 96
 FOREGROUND_THRESHOLD_U8 = 128
+CKPT_PATTERN = re.compile(r"(?:^|_)ckpt_(?P<ckpt>\d+)(?:_|$)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -143,6 +145,17 @@ def matches_prediction_terms(path: Path, normalized_terms: Sequence[str]) -> boo
     return any(term in lower_name for term in normalized_terms)
 
 
+def extract_ckpt_number(path: Path) -> int:
+    match = CKPT_PATTERN.search(path.stem)
+    if match is None:
+        return -1
+    return int(match.group("ckpt"))
+
+
+def prediction_priority(path: Path) -> tuple[int, str]:
+    return (extract_ckpt_number(path), path.stem.lower())
+
+
 def collect_matching_prediction_files(
     preds_dir: Path,
     *,
@@ -158,7 +171,17 @@ def collect_matching_prediction_files(
         if not matches_prediction_terms(candidate, normalized_terms):
             continue
         matches.append(candidate)
-    return matches
+
+    if not normalized_terms:
+        return matches
+
+    selected_paths: set[Path] = set()
+    for term in normalized_terms:
+        term_matches = [path for path in matches if term in path.stem.lower()]
+        if not term_matches:
+            continue
+        selected_paths.add(max(term_matches, key=prediction_priority))
+    return sorted(selected_paths)
 
 
 def choose_output_suffix(paths: Sequence[Path]) -> str:
