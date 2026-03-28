@@ -53,6 +53,57 @@ class MaskingLossWrapper(nn.Module):
         return masked_loss.sum() / num_valid
 
 
+class BinaryBCEAndDiceLoss(nn.Module):
+    """
+    Binary BCE + soft dice loss for single-channel logits with optional ignore label.
+    """
+
+    def __init__(
+        self,
+        bce_kwargs=None,
+        weight_bce: float = 1.0,
+        weight_dice: float = 1.0,
+        smooth: float = 1e-5,
+        ignore_label: int | None = None,
+    ):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss(reduction="none", **(bce_kwargs or {}))
+        self.weight_bce = float(weight_bce)
+        self.weight_dice = float(weight_dice)
+        self.smooth = float(smooth)
+        self.ignore_label = ignore_label
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if input.shape[1] != 1:
+            raise ValueError(
+                f"BinaryBCEAndDiceLoss expects a single-channel prediction, got shape {tuple(input.shape)}"
+            )
+        if target.ndim != input.ndim:
+            target = target.view((target.shape[0], 1, *target.shape[1:]))
+
+        target = target.float()
+        if self.ignore_label is not None:
+            valid_mask = target != float(self.ignore_label)
+            target = torch.where(valid_mask, target, torch.zeros_like(target))
+        else:
+            valid_mask = torch.ones_like(target, dtype=torch.bool)
+
+        bce_map = self.bce(input, target)
+        valid_mask_f = valid_mask.float()
+        valid_voxels = valid_mask_f.sum().clamp(min=1.0)
+        bce_loss = (bce_map * valid_mask_f).sum() / valid_voxels
+
+        probs = torch.sigmoid(input) * valid_mask_f
+        target_masked = target * valid_mask_f
+        axes = tuple(range(2, probs.ndim))
+        intersection = (probs * target_masked).sum(axes)
+        pred_sum = probs.sum(axes)
+        target_sum = target_masked.sum(axes)
+        dice = (2.0 * intersection + self.smooth) / (pred_sum + target_sum + self.smooth)
+        dice_loss = 1.0 - dice.mean()
+        return self.weight_bce * bce_loss + self.weight_dice * dice_loss
+
+
 class SkipLastTargetChannelWrapper(nn.Module):
     """
     Loss wrapper which removes additional target channel
@@ -1142,7 +1193,19 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
             use_ignore_label=use_ignore_label,
             dice_class=MemoryEfficientSoftDiceLoss
         )
-    
+
+    elif name == 'BinaryBCEAndDiceLoss':
+        bce_kwargs = dict(loss_config.get('bce_kwargs', {}))
+        if pos_weight is not None and 'pos_weight' not in bce_kwargs:
+            bce_kwargs['pos_weight'] = pos_weight
+        base_loss = BinaryBCEAndDiceLoss(
+            bce_kwargs=bce_kwargs,
+            weight_bce=loss_config.get('weight_bce', loss_config.get('weight_ce', 1)),
+            weight_dice=loss_config.get('weight_dice', 1),
+            smooth=loss_config.get('smooth', 1e-5),
+            ignore_label=ignore_index,
+        )
+
     elif name == 'MemoryEfficientSoftDiceLoss':
         # Standalone memory efficient dice loss
         base_loss = MemoryEfficientSoftDiceLoss(

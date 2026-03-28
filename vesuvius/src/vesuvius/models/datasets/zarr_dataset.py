@@ -120,6 +120,7 @@ class ZarrDataset(Dataset):
 
         # OME-Zarr parameters
         self.ome_zarr_resolution = getattr(mgr, 'ome_zarr_resolution', 0)
+        self.ome_zarr_scale_factor = 2 ** int(self.ome_zarr_resolution)
         self.valid_patch_find_resolution = getattr(mgr, 'valid_patch_find_resolution', 1)
 
         # Semi-supervised parameters
@@ -320,6 +321,26 @@ class ZarrDataset(Dataset):
             "Patch index built: %d labeled FG, %d unlabeled FG, %d total",
             self._n_labeled_fg, self._n_unlabeled_fg, len(self._patches)
         )
+
+    @staticmethod
+    def _cached_position_to_training_level(
+        position: Tuple[int, ...],
+        ome_zarr_resolution: int,
+    ) -> Tuple[int, ...]:
+        """Convert cached full-resolution coordinates into the selected training level."""
+        scale_factor = 2 ** int(ome_zarr_resolution)
+        if scale_factor == 1:
+            return tuple(int(v) for v in position)
+
+        converted = []
+        for coord in position:
+            coord = int(coord)
+            if coord % scale_factor != 0:
+                raise ValueError(
+                    f"Cached full-resolution position {position} is not divisible by scale factor {scale_factor}"
+                )
+            converted.append(coord // scale_factor)
+        return tuple(converted)
 
     def _load_from_mapping(self, mapping_file: Path) -> None:
         """
@@ -551,6 +572,7 @@ class ZarrDataset(Dataset):
             min_labeled_ratio=self.min_labeled_ratio,
             bbox_threshold=self.min_bbox_percent,
             valid_patch_find_resolution=self.valid_patch_find_resolution,
+            ome_zarr_resolution=self.ome_zarr_resolution,
             valid_patch_value=valid_patch_value,
             unlabeled_fg_enabled=self.unlabeled_fg_enabled,
             unlabeled_fg_threshold=self.unlabeled_fg_threshold,
@@ -565,10 +587,14 @@ class ZarrDataset(Dataset):
         # Add FG patches
         for entry in cache_data.fg_patches:
             vol_idx = volume_name_to_idx.get(entry.volume_name, entry.volume_idx)
+            position = self._cached_position_to_training_level(
+                entry.position,
+                self.ome_zarr_resolution,
+            )
             self._patches.append(PatchInfo(
                 volume_index=vol_idx,
                 volume_name=entry.volume_name,
-                position=entry.position,
+                position=position,
                 patch_size=self.patch_size,
                 is_unlabeled_fg=False,
             ))
@@ -577,10 +603,14 @@ class ZarrDataset(Dataset):
         # Add unlabeled FG patches
         for entry in cache_data.unlabeled_fg_patches:
             vol_idx = volume_name_to_idx.get(entry.volume_name, entry.volume_idx)
+            position = self._cached_position_to_training_level(
+                entry.position,
+                self.ome_zarr_resolution,
+            )
             self._patches.append(PatchInfo(
                 volume_index=vol_idx,
                 volume_name=entry.volume_name,
-                position=entry.position,
+                position=position,
                 patch_size=self.patch_size,
                 is_unlabeled_fg=True,
             ))

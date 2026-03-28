@@ -273,6 +273,16 @@ class ConfigManager:
 
         # Chunk-slicing worker configuration
         self.valid_patch_find_resolution = int(self.dataset_config.get("valid_patch_find_resolution", 1))
+        self.ome_zarr_resolution = int(self.dataset_config.get("ome_zarr_resolution", 0))
+        if self.ome_zarr_resolution < 0:
+            raise ValueError(
+                f"dataset_config.ome_zarr_resolution must be >= 0, got {self.ome_zarr_resolution}"
+            )
+        if self.valid_patch_find_resolution < self.ome_zarr_resolution:
+            raise ValueError(
+                "dataset_config.valid_patch_find_resolution must be >= dataset_config.ome_zarr_resolution "
+                f"(got {self.valid_patch_find_resolution} < {self.ome_zarr_resolution})"
+            )
         self.num_workers = int(self.dataset_config.get("num_workers", 8))
 
         # Worker configuration for image→Zarr pipeline
