@@ -35,6 +35,11 @@ from koine_machines.training.profiling import (
     NormalPoolingProfiler,
     _BackwardProfileMarkers,
 )
+from koine_machines.training.deep_supervision import (
+    DeepSupervisionWrapper,
+    _compute_ds_weights,
+    build_deep_supervision_targets,
+)
 from koine_machines.training.visualization import PreviewAccumulator, build_validation_preview_log
 from koine_machines.training.loss.losses import create_loss_from_config
 from koine_machines.training.stitching import resolve_model_and_loader_patch_sizes, run_model_forward
@@ -223,6 +228,31 @@ def _forward_model_with_optional_shared_features(
         None,
     )
 
+
+def _primary_supervision_output(preds):
+    if isinstance(preds, (list, tuple)):
+        if len(preds) == 0:
+            raise ValueError("Deep supervision output list must not be empty")
+        return preds[0]
+    return preds
+
+
+def _float_supervision_tree(value):
+    if isinstance(value, (list, tuple)):
+        return type(value)(_float_supervision_tree(v) for v in value)
+    return value.float()
+
+
+def _build_targets_with_ignore_for_loss(loss_preds, targets, ignore_mask):
+    ds_targets = build_deep_supervision_targets(targets, loss_preds, mode='nearest')
+    ds_ignore = build_deep_supervision_targets(ignore_mask, loss_preds, mode='nearest')
+    if isinstance(ds_targets, (list, tuple)):
+        return type(ds_targets)(
+            torch.cat([target_level, ignore_level], dim=1)
+            for target_level, ignore_level in zip(ds_targets, ds_ignore)
+        )
+    return torch.cat([ds_targets, ds_ignore], dim=1)
+
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
 @click.option(
@@ -275,6 +305,7 @@ def train(config_path, profile_steps):
     pooling_config = config.get('normal_pooling') or {}
     feature_head_config = pooling_config.get('feature_head') or {}
     use_feature_head = normal_pooled_mode and bool(feature_head_config.get('enabled', False))
+    deep_supervision_enabled = bool(config.get('enable_deep_supervision', False))
     model_type = str(config.get('model_type', '')).strip().lower()
     if normal_pooled_mode and model_type.startswith('resnet3d'):
         raise ValueError("normal_pooled_3d is currently only supported with the vesuvius_unet model path")
@@ -382,6 +413,11 @@ def train(config_path, profile_steps):
     )
 
     model = make_model(config)
+    if deep_supervision_enabled and use_feature_head:
+        raise ValueError(
+            "enable_deep_supervision is not supported with normal_pooling.feature_head because "
+            "deep supervision forces separate decoders and shared decoder features are unavailable"
+        )
     if use_feature_head:
         if not hasattr(model, 'shared_encoder'):
             raise ValueError("normal_pooling.feature_head requires a model with shared_encoder output channels")
@@ -441,6 +477,20 @@ def train(config_path, profile_steps):
         model.apply(InitWeights_He(neg_slope=0.2))
 
     loss = create_loss_from_config(config)
+    if deep_supervision_enabled:
+        task_decoders = getattr(model, 'task_decoders', None)
+        if not task_decoders:
+            raise ValueError(
+                "enable_deep_supervision requires per-task decoders, but the current model did not build any"
+            )
+        first_decoder = next(iter(task_decoders.values()))
+        ds_output_count = len(getattr(first_decoder, 'stages', ()))
+        ds_weights = _compute_ds_weights(ds_output_count)
+        if ds_weights is None:
+            raise ValueError(
+                "enable_deep_supervision requires at least one decoder supervision stage"
+            )
+        loss = DeepSupervisionWrapper(loss, ds_weights)
 
     model, optimizer, train_dl, val_dl, lr_scheduler = accelerator.prepare(
             model, optimizer, train_dl, val_dl, lr_scheduler
@@ -507,6 +557,25 @@ def train(config_path, profile_steps):
         return image
 
     def prepare_loss_inputs(preds, batch, profiler=None, feature_volume=None):
+        if isinstance(preds, (list, tuple)):
+            loss_preds = []
+            targets = None
+            ignore_mask = None
+            outside_bg_loss = None
+            for idx, pred_level in enumerate(preds):
+                current_loss_preds, current_targets, current_ignore_mask, current_outside_bg_loss = prepare_loss_inputs(
+                    pred_level,
+                    batch,
+                    profiler=profiler if idx == 0 else None,
+                    feature_volume=feature_volume if idx == 0 else None,
+                )
+                loss_preds.append(current_loss_preds)
+                if idx == 0:
+                    targets = current_targets
+                    ignore_mask = current_ignore_mask
+                    outside_bg_loss = current_outside_bg_loss
+            return type(preds)(loss_preds), targets, ignore_mask, outside_bg_loss
+
         if normal_pooled_mode:
             total_section = profiler.section('normal_pooling/total', preds.device) if profiler is not None else nullcontext()
             with total_section:
@@ -638,17 +707,21 @@ def train(config_path, profile_steps):
                 profiler=normal_pooling_profiler if normal_pooling_profiler.enabled else None,
                 feature_volume=feature_volume,
             )
-            loss_section = normal_pooling_profiler.section('normal_pooling/loss', preds.device) if normal_pooling_profiler.enabled else nullcontext()
+            primary_loss_preds = _primary_supervision_output(loss_preds)
+            loss_section = normal_pooling_profiler.section('normal_pooling/loss', primary_loss_preds.device) if normal_pooling_profiler.enabled else nullcontext()
             with loss_section:
-                targets_with_ignore = torch.cat([targets, ignore_mask], dim=1)
-                l = loss(loss_preds.float(), targets_with_ignore.float())
+                targets_with_ignore = _build_targets_with_ignore_for_loss(loss_preds, targets, ignore_mask)
+                l = loss(
+                    _float_supervision_tree(loss_preds),
+                    _float_supervision_tree(targets_with_ignore),
+                )
                 l = l + outside_bg_loss
             if not torch.isfinite(l):
                 raise RuntimeError(f"Non-finite loss at step {step}")
             backward_markers = _BackwardProfileMarkers.create(
                 normal_pooling_profiler if normal_pooling_profiler.enabled else None,
-                preds=preds,
-                loss_preds=loss_preds,
+                preds=_primary_supervision_output(preds),
+                loss_preds=primary_loss_preds,
             )
             if backward_markers is None:
                 backward_section = normal_pooling_profiler.section('train/backward_total', preds.device) if normal_pooling_profiler.enabled else nullcontext()
@@ -705,10 +778,10 @@ def train(config_path, profile_steps):
                 normal_pooling_config=(config.get('normal_pooling') if normal_pooled_mode else None),
             )
             train_preview_batch = batch
-            train_preview_preds = loss_preds.detach()
+            train_preview_preds = primary_loss_preds.detach()
             train_preview_targets = targets.detach()
             train_preview_ignore_mask = ignore_mask.detach()
-            train_preview_volume_logits = preds.detach() if normal_pooled_mode else None
+            train_preview_volume_logits = _primary_supervision_output(preds).detach() if normal_pooled_mode else None
             if mode == 'full_3d':
                 (
                     train_preview_batch,
@@ -765,14 +838,22 @@ def train(config_path, profile_steps):
                         val_batch,
                         feature_volume=val_feature_volume,
                     )
-                    preview_preds = val_loss_preds
-                    preview_volume_preds = val_preds
-                    val_targets_with_ignore = torch.cat([val_targets, val_ignore_mask], dim=1)
-                    val_l = loss(val_loss_preds.float(), val_targets_with_ignore.float()) + val_outside_bg_loss
+                    primary_val_loss_preds = _primary_supervision_output(val_loss_preds)
+                    preview_preds = primary_val_loss_preds
+                    preview_volume_preds = _primary_supervision_output(val_preds)
+                    val_targets_with_ignore = _build_targets_with_ignore_for_loss(
+                        val_loss_preds,
+                        val_targets,
+                        val_ignore_mask,
+                    )
+                    val_l = loss(
+                        _float_supervision_tree(val_loss_preds),
+                        _float_supervision_tree(val_targets_with_ignore),
+                    ) + val_outside_bg_loss
                     val_losses.append(val_l.item())
                     batch_counts = validation_confusion_metric.compute_batch(
                         ValidationMetricBatch(
-                            logits=val_loss_preds.detach(),
+                            logits=primary_val_loss_preds.detach(),
                             targets=val_targets.detach(),
                             valid_mask=(val_ignore_mask <= 0).detach(),
                         )
@@ -806,10 +887,18 @@ def train(config_path, profile_steps):
                             val_batch,
                             feature_volume=ema_val_feature_volume,
                         )
-                        ema_val_l = loss(ema_val_loss_preds.float(), val_targets_with_ignore.float()) + ema_val_outside_bg_loss
+                        ema_val_targets_with_ignore = _build_targets_with_ignore_for_loss(
+                            ema_val_loss_preds,
+                            val_targets,
+                            val_ignore_mask,
+                        )
+                        ema_val_l = loss(
+                            _float_supervision_tree(ema_val_loss_preds),
+                            _float_supervision_tree(ema_val_targets_with_ignore),
+                        ) + ema_val_outside_bg_loss
                         ema_val_losses.append(ema_val_l.item())
-                        preview_preds = ema_val_loss_preds
-                        preview_volume_preds = ema_val_preds
+                        preview_preds = _primary_supervision_output(ema_val_loss_preds)
+                        preview_volume_preds = _primary_supervision_output(ema_val_preds)
 
                     if val_batch_idx in preview_batch_indices:
                         val_preview_batch = val_batch
