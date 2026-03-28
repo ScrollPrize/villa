@@ -95,6 +95,6 @@ def run_model_forward(
                 stitched_output = _allocate_stitched_output(tile_pred)
             _write_stitched_output(stitched_output, tile_pred, y0=y0, y1=y1, x0=x0, x1=x1)
 
-    if isinstance(tile_pred, tuple):
-        return tuple(stitched_output)
+    if isinstance(tile_pred, (list, tuple)):
+        return type(tile_pred)(stitched_output)
     return stitched_output
