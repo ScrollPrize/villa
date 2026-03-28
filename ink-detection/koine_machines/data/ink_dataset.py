@@ -51,6 +51,30 @@ def _read_flat_surface_patch(volume, *, y0, y1, x0, x1):
     return patch[0]
 
 
+def _exclude_validation_voxels_from_training_supervision(
+    supervision_patch,
+    validation_patch,
+    *,
+    is_validation_patch=False,
+):
+    if is_validation_patch or validation_patch is None:
+        return supervision_patch
+
+    supervision_patch = np.asarray(supervision_patch)
+    validation_patch = np.asarray(validation_patch)
+    if supervision_patch.shape != validation_patch.shape:
+        raise ValueError(
+            "supervision_patch and validation_patch must have matching shapes, "
+            f"got {tuple(supervision_patch.shape)} and {tuple(validation_patch.shape)}"
+        )
+    if supervision_patch.size == 0 or not np.any(validation_patch):
+        return supervision_patch
+
+    masked_supervision = np.array(supervision_patch, copy=True)
+    masked_supervision[validation_patch > 0] = 0
+    return masked_supervision
+
+
 def _select_flat_pixels_for_native_crop(patch_zyxs, valid_mask, crop_bbox):
     patch_zyxs = np.asarray(patch_zyxs)
     valid_mask = np.asarray(valid_mask, dtype=bool)
@@ -772,6 +796,12 @@ class InkDataset(Dataset):
                         image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
                         supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
                         inklabels = self._get_cached_zarr(patch.inklabels, resolution=patch.segment.scale)
+                        validation_mask = None
+                        if (not patch.is_validation) and patch.segment.validation_mask is not None:
+                            validation_mask = self._get_cached_zarr(
+                                patch.segment.validation_mask,
+                                resolution=patch.segment.scale,
+                            )
                         patch_tifxyz = self._get_cached_tifxyz(patch.segment_dir)
                         coarse_patch_zyxs, coarse_valid = self._get_cached_stored_resolution_zyxs(
                             patch.segment_dir,
@@ -814,6 +844,19 @@ class InkDataset(Dataset):
                                 x0=x0,
                                 x1=x1,
                             )
+                            if validation_mask is not None:
+                                validation_flat_patch = _read_flat_surface_patch(
+                                    validation_mask,
+                                    y0=y0,
+                                    y1=y1,
+                                    x0=x0,
+                                    x1=x1,
+                                )
+                                supervision_flat_patch = _exclude_validation_voxels_from_training_supervision(
+                                    supervision_flat_patch,
+                                    validation_flat_patch,
+                                    is_validation_patch=patch.is_validation,
+                                )
                         if self.do_augmentations:
                             with sample_profiler.section('dataset/translate_crop_bbox'):
                                 crop_bbox = maybe_translate_normal_pooled_crop_bbox(
@@ -846,6 +889,19 @@ class InkDataset(Dataset):
                                 x0=support_x0,
                                 x1=support_x1,
                             )
+                            if validation_mask is not None:
+                                support_validation_flat_patch = _read_flat_surface_patch(
+                                    validation_mask,
+                                    y0=support_y0,
+                                    y1=support_y1,
+                                    x0=support_x0,
+                                    x1=support_x1,
+                                )
+                                support_supervision_flat_patch = _exclude_validation_voxels_from_training_supervision(
+                                    support_supervision_flat_patch,
+                                    support_validation_flat_patch,
+                                    is_validation_patch=patch.is_validation,
+                                )
                             support_inklabels_flat_patch = _read_flat_surface_patch(
                                 inklabels,
                                 y0=support_y0,
@@ -951,9 +1007,22 @@ class InkDataset(Dataset):
                         image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
                         supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
                         inklabels = self._get_cached_zarr(patch.inklabels, resolution=patch.segment.scale)
+                        validation_mask = None
+                        if (not patch.is_validation) and patch.segment.validation_mask is not None:
+                            validation_mask = self._get_cached_zarr(
+                                patch.segment.validation_mask,
+                                resolution=patch.segment.scale,
+                            )
                     with sample_profiler.section('dataset/read_supervised_crops'):
                         image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, patch.bbox, fill_value=0)
                         supervision_crop, _ = _read_bbox_with_padding(supervision_mask, patch.bbox, fill_value=0)
+                        if validation_mask is not None:
+                            validation_crop, _ = _read_bbox_with_padding(validation_mask, patch.bbox, fill_value=0)
+                            supervision_crop = _exclude_validation_voxels_from_training_supervision(
+                                supervision_crop,
+                                validation_crop,
+                                is_validation_patch=patch.is_validation,
+                            )
                         inklabels_crop, _ = _read_bbox_with_padding(inklabels, patch.bbox, fill_value=0)
 
                 if resample_idx is None:

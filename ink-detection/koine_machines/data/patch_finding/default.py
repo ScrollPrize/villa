@@ -63,8 +63,14 @@ def find_segment_patches(segment, patch_cls):
     validation_patches = []
     for y0, x0 in patch_corners_top_left.tolist():
         patch_bbox_zyx = _surface_patch_bbox(surface, int(y0), int(x0), patch_size)
+        supervision_patch = supervision_mask[
+            surface,
+            int(y0):int(y0) + patch_size[1],
+            int(x0):int(x0) + patch_size[2],
+        ]
 
         has_validation_supervision = False
+        has_training_supervision = bool(supervision_patch.size > 0 and np.any(supervision_patch))
         if validation_mask is not None:
             validation_patch = validation_mask[
                 surface,
@@ -72,6 +78,10 @@ def find_segment_patches(segment, patch_cls):
                 int(x0):int(x0) + patch_size[2],
             ]
             has_validation_supervision = bool(validation_patch.size > 0 and np.any(validation_patch))
+            if has_training_supervision and has_validation_supervision:
+                has_training_supervision = bool(
+                    np.any(np.asarray(supervision_patch) & ~np.asarray(validation_patch))
+                )
         if has_validation_supervision:
             validation_patches.append(
                 patch_cls(
@@ -81,14 +91,13 @@ def find_segment_patches(segment, patch_cls):
                     supervision_mask_override=segment.validation_mask,
                 )
             )
-            continue
 
         label_patch = inklabels[
             surface,
             int(y0):int(y0) + patch_size[1],
             int(x0):int(x0) + patch_size[2],
         ]
-        if _labeled_patch_coverage(label_patch) >= float(segment.config["patch_min_labeled_coverage"]):
+        if has_training_supervision and _labeled_patch_coverage(label_patch) >= float(segment.config["patch_min_labeled_coverage"]):
             training_patches.append(
                 patch_cls(
                     segment=segment,
