@@ -377,7 +377,7 @@ def train(config_path, profile_steps):
 
     shared_ds = InkDataset(dataset_config, do_augmentations=False)
     if len(shared_ds.training_patches) == 0:
-        raise ValueError("FlatInkDataset produced no training patches after excluding validation_mask chunks")
+        raise ValueError("FlatInkDataset produced no training patches after applying supervision masking")
     train_ds = InkDataset(dataset_config, do_augmentations=True, patches=shared_ds.training_patches)
     val_ds = InkDataset(dataset_config, do_augmentations=False, patches=shared_ds.validation_patches)
     train_subset = train_ds

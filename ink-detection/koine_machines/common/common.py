@@ -6,6 +6,8 @@ import fsspec
 import numpy as np
 import zarr
 
+_FLAT_PATCH_FINDING_CACHE_VERSION = "v2"
+
 
 def load_volume_auth(auth_json_path):
     if auth_json_path is None:
@@ -48,9 +50,12 @@ def flat_patch_finding_cache_token(config):
         tile_size = int(config.get("patch_finding_tile_size", patch_size_y))
         stride = int(config.get("patch_finding_stride", default_stride))
         filter_empty_tile = int(bool(config.get("patch_finding_filter_empty_tile", False)))
-        return f"subtiling-ts-{tile_size}_st-{stride}_fe-{filter_empty_tile}"
+        return (
+            f"subtiling-{_FLAT_PATCH_FINDING_CACHE_VERSION}"
+            f"-ts-{tile_size}_st-{stride}_fe-{filter_empty_tile}"
+        )
 
-    return f"default-po-{config.get('patch_overlap', '')}"
+    return f"default-{_FLAT_PATCH_FINDING_CACHE_VERSION}-po-{config.get('patch_overlap', '')}"
 
 
 def save_flat_patch_cache(path, patches):
