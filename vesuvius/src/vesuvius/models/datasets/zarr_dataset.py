@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy import ndimage as ndi
 import torch
 import zarr
 from torch.utils.data import Dataset
@@ -146,6 +147,14 @@ class ZarrDataset(Dataset):
 
         # Transforms (initialized after normalization)
         self.transforms = None
+        self._zero_cc_to_ignore_enabled = bool(
+            getattr(mgr, 'zero_components_without_fg_to_ignore', True)
+        )
+        self._zero_cc_to_ignore_structure = ndi.generate_binary_structure(
+            len(self.patch_size),
+            len(self.patch_size),
+        )
+        self._target_cleanup_rules = self._build_target_cleanup_rules()
 
         # Initialize
         self._discover_and_load_volumes()
@@ -291,6 +300,85 @@ class ZarrDataset(Dataset):
                 }
             })
         return {first_target: volumes_list}
+
+    def _build_target_cleanup_rules(self) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+        """Collect per-target foreground/ignore values used for patch-local cleanup."""
+        rules: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+        dataset_cfg = getattr(self.mgr, "dataset_config", {}) or {}
+        for target_name in self.target_names:
+            info = self.targets.get(target_name, {}) or {}
+            valid_patch_value = info.get("valid_patch_value")
+            if valid_patch_value is None:
+                valid_patch_value = dataset_cfg.get("valid_patch_value")
+
+            ignore_label = info.get("ignore_label")
+            if ignore_label is None:
+                ignore_label = info.get("ignore_index")
+            if ignore_label is None:
+                ignore_label = info.get("ignore_value")
+            if ignore_label is None:
+                ignore_label = dataset_cfg.get("ignore_label")
+            if ignore_label is None:
+                ignore_label = dataset_cfg.get("ignore_index")
+            if ignore_label is None:
+                ignore_label = dataset_cfg.get("ignore_value")
+
+            rules[target_name] = (valid_patch_value, ignore_label)
+        return rules
+
+    def _zero_components_without_foreground_to_ignore(
+        self,
+        label_data: np.ndarray,
+        *,
+        valid_patch_value: Optional[float],
+        ignore_label: Optional[float],
+    ) -> np.ndarray:
+        """
+        Relabel patch-local zero components that do not touch foreground as ignore.
+
+        This is intentionally patch-local. It keeps zero regions connected to any
+        foreground voxel unchanged and turns the rest into the configured
+        ignore label. The propagation is implemented with scipy ndimage to keep
+        the hot path in compiled code.
+        """
+        if (
+            not self._zero_cc_to_ignore_enabled
+            or valid_patch_value is None
+            or ignore_label is None
+        ):
+            return label_data
+
+        zero_mask = label_data == 0
+        if not np.any(zero_mask):
+            return label_data
+
+        fg_mask = label_data == valid_patch_value
+        if not np.any(fg_mask):
+            cleaned = label_data.copy()
+            cleaned[zero_mask] = ignore_label
+            return cleaned
+
+        touching_zero = zero_mask & ndi.binary_dilation(
+            fg_mask,
+            structure=self._zero_cc_to_ignore_structure,
+            iterations=1,
+        )
+        if np.any(touching_zero):
+            zero_connected_to_fg = ndi.binary_propagation(
+                touching_zero,
+                structure=self._zero_cc_to_ignore_structure,
+                mask=zero_mask,
+            )
+        else:
+            zero_connected_to_fg = np.zeros_like(zero_mask, dtype=bool)
+
+        isolated_zero = zero_mask & ~zero_connected_to_fg
+        if not np.any(isolated_zero):
+            return label_data
+
+        cleaned = label_data.copy()
+        cleaned[isolated_zero] = ignore_label
+        return cleaned
 
     # -------------------------------------------------------------------------
     # Patch Index Building
@@ -799,6 +887,15 @@ class ZarrDataset(Dataset):
         for target_name in self.target_names:
             label_arr = vol.label_arrays.get(target_name)
             label_data = load_array(label_arr)
+            valid_patch_value, ignore_label = self._target_cleanup_rules.get(
+                target_name,
+                (None, None),
+            )
+            label_data = self._zero_components_without_foreground_to_ignore(
+                label_data,
+                valid_patch_value=valid_patch_value,
+                ignore_label=ignore_label,
+            )
             if label_arr is not None and np.count_nonzero(label_data) > 0:
                 is_unlabeled = False
             result[target_name] = torch.from_numpy(label_data[np.newaxis, ...])

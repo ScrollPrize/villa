@@ -6,8 +6,10 @@ import yaml
 import pytest
 import torch
 import numpy as np
+from scipy import ndimage as ndi
 
 from vesuvius.models.configuration.config_manager import ConfigManager
+from vesuvius.models.datasets.find_valid_patches import _filter_z_starts_by_ignore_bounds
 from vesuvius.models.datasets.zarr_dataset import ZarrDataset
 from vesuvius.models.evaluation.base_metric import prediction_to_discrete_labels
 from vesuvius.models.preprocessing.patches.cache import build_cache_params, cache_filename
@@ -92,6 +94,59 @@ def test_cached_positions_scale_to_training_level() -> None:
     assert ZarrDataset._cached_position_to_training_level((256, 128, 64), 2) == (64, 32, 16)
     with pytest.raises(ValueError, match="not divisible"):
         ZarrDataset._cached_position_to_training_level((258, 128, 64), 2)
+
+
+def test_zero_components_without_foreground_become_ignore() -> None:
+    ds = ZarrDataset.__new__(ZarrDataset)
+    ds._zero_cc_to_ignore_enabled = True
+    ds._zero_cc_to_ignore_structure = ndi.generate_binary_structure(2, 2)
+    label = np.array(
+        [
+            [0, 0, 2, 2],
+            [0, 1, 2, 0],
+            [0, 0, 2, 0],
+            [2, 2, 2, 0],
+        ],
+        dtype=np.float32,
+    )
+    cleaned = ds._zero_components_without_foreground_to_ignore(
+        label,
+        valid_patch_value=1,
+        ignore_label=2,
+    )
+    expected = np.array(
+        [
+            [0, 0, 2, 2],
+            [0, 1, 2, 2],
+            [0, 0, 2, 2],
+            [2, 2, 2, 2],
+        ],
+        dtype=np.float32,
+    )
+    np.testing.assert_array_equal(cleaned, expected)
+
+
+def test_all_zero_patch_becomes_ignore_when_no_foreground_present() -> None:
+    ds = ZarrDataset.__new__(ZarrDataset)
+    ds._zero_cc_to_ignore_enabled = True
+    ds._zero_cc_to_ignore_structure = ndi.generate_binary_structure(3, 3)
+    label = np.zeros((2, 2, 2), dtype=np.float32)
+    cleaned = ds._zero_components_without_foreground_to_ignore(
+        label,
+        valid_patch_value=1,
+        ignore_label=2,
+    )
+    np.testing.assert_array_equal(cleaned, np.full_like(label, 2.0))
+
+
+def test_filter_z_starts_by_ignore_bounds_keeps_intersecting_patches() -> None:
+    z_starts = [0, 64, 128, 192]
+    filtered = _filter_z_starts_by_ignore_bounds(
+        z_starts,
+        patch_depth=64,
+        ignore_bounds=(96, 159),
+    )
+    assert filtered == [64, 128]
 
 
 def test_full_resolution_patch_size_uses_training_scale() -> None:
