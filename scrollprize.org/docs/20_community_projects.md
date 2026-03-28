@@ -160,6 +160,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
     - Unet trained on affinity labels using pytorch_connectomics and experiments with watershed
 - [Gabor Filter for surface prediction](https://www.kaggle.com/code/bluetriad/scroll4-gaborfilters/notebook?scriptVersionId=265957590) by Ayush Mishra
 
+- [Customizable Training Pipeline](https://github.com/andre-fs-ferreira/Vesuvius)
+A comprehensive pipeline for the [Vesuvius Challenge](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/overview) that streamlines the use of [full scrolls](https://dl.ash2txt.org/full-scrolls/) for pre-training. This repository includes automated download scripts with integrated foreground cropping and **uint8** conversion to significantly reduce disk space. It provides a complete workflow for self-supervised pre-training on unlabeled volumes, followed by main training and fine-tuning on the challenge dataset, supporting **U-Net** architectures and other custom neural networks. Great for starting point!
 
 
 ### 📦 Materials
