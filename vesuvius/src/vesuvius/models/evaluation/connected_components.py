@@ -2,7 +2,7 @@ import numpy as np
 import cc3d
 import torch
 from typing import Dict, Optional
-from .base_metric import BaseMetric
+from .base_metric import BaseMetric, prediction_to_discrete_labels
 
 
 class ConnectedComponentsMetric(BaseMetric):
@@ -64,20 +64,7 @@ def get_connected_components_difference(
         else:
             mask_np = np.asarray(mask)
 
-    # Handle different input shapes for predictions
-    if pred_np.ndim == 5:  # (batch, channels, depth, height, width)
-        if pred_np.shape[1] > 1:  # Multi-channel, need argmax
-            pred_np = np.argmax(pred_np, axis=1)
-        else:  # Single channel, just squeeze
-            pred_np = pred_np.squeeze(1)
-    elif pred_np.ndim == 4:  # Could be (batch, depth, height, width) or (batch, channels, height, width)
-        # Check if second dimension is channels (usually small) or spatial dimension
-        if pred_np.shape[1] <= 10:  # Likely channels dimension
-            if pred_np.shape[1] > 1:
-                pred_np = np.argmax(pred_np, axis=1)
-            else:
-                pred_np = pred_np.squeeze(1)
-        # Otherwise assume it's already (batch, depth, height, width)
+    pred_np = prediction_to_discrete_labels(pred_np)
     
     # Handle different input shapes for ground truth (and align mask)
     if gt_np.ndim == 3:  # (depth, height, width)

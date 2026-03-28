@@ -5,12 +5,15 @@ from pathlib import Path
 import yaml
 import pytest
 import torch
+import numpy as np
 
 from vesuvius.models.configuration.config_manager import ConfigManager
 from vesuvius.models.datasets.zarr_dataset import ZarrDataset
+from vesuvius.models.evaluation.base_metric import prediction_to_discrete_labels
 from vesuvius.models.preprocessing.patches.cache import build_cache_params, cache_filename
 from vesuvius.models.preprocessing.patches.generate import _full_resolution_patch_size
 from vesuvius.models.training.loss.losses import BinaryBCEAndDiceLoss
+from vesuvius.utils.plotting import _resolve_visualization_activation
 
 
 def _write_config(
@@ -89,3 +92,19 @@ def test_binary_bce_and_dice_loss_ignores_ignore_label() -> None:
     loss = loss_fn(logits, target)
     assert torch.isfinite(loss)
     assert loss.item() >= 0.0
+
+
+def test_prediction_to_discrete_labels_thresholds_single_channel_logits() -> None:
+    logits = np.array([[[[[-2.0, 2.0], [0.1, -0.1]]]]], dtype=np.float32)
+    labels = prediction_to_discrete_labels(logits)
+    assert labels.shape == (1, 1, 2, 2)
+    assert labels.tolist() == [[[[0, 1], [1, 0]]]]
+
+
+def test_visualization_activation_uses_sigmoid_for_binary_bce_dice() -> None:
+    task_cfg = {
+        "out_channels": 1,
+        "activation": "none",
+        "losses": [{"name": "BinaryBCEAndDiceLoss"}],
+    }
+    assert _resolve_visualization_activation(task_cfg) == "sigmoid"

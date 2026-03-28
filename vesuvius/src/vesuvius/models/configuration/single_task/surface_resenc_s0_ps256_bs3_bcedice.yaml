@@ -34,11 +34,10 @@ dataset_config:
     surface:
       out_channels: 1
       valid_patch_value: 1
-      activation: "sigmoid"
+      activation: "none"
       ignore_label: 2
       losses:
         - name: "BinaryBCEAndDiceLoss"
           weight: 1.0
           weight_bce: 1.0
           weight_dice: 1.0
-

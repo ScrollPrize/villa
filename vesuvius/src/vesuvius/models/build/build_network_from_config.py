@@ -849,9 +849,11 @@ class NetworkFromConfig(nn.Module):
             return False
         return True
 
-    def forward(self, x, return_mae_mask=False):
+    def forward(self, x, return_mae_mask=False, apply_activation=None):
         # Check input channels and warn if mismatch
         self.check_input_channels(x)
+        if apply_activation is None:
+            apply_activation = not self.training
 
         # Get features from encoder (works for both U-Net and Primus)
         # For MAE training with Primus, we need to get the mask
@@ -897,7 +899,7 @@ class NetworkFromConfig(nn.Module):
                 logits = logits[0]
             logits = self._apply_z_projection(task_name, logits)
             activation_fn = self.task_activations[task_name] if task_name in self.task_activations else None
-            if activation_fn is not None and not self.training:
+            if activation_fn is not None and apply_activation:
                 if isinstance(logits, (list, tuple)):
                     logits = type(logits)(activation_fn(l) for l in logits)
                 else:
@@ -912,7 +914,7 @@ class NetworkFromConfig(nn.Module):
                 logits = head(shared_features)
                 logits = self._apply_z_projection(task_name, logits)
                 activation_fn = self.task_activations[task_name] if task_name in self.task_activations else None
-                if activation_fn is not None and not self.training:
+                if activation_fn is not None and apply_activation:
                     if isinstance(logits, (list, tuple)):
                         logits = type(logits)(activation_fn(l) for l in logits)
                     else:

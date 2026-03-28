@@ -222,6 +222,25 @@ def _apply_activation(array_np: np.ndarray, activation: Optional[str], *, is_sur
     return array_np
 
 
+def _resolve_visualization_activation(task_cfg: Dict | None) -> Optional[str]:
+    task_cfg = task_cfg or {}
+    override = task_cfg.get("visualization_activation")
+    if override is not None:
+        return override
+
+    activation = task_cfg.get("activation", None)
+    activation_l = str(activation).lower() if activation is not None else "none"
+    if activation_l not in {"none", "identity", ""}:
+        return activation
+
+    losses = task_cfg.get("losses") or []
+    if task_cfg.get("out_channels") == 1:
+        for loss_cfg in losses:
+            if (loss_cfg or {}).get("name") == "BinaryBCEAndDiceLoss":
+                return "sigmoid"
+    return activation
+
+
 def _vector_to_bgr(vector_3ch):
     """Map a 3×H×W vector field to a BGR image using directional colouring."""
     if vector_3ch.shape[0] != 3:
@@ -393,7 +412,7 @@ def save_debug(
             arr_np = arr_np[0]
         
         task_cfg = tasks_dict.get(t_name, {}) if tasks_dict else {}
-        activation = task_cfg.get("activation", None)
+        activation = _resolve_visualization_activation(task_cfg)
         is_surface_frame = arr_np.shape[0] == 9 or t_name.endswith("surface_frame")
 
         if apply_activation:
@@ -436,7 +455,7 @@ def save_debug(
                 arr_np = arr_np[0]
             
             task_cfg = tasks_dict.get(t_name, {}) if tasks_dict else {}
-            activation = task_cfg.get("activation", None)
+            activation = _resolve_visualization_activation(task_cfg)
             is_surface_frame = arr_np.shape[0] == 9 or t_name.endswith("surface_frame")
 
             if apply_activation:
@@ -466,7 +485,7 @@ def save_debug(
                 arr_np = arr_np[0]
 
             task_cfg = tasks_dict.get(t_name, {}) if tasks_dict else {}
-            activation = task_cfg.get("activation", None)
+            activation = _resolve_visualization_activation(task_cfg)
             is_surface_frame = arr_np.shape[0] == 9 or t_name.endswith("surface_frame")
 
             if apply_activation:
@@ -483,7 +502,7 @@ def save_debug(
                 arr_np = arr_np[0]
 
             task_cfg = tasks_dict.get(t_name, {}) if tasks_dict else {}
-            activation = task_cfg.get("activation", None)
+            activation = _resolve_visualization_activation(task_cfg)
             is_surface_frame = arr_np.shape[0] == 9 or t_name.endswith("surface_frame")
 
             if apply_activation:
