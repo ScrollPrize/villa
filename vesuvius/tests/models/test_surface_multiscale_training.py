@@ -74,6 +74,20 @@ def test_patch_cache_filename_varies_by_training_resolution(tmp_path: Path) -> N
     assert cache_filename(scale0) != cache_filename(scale2)
 
 
+def test_patch_cache_filename_varies_by_ignore_label(tmp_path: Path) -> None:
+    common_kwargs = {
+        "data_path": tmp_path,
+        "volume_ids": ["sample"],
+        "patch_size": [128, 128, 128],
+        "min_labeled_ratio": 0.001,
+        "bbox_threshold": 0.35,
+        "valid_patch_find_resolution": 3,
+    }
+    ignore0 = build_cache_params(ignore_label=0, **common_kwargs)
+    ignore2 = build_cache_params(ignore_label=2, **common_kwargs)
+    assert cache_filename(ignore0) != cache_filename(ignore2)
+
+
 def test_cached_positions_scale_to_training_level() -> None:
     assert ZarrDataset._cached_position_to_training_level((256, 128, 64), 2) == (64, 32, 16)
     with pytest.raises(ValueError, match="not divisible"):

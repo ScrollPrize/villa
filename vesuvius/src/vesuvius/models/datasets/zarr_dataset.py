@@ -553,14 +553,27 @@ class ZarrDataset(Dataset):
 
         # Get valid_patch_value from target config, with dataset-level fallback
         valid_patch_value = None
+        ignore_label = None
         for target_name in self.target_names:
             info = self.targets.get(target_name, {})
+            if ignore_label is None:
+                ignore_label = info.get('ignore_label')
+            if ignore_label is None:
+                ignore_label = info.get('ignore_index')
+            if ignore_label is None:
+                ignore_label = info.get('ignore_value')
             if 'valid_patch_value' in info:
                 valid_patch_value = info['valid_patch_value']
                 break
+        dataset_cfg = getattr(self.mgr, "dataset_config", {}) or {}
         if valid_patch_value is None:
-            dataset_cfg = getattr(self.mgr, "dataset_config", {}) or {}
             valid_patch_value = dataset_cfg.get("valid_patch_value")
+        if ignore_label is None:
+            ignore_label = dataset_cfg.get("ignore_label")
+        if ignore_label is None:
+            ignore_label = dataset_cfg.get("ignore_index")
+        if ignore_label is None:
+            ignore_label = dataset_cfg.get("ignore_value")
 
         volume_ids = [vol.volume_id for vol in self._volumes]
 
@@ -573,6 +586,7 @@ class ZarrDataset(Dataset):
             bbox_threshold=self.min_bbox_percent,
             valid_patch_find_resolution=self.valid_patch_find_resolution,
             ome_zarr_resolution=self.ome_zarr_resolution,
+            ignore_label=ignore_label,
             valid_patch_value=valid_patch_value,
             unlabeled_fg_enabled=self.unlabeled_fg_enabled,
             unlabeled_fg_threshold=self.unlabeled_fg_threshold,
