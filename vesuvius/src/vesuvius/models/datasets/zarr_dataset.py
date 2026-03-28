@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy import ndimage as ndi
 import torch
 import zarr
 from torch.utils.data import Dataset
@@ -120,6 +121,7 @@ class ZarrDataset(Dataset):
 
         # OME-Zarr parameters
         self.ome_zarr_resolution = getattr(mgr, 'ome_zarr_resolution', 0)
+        self.ome_zarr_scale_factor = 2 ** int(self.ome_zarr_resolution)
         self.valid_patch_find_resolution = getattr(mgr, 'valid_patch_find_resolution', 1)
 
         # Semi-supervised parameters
@@ -145,6 +147,14 @@ class ZarrDataset(Dataset):
 
         # Transforms (initialized after normalization)
         self.transforms = None
+        self._zero_cc_to_ignore_enabled = bool(
+            getattr(mgr, 'zero_components_without_fg_to_ignore', True)
+        )
+        self._zero_cc_to_ignore_structure = ndi.generate_binary_structure(
+            len(self.patch_size),
+            len(self.patch_size),
+        )
+        self._target_cleanup_rules = self._build_target_cleanup_rules()
 
         # Initialize
         self._discover_and_load_volumes()
@@ -291,6 +301,85 @@ class ZarrDataset(Dataset):
             })
         return {first_target: volumes_list}
 
+    def _build_target_cleanup_rules(self) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+        """Collect per-target foreground/ignore values used for patch-local cleanup."""
+        rules: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+        dataset_cfg = getattr(self.mgr, "dataset_config", {}) or {}
+        for target_name in self.target_names:
+            info = self.targets.get(target_name, {}) or {}
+            valid_patch_value = info.get("valid_patch_value")
+            if valid_patch_value is None:
+                valid_patch_value = dataset_cfg.get("valid_patch_value")
+
+            ignore_label = info.get("ignore_label")
+            if ignore_label is None:
+                ignore_label = info.get("ignore_index")
+            if ignore_label is None:
+                ignore_label = info.get("ignore_value")
+            if ignore_label is None:
+                ignore_label = dataset_cfg.get("ignore_label")
+            if ignore_label is None:
+                ignore_label = dataset_cfg.get("ignore_index")
+            if ignore_label is None:
+                ignore_label = dataset_cfg.get("ignore_value")
+
+            rules[target_name] = (valid_patch_value, ignore_label)
+        return rules
+
+    def _zero_components_without_foreground_to_ignore(
+        self,
+        label_data: np.ndarray,
+        *,
+        valid_patch_value: Optional[float],
+        ignore_label: Optional[float],
+    ) -> np.ndarray:
+        """
+        Relabel patch-local zero components that do not touch foreground as ignore.
+
+        This is intentionally patch-local. It keeps zero regions connected to any
+        foreground voxel unchanged and turns the rest into the configured
+        ignore label. The propagation is implemented with scipy ndimage to keep
+        the hot path in compiled code.
+        """
+        if (
+            not self._zero_cc_to_ignore_enabled
+            or valid_patch_value is None
+            or ignore_label is None
+        ):
+            return label_data
+
+        zero_mask = label_data == 0
+        if not np.any(zero_mask):
+            return label_data
+
+        fg_mask = label_data == valid_patch_value
+        if not np.any(fg_mask):
+            cleaned = label_data.copy()
+            cleaned[zero_mask] = ignore_label
+            return cleaned
+
+        touching_zero = zero_mask & ndi.binary_dilation(
+            fg_mask,
+            structure=self._zero_cc_to_ignore_structure,
+            iterations=1,
+        )
+        if np.any(touching_zero):
+            zero_connected_to_fg = ndi.binary_propagation(
+                touching_zero,
+                structure=self._zero_cc_to_ignore_structure,
+                mask=zero_mask,
+            )
+        else:
+            zero_connected_to_fg = np.zeros_like(zero_mask, dtype=bool)
+
+        isolated_zero = zero_mask & ~zero_connected_to_fg
+        if not np.any(isolated_zero):
+            return label_data
+
+        cleaned = label_data.copy()
+        cleaned[isolated_zero] = ignore_label
+        return cleaned
+
     # -------------------------------------------------------------------------
     # Patch Index Building
     # -------------------------------------------------------------------------
@@ -320,6 +409,26 @@ class ZarrDataset(Dataset):
             "Patch index built: %d labeled FG, %d unlabeled FG, %d total",
             self._n_labeled_fg, self._n_unlabeled_fg, len(self._patches)
         )
+
+    @staticmethod
+    def _cached_position_to_training_level(
+        position: Tuple[int, ...],
+        ome_zarr_resolution: int,
+    ) -> Tuple[int, ...]:
+        """Convert cached full-resolution coordinates into the selected training level."""
+        scale_factor = 2 ** int(ome_zarr_resolution)
+        if scale_factor == 1:
+            return tuple(int(v) for v in position)
+
+        converted = []
+        for coord in position:
+            coord = int(coord)
+            if coord % scale_factor != 0:
+                raise ValueError(
+                    f"Cached full-resolution position {position} is not divisible by scale factor {scale_factor}"
+                )
+            converted.append(coord // scale_factor)
+        return tuple(converted)
 
     def _load_from_mapping(self, mapping_file: Path) -> None:
         """
@@ -532,14 +641,27 @@ class ZarrDataset(Dataset):
 
         # Get valid_patch_value from target config, with dataset-level fallback
         valid_patch_value = None
+        ignore_label = None
         for target_name in self.target_names:
             info = self.targets.get(target_name, {})
+            if ignore_label is None:
+                ignore_label = info.get('ignore_label')
+            if ignore_label is None:
+                ignore_label = info.get('ignore_index')
+            if ignore_label is None:
+                ignore_label = info.get('ignore_value')
             if 'valid_patch_value' in info:
                 valid_patch_value = info['valid_patch_value']
                 break
+        dataset_cfg = getattr(self.mgr, "dataset_config", {}) or {}
         if valid_patch_value is None:
-            dataset_cfg = getattr(self.mgr, "dataset_config", {}) or {}
             valid_patch_value = dataset_cfg.get("valid_patch_value")
+        if ignore_label is None:
+            ignore_label = dataset_cfg.get("ignore_label")
+        if ignore_label is None:
+            ignore_label = dataset_cfg.get("ignore_index")
+        if ignore_label is None:
+            ignore_label = dataset_cfg.get("ignore_value")
 
         volume_ids = [vol.volume_id for vol in self._volumes]
 
@@ -551,6 +673,8 @@ class ZarrDataset(Dataset):
             min_labeled_ratio=self.min_labeled_ratio,
             bbox_threshold=self.min_bbox_percent,
             valid_patch_find_resolution=self.valid_patch_find_resolution,
+            ome_zarr_resolution=self.ome_zarr_resolution,
+            ignore_label=ignore_label,
             valid_patch_value=valid_patch_value,
             unlabeled_fg_enabled=self.unlabeled_fg_enabled,
             unlabeled_fg_threshold=self.unlabeled_fg_threshold,
@@ -565,10 +689,14 @@ class ZarrDataset(Dataset):
         # Add FG patches
         for entry in cache_data.fg_patches:
             vol_idx = volume_name_to_idx.get(entry.volume_name, entry.volume_idx)
+            position = self._cached_position_to_training_level(
+                entry.position,
+                self.ome_zarr_resolution,
+            )
             self._patches.append(PatchInfo(
                 volume_index=vol_idx,
                 volume_name=entry.volume_name,
-                position=entry.position,
+                position=position,
                 patch_size=self.patch_size,
                 is_unlabeled_fg=False,
             ))
@@ -577,10 +705,14 @@ class ZarrDataset(Dataset):
         # Add unlabeled FG patches
         for entry in cache_data.unlabeled_fg_patches:
             vol_idx = volume_name_to_idx.get(entry.volume_name, entry.volume_idx)
+            position = self._cached_position_to_training_level(
+                entry.position,
+                self.ome_zarr_resolution,
+            )
             self._patches.append(PatchInfo(
                 volume_index=vol_idx,
                 volume_name=entry.volume_name,
-                position=entry.position,
+                position=position,
                 patch_size=self.patch_size,
                 is_unlabeled_fg=True,
             ))
@@ -755,6 +887,15 @@ class ZarrDataset(Dataset):
         for target_name in self.target_names:
             label_arr = vol.label_arrays.get(target_name)
             label_data = load_array(label_arr)
+            valid_patch_value, ignore_label = self._target_cleanup_rules.get(
+                target_name,
+                (None, None),
+            )
+            label_data = self._zero_components_without_foreground_to_ignore(
+                label_data,
+                valid_patch_value=valid_patch_value,
+                ignore_label=ignore_label,
+            )
             if label_arr is not None and np.count_nonzero(label_data) > 0:
                 is_unlabeled = False
             result[target_name] = torch.from_numpy(label_data[np.newaxis, ...])

@@ -1,5 +1,6 @@
 import logging
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -167,6 +168,98 @@ def zero_ignore_labels(array: np.ndarray, ignore_label: Union[int, float]) -> np
     result = arr.copy()
     result[mask] = 0
     return result
+
+
+def _filter_z_starts_by_ignore_bounds(
+    z_starts: Sequence[int],
+    *,
+    patch_depth: int,
+    ignore_bounds: Optional[Tuple[int, int]],
+) -> List[int]:
+    """Keep only patch starts whose z-interval intersects the ignore-label z-support."""
+    if ignore_bounds is None:
+        return list(z_starts)
+    ignore_min_z, ignore_max_z = ignore_bounds
+    return [
+        int(z_start)
+        for z_start in z_starts
+        if (int(z_start) + int(patch_depth) - 1) >= ignore_min_z and int(z_start) <= ignore_max_z
+    ]
+
+
+def _find_ignore_z_bounds_from_stored_chunks(
+    array_obj,
+    *,
+    ignore_label: Union[int, float],
+) -> Optional[Tuple[int, int]]:
+    """
+    Find the exact z-range containing ignore labels using only stored chunks.
+
+    Missing chunks are intentionally ignored here. This prevents fill-value based
+    ignore regions from expanding the usable z-range to the full volume.
+    """
+    store = getattr(array_obj, "store", None)
+    store_path = getattr(store, "path", None)
+    if store_path is None:
+        return None
+
+    chunk_shape = getattr(array_obj, "chunks", None)
+    spatial_shape = getattr(array_obj, "shape", None)
+    if chunk_shape is None or spatial_shape is None or len(chunk_shape) < 3 or len(spatial_shape) < 3:
+        return None
+
+    chunk_dir = Path(store_path)
+    array_path = getattr(array_obj, "path", "")
+    if array_path:
+        chunk_dir = chunk_dir / str(array_path)
+    if not chunk_dir.exists():
+        return None
+
+    z_groups: Dict[int, List[Tuple[int, int, int]]] = {}
+    for chunk_file in chunk_dir.iterdir():
+        if not chunk_file.is_file() or chunk_file.name.startswith("."):
+            continue
+        parts = chunk_file.name.split(".")
+        if len(parts) < 3:
+            continue
+        try:
+            chunk_idx = (int(parts[0]), int(parts[1]), int(parts[2]))
+        except ValueError:
+            continue
+        z_groups.setdefault(chunk_idx[0], []).append(chunk_idx)
+
+    if not z_groups:
+        return None
+
+    def _chunk_has_ignore(chunk: np.ndarray) -> np.ndarray:
+        if isinstance(ignore_label, float) and np.isnan(ignore_label):
+            return np.any(np.isnan(chunk), axis=(1, 2))
+        return np.any(chunk == ignore_label, axis=(1, 2))
+
+    def _scan(sorted_z_indices: Sequence[int], *, from_start: bool) -> Optional[int]:
+        for z_chunk_idx in sorted_z_indices:
+            z0 = z_chunk_idx * int(chunk_shape[0])
+            z_len = min(int(chunk_shape[0]), int(spatial_shape[0]) - z0)
+            local_hits = np.zeros(z_len, dtype=bool)
+            for chunk_idx in z_groups[z_chunk_idx]:
+                slices = tuple(
+                    slice(idx * size, min((idx + 1) * size, shape))
+                    for idx, size, shape in zip(chunk_idx, chunk_shape[:3], spatial_shape[:3])
+                )
+                chunk = np.asarray(array_obj[slices])
+                local_hits |= _chunk_has_ignore(chunk)
+            hit_indices = np.flatnonzero(local_hits)
+            if hit_indices.size:
+                local_idx = int(hit_indices[0] if from_start else hit_indices[-1])
+                return z0 + local_idx
+        return None
+
+    sorted_z = sorted(z_groups)
+    first = _scan(sorted_z, from_start=True)
+    last = _scan(sorted_z[::-1], from_start=False)
+    if first is None or last is None:
+        return None
+    return (first, last)
 
 
 def check_patch_chunk(
@@ -857,6 +950,32 @@ def find_valid_patches(
             z_starts = list(range(vol_min_z, max(vol_min_z, vol_max_z - dpZ + 1), dpZ))
             y_starts = list(range(vol_min_y, max(vol_min_y, vol_max_y - dpY + 1), dpY))
             x_starts = list(range(vol_min_x, max(vol_min_x, vol_max_x - dpX + 1), dpX))
+
+            ignore_z_bounds = None
+            if ignore_label is not None:
+                ignore_z_bounds = _find_ignore_z_bounds_from_stored_chunks(
+                    downsampled_array,
+                    ignore_label=ignore_label,
+                )
+                if ignore_z_bounds is not None:
+                    original_z_count = len(z_starts)
+                    z_starts = _filter_z_starts_by_ignore_bounds(
+                        z_starts,
+                        patch_depth=dpZ,
+                        ignore_bounds=ignore_z_bounds,
+                    )
+                    logger.info(
+                        "Volume '%s': restrict patch starts to ignore-label z-range %s -> %d/%d z positions",
+                        label_name,
+                        ignore_z_bounds,
+                        len(z_starts),
+                        original_z_count,
+                    )
+                else:
+                    logger.warning(
+                        "Volume '%s': could not determine stored ignore-label z-range; leaving z candidates unfiltered",
+                        label_name,
+                    )
 
         generate_elapsed = time.perf_counter() - position_gen_start
         candidate_count = (

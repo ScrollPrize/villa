@@ -49,6 +49,15 @@ class PatchCacheResult:
     total_unlabeled_fg_patches: int
 
 
+def _full_resolution_patch_size(
+    train_patch_size: Tuple[int, ...],
+    ome_zarr_resolution: int,
+) -> Tuple[int, ...]:
+    """Convert a training-resolution patch size into full-resolution coordinates."""
+    scale_factor = 2 ** int(ome_zarr_resolution)
+    return tuple(int(v) * scale_factor for v in train_patch_size)
+
+
 def generate_patch_caches(
     config_path: Path,
     *,
@@ -78,6 +87,14 @@ def generate_patch_caches(
 
     data_path = Path(mgr.data_path)
     patch_size = tuple(int(v) for v in mgr.train_patch_size)
+    ome_zarr_resolution = int(getattr(mgr, "ome_zarr_resolution", 0))
+    full_res_patch_size = _full_resolution_patch_size(patch_size, ome_zarr_resolution)
+    logger.info(
+        "Training resolution level %d uses patch size %s; generating cache with full-resolution patch size %s",
+        ome_zarr_resolution,
+        patch_size,
+        full_res_patch_size,
+    )
 
     # Resolve target names
     target_names = _resolve_target_names(mgr)
@@ -106,6 +123,8 @@ def generate_patch_caches(
         min_labeled_ratio=float(getattr(mgr, "min_labeled_ratio", 0.10)),
         bbox_threshold=float(getattr(mgr, "min_bbox_percent", 0.95)),
         valid_patch_find_resolution=int(getattr(mgr, "valid_patch_find_resolution", 1)),
+        ome_zarr_resolution=ome_zarr_resolution,
+        ignore_label=_resolve_ignore_label(target_names, mgr),
         valid_patch_value=_resolve_valid_patch_value(target_names, mgr),
         unlabeled_fg_enabled=bool(getattr(mgr, "unlabeled_foreground_enabled", False)),
         unlabeled_fg_threshold=float(getattr(mgr, "unlabeled_foreground_threshold", 0.05)),
@@ -171,10 +190,15 @@ def generate_patch_caches(
     result = find_valid_patches(
         label_arrays=label_arrays,
         label_names=label_names,
-        patch_size=patch_size,
+        patch_size=full_res_patch_size,
         bbox_threshold=cache_params.bbox_threshold,
         label_threshold=cache_params.min_labeled_ratio,
         valid_patch_find_resolution=cache_params.valid_patch_find_resolution,
+        ignore_labels=(
+            [cache_params.ignore_label] * len(label_arrays)
+            if cache_params.ignore_label is not None
+            else None
+        ),
         valid_patch_values=(
             [cache_params.valid_patch_value] * len(label_arrays)
             if cache_params.valid_patch_value is not None
@@ -262,6 +286,27 @@ def _resolve_valid_patch_value(
     dataset_value = dataset_cfg.get("valid_patch_value")
     if dataset_value is not None:
         return dataset_value
+    return None
+
+
+def _resolve_ignore_label(
+    target_names: List[str],
+    mgr,
+) -> Optional[Union[int, float]]:
+    """Extract ignore label from target config, with dataset-level fallbacks."""
+    targets = getattr(mgr, "targets", {})
+    fallback_keys = ("ignore_label", "ignore_index", "ignore_value")
+    for target in target_names:
+        info = targets.get(target) or {}
+        for key in fallback_keys:
+            value = info.get(key)
+            if value is not None:
+                return value
+    dataset_cfg = getattr(mgr, "dataset_config", {}) or {}
+    for key in fallback_keys:
+        value = dataset_cfg.get(key)
+        if value is not None:
+            return value
     return None
 
 

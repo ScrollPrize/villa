@@ -1,5 +1,6 @@
 from pathlib import Path
 from copy import deepcopy
+import inspect
 import os
 from datetime import datetime
 from tqdm import tqdm
@@ -1125,8 +1126,11 @@ class BaseTrainer:
     def _get_model_outputs(self, model, data_dict):
         inputs = data_dict["image"].to(self.device)
         targets_dict = self._extract_targets(data_dict)
-        
-        outputs = model(inputs)
+
+        if "apply_activation" in inspect.signature(model.forward).parameters:
+            outputs = model(inputs, apply_activation=False)
+        else:
+            outputs = model(inputs)
 
         # If deep supervision is enabled, prepare lists of downsampled targets
         if getattr(self.mgr, 'enable_deep_supervision', False):

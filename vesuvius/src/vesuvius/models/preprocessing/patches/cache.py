@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,8 @@ class PatchCacheParams:
     min_labeled_ratio: float
     bbox_threshold: float
     valid_patch_find_resolution: int
+    ome_zarr_resolution: int = 0
+    ignore_label: Optional[float] = None
     valid_patch_value: Optional[float] = None
     unlabeled_fg_enabled: bool = True
     unlabeled_fg_threshold: float = 0.05
@@ -45,6 +47,8 @@ class PatchCacheParams:
             "min_labeled_ratio": float(self.min_labeled_ratio),
             "bbox_threshold": float(self.bbox_threshold),
             "valid_patch_find_resolution": int(self.valid_patch_find_resolution),
+            "ome_zarr_resolution": int(self.ome_zarr_resolution),
+            "ignore_label": self.ignore_label,
             "valid_patch_value": self.valid_patch_value,
             "unlabeled_fg_enabled": bool(self.unlabeled_fg_enabled),
             "unlabeled_fg_threshold": float(self.unlabeled_fg_threshold),
@@ -78,6 +82,8 @@ def build_cache_params(
     min_labeled_ratio: float,
     bbox_threshold: float,
     valid_patch_find_resolution: int,
+    ome_zarr_resolution: int = 0,
+    ignore_label: Optional[float] = None,
     valid_patch_value: Optional[float] = None,
     unlabeled_fg_enabled: bool = True,
     unlabeled_fg_threshold: float = 0.05,
@@ -91,6 +97,8 @@ def build_cache_params(
         min_labeled_ratio=float(min_labeled_ratio),
         bbox_threshold=float(bbox_threshold),
         valid_patch_find_resolution=int(valid_patch_find_resolution),
+        ome_zarr_resolution=int(ome_zarr_resolution),
+        ignore_label=ignore_label,
         valid_patch_value=valid_patch_value,
         unlabeled_fg_enabled=bool(unlabeled_fg_enabled),
         unlabeled_fg_threshold=float(unlabeled_fg_threshold),
@@ -223,6 +231,8 @@ def try_load_patch_cache(
     min_labeled_ratio: float,
     bbox_threshold: float,
     valid_patch_find_resolution: int,
+    ome_zarr_resolution: int = 0,
+    ignore_label: Optional[float] = None,
     valid_patch_value: Optional[float] = None,
     unlabeled_fg_enabled: bool = True,
     unlabeled_fg_threshold: float = 0.05,
@@ -247,6 +257,10 @@ def try_load_patch_cache(
         Minimum bounding box coverage.
     valid_patch_find_resolution : int
         Multi-resolution level for patch finding.
+    ome_zarr_resolution : int
+        Multi-resolution level used for training data reads.
+    ignore_label : Optional[float]
+        Label value that should be treated as ignored/background for cache generation.
     valid_patch_value : Optional[float]
         Specific label value to match.
     unlabeled_fg_enabled : bool
@@ -268,6 +282,8 @@ def try_load_patch_cache(
         min_labeled_ratio=min_labeled_ratio,
         bbox_threshold=bbox_threshold,
         valid_patch_find_resolution=valid_patch_find_resolution,
+        ome_zarr_resolution=ome_zarr_resolution,
+        ignore_label=ignore_label,
         valid_patch_value=valid_patch_value,
         unlabeled_fg_enabled=unlabeled_fg_enabled,
         unlabeled_fg_threshold=unlabeled_fg_threshold,

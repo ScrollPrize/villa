@@ -4,7 +4,7 @@ import torch
 from typing import Dict, Optional, Tuple
 from skimage.metrics import variation_of_information
 
-from .base_metric import BaseMetric
+from .base_metric import BaseMetric, prediction_to_discrete_labels
 
 
 class VOIMetric(BaseMetric):
@@ -172,18 +172,7 @@ def compute_voi(
         else:
             mask_np = np.asarray(mask).astype(bool)
 
-    # Handle different input shapes for predictions
-    if pred_np.ndim == 5:  # (batch, channels, depth, height, width)
-        if pred_np.shape[1] > 1:  # Multi-channel, need argmax
-            pred_np = np.argmax(pred_np, axis=1)
-        else:  # Single channel, just squeeze
-            pred_np = pred_np.squeeze(1)
-    elif pred_np.ndim == 4:  # Could be (batch, depth, height, width) or (batch, channels, height, width)
-        if pred_np.shape[1] <= 10:  # Likely channels dimension
-            if pred_np.shape[1] > 1:
-                pred_np = np.argmax(pred_np, axis=1)
-            else:
-                pred_np = pred_np.squeeze(1)
+    pred_np = prediction_to_discrete_labels(pred_np)
 
     # Handle different input shapes for ground truth
     if gt_np.ndim == 3:  # (depth, height, width)
