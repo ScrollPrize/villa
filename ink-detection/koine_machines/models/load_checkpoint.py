@@ -3,6 +3,36 @@ import os
 import torch
 
 
+def _load_model_state_with_ddp_compat(model, model_state):
+    try:
+        model.load_state_dict(model_state)
+        return
+    except RuntimeError as exc:
+        if not isinstance(model_state, dict):
+            raise exc
+
+        stripped_state = {
+            (key[len("module."):] if str(key).startswith("module.") else key): value
+            for key, value in model_state.items()
+        }
+        if stripped_state != model_state:
+            try:
+                model.load_state_dict(stripped_state)
+                return
+            except RuntimeError:
+                pass
+
+        prefixed_state = {
+            (key if str(key).startswith("module.") else f"module.{key}"): value
+            for key, value in model_state.items()
+        }
+        if prefixed_state != model_state:
+            model.load_state_dict(prefixed_state)
+            return
+
+        raise exc
+
+
 def resolve_training_checkpoint_path(ckpt_path, config_path=None):
     if ckpt_path in (None, ""):
         return None
@@ -41,7 +71,7 @@ def restore_training_state(
     model_state = checkpoint.get("model")
     if model_state is None:
         raise ValueError(f"Checkpoint '{ckpt_path}' is missing 'model'")
-    model.load_state_dict(model_state)
+    _load_model_state_with_ddp_compat(model, model_state)
 
     if load_weights_only:
         return 0, 0
