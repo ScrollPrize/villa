@@ -6,14 +6,17 @@ from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 import wandb
-import numpy as np 
 import random
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import accelerate
-from accelerate.utils import GradientAccumulationPlugin, set_seed
+from accelerate.utils import (
+    DistributedDataParallelKwargs,
+    GradientAccumulationPlugin,
+    set_seed,
+)
 import click
 from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.training.optimizers import (
@@ -253,6 +256,31 @@ def _build_targets_with_ignore_for_loss(loss_preds, targets, ignore_mask):
         )
     return torch.cat([ds_targets, ds_ignore], dim=1)
 
+
+def _ddp_kwargs_from_config(config):
+    return DistributedDataParallelKwargs(
+        find_unused_parameters=bool(config.get('ddp_find_unused_parameters', True)),
+        broadcast_buffers=bool(config.get('ddp_broadcast_buffers', False)),
+    )
+
+
+def _distributed_mean_scalar(accelerator, value):
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+    else:
+        tensor = torch.tensor(float(value), device=accelerator.device)
+    tensor = tensor.to(device=accelerator.device, dtype=torch.float32).reshape(())
+    return accelerator.reduce(tensor, reduction='mean')
+
+
+def _distributed_mean_metrics(accelerator, metrics):
+    if not isinstance(metrics, dict):
+        return {}
+    return {
+        str(name): float(_distributed_mean_scalar(accelerator, metric_value).item())
+        for name, metric_value in metrics.items()
+    }
+
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
 @click.option(
@@ -341,10 +369,16 @@ def train(config_path, profile_steps):
     val_preview_batches = config.get('val_preview_batches', 3)
 
     dataloader_config = accelerate.DataLoaderConfiguration(non_blocking = True)
+    ddp_kwargs = _ddp_kwargs_from_config(config)
 
     # The training loop reuses the dataloader indefinitely, so keep accumulation boundaries independent of dataloader exhaustion.
     gradient_accumulation_plugin = GradientAccumulationPlugin(num_steps=grad_acc_steps, sync_with_dataloader=False)
-    accelerator = accelerate.Accelerator(mixed_precision=config.get('mixed_precision', "fp16"), gradient_accumulation_plugin=gradient_accumulation_plugin, dataloader_config=dataloader_config)
+    accelerator = accelerate.Accelerator(
+        mixed_precision=config.get('mixed_precision', "fp16"),
+        gradient_accumulation_plugin=gradient_accumulation_plugin,
+        dataloader_config=dataloader_config,
+        kwargs_handlers=[ddp_kwargs],
+    )
     normal_pooling_profiler = NormalPoolingProfiler(
         enabled=profile_steps is not None and normal_pooled_mode
     )
@@ -506,7 +540,7 @@ def train(config_path, profile_steps):
     optimizer_step = 0
     if checkpoint is not None:
         start_step, optimizer_step = restore_training_state(
-            model,
+            unwrapped_model,
             optimizer,
             lr_scheduler,
             checkpoint,
@@ -753,7 +787,7 @@ def train(config_path, profile_steps):
                                 else:
                                     ema_value.copy_(model_value)
 
-        train_loss = l.item()
+        train_loss = float(_distributed_mean_scalar(accelerator, l).item())
         if accelerator.is_main_process:
             refresh_progress_bar(train_loss)
 
@@ -764,10 +798,12 @@ def train(config_path, profile_steps):
                 'step': step,
             }
             if normal_pooled_mode:
-                log_dict['train/outside_bg_loss'] = float(outside_bg_loss.detach().item())
+                log_dict['train/outside_bg_loss'] = float(
+                    _distributed_mean_scalar(accelerator, outside_bg_loss).item()
+                )
             latest_loss_metrics = getattr(loss, 'latest_metrics', None)
             if isinstance(latest_loss_metrics, dict):
-                log_dict.update(latest_loss_metrics)
+                log_dict.update(_distributed_mean_metrics(accelerator, latest_loss_metrics))
             if wandb.run is not None:
                 wandb.log(log_dict, step=step)
 
@@ -802,8 +838,10 @@ def train(config_path, profile_steps):
                 volume_logits=train_preview_volume_logits,
             )
             model.eval()
-            val_losses = []
-            ema_val_losses = []
+            val_loss_total = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+            val_loss_batches = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+            ema_val_loss_total = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+            ema_val_loss_batches = torch.zeros((), device=accelerator.device, dtype=torch.float32)
             validation_counts = Confusion.zero_counts(device=accelerator.device)
             val_preview = PreviewAccumulator(
                 accelerator=accelerator,
@@ -850,7 +888,8 @@ def train(config_path, profile_steps):
                         _float_supervision_tree(val_loss_preds),
                         _float_supervision_tree(val_targets_with_ignore),
                     ) + val_outside_bg_loss
-                    val_losses.append(val_l.item())
+                    val_loss_total = val_loss_total + _distributed_mean_scalar(accelerator, val_l)
+                    val_loss_batches = val_loss_batches + 1.0
                     batch_counts = validation_confusion_metric.compute_batch(
                         ValidationMetricBatch(
                             logits=primary_val_loss_preds.detach(),
@@ -896,7 +935,11 @@ def train(config_path, profile_steps):
                             _float_supervision_tree(ema_val_loss_preds),
                             _float_supervision_tree(ema_val_targets_with_ignore),
                         ) + ema_val_outside_bg_loss
-                        ema_val_losses.append(ema_val_l.item())
+                        ema_val_loss_total = ema_val_loss_total + _distributed_mean_scalar(
+                            accelerator,
+                            ema_val_l,
+                        )
+                        ema_val_loss_batches = ema_val_loss_batches + 1.0
                         preview_preds = _primary_supervision_output(ema_val_loss_preds)
                         preview_volume_preds = _primary_supervision_output(ema_val_preds)
 
@@ -926,8 +969,12 @@ def train(config_path, profile_steps):
                             volume_logits=val_preview_volume_logits,
                         )
 
-            mean_val_loss = np.mean(val_losses)
-            mean_ema_val_loss = np.mean(ema_val_losses) if ema_val_losses else None
+            mean_val_loss = float((val_loss_total / val_loss_batches.clamp_min(1.0)).item())
+            mean_ema_val_loss = None
+            if float(ema_val_loss_batches.item()) > 0.0:
+                mean_ema_val_loss = float(
+                    (ema_val_loss_total / ema_val_loss_batches.clamp_min(1.0)).item()
+                )
             if accelerator.is_main_process:
                 latest_val_loss = float(mean_val_loss)
                 latest_ema_val_loss = (float(mean_ema_val_loss) if mean_ema_val_loss is not None else None)
@@ -959,7 +1006,7 @@ def train(config_path, profile_steps):
 
         if accelerator.is_main_process and step % save_every == 0 and step > 0:
             checkpoint = {
-                'model': model.state_dict(),
+                'model': accelerator.get_state_dict(model),
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
                 'config': config,
