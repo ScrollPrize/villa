@@ -55,34 +55,28 @@ SliceCache::SliceCache(size_t maxBytes)
 
 SliceCacheLookup SliceCache::getBest(const SliceCacheKey& key, int maxCoarserLevels)
 {
-    // Try exact match first
-    auto result = cache_.get(key);
-    if (result) {
+    // Construct a mutable key once, vary dsScaleIdx for each lookup
+    SliceCacheKey probe = key;
+
+    // Exact match
+    if (auto result = cache_.get(probe)) {
         return {std::move(*result), key.dsScaleIdx};
     }
 
-    // Try finer levels first (higher resolution → sharp when scaled down).
-    // Prefer finer over coarser because downscaling looks crisp while
-    // upscaling looks blurry.
+    // Finer levels first (sharper fallback)
     constexpr int kMaxFinerLevels = 3;
     for (int delta = 1; delta <= kMaxFinerLevels && key.dsScaleIdx - delta >= 0; delta++) {
-        SliceCacheKey finer = key;
-        finer.dsScaleIdx = key.dsScaleIdx - delta;
-
-        auto fresult = cache_.get(finer);
-        if (fresult) {
-            return {std::move(*fresult), finer.dsScaleIdx};
+        probe.dsScaleIdx = key.dsScaleIdx - delta;
+        if (auto result = cache_.get(probe)) {
+            return {std::move(*result), probe.dsScaleIdx};
         }
     }
 
-    // Try coarser levels (fallback to lower resolution)
+    // Coarser levels (blurry fallback)
     for (int delta = 1; delta <= maxCoarserLevels; delta++) {
-        SliceCacheKey coarser = key;
-        coarser.dsScaleIdx = key.dsScaleIdx + delta;
-
-        auto cresult = cache_.get(coarser);
-        if (cresult) {
-            return {std::move(*cresult), coarser.dsScaleIdx};
+        probe.dsScaleIdx = key.dsScaleIdx + delta;
+        if (auto result = cache_.get(probe)) {
+            return {std::move(*result), probe.dsScaleIdx};
         }
     }
 

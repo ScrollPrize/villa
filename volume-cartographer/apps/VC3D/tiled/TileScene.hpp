@@ -118,6 +118,10 @@ public:
     void clearRetained();
     bool hasRetainedItems() const { return !_retainedItems.empty(); }
 
+    // Number of tiles that have no rendered content (level == -1).
+    // Tracked incrementally — O(1) to query.
+    int unfilledTileCount() const { return _unfilledCount; }
+
     // Content bounds
     const ContentBounds& bounds() const { return _bounds; }
     int cols() const { return _bounds.totalCols; }
@@ -161,6 +165,7 @@ private:
     std::vector<QGraphicsPixmapItem*> _items; // row-major: [row * totalCols + col]
     std::vector<TileMetadata> _meta;
     std::vector<QGraphicsPixmapItem*> _retainedItems; // old items kept as background during transition
+    int _unfilledCount = 0;  // tiles with level == -1 (tracked incrementally)
     ContentBounds _bounds;
     float _padX = 0;  // scene padding when content < viewport
     float _padY = 0;

@@ -77,6 +77,7 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
     const int count = _bounds.totalRows * _bounds.totalCols;
     _items.resize(count, nullptr);
     _meta.resize(count);
+    _unfilledCount = count;  // all tiles start unfilled
 
     for (int r = 0; r < _bounds.totalRows; ++r) {
         for (int c = 0; c < _bounds.totalCols; ++c) {
@@ -113,9 +114,13 @@ bool TileScene::setTile(const TileKey& key, const QPixmap& pixmap,
     }
     if (epoch == m.epoch && m.level >= 0 && level >= m.level) return false;
 
+    bool wasFilling = (m.level < 0);
     m.epoch = epoch;
     m.level = level;
     _items[idx]->setPixmap(pixmap);
+    if (wasFilling && level >= 0) {
+        --_unfilledCount;
+    }
     return true;
 }
 
@@ -144,6 +149,7 @@ void TileScene::resetMetadata()
         m.epoch = 0;
         m.level = -1;
     }
+    _unfilledCount = static_cast<int>(_meta.size());
 }
 
 void TileScene::clearAll()
@@ -174,6 +180,7 @@ void TileScene::sceneCleared()
 {
     // The scene already deleted all items — just forget the pointers.
     _items.clear();
+    _unfilledCount = 0;
     _meta.clear();
     _retainedItems.clear();
     _bounds = ContentBounds{};

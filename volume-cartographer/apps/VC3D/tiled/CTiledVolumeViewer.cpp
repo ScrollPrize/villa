@@ -214,21 +214,9 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     connect(_renderController, &TileRenderController::sceneNeedsUpdate,
             this, [this]() {
                 fGraphicsView->viewport()->update();
-                // Only clear retained background once all visible tiles have
-                // content.  Clearing too early exposes transparent placeholders.
-                if (_tileScene->hasRetainedItems()) {
-                    bool allFilled = true;
-                    QRectF vp = viewportSceneRect();
-                    auto visible = _tileScene->visibleTiles(vp, 0);
-                    for (const auto& wk : visible) {
-                        if (_tileScene->tileNeedsContent(wk)) {
-                            allFilled = false;
-                            break;
-                        }
-                    }
-                    if (allFilled) {
-                        _tileScene->clearRetained();
-                    }
+                // Clear retained background once all tiles have content (O(1) check)
+                if (_tileScene->hasRetainedItems() && _tileScene->unfilledTileCount() <= 0) {
+                    _tileScene->clearRetained();
                 }
             });
 
@@ -250,14 +238,14 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     _lbl->setMinimumWidth(300);
     _lbl->move(10, 5);
 
-    // Periodic status refresh so download/queue counters update even when idle
+    // Periodic status refresh for download/queue counters
     auto* statusTimer = new QTimer(this);
     connect(statusTimer, &QTimer::timeout, this, &CTiledVolumeViewer::updateStatusLabel);
-    statusTimer->start(250);
+    statusTimer->start(500);
 
     _interactionSettleTimer = new QTimer(this);
     _interactionSettleTimer->setSingleShot(true);
-    _interactionSettleTimer->setInterval(50);
+    _interactionSettleTimer->setInterval(16);
     connect(_interactionSettleTimer, &QTimer::timeout, this, &CTiledVolumeViewer::settleInteractionRender);
 
     // Throttle intersection recomputation to ~5Hz during interaction

@@ -169,7 +169,7 @@ void TileRenderController::onCameraChanged(
     const int coarsestLevel = volume ? std::max(0, static_cast<int>(volume->numScales()) - 1) : 0;
     const uint64_t epoch = _currentEpoch->load(std::memory_order_relaxed);
     int syncFillCount = 0;
-    constexpr int kMaxSyncFills = 8;  // cap to avoid blocking UI thread
+    constexpr int kMaxSyncFills = 4;  // cap to avoid blocking UI thread
 
     for (const auto& wk : visibleKeys) {
         SliceCacheKey cacheKey = SliceCacheKey::make(wk, camera, _paramsHash);
@@ -249,10 +249,12 @@ void TileRenderController::scheduleRender(
     const std::function<TileRenderParams(const WorldTileKey&)>& buildParams,
     const QRectF& viewportRect)
 {
-    // Coalescing: only the LATEST camera state matters.  Overwriting pending
-    // state is intentional — intermediate states are superseded by whichever
-    // call arrives last before tick() fires.  The _pendingDirty flag ensures
-    // tick() always dispatches exactly once per batch of rapid calls.
+    // Skip if camera state hasn't changed (avoids redundant copies)
+    if (_pendingDirty && camera.epoch == _pendingCamera.epoch &&
+        std::abs(camera.zOff - _pendingCamera.zOff) < 1e-6f &&
+        std::abs(camera.scale - _pendingCamera.scale) < 1e-6f) {
+        return;
+    }
     _pendingCamera = camera;
     _pendingSurface = surface;
     _pendingVolume = volume;

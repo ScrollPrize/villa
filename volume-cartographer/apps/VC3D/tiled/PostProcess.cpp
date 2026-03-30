@@ -4,6 +4,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 
 QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
@@ -37,8 +38,18 @@ QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
         return volume_viewer_cmaps::makeColors(gray, *spec);
     }
 
-    // Grayscale: write 0xffGGGGGG directly into RGB32 buffer.
-    // This replaces: cvtColor(GRAY2BGR) + cvtColor(BGR2RGB) + QImage(RGB888) + RGB888→RGB32
+    // Grayscale → RGB32: use a precomputed LUT for fast conversion.
+    // Each gray value maps to 0xFFgggggg.
+    static const auto lut = []() {
+        std::array<uint32_t, 256> t;
+        for (int i = 0; i < 256; ++i) {
+            t[i] = 0xFF000000u | (static_cast<uint32_t>(i) << 16)
+                                | (static_cast<uint32_t>(i) << 8)
+                                | static_cast<uint32_t>(i);
+        }
+        return t;
+    }();
+
     const int rows = gray.rows;
     const int cols = gray.cols;
     QImage result(cols, rows, QImage::Format_RGB32);
@@ -49,8 +60,7 @@ QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
         const auto* src = gray.ptr<uint8_t>(y);
         auto* dst = bits + y * stride;
         for (int x = 0; x < cols; ++x) {
-            uint32_t v = src[x];
-            dst[x] = 0xFF000000u | (v << 16) | (v << 8) | v;
+            dst[x] = lut[src[x]];
         }
     }
     return result;
