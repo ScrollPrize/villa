@@ -39,6 +39,7 @@ from transform_utils import (
     get_vtk_mesh_info,
     invert_affine_matrix,
     fit_affine_transform_from_points,
+    fit_constrained_transform_from_points,
     MeshGeometry,
     matrix_swap_output_xyz_zyx,
     matrix_swap_xyz_zyx,
@@ -137,6 +138,7 @@ mesh_slice_max_segments = 256
 numba_mesh_slice_kernels_warmed = False
 slice_overlay_update_pending = False
 last_mesh_slice_overlay_key = None
+constrained_fit_mode = False
 
 
 def infer_moving_source_type(path: str, explicit_type: str) -> str:
@@ -1380,7 +1382,12 @@ def navigate_to_next_fixed_point(action_state):
 
 
 def update_transform_if_sufficient_points(state):
-    """Update transform if there are 4+ matching point pairs."""
+    """Update transform if there are sufficient matching point pairs.
+
+    Uses constrained fitting (5 DOF + z-flip, min 3 pairs) or unconstrained
+    affine fitting (12 DOF, min 4 pairs) depending on constrained_fit_mode.
+    """
+    global constrained_fit_mode
     if (
         FIXED_POINTS_LAYER_STR in state.layers
         and MOVING_POINTS_LAYER_STR in state.layers
@@ -1388,22 +1395,29 @@ def update_transform_if_sufficient_points(state):
         fixed_annotations = state.layers[FIXED_POINTS_LAYER_STR].layer.annotations
         moving_annotations = state.layers[MOVING_POINTS_LAYER_STR].layer.annotations
 
+        min_points = 3 if constrained_fit_mode else 4
         if (
             len(fixed_annotations) == len(moving_annotations)
-            and len(fixed_annotations) >= 4
+            and len(fixed_annotations) >= min_points
         ):
-            # Extract point coordinates from annotations
             fixed_points_list = [list(ann.point) for ann in fixed_annotations]
             moving_points_list = [list(ann.point) for ann in moving_annotations]
 
-            transform = fit_affine_transform_from_points(
-                fixed_points_list, moving_points_list
-            )
+            if constrained_fit_mode:
+                mode_label = "constrained"
+                transform = fit_constrained_transform_from_points(
+                    fixed_points_list, moving_points_list
+                )
+            else:
+                mode_label = "unconstrained"
+                transform = fit_affine_transform_from_points(
+                    fixed_points_list, moving_points_list
+                )
             if transform is not None:
                 set_current_transform(state, transform)
                 update_error_layer(state)
                 print(
-                    f"Automatically updated transform from {len(fixed_annotations)} point pairs"
+                    f"Updated transform ({mode_label}) from {len(fixed_annotations)} point pairs"
                 )
                 return True
     return False
@@ -1623,6 +1637,19 @@ def delete_nearest_point(action_state):
         update_transform_if_sufficient_points(state)
 
 
+def toggle_constrained_fit(_):
+    """Toggle between constrained and unconstrained affine fitting."""
+    global constrained_fit_mode
+    if not constrained_fit_mode and moving_source.source_type == "mesh":
+        print("Constrained fit mode is not supported with mesh moving sources.")
+        return
+    constrained_fit_mode = not constrained_fit_mode
+    mode = "CONSTRAINED (5 DOF + z-flip)" if constrained_fit_mode else "UNCONSTRAINED (12 DOF)"
+    print(f"Fit mode: {mode}")
+    with viewer.txn() as state:
+        update_transform_if_sufficient_points(state)
+
+
 def write_current_transform(_):
     """Write the current transform and print the shareable URL."""
     with viewer.txn() as state:
@@ -1641,6 +1668,7 @@ def add_actions_and_keybinds(
 ) -> None:
 
     viewer.actions.add("toggle-color", toggle_color)
+    viewer.actions.add("toggle-constrained-fit", toggle_constrained_fit)
     viewer.actions.add("write-transform", write_current_transform)
     if enable_fine_align:
         viewer.actions.add("fine-align", fine_align)
@@ -1710,6 +1738,7 @@ def add_actions_and_keybinds(
 
     with viewer.config_state.txn() as s:
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
+        s.input_event_bindings.viewer["keym"] = "toggle-constrained-fit"
         s.input_event_bindings.viewer["keyw"] = "write-transform"
         if enable_fine_align:
             s.input_event_bindings.viewer["keyf"] = "fine-align"
@@ -1853,6 +1882,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Invert the initial transform before applying it",
     )
+    parser.add_argument(
+        "--constrained-fit",
+        action="store_true",
+        help="Start in constrained fit mode (5 DOF + z-flip instead of 12 DOF affine). Toggle at runtime with 'm'.",
+    )
     args = parser.parse_args()
 
     if not sys.flags.interactive:
@@ -1860,6 +1894,10 @@ if __name__ == "__main__":
             f"Running in non-interactive mode. Use `python -i {Path(__file__).name}` to run in interactive mode (required for neuroglancer)."
         )
         sys.exit(1)
+
+    if args.constrained_fit:
+        constrained_fit_mode = True
+        print("Starting in CONSTRAINED fit mode (5 DOF + z-flip). Press 'm' to toggle.")
 
     if args.output_transform is not None:
         if not args.output_transform.endswith(".json"):
@@ -1879,6 +1917,12 @@ if __name__ == "__main__":
         args.moving_source_unit_size,
     )
     scale_factor = moving_source.unit_size_um / fixed_dimensions.voxel_size_um
+
+    if moving_source.source_type == "mesh" and constrained_fit_mode:
+        raise ValueError(
+            "Constrained fit mode is not supported with mesh moving sources "
+            "(mesh landmarks use XYZ order, but the constrained solver assumes ZYX)."
+        )
 
     if moving_source.source_type == "mesh":
         moving_mesh_geometry = read_vtk_mesh_geometry(args.moving)
