@@ -91,44 +91,165 @@ class ConfigManager:
 
         return config
 
-    def _explicit_volumes_require_unlabeled(self) -> bool:
+    def _resolve_config_relative_path(self, raw_path):
+        """Resolve a config path relative to the config file location."""
+        if raw_path in (None, ""):
+            return None
+
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            base_dir = self._config_path.parent if self._config_path is not None else Path.cwd()
+            candidate = (base_dir / candidate).resolve()
+        return candidate
+
+    def _get_primary_target_names(self):
+        targets = getattr(self, "targets", {}) or {}
+        names = [
+            name for name, info in targets.items()
+            if not (info or {}).get("auxiliary_task", False)
+        ]
+        return names if names else ["ink"]
+
+    def _make_unique_volume_id(self, base_name, used_names):
+        candidate = str(base_name or "volume")
+        next_index = used_names.get(candidate, 0)
+        if next_index == 0:
+            used_names[candidate] = 1
+            return candidate
+
+        while True:
+            unique_candidate = f"{candidate}_{next_index}"
+            if unique_candidate not in used_names:
+                used_names[candidate] = next_index + 1
+                used_names[unique_candidate] = 1
+                return unique_candidate
+            next_index += 1
+
+    def get_explicit_volume_specs(self):
+        """
+        Normalize dataset_config.volumes into explicit image/label path specs.
+
+        Supported entries include:
+        - {image: /path/to/image.zarr, label: /path/to/label.zarr, scale: 2}
+        - {image: ..., labels: {ink: /path/to/ink.zarr, surface: /path/to/surface.zarr}}
+        - /path/to/image_only_volume.zarr
+        """
         volumes_cfg = self.dataset_config.get("volumes")
         if not volumes_cfg:
-            return False
+            return []
 
         if isinstance(volumes_cfg, dict):
-            volume_specs = list(volumes_cfg.values())
+            raw_entries = list(volumes_cfg.items())
         elif isinstance(volumes_cfg, (list, tuple)):
-            volume_specs = list(volumes_cfg)
+            raw_entries = [(None, spec) for spec in volumes_cfg]
         else:
             raise ValueError("dataset_config.volumes must be a list or mapping")
 
-        target_names = list((self.targets or {}).keys())
+        target_names = self._get_primary_target_names()
+        normalized_specs = []
+        used_names = {}
+
+        for index, (entry_name, spec) in enumerate(raw_entries):
+            if spec is None:
+                raise ValueError("Explicit volume entries cannot be null")
+
+            labels_cfg = None
+            singular_label = None
+            scale = None
+
+            if isinstance(spec, (str, Path)):
+                image_path = self._resolve_config_relative_path(spec)
+                volume_id = entry_name or image_path.stem or f"volume_{index}"
+            elif isinstance(spec, dict):
+                image_raw = spec.get("image")
+                if image_raw is None:
+                    image_raw = spec.get("image_path")
+                if image_raw in (None, ""):
+                    raise ValueError(
+                        f"Explicit volume entry {entry_name or index} is missing an image path"
+                    )
+
+                image_path = self._resolve_config_relative_path(image_raw)
+                volume_id = (
+                    spec.get("volume_id")
+                    or spec.get("id")
+                    or spec.get("name")
+                    or entry_name
+                    or image_path.stem
+                    or f"volume_{index}"
+                )
+
+                labels_cfg = spec.get("labels")
+                if labels_cfg is None:
+                    labels_cfg = spec.get("label_paths")
+                singular_label = spec.get("label")
+
+                if singular_label not in (None, "") and labels_cfg is not None:
+                    raise ValueError(
+                        f"Explicit volume '{volume_id}' must use either 'label' or 'labels', not both"
+                    )
+
+                scale_raw = spec.get("scale", spec.get("ome_zarr_resolution"))
+                if scale_raw not in (None, ""):
+                    try:
+                        scale = int(scale_raw)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"Explicit volume '{volume_id}' has invalid scale {scale_raw!r}"
+                        ) from exc
+                    if scale < 0:
+                        raise ValueError(
+                            f"Explicit volume '{volume_id}' scale must be >= 0"
+                        )
+            else:
+                raise ValueError(
+                    "Each volume entry must be a mapping or a direct image path string"
+                )
+
+            label_paths = {target: None for target in target_names}
+
+            if singular_label not in (None, ""):
+                if len(target_names) != 1:
+                    raise ValueError(
+                        f"Explicit volume '{volume_id}' uses singular 'label', "
+                        f"but config has multiple targets: {target_names}. Use 'labels' instead."
+                    )
+                label_paths[target_names[0]] = self._resolve_config_relative_path(singular_label)
+            elif labels_cfg is not None:
+                if not isinstance(labels_cfg, dict):
+                    raise ValueError(
+                        f"Explicit volume '{volume_id}' labels must be a mapping of target -> path"
+                    )
+
+                unknown_targets = set(labels_cfg.keys()) - set(target_names)
+                if unknown_targets:
+                    raise ValueError(
+                        f"Explicit volume '{volume_id}' specifies unknown label targets: "
+                        f"{sorted(unknown_targets)}"
+                    )
+
+                for target_name in target_names:
+                    label_paths[target_name] = self._resolve_config_relative_path(
+                        labels_cfg.get(target_name)
+                    )
+
+            normalized_specs.append({
+                "volume_id": self._make_unique_volume_id(volume_id, used_names),
+                "image_path": image_path,
+                "label_paths": label_paths,
+                "scale": scale,
+            })
+
+        return normalized_specs
+
+    def _explicit_volumes_require_unlabeled(self) -> bool:
+        volume_specs = self.get_explicit_volume_specs()
+        if not volume_specs:
+            return False
 
         for spec in volume_specs:
-            if spec is None:
-                return True
-            if isinstance(spec, (str, Path)):
-                # Treat as image-only entry; labels are missing.
-                return True
-            if not isinstance(spec, dict):
-                raise ValueError("Each volume entry must be a mapping or path string")
-
-            labels = spec.get("labels")
-            if labels is None:
-                labels = spec.get("label_paths")
-            if labels is None or labels == {}:
-                return True
-            if not isinstance(labels, dict):
-                raise ValueError("Volume labels must be a mapping of target -> path")
-
-            if not target_names:
-                # If targets are unknown, assume labels are incomplete.
-                return True
-
-            for target in target_names:
-                value = labels.get(target)
-                if value in (None, ""):
+            for value in spec["label_paths"].values():
+                if value is None:
                     return True
 
         return False
