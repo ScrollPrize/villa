@@ -2,6 +2,7 @@
 
 #include "VCSettings.hpp"
 
+#include <algorithm>
 #include <QDir>
 #include <QFileDialog>
 #include <QSettings>
@@ -60,6 +61,31 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
         QString defaultCache = QDir::homePath() + "/.VC3D/remote_cache";
         edtRemoteCachePath->setText(settings.value(viewer::REMOTE_CACHE_DIR, defaultCache).toString());
     }
+
+    // Video codec recompression settings
+    chkVideoRecompress->setChecked(settings.value(perf::VIDEO_RECOMPRESS_ENABLED, perf::VIDEO_RECOMPRESS_ENABLED_DEFAULT).toBool());
+    {
+        // Map codec type value to combo index: 0=H264→0, 1=H265→1, 3=C3D→2
+        int codecType = settings.value(perf::VIDEO_CODEC_TYPE, perf::VIDEO_CODEC_TYPE_DEFAULT).toInt();
+        int comboIdx = (codecType == 3) ? 2 : codecType;
+        cmbVideoCodecType->setCurrentIndex(std::clamp(comboIdx, 0, 2));
+    }
+    cmbVideoQualityPreset->setCurrentIndex(std::clamp(
+        settings.value(perf::VIDEO_QUALITY_PRESET, perf::VIDEO_QUALITY_PRESET_DEFAULT).toInt(),
+        0, perf::PRESET_COUNT - 1));
+    chkRechunk32->setChecked(settings.value(perf::VIDEO_RECHUNK_32, perf::VIDEO_RECHUNK_32_DEFAULT).toBool());
+    spinPrefetchLevels->setValue(settings.value(perf::PREFETCH_LEVELS, perf::PREFETCH_LEVELS_DEFAULT).toInt());
+    spinIOThreads->setValue(settings.value(perf::IO_THREADS, perf::IO_THREADS_DEFAULT).toInt());
+
+    // Enable/disable codec options based on checkbox
+    auto updateVideoCodecEnabled = [this]{
+        bool enabled = chkVideoRecompress->isChecked();
+        cmbVideoCodecType->setEnabled(enabled);
+        cmbVideoQualityPreset->setEnabled(enabled);
+        chkRechunk32->setEnabled(enabled);
+    };
+    updateVideoCodecEnabled();
+    connect(chkVideoRecompress, &QCheckBox::toggled, this, updateVideoCodecEnabled);
 
     connect(btnBrowseRemoteCachePath, &QPushButton::clicked, this, [this]{
         QString dir = QFileDialog::getExistingDirectory(this, tr("Select Remote Cache Directory"),
@@ -120,6 +146,19 @@ void SettingsDialog::accept()
     settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
     settings.setValue(perf::DISK_CACHE_SIZE_GB, spinDiskCacheSizeGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
+
+    // Video codec recompression
+    settings.setValue(perf::VIDEO_RECOMPRESS_ENABLED, chkVideoRecompress->isChecked());
+    {
+        // Map combo index to codec type value: 0→0(H264), 1→1(H265), 2→3(C3D)
+        static constexpr int comboToCodec[] = {0, 1, 3};
+        int idx = std::clamp(cmbVideoCodecType->currentIndex(), 0, 2);
+        settings.setValue(perf::VIDEO_CODEC_TYPE, comboToCodec[idx]);
+    }
+    settings.setValue(perf::VIDEO_QUALITY_PRESET, cmbVideoQualityPreset->currentIndex());
+    settings.setValue(perf::VIDEO_RECHUNK_32, chkRechunk32->isChecked());
+    settings.setValue(perf::PREFETCH_LEVELS, spinPrefetchLevels->value());
+    settings.setValue(perf::IO_THREADS, spinIOThreads->value());
 
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 

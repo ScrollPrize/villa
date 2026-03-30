@@ -114,6 +114,24 @@ void IOPool::submit(const std::vector<ChunkKey>& keys)
     queue_.submit_batch(tasks.begin(), tasks.end());
 }
 
+void IOPool::submitBackground(const std::vector<ChunkKey>& keys)
+{
+    // Background submit: no cancel_pending. If queue is full, just skip.
+    if (queue_.queued_count() >= maxQueueSize_) return;
+
+    uint64_t epoch = currentEpoch_.load(std::memory_order_relaxed);
+    std::vector<Task> tasks;
+    tasks.reserve(keys.size());
+    for (const auto& k : keys) {
+        tasks.push_back(Task{
+            k,
+            nextSeq_.fetch_add(1, std::memory_order_relaxed),
+            epoch
+        });
+    }
+    queue_.submit_batch(tasks.begin(), tasks.end());
+}
+
 void IOPool::cancelPending()
 {
     queue_.cancel_pending();

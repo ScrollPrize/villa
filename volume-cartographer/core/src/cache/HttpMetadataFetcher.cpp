@@ -90,7 +90,8 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
                           response.find("AccessDenied") != std::string::npos ||
                           response.find("InvalidAccessKeyId") != std::string::npos ||
                           response.find("SignatureDoesNotMatch") != std::string::npos ||
-                          response.find("TokenRefreshRequired") != std::string::npos;
+                          response.find("TokenRefreshRequired") != std::string::npos ||
+                          response.find("InvalidToken") != std::string::npos;
         }
 
         if (isAuthError) {
@@ -257,7 +258,7 @@ S3ListResult s3ListObjects(const std::string& httpsBaseUrl, const HttpAuth& auth
                 for (const auto& code : codes) {
                     if (code == "ExpiredToken" || code == "AccessDenied" ||
                         code == "InvalidAccessKeyId" || code == "SignatureDoesNotMatch" ||
-                        code == "TokenRefreshRequired") {
+                        code == "TokenRefreshRequired" || code == "InvalidToken") {
                         result.authError = true;
                         auto msgs = extractXmlTags(xml, "Message");
                         if (!msgs.empty()) result.errorMessage = msgs.front();

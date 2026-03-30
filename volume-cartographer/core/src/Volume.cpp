@@ -408,18 +408,19 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
     config.hotMaxBytes = cacheBudgetHot_;
     config.warmMaxBytes = cacheBudgetWarm_;
     if (isRemote_ || mountInfo_.type == vc::FilesystemType::NetworkMount) {
-        // Cap IO threads to avoid oversubscription — multiple volumes each
-        // create their own pool.  8 threads is enough to saturate most
-        // network links while keeping context-switch overhead manageable.
-        if (mountInfo_.parallelCount > 0) {
-            // Respect s3fs parallel_count to avoid overwhelming the FUSE layer
+        if (ioThreads_ > 0) {
+            config.ioThreads = ioThreads_;
+        } else if (mountInfo_.parallelCount > 0) {
             config.ioThreads = mountInfo_.parallelCount;
-            fprintf(stderr, "[Volume] Using s3fs parallel_count=%d for IO threads\n",
-                    mountInfo_.parallelCount);
         } else {
             int cores = static_cast<int>(std::thread::hardware_concurrency());
             config.ioThreads = std::clamp(cores, 2, 8);
         }
+        fprintf(stderr, "[Volume] IO threads: %d\n", config.ioThreads);
+    }
+
+    if (videoRecompressEnabled_ && (isRemote_ || mountInfo_.type == vc::FilesystemType::NetworkMount)) {
+        config.recompress = vc::cache::makeVideoRecompressor(dsPtrs, videoCodecType_, videoCodecQP_);
     }
 
     return std::make_unique<vc::cache::TieredChunkCache>(
@@ -466,6 +467,18 @@ void Volume::setDiskStore(std::shared_ptr<vc::cache::DiskStore> store)
 void Volume::setDiskCacheMaxBytes(size_t bytes)
 {
     diskCacheMaxBytes_ = bytes;
+}
+
+void Volume::setVideoRecompression(bool enabled, int codecType, int qp)
+{
+    videoRecompressEnabled_ = enabled;
+    videoCodecType_ = codecType;
+    videoCodecQP_ = qp;
+}
+
+void Volume::setIOThreads(int count)
+{
+    ioThreads_ = count;
 }
 
 // ============================================================================
@@ -754,93 +767,17 @@ void Volume::pinCoarsestLevel(bool blocking)
 
 void Volume::computeDataBounds()
 {
-    ensureTieredCache();
-    if (!tieredCache_ || zarrDs_.empty()) return;
-
-    int coarsest = static_cast<int>(zarrDs_.size()) - 1;
-    auto levelShape = tieredCache_->levelShape(coarsest);   // {z, y, x}
-    auto chunkShape = tieredCache_->chunkShape(coarsest);   // {z, y, x}
-
-    int gridZ = (levelShape[0] + chunkShape[0] - 1) / chunkShape[0];
-    int gridY = (levelShape[1] + chunkShape[1] - 1) / chunkShape[1];
-    int gridX = (levelShape[2] + chunkShape[2] - 1) / chunkShape[2];
-
-    // Track min/max in coarsest-level voxel coordinates
-    int cMinX = std::numeric_limits<int>::max();
-    int cMinY = std::numeric_limits<int>::max();
-    int cMinZ = std::numeric_limits<int>::max();
-    int cMaxX = std::numeric_limits<int>::lowest();
-    int cMaxY = std::numeric_limits<int>::lowest();
-    int cMaxZ = std::numeric_limits<int>::lowest();
-    bool found = false;
-
-    for (int iz = 0; iz < gridZ; iz++) {
-        for (int iy = 0; iy < gridY; iy++) {
-            for (int ix = 0; ix < gridX; ix++) {
-                auto chunk = tieredCache_->get(
-                    vc::cache::ChunkKey{coarsest, iz, iy, ix});
-                if (!chunk) continue;  // nullptr = missing/all-zeros
-
-                const int cz = chunkShape[0];
-                const int cy = chunkShape[1];
-                const int cx = chunkShape[2];
-                const int strideZ = chunk->strideZ();
-                const int strideY = chunk->strideY();
-
-                // Clamp to actual level shape (edge chunks may be padded)
-                int maxLz = std::min(cz, levelShape[0] - iz * cz);
-                int maxLy = std::min(cy, levelShape[1] - iy * cy);
-                int maxLx = std::min(cx, levelShape[2] - ix * cx);
-
-                auto scanChunkVoxels = [&](const auto* ptr) {
-                    for (int lz = 0; lz < maxLz; lz++) {
-                        for (int ly = 0; ly < maxLy; ly++) {
-                            for (int lx = 0; lx < maxLx; lx++) {
-                                if (ptr[lz * strideZ + ly * strideY + lx] != 0) {
-                                    int gx = ix * cx + lx;
-                                    int gy = iy * cy + ly;
-                                    int gz = iz * cz + lz;
-                                    cMinX = std::min(cMinX, gx);
-                                    cMaxX = std::max(cMaxX, gx);
-                                    cMinY = std::min(cMinY, gy);
-                                    cMaxY = std::max(cMaxY, gy);
-                                    cMinZ = std::min(cMinZ, gz);
-                                    cMaxZ = std::max(cMaxZ, gz);
-                                    found = true;
-                                }
-                            }
-                        }
-                    }
-                };
-
-                if (chunk->elementSize == 2) {
-                    scanChunkVoxels(chunk->data<uint16_t>());
-                } else {
-                    scanChunkVoxels(chunk->data<uint8_t>());
-                }
-            }
-        }
-    }
-
-    if (!found) {
-        fprintf(stderr, "[Volume] dataBounds: no non-zero data found\n");
-        return;
-    }
-
-    // Scale back to level-0 coordinates.
-    // Dilate by 1 coarsest-level voxel on each side — downsampling can
-    // average boundary voxels to zero even when the full-resolution data
-    // is non-zero there.
-    int scaleFactor = 1 << coarsest;
-    dataBounds_.minX = std::max(0, cMinX - 1) * scaleFactor;
-    dataBounds_.minY = std::max(0, cMinY - 1) * scaleFactor;
-    dataBounds_.minZ = std::max(0, cMinZ - 1) * scaleFactor;
-    dataBounds_.maxX = std::min((cMaxX + 2) * scaleFactor - 1, _width - 1);
-    dataBounds_.maxY = std::min((cMaxY + 2) * scaleFactor - 1, _height - 1);
-    dataBounds_.maxZ = std::min((cMaxZ + 2) * scaleFactor - 1, _slices - 1);
+    // Set bounds to the full volume shape — no scanning needed.
+    dataBounds_.minX = 0;
+    dataBounds_.maxX = _width - 1;
+    dataBounds_.minY = 0;
+    dataBounds_.maxY = _height - 1;
+    dataBounds_.minZ = 0;
+    dataBounds_.maxZ = _slices - 1;
     dataBounds_.valid = true;
 
-    // Push to cache so ChunkSampler can skip chunks in zero-padded regions
+    // Push to cache so ChunkSampler can skip chunks outside bounds
+    ensureTieredCache();
     if (tieredCache_) {
         tieredCache_->setDataBounds(
             dataBounds_.minX, dataBounds_.maxX,
@@ -848,12 +785,10 @@ void Volume::computeDataBounds()
             dataBounds_.minZ, dataBounds_.maxZ);
     }
 
-    fprintf(stderr, "[Volume] dataBounds: x=[%d, %d] y=[%d, %d] z=[%d, %d] "
-                    "(from level %d, scale %dx)\n",
+    fprintf(stderr, "[Volume] dataBounds: x=[%d, %d] y=[%d, %d] z=[%d, %d] (full volume shape)\n",
             dataBounds_.minX, dataBounds_.maxX,
             dataBounds_.minY, dataBounds_.maxY,
-            dataBounds_.minZ, dataBounds_.maxZ,
-            coarsest, scaleFactor);
+            dataBounds_.minZ, dataBounds_.maxZ);
 }
 
 const Volume::DataBounds& Volume::dataBounds() const
@@ -862,13 +797,80 @@ const Volume::DataBounds& Volume::dataBounds() const
         std::lock_guard<std::mutex> lock(boundsMutex_);
         if (!boundsComputed_.load(std::memory_order_relaxed)) {
             const_cast<Volume*>(this)->computeDataBounds();
-            if (dataBounds_.valid) {
-                boundsComputed_.store(true, std::memory_order_release);
-            }
-            // If invalid, don't set flag — future calls will retry
+            boundsComputed_.store(true, std::memory_order_release);
         }
     }
     return dataBounds_;
+}
+
+bool Volume::needsRemoteLevel5Prime() const
+{
+    if (!isRemote_) return false;
+    if (zarrDs_.size() < 6) return false;  // need at least levels 0-5
+
+    {
+        std::lock_guard lock(remoteLevel5PrimeMutex_);
+        if (remoteLevel5PrimeStarted_ || remoteLevel5PrimeDone_) return false;
+    }
+
+    // Check if level 5 is already fully cached locally
+    const_cast<Volume*>(this)->ensureTieredCache();
+    if (!tieredCache_) return false;
+
+    auto levelShape = tieredCache_->levelShape(5);
+    auto chunkShape = tieredCache_->chunkShape(5);
+    int gridZ = (levelShape[0] + chunkShape[0] - 1) / chunkShape[0];
+    int gridY = (levelShape[1] + chunkShape[1] - 1) / chunkShape[1];
+    int gridX = (levelShape[2] + chunkShape[2] - 1) / chunkShape[2];
+
+    return !tieredCache_->areAllCachedInRegion(5, 0, 0, 0,
+                                                gridZ - 1, gridY - 1, gridX - 1);
+}
+
+void Volume::primeRemoteLevel5Blocking(
+    std::function<void(size_t completed, size_t total)> progressCb)
+{
+    {
+        std::lock_guard lock(remoteLevel5PrimeMutex_);
+        if (remoteLevel5PrimeDone_) return;
+        remoteLevel5PrimeStarted_ = true;
+    }
+
+    ensureTieredCache();
+    if (!tieredCache_ || zarrDs_.size() < 6) {
+        std::lock_guard lock(remoteLevel5PrimeMutex_);
+        remoteLevel5PrimeDone_ = true;
+        return;
+    }
+
+    auto levelShape = tieredCache_->levelShape(5);
+    auto chunkShape = tieredCache_->chunkShape(5);
+    int gridZ = (levelShape[0] + chunkShape[0] - 1) / chunkShape[0];
+    int gridY = (levelShape[1] + chunkShape[1] - 1) / chunkShape[1];
+    int gridX = (levelShape[2] + chunkShape[2] - 1) / chunkShape[2];
+    size_t total = static_cast<size_t>(gridZ) * gridY * gridX;
+    size_t completed = 0;
+
+    try {
+        for (int iz = 0; iz < gridZ; iz++) {
+            for (int iy = 0; iy < gridY; iy++) {
+                for (int ix = 0; ix < gridX; ix++) {
+                    tieredCache_->getBlocking(vc::cache::ChunkKey{5, iz, iy, ix});
+                    completed++;
+                    if (progressCb)
+                        progressCb(completed, total);
+                }
+            }
+        }
+        tieredCache_->flushPersistentState();
+    } catch (...) {
+        std::lock_guard lock(remoteLevel5PrimeMutex_);
+        remoteLevel5PrimeStarted_ = false;
+        throw;
+    }
+
+    std::lock_guard lock(remoteLevel5PrimeMutex_);
+    remoteLevel5PrimeDone_ = true;
 }
 
 // ============================================================================
@@ -993,6 +995,103 @@ void Volume::prefetchChunks(const cv::Mat_<cv::Vec3f>& coords, int level)
     tieredCache_->prefetchRegion(level,
         bb.minIz, bb.minIy, bb.minIx,
         bb.maxIz, bb.maxIy, bb.maxIx);
+}
+
+void Volume::prefetchLevels(int fromLevel, int toLevel)
+{
+    // Only allow one prefetch to run per volume
+    bool expected = false;
+    if (!prefetchStarted_.compare_exchange_strong(expected, true))
+        return;
+
+    ensureTieredCache();
+    if (!tieredCache_) return;
+
+    int maxLevel = tieredCache_->numLevels() - 1;
+    fromLevel = std::clamp(fromLevel, 0, maxLevel);
+    toLevel = std::clamp(toLevel, 0, maxLevel);
+
+    // Use data bounds to limit prefetch to non-empty region
+    const auto& db = dataBounds();
+    bool hasDataBounds = db.valid;
+    int dbMinX = db.minX, dbMaxX = db.maxX;
+    int dbMinY = db.minY, dbMaxY = db.maxY;
+    int dbMinZ = db.minZ, dbMaxZ = db.maxZ;
+
+    size_t diskBudget = diskCacheMaxBytes_;
+
+    // Spawn a background thread that feeds levels coarsest-first
+    std::thread([cache = tieredCache_.get(), fromLevel, toLevel, diskBudget,
+                 hasDataBounds, dbMinX, dbMaxX, dbMinY, dbMaxY, dbMinZ, dbMaxZ]() {
+        for (int lvl = toLevel; lvl >= fromLevel; lvl--) {
+            int iz0 = 0, iy0 = 0, ix0 = 0;
+            auto ls = cache->levelShape(lvl);
+            auto cs = cache->chunkShape(lvl);
+            int iz1 = (ls[0] + cs[0] - 1) / cs[0] - 1;
+            int iy1 = (ls[1] + cs[1] - 1) / cs[1] - 1;
+            int ix1 = (ls[2] + cs[2] - 1) / cs[2] - 1;
+
+            if (hasDataBounds) {
+                // Only prefetch chunks that overlap the data bounds
+                float scale = 1.0f / static_cast<float>(1 << lvl);
+                iz0 = std::max(0, static_cast<int>(dbMinZ * scale) / cs[0]);
+                iy0 = std::max(0, static_cast<int>(dbMinY * scale) / cs[1]);
+                ix0 = std::max(0, static_cast<int>(dbMinX * scale) / cs[2]);
+                iz1 = std::min(iz1, static_cast<int>(dbMaxZ * scale) / cs[0]);
+                iy1 = std::min(iy1, static_cast<int>(dbMaxY * scale) / cs[1]);
+                ix1 = std::min(ix1, static_cast<int>(dbMaxX * scale) / cs[2]);
+            }
+
+            int total = (iz1 - iz0 + 1) * (iy1 - iy0 + 1) * (ix1 - ix0 + 1);
+
+            // Estimate on-disk size using average compressed bytes per file.
+            // DiskStore tracks actual compressed file sizes, so this accounts
+            // for recompression.
+            auto stats = cache->stats();
+            size_t diskUsed = stats.diskBytes;
+            size_t avgBytesPerChunk = (stats.diskFiles > 0)
+                ? diskUsed / stats.diskFiles
+                : static_cast<size_t>(cs[0]) * cs[1] * cs[2];  // fallback: uncompressed
+            size_t estimatedBytes = static_cast<size_t>(total) * avgBytesPerChunk;
+            if (diskBudget > 0 && diskUsed + estimatedBytes > diskBudget) {
+                double estGB = estimatedBytes / (1024.0 * 1024.0 * 1024.0);
+                double budgetGB = diskBudget / (1024.0 * 1024.0 * 1024.0);
+                double usedGB = diskUsed / (1024.0 * 1024.0 * 1024.0);
+                std::fprintf(stderr,
+                    "[Volume] Skipping level %d prefetch: %d chunks (~%.1f GB) "
+                    "would exceed disk budget (%.1f/%.1f GB used)\n",
+                    lvl, total, estGB, usedGB, budgetGB);
+                continue;
+            }
+
+            double estGB = estimatedBytes / (1024.0 * 1024.0 * 1024.0);
+            std::fprintf(stderr, "[Volume] Prefetching level %d (%d chunks, ~%.1f GB)...\n",
+                         lvl, total, estGB);
+
+            // Drip-feed: submit one z-slab at a time, waiting for the queue
+            // to drain between slabs so we don't overwhelm the IO pool.
+            int submitted = 0;
+            int slabSize = (iy1 - iy0 + 1) * (ix1 - ix0 + 1);
+
+            for (int iz = iz0; iz <= iz1; iz++) {
+                cache->prefetchRegion(lvl, iz, iy0, ix0, iz, iy1, ix1);
+                submitted += slabSize;
+
+                if (submitted % 5000 < slabSize)
+                    std::fprintf(stderr, "[Volume] Level %d prefetch: %d/%d\n",
+                                 lvl, submitted, total);
+
+                // Wait for queue to drain before submitting more
+                while (cache->stats().ioPending > 10000) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            }
+            std::fprintf(stderr, "[Volume] Level %d prefetch: %d/%d done\n",
+                         lvl, submitted, total);
+        }
+        std::fprintf(stderr, "[Volume] Level prefetch complete (levels %d-%d)\n",
+                     fromLevel, toLevel);
+    }).detach();
 }
 
 void Volume::cancelPendingPrefetch()

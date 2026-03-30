@@ -33,6 +33,7 @@ class QGraphicsScene;
 class QGraphicsItem;
 class QGraphicsPixmapItem;
 class QLabel;
+class QTimer;
 struct POI;
 class CState;
 class ViewerManager;
@@ -65,6 +66,7 @@ public:
     void invalidateIntersect(const std::string& name = "");
 
     // --- Accessors ---
+    TileScene* tileScene() const { return _tileScene; }
     std::string surfName() const { return _surfName; }
     std::shared_ptr<Volume> currentVolume() const { return _volume; }
     vc::cache::TieredChunkCache* chunkCachePtr() const override {
@@ -174,6 +176,8 @@ public:
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const;
     // Scene-to-volume coordinate conversion (returns position + normal)
     bool sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n, const QPointF& scenePos) const;
+    // Transform from canvas scene coordinates to surface parameter coordinates
+    cv::Vec2f sceneToSurfaceCoords(const QPointF& scenePos) const;
     QPointF lastScenePosition() const { return _lastScenePos; }
 
     // --- BBox tool ---
@@ -261,6 +265,12 @@ private:
 
     // Recompute dynamic minimum scale so content never appears smaller than viewport
     void updateContentMinScale();
+
+    // Temporarily lower render quality during active interaction, then
+    // restore full quality after a short idle period.
+    void beginInteractionRender();
+    void settleInteractionRender();
+    bool interactionRenderActive() const;
 
     // Returns true for axis-aligned viewer slots (xy/xz/yz plane, seg xz/yz)
     bool isAxisAlignedView() const;
@@ -357,6 +367,8 @@ private:
     int _surfacePatchSamplingStride = 1;
     std::set<std::string> _intersectTgts = {"visible_segmentation"};
     std::unordered_set<std::string> _highlightedSurfaceIds;
+    std::unordered_map<std::string, size_t> _surfaceColorAssignments;
+    size_t _nextColorIndex = 0;
 
     // --- Interaction state ---
     uint64_t _highlightedPointId = 0;
@@ -397,8 +409,9 @@ private:
     // --- Status ---
     QLabel* _lbl = nullptr;
     bool _dirtyWhileMinimized = false;
-    std::chrono::steady_clock::time_point _lastStatusUpdate;  // debounce status label
     bool _overlayUpdatePending = false;  // coalescing flag for scheduleOverlayUpdate()
+    bool _interactionQualityActive = false;
+    QTimer* _interactionSettleTimer = nullptr;
 
     // --- Zoom limits ---
     float _contentMinScale = TiledViewerCamera::MIN_SCALE;  // dynamic minimum so content fills viewport
@@ -411,6 +424,10 @@ private:
     // --- Chunk-ready listener tracking ---
     vc::cache::TieredChunkCache::ChunkReadyCallbackId _chunkCbId = 0;
     bool _hadValidDataBounds = false;
+
+    // --- Focus marker position (in surface coords) ---
+    // Tracks where the focus point is on the surface, independent of camera pan.
+    float _focusSurfacePos[2] = {0.0f, 0.0f};
 
     // --- Pan tracking ---
     // For tiled viewer, panning is tracked via delta signals from the view

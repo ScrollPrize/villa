@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -527,16 +528,27 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     impl_->surfaceRecords.clear();
     impl_->patchCount = 0;
 
-    // Skip surfaces whose TIFF data hasn't been loaded yet.
-    // They'll be added incrementally via addSurface() when loaded.
+    // Eagerly load any surfaces whose TIFF data hasn't been loaded yet.
+    // This is safe because rebuild() typically runs on a background thread.
     std::vector<SurfacePtr> loaded;
     loaded.reserve(surfaces.size());
     for (const auto& s : surfaces) {
-        if (s && s->isLoaded()) {
+        if (!s) {
+            continue;
+        }
+        if (!s->isLoaded()) {
+            std::cout << "[SurfacePatchIndex] Loading surface: " << s->id << std::endl;
+            s->rawPointsPtr();  // triggers ensureLoaded()
+        }
+        if (s->isLoaded()) {
             loaded.push_back(s);
+            std::cout << "[SurfacePatchIndex] Indexed surface: " << s->id << std::endl;
+        } else {
+            std::cout << "[SurfacePatchIndex] Failed to load surface: " << s->id << std::endl;
         }
     }
     const size_t surfaceCount = loaded.size();
+    std::cout << "[SurfacePatchIndex] rebuild: " << surfaceCount << " of " << surfaces.size() << " surfaces loaded" << std::endl;
     if (surfaceCount == 0) {
         impl_->tree.reset();
         impl_->samplingStride = std::max(1, impl_->samplingStride);

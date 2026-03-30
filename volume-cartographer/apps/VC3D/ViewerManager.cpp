@@ -22,6 +22,7 @@
 #include <QLoggingCategory>
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <optional>
 #include <unordered_set>
 #include <nlohmann/json.hpp>
@@ -56,6 +57,7 @@ ViewerManager::ViewerManager(CState* state,
     _surfacePatchSamplingStride = std::max(1, storedSampling);
     const float storedThickness = settings.value(viewer::INTERSECTION_THICKNESS, viewer::INTERSECTION_THICKNESS_DEFAULT).toFloat();
     _intersectionThickness = std::max(0.0f, storedThickness);
+    _intersectionMaxSurfaces = std::max(0, settings.value(viewer::INTERSECTION_MAX_SURFACES, viewer::INTERSECTION_MAX_SURFACES_DEFAULT).toInt());
 
     _surfacePatchIndexWatcher =
         new QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>(this);
@@ -354,6 +356,18 @@ void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated
     emit samplingStrideChanged(_surfacePatchSamplingStride);
 }
 
+void ViewerManager::setIntersectionMaxSurfaces(int limit)
+{
+    limit = std::max(0, limit);
+    if (_intersectionMaxSurfaces == limit) {
+        return;
+    }
+    _intersectionMaxSurfaces = limit;
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(vc3d::settings::viewer::INTERSECTION_MAX_SURFACES, limit);
+}
+
 SurfacePatchIndex* ViewerManager::surfacePatchIndex()
 {
     rebuildSurfacePatchIndexIfNeeded();
@@ -447,6 +461,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         return;
     }
     auto allSurfaces = _state->surfaces();
+    std::cout << "[ViewerManager] primeSurfacePatchIndicesAsync: " << allSurfaces.size() << " surfaces in CState" << std::endl;
     std::vector<SurfacePatchIndex::SurfacePtr> quadSurfaces;
     std::vector<std::string> surfaceIds;
     quadSurfaces.reserve(allSurfaces.size());
@@ -462,8 +477,16 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
             }
         }
     }
+    // Apply max surfaces limit
+    if (_intersectionMaxSurfaces > 0 && quadSurfaces.size() > static_cast<size_t>(_intersectionMaxSurfaces)) {
+        std::cout << "[ViewerManager] Limiting intersection surfaces from " << quadSurfaces.size() << " to " << _intersectionMaxSurfaces << std::endl;
+        quadSurfaces.resize(_intersectionMaxSurfaces);
+        surfaceIds.resize(_intersectionMaxSurfaces);
+    }
     _pendingSurfacePatchIndexSurfaceIds = surfaceIds;
+    std::cout << "[ViewerManager] primeSurfacePatchIndicesAsync: " << quadSurfaces.size() << " QuadSurfaces to index" << std::endl;
     if (quadSurfaces.empty()) {
+        std::cout << "[ViewerManager] primeSurfacePatchIndicesAsync: no QuadSurfaces, aborting" << std::endl;
         _surfacePatchIndex.clear();
         _indexedSurfaceIds.clear();
         _surfacePatchIndexNeedsRebuild = false;
@@ -477,17 +500,28 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     if (!_surfacePatchStrideUserSet) {
         int defaultStride;
         if (surfaceCount > 2500) {
-            // > 2500: build at 8x initially, then refine to 4x
+            // > 2500: build at 32x initially, then refine to 16x
+            defaultStride = 32;
+            _targetRefinedStride = 16;
+        } else if (surfaceCount >= 500) {
+            // 500-2500: build at 16x initially, then refine to 8x
+            defaultStride = 16;
+            _targetRefinedStride = 8;
+        } else if (surfaceCount >= 100) {
+            // 100-499: build at 8x initially, then refine to 4x
             defaultStride = 8;
             _targetRefinedStride = 4;
-        } else if (surfaceCount >= 500) {
-            // 500-2500: build at 4x initially, then refine to 2x
+        } else if (surfaceCount >= 30) {
+            // 30-99: build at 4x initially, then refine to 2x
             defaultStride = 4;
             _targetRefinedStride = 2;
         } else {
-            // < 500: build at 1x (full resolution), no progressive loading
-            defaultStride = 1;
+            // < 30: build at 2x initially, then refine to 1x
+            defaultStride = 2;
+            _targetRefinedStride = 1;
         }
+        std::cout << "[ViewerManager] Auto stride: " << defaultStride << "x for " << surfaceCount << " surfaces"
+                  << " (refine to " << _targetRefinedStride << "x)" << std::endl;
         setSurfacePatchSamplingStride(defaultStride, false);
     }
 
@@ -557,9 +591,11 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     }
     auto result = _surfacePatchIndexWatcher->future().result();
     if (!result) {
+        std::cout << "[ViewerManager] handleSurfacePatchIndexPrimeFinished: null result" << std::endl;
         _pendingSurfacePatchIndexSurfaceIds.clear();
         return;
     }
+    std::cout << "[ViewerManager] handleSurfacePatchIndexPrimeFinished: index built, dispatching renderIntersections" << std::endl;
     _surfacePatchIndex = std::move(*result);
     _surfacePatchIndexNeedsRebuild = false;
     _indexedSurfaceIds.clear();

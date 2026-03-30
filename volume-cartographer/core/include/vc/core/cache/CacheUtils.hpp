@@ -22,7 +22,11 @@ namespace vc::cache {
 [[nodiscard]] inline std::optional<std::vector<uint8_t>> readFileToVector(
     const std::filesystem::path& path)
 {
+#ifdef O_NOATIME
     int fd = ::open(path.c_str(), O_RDONLY | O_NOATIME);
+#else
+    int fd = ::open(path.c_str(), O_RDONLY);
+#endif
     if (fd < 0) {
         fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) return std::nullopt;
