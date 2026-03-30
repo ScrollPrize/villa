@@ -1604,7 +1604,7 @@ export function Landing() {
         <title>Vesuvius Challenge</title>
         <meta
           name="description"
-          content="A $1,500,000+ machine learning and computer vision competition"
+          content="A $1,700,000+ machine learning and computer vision competition"
         />
         <link rel="canonical" href={canonicalUrl} />
         {/* Preload the LCP poster image */}
@@ -1613,13 +1613,13 @@ export function Landing() {
         <meta property="og:type" content="website" />
         <meta property="og:url" content={siteUrl} />
         <meta property="og:title" content="Vesuvius Challenge" />
-        <meta property="og:description" content="A $1,500,000+ machine learning and computer vision competition" />
+        <meta property="og:description" content="A $1,700,000+ machine learning and computer vision competition" />
         <meta property="og:image" content={siteUrl + "img/social/opengraph.jpg"} />
         <meta property="og:image:width" content="1200" />
         <meta property="og:image:height" content="630" />
         <meta name="twitter:card" content="summary_large_image" />
         <meta name="twitter:title" content="Vesuvius Challenge" />
-        <meta name="twitter:description" content="A $1,500,000+ machine learning and computer vision competition" />
+        <meta name="twitter:description" content="A $1,700,000+ machine learning and computer vision competition" />
         <meta name="twitter:image" content={siteUrl + "img/social/opengraph.jpg"} />
         {/* JSON-LD */}
         <script type="application/ld+json"
@@ -1673,7 +1673,7 @@ export function Landing() {
                     <a href="/grandprize">reading</a>&nbsp;
                   </span>
                   <span className="opacity-80 md:opacity-60">
-                    the carbonized Herculaneum scrolls & has awarded $1,500,000 in prizes.
+                    the carbonized Herculaneum scrolls & has awarded $1,700,000 in prizes.
                   </span>
                   <br />
                   <br />

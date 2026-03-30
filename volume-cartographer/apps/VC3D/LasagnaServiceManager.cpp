@@ -22,7 +22,7 @@
 #endif
 
 // Avahi client library for mDNS service discovery
-#ifdef Q_OS_LINUX
+#if defined(Q_OS_LINUX) && defined(VC_HAVE_AVAHI) && VC_HAVE_AVAHI
 #include <avahi-client/client.h>
 #include <avahi-client/lookup.h>
 #include <avahi-common/error.h>
@@ -613,7 +613,7 @@ QJsonArray LasagnaServiceManager::discoverServices()
     }
 
     // --- mDNS discovery via avahi-client library ---
-#ifdef Q_OS_LINUX
+#if defined(Q_OS_LINUX) && defined(VC_HAVE_AVAHI) && VC_HAVE_AVAHI
     {
         struct AvahiDiscovery {
             QJsonArray* result;
@@ -729,6 +729,9 @@ QJsonArray LasagnaServiceManager::discoverServices()
             avahi_simple_poll_free(poll);
         }
     }
+#elif defined(Q_OS_LINUX)
+    std::cerr << "[lasagna] avahi-client headers not available; skipping mDNS discovery"
+              << std::endl;
 #endif
 
     return result;

@@ -215,7 +215,7 @@ def preprocess_layers(
     is_reverse_segment: bool = False,
     start_z: Optional[int] = None,
     end_z: Optional[int] = None
-) -> Tuple[LayersSource, np.ndarray, Tuple[int, int], bool]:
+) -> Tuple[LayersSource, Optional[np.ndarray], Tuple[int, int], bool]:
     """
     Prepare layers for streaming inference.
 
@@ -227,7 +227,7 @@ def preprocess_layers(
         end_z: Optional ending z-layer index (exclusive)
 
     Returns:
-        (source, mask, orig_shape, reverse_flag)
+        (source, mask_or_None, orig_shape, reverse_flag)
     """
     try:
         src = LayersSource(layers, start_z=start_z, end_z=end_z)
@@ -235,10 +235,8 @@ def preprocess_layers(
         if c != CFG.in_chans:
             logger.warning(f"Model expects {CFG.in_chans} channels, got {c}")
 
-        if fragment_mask is None:
-            fragment_mask = np.ones((h, w), dtype=np.uint8) * 255
-
-        logger.info(f"Prepared layers source: shape={src.shape}, mask={fragment_mask.shape}, reverse={is_reverse_segment}")
+        mask_desc = f"{fragment_mask.shape}" if fragment_mask is not None else "None"
+        logger.info(f"Prepared layers source: shape={src.shape}, mask={mask_desc}, reverse={is_reverse_segment}")
         return src, fragment_mask, (h, w), bool(is_reverse_segment)
 
     except Exception as e:
@@ -282,7 +280,7 @@ class SlidingWindowDataset(Dataset):
 
 def create_inference_dataloader(
     source: LayersSource,
-    fragment_mask: np.ndarray,
+    fragment_mask: Optional[np.ndarray],
     reverse: bool
 ) -> Tuple[DataLoader, Tuple[int, int], Dict[str, int]]:
     """Return (loader, pred_shape=(H,W), partition_info)."""
@@ -292,17 +290,26 @@ def create_inference_dataloader(
         x1_list = _grid_1d(w, CFG.tile_size, CFG.stride)
         y1_list = _grid_1d(h, CFG.tile_size, CFG.stride)
 
-        xyxys: List[List[int]] = []
-        for y1 in y1_list:
-            for x1 in x1_list:
-                y2, x2 = y1 + CFG.tile_size, x1 + CFG.tile_size
-                # compute valid ratio inside bounds
-                yy1, yy2 = max(0, y1), min(h, y2)
-                xx1, xx2 = max(0, x1), min(w, x2)
-                roi = fragment_mask[yy1:yy2, xx1:xx2]
-                valid_ratio = float(roi.size and (roi != 0).mean() or 0.0)
-                if valid_ratio >= CFG.min_valid_ratio:
-                    xyxys.append([x1, y1, x2, y2])
+        if fragment_mask is None or CFG.min_valid_ratio <= 0.0:
+            # No filtering needed: either no mask or threshold admits everything
+            xyxys = [[x1, y1, x1 + CFG.tile_size, y1 + CFG.tile_size]
+                     for y1 in y1_list for x1 in x1_list]
+        else:
+            # Use integral image for O(1) per-tile mask validity check
+            sat = np.zeros((h + 1, w + 1), dtype=np.float64)
+            sat[1:, 1:] = np.cumsum(np.cumsum((fragment_mask != 0).astype(np.float64), axis=0), axis=1)
+            min_valid = CFG.min_valid_ratio
+            xyxys: List[List[int]] = []
+            for y1 in y1_list:
+                for x1 in x1_list:
+                    y2, x2 = y1 + CFG.tile_size, x1 + CFG.tile_size
+                    yy1, yy2 = max(0, y1), min(h, y2)
+                    xx1, xx2 = max(0, x1), min(w, x2)
+                    area = (yy2 - yy1) * (xx2 - xx1)
+                    if area > 0:
+                        roi_sum = sat[yy2, xx2] - sat[yy1, xx2] - sat[yy2, xx1] + sat[yy1, xx1]
+                        if roi_sum / area >= min_valid:
+                            xyxys.append([x1, y1, x2, y2])
 
         if not xyxys:
             raise ValueError("No valid tiles (mask empty or fully filtered).")
@@ -340,8 +347,7 @@ def create_inference_dataloader(
         if CFG.tile_size != CFG.size:
             tfm_list.append(A.Resize(CFG.size, CFG.size))
         tfm_list += [
-            A.Normalize(mean=[0.0] * CFG.in_chans, std=[1.0] * CFG.in_chans,
-                        max_pixel_value=CFG.max_clip_value),
+            A.ToFloat(max_value=CFG.max_clip_value),
             ToTensorV2(),
         ]
         transform = A.Compose(tfm_list)
@@ -405,14 +411,22 @@ def predict_fn(
                         unit="tile",
                         **get_tqdm_kwargs())
 
+            # Only sync CUDA for per-phase timing when detailed profiling is enabled;
+            # in production this avoids ~20s of GPU pipeline stalls per run.
+            detailed_sync = (
+                device.type == "cuda"
+                and profiler is not None
+                and getattr(profiler, "detailed_enabled", False)
+            )
+
             for (images, xys) in test_loader:
                 batch_count += 1
                 tile_count += int(images.size(0))
-                with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=device.type == "cuda"):
+                with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=detailed_sync):
                     images = images.to(device, non_blocking=True)
 
                 amp_device = "cuda" if device.type == "cuda" else "cpu"
-                with scoped_timer(profiler, "forward_seconds", cuda_sync=device.type == "cuda"):
+                with scoped_timer(profiler, "forward_seconds", cuda_sync=detailed_sync):
                     with torch.autocast(device_type=amp_device, enabled=True):
                         y_preds = model.forward(images)  # Model-specific forward
                     y_preds = torch.sigmoid(y_preds)
@@ -442,7 +456,7 @@ def predict_fn(
 
                 y_weighted = (y_preds_resized * weight_tensor).squeeze(1)  # (B,th,tw)
 
-                with scoped_timer(profiler, "device_to_host_seconds", cuda_sync=device.type == "cuda"):
+                with scoped_timer(profiler, "device_to_host_seconds", cuda_sync=detailed_sync):
                     y_cpu = y_weighted.cpu().numpy()
                     w_cpu = weight_tensor.detach().cpu().numpy().astype(np.float32)
 

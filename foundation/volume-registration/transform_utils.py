@@ -6,6 +6,7 @@ from urllib.parse import urljoin, urlparse
 import jsonschema
 import numpy as np
 import requests
+from scipy.optimize import least_squares
 import SimpleITK as sitk
 import zarr
 
@@ -62,6 +63,28 @@ class Dimensions(NamedTuple):
     voxels_y: int
     voxels_z: int
     voxel_size_um: float
+
+
+class MeshInfo(NamedTuple):
+    """Basic mesh metadata in native XYZ source coordinates."""
+
+    vertex_count: int
+    polygon_count: int
+    bounds_min_xyz: tuple[float, float, float]
+    bounds_max_xyz: tuple[float, float, float]
+
+    @property
+    def center_xyz(self) -> tuple[float, float, float]:
+        return tuple(
+            (self.bounds_min_xyz[i] + self.bounds_max_xyz[i]) / 2.0 for i in range(3)
+        )
+
+
+class MeshGeometry(NamedTuple):
+    """Mesh geometry in native XYZ source coordinates."""
+
+    vertices_xyz: np.ndarray
+    faces: np.ndarray
 
 
 def sanity_check_zarr_store(store):
@@ -223,12 +246,9 @@ def invert_affine_matrix(matrix: np.ndarray) -> np.ndarray:
     return np.linalg.inv(matrix)
 
 
-def matrix_swap_xyz_zyx(matrix: np.ndarray) -> np.ndarray:
-    """
-    Swap a 4x4 affine transform matrix between neuroglancer (ZYX order) and SITK (XYZ order).
-    """
-    # Swap the first and third rows/columns
-    reorder_matrix = np.array(
+def get_swap_matrix() -> np.ndarray:
+    """Get the homogeneous matrix that swaps XYZ and ZYX coordinate orders."""
+    return np.array(
         [
             [0, 0, 1, 0],  # z -> x
             [0, 1, 0, 0],  # y -> y
@@ -237,15 +257,225 @@ def matrix_swap_xyz_zyx(matrix: np.ndarray) -> np.ndarray:
         ]
     )
 
-    # Apply the reordering
-    output_matrix = reorder_matrix @ matrix @ reorder_matrix.T
 
-    return output_matrix
+def matrix_swap_xyz_zyx(matrix: np.ndarray) -> np.ndarray:
+    """
+    Swap a 4x4 affine transform matrix between neuroglancer (ZYX order) and SITK (XYZ order).
+    """
+    reorder_matrix = get_swap_matrix()
+    return reorder_matrix @ matrix @ reorder_matrix.T
+
+
+def matrix_swap_output_xyz_zyx(matrix: np.ndarray) -> np.ndarray:
+    """
+    Swap only the output coordinate order of a 4x4 affine transform matrix.
+
+    This converts a matrix between:
+    - XYZ output space and ZYX output space
+    while leaving the input coordinate order unchanged.
+    """
+    return get_swap_matrix() @ matrix
 
 
 def points_swap_xyz_zyx(points: list) -> list:
     """Swap points between neuroglancer (ZYX order) and SITK (XYZ order)."""
     return [[point[2], point[1], point[0]] for point in points]
+
+
+def strip_vtk_url_prefix(path: str) -> str:
+    """Strip the vtk:// prefix from a Neuroglancer VTK mesh URL if present."""
+    if path.startswith("vtk://"):
+        return path[len("vtk://") :]
+    return path
+
+
+def _iter_text_lines(path: str):
+    """Yield lines from a local path or remote URL as Unicode strings."""
+    parsed = urlparse(path)
+    if parsed.scheme in ("http", "https"):
+        with requests.get(path, stream=True, timeout=30) as response:
+            response.raise_for_status()
+            response.encoding = response.encoding or "utf-8"
+            for line in response.iter_lines(decode_unicode=True):
+                if line is not None:
+                    yield line
+        return
+
+    with Path(path).open("r", encoding="utf-8") as f:
+        for line in f:
+            yield line.rstrip("\n")
+
+
+def _read_json_if_exists(path: str) -> Optional[dict]:
+    """Read a local or remote JSON document if it exists, otherwise return None."""
+    parsed = urlparse(path)
+    if parsed.scheme in ("http", "https"):
+        try:
+            response = requests.get(path, timeout=10)
+            if response.status_code != 200:
+                return None
+            return response.json()
+        except (requests.RequestException, json.JSONDecodeError):
+            return None
+
+    json_path = Path(path)
+    if not json_path.exists():
+        return None
+    with json_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _mesh_info_from_sidecar(path: str) -> Optional[MeshInfo]:
+    data = _read_json_if_exists(path)
+    if data is None:
+        return None
+
+    try:
+        return MeshInfo(
+            vertex_count=int(data["vertex_count"]),
+            polygon_count=int(data["polygon_count"]),
+            bounds_min_xyz=tuple(float(v) for v in data["bounds_min_xyz"]),
+            bounds_max_xyz=tuple(float(v) for v in data["bounds_max_xyz"]),
+        )
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"Invalid mesh sidecar metadata at {path}: {e}") from e
+
+
+def get_vtk_mesh_info(path: str) -> MeshInfo:
+    """Get mesh bounds and counts from an ASCII legacy VTK POLYDATA file."""
+    mesh_path = strip_vtk_url_prefix(path)
+    sidecar = _mesh_info_from_sidecar(mesh_path + ".json")
+    if sidecar is not None:
+        return sidecar
+
+    point_count = None
+    polygon_count = 0
+    mins = [np.inf, np.inf, np.inf]
+    maxs = [-np.inf, -np.inf, -np.inf]
+    remaining_coords = 0
+    buffered_numbers: list[float] = []
+
+    for raw_line in _iter_text_lines(mesh_path):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if remaining_coords > 0:
+            buffered_numbers.extend(float(value) for value in line.split())
+            while remaining_coords > 0 and len(buffered_numbers) >= 3:
+                x, y, z = buffered_numbers[:3]
+                del buffered_numbers[:3]
+                mins[0] = min(mins[0], x)
+                mins[1] = min(mins[1], y)
+                mins[2] = min(mins[2], z)
+                maxs[0] = max(maxs[0], x)
+                maxs[1] = max(maxs[1], y)
+                maxs[2] = max(maxs[2], z)
+                remaining_coords -= 3
+            continue
+
+        upper = line.upper()
+        if upper.startswith("POINTS "):
+            parts = line.split()
+            if len(parts) < 3:
+                raise ValueError(f"Malformed POINTS line in {mesh_path}: {line}")
+            point_count = int(parts[1])
+            remaining_coords = point_count * 3
+            continue
+
+        if upper.startswith("POLYGONS "):
+            parts = line.split()
+            if len(parts) < 3:
+                raise ValueError(f"Malformed POLYGONS line in {mesh_path}: {line}")
+            polygon_count = int(parts[1])
+
+    if point_count is None:
+        raise ValueError(f"No POINTS section found in {mesh_path}")
+    if remaining_coords != 0:
+        raise ValueError(f"Incomplete POINTS section in {mesh_path}")
+
+    return MeshInfo(
+        vertex_count=point_count,
+        polygon_count=polygon_count,
+        bounds_min_xyz=tuple(float(v) for v in mins),
+        bounds_max_xyz=tuple(float(v) for v in maxs),
+    )
+
+
+def read_vtk_mesh_geometry(path: str) -> MeshGeometry:
+    """Read geometry from an ASCII legacy VTK POLYDATA mesh."""
+    mesh_path = strip_vtk_url_prefix(path)
+    point_count = None
+    polygon_count = None
+    remaining_coords = 0
+    remaining_polygon_ints = 0
+    buffered_numbers: list[float] = []
+    buffered_ints: list[int] = []
+    vertices: list[list[float]] = []
+    faces: list[list[int]] = []
+
+    for raw_line in _iter_text_lines(mesh_path):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if remaining_coords > 0:
+            buffered_numbers.extend(float(value) for value in line.split())
+            while remaining_coords > 0 and len(buffered_numbers) >= 3:
+                vertices.append(buffered_numbers[:3])
+                del buffered_numbers[:3]
+                remaining_coords -= 3
+            continue
+
+        if remaining_polygon_ints > 0:
+            buffered_ints.extend(int(value) for value in line.split())
+            while remaining_polygon_ints > 0 and buffered_ints:
+                if len(buffered_ints) < 4:
+                    break
+                size = buffered_ints[0]
+                if size != 3:
+                    raise ValueError(
+                        f"Only triangular POLYGONS are supported in {mesh_path}, found polygon size {size}"
+                    )
+                faces.append(buffered_ints[1:4])
+                del buffered_ints[:4]
+                remaining_polygon_ints -= 4
+            continue
+
+        upper = line.upper()
+        if upper.startswith("POINTS "):
+            parts = line.split()
+            if len(parts) < 3:
+                raise ValueError(f"Malformed POINTS line in {mesh_path}: {line}")
+            point_count = int(parts[1])
+            remaining_coords = point_count * 3
+            continue
+
+        if upper.startswith("POLYGONS "):
+            parts = line.split()
+            if len(parts) < 3:
+                raise ValueError(f"Malformed POLYGONS line in {mesh_path}: {line}")
+            polygon_count = int(parts[1])
+            remaining_polygon_ints = int(parts[2])
+            continue
+
+    if point_count is None or polygon_count is None:
+        raise ValueError(f"Missing POINTS or POLYGONS section in {mesh_path}")
+    if remaining_coords != 0 or remaining_polygon_ints != 0:
+        raise ValueError(f"Incomplete geometry section in {mesh_path}")
+    if len(vertices) != point_count:
+        raise ValueError(
+            f"Expected {point_count} vertices in {mesh_path}, found {len(vertices)}"
+        )
+    if len(faces) != polygon_count:
+        raise ValueError(
+            f"Expected {polygon_count} polygons in {mesh_path}, found {len(faces)}"
+        )
+
+    return MeshGeometry(
+        vertices_xyz=np.asarray(vertices, dtype=np.float32),
+        faces=np.asarray(faces, dtype=np.int32),
+    )
 
 
 def fit_affine_transform_from_points(fixed_points, moving_points):
@@ -277,6 +507,83 @@ def fit_affine_transform_from_points(fixed_points, moving_points):
     transform_4x4 = np.vstack([transform_3x4, [0, 0, 0, 1]])
 
     return transform_4x4
+
+
+def fit_constrained_transform_from_points(fixed_points, moving_points):
+    """Fit a constrained affine transform from corresponding point pairs.
+
+    Fits 5 continuous parameters + 3 discrete sign choices:
+    - Isotropic scale s
+    - Rotation around z-axis (index 0 in ZYX) by angle theta
+    - Translation tx, ty, tz
+    - Independent axis flips: fz, fy, fx each ±1 (tries all 8 combinations)
+
+    The transform applies flip, then rotation, then scale, then translation.
+    The resulting 4x4 matrix in ZYX order is:
+        [fz*s    0               0              tz]
+        [0       fy*s*cos(θ)    -fx*s*sin(θ)    ty]
+        [0       fy*s*sin(θ)     fx*s*cos(θ)    tx]
+        [0       0               0               1]
+
+    Args:
+        fixed_points: List of points in fixed space (Nx3, ZYX order)
+        moving_points: List of points in moving space (Nx3, ZYX order)
+
+    Returns:
+        4x4 affine transformation matrix or None if insufficient points
+    """
+    if len(fixed_points) != len(moving_points) or len(fixed_points) < 3:
+        return None
+
+    fixed_array = np.array(fixed_points)
+    moving_array = np.array(moving_points)
+
+    def _build_matrix(params, flips):
+        s, theta, tx, ty, tz = params
+        fz, fy, fx = flips
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
+        return np.array([
+            [fz * s, 0,              0,             tz],
+            [0,      fy * s * cos_t, -fx * s * sin_t, ty],
+            [0,      fy * s * sin_t,  fx * s * cos_t, tx],
+            [0,      0,              0,              1],
+        ])
+
+    def _residuals(params, flips):
+        mat = _build_matrix(params, flips)
+        moving_h = np.column_stack([moving_array, np.ones(len(moving_array))])
+        predicted = (mat @ moving_h.T).T[:, :3]
+        return (predicted - fixed_array).ravel()
+
+    # Initial scale estimate
+    fixed_spread = np.linalg.norm(fixed_array - fixed_array.mean(axis=0), axis=1).mean()
+    moving_spread = np.linalg.norm(moving_array - moving_array.mean(axis=0), axis=1).mean()
+    s0 = fixed_spread / moving_spread if moving_spread > 0 else 1.0
+
+    fixed_centroid = fixed_array.mean(axis=0)  # [z, y, x]
+    moving_centroid = moving_array.mean(axis=0)
+
+    best_result = None
+    best_cost = np.inf
+    best_flips = (1, 1, 1)
+
+    for fz in [1, -1]:
+        for fy in [1, -1]:
+            for fx in [1, -1]:
+                flips = (fz, fy, fx)
+                # Initial translation: t = fixed_centroid - diag(fz,fy,fx)*s0 * moving_centroid
+                tz0 = fixed_centroid[0] - fz * s0 * moving_centroid[0]
+                ty0 = fixed_centroid[1] - fy * s0 * moving_centroid[1]
+                tx0 = fixed_centroid[2] - fx * s0 * moving_centroid[2]
+                init = [s0, 0.0, tx0, ty0, tz0]
+                result = least_squares(_residuals, init, args=(flips,))
+                if result.cost < best_cost:
+                    best_cost = result.cost
+                    best_result = result
+                    best_flips = flips
+
+    return _build_matrix(best_result.x, best_flips)
 
 
 def check_images_with_transform(

@@ -3,7 +3,7 @@ title: "Overview"
 hide_title: true
 slug: /
 hide_table_of_contents: true
-description: "A $1,500,000+ machine learning and computer vision competition"
+description: "A $1,700,000+ machine learning and computer vision competition"
 image: "/img/social/opengraph.jpg"
 ---
 
@@ -13,7 +13,7 @@ image: "/img/social/opengraph.jpg"
   <meta name="title" content="Vesuvius Challenge" />
   <meta
     name="description"
-    content="A $1,500,000+ machine learning and computer vision competition"
+    content="A $1,700,000+ machine learning and computer vision competition"
   />
 
   <meta property="og:type" content="website" />
@@ -21,7 +21,7 @@ image: "/img/social/opengraph.jpg"
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A $1,500,000+ machine learning and computer vision competition"
+    content="A $1,700,000+ machine learning and computer vision competition"
   />
   <meta
     property="og:image"
@@ -33,7 +33,7 @@ image: "/img/social/opengraph.jpg"
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A $1,500,000+ machine learning and computer vision competition"
+    content="A $1,700,000+ machine learning and computer vision competition"
   />
   <meta
     property="twitter:image"

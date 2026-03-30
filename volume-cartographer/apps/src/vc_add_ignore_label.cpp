@@ -53,7 +53,7 @@ constexpr double kDefaultAlpha = 0.005;
 constexpr double kDefaultShrink = 0.95;
 constexpr int kDefaultInnerSmoothing = 5;
 constexpr int kDefaultOuterSmoothing = 5;
-constexpr int kDefaultIgnoreValue = 127;
+constexpr int kDefaultIgnoreValue = 2;
 constexpr std::size_t kLockPoolSize = 4096;
 constexpr double kPi = 3.14159265358979323846264338327950288;
 constexpr double kRadPerDeg = kPi / 180.0;
@@ -697,6 +697,82 @@ static std::size_t linearIndex(const Shape3& shape,
                                std::size_t x)
 {
     return (z * shape[1] + y) * shape[2] + x;
+}
+
+static bool shouldDropIgnoreSparseChunk(const Shape3& datasetShape,
+                                        const Shape3& chunkShape,
+                                        const ChunkIndex& chunk,
+                                        const std::vector<uint8_t>& chunkBuf,
+                                        uint8_t ignoreValue)
+{
+    const Shape3 chunkOrigin = {
+        chunk.z * chunkShape[0],
+        chunk.y * chunkShape[1],
+        chunk.x * chunkShape[2],
+    };
+    const Shape3 validShape = {
+        chunkOrigin[0] < datasetShape[0] ? std::min(chunkShape[0], datasetShape[0] - chunkOrigin[0]) : 0,
+        chunkOrigin[1] < datasetShape[1] ? std::min(chunkShape[1], datasetShape[1] - chunkOrigin[1]) : 0,
+        chunkOrigin[2] < datasetShape[2] ? std::min(chunkShape[2], datasetShape[2] - chunkOrigin[2]) : 0,
+    };
+
+    const auto isUniformValid = [&](uint8_t value) {
+        if (validShape[0] == 0 || validShape[1] == 0 || validShape[2] == 0) {
+            return true;
+        }
+        for (std::size_t z = 0; z < validShape[0]; ++z) {
+            for (std::size_t y = 0; y < validShape[1]; ++y) {
+                const std::size_t rowBase = linearIndex(chunkShape, z, y, 0);
+                for (std::size_t x = 0; x < validShape[2]; ++x) {
+                    if (chunkBuf[rowBase + x] != value) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+
+    return isUniformValid(uint8_t(0)) || isUniformValid(ignoreValue);
+}
+
+static bool persistIgnoreSparseChunk(vc::VcDataset& dataset,
+                                     const ChunkIndex& chunk,
+                                     const std::vector<uint8_t>& chunkBuf,
+                                     uint8_t ignoreValue,
+                                     ProfileStats* profile = nullptr,
+                                     bool pyramidWrite = false)
+{
+    const Shape3 datasetShape = toShape3(dataset.shape());
+    const Shape3 chunkShape = toShape3(dataset.defaultChunkShape());
+    auto writeStart = std::chrono::steady_clock::now();
+    const bool dropChunk =
+        shouldDropIgnoreSparseChunk(datasetShape, chunkShape, chunk, chunkBuf, ignoreValue);
+    bool changed = false;
+    if (dropChunk) {
+        changed = dataset.removeChunk(chunk.z, chunk.y, chunk.x);
+    } else {
+        dataset.writeChunk(chunk.z,
+                           chunk.y,
+                           chunk.x,
+                           chunkBuf.data(),
+                           chunkBuf.size() * sizeof(uint8_t));
+        changed = true;
+    }
+
+    if (profile) {
+        auto writeEnd = std::chrono::steady_clock::now();
+        if (pyramidWrite) {
+            profile->tPyramidWrite.add(std::chrono::duration<double>(writeEnd - writeStart).count());
+        } else {
+            profile->tChunkWriteIo.add(std::chrono::duration<double>(writeEnd - writeStart).count());
+            ++profile->chunkIoWrites;
+        }
+        if (!dropChunk) {
+            profile->bytesWritten += chunkBuf.size() * sizeof(uint8_t);
+        }
+    }
+    return changed;
 }
 
 static bool boxIntersectsZRange(const Box3& box, int zStart, int zStop)
@@ -1382,7 +1458,7 @@ static void applyMaskToOutputZRangeLegacy(
                 std::lock_guard<std::mutex> guard(lockPool.lockFor(cz, cy, cx));
                 auto ioStart = std::chrono::steady_clock::now();
                 chunkBuf.assign(chunkElems, 0);
-                output.readChunk(cz, cy, cx, chunkBuf.data());
+                output.readChunkOrFill(cz, cy, cx, chunkBuf.data());
                 if (profile) {
                     auto ioEnd = std::chrono::steady_clock::now();
                     profile->tChunkReadIo.add(
@@ -1415,16 +1491,9 @@ static void applyMaskToOutputZRangeLegacy(
                 }
 
                 if (changed) {
-                    auto ioWriteStart = std::chrono::steady_clock::now();
-                    output.writeChunk(cz, cy, cx, chunkBuf.data(), chunkBytes);
-                    if (profile) {
-                        auto ioWriteEnd = std::chrono::steady_clock::now();
-                        profile->tChunkWriteIo.add(
-                            std::chrono::duration<double>(ioWriteEnd - ioWriteStart).count());
-                        ++profile->chunkIoWrites;
-                        profile->bytesWritten += chunkBytes;
+                    if (persistIgnoreSparseChunk(output, chunk, chunkBuf, ignoreValue, profile)) {
+                        touchedLevel0.insert(chunk);
                     }
-                    touchedLevel0.insert(chunk);
                 }
             }
         }
@@ -1500,7 +1569,7 @@ static void applyMaskToOutputZRangeMapped(
                 std::lock_guard<std::mutex> guard(lockPool.lockFor(cz, cy, cx));
                 auto ioStart = std::chrono::steady_clock::now();
                 chunkBuf.assign(chunkElems, 0);
-                output.readChunk(cz, cy, cx, chunkBuf.data());
+                output.readChunkOrFill(cz, cy, cx, chunkBuf.data());
                 if (profile) {
                     auto ioEnd = std::chrono::steady_clock::now();
                     profile->tChunkReadIo.add(std::chrono::duration<double>(ioEnd - ioStart).count());
@@ -1535,16 +1604,9 @@ static void applyMaskToOutputZRangeMapped(
                 }
 
                 if (changed) {
-                    auto ioWriteStart = std::chrono::steady_clock::now();
-                    output.writeChunk(cz, cy, cx, chunkBuf.data(), chunkBytes);
-                    if (profile) {
-                        auto ioWriteEnd = std::chrono::steady_clock::now();
-                        profile->tChunkWriteIo.add(
-                            std::chrono::duration<double>(ioWriteEnd - ioWriteStart).count());
-                        ++profile->chunkIoWrites;
-                        profile->bytesWritten += chunkBytes;
+                    if (persistIgnoreSparseChunk(output, chunk, chunkBuf, ignoreValue, profile)) {
+                        touchedLevel0.insert(chunk);
                     }
-                    touchedLevel0.insert(chunk);
                 }
             }
         }
@@ -1862,6 +1924,18 @@ static void copyRootMetadata(const fs::path& inputRoot,
     }
 }
 
+static void rewriteOutputFillValue(const fs::path& outputRoot,
+                                   const std::vector<int>& levels,
+                                   uint8_t fillValue)
+{
+    for (int level : levels) {
+        const fs::path zarrayPath = outputRoot / std::to_string(level) / ".zarray";
+        nlohmann::json zarray = readJsonFile(zarrayPath);
+        zarray["fill_value"] = static_cast<int>(fillValue);
+        writeJsonFile(zarrayPath, zarray);
+    }
+}
+
 static void copyLevelFromExisting(const fs::path& inputLevelPath,
                                   const fs::path& outputLevelPath,
                                   const std::unordered_set<ChunkIndex, ChunkIndexHash>& existingChunks,
@@ -2067,9 +2141,7 @@ static bool readAlignedSourceRegionByChunk(vc::VcDataset& src,
                     for (std::size_t xc = xChunkStart; xc < xChunkStart + xChunks; ++xc) {
                         const std::size_t dstX = (xc - xChunkStart) * srcChunk[2];
                         try {
-                            if (!src.readChunk(zc, yc, xc, chunkBuf.data())) {
-                                std::fill(chunkBuf.begin(), chunkBuf.end(), uint8_t(0));
-                            }
+                            src.readChunkOrFill(zc, yc, xc, chunkBuf.data());
                         } catch (...) {
                             return false;
                         }
@@ -2087,6 +2159,146 @@ static bool readAlignedSourceRegionByChunk(vc::VcDataset& src,
     }
 
     return true;
+}
+
+static std::vector<ChunkIndex> clearLevel0OutsideZRange(
+    vc::VcDataset& output,
+    const Shape3& outShape,
+    const Shape3& outChunk,
+    const std::unordered_set<ChunkIndex, ChunkIndexHash>& existingOutputChunks,
+    std::size_t keepZ0,
+    std::size_t keepZ1,
+    uint8_t ignoreValue,
+    std::size_t workers,
+    ProfileStats* profile = nullptr)
+{
+    if (keepZ0 == 0 && keepZ1 == outShape[0]) {
+        return {};
+    }
+
+    std::vector<ChunkIndex> affected;
+    affected.reserve(existingOutputChunks.size());
+    for (const auto& chunk : existingOutputChunks) {
+        const std::size_t chunkZ0 = chunk.z * outChunk[0];
+        const std::size_t chunkZ1 = std::min(chunkZ0 + outChunk[0], outShape[0]);
+        if (chunkZ0 >= chunkZ1) {
+            continue;
+        }
+        if (chunkZ0 >= keepZ0 && chunkZ1 <= keepZ1) {
+            continue;
+        }
+        affected.push_back(chunk);
+    }
+    if (affected.empty()) {
+        return {};
+    }
+
+    std::sort(affected.begin(), affected.end(), chunkIndexLess);
+    const std::size_t chunkElems = volumeElements(outChunk);
+    const std::size_t chunkBytes = chunkElems * sizeof(uint8_t);
+
+    std::atomic<std::size_t> next{0};
+    std::atomic<bool> hadError{false};
+    std::mutex touchedMutex;
+    std::mutex profileMutex;
+    std::mutex errMutex;
+    std::string firstError;
+    std::vector<ChunkIndex> touched;
+    touched.reserve(affected.size());
+    ProfileStats profileAccum;
+    std::vector<std::thread> threads;
+    threads.reserve(workers);
+
+    for (std::size_t tid = 0; tid < workers; ++tid) {
+        threads.emplace_back([&, tid]() {
+            (void)tid;
+            vc::VcDataset outputLocal(output.path());
+            std::vector<uint8_t> chunkBuf(chunkElems, 0);
+            ProfileStats localProfile;
+            std::vector<ChunkIndex> localTouched;
+            localTouched.reserve(64);
+
+            while (!hadError.load()) {
+                const std::size_t idx = next.fetch_add(1);
+                if (idx >= affected.size()) {
+                    break;
+                }
+
+                try {
+                    const ChunkIndex chunk = affected[idx];
+                    const std::size_t chunkZ0 = chunk.z * outChunk[0];
+                    const std::size_t chunkActualZ = chunkZ0 < outShape[0]
+                        ? std::min(outChunk[0], outShape[0] - chunkZ0)
+                        : 0;
+                    if (chunkActualZ == 0) {
+                        continue;
+                    }
+
+                    auto readStart = std::chrono::steady_clock::now();
+                    outputLocal.readChunkOrFill(chunk.z, chunk.y, chunk.x, chunkBuf.data());
+                    auto readEnd = std::chrono::steady_clock::now();
+                    localProfile.tChunkReadIo.add(std::chrono::duration<double>(readEnd - readStart).count());
+                    ++localProfile.chunkIoReads;
+                    localProfile.bytesRead += chunkBytes;
+
+                    bool changed = false;
+                    const std::size_t sliceElems = outChunk[1] * outChunk[2];
+                    for (std::size_t localZ = 0; localZ < chunkActualZ; ++localZ) {
+                        const std::size_t globalZ = chunkZ0 + localZ;
+                        if (globalZ >= keepZ0 && globalZ < keepZ1) {
+                            continue;
+                        }
+
+                        uint8_t* slicePtr = chunkBuf.data() + localZ * sliceElems;
+                        if (hasAnyNonZero(slicePtr, sliceElems)) {
+                            std::fill(slicePtr, slicePtr + sliceElems, uint8_t(0));
+                            changed = true;
+                        }
+                    }
+
+                    if (!changed &&
+                        !shouldDropIgnoreSparseChunk(outShape, outChunk, chunk, chunkBuf, ignoreValue)) {
+                        continue;
+                    }
+
+                    if (persistIgnoreSparseChunk(outputLocal, chunk, chunkBuf, ignoreValue, &localProfile)) {
+                        localTouched.push_back(chunk);
+                    }
+                } catch (const std::exception& e) {
+                    hadError.store(true);
+                    std::lock_guard<std::mutex> lk(errMutex);
+                    if (firstError.empty()) {
+                        firstError = e.what();
+                    }
+                    break;
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(touchedMutex);
+                touched.insert(touched.end(), localTouched.begin(), localTouched.end());
+            }
+            if (profile) {
+                std::lock_guard<std::mutex> lk(profileMutex);
+                profileAccum.accumulate(localProfile);
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+    if (hadError.load()) {
+        throw std::runtime_error("failed clearing outside z range: " + firstError);
+    }
+
+    if (profile) {
+        profile->accumulate(profileAccum);
+    }
+
+    std::sort(touched.begin(), touched.end(), chunkIndexLess);
+    touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+    return touched;
 }
 
 static std::vector<ChunkIndex> buildTouchedParents(const std::vector<ChunkIndex>& sourceTouched,
@@ -2266,7 +2478,7 @@ static std::vector<ChunkIndex> buildLabelPriorityPyramidLevelTouched(
                                                        srcActualY,
                                                        srcActualX,
                                                        srcBuf)) {
-                        srcBuf.assign(srcElems, 0);
+                        srcBuf.assign(srcElems, ignoreValue);
                         srcLocal.readRegion({srcZ0, srcY0, srcX0},
                                             {srcActualZ, srcActualY, srcActualX},
                                             srcBuf.data());
@@ -2284,15 +2496,18 @@ static std::vector<ChunkIndex> buildLabelPriorityPyramidLevelTouched(
                         vc::core::util::Shape3{dstChunk[0], dstChunk[1], dstChunk[2]},
                         ignoreValue);
 
-                    if (hasAnyNonZero(dstBuf)) {
-                        auto tWriteStart = std::chrono::steady_clock::now();
-                        dstLocal.writeChunk(cz, cy, cx, dstBuf.data(), dstBuf.size() * sizeof(uint8_t));
-                        auto tWriteEnd = std::chrono::steady_clock::now();
-                        localProfile.tPyramidWrite.add(std::chrono::duration<double>(tWriteEnd - tWriteStart).count());
+                    if (hasAnyNonZero(dstBuf) ||
+                        shouldDropIgnoreSparseChunk(dstShape, dstChunk, chunk, dstBuf, ignoreValue)) {
+                        if (persistIgnoreSparseChunk(dstLocal,
+                                                     chunk,
+                                                     dstBuf,
+                                                     ignoreValue,
+                                                     &localProfile,
+                                                     true)) {
+                            std::lock_guard<std::mutex> lk(outTouchedMutex);
+                            outputTouched.push_back(chunk);
+                        }
                         ++localProfile.pyramidWriteCalls;
-                        localProfile.bytesWritten += dstBuf.size() * sizeof(uint8_t);
-                        std::lock_guard<std::mutex> lk(outTouchedMutex);
-                        outputTouched.push_back(chunk);
                     }
                     const std::size_t progressDone = done.fetch_add(1) + 1;
                     if (structuredProgress &&
@@ -2528,7 +2743,7 @@ static void writeReplicatedCoreMaskToLevel0(
 
                 auto readStart = std::chrono::steady_clock::now();
                 chunkBuf.assign(chunkElems, 0);
-                output.readChunk(cz, cy, cx, chunkBuf.data());
+                output.readChunkOrFill(cz, cy, cx, chunkBuf.data());
                 if (profile) {
                     auto readEnd = std::chrono::steady_clock::now();
                     profile->tChunkReadIo.add(std::chrono::duration<double>(readEnd - readStart).count());
@@ -2572,15 +2787,9 @@ static void writeReplicatedCoreMaskToLevel0(
                     continue;
                 }
 
-                auto writeStart = std::chrono::steady_clock::now();
-                output.writeChunk(cz, cy, cx, chunkBuf.data(), chunkBytes);
-                if (profile) {
-                    auto writeEnd = std::chrono::steady_clock::now();
-                    profile->tChunkWriteIo.add(std::chrono::duration<double>(writeEnd - writeStart).count());
-                    ++profile->chunkIoWrites;
-                    profile->bytesWritten += chunkBytes;
+                if (persistIgnoreSparseChunk(output, chunk, chunkBuf, ignoreValue, profile)) {
+                    touchedLevel0.insert(chunk);
                 }
-                touchedLevel0.insert(chunk);
             }
         }
     }
@@ -2649,7 +2858,11 @@ static void writeOutputMetadata(const Config& cfg,
     meta["slices"] = static_cast<long long>(shape0[0]);
     meta["format"] = "zarr";
     meta["min"] = 0.0;
-    meta["max"] = 255.0;
+    double maxValue = static_cast<double>(std::max(1, cfg.ignoreValue));
+    if (meta.contains("max") && meta["max"].is_number()) {
+        maxValue = std::max(maxValue, meta["max"].get<double>());
+    }
+    meta["max"] = maxValue;
     meta["label_volume"] = "rasterized";
     meta["ignore_label_value"] = cfg.ignoreValue;
     meta["ignore_label_added_at"] = nowIsoUtc();
@@ -2847,6 +3060,19 @@ static int processChunkAlphaWrap(
     std::string firstError;
     std::unordered_set<ChunkIndex, ChunkIndexHash> touchedLevel0Global;
     ProfileStats profile;
+    const std::size_t keepZ0 = static_cast<std::size_t>(zStart) * scale;
+    const std::size_t keepZ1 = std::min(static_cast<std::size_t>(zStop) * scale, outShape[0]);
+    const auto existingOutputLevel0Chunks = scanLevelExistingChunks(cfg.outputRoot / "0");
+    const auto clearedChunks = clearLevel0OutsideZRange(out0,
+                                                        outShape,
+                                                        outChunk,
+                                                        existingOutputLevel0Chunks,
+                                                        keepZ0,
+                                                        keepZ1,
+                                                        static_cast<uint8_t>(cfg.ignoreValue),
+                                                        workers,
+                                                        &profile);
+    touchedLevel0Global.insert(clearedChunks.begin(), clearedChunks.end());
     std::vector<std::thread> threads;
     threads.reserve(workers);
 
@@ -3547,6 +3773,44 @@ static bool runSelfTest()
                 }
             }
 
+            auto dsIgnore = vc::createZarrDataset(tmpRoot,
+                                                  "1",
+                                                  {128, 128, 256},
+                                                  {128, 128, 128},
+                                                  vc::VcDtype::uint8,
+                                                  "none",
+                                                  ".",
+                                                  2);
+            dsIgnore->writeChunk(0, 0, 0, chunk.data(), chunk.size() * sizeof(uint8_t));
+            region.clear();
+            const bool ignoreOk = readAlignedSourceRegionByChunk(*dsIgnore,
+                                                                 {128, 128, 256},
+                                                                 {128, 128, 128},
+                                                                 0,
+                                                                 0,
+                                                                 0,
+                                                                 128,
+                                                                 128,
+                                                                 256,
+                                                                 region);
+            if (!ignoreOk) {
+                std::cerr << "self-test failed: aligned ignore-fill read returned false\n";
+                fs::remove_all(tmpRoot, ec);
+                return false;
+            }
+            for (std::size_t z = 0; z < 128; ++z) {
+                for (std::size_t y = 0; y < 128; ++y) {
+                    const std::size_t right = linearIndex({128, 128, 256}, z, y, 128);
+                    if (!std::all_of(region.begin() + static_cast<std::ptrdiff_t>(right),
+                                     region.begin() + static_cast<std::ptrdiff_t>(right + 128),
+                                     [](uint8_t v) { return v == 2; })) {
+                        std::cerr << "self-test failed: aligned read did not use ignore fill value\n";
+                        fs::remove_all(tmpRoot, ec);
+                        return false;
+                    }
+                }
+            }
+
             fs::remove_all(tmpRoot, ec);
             return true;
         } catch (const std::exception& e) {
@@ -3556,10 +3820,87 @@ static bool runSelfTest()
         }
     };
 
+    auto checkClearOutsideRangeSparse = [&]() {
+        const fs::path tmpRoot = fs::temp_directory_path() / "vc_add_ignore_selftest_clear_range";
+        std::error_code ec;
+        fs::remove_all(tmpRoot, ec);
+        fs::create_directories(tmpRoot, ec);
+        if (ec) {
+            std::cerr << "self-test failed: unable to create temp root for clear-range test\n";
+            return false;
+        }
+
+        try {
+            constexpr uint8_t ignoreValue = 2;
+            const Shape3 shape = {8, 2, 2};
+            const Shape3 chunk = {2, 2, 2};
+            auto ds = vc::createZarrDataset(tmpRoot,
+                                            "0",
+                                            {shape[0], shape[1], shape[2]},
+                                            {chunk[0], chunk[1], chunk[2]},
+                                            vc::VcDtype::uint8,
+                                            "none",
+                                            ".",
+                                            ignoreValue);
+            std::vector<uint8_t> fullChunk(volumeElements(chunk), 1);
+            for (std::size_t cz = 0; cz < 4; ++cz) {
+                ds->writeChunk(cz, 0, 0, fullChunk.data(), fullChunk.size() * sizeof(uint8_t));
+            }
+
+            ProfileStats profile;
+            const auto touched = clearLevel0OutsideZRange(*ds,
+                                                          shape,
+                                                          chunk,
+                                                          scanLevelExistingChunks(tmpRoot / "0"),
+                                                          1,
+                                                          5,
+                                                          ignoreValue,
+                                                          1,
+                                                          &profile);
+            if (touched.size() != 3) {
+                std::cerr << "self-test failed: expected 3 touched chunks after clear-range\n";
+                fs::remove_all(tmpRoot, ec);
+                return false;
+            }
+            if (ds->chunkExists(3, 0, 0)) {
+                std::cerr << "self-test failed: fully outside chunk was not removed\n";
+                fs::remove_all(tmpRoot, ec);
+                return false;
+            }
+
+            std::vector<uint8_t> volume(volumeElements(shape), 0);
+            ds->readRegion({0, 0, 0}, {shape[0], shape[1], shape[2]}, volume.data());
+            for (std::size_t y = 0; y < shape[1]; ++y) {
+                for (std::size_t x = 0; x < shape[2]; ++x) {
+                    if (volume[linearIndex(shape, 0, y, x)] != 0 ||
+                        volume[linearIndex(shape, 1, y, x)] != 1 ||
+                        volume[linearIndex(shape, 4, y, x)] != 1 ||
+                        volume[linearIndex(shape, 5, y, x)] != 0 ||
+                        volume[linearIndex(shape, 6, y, x)] != ignoreValue ||
+                        volume[linearIndex(shape, 7, y, x)] != ignoreValue) {
+                        std::cerr << "self-test failed: clear-range output values are incorrect\n";
+                        fs::remove_all(tmpRoot, ec);
+                        return false;
+                    }
+                }
+            }
+
+            fs::remove_all(tmpRoot, ec);
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "self-test failed in clear-range test: " << e.what() << '\n';
+            fs::remove_all(tmpRoot, ec);
+            return false;
+        }
+    };
+
     if (!checkChunkAlphaWrapConsistency()) {
         return false;
     }
     if (!checkAlignedReadMissingChunk()) {
+        return false;
+    }
+    if (!checkClearOutsideRangeSparse()) {
         return false;
     }
 
@@ -3668,6 +4009,8 @@ static int process(const Config& cfg)
     const double copyStageSeconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - copyStageStart).count();
 
+    rewriteOutputFillValue(cfg.outputRoot, levels, static_cast<uint8_t>(cfg.ignoreValue));
+
     vc::VcDataset computeDs(cfg.inputRoot / std::to_string(cfg.computeLevel));
     vc::VcDataset out0(cfg.outputRoot / "0");
     const Shape3 computeShape = toShape3(computeDs.shape());
@@ -3703,6 +4046,18 @@ static int process(const Config& cfg)
         std::size_t{1} << static_cast<std::size_t>(cfg.computeLevel - cfg.outputLevel);
 
     ProfileStats profile;
+    const std::size_t keepZ0 = static_cast<std::size_t>(zStart) * zScale;
+    const std::size_t keepZ1 = std::min(static_cast<std::size_t>(zStop) * zScale, outShape[0]);
+    const auto existingOutputLevel0Chunks = scanLevelExistingChunks(cfg.outputRoot / "0");
+    const auto clearedChunks = clearLevel0OutsideZRange(out0,
+                                                        outShape,
+                                                        outChunk,
+                                                        existingOutputLevel0Chunks,
+                                                        keepZ0,
+                                                        keepZ1,
+                                                        static_cast<uint8_t>(cfg.ignoreValue),
+                                                        workers,
+                                                        &profile);
 
     std::vector<uint8_t> preloadedCompute;
     if (cachePlan.mode == ComputeCacheMode::preload) {
@@ -3758,6 +4113,7 @@ static int process(const Config& cfg)
     std::mutex errMutex;
     std::string firstError;
     std::unordered_set<ChunkIndex, ChunkIndexHash> touchedLevel0Global;
+    touchedLevel0Global.insert(clearedChunks.begin(), clearedChunks.end());
     std::vector<std::thread> threads;
     threads.reserve(workers);
 
@@ -4073,7 +4429,7 @@ static int process(const Config& cfg)
                                     }
 
                                     auto readTimer = std::chrono::steady_clock::now();
-                                    localOut0.readChunk(slab, cy, cx, state.buf.data());
+                                    localOut0.readChunkOrFill(slab, cy, cx, state.buf.data());
                                     auto readEnd = std::chrono::steady_clock::now();
                                     localProfile.tChunkReadIo.add(std::chrono::duration<double>(readEnd - readTimer).count());
                                     ++localProfile.chunkIoReads;
@@ -4126,14 +4482,14 @@ static int process(const Config& cfg)
                             const std::size_t cy = static_cast<std::size_t>((packed >> 32) & 0xFFFFFFFFULL);
                             const ChunkIndex chunk = {slab, cy, cx};
 
-                            auto writeTimer = std::chrono::steady_clock::now();
-                            localOut0.writeChunk(slab, cy, cx, it->second.buf.data(), outChunkBytes);
-                            auto writeEnd = std::chrono::steady_clock::now();
-                            localProfile.tChunkWriteIo.add(std::chrono::duration<double>(writeEnd - writeTimer).count());
-                            ++localProfile.chunkIoWrites;
-                            localProfile.bytesWritten += outChunkBytes;
+                            if (persistIgnoreSparseChunk(localOut0,
+                                                         chunk,
+                                                         it->second.buf,
+                                                         static_cast<uint8_t>(cfg.ignoreValue),
+                                                         &localProfile)) {
+                                localTouchedLevel0.insert(chunk);
+                            }
                             it->second.loaded = false;
-                            localTouchedLevel0.insert(chunk);
                         }
                     } catch (const std::exception& e) {
                         hadError.store(true);
@@ -4339,7 +4695,7 @@ int main(int argc, char* argv[])
             ("mode", po::value<std::string>(&modeArg)->default_value(processingModeToString(Config{}.mode)),
              "Processing mode: chunk-alpha-wrap | legacy-slice")
             ("ignore-value", po::value<int>(&cfg.ignoreValue)->default_value(kDefaultIgnoreValue),
-             "Ignore label value [1..254] (default 127)")
+             "Ignore label value [1..254] (default 2)")
             ("alpha", po::value<double>(&cfg.alpha)->default_value(kDefaultAlpha),
              "Legacy 2D alpha, or chunk alpha alias in chunk-alpha-wrap mode")
             ("chunk-alpha", po::value<double>(&cfg.chunkAlpha)->default_value(0.0),
