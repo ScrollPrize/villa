@@ -1640,6 +1640,9 @@ def delete_nearest_point(action_state):
 def toggle_constrained_fit(_):
     """Toggle between constrained and unconstrained affine fitting."""
     global constrained_fit_mode
+    if not constrained_fit_mode and moving_source.source_type == "mesh":
+        print("Constrained fit mode is not supported with mesh moving sources.")
+        return
     constrained_fit_mode = not constrained_fit_mode
     mode = "CONSTRAINED (5 DOF + z-flip)" if constrained_fit_mode else "UNCONSTRAINED (12 DOF)"
     print(f"Fit mode: {mode}")
@@ -1914,6 +1917,12 @@ if __name__ == "__main__":
         args.moving_source_unit_size,
     )
     scale_factor = moving_source.unit_size_um / fixed_dimensions.voxel_size_um
+
+    if moving_source.source_type == "mesh" and constrained_fit_mode:
+        raise ValueError(
+            "Constrained fit mode is not supported with mesh moving sources "
+            "(mesh landmarks use XYZ order, but the constrained solver assumes ZYX)."
+        )
 
     if moving_source.source_type == "mesh":
         moving_mesh_geometry = read_vtk_mesh_geometry(args.moving)
