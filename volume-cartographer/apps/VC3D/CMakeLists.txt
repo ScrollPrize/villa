@@ -175,6 +175,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     endif()
 endif()
 
+if(AVAHI_FOUND)
+    target_compile_definitions(VC3D PRIVATE VC_HAVE_AVAHI=1)
+else()
+    target_compile_definitions(VC3D PRIVATE VC_HAVE_AVAHI=0)
+endif()
+
 target_link_libraries(VC3D
     vc_core
     vc_ui
@@ -189,4 +195,3 @@ target_link_libraries(VC3D
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
     blosc_static
 )
-

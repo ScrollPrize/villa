@@ -94,18 +94,20 @@ RUN make SCOTCH_HOME=/usr/local/scotch
 RUN make SCOTCH_HOME=/usr/local/scotch install
     
     # --- build libigl-based target (after overlay) ---
-WORKDIR /src/libs/flatboi/build
-RUN cmake .. -DCMAKE_BUILD_TYPE=Release \
+WORKDIR /src/libs/flatboi
+RUN rm -rf build \
+ && cmake -S . -B build \
+      -DCMAKE_BUILD_TYPE=Release \
       -DLIBIGL_WITH_PASTIX=ON \
       -DBLA_VENDOR=OpenBLAS \
       -DCMAKE_PREFIX_PATH=/usr/local/pastix \
       -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG" \
       -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
       -DCMAKE_CXX_FLAGS="-DSLIM_CACHED"
-RUN cmake --build . -j"$(nproc)"
+RUN cmake --build build -j"$(nproc)"
     
 # Install the flatboi binary into PATH before removing /src
-RUN install -m 0755 ./flatboi /usr/local/bin/flatboi
+RUN install -m 0755 /src/libs/flatboi/build/flatboi /usr/local/bin/flatboi
 
 # ------------------------- Build the main project ---------------------------
 RUN mkdir -p /src/build

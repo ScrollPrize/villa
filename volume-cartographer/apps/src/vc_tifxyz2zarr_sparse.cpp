@@ -24,9 +24,12 @@
 #include <exception>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <thread>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include <optional>
 #include <cstring>
@@ -43,7 +46,7 @@ constexpr size_t kLocalSpoolFlushThreshold = 8192;
 constexpr int kQuadRowWorkBlock = 32;
 constexpr float kAxisPlaneEps = 1e-5f;
 constexpr float kSegmentEps2 = 1e-12f;
-constexpr uint8_t kSurfaceValue = 255;
+constexpr uint8_t kSurfaceValue = 1;
 const char* kChunkSuffix = "vc_tifxyz2zarr_sparse";
 
 using Shape3 = std::array<size_t, 3>;
@@ -615,6 +618,29 @@ static Shape3 parseShapeFromReference(const fs::path& ref) {
     return {s[0], s[1], s[2]};
 }
 
+static std::pair<std::size_t, std::size_t> normalizeZRange(long long requestedMin,
+                                                           long long requestedMax,
+                                                           const Shape3& shape)
+{
+    if (requestedMin < 0) {
+        throw std::runtime_error("--z-min must be >= 0");
+    }
+    if (requestedMax < -1) {
+        throw std::runtime_error("--z-max must be >= -1");
+    }
+
+    const std::size_t zMin = std::min<std::size_t>(static_cast<std::size_t>(requestedMin), shape[0]);
+    const std::size_t zMax = requestedMax < 0
+        ? shape[0]
+        : std::min<std::size_t>(static_cast<std::size_t>(requestedMax), shape[0]);
+
+    if (zMin >= zMax) {
+        throw std::runtime_error("empty z range after applying --z-min/--z-max");
+    }
+
+    return {zMin, zMax};
+}
+
 static nlohmann::json toJsonArray(const std::vector<std::string>& values) {
     nlohmann::json result = nlohmann::json::array();
     for (const auto& value : values) {
@@ -860,16 +886,26 @@ static void rasterizePointGridRows(const cv::Mat_<cv::Vec3f>& pts,
 template<typename EmitVoxel>
 static void rasterizeTifxyzMeshToSpool(const fs::path& meshPath,
                                        const Shape3& shape,
+                                       std::size_t zMin,
+                                       std::size_t zMax,
                                        RasterMode rasterMode,
                                        EmitVoxel&& emit) {
     auto surf = load_quad_from_tifxyz(meshPath.string());
     const cv::Mat_<cv::Vec3f> pts = surf->rawPoints();
     if (pts.empty()) return;
-    rasterizePointGridRows(pts, 0, pts.rows - 1, shape, rasterMode, emit);
+    rasterizePointGridRows(pts, 0, pts.rows - 1, shape, rasterMode,
+        [&](size_t z, size_t y, size_t x) {
+            if (z < zMin || z >= zMax) {
+                return;
+            }
+            emit(z, y, x);
+        });
 }
 
 static void rasterizeSingleMeshIntraParallel(const fs::path& meshPath,
                                              const Shape3& shape,
+                                             std::size_t zMin,
+                                             std::size_t zMax,
                                              RasterMode rasterMode,
                                              size_t numThreads,
                                              SpoolManager& spool) {
@@ -883,6 +919,9 @@ static void rasterizeSingleMeshIntraParallel(const fs::path& meshPath,
         ThreadSpoolBuffer buffer(spool, spool.chunkShape(), spool.volumeShape());
         rasterizePointGridRows(pts, 0, quadRows, shape, rasterMode,
             [&](size_t z, size_t y, size_t x) {
+                if (z < zMin || z >= zMax) {
+                    return;
+                }
                 buffer.emit(z, y, x);
             });
         buffer.flushAll();
@@ -906,6 +945,9 @@ static void rasterizeSingleMeshIntraParallel(const fs::path& meshPath,
                     const int rowEnd = std::min(rowBegin + kQuadRowWorkBlock, quadRows);
                     rasterizePointGridRows(pts, rowBegin, rowEnd, shape, rasterMode,
                         [&](size_t z, size_t y, size_t x) {
+                            if (z < zMin || z >= zMax) {
+                                return;
+                            }
                             buffer.emit(z, y, x);
                         });
                 }
@@ -927,6 +969,8 @@ static void rasterizeSingleMeshIntraParallel(const fs::path& meshPath,
 
 static void rasterizeSingleMeshPhase(const fs::path& meshPath,
                                      const Shape3& shape,
+                                     std::size_t zMin,
+                                     std::size_t zMax,
                                      RasterMode rasterMode,
                                      size_t numThreads,
                                      SpoolManager& spool,
@@ -937,7 +981,7 @@ static void rasterizeSingleMeshPhase(const fs::path& meshPath,
     if (hadError.load()) return;
 
     try {
-        rasterizeSingleMeshIntraParallel(meshPath, shape, rasterMode, numThreads, spool);
+        rasterizeSingleMeshIntraParallel(meshPath, shape, zMin, zMax, rasterMode, numThreads, spool);
     } catch (const std::exception& e) {
         std::lock_guard<std::mutex> lk(outMutex);
         std::cerr << "mesh rasterization failed for " << meshPath
@@ -958,6 +1002,8 @@ static void rasterizePhase(const std::vector<fs::path>& meshes,
                           size_t start,
                           size_t stride,
                           const Shape3& shape,
+                          std::size_t zMin,
+                          std::size_t zMax,
                           RasterMode rasterMode,
                           SpoolManager& spool,
                           std::atomic<bool>& hadError,
@@ -971,7 +1017,7 @@ static void rasterizePhase(const std::vector<fs::path>& meshes,
         if (hadError.load()) return;
 
         try {
-            rasterizeTifxyzMeshToSpool(meshes[i], shape, rasterMode,
+            rasterizeTifxyzMeshToSpool(meshes[i], shape, zMin, zMax, rasterMode,
                 [&](size_t z, size_t y, size_t x) {
                     buffer.emit(z, y, x);
                 });
@@ -1272,7 +1318,7 @@ static void writeVolumeMetadata(const fs::path& outDir,
     meta["slices"] = static_cast<long long>(level0Shape[0]);
     meta["voxelsize"] = voxelSize;
     meta["min"] = 0.0;
-    meta["max"] = 255.0;
+    meta["max"] = static_cast<double>(kSurfaceValue);
     meta["format"] = "zarr";
 
     if (sourceRef) {
@@ -1304,6 +1350,61 @@ static void writeVolumeMetadata(const fs::path& outDir,
     }
 }
 
+static bool runSelfTest()
+{
+    const Shape3 shape{16, 16, 16};
+    const cv::Vec3f p00{2.0f, 2.0f, 9.6f};
+    const cv::Vec3f p01{12.0f, 2.0f, 10.4f};
+    const cv::Vec3f p10{2.0f, 12.0f, 10.4f};
+    const cv::Vec3f p11{12.0f, 12.0f, 11.2f};
+
+    std::set<std::tuple<size_t, size_t, size_t>> full;
+    std::set<std::tuple<size_t, size_t, size_t>> clipped;
+    rasterizeQuadForMode(p00, p01, p10, p11, shape, RasterMode::ZYXInteger,
+        [&](size_t z, size_t y, size_t x) {
+            full.emplace(z, y, x);
+        });
+    rasterizeQuadForMode(p00, p01, p10, p11, shape, RasterMode::ZYXInteger,
+        [&](size_t z, size_t y, size_t x) {
+            if (z < 10 || z >= 11) {
+                return;
+            }
+            clipped.emplace(z, y, x);
+        });
+
+    if (full.empty() || clipped.empty()) {
+        std::cerr << "self-test failed: rasterization produced no voxels\n";
+        return false;
+    }
+    if (std::all_of(full.begin(), full.end(), [](const auto& voxel) {
+            return std::get<0>(voxel) == 10;
+        })) {
+        std::cerr << "self-test failed: z clipping did not reduce output\n";
+        return false;
+    }
+    if (!std::all_of(clipped.begin(), clipped.end(), [](const auto& voxel) {
+            return std::get<0>(voxel) == 10;
+        })) {
+        std::cerr << "self-test failed: clipped output contains voxels outside z range\n";
+        return false;
+    }
+
+    std::vector<uint8_t> buf(shape[0] * shape[1] * shape[2], 0);
+    const auto linear = [&](size_t z, size_t y, size_t x) {
+        return (z * shape[1] + y) * shape[2] + x;
+    };
+    for (const auto& [z, y, x] : clipped) {
+        buf[linear(z, y, x)] = kSurfaceValue;
+    }
+    if (std::none_of(buf.begin(), buf.end(), [](uint8_t v) { return v == 1; })) {
+        std::cerr << "self-test failed: rasterized foreground value is not 1\n";
+        return false;
+    }
+
+    std::cout << "self-test passed\n";
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -1317,11 +1418,13 @@ int main(int argc, char* argv[])
                   << " <input_tifxyz_dir> <output_omezarr> [options]\n"
                   << "\n"
                   << "Options:\n"
-                  << "  Surface voxels are written as 255 in uint8 output.\n"
+                  << "  Surface voxels are written as 1 in uint8 output.\n"
                   << "  --shape-z N               full output Z\n"
                   << "  --shape-y N               full output Y\n"
                   << "  --shape-x N               full output X\n"
                   << "  --reference-zarr PATH      infer shape from existing zarr (uses /0 if present)\n"
+                  << "  --z-min N                 level-0 start slice (inclusive)\n"
+                  << "  --z-max N                 level-0 end slice (exclusive, -1 = end)\n"
                   << "  --chunk-size N             isotropic chunk edge (default 128)\n"
                   << "  --source-segment SEGMENT    optional segment ID provenance (repeatable)\n"
                   << "  --source-mesh PATH         optional mesh path provenance (repeatable)\n"
@@ -1333,6 +1436,7 @@ int main(int argc, char* argv[])
                   << "  --source-group IDX          optional source group for metadata\n"
                   << "  --raster-mode MODE         zyx-integer (default) or z-half\n"
                   << "  --metrics-json PATH        write timing + unique-voxel metrics json\n"
+                  << "  --self-test                run built-in synthetic regression harness and exit\n"
                   << "\n"
                   << "Note:\n"
                   << "  --chunk-size-z/x/y are intentionally not supported; use --chunk-size.\n";
@@ -1349,6 +1453,8 @@ int main(int argc, char* argv[])
             ("shape-y", po::value<size_t>(), "Output Y size")
             ("shape-x", po::value<size_t>(), "Output X size")
             ("reference-zarr", po::value<std::string>(), "Reference OME-Zarr for shape inference")
+            ("z-min", po::value<long long>()->default_value(0), "Level-0 start slice (inclusive)")
+            ("z-max", po::value<long long>()->default_value(-1), "Level-0 end slice (exclusive, -1 = end)")
             ("chunk-size", po::value<size_t>()->default_value(128), "Isotropic chunk size")
             ("source-segment", po::value<std::vector<std::string>>()->multitoken(),
              "Segment ID used for provenance (repeatable)")
@@ -1365,6 +1471,7 @@ int main(int argc, char* argv[])
             ("raster-mode", po::value<std::string>()->default_value("zyx-integer"),
              "Raster mode: zyx-integer or z-half")
             ("metrics-json", po::value<std::string>(), "Write timing + unique-voxel metrics json")
+            ("self-test", po::bool_switch()->default_value(false), "Run built-in synthetic regression harness and exit")
             ("chunk-size-z", po::value<size_t>(), "DEPRECATED: ignored; use --chunk-size")
             ("chunk-size-y", po::value<size_t>(), "DEPRECATED: ignored; use --chunk-size")
             ("chunk-size-x", po::value<size_t>(), "DEPRECATED: ignored; use --chunk-size");
@@ -1382,8 +1489,14 @@ int main(int argc, char* argv[])
         po::notify(vm);
 
         if (vm.count("help") || !vm.count("input") || !vm.count("output")) {
+            if (vm.count("self-test") && vm["self-test"].as<bool>()) {
+                return runSelfTest() ? EXIT_SUCCESS : EXIT_FAILURE;
+            }
             std::cerr << desc << "\n";
             return EXIT_FAILURE;
+        }
+        if (vm["self-test"].as<bool>()) {
+            return runSelfTest() ? EXIT_SUCCESS : EXIT_FAILURE;
         }
 
         const bool hasChunkAxisFlags = vm.count("chunk-size-z") ||
@@ -1443,6 +1556,9 @@ int main(int argc, char* argv[])
         } else {
             throw std::runtime_error("provide either --shape-z/y/x or --reference-zarr");
         }
+        const auto [zMin, zMax] = normalizeZRange(vm["z-min"].as<long long>(),
+                                                  vm["z-max"].as<long long>(),
+                                                  shape);
 
         int threadCount = vm["threads"].as<int>();
         if (threadCount <= 0) {
@@ -1515,13 +1631,13 @@ int main(int argc, char* argv[])
 
         std::vector<std::thread> rasterThreads;
         if (rasterMode == RasterMode::ZYXInteger && meshes.size() == 1 && numThreads > 1) {
-            rasterizeSingleMeshPhase(meshes.front(), shape, rasterMode, numThreads,
+            rasterizeSingleMeshPhase(meshes.front(), shape, zMin, zMax, rasterMode, numThreads,
                                      spool, hadError, rasterizedCount, verbose, ioMutex);
         } else {
             rasterThreads.reserve(numThreads);
             for (size_t tid = 0; tid < numThreads; ++tid) {
                 rasterThreads.emplace_back([&, tid]() {
-                    rasterizePhase(meshes, tid, numThreads, shape, rasterMode,
+                    rasterizePhase(meshes, tid, numThreads, shape, zMin, zMax, rasterMode,
                                   spool, hadError, rasterizedCount,
                                   verbose, ioMutex, meshes.size());
                 });

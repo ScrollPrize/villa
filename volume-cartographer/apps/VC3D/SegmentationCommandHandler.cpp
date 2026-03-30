@@ -202,33 +202,73 @@ static bool writeJsonObject(const QString& path, const QJsonObject& obj)
     return true;
 }
 
-static bool selectRasterizeChunkSize(QWidget* parent, int* outChunkSize)
+struct RasterizeDialogResult {
+    int chunkSize{128};
+    int zMin{0};
+    int zMax{-1};
+};
+
+static bool selectRasterizeParams(QWidget* parent, RasterizeDialogResult* out)
 {
-    if (!outChunkSize) {
+    if (!out) {
         return false;
     }
+
+    QDialog dlg(parent);
+    dlg.setWindowTitle(QObject::tr("Rasterize"));
+
+    auto* main = new QVBoxLayout(&dlg);
+    auto* form = new QFormLayout();
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const int savedChunkSize = std::clamp(
         settings.value(QStringLiteral("tools/rasterize_chunk_size"), 128).toInt(),
         1, 4096);
+    const int savedZMin = std::max(0, settings.value(QStringLiteral("tools/rasterize_z_min"), 0).toInt());
+    const int savedZMax = settings.value(QStringLiteral("tools/rasterize_z_max"), -1).toInt();
 
-    bool ok = false;
-    const int chunkSize = QInputDialog::getInt(
-        parent,
-        QObject::tr("Rasterize"),
-        QObject::tr("Isotropic chunk size (voxels, applied to all pyramid levels):"),
-        savedChunkSize,
-        1,
-        4096,
-        1,
-        &ok);
-    if (!ok) {
+    auto* spChunkSize = new QSpinBox(&dlg);
+    spChunkSize->setRange(1, 4096);
+    spChunkSize->setValue(savedChunkSize);
+    spChunkSize->setToolTip(QObject::tr("Isotropic chunk size applied to all pyramid levels."));
+    form->addRow(QObject::tr("Chunk size:"), spChunkSize);
+
+    auto* spZMin = new QSpinBox(&dlg);
+    spZMin->setRange(0, 1000000000);
+    spZMin->setValue(savedZMin);
+    form->addRow(QObject::tr("Level-0 Z min:"), spZMin);
+
+    auto* spZMax = new QSpinBox(&dlg);
+    spZMax->setRange(-1, 1000000000);
+    spZMax->setValue(savedZMax);
+    spZMax->setToolTip(QObject::tr("-1 means the end of the level-0 volume."));
+    form->addRow(QObject::tr("Level-0 Z max (exclusive):"), spZMax);
+
+    main->addLayout(form);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, [&]() {
+        if (spZMax->value() >= 0 && spZMin->value() >= spZMax->value()) {
+            QMessageBox::warning(&dlg,
+                                 QObject::tr("Error"),
+                                 QObject::tr("Z min must be smaller than Z max unless Z max is -1."));
+            return;
+        }
+        settings.setValue(QStringLiteral("tools/rasterize_chunk_size"), spChunkSize->value());
+        settings.setValue(QStringLiteral("tools/rasterize_z_min"), spZMin->value());
+        settings.setValue(QStringLiteral("tools/rasterize_z_max"), spZMax->value());
+        dlg.accept();
+    });
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    main->addWidget(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) {
         return false;
     }
 
-    settings.setValue(QStringLiteral("tools/rasterize_chunk_size"), chunkSize);
-    *outChunkSize = chunkSize;
+    out->chunkSize = spChunkSize->value();
+    out->zMin = spZMin->value();
+    out->zMax = spZMax->value();
     return true;
 }
 
@@ -272,7 +312,7 @@ static bool isRasterizedLabelVolumePath(const QString& volumePath)
 struct IgnoreLabelDialogResult {
     QString volumePath;
     QString outputName;
-    int ignoreValue{127};
+    int ignoreValue{2};
     double chunkAlphaL0{64.0};
     int workers{0};
     int zMin{0};
@@ -393,7 +433,7 @@ bool selectIgnoreLabelParams(QWidget* parent,
 
     auto* spIgnore = new QSpinBox(&dlg);
     spIgnore->setRange(1, 254);
-    spIgnore->setValue(settings.value(QStringLiteral("tools/add_ignore_label_ignore_value"), 127).toInt());
+    spIgnore->setValue(settings.value(QStringLiteral("tools/add_ignore_label_ignore_value"), 2).toInt());
     form->addRow(QObject::tr("Ignore value:"), spIgnore);
 
     auto* lblMode = new QLabel(
@@ -2654,8 +2694,8 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         return;
     }
 
-    int chunkSize = 128;
-    if (!selectRasterizeChunkSize(_parentWidget, &chunkSize)) {
+    RasterizeDialogResult rasterizeParams;
+    if (!selectRasterizeParams(_parentWidget, &rasterizeParams)) {
         return;
     }
 
@@ -2746,10 +2786,15 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
          << QStringLiteral("--reference-zarr")
          << referenceZarr
          << QStringLiteral("--chunk-size")
-         << QString::number(chunkSize)
+         << QString::number(rasterizeParams.chunkSize)
+         << QStringLiteral("--z-min")
+         << QString::number(rasterizeParams.zMin)
          << QStringLiteral("--raster-mode")
          << QStringLiteral("zyx-integer")
          << QStringLiteral("--overwrite");
+    if (rasterizeParams.zMax >= 0) {
+        args << QStringLiteral("--z-max") << QString::number(rasterizeParams.zMax);
+    }
     for (const QString& segmentId : validIds) {
         args << QStringLiteral("--source-segment") << segmentId;
     }
@@ -3435,7 +3480,7 @@ bool SegmentationCommandHandler::appendRasterizationMetadata(const QString& outp
         metaJson["slices"] = 0;
         metaJson["voxelsize"] = 0.0;
         metaJson["min"] = 0.0;
-        metaJson["max"] = 255.0;
+        metaJson["max"] = 1.0;
         metaJson["format"] = QStringLiteral("zarr");
     }
 
