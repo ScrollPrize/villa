@@ -41,6 +41,7 @@ class VolumeInfo:
     label_paths: Dict[str, Optional[Path]]
     label_arrays: Dict[str, Optional[zarr.Array]]
     spatial_shape: Tuple[int, ...]
+    scale: Optional[int] = None
     has_labels: bool = True
 
 
@@ -52,6 +53,7 @@ class PatchInfo:
     position: Tuple[int, ...]
     patch_size: Tuple[int, ...]
     is_unlabeled_fg: bool = False
+    position_scale_factor: int = 1
     # For packed sparse zarr: boundary beyond which data belongs to neighbor
     safe_boundary: Optional[Tuple[int, ...]] = None
 
@@ -166,6 +168,14 @@ class ZarrDataset(Dataset):
 
     def _discover_and_load_volumes(self) -> None:
         """Discover and load all OME-Zarr volumes."""
+        explicit_specs = []
+        if hasattr(self.mgr, "get_explicit_volume_specs"):
+            explicit_specs = self.mgr.get_explicit_volume_specs()
+
+        if explicit_specs:
+            self._load_explicit_volumes(explicit_specs)
+            return
+
         images_dir = self.data_path / "images"
         labels_dir = self.data_path / "labels"
 
@@ -214,6 +224,7 @@ class ZarrDataset(Dataset):
                 label_paths=label_paths,
                 label_arrays=label_arrays,
                 spatial_shape=spatial_shape,
+                scale=self.ome_zarr_resolution,
                 has_labels=has_any_label,
             ))
 
@@ -222,16 +233,86 @@ class ZarrDataset(Dataset):
                 volume_id, spatial_shape, has_any_label
             )
 
-    def _open_zarr(self, path: Path) -> zarr.Array:
+    def _load_explicit_volumes(self, volume_specs: List[Dict]) -> None:
+        """Load explicitly configured image/label volume specs."""
+        for spec in volume_specs:
+            volume_id = str(spec["volume_id"])
+            image_path = Path(spec["image_path"])
+            scale = spec.get("scale")
+
+            if not image_path.exists():
+                raise FileNotFoundError(
+                    f"Explicit image path for volume '{volume_id}' does not exist: {image_path}"
+                )
+
+            label_paths: Dict[str, Optional[Path]] = {}
+            label_arrays: Dict[str, Optional[zarr.Array]] = {}
+            has_any_label = False
+
+            raw_label_paths = spec.get("label_paths", {}) or {}
+
+            for target in self.target_names:
+                label_path = raw_label_paths.get(target)
+                if label_path is not None:
+                    label_path = Path(label_path)
+                    if not label_path.exists():
+                        raise FileNotFoundError(
+                            f"Explicit label path for volume '{volume_id}' target "
+                            f"'{target}' does not exist: {label_path}"
+                        )
+                    label_paths[target] = label_path
+                    label_arrays[target] = self._open_zarr(label_path, scale=scale)
+                    has_any_label = True
+                else:
+                    if not self.allow_unlabeled_data:
+                        raise FileNotFoundError(
+                            f"Explicit volume '{volume_id}' is missing a label path for target "
+                            f"'{target}' (set allow_unlabeled_data=True to allow)"
+                        )
+                    label_paths[target] = None
+                    label_arrays[target] = None
+                    logger.warning(
+                        "No label path provided for explicit volume '%s' target '%s'",
+                        volume_id, target
+                    )
+
+            image_array = self._open_zarr(image_path, scale=scale)
+            spatial_shape = self._get_spatial_shape(image_array)
+
+            self._volumes.append(VolumeInfo(
+                volume_id=volume_id,
+                image_path=image_path,
+                image_array=image_array,
+                label_paths=label_paths,
+                label_arrays=label_arrays,
+                spatial_shape=spatial_shape,
+                scale=scale if scale is not None else self.ome_zarr_resolution,
+                has_labels=has_any_label,
+            ))
+
+            logger.info(
+                "Loaded explicit volume '%s': shape=%s, scale=%s, has_labels=%s",
+                volume_id,
+                spatial_shape,
+                scale if scale is not None else self.ome_zarr_resolution,
+                has_any_label,
+            )
+
+    def _open_zarr(self, path: Path, scale: Optional[int] = None) -> zarr.Array:
         """Open a zarr array at the configured resolution level."""
         store = zarr.open(path, mode="r")
 
         # Handle zarr Group (OME-Zarr format)
-        if isinstance(store, zarr.hierarchy.Group):
+        if isinstance(store, zarr.Group):
             # Try to get the requested resolution level
-            level_key = str(self.ome_zarr_resolution)
+            requested_scale = self.ome_zarr_resolution if scale is None else int(scale)
+            level_key = str(requested_scale)
             if level_key in store:
                 return store[level_key]
+            if scale is not None:
+                raise ValueError(
+                    f"Requested scale {requested_scale} was not found in zarr Group at {path}"
+                )
             # Fallback keys
             for key in ["0", "data", "arr_0"]:
                 if key in store and hasattr(store[key], "shape"):
@@ -565,24 +646,28 @@ class ZarrDataset(Dataset):
         # Add FG patches
         for entry in cache_data.fg_patches:
             vol_idx = volume_name_to_idx.get(entry.volume_name, entry.volume_idx)
+            coord_scale_factor = 2 ** int(getattr(self._volumes[vol_idx], "scale", 0) or 0)
             self._patches.append(PatchInfo(
                 volume_index=vol_idx,
                 volume_name=entry.volume_name,
                 position=entry.position,
                 patch_size=self.patch_size,
                 is_unlabeled_fg=False,
+                position_scale_factor=coord_scale_factor,
             ))
         self._n_labeled_fg = len(cache_data.fg_patches)
 
         # Add unlabeled FG patches
         for entry in cache_data.unlabeled_fg_patches:
             vol_idx = volume_name_to_idx.get(entry.volume_name, entry.volume_idx)
+            coord_scale_factor = 2 ** int(getattr(self._volumes[vol_idx], "scale", 0) or 0)
             self._patches.append(PatchInfo(
                 volume_index=vol_idx,
                 volume_name=entry.volume_name,
                 position=entry.position,
                 patch_size=self.patch_size,
                 is_unlabeled_fg=True,
+                position_scale_factor=coord_scale_factor,
             ))
         self._n_unlabeled_fg = len(cache_data.unlabeled_fg_patches)
 
@@ -695,7 +780,8 @@ class ZarrDataset(Dataset):
         patch = self._patches[index]
         vol = self._volumes[patch.volume_index]
         size = patch.patch_size
-        slices = tuple(slice(p, p + s) for p, s in zip(patch.position, size))
+        array_position = self._scale_patch_position_for_array(patch)
+        slices = tuple(slice(p, p + s) for p, s in zip(array_position, size))
         pad_or_crop = pad_or_crop_2d if self.is_2d else pad_or_crop_3d
 
         def mask_neighbor_intrusion(data: np.ndarray) -> np.ndarray:
@@ -767,6 +853,22 @@ class ZarrDataset(Dataset):
             result = self.transforms(**result)
 
         return result
+
+    def _scale_patch_position_for_array(self, patch: PatchInfo) -> Tuple[int, ...]:
+        """Convert cached full-resolution coordinates into the active array scale."""
+        factor = int(getattr(patch, "position_scale_factor", 1) or 1)
+        if factor <= 1:
+            return patch.position
+
+        scaled_position = []
+        for axis, coord in enumerate(patch.position):
+            if coord % factor != 0:
+                raise ValueError(
+                    f"Patch coordinate {coord} on axis {axis} is not divisible by "
+                    f"scale factor {factor} for volume '{patch.volume_name}'"
+                )
+            scaled_position.append(coord // factor)
+        return tuple(scaled_position)
 
     # -------------------------------------------------------------------------
     # Semi-supervised Support
