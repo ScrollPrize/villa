@@ -197,6 +197,10 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
 
     // Create fixed-size scene
     _scene = new QGraphicsScene(this);
+    // Disable BSP index — with hundreds of tile items at fixed positions,
+    // the BSP tree overhead exceeds its benefit. NoIndex is faster for
+    // scenes with frequent pixmap updates.
+    _scene->setItemIndexMethod(QGraphicsScene::NoIndex);
 
     // Create tile scene manager
     _tileScene = new TileScene(_scene);

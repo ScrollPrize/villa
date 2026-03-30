@@ -380,44 +380,30 @@ void TileRenderController::tick()
         _chunkArrived = false;
     }
 
-    // 3. Progressive refinement: re-submit stale tiles when new chunks have
-    //    arrived OR when the pool is idle AND not actively interacting
-    //    (during z-scroll, idle refinement just re-renders the same tiles).
+    // 3. Progressive refinement: re-submit stale tiles when new chunks
+    //    have arrived OR when the pool is idle and not actively interacting.
     bool poolIdle = _renderPool->pendingCount() == 0;
     bool shouldRefine = chunksJustArrived || (poolIdle && !_pendingDirty);
     if (_progressiveEnabled && shouldRefine) {
         if (_lastSurface && _lastVolume && _lastBuildParams) {
-            auto stale = _tileScene->staleTilesInRect(_desiredLevel, _currentEpoch->load(std::memory_order_relaxed), _lastViewportRect, tiled_config::VISIBLE_BUFFER_TILES);
+            auto stale = _tileScene->staleTilesInRect(
+                _desiredLevel, _currentEpoch->load(std::memory_order_relaxed),
+                _lastViewportRect, tiled_config::VISIBLE_BUFFER_TILES);
             if (!stale.empty()) {
-                // Sort by distance to viewport center so the user sees
-                // center-of-screen tiles refine first.
-                const auto& b = _tileScene->bounds();
-                float cx = static_cast<float>(_lastViewportRect.center().x());
-                float cy = static_cast<float>(_lastViewportRect.center().y());
-                // Convert viewport center to fractional world-tile coords
-                float wcx = cx / TileScene::TILE_PX - 0.5f;
-                float wcy = cy / TileScene::TILE_PX - 0.5f;
-
-                std::sort(stale.begin(), stale.end(),
-                    [wcx, wcy](const WorldTileKey& a, const WorldTileKey& b) {
-                        float da = (a.worldCol - wcx) * (a.worldCol - wcx)
-                                 + (a.worldRow - wcy) * (a.worldRow - wcy);
-                        float db = (b.worldCol - wcx) * (b.worldCol - wcx)
-                                 + (b.worldRow - wcy) * (b.worldRow - wcy);
-                        return da < db;
-                    });
-
-                int maxRefine = std::min(static_cast<int>(stale.size()),
-                                         tiled_config::DRAIN_BATCH_SIZE);
                 const uint64_t epoch = _currentEpoch->load(std::memory_order_relaxed);
-                for (int i = 0; i < maxRefine; i++) {
-                    TileRenderParams params = _lastBuildParams(stale[i]);
-                    // Use current controller epoch so the render isn't filtered
-                    // as stale by pre/post-render checks in RenderPool.
+                // Submit up to 32 stale tiles, skipping those already in-flight.
+                // No sort needed — visibleTiles already returns center-first order.
+                int submitted = 0;
+                for (const auto& wk : stale) {
+                    if (submitted >= 32) break;
+                    if (_inFlightTiles.count(wk)) continue;
+                    TileRenderParams params = _lastBuildParams(wk);
                     params.epoch = epoch;
                     _renderPool->submit(params, _lastSurface, _lastVolume, _currentEpoch, _controllerId);
+                    _inFlightTiles.insert(wk);
+                    ++submitted;
                 }
-                moreWork = true;
+                if (submitted > 0) moreWork = true;
             }
         }
     }
