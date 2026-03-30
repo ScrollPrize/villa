@@ -61,7 +61,21 @@ SliceCacheLookup SliceCache::getBest(const SliceCacheKey& key, int maxCoarserLev
         return {std::move(*result), key.dsScaleIdx};
     }
 
-    // Try coarser levels
+    // Try finer levels first (higher resolution → sharp when scaled down).
+    // Prefer finer over coarser because downscaling looks crisp while
+    // upscaling looks blurry.
+    constexpr int kMaxFinerLevels = 3;
+    for (int delta = 1; delta <= kMaxFinerLevels && key.dsScaleIdx - delta >= 0; delta++) {
+        SliceCacheKey finer = key;
+        finer.dsScaleIdx = key.dsScaleIdx - delta;
+
+        auto fresult = cache_.get(finer);
+        if (fresult) {
+            return {std::move(*fresult), finer.dsScaleIdx};
+        }
+    }
+
+    // Try coarser levels (fallback to lower resolution)
     for (int delta = 1; delta <= maxCoarserLevels; delta++) {
         SliceCacheKey coarser = key;
         coarser.dsScaleIdx = key.dsScaleIdx + delta;

@@ -28,13 +28,14 @@
 #include <QPainterPath>
 #include <QWindowStateChangeEvent>
 #include <QScrollBar>
+#include <QTransform>
+#include <QOpenGLWidget>
 #include <QGuiApplication>
 #include <QPointer>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <iostream>
 
 #include <QDebug>
 #include "vc/core/cache/TieredChunkCache.hpp"
@@ -175,6 +176,10 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     fGraphicsView->setTransformationAnchor(QGraphicsView::NoAnchor);
     fGraphicsView->setRenderHint(QPainter::Antialiasing);
     fGraphicsView->setScrollPanDisabled(true);
+    // Use OpenGL viewport for hardware-accelerated pixmap compositing.
+    // Dramatically reduces CPU cost of scene repaints with many tile items.
+    fGraphicsView->setViewport(new QOpenGLWidget());
+    fGraphicsView->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
 
     // Connect signals from view
     connect(fGraphicsView, &CVolumeViewerView::sendScrolled, this, &CTiledVolumeViewer::onScrolled);
@@ -187,6 +192,7 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     connect(fGraphicsView, &CVolumeViewerView::sendMousePress, this, &CTiledVolumeViewer::onMousePress);
     connect(fGraphicsView, &CVolumeViewerView::sendMouseMove, this, &CTiledVolumeViewer::onMouseMove);
     connect(fGraphicsView, &CVolumeViewerView::sendMouseRelease, this, &CTiledVolumeViewer::onMouseRelease);
+    connect(fGraphicsView, &CVolumeViewerView::sendKeyPress, this, &CTiledVolumeViewer::onKeyPress);
     connect(fGraphicsView, &CVolumeViewerView::sendKeyRelease, this, &CTiledVolumeViewer::onKeyRelease);
 
     // Create fixed-size scene
@@ -206,7 +212,25 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     // explicit signal guarantees the view refreshes when updates arrive
     // while the view is otherwise idle (no user interaction).
     connect(_renderController, &TileRenderController::sceneNeedsUpdate,
-            this, [this]() { fGraphicsView->viewport()->update(); });
+            this, [this]() {
+                fGraphicsView->viewport()->update();
+                // Only clear retained background once all visible tiles have
+                // content.  Clearing too early exposes transparent placeholders.
+                if (_tileScene->hasRetainedItems()) {
+                    bool allFilled = true;
+                    QRectF vp = viewportSceneRect();
+                    auto visible = _tileScene->visibleTiles(vp, 0);
+                    for (const auto& wk : visible) {
+                        if (_tileScene->tileNeedsContent(wk)) {
+                            allFilled = false;
+                            break;
+                        }
+                    }
+                    if (allFilled) {
+                        _tileScene->clearRetained();
+                    }
+                }
+            });
 
     // Read settings
     using namespace vc3d::settings;
@@ -220,14 +244,6 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
 
     // Wire callbacks into the unified tick on the render controller
     _renderController->setOverlayCallback([this]() { updateAllOverlays(); });
-    _renderController->setZoomSettleCallback([this]() {
-        fGraphicsView->resetTransform();
-        rebuildContentGrid();
-        centerViewport();
-        _camera.invalidate();
-        submitRender();
-        renderIntersections();
-    });
 
     _lbl = new QLabel(this);
     _lbl->setStyleSheet("QLabel { color : #00FF00; background-color: rgba(0,0,0,128); padding: 2px 4px; }");
@@ -241,8 +257,20 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
 
     _interactionSettleTimer = new QTimer(this);
     _interactionSettleTimer->setSingleShot(true);
-    _interactionSettleTimer->setInterval(125);
+    _interactionSettleTimer->setInterval(50);
     connect(_interactionSettleTimer, &QTimer::timeout, this, &CTiledVolumeViewer::settleInteractionRender);
+
+    // Throttle intersection recomputation to ~5Hz during interaction
+    _intersectionThrottleTimer = new QTimer(this);
+    _intersectionThrottleTimer->setSingleShot(true);
+    _intersectionThrottleTimer->setInterval(1000);
+    connect(_intersectionThrottleTimer, &QTimer::timeout, this, [this]() {
+        if (_intersectionsDirty) {
+            _intersectionsDirty = false;
+            renderIntersections();
+        }
+    });
+
 }
 
 CTiledVolumeViewer::~CTiledVolumeViewer()
@@ -401,10 +429,10 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
                     _camera.zOff = 0.0f;
                 }
 
-                // Full surface changes still need a full render reset.
+                // Full surface changes: cancel stale work and clear cache,
+                // but keep old tiles visible via retained layer (no gray flash).
                 _renderController->cancelAll();
                 _renderController->sliceCache().clear();
-                _tileScene->clearAll();
 
                 updateContentMinScale();
                 rebuildContentGrid();
@@ -515,7 +543,12 @@ void CTiledVolumeViewer::beginInteractionRender()
 
 void CTiledVolumeViewer::settleInteractionRender()
 {
-    if (_isPanning || !_interactionQualityActive) {
+    if (_isPanning) {
+        // Still panning — restart timer so it fires after pan stops
+        if (_interactionSettleTimer) _interactionSettleTimer->start();
+        return;
+    }
+    if (!_interactionQualityActive) {
         return;
     }
 
@@ -680,10 +713,9 @@ void CTiledVolumeViewer::onDataBoundsReady()
         }
     }
 
-    // Clear stale tiles and caches, then rebuild with new tight bounds
+    // Clear stale caches, rebuild grid with retained tile layer (no gray flash)
     _renderController->cancelAll();
     _renderController->sliceCache().clear();
-    _tileScene->clearAll();
     updateContentMinScale();
     rebuildContentGrid();
     centerViewport();
@@ -721,8 +753,6 @@ void CTiledVolumeViewer::panBy(int dx, int dy)
 
     centerViewport();
     submitRender();
-    scheduleOverlayUpdate();
-    updateStatusLabel();
 }
 
 void CTiledVolumeViewer::zoomAt(float factor, const QPointF& scenePos)
@@ -762,14 +792,20 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
         }
     }
 
-    // Every stop change is significant — always do a full re-render
-    _renderController->cancelZoomSettle();
+    // Immediate zoom: rebuild grid and render right now. Retained tile layer
+    // + synchronous coarse fill prevent any gray flash. No debounce delay.
     fGraphicsView->resetTransform();
     rebuildContentGrid();
     centerViewport();
     _camera.invalidate();
-    submitRender();
-    renderIntersections();
+
+    auto surf = _surfWeak.lock();
+    if (surf && _volume && _volume->zarrDataset() &&
+        _tileScene->cols() > 0 && _tileScene->rows() > 0) {
+        QRectF vpRect = viewportSceneRect();
+        auto buildParams = [this](const WorldTileKey& wk) { return buildRenderParams(wk); };
+        _renderController->onCameraChanged(_camera, surf, _volume, buildParams, vpRect);
+    }
 }
 
 void CTiledVolumeViewer::setSliceOffset(float dz)
@@ -836,8 +872,6 @@ void CTiledVolumeViewer::onZoom(int steps, QPointF scene_point, Qt::KeyboardModi
         }
     }
 
-    updateStatusLabel();
-    invalidateOverlays();
 }
 
 void CTiledVolumeViewer::adjustZoomByFactor(float factor)
@@ -853,16 +887,11 @@ void CTiledVolumeViewer::adjustZoomByFactor(float factor)
     QPointF vpCenter(vpSize.width() * 0.5, vpSize.height() * 0.5);
     QPointF sceneCenter = fGraphicsView->mapToScene(vpCenter.toPoint());
     zoomStepsAt(steps, sceneCenter);
-
-    updateStatusLabel();
-    invalidateOverlays();
 }
 
 void CTiledVolumeViewer::adjustSurfaceOffset(float dn)
 {
     setSliceOffset(dn);
-    updateStatusLabel();
-    invalidateOverlays();
 }
 
 void CTiledVolumeViewer::resetSurfaceOffsets()
@@ -870,8 +899,6 @@ void CTiledVolumeViewer::resetSurfaceOffsets()
     _camera.zOff = 0.0f;
     _camera.invalidate();
     submitRender();
-    updateStatusLabel();
-    invalidateOverlays();
 }
 
 // ============================================================================
@@ -898,12 +925,10 @@ void CTiledVolumeViewer::onPanStart(Qt::MouseButton /*buttons*/, Qt::KeyboardMod
 void CTiledVolumeViewer::onPanRelease(Qt::MouseButton /*buttons*/, Qt::KeyboardModifiers /*modifiers*/)
 {
     _isPanning = false;
-    if (!_interactionQualityActive) {
-        _camera.invalidate();
-        submitRender();
-    }
-    _renderController->markOverlaysDirty();
-    renderIntersections();
+    _interactionQualityActive = false;
+    _camera.invalidate();
+    submitRender();
+    scheduleOverlayUpdate();
 }
 
 void CTiledVolumeViewer::onScrolled()
@@ -919,7 +944,7 @@ void CTiledVolumeViewer::onResized()
     centerViewport();
     _camera.invalidate();
     submitRender();
-    renderIntersections();
+    scheduleOverlayUpdate();
 }
 
 // ============================================================================
@@ -983,9 +1008,14 @@ void CTiledVolumeViewer::submitRender()
     QPointF centerScene = _tileScene->surfaceToScene(_focusSurfacePos[0], _focusSurfacePos[1]);
     _ov.centerMarker->setPos(centerScene);
 
-    // Submit to async render controller
     auto buildParams = [this](const WorldTileKey& wk) { return buildRenderParams(wk); };
-    _renderController->scheduleRender(_camera, surf, _volume, buildParams, vpRect);
+    // During active interaction (pan, z-scroll), coalesce via scheduleRender
+    // to avoid flooding the pool.  Other paths use direct onCameraChanged.
+    if (_isPanning || _interactionQualityActive) {
+        _renderController->scheduleRender(_camera, surf, _volume, buildParams, vpRect);
+    } else {
+        _renderController->onCameraChanged(_camera, surf, _volume, buildParams, vpRect);
+    }
 
     // Compute prefetch viewport: extend in pan direction for predictive prefetch
     QRectF prefetchRect = vpRect;
@@ -1014,7 +1044,7 @@ void CTiledVolumeViewer::submitRender()
         }
     }
 
-    // Viewport-aware prefetch
+    // Viewport-aware prefetch: current view + adjacent z-slices
     if (_volume->tieredCache()) {
         cv::Vec3f lo, hi;
         auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
@@ -1022,7 +1052,16 @@ void CTiledVolumeViewer::submitRender()
             ? computePlanePrefetchBBox(plane, prefetchRect, lo, hi)
             : computeQuadPrefetchBBox(surf, prefetchRect, lo, hi);
         if (ok) {
+            // Prefetch current viewport
             _volume->prefetchWorldBBox(lo, hi, _camera.dsScaleIdx);
+
+            // Also prefetch adjacent z-slices so scroll-ahead data is warm.
+            // Extend the bbox ±PREFETCH_Z_SLICES in the normal direction.
+            constexpr float PREFETCH_Z_SLICES = 16.0f;
+            cv::Vec3f loZ = lo, hiZ = hi;
+            loZ[2] -= PREFETCH_Z_SLICES;
+            hiZ[2] += PREFETCH_Z_SLICES;
+            _volume->prefetchWorldBBox(loZ, hiZ, _camera.dsScaleIdx);
         }
     }
 }
@@ -1152,7 +1191,6 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
 
     const bool interactionActive = interactionRenderActive();
     uint64_t cacheIdentity = _renderController ? _renderController->paramsHash() : 0;
-    cacheIdentity = utils::hash_combine_values(cacheIdentity, interactionActive);
     params.cacheIdentity = cacheIdentity;
 
     // Surface parameter ROI from world tile coordinates
@@ -1168,12 +1206,6 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     params.dsScale = _camera.dsScale;
     params.dsScaleIdx = _camera.dsScaleIdx;
     params.zOff = _camera.zOff;
-
-    if (interactionActive && _volume) {
-        const int maxLevel = std::max(0, static_cast<int>(_volume->numScales()) - 1);
-        params.dsScaleIdx = std::min(_camera.dsScaleIdx + 1, maxLevel);
-        params.dsScale = std::pow(2.0f, -params.dsScaleIdx);
-    }
 
     params.windowLow = _baseWindowLow;
     params.windowHigh = _baseWindowHigh;
@@ -1410,7 +1442,12 @@ void CTiledVolumeViewer::onMouseRelease(QPointF scene_loc, Qt::MouseButton butto
     }
 }
 
-void CTiledVolumeViewer::onKeyRelease(int key, Qt::KeyboardModifiers /*modifiers*/)
+void CTiledVolumeViewer::onKeyRelease(int /*key*/, Qt::KeyboardModifiers /*modifiers*/)
+{
+    // Arrow key pan moved to onKeyPress for immediate response
+}
+
+void CTiledVolumeViewer::onKeyPress(int key, Qt::KeyboardModifiers /*modifiers*/)
 {
     constexpr int PAN_PX = 64;
     switch (key) {
@@ -1572,6 +1609,14 @@ void CTiledVolumeViewer::updateStatusLabel()
         status += QString(" | downloading %1/%2").arg(_pinReceived).arg(_pinTotal.load());
     }
 
+    // Render pool pending count
+    if (_renderController) {
+        int pending = _renderController->renderPool()->pendingCount();
+        if (pending > 0) {
+            status += QString(" | pool %1").arg(pending);
+        }
+    }
+
     status += " [tiled]";
 
     _lbl->setText(status);
@@ -1591,6 +1636,7 @@ void CTiledVolumeViewer::fitSurfaceInView()
         if (_volume) _camera.recalcPyramidLevel(_volume->numScales());
         _camera.invalidate();
         updateStatusLabel();
+        fGraphicsView->resetTransform();
         rebuildContentGrid();
         centerViewport();
         submitRender();
@@ -1658,6 +1704,7 @@ void CTiledVolumeViewer::fitSurfaceInView()
     if (_volume) _camera.recalcPyramidLevel(_volume->numScales());
     _camera.invalidate();
     updateStatusLabel();
+    fGraphicsView->resetTransform();
     rebuildContentGrid();
     centerViewport();
     submitRender();
@@ -1880,26 +1927,35 @@ void CTiledVolumeViewer::updateAllOverlays()
 
 void CTiledVolumeViewer::renderIntersections()
 {
-    invalidateIntersect();
+    // During active interaction, throttle intersection recomputation to ~5Hz.
+    // The full rebuild (invalidateIntersect + computePlaneIntersections + new
+    // QGraphicsPathItems) is expensive and causes visible line pop-in.
+    if (interactionRenderActive() && _intersectionThrottleTimer) {
+        _intersectionsDirty = true;
+        if (!_intersectionThrottleTimer->isActive()) {
+            _intersectionThrottleTimer->start();
+        }
+        return;
+    }
+
+    // NOTE: old intersection items are kept visible until new ones are
+    // built below.  invalidateIntersect() is called right before the new
+    // items are installed, so lines never disappear mid-frame.
 
     auto surf = _surfWeak.lock();
     auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
     if (!plane || !_state || !_tileScene || !_viewerManager) {
-        std::cout << "[renderIntersections:" << _surfName << "] early return: plane=" << (plane != nullptr) << " state=" << (_state != nullptr)
-                  << " tileScene=" << (_tileScene != nullptr) << " viewerManager=" << (_viewerManager != nullptr) << std::endl;
+        invalidateIntersect();
         return;
     }
 
     auto* patchIndex = _viewerManager->surfacePatchIndex();
     if (!patchIndex || patchIndex->empty()) {
-        std::cout << "[renderIntersections:" << _surfName << "] early return: patchIndex=" << (patchIndex != nullptr)
-                  << " empty=" << (patchIndex ? patchIndex->empty() : true) << std::endl;
         return;
     }
 
     const QRectF sceneRect = viewportSceneRect();
     if (!sceneRect.isValid()) {
-        std::cout << "[renderIntersections:" << _surfName << "] early return: invalid sceneRect" << std::endl;
         return;
     }
 
@@ -1925,9 +1981,8 @@ void CTiledVolumeViewer::renderIntersections()
         addTarget(name);
     }
 
-    std::cout << "[renderIntersections:" << _surfName << "] intersectTgts=" << _intersectTgts.size() << " targets=" << targets.size() << std::endl;
-
     if (targets.empty()) {
+        invalidateIntersect();  // user removed all targets
         return;
     }
 
@@ -2049,6 +2104,8 @@ void CTiledVolumeViewer::renderIntersections()
         items.push_back(item);
     }
 
+    // Remove old items and install new ones atomically — lines never disappear
+    invalidateIntersect();
     if (!items.empty()) {
         _ov.intersectItems[kIntersectionItemsKey] = std::move(items);
         fGraphicsView->viewport()->update();

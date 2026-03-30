@@ -6,6 +6,7 @@
 #include <QTimer>
 #include <QImage>
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 #include "vc/core/cache/TieredChunkCache.hpp"
@@ -18,10 +19,10 @@ TileRenderController::TileRenderController(TileScene* tileScene, RenderPool* sha
     , _renderPool(sharedPool)
     , _controllerId(_nextControllerId.fetch_add(1, std::memory_order_relaxed))
 {
-    // Tick timer (~30 Hz) handles periodic work; started on-demand, auto-stops
+    // Tick timer (~60 Hz) handles periodic work; started on-demand, auto-stops
     // when idle to avoid burning CPU.
     _tickTimer = new QTimer(this);
-    _tickTimer->setInterval(33);
+    _tickTimer->setInterval(16);
     connect(_tickTimer, &QTimer::timeout, this, &TileRenderController::tick);
     // Not started here — ensureTickRunning() starts it when work arrives.
 
@@ -119,9 +120,17 @@ void TileRenderController::onCameraChanged(
     _currentEpoch->store(camera.epoch, std::memory_order_relaxed);
     _desiredLevel = camera.dsScaleIdx;
 
-    if (epochChanged && volume) {
-        volume->cancelPendingPrefetch();
-        volume->tieredCache()->setIOEpoch(camera.epoch);
+    if (epochChanged) {
+        _inFlightTiles.clear();  // new epoch → need fresh renders
+        if (volume && volume->tieredCache()) {
+            volume->tieredCache()->setIOEpoch(camera.epoch);
+        }
+    } else {
+        // Same epoch but pool may have been flushed — prune in-flight set
+        // against pool pending count to avoid permanent dedup blocks
+        if (_renderPool->pendingCount() == 0) {
+            _inFlightTiles.clear();
+        }
     }
 
     // Store last render state for refinement retries
@@ -152,6 +161,16 @@ void TileRenderController::onCameraChanged(
         _atomicNextEpochSwap = false;
     }
 
+    // Determine coarsest level for synchronous preview fills.
+    // Skip sync fill when only zOff changed (tiles already have content from
+    // the previous slice — keeping them is better than blocking the UI).
+    const bool scaleOrViewChanged = (std::abs(camera.scale - _lastCamera.scale) > 1e-6f) ||
+                                     (viewportRect != _lastViewportRect);
+    const int coarsestLevel = volume ? std::max(0, static_cast<int>(volume->numScales()) - 1) : 0;
+    const uint64_t epoch = _currentEpoch->load(std::memory_order_relaxed);
+    int syncFillCount = 0;
+    constexpr int kMaxSyncFills = 8;  // cap to avoid blocking UI thread
+
     for (const auto& wk : visibleKeys) {
         SliceCacheKey cacheKey = SliceCacheKey::make(wk, camera, _paramsHash);
 
@@ -162,16 +181,49 @@ void TileRenderController::onCameraChanged(
                 stagePendingSwapTile(wk, lookup.pixmap, static_cast<int8_t>(lookup.level), true);
             } else {
                 _tileScene->setTileWorld(
-                    wk, lookup.pixmap, _currentEpoch->load(std::memory_order_relaxed), lookup.level);
+                    wk, lookup.pixmap, epoch, lookup.level);
             }
             if (lookup.level == camera.dsScaleIdx) {
                 continue;  // exact hit, no need to re-render
             }
+        } else if (volume && surface && scaleOrViewChanged
+                   && _tileScene->tileNeedsContent(wk)
+                   && syncFillCount < kMaxSyncFills) {
+            // Tile has no rendered content — render a coarse preview
+            // synchronously from pinned zarr data (~1ms/tile).
+            // Capped to avoid blocking the UI thread too long.
+            ++syncFillCount;
+            TileRenderParams coarseParams = buildParams(wk);
+            coarseParams.dsScaleIdx = coarsestLevel;
+            coarseParams.dsScale = std::pow(2.0f, -coarsestLevel);
+            coarseParams.useFastInterpolation = true;
+            coarseParams.overlayVolume = nullptr;
+            coarseParams.overlayOpacity = 0.0f;
+            coarseParams.compositeSettings = CompositeRenderSettings{};
+
+            auto preview = TileRenderer::renderTile(coarseParams, surface, volume.get());
+            if (!preview.image.isNull()) {
+                QPixmap px = QPixmap::fromImage(preview.image, Qt::NoFormatConversion);
+                if (_pendingSwapActive && camera.epoch == _pendingSwapEpoch) {
+                    stagePendingSwapTile(wk, px, static_cast<int8_t>(coarsestLevel), true);
+                } else {
+                    _tileScene->setTileWorld(wk, px, epoch, static_cast<int8_t>(coarsestLevel));
+                }
+                TiledViewerCamera snapCam;
+                snapCam.scale = coarseParams.scale;
+                snapCam.zOff = coarseParams.zOff;
+                snapCam.dsScaleIdx = coarsestLevel;
+                SliceCacheKey coarseKey = SliceCacheKey::make(wk, snapCam, coarseParams.cacheIdentity);
+                _cache.put(coarseKey, px);
+            }
         }
 
-        // Submit to background pool (tiered cache handles progressive resolution)
-        TileRenderParams params = buildParams(wk);
-        _renderPool->submit(params, surface, volume, _currentEpoch, _controllerId);
+        // Submit to background pool for full-quality render (skip duplicates)
+        if (_inFlightTiles.find(wk) == _inFlightTiles.end()) {
+            TileRenderParams params = buildParams(wk);
+            _renderPool->submit(params, surface, volume, _currentEpoch, _controllerId);
+            _inFlightTiles.insert(wk);
+        }
     }
 
     if (tryCommitPendingSwap()) {
@@ -247,10 +299,12 @@ void TileRenderController::drainResults()
     bool anyUpdated = false;
 
     for (auto& result : results) {
+        // Remove from in-flight tracking so tile can be re-submitted for refinement
+        _inFlightTiles.erase(result.worldKey);
+
         QPixmap pixmap;
         const bool hasPixmap = !result.image.isNull();
         if (hasPixmap) {
-            // QImage is Format_RGB32 (native pixmap format) — no conversion needed
             pixmap = QPixmap::fromImage(result.image, Qt::NoFormatConversion);
         }
 
@@ -320,10 +374,12 @@ void TileRenderController::tick()
         _chunkArrived = false;
     }
 
-    // 3. Progressive refinement: re-submit stale tiles only when new chunks
-    //    have arrived (meaning finer data may now be available).
-    //    Without the chunksJustArrived guard, idle pool + stale tiles = infinite loop.
-    if (_progressiveEnabled && chunksJustArrived) {
+    // 3. Progressive refinement: re-submit stale tiles when new chunks have
+    //    arrived OR when the pool is idle AND not actively interacting
+    //    (during z-scroll, idle refinement just re-renders the same tiles).
+    bool poolIdle = _renderPool->pendingCount() == 0;
+    bool shouldRefine = chunksJustArrived || (poolIdle && !_pendingDirty);
+    if (_progressiveEnabled && shouldRefine) {
         if (_lastSurface && _lastVolume && _lastBuildParams) {
             auto stale = _tileScene->staleTilesInRect(_desiredLevel, _currentEpoch->load(std::memory_order_relaxed), _lastViewportRect, tiled_config::VISIBLE_BUFFER_TILES);
             if (!stale.empty()) {
@@ -360,18 +416,7 @@ void TileRenderController::tick()
         }
     }
 
-    // 4. Zoom settle countdown
-    if (_zoomSettlePending) {
-        if (_zoomSettleTicksLeft == 0) {
-            _zoomSettlePending = false;
-            if (_zoomSettleCallback) _zoomSettleCallback();
-        } else {
-            _zoomSettleTicksLeft--;
-            moreWork = true;
-        }
-    }
-
-    // 5. Overlay update
+    // 4. Overlay update
     if (_overlaysDirty) {
         _overlaysDirty = false;
         if (_overlayCallback) _overlayCallback();
@@ -412,25 +457,8 @@ void TileRenderController::markChunkArrived()
     ensureTickRunning();
 }
 
-void TileRenderController::startZoomSettle()
-{
-    _zoomSettlePending = true;
-    ensureTickRunning();
-    _zoomSettleTicksLeft = tiled_config::ZOOM_SETTLE_TICKS;  // ~200ms at 33ms/tick
-}
-
-void TileRenderController::cancelZoomSettle()
-{
-    _zoomSettlePending = false;
-    _zoomSettleTicksLeft = 0;
-}
-
 void TileRenderController::setOverlayCallback(std::function<void()> cb)
 {
     _overlayCallback = std::move(cb);
 }
 
-void TileRenderController::setZoomSettleCallback(std::function<void()> cb)
-{
-    _zoomSettleCallback = std::move(cb);
-}

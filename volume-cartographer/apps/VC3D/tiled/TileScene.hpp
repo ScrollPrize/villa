@@ -65,10 +65,9 @@ struct ContentBounds {
 // Shared configuration constants for the tiled renderer subsystem.
 // TILE_PX lives in TileScene (tightly coupled to grid layout).
 namespace tiled_config {
-    constexpr int VISIBLE_BUFFER_TILES = 1;   // extra tiles around viewport for smooth scrolling
+    constexpr int VISIBLE_BUFFER_TILES = 2;   // extra tiles around viewport for smooth scrolling
     constexpr int MAX_COARSER_LEVELS   = 8;   // fallback levels searched in SliceCache::getBest()
-    constexpr int ZOOM_SETTLE_TICKS    = 5;   // ticks before zoom settle fires (~200ms at 33ms/tick)
-    constexpr int DRAIN_BATCH_SIZE     = 32;  // max results drained per tick cycle
+    constexpr int DRAIN_BATCH_SIZE     = 128; // max results drained per tick cycle
 }
 
 // Per-tile metadata for staleness checks during progressive rendering.
@@ -102,6 +101,10 @@ public:
     bool setTileWorld(const WorldTileKey& wk, const QPixmap& pixmap,
                       uint64_t epoch, int8_t level);
 
+    // Returns true if the tile at wk has no rendered content (level == -1).
+    // Used to decide whether a synchronous coarse preview is needed.
+    bool tileNeedsContent(const WorldTileKey& wk) const;
+
     // Reset all tile metadata (on full invalidation)
     void resetMetadata();
 
@@ -110,6 +113,10 @@ public:
 
     // Call after the QGraphicsScene is cleared externally.
     void sceneCleared();
+
+    // Remove and delete retained (background) items from previous grid rebuilds.
+    void clearRetained();
+    bool hasRetainedItems() const { return !_retainedItems.empty(); }
 
     // Content bounds
     const ContentBounds& bounds() const { return _bounds; }
@@ -153,6 +160,7 @@ private:
     QGraphicsScene* _scene;
     std::vector<QGraphicsPixmapItem*> _items; // row-major: [row * totalCols + col]
     std::vector<TileMetadata> _meta;
+    std::vector<QGraphicsPixmapItem*> _retainedItems; // old items kept as background during transition
     ContentBounds _bounds;
     float _padX = 0;  // scene padding when content < viewport
     float _padY = 0;

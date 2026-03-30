@@ -191,6 +191,7 @@ target_link_libraries(VC3D
     Qt6::Gui
     Qt6::Widgets
     Qt6::Network
+    Qt6::OpenGLWidgets
     opencv_ximgproc
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
     blosc_static

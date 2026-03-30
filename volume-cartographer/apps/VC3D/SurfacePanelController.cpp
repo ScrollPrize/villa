@@ -1597,7 +1597,6 @@ void SurfacePanelController::applyFiltersInternal()
     POI* poi = _state ? _state->poi("focus") : nullptr;
     int filterCounter = 0;
     const bool currentOnly = isChecked(_filters.currentOnly);
-    const bool restrictToCurrent = currentOnly && !_currentSurfaceId.empty();
 
     QTreeWidgetItemIterator it(_ui.treeWidget);
     while (*it) {
@@ -1718,12 +1717,13 @@ void SurfacePanelController::applyFiltersInternal()
 
     intersects.clear();
     intersects.insert("segmentation");
-    bool insertedCurrent = false;
-    if (restrictToCurrent && getSurfaceById(_currentSurfaceId)) {
-        intersects.insert(_currentSurfaceId);
-        insertedCurrent = true;
-    }
-    if (!restrictToCurrent || !insertedCurrent) {
+    if (currentOnly) {
+        // Only show the current segment's intersection line.
+        // If no segment is selected, just show "segmentation" alone.
+        if (!_currentSurfaceId.empty() && getSurfaceById(_currentSurfaceId)) {
+            intersects.insert(_currentSurfaceId);
+        }
+    } else {
         collectVisibleSurfaces(intersects);
     }
 

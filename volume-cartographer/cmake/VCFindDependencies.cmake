@@ -55,7 +55,7 @@ foreach(_target xtl xsimd xtensor)
 endforeach()
 
 # ---- Qt (apps / utils) -------------------------------------------------------
-find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent)
+find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent OpenGLWidgets)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)

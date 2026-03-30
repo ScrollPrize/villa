@@ -36,10 +36,12 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
         return;
     }
 
-    // Remove old items from scene
+    // Retain old items as a background layer so they remain visible
+    // through the new (initially transparent) tiles, preventing gray flash.
+    clearRetained();
     for (auto* item : _items) {
-        _scene->removeItem(item);
-        delete item;
+        item->setZValue(-1);
+        _retainedItems.push_back(item);
     }
     _items.clear();
     _meta.clear();
@@ -63,9 +65,14 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
 
     _scene->setSceneRect(0, 0, sceneW, sceneH);
 
-    // Create placeholder pixmap
+    // Create transparent placeholder so retained items show through
     QPixmap placeholder(TILE_PX, TILE_PX);
-    placeholder.fill(QColor(64, 64, 64));
+    if (_retainedItems.empty()) {
+        // No retained background — use gray placeholder (initial load)
+        placeholder.fill(QColor(64, 64, 64));
+    } else {
+        placeholder.fill(Qt::transparent);
+    }
 
     const int count = _bounds.totalRows * _bounds.totalCols;
     _items.resize(count, nullptr);
@@ -92,11 +99,18 @@ bool TileScene::setTile(const TileKey& key, const QPixmap& pixmap,
     const int idx = key.row * _bounds.totalCols + key.col;
     auto& m = _meta[idx];
 
-    // Reject stale renders (from an older epoch)
-    if (epoch < m.epoch) return false;
-
-    // Same epoch: reject if we already have equal or better (finer) data.
-    // Lower level number = finer resolution = better.
+    // Accept if newer epoch (any level — new camera state wins).
+    // Accept if same epoch and finer level (progressive refinement).
+    // Also accept if slightly older epoch but MUCH finer level — this
+    // lets fine-resolution renders from a recent camera state replace
+    // coarse preview fills from the current epoch.
+    if (epoch < m.epoch) {
+        // Allow a finer render from a recent epoch to replace a coarse fill
+        constexpr uint64_t kEpochGrace = 3;
+        bool finerFromRecentEpoch = (m.epoch - epoch <= kEpochGrace) &&
+                                     m.level >= 0 && level >= 0 && level < m.level;
+        if (!finerFromRecentEpoch) return false;
+    }
     if (epoch == m.epoch && m.level >= 0 && level >= m.level) return false;
 
     m.epoch = epoch;
@@ -115,6 +129,15 @@ bool TileScene::setTileWorld(const WorldTileKey& wk, const QPixmap& pixmap,
     return setTile(TileKey{col, row}, pixmap, epoch, level);
 }
 
+bool TileScene::tileNeedsContent(const WorldTileKey& wk) const
+{
+    int col, row;
+    if (!_bounds.gridPosition(wk, col, row)) return false;
+    const int idx = row * _bounds.totalCols + col;
+    if (static_cast<size_t>(idx) >= _meta.size()) return false;
+    return _meta[idx].level < 0;
+}
+
 void TileScene::resetMetadata()
 {
     for (auto& m : _meta) {
@@ -125,6 +148,8 @@ void TileScene::resetMetadata()
 
 void TileScene::clearAll()
 {
+    clearRetained();
+
     QPixmap placeholder(TILE_PX, TILE_PX);
     placeholder.fill(QColor(64, 64, 64));
 
@@ -136,11 +161,21 @@ void TileScene::clearAll()
     resetMetadata();
 }
 
+void TileScene::clearRetained()
+{
+    for (auto* item : _retainedItems) {
+        _scene->removeItem(item);
+        delete item;
+    }
+    _retainedItems.clear();
+}
+
 void TileScene::sceneCleared()
 {
     // The scene already deleted all items — just forget the pointers.
     _items.clear();
     _meta.clear();
+    _retainedItems.clear();
     _bounds = ContentBounds{};
     _padX = 0;
     _padY = 0;

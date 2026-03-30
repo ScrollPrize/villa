@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "SliceCache.hpp"
 #include "RenderPool.hpp"
@@ -68,6 +69,7 @@ public:
 
     // Access the slice cache (for stats, manual invalidation, etc.)
     SliceCache& sliceCache() { return _cache; }
+    RenderPool* renderPool() const { return _renderPool; }
 
     // Hash rendering parameters for cache key generation.
     // Should be recomputed whenever window/level, colormap, composite settings change.
@@ -85,10 +87,7 @@ public:
     // --- Dirty flags (set by viewer, processed each tick) ---
     void markOverlaysDirty();
     void markChunkArrived();
-    void startZoomSettle();
-    void cancelZoomSettle();
     void setOverlayCallback(std::function<void()> cb);
-    void setZoomSettleCallback(std::function<void()> cb);
 
 signals:
     // Emitted when drainResults() actually updated tile pixmaps.
@@ -144,15 +143,15 @@ private:
     std::function<TileRenderParams(const WorldTileKey&)> _pendingBuildParams;
     QRectF _pendingViewportRect;
 
+    // In-flight tile tracking to avoid duplicate submissions
+    std::unordered_set<WorldTileKey, WorldTileKeyHash> _inFlightTiles;
+
     // Dirty flags set by the viewer, processed each tick
     bool _overlaysDirty = false;
     bool _chunkArrived = false;
-    bool _zoomSettlePending = false;
-    uint64_t _zoomSettleTicksLeft = 0;  // countdown in ticks (~6 ticks = 200ms)
 
-    // Callbacks to notify the viewer
+    // Callback to notify the viewer
     std::function<void()> _overlayCallback;
-    std::function<void()> _zoomSettleCallback;
 
     // Atomic epoch swap: collect all tiles for a new epoch before displaying
     bool _pendingSwapActive = false;

@@ -67,6 +67,7 @@ private:
     std::mutex resultsMutex_;
     std::vector<TileRenderResult> completedResults_;
     std::atomic<int> pendingCount_{0};
+    std::atomic<bool> resultSignalPending_{false};  // debounce tileReady emission
 
     // Track the oldest submission time to detect timed-out renders.
     std::mutex timeMutex_;

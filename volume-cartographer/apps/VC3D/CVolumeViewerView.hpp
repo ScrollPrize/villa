@@ -34,6 +34,7 @@ signals:
     void sendMousePress(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendMouseMove(QPointF, Qt::MouseButtons, Qt::KeyboardModifiers);
     void sendMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
+    void sendKeyPress(int key, Qt::KeyboardModifiers modifiers);
     void sendKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     
 protected:
@@ -51,6 +52,7 @@ protected:
     double m_vx = 32.0, m_vy = 32.0;
     bool _middleButtonPanEnabled = true;
     bool _scrollPanDisabled = false;
+    int _wheelAccum = 0;  // fractional wheel delta accumulator
 
     // Scalebar cache — avoid recomputing font/text every frame
     mutable QFont _cachedFont;

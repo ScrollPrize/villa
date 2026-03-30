@@ -223,6 +223,7 @@ public slots:
     void onMouseRelease(QPointF scene_loc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onVolumeClosing();
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
+    void onKeyPress(int key, Qt::KeyboardModifiers modifiers);
     void onKeyRelease(int key, Qt::KeyboardModifiers modifiers);
 
 signals:
@@ -412,6 +413,8 @@ private:
     bool _overlayUpdatePending = false;  // coalescing flag for scheduleOverlayUpdate()
     bool _interactionQualityActive = false;
     QTimer* _interactionSettleTimer = nullptr;
+    QTimer* _intersectionThrottleTimer = nullptr;  // coalesces renderIntersections calls
+    bool _intersectionsDirty = false;
 
     // --- Zoom limits ---
     float _contentMinScale = TiledViewerCamera::MIN_SCALE;  // dynamic minimum so content fills viewport

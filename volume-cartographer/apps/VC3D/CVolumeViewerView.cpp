@@ -85,16 +85,22 @@ void CVolumeViewerView::scrollContentsBy(int dx, int dy)
 
 void CVolumeViewerView::wheelEvent(QWheelEvent *event)
 {
-    // Get raw delta value and use smaller divisor for higher sensitivity
-    int num_degrees = event->angleDelta().y() / 8;
-    
+    // Accumulate fractional degrees so high-resolution trackpads and mice
+    // with fine scroll steps don't lose precision to integer truncation.
+    // Standard mice send 120 units (= 15 degrees) per notch.
+    _wheelAccum += event->angleDelta().y();
+    constexpr int kStepThreshold = 120;  // one notch = one step
+    int steps = _wheelAccum / kStepThreshold;
+    if (steps == 0) {
+        event->accept();
+        return;
+    }
+    _wheelAccum -= steps * kStepThreshold;
+
     QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
     QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
 
-    // Send the zoom event with a more sensitive delta value
-    // Changed from /15 to /5 to make it more responsive to small wheel movements
-    sendZoom(num_degrees/5, scene_loc, event->modifiers());
-    
+    sendZoom(steps, scene_loc, event->modifiers());
     event->accept();
 }
 
@@ -158,6 +164,7 @@ void CVolumeViewerView::keyPressEvent(QKeyEvent *event)
         case Qt::Key_Right:
         case Qt::Key_Up:
         case Qt::Key_Down:
+            emit sendKeyPress(event->key(), event->modifiers());
             event->accept();
             return;
         default:
