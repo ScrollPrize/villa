@@ -162,3 +162,38 @@ TEST(VcDataset, WriteZarrRegionU8ByChunkPreservesSubregionAndFillPadding)
         }
     }
 }
+
+TEST(VcDataset, ReadChunkOrFillUsesDatasetFillAndRemoveChunkDeletesFile)
+{
+    ScopedTempDir tempDir;
+    const std::vector<size_t> shape = {8, 8, 8};
+    const std::vector<size_t> chunks = {4, 4, 4};
+
+    auto ds = vc::createZarrDataset(
+        tempDir.path(), "0", shape, chunks, vc::VcDtype::uint8, "none", ".", 2);
+    ASSERT_TRUE(ds != nullptr);
+
+    std::vector<uint8_t> missing(chunks[0] * chunks[1] * chunks[2], 0);
+    EXPECT_FALSE(ds->readChunkOrFill(0, 0, 1, missing.data()));
+    for (uint8_t value : missing) {
+        EXPECT_EQ(value, uint8_t(2));
+    }
+
+    std::vector<uint8_t> chunk(chunks[0] * chunks[1] * chunks[2], 1);
+    EXPECT_TRUE(ds->writeChunk(0, 0, 0, chunk.data(), chunk.size() * sizeof(uint8_t)));
+    EXPECT_TRUE(ds->chunkExists(0, 0, 0));
+
+    std::vector<uint8_t> roundTrip(chunk.size(), 0);
+    EXPECT_TRUE(ds->readChunkOrFill(0, 0, 0, roundTrip.data()));
+    EXPECT_EQ(roundTrip, chunk);
+
+    EXPECT_TRUE(ds->removeChunk(0, 0, 0));
+    EXPECT_FALSE(ds->chunkExists(0, 0, 0));
+    EXPECT_FALSE(ds->removeChunk(0, 0, 0));
+
+    std::fill(roundTrip.begin(), roundTrip.end(), 0);
+    EXPECT_FALSE(ds->readChunkOrFill(0, 0, 0, roundTrip.data()));
+    for (uint8_t value : roundTrip) {
+        EXPECT_EQ(value, uint8_t(2));
+    }
+}

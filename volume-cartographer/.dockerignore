@@ -6,3 +6,7 @@
 .zenodo.json
 build
 results
+**/build/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake-build*/
