@@ -1915,7 +1915,7 @@ void CTiledVolumeViewer::updateAllOverlays()
 }
 
 // ============================================================================
-// Stubs for functionality ported in later phases
+// Intersection rendering
 // ============================================================================
 
 void CTiledVolumeViewer::renderIntersections()

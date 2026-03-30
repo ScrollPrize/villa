@@ -43,8 +43,8 @@ class PlaneSurface;
 // QGraphicsPixmapItems. Navigation updates tile *contents* rather than
 // scrolling a large scene.
 //
-// Phase 1: synchronous rendering. Later phases add async rendering,
-// tile caching, and progressive resolution.
+// Tiled volume viewer with async rendering, tile caching, progressive
+// resolution, and retained-layer transitions.
 class CTiledVolumeViewer : public QWidget, public VolumeViewerBase
 {
     Q_OBJECT

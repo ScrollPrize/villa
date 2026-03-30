@@ -99,7 +99,7 @@ private slots:
     // Drain completed results from the render pool and update tile scene.
     void drainResults();
 
-    // Unified tick: runs at ~30 Hz, handles all periodic work.
+    // Unified tick: runs at ~60 Hz, handles all periodic work.
     void tick();
 
     // Start the tick timer if not already running.

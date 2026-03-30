@@ -87,7 +87,7 @@ public:
     explicit TileScene(QGraphicsScene* scene);
 
     // Rebuild the grid to cover the given content bounds.
-    // Destroys old items and creates new ones at fixed positions.
+    // Retains old items as background layer and creates new ones.
     // viewportW/H are used to pad the scene rect so centerOn() works when
     // content is smaller than the viewport.
     void rebuildGrid(const ContentBounds& bounds, int viewportW, int viewportH);
