@@ -73,6 +73,12 @@ void RenderPool::submit(const TileRenderParams& params,
 
             TileRenderResult result = TileRenderer::renderTile(params, surface, volume.get());
             result.controllerId = controllerId;
+            // Convert QImage→QPixmap on worker thread to avoid GPU upload
+            // stalls on the main thread during drain.
+            if (!result.image.isNull()) {
+                result.pixmap = QPixmap::fromImage(result.image, Qt::NoFormatConversion);
+                result.image = QImage();  // release QImage memory
+            }
 
             pushResult(std::move(result));
         });

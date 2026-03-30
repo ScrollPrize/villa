@@ -251,7 +251,7 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     // Throttle intersection recomputation to ~5Hz during interaction
     _intersectionThrottleTimer = new QTimer(this);
     _intersectionThrottleTimer->setSingleShot(true);
-    _intersectionThrottleTimer->setInterval(1000);
+    _intersectionThrottleTimer->setInterval(500);
     connect(_intersectionThrottleTimer, &QTimer::timeout, this, [this]() {
         if (_intersectionsDirty) {
             _intersectionsDirty = false;
@@ -1016,9 +1016,9 @@ void CTiledVolumeViewer::submitRender()
         // so prefetch stays ahead of rapid panning.
         constexpr int PREFETCH_TILES_AHEAD = 3;
         const float tileExtent = static_cast<float>(TileScene::TILE_PX) * PREFETCH_TILES_AHEAD;
-        if (std::abs(delta.x()) > 0.5 || std::abs(delta.y()) > 0.5) {
-            // Normalize delta and scale by tile extent
-            double len = std::sqrt(delta.x() * delta.x() + delta.y() * delta.y());
+        double lenSq = delta.x() * delta.x() + delta.y() * delta.y();
+        if (lenSq > 1.0) {
+            double len = std::sqrt(lenSq);
             double nx = delta.x() / len;
             double ny = delta.y() / len;
             double extX = nx * tileExtent;
@@ -1032,7 +1032,8 @@ void CTiledVolumeViewer::submitRender()
         }
     }
 
-    // Viewport-aware prefetch: current view + adjacent z-slices
+    // Viewport-aware prefetch: always prefetch current view.
+    // Extended z-slice prefetch only when not actively scrolling.
     if (_volume->tieredCache()) {
         cv::Vec3f lo, hi;
         auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
@@ -1040,16 +1041,16 @@ void CTiledVolumeViewer::submitRender()
             ? computePlanePrefetchBBox(plane, prefetchRect, lo, hi)
             : computeQuadPrefetchBBox(surf, prefetchRect, lo, hi);
         if (ok) {
-            // Prefetch current viewport
             _volume->prefetchWorldBBox(lo, hi, _camera.dsScaleIdx);
 
-            // Also prefetch adjacent z-slices so scroll-ahead data is warm.
-            // Extend the bbox ±PREFETCH_Z_SLICES in the normal direction.
-            constexpr float PREFETCH_Z_SLICES = 16.0f;
-            cv::Vec3f loZ = lo, hiZ = hi;
-            loZ[2] -= PREFETCH_Z_SLICES;
-            hiZ[2] += PREFETCH_Z_SLICES;
-            _volume->prefetchWorldBBox(loZ, hiZ, _camera.dsScaleIdx);
+            // Extended z-slice prefetch (skip during rapid interaction)
+            if (!_interactionQualityActive) {
+                constexpr float PREFETCH_Z_SLICES = 16.0f;
+                cv::Vec3f loZ = lo, hiZ = hi;
+                loZ[2] -= PREFETCH_Z_SLICES;
+                hiZ[2] += PREFETCH_Z_SLICES;
+                _volume->prefetchWorldBBox(loZ, hiZ, _camera.dsScaleIdx);
+            }
         }
     }
 }

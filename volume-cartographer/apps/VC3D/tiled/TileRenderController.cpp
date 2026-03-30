@@ -117,6 +117,12 @@ void TileRenderController::onCameraChanged(
 {
     ensureTickRunning();
     bool epochChanged = (camera.epoch != _currentEpoch->load(std::memory_order_relaxed));
+
+    // Early out if nothing changed (pan without movement, duplicate calls)
+    if (!epochChanged && viewportRect == _lastViewportRect) {
+        return;
+    }
+
     _currentEpoch->store(camera.epoch, std::memory_order_relaxed);
     _desiredLevel = camera.dsScaleIdx;
 
@@ -304,11 +310,9 @@ void TileRenderController::drainResults()
         // Remove from in-flight tracking so tile can be re-submitted for refinement
         _inFlightTiles.erase(result.worldKey);
 
-        QPixmap pixmap;
-        const bool hasPixmap = !result.image.isNull();
-        if (hasPixmap) {
-            pixmap = QPixmap::fromImage(result.image, Qt::NoFormatConversion);
-        }
+        // Pixmap was already converted on the worker thread
+        const QPixmap& pixmap = result.pixmap;
+        const bool hasPixmap = !pixmap.isNull();
 
         // Always cache with world tile key (even if tile is no longer visible)
         TiledViewerCamera snapCamera;

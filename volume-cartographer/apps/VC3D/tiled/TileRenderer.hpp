@@ -5,6 +5,7 @@
 #include <string>
 #include <opencv2/core.hpp>
 #include <QImage>
+#include <QPixmap>
 
 #include "TiledViewerCamera.hpp"
 #include "TileScene.hpp"
@@ -53,7 +54,8 @@ struct TileRenderParams {
 // Result from rendering a single tile
 struct TileRenderResult {
     WorldTileKey worldKey;
-    QImage image;        // Format_RGB32 QImage (produced directly on worker thread)
+    QImage image;        // Format_RGB32 QImage (produced on worker thread)
+    QPixmap pixmap;      // Converted from image on worker thread (avoids main-thread GPU upload)
     uint64_t epoch = 0;
     uint64_t cacheIdentity = 0;
 
