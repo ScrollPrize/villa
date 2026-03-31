@@ -119,8 +119,9 @@ TileRenderResult TileRenderer::renderTile(
     }
 
     // Generate coordinates for non-fused paths.
-    cv::Mat_<cv::Vec3f> coords;
-    cv::Mat_<cv::Vec3f> normals;
+    // Thread-local to reuse buffers across tiles (gen() uses create() internally).
+    thread_local cv::Mat_<cv::Vec3f> coords;
+    thread_local cv::Mat_<cv::Vec3f> normals;
     if (!useFusedPlane) {
         if (needNormals && !plane) {
             surface->gen(&coords, &normals, cv::Size(params.tileW, params.tileH),
@@ -198,8 +199,11 @@ TileRenderResult TileRenderer::renderTile(
         }
     }
 
-    // Sample volume data
-    cv::Mat_<uint8_t> gray;
+    // Sample volume data — thread-local buffers avoid per-tile malloc/free.
+    // The sampling functions reuse the buffer when size matches.
+    thread_local cv::Mat_<uint8_t> gray;
+    thread_local cv::Mat_<uint8_t> grayFine;
+    thread_local cv::Mat_<uint8_t> overlayGray;
 
     if (useComposite && !plane) {
         // QuadSurface composite: coords and normals already generated above

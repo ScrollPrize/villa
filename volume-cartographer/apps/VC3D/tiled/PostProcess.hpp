@@ -51,3 +51,8 @@ struct PostProcessParams {
 //   5. Colormap or grayscale → RGB32
 QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
                         const PostProcessParams& params);
+
+// Allocate a QImage backed by a lock-free slab pool (1 MB for 512x512 ARGB32).
+// Buffer is returned to the pool when the QImage is destroyed. Falls back to
+// normal QImage allocation for non-standard sizes.
+QImage allocTileImage(int cols, int rows);

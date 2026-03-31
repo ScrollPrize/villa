@@ -115,8 +115,8 @@ canvas {
 </div>
 
 <div id="statusbar">
-    <span>Z: <span class="val" id="stat-z">0</span></span>
-    <span>Zoom: <span class="val" id="stat-zoom">1.00</span></span>
+    <span>Z: <span class="val" id="stat-z">0.0</span></span>
+    <span>Zoom: <span class="val" id="stat-zoom">0.50</span></span>
     <span>Level: <span class="val" id="stat-level">0</span></span>
     <span>Chunks: <span class="val" id="stat-chunks">0</span></span>
     <span>Cache: <span class="val" id="stat-cache">0 MB</span></span>
@@ -127,7 +127,7 @@ canvas {
 <script src="vc3d-web.js"></script>
 <script>
 // ============================================================================
-// VC3D Web Viewer
+// VC3D Web Viewer — uses RenderCore C API via WASM
 // ============================================================================
 
 const state = {
@@ -140,19 +140,10 @@ const state = {
     levels: [],         // Array of {shape: [z,y,x], chunks: [z,y,x]}
     compressor: null,   // 'blosc' | 'zstd' | null (raw)
 
-    // View state
-    sliceZ: 0,          // Current Z slice
-    zoom: 1.0,          // Pixels per voxel
-    panX: 0,            // Pan offset in pixels
-    panY: 0,
-    level: 0,           // Current pyramid level
-
     // Interaction
     dragging: false,
     dragStartX: 0,
     dragStartY: 0,
-    dragStartPanX: 0,
-    dragStartPanY: 0,
 
     // Chunk loading
     pendingFetches: 0,
@@ -167,23 +158,23 @@ function initWebGL(canvas) {
     const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
     if (!gl) { alert('WebGL not supported'); return null; }
 
-    // Fullscreen quad vertex shader
     const vsSource = `
         attribute vec2 aPos;
         varying vec2 vUV;
         void main() {
             vUV = aPos * 0.5 + 0.5;
-            vUV.y = 1.0 - vUV.y; // flip Y
+            vUV.y = 1.0 - vUV.y;
             gl_Position = vec4(aPos, 0.0, 1.0);
         }
     `;
-    // Fragment shader: sample texture
+    // ARGB32 -> swap channels: texture has BGRA byte order when uploaded as RGBA
     const fsSource = `
         precision mediump float;
         varying vec2 vUV;
         uniform sampler2D uTex;
         void main() {
-            gl_FragColor = texture2D(uTex, vUV);
+            vec4 c = texture2D(uTex, vUV);
+            gl_FragColor = vec4(c.b, c.g, c.r, c.a);
         }
     `;
 
@@ -201,7 +192,6 @@ function initWebGL(canvas) {
     gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSource));
     gl.linkProgram(prog);
 
-    // Fullscreen quad
     const buf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
@@ -210,7 +200,6 @@ function initWebGL(canvas) {
     gl.enableVertexAttribArray(aPos);
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
-    // Texture
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -228,6 +217,7 @@ function uploadToGL(pixelPtr, width, height) {
     const gl = state.gl;
     if (!gl || !pixelPtr) return;
 
+    // RenderCore outputs ARGB32 as uint32. Read as raw bytes (4 * width * height).
     const pixels = new Uint8Array(state.wasm.HEAPU8.buffer, pixelPtr, width * height * 4);
     gl.bindTexture(gl.TEXTURE_2D, state.texture);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
@@ -246,11 +236,9 @@ async function fetchJson(url) {
 }
 
 async function loadZarrMetadata(baseUrl) {
-    // Remove trailing slash
     baseUrl = baseUrl.replace(/\/+$/, '');
     state.zarrUrl = baseUrl;
 
-    // Discover pyramid levels by trying 0, 1, 2, ... until 404
     const levels = [];
     for (let lvl = 0; lvl < 20; lvl++) {
         try {
@@ -260,7 +248,7 @@ async function loadZarrMetadata(baseUrl) {
             const compressor = meta.compressor || null;
             levels.push({ shape, chunks, compressor, dtype: meta.dtype || '|u1' });
         } catch (e) {
-            break; // No more levels
+            break;
         }
     }
 
@@ -270,23 +258,23 @@ async function loadZarrMetadata(baseUrl) {
     state.compressor = levels[0].compressor;
 
     // Reset and configure WASM
-    state.wasm._vc3d_reset_levels();
+    state.wasm._wasm_reset_levels();
     state.loadedChunks.clear();
     state.failedChunks.clear();
 
     for (const lvl of levels) {
-        state.wasm._vc3d_add_level(
+        state.wasm._wasm_add_level(
             lvl.shape[0], lvl.shape[1], lvl.shape[2],
             lvl.chunks[0], lvl.chunks[1], lvl.chunks[2]
         );
     }
 
-    // Start at middle Z slice, level 0
-    state.level = 0;
-    state.sliceZ = Math.floor(levels[0].shape[0] / 2);
-    state.zoom = 1.0;
-    state.panX = 0;
-    state.panY = 0;
+    // Set initial plane: Z-axis normal, origin at volume center
+    const s = levels[0].shape;
+    state.wasm._wasm_set_plane(
+        s[2] / 2.0, s[1] / 2.0, s[0] / 2.0,  // origin: center of volume
+        0.0, 0.0, 1.0                           // normal: Z axis
+    );
 
     updateLevelInfo();
     return levels;
@@ -294,24 +282,13 @@ async function loadZarrMetadata(baseUrl) {
 
 // --- Chunk decompression ---
 
-// Blosc decompression in pure JS (minimal implementation for zarr compatibility).
-// For production, use blosc.js or a WASM blosc build.
-// For now, we try fetching raw (uncompressed) chunks, which works for
-// zarr volumes stored without compression or with server-side decompression.
-//
-// If chunks are blosc-compressed, we need a JS blosc decoder.
-// The simplest approach: use the pako library for zlib, or load
-// blosc via a separate WASM module.
-
 async function decompressChunk(compressed, compressorMeta) {
-    // If no compressor, data is raw
     if (!compressorMeta) return compressed;
 
     const id = compressorMeta.id || compressorMeta;
     if (id === 'blosc') {
         return decompressBlosc(compressed);
     } else if (id === 'zstd') {
-        // Would need a zstd JS decoder
         console.warn('zstd decompression not yet implemented in JS');
         return compressed;
     }
@@ -319,28 +296,8 @@ async function decompressChunk(compressed, compressorMeta) {
 }
 
 function decompressBlosc(input) {
-    // Minimal blosc header parsing:
-    // Bytes 0-3: blosc header (version, flags, etc.)
-    // Bytes 4-7: uncompressed size (little-endian)
-    // Bytes 8-11: compressed size (little-endian)
-    // Bytes 12-15: block size
-    // Then compressed data follows (lz4, zstd, etc.)
-    //
-    // For a minimal prototype, if the volume is stored with raw/uncompressed
-    // blosc (shuffle only, no compression), we can extract directly.
-    // For real blosc, we would need https://github.com/nicktraveler/blosc-js
-    // or compile c-blosc to WASM.
-
     const view = new DataView(input.buffer, input.byteOffset, input.byteLength);
-    // blosc header byte 0 = version, byte 1 = flags (bit 0 = byte shuffle)
-    // bytes 4-7 = nbytes (uncompressed size), little-endian
     const nbytes = view.getUint32(4, true);
-    // bytes 12-15 = blocksize
-    // byte 2 = typesize
-
-    // For now, return the raw data past the 16-byte header.
-    // This only works for uncompressed blosc (clevel=0).
-    // TODO: integrate a real blosc decoder.
     console.warn('Blosc decompression stub: assuming uncompressed blosc (clevel=0). ' +
                  'For compressed data, integrate blosc.js or c-blosc WASM.');
     return new Uint8Array(input.buffer, input.byteOffset + 16, nbytes);
@@ -352,7 +309,6 @@ async function fetchChunk(level, iz, iy, ix) {
     const key = `${level}/${iz}/${iy}/${ix}`;
     if (state.loadedChunks.has(key) || state.failedChunks.has(key)) return;
 
-    // Determine zarr chunk filename separator (default '.')
     const url = `${state.zarrUrl}/${level}/${iz}.${iy}.${ix}`;
 
     state.pendingFetches++;
@@ -362,7 +318,6 @@ async function fetchChunk(level, iz, iy, ix) {
         const resp = await fetch(url);
         if (!resp.ok) {
             if (resp.status === 404 || resp.status === 403) {
-                // Chunk doesn't exist (empty region)
                 state.failedChunks.add(key);
                 return;
             }
@@ -371,20 +326,19 @@ async function fetchChunk(level, iz, iy, ix) {
 
         let data = new Uint8Array(await resp.arrayBuffer());
 
-        // Decompress if needed
         const lvlMeta = state.levels[level];
         if (lvlMeta && lvlMeta.compressor) {
             data = await decompressChunk(data, lvlMeta.compressor);
         }
 
-        // Handle uint16 -> uint8 conversion (matching VC3D behavior)
+        // Handle uint16 -> uint8 conversion
         if (lvlMeta && (lvlMeta.dtype === '<u2' || lvlMeta.dtype === '>u2' ||
                         lvlMeta.dtype === '<i2' || lvlMeta.dtype === '>i2')) {
             const u16 = new Uint16Array(data.buffer, data.byteOffset,
                                         data.byteLength / 2);
             const u8 = new Uint8Array(u16.length);
             for (let i = 0; i < u16.length; i++) {
-                u8[i] = Math.min(255, u16[i] >> 8); // scale 0-65535 to 0-255
+                u8[i] = Math.min(255, u16[i] >> 8);
             }
             data = u8;
         }
@@ -392,7 +346,7 @@ async function fetchChunk(level, iz, iy, ix) {
         // Pass to WASM
         const ptr = state.wasm._malloc(data.length);
         state.wasm.HEAPU8.set(data, ptr);
-        state.wasm._vc3d_load_chunk(level, iz, iy, ix, ptr, data.length);
+        state.wasm._wasm_load_chunk(level, iz, iy, ix, ptr, data.length);
         state.wasm._free(ptr);
 
         state.loadedChunks.add(key);
@@ -407,42 +361,68 @@ async function fetchChunk(level, iz, iy, ix) {
 }
 
 // Determine which chunks are visible and fetch them.
+// Uses the RenderCore camera state to compute the visible region.
 function fetchVisibleChunks() {
     if (state.levels.length === 0) return;
 
-    const lvl = state.levels[state.level];
+    const level = state.wasm._wasm_pyramid_level();
+    const lvl = state.levels[level];
     if (!lvl) return;
 
     const canvas = document.getElementById('viewport');
     const w = canvas.width;
     const h = canvas.height;
+    const scale = state.wasm._wasm_scale();
+    const zOff = state.wasm._wasm_z_offset();
 
     const cs = lvl.chunks;
-    const invZoom = 1.0 / state.zoom;
+    const invZoom = 1.0 / scale;
+    const levelScale = 1.0 / (1 << level);
 
-    // Compute voxel range visible on screen
-    const voxMinX = -state.panX * invZoom;
-    const voxMinY = -state.panY * invZoom;
-    const voxMaxX = voxMinX + w * invZoom;
-    const voxMaxY = voxMinY + h * invZoom;
+    // The RenderCore uses a center-origin model. The visible region in
+    // world coordinates spans +/- (w/2) / scale and +/- (h/2) / scale
+    // around the origin. We need to know the origin to compute chunk ranges.
+    // For now, read origin from the level-0 shape center (set at load time)
+    // plus any pan offsets. Since we can't read origin back from WASM easily,
+    // we track it approximately via the level-0 shape.
+    //
+    // The actual visible world-space range is computed from the plane equation.
+    // For an axis-aligned Z-normal plane, the visible X range at level coords is:
+    //   centerX * levelScale +/- (w/2) * invZoom * levelScale
 
-    // Z slice -- just the current one (plus neighbors for scrolling)
-    const iz = state.sliceZ;
-    const minCz = Math.max(0, Math.floor((iz - 1) / cs[0]));
+    // Use a conservative approach: fetch chunks covering the whole visible area
+    // We'll compute approximate center from shape
+    const s0 = state.levels[0].shape;
+    const halfW = (w / 2.0) * invZoom;
+    const halfH = (h / 2.0) * invZoom;
+
+    // Approximate center (we set origin at volume center on load)
+    // For the Z-normal axis-aligned case, the visible range in level coords is:
+    const centerX = s0[2] / 2.0;
+    const centerY = s0[1] / 2.0;
+    const centerZ = s0[0] / 2.0 + zOff;
+
+    const minX = (centerX - halfW) * levelScale;
+    const maxX = (centerX + halfW) * levelScale;
+    const minY = (centerY - halfH) * levelScale;
+    const maxY = (centerY + halfH) * levelScale;
+    const minZ = centerZ * levelScale;
+    const maxZ = centerZ * levelScale;
+
+    const minCz = Math.max(0, Math.floor((minZ - 1) / cs[0]));
     const maxCz = Math.min(Math.ceil(lvl.shape[0] / cs[0]) - 1,
-                           Math.floor((iz + 1) / cs[0]));
-
-    const minCy = Math.max(0, Math.floor(voxMinY / cs[1]));
+                           Math.floor((maxZ + 1) / cs[0]));
+    const minCy = Math.max(0, Math.floor(minY / cs[1]));
     const maxCy = Math.min(Math.ceil(lvl.shape[1] / cs[1]) - 1,
-                           Math.floor(voxMaxY / cs[1]));
-    const minCx = Math.max(0, Math.floor(voxMinX / cs[2]));
+                           Math.floor(maxY / cs[1]));
+    const minCx = Math.max(0, Math.floor(minX / cs[2]));
     const maxCx = Math.min(Math.ceil(lvl.shape[2] / cs[2]) - 1,
-                           Math.floor(voxMaxX / cs[2]));
+                           Math.floor(maxX / cs[2]));
 
     for (let cz = minCz; cz <= maxCz; cz++) {
         for (let cy = minCy; cy <= maxCy; cy++) {
             for (let cx = minCx; cx <= maxCx; cx++) {
-                fetchChunk(state.level, cz, cy, cx);
+                fetchChunk(level, cz, cy, cx);
             }
         }
     }
@@ -460,14 +440,10 @@ function doRender() {
     state.renderScheduled = false;
     if (!state.wasm) return;
 
-    const canvas = document.getElementById('viewport');
-    const w = canvas.width;
-    const h = canvas.height;
-
-    state.wasm._vc3d_set_level(state.level);
-    state.wasm._vc3d_set_slice(state.sliceZ, state.zoom, state.panX, state.panY);
-
-    const pixelPtr = state.wasm._vc3d_render();
+    state.wasm._wasm_render();
+    const pixelPtr = state.wasm._wasm_pixels();
+    const w = state.wasm._wasm_width();
+    const h = state.wasm._wasm_height();
     uploadToGL(pixelPtr, w, h);
     updateStatus();
 }
@@ -475,13 +451,17 @@ function doRender() {
 // --- UI ---
 
 function updateStatus() {
-    document.getElementById('stat-z').textContent = state.sliceZ;
-    document.getElementById('stat-zoom').textContent = state.zoom.toFixed(2);
-    document.getElementById('stat-level').textContent = state.level;
+    const zOff = state.wasm ? state.wasm._wasm_z_offset() : 0;
+    const scale = state.wasm ? state.wasm._wasm_scale() : 0.5;
+    const level = state.wasm ? state.wasm._wasm_pyramid_level() : 0;
+
+    document.getElementById('stat-z').textContent = zOff.toFixed(1);
+    document.getElementById('stat-zoom').textContent = scale.toFixed(2);
+    document.getElementById('stat-level').textContent = level;
 
     if (state.wasm) {
-        document.getElementById('stat-chunks').textContent = state.wasm._vc3d_cache_count();
-        const mb = (state.wasm._vc3d_cache_bytes() / (1024 * 1024)).toFixed(1);
+        document.getElementById('stat-chunks').textContent = state.wasm._wasm_cache_count();
+        const mb = (state.wasm._wasm_cache_bytes() / (1024 * 1024)).toFixed(1);
         document.getElementById('stat-cache').textContent = mb + ' MB';
     }
     document.getElementById('stat-pending').textContent = state.pendingFetches;
@@ -492,9 +472,11 @@ function updateLevelInfo() {
         document.getElementById('level-info').textContent = '';
         return;
     }
-    const lvl = state.levels[state.level];
+    const numLevels = state.wasm._wasm_num_levels();
+    const level = state.wasm._wasm_pyramid_level();
+    const lvl = state.levels[level];
     document.getElementById('level-info').textContent =
-        `Level ${state.level}/${state.levels.length - 1}: ` +
+        `Level ${level}/${numLevels - 1}: ` +
         `${lvl.shape[2]}x${lvl.shape[1]}x${lvl.shape[0]} ` +
         `(chunks ${lvl.chunks[2]}x${lvl.chunks[1]}x${lvl.chunks[0]})`;
 }
@@ -514,32 +496,10 @@ function resizeCanvas() {
     canvas.width = container.clientWidth;
     canvas.height = container.clientHeight;
     if (state.wasm) {
-        state.wasm._vc3d_resize(canvas.width, canvas.height);
+        state.wasm._wasm_resize(canvas.width, canvas.height);
     }
     if (state.gl) {
         state.gl.viewport(0, 0, canvas.width, canvas.height);
-    }
-}
-
-// Pick best pyramid level for current zoom
-function autoLevel() {
-    // At zoom=1, use level 0. At zoom=0.5, use level 1, etc.
-    if (state.levels.length <= 1) return;
-
-    let best = 0;
-    for (let i = 1; i < state.levels.length; i++) {
-        const scale = state.levels[0].shape[2] / state.levels[i].shape[2];
-        if (state.zoom * scale <= 1.5) { // switch up when we'd be downsampling
-            best = i;
-        }
-    }
-    if (best !== state.level) {
-        // Adjust sliceZ for new level
-        const oldScale = state.levels[0].shape[0] / state.levels[state.level].shape[0];
-        const newScale = state.levels[0].shape[0] / state.levels[best].shape[0];
-        state.sliceZ = Math.round(state.sliceZ * oldScale / newScale);
-        state.level = best;
-        updateLevelInfo();
     }
 }
 
@@ -552,26 +512,31 @@ function setupEvents() {
     canvas.addEventListener('wheel', (e) => {
         e.preventDefault();
         if (e.ctrlKey || e.metaKey) {
-            // Zoom
-            const factor = e.deltaY > 0 ? 0.9 : 1.1;
-            const rect = canvas.getBoundingClientRect();
-            const mx = e.clientX - rect.left;
-            const my = e.clientY - rect.top;
-
             // Zoom toward mouse position
-            state.panX = mx - (mx - state.panX) * factor;
-            state.panY = my - (my - state.panY) * factor;
-            state.zoom *= factor;
-            state.zoom = Math.max(0.01, Math.min(100, state.zoom));
+            const factor = e.deltaY > 0 ? 0.9 : 1.1;
+
+            // Pan to keep the point under the mouse fixed:
+            // Before zoom, the mouse pixel offset from center is (mx - cx, my - cy).
+            // After zoom, the same world point would be at a different pixel.
+            // Compensate by panning by the difference.
+            const rect = canvas.getBoundingClientRect();
+            const mx = e.clientX - rect.left - canvas.width / 2;
+            const my = e.clientY - rect.top - canvas.height / 2;
+
+            // Pan offset = mouse_offset * (1 - 1/factor) in screen pixels
+            const panDx = mx * (1 - 1/factor);
+            const panDy = my * (1 - 1/factor);
+
+            state.wasm._wasm_pan(panDx, panDy);
+            state.wasm._wasm_zoom(factor);
         } else {
-            // Scroll Z
+            // Scroll Z slices
             const delta = Math.sign(e.deltaY);
-            const maxZ = state.levels[state.level] ?
-                         state.levels[state.level].shape[0] - 1 : 0;
-            state.sliceZ = Math.max(0, Math.min(maxZ, state.sliceZ + delta));
+            state.wasm._wasm_scroll(delta);
         }
         fetchVisibleChunks();
         scheduleRender();
+        updateLevelInfo();
     }, { passive: false });
 
     // Pan with mouse drag
@@ -580,16 +545,19 @@ function setupEvents() {
             state.dragging = true;
             state.dragStartX = e.clientX;
             state.dragStartY = e.clientY;
-            state.dragStartPanX = state.panX;
-            state.dragStartPanY = state.panY;
             canvas.style.cursor = 'grabbing';
         }
     });
 
     window.addEventListener('mousemove', (e) => {
         if (!state.dragging) return;
-        state.panX = state.dragStartPanX + (e.clientX - state.dragStartX);
-        state.panY = state.dragStartPanY + (e.clientY - state.dragStartY);
+        const dx = e.clientX - state.dragStartX;
+        const dy = e.clientY - state.dragStartY;
+        state.dragStartX = e.clientX;
+        state.dragStartY = e.clientY;
+        // Pan uses screen-pixel deltas (negative because moving the mouse
+        // right should shift the origin left)
+        state.wasm._wasm_pan(-dx, -dy);
         scheduleRender();
     });
 
@@ -605,49 +573,54 @@ function setupEvents() {
     window.addEventListener('keydown', (e) => {
         if (e.target.tagName === 'INPUT') return;
 
-        const maxZ = state.levels[state.level] ?
-                     state.levels[state.level].shape[0] - 1 : 0;
-
         switch (e.key) {
             case 'ArrowUp':
             case 'k':
-                state.sliceZ = Math.max(0, state.sliceZ - 1);
+                state.wasm._wasm_scroll(-1);
                 fetchVisibleChunks();
                 scheduleRender();
                 break;
             case 'ArrowDown':
             case 'j':
-                state.sliceZ = Math.min(maxZ, state.sliceZ + 1);
+                state.wasm._wasm_scroll(1);
                 fetchVisibleChunks();
                 scheduleRender();
                 break;
             case 'PageUp':
-                state.sliceZ = Math.max(0, state.sliceZ - 10);
+                state.wasm._wasm_scroll(-10);
                 fetchVisibleChunks();
                 scheduleRender();
                 break;
             case 'PageDown':
-                state.sliceZ = Math.min(maxZ, state.sliceZ + 10);
+                state.wasm._wasm_scroll(10);
                 fetchVisibleChunks();
                 scheduleRender();
                 break;
             case '+':
             case '=':
-                state.zoom *= 1.2;
+                state.wasm._wasm_zoom(1.2);
                 fetchVisibleChunks();
                 scheduleRender();
+                updateLevelInfo();
                 break;
             case '-':
-                state.zoom *= 0.8;
+                state.wasm._wasm_zoom(0.8);
                 fetchVisibleChunks();
                 scheduleRender();
+                updateLevelInfo();
                 break;
             case '0':
-                state.zoom = 1.0;
-                state.panX = 0;
-                state.panY = 0;
+                // Reset view: re-center at volume center, default zoom
+                if (state.levels.length > 0) {
+                    const s = state.levels[0].shape;
+                    state.wasm._wasm_set_plane(
+                        s[2] / 2.0, s[1] / 2.0, s[0] / 2.0,
+                        0.0, 0.0, 1.0
+                    );
+                }
                 fetchVisibleChunks();
                 scheduleRender();
+                updateLevelInfo();
                 break;
         }
     });
@@ -675,13 +648,12 @@ async function loadVolume() {
     showLoading('Loading zarr metadata...');
 
     try {
+        const canvas = document.getElementById('viewport');
+        resizeCanvas();
+        state.wasm._wasm_init(canvas.width, canvas.height);
+
         await loadZarrMetadata(url);
         hideLoading();
-        resizeCanvas();
-        state.wasm._vc3d_init(
-            document.getElementById('viewport').width,
-            document.getElementById('viewport').height
-        );
         fetchVisibleChunks();
         scheduleRender();
     } catch (e) {
