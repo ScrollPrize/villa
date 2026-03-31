@@ -138,6 +138,7 @@ class BaseTrainer:
         self._augmentation_names = None
         self._epoch_aug_time = None
         self._epoch_aug_count = None
+        self._on_device_transforms = None
         ema_cfg = getattr(self.mgr, 'ema_config', {}) or {}
         self.ema_enabled = bool(getattr(self.mgr, 'ema_enabled', ema_cfg.get('enabled', False)))
         self.ema_decay = float(getattr(self.mgr, 'ema_decay', ema_cfg.get('decay', 0.999)))
@@ -1010,12 +1011,16 @@ class BaseTrainer:
             print("\nDetected S3 paths in configuration")
             setup_multiprocessing_for_s3()
 
-        # the is_training flag forces the dataset to perform augmentations
-        # we put augmentations in the dataset class so we can use the __getitem__ method
-        # for free multi processing of augmentations , alternatively you can perform on-device within the train loop
+        # By default the training dataset applies augmentations in __getitem__ so
+        # workers can parallelize them. When augment_on_device=True we preserve the
+        # same pipeline here and disable dataset-side augmentation to avoid applying
+        # transforms twice.
         train_dataset = self._configure_dataset(is_training=True)
-        # Keep a handle to the training dataset for on-device augmentation
         self._train_dataset = train_dataset
+        self._on_device_transforms = None
+        if getattr(self.mgr, 'augment_on_device', False):
+            self._on_device_transforms = getattr(train_dataset, 'transforms', None)
+            train_dataset.transforms = None
         if self._profile_augmentations:
             self._augmentation_names = getattr(train_dataset, '_augmentation_names', None)
 
@@ -1323,8 +1328,8 @@ class BaseTrainer:
                     print(f"{item}: {val.dtype}, {val.shape}, min {val.min()} max {val.max()}")
 
         # Optionally run augmentations on the model device instead of Dataset workers
-        if getattr(self.mgr, 'augment_on_device', False) and getattr(self, '_train_dataset', None) is not None:
-            tfm = getattr(self._train_dataset, 'transforms', None)
+        if getattr(self.mgr, 'augment_on_device', False):
+            tfm = self._on_device_transforms
             if tfm is None:
                 data_for_forward = data_dict
             else:
