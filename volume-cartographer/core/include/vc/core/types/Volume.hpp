@@ -194,9 +194,9 @@ protected:
     size_t cacheBudgetWarm_ = 2ULL << 30;   // 2 GB default
     size_t diskCacheMaxBytes_ = 100ULL << 30; // 100 GB default
     std::shared_ptr<vc::cache::DiskStore> pendingDiskStore_;
-    bool videoRecompressEnabled_ = false;
+    bool videoRecompressEnabled_ = true;
     int videoCodecType_ = 0;
-    int videoCodecQP_ = 26;
+    int videoCodecQP_ = 41;
     int ioThreads_ = 0;  // 0 = use default
     std::atomic<bool> prefetchStarted_{false};
 

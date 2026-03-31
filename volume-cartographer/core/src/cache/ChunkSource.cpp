@@ -207,12 +207,15 @@ std::vector<uint8_t> HttpChunkSource::fetch(const ChunkKey& key)
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
 #endif
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
-    curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 300L);
-    curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 256L * 1024L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
+    curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 600L);
+    curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 512L * 1024L);
+    // Enable TCP_NODELAY for lower latency
+    curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
 
     auto authGuard = applyCurlAuth(curl, auth_);
 

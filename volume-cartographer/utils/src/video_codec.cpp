@@ -129,11 +129,16 @@ auto h264_encode(std::span<const std::byte> raw, const VideoCodecParams& params)
     SEncParamExt paramExt{};
     encoder->GetDefaultParams(&paramExt);
     paramExt.iUsageType = CAMERA_VIDEO_REAL_TIME;
+    paramExt.iComplexityMode = LOW_COMPLEXITY;
     paramExt.iPicWidth = padW;
     paramExt.iPicHeight = padH;
     paramExt.fMaxFrameRate = 30.0f;
     paramExt.iRCMode = RC_OFF_MODE;
     paramExt.bEnableFrameSkip = false;
+    paramExt.bEnableDenoise = false;
+    paramExt.bEnableAdaptiveQuant = false;
+    paramExt.bEnableSceneChangeDetect = false;
+    paramExt.bEnableLongTermReference = false;
     paramExt.iMultipleThreadIdc = 1;
     paramExt.sSpatialLayers[0].iVideoWidth = padW;
     paramExt.sSpatialLayers[0].iVideoHeight = padH;

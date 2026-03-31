@@ -409,11 +409,11 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
     config.warmMaxBytes = cacheBudgetWarm_;
     if (isRemote_ || mountInfo_.type == vc::FilesystemType::NetworkMount) {
         if (ioThreads_ > 0) {
-            config.ioThreads = std::min(ioThreads_, 32);
+            config.ioThreads = ioThreads_;
         } else if (mountInfo_.parallelCount > 0) {
-            config.ioThreads = std::min(mountInfo_.parallelCount, 32);
+            config.ioThreads = mountInfo_.parallelCount;
         } else {
-            config.ioThreads = 32;  // saturate connection
+            config.ioThreads = 64;  // saturate connection
         }
         fprintf(stderr, "[Volume] IO threads: %d\n", config.ioThreads);
     }
