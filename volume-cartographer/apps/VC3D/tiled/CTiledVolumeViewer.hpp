@@ -245,6 +245,9 @@ signals:
     void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
 
 private:
+    // Core intersection rendering (bypasses throttle)
+    void renderIntersectionsCore();
+
     // Async intersection computation completion handler
     void onIntersectionComputeFinished();
 
@@ -319,6 +322,10 @@ private:
     TiledViewerCamera _camera;
     TileRenderController* _renderController = nullptr;
     ContentBounds _contentBounds;
+    // Full content extent in surface coordinates (for pan clamping when grid is windowed)
+    float _fullContentMinU = 0, _fullContentMaxU = 0;
+    float _fullContentMinV = 0, _fullContentMaxV = 0;
+    bool _gridWindowed = false;  // true when grid is capped (subset of full content)
 
     // --- Data ---
     std::shared_ptr<Volume> _volume;

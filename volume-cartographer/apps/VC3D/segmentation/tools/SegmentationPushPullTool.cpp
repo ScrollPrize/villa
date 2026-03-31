@@ -43,6 +43,7 @@ constexpr float kAlphaDefaultHighDelta = 0.05f;
 constexpr float kAlphaBorderLimit = 20.0f;
 constexpr int kAlphaBlurRadiusMax = 15;
 constexpr float kAlphaPerVertexLimitMax = 128.0f;
+constexpr std::size_t kAlphaPerVertexMaxSamples = 512;
 
 bool nearlyEqual(float lhs, float rhs)
 {
@@ -742,7 +743,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
 
     const int direction = _ppState.direction;
     const AlphaPushPullConfig config = _alphaConfig;
-    const bool perVertex = config.perVertex;
+    bool perVertex = config.perVertex;
 
     // Snapshot per-vertex sample data from the active drag
     struct SampleInput {
@@ -783,20 +784,27 @@ void SegmentationPushPullTool::launchAlphaCompute()
 
         if (perVertex) {
             const auto& activeSamples = _editManager->activeDrag().samples;
-            sampleInputs.reserve(activeSamples.size());
-            for (const auto& sample : activeSamples) {
-                cv::Vec3f sampleNormal = baseSurface->gridNormal(sample.row, sample.col);
-                if (!isValidNormal(sampleNormal)) {
-                    sampleNormal = centerNormal;
-                } else {
-                    const float sn = cv::norm(sampleNormal);
-                    if (sn > 1e-4f) {
-                        sampleNormal /= sn;
-                    } else {
+            const std::size_t totalSamples = activeSamples.size();
+            // Fall back to single-target mode when too many vertices to keep
+            // background computation bounded and avoid blocking on stop.
+            if (totalSamples > kAlphaPerVertexMaxSamples) {
+                perVertex = false;
+            } else {
+                sampleInputs.reserve(totalSamples);
+                for (const auto& sample : activeSamples) {
+                    cv::Vec3f sampleNormal = baseSurface->gridNormal(sample.row, sample.col);
+                    if (!isValidNormal(sampleNormal)) {
                         sampleNormal = centerNormal;
+                    } else {
+                        const float sn = cv::norm(sampleNormal);
+                        if (sn > 1e-4f) {
+                            sampleNormal /= sn;
+                        } else {
+                            sampleNormal = centerNormal;
+                        }
                     }
+                    sampleInputs.push_back({sample.baseWorld, sampleNormal});
                 }
-                sampleInputs.push_back({sample.baseWorld, sampleNormal});
             }
         }
     }
@@ -992,7 +1000,6 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     PlaneSurface plane(centerWorld, orientedNormal);
     cv::Mat_<cv::Vec3f> coords;
     plane.gen(&coords, nullptr, patchSize, cv::Vec3f(0, 0, 0), scale, cv::Vec3f(0, 0, 0));
-    coords *= scale;
 
     const cv::Point2i centerIndex(radius, radius);
     const float range = std::max(cfg.high - cfg.low, kAlphaMinRange);
@@ -1011,7 +1018,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     cv::Mat sliceFloat(patchSize, CV_32F);
 
     for (float offset = start; offset <= stop + 1e-4f; offset += step) {
-        offsetMat.setTo(orientedNormal * (offset * scale));
+        offsetMat.setTo(orientedNormal * offset);
         cv::add(coords, offsetMat, offsetCoords);
         vc::SampleParams sp;
         sp.level = datasetIndex;

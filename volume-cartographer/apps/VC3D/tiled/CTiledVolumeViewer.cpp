@@ -258,7 +258,7 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     connect(_intersectionThrottleTimer, &QTimer::timeout, this, [this]() {
         if (_intersectionsDirty) {
             _intersectionsDirty = false;
-            renderIntersections();
+            renderIntersectionsCore();
         }
     });
 
@@ -614,6 +614,74 @@ void CTiledVolumeViewer::rebuildContentGrid()
         bounds.totalRows = lastRow - bounds.firstWorldRow + 1;
     }
 
+    // Store full content extent for pan clamping before any grid capping
+    _fullContentMinU = bounds.firstWorldCol * bounds.worldTileSize;
+    _fullContentMaxU = (bounds.firstWorldCol + bounds.totalCols) * bounds.worldTileSize;
+    _fullContentMinV = bounds.firstWorldRow * bounds.worldTileSize;
+    _fullContentMaxV = (bounds.firstWorldRow + bounds.totalRows) * bounds.worldTileSize;
+
+    // Cap grid size to prevent freeze at extreme zoom.
+    // At 10x zoom on a large volume, uncapped grid can have 20,000+ tiles.
+    // Limit to a window around the camera position.
+    constexpr int kMaxTilesPerAxis = 64;
+    constexpr int kMaxTotalTiles = kMaxTilesPerAxis * kMaxTilesPerAxis;
+    _gridWindowed = false;
+
+    if (bounds.totalCols > 0 && bounds.totalRows > 0 &&
+        bounds.totalCols * bounds.totalRows > kMaxTotalTiles) {
+
+        // Determine viewport size in tiles (+ buffer)
+        QSize vpSize = fGraphicsView->viewport()->size();
+        int vpTilesW = static_cast<int>(std::ceil(
+            static_cast<float>(vpSize.width()) / TileScene::TILE_PX)) + 2 * tiled_config::VISIBLE_BUFFER_TILES;
+        int vpTilesH = static_cast<int>(std::ceil(
+            static_cast<float>(vpSize.height()) / TileScene::TILE_PX)) + 2 * tiled_config::VISIBLE_BUFFER_TILES;
+
+        // Window size: enough for viewport + generous buffer, capped at max
+        int windowCols = std::min(std::max(vpTilesW * 2, 16), kMaxTilesPerAxis);
+        int windowRows = std::min(std::max(vpTilesH * 2, 16), kMaxTilesPerAxis);
+
+        // Also cap so total doesn't exceed budget
+        if (windowCols * windowRows > kMaxTotalTiles) {
+            float aspect = static_cast<float>(windowCols) / windowRows;
+            windowCols = static_cast<int>(std::sqrt(kMaxTotalTiles * aspect));
+            windowRows = kMaxTotalTiles / windowCols;
+        }
+
+        // Center window on camera position
+        float cameraTileCol = _camera.surfacePtr[0] / bounds.worldTileSize;
+        float cameraTileRow = _camera.surfacePtr[1] / bounds.worldTileSize;
+        int centerCol = static_cast<int>(std::round(cameraTileCol));
+        int centerRow = static_cast<int>(std::round(cameraTileRow));
+
+        int winFirstCol = centerCol - windowCols / 2;
+        int winFirstRow = centerRow - windowRows / 2;
+
+        // Clamp window to content extent
+        winFirstCol = std::max(winFirstCol, bounds.firstWorldCol);
+        winFirstRow = std::max(winFirstRow, bounds.firstWorldRow);
+        int winLastCol = winFirstCol + windowCols - 1;
+        int winLastRow = winFirstRow + windowRows - 1;
+        int contentLastCol = bounds.firstWorldCol + bounds.totalCols - 1;
+        int contentLastRow = bounds.firstWorldRow + bounds.totalRows - 1;
+        if (winLastCol > contentLastCol) {
+            winFirstCol -= (winLastCol - contentLastCol);
+            winFirstCol = std::max(winFirstCol, bounds.firstWorldCol);
+            winLastCol = contentLastCol;
+        }
+        if (winLastRow > contentLastRow) {
+            winFirstRow -= (winLastRow - contentLastRow);
+            winFirstRow = std::max(winFirstRow, bounds.firstWorldRow);
+            winLastRow = contentLastRow;
+        }
+
+        bounds.firstWorldCol = winFirstCol;
+        bounds.firstWorldRow = winFirstRow;
+        bounds.totalCols = winLastCol - winFirstCol + 1;
+        bounds.totalRows = winLastRow - winFirstRow + 1;
+        _gridWindowed = true;
+    }
+
     _contentBounds = bounds;
 
     QSize vpSize = fGraphicsView->viewport()->size();
@@ -739,14 +807,10 @@ void CTiledVolumeViewer::panBy(int dx, int dy)
     _camera.surfacePtr[0] -= dx * invScale;
     _camera.surfacePtr[1] -= dy * invScale;
 
-    // Clamp pan to content bounds (derived from data bounds)
-    if (_contentBounds.totalCols > 0 && _contentBounds.totalRows > 0) {
-        float minU = _contentBounds.firstWorldCol * _contentBounds.worldTileSize;
-        float maxU = (_contentBounds.firstWorldCol + _contentBounds.totalCols) * _contentBounds.worldTileSize;
-        float minV = _contentBounds.firstWorldRow * _contentBounds.worldTileSize;
-        float maxV = (_contentBounds.firstWorldRow + _contentBounds.totalRows) * _contentBounds.worldTileSize;
-        _camera.surfacePtr[0] = std::clamp(_camera.surfacePtr[0], minU, maxU);
-        _camera.surfacePtr[1] = std::clamp(_camera.surfacePtr[1], minV, maxV);
+    // Clamp pan to full content bounds (not the windowed grid bounds)
+    if (_fullContentMaxU > _fullContentMinU) {
+        _camera.surfacePtr[0] = std::clamp(_camera.surfacePtr[0], _fullContentMinU, _fullContentMaxU);
+        _camera.surfacePtr[1] = std::clamp(_camera.surfacePtr[1], _fullContentMinV, _fullContentMaxV);
     }
 
     _focusSurfacePos[0] = _camera.surfacePtr[0];
@@ -754,6 +818,25 @@ void CTiledVolumeViewer::panBy(int dx, int dy)
 
     // Clear z-velocity on pan so z-prefetch reverts to symmetric
     _zVelocity = 0.0f;
+
+    // When grid is windowed (extreme zoom), rebuild the tile window if the
+    // camera has panned near the edge of the current window.  Use hysteresis
+    // (25% margin) to avoid rebuilding every frame.
+    if (_gridWindowed && _contentBounds.worldTileSize > 0) {
+        float camCol = _camera.surfacePtr[0] / _contentBounds.worldTileSize;
+        float camRow = _camera.surfacePtr[1] / _contentBounds.worldTileSize;
+        float marginCols = _contentBounds.totalCols * 0.25f;
+        float marginRows = _contentBounds.totalRows * 0.25f;
+        bool nearEdge =
+            camCol < _contentBounds.firstWorldCol + marginCols ||
+            camCol > _contentBounds.firstWorldCol + _contentBounds.totalCols - marginCols ||
+            camRow < _contentBounds.firstWorldRow + marginRows ||
+            camRow > _contentBounds.firstWorldRow + _contentBounds.totalRows - marginRows;
+        if (nearEdge) {
+            rebuildContentGrid();
+            centerViewport();
+        }
+    }
 
     centerViewport();
     submitRender();
@@ -1981,6 +2064,11 @@ void CTiledVolumeViewer::renderIntersections()
         return;
     }
 
+    renderIntersectionsCore();
+}
+
+void CTiledVolumeViewer::renderIntersectionsCore()
+{
     // NOTE: old intersection items are kept visible until new ones are
     // built below.  invalidateIntersect() is called right before the new
     // items are installed, so lines never disappear mid-frame.
@@ -1994,6 +2082,7 @@ void CTiledVolumeViewer::renderIntersections()
 
     auto* patchIndex = _viewerManager->surfacePatchIndex();
     if (!patchIndex || patchIndex->empty()) {
+        invalidateIntersect();
         return;
     }
 

@@ -1,20 +1,20 @@
 #pragma once
 
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdlib>
+#include <mutex>
 
 namespace utils {
 
-// Lock-free slab allocator for fixed-size buffers.
+// Slab allocator for fixed-size buffers.
 //
 // Maintains a stack of pre-allocated buffers. allocate() pops from
 // the stack (falling back to aligned_alloc), deallocate() pushes
 // back (falling back to free if the pool is full).
 //
 // Two variants:
-//   SlabAllocator  — thread-safe (atomic top), for cross-thread alloc/free
+//   SlabAllocator  — thread-safe (mutex), for cross-thread alloc/free
 //   LocalSlabAllocator — single-thread (plain int top), for thread_local use
 //
 // Common sizes in the rendering pipeline:
@@ -22,21 +22,21 @@ namespace utils {
 //   1 MB  = 512*512*4 tile ARGB32 buffers
 //   2 MB  = 128^3 decoded chunks (handled by HugePageAllocator)
 
-// Thread-safe variant: lock-free stack with atomic CAS.
+// Thread-safe variant: mutex-protected stack.
 // Use when allocate() and deallocate() may run on different threads
 // (e.g., QImage buffers allocated on workers, freed on main thread).
 template<size_t SlabSize, size_t PoolCount = 64>
 class SlabAllocator {
     std::array<void*, PoolCount> pool_;
-    std::atomic<int> top_{0};
+    int top_{0};
+    std::mutex mutex_;
 
 public:
     SlabAllocator() = default;
 
     ~SlabAllocator()
     {
-        int t = top_.load(std::memory_order_relaxed);
-        for (int i = 0; i < t; ++i)
+        for (int i = 0; i < top_; ++i)
             std::free(pool_[i]);
     }
 
@@ -45,11 +45,10 @@ public:
 
     void* allocate()
     {
-        int t = top_.load(std::memory_order_relaxed);
-        while (t > 0) {
-            if (top_.compare_exchange_weak(t, t - 1,
-                    std::memory_order_acquire, std::memory_order_relaxed))
-                return pool_[t - 1];
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (top_ > 0)
+                return pool_[--top_];
         }
         return std::aligned_alloc(64, SlabSize);
     }
@@ -57,12 +56,12 @@ public:
     void deallocate(void* p)
     {
         if (!p) return;
-        int t = top_.load(std::memory_order_relaxed);
-        while (static_cast<size_t>(t) < PoolCount) {
-            pool_[t] = p;
-            if (top_.compare_exchange_weak(t, t + 1,
-                    std::memory_order_release, std::memory_order_relaxed))
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (static_cast<size_t>(top_) < PoolCount) {
+                pool_[top_++] = p;
                 return;
+            }
         }
         std::free(p);
     }

@@ -349,6 +349,9 @@ void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated
     if (_surfacePatchIndex.setSamplingStride(_surfacePatchSamplingStride)) {
         _surfacePatchIndexNeedsRebuild = true;
         _indexedSurfaceIds.clear();
+        // Index was cleared — remove stale intersection lines immediately.
+        // New lines will appear once the async rebuild completes.
+        forEachViewer([](CTiledVolumeViewer* v) { v->invalidateIntersect(); });
     }
 
     forEachViewer([this](CTiledVolumeViewer* v) { v->setSurfacePatchSamplingStride(_surfacePatchSamplingStride); });
@@ -761,6 +764,13 @@ void ViewerManager::handleSurfaceWillBeDeleted(std::string name, std::shared_ptr
 
         // Remove from the current R-tree index
         _surfacePatchIndex.removeSurface(quad);
+
+        // Invalidate intersection lines on all viewers so stale lines from the
+        // deleted surface don't persist on screen.
+        forEachViewer([](CTiledVolumeViewer* v) {
+            v->invalidateIntersect();
+            v->renderIntersections();
+        });
     }
 }
 
