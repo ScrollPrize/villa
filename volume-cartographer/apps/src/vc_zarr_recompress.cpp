@@ -1,9 +1,12 @@
-// vc_zarr_recompress: Recompress zarr v2 volumes with H264-encoded chunks.
+// vc_zarr_recompress: Recompress zarr v2 volumes to zarr v3 with H264 + sharding.
 //
 // Reads zarr v2 chunks (blosc/zstd/raw) from S3 or local filesystem,
-// recompresses with H264 (VC3D video codec), writes zarr v2 output
-// to S3 or local filesystem. Each output chunk is a VC3D H264 blob
-// that VC3D's VcDecompressor can decode directly.
+// recompresses with H264 into zarr v3 shards (1024³ shards, 128³ inner chunks),
+// writes zarr v3 output to S3 or local filesystem.
+//
+// Each 128³ inner chunk is H264-encoded individually (VC3D header + H264
+// bitstream). Shards use the standard zarr v3 sharding_indexed format with
+// the index at end.
 //
 // Usage:
 //   vc_zarr_recompress <input> <output> [options]
@@ -18,7 +21,6 @@
 //   --verify      Verify roundtrip (decode after encode)
 //   --level N     Process only this pyramid level (-1=all) [default: -1]
 //   --jobs N      Worker threads [default: half hardware threads]
-//   --in-place    Write output back to input path (local only)
 
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +44,12 @@
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
+
+static constexpr size_t SHARD_DIM = 1024;  // shard shape per axis
+static constexpr size_t CHUNK_DIM = 128;   // inner chunk shape per axis
+static constexpr size_t CHUNKS_PER_SHARD = SHARD_DIM / CHUNK_DIM;  // 8
+static constexpr size_t INNER_CHUNKS = CHUNKS_PER_SHARD * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD;  // 512
+static constexpr size_t CHUNK_VOXELS = CHUNK_DIM * CHUNK_DIM * CHUNK_DIM;
 
 // ============================================================================
 // I/O abstraction: local filesystem or S3
@@ -180,10 +188,6 @@ struct S3Backend : IOBackend {
         std::vector<std::string> result;
         std::string continuation_token;
 
-        // We need the bucket and key_prefix from base_url
-        // base_url is like https://bucket.s3.region.amazonaws.com/root_prefix
-        // We need to call: https://bucket.s3.region.amazonaws.com?list-type=2&prefix=root_prefix/level_prefix
-        // Parse bucket from base_url
         auto after_scheme = base_url.substr(base_url.find("//") + 2);
         auto dot = after_scheme.find('.');
         auto bucket = after_scheme.substr(0, dot);
@@ -290,35 +294,57 @@ static std::vector<std::byte> decompress_blosc(const std::vector<std::byte>& com
 }
 
 // ============================================================================
-// Zarr v2 metadata generation
+// Zarr v3 metadata generation
 // ============================================================================
 
-static std::string make_zgroup() {
-    return "{\"zarr_format\": 2}\n";
+static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape, int qp) {
+    utils::ZarrMetadata meta;
+    meta.version = utils::ZarrVersion::v3;
+    meta.shape = shape;
+    meta.chunks = {SHARD_DIM, SHARD_DIM, SHARD_DIM};  // shard shape
+    meta.dtype = utils::ZarrDtype::uint8;
+    meta.fill_value = 0;
+    meta.chunk_key_encoding = "default";  // "/" separator
+    meta.node_type = "array";
+
+    // Sharding config: 1024³ shards with 128³ inner chunks
+    utils::ShardConfig sc;
+    sc.sub_chunks = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
+    sc.index_at_end = true;
+
+    // Sub-chunk codec: h264 (VC3D video codec)
+    utils::ZarrCodecConfig h264_codec;
+    h264_codec.name = "h264";
+    h264_codec.configuration = json{{"qp", qp}};
+    sc.sub_codecs.push_back(h264_codec);
+
+    // Index codec: bytes (little-endian)
+    utils::ZarrCodecConfig bytes_codec;
+    bytes_codec.name = "bytes";
+    bytes_codec.configuration = json{{"endian", "little"}};
+    sc.index_codecs.push_back(bytes_codec);
+
+    meta.shard_config = sc;
+
+    return utils::detail::serialize_zarr_json(meta);
 }
 
-static std::string make_zarray(const std::vector<size_t>& shape,
-                                const std::vector<size_t>& chunks,
-                                const std::string& dim_sep) {
+static std::string make_zarr_v3_group() {
     json root;
-    root["zarr_format"] = 2;
-
-    root["shape"] = shape;
-    root["chunks"] = chunks;
-    root["dtype"] = "|u1";
-    root["compressor"] = nullptr;
-    root["fill_value"] = 0;
-    root["order"] = "C";
-    root["filters"] = nullptr;
-    root["dimension_separator"] = dim_sep;
-
+    root["zarr_format"] = 3;
+    root["node_type"] = "group";
     return root.dump(2) + "\n";
 }
 
-static std::string make_zattrs_multiscales(
+static std::string make_zarr_v3_group_with_multiscales(
     const std::vector<int>& levels,
     const std::vector<std::vector<size_t>>& shapes)
 {
+    json root;
+    root["zarr_format"] = 3;
+    root["node_type"] = "group";
+
+    // OME-Zarr multiscales attribute
     json axes = json::array();
     axes.push_back({{"name", "z"}, {"type", "space"}});
     axes.push_back({{"name", "y"}, {"type", "space"}});
@@ -341,30 +367,35 @@ static std::string make_zattrs_multiscales(
     ms["axes"] = axes;
     ms["datasets"] = datasets;
 
-    json root;
-    root["multiscales"] = json::array({ms});
+    root["attributes"] = {{"multiscales", json::array({ms})}};
     return root.dump(2) + "\n";
+}
+
+// ============================================================================
+// Shard building: write_le64 for shard index
+// ============================================================================
+
+static void write_le64(std::byte* dst, uint64_t val) {
+    for (int i = 0; i < 8; ++i)
+        dst[i] = static_cast<std::byte>((val >> (8 * i)) & 0xFF);
 }
 
 // ============================================================================
 // Mask: use lowest-resolution level to skip empty chunks
 // ============================================================================
 
-// Build a 3D boolean mask indicating which chunks at `level` have nonzero data,
-// using the lowest-resolution pyramid level as a guide.
-// Returns an empty vector if mask cannot be built (caller should process all).
 static std::vector<bool> build_occupancy_mask(
     IOBackend& io,
-    int level,                           // target level (e.g. 0)
-    const std::vector<size_t>& shape,    // target level shape
-    const std::vector<size_t>& chunks,   // target level chunk size
-    int mask_level,                      // lowest-res level to use as mask
+    int level,
+    const std::vector<size_t>& shape,
+    const std::vector<size_t>& chunks,
+    int mask_level,
     const std::vector<size_t>& mask_shape,
     const std::vector<size_t>& mask_chunks)
 {
     if (shape.size() < 3 || mask_shape.size() < 3) return {};
 
-    int scale = 1 << (mask_level - level);  // e.g. 2^5 = 32 for level 5 vs level 0
+    int scale = 1 << (mask_level - level);
 
     size_t nz = (shape[0] + chunks[0] - 1) / chunks[0];
     size_t ny = (shape[1] + chunks[1] - 1) / chunks[1];
@@ -380,7 +411,6 @@ static std::vector<bool> build_occupancy_mask(
     printf("  Building occupancy mask from level %d (%zu chunks to scan)...\n",
            mask_level, mask_nz * mask_ny * mask_nx);
 
-    // Read each mask-level chunk and check which target chunks have data
     std::string mask_prefix = std::to_string(mask_level) + "/";
     std::string dim_sep = "/";
 
@@ -395,12 +425,10 @@ static std::vector<bool> build_occupancy_mask(
                     auto data = io.read(key);
                     raw = decompress_blosc(data, mask_chunks[0] * mask_chunks[1] * mask_chunks[2]);
                 } catch (...) {
-                    continue;  // chunk doesn't exist = all zero
+                    continue;
                 }
 
-                // For each voxel in this mask chunk, determine which target chunk it maps to
                 size_t cz = mask_chunks[0], cy = mask_chunks[1], cx = mask_chunks[2];
-                // Clamp to actual mask shape
                 size_t z0 = mz * cz, y0 = my * cy, x0 = mx * cx;
                 size_t z1 = std::min(z0 + cz, mask_shape[0]);
                 size_t y1 = std::min(y0 + cy, mask_shape[1]);
@@ -412,7 +440,6 @@ static std::vector<bool> build_occupancy_mask(
                             size_t local_z = z - z0, local_y = y - y0, local_x = x - x0;
                             size_t idx = local_z * cy * cx + local_y * cx + local_x;
                             if (idx < raw.size() && raw[idx] != std::byte{0}) {
-                                // This mask voxel is nonzero. Mark the corresponding target chunk.
                                 size_t tz = (z * scale) / chunks[0];
                                 size_t ty = (y * scale) / chunks[1];
                                 size_t tx = (x * scale) / chunks[2];
@@ -449,8 +476,7 @@ int main(int argc, char** argv) {
                   << "  --qp N        H264 quantization (0-51, lower=better) [40]\n"
                   << "  --verify      Verify roundtrip after encoding\n"
                   << "  --level N     Single pyramid level (-1=all) [-1]\n"
-                  << "  --jobs N      Worker threads [half HW threads]\n"
-                  << "  --in-place    Recompress input in-place (ignores output arg)\n";
+                  << "  --jobs N      Worker threads [half HW threads]\n";
         return 1;
     }
 
@@ -462,7 +488,6 @@ int main(int argc, char** argv) {
     bool verify = false;
     int target_level = -1;
     int jobs = std::max(1, (int)std::thread::hardware_concurrency() / 2);
-    bool in_place = false;
 
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
@@ -470,24 +495,19 @@ int main(int argc, char** argv) {
         else if (arg == "--verify") verify = true;
         else if (arg == "--level" && i + 1 < argc) target_level = std::atoi(argv[++i]);
         else if (arg == "--jobs" && i + 1 < argc) jobs = std::atoi(argv[++i]);
-        else if (arg == "--in-place") in_place = true;
     }
 
     auto input = make_backend(input_path);
-    auto output = in_place ? make_backend(input_path) : make_backend(output_path);
+    auto output = make_backend(output_path);
 
     printf("Input:  %s\n", input_path.c_str());
-    printf("Output: %s%s\n", in_place ? input_path.c_str() : output_path.c_str(),
-           in_place ? " (in-place)" : "");
-    printf("H264 QP: %d\n", qp);
+    printf("Output: %s\n", output_path.c_str());
+    printf("H264 QP: %d, shard: %zu³, chunk: %zu³\n", qp, SHARD_DIM, CHUNK_DIM);
     printf("Jobs: %d\n\n", jobs);
 
     // Discover pyramid levels
     std::vector<int> levels;
     std::vector<std::vector<size_t>> shapes;
-    std::vector<std::vector<size_t>> all_chunks;  // per-level chunk sizes
-    std::vector<std::string> all_dim_seps;        // per-level dimension separators
-    std::vector<bool> all_is_u16;                  // per-level dtype
 
     for (int l = 0; l < 10; l++) {
         if (target_level != -1 && l != target_level) continue;
@@ -511,39 +531,12 @@ int main(int argc, char** argv) {
             for (auto& v : zarray["shape"]) shape.push_back(v.get<size_t>());
         }
 
-        std::vector<size_t> chunks = {128, 128, 128};
-        if (zarray.contains("chunks")) {
-            chunks.clear();
-            for (auto& v : zarray["chunks"]) chunks.push_back(v.get<size_t>());
-        }
-
-        std::string dim_sep = "/";
-        if (zarray.contains("dimension_separator")) {
-            dim_sep = zarray["dimension_separator"].get<std::string>();
-        }
-
-        // Detect dtype — check for uint16 (">u2", "<u2", "|u2")
-        bool is_u16 = false;
-        if (zarray.contains("dtype") && zarray["dtype"].is_string()) {
-            std::string dt = zarray["dtype"].get<std::string>();
-            // Strip byte-order prefix
-            std::string_view sv = dt;
-            if (!sv.empty() && (sv[0] == '<' || sv[0] == '>' || sv[0] == '|'))
-                sv.remove_prefix(1);
-            is_u16 = (sv == "u2");
-        }
-
         levels.push_back(l);
         shapes.push_back(shape);
-        all_chunks.push_back(chunks);
-        all_dim_seps.push_back(dim_sep);
-        all_is_u16.push_back(is_u16);
-        printf("Found level %d: shape [%zu, %zu, %zu] chunks [%zu, %zu, %zu] %s\n",
+        printf("Found level %d: shape [%zu, %zu, %zu]\n",
                l, shape.size() > 0 ? shape[0] : 0,
                shape.size() > 1 ? shape[1] : 0,
-               shape.size() > 2 ? shape[2] : 0,
-               chunks[0], chunks[1], chunks[2],
-               is_u16 ? "uint16" : "uint8");
+               shape.size() > 2 ? shape[2] : 0);
     }
 
     if (levels.empty()) {
@@ -551,30 +544,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Write zarr v2 root metadata
-    if (!in_place) {
-        output->write_string(".zgroup", make_zgroup());
-        output->write_string(".zattrs", make_zattrs_multiscales(levels, shapes));
-    }
+    // Write zarr v3 root metadata
+    output->write_string("zarr.json", make_zarr_v3_group_with_multiscales(levels, shapes));
 
     for (size_t li = 0; li < levels.size(); li++) {
         int l = levels[li];
         auto& shape = shapes[li];
-        auto& src_chunks = all_chunks[li];
-        auto& dim_sep = all_dim_seps[li];
-        bool is_u16 = all_is_u16[li];
 
         printf("\n=== Level %d ===\n", l);
 
-        // Write per-level zarr v2 metadata
-        if (!in_place) {
-            std::string level_str = std::to_string(l);
-            output->write_string(level_str + "/.zarray",
-                                  make_zarray(shape, src_chunks, dim_sep));
-            output->write_string(level_str + "/.zgroup", make_zgroup());
-        }
+        // Write per-level zarr v3 metadata
+        output->write_string(std::to_string(l) + "/zarr.json",
+                              make_zarr_v3_metadata(shape, qp));
 
-        // Read input .zarray to determine compressor
+        // Read input .zarray to determine compressor, chunks, dtype, dim_sep
         std::string level_prefix = std::to_string(l) + "/";
         json zarray;
         try {
@@ -586,57 +569,68 @@ int main(int argc, char** argv) {
             compressor_id = zarray["compressor"].value("id", "");
         }
 
-        // Chunk voxel count (for decompression buffer sizing)
-        size_t chunk_voxels = 1;
-        for (auto d : src_chunks) chunk_voxels *= d;
-        size_t raw_bytes = is_u16 ? chunk_voxels * 2 : chunk_voxels;
+        std::vector<size_t> src_chunks = {128, 128, 128};
+        if (zarray.contains("chunks")) {
+            src_chunks.clear();
+            for (auto& v : zarray["chunks"]) src_chunks.push_back(v.get<size_t>());
+        }
 
-        // Compute chunk keys from shape and chunk size (avoids S3 listing)
-        std::vector<std::string> chunk_keys;
-        if (shape.size() >= 3 && src_chunks.size() >= 3) {
-            size_t nz = (shape[0] + src_chunks[0] - 1) / src_chunks[0];
-            size_t ny = (shape[1] + src_chunks[1] - 1) / src_chunks[1];
-            size_t nx = (shape[2] + src_chunks[2] - 1) / src_chunks[2];
+        std::string dim_sep = "/";
+        if (zarray.contains("dimension_separator")) {
+            dim_sep = zarray["dimension_separator"].get<std::string>();
+        }
 
-            // Build occupancy mask from lowest-res level to skip empty chunks
-            std::vector<bool> occ_mask;
-            int mask_level = -1;
-            for (int mi = (int)levels.size() - 1; mi >= 0; mi--) {
-                if (levels[mi] > l) {
-                    mask_level = levels[mi];
+        // Detect dtype
+        bool is_u16 = false;
+        if (zarray.contains("dtype") && zarray["dtype"].is_string()) {
+            std::string dt = zarray["dtype"].get<std::string>();
+            std::string_view sv = dt;
+            if (!sv.empty() && (sv[0] == '<' || sv[0] == '>' || sv[0] == '|'))
+                sv.remove_prefix(1);
+            is_u16 = (sv == "u2");
+        }
+
+        // Source chunk voxel count
+        size_t src_chunk_voxels = 1;
+        for (auto d : src_chunks) src_chunk_voxels *= d;
+        size_t src_raw_bytes = is_u16 ? src_chunk_voxels * 2 : src_chunk_voxels;
+
+        // Shard grid dimensions
+        size_t shard_nz = (shape[0] + SHARD_DIM - 1) / SHARD_DIM;
+        size_t shard_ny = (shape[1] + SHARD_DIM - 1) / SHARD_DIM;
+        size_t shard_nx = (shape[2] + SHARD_DIM - 1) / SHARD_DIM;
+        size_t total_shards = shard_nz * shard_ny * shard_nx;
+
+        // Build occupancy mask at 128³ chunk granularity
+        std::vector<bool> occ_mask;
+        int mask_level = -1;
+        for (int mi = (int)levels.size() - 1; mi >= 0; mi--) {
+            if (levels[mi] > l) {
+                mask_level = levels[mi];
+                break;
+            }
+        }
+        if (mask_level >= 0) {
+            for (size_t mi = 0; mi < levels.size(); mi++) {
+                if (levels[mi] == mask_level) {
+                    // Build mask at 128³ granularity
+                    std::vector<size_t> chunk128 = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
+                    std::vector<size_t> mask_src_chunks = {128, 128, 128};
+                    // Read mask level's actual chunk size
+                    try {
+                        json mask_zarray = json::parse(
+                            input->read_string(std::to_string(mask_level) + "/.zarray"));
+                        if (mask_zarray.contains("chunks")) {
+                            mask_src_chunks.clear();
+                            for (auto& v : mask_zarray["chunks"])
+                                mask_src_chunks.push_back(v.get<size_t>());
+                        }
+                    } catch (...) {}
+                    occ_mask = build_occupancy_mask(
+                        *input, l, shape, chunk128,
+                        mask_level, shapes[mi], mask_src_chunks);
                     break;
                 }
-            }
-            if (mask_level >= 0) {
-                for (size_t mi = 0; mi < levels.size(); mi++) {
-                    if (levels[mi] == mask_level) {
-                        occ_mask = build_occupancy_mask(
-                            *input, l, shape, src_chunks,
-                            mask_level, shapes[mi], all_chunks[mi]);
-                        break;
-                    }
-                }
-            }
-
-            size_t skipped_by_mask = 0;
-            for (size_t iz = 0; iz < nz; iz++) {
-                for (size_t iy = 0; iy < ny; iy++) {
-                    for (size_t ix = 0; ix < nx; ix++) {
-                        if (!occ_mask.empty()) {
-                            size_t flat = iz * ny * nx + iy * nx + ix;
-                            if (!occ_mask[flat]) {
-                                skipped_by_mask++;
-                                continue;
-                            }
-                        }
-                        chunk_keys.push_back(
-                            level_prefix + std::to_string(iz) + dim_sep +
-                            std::to_string(iy) + dim_sep + std::to_string(ix));
-                    }
-                }
-            }
-            if (!occ_mask.empty()) {
-                printf("  Mask skipped %zu empty chunk positions\n", skipped_by_mask);
             }
         }
 
@@ -644,112 +638,204 @@ int main(int argc, char** argv) {
                src_chunks[0], src_chunks[1], src_chunks[2],
                compressor_id.empty() ? "none" : compressor_id.c_str(),
                dim_sep.c_str(), is_u16 ? "uint16" : "uint8");
-        printf("  Computed %zu chunk keys\n", chunk_keys.size());
+        printf("  Output: %zu shards (%zux%zux%zu), %zu inner chunks each\n",
+               total_shards, shard_nz, shard_ny, shard_nx, INNER_CHUNKS);
+
+        // Number of 128³ chunks in the output volume
+        size_t out_nz = (shape[0] + CHUNK_DIM - 1) / CHUNK_DIM;
+        size_t out_ny = (shape[1] + CHUNK_DIM - 1) / CHUNK_DIM;
+        size_t out_nx = (shape[2] + CHUNK_DIM - 1) / CHUNK_DIM;
+
+        // Build list of shard positions to process
+        struct ShardPos { size_t sz, sy, sx; };
+        std::vector<ShardPos> shard_positions;
+        for (size_t sz = 0; sz < shard_nz; sz++)
+            for (size_t sy = 0; sy < shard_ny; sy++)
+                for (size_t sx = 0; sx < shard_nx; sx++)
+                    shard_positions.push_back({sz, sy, sx});
 
         std::atomic<size_t> total_raw{0}, total_compressed{0};
-        std::atomic<int> processed{0}, errs{0}, skipped{0};
+        std::atomic<int> processed_shards{0}, processed_chunks{0};
+        std::atomic<int> errs{0}, skipped_chunks{0};
         std::atomic<int> verify_ok{0}, verify_fail{0};
         std::mutex print_mtx;
 
         auto t0 = std::chrono::steady_clock::now();
-
-        std::atomic<size_t> next_idx{0};
+        std::atomic<size_t> next_shard{0};
 
         auto worker = [&]() {
-            // Thread-local I/O backends (HttpClient is not thread-safe)
             auto t_input = make_backend(input_path);
-            auto t_output = in_place ? make_backend(input_path) : make_backend(output_path);
+            auto t_output = make_backend(output_path);
 
             while (true) {
-                size_t idx = next_idx.fetch_add(1);
-                if (idx >= chunk_keys.size()) break;
+                size_t si = next_shard.fetch_add(1);
+                if (si >= shard_positions.size()) break;
 
-                const auto& key = chunk_keys[idx];
-                try {
-                    auto data = t_input->read(key);
+                auto [sz, sy, sx] = shard_positions[si];
 
-                    // Skip if already VC3D-encoded
-                    if (utils::is_video_compressed(std::span<const std::byte>(data))) {
-                        skipped.fetch_add(1);
-                        processed.fetch_add(1);
-                        continue;
-                    }
+                // Base 128³ chunk coords for this shard
+                size_t base_cz = sz * CHUNKS_PER_SHARD;
+                size_t base_cy = sy * CHUNKS_PER_SHARD;
+                size_t base_cx = sx * CHUNKS_PER_SHARD;
 
-                    // Decompress blosc/zstd if needed
-                    std::vector<std::byte> raw;
-                    if (!compressor_id.empty()) {
-                        raw = decompress_blosc(data, raw_bytes);
-                    } else {
-                        raw = std::move(data);
-                    }
+                // Build shard: encode each inner 128³ chunk
+                std::vector<std::byte> shard_data;
+                // Index: INNER_CHUNKS entries, 16 bytes each (offset + nbytes)
+                std::vector<std::byte> index_bytes(INNER_CHUNKS * 16);
+                // Initialize all index entries to missing (0xFFFFFFFFFFFFFFFF)
+                std::memset(index_bytes.data(), 0xFF, index_bytes.size());
 
-                    // Convert uint16 -> uint8 if needed (divide by 257)
-                    if (is_u16) {
-                        size_t n_voxels = raw.size() / 2;
-                        auto* src = reinterpret_cast<const uint16_t*>(raw.data());
-                        for (size_t i = 0; i < n_voxels; i++) {
-                            raw[i] = static_cast<std::byte>(
-                                static_cast<uint8_t>(src[i] / 257));
+                bool any_data = false;
+
+                for (size_t iz = 0; iz < CHUNKS_PER_SHARD; iz++) {
+                    for (size_t iy = 0; iy < CHUNKS_PER_SHARD; iy++) {
+                        for (size_t ix = 0; ix < CHUNKS_PER_SHARD; ix++) {
+                            size_t cz = base_cz + iz;
+                            size_t cy = base_cy + iy;
+                            size_t cx = base_cx + ix;
+
+                            // Out of bounds?
+                            if (cz >= out_nz || cy >= out_ny || cx >= out_nx) continue;
+
+                            // Check occupancy mask
+                            if (!occ_mask.empty()) {
+                                size_t flat = cz * out_ny * out_nx + cy * out_nx + cx;
+                                if (!occ_mask[flat]) {
+                                    skipped_chunks.fetch_add(1);
+                                    continue;
+                                }
+                            }
+
+                            // Map output 128³ chunk to source chunk(s)
+                            // If source chunks are 128³, it's 1:1
+                            // If source chunks differ, we need to remap
+                            // For now, assume source chunks are 128³ (most common)
+                            std::string src_key = level_prefix +
+                                std::to_string(cz) + dim_sep +
+                                std::to_string(cy) + dim_sep +
+                                std::to_string(cx);
+
+                            std::vector<std::byte> raw;
+                            try {
+                                auto data = t_input->read(src_key);
+
+                                // Already VC3D? Use as-is
+                                if (utils::is_video_compressed(
+                                        std::span<const std::byte>(data))) {
+                                    // Write directly into shard
+                                    size_t inner_idx = iz * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD +
+                                                       iy * CHUNKS_PER_SHARD + ix;
+                                    uint64_t offset = shard_data.size();
+                                    uint64_t nbytes = data.size();
+                                    write_le64(index_bytes.data() + inner_idx * 16, offset);
+                                    write_le64(index_bytes.data() + inner_idx * 16 + 8, nbytes);
+                                    shard_data.insert(shard_data.end(),
+                                                      data.begin(), data.end());
+                                    any_data = true;
+                                    processed_chunks.fetch_add(1);
+                                    total_compressed.fetch_add(data.size());
+                                    total_raw.fetch_add(CHUNK_VOXELS);
+                                    continue;
+                                }
+
+                                // Decompress blosc/zstd
+                                if (!compressor_id.empty()) {
+                                    raw = decompress_blosc(data, src_raw_bytes);
+                                } else {
+                                    raw = std::move(data);
+                                }
+                            } catch (...) {
+                                continue;  // chunk doesn't exist
+                            }
+
+                            // Convert uint16 -> uint8
+                            if (is_u16) {
+                                size_t n_voxels = raw.size() / 2;
+                                auto* src = reinterpret_cast<const uint16_t*>(raw.data());
+                                for (size_t i = 0; i < n_voxels; i++) {
+                                    raw[i] = static_cast<std::byte>(
+                                        static_cast<uint8_t>(src[i] / 257));
+                                }
+                                raw.resize(n_voxels);
+                            }
+
+                            // Pad to 128³
+                            if (raw.size() < CHUNK_VOXELS) {
+                                std::vector<std::byte> padded(CHUNK_VOXELS, std::byte{0});
+                                std::memcpy(padded.data(), raw.data(), raw.size());
+                                raw = std::move(padded);
+                            } else if (raw.size() > CHUNK_VOXELS) {
+                                raw.resize(CHUNK_VOXELS);
+                            }
+
+                            total_raw.fetch_add(CHUNK_VOXELS);
+
+                            // H264 encode
+                            utils::VideoCodecParams params;
+                            params.type = utils::VideoCodecType::H264;
+                            params.qp = qp;
+                            params.depth = CHUNK_DIM;
+                            params.height = CHUNK_DIM;
+                            params.width = CHUNK_DIM;
+
+                            auto compressed = utils::video_encode(
+                                std::span<const std::byte>(raw), params);
+                            total_compressed.fetch_add(compressed.size());
+
+                            // Verify
+                            if (verify) {
+                                auto decoded = utils::video_decode(
+                                    std::span<const std::byte>(compressed),
+                                    CHUNK_VOXELS, params);
+                                if (decoded.size() != raw.size() ||
+                                    std::memcmp(decoded.data(), raw.data(), raw.size()) != 0) {
+                                    verify_fail.fetch_add(1);
+                                    std::lock_guard lk(print_mtx);
+                                    fprintf(stderr, "  VERIFY FAIL: %s\n", src_key.c_str());
+                                } else {
+                                    verify_ok.fetch_add(1);
+                                }
+                            }
+
+                            // Record in shard index
+                            size_t inner_idx = iz * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD +
+                                               iy * CHUNKS_PER_SHARD + ix;
+                            uint64_t offset = shard_data.size();
+                            uint64_t nbytes = compressed.size();
+                            write_le64(index_bytes.data() + inner_idx * 16, offset);
+                            write_le64(index_bytes.data() + inner_idx * 16 + 8, nbytes);
+
+                            shard_data.insert(shard_data.end(),
+                                              compressed.begin(), compressed.end());
+                            any_data = true;
+                            processed_chunks.fetch_add(1);
                         }
-                        raw.resize(n_voxels);
                     }
+                }
 
-                    // Pad undersized boundary chunks to full chunk size
-                    if (raw.size() < chunk_voxels) {
-                        std::vector<std::byte> padded(chunk_voxels, std::byte{0});
-                        std::memcpy(padded.data(), raw.data(), raw.size());
-                        raw = std::move(padded);
-                    } else if (raw.size() > chunk_voxels) {
-                        // Truncate to expected size (boundary rounding)
-                        raw.resize(chunk_voxels);
-                    }
+                if (any_data) {
+                    // Append index at end of shard
+                    shard_data.insert(shard_data.end(),
+                                      index_bytes.begin(), index_bytes.end());
 
-                    total_raw.fetch_add(chunk_voxels);
+                    // Write shard: level/c/sz/sy/sx
+                    std::string shard_key = std::to_string(l) + "/c/" +
+                        std::to_string(sz) + "/" +
+                        std::to_string(sy) + "/" +
+                        std::to_string(sx);
+                    t_output->write(shard_key, shard_data);
+                }
 
-                    // Encode with H264
-                    utils::VideoCodecParams params;
-                    params.type = utils::VideoCodecType::H264;
-                    params.qp = qp;
-                    params.depth = static_cast<int>(src_chunks[0]);
-                    params.height = static_cast<int>(src_chunks[1]);
-                    params.width = static_cast<int>(src_chunks[2]);
-
-                    auto compressed = utils::video_encode(
-                        std::span<const std::byte>(raw), params);
-                    total_compressed.fetch_add(compressed.size());
-
-                    // Verify roundtrip
-                    if (verify) {
-                        auto decoded = utils::video_decode(
-                            std::span<const std::byte>(compressed), chunk_voxels, params);
-                        if (decoded.size() != raw.size() ||
-                            std::memcmp(decoded.data(), raw.data(), raw.size()) != 0) {
-                            verify_fail.fetch_add(1);
-                            std::lock_guard lk(print_mtx);
-                            fprintf(stderr, "  VERIFY FAIL: %s\n", key.c_str());
-                        } else {
-                            verify_ok.fetch_add(1);
-                        }
-                    }
-
-                    // Write chunk at same path (zarr v2 -> zarr v2)
-                    t_output->write(key, compressed);
-
-                    int p_count = processed.fetch_add(1) + 1;
-                    if (p_count % 500 == 0) {
-                        auto now = std::chrono::steady_clock::now();
-                        double secs = std::chrono::duration<double>(now - t0).count();
-                        double mb_s = (double)total_compressed / (1024 * 1024) / secs;
-                        std::lock_guard lk(print_mtx);
-                        printf("  %d/%zu (%.0f chunks/s, %.1f MB/s) ratio: %.2f:1\n",
-                               p_count, chunk_keys.size(), p_count / secs, mb_s,
-                               (double)total_raw / total_compressed);
-                    }
-                } catch (const std::exception& e) {
-                    errs.fetch_add(1);
-                    processed.fetch_add(1);
+                int s_count = processed_shards.fetch_add(1) + 1;
+                if (s_count % 10 == 0 || s_count == (int)total_shards) {
+                    auto now = std::chrono::steady_clock::now();
+                    double secs = std::chrono::duration<double>(now - t0).count();
+                    size_t tc = total_compressed.load();
+                    double mb_s = tc > 0 ? (double)tc / (1024 * 1024) / secs : 0;
                     std::lock_guard lk(print_mtx);
-                    fprintf(stderr, "  ERROR: %s: %s\n", key.c_str(), e.what());
+                    printf("  %d/%zu shards, %d chunks (%.0f/s, %.1f MB/s)\n",
+                           s_count, total_shards, processed_chunks.load(),
+                           processed_chunks.load() / secs, mb_s);
                 }
             }
         };
@@ -765,12 +851,13 @@ int main(int argc, char** argv) {
         double ratio = tc > 0 ? (double)tr / tc : 0;
         double mb_s = tc > 0 ? (double)tc / (1024 * 1024) / elapsed : 0;
 
-        printf("  Processed: %d (skipped: %d, errors: %d)\n",
-               processed.load(), skipped.load(), errs.load());
+        printf("  Processed: %d shards, %d chunks (skipped: %d, errors: %d)\n",
+               processed_shards.load(), processed_chunks.load(),
+               skipped_chunks.load(), errs.load());
         printf("  Raw: %zu MB -> Compressed: %zu MB (ratio: %.2f:1)\n",
                tr / 1024 / 1024, tc / 1024 / 1024, ratio);
         printf("  Time: %.1fs (%.0f chunks/s, %.1f MB/s)\n",
-               elapsed, chunk_keys.size() / elapsed, mb_s);
+               elapsed, processed_chunks.load() / elapsed, mb_s);
         if (verify) {
             printf("  Verify: %d OK, %d FAIL\n", verify_ok.load(), verify_fail.load());
         }
