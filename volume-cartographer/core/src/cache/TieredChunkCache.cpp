@@ -137,33 +137,25 @@ TieredChunkCache::TieredChunkCache(
             std::fprintf(stderr, "[Cache] ice-fetch #%lu lvl=%d (%d,%d,%d) bytes=%zu %ldms\n",
                          n + 1, key.level, key.iz, key.iy, key.ix, data.size(), fetchMs);
 
-        // Store to cold (disk cache) for persistence — raw format first
-        // so the IO thread returns immediately.
+        // Store to cold (disk cache) for persistence.
         if (diskStore_) {
             diskStore_->put(config_.volumeId, key, data);
             statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
         }
 
-        // Submit recompression to the decompression pool so IO threads
-        // stay free for network fetches.  When done, overwrites the disk
-        // cache entry with the smaller video-compressed format.
-        if (config_.recompress && diskStore_) {
-            auto rawCopy = data;  // decompPool_ outlives this lambda
+        // If data is already video-compressed (H265), skip recompression.
+        // Otherwise submit recompression to background pool.
+        bool alreadyEncoded = data.size() >= 4 &&
+            data[0] == 'V' && data[1] == 'C' && data[2] == '3' && data[3] == 'D';
+        if (config_.recompress && diskStore_ && !alreadyEncoded) {
+            auto rawCopy = data;
             decompPool_->enqueue([this, key, raw = std::move(rawCopy)]() {
                 try {
                     auto recompressed = config_.recompress(raw, key);
                     if (!recompressed.empty()) {
                         diskStore_->put(config_.volumeId, key, recompressed);
-                        if (auto* log = cacheDebugLog())
-                            std::fprintf(log, "RECOMPRESS lvl=%d (%d,%d,%d) %zu -> %zu bytes\n",
-                                         key.level, key.iz, key.iy, key.ix,
-                                         raw.size(), recompressed.size());
                     }
-                } catch (const std::exception& e) {
-                    if (auto* log = cacheDebugLog())
-                        std::fprintf(log, "RECOMPRESS error lvl=%d (%d,%d,%d) %s\n",
-                                     key.level, key.iz, key.iy, key.ix, e.what());
-                }
+                } catch (...) {}
             });
         }
         auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
@@ -825,15 +817,17 @@ ChunkDataPtr TieredChunkCache::promoteFromIce(const ChunkKey& key)
 
     statIceFetches_.fetch_add(1, std::memory_order_relaxed);
 
-    // Store to cold (disk cache) with raw format first
+    // Store to cold (disk cache)
     if (diskStore_) {
         diskStore_->put(config_.volumeId, key, compressed);
         statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Submit recompression to background pool — overwrites disk entry
-    // when done but doesn't block the caller.
-    if (config_.recompress && diskStore_) {
+    // Skip recompression if already H265 encoded
+    bool alreadyEncoded = compressed.size() >= 4 &&
+        compressed[0] == 'V' && compressed[1] == 'C' &&
+        compressed[2] == '3' && compressed[3] == 'D';
+    if (config_.recompress && diskStore_ && !alreadyEncoded) {
         auto rawCopy = compressed;
         decompPool_->enqueue([this, key, raw = std::move(rawCopy)]() {
             try {
