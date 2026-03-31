@@ -84,23 +84,23 @@ struct CacheParams {
 
     // Chunk index: shift for pow2, divide otherwise
     inline int chunkIdx(int v, int c, int shift) const {
-        return pow2 ? (v >> shift) : (v / c);
+        return __builtin_expect(pow2, 1) ? (v >> shift) : (v / c);
     }
 
     // Local offset within chunk: mask for pow2, modulo otherwise
     inline int localOff(int v, int c, int mask) const {
-        return pow2 ? (v & mask) : (v % c);
+        return __builtin_expect(pow2, 1) ? (v & mask) : (v % c);
     }
 
     // Convenience: chunk indices from voxel coords
-    inline int chunkZ(int iz) const { return pow2 ? (iz >> czShift) : (iz / cz); }
-    inline int chunkY(int iy) const { return pow2 ? (iy >> cyShift) : (iy / cy); }
-    inline int chunkX(int ix) const { return pow2 ? (ix >> cxShift) : (ix / cx); }
+    inline int chunkZ(int iz) const { return __builtin_expect(pow2, 1) ? (iz >> czShift) : (iz / cz); }
+    inline int chunkY(int iy) const { return __builtin_expect(pow2, 1) ? (iy >> cyShift) : (iy / cy); }
+    inline int chunkX(int ix) const { return __builtin_expect(pow2, 1) ? (ix >> cxShift) : (ix / cx); }
 
     // Convenience: local offsets from voxel coords
-    inline int localZ(int iz) const { return pow2 ? (iz & czMask) : (iz % cz); }
-    inline int localY(int iy) const { return pow2 ? (iy & cyMask) : (iy % cy); }
-    inline int localX(int ix) const { return pow2 ? (ix & cxMask) : (ix % cx); }
+    inline int localZ(int iz) const { return __builtin_expect(pow2, 1) ? (iz & czMask) : (iz % cz); }
+    inline int localY(int iy) const { return __builtin_expect(pow2, 1) ? (iy & cyMask) : (iy % cy); }
+    inline int localX(int ix) const { return __builtin_expect(pow2, 1) ? (ix & cxMask) : (ix % cx); }
 
     static int log2_pow2(int v) {
         int r = 0;
@@ -211,7 +211,7 @@ struct ChunkSampler {
         if (__builtin_expect(ix >= p.sx, 0)) ix = p.sx - 1;
 
         int ciz, ciy, cix, lz, ly, lx;
-        if (p.pow2) {
+        if (__builtin_expect(p.pow2, 1)) {
             ciz = iz >> p.czShift; ciy = iy >> p.cyShift; cix = ix >> p.cxShift;
             lz = iz & p.czMask; ly = iy & p.cyMask; lx = ix & p.cxMask;
         } else {
@@ -219,14 +219,14 @@ struct ChunkSampler {
             lz = iz % p.cz; ly = iy % p.cy; lx = ix % p.cx;
         }
 
-        updateChunk(ciz, ciy, cix);
+        // Inlined MRU check — avoids function call overhead on the hot path
+        uint64_t key = packKey(ciz, ciy, cix);
+        if (__builtin_expect(key != lastKey, 0)) {
+            updateChunk(ciz, ciy, cix);
+        }
         if (__builtin_expect(!data, 0)) return 0;
 
-        size_t offset = static_cast<size_t>(lz) * s0 + static_cast<size_t>(ly) * s1 + lx;
-        T val = data[offset];
-        // Speculatively prefetch next pixel's data (likely adjacent in x)
-        __builtin_prefetch(data + offset + 1, 0, 1);
-        return val;
+        return data[static_cast<size_t>(lz) * s0 + static_cast<size_t>(ly) * s1 + lx];
     }
 
     T sampleInt(int iz, int iy, int ix) {
@@ -234,7 +234,7 @@ struct ChunkSampler {
             return 0;
 
         int ciz, ciy, cix, lz, ly, lx;
-        if (p.pow2) {
+        if (__builtin_expect(p.pow2, 1)) {
             ciz = iz >> p.czShift; ciy = iy >> p.cyShift; cix = ix >> p.cxShift;
             lz = iz & p.czMask; ly = iy & p.cyMask; lx = ix & p.cxMask;
         } else {
@@ -242,7 +242,11 @@ struct ChunkSampler {
             lz = iz % p.cz; ly = iy % p.cy; lx = ix % p.cx;
         }
 
-        updateChunk(ciz, ciy, cix);
+        // Inlined MRU check — avoids function call overhead on the hot path
+        uint64_t key = packKey(ciz, ciy, cix);
+        if (__builtin_expect(key != lastKey, 0)) {
+            updateChunk(ciz, ciy, cix);
+        }
         if (__builtin_expect(!data, 0)) return 0;
 
         return data[static_cast<size_t>(lz) * s0 + static_cast<size_t>(ly) * s1 + lx];
@@ -627,7 +631,7 @@ static void readVolumeImpl(
 
                             // Chunk indices (vshlq with negative = right shift)
                             int32x4_t cix4, ciy4, ciz4;
-                            if (p.pow2) {
+                            if (__builtin_expect(p.pow2, 1)) {
                                 cix4 = vshlq_s32(ix4, negCxShift);
                                 ciy4 = vshlq_s32(iy4, negCyShift);
                                 ciz4 = vshlq_s32(iz4, negCzShift);
@@ -742,7 +746,7 @@ static void readVolumeImpl(
                             __m128i iy4 = _mm_cvttps_epi32(vy4);
                             __m128i iz4 = _mm_cvttps_epi32(vz4);
 
-                            if (p.pow2 && validBits == 0xF) {
+                            if (__builtin_expect(p.pow2, 1) && validBits == 0xF) {
                                 // All 4 valid — check same chunk
                                 // _mm_sra_epi32 takes shift count in low 64 bits of __m128i
                                 __m128i cxShiftV = _mm_cvtsi32_si128(p.cxShift);
@@ -853,13 +857,61 @@ static void readVolumeImpl(
                         }
                     }
                 } else {
-                    // Nearest
-                    for (int x = 0; x < w; x++) {
-                        float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
-                        if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0 &&
-                              base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
-                        if ((static_cast<int>(base_vz + 0.5f) | static_cast<int>(base_vy + 0.5f) | static_cast<int>(base_vx + 0.5f)) < 0) continue;
-                        outRow[x] = sampler.sampleNearest(base_vz, base_vy, base_vx);
+                    // Nearest — row-level same-chunk check
+                    bool rowSingleChunk = false;
+                    int rowCiz = 0, rowCiy = 0, rowCix = 0;
+                    if (w > 1) {
+                        float r0x = coordRow[0][0], r0y = coordRow[0][1], r0z = coordRow[0][2];
+                        float rEx = coordRow[w-1][0], rEy = coordRow[w-1][1], rEz = coordRow[w-1][2];
+                        if (r0z >= 0 && r0y >= 0 && r0x >= 0 &&
+                            rEz >= 0 && rEy >= 0 && rEx >= 0 &&
+                            r0z < p.sz && r0y < p.sy && r0x < p.sx &&
+                            rEz < p.sz && rEy < p.sy && rEx < p.sx) {
+                            int iz0 = std::min(static_cast<int>(r0z + 0.5f), p.sz - 1);
+                            int iy0 = std::min(static_cast<int>(r0y + 0.5f), p.sy - 1);
+                            int ix0 = std::min(static_cast<int>(r0x + 0.5f), p.sx - 1);
+                            int izE = std::min(static_cast<int>(rEz + 0.5f), p.sz - 1);
+                            int iyE = std::min(static_cast<int>(rEy + 0.5f), p.sy - 1);
+                            int ixE = std::min(static_cast<int>(rEx + 0.5f), p.sx - 1);
+                            if (iz0 >= 0 && iy0 >= 0 && ix0 >= 0 &&
+                                izE >= 0 && iyE >= 0 && ixE >= 0) {
+                                int ciz0 = p.chunkZ(iz0), ciy0 = p.chunkY(iy0), cix0 = p.chunkX(ix0);
+                                int ciz1 = p.chunkZ(izE), ciy1 = p.chunkY(iyE), cix1 = p.chunkX(ixE);
+                                if (ciz0 == ciz1 && ciy0 == ciy1 && cix0 == cix1) {
+                                    rowSingleChunk = true;
+                                    rowCiz = ciz0; rowCiy = ciy0; rowCix = cix0;
+                                }
+                            }
+                        }
+                    }
+
+                    if (rowSingleChunk) {
+                        sampler.updateChunk(rowCiz, rowCiy, rowCix);
+                        if (sampler.data) {
+                            const T* chunkData = sampler.data;
+                            const size_t ls0 = sampler.s0, ls1 = sampler.s1;
+                            for (int x = 0; x < w; x++) {
+                                float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
+                                if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0 &&
+                                      base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                                int iz = static_cast<int>(base_vz + 0.5f);
+                                int iy = static_cast<int>(base_vy + 0.5f);
+                                int ix = static_cast<int>(base_vx + 0.5f);
+                                if (__builtin_expect(iz >= p.sz, 0)) iz = p.sz - 1;
+                                if (__builtin_expect(iy >= p.sy, 0)) iy = p.sy - 1;
+                                if (__builtin_expect(ix >= p.sx, 0)) ix = p.sx - 1;
+                                int lz = p.localZ(iz), ly = p.localY(iy), lx = p.localX(ix);
+                                outRow[x] = chunkData[static_cast<size_t>(lz) * ls0 + static_cast<size_t>(ly) * ls1 + lx];
+                            }
+                        }
+                    } else {
+                        for (int x = 0; x < w; x++) {
+                            float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
+                            if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0 &&
+                                  base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                            if ((static_cast<int>(base_vz + 0.5f) | static_cast<int>(base_vy + 0.5f) | static_cast<int>(base_vx + 0.5f)) < 0) continue;
+                            outRow[x] = sampler.sampleNearest(base_vz, base_vy, base_vx);
+                        }
                     }
                 }
             } else {
@@ -1212,14 +1264,110 @@ static void samplePlaneImpl(
                     vx += vx_step[0]; vy += vx_step[1]; vz += vx_step[2];
                 }
             } else {
-                // Nearest
-                float vx = row_base[0], vy = row_base[1], vz = row_base[2];
-                for (int x = 0; x < w; x++) {
-                    if (vz >= 0 && vy >= 0 && vx >= 0 &&
-                        vz < p.sz && vy < p.sy && vx < p.sx) {
-                        outRow[x] = sampler.sampleNearest(vz, vy, vx);
+                // Nearest — integer stepping with row-level bounds elimination.
+                // Instead of float-to-int per pixel, track integer coords with
+                // fractional accumulators (Bresenham-style).
+                const float dx = vx_step[0], dy = vx_step[1], dz = vx_step[2];
+                cv::Vec3f first = row_base;
+                cv::Vec3f last = row_base + vx_step * static_cast<float>(w - 1);
+
+                // Row-level bounds: after nearest-rounding (+0.5f), int coords
+                // are in [0, sz-1] iff float coords are in [-0.5, sz-0.5).
+                float rowMinX = std::min(first[0], last[0]);
+                float rowMaxX = std::max(first[0], last[0]);
+                float rowMinY = std::min(first[1], last[1]);
+                float rowMaxY = std::max(first[1], last[1]);
+                float rowMinZ = std::min(first[2], last[2]);
+                float rowMaxZ = std::max(first[2], last[2]);
+                bool rowInBounds = rowMinX >= -0.5f && rowMinY >= -0.5f && rowMinZ >= -0.5f &&
+                                   rowMaxX < p.sx - 0.5f && rowMaxY < p.sy - 0.5f && rowMaxZ < p.sz - 0.5f;
+
+                // Single-chunk detection from integer bounding box
+                bool rowSingleChunk = false;
+                int rowCiz = 0, rowCiy = 0, rowCix = 0;
+                if (rowInBounds && w > 1) {
+                    int iz0 = static_cast<int>(first[2] + 0.5f), iy0 = static_cast<int>(first[1] + 0.5f), ix0 = static_cast<int>(first[0] + 0.5f);
+                    int izE = static_cast<int>(last[2] + 0.5f), iyE = static_cast<int>(last[1] + 0.5f), ixE = static_cast<int>(last[0] + 0.5f);
+                    int izMin = std::min(iz0, izE), izMax = std::max(iz0, izE);
+                    int iyMin = std::min(iy0, iyE), iyMax = std::max(iy0, iyE);
+                    int ixMin = std::min(ix0, ixE), ixMax = std::max(ix0, ixE);
+                    int ciz0 = p.chunkZ(izMin), ciz1 = p.chunkZ(izMax);
+                    int ciy0 = p.chunkY(iyMin), ciy1 = p.chunkY(iyMax);
+                    int cix0 = p.chunkX(ixMin), cix1 = p.chunkX(ixMax);
+                    if (ciz0 == ciz1 && ciy0 == ciy1 && cix0 == cix1) {
+                        rowSingleChunk = true;
+                        rowCiz = ciz0; rowCiy = ciy0; rowCix = cix0;
                     }
-                    vx += vx_step[0]; vy += vx_step[1]; vz += vx_step[2];
+                }
+
+                if (rowSingleChunk) {
+                    // Fast path: single chunk, no bounds checks, integer stepping.
+                    // Local coords tracked incrementally — no localX/Y/Z per pixel.
+                    sampler.updateChunk(rowCiz, rowCiy, rowCix);
+                    if (sampler.data) {
+                        const T* __restrict__ chunkData = sampler.data;
+                        const size_t ls0 = sampler.s0, ls1 = sampler.s1;
+                        float fx = first[0] + 0.5f, fy = first[1] + 0.5f, fz = first[2] + 0.5f;
+                        int ix = static_cast<int>(fx);
+                        int iy = static_cast<int>(fy);
+                        int iz = static_cast<int>(fz);
+                        int lx = p.localX(ix), ly = p.localY(iy), lz = p.localZ(iz);
+                        float fracX = fx - ix, fracY = fy - iy, fracZ = fz - iz;
+                        for (int x = 0; x < w; x++) {
+                            outRow[x] = chunkData[static_cast<size_t>(lz) * ls0 + static_cast<size_t>(ly) * ls1 + lx];
+                            fracX += dx;
+                            if (fracX >= 1.0f) { lx++; fracX -= 1.0f; }
+                            else if (fracX < 0.0f) { lx--; fracX += 1.0f; }
+                            fracY += dy;
+                            if (fracY >= 1.0f) { ly++; fracY -= 1.0f; }
+                            else if (fracY < 0.0f) { ly--; fracY += 1.0f; }
+                            fracZ += dz;
+                            if (fracZ >= 1.0f) { lz++; fracZ -= 1.0f; }
+                            else if (fracZ < 0.0f) { lz--; fracZ += 1.0f; }
+                        }
+                    }
+                } else if (rowInBounds) {
+                    // In-bounds multi-chunk: integer stepping, no per-pixel bounds checks
+                    float fx = first[0] + 0.5f, fy = first[1] + 0.5f, fz = first[2] + 0.5f;
+                    int ix = static_cast<int>(fx);
+                    int iy = static_cast<int>(fy);
+                    int iz = static_cast<int>(fz);
+                    float fracX = fx - ix, fracY = fy - iy, fracZ = fz - iz;
+                    uint64_t curKey = UINT64_MAX;
+                    const T* __restrict__ curData = nullptr;
+                    const size_t curS0 = sampler.s0, curS1 = sampler.s1;
+                    for (int x = 0; x < w; x++) {
+                        int ciz = p.chunkZ(iz), ciy = p.chunkY(iy), cix = p.chunkX(ix);
+                        uint64_t key = ChunkSampler<T>::packKey(ciz, ciy, cix);
+                        if (key != curKey) {
+                            sampler.updateChunk(ciz, ciy, cix);
+                            curData = sampler.data;
+                            curKey = sampler.lastKey;
+                        }
+                        if (__builtin_expect(curData != nullptr, 1)) {
+                            int lz = p.localZ(iz), ly = p.localY(iy), lx = p.localX(ix);
+                            outRow[x] = curData[static_cast<size_t>(lz) * curS0 + static_cast<size_t>(ly) * curS1 + lx];
+                        }
+                        fracX += dx;
+                        if (fracX >= 1.0f) { ix++; fracX -= 1.0f; }
+                        else if (fracX < 0.0f) { ix--; fracX += 1.0f; }
+                        fracY += dy;
+                        if (fracY >= 1.0f) { iy++; fracY -= 1.0f; }
+                        else if (fracY < 0.0f) { iy--; fracY += 1.0f; }
+                        fracZ += dz;
+                        if (fracZ >= 1.0f) { iz++; fracZ -= 1.0f; }
+                        else if (fracZ < 0.0f) { iz--; fracZ += 1.0f; }
+                    }
+                } else {
+                    // Boundary row: per-pixel bounds checks, float coords
+                    float vx = row_base[0], vy = row_base[1], vz = row_base[2];
+                    for (int x = 0; x < w; x++) {
+                        if (vz >= 0 && vy >= 0 && vx >= 0 &&
+                            vz < p.sz && vy < p.sy && vx < p.sx) {
+                            outRow[x] = sampler.sampleNearest(vz, vy, vx);
+                        }
+                        vx += dx; vy += dy; vz += dz;
+                    }
                 }
             }
         }

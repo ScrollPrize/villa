@@ -123,7 +123,7 @@ auto h265_encode(std::span<const std::byte> raw, const VideoCodecParams& params)
     x265_param_default_preset(xparam, "ultrafast", "zerolatency");
     xparam->sourceWidth = padW;
     xparam->sourceHeight = padH;
-    xparam->internalCsp = X265_CSP_I420;
+    xparam->internalCsp = X265_CSP_I400;  // monochrome — no chroma planes
     xparam->fpsNum = 30;
     xparam->fpsDenom = 1;
     xparam->totalFrames = Z;
@@ -132,6 +132,7 @@ auto h265_encode(std::span<const std::byte> raw, const VideoCodecParams& params)
     xparam->rc.qp = params.qp;
     xparam->bEnableWavefront = 0;
     xparam->frameNumThreads = 1;
+    xparam->logLevel = X265_LOG_NONE;
 
     x265_encoder* enc = x265_encoder_open(xparam);
     if (!enc) throw std::runtime_error("h265_encode: encoder open failed");
@@ -145,18 +146,15 @@ auto h265_encode(std::span<const std::byte> raw, const VideoCodecParams& params)
         pic, x265_picture_free);
 
     const int yPlaneSize = padW * padH;
-    const int uvPlaneSize = (padW / 2) * (padH / 2);
     std::vector<uint8_t> yBuf(yPlaneSize, 0);
-    std::vector<uint8_t> uBuf(uvPlaneSize, 128);
-    std::vector<uint8_t> vBuf(uvPlaneSize, 128);
 
     pic->planes[0] = yBuf.data();
-    pic->planes[1] = uBuf.data();
-    pic->planes[2] = vBuf.data();
+    pic->planes[1] = nullptr;
+    pic->planes[2] = nullptr;
     pic->stride[0] = padW;
-    pic->stride[1] = padW / 2;
-    pic->stride[2] = padW / 2;
-    pic->colorSpace = X265_CSP_I420;
+    pic->stride[1] = 0;
+    pic->stride[2] = 0;
+    pic->colorSpace = X265_CSP_I400;  // monochrome
 
     std::vector<std::byte> output;
     write_header(output, params.type, params.qp, Z, Y, X);

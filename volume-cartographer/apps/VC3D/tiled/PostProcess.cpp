@@ -41,6 +41,44 @@ static void buildFusedGrayLut(std::array<uint32_t, 256>& lut,
     }
 }
 
+// Check whether core preprocessing steps 1-3 are all no-ops.
+static bool corePreprocessIsNoop(const PostProcessParams& params)
+{
+    return params.isoCutoff == 0
+        && !params.postStretchValues
+        && !params.removeSmallComponents;
+}
+
+// Apply the fused LUT to convert grayscale pixels to ARGB32.
+// Handles contiguous and row-strided layouts, processes 4 pixels at a time.
+static void applyFusedLut(const cv::Mat_<uint8_t>& gray,
+                          const std::array<uint32_t, 256>& lut,
+                          uint32_t* bits, int stride)
+{
+    const int rows = gray.rows;
+    const int cols = gray.cols;
+
+    for (int y = 0; y < rows; ++y) {
+        const auto* __restrict__ src = gray.ptr<uint8_t>(y);
+        auto* __restrict__ dst = bits + y * stride;
+
+        int x = 0;
+        // Process 4 pixels per iteration — scalar gather, batch store.
+        // The LUT is 1KB and stays hot in L1. Unrolling 4x cuts loop
+        // overhead and lets the CPU pipeline overlapping loads/stores.
+        const int cols4 = cols - 3;
+        for (; x < cols4; x += 4) {
+            dst[x + 0] = lut[src[x + 0]];
+            dst[x + 1] = lut[src[x + 1]];
+            dst[x + 2] = lut[src[x + 2]];
+            dst[x + 3] = lut[src[x + 3]];
+        }
+        for (; x < cols; ++x) {
+            dst[x] = lut[src[x]];
+        }
+    }
+}
+
 QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
                         const PostProcessParams& params)
 {
@@ -71,31 +109,28 @@ QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
     }
 
     // Grayscale path: fused window/level + gray→RGB32 in a single pass.
-    // Run core steps 1-3 (ISO cutoff, post-stretch, component removal)
-    // with identity window so step 4 is a no-op.
-    auto coreParams = params.toCoreParams();
-    coreParams.windowLow = 0.0f;
-    coreParams.windowHigh = 255.0f;
-    coreParams.stretchValues = false;
-    vc::applyPostProcess(gray, coreParams);
+    // Skip core preprocessing entirely when all steps are no-ops (common case
+    // for volume tiles: isoCutoff=0, no postStretch, no component removal).
+    if (!corePreprocessIsNoop(params)) {
+        auto coreParams = params.toCoreParams();
+        coreParams.windowLow = 0.0f;
+        coreParams.windowHigh = 255.0f;
+        coreParams.stretchValues = false;
+        vc::applyPostProcess(gray, coreParams);
+    }
 
     // Build fused LUT: window/level (or stretch) → ARGB32
     std::array<uint32_t, 256> lut;
     buildFusedGrayLut(lut, params, gray);
 
-    // Single-pass: gray → RGB32 via fused LUT
+    // Single-pass: gray → RGB32 via fused LUT (4x unrolled)
     const int rows = gray.rows;
     const int cols = gray.cols;
     QImage result(cols, rows, QImage::Format_RGB32);
 
     auto* bits = reinterpret_cast<uint32_t*>(result.bits());
     const int stride = result.bytesPerLine() / 4;
-    for (int y = 0; y < rows; ++y) {
-        const auto* src = gray.ptr<uint8_t>(y);
-        auto* dst = bits + y * stride;
-        for (int x = 0; x < cols; ++x) {
-            dst[x] = lut[src[x]];
-        }
-    }
+    applyFusedLut(gray, lut, bits, stride);
+
     return result;
 }
