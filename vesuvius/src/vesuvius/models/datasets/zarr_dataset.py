@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import zarr
+from scipy.ndimage import distance_transform_edt
 from torch.utils.data import Dataset
 
 from vesuvius.utils.utils import pad_or_crop_3d, pad_or_crop_2d
@@ -43,6 +44,7 @@ class VolumeInfo:
     spatial_shape: Tuple[int, ...]
     scale: Optional[int] = None
     has_labels: bool = True
+    dilate: Optional[float] = None
 
 
 @dataclass
@@ -107,6 +109,10 @@ class ZarrDataset(Dataset):
         ]
         if not self.target_names:
             self.target_names = ['ink']  # Default target
+        self.target_ignore_labels = {
+            name: self._resolve_ignore_label(self.targets.get(name) or {})
+            for name in self.target_names
+        }
 
         # Determine 2D vs 3D
         self.is_2d = len(self.patch_size) == 2
@@ -239,6 +245,7 @@ class ZarrDataset(Dataset):
             volume_id = str(spec["volume_id"])
             image_path = Path(spec["image_path"])
             scale = spec.get("scale")
+            dilate = spec.get("dilate")
 
             if not image_path.exists():
                 raise FileNotFoundError(
@@ -288,14 +295,16 @@ class ZarrDataset(Dataset):
                 spatial_shape=spatial_shape,
                 scale=scale if scale is not None else self.ome_zarr_resolution,
                 has_labels=has_any_label,
+                dilate=dilate,
             ))
 
             logger.info(
-                "Loaded explicit volume '%s': shape=%s, scale=%s, has_labels=%s",
+                "Loaded explicit volume '%s': shape=%s, scale=%s, has_labels=%s, dilate=%s",
                 volume_id,
                 spatial_shape,
                 scale if scale is not None else self.ome_zarr_resolution,
                 has_any_label,
+                dilate,
             )
 
     def _open_zarr(self, path: Path, scale: Optional[int] = None) -> zarr.Array:
@@ -335,6 +344,83 @@ class ZarrDataset(Dataset):
             if len(shape) >= 3:
                 return tuple(shape[-3:])
         raise ValueError(f"Unsupported array shape for {'2D' if self.is_2d else '3D'}: {shape}")
+
+    @staticmethod
+    def _resolve_ignore_label(target_info: Dict) -> Optional[float]:
+        for key in ("ignore_label", "ignore_index", "ignore_value"):
+            value = target_info.get(key)
+            if value is not None:
+                return value
+        return None
+
+    @staticmethod
+    def _ignore_mask(values: np.ndarray, ignore_label: Optional[float]) -> np.ndarray:
+        if ignore_label is None:
+            return np.zeros(values.shape, dtype=bool)
+
+        if isinstance(ignore_label, float) and np.isnan(ignore_label):
+            return np.isnan(values)
+
+        try:
+            return values == ignore_label
+        except TypeError:
+            return np.zeros(values.shape, dtype=bool)
+
+    @classmethod
+    def _dilate_label_region(
+        cls,
+        values: np.ndarray,
+        distance: float,
+        ignore_label: Optional[float],
+    ) -> np.ndarray:
+        if distance <= 0:
+            return values
+
+        arr = np.asarray(values)
+        ignore_mask = cls._ignore_mask(arr, ignore_label)
+        source_mask = (arr != 0) & ~ignore_mask
+        if not np.any(source_mask):
+            return arr
+
+        fill_mask = (arr == 0)
+        if not np.any(fill_mask):
+            return arr
+
+        distances, nearest_indices = distance_transform_edt(
+            ~source_mask,
+            return_indices=True,
+        )
+        fill_mask &= distances <= float(distance)
+        if not np.any(fill_mask):
+            return arr
+
+        result = arr.copy()
+        nearest_values = arr[tuple(nearest_indices[axis][fill_mask] for axis in range(arr.ndim))]
+        result[fill_mask] = nearest_values
+        return result
+
+    @classmethod
+    def _dilate_label_patch(
+        cls,
+        values: np.ndarray,
+        distance: Optional[float],
+        ignore_label: Optional[float],
+        original_shape: Tuple[int, ...],
+    ) -> np.ndarray:
+        if distance in (None, 0):
+            return values
+
+        valid_slices = tuple(slice(0, max(0, min(int(o), int(s)))) for o, s in zip(original_shape, values.shape))
+        if any(slc.stop == 0 for slc in valid_slices):
+            return values
+
+        result = np.array(values, copy=True)
+        result[valid_slices] = cls._dilate_label_region(
+            result[valid_slices],
+            float(distance),
+            ignore_label,
+        )
+        return result
 
     # -------------------------------------------------------------------------
     # Normalization
@@ -840,7 +926,13 @@ class ZarrDataset(Dataset):
         is_unlabeled = True
         for target_name in self.target_names:
             label_arr = vol.label_arrays.get(target_name)
-            label_data = load_array(label_arr)
+            label_data, label_shape = load_array(label_arr, return_original_shape=True)
+            label_data = self._dilate_label_patch(
+                label_data,
+                vol.dilate,
+                self.target_ignore_labels.get(target_name),
+                label_shape,
+            )
             if label_arr is not None and np.count_nonzero(label_data) > 0:
                 is_unlabeled = False
             result[target_name] = torch.from_numpy(label_data[np.newaxis, ...])
