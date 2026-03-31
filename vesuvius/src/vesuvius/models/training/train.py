@@ -1279,22 +1279,57 @@ class BaseTrainer:
     def _apply_transforms_per_sample(self, tfm, batched_dict):
         """Apply a ComposeTransforms pipeline to each sample in a batched dict.
         Expects tensors shaped [B, C, ...]. Returns a new batched dict with tensors stacked on dim 0.
-        Non-tensor fields that are lists/tuples of length B are passed per-sample and returned as lists.
+        Preserves nested metadata structures such as patch_info produced by the default collate_fn.
         """
         if 'image' not in batched_dict or not isinstance(batched_dict['image'], torch.Tensor):
             return batched_dict
+
+        def _extract_sample(value, batch_size: int, sample_idx: int):
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
+                return value[sample_idx]
+            if isinstance(value, dict):
+                return {
+                    key: _extract_sample(subvalue, batch_size, sample_idx)
+                    for key, subvalue in value.items()
+                }
+            if isinstance(value, list):
+                if len(value) == batch_size:
+                    return value[sample_idx]
+                return [_extract_sample(item, batch_size, sample_idx) for item in value]
+            if isinstance(value, tuple):
+                if len(value) == batch_size:
+                    return value[sample_idx]
+                return tuple(_extract_sample(item, batch_size, sample_idx) for item in value)
+            return value
+
+        def _collate_samples(values):
+            first = values[0]
+            if isinstance(first, torch.Tensor):
+                return torch.stack(values, dim=0)
+            if isinstance(first, dict):
+                return {
+                    key: _collate_samples([value[key] for value in values])
+                    for key in first
+                }
+            if isinstance(first, list):
+                return [
+                    _collate_samples([value[idx] for value in values])
+                    for idx in range(len(first))
+                ]
+            if isinstance(first, tuple):
+                return tuple(
+                    _collate_samples([value[idx] for value in values])
+                    for idx in range(len(first))
+                )
+            return values
+
         B = batched_dict['image'].shape[0]
         out_accum = {}
         perf_names = self._augmentation_names if (self._profile_augmentations and self._augmentation_names) else None
         for b in range(B):
             sample = {}
             for k, v in batched_dict.items():
-                if isinstance(v, torch.Tensor) and v.shape[0] == B:
-                    sample[k] = v[b]
-                elif isinstance(v, (list, tuple)) and len(v) == B:
-                    sample[k] = v[b]
-                else:
-                    sample[k] = v
+                sample[k] = _extract_sample(v, B, b)
             if perf_names is not None:
                 sample['_aug_perf'] = {name: 0.0 for name in perf_names}
             sample_out = tfm(**sample)
@@ -1303,10 +1338,7 @@ class BaseTrainer:
 
         batched_out = {}
         for k, vals in out_accum.items():
-            if isinstance(vals[0], torch.Tensor):
-                batched_out[k] = torch.stack(vals, dim=0)
-            else:
-                batched_out[k] = vals
+            batched_out[k] = _collate_samples(vals)
         return batched_out
 
     def _train_step(self, model, data_dict, loss_fns, use_amp, autocast_ctx, epoch, step, verbose=False,
