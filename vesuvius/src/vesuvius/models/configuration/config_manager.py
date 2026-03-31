@@ -159,6 +159,7 @@ class ConfigManager:
             labels_cfg = None
             singular_label = None
             scale = None
+            dilate = None
 
             if isinstance(spec, (str, Path)):
                 image_path = self._resolve_config_relative_path(spec)
@@ -204,6 +205,19 @@ class ConfigManager:
                         raise ValueError(
                             f"Explicit volume '{volume_id}' scale must be >= 0"
                         )
+
+                dilate_raw = spec.get("dilate")
+                if dilate_raw not in (None, ""):
+                    try:
+                        dilate = float(dilate_raw)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"Explicit volume '{volume_id}' has invalid dilate value {dilate_raw!r}"
+                        ) from exc
+                    if dilate < 0:
+                        raise ValueError(
+                            f"Explicit volume '{volume_id}' dilate must be >= 0"
+                        )
             else:
                 raise ValueError(
                     "Each volume entry must be a mapping or a direct image path string"
@@ -241,6 +255,7 @@ class ConfigManager:
                 "image_path": image_path,
                 "label_paths": label_paths,
                 "scale": scale,
+                "dilate": dilate,
             })
 
         return normalized_specs
