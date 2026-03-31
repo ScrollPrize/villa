@@ -84,6 +84,9 @@ class ConfigManager:
             attr_name = "lejepa_lambda" if key == "lambda" else key
             setattr(self, attr_name, value)
 
+        # Load optional EMA config used by the base trainer.
+        self.ema_config = deepcopy(config.get("ema", {}) or {})
+
         self._init_attributes()
 
         if self.auxiliary_tasks and self.targets:
@@ -288,6 +291,24 @@ class ConfigManager:
         self.optimizer = self.tr_configs.get("optimizer", "SGD")
         self.initial_lr = float(self.tr_configs.get("initial_lr", 0.01))
         self.weight_decay = float(self.tr_configs.get("weight_decay", 0.00003))
+
+        ema_cfg = deepcopy(getattr(self, "ema_config", {}) or {})
+        self.ema_enabled = bool(ema_cfg.get("enabled", False))
+        self.ema_decay = float(ema_cfg.get("decay", 0.999))
+        self.ema_start_step = int(ema_cfg.get("start_step", 0))
+        self.ema_update_every_steps = max(1, int(ema_cfg.get("update_every_steps", 1)))
+        self.ema_validate = bool(ema_cfg.get("validate", self.ema_enabled))
+        self.ema_save_in_checkpoint = bool(
+            ema_cfg.get("save_in_checkpoint", self.ema_enabled)
+        )
+        self.ema_config = {
+            "enabled": self.ema_enabled,
+            "decay": self.ema_decay,
+            "start_step": self.ema_start_step,
+            "update_every_steps": self.ema_update_every_steps,
+            "validate": self.ema_validate,
+            "save_in_checkpoint": self.ema_save_in_checkpoint,
+        }
         
         ### Dataset config ###
         self.min_labeled_ratio = float(self.dataset_config.get("min_labeled_ratio", 0.10))
@@ -969,6 +990,7 @@ class ConfigManager:
             "model_config": model_config,
             "dataset_config": dataset_config,
             "inference_config": inference_config,
+            "ema": deepcopy(getattr(self, "ema_config", {})),
         }
 
         return combined_config

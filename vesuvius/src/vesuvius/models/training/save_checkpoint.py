@@ -242,8 +242,9 @@ def cleanup_old_configs(model_ckpt_dir, model_name, keep_latest=1):
 
 
 def save_final_checkpoint(model, optimizer, scheduler, max_epoch,
-                         model_ckpt_dir, model_name, 
-                         model_config=None, train_dataset=None):
+                         model_ckpt_dir, model_name,
+                         model_config=None, train_dataset=None,
+                         additional_data=None):
     """
     Save the final model checkpoint at the end of training.
     
@@ -280,7 +281,8 @@ def save_final_checkpoint(model, optimizer, scheduler, max_epoch,
         epoch=max_epoch - 1,
         checkpoint_path=final_model_path,
         model_config=model_config,
-        train_dataset=train_dataset
+        train_dataset=train_dataset,
+        additional_data=additional_data,
     )
     
     print(f"Final model saved to {final_model_path}")

@@ -138,6 +138,29 @@ class BaseTrainer:
         self._augmentation_names = None
         self._epoch_aug_time = None
         self._epoch_aug_count = None
+        ema_cfg = getattr(self.mgr, 'ema_config', {}) or {}
+        self.ema_enabled = bool(getattr(self.mgr, 'ema_enabled', ema_cfg.get('enabled', False)))
+        self.ema_decay = float(getattr(self.mgr, 'ema_decay', ema_cfg.get('decay', 0.999)))
+        self.ema_start_step = int(getattr(self.mgr, 'ema_start_step', ema_cfg.get('start_step', 0)))
+        self.ema_update_every_steps = max(
+            1,
+            int(getattr(self.mgr, 'ema_update_every_steps', ema_cfg.get('update_every_steps', 1)))
+        )
+        self.ema_validate = bool(
+            getattr(self.mgr, 'ema_validate', ema_cfg.get('validate', self.ema_enabled))
+        )
+        self.ema_save_in_checkpoint = bool(
+            getattr(
+                self.mgr,
+                'ema_save_in_checkpoint',
+                ema_cfg.get('save_in_checkpoint', self.ema_enabled),
+            )
+        )
+        self.ema_model = None
+        self._ema_optimizer_step = 0
+        self._checkpoint_ema_state = None
+        self._checkpoint_ema_optimizer_step = None
+        self._printed_ema_validation_mode = False
 
     # --- build model --- #
     def _build_model(self):
@@ -161,7 +184,86 @@ class BaseTrainer:
         Subclasses can override this to save extra state (e.g., EMA model).
         Returns a dict that will be merged into the checkpoint.
         """
+        if self.ema_model is not None and self.ema_save_in_checkpoint:
+            return {
+                'ema_model': self.ema_model.state_dict(),
+                'ema_optimizer_step': int(self._ema_optimizer_step),
+            }
         return {}
+
+    def _unwrap_model(self, model):
+        if hasattr(model, 'module'):
+            model = model.module
+        if hasattr(model, '_orig_mod'):
+            try:
+                model = model._orig_mod
+            except Exception:
+                pass
+        return model
+
+    def _create_ema_model(self, model):
+        ema_model = deepcopy(self._unwrap_model(model))
+        ema_model = ema_model.to(self.device)
+        ema_model.eval()
+        for parameter in ema_model.parameters():
+            parameter.requires_grad_(False)
+        return ema_model
+
+    def _initialize_ema_model(self, model):
+        if not self.ema_enabled:
+            self.ema_model = None
+            return None
+
+        self.ema_model = self._create_ema_model(model)
+        if self._checkpoint_ema_state is not None:
+            try:
+                self.ema_model.load_state_dict(self._checkpoint_ema_state)
+                self._ema_optimizer_step = int(self._checkpoint_ema_optimizer_step or 0)
+                print(
+                    "Restored EMA model from checkpoint "
+                    f"(optimizer_step={self._ema_optimizer_step})"
+                )
+            except Exception as exc:
+                print(f"Warning: Failed to restore EMA model from checkpoint: {exc}")
+                print("Using freshly initialized EMA model")
+                self._ema_optimizer_step = 0
+            finally:
+                self._checkpoint_ema_state = None
+                self._checkpoint_ema_optimizer_step = None
+        else:
+            print(
+                "Created EMA model "
+                f"(decay={self.ema_decay}, start_step={self.ema_start_step}, "
+                f"update_every_steps={self.ema_update_every_steps})"
+            )
+        return self.ema_model
+
+    def _update_ema_model(self, model):
+        if self.ema_model is None:
+            return
+
+        self._ema_optimizer_step += 1
+        if self._ema_optimizer_step < self.ema_start_step:
+            return
+        if ((self._ema_optimizer_step - self.ema_start_step) % self.ema_update_every_steps) != 0:
+            return
+
+        ema_state = self.ema_model.state_dict()
+        for name, model_value in self._unwrap_model(model).state_dict().items():
+            ema_value = ema_state[name]
+            model_value = model_value.detach()
+            if torch.is_floating_point(ema_value):
+                ema_value.lerp_(model_value.to(dtype=ema_value.dtype), 1.0 - self.ema_decay)
+            else:
+                ema_value.copy_(model_value)
+
+    def _get_validation_model(self, model):
+        if self.ema_model is not None and self.ema_validate:
+            if not self._printed_ema_validation_mode:
+                print("Validation will use the EMA model")
+                self._printed_ema_validation_mode = True
+            return self.ema_model
+        return model
 
     # --- configure dataset --- #
     def _configure_dataset(self, is_training=True):
@@ -1015,6 +1117,7 @@ class BaseTrainer:
                     ckpt = torch.load(self.mgr.checkpoint_path, map_location=self.device, weights_only=False)
                     if isinstance(ckpt, dict) and 'ema_model' in ckpt:
                         self._checkpoint_ema_state = ckpt['ema_model']
+                        self._checkpoint_ema_optimizer_step = int(ckpt.get('ema_optimizer_step', 0))
                         print("Found EMA model state in checkpoint")
                     del ckpt
                 except Exception:
@@ -1033,6 +1136,7 @@ class BaseTrainer:
             self._ds_scales = None
             self._ds_weights = None
         loss_fns = self._build_loss()
+        self._initialize_ema_model(model)
 
         if self.device.type == 'cuda':
             try:
@@ -1544,7 +1648,10 @@ class BaseTrainer:
                             train_sample_outputs[t_name] = p_val[b_idx: b_idx + 1]
 
                 if optimizer_stepped and is_per_iteration_scheduler:
+                    self._update_ema_model(model)
                     scheduler.step()
+                elif optimizer_stepped:
+                    self._update_ema_model(model)
 
                 if pbar is not None:
                     loss_str = " | ".join([f"{t}: {np.mean(epoch_losses[t][-100:]):.4f}"
@@ -1601,9 +1708,12 @@ class BaseTrainer:
             val_every_n = int(getattr(self.mgr, 'val_every_n', 1))
             do_validate = ((epoch + 1) % max(1, val_every_n) == 0)
             if do_validate and (not self.is_distributed or self.rank == 0):
+                validation_model = self._get_validation_model(model)
                 # For MAE training, don't set to eval mode to keep patch dropping active
                 if not hasattr(self, '_is_mae_training'):
                     model.eval()
+                if validation_model is not model or not hasattr(self, '_is_mae_training'):
+                    validation_model.eval()
                 with torch.no_grad():
                     val_losses = {t_name: [] for t_name in self.mgr.targets}
                     debug_preview_image = None
@@ -1628,7 +1738,7 @@ class BaseTrainer:
                             data_dict = next(val_dataloader_iter)
 
                         task_losses, inputs, targets_dict, outputs = self._validation_step(
-                            model=model,
+                            model=validation_model,
                             data_dict=data_dict,
                             loss_fns=loss_fns,
                             use_amp=use_amp
@@ -1852,7 +1962,8 @@ class BaseTrainer:
                 model_ckpt_dir=model_ckpt_dir,
                 model_name=self.mgr.model_name,
                 model_config=getattr(model, 'final_config', None),
-                train_dataset=train_dataset
+                train_dataset=train_dataset,
+                additional_data=self._get_additional_checkpoint_data(),
             )
 
         # Clean up DDP process group

@@ -232,6 +232,32 @@ def update_config_from_args(mgr, args):
         if mgr.verbose:
             print(f"Set gradient clipping: {mgr.gradient_clip}")
 
+    ema_updates = {}
+    if getattr(args, 'ema_enabled', None) is not None:
+        mgr.ema_enabled = bool(args.ema_enabled)
+        ema_updates["enabled"] = mgr.ema_enabled
+    if getattr(args, 'ema_decay', None) is not None:
+        mgr.ema_decay = float(args.ema_decay)
+        ema_updates["decay"] = mgr.ema_decay
+    if getattr(args, 'ema_start_step', None) is not None:
+        mgr.ema_start_step = int(args.ema_start_step)
+        ema_updates["start_step"] = mgr.ema_start_step
+    if getattr(args, 'ema_update_every_steps', None) is not None:
+        mgr.ema_update_every_steps = max(1, int(args.ema_update_every_steps))
+        ema_updates["update_every_steps"] = mgr.ema_update_every_steps
+    if getattr(args, 'ema_validate', None) is not None:
+        mgr.ema_validate = bool(args.ema_validate)
+        ema_updates["validate"] = mgr.ema_validate
+    if getattr(args, 'ema_save_in_checkpoint', None) is not None:
+        mgr.ema_save_in_checkpoint = bool(args.ema_save_in_checkpoint)
+        ema_updates["save_in_checkpoint"] = mgr.ema_save_in_checkpoint
+    if ema_updates:
+        if not hasattr(mgr, 'ema_config') or mgr.ema_config is None:
+            mgr.ema_config = {}
+        mgr.ema_config.update(ema_updates)
+        if mgr.verbose:
+            print(f"Updated EMA config: {mgr.ema_config}")
+
     # Gradient accumulation steps
     if hasattr(args, 'gradient_accumulation') and args.gradient_accumulation is not None:
         if args.gradient_accumulation < 1:

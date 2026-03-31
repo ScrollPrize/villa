@@ -35,6 +35,11 @@ def main(argv=None):
         description="Train Vesuvius neural networks for ink detection and segmentation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
+    parser.set_defaults(
+        ema_enabled=None,
+        ema_validate=None,
+        ema_save_in_checkpoint=None,
+    )
 
     grp_required = parser.add_argument_group("Required")
     grp_paths = parser.add_argument_group("Paths & Format")
@@ -138,6 +143,24 @@ def main(argv=None):
                            help="Autocast dtype when AMP is enabled (float16 uses GradScaler; bfloat16 skips scaling)")
     grp_optim.add_argument("--no-amp", action="store_true",
                            help="Disable Automatic Mixed Precision (AMP)")
+    grp_optim.add_argument("--ema", dest="ema_enabled", action="store_true",
+                           help="Enable EMA weights tracking for the base trainer")
+    grp_optim.add_argument("--no-ema", dest="ema_enabled", action="store_false",
+                           help="Disable EMA weights tracking")
+    grp_optim.add_argument("--ema-decay", type=float,
+                           help="EMA decay factor")
+    grp_optim.add_argument("--ema-start-step", type=int,
+                           help="Optimizer step at which EMA updates begin")
+    grp_optim.add_argument("--ema-update-every-steps", type=int,
+                           help="Update EMA weights every N optimizer steps")
+    grp_optim.add_argument("--ema-validate", dest="ema_validate", action="store_true",
+                           help="Use the EMA model for validation when EMA is enabled")
+    grp_optim.add_argument("--no-ema-validate", dest="ema_validate", action="store_false",
+                           help="Validate with the student model even when EMA is enabled")
+    grp_optim.add_argument("--ema-save-in-checkpoint", dest="ema_save_in_checkpoint", action="store_true",
+                           help="Save EMA weights in checkpoints")
+    grp_optim.add_argument("--no-ema-save-in-checkpoint", dest="ema_save_in_checkpoint", action="store_false",
+                           help="Do not save EMA weights in checkpoints")
 
     # Scheduler
     grp_sched.add_argument("--scheduler", type=str,
