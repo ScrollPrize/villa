@@ -64,14 +64,9 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
 
     _scene->setSceneRect(0, 0, sceneW, sceneH);
 
-    // Create transparent placeholder so retained items show through
+    // Dark placeholder matches scene background — no visible flash
     QPixmap placeholder(TILE_PX, TILE_PX);
-    if (_retainedItems.empty()) {
-        // No retained background — use gray placeholder (initial load)
-        placeholder.fill(QColor(64, 64, 64));
-    } else {
-        placeholder.fill(Qt::transparent);
-    }
+    placeholder.fill(QColor(0, 0, 0));
 
     const int count = _bounds.totalRows * _bounds.totalCols;
     _items.resize(count, nullptr);

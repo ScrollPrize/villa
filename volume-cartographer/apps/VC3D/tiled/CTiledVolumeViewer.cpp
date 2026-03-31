@@ -969,22 +969,11 @@ void CTiledVolumeViewer::onZoom(int steps, QPointF scene_point, Qt::KeyboardModi
             setSliceOffset(static_cast<float>(adjustedSteps));
         }
     } else {
-        // Apply zoom immediately AND add momentum for smooth coast
+        // Zoom immediately, no momentum (causes ghosting)
         int zoomDir = (steps > 0) ? 1 : (steps < 0) ? -1 : 0;
         if (zoomDir != 0) {
             zoomStepsAt(zoomDir, scene_point);
-            // Accumulate zoom momentum
-            _momentumZoomV = _momentumZoomV * 0.5f + zoomDir * 0.8f;
-            _momentumZoomAnchor = scene_point;
-            if (!_momentumTimer->isActive()) _momentumTimer->start();
         }
-    }
-
-    // Add slice momentum
-    if (modifiers & Qt::ShiftModifier) {
-        float sliceDir = (steps > 0) ? 1.0f : -1.0f;
-        _momentumSliceV = _momentumSliceV * 0.5f + sliceDir * _navSpeed * 0.6f;
-        if (!_momentumTimer->isActive()) _momentumTimer->start();
     }
 }
 
