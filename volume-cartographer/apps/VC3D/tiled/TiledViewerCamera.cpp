@@ -33,35 +33,35 @@ void TiledViewerCamera::recalcPyramidLevel(int numScales)
     dsScale = std::pow(2.0f, -dsScaleIdx);
 }
 
-// Predefined zoom stops where 256/scale is a "nice" number, eliminating
+// Predefined zoom stops where TILE_PX/scale is a "nice" number, eliminating
 // sub-pixel tile-boundary seams.  Covers MIN_SCALE..MAX_SCALE roughly
 // 12 steps per octave (≈6% apart).
 static constexpr float kZoomStops[] = {
     // Extended range: 0.01 .. 10.0
     0.01f,
-    0.015625f, // 16384
-    0.03125f,  // 8192
-    0.0625f,   // 4096
-    0.125f,    // 2048
-    0.1875f,   // 1365.3  (close to 3/16)
-    0.25f,     // 1024
-    0.3125f,   // 819.2   (5/16)
-    0.375f,    // 682.7   (3/8)
-    0.4375f,   // 585.1   (7/16)
-    0.5f,      // 512
-    0.5625f,   // 455.1   (9/16)
-    0.625f,    // 409.6   (5/8)
-    0.75f,     // 341.3   (3/4)
-    0.875f,    // 292.6   (7/8)
-    1.0f,      // 256
-    1.25f,     // 204.8   (5/4)
-    1.5f,      // 170.7   (3/2)
-    1.75f,     // 146.3   (7/4)
-    2.0f,      // 128
-    2.5f,      // 102.4   (5/2)
-    3.0f,      // 85.3
-    3.5f,      // 73.1
-    4.0f,      // 64
+    0.015625f, // 32768
+    0.03125f,  // 16384
+    0.0625f,   // 8192
+    0.125f,    // 4096
+    0.1875f,   // 2730.7  (close to 3/16)
+    0.25f,     // 2048
+    0.3125f,   // 1638.4  (5/16)
+    0.375f,    // 1365.3  (3/8)
+    0.4375f,   // 1170.3  (7/16)
+    0.5f,      // 1024
+    0.5625f,   // 910.2   (9/16)
+    0.625f,    // 819.2   (5/8)
+    0.75f,     // 682.7   (3/4)
+    0.875f,    // 585.1   (7/8)
+    1.0f,      // 512
+    1.25f,     // 409.6   (5/4)
+    1.5f,      // 341.3   (3/2)
+    1.75f,     // 292.6   (7/4)
+    2.0f,      // 256
+    2.5f,      // 204.8   (5/2)
+    3.0f,      // 170.7
+    3.5f,      // 146.3
+    4.0f,      // 128
     5.0f,
     6.0f,
     8.0f,

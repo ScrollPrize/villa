@@ -1063,6 +1063,233 @@ void readArea3D(xt::xtensor<uint16_t, 3, xt::layout_type::column_major>& out, co
 
 
 // ============================================================================
+// samplePlaneImpl — fused plane coord generation + sampling (no coords Mat)
+// ============================================================================
+
+template<typename T, SampleMode Mode>
+static void samplePlaneImpl(
+    cv::Mat_<T>& out,
+    vc::cache::TieredChunkCache& cache,
+    int level,
+    const CacheParams& p,
+    const cv::Vec3f& origin,
+    const cv::Vec3f& vx_step,
+    const cv::Vec3f& vy_step,
+    int w, int h)
+{
+    out = cv::Mat_<T>(h, w, T(0));
+
+    // Phase 1: Prefetch needed chunks.
+    // Compute world bounding box from 4 corners of the plane.
+    {
+        cv::Vec3f corners[4] = {
+            origin,
+            origin + vx_step * static_cast<float>(w - 1),
+            origin + vy_step * static_cast<float>(h - 1),
+            origin + vx_step * static_cast<float>(w - 1) + vy_step * static_cast<float>(h - 1)
+        };
+
+        float minVx = corners[0][0], maxVx = corners[0][0];
+        float minVy = corners[0][1], maxVy = corners[0][1];
+        float minVz = corners[0][2], maxVz = corners[0][2];
+        for (int c = 1; c < 4; c++) {
+            minVx = std::min(minVx, corners[c][0]); maxVx = std::max(maxVx, corners[c][0]);
+            minVy = std::min(minVy, corners[c][1]); maxVy = std::max(maxVy, corners[c][1]);
+            minVz = std::min(minVz, corners[c][2]); maxVz = std::max(maxVz, corners[c][2]);
+        }
+
+        // Add interpolation margin
+        float margin = (Mode == SampleMode::Tricubic) ? 2.0f : 1.0f;
+        minVx -= margin; minVy -= margin; minVz -= margin;
+        maxVx += margin; maxVy += margin; maxVz += margin;
+
+        // Clamp to volume bounds
+        if (maxVx < 0 || maxVy < 0 || maxVz < 0 ||
+            minVx >= p.sx || minVy >= p.sy || minVz >= p.sz) {
+            return;  // Entirely out of bounds
+        }
+
+        int iMinX = std::max(0, static_cast<int>(std::floor(minVx)));
+        int iMaxX = std::min(p.sx - 1, static_cast<int>(std::ceil(maxVx)));
+        int iMinY = std::max(0, static_cast<int>(std::floor(minVy)));
+        int iMaxY = std::min(p.sy - 1, static_cast<int>(std::ceil(maxVy)));
+        int iMinZ = std::max(0, static_cast<int>(std::floor(minVz)));
+        int iMaxZ = std::min(p.sz - 1, static_cast<int>(std::ceil(maxVz)));
+
+        int minCx = p.chunkX(iMinX), maxCx = p.chunkX(iMaxX);
+        int minCy = p.chunkY(iMinY), maxCy = p.chunkY(iMaxY);
+        int minCz = p.chunkZ(iMinZ), maxCz = p.chunkZ(iMaxZ);
+
+        // Collect and prefetch needed chunks
+        std::vector<std::array<int,3>> neededChunks;
+        for (int cix = minCx; cix <= maxCx; cix++)
+            for (int ciy = minCy; ciy <= maxCy; ciy++)
+                for (int ciz = minCz; ciz <= maxCz; ciz++) {
+                    if (p.dbValid && (ciz < p.dbMinCz || ciz > p.dbMaxCz ||
+                                      ciy < p.dbMinCy || ciy > p.dbMaxCy ||
+                                      cix < p.dbMinCx || cix > p.dbMaxCx)) continue;
+                    neededChunks.push_back({ciz, ciy, cix});
+                }
+
+        bool anyMissing = false;
+        for (size_t ci = 0; ci < neededChunks.size(); ci++) {
+            if (!cache.get(vc::cache::ChunkKey{level, neededChunks[ci][0], neededChunks[ci][1], neededChunks[ci][2]})) {
+                anyMissing = true;
+                break;
+            }
+        }
+        if (anyMissing) {
+            for (size_t ci = 0; ci < neededChunks.size(); ci++)
+                cache.getBlocking(vc::cache::ChunkKey{level, neededChunks[ci][0], neededChunks[ci][1], neededChunks[ci][2]});
+        }
+    }
+
+    // Phase 2: Sample with inline coordinate computation
+    const int tileH = std::max(8, std::min(p.cy, h));
+    const int numTiles = (h + tileH - 1) / tileH;
+
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int tile = 0; tile < numTiles; tile++) {
+        const int yStart = tile * tileH;
+        const int yEnd = std::min(yStart + tileH, h);
+
+        ChunkSampler<T> sampler(p, cache, level);
+
+        for (int y = yStart; y < yEnd; y++) {
+            auto* outRow = out.template ptr<T>(y);
+            cv::Vec3f row_base = origin + vy_step * static_cast<float>(y);
+
+            if constexpr (Mode == SampleMode::Trilinear) {
+                // Row-level same-chunk check: if first and last pixel
+                // map to the same chunk, skip all updateChunk calls.
+                cv::Vec3f first = row_base;
+                cv::Vec3f last = row_base + vx_step * static_cast<float>(w - 1);
+                bool rowSingleChunk = false;
+                int rowCiz = 0, rowCiy = 0, rowCix = 0;
+
+                if (w > 1 &&
+                    first[2] >= 0 && first[1] >= 0 && first[0] >= 0 &&
+                    last[2] >= 0 && last[1] >= 0 && last[0] >= 0 &&
+                    first[2] + 1 < p.sz && first[1] + 1 < p.sy && first[0] + 1 < p.sx &&
+                    last[2] + 1 < p.sz && last[1] + 1 < p.sy && last[0] + 1 < p.sx) {
+                    int iz0 = static_cast<int>(first[2]), iy0 = static_cast<int>(first[1]), ix0 = static_cast<int>(first[0]);
+                    int izE = static_cast<int>(last[2]), iyE = static_cast<int>(last[1]), ixE = static_cast<int>(last[0]);
+                    int ciz0 = p.chunkZ(iz0), ciy0 = p.chunkY(iy0), cix0 = p.chunkX(ix0);
+                    int ciz1 = p.chunkZ(izE + 1), ciy1 = p.chunkY(iyE + 1), cix1 = p.chunkX(ixE + 1);
+                    if (ciz0 == ciz1 && ciy0 == ciy1 && cix0 == cix1) {
+                        rowSingleChunk = true;
+                        rowCiz = ciz0; rowCiy = ciy0; rowCix = cix0;
+                    }
+                }
+
+                if (rowSingleChunk) {
+                    sampler.updateChunk(rowCiz, rowCiy, rowCix);
+                    if (sampler.data) {
+                        const T* chunkData = sampler.data;
+                        const size_t ls0 = sampler.s0, ls1 = sampler.s1;
+                        float vx = row_base[0], vy = row_base[1], vz = row_base[2];
+                        for (int x = 0; x < w; x++) {
+                            if (vz >= 0 && vy >= 0 && vx >= 0 &&
+                                vz < p.sz && vy < p.sy && vx < p.sx) {
+                                int iz = static_cast<int>(vz);
+                                int iy = static_cast<int>(vy);
+                                int ix = static_cast<int>(vx);
+                                int lz0 = p.localZ(iz), ly0 = p.localY(iy), lx0 = p.localX(ix);
+
+                                float c000 = chunkData[lz0*ls0 + ly0*ls1 + lx0];
+                                float c100 = chunkData[(lz0+1)*ls0 + ly0*ls1 + lx0];
+                                float c010 = chunkData[lz0*ls0 + (ly0+1)*ls1 + lx0];
+                                float c110 = chunkData[(lz0+1)*ls0 + (ly0+1)*ls1 + lx0];
+                                float c001 = chunkData[lz0*ls0 + ly0*ls1 + (lx0+1)];
+                                float c101 = chunkData[(lz0+1)*ls0 + ly0*ls1 + (lx0+1)];
+                                float c011 = chunkData[lz0*ls0 + (ly0+1)*ls1 + (lx0+1)];
+                                float c111 = chunkData[(lz0+1)*ls0 + (ly0+1)*ls1 + (lx0+1)];
+
+                                float fz = vz - iz, fy = vy - iy, fx = vx - ix;
+                                float c00 = std::fma(fx, c001 - c000, c000);
+                                float c01 = std::fma(fx, c011 - c010, c010);
+                                float c10 = std::fma(fx, c101 - c100, c100);
+                                float c11 = std::fma(fx, c111 - c110, c110);
+                                float c0 = std::fma(fy, c01 - c00, c00);
+                                float c1 = std::fma(fy, c11 - c10, c10);
+                                float v = std::fma(fz, c1 - c0, c0);
+
+                                if constexpr (std::is_same_v<T, uint16_t>) {
+                                    v = std::clamp(v, 0.f, 65535.f);
+                                    outRow[x] = static_cast<uint16_t>(v + 0.5f);
+                                } else {
+                                    outRow[x] = static_cast<T>(v);
+                                }
+                            }
+                            vx += vx_step[0]; vy += vx_step[1]; vz += vx_step[2];
+                        }
+                    }
+                } else {
+                    // Multi-chunk path: incremental coord computation
+                    float vx = row_base[0], vy = row_base[1], vz = row_base[2];
+                    for (int x = 0; x < w; x++) {
+                        if (vz >= 0 && vy >= 0 && vx >= 0 &&
+                            vz < p.sz && vy < p.sy && vx < p.sx) {
+                            float v = sampler.sampleTrilinearFast(vz, vy, vx);
+                            if constexpr (std::is_same_v<T, uint16_t>) {
+                                v = std::clamp(v, 0.f, 65535.f);
+                                outRow[x] = static_cast<uint16_t>(v + 0.5f);
+                            } else {
+                                outRow[x] = static_cast<T>(v);
+                            }
+                        }
+                        vx += vx_step[0]; vy += vx_step[1]; vz += vx_step[2];
+                    }
+                }
+            } else if constexpr (Mode == SampleMode::Tricubic) {
+                float vx = row_base[0], vy = row_base[1], vz = row_base[2];
+                for (int x = 0; x < w; x++) {
+                    if (vz >= 0 && vy >= 0 && vx >= 0 &&
+                        vz < p.sz && vy < p.sy && vx < p.sx) {
+                        float v = sampler.sampleTricubic(vz, vy, vx);
+                        if constexpr (std::is_same_v<T, uint16_t>) {
+                            v = std::clamp(v, 0.f, 65535.f);
+                            outRow[x] = static_cast<uint16_t>(v + 0.5f);
+                        } else {
+                            outRow[x] = static_cast<T>(v);
+                        }
+                    }
+                    vx += vx_step[0]; vy += vx_step[1]; vz += vx_step[2];
+                }
+            } else {
+                // Nearest
+                float vx = row_base[0], vy = row_base[1], vz = row_base[2];
+                for (int x = 0; x < w; x++) {
+                    if (vz >= 0 && vy >= 0 && vx >= 0 &&
+                        vz < p.sz && vy < p.sy && vx < p.sx) {
+                        outRow[x] = sampler.sampleNearest(vz, vy, vx);
+                    }
+                    vx += vx_step[0]; vy += vx_step[1]; vz += vx_step[2];
+                }
+            }
+        }
+    }
+}
+
+void samplePlane(cv::Mat_<uint8_t>& out, vc::cache::TieredChunkCache* cache, int level,
+                 const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
+                 int width, int height, vc::Sampling method) {
+    CacheParams p(cache, level);
+    switch (method) {
+        case vc::Sampling::Nearest:
+            samplePlaneImpl<uint8_t, SampleMode::Nearest>(out, *cache, level, p, origin, vx_step, vy_step, width, height);
+            break;
+        case vc::Sampling::Tricubic:
+            samplePlaneImpl<uint8_t, SampleMode::Tricubic>(out, *cache, level, p, origin, vx_step, vy_step, width, height);
+            break;
+        default:
+            samplePlaneImpl<uint8_t, SampleMode::Trilinear>(out, *cache, level, p, origin, vx_step, vy_step, width, height);
+            break;
+    }
+}
+
+
+// ============================================================================
 // Public API — thin wrappers around readVolumeImpl
 // ============================================================================
 

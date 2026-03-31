@@ -7,6 +7,40 @@
 #include <array>
 #include <cstdint>
 
+// Build a fused uint32_t[256] LUT: window/level (or stretch) + gray→ARGB32.
+// Eliminates the intermediate uint8 Mat that cv::LUT would produce.
+static void buildFusedGrayLut(std::array<uint32_t, 256>& lut,
+                              const PostProcessParams& params,
+                              const cv::Mat_<uint8_t>& gray)
+{
+    if (params.stretchValues) {
+        double minVal, maxVal;
+        cv::minMaxLoc(gray, &minVal, &maxVal);
+        const double range = std::max(1.0, maxVal - minVal);
+        for (int i = 0; i < 256; ++i) {
+            uint8_t v = static_cast<uint8_t>(
+                std::clamp((i - minVal) / range * 255.0, 0.0, 255.0));
+            lut[i] = 0xFF000000u | (static_cast<uint32_t>(v) << 16)
+                                 | (static_cast<uint32_t>(v) << 8)
+                                 | static_cast<uint32_t>(v);
+        }
+    } else {
+        const int lo = static_cast<int>(
+            std::clamp(params.windowLow, 0.0f, 255.0f));
+        const int hi = static_cast<int>(
+            std::clamp(params.windowHigh, static_cast<float>(lo + 1), 255.0f));
+        const float span = std::max(1.0f, static_cast<float>(hi - lo));
+        for (int i = 0; i < 256; ++i) {
+            uint8_t v = static_cast<uint8_t>(
+                std::clamp((static_cast<float>(i) - static_cast<float>(lo))
+                           / span * 255.0f, 0.0f, 255.0f));
+            lut[i] = 0xFF000000u | (static_cast<uint32_t>(v) << 16)
+                                 | (static_cast<uint32_t>(v) << 8)
+                                 | static_cast<uint32_t>(v);
+        }
+    }
+}
+
 QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
                         const PostProcessParams& params)
 {
@@ -30,26 +64,26 @@ QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
         return volume_viewer_cmaps::makeColors(gray, *spec);
     }
 
-    // Steps 1-4: core grayscale pipeline (modifies gray in-place)
-    vc::applyPostProcess(gray, params.toCoreParams());
-
-    // Step 5: Colormap or grayscale → QImage::Format_RGB32
+    // Colormap path: full core pipeline then colormap conversion.
     if (spec) {
+        vc::applyPostProcess(gray, params.toCoreParams());
         return volume_viewer_cmaps::makeColors(gray, *spec);
     }
 
-    // Grayscale → RGB32: use a precomputed LUT for fast conversion.
-    // Each gray value maps to 0xFFgggggg.
-    static const auto lut = []() {
-        std::array<uint32_t, 256> t;
-        for (int i = 0; i < 256; ++i) {
-            t[i] = 0xFF000000u | (static_cast<uint32_t>(i) << 16)
-                                | (static_cast<uint32_t>(i) << 8)
-                                | static_cast<uint32_t>(i);
-        }
-        return t;
-    }();
+    // Grayscale path: fused window/level + gray→RGB32 in a single pass.
+    // Run core steps 1-3 (ISO cutoff, post-stretch, component removal)
+    // with identity window so step 4 is a no-op.
+    auto coreParams = params.toCoreParams();
+    coreParams.windowLow = 0.0f;
+    coreParams.windowHigh = 255.0f;
+    coreParams.stretchValues = false;
+    vc::applyPostProcess(gray, coreParams);
 
+    // Build fused LUT: window/level (or stretch) → ARGB32
+    std::array<uint32_t, 256> lut;
+    buildFusedGrayLut(lut, params, gray);
+
+    // Single-pass: gray → RGB32 via fused LUT
     const int rows = gray.rows;
     const int cols = gray.cols;
     QImage result(cols, rows, QImage::Format_RGB32);

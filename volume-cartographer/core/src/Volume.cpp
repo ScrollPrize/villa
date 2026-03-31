@@ -612,6 +612,78 @@ int Volume::sampleCompositeBestEffort(cv::Mat_<uint8_t>& out,
     return last;
 }
 
+int Volume::samplePlaneBestEffort(cv::Mat_<uint8_t>& out,
+                                   const cv::Vec3f& origin,
+                                   const cv::Vec3f& vx_step,
+                                   const cv::Vec3f& vy_step,
+                                   int width, int height,
+                                   const vc::SampleParams& params)
+{
+    const int nScales = static_cast<int>(numScales());
+    const int level = params.level;
+
+    // Compute world-space bounding box from the 4 corners of the plane
+    cv::Vec3f corners[4] = {
+        origin,
+        origin + vx_step * static_cast<float>(width - 1),
+        origin + vy_step * static_cast<float>(height - 1),
+        origin + vx_step * static_cast<float>(width - 1) + vy_step * static_cast<float>(height - 1)
+    };
+    WorldBBox wb;
+    wb.loX = corners[0][0]; wb.hiX = corners[0][0];
+    wb.loY = corners[0][1]; wb.hiY = corners[0][1];
+    wb.loZ = corners[0][2]; wb.hiZ = corners[0][2];
+    for (int c = 1; c < 4; c++) {
+        wb.loX = std::min(wb.loX, corners[c][0]); wb.hiX = std::max(wb.hiX, corners[c][0]);
+        wb.loY = std::min(wb.loY, corners[c][1]); wb.hiY = std::max(wb.hiY, corners[c][1]);
+        wb.loZ = std::min(wb.loZ, corners[c][2]); wb.hiZ = std::max(wb.hiZ, corners[c][2]);
+    }
+
+    for (int lvl = level; lvl < nScales; lvl++) {
+        if (allChunksCachedFast(wb, lvl)) {
+            float scale = (lvl > 0) ? (1.0f / static_cast<float>(1 << lvl)) : 1.0f;
+            samplePlane(out, tieredCache(), lvl,
+                        origin * scale, vx_step * scale, vy_step * scale,
+                        width, height, params.method);
+            if (lvl > level) {
+                prefetchWorldBBox(
+                    cv::Vec3f(wb.loX, wb.loY, wb.loZ),
+                    cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level);
+                if (lvl - level > 1)
+                    prefetchWorldBBox(
+                        cv::Vec3f(wb.loX, wb.loY, wb.loZ),
+                        cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level + 1);
+            } else if (lvl > 0) {
+                prefetchWorldBBox(
+                    cv::Vec3f(wb.loX, wb.loY, wb.loZ),
+                    cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), lvl - 1);
+            }
+            if (!out.empty())
+                applyOptionalPostProcess(out, params);
+            return lvl;
+        }
+    }
+
+    // No level cached — block at coarsest level
+    int last = std::max(0, nScales - 1);
+    float scale = (last > 0) ? (1.0f / static_cast<float>(1 << last)) : 1.0f;
+    samplePlane(out, tieredCache(), last,
+                origin * scale, vx_step * scale, vy_step * scale,
+                width, height, params.method);
+    if (last > level) {
+        prefetchWorldBBox(
+            cv::Vec3f(wb.loX, wb.loY, wb.loZ),
+            cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level);
+        if (last - level > 1)
+            prefetchWorldBBox(
+                cv::Vec3f(wb.loX, wb.loY, wb.loZ),
+                cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level + 1);
+    }
+    if (!out.empty())
+        applyOptionalPostProcess(out, params);
+    return last;
+}
+
 // ============================================================================
 // Composite-aware chunk helpers
 // ============================================================================

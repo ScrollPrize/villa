@@ -136,6 +136,16 @@ public:
                                   const cv::Mat_<cv::Vec3f>& normals,
                                   const vc::SampleParams& params);
 
+    // Fused plane sampling: generates coordinates inline during sampling,
+    // eliminating the intermediate coords Mat. origin/vx_step/vy_step are
+    // in world (level-0) coordinates. Returns actual pyramid level used.
+    int samplePlaneBestEffort(cv::Mat_<uint8_t>& out,
+                              const cv::Vec3f& origin,
+                              const cv::Vec3f& vx_step,
+                              const cv::Vec3f& vy_step,
+                              int width, int height,
+                              const vc::SampleParams& params);
+
     // Pin the coarsest pyramid level in the hot tier (never evicted).
     // Guarantees sampleBestEffort() always returns data immediately.
     void pinCoarsestLevel(bool blocking = false);

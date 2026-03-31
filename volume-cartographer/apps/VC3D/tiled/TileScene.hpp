@@ -82,7 +82,7 @@ struct TileMetadata {
 class TileScene
 {
 public:
-    static constexpr int TILE_PX = 256;
+    static constexpr int TILE_PX = 512;
 
     explicit TileScene(QGraphicsScene* scene);
 

@@ -74,4 +74,10 @@ void sampleTileSlices(
     const std::vector<float>& offsets
 );
 
+// Fused plane coordinate generation + sampling (eliminates intermediate coords Mat).
+// origin, vx_step, vy_step define the affine plane in level-scaled coordinates.
+// coord(i,j) = origin + vx_step * i + vy_step * j
+void samplePlane(cv::Mat_<uint8_t>& out, vc::cache::TieredChunkCache* cache, int level,
+                 const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
+                 int width, int height, vc::Sampling method);
 

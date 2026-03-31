@@ -98,53 +98,87 @@ TileRenderResult TileRenderer::renderTile(
     const bool needNormals = (useComposite && !plane) ||
                              params.compositeSettings.params.lightingEnabled;
 
-    // Generate coordinates for this tile.
-    // When normals are needed for a QuadSurface, request both coords and
-    // normals in a single gen() call to avoid computing them twice.
-    cv::Mat_<cv::Vec3f> coords;
-    cv::Mat_<cv::Vec3f> normals;
-    if (needNormals && !plane) {
-        surface->gen(&coords, &normals, cv::Size(params.tileW, params.tileH),
-                     cv::Vec3f(0, 0, 0), params.scale,
-                     {params.surfaceROI.x * params.scale,
-                      params.surfaceROI.y * params.scale,
-                      params.zOff});
-    } else {
-        generateTileCoords(coords, params, surface);
+    // Fused plane path: for PlaneSurface without composite, we can skip
+    // generating the intermediate coords Mat entirely by computing coordinates
+    // inline during sampling. This eliminates 786KB of allocation + two
+    // full passes over transient data, cutting cache pressure significantly.
+    const bool useFusedPlane = (plane != nullptr && !useComposite && !usePlaneComposite);
+
+    // Compute plane affine parameters (world-space) for PlaneSurface paths.
+    // These are used by both the fused path and the AABB quick-reject.
+    cv::Vec3f planeOrigin, planeVxStep, planeVyStep;
+    if (plane) {
+        float m = 1.0f / params.scale;
+        cv::Vec3f totalOffset(params.surfaceROI.x, params.surfaceROI.y, params.zOff);
+        cv::Vec3f vx = plane->basisX();
+        cv::Vec3f vy = plane->basisY();
+        cv::Vec3f useOrigin = plane->origin() + plane->normal(cv::Vec3f(0,0,0)) * totalOffset[2];
+        planeVxStep = vx * m;
+        planeVyStep = vy * m;
+        planeOrigin = vx * totalOffset[0] + vy * totalOffset[1] + useOrigin;
     }
 
-    if (coords.empty()) {
-        return result;
+    // Generate coordinates for non-fused paths.
+    cv::Mat_<cv::Vec3f> coords;
+    cv::Mat_<cv::Vec3f> normals;
+    if (!useFusedPlane) {
+        if (needNormals && !plane) {
+            surface->gen(&coords, &normals, cv::Size(params.tileW, params.tileH),
+                         cv::Vec3f(0, 0, 0), params.scale,
+                         {params.surfaceROI.x * params.scale,
+                          params.surfaceROI.y * params.scale,
+                          params.zOff});
+        } else {
+            generateTileCoords(coords, params, surface);
+        }
+
+        if (coords.empty()) {
+            return result;
+        }
     }
 
     // Quick reject: if the tile's world AABB doesn't intersect data bounds,
     // skip the entire sampling pass (avoids cache lookups and prefetch requests).
-    // Sample corners, edge midpoints, and center to handle curved surfaces
-    // where interior points can extend beyond the corner-only AABB.
     const auto& db = volume->dataBounds();
     if (db.valid) {
-        int midR = coords.rows / 2;
-        int midC = coords.cols / 2;
-        int lastR = coords.rows - 1;
-        int lastC = coords.cols - 1;
+        float tMinX, tMaxX, tMinY, tMaxY, tMinZ, tMaxZ;
 
-        // 4 corners + 4 edge midpoints + center = 9 sample points
-        const cv::Vec3f* samples[] = {
-            &coords(0, 0), &coords(0, lastC),
-            &coords(lastR, 0), &coords(lastR, lastC),
-            &coords(0, midC), &coords(lastR, midC),
-            &coords(midR, 0), &coords(midR, lastC),
-            &coords(midR, midC)
-        };
+        if (plane) {
+            // Plane: compute AABB analytically from 4 corners (exact for affine)
+            cv::Vec3f c0 = planeOrigin;
+            cv::Vec3f c1 = planeOrigin + planeVxStep * static_cast<float>(params.tileW - 1);
+            cv::Vec3f c2 = planeOrigin + planeVyStep * static_cast<float>(params.tileH - 1);
+            cv::Vec3f c3 = c1 + planeVyStep * static_cast<float>(params.tileH - 1);
+            tMinX = std::min({c0[0], c1[0], c2[0], c3[0]});
+            tMaxX = std::max({c0[0], c1[0], c2[0], c3[0]});
+            tMinY = std::min({c0[1], c1[1], c2[1], c3[1]});
+            tMaxY = std::max({c0[1], c1[1], c2[1], c3[1]});
+            tMinZ = std::min({c0[2], c1[2], c2[2], c3[2]});
+            tMaxZ = std::max({c0[2], c1[2], c2[2], c3[2]});
+        } else {
+            // QuadSurface: sample corners, edge midpoints, and center
+            int midR = coords.rows / 2;
+            int midC = coords.cols / 2;
+            int lastR = coords.rows - 1;
+            int lastC = coords.cols - 1;
 
-        float tMinX = samples[0]->val[0], tMaxX = tMinX;
-        float tMinY = samples[0]->val[1], tMaxY = tMinY;
-        float tMinZ = samples[0]->val[2], tMaxZ = tMinZ;
-        for (int i = 1; i < 9; i++) {
-            const auto& s = *samples[i];
-            tMinX = std::min(tMinX, s[0]); tMaxX = std::max(tMaxX, s[0]);
-            tMinY = std::min(tMinY, s[1]); tMaxY = std::max(tMaxY, s[1]);
-            tMinZ = std::min(tMinZ, s[2]); tMaxZ = std::max(tMaxZ, s[2]);
+            const cv::Vec3f* samples[] = {
+                &coords(0, 0), &coords(0, lastC),
+                &coords(lastR, 0), &coords(lastR, lastC),
+                &coords(0, midC), &coords(lastR, midC),
+                &coords(midR, 0), &coords(midR, lastC),
+                &coords(midR, midC)
+            };
+
+            tMinX = samples[0]->val[0]; tMaxX = tMinX;
+            tMinY = samples[0]->val[1]; tMaxY = tMinY;
+            tMinZ = samples[0]->val[2]; tMaxZ = tMinZ;
+            for (int i = 1; i < 9; i++) {
+                const auto& s = *samples[i];
+                tMinX = std::min(tMinX, s[0]); tMaxX = std::max(tMaxX, s[0]);
+                tMinY = std::min(tMinY, s[1]); tMaxY = std::max(tMaxY, s[1]);
+                tMinZ = std::min(tMinZ, s[2]); tMaxZ = std::max(tMaxZ, s[2]);
+            }
         }
 
         // Conservative margin for interpolation + composite layers
@@ -198,6 +232,32 @@ TileRenderResult TileRenderer::renderTile(
 
         result.actualLevel = volume->sampleCompositeBestEffort(
             gray, coords, normals, sp);
+    } else if (useFusedPlane) {
+        // Fused plane path: no intermediate coords Mat
+        vc::SampleParams sp;
+        sp.level = params.dsScaleIdx;
+        sp.method = (params.useFastInterpolation || params.dsScaleIdx >= 3)
+                        ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
+
+        result.actualLevel = volume->samplePlaneBestEffort(
+            gray, planeOrigin, planeVxStep, planeVyStep,
+            params.tileW, params.tileH, sp);
+
+        // Apply directional lighting when enabled outside composite mode.
+        if (params.compositeSettings.params.lightingEnabled && !gray.empty()) {
+            const auto& cp = params.compositeSettings.params;
+            cv::Vec3f planeN = plane->normal(cv::Vec3f(0, 0, 0));
+            float factor = computeLightingFactor(planeN, cp);
+            if (factor < 1.0f) {
+                for (int y = 0; y < gray.rows; ++y) {
+                    auto* row = gray.ptr<uint8_t>(y);
+                    for (int x = 0; x < gray.cols; ++x) {
+                        row[x] = static_cast<uint8_t>(
+                            std::clamp(row[x] * factor, 0.0f, 255.0f));
+                    }
+                }
+            }
+        }
     } else {
         vc::SampleParams sp;
         sp.level = params.dsScaleIdx;
@@ -260,6 +320,11 @@ TileRenderResult TileRenderer::renderTile(
     result.image = applyPostProcess(gray, pp);
 
     if (params.overlayVolume && params.overlayOpacity > 0.0f) {
+        // Overlay needs coords — generate them lazily if the fused path skipped it
+        if (coords.empty() && plane) {
+            generateTileCoords(coords, params, surface);
+        }
+
         cv::Mat_<uint8_t> overlayGray;
         vc::SampleParams overlaySp;
         overlaySp.level = params.dsScaleIdx;
