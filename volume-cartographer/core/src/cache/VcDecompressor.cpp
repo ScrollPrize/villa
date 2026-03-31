@@ -3,12 +3,58 @@
 
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 #if __has_include("utils/video_codec.hpp")
 #include "utils/video_codec.hpp"
 #endif
 
 namespace vc::cache {
+
+// Thread-local pool of pre-allocated ChunkData objects to avoid
+// malloc/free churn on every decompress (0.46% of CPU in profiles).
+// Each thread keeps up to 4 recycled buffers. When a ChunkDataPtr's
+// refcount drops to 1 (only the pool holds it), it's available for reuse.
+static ChunkDataPtr acquireChunkData(size_t bytesNeeded)
+{
+    // Small thread-local free list
+    constexpr size_t kPoolSize = 4;
+    struct Pool {
+        ChunkDataPtr bufs[kPoolSize];
+        int count = 0;
+    };
+    thread_local Pool pool;
+
+    // Try to reuse a pooled buffer with sufficient capacity
+    for (int i = 0; i < pool.count; i++) {
+        if (pool.bufs[i].use_count() == 1 &&
+            pool.bufs[i]->bytes.capacity() >= bytesNeeded) {
+            auto result = pool.bufs[i];
+            result->bytes.resize(bytesNeeded);
+            return result;
+        }
+    }
+
+    // Allocate fresh
+    auto result = std::make_shared<ChunkData>();
+    result->bytes.resize(bytesNeeded);
+
+    // Try to add to pool for future reuse
+    if (pool.count < static_cast<int>(kPoolSize)) {
+        pool.bufs[pool.count++] = result;
+    } else {
+        // Replace the first entry with refcount > 1 (in active use, won't
+        // be recycled anyway), or the first entry if all are reclaimable.
+        for (int i = 0; i < static_cast<int>(kPoolSize); i++) {
+            if (pool.bufs[i].use_count() > 1) {
+                pool.bufs[i] = result;
+                break;
+            }
+        }
+    }
+
+    return result;
+}
 
 DecompressFn makeVcDecompressor(const std::vector<vc::VcDataset*>& datasets)
 {
@@ -24,12 +70,9 @@ DecompressFn makeVcDecompressor(const std::vector<vc::VcDataset*>& datasets)
         const auto& chunkShape = ds.defaultChunkShape();
         const size_t chunkSize = ds.defaultChunkSize();
 
-        auto result = std::make_shared<ChunkData>();
-        result->shape = {
-            static_cast<int>(chunkShape[0]),
-            static_cast<int>(chunkShape[1]),
-            static_cast<int>(chunkShape[2])};
-        result->elementSize = 1;
+        // Determine required buffer size upfront to reuse pooled buffers
+        const auto dtype = ds.getDtype();
+        size_t bufferBytes = (dtype == vc::VcDtype::uint16) ? chunkSize * 2 : chunkSize;
 
 #ifdef UTILS_HAS_VIDEO_CODEC
         // Check for VC3D video codec magic header
@@ -53,22 +96,29 @@ DecompressFn makeVcDecompressor(const std::vector<vc::VcDataset*>& datasets)
                     compressed.size()),
                 size_t(dims[0]) * dims[1] * dims[2], vp);
 
-            // The video codec always produces uint8 data
-            result->bytes.resize(chunkSize);
+            auto result = acquireChunkData(chunkSize);
+            result->shape = {
+                static_cast<int>(chunkShape[0]),
+                static_cast<int>(chunkShape[1]),
+                static_cast<int>(chunkShape[2])};
+            result->elementSize = 1;
             size_t copySize = std::min(decoded.size(), chunkSize);
             std::memcpy(result->bytes.data(), decoded.data(), copySize);
             return result;
         }
 #endif
 
-        // Normal zarr decompression path
-        const auto dtype = ds.getDtype();
+        auto result = acquireChunkData(bufferBytes);
+        result->shape = {
+            static_cast<int>(chunkShape[0]),
+            static_cast<int>(chunkShape[1]),
+            static_cast<int>(chunkShape[2])};
+        result->elementSize = 1;
 
+        // Normal zarr decompression path
         if (dtype == vc::VcDtype::uint8) {
-            result->bytes.resize(chunkSize);
             ds.decompress(compressed, result->bytes.data(), chunkSize);
         } else if (dtype == vc::VcDtype::uint16) {
-            result->bytes.resize(chunkSize * 2);
             ds.decompress(compressed, result->bytes.data(), chunkSize);
 
             auto* src = reinterpret_cast<const uint16_t*>(result->bytes.data());

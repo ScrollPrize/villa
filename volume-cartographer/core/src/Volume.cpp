@@ -413,7 +413,7 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
         } else if (mountInfo_.parallelCount > 0) {
             config.ioThreads = mountInfo_.parallelCount;
         } else {
-            config.ioThreads = 64;  // saturate connection
+            config.ioThreads = 32;  // 64 caused malloc corruption crashes
         }
         fprintf(stderr, "[Volume] IO threads: %d\n", config.ioThreads);
     }

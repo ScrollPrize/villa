@@ -328,4 +328,149 @@ private:
     mutable std::atomic<std::uint64_t> evictions_;
 };
 
+// ---------------------------------------------------------------------------
+// ShardedLRUCache -- distributes keys across N independent LRUCache shards
+// to eliminate shared_mutex contention on concurrent reads.
+//
+// With a single LRUCache, even read-only shared_lock operations contend on
+// the internal atomic reader counter. With N shards, concurrent readers
+// hitting different shards never touch the same cache line.
+// ---------------------------------------------------------------------------
+template<typename K, typename V,
+         typename Hash     = std::hash<K>,
+         typename KeyEqual = std::equal_to<K>,
+         std::size_t NumShards = 16>
+class ShardedLRUCache final {
+public:
+    using Config = typename LRUCache<K, V, Hash, KeyEqual>::Config;
+
+    explicit ShardedLRUCache(Config config = {})
+    {
+        // Distribute byte budget evenly across shards
+        Config shardConfig = config;
+        shardConfig.max_bytes = std::max<std::size_t>(1, config.max_bytes / NumShards);
+        for (std::size_t i = 0; i < NumShards; i++) {
+            shards_[i].emplace(shardConfig);
+        }
+    }
+
+    ShardedLRUCache(const ShardedLRUCache&)            = delete;
+    ShardedLRUCache& operator=(const ShardedLRUCache&) = delete;
+
+    // -- read ---------------------------------------------------------------
+
+    [[nodiscard]] std::optional<V> get(const K& key) const
+    {
+        return shard(key).get(key);
+    }
+
+    [[nodiscard]] V get_or(const K& key, V fallback) const
+    {
+        return shard(key).get_or(key, std::move(fallback));
+    }
+
+    [[nodiscard]] bool contains(const K& key) const noexcept
+    {
+        return shard(key).contains(key);
+    }
+
+    // -- write --------------------------------------------------------------
+
+    void put(const K& key, V value)
+    {
+        shard(key).put(key, std::move(value));
+    }
+
+    void put_pinned(const K& key, V value)
+    {
+        shard(key).put_pinned(key, std::move(value));
+    }
+
+    bool remove(const K& key)
+    {
+        return shard(key).remove(key);
+    }
+
+    void clear()
+    {
+        for (auto& s : shards_) s->clear();
+    }
+
+    // -- stats (aggregated) -------------------------------------------------
+
+    [[nodiscard]] std::size_t size() const noexcept
+    {
+        std::size_t total = 0;
+        for (const auto& s : shards_) total += s->size();
+        return total;
+    }
+
+    [[nodiscard]] std::size_t byte_size() const noexcept
+    {
+        std::size_t total = 0;
+        for (const auto& s : shards_) total += s->byte_size();
+        return total;
+    }
+
+    [[nodiscard]] std::size_t max_bytes() const noexcept
+    {
+        std::size_t total = 0;
+        for (const auto& s : shards_) total += s->max_bytes();
+        return total;
+    }
+
+    [[nodiscard]] std::uint64_t hits() const noexcept
+    {
+        std::uint64_t total = 0;
+        for (const auto& s : shards_) total += s->hits();
+        return total;
+    }
+
+    [[nodiscard]] std::uint64_t misses() const noexcept
+    {
+        std::uint64_t total = 0;
+        for (const auto& s : shards_) total += s->misses();
+        return total;
+    }
+
+    [[nodiscard]] std::uint64_t evictions() const noexcept
+    {
+        std::uint64_t total = 0;
+        for (const auto& s : shards_) total += s->evictions();
+        return total;
+    }
+
+    // -- batch operations ---------------------------------------------------
+
+    template<typename Iter>
+    [[nodiscard]] std::vector<K> missing_keys(Iter begin, Iter end) const
+    {
+        std::vector<K> result;
+        for (auto it = begin; it != end; ++it) {
+            if (!shard(*it).contains(*it)) {
+                result.push_back(*it);
+            }
+        }
+        return result;
+    }
+
+    template<typename F>
+    void for_each(F&& func) const
+    {
+        for (const auto& s : shards_) {
+            s->for_each(func);
+        }
+    }
+
+private:
+    [[nodiscard]] LRUCache<K, V, Hash, KeyEqual>& shard(const K& key) const
+    {
+        auto idx = Hash{}(key) % NumShards;
+        return *shards_[idx];
+    }
+
+    // Use std::optional to avoid requiring movability of LRUCache
+    mutable std::array<std::optional<LRUCache<K, V, Hash, KeyEqual>>, NumShards> shards_;
+};
+
 } // namespace utils

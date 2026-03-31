@@ -215,13 +215,15 @@ public:
 
 private:
     // --- Hot tier (decompressed in RAM) ---
-    utils::LRUCache<ChunkKey, ChunkDataPtr, ChunkKeyHash> hotCache_;
+    // Sharded across 16 independent LRU caches to eliminate shared_mutex
+    // atomic contention on concurrent reads (12% CPU on aarch64).
+    utils::ShardedLRUCache<ChunkKey, ChunkDataPtr, ChunkKeyHash> hotCache_;
 
     [[nodiscard]] ChunkDataPtr hotGet(const ChunkKey& key);
     void hotPut(const ChunkKey& key, ChunkDataPtr data, bool pinned = false);
 
     // --- Warm tier (compressed in RAM) ---
-    utils::LRUCache<ChunkKey, CompressedChunk, ChunkKeyHash> warmCache_;
+    utils::ShardedLRUCache<ChunkKey, CompressedChunk, ChunkKeyHash> warmCache_;
 
     [[nodiscard]] std::optional<CompressedChunk> warmGet(const ChunkKey& key);
     void warmPut(const ChunkKey& key, std::vector<uint8_t> compressed);
@@ -247,6 +249,16 @@ private:
     // --- Negative cache: chunks confirmed not to exist at the source ---
     // Prevents repeated S3 round-trips for out-of-bounds / sparse chunks.
     // Persisted to disk alongside the cold tier so it survives restarts.
+    //
+    // Fast path: atomic bloom filter rejects most lookups without taking the
+    // shared_mutex. The bloom filter has false positives but no false negatives,
+    // so a negative bloom result means "definitely not in negative cache"
+    // (i.e. the chunk might exist -- proceed to fetch).
+    static constexpr size_t kBloomBits = 65536;  // 8 KB, ~1% FPR at 5000 entries
+    std::array<std::atomic<uint64_t>, kBloomBits / 64> negativeBloom_{};
+    void bloomAdd(const ChunkKey& key);
+    [[nodiscard]] bool bloomMayContain(const ChunkKey& key) const;
+    void bloomClear();
     mutable std::shared_mutex negativeMutex_;
     std::unordered_set<ChunkKey, ChunkKeyHash> negativeCache_;
     void loadNegativeCache();

@@ -137,28 +137,34 @@ TieredChunkCache::TieredChunkCache(
             std::fprintf(stderr, "[Cache] ice-fetch #%lu lvl=%d (%d,%d,%d) bytes=%zu %ldms\n",
                          n + 1, key.level, key.iz, key.iy, key.ix, data.size(), fetchMs);
 
-        // Optionally recompress before storing to disk cache.
-        if (config_.recompress) {
-            try {
-                auto recompressed = config_.recompress(data, key);
-                if (!recompressed.empty()) {
-                    if (auto* log = cacheDebugLog())
-                        std::fprintf(log, "FETCH recompress lvl=%d (%d,%d,%d) %zu -> %zu bytes\n",
-                                     key.level, key.iz, key.iy, key.ix,
-                                     data.size(), recompressed.size());
-                    data = std::move(recompressed);
-                }
-            } catch (const std::exception& e) {
-                if (auto* log = cacheDebugLog())
-                    std::fprintf(log, "FETCH recompress-error lvl=%d (%d,%d,%d) %s\n",
-                                 key.level, key.iz, key.iy, key.ix, e.what());
-            }
-        }
-
-        // Store to cold (disk cache) for persistence
+        // Store to cold (disk cache) for persistence — raw format first
+        // so the IO thread returns immediately.
         if (diskStore_) {
             diskStore_->put(config_.volumeId, key, data);
             statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // Submit recompression to the decompression pool so IO threads
+        // stay free for network fetches.  When done, overwrites the disk
+        // cache entry with the smaller video-compressed format.
+        if (config_.recompress && diskStore_) {
+            auto rawCopy = data;  // decompPool_ outlives this lambda
+            decompPool_->enqueue([this, key, raw = std::move(rawCopy)]() {
+                try {
+                    auto recompressed = config_.recompress(raw, key);
+                    if (!recompressed.empty()) {
+                        diskStore_->put(config_.volumeId, key, recompressed);
+                        if (auto* log = cacheDebugLog())
+                            std::fprintf(log, "RECOMPRESS lvl=%d (%d,%d,%d) %zu -> %zu bytes\n",
+                                         key.level, key.iz, key.iy, key.ix,
+                                         raw.size(), recompressed.size());
+                    }
+                } catch (const std::exception& e) {
+                    if (auto* log = cacheDebugLog())
+                        std::fprintf(log, "RECOMPRESS error lvl=%d (%d,%d,%d) %s\n",
+                                     key.level, key.iz, key.iy, key.ix, e.what());
+                }
+            });
         }
         auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
         if (auto* log = cacheDebugLog())
@@ -175,6 +181,7 @@ TieredChunkCache::TieredChunkCache(
         [this](const ChunkKey& key, std::vector<uint8_t>&& compressed) {
             if (compressed.empty()) {
                 // Empty fetch result: negative cache (chunk doesn't exist)
+                bloomAdd(key);
                 {
                     std::unique_lock lock(negativeMutex_);
                     negativeCache_.insert(key);
@@ -263,6 +270,40 @@ TieredChunkCache::~TieredChunkCache()
 }
 
 // =============================================================================
+// Bloom filter for negative cache (lock-free fast path)
+// =============================================================================
+
+void TieredChunkCache::bloomAdd(const ChunkKey& key)
+{
+    auto h = ChunkKeyHash{}(key);
+    // Two hash functions derived from the single hash via golden ratio mixing
+    auto h1 = h;
+    auto h2 = h * 0x9E3779B97F4A7C15ULL;
+    auto idx1 = h1 % kBloomBits;
+    auto idx2 = h2 % kBloomBits;
+    negativeBloom_[idx1 / 64].fetch_or(1ULL << (idx1 % 64), std::memory_order_relaxed);
+    negativeBloom_[idx2 / 64].fetch_or(1ULL << (idx2 % 64), std::memory_order_relaxed);
+}
+
+bool TieredChunkCache::bloomMayContain(const ChunkKey& key) const
+{
+    auto h = ChunkKeyHash{}(key);
+    auto h1 = h;
+    auto h2 = h * 0x9E3779B97F4A7C15ULL;
+    auto idx1 = h1 % kBloomBits;
+    auto idx2 = h2 % kBloomBits;
+    auto b1 = negativeBloom_[idx1 / 64].load(std::memory_order_relaxed) & (1ULL << (idx1 % 64));
+    auto b2 = negativeBloom_[idx2 / 64].load(std::memory_order_relaxed) & (1ULL << (idx2 % 64));
+    return b1 && b2;
+}
+
+void TieredChunkCache::bloomClear()
+{
+    for (auto& word : negativeBloom_)
+        word.store(0, std::memory_order_relaxed);
+}
+
+// =============================================================================
 // Non-blocking reads
 // =============================================================================
 
@@ -310,8 +351,8 @@ std::pair<ChunkDataPtr, int> TieredChunkCache::getBestAvailable(
 
 ChunkDataPtr TieredChunkCache::getBlocking(const ChunkKey& key)
 {
-    // Known non-existent? Return immediately.
-    {
+    // Known non-existent? Bloom filter fast-reject avoids the shared_mutex.
+    if (bloomMayContain(key)) {
         std::shared_lock lock(negativeMutex_);
         if (negativeCache_.count(key)) return nullptr;
     }
@@ -349,8 +390,11 @@ ChunkDataPtr TieredChunkCache::getBlocking(const ChunkKey& key)
     auto data = loadFull(key);
     if (!data) {
         // Fetch failed — remember so we don't retry
-        std::unique_lock lock(negativeMutex_);
-        negativeCache_.insert(key);
+        bloomAdd(key);
+        {
+            std::unique_lock lock(negativeMutex_);
+            negativeCache_.insert(key);
+        }
     }
     return data;
 }
@@ -566,6 +610,7 @@ void TieredChunkCache::clearAll()
 {
     ioPool_.cancelPending();
     clearMemory();
+    bloomClear();
     {
         std::unique_lock lock(negativeMutex_);
         negativeCache_.clear();
@@ -607,6 +652,8 @@ TieredChunkCache::DataBoundsL0 TieredChunkCache::dataBounds() const
 
 bool TieredChunkCache::isNegativeCached(const ChunkKey& key) const
 {
+    // Bloom filter fast-reject: if bloom says no, definitely not cached.
+    if (!bloomMayContain(key)) return false;
     std::shared_lock lock(negativeMutex_);
     return negativeCache_.count(key) > 0;
 }
@@ -777,21 +824,23 @@ ChunkDataPtr TieredChunkCache::promoteFromIce(const ChunkKey& key)
 
     statIceFetches_.fetch_add(1, std::memory_order_relaxed);
 
-    // Optionally recompress before storing to disk/warm
-    if (config_.recompress) {
-        try {
-            auto recompressed = config_.recompress(compressed, key);
-            if (!recompressed.empty())
-                compressed = std::move(recompressed);
-        } catch (...) {
-            // Fall through with original data
-        }
-    }
-
-    // Store to cold (disk cache)
+    // Store to cold (disk cache) with raw format first
     if (diskStore_) {
         diskStore_->put(config_.volumeId, key, compressed);
         statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Submit recompression to background pool — overwrites disk entry
+    // when done but doesn't block the caller.
+    if (config_.recompress && diskStore_) {
+        auto rawCopy = compressed;
+        decompPool_->enqueue([this, key, raw = std::move(rawCopy)]() {
+            try {
+                auto recompressed = config_.recompress(raw, key);
+                if (!recompressed.empty())
+                    diskStore_->put(config_.volumeId, key, recompressed);
+            } catch (...) {}
+        });
     }
 
     // Keep a local copy for promotion before putting into warm cache,
@@ -820,7 +869,9 @@ bool TieredChunkCache::isReadyForNonBlockingRead(const ChunkKey& key) const
     if (hotCache_.contains(key)) return true;
     if (warmCache_.contains(key)) return true;
 
-    {
+    // Bloom filter fast-reject avoids the shared_mutex on the common path
+    // (most keys are NOT negative-cached).
+    if (bloomMayContain(key)) {
         std::shared_lock lock(negativeMutex_);
         if (negativeCache_.count(key)) return true;
     }
@@ -862,7 +913,9 @@ void TieredChunkCache::loadNegativeCache()
            f.read(reinterpret_cast<char*>(&iz), 4) &&
            f.read(reinterpret_cast<char*>(&iy), 4) &&
            f.read(reinterpret_cast<char*>(&ix), 4)) {
-        negativeCache_.insert(ChunkKey{level, iz, iy, ix});
+        ChunkKey k{level, iz, iy, ix};
+        negativeCache_.insert(k);
+        bloomAdd(k);
         count++;
     }
     if (count > 0) {
