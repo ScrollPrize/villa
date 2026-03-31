@@ -787,7 +787,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit flipURequested(segmentId);
     });
 
-    QAction* rotateAction = contextMenu.addAction(tr("Rotate Surface 90° CW"));
+    QAction* rotateAction = contextMenu.addAction(tr("Rotate Surface..."));
     connect(rotateAction, &QAction::triggered, this, [this, segmentId]() {
         emit rotateSurfaceRequested(segmentId);
     });

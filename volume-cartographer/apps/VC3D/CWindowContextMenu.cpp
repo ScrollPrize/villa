@@ -1724,8 +1724,17 @@ void CWindow::onRotateSurface(const std::string& segmentId)
         return;
     }
 
+    bool ok;
+    double angle = QInputDialog::getDouble(
+        this, tr("Rotate Surface"),
+        tr("Rotation angle (degrees, clockwise):"),
+        90.0, -360.0, 360.0, 1, &ok);
+    if (!ok) {
+        return;
+    }
+
     QuadSurface* surface = surf.get();
-    surface->rotate(90.0f);
+    surface->rotate(static_cast<float>(angle));
 
     try {
         surface->save(surface->path.string(), surface->id, true);
@@ -1747,8 +1756,9 @@ void CWindow::onRotateSurface(const std::string& segmentId)
 
     if (statusBar()) {
         statusBar()->showMessage(
-            tr("Rotated %1 by 90° clockwise")
-                .arg(QString::fromStdString(segmentId)),
+            tr("Rotated %1 by %2°")
+                .arg(QString::fromStdString(segmentId))
+                .arg(angle),
             5000);
     }
 }
