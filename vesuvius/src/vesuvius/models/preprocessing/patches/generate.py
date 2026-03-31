@@ -33,7 +33,7 @@ class VolumeInfo:
 
     volume_id: str
     image_path: Path
-    label_paths: Dict[str, Path]
+    label_paths: Dict[str, Optional[Path]]
 
 
 @dataclass
@@ -90,7 +90,7 @@ def generate_patch_caches(
     logger.info("Cache directory: %s", cache_dir)
 
     # Discover volumes
-    volumes = _discover_volumes(data_path, target_names)
+    volumes = _discover_volumes(data_path, target_names, mgr=mgr)
     if not volumes:
         logger.warning("No volumes found in %s", data_path)
         return PatchCacheResult(0, 0, 0, 0, 0, 0, 0)
@@ -268,6 +268,8 @@ def _resolve_valid_patch_value(
 def _discover_volumes(
     data_path: Path,
     target_names: List[str],
+    *,
+    mgr=None,
 ) -> List[VolumeInfo]:
     """
     Discover OME-Zarr volumes following ZarrDataset pattern.
@@ -281,6 +283,24 @@ def _discover_volumes(
                 volume1_target.zarr/
                 volume2_target.zarr/
     """
+    if mgr is not None and hasattr(mgr, "get_explicit_volume_specs"):
+        explicit_specs = mgr.get_explicit_volume_specs()
+        if explicit_specs:
+            volumes = []
+            for spec in explicit_specs:
+                label_paths = {
+                    target: spec.get("label_paths", {}).get(target)
+                    for target in target_names
+                }
+                volumes.append(
+                    VolumeInfo(
+                        volume_id=str(spec["volume_id"]),
+                        image_path=Path(spec["image_path"]),
+                        label_paths=label_paths,
+                    )
+                )
+            return volumes
+
     images_dir = data_path / "images"
     labels_dir = data_path / "labels"
 
