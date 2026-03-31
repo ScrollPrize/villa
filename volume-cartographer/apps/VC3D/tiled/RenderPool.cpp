@@ -119,16 +119,10 @@ std::vector<TileRenderResult> RenderPool::drainCompleted(int maxResults, uint64_
 void RenderPool::cancelAll()
 {
     pool_->cancel_pending();
-    pool_->wait_idle();
 
     {
         std::lock_guard<std::mutex> lock(resultsMutex_);
         completedResults_.clear();
-        pendingCount_.store(0, std::memory_order_relaxed);
-    }
-    {
-        std::lock_guard<std::mutex> lock(timeMutex_);
-        hasSubmissions_ = false;
     }
 }
 
