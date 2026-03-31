@@ -36,16 +36,11 @@ struct ChunkData {
         return hugeBuf.ptr ? hugeBuf.size : bytes.size();
     }
 
-    // Resize storage: uses huge page pool for sizes <= 2MB, vector otherwise.
+    // Resize storage — plain vector (HugePageAllocator disabled for stability)
     void resizeBytes(size_t n)
     {
-        if (n <= HugePageAllocator::k2MB) {
-            hugeBuf.resize(n);
-            bytes.clear();
-        } else {
-            hugeBuf = HugePageBuffer{};
-            bytes.resize(n);
-        }
+        hugeBuf = HugePageBuffer{};
+        bytes.resize(n);
     }
 
     // Raw byte pointer (whichever storage is active).
