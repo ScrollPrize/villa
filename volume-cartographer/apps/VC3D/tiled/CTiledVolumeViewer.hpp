@@ -253,6 +253,7 @@ private:
 
     // Camera-based navigation (replaces scrollbar-based)
     void panBy(int dx, int dy);
+    void panByF(float dx, float dy);
     void zoomAt(float factor, const QPointF& widgetPos);
     void zoomStepsAt(int steps, const QPointF& scenePos);
     void setSliceOffset(float dz);
@@ -473,6 +474,7 @@ private:
     // --- Pan tracking ---
     // For tiled viewer, panning is tracked via delta signals from the view
     QPoint _lastPanPos;
+    QPointF _lastPanSceneF;  // sub-pixel pan tracking in scene coords
     bool _isPanning = false;
 
     // Predictive prefetch state

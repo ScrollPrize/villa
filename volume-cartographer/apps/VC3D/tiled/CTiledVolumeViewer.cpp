@@ -808,6 +808,11 @@ QRectF CTiledVolumeViewer::viewportSceneRect() const
 
 void CTiledVolumeViewer::panBy(int dx, int dy)
 {
+    panByF(static_cast<float>(dx), static_cast<float>(dy));
+}
+
+void CTiledVolumeViewer::panByF(float dx, float dy)
+{
     const float invScale = _navSpeed / _camera.scale;
     _camera.surfacePtr[0] -= dx * invScale;
     _camera.surfacePtr[1] -= dy * invScale;
@@ -1024,6 +1029,10 @@ void CTiledVolumeViewer::onPanStart(Qt::MouseButton /*buttons*/, Qt::KeyboardMod
     // We need to intercept the mouse move deltas instead.
     // Store current mouse pos for delta computation
     _lastPanPos = QCursor::pos();
+    // Init float scene position for sub-pixel pan tracking
+    QPoint gp = QCursor::pos();
+    QPoint vp2 = fGraphicsView->viewport()->mapFromGlobal(gp);
+    _lastPanSceneF = fGraphicsView->mapToScene(vp2);
 
     // Record viewport center in scene coords for predictive prefetch
     QRectF vp = viewportSceneRect();
@@ -1418,17 +1427,22 @@ void CTiledVolumeViewer::onCursorMove(QPointF scene_loc)
 
     // Handle panning: if middle/right button is down, pan instead
     if (_isPanning) {
-        QPoint currentPos = QCursor::pos();
-        QPoint delta = _lastPanPos - currentPos;
-        _lastPanPos = currentPos;
-        if (delta.x() != 0 || delta.y() != 0) {
-            panBy(-delta.x(), -delta.y());
-            // Track velocity for momentum (exponential moving average)
-            _momentumPanVx = _momentumPanVx * 0.3f + (-delta.x()) * 0.7f;
-            _momentumPanVy = _momentumPanVy * 0.3f + (-delta.y()) * 0.7f;
+        // Use scene coordinates for sub-pixel precision
+        QPointF currentScenePos = scene_loc;
+        float dx = static_cast<float>(currentScenePos.x() - _lastPanSceneF.x());
+        float dy = static_cast<float>(currentScenePos.y() - _lastPanSceneF.y());
+        _lastPanSceneF = currentScenePos;
+        _lastPanPos = QCursor::pos();  // keep for compatibility
+        if (std::abs(dx) > 0.001f || std::abs(dy) > 0.001f) {
+            // Scene coords are already in surface space — convert to pixels
+            float pxDx = dx * _camera.scale;
+            float pxDy = dy * _camera.scale;
+            panByF(-pxDx, -pxDy);
+            _momentumPanVx = _momentumPanVx * 0.3f + (-pxDx) * 0.7f;
+            _momentumPanVy = _momentumPanVy * 0.3f + (-pxDy) * 0.7f;
         }
 
-        const QPoint viewportPos = fGraphicsView->viewport()->mapFromGlobal(currentPos);
+        const QPoint viewportPos = fGraphicsView->viewport()->mapFromGlobal(_lastPanPos);
         updateCursorPoi(fGraphicsView->mapToScene(viewportPos));
         return;
     }
@@ -2299,7 +2313,7 @@ void CTiledVolumeViewer::momentumTick()
 
     // Pan momentum
     if (std::abs(_momentumPanVx) > kPanMin || std::abs(_momentumPanVy) > kPanMin) {
-        panBy(static_cast<int>(_momentumPanVx), static_cast<int>(_momentumPanVy));
+        panByF(_momentumPanVx, _momentumPanVy);
         _momentumPanVx *= kDecay;
         _momentumPanVy *= kDecay;
         anyActive = true;
