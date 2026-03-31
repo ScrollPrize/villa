@@ -8,6 +8,10 @@
 #include <optional>
 #include <thread>
 
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
+
 #include <opencv2/imgcodecs.hpp>
 #include <nlohmann/json.hpp>
 
@@ -902,13 +906,70 @@ Volume::WorldBBox Volume::coordsWorldBBox(const cv::Mat_<cv::Vec3f>& coords) con
     const int h = coords.rows;
     const int w = coords.cols;
 
+#ifdef __aarch64__
+    // NEON with vld3q_f32 to deinterleave xyz — processes 4 Vec3f (12 floats) at a time
+    float32x4_t loX = vdupq_n_f32(std::numeric_limits<float>::max());
+    float32x4_t loY = loX, loZ = loX;
+    float32x4_t hiX = vdupq_n_f32(std::numeric_limits<float>::lowest());
+    float32x4_t hiY = hiX, hiZ = hiX;
+
+    auto scanRow = [&](const cv::Vec3f* row, int count) {
+        const float* p = reinterpret_cast<const float*>(row);
+        int i = 0;
+        for (; i + 4 <= count; i += 4) {
+            float32x4x3_t v = vld3q_f32(p + i * 3);
+            loX = vminq_f32(loX, v.val[0]);
+            loY = vminq_f32(loY, v.val[1]);
+            loZ = vminq_f32(loZ, v.val[2]);
+            hiX = vmaxq_f32(hiX, v.val[0]);
+            hiY = vmaxq_f32(hiY, v.val[1]);
+            hiZ = vmaxq_f32(hiZ, v.val[2]);
+        }
+        for (; i < count; i++) {
+            float x = p[i*3], y = p[i*3+1], z = p[i*3+2];
+            loX = vminq_f32(loX, vdupq_n_f32(x));
+            loY = vminq_f32(loY, vdupq_n_f32(y));
+            loZ = vminq_f32(loZ, vdupq_n_f32(z));
+            hiX = vmaxq_f32(hiX, vdupq_n_f32(x));
+            hiY = vmaxq_f32(hiY, vdupq_n_f32(y));
+            hiZ = vmaxq_f32(hiZ, vdupq_n_f32(z));
+        }
+    };
+
+    scanRow(coords.ptr<cv::Vec3f>(0), w);
+    if (h > 1) scanRow(coords.ptr<cv::Vec3f>(h - 1), w);
+
+    auto updateScalar = [&](const cv::Vec3f& v) {
+        loX = vminq_f32(loX, vdupq_n_f32(v[0]));
+        loY = vminq_f32(loY, vdupq_n_f32(v[1]));
+        loZ = vminq_f32(loZ, vdupq_n_f32(v[2]));
+        hiX = vmaxq_f32(hiX, vdupq_n_f32(v[0]));
+        hiY = vmaxq_f32(hiY, vdupq_n_f32(v[1]));
+        hiZ = vmaxq_f32(hiZ, vdupq_n_f32(v[2]));
+    };
+
+    for (int y = 1; y < h - 1; ++y) {
+        const auto* row = coords.ptr<cv::Vec3f>(y);
+        updateScalar(row[0]);
+        updateScalar(row[w - 1]);
+    }
+    for (int y = 32; y < h - 1; y += 32) {
+        const auto* row = coords.ptr<cv::Vec3f>(y);
+        for (int x = 32; x < w - 1; x += 32)
+            updateScalar(row[x]);
+    }
+
+    // Reduce each 4-lane accumulator to scalar
+    wb.loX = vminvq_f32(loX); wb.hiX = vmaxvq_f32(hiX);
+    wb.loY = vminvq_f32(loY); wb.hiY = vmaxvq_f32(hiY);
+    wb.loZ = vminvq_f32(loZ); wb.hiZ = vmaxvq_f32(hiZ);
+#else
     auto updateBounds = [&](const cv::Vec3f& v) {
         wb.loX = std::min(wb.loX, v[0]); wb.hiX = std::max(wb.hiX, v[0]);
         wb.loY = std::min(wb.loY, v[1]); wb.hiY = std::max(wb.hiY, v[1]);
         wb.loZ = std::min(wb.loZ, v[2]); wb.hiZ = std::max(wb.hiZ, v[2]);
     };
 
-    // All 4 borders
     const auto* topRow = coords.ptr<cv::Vec3f>(0);
     const auto* botRow = coords.ptr<cv::Vec3f>(h - 1);
     for (int x = 0; x < w; ++x) {
@@ -920,14 +981,12 @@ Volume::WorldBBox Volume::coordsWorldBBox(const cv::Mat_<cv::Vec3f>& coords) con
         updateBounds(row[0]);
         updateBounds(row[w - 1]);
     }
-
-    // Sparse interior grid (every 32 pixels) to catch curved surfaces
     for (int y = 32; y < h - 1; y += 32) {
         const auto* row = coords.ptr<cv::Vec3f>(y);
-        for (int x = 32; x < w - 1; x += 32) {
+        for (int x = 32; x < w - 1; x += 32)
             updateBounds(row[x]);
-        }
     }
+#endif
 
     return wb;
 }

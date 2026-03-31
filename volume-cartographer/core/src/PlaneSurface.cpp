@@ -208,13 +208,24 @@ void PlaneSurface::gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals
     const cv::Vec3f vy = _vy;
 
     float m = 1/scale;
+    // Precompute: row_base = vy*(j*m + off_y) + vx*off_x + origin
+    // Inner loop: row_base + vx * (i * m) => start + i * step
     cv::Vec3f use_origin = _origin + _normal*total_offset[2];
+    cv::Vec3f x_start = vx * total_offset[0] + use_origin;
+    cv::Vec3f vx_step = vx * m;
+    cv::Vec3f vy_step = vy * m;
+    cv::Vec3f vy_base = vy * total_offset[1];
 
 #pragma omp parallel for
-    for(int j=0;j<h;j++)
+    for(int j=0;j<h;j++) {
+        cv::Vec3f row_base = vy_base + vy_step * static_cast<float>(j) + x_start;
+        cv::Vec3f *row = coords->ptr<cv::Vec3f>(j);
+        cv::Vec3f cur = row_base;
         for(int i=0;i<w;i++) {
-            (*coords)(j,i) = vx*(i*m+total_offset[0]) + vy*(j*m+total_offset[1]) + use_origin;
+            row[i] = cur;
+            cur += vx_step;
         }
+    }
 }
 
 void PlaneSurface::move(cv::Vec3f &ptr, const cv::Vec3f &offset)

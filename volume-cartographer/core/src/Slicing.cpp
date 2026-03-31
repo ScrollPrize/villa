@@ -111,58 +111,124 @@ struct CacheParams {
 template<typename T, int kSlots = 16>
 struct ChunkSampler {
     struct Slot {
-        int iz = -1, iy = -1, ix = -1;
+        uint64_t key = UINT64_MAX;  // packed (iz,iy,ix) key
         vc::cache::ChunkDataPtr chunk;
         const T* data = nullptr;
     };
+
+    // Open-addressing hash table: kHashSlots must be power of 2 and > kSlots
+    static constexpr int kHashSlots = kSlots <= 8 ? 16 : 32;
+    static constexpr int kHashMask = kHashSlots - 1;
 
     const CacheParams& p;
     vc::cache::TieredChunkCache& cache;
     int level;
     Slot slots[kSlots];
-    int mru = 0;  // most-recently-used slot index
+    int slotHead = 0;           // ring-buffer head for FIFO eviction
+    int hashTable[kHashSlots];  // maps hash -> slot index, -1 = empty
+    uint64_t lastKey = UINT64_MAX;  // MRU key for fast repeat check
     const T* data = nullptr;  // current data pointer
     size_t s0 = 0, s1 = 0;   // strides (s2 is always 1, eliminated)
+
+    static uint64_t packKey(int iz, int iy, int ix) {
+        return (uint64_t(unsigned(iz)) << 40) | (uint64_t(unsigned(iy)) << 20) | uint64_t(unsigned(ix));
+    }
+
+    // Fast hash for open-addressing — mix bits of packed key
+    static int hashIdx(uint64_t k) {
+        k ^= k >> 17;
+        k *= 0xff51afd7ed558ccdULL;
+        k ^= k >> 31;
+        return static_cast<int>(k) & kHashMask;
+    }
 
     ChunkSampler(const CacheParams& p_, vc::cache::TieredChunkCache& cache_, int level_)
         : p(p_), cache(cache_), level(level_)
     {
         s0 = static_cast<size_t>(p.cy) * p.cx;
         s1 = static_cast<size_t>(p.cx);
+        std::memset(hashTable, -1, sizeof(hashTable));
     }
 
     void updateChunk(int iz, int iy, int ix) {
+        uint64_t key = packKey(iz, iy, ix);
+
+        // Fast MRU check — same chunk as last call
+        if (key == lastKey) return;
+
         // Quick reject: chunk is entirely in zero-padded region
         if (p.dbValid && (iz < p.dbMinCz || iz > p.dbMaxCz ||
                           iy < p.dbMinCy || iy > p.dbMaxCy ||
                           ix < p.dbMinCx || ix > p.dbMaxCx)) {
             data = nullptr;
+            lastKey = key;
             return;
         }
-        // Check MRU slot first
-        auto& m = slots[mru];
-        if (m.iz == iz && m.iy == iy && m.ix == ix) {
-            data = m.data;
-            return;
-        }
-        // Linear scan remaining slots
-        for (int i = 0; i < kSlots; i++) {
-            if (i == mru) continue;
-            auto& s = slots[i];
-            if (s.iz == iz && s.iy == iy && s.ix == ix) {
-                mru = i;
-                data = s.data;
+
+        // Hash table lookup (open addressing, linear probe)
+        int h = hashIdx(key);
+        for (int probe = 0; probe < kHashSlots; probe++) {
+            int idx = (h + probe) & kHashMask;
+            int si = hashTable[idx];
+            if (si < 0) break;  // empty slot — not found
+            if (slots[si].key == key) {
+                data = slots[si].data;
+                lastKey = key;
                 return;
             }
         }
-        // Miss: evict LRU (slot furthest from mru in ring)
-        int victim = (mru + 1) % kSlots;
+
+        // Miss: evict oldest slot (FIFO ring)
+        int victim = slotHead;
+        slotHead = (slotHead + 1) % kSlots;
         auto& v = slots[victim];
+
+        // Remove old entry from hash table
+        if (v.key != UINT64_MAX) {
+            int oh = hashIdx(v.key);
+            for (int probe = 0; probe < kHashSlots; probe++) {
+                int idx = (oh + probe) & kHashMask;
+                if (hashTable[idx] == victim) {
+                    // Delete with backward-shift to maintain probe chains
+                    int hole = idx;
+                    for (;;) {
+                        int next = (hole + 1) & kHashMask;
+                        int nsi = hashTable[next];
+                        if (nsi < 0) break;
+                        int ideal = hashIdx(slots[nsi].key);
+                        // Check if 'next' needs hole: does its ideal position
+                        // lie at or before 'hole' in probe order from ideal?
+                        int dNext = (next - ideal) & kHashMask;
+                        int dHole = (hole - ideal) & kHashMask;
+                        if (dHole < dNext) {
+                            hashTable[hole] = nsi;
+                            hole = next;
+                        } else {
+                            break;
+                        }
+                    }
+                    hashTable[hole] = -1;
+                    break;
+                }
+            }
+        }
+
+        // Load new chunk
         v.chunk = cache.getBlocking(vc::cache::ChunkKey{level, iz, iy, ix});
-        v.iz = iz; v.iy = iy; v.ix = ix;
+        v.key = key;
         v.data = v.chunk ? v.chunk->template data<T>() : nullptr;
-        mru = victim;
         data = v.data;
+        lastKey = key;
+
+        // Insert into hash table
+        int ih = hashIdx(key);
+        for (int probe = 0; probe < kHashSlots; probe++) {
+            int idx = (ih + probe) & kHashMask;
+            if (hashTable[idx] < 0) {
+                hashTable[idx] = victim;
+                break;
+            }
+        }
     }
 
     bool inBounds(float vz, float vy, float vx) const {
@@ -173,24 +239,42 @@ struct ChunkSampler {
         int iz = static_cast<int>(vz + 0.5f);
         int iy = static_cast<int>(vy + 0.5f);
         int ix = static_cast<int>(vx + 0.5f);
-        if (iz >= p.sz) iz = p.sz - 1;
-        if (iy >= p.sy) iy = p.sy - 1;
-        if (ix >= p.sx) ix = p.sx - 1;
+        if (__builtin_expect(iz >= p.sz, 0)) iz = p.sz - 1;
+        if (__builtin_expect(iy >= p.sy, 0)) iy = p.sy - 1;
+        if (__builtin_expect(ix >= p.sx, 0)) ix = p.sx - 1;
 
-        updateChunk(p.chunkZ(iz), p.chunkY(iy), p.chunkX(ix));
-        if (!data) return 0;
+        int ciz, ciy, cix, lz, ly, lx;
+        if (p.pow2) {
+            ciz = iz >> p.czShift; ciy = iy >> p.cyShift; cix = ix >> p.cxShift;
+            lz = iz & p.czMask; ly = iy & p.cyMask; lx = ix & p.cxMask;
+        } else {
+            ciz = iz / p.cz; ciy = iy / p.cy; cix = ix / p.cx;
+            lz = iz % p.cz; ly = iy % p.cy; lx = ix % p.cx;
+        }
 
-        return data[p.localZ(iz) * s0 + p.localY(iy) * s1 + p.localX(ix)];
+        updateChunk(ciz, ciy, cix);
+        if (__builtin_expect(!data, 0)) return 0;
+
+        return data[static_cast<size_t>(lz) * s0 + static_cast<size_t>(ly) * s1 + lx];
     }
 
     T sampleInt(int iz, int iy, int ix) {
-        if (iz < 0 || iy < 0 || ix < 0 || iz >= p.sz || iy >= p.sy || ix >= p.sx)
+        if (__builtin_expect(iz < 0 || iy < 0 || ix < 0 || iz >= p.sz || iy >= p.sy || ix >= p.sx, 0))
             return 0;
 
-        updateChunk(p.chunkZ(iz), p.chunkY(iy), p.chunkX(ix));
-        if (!data) return 0;
+        int ciz, ciy, cix, lz, ly, lx;
+        if (p.pow2) {
+            ciz = iz >> p.czShift; ciy = iy >> p.cyShift; cix = ix >> p.cxShift;
+            lz = iz & p.czMask; ly = iy & p.cyMask; lx = ix & p.cxMask;
+        } else {
+            ciz = iz / p.cz; ciy = iy / p.cy; cix = ix / p.cx;
+            lz = iz % p.cz; ly = iy % p.cy; lx = ix % p.cx;
+        }
 
-        return data[p.localZ(iz) * s0 + p.localY(iy) * s1 + p.localX(ix)];
+        updateChunk(ciz, ciy, cix);
+        if (__builtin_expect(!data, 0)) return 0;
+
+        return data[static_cast<size_t>(lz) * s0 + static_cast<size_t>(ly) * s1 + lx];
     }
 
     float sampleTrilinear(float vz, float vy, float vx) {
@@ -426,6 +510,12 @@ static void readVolumeImpl(
     }
 
     // Phase 2: Sample (all chunks already cached)
+    //
+    // Process pixels in chunk-aligned tile blocks to maximize spatial locality
+    // and minimize updateChunk calls. For a typical surface, adjacent pixels
+    // map to adjacent voxels, so tiling by chunk size keeps most pixels in
+    // the same chunk. We tile over the Y dimension (since X already has good
+    // sequential locality within a row) using chunk-sized bands.
     const bool isComposite = (numLayers > 1);
     const bool isMin = params && (params->method == "min");
     const bool isMax = params && (params->method == "max");
@@ -433,116 +523,126 @@ static void readVolumeImpl(
     const bool needsLayerStorage = params && methodRequiresLayerStorage(params->method);
     const float firstLayerOffset = zStart * zStep;
 
-    // Each thread gets its own ChunkSampler (has mutable slot cache) and LayerStack.
-    #pragma omp parallel for schedule(dynamic, 8)
-    for (int y = 0; y < h; y++) {
-        // Per-thread sampler and layer stack (ChunkSampler has mutable cache slots)
-        ChunkSampler<T> samplerNoPrefetch(p, cache, level);
-        ChunkSampler<T> samplerPrefetch(p, cache, level);
+    // Tile height: use chunk Y size for good locality (chunks are typically 128)
+    // but clamp to reasonable range for the OMP scheduler.
+    const int tileH = std::max(8, std::min(p.cy, h));
+    const int numTiles = (h + tileH - 1) / tileH;
+
+    // Each OMP task processes a horizontal band of tileH rows.
+    // The sampler persists across all rows in the band, keeping its cache warm.
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int tile = 0; tile < numTiles; tile++) {
+        const int yStart = tile * tileH;
+        const int yEnd = std::min(yStart + tileH, h);
+
+        // Per-thread sampler and layer stack — persists across rows in this band
+        ChunkSampler<T> sampler(p, cache, level);
         LayerStack stack;
         if (needsLayerStorage) {
             stack.values.resize(numLayers);
         }
 
-        const auto* coordRow = coords.template ptr<cv::Vec3f>(y);
-        auto* outRow = out.template ptr<T>(y);
-        for (int x = 0; x < w; x++) {
-            float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
+        for (int y = yStart; y < yEnd; y++) {
+            const auto* coordRow = coords.template ptr<cv::Vec3f>(y);
+            auto* outRow = out.template ptr<T>(y);
+            for (int x = 0; x < w; x++) {
+                float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
 
-            if (numLayers == 1) {
-                // Single-sample path
-                if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0)) continue;
+                if (numLayers == 1) {
+                    // Single-sample path
+                    if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0)) continue;
 
-                if constexpr (Mode == SampleMode::Trilinear) {
-                    if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
-                    float v = samplerNoPrefetch.sampleTrilinearFast(base_vz, base_vy, base_vx);
-                    if constexpr (std::is_same_v<T, uint16_t>) {
-                        if (v < 0.f) v = 0.f;
-                        if (v > 65535.f) v = 65535.f;
-                        outRow[x] = static_cast<uint16_t>(v + 0.5f);
+                    if constexpr (Mode == SampleMode::Trilinear) {
+                        if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                        float v = sampler.sampleTrilinearFast(base_vz, base_vy, base_vx);
+                        if constexpr (std::is_same_v<T, uint16_t>) {
+                            if (v < 0.f) v = 0.f;
+                            if (v > 65535.f) v = 65535.f;
+                            outRow[x] = static_cast<uint16_t>(v + 0.5f);
+                        } else {
+                            outRow[x] = static_cast<T>(v);
+                        }
+                    } else if constexpr (Mode == SampleMode::Tricubic) {
+                        if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                        float v = sampler.sampleTricubic(base_vz, base_vy, base_vx);
+                        if constexpr (std::is_same_v<T, uint16_t>) {
+                            if (v < 0.f) v = 0.f;
+                            if (v > 65535.f) v = 65535.f;
+                            outRow[x] = static_cast<uint16_t>(v + 0.5f);
+                        } else {
+                            outRow[x] = static_cast<T>(v);
+                        }
                     } else {
-                        outRow[x] = static_cast<T>(v);
-                    }
-                } else if constexpr (Mode == SampleMode::Tricubic) {
-                    if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
-                    float v = samplerNoPrefetch.sampleTricubic(base_vz, base_vy, base_vx);
-                    if constexpr (std::is_same_v<T, uint16_t>) {
-                        if (v < 0.f) v = 0.f;
-                        if (v > 65535.f) v = 65535.f;
-                        outRow[x] = static_cast<uint16_t>(v + 0.5f);
-                    } else {
-                        outRow[x] = static_cast<T>(v);
+                        if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                        if ((static_cast<int>(base_vz + 0.5f) | static_cast<int>(base_vy + 0.5f) | static_cast<int>(base_vx + 0.5f)) < 0) continue;
+                        outRow[x] = sampler.sampleNearest(base_vz, base_vy, base_vx);
                     }
                 } else {
-                    if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
-                    if ((static_cast<int>(base_vz + 0.5f) | static_cast<int>(base_vy + 0.5f) | static_cast<int>(base_vx + 0.5f)) < 0) continue;
-                    outRow[x] = samplerNoPrefetch.sampleNearest(base_vz, base_vy, base_vx);
-                }
-            } else {
-                // Composite path
-                if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0)) continue;
+                    // Composite path
+                    if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0)) continue;
 
-                cv::Vec3f n = getNormal(y, x);
-                float nz = n[2], ny = n[1], nx = n[0];
+                    cv::Vec3f n = getNormal(y, x);
+                    float nz = n[2], ny = n[1], nx = n[0];
 
-                float acc = isMin ? 255.0f : 0.0f;
-                int validCount = 0;
+                    float acc = isMin ? 255.0f : 0.0f;
+                    int validCount = 0;
 
-                if (needsLayerStorage) {
-                    stack.validCount = 0;
-                }
-
-                float dz = nz * zStep;
-                float dy = ny * zStep;
-                float dx = nx * zStep;
-
-                float vz = base_vz + nz * firstLayerOffset;
-                float vy = base_vy + ny * firstLayerOffset;
-                float vx = base_vx + nx * firstLayerOffset;
-
-                for (int layer = 0; layer < numLayers; layer++) {
-                    bool validSample = false;
-                    float value = 0;
-
-                    if (samplerPrefetch.inBounds(vz, vy, vx)) {
-                        uint8_t raw = samplerPrefetch.sampleNearest(vz, vy, vx);
-                        value = static_cast<float>(raw < params->isoCutoff ? 0 : raw);
-                        validSample = true;
+                    if (needsLayerStorage) {
+                        stack.validCount = 0;
                     }
 
-                    vz += dz; vy += dy; vx += dx;
+                    float dz = nz * zStep;
+                    float dy = ny * zStep;
+                    float dx = nx * zStep;
 
-                    if (validSample) {
-                        if (needsLayerStorage) {
-                            stack.values[stack.validCount++] = value;
-                        } else if (isMax) {
-                            acc = value > acc ? value : acc;
-                            validCount++;
-                        } else if (isMin) {
-                            acc = value < acc ? value : acc;
-                            validCount++;
-                        } else {
-                            acc += value;
-                            validCount++;
+                    float vz = base_vz + nz * firstLayerOffset;
+                    float vy = base_vy + ny * firstLayerOffset;
+                    float vx = base_vx + nx * firstLayerOffset;
+
+                    for (int layer = 0; layer < numLayers; layer++) {
+                        bool validSample = false;
+                        float value = 0;
+
+                        if (sampler.inBounds(vz, vy, vx)) {
+                            uint8_t raw = sampler.sampleNearest(vz, vy, vx);
+                            value = static_cast<float>(raw < params->isoCutoff ? 0 : raw);
+                            validSample = true;
+                        }
+
+                        vz += dz; vy += dy; vx += dx;
+
+                        if (validSample) {
+                            if (needsLayerStorage) {
+                                stack.values[stack.validCount++] = value;
+                            } else if (isMax) {
+                                acc = value > acc ? value : acc;
+                                validCount++;
+                            } else if (isMin) {
+                                acc = value < acc ? value : acc;
+                                validCount++;
+                            } else {
+                                acc += value;
+                                validCount++;
+                            }
                         }
                     }
-                }
 
-                float result = 0.0f;
-                if (needsLayerStorage) {
-                    result = compositeLayerStack(stack, *params);
-                } else if (isMax || isMin) {
-                    result = acc;
-                } else if (isMean && validCount > 0) {
-                    result = acc / static_cast<float>(validCount);
-                }
+                    float result = 0.0f;
+                    if (needsLayerStorage) {
+                        result = compositeLayerStack(stack, *params);
+                    } else if (isMax || isMin) {
+                        result = acc;
+                    } else if (isMean && validCount > 0) {
+                        result = acc / static_cast<float>(validCount);
+                    }
 
-                if (params->lightingEnabled) {
-                    float lightFactor = computeLightingFactor(n, *params);
-                    result *= lightFactor;
-                }
+                    if (params->lightingEnabled) {
+                        float lightFactor = computeLightingFactor(n, *params);
+                        result *= lightFactor;
+                    }
 
-                outRow[x] = static_cast<T>(std::max(0.0f, std::min(255.0f, result)));
+                    outRow[x] = static_cast<T>(std::max(0.0f, std::min(255.0f, result)));
+                }
             }
         }
     }

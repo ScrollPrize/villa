@@ -351,17 +351,18 @@ std::pair<ChunkDataPtr, int> TieredChunkCache::getBestAvailable(
 
 ChunkDataPtr TieredChunkCache::getBlocking(const ChunkKey& key)
 {
-    // Known non-existent? Bloom filter fast-reject avoids the shared_mutex.
-    if (bloomMayContain(key)) {
-        std::shared_lock lock(negativeMutex_);
-        if (negativeCache_.count(key)) return nullptr;
-    }
-
-    // Check hot
+    // Fast path: hot cache hit. This is the common case during rendering —
+    // just hash + shard + shared_lock + flat-map probe + return.
     auto hot = hotGet(key);
     if (hot) {
         statHotHits_.fetch_add(1, std::memory_order_relaxed);
         return hot;
+    }
+
+    // Known non-existent? Bloom filter fast-reject avoids the shared_mutex.
+    if (bloomMayContain(key)) {
+        std::shared_lock lock(negativeMutex_);
+        if (negativeCache_.count(key)) return nullptr;
     }
 
     // Check warm
