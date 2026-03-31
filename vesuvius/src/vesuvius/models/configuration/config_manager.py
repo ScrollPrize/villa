@@ -288,6 +288,7 @@ class ConfigManager:
         self.max_val_steps_per_epoch = int(self.tr_configs.get("max_val_steps_per_epoch", 50))
         self.train_num_dataloader_workers = int(self.tr_configs.get("num_dataloader_workers", 8))
         self.max_epoch = int(self.tr_configs.get("max_epoch", 5000))
+        self.val_every_n = int(self.tr_configs.get("val_every_n", 1))
         self.early_stopping_patience = int(self.tr_configs.get("early_stopping_patience", 0))
         self.optimizer = self.tr_configs.get("optimizer", "SGD")
         self.initial_lr = float(self.tr_configs.get("initial_lr", 0.01))

@@ -109,19 +109,19 @@ def main(argv=None):
                            help="Type of pooling in encoder ('conv' = strided conv)")
 
     # Training Control
-    grp_train.add_argument("--max-epoch", type=int, default=1000,
+    grp_train.add_argument("--max-epoch", type=int, default=None,
                            help="Maximum number of epochs")
-    grp_train.add_argument("--max-steps-per-epoch", type=int, default=250,
+    grp_train.add_argument("--max-steps-per-epoch", type=int, default=None,
                            help="Max training steps per epoch (use all data if unset)")
-    grp_train.add_argument("--max-val-steps-per-epoch", type=int, default=50,
+    grp_train.add_argument("--max-val-steps-per-epoch", type=int, default=None,
                            help="Max validation steps per epoch (use all data if unset)")
     grp_train.add_argument("--full-epoch", action="store_true",
                            help="Iterate over entire train/val set per epoch (overrides max-steps)")
-    grp_train.add_argument("--early-stopping-patience", type=int, default=0,
+    grp_train.add_argument("--early-stopping-patience", type=int, default=None,
                            help="Epochs to wait for val loss improvement (0 disables)")
     grp_train.add_argument("--ddp", action="store_true",
                            help="Enable DistributedDataParallel (use with torchrun)")
-    grp_train.add_argument("--val-every-n", dest="val_every_n", type=int, default=1,
+    grp_train.add_argument("--val-every-n", dest="val_every_n", type=int, default=None,
                            help="Perform validation every N epochs (1=every epoch)")
     grp_train.add_argument("--gpus", type=str, default=None,
                            help="Comma-separated GPU device IDs to use, e.g. '0,1,3'. With DDP, length must equal WORLD_SIZE")
