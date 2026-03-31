@@ -20,7 +20,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import zarr
-from scipy.ndimage import distance_transform_edt
 from torch.utils.data import Dataset
 
 from vesuvius.utils.utils import pad_or_crop_3d, pad_or_crop_2d
@@ -373,6 +372,9 @@ class ZarrDataset(Dataset):
         distance: float,
         ignore_label: Optional[float],
     ) -> np.ndarray:
+        import cupy as cp
+        from cucim.core.operations.morphology import distance_transform_edt as cucim_distance_transform_edt
+
         if distance <= 0:
             return values
 
@@ -386,18 +388,22 @@ class ZarrDataset(Dataset):
         if not np.any(fill_mask):
             return arr
 
-        distances, nearest_indices = distance_transform_edt(
-            ~source_mask,
-            return_indices=True,
+        arr_gpu = cp.asarray(arr)
+        source_mask_gpu = cp.asarray(source_mask)
+
+        distances_gpu = cucim_distance_transform_edt(
+            ~source_mask_gpu,
+            return_indices=False,
+            float64_distances=False,
         )
-        fill_mask &= distances <= float(distance)
-        if not np.any(fill_mask):
+        fill_mask_gpu = cp.asarray(fill_mask)
+        fill_mask_gpu &= distances_gpu <= float(distance)
+        if not bool(fill_mask_gpu.any()):
             return arr
 
-        result = arr.copy()
-        nearest_values = arr[tuple(nearest_indices[axis][fill_mask] for axis in range(arr.ndim))]
-        result[fill_mask] = nearest_values
-        return result
+        result_gpu = arr_gpu.copy()
+        result_gpu[fill_mask_gpu] = arr.dtype.type(1)
+        return cp.asnumpy(result_gpu)
 
     @classmethod
     def _dilate_label_patch(

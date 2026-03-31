@@ -221,8 +221,7 @@ def create_training_transforms(
     # =========================================================================
     # BLANK RECTANGLE (conditional)
     # =========================================================================
-    blank_rectangle = None
-    if ENABLE_BLANK_RECTANGLE and not only_spatial_and_intensity:
+    if not only_spatial_and_intensity:
         blank_rectangle = RandomTransform(
             BlankRectangleTransform(
                 rectangle_size=tuple(
@@ -427,17 +426,17 @@ def create_training_transforms(
             apply_probability=0.2
         ))
 
-        # Local gamma (3D only)
-        transforms.append(RandomTransform(
-            LocalGammaTransform(
-                scale=_local_transform_scale,
-                loc=(-0.5, 1.5),
-                gamma=_local_gamma_gamma,
-                same_for_all_channels=False,
-                p_per_channel=0.5,
-            ),
-            apply_probability=0.2
-        ))
+        # # Local gamma (3D only)
+        # transforms.append(RandomTransform(
+        #     LocalGammaTransform(
+        #         scale=_local_transform_scale,
+        #         loc=(-0.5, 1.5),
+        #         gamma=_local_gamma_gamma,
+        #         same_for_all_channels=False,
+        #         p_per_channel=0.5,
+        #     ),
+        #     apply_probability=0.2
+        # ))
 
         transforms.extend(common_transforms)
 
