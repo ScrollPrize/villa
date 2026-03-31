@@ -13,6 +13,7 @@
 #include <QSettings>
 #include <QDir>
 #include <QFile>
+#include <QtConcurrent/QtConcurrent>
 
 #include <opencv2/imgproc.hpp>
 
@@ -51,6 +52,10 @@ SeedingWidget::SeedingWidget(VCCollection* point_collection, CState* state, QWid
     qRegisterMetaType<PathPrimitive>("PathPrimitive");
     qRegisterMetaType<QList<PathPrimitive>>("QList<PathPrimitive>");
     setupUI();
+
+    _castRaysWatcher = new QFutureWatcher<void>(this);
+    connect(_castRaysWatcher, &QFutureWatcher<void>::finished,
+            this, &SeedingWidget::onCastRaysFinished);
 
     if (_point_collection) {
         connect(_point_collection, &VCCollection::collectionsAdded, this, &SeedingWidget::onCollectionsAdded);
@@ -475,32 +480,258 @@ void SeedingWidget::onPreviewRaysClicked()
 void SeedingWidget::onCastRaysClicked()
 {
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    if (currentMode == Mode::PointMode) {
-        if (!currentVolume) {
+    if (!currentVolume) {
+        return;
+    }
+
+    _castRaysWasPointMode = (currentMode == Mode::PointMode);
+
+    if (_castRaysWasPointMode) {
+        POI* focusPoi = _state ? _state->poi("focus") : nullptr;
+        if (!focusPoi) {
+            QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before casting rays.");
             return;
         }
-        
-        // Reset previous peaks
-        _point_collection->clearCollection(_point_collection->getCollectionId("seeding_peaks"));
-        
-        // Compute distance transform for the current slice
-        computeDistanceTransform();
-        
-        // Cast rays and find peaks
-        castRays();
-        
-        // Enable segmentation button if we found peaks
-        runSegmentationButton->setEnabled(!_point_collection->getAllCollections().at(_point_collection->getCollectionId("seeding_peaks")).points.empty());
-        
-        // Update UI with clearer instructions about the displayed points
-        infoLabel->setText(QString("Found %1 peaks (shown in red). Review points then click 'Run Segmentation'.").arg(_point_collection->getAllCollections().at(_point_collection->getCollectionId("seeding_peaks")).points.size()));
+    } else {
+        if (paths.empty()) {
+            return;
+        }
+    }
+
+    // Reset previous peaks
+    _point_collection->clearCollection(_point_collection->getCollectionId("seeding_peaks"));
+
+    // Capture all UI parameters before going to background
+    const double angleStep = angleStepSpinBox->value();
+    const int maxRadius = maxRadiusSpinBox->value();
+    const int threshold = thresholdSpinBox->value();
+    const int zSlice = currentZSlice;
+    const cv::Vec3f startPoint = _castRaysWasPointMode
+        ? _state->poi("focus")->p : cv::Vec3f(0, 0, 0);
+    const QList<PathPrimitive> pathsCopy = paths;  // snapshot for draw mode
+
+    // Disable button, show status
+    castRaysButton->setEnabled(false);
+    infoLabel->setText("Computing rays...");
+    emit sendStatusMessageAvailable("Computing rays...", 0);
+
+    // Clear previous results
+    _castRaysPeaks.clear();
+
+    // Launch background computation
+    auto future = QtConcurrent::run(
+        [this, currentVolume, angleStep, maxRadius, threshold,
+         zSlice, startPoint, pathsCopy]() {
+
+        // --- Compute distance transform ---
+        const int width = currentVolume->sliceWidth();
+        const int height = currentVolume->sliceHeight();
+
+        cv::Mat_<uint8_t> sliceData(height, width);
+        cv::Mat_<cv::Vec3f> coords(height, width);
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                coords(y, x) = cv::Vec3f(x, y, zSlice);
+            }
+        }
+        currentVolume->sample(sliceData, coords, vc::SampleParams{});
+
+        cv::Mat binaryImage;
+        cv::threshold(sliceData, binaryImage, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+
+        cv::Mat dt;
+        cv::distanceTransform(binaryImage, dt, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+
+        // --- Helper lambdas ---
+        auto sampleDistAt = [&](const cv::Vec3f& p) -> float {
+            if (dt.empty()) return 0.0f;
+            int px = std::max(0, std::min(dt.cols - 1, int(std::round(p[0]))));
+            int py = std::max(0, std::min(dt.rows - 1, int(std::round(p[1]))));
+            return dt.at<float>(py, px);
+        };
+
+        auto collectSegmentPeaks = [&](const std::vector<float>& intensities,
+                                       const std::vector<cv::Vec3f>& positions,
+                                       std::vector<cv::Vec3f>& out) {
+            bool inside = false;
+            size_t seg_start = 0;
+
+            auto addCenterOfSegment = [&](size_t s, size_t e) {
+                if (e < s || s >= positions.size() || e >= positions.size()) return;
+
+                const float distEps = 1e-4f;
+                const float intensityEps = 1e-3f;
+
+                size_t center_idx = s + (e - s) / 2;
+                size_t best_idx = center_idx;
+                float best_dt = sampleDistAt(positions[best_idx]);
+                float best_intensity = intensities[best_idx];
+
+                for (size_t k = s; k <= e; ++k) {
+                    float dtVal = sampleDistAt(positions[k]);
+                    float intensity = intensities[k];
+
+                    bool betterDistance = dtVal > best_dt + distEps;
+                    bool similarDistance = std::fabs(dtVal - best_dt) <= distEps;
+                    bool betterIntensity = intensity > best_intensity + intensityEps;
+                    bool similarIntensity = std::fabs(intensity - best_intensity) <= intensityEps;
+
+                    if (betterDistance || (similarDistance && betterIntensity)) {
+                        best_idx = k;
+                        best_dt = dtVal;
+                        best_intensity = intensity;
+                        continue;
+                    }
+
+                    if (similarDistance && similarIntensity) {
+                        size_t currentOffset = (best_idx > center_idx) ? (best_idx - center_idx) : (center_idx - best_idx);
+                        size_t newOffset = (k > center_idx) ? (k - center_idx) : (center_idx - k);
+                        if (newOffset < currentOffset) {
+                            best_idx = k;
+                            best_dt = dtVal;
+                            best_intensity = intensity;
+                        }
+                    }
+                }
+
+                out.push_back(positions[best_idx]);
+            };
+
+            for (size_t i = 0; i < intensities.size(); ++i) {
+                bool curr_inside = intensities[i] >= threshold;
+                if (curr_inside && !inside) {
+                    inside = true;
+                    seg_start = i;
+                }
+                bool at_end = (i + 1 == intensities.size());
+                bool next_inside = at_end ? false : (intensities[i + 1] >= threshold);
+                if (inside && (!next_inside || at_end)) {
+                    size_t seg_end = i;
+                    addCenterOfSegment(seg_start, seg_end);
+                    inside = false;
+                }
+            }
+        };
+
+        // Get volume bounds
+        auto [vw, vh, vd] = currentVolume->shape();
+        float bx0 = 0, by0 = 0, bz0 = 0;
+        float bx1 = static_cast<float>(vw), by1 = static_cast<float>(vh), bz1 = static_cast<float>(vd);
+        const auto& db = currentVolume->dataBounds();
+        if (db.valid) {
+            bx0 = static_cast<float>(db.minX); bx1 = static_cast<float>(db.maxX);
+            by0 = static_cast<float>(db.minY); by1 = static_cast<float>(db.maxY);
+            bz0 = static_cast<float>(db.minZ); bz1 = static_cast<float>(db.maxZ);
+        }
+
+        if (_castRaysWasPointMode) {
+            // --- Point mode: cast rays ---
+            const int numSteps = static_cast<int>(360.0 / angleStep);
+
+            for (int i = 0; i < numSteps; i++) {
+                const double angle = i * angleStep * M_PI / 180.0;
+                const cv::Vec2f rayDir(cos(angle), sin(angle));
+
+                std::vector<float> intensities;
+                std::vector<cv::Vec3f> positions;
+
+                for (int dist = 1; dist < maxRadius; dist++) {
+                    cv::Vec3f point;
+                    point[0] = startPoint[0] + dist * rayDir[0];
+                    point[1] = startPoint[1] + dist * rayDir[1];
+                    point[2] = startPoint[2];
+
+                    if (point[0] < bx0 || point[0] >= bx1 ||
+                        point[1] < by0 || point[1] >= by1 ||
+                        point[2] < bz0 || point[2] >= bz1) {
+                        break;
+                    }
+
+                    cv::Mat_<cv::Vec3f> coord(1, 1);
+                    coord(0, 0) = point;
+                    cv::Mat_<uint8_t> intensity(1, 1);
+                    currentVolume->sample(intensity, coord, vc::SampleParams{});
+
+                    intensities.push_back(intensity(0, 0));
+                    positions.push_back(point);
+                }
+
+                if (!intensities.empty()) {
+                    collectSegmentPeaks(intensities, positions, _castRaysPeaks);
+                }
+            }
+        } else {
+            // --- Draw mode: analyze paths ---
+            for (const auto& path : pathsCopy) {
+                if (path.points.empty()) continue;
+
+                PathPrimitive densifiedPath = path.densify(0.5f);
+
+                std::vector<float> intensities;
+                std::vector<cv::Vec3f> positions;
+
+                for (const auto& pt : densifiedPath.points) {
+                    if (pt[0] >= bx0 && pt[0] < bx1 &&
+                        pt[1] >= by0 && pt[1] < by1 &&
+                        pt[2] >= bz0 && pt[2] < bz1) {
+
+                        cv::Mat_<cv::Vec3f> coord(1, 1);
+                        coord(0, 0) = pt;
+                        cv::Mat_<uint8_t> intensity(1, 1);
+                        currentVolume->sample(intensity, coord, vc::SampleParams{});
+
+                        intensities.push_back(intensity(0, 0));
+                        positions.push_back(pt);
+                    }
+                }
+
+                if (!intensities.empty()) {
+                    collectSegmentPeaks(intensities, positions, _castRaysPeaks);
+                }
+            }
+        }
+
+        // Also store the distance transform for potential later use
+        distanceTransform = dt;
+    });
+
+    _castRaysWatcher->setFuture(future);
+}
+
+void SeedingWidget::onCastRaysFinished()
+{
+    // Add collected peaks to the point collection (main thread)
+    if (!_castRaysPeaks.empty()) {
+        _point_collection->addPoints("seeding_peaks", _castRaysPeaks);
+    }
+
+    const int numPeaks = static_cast<int>(_castRaysPeaks.size());
+
+    // Enable segmentation button if we found peaks
+    runSegmentationButton->setEnabled(numPeaks > 0);
+
+    // Re-enable the cast rays button
+    if (currentMode == Mode::PointMode) {
+        castRaysButton->setEnabled(_state && _state->currentVolume() != nullptr);
+    } else {
+        castRaysButton->setEnabled(!paths.empty());
+    }
+
+    if (_castRaysWasPointMode) {
+        infoLabel->setText(QString("Found %1 peaks (shown in red). Review points then click 'Run Segmentation'.").arg(numPeaks));
         emit sendStatusMessageAvailable(
-            QString("Cast %1 rays and found %2 intensity peaks. Points are displayed for review.").arg(360.0 / angleStepSpinBox->value()).arg(_point_collection->getAllCollections().at(_point_collection->getCollectionId("seeding_peaks")).points.size()),
+            QString("Cast rays and found %1 intensity peaks. Points are displayed for review.").arg(numPeaks),
             5000);
     } else {
-        // Draw mode - analyze paths
-        analyzePaths();
+        // Draw mode post-processing
+        displayPaths();
+        infoLabel->setText(QString("Found %1 peaks along %2 paths").arg(numPeaks).arg(paths.size()));
+        emit sendStatusMessageAvailable(
+            QString("Analyzed %1 paths and found %2 intensity peaks").arg(paths.size()).arg(numPeaks),
+            5000);
     }
+
+    _castRaysPeaks.clear();
 }
 
 void SeedingWidget::computeDistanceTransform()

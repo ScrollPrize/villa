@@ -510,53 +510,35 @@ void primeRemoteLevel5WithDialog(CWindow* window, const std::shared_ptr<Volume>&
         return;
     }
 
-    QProgressDialog progress(window->tr("Downloading remote level 5 overview..."),
-                             QString(),
-                             0,
-                             0,
-                             window);
-    progress.setWindowTitle(window->tr("Caching Remote Overview"));
-    progress.setWindowModality(Qt::ApplicationModal);
-    progress.setMinimumDuration(0);
-    progress.setAutoClose(false);
-    progress.setAutoReset(false);
-    progress.setCancelButton(nullptr);
-    progress.show();
-
-    try {
-        volume->primeRemoteLevel5Blocking([&](size_t completed, size_t total) {
-            const int safeTotal = total > static_cast<size_t>(std::numeric_limits<int>::max())
-                                      ? std::numeric_limits<int>::max()
-                                      : static_cast<int>(total);
-            const int safeCompleted =
-                completed > static_cast<size_t>(safeTotal)
-                    ? safeTotal
-                    : static_cast<int>(completed);
-
-            progress.setMaximum(std::max(0, safeTotal));
-            progress.setValue(safeCompleted);
-            progress.setLabelText(
-                window->tr("Downloading remote level 5 overview (%1/%2 chunks)...")
-                    .arg(completed)
-                    .arg(total));
-            QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-        });
-
-        progress.setValue(progress.maximum());
-        if (window->statusBar()) {
-            window->statusBar()->showMessage(
-                window->tr("Cached remote level 5 overview for '%1'.")
-                    .arg(QString::fromStdString(volume->id())),
-                5000);
-        }
-    } catch (const std::exception& e) {
-        progress.hide();
-        QMessageBox::warning(
-            window,
-            window->tr("Remote Overview Cache"),
-            window->tr("Attached the remote volume, but failed to cache level 5 locally:\n%1")
-                .arg(QString::fromUtf8(e.what())));
+    if (window->statusBar()) {
+        window->statusBar()->showMessage(
+            window->tr("Downloading remote level 5 overview in background..."), 0);
     }
+
+    auto* watcher = new QFutureWatcher<void>(window);
+    QObject::connect(watcher, &QFutureWatcher<void>::finished, window, [window, volume, watcher]() {
+        watcher->deleteLater();
+        try {
+            watcher->future().waitForFinished();  // rethrows exceptions
+            if (window->statusBar()) {
+                window->statusBar()->showMessage(
+                    window->tr("Cached remote level 5 overview for '%1'.")
+                        .arg(QString::fromStdString(volume->id())),
+                    5000);
+            }
+        } catch (const std::exception& e) {
+            if (window->statusBar()) {
+                window->statusBar()->showMessage(
+                    window->tr("Failed to cache level 5: %1")
+                        .arg(QString::fromUtf8(e.what())),
+                    5000);
+            }
+        }
+    });
+
+    watcher->setFuture(QtConcurrent::run([volume]() {
+        volume->primeRemoteLevel5Blocking(nullptr);
+    }));
 }
 
 } // namespace
@@ -911,15 +893,18 @@ CWindow::CWindow(size_t cacheSizeGB) :
                std::max(height(), minWindowSize.height()));
     }
 
-    // If enabled, auto open the last used volpkg
+    // If enabled, auto open the last used volpkg (deferred so window shows first)
     if (settings.value(vc3d::settings::volpkg::AUTO_OPEN, vc3d::settings::volpkg::AUTO_OPEN_DEFAULT).toInt() != 0) {
 
         QStringList files = settings.value(vc3d::settings::volpkg::RECENT).toStringList();
 
         if (!files.empty() && !files.at(0).isEmpty()) {
-            if (_menuController) {
-                _menuController->openVolpkgAt(files[0]);
-            }
+            QString path = files[0];
+            QTimer::singleShot(0, this, [this, path]() {
+                if (_menuController) {
+                    _menuController->openVolpkgAt(path);
+                }
+            });
         }
     }
 
@@ -2023,6 +2008,100 @@ void CWindow::setRemoteSurfaces(const std::vector<std::pair<std::string, std::sh
     refreshTransformsPanelState();
 }
 
+void CWindow::setRemoteStubs(
+    const std::vector<std::string>& segmentIds,
+    const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& cachedSurfaces)
+{
+    if (_surfacePanel) {
+        _surfacePanel->loadRemoteStubs(segmentIds, cachedSurfaces);
+    }
+
+    // Activate the first cached surface if available
+    if (_state && !cachedSurfaces.empty()) {
+        const auto& [firstId, firstSurf] = cachedSurfaces.front();
+        _state->setSurface("segmentation", firstSurf);
+        _state->setActiveSurface(firstId, std::dynamic_pointer_cast<QuadSurface>(firstSurf));
+        _state->emitSurfacesChanged();
+    }
+
+    emit _state->surfacesLoaded();
+    refreshTransformsPanelState();
+}
+
+void CWindow::downloadRemoteSegmentOnDemand(const QString& segmentId)
+{
+    const std::string segId = segmentId.toStdString();
+    const std::string dlBase = (_remoteScroll.segSource == vc::RemoteSegmentSource::Direct)
+        ? _remoteScroll.segmentsBaseUrl : _remoteScroll.baseUrl;
+    const std::string cachePath = _remoteScroll.cachePath;
+    const auto auth = _remoteScroll.auth;
+    const auto segSource = _remoteScroll.segSource;
+
+    if (statusBar()) {
+        statusBar()->showMessage(
+            tr("Downloading segment %1...").arg(segmentId));
+    }
+
+    auto* watcher = new QFutureWatcher<std::shared_ptr<QuadSurface>>(this);
+    connect(watcher, &QFutureWatcher<std::shared_ptr<QuadSurface>>::finished, this,
+        [this, watcher, segId]() {
+            watcher->deleteLater();
+            std::shared_ptr<QuadSurface> surf;
+            try {
+                surf = watcher->result();
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[RemoteScroll] Download failed for %s: %s\n",
+                    segId.c_str(), e.what());
+            }
+
+            if (surf) {
+                if (statusBar()) {
+                    statusBar()->showMessage(
+                        tr("Downloaded segment %1").arg(QString::fromStdString(segId)), 3000);
+                }
+                if (_surfacePanel) {
+                    _surfacePanel->replaceStubWithSurface(segId, surf);
+                }
+            } else {
+                if (statusBar()) {
+                    statusBar()->showMessage(
+                        tr("Failed to download segment %1").arg(QString::fromStdString(segId)), 5000);
+                }
+                // Reset the stub state so user can retry
+                if (_surfacePanel) {
+                    _surfacePanel->replaceStubWithSurface(segId, nullptr);
+                }
+            }
+        });
+
+    const std::string baseUrl = _remoteScroll.baseUrl;
+
+    auto future = QtConcurrent::run(
+        [dlBase, baseUrl, segId, cachePath, auth, segSource]() -> std::shared_ptr<QuadSurface> {
+            // Derive volpkg name from base URL (same logic as phase 2)
+            std::string volpkgName = baseUrl;
+            while (!volpkgName.empty() && volpkgName.back() == '/') volpkgName.pop_back();
+            auto slash = volpkgName.rfind('/');
+            if (slash != std::string::npos) volpkgName = volpkgName.substr(slash + 1);
+
+            std::filesystem::path volpkgCache = std::filesystem::path(cachePath) / volpkgName;
+
+            auto localDir = vc::downloadRemoteSegment(
+                dlBase, segId, volpkgCache, auth, segSource);
+
+            if (!std::filesystem::exists(localDir / "meta.json")) {
+                return nullptr;
+            }
+
+            auto seg = Segmentation::New(localDir);
+            if (seg && seg->canLoadSurface()) {
+                return seg->loadSurface();
+            }
+            return nullptr;
+        });
+    watcher->setFuture(future);
+}
+
 void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
                                             bool reloadSurfaces)
 {
@@ -2421,6 +2500,8 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onFetchRemoteChunks(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::remoteSegmentDownloadRequested,
+            this, &CWindow::downloadRemoteSegmentOnDemand);
 
     connect(_surfacePanel.get(), &SurfacePanelController::growSeedsRequested,
             this, [this](const QString& segmentId, bool isExpand, bool isRandomSeed) {
@@ -4369,6 +4450,8 @@ void CWindow::CloseVolume(void)
         _surfacePanel->resetTagUi();
     }
 
+    _remoteScroll.active = false;
+
     // Update UI
     UpdateView();
     if (treeWidgetSurfaces) {
@@ -4553,22 +4636,47 @@ void CWindow::onEditMaskPressed(void)
 
     std::filesystem::path path = surf->path/"mask.tif";
 
-    if (!std::filesystem::exists(path)) {
-        cv::Mat_<uint8_t> mask;
-        cv::Mat_<cv::Vec3f> coords; // Not used after generation
-
-        // Generate the binary mask at raw points resolution
-        render_binary_mask(surf.get(), mask, coords, 1.0f);
-
-        // Save just the mask as single layer
-        cv::imwrite(path.string(), mask);
-
-        // Update metadata
-        (*surf->meta)["date_last_modified"] = get_surface_time_str();
-        surf->save_meta();
+    // If mask already exists, just open it
+    if (std::filesystem::exists(path)) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
+        return;
     }
 
-    QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
+    if (_maskRenderInProgress)
+        return;
+    _maskRenderInProgress = true;
+    ui.btnEditMask->setEnabled(false);
+    ui.btnAppendMask->setEnabled(false);
+    statusBar()->showMessage(tr("Rendering mask..."));
+
+    auto* watcher = new QFutureWatcher<void>(this);
+    connect(watcher, &QFutureWatcher<void>::finished, this,
+            [this, watcher, surf, path]() {
+                watcher->deleteLater();
+                _maskRenderInProgress = false;
+                ui.btnEditMask->setEnabled(true);
+                ui.btnAppendMask->setEnabled(true);
+
+                try {
+                    watcher->waitForFinished();
+                    statusBar()->showMessage(tr("Mask saved"), 3000);
+                    QDesktopServices::openUrl(QUrl::fromLocalFile(
+                        QString::fromStdString(path.string())));
+                } catch (const std::exception& e) {
+                    statusBar()->showMessage(
+                        tr("Mask render failed: %1").arg(e.what()), 5000);
+                }
+            });
+
+    watcher->setFuture(QtConcurrent::run([surf, path]() {
+        cv::Mat_<uint8_t> mask;
+        cv::Mat_<cv::Vec3f> coords;
+        render_binary_mask(surf.get(), mask, coords, 1.0f);
+        cv::imwrite(path.string(), mask);
+
+        (*surf->meta)["date_last_modified"] = get_surface_time_str();
+        surf->save_meta();
+    }));
 }
 
 void CWindow::onAppendMaskPressed(void)
@@ -4583,80 +4691,85 @@ void CWindow::onAppendMaskPressed(void)
         return;
     }
 
+    if (_maskRenderInProgress)
+        return;
+    _maskRenderInProgress = true;
+    ui.btnEditMask->setEnabled(false);
+    ui.btnAppendMask->setEnabled(false);
+    statusBar()->showMessage(tr("Rendering mask..."));
+
     std::filesystem::path path = surf->path/"mask.tif";
+    auto volume = _state->currentVolume();
 
-    cv::Mat_<uint8_t> mask;
-    cv::Mat_<uint8_t> img;
-    std::vector<cv::Mat> existing_layers;
+    auto* watcher = new QFutureWatcher<QString>(this);
+    connect(watcher, &QFutureWatcher<QString>::finished, this,
+            [this, watcher, path]() {
+                watcher->deleteLater();
+                _maskRenderInProgress = false;
+                ui.btnEditMask->setEnabled(true);
+                ui.btnAppendMask->setEnabled(true);
 
-    vc::VcDataset* ds = _state->currentVolume()->zarrDataset(0);
+                try {
+                    QString msg = watcher->result();
+                    statusBar()->showMessage(msg, 3000);
+                    QDesktopServices::openUrl(QUrl::fromLocalFile(
+                        QString::fromStdString(path.string())));
+                } catch (const std::exception& e) {
+                    QMessageBox::critical(this, tr("Error"),
+                                         tr("Failed to render surface: %1").arg(e.what()));
+                    statusBar()->clearMessage();
+                }
+            });
 
-    try {
-        // Find the segmentation viewer and check if composite is enabled
-        // Check if mask.tif exists
+    watcher->setFuture(QtConcurrent::run([surf, volume, path]() -> QString {
+        cv::Mat_<uint8_t> mask;
+        cv::Mat_<uint8_t> img;
+        std::vector<cv::Mat> existing_layers;
+
         if (std::filesystem::exists(path)) {
-            // Load existing mask
             cv::imreadmulti(path.string(), existing_layers, cv::IMREAD_UNCHANGED);
 
-            if (existing_layers.empty()) {
-                QMessageBox::warning(this, tr("Error"), tr("Could not read existing mask file."));
-                return;
-            }
+            if (existing_layers.empty())
+                throw std::runtime_error("Could not read existing mask file.");
 
-            // Use the first layer as the mask
             mask = existing_layers[0];
             cv::Size maskSize = mask.size();
 
             {
-                // Single-layer rendering - use same approach as render_binary_mask
                 cv::Size rawSize = surf->rawPointsPtr()->size();
                 cv::Vec3f ptr(0, 0, 0);
                 cv::Vec3f offset(-rawSize.width/2.0f, -rawSize.height/2.0f, 0);
-
-                // Use surface's scale so sx = _scale/_scale = 1.0, sampling 1:1 from raw points
                 float surfScale = surf->scale()[0];
                 cv::Mat_<cv::Vec3f> coords;
                 surf->gen(&coords, nullptr, maskSize, ptr, surfScale, offset);
-
-                render_image_from_coords(coords, img, _state->currentVolume().get());
+                render_image_from_coords(coords, img, volume.get());
             }
             cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
 
-            // Append the new image layer to existing layers
             existing_layers.push_back(img);
-
-            // Save all layers
             imwritemulti(path.string(), existing_layers);
 
-            statusBar()->showMessage(
-                tr("Appended surface image to existing mask (now %1 layers)").arg(existing_layers.size()), 3000);
+            QString msg = QString("Appended surface image to existing mask (now %1 layers)")
+                              .arg(existing_layers.size());
+
+            (*surf->meta)["date_last_modified"] = get_surface_time_str();
+            surf->save_meta();
+            return msg;
 
         } else {
-            // No existing mask, generate both mask and image at raw points resolution
             cv::Mat_<cv::Vec3f> coords;
             render_binary_mask(surf.get(), mask, coords, 1.0f);
-            cv::Size maskSize = mask.size();
-
-            render_surface_image(surf.get(), mask, img, _state->currentVolume().get(), 0, 1.0f);
+            render_surface_image(surf.get(), mask, img, volume.get(), 0, 1.0f);
             cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
 
-            // Save as new multi-layer TIFF
             std::vector<cv::Mat> layers = {mask, img};
             imwritemulti(path.string(), layers);
 
-            statusBar()->showMessage(tr("Created new surface mask with image data"), 3000);
+            (*surf->meta)["date_last_modified"] = get_surface_time_str();
+            surf->save_meta();
+            return QString("Created new surface mask with image data");
         }
-
-        // Update metadata
-        (*surf->meta)["date_last_modified"] = get_surface_time_str();
-        surf->save_meta();
-
-        QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
-
-    } catch (const std::exception& e) {
-        QMessageBox::critical(this, tr("Error"),
-                            tr("Failed to render surface: %1").arg(e.what()));
-    }
+    }));
 }
 
 QString CWindow::getCurrentVolumePath() const

@@ -37,6 +37,8 @@
 #include <array>
 #include <cmath>
 
+#include <QtConcurrent/QtConcurrent>
+
 #include <QDebug>
 #include "vc/core/cache/TieredChunkCache.hpp"
 
@@ -229,6 +231,8 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     _camera.downscaleOverride = settings.value(perf::DOWNSCALE_OVERRIDE, perf::DOWNSCALE_OVERRIDE_DEFAULT).toInt();
     _useFastInterpolation = settings.value(perf::FAST_INTERPOLATION, perf::FAST_INTERPOLATION_DEFAULT).toBool();
+    _navSpeed = settings.value(viewer::NAV_SPEED, viewer::NAV_SPEED_DEFAULT).toFloat();
+    if (_navSpeed <= 0.0f) _navSpeed = 1.0f;
 
     auto* layout = new QVBoxLayout;
     layout->addWidget(fGraphicsView);
@@ -255,7 +259,7 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     // Throttle intersection recomputation to ~5Hz during interaction
     _intersectionThrottleTimer = new QTimer(this);
     _intersectionThrottleTimer->setSingleShot(true);
-    _intersectionThrottleTimer->setInterval(500);
+    _intersectionThrottleTimer->setInterval(150);
     connect(_intersectionThrottleTimer, &QTimer::timeout, this, [this]() {
         if (_intersectionsDirty) {
             _intersectionsDirty = false;
@@ -263,10 +267,19 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
         }
     });
 
+    // Async intersection completion handler
+    connect(&_intersectionFutureWatcher,
+            &QFutureWatcher<std::vector<IntersectionPathEntry>>::finished,
+            this, &CTiledVolumeViewer::onIntersectionComputeFinished);
+
 }
 
 CTiledVolumeViewer::~CTiledVolumeViewer()
 {
+    _intersectionFutureWatcher.disconnect();
+    _intersectionFutureWatcher.waitForFinished();
+    _intersectionThrottleTimer->stop();
+
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
@@ -728,7 +741,7 @@ QRectF CTiledVolumeViewer::viewportSceneRect() const
 
 void CTiledVolumeViewer::panBy(int dx, int dy)
 {
-    const float invScale = 1.0f / _camera.scale;
+    const float invScale = _navSpeed / _camera.scale;
     _camera.surfacePtr[0] -= dx * invScale;
     _camera.surfacePtr[1] -= dy * invScale;
 
@@ -742,6 +755,8 @@ void CTiledVolumeViewer::panBy(int dx, int dy)
         _camera.surfacePtr[1] = std::clamp(_camera.surfacePtr[1], minV, maxV);
     }
 
+    _focusSurfacePos[0] = _camera.surfacePtr[0];
+    _focusSurfacePos[1] = _camera.surfacePtr[1];
 
     centerViewport();
     submitRender();
@@ -757,8 +772,11 @@ void CTiledVolumeViewer::zoomAt(float factor, const QPointF& scenePos)
 
 void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 {
+    int scaledSteps = static_cast<int>(std::round(steps * _navSpeed));
+    if (scaledSteps == 0 && steps != 0) scaledSteps = (steps > 0) ? 1 : -1;
+
     const float newScale = std::max(
-        TiledViewerCamera::stepScale(_camera.scale, steps), _contentMinScale);
+        TiledViewerCamera::stepScale(_camera.scale, scaledSteps), _contentMinScale);
     if (std::abs(newScale - _camera.scale) < 0.001f) {
         return;
     }
@@ -789,6 +807,10 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     fGraphicsView->resetTransform();
     rebuildContentGrid();
     centerViewport();
+
+    _focusSurfacePos[0] = _camera.surfacePtr[0];
+    _focusSurfacePos[1] = _camera.surfacePtr[1];
+
     _camera.invalidate();
 
     auto surf = _surfWeak.lock();
@@ -824,7 +846,7 @@ void CTiledVolumeViewer::onZoom(int steps, QPointF scene_point, Qt::KeyboardModi
 
         PlaneSurface* plane = dynamic_cast<PlaneSurface*>(surf.get());
         int stepSize = _viewerManager ? _viewerManager->sliceStepSize() : 1;
-        int adjustedSteps = steps * stepSize;
+        float adjustedSteps = static_cast<float>(steps * stepSize) * _navSpeed;
 
         if (_surfName != "segmentation" && plane && _state) {
             POI* focus = _state->poi("focus");
@@ -1547,6 +1569,7 @@ void CTiledVolumeViewer::onPOIChanged(std::string name, POI* poi)
 void CTiledVolumeViewer::updateStatusLabel()
 {
     QString status = QString("%1x").arg(_camera.scale, 0, 'f', 2);
+    status += QString(" 1:%1").arg(1 << _camera.dsScaleIdx);
 
     status += QString(" z=%1").arg(_camera.zOff, 0, 'f', 1);
 
@@ -1586,7 +1609,7 @@ void CTiledVolumeViewer::updateStatusLabel()
         // Disk cache
         if (s.diskFiles > 0) {
             double diskGB = s.diskBytes / (1024.0 * 1024.0 * 1024.0);
-            status += QString(" | disk %1 (%2G)").arg(s.diskFiles).arg(diskGB, 0, 'f', 1);
+            status += QString(" | disk %1 (%2G w%3)").arg(s.diskFiles).arg(diskGB, 0, 'f', 1).arg(s.diskWrites);
         }
 
         // Negative cache
@@ -2112,6 +2135,16 @@ void CTiledVolumeViewer::invalidateVis()
     }
     _ov.sliceVisItems.clear();
 }
+void CTiledVolumeViewer::onIntersectionComputeFinished()
+{
+    // Stub — async intersection results handled by renderIntersections() directly
+    _intersectionPending = false;
+    if (_intersectionRerunNeeded) {
+        _intersectionRerunNeeded = false;
+        renderIntersections();
+    }
+}
+
 void CTiledVolumeViewer::invalidateIntersect(const std::string& /*name*/)
 {
     for (auto& [key, items] : _ov.intersectItems) {

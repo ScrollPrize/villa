@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QColor>
+#include <QFuture>
 #include <QObject>
 #include <QElapsedTimer>
 #include <QPointer>
@@ -77,6 +78,7 @@ public:
     void setPushPullRadius(float radiusSteps);
     void setPushPullSigma(float sigmaSteps);
     void setPushPullStepMultiplier(float multiplier);
+    void setEditScale(float scale);
     void setSmoothingStrength(float strength);
     void setSmoothingIterations(int iterations);
     void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
@@ -390,6 +392,11 @@ private:
     QTimer* _autosaveTimer{nullptr};
     bool _pendingAutosave{false};
     bool _autosaveNotifiedFailure{false};
+
+    // Async save state
+    QFuture<void> _saveFuture;
+    bool _saveInProgress{false};
+    bool _dirtyAfterSave{false};
 
     // Correction points auto-save
     static constexpr int kCorrectionsSaveDelayMs = 2000;

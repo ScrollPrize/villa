@@ -16,6 +16,7 @@
 #include <limits>
 #include <cerrno>
 #include <algorithm>
+#include <thread>
 #include <vector>
 #include <fstream>
 #include <iomanip>
@@ -498,12 +499,13 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
         normals_big.setTo(cv::Vec3f(std::numeric_limits<float>::quiet_NaN(),
                                     std::numeric_limits<float>::quiet_NaN(),
                                     std::numeric_limits<float>::quiet_NaN()));
+        #pragma omp parallel for collapse(2) schedule(dynamic, 16)
         for (int j = 0; j < h; ++j) {
-            const double y = oy + (j + 4.0) * sy;
             for (int i = 0; i < w; ++i) {
+                const double y = oy + (j + 4.0) * sy;
                 const double x = ox + (i + 4.0) * sx;
                 const int jj = j + 4, ii = i + 4;
-                if (valid_big.at<uint8_t>(jj, ii)) {
+                if (valid_big.ptr<uint8_t>(jj)[ii]) {
                     normals_big(jj, ii) = grid_normal(*_points,
                         cv::Vec3f(static_cast<float>(x),
                                 static_cast<float>(y),
@@ -525,15 +527,8 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     const cv::Vec3f qnan(std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN());
-    for (int j = 0; j < h; ++j) {
-        const uint8_t* mv = valid.ptr<uint8_t>(j);
-        for (int i = 0; i < w; ++i) {
-            if (!mv[i]) {
-                (*coords)(j, i) = qnan;
-                if (need_normals) (*normals)(j, i) = qnan;
-            }
-        }
-    }
+    coords->setTo(qnan, valid == 0);
+    if (need_normals) normals->setTo(qnan, valid == 0);
 
     // --- apply offset along normals only where normals are valid --------
     if (need_normals && ul[2] != 0.0f) {
@@ -1019,8 +1014,11 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
     if (!force_overwrite && std::filesystem::exists(final_path))
         throw std::runtime_error("path already exists!");
 
-    // Save to temporary location first for atomic operation
-    std::filesystem::path temp_path = target_path.parent_path() / ".tmp" / target_path.filename();
+    // Save to temporary location first for atomic operation.
+    // Use a unique suffix so concurrent saves to the same path don't collide.
+    auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    std::string tmp_dir_name = ".tmp_" + std::to_string(tid);
+    std::filesystem::path temp_path = target_path.parent_path() / tmp_dir_name / target_path.filename();
     std::filesystem::create_directories(temp_path.parent_path());
 
     // Temporarily set path for any operations that might need it
@@ -1110,6 +1108,13 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
 
     if (!replacedExisting) {
         std::filesystem::rename(temp_path, final_path);
+    }
+
+    // Clean up the per-thread temp parent directory if empty
+    {
+        std::error_code ec;
+        std::filesystem::remove(temp_path.parent_path(), ec);
+        // Ignore errors - directory might not be empty or might not exist
     }
 
     // Update the path to the final canonical location

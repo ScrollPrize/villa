@@ -409,9 +409,9 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
     config.warmMaxBytes = cacheBudgetWarm_;
     if (isRemote_ || mountInfo_.type == vc::FilesystemType::NetworkMount) {
         if (ioThreads_ > 0) {
-            config.ioThreads = ioThreads_;
+            config.ioThreads = std::min(ioThreads_, 16);
         } else if (mountInfo_.parallelCount > 0) {
-            config.ioThreads = mountInfo_.parallelCount;
+            config.ioThreads = std::min(mountInfo_.parallelCount, 16);
         } else {
             int cores = static_cast<int>(std::thread::hardware_concurrency());
             config.ioThreads = std::clamp(cores, 2, 8);
@@ -852,14 +852,25 @@ void Volume::primeRemoteLevel5Blocking(
     size_t completed = 0;
 
     try {
-        for (int iz = 0; iz < gridZ; iz++) {
-            for (int iy = 0; iy < gridY; iy++) {
-                for (int ix = 0; ix < gridX; ix++) {
-                    tieredCache_->getBlocking(vc::cache::ChunkKey{5, iz, iy, ix});
-                    completed++;
-                    if (progressCb)
-                        progressCb(completed, total);
-                }
+        // Download chunks with bounded concurrency: prefetch a batch,
+        // then wait for them before submitting the next batch.
+        constexpr size_t kBatchSize = 32;
+        std::vector<vc::cache::ChunkKey> allKeys;
+        allKeys.reserve(total);
+        for (int iz = 0; iz < gridZ; iz++)
+            for (int iy = 0; iy < gridY; iy++)
+                for (int ix = 0; ix < gridX; ix++)
+                    allKeys.push_back(vc::cache::ChunkKey{5, iz, iy, ix});
+
+        for (size_t i = 0; i < allKeys.size(); i += kBatchSize) {
+            size_t end = std::min(i + kBatchSize, allKeys.size());
+            for (size_t j = i; j < end; j++)
+                tieredCache_->prefetch(allKeys[j]);
+            for (size_t j = i; j < end; j++) {
+                tieredCache_->getBlocking(allKeys[j]);
+                completed++;
+                if (progressCb)
+                    progressCb(completed, total);
             }
         }
         tieredCache_->flushPersistentState();

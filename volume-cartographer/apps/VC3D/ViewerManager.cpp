@@ -461,7 +461,6 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         return;
     }
     auto allSurfaces = _state->surfaces();
-    std::cout << "[ViewerManager] primeSurfacePatchIndicesAsync: " << allSurfaces.size() << " surfaces in CState" << std::endl;
     std::vector<SurfacePatchIndex::SurfacePtr> quadSurfaces;
     std::vector<std::string> surfaceIds;
     quadSurfaces.reserve(allSurfaces.size());
@@ -479,14 +478,11 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     }
     // Apply max surfaces limit
     if (_intersectionMaxSurfaces > 0 && quadSurfaces.size() > static_cast<size_t>(_intersectionMaxSurfaces)) {
-        std::cout << "[ViewerManager] Limiting intersection surfaces from " << quadSurfaces.size() << " to " << _intersectionMaxSurfaces << std::endl;
         quadSurfaces.resize(_intersectionMaxSurfaces);
         surfaceIds.resize(_intersectionMaxSurfaces);
     }
     _pendingSurfacePatchIndexSurfaceIds = surfaceIds;
-    std::cout << "[ViewerManager] primeSurfacePatchIndicesAsync: " << quadSurfaces.size() << " QuadSurfaces to index" << std::endl;
     if (quadSurfaces.empty()) {
-        std::cout << "[ViewerManager] primeSurfacePatchIndicesAsync: no QuadSurfaces, aborting" << std::endl;
         _surfacePatchIndex.clear();
         _indexedSurfaceIds.clear();
         _surfacePatchIndexNeedsRebuild = false;
@@ -520,8 +516,6 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
             defaultStride = 2;
             _targetRefinedStride = 1;
         }
-        std::cout << "[ViewerManager] Auto stride: " << defaultStride << "x for " << surfaceCount << " surfaces"
-                  << " (refine to " << _targetRefinedStride << "x)" << std::endl;
         setSurfacePatchSamplingStride(defaultStride, false);
     }
 
@@ -591,11 +585,9 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     }
     auto result = _surfacePatchIndexWatcher->future().result();
     if (!result) {
-        std::cout << "[ViewerManager] handleSurfacePatchIndexPrimeFinished: null result" << std::endl;
         _pendingSurfacePatchIndexSurfaceIds.clear();
         return;
     }
-    std::cout << "[ViewerManager] handleSurfacePatchIndexPrimeFinished: index built, dispatching renderIntersections" << std::endl;
     _surfacePatchIndex = std::move(*result);
     _surfacePatchIndexNeedsRebuild = false;
     _indexedSurfaceIds.clear();

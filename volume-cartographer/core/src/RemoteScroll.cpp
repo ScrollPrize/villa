@@ -177,4 +177,90 @@ std::filesystem::path downloadRemoteSegment(
     return localDir;
 }
 
+std::filesystem::path downloadRemoteSegmentMetadataOnly(
+    const std::string& baseUrl,
+    const std::string& segmentId,
+    const std::filesystem::path& cacheDir,
+    const cache::HttpAuth& auth,
+    RemoteSegmentSource source)
+{
+    namespace fs = std::filesystem;
+
+    const char* subdir = (source == RemoteSegmentSource::Segments) ? "segments" : "paths";
+    auto localDir = cacheDir / subdir / segmentId;
+    fs::create_directories(localDir);
+
+    auto metaPath = localDir / "meta.json";
+    if (fs::exists(metaPath)) {
+        Logger()->debug("[RemoteScroll] meta.json already cached for segment {}", segmentId);
+        return localDir;
+    }
+
+    // Skip if previously failed
+    auto failMarker = localDir / ".download_failed";
+    if (fs::exists(failMarker)) {
+        Logger()->debug("[RemoteScroll] Segment {} previously failed, skipping", segmentId);
+        return localDir;
+    }
+
+    // Build remote URL for meta.json
+    std::string remoteBase;
+    if (source == RemoteSegmentSource::Direct) {
+        remoteBase = baseUrl + "/" + segmentId + "/";
+    } else if (source == RemoteSegmentSource::Paths) {
+        remoteBase = baseUrl + "/paths/" + segmentId + "/";
+    } else {
+        remoteBase = baseUrl + "/segments/" + segmentId + "/mesh/tifxyz/";
+    }
+
+    std::string url = remoteBase + "meta.json";
+    Logger()->info("[RemoteScroll] Downloading metadata {} -> {}", url, metaPath.string());
+
+    if (!cache::httpDownloadFile(url, metaPath, auth)) {
+        Logger()->error("[RemoteScroll] Failed to download meta.json for segment {}", segmentId);
+        return localDir;
+    }
+
+    // Patch meta.json if required fields are missing
+    if (fs::exists(metaPath)) {
+        try {
+            std::ifstream ifs(metaPath);
+            auto meta = nlohmann::json::parse(ifs);
+            ifs.close();
+
+            bool patched = false;
+            if (!meta.contains("type")) { meta["type"] = "seg"; patched = true; }
+            if (!meta.contains("uuid")) { meta["uuid"] = segmentId; patched = true; }
+            if (!meta.contains("format")) { meta["format"] = "tifxyz"; patched = true; }
+
+            if (patched) {
+                Logger()->info("[RemoteScroll] Patched meta.json for segment {}", segmentId);
+                std::ofstream ofs(metaPath);
+                ofs << meta.dump(2);
+            }
+        } catch (const std::exception& e) {
+            Logger()->warn("[RemoteScroll] Failed to patch meta.json: {}", e.what());
+        }
+    }
+
+    return localDir;
+}
+
+bool isRemoteSegmentFullyCached(
+    const std::filesystem::path& cacheDir,
+    const std::string& segmentId,
+    RemoteSegmentSource source)
+{
+    namespace fs = std::filesystem;
+    const char* subdir = (source == RemoteSegmentSource::Segments) ? "segments" : "paths";
+    auto localDir = cacheDir / subdir / segmentId;
+
+    for (const auto& f : {"meta.json", "x.tif", "y.tif", "z.tif"}) {
+        if (!fs::exists(localDir / f)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace vc

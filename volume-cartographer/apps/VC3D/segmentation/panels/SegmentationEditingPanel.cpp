@@ -130,7 +130,7 @@ SegmentationEditingPanel::SegmentationEditingPanel(const QString& settingsGroup,
     auto* pushPullLabel = new QLabel(tr("Step"), pushParent);
     _spinPushPullStep = new QDoubleSpinBox(pushParent);
     _spinPushPullStep->setDecimals(2);
-    _spinPushPullStep->setRange(0.05, 40.0);
+    _spinPushPullStep->setRange(0.05, 100.0);
     _spinPushPullStep->setSingleStep(0.05);
     pushGrid->addWidget(pushPullLabel, 1, 0);
     pushGrid->addWidget(_spinPushPullStep, 1, 1);
@@ -260,6 +260,19 @@ SegmentationEditingPanel::SegmentationEditingPanel(const QString& settingsGroup,
     pushPullRow->addWidget(_groupPushPull, 1);
     falloffLayout->addLayout(pushPullRow);
 
+    auto* scaleRow = new QHBoxLayout();
+    auto* scaleLabel = new QLabel(tr("Scale"), falloffParent);
+    _spinEditScale = new QDoubleSpinBox(falloffParent);
+    _spinEditScale->setDecimals(1);
+    _spinEditScale->setRange(0.1, 10.0);
+    _spinEditScale->setSingleStep(0.1);
+    _spinEditScale->setToolTip(tr("Multiplier for all editing movement (drag, line brush, push/pull). "
+                                  "A value of 2.0 moves everything twice as far per mouse pixel."));
+    scaleRow->addWidget(scaleLabel);
+    scaleRow->addWidget(_spinEditScale);
+    scaleRow->addStretch(1);
+    falloffLayout->addLayout(scaleRow);
+
     auto* smoothingRow = new QHBoxLayout();
     auto* smoothStrengthLabel = new QLabel(tr("Smoothing strength"), falloffParent);
     _spinSmoothStrength = new QDoubleSpinBox(falloffParent);
@@ -333,6 +346,11 @@ SegmentationEditingPanel::SegmentationEditingPanel(const QString& settingsGroup,
     connect(_spinPushPullStep, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setPushPullStep(static_cast<float>(value));
         emit pushPullStepChanged(_pushPullStep);
+    });
+
+    connect(_spinEditScale, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setEditScale(static_cast<float>(value));
+        emit editScaleChanged(_editScale);
     });
 
     auto onAlphaValueChanged = [this](auto updater) {
@@ -542,6 +560,20 @@ void SegmentationEditingPanel::setPushPullStep(float value)
     }
 }
 
+void SegmentationEditingPanel::setEditScale(float value)
+{
+    const float clamped = std::clamp(value, 0.1f, 10.0f);
+    if (std::fabs(clamped - _editScale) < kFloatEpsilon) {
+        return;
+    }
+    _editScale = clamped;
+    writeSetting(QStringLiteral("edit_scale"), _editScale);
+    if (_spinEditScale) {
+        const QSignalBlocker blocker(_spinEditScale);
+        _spinEditScale->setValue(static_cast<double>(_editScale));
+    }
+}
+
 void SegmentationEditingPanel::setAlphaPushPullConfig(const AlphaPushPullConfig& config)
 {
     applyAlphaPushPullConfig(config, false);
@@ -683,6 +715,9 @@ void SegmentationEditingPanel::restoreSettings(QSettings& settings)
     _pushPullStep = settings.value(segmentation::PUSH_PULL_STEP, _pushPullStep).toFloat();
     _pushPullStep = std::clamp(_pushPullStep, 0.05f, 40.0f);
 
+    _editScale = settings.value(segmentation::EDIT_SCALE, _editScale).toFloat();
+    _editScale = std::clamp(_editScale, 0.1f, 10.0f);
+
     AlphaPushPullConfig storedAlpha = _alphaPushPullConfig;
     storedAlpha.start = settings.value(segmentation::PUSH_PULL_ALPHA_START, storedAlpha.start).toFloat();
     storedAlpha.stop = settings.value(segmentation::PUSH_PULL_ALPHA_STOP, storedAlpha.stop).toFloat();
@@ -761,6 +796,12 @@ void SegmentationEditingPanel::syncUiState(bool editingEnabled, bool growthInPro
         const QSignalBlocker blocker(_spinPushPullStep);
         _spinPushPullStep->setValue(static_cast<double>(_pushPullStep));
         _spinPushPullStep->setEnabled(editingActive);
+    }
+
+    if (_spinEditScale) {
+        const QSignalBlocker blocker(_spinEditScale);
+        _spinEditScale->setValue(static_cast<double>(_editScale));
+        _spinEditScale->setEnabled(editingActive);
     }
 
     if (_lblAlphaInfo) {

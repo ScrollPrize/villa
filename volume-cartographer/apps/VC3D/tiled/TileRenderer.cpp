@@ -92,12 +92,18 @@ TileRenderResult TileRenderer::renderTile(
                                     (params.compositeSettings.planeLayersFront > 0 ||
                                      params.compositeSettings.planeLayersBehind > 0));
 
+    // Determine whether we need surface normals.  Normals are required for
+    // composite sampling (layers along normal) and for directional lighting
+    // even when composite mode is off.
+    const bool needNormals = (useComposite && !plane) ||
+                             params.compositeSettings.params.lightingEnabled;
+
     // Generate coordinates for this tile.
-    // For the QuadSurface composite path we also need normals, so request both
-    // in a single gen() call instead of calling gen() twice.
+    // When normals are needed for a QuadSurface, request both coords and
+    // normals in a single gen() call to avoid computing them twice.
     cv::Mat_<cv::Vec3f> coords;
     cv::Mat_<cv::Vec3f> normals;
-    if (useComposite && !plane) {
+    if (needNormals && !plane) {
         surface->gen(&coords, &normals, cv::Size(params.tileW, params.tileH),
                      cv::Vec3f(0, 0, 0), params.scale,
                      {params.surfaceROI.x * params.scale,
@@ -199,6 +205,39 @@ TileRenderResult TileRenderer::renderTile(
                         ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
 
         result.actualLevel = volume->sampleBestEffort(gray, coords, sp);
+
+        // Apply directional lighting when enabled outside composite mode.
+        // The composite path handles this internally; here we do it as a
+        // post-step using the surface normals generated above.
+        if (params.compositeSettings.params.lightingEnabled && !gray.empty()) {
+            const auto& cp = params.compositeSettings.params;
+            if (plane) {
+                // PlaneSurface: constant normal, compute factor once
+                cv::Vec3f planeN = plane->normal(cv::Vec3f(0, 0, 0));
+                float factor = computeLightingFactor(planeN, cp);
+                if (factor < 1.0f) {
+                    for (int y = 0; y < gray.rows; ++y) {
+                        auto* row = gray.ptr<uint8_t>(y);
+                        for (int x = 0; x < gray.cols; ++x) {
+                            row[x] = static_cast<uint8_t>(
+                                std::clamp(row[x] * factor, 0.0f, 255.0f));
+                        }
+                    }
+                }
+            } else if (!normals.empty()) {
+                // QuadSurface: per-pixel normal
+                for (int y = 0; y < gray.rows; ++y) {
+                    auto* row = gray.ptr<uint8_t>(y);
+                    for (int x = 0; x < gray.cols; ++x) {
+                        const cv::Vec3f& n = normals(y, x);
+                        if (!std::isfinite(n[0])) continue;
+                        float factor = computeLightingFactor(n, cp);
+                        row[x] = static_cast<uint8_t>(
+                            std::clamp(row[x] * factor, 0.0f, 255.0f));
+                    }
+                }
+            }
+        }
     }
 
     // Post-process

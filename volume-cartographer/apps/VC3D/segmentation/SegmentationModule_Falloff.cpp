@@ -168,6 +168,17 @@ void SegmentationModule::setPushPullStepMultiplier(float multiplier)
     }
 }
 
+void SegmentationModule::setEditScale(float scale)
+{
+    const float clamped = std::clamp(scale, 0.1f, 10.0f);
+    if (_editManager) {
+        _editManager->setEditScale(clamped);
+    }
+    if (_widget && std::fabs(_widget->editScale() - clamped) >= kFloatEpsilon) {
+        _widget->setEditScale(clamped);
+    }
+}
+
 void SegmentationModule::setSmoothingStrength(float strength)
 {
     const float clamped = std::clamp(strength, 0.0f, 1.0f);

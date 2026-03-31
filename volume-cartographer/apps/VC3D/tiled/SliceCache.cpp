@@ -38,7 +38,7 @@ size_t SliceCacheKeyHash::operator()(const SliceCacheKey& k) const
 SliceCache::SliceCache(size_t maxBytes)
     : cache_({
         .max_bytes = maxBytes,
-        .evict_ratio = 15.0 / 16.0,
+        .evict_ratio = 0.5,
         .promote_on_read = true,
         .size_fn = [](const QPixmap& pm) -> std::size_t {
             // Estimate actual pixmap memory: width * height * bytes-per-pixel.

@@ -215,9 +215,17 @@ std::vector<uint8_t> HttpChunkSource::fetch(const ChunkKey& key)
 #else
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
 #endif
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+
+    // TCP keep-alive to avoid idle connection drops
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+
+    // Extended DNS cache to reduce repeated lookups
+    curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 300L);  // 5 min DNS cache
 
     auto authGuard = applyCurlAuth(curl, auth_);
 

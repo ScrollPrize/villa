@@ -207,6 +207,7 @@ public:
         size_t ioPending = 0;   // pending + in-flight IO tasks
         size_t diskFiles = 0;   // total chunk files on disk (all sessions)
         size_t diskBytes = 0;   // total bytes on disk
+        uint64_t diskWrites = 0; // disk writes this session
         size_t negativeCount = 0; // chunks known to be empty/missing
     };
 
@@ -293,6 +294,7 @@ private:
     mutable std::atomic<uint64_t> statWarmHits_{0};
     std::atomic<uint64_t> statColdHits_{0};
     std::atomic<uint64_t> statIceFetches_{0};
+    std::atomic<uint64_t> statDiskWrites_{0};
     mutable std::atomic<uint64_t> statMisses_{0};
 };
 

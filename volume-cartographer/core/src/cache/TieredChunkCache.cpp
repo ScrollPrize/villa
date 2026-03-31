@@ -158,6 +158,7 @@ TieredChunkCache::TieredChunkCache(
         // Store to cold (disk cache) for persistence
         if (diskStore_) {
             diskStore_->put(config_.volumeId, key, data);
+            statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
         }
         auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
         if (auto* log = cacheDebugLog())
@@ -694,6 +695,7 @@ auto TieredChunkCache::stats() const -> Stats
     if (diskStore_) {
         s.diskFiles = diskStore_->fileCount();
         s.diskBytes = diskStore_->totalBytes();
+        s.diskWrites = statDiskWrites_.load(std::memory_order_relaxed);
     }
     {
         std::shared_lock lock(negativeMutex_);
@@ -789,6 +791,7 @@ ChunkDataPtr TieredChunkCache::promoteFromIce(const ChunkKey& key)
     // Store to cold (disk cache)
     if (diskStore_) {
         diskStore_->put(config_.volumeId, key, compressed);
+        statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Keep a local copy for promotion before putting into warm cache,

@@ -97,6 +97,14 @@ void SegmentationEditManager::setSigma(float sigmaSteps)
     _sigmaSteps = std::clamp(sigmaSteps, 0.05f, 32.0f);
 }
 
+void SegmentationEditManager::setEditScale(float scale)
+{
+    if (!std::isfinite(scale)) {
+        return;
+    }
+    _editScale = std::clamp(scale, 0.1f, 10.0f);
+}
+
 const cv::Mat_<cv::Vec3f>& SegmentationEditManager::previewPoints() const
 {
     static const cv::Mat_<cv::Vec3f> kEmpty;
@@ -541,17 +549,18 @@ bool SegmentationEditManager::updateActiveDragTargets(const std::vector<cv::Vec3
 
     for (std::size_t i = 0; i < sampleCount; ++i) {
         const auto& sample = _activeDrag.samples[i];
-        const cv::Vec3f& newWorld = newWorldPositions[i];
-        if (isInvalidPoint(newWorld)) {
+        const cv::Vec3f& rawTarget = newWorldPositions[i];
+        if (isInvalidPoint(rawTarget)) {
             return false;
         }
 
-        (*_previewPoints)(sample.row, sample.col) = newWorld;
-        recordVertexEdit(sample.row, sample.col, newWorld);
+        const cv::Vec3f scaledWorld = sample.baseWorld + (rawTarget - sample.baseWorld) * _editScale;
+        (*_previewPoints)(sample.row, sample.col) = scaledWorld;
+        recordVertexEdit(sample.row, sample.col, scaledWorld);
         _recentTouched.push_back(GridKey{sample.row, sample.col});
 
         if (!centerUpdated && sample.row == centerKey.row && sample.col == centerKey.col) {
-            _activeDrag.targetWorld = newWorld;
+            _activeDrag.targetWorld = scaledWorld;
             centerUpdated = true;
         }
     }
@@ -1028,6 +1037,8 @@ void SegmentationEditManager::applyGaussianToSamples(const cv::Vec3f& delta)
     const float sigmaWorld = std::max(0.001f, _sigmaSteps * stepNorm);
     const float invTwoSigmaSq = 1.0f / (2.0f * sigmaWorld * sigmaWorld);
 
+    const cv::Vec3f scaledDelta = delta * _editScale;
+
     _recentTouched.clear();
     _recentTouched.reserve(_activeDrag.samples.size());
 
@@ -1037,7 +1048,7 @@ void SegmentationEditManager::applyGaussianToSamples(const cv::Vec3f& delta)
             weight = std::exp(-sample.distanceWorldSq * invTwoSigmaSq);
         }
 
-        cv::Vec3f newWorld = sample.baseWorld + delta * weight;
+        cv::Vec3f newWorld = sample.baseWorld + scaledDelta * weight;
         (*_previewPoints)(sample.row, sample.col) = newWorld;
         recordVertexEdit(sample.row, sample.col, newWorld);
         _recentTouched.push_back(GridKey{sample.row, sample.col});

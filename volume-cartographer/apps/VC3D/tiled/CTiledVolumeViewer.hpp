@@ -16,6 +16,9 @@
 #include <vector>
 #include <optional>
 
+#include <QFutureWatcher>
+#include <QPainterPath>
+
 #include "VolumeViewerBase.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "CVolumeViewerView.hpp"
@@ -243,6 +246,9 @@ signals:
     void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
 
 private:
+    // Async intersection computation completion handler
+    void onIntersectionComputeFinished();
+
     // Camera-based navigation (replaces scrollbar-based)
     void panBy(int dx, int dy);
     void zoomAt(float factor, const QPointF& widgetPos);
@@ -416,8 +422,34 @@ private:
     QTimer* _intersectionThrottleTimer = nullptr;  // coalesces renderIntersections calls
     bool _intersectionsDirty = false;
 
+    // --- Intersection cache (skip recomputation when inputs unchanged) ---
+    struct IntersectionCache {
+        cv::Vec3f planeOrigin{0, 0, 0};
+        cv::Vec3f planeNormal{0, 0, 0};
+        cv::Rect planeRoi;
+        std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
+        float opacity = -1.0f;
+        float thickness = -1.0f;
+        float cameraScale = -1.0f;  // for adaptive sub-pixel culling
+        bool valid = false;
+    };
+    IntersectionCache _intersectionCache;
+
+    // --- Async intersection computation ---
+    struct IntersectionPathEntry {
+        QPainterPath path;
+        QColor color;
+        int zValue;
+    };
+    QFutureWatcher<std::vector<IntersectionPathEntry>> _intersectionFutureWatcher;
+    bool _intersectionPending = false;   // true while background computation is running
+    bool _intersectionRerunNeeded = false; // dirty flag: re-run after current finishes
+    // Snapshot of cache key stored when async work is dispatched, applied on completion.
+    IntersectionCache _pendingCacheKey;
+
     // --- Zoom limits ---
     float _contentMinScale = TiledViewerCamera::MIN_SCALE;  // dynamic minimum so content fills viewport
+    float _navSpeed = 1.0f;  // navigation speed multiplier (zoom, pan, scroll)
 
     // --- Remote volume pin progress ---
     std::atomic<int> _pinTotal{0};   // total chunks to pin at coarsest level
@@ -439,4 +471,35 @@ private:
 
     // Predictive prefetch state
     QPointF _lastPanScenePos;
+
+    // --- Pan inertia (momentum after release) ---
+    QPointF _panVelocity;                                      // pixels per second
+    QTimer* _panInertiaTimer = nullptr;                        // 16ms tick for coasting
+    std::chrono::steady_clock::time_point _lastPanTime;        // timestamp of last drag move
+    bool _panInertiaActive = false;
+
+    void panInertiaTick();
+
+    // --- Smooth zoom animation ---
+    float _targetScale = 0.5f;         // where zoom is heading (accumulates scroll input)
+    float _zoomBaseScale = 0.5f;       // camera.scale at start of current animation
+    QPointF _zoomAnchorScene;          // scene point to zoom toward/away from
+    QPointF _zoomAnchorVpPos;          // viewport position of anchor at animation start
+    QTimer* _zoomAnimTimer = nullptr;  // 16ms tick for smooth interpolation
+    bool _zoomAnimActive = false;      // true while animating
+
+    void zoomAnimTick();               // called each animation frame
+    void zoomSettle();                 // full-quality render at final scale
+
+    // --- Smooth slice scrolling animation ---
+    float _targetSliceOffset = 0.0f;   // accumulated target offset (relative to animation start)
+    float _currentSliceOffset = 0.0f;  // current interpolated offset
+    QTimer* _sliceAnimTimer = nullptr; // 16ms tick for smooth slice interpolation
+    bool _sliceAnimActive = false;     // true while animating
+    // For PlaneSurface focus-POI path: base position at animation start
+    cv::Vec3f _sliceAnimBasePos{0, 0, 0};
+    cv::Vec3f _sliceAnimNormal{0, 0, 0};
+    bool _sliceAnimUsesPOI = false;    // true = POI path, false = zOff path
+
+    void sliceAnimTick();              // called each animation frame
 };

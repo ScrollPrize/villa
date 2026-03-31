@@ -19,6 +19,7 @@
 #include <climits>
 #include <limits>
 #include <unordered_set>
+#include <omp.h>
 
 
 // ============================================================================
@@ -432,116 +433,116 @@ static void readVolumeImpl(
     const bool needsLayerStorage = params && methodRequiresLayerStorage(params->method);
     const float firstLayerOffset = zStart * zStep;
 
-    {
+    // Each thread gets its own ChunkSampler (has mutable slot cache) and LayerStack.
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int y = 0; y < h; y++) {
+        // Per-thread sampler and layer stack (ChunkSampler has mutable cache slots)
         ChunkSampler<T> samplerNoPrefetch(p, cache, level);
         ChunkSampler<T> samplerPrefetch(p, cache, level);
-
         LayerStack stack;
         if (needsLayerStorage) {
             stack.values.resize(numLayers);
         }
 
-        for (int y = 0; y < h; y++) {
-            const auto* coordRow = coords.template ptr<cv::Vec3f>(y);
-            auto* outRow = out.template ptr<T>(y);
-            for (int x = 0; x < w; x++) {
-                float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
+        const auto* coordRow = coords.template ptr<cv::Vec3f>(y);
+        auto* outRow = out.template ptr<T>(y);
+        for (int x = 0; x < w; x++) {
+            float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
 
-                if (numLayers == 1) {
-                    // Single-sample path
-                    if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0)) continue;
+            if (numLayers == 1) {
+                // Single-sample path
+                if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0)) continue;
 
-                    if constexpr (Mode == SampleMode::Trilinear) {
-                        if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
-                        float v = samplerNoPrefetch.sampleTrilinearFast(base_vz, base_vy, base_vx);
-                        if constexpr (std::is_same_v<T, uint16_t>) {
-                            if (v < 0.f) v = 0.f;
-                            if (v > 65535.f) v = 65535.f;
-                            outRow[x] = static_cast<uint16_t>(v + 0.5f);
-                        } else {
-                            outRow[x] = static_cast<T>(v);
-                        }
-                    } else if constexpr (Mode == SampleMode::Tricubic) {
-                        if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
-                        float v = samplerNoPrefetch.sampleTricubic(base_vz, base_vy, base_vx);
-                        if constexpr (std::is_same_v<T, uint16_t>) {
-                            if (v < 0.f) v = 0.f;
-                            if (v > 65535.f) v = 65535.f;
-                            outRow[x] = static_cast<uint16_t>(v + 0.5f);
-                        } else {
-                            outRow[x] = static_cast<T>(v);
-                        }
+                if constexpr (Mode == SampleMode::Trilinear) {
+                    if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                    float v = samplerNoPrefetch.sampleTrilinearFast(base_vz, base_vy, base_vx);
+                    if constexpr (std::is_same_v<T, uint16_t>) {
+                        if (v < 0.f) v = 0.f;
+                        if (v > 65535.f) v = 65535.f;
+                        outRow[x] = static_cast<uint16_t>(v + 0.5f);
                     } else {
-                        if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
-                        if ((static_cast<int>(base_vz + 0.5f) | static_cast<int>(base_vy + 0.5f) | static_cast<int>(base_vx + 0.5f)) < 0) continue;
-                        outRow[x] = samplerNoPrefetch.sampleNearest(base_vz, base_vy, base_vx);
+                        outRow[x] = static_cast<T>(v);
+                    }
+                } else if constexpr (Mode == SampleMode::Tricubic) {
+                    if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                    float v = samplerNoPrefetch.sampleTricubic(base_vz, base_vy, base_vx);
+                    if constexpr (std::is_same_v<T, uint16_t>) {
+                        if (v < 0.f) v = 0.f;
+                        if (v > 65535.f) v = 65535.f;
+                        outRow[x] = static_cast<uint16_t>(v + 0.5f);
+                    } else {
+                        outRow[x] = static_cast<T>(v);
                     }
                 } else {
-                    // Composite path
-                    if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0)) continue;
-
-                    cv::Vec3f n = getNormal(y, x);
-                    float nz = n[2], ny = n[1], nx = n[0];
-
-                    float acc = isMin ? 255.0f : 0.0f;
-                    int validCount = 0;
-
-                    if (needsLayerStorage) {
-                        stack.validCount = 0;
-                    }
-
-                    float dz = nz * zStep;
-                    float dy = ny * zStep;
-                    float dx = nx * zStep;
-
-                    float vz = base_vz + nz * firstLayerOffset;
-                    float vy = base_vy + ny * firstLayerOffset;
-                    float vx = base_vx + nx * firstLayerOffset;
-
-                    for (int layer = 0; layer < numLayers; layer++) {
-                        bool validSample = false;
-                        float value = 0;
-
-                        if (samplerPrefetch.inBounds(vz, vy, vx)) {
-                            uint8_t raw = samplerPrefetch.sampleNearest(vz, vy, vx);
-                            value = static_cast<float>(raw < params->isoCutoff ? 0 : raw);
-                            validSample = true;
-                        }
-
-                        vz += dz; vy += dy; vx += dx;
-
-                        if (validSample) {
-                            if (needsLayerStorage) {
-                                stack.values[stack.validCount++] = value;
-                            } else if (isMax) {
-                                acc = value > acc ? value : acc;
-                                validCount++;
-                            } else if (isMin) {
-                                acc = value < acc ? value : acc;
-                                validCount++;
-                            } else {
-                                acc += value;
-                                validCount++;
-                            }
-                        }
-                    }
-
-                    float result = 0.0f;
-                    if (needsLayerStorage) {
-                        result = compositeLayerStack(stack, *params);
-                    } else if (isMax || isMin) {
-                        result = acc;
-                    } else if (isMean && validCount > 0) {
-                        result = acc / static_cast<float>(validCount);
-                    }
-
-                    if (params->lightingEnabled) {
-                        float lightFactor = computeLightingFactor(n, *params);
-                        result *= lightFactor;
-                    }
-
-                    outRow[x] = static_cast<T>(std::max(0.0f, std::min(255.0f, result)));
+                    if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                    if ((static_cast<int>(base_vz + 0.5f) | static_cast<int>(base_vy + 0.5f) | static_cast<int>(base_vx + 0.5f)) < 0) continue;
+                    outRow[x] = samplerNoPrefetch.sampleNearest(base_vz, base_vy, base_vx);
                 }
+            } else {
+                // Composite path
+                if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0)) continue;
+
+                cv::Vec3f n = getNormal(y, x);
+                float nz = n[2], ny = n[1], nx = n[0];
+
+                float acc = isMin ? 255.0f : 0.0f;
+                int validCount = 0;
+
+                if (needsLayerStorage) {
+                    stack.validCount = 0;
+                }
+
+                float dz = nz * zStep;
+                float dy = ny * zStep;
+                float dx = nx * zStep;
+
+                float vz = base_vz + nz * firstLayerOffset;
+                float vy = base_vy + ny * firstLayerOffset;
+                float vx = base_vx + nx * firstLayerOffset;
+
+                for (int layer = 0; layer < numLayers; layer++) {
+                    bool validSample = false;
+                    float value = 0;
+
+                    if (samplerPrefetch.inBounds(vz, vy, vx)) {
+                        uint8_t raw = samplerPrefetch.sampleNearest(vz, vy, vx);
+                        value = static_cast<float>(raw < params->isoCutoff ? 0 : raw);
+                        validSample = true;
+                    }
+
+                    vz += dz; vy += dy; vx += dx;
+
+                    if (validSample) {
+                        if (needsLayerStorage) {
+                            stack.values[stack.validCount++] = value;
+                        } else if (isMax) {
+                            acc = value > acc ? value : acc;
+                            validCount++;
+                        } else if (isMin) {
+                            acc = value < acc ? value : acc;
+                            validCount++;
+                        } else {
+                            acc += value;
+                            validCount++;
+                        }
+                    }
+                }
+
+                float result = 0.0f;
+                if (needsLayerStorage) {
+                    result = compositeLayerStack(stack, *params);
+                } else if (isMax || isMin) {
+                    result = acc;
+                } else if (isMean && validCount > 0) {
+                    result = acc / static_cast<float>(validCount);
+                }
+
+                if (params->lightingEnabled) {
+                    float lightFactor = computeLightingFactor(n, *params);
+                    result *= lightFactor;
+                }
+
+                outRow[x] = static_cast<T>(std::max(0.0f, std::min(255.0f, result)));
             }
         }
     }

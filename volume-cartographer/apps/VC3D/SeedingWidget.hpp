@@ -12,6 +12,7 @@
 #include <QProcess>
 #include <QPointer>
 #include <QToolButton>
+#include <QFutureWatcher>
 #include <opencv2/core.hpp>
 #include <memory>
 
@@ -54,6 +55,7 @@ private slots:
     void onPreviewRaysClicked();
     void onClearPreviewClicked();
     void onCastRaysClicked();
+    void onCastRaysFinished();
     void onClearPeaksClicked();
     void onRunSegmentationClicked();
     void onExpandSeedsClicked();
@@ -144,6 +146,11 @@ private:
     // Process management
     QList<QPointer<QProcess>> runningProcesses;
     bool jobsRunning;
+
+    // Async cast rays
+    QFutureWatcher<void>* _castRaysWatcher{nullptr};
+    std::vector<cv::Vec3f> _castRaysPeaks;  // Collected by background thread
+    bool _castRaysWasPointMode{true};  // Track which mode triggered the cast
 
     // Neural trace UI and state
     QLineEdit* _neuralCheckpointEdit{nullptr};

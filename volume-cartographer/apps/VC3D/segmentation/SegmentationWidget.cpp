@@ -88,6 +88,8 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::pushPullStepChanged);
     connect(_editingPanel, &SegmentationEditingPanel::alphaPushPullConfigChanged,
             this, &SegmentationWidget::alphaPushPullConfigChanged);
+    connect(_editingPanel, &SegmentationEditingPanel::editScaleChanged,
+            this, &SegmentationWidget::editScaleChanged);
     connect(_editingPanel, &SegmentationEditingPanel::smoothingStrengthChanged,
             this, &SegmentationWidget::smoothingStrengthChanged);
     connect(_editingPanel, &SegmentationEditingPanel::smoothingIterationsChanged,
@@ -260,6 +262,7 @@ float SegmentationWidget::pushPullRadius() const { return _editingPanel->pushPul
 float SegmentationWidget::pushPullSigma() const { return _editingPanel->pushPullSigma(); }
 float SegmentationWidget::pushPullStep() const { return _editingPanel->pushPullStep(); }
 AlphaPushPullConfig SegmentationWidget::alphaPushPullConfig() const { return _editingPanel->alphaPushPullConfig(); }
+float SegmentationWidget::editScale() const { return _editingPanel->editScale(); }
 float SegmentationWidget::smoothingStrength() const { return _editingPanel->smoothingStrength(); }
 int SegmentationWidget::smoothingIterations() const { return _editingPanel->smoothingIterations(); }
 bool SegmentationWidget::showHoverMarker() const { return _editingPanel->showHoverMarker(); }
@@ -272,6 +275,7 @@ void SegmentationWidget::setPushPullRadius(float value) { _editingPanel->setPush
 void SegmentationWidget::setPushPullSigma(float value) { _editingPanel->setPushPullSigma(value); }
 void SegmentationWidget::setPushPullStep(float value) { _editingPanel->setPushPullStep(value); }
 void SegmentationWidget::setAlphaPushPullConfig(const AlphaPushPullConfig& config) { _editingPanel->setAlphaPushPullConfig(config); }
+void SegmentationWidget::setEditScale(float value) { _editingPanel->setEditScale(value); }
 void SegmentationWidget::setSmoothingStrength(float value) { _editingPanel->setSmoothingStrength(value); }
 void SegmentationWidget::setSmoothingIterations(int value) { _editingPanel->setSmoothingIterations(value); }
 void SegmentationWidget::setShowHoverMarker(bool enabled) { _editingPanel->setShowHoverMarker(enabled); }

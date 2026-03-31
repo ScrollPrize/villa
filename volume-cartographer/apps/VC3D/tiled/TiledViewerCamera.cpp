@@ -37,29 +37,35 @@ void TiledViewerCamera::recalcPyramidLevel(int numScales)
 // sub-pixel tile-boundary seams.  Covers MIN_SCALE..MAX_SCALE roughly
 // 12 steps per octave (≈6% apart).
 static constexpr float kZoomStops[] = {
-    // 256 / scale → integer or near-integer tile world size
-    0.03125f, // 8192
-    0.0625f,  // 4096
-    0.125f,   // 2048
-    0.1875f,  // 1365.3  (close to 3/16)
-    0.25f,    // 1024
-    0.3125f,  // 819.2   (5/16)
-    0.375f,   // 682.7   (3/8)
-    0.4375f,  // 585.1   (7/16)
-    0.5f,     // 512
-    0.5625f,  // 455.1   (9/16)
-    0.625f,   // 409.6   (5/8)
-    0.75f,    // 341.3   (3/4)
-    0.875f,   // 292.6   (7/8)
-    1.0f,     // 256
-    1.25f,    // 204.8   (5/4)
-    1.5f,     // 170.7   (3/2)
-    1.75f,    // 146.3   (7/4)
-    2.0f,     // 128
-    2.5f,     // 102.4   (5/2)
-    3.0f,     // 85.3
-    3.5f,     // 73.1
-    4.0f,     // 64
+    // Extended range: 0.01 .. 10.0
+    0.01f,
+    0.015625f, // 16384
+    0.03125f,  // 8192
+    0.0625f,   // 4096
+    0.125f,    // 2048
+    0.1875f,   // 1365.3  (close to 3/16)
+    0.25f,     // 1024
+    0.3125f,   // 819.2   (5/16)
+    0.375f,    // 682.7   (3/8)
+    0.4375f,   // 585.1   (7/16)
+    0.5f,      // 512
+    0.5625f,   // 455.1   (9/16)
+    0.625f,    // 409.6   (5/8)
+    0.75f,     // 341.3   (3/4)
+    0.875f,    // 292.6   (7/8)
+    1.0f,      // 256
+    1.25f,     // 204.8   (5/4)
+    1.5f,      // 170.7   (3/2)
+    1.75f,     // 146.3   (7/4)
+    2.0f,      // 128
+    2.5f,      // 102.4   (5/2)
+    3.0f,      // 85.3
+    3.5f,      // 73.1
+    4.0f,      // 64
+    5.0f,
+    6.0f,
+    8.0f,
+    10.0f,
 };
 static constexpr int kNumStops = sizeof(kZoomStops) / sizeof(kZoomStops[0]);
 
@@ -90,9 +96,9 @@ float TiledViewerCamera::roundScale(float s)
 
 float TiledViewerCamera::stepScale(float current, int steps)
 {
-    int idx = closestStopIndex(std::clamp(current, MIN_SCALE, MAX_SCALE));
-    idx = std::clamp(idx + steps, 0, kNumStops - 1);
-    return kZoomStops[idx];
+    // Continuous zoom: 1% per step at all zoom levels.
+    float result = current * std::pow(1.01f, static_cast<float>(steps));
+    return std::clamp(result, MIN_SCALE, MAX_SCALE);
 }
 
 // ---------------------------------------------------------------------------

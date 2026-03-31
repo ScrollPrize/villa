@@ -9,6 +9,7 @@
 #include "CVolumeViewerView.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "SettingsDialog.hpp"
+#include "S3BrowserDialog.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
@@ -143,6 +144,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _attachRemoteZarrAct = new QAction(QObject::tr("Attach Remote &Zarr..."), this);
     connect(_attachRemoteZarrAct, &QAction::triggered, this, &MenuActionController::attachRemoteZarr);
 
+    _browseS3Act = new QAction(QObject::tr("&Browse S3..."), this);
+    connect(_browseS3Act, &QAction::triggered, this, &MenuActionController::browseS3);
+
     _settingsAct = new QAction(QObject::tr("Settings"), this);
     connect(_settingsAct, &QAction::triggered, this, &MenuActionController::showSettingsDialog);
 
@@ -197,6 +201,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_openLocalZarrAct);
     _fileMenu->addAction(_openRemoteAct);
     _fileMenu->addAction(_attachRemoteZarrAct);
+    _fileMenu->addAction(_browseS3Act);
 
     _recentMenu = new QMenu(QObject::tr("Open &recent volpkg"), _fileMenu);
     _recentMenu->setEnabled(false);
@@ -540,6 +545,38 @@ void MenuActionController::openRemoteVolume()
     if (!ok || url.trimmed().isEmpty()) return;
 
     openRemoteUrl(url.trimmed(), false);
+}
+
+void MenuActionController::browseS3()
+{
+    if (!_window) return;
+
+    // Get the most recent S3 URL as starting point
+    QStringList recentUrls = loadRecentRemoteUrls();
+    QString startUrl;
+    for (const auto& u : recentUrls) {
+        if (u.startsWith("s3://")) {
+            startUrl = u;
+            break;
+        }
+    }
+
+    // Resolve auth before opening the dialog
+    // Use a dummy s3:// URL to trigger AWS credential resolution
+    QString probeUrl = startUrl.isEmpty() ? QStringLiteral("s3://probe") : startUrl;
+    vc::cache::HttpAuth auth;
+    QString authError;
+    if (!tryResolveRemoteAuth(probeUrl, &auth, true, &authError)) {
+        return;
+    }
+
+    S3BrowserDialog dialog(auth, startUrl, _window);
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    QString selected = dialog.selectedUrl();
+    if (selected.isEmpty()) return;
+
+    openRemoteUrl(selected, false);
 }
 
 void MenuActionController::attachRemoteZarr()
@@ -1316,10 +1353,14 @@ void MenuActionController::openRemoteScroll(
             auto continueWithPhase2 = [this, auth, cachePath](
                 vc::RemoteScrollInfo scrollInfo, const std::string& volumeName) {
 
-            // Phase 2: Open volume + download segments on background thread
+            // Phase 2: Open volume + fetch segment metadata on background
+            // thread.  Only downloads meta.json for each segment (fast, tiny
+            // files).  Segments whose TIFFs are already cached get loaded
+            // immediately; the rest appear as stubs that download on demand
+            // when the user selects them.
             if (_window->statusBar()) {
                 _window->statusBar()->showMessage(
-                    QObject::tr("Opening remote scroll (volume: %1, %2 segments)...")
+                    QObject::tr("Opening remote scroll (volume: %1, discovering %2 segments)...")
                         .arg(QString::fromStdString(volumeName))
                         .arg(scrollInfo.segmentIds.size()));
             }
@@ -1355,9 +1396,16 @@ void MenuActionController::openRemoteScroll(
 
                     _window->setVolume(result.volume);
 
-                    if (!result.surfaces.empty()) {
-                        _window->setRemoteSurfaces(result.surfaces);
-                    }
+                    // Store remote scroll state for on-demand downloads
+                    _window->_remoteScroll.baseUrl = scrollInfo.baseUrl;
+                    _window->_remoteScroll.segmentsBaseUrl = scrollInfo.segmentsBaseUrl;
+                    _window->_remoteScroll.cachePath = cachePath;
+                    _window->_remoteScroll.auth = scrollInfo.auth;
+                    _window->_remoteScroll.segSource = scrollInfo.segmentSource;
+                    _window->_remoteScroll.active = true;
+
+                    // Use lazy loading: show all segments, load only cached ones
+                    _window->setRemoteStubs(scrollInfo.segmentIds, result.surfaces);
 
                     // Populate volume combo with all discovered volumes
                     if (_window->volSelect && scrollInfo.volumeNames.size() > 1) {
@@ -1383,11 +1431,14 @@ void MenuActionController::openRemoteScroll(
 
                     _window->UpdateView();
 
+                    int cachedCount = static_cast<int>(result.surfaces.size());
+                    int totalCount = static_cast<int>(scrollInfo.segmentIds.size());
                     if (_window->statusBar()) {
                         _window->statusBar()->showMessage(
-                            QObject::tr("Opened remote scroll: %1 (%2 segments)")
+                            QObject::tr("Opened remote scroll: %1 (%2/%3 segments cached, rest on-demand)")
                                 .arg(QString::fromStdString(result.volume->id()))
-                                .arg(result.surfaces.size()),
+                                .arg(cachedCount)
+                                .arg(totalCount),
                             5000);
                     }
                 });
@@ -1418,28 +1469,29 @@ void MenuActionController::openRemoteScroll(
                         const std::string& dlBase = (segSource == vc::RemoteSegmentSource::Direct)
                             ? segBaseUrl : baseUrl;
 
-                        // Download and load segments
+                        // Lazy loading: only download meta.json for each segment,
+                        // and fully load only those whose TIFFs are already cached.
                         for (const auto& segId : segIds) {
                             try {
-                                auto localDir = vc::downloadRemoteSegment(
+                                // Download metadata only (fast)
+                                vc::downloadRemoteSegmentMetadataOnly(
                                     dlBase, segId, volpkgCache, scrollAuth, segSource);
 
-                                // Check that meta.json exists (download succeeded)
-                                if (!std::filesystem::exists(localDir / "meta.json")) {
-                                    std::fprintf(stderr, "[RemoteScroll] Skipping segment %s: no meta.json\n",
-                                                 segId.c_str());
-                                    continue;
-                                }
-
-                                auto seg = Segmentation::New(localDir);
-                                if (seg && seg->canLoadSurface()) {
-                                    auto surf = seg->loadSurface();
-                                    if (surf) {
-                                        result.surfaces.emplace_back(segId, surf);
+                                // If TIFFs are already cached, load the surface
+                                if (vc::isRemoteSegmentFullyCached(volpkgCache, segId, segSource)) {
+                                    const char* subdir = (segSource == vc::RemoteSegmentSource::Segments)
+                                        ? "segments" : "paths";
+                                    auto localDir = volpkgCache / subdir / segId;
+                                    auto seg = Segmentation::New(localDir);
+                                    if (seg && seg->canLoadSurface()) {
+                                        auto surf = seg->loadSurface();
+                                        if (surf) {
+                                            result.surfaces.emplace_back(segId, surf);
+                                        }
                                     }
                                 }
                             } catch (const std::exception& e) {
-                                std::fprintf(stderr, "[RemoteScroll] Failed to load segment %s: %s\n",
+                                std::fprintf(stderr, "[RemoteScroll] Failed to process segment %s: %s\n",
                                              segId.c_str(), e.what());
                             }
                         }

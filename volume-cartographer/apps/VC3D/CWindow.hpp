@@ -131,6 +131,12 @@ private:
     bool attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
                                       const QString& preferredVolumeId = QString());
     void setRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces);
+    // Lazy loading: set remote stubs (segments listed but not yet downloaded)
+    void setRemoteStubs(
+        const std::vector<std::string>& segmentIds,
+        const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& cachedSurfaces);
+    // Download a single remote segment on demand (called when user selects a stub)
+    void downloadRemoteSegmentOnDemand(const QString& segmentId);
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
     void updateNormalGridAvailability();
@@ -244,8 +250,20 @@ private:
     bool _normalGridAvailable{false};
     QString _normalGridPath;
 
+    // Remote scroll state for on-demand segment downloading
+    struct RemoteScrollState {
+        std::string baseUrl;
+        std::string segmentsBaseUrl;
+        std::string cachePath;
+        vc::cache::HttpAuth auth;
+        vc::RemoteSegmentSource segSource = vc::RemoteSegmentSource::Segments;
+        bool active = false;
+    };
+    RemoteScrollState _remoteScroll;
+
     std::unique_ptr<FileWatcherService> _fileWatcher;
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
+    bool _maskRenderInProgress{false};
     FocusHistoryManager _focusHistory;
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
     std::shared_ptr<QuadSurface> _transformPreviewSourceSurface;

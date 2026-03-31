@@ -42,6 +42,7 @@ public:
     [[nodiscard]] float pushPullSigma() const;
     [[nodiscard]] float pushPullStep() const;
     [[nodiscard]] AlphaPushPullConfig alphaPushPullConfig() const;
+    [[nodiscard]] float editScale() const;
     [[nodiscard]] float smoothingStrength() const;
     [[nodiscard]] int smoothingIterations() const;
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const;
@@ -89,6 +90,7 @@ public:
     void setPushPullSigma(float value);
     void setPushPullStep(float value);
     void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
+    void setEditScale(float value);
     void setSmoothingStrength(float value);
     void setSmoothingIterations(int value);
     void setGrowthMethod(SegmentationGrowthMethod method);
@@ -206,6 +208,7 @@ signals:
     void growthMethodChanged(SegmentationGrowthMethod method);
     void pushPullStepChanged(float value);
     void alphaPushPullConfigChanged();
+    void editScaleChanged(float value);
     void smoothingStrengthChanged(float value);
     void smoothingIterationsChanged(int value);
     void growSurfaceRequested(SegmentationGrowthMethod method,

@@ -37,6 +37,7 @@ private slots:
     void openRecentVolpkg();
     void openLocalZarr();
     void openRemoteVolume();
+    void browseS3();
     void attachRemoteZarr();
     void openRecentRemoteVolume();
     void showSettingsDialog();
@@ -91,6 +92,7 @@ private:
     QAction* _openLocalZarrAct{nullptr};
     QAction* _openRemoteAct{nullptr};
     QAction* _attachRemoteZarrAct{nullptr};
+    QAction* _browseS3Act{nullptr};
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     std::array<QAction*, kMaxRecentRemote> _recentRemoteActs{};
     QAction* _settingsAct{nullptr};

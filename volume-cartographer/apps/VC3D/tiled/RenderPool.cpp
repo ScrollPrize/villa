@@ -17,9 +17,7 @@ RenderPool::RenderPool(int numThreads, QObject* parent)
 
 RenderPool::~RenderPool()
 {
-    // Do NOT call cancelAll() here — that calls pool_->cancel_pending()
-    // which would kill other controllers' tasks if this pool is shared.
-    // The unique_ptr<PriorityThreadPool> destructor handles shutdown.
+    cancelAll();
 }
 
 void RenderPool::submit(const TileRenderParams& params,

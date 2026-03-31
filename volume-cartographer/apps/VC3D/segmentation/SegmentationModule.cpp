@@ -20,6 +20,7 @@
 #include <QPointer>
 #include <QString>
 #include <QTimer>
+#include <QtConcurrent/QtConcurrent>
 
 #include <algorithm>
 #include <cmath>
@@ -84,7 +85,13 @@ void SegmentationModule::HoverState::clear()
     viewer = nullptr;
 }
 
-SegmentationModule::~SegmentationModule() = default;
+SegmentationModule::~SegmentationModule()
+{
+    // Wait for any in-progress background save to finish before destroying
+    if (_saveInProgress && _saveFuture.isRunning()) {
+        _saveFuture.waitForFinished();
+    }
+}
 
 SegmentationModule::SegmentationModule(SegmentationWidget* widget,
                                        SegmentationEditManager* editManager,
@@ -115,7 +122,10 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _lineSigmaSteps = _widget->lineSigma();
         _pushPullRadiusSteps = _widget->pushPullRadius();
         _pushPullSigmaSteps = _widget->pushPullSigma();
-        initialPushPullStep = std::clamp(_widget->pushPullStep(), 0.05f, 40.0f);
+        initialPushPullStep = std::clamp(_widget->pushPullStep(), 0.05f, 100.0f);
+        if (_editManager) {
+            _editManager->setEditScale(std::clamp(_widget->editScale(), 0.1f, 10.0f));
+        }
         _smoothStrength = std::clamp(_widget->smoothingStrength(), 0.0f, 1.0f);
         _smoothIterations = std::clamp(_widget->smoothingIterations(), 1, 25);
         initialAlphaConfig = SegmentationPushPullTool::sanitizeConfig(_widget->alphaPushPullConfig());
@@ -324,6 +334,8 @@ void SegmentationModule::bindWidgetSignals()
             });
     connect(_widget, &SegmentationWidget::pushPullStepChanged,
             this, &SegmentationModule::setPushPullStepMultiplier);
+    connect(_widget, &SegmentationWidget::editScaleChanged,
+            this, &SegmentationModule::setEditScale);
     connect(_widget, &SegmentationWidget::smoothingStrengthChanged,
             this, &SegmentationModule::setSmoothingStrength);
     connect(_widget, &SegmentationWidget::smoothingIterationsChanged,
@@ -1755,11 +1767,18 @@ void SegmentationModule::performAutosave()
     if (!_editManager) {
         return;
     }
-    QuadSurface* surface = _editManager->baseSurface().get();
-    if (!surface) {
+
+    // If a save is already running, mark dirty so we re-save when it finishes
+    if (_saveInProgress) {
+        _dirtyAfterSave = true;
         return;
     }
-    if (surface->path.empty() || surface->id.empty()) {
+
+    auto surfacePtr = _editManager->baseSurface();
+    if (!surfacePtr) {
+        return;
+    }
+    if (surfacePtr->path.empty() || surfacePtr->id.empty()) {
         if (!_autosaveNotifiedFailure) {
             qCWarning(lcSegModule) << "Skipping autosave: segmentation surface lacks path or id.";
             emit statusMessageRequested(tr("Cannot autosave segmentation: surface is missing file metadata."),
@@ -1769,21 +1788,72 @@ void SegmentationModule::performAutosave()
         return;
     }
 
-    ensureSurfaceMetaObject(surface);
+    ensureSurfaceMetaObject(surfacePtr.get());
 
-    try {
-        surface->saveOverwrite();
-        _pendingAutosave = false;
-        _autosaveNotifiedFailure = false;
-    } catch (const std::exception& ex) {
-        qCWarning(lcSegModule) << "Autosave failed:" << ex.what();
-        if (!_autosaveNotifiedFailure) {
-            emit statusMessageRequested(tr("Failed to autosave segmentation: %1")
-                                            .arg(QString::fromUtf8(ex.what())),
-                                        kStatusLong);
-            _autosaveNotifiedFailure = true;
+    // Snapshot the surface data on the main thread so the background write
+    // does not race with ongoing edits.
+    auto snapshot = std::make_shared<QuadSurface>(surfacePtr->rawPoints(), surfacePtr->scale());
+    for (const auto& name : surfacePtr->channelNames()) {
+        cv::Mat ch = surfacePtr->channel(name, SURF_CHANNEL_NORESIZE);
+        if (!ch.empty()) {
+            snapshot->setChannel(name, ch.clone());
         }
     }
+    // Copy metadata needed by save()
+    snapshot->path = surfacePtr->path;
+    snapshot->id = surfacePtr->id;
+    if (surfacePtr->meta) {
+        snapshot->meta = std::make_unique<nlohmann::json>(*surfacePtr->meta);
+    }
+
+    _pendingAutosave = false;
+    _saveInProgress = true;
+    _dirtyAfterSave = false;
+
+    emit statusMessageRequested(tr("Saving..."), kStatusShort);
+
+    _saveFuture = QtConcurrent::run([snapshot]() {
+        snapshot->saveOverwrite();
+    });
+
+    // Poll for completion via a single-shot timer to avoid blocking
+    auto* pollTimer = new QTimer(this);
+    pollTimer->setInterval(50);
+    pollTimer->setSingleShot(false);
+    connect(pollTimer, &QTimer::timeout, this, [this, pollTimer]() {
+        if (!_saveFuture.isFinished()) {
+            return;
+        }
+        pollTimer->stop();
+        pollTimer->deleteLater();
+
+        _saveInProgress = false;
+
+        // Check for exceptions from the future
+        try {
+            _saveFuture.waitForFinished();
+            _autosaveNotifiedFailure = false;
+            emit statusMessageRequested(tr("Saved"), kStatusShort);
+        } catch (const std::exception& ex) {
+            qCWarning(lcSegModule) << "Autosave failed:" << ex.what();
+            if (!_autosaveNotifiedFailure) {
+                emit statusMessageRequested(tr("Failed to autosave segmentation: %1")
+                                                .arg(QString::fromUtf8(ex.what())),
+                                            kStatusLong);
+                _autosaveNotifiedFailure = true;
+            }
+            // Re-mark pending so the next timer tick retries
+            _pendingAutosave = true;
+        }
+
+        // If another save was requested while we were saving, start it now
+        if (_dirtyAfterSave) {
+            _dirtyAfterSave = false;
+            _pendingAutosave = true;
+            performAutosave();
+        }
+    });
+    pollTimer->start();
 }
 
 void SegmentationModule::ensureAutosaveTimer()

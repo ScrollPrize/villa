@@ -44,12 +44,14 @@ namespace viewer {
     constexpr auto FWD_BACK_STEP_MS = "viewer/fwd_back_step_ms";
     constexpr auto CENTER_ON_ZOOM = "viewer/center_on_zoom";
     constexpr auto SCROLL_SPEED = "viewer/scroll_speed";
+    constexpr auto NAV_SPEED = "viewer/nav_speed";
     constexpr auto IMPACT_RANGE_STEPS = "viewer/impact_range_steps";
     constexpr auto SCAN_RANGE_STEPS = "viewer/scan_range_steps";
 
     constexpr int FWD_BACK_STEP_MS_DEFAULT = 25;
     constexpr bool CENTER_ON_ZOOM_DEFAULT = false;
     constexpr int SCROLL_SPEED_DEFAULT = -1;
+    constexpr float NAV_SPEED_DEFAULT = 1.0f;
     constexpr auto IMPACT_RANGE_STEPS_DEFAULT = "1-3, 5, 8, 11, 15, 20, 28, 40, 60, 100, 200";
     constexpr auto SCAN_RANGE_STEPS_DEFAULT = "1, 2, 5, 10, 20, 50, 100, 200, 500, 1000";
 
@@ -301,6 +303,9 @@ namespace segmentation {
     constexpr auto PUSH_PULL_ALPHA_RADIUS = "push_pull_alpha_radius";
     constexpr auto PUSH_PULL_ALPHA_LIMIT = "push_pull_alpha_limit";
     constexpr auto PUSH_PULL_ALPHA_PER_VERTEX = "push_pull_alpha_per_vertex";
+
+    // Edit scale
+    constexpr auto EDIT_SCALE = "edit_scale";
 
     // Smoothing
     constexpr auto SMOOTH_STRENGTH = "smooth_strength";

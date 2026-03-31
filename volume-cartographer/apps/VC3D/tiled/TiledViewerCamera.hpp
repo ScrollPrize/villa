@@ -36,8 +36,8 @@ struct TiledViewerCamera {
     int downscaleOverride = 0;
 
     // Zoom limits
-    static constexpr float MIN_SCALE = 0.03125f;
-    static constexpr float MAX_SCALE = 4.0f;
+    static constexpr float MIN_SCALE = 0.01f;
+    static constexpr float MAX_SCALE = 10.0f;
 
     // Bump epoch to invalidate all in-flight renders
     void invalidate() { ++epoch; }

@@ -5,8 +5,10 @@
 
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include <opencv2/core.hpp>
+#include <QFutureWatcher>
 
 class SegmentationEditManager;
 class SegmentationWidget;
@@ -15,6 +17,7 @@ class CState;
 class SegmentationModule;
 class CTiledVolumeViewer;
 class QuadSurface;
+class Volume;
 class QTimer;
 
 class SegmentationPushPullTool : public SegmentationTool
@@ -48,15 +51,30 @@ public:
     void cancel() override { stopAll(); }
     [[nodiscard]] bool isActive() const override { return _ppState.active; }
 
+    // Result of async alpha computation, produced on background thread
+    struct AlphaResult
+    {
+        bool success{false};
+        bool perVertex{false};
+        std::optional<cv::Vec3f> singleTarget;
+        std::vector<cv::Vec3f> perVertexTargets;
+    };
+
 private:
     bool applyStepInternal();
     void ensureTimer();
-    std::optional<cv::Vec3f> computeAlphaTarget(const cv::Vec3f& centerWorld,
-                                                const cv::Vec3f& normal,
-                                                int direction,
-                                                QuadSurface* surface,
-                                                CTiledVolumeViewer* viewer,
-                                                bool* outUnavailable) const;
+    void launchAlphaCompute();
+    void applyAlphaResult();
+
+    static std::optional<cv::Vec3f> computeAlphaTargetStatic(
+        const cv::Vec3f& centerWorld,
+        const cv::Vec3f& normal,
+        int direction,
+        const AlphaPushPullConfig& config,
+        const std::shared_ptr<Volume>& volume,
+        int datasetIndex,
+        float scale,
+        bool* outUnavailable);
 
     SegmentationModule& _module;
     SegmentationEditManager* _editManager{nullptr};
@@ -82,4 +100,9 @@ private:
     int _cachedRow{-1};
     int _cachedCol{-1};
     bool _samplesValid{false};
+
+    // Async alpha computation state
+    QFutureWatcher<AlphaResult> _alphaWatcher;
+    bool _alphaComputeRunning{false};
+    bool _alphaComputePending{false};
 };

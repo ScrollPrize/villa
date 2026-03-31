@@ -24,6 +24,7 @@
 #include <thread>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 
 namespace utils {
 
@@ -528,8 +529,10 @@ private:
 
                 // Retry on 5xx server errors
                 if (resp.status_code >= 500 && attempt < config_.max_retries) {
+                    thread_local std::mt19937 rng{std::random_device{}()};
+                    std::uniform_int_distribution<unsigned> jitter(0, 100);
                     std::this_thread::sleep_for(
-                        std::chrono::milliseconds(200 * (1u << attempt)));
+                        std::chrono::milliseconds(200 * (1u << attempt) + jitter(rng)));
                     continue;
                 }
                 return resp;
@@ -537,8 +540,10 @@ private:
 
             // Retry on network / transient curl errors
             if (attempt < config_.max_retries) {
+                thread_local std::mt19937 rng{std::random_device{}()};
+                std::uniform_int_distribution<unsigned> jitter(0, 100);
                 std::this_thread::sleep_for(
-                    std::chrono::milliseconds(200 * (1u << attempt)));
+                    std::chrono::milliseconds(200 * (1u << attempt) + jitter(rng)));
                 continue;
             }
         }
