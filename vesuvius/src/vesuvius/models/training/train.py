@@ -1429,8 +1429,6 @@ class BaseTrainer:
         checkpoint_history.append((epoch, ckpt_path))
 
         del checkpoint_data
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
 
         # Manage checkpoint history
         checkpoint_history, best_checkpoints = manage_checkpoint_history(
