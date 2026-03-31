@@ -64,18 +64,15 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
 
     _scene->setSceneRect(0, 0, sceneW, sceneH);
 
-    // Dark placeholder matches scene background — no visible flash
-    QPixmap placeholder(TILE_PX, TILE_PX);
-    placeholder.fill(QColor(0, 0, 0));
-
     const int count = _bounds.totalRows * _bounds.totalCols;
     _items.resize(count, nullptr);
     _meta.resize(count);
-    _unfilledCount = count;  // all tiles start unfilled
+    _unfilledCount = count;
 
+    // Create empty items — invisible until a render result sets their pixmap
     for (int r = 0; r < _bounds.totalRows; ++r) {
         for (int c = 0; c < _bounds.totalCols; ++c) {
-            auto* item = _scene->addPixmap(placeholder);
+            auto* item = _scene->addPixmap(QPixmap());
             item->setPos(_padX + c * TILE_PX, _padY + r * TILE_PX);
             item->setZValue(0);
             _items[r * _bounds.totalCols + c] = item;

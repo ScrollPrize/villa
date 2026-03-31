@@ -25,24 +25,8 @@ static inline void nt_store_u32(uint32_t* dst, uint32_t val) {
 }
 
 // Global lock-free slab pool for 512x512 ARGB32 tile buffers (1 MB each).
-// Workers allocate on render threads; main thread frees when QImage is destroyed.
-// Atomic CAS stack keeps contention minimal across threads.
-static utils::TileBufferSlab& tileBufferSlab()
-{
-    static utils::TileBufferSlab slab;
-    return slab;
-}
-
-static void slabCleanup(void* ptr) { tileBufferSlab().deallocate(ptr); }
-
 QImage allocTileImage(int cols, int rows)
 {
-    const size_t needed = static_cast<size_t>(cols) * rows * 4;
-    if (needed <= utils::TileBufferSlab::slab_size()) {
-        auto* buf = static_cast<uchar*>(tileBufferSlab().allocate());
-        return QImage(buf, cols, rows, cols * 4, QImage::Format_RGB32,
-                      slabCleanup, buf);
-    }
     return QImage(cols, rows, QImage::Format_RGB32);
 }
 
