@@ -878,40 +878,30 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     _camera.surfacePtr[1] += dy * (1.0f / _camera.scale - 1.0f / newScale);
     _camera.scale = newScale;
 
-    int oldLevel = _camera.dsScaleIdx;
     if (_volume) {
+        float oldDs = _camera.dsScale;
         _camera.recalcPyramidLevel(_volume->numScales());
-        if (_camera.dsScaleIdx != oldLevel) {
+        if (std::abs(_camera.dsScale - oldDs) > 1e-6f) {
             double vs = _volume->voxelSize() / _camera.dsScale;
             fGraphicsView->setVoxelSize(vs, vs);
         }
     }
 
-    if (_camera.dsScaleIdx != oldLevel) {
-        // Pyramid level changed — full grid rebuild + re-render
-        _zoomBaseScale = _camera.scale;
-        fGraphicsView->resetTransform();
-        rebuildContentGrid();
-        centerViewport();
-        _focusSurfacePos[0] = _camera.surfacePtr[0];
-        _focusSurfacePos[1] = _camera.surfacePtr[1];
-        _camera.invalidate();
+    // Immediate zoom: rebuild grid and render right now. Retained tile layer
+    // + synchronous coarse fill prevent any gray flash. No debounce delay.
+    fGraphicsView->resetTransform();
+    rebuildContentGrid();
+    centerViewport();
+    _focusSurfacePos[0] = _camera.surfacePtr[0];
+    _focusSurfacePos[1] = _camera.surfacePtr[1];
+    _camera.invalidate();
 
-        auto surf = _surfWeak.lock();
-        if (surf && _volume && _volume->zarrDataset() &&
-            _tileScene->cols() > 0 && _tileScene->rows() > 0) {
-            QRectF vpRect = viewportSceneRect();
-            auto buildParams = [this](const WorldTileKey& wk) { return buildRenderParams(wk); };
-            _renderController->onCameraChanged(_camera, surf, _volume, buildParams, vpRect);
-        }
-    } else {
-        // Same pyramid level — visual scale only, no grid rebuild
-        float visualRatio = _camera.scale / _zoomBaseScale;
-        fGraphicsView->resetTransform();
-        fGraphicsView->scale(visualRatio, visualRatio);
-        centerViewport();
-        _focusSurfacePos[0] = _camera.surfacePtr[0];
-        _focusSurfacePos[1] = _camera.surfacePtr[1];
+    auto surf = _surfWeak.lock();
+    if (surf && _volume && _volume->zarrDataset() &&
+        _tileScene->cols() > 0 && _tileScene->rows() > 0) {
+        QRectF vpRect = viewportSceneRect();
+        auto buildParams = [this](const WorldTileKey& wk) { return buildRenderParams(wk); };
+        _renderController->onCameraChanged(_camera, surf, _volume, buildParams, vpRect);
     }
 }
 

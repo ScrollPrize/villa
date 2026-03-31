@@ -36,12 +36,11 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
         return;
     }
 
-    // Retain old items as a background layer so they remain visible
-    // through the new (initially transparent) tiles, preventing gray flash.
+    // Delete old tiles immediately — no retained layer
     clearRetained();
     for (auto* item : _items) {
-        item->setZValue(-1);
-        _retainedItems.push_back(item);
+        if (item && item->scene()) item->scene()->removeItem(item);
+        delete item;
     }
     _items.clear();
     _meta.clear();

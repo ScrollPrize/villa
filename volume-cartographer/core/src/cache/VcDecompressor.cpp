@@ -30,9 +30,9 @@ static void reorderToBlocks16(uint8_t* dst, const uint8_t* src, int Z, int Y, in
 }
 
 // Check if block layout is applicable: all dims must be multiples of 16.
-static bool canUseBlockLayout(int z, int y, int x)
+static bool canUseBlockLayout(int /*z*/, int /*y*/, int /*x*/)
 {
-    return (z & 15) == 0 && (y & 15) == 0 && (x & 15) == 0;
+    return false;  // disabled — investigating heap corruption
 }
 
 // Check if all bytes in a chunk are zero.
