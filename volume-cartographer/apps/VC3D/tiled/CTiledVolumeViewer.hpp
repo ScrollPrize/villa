@@ -470,6 +470,8 @@ private:
 
     // Predictive prefetch state
     QPointF _lastPanScenePos;
+    float _lastZOff = 0.0f;       // previous z offset for velocity-based z-prefetch
+    float _zVelocity = 0.0f;      // last z-scroll direction (+/- or 0)
 
     // --- Visual zoom transform ---
     float _zoomBaseScale = 0.5f;       // camera.scale at start of current zoom

@@ -1,10 +1,10 @@
-// vc_zarr_recompress: Recompress zarr v2 volumes to zarr v3 with H264 + sharding.
+// vc_zarr_recompress: Recompress zarr v2 volumes to zarr v3 with H265 + sharding.
 //
 // Reads zarr v2 chunks (blosc/zstd/raw) from S3 or local filesystem,
-// recompresses with H264 into zarr v3 shards (1024³ shards, 128³ inner chunks),
+// recompresses with H265 into zarr v3 shards (1024³ shards, 128³ inner chunks),
 // writes zarr v3 output to S3 or local filesystem.
 //
-// Each 128³ inner chunk is H264-encoded individually (VC3D header + H264
+// Each 128³ inner chunk is H265-encoded individually (VC3D header + H265
 // bitstream). Shards use the standard zarr v3 sharding_indexed format with
 // the index at end.
 //
@@ -17,7 +17,7 @@
 //   s3+us-east-1://bucket/...     (S3 with explicit region)
 //
 // Options:
-//   --qp N        H264 quantization parameter (0-51) [default: 40]
+//   --qp N        H265 quantization parameter (0-51) [default: 15]
 //   --verify      Verify roundtrip (decode after encode)
 //   --level N     Process only this pyramid level (-1=all) [default: -1]
 //   --jobs N      Worker threads [default: half hardware threads]
@@ -312,11 +312,11 @@ static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape, int q
     sc.sub_chunks = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
     sc.index_at_end = true;
 
-    // Sub-chunk codec: h264 (VC3D video codec)
-    utils::ZarrCodecConfig h264_codec;
-    h264_codec.name = "h264";
-    h264_codec.configuration = json{{"qp", qp}};
-    sc.sub_codecs.push_back(h264_codec);
+    // Sub-chunk codec: h265 (VC3D video codec)
+    utils::ZarrCodecConfig h265_codec;
+    h265_codec.name = "h265";
+    h265_codec.configuration = json{{"qp", qp}};
+    sc.sub_codecs.push_back(h265_codec);
 
     // Index codec: bytes (little-endian)
     utils::ZarrCodecConfig bytes_codec;
@@ -473,7 +473,7 @@ int main(int argc, char** argv) {
                   << "Input/output: local path or s3://bucket/path\n"
                   << "\n"
                   << "Options:\n"
-                  << "  --qp N        H264 quantization (0-51, lower=better) [40]\n"
+                  << "  --qp N        H265 quantization (0-51, lower=better) [15]\n"
                   << "  --verify      Verify roundtrip after encoding\n"
                   << "  --level N     Single pyramid level (-1=all) [-1]\n"
                   << "  --jobs N      Worker threads [half HW threads]\n";
@@ -484,7 +484,7 @@ int main(int argc, char** argv) {
 
     std::string input_path = argv[1];
     std::string output_path = argv[2];
-    int qp = 40;
+    int qp = 15;
     bool verify = false;
     int target_level = -1;
     int jobs = std::max(1, (int)std::thread::hardware_concurrency() / 2);
@@ -502,7 +502,7 @@ int main(int argc, char** argv) {
 
     printf("Input:  %s\n", input_path.c_str());
     printf("Output: %s\n", output_path.c_str());
-    printf("H264 QP: %d, shard: %zu³, chunk: %zu³\n", qp, SHARD_DIM, CHUNK_DIM);
+    printf("H265 QP: %d, shard: %zu³, chunk: %zu³\n", qp, SHARD_DIM, CHUNK_DIM);
     printf("Jobs: %d\n\n", jobs);
 
     // Discover pyramid levels
@@ -770,9 +770,9 @@ int main(int argc, char** argv) {
 
                             total_raw.fetch_add(CHUNK_VOXELS);
 
-                            // H264 encode
+                            // H265 encode
                             utils::VideoCodecParams params;
-                            params.type = utils::VideoCodecType::H264;
+                            params.type = utils::VideoCodecType::H265;
                             params.qp = qp;
                             params.depth = CHUNK_DIM;
                             params.height = CHUNK_DIM;

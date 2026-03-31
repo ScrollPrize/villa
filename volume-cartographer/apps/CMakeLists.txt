@@ -93,7 +93,7 @@ target_link_libraries(vc_diffuse_winding
         Ceres::ceres
 )
 
-add_executable(vc_render_bench src/ZarrExtract.cpp)
+add_executable(vc_render_bench src/vc_render_bench.cpp)
 target_link_libraries(vc_render_bench vc_core)
 
 add_executable(vc_create_segment_mask src/vc_create_segment_mask.cpp)

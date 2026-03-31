@@ -34,9 +34,10 @@ void RenderPool::submit(const TileRenderParams& params,
 
     pendingCount_.fetch_add(1, std::memory_order_relaxed);
 
-    // Coarser pyramid levels (higher dsScaleIdx) get higher priority (lower value)
-    // so fallback previews appear before fine tiles.
-    int priority = -params.dsScaleIdx;
+    // Use the caller-provided priority which encodes both pyramid level
+    // and spatial locality (chunk batching).  Coarser levels and
+    // chunk-grouped tiles get lower values (= higher urgency).
+    int priority = params.submitPriority;
 
     // Submit without pool-level epoch filtering (the pool is shared across
     // multiple controllers with independent epoch counters).  Instead, check

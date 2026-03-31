@@ -65,8 +65,8 @@ if(UTILS_COMPRESSION_LIBS)
     target_link_libraries(utils_compression INTERFACE ${UTILS_COMPRESSION_LIBS})
 endif()
 
-# Optional: video codec support (H264/H265/AV1)
-option(VC_WITH_VIDEO_CODEC "Enable video codec compression (H264/H265/AV1)" ON)
+# Optional: video codec support (H265/AV1)
+option(VC_WITH_VIDEO_CODEC "Enable video codec compression (H265/AV1)" ON)
 include(FindPkgConfig OPTIONAL)
 
 set(_VC_VIDEO_LIBS "")
@@ -75,16 +75,6 @@ set(_VC_VIDEO_DEFS "")
 set(_VC_VIDEO_FOUND FALSE)
 
 if(PKG_CONFIG_FOUND AND VC_WITH_VIDEO_CODEC)
-    # H.264: OpenH264
-    pkg_check_modules(OPENH264 QUIET openh264)
-    if(OPENH264_FOUND)
-        list(APPEND _VC_VIDEO_LIBS ${OPENH264_LIBRARIES})
-        list(APPEND _VC_VIDEO_INCS ${OPENH264_INCLUDE_DIRS})
-        list(APPEND _VC_VIDEO_DEFS UTILS_HAS_H264=1)
-        set(_VC_VIDEO_FOUND TRUE)
-        message(STATUS "Video codec H.264: enabled (OpenH264)")
-    endif()
-
     # H.265: x265 (encoder) + libde265 (decoder)
     pkg_check_modules(LIBDE265 QUIET libde265)
     find_library(X265_LIB x265 QUIET)
@@ -122,8 +112,8 @@ target_compile_features(utils_video_codec PUBLIC cxx_std_23)
 
 # C3D (compress3d) is always available — no external deps.
 # UTILS_HAS_VIDEO_CODEC is always defined so the recompression/decompression
-# paths are compiled in. Individual codecs (H264/H265/AV1) are gated by their
-# own UTILS_HAS_H264 / UTILS_HAS_H265 / UTILS_HAS_AV1 defines.
+# paths are compiled in. Individual codecs (H265/AV1) are gated by their
+# own UTILS_HAS_H265 / UTILS_HAS_AV1 defines.
 target_compile_definitions(utils_video_codec PUBLIC UTILS_HAS_VIDEO_CODEC=1)
 
 if(_VC_VIDEO_FOUND)

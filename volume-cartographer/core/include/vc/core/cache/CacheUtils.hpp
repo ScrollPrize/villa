@@ -2,13 +2,14 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
 
-#include <cstdio>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -16,9 +17,12 @@
 
 namespace vc::cache {
 
-// Read an entire file into a byte vector using POSIX I/O.
+// Read an entire file into a byte vector via mmap.
+// Uses mmap + memcpy + munmap instead of a read() loop — single-syscall data
+// transfer for large chunks (2MB+), and the kernel can use DMA / page-cache
+// mappings rather than copying through an intermediate kernel buffer.
 // Tries O_NOATIME first (avoids atime updates), falls back to plain O_RDONLY.
-// Returns nullopt on any failure (missing file, read error, etc.).
+// Returns nullopt on any failure (missing file, mmap error, etc.).
 [[nodiscard]] inline std::optional<std::vector<uint8_t>> readFileToVector(
     const std::filesystem::path& path)
 {
@@ -44,17 +48,15 @@ namespace vc::cache {
         return std::nullopt;
     }
 
-    std::vector<uint8_t> buf(fileSize);
-    size_t total = 0;
-    while (total < fileSize) {
-        ssize_t n = ::read(fd, buf.data() + total, fileSize - total);
-        if (n <= 0) {
-            ::close(fd);
-            return std::nullopt;
-        }
-        total += static_cast<size_t>(n);
+    void* mapped = ::mmap(nullptr, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);  // fd no longer needed after mmap
+    if (mapped == MAP_FAILED) {
+        return std::nullopt;
     }
-    ::close(fd);
+
+    std::vector<uint8_t> buf(fileSize);
+    std::memcpy(buf.data(), mapped, fileSize);
+    ::munmap(mapped, fileSize);
     return buf;
 }
 

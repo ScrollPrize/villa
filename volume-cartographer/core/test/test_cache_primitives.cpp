@@ -230,7 +230,7 @@ TEST(ChunkData, BasicAccessors)
     vc::cache::ChunkData cd;
     cd.shape = {2, 3, 4};
     cd.elementSize = 2;
-    cd.bytes.resize(2 * 3 * 4 * 2);
+    cd.resizeBytes(2 * 3 * 4 * 2);
 
     EXPECT_EQ(cd.numElements(), 24u);
     EXPECT_EQ(cd.totalBytes(), 48u);
@@ -244,7 +244,7 @@ TEST(ChunkData, TypedAccess)
     vc::cache::ChunkData cd;
     cd.shape = {1, 1, 4};
     cd.elementSize = 2;
-    cd.bytes.resize(8);
+    cd.resizeBytes(8);
 
     auto* p = cd.data<uint16_t>();
     p[0] = 100;

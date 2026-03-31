@@ -8,34 +8,64 @@
 #include <vector>
 
 #include "ChunkKey.hpp"
+#include "HugePageAllocator.hpp"
 
 namespace vc::cache {
 
 // Decompressed chunk data, ready for sampling.
 // Stores raw bytes with shape metadata. Callers cast to the appropriate type
 // (uint8_t, uint16_t, float, etc.) via the data<T>() accessors.
+//
+// Storage: uses a 2MB huge-page-aligned buffer from HugePageAllocator when
+// the data fits (<=2MB). Falls back to std::vector for larger buffers.
 struct ChunkData {
-    std::vector<uint8_t> bytes;
-    std::array<int, 3> shape{0, 0, 0};  // {z, y, x}
-    int elementSize = 1;                 // bytes per element (1=u8, 2=u16, 4=f32)
+    std::vector<uint8_t> bytes;          // fallback for >2MB or legacy path
+    HugePageBuffer hugeBuf;              // 2MB-aligned buffer from pool
+    std::array<int, 3> shape{0, 0, 0};   // {z, y, x}
+    int elementSize = 1;                  // bytes per element (1=u8, 2=u16, 4=f32)
 
     [[nodiscard]] size_t numElements() const noexcept
     {
         return static_cast<size_t>(shape[0]) * shape[1] * shape[2];
     }
 
-    [[nodiscard]] size_t totalBytes() const noexcept { return bytes.size(); }
+    [[nodiscard]] size_t totalBytes() const noexcept
+    {
+        return hugeBuf.ptr ? hugeBuf.size : bytes.size();
+    }
+
+    // Resize storage: uses huge page pool for sizes <= 2MB, vector otherwise.
+    void resizeBytes(size_t n)
+    {
+        if (n <= HugePageAllocator::k2MB) {
+            hugeBuf.resize(n);
+            bytes.clear();
+        } else {
+            hugeBuf = HugePageBuffer{};
+            bytes.resize(n);
+        }
+    }
+
+    // Raw byte pointer (whichever storage is active).
+    [[nodiscard]] uint8_t* rawData() noexcept
+    {
+        return hugeBuf.ptr ? hugeBuf.ptr : bytes.data();
+    }
+    [[nodiscard]] const uint8_t* rawData() const noexcept
+    {
+        return hugeBuf.ptr ? hugeBuf.ptr : bytes.data();
+    }
 
     template <typename T>
     [[nodiscard]] T* data() noexcept
     {
-        return reinterpret_cast<T*>(bytes.data());
+        return reinterpret_cast<T*>(rawData());
     }
 
     template <typename T>
     [[nodiscard]] const T* data() const noexcept
     {
-        return reinterpret_cast<const T*>(bytes.data());
+        return reinterpret_cast<const T*>(rawData());
     }
 
     // Stride helpers for (z, y, x) indexing into the flat buffer.

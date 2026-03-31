@@ -4,10 +4,6 @@
 #include <cstring>
 #include <memory>
 
-#ifdef UTILS_HAS_H264
-#include <wels/codec_api.h>
-#endif
-
 #ifdef UTILS_HAS_H265
 #include <libde265/de265.h>
 #include <x265.h>
@@ -106,158 +102,6 @@ void fill_y_plane(
         std::memset(yBuf.data() + y * padW, 0, padW);
     }
 }
-
-// ============================================================
-// H.264 (OpenH264)
-// ============================================================
-
-#ifdef UTILS_HAS_H264
-
-auto h264_encode(std::span<const std::byte> raw, const VideoCodecParams& params)
-    -> std::vector<std::byte>
-{
-    const int Z = params.depth, Y = params.height, X = params.width;
-    const int padW = pad2(X), padH = pad2(Y);
-
-    ISVCEncoder* encoder = nullptr;
-    if (WelsCreateSVCEncoder(&encoder) != 0 || !encoder) {
-        throw std::runtime_error("h264_encode: failed to create encoder");
-    }
-    auto guard = std::unique_ptr<ISVCEncoder, void (*)(ISVCEncoder*)>(
-        encoder, [](ISVCEncoder* e) { e->Uninitialize(); WelsDestroySVCEncoder(e); });
-
-    SEncParamExt paramExt{};
-    encoder->GetDefaultParams(&paramExt);
-    paramExt.iUsageType = CAMERA_VIDEO_REAL_TIME;
-    paramExt.iComplexityMode = LOW_COMPLEXITY;
-    paramExt.iPicWidth = padW;
-    paramExt.iPicHeight = padH;
-    paramExt.fMaxFrameRate = 30.0f;
-    paramExt.iRCMode = RC_OFF_MODE;
-    paramExt.bEnableFrameSkip = false;
-    paramExt.bEnableDenoise = false;
-    paramExt.bEnableAdaptiveQuant = false;
-    paramExt.bEnableSceneChangeDetect = false;
-    paramExt.bEnableLongTermReference = false;
-    paramExt.iMultipleThreadIdc = 1;
-    paramExt.sSpatialLayers[0].iVideoWidth = padW;
-    paramExt.sSpatialLayers[0].iVideoHeight = padH;
-    paramExt.sSpatialLayers[0].fFrameRate = 30.0f;
-    paramExt.sSpatialLayers[0].iMaxSpatialBitrate = 0;
-    paramExt.sSpatialLayers[0].iSpatialBitrate = 0;
-    paramExt.iMaxQp = params.qp;
-    paramExt.iMinQp = params.qp;
-    if (encoder->InitializeExt(&paramExt) != 0) {
-        throw std::runtime_error("h264_encode: encoder init failed");
-    }
-
-    const int yPlaneSize = padW * padH;
-    const int uvPlaneSize = (padW / 2) * (padH / 2);
-    std::vector<uint8_t> yBuf(yPlaneSize, 0);
-    std::vector<uint8_t> uBuf(uvPlaneSize, 128);
-    std::vector<uint8_t> vBuf(uvPlaneSize, 128);
-
-    std::vector<std::byte> output;
-    write_header(output, params.type, params.qp, Z, Y, X);
-
-    SSourcePicture pic{};
-    pic.iColorFormat = videoFormatI420;
-    pic.iPicWidth = padW;
-    pic.iPicHeight = padH;
-    pic.iStride[0] = padW;
-    pic.iStride[1] = padW / 2;
-    pic.iStride[2] = padW / 2;
-    pic.pData[0] = yBuf.data();
-    pic.pData[1] = uBuf.data();
-    pic.pData[2] = vBuf.data();
-
-    SFrameBSInfo info{};
-    for (int z = 0; z < Z; ++z) {
-        const auto* src = reinterpret_cast<const uint8_t*>(raw.data()) + z * Y * X;
-        fill_y_plane(yBuf, src, X, Y, padW, padH);
-        pic.uiTimeStamp = z * 33;
-        if (z == 0) encoder->ForceIntraFrame(true);
-
-        std::memset(&info, 0, sizeof(info));
-        if (encoder->EncodeFrame(&pic, &info) != 0) {
-            throw std::runtime_error("h264_encode: EncodeFrame failed");
-        }
-        if (info.eFrameType != videoFrameTypeSkip) {
-            for (int layer = 0; layer < info.iLayerNum; ++layer) {
-                const auto& li = info.sLayerInfo[layer];
-                int layerSize = 0;
-                for (int n = 0; n < li.iNalCount; ++n) layerSize += li.pNalLengthInByte[n];
-                auto old = output.size();
-                output.resize(old + layerSize);
-                std::memcpy(output.data() + old, li.pBsBuf, layerSize);
-            }
-        }
-    }
-    return output;
-}
-
-auto h264_decode(const uint8_t* bitstream, int bitstreamLen, int Z, int Y, int X)
-    -> std::vector<std::byte>
-{
-    ISVCDecoder* decoder = nullptr;
-    if (WelsCreateDecoder(&decoder) != 0 || !decoder) {
-        throw std::runtime_error("h264_decode: failed to create decoder");
-    }
-    auto guard = std::unique_ptr<ISVCDecoder, void (*)(ISVCDecoder*)>(
-        decoder, [](ISVCDecoder* d) { d->Uninitialize(); WelsDestroyDecoder(d); });
-
-    SDecodingParam decParam{};
-    decParam.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_AVC;
-    if (decoder->Initialize(&decParam) != 0) {
-        throw std::runtime_error("h264_decode: decoder init failed");
-    }
-
-    std::vector<std::byte> output(static_cast<std::size_t>(Z) * Y * X, std::byte{0});
-    uint8_t* yuvData[3] = {};
-    SBufferInfo bufInfo{};
-    int framesDecoded = 0;
-
-    auto extractFrame = [&]() {
-        if (bufInfo.iBufferStatus == 1 && yuvData[0] && framesDecoded < Z) {
-            int stride = bufInfo.UsrData.sSystemBuffer.iStride[0];
-            auto* dst = reinterpret_cast<uint8_t*>(output.data()) + framesDecoded * Y * X;
-            for (int y = 0; y < Y; ++y)
-                std::memcpy(dst + y * X, yuvData[0] + y * stride, X);
-            ++framesDecoded;
-        }
-    };
-
-    // Find NAL start codes and feed each separately
-    std::vector<int> nalStarts;
-    for (int i = 0; i + 3 < bitstreamLen; ++i) {
-        if (bitstream[i] == 0 && bitstream[i + 1] == 0 &&
-            bitstream[i + 2] == 0 && bitstream[i + 3] == 1) {
-            nalStarts.push_back(i);
-        }
-    }
-    if (nalStarts.empty()) nalStarts.push_back(0);
-
-    for (std::size_t i = 0; i < nalStarts.size(); ++i) {
-        int start = nalStarts[i];
-        int end = (i + 1 < nalStarts.size()) ? nalStarts[i + 1] : bitstreamLen;
-        std::memset(&bufInfo, 0, sizeof(bufInfo));
-        yuvData[0] = yuvData[1] = yuvData[2] = nullptr;
-        decoder->DecodeFrameNoDelay(bitstream + start, end - start, yuvData, &bufInfo);
-        extractFrame();
-    }
-
-    while (framesDecoded < Z) {
-        std::memset(&bufInfo, 0, sizeof(bufInfo));
-        yuvData[0] = yuvData[1] = yuvData[2] = nullptr;
-        decoder->DecodeFrameNoDelay(nullptr, 0, yuvData, &bufInfo);
-        if (bufInfo.iBufferStatus != 1) break;
-        extractFrame();
-    }
-
-    return output;
-}
-
-#endif  // UTILS_HAS_H264
 
 // ============================================================
 // H.265 (x265 encode, libde265 decode)
@@ -706,9 +550,6 @@ auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params
     }
 
     switch (params.type) {
-#ifdef UTILS_HAS_H264
-        case VideoCodecType::H264: return h264_encode(raw, params);
-#endif
 #ifdef UTILS_HAS_H265
         case VideoCodecType::H265: return h265_encode(raw, params);
 #endif
@@ -741,9 +582,6 @@ auto video_decode(
     const int bitstreamLen = static_cast<int>(compressed.size() - HEADER_SIZE);
 
     switch (hdr.codec) {
-#ifdef UTILS_HAS_H264
-        case VideoCodecType::H264: return h264_decode(bitstream, bitstreamLen, hdr.Z, hdr.Y, hdr.X);
-#endif
 #ifdef UTILS_HAS_H265
         case VideoCodecType::H265: return h265_decode(bitstream, bitstreamLen, hdr.Z, hdr.Y, hdr.X);
 #endif

@@ -15,6 +15,9 @@ namespace vc::cache {
 // malloc/free churn on every decompress (0.46% of CPU in profiles).
 // Each thread keeps up to 4 recycled buffers. When a ChunkDataPtr's
 // refcount drops to 1 (only the pool holds it), it's available for reuse.
+//
+// Buffers are backed by the HugePageAllocator (2MB-aligned pages) when
+// the decoded chunk fits within 2MB (128^3 uint8 = 2MB exactly).
 static ChunkDataPtr acquireChunkData(size_t bytesNeeded)
 {
     // Small thread-local free list
@@ -28,16 +31,16 @@ static ChunkDataPtr acquireChunkData(size_t bytesNeeded)
     // Try to reuse a pooled buffer with sufficient capacity
     for (int i = 0; i < pool.count; i++) {
         if (pool.bufs[i].use_count() == 1 &&
-            pool.bufs[i]->bytes.capacity() >= bytesNeeded) {
+            pool.bufs[i]->totalBytes() >= bytesNeeded) {
             auto result = pool.bufs[i];
-            result->bytes.resize(bytesNeeded);
+            result->resizeBytes(bytesNeeded);
             return result;
         }
     }
 
-    // Allocate fresh
+    // Allocate fresh — uses huge page pool for sizes <= 2MB
     auto result = std::make_shared<ChunkData>();
-    result->bytes.resize(bytesNeeded);
+    result->resizeBytes(bytesNeeded);
 
     // Try to add to pool for future reuse
     if (pool.count < static_cast<int>(kPoolSize)) {
@@ -103,7 +106,7 @@ DecompressFn makeVcDecompressor(const std::vector<vc::VcDataset*>& datasets)
                 static_cast<int>(chunkShape[2])};
             result->elementSize = 1;
             size_t copySize = std::min(decoded.size(), chunkSize);
-            std::memcpy(result->bytes.data(), decoded.data(), copySize);
+            std::memcpy(result->rawData(), decoded.data(), copySize);
             return result;
         }
 #endif
@@ -117,15 +120,16 @@ DecompressFn makeVcDecompressor(const std::vector<vc::VcDataset*>& datasets)
 
         // Normal zarr decompression path
         if (dtype == vc::VcDtype::uint8) {
-            ds.decompress(compressed, result->bytes.data(), chunkSize);
+            ds.decompress(compressed, result->rawData(), chunkSize);
         } else if (dtype == vc::VcDtype::uint16) {
-            ds.decompress(compressed, result->bytes.data(), chunkSize);
+            ds.decompress(compressed, result->rawData(), chunkSize);
 
-            auto* src = reinterpret_cast<const uint16_t*>(result->bytes.data());
+            auto* dst = result->rawData();
+            auto* src = reinterpret_cast<const uint16_t*>(dst);
             for (size_t i = 0; i < chunkSize; i++) {
-                result->bytes[i] = static_cast<uint8_t>(src[i] / 257);
+                dst[i] = static_cast<uint8_t>(src[i] / 257);
             }
-            result->bytes.resize(chunkSize);
+            result->resizeBytes(chunkSize);
         } else {
             return nullptr;
         }

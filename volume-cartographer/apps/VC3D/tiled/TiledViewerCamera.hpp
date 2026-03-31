@@ -26,6 +26,12 @@ struct TiledViewerCamera {
     // Pyramid level index (0 = full res, higher = coarser)
     int dsScaleIdx = 1;
 
+    // Adjacent pyramid level for blending (finer or coarser than dsScaleIdx)
+    int dsScaleIdxFine = 0;
+
+    // Blend factor: 0.0 = fully dsScaleIdx, 1.0 = fully dsScaleIdxFine
+    float dsBlendFactor = 0.0f;
+
     // Derived: 2^(-dsScaleIdx), e.g., level 2 -> 0.25
     float dsScale = 0.5f;
 

@@ -33,6 +33,7 @@ add_library(vc_core
         src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
+        src/render/RenderCore.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
 

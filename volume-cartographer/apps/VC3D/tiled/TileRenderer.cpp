@@ -243,6 +243,36 @@ TileRenderResult TileRenderer::renderTile(
             gray, planeOrigin, planeVxStep, planeVyStep,
             params.tileW, params.tileH, sp);
 
+        // Blend with finer pyramid level for smooth zoom transitions
+        const float blend = params.dsBlendFactor;
+        if (blend > 0.0f && blend < 1.0f &&
+            params.dsScaleIdxFine != params.dsScaleIdx &&
+            volume->zarrDataset(params.dsScaleIdxFine)) {
+            cv::Mat_<uint8_t> grayFine;
+            vc::SampleParams spFine;
+            spFine.level = params.dsScaleIdxFine;
+            spFine.method = (params.useFastInterpolation || params.dsScaleIdxFine >= 3)
+                                ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
+
+            volume->samplePlaneBestEffort(
+                grayFine, planeOrigin, planeVxStep, planeVyStep,
+                params.tileW, params.tileH, spFine);
+
+            if (!gray.empty() && !grayFine.empty()) {
+                const float coarseWeight = 1.0f - blend;
+                for (int y = 0; y < gray.rows; ++y) {
+                    auto* dst = gray.ptr<uint8_t>(y);
+                    const auto* src = grayFine.ptr<uint8_t>(y);
+                    for (int x = 0; x < gray.cols; ++x) {
+                        dst[x] = static_cast<uint8_t>(
+                            dst[x] * coarseWeight + src[x] * blend + 0.5f);
+                    }
+                }
+            } else if (gray.empty() && !grayFine.empty()) {
+                gray = grayFine;
+            }
+        }
+
         // Apply directional lighting when enabled outside composite mode.
         if (params.compositeSettings.params.lightingEnabled && !gray.empty()) {
             const auto& cp = params.compositeSettings.params;
@@ -265,6 +295,34 @@ TileRenderResult TileRenderer::renderTile(
                         ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
 
         result.actualLevel = volume->sampleBestEffort(gray, coords, sp);
+
+        // Blend with finer pyramid level for smooth zoom transitions
+        const float blend = params.dsBlendFactor;
+        if (blend > 0.0f && blend < 1.0f &&
+            params.dsScaleIdxFine != params.dsScaleIdx &&
+            volume->zarrDataset(params.dsScaleIdxFine)) {
+            cv::Mat_<uint8_t> grayFine;
+            vc::SampleParams spFine;
+            spFine.level = params.dsScaleIdxFine;
+            spFine.method = (params.useFastInterpolation || params.dsScaleIdxFine >= 3)
+                                ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
+
+            volume->sampleBestEffort(grayFine, coords, spFine);
+
+            if (!gray.empty() && !grayFine.empty()) {
+                const float coarseWeight = 1.0f - blend;
+                for (int y = 0; y < gray.rows; ++y) {
+                    auto* dst = gray.ptr<uint8_t>(y);
+                    const auto* src = grayFine.ptr<uint8_t>(y);
+                    for (int x = 0; x < gray.cols; ++x) {
+                        dst[x] = static_cast<uint8_t>(
+                            dst[x] * coarseWeight + src[x] * blend + 0.5f);
+                    }
+                }
+            } else if (gray.empty() && !grayFine.empty()) {
+                gray = grayFine;
+            }
+        }
 
         // Apply directional lighting when enabled outside composite mode.
         // The composite path handles this internally; here we do it as a

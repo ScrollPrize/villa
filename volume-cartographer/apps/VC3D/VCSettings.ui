@@ -692,11 +692,6 @@
            <widget class="QComboBox" name="cmbVideoCodecType">
             <item>
              <property name="text">
-              <string>H.264</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
               <string>H.265</string>
              </property>
             </item>

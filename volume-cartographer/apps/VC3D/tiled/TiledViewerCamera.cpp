@@ -10,6 +10,8 @@ void TiledViewerCamera::recalcPyramidLevel(int numScales)
 {
     if (numScales <= 0) {
         dsScaleIdx = 0;
+        dsScaleIdxFine = 0;
+        dsBlendFactor = 0.0f;
         dsScale = 1.0f;
         return;
     }
@@ -31,6 +33,34 @@ void TiledViewerCamera::recalcPyramidLevel(int numScales)
     }
 
     dsScale = std::pow(2.0f, -dsScaleIdx);
+
+    // Compute blend factor between current level and an adjacent level.
+    // The camera scale falls between two pyramid level scales; we blend
+    // between them for a smooth transition.
+    //
+    // dsScaleIdxFine = the adjacent level to blend toward.
+    // dsBlendFactor  = 0.0 means fully current level, 1.0 means fully adjacent.
+    //
+    // When scale > dsScale (finer than current), blend toward the finer level.
+    // When scale < dsScale (coarser than current), blend toward the coarser level.
+
+    if (scale > dsScale && dsScaleIdx > 0) {
+        // Blend toward finer level
+        dsScaleIdxFine = dsScaleIdx - 1;
+        float fineScale = std::pow(2.0f, -dsScaleIdxFine);
+        dsBlendFactor = std::clamp(
+            (scale - dsScale) / (fineScale - dsScale), 0.0f, 1.0f);
+    } else if (scale < dsScale && dsScaleIdx < numScales - 1) {
+        // Blend toward coarser level
+        dsScaleIdxFine = dsScaleIdx + 1;
+        float coarseScale = std::pow(2.0f, -dsScaleIdxFine);
+        dsBlendFactor = std::clamp(
+            (scale - dsScale) / (coarseScale - dsScale), 0.0f, 1.0f);
+    } else {
+        // At exact level scale or at boundary — no blending
+        dsScaleIdxFine = dsScaleIdx;
+        dsBlendFactor = 0.0f;
+    }
 }
 
 // Predefined zoom stops where TILE_PX/scale is a "nice" number, eliminating

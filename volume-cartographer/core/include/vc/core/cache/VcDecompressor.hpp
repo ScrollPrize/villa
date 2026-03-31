@@ -35,7 +35,7 @@ DecompressFn makeVcDecompressor(vc::VcDataset* ds);
 // The function first decompresses the original data using the dataset's
 // decompressor, then re-encodes it with the specified video codec.
 //
-// codecType: 0=H264, 1=H265, 2=AV1
+// codecType: 1=H265, 2=AV1, 3=C3D
 // qp: quantization parameter (0-51)
 RecompressFn makeVideoRecompressor(
     const std::vector<vc::VcDataset*>& datasets,

@@ -112,40 +112,38 @@ struct CacheParams {
 
 // ============================================================================
 // ChunkSampler — thread-local fast voxel access via raw pointer + strides
+//
+// Direct-mapped cache: chunk coords (iz, iy, ix) map to a slot index via
+//   (iz * NY * NX + iy * NX + ix) & (kSlots - 1)
+// This is a single mask operation — faster than the previous hash table.
+// kSlots must be a power of 2 (16, 32, or 64). With 16^3 = 4KB alignment
+// per sampler slot, the total footprint is kSlots * sizeof(Slot).
 // ============================================================================
 
-template<typename T, int kSlots = 16>
+template<typename T, int kSlots = 32>
 struct ChunkSampler {
+    static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be power of 2");
+    static constexpr int kSlotMask = kSlots - 1;
+
     struct Slot {
         uint64_t key = UINT64_MAX;  // packed (iz,iy,ix) key
         vc::cache::ChunkDataPtr chunk;
         const T* data = nullptr;
     };
 
-    // Open-addressing hash table: kHashSlots must be power of 2 and > kSlots
-    static constexpr int kHashSlots = kSlots <= 8 ? 16 : 32;
-    static constexpr int kHashMask = kHashSlots - 1;
-
     const CacheParams& p;
     vc::cache::TieredChunkCache& cache;
     int level;
     Slot slots[kSlots];
-    int slotHead = 0;           // ring-buffer head for FIFO eviction
-    int hashTable[kHashSlots];  // maps hash -> slot index, -1 = empty
     uint64_t lastKey = UINT64_MAX;  // MRU key for fast repeat check
     const T* data = nullptr;  // current data pointer
     size_t s0 = 0, s1 = 0;   // strides (s2 is always 1, eliminated)
 
+    // Grid dimensions for direct index computation
+    int NY = 0, NX = 0;
+
     static uint64_t packKey(int iz, int iy, int ix) {
         return (uint64_t(unsigned(iz)) << 40) | (uint64_t(unsigned(iy)) << 20) | uint64_t(unsigned(ix));
-    }
-
-    // Fast hash for open-addressing — mix bits of packed key
-    static int hashIdx(uint64_t k) {
-        k ^= k >> 17;
-        k *= 0xff51afd7ed558ccdULL;
-        k ^= k >> 31;
-        return static_cast<int>(k) & kHashMask;
     }
 
     ChunkSampler(const CacheParams& p_, vc::cache::TieredChunkCache& cache_, int level_)
@@ -153,7 +151,13 @@ struct ChunkSampler {
     {
         s0 = static_cast<size_t>(p.cy) * p.cx;
         s1 = static_cast<size_t>(p.cx);
-        std::memset(hashTable, -1, sizeof(hashTable));
+        NY = p.chunksY;
+        NX = p.chunksX;
+    }
+
+    // Direct-mapped index: chunk coords → slot index via simple mask
+    int directIndex(int iz, int iy, int ix) const {
+        return (iz * NY * NX + iy * NX + ix) & kSlotMask;
     }
 
     void updateChunk(int iz, int iy, int ix) {
@@ -171,75 +175,26 @@ struct ChunkSampler {
             return;
         }
 
-        // Hash table lookup (open addressing, linear probe)
-        int h = hashIdx(key);
-        for (int probe = 0; probe < kHashSlots; probe++) {
-            int idx = (h + probe) & kHashMask;
-            int si = hashTable[idx];
-            if (si < 0) break;  // empty slot — not found
-            if (slots[si].key == key) {
-                data = slots[si].data;
-                lastKey = key;
-                return;
-            }
+        // Direct-mapped lookup: single index computation + compare
+        int idx = directIndex(iz, iy, ix);
+        auto& slot = slots[idx];
+        if (slot.key == key) {
+            data = slot.data;
+            lastKey = key;
+            return;
         }
 
-        // Miss: evict oldest slot (FIFO ring)
-        int victim = slotHead;
-        slotHead = (slotHead + 1) % kSlots;
-        auto& v = slots[victim];
-
-        // Remove old entry from hash table
-        if (v.key != UINT64_MAX) {
-            int oh = hashIdx(v.key);
-            for (int probe = 0; probe < kHashSlots; probe++) {
-                int idx = (oh + probe) & kHashMask;
-                if (hashTable[idx] == victim) {
-                    // Delete with backward-shift to maintain probe chains
-                    int hole = idx;
-                    for (;;) {
-                        int next = (hole + 1) & kHashMask;
-                        int nsi = hashTable[next];
-                        if (nsi < 0) break;
-                        int ideal = hashIdx(slots[nsi].key);
-                        // Check if 'next' needs hole: does its ideal position
-                        // lie at or before 'hole' in probe order from ideal?
-                        int dNext = (next - ideal) & kHashMask;
-                        int dHole = (hole - ideal) & kHashMask;
-                        if (dHole < dNext) {
-                            hashTable[hole] = nsi;
-                            hole = next;
-                        } else {
-                            break;
-                        }
-                    }
-                    hashTable[hole] = -1;
-                    break;
-                }
-            }
-        }
-
-        // Load new chunk
-        v.chunk = cache.getBlocking(vc::cache::ChunkKey{level, iz, iy, ix});
-        v.key = key;
-        v.data = v.chunk ? v.chunk->template data<T>() : nullptr;
-        data = v.data;
+        // Miss: evict this slot and load the new chunk
+        slot.chunk = cache.getBlocking(vc::cache::ChunkKey{level, iz, iy, ix});
+        slot.key = key;
+        slot.data = slot.chunk ? slot.chunk->template data<T>() : nullptr;
+        data = slot.data;
         lastKey = key;
 
         // Prefetch chunk data into L1 cache
         if (data) {
             __builtin_prefetch(data, 0, 3);
             __builtin_prefetch(reinterpret_cast<const char*>(data) + 64, 0, 3);
-        }
-
-        // Insert into hash table
-        int ih = hashIdx(key);
-        for (int probe = 0; probe < kHashSlots; probe++) {
-            int idx = (ih + probe) & kHashMask;
-            if (hashTable[idx] < 0) {
-                hashTable[idx] = victim;
-                break;
-            }
         }
     }
 

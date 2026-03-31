@@ -68,10 +68,10 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     // Video codec recompression settings
     chkVideoRecompress->setChecked(settings.value(perf::VIDEO_RECOMPRESS_ENABLED, perf::VIDEO_RECOMPRESS_ENABLED_DEFAULT).toBool());
     {
-        // Map codec type value to combo index: 0=H264→0, 1=H265→1, 3=C3D→2
+        // Map codec type value to combo index: 1=H265→0, 3=C3D→1
         int codecType = settings.value(perf::VIDEO_CODEC_TYPE, perf::VIDEO_CODEC_TYPE_DEFAULT).toInt();
-        int comboIdx = (codecType == 3) ? 2 : codecType;
-        cmbVideoCodecType->setCurrentIndex(std::clamp(comboIdx, 0, 2));
+        int comboIdx = (codecType == 3) ? 1 : 0;
+        cmbVideoCodecType->setCurrentIndex(std::clamp(comboIdx, 0, 1));
     }
     cmbVideoQualityPreset->setCurrentIndex(std::clamp(
         settings.value(perf::VIDEO_QUALITY_PRESET, perf::VIDEO_QUALITY_PRESET_DEFAULT).toInt(),
@@ -156,9 +156,9 @@ void SettingsDialog::accept()
     // Video codec recompression
     settings.setValue(perf::VIDEO_RECOMPRESS_ENABLED, chkVideoRecompress->isChecked());
     {
-        // Map combo index to codec type value: 0→0(H264), 1→1(H265), 2→3(C3D)
-        static constexpr int comboToCodec[] = {0, 1, 3};
-        int idx = std::clamp(cmbVideoCodecType->currentIndex(), 0, 2);
+        // Map combo index to codec type value: 0→1(H265), 1→3(C3D)
+        static constexpr int comboToCodec[] = {1, 3};
+        int idx = std::clamp(cmbVideoCodecType->currentIndex(), 0, 1);
         settings.setValue(perf::VIDEO_CODEC_TYPE, comboToCodec[idx]);
     }
     settings.setValue(perf::VIDEO_QUALITY_PRESET, cmbVideoQualityPreset->currentIndex());

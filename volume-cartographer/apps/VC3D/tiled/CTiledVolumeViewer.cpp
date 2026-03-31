@@ -752,6 +752,9 @@ void CTiledVolumeViewer::panBy(int dx, int dy)
     _focusSurfacePos[0] = _camera.surfacePtr[0];
     _focusSurfacePos[1] = _camera.surfacePtr[1];
 
+    // Clear z-velocity on pan so z-prefetch reverts to symmetric
+    _zVelocity = 0.0f;
+
     centerViewport();
     submitRender();
 }
@@ -828,6 +831,8 @@ void CTiledVolumeViewer::setSliceOffset(float dz)
 {
     beginInteractionRender();
     _camera.zOff += dz;
+    // Track z-scroll velocity for directional prefetch
+    _zVelocity = dz;
     // Reset visual zoom transform so tiles render at correct scale
     _zoomBaseScale = _camera.scale;
     fGraphicsView->resetTransform();
@@ -1066,7 +1071,8 @@ void CTiledVolumeViewer::submitRender()
     }
 
     // Viewport-aware prefetch: always prefetch current view.
-    // Extended z-slice prefetch only when not actively scrolling.
+    // Velocity-biased z-slice prefetch: prefetch more slices ahead in the
+    // scroll direction so chunks are ready before the user arrives there.
     if (_volume->tieredCache()) {
         cv::Vec3f lo, hi;
         auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
@@ -1076,16 +1082,28 @@ void CTiledVolumeViewer::submitRender()
         if (ok) {
             _volume->prefetchWorldBBox(lo, hi, _camera.dsScaleIdx);
 
-            // Extended z-slice prefetch (skip during rapid interaction)
+            // Extended z-slice prefetch: bias in the scroll direction.
+            // During active scrolling, prefetch further ahead in the
+            // movement direction; when idle, prefetch symmetrically.
             if (!_interactionQualityActive) {
-                constexpr float PREFETCH_Z_SLICES = 16.0f;
+                constexpr float PREFETCH_Z_BEHIND = 4.0f;
+                constexpr float PREFETCH_Z_AHEAD = 24.0f;
                 cv::Vec3f loZ = lo, hiZ = hi;
-                loZ[2] -= PREFETCH_Z_SLICES;
-                hiZ[2] += PREFETCH_Z_SLICES;
+                if (_zVelocity > 0) {
+                    loZ[2] -= PREFETCH_Z_BEHIND;
+                    hiZ[2] += PREFETCH_Z_AHEAD;
+                } else if (_zVelocity < 0) {
+                    loZ[2] -= PREFETCH_Z_AHEAD;
+                    hiZ[2] += PREFETCH_Z_BEHIND;
+                } else {
+                    loZ[2] -= 16.0f;
+                    hiZ[2] += 16.0f;
+                }
                 _volume->prefetchWorldBBox(loZ, hiZ, _camera.dsScaleIdx);
             }
         }
     }
+    _lastZOff = _camera.zOff;
 }
 
 bool CTiledVolumeViewer::computePlanePrefetchBBox(PlaneSurface* plane,
@@ -1227,6 +1245,8 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     params.scale = _camera.scale;
     params.dsScale = _camera.dsScale;
     params.dsScaleIdx = _camera.dsScaleIdx;
+    params.dsScaleIdxFine = _camera.dsScaleIdxFine;
+    params.dsBlendFactor = _camera.dsBlendFactor;
     params.zOff = _camera.zOff;
 
     params.windowLow = _baseWindowLow;

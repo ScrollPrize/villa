@@ -83,14 +83,50 @@ void TileRenderController::onCameraChanged(
     _lastBuildParams = buildParams;
     _lastViewportRect = viewportRect;
 
-    // Get visible tiles (+ buffer for smooth scrolling), sorted center-first
-    // so the user sees the most important tiles render before edges.
+    // Get visible tiles (+ buffer for smooth scrolling), sorted by spatial
+    // chunk groups so tiles sharing the same volume chunks are submitted
+    // consecutively and processed by the same worker thread (keeping the
+    // ChunkSampler's per-thread cache warm).  Within each chunk group,
+    // center-first ordering ensures the most important tiles render first.
     auto visibleKeys = _tileScene->visibleTiles(viewportRect, tiled_config::VISIBLE_BUFFER_TILES);
+    // Compute chunk group size in tile units.  Chunk XY is typically 128
+    // voxels; at pyramid level dsScaleIdx the effective chunk covers
+    // 128 * 2^dsScaleIdx surface units.  Each tile covers worldTileSize
+    // surface units.  Group tiles that fall within the same chunk.
+    int chunkGroupSize = 4;  // default: group 4x4 tiles
+    if (volume && volume->tieredCache()) {
+        auto cs = volume->tieredCache()->chunkShape(camera.dsScaleIdx);
+        float worldTileSize = _tileScene->bounds().worldTileSize;
+        if (worldTileSize > 0) {
+            // cs is {z,y,x}; use XY chunk extent in surface parameter units
+            chunkGroupSize = std::max(1, static_cast<int>(cs[1] / worldTileSize));
+        }
+    }
     {
         float vcx = static_cast<float>(viewportRect.center().x()) / TileScene::TILE_PX;
         float vcy = static_cast<float>(viewportRect.center().y()) / TileScene::TILE_PX;
+        int cgs = chunkGroupSize;
+        // Floor-division helper for correct grouping with negative tile coords
+        auto floorDiv = [](int a, int b) { return (a >= 0) ? a / b : (a - b + 1) / b; };
         std::sort(visibleKeys.begin(), visibleKeys.end(),
-            [vcx, vcy](const WorldTileKey& a, const WorldTileKey& b) {
+            [vcx, vcy, cgs, floorDiv](const WorldTileKey& a, const WorldTileKey& b) {
+                // Primary key: chunk group — tiles in the same chunk group
+                // are submitted consecutively to the pool.
+                int gaCol = floorDiv(a.worldCol, cgs);
+                int gaRow = floorDiv(a.worldRow, cgs);
+                int gbCol = floorDiv(b.worldCol, cgs);
+                int gbRow = floorDiv(b.worldRow, cgs);
+                if (gaCol != gbCol || gaRow != gbRow) {
+                    // Chunk group closer to viewport center wins
+                    float gaCx = gaCol * cgs + cgs * 0.5f;
+                    float gaCy = gaRow * cgs + cgs * 0.5f;
+                    float gbCx = gbCol * cgs + cgs * 0.5f;
+                    float gbCy = gbRow * cgs + cgs * 0.5f;
+                    float dga = (gaCx - vcx) * (gaCx - vcx) + (gaCy - vcy) * (gaCy - vcy);
+                    float dgb = (gbCx - vcx) * (gbCx - vcx) + (gbCy - vcy) * (gbCy - vcy);
+                    return dga < dgb;
+                }
+                // Secondary: center-distance within the group
                 float da = (a.worldCol - vcx) * (a.worldCol - vcx)
                          + (a.worldRow - vcy) * (a.worldRow - vcy);
                 float db = (b.worldCol - vcx) * (b.worldCol - vcx)
@@ -108,6 +144,7 @@ void TileRenderController::onCameraChanged(
     const uint64_t epoch = _currentEpoch->load(std::memory_order_relaxed);
     int syncFillCount = 0;
     constexpr int kMaxSyncFills = 4;  // cap to avoid blocking UI thread
+    int submitOrder = 0;  // encodes chunk-grouped spatial locality in priority
 
     for (const auto& wk : visibleKeys) {
         SliceCacheKey cacheKey = SliceCacheKey::make(wk, camera, _paramsHash);
@@ -150,8 +187,12 @@ void TileRenderController::onCameraChanged(
         // Submit to background pool for full-quality render (skip duplicates)
         if (_inFlightTiles.find(wk) == _inFlightTiles.end()) {
             TileRenderParams params = buildParams(wk);
+            // Priority: primary = pyramid level (coarser first, negative),
+            // secondary = submission order (preserves chunk-grouped sort).
+            params.submitPriority = -params.dsScaleIdx * 10000 + submitOrder;
             _renderPool->submit(params, surface, volume, _currentEpoch, _controllerId);
             _inFlightTiles.insert(wk);
+            ++submitOrder;
         }
     }
 }
@@ -302,6 +343,9 @@ void TileRenderController::tick()
                     if (_inFlightTiles.count(wk)) continue;
                     TileRenderParams params = _lastBuildParams(wk);
                     params.epoch = epoch;
+                    // Refinement uses low priority (high value) so it
+                    // doesn't compete with fresh camera-change renders.
+                    params.submitPriority = 1000 + submitted;
                     _renderPool->submit(params, _lastSurface, _lastVolume, _currentEpoch, _controllerId);
                     _inFlightTiles.insert(wk);
                     ++submitted;

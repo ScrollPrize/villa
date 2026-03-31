@@ -3,12 +3,12 @@
 // Video codec compression for 3D cubic chunks.
 //
 // A 3D chunk of shape (Z, Y, X) is encoded as a Z-frame grayscale video
-// sequence using H.264 (OpenH264), with H.265 and AV1 support planned.
+// sequence using H.265 (x265), with AV1 support planned.
 //
 // Encoding: voxel values become the Y (luma) plane; U/V are set to 128.
 // Decoding: Y plane is extracted back to voxel values; U/V are discarded.
 //
-// H.264 requires dimensions to be multiples of 2 (and ideally 16 for
+// H.265 requires dimensions to be multiples of 2 (and ideally 16 for
 // macroblock alignment). Chunks with odd dimensions are padded during
 // encoding and cropped on decode.
 
@@ -22,14 +22,13 @@
 namespace utils {
 
 enum class VideoCodecType {
-    H264,
-    H265,
-    AV1,
-    C3D,  // compress3d: 3D DCT + rANS, native 32³ blocks
+    H265 = 1,
+    AV1 = 2,
+    C3D = 3,  // compress3d: 3D DCT + rANS, native 32³ blocks
 };
 
 struct VideoCodecParams {
-    VideoCodecType type = VideoCodecType::H264;
+    VideoCodecType type = VideoCodecType::H265;
 
     // Quantization parameter (0-51). Lower = better quality, larger output.
     // 0 = lossless (if codec supports it), 26 = default, 51 = worst quality.

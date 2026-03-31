@@ -169,20 +169,20 @@ namespace perf {
 
     // Video codec recompression for remote streaming
     constexpr auto VIDEO_RECOMPRESS_ENABLED = "perf/video_recompress_enabled";
-    constexpr auto VIDEO_CODEC_TYPE = "perf/video_codec_type";  // 0=H264, 1=H265, 3=C3D
+    constexpr auto VIDEO_CODEC_TYPE = "perf/video_codec_type";  // 1=H265, 3=C3D
     constexpr auto VIDEO_QUALITY_PRESET = "perf/video_quality_preset";
 
     constexpr auto VIDEO_RECHUNK_32 = "perf/video_rechunk_32";
 
-    constexpr bool VIDEO_RECOMPRESS_ENABLED_DEFAULT = false;
-    constexpr int VIDEO_CODEC_TYPE_DEFAULT = 0;  // H264
+    constexpr bool VIDEO_RECOMPRESS_ENABLED_DEFAULT = true;
+    constexpr int VIDEO_CODEC_TYPE_DEFAULT = 1;  // H265
     constexpr int VIDEO_QUALITY_PRESET_DEFAULT = 3;  // Balanced
     constexpr bool VIDEO_RECHUNK_32_DEFAULT = false;
 
     // Quality preset → per-codec QP mapping
     // Index: 0=Lossless, 1=Near-lossless, 2=High, 3=Balanced, 4=Compact, 5=Max compression
     constexpr int PRESET_COUNT = 6;
-    // H.264/H.265/AV1 QP values (0=lossless uses 0)
+    // H.265/AV1 QP values (0=lossless uses 0)
     constexpr int PRESET_VIDEO_QP[PRESET_COUNT] = {0, 18, 22, 28, 35, 42};
     // C3D size divisor shift: 0=lossless, 1=lossless/2, 2=/4, 3=/8, 4=/16, 5=/32
     constexpr int PRESET_C3D_QUALITY[PRESET_COUNT] = {0, 1, 2, 3, 4, 5};
