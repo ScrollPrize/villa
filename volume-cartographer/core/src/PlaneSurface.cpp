@@ -6,6 +6,12 @@
 #include <cmath>
 #include <limits>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 namespace {
 
 //NOTE we have 3 coordinate systems. Nominal (voxel volume) coordinates, internal relative (ptr) coords (where _center is at 0/0) and internal absolute (_points) coordinates where the upper left corner is at 0/0.
@@ -219,12 +225,83 @@ void PlaneSurface::gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals
 #pragma omp parallel for
     for(int j=0;j<h;j++) {
         cv::Vec3f row_base = vy_base + vy_step * static_cast<float>(j) + x_start;
-        cv::Vec3f *row = coords->ptr<cv::Vec3f>(j);
+        float *row = reinterpret_cast<float*>(coords->ptr<cv::Vec3f>(j));
+
+#if defined(__aarch64__)
+        // NEON: process 4 pixels per iteration
+        float32x4_t base_x = vdupq_n_f32(row_base[0]);
+        float32x4_t base_y = vdupq_n_f32(row_base[1]);
+        float32x4_t base_z = vdupq_n_f32(row_base[2]);
+        float32x4_t step_x = vdupq_n_f32(vx_step[0]);
+        float32x4_t step_y = vdupq_n_f32(vx_step[1]);
+        float32x4_t step_z = vdupq_n_f32(vx_step[2]);
+        float32x4_t idx4 = {0.f, 1.f, 2.f, 3.f};
+        float32x4_t four = vdupq_n_f32(4.f);
+
+        int i = 0;
+        for (; i + 3 < w; i += 4) {
+            float32x4_t px = vmlaq_f32(base_x, idx4, step_x);
+            float32x4_t py = vmlaq_f32(base_y, idx4, step_y);
+            float32x4_t pz = vmlaq_f32(base_z, idx4, step_z);
+            float32x4x3_t out = {px, py, pz};
+            vst3q_f32(row + i * 3, out);
+            idx4 = vaddq_f32(idx4, four);
+        }
+        // Scalar tail
+        for (; i < w; i++) {
+            float fi = static_cast<float>(i);
+            row[i*3+0] = row_base[0] + fi * vx_step[0];
+            row[i*3+1] = row_base[1] + fi * vx_step[1];
+            row[i*3+2] = row_base[2] + fi * vx_step[2];
+        }
+
+#elif defined(__x86_64__)
+        // SSE: process 4 pixels per iteration
+        __m128 base_x = _mm_set1_ps(row_base[0]);
+        __m128 base_y = _mm_set1_ps(row_base[1]);
+        __m128 base_z = _mm_set1_ps(row_base[2]);
+        __m128 step_x = _mm_set1_ps(vx_step[0]);
+        __m128 step_y = _mm_set1_ps(vx_step[1]);
+        __m128 step_z = _mm_set1_ps(vx_step[2]);
+        __m128 idx4 = _mm_set_ps(3.f, 2.f, 1.f, 0.f);
+        __m128 four = _mm_set1_ps(4.f);
+
+        int i = 0;
+        for (; i + 3 < w; i += 4) {
+            __m128 px = _mm_add_ps(base_x, _mm_mul_ps(idx4, step_x));
+            __m128 py = _mm_add_ps(base_y, _mm_mul_ps(idx4, step_y));
+            __m128 pz = _mm_add_ps(base_z, _mm_mul_ps(idx4, step_z));
+            // Interleave x,y,z for 4 Vec3f: need to produce [x0,y0,z0, x1,y1,z1, ...]
+            // Transpose from SOA to AOS
+            // px = [x0, x1, x2, x3], py = [y0, y1, y2, y3], pz = [z0, z1, z2, z3]
+            float xs[4], ys[4], zs[4];
+            _mm_storeu_ps(xs, px);
+            _mm_storeu_ps(ys, py);
+            _mm_storeu_ps(zs, pz);
+            float *dst = row + i * 3;
+            dst[0]  = xs[0]; dst[1]  = ys[0]; dst[2]  = zs[0];
+            dst[3]  = xs[1]; dst[4]  = ys[1]; dst[5]  = zs[1];
+            dst[6]  = xs[2]; dst[7]  = ys[2]; dst[8]  = zs[2];
+            dst[9]  = xs[3]; dst[10] = ys[3]; dst[11] = zs[3];
+            idx4 = _mm_add_ps(idx4, four);
+        }
+        // Scalar tail
+        for (; i < w; i++) {
+            float fi = static_cast<float>(i);
+            row[i*3+0] = row_base[0] + fi * vx_step[0];
+            row[i*3+1] = row_base[1] + fi * vx_step[1];
+            row[i*3+2] = row_base[2] + fi * vx_step[2];
+        }
+
+#else
+        // Scalar fallback
         cv::Vec3f cur = row_base;
+        cv::Vec3f *rowv = reinterpret_cast<cv::Vec3f*>(row);
         for(int i=0;i<w;i++) {
-            row[i] = cur;
+            rowv[i] = cur;
             cur += vx_step;
         }
+#endif
     }
 }
 

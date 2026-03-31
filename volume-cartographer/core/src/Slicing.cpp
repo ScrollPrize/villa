@@ -21,6 +21,12 @@
 #include <unordered_set>
 #include <omp.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 
 // ============================================================================
 // CacheParams — extract dataset constants once (ZYX ordering)
@@ -220,6 +226,12 @@ struct ChunkSampler {
         data = v.data;
         lastKey = key;
 
+        // Prefetch chunk data into L1 cache
+        if (data) {
+            __builtin_prefetch(data, 0, 3);
+            __builtin_prefetch(reinterpret_cast<const char*>(data) + 64, 0, 3);
+        }
+
         // Insert into hash table
         int ih = hashIdx(key);
         for (int probe = 0; probe < kHashSlots; probe++) {
@@ -255,7 +267,11 @@ struct ChunkSampler {
         updateChunk(ciz, ciy, cix);
         if (__builtin_expect(!data, 0)) return 0;
 
-        return data[static_cast<size_t>(lz) * s0 + static_cast<size_t>(ly) * s1 + lx];
+        size_t offset = static_cast<size_t>(lz) * s0 + static_cast<size_t>(ly) * s1 + lx;
+        T val = data[offset];
+        // Speculatively prefetch next pixel's data (likely adjacent in x)
+        __builtin_prefetch(data + offset + 1, 0, 1);
+        return val;
     }
 
     T sampleInt(int iz, int iy, int ix) {
@@ -545,25 +561,333 @@ static void readVolumeImpl(
         for (int y = yStart; y < yEnd; y++) {
             const auto* coordRow = coords.template ptr<cv::Vec3f>(y);
             auto* outRow = out.template ptr<T>(y);
-            for (int x = 0; x < w; x++) {
-                float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
 
-                if (numLayers == 1) {
-                    // Single-sample path
-                    if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0)) continue;
+            if (numLayers == 1) {
+                // ============================================================
+                // Single-sample path — optimized per SampleMode
+                // ============================================================
+                if constexpr (Mode == SampleMode::Trilinear) {
+                    const float* rawCoords = reinterpret_cast<const float*>(coordRow);
 
-                    if constexpr (Mode == SampleMode::Trilinear) {
-                        if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
-                        float v = sampler.sampleTrilinearFast(base_vz, base_vy, base_vx);
-                        if constexpr (std::is_same_v<T, uint16_t>) {
-                            if (v < 0.f) v = 0.f;
-                            if (v > 65535.f) v = 65535.f;
-                            outRow[x] = static_cast<uint16_t>(v + 0.5f);
-                        } else {
-                            outRow[x] = static_cast<T>(v);
+                    // Row-level same-chunk check: if first and last pixel
+                    // (including +1 trilinear corners) map to the same chunk,
+                    // skip all updateChunk calls for the entire row.
+                    bool rowSingleChunk = false;
+                    int rowCiz = 0, rowCiy = 0, rowCix = 0;
+                    if (w > 1) {
+                        float r0x = coordRow[0][0], r0y = coordRow[0][1], r0z = coordRow[0][2];
+                        float rEx = coordRow[w-1][0], rEy = coordRow[w-1][1], rEz = coordRow[w-1][2];
+                        if (r0z >= 0 && r0y >= 0 && r0x >= 0 &&
+                            rEz >= 0 && rEy >= 0 && rEx >= 0 &&
+                            r0z + 1 < p.sz && r0y + 1 < p.sy && r0x + 1 < p.sx &&
+                            rEz + 1 < p.sz && rEy + 1 < p.sy && rEx + 1 < p.sx) {
+                            int iz0 = static_cast<int>(r0z), iy0 = static_cast<int>(r0y), ix0 = static_cast<int>(r0x);
+                            int izE = static_cast<int>(rEz), iyE = static_cast<int>(rEy), ixE = static_cast<int>(rEx);
+                            int ciz0 = p.chunkZ(iz0), ciy0 = p.chunkY(iy0), cix0 = p.chunkX(ix0);
+                            int ciz1 = p.chunkZ(izE + 1), ciy1 = p.chunkY(iyE + 1), cix1 = p.chunkX(ixE + 1);
+                            if (ciz0 == ciz1 && ciy0 == ciy1 && cix0 == cix1) {
+                                rowSingleChunk = true;
+                                rowCiz = ciz0; rowCiy = ciy0; rowCix = cix0;
+                            }
                         }
-                    } else if constexpr (Mode == SampleMode::Tricubic) {
-                        if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                    }
+
+                    if (rowSingleChunk) {
+                        // Entire row in one chunk — single updateChunk, direct access
+                        sampler.updateChunk(rowCiz, rowCiy, rowCix);
+                        if (sampler.data) {
+                            const T* chunkData = sampler.data;
+                            const size_t ls0 = sampler.s0, ls1 = sampler.s1;
+                            for (int x = 0; x < w; x++) {
+                                float vx = coordRow[x][0], vy = coordRow[x][1], vz = coordRow[x][2];
+                                if (!(vz >= 0 && vy >= 0 && vx >= 0 &&
+                                      vz < p.sz && vy < p.sy && vx < p.sx)) continue;
+
+                                int iz = static_cast<int>(vz);
+                                int iy = static_cast<int>(vy);
+                                int ix = static_cast<int>(vx);
+                                int lz0 = p.localZ(iz), ly0 = p.localY(iy), lx0 = p.localX(ix);
+
+                                float c000 = chunkData[lz0*ls0 + ly0*ls1 + lx0];
+                                float c100 = chunkData[(lz0+1)*ls0 + ly0*ls1 + lx0];
+                                float c010 = chunkData[lz0*ls0 + (ly0+1)*ls1 + lx0];
+                                float c110 = chunkData[(lz0+1)*ls0 + (ly0+1)*ls1 + lx0];
+                                float c001 = chunkData[lz0*ls0 + ly0*ls1 + (lx0+1)];
+                                float c101 = chunkData[(lz0+1)*ls0 + ly0*ls1 + (lx0+1)];
+                                float c011 = chunkData[lz0*ls0 + (ly0+1)*ls1 + (lx0+1)];
+                                float c111 = chunkData[(lz0+1)*ls0 + (ly0+1)*ls1 + (lx0+1)];
+
+                                float fz = vz - iz, fy = vy - iy, fx = vx - ix;
+                                float c00 = std::fma(fx, c001 - c000, c000);
+                                float c01 = std::fma(fx, c011 - c010, c010);
+                                float c10 = std::fma(fx, c101 - c100, c100);
+                                float c11 = std::fma(fx, c111 - c110, c110);
+                                float c0 = std::fma(fy, c01 - c00, c00);
+                                float c1 = std::fma(fy, c11 - c10, c10);
+                                float v = std::fma(fz, c1 - c0, c0);
+
+                                if constexpr (std::is_same_v<T, uint16_t>) {
+                                    if (v < 0.f) v = 0.f;
+                                    if (v > 65535.f) v = 65535.f;
+                                    outRow[x] = static_cast<uint16_t>(v + 0.5f);
+                                } else {
+                                    outRow[x] = static_cast<T>(v);
+                                }
+                            }
+                        }
+                        // if data was null, output stays zero-initialized
+                    } else {
+                        // Multi-chunk path: SIMD batch of 4 pixels
+                        int x = 0;
+
+#if defined(__aarch64__)
+                        // NEON: process 4 pixels at a time
+                        const int32x4_t negCxShift = vdupq_n_s32(-p.cxShift);
+                        const int32x4_t negCyShift = vdupq_n_s32(-p.cyShift);
+                        const int32x4_t negCzShift = vdupq_n_s32(-p.czShift);
+                        for (; x + 3 < w; x += 4) {
+                            // vld3q_f32 deinterleaves 4 Vec3f into separate x,y,z
+                            float32x4x3_t xyz = vld3q_f32(rawCoords + x * 3);
+                            float32x4_t vx4 = xyz.val[0];
+                            float32x4_t vy4 = xyz.val[1];
+                            float32x4_t vz4 = xyz.val[2];
+
+                            // Bounds check: all >= 0 and < size
+                            uint32x4_t geZero = vandq_u32(vandq_u32(
+                                vcgeq_f32(vx4, vdupq_n_f32(0.0f)),
+                                vcgeq_f32(vy4, vdupq_n_f32(0.0f))),
+                                vcgeq_f32(vz4, vdupq_n_f32(0.0f)));
+                            uint32x4_t ltSize = vandq_u32(vandq_u32(
+                                vcltq_f32(vx4, vdupq_n_f32(static_cast<float>(p.sx))),
+                                vcltq_f32(vy4, vdupq_n_f32(static_cast<float>(p.sy)))),
+                                vcltq_f32(vz4, vdupq_n_f32(static_cast<float>(p.sz))));
+                            uint32x4_t validMask = vandq_u32(geZero, ltSize);
+
+                            if (vmaxvq_u32(validMask) == 0) continue;
+
+                            // Floor to int for chunk index computation
+                            int32x4_t ix4 = vcvtq_s32_f32(vx4);
+                            int32x4_t iy4 = vcvtq_s32_f32(vy4);
+                            int32x4_t iz4 = vcvtq_s32_f32(vz4);
+
+                            // Chunk indices (vshlq with negative = right shift)
+                            int32x4_t cix4, ciy4, ciz4;
+                            if (p.pow2) {
+                                cix4 = vshlq_s32(ix4, negCxShift);
+                                ciy4 = vshlq_s32(iy4, negCyShift);
+                                ciz4 = vshlq_s32(iz4, negCzShift);
+                                // Also check +1 corners
+                                int32x4_t ones = vdupq_n_s32(1);
+                                int32x4_t cix4_1 = vshlq_s32(vaddq_s32(ix4, ones), negCxShift);
+                                int32x4_t ciy4_1 = vshlq_s32(vaddq_s32(iy4, ones), negCyShift);
+                                int32x4_t ciz4_1 = vshlq_s32(vaddq_s32(iz4, ones), negCzShift);
+
+                                // Extract all chunk indices to scalar for comparison
+                                int cixArr[4], ciyArr[4], cizArr[4];
+                                int cixArr1[4], ciyArr1[4], cizArr1[4];
+                                vst1q_s32(cixArr, cix4); vst1q_s32(ciyArr, ciy4); vst1q_s32(cizArr, ciz4);
+                                vst1q_s32(cixArr1, cix4_1); vst1q_s32(ciyArr1, ciy4_1); vst1q_s32(cizArr1, ciz4_1);
+
+                                uint32_t vmask[4];
+                                vst1q_u32(vmask, validMask);
+
+                                // Check if all valid pixels are in the same chunk
+                                bool allSame = true;
+                                bool allValid = true;
+                                for (int k = 0; k < 4; k++) {
+                                    if (!vmask[k]) { allValid = false; continue; }
+                                    if (cixArr[k] != cixArr[0] || ciyArr[k] != ciyArr[0] || cizArr[k] != cizArr[0] ||
+                                        cixArr1[k] != cixArr[0] || ciyArr1[k] != ciyArr[0] || cizArr1[k] != cizArr[0]) {
+                                        allSame = false; break;
+                                    }
+                                }
+
+                                if (allValid && allSame) {
+                                    // All 4 valid, same chunk — batch sample
+                                    sampler.updateChunk(cizArr[0], ciyArr[0], cixArr[0]);
+                                    if (sampler.data) {
+                                        const T* cd = sampler.data;
+                                        const size_t ls0 = sampler.s0, ls1 = sampler.s1;
+                                        float fvxArr[4], fvyArr[4], fvzArr[4];
+                                        vst1q_f32(fvxArr, vx4); vst1q_f32(fvyArr, vy4); vst1q_f32(fvzArr, vz4);
+                                        for (int k = 0; k < 4; k++) {
+                                            int iz = static_cast<int>(fvzArr[k]), iy = static_cast<int>(fvyArr[k]), ix = static_cast<int>(fvxArr[k]);
+                                            int lz0 = iz & p.czMask, ly0 = iy & p.cyMask, lx0 = ix & p.cxMask;
+                                            float c000 = cd[lz0*ls0 + ly0*ls1 + lx0];
+                                            float c100 = cd[(lz0+1)*ls0 + ly0*ls1 + lx0];
+                                            float c010 = cd[lz0*ls0 + (ly0+1)*ls1 + lx0];
+                                            float c110 = cd[(lz0+1)*ls0 + (ly0+1)*ls1 + lx0];
+                                            float c001 = cd[lz0*ls0 + ly0*ls1 + (lx0+1)];
+                                            float c101 = cd[(lz0+1)*ls0 + ly0*ls1 + (lx0+1)];
+                                            float c011 = cd[lz0*ls0 + (ly0+1)*ls1 + (lx0+1)];
+                                            float c111 = cd[(lz0+1)*ls0 + (ly0+1)*ls1 + (lx0+1)];
+                                            float fz = fvzArr[k] - iz, fy = fvyArr[k] - iy, fx = fvxArr[k] - ix;
+                                            float rc00 = std::fma(fx, c001 - c000, c000);
+                                            float rc01 = std::fma(fx, c011 - c010, c010);
+                                            float rc10 = std::fma(fx, c101 - c100, c100);
+                                            float rc11 = std::fma(fx, c111 - c110, c110);
+                                            float rc0 = std::fma(fy, rc01 - rc00, rc00);
+                                            float rc1 = std::fma(fy, rc11 - rc10, rc10);
+                                            float v = std::fma(fz, rc1 - rc0, rc0);
+                                            if constexpr (std::is_same_v<T, uint16_t>) {
+                                                if (v < 0.f) v = 0.f;
+                                                if (v > 65535.f) v = 65535.f;
+                                                outRow[x + k] = static_cast<uint16_t>(v + 0.5f);
+                                            } else {
+                                                outRow[x + k] = static_cast<T>(v);
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            // NEON fallback: process 4 pixels individually
+                            for (int k = 0; k < 4; k++) {
+                                float fvx = rawCoords[(x+k)*3], fvy = rawCoords[(x+k)*3+1], fvz = rawCoords[(x+k)*3+2];
+                                if (!(fvz >= 0 && fvy >= 0 && fvx >= 0 &&
+                                      fvz < p.sz && fvy < p.sy && fvx < p.sx)) continue;
+                                float v = sampler.sampleTrilinearFast(fvz, fvy, fvx);
+                                if constexpr (std::is_same_v<T, uint16_t>) {
+                                    if (v < 0.f) v = 0.f;
+                                    if (v > 65535.f) v = 65535.f;
+                                    outRow[x + k] = static_cast<uint16_t>(v + 0.5f);
+                                } else {
+                                    outRow[x + k] = static_cast<T>(v);
+                                }
+                            }
+                        }
+#elif defined(__x86_64__)
+                        // SSE: process 4 pixels at a time
+                        for (; x + 3 < w; x += 4) {
+                            // Load 12 floats (4 Vec3f), deinterleave to x,y,z
+                            const float* base = rawCoords + x * 3;
+                            float xs[4] = { base[0], base[3], base[6], base[9] };
+                            float ys[4] = { base[1], base[4], base[7], base[10] };
+                            float zs[4] = { base[2], base[5], base[8], base[11] };
+                            __m128 vx4 = _mm_loadu_ps(xs);
+                            __m128 vy4 = _mm_loadu_ps(ys);
+                            __m128 vz4 = _mm_loadu_ps(zs);
+
+                            // Bounds check
+                            __m128 zero = _mm_setzero_ps();
+                            __m128 geZero = _mm_and_ps(_mm_and_ps(
+                                _mm_cmpge_ps(vx4, zero), _mm_cmpge_ps(vy4, zero)),
+                                _mm_cmpge_ps(vz4, zero));
+                            __m128 ltSize = _mm_and_ps(_mm_and_ps(
+                                _mm_cmplt_ps(vx4, _mm_set1_ps(static_cast<float>(p.sx))),
+                                _mm_cmplt_ps(vy4, _mm_set1_ps(static_cast<float>(p.sy)))),
+                                _mm_cmplt_ps(vz4, _mm_set1_ps(static_cast<float>(p.sz))));
+                            int validBits = _mm_movemask_ps(_mm_and_ps(geZero, ltSize));
+
+                            if (validBits == 0) continue;
+
+                            // Floor to int for chunk index
+                            __m128i ix4 = _mm_cvttps_epi32(vx4);
+                            __m128i iy4 = _mm_cvttps_epi32(vy4);
+                            __m128i iz4 = _mm_cvttps_epi32(vz4);
+
+                            if (p.pow2 && validBits == 0xF) {
+                                // All 4 valid — check same chunk
+                                // _mm_sra_epi32 takes shift count in low 64 bits of __m128i
+                                __m128i cxShiftV = _mm_cvtsi32_si128(p.cxShift);
+                                __m128i cyShiftV = _mm_cvtsi32_si128(p.cyShift);
+                                __m128i czShiftV = _mm_cvtsi32_si128(p.czShift);
+                                __m128i cix4 = _mm_sra_epi32(ix4, cxShiftV);
+                                __m128i ciy4 = _mm_sra_epi32(iy4, cyShiftV);
+                                __m128i ciz4 = _mm_sra_epi32(iz4, czShiftV);
+                                __m128i ones = _mm_set1_epi32(1);
+                                __m128i cix4_1 = _mm_sra_epi32(_mm_add_epi32(ix4, ones), cxShiftV);
+                                __m128i ciy4_1 = _mm_sra_epi32(_mm_add_epi32(iy4, ones), cyShiftV);
+                                __m128i ciz4_1 = _mm_sra_epi32(_mm_add_epi32(iz4, ones), czShiftV);
+
+                                // Broadcast lane 0 and compare all
+                                __m128i cx0 = _mm_shuffle_epi32(cix4, 0);
+                                __m128i cy0 = _mm_shuffle_epi32(ciy4, 0);
+                                __m128i cz0 = _mm_shuffle_epi32(ciz4, 0);
+
+                                __m128i same = _mm_and_si128(
+                                    _mm_and_si128(_mm_cmpeq_epi32(cix4, cx0), _mm_cmpeq_epi32(ciy4, cy0)),
+                                    _mm_cmpeq_epi32(ciz4, cz0));
+                                __m128i same1 = _mm_and_si128(
+                                    _mm_and_si128(_mm_cmpeq_epi32(cix4_1, cx0), _mm_cmpeq_epi32(ciy4_1, cy0)),
+                                    _mm_cmpeq_epi32(ciz4_1, cz0));
+                                int allSameMask = _mm_movemask_epi8(_mm_and_si128(same, same1));
+
+                                if (allSameMask == 0xFFFF) {
+                                    int ciz0v = _mm_cvtsi128_si32(ciz4);
+                                    int ciy0v = _mm_cvtsi128_si32(ciy4);
+                                    int cix0v = _mm_cvtsi128_si32(cix4);
+                                    sampler.updateChunk(ciz0v, ciy0v, cix0v);
+                                    if (sampler.data) {
+                                        const T* cd = sampler.data;
+                                        const size_t ls0 = sampler.s0, ls1 = sampler.s1;
+                                        for (int k = 0; k < 4; k++) {
+                                            int iz = static_cast<int>(zs[k]), iy = static_cast<int>(ys[k]), ix = static_cast<int>(xs[k]);
+                                            int lz0 = iz & p.czMask, ly0 = iy & p.cyMask, lx0 = ix & p.cxMask;
+                                            float c000 = cd[lz0*ls0 + ly0*ls1 + lx0];
+                                            float c100 = cd[(lz0+1)*ls0 + ly0*ls1 + lx0];
+                                            float c010 = cd[lz0*ls0 + (ly0+1)*ls1 + lx0];
+                                            float c110 = cd[(lz0+1)*ls0 + (ly0+1)*ls1 + lx0];
+                                            float c001 = cd[lz0*ls0 + ly0*ls1 + (lx0+1)];
+                                            float c101 = cd[(lz0+1)*ls0 + ly0*ls1 + (lx0+1)];
+                                            float c011 = cd[lz0*ls0 + (ly0+1)*ls1 + (lx0+1)];
+                                            float c111 = cd[(lz0+1)*ls0 + (ly0+1)*ls1 + (lx0+1)];
+                                            float fz = zs[k] - iz, fy = ys[k] - iy, fx = xs[k] - ix;
+                                            float rc00 = std::fma(fx, c001 - c000, c000);
+                                            float rc01 = std::fma(fx, c011 - c010, c010);
+                                            float rc10 = std::fma(fx, c101 - c100, c100);
+                                            float rc11 = std::fma(fx, c111 - c110, c110);
+                                            float rc0 = std::fma(fy, rc01 - rc00, rc00);
+                                            float rc1 = std::fma(fy, rc11 - rc10, rc10);
+                                            float v = std::fma(fz, rc1 - rc0, rc0);
+                                            if constexpr (std::is_same_v<T, uint16_t>) {
+                                                if (v < 0.f) v = 0.f;
+                                                if (v > 65535.f) v = 65535.f;
+                                                outRow[x + k] = static_cast<uint16_t>(v + 0.5f);
+                                            } else {
+                                                outRow[x + k] = static_cast<T>(v);
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            // SSE fallback: process 4 pixels individually
+                            for (int k = 0; k < 4; k++) {
+                                if (!(validBits & (1 << k))) continue;
+                                float v = sampler.sampleTrilinearFast(zs[k], ys[k], xs[k]);
+                                if constexpr (std::is_same_v<T, uint16_t>) {
+                                    if (v < 0.f) v = 0.f;
+                                    if (v > 65535.f) v = 65535.f;
+                                    outRow[x + k] = static_cast<uint16_t>(v + 0.5f);
+                                } else {
+                                    outRow[x + k] = static_cast<T>(v);
+                                }
+                            }
+                        }
+#endif
+                        // Scalar tail for remaining pixels (and entire loop on non-SIMD platforms)
+                        for (; x < w; x++) {
+                            float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
+                            if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0 &&
+                                  base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                            float v = sampler.sampleTrilinearFast(base_vz, base_vy, base_vx);
+                            if constexpr (std::is_same_v<T, uint16_t>) {
+                                if (v < 0.f) v = 0.f;
+                                if (v > 65535.f) v = 65535.f;
+                                outRow[x] = static_cast<uint16_t>(v + 0.5f);
+                            } else {
+                                outRow[x] = static_cast<T>(v);
+                            }
+                        }
+                    }
+                } else if constexpr (Mode == SampleMode::Tricubic) {
+                    for (int x = 0; x < w; x++) {
+                        float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
+                        if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0 &&
+                              base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
                         float v = sampler.sampleTricubic(base_vz, base_vy, base_vx);
                         if constexpr (std::is_same_v<T, uint16_t>) {
                             if (v < 0.f) v = 0.f;
@@ -572,13 +896,23 @@ static void readVolumeImpl(
                         } else {
                             outRow[x] = static_cast<T>(v);
                         }
-                    } else {
-                        if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                    }
+                } else {
+                    // Nearest
+                    for (int x = 0; x < w; x++) {
+                        float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
+                        if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0 &&
+                              base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
                         if ((static_cast<int>(base_vz + 0.5f) | static_cast<int>(base_vy + 0.5f) | static_cast<int>(base_vx + 0.5f)) < 0) continue;
                         outRow[x] = sampler.sampleNearest(base_vz, base_vy, base_vx);
                     }
-                } else {
-                    // Composite path
+                }
+            } else {
+                // ============================================================
+                // Composite path (multi-layer) — per-pixel, no SIMD
+                // ============================================================
+                for (int x = 0; x < w; x++) {
+                    float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
                     if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0)) continue;
 
                     cv::Vec3f n = getNormal(y, x);
