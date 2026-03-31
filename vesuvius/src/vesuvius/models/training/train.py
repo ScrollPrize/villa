@@ -974,6 +974,7 @@ class BaseTrainer:
         dl_kwargs = {}
         if self.mgr.train_num_dataloader_workers and self.mgr.train_num_dataloader_workers > 0:
             dl_kwargs['prefetch_factor'] = 2
+            dl_kwargs['persistent_workers'] = True
 
         train_dataloader = DataLoader(
             train_subset,
@@ -1823,7 +1824,8 @@ class BaseTrainer:
                                     
                                     # Check for custom debug visualization (e.g., self-supervised trainers)
                                     custom_debug_method = getattr(self, '_save_lejepa_debug', None)
-                                    if custom_debug_method is not None:
+                                    save_debug_media = bool(getattr(self.mgr, 'save_gifs', True))
+                                    if custom_debug_method is not None and save_debug_media:
                                         saved_path = custom_debug_method(debug_img_path, epoch)
                                         if saved_path:
                                             debug_gif_history.append((epoch, saved_path))
@@ -1848,9 +1850,11 @@ class BaseTrainer:
                                             train_skeleton_dict=train_skeleton_dict,
                                             unlabeled_input=unlabeled_input,
                                             unlabeled_pseudo_dict=unlabeled_pseudo,
-                                            unlabeled_outputs_dict=unlabeled_pred
+                                            unlabeled_outputs_dict=unlabeled_pred,
+                                            save_media=save_debug_media,
                                         )
-                                        debug_gif_history.append((epoch, debug_img_path))
+                                        if save_debug_media:
+                                            debug_gif_history.append((epoch, debug_img_path))
 
                         loss_str = " | ".join([f"{t}: {np.mean(val_losses[t]):.4f}"
                                                for t in self.mgr.targets if len(val_losses[t]) > 0])
@@ -1935,7 +1939,7 @@ class BaseTrainer:
                     )
 
                     # Manage debug videos
-                    if epoch in [e for e, _ in debug_gif_history]:
+                    if getattr(self.mgr, 'save_gifs', True) and epoch in [e for e, _ in debug_gif_history]:
                         debug_gif_history, best_debug_gifs = manage_debug_gifs(
                             debug_gif_history=debug_gif_history,
                             best_debug_gifs=best_debug_gifs,
