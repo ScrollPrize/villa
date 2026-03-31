@@ -323,6 +323,71 @@ def convert_slice_to_bgr(
         raise ValueError(f"Expected 2D or 3D array, got shape {slice_2d_or_3d.shape}")
 
 
+def _target_volume_for_preview(arr_np: np.ndarray, is_2d_run: bool) -> Optional[np.ndarray]:
+    if is_2d_run:
+        return None
+    if arr_np.ndim == 4:
+        if arr_np.shape[0] == 1:
+            return arr_np[0]
+        if arr_np.shape[0] == 2:
+            return arr_np[1]
+        return np.argmax(arr_np, axis=0)
+    if arr_np.ndim == 3:
+        return arr_np
+    return None
+
+
+def _prediction_volume_for_preview(arr_np: np.ndarray, is_2d_run: bool) -> Optional[np.ndarray]:
+    if is_2d_run:
+        return None
+    if arr_np.ndim == 4:
+        if arr_np.shape[0] == 1:
+            return arr_np[0]
+        if arr_np.shape[0] >= 2:
+            return arr_np[1:].sum(axis=0)
+    if arr_np.ndim == 3:
+        return arr_np
+    return None
+
+
+def _choose_preview_slice_index(
+    input_array: np.ndarray,
+    targets_np: Dict[str, np.ndarray],
+    preds_np: Dict[str, np.ndarray],
+    *,
+    is_2d_run: bool,
+) -> Optional[int]:
+    if is_2d_run:
+        return None
+
+    if input_array.ndim == 3:
+        z_dim = input_array.shape[0]
+    elif input_array.ndim == 4:
+        z_dim = input_array.shape[1]
+    else:
+        return None
+
+    gt_scores = np.zeros(z_dim, dtype=np.float64)
+    for arr_np in targets_np.values():
+        volume = _target_volume_for_preview(arr_np, is_2d_run)
+        if volume is None or volume.ndim != 3:
+            continue
+        gt_scores += np.count_nonzero(volume > 0, axis=(1, 2))
+    if np.any(gt_scores > 0):
+        return int(gt_scores.argmax())
+
+    pred_scores = np.zeros(z_dim, dtype=np.float64)
+    for arr_np in preds_np.values():
+        volume = _prediction_volume_for_preview(arr_np, is_2d_run)
+        if volume is None or volume.ndim != 3:
+            continue
+        pred_scores += volume.astype(np.float32, copy=False).sum(axis=(1, 2))
+    if np.any(pred_scores > 0):
+        return int(pred_scores.argmax())
+
+    return int(max(z_dim // 2, 0))
+
+
 def save_debug(
     input_volume: torch.Tensor,          # shape [1, C, Z, H, W] for 3D or [1, C, H, W] for 2D
     targets_dict: dict,                 # e.g. {"sheet": tensor([1, Z, H, W]), "normals": tensor([3, Z, H, W])}
@@ -338,6 +403,8 @@ def save_debug(
     skeleton_dict: dict = None,         # Optional skeleton data for visualization
     train_skeleton_dict: dict = None,   # Optional train skeleton data
     apply_activation: bool = True,      # Whether to apply activation functions
+    save_media: bool = True,            # Whether to write GIF/PNG media to disk
+    preview_slice_index: Optional[int] = None,  # Preferred 3D slice for W&B preview
     # Unlabeled sample visualization for semi-supervised training
     unlabeled_input: torch.Tensor = None,       # Optional unlabeled sample input
     unlabeled_pseudo_dict: dict = None,         # Teacher predictions (pseudo-labels)
@@ -704,11 +771,11 @@ def save_debug(
         # Stack rows and save
         rows = _pad_rows_to_uniform_width(rows)
         final_img = np.vstack(rows)
-        out_dir = Path(save_path).parent
-        out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[Epoch {epoch}] Saving PNG to: {save_path}")
-        # Use PIL for saving
-        Image.fromarray(final_img).save(save_path)
+        if save_media:
+            out_dir = Path(save_path).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[Epoch {epoch}] Saving PNG to: {save_path}")
+            Image.fromarray(final_img).save(save_path)
 
         preview_img = np.ascontiguousarray(final_img, dtype=np.uint8)
         return None, preview_img
@@ -718,9 +785,19 @@ def save_debug(
         frames = []
         preview_frame = None
         z_dim = inp_np.shape[0] if inp_np.ndim == 3 else inp_np.shape[1]
-        mid_z_idx = max(z_dim // 2, 0)
+        if preview_slice_index is None:
+            preview_slice_index = _choose_preview_slice_index(
+                inp_np,
+                targets_np,
+                preds_np,
+                is_2d_run=is_2d,
+            )
+        if preview_slice_index is None:
+            preview_slice_index = max(z_dim // 2, 0)
+        preview_slice_index = int(max(0, min(preview_slice_index, z_dim - 1)))
+        z_indices = range(z_dim) if save_media else [preview_slice_index]
 
-        for z_idx in range(z_dim):
+        for z_idx in z_indices:
             rows = []
             
             # Get slices
@@ -882,9 +959,14 @@ def save_debug(
             frame = np.ascontiguousarray(frame, dtype=np.uint8)
             frames.append(frame)
 
-            if z_idx == mid_z_idx:
+            if z_idx == preview_slice_index:
                 preview_frame = frame.copy()
-        
+
+        if not save_media:
+            if preview_frame is None and frames:
+                preview_frame = frames[len(frames) // 2].copy()
+            return None, preview_frame
+
         # Save GIF in a subprocess to avoid crashing main training process on encoder segfaults
         out_dir = Path(save_path).parent
         out_dir.mkdir(parents=True, exist_ok=True)

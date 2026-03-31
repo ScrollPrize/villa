@@ -84,9 +84,6 @@ class ConfigManager:
             attr_name = "lejepa_lambda" if key == "lambda" else key
             setattr(self, attr_name, value)
 
-        # Load optional EMA config used by the base trainer.
-        self.ema_config = deepcopy(config.get("ema", {}) or {})
-
         self._init_attributes()
 
         if self.auxiliary_tasks and self.targets:
@@ -95,7 +92,6 @@ class ConfigManager:
         return config
 
     def _resolve_config_relative_path(self, raw_path):
-        """Resolve a config path relative to the config file location."""
         if raw_path in (None, ""):
             return None
 
@@ -129,14 +125,6 @@ class ConfigManager:
             next_index += 1
 
     def get_explicit_volume_specs(self):
-        """
-        Normalize dataset_config.volumes into explicit image/label path specs.
-
-        Supported entries include:
-        - {image: /path/to/image.zarr, label: /path/to/label.zarr, scale: 2}
-        - {image: ..., labels: {ink: /path/to/ink.zarr, surface: /path/to/surface.zarr}}
-        - /path/to/image_only_volume.zarr
-        """
         volumes_cfg = self.dataset_config.get("volumes")
         if not volumes_cfg:
             return []
@@ -195,12 +183,7 @@ class ConfigManager:
 
                 scale_raw = spec.get("scale", spec.get("ome_zarr_resolution"))
                 if scale_raw not in (None, ""):
-                    try:
-                        scale = int(scale_raw)
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError(
-                            f"Explicit volume '{volume_id}' has invalid scale {scale_raw!r}"
-                        ) from exc
+                    scale = int(scale_raw)
                     if scale < 0:
                         raise ValueError(
                             f"Explicit volume '{volume_id}' scale must be >= 0"
@@ -208,12 +191,7 @@ class ConfigManager:
 
                 dilate_raw = spec.get("dilate")
                 if dilate_raw not in (None, ""):
-                    try:
-                        dilate = float(dilate_raw)
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError(
-                            f"Explicit volume '{volume_id}' has invalid dilate value {dilate_raw!r}"
-                        ) from exc
+                    dilate = float(dilate_raw)
                     if dilate < 0:
                         raise ValueError(
                             f"Explicit volume '{volume_id}' dilate must be >= 0"
@@ -302,30 +280,26 @@ class ConfigManager:
         self.max_steps_per_epoch = int(self.tr_configs.get("max_steps_per_epoch", 250))
         self.max_val_steps_per_epoch = int(self.tr_configs.get("max_val_steps_per_epoch", 50))
         self.train_num_dataloader_workers = int(self.tr_configs.get("num_dataloader_workers", 8))
+        self.val_num_dataloader_workers = int(
+            self.tr_configs.get("val_num_dataloader_workers", self.train_num_dataloader_workers)
+        )
+        self.train_prefetch_factor = int(self.tr_configs.get("prefetch_factor", 2))
+        self.val_prefetch_factor = int(self.tr_configs.get("val_prefetch_factor", self.train_prefetch_factor))
+        self.persistent_workers = bool(self.tr_configs.get("persistent_workers", True))
+        self.val_persistent_workers = bool(
+            self.tr_configs.get("val_persistent_workers", self.persistent_workers)
+        )
+        self.log_every_n_steps = max(1, int(self.tr_configs.get("log_every_n_steps", 10)))
         self.max_epoch = int(self.tr_configs.get("max_epoch", 5000))
         self.val_every_n = int(self.tr_configs.get("val_every_n", 1))
         self.early_stopping_patience = int(self.tr_configs.get("early_stopping_patience", 0))
         self.optimizer = self.tr_configs.get("optimizer", "SGD")
         self.initial_lr = float(self.tr_configs.get("initial_lr", 0.01))
         self.weight_decay = float(self.tr_configs.get("weight_decay", 0.00003))
-
-        ema_cfg = deepcopy(getattr(self, "ema_config", {}) or {})
-        self.ema_enabled = bool(ema_cfg.get("enabled", False))
-        self.ema_decay = float(ema_cfg.get("decay", 0.999))
-        self.ema_start_step = int(ema_cfg.get("start_step", 0))
-        self.ema_update_every_steps = max(1, int(ema_cfg.get("update_every_steps", 1)))
-        self.ema_validate = bool(ema_cfg.get("validate", self.ema_enabled))
-        self.ema_save_in_checkpoint = bool(
-            ema_cfg.get("save_in_checkpoint", self.ema_enabled)
-        )
-        self.ema_config = {
-            "enabled": self.ema_enabled,
-            "decay": self.ema_decay,
-            "start_step": self.ema_start_step,
-            "update_every_steps": self.ema_update_every_steps,
-            "validate": self.ema_validate,
-            "save_in_checkpoint": self.ema_save_in_checkpoint,
-        }
+        self.numa_pin = str(self.tr_configs.get("numa_pin", "auto")).lower()
+        self.debug_visualization_every_n = int(self.tr_configs.get("debug_visualization_every_n", 0))
+        self.validation_preview_pool_size = int(self.tr_configs.get("validation_preview_pool_size", 32))
+        self.log_validation_preview = bool(self.tr_configs.get("log_validation_preview", True))
         
         ### Dataset config ###
         self.min_labeled_ratio = float(self.dataset_config.get("min_labeled_ratio", 0.10))
@@ -1007,7 +981,6 @@ class ConfigManager:
             "model_config": model_config,
             "dataset_config": dataset_config,
             "inference_config": inference_config,
-            "ema": deepcopy(getattr(self, "ema_config", {})),
         }
 
         return combined_config

@@ -9,7 +9,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
 from vesuvius.models.training.lr_schedulers import get_scheduler
-from torch.utils.data import DataLoader, SubsetRandomSampler, Subset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Sampler, SubsetRandomSampler, Subset, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.datasets import ZarrDataset
@@ -37,6 +37,27 @@ from vesuvius.models.evaluation.iou_dice import IOUDiceMetric
 from vesuvius.models.evaluation.voi import VOIMetric
 from contextlib import nullcontext
 from collections import deque, defaultdict
+import gc
+
+from vesuvius.models.training.numa import apply_numa_affinity
+
+
+class DistributedValidationSampler(Sampler[int]):
+    def __init__(self, dataset, num_replicas: int, rank: int, max_samples: int | None = None):
+        self.dataset = dataset
+        self.num_replicas = max(1, int(num_replicas))
+        self.rank = int(rank)
+        total_size = len(dataset)
+        if max_samples is not None and max_samples > 0:
+            total_size = min(total_size, int(max_samples))
+        self.global_indices = list(range(total_size))
+        self.indices = self.global_indices[self.rank::self.num_replicas]
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self):
+        return len(self.indices)
 
 
 
@@ -117,6 +138,11 @@ class BaseTrainer:
                     f"In DDP, number of GPUs in --gpus ({len(self.gpu_ids)}) must equal WORLD_SIZE ({self.world_size})."
                 )
 
+        self.numa_affinity = apply_numa_affinity(
+            getattr(self.mgr, 'numa_pin', 'auto'),
+            self.assigned_gpu_id,
+        )
+
         # Friendly prints
         if self.is_distributed and (not self.rank or self.rank == 0):
             if torch.cuda.is_available():
@@ -130,6 +156,12 @@ class BaseTrainer:
             else:
                 print(f"Using GPU {self.gpu_ids[0]}")
 
+        if self.numa_affinity is not None:
+            print(
+                f"Rank {self.rank} pinned to {self.numa_affinity['cpu_count']} CPUs "
+                f"for GPU {self.numa_affinity['gpu_id']}"
+            )
+
         # Default AMP dtype; resolved during training initialization
         self.amp_dtype = torch.float16
         self.amp_dtype_str = 'float16'
@@ -137,29 +169,6 @@ class BaseTrainer:
         self._augmentation_names = None
         self._epoch_aug_time = None
         self._epoch_aug_count = None
-        ema_cfg = getattr(self.mgr, 'ema_config', {}) or {}
-        self.ema_enabled = bool(getattr(self.mgr, 'ema_enabled', ema_cfg.get('enabled', False)))
-        self.ema_decay = float(getattr(self.mgr, 'ema_decay', ema_cfg.get('decay', 0.999)))
-        self.ema_start_step = int(getattr(self.mgr, 'ema_start_step', ema_cfg.get('start_step', 0)))
-        self.ema_update_every_steps = max(
-            1,
-            int(getattr(self.mgr, 'ema_update_every_steps', ema_cfg.get('update_every_steps', 1)))
-        )
-        self.ema_validate = bool(
-            getattr(self.mgr, 'ema_validate', ema_cfg.get('validate', self.ema_enabled))
-        )
-        self.ema_save_in_checkpoint = bool(
-            getattr(
-                self.mgr,
-                'ema_save_in_checkpoint',
-                ema_cfg.get('save_in_checkpoint', self.ema_enabled),
-            )
-        )
-        self.ema_model = None
-        self._ema_optimizer_step = 0
-        self._checkpoint_ema_state = None
-        self._checkpoint_ema_optimizer_step = None
-        self._printed_ema_validation_mode = False
 
     # --- build model --- #
     def _build_model(self):
@@ -183,98 +192,7 @@ class BaseTrainer:
         Subclasses can override this to save extra state (e.g., EMA model).
         Returns a dict that will be merged into the checkpoint.
         """
-        if self.ema_model is not None and self.ema_save_in_checkpoint:
-            return {
-                'ema_model': self.ema_model.state_dict(),
-                'ema_optimizer_step': int(self._ema_optimizer_step),
-            }
         return {}
-
-    def _unwrap_model(self, model):
-        if hasattr(model, 'module'):
-            model = model.module
-        if hasattr(model, '_orig_mod'):
-            try:
-                model = model._orig_mod
-            except Exception:
-                pass
-        return model
-
-    def _wrap_model_for_distributed_training(self, model):
-        if not self.is_distributed:
-            return model
-
-        ddp_kwargs = {"find_unused_parameters": True}
-        if self.device.type == 'cuda':
-            ddp_kwargs.update(
-                device_ids=[self.assigned_gpu_id],
-                output_device=self.assigned_gpu_id,
-            )
-        return DDP(model, **ddp_kwargs)
-
-    def _create_ema_model(self, model):
-        ema_model = deepcopy(self._unwrap_model(model))
-        ema_model = ema_model.to(self.device)
-        ema_model.eval()
-        for parameter in ema_model.parameters():
-            parameter.requires_grad_(False)
-        return ema_model
-
-    def _initialize_ema_model(self, model):
-        if not self.ema_enabled:
-            self.ema_model = None
-            return None
-
-        self.ema_model = self._create_ema_model(model)
-        if self._checkpoint_ema_state is not None:
-            try:
-                self.ema_model.load_state_dict(self._checkpoint_ema_state)
-                self._ema_optimizer_step = int(self._checkpoint_ema_optimizer_step or 0)
-                print(
-                    "Restored EMA model from checkpoint "
-                    f"(optimizer_step={self._ema_optimizer_step})"
-                )
-            except Exception as exc:
-                print(f"Warning: Failed to restore EMA model from checkpoint: {exc}")
-                print("Using freshly initialized EMA model")
-                self._ema_optimizer_step = 0
-            finally:
-                self._checkpoint_ema_state = None
-                self._checkpoint_ema_optimizer_step = None
-        else:
-            print(
-                "Created EMA model "
-                f"(decay={self.ema_decay}, start_step={self.ema_start_step}, "
-                f"update_every_steps={self.ema_update_every_steps})"
-            )
-        return self.ema_model
-
-    def _update_ema_model(self, model):
-        if self.ema_model is None:
-            return
-
-        self._ema_optimizer_step += 1
-        if self._ema_optimizer_step < self.ema_start_step:
-            return
-        if ((self._ema_optimizer_step - self.ema_start_step) % self.ema_update_every_steps) != 0:
-            return
-
-        ema_state = self.ema_model.state_dict()
-        for name, model_value in self._unwrap_model(model).state_dict().items():
-            ema_value = ema_state[name]
-            model_value = model_value.detach()
-            if torch.is_floating_point(ema_value):
-                ema_value.lerp_(model_value.to(dtype=ema_value.dtype), 1.0 - self.ema_decay)
-            else:
-                ema_value.copy_(model_value)
-
-    def _get_validation_model(self, model):
-        if self.ema_model is not None and self.ema_validate:
-            if not self._printed_ema_validation_mode:
-                print("Validation will use the EMA model")
-                self._printed_ema_validation_mode = True
-            return self.ema_model
-        return model
 
     # --- configure dataset --- #
     def _configure_dataset(self, is_training=True):
@@ -789,10 +707,14 @@ class BaseTrainer:
 
             if target_ignore_value is not None:
                 task_metrics.append(IOUDiceMetric(num_classes=num_classes, ignore_index=target_ignore_value))
-                task_metrics.append(VOIMetric(ignore_index=target_ignore_value))
+                # task_metrics.append(VOIMetric(ignore_index=target_ignore_value))
+                # VOI is intentionally disabled for distributed online validation because
+                # it is too expensive and not needed for runtime monitoring.
             else:
                 task_metrics.append(IOUDiceMetric(num_classes=num_classes))
-                task_metrics.append(VOIMetric())
+                # task_metrics.append(VOIMetric())
+                # VOI is intentionally disabled for distributed online validation because
+                # it is too expensive and not needed for runtime monitoring.
             # task_metrics.append(SkeletonBranchPointsMetric(num_classes=num_classes))
             # task_metrics.append(HausdorffDistanceMetric(num_classes=num_classes))
             metrics[task_name] = task_metrics
@@ -835,6 +757,87 @@ class BaseTrainer:
         if self.device.type in ['mlx', 'mps']:
             return torch.amp.autocast(self.device.type, dtype=self.amp_dtype)
         return torch.amp.autocast(self.device.type)
+
+    def _should_save_debug_media(self, epoch: int) -> bool:
+        every_n = int(getattr(self.mgr, 'debug_visualization_every_n', 0))
+        return every_n > 0 and ((epoch + 1) % every_n == 0)
+
+    def _validation_preview_target(self, epoch: int):
+        if not getattr(self.mgr, 'log_validation_preview', True):
+            return None
+        preview_pool_size = max(0, int(getattr(self.mgr, 'validation_preview_pool_size', 32)))
+        global_indices = tuple(getattr(self, '_val_global_indices', ()))
+        if preview_pool_size == 0 or not global_indices:
+            return None
+        preview_pool = global_indices[:min(preview_pool_size, len(global_indices))]
+        if not preview_pool:
+            return None
+        return int(preview_pool[epoch % len(preview_pool)])
+
+    def _reduce_validation_task_losses(self, local_sums, local_counts):
+        task_names = list(self.mgr.targets.keys())
+        reduce_device = self.device if self.device.type == 'cuda' else torch.device('cpu')
+        sum_tensor = torch.tensor(
+            [float(local_sums.get(task_name, 0.0)) for task_name in task_names],
+            device=reduce_device,
+            dtype=torch.float64,
+        )
+        count_tensor = torch.tensor(
+            [float(local_counts.get(task_name, 0.0)) for task_name in task_names],
+            device=reduce_device,
+            dtype=torch.float64,
+        )
+        if self.is_distributed:
+            dist.all_reduce(sum_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+
+        reduced = {}
+        for idx, task_name in enumerate(task_names):
+            count = float(count_tensor[idx].item())
+            reduced[task_name] = float(sum_tensor[idx].item() / count) if count > 0 else 0.0
+        return reduced
+
+    def _merge_metric_payloads(self, gathered_payloads):
+        merged = {}
+        for payload in gathered_payloads:
+            if not payload:
+                continue
+            for task_name, metrics in payload.items():
+                task_accumulator = merged.setdefault(task_name, {})
+                for metric_name, metric_payload in metrics.items():
+                    count = int(metric_payload.get("count", 0))
+                    if count <= 0:
+                        continue
+                    metric_accumulator = task_accumulator.setdefault(metric_name, {})
+                    for key, value in metric_payload.get("values", {}).items():
+                        slot = metric_accumulator.setdefault(
+                            key,
+                            {"weighted_sum": 0.0, "count": 0},
+                        )
+                        slot["weighted_sum"] += float(value) * count
+                        slot["count"] += count
+
+        reduced = {}
+        for task_name, metrics in merged.items():
+            reduced[task_name] = {}
+            for metric_name, metric_values in metrics.items():
+                reduced[task_name][metric_name] = {}
+                for key, accumulator in metric_values.items():
+                    count = max(1, accumulator["count"])
+                    reduced[task_name][metric_name][key] = accumulator["weighted_sum"] / count
+        return reduced
+
+    def _gather_preview_image(self, preview_image):
+        if not self.is_distributed:
+            return preview_image
+        gathered = [None for _ in range(self.world_size)]
+        dist.all_gather_object(gathered, preview_image)
+        if self.rank != 0:
+            return None
+        for image in gathered:
+            if image is not None:
+                return image
+        return None
 
     # --- dataloaders --- #
     def _configure_dataloaders(self, train_dataset, val_dataset=None):
@@ -923,13 +926,15 @@ class BaseTrainer:
         val_base = val_dataset if val_dataset is not None else train_dataset
         train_subset = Subset(train_base, train_indices)
         val_subset = Subset(val_base, val_indices)
+        if getattr(self.mgr, 'max_val_steps_per_epoch', None) is not None and self.mgr.max_val_steps_per_epoch > 0:
+            global_val_budget = min(len(val_subset), int(self.mgr.max_val_steps_per_epoch))
+        else:
+            global_val_budget = len(val_subset)
 
         if self.is_distributed:
             train_sampler = DistributedSampler(
                 train_subset, num_replicas=self.world_size, rank=self.rank, shuffle=True, drop_last=False
             )
-            # For validation we only run on rank 0; sampler unused there, but keep a sequential sampler for completeness
-            val_sampler = None
         else:
             if hasattr(train_base, 'patch_weights') and isinstance(getattr(train_base, 'patch_weights', None), list):
                 if train_base.patch_weights and len(train_base.patch_weights) >= len(train_base):
@@ -968,12 +973,25 @@ class BaseTrainer:
                     train_sampler = SubsetRandomSampler(list(range(len(train_subset))))
             else:
                 train_sampler = SubsetRandomSampler(list(range(len(train_subset))))
-            val_sampler = SubsetRandomSampler(list(range(len(val_subset))))
+
+        val_sampler = DistributedValidationSampler(
+            val_subset,
+            num_replicas=self.world_size if self.is_distributed else 1,
+            rank=self.rank if self.is_distributed else 0,
+            max_samples=global_val_budget,
+        )
+        self._val_global_indices = tuple(val_sampler.global_indices)
 
         pin_mem = True if self.device.type == 'cuda' else False
-        dl_kwargs = {}
+        train_dl_kwargs = {}
         if self.mgr.train_num_dataloader_workers and self.mgr.train_num_dataloader_workers > 0:
-            dl_kwargs['prefetch_factor'] = 2
+            train_dl_kwargs['prefetch_factor'] = max(1, int(getattr(self.mgr, 'train_prefetch_factor', 2)))
+            train_dl_kwargs['persistent_workers'] = bool(getattr(self.mgr, 'persistent_workers', True))
+
+        val_dl_kwargs = {}
+        if self.mgr.val_num_dataloader_workers and self.mgr.val_num_dataloader_workers > 0:
+            val_dl_kwargs['prefetch_factor'] = max(1, int(getattr(self.mgr, 'val_prefetch_factor', 2)))
+            val_dl_kwargs['persistent_workers'] = bool(getattr(self.mgr, 'val_persistent_workers', True))
 
         train_dataloader = DataLoader(
             train_subset,
@@ -982,18 +1000,17 @@ class BaseTrainer:
             shuffle=False,
             pin_memory=pin_mem,
             num_workers=self.mgr.train_num_dataloader_workers,
-            **dl_kwargs
+            **train_dl_kwargs
         )
 
-        # Validation dataloader will only be iterated on rank 0 in DDP
         val_dataloader = DataLoader(
             val_subset,
             batch_size=1,
             sampler=val_sampler,
             shuffle=False,
             pin_memory=pin_mem,
-            num_workers=self.mgr.train_num_dataloader_workers,
-            **dl_kwargs
+            num_workers=self.mgr.val_num_dataloader_workers,
+            **val_dl_kwargs
         )
 
         return train_dataloader, val_dataloader, train_indices, val_indices
@@ -1091,7 +1108,11 @@ class BaseTrainer:
                                                                                                    val_dataset)
 
         # Wrap model with DDP if distributed
-        model = self._wrap_model_for_distributed_training(model)
+        if self.is_distributed:
+            if self.device.type == 'cuda':
+                model = DDP(model, device_ids=[self.assigned_gpu_id], output_device=self.assigned_gpu_id, find_unused_parameters=True)
+            else:
+                model = DDP(model, find_unused_parameters=True)
         os.makedirs(self.mgr.ckpt_out_base, exist_ok=True)
         model_ckpt_dir = os.path.join(self.mgr.ckpt_out_base, self.mgr.model_name)
         os.makedirs(model_ckpt_dir, exist_ok=True)
@@ -1099,7 +1120,7 @@ class BaseTrainer:
         now = datetime.now()
         date_str = now.strftime('%m%d%y')
         time_str = now.strftime('%H%M')
-        ckpt_dir = os.path.join('checkpoints', f"{self.mgr.model_name}_{date_str}{time_str}")
+        ckpt_dir = os.path.join(self.mgr.ckpt_out_base, f"{self.mgr.model_name}_{date_str}{time_str}")
         os.makedirs(ckpt_dir, exist_ok=True)
 
         loss_overrides = self._capture_loss_overrides()
@@ -1124,7 +1145,6 @@ class BaseTrainer:
                     ckpt = torch.load(self.mgr.checkpoint_path, map_location=self.device, weights_only=False)
                     if isinstance(ckpt, dict) and 'ema_model' in ckpt:
                         self._checkpoint_ema_state = ckpt['ema_model']
-                        self._checkpoint_ema_optimizer_step = int(ckpt.get('ema_optimizer_step', 0))
                         print("Found EMA model state in checkpoint")
                     del ckpt
                 except Exception:
@@ -1143,7 +1163,6 @@ class BaseTrainer:
             self._ds_scales = None
             self._ds_weights = None
         loss_fns = self._build_loss()
-        self._initialize_ema_model(model)
 
         if self.device.type == 'cuda':
             try:
@@ -1182,6 +1201,9 @@ class BaseTrainer:
             train_val_splits = save_train_val_filenames(self, train_dataset, val_dataset, train_indices, val_indices)
 
             save_dir = ckpt_dir if ckpt_dir else os.getcwd()
+            wandb_dir = os.path.join(str(self.mgr.ckpt_out_base), "wandb")
+            os.makedirs(wandb_dir, exist_ok=True)
+            os.environ["WANDB_DIR"] = wandb_dir
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             splits_filename = f"train_val_splits_{self.mgr.model_name}_{timestamp}.json"
@@ -1202,6 +1224,7 @@ class BaseTrainer:
                 "project": self.mgr.wandb_project,
                 "group": self.mgr.model_name,
                 "config": mgr_config,
+                "dir": wandb_dir,
             }
             wandb_resume = getattr(self.mgr, "wandb_resume", None)
             if wandb_resume:
@@ -1426,9 +1449,9 @@ class BaseTrainer:
             additional_data=self._get_additional_checkpoint_data()
         )
 
-        checkpoint_history.append((epoch, ckpt_path))
-
         del checkpoint_data
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
 
         # Manage checkpoint history
         checkpoint_history, best_checkpoints = manage_checkpoint_history(
@@ -1653,10 +1676,7 @@ class BaseTrainer:
                             train_sample_outputs[t_name] = p_val[b_idx: b_idx + 1]
 
                 if optimizer_stepped and is_per_iteration_scheduler:
-                    self._update_ema_model(model)
                     scheduler.step()
-                elif optimizer_stepped:
-                    self._update_ema_model(model)
 
                 if pbar is not None:
                     loss_str = " | ".join([f"{t}: {np.mean(epoch_losses[t][-100:]):.4f}"
@@ -1666,7 +1686,16 @@ class BaseTrainer:
 
                 current_lr = optimizer.param_groups[0]['lr']
 
-                if self.mgr.wandb_project and (not self.is_distributed or self.rank == 0):
+                should_log_train_metrics = (
+                    self.mgr.wandb_project
+                    and (not self.is_distributed or self.rank == 0)
+                    and (
+                        global_step == 1
+                        or (global_step % max(1, int(getattr(self.mgr, 'log_every_n_steps', 10)))) == 0
+                        or i == (num_iters - 1)
+                    )
+                )
+                if should_log_train_metrics:
                     metrics = self._prepare_metrics_for_logging(
                         epoch=epoch,
                         step=global_step,
@@ -1685,6 +1714,10 @@ class BaseTrainer:
 
             if not is_per_iteration_scheduler and not step_scheduler_at_epoch_begin:
                 scheduler.step()
+
+            gc.collect()
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
 
             # Report the effective learning rate(s) after all scheduler updates for this epoch.
             current_lrs = [group['lr'] for group in optimizer.param_groups]
@@ -1708,30 +1741,30 @@ class BaseTrainer:
             # ---- validation ----- #
             val_every_n = int(getattr(self.mgr, 'val_every_n', 1))
             do_validate = ((epoch + 1) % max(1, val_every_n) == 0)
-            if do_validate and (not self.is_distributed or self.rank == 0):
-                validation_model = self._get_validation_model(model)
+            stop_training_early = False
+            if do_validate:
                 # For MAE training, don't set to eval mode to keep patch dropping active
                 if not hasattr(self, '_is_mae_training'):
                     model.eval()
-                if validation_model is not model or not hasattr(self, '_is_mae_training'):
-                    validation_model.eval()
                 with torch.no_grad():
-                    val_losses = {t_name: [] for t_name in self.mgr.targets}
-                    debug_preview_image = None
-                    
+                    local_val_sums = {t_name: 0.0 for t_name in self.mgr.targets}
+                    local_val_counts = {t_name: 0 for t_name in self.mgr.targets}
+                    local_preview_image = None
+                    local_metric_payload = {}
+                    should_save_debug_media = self._should_save_debug_media(epoch) and (not self.is_distributed or self.rank == 0)
+
                     # Initialize evaluation metrics
                     evaluation_metrics = self._initialize_evaluation_metrics()
 
                     val_dataloader_iter = iter(val_dataloader)
+                    num_val_iters = len(val_dataloader)
+                    val_sampler = getattr(val_dataloader, 'sampler', None)
+                    local_val_indices = list(getattr(val_sampler, 'indices', range(num_val_iters)))
+                    preview_target = self._validation_preview_target(epoch)
 
-                    if hasattr(self.mgr, 'max_val_steps_per_epoch') and self.mgr.max_val_steps_per_epoch is not None and self.mgr.max_val_steps_per_epoch > 0:
-                        num_val_iters = min(len(val_indices), self.mgr.max_val_steps_per_epoch)
-                    else:
-                        num_val_iters = len(val_indices)
+                    val_pbar = tqdm(range(num_val_iters), desc=f'Validation {epoch + 1}') if (not self.is_distributed or self.rank == 0) else None
 
-                    val_pbar = tqdm(range(num_val_iters), desc=f'Validation {epoch + 1}')
-
-                    for i in val_pbar:
+                    for i in range(num_val_iters):
                         try:
                             data_dict = next(val_dataloader_iter)
                         except StopIteration:
@@ -1739,7 +1772,7 @@ class BaseTrainer:
                             data_dict = next(val_dataloader_iter)
 
                         task_losses, inputs, targets_dict, outputs = self._validation_step(
-                            model=validation_model,
+                            model=model,
                             data_dict=data_dict,
                             loss_fns=loss_fns,
                             use_amp=use_amp
@@ -1747,9 +1780,11 @@ class BaseTrainer:
 
                         for t_name, loss_value in task_losses.items():
                             # Ensure we have a slot for dynamically introduced tasks (e.g., 'mae')
-                            if t_name not in val_losses:
-                                val_losses[t_name] = []
-                            val_losses[t_name].append(loss_value)
+                            if t_name not in local_val_sums:
+                                local_val_sums[t_name] = 0.0
+                                local_val_counts[t_name] = 0
+                            local_val_sums[t_name] += float(loss_value)
+                            local_val_counts[t_name] += 1
                         
                         # Compute evaluation metrics for each task (handle deep supervision lists)
                         for t_name in self.mgr.targets:
@@ -1769,7 +1804,8 @@ class BaseTrainer:
                                         continue
                                     metric.update(pred=pred_val, gt=gt_val, mask=mask_tensor)
 
-                        if i == 0:
+                        current_val_index = local_val_indices[i] if i < len(local_val_indices) else None
+                        if preview_target is not None and current_val_index == preview_target:
                                 # Find first non-zero sample for debug visualization, but save even if all zeros
                                 b_idx = 0
                                 found_non_zero = False
@@ -1846,66 +1882,95 @@ class BaseTrainer:
                                             train_outputs_dict=train_sample_outputs,
                                             skeleton_dict=skeleton_dict,
                                             train_skeleton_dict=train_skeleton_dict,
+                                            save_media=should_save_debug_media,
                                             unlabeled_input=unlabeled_input,
                                             unlabeled_pseudo_dict=unlabeled_pseudo,
                                             unlabeled_outputs_dict=unlabeled_pred
                                         )
-                                        debug_gif_history.append((epoch, debug_img_path))
+                                        local_preview_image = debug_preview_image
+                                        if should_save_debug_media:
+                                            debug_gif_history.append((epoch, debug_img_path))
 
-                        loss_str = " | ".join([f"{t}: {np.mean(val_losses[t]):.4f}"
-                                               for t in self.mgr.targets if len(val_losses[t]) > 0])
-                        val_pbar.set_postfix_str(loss_str)
+                        if val_pbar is not None:
+                            loss_str = " | ".join([
+                                f"{t}: {local_val_sums[t] / max(1, local_val_counts[t]):.4f}"
+                                for t in self.mgr.targets if local_val_counts.get(t, 0) > 0
+                            ])
+                            val_pbar.set_postfix_str(loss_str)
+                            val_pbar.update(1)
 
                         del outputs, inputs, targets_dict
 
-                    print(f"\n[Validation] Epoch {epoch + 1} summary:")
-                    total_val_loss = 0.0
-                    for t_name in self.mgr.targets:
-                        val_avg = np.mean(val_losses[t_name]) if val_losses[t_name] else 0
-                        print(f"  Task '{t_name}': Avg validation loss = {val_avg:.4f}")
-                        total_val_loss += val_avg
+                    if val_pbar is not None:
+                        val_pbar.close()
 
-                    avg_val_loss = total_val_loss / len(self.mgr.targets) if self.mgr.targets else 0
-                    val_loss_history[epoch] = avg_val_loss
-                    
-                    print("\n[Validation Metrics]")
-                    metric_results = {}
-                    for t_name in self.mgr.targets:
-                        if t_name in evaluation_metrics:
-                            print(f"  Task '{t_name}':")
-                            for metric in evaluation_metrics[t_name]:
-                                aggregated = metric.aggregate()
-                                for metric_name, value in aggregated.items():
-                                    full_metric_name = f"{t_name}_{metric_name}"
-                                    metric_results[full_metric_name] = value
-                                    display_name = f"{metric.name}_{metric_name}"
-                                    print(f"    {display_name}: {value:.4f}")
+                    reduced_val_losses = self._reduce_validation_task_losses(local_val_sums, local_val_counts)
 
-                    if self.mgr.wandb_project:
-                        val_metrics = {"epoch": epoch, "step": global_step}
+                    for t_name in self.mgr.targets:
+                        metric_group = {}
+                        for metric in evaluation_metrics.get(t_name, []):
+                            aggregated = metric.aggregate()
+                            if aggregated:
+                                metric_group[metric.name] = {
+                                    "count": len(metric.results),
+                                    "values": aggregated,
+                                }
+                        if metric_group:
+                            local_metric_payload[t_name] = metric_group
+
+                    if self.is_distributed:
+                        gathered_metric_payloads = [None for _ in range(self.world_size)]
+                        dist.all_gather_object(gathered_metric_payloads, local_metric_payload)
+                    else:
+                        gathered_metric_payloads = [local_metric_payload]
+
+                    debug_preview_image = self._gather_preview_image(local_preview_image)
+
+                    if not self.is_distributed or self.rank == 0:
+                        print(f"\n[Validation] Epoch {epoch + 1} summary:")
+                        total_val_loss = 0.0
                         for t_name in self.mgr.targets:
-                            if t_name in val_losses and len(val_losses[t_name]) > 0:
-                                val_metrics[f"val_loss_{t_name}"] = np.mean(val_losses[t_name])
-                        val_metrics["val_loss_total"] = avg_val_loss
-                        
-                        # Add evaluation metrics to wandb
-                        for metric_name, value in metric_results.items():
-                            val_metrics[f"val_{metric_name}"] = value
+                            val_avg = reduced_val_losses.get(t_name, 0.0)
+                            print(f"  Task '{t_name}': Avg validation loss = {val_avg:.4f}")
+                            total_val_loss += val_avg
 
-                        import wandb
+                        avg_val_loss = total_val_loss / len(self.mgr.targets) if self.mgr.targets else 0
+                        val_loss_history[epoch] = avg_val_loss
 
-                        if debug_preview_image is not None:
-                            preview_to_log = debug_preview_image
-                            if preview_to_log.ndim == 3 and preview_to_log.shape[2] == 3:
-                                # Convert BGR (OpenCV) to RGB for wandb
-                                preview_to_log = preview_to_log[..., ::-1]
-                            preview_to_log = np.ascontiguousarray(preview_to_log)
-                            val_metrics["debug_image"] = wandb.Image(preview_to_log)
+                        print("\n[Validation Metrics]")
+                        metric_results = {}
+                        merged_metrics = self._merge_metric_payloads(gathered_metric_payloads)
+                        for t_name in self.mgr.targets:
+                            if t_name in merged_metrics:
+                                print(f"  Task '{t_name}':")
+                                for metric_name, aggregated in merged_metrics[t_name].items():
+                                    for metric_key, value in aggregated.items():
+                                        full_metric_name = f"{t_name}_{metric_key}"
+                                        metric_results[full_metric_name] = value
+                                        print(f"    {metric_name}_{metric_key}: {value:.4f}")
 
-                        wandb.log(val_metrics)
+                        if self.mgr.wandb_project:
+                            val_metrics = {"epoch": epoch, "step": global_step}
+                            for t_name in self.mgr.targets:
+                                val_metrics[f"val_loss_{t_name}"] = reduced_val_losses.get(t_name, 0.0)
+                            val_metrics["val_loss_total"] = avg_val_loss
+
+                            for metric_name, value in metric_results.items():
+                                val_metrics[f"val_{metric_name}"] = value
+
+                            import wandb
+
+                            if debug_preview_image is not None:
+                                preview_to_log = debug_preview_image
+                                if preview_to_log.ndim == 3 and preview_to_log.shape[2] == 3:
+                                    preview_to_log = preview_to_log[..., ::-1]
+                                preview_to_log = np.ascontiguousarray(preview_to_log)
+                                val_metrics["debug_image"] = wandb.Image(preview_to_log)
+
+                            wandb.log(val_metrics)
 
                     # Early stopping check
-                    if early_stopping_patience > 0:
+                    if (not self.is_distributed or self.rank == 0) and early_stopping_patience > 0:
                         if avg_val_loss < best_val_loss:
                             best_val_loss = avg_val_loss
                             patience_counter = 0
@@ -1918,35 +1983,50 @@ class BaseTrainer:
                             print(f"\n[Early Stopping] Validation loss did not improve for {early_stopping_patience} epochs.")
                             print(f"Best validation loss: {best_val_loss:.4f}")
                             print("Stopping training early.")
-                            break
+                            stop_training_early = True
                     
                     # Handle epoch end operations (checkpointing, cleanup)
-                    checkpoint_history, best_checkpoints, ckpt_path = self._on_epoch_end(
-                        epoch=epoch,
-                        model=model,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        train_dataset=train_dataset,
-                        ckpt_dir=ckpt_dir,
-                        model_ckpt_dir=model_ckpt_dir,
-                        checkpoint_history=checkpoint_history,
-                        best_checkpoints=best_checkpoints,
-                        avg_val_loss=avg_val_loss
-                    )
-
-                    # Manage debug videos
-                    if epoch in [e for e, _ in debug_gif_history]:
-                        debug_gif_history, best_debug_gifs = manage_debug_gifs(
-                            debug_gif_history=debug_gif_history,
-                            best_debug_gifs=best_debug_gifs,
+                    if (not self.is_distributed or self.rank == 0) and not stop_training_early:
+                        checkpoint_history, best_checkpoints, ckpt_path = self._on_epoch_end(
                             epoch=epoch,
-                            gif_path=next(p for e, p in debug_gif_history if e == epoch),
-                            validation_loss=avg_val_loss,
-                            checkpoint_dir=ckpt_dir,
-                            model_name=self.mgr.model_name,
-                            max_recent=3,
-                            max_best=2
+                            model=model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            train_dataset=train_dataset,
+                            ckpt_dir=ckpt_dir,
+                            model_ckpt_dir=model_ckpt_dir,
+                            checkpoint_history=checkpoint_history,
+                            best_checkpoints=best_checkpoints,
+                            avg_val_loss=avg_val_loss
                         )
+
+                        if epoch in [e for e, _ in debug_gif_history]:
+                            debug_gif_history, best_debug_gifs = manage_debug_gifs(
+                                debug_gif_history=debug_gif_history,
+                                best_debug_gifs=best_debug_gifs,
+                                epoch=epoch,
+                                gif_path=next(p for e, p in debug_gif_history if e == epoch),
+                                validation_loss=avg_val_loss,
+                                checkpoint_dir=ckpt_dir,
+                                model_name=self.mgr.model_name,
+                                max_recent=3,
+                                max_best=2
+                            )
+
+                    if self.is_distributed:
+                        dist.barrier()
+
+            if self.is_distributed:
+                stop_tensor = torch.tensor(
+                    1 if stop_training_early else 0,
+                    device=self.device if self.device.type == 'cuda' else torch.device('cpu'),
+                    dtype=torch.int32,
+                )
+                dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX)
+                stop_training_early = bool(stop_tensor.item())
+
+            if stop_training_early:
+                break
 
         # Synchronize all ranks before finalization
         if self.is_distributed:
@@ -1963,8 +2043,7 @@ class BaseTrainer:
                 model_ckpt_dir=model_ckpt_dir,
                 model_name=self.mgr.model_name,
                 model_config=getattr(model, 'final_config', None),
-                train_dataset=train_dataset,
-                additional_data=self._get_additional_checkpoint_data(),
+                train_dataset=train_dataset
             )
 
         # Clean up DDP process group

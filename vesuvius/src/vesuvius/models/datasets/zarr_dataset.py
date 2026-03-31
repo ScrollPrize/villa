@@ -12,7 +12,9 @@ This module provides a streamlined Dataset implementation that:
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -28,9 +30,17 @@ from .intensity_properties import initialize_intensity_properties
 from ..training.normalization import get_normalization
 from ..augmentation.pipelines import create_training_transforms
 from ..augmentation.transforms.utils.perf import collect_augmentation_names
+from ..augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
+
+try:
+    import edt as fast_edt
+except Exception:
+    fast_edt = None
 
 
 logger = logging.getLogger(__name__)
+
+DERIVED_CACHE_VERSION = "v1"
 
 
 @dataclass
@@ -113,6 +123,10 @@ class ZarrDataset(Dataset):
             name: self._resolve_ignore_label(self.targets.get(name) or {})
             for name in self.target_names
         }
+        self._binary_fast_path_targets = {
+            name for name in self.target_names
+            if str(name).lower() == "surface"
+        }
 
         # Determine 2D vs 3D
         self.is_2d = len(self.patch_size) == 2
@@ -139,6 +153,17 @@ class ZarrDataset(Dataset):
         # Caching
         self.cache_enabled = getattr(mgr, 'cache_valid_patches', True)
         self.cache_dir = self.data_path / '.patches_cache'
+        derived_cache_root = getattr(mgr, 'derived_patch_cache_dir', None)
+        if derived_cache_root:
+            self.derived_cache_dir = Path(derived_cache_root)
+        elif Path('/ephemeral').exists():
+            self.derived_cache_dir = Path('/ephemeral/vesuvius_patch_cache')
+        else:
+            self.derived_cache_dir = self.data_path / '.derived_patch_cache'
+        self._derived_cache_disk_enabled = not self.is_training
+        self._derived_cache_limit = 128 if self.is_training else 256
+        self._derived_cache: OrderedDict[str, tuple[tuple[tuple[int, int], ...], np.ndarray]] = OrderedDict()
+        self._precomputed_skeleton_transform = None
 
         # Initialize storage
         self._volumes: List[VolumeInfo] = []
@@ -366,38 +391,69 @@ class ZarrDataset(Dataset):
         except TypeError:
             return np.zeros(values.shape, dtype=bool)
 
+    @staticmethod
+    def _bbox_slices(mask: np.ndarray, margin: int = 0) -> Optional[Tuple[slice, ...]]:
+        if not np.any(mask):
+            return None
+        coords = np.where(mask)
+        slices = []
+        for axis, axis_coords in enumerate(coords):
+            start = max(int(axis_coords.min()) - margin, 0)
+            stop = min(int(axis_coords.max()) + margin + 1, mask.shape[axis])
+            slices.append(slice(start, stop))
+        return tuple(slices)
+
     @classmethod
     def _dilate_label_region(
         cls,
         values: np.ndarray,
         distance: float,
         ignore_label: Optional[float],
-    ) -> np.ndarray:
+        *,
+        binary_fast_path: bool = False,
+    ) -> tuple[np.ndarray, Optional[Tuple[slice, ...]]]:
         if distance <= 0:
-            return values
+            return values, None
 
         arr = np.asarray(values)
         ignore_mask = cls._ignore_mask(arr, ignore_label)
         source_mask = (arr != 0) & ~ignore_mask
         if not np.any(source_mask):
-            return arr
+            return arr, None
 
-        fill_mask = (arr == 0)
+        roi_slices = cls._bbox_slices(source_mask, margin=int(np.ceil(distance)))
+        if roi_slices is None:
+            return arr, None
+
+        roi = arr[roi_slices]
+        roi_ignore_mask = cls._ignore_mask(roi, ignore_label)
+        roi_source_mask = (roi != 0) & ~roi_ignore_mask
+        fill_mask = roi == 0
         if not np.any(fill_mask):
-            return arr
+            return arr, roi_slices
 
-        distances, nearest_indices = distance_transform_edt(
-            ~source_mask,
-            return_indices=True,
-        )
-        fill_mask &= distances <= float(distance)
-        if not np.any(fill_mask):
-            return arr
+        result = np.array(arr, copy=True)
+        roi_result = np.array(roi, copy=True)
 
-        result = arr.copy()
-        nearest_values = arr[tuple(nearest_indices[axis][fill_mask] for axis in range(arr.ndim))]
-        result[fill_mask] = nearest_values
-        return result
+        if binary_fast_path and fast_edt is not None:
+            distances = fast_edt.edt((~roi_source_mask).astype(np.uint8), parallel=1)
+            fill_mask &= distances <= float(distance)
+            if not np.any(fill_mask):
+                return arr, roi_slices
+            roi_result[fill_mask] = 1
+        else:
+            distances, nearest_indices = distance_transform_edt(
+                ~roi_source_mask,
+                return_indices=True,
+            )
+            fill_mask &= distances <= float(distance)
+            if not np.any(fill_mask):
+                return arr, roi_slices
+            nearest_values = roi[tuple(nearest_indices[axis][fill_mask] for axis in range(roi.ndim))]
+            roi_result[fill_mask] = nearest_values
+
+        result[roi_slices] = roi_result
+        return result, roi_slices
 
     @classmethod
     def _dilate_label_patch(
@@ -406,21 +462,31 @@ class ZarrDataset(Dataset):
         distance: Optional[float],
         ignore_label: Optional[float],
         original_shape: Tuple[int, ...],
-    ) -> np.ndarray:
+        *,
+        binary_fast_path: bool = False,
+    ) -> tuple[np.ndarray, Optional[Tuple[slice, ...]]]:
         if distance in (None, 0):
-            return values
+            return values, None
 
         valid_slices = tuple(slice(0, max(0, min(int(o), int(s)))) for o, s in zip(original_shape, values.shape))
         if any(slc.stop == 0 for slc in valid_slices):
-            return values
+            return values, None
 
         result = np.array(values, copy=True)
-        result[valid_slices] = cls._dilate_label_region(
+        dilated_region, roi_slices = cls._dilate_label_region(
             result[valid_slices],
             float(distance),
             ignore_label,
+            binary_fast_path=binary_fast_path,
         )
-        return result
+        result[valid_slices] = dilated_region
+        if roi_slices is None:
+            return result, None
+        absolute_roi = tuple(
+            slice(valid_slices[axis].start + roi_slice.start, valid_slices[axis].start + roi_slice.stop)
+            for axis, roi_slice in enumerate(roi_slices)
+        )
+        return result, absolute_roi
 
     # -------------------------------------------------------------------------
     # Normalization
@@ -457,6 +523,97 @@ class ZarrDataset(Dataset):
                 }
             })
         return {first_target: volumes_list}
+
+    @staticmethod
+    def _roi_tuple_from_slices(roi_slices: Tuple[slice, ...]) -> tuple[tuple[int, int], ...]:
+        return tuple((int(slc.start), int(slc.stop)) for slc in roi_slices)
+
+    @staticmethod
+    def _roi_slices_from_tuple(roi_tuple: tuple[tuple[int, int], ...]) -> Tuple[slice, ...]:
+        return tuple(slice(start, stop) for start, stop in roi_tuple)
+
+    def _derived_cache_key(
+        self,
+        *,
+        derivation: str,
+        patch: PatchInfo,
+        target_name: str,
+        extra: Dict[str, object],
+    ) -> str:
+        vol = self._volumes[patch.volume_index]
+        payload = {
+            "version": DERIVED_CACHE_VERSION,
+            "derivation": derivation,
+            "volume_name": patch.volume_name,
+            "position": list(patch.position),
+            "patch_size": list(patch.patch_size),
+            "position_scale_factor": int(getattr(patch, "position_scale_factor", 1) or 1),
+            "scale": getattr(vol, "scale", self.ome_zarr_resolution),
+            "target_name": target_name,
+            "extra": {key: repr(value) for key, value in extra.items()},
+        }
+        return hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def _derived_cache_path(self, derivation: str, cache_key: str) -> Path:
+        return self.derived_cache_dir / derivation / cache_key[:2] / f"{cache_key}.npz"
+
+    def _derived_cache_get(self, cache_key: str):
+        entry = self._derived_cache.get(cache_key)
+        if entry is not None:
+            self._derived_cache.move_to_end(cache_key)
+            return entry
+        return None
+
+    def _derived_cache_put(self, cache_key: str, roi_tuple, roi_values: np.ndarray) -> None:
+        self._derived_cache[cache_key] = (roi_tuple, np.ascontiguousarray(roi_values))
+        self._derived_cache.move_to_end(cache_key)
+        while len(self._derived_cache) > self._derived_cache_limit:
+            self._derived_cache.popitem(last=False)
+
+    def _load_cached_roi(self, derivation: str, cache_key: str):
+        cached = self._derived_cache_get(cache_key)
+        if cached is not None:
+            return cached
+        if not self._derived_cache_disk_enabled:
+            return None
+
+        cache_path = self._derived_cache_path(derivation, cache_key)
+        if not cache_path.exists():
+            return None
+        try:
+            with np.load(cache_path, allow_pickle=False) as payload:
+                roi_tuple = tuple(tuple(int(v) for v in pair) for pair in payload["roi"].tolist())
+                roi_values = np.ascontiguousarray(payload["values"])
+        except Exception:
+            return None
+
+        self._derived_cache_put(cache_key, roi_tuple, roi_values)
+        return roi_tuple, roi_values
+
+    def _store_cached_roi(self, derivation: str, cache_key: str, roi_slices, values: np.ndarray) -> None:
+        if roi_slices is None:
+            return
+
+        roi_tuple = self._roi_tuple_from_slices(roi_slices)
+        roi_values = np.ascontiguousarray(values[roi_slices])
+        self._derived_cache_put(cache_key, roi_tuple, roi_values)
+
+        if not self._derived_cache_disk_enabled:
+            return
+
+        cache_path = self._derived_cache_path(derivation, cache_key)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        if cache_path.exists():
+            return
+        np.savez(cache_path, roi=np.asarray(roi_tuple, dtype=np.int64), values=roi_values)
+
+    def _apply_cached_roi(self, base_values: np.ndarray, cached_entry):
+        if cached_entry is None:
+            return base_values
+        roi_tuple, roi_values = cached_entry
+        result = np.array(base_values, copy=True)
+        result[self._roi_slices_from_tuple(roi_tuple)] = roi_values
+        return result
 
     # -------------------------------------------------------------------------
     # Patch Index Building
@@ -831,6 +988,7 @@ class ZarrDataset(Dataset):
     def _initialize_transforms(self) -> None:
         """Initialize augmentation transforms."""
         skeleton_targets, skeleton_ignore_values = self._get_skeleton_targets()
+        self._precomputed_skeleton_transform = None
 
         if self.is_training:
             no_spatial = getattr(self.mgr, 'no_spatial_augmentation', False)
@@ -846,14 +1004,17 @@ class ZarrDataset(Dataset):
             if self._profile_augmentations:
                 self._augmentation_names = collect_augmentation_names(self.transforms)
         elif skeleton_targets:
-            # Validation: only apply skeleton generation (no augmentation)
-            from vesuvius.models.augmentation.pipelines.training_transforms import create_validation_transforms
-            self.transforms = create_validation_transforms(
-                skeleton_targets=skeleton_targets,
-                skeleton_ignore_values=skeleton_ignore_values if skeleton_ignore_values else None,
+            self._precomputed_skeleton_transform = MedialSurfaceTransform(
+                do_tube=False,
+                target_keys=skeleton_targets,
+                ignore_values=skeleton_ignore_values or None,
+                cache_dir=str(self.derived_cache_dir / "medial_surface"),
+                enable_disk_cache=self._derived_cache_disk_enabled,
+                memory_cache_size=512,
             )
-            if self._profile_augmentations:
-                self._augmentation_names = collect_augmentation_names(self.transforms)
+            self.transforms = None
+        else:
+            self.transforms = None
 
     # -------------------------------------------------------------------------
     # Dataset Interface
@@ -920,24 +1081,52 @@ class ZarrDataset(Dataset):
             'patch_info': {
                 'volume_name': vol.volume_id,
                 'position': patch.position,
+                'patch_size': patch.patch_size,
+                'scale': getattr(vol, "scale", self.ome_zarr_resolution),
             },
         }
 
-        is_unlabeled = True
+        can_assume_labeled = (
+            not self.allow_unlabeled_data
+            and not patch.is_unlabeled_fg
+            and all(vol.label_arrays.get(target_name) is not None for target_name in self.target_names)
+        )
+        is_unlabeled = False if can_assume_labeled else True
         for target_name in self.target_names:
             label_arr = vol.label_arrays.get(target_name)
             label_data, label_shape = load_array(label_arr, return_original_shape=True)
-            label_data = self._dilate_label_patch(
-                label_data,
-                vol.dilate,
-                self.target_ignore_labels.get(target_name),
-                label_shape,
-            )
-            if label_arr is not None and np.count_nonzero(label_data) > 0:
+            dilate_distance = getattr(vol, "dilate", None)
+            if dilate_distance not in (None, 0):
+                cache_key = self._derived_cache_key(
+                    derivation="dilated_label",
+                    patch=patch,
+                    target_name=target_name,
+                    extra={
+                        "dilate": dilate_distance,
+                        "ignore_label": self.target_ignore_labels.get(target_name),
+                        "shape": label_shape,
+                    },
+                )
+                cached = self._load_cached_roi("dilated_label", cache_key)
+                if cached is not None:
+                    label_data = self._apply_cached_roi(label_data, cached)
+                else:
+                    label_data, roi_slices = self._dilate_label_patch(
+                        label_data,
+                        dilate_distance,
+                        self.target_ignore_labels.get(target_name),
+                        label_shape,
+                        binary_fast_path=(target_name in self._binary_fast_path_targets),
+                    )
+                    self._store_cached_roi("dilated_label", cache_key, roi_slices, label_data)
+            if not can_assume_labeled and label_arr is not None and np.count_nonzero(label_data) > 0:
                 is_unlabeled = False
             result[target_name] = torch.from_numpy(label_data[np.newaxis, ...])
 
         result['is_unlabeled'] = is_unlabeled or patch.is_unlabeled_fg
+
+        if self._precomputed_skeleton_transform is not None and not self.is_training:
+            result = self._precomputed_skeleton_transform.apply(result)
 
         if self.transforms is not None:
             if self._profile_augmentations and self._augmentation_names:
@@ -947,7 +1136,6 @@ class ZarrDataset(Dataset):
         return result
 
     def _scale_patch_position_for_array(self, patch: PatchInfo) -> Tuple[int, ...]:
-        """Convert cached full-resolution coordinates into the active array scale."""
         factor = int(getattr(patch, "position_scale_factor", 1) or 1)
         if factor <= 1:
             return patch.position

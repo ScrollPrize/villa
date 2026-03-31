@@ -113,7 +113,9 @@ def manage_checkpoint_history(checkpoint_history, best_checkpoints, epoch,
     checkpoint_path = Path(checkpoint_path)
     checkpoint_dir = Path(checkpoint_dir)
     
-    checkpoint_history.append((epoch, str(checkpoint_path)))
+    checkpoint_record = (epoch, str(checkpoint_path))
+    if checkpoint_record not in checkpoint_history:
+        checkpoint_history.append(checkpoint_record)
     
     if epoch in [e for e, _ in checkpoint_history]:
         ckpt_path = next(p for e, p in checkpoint_history if e == epoch)
@@ -242,9 +244,8 @@ def cleanup_old_configs(model_ckpt_dir, model_name, keep_latest=1):
 
 
 def save_final_checkpoint(model, optimizer, scheduler, max_epoch,
-                         model_ckpt_dir, model_name,
-                         model_config=None, train_dataset=None,
-                         additional_data=None):
+                         model_ckpt_dir, model_name, 
+                         model_config=None, train_dataset=None):
     """
     Save the final model checkpoint at the end of training.
     
@@ -281,8 +282,7 @@ def save_final_checkpoint(model, optimizer, scheduler, max_epoch,
         epoch=max_epoch - 1,
         checkpoint_path=final_model_path,
         model_config=model_config,
-        train_dataset=train_dataset,
-        additional_data=additional_data,
+        train_dataset=train_dataset
     )
     
     print(f"Final model saved to {final_model_path}")

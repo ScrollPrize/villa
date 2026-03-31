@@ -82,6 +82,44 @@ def update_config_from_args(mgr, args):
         mgr.max_val_steps_per_epoch = args.max_val_steps_per_epoch
         mgr.tr_configs["max_val_steps_per_epoch"] = args.max_val_steps_per_epoch
 
+    if getattr(args, 'num_dataloader_workers', None) is not None:
+        mgr.train_num_dataloader_workers = int(args.num_dataloader_workers)
+        mgr.tr_configs["num_dataloader_workers"] = int(args.num_dataloader_workers)
+
+    if getattr(args, 'val_num_dataloader_workers', None) is not None:
+        mgr.val_num_dataloader_workers = int(args.val_num_dataloader_workers)
+        mgr.tr_configs["val_num_dataloader_workers"] = int(args.val_num_dataloader_workers)
+
+    if getattr(args, 'persistent_workers', None) is not None:
+        mgr.persistent_workers = bool(args.persistent_workers)
+        mgr.val_persistent_workers = bool(args.persistent_workers)
+        mgr.tr_configs["persistent_workers"] = bool(args.persistent_workers)
+        mgr.tr_configs["val_persistent_workers"] = bool(args.persistent_workers)
+
+    if getattr(args, 'prefetch_factor', None) is not None:
+        mgr.train_prefetch_factor = int(args.prefetch_factor)
+        mgr.tr_configs["prefetch_factor"] = int(args.prefetch_factor)
+
+    if getattr(args, 'val_prefetch_factor', None) is not None:
+        mgr.val_prefetch_factor = int(args.val_prefetch_factor)
+        mgr.tr_configs["val_prefetch_factor"] = int(args.val_prefetch_factor)
+
+    if getattr(args, 'debug_visualization_every_n', None) is not None:
+        mgr.debug_visualization_every_n = int(args.debug_visualization_every_n)
+        mgr.tr_configs["debug_visualization_every_n"] = int(args.debug_visualization_every_n)
+
+    if getattr(args, 'validation_preview_pool_size', None) is not None:
+        mgr.validation_preview_pool_size = int(args.validation_preview_pool_size)
+        mgr.tr_configs["validation_preview_pool_size"] = int(args.validation_preview_pool_size)
+
+    if getattr(args, 'log_every_n_steps', None) is not None:
+        mgr.log_every_n_steps = max(1, int(args.log_every_n_steps))
+        mgr.tr_configs["log_every_n_steps"] = mgr.log_every_n_steps
+
+    if getattr(args, 'numa_pin', None) is not None:
+        mgr.numa_pin = str(args.numa_pin).lower()
+        mgr.tr_configs["numa_pin"] = mgr.numa_pin
+
     if getattr(args, 'profile_augmentations', False):
         mgr.profile_augmentations = True
         mgr.tr_configs["profile_augmentations"] = True
@@ -231,32 +269,6 @@ def update_config_from_args(mgr, args):
         mgr.tr_configs["gradient_clip"] = args.grad_clip
         if mgr.verbose:
             print(f"Set gradient clipping: {mgr.gradient_clip}")
-
-    ema_updates = {}
-    if getattr(args, 'ema_enabled', None) is not None:
-        mgr.ema_enabled = bool(args.ema_enabled)
-        ema_updates["enabled"] = mgr.ema_enabled
-    if getattr(args, 'ema_decay', None) is not None:
-        mgr.ema_decay = float(args.ema_decay)
-        ema_updates["decay"] = mgr.ema_decay
-    if getattr(args, 'ema_start_step', None) is not None:
-        mgr.ema_start_step = int(args.ema_start_step)
-        ema_updates["start_step"] = mgr.ema_start_step
-    if getattr(args, 'ema_update_every_steps', None) is not None:
-        mgr.ema_update_every_steps = max(1, int(args.ema_update_every_steps))
-        ema_updates["update_every_steps"] = mgr.ema_update_every_steps
-    if getattr(args, 'ema_validate', None) is not None:
-        mgr.ema_validate = bool(args.ema_validate)
-        ema_updates["validate"] = mgr.ema_validate
-    if getattr(args, 'ema_save_in_checkpoint', None) is not None:
-        mgr.ema_save_in_checkpoint = bool(args.ema_save_in_checkpoint)
-        ema_updates["save_in_checkpoint"] = mgr.ema_save_in_checkpoint
-    if ema_updates:
-        if not hasattr(mgr, 'ema_config') or mgr.ema_config is None:
-            mgr.ema_config = {}
-        mgr.ema_config.update(ema_updates)
-        if mgr.verbose:
-            print(f"Updated EMA config: {mgr.ema_config}")
 
     # Gradient accumulation steps
     if hasattr(args, 'gradient_accumulation') and args.gradient_accumulation is not None:

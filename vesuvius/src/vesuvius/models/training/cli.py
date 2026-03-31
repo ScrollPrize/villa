@@ -35,11 +35,6 @@ def main(argv=None):
         description="Train Vesuvius neural networks for ink detection and segmentation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.set_defaults(
-        ema_enabled=None,
-        ema_validate=None,
-        ema_save_in_checkpoint=None,
-    )
 
     grp_required = parser.add_argument_group("Required")
     grp_paths = parser.add_argument_group("Paths & Format")
@@ -109,20 +104,40 @@ def main(argv=None):
                            help="Type of pooling in encoder ('conv' = strided conv)")
 
     # Training Control
-    grp_train.add_argument("--max-epoch", type=int, default=None,
+    grp_train.add_argument("--max-epoch", type=int, default=1000,
                            help="Maximum number of epochs")
-    grp_train.add_argument("--max-steps-per-epoch", type=int, default=None,
+    grp_train.add_argument("--max-steps-per-epoch", type=int, default=250,
                            help="Max training steps per epoch (use all data if unset)")
-    grp_train.add_argument("--max-val-steps-per-epoch", type=int, default=None,
+    grp_train.add_argument("--max-val-steps-per-epoch", type=int, default=50,
                            help="Max validation steps per epoch (use all data if unset)")
     grp_train.add_argument("--full-epoch", action="store_true",
                            help="Iterate over entire train/val set per epoch (overrides max-steps)")
-    grp_train.add_argument("--early-stopping-patience", type=int, default=None,
+    grp_train.add_argument("--early-stopping-patience", type=int, default=0,
                            help="Epochs to wait for val loss improvement (0 disables)")
     grp_train.add_argument("--ddp", action="store_true",
                            help="Enable DistributedDataParallel (use with torchrun)")
-    grp_train.add_argument("--val-every-n", dest="val_every_n", type=int, default=None,
+    grp_train.add_argument("--val-every-n", dest="val_every_n", type=int, default=1,
                            help="Perform validation every N epochs (1=every epoch)")
+    grp_train.add_argument("--num-dataloader-workers", type=int,
+                           help="Training dataloader worker count")
+    grp_train.add_argument("--val-num-dataloader-workers", type=int,
+                           help="Validation dataloader worker count")
+    grp_train.add_argument("--persistent-workers", dest="persistent_workers", action="store_true",
+                           help="Enable persistent dataloader workers")
+    grp_train.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false",
+                           help="Disable persistent dataloader workers")
+    grp_train.add_argument("--prefetch-factor", type=int,
+                           help="Training dataloader prefetch factor")
+    grp_train.add_argument("--val-prefetch-factor", type=int,
+                           help="Validation dataloader prefetch factor")
+    grp_train.add_argument("--debug-visualization-every-n", type=int,
+                           help="Save debug GIF/PNG media every N validation epochs (0 disables media saves)")
+    grp_train.add_argument("--validation-preview-pool-size", type=int,
+                           help="Number of globally ordered validation patches to rotate through for W&B previews")
+    grp_train.add_argument("--log-every-n-steps", type=int,
+                           help="Log training metrics to W&B every N optimizer steps")
+    grp_train.add_argument("--numa-pin", type=str, choices=["auto", "off"],
+                           help="NUMA affinity mode for CUDA DDP workers")
     grp_train.add_argument("--gpus", type=str, default=None,
                            help="Comma-separated GPU device IDs to use, e.g. '0,1,3'. With DDP, length must equal WORLD_SIZE")
     grp_train.add_argument("--nproc-per-node", type=int, default=None,
@@ -131,6 +146,7 @@ def main(argv=None):
                            help="Master address for DDP when spawning without torchrun")
     grp_train.add_argument("--master-port", type=int, default=None,
                            help="Master port for DDP when spawning without torchrun (default: auto)")
+    grp_train.set_defaults(persistent_workers=None)
 
     # Optimization
     grp_optim.add_argument("--optimizer", type=str,
@@ -143,24 +159,6 @@ def main(argv=None):
                            help="Autocast dtype when AMP is enabled (float16 uses GradScaler; bfloat16 skips scaling)")
     grp_optim.add_argument("--no-amp", action="store_true",
                            help="Disable Automatic Mixed Precision (AMP)")
-    grp_optim.add_argument("--ema", dest="ema_enabled", action="store_true",
-                           help="Enable EMA weights tracking for the base trainer")
-    grp_optim.add_argument("--no-ema", dest="ema_enabled", action="store_false",
-                           help="Disable EMA weights tracking")
-    grp_optim.add_argument("--ema-decay", type=float,
-                           help="EMA decay factor")
-    grp_optim.add_argument("--ema-start-step", type=int,
-                           help="Optimizer step at which EMA updates begin")
-    grp_optim.add_argument("--ema-update-every-steps", type=int,
-                           help="Update EMA weights every N optimizer steps")
-    grp_optim.add_argument("--ema-validate", dest="ema_validate", action="store_true",
-                           help="Use the EMA model for validation when EMA is enabled")
-    grp_optim.add_argument("--no-ema-validate", dest="ema_validate", action="store_false",
-                           help="Validate with the student model even when EMA is enabled")
-    grp_optim.add_argument("--ema-save-in-checkpoint", dest="ema_save_in_checkpoint", action="store_true",
-                           help="Save EMA weights in checkpoints")
-    grp_optim.add_argument("--no-ema-save-in-checkpoint", dest="ema_save_in_checkpoint", action="store_false",
-                           help="Do not save EMA weights in checkpoints")
 
     # Scheduler
     grp_sched.add_argument("--scheduler", type=str,

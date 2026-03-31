@@ -470,6 +470,8 @@ def create_training_transforms(
 def create_validation_transforms(
     skeleton_targets: Optional[List[str]] = None,
     skeleton_ignore_values: Optional[Dict[str, int]] = None,
+    cache_dir: Optional[str] = None,
+    enable_disk_cache: bool = False,
 ) -> Optional[ComposeTransforms]:
     """
     Create minimal transforms for validation.
@@ -489,17 +491,5 @@ def create_validation_transforms(
     Optional[ComposeTransforms]
         The composed validation transforms, or None if no transforms needed.
     """
-    if not skeleton_targets:
-        return None
-
-    from vesuvius.models.augmentation.transforms.utils.skeleton_transform import MedialSurfaceTransform
-
-    transforms = [
-        MedialSurfaceTransform(
-            do_tube=False,
-            target_keys=skeleton_targets,
-            ignore_values=skeleton_ignore_values or None,
-        )
-    ]
-
-    return ComposeTransforms(transforms)
+    # Deterministic skeleton targets are generated in the dataset before augmentation.
+    return None
