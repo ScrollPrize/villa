@@ -305,6 +305,7 @@ class ConfigManager:
         self.max_epoch = int(self.tr_configs.get("max_epoch", 5000))
         self.val_every_n = int(self.tr_configs.get("val_every_n", 1))
         self.early_stopping_patience = int(self.tr_configs.get("early_stopping_patience", 0))
+        self.save_gifs = bool(self.tr_configs.get("save_gifs", True))
         self.optimizer = self.tr_configs.get("optimizer", "SGD")
         self.initial_lr = float(self.tr_configs.get("initial_lr", 0.01))
         self.weight_decay = float(self.tr_configs.get("weight_decay", 0.00003))
