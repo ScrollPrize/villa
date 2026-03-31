@@ -7,7 +7,6 @@
 #include <QString>
 
 #include <atomic>
-#include <chrono>
 #include <map>
 #include <memory>
 #include <set>
@@ -472,34 +471,6 @@ private:
     // Predictive prefetch state
     QPointF _lastPanScenePos;
 
-    // --- Pan inertia (momentum after release) ---
-    QPointF _panVelocity;                                      // pixels per second
-    QTimer* _panInertiaTimer = nullptr;                        // 16ms tick for coasting
-    std::chrono::steady_clock::time_point _lastPanTime;        // timestamp of last drag move
-    bool _panInertiaActive = false;
-
-    void panInertiaTick();
-
-    // --- Smooth zoom animation ---
-    float _targetScale = 0.5f;         // where zoom is heading (accumulates scroll input)
-    float _zoomBaseScale = 0.5f;       // camera.scale at start of current animation
-    QPointF _zoomAnchorScene;          // scene point to zoom toward/away from
-    QPointF _zoomAnchorVpPos;          // viewport position of anchor at animation start
-    QTimer* _zoomAnimTimer = nullptr;  // 16ms tick for smooth interpolation
-    bool _zoomAnimActive = false;      // true while animating
-
-    void zoomAnimTick();               // called each animation frame
-    void zoomSettle();                 // full-quality render at final scale
-
-    // --- Smooth slice scrolling animation ---
-    float _targetSliceOffset = 0.0f;   // accumulated target offset (relative to animation start)
-    float _currentSliceOffset = 0.0f;  // current interpolated offset
-    QTimer* _sliceAnimTimer = nullptr; // 16ms tick for smooth slice interpolation
-    bool _sliceAnimActive = false;     // true while animating
-    // For PlaneSurface focus-POI path: base position at animation start
-    cv::Vec3f _sliceAnimBasePos{0, 0, 0};
-    cv::Vec3f _sliceAnimNormal{0, 0, 0};
-    bool _sliceAnimUsesPOI = false;    // true = POI path, false = zOff path
-
-    void sliceAnimTick();              // called each animation frame
+    // --- Visual zoom transform ---
+    float _zoomBaseScale = 0.5f;       // camera.scale at start of current zoom
 };

@@ -1,7 +1,5 @@
 #include "RenderPool.hpp"
 
-#include <chrono>
-
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/types/Volume.hpp"
 
@@ -35,16 +33,6 @@ void RenderPool::submit(const TileRenderParams& params,
     }
 
     pendingCount_.fetch_add(1, std::memory_order_relaxed);
-
-    // Track submission time for timeout detection
-    {
-        std::lock_guard<std::mutex> lock(timeMutex_);
-        auto now = std::chrono::steady_clock::now();
-        if (!hasSubmissions_) {
-            oldestSubmitTime_ = now;
-            hasSubmissions_ = true;
-        }
-    }
 
     // Coarser pyramid levels (higher dsScaleIdx) get higher priority (lower value)
     // so fallback previews appear before fine tiles.
@@ -126,30 +114,19 @@ void RenderPool::cancelAll()
     }
 }
 
-bool RenderPool::expireTimedOut(std::chrono::steady_clock::duration timeout)
+bool RenderPool::expireTimedOut()
 {
     int pending = pendingCount_.load(std::memory_order_relaxed);
     if (pending <= 0)
         return false;
 
     // Only expire if the pool is idle (no workers actively running tasks)
-    // AND no tasks are queued. This means the pending count is stuck.
+    // AND no tasks are queued. This means the pending count is stuck
+    // (tasks lost to epoch filtering without going through pushResult).
     if (pool_->active() > 0 || pool_->pending() > 0)
         return false;
 
-    std::lock_guard<std::mutex> lock(timeMutex_);
-    if (!hasSubmissions_)
-        return false;
-
-    auto elapsed = std::chrono::steady_clock::now() - oldestSubmitTime_;
-    if (elapsed < timeout)
-        return false;
-
-    // Pool is idle but pendingCount > 0 and oldest submission exceeded timeout.
-    // This means some tasks were lost (e.g. skipped by epoch filtering in the
-    // pool without going through pushResult). Reset the count.
     pendingCount_.store(0, std::memory_order_relaxed);
-    hasSubmissions_ = false;
     return true;
 }
 
@@ -164,13 +141,7 @@ void RenderPool::pushResult(TileRenderResult result)
         std::lock_guard<std::mutex> lock(resultsMutex_);
         completedResults_.push_back(std::move(result));
     }
-    auto prev = pendingCount_.fetch_sub(1, std::memory_order_acq_rel);
-
-    // When all pending tasks have completed, reset the submission tracker
-    if (prev == 1) {
-        std::lock_guard<std::mutex> lock(timeMutex_);
-        hasSubmissions_ = false;
-    }
+    pendingCount_.fetch_sub(1, std::memory_order_acq_rel);
 
     // Debounce: only emit one tileReady per drain cycle. Without this,
     // 128 tiles completing in rapid succession queue 128 Qt events that

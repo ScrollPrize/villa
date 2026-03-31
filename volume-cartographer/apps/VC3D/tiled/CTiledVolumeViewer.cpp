@@ -246,11 +246,6 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     _lbl->setMinimumWidth(300);
     _lbl->move(10, 5);
 
-    // Periodic status refresh for download/queue counters
-    auto* statusTimer = new QTimer(this);
-    connect(statusTimer, &QTimer::timeout, this, &CTiledVolumeViewer::updateStatusLabel);
-    statusTimer->start(500);
-
     _interactionSettleTimer = new QTimer(this);
     _interactionSettleTimer->setSingleShot(true);
     _interactionSettleTimer->setInterval(16);
@@ -426,7 +421,6 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
                 updateContentMinScale();
                 rebuildContentGrid();
                 centerViewport();
-                _renderController->setAtomicNextEpochSwap(true);
             } else {
                 _surfaceContentVersion = 0;
                 updateParamsHash();

@@ -1,6 +1,5 @@
 #include "TileRenderController.hpp"
 
-#include <QColor>
 #include <QDebug>
 #include <QThread>
 #include <QTimer>
@@ -38,68 +37,6 @@ TileRenderController::~TileRenderController()
     _tickTimer->stop();
     // Bump epoch so our in-flight tasks are discarded on completion.
     _currentEpoch->fetch_add(1, std::memory_order_relaxed);
-}
-
-QPixmap TileRenderController::placeholderPixmap()
-{
-    QPixmap placeholder(TileScene::TILE_PX, TileScene::TILE_PX);
-    placeholder.fill(QColor(64, 64, 64));
-    return placeholder;
-}
-
-void TileRenderController::beginPendingSwap(uint64_t epoch, const std::vector<WorldTileKey>& keys)
-{
-    _pendingSwapActive = true;
-    _pendingSwapEpoch = epoch;
-    _pendingSwapTiles.clear();
-    _pendingSwapTiles.reserve(keys.size());
-    for (const auto& key : keys) {
-        _pendingSwapTiles.emplace(key, PendingSwapTile{});
-    }
-}
-
-void TileRenderController::stagePendingSwapTile(const WorldTileKey& wk,
-                                                const QPixmap& pixmap,
-                                                int8_t level,
-                                                bool hasPixmap)
-{
-    if (!_pendingSwapActive) return;
-    auto it = _pendingSwapTiles.find(wk);
-    if (it == _pendingSwapTiles.end()) return;
-
-    auto& pending = it->second;
-    // Don't downgrade a tile that already has a pixmap with a better (lower) level
-    if (pending.ready && pending.hasPixmap && hasPixmap &&
-        pending.level >= 0 && level >= pending.level) {
-        return;
-    }
-
-    pending.ready = true;
-    pending.hasPixmap = hasPixmap;
-    pending.level = level;
-    pending.pixmap = hasPixmap ? pixmap : QPixmap();
-}
-
-bool TileRenderController::tryCommitPendingSwap()
-{
-    if (!_pendingSwapActive) return false;
-
-    for (const auto& [_, pending] : _pendingSwapTiles) {
-        if (!pending.ready) return false;
-    }
-
-    const QPixmap placeholder = placeholderPixmap();
-    bool anyUpdated = false;
-    for (const auto& [wk, pending] : _pendingSwapTiles) {
-        const QPixmap& pixmap = pending.hasPixmap ? pending.pixmap : placeholder;
-        if (_tileScene->setTileWorld(wk, pixmap, _pendingSwapEpoch, pending.level)) {
-            anyUpdated = true;
-        }
-    }
-
-    _pendingSwapTiles.clear();
-    _pendingSwapActive = false;
-    return anyUpdated;
 }
 
 void TileRenderController::ensureTickRunning()
@@ -162,11 +99,6 @@ void TileRenderController::onCameraChanged(
             });
     }
 
-    if (epochChanged && _atomicNextEpochSwap) {
-        beginPendingSwap(camera.epoch, visibleKeys);
-        _atomicNextEpochSwap = false;
-    }
-
     // Determine coarsest level for synchronous preview fills.
     // Skip sync fill when only zOff changed (tiles already have content from
     // the previous slice — keeping them is better than blocking the UI).
@@ -183,12 +115,7 @@ void TileRenderController::onCameraChanged(
         // Check slice cache — apply best available immediately
         auto lookup = _cache.getBest(cacheKey);
         if (lookup.level >= 0) {
-            if (_pendingSwapActive && camera.epoch == _pendingSwapEpoch) {
-                stagePendingSwapTile(wk, lookup.pixmap, static_cast<int8_t>(lookup.level), true);
-            } else {
-                _tileScene->setTileWorld(
-                    wk, lookup.pixmap, epoch, lookup.level);
-            }
+            _tileScene->setTileWorld(wk, lookup.pixmap, epoch, lookup.level);
             if (lookup.level == camera.dsScaleIdx) {
                 continue;  // exact hit, no need to re-render
             }
@@ -210,11 +137,7 @@ void TileRenderController::onCameraChanged(
             auto preview = TileRenderer::renderTile(coarseParams, surface, volume.get());
             if (!preview.image.isNull()) {
                 QPixmap px = QPixmap::fromImage(preview.image, Qt::NoFormatConversion);
-                if (_pendingSwapActive && camera.epoch == _pendingSwapEpoch) {
-                    stagePendingSwapTile(wk, px, static_cast<int8_t>(coarsestLevel), true);
-                } else {
-                    _tileScene->setTileWorld(wk, px, epoch, static_cast<int8_t>(coarsestLevel));
-                }
+                _tileScene->setTileWorld(wk, px, epoch, static_cast<int8_t>(coarsestLevel));
                 TiledViewerCamera snapCam;
                 snapCam.scale = coarseParams.scale;
                 snapCam.zOff = coarseParams.zOff;
@@ -230,10 +153,6 @@ void TileRenderController::onCameraChanged(
             _renderPool->submit(params, surface, volume, _currentEpoch, _controllerId);
             _inFlightTiles.insert(wk);
         }
-    }
-
-    if (tryCommitPendingSwap()) {
-        emit sceneNeedsUpdate();
     }
 }
 
@@ -276,9 +195,6 @@ void TileRenderController::cancelAll()
     // controllers' tasks).  Instead bump the epoch so our in-flight and
     // queued tasks are discarded at completion time.
     _currentEpoch->fetch_add(1, std::memory_order_relaxed);
-    _pendingSwapActive = false;
-    _pendingSwapTiles.clear();
-    _atomicNextEpochSwap = false;
 }
 
 void TileRenderController::clearState()
@@ -294,9 +210,6 @@ void TileRenderController::clearState()
     _pendingBuildParams = nullptr;
 
     _chunkArrived = false;
-    _pendingSwapActive = false;
-    _pendingSwapTiles.clear();
-    _atomicNextEpochSwap = false;
 }
 
 void TileRenderController::drainResults()
@@ -326,22 +239,12 @@ void TileRenderController::drainResults()
             _cache.put(cacheKey, pixmap);
         }
 
-        if (_pendingSwapActive && result.epoch == _pendingSwapEpoch) {
-            stagePendingSwapTile(result.worldKey, pixmap,
-                                 static_cast<int8_t>(result.actualLevel), hasPixmap);
-            continue;
-        }
-
         // Apply to scene directly via world key
         if (hasPixmap &&
             _tileScene->setTileWorld(result.worldKey, pixmap, result.epoch,
                                      static_cast<int8_t>(result.actualLevel))) {
             anyUpdated = true;
         }
-    }
-
-    if (tryCommitPendingSwap()) {
-        anyUpdated = true;
     }
 
     // Ensure the scene repaints after progressive refinement updates.

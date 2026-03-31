@@ -3,7 +3,6 @@
 #include <QObject>
 
 #include <atomic>
-#include <chrono>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -49,10 +48,10 @@ public:
     // Number of pending + in-flight tasks
     int pendingCount() const;
 
-    // Check for timed-out tasks. If pending tasks have been waiting longer
-    // than the timeout and the pool is idle, reset the pending count.
-    // Returns true if any tasks were expired.
-    bool expireTimedOut(std::chrono::steady_clock::duration timeout = std::chrono::seconds(5));
+    // Reset stuck pending count when the pool is idle but pendingCount > 0
+    // (tasks lost to epoch filtering without going through pushResult).
+    // Returns true if the count was reset.
+    bool expireTimedOut();
 
 signals:
     // Emitted (from worker thread) when a result is ready.
@@ -68,9 +67,4 @@ private:
     std::vector<TileRenderResult> completedResults_;
     std::atomic<int> pendingCount_{0};
     std::atomic<bool> resultSignalPending_{false};  // debounce tileReady emission
-
-    // Track the oldest submission time to detect timed-out renders.
-    std::mutex timeMutex_;
-    std::chrono::steady_clock::time_point oldestSubmitTime_;
-    bool hasSubmissions_{false};
 };
