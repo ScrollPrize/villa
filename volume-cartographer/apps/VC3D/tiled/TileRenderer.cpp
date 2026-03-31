@@ -136,6 +136,10 @@ TileRenderResult TileRenderer::renderTile(
         if (coords.empty()) {
             return result;
         }
+    } else {
+        // Fused path skips coord generation; mark empty so overlay
+        // logic knows to generate coords lazily if needed.
+        coords.release();
     }
 
     // Quick reject: if the tile's world AABB doesn't intersect data bounds,
@@ -222,7 +226,10 @@ TileRenderResult TileRenderer::renderTile(
             gray, coords, normals, sp);
     } else if (usePlaneComposite) {
         cv::Vec3f planeNormal = plane->normal(cv::Vec3f(0, 0, 0));
-        cv::Mat_<cv::Vec3f> normals(coords.size(), planeNormal);
+        if (normals.size() != coords.size()) {
+            normals.create(coords.size());
+        }
+        normals.setTo(planeNormal);
 
         vc::SampleParams sp;
         sp.level = params.dsScaleIdx;
@@ -243,16 +250,54 @@ TileRenderResult TileRenderer::renderTile(
         sp.method = (params.useFastInterpolation || params.dsScaleIdx >= 3)
                         ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
 
+        // Determine blend factor
+        const float blend = params.dsBlendFactor;
+        const bool needBlend = blend > 0.0f && blend < 1.0f &&
+                               params.dsScaleIdxFine != params.dsScaleIdx &&
+                               volume->zarrDataset(params.dsScaleIdxFine);
+
+        // Fully fused ARGB32 path: sample voxels and apply window/level LUT
+        // in a single pass, writing directly to QImage memory. Eliminates
+        // the intermediate cv::Mat and the applyPostProcess second pass.
+        // Valid when no blend, no colormap, no stretch, core preprocessing
+        // is a no-op. Lighting is fused into the LUT (plane has constant normal).
+        const bool canFuseARGB32 = !needBlend &&
+            params.colormapId.empty() && !params.stretchValues &&
+            params.compositeSettings.params.isoCutoff == 0 &&
+            !params.compositeSettings.postStretchValues &&
+            !params.compositeSettings.postRemoveSmallComponents;
+
+        if (canFuseARGB32) {
+            // Compute lighting factor for constant plane normal (fused into LUT)
+            float lightFactor = 1.0f;
+            if (params.compositeSettings.params.lightingEnabled) {
+                cv::Vec3f planeN = plane->normal(cv::Vec3f(0, 0, 0));
+                lightFactor = computeLightingFactor(planeN,
+                    params.compositeSettings.params);
+            }
+
+            std::array<uint32_t, 256> lut;
+            buildWindowLevelLut(lut, params.windowLow, params.windowHigh,
+                                lightFactor);
+
+            // Write directly into QImage scanline buffer -- one pass, zero copies.
+            result.image = allocTileImage(params.tileW, params.tileH);
+            auto* bits = reinterpret_cast<uint32_t*>(result.image.bits());
+            const int stride = result.image.bytesPerLine() / 4;
+
+            result.actualLevel = volume->samplePlaneBestEffortARGB32(
+                bits, stride, planeOrigin, planeVxStep, planeVyStep,
+                params.tileW, params.tileH, sp, lut.data());
+            // Skip the gray post-process path; jump directly to overlay
+            goto overlay;
+        }
+
         result.actualLevel = volume->samplePlaneBestEffort(
             gray, planeOrigin, planeVxStep, planeVyStep,
             params.tileW, params.tileH, sp);
 
         // Blend with finer pyramid level for smooth zoom transitions
-        const float blend = params.dsBlendFactor;
-        if (blend > 0.0f && blend < 1.0f &&
-            params.dsScaleIdxFine != params.dsScaleIdx &&
-            volume->zarrDataset(params.dsScaleIdxFine)) {
-            cv::Mat_<uint8_t> grayFine;
+        if (needBlend) {
             vc::SampleParams spFine;
             spFine.level = params.dsScaleIdxFine;
             spFine.method = (params.useFastInterpolation || params.dsScaleIdxFine >= 3)
@@ -273,7 +318,7 @@ TileRenderResult TileRenderer::renderTile(
                     }
                 }
             } else if (gray.empty() && !grayFine.empty()) {
-                gray = grayFine;
+                std::swap(gray, grayFine);
             }
         }
 
@@ -305,7 +350,6 @@ TileRenderResult TileRenderer::renderTile(
         if (blend > 0.0f && blend < 1.0f &&
             params.dsScaleIdxFine != params.dsScaleIdx &&
             volume->zarrDataset(params.dsScaleIdxFine)) {
-            cv::Mat_<uint8_t> grayFine;
             vc::SampleParams spFine;
             spFine.level = params.dsScaleIdxFine;
             spFine.method = (params.useFastInterpolation || params.dsScaleIdxFine >= 3)
@@ -324,7 +368,7 @@ TileRenderResult TileRenderer::renderTile(
                     }
                 }
             } else if (gray.empty() && !grayFine.empty()) {
-                gray = grayFine;
+                std::swap(gray, grayFine);
             }
         }
 
@@ -368,26 +412,28 @@ TileRenderResult TileRenderer::renderTile(
         return result;
     }
 
-    // Unified post-processing: produces QImage::Format_RGB32 directly,
-    // bypassing all cvtColor conversions and RGB888→RGB32 expansion.
-    PostProcessParams pp;
-    pp.isoCutoff = params.compositeSettings.params.isoCutoff;
-    pp.windowLow = params.windowLow;
-    pp.windowHigh = params.windowHigh;
-    pp.stretchValues = params.stretchValues;
-    pp.colormapId = params.colormapId;
-    pp.postStretchValues = params.compositeSettings.postStretchValues;
-    pp.removeSmallComponents = params.compositeSettings.postRemoveSmallComponents;
-    pp.minComponentSize = params.compositeSettings.postMinComponentSize;
-    result.image = applyPostProcess(gray, pp);
+    {
+        // Unified post-processing: produces QImage::Format_RGB32 directly,
+        // bypassing all cvtColor conversions and RGB888->RGB32 expansion.
+        PostProcessParams pp;
+        pp.isoCutoff = params.compositeSettings.params.isoCutoff;
+        pp.windowLow = params.windowLow;
+        pp.windowHigh = params.windowHigh;
+        pp.stretchValues = params.stretchValues;
+        pp.colormapId = params.colormapId;
+        pp.postStretchValues = params.compositeSettings.postStretchValues;
+        pp.removeSmallComponents = params.compositeSettings.postRemoveSmallComponents;
+        pp.minComponentSize = params.compositeSettings.postMinComponentSize;
+        result.image = applyPostProcess(gray, pp);
+    }
 
+overlay:
     if (params.overlayVolume && params.overlayOpacity > 0.0f) {
-        // Overlay needs coords — generate them lazily if the fused path skipped it
+        // Overlay needs coords -- generate them lazily if the fused path skipped it
         if (coords.empty() && plane) {
             generateTileCoords(coords, params, surface);
         }
 
-        cv::Mat_<uint8_t> overlayGray;
         vc::SampleParams overlaySp;
         overlaySp.level = params.dsScaleIdx;
         const bool categoricalOverlay =

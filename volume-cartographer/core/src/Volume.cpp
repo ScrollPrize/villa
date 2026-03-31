@@ -497,18 +497,29 @@ static void applyOptionalPostProcess(cv::Mat_<uint8_t>& img,
 }
 
 // Helper: scale level-0 coords to pyramid level coords.
-static cv::Mat_<cv::Vec3f> scaleCoords(const cv::Mat_<cv::Vec3f>& coords, int level)
+static const cv::Mat_<cv::Vec3f>& scaleCoords(const cv::Mat_<cv::Vec3f>& coords, int level)
 {
     if (level <= 0) return coords;
+    // Thread-local buffer avoids per-tile allocation for the scaled copy
+    thread_local cv::Mat_<cv::Vec3f> scaled;
     float scale = 1.0f / static_cast<float>(1 << level);
-    return coords * scale;
+    if (scaled.rows != coords.rows || scaled.cols != coords.cols) {
+        scaled.create(coords.size());
+    }
+    const int total = coords.rows * coords.cols;
+    const auto* src = coords.ptr<cv::Vec3f>();
+    auto* dst = scaled.ptr<cv::Vec3f>();
+    for (int i = 0; i < total; ++i) {
+        dst[i] = src[i] * scale;
+    }
+    return scaled;
 }
 
 void Volume::sample(cv::Mat_<uint8_t>& out,
                     const cv::Mat_<cv::Vec3f>& coords,
                     const vc::SampleParams& params)
 {
-    auto scaled = scaleCoords(coords, params.level);
+    const auto& scaled = scaleCoords(coords, params.level);
     readInterpolated3D(out, tieredCache(), params.level, scaled, params.method);
     applyOptionalPostProcess(out, params);
 }
@@ -517,7 +528,7 @@ void Volume::sample(cv::Mat_<uint16_t>& out,
                     const cv::Mat_<cv::Vec3f>& coords,
                     const vc::SampleParams& params)
 {
-    auto scaled = scaleCoords(coords, params.level);
+    const auto& scaled = scaleCoords(coords, params.level);
     readInterpolated3D(out, tieredCache(), params.level, scaled, params.method);
 }
 
@@ -534,7 +545,7 @@ int Volume::sampleBestEffort(cv::Mat_<uint8_t>& out,
 
     for (int lvl = level; lvl < nScales; lvl++) {
         if (allChunksCachedFast(wb, lvl)) {
-            auto scaled = scaleCoords(coords, lvl);
+            const auto& scaled = scaleCoords(coords, lvl);
             readInterpolated3D(out, tieredCache(), lvl, scaled, params.method);
             if (lvl > level) {
                 // Prefetch desired level and one intermediate for progressive refinement
@@ -555,7 +566,7 @@ int Volume::sampleBestEffort(cv::Mat_<uint8_t>& out,
     // coarsest level (which is pinned hot in steady state, so this only blocks
     // during initial loading).  This matches sampleCompositeBestEffort behavior.
     int last = std::max(0, nScales - 1);
-    auto scaled = scaleCoords(coords, last);
+    const auto& scaled = scaleCoords(coords, last);
     readInterpolated3D(out, tieredCache(), last, scaled, params.method);
     if (last > level) {
         prefetchChunks(coords, level);
@@ -573,7 +584,7 @@ void Volume::sampleComposite(cv::Mat_<uint8_t>& out,
                               const vc::SampleParams& params)
 {
     float scale = (params.level > 0) ? (1.0f / static_cast<float>(1 << params.level)) : 1.0f;
-    auto scaled = scaleCoords(coords, params.level);
+    const auto& scaled = scaleCoords(coords, params.level);
     readCompositeFast(out, tieredCache(), params.level, scaled, normals, scale,
                       params.zStart, params.zEnd,
                       params.composite.value_or(CompositeParams{}),
@@ -681,6 +692,75 @@ int Volume::samplePlaneBestEffort(cv::Mat_<uint8_t>& out,
     }
     if (!out.empty())
         applyOptionalPostProcess(out, params);
+    return last;
+}
+
+int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
+                                         const cv::Vec3f& origin,
+                                         const cv::Vec3f& vx_step,
+                                         const cv::Vec3f& vy_step,
+                                         int width, int height,
+                                         const vc::SampleParams& params,
+                                         const uint32_t lut[256])
+{
+    const int nScales = static_cast<int>(numScales());
+    const int level = params.level;
+
+    // Compute world-space bounding box from the 4 corners of the plane
+    cv::Vec3f corners[4] = {
+        origin,
+        origin + vx_step * static_cast<float>(width - 1),
+        origin + vy_step * static_cast<float>(height - 1),
+        origin + vx_step * static_cast<float>(width - 1) + vy_step * static_cast<float>(height - 1)
+    };
+    WorldBBox wb;
+    wb.loX = corners[0][0]; wb.hiX = corners[0][0];
+    wb.loY = corners[0][1]; wb.hiY = corners[0][1];
+    wb.loZ = corners[0][2]; wb.hiZ = corners[0][2];
+    for (int c = 1; c < 4; c++) {
+        wb.loX = std::min(wb.loX, corners[c][0]); wb.hiX = std::max(wb.hiX, corners[c][0]);
+        wb.loY = std::min(wb.loY, corners[c][1]); wb.hiY = std::max(wb.hiY, corners[c][1]);
+        wb.loZ = std::min(wb.loZ, corners[c][2]); wb.hiZ = std::max(wb.hiZ, corners[c][2]);
+    }
+
+    for (int lvl = level; lvl < nScales; lvl++) {
+        if (allChunksCachedFast(wb, lvl)) {
+            float scale = (lvl > 0) ? (1.0f / static_cast<float>(1 << lvl)) : 1.0f;
+            samplePlaneARGB32(outBuf, outStride, tieredCache(), lvl,
+                              origin * scale, vx_step * scale, vy_step * scale,
+                              width, height, params.method, lut);
+            if (lvl > level) {
+                prefetchWorldBBox(
+                    cv::Vec3f(wb.loX, wb.loY, wb.loZ),
+                    cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level);
+                if (lvl - level > 1)
+                    prefetchWorldBBox(
+                        cv::Vec3f(wb.loX, wb.loY, wb.loZ),
+                        cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level + 1);
+            } else if (lvl > 0) {
+                prefetchWorldBBox(
+                    cv::Vec3f(wb.loX, wb.loY, wb.loZ),
+                    cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), lvl - 1);
+            }
+            return lvl;
+        }
+    }
+
+    // No level cached -- block at coarsest level
+    int last = std::max(0, nScales - 1);
+    float scale = (last > 0) ? (1.0f / static_cast<float>(1 << last)) : 1.0f;
+    samplePlaneARGB32(outBuf, outStride, tieredCache(), last,
+                      origin * scale, vx_step * scale, vy_step * scale,
+                      width, height, params.method, lut);
+    if (last > level) {
+        prefetchWorldBBox(
+            cv::Vec3f(wb.loX, wb.loY, wb.loZ),
+            cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level);
+        if (last - level > 1)
+            prefetchWorldBBox(
+                cv::Vec3f(wb.loX, wb.loY, wb.loZ),
+                cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level + 1);
+    }
     return last;
 }
 

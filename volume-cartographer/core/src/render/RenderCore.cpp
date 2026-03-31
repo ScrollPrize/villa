@@ -12,6 +12,22 @@
 #include <thread>
 #include <vector>
 
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
+// Non-temporal store for write-only ARGB32 output — bypasses cache,
+// freeing cache lines for read-heavy LUT/chunk data.
+static inline void nt_store_u32(uint32_t* dst, uint32_t val) {
+#if defined(__x86_64__)
+    _mm_stream_si32(reinterpret_cast<int*>(dst), static_cast<int>(val));
+#elif defined(__aarch64__) && __has_builtin(__builtin_nontemporal_store)
+    __builtin_nontemporal_store(val, dst);
+#else
+    *dst = val;
+#endif
+}
+
 namespace vc::render {
 
 // ============================================================================
@@ -211,13 +227,14 @@ int RenderCore::render()
         cv::Mat_<uint8_t> gray;
         volume_->samplePlaneBestEffort(gray, tileOrigin, vxStep, vyStep, tw, th, sp);
 
-        // Write ARGB32 into framebuffer via the fused LUT
+        // Write ARGB32 into framebuffer via the fused LUT.
+        // Non-temporal stores bypass the cache for write-only output.
         if (!gray.empty()) {
             for (int row = 0; row < th; ++row) {
                 const uint8_t* src = gray.ptr<uint8_t>(row);
                 uint32_t* dst = pixels_.get() + (y0 + row) * width_ + x0;
                 for (int col = 0; col < tw; ++col) {
-                    dst[col] = lut_[src[col]];
+                    nt_store_u32(&dst[col], lut_[src[col]]);
                 }
             }
         } else {

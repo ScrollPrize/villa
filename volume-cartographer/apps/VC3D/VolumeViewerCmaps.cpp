@@ -1,10 +1,27 @@
 #include "VolumeViewerCmaps.hpp"
+#include "tiled/PostProcess.hpp"
 
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
+// Non-temporal store for write-only ARGB32 output — bypasses cache,
+// freeing cache lines for read-heavy LUT/chunk data.
+static inline void nt_store_u32(uint32_t* dst, uint32_t val) {
+#if defined(__x86_64__)
+    _mm_stream_si32(reinterpret_cast<int*>(dst), static_cast<int>(val));
+#elif defined(__aarch64__) && __has_builtin(__builtin_nontemporal_store)
+    __builtin_nontemporal_store(val, dst);
+#else
+    *dst = val;
+#endif
+}
 
 namespace volume_viewer_cmaps
 {
@@ -17,13 +34,13 @@ QImage applyPackedLut(const cv::Mat_<uint8_t>& values, const uint32_t* lut)
 {
     const int rows = values.rows;
     const int cols = values.cols;
-    QImage result(cols, rows, QImage::Format_RGB32);
+    QImage result = allocTileImage(cols, rows);
 
     for (int y = 0; y < rows; ++y) {
         const auto* src = values.ptr<uint8_t>(y);
         auto* dst = reinterpret_cast<uint32_t*>(result.scanLine(y));
         for (int x = 0; x < cols; ++x) {
-            dst[x] = lut[src[x]];
+            nt_store_u32(&dst[x], lut[src[x]]);
         }
     }
 

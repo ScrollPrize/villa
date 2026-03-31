@@ -2,10 +2,49 @@
 #include "VolumeViewerCmaps.hpp"
 
 #include <opencv2/imgproc.hpp>
+#include <utils/slab_allocator.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
+// Non-temporal store for write-only ARGB32 output — bypasses cache,
+// freeing cache lines for read-heavy LUT/chunk data.
+static inline void nt_store_u32(uint32_t* dst, uint32_t val) {
+#if defined(__x86_64__)
+    _mm_stream_si32(reinterpret_cast<int*>(dst), static_cast<int>(val));
+#elif defined(__aarch64__) && __has_builtin(__builtin_nontemporal_store)
+    __builtin_nontemporal_store(val, dst);
+#else
+    *dst = val;
+#endif
+}
+
+// Global lock-free slab pool for 512x512 ARGB32 tile buffers (1 MB each).
+// Workers allocate on render threads; main thread frees when QImage is destroyed.
+// Atomic CAS stack keeps contention minimal across threads.
+static utils::TileBufferSlab& tileBufferSlab()
+{
+    static utils::TileBufferSlab slab;
+    return slab;
+}
+
+static void slabCleanup(void* ptr) { tileBufferSlab().deallocate(ptr); }
+
+QImage allocTileImage(int cols, int rows)
+{
+    const size_t needed = static_cast<size_t>(cols) * rows * 4;
+    if (needed <= utils::TileBufferSlab::slab_size()) {
+        auto* buf = static_cast<uchar*>(tileBufferSlab().allocate());
+        return QImage(buf, cols, rows, cols * 4, QImage::Format_RGB32,
+                      slabCleanup, buf);
+    }
+    return QImage(cols, rows, QImage::Format_RGB32);
+}
 
 // Build a fused uint32_t[256] LUT: window/level (or stretch) + gray→ARGB32.
 // Eliminates the intermediate uint8 Mat that cv::LUT would produce.
@@ -68,13 +107,13 @@ static void applyFusedLut(const cv::Mat_<uint8_t>& gray,
         // overhead and lets the CPU pipeline overlapping loads/stores.
         const int cols4 = cols - 3;
         for (; x < cols4; x += 4) {
-            dst[x + 0] = lut[src[x + 0]];
-            dst[x + 1] = lut[src[x + 1]];
-            dst[x + 2] = lut[src[x + 2]];
-            dst[x + 3] = lut[src[x + 3]];
+            nt_store_u32(&dst[x + 0], lut[src[x + 0]]);
+            nt_store_u32(&dst[x + 1], lut[src[x + 1]]);
+            nt_store_u32(&dst[x + 2], lut[src[x + 2]]);
+            nt_store_u32(&dst[x + 3], lut[src[x + 3]]);
         }
         for (; x < cols; ++x) {
-            dst[x] = lut[src[x]];
+            nt_store_u32(&dst[x], lut[src[x]]);
         }
     }
 }
@@ -126,11 +165,33 @@ QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
     // Single-pass: gray → RGB32 via fused LUT (4x unrolled)
     const int rows = gray.rows;
     const int cols = gray.cols;
-    QImage result(cols, rows, QImage::Format_RGB32);
+    QImage result = allocTileImage(cols, rows);
 
     auto* bits = reinterpret_cast<uint32_t*>(result.bits());
     const int stride = result.bytesPerLine() / 4;
     applyFusedLut(gray, lut, bits, stride);
 
     return result;
+}
+
+void buildWindowLevelLut(std::array<uint32_t, 256>& lut,
+                         float windowLow, float windowHigh,
+                         float lightFactor)
+{
+    const int lo = static_cast<int>(std::clamp(windowLow, 0.0f, 255.0f));
+    const int hi = static_cast<int>(
+        std::clamp(windowHigh, static_cast<float>(lo + 1), 255.0f));
+    const float span = std::max(1.0f, static_cast<float>(hi - lo));
+    const bool applyLight = lightFactor < 1.0f;
+    for (int i = 0; i < 256; ++i) {
+        float lit = applyLight
+            ? std::clamp(static_cast<float>(i) * lightFactor, 0.0f, 255.0f)
+            : static_cast<float>(i);
+        uint8_t v = static_cast<uint8_t>(
+            std::clamp((lit - static_cast<float>(lo))
+                       / span * 255.0f, 0.0f, 255.0f));
+        lut[i] = 0xFF000000u | (static_cast<uint32_t>(v) << 16)
+                              | (static_cast<uint32_t>(v) << 8)
+                              | static_cast<uint32_t>(v);
+    }
 }

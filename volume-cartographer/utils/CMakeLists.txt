@@ -22,6 +22,7 @@ set(UTILS_HEADERS
     http_fetch
     thread_pool
     compression
+    slab_allocator
 )
 
 foreach(header ${UTILS_HEADERS})

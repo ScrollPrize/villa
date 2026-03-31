@@ -1,103 +1,155 @@
 // WASM entry point for vc3d-web.
 // Exports C functions callable from JavaScript via Emscripten.
+// Uses the RenderCore C API (same interface as native vc3d).
 
-#include "renderer.hpp"
-#include "chunk_cache.hpp"
-
+#include <cstdint>
 #include <emscripten/emscripten.h>
 
-static Renderer g_renderer;
-static ChunkCache g_cache;
-static std::vector<LevelMeta> g_levels;
+// RenderCore C API (implemented in RenderCore_wasm.cpp)
+extern "C" {
+    void*           vc3d_create(int width, int height);
+    void            vc3d_destroy(void* ctx);
+    void            vc3d_resize(void* ctx, int width, int height);
+    void            vc3d_set_plane(void* ctx, float ox, float oy, float oz,
+                                   float nx, float ny, float nz);
+    void            vc3d_pan(void* ctx, float dx, float dy);
+    void            vc3d_zoom(void* ctx, float factor);
+    void            vc3d_scroll(void* ctx, float dz);
+    void            vc3d_set_window_level(void* ctx, float window, float level);
+    int             vc3d_render(void* ctx);
+    const uint32_t* vc3d_pixels(void* ctx);
+    int             vc3d_width(void* ctx);
+    int             vc3d_height(void* ctx);
+
+    // WASM-specific chunk API
+    void  vc3d_add_level(void* ctx, int sz, int sy, int sx,
+                         int cz, int cy, int cx);
+    void  vc3d_reset_levels(void* ctx);
+    void  vc3d_set_cache_max(void* ctx, int maxBytes);
+    void  vc3d_load_chunk(void* ctx, int level, int iz, int iy, int ix,
+                          const uint8_t* data, int size);
+    int   vc3d_cache_count(void* ctx);
+    int   vc3d_cache_bytes(void* ctx);
+    float vc3d_scale(void* ctx);
+    float vc3d_z_offset(void* ctx);
+    int   vc3d_pyramid_level(void* ctx);
+    int   vc3d_num_levels(void* ctx);
+    float vc3d_origin_x(void* ctx);
+    float vc3d_origin_y(void* ctx);
+    float vc3d_origin_z(void* ctx);
+}
+
+// Single global context (one viewer per page)
+static void* g_ctx = nullptr;
+
+// ============================================================================
+// Emscripten exports -- thin wrappers around the C API with the global context
+// ============================================================================
 
 extern "C" {
 
-// Initialize the renderer with given canvas dimensions.
 EMSCRIPTEN_KEEPALIVE
-void vc3d_init(int width, int height) {
-    g_renderer.init(width, height);
+void wasm_init(int width, int height) {
+    if (g_ctx) vc3d_destroy(g_ctx);
+    g_ctx = vc3d_create(width, height);
 }
 
-// Resize the renderer (e.g., on window resize).
 EMSCRIPTEN_KEEPALIVE
-void vc3d_resize(int width, int height) {
-    g_renderer.resize(width, height);
+void wasm_resize(int width, int height) {
+    if (g_ctx) vc3d_resize(g_ctx, width, height);
 }
 
-// Configure volume metadata: add a pyramid level.
-// shape_z/y/x = volume dimensions at this level.
-// chunk_z/y/x = chunk dimensions at this level.
 EMSCRIPTEN_KEEPALIVE
-void vc3d_add_level(int shape_z, int shape_y, int shape_x,
-                    int chunk_z, int chunk_y, int chunk_x) {
-    g_levels.push_back(LevelMeta{{shape_z, shape_y, shape_x},
-                                 {chunk_z, chunk_y, chunk_x}});
-    g_cache.setLevels(g_levels);
+void wasm_add_level(int sz, int sy, int sx, int cz, int cy, int cx) {
+    if (g_ctx) vc3d_add_level(g_ctx, sz, sy, sx, cz, cy, cx);
 }
 
-// Reset level metadata (call before re-adding levels for a new volume).
 EMSCRIPTEN_KEEPALIVE
-void vc3d_reset_levels() {
-    g_levels.clear();
-    g_cache.setLevels({});
+void wasm_reset_levels() {
+    if (g_ctx) vc3d_reset_levels(g_ctx);
 }
 
-// Set the slice plane with origin and two basis vectors.
-// All coordinates in voxel space at the current pyramid level.
 EMSCRIPTEN_KEEPALIVE
-void vc3d_set_plane(float ox, float oy, float oz,
-                    float vx_x, float vx_y, float vx_z,
-                    float vy_x, float vy_y, float vy_z) {
-    g_renderer.setPlane(ox, oy, oz, vx_x, vx_y, vx_z, vy_x, vy_y, vy_z);
+void wasm_set_plane(float ox, float oy, float oz,
+                    float nx, float ny, float nz) {
+    if (g_ctx) vc3d_set_plane(g_ctx, ox, oy, oz, nx, ny, nz);
 }
 
-// Convenience: set an axis-aligned XY slice at given Z depth.
-// scale = zoom factor (pixels per voxel), panX/panY in pixels.
 EMSCRIPTEN_KEEPALIVE
-void vc3d_set_slice(float z, float scale, float panX, float panY) {
-    g_renderer.setAxisAlignedSlice(z, scale, panX, panY);
+void wasm_pan(float dx, float dy) {
+    if (g_ctx) vc3d_pan(g_ctx, dx, dy);
 }
 
-// Set the pyramid level to render from.
 EMSCRIPTEN_KEEPALIVE
-void vc3d_set_level(int level) {
-    g_renderer.setLevel(level);
+void wasm_zoom(float factor) {
+    if (g_ctx) vc3d_zoom(g_ctx, factor);
 }
 
-// Set maximum cache size in bytes.
 EMSCRIPTEN_KEEPALIVE
-void vc3d_set_cache_max(int maxBytes) {
-    g_cache.setMaxBytes(static_cast<size_t>(maxBytes));
+void wasm_scroll(float dz) {
+    if (g_ctx) vc3d_scroll(g_ctx, dz);
 }
 
-// Load a decompressed chunk into the cache.
-// data = pointer to raw uint8 voxel data in ZYX row-major order.
-// size = byte count (should be chunk_z * chunk_y * chunk_x).
 EMSCRIPTEN_KEEPALIVE
-void vc3d_load_chunk(int level, int iz, int iy, int ix,
+void wasm_set_window_level(float window, float level) {
+    if (g_ctx) vc3d_set_window_level(g_ctx, window, level);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void wasm_set_cache_max(int maxBytes) {
+    if (g_ctx) vc3d_set_cache_max(g_ctx, maxBytes);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void wasm_load_chunk(int level, int iz, int iy, int ix,
                      const uint8_t* data, int size) {
-    g_cache.loadChunk(level, iz, iy, ix, data, static_cast<size_t>(size));
+    if (g_ctx) vc3d_load_chunk(g_ctx, level, iz, iy, ix, data, size);
 }
 
-// Render the current view. Returns pointer to RGBA pixel data
-// (width * height * 4 bytes). Valid until next render() call.
 EMSCRIPTEN_KEEPALIVE
-const uint8_t* vc3d_render() {
-    return g_renderer.render(g_cache);
+int wasm_render() {
+    if (!g_ctx) return 0;
+    return vc3d_render(g_ctx);
 }
 
-// Query current canvas dimensions.
+// Returns pointer to ARGB32 pixels (width * height * 4 bytes).
 EMSCRIPTEN_KEEPALIVE
-int vc3d_width() { return g_renderer.width(); }
+const uint32_t* wasm_pixels() {
+    if (!g_ctx) return nullptr;
+    return vc3d_pixels(g_ctx);
+}
 
 EMSCRIPTEN_KEEPALIVE
-int vc3d_height() { return g_renderer.height(); }
-
-// Query cache stats.
-EMSCRIPTEN_KEEPALIVE
-int vc3d_cache_count() { return static_cast<int>(g_cache.count()); }
+int wasm_width() { return g_ctx ? vc3d_width(g_ctx) : 0; }
 
 EMSCRIPTEN_KEEPALIVE
-int vc3d_cache_bytes() { return static_cast<int>(g_cache.totalBytes()); }
+int wasm_height() { return g_ctx ? vc3d_height(g_ctx) : 0; }
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_cache_count() { return g_ctx ? vc3d_cache_count(g_ctx) : 0; }
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_cache_bytes() { return g_ctx ? vc3d_cache_bytes(g_ctx) : 0; }
+
+EMSCRIPTEN_KEEPALIVE
+float wasm_scale() { return g_ctx ? vc3d_scale(g_ctx) : 1.0f; }
+
+EMSCRIPTEN_KEEPALIVE
+float wasm_z_offset() { return g_ctx ? vc3d_z_offset(g_ctx) : 0.0f; }
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_pyramid_level() { return g_ctx ? vc3d_pyramid_level(g_ctx) : 0; }
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_num_levels() { return g_ctx ? vc3d_num_levels(g_ctx) : 0; }
+
+EMSCRIPTEN_KEEPALIVE
+float wasm_origin_x() { return g_ctx ? vc3d_origin_x(g_ctx) : 0.0f; }
+
+EMSCRIPTEN_KEEPALIVE
+float wasm_origin_y() { return g_ctx ? vc3d_origin_y(g_ctx) : 0.0f; }
+
+EMSCRIPTEN_KEEPALIVE
+float wasm_origin_z() { return g_ctx ? vc3d_origin_z(g_ctx) : 0.0f; }
 
 } // extern "C"

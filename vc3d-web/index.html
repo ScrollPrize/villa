@@ -379,35 +379,23 @@ function fetchVisibleChunks() {
     const invZoom = 1.0 / scale;
     const levelScale = 1.0 / (1 << level);
 
-    // The RenderCore uses a center-origin model. The visible region in
-    // world coordinates spans +/- (w/2) / scale and +/- (h/2) / scale
-    // around the origin. We need to know the origin to compute chunk ranges.
-    // For now, read origin from the level-0 shape center (set at load time)
-    // plus any pan offsets. Since we can't read origin back from WASM easily,
-    // we track it approximately via the level-0 shape.
-    //
-    // The actual visible world-space range is computed from the plane equation.
-    // For an axis-aligned Z-normal plane, the visible X range at level coords is:
-    //   centerX * levelScale +/- (w/2) * invZoom * levelScale
+    // Read the actual origin from the RenderCore (tracks pan offsets).
+    // For the Z-normal axis-aligned case: origin.x maps to voxel X,
+    // origin.y maps to voxel Y, origin.z + zOff maps to voxel Z.
+    const originX = state.wasm._wasm_origin_x();
+    const originY = state.wasm._wasm_origin_y();
+    const originZ = state.wasm._wasm_origin_z() + zOff;
 
-    // Use a conservative approach: fetch chunks covering the whole visible area
-    // We'll compute approximate center from shape
-    const s0 = state.levels[0].shape;
     const halfW = (w / 2.0) * invZoom;
     const halfH = (h / 2.0) * invZoom;
 
-    // Approximate center (we set origin at volume center on load)
-    // For the Z-normal axis-aligned case, the visible range in level coords is:
-    const centerX = s0[2] / 2.0;
-    const centerY = s0[1] / 2.0;
-    const centerZ = s0[0] / 2.0 + zOff;
-
-    const minX = (centerX - halfW) * levelScale;
-    const maxX = (centerX + halfW) * levelScale;
-    const minY = (centerY - halfH) * levelScale;
-    const maxY = (centerY + halfH) * levelScale;
-    const minZ = centerZ * levelScale;
-    const maxZ = centerZ * levelScale;
+    // Visible world-space range, scaled to this pyramid level
+    const minX = (originX - halfW) * levelScale;
+    const maxX = (originX + halfW) * levelScale;
+    const minY = (originY - halfH) * levelScale;
+    const maxY = (originY + halfH) * levelScale;
+    const minZ = originZ * levelScale;
+    const maxZ = originZ * levelScale;
 
     const minCz = Math.max(0, Math.floor((minZ - 1) / cs[0]));
     const maxCz = Math.min(Math.ceil(lvl.shape[0] / cs[0]) - 1,

@@ -2,6 +2,7 @@
 
 #include <QImage>
 #include <opencv2/core.hpp>
+#include <array>
 #include <string>
 #include <cstdint>
 
@@ -51,6 +52,14 @@ struct PostProcessParams {
 //   5. Colormap or grayscale → RGB32
 QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
                         const PostProcessParams& params);
+
+// Build a window/level LUT mapping uint8 -> ARGB32 for the fused sampling path.
+// Only valid for non-stretch grayscale mode (no colormap, no stretchValues).
+// An optional lightFactor (0..1) scales voxel values before the window/level
+// mapping, fusing directional lighting into the same LUT.
+void buildWindowLevelLut(std::array<uint32_t, 256>& lut,
+                         float windowLow, float windowHigh,
+                         float lightFactor = 1.0f);
 
 // Allocate a QImage backed by a lock-free slab pool (1 MB for 512x512 ARGB32).
 // Buffer is returned to the pool when the QImage is destroyed. Falls back to

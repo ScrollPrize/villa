@@ -405,4 +405,8 @@ int vc3d_num_levels(void* ctx)
     return static_cast<int>(RC(ctx)->levels.size());
 }
 
+float vc3d_origin_x(void* ctx) { return RC(ctx)->origin[0]; }
+float vc3d_origin_y(void* ctx) { return RC(ctx)->origin[1]; }
+float vc3d_origin_z(void* ctx) { return RC(ctx)->origin[2]; }
+
 } // extern "C"

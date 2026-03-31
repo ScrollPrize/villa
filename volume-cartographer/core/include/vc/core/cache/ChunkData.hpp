@@ -23,6 +23,8 @@ struct ChunkData {
     HugePageBuffer hugeBuf;              // 2MB-aligned buffer from pool
     std::array<int, 3> shape{0, 0, 0};   // {z, y, x}
     int elementSize = 1;                  // bytes per element (1=u8, 2=u16, 4=f32)
+    bool blockLayout = false;             // true = 16^3 block layout, false = row-major
+    bool isEmpty = false;                 // true = all voxels are zero (skip sampling)
 
     [[nodiscard]] size_t numElements() const noexcept
     {

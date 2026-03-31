@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(vc3d-web
     src/main.cpp
-    src/renderer.cpp
+    src/RenderCore_wasm.cpp
 )
 
 target_include_directories(vc3d-web PRIVATE src)
@@ -22,20 +22,30 @@ if(EMSCRIPTEN)
     # -s MODULARIZE: wrap in a factory function for cleaner loading
     # -s EXPORT_NAME: name of the factory function
     set(EXPORTED_FUNCS
-        "_vc3d_init"
-        "_vc3d_resize"
-        "_vc3d_add_level"
-        "_vc3d_reset_levels"
-        "_vc3d_set_plane"
-        "_vc3d_set_slice"
-        "_vc3d_set_level"
-        "_vc3d_set_cache_max"
-        "_vc3d_load_chunk"
-        "_vc3d_render"
-        "_vc3d_width"
-        "_vc3d_height"
-        "_vc3d_cache_count"
-        "_vc3d_cache_bytes"
+        "_wasm_init"
+        "_wasm_resize"
+        "_wasm_add_level"
+        "_wasm_reset_levels"
+        "_wasm_set_plane"
+        "_wasm_pan"
+        "_wasm_zoom"
+        "_wasm_scroll"
+        "_wasm_set_window_level"
+        "_wasm_set_cache_max"
+        "_wasm_load_chunk"
+        "_wasm_render"
+        "_wasm_pixels"
+        "_wasm_width"
+        "_wasm_height"
+        "_wasm_cache_count"
+        "_wasm_cache_bytes"
+        "_wasm_scale"
+        "_wasm_z_offset"
+        "_wasm_pyramid_level"
+        "_wasm_num_levels"
+        "_wasm_origin_x"
+        "_wasm_origin_y"
+        "_wasm_origin_z"
         "_malloc"
         "_free"
     )

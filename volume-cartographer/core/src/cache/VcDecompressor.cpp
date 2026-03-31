@@ -11,6 +11,44 @@
 
 namespace vc::cache {
 
+// Reorder row-major data into 16^3 block layout.
+// Each 16x16x16 block becomes a contiguous 4KB region.
+// Z, Y, X are chunk dimensions (must be multiples of 16).
+static void reorderToBlocks16(uint8_t* dst, const uint8_t* src, int Z, int Y, int X)
+{
+    for (int bz = 0; bz < Z / 16; bz++)
+        for (int by = 0; by < Y / 16; by++)
+            for (int bx = 0; bx < X / 16; bx++) {
+                int blockIdx = bz * (Y / 16) * (X / 16) + by * (X / 16) + bx;
+                uint8_t* blk = dst + blockIdx * 4096;
+                for (int lz = 0; lz < 16; lz++)
+                    for (int ly = 0; ly < 16; ly++) {
+                        int srcZ = bz * 16 + lz, srcY = by * 16 + ly, srcX = bx * 16;
+                        memcpy(blk + lz * 256 + ly * 16, src + srcZ * Y * X + srcY * X + srcX, 16);
+                    }
+            }
+}
+
+// Check if block layout is applicable: all dims must be multiples of 16.
+static bool canUseBlockLayout(int z, int y, int x)
+{
+    return (z & 15) == 0 && (y & 15) == 0 && (x & 15) == 0;
+}
+
+// Check if all bytes in a chunk are zero.
+static bool isChunkEmpty(const uint8_t* data, size_t n)
+{
+    // Check 8 bytes at a time
+    const uint64_t* p = reinterpret_cast<const uint64_t*>(data);
+    size_t n8 = n / 8;
+    for (size_t i = 0; i < n8; i++)
+        if (p[i]) return false;
+    for (size_t i = n8 * 8; i < n; i++)
+        if (data[i]) return false;
+    return true;
+}
+
+
 // Thread-local pool of pre-allocated ChunkData objects to avoid
 // malloc/free churn on every decompress (0.46% of CPU in profiles).
 // Each thread keeps up to 4 recycled buffers. When a ChunkDataPtr's
@@ -99,23 +137,34 @@ DecompressFn makeVcDecompressor(const std::vector<vc::VcDataset*>& datasets)
                     compressed.size()),
                 size_t(dims[0]) * dims[1] * dims[2], vp);
 
-            auto result = acquireChunkData(chunkSize);
-            result->shape = {
-                static_cast<int>(chunkShape[0]),
-                static_cast<int>(chunkShape[1]),
-                static_cast<int>(chunkShape[2])};
-            result->elementSize = 1;
+            int cz = static_cast<int>(chunkShape[0]);
+            int cy = static_cast<int>(chunkShape[1]);
+            int cx = static_cast<int>(chunkShape[2]);
             size_t copySize = std::min(decoded.size(), chunkSize);
-            std::memcpy(result->rawData(), decoded.data(), copySize);
+
+            auto result = acquireChunkData(chunkSize);
+            result->shape = {cz, cy, cx};
+            result->elementSize = 1;
+
+            if (canUseBlockLayout(cz, cy, cx)) {
+                reorderToBlocks16(result->rawData(),
+                    reinterpret_cast<const uint8_t*>(decoded.data()), cz, cy, cx);
+                result->blockLayout = true;
+            } else {
+                std::memcpy(result->rawData(), decoded.data(), copySize);
+                result->blockLayout = false;
+            }
+            result->isEmpty = isChunkEmpty(result->rawData(), chunkSize);
             return result;
         }
 #endif
 
+        int cz = static_cast<int>(chunkShape[0]);
+        int cy = static_cast<int>(chunkShape[1]);
+        int cx = static_cast<int>(chunkShape[2]);
+
         auto result = acquireChunkData(bufferBytes);
-        result->shape = {
-            static_cast<int>(chunkShape[0]),
-            static_cast<int>(chunkShape[1]),
-            static_cast<int>(chunkShape[2])};
+        result->shape = {cz, cy, cx};
         result->elementSize = 1;
 
         // Normal zarr decompression path
@@ -134,6 +183,17 @@ DecompressFn makeVcDecompressor(const std::vector<vc::VcDataset*>& datasets)
             return nullptr;
         }
 
+        // Reorder to 16^3 block layout if applicable
+        if (canUseBlockLayout(cz, cy, cx)) {
+            thread_local std::vector<uint8_t> scratch;
+            if (scratch.size() < chunkSize)
+                scratch.resize(chunkSize);
+            std::memcpy(scratch.data(), result->rawData(), chunkSize);
+            reorderToBlocks16(result->rawData(), scratch.data(), cz, cy, cx);
+            result->blockLayout = true;
+        }
+
+        result->isEmpty = isChunkEmpty(result->rawData(), chunkSize);
         return result;
     };
 }
