@@ -267,6 +267,11 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
             &QFutureWatcher<std::vector<IntersectionPathEntry>>::finished,
             this, &CTiledVolumeViewer::onIntersectionComputeFinished);
 
+    // Momentum / kinetic scrolling timer (16ms = 60fps)
+    _momentumTimer = new QTimer(this);
+    _momentumTimer->setInterval(16);
+    connect(_momentumTimer, &QTimer::timeout, this, &CTiledVolumeViewer::momentumTick);
+
 }
 
 CTiledVolumeViewer::~CTiledVolumeViewer()
@@ -974,13 +979,23 @@ void CTiledVolumeViewer::onZoom(int steps, QPointF scene_point, Qt::KeyboardModi
             setSliceOffset(static_cast<float>(adjustedSteps));
         }
     } else {
-        // One zoom stop per scroll tick, regardless of scroll delta magnitude
+        // Apply zoom immediately AND add momentum for smooth coast
         int zoomDir = (steps > 0) ? 1 : (steps < 0) ? -1 : 0;
         if (zoomDir != 0) {
             zoomStepsAt(zoomDir, scene_point);
+            // Accumulate zoom momentum
+            _momentumZoomV = _momentumZoomV * 0.5f + zoomDir * 0.8f;
+            _momentumZoomAnchor = scene_point;
+            if (!_momentumTimer->isActive()) _momentumTimer->start();
         }
     }
 
+    // Add slice momentum
+    if (modifiers & Qt::ShiftModifier) {
+        float sliceDir = (steps > 0) ? 1.0f : -1.0f;
+        _momentumSliceV = _momentumSliceV * 0.5f + sliceDir * _navSpeed * 0.6f;
+        if (!_momentumTimer->isActive()) _momentumTimer->start();
+    }
 }
 
 void CTiledVolumeViewer::adjustZoomByFactor(float factor)
@@ -1017,6 +1032,11 @@ void CTiledVolumeViewer::resetSurfaceOffsets()
 void CTiledVolumeViewer::onPanStart(Qt::MouseButton /*buttons*/, Qt::KeyboardModifiers /*modifiers*/)
 {
     _isPanning = true;
+    // Cancel any active momentum
+    _momentumTimer->stop();
+    _momentumPanVx = _momentumPanVy = 0.0f;
+    _momentumZoomV = 0.0f;
+    _momentumSliceV = 0.0f;
     if (_interactionSettleTimer) {
         _interactionSettleTimer->stop();
     }
@@ -1034,10 +1054,19 @@ void CTiledVolumeViewer::onPanStart(Qt::MouseButton /*buttons*/, Qt::KeyboardMod
 void CTiledVolumeViewer::onPanRelease(Qt::MouseButton /*buttons*/, Qt::KeyboardModifiers /*modifiers*/)
 {
     _isPanning = false;
-    _interactionQualityActive = false;
-    _camera.invalidate();
-    submitRender();
-    scheduleOverlayUpdate();
+
+    // Start momentum coasting if velocity is significant
+    float speed = std::sqrt(_momentumPanVx * _momentumPanVx + _momentumPanVy * _momentumPanVy);
+    if (speed > 2.0f) {
+        if (!_momentumTimer->isActive()) _momentumTimer->start();
+        // Don't settle yet — momentum tick will handle it
+    } else {
+        _momentumPanVx = _momentumPanVy = 0.0f;
+        _interactionQualityActive = false;
+        _camera.invalidate();
+        submitRender();
+        scheduleOverlayUpdate();
+    }
 }
 
 void CTiledVolumeViewer::onScrolled()
@@ -1415,6 +1444,9 @@ void CTiledVolumeViewer::onCursorMove(QPointF scene_loc)
         _lastPanPos = currentPos;
         if (delta.x() != 0 || delta.y() != 0) {
             panBy(-delta.x(), -delta.y());
+            // Track velocity for momentum (exponential moving average)
+            _momentumPanVx = _momentumPanVx * 0.3f + (-delta.x()) * 0.7f;
+            _momentumPanVy = _momentumPanVy * 0.3f + (-delta.y()) * 0.7f;
         }
 
         const QPoint viewportPos = fGraphicsView->viewport()->mapFromGlobal(currentPos);
@@ -2275,6 +2307,72 @@ void CTiledVolumeViewer::invalidateIntersect(const std::string& /*name*/)
         }
     }
     _ov.intersectItems.clear();
+}
+
+void CTiledVolumeViewer::momentumTick()
+{
+    constexpr float kDecay = 0.92f;     // 8% velocity loss per frame (~2s to stop)
+    constexpr float kPanMin = 0.5f;     // stop pan below 0.5 px/frame
+    constexpr float kZoomMin = 0.01f;   // stop zoom below 0.01 steps/frame
+    constexpr float kSliceMin = 0.05f;  // stop slice below 0.05/frame
+
+    bool anyActive = false;
+
+    // Pan momentum
+    if (std::abs(_momentumPanVx) > kPanMin || std::abs(_momentumPanVy) > kPanMin) {
+        panBy(static_cast<int>(_momentumPanVx), static_cast<int>(_momentumPanVy));
+        _momentumPanVx *= kDecay;
+        _momentumPanVy *= kDecay;
+        anyActive = true;
+    } else {
+        _momentumPanVx = _momentumPanVy = 0.0f;
+    }
+
+    // Zoom momentum
+    if (std::abs(_momentumZoomV) > kZoomMin) {
+        // Accumulate fractional zoom steps
+        int zoomSteps = static_cast<int>(_momentumZoomV);
+        if (zoomSteps != 0) {
+            zoomStepsAt(zoomSteps > 0 ? 1 : -1, _momentumZoomAnchor);
+        }
+        _momentumZoomV *= kDecay;
+        anyActive = true;
+    } else {
+        _momentumZoomV = 0.0f;
+    }
+
+    // Slice momentum
+    if (std::abs(_momentumSliceV) > kSliceMin) {
+        auto surf = _surfWeak.lock();
+        if (surf) {
+            PlaneSurface* plane = dynamic_cast<PlaneSurface*>(surf.get());
+            if (_surfName != "segmentation" && plane && _state) {
+                POI* focus = _state->poi("focus");
+                if (focus) {
+                    cv::Vec3f normal = plane->normal(cv::Vec3f(0, 0, 0), {});
+                    double len = cv::norm(normal);
+                    if (len > 0.0) normal *= static_cast<float>(1.0 / len);
+                    focus->p += normal * _momentumSliceV;
+                    _state->setPOI("focus", focus);
+                }
+            } else {
+                setSliceOffset(_momentumSliceV);
+            }
+        }
+        _momentumSliceV *= kDecay;
+        anyActive = true;
+    } else {
+        _momentumSliceV = 0.0f;
+    }
+
+    if (!anyActive) {
+        _momentumTimer->stop();
+        // Full quality settle
+        _interactionQualityActive = false;
+        _camera.invalidate();
+        submitRender();
+        scheduleOverlayUpdate();
+    }
 }
 
 void CTiledVolumeViewer::onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths)
