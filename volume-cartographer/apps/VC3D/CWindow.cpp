@@ -893,16 +893,26 @@ CWindow::CWindow(size_t cacheSizeGB) :
                std::max(height(), minWindowSize.height()));
     }
 
-    // If enabled, auto open the last used volpkg (deferred so window shows first)
+    // If enabled, auto open the last used volume (local or remote, deferred so window shows first)
     if (settings.value(vc3d::settings::volpkg::AUTO_OPEN, vc3d::settings::volpkg::AUTO_OPEN_DEFAULT).toInt() != 0) {
 
         QStringList files = settings.value(vc3d::settings::volpkg::RECENT).toStringList();
+        QStringList remoteUrls = settings.value(vc3d::settings::viewer::REMOTE_RECENT_URLS).toStringList();
 
         if (!files.empty() && !files.at(0).isEmpty()) {
+            // Local volpkg available — open it
             QString path = files[0];
             QTimer::singleShot(0, this, [this, path]() {
                 if (_menuController) {
                     _menuController->openVolpkgAt(path);
+                }
+            });
+        } else if (!remoteUrls.empty() && !remoteUrls.at(0).isEmpty()) {
+            // No local volpkg but have a recent remote URL — open it
+            QString url = remoteUrls[0];
+            QTimer::singleShot(0, this, [this, url]() {
+                if (_menuController) {
+                    _menuController->openRemoteUrl(url, false);
                 }
             });
         }

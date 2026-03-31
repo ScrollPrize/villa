@@ -31,6 +31,7 @@ public:
     void openVolpkgAt(const QString& path);
     void loadAttachedRemoteVolumesForCurrentPackage();
     void triggerTeleaInpaint();
+    void openRemoteUrl(const QString& url, bool isRetry = false);
 
 private slots:
     void openVolpkg();
@@ -65,7 +66,6 @@ private:
     void updateRecentRemoteList(const QString& url);
     void refreshRecentRemoteMenu();
     void ensureRecentRemoteActions();
-    void openRemoteUrl(const QString& url, bool isRetry = false);
     void attachRemoteZarrUrl(const QString& url, bool persistEntry = true);
     void openRemoteZarr(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
     void openRemoteScroll(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
