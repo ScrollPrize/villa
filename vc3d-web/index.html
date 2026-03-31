@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VC3D Web Volume Viewer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    background: #1a1a1a;
+    color: #ddd;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+    height: 100vh;
+}
+#toolbar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 48px;
+    background: #2a2a2a;
+    border-bottom: 1px solid #444;
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    gap: 16px;
+    z-index: 10;
+    font-size: 13px;
+}
+#toolbar label { color: #aaa; }
+#toolbar input[type="text"] {
+    background: #333;
+    border: 1px solid #555;
+    color: #eee;
+    padding: 4px 8px;
+    border-radius: 4px;
+    width: 400px;
+    font-family: monospace;
+    font-size: 12px;
+}
+#toolbar button {
+    background: #4a7fff;
+    color: white;
+    border: none;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+}
+#toolbar button:hover { background: #6090ff; }
+#toolbar button:disabled { background: #555; cursor: default; }
+#canvas-container {
+    position: fixed;
+    top: 48px;
+    left: 0;
+    right: 0;
+    bottom: 32px;
+}
+canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+    image-rendering: pixelated;
+}
+#statusbar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 32px;
+    background: #2a2a2a;
+    border-top: 1px solid #444;
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    gap: 24px;
+    font-size: 12px;
+    color: #888;
+    font-family: monospace;
+}
+#statusbar .val { color: #ccc; }
+#loading-overlay {
+    position: fixed;
+    top: 48px;
+    left: 0;
+    right: 0;
+    bottom: 32px;
+    background: rgba(0,0,0,0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 5;
+    font-size: 18px;
+    color: #aaa;
+}
+#loading-overlay.hidden { display: none; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+    <label>Zarr URL:</label>
+    <input type="text" id="zarr-url" value="" placeholder="https://example.com/volume.zarr">
+    <button id="load-btn">Load</button>
+    <span id="level-info" style="color:#888"></span>
+</div>
+
+<div id="canvas-container">
+    <canvas id="viewport"></canvas>
+</div>
+
+<div id="loading-overlay" class="hidden">
+    <span id="loading-text">Loading...</span>
+</div>
+
+<div id="statusbar">
+    <span>Z: <span class="val" id="stat-z">0</span></span>
+    <span>Zoom: <span class="val" id="stat-zoom">1.00</span></span>
+    <span>Level: <span class="val" id="stat-level">0</span></span>
+    <span>Chunks: <span class="val" id="stat-chunks">0</span></span>
+    <span>Cache: <span class="val" id="stat-cache">0 MB</span></span>
+    <span>Pending: <span class="val" id="stat-pending">0</span></span>
+    <span id="stat-voxel"></span>
+</div>
+
+<script src="vc3d-web.js"></script>
+<script>
+// ============================================================================
+// VC3D Web Viewer
+// ============================================================================
+
+const state = {
+    wasm: null,         // WASM module instance
+    gl: null,           // WebGL context
+    texture: null,      // WebGL texture for display
+    program: null,      // WebGL shader program
+
+    zarrUrl: '',        // Base URL of zarr volume
+    levels: [],         // Array of {shape: [z,y,x], chunks: [z,y,x]}
+    compressor: null,   // 'blosc' | 'zstd' | null (raw)
+
+    // View state
+    sliceZ: 0,          // Current Z slice
+    zoom: 1.0,          // Pixels per voxel
+    panX: 0,            // Pan offset in pixels
+    panY: 0,
+    level: 0,           // Current pyramid level
+
+    // Interaction
+    dragging: false,
+    dragStartX: 0,
+    dragStartY: 0,
+    dragStartPanX: 0,
+    dragStartPanY: 0,
+
+    // Chunk loading
+    pendingFetches: 0,
+    loadedChunks: new Set(),    // "level/iz/iy/ix" strings
+    failedChunks: new Set(),
+    renderScheduled: false,
+};
+
+// --- WebGL setup ---
+
+function initWebGL(canvas) {
+    const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+    if (!gl) { alert('WebGL not supported'); return null; }
+
+    // Fullscreen quad vertex shader
+    const vsSource = `
+        attribute vec2 aPos;
+        varying vec2 vUV;
+        void main() {
+            vUV = aPos * 0.5 + 0.5;
+            vUV.y = 1.0 - vUV.y; // flip Y
+            gl_Position = vec4(aPos, 0.0, 1.0);
+        }
+    `;
+    // Fragment shader: sample texture
+    const fsSource = `
+        precision mediump float;
+        varying vec2 vUV;
+        uniform sampler2D uTex;
+        void main() {
+            gl_FragColor = texture2D(uTex, vUV);
+        }
+    `;
+
+    function compile(type, src) {
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+            console.error('Shader error:', gl.getShaderInfoLog(s));
+        return s;
+    }
+
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSource));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSource));
+    gl.linkProgram(prog);
+
+    // Fullscreen quad
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+
+    const aPos = gl.getAttribLocation(prog, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    // Texture
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    state.gl = gl;
+    state.texture = tex;
+    state.program = prog;
+    return gl;
+}
+
+function uploadToGL(pixelPtr, width, height) {
+    const gl = state.gl;
+    if (!gl || !pixelPtr) return;
+
+    const pixels = new Uint8Array(state.wasm.HEAPU8.buffer, pixelPtr, width * height * 4);
+    gl.bindTexture(gl.TEXTURE_2D, state.texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+    gl.useProgram(state.program);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+// --- Zarr metadata loading ---
+
+async function fetchJson(url) {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${url}`);
+    return resp.json();
+}
+
+async function loadZarrMetadata(baseUrl) {
+    // Remove trailing slash
+    baseUrl = baseUrl.replace(/\/+$/, '');
+    state.zarrUrl = baseUrl;
+
+    // Discover pyramid levels by trying 0, 1, 2, ... until 404
+    const levels = [];
+    for (let lvl = 0; lvl < 20; lvl++) {
+        try {
+            const meta = await fetchJson(`${baseUrl}/${lvl}/.zarray`);
+            const shape = meta.shape || [0, 0, 0];
+            const chunks = meta.chunks || [128, 128, 128];
+            const compressor = meta.compressor || null;
+            levels.push({ shape, chunks, compressor, dtype: meta.dtype || '|u1' });
+        } catch (e) {
+            break; // No more levels
+        }
+    }
+
+    if (levels.length === 0) throw new Error('No zarr levels found at ' + baseUrl);
+
+    state.levels = levels;
+    state.compressor = levels[0].compressor;
+
+    // Reset and configure WASM
+    state.wasm._vc3d_reset_levels();
+    state.loadedChunks.clear();
+    state.failedChunks.clear();
+
+    for (const lvl of levels) {
+        state.wasm._vc3d_add_level(
+            lvl.shape[0], lvl.shape[1], lvl.shape[2],
+            lvl.chunks[0], lvl.chunks[1], lvl.chunks[2]
+        );
+    }
+
+    // Start at middle Z slice, level 0
+    state.level = 0;
+    state.sliceZ = Math.floor(levels[0].shape[0] / 2);
+    state.zoom = 1.0;
+    state.panX = 0;
+    state.panY = 0;
+
+    updateLevelInfo();
+    return levels;
+}
+
+// --- Chunk decompression ---
+
+// Blosc decompression in pure JS (minimal implementation for zarr compatibility).
+// For production, use blosc.js or a WASM blosc build.
+// For now, we try fetching raw (uncompressed) chunks, which works for
+// zarr volumes stored without compression or with server-side decompression.
+//
+// If chunks are blosc-compressed, we need a JS blosc decoder.
+// The simplest approach: use the pako library for zlib, or load
+// blosc via a separate WASM module.
+
+async function decompressChunk(compressed, compressorMeta) {
+    // If no compressor, data is raw
+    if (!compressorMeta) return compressed;
+
+    const id = compressorMeta.id || compressorMeta;
+    if (id === 'blosc') {
+        return decompressBlosc(compressed);
+    } else if (id === 'zstd') {
+        // Would need a zstd JS decoder
+        console.warn('zstd decompression not yet implemented in JS');
+        return compressed;
+    }
+    return compressed;
+}
+
+function decompressBlosc(input) {
+    // Minimal blosc header parsing:
+    // Bytes 0-3: blosc header (version, flags, etc.)
+    // Bytes 4-7: uncompressed size (little-endian)
+    // Bytes 8-11: compressed size (little-endian)
+    // Bytes 12-15: block size
+    // Then compressed data follows (lz4, zstd, etc.)
+    //
+    // For a minimal prototype, if the volume is stored with raw/uncompressed
+    // blosc (shuffle only, no compression), we can extract directly.
+    // For real blosc, we would need https://github.com/nicktraveler/blosc-js
+    // or compile c-blosc to WASM.
+
+    const view = new DataView(input.buffer, input.byteOffset, input.byteLength);
+    // blosc header byte 0 = version, byte 1 = flags (bit 0 = byte shuffle)
+    // bytes 4-7 = nbytes (uncompressed size), little-endian
+    const nbytes = view.getUint32(4, true);
+    // bytes 12-15 = blocksize
+    // byte 2 = typesize
+
+    // For now, return the raw data past the 16-byte header.
+    // This only works for uncompressed blosc (clevel=0).
+    // TODO: integrate a real blosc decoder.
+    console.warn('Blosc decompression stub: assuming uncompressed blosc (clevel=0). ' +
+                 'For compressed data, integrate blosc.js or c-blosc WASM.');
+    return new Uint8Array(input.buffer, input.byteOffset + 16, nbytes);
+}
+
+// --- Chunk fetching ---
+
+async function fetchChunk(level, iz, iy, ix) {
+    const key = `${level}/${iz}/${iy}/${ix}`;
+    if (state.loadedChunks.has(key) || state.failedChunks.has(key)) return;
+
+    // Determine zarr chunk filename separator (default '.')
+    const url = `${state.zarrUrl}/${level}/${iz}.${iy}.${ix}`;
+
+    state.pendingFetches++;
+    updateStatus();
+
+    try {
+        const resp = await fetch(url);
+        if (!resp.ok) {
+            if (resp.status === 404 || resp.status === 403) {
+                // Chunk doesn't exist (empty region)
+                state.failedChunks.add(key);
+                return;
+            }
+            throw new Error(`HTTP ${resp.status}`);
+        }
+
+        let data = new Uint8Array(await resp.arrayBuffer());
+
+        // Decompress if needed
+        const lvlMeta = state.levels[level];
+        if (lvlMeta && lvlMeta.compressor) {
+            data = await decompressChunk(data, lvlMeta.compressor);
+        }
+
+        // Handle uint16 -> uint8 conversion (matching VC3D behavior)
+        if (lvlMeta && (lvlMeta.dtype === '<u2' || lvlMeta.dtype === '>u2' ||
+                        lvlMeta.dtype === '<i2' || lvlMeta.dtype === '>i2')) {
+            const u16 = new Uint16Array(data.buffer, data.byteOffset,
+                                        data.byteLength / 2);
+            const u8 = new Uint8Array(u16.length);
+            for (let i = 0; i < u16.length; i++) {
+                u8[i] = Math.min(255, u16[i] >> 8); // scale 0-65535 to 0-255
+            }
+            data = u8;
+        }
+
+        // Pass to WASM
+        const ptr = state.wasm._malloc(data.length);
+        state.wasm.HEAPU8.set(data, ptr);
+        state.wasm._vc3d_load_chunk(level, iz, iy, ix, ptr, data.length);
+        state.wasm._free(ptr);
+
+        state.loadedChunks.add(key);
+        scheduleRender();
+    } catch (e) {
+        console.warn(`Failed to fetch chunk ${key}:`, e.message);
+        state.failedChunks.add(key);
+    } finally {
+        state.pendingFetches--;
+        updateStatus();
+    }
+}
+
+// Determine which chunks are visible and fetch them.
+function fetchVisibleChunks() {
+    if (state.levels.length === 0) return;
+
+    const lvl = state.levels[state.level];
+    if (!lvl) return;
+
+    const canvas = document.getElementById('viewport');
+    const w = canvas.width;
+    const h = canvas.height;
+
+    const cs = lvl.chunks;
+    const invZoom = 1.0 / state.zoom;
+
+    // Compute voxel range visible on screen
+    const voxMinX = -state.panX * invZoom;
+    const voxMinY = -state.panY * invZoom;
+    const voxMaxX = voxMinX + w * invZoom;
+    const voxMaxY = voxMinY + h * invZoom;
+
+    // Z slice -- just the current one (plus neighbors for scrolling)
+    const iz = state.sliceZ;
+    const minCz = Math.max(0, Math.floor((iz - 1) / cs[0]));
+    const maxCz = Math.min(Math.ceil(lvl.shape[0] / cs[0]) - 1,
+                           Math.floor((iz + 1) / cs[0]));
+
+    const minCy = Math.max(0, Math.floor(voxMinY / cs[1]));
+    const maxCy = Math.min(Math.ceil(lvl.shape[1] / cs[1]) - 1,
+                           Math.floor(voxMaxY / cs[1]));
+    const minCx = Math.max(0, Math.floor(voxMinX / cs[2]));
+    const maxCx = Math.min(Math.ceil(lvl.shape[2] / cs[2]) - 1,
+                           Math.floor(voxMaxX / cs[2]));
+
+    for (let cz = minCz; cz <= maxCz; cz++) {
+        for (let cy = minCy; cy <= maxCy; cy++) {
+            for (let cx = minCx; cx <= maxCx; cx++) {
+                fetchChunk(state.level, cz, cy, cx);
+            }
+        }
+    }
+}
+
+// --- Rendering ---
+
+function scheduleRender() {
+    if (state.renderScheduled) return;
+    state.renderScheduled = true;
+    requestAnimationFrame(doRender);
+}
+
+function doRender() {
+    state.renderScheduled = false;
+    if (!state.wasm) return;
+
+    const canvas = document.getElementById('viewport');
+    const w = canvas.width;
+    const h = canvas.height;
+
+    state.wasm._vc3d_set_level(state.level);
+    state.wasm._vc3d_set_slice(state.sliceZ, state.zoom, state.panX, state.panY);
+
+    const pixelPtr = state.wasm._vc3d_render();
+    uploadToGL(pixelPtr, w, h);
+    updateStatus();
+}
+
+// --- UI ---
+
+function updateStatus() {
+    document.getElementById('stat-z').textContent = state.sliceZ;
+    document.getElementById('stat-zoom').textContent = state.zoom.toFixed(2);
+    document.getElementById('stat-level').textContent = state.level;
+
+    if (state.wasm) {
+        document.getElementById('stat-chunks').textContent = state.wasm._vc3d_cache_count();
+        const mb = (state.wasm._vc3d_cache_bytes() / (1024 * 1024)).toFixed(1);
+        document.getElementById('stat-cache').textContent = mb + ' MB';
+    }
+    document.getElementById('stat-pending').textContent = state.pendingFetches;
+}
+
+function updateLevelInfo() {
+    if (state.levels.length === 0) {
+        document.getElementById('level-info').textContent = '';
+        return;
+    }
+    const lvl = state.levels[state.level];
+    document.getElementById('level-info').textContent =
+        `Level ${state.level}/${state.levels.length - 1}: ` +
+        `${lvl.shape[2]}x${lvl.shape[1]}x${lvl.shape[0]} ` +
+        `(chunks ${lvl.chunks[2]}x${lvl.chunks[1]}x${lvl.chunks[0]})`;
+}
+
+function showLoading(msg) {
+    document.getElementById('loading-text').textContent = msg;
+    document.getElementById('loading-overlay').classList.remove('hidden');
+}
+
+function hideLoading() {
+    document.getElementById('loading-overlay').classList.add('hidden');
+}
+
+function resizeCanvas() {
+    const canvas = document.getElementById('viewport');
+    const container = document.getElementById('canvas-container');
+    canvas.width = container.clientWidth;
+    canvas.height = container.clientHeight;
+    if (state.wasm) {
+        state.wasm._vc3d_resize(canvas.width, canvas.height);
+    }
+    if (state.gl) {
+        state.gl.viewport(0, 0, canvas.width, canvas.height);
+    }
+}
+
+// Pick best pyramid level for current zoom
+function autoLevel() {
+    // At zoom=1, use level 0. At zoom=0.5, use level 1, etc.
+    if (state.levels.length <= 1) return;
+
+    let best = 0;
+    for (let i = 1; i < state.levels.length; i++) {
+        const scale = state.levels[0].shape[2] / state.levels[i].shape[2];
+        if (state.zoom * scale <= 1.5) { // switch up when we'd be downsampling
+            best = i;
+        }
+    }
+    if (best !== state.level) {
+        // Adjust sliceZ for new level
+        const oldScale = state.levels[0].shape[0] / state.levels[state.level].shape[0];
+        const newScale = state.levels[0].shape[0] / state.levels[best].shape[0];
+        state.sliceZ = Math.round(state.sliceZ * oldScale / newScale);
+        state.level = best;
+        updateLevelInfo();
+    }
+}
+
+// --- Event handlers ---
+
+function setupEvents() {
+    const canvas = document.getElementById('viewport');
+
+    // Mouse wheel: scroll Z slices (or zoom with Ctrl)
+    canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        if (e.ctrlKey || e.metaKey) {
+            // Zoom
+            const factor = e.deltaY > 0 ? 0.9 : 1.1;
+            const rect = canvas.getBoundingClientRect();
+            const mx = e.clientX - rect.left;
+            const my = e.clientY - rect.top;
+
+            // Zoom toward mouse position
+            state.panX = mx - (mx - state.panX) * factor;
+            state.panY = my - (my - state.panY) * factor;
+            state.zoom *= factor;
+            state.zoom = Math.max(0.01, Math.min(100, state.zoom));
+        } else {
+            // Scroll Z
+            const delta = Math.sign(e.deltaY);
+            const maxZ = state.levels[state.level] ?
+                         state.levels[state.level].shape[0] - 1 : 0;
+            state.sliceZ = Math.max(0, Math.min(maxZ, state.sliceZ + delta));
+        }
+        fetchVisibleChunks();
+        scheduleRender();
+    }, { passive: false });
+
+    // Pan with mouse drag
+    canvas.addEventListener('mousedown', (e) => {
+        if (e.button === 0) {
+            state.dragging = true;
+            state.dragStartX = e.clientX;
+            state.dragStartY = e.clientY;
+            state.dragStartPanX = state.panX;
+            state.dragStartPanY = state.panY;
+            canvas.style.cursor = 'grabbing';
+        }
+    });
+
+    window.addEventListener('mousemove', (e) => {
+        if (!state.dragging) return;
+        state.panX = state.dragStartPanX + (e.clientX - state.dragStartX);
+        state.panY = state.dragStartPanY + (e.clientY - state.dragStartY);
+        scheduleRender();
+    });
+
+    window.addEventListener('mouseup', () => {
+        if (state.dragging) {
+            state.dragging = false;
+            document.getElementById('viewport').style.cursor = 'default';
+            fetchVisibleChunks();
+        }
+    });
+
+    // Keyboard shortcuts
+    window.addEventListener('keydown', (e) => {
+        if (e.target.tagName === 'INPUT') return;
+
+        const maxZ = state.levels[state.level] ?
+                     state.levels[state.level].shape[0] - 1 : 0;
+
+        switch (e.key) {
+            case 'ArrowUp':
+            case 'k':
+                state.sliceZ = Math.max(0, state.sliceZ - 1);
+                fetchVisibleChunks();
+                scheduleRender();
+                break;
+            case 'ArrowDown':
+            case 'j':
+                state.sliceZ = Math.min(maxZ, state.sliceZ + 1);
+                fetchVisibleChunks();
+                scheduleRender();
+                break;
+            case 'PageUp':
+                state.sliceZ = Math.max(0, state.sliceZ - 10);
+                fetchVisibleChunks();
+                scheduleRender();
+                break;
+            case 'PageDown':
+                state.sliceZ = Math.min(maxZ, state.sliceZ + 10);
+                fetchVisibleChunks();
+                scheduleRender();
+                break;
+            case '+':
+            case '=':
+                state.zoom *= 1.2;
+                fetchVisibleChunks();
+                scheduleRender();
+                break;
+            case '-':
+                state.zoom *= 0.8;
+                fetchVisibleChunks();
+                scheduleRender();
+                break;
+            case '0':
+                state.zoom = 1.0;
+                state.panX = 0;
+                state.panY = 0;
+                fetchVisibleChunks();
+                scheduleRender();
+                break;
+        }
+    });
+
+    // Resize
+    window.addEventListener('resize', () => {
+        resizeCanvas();
+        fetchVisibleChunks();
+        scheduleRender();
+    });
+
+    // Load button
+    document.getElementById('load-btn').addEventListener('click', loadVolume);
+    document.getElementById('zarr-url').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') loadVolume();
+    });
+}
+
+async function loadVolume() {
+    const url = document.getElementById('zarr-url').value.trim();
+    if (!url) return;
+
+    const btn = document.getElementById('load-btn');
+    btn.disabled = true;
+    showLoading('Loading zarr metadata...');
+
+    try {
+        await loadZarrMetadata(url);
+        hideLoading();
+        resizeCanvas();
+        state.wasm._vc3d_init(
+            document.getElementById('viewport').width,
+            document.getElementById('viewport').height
+        );
+        fetchVisibleChunks();
+        scheduleRender();
+    } catch (e) {
+        hideLoading();
+        alert('Failed to load volume: ' + e.message);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+// --- Main ---
+
+async function main() {
+    const canvas = document.getElementById('viewport');
+    resizeCanvas();
+    initWebGL(canvas);
+
+    showLoading('Loading WASM module...');
+
+    try {
+        state.wasm = await createVC3D();
+        hideLoading();
+        setupEvents();
+        updateStatus();
+
+        // Auto-load if URL has a hash with a zarr path
+        const hash = window.location.hash.slice(1);
+        if (hash) {
+            document.getElementById('zarr-url').value = decodeURIComponent(hash);
+            loadVolume();
+        }
+    } catch (e) {
+        hideLoading();
+        document.getElementById('loading-text').textContent =
+            'Failed to load WASM: ' + e.message;
+        document.getElementById('loading-overlay').classList.remove('hidden');
+    }
+}
+
+main();
+</script>
+</body>
+</html>
