@@ -35,6 +35,7 @@ from vesuvius.models.evaluation.connected_components import ConnectedComponentsM
 from vesuvius.models.evaluation.critical_components import CriticalComponentsMetric
 from vesuvius.models.evaluation.iou_dice import IOUDiceMetric
 from vesuvius.models.evaluation.voi import VOIMetric
+from vesuvius.models.augmentation.transforms.cucim_dilate import dilate_label_batch_with_cucim
 from contextlib import nullcontext
 from collections import deque, defaultdict
 
@@ -160,6 +161,7 @@ class BaseTrainer:
         self._checkpoint_ema_state = None
         self._checkpoint_ema_optimizer_step = None
         self._printed_ema_validation_mode = False
+        self._volume_dilate_by_name = {}
 
     # --- build model --- #
     def _build_model(self):
@@ -279,6 +281,10 @@ class BaseTrainer:
     # --- configure dataset --- #
     def _configure_dataset(self, is_training=True):
         dataset = self._build_dataset_for_mgr(self.mgr, is_training=is_training)
+        for vol in getattr(dataset, '_volumes', []):
+            if vol.dilate not in (None, 0):
+                self._volume_dilate_by_name[vol.volume_id] = float(vol.dilate)
+                vol.dilate = None
         print(f"Using ZarrDataset ({'training' if is_training else 'validation'})")
         return dataset
 
@@ -1237,6 +1243,25 @@ class BaseTrainer:
     def _get_model_outputs(self, model, data_dict):
         inputs = data_dict["image"].to(self.device)
         targets_dict = self._extract_targets(data_dict)
+        if self.device.type == 'cuda' and self._volume_dilate_by_name:
+            padding_mask = data_dict["padding_mask"].to(self.device)
+            volume_names = data_dict["patch_info"]["volume_name"]
+            for i, volume_name in enumerate(volume_names):
+                distance = self._volume_dilate_by_name.get(volume_name)
+                if distance in (None, 0):
+                    continue
+                for target_name in self.mgr.targets:
+                    if target_name not in targets_dict:
+                        continue
+                    target_tensor = targets_dict[target_name]
+                    target_info = self.mgr.targets.get(target_name, {})
+                    ignore_label = target_info.get("ignore_label", target_info.get("ignore_index", target_info.get("ignore_value")))
+                    targets_dict[target_name][i:i + 1] = dilate_label_batch_with_cucim(
+                        target_tensor[i:i + 1],
+                        padding_mask[i:i + 1],
+                        distance,
+                        ignore_label,
+                    )
         
         outputs = model(inputs)
 
