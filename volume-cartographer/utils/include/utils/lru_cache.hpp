@@ -366,7 +366,7 @@ public:
     [[nodiscard]] V get_or_prehashed(const K& key, std::size_t hash, V fallback) const
     {
         std::shared_lock lock{mutex_};
-        auto it = map_.find_prehashed(key, hash);
+        auto it = map_.find(key);
         if (it == map_.end()) {
             misses_.fetch_add(1, std::memory_order_relaxed);
             return fallback;
@@ -602,7 +602,7 @@ private:
     // -- data members -------------------------------------------------------
     Config config_;
 
-    using Map = FlatHashMap<K, Entry, Hash, KeyEqual>;
+    using Map = std::unordered_map<K, Entry, Hash, KeyEqual>;
     mutable Map map_;
 
     mutable std::shared_mutex          mutex_;

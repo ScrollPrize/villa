@@ -178,9 +178,7 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     fGraphicsView->setTransformationAnchor(QGraphicsView::NoAnchor);
     fGraphicsView->setRenderHint(QPainter::Antialiasing);
     fGraphicsView->setScrollPanDisabled(true);
-    // Use OpenGL viewport for hardware-accelerated pixmap compositing.
-    // Dramatically reduces CPU cost of scene repaints with many tile items.
-    fGraphicsView->setViewport(new QOpenGLWidget());
+    // Software rendering — no OpenGL (eliminates ghosting from GL double-buffer)
     fGraphicsView->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
 
     // Connect signals from view
