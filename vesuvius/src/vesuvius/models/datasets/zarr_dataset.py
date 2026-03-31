@@ -365,69 +365,6 @@ class ZarrDataset(Dataset):
         except TypeError:
             return np.zeros(values.shape, dtype=bool)
 
-    @classmethod
-    def _dilate_label_region(
-        cls,
-        values: np.ndarray,
-        distance: float,
-        ignore_label: Optional[float],
-    ) -> np.ndarray:
-        import cupy as cp
-        from cucim.core.operations.morphology import distance_transform_edt as cucim_distance_transform_edt
-
-        if distance <= 0:
-            return values
-
-        arr = np.asarray(values)
-        ignore_mask = cls._ignore_mask(arr, ignore_label)
-        source_mask = (arr != 0) & ~ignore_mask
-        if not np.any(source_mask):
-            return arr
-
-        fill_mask = (arr == 0)
-        if not np.any(fill_mask):
-            return arr
-
-        arr_gpu = cp.asarray(arr)
-        source_mask_gpu = cp.asarray(source_mask)
-
-        distances_gpu = cucim_distance_transform_edt(
-            ~source_mask_gpu,
-            return_indices=False,
-            float64_distances=False,
-        )
-        fill_mask_gpu = cp.asarray(fill_mask)
-        fill_mask_gpu &= distances_gpu <= float(distance)
-        if not bool(fill_mask_gpu.any()):
-            return arr
-
-        result_gpu = arr_gpu.copy()
-        result_gpu[fill_mask_gpu] = arr.dtype.type(1)
-        return cp.asnumpy(result_gpu)
-
-    @classmethod
-    def _dilate_label_patch(
-        cls,
-        values: np.ndarray,
-        distance: Optional[float],
-        ignore_label: Optional[float],
-        original_shape: Tuple[int, ...],
-    ) -> np.ndarray:
-        if distance in (None, 0):
-            return values
-
-        valid_slices = tuple(slice(0, max(0, min(int(o), int(s)))) for o, s in zip(original_shape, values.shape))
-        if any(slc.stop == 0 for slc in valid_slices):
-            return values
-
-        result = np.array(values, copy=True)
-        result[valid_slices] = cls._dilate_label_region(
-            result[valid_slices],
-            float(distance),
-            ignore_label,
-        )
-        return result
-
     # -------------------------------------------------------------------------
     # Normalization
     # -------------------------------------------------------------------------
@@ -932,13 +869,7 @@ class ZarrDataset(Dataset):
         is_unlabeled = True
         for target_name in self.target_names:
             label_arr = vol.label_arrays.get(target_name)
-            label_data, label_shape = load_array(label_arr, return_original_shape=True)
-            label_data = self._dilate_label_patch(
-                label_data,
-                vol.dilate,
-                self.target_ignore_labels.get(target_name),
-                label_shape,
-            )
+            label_data, _ = load_array(label_arr, return_original_shape=True)
             if label_arr is not None and np.count_nonzero(label_data) > 0:
                 is_unlabeled = False
             result[target_name] = torch.from_numpy(label_data[np.newaxis, ...])
