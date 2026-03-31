@@ -201,6 +201,18 @@ class BaseTrainer:
                 pass
         return model
 
+    def _wrap_model_for_distributed_training(self, model):
+        if not self.is_distributed:
+            return model
+
+        ddp_kwargs = {"find_unused_parameters": True}
+        if self.device.type == 'cuda':
+            ddp_kwargs.update(
+                device_ids=[self.assigned_gpu_id],
+                output_device=self.assigned_gpu_id,
+            )
+        return DDP(model, **ddp_kwargs)
+
     def _create_ema_model(self, model):
         ema_model = deepcopy(self._unwrap_model(model))
         ema_model = ema_model.to(self.device)
@@ -1080,11 +1092,7 @@ class BaseTrainer:
                                                                                                    val_dataset)
 
         # Wrap model with DDP if distributed
-        if self.is_distributed:
-            if self.device.type == 'cuda':
-                model = DDP(model, device_ids=[self.assigned_gpu_id], output_device=self.assigned_gpu_id, find_unused_parameters=False)
-            else:
-                model = DDP(model)
+        model = self._wrap_model_for_distributed_training(model)
         os.makedirs(self.mgr.ckpt_out_base, exist_ok=True)
         model_ckpt_dir = os.path.join(self.mgr.ckpt_out_base, self.mgr.model_name)
         os.makedirs(model_ckpt_dir, exist_ok=True)
