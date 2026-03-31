@@ -37,7 +37,6 @@ from vesuvius.models.evaluation.iou_dice import IOUDiceMetric
 from vesuvius.models.evaluation.voi import VOIMetric
 from contextlib import nullcontext
 from collections import deque, defaultdict
-import gc
 
 
 
@@ -1688,10 +1687,6 @@ class BaseTrainer:
 
             if not is_per_iteration_scheduler and not step_scheduler_at_epoch_begin:
                 scheduler.step()
-
-            gc.collect()
-            if self.device.type == 'cuda':
-                torch.cuda.empty_cache()
 
             # Report the effective learning rate(s) after all scheduler updates for this epoch.
             current_lrs = [group['lr'] for group in optimizer.param_groups]
