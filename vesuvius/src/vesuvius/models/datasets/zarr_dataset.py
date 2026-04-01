@@ -312,7 +312,7 @@ class ZarrDataset(Dataset):
         # No cache found - enumerate all patches without validation
         logger.warning(
             "No patch cache found. Enumerating all patches without validation. "
-            "Run `vesuvius.build_patch_cache --config <config.yaml>` to generate cache."
+            "Run `vesuvius.find_patches --config <config.yaml>` to generate cache."
         )
         self._enumerate_all_patches()
 

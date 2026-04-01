@@ -772,6 +772,7 @@ class NetworkFromConfig(nn.Module):
             mask[torch.arange(batch_size, device=guide_features.device), random_indices] = True
         return mask
 
+    @torch.compiler.disable(reason="guided backbone compile failure")
     def _apply_input_guidance(self, x):
         if not self.guide_enabled:
             return x, {}

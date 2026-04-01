@@ -164,6 +164,17 @@ class ConfigManager:
         self.max_val_steps_per_epoch = int(self.tr_configs.get("max_val_steps_per_epoch", 50))
         self.train_num_dataloader_workers = int(self.tr_configs.get("num_dataloader_workers", 8))
         self.max_epoch = int(self.tr_configs.get("max_epoch", 5000))
+        self.val_every_n = int(self.tr_configs.get("val_every_n", 1))
+        self.early_stopping_patience = int(self.tr_configs.get("early_stopping_patience", 0))
+        self.save_gifs = bool(self.tr_configs.get("save_gifs", True))
+        compile_policy = str(self.tr_configs.get("compile_policy", "auto")).strip().lower()
+        if compile_policy not in {"auto", "off", "module", "ddp_wrapper"}:
+            raise ValueError(
+                "tr_config.compile_policy must be one of "
+                "{'auto', 'off', 'module', 'ddp_wrapper'}"
+            )
+        self.compile_policy = compile_policy
+        self.startup_timing = bool(self.tr_configs.get("startup_timing", False))
         self.optimizer = self.tr_configs.get("optimizer", "SGD")
         self.initial_lr = float(self.tr_configs.get("initial_lr", 0.01))
         self.weight_decay = float(self.tr_configs.get("weight_decay", 0.00003))
