@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 import zarr
 from torch.utils.data import DataLoader
@@ -376,3 +377,22 @@ def test_initialize_training_skips_compile_when_policy_is_off(tmp_path: Path, mo
     trainer._initialize_training()
 
     assert call_order == ["wrap"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for autocast safety test")
+def test_guide_alignment_loss_is_amp_safe_on_cuda():
+    mgr = _make_mgr(Path("/tmp/guide_backbone.pt"), Path("/tmp/guide_backbone.pt"))
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    trainer.device = torch.device("cuda")
+    trainer._current_aux_outputs = {
+        "guide_mask": torch.full((1, 1, 2, 2, 2), 0.5, device=trainer.device, dtype=torch.float16)
+    }
+    targets_dict = {
+        "ink": torch.ones((1, 1, 2, 2, 2), device=trainer.device, dtype=torch.float16)
+    }
+
+    with torch.amp.autocast("cuda"):
+        loss = trainer._compute_guide_alignment_loss(targets_dict)
+
+    assert loss is not None
+    assert torch.isfinite(loss)
