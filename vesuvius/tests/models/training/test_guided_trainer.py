@@ -259,6 +259,25 @@ def test_trainer_builds_only_standard_debug_payload_when_no_guide_preview():
     assert set(payload.keys()) == {"debug_image"}
 
 
+def test_prepare_metrics_for_logging_includes_guide_loss_entries():
+    mgr = _make_mgr(Path("/tmp/guide_backbone.pt"), Path("/tmp/guide_backbone.pt"))
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+
+    metrics = trainer._prepare_metrics_for_logging(
+        epoch=0,
+        step=3,
+        epoch_losses={"ink": [0.4, 0.2], "guide_mask": [0.1, 0.3]},
+        current_lr=1e-3,
+        val_losses={"ink": [0.5], "guide_mask": [0.25]},
+    )
+
+    assert metrics["train_loss_ink"] == pytest.approx(0.3)
+    assert metrics["train_loss_guide_mask"] == pytest.approx(0.2)
+    assert metrics["val_loss_ink"] == pytest.approx(0.5)
+    assert metrics["val_loss_guide_mask"] == pytest.approx(0.25)
+    assert metrics["val_loss_total"] == pytest.approx(0.375)
+
+
 class _DummyDataset:
     def __len__(self):
         return 1

@@ -1821,11 +1821,10 @@ class BaseTrainer:
 
         metrics = {"epoch": epoch, "step": step}
 
-        # Add training losses
-        for t_name in self.mgr.targets:
-            if t_name in epoch_losses and len(epoch_losses[t_name]) > 0:
-                # Use recent average for training losses
-                metrics[f"train_loss_{t_name}"] = np.mean(epoch_losses[t_name][-100:])
+        # Add training losses, including auxiliary entries such as guide_mask
+        for t_name, losses in epoch_losses.items():
+            if len(losses) > 0:
+                metrics[f"train_loss_{t_name}"] = np.mean(losses[-100:])
 
         # Add total training loss
         if epoch_losses:
@@ -1837,18 +1836,20 @@ class BaseTrainer:
         if current_lr is not None:
             metrics["learning_rate"] = current_lr
 
-        # Add validation losses if provided
+        # Add validation losses if provided, including auxiliary entries such as guide_mask
         if val_losses is not None:
             total_val_loss = 0.0
-            for t_name in self.mgr.targets:
-                if t_name in val_losses and len(val_losses[t_name]) > 0:
-                    val_avg = np.mean(val_losses[t_name])
+            num_val_entries = 0
+            for t_name, losses in val_losses.items():
+                if len(losses) > 0:
+                    val_avg = np.mean(losses)
                     metrics[f"val_loss_{t_name}"] = val_avg
                     total_val_loss += val_avg
+                    num_val_entries += 1
 
             # Add total validation loss
-            if self.mgr.targets:
-                metrics["val_loss_total"] = total_val_loss / len(self.mgr.targets)
+            if num_val_entries > 0:
+                metrics["val_loss_total"] = total_val_loss / num_val_entries
 
         return metrics
 
