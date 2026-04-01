@@ -52,7 +52,7 @@ target_link_libraries(vc_core
         CURL::libcurl
 )
 
-# utils header-only library + vendored blosc1 compression + video codec
+# utils header-only library + vendored video codec
 # WHOLE_ARCHIVE is needed because ThinLTO + lld can internalize symbols from
 # static archives before cross-archive references are resolved.
 target_link_libraries(vc_core PUBLIC
@@ -61,13 +61,6 @@ target_link_libraries(vc_core PUBLIC
 )
 target_link_libraries(vc_core PRIVATE
     $<BUILD_INTERFACE:blosc_static>
-)
-target_include_directories(vc_core PRIVATE
-    ${CMAKE_SOURCE_DIR}/libs/c-blosc/blosc
-    ${CMAKE_BINARY_DIR}/libs/c-blosc/blosc
-    ${CMAKE_SOURCE_DIR}/libs/c-blosc/internal-complibs/zstd-1.5.6
-    ${CMAKE_SOURCE_DIR}/libs/c-blosc/internal-complibs/lz4-1.10.0
-    ${CMAKE_SOURCE_DIR}/libs/c-blosc/internal-complibs/zlib-1.3.1
 )
 
 target_compile_definitions(vc_core PUBLIC VC_USE_CURL)
@@ -134,6 +127,8 @@ target_precompile_headers(vc_core PRIVATE
     <xtensor/containers/xadapt.hpp>
     <xtensor/views/xview.hpp>
     <xtensor/generators/xbuilder.hpp>
+    # JSON (heavy templates, used in ~70 TUs)
+    <nlohmann/json.hpp>
 )
 endif()
 

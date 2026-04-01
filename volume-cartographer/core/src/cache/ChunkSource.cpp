@@ -163,6 +163,21 @@ HttpChunkSource::HttpChunkSource(
 
 HttpChunkSource::~HttpChunkSource() = default;
 
+void HttpChunkSource::setShardConfig(const ShardConfig& config)
+{
+    sharded_ = config.enabled;
+    shardShape_ = config.shardShape;
+    if (sharded_ && !levels_.empty()) {
+        // Compute chunks per shard from shard shape and chunk shape of level 0
+        auto& cs = levels_[0].chunkShape;
+        for (int d = 0; d < 3; d++) {
+            chunksPerShard_[d] = (cs[d] > 0 && shardShape_[d] > 0)
+                ? shardShape_[d] / cs[d] : 1;
+            if (chunksPerShard_[d] < 1) chunksPerShard_[d] = 1;
+        }
+    }
+}
+
 std::string HttpChunkSource::chunkUrl(const ChunkKey& key) const
 {
     std::string url;
@@ -179,20 +194,49 @@ std::string HttpChunkSource::chunkUrl(const ChunkKey& key) const
     return url;
 }
 
-std::vector<uint8_t> HttpChunkSource::fetch(const ChunkKey& key)
+std::string HttpChunkSource::shardUrl(const ChunkKey& key) const
 {
+    int sz = key.iz / chunksPerShard_[0];
+    int sy = key.iy / chunksPerShard_[1];
+    int sx = key.ix / chunksPerShard_[2];
+    std::string url;
+    url.reserve(baseUrl_.size() + 32);
+    url += baseUrl_;
+    url += '/';
+    url += std::to_string(key.level);
+    url += "/c/";
+    url += std::to_string(sz);
+    url += '/';
+    url += std::to_string(sy);
+    url += '/';
+    url += std::to_string(sx);
+    return url;
+}
+
+int HttpChunkSource::innerChunkIndex(const ChunkKey& key) const
+{
+    int iz = key.iz % chunksPerShard_[0];
+    int iy = key.iy % chunksPerShard_[1];
+    int ix = key.ix % chunksPerShard_[2];
+    return (iz * chunksPerShard_[1] + iy) * chunksPerShard_[2] + ix;
+}
+
+int HttpChunkSource::totalChunksPerShard() const
+{
+    return chunksPerShard_[0] * chunksPerShard_[1] * chunksPerShard_[2];
+}
+
+// Helper: perform a full HTTP GET, returning raw bytes.
 #ifdef VC_USE_CURL
-    // Thread-local CURL handle: reuses TCP+TLS connections across requests.
-    // curl_easy_reset() clears per-request state but preserves the connection pool.
+static std::vector<uint8_t> httpGetBytes(
+    const std::string& url, const HttpAuth& auth, size_t reserveHint = 2 * 1024 * 1024)
+{
     thread_local CURL* curl = curl_easy_init();
     if (!curl) return {};
 
-    // Reset clears per-request state but keeps connections alive
     curl_easy_reset(curl);
-
-    std::string url = chunkUrl(key);
     std::vector<uint8_t> response;
-    response.reserve(2 * 1024 * 1024);  // 2MB typical chunk size
+    response.reserve(reserveHint);
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
@@ -215,11 +259,9 @@ std::vector<uint8_t> HttpChunkSource::fetch(const ChunkKey& key)
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
     curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 600L);
     curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 512L * 1024L);
-    // Enable TCP_NODELAY for lower latency
     curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
 
-    auto authGuard = applyCurlAuth(curl, auth_);
-
+    auto authGuard = applyCurlAuth(curl, auth);
     CURLcode res = curl_easy_perform(curl);
 
     if (res != CURLE_OK) {
@@ -227,12 +269,9 @@ std::vector<uint8_t> HttpChunkSource::fetch(const ChunkKey& key)
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
 
         if (res == CURLE_HTTP_RETURNED_ERROR &&
-            (httpCode == 404 || httpCode == 403 || httpCode == 400)) {
-            return {};  // chunk doesn't exist at source
-        }
+            (httpCode == 404 || httpCode == 403 || httpCode == 400))
+            return {};
 
-        // Transient error — throw so IOPool skips negative caching.
-        // Include URL and HTTP code for diagnostics.
         char msg[512];
         std::snprintf(msg, sizeof(msg),
                       "HTTP fetch failed: %s (curl=%d http=%ld) url=%s",
@@ -241,6 +280,72 @@ std::vector<uint8_t> HttpChunkSource::fetch(const ChunkKey& key)
         throw std::runtime_error(msg);
     }
     return response;
+}
+#endif
+
+std::vector<uint8_t> HttpChunkSource::fetchFromShard(const ChunkKey& key)
+{
+    std::string url = shardUrl(key);
+
+    // Check shard cache (shared_ptr so multiple threads can read concurrently)
+    std::shared_ptr<std::vector<uint8_t>> shardData;
+    {
+        std::lock_guard<std::mutex> lock(shardCacheMutex_);
+        auto it = shardCache_.find(url);
+        if (it != shardCache_.end())
+            shardData = it->second;
+    }
+
+    if (!shardData) {
+#ifdef VC_USE_CURL
+        auto raw = httpGetBytes(url, auth_, 8 * 1024 * 1024);
+        if (raw.empty()) return {};
+        shardData = std::make_shared<std::vector<uint8_t>>(std::move(raw));
+
+        std::lock_guard<std::mutex> lock(shardCacheMutex_);
+        // Another thread may have inserted while we fetched — keep first
+        auto [it, inserted] = shardCache_.emplace(url, shardData);
+        if (!inserted) shardData = it->second;
+
+        if (auto* log = cacheDebugLog())
+            std::fprintf(log, "[SHARD] Cached %s (%zu bytes, %d entries)\n",
+                         url.c_str(), shardData->size(), totalChunksPerShard());
+#else
+        return {};
+#endif
+    }
+
+    // Parse the binary index at the end of the shard.
+    // Format: N entries of [uint64_le offset, uint64_le nbytes], 16 bytes each.
+    int nChunks = totalChunksPerShard();
+    uint64_t indexSize = static_cast<uint64_t>(nChunks) * 16;
+    if (shardData->size() < indexSize) return {};
+
+    int inner = innerChunkIndex(key);
+    if (inner < 0 || inner >= nChunks) return {};
+
+    const uint8_t* indexBase = shardData->data() + shardData->size() - indexSize;
+    const uint8_t* entry = indexBase + inner * 16;
+
+    uint64_t offset = 0, nbytes = 0;
+    std::memcpy(&offset, entry, 8);
+    std::memcpy(&nbytes, entry + 8, 8);
+
+    // Empty sentinel: all-ones means chunk not present
+    if (offset == UINT64_MAX && nbytes == UINT64_MAX) return {};
+
+    if (offset + nbytes > shardData->size() - indexSize) return {};
+
+    return {shardData->data() + offset, shardData->data() + offset + nbytes};
+}
+
+std::vector<uint8_t> HttpChunkSource::fetch(const ChunkKey& key)
+{
+    if (sharded_)
+        return fetchFromShard(key);
+
+#ifdef VC_USE_CURL
+    return httpGetBytes(chunkUrl(key), auth_);
 #else
     (void)key;
     return {};

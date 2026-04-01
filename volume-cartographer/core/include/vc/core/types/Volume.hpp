@@ -275,4 +275,5 @@ protected:
     std::string remoteUrl_;
     std::string remoteDelimiter_ = ".";
     vc::cache::HttpAuth remoteAuth_;
+    vc::cache::ShardConfig remoteShardConfig_;
 };

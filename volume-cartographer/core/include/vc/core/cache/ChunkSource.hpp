@@ -3,7 +3,9 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "ChunkKey.hpp"
@@ -67,8 +69,12 @@ private:
     std::vector<LevelMeta> levels_;
 };
 
+// Shard configuration for zarr v3 sharded storage (forward declaration).
+struct ShardConfig;
+
 // Fetches compressed chunks from an HTTP/HTTPS zarr store.
-// URL layout: <baseUrl>/<level>/<iz>.<iy>.<ix>
+// URL layout: <baseUrl>/<level>/<iz>.<iy>.<ix>  (zarr v2)
+//         or: <baseUrl>/<level>/c/<sz>/<sy>/<sx> (zarr v3 sharded)
 // Requires libcurl at link time (gated behind VC_USE_CURL).
 class HttpChunkSource : public ChunkSource {
 public:
@@ -85,6 +91,10 @@ public:
 
     ~HttpChunkSource() override;
 
+    // Enable zarr v3 sharded storage. When set, chunk URLs use
+    // {level}/c/{sz}/{sy}/{sx} format with shard coordinate mapping.
+    void setShardConfig(const ShardConfig& config);
+
     [[nodiscard]] std::vector<uint8_t> fetch(const ChunkKey& key) override;
     [[nodiscard]] int numLevels() const override;
     [[nodiscard]] std::array<int, 3> chunkShape(int level) const override;
@@ -92,11 +102,24 @@ public:
 
 private:
     std::string chunkUrl(const ChunkKey& key) const;
+    std::string shardUrl(const ChunkKey& key) const;
+    int innerChunkIndex(const ChunkKey& key) const;
+    int totalChunksPerShard() const;
+
+    // Fetch entire shard file, cache it, extract chunk by inner index.
+    std::vector<uint8_t> fetchFromShard(const ChunkKey& key);
 
     std::string baseUrl_;
     std::string delimiter_;
     std::vector<LevelMeta> levels_;
     HttpAuth auth_;
+    bool sharded_ = false;
+    std::array<int, 3> shardShape_ = {0, 0, 0};   // shard size in voxels
+    std::array<int, 3> chunksPerShard_ = {1, 1, 1}; // chunks per shard dimension
+
+    // Whole-shard cache: shard URL -> raw bytes.
+    std::mutex shardCacheMutex_;
+    std::unordered_map<std::string, std::shared_ptr<std::vector<uint8_t>>> shardCache_;
 };
 
 }  // namespace vc::cache

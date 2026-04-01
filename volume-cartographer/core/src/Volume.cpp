@@ -301,6 +301,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->remoteUrl_ = info.url;
     vol->remoteDelimiter_ = info.delimiter;
     vol->remoteAuth_ = auth;
+    vol->remoteShardConfig_ = info.shardConfig;
 
     return vol;
 }
@@ -357,8 +358,12 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
     // Create chunk source: HTTP for remote volumes, filesystem for local
     std::unique_ptr<vc::cache::ChunkSource> source;
     if (isRemote_) {
-        source = std::make_unique<vc::cache::HttpChunkSource>(
+        auto httpSource = std::make_unique<vc::cache::HttpChunkSource>(
             remoteUrl_, remoteDelimiter_, std::move(levels), remoteAuth_);
+        if (remoteShardConfig_.enabled) {
+            httpSource->setShardConfig(remoteShardConfig_);
+        }
+        source = std::move(httpSource);
 
         // For remote volumes, use the staging dir itself as the disk store.
         if (!diskStore) {

@@ -163,11 +163,7 @@ add_executable(vc_zarr_to_tiff src/vc_zarr_to_tiff.cpp)
 target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
 
 add_executable(vc_zarr_recompress src/vc_zarr_recompress.cpp)
-target_link_libraries(vc_zarr_recompress vc_core)
-target_include_directories(vc_zarr_recompress PRIVATE
-    ${CMAKE_SOURCE_DIR}/libs/c-blosc/blosc
-    ${CMAKE_BINARY_DIR}/libs/c-blosc/blosc
-)
+target_link_libraries(vc_zarr_recompress vc_core blosc_static)
 
 
 # Precompiled headers for CLI apps (reuse vc_core's PCH)
@@ -204,7 +200,6 @@ if(VC_USE_PCH)
         vc_rgb2tifxyz
         vc_telea_inpaint
         vc_thinning
-        vc_thinning_bench
         vc_tifxyz
         vc_zarr_to_tiff
     )

@@ -17,11 +17,21 @@ struct HttpAuth {
     std::string sessionToken;  // AWS_SESSION_TOKEN (optional, for STS)
 };
 
+// Shard configuration for zarr v3 sharded storage.
+// When present, each level stores multiple chunks in shard files at
+// {level}/c/{sz}/{sy}/{sx}, and the HTTP chunk source must map logical
+// chunk coordinates to shard coordinates + inner chunk offsets.
+struct ShardConfig {
+    bool enabled = false;
+    std::array<int, 3> shardShape = {0, 0, 0};  // shard size in voxels {z, y, x}
+};
+
 struct RemoteZarrInfo {
     std::string url;
     std::filesystem::path stagingDir;  // local dir with .zarray files
     std::string delimiter = ".";
     int numLevels = 0;
+    ShardConfig shardConfig;
 };
 
 // Result of S3 ListObjectsV2 with delimiter.

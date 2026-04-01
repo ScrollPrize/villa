@@ -400,6 +400,122 @@ bool httpDownloadFile(const std::string& url, const std::filesystem::path& dest,
 #endif
 }
 
+// ---- zarr v3 helpers --------------------------------------------------------
+
+// Convert a zarr v3 zarr.json into a zarr v2-compatible .zarray JSON string.
+// This lets the rest of the codebase (VcDataset, openZarrLevels) consume v3
+// volumes without any changes — they only ever see synthesized v2 metadata.
+static std::string synthesize_v2_metadata(const nlohmann::json& v3)
+{
+    nlohmann::json v2;
+    v2["zarr_format"] = 2;
+
+    // Shape
+    v2["shape"] = v3["shape"];
+
+    // Chunk shape: v3 uses chunk_grid.configuration.chunk_shape
+    auto& grid = v3["chunk_grid"];
+    v2["chunks"] = grid["configuration"]["chunk_shape"];
+
+    // Data type: v3 uses string like "uint8", "uint16"; map to v2 dtype codes
+    std::string dtype = v3["data_type"].get<std::string>();
+    if (dtype == "uint8")       v2["dtype"] = "|u1";
+    else if (dtype == "uint16") v2["dtype"] = "<u2";
+    else                        v2["dtype"] = dtype;  // pass through, VcDataset will validate
+
+    // Fill value
+    v2["fill_value"] = v3.value("fill_value", 0);
+
+    // Order
+    v2["order"] = "C";
+
+    // Dimension separator: v3 uses "/" by default
+    v2["dimension_separator"] = "/";
+
+    // Compressor: map v3 codecs array to v2 compressor
+    v2["compressor"] = nullptr;
+    if (v3.contains("codecs") && v3["codecs"].is_array()) {
+        for (auto& codec : v3["codecs"]) {
+            std::string name = codec.value("name", "");
+            if (name == "blosc") {
+                auto& cfg = codec["configuration"];
+                nlohmann::json comp;
+                comp["id"] = "blosc";
+                comp["cname"] = cfg.value("cname", "lz4");
+                comp["clevel"] = cfg.value("clevel", 5);
+                comp["shuffle"] = cfg.value("shuffle", 1);
+                if (cfg.contains("typesize"))
+                    comp["typesize"] = cfg["typesize"];
+                if (cfg.contains("blocksize"))
+                    comp["blocksize"] = cfg["blocksize"];
+                v2["compressor"] = comp;
+                break;
+            } else if (name == "zstd") {
+                nlohmann::json comp;
+                comp["id"] = "zstd";
+                comp["level"] = codec["configuration"].value("level", 3);
+                v2["compressor"] = comp;
+                break;
+            } else if (name == "gzip" || name == "zlib") {
+                nlohmann::json comp;
+                comp["id"] = "gzip";
+                comp["level"] = codec["configuration"].value("level", 5);
+                v2["compressor"] = comp;
+                break;
+            } else if (name == "lz4") {
+                nlohmann::json comp;
+                comp["id"] = "lz4";
+                comp["acceleration"] = codec["configuration"].value("acceleration", 1);
+                v2["compressor"] = comp;
+                break;
+            }
+            // Unknown codecs (e.g. "vc3d_h265") — leave compressor null.
+            // The VcDecompressor handles these via magic-header detection.
+        }
+    }
+
+    v2["filters"] = nullptr;
+
+    return v2.dump(2);
+}
+
+// Parse shard configuration from zarr v3 storage_transformers.
+// Returns a ShardConfig with enabled=true if chunk_manifest_sharding is found.
+static ShardConfig parse_v3_shard_config(
+    const nlohmann::json& v3,
+    const std::array<int, 3>& chunkShape)
+{
+    ShardConfig config;
+
+    if (!v3.contains("storage_transformers") || !v3["storage_transformers"].is_array())
+        return config;
+
+    for (auto& t : v3["storage_transformers"]) {
+        std::string name = t.value("name", "");
+        if (name != "chunk_manifest_sharding") continue;
+
+        if (!t.contains("configuration")) continue;
+        auto& cfg = t["configuration"];
+
+        // Shard shape in chunks (how many chunks per shard in each dimension)
+        if (cfg.contains("chunks_per_shard") && cfg["chunks_per_shard"].is_array() &&
+            cfg["chunks_per_shard"].size() >= 3) {
+            int cz = cfg["chunks_per_shard"][0].get<int>();
+            int cy = cfg["chunks_per_shard"][1].get<int>();
+            int cx = cfg["chunks_per_shard"][2].get<int>();
+            config.enabled = true;
+            config.shardShape = {
+                cz * chunkShape[0],
+                cy * chunkShape[1],
+                cx * chunkShape[2]
+            };
+        }
+        break;
+    }
+
+    return config;
+}
+
 // ---- metadata fetcher -------------------------------------------------------
 
 std::string normalizeRemoteUrl(const std::string& url)
@@ -583,13 +699,19 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
     // Probe levels concurrently in batches of 8.
     // Most volumes have fewer than 8 pyramid levels, so the first batch
     // typically discovers all of them in a single round-trip.
+    //
+    // Strategy: try zarr v2 (.zarray) first. If that yields zero levels,
+    // fall back to zarr v3 (zarr.json). This keeps v2 as the fast path.
     std::string delimiter = ".";
     int numLevels = 0;
     nlohmann::json level0Meta;
+    ShardConfig shardConfig;
+    bool isV3 = false;
 
     constexpr int kBatchSize = 8;
     constexpr int kMaxLevels = 20;
 
+    // --- Phase 1: try zarr v2 (.zarray) ---
     for (int batchStart = 0; batchStart < kMaxLevels; batchStart += kBatchSize) {
         int batchEnd = std::min(batchStart + kBatchSize, kMaxLevels);
 
@@ -641,8 +763,105 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
         if (batchHadMiss) break;
     }
 
+    // --- Phase 2: if v2 found nothing, try zarr v3 (zarr.json) ---
     if (numLevels == 0) {
-        throw std::runtime_error("No zarr levels found at " + baseUrl);
+        if (auto* log = cacheDebugLog())
+            std::fprintf(log, "[REMOTE] No zarr v2 levels found, trying zarr v3...\n");
+
+        for (int batchStart = 0; batchStart < kMaxLevels; batchStart += kBatchSize) {
+            int batchEnd = std::min(batchStart + kBatchSize, kMaxLevels);
+
+            std::vector<std::future<std::string>> futures;
+            futures.reserve(batchEnd - batchStart);
+            for (int lvl = batchStart; lvl < batchEnd; lvl++) {
+                std::string lvlUrl = baseUrl + "/" + std::to_string(lvl) + "/zarr.json";
+                futures.push_back(std::async(std::launch::async,
+                    [lvlUrl, &auth]() { return httpGetString(lvlUrl, auth); }));
+            }
+
+            bool batchHadMiss = false;
+            for (int i = 0; i < static_cast<int>(futures.size()); i++) {
+                int lvl = batchStart + i;
+                auto zarrJson = futures[i].get();
+
+                if (zarrJson.empty()) {
+                    if (auto* log = cacheDebugLog())
+                        std::fprintf(log, "[REMOTE] Level %d: no zarr.json\n", lvl);
+                    batchHadMiss = true;
+                    break;
+                }
+
+                // Parse zarr v3 metadata
+                nlohmann::json v3;
+                try {
+                    v3 = nlohmann::json::parse(zarrJson);
+                } catch (const std::exception& e) {
+                    if (auto* log = cacheDebugLog())
+                        std::fprintf(log, "[REMOTE] Level %d: failed to parse zarr.json: %s\n", lvl, e.what());
+                    batchHadMiss = true;
+                    break;
+                }
+
+                // Verify this is actually zarr v3
+                if (v3.value("zarr_format", 0) != 3 ||
+                    v3.value("node_type", "") != "array") {
+                    if (auto* log = cacheDebugLog())
+                        std::fprintf(log, "[REMOTE] Level %d: zarr.json is not zarr v3 array\n", lvl);
+                    batchHadMiss = true;
+                    break;
+                }
+
+                // Synthesize v2-compatible .zarray from v3 metadata
+                std::string synthesized = synthesize_v2_metadata(v3);
+                auto levelDir = stagingDir / std::to_string(lvl);
+                writeFile(levelDir / ".zarray", synthesized);
+                numLevels++;
+                isV3 = true;
+
+                if (auto* log = cacheDebugLog())
+                    std::fprintf(log, "[REMOTE] Level %d: fetched zarr.json (v3), synthesized .zarray (%zu bytes)\n",
+                                 lvl, synthesized.size());
+
+                // Parse level 0 for shape, delimiter, and shard config
+                if (lvl == 0) {
+                    try {
+                        level0Meta = nlohmann::json::parse(synthesized);
+                        // v3 default delimiter is "/"
+                        delimiter = "/";
+                        if (level0Meta.contains("dimension_separator")) {
+                            delimiter = level0Meta["dimension_separator"].get<std::string>();
+                        }
+
+                        // Check for sharded storage
+                        auto& grid = v3["chunk_grid"];
+                        std::array<int, 3> chunkShape = {
+                            grid["configuration"]["chunk_shape"][0].get<int>(),
+                            grid["configuration"]["chunk_shape"][1].get<int>(),
+                            grid["configuration"]["chunk_shape"][2].get<int>()
+                        };
+                        shardConfig = parse_v3_shard_config(v3, chunkShape);
+
+                        if (shardConfig.enabled) {
+                            if (auto* log = cacheDebugLog())
+                                std::fprintf(log, "[REMOTE] Shard config: shape=[%d, %d, %d]\n",
+                                             shardConfig.shardShape[0],
+                                             shardConfig.shardShape[1],
+                                             shardConfig.shardShape[2]);
+                        }
+                    } catch (const std::exception& e) {
+                        if (auto* log = cacheDebugLog())
+                            std::fprintf(log, "[REMOTE] Warning: failed to parse level 0 synthesized .zarray: %s\n", e.what());
+                    }
+                }
+            }
+
+            if (batchHadMiss) break;
+        }
+    }
+
+    if (numLevels == 0) {
+        throw std::runtime_error("No zarr levels found at " + baseUrl +
+                                 " (tried both v2 .zarray and v3 zarr.json)");
     }
 
     // Synthesize meta.json from level 0 shape
@@ -671,14 +890,16 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
     writeRemoteSourceMarker(stagingDir, baseUrl);
 
     if (auto* log = cacheDebugLog())
-        std::fprintf(log, "[REMOTE] Metadata complete: %d levels, shape=[%d, %d, %d] delimiter='%s'\n",
-                     numLevels, slices, height, width, delimiter.c_str());
+        std::fprintf(log, "[REMOTE] Metadata complete: %d levels, shape=[%d, %d, %d] delimiter='%s'%s\n",
+                     numLevels, slices, height, width, delimiter.c_str(),
+                     isV3 ? " (zarr v3)" : "");
 
     return RemoteZarrInfo{
         .url = baseUrl,
         .stagingDir = stagingDir,
         .delimiter = delimiter,
-        .numLevels = numLevels
+        .numLevels = numLevels,
+        .shardConfig = shardConfig
     };
 }
 

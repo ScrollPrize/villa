@@ -166,7 +166,6 @@ target_include_directories(VC3D
         ${CMAKE_SOURCE_DIR}/libs/edt
         ${CMAKE_SOURCE_DIR}/libs/cc3d
         ${CMAKE_SOURCE_DIR}/libs/djikstra3d
-        ${CMAKE_SOURCE_DIR}/libs/c-blosc/blosc
 )
 
 # Avahi for mDNS service discovery (Linux only)
@@ -198,3 +197,7 @@ target_link_libraries(VC3D
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
     blosc_static
 )
+
+if(VC_USE_PCH)
+    target_precompile_headers(VC3D REUSE_FROM vc_core)
+endif()
