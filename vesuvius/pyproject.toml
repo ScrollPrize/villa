@@ -70,6 +70,7 @@ models = [
     "typed-argument-parser>=1.11.0",
     "wandb[media]>=0.22.0",
     "psutil>=7.1.0",
+    "nest-asyncio>=1.6.0",
 
     # Data pipeline / I/O and compression
     "aiohttp>=3.12.15",
