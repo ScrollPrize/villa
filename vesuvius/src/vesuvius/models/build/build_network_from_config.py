@@ -256,6 +256,13 @@ class NetworkFromConfig(nn.Module):
         self.guide_tokenbook = None
         self.guide_patch_grid = None
         self.guide_freeze = bool(model_config.get("guide_freeze", True))
+        guide_compile_policy = str(model_config.get("guide_compile_policy", "off")).strip().lower()
+        if guide_compile_policy not in {"off", "backbone_only", "tokenbook_only"}:
+            raise ValueError(
+                "guide_compile_policy must be one of "
+                "{'off', 'backbone_only', 'tokenbook_only'}"
+            )
+        self.guide_compile_policy = guide_compile_policy
         # Determine if deep supervision is requested
         ds_enabled = bool(getattr(mgr, 'enable_deep_supervision', False))
 
@@ -709,6 +716,7 @@ class NetworkFromConfig(nn.Module):
             "guide_freeze": self.guide_freeze,
             "guide_patch_grid": self.guide_patch_grid,
             "guide_tokenbook_tokens": getattr(self, "guide_tokenbook_tokens", None),
+            "guide_compile_policy": self.guide_compile_policy if self.guide_enabled else "off",
             "guide_fusion_stage": "input" if self.guide_enabled else None,
         }
 
@@ -771,6 +779,27 @@ class NetworkFromConfig(nn.Module):
             random_indices = torch.randint(0, token_count, (batch_size,), device=guide_features.device)
             mask[torch.arange(batch_size, device=guide_features.device), random_indices] = True
         return mask
+
+    @staticmethod
+    def _compile_module_in_place(module: nn.Module) -> nn.Module:
+        compile_method = getattr(module, "compile", None)
+        if callable(compile_method):
+            compile_method()
+            return module
+        return torch.compile(module)
+
+    def _compile_guidance_submodules(self, *, device_type: str) -> list[str]:
+        if not self.guide_enabled or device_type != "cuda":
+            return []
+
+        compiled_modules: list[str] = []
+        if self.guide_compile_policy == "backbone_only" and self.guide_backbone is not None:
+            self.guide_backbone = self._compile_module_in_place(self.guide_backbone)
+            compiled_modules.append("guide_backbone")
+        elif self.guide_compile_policy == "tokenbook_only" and self.guide_tokenbook is not None:
+            self.guide_tokenbook = self._compile_module_in_place(self.guide_tokenbook)
+            compiled_modules.append("guide_tokenbook")
+        return compiled_modules
 
     @torch.compiler.disable(reason="guided backbone compile failure")
     def _apply_input_guidance(self, x):
