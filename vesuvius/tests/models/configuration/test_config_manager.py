@@ -102,3 +102,41 @@ class TestTargetNameValidation:
         # Should raise for the first reserved name encountered
         with pytest.raises(ValueError, match="is reserved"):
             mgr.validate_target_names(names_with_reserved)
+
+    def test_compile_policy_and_startup_timing_load_from_config(self):
+        config = {
+            "tr_config": {
+                "compile_policy": "module",
+                "startup_timing": True,
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+
+        try:
+            mgr = ConfigManager(verbose=False)
+            mgr.load_config(temp_path)
+            assert mgr.compile_policy == "module"
+            assert mgr.startup_timing is True
+        finally:
+            Path(temp_path).unlink()
+
+    def test_invalid_compile_policy_raises_value_error(self):
+        config = {
+            "tr_config": {
+                "compile_policy": "not_a_policy",
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+
+        try:
+            mgr = ConfigManager(verbose=False)
+            with pytest.raises(ValueError, match="compile_policy"):
+                mgr.load_config(temp_path)
+        finally:
+            Path(temp_path).unlink()

@@ -1,6 +1,7 @@
 from pathlib import Path
 from copy import deepcopy
 import os
+from time import perf_counter
 from datetime import datetime
 from tqdm import tqdm
 import numpy as np
@@ -166,6 +167,11 @@ class BaseTrainer:
         self.guide_loss_weight = float(getattr(self.mgr, "guide_loss_weight", 0.0))
         self.guide_supervision_target = getattr(self.mgr, "guide_supervision_target", None)
         self._current_aux_outputs = {}
+        self.compile_policy = str(getattr(self.mgr, "compile_policy", "auto")).strip().lower()
+        self.startup_timing = bool(getattr(self.mgr, "startup_timing", False))
+        self._startup_timing_records = []
+        self._startup_timing_logged = False
+        self._first_optimizer_timing_recorded = False
 
     # --- build model --- #
     def _build_model(self):
@@ -217,6 +223,64 @@ class BaseTrainer:
                 output_device=self.assigned_gpu_id,
             )
         return DDP(model, **ddp_kwargs)
+
+    def _record_startup_timing(self, label, duration_seconds):
+        if not self.startup_timing:
+            return
+        label = str(label)
+        duration_seconds = float(duration_seconds)
+        self._startup_timing_records.append((label, duration_seconds))
+        if not self.is_distributed or self.rank == 0:
+            print(f"[Timing] {label}: {duration_seconds:.3f}s")
+
+    def _flush_startup_timing(self, prefix="startup"):
+        if not self.startup_timing or self._startup_timing_logged:
+            return
+        self._startup_timing_logged = True
+
+    def _resolve_compile_policy(self, model):
+        policy = self.compile_policy
+        if policy == "auto":
+            raw_model = self._unwrap_model(model)
+            return "module" if getattr(raw_model, "guide_enabled", False) else "ddp_wrapper"
+        return policy
+
+    def _compile_module_in_place(self, model):
+        compile_method = getattr(model, "compile", None)
+        if callable(compile_method):
+            compile_method()
+            return model
+        return torch.compile(model)
+
+    def _maybe_compile_model(self, model):
+        if self.device.type != "cuda":
+            return model
+
+        compile_policy = self._resolve_compile_policy(model)
+        if compile_policy == "off":
+            if not self.is_distributed or self.rank == 0:
+                print("Compile policy set to 'off'; using eager mode.")
+            return model
+
+        compile_start = perf_counter()
+        if not self.is_distributed or self.rank == 0:
+            print(f"Compiling model with policy '{compile_policy}'")
+
+        try:
+            if compile_policy == "module":
+                model = self._compile_module_in_place(model)
+            elif compile_policy == "ddp_wrapper":
+                model = torch.compile(model)
+            else:
+                raise ValueError(f"Unsupported compile policy: {compile_policy}")
+        except Exception as e:
+            if not self.is_distributed or self.rank == 0:
+                print(f"Compile policy '{compile_policy}' failed; continuing without compile. Reason: {e}")
+            self._record_startup_timing("compile_failed", perf_counter() - compile_start)
+            return model
+
+        self._record_startup_timing("compile", perf_counter() - compile_start)
+        return model
 
     def _create_ema_model(self, model):
         ema_model = deepcopy(self._unwrap_model(model))
@@ -1158,7 +1222,9 @@ class BaseTrainer:
         # workers can parallelize them. When augment_on_device=True we preserve the
         # same pipeline here and disable dataset-side augmentation to avoid applying
         # transforms twice.
+        stage_start = perf_counter()
         train_dataset = self._configure_dataset(is_training=True)
+        self._record_startup_timing("train_dataset_init", perf_counter() - stage_start)
         self._train_dataset = train_dataset
         self._on_device_transforms = None
         if getattr(self.mgr, 'augment_on_device', False):
@@ -1179,7 +1245,9 @@ class BaseTrainer:
                 raise ValueError(f"Could not determine data format for validation directory: {val_mgr.data_path}")
             val_mgr.data_format = detected_val_fmt
 
+            stage_start = perf_counter()
             val_dataset = self._build_dataset_for_mgr(val_mgr, is_training=False)
+            self._record_startup_timing("val_dataset_init", perf_counter() - stage_start)
             print(f"Using {val_mgr.data_format} dataset format (validation from --val-dir)")
         else:
             # Reuse same source for validation without re-running expensive image checks
@@ -1187,15 +1255,21 @@ class BaseTrainer:
             val_mgr = deepcopy(self.mgr)
             setattr(val_mgr, 'skip_image_checks', True)
 
+            stage_start = perf_counter()
             val_dataset = self._build_dataset_for_mgr(val_mgr, is_training=False)
+            self._record_startup_timing("val_dataset_init", perf_counter() - stage_start)
         
-
+        stage_start = perf_counter()
         autodetect_sample = self._prepare_sample(train_dataset[0], is_training=True) if len(train_dataset) > 0 else None
+        self._record_startup_timing("sample_autodetect", perf_counter() - stage_start)
         self.mgr.auto_detect_channels(dataset=train_dataset, sample=autodetect_sample)
+        stage_start = perf_counter()
         model = self._build_model()
+        self._record_startup_timing("model_build", perf_counter() - stage_start)
 
         self._ds_scales = None
         self._ds_weights = None
+        stage_start = perf_counter()
         optimizer = self._get_optimizer(model)
         scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
         self._is_per_iteration_scheduler = is_per_iteration_scheduler  # Store for later use
@@ -1242,11 +1316,12 @@ class BaseTrainer:
                 print("Using CUDA AMP with bfloat16 (GradScaler disabled)")
 
         scaler = self._get_scaler(self.device.type, use_amp=use_amp, amp_dtype=self.amp_dtype)
+        self._record_startup_timing("optimizer_scheduler_scaler_init", perf_counter() - stage_start)
+        stage_start = perf_counter()
         train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset,
                                                                                                    val_dataset)
+        self._record_startup_timing("dataloader_build", perf_counter() - stage_start)
 
-        # Wrap model with DDP if distributed
-        model = self._wrap_model_for_distributed_training(model)
         os.makedirs(self.mgr.ckpt_out_base, exist_ok=True)
         model_ckpt_dir = os.path.join(self.mgr.ckpt_out_base, self.mgr.model_name)
         os.makedirs(model_ckpt_dir, exist_ok=True)
@@ -1300,11 +1375,14 @@ class BaseTrainer:
         loss_fns = self._build_loss()
         self._initialize_ema_model(model)
 
-        if self.device.type == 'cuda':
-            try:
-                model = torch.compile(model)
-            except Exception as e:
-                print(f"torch.compile failed; continuing without compile. Reason: {e}")
+        compile_policy = self._resolve_compile_policy(model)
+        if compile_policy == "module":
+            model = self._maybe_compile_model(model)
+        stage_start = perf_counter()
+        model = self._wrap_model_for_distributed_training(model)
+        self._record_startup_timing("ddp_wrap", perf_counter() - stage_start)
+        if compile_policy == "ddp_wrapper":
+            model = self._maybe_compile_model(model)
 
         return {
             'model': model,
@@ -1530,25 +1608,43 @@ class BaseTrainer:
 
         self._accumulate_aug_timers(data_for_forward)
 
+        should_time_first_step = self.startup_timing and epoch == 0 and step == 0
+        if should_time_first_step:
+            step_stage_start = perf_counter()
         with autocast_ctx:
             inputs, targets_dict, outputs = self._get_model_outputs(model, data_for_forward)
+            if should_time_first_step:
+                self._record_startup_timing("first_forward", perf_counter() - step_stage_start)
+                step_stage_start = perf_counter()
             total_loss, task_losses = self._compute_train_loss(outputs, targets_dict, loss_fns)
+            if should_time_first_step:
+                self._record_startup_timing("first_loss_compute", perf_counter() - step_stage_start)
 
         # Handle gradient accumulation, clipping, and optimizer step
         # Scale loss by accumulation steps to maintain same effective batch size
         scaled_loss = total_loss / grad_accumulate_n
 
         # backward
+        if should_time_first_step:
+            step_stage_start = perf_counter()
         scaler.scale(scaled_loss).backward()
+        if should_time_first_step:
+            self._record_startup_timing("first_backward", perf_counter() - step_stage_start)
 
         optimizer_stepped = False
         if (step + 1) % grad_accumulate_n == 0 or (step + 1) == num_iters:
+            should_time_optimizer = self.startup_timing and not self._first_optimizer_timing_recorded
+            if should_time_optimizer:
+                step_stage_start = perf_counter()
             scaler.unscale_(optimizer)
             grad_clip = getattr(self.mgr, 'gradient_clip', 12.0)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer_stepped = True
+            if should_time_optimizer:
+                self._record_startup_timing("first_optimizer_step", perf_counter() - step_stage_start)
+                self._first_optimizer_timing_recorded = True
 
         return total_loss, task_losses, inputs, targets_dict, outputs, optimizer_stepped
 
@@ -1801,7 +1897,10 @@ class BaseTrainer:
                 if i % grad_accumulate_n == 0:
                     optimizer.zero_grad(set_to_none=True)
 
+                fetch_start = perf_counter() if (self.startup_timing and epoch == 0 and i == 0) else None
                 data_dict = next(train_iter)
+                if fetch_start is not None:
+                    self._record_startup_timing("first_batch_fetch", perf_counter() - fetch_start)
                 global_step += 1
                 
                 # Setup autocast context (dtype resolved based on CLI/config)
@@ -1882,6 +1981,9 @@ class BaseTrainer:
                     scheduler.step()
                 elif optimizer_stepped:
                     self._update_ema_model(model)
+
+                if self.startup_timing and self._first_optimizer_timing_recorded and not self._startup_timing_logged:
+                    self._flush_startup_timing(prefix="startup_and_first_step")
 
                 if pbar is not None:
                     loss_str = " | ".join([f"{t}: {np.mean(epoch_losses[t][-100:]):.4f}"

@@ -256,3 +256,123 @@ def test_trainer_builds_only_standard_debug_payload_when_no_guide_preview():
     )
 
     assert set(payload.keys()) == {"debug_image"}
+
+
+class _DummyDataset:
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, index):
+        return {"image": torch.zeros((1, 4, 4, 4), dtype=torch.float32)}
+
+
+class _DummyModel(torch.nn.Module):
+    def __init__(self, *, guide_enabled: bool):
+        super().__init__()
+        self.guide_enabled = guide_enabled
+        self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, x):
+        return x * self.weight
+
+
+def _make_compile_mgr(tmp_path: Path, *, compile_policy: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        gpu_ids=None,
+        use_ddp=False,
+        targets={"ink": {"out_channels": 1, "activation": "none"}},
+        tr_configs={},
+        model_name="compile_policy_test",
+        train_patch_size=(4, 4, 4),
+        train_batch_size=1,
+        in_channels=1,
+        autoconfigure=False,
+        enable_deep_supervision=False,
+        spacing=(1.0, 1.0, 1.0),
+        data_path=tmp_path,
+        ckpt_out_base=tmp_path / "ckpts",
+        checkpoint_path=None,
+        load_weights_only=False,
+        guide_loss_weight=0.0,
+        guide_supervision_target=None,
+        train_num_dataloader_workers=0,
+        compile_policy=compile_policy,
+        startup_timing=False,
+        no_amp=True,
+        amp_dtype="float16",
+        verbose=False,
+        auto_detect_channels=lambda dataset, sample: None,
+    )
+
+
+def _configure_compile_test_trainer(
+    trainer: BaseTrainer,
+    monkeypatch,
+    *,
+    guide_enabled: bool,
+    call_order: list[str],
+):
+    dummy_dataset = _DummyDataset()
+    dummy_model = _DummyModel(guide_enabled=guide_enabled)
+
+    monkeypatch.setattr(trainer, "_configure_dataset", lambda is_training: dummy_dataset)
+    monkeypatch.setattr(trainer, "_build_dataset_for_mgr", lambda mgr, is_training: dummy_dataset)
+    monkeypatch.setattr(trainer, "_prepare_sample", lambda sample, is_training: sample)
+    monkeypatch.setattr(trainer, "_build_model", lambda: dummy_model)
+    monkeypatch.setattr(trainer, "_get_optimizer", lambda model: torch.optim.SGD(model.parameters(), lr=0.1))
+    monkeypatch.setattr(
+        trainer,
+        "_get_scheduler",
+        lambda optimizer: (torch.optim.lr_scheduler.StepLR(optimizer, step_size=1), False),
+    )
+    monkeypatch.setattr(trainer, "_get_scaler", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        trainer,
+        "_configure_dataloaders",
+        lambda train_dataset, val_dataset: ([], [], [0], [0]),
+    )
+    monkeypatch.setattr(trainer, "_build_loss", lambda: {})
+    monkeypatch.setattr(trainer, "_initialize_ema_model", lambda model: None)
+    monkeypatch.setattr(
+        trainer,
+        "_wrap_model_for_distributed_training",
+        lambda model: call_order.append("wrap") or model,
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_maybe_compile_model",
+        lambda model: call_order.append("compile") or model,
+    )
+
+
+def test_initialize_training_compiles_guided_model_before_ddp_wrap(tmp_path: Path, monkeypatch):
+    mgr = _make_compile_mgr(tmp_path, compile_policy="auto")
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    call_order: list[str] = []
+    _configure_compile_test_trainer(trainer, monkeypatch, guide_enabled=True, call_order=call_order)
+
+    trainer._initialize_training()
+
+    assert call_order == ["compile", "wrap"]
+
+
+def test_initialize_training_compiles_unguided_ddp_wrapper_by_default(tmp_path: Path, monkeypatch):
+    mgr = _make_compile_mgr(tmp_path, compile_policy="auto")
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    call_order: list[str] = []
+    _configure_compile_test_trainer(trainer, monkeypatch, guide_enabled=False, call_order=call_order)
+
+    trainer._initialize_training()
+
+    assert call_order == ["wrap", "compile"]
+
+
+def test_initialize_training_skips_compile_when_policy_is_off(tmp_path: Path, monkeypatch):
+    mgr = _make_compile_mgr(tmp_path, compile_policy="off")
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    call_order: list[str] = []
+    _configure_compile_test_trainer(trainer, monkeypatch, guide_enabled=True, call_order=call_order)
+
+    trainer._initialize_training()
+
+    assert call_order == ["wrap"]
