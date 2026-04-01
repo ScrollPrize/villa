@@ -309,6 +309,8 @@ class ConfigManager:
         self.optimizer = self.tr_configs.get("optimizer", "SGD")
         self.initial_lr = float(self.tr_configs.get("initial_lr", 0.01))
         self.weight_decay = float(self.tr_configs.get("weight_decay", 0.00003))
+        self.guide_loss_weight = float(self.tr_configs.get("guide_loss_weight", 0.0))
+        self.guide_supervision_target = self.tr_configs.get("guide_supervision_target", None)
 
         ema_cfg = deepcopy(getattr(self, "ema_config", {}) or {})
         self.ema_enabled = bool(ema_cfg.get("enabled", False))
