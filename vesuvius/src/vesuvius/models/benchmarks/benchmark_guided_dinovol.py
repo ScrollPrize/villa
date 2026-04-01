@@ -312,6 +312,8 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--guide-tokenbook-tokens", type=str, default="full", help="'full' or integer prototype count.")
+    parser.add_argument("--skip-compile-variants", action="store_true")
+    parser.add_argument("--skip-stage-breakdown", action="store_true")
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
@@ -352,13 +354,6 @@ def main() -> None:
         )
 
         patch_summary: dict[str, object] = {}
-        patch_summary["guided_eager_stage_breakdown_ms"] = _profile_guided_stages(
-            guided_eager_model,
-            device=device,
-            cpu_inputs=cpu_inputs.detach().clone(),
-            iterations=args.iterations,
-        )
-
         variants = {
             "baseline_eager": _build_model(
                 patch_size=patch_size,
@@ -369,23 +364,32 @@ def main() -> None:
                 channels_last_3d=False,
             ),
             "guided_eager": guided_eager_model,
-            "guided_compile": _build_model(
+        }
+        if not args.skip_compile_variants:
+            variants["guided_compile"] = _build_model(
                 patch_size=patch_size,
                 device=device,
                 guide_checkpoint=str(guide_checkpoint),
                 guide_tokenbook_tokens=guide_tokenbook_tokens,
                 compile_model=True,
                 channels_last_3d=False,
-            ),
-            "guided_compile_channels_last_3d": _build_model(
+            )
+            variants["guided_compile_channels_last_3d"] = _build_model(
                 patch_size=patch_size,
                 device=device,
                 guide_checkpoint=str(guide_checkpoint),
                 guide_tokenbook_tokens=guide_tokenbook_tokens,
                 compile_model=True,
                 channels_last_3d=True,
-            ),
-        }
+            )
+
+        if not args.skip_stage_breakdown:
+            patch_summary["guided_eager_stage_breakdown_ms"] = _profile_guided_stages(
+                guided_eager_model,
+                device=device,
+                cpu_inputs=cpu_inputs.detach().clone(),
+                iterations=args.iterations,
+            )
 
         for variant_name, model in variants.items():
             variant_inputs = cpu_inputs

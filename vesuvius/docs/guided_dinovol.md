@@ -24,6 +24,15 @@ The guided config uses the local volumetric DINO checkpoint at:
 /home/giorgio/Projects/dino-vesuvius/dino-checkpoints/checkpoint_step_342500.pt
 ```
 
+It also enables:
+
+```yaml
+model_config:
+  guide_tokenbook_tokens: 256
+```
+
+This is an opt-in speed setting for the example config only. The model default remains full-grid TokenBook prototypes when the key is omitted.
+
 ## Tests
 
 Run the guided coverage:
@@ -45,3 +54,21 @@ uv run --extra models python -m vesuvius.models.benchmarks.benchmark_guided_dino
   --patch-size 64,64,64 \
   --device cuda
 ```
+
+For faster prototype-count sweeps without compile variants:
+
+```bash
+uv run --extra models python -m vesuvius.models.benchmarks.benchmark_guided_dinovol \
+  --guide-checkpoint /home/giorgio/Projects/dino-vesuvius/dino-checkpoints/checkpoint_step_342500.pt \
+  --patch-size 64,64,64 \
+  --device cuda \
+  --guide-tokenbook-tokens 256 \
+  --skip-compile-variants \
+  --skip-stage-breakdown
+```
+
+## Current Operational Guidance
+
+- Keep the guided path in eager mode unless a local benchmark shows compile is stable for your exact setup.
+- Do not expose or rely on a public `channels_last_3d` toggle; the measured gain was negligible relative to plain compile.
+- Prefer capped TokenBook prototypes for large training patches; the example config uses `256` for `128^3`.
