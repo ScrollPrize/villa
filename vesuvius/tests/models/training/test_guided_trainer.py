@@ -299,6 +299,9 @@ def _make_compile_mgr(tmp_path: Path, *, compile_policy: str) -> SimpleNamespace
         train_num_dataloader_workers=0,
         compile_policy=compile_policy,
         startup_timing=False,
+        ddp_find_unused_parameters="auto",
+        ddp_static_graph="auto",
+        ddp_gradient_as_bucket_view=False,
         no_amp=True,
         amp_dtype="float16",
         verbose=False,
@@ -377,6 +380,54 @@ def test_initialize_training_skips_compile_when_policy_is_off(tmp_path: Path, mo
     trainer._initialize_training()
 
     assert call_order == ["wrap"]
+
+
+def test_wrap_model_uses_guided_ddp_defaults(tmp_path: Path):
+    mgr = _make_compile_mgr(tmp_path, compile_policy="module")
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    trainer.is_distributed = True
+    trainer.device = torch.device("cpu")
+    trainer.rank = 0
+    captured = {}
+
+    class _FakeDDP:
+        def __init__(self, model, **kwargs):
+            captured["model"] = model
+            captured["kwargs"] = kwargs
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("vesuvius.models.training.train.DDP", _FakeDDP)
+    try:
+        trainer._wrap_model_for_distributed_training(_DummyModel(guide_enabled=True))
+    finally:
+        monkeypatch.undo()
+
+    assert captured["kwargs"]["find_unused_parameters"] is False
+    assert captured["kwargs"]["static_graph"] is True
+
+
+def test_wrap_model_uses_unguided_ddp_defaults(tmp_path: Path):
+    mgr = _make_compile_mgr(tmp_path, compile_policy="module")
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    trainer.is_distributed = True
+    trainer.device = torch.device("cpu")
+    trainer.rank = 0
+    captured = {}
+
+    class _FakeDDP:
+        def __init__(self, model, **kwargs):
+            captured["model"] = model
+            captured["kwargs"] = kwargs
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("vesuvius.models.training.train.DDP", _FakeDDP)
+    try:
+        trainer._wrap_model_for_distributed_training(_DummyModel(guide_enabled=False))
+    finally:
+        monkeypatch.undo()
+
+    assert captured["kwargs"]["find_unused_parameters"] is True
+    assert captured["kwargs"]["static_graph"] is False
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for autocast safety test")

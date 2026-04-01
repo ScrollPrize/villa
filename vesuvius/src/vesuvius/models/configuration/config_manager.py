@@ -314,6 +314,31 @@ class ConfigManager:
             )
         self.compile_policy = compile_policy
         self.startup_timing = bool(self.tr_configs.get("startup_timing", False))
+        ddp_find_unused_parameters = self.tr_configs.get("ddp_find_unused_parameters", "auto")
+        if isinstance(ddp_find_unused_parameters, str):
+            ddp_find_unused_parameters_norm = ddp_find_unused_parameters.strip().lower()
+            if ddp_find_unused_parameters_norm not in {"auto", "true", "false"}:
+                raise ValueError(
+                    "tr_config.ddp_find_unused_parameters must be one of "
+                    "{'auto', true, false}"
+                )
+            self.ddp_find_unused_parameters = ddp_find_unused_parameters_norm
+        else:
+            self.ddp_find_unused_parameters = bool(ddp_find_unused_parameters)
+        ddp_static_graph = self.tr_configs.get("ddp_static_graph", "auto")
+        if isinstance(ddp_static_graph, str):
+            ddp_static_graph_norm = ddp_static_graph.strip().lower()
+            if ddp_static_graph_norm not in {"auto", "true", "false"}:
+                raise ValueError(
+                    "tr_config.ddp_static_graph must be one of "
+                    "{'auto', true, false}"
+                )
+            self.ddp_static_graph = ddp_static_graph_norm
+        else:
+            self.ddp_static_graph = bool(ddp_static_graph)
+        self.ddp_gradient_as_bucket_view = bool(
+            self.tr_configs.get("ddp_gradient_as_bucket_view", False)
+        )
         self.optimizer = self.tr_configs.get("optimizer", "SGD")
         self.initial_lr = float(self.tr_configs.get("initial_lr", 0.01))
         self.weight_decay = float(self.tr_configs.get("weight_decay", 0.00003))

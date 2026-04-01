@@ -216,11 +216,45 @@ class BaseTrainer:
         if not self.is_distributed:
             return model
 
-        ddp_kwargs = {"find_unused_parameters": True}
+        raw_model = self._unwrap_model(model)
+        guide_enabled = bool(getattr(raw_model, "guide_enabled", False))
+
+        find_unused_cfg = getattr(self.mgr, "ddp_find_unused_parameters", "auto")
+        if isinstance(find_unused_cfg, str):
+            find_unused_norm = find_unused_cfg.strip().lower()
+            if find_unused_norm == "auto":
+                find_unused_parameters = not guide_enabled
+            else:
+                find_unused_parameters = find_unused_norm == "true"
+        else:
+            find_unused_parameters = bool(find_unused_cfg)
+
+        static_graph_cfg = getattr(self.mgr, "ddp_static_graph", "auto")
+        if isinstance(static_graph_cfg, str):
+            static_graph_norm = static_graph_cfg.strip().lower()
+            if static_graph_norm == "auto":
+                static_graph = guide_enabled
+            else:
+                static_graph = static_graph_norm == "true"
+        else:
+            static_graph = bool(static_graph_cfg)
+
+        ddp_kwargs = {
+            "find_unused_parameters": find_unused_parameters,
+            "static_graph": static_graph,
+            "gradient_as_bucket_view": bool(getattr(self.mgr, "ddp_gradient_as_bucket_view", False)),
+        }
         if self.device.type == 'cuda':
             ddp_kwargs.update(
                 device_ids=[self.assigned_gpu_id],
                 output_device=self.assigned_gpu_id,
+            )
+        if not self.is_distributed or self.rank == 0:
+            print(
+                "DDP kwargs: "
+                f"find_unused_parameters={ddp_kwargs['find_unused_parameters']}, "
+                f"static_graph={ddp_kwargs['static_graph']}, "
+                f"gradient_as_bucket_view={ddp_kwargs['gradient_as_bucket_view']}"
             )
         return DDP(model, **ddp_kwargs)
 

@@ -108,6 +108,9 @@ class TestTargetNameValidation:
             "tr_config": {
                 "compile_policy": "module",
                 "startup_timing": True,
+                "ddp_find_unused_parameters": False,
+                "ddp_static_graph": True,
+                "ddp_gradient_as_bucket_view": True,
             }
         }
 
@@ -120,6 +123,9 @@ class TestTargetNameValidation:
             mgr.load_config(temp_path)
             assert mgr.compile_policy == "module"
             assert mgr.startup_timing is True
+            assert mgr.ddp_find_unused_parameters is False
+            assert mgr.ddp_static_graph is True
+            assert mgr.ddp_gradient_as_bucket_view is True
         finally:
             Path(temp_path).unlink()
 
@@ -137,6 +143,42 @@ class TestTargetNameValidation:
         try:
             mgr = ConfigManager(verbose=False)
             with pytest.raises(ValueError, match="compile_policy"):
+                mgr.load_config(temp_path)
+        finally:
+            Path(temp_path).unlink()
+
+    def test_invalid_ddp_find_unused_parameters_raises_value_error(self):
+        config = {
+            "tr_config": {
+                "ddp_find_unused_parameters": "sometimes",
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+
+        try:
+            mgr = ConfigManager(verbose=False)
+            with pytest.raises(ValueError, match="ddp_find_unused_parameters"):
+                mgr.load_config(temp_path)
+        finally:
+            Path(temp_path).unlink()
+
+    def test_invalid_ddp_static_graph_raises_value_error(self):
+        config = {
+            "tr_config": {
+                "ddp_static_graph": "sometimes",
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+
+        try:
+            mgr = ConfigManager(verbose=False)
+            with pytest.raises(ValueError, match="ddp_static_graph"):
                 mgr.load_config(temp_path)
         finally:
             Path(temp_path).unlink()
