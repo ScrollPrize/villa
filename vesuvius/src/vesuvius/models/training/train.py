@@ -1301,18 +1301,20 @@ class BaseTrainer:
 
     def _extract_targets(self, data_dict):
         # Only include tensor targets; skip metadata and lists (e.g., 'regression_keys')
+        non_blocking = self.device.type == 'cuda'
         return {
-            k: v.to(self.device)
+            k: v.to(self.device, non_blocking=non_blocking)
             for k, v in data_dict.items()
             if k not in ["image", "patch_info", "is_unlabeled", "regression_keys"]
             and hasattr(v, "to")
         }
 
     def _get_model_outputs(self, model, data_dict):
-        inputs = data_dict["image"].to(self.device)
+        non_blocking = self.device.type == 'cuda'
+        inputs = data_dict["image"].to(self.device, non_blocking=non_blocking)
         targets_dict = self._extract_targets(data_dict)
         if self.device.type == 'cuda' and self._volume_dilate_by_name:
-            padding_mask = data_dict["padding_mask"].to(self.device)
+            padding_mask = data_dict["padding_mask"].to(self.device, non_blocking=True)
             volume_names = data_dict["patch_info"]["volume_name"]
             for i, volume_name in enumerate(volume_names):
                 distance = self._volume_dilate_by_name.get(volume_name)
@@ -1436,7 +1438,7 @@ class BaseTrainer:
             else:
                 dd = {}
                 for k, v in data_dict.items():
-                    dd[k] = v.to(self.device) if isinstance(v, torch.Tensor) else v
+                    dd[k] = v.to(self.device, non_blocking=(self.device.type == 'cuda')) if isinstance(v, torch.Tensor) else v
 
                 # Apply transforms per-sample (transforms expect unbatched (C, ...) tensors)
                 try:

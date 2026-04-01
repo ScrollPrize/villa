@@ -4,6 +4,7 @@ import argparse
 import json
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +29,12 @@ def _sync_if_needed(device: torch.device) -> None:
 def _to_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
     non_blocking = device.type == "cuda"
     return tensor.to(device=device, non_blocking=non_blocking)
+
+
+def _autocast_context(device: torch.device):
+    if device.type == "cuda":
+        return torch.amp.autocast("cuda")
+    return nullcontext()
 
 
 def _make_mgr(
@@ -112,13 +119,13 @@ def _make_cpu_batch(
 
 
 def _compute_loss(logits_dict: dict[str, torch.Tensor], aux: dict[str, torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
-    logits = logits_dict["ink"]
+    logits = logits_dict["ink"].float()
     loss = F.cross_entropy(logits, labels)
     if "guide_mask" in aux:
         guide_target = (labels > 0).float().unsqueeze(1)
         guide_target = F.interpolate(guide_target, size=aux["guide_mask"].shape[2:], mode="nearest")
         loss = loss + 0.5 * F.binary_cross_entropy(
-            aux["guide_mask"].clamp(1e-6, 1.0 - 1e-6),
+            aux["guide_mask"].float().clamp(1e-6, 1.0 - 1e-6),
             guide_target,
         )
     return loss
@@ -145,16 +152,26 @@ def _run_variant_benchmark(
 
     def _first_forward():
         inputs = _to_device(cpu_inputs, device)
-        outputs = model(inputs, return_aux=True) if getattr(model, "guide_enabled", False) else model(inputs)
-        if getattr(model, "guide_enabled", False):
-            logits_dict, aux = outputs
-        else:
-            logits_dict, aux = outputs, {}
-        logits = logits_dict["ink"].to(dtype=torch.float16)
+        with _autocast_context(device):
+            outputs = model(inputs)
+        logits = outputs["ink"].to(dtype=torch.float16)
         _ = logits.cpu()
-        return logits_dict, aux
+        return outputs
 
-    _result, startup_ms = _timed_call(_first_forward, device=device)
+    try:
+        _result, startup_ms = _timed_call(_first_forward, device=device)
+    except Exception as exc:  # pragma: no cover - benchmark fallback path
+        return {
+            "startup_forward_ms": None,
+            "steady_state_forward_ms_mean": None,
+            "steady_state_train_step_ms_mean": None,
+            "max_memory_mb": (
+                torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                if device.type == "cuda"
+                else None
+            ),
+            "error": f"{type(exc).__name__}: {str(exc).splitlines()[0]}",
+        }
 
     forward_times = []
     train_step_times = []
@@ -165,14 +182,18 @@ def _run_variant_benchmark(
         labels = _to_device(cpu_labels, device)
 
         optimizer.zero_grad(set_to_none=True)
+        def _forward_only():
+            with _autocast_context(device):
+                return model(inputs)
         _, forward_ms = _timed_call(
-            lambda: model(inputs, return_aux=True) if getattr(model, "guide_enabled", False) else model(inputs),
+            _forward_only,
             device=device,
         )
         forward_times.append(forward_ms)
 
         def _train_step():
-            outputs = model(inputs, return_aux=True) if getattr(model, "guide_enabled", False) else model(inputs)
+            with _autocast_context(device):
+                outputs = model(inputs, return_aux=True) if getattr(model, "guide_enabled", False) else model(inputs)
             if getattr(model, "guide_enabled", False):
                 logits_dict, aux = outputs
             else:
@@ -181,20 +202,31 @@ def _run_variant_benchmark(
             loss.backward()
             optimizer.step()
 
-        _, train_ms = _timed_call(_train_step, device=device)
-        train_step_times.append(train_ms)
+        try:
+            _, train_ms = _timed_call(_train_step, device=device)
+            train_step_times.append(train_ms)
+        except Exception as exc:  # pragma: no cover - benchmark fallback path
+            train_step_times = []
+            train_step_error = f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+            break
+    else:
+        train_step_error = None
 
     model.eval()
     result = {
         "startup_forward_ms": startup_ms,
         "steady_state_forward_ms_mean": sum(forward_times) / len(forward_times),
-        "steady_state_train_step_ms_mean": sum(train_step_times) / len(train_step_times),
+        "steady_state_train_step_ms_mean": (
+            sum(train_step_times) / len(train_step_times) if train_step_times else None
+        ),
         "max_memory_mb": (
             torch.cuda.max_memory_allocated(device) / (1024 ** 2)
             if device.type == "cuda"
             else None
         ),
     }
+    if train_step_error is not None:
+        result["train_step_error"] = train_step_error
     return result
 
 
@@ -217,7 +249,8 @@ def _profile_guided_stages(
 
         def _guide_backbone():
             with torch.no_grad():
-                return model.guide_backbone(inputs)[0]
+                with _autocast_context(device):
+                    return model.guide_backbone(inputs)[0]
 
         guide_features, guide_backbone_ms = _timed_call(_guide_backbone, device=device)
         timings["guide_backbone_ms"].append(guide_backbone_ms)
@@ -230,21 +263,23 @@ def _profile_guided_stages(
         timings["tokenbook_ms"].append(tokenbook_ms)
 
         def _upsample():
-            return F.interpolate(
-                guide_mask,
-                size=inputs.shape[2:],
-                mode="trilinear",
-                align_corners=False,
-            )
+            with _autocast_context(device):
+                return F.interpolate(
+                    guide_mask,
+                    size=inputs.shape[2:],
+                    mode="trilinear",
+                    align_corners=False,
+                )
 
         guide_for_input, upsample_ms = _timed_call(_upsample, device=device)
         timings["guide_upsample_ms"].append(upsample_ms)
 
         def _segmentation():
-            guided_input = inputs * guide_for_input
-            features = model.shared_encoder(guided_input)
-            logits = model.task_decoders["ink"](features)
-            return logits
+            with _autocast_context(device):
+                guided_input = inputs * guide_for_input
+                features = model.shared_encoder(guided_input)
+                logits = model.task_decoders["ink"](features)
+                return logits
 
         logits, segmentation_ms = _timed_call(_segmentation, device=device)
         timings["segmentation_trunk_ms"].append(segmentation_ms)
@@ -307,6 +342,23 @@ def main() -> None:
     for patch_size in patch_sizes:
         patch_label = "x".join(str(v) for v in patch_size)
         cpu_inputs, cpu_labels = _make_cpu_batch(patch_size, pin_memory=pin_memory)
+        guided_eager_model = _build_model(
+            patch_size=patch_size,
+            device=device,
+            guide_checkpoint=str(guide_checkpoint),
+            guide_tokenbook_tokens=guide_tokenbook_tokens,
+            compile_model=False,
+            channels_last_3d=False,
+        )
+
+        patch_summary: dict[str, object] = {}
+        patch_summary["guided_eager_stage_breakdown_ms"] = _profile_guided_stages(
+            guided_eager_model,
+            device=device,
+            cpu_inputs=cpu_inputs.detach().clone(),
+            iterations=args.iterations,
+        )
+
         variants = {
             "baseline_eager": _build_model(
                 patch_size=patch_size,
@@ -316,14 +368,7 @@ def main() -> None:
                 compile_model=False,
                 channels_last_3d=False,
             ),
-            "guided_eager": _build_model(
-                patch_size=patch_size,
-                device=device,
-                guide_checkpoint=str(guide_checkpoint),
-                guide_tokenbook_tokens=guide_tokenbook_tokens,
-                compile_model=False,
-                channels_last_3d=False,
-            ),
+            "guided_eager": guided_eager_model,
             "guided_compile": _build_model(
                 patch_size=patch_size,
                 device=device,
@@ -342,7 +387,6 @@ def main() -> None:
             ),
         }
 
-        patch_summary: dict[str, object] = {}
         for variant_name, model in variants.items():
             variant_inputs = cpu_inputs
             if variant_name.endswith("channels_last_3d"):
@@ -354,13 +398,6 @@ def main() -> None:
                 cpu_labels=cpu_labels,
                 iterations=args.iterations,
             )
-
-        patch_summary["guided_eager_stage_breakdown_ms"] = _profile_guided_stages(
-            variants["guided_eager"],
-            device=device,
-            cpu_inputs=cpu_inputs,
-            iterations=args.iterations,
-        )
         summary["results"][patch_label] = patch_summary
 
     payload = json.dumps(summary, indent=2, sort_keys=True)
