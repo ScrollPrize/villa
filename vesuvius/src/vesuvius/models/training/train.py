@@ -138,6 +138,34 @@ class BaseTrainer:
         self._augmentation_names = None
         self._epoch_aug_time = None
         self._epoch_aug_count = None
+        self._on_device_transforms = None
+        ema_cfg = getattr(self.mgr, 'ema_config', {}) or {}
+        self.ema_enabled = bool(getattr(self.mgr, 'ema_enabled', ema_cfg.get('enabled', False)))
+        self.ema_decay = float(getattr(self.mgr, 'ema_decay', ema_cfg.get('decay', 0.999)))
+        self.ema_start_step = int(getattr(self.mgr, 'ema_start_step', ema_cfg.get('start_step', 0)))
+        self.ema_update_every_steps = max(
+            1,
+            int(getattr(self.mgr, 'ema_update_every_steps', ema_cfg.get('update_every_steps', 1)))
+        )
+        self.ema_validate = bool(
+            getattr(self.mgr, 'ema_validate', ema_cfg.get('validate', self.ema_enabled))
+        )
+        self.ema_save_in_checkpoint = bool(
+            getattr(
+                self.mgr,
+                'ema_save_in_checkpoint',
+                ema_cfg.get('save_in_checkpoint', self.ema_enabled),
+            )
+        )
+        self.ema_model = None
+        self._ema_optimizer_step = 0
+        self._checkpoint_ema_state = None
+        self._checkpoint_ema_optimizer_step = None
+        self._printed_ema_validation_mode = False
+        self._volume_dilate_by_name = {}
+        self.guide_loss_weight = float(getattr(self.mgr, "guide_loss_weight", 0.0))
+        self.guide_supervision_target = getattr(self.mgr, "guide_supervision_target", None)
+        self._current_aux_outputs = {}
 
     # --- build model --- #
     def _build_model(self):
@@ -276,6 +304,66 @@ class BaseTrainer:
             return loss_fn(prediction, ground_truth, skeleton_data)
 
         return loss_fn(prediction, ground_truth)
+
+    def _resolve_guide_supervision_target(self, targets_dict):
+        if self.guide_supervision_target is not None:
+            return self.guide_supervision_target
+        for target_name, target_info in self.mgr.targets.items():
+            if not target_info.get("auxiliary_task", False) and target_name in targets_dict:
+                return target_name
+        return None
+
+    def _compute_guide_alignment_loss(self, targets_dict):
+        if self.guide_loss_weight <= 0.0:
+            return None
+
+        guide_mask = self._current_aux_outputs.get("guide_mask")
+        if guide_mask is None:
+            return None
+
+        target_name = self._resolve_guide_supervision_target(targets_dict)
+        if target_name is None or target_name not in targets_dict:
+            return None
+
+        guide_target = targets_dict[target_name]
+        if isinstance(guide_target, (list, tuple)):
+            guide_target = guide_target[0]
+        if not torch.is_tensor(guide_target):
+            return None
+
+        ignore_label = None
+        target_info = self.mgr.targets.get(target_name, {}) or {}
+        for key in ("ignore_label", "ignore_index", "ignore_value"):
+            value = target_info.get(key)
+            if value is not None:
+                ignore_label = value
+                break
+
+        guide_target = guide_target.float()
+        if guide_target.ndim != 5:
+            return None
+
+        if guide_target.shape[1] == 1:
+            ignore_mask = torch.zeros_like(guide_target, dtype=torch.bool)
+            if ignore_label is not None:
+                if isinstance(ignore_label, float) and np.isnan(ignore_label):
+                    ignore_mask = torch.isnan(guide_target)
+                else:
+                    ignore_mask = guide_target == float(ignore_label)
+            foreground = (guide_target > 0).float()
+            if ignore_label is not None:
+                foreground = foreground.masked_fill(ignore_mask, 0.0)
+            valid_mask = (~ignore_mask).float()
+        else:
+            foreground = (guide_target > 0).any(dim=1, keepdim=True).float()
+            valid_mask = torch.ones_like(foreground)
+
+        target_resize = F.interpolate(foreground, size=guide_mask.shape[2:], mode="nearest")
+        valid_resize = F.interpolate(valid_mask, size=guide_mask.shape[2:], mode="nearest")
+        loss_map = F.binary_cross_entropy(guide_mask.clamp(1e-6, 1.0 - 1e-6), target_resize, reduction="none")
+        weighted_loss = loss_map * valid_resize
+        denom = valid_resize.sum().clamp_min(1.0)
+        return weighted_loss.sum() / denom
 
     # --- losses ---- #
     def _build_loss(self):
@@ -1126,7 +1214,13 @@ class BaseTrainer:
         inputs = data_dict["image"].to(self.device)
         targets_dict = self._extract_targets(data_dict)
         
-        outputs = model(inputs)
+        raw_model = self._unwrap_model(model)
+        if getattr(raw_model, "guide_enabled", False):
+            outputs, aux_outputs = model(inputs, return_aux=True)
+            self._current_aux_outputs = aux_outputs
+        else:
+            outputs = model(inputs)
+            self._current_aux_outputs = {}
 
         # If deep supervision is enabled, prepare lists of downsampled targets
         if getattr(self.mgr, 'enable_deep_supervision', False):
@@ -1275,6 +1369,12 @@ class BaseTrainer:
             weighted_loss = task_weight * task_total_loss
             total_loss = total_loss + weighted_loss.to(total_loss.dtype)
             task_losses[t_name] = weighted_loss.detach().cpu().item()
+
+        guide_loss = self._compute_guide_alignment_loss(targets_dict)
+        if guide_loss is not None:
+            weighted_guide_loss = self.guide_loss_weight * guide_loss
+            total_loss = total_loss + weighted_guide_loss.to(total_loss.dtype)
+            task_losses["guide_mask"] = weighted_guide_loss.detach().cpu().item()
 
         return total_loss, task_losses
 
