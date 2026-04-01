@@ -34,3 +34,25 @@ def test_ps256_dicece_config_loads_and_builds_without_guide_path():
     assert list(mgr.targets.keys()) == ["surface"]
     assert model.guide_enabled is False
     assert model.final_config["guide_backbone"] is None
+
+
+def test_ps256_guided_medial_config_loads_and_builds_with_guide_path():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps256_guided_medial.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (256, 256, 256)
+    assert list(mgr.targets.keys()) == ["surface"]
+    assert model.guide_enabled is True
+    assert model.final_config["guide_backbone"] is not None
+    assert model.final_config["guide_tokenbook_tokens"] == 256
+
+
+def test_ps256_guided_dicece_config_loads_and_builds_with_guide_path():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps256_guided_dicece.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (256, 256, 256)
+    assert list(mgr.targets.keys()) == ["surface"]
+    assert model.guide_enabled is True
+    assert model.final_config["guide_backbone"] is not None
+    assert model.final_config["guide_tokenbook_tokens"] == 256

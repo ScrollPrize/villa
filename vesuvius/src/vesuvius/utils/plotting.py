@@ -205,6 +205,14 @@ def add_text_label(img, text):
     return np.array(pil_img, dtype=np.uint8)
 
 
+def _format_aux_panel_label(name: str) -> str:
+    raw = str(name).strip()
+    if raw.startswith("guide_"):
+        target_name = raw[len("guide_"):].replace("_", " ")
+        return f"Guide {target_name}"
+    return raw.replace("_", " ")
+
+
 def _apply_activation(array_np: np.ndarray, activation: Optional[str], *, is_surface: bool) -> np.ndarray:
     if activation is None or str(activation).lower() in {"none", "identity"} or is_surface:
         return array_np
@@ -335,6 +343,8 @@ def save_debug(
     train_input: torch.Tensor = None,   # Optional train sample input
     train_targets_dict: dict = None,    # Optional train sample targets
     train_outputs_dict: dict = None,    # Optional train sample outputs
+    aux_outputs_dict: dict = None,      # Optional display-only aux outputs
+    train_aux_outputs_dict: dict = None,# Optional display-only train aux outputs
     skeleton_dict: dict = None,         # Optional skeleton data for visualization
     train_skeleton_dict: dict = None,   # Optional train skeleton data
     apply_activation: bool = True,      # Whether to apply activation functions
@@ -401,10 +411,20 @@ def save_debug(
         
         preds_np[t_name] = arr_np
 
+    aux_outputs_np = {}
+    for aux_name, aux_tensor in (aux_outputs_dict or {}).items():
+        if aux_tensor.dtype == torch.bfloat16:
+            aux_tensor = aux_tensor.float()
+        arr_np = aux_tensor.cpu().numpy()
+        while arr_np.ndim > (3 if is_2d else 4):
+            arr_np = arr_np[0]
+        aux_outputs_np[aux_name] = arr_np
+
     # Process train data if provided
     train_inp_np = None
     train_targets_np = {}
     train_preds_np = {}
+    train_aux_outputs_np = {}
     
     if train_input is not None and train_targets_dict is not None and train_outputs_dict is not None:
         # Convert BFloat16 to Float32 before numpy conversion
@@ -443,6 +463,14 @@ def save_debug(
                 arr_np = _apply_activation(arr_np, activation, is_surface=is_surface_frame)
 
             train_preds_np[t_name] = arr_np
+
+        for aux_name, aux_tensor in (train_aux_outputs_dict or {}).items():
+            if aux_tensor.dtype == torch.bfloat16:
+                aux_tensor = aux_tensor.float()
+            arr_np = aux_tensor.cpu().numpy()
+            while arr_np.ndim > (3 if is_2d else 4):
+                arr_np = arr_np[0]
+            train_aux_outputs_np[aux_name] = arr_np
 
     # Process unlabeled data if provided (for semi-supervised training visualization)
     unlabeled_inp_np = None
@@ -515,6 +543,15 @@ def save_debug(
         )
         for t_name, p_arr in preds_np.items()
     }
+    aux_ranges = {
+        aux_name: _compute_display_value_range(
+            aux_arr,
+            is_2d_run=is_2d,
+            task_name=aux_name,
+            task_cfg={},
+        )
+        for aux_name, aux_arr in aux_outputs_np.items()
+    }
 
     train_input_range = (
         _compute_display_value_range(train_inp_np, is_2d_run=is_2d) if train_inp_np is not None else None
@@ -536,6 +573,15 @@ def save_debug(
             task_cfg=tasks_dict.get(t_name, {}),
         )
         for t_name, p_arr in train_preds_np.items()
+    }
+    train_aux_ranges = {
+        aux_name: _compute_display_value_range(
+            aux_arr,
+            is_2d_run=is_2d,
+            task_name=aux_name,
+            task_cfg={},
+        )
+        for aux_name, aux_arr in train_aux_outputs_np.items()
     }
 
     unlabeled_input_range = (
@@ -586,6 +632,18 @@ def save_debug(
         
         # Val row: input, targets (including skels), preds
         val_imgs = [add_text_label(convert_slice_to_bgr(inp_np, value_range=val_input_range), "Val Input")]
+        for aux_name in sorted(aux_outputs_np.keys()):
+            aux_arr = aux_outputs_np[aux_name]
+            aux_slice = aux_arr[0] if aux_arr.ndim == 3 and aux_arr.shape[0] == 1 else aux_arr
+            val_imgs.append(
+                add_text_label(
+                    convert_slice_to_bgr(
+                        aux_slice,
+                        value_range=aux_ranges.get(aux_name),
+                    ),
+                    _format_aux_panel_label(aux_name),
+                )
+            )
         
         # Show all targets (including skeleton data)
         for t_name in sorted(targets_np.keys()):
@@ -625,6 +683,18 @@ def save_debug(
         # Train row if available
         if train_inp_np is not None:
             train_imgs = [add_text_label(convert_slice_to_bgr(train_inp_np, value_range=train_input_range), "Train Input")]
+            for aux_name in sorted(train_aux_outputs_np.keys()):
+                aux_arr = train_aux_outputs_np[aux_name]
+                aux_slice = aux_arr[0] if aux_arr.ndim == 3 and aux_arr.shape[0] == 1 else aux_arr
+                train_imgs.append(
+                    add_text_label(
+                        convert_slice_to_bgr(
+                            aux_slice,
+                            value_range=train_aux_ranges.get(aux_name),
+                        ),
+                        _format_aux_panel_label(aux_name),
+                    )
+                )
             
             # Show all train targets (including skeleton data)
             for t_name in sorted(train_targets_np.keys()):
@@ -720,16 +790,92 @@ def save_debug(
         z_dim = inp_np.shape[0] if inp_np.ndim == 3 else inp_np.shape[1]
         mid_z_idx = max(z_dim // 2, 0)
 
-        for z_idx in range(z_dim):
+        val_input_bgr = _render_3d_volume_to_bgr(inp_np, value_range=val_input_range)
+        target_panel_volumes = {
+            t_name: _render_3d_volume_to_bgr(
+                t_arr,
+                task_name=t_name,
+                task_cfg=tasks_dict.get(t_name, {}),
+                value_range=target_ranges.get(t_name),
+            )
+            for t_name, t_arr in targets_np.items()
+        }
+        pred_panel_volumes = {
+            t_name: _render_3d_volume_to_bgr(
+                p_arr,
+                task_name=t_name,
+                task_cfg=tasks_dict.get(t_name, {}),
+                value_range=pred_ranges.get(t_name),
+            )
+            for t_name, p_arr in preds_np.items()
+        }
+        aux_panel_volumes = {
+            aux_name: _render_3d_volume_to_bgr(
+                aux_arr,
+                value_range=aux_ranges.get(aux_name),
+            )
+            for aux_name, aux_arr in aux_outputs_np.items()
+        }
+
+        train_input_bgr = (
+            _render_3d_volume_to_bgr(train_inp_np, value_range=train_input_range)
+            if train_inp_np is not None else None
+        )
+        train_target_panel_volumes = {
+            t_name: _render_3d_volume_to_bgr(
+                t_arr,
+                task_name=t_name,
+                task_cfg=tasks_dict.get(t_name, {}),
+                value_range=train_target_ranges.get(t_name),
+            )
+            for t_name, t_arr in train_targets_np.items()
+        }
+        train_pred_panel_volumes = {
+            t_name: _render_3d_volume_to_bgr(
+                p_arr,
+                task_name=t_name,
+                task_cfg=tasks_dict.get(t_name, {}),
+                value_range=train_pred_ranges.get(t_name),
+            )
+            for t_name, p_arr in train_preds_np.items()
+        }
+        train_aux_panel_volumes = {
+            aux_name: _render_3d_volume_to_bgr(
+                aux_arr,
+                value_range=train_aux_ranges.get(aux_name),
+            )
+            for aux_name, aux_arr in train_aux_outputs_np.items()
+        }
+
+        unlabeled_input_bgr = (
+            _render_3d_volume_to_bgr(unlabeled_inp_np, value_range=unlabeled_input_range)
+            if unlabeled_inp_np is not None else None
+        )
+        unlabeled_pseudo_panel_volumes = {
+            t_name: _render_3d_volume_to_bgr(
+                p_arr,
+                task_name=t_name,
+                task_cfg=tasks_dict.get(t_name, {}),
+                value_range=unlabeled_pseudo_ranges.get(t_name),
+            )
+            for t_name, p_arr in unlabeled_pseudo_np.items()
+        }
+        unlabeled_pred_panel_volumes = {
+            t_name: _render_3d_volume_to_bgr(
+                p_arr,
+                task_name=t_name,
+                task_cfg=tasks_dict.get(t_name, {}),
+                value_range=unlabeled_pred_ranges.get(t_name),
+            )
+            for t_name, p_arr in unlabeled_preds_np.items()
+        }
+
+        def _build_3d_frame(z_idx: int) -> np.ndarray:
             rows = []
-            
-            # Get slices
-            inp_slice = inp_np[z_idx] if inp_np.ndim == 3 else inp_np[:, z_idx, :, :]
-            
-            # Val row
-            val_imgs = [add_text_label(convert_slice_to_bgr(inp_slice, value_range=val_input_range), "Val Input")]
-            
-            # Show all targets (including skeleton data)
+
+            val_imgs = [add_text_label(val_input_bgr[z_idx], "Val Input")]
+            for aux_name in sorted(aux_outputs_np.keys()):
+                val_imgs.append(add_text_label(aux_panel_volumes[aux_name][z_idx], _format_aux_panel_label(aux_name)))
             for t_name in sorted(targets_np.keys()):
                 gt = targets_np[t_name]
                 if gt.shape[0] == 1:
@@ -772,13 +918,11 @@ def save_debug(
                 )
             
             rows.append(np.hstack(val_imgs))
-            
-            # Train row if available
-            if train_inp_np is not None:
-                train_slice = train_inp_np[z_idx] if train_inp_np.ndim == 3 else train_inp_np[:, z_idx, :, :]
-                train_imgs = [add_text_label(convert_slice_to_bgr(train_slice, value_range=train_input_range), "Train Input")]
-                
-                # Show all train targets (including skeleton data)
+
+            if train_input_bgr is not None:
+                train_imgs = [add_text_label(train_input_bgr[z_idx], "Train Input")]
+                for aux_name in sorted(train_aux_outputs_np.keys()):
+                    train_imgs.append(add_text_label(train_aux_panel_volumes[aux_name][z_idx], _format_aux_panel_label(aux_name)))
                 for t_name in sorted(train_targets_np.keys()):
                     gt = train_targets_np[t_name]
                     if gt.shape[0] == 1:
