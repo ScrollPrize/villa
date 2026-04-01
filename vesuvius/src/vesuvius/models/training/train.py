@@ -1413,6 +1413,14 @@ class BaseTrainer:
             self._ds_weights = None
         loss_fns = self._build_loss()
         self._initialize_ema_model(model)
+        raw_model = self._unwrap_model(model)
+        if hasattr(raw_model, "_compile_guidance_submodules"):
+            stage_start = perf_counter()
+            compiled_guide_modules = raw_model._compile_guidance_submodules(device_type=self.device.type)
+            if compiled_guide_modules:
+                self._record_startup_timing("guide_submodule_compile", perf_counter() - stage_start)
+                if not self.is_distributed or self.rank == 0:
+                    print("Compiled guide submodules: " + ", ".join(compiled_guide_modules))
 
         compile_policy = self._resolve_compile_policy(model)
         if compile_policy == "module":

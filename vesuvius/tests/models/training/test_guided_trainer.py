@@ -315,9 +315,12 @@ def _configure_compile_test_trainer(
     *,
     guide_enabled: bool,
     call_order: list[str],
+    compile_guidance: bool = False,
 ):
     dummy_dataset = _DummyDataset()
     dummy_model = _DummyModel(guide_enabled=guide_enabled)
+    if compile_guidance:
+        dummy_model._compile_guidance_submodules = lambda device_type: call_order.append("guide_submodule_compile") or ["guide_backbone"]
 
     monkeypatch.setattr(trainer, "_configure_dataset", lambda is_training: dummy_dataset)
     monkeypatch.setattr(trainer, "_build_dataset_for_mgr", lambda mgr, is_training: dummy_dataset)
@@ -358,6 +361,23 @@ def test_initialize_training_compiles_guided_model_before_ddp_wrap(tmp_path: Pat
     trainer._initialize_training()
 
     assert call_order == ["compile", "wrap"]
+
+
+def test_initialize_training_compiles_guidance_submodule_before_model_compile(tmp_path: Path, monkeypatch):
+    mgr = _make_compile_mgr(tmp_path, compile_policy="auto")
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    call_order: list[str] = []
+    _configure_compile_test_trainer(
+        trainer,
+        monkeypatch,
+        guide_enabled=True,
+        call_order=call_order,
+        compile_guidance=True,
+    )
+
+    trainer._initialize_training()
+
+    assert call_order == ["guide_submodule_compile", "compile", "wrap"]
 
 
 def test_initialize_training_compiles_unguided_ddp_wrapper_by_default(tmp_path: Path, monkeypatch):

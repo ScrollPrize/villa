@@ -49,10 +49,13 @@ def _make_mgr(
     *,
     basic_encoder_block: str,
     guide_tokenbook_tokens: int | None = None,
+    guide_compile_policy: str | None = None,
 ) -> SimpleNamespace:
     guided_config = {}
     if guide_tokenbook_tokens is not None:
         guided_config["guide_tokenbook_tokens"] = int(guide_tokenbook_tokens)
+    if guide_compile_policy is not None:
+        guided_config["guide_compile_policy"] = str(guide_compile_policy)
     return SimpleNamespace(
         targets={"ink": {"out_channels": 1, "activation": "none"}},
         train_patch_size=(16, 16, 16),
@@ -142,6 +145,34 @@ def test_guided_network_supports_reduced_tokenbook_prototype_count(tmp_path: Pat
     assert model.final_config["guide_tokenbook_tokens"] == 3
     assert outputs["ink"].shape == (1, 1, 16, 16, 16)
     assert aux["guide_mask"].shape == (1, 1, 2, 2, 2)
+
+
+@pytest.mark.parametrize("guide_compile_policy", ["off", "backbone_only", "tokenbook_only"])
+def test_guided_network_records_guide_compile_policy(tmp_path: Path, guide_compile_policy: str):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_compile_policy=guide_compile_policy,
+    )
+    model = NetworkFromConfig(mgr)
+
+    assert model.guide_compile_policy == guide_compile_policy
+    assert model.final_config["guide_compile_policy"] == guide_compile_policy
+
+
+def test_guided_network_rejects_invalid_guide_compile_policy(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_compile_policy="bad_policy",
+    )
+
+    with pytest.raises(ValueError, match="guide_compile_policy"):
+        NetworkFromConfig(mgr)
 
 
 def test_guided_network_rejects_primus_architecture(tmp_path: Path):
