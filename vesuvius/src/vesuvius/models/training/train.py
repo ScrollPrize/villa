@@ -519,7 +519,12 @@ class BaseTrainer:
 
         target_resize = F.interpolate(foreground, size=guide_mask.shape[2:], mode="nearest")
         valid_resize = F.interpolate(valid_mask, size=guide_mask.shape[2:], mode="nearest")
-        loss_map = F.binary_cross_entropy(guide_mask.clamp(1e-6, 1.0 - 1e-6), target_resize, reduction="none")
+        device_type = guide_mask.device.type
+        autocast_enabled = device_type in {"cuda", "cpu"}
+        with torch.amp.autocast(device_type=device_type, enabled=False) if autocast_enabled else nullcontext():
+            guide_mask_fp32 = guide_mask.float().clamp(1e-6, 1.0 - 1e-6)
+            target_resize_fp32 = target_resize.float()
+            loss_map = F.binary_cross_entropy(guide_mask_fp32, target_resize_fp32, reduction="none")
         weighted_loss = loss_map * valid_resize
         denom = valid_resize.sum().clamp_min(1.0)
         return weighted_loss.sum() / denom
