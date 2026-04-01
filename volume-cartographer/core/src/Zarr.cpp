@@ -322,7 +322,8 @@ void createPyramidDatasets(const std::filesystem::path& outDir,
 
     std::vector<size_t> prevShape = shape0;
     for (int level = 1; level <= 5; level++) {
-        std::vector<size_t> shape = {(prevShape[0]+1)/2, (prevShape[1]+1)/2, (prevShape[2]+1)/2};
+        // Keep Z fixed and halve only Y/X at each level (anisotropic scaling).
+        std::vector<size_t> shape = {prevShape[0], (prevShape[1]+1)/2, (prevShape[2]+1)/2};
         size_t chZ = std::min(shape[0], shape0[0]);
         std::vector<size_t> chunks = {chZ, std::min(CH, shape[1]), std::min(CW, shape[2])};
         vc::createZarrDataset(outDir, std::to_string(level), shape, chunks, dtype, "blosc");
