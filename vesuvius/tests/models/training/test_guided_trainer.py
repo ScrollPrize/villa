@@ -181,3 +181,14 @@ def test_guided_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path:
 
     assert isinstance(output, dict)
     assert set(output.keys()) == {"ink"}
+
+
+def test_inferer_finalize_output_batch_returns_float16_numpy():
+    inferer = object.__new__(Inferer)
+    inferer.device = torch.device("cpu")
+
+    output_batch = torch.randn(1, 2, 4, 4, 4, dtype=torch.float32)
+    output_np = inferer._finalize_output_batch(output_batch)
+
+    assert output_np.dtype == np.float16
+    assert output_np.shape == (1, 2, 4, 4, 4)

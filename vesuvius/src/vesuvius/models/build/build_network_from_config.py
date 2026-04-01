@@ -768,9 +768,9 @@ class NetworkFromConfig(nn.Module):
             return x, {}
 
         if self.guide_freeze:
-            self.guide_backbone.eval()
-            with torch.no_grad():
-                guide_features = self.guide_backbone(x)[0]
+            with torch.inference_mode():
+                frozen_features = self.guide_backbone(x)[0]
+            guide_features = frozen_features.clone()
         else:
             guide_features = self.guide_backbone(x)[0]
 
