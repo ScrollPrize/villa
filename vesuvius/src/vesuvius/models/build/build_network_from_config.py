@@ -43,12 +43,16 @@ this is inspired by the nnUNet architecture.
 https://github.com/MIC-DKFZ/nnUNet
 """
 
+import math
+
 import torch
 import torch.nn as nn
-from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage
+import torch.nn.functional as F
+from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage, pad_shape
 from .encoder import Encoder
 from .decoder import Decoder
 from .activations import SwiGLUBlock, GLUBlock
+from .guidance import TokenBook3D
 from .primus_wrapper import PrimusEncoder, PrimusDecoder
 
 
@@ -243,8 +247,39 @@ class NetworkFromConfig(nn.Module):
         self.save_config = False
         
         self.architecture_type = model_config.get("architecture_type", "unet")
+        self.pretrained_backbone = model_config.get("pretrained_backbone")
+        self.guide_backbone_name = model_config.get("guide_backbone")
+        self.guide_backbone_config_path = model_config.get("guide_backbone_config_path")
+        self.guide_fusion_stage = str(model_config.get("guide_fusion_stage", "input")).strip().lower()
+        self.guide_enabled = bool(self.guide_backbone_name)
+        self.guide_backbone = None
+        self.guide_tokenbook = None
+        self.guide_patch_grid = None
+        self.guide_freeze = bool(model_config.get("guide_freeze", True))
         # Determine if deep supervision is requested
         ds_enabled = bool(getattr(mgr, 'enable_deep_supervision', False))
+
+        if self.guide_enabled:
+            if self.op_dims != 3:
+                raise ValueError("guide_backbone is only supported for 3D models in v1")
+            if self.pretrained_backbone:
+                raise ValueError("guide_backbone cannot be combined with pretrained_backbone in v1")
+            if self.architecture_type.lower().startswith("primus"):
+                raise ValueError("guide_backbone is not supported with primus architectures in v1")
+            if self.guide_fusion_stage not in {"input", "input_gating"}:
+                raise ValueError(
+                    "Unsupported guide_fusion_stage for v1. Only input-space gating is implemented."
+                )
+
+        if self.pretrained_backbone:
+            if ds_enabled:
+                print(
+                    "Warning: Deep supervision is enabled but the selected pretrained backbone path does not "
+                    "support multi-scale logits. Disabling deep supervision for this run."
+                )
+                setattr(mgr, "enable_deep_supervision", False)
+            self._init_pretrained_backbone(mgr, model_config)
+            return
 
         # Primus decoders do not emit multi-scale logits; block DS to avoid silent misconfiguration
         if self.architecture_type.lower().startswith("primus"):
@@ -623,6 +658,8 @@ class NetworkFromConfig(nn.Module):
             self.task_activations[target_name] = get_activation_module(activation_str)
             print(f"Task '{target_name}' configured with separate decoder ({out_channels} channels)")
 
+        self._init_input_guidance(model_config)
+
         # --------------------------------------------------------------------
         # Build final configuration snapshot.
         # --------------------------------------------------------------------
@@ -666,13 +703,166 @@ class NetworkFromConfig(nn.Module):
             "target_z_projection": self.task_z_projection_cfg,
             "separate_decoders": len(tasks_using_separate) > 0,
             "num_pool_per_axis": getattr(self, 'num_pool_per_axis', None),
-            "must_be_divisible_by": getattr(self, 'must_be_divisible_by', None)
+            "must_be_divisible_by": getattr(self, 'must_be_divisible_by', None),
+            "guide_backbone": self.guide_backbone_name,
+            "guide_backbone_config_path": self.guide_backbone_config_path,
+            "guide_freeze": self.guide_freeze,
+            "guide_patch_grid": self.guide_patch_grid,
+            "guide_fusion_stage": "input" if self.guide_enabled else None,
         }
 
         print("NetworkFromConfig initialized with final configuration:")
         for k, v in self.final_config.items():
             print(f"  {k}: {v}")
+
+    def _init_input_guidance(self, model_config):
+        if not self.guide_enabled:
+            return
+
+        input_shape = tuple(model_config.get("input_shape", self.patch_size))
+        self.guide_backbone = build_dinov2_backbone(
+            self.guide_backbone_name,
+            input_channels=self.in_channels,
+            input_shape=input_shape,
+            config_path=self.guide_backbone_config_path,
+        )
+        if getattr(self.guide_backbone, "ndim", None) != 3:
+            raise ValueError("guide_backbone must resolve to a 3D Dinovol backbone")
+
+        patch_embed_size = tuple(int(v) for v in self.guide_backbone.patch_embed_size)
+        if any(size % patch != 0 for size, patch in zip(input_shape, patch_embed_size)):
+            raise ValueError(
+                f"Configured input_shape {input_shape} must be divisible by guide patch size {patch_embed_size}"
+            )
+
+        self.guide_patch_grid = tuple(size // patch for size, patch in zip(input_shape, patch_embed_size))
+        token_count = int(math.prod(self.guide_patch_grid))
+        self.guide_tokenbook = TokenBook3D(
+            n_tokens=token_count,
+            embed_dim=int(self.guide_backbone.embed_dim),
+            dropout=float(model_config.get("guide_tokenbook_dropout", 0.0)),
+            ema_decay=model_config.get("guide_tokenbook_ema_decay"),
+            use_ema=bool(model_config.get("guide_tokenbook_use_ema", False)),
+        )
+        self.guide_tokenbook_sample_rate = float(model_config.get("guide_tokenbook_sample_rate", 1.0))
+
+        if self.guide_freeze:
+            for parameter in self.guide_backbone.parameters():
+                parameter.requires_grad_(False)
+            self.guide_backbone.eval()
+
+    def _sample_guide_token_mask(self, guide_features):
+        if self.guide_tokenbook_sample_rate >= 1.0:
+            return None
+
+        batch_size = guide_features.shape[0]
+        token_count = int(guide_features.shape[2] * guide_features.shape[3] * guide_features.shape[4])
+        mask = torch.rand(batch_size, token_count, device=guide_features.device) < self.guide_tokenbook_sample_rate
+        if mask.sum(dim=1).min().item() == 0:
+            random_indices = torch.randint(0, token_count, (batch_size,), device=guide_features.device)
+            mask[torch.arange(batch_size, device=guide_features.device), random_indices] = True
+        return mask
+
+    def _apply_input_guidance(self, x):
+        if not self.guide_enabled:
+            return x, {}
+
+        if self.guide_freeze:
+            self.guide_backbone.eval()
+            with torch.no_grad():
+                guide_features = self.guide_backbone(x)[0]
+        else:
+            guide_features = self.guide_backbone(x)[0]
+
+        token_mask = self._sample_guide_token_mask(guide_features)
+        guide_mask = self.guide_tokenbook(guide_features, token_mask=token_mask)
+        guide_for_input = F.interpolate(
+            guide_mask,
+            size=x.shape[2:],
+            mode="trilinear",
+            align_corners=False,
+        )
+        return x * guide_for_input, {"guide_mask": guide_mask}
     
+    def _init_pretrained_backbone(self, mgr, model_config):
+        print(f"--- Initializing pretrained backbone '{self.pretrained_backbone}' ---")
+        input_shape = tuple(model_config.get("input_shape", self.patch_size))
+        decoder_type = model_config.get("pretrained_decoder_type", "primus_patch_decode")
+        config_path = model_config.get("pretrained_backbone_config_path")
+
+        self.shared_encoder = build_dinov2_backbone(
+            self.pretrained_backbone,
+            input_channels=self.in_channels,
+            input_shape=input_shape,
+            config_path=config_path,
+        )
+        self.task_decoders = nn.ModuleDict()
+        self.task_activations = nn.ModuleDict()
+        self.task_heads = nn.ModuleDict()
+
+        separate_decoders_default = model_config.get("separate_decoders", True)
+        decoder_head_channels = model_config.get("decoder_head_channels", 32)
+        tasks_using_shared, tasks_using_separate = set(), set()
+
+        for target_name, target_info in self.targets.items():
+            if 'out_channels' in target_info:
+                out_channels = target_info['out_channels']
+            elif 'channels' in target_info:
+                out_channels = target_info['channels']
+            else:
+                out_channels = self.in_channels
+                print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels")
+            target_info["out_channels"] = out_channels
+            self._register_target_projection(target_name, target_info, model_config)
+
+            use_separate = target_info.get("separate_decoder", separate_decoders_default)
+            if use_separate:
+                tasks_using_separate.add(target_name)
+            else:
+                tasks_using_shared.add(target_name)
+
+        if len(tasks_using_shared) > 0:
+            self.shared_decoder = build_dinov2_decoder(decoder_type, self.shared_encoder, decoder_head_channels)
+            head_conv = nn.Conv2d if self.shared_encoder.ndim == 2 else nn.Conv3d
+            for target_name in sorted(tasks_using_shared):
+                out_ch = self.targets[target_name]["out_channels"]
+                self.task_heads[target_name] = head_conv(
+                    decoder_head_channels, out_ch, kernel_size=1, stride=1, padding=0, bias=True
+                )
+                activation_str = self.targets[target_name].get("activation", "none")
+                self.task_activations[target_name] = get_activation_module(activation_str)
+                print(
+                    f"Pretrained task '{target_name}' configured with shared {decoder_type} decoder + head ({out_ch} channels)"
+                )
+
+        for target_name in sorted(tasks_using_separate):
+            out_channels = self.targets[target_name]["out_channels"]
+            activation_str = self.targets[target_name].get("activation", "none")
+            self.task_decoders[target_name] = build_dinov2_decoder(
+                decoder_type,
+                self.shared_encoder,
+                out_channels,
+            )
+            self.task_activations[target_name] = get_activation_module(activation_str)
+            print(f"Pretrained task '{target_name}' configured with separate {decoder_type} decoder ({out_channels} channels)")
+
+        self.final_config = {
+            "model_name": self.mgr.model_name,
+            "architecture_type": self.architecture_type,
+            "pretrained_backbone": self.pretrained_backbone,
+            "pretrained_decoder_type": decoder_type,
+            "input_shape": input_shape,
+            "in_channels": self.in_channels,
+            "targets": self.targets,
+            "target_z_projection": self.task_z_projection_cfg,
+            "separate_decoders": len(tasks_using_separate) > 0,
+            "decoder_head_channels": decoder_head_channels,
+        }
+
+        print("Pretrained backbone network initialized with configuration:")
+        for k, v in self.final_config.items():
+            print(f"  {k}: {v}")
+
     def _init_primus(self, mgr, model_config):
         """
         Initialize Primus transformer architecture.
@@ -849,9 +1039,19 @@ class NetworkFromConfig(nn.Module):
             return False
         return True
 
-    def forward(self, x, return_mae_mask=False):
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.guide_enabled and self.guide_freeze and self.guide_backbone is not None:
+            self.guide_backbone.eval()
+        return self
+
+    def forward(self, x, return_mae_mask=False, return_aux=False):
         # Check input channels and warn if mismatch
         self.check_input_channels(x)
+        aux_outputs = {}
+
+        if self.guide_enabled:
+            x, aux_outputs = self._apply_input_guidance(x)
 
         # Get features from encoder (works for both U-Net and Primus)
         # For MAE training with Primus, we need to get the mask
@@ -921,5 +1121,9 @@ class NetworkFromConfig(nn.Module):
         
         # Return MAE mask if requested (for MAE training)
         if return_mae_mask:
+            if return_aux:
+                return results, restoration_mask, aux_outputs
             return results, restoration_mask
+        if return_aux:
+            return results, aux_outputs
         return results
