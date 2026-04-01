@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -109,6 +110,38 @@ def _load_json_config(path):
         return json.load(f)
 
 
+def _resolve_local_checkpoint_config(
+    checkpoint_path: Path,
+    checkpoint,
+    *,
+    config_path: Optional[str | Path] = None,
+):
+    embedded_config = checkpoint.get("config")
+    if isinstance(embedded_config, dict) and isinstance(embedded_config.get("model"), dict):
+        return embedded_config
+
+    candidate_paths: list[Path] = []
+    if config_path is not None:
+        candidate_paths.append(Path(config_path).expanduser())
+    candidate_paths.append(checkpoint_path.with_name("config.json"))
+    candidate_paths.append(checkpoint_path.with_suffix(".json"))
+
+    seen = set()
+    for candidate in candidate_paths:
+        resolved = candidate.resolve() if candidate.exists() else candidate
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists():
+            return _load_json_config(candidate)
+
+    raise ValueError(
+        "Local Dinovol checkpoint does not contain an embedded config and no JSON config was found. "
+        f"checkpoint={checkpoint_path}"
+    )
+
+
 def _resolve_checkpoint_config(spec, checkpoint_path, checkpoint):
     embedded_config = checkpoint.get("config")
     if isinstance(embedded_config, dict) and isinstance(embedded_config.get("model"), dict):
@@ -139,14 +172,34 @@ def _load_teacher_backbone_state(checkpoint):
     raise ValueError("Checkpoint does not contain teacher.backbone or student.backbone weights")
 
 
-def build_dinov2_backbone(name, input_channels, input_shape):
+def _load_local_model_config(checkpoint_path, input_channels, *, config_path=None):
+    checkpoint_path = Path(checkpoint_path).expanduser()
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Local Dinovol checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    config = _resolve_local_checkpoint_config(checkpoint_path, checkpoint, config_path=config_path)
+    model_config = dict(config.get("model") or {})
+    dataset_config = config.get("dataset") or {}
+    if "global_crops_size" not in model_config and "global_crop_size" in dataset_config:
+        model_config["global_crops_size"] = dataset_config["global_crop_size"]
+    if "local_crops_size" not in model_config and "local_crop_size" in dataset_config:
+        model_config["local_crops_size"] = dataset_config["local_crop_size"]
+    model_config["input_channels"] = int(input_channels)
+    return model_config, checkpoint_path, checkpoint
+
+
+def build_dinov2_backbone(name, input_channels, input_shape, *, config_path=None):
     del input_shape
-    if name not in _DINO_V2_PRETRAINED:
-        raise ValueError(
-            f"Unknown pretrained_backbone {name!r}. Expected one of: {', '.join(sorted(_DINO_V2_PRETRAINED))}"
+    if name in _DINO_V2_PRETRAINED:
+        spec = _DINO_V2_PRETRAINED[name]
+        model_config, checkpoint_path, checkpoint = _load_model_config(spec, input_channels)
+    else:
+        model_config, checkpoint_path, checkpoint = _load_local_model_config(
+            name,
+            input_channels,
+            config_path=config_path,
         )
-    spec = _DINO_V2_PRETRAINED[name]
-    model_config, checkpoint_path, checkpoint = _load_model_config(spec, input_channels)
     backbone = build_dinovol_2_backbone(model_config)
     backbone.load_pretrained_weights(_load_teacher_backbone_state(checkpoint), unchunk=True)
     return Dinov2Backbone(backbone)
