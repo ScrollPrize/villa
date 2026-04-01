@@ -33,12 +33,20 @@ model_config:
 
 This is an opt-in speed setting for the example config only. The model default remains full-grid TokenBook prototypes when the key is omitted.
 
+Ps256 guided configs are also available:
+
+```text
+src/vesuvius/models/configuration/single_task/ps256_guided_medial.yaml
+src/vesuvius/models/configuration/single_task/ps256_guided_dicece.yaml
+```
+
 ## Tests
 
 Run the guided coverage:
 
 ```bash
 uv run --extra models --extra tests python -m pytest \
+  tests/models/configuration/test_ps256_config_compat.py \
   tests/models/build/test_dinovol_local_backbone.py \
   tests/models/build/test_guided_network.py \
   tests/models/training/test_guided_trainer.py -q
@@ -72,3 +80,8 @@ uv run --extra models python -m vesuvius.models.benchmarks.benchmark_guided_dino
 - Keep the guided path in eager mode unless a local benchmark shows compile is stable for your exact setup.
 - Do not expose or rely on a public `channels_last_3d` toggle; the measured gain was negligible relative to plain compile.
 - Prefer capped TokenBook prototypes for large training patches; the example config uses `256` for `128^3`.
+- The trainer now logs the guide validation visualization twice when guidance is enabled:
+  - embedded inside the composite `debug_image`
+  - separately as `debug_guide_image`
+- On the local RTX 4090, full `256^3` forward inference for both unguided and guided ps256 configs hit OOM, so practical timing comparisons should use smaller patches or larger-memory GPUs.
+- The guide panel/render overhead is small relative to model runtime, so it is reasonable to keep both composite and separate guide-image logging enabled.
