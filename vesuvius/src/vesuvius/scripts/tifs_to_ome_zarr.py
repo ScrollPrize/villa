@@ -12,6 +12,7 @@ providing 10-50x speedup for large volumes.
 Usage:
     python tifs_to_ome_zarr.py /path/to/tiff/folder /path/to/output.zarr
     python tifs_to_ome_zarr.py /path/to/tiff/folder /path/to/output.zarr --workers 16
+    python tifs_to_ome_zarr.py --scan-root /path/to/search/root
 """
 
 from __future__ import annotations
@@ -19,7 +20,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
+import shutil
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
@@ -65,6 +68,20 @@ def discover_tiffs(folder: Path) -> List[Path]:
     if not tiffs:
         raise ValueError(f"No TIFF files found in {folder}")
     return tiffs
+
+
+def discover_layers_folders(root: Path) -> List[Path]:
+    """Recursively discover folders named ``layers`` under ``root``."""
+    if not root.is_dir():
+        raise ValueError(f"Scan root is not a directory: {root}")
+
+    layers_dirs = sorted(
+        (path for path in root.rglob("layers") if path.is_dir()),
+        key=lambda path: str(path),
+    )
+    if not layers_dirs:
+        raise ValueError(f"No folders named 'layers' found under {root}")
+    return layers_dirs
 
 
 def get_tiff_info(tiff_path: Path) -> Tuple[Tuple[int, int], np.dtype, bool, Tuple[int, int]]:
@@ -339,7 +356,6 @@ def convert_to_tiled_tiff(tiff_path: str, tile_size: int = 256) -> None:
     )
 
     # Replace original with tiled version
-    import os
     os.replace(temp_path, tiff_path)
 
 
@@ -613,6 +629,7 @@ def convert_tifs_to_ome_zarr(
     chunk_shape: Tuple[int, int, int] = (64, 256, 256),
     num_workers: int = 8,
     compressor_level: int = 3,
+    delete_tifs: bool = False,
 ) -> None:
     """Convert folder of 2D TIFFs to OME-Zarr pyramid.
 
@@ -637,6 +654,8 @@ def convert_tifs_to_ome_zarr(
         Number of threads for parallel tile reading within each z-slice.
     compressor_level : int
         Blosc compression level (1-9).
+    delete_tifs : bool
+        Delete source TIFF files after a successful OME-Zarr conversion.
     """
     # Discover TIFFs
     logger.info(f"Discovering TIFFs in {input_folder}")
@@ -699,7 +718,6 @@ def convert_tifs_to_ome_zarr(
     # Create output zarr
     logger.info(f"Creating OME-Zarr at {output_path}")
     if output_path.exists():
-        import shutil
         logger.warning(f"Removing existing {output_path}")
         shutil.rmtree(output_path)
 
@@ -777,7 +795,49 @@ def convert_tifs_to_ome_zarr(
             num_workers,
         )
 
+    if delete_tifs:
+        logger.info(f"Deleting {len(tiff_paths)} source TIFF files")
+        failed_deletions = []
+        for tiff_path in tiff_paths:
+            try:
+                tiff_path.unlink()
+            except FileNotFoundError:
+                logger.warning(f"Source TIFF already missing, skipping: {tiff_path}")
+            except OSError as exc:
+                failed_deletions.append((tiff_path, exc))
+
+        if failed_deletions:
+            failed_paths = ", ".join(f"{path} ({exc})" for path, exc in failed_deletions)
+            raise RuntimeError(f"OME-Zarr was written, but failed to delete some TIFFs: {failed_paths}")
+
     logger.info(f"Conversion complete: {output_path}")
+
+
+def convert_layers_tree_to_ome_zarr(
+    scan_root: Path,
+    num_levels: int = 6,
+    chunk_shape: Tuple[int, int, int] = (64, 256, 256),
+    num_workers: int = 8,
+    compressor_level: int = 3,
+    delete_tifs: bool = False,
+) -> None:
+    """Convert each discovered ``layers`` folder under ``scan_root`` to a sibling OME-Zarr."""
+    layers_folders = discover_layers_folders(scan_root)
+    logger.info(f"Found {len(layers_folders)} layers folders under {scan_root}")
+
+    for layers_folder in layers_folders:
+        parent_dir = layers_folder.parent
+        output_path = parent_dir / f"{parent_dir.name}.zarr"
+        logger.info(f"Converting {layers_folder} -> {output_path}")
+        convert_tifs_to_ome_zarr(
+            input_folder=layers_folder,
+            output_path=output_path,
+            num_levels=num_levels,
+            chunk_shape=chunk_shape,
+            num_workers=num_workers,
+            compressor_level=compressor_level,
+            delete_tifs=delete_tifs,
+        )
 
 
 def main():
@@ -787,13 +847,20 @@ def main():
     )
     parser.add_argument(
         "input_folder",
+        nargs="?",
         type=Path,
         help="Folder containing 2D TIFF files (one per z-slice)",
     )
     parser.add_argument(
         "output_path",
+        nargs="?",
         type=Path,
         help="Output .zarr path",
+    )
+    parser.add_argument(
+        "--scan-root",
+        type=Path,
+        help="Recursively find folders named 'layers' under this root and write one sibling .zarr per match",
     )
     parser.add_argument(
         "--num-levels",
@@ -820,8 +887,32 @@ def main():
         choices=range(1, 10),
         help="Blosc compression level (1-9)",
     )
+    parser.add_argument(
+        "--delete-tifs",
+        action="store_true",
+        help="Delete source TIFF files after a successful OME-Zarr conversion",
+    )
 
     args = parser.parse_args()
+    using_single_conversion = args.input_folder is not None or args.output_path is not None
+    using_scan_root = args.scan_root is not None
+
+    if using_scan_root and using_single_conversion:
+        parser.error("Use either input_folder/output_path or --scan-root, not both")
+
+    if using_scan_root:
+        convert_layers_tree_to_ome_zarr(
+            scan_root=args.scan_root,
+            num_levels=args.num_levels,
+            chunk_shape=args.chunk_size,
+            num_workers=args.workers,
+            compressor_level=args.compression_level,
+            delete_tifs=args.delete_tifs,
+        )
+        return
+
+    if args.input_folder is None or args.output_path is None:
+        parser.error("Provide input_folder and output_path, or use --scan-root")
 
     convert_tifs_to_ome_zarr(
         input_folder=args.input_folder,
@@ -830,6 +921,7 @@ def main():
         chunk_shape=args.chunk_size,
         num_workers=args.workers,
         compressor_level=args.compression_level,
+        delete_tifs=args.delete_tifs,
     )
 
 
