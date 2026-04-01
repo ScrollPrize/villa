@@ -338,7 +338,8 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
                     const std::filesystem::path& volPath, int groupIdx,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
-                    const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW)
+                    const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
+                    double baseVoxelSize, const std::string& voxelUnit)
 {
     json attrs;
     attrs["source_zarr"] = volPath.string();
@@ -356,19 +357,20 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
 
     json ms;
     ms["version"] = "0.4"; ms["name"] = "render";
-    ms["axes"] = json::array({
-        json{{"name","z"},{"type","space"}},
-        json{{"name","y"},{"type","space"}},
-        json{{"name","x"},{"type","space"}}
-    });
+    auto makeAxis = [&](const char* name) -> json {
+        json ax = {{"name", name}, {"type", "space"}};
+        if (!voxelUnit.empty()) ax["unit"] = voxelUnit;
+        return ax;
+    };
+    ms["axes"] = json::array({makeAxis("z"), makeAxis("y"), makeAxis("x")});
     ms["datasets"] = json::array();
     for (int l = 0; l <= 5; l++) {
-        double s = std::pow(2.0, l);
-        const double sz = 1.0;
+        const double sYX = baseVoxelSize * std::pow(2.0, l);
+        const double sZ = baseVoxelSize;
         ms["datasets"].push_back({
             {"path", std::to_string(l)},
             {"coordinateTransformations", json::array({
-                json{{"type","scale"},{"scale",json::array({sz,s,s})}},
+                json{{"type","scale"},{"scale",json::array({sZ, sYX, sYX})}},
                 json{{"type","translation"},{"translation",json::array({0.0,0.0,0.0})}}
             })}
         });

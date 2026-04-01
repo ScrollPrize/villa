@@ -85,7 +85,9 @@ void writeZarrAttrs(const std::filesystem::path& outFile,
                     const std::filesystem::path& volPath, int groupIdx,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
-                    const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW);
+                    const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
+                    double baseVoxelSize = 1.0,
+                    const std::string& voxelUnit = "");
 
 // Write a dense uint8 ZYX subregion into a freshly created dataset via
 // writeChunk(). Chunks overlapping the region are materialized; untouched
