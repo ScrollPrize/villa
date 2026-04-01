@@ -89,15 +89,14 @@ void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
         vol->setCacheBudget(hotBytes, warmBytes);
         vol->setDiskCacheMaxBytes(_diskCacheSizeBytes);
 
-        // Video codec recompression settings
+        // H.265 recompression settings
         using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         bool recompressEnabled = settings.value(perf::VIDEO_RECOMPRESS_ENABLED, perf::VIDEO_RECOMPRESS_ENABLED_DEFAULT).toBool();
-        int codecType = settings.value(perf::VIDEO_CODEC_TYPE, perf::VIDEO_CODEC_TYPE_DEFAULT).toInt();
         int preset = settings.value(perf::VIDEO_QUALITY_PRESET, perf::VIDEO_QUALITY_PRESET_DEFAULT).toInt();
         preset = std::clamp(preset, 0, perf::PRESET_COUNT - 1);
-        int qp = (codecType == 3) ? perf::PRESET_C3D_QUALITY[preset] : perf::PRESET_VIDEO_QP[preset];
-        vol->setVideoRecompression(recompressEnabled, codecType, qp);
+        int qp = perf::PRESET_VIDEO_QP[preset];
+        vol->setVideoRecompression(recompressEnabled, qp);
 
         int ioThreads = settings.value(perf::IO_THREADS, perf::IO_THREADS_DEFAULT).toInt();
         vol->setIOThreads(std::clamp(ioThreads, 1, 100));

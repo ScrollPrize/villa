@@ -104,10 +104,10 @@ public:
     // Must be called before first tieredCache() access.
     void setDiskCacheMaxBytes(size_t bytes);
 
-    // Enable video codec recompression for disk-cached remote chunks.
-    // codecType: 1=H265, 3=C3D; qp: quantization parameter (0-51).
+    // Enable H.265 recompression for disk-cached remote chunks.
+    // qp: quantization parameter (0-51). 0 = lossless.
     // Must be called before first tieredCache() access.
-    void setVideoRecompression(bool enabled, int codecType = 1, int qp = 15);
+    void setVideoRecompression(bool enabled, int qp = 15);
 
     // Set the number of background IO threads for chunk fetching.
     // Must be called before first tieredCache() access.
@@ -216,7 +216,6 @@ protected:
     size_t diskCacheMaxBytes_ = 100ULL << 30; // 100 GB default
     std::shared_ptr<vc::cache::DiskStore> pendingDiskStore_;
     bool videoRecompressEnabled_ = true;
-    int videoCodecType_ = 1;    // H265
     int videoCodecQP_ = 15;
     int ioThreads_ = 0;  // 0 = use default
     std::atomic<bool> prefetchStarted_{false};

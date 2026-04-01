@@ -205,10 +205,10 @@ DecompressFn makeVcDecompressor(vc::VcDataset* ds)
 
 RecompressFn makeVideoRecompressor(
     const std::vector<vc::VcDataset*>& datasets,
-    int codecType, int qp)
+    int qp)
 {
 #ifdef UTILS_HAS_VIDEO_CODEC
-    return [datasets, codecType, qp](const std::vector<uint8_t>& original,
+    return [datasets, qp](const std::vector<uint8_t>& original,
                                      const ChunkKey& key) -> std::vector<uint8_t> {
         if (key.level < 0 ||
             key.level >= static_cast<int>(datasets.size()) ||
@@ -246,9 +246,8 @@ RecompressFn makeVideoRecompressor(
             raw.resize(chunkSize);
         }
 
-        // Encode with video codec
+        // Encode with H.265
         utils::VideoCodecParams vp;
-        vp.type = static_cast<utils::VideoCodecType>(codecType);
         vp.qp = qp;
         vp.depth = static_cast<int>(chunkShape[0]);
         vp.height = static_cast<int>(chunkShape[1]);

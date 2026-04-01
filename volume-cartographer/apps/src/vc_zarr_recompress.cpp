@@ -772,7 +772,6 @@ int main(int argc, char** argv) {
 
                             // H265 encode
                             utils::VideoCodecParams params;
-                            params.type = utils::VideoCodecType::H265;
                             params.qp = qp;
                             params.depth = CHUNK_DIM;
                             params.height = CHUNK_DIM;

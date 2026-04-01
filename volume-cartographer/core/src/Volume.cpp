@@ -428,7 +428,7 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
     }
 
     if (videoRecompressEnabled_ && (isRemote_ || mountInfo_.type == vc::FilesystemType::NetworkMount)) {
-        config.recompress = vc::cache::makeVideoRecompressor(dsPtrs, videoCodecType_, videoCodecQP_);
+        config.recompress = vc::cache::makeVideoRecompressor(dsPtrs, videoCodecQP_);
     }
 
     return std::make_unique<vc::cache::TieredChunkCache>(
@@ -477,10 +477,9 @@ void Volume::setDiskCacheMaxBytes(size_t bytes)
     diskCacheMaxBytes_ = bytes;
 }
 
-void Volume::setVideoRecompression(bool enabled, int codecType, int qp)
+void Volume::setVideoRecompression(bool enabled, int qp)
 {
     videoRecompressEnabled_ = enabled;
-    videoCodecType_ = codecType;
     videoCodecQP_ = qp;
 }
 
