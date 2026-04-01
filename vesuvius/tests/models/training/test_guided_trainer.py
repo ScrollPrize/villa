@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
 from vesuvius.models.run.inference import Inferer
 from vesuvius.models.training.train import BaseTrainer
+from vesuvius.utils.plotting import save_debug
 
 
 def _tiny_dinovol_model_config() -> dict:
@@ -192,3 +193,66 @@ def test_inferer_finalize_output_batch_returns_float16_numpy():
 
     assert output_np.dtype == np.float16
     assert output_np.shape == (1, 2, 4, 4, 4)
+
+
+def test_save_debug_adds_aux_panel_to_preview_image():
+    input_volume = torch.zeros((1, 1, 4, 8, 8), dtype=torch.float32)
+    targets_dict = {"surface": torch.zeros((1, 2, 4, 8, 8), dtype=torch.float32)}
+    outputs_dict = {"surface": torch.zeros((1, 2, 4, 8, 8), dtype=torch.float32)}
+    aux_outputs_dict = {"guide_surface": torch.ones((1, 1, 4, 8, 8), dtype=torch.float32)}
+    tasks_dict = {"surface": {"activation": "none"}}
+
+    _, preview_without_aux = save_debug(
+        input_volume=input_volume,
+        targets_dict=targets_dict,
+        outputs_dict=outputs_dict,
+        tasks_dict=tasks_dict,
+        epoch=0,
+        save_media=False,
+    )
+    _, preview_with_aux = save_debug(
+        input_volume=input_volume,
+        targets_dict=targets_dict,
+        outputs_dict=outputs_dict,
+        aux_outputs_dict=aux_outputs_dict,
+        tasks_dict=tasks_dict,
+        epoch=0,
+        save_media=False,
+    )
+
+    assert preview_with_aux is not None
+    assert preview_without_aux is not None
+    assert preview_with_aux.shape[1] > preview_without_aux.shape[1]
+
+
+def test_trainer_builds_guide_preview_and_media_payload():
+    mgr = _make_mgr(Path("/tmp/guide_backbone.pt"), Path("/tmp/guide_backbone.pt"))
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+
+    aux_outputs_dict = {
+        "guide_surface": torch.zeros((1, 1, 8, 8, 8), dtype=torch.float32)
+    }
+    aux_outputs_dict["guide_surface"][:, :, 4] = 1.0
+
+    guide_preview = trainer._make_aux_preview_image(aux_outputs_dict)
+    payload = trainer._build_debug_media_payload(
+        debug_preview_image=np.zeros((8, 8, 3), dtype=np.uint8),
+        guide_preview_image=guide_preview,
+    )
+
+    assert guide_preview is not None
+    assert guide_preview.ndim == 3
+    assert guide_preview.shape[2] == 3
+    assert set(payload.keys()) == {"debug_image", "debug_guide_image"}
+
+
+def test_trainer_builds_only_standard_debug_payload_when_no_guide_preview():
+    mgr = _make_mgr(Path("/tmp/guide_backbone.pt"), Path("/tmp/guide_backbone.pt"))
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+
+    payload = trainer._build_debug_media_payload(
+        debug_preview_image=np.zeros((8, 8, 3), dtype=np.uint8),
+        guide_preview_image=None,
+    )
+
+    assert set(payload.keys()) == {"debug_image"}

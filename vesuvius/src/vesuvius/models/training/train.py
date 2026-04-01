@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, SubsetRandomSampler, Subset, WeightedRa
 from torch.utils.data.distributed import DistributedSampler
 from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.datasets import ZarrDataset
-from vesuvius.utils.plotting import save_debug
+from vesuvius.utils.plotting import save_debug, convert_slice_to_bgr, _compute_display_value_range
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
 from vesuvius.models.training.loss.losses import _create_loss
@@ -459,6 +459,86 @@ class BaseTrainer:
         weighted_loss = loss_map * valid_resize
         denom = valid_resize.sum().clamp_min(1.0)
         return weighted_loss.sum() / denom
+
+    def _resolve_guide_supervision_target_name(self) -> str:
+        if self.guide_supervision_target is not None:
+            return str(self.guide_supervision_target)
+        for target_name, target_info in self.mgr.targets.items():
+            if not target_info.get("auxiliary_task", False):
+                return str(target_name)
+        return "target"
+
+    def _slice_aux_outputs_for_debug(self, aux_outputs, batch_index: int):
+        if not aux_outputs:
+            return {}
+        sliced = {}
+        for name, value in aux_outputs.items():
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] > batch_index:
+                sliced[name] = value[batch_index: batch_index + 1]
+        return sliced
+
+    def _prepare_aux_debug_outputs(self, aux_outputs, reference_input):
+        if not aux_outputs or not isinstance(reference_input, torch.Tensor):
+            return {}
+
+        prepared = {}
+        guide_mask = aux_outputs.get("guide_mask")
+        if guide_mask is not None:
+            upsampled = F.interpolate(
+                guide_mask.float(),
+                size=reference_input.shape[2:],
+                mode="trilinear",
+                align_corners=False,
+            ).clamp_(0.0, 1.0)
+            prepared[f"guide_{self._resolve_guide_supervision_target_name()}"] = upsampled.detach()
+        return prepared
+
+    def _make_aux_preview_image(self, aux_outputs_dict):
+        if not aux_outputs_dict:
+            return None
+
+        aux_name = sorted(aux_outputs_dict.keys())[0]
+        aux_tensor = aux_outputs_dict[aux_name]
+        if not isinstance(aux_tensor, torch.Tensor):
+            return None
+        if aux_tensor.dtype == torch.bfloat16:
+            aux_tensor = aux_tensor.float()
+
+        aux_np = aux_tensor.detach().cpu().numpy()
+        while aux_np.ndim > 4:
+            aux_np = aux_np[0]
+        if aux_np.ndim == 4:
+            aux_np = aux_np[0]
+
+        if aux_np.ndim == 2:
+            preview_slice = aux_np
+            is_2d = True
+        else:
+            preview_slice = aux_np[max(aux_np.shape[0] // 2, 0)]
+            is_2d = False
+
+        value_range = _compute_display_value_range(
+            aux_np,
+            is_2d_run=is_2d,
+            task_name=aux_name,
+            task_cfg={},
+        )
+        preview = convert_slice_to_bgr(preview_slice, value_range=value_range)
+        return np.ascontiguousarray(preview, dtype=np.uint8)
+
+    def _build_debug_media_payload(self, debug_preview_image=None, guide_preview_image=None):
+        payload = {}
+        for key, image in (
+            ("debug_image", debug_preview_image),
+            ("debug_guide_image", guide_preview_image),
+        ):
+            if image is None:
+                continue
+            image_to_log = image
+            if image_to_log.ndim == 3 and image_to_log.shape[2] == 3:
+                image_to_log = image_to_log[..., ::-1]
+            payload[key] = np.ascontiguousarray(image_to_log)
+        return payload
 
     # --- losses ---- #
     def _build_loss(self):
@@ -1711,6 +1791,7 @@ class BaseTrainer:
             train_sample_input = None
             train_sample_targets = None
             train_sample_outputs = None
+            train_sample_aux_outputs = None
 
             print(f"Using optimizer : {optimizer.__class__.__name__}")
             print(f"Using scheduler : {scheduler.__class__.__name__} (per-iteration: {is_per_iteration_scheduler})")
@@ -1791,6 +1872,10 @@ class BaseTrainer:
                             train_sample_outputs[t_name] = p_val[0][b_idx: b_idx + 1]
                         else:
                             train_sample_outputs[t_name] = p_val[b_idx: b_idx + 1]
+                    train_sample_aux_outputs = self._prepare_aux_debug_outputs(
+                        self._slice_aux_outputs_for_debug(getattr(self, "_current_aux_outputs", {}), b_idx),
+                        train_sample_input,
+                    )
 
                 if optimizer_stepped and is_per_iteration_scheduler:
                     self._update_ema_model(model)
@@ -1858,6 +1943,7 @@ class BaseTrainer:
                 with torch.no_grad():
                     val_losses = {t_name: [] for t_name in self.mgr.targets}
                     debug_preview_image = None
+                    debug_guide_preview_image = None
                     
                     # Initialize evaluation metrics
                     evaluation_metrics = self._initialize_evaluation_metrics()
@@ -1943,6 +2029,11 @@ class BaseTrainer:
                                             outputs_dict_first[t_name] = p_val[0][b_idx: b_idx + 1]
                                         else:
                                             outputs_dict_first[t_name] = p_val[b_idx: b_idx + 1]
+                                    aux_outputs_dict_first = self._prepare_aux_debug_outputs(
+                                        self._slice_aux_outputs_for_debug(getattr(self, "_current_aux_outputs", {}), b_idx),
+                                        inputs_first,
+                                    )
+                                    debug_guide_preview_image = self._make_aux_preview_image(aux_outputs_dict_first)
 
                                     # Use human-friendly 1-based epoch numbering in debug image filenames
                                     debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch + 1}.gif"
@@ -1978,6 +2069,7 @@ class BaseTrainer:
                                             input_volume=inputs_first,
                                             targets_dict=targets_dict_first,
                                             outputs_dict=outputs_dict_first,
+                                            aux_outputs_dict=aux_outputs_dict_first,
                                             tasks_dict=self.mgr.targets,
                                             # dictionary, e.g. {"sheet": {"activation":"sigmoid"}, "normals": {"activation":"none"}}
                                             epoch=epoch,
@@ -1985,6 +2077,7 @@ class BaseTrainer:
                                             train_input=train_sample_input,
                                             train_targets_dict=train_sample_targets,
                                             train_outputs_dict=train_sample_outputs,
+                                            train_aux_outputs_dict=train_sample_aux_outputs,
                                             skeleton_dict=skeleton_dict,
                                             train_skeleton_dict=train_skeleton_dict,
                                             unlabeled_input=unlabeled_input,
@@ -2037,13 +2130,14 @@ class BaseTrainer:
 
                         import wandb
 
-                        if debug_preview_image is not None:
-                            preview_to_log = debug_preview_image
-                            if preview_to_log.ndim == 3 and preview_to_log.shape[2] == 3:
-                                # Convert BGR (OpenCV) to RGB for wandb
-                                preview_to_log = preview_to_log[..., ::-1]
-                            preview_to_log = np.ascontiguousarray(preview_to_log)
-                            val_metrics["debug_image"] = wandb.Image(preview_to_log)
+                        media_payload = self._build_debug_media_payload(
+                            debug_preview_image=debug_preview_image,
+                            guide_preview_image=debug_guide_preview_image,
+                        )
+                        if "debug_image" in media_payload:
+                            val_metrics["debug_image"] = wandb.Image(media_payload["debug_image"])
+                        if "debug_guide_image" in media_payload:
+                            val_metrics["debug_guide_image"] = wandb.Image(media_payload["debug_guide_image"])
 
                         wandb.log(val_metrics)
 
