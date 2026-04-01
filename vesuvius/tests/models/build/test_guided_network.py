@@ -44,7 +44,15 @@ def _write_local_guide_checkpoint(path: Path) -> None:
     torch.save(checkpoint, path)
 
 
-def _make_mgr(checkpoint_path: Path, *, basic_encoder_block: str) -> SimpleNamespace:
+def _make_mgr(
+    checkpoint_path: Path,
+    *,
+    basic_encoder_block: str,
+    guide_tokenbook_tokens: int | None = None,
+) -> SimpleNamespace:
+    guided_config = {}
+    if guide_tokenbook_tokens is not None:
+        guided_config["guide_tokenbook_tokens"] = int(guide_tokenbook_tokens)
     return SimpleNamespace(
         targets={"ink": {"out_channels": 1, "activation": "none"}},
         train_patch_size=(16, 16, 16),
@@ -69,6 +77,7 @@ def _make_mgr(checkpoint_path: Path, *, basic_encoder_block: str) -> SimpleNames
             "guide_freeze": True,
             "guide_tokenbook_sample_rate": 1.0,
             "input_shape": [16, 16, 16],
+            **guided_config,
         },
     )
 
@@ -116,6 +125,23 @@ def test_guided_network_backprop_updates_tokenbook_but_not_frozen_guide_backbone
 
     assert any(parameter.grad is not None for parameter in model.guide_tokenbook.parameters())
     assert all(parameter.grad is None for parameter in model.guide_backbone.parameters())
+
+
+def test_guided_network_supports_reduced_tokenbook_prototype_count(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_tokenbook_tokens=3,
+    )
+    model = NetworkFromConfig(mgr)
+    outputs, aux = model(torch.randn(1, 1, 16, 16, 16), return_aux=True)
+
+    assert model.guide_tokenbook.book.shape[0] == 3
+    assert model.final_config["guide_tokenbook_tokens"] == 3
+    assert outputs["ink"].shape == (1, 1, 16, 16, 16)
+    assert aux["guide_mask"].shape == (1, 1, 2, 2, 2)
 
 
 def test_guided_network_rejects_primus_architecture(tmp_path: Path):

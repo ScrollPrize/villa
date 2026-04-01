@@ -708,6 +708,7 @@ class NetworkFromConfig(nn.Module):
             "guide_backbone_config_path": self.guide_backbone_config_path,
             "guide_freeze": self.guide_freeze,
             "guide_patch_grid": self.guide_patch_grid,
+            "guide_tokenbook_tokens": getattr(self, "guide_tokenbook_tokens", None),
             "guide_fusion_stage": "input" if self.guide_enabled else None,
         }
 
@@ -736,7 +737,15 @@ class NetworkFromConfig(nn.Module):
             )
 
         self.guide_patch_grid = tuple(size // patch for size, patch in zip(input_shape, patch_embed_size))
-        token_count = int(math.prod(self.guide_patch_grid))
+        default_token_count = int(math.prod(self.guide_patch_grid))
+        configured_token_count = model_config.get("guide_tokenbook_tokens")
+        if configured_token_count is None:
+            token_count = default_token_count
+        else:
+            token_count = int(configured_token_count)
+            if token_count <= 0:
+                raise ValueError(f"guide_tokenbook_tokens must be > 0, got {token_count}")
+        self.guide_tokenbook_tokens = token_count
         self.guide_tokenbook = TokenBook3D(
             n_tokens=token_count,
             embed_dim=int(self.guide_backbone.embed_dim),
