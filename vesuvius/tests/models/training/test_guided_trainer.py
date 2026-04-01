@@ -421,6 +421,18 @@ def test_initialize_training_skips_compile_when_policy_is_off(tmp_path: Path, mo
     assert call_order == ["wrap"]
 
 
+def test_initialize_training_places_run_checkpoint_dir_under_ckpt_out_base(tmp_path: Path, monkeypatch):
+    mgr = _make_compile_mgr(tmp_path, compile_policy="off")
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    call_order: list[str] = []
+    _configure_compile_test_trainer(trainer, monkeypatch, guide_enabled=True, call_order=call_order)
+
+    state = trainer._initialize_training()
+
+    assert str(state["ckpt_dir"]).startswith(str(mgr.ckpt_out_base))
+    assert str(state["model_ckpt_dir"]).startswith(str(mgr.ckpt_out_base))
+
+
 def test_wrap_model_uses_guided_ddp_defaults(tmp_path: Path):
     mgr = _make_compile_mgr(tmp_path, compile_policy="module")
     trainer = BaseTrainer(mgr=mgr, verbose=False)

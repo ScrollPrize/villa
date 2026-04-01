@@ -1361,14 +1361,15 @@ class BaseTrainer:
                                                                                                    val_dataset)
         self._record_startup_timing("dataloader_build", perf_counter() - stage_start)
 
-        os.makedirs(self.mgr.ckpt_out_base, exist_ok=True)
-        model_ckpt_dir = os.path.join(self.mgr.ckpt_out_base, self.mgr.model_name)
+        ckpt_out_base = str(self.mgr.ckpt_out_base)
+        os.makedirs(ckpt_out_base, exist_ok=True)
+        model_ckpt_dir = os.path.join(ckpt_out_base, self.mgr.model_name)
         os.makedirs(model_ckpt_dir, exist_ok=True)
 
         now = datetime.now()
         date_str = now.strftime('%m%d%y')
         time_str = now.strftime('%H%M')
-        ckpt_dir = os.path.join('checkpoints', f"{self.mgr.model_name}_{date_str}{time_str}")
+        ckpt_dir = os.path.join(ckpt_out_base, f"{self.mgr.model_name}_{date_str}{time_str}")
         os.makedirs(ckpt_dir, exist_ok=True)
 
         loss_overrides = self._capture_loss_overrides()
