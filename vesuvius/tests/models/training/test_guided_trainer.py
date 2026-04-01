@@ -244,7 +244,7 @@ def test_trainer_builds_guide_preview_and_media_payload():
     assert guide_preview is not None
     assert guide_preview.ndim == 3
     assert guide_preview.shape[2] == 3
-    assert set(payload.keys()) == {"debug_image", "debug_guide_image"}
+    assert set(payload.keys()) == {"debug_image"}
 
 
 def test_trainer_builds_only_standard_debug_payload_when_no_guide_preview():
@@ -257,6 +257,25 @@ def test_trainer_builds_only_standard_debug_payload_when_no_guide_preview():
     )
 
     assert set(payload.keys()) == {"debug_image"}
+
+
+def test_guided_base_trainer_omits_guide_loss_when_weight_is_zero(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(data_root, guide_checkpoint)
+    mgr.guide_loss_weight = 0.0
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model().to(trainer.device)
+    loss_fns = trainer._build_loss()
+    dataset = trainer._configure_dataset(is_training=True)
+    batch = next(iter(DataLoader(dataset, batch_size=1, shuffle=False)))
+
+    _inputs, targets_dict, outputs = trainer._get_model_outputs(model, batch)
+    loss, task_losses = trainer._compute_train_loss(outputs, targets_dict, loss_fns)
+
+    assert torch.isfinite(loss)
+    assert "guide_mask" not in task_losses
 
 
 def test_prepare_metrics_for_logging_includes_guide_loss_entries():

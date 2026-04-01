@@ -631,10 +631,7 @@ class BaseTrainer:
 
     def _build_debug_media_payload(self, debug_preview_image=None, guide_preview_image=None):
         payload = {}
-        for key, image in (
-            ("debug_image", debug_preview_image),
-            ("debug_guide_image", guide_preview_image),
-        ):
+        for key, image in (("debug_image", debug_preview_image),):
             if image is None:
                 continue
             image_to_log = image
@@ -1745,11 +1742,12 @@ class BaseTrainer:
             total_loss = total_loss + weighted_loss.to(total_loss.dtype)
             task_losses[t_name] = weighted_loss.detach().cpu().item()
 
-        guide_loss = self._compute_guide_alignment_loss(targets_dict)
-        if guide_loss is not None:
-            weighted_guide_loss = self.guide_loss_weight * guide_loss
-            total_loss = total_loss + weighted_guide_loss.to(total_loss.dtype)
-            task_losses["guide_mask"] = weighted_guide_loss.detach().cpu().item()
+        if self.guide_loss_weight > 0.0:
+            guide_loss = self._compute_guide_alignment_loss(targets_dict)
+            if guide_loss is not None:
+                weighted_guide_loss = self.guide_loss_weight * guide_loss
+                total_loss = total_loss + weighted_guide_loss.to(total_loss.dtype)
+                task_losses["guide_mask"] = weighted_guide_loss.detach().cpu().item()
 
         return total_loss, task_losses
 
@@ -2184,8 +2182,6 @@ class BaseTrainer:
                                         self._slice_aux_outputs_for_debug(getattr(self, "_current_aux_outputs", {}), b_idx),
                                         inputs_first,
                                     )
-                                    debug_guide_preview_image = self._make_aux_preview_image(aux_outputs_dict_first)
-
                                     # Use human-friendly 1-based epoch numbering in debug image filenames
                                     debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch + 1}.gif"
                                     
@@ -2287,8 +2283,6 @@ class BaseTrainer:
                         )
                         if "debug_image" in media_payload:
                             val_metrics["debug_image"] = wandb.Image(media_payload["debug_image"])
-                        if "debug_guide_image" in media_payload:
-                            val_metrics["debug_guide_image"] = wandb.Image(media_payload["debug_guide_image"])
 
                         wandb.log(val_metrics)
 
