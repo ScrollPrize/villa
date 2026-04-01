@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,11 +20,32 @@ def _parse_patch_size(text: str) -> tuple[int, int, int]:
     return values
 
 
+def _sync_if_needed(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _to_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    non_blocking = device.type == "cuda"
+    return tensor.to(device=device, non_blocking=non_blocking)
+
+
 def _make_mgr(
     *,
     patch_size: tuple[int, int, int],
     guide_checkpoint: str | None,
+    guide_tokenbook_tokens: int | None = None,
 ) -> SimpleNamespace:
+    guided_config = {}
+    if guide_checkpoint is not None:
+        guided_config = {
+            "guide_backbone": str(guide_checkpoint),
+            "guide_freeze": True,
+            "guide_tokenbook_sample_rate": 1.0,
+        }
+        if guide_tokenbook_tokens is not None:
+            guided_config["guide_tokenbook_tokens"] = int(guide_tokenbook_tokens)
+
     return SimpleNamespace(
         targets={"ink": {"out_channels": 2, "activation": "none"}},
         train_patch_size=patch_size,
@@ -45,102 +67,195 @@ def _make_mgr(
             "bottleneck_block": "BasicBlockD",
             "separate_decoders": True,
             "input_shape": list(patch_size),
-            **(
-                {
-                    "guide_backbone": str(guide_checkpoint),
-                    "guide_freeze": True,
-                    "guide_tokenbook_sample_rate": 1.0,
-                }
-                if guide_checkpoint is not None
-                else {}
-            ),
+            **guided_config,
         },
     )
 
 
-def _sync_if_needed(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
+def _label_name(tokenbook_tokens: int | None) -> str:
+    return "full" if tokenbook_tokens is None else f"k{int(tokenbook_tokens)}"
 
 
-def _time_model(
-    model: NetworkFromConfig,
+def _build_model(
+    *,
+    patch_size: tuple[int, int, int],
+    device: torch.device,
+    guide_checkpoint: str | None,
+    guide_tokenbook_tokens: int | None,
+    compile_model: bool,
+    channels_last_3d: bool,
+):
+    mgr = _make_mgr(
+        patch_size=patch_size,
+        guide_checkpoint=guide_checkpoint,
+        guide_tokenbook_tokens=guide_tokenbook_tokens,
+    )
+    model = NetworkFromConfig(mgr).to(device)
+    if channels_last_3d:
+        model = model.to(memory_format=torch.channels_last_3d)
+    if compile_model:
+        model = torch.compile(model, mode="default")
+    return model
+
+
+def _make_cpu_batch(
+    patch_size: tuple[int, int, int],
+    *,
+    pin_memory: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    image = torch.randn(1, 1, *patch_size)
+    labels = torch.randint(0, 2, (1, *patch_size))
+    if pin_memory:
+        image = image.pin_memory()
+        labels = labels.pin_memory()
+    return image, labels
+
+
+def _compute_loss(logits_dict: dict[str, torch.Tensor], aux: dict[str, torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+    logits = logits_dict["ink"]
+    loss = F.cross_entropy(logits, labels)
+    if "guide_mask" in aux:
+        guide_target = (labels > 0).float().unsqueeze(1)
+        guide_target = F.interpolate(guide_target, size=aux["guide_mask"].shape[2:], mode="nearest")
+        loss = loss + 0.5 * F.binary_cross_entropy(
+            aux["guide_mask"].clamp(1e-6, 1.0 - 1e-6),
+            guide_target,
+        )
+    return loss
+
+
+def _timed_call(fn, *, device: torch.device):
+    _sync_if_needed(device)
+    start = time.perf_counter()
+    result = fn()
+    _sync_if_needed(device)
+    return result, (time.perf_counter() - start) * 1000.0
+
+
+def _run_variant_benchmark(
+    model,
     *,
     device: torch.device,
-    inputs: torch.Tensor,
-    labels: torch.Tensor,
-    warmup: int,
+    cpu_inputs: torch.Tensor,
+    cpu_labels: torch.Tensor,
     iterations: int,
-) -> dict:
-    model = model.to(device)
-    model.train()
-    optimizer = torch.optim.AdamW(
-        [param for param in model.parameters() if param.requires_grad],
-        lr=1e-4,
-    )
-
+) -> dict[str, float | None]:
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    for _ in range(warmup):
-        optimizer.zero_grad(set_to_none=True)
-        outputs = model(inputs, return_aux=True) if model.guide_enabled else model(inputs)
-        if model.guide_enabled:
+    def _first_forward():
+        inputs = _to_device(cpu_inputs, device)
+        outputs = model(inputs, return_aux=True) if getattr(model, "guide_enabled", False) else model(inputs)
+        if getattr(model, "guide_enabled", False):
             logits_dict, aux = outputs
         else:
             logits_dict, aux = outputs, {}
-        logits = logits_dict["ink"]
-        loss = F.cross_entropy(logits, labels)
-        if "guide_mask" in aux:
-            guide_target = (labels > 0).float().unsqueeze(1)
-            guide_target = F.interpolate(guide_target, size=aux["guide_mask"].shape[2:], mode="nearest")
-            loss = loss + 0.5 * F.binary_cross_entropy(
-                aux["guide_mask"].clamp(1e-6, 1.0 - 1e-6),
-                guide_target,
-            )
-        loss.backward()
-        optimizer.step()
-        _sync_if_needed(device)
+        logits = logits_dict["ink"].to(dtype=torch.float16)
+        _ = logits.cpu()
+        return logits_dict, aux
+
+    _result, startup_ms = _timed_call(_first_forward, device=device)
 
     forward_times = []
     train_step_times = []
+    optimizer = torch.optim.AdamW([param for param in model.parameters() if param.requires_grad], lr=1e-4)
+    model.train()
     for _ in range(iterations):
+        inputs = _to_device(cpu_inputs, device)
+        labels = _to_device(cpu_labels, device)
+
         optimizer.zero_grad(set_to_none=True)
+        _, forward_ms = _timed_call(
+            lambda: model(inputs, return_aux=True) if getattr(model, "guide_enabled", False) else model(inputs),
+            device=device,
+        )
+        forward_times.append(forward_ms)
 
-        start = time.perf_counter()
-        outputs = model(inputs, return_aux=True) if model.guide_enabled else model(inputs)
-        _sync_if_needed(device)
-        forward_times.append((time.perf_counter() - start) * 1000.0)
+        def _train_step():
+            outputs = model(inputs, return_aux=True) if getattr(model, "guide_enabled", False) else model(inputs)
+            if getattr(model, "guide_enabled", False):
+                logits_dict, aux = outputs
+            else:
+                logits_dict, aux = outputs, {}
+            loss = _compute_loss(logits_dict, aux, labels)
+            loss.backward()
+            optimizer.step()
 
-        if model.guide_enabled:
-            logits_dict, aux = outputs
-        else:
-            logits_dict, aux = outputs, {}
-        logits = logits_dict["ink"]
-        loss = F.cross_entropy(logits, labels)
-        if "guide_mask" in aux:
-            guide_target = (labels > 0).float().unsqueeze(1)
-            guide_target = F.interpolate(guide_target, size=aux["guide_mask"].shape[2:], mode="nearest")
-            loss = loss + 0.5 * F.binary_cross_entropy(
-                aux["guide_mask"].clamp(1e-6, 1.0 - 1e-6),
-                guide_target,
+        _, train_ms = _timed_call(_train_step, device=device)
+        train_step_times.append(train_ms)
+
+    model.eval()
+    result = {
+        "startup_forward_ms": startup_ms,
+        "steady_state_forward_ms_mean": sum(forward_times) / len(forward_times),
+        "steady_state_train_step_ms_mean": sum(train_step_times) / len(train_step_times),
+        "max_memory_mb": (
+            torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            if device.type == "cuda"
+            else None
+        ),
+    }
+    return result
+
+
+def _profile_guided_stages(
+    model: NetworkFromConfig,
+    *,
+    device: torch.device,
+    cpu_inputs: torch.Tensor,
+    iterations: int,
+) -> dict[str, float]:
+    if not model.guide_enabled:
+        return {}
+
+    timings = defaultdict(list)
+    model.eval()
+
+    for _ in range(iterations):
+        inputs, h2d_ms = _timed_call(lambda: _to_device(cpu_inputs, device), device=device)
+        timings["host_to_device_ms"].append(h2d_ms)
+
+        def _guide_backbone():
+            with torch.no_grad():
+                return model.guide_backbone(inputs)[0]
+
+        guide_features, guide_backbone_ms = _timed_call(_guide_backbone, device=device)
+        timings["guide_backbone_ms"].append(guide_backbone_ms)
+
+        token_mask = model._sample_guide_token_mask(guide_features)
+        guide_mask, tokenbook_ms = _timed_call(
+            lambda: model.guide_tokenbook(guide_features, token_mask=token_mask),
+            device=device,
+        )
+        timings["tokenbook_ms"].append(tokenbook_ms)
+
+        def _upsample():
+            return F.interpolate(
+                guide_mask,
+                size=inputs.shape[2:],
+                mode="trilinear",
+                align_corners=False,
             )
 
-        start = time.perf_counter()
-        loss.backward()
-        optimizer.step()
-        _sync_if_needed(device)
-        train_step_times.append((time.perf_counter() - start) * 1000.0)
+        guide_for_input, upsample_ms = _timed_call(_upsample, device=device)
+        timings["guide_upsample_ms"].append(upsample_ms)
 
-    result = {
-        "forward_ms_mean": sum(forward_times) / len(forward_times),
-        "train_step_ms_mean": sum(train_step_times) / len(train_step_times),
-    }
-    if device.type == "cuda":
-        result["max_memory_mb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-    else:
-        result["max_memory_mb"] = None
-    return result
+        def _segmentation():
+            guided_input = inputs * guide_for_input
+            features = model.shared_encoder(guided_input)
+            logits = model.task_decoders["ink"](features)
+            return logits
+
+        logits, segmentation_ms = _timed_call(_segmentation, device=device)
+        timings["segmentation_trunk_ms"].append(segmentation_ms)
+
+        def _device_to_host():
+            return logits.to(dtype=torch.float16).cpu()
+
+        _host_logits, d2h_ms = _timed_call(_device_to_host, device=device)
+        timings["device_to_host_ms"].append(d2h_ms)
+
+    return {name: sum(values) / len(values) for name, values in timings.items()}
 
 
 def main() -> None:
@@ -151,59 +266,102 @@ def main() -> None:
         default="/home/giorgio/Projects/dino-vesuvius/dino-checkpoints/checkpoint_step_342500.pt",
         help="Local volumetric DINO checkpoint path.",
     )
-    parser.add_argument("--patch-size", type=str, default="64,64,64")
-    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument(
+        "--patch-size",
+        type=str,
+        action="append",
+        default=None,
+        help="3D patch size as z,y,x. Repeat to benchmark multiple sizes.",
+    )
+    parser.add_argument("--warmup", type=int, default=1, help="Reserved for compatibility; startup is measured explicitly.")
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--guide-tokenbook-tokens", type=str, default="full", help="'full' or integer prototype count.")
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
-    patch_size = _parse_patch_size(args.patch_size)
     device = torch.device(args.device)
+    patch_sizes = args.patch_size or ["64,64,64"]
+    patch_sizes = [_parse_patch_size(text) for text in patch_sizes]
+
+    if args.guide_tokenbook_tokens.strip().lower() == "full":
+        guide_tokenbook_tokens = None
+    else:
+        guide_tokenbook_tokens = int(args.guide_tokenbook_tokens)
+        if guide_tokenbook_tokens <= 0:
+            raise ValueError("--guide-tokenbook-tokens must be positive or 'full'")
+
     guide_checkpoint = Path(args.guide_checkpoint)
     if not guide_checkpoint.exists():
         raise FileNotFoundError(f"Guide checkpoint not found: {guide_checkpoint}")
 
-    baseline = NetworkFromConfig(_make_mgr(patch_size=patch_size, guide_checkpoint=None))
-    guided = NetworkFromConfig(_make_mgr(patch_size=patch_size, guide_checkpoint=str(guide_checkpoint)))
-
-    torch.manual_seed(0)
-    inputs = torch.randn(1, 1, *patch_size, device=device)
-    labels = torch.randint(0, 2, (1, *patch_size), device=device)
-
-    baseline_result = _time_model(
-        baseline,
-        device=device,
-        inputs=inputs,
-        labels=labels,
-        warmup=args.warmup,
-        iterations=args.iterations,
-    )
-    guided_result = _time_model(
-        guided,
-        device=device,
-        inputs=inputs,
-        labels=labels,
-        warmup=args.warmup,
-        iterations=args.iterations,
-    )
-
-    summary = {
+    summary: dict[str, object] = {
         "device": str(device),
-        "patch_size": patch_size,
         "warmup": args.warmup,
         "iterations": args.iterations,
-        "baseline": baseline_result,
-        "guided": guided_result,
-        "guided_forward_overhead_pct": (
-            100.0 * (guided_result["forward_ms_mean"] - baseline_result["forward_ms_mean"])
-            / baseline_result["forward_ms_mean"]
-        ),
-        "guided_train_step_overhead_pct": (
-            100.0 * (guided_result["train_step_ms_mean"] - baseline_result["train_step_ms_mean"])
-            / baseline_result["train_step_ms_mean"]
-        ),
+        "guide_tokenbook_tokens": _label_name(guide_tokenbook_tokens),
+        "results": {},
     }
+
+    pin_memory = device.type == "cuda"
+    for patch_size in patch_sizes:
+        patch_label = "x".join(str(v) for v in patch_size)
+        cpu_inputs, cpu_labels = _make_cpu_batch(patch_size, pin_memory=pin_memory)
+        variants = {
+            "baseline_eager": _build_model(
+                patch_size=patch_size,
+                device=device,
+                guide_checkpoint=None,
+                guide_tokenbook_tokens=None,
+                compile_model=False,
+                channels_last_3d=False,
+            ),
+            "guided_eager": _build_model(
+                patch_size=patch_size,
+                device=device,
+                guide_checkpoint=str(guide_checkpoint),
+                guide_tokenbook_tokens=guide_tokenbook_tokens,
+                compile_model=False,
+                channels_last_3d=False,
+            ),
+            "guided_compile": _build_model(
+                patch_size=patch_size,
+                device=device,
+                guide_checkpoint=str(guide_checkpoint),
+                guide_tokenbook_tokens=guide_tokenbook_tokens,
+                compile_model=True,
+                channels_last_3d=False,
+            ),
+            "guided_compile_channels_last_3d": _build_model(
+                patch_size=patch_size,
+                device=device,
+                guide_checkpoint=str(guide_checkpoint),
+                guide_tokenbook_tokens=guide_tokenbook_tokens,
+                compile_model=True,
+                channels_last_3d=True,
+            ),
+        }
+
+        patch_summary: dict[str, object] = {}
+        for variant_name, model in variants.items():
+            variant_inputs = cpu_inputs
+            if variant_name.endswith("channels_last_3d"):
+                variant_inputs = cpu_inputs.contiguous(memory_format=torch.channels_last_3d)
+            patch_summary[variant_name] = _run_variant_benchmark(
+                model,
+                device=device,
+                cpu_inputs=variant_inputs,
+                cpu_labels=cpu_labels,
+                iterations=args.iterations,
+            )
+
+        patch_summary["guided_eager_stage_breakdown_ms"] = _profile_guided_stages(
+            variants["guided_eager"],
+            device=device,
+            cpu_inputs=cpu_inputs,
+            iterations=args.iterations,
+        )
+        summary["results"][patch_label] = patch_summary
 
     payload = json.dumps(summary, indent=2, sort_keys=True)
     if args.output is not None:
