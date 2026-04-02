@@ -46,6 +46,7 @@ def _make_mgr(
     guide_tokenbook_prototype_weighting: str = "mean",
     guide_tokenbook_weight_mlp_hidden: int | None = None,
 ) -> SimpleNamespace:
+    benchmark_features_per_stage = [16, 32, 64, 128, 192]
     guided_config = {}
     if guide_checkpoint is not None:
         guided_config = {
@@ -61,6 +62,8 @@ def _make_mgr(
                 guided_config["guide_tokenbook_tokens"] = int(guide_tokenbook_tokens)
             if guide_tokenbook_weight_mlp_hidden is not None:
                 guided_config["guide_tokenbook_weight_mlp_hidden"] = int(guide_tokenbook_weight_mlp_hidden)
+        else:
+            guided_config["guide_skip_concat_projector_channels"] = [max(1, int(ch) // 4) for ch in benchmark_features_per_stage]
 
     return SimpleNamespace(
         targets={"ink": {"out_channels": 2, "activation": "none"}},
@@ -72,7 +75,7 @@ def _make_mgr(
         enable_deep_supervision=False,
         spacing=(1.0, 1.0, 1.0),
         model_config={
-            "features_per_stage": [16, 32, 64, 128, 192],
+            "features_per_stage": benchmark_features_per_stage,
             "n_stages": 5,
             "n_blocks_per_stage": [1, 1, 1, 1, 1],
             "n_conv_per_stage_decoder": [1, 1, 1, 1],
@@ -335,13 +338,14 @@ def _profile_guided_stages(
                 with _autocast_context(device):
                     projected_features = []
                     for stage_idx, stage_key in enumerate(model.guide_stage_keys or []):
-                        projected = F.interpolate(
-                            guide_features,
-                            size=stage_shapes[stage_idx],
-                            mode="trilinear",
-                            align_corners=False,
-                        )
-                        projected = model.guide_skip_projectors[stage_key](projected)
+                        projected = model.guide_skip_projectors[stage_key](guide_features)
+                        if projected.shape[2:] != stage_shapes[stage_idx]:
+                            projected = F.interpolate(
+                                projected,
+                                size=stage_shapes[stage_idx],
+                                mode="trilinear",
+                                align_corners=False,
+                            )
                         projected_features.append(projected)
                     return projected_features
 

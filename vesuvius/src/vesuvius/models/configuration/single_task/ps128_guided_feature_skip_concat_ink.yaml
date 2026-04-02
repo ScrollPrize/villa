@@ -22,6 +22,7 @@ model_config:
   guide_backbone: "/home/giorgio/Projects/dino-vesuvius/dino-checkpoints/checkpoint_step_342500.pt"
   guide_fusion_stage: "feature_skip_concat"
   guide_compile_policy: "all_guidance"
+  guide_skip_concat_projector_channels: [8, 16, 32, 64, 80]
   guide_freeze: true
 
 dataset_config:
