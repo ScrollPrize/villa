@@ -890,18 +890,12 @@ void Volume::pinCoarsestLevel(bool blocking)
     if (!tieredCache_ || zarrDs_.empty()) return;
 
     int last = static_cast<int>(zarrDs_.size()) - 1;
-    vc::VcDataset* ds = zarrDataset(last);
-    if (!ds) return;
+    tieredCache_->loadCoarseLevel(last);
 
-    const auto& shape = ds->shape();
-    const auto& chunks = ds->defaultChunkShape();
-    std::array<int, 3> gridDims = {
-        static_cast<int>((shape[0] + chunks[0] - 1) / chunks[0]),
-        static_cast<int>((shape[1] + chunks[1] - 1) / chunks[1]),
-        static_cast<int>((shape[2] + chunks[2] - 1) / chunks[2])
-    };
-    tieredCache_->pinLevel(last, gridDims, blocking);
-
+    // Scan the coarsest level for all-zero chunks and propagate
+    // zero-knowledge to all finer levels. This eliminates network requests
+    // for chunks in masked/padded regions of the volume.
+    tieredCache_->propagateZeroChunks(last);
     if (blocking) {
         computeDataBounds();
     }
@@ -1221,7 +1215,14 @@ void Volume::prefetchLevels(int fromLevel, int toLevel)
     // Spawn a detached background thread — never blocks the GUI
     std::thread([cache = tieredCache_.get(), fromLevel, toLevel, &stop = prefetchStop_]() {
         stop.store(false, std::memory_order_relaxed);
-        for (int lvl = toLevel; lvl >= fromLevel && !stop.load(std::memory_order_relaxed); lvl--) {
+
+        // Load the coarsest level into dedicated flat storage, then scan for
+        // all-zero chunks and propagate to finer levels.
+        // This eliminates network requests for chunks in masked/padded regions.
+        cache->loadCoarseLevel(toLevel);
+        cache->propagateZeroChunks(toLevel);
+
+        for (int lvl = toLevel - 1; lvl >= fromLevel && !stop.load(std::memory_order_relaxed); lvl--) {
             auto ls = cache->levelShape(lvl);
             auto cs = cache->chunkShape(lvl);
             int gridZ = (ls[0] + cs[0] - 1) / cs[0];

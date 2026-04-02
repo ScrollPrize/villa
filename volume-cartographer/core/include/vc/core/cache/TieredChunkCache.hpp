@@ -32,7 +32,8 @@ namespace vc::cache {
 // Promotion path:  ice → cold → hot  (decompression inline on IO thread)
 // Eviction:        hot entries removed (cold still has on-disk copy).
 //
-// The coarsest pyramid level is pinned in the hot tier and never evicted.
+// The coarsest pyramid level is stored in a dedicated flat array
+// (coarseData_) that is always in memory — no cache lookup or eviction.
 // This guarantees getBestAvailable() always returns data.
 //
 // Thread safety:
@@ -72,7 +73,7 @@ public:
     // Returns the best available data, searching from the requested level
     // up to the coarsest. Returns {data, actualLevel}.
     // The coarsest level is always pinned hot, so this never returns nullptr
-    // (after pinLevel() has been called).
+    // (after loadCoarseLevel() has been called).
     [[nodiscard]] std::pair<ChunkDataPtr, int> getBestAvailable(const ChunkKey& key);
 
     // --- Blocking reads ---
@@ -98,16 +99,24 @@ public:
     using PrefetchProgressCb = std::function<void(int fetched, int total)>;
     void prefetchLevel(int level, PrefetchProgressCb progressCb = nullptr);
 
+    // Scan the coarsest level for all-zero chunks and propagate zero-knowledge
+    // to all finer levels by adding descendant keys to the negative cache.
+    // Call after loadCoarseLevel(). Eliminates network requests for chunks
+    // that are known-empty from the parent pyramid level.
+    void propagateZeroChunks(int coarseLevel);
+
     // Cancel all pending (not in-flight) prefetch tasks.
     void cancelPendingPrefetch();
 
     // --- Cache management ---
 
-    // Pin all chunks at a pyramid level: load them into hot and mark non-evictable.
-    // gridDims: number of chunks along {z, y, x} at this level.
-    // blocking: if true, waits for all chunks to load.
-    void pinLevel(int level, const std::array<int, 3>& gridDims,
-                  bool blocking = true);
+    // Load the coarsest level into dedicated storage. Blocking.
+    // After this, getCoarse() returns data directly without cache lookup.
+    void loadCoarseLevel(int level);
+
+    // Direct access to coarsest level data. Returns nullptr if not loaded
+    // or out of range.
+    [[nodiscard]] ChunkDataPtr getCoarse(const ChunkKey& key) const;
 
     // Clear hot tier. Does not touch cold/ice.
     void clearMemory();
@@ -199,7 +208,7 @@ private:
     utils::ShardedLRUCache<ChunkKey, ChunkDataPtr, ChunkKeyHash> hotCache_;
 
     [[nodiscard]] ChunkDataPtr hotGet(const ChunkKey& key);
-    void hotPut(const ChunkKey& key, ChunkDataPtr data, bool pinned = false);
+    void hotPut(const ChunkKey& key, ChunkDataPtr data);
 
     // --- Config (must be declared before ioPool_ for initialization order) ---
     Config config_;
@@ -234,9 +243,12 @@ private:
     void loadNegativeCache();
     void saveNegativeCache() const;
 
-    // --- Keys that should be pinned when they arrive in hot tier ---
-    std::mutex pinnedKeysMutex_;
-    std::unordered_set<ChunkKey, ChunkKeyHash> pendingPinKeys_;
+    // --- Dedicated storage for the coarsest pyramid level ---
+    // Always in memory, no cache lookup needed.
+    // Indexed by flattened (iz * gridY * gridX + iy * gridX + ix).
+    int coarseLevel_ = -1;
+    std::array<int, 3> coarseGrid_ = {0, 0, 0};
+    std::vector<ChunkDataPtr> coarseData_;
 
     // --- Promotion helpers ---
 

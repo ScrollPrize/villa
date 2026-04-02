@@ -141,14 +141,8 @@ TieredChunkCache::TieredChunkCache(
                 auto data = decompress_(compressed, key);
                 auto decompMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
                 if (data) {
-                    // Check if this key should be pinned
-                    bool shouldPin = false;
-                    {
-                        std::lock_guard plock(pinnedKeysMutex_);
-                        shouldPin = pendingPinKeys_.count(key) > 0;
-                    }
                     size_t decompBytes = data->totalBytes();
-                    hotPut(key, std::move(data), shouldPin);
+                    hotPut(key, std::move(data));
                     if (auto* log = cacheDebugLog())
                         std::fprintf(log, "COMPLETE hot-put lvl=%d (%d,%d,%d) decompBytes=%zu decomp=%ldms\n",
                                      key.level, key.iz, key.iy, key.ix, decompBytes, decompMs);
@@ -232,6 +226,10 @@ void TieredChunkCache::bloomClear()
 
 ChunkDataPtr TieredChunkCache::get(const ChunkKey& key)
 {
+    // Direct access for coarsest level — no cache lookup
+    auto coarse = getCoarse(key);
+    if (coarse) return coarse;
+
     // Check hot tier
     auto hot = hotGet(key);
     if (hot) {
@@ -267,6 +265,10 @@ std::pair<ChunkDataPtr, int> TieredChunkCache::getBestAvailable(
 
 ChunkDataPtr TieredChunkCache::getBlocking(const ChunkKey& key)
 {
+    // Direct access for coarsest level — no cache lookup
+    auto coarse = getCoarse(key);
+    if (coarse) return coarse;
+
     // Fast path: hot cache hit. This is the common case during rendering —
     // just hash + shard + shared_lock + flat-map probe + return.
     auto hot = hotGet(key);
@@ -397,57 +399,122 @@ void TieredChunkCache::cancelPendingPrefetch()
 }
 
 // =============================================================================
-// Pin level
+// Coarse level — dedicated flat storage
 // =============================================================================
 
-void TieredChunkCache::pinLevel(
-    int level,
-    const std::array<int, 3>& gridDims,
-    bool blocking)
+void TieredChunkCache::loadCoarseLevel(int level)
 {
-    std::vector<ChunkKey> keys;
-    for (int iz = 0; iz < gridDims[0]; iz++) {
-        for (int iy = 0; iy < gridDims[1]; iy++) {
-            for (int ix = 0; ix < gridDims[2]; ix++) {
-                keys.push_back({level, iz, iy, ix});
+    coarseLevel_ = level;
+    auto shape = levelShape(level);
+    auto chunks = chunkShape(level);
+    coarseGrid_ = {
+        (shape[0] + chunks[0] - 1) / chunks[0],
+        (shape[1] + chunks[1] - 1) / chunks[1],
+        (shape[2] + chunks[2] - 1) / chunks[2]
+    };
+    int total = coarseGrid_[0] * coarseGrid_[1] * coarseGrid_[2];
+    coarseData_.resize(total);
+
+    for (int iz = 0; iz < coarseGrid_[0]; iz++) {
+        for (int iy = 0; iy < coarseGrid_[1]; iy++) {
+            for (int ix = 0; ix < coarseGrid_[2]; ix++) {
+                ChunkKey key{level, iz, iy, ix};
+                auto data = getBlocking(key);
+                int idx = iz * coarseGrid_[1] * coarseGrid_[2] + iy * coarseGrid_[2] + ix;
+                coarseData_[idx] = std::move(data);
+            }
+        }
+    }
+    std::fprintf(stderr, "[Cache] loadCoarseLevel: level=%d grid=%dx%dx%d (%d chunks)\n",
+                 level, coarseGrid_[0], coarseGrid_[1], coarseGrid_[2], total);
+}
+
+ChunkDataPtr TieredChunkCache::getCoarse(const ChunkKey& key) const
+{
+    if (key.level != coarseLevel_ || coarseData_.empty()) return nullptr;
+    if (key.iz < 0 || key.iz >= coarseGrid_[0] ||
+        key.iy < 0 || key.iy >= coarseGrid_[1] ||
+        key.ix < 0 || key.ix >= coarseGrid_[2]) return nullptr;
+    int idx = key.iz * coarseGrid_[1] * coarseGrid_[2] + key.iy * coarseGrid_[2] + key.ix;
+    return coarseData_[idx];
+}
+
+void TieredChunkCache::propagateZeroChunks(int coarseLevel)
+{
+    if (coarseLevel < 0 || coarseLevel >= numLevels()) return;
+
+    auto coarseShape = levelShape(coarseLevel);
+    auto coarseChunks = chunkShape(coarseLevel);
+    int cGridZ = (coarseShape[0] + coarseChunks[0] - 1) / coarseChunks[0];
+    int cGridY = (coarseShape[1] + coarseChunks[1] - 1) / coarseChunks[1];
+    int cGridX = (coarseShape[2] + coarseChunks[2] - 1) / coarseChunks[2];
+
+    // Find all-zero chunks at the coarse level
+    std::vector<ChunkKey> zeroChunks;
+    for (int iz = 0; iz < cGridZ; iz++) {
+        for (int iy = 0; iy < cGridY; iy++) {
+            for (int ix = 0; ix < cGridX; ix++) {
+                ChunkKey key{coarseLevel, iz, iy, ix};
+                auto data = getCoarse(key);
+                if (!data) continue;  // not loaded, skip
+
+                // Check if chunk is all zeros
+                const auto* bytes = reinterpret_cast<const uint64_t*>(data->rawData());
+                size_t n8 = data->totalBytes() / 8;
+                bool allZero = true;
+                for (size_t i = 0; i < n8; i++) {
+                    if (bytes[i] != 0) { allZero = false; break; }
+                }
+                if (allZero) {
+                    for (size_t i = n8 * 8; i < data->totalBytes(); i++) {
+                        if (data->rawData()[i] != 0) { allZero = false; break; }
+                    }
+                }
+                if (allZero) {
+                    zeroChunks.push_back(key);
+                }
             }
         }
     }
 
-    if (blocking) {
-        // Load all chunks synchronously and pin them
-        int pinned = 0, failed = 0;
-        for (auto& key : keys) {
-            auto data = getBlocking(key);
-            if (data) {
-                // Re-insert as pinned
-                hotPut(key, std::move(data), /*pinned=*/true);
-                pinned++;
-            } else {
-                failed++;
-            }
-        }
-        if (auto* log = cacheDebugLog())
-            std::fprintf(log, "pinLevel: level=%d total=%zu pinned=%d failed=%d\n",
-                         level, keys.size(), pinned, failed);
-    } else {
-        // Register keys as pending pin, then submit for background loading
-        {
-            std::lock_guard lock(pinnedKeysMutex_);
-            for (auto& key : keys) {
-                pendingPinKeys_.insert(key);
-            }
-        }
-        for (auto& key : keys) {
-            auto data = hotGet(key);
-            if (!data) {
-                ioPool_.submit(key);
-            } else {
-                // Already in hot — just mark as pinned
-                hotPut(key, std::move(data), /*pinned=*/true);
+    if (zeroChunks.empty()) return;
+
+    // For each zero chunk at the coarse level, compute all descendant chunk
+    // keys at every finer level and add them to the negative cache.
+    // Each coarse chunk covers a 2x region at the next finer level in each axis.
+    int totalNegated = 0;
+    {
+        std::unique_lock lock(negativeMutex_);
+        for (int lvl = coarseLevel - 1; lvl >= 0; lvl--) {
+            int scale = 1 << (coarseLevel - lvl);  // 2, 4, 8, ...
+            auto fineShape = levelShape(lvl);
+            auto fineChunks = chunkShape(lvl);
+            int fGridZ = (fineShape[0] + fineChunks[0] - 1) / fineChunks[0];
+            int fGridY = (fineShape[1] + fineChunks[1] - 1) / fineChunks[1];
+            int fGridX = (fineShape[2] + fineChunks[2] - 1) / fineChunks[2];
+
+            for (const auto& zk : zeroChunks) {
+                // This coarse chunk covers fine chunks [zk*scale .. (zk+1)*scale-1]
+                int fz0 = zk.iz * scale, fz1 = std::min(fz0 + scale, fGridZ);
+                int fy0 = zk.iy * scale, fy1 = std::min(fy0 + scale, fGridY);
+                int fx0 = zk.ix * scale, fx1 = std::min(fx0 + scale, fGridX);
+
+                for (int fz = fz0; fz < fz1; fz++) {
+                    for (int fy = fy0; fy < fy1; fy++) {
+                        for (int fx = fx0; fx < fx1; fx++) {
+                            ChunkKey fineKey{lvl, fz, fy, fx};
+                            negativeCache_.insert(fineKey);
+                            bloomAdd(fineKey);
+                            totalNegated++;
+                        }
+                    }
+                }
             }
         }
     }
+
+    std::fprintf(stderr, "[Cache] propagateZeroChunks: %zu zero chunks at level %d → %d descendant keys negative-cached\n",
+                 zeroChunks.size(), coarseLevel, totalNegated);
 }
 
 // =============================================================================
@@ -607,14 +674,9 @@ ChunkDataPtr TieredChunkCache::hotGet(const ChunkKey& key)
     return hotCache_.get_or(key, nullptr);
 }
 
-void TieredChunkCache::hotPut(
-    const ChunkKey& key, ChunkDataPtr data, bool pinned)
+void TieredChunkCache::hotPut(const ChunkKey& key, ChunkDataPtr data)
 {
-    if (pinned) {
-        hotCache_.put_pinned(key, std::move(data));
-    } else {
-        hotCache_.put(key, std::move(data));
-    }
+    hotCache_.put(key, std::move(data));
 }
 
 // =============================================================================
@@ -671,6 +733,7 @@ ChunkDataPtr TieredChunkCache::loadFull(const ChunkKey& key)
 
 bool TieredChunkCache::isReadyForNonBlockingRead(const ChunkKey& key) const
 {
+    if (key.level == coarseLevel_ && !coarseData_.empty()) return true;
     if (hotCache_.contains(key)) return true;
 
     // Bloom filter fast-reject avoids the shared_mutex on the common path
