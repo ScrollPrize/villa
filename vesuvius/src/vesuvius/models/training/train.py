@@ -601,6 +601,48 @@ class BaseTrainer:
                 return b, True
         return 0, False
 
+    @staticmethod
+    def _detach_debug_tensors(data_dict):
+        detached = {}
+        for name, value in data_dict.items():
+            if isinstance(value, torch.Tensor):
+                detached[name] = value.detach().cpu()
+        return detached
+
+    def _capture_validation_debug_snapshot(self, inputs, targets_dict, outputs, aux_outputs, batch_index: int):
+        inputs_first = inputs[batch_index: batch_index + 1].detach().cpu()
+
+        targets_dict_first_all = {}
+        for t_name, t_val in targets_dict.items():
+            if isinstance(t_val, (list, tuple)):
+                targets_dict_first_all[t_name] = t_val[0][batch_index: batch_index + 1].detach().cpu()
+            else:
+                targets_dict_first_all[t_name] = t_val[batch_index: batch_index + 1].detach().cpu()
+
+        outputs_dict_first = {}
+        for t_name, p_val in outputs.items():
+            if isinstance(p_val, (list, tuple)):
+                outputs_dict_first[t_name] = p_val[0][batch_index: batch_index + 1].detach().cpu()
+            else:
+                outputs_dict_first[t_name] = p_val[batch_index: batch_index + 1].detach().cpu()
+
+        raw_aux_outputs_dict_first = self._detach_debug_tensors(
+            self._slice_aux_outputs_for_debug(aux_outputs, batch_index)
+        )
+
+        return {
+            "input": inputs_first,
+            "targets_all": targets_dict_first_all,
+            "outputs": outputs_dict_first,
+            "raw_aux_outputs": raw_aux_outputs_dict_first,
+        }
+
+    @staticmethod
+    def _select_validation_debug_snapshot_for_epoch(candidates, fallback, epoch: int):
+        if candidates:
+            return candidates[int(epoch) % len(candidates)]
+        return fallback
+
     def _prepare_aux_debug_outputs(self, aux_outputs, reference_input):
         if not aux_outputs or not isinstance(reference_input, torch.Tensor):
             return {}
@@ -2225,6 +2267,7 @@ class BaseTrainer:
                     debug_preview_image = None
                     debug_guide_preview_image = None
                     debug_preview_fallback = None
+                    debug_preview_candidates = []
                     
                     # Initialize evaluation metrics
                     evaluation_metrics = self._initialize_evaluation_metrics()
@@ -2278,94 +2321,19 @@ class BaseTrainer:
 
                         if debug_preview_image is None:
                                 b_idx, found_non_zero = self._select_debug_sample_index_from_targets(targets_dict)
+                                snapshot = self._capture_validation_debug_snapshot(
+                                    inputs,
+                                    targets_dict,
+                                    outputs,
+                                    getattr(self, "_current_aux_outputs", {}),
+                                    b_idx,
+                                )
 
                                 if i == 0:
-                                    debug_preview_fallback = (inputs, targets_dict, outputs, getattr(self, "_current_aux_outputs", {}), b_idx)
+                                    debug_preview_fallback = snapshot
 
                                 if found_non_zero:
-                                    # Slicing shape: [1, c, z, y, x ]
-                                    inputs_first = inputs[b_idx: b_idx + 1]
-
-                                    targets_dict_first_all = {}
-                                    for t_name, t_val in targets_dict.items():
-                                        if isinstance(t_val, (list, tuple)):
-                                            targets_dict_first_all[t_name] = t_val[0][b_idx: b_idx + 1]
-                                        else:
-                                            targets_dict_first_all[t_name] = t_val[b_idx: b_idx + 1]
-
-                                    outputs_dict_first = {}
-                                    for t_name, p_val in outputs.items():
-                                        if isinstance(p_val, (list, tuple)):
-                                            outputs_dict_first[t_name] = p_val[0][b_idx: b_idx + 1]
-                                        else:
-                                            outputs_dict_first[t_name] = p_val[b_idx: b_idx + 1]
-                                    raw_aux_outputs_dict_first = self._slice_aux_outputs_for_debug(
-                                        getattr(self, "_current_aux_outputs", {}),
-                                        b_idx,
-                                    )
-                                    aux_outputs_dict_first = self._prepare_aux_debug_outputs(
-                                        raw_aux_outputs_dict_first,
-                                        inputs_first,
-                                    )
-                                    # Use human-friendly 1-based epoch numbering in debug image filenames
-                                    debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch + 1}.gif"
-                                    guide_debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_guide_epoch{epoch + 1}.png"
-                                    
-                                    # handle skel data from skeleton-based losses
-                                    skeleton_dict = None
-                                    train_skeleton_dict = None
-                                    if 'skel' in targets_dict_first_all:
-                                        skeleton_dict = {'segmentation': targets_dict_first_all.get('skel')}
-                                    # Check if train_sample_targets_all exists (from earlier training step)
-                                    if 'train_sample_targets_all' in locals() and train_sample_targets_all and 'skel' in train_sample_targets_all:
-                                        train_skeleton_dict = {'segmentation': train_sample_targets_all.get('skel')}
-                                    
-                                    targets_dict_first = {}
-                                    for t_name, t_tensor in targets_dict_first_all.items():
-                                        if t_name not in ['skel', 'is_unlabeled']:
-                                            targets_dict_first[t_name] = t_tensor
-                                    
-                                    # Check for custom debug visualization (e.g., self-supervised trainers)
-                                    custom_debug_method = getattr(self, '_save_lejepa_debug', None)
-                                    save_debug_media = bool(getattr(self.mgr, 'save_gifs', True))
-                                    if custom_debug_method is not None and save_debug_media:
-                                        saved_path = custom_debug_method(debug_img_path, epoch)
-                                        if saved_path:
-                                            debug_gif_history.append((epoch, saved_path))
-                                    else:
-                                        # Get unlabeled debug samples if available (for semi-supervised trainers)
-                                        unlabeled_input = getattr(self, '_debug_unlabeled_input', None)
-                                        unlabeled_pseudo = getattr(self, '_debug_unlabeled_pseudo_label', None)
-                                        unlabeled_pred = getattr(self, '_debug_unlabeled_student_pred', None)
-
-                                        _, debug_preview_image = save_debug(
-                                            input_volume=inputs_first,
-                                            targets_dict=targets_dict_first,
-                                            outputs_dict=outputs_dict_first,
-                                            aux_outputs_dict=aux_outputs_dict_first,
-                                            tasks_dict=self.mgr.targets,
-                                            # dictionary, e.g. {"sheet": {"activation":"sigmoid"}, "normals": {"activation":"none"}}
-                                            epoch=epoch,
-                                            save_path=debug_img_path,
-                                            train_input=train_sample_input,
-                                            train_targets_dict=train_sample_targets,
-                                            train_outputs_dict=train_sample_outputs,
-                                            train_aux_outputs_dict=train_sample_aux_outputs,
-                                            skeleton_dict=skeleton_dict,
-                                            train_skeleton_dict=train_skeleton_dict,
-                                            unlabeled_input=unlabeled_input,
-                                            unlabeled_pseudo_dict=unlabeled_pseudo,
-                                            unlabeled_outputs_dict=unlabeled_pred,
-                                            save_media=save_debug_media,
-                                        )
-                                        debug_guide_preview_image = self._make_feature_encoder_guide_preview_image(
-                                            raw_aux_outputs_dict_first,
-                                            train_aux_outputs_dict=train_sample_raw_aux_outputs,
-                                        )
-                                        if save_debug_media and debug_guide_preview_image is not None:
-                                            self._save_preview_image(debug_guide_preview_image, guide_debug_img_path)
-                                        if save_debug_media:
-                                            debug_gif_history.append((epoch, debug_img_path))
+                                    debug_preview_candidates.append(snapshot)
 
                         loss_str = " | ".join([f"{t}: {np.mean(val_losses[t]):.4f}"
                                                for t in self.mgr.targets if len(val_losses[t]) > 0])
@@ -2373,22 +2341,17 @@ class BaseTrainer:
 
                         del outputs, inputs, targets_dict
 
-                    if debug_preview_image is None and debug_preview_fallback is not None:
-                        inputs, targets_dict, outputs, raw_aux_outputs, b_idx = debug_preview_fallback
-                        inputs_first = inputs[b_idx: b_idx + 1]
-                        targets_dict_first_all = {}
-                        for t_name, t_val in targets_dict.items():
-                            if isinstance(t_val, (list, tuple)):
-                                targets_dict_first_all[t_name] = t_val[0][b_idx: b_idx + 1]
-                            else:
-                                targets_dict_first_all[t_name] = t_val[b_idx: b_idx + 1]
-                        outputs_dict_first = {}
-                        for t_name, p_val in outputs.items():
-                            if isinstance(p_val, (list, tuple)):
-                                outputs_dict_first[t_name] = p_val[0][b_idx: b_idx + 1]
-                            else:
-                                outputs_dict_first[t_name] = p_val[b_idx: b_idx + 1]
-                        raw_aux_outputs_dict_first = self._slice_aux_outputs_for_debug(raw_aux_outputs, b_idx)
+                    selected_debug_snapshot = self._select_validation_debug_snapshot_for_epoch(
+                        debug_preview_candidates,
+                        debug_preview_fallback,
+                        epoch,
+                    )
+
+                    if debug_preview_image is None and selected_debug_snapshot is not None:
+                        inputs_first = selected_debug_snapshot["input"]
+                        targets_dict_first_all = selected_debug_snapshot["targets_all"]
+                        outputs_dict_first = selected_debug_snapshot["outputs"]
+                        raw_aux_outputs_dict_first = selected_debug_snapshot["raw_aux_outputs"]
                         aux_outputs_dict_first = self._prepare_aux_debug_outputs(
                             raw_aux_outputs_dict_first,
                             inputs_first,
