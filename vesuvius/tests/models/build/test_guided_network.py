@@ -255,6 +255,65 @@ def test_feature_skip_concat_decoder_contract_uses_augmented_skip_channels(tmp_p
     )
 
 
+def test_feature_skip_concat_projects_low_res_guide_features_before_upsampling(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_fusion_stage="feature_skip_concat",
+    )
+    model = NetworkFromConfig(mgr)
+
+    class _RecordingProjector(torch.nn.Module):
+        def __init__(self, out_channels: int):
+            super().__init__()
+            self.out_channels = out_channels
+            self.last_input_shape = None
+
+        def forward(self, x):
+            self.last_input_shape = tuple(x.shape)
+            return torch.ones(
+                x.shape[0],
+                self.out_channels,
+                x.shape[2],
+                x.shape[3],
+                x.shape[4],
+                device=x.device,
+                dtype=x.dtype,
+            )
+
+    model.guide_skip_projectors = torch.nn.ModuleDict(
+        {
+            "enc_0": _RecordingProjector(8),
+            "enc_1": _RecordingProjector(16),
+            "enc_2": _RecordingProjector(32),
+        }
+    )
+    low_res_guide = torch.randn(2, 48, 2, 2, 2)
+    model._compute_guide_features = lambda x: low_res_guide
+
+    encoder_features = [
+        torch.randn(2, 8, 16, 16, 16),
+        torch.randn(2, 16, 8, 8, 8),
+        torch.randn(2, 32, 4, 4, 4),
+    ]
+
+    augmented_features, aux = model._build_skip_concat_features(
+        torch.randn(2, 1, 16, 16, 16),
+        encoder_features,
+    )
+
+    assert aux == {}
+    assert [feature.shape for feature in augmented_features] == [
+        (2, 16, 16, 16, 16),
+        (2, 32, 8, 8, 8),
+        (2, 64, 4, 4, 4),
+    ]
+    for projector in model.guide_skip_projectors.values():
+        assert projector.last_input_shape == (2, 48, 2, 2, 2)
+
+
 def test_guided_network_backprop_updates_tokenbook_but_not_frozen_guide_backbone(tmp_path: Path):
     checkpoint_path = tmp_path / "guide_backbone.pt"
     _write_local_guide_checkpoint(checkpoint_path)

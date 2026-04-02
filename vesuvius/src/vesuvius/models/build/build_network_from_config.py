@@ -979,13 +979,14 @@ class NetworkFromConfig(nn.Module):
         guide_features = self._compute_guide_features(x)
         augmented_features = []
         for stage_idx, (stage_key, stage_feature) in enumerate(zip(self.guide_stage_keys or [], encoder_features)):
-            projected = F.interpolate(
-                guide_features,
-                size=stage_feature.shape[2:],
-                mode="trilinear",
-                align_corners=False,
-            )
-            projected = self.guide_skip_projectors[stage_key](projected)
+            projected = self.guide_skip_projectors[stage_key](guide_features)
+            if projected.shape[2:] != stage_feature.shape[2:]:
+                projected = F.interpolate(
+                    projected,
+                    size=stage_feature.shape[2:],
+                    mode="trilinear",
+                    align_corners=False,
+                )
             augmented_features.append(torch.cat([stage_feature, projected], dim=1))
         return augmented_features, {}
     
