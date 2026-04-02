@@ -309,6 +309,24 @@ def test_trainer_builds_only_standard_debug_payload_when_no_guide_preview():
     assert set(payload.keys()) == {"debug_image"}
 
 
+def test_attach_debug_media_to_wandb_metrics_includes_guide_image():
+    class _FakeWandb:
+        @staticmethod
+        def Image(value):
+            return ("image", value.shape)
+
+    metrics = {"epoch": 0, "step": 1}
+    payload = {
+        "debug_image": np.zeros((8, 8, 3), dtype=np.uint8),
+        "debug_guide_image": np.zeros((6, 10, 3), dtype=np.uint8),
+    }
+
+    result = BaseTrainer._attach_debug_media_to_wandb_metrics(metrics, payload, _FakeWandb)
+
+    assert result["debug_image"] == ("image", (8, 8, 3))
+    assert result["debug_guide_image"] == ("image", (6, 10, 3))
+
+
 def test_guided_base_trainer_omits_guide_loss_when_weight_is_zero(tmp_path: Path):
     data_root = _make_synthetic_dataset(tmp_path)
     guide_checkpoint = tmp_path / "guide_backbone.pt"
