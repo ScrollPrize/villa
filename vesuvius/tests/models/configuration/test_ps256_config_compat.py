@@ -67,6 +67,7 @@ def test_ps128_guided_feature_encoder_config_loads_and_builds_with_encoder_guida
     assert model.guide_enabled is True
     assert model.final_config["guide_fusion_stage"] == "feature_encoder"
     assert model.final_config["guide_stage_keys"] == ["enc_0", "enc_1", "enc_2", "enc_3", "enc_4"]
+    assert model.final_config["guide_tokenbook_prototype_weighting"] == "token_mlp"
 
 
 def test_ps256_guided_feature_encoder_medial_config_loads_and_builds():
@@ -78,6 +79,7 @@ def test_ps256_guided_feature_encoder_medial_config_loads_and_builds():
     assert model.guide_enabled is True
     assert model.final_config["guide_fusion_stage"] == "feature_encoder"
     assert model.final_config["guide_tokenbook_tokens"] == 256
+    assert model.final_config["guide_tokenbook_prototype_weighting"] == "token_mlp"
 
 
 def test_ps256_guided_feature_encoder_dicece_config_loads_and_builds():
@@ -89,3 +91,4 @@ def test_ps256_guided_feature_encoder_dicece_config_loads_and_builds():
     assert model.guide_enabled is True
     assert model.final_config["guide_fusion_stage"] == "feature_encoder"
     assert model.final_config["guide_tokenbook_tokens"] == 256
+    assert model.final_config["guide_tokenbook_prototype_weighting"] == "token_mlp"

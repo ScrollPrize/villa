@@ -802,6 +802,8 @@ class NetworkFromConfig(nn.Module):
             "guide_patch_grid": self.guide_patch_grid,
             "guide_stage_keys": list(self.guide_stage_keys) if self.guide_stage_keys is not None else None,
             "guide_tokenbook_tokens": getattr(self, "guide_tokenbook_tokens", None),
+            "guide_tokenbook_prototype_weighting": getattr(self, "guide_tokenbook_prototype_weighting", "mean"),
+            "guide_tokenbook_weight_mlp_hidden": getattr(self, "guide_tokenbook_weight_mlp_hidden", None),
             "guide_compile_policy": self.guide_compile_policy if self.guide_enabled else "off",
             "guide_fusion_stage": self.guide_fusion_stage if self.guide_enabled else None,
         }
@@ -846,12 +848,19 @@ class NetworkFromConfig(nn.Module):
             if token_count <= 0:
                 raise ValueError(f"guide_tokenbook_tokens must be > 0, got {token_count}")
         self.guide_tokenbook_tokens = token_count
+        prototype_weighting = str(
+            model_config.get("guide_tokenbook_prototype_weighting", "mean")
+        ).strip().lower()
+        self.guide_tokenbook_prototype_weighting = prototype_weighting
+        self.guide_tokenbook_weight_mlp_hidden = model_config.get("guide_tokenbook_weight_mlp_hidden")
         tokenbook_kwargs = {
             "n_tokens": token_count,
             "embed_dim": int(self.guide_backbone.embed_dim),
             "dropout": float(model_config.get("guide_tokenbook_dropout", 0.0)),
             "ema_decay": model_config.get("guide_tokenbook_ema_decay"),
             "use_ema": bool(model_config.get("guide_tokenbook_use_ema", False)),
+            "prototype_weighting": prototype_weighting,
+            "weight_mlp_hidden": self.guide_tokenbook_weight_mlp_hidden,
         }
         if self._guide_uses_input_gating():
             self.guide_tokenbook = TokenBook3D(**tokenbook_kwargs)

@@ -43,6 +43,8 @@ def _make_mgr(
     guide_checkpoint: str | None,
     guide_tokenbook_tokens: int | None = None,
     guide_fusion_stage: str | None = None,
+    guide_tokenbook_prototype_weighting: str = "mean",
+    guide_tokenbook_weight_mlp_hidden: int | None = None,
 ) -> SimpleNamespace:
     guided_config = {}
     if guide_checkpoint is not None:
@@ -50,11 +52,14 @@ def _make_mgr(
             "guide_backbone": str(guide_checkpoint),
             "guide_freeze": True,
             "guide_tokenbook_sample_rate": 1.0,
+            "guide_tokenbook_prototype_weighting": str(guide_tokenbook_prototype_weighting),
         }
         if guide_fusion_stage is not None:
             guided_config["guide_fusion_stage"] = str(guide_fusion_stage)
         if guide_tokenbook_tokens is not None:
             guided_config["guide_tokenbook_tokens"] = int(guide_tokenbook_tokens)
+        if guide_tokenbook_weight_mlp_hidden is not None:
+            guided_config["guide_tokenbook_weight_mlp_hidden"] = int(guide_tokenbook_weight_mlp_hidden)
 
     return SimpleNamespace(
         targets={"ink": {"out_channels": 2, "activation": "none"}},
@@ -93,6 +98,8 @@ def _build_model(
     guide_checkpoint: str | None,
     guide_tokenbook_tokens: int | None,
     guide_fusion_stage: str | None,
+    guide_tokenbook_prototype_weighting: str,
+    guide_tokenbook_weight_mlp_hidden: int | None,
     compile_model: bool,
     channels_last_3d: bool,
 ):
@@ -101,6 +108,8 @@ def _build_model(
         guide_checkpoint=guide_checkpoint,
         guide_tokenbook_tokens=guide_tokenbook_tokens,
         guide_fusion_stage=guide_fusion_stage,
+        guide_tokenbook_prototype_weighting=guide_tokenbook_prototype_weighting,
+        guide_tokenbook_weight_mlp_hidden=guide_tokenbook_weight_mlp_hidden,
     )
     model = NetworkFromConfig(mgr).to(device)
     if channels_last_3d:
@@ -352,6 +361,19 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--guide-tokenbook-tokens", type=str, default="full", help="'full' or integer prototype count.")
+    parser.add_argument(
+        "--guide-tokenbook-prototype-weighting",
+        type=str,
+        default="mean",
+        choices=["mean", "token_mlp"],
+        help="Prototype aggregation mode for guided variants.",
+    )
+    parser.add_argument(
+        "--guide-tokenbook-weight-mlp-hidden",
+        type=int,
+        default=None,
+        help="Hidden width for token-conditioned prototype weighting MLP.",
+    )
     parser.add_argument("--skip-compile-variants", action="store_true")
     parser.add_argument("--skip-stage-breakdown", action="store_true")
     parser.add_argument("--output", type=str, default=None)
@@ -377,6 +399,8 @@ def main() -> None:
         "warmup": args.warmup,
         "iterations": args.iterations,
         "guide_tokenbook_tokens": _label_name(guide_tokenbook_tokens),
+        "guide_tokenbook_prototype_weighting": args.guide_tokenbook_prototype_weighting,
+        "guide_tokenbook_weight_mlp_hidden": args.guide_tokenbook_weight_mlp_hidden,
         "results": {},
     }
 
@@ -390,6 +414,8 @@ def main() -> None:
             guide_checkpoint=str(guide_checkpoint),
             guide_tokenbook_tokens=guide_tokenbook_tokens,
             guide_fusion_stage="input",
+            guide_tokenbook_prototype_weighting=args.guide_tokenbook_prototype_weighting,
+            guide_tokenbook_weight_mlp_hidden=args.guide_tokenbook_weight_mlp_hidden,
             compile_model=False,
             channels_last_3d=False,
         )
@@ -399,6 +425,8 @@ def main() -> None:
             guide_checkpoint=str(guide_checkpoint),
             guide_tokenbook_tokens=guide_tokenbook_tokens,
             guide_fusion_stage="feature_encoder",
+            guide_tokenbook_prototype_weighting=args.guide_tokenbook_prototype_weighting,
+            guide_tokenbook_weight_mlp_hidden=args.guide_tokenbook_weight_mlp_hidden,
             compile_model=False,
             channels_last_3d=False,
         )
@@ -411,6 +439,8 @@ def main() -> None:
                 guide_checkpoint=None,
                 guide_tokenbook_tokens=None,
                 guide_fusion_stage=None,
+                guide_tokenbook_prototype_weighting="mean",
+                guide_tokenbook_weight_mlp_hidden=None,
                 compile_model=False,
                 channels_last_3d=False,
             ),
@@ -424,6 +454,8 @@ def main() -> None:
                 guide_checkpoint=str(guide_checkpoint),
                 guide_tokenbook_tokens=guide_tokenbook_tokens,
                 guide_fusion_stage="input",
+                guide_tokenbook_prototype_weighting=args.guide_tokenbook_prototype_weighting,
+                guide_tokenbook_weight_mlp_hidden=args.guide_tokenbook_weight_mlp_hidden,
                 compile_model=True,
                 channels_last_3d=False,
             )
@@ -433,6 +465,8 @@ def main() -> None:
                 guide_checkpoint=str(guide_checkpoint),
                 guide_tokenbook_tokens=guide_tokenbook_tokens,
                 guide_fusion_stage="input",
+                guide_tokenbook_prototype_weighting=args.guide_tokenbook_prototype_weighting,
+                guide_tokenbook_weight_mlp_hidden=args.guide_tokenbook_weight_mlp_hidden,
                 compile_model=True,
                 channels_last_3d=True,
             )
@@ -442,6 +476,8 @@ def main() -> None:
                 guide_checkpoint=str(guide_checkpoint),
                 guide_tokenbook_tokens=guide_tokenbook_tokens,
                 guide_fusion_stage="feature_encoder",
+                guide_tokenbook_prototype_weighting=args.guide_tokenbook_prototype_weighting,
+                guide_tokenbook_weight_mlp_hidden=args.guide_tokenbook_weight_mlp_hidden,
                 compile_model=True,
                 channels_last_3d=False,
             )
@@ -451,6 +487,8 @@ def main() -> None:
                 guide_checkpoint=str(guide_checkpoint),
                 guide_tokenbook_tokens=guide_tokenbook_tokens,
                 guide_fusion_stage="feature_encoder",
+                guide_tokenbook_prototype_weighting=args.guide_tokenbook_prototype_weighting,
+                guide_tokenbook_weight_mlp_hidden=args.guide_tokenbook_weight_mlp_hidden,
                 compile_model=True,
                 channels_last_3d=True,
             )

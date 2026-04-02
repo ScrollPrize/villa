@@ -16,6 +16,8 @@ class TokenBook3D(nn.Module):
         dropout: float = 0.0,
         ema_decay: float | None = None,
         use_ema: bool = False,
+        prototype_weighting: str = "mean",
+        weight_mlp_hidden: int | None = None,
     ) -> None:
         super().__init__()
         self.input_conv = nn.Conv3d(embed_dim, embed_dim, kernel_size=1, bias=True)
@@ -28,6 +30,24 @@ class TokenBook3D(nn.Module):
             self.register_buffer("book_ema", self.book.detach().clone())
         else:
             self.book_ema = None
+
+        self.prototype_weighting = str(prototype_weighting).strip().lower()
+        if self.prototype_weighting not in {"mean", "token_mlp"}:
+            raise ValueError(
+                "prototype_weighting must be one of {'mean', 'token_mlp'}"
+            )
+        self.prototype_weight_mlp = None
+        self.weight_mlp_hidden = None
+        if self.prototype_weighting == "token_mlp":
+            hidden = int(weight_mlp_hidden or embed_dim)
+            if hidden <= 0:
+                raise ValueError(f"weight_mlp_hidden must be > 0, got {hidden}")
+            self.weight_mlp_hidden = hidden
+            self.prototype_weight_mlp = nn.Sequential(
+                nn.Linear(int(embed_dim), hidden),
+                nn.GELU(),
+                nn.Linear(hidden, int(n_tokens)),
+            )
 
     @torch.no_grad()
     def _ema_update(self) -> None:
@@ -59,7 +79,11 @@ class TokenBook3D(nn.Module):
         if self.dropout > 0.0:
             similarities = F.dropout(similarities, p=self.dropout, training=self.training)
 
-        similarities = similarities.mean(dim=-1)
+        if self.prototype_weighting == "token_mlp":
+            prototype_weights = F.softmax(self.prototype_weight_mlp(tokens), dim=-1)
+            similarities = (similarities * prototype_weights).sum(dim=-1)
+        else:
+            similarities = similarities.mean(dim=-1)
 
         if token_mask is not None:
             token_mask = token_mask.to(device=similarities.device, dtype=similarities.dtype)

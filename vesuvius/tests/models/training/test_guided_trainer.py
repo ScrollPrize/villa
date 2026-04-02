@@ -76,6 +76,7 @@ def _make_mgr(
     *,
     guide_fusion_stage: str | None = None,
     guide_loss_weight: float = 0.5,
+    guide_tokenbook_prototype_weighting: str | None = None,
 ) -> SimpleNamespace:
     guided_model_config = {
         "features_per_stage": [8, 16, 32],
@@ -95,6 +96,8 @@ def _make_mgr(
     }
     if guide_fusion_stage is not None:
         guided_model_config["guide_fusion_stage"] = str(guide_fusion_stage)
+    if guide_tokenbook_prototype_weighting is not None:
+        guided_model_config["guide_tokenbook_prototype_weighting"] = str(guide_tokenbook_prototype_weighting)
 
     return SimpleNamespace(
         gpu_ids=None,
@@ -204,6 +207,7 @@ def test_feature_encoder_checkpoint_roundtrip_preserves_plain_inference_forward(
         guide_checkpoint,
         guide_fusion_stage="feature_encoder",
         guide_loss_weight=0.0,
+        guide_tokenbook_prototype_weighting="token_mlp",
     )
     trainer = BaseTrainer(mgr=mgr, verbose=False)
     model = trainer._build_model()
@@ -360,6 +364,7 @@ def test_feature_encoder_rejects_nonzero_guide_loss_weight(tmp_path: Path):
         guide_checkpoint,
         guide_fusion_stage="feature_encoder",
         guide_loss_weight=0.25,
+        guide_tokenbook_prototype_weighting="token_mlp",
     )
 
     with pytest.raises(ValueError, match="guide_loss_weight"):
@@ -391,6 +396,7 @@ def test_feature_encoder_aux_outputs_stay_out_of_debug_composite():
         Path("/tmp/guide_backbone.pt"),
         guide_fusion_stage="feature_encoder",
         guide_loss_weight=0.0,
+        guide_tokenbook_prototype_weighting="token_mlp",
     )
     trainer = BaseTrainer(mgr=mgr, verbose=False)
     aux_outputs_dict = {
@@ -412,6 +418,7 @@ def test_feature_encoder_trainer_builds_stage_montage_and_media_payload(tmp_path
         tmp_path / "guide_backbone.pt",
         guide_fusion_stage="feature_encoder",
         guide_loss_weight=0.0,
+        guide_tokenbook_prototype_weighting="token_mlp",
     )
     trainer = BaseTrainer(mgr=mgr, verbose=False)
     aux_outputs_dict = {
