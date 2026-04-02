@@ -210,7 +210,7 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     connect(_renderController, &TileRenderController::sceneNeedsUpdate,
             this, [this]() {
                 fGraphicsView->viewport()->update();
-                // Clear retained background once all tiles have content (O(1) check)
+                updateStatusLabel();
                 if (_tileScene->hasRetainedItems() && _tileScene->unfilledTileCount() <= 0) {
                     _tileScene->clearRetained();
                 }
