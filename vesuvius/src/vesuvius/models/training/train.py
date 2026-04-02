@@ -614,7 +614,25 @@ class BaseTrainer:
             return False
         return True
 
-    def _make_feature_encoder_guide_preview_image(self, aux_outputs_dict):
+    @staticmethod
+    def _stack_preview_rows(rows):
+        valid_rows = [row for row in rows if row is not None]
+        if not valid_rows:
+            return None
+        max_width = max(row.shape[1] for row in valid_rows)
+        padded_rows = []
+        for row in valid_rows:
+            if row.shape[1] < max_width:
+                row = np.pad(
+                    row,
+                    ((0, 0), (0, max_width - row.shape[1]), (0, 0)),
+                    mode="constant",
+                    constant_values=0,
+                )
+            padded_rows.append(np.ascontiguousarray(row, dtype=np.uint8))
+        return np.ascontiguousarray(np.vstack(padded_rows), dtype=np.uint8)
+
+    def _make_feature_encoder_guide_preview_row(self, aux_outputs_dict, *, row_prefix: str | None = None):
         if not aux_outputs_dict:
             return None
 
@@ -661,12 +679,18 @@ class BaseTrainer:
         for aux_name, preview in rendered_panels:
             if preview.shape[0] != max_height or preview.shape[1] != max_width:
                 preview = np.array(
-                    Image.fromarray(preview).resize((max_width, max_height), resample=Image.Resampling.NEAREST),
+                    Image.fromarray(preview).resize((max_width, max_height), resample=Image.Resampling.BILINEAR),
                     dtype=np.uint8,
                 )
-            labeled_panels.append(add_text_label(preview, aux_name))
+            label = aux_name if not row_prefix else f"{row_prefix} {aux_name}"
+            labeled_panels.append(add_text_label(preview, label))
 
         return np.ascontiguousarray(np.hstack(labeled_panels), dtype=np.uint8)
+
+    def _make_feature_encoder_guide_preview_image(self, aux_outputs_dict, *, train_aux_outputs_dict=None):
+        val_row = self._make_feature_encoder_guide_preview_row(aux_outputs_dict, row_prefix="Val")
+        train_row = self._make_feature_encoder_guide_preview_row(train_aux_outputs_dict, row_prefix="Train")
+        return self._stack_preview_rows([val_row, train_row])
 
     @staticmethod
     def _save_preview_image(preview_image, save_path):
@@ -2023,6 +2047,7 @@ class BaseTrainer:
             train_sample_targets = None
             train_sample_outputs = None
             train_sample_aux_outputs = None
+            train_sample_raw_aux_outputs = None
 
             print(f"Using optimizer : {optimizer.__class__.__name__}")
             print(f"Using scheduler : {scheduler.__class__.__name__} (per-iteration: {is_per_iteration_scheduler})")
@@ -2106,8 +2131,12 @@ class BaseTrainer:
                             train_sample_outputs[t_name] = p_val[0][b_idx: b_idx + 1]
                         else:
                             train_sample_outputs[t_name] = p_val[b_idx: b_idx + 1]
+                    train_sample_raw_aux_outputs = self._slice_aux_outputs_for_debug(
+                        getattr(self, "_current_aux_outputs", {}),
+                        b_idx,
+                    )
                     train_sample_aux_outputs = self._prepare_aux_debug_outputs(
-                        self._slice_aux_outputs_for_debug(getattr(self, "_current_aux_outputs", {}), b_idx),
+                        train_sample_raw_aux_outputs,
                         train_sample_input,
                     )
 
@@ -2326,7 +2355,8 @@ class BaseTrainer:
                                             save_media=save_debug_media,
                                         )
                                         debug_guide_preview_image = self._make_feature_encoder_guide_preview_image(
-                                            raw_aux_outputs_dict_first
+                                            raw_aux_outputs_dict_first,
+                                            train_aux_outputs_dict=train_sample_raw_aux_outputs,
                                         )
                                         if save_debug_media and debug_guide_preview_image is not None:
                                             self._save_preview_image(debug_guide_preview_image, guide_debug_img_path)
