@@ -264,7 +264,7 @@ def test_feature_encoder_guidance_supports_reduced_tokenbook_prototype_count(tmp
     assert set(aux.keys()) == {"enc_0", "enc_1", "enc_2"}
 
 
-@pytest.mark.parametrize("guide_compile_policy", ["off", "backbone_only", "tokenbook_only"])
+@pytest.mark.parametrize("guide_compile_policy", ["off", "backbone_only", "tokenbook_only", "all_guidance"])
 def test_guided_network_records_guide_compile_policy(tmp_path: Path, guide_compile_policy: str):
     checkpoint_path = tmp_path / "guide_backbone.pt"
     _write_local_guide_checkpoint(checkpoint_path)
@@ -277,6 +277,58 @@ def test_guided_network_records_guide_compile_policy(tmp_path: Path, guide_compi
 
     assert model.guide_compile_policy == guide_compile_policy
     assert model.final_config["guide_compile_policy"] == guide_compile_policy
+
+
+def test_guided_network_all_guidance_compile_policy_compiles_backbone_and_tokenbook(tmp_path: Path, monkeypatch):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_compile_policy="all_guidance",
+    )
+    model = NetworkFromConfig(mgr)
+    compiled_targets: list[str] = []
+
+    def _record_compile(module):
+        compiled_targets.append(type(module).__name__)
+        return module
+
+    monkeypatch.setattr(model, "_compile_module_in_place", _record_compile)
+
+    compiled_modules = model._compile_guidance_submodules(device_type="cuda")
+
+    assert compiled_modules == ["guide_backbone", "guide_tokenbook"]
+    assert compiled_targets == ["Dinov2Backbone", "TokenBook3D"]
+
+
+def test_feature_encoder_all_guidance_compile_policy_compiles_backbone_and_stage_tokenbooks(tmp_path: Path, monkeypatch):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_compile_policy="all_guidance",
+        guide_fusion_stage="feature_encoder",
+    )
+    model = NetworkFromConfig(mgr)
+    compiled_targets: list[str] = []
+
+    def _record_compile(module):
+        compiled_targets.append(type(module).__name__)
+        return module
+
+    monkeypatch.setattr(model, "_compile_module_in_place", _record_compile)
+
+    compiled_modules = model._compile_guidance_submodules(device_type="cuda")
+
+    assert compiled_modules == [
+        "guide_backbone",
+        "guide_tokenbook:enc_0",
+        "guide_tokenbook:enc_1",
+        "guide_tokenbook:enc_2",
+    ]
+    assert compiled_targets == ["Dinov2Backbone", "TokenBook3D", "TokenBook3D", "TokenBook3D"]
 
 
 def test_feature_encoder_guidance_records_exact_fusion_stage(tmp_path: Path):

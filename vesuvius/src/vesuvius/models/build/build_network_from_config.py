@@ -259,10 +259,10 @@ class NetworkFromConfig(nn.Module):
         self.guide_patch_grid = None
         self.guide_freeze = bool(model_config.get("guide_freeze", True))
         guide_compile_policy = str(model_config.get("guide_compile_policy", "off")).strip().lower()
-        if guide_compile_policy not in {"off", "backbone_only", "tokenbook_only"}:
+        if guide_compile_policy not in {"off", "backbone_only", "tokenbook_only", "all_guidance"}:
             raise ValueError(
                 "guide_compile_policy must be one of "
-                "{'off', 'backbone_only', 'tokenbook_only'}"
+                "{'off', 'backbone_only', 'tokenbook_only', 'all_guidance'}"
             )
         self.guide_compile_policy = guide_compile_policy
         # Determine if deep supervision is requested
@@ -823,13 +823,18 @@ class NetworkFromConfig(nn.Module):
             return []
 
         compiled_modules: list[str] = []
-        if self.guide_compile_policy == "backbone_only" and self.guide_backbone is not None:
+        compile_backbone = self.guide_compile_policy in {"backbone_only", "all_guidance"}
+        compile_tokenbooks = self.guide_compile_policy in {"tokenbook_only", "all_guidance"}
+
+        if compile_backbone and self.guide_backbone is not None:
             self.guide_backbone = self._compile_module_in_place(self.guide_backbone)
             compiled_modules.append("guide_backbone")
-        elif self.guide_compile_policy == "tokenbook_only" and self.guide_tokenbook is not None:
+
+        if compile_tokenbooks and self.guide_tokenbook is not None:
             self.guide_tokenbook = self._compile_module_in_place(self.guide_tokenbook)
             compiled_modules.append("guide_tokenbook")
-        elif self.guide_compile_policy == "tokenbook_only" and len(self.guide_stage_tokenbooks) > 0:
+
+        if compile_tokenbooks and len(self.guide_stage_tokenbooks) > 0:
             for stage_key in list(self.guide_stage_tokenbooks.keys()):
                 self.guide_stage_tokenbooks[stage_key] = self._compile_module_in_place(
                     self.guide_stage_tokenbooks[stage_key]
