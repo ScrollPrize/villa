@@ -29,7 +29,6 @@ from koine_machines.models.load_checkpoint import load_training_checkpoint_from_
 from koine_machines.evaluation.metrics.balanced_accuracy import BalancedAccuracy
 from koine_machines.evaluation.metrics.confusion import Confusion, ConfusionCounts
 from koine_machines.training.normal_pooling import (
-    RayFeatureHead,
     collate_normal_pooled_batch,
     pool_logits_along_normals,
 )
@@ -62,6 +61,13 @@ _NATIVE_3D_TRAINING_MODES = {"normal_pooled_3d", "full_3d"}
 
 def _is_native_3d_training_mode(mode):
     return str(mode).strip().lower() in _NATIVE_3D_TRAINING_MODES
+
+
+def _drop_normal_pooling_feature_head_config(config: dict) -> dict:
+    normal_pooling = config.get('normal_pooling')
+    if isinstance(normal_pooling, dict):
+        normal_pooling.pop('feature_head', None)
+    return normal_pooling if isinstance(normal_pooling, dict) else {}
 
 
 def _build_full_3d_preview_batch(
@@ -102,28 +108,20 @@ def _build_full_3d_preview_batch(
         ignore_mask[:, :, z_index],
     )
 
-def _forward_model_with_optional_shared_features(
+def _forward_model(
     model,
     image: torch.Tensor,
     model_crop_size,
     *,
-    capture_shared_features: bool,
     stitched: bool = True,
     use_gradient_checkpointing: bool = True,
 ):
-    if capture_shared_features:
-        model_output = model(image)
-        return model_output['ink'], model_output.get('shared_features')
-
-    return (
-        run_model_forward(
-            model,
-            image,
-            model_crop_size,
-            stitched=stitched,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-        ),
-        None,
+    return run_model_forward(
+        model,
+        image,
+        model_crop_size,
+        stitched=stitched,
+        use_gradient_checkpointing=use_gradient_checkpointing,
     )
 
 @click.command()
@@ -175,9 +173,7 @@ def train(config_path, profile_steps):
     mode = str(config.get('mode', 'flat')).strip().lower()
     native_3d_mode = _is_native_3d_training_mode(mode)
     normal_pooled_mode = mode == 'normal_pooled_3d'
-    pooling_config = config.get('normal_pooling') or {}
-    feature_head_config = pooling_config.get('feature_head') or {}
-    use_feature_head = normal_pooled_mode and bool(feature_head_config.get('enabled', False))
+    pooling_config = _drop_normal_pooling_feature_head_config(config)
     deep_supervision_enabled = bool(config.get('enable_deep_supervision', False))
     model_type = str(config.get('model_type', '')).strip().lower()
     
@@ -301,23 +297,6 @@ def train(config_path, profile_steps):
     )
 
     model = make_model(config)
-    if deep_supervision_enabled and use_feature_head:
-        raise ValueError(
-            "enable_deep_supervision is not supported with normal_pooling.feature_head because "
-            "deep supervision forces separate decoders and shared decoder features are unavailable"
-        )
-    if use_feature_head:
-        if not hasattr(model, 'shared_encoder'):
-            raise ValueError("normal_pooling.feature_head requires a model with shared_encoder output channels")
-        feature_in_channels = int(model.shared_encoder.output_channels[0])
-        model.normal_pooling_ray_head = RayFeatureHead(
-            in_channels=feature_in_channels,
-            bottleneck_channels=int(feature_head_config.get('bottleneck_channels', 16)),
-            hidden_channels=int(feature_head_config.get('hidden_channels', 32)),
-            pool_mode=str(feature_head_config.get('pool_mode', 'max')),
-            pool_temperature=float(feature_head_config.get('pool_temperature', 1.0)),
-        )
-        model.return_shared_features = True
     optimizer_target = model
     pretrained_backbone = (config.get('model_config') or {}).get('pretrained_backbone')
     freeze_encoder = False
@@ -444,7 +423,7 @@ def train(config_path, profile_steps):
             return torch.cat([image, surface_mask], dim=1)
         return image
 
-    def prepare_loss_inputs(preds, batch, profiler=None, feature_volume=None):
+    def prepare_loss_inputs(preds, batch, profiler=None):
         if isinstance(preds, (list, tuple)):
             loss_preds = []
             targets = None
@@ -454,7 +433,6 @@ def train(config_path, profile_steps):
                     pred_level,
                     batch,
                     profiler=profiler if idx == 0 else None,
-                    feature_volume=feature_volume if idx == 0 else None,
                 )
                 loss_preds.append(current_loss_preds)
                 if idx == 0:
@@ -480,32 +458,17 @@ def train(config_path, profile_steps):
                     pooling_dtype = preds.dtype
                     flat_points = batch['flat_points_local_zyx'].to(dtype=pooling_dtype)
                     flat_normals = batch['flat_normals_local_zyx'].to(dtype=pooling_dtype)
-                    if use_feature_head:
-                        if feature_volume is None:
-                            raise ValueError("normal_pooling.feature_head is enabled but feature_volume was not returned by the model")
-                        pooled_logits, pooled_valid = model.normal_pooling_ray_head(
-                            feature_volume.to(dtype=pooling_dtype),
-                            flat_points,
-                            flat_normals,
-                            batch['flat_valid'],
-                            neg_dist=float(pooling_config.get('neg_dist', 10.0)),
-                            pos_dist=float(pooling_config.get('pos_dist', 10.0)),
-                            sample_step=float(pooling_config.get('sample_step', 0.5)),
-                            align_corners=True,
-                            timer=(profiler.section if profiler is not None else None),
-                        )
-                    else:
-                        pooled_logits, pooled_valid = pool_logits_along_normals(
-                            preds,
-                            flat_points,
-                            flat_normals,
-                            batch['flat_valid'],
-                            neg_dist=float(pooling_config.get('neg_dist', 10.0)),
-                            pos_dist=float(pooling_config.get('pos_dist', 10.0)),
-                            sample_step=float(pooling_config.get('sample_step', 0.5)),
-                            align_corners=True,
-                            timer=(profiler.section if profiler is not None else None),
-                        )
+                    pooled_logits, pooled_valid = pool_logits_along_normals(
+                        preds,
+                        flat_points,
+                        flat_normals,
+                        batch['flat_valid'],
+                        neg_dist=float(pooling_config.get('neg_dist', 10.0)),
+                        pos_dist=float(pooling_config.get('pos_dist', 10.0)),
+                        sample_step=float(pooling_config.get('sample_step', 0.5)),
+                        align_corners=True,
+                        timer=(profiler.section if profiler is not None else None),
+                    )
                 targets_section = profiler.section('normal_pooling/build_targets_and_ignore_mask', preds.device) if profiler is not None else nullcontext()
                 with targets_section:
                     targets = batch['flat_target']
@@ -579,11 +542,10 @@ def train(config_path, profile_steps):
             forward_section = normal_pooling_profiler.section('model/forward', accelerator.device) if normal_pooling_profiler.enabled else nullcontext()
             with forward_section:
                 with accelerator.autocast():
-                    preds, feature_volume = _forward_model_with_optional_shared_features(
+                    preds = _forward_model(
                         model,
                         get_model_input(batch),
                         model_crop_size,
-                        capture_shared_features=use_feature_head,
                         stitched=use_stitched_forward,
                         use_gradient_checkpointing=stitched_gradient_checkpointing,
                     )
@@ -591,7 +553,6 @@ def train(config_path, profile_steps):
                 preds,
                 batch,
                 profiler=normal_pooling_profiler if normal_pooling_profiler.enabled else None,
-                feature_volume=feature_volume,
             )
             primary_loss_preds = loss_preds[0] if isinstance(loss_preds, (list, tuple)) else loss_preds
             loss_section = normal_pooling_profiler.section('normal_pooling/loss', primary_loss_preds.device) if normal_pooling_profiler.enabled else nullcontext()
@@ -737,18 +698,16 @@ def train(config_path, profile_steps):
                 for val_batch_idx in range(num_val_batches):
                     val_batch = next(val_iterator)
                     with accelerator.autocast():
-                        val_preds, val_feature_volume = _forward_model_with_optional_shared_features(
+                        val_preds = _forward_model(
                             model,
                             get_model_input(val_batch),
                             model_crop_size,
-                            capture_shared_features=use_feature_head,
                             stitched=use_stitched_forward,
                             use_gradient_checkpointing=stitched_gradient_checkpointing,
                         )
                     val_loss_preds, val_targets, val_ignore_mask = prepare_loss_inputs(
                         val_preds,
                         val_batch,
-                        feature_volume=val_feature_volume,
                     )
                     primary_val_loss_preds = val_loss_preds[0] if isinstance(val_loss_preds, (list, tuple)) else val_loss_preds
                     preview_preds = primary_val_loss_preds
@@ -799,18 +758,16 @@ def train(config_path, profile_steps):
                     )
                     if ema_model is not None and ema_validate:
                         with accelerator.autocast():
-                            ema_val_preds, ema_val_feature_volume = _forward_model_with_optional_shared_features(
+                            ema_val_preds = _forward_model(
                                 ema_model,
                                 get_model_input(val_batch),
                                 model_crop_size,
-                                capture_shared_features=use_feature_head,
                                 stitched=use_stitched_forward,
                                 use_gradient_checkpointing=stitched_gradient_checkpointing,
                             )
                         ema_val_loss_preds, _, _ = prepare_loss_inputs(
                             ema_val_preds,
                             val_batch,
-                            feature_volume=ema_val_feature_volume,
                         )
                         ema_val_targets_with_ignore = build_deep_supervision_targets(val_targets, ema_val_loss_preds, mode='nearest')
                         ds_ignore = build_deep_supervision_targets(val_ignore_mask, ema_val_loss_preds, mode='nearest')
