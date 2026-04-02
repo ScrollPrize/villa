@@ -17,13 +17,7 @@ TileRenderController::TileRenderController(TileScene* tileScene, RenderPool* sha
     , _renderPool(sharedPool)
     , _viewportRenderer(&sharedPool->corePool())
 {
-    // Tick timer (~60 Hz) handles periodic work; started on-demand, auto-stops
-    // when idle to avoid burning CPU.
-    _tickTimer = new QTimer(this);
-    _tickTimer->setInterval(16);
-    connect(_tickTimer, &QTimer::timeout, this, &TileRenderController::tick);
-
-    // When a tile completes, wake the tick timer so it drains on the next cycle.
+    // When a tile completes, wake the tick so it drains on the next cycle.
     // RenderPool emits tileReady() from the core pool's ready callback.
     // Don't use _viewportRenderer.setTileReadyCallback() here — that would
     // overwrite the shared RenderPool's callback, breaking other controllers.
@@ -33,13 +27,14 @@ TileRenderController::TileRenderController(TileScene* tileScene, RenderPool* sha
 
 TileRenderController::~TileRenderController()
 {
-    _tickTimer->stop();
 }
 
 void TileRenderController::ensureTickRunning()
 {
-    if (!_tickTimer->isActive())
-        _tickTimer->start();
+    if (!_tickPending) {
+        _tickPending = true;
+        QTimer::singleShot(0, this, &TileRenderController::tick);
+    }
 }
 
 void TileRenderController::onCameraChanged(
@@ -181,6 +176,8 @@ bool TileRenderController::syncTilesToScene()
 
 void TileRenderController::tick()
 {
+    _tickPending = false;
+
     // Delegate all scheduling, draining, and progressive refinement to ViewportRenderer.
     bool moreWork = _viewportRenderer.tick();
 
@@ -190,7 +187,7 @@ void TileRenderController::tick()
     if (anyUpdated)
         emit sceneNeedsUpdate();
 
-    // Auto-stop when idle
-    if (!moreWork)
-        _tickTimer->stop();
+    // Schedule next tick if there's more work
+    if (moreWork)
+        ensureTickRunning();
 }

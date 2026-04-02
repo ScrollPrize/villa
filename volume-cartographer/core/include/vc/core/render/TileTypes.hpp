@@ -47,7 +47,9 @@ struct ContentBounds {
 
     bool operator==(const ContentBounds& o) const {
         return firstWorldCol == o.firstWorldCol && firstWorldRow == o.firstWorldRow &&
-               totalCols == o.totalCols && totalRows == o.totalRows;
+               totalCols == o.totalCols && totalRows == o.totalRows &&
+               std::abs(worldTileSize - o.worldTileSize) < 0.001f &&
+               std::abs(scale - o.scale) < 1e-6f;
     }
     bool operator!=(const ContentBounds& o) const { return !(*this == o); }
 

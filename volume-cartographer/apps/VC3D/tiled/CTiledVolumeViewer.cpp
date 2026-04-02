@@ -243,15 +243,10 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     _lbl->setMinimumWidth(300);
     _lbl->move(10, 5);
 
-    _interactionSettleTimer = new QTimer(this);
-    _interactionSettleTimer->setSingleShot(true);
-    _interactionSettleTimer->setInterval(16);
-    connect(_interactionSettleTimer, &QTimer::timeout, this, &CTiledVolumeViewer::settleInteractionRender);
-
-    // Throttle intersection recomputation to ~5Hz during interaction
+    // Throttle intersection recomputation during interaction
     _intersectionThrottleTimer = new QTimer(this);
     _intersectionThrottleTimer->setSingleShot(true);
-    _intersectionThrottleTimer->setInterval(150);
+    _intersectionThrottleTimer->setInterval(1000);
     connect(_intersectionThrottleTimer, &QTimer::timeout, this, [this]() {
         if (_intersectionsDirty) {
             _intersectionsDirty = false;
@@ -263,11 +258,6 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     connect(&_intersectionFutureWatcher,
             &QFutureWatcher<std::vector<IntersectionPathEntry>>::finished,
             this, &CTiledVolumeViewer::onIntersectionComputeFinished);
-
-    // Momentum / kinetic scrolling timer (16ms = 60fps)
-    _momentumTimer = new QTimer(this);
-    _momentumTimer->setInterval(16);
-    connect(_momentumTimer, &QTimer::timeout, this, &CTiledVolumeViewer::momentumTick);
 
 }
 
@@ -530,32 +520,6 @@ void CTiledVolumeViewer::updateContentMinScale()
     // Scale at which content just fills viewport (fit, not cover)
     float fitScale = std::min(vpW / contentW, vpH / contentH);
     _contentMinScale = std::max(fitScale, TiledViewerCamera::MIN_SCALE);
-}
-
-void CTiledVolumeViewer::beginInteractionRender()
-{
-    _interactionQualityActive = true;
-    if (_interactionSettleTimer) {
-        _interactionSettleTimer->start();
-    }
-}
-
-void CTiledVolumeViewer::settleInteractionRender()
-{
-    if (!_interactionQualityActive) {
-        return;
-    }
-
-    _interactionQualityActive = false;
-    _camera.invalidate();
-    submitRender();
-    renderIntersections();
-    updateStatusLabel();
-}
-
-bool CTiledVolumeViewer::interactionRenderActive() const
-{
-    return _isPanning || _interactionQualityActive;
 }
 
 void CTiledVolumeViewer::rebuildContentGrid()
@@ -999,14 +963,6 @@ void CTiledVolumeViewer::resetSurfaceOffsets()
 void CTiledVolumeViewer::onPanStart(Qt::MouseButton /*buttons*/, Qt::KeyboardModifiers /*modifiers*/)
 {
     _isPanning = true;
-    // Cancel any active momentum
-    _momentumTimer->stop();
-    _momentumPanVx = _momentumPanVy = 0.0f;
-    _momentumZoomV = 0.0f;
-    _momentumSliceV = 0.0f;
-    if (_interactionSettleTimer) {
-        _interactionSettleTimer->stop();
-    }
     // The view handles pan tracking with _last_pan_position internally,
     // but since we disabled scrollbars, its scroll-based panning won't work.
     // We need to intercept the mouse move deltas instead.
@@ -1025,18 +981,11 @@ void CTiledVolumeViewer::onPanStart(Qt::MouseButton /*buttons*/, Qt::KeyboardMod
 void CTiledVolumeViewer::onPanRelease(Qt::MouseButton /*buttons*/, Qt::KeyboardModifiers /*modifiers*/)
 {
     _isPanning = false;
-
-    // Start momentum coasting if velocity is significant
-    float speed = std::sqrt(_momentumPanVx * _momentumPanVx + _momentumPanVy * _momentumPanVy);
-    if (speed > 2.0f) {
-        if (!_momentumTimer->isActive()) _momentumTimer->start();
-        // Don't settle yet — momentum tick will handle it
-    } else {
-        _momentumPanVx = _momentumPanVy = 0.0f;
-        // Settle directly instead of polling via timer
-        settleInteractionRender();
-        scheduleOverlayUpdate();
-    }
+    _camera.invalidate();
+    submitRender();
+    renderIntersections();
+    updateStatusLabel();
+    scheduleOverlayUpdate();
 }
 
 void CTiledVolumeViewer::onScrolled()
@@ -1119,9 +1068,9 @@ void CTiledVolumeViewer::submitRender()
     _ov.centerMarker->setPos(centerScene);
 
     auto buildParams = [this](const WorldTileKey& wk) { return buildRenderParams(wk); };
-    // During active interaction (pan, z-scroll), coalesce via scheduleRender
+    // During active interaction (pan), coalesce via scheduleRender
     // to avoid flooding the pool.  Other paths use direct onCameraChanged.
-    if (_isPanning || _interactionQualityActive) {
+    if (_isPanning) {
         _renderController->scheduleRender(_camera, surf, _volume, buildParams, vpRect);
     } else {
         _renderController->onCameraChanged(_camera, surf, _volume, buildParams, vpRect);
@@ -1169,7 +1118,7 @@ void CTiledVolumeViewer::submitRender()
             // Extended z-slice prefetch: bias in the scroll direction.
             // During active scrolling, prefetch further ahead in the
             // movement direction; when idle, prefetch symmetrically.
-            if (!_interactionQualityActive) {
+            if (!_isPanning) {
                 constexpr float PREFETCH_Z_BEHIND = 4.0f;
                 constexpr float PREFETCH_Z_AHEAD = 24.0f;
                 cv::Vec3f loZ = lo, hiZ = hi;
@@ -1279,7 +1228,7 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     params.worldKey = wk;
     params.epoch = _camera.epoch;
 
-    const bool interactionActive = interactionRenderActive();
+    const bool interactionActive = _isPanning;
 
     // Surface parameter ROI from world tile coordinates
     params.surfaceROI.x = wk.worldCol * _contentBounds.worldTileSize;
@@ -1391,8 +1340,6 @@ void CTiledVolumeViewer::onCursorMoveImpl(QPointF scene_loc,
             float pxDx = dx * _camera.scale;
             float pxDy = dy * _camera.scale;
             panByF(-pxDx, -pxDy);
-            _momentumPanVx = _momentumPanVx * 0.3f + (-pxDx) * 0.7f;
-            _momentumPanVy = _momentumPanVy * 0.3f + (-pxDy) * 0.7f;
         }
 
         const QPoint viewportPos = fGraphicsView->viewport()->mapFromGlobal(_lastPanPos);
@@ -1580,7 +1527,6 @@ void CTiledVolumeViewer::onPOIChanged(std::string name, POI* poi)
 
     if (name == "focus") {
         if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-            beginInteractionRender();
             const bool originChanged = (poi->p != plane->origin());
             if (originChanged) {
                 plane->setOrigin(poi->p);
@@ -2043,7 +1989,7 @@ void CTiledVolumeViewer::renderIntersections()
     // During active interaction, throttle intersection recomputation to ~5Hz.
     // The full rebuild (invalidateIntersect + computePlaneIntersections + new
     // QGraphicsPathItems) is expensive and causes visible line pop-in.
-    if (interactionRenderActive() && _intersectionThrottleTimer) {
+    if (_isPanning && _intersectionThrottleTimer) {
         _intersectionsDirty = true;
         if (!_intersectionThrottleTimer->isActive()) {
             _intersectionThrottleTimer->start();
@@ -2262,75 +2208,6 @@ void CTiledVolumeViewer::invalidateIntersect(const std::string& /*name*/)
         }
     }
     _ov.intersectItems.clear();
-}
-
-void CTiledVolumeViewer::momentumTick()
-{
-    constexpr float kDecay = 0.85f;     // 15% velocity loss per frame (~400ms to stop)
-    constexpr float kPanMin = 0.5f;     // stop pan below 0.5 px/frame
-    constexpr float kZoomMin = 0.01f;   // stop zoom below 0.01 steps/frame
-    constexpr float kSliceMin = 0.05f;  // stop slice below 0.05/frame
-
-    bool anyActive = false;
-
-    // Pan momentum
-    if (std::abs(_momentumPanVx) > kPanMin || std::abs(_momentumPanVy) > kPanMin) {
-        panByF(_momentumPanVx, _momentumPanVy);
-        _momentumPanVx *= kDecay;
-        _momentumPanVy *= kDecay;
-        anyActive = true;
-    } else {
-        _momentumPanVx = _momentumPanVy = 0.0f;
-    }
-
-    // Zoom momentum
-    if (std::abs(_momentumZoomV) > kZoomMin) {
-        // Accumulate fractional zoom steps
-        int zoomSteps = static_cast<int>(_momentumZoomV);
-        if (zoomSteps != 0) {
-            _momentumZoomV -= static_cast<float>(zoomSteps);
-            int dir = zoomSteps > 0 ? 1 : -1;
-            for (int i = 0; i < std::abs(zoomSteps); ++i)
-                zoomStepsAt(dir, _momentumZoomAnchor);
-        }
-        _momentumZoomV *= kDecay;
-        anyActive = true;
-    } else {
-        _momentumZoomV = 0.0f;
-    }
-
-    // Slice momentum
-    if (std::abs(_momentumSliceV) > kSliceMin) {
-        auto surf = _surfWeak.lock();
-        if (surf) {
-            PlaneSurface* plane = dynamic_cast<PlaneSurface*>(surf.get());
-            if (_surfName != "segmentation" && plane && _state) {
-                POI* focus = _state->poi("focus");
-                if (focus) {
-                    cv::Vec3f normal = plane->normal(cv::Vec3f(0, 0, 0), {});
-                    double len = cv::norm(normal);
-                    if (len > 0.0) normal *= static_cast<float>(1.0 / len);
-                    focus->p += normal * _momentumSliceV;
-                    _state->setPOI("focus", focus);
-                }
-            } else {
-                setSliceOffset(_momentumSliceV);
-            }
-        }
-        _momentumSliceV *= kDecay;
-        anyActive = true;
-    } else {
-        _momentumSliceV = 0.0f;
-    }
-
-    if (!anyActive) {
-        _momentumTimer->stop();
-        // Full quality settle
-        _interactionQualityActive = false;
-        _camera.invalidate();
-        submitRender();
-        scheduleOverlayUpdate();
-    }
 }
 
 void CTiledVolumeViewer::onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths)

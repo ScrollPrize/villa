@@ -16,7 +16,6 @@
 #include "TileRenderer.hpp"
 #include "vc/core/render/ViewportRenderer.hpp"
 
-class QTimer;
 class Surface;
 class Volume;
 
@@ -90,10 +89,10 @@ signals:
     void sceneNeedsUpdate();
 
 private slots:
-    // Unified tick: runs at ~60 Hz, handles all periodic work.
+    // Event-driven tick: scheduled via QTimer::singleShot(0) when there's work.
     void tick();
 
-    // Start the tick timer if not already running.
+    // Schedule a tick on the next event loop iteration if not already pending.
     void ensureTickRunning();
 
 private:
@@ -103,7 +102,7 @@ private:
 
     TileScene* _tileScene;
     RenderPool* _renderPool;  // shared, not owned
-    QTimer* _tickTimer;
+    bool _tickPending = false;
 
     vc::render::ViewportRenderer _viewportRenderer;
 

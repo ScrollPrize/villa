@@ -276,11 +276,6 @@ private:
     // Recompute dynamic minimum scale so content never appears smaller than viewport
     void updateContentMinScale();
 
-    // Temporarily lower render quality during active interaction, then
-    // restore full quality after a short idle period.
-    void beginInteractionRender();
-    void settleInteractionRender();
-    bool interactionRenderActive() const;
 
     // Returns true for axis-aligned viewer slots (xy/xz/yz plane, seg xz/yz)
     bool isAxisAlignedView() const;
@@ -427,8 +422,6 @@ private:
     QLabel* _lbl = nullptr;
     bool _dirtyWhileMinimized = false;
     bool _overlayUpdatePending = false;  // coalescing flag for scheduleOverlayUpdate()
-    bool _interactionQualityActive = false;
-    QTimer* _interactionSettleTimer = nullptr;
     QTimer* _intersectionThrottleTimer = nullptr;  // coalesces renderIntersections calls
     bool _intersectionsDirty = false;
 
@@ -488,12 +481,4 @@ private:
     // --- Visual zoom transform ---
     float _zoomBaseScale = 0.5f;       // camera.scale at start of current zoom
 
-    // --- Momentum / kinetic scrolling ---
-    QTimer* _momentumTimer = nullptr;
-    float _momentumPanVx = 0.0f, _momentumPanVy = 0.0f;   // pan velocity (px/frame)
-    float _momentumZoomV = 0.0f;                            // zoom velocity (steps/frame)
-    float _momentumSliceV = 0.0f;                           // slice velocity (slices/frame)
-    QPointF _momentumZoomAnchor;                            // zoom anchor point
-    std::chrono::steady_clock::time_point _lastWheelTime;
-    void momentumTick();
 };
