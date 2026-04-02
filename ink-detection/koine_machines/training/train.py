@@ -1,7 +1,6 @@
 import json
 import math
 import os
-from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 import wandb
@@ -31,10 +30,6 @@ from koine_machines.evaluation.metrics.confusion import Confusion, ConfusionCoun
 from koine_machines.training.normal_pooling import (
     collate_normal_pooled_batch,
     pool_logits_along_normals,
-)
-from koine_machines.training.profiling import (
-    NormalPoolingProfiler,
-    _BackwardProfileMarkers,
 )
 from koine_machines.training.deep_supervision import (
     DeepSupervisionWrapper,
@@ -126,14 +121,7 @@ def _forward_model(
 
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
-@click.option(
-    '--profile',
-    'profile_steps',
-    type=click.IntRange(min=1),
-    default=None,
-    help='Run only N training steps and print granular normal-pooling timings.',
-)
-def train(config_path, profile_steps):
+def train(config_path):
     with open(config_path, 'r') as f:
         config = json.load(f)
 
@@ -229,9 +217,6 @@ def train(config_path, profile_steps):
         dataloader_config=dataloader_config,
         kwargs_handlers=[ddp_kwargs],
     )
-    normal_pooling_profiler = NormalPoolingProfiler(
-        enabled=profile_steps is not None and normal_pooled_mode
-    )
 
     if 'wandb_project' in config and accelerator.is_main_process:
         wandb_kwargs = { 'project' : config['wandb_project'], 'entity'  : config['wandb_entity'], 'config'  : config}
@@ -257,7 +242,6 @@ def train(config_path, profile_steps):
     set_seed(config['seed'])
     dataset_config = deepcopy(config)
     dataset_config['patch_size'] = list(loader_patch_size)
-    dataset_config['profile_dataset'] = profile_steps is not None and normal_pooled_mode
 
     shared_ds = InkDataset(dataset_config, do_augmentations=False)
     if len(shared_ds.training_patches) == 0:
@@ -390,40 +374,22 @@ def train(config_path, profile_steps):
     validation_confusion_metric = Confusion()
     validation_balanced_accuracy_metric = BalancedAccuracy()
     
-    loop_start, loop_stop, progress_total, progress_initial = (
-        (start_step, config['num_iterations'], config['num_iterations'], start_step)
-        if profile_steps is None
-        else (start_step, start_step + profile_steps, profile_steps, 0)
-    )
     progress_bar = tqdm(
-        range(loop_start, loop_stop),
-        total=progress_total,
-        initial=progress_initial,
+        range(start_step, config['num_iterations']),
+        total=config['num_iterations'],
+        initial=start_step,
         disable=not accelerator.is_main_process,
         dynamic_ncols=True,
     )
 
     def get_model_input(batch):
         image = batch['image'].float()
-        if image.ndim == 4:
-            image = image.unsqueeze(1)
-        if image.ndim != 5:
-            raise ValueError(
-                f"Expected 'image' batch tensor with 4 or 5 dims, got shape {tuple(image.shape)}"
-            )
         if native_3d_mode:
             surface_mask = batch['surface_mask'].float()
-            if surface_mask.ndim == 4:
-                surface_mask = surface_mask.unsqueeze(1)
-            if surface_mask.shape != image.shape:
-                raise ValueError(
-                    f"Expected 'surface_mask' to match 'image' shape, got {tuple(surface_mask.shape)} "
-                    f"vs {tuple(image.shape)}"
-                )
             return torch.cat([image, surface_mask], dim=1)
         return image
 
-    def prepare_loss_inputs(preds, batch, profiler=None):
+    def prepare_loss_inputs(preds, batch):
         if isinstance(preds, (list, tuple)):
             loss_preds = []
             targets = None
@@ -432,7 +398,6 @@ def train(config_path, profile_steps):
                 current_loss_preds, current_targets, current_ignore_mask = prepare_loss_inputs(
                     pred_level,
                     batch,
-                    profiler=profiler if idx == 0 else None,
                 )
                 loss_preds.append(current_loss_preds)
                 if idx == 0:
@@ -441,50 +406,37 @@ def train(config_path, profile_steps):
             return type(preds)(loss_preds), targets, ignore_mask
 
         if normal_pooled_mode:
-            total_section = profiler.section('normal_pooling/total', preds.device) if profiler is not None else nullcontext()
-            with total_section:
-                crop_shape = tuple(int(v) for v in batch['image'].shape[-3:])
-                if tuple(int(v) for v in preds.shape[-3:]) != crop_shape:
-                    interpolate_section = profiler.section('normal_pooling/interpolate', preds.device) if profiler is not None else nullcontext()
-                    with interpolate_section:
-                        preds = F.interpolate(
-                            preds,
-                            size=crop_shape,
-                            mode='trilinear',
-                            align_corners=True,
-                        )
-                pool_section = profiler.section('normal_pooling/pool_logits_along_normals', preds.device) if profiler is not None else nullcontext()
-                with pool_section:
-                    pooling_dtype = preds.dtype
-                    flat_points = batch['flat_points_local_zyx'].to(dtype=pooling_dtype)
-                    flat_normals = batch['flat_normals_local_zyx'].to(dtype=pooling_dtype)
-                    pooled_logits, pooled_valid = pool_logits_along_normals(
-                        preds,
-                        flat_points,
-                        flat_normals,
-                        batch['flat_valid'],
-                        neg_dist=float(pooling_config.get('neg_dist', 10.0)),
-                        pos_dist=float(pooling_config.get('pos_dist', 10.0)),
-                        sample_step=float(pooling_config.get('sample_step', 0.5)),
-                        align_corners=True,
-                        timer=(profiler.section if profiler is not None else None),
-                    )
-                targets_section = profiler.section('normal_pooling/build_targets_and_ignore_mask', preds.device) if profiler is not None else nullcontext()
-                with targets_section:
-                    targets = batch['flat_target']
-                    ignore_mask = (
-                        (batch['flat_supervision'] <= 0)
-                        | (batch['flat_valid'] <= 0)
-                        | (pooled_valid <= 0)
-                    ).to(dtype=targets.dtype)
-                return pooled_logits, targets, ignore_mask
+            crop_shape = tuple(int(v) for v in batch['image'].shape[-3:])
+            if tuple(int(v) for v in preds.shape[-3:]) != crop_shape:
+                preds = F.interpolate(
+                    preds,
+                    size=crop_shape,
+                    mode='trilinear',
+                    align_corners=True,
+                )
+            pooling_dtype = preds.dtype
+            flat_points = batch['flat_points_local_zyx'].to(dtype=pooling_dtype)
+            flat_normals = batch['flat_normals_local_zyx'].to(dtype=pooling_dtype)
+            pooled_logits, pooled_valid = pool_logits_along_normals(
+                preds,
+                flat_points,
+                flat_normals,
+                batch['flat_valid'],
+                neg_dist=float(pooling_config.get('neg_dist', 10.0)),
+                pos_dist=float(pooling_config.get('pos_dist', 10.0)),
+                sample_step=float(pooling_config.get('sample_step', 0.5)),
+                align_corners=True,
+            )
+            targets = batch['flat_target']
+            ignore_mask = (
+                (batch['flat_supervision'] <= 0)
+                | (batch['flat_valid'] <= 0)
+                | (pooled_valid <= 0)
+            ).to(dtype=targets.dtype)
+            return pooled_logits, targets, ignore_mask
 
         if mode == 'full_3d':
             crop_shape = tuple(int(v) for v in batch['image'].shape[-3:])
-            if preds.ndim != 5:
-                raise ValueError(
-                    f"full_3d mode expects volumetric logits with shape [B, 1, Z, Y, X], got {tuple(preds.shape)}"
-                )
             if tuple(int(v) for v in preds.shape[-3:]) != crop_shape:
                 preds = F.interpolate(
                     preds,
@@ -518,99 +470,64 @@ def train(config_path, profile_steps):
         model.train()
         if frozen_encoder is not None:
             frozen_encoder.eval()
-        normal_pooling_profiler.start_step()
-
-        next_batch_section = normal_pooling_profiler.section('dataloader/next_batch', accelerator.device) if normal_pooling_profiler.enabled else nullcontext()
-        with next_batch_section:
-            try:
-                batch = next(train_iterator)
-            except StopIteration:
-                train_iterator = iter(train_dl)
-                batch = next(train_iterator)
-        if normal_pooling_profiler.enabled and batch.get('profile_timings'):
-            totals = {}
-            counts = {}
-            for sample_timings in batch['profile_timings']:
-                for name, duration_seconds in sample_timings.items():
-                    name = str(name)
-                    totals[name] = totals.get(name, 0.0) + float(duration_seconds)
-                    counts[name] = counts.get(name, 0) + 1
-            for name, total_duration in totals.items():
-                normal_pooling_profiler.add_duration(name, total_duration / counts[name])
+        try:
+            batch = next(train_iterator)
+        except StopIteration:
+            train_iterator = iter(train_dl)
+            batch = next(train_iterator)
 
         with accelerator.accumulate(model):
-            forward_section = normal_pooling_profiler.section('model/forward', accelerator.device) if normal_pooling_profiler.enabled else nullcontext()
-            with forward_section:
-                with accelerator.autocast():
-                    preds = _forward_model(
-                        model,
-                        get_model_input(batch),
-                        model_crop_size,
-                        stitched=use_stitched_forward,
-                        use_gradient_checkpointing=stitched_gradient_checkpointing,
-                    )
+            with accelerator.autocast():
+                preds = _forward_model(
+                    model,
+                    get_model_input(batch),
+                    model_crop_size,
+                    stitched=use_stitched_forward,
+                    use_gradient_checkpointing=stitched_gradient_checkpointing,
+                )
             loss_preds, targets, ignore_mask = prepare_loss_inputs(
                 preds,
                 batch,
-                profiler=normal_pooling_profiler if normal_pooling_profiler.enabled else None,
             )
             primary_loss_preds = loss_preds[0] if isinstance(loss_preds, (list, tuple)) else loss_preds
-            loss_section = normal_pooling_profiler.section('normal_pooling/loss', primary_loss_preds.device) if normal_pooling_profiler.enabled else nullcontext()
-            with loss_section:
-                targets_with_ignore = build_deep_supervision_targets(targets, loss_preds, mode='nearest')
-                ds_ignore = build_deep_supervision_targets(ignore_mask, loss_preds, mode='nearest')
-                targets_with_ignore = (
-                    type(targets_with_ignore)(
-                        torch.cat([target_level, ignore_level], dim=1)
-                        for target_level, ignore_level in zip(targets_with_ignore, ds_ignore)
-                    )
+            targets_with_ignore = build_deep_supervision_targets(targets, loss_preds, mode='nearest')
+            ds_ignore = build_deep_supervision_targets(ignore_mask, loss_preds, mode='nearest')
+            targets_with_ignore = (
+                type(targets_with_ignore)(
+                    torch.cat([target_level, ignore_level], dim=1)
+                    for target_level, ignore_level in zip(targets_with_ignore, ds_ignore)
+                )
+                if isinstance(targets_with_ignore, (list, tuple))
+                else torch.cat([targets_with_ignore, ds_ignore], dim=1)
+            )
+            l = loss(
+                type(loss_preds)(v.float() for v in loss_preds) if isinstance(loss_preds, (list, tuple)) else loss_preds.float(),
+                (
+                    type(targets_with_ignore)(v.float() for v in targets_with_ignore)
                     if isinstance(targets_with_ignore, (list, tuple))
-                    else torch.cat([targets_with_ignore, ds_ignore], dim=1)
-                )
-                l = loss(
-                    type(loss_preds)(v.float() for v in loss_preds) if isinstance(loss_preds, (list, tuple)) else loss_preds.float(),
-                    (
-                        type(targets_with_ignore)(v.float() for v in targets_with_ignore)
-                        if isinstance(targets_with_ignore, (list, tuple))
-                        else targets_with_ignore.float()
-                    ),
-                )
+                    else targets_with_ignore.float()
+                ),
+            )
             if not torch.isfinite(l):
                 raise RuntimeError(f"Non-finite loss at step {step}")
-            backward_markers = _BackwardProfileMarkers.create(
-                normal_pooling_profiler if normal_pooling_profiler.enabled else None,
-                preds=preds[0] if isinstance(preds, (list, tuple)) else preds,
-                loss_preds=primary_loss_preds,
-            )
-            if backward_markers is None:
-                backward_section = normal_pooling_profiler.section('train/backward_total', preds.device) if normal_pooling_profiler.enabled else nullcontext()
-                with backward_section:
-                    accelerator.backward(l)
-            else:
-                backward_markers.start()
-                try:
-                    accelerator.backward(l)
-                finally:
-                    backward_markers.finish()
-            optimizer_section = normal_pooling_profiler.section('train/optimizer_step', accelerator.device) if normal_pooling_profiler.enabled else nullcontext()
-            with optimizer_section:
-                if grad_clip is not None and grad_clip > 0 and accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                if accelerator.sync_gradients:
-                    optimizer_step += 1
-                    if ema_model is not None and optimizer_step >= ema_start_step:
-                        if (optimizer_step - ema_start_step) % ema_update_every_steps == 0:
-                            ema_state = ema_model.state_dict()
-                            for name, model_value in unwrapped_model.state_dict().items():
-                                ema_value = ema_state[name]
-                                model_value = model_value.detach()
-                                if torch.is_floating_point(ema_value):
-                                    ema_value.lerp_(model_value.to(dtype=ema_value.dtype), 1.0 - ema_decay)
-                                else:
-                                    ema_value.copy_(model_value)
+            accelerator.backward(l)
+            if grad_clip is not None and grad_clip > 0 and accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            if accelerator.sync_gradients:
+                optimizer_step += 1
+                if ema_model is not None and optimizer_step >= ema_start_step:
+                    if (optimizer_step - ema_start_step) % ema_update_every_steps == 0:
+                        ema_state = ema_model.state_dict()
+                        for name, model_value in unwrapped_model.state_dict().items():
+                            ema_value = ema_state[name]
+                            model_value = model_value.detach()
+                            if torch.is_floating_point(ema_value):
+                                ema_value.lerp_(model_value.to(dtype=ema_value.dtype), 1.0 - ema_decay)
+                            else:
+                                ema_value.copy_(model_value)
 
         train_loss = float(
             accelerator.reduce(l.detach().to(device=accelerator.device, dtype=torch.float32).reshape(()), reduction='mean').item()
@@ -871,9 +788,6 @@ def train(config_path, profile_steps):
             torch.save(checkpoint, f'{out_dir}/ckpt_{step:06}.pth')
 
     accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        for line in normal_pooling_profiler.summary_lines():
-            accelerator.print(line)
 
 if __name__ == '__main__':
     train()
