@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
+import yaml
 
 from vesuvius.models.build.transformers.patch_encode_decode import LayerNormNd, PatchDecode
 
@@ -91,11 +92,9 @@ class PrimusPatchDecodeDinov2Decoder(nn.Module):
 
 
 def _load_model_config(spec, input_channels):
-    checkpoint_path = Path(hf_hub_download(repo_id=spec["repo_id"], filename=spec["checkpoint"]))
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint_path, checkpoint = _resolve_checkpoint_path_and_payload(spec)
     config = _resolve_checkpoint_config(spec, checkpoint_path, checkpoint)
-    model_config = dict(config.get("model") or {})
-    dataset_config = config.get("dataset") or {}
+    model_config, dataset_config = _extract_model_and_dataset_config(config)
     if "global_crops_size" not in model_config and "global_crop_size" in dataset_config:
         model_config["global_crops_size"] = dataset_config["global_crop_size"]
     if "local_crops_size" not in model_config and "local_crop_size" in dataset_config:
@@ -104,48 +103,131 @@ def _load_model_config(spec, input_channels):
     return model_config, checkpoint_path, checkpoint
 
 
-def _load_json_config(path):
+def _resolve_checkpoint_path_and_payload(spec):
+    if "checkpoint_path" in spec:
+        checkpoint_path = Path(spec["checkpoint_path"]).expanduser().resolve()
+    else:
+        checkpoint_path = Path(hf_hub_download(repo_id=spec["repo_id"], filename=spec["checkpoint"]))
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return checkpoint_path, checkpoint
+
+
+def _extract_model_and_dataset_config(config):
+    if not isinstance(config, dict):
+        return {}, {}
+    if isinstance(config.get("model"), dict):
+        return dict(config["model"]), dict(config.get("dataset") or {})
+    return dict(config), {}
+
+
+def _load_config_file(path):
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        if path.suffix.lower() == ".json":
+            return json.load(f)
+        if path.suffix.lower() in {".yaml", ".yml"}:
+            return yaml.safe_load(f)
+    raise ValueError(f"Unsupported config file extension for DINOv2 checkpoint config: {path}")
+
+
+def _candidate_local_config_paths(checkpoint_path):
+    candidates = [
+        checkpoint_path.with_name("config.json"),
+        checkpoint_path.with_name("config.yaml"),
+        checkpoint_path.with_name("config.yml"),
+        checkpoint_path.with_suffix(".json"),
+        checkpoint_path.with_suffix(".yaml"),
+        checkpoint_path.with_suffix(".yml"),
+    ]
+    unique_candidates = []
+    seen = set()
+    for candidate in candidates:
+        candidate_str = str(candidate)
+        if candidate_str in seen:
+            continue
+        seen.add(candidate_str)
+        unique_candidates.append(candidate)
+    return unique_candidates
 
 
 def _resolve_checkpoint_config(spec, checkpoint_path, checkpoint):
     embedded_config = checkpoint.get("config")
-    if isinstance(embedded_config, dict) and isinstance(embedded_config.get("model"), dict):
+    if isinstance(embedded_config, dict):
         return embedded_config
 
-    sidecar_path = checkpoint_path.with_name("config.json")
-    if sidecar_path.exists():
-        return _load_json_config(sidecar_path)
+    for sidecar_path in _candidate_local_config_paths(checkpoint_path):
+        if sidecar_path.exists():
+            return _load_config_file(sidecar_path)
 
-    config_path = hf_hub_download(repo_id=spec["repo_id"], filename=spec["config"])
-    return _load_json_config(config_path)
+    if "repo_id" in spec:
+        config_path = Path(hf_hub_download(repo_id=spec["repo_id"], filename=spec["config"]))
+        return _load_config_file(config_path)
+
+    candidate_paths = ", ".join(str(path) for path in _candidate_local_config_paths(checkpoint_path))
+    raise ValueError(
+        f"Could not resolve DINOv2 config for local checkpoint '{checkpoint_path}'. "
+        f"Expected an embedded 'config' dict or one of: {candidate_paths}"
+    )
+
+
+def _extract_backbone_state(candidate_state):
+    if not isinstance(candidate_state, dict):
+        return None
+
+    for prefix in (
+        "backbone.",
+        "module.backbone.",
+        "_orig_mod.backbone.",
+        "module._orig_mod.backbone.",
+    ):
+        backbone_state = {
+            key.replace(prefix, "", 1): value
+            for key, value in candidate_state.items()
+            if key.startswith(prefix)
+        }
+        if backbone_state:
+            return backbone_state
+
+    nested_state = candidate_state.get("state_dict")
+    if isinstance(nested_state, dict):
+        return _extract_backbone_state(nested_state)
+
+    if all(isinstance(key, str) for key in candidate_state):
+        likely_backbone_keys = {"cls_token", "mask_token", "pos_embed", "patch_embed.proj.weight"}
+        if any(key in candidate_state for key in likely_backbone_keys):
+            return dict(candidate_state)
+
+    return None
 
 
 def _load_teacher_backbone_state(checkpoint):
     if isinstance(checkpoint, (str, Path)):
         checkpoint = torch.load(checkpoint, map_location="cpu", weights_only=False)
     for branch_name in ("teacher", "student"):
-        branch_state = checkpoint.get(branch_name)
-        if not isinstance(branch_state, dict):
-            continue
-        backbone_state = {
-            key.replace("backbone.", "", 1): value
-            for key, value in branch_state.items()
-            if key.startswith("backbone.")
-        }
+        backbone_state = _extract_backbone_state(checkpoint.get(branch_name))
         if backbone_state:
             return backbone_state
+    direct_backbone_state = _extract_backbone_state(checkpoint)
+    if direct_backbone_state:
+        return direct_backbone_state
     raise ValueError("Checkpoint does not contain teacher.backbone or student.backbone weights")
 
 
 def build_dinov2_backbone(name, input_channels, input_shape):
     del input_shape
-    if name not in _DINO_V2_PRETRAINED:
-        raise ValueError(
-            f"Unknown pretrained_backbone {name!r}. Expected one of: {', '.join(sorted(_DINO_V2_PRETRAINED))}"
-        )
-    spec = _DINO_V2_PRETRAINED[name]
+    spec = _DINO_V2_PRETRAINED.get(name)
+    if spec is None:
+        checkpoint_path = Path(name).expanduser()
+        if checkpoint_path.exists():
+            if checkpoint_path.is_dir():
+                raise ValueError(
+                    f"Local pretrained_backbone must point to a checkpoint file, not a directory: {checkpoint_path}"
+                )
+            spec = {"checkpoint_path": str(checkpoint_path)}
+        else:
+            raise ValueError(
+                f"Unknown pretrained_backbone {name!r}. Expected one of: "
+                f"{', '.join(sorted(_DINO_V2_PRETRAINED))}, or a local checkpoint path"
+            )
     model_config, checkpoint_path, checkpoint = _load_model_config(spec, input_channels)
     backbone = build_dinovol_2_backbone(model_config)
     backbone.load_pretrained_weights(_load_teacher_backbone_state(checkpoint), unchunk=True)
