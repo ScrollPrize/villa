@@ -51,15 +51,16 @@ def _make_mgr(
         guided_config = {
             "guide_backbone": str(guide_checkpoint),
             "guide_freeze": True,
-            "guide_tokenbook_sample_rate": 1.0,
-            "guide_tokenbook_prototype_weighting": str(guide_tokenbook_prototype_weighting),
         }
         if guide_fusion_stage is not None:
             guided_config["guide_fusion_stage"] = str(guide_fusion_stage)
-        if guide_tokenbook_tokens is not None:
-            guided_config["guide_tokenbook_tokens"] = int(guide_tokenbook_tokens)
-        if guide_tokenbook_weight_mlp_hidden is not None:
-            guided_config["guide_tokenbook_weight_mlp_hidden"] = int(guide_tokenbook_weight_mlp_hidden)
+        if guide_fusion_stage != "feature_skip_concat":
+            guided_config["guide_tokenbook_sample_rate"] = 1.0
+            guided_config["guide_tokenbook_prototype_weighting"] = str(guide_tokenbook_prototype_weighting)
+            if guide_tokenbook_tokens is not None:
+                guided_config["guide_tokenbook_tokens"] = int(guide_tokenbook_tokens)
+            if guide_tokenbook_weight_mlp_hidden is not None:
+                guided_config["guide_tokenbook_weight_mlp_hidden"] = int(guide_tokenbook_weight_mlp_hidden)
 
     return SimpleNamespace(
         targets={"ink": {"out_channels": 2, "activation": "none"}},

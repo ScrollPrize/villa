@@ -815,9 +815,9 @@ class NetworkFromConfig(nn.Module):
             "guide_patch_grid": self.guide_patch_grid,
             "guide_stage_keys": list(self.guide_stage_keys) if self.guide_stage_keys is not None else None,
             "guide_feature_gate_alpha": self.guide_feature_gate_alpha if self._guide_uses_encoder_feature_gating() else None,
-            "guide_tokenbook_tokens": getattr(self, "guide_tokenbook_tokens", None),
-            "guide_tokenbook_prototype_weighting": getattr(self, "guide_tokenbook_prototype_weighting", "mean"),
-            "guide_tokenbook_weight_mlp_hidden": getattr(self, "guide_tokenbook_weight_mlp_hidden", None),
+            "guide_tokenbook_tokens": getattr(self, "guide_tokenbook_tokens", None) if not self._guide_uses_skip_feature_concat() else None,
+            "guide_tokenbook_prototype_weighting": getattr(self, "guide_tokenbook_prototype_weighting", "mean") if not self._guide_uses_skip_feature_concat() else None,
+            "guide_tokenbook_weight_mlp_hidden": getattr(self, "guide_tokenbook_weight_mlp_hidden", None) if not self._guide_uses_skip_feature_concat() else None,
             "guide_compile_policy": self.guide_compile_policy if self.guide_enabled else "off",
             "guide_fusion_stage": self.guide_fusion_stage if self.guide_enabled else None,
         }

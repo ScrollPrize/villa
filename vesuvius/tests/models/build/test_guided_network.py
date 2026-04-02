@@ -180,6 +180,10 @@ def test_feature_skip_concat_forward_shapes_and_empty_aux_outputs(tmp_path: Path
     assert aux == {}
     assert list(model.guide_skip_projectors.keys()) == ["enc_0", "enc_1", "enc_2"]
     assert model.final_config["guide_fusion_stage"] == "feature_skip_concat"
+    assert model.final_config["guide_feature_gate_alpha"] is None
+    assert model.final_config["guide_tokenbook_tokens"] is None
+    assert model.final_config["guide_tokenbook_prototype_weighting"] is None
+    assert model.final_config["guide_tokenbook_weight_mlp_hidden"] is None
 
 
 def test_encoder_skip_only_feature_gating_uses_residual_alpha_formula():
@@ -450,6 +454,29 @@ def test_feature_skip_concat_records_exact_fusion_stage_and_no_alpha(tmp_path: P
 
     assert model.guide_fusion_stage == "feature_skip_concat"
     assert model.final_config["guide_fusion_stage"] == "feature_skip_concat"
+    assert model.final_config["guide_feature_gate_alpha"] is None
+    assert model.final_config["guide_tokenbook_tokens"] is None
+    assert model.final_config["guide_tokenbook_prototype_weighting"] is None
+    assert model.final_config["guide_tokenbook_weight_mlp_hidden"] is None
+
+
+def test_feature_skip_concat_ignores_stale_tokenbook_and_alpha_keys(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_fusion_stage="feature_skip_concat",
+        guide_tokenbook_tokens=17,
+        guide_tokenbook_prototype_weighting="token_mlp",
+        guide_feature_gate_alpha=0.9,
+    )
+    model = NetworkFromConfig(mgr)
+
+    assert model.guide_fusion_stage == "feature_skip_concat"
+    assert model.final_config["guide_tokenbook_tokens"] is None
+    assert model.final_config["guide_tokenbook_prototype_weighting"] is None
+    assert model.final_config["guide_tokenbook_weight_mlp_hidden"] is None
     assert model.final_config["guide_feature_gate_alpha"] is None
 
 
