@@ -52,6 +52,7 @@ from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage, p
 from .encoder import Encoder
 from .decoder import Decoder
 from .activations import SwiGLUBlock, GLUBlock
+from .simple_conv_blocks import ConvDropoutNormReLU
 from .guidance import TokenBook3D
 from .primus_wrapper import PrimusEncoder, PrimusDecoder
 
@@ -876,13 +877,19 @@ class NetworkFromConfig(nn.Module):
             self.guide_stage_keys = [f"enc_{stage_idx}" for stage_idx in range(self.num_stages)]
             self.guide_skip_projectors = nn.ModuleDict(
                 {
-                    stage_key: self.conv_op(
-                        int(self.guide_backbone.embed_dim),
-                        int(self.guide_skip_concat_projector_channels[stage_idx]),
+                    stage_key: ConvDropoutNormReLU(
+                        conv_op=self.conv_op,
+                        input_channels=int(self.guide_backbone.embed_dim),
+                        output_channels=int(self.guide_skip_concat_projector_channels[stage_idx]),
                         kernel_size=1,
                         stride=1,
-                        padding=0,
-                        bias=True,
+                        conv_bias=False,
+                        norm_op=self.norm_op,
+                        norm_op_kwargs=self.norm_op_kwargs,
+                        dropout_op=None,
+                        dropout_op_kwargs=None,
+                        nonlin=self.nonlin,
+                        nonlin_kwargs=self.nonlin_kwargs,
                     )
                     for stage_idx, stage_key in enumerate(self.guide_stage_keys)
                 }

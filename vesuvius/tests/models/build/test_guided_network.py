@@ -9,6 +9,7 @@ import torch
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.build.guidance import TokenBook3D
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
+from vesuvius.models.build.simple_conv_blocks import ConvDropoutNormReLU
 
 
 def _tiny_dinovol_model_config() -> dict:
@@ -182,6 +183,9 @@ def test_feature_skip_concat_forward_shapes_and_empty_aux_outputs(tmp_path: Path
     assert outputs["ink"].shape == (2, 1, 16, 16, 16)
     assert aux == {}
     assert list(model.guide_skip_projectors.keys()) == ["enc_0", "enc_1", "enc_2"]
+    assert all(isinstance(projector, ConvDropoutNormReLU) for projector in model.guide_skip_projectors.values())
+    assert all(projector.conv.bias is None for projector in model.guide_skip_projectors.values())
+    assert all(isinstance(projector.norm, model.norm_op) for projector in model.guide_skip_projectors.values())
     assert model.final_config["guide_fusion_stage"] == "feature_skip_concat"
     assert model.final_config["guide_feature_gate_alpha"] is None
     assert model.final_config["guide_skip_concat_projector_channels"] == [8, 16, 32]
@@ -254,7 +258,7 @@ def test_feature_skip_concat_decoder_contract_uses_augmented_skip_channels(tmp_p
     assert decoder.decoder_stage_output_channels == [16, 8]
     assert model.guide_stage_keys == ["enc_0", "enc_1", "enc_2"]
     assert all(
-        projector.out_channels == native_width
+        projector.output_channels == native_width
         for projector, native_width in zip(model.guide_skip_projectors.values(), [8, 16, 32])
     )
 
@@ -276,7 +280,9 @@ def test_feature_skip_concat_decoder_contract_uses_configured_projector_widths(t
     assert decoder.decoder_stage_input_channels == [16 + 20, 8 + 10]
     assert decoder.decoder_stage_output_channels == [16, 8]
     assert model.final_config["guide_skip_concat_projector_channels"] == [2, 4, 8]
-    assert [projector.out_channels for projector in model.guide_skip_projectors.values()] == [2, 4, 8]
+    assert [projector.output_channels for projector in model.guide_skip_projectors.values()] == [2, 4, 8]
+    assert all(projector.conv.bias is None for projector in model.guide_skip_projectors.values())
+    assert all(isinstance(projector.norm, model.norm_op) for projector in model.guide_skip_projectors.values())
 
 
 def test_feature_skip_concat_projects_low_res_guide_features_before_upsampling(tmp_path: Path):
@@ -655,7 +661,7 @@ def test_feature_skip_concat_all_guidance_compile_policy_compiles_backbone_and_p
     compiled_modules = model._compile_guidance_submodules(device_type="cuda")
 
     assert compiled_modules == ["guide_backbone", "guide_projector:enc_0", "guide_projector:enc_1", "guide_projector:enc_2"]
-    assert compiled_targets == ["Dinov2Backbone", "Conv3d", "Conv3d", "Conv3d"]
+    assert compiled_targets == ["Dinov2Backbone", "ConvDropoutNormReLU", "ConvDropoutNormReLU", "ConvDropoutNormReLU"]
 
 
 def test_guided_network_rejects_primus_architecture(tmp_path: Path):
