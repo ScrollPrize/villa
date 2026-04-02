@@ -711,6 +711,14 @@ class BaseTrainer:
             payload[key] = np.ascontiguousarray(image_to_log)
         return payload
 
+    @staticmethod
+    def _attach_debug_media_to_wandb_metrics(metrics, media_payload, wandb_module):
+        if "debug_image" in media_payload:
+            metrics["debug_image"] = wandb_module.Image(media_payload["debug_image"])
+        if "debug_guide_image" in media_payload:
+            metrics["debug_guide_image"] = wandb_module.Image(media_payload["debug_guide_image"])
+        return metrics
+
     # --- losses ---- #
     def _build_loss(self):
         loss_fns = {}
@@ -2322,8 +2330,11 @@ class BaseTrainer:
                             debug_preview_image=debug_preview_image,
                             guide_preview_image=debug_guide_preview_image,
                         )
-                        if "debug_image" in media_payload:
-                            val_metrics["debug_image"] = wandb.Image(media_payload["debug_image"])
+                        val_metrics = self._attach_debug_media_to_wandb_metrics(
+                            val_metrics,
+                            media_payload,
+                            wandb,
+                        )
 
                         wandb.log(val_metrics)
 
