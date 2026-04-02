@@ -259,7 +259,13 @@ class InkDataset(Dataset):
             supervision_crop = None
             resample_idx = None
             resample_warning_message = None
-
+            
+            # this entire if block only applies if you're using a "3d" mode. it samples the supervision in 2d 'flat' space,
+            # and extracts the crop using the same patch finding as the 2d patch finding code. the result of this is that sometimes this patch
+            # does not occupy the full 3d crop (or more than the full 3d crop). we handle this by either padding (adding adjacent quads until we reach crop size)
+            # or by cropping. the supervision mask is built by first doing a 3d connected components on the surface voxels, and then filtering once again to the 2d
+            # connected components "in crop". the first may be unnecessary.
+            # the conditioning is a edt clipped to a dist of 10
             if _is_native_3d_mode(self.mode):
                 image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
                 supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
@@ -399,6 +405,8 @@ class InkDataset(Dataset):
                                     full_3d_config.get('supervision_dilation_distance', 0.0)
                                 ),
                             )
+            
+            # for pooled 2d, this is the only block that applies (outside of potential resampling)
             else:
                 image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
                 supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
