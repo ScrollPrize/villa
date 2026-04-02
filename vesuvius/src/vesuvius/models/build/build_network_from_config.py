@@ -259,6 +259,7 @@ class NetworkFromConfig(nn.Module):
         self.guide_skip_projectors = nn.ModuleDict()
         self.guide_stage_keys = None
         self.guide_patch_grid = None
+        self.guide_skip_concat_projector_channels = None
         self.guide_feature_gate_alpha = 1.0
         self.guide_freeze = bool(model_config.get("guide_freeze", True))
         guide_compile_policy = str(model_config.get("guide_compile_policy", "off")).strip().lower()
@@ -689,6 +690,8 @@ class NetworkFromConfig(nn.Module):
             squeeze_excitation_add_maxpool=model_config.get("squeeze_excitation_add_maxpool", False),
             pool_type=model_config.get("pool_type", "conv")
         )
+        if self._guide_uses_skip_feature_concat():
+            self.guide_skip_concat_projector_channels = self._resolve_skip_concat_projector_channels(model_config)
         self.task_decoders = nn.ModuleDict()
         self.task_activations = nn.ModuleDict()
         self.task_heads = nn.ModuleDict()
@@ -814,6 +817,11 @@ class NetworkFromConfig(nn.Module):
             "guide_freeze": self.guide_freeze,
             "guide_patch_grid": self.guide_patch_grid,
             "guide_stage_keys": list(self.guide_stage_keys) if self.guide_stage_keys is not None else None,
+            "guide_skip_concat_projector_channels": (
+                list(self.guide_skip_concat_projector_channels)
+                if self._guide_uses_skip_feature_concat() and self.guide_skip_concat_projector_channels is not None
+                else None
+            ),
             "guide_feature_gate_alpha": self.guide_feature_gate_alpha if self._guide_uses_encoder_feature_gating() else None,
             "guide_tokenbook_tokens": getattr(self, "guide_tokenbook_tokens", None) if not self._guide_uses_skip_feature_concat() else None,
             "guide_tokenbook_prototype_weighting": getattr(self, "guide_tokenbook_prototype_weighting", "mean") if not self._guide_uses_skip_feature_concat() else None,
@@ -835,9 +843,34 @@ class NetworkFromConfig(nn.Module):
     def _guide_uses_skip_feature_concat(self) -> bool:
         return self.guide_enabled and self.guide_fusion_stage == "feature_skip_concat"
 
+    def _resolve_skip_concat_projector_channels(self, model_config):
+        native_skip_channels = [int(ch) for ch in self.shared_encoder.output_channels]
+        configured = model_config.get("guide_skip_concat_projector_channels")
+        if configured is None:
+            return native_skip_channels
+
+        projector_channels = [int(ch) for ch in configured]
+        if len(projector_channels) != len(native_skip_channels):
+            raise ValueError(
+                "guide_skip_concat_projector_channels must have as many entries as encoder stages, "
+                f"got {len(projector_channels)} and {len(native_skip_channels)}."
+            )
+        if any(ch <= 0 for ch in projector_channels):
+            raise ValueError(
+                "guide_skip_concat_projector_channels entries must be > 0, "
+                f"got {projector_channels}."
+            )
+        return projector_channels
+
     def _decoder_skip_channels(self):
         if self._guide_uses_skip_feature_concat():
-            return [int(ch) * 2 for ch in self.shared_encoder.output_channels]
+            projector_channels = self.guide_skip_concat_projector_channels
+            if projector_channels is None:
+                projector_channels = [int(ch) for ch in self.shared_encoder.output_channels]
+            return [
+                int(native_ch) + int(projected_ch)
+                for native_ch, projected_ch in zip(self.shared_encoder.output_channels, projector_channels)
+            ]
         return list(self.shared_encoder.output_channels)
 
     def _init_guidance(self, model_config):
@@ -927,7 +960,7 @@ class NetworkFromConfig(nn.Module):
                 {
                     stage_key: self.conv_op(
                         int(self.guide_backbone.embed_dim),
-                        int(self.shared_encoder.output_channels[stage_idx]),
+                        int(self.guide_skip_concat_projector_channels[stage_idx]),
                         kernel_size=1,
                         stride=1,
                         padding=0,

@@ -53,6 +53,7 @@ def _make_mgr(
     guide_fusion_stage: str | None = None,
     guide_tokenbook_prototype_weighting: str | None = None,
     guide_feature_gate_alpha: float | None = None,
+    guide_skip_concat_projector_channels: list[int] | None = None,
 ) -> SimpleNamespace:
     guided_config = {}
     if guide_tokenbook_tokens is not None:
@@ -65,6 +66,8 @@ def _make_mgr(
         guided_config["guide_tokenbook_prototype_weighting"] = str(guide_tokenbook_prototype_weighting)
     if guide_feature_gate_alpha is not None:
         guided_config["guide_feature_gate_alpha"] = float(guide_feature_gate_alpha)
+    if guide_skip_concat_projector_channels is not None:
+        guided_config["guide_skip_concat_projector_channels"] = [int(v) for v in guide_skip_concat_projector_channels]
     return SimpleNamespace(
         targets={"ink": {"out_channels": 1, "activation": "none"}},
         train_patch_size=(16, 16, 16),
@@ -181,6 +184,7 @@ def test_feature_skip_concat_forward_shapes_and_empty_aux_outputs(tmp_path: Path
     assert list(model.guide_skip_projectors.keys()) == ["enc_0", "enc_1", "enc_2"]
     assert model.final_config["guide_fusion_stage"] == "feature_skip_concat"
     assert model.final_config["guide_feature_gate_alpha"] is None
+    assert model.final_config["guide_skip_concat_projector_channels"] == [8, 16, 32]
     assert model.final_config["guide_tokenbook_tokens"] is None
     assert model.final_config["guide_tokenbook_prototype_weighting"] is None
     assert model.final_config["guide_tokenbook_weight_mlp_hidden"] is None
@@ -253,6 +257,26 @@ def test_feature_skip_concat_decoder_contract_uses_augmented_skip_channels(tmp_p
         projector.out_channels == native_width
         for projector, native_width in zip(model.guide_skip_projectors.values(), [8, 16, 32])
     )
+
+
+def test_feature_skip_concat_decoder_contract_uses_configured_projector_widths(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_fusion_stage="feature_skip_concat",
+        guide_skip_concat_projector_channels=[2, 4, 8],
+    )
+    model = NetworkFromConfig(mgr)
+    decoder = model.task_decoders["ink"]
+
+    assert decoder.skip_channels == [10, 20, 40]
+    assert decoder.bottleneck_input_channels == 40
+    assert decoder.decoder_stage_input_channels == [16 + 20, 8 + 10]
+    assert decoder.decoder_stage_output_channels == [16, 8]
+    assert model.final_config["guide_skip_concat_projector_channels"] == [2, 4, 8]
+    assert [projector.out_channels for projector in model.guide_skip_projectors.values()] == [2, 4, 8]
 
 
 def test_feature_skip_concat_projects_low_res_guide_features_before_upsampling(tmp_path: Path):
@@ -329,6 +353,20 @@ def test_guided_network_backprop_updates_tokenbook_but_not_frozen_guide_backbone
 
     assert any(parameter.grad is not None for parameter in model.guide_tokenbook.parameters())
     assert all(parameter.grad is None for parameter in model.guide_backbone.parameters())
+
+
+def test_feature_skip_concat_requires_projector_channels_to_match_num_stages(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_fusion_stage="feature_skip_concat",
+        guide_skip_concat_projector_channels=[8, 16],
+    )
+
+    with pytest.raises(ValueError, match="guide_skip_concat_projector_channels must have as many entries"):
+        NetworkFromConfig(mgr)
 
 
 def test_feature_encoder_guidance_backprop_updates_all_stage_tokenbooks(tmp_path: Path):
