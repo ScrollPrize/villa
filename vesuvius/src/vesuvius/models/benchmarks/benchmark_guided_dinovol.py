@@ -42,6 +42,7 @@ def _make_mgr(
     patch_size: tuple[int, int, int],
     guide_checkpoint: str | None,
     guide_tokenbook_tokens: int | None = None,
+    guide_fusion_stage: str | None = None,
 ) -> SimpleNamespace:
     guided_config = {}
     if guide_checkpoint is not None:
@@ -50,6 +51,8 @@ def _make_mgr(
             "guide_freeze": True,
             "guide_tokenbook_sample_rate": 1.0,
         }
+        if guide_fusion_stage is not None:
+            guided_config["guide_fusion_stage"] = str(guide_fusion_stage)
         if guide_tokenbook_tokens is not None:
             guided_config["guide_tokenbook_tokens"] = int(guide_tokenbook_tokens)
 
@@ -89,6 +92,7 @@ def _build_model(
     device: torch.device,
     guide_checkpoint: str | None,
     guide_tokenbook_tokens: int | None,
+    guide_fusion_stage: str | None,
     compile_model: bool,
     channels_last_3d: bool,
 ):
@@ -96,6 +100,7 @@ def _build_model(
         patch_size=patch_size,
         guide_checkpoint=guide_checkpoint,
         guide_tokenbook_tokens=guide_tokenbook_tokens,
+        guide_fusion_stage=guide_fusion_stage,
     )
     model = NetworkFromConfig(mgr).to(device)
     if channels_last_3d:
@@ -256,30 +261,65 @@ def _profile_guided_stages(
         timings["guide_backbone_ms"].append(guide_backbone_ms)
 
         token_mask = model._sample_guide_token_mask(guide_features)
-        guide_mask, tokenbook_ms = _timed_call(
-            lambda: model.guide_tokenbook(guide_features, token_mask=token_mask),
-            device=device,
-        )
-        timings["tokenbook_ms"].append(tokenbook_ms)
+        if model.guide_fusion_stage in {"input", "input_gating"}:
+            guide_mask, tokenbook_ms = _timed_call(
+                lambda: model.guide_tokenbook(guide_features, token_mask=token_mask),
+                device=device,
+            )
+            timings["tokenbook_ms"].append(tokenbook_ms)
 
-        def _upsample():
-            with _autocast_context(device):
-                return F.interpolate(
-                    guide_mask,
-                    size=inputs.shape[2:],
-                    mode="trilinear",
-                    align_corners=False,
-                )
+            def _upsample():
+                with _autocast_context(device):
+                    return F.interpolate(
+                        guide_mask,
+                        size=inputs.shape[2:],
+                        mode="trilinear",
+                        align_corners=False,
+                    )
 
-        guide_for_input, upsample_ms = _timed_call(_upsample, device=device)
-        timings["guide_upsample_ms"].append(upsample_ms)
+            guide_for_input, upsample_ms = _timed_call(_upsample, device=device)
+            timings["guide_upsample_ms"].append(upsample_ms)
 
-        def _segmentation():
-            with _autocast_context(device):
-                guided_input = inputs * guide_for_input
-                features = model.shared_encoder(guided_input)
-                logits = model.task_decoders["ink"](features)
-                return logits
+            def _segmentation():
+                with _autocast_context(device):
+                    guided_input = inputs * guide_for_input
+                    features = model.shared_encoder(guided_input)
+                    logits = model.task_decoders["ink"](features)
+                    return logits
+
+        elif model.guide_fusion_stage == "feature_encoder":
+            stage_shapes = model._get_encoder_stage_shapes(inputs.shape[2:])
+
+            def _feature_gates():
+                with _autocast_context(device):
+                    feature_gates = {}
+                    for stage_idx, stage_key in enumerate(model.guide_stage_keys or []):
+                        stage_guide = model.guide_stage_tokenbooks[stage_key](
+                            guide_features,
+                            token_mask=token_mask,
+                        )
+                        target_shape = stage_shapes[stage_idx]
+                        if stage_guide.shape[2:] != target_shape:
+                            stage_guide = F.interpolate(
+                                stage_guide,
+                                size=target_shape,
+                                mode="trilinear",
+                                align_corners=False,
+                            )
+                        feature_gates[stage_key] = stage_guide
+                    return feature_gates
+
+            feature_gates, tokenbook_ms = _timed_call(_feature_gates, device=device)
+            timings["encoder_guide_heads_ms"].append(tokenbook_ms)
+
+            def _segmentation():
+                with _autocast_context(device):
+                    features = model.shared_encoder(inputs, feature_gates=feature_gates)
+                    logits = model.task_decoders["ink"](features)
+                    return logits
+
+        else:  # pragma: no cover - defensive path for future guide modes
+            raise ValueError(f"Unsupported guided benchmark mode: {model.guide_fusion_stage!r}")
 
         logits, segmentation_ms = _timed_call(_segmentation, device=device)
         timings["segmentation_trunk_ms"].append(segmentation_ms)
@@ -294,7 +334,7 @@ def _profile_guided_stages(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark baseline vs guided volumetric Dinovol gating.")
+    parser = argparse.ArgumentParser(description="Benchmark baseline, input-gated, and encoder-guided volumetric Dinovol modes.")
     parser.add_argument(
         "--guide-checkpoint",
         type=str,
@@ -349,6 +389,16 @@ def main() -> None:
             device=device,
             guide_checkpoint=str(guide_checkpoint),
             guide_tokenbook_tokens=guide_tokenbook_tokens,
+            guide_fusion_stage="input",
+            compile_model=False,
+            channels_last_3d=False,
+        )
+        feature_encoder_eager_model = _build_model(
+            patch_size=patch_size,
+            device=device,
+            guide_checkpoint=str(guide_checkpoint),
+            guide_tokenbook_tokens=guide_tokenbook_tokens,
+            guide_fusion_stage="feature_encoder",
             compile_model=False,
             channels_last_3d=False,
         )
@@ -360,32 +410,60 @@ def main() -> None:
                 device=device,
                 guide_checkpoint=None,
                 guide_tokenbook_tokens=None,
+                guide_fusion_stage=None,
                 compile_model=False,
                 channels_last_3d=False,
             ),
-            "guided_eager": guided_eager_model,
+            "guided_input_eager": guided_eager_model,
+            "guided_feature_encoder_eager": feature_encoder_eager_model,
         }
         if not args.skip_compile_variants:
-            variants["guided_compile"] = _build_model(
+            variants["guided_input_compile"] = _build_model(
                 patch_size=patch_size,
                 device=device,
                 guide_checkpoint=str(guide_checkpoint),
                 guide_tokenbook_tokens=guide_tokenbook_tokens,
+                guide_fusion_stage="input",
                 compile_model=True,
                 channels_last_3d=False,
             )
-            variants["guided_compile_channels_last_3d"] = _build_model(
+            variants["guided_input_compile_channels_last_3d"] = _build_model(
                 patch_size=patch_size,
                 device=device,
                 guide_checkpoint=str(guide_checkpoint),
                 guide_tokenbook_tokens=guide_tokenbook_tokens,
+                guide_fusion_stage="input",
+                compile_model=True,
+                channels_last_3d=True,
+            )
+            variants["guided_feature_encoder_compile"] = _build_model(
+                patch_size=patch_size,
+                device=device,
+                guide_checkpoint=str(guide_checkpoint),
+                guide_tokenbook_tokens=guide_tokenbook_tokens,
+                guide_fusion_stage="feature_encoder",
+                compile_model=True,
+                channels_last_3d=False,
+            )
+            variants["guided_feature_encoder_compile_channels_last_3d"] = _build_model(
+                patch_size=patch_size,
+                device=device,
+                guide_checkpoint=str(guide_checkpoint),
+                guide_tokenbook_tokens=guide_tokenbook_tokens,
+                guide_fusion_stage="feature_encoder",
                 compile_model=True,
                 channels_last_3d=True,
             )
 
         if not args.skip_stage_breakdown:
-            patch_summary["guided_eager_stage_breakdown_ms"] = _profile_guided_stages(
+            patch_summary["guided_input_eager_stage_breakdown_ms"] = _profile_guided_stages(
                 guided_eager_model,
+                device=device,
+                cpu_inputs=cpu_inputs.detach().clone(),
+                iterations=args.iterations,
+            )
+            patch_summary["guided_feature_encoder_eager_stage_breakdown_ms"] = _profile_guided_stages(
+                feature_encoder_eager_model,
                 device=device,
                 cpu_inputs=cpu_inputs.detach().clone(),
                 iterations=args.iterations,
