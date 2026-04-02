@@ -542,11 +542,6 @@ void CTiledVolumeViewer::beginInteractionRender()
 
 void CTiledVolumeViewer::settleInteractionRender()
 {
-    if (_isPanning) {
-        // Still panning — restart timer so it fires after pan stops
-        if (_interactionSettleTimer) _interactionSettleTimer->start();
-        return;
-    }
     if (!_interactionQualityActive) {
         return;
     }
@@ -1038,9 +1033,8 @@ void CTiledVolumeViewer::onPanRelease(Qt::MouseButton /*buttons*/, Qt::KeyboardM
         // Don't settle yet — momentum tick will handle it
     } else {
         _momentumPanVx = _momentumPanVy = 0.0f;
-        _interactionQualityActive = false;
-        _camera.invalidate();
-        submitRender();
+        // Settle directly instead of polling via timer
+        settleInteractionRender();
         scheduleOverlayUpdate();
     }
 }
@@ -1102,6 +1096,8 @@ void CTiledVolumeViewer::renderVisible(bool force)
 
 void CTiledVolumeViewer::submitRender()
 {
+    _pointSceneCache.clear();
+
     auto surf = _surfWeak.lock();
     if (!surf || !_volume || !_volume->zarrDataset()) {
         return;
@@ -1422,7 +1418,14 @@ void CTiledVolumeViewer::onCursorMoveImpl(QPointF scene_loc,
 
             for (const auto& [colId, col] : collections) {
                 for (const auto& [ptId, pt] : col.points) {
-                    QPointF ptScene = volumeToScene(pt.p);
+                    auto cacheIt = _pointSceneCache.find(pt.id);
+                    QPointF ptScene;
+                    if (cacheIt != _pointSceneCache.end()) {
+                        ptScene = cacheIt->second;
+                    } else {
+                        ptScene = volumeToScene(pt.p);
+                        _pointSceneCache[pt.id] = ptScene;
+                    }
                     QPointF diff = scene_loc - ptScene;
                     float distSq = QPointF::dotProduct(diff, diff);
                     if (distSq < minDistSq) {
@@ -2263,7 +2266,7 @@ void CTiledVolumeViewer::invalidateIntersect(const std::string& /*name*/)
 
 void CTiledVolumeViewer::momentumTick()
 {
-    constexpr float kDecay = 0.92f;     // 8% velocity loss per frame (~2s to stop)
+    constexpr float kDecay = 0.85f;     // 15% velocity loss per frame (~400ms to stop)
     constexpr float kPanMin = 0.5f;     // stop pan below 0.5 px/frame
     constexpr float kZoomMin = 0.01f;   // stop zoom below 0.01 steps/frame
     constexpr float kSliceMin = 0.05f;  // stop slice below 0.05/frame

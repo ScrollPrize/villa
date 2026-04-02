@@ -384,6 +384,9 @@ private:
     std::unordered_map<std::string, size_t> _surfaceColorAssignments;
     size_t _nextColorIndex = 0;
 
+    // --- Point highlight cache (invalidated on camera change) ---
+    std::unordered_map<uint64_t, QPointF> _pointSceneCache;
+
     // --- Interaction state ---
     uint64_t _highlightedPointId = 0;
     uint64_t _selectedPointId = 0;

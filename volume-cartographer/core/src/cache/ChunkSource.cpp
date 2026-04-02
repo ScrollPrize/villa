@@ -248,44 +248,59 @@ int HttpChunkSource::totalChunksPerShard() const
 
 // Helper: perform a full HTTP GET, returning raw bytes.
 // Uses the pre-computed auth strings from the HttpChunkSource instance.
+//
+// The thread-local CURL handle is initialized once with constant options
+// (HTTP/2, keep-alive, timeouts, etc.) and never reset. Only per-request
+// options (URL, write callback/data, auth headers) are set each call.
+// This avoids curl_easy_reset() which, while it preserves the connection
+// pool, forces us to re-set ~18 constant options on every request.
 #ifdef VC_USE_CURL
 static std::vector<uint8_t> httpGetBytes(
     const std::string& url, const HttpChunkSource& src, size_t reserveHint = 2 * 1024 * 1024)
 {
-    thread_local CURL* curl = curl_easy_init();
+    thread_local CURL* curl = [] {
+        CURL* c = curl_easy_init();
+        if (!c) return c;
+        // Constant options — set once, never cleared
+        curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+        curl_easy_setopt(c, CURLOPT_PIPEWAIT, 1L);
+        curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
+#if CURL_AT_LEAST_VERSION(7, 85, 0)
+        curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+        curl_easy_setopt(c, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
+        curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+        curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
+        curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L);
+        curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(c, CURLOPT_TCP_KEEPIDLE, 30L);
+        curl_easy_setopt(c, CURLOPT_TCP_KEEPINTVL, 15L);
+        curl_easy_setopt(c, CURLOPT_DNS_CACHE_TIMEOUT, 600L);
+        curl_easy_setopt(c, CURLOPT_BUFFERSIZE, 512L * 1024L);
+        curl_easy_setopt(c, CURLOPT_TCP_NODELAY, 1L);
+        curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWriteCallback);
+        return c;
+    }();
     if (!curl) return {};
 
-    curl_easy_reset(curl);
+    // Per-request options only
     std::vector<uint8_t> response;
     response.reserve(reserveHint);
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
-    curl_easy_setopt(curl, CURLOPT_PIPEWAIT, 1L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-#if CURL_AT_LEAST_VERSION(7, 85, 0)
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
-#else
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-#endif
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
-    curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 600L);
-    curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 512L * 1024L);
-    curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
 
     struct curl_slist* authHeaders = nullptr;
     src.applyCachedAuth(curl, authHeaders);
     CURLcode res = curl_easy_perform(curl);
-    if (authHeaders) curl_slist_free_all(authHeaders);
+    if (authHeaders) {
+        curl_slist_free_all(authHeaders);
+        // Clear custom headers so they don't leak into next request
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, nullptr);
+    }
 
     if (res != CURLE_OK) {
         long httpCode = 0;

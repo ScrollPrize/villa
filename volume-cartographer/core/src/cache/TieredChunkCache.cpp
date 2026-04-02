@@ -420,6 +420,10 @@ void TieredChunkCache::loadCoarseLevel(int level)
         (shape[2] + chunks[2] - 1) / chunks[2]
     };
     int total = coarseGrid_[0] * coarseGrid_[1] * coarseGrid_[2];
+    if (total > 10000) {
+        std::fprintf(stderr, "[Cache] WARNING: coarse level has %d chunks, skipping flat storage\n", total);
+        return;
+    }
     coarseData_.resize(total);
 
     for (int iz = 0; iz < coarseGrid_[0]; iz++) {

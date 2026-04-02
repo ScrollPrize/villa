@@ -91,14 +91,12 @@ public:
     [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
     [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
     [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
-    [[nodiscard]] bool autoApproveEdits() const { return _autoApprovalEnabled; }
     [[nodiscard]] bool autoApprovalEnabled() const { return _autoApprovalEnabled; }
     [[nodiscard]] float autoApprovalRadius() const { return _autoApprovalRadius; }
     [[nodiscard]] float autoApprovalThreshold() const { return _autoApprovalThreshold; }
     [[nodiscard]] float autoApprovalMaxDistance() const { return _autoApprovalMaxDistance; }
 
     [[nodiscard]] bool isEditingApprovalMask() const { return _editApprovedMask || _editUnapprovedMask; }
-    void setAutoApproveEdits(bool enabled);
     void setAutoApprovalEnabled(bool enabled);
     void setAutoApprovalRadius(float radius);
     void setAutoApprovalThreshold(float threshold);

@@ -3,8 +3,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 #include <opencv2/core.hpp>
-#include <QImage>
 #include <QPixmap>
 
 #include "TiledViewerCamera.hpp"
@@ -54,11 +54,15 @@ struct TileRenderParams {
     int submitPriority = 0;  // lower = higher urgency; set by TileRenderController
 };
 
-// Result from rendering a single tile
+// Result from rendering a single tile.
+// TileRenderer fills the raw pixels buffer; RenderPool converts to QPixmap
+// for Qt display, then releases the pixel data.
 struct TileRenderResult {
     WorldTileKey worldKey;
-    QImage image;        // Format_RGB32 QImage (produced on worker thread)
-    QPixmap pixmap;      // Converted from image on worker thread (avoids main-thread GPU upload)
+    std::vector<uint32_t> pixels;  // ARGB32 buffer (tileW * tileH)
+    int width = 0;                 // tile width in pixels
+    int height = 0;                // tile height in pixels
+    QPixmap pixmap;                // For Qt display (created in RenderPool after render)
     uint64_t epoch = 0;
 
     // Camera state snapshot for cache key reconstruction

@@ -112,8 +112,6 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::editApprovedMaskChanged);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::editUnapprovedMaskChanged,
             this, &SegmentationWidget::editUnapprovedMaskChanged);
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApproveEditsChanged,
-            this, &SegmentationWidget::autoApproveEditsChanged);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApprovalEnabledChanged,
             this, &SegmentationWidget::autoApprovalEnabledChanged);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApprovalRadiusChanged,
@@ -285,7 +283,6 @@ void SegmentationWidget::setShowHoverMarker(bool enabled) { _editingPanel->setSh
 bool SegmentationWidget::showApprovalMask() const { return _approvalMaskPanel->showApprovalMask(); }
 bool SegmentationWidget::editApprovedMask() const { return _approvalMaskPanel->editApprovedMask(); }
 bool SegmentationWidget::editUnapprovedMask() const { return _approvalMaskPanel->editUnapprovedMask(); }
-bool SegmentationWidget::autoApproveEdits() const { return _approvalMaskPanel->autoApproveEdits(); }
 bool SegmentationWidget::autoApprovalEnabled() const { return _approvalMaskPanel->autoApprovalEnabled(); }
 float SegmentationWidget::autoApprovalRadius() const { return _approvalMaskPanel->autoApprovalRadius(); }
 float SegmentationWidget::autoApprovalThreshold() const { return _approvalMaskPanel->autoApprovalThreshold(); }
@@ -299,7 +296,6 @@ QColor SegmentationWidget::approvalBrushColor() const { return _approvalMaskPane
 void SegmentationWidget::setShowApprovalMask(bool enabled) { _approvalMaskPanel->setShowApprovalMask(enabled); syncUiState(); }
 void SegmentationWidget::setEditApprovedMask(bool enabled) { _approvalMaskPanel->setEditApprovedMask(enabled); }
 void SegmentationWidget::setEditUnapprovedMask(bool enabled) { _approvalMaskPanel->setEditUnapprovedMask(enabled); }
-void SegmentationWidget::setAutoApproveEdits(bool enabled) { _approvalMaskPanel->setAutoApproveEdits(enabled); }
 void SegmentationWidget::setAutoApprovalEnabled(bool enabled) { _approvalMaskPanel->setAutoApprovalEnabled(enabled); }
 void SegmentationWidget::setAutoApprovalRadius(float radius) { _approvalMaskPanel->setAutoApprovalRadius(radius); }
 void SegmentationWidget::setAutoApprovalThreshold(float threshold) { _approvalMaskPanel->setAutoApprovalThreshold(threshold); }

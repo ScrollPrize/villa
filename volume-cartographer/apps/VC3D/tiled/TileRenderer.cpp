@@ -13,12 +13,12 @@
 
 namespace {
 
-void blendOverlayImage(QImage* base,
-                       const QImage& overlay,
+void blendOverlayImage(uint32_t* base, int baseStride,
+                       const uint32_t* overlay, int overlayStride,
                        const cv::Mat_<uint8_t>& overlayMask,
-                       float opacity)
+                       float opacity, int rows, int cols)
 {
-    if (!base || base->isNull() || overlay.isNull() || overlayMask.empty()) {
+    if (!base || !overlay || overlayMask.empty()) {
         return;
     }
 
@@ -28,11 +28,9 @@ void blendOverlayImage(QImage* base,
     }
 
     const float ia = 1.0f - alpha;
-    const int rows = std::min(base->height(), overlay.height());
-    const int cols = std::min(base->width(), overlay.width());
     for (int y = 0; y < rows; ++y) {
-        auto* dst = reinterpret_cast<uint32_t*>(base->scanLine(y));
-        const auto* src = reinterpret_cast<const uint32_t*>(overlay.constScanLine(y));
+        auto* dst = base + y * baseStride;
+        const auto* src = overlay + y * overlayStride;
         const auto* mask = overlayMask.ptr<uint8_t>(y);
         for (int x = 0; x < cols; ++x) {
             if (mask[x] == 0) {
@@ -71,6 +69,8 @@ TileRenderResult TileRenderer::renderTile(
     result.scale = params.scale;
     result.zOff = params.zOff;
     result.dsScaleIdx = params.dsScaleIdx;
+    result.width = params.tileW;
+    result.height = params.tileH;
 
     if (!surface || !volume) {
         return result;
@@ -253,7 +253,7 @@ TileRenderResult TileRenderer::renderTile(
                         ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
 
         // Fully fused ARGB32 path: sample voxels and apply window/level LUT
-        // in a single pass, writing directly to QImage memory. Eliminates
+        // in a single pass, writing directly to the pixel buffer. Eliminates
         // the intermediate cv::Mat and the applyPostProcess second pass.
         // Valid when no colormap, no stretch, core preprocessing is a no-op.
         // Lighting is fused into the LUT (plane has constant normal).
@@ -275,10 +275,10 @@ TileRenderResult TileRenderer::renderTile(
             buildWindowLevelLut(lut, params.windowLow, params.windowHigh,
                                 lightFactor);
 
-            // Write directly into QImage scanline buffer -- one pass, zero copies.
-            result.image = allocTileImage(params.tileW, params.tileH);
-            auto* bits = reinterpret_cast<uint32_t*>(result.image.bits());
-            const int stride = result.image.bytesPerLine() / 4;
+            // Write directly into pixel buffer -- one pass, zero copies.
+            result.pixels.resize(params.tileW * params.tileH);
+            auto* bits = result.pixels.data();
+            const int stride = params.tileW;
 
             result.actualLevel = volume->samplePlaneBestEffortARGB32(
                 bits, stride, planeOrigin, planeVxStep, planeVyStep,
@@ -353,7 +353,7 @@ TileRenderResult TileRenderer::renderTile(
     }
 
     {
-        // Unified post-processing: produces QImage::Format_RGB32 directly,
+        // Unified post-processing: produces ARGB32 directly,
         // bypassing all cvtColor conversions and RGB888->RGB32 expansion.
         PostProcessParams pp;
         pp.isoCutoff = params.compositeSettings.params.isoCutoff;
@@ -364,7 +364,8 @@ TileRenderResult TileRenderer::renderTile(
         pp.postStretchValues = params.compositeSettings.postStretchValues;
         pp.removeSmallComponents = params.compositeSettings.postRemoveSmallComponents;
         pp.minComponentSize = params.compositeSettings.postMinComponentSize;
-        result.image = applyPostProcess(gray, pp);
+        result.pixels.resize(params.tileW * params.tileH);
+        applyPostProcess(gray, pp, result.pixels.data(), params.tileW);
     }
 
 overlay:
@@ -405,8 +406,17 @@ overlay:
             overlayParams.colormapId = params.overlayColormapId;
             overlayParams.stretchValues = false;
 
-            QImage overlayImage = applyPostProcess(overlayGray, overlayParams);
-            blendOverlayImage(&result.image, overlayImage, overlayGray, params.overlayOpacity);
+            // Render overlay into a temporary buffer, then blend into result.pixels
+            const int ow = overlayGray.cols;
+            const int oh = overlayGray.rows;
+            thread_local std::vector<uint32_t> overlayBuf;
+            overlayBuf.resize(ow * oh);
+            applyPostProcess(overlayGray, overlayParams, overlayBuf.data(), ow);
+            blendOverlayImage(result.pixels.data(), params.tileW,
+                              overlayBuf.data(), ow,
+                              overlayGray, params.overlayOpacity,
+                              std::min(result.height, oh),
+                              std::min(result.width, ow));
         }
     }
 

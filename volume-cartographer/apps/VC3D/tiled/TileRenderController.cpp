@@ -248,7 +248,10 @@ void TileRenderController::tick()
     bool moreWork = false;
 
     // 1. Drain completed render results
+    int drainedBefore = _renderPool->pendingCount();
     drainResults();
+    int drainedAfter = _renderPool->pendingCount();
+    bool drainedSomething = drainedAfter < drainedBefore;
 
     // 2. Check if chunks arrived → directly re-submit stale tiles using _last* state.
     //    Do NOT use the _pendingDirty mechanism — that path clears _pending* after
@@ -299,12 +302,12 @@ void TileRenderController::tick()
     // Expire stuck pending counts (pool idle but pendingCount > 0 for too long)
     _renderPool->expireTimedOut();
 
-    // Still have in-flight renders? Keep ticking to drain them.
+    // Still have in-flight renders or pending dirty? Keep ticking.
     if (_renderPool->pendingCount() > 0 || _pendingDirty)
         moreWork = true;
 
-    // Auto-stop when idle to avoid burning CPU
-    if (!moreWork)
+    // Auto-stop when idle: nothing drained, no chunks arrived, no pending work
+    if (!moreWork && !drainedSomething && !chunksJustArrived)
         _tickTimer->stop();
 }
 

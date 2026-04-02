@@ -136,7 +136,8 @@ ColPoint VCCollection::addPoint(const std::string& collectionName, const cv::Vec
     new_point.id = getNextPointId();
     new_point.collectionId = collection_id;
     new_point.p = point;
-    new_point.creation_time = QDateTime::currentMSecsSinceEpoch();
+    new_point.creation_time = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
     
     _collections[collection_id].points[new_point.id] = new_point;
     _points[new_point.id] = new_point;
@@ -155,7 +156,8 @@ void VCCollection::addPoints(const std::string& collectionName, const std::vecto
         new_point.id = getNextPointId();
         new_point.collectionId = collection_id;
         new_point.p = p;
-        new_point.creation_time = QDateTime::currentMSecsSinceEpoch();
+        new_point.creation_time = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
         collection_points[new_point.id] = new_point;
         _points[new_point.id] = new_point;
         emit pointAdded(new_point);

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <QImage>
 #include <opencv2/core.hpp>
 #include <array>
 #include <string>
@@ -9,7 +8,7 @@
 #include "vc/core/util/PostProcess.hpp"
 
 // App-layer post-processing parameters.
-// Extends core vc::PostProcessParams with colormap (Qt-dependent).
+// Extends core vc::PostProcessParams with colormap.
 struct PostProcessParams {
     // Window/level: map [windowLow, windowHigh] -> [0, 255]
     float windowLow = 0.0f;
@@ -26,7 +25,7 @@ struct PostProcessParams {
     // ISO cutoff: zero out values below threshold (0 = disabled)
     uint8_t isoCutoff = 0;
 
-    // Colormap (empty = grayscale) — Qt-dependent, stays in app layer
+    // Colormap (empty = grayscale)
     std::string colormapId;
 
     // Convert to core params (without colormap)
@@ -43,15 +42,18 @@ struct PostProcessParams {
     }
 };
 
-// Apply all post-processing steps and produce a QImage::Format_RGB32 directly.
+// Apply all post-processing steps and write ARGB32 pixels into outBuf.
+// outBuf must point to gray.rows * outStride uint32_t elements.
+// outStride is in uint32_t units (pixels per row including padding).
 // The input gray mat is modified in-place (caller should not reuse it).
 //   1. ISO cutoff
 //   2. Composite post-stretch (if enabled)
 //   3. Composite component removal (if enabled)
 //   4. Window/level or value stretch
-//   5. Colormap or grayscale → RGB32
-QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
-                        const PostProcessParams& params);
+//   5. Colormap or grayscale -> ARGB32
+void applyPostProcess(cv::Mat_<uint8_t>& gray,
+                      const PostProcessParams& params,
+                      uint32_t* outBuf, int outStride);
 
 // Build a window/level LUT mapping uint8 -> ARGB32 for the fused sampling path.
 // Only valid for non-stretch grayscale mode (no colormap, no stretchValues).
@@ -60,8 +62,3 @@ QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
 void buildWindowLevelLut(std::array<uint32_t, 256>& lut,
                          float windowLow, float windowHigh,
                          float lightFactor = 1.0f);
-
-// Allocate a QImage backed by a lock-free slab pool (1 MB for 512x512 ARGB32).
-// Buffer is returned to the pool when the QImage is destroyed. Falls back to
-// normal QImage allocation for non-standard sizes.
-QImage allocTileImage(int cols, int rows);

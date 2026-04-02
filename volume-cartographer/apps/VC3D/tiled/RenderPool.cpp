@@ -1,5 +1,7 @@
 #include "RenderPool.hpp"
 
+#include <QImage>
+
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/types/Volume.hpp"
 
@@ -61,11 +63,15 @@ void RenderPool::submit(const TileRenderParams& params,
 
             TileRenderResult result = TileRenderer::renderTile(params, surface, volume.get());
             result.controllerId = controllerId;
-            // Convert QImage→QPixmap on worker thread to avoid GPU upload
-            // stalls on the main thread during drain.
-            if (!result.image.isNull()) {
-                result.pixmap = QPixmap::fromImage(result.image, Qt::NoFormatConversion);
-                result.image = QImage();  // release QImage memory
+            // Convert raw ARGB32 pixels -> QPixmap on worker thread to
+            // avoid GPU upload stalls on the main thread during drain.
+            if (!result.pixels.empty()) {
+                QImage img(reinterpret_cast<const uchar*>(result.pixels.data()),
+                           result.width, result.height,
+                           result.width * 4, QImage::Format_RGB32);
+                result.pixmap = QPixmap::fromImage(img, Qt::NoFormatConversion);
+                result.pixels.clear();
+                result.pixels.shrink_to_fit();
             }
 
             pushResult(std::move(result));

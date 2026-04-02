@@ -2,7 +2,6 @@
 #include "VolumeViewerCmaps.hpp"
 
 #include <opencv2/imgproc.hpp>
-#include <utils/slab_allocator.hpp>
 
 #include <algorithm>
 #include <array>
@@ -22,12 +21,6 @@ static inline void nt_store_u32(uint32_t* dst, uint32_t val) {
 #else
     *dst = val;
 #endif
-}
-
-// Global lock-free slab pool for 512x512 ARGB32 tile buffers (1 MB each).
-QImage allocTileImage(int cols, int rows)
-{
-    return QImage(cols, rows, QImage::Format_RGB32);
 }
 
 // Build a fused uint32_t[256] LUT: window/level (or stretch) + gray→ARGB32.
@@ -102,8 +95,9 @@ static void applyFusedLut(const cv::Mat_<uint8_t>& gray,
     }
 }
 
-QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
-                        const PostProcessParams& params)
+void applyPostProcess(cv::Mat_<uint8_t>& gray,
+                      const PostProcessParams& params,
+                      uint32_t* outBuf, int outStride)
 {
     const volume_viewer_cmaps::OverlayColormapSpec* spec = nullptr;
     if (!params.colormapId.empty()) {
@@ -122,16 +116,18 @@ QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
             cv::threshold(gray, gray, cutoff - 1, 0, cv::THRESH_TOZERO);
         }
 
-        return volume_viewer_cmaps::makeColors(gray, *spec);
+        volume_viewer_cmaps::makeColors(gray, *spec, outBuf, outStride);
+        return;
     }
 
     // Colormap path: full core pipeline then colormap conversion.
     if (spec) {
         vc::applyPostProcess(gray, params.toCoreParams());
-        return volume_viewer_cmaps::makeColors(gray, *spec);
+        volume_viewer_cmaps::makeColors(gray, *spec, outBuf, outStride);
+        return;
     }
 
-    // Grayscale path: fused window/level + gray→RGB32 in a single pass.
+    // Grayscale path: fused window/level + gray->ARGB32 in a single pass.
     // Skip core preprocessing entirely when all steps are no-ops (common case
     // for volume tiles: isoCutoff=0, no postStretch, no component removal).
     if (!corePreprocessIsNoop(params)) {
@@ -142,7 +138,7 @@ QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
         vc::applyPostProcess(gray, coreParams);
     }
 
-    // Build fused LUT: window/level (or stretch) → ARGB32
+    // Build fused LUT: window/level (or stretch) -> ARGB32
     // Thread-local cache: when stretchValues is false (common case), the LUT
     // depends only on windowLow/windowHigh and is identical for every tile.
     thread_local std::array<uint32_t, 256> cachedLut;
@@ -157,16 +153,8 @@ QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
         cachedStretch = params.stretchValues;
     }
 
-    // Single-pass: gray → RGB32 via fused LUT (4x unrolled)
-    const int rows = gray.rows;
-    const int cols = gray.cols;
-    QImage result = allocTileImage(cols, rows);
-
-    auto* bits = reinterpret_cast<uint32_t*>(result.bits());
-    const int stride = result.bytesPerLine() / 4;
-    applyFusedLut(gray, cachedLut, bits, stride);
-
-    return result;
+    // Single-pass: gray -> ARGB32 via fused LUT (4x unrolled)
+    applyFusedLut(gray, cachedLut, outBuf, outStride);
 }
 
 void buildWindowLevelLut(std::array<uint32_t, 256>& lut,

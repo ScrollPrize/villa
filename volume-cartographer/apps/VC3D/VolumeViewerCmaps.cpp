@@ -1,5 +1,4 @@
 #include "VolumeViewerCmaps.hpp"
-#include "tiled/PostProcess.hpp"
 
 #include <opencv2/imgproc.hpp>
 
@@ -31,21 +30,19 @@ namespace
 {
 const std::vector<OverlayColormapSpec>& buildSpecs();
 
-QImage applyPackedLut(const cv::Mat_<uint8_t>& values, const uint32_t* lut)
+void applyPackedLut(const cv::Mat_<uint8_t>& values, const uint32_t* lut,
+                    uint32_t* outBuf, int outStride)
 {
     const int rows = values.rows;
     const int cols = values.cols;
-    QImage result = allocTileImage(cols, rows);
 
     for (int y = 0; y < rows; ++y) {
         const auto* src = values.ptr<uint8_t>(y);
-        auto* dst = reinterpret_cast<uint32_t*>(result.scanLine(y));
+        auto* dst = outBuf + y * outStride;
         for (int x = 0; x < cols; ++x) {
             nt_store_u32(&dst[x], lut[src[x]]);
         }
     }
-
-    return result;
 }
 
 // Fixed Glasbey-like categorical palette generated offline from a maximin RGB
@@ -133,10 +130,11 @@ const OverlayColormapSpec& resolve(const std::string& id)
     return allSpecs.front();
 }
 
-QImage makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec)
+void makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec,
+                uint32_t* outBuf, int outStride)
 {
     if (values.empty()) {
-        return {};
+        return;
     }
 
     if (spec.kind == OverlayColormapKind::OpenCv) {
@@ -159,11 +157,13 @@ QImage makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& sp
             }
             it = lutCache.emplace(spec.opencvCode, lut).first;
         }
-        return applyPackedLut(values, it->second.data());
+        applyPackedLut(values, it->second.data(), outBuf, outStride);
+        return;
     }
 
     if (spec.kind == OverlayColormapKind::DiscreteLut && spec.discreteLut != nullptr) {
-        return applyPackedLut(values, spec.discreteLut);
+        applyPackedLut(values, spec.discreteLut, outBuf, outStride);
+        return;
     }
 
     {
@@ -182,7 +182,7 @@ QImage makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& sp
             auto b = static_cast<uint32_t>(std::min(f * tB, 255.0f));
             lut[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
-        return applyPackedLut(values, lut.data());
+        applyPackedLut(values, lut.data(), outBuf, outStride);
     }
 }
 

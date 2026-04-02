@@ -731,11 +731,6 @@ void SegmentationModule::setEditUnapprovedMask(bool enabled)
     refreshOverlay();
 }
 
-void SegmentationModule::setAutoApproveEdits(bool enabled)
-{
-    setAutoApprovalEnabled(enabled);
-}
-
 void SegmentationModule::setAutoApprovalEnabled(bool enabled)
 {
     _autoApprovalEnabled = enabled;
