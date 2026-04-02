@@ -588,6 +588,19 @@ class BaseTrainer:
                 sliced[name] = value[batch_index: batch_index + 1]
         return sliced
 
+    @staticmethod
+    def _select_debug_sample_index_from_targets(targets_dict):
+        if not targets_dict:
+            return 0, False
+        first_target_any = next(iter(targets_dict.values()))
+        first_target = first_target_any[0] if isinstance(first_target_any, (list, tuple)) else first_target_any
+        if not torch.is_tensor(first_target) or first_target.ndim == 0:
+            return 0, False
+        for b in range(first_target.shape[0]):
+            if torch.any(first_target[b] != 0):
+                return b, True
+        return 0, False
+
     def _prepare_aux_debug_outputs(self, aux_outputs, reference_input):
         if not aux_outputs or not isinstance(reference_input, torch.Tensor):
             return {}
@@ -2211,6 +2224,7 @@ class BaseTrainer:
                     val_losses = {t_name: [] for t_name in self.mgr.targets}
                     debug_preview_image = None
                     debug_guide_preview_image = None
+                    debug_preview_fallback = None
                     
                     # Initialize evaluation metrics
                     evaluation_metrics = self._initialize_evaluation_metrics()
@@ -2262,24 +2276,13 @@ class BaseTrainer:
                                         continue
                                     metric.update(pred=pred_val, gt=gt_val, mask=mask_tensor)
 
-                        if i == 0:
-                                # Find first non-zero sample for debug visualization, but save even if all zeros
-                                b_idx = 0
-                                found_non_zero = False
+                        if debug_preview_image is None:
+                                b_idx, found_non_zero = self._select_debug_sample_index_from_targets(targets_dict)
 
-                                first_target_any = next(iter(targets_dict.values()))
-                                first_target = first_target_any[0] if isinstance(first_target_any, (list, tuple)) else first_target_any
-                                if torch.any(first_target[0] != 0):
-                                    found_non_zero = True
-                                else:
-                                    # Look for a non-zero sample
-                                    for b in range(first_target.shape[0]):
-                                        if torch.any(first_target[b] != 0):
-                                            b_idx = b
-                                            found_non_zero = True
-                                            break
+                                if i == 0:
+                                    debug_preview_fallback = (inputs, targets_dict, outputs, getattr(self, "_current_aux_outputs", {}), b_idx)
 
-                                if True:  # Was: if found_non_zero:
+                                if found_non_zero:
                                     # Slicing shape: [1, c, z, y, x ]
                                     inputs_first = inputs[b_idx: b_idx + 1]
 
@@ -2369,6 +2372,70 @@ class BaseTrainer:
                         val_pbar.set_postfix_str(loss_str)
 
                         del outputs, inputs, targets_dict
+
+                    if debug_preview_image is None and debug_preview_fallback is not None:
+                        inputs, targets_dict, outputs, raw_aux_outputs, b_idx = debug_preview_fallback
+                        inputs_first = inputs[b_idx: b_idx + 1]
+                        targets_dict_first_all = {}
+                        for t_name, t_val in targets_dict.items():
+                            if isinstance(t_val, (list, tuple)):
+                                targets_dict_first_all[t_name] = t_val[0][b_idx: b_idx + 1]
+                            else:
+                                targets_dict_first_all[t_name] = t_val[b_idx: b_idx + 1]
+                        outputs_dict_first = {}
+                        for t_name, p_val in outputs.items():
+                            if isinstance(p_val, (list, tuple)):
+                                outputs_dict_first[t_name] = p_val[0][b_idx: b_idx + 1]
+                            else:
+                                outputs_dict_first[t_name] = p_val[b_idx: b_idx + 1]
+                        raw_aux_outputs_dict_first = self._slice_aux_outputs_for_debug(raw_aux_outputs, b_idx)
+                        aux_outputs_dict_first = self._prepare_aux_debug_outputs(
+                            raw_aux_outputs_dict_first,
+                            inputs_first,
+                        )
+                        debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch + 1}.gif"
+                        guide_debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_guide_epoch{epoch + 1}.png"
+                        skeleton_dict = None
+                        train_skeleton_dict = None
+                        if 'skel' in targets_dict_first_all:
+                            skeleton_dict = {'segmentation': targets_dict_first_all.get('skel')}
+                        if 'train_sample_targets_all' in locals() and train_sample_targets_all and 'skel' in train_sample_targets_all:
+                            train_skeleton_dict = {'segmentation': train_sample_targets_all.get('skel')}
+                        targets_dict_first = {}
+                        for t_name, t_tensor in targets_dict_first_all.items():
+                            if t_name not in ['skel', 'is_unlabeled']:
+                                targets_dict_first[t_name] = t_tensor
+                        save_debug_media = bool(getattr(self.mgr, 'save_gifs', True))
+                        unlabeled_input = getattr(self, '_debug_unlabeled_input', None)
+                        unlabeled_pseudo = getattr(self, '_debug_unlabeled_pseudo_label', None)
+                        unlabeled_pred = getattr(self, '_debug_unlabeled_student_pred', None)
+                        _, debug_preview_image = save_debug(
+                            input_volume=inputs_first,
+                            targets_dict=targets_dict_first,
+                            outputs_dict=outputs_dict_first,
+                            aux_outputs_dict=aux_outputs_dict_first,
+                            tasks_dict=self.mgr.targets,
+                            epoch=epoch,
+                            save_path=debug_img_path,
+                            train_input=train_sample_input,
+                            train_targets_dict=train_sample_targets,
+                            train_outputs_dict=train_sample_outputs,
+                            train_aux_outputs_dict=train_sample_aux_outputs,
+                            skeleton_dict=skeleton_dict,
+                            train_skeleton_dict=train_skeleton_dict,
+                            unlabeled_input=unlabeled_input,
+                            unlabeled_pseudo_dict=unlabeled_pseudo,
+                            unlabeled_outputs_dict=unlabeled_pred,
+                            save_media=save_debug_media,
+                        )
+                        debug_guide_preview_image = self._make_feature_encoder_guide_preview_image(
+                            raw_aux_outputs_dict_first,
+                            train_aux_outputs_dict=train_sample_raw_aux_outputs,
+                        )
+                        if save_debug_media and debug_guide_preview_image is not None:
+                            self._save_preview_image(debug_guide_preview_image, guide_debug_img_path)
+                        if save_debug_media:
+                            debug_gif_history.append((epoch, debug_img_path))
 
                     print(f"\n[Validation] Epoch {epoch + 1} summary:")
                     total_val_loss = 0.0
