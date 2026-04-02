@@ -106,6 +106,9 @@ def test_ps128_guided_feature_skip_concat_config_loads_and_builds():
     assert model.guide_enabled is True
     assert model.final_config["guide_fusion_stage"] == "feature_skip_concat"
     assert model.final_config["guide_stage_keys"] == ["enc_0", "enc_1", "enc_2", "enc_3", "enc_4"]
+    assert model.final_config["guide_feature_gate_alpha"] is None
+    assert model.final_config["guide_tokenbook_tokens"] is None
+    assert model.final_config["guide_tokenbook_prototype_weighting"] is None
 
 
 def test_ps256_guided_feature_skip_concat_medial_config_loads_and_builds():
@@ -116,6 +119,9 @@ def test_ps256_guided_feature_skip_concat_medial_config_loads_and_builds():
     assert list(mgr.targets.keys()) == ["surface"]
     assert model.guide_enabled is True
     assert model.final_config["guide_fusion_stage"] == "feature_skip_concat"
+    assert model.final_config["guide_feature_gate_alpha"] is None
+    assert model.final_config["guide_tokenbook_tokens"] is None
+    assert model.final_config["guide_tokenbook_prototype_weighting"] is None
 
 
 def test_ps256_guided_feature_skip_concat_dicece_config_loads_and_builds():
@@ -126,3 +132,6 @@ def test_ps256_guided_feature_skip_concat_dicece_config_loads_and_builds():
     assert list(mgr.targets.keys()) == ["surface"]
     assert model.guide_enabled is True
     assert model.final_config["guide_fusion_stage"] == "feature_skip_concat"
+    assert model.final_config["guide_feature_gate_alpha"] is None
+    assert model.final_config["guide_tokenbook_tokens"] is None
+    assert model.final_config["guide_tokenbook_prototype_weighting"] is None

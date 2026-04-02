@@ -22,12 +22,7 @@ model_config:
   guide_backbone: "/home/giorgio/Projects/dino-vesuvius/dino-checkpoints/checkpoint_step_342500.pt"
   guide_fusion_stage: "feature_skip_concat"
   guide_compile_policy: "all_guidance"
-  guide_feature_gate_alpha: 0.9
   guide_freeze: true
-  guide_tokenbook_dropout: 0.0
-  guide_tokenbook_sample_rate: 1.0
-  guide_tokenbook_ema_decay: null
-  guide_tokenbook_use_ema: false
 
 dataset_config:
   min_labeled_ratio: 0.01
