@@ -420,11 +420,7 @@ def train(config_path):
                 align_corners=True,
             )
             targets = batch['flat_target']
-            ignore_mask = (
-                (batch['flat_supervision'] <= 0)
-                | (batch['flat_valid'] <= 0)
-                | (pooled_valid <= 0)
-            ).to(dtype=targets.dtype)
+            ignore_mask = ((batch['flat_supervision'] <= 0) | (batch['flat_valid'] <= 0) | (pooled_valid <= 0)).to(dtype=targets.dtype)
             return pooled_logits, targets, ignore_mask
 
         if mode == 'full_3d':
