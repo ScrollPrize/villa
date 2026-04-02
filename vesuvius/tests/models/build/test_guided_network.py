@@ -52,6 +52,7 @@ def _make_mgr(
     guide_compile_policy: str | None = None,
     guide_fusion_stage: str | None = None,
     guide_tokenbook_prototype_weighting: str | None = None,
+    guide_feature_gate_alpha: float | None = None,
 ) -> SimpleNamespace:
     guided_config = {}
     if guide_tokenbook_tokens is not None:
@@ -62,6 +63,8 @@ def _make_mgr(
         guided_config["guide_fusion_stage"] = str(guide_fusion_stage)
     if guide_tokenbook_prototype_weighting is not None:
         guided_config["guide_tokenbook_prototype_weighting"] = str(guide_tokenbook_prototype_weighting)
+    if guide_feature_gate_alpha is not None:
+        guided_config["guide_feature_gate_alpha"] = float(guide_feature_gate_alpha)
     return SimpleNamespace(
         targets={"ink": {"out_channels": 1, "activation": "none"}},
         train_patch_size=(16, 16, 16),
@@ -156,7 +159,54 @@ def test_feature_encoder_guidance_returns_encoder_stage_aux_outputs(tmp_path: Pa
     assert aux["enc_2"].shape == (2, 1, 4, 4, 4)
     assert model.final_config["guide_fusion_stage"] == "feature_encoder"
     assert model.final_config["guide_stage_keys"] == ["enc_0", "enc_1", "enc_2"]
+    assert model.final_config["guide_feature_gate_alpha"] == pytest.approx(1.0)
     assert len(model.guide_stage_tokenbooks) == 3
+
+def test_encoder_skip_only_feature_gating_uses_residual_alpha_formula():
+    class _TestStage(torch.nn.Module):
+        def __init__(self, value: float):
+            super().__init__()
+            self.value = value
+            self.last_input = None
+
+        def forward(self, x):
+            self.last_input = x.detach().clone()
+            return torch.full_like(x, self.value)
+
+    from vesuvius.models.build.encoder import Encoder
+
+    test_encoder = Encoder.__new__(Encoder)
+    torch.nn.Module.__init__(test_encoder)
+    stage0 = _TestStage(2.0)
+    stage1 = _TestStage(3.0)
+    test_encoder.stem = None
+    test_encoder.stages = torch.nn.Sequential(stage0, stage1)
+    test_encoder.output_channels = [1, 1]
+    test_encoder.strides = [[1, 1, 1], [1, 1, 1]]
+    test_encoder.return_skips = True
+    test_encoder.conv_op = torch.nn.Conv3d
+    test_encoder.norm_op = None
+    test_encoder.norm_op_kwargs = {}
+    test_encoder.nonlin = None
+    test_encoder.nonlin_kwargs = {}
+    test_encoder.dropout_op = None
+    test_encoder.dropout_op_kwargs = {}
+    test_encoder.conv_bias = True
+    test_encoder.kernel_sizes = [[3, 3, 3], [3, 3, 3]]
+
+    x = torch.ones((1, 1, 2, 2, 2), dtype=torch.float32)
+    feature_gates = {
+        "enc_0": torch.full((1, 1, 2, 2, 2), 0.5, dtype=torch.float32),
+        "enc_1": torch.full((1, 1, 2, 2, 2), 0.25, dtype=torch.float32),
+    }
+
+    skips = test_encoder(x, feature_gates=feature_gates, feature_gate_alpha=0.9)
+
+    expected_stage0_skip = 2.0 * (0.1 + 0.9 * 0.5)
+    expected_stage1_skip = 3.0 * (0.1 + 0.9 * 0.25)
+    assert torch.allclose(skips[0], torch.full_like(skips[0], expected_stage0_skip))
+    assert torch.allclose(skips[1], torch.full_like(skips[1], expected_stage1_skip))
+    assert torch.allclose(stage1.last_input, torch.full_like(stage1.last_input, 2.0))
 
 
 def test_guided_network_backprop_updates_tokenbook_but_not_frozen_guide_backbone(tmp_path: Path):
@@ -343,6 +393,36 @@ def test_feature_encoder_guidance_records_exact_fusion_stage(tmp_path: Path):
 
     assert model.guide_fusion_stage == "feature_encoder"
     assert model.final_config["guide_fusion_stage"] == "feature_encoder"
+    assert model.guide_feature_gate_alpha == pytest.approx(1.0)
+
+
+def test_feature_encoder_guidance_records_configured_gate_alpha(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_fusion_stage="feature_encoder",
+        guide_feature_gate_alpha=0.9,
+    )
+    model = NetworkFromConfig(mgr)
+
+    assert model.guide_feature_gate_alpha == pytest.approx(0.9)
+    assert model.final_config["guide_feature_gate_alpha"] == pytest.approx(0.9)
+
+
+def test_feature_encoder_guidance_rejects_invalid_gate_alpha(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_fusion_stage="feature_encoder",
+        guide_feature_gate_alpha=1.5,
+    )
+
+    with pytest.raises(ValueError, match="guide_feature_gate_alpha"):
+        NetworkFromConfig(mgr)
 
 
 def test_feature_encoder_guidance_records_token_mlp_weighting(tmp_path: Path):
