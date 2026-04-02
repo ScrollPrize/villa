@@ -28,7 +28,7 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
         for (int r = 0; r < b.totalRows; ++r) {
             for (int c = 0; c < b.totalCols; ++c) {
                 if (auto* item = itemAt(c, r)) {
-                    item->setPos(padX + c * TILE_PX, padY + r * TILE_PX);
+                    item->setPos(padX + static_cast<float>(c) * TILE_PX, padY + static_cast<float>(r) * TILE_PX);
                 }
             }
         }
@@ -49,10 +49,10 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
         return;
     }
 
-    const int contentPxW = b.totalCols * TILE_PX;
-    const int contentPxH = b.totalRows * TILE_PX;
-    const int sceneW = std::max(contentPxW, viewportW);
-    const int sceneH = std::max(contentPxH, viewportH);
+    const float contentPxW = static_cast<float>(b.totalCols) * TILE_PX;
+    const float contentPxH = static_cast<float>(b.totalRows) * TILE_PX;
+    const float sceneW = std::max(contentPxW, static_cast<float>(viewportW));
+    const float sceneH = std::max(contentPxH, static_cast<float>(viewportH));
     _scene->setSceneRect(0, 0, sceneW, sceneH);
 
     // Build new grid, carrying over pixmaps from old items at matching world positions.
@@ -76,7 +76,7 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
             }
 
             auto* item = _scene->addPixmap(carried.isNull() ? QPixmap() : carried);
-            item->setPos(padX + c * TILE_PX, padY + r * TILE_PX);
+            item->setPos(padX + static_cast<float>(c) * TILE_PX, padY + static_cast<float>(r) * TILE_PX);
             item->setZValue(0);
             _items[r * b.totalCols + c] = item;
         }

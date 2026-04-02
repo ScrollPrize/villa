@@ -41,12 +41,16 @@ struct WorldTileKeyHash {
 
 // Content bounds describing the full tile grid covering all content
 struct ContentBounds {
-    int firstWorldCol = 0;  // world column of leftmost tile
-    int firstWorldRow = 0;  // world row of topmost tile
+    int firstWorldCol = 0;  // world column of leftmost tile (for tile identity)
+    int firstWorldRow = 0;  // world row of topmost tile (for tile identity)
     int totalCols = 0;      // number of tile columns
     int totalRows = 0;      // number of tile rows
     float worldTileSize = 0; // surface units per tile = TILE_PX / scale
     float scale = 0;        // current zoom scale
+    // Float grid origin in surface space (exact, no int quantization).
+    // Used for pixel positioning — avoids the jitter from integer firstWorldCol.
+    float originSurfX = 0;  // = firstWorldCol * worldTileSize
+    float originSurfY = 0;  // = firstWorldRow * worldTileSize
 
     constexpr bool operator==(const ContentBounds& o) const noexcept {
         return firstWorldCol == o.firstWorldCol && firstWorldRow == o.firstWorldRow &&

@@ -113,14 +113,14 @@ TileRenderResult TileRenderer::renderTile(
     // These are used by both the fused path and the AABB quick-reject.
     cv::Vec3f planeOrigin, planeVxStep, planeVyStep, planeNormal;
     if (plane) {
-        float m = 1.0f / params.scale;
         cv::Vec3f totalOffset(params.surfaceROI.x, params.surfaceROI.y, params.zOff);
         cv::Vec3f vx = plane->basisX();
         cv::Vec3f vy = plane->basisY();
         planeNormal = plane->normal(cv::Vec3f(0, 0, 0));
         cv::Vec3f useOrigin = plane->origin() + planeNormal * totalOffset[2];
-        planeVxStep = vx * m;
-        planeVyStep = vy * m;
+        // Division is more numerically stable than multiply-by-reciprocal
+        planeVxStep = vx / params.scale;
+        planeVyStep = vy / params.scale;
         planeOrigin = vx * totalOffset[0] + vy * totalOffset[1] + useOrigin;
     }
 

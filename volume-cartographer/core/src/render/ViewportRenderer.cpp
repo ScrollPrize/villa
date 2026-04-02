@@ -37,8 +37,8 @@ void ViewportRenderer::onCameraChanged(
     bool epochChanged = (camera.epoch != _currentEpoch->load(std::memory_order_relaxed));
 
     if (!epochChanged &&
-        vpLeft == _lastVpL && vpTop == _lastVpT &&
-        vpRight == _lastVpR && vpBottom == _lastVpB) {
+        std::abs(vpLeft - _lastVpL) < 0.5f && std::abs(vpTop - _lastVpT) < 0.5f &&
+        std::abs(vpRight - _lastVpR) < 0.5f && std::abs(vpBottom - _lastVpB) < 0.5f) {
         return;
     }
 
@@ -70,7 +70,7 @@ void ViewportRenderer::onCameraChanged(
         auto cs = volume->tieredCache()->chunkShape(camera.dsScaleIdx);
         float worldTileSize = _tileGrid.bounds().worldTileSize;
         if (worldTileSize > 0)
-            chunkGroupSize = std::max(1, static_cast<int>(cs[1] / worldTileSize));
+            chunkGroupSize = std::max(1, static_cast<int>(std::round(cs[1] / worldTileSize)));
     }
 
     // Sort by chunk group (center-first within groups) for cache locality.
@@ -94,10 +94,12 @@ void ViewportRenderer::onCameraChanged(
                     float dgb = (gbCx - vcx) * (gbCx - vcx) + (gbCy - vcy) * (gbCy - vcy);
                     return dga < dgb;
                 }
-                float da = (a.worldCol - vcx) * (a.worldCol - vcx)
-                         + (a.worldRow - vcy) * (a.worldRow - vcy);
-                float db = (b.worldCol - vcx) * (b.worldCol - vcx)
-                         + (b.worldRow - vcy) * (b.worldRow - vcy);
+                float dax = static_cast<float>(a.worldCol) - vcx;
+                float day = static_cast<float>(a.worldRow) - vcy;
+                float dbx = static_cast<float>(b.worldCol) - vcx;
+                float dby = static_cast<float>(b.worldRow) - vcy;
+                float da = dax * dax + day * day;
+                float db = dbx * dbx + dby * dby;
                 return da < db;
             });
     }

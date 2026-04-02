@@ -564,13 +564,16 @@ void CTiledVolumeViewer::rebuildContentGrid()
         int lastRow = static_cast<int>(std::floor(contentMaxY / bounds.worldTileSize));
         bounds.totalCols = lastCol - bounds.firstWorldCol + 1;
         bounds.totalRows = lastRow - bounds.firstWorldRow + 1;
+        // Float origin: exact surface coord of grid top-left (no int quantization)
+        bounds.originSurfX = static_cast<float>(bounds.firstWorldCol) * bounds.worldTileSize;
+        bounds.originSurfY = static_cast<float>(bounds.firstWorldRow) * bounds.worldTileSize;
     }
 
     // Store full content extent for pan clamping before any grid capping
-    _fullContentMinU = bounds.firstWorldCol * bounds.worldTileSize;
-    _fullContentMaxU = (bounds.firstWorldCol + bounds.totalCols) * bounds.worldTileSize;
-    _fullContentMinV = bounds.firstWorldRow * bounds.worldTileSize;
-    _fullContentMaxV = (bounds.firstWorldRow + bounds.totalRows) * bounds.worldTileSize;
+    _fullContentMinU = static_cast<float>(bounds.firstWorldCol) * bounds.worldTileSize;
+    _fullContentMaxU = static_cast<float>(bounds.firstWorldCol + bounds.totalCols) * bounds.worldTileSize;
+    _fullContentMinV = static_cast<float>(bounds.firstWorldRow) * bounds.worldTileSize;
+    _fullContentMaxV = static_cast<float>(bounds.firstWorldRow + bounds.totalRows) * bounds.worldTileSize;
 
     // Cap grid size to prevent freeze at extreme zoom.
     // At 10x zoom on a large volume, uncapped grid can have 20,000+ tiles.
@@ -933,10 +936,9 @@ void CTiledVolumeViewer::adjustZoomByFactor(float factor)
     int steps = (factor > 1.0f) ? 1 : (factor < 1.0f) ? -1 : 0;
     if (steps == 0) return;
 
-    // Zoom centered on viewport center
-    QSize vpSize = fGraphicsView->viewport()->size();
-    QPointF vpCenter(vpSize.width() * 0.5, vpSize.height() * 0.5);
-    QPointF sceneCenter = fGraphicsView->mapToScene(vpCenter.toPoint());
+    // Zoom centered on camera position (avoids Qt's integer viewport rounding)
+    QPointF sceneCenter = _tileScene->surfaceToScene(
+        _camera.surfacePtr[0], _camera.surfacePtr[1]);
     zoomStepsAt(steps, sceneCenter);
 }
 
@@ -1226,9 +1228,9 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
 
     const bool interactionActive = _isPanning;
 
-    // Surface parameter ROI from world tile coordinates
-    params.surfaceROI.x = wk.worldCol * _contentBounds.worldTileSize;
-    params.surfaceROI.y = wk.worldRow * _contentBounds.worldTileSize;
+    // Surface parameter ROI from world tile coordinates (float throughout)
+    params.surfaceROI.x = static_cast<float>(wk.worldCol) * _contentBounds.worldTileSize;
+    params.surfaceROI.y = static_cast<float>(wk.worldRow) * _contentBounds.worldTileSize;
     params.surfaceROI.width = _contentBounds.worldTileSize;
     params.surfaceROI.height = _contentBounds.worldTileSize;
 

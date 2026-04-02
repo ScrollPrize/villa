@@ -38,13 +38,13 @@ bool TileGrid::rebuildGrid(const ContentBounds& bounds, int viewportW, int viewp
         return true;
     }
 
-    const int contentPxW = _bounds.totalCols * TILE_PX;
-    const int contentPxH = _bounds.totalRows * TILE_PX;
-    const int sceneW = std::max(contentPxW, viewportW);
-    const int sceneH = std::max(contentPxH, viewportH);
+    const float contentPxW = static_cast<float>(_bounds.totalCols) * TILE_PX;
+    const float contentPxH = static_cast<float>(_bounds.totalRows) * TILE_PX;
+    const float sceneW = std::max(contentPxW, static_cast<float>(viewportW));
+    const float sceneH = std::max(contentPxH, static_cast<float>(viewportH));
 
-    _padX = static_cast<float>(sceneW - contentPxW) * 0.5f;
-    _padY = static_cast<float>(sceneH - contentPxH) * 0.5f;
+    _padX = (sceneW - contentPxW) * 0.5f;
+    _padY = (sceneH - contentPxH) * 0.5f;
 
     const int count = _bounds.totalRows * _bounds.totalCols;
     _meta.resize(count);
@@ -181,15 +181,14 @@ void TileGrid::clear()
 
 cv::Vec2f TileGrid::surfaceToGrid(float surfX, float surfY) const
 {
-    if (_bounds.worldTileSize <= 0) {
+    if (_bounds.scale <= 0) {
         return {_padX, _padY};
     }
-    // Use scale directly: surfX * scale gives pixel offset from surface origin.
-    // Subtracting firstWorldCol * TILE_PX gives grid-relative pixel position.
-    // This avoids the division by worldTileSize which introduces rounding jitter.
-    const float scale = _bounds.scale;
-    const float gridX = surfX * scale - static_cast<float>(_bounds.firstWorldCol) * TILE_PX + _padX;
-    const float gridY = surfY * scale - static_cast<float>(_bounds.firstWorldRow) * TILE_PX + _padY;
+    // All float: (surfX - originSurf) * scale + pad.
+    // originSurfX is the float surface coordinate of the grid's top-left corner.
+    // No integer tile math in the positioning path — eliminates quantization jitter.
+    const float gridX = (surfX - _bounds.originSurfX) * _bounds.scale + _padX;
+    const float gridY = (surfY - _bounds.originSurfY) * _bounds.scale + _padY;
     return {gridX, gridY};
 }
 
@@ -198,10 +197,9 @@ cv::Vec2f TileGrid::gridToSurface(float gridX, float gridY) const
     if (_bounds.scale <= 0) {
         return {0, 0};
     }
-    // Exact inverse of surfaceToGrid: surfX = (gridX - padX + firstWorldCol * TILE_PX) / scale
-    const float invScale = 1.0f / _bounds.scale;
-    const float surfX = (gridX - _padX + static_cast<float>(_bounds.firstWorldCol) * TILE_PX) * invScale;
-    const float surfY = (gridY - _padY + static_cast<float>(_bounds.firstWorldRow) * TILE_PX) * invScale;
+    // Exact inverse of surfaceToGrid: surfX = (gridX - padX) / scale + originSurfX
+    const float surfX = (gridX - _padX) / _bounds.scale + _bounds.originSurfX;
+    const float surfY = (gridY - _padY) / _bounds.scale + _bounds.originSurfY;
     return {surfX, surfY};
 }
 
@@ -217,10 +215,13 @@ void TileGrid::visibleGridRange(float vpL, float vpT, float vpR, float vpB, int 
         return;
     }
 
-    firstCol = static_cast<int>(std::floor((vpL - _padX) / TILE_PX)) - buffer;
-    firstRow = static_cast<int>(std::floor((vpT - _padY) / TILE_PX)) - buffer;
-    lastCol  = static_cast<int>(std::floor((vpR - _padX) / TILE_PX)) + buffer;
-    lastRow  = static_cast<int>(std::floor((vpB - _padY) / TILE_PX)) + buffer;
+    const float tilePx = static_cast<float>(TILE_PX);
+    firstCol = static_cast<int>(std::floor((vpL - _padX) / tilePx)) - buffer;
+    firstRow = static_cast<int>(std::floor((vpT - _padY) / tilePx)) - buffer;
+    // Right/bottom: pixel vpR extends into the tile at floor(vpR/tilePx),
+    // so use floor (not ceil-1) — same as left/top but without subtracting 1.
+    lastCol  = static_cast<int>(std::floor((vpR - _padX) / tilePx)) + buffer;
+    lastRow  = static_cast<int>(std::floor((vpB - _padY) / tilePx)) + buffer;
 
     firstCol = std::max(0, firstCol);
     firstRow = std::max(0, firstRow);
