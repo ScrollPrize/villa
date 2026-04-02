@@ -464,6 +464,37 @@ def test_feature_encoder_trainer_builds_stage_montage_and_media_payload(tmp_path
     assert set(payload.keys()) == {"debug_image", "debug_guide_image"}
 
 
+def test_feature_encoder_trainer_builds_train_and_val_stage_montage(tmp_path: Path):
+    mgr = _make_mgr(
+        tmp_path,
+        tmp_path / "guide_backbone.pt",
+        guide_fusion_stage="feature_encoder",
+        guide_loss_weight=0.0,
+        guide_tokenbook_prototype_weighting="token_mlp",
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    val_aux_outputs_dict = {
+        "enc_0": torch.zeros((1, 1, 8, 8, 8), dtype=torch.float32),
+        "enc_1": torch.zeros((1, 1, 4, 4, 4), dtype=torch.float32),
+        "enc_2": torch.zeros((1, 1, 2, 2, 2), dtype=torch.float32),
+    }
+    train_aux_outputs_dict = {
+        "enc_0": torch.ones((1, 1, 8, 8, 8), dtype=torch.float32),
+        "enc_1": torch.ones((1, 1, 4, 4, 4), dtype=torch.float32),
+        "enc_2": torch.ones((1, 1, 2, 2, 2), dtype=torch.float32),
+    }
+
+    guide_preview = trainer._make_feature_encoder_guide_preview_image(
+        val_aux_outputs_dict,
+        train_aux_outputs_dict=train_aux_outputs_dict,
+    )
+
+    assert guide_preview is not None
+    assert guide_preview.ndim == 3
+    assert guide_preview.shape[2] == 3
+    assert guide_preview.shape[:2] == (76, 24)
+
+
 class _DummyDataset:
     def __len__(self):
         return 1
