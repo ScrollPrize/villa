@@ -255,6 +255,8 @@ class NetworkFromConfig(nn.Module):
         self.guide_enabled = bool(self.guide_backbone_name)
         self.guide_backbone = None
         self.guide_tokenbook = None
+        self.guide_stage_tokenbooks = nn.ModuleDict()
+        self.guide_stage_keys = None
         self.guide_patch_grid = None
         self.guide_freeze = bool(model_config.get("guide_freeze", True))
         guide_compile_policy = str(model_config.get("guide_compile_policy", "off")).strip().lower()
@@ -274,9 +276,10 @@ class NetworkFromConfig(nn.Module):
                 raise ValueError("guide_backbone cannot be combined with pretrained_backbone in v1")
             if self.architecture_type.lower().startswith("primus"):
                 raise ValueError("guide_backbone is not supported with primus architectures in v1")
-            if self.guide_fusion_stage not in {"input", "input_gating"}:
+            if self.guide_fusion_stage not in {"input", "input_gating", "feature_encoder"}:
                 raise ValueError(
-                    "Unsupported guide_fusion_stage for v1. Only input-space gating is implemented."
+                    "Unsupported guide_fusion_stage. Expected one of "
+                    "{'input', 'input_gating', 'feature_encoder'}."
                 )
 
         if self.pretrained_backbone:
@@ -747,7 +750,7 @@ class NetworkFromConfig(nn.Module):
             self.task_activations[target_name] = get_activation_module(activation_str)
             print(f"Task '{target_name}' configured with separate decoder ({out_channels} channels)")
 
-        self._init_input_guidance(model_config)
+        self._init_guidance(model_config)
 
         # --------------------------------------------------------------------
         # Build final configuration snapshot.
@@ -797,16 +800,23 @@ class NetworkFromConfig(nn.Module):
             "guide_backbone_config_path": self.guide_backbone_config_path,
             "guide_freeze": self.guide_freeze,
             "guide_patch_grid": self.guide_patch_grid,
+            "guide_stage_keys": list(self.guide_stage_keys) if self.guide_stage_keys is not None else None,
             "guide_tokenbook_tokens": getattr(self, "guide_tokenbook_tokens", None),
             "guide_compile_policy": self.guide_compile_policy if self.guide_enabled else "off",
-            "guide_fusion_stage": "input" if self.guide_enabled else None,
+            "guide_fusion_stage": self.guide_fusion_stage if self.guide_enabled else None,
         }
 
         print("NetworkFromConfig initialized with final configuration:")
         for k, v in self.final_config.items():
             print(f"  {k}: {v}")
 
-    def _init_input_guidance(self, model_config):
+    def _guide_uses_input_gating(self) -> bool:
+        return self.guide_enabled and self.guide_fusion_stage in {"input", "input_gating"}
+
+    def _guide_uses_encoder_feature_gating(self) -> bool:
+        return self.guide_enabled and self.guide_fusion_stage == "feature_encoder"
+
+    def _init_guidance(self, model_config):
         if not self.guide_enabled:
             return
 
@@ -836,13 +846,24 @@ class NetworkFromConfig(nn.Module):
             if token_count <= 0:
                 raise ValueError(f"guide_tokenbook_tokens must be > 0, got {token_count}")
         self.guide_tokenbook_tokens = token_count
-        self.guide_tokenbook = TokenBook3D(
-            n_tokens=token_count,
-            embed_dim=int(self.guide_backbone.embed_dim),
-            dropout=float(model_config.get("guide_tokenbook_dropout", 0.0)),
-            ema_decay=model_config.get("guide_tokenbook_ema_decay"),
-            use_ema=bool(model_config.get("guide_tokenbook_use_ema", False)),
-        )
+        tokenbook_kwargs = {
+            "n_tokens": token_count,
+            "embed_dim": int(self.guide_backbone.embed_dim),
+            "dropout": float(model_config.get("guide_tokenbook_dropout", 0.0)),
+            "ema_decay": model_config.get("guide_tokenbook_ema_decay"),
+            "use_ema": bool(model_config.get("guide_tokenbook_use_ema", False)),
+        }
+        if self._guide_uses_input_gating():
+            self.guide_tokenbook = TokenBook3D(**tokenbook_kwargs)
+            self.guide_stage_keys = None
+        elif self._guide_uses_encoder_feature_gating():
+            self.guide_stage_keys = [f"enc_{stage_idx}" for stage_idx in range(self.num_stages)]
+            self.guide_stage_tokenbooks = nn.ModuleDict(
+                {
+                    stage_key: TokenBook3D(**tokenbook_kwargs)
+                    for stage_key in self.guide_stage_keys
+                }
+            )
         self.guide_tokenbook_sample_rate = float(model_config.get("guide_tokenbook_sample_rate", 1.0))
 
         if self.guide_freeze:
@@ -881,20 +902,28 @@ class NetworkFromConfig(nn.Module):
         elif self.guide_compile_policy == "tokenbook_only" and self.guide_tokenbook is not None:
             self.guide_tokenbook = self._compile_module_in_place(self.guide_tokenbook)
             compiled_modules.append("guide_tokenbook")
+        elif self.guide_compile_policy == "tokenbook_only" and len(self.guide_stage_tokenbooks) > 0:
+            for stage_key in list(self.guide_stage_tokenbooks.keys()):
+                self.guide_stage_tokenbooks[stage_key] = self._compile_module_in_place(
+                    self.guide_stage_tokenbooks[stage_key]
+                )
+                compiled_modules.append(f"guide_tokenbook:{stage_key}")
         return compiled_modules
+
+    @torch.compiler.disable(reason="guided backbone compile failure")
+    def _compute_guide_features(self, x):
+        if self.guide_freeze:
+            with torch.inference_mode():
+                frozen_features = self.guide_backbone(x)[0]
+            return frozen_features.clone()
+        return self.guide_backbone(x)[0]
 
     @torch.compiler.disable(reason="guided backbone compile failure")
     def _apply_input_guidance(self, x):
         if not self.guide_enabled:
             return x, {}
 
-        if self.guide_freeze:
-            with torch.inference_mode():
-                frozen_features = self.guide_backbone(x)[0]
-            guide_features = frozen_features.clone()
-        else:
-            guide_features = self.guide_backbone(x)[0]
-
+        guide_features = self._compute_guide_features(x)
         token_mask = self._sample_guide_token_mask(guide_features)
         guide_mask = self.guide_tokenbook(guide_features, token_mask=token_mask)
         guide_for_input = F.interpolate(
@@ -904,6 +933,42 @@ class NetworkFromConfig(nn.Module):
             align_corners=False,
         )
         return x * guide_for_input, {"guide_mask": guide_mask}
+
+    def _get_encoder_stage_shapes(self, input_spatial_shape):
+        current_shape = [int(v) for v in input_spatial_shape]
+        stage_shapes = []
+        for stride in self.shared_encoder.strides:
+            current_shape = [
+                max(1, math.ceil(size / int(step)))
+                for size, step in zip(current_shape, stride)
+            ]
+            stage_shapes.append(tuple(current_shape))
+        return stage_shapes
+
+    @torch.compiler.disable(reason="guided backbone compile failure")
+    def _build_encoder_feature_guidance(self, x):
+        if not self._guide_uses_encoder_feature_gating():
+            return {}, {}
+
+        guide_features = self._compute_guide_features(x)
+        token_mask = self._sample_guide_token_mask(guide_features)
+        stage_shapes = self._get_encoder_stage_shapes(x.shape[2:])
+
+        feature_gates = {}
+        aux_outputs = {}
+        for stage_idx, stage_key in enumerate(self.guide_stage_keys or []):
+            stage_guide = self.guide_stage_tokenbooks[stage_key](guide_features, token_mask=token_mask)
+            target_shape = stage_shapes[stage_idx]
+            if stage_guide.shape[2:] != target_shape:
+                stage_guide = F.interpolate(
+                    stage_guide,
+                    size=target_shape,
+                    mode="trilinear",
+                    align_corners=False,
+                )
+            feature_gates[stage_key] = stage_guide
+            aux_outputs[stage_key] = stage_guide
+        return feature_gates, aux_outputs
     
     def _init_pretrained_backbone(self, mgr, model_config):
         print(f"--- Initializing pretrained backbone '{self.pretrained_backbone}' ---")
@@ -1172,9 +1237,12 @@ class NetworkFromConfig(nn.Module):
         # Check input channels and warn if mismatch
         self.check_input_channels(x)
         aux_outputs = {}
+        encoder_feature_gates = None
 
-        if self.guide_enabled:
+        if self._guide_uses_input_gating():
             x, aux_outputs = self._apply_input_guidance(x)
+        elif self._guide_uses_encoder_feature_gating():
+            encoder_feature_gates, aux_outputs = self._build_encoder_feature_guidance(x)
 
         # Get features from encoder (works for both U-Net and Primus)
         # For MAE training with Primus, we need to get the mask
@@ -1204,7 +1272,10 @@ class NetworkFromConfig(nn.Module):
                 )
         else:
             # Standard forward pass
-            features = self.shared_encoder(x)
+            if encoder_feature_gates is not None:
+                features = self.shared_encoder(x, feature_gates=encoder_feature_gates)
+            else:
+                features = self.shared_encoder(x)
             restoration_mask = None
         
         results = {}

@@ -152,12 +152,17 @@ class Encoder(nn.Module,):
         self.conv_bias = conv_bias
         self.kernel_sizes = kernel_sizes
 
-    def forward(self, x):
+    def forward(self, x, feature_gates=None):
         if self.stem is not None:
             x = self.stem(x)
         ret = []
-        for s in self.stages:
+        for stage_idx, s in enumerate(self.stages):
             x = s(x)
+            if feature_gates is not None:
+                stage_key = f"enc_{stage_idx}"
+                gate = feature_gates.get(stage_key)
+                if gate is not None:
+                    x = x * gate
             ret.append(x)
         if self.return_skips:
             return ret
@@ -175,5 +180,4 @@ class Encoder(nn.Module,):
             input_size = [i // j for i, j in zip(input_size, self.strides[s])]
 
         return output
-
 
