@@ -1,7 +1,6 @@
 import json
 import math
 import os
-from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
@@ -65,44 +64,6 @@ def _is_native_3d_training_mode(mode):
     return str(mode).strip().lower() in _NATIVE_3D_TRAINING_MODES
 
 
-def _disable_z_projection_for_3d_training_modes(config):
-    if not _is_native_3d_training_mode(config.get('mode', 'flat')):
-        return
-
-    model_config = config.setdefault('model_config', {})
-    model_config['z_projection_mode'] = 'none'
-
-    targets = config.get('targets') or {}
-    for target_info in targets.values():
-        if not isinstance(target_info, dict):
-            continue
-        target_info['z_projection_mode'] = 'none'
-        if isinstance(target_info.get('z_projection'), dict):
-            target_info['z_projection']['mode'] = 'none'
-
-
-def _disable_z_projection_for_normal_pooled_3d(config):
-    _disable_z_projection_for_3d_training_modes(config)
-
-
-def _select_full_3d_preview_z_index(supervision_mask: torch.Tensor) -> int:
-    if supervision_mask.ndim == 4:
-        supervision_mask = supervision_mask.unsqueeze(1)
-    elif supervision_mask.ndim != 5:
-        raise ValueError(
-            f"Expected supervision_mask with shape [B, 1, Z, Y, X] or [B, Z, Y, X], got {tuple(supervision_mask.shape)}"
-        )
-
-    if int(supervision_mask.shape[2]) <= 0:
-        raise ValueError("supervision_mask must have positive depth for preview selection")
-
-    per_slice_supervision = supervision_mask.float().sum(dim=(0, 1, 3, 4))
-    best_index = int(torch.argmax(per_slice_supervision).item())
-    if float(per_slice_supervision[best_index].item()) <= 0.0:
-        return int(supervision_mask.shape[2] // 2)
-    return best_index
-
-
 def _build_full_3d_preview_batch(
     batch: dict,
     preds: torch.Tensor,
@@ -114,7 +75,7 @@ def _build_full_3d_preview_batch(
             "full_3d previews expect preds, targets, and ignore_mask with shape [B, 1, Z, Y, X]"
         )
 
-    z_index = _select_full_3d_preview_z_index(batch['supervision_mask'])
+    z_index = int(batch['supervision_mask'].shape[-3] // 2)
 
     preview_batch = dict(batch)
     image = batch['image']
@@ -141,72 +102,6 @@ def _build_full_3d_preview_batch(
         ignore_mask[:, :, z_index],
     )
 
-
-def _resolve_training_step_window(
-    start_step: int,
-    configured_num_iterations: int,
-    profile_steps: int | None,
-) -> tuple[int, int, int, int]:
-    if profile_steps is None:
-        return start_step, configured_num_iterations, configured_num_iterations, start_step
-    return start_step, start_step + profile_steps, profile_steps, 0
-
-
-def _record_dataset_profile_batch(profiler, batch):
-    if profiler is None or not profiler.enabled:
-        return
-
-    profile_timings = batch.get('profile_timings')
-    if not isinstance(profile_timings, list) or not profile_timings:
-        return
-
-    grouped = defaultdict(list)
-    for sample_timings in profile_timings:
-        if not isinstance(sample_timings, dict):
-            continue
-        for name, duration_seconds in sample_timings.items():
-            grouped[str(name)].append(float(duration_seconds))
-
-    for name, durations in grouped.items():
-        if durations:
-            profiler.add_duration(name, sum(durations) / len(durations))
-
-
-def _compute_normal_pooled_3d_background_loss(
-    volume_logits: torch.Tensor,
-    surface_mask: torch.Tensor,
-    *,
-    outside_threshold: float = 0.0,
-    loss_weight: float = 1.0,
-) -> torch.Tensor:
-    if volume_logits.ndim != 5:
-        raise ValueError(
-            f"Expected volume_logits with shape [B, 1, Z, Y, X], got {tuple(volume_logits.shape)}"
-        )
-    if surface_mask.ndim == 4:
-        surface_mask = surface_mask.unsqueeze(1)
-    elif surface_mask.ndim != 5:
-        raise ValueError(
-            f"Expected surface_mask with shape [B, 1, Z, Y, X] or [B, Z, Y, X], got {tuple(surface_mask.shape)}"
-        )
-    if tuple(int(v) for v in surface_mask.shape) != tuple(int(v) for v in volume_logits.shape):
-        raise ValueError(
-            f"surface_mask must match volume_logits shape, got {tuple(surface_mask.shape)} vs {tuple(volume_logits.shape)}"
-        )
-
-    loss_weight = float(loss_weight)
-    if loss_weight <= 0.0:
-        return volume_logits.new_zeros(())
-
-    outside_mask = surface_mask <= float(outside_threshold)
-    if not torch.any(outside_mask):
-        return volume_logits.new_zeros(())
-
-    outside_bg_loss = F.softplus(volume_logits.float())
-    outside_bg_loss = outside_bg_loss.masked_select(outside_mask).mean()
-    return outside_bg_loss * loss_weight
-
-
 def _forward_model_with_optional_shared_features(
     model,
     image: torch.Tensor,
@@ -230,56 +125,6 @@ def _forward_model_with_optional_shared_features(
         ),
         None,
     )
-
-
-def _primary_supervision_output(preds):
-    if isinstance(preds, (list, tuple)):
-        if len(preds) == 0:
-            raise ValueError("Deep supervision output list must not be empty")
-        return preds[0]
-    return preds
-
-
-def _float_supervision_tree(value):
-    if isinstance(value, (list, tuple)):
-        return type(value)(_float_supervision_tree(v) for v in value)
-    return value.float()
-
-
-def _build_targets_with_ignore_for_loss(loss_preds, targets, ignore_mask):
-    ds_targets = build_deep_supervision_targets(targets, loss_preds, mode='nearest')
-    ds_ignore = build_deep_supervision_targets(ignore_mask, loss_preds, mode='nearest')
-    if isinstance(ds_targets, (list, tuple)):
-        return type(ds_targets)(
-            torch.cat([target_level, ignore_level], dim=1)
-            for target_level, ignore_level in zip(ds_targets, ds_ignore)
-        )
-    return torch.cat([ds_targets, ds_ignore], dim=1)
-
-
-def _ddp_kwargs_from_config(config):
-    return DistributedDataParallelKwargs(
-        find_unused_parameters=bool(config.get('ddp_find_unused_parameters', True)),
-        broadcast_buffers=bool(config.get('ddp_broadcast_buffers', False)),
-    )
-
-
-def _distributed_mean_scalar(accelerator, value):
-    if isinstance(value, torch.Tensor):
-        tensor = value.detach()
-    else:
-        tensor = torch.tensor(float(value), device=accelerator.device)
-    tensor = tensor.to(device=accelerator.device, dtype=torch.float32).reshape(())
-    return accelerator.reduce(tensor, reduction='mean')
-
-
-def _distributed_mean_metrics(accelerator, metrics):
-    if not isinstance(metrics, dict):
-        return {}
-    return {
-        str(name): float(_distributed_mean_scalar(accelerator, metric_value).item())
-        for name, metric_value in metrics.items()
-    }
 
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
@@ -335,10 +180,16 @@ def train(config_path, profile_steps):
     use_feature_head = normal_pooled_mode and bool(feature_head_config.get('enabled', False))
     deep_supervision_enabled = bool(config.get('enable_deep_supervision', False))
     model_type = str(config.get('model_type', '')).strip().lower()
+    
     if normal_pooled_mode and model_type.startswith('resnet3d'):
         raise ValueError("normal_pooled_3d is currently only supported with the vesuvius_unet model path")
     if native_3d_mode:
-        _disable_z_projection_for_3d_training_modes(config)
+        config.setdefault('model_config', {})['z_projection_mode'] = 'none'
+        for target_info in (config.get('targets') or {}).values():
+            if isinstance(target_info, dict):
+                target_info['z_projection_mode'] = 'none'
+                if isinstance(target_info.get('z_projection'), dict):
+                    target_info['z_projection']['mode'] = 'none'
         config['in_channels'] = 2
 
     config.setdefault('volume_auth_json', None)
@@ -369,7 +220,10 @@ def train(config_path, profile_steps):
     val_preview_batches = config.get('val_preview_batches', 3)
 
     dataloader_config = accelerate.DataLoaderConfiguration(non_blocking = True)
-    ddp_kwargs = _ddp_kwargs_from_config(config)
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=bool(config.get('ddp_find_unused_parameters', True)),
+        broadcast_buffers=bool(config.get('ddp_broadcast_buffers', False)),
+    )
 
     # The training loop reuses the dataloader indefinitely, so keep accumulation boundaries independent of dataloader exhaustion.
     gradient_accumulation_plugin = GradientAccumulationPlugin(num_steps=grad_acc_steps, sync_with_dataloader=False)
@@ -557,10 +411,10 @@ def train(config_path, profile_steps):
     validation_confusion_metric = Confusion()
     validation_balanced_accuracy_metric = BalancedAccuracy()
     
-    loop_start, loop_stop, progress_total, progress_initial = _resolve_training_step_window(
-        start_step,
-        config['num_iterations'],
-        profile_steps,
+    loop_start, loop_stop, progress_total, progress_initial = (
+        (start_step, config['num_iterations'], config['num_iterations'], start_step)
+        if profile_steps is None
+        else (start_step, start_step + profile_steps, profile_steps, 0)
     )
     progress_bar = tqdm(
         range(loop_start, loop_stop),
@@ -595,9 +449,8 @@ def train(config_path, profile_steps):
             loss_preds = []
             targets = None
             ignore_mask = None
-            outside_bg_loss = None
             for idx, pred_level in enumerate(preds):
-                current_loss_preds, current_targets, current_ignore_mask, current_outside_bg_loss = prepare_loss_inputs(
+                current_loss_preds, current_targets, current_ignore_mask = prepare_loss_inputs(
                     pred_level,
                     batch,
                     profiler=profiler if idx == 0 else None,
@@ -607,8 +460,7 @@ def train(config_path, profile_steps):
                 if idx == 0:
                     targets = current_targets
                     ignore_mask = current_ignore_mask
-                    outside_bg_loss = current_outside_bg_loss
-            return type(preds)(loss_preds), targets, ignore_mask, outside_bg_loss
+            return type(preds)(loss_preds), targets, ignore_mask
 
         if normal_pooled_mode:
             total_section = profiler.section('normal_pooling/total', preds.device) if profiler is not None else nullcontext()
@@ -623,12 +475,6 @@ def train(config_path, profile_steps):
                             mode='trilinear',
                             align_corners=True,
                         )
-                outside_bg_loss = _compute_normal_pooled_3d_background_loss(
-                    preds,
-                    batch['surface_mask'].to(device=preds.device, dtype=preds.dtype),
-                    outside_threshold=float(pooling_config.get('outside_bg_threshold', 0.0)),
-                    loss_weight=float(pooling_config.get('outside_bg_loss_weight', 1.0)),
-                )
                 pool_section = profiler.section('normal_pooling/pool_logits_along_normals', preds.device) if profiler is not None else nullcontext()
                 with pool_section:
                     pooling_dtype = preds.dtype
@@ -668,7 +514,7 @@ def train(config_path, profile_steps):
                         | (batch['flat_valid'] <= 0)
                         | (pooled_valid <= 0)
                     ).to(dtype=targets.dtype)
-                return pooled_logits, targets, ignore_mask, outside_bg_loss
+                return pooled_logits, targets, ignore_mask
 
         if mode == 'full_3d':
             crop_shape = tuple(int(v) for v in batch['image'].shape[-3:])
@@ -685,12 +531,12 @@ def train(config_path, profile_steps):
                 )
             targets = batch['inklabels']
             ignore_mask = (batch['supervision_mask'] <= 0).to(dtype=targets.dtype)
-            return preds, targets, ignore_mask, preds.new_zeros(())
+            return preds, targets, ignore_mask
 
         targets = (torch.amax(batch['inklabels'], dim=2) > 0).to(dtype=batch['inklabels'].dtype)
         supervision_mask = torch.amax(batch['supervision_mask'], dim=2)
         ignore_mask = (supervision_mask <= 0).to(dtype=targets.dtype)
-        return preds, targets, ignore_mask, preds.new_zeros(())
+        return preds, targets, ignore_mask
 
     def refresh_progress_bar(current_train_loss):
         if not accelerator.is_main_process:
@@ -718,10 +564,16 @@ def train(config_path, profile_steps):
             except StopIteration:
                 train_iterator = iter(train_dl)
                 batch = next(train_iterator)
-        _record_dataset_profile_batch(
-            normal_pooling_profiler if normal_pooling_profiler.enabled else None,
-            batch,
-        )
+        if normal_pooling_profiler.enabled and batch.get('profile_timings'):
+            totals = {}
+            counts = {}
+            for sample_timings in batch['profile_timings']:
+                for name, duration_seconds in sample_timings.items():
+                    name = str(name)
+                    totals[name] = totals.get(name, 0.0) + float(duration_seconds)
+                    counts[name] = counts.get(name, 0) + 1
+            for name, total_duration in totals.items():
+                normal_pooling_profiler.add_duration(name, total_duration / counts[name])
 
         with accelerator.accumulate(model):
             forward_section = normal_pooling_profiler.section('model/forward', accelerator.device) if normal_pooling_profiler.enabled else nullcontext()
@@ -735,26 +587,38 @@ def train(config_path, profile_steps):
                         stitched=use_stitched_forward,
                         use_gradient_checkpointing=stitched_gradient_checkpointing,
                     )
-            loss_preds, targets, ignore_mask, outside_bg_loss = prepare_loss_inputs(
+            loss_preds, targets, ignore_mask = prepare_loss_inputs(
                 preds,
                 batch,
                 profiler=normal_pooling_profiler if normal_pooling_profiler.enabled else None,
                 feature_volume=feature_volume,
             )
-            primary_loss_preds = _primary_supervision_output(loss_preds)
+            primary_loss_preds = loss_preds[0] if isinstance(loss_preds, (list, tuple)) else loss_preds
             loss_section = normal_pooling_profiler.section('normal_pooling/loss', primary_loss_preds.device) if normal_pooling_profiler.enabled else nullcontext()
             with loss_section:
-                targets_with_ignore = _build_targets_with_ignore_for_loss(loss_preds, targets, ignore_mask)
-                l = loss(
-                    _float_supervision_tree(loss_preds),
-                    _float_supervision_tree(targets_with_ignore),
+                targets_with_ignore = build_deep_supervision_targets(targets, loss_preds, mode='nearest')
+                ds_ignore = build_deep_supervision_targets(ignore_mask, loss_preds, mode='nearest')
+                targets_with_ignore = (
+                    type(targets_with_ignore)(
+                        torch.cat([target_level, ignore_level], dim=1)
+                        for target_level, ignore_level in zip(targets_with_ignore, ds_ignore)
+                    )
+                    if isinstance(targets_with_ignore, (list, tuple))
+                    else torch.cat([targets_with_ignore, ds_ignore], dim=1)
                 )
-                l = l + outside_bg_loss
+                l = loss(
+                    type(loss_preds)(v.float() for v in loss_preds) if isinstance(loss_preds, (list, tuple)) else loss_preds.float(),
+                    (
+                        type(targets_with_ignore)(v.float() for v in targets_with_ignore)
+                        if isinstance(targets_with_ignore, (list, tuple))
+                        else targets_with_ignore.float()
+                    ),
+                )
             if not torch.isfinite(l):
                 raise RuntimeError(f"Non-finite loss at step {step}")
             backward_markers = _BackwardProfileMarkers.create(
                 normal_pooling_profiler if normal_pooling_profiler.enabled else None,
-                preds=_primary_supervision_output(preds),
+                preds=preds[0] if isinstance(preds, (list, tuple)) else preds,
                 loss_preds=primary_loss_preds,
             )
             if backward_markers is None:
@@ -787,7 +651,9 @@ def train(config_path, profile_steps):
                                 else:
                                     ema_value.copy_(model_value)
 
-        train_loss = float(_distributed_mean_scalar(accelerator, l).item())
+        train_loss = float(
+            accelerator.reduce(l.detach().to(device=accelerator.device, dtype=torch.float32).reshape(()), reduction='mean').item()
+        )
         if accelerator.is_main_process:
             refresh_progress_bar(train_loss)
 
@@ -797,13 +663,21 @@ def train(config_path, profile_steps):
                 'train/lr': optimizer.param_groups[0]['lr'],
                 'step': step,
             }
-            if normal_pooled_mode:
-                log_dict['train/outside_bg_loss'] = float(
-                    _distributed_mean_scalar(accelerator, outside_bg_loss).item()
-                )
             latest_loss_metrics = getattr(loss, 'latest_metrics', None)
             if isinstance(latest_loss_metrics, dict):
-                log_dict.update(_distributed_mean_metrics(accelerator, latest_loss_metrics))
+                log_dict.update({
+                    str(name): float(
+                        accelerator.reduce(
+                            (
+                                metric_value.detach()
+                                if isinstance(metric_value, torch.Tensor)
+                                else torch.tensor(float(metric_value), device=accelerator.device)
+                            ).to(device=accelerator.device, dtype=torch.float32).reshape(()),
+                            reduction='mean',
+                        ).item()
+                    )
+                    for name, metric_value in latest_loss_metrics.items()
+                })
             if wandb.run is not None:
                 wandb.log(log_dict, step=step)
 
@@ -817,7 +691,7 @@ def train(config_path, profile_steps):
             train_preview_preds = primary_loss_preds.detach()
             train_preview_targets = targets.detach()
             train_preview_ignore_mask = ignore_mask.detach()
-            train_preview_volume_logits = _primary_supervision_output(preds).detach() if normal_pooled_mode else None
+            train_preview_volume_logits = (preds[0] if isinstance(preds, (list, tuple)) else preds).detach() if normal_pooled_mode else None
             if mode == 'full_3d':
                 (
                     train_preview_batch,
@@ -871,24 +745,36 @@ def train(config_path, profile_steps):
                             stitched=use_stitched_forward,
                             use_gradient_checkpointing=stitched_gradient_checkpointing,
                         )
-                    val_loss_preds, val_targets, val_ignore_mask, val_outside_bg_loss = prepare_loss_inputs(
+                    val_loss_preds, val_targets, val_ignore_mask = prepare_loss_inputs(
                         val_preds,
                         val_batch,
                         feature_volume=val_feature_volume,
                     )
-                    primary_val_loss_preds = _primary_supervision_output(val_loss_preds)
+                    primary_val_loss_preds = val_loss_preds[0] if isinstance(val_loss_preds, (list, tuple)) else val_loss_preds
                     preview_preds = primary_val_loss_preds
-                    preview_volume_preds = _primary_supervision_output(val_preds)
-                    val_targets_with_ignore = _build_targets_with_ignore_for_loss(
-                        val_loss_preds,
-                        val_targets,
-                        val_ignore_mask,
+                    preview_volume_preds = val_preds[0] if isinstance(val_preds, (list, tuple)) else val_preds
+                    val_targets_with_ignore = build_deep_supervision_targets(val_targets, val_loss_preds, mode='nearest')
+                    ds_ignore = build_deep_supervision_targets(val_ignore_mask, val_loss_preds, mode='nearest')
+                    val_targets_with_ignore = (
+                        type(val_targets_with_ignore)(
+                            torch.cat([target_level, ignore_level], dim=1)
+                            for target_level, ignore_level in zip(val_targets_with_ignore, ds_ignore)
+                        )
+                        if isinstance(val_targets_with_ignore, (list, tuple))
+                        else torch.cat([val_targets_with_ignore, ds_ignore], dim=1)
                     )
                     val_l = loss(
-                        _float_supervision_tree(val_loss_preds),
-                        _float_supervision_tree(val_targets_with_ignore),
-                    ) + val_outside_bg_loss
-                    val_loss_total = val_loss_total + _distributed_mean_scalar(accelerator, val_l)
+                        type(val_loss_preds)(v.float() for v in val_loss_preds) if isinstance(val_loss_preds, (list, tuple)) else val_loss_preds.float(),
+                        (
+                            type(val_targets_with_ignore)(v.float() for v in val_targets_with_ignore)
+                            if isinstance(val_targets_with_ignore, (list, tuple))
+                            else val_targets_with_ignore.float()
+                        ),
+                    )
+                    val_loss_total = val_loss_total + accelerator.reduce(
+                        val_l.detach().to(device=accelerator.device, dtype=torch.float32).reshape(()),
+                        reduction='mean',
+                    )
                     val_loss_batches = val_loss_batches + 1.0
                     batch_counts = validation_confusion_metric.compute_batch(
                         ValidationMetricBatch(
@@ -921,27 +807,36 @@ def train(config_path, profile_steps):
                                 stitched=use_stitched_forward,
                                 use_gradient_checkpointing=stitched_gradient_checkpointing,
                             )
-                        ema_val_loss_preds, _, _, ema_val_outside_bg_loss = prepare_loss_inputs(
+                        ema_val_loss_preds, _, _ = prepare_loss_inputs(
                             ema_val_preds,
                             val_batch,
                             feature_volume=ema_val_feature_volume,
                         )
-                        ema_val_targets_with_ignore = _build_targets_with_ignore_for_loss(
-                            ema_val_loss_preds,
-                            val_targets,
-                            val_ignore_mask,
+                        ema_val_targets_with_ignore = build_deep_supervision_targets(val_targets, ema_val_loss_preds, mode='nearest')
+                        ds_ignore = build_deep_supervision_targets(val_ignore_mask, ema_val_loss_preds, mode='nearest')
+                        ema_val_targets_with_ignore = (
+                            type(ema_val_targets_with_ignore)(
+                                torch.cat([target_level, ignore_level], dim=1)
+                                for target_level, ignore_level in zip(ema_val_targets_with_ignore, ds_ignore)
+                            )
+                            if isinstance(ema_val_targets_with_ignore, (list, tuple))
+                            else torch.cat([ema_val_targets_with_ignore, ds_ignore], dim=1)
                         )
                         ema_val_l = loss(
-                            _float_supervision_tree(ema_val_loss_preds),
-                            _float_supervision_tree(ema_val_targets_with_ignore),
-                        ) + ema_val_outside_bg_loss
-                        ema_val_loss_total = ema_val_loss_total + _distributed_mean_scalar(
-                            accelerator,
-                            ema_val_l,
+                            type(ema_val_loss_preds)(v.float() for v in ema_val_loss_preds) if isinstance(ema_val_loss_preds, (list, tuple)) else ema_val_loss_preds.float(),
+                            (
+                                type(ema_val_targets_with_ignore)(v.float() for v in ema_val_targets_with_ignore)
+                                if isinstance(ema_val_targets_with_ignore, (list, tuple))
+                                else ema_val_targets_with_ignore.float()
+                            ),
+                        )
+                        ema_val_loss_total = ema_val_loss_total + accelerator.reduce(
+                            ema_val_l.detach().to(device=accelerator.device, dtype=torch.float32).reshape(()),
+                            reduction='mean',
                         )
                         ema_val_loss_batches = ema_val_loss_batches + 1.0
-                        preview_preds = _primary_supervision_output(ema_val_loss_preds)
-                        preview_volume_preds = _primary_supervision_output(ema_val_preds)
+                        preview_preds = ema_val_loss_preds[0] if isinstance(ema_val_loss_preds, (list, tuple)) else ema_val_loss_preds
+                        preview_volume_preds = ema_val_preds[0] if isinstance(ema_val_preds, (list, tuple)) else ema_val_preds
 
                     if val_batch_idx in preview_batch_indices:
                         val_preview_batch = val_batch
