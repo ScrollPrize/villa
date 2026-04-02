@@ -10,7 +10,6 @@
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
 
-#include <nlohmann/json.hpp>
 #include <system_error>
 #include <cmath>
 #include <limits>
@@ -148,9 +147,10 @@ QuadSurface::QuadSurface(cv::Mat_<cv::Vec3f> *points, const cv::Vec2f &scale)
 }
 
 namespace {
-static Rect3D rect_from_json(const nlohmann::json &json)
+static Rect3D rect_from_json(const utils::Json &json)
 {
-    return {{json[0][0],json[0][1],json[0][2]},{json[1][0],json[1][1],json[1][2]}};
+    return {{json[0][0].get_float(),json[0][1].get_float(),json[0][2].get_float()},
+            {json[1][0].get_float(),json[1][1].get_float(),json[1][2].get_float()}};
 }
 } // anonymous namespace
 
@@ -159,20 +159,20 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
     path = path_;
     id = path_.filename().string();
     auto metaPath = path_ / "meta.json";
-    meta = std::make_unique<nlohmann::json>(vc::json::load_json_file(metaPath));
+    meta = vc::json::load_json_file(metaPath);
 
-    if (meta->contains("bbox"))
-        _bbox = rect_from_json((*meta)["bbox"]);
+    if (meta.contains("bbox"))
+        _bbox = rect_from_json(meta["bbox"]);
 
     _maskTimestamp = readMaskTimestamp(path);
     _needsLoad = true;  // Points will be loaded lazily
 }
 
-QuadSurface::QuadSurface(const std::filesystem::path &path_, const nlohmann::json &json)
+QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &json)
 {
     path = path_;
     id = path_.filename().string();
-    meta = std::make_unique<nlohmann::json>(json);
+    meta = json;
 
     if (json.contains("bbox"))
         _bbox = rect_from_json(json["bbox"]);
@@ -973,19 +973,27 @@ void QuadSurface::saveSnapshot(int maxBackups)
     writeDataToDirectory(snapshot_dest, "mask");
 
     // Write metadata - create a copy so we don't modify the original
-    nlohmann::json snapshotMeta;
-    if (meta) {
-        snapshotMeta = *meta;
+    utils::Json snapshotMeta = meta;
+    {
+        auto lo = utils::Json::array();
+        lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
+        auto hi = utils::Json::array();
+        hi.push_back(bbox().high[0]); hi.push_back(bbox().high[1]); hi.push_back(bbox().high[2]);
+        auto bb = utils::Json::array();
+        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
+        snapshotMeta["bbox"] = std::move(bb);
     }
-    snapshotMeta["bbox"] = {{bbox().low[0], bbox().low[1], bbox().low[2]},
-                            {bbox().high[0], bbox().high[1], bbox().high[2]}};
     snapshotMeta["type"] = "seg";
     snapshotMeta["uuid"] = id;
     snapshotMeta["format"] = "tifxyz";
-    snapshotMeta["scale"] = {_scale[0], _scale[1]};
+    {
+        auto sc = utils::Json::array();
+        sc.push_back(_scale[0]); sc.push_back(_scale[1]);
+        snapshotMeta["scale"] = std::move(sc);
+    }
 
     std::ofstream o(snapshot_dest / "meta.json");
-    o << std::setw(4) << snapshotMeta << std::endl;
+    o << snapshotMeta.dump(4) << std::endl;
     o.close();
 
     // Copy mask.tif and generations.tif if they exist on disk
@@ -1041,18 +1049,26 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
     }
 
     // Prepare and write metadata
-    if (!meta)
-        meta = std::make_unique<nlohmann::json>();
-
-    (*meta)["bbox"] = {{bbox().low[0], bbox().low[1], bbox().low[2]},
-                       {bbox().high[0], bbox().high[1], bbox().high[2]}};
-    (*meta)["type"] = "seg";
-    (*meta)["uuid"] = uuid;
-    (*meta)["format"] = "tifxyz";
-    (*meta)["scale"] = {_scale[0], _scale[1]};
+    {
+        auto lo = utils::Json::array();
+        lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
+        auto hi = utils::Json::array();
+        hi.push_back(bbox().high[0]); hi.push_back(bbox().high[1]); hi.push_back(bbox().high[2]);
+        auto bb = utils::Json::array();
+        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
+        meta["bbox"] = std::move(bb);
+    }
+    meta["type"] = "seg";
+    meta["uuid"] = uuid;
+    meta["format"] = "tifxyz";
+    {
+        auto sc = utils::Json::array();
+        sc.push_back(_scale[0]); sc.push_back(_scale[1]);
+        meta["scale"] = std::move(sc);
+    }
 
     std::ofstream o(path / "meta.json.tmp");
-    o << std::setw(4) << (*meta) << std::endl;
+    o << meta.dump(4) << std::endl;
     o.close();
 
     // Rename to make creation atomic
@@ -1124,13 +1140,13 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
 
 void QuadSurface::save_meta()
 {
-    if (!meta)
+    if (meta.is_null())
         throw std::runtime_error("can't save_meta() without metadata!");
     if (path.empty())
         throw std::runtime_error("no storage path for QuadSurface");
 
     std::ofstream o(path/"meta.json.tmp");
-    o << std::setw(4) << (*meta) << std::endl;
+    o << meta.dump(4) << std::endl;
 
     //rename to make creation atomic
     std::filesystem::rename(path/"meta.json.tmp", path/"meta.json");
@@ -1279,12 +1295,8 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int 
     };
 
     // Read meta first (scale, uuid, etc.)
-    std::ifstream meta_f((std::filesystem::path(path)/"meta.json").string());
-    if (!meta_f.is_open() || !meta_f.good()) {
-        throw std::runtime_error("Cannot open meta.json at: " + path);
-    }
-    nlohmann::json metadata = nlohmann::json::parse(meta_f);
-    cv::Vec2f scale = {metadata["scale"][0].get<float>(), metadata["scale"][1].get<float>()};
+    auto metadata = utils::Json::parse_file(std::filesystem::path(path)/"meta.json");
+    cv::Vec2f scale = {metadata["scale"][0].get_float(), metadata["scale"][1].get_float()};
 
     auto points = std::make_unique<cv::Mat_<cv::Vec3f>>();
     int W=0, H=0;
@@ -1418,8 +1430,8 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int 
 
     auto surf = std::make_unique<QuadSurface>(points.release(), scale);
     surf->path = path;
-    surf->id   = metadata["uuid"];
-    surf->meta = std::make_unique<nlohmann::json>(metadata);
+    surf->id   = metadata["uuid"].get_string();
+    surf->meta = metadata;
 
     // Register extra channels lazily (left as OpenCV-based on-demand load).
     for (const auto& entry : std::filesystem::directory_iterator(path)) {
@@ -1909,11 +1921,14 @@ void QuadSurface::flipV()
 
 // Overlapping JSON file utilities
 void write_overlapping_json(const std::filesystem::path& seg_path, const std::set<std::string>& overlapping_names) {
-    nlohmann::json overlap_json;
-    overlap_json["overlapping"] = std::vector<std::string>(overlapping_names.begin(), overlapping_names.end());
+    auto overlap_json = utils::Json::object();
+    auto arr = utils::Json::array();
+    for (const auto& n : overlapping_names)
+        arr.push_back(n);
+    overlap_json["overlapping"] = std::move(arr);
 
     std::ofstream o(seg_path / "overlapping.json");
-    o << std::setw(4) << overlap_json << std::endl;
+    o << overlap_json.dump(4) << std::endl;
 }
 
 std::set<std::string> read_overlapping_json(const std::filesystem::path& seg_path) {
@@ -1921,13 +1936,11 @@ std::set<std::string> read_overlapping_json(const std::filesystem::path& seg_pat
     std::filesystem::path json_path = seg_path / "overlapping.json";
 
     if (std::filesystem::exists(json_path)) {
-        std::ifstream i(json_path);
-        nlohmann::json overlap_json;
-        i >> overlap_json;
+        auto overlap_json = utils::Json::parse_file(json_path);
 
         if (overlap_json.contains("overlapping")) {
             for (const auto& name : overlap_json["overlapping"]) {
-                overlapping.insert(name.get<std::string>());
+                overlapping.insert(name.get_string());
             }
         }
     }

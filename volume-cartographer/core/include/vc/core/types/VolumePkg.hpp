@@ -9,7 +9,7 @@
 
 #include <filesystem>
 #include <fstream>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/RemoteScroll.hpp"
@@ -63,7 +63,7 @@ public:
     bool reloadSingleSegmentation(const std::string& id);
 
 private:
-    nlohmann::json config_;
+    utils::Json config_;
     std::filesystem::path rootDir_;
     std::map<std::string, std::shared_ptr<Volume>> volumes_;
     std::map<std::string, std::shared_ptr<Segmentation>> segmentations_;

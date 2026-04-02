@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cmath>
+#include <numbers>
 
 // Parameters for multi-layer compositing
 struct CompositeParams {
@@ -28,8 +30,23 @@ struct CompositeParams {
     float lightDiffuse = 0.7f;        // Diffuse lighting strength (0-1)
     float lightAmbient = 0.3f;        // Ambient lighting (0-1, ensures shadows aren't pure black)
 
+    // Pre-computed light direction (call updateLightDir() after changing azimuth/elevation)
+    float lightDirX = 0.5f;
+    float lightDirY = 0.5f;
+    float lightDirZ = 0.70710678f;    // default: azimuth=45, elevation=45
+
     // Pre-processing
     uint8_t isoCutoff = 0;           // Highpass filter: values below this are set to 0
+
+    // Recompute lightDir from lightAzimuth/lightElevation (degrees)
+    void updateLightDir() {
+        float azRad = lightAzimuth * (std::numbers::pi_v<float> / 180.0f);
+        float elRad = lightElevation * (std::numbers::pi_v<float> / 180.0f);
+        float ce = std::cos(elRad);
+        lightDirX = ce * std::cos(azRad);
+        lightDirY = ce * std::sin(azRad);
+        lightDirZ = std::sin(elRad);
+    }
 
     bool operator==(const CompositeParams&) const = default;
 };

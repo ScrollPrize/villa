@@ -65,7 +65,7 @@
 #include "ToolDialogs.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 // --------- locate executables (unified helper) --------------------------------
 
@@ -2263,8 +2263,8 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
         tempSurface = std::make_unique<QuadSurface>(croppedPoints, surface->scale());
         tempSurface->path = surface->path;
         tempSurface->id = surface->id;
-        if (surface->meta) {
-            tempSurface->meta = std::make_unique<nlohmann::json>(*surface->meta);
+        if (!surface->meta.is_null()) {
+            tempSurface->meta = surface->meta;
         }
         for (const auto& ch : croppedChannels) {
             tempSurface->setChannel(ch.name, ch.data);
@@ -2285,19 +2285,9 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
     }
     surface->invalidateCache();
 
-    if (tempSurface && tempSurface->meta) {
-        if (!surface->meta) {
-            surface->meta = std::make_unique<nlohmann::json>(*tempSurface->meta);
-        } else {
-            *surface->meta = *tempSurface->meta;
-        }
-        if (surface->meta) {
-            if (surf->meta) {
-                *surf->meta = *surface->meta;
-            } else {
-                surf->meta = std::make_unique<nlohmann::json>(*surface->meta);
-            }
-        }
+    if (tempSurface && !tempSurface->meta.is_null()) {
+        surface->meta = tempSurface->meta;
+        surf->meta = surface->meta;
     }
 
     // Bbox will be recalculated lazily (invalidateCache was already called)

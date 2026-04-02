@@ -27,6 +27,7 @@ void blendOverlayImage(QImage* base,
         return;
     }
 
+    const float ia = 1.0f - alpha;
     const int rows = std::min(base->height(), overlay.height());
     const int cols = std::min(base->width(), overlay.width());
     for (int y = 0; y < rows; ++y) {
@@ -40,7 +41,6 @@ void blendOverlayImage(QImage* base,
 
             const uint32_t d = dst[x];
             const uint32_t s = src[x];
-            const float ia = 1.0f - alpha;
 
             const uint32_t dr = (d >> 16) & 0xFFu;
             const uint32_t dg = (d >> 8) & 0xFFu;
@@ -83,7 +83,7 @@ TileRenderResult TileRenderer::renderTile(
 
     // Check for composite rendering (needed before generateTileCoords to
     // avoid calling gen() twice for the QuadSurface composite path)
-    PlaneSurface* plane = dynamic_cast<PlaneSurface*>(surface.get());
+    PlaneSurface* plane = params.isPlaneSurface ? static_cast<PlaneSurface*>(surface.get()) : nullptr;
     const bool useComposite = (params.compositeSettings.enabled &&
                                (params.compositeSettings.layersFront > 0 ||
                                 params.compositeSettings.layersBehind > 0));
@@ -102,17 +102,22 @@ TileRenderResult TileRenderer::renderTile(
     // generating the intermediate coords Mat entirely by computing coordinates
     // inline during sampling. This eliminates 786KB of allocation + two
     // full passes over transient data, cutting cache pressure significantly.
-    const bool useFusedPlane = (plane != nullptr && !useComposite && !usePlaneComposite);
+    // When overlays are active we need coords for overlay sampling, so disable
+    // the fused path to avoid generating coords, releasing them, then
+    // regenerating them (which defeats the memory savings).
+    const bool hasOverlay = params.overlayVolume && params.overlayOpacity > 0.0f;
+    const bool useFusedPlane = (plane != nullptr && !useComposite && !usePlaneComposite && !hasOverlay);
 
     // Compute plane affine parameters (world-space) for PlaneSurface paths.
     // These are used by both the fused path and the AABB quick-reject.
-    cv::Vec3f planeOrigin, planeVxStep, planeVyStep;
+    cv::Vec3f planeOrigin, planeVxStep, planeVyStep, planeNormal;
     if (plane) {
         float m = 1.0f / params.scale;
         cv::Vec3f totalOffset(params.surfaceROI.x, params.surfaceROI.y, params.zOff);
         cv::Vec3f vx = plane->basisX();
         cv::Vec3f vy = plane->basisY();
-        cv::Vec3f useOrigin = plane->origin() + plane->normal(cv::Vec3f(0,0,0)) * totalOffset[2];
+        planeNormal = plane->normal(cv::Vec3f(0, 0, 0));
+        cv::Vec3f useOrigin = plane->origin() + planeNormal * totalOffset[2];
         planeVxStep = vx * m;
         planeVyStep = vy * m;
         planeOrigin = vx * totalOffset[0] + vy * totalOffset[1] + useOrigin;
@@ -206,7 +211,6 @@ TileRenderResult TileRenderer::renderTile(
     // Sample volume data — thread-local buffers avoid per-tile malloc/free.
     // The sampling functions reuse the buffer when size matches.
     thread_local cv::Mat_<uint8_t> gray;
-    thread_local cv::Mat_<uint8_t> grayFine;
     thread_local cv::Mat_<uint8_t> overlayGray;
 
     if (useComposite && !plane) {
@@ -225,7 +229,6 @@ TileRenderResult TileRenderer::renderTile(
         result.actualLevel = volume->sampleCompositeBestEffort(
             gray, coords, normals, sp);
     } else if (usePlaneComposite) {
-        cv::Vec3f planeNormal = plane->normal(cv::Vec3f(0, 0, 0));
         if (normals.size() != coords.size()) {
             normals.create(coords.size());
         }
@@ -250,18 +253,12 @@ TileRenderResult TileRenderer::renderTile(
         sp.method = (params.useFastInterpolation || params.dsScaleIdx >= 3)
                         ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
 
-        // Determine blend factor
-        const float blend = params.dsBlendFactor;
-        const bool needBlend = blend > 0.0f && blend < 1.0f &&
-                               params.dsScaleIdxFine != params.dsScaleIdx &&
-                               volume->zarrDataset(params.dsScaleIdxFine);
-
         // Fully fused ARGB32 path: sample voxels and apply window/level LUT
         // in a single pass, writing directly to QImage memory. Eliminates
         // the intermediate cv::Mat and the applyPostProcess second pass.
-        // Valid when no blend, no colormap, no stretch, core preprocessing
-        // is a no-op. Lighting is fused into the LUT (plane has constant normal).
-        const bool canFuseARGB32 = !needBlend &&
+        // Valid when no colormap, no stretch, core preprocessing is a no-op.
+        // Lighting is fused into the LUT (plane has constant normal).
+        const bool canFuseARGB32 =
             params.colormapId.empty() && !params.stretchValues &&
             params.compositeSettings.params.isoCutoff == 0 &&
             !params.compositeSettings.postStretchValues &&
@@ -271,8 +268,7 @@ TileRenderResult TileRenderer::renderTile(
             // Compute lighting factor for constant plane normal (fused into LUT)
             float lightFactor = 1.0f;
             if (params.compositeSettings.params.lightingEnabled) {
-                cv::Vec3f planeN = plane->normal(cv::Vec3f(0, 0, 0));
-                lightFactor = computeLightingFactor(planeN,
+                lightFactor = computeLightingFactor(planeNormal,
                     params.compositeSettings.params);
             }
 
@@ -296,37 +292,10 @@ TileRenderResult TileRenderer::renderTile(
             gray, planeOrigin, planeVxStep, planeVyStep,
             params.tileW, params.tileH, sp);
 
-        // Blend with finer pyramid level for smooth zoom transitions
-        if (needBlend) {
-            vc::SampleParams spFine;
-            spFine.level = params.dsScaleIdxFine;
-            spFine.method = (params.useFastInterpolation || params.dsScaleIdxFine >= 3)
-                                ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
-
-            volume->samplePlaneBestEffort(
-                grayFine, planeOrigin, planeVxStep, planeVyStep,
-                params.tileW, params.tileH, spFine);
-
-            if (!gray.empty() && !grayFine.empty()) {
-                const float coarseWeight = 1.0f - blend;
-                for (int y = 0; y < gray.rows; ++y) {
-                    auto* dst = gray.ptr<uint8_t>(y);
-                    const auto* src = grayFine.ptr<uint8_t>(y);
-                    for (int x = 0; x < gray.cols; ++x) {
-                        dst[x] = static_cast<uint8_t>(
-                            dst[x] * coarseWeight + src[x] * blend + 0.5f);
-                    }
-                }
-            } else if (gray.empty() && !grayFine.empty()) {
-                std::swap(gray, grayFine);
-            }
-        }
-
         // Apply directional lighting when enabled outside composite mode.
         if (params.compositeSettings.params.lightingEnabled && !gray.empty()) {
             const auto& cp = params.compositeSettings.params;
-            cv::Vec3f planeN = plane->normal(cv::Vec3f(0, 0, 0));
-            float factor = computeLightingFactor(planeN, cp);
+            float factor = computeLightingFactor(planeNormal, cp);
             if (factor < 1.0f) {
                 for (int y = 0; y < gray.rows; ++y) {
                     auto* row = gray.ptr<uint8_t>(y);
@@ -345,33 +314,6 @@ TileRenderResult TileRenderer::renderTile(
 
         result.actualLevel = volume->sampleBestEffort(gray, coords, sp);
 
-        // Blend with finer pyramid level for smooth zoom transitions
-        const float blend = params.dsBlendFactor;
-        if (blend > 0.0f && blend < 1.0f &&
-            params.dsScaleIdxFine != params.dsScaleIdx &&
-            volume->zarrDataset(params.dsScaleIdxFine)) {
-            vc::SampleParams spFine;
-            spFine.level = params.dsScaleIdxFine;
-            spFine.method = (params.useFastInterpolation || params.dsScaleIdxFine >= 3)
-                                ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
-
-            volume->sampleBestEffort(grayFine, coords, spFine);
-
-            if (!gray.empty() && !grayFine.empty()) {
-                const float coarseWeight = 1.0f - blend;
-                for (int y = 0; y < gray.rows; ++y) {
-                    auto* dst = gray.ptr<uint8_t>(y);
-                    const auto* src = grayFine.ptr<uint8_t>(y);
-                    for (int x = 0; x < gray.cols; ++x) {
-                        dst[x] = static_cast<uint8_t>(
-                            dst[x] * coarseWeight + src[x] * blend + 0.5f);
-                    }
-                }
-            } else if (gray.empty() && !grayFine.empty()) {
-                std::swap(gray, grayFine);
-            }
-        }
-
         // Apply directional lighting when enabled outside composite mode.
         // The composite path handles this internally; here we do it as a
         // post-step using the surface normals generated above.
@@ -379,8 +321,7 @@ TileRenderResult TileRenderer::renderTile(
             const auto& cp = params.compositeSettings.params;
             if (plane) {
                 // PlaneSurface: constant normal, compute factor once
-                cv::Vec3f planeN = plane->normal(cv::Vec3f(0, 0, 0));
-                float factor = computeLightingFactor(planeN, cp);
+                float factor = computeLightingFactor(planeNormal, cp);
                 if (factor < 1.0f) {
                     for (int y = 0; y < gray.rows; ++y) {
                         auto* row = gray.ptr<uint8_t>(y);
@@ -444,7 +385,20 @@ overlay:
                                ? vc::Sampling::Nearest
                                : vc::Sampling::Trilinear;
 
-        params.overlayVolume->sampleBestEffort(overlayGray, coords, overlaySp);
+        // Avoid double I/O when overlay is the same volume with matching
+        // sample params -- just copy the already-sampled base data.
+        vc::SampleParams baseSp;
+        baseSp.level = params.dsScaleIdx;
+        baseSp.method = (params.useFastInterpolation || params.dsScaleIdx >= 3)
+                            ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
+        if (params.overlayVolume.get() == volume &&
+            overlaySp.level == baseSp.level &&
+            overlaySp.method == baseSp.method &&
+            !gray.empty()) {
+            overlayGray = gray;
+        } else {
+            params.overlayVolume->sampleBestEffort(overlayGray, coords, overlaySp);
+        }
         if (!overlayGray.empty()) {
             PostProcessParams overlayParams;
             overlayParams.windowLow = params.overlayWindowLow;

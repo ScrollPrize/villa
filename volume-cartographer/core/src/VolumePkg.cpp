@@ -85,7 +85,7 @@ bool VolumePkg::isRemote() const { return isRemote_; }
 
 std::string VolumePkg::name() const
 {
-    auto name = config_["name"].get<std::string>();
+    auto name = config_["name"].get_string();
     if (name != "NULL") {
         return name;
     }
@@ -93,7 +93,7 @@ std::string VolumePkg::name() const
     return "UnnamedVolume";
 }
 
-int VolumePkg::version() const { return config_["version"].get<int>(); }
+int VolumePkg::version() const { return config_["version"].get_int(); }
 
 bool VolumePkg::hasVolumes() const { return !volumes_.empty(); }
 
@@ -331,7 +331,7 @@ void VolumePkg::ensureSegmentScrollSource()
         return;
     }
 
-    auto scrollName = config_["name"].get<std::string>();
+    auto scrollName = config_["name"].get_string();
     auto vol = volumes_.begin()->second;
     auto volumeUuid = vol->id();
 
@@ -583,7 +583,7 @@ bool VolumePkg::addSingleSegmentation(const std::string& id)
     try {
         auto s = Segmentation::New(segPath);
         if (!volumes_.empty()) {
-            auto scrollName = config_["name"].get<std::string>();
+            auto scrollName = config_["name"].get_string();
             auto volumeUuid = volumes_.begin()->second->id();
             s->ensureScrollSource(scrollName, volumeUuid);
         }

@@ -17,7 +17,7 @@
 #include <QVBoxLayout>
 #include <QVariant>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 Q_LOGGING_CATEGORY(lcSegWidget, "vc.segmentation.widget")
 
@@ -397,7 +397,7 @@ QString SegmentationWidget::customParamsText() const { return _customParamsPanel
 QString SegmentationWidget::customParamsProfile() const { return _customParamsPanel->customParamsProfile(); }
 bool SegmentationWidget::customParamsValid() const { return _customParamsPanel->customParamsValid(); }
 QString SegmentationWidget::customParamsError() const { return _customParamsPanel->customParamsError(); }
-std::optional<nlohmann::json> SegmentationWidget::customParamsJson() const { return _customParamsPanel->customParamsJson(); }
+utils::Json SegmentationWidget::customParamsJson() const { return _customParamsPanel->customParamsJson(); }
 
 // --- Neural tracer delegations ---
 

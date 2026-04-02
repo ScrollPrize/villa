@@ -10,7 +10,7 @@
 #include <numeric>
 #include <vector>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/Zarr.hpp"
@@ -43,10 +43,9 @@ private:
     fs::path path_;
 };
 
-nlohmann::json readJson(const fs::path& path)
+utils::Json readJson(const fs::path& path)
 {
-    std::ifstream in(path);
-    return nlohmann::json::parse(in);
+    return utils::Json::parse_file(path);
 }
 
 std::vector<uint8_t> readBytes(const fs::path& path)
@@ -74,11 +73,11 @@ TEST(VcDataset, BloscDatasetWritesCompressedChunksAndReadsBack)
     const auto zarray = readJson(tempDir.path() / "0" / ".zarray");
     ASSERT_TRUE(zarray.contains("compressor"));
     ASSERT_TRUE(zarray["compressor"].is_object());
-    EXPECT_EQ(zarray["compressor"]["id"].get<std::string>(), std::string("blosc"));
-    EXPECT_EQ(zarray["compressor"]["cname"].get<std::string>(), std::string("zstd"));
-    EXPECT_EQ(zarray["compressor"]["clevel"].get<int>(), 3);
-    EXPECT_EQ(zarray["compressor"]["shuffle"].get<int>(), 1);
-    EXPECT_EQ(zarray["compressor"]["blocksize"].get<int>(), 0);
+    EXPECT_EQ(zarray["compressor"]["id"].get_string(), std::string("blosc"));
+    EXPECT_EQ(zarray["compressor"]["cname"].get_string(), std::string("zstd"));
+    EXPECT_EQ(zarray["compressor"]["clevel"].get_int(), 3);
+    EXPECT_EQ(zarray["compressor"]["shuffle"].get_int(), 1);
+    EXPECT_EQ(zarray["compressor"]["blocksize"].get_int(), 0);
 
     std::vector<uint8_t> chunk(shape[0] * shape[1] * shape[2], 0);
     chunk[0] = 255;
@@ -122,7 +121,7 @@ TEST(VcDataset, CreateZarrDatasetWritesConfiguredFillValue)
 
     const auto zarray = readJson(tempDir.path() / "0" / ".zarray");
     ASSERT_TRUE(zarray.contains("fill_value"));
-    EXPECT_EQ(zarray["fill_value"].get<int>(), 128);
+    EXPECT_EQ(zarray["fill_value"].get_int(), 128);
 }
 
 TEST(VcDataset, WriteZarrRegionU8ByChunkPreservesSubregionAndFillPadding)

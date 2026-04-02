@@ -40,7 +40,7 @@
 
 #include <opencv2/core.hpp>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -92,11 +92,11 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
         return;
     }
 
-    if (surface->meta && surface->meta->is_object()) {
+    if (!surface->meta.is_null() && surface->meta.is_object()) {
         return;
     }
 
-    surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
+    surface->meta = utils::Json::object();
 }
 
 
@@ -500,23 +500,40 @@ void saveCorrectionsAnnotation(
     }
 
     // Build corrections.json
-    nlohmann::json j;
+    utils::Json j = utils::Json::object();
     j["timestamp"] = timestamp;
     j["segment_id"] = segmentId;
-    j["volumes"] = volumeIds;
+    {
+        utils::Json volArr = utils::Json::array();
+        for (const auto& vid : volumeIds) volArr.push_back(utils::Json(vid));
+        j["volumes"] = std::move(volArr);
+    }
     j["volume_used"] = growthVolumeId;
-    j["bbox"] = {
-        {"min", {bounds.worldMin[0], bounds.worldMin[1], bounds.worldMin[2]}},
-        {"max", {bounds.worldMax[0], bounds.worldMax[1], bounds.worldMax[2]}}
-    };
+    {
+        utils::Json bboxMin = utils::Json::array();
+        bboxMin.push_back(utils::Json(bounds.worldMin[0]));
+        bboxMin.push_back(utils::Json(bounds.worldMin[1]));
+        bboxMin.push_back(utils::Json(bounds.worldMin[2]));
+        utils::Json bboxMax = utils::Json::array();
+        bboxMax.push_back(utils::Json(bounds.worldMax[0]));
+        bboxMax.push_back(utils::Json(bounds.worldMax[1]));
+        bboxMax.push_back(utils::Json(bounds.worldMax[2]));
+        j["bbox"] = {{"min", std::move(bboxMin)}, {"max", std::move(bboxMax)}};
+    }
 
     // Build collections array with points sorted by creation_time
-    nlohmann::json collectionsJson = nlohmann::json::array();
+    utils::Json collectionsJson = utils::Json::array();
     for (const auto& collection : corrections.collections) {
-        nlohmann::json collJson;
-        collJson["id"] = collection.id;
+        utils::Json collJson = utils::Json::object();
+        collJson["id"] = static_cast<uint64_t>(collection.id);
         collJson["name"] = collection.name;
-        collJson["color"] = {collection.color[0], collection.color[1], collection.color[2]};
+        {
+            utils::Json colorArr = utils::Json::array();
+            colorArr.push_back(utils::Json(static_cast<double>(collection.color[0])));
+            colorArr.push_back(utils::Json(static_cast<double>(collection.color[1])));
+            colorArr.push_back(utils::Json(static_cast<double>(collection.color[2])));
+            collJson["color"] = std::move(colorArr);
+        }
 
         // Sort points by creation_time to preserve placement order
         std::vector<ColPoint> sortedPoints = collection.points;
@@ -525,19 +542,25 @@ void saveCorrectionsAnnotation(
                       return a.creation_time < b.creation_time;
                   });
 
-        nlohmann::json pointsJson = nlohmann::json::array();
+        utils::Json pointsJson = utils::Json::array();
         for (const auto& pt : sortedPoints) {
-            nlohmann::json ptJson;
-            ptJson["id"] = pt.id;
-            ptJson["position"] = {pt.p[0], pt.p[1], pt.p[2]};
-            ptJson["creation_time"] = pt.creation_time;
-            pointsJson.push_back(ptJson);
+            utils::Json ptJson = utils::Json::object();
+            ptJson["id"] = static_cast<uint64_t>(pt.id);
+            {
+                utils::Json posArr = utils::Json::array();
+                posArr.push_back(utils::Json(static_cast<double>(pt.p[0])));
+                posArr.push_back(utils::Json(static_cast<double>(pt.p[1])));
+                posArr.push_back(utils::Json(static_cast<double>(pt.p[2])));
+                ptJson["position"] = std::move(posArr);
+            }
+            ptJson["creation_time"] = static_cast<int64_t>(pt.creation_time);
+            pointsJson.push_back(std::move(ptJson));
         }
-        collJson["points"] = pointsJson;
+        collJson["points"] = std::move(pointsJson);
 
-        collectionsJson.push_back(collJson);
+        collectionsJson.push_back(std::move(collJson));
     }
-    j["collections"] = collectionsJson;
+    j["collections"] = std::move(collectionsJson);
 
     // Write corrections.json
     std::filesystem::path jsonPath = correctionsDir / "corrections.json";
@@ -589,13 +612,10 @@ void synchronizeSurfaceMeta(const std::shared_ptr<VolumePkg>& pkg,
 
         if (loadedSurface->path == surface->path) {
             // Sync metadata if needed
-            if (surface->meta) {
-                if (!loadedSurface->meta) {
-                    loadedSurface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
-                }
-                *loadedSurface->meta = *surface->meta;
-            } else if (loadedSurface->meta) {
-                loadedSurface->meta->clear();
+            if (!surface->meta.is_null()) {
+                loadedSurface->meta = surface->meta;
+            } else {
+                loadedSurface->meta = utils::Json();
             }
 
             if (panel) {
@@ -633,7 +653,7 @@ struct DenseDisplacementJob
     DenseTtaMode ttaMode{DenseTtaMode::Mirror};
     QString ttaMergeMethod{QStringLiteral("vector_geomedian")};
     double ttaOutlierDropThresh{1.25};
-    std::optional<nlohmann::json> customParams;
+    utils::Json customParams;
     std::vector<SegmentationGrowthDirection> directions;
 };
 
@@ -647,7 +667,7 @@ struct CopyDisplacementJob
     DenseTtaMode ttaMode{DenseTtaMode::Mirror};
     QString ttaMergeMethod{QStringLiteral("vector_geomedian")};
     double ttaOutlierDropThresh{1.25};
-    std::optional<nlohmann::json> customParams;
+    utils::Json customParams;
 };
 
 std::optional<std::string> denseDirectionToToken(SegmentationGrowthDirection direction)
@@ -730,7 +750,7 @@ QString createDenseSnapshotPath(const QString& preferredDir)
     return dir.filePath(QStringLiteral("vc_dense_input_%1").arg(suffix));
 }
 
-nlohmann::json sendSocketJsonRequest(const QString& socketPath, const nlohmann::json& request)
+utils::Json sendSocketJsonRequest(const QString& socketPath, const utils::Json& request)
 {
     const std::string socketStd = socketPath.toStdString();
     int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -779,7 +799,7 @@ nlohmann::json sendSocketJsonRequest(const QString& socketPath, const nlohmann::
                 if (responsePayload.empty()) {
                     throw std::runtime_error("Dense displacement service returned an empty response.");
                 }
-                return nlohmann::json::parse(responsePayload);
+                return utils::Json::parse(responsePayload);
             }
             responsePayload.push_back(buf[i]);
         }
@@ -790,7 +810,7 @@ nlohmann::json sendSocketJsonRequest(const QString& socketPath, const nlohmann::
         throw std::runtime_error("Dense displacement service returned an empty response.");
     }
 
-    return nlohmann::json::parse(responsePayload);
+    return utils::Json::parse(responsePayload);
 }
 
 std::string sanitizeSegmentId(const std::string& value)
@@ -843,7 +863,7 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
         return result;
     };
 
-    nlohmann::json request;
+    utils::Json request = utils::Json::object();
     request["request_type"] = "displacement_copy_grow";
     request["tifxyz_path"] = job.tifxyzInputPath.toStdString();
     request["volume_path"] = job.volumeZarrPath.toStdString();
@@ -867,18 +887,16 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
         break;
     }
 
-    if (job.customParams) {
-        auto copyArgsIt = job.customParams->find("copy_args");
-        if (copyArgsIt != job.customParams->end() && copyArgsIt->is_object()) {
-            request["copy_args"] = *copyArgsIt;
+    if (!job.customParams.is_null()) {
+        if (job.customParams.contains("copy_args") && job.customParams["copy_args"].is_object()) {
+            request["copy_args"] = job.customParams["copy_args"];
         }
-        auto copyOverridesIt = job.customParams->find("copy_overrides");
-        if (copyOverridesIt != job.customParams->end() && copyOverridesIt->is_object()) {
-            request["overrides"] = *copyOverridesIt;
+        if (job.customParams.contains("copy_overrides") && job.customParams["copy_overrides"].is_object()) {
+            request["overrides"] = job.customParams["copy_overrides"];
         }
     }
 
-    nlohmann::json response;
+    utils::Json response;
     try {
         response = sendSocketJsonRequest(job.socketPath, request);
     } catch (const std::exception& ex) {
@@ -889,7 +907,7 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
     if (response.contains("error")) {
         QString serviceError;
         if (response["error"].is_string()) {
-            serviceError = QString::fromStdString(response["error"].get<std::string>());
+            serviceError = QString::fromStdString(response["error"].get_string());
         } else {
             serviceError = QString::fromStdString(response["error"].dump());
         }
@@ -912,8 +930,8 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
         return finalizeResult();
     }
 
-    const QString frontPath = QString::fromStdString(outputs["front"].get<std::string>());
-    const QString backPath = QString::fromStdString(outputs["back"].get<std::string>());
+    const QString frontPath = QString::fromStdString(outputs["front"].get_string());
+    const QString backPath = QString::fromStdString(outputs["back"].get_string());
     if (!frontPath.isEmpty()) {
         temporaryPaths.emplace_back(frontPath.toStdString());
     }
@@ -953,7 +971,7 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
             continue;
         }
 
-        nlohmann::json request;
+        utils::Json request = utils::Json::object();
         request["request_type"] = "dense_displacement_grow";
         request["tifxyz_path"] = currentInputPath.toStdString();
         request["grow_direction"] = *directionToken;
@@ -979,18 +997,16 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
             break;
         }
 
-        if (job.customParams) {
-            auto denseArgsIt = job.customParams->find("dense_args");
-            if (denseArgsIt != job.customParams->end() && denseArgsIt->is_object()) {
-                request["dense_args"] = *denseArgsIt;
+        if (!job.customParams.is_null()) {
+            if (job.customParams.contains("dense_args") && job.customParams["dense_args"].is_object()) {
+                request["dense_args"] = job.customParams["dense_args"];
             }
-            auto denseOverridesIt = job.customParams->find("dense_overrides");
-            if (denseOverridesIt != job.customParams->end() && denseOverridesIt->is_object()) {
-                request["overrides"] = *denseOverridesIt;
+            if (job.customParams.contains("dense_overrides") && job.customParams["dense_overrides"].is_object()) {
+                request["overrides"] = job.customParams["dense_overrides"];
             }
         }
 
-        nlohmann::json response;
+        utils::Json response;
         try {
             response = sendSocketJsonRequest(job.socketPath, request);
         } catch (const std::exception& ex) {
@@ -1001,7 +1017,7 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
         if (response.contains("error")) {
             QString serviceError;
             if (response["error"].is_string()) {
-                serviceError = QString::fromStdString(response["error"].get<std::string>());
+                serviceError = QString::fromStdString(response["error"].get_string());
             } else {
                 serviceError = QString::fromStdString(response["error"].dump());
             }
@@ -1013,7 +1029,7 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
             return finalizeResult();
         }
 
-        finalOutputPath = QString::fromStdString(response["output_tifxyz_path"].get<std::string>());
+        finalOutputPath = QString::fromStdString(response["output_tifxyz_path"].get_string());
         currentInputPath = finalOutputPath;
         if (!finalOutputPath.isEmpty()) {
             temporaryPaths.emplace_back(finalOutputPath.toStdString());
@@ -1111,15 +1127,16 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
         // Check for JSON custom params overrides
         if (_context.widget->customParamsValid()) {
-            if (auto customParams = _context.widget->customParamsJson()) {
-                if (customParams->contains("extrapolation_point_count") &&
-                    (*customParams)["extrapolation_point_count"].is_number()) {
-                    pointCount = (*customParams)["extrapolation_point_count"].get<int>();
+            auto customParams = _context.widget->customParamsJson();
+            if (!customParams.is_null()) {
+                if (customParams.contains("extrapolation_point_count") &&
+                    customParams["extrapolation_point_count"].is_number()) {
+                    pointCount = customParams["extrapolation_point_count"].get_int();
                     pointCount = std::clamp(pointCount, 3, 20);
                 }
-                if (customParams->contains("extrapolation_type") &&
-                    (*customParams)["extrapolation_type"].is_string()) {
-                    const std::string typeStr = (*customParams)["extrapolation_type"].get<std::string>();
+                if (customParams.contains("extrapolation_type") &&
+                    customParams["extrapolation_type"].is_string()) {
+                    const std::string typeStr = customParams["extrapolation_type"].get_string();
                     if (typeStr == "quadratic") {
                         extrapType = ExtrapolationType::Quadratic;
                     } else {
@@ -1166,11 +1183,12 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
         // Check custom params for SDT settings overrides (or explicit volume for other modes)
         if (_context.widget->customParamsValid()) {
-            if (auto customParams = _context.widget->customParamsJson()) {
+            auto customParams = _context.widget->customParamsJson();
+            if (!customParams.is_null()) {
                 // Allow custom params to override/specify SDT volume for any mode
-                if (!sdtContextPtr && customParams->contains("sdt_volume_id") &&
-                    (*customParams)["sdt_volume_id"].is_string()) {
-                    const std::string sdtVolumeId = (*customParams)["sdt_volume_id"].get<std::string>();
+                if (!sdtContextPtr && customParams.contains("sdt_volume_id") &&
+                    customParams["sdt_volume_id"].is_string()) {
+                    const std::string sdtVolumeId = customParams["sdt_volume_id"].get_string();
                     if (!sdtVolumeId.empty() && volumeContext.package) {
                         try {
                             sdtVolume = volumeContext.package->volume(sdtVolumeId);
@@ -1190,25 +1208,25 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
                 // Apply Newton refinement param overrides from JSON if SDT is enabled
                 // (JSON overrides widget UI values for advanced users)
                 if (sdtContextPtr) {
-                    if (customParams->contains("sdt_max_steps") &&
-                        (*customParams)["sdt_max_steps"].is_number()) {
+                    if (customParams.contains("sdt_max_steps") &&
+                        customParams["sdt_max_steps"].is_number()) {
                         sdtContext.params.maxSteps = std::clamp(
-                            (*customParams)["sdt_max_steps"].get<int>(), 1, 10);
+                            customParams["sdt_max_steps"].get_int(), 1, 10);
                     }
-                    if (customParams->contains("sdt_step_size") &&
-                        (*customParams)["sdt_step_size"].is_number()) {
+                    if (customParams.contains("sdt_step_size") &&
+                        customParams["sdt_step_size"].is_number()) {
                         sdtContext.params.stepSize = std::clamp(
-                            (*customParams)["sdt_step_size"].get<float>(), 0.1f, 2.0f);
+                            customParams["sdt_step_size"].get_float(), 0.1f, 2.0f);
                     }
-                    if (customParams->contains("sdt_convergence") &&
-                        (*customParams)["sdt_convergence"].is_number()) {
+                    if (customParams.contains("sdt_convergence") &&
+                        customParams["sdt_convergence"].is_number()) {
                         sdtContext.params.convergenceThreshold = std::clamp(
-                            (*customParams)["sdt_convergence"].get<float>(), 0.1f, 2.0f);
+                            customParams["sdt_convergence"].get_float(), 0.1f, 2.0f);
                     }
-                    if (customParams->contains("sdt_chunk_size") &&
-                        (*customParams)["sdt_chunk_size"].is_number()) {
+                    if (customParams.contains("sdt_chunk_size") &&
+                        customParams["sdt_chunk_size"].is_number()) {
                         sdtContext.params.chunkSize = std::clamp(
-                            (*customParams)["sdt_chunk_size"].get<int>(), 32, 256);
+                            customParams["sdt_chunk_size"].get_int(), 32, 256);
                     }
                 }
             }
@@ -1313,9 +1331,9 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         }
 
         // Copy metadata
-        if (result.surface->meta && result.surface->meta->is_object()) {
+        if (!result.surface->meta.is_null() && result.surface->meta.is_object()) {
             ensureSurfaceMetaObject(segmentationSurface.get());
-            *segmentationSurface->meta = *result.surface->meta;
+            segmentationSurface->meta = result.surface->meta;
         }
 
         // Update metadata
@@ -1454,15 +1472,18 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         showStatus(message, kStatusLong);
         return false;
     }
-    if (auto customParams = _context.widget->customParamsJson()) {
-        request.customParams = std::move(*customParams);
+    {
+        auto customParams = _context.widget->customParamsJson();
+        if (!customParams.is_null()) {
+            request.customParams = std::move(customParams);
+        }
     }
     if (method == SegmentationGrowthMethod::Corrections &&
         _context.module && _context.module->cellReoptCollectionPending()) {
-        if (!request.customParams) {
-            request.customParams = nlohmann::json::object();
+        if (request.customParams.is_null()) {
+            request.customParams = utils::Json::object();
         }
-        (*request.customParams)["cell_reopt_mode"] = true;
+        request.customParams["cell_reopt_mode"] = true;
         qCInfo(lcSegGrowth) << "Cell reoptimization mode enabled for tracer params.";
     }
 
@@ -1527,19 +1548,12 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             // so taking a dense snapshot does not retarget the live segmentation surface.
             const std::filesystem::path originalSurfacePath = segmentationSurface->path;
             const std::string originalSurfaceId = segmentationSurface->id;
-            std::unique_ptr<nlohmann::json> originalSurfaceMeta;
-            if (segmentationSurface->meta) {
-                originalSurfaceMeta = std::make_unique<nlohmann::json>(*segmentationSurface->meta);
-            }
+            utils::Json originalSurfaceMeta = segmentationSurface->meta;
 
             const auto restoreLiveSurfaceState = [&]() {
                 segmentationSurface->path = originalSurfacePath;
                 segmentationSurface->id = originalSurfaceId;
-                if (originalSurfaceMeta) {
-                    segmentationSurface->meta = std::make_unique<nlohmann::json>(*originalSurfaceMeta);
-                } else {
-                    segmentationSurface->meta.reset();
-                }
+                segmentationSurface->meta = originalSurfaceMeta;
             };
 
             try {
@@ -1566,7 +1580,8 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             ? QStringLiteral("vector_geomedian")
             : denseTtaMergeMethod;
         denseJob.ttaOutlierDropThresh = std::max(0.01, denseTtaOutlierDropThresh);
-        denseJob.customParams = request.customParams;
+        if (!request.customParams.is_null())
+            denseJob.customParams = request.customParams;
         denseJob.directions = denseDirections;
 
         qCInfo(lcSegGrowth) << "Dense displacement enabled:"
@@ -1636,11 +1651,11 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         }
 
         // Add neural socket parameters to custom params
-        if (!request.customParams) {
-            request.customParams = nlohmann::json::object();
+        if (request.customParams.is_null()) {
+            request.customParams = utils::Json::object();
         }
-        (*request.customParams)["neural_socket"] = socketPath.toStdString();
-        (*request.customParams)["neural_batch_size"] = batchSize;
+        request.customParams["neural_socket"] = socketPath.toStdString();
+        request.customParams["neural_batch_size"] = batchSize;
 
         qCInfo(lcSegGrowth) << "Neural tracer enabled:"
                             << "socket" << socketPath
@@ -1884,19 +1899,12 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
 
         const std::filesystem::path originalSurfacePath = segmentationSurface->path;
         const std::string originalSurfaceId = segmentationSurface->id;
-        std::unique_ptr<nlohmann::json> originalSurfaceMeta;
-        if (segmentationSurface->meta) {
-            originalSurfaceMeta = std::make_unique<nlohmann::json>(*segmentationSurface->meta);
-        }
+        utils::Json originalSurfaceMeta2 = segmentationSurface->meta;
 
         const auto restoreLiveSurfaceState = [&]() {
             segmentationSurface->path = originalSurfacePath;
             segmentationSurface->id = originalSurfaceId;
-            if (originalSurfaceMeta) {
-                segmentationSurface->meta = std::make_unique<nlohmann::json>(*originalSurfaceMeta);
-            } else {
-                segmentationSurface->meta.reset();
-            }
+            segmentationSurface->meta = originalSurfaceMeta2;
         };
 
         try {
@@ -1911,10 +1919,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
         return false;
     }
 
-    std::optional<nlohmann::json> customParams;
-    if (auto parsed = _context.widget->customParamsJson()) {
-        customParams = std::move(*parsed);
-    }
+    utils::Json customParams = _context.widget->customParamsJson();
 
     CopyDisplacementJob copyJob;
     copyJob.socketPath = socketPath;
@@ -2373,12 +2378,11 @@ void SegmentationGrower::onFutureFinished()
             targetSurface->invalidateCache();
         }
 
-        nlohmann::json preservedTags = nlohmann::json::object();
+        utils::Json preservedTags = utils::Json::object();
         bool hadPreservedTags = false;
-        if (targetSurface->meta && targetSurface->meta->is_object()) {
-            auto tagsIt = targetSurface->meta->find("tags");
-            if (tagsIt != targetSurface->meta->end() && tagsIt->is_object()) {
-                preservedTags = *tagsIt;
+        if (!targetSurface->meta.is_null() && targetSurface->meta.is_object()) {
+            if (targetSurface->meta.contains("tags") && targetSurface->meta["tags"].is_object()) {
+                preservedTags = targetSurface->meta["tags"];
                 hadPreservedTags = true;
             }
         }
@@ -2393,19 +2397,18 @@ void SegmentationGrower::onFutureFinished()
             targetSurface->setChannel("approval", approval);
         }
 
-        if (result.surface->meta) {
-            targetSurface->meta = std::make_unique<nlohmann::json>(*result.surface->meta);
+        if (!result.surface->meta.is_null()) {
+            targetSurface->meta = result.surface->meta;
         } else {
             ensureSurfaceMetaObject(targetSurface);
         }
 
-        if (hadPreservedTags && targetSurface->meta && targetSurface->meta->is_object()) {
-            nlohmann::json mergedTags = preservedTags;
-            auto tagsIt = targetSurface->meta->find("tags");
-            if (tagsIt != targetSurface->meta->end() && tagsIt->is_object()) {
-                mergedTags.update(*tagsIt);
+        if (hadPreservedTags && !targetSurface->meta.is_null() && targetSurface->meta.is_object()) {
+            utils::Json mergedTags = preservedTags;
+            if (targetSurface->meta.contains("tags") && targetSurface->meta["tags"].is_object()) {
+                mergedTags.update(targetSurface->meta["tags"]);
             }
-            (*targetSurface->meta)["tags"] = mergedTags;
+            targetSurface->meta["tags"] = mergedTags;
         }
 
         updateSegmentationSurfaceMetadata(targetSurface, voxelSize);
@@ -2610,11 +2613,12 @@ void SegmentationGrower::onFutureFinished()
 
     // Apply grid offset to correction anchors (for surface growth remapping)
     // and save immediately to persist updated positions
-    if (result.surface && result.surface->meta && _context.module) {
-        auto offsetIt = result.surface->meta->find("grid_offset");
-        if (offsetIt != result.surface->meta->end() && offsetIt->is_array() && offsetIt->size() == 2) {
-            float offsetX = (*offsetIt)[0].get<float>();
-            float offsetY = (*offsetIt)[1].get<float>();
+    if (result.surface && !result.surface->meta.is_null() && _context.module) {
+        if (result.surface->meta.contains("grid_offset") &&
+            result.surface->meta["grid_offset"].is_array() &&
+            result.surface->meta["grid_offset"].size() == 2) {
+            float offsetX = result.surface->meta["grid_offset"][static_cast<size_t>(0)].get_float();
+            float offsetY = result.surface->meta["grid_offset"][static_cast<size_t>(1)].get_float();
             if (offsetX != 0.0f || offsetY != 0.0f) {
                 _context.module->applyCorrectionAnchorOffset(offsetX, offsetY);
                 // Save corrections with updated anchors to the new surface path

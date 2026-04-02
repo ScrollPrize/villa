@@ -330,13 +330,27 @@ public:
         std::shared_lock lock{mutex_};
         auto it = map_.find(key);
         if (it == map_.end()) {
-            misses_.fetch_add(1, std::memory_order_relaxed);
+            thread_local int missCount = 0;
+            if (++missCount >= 256) {
+                misses_.fetch_add(256, std::memory_order_relaxed);
+                missCount = 0;
+            }
             return std::nullopt;
         }
         if (config_.promote_on_read) {
-            it->second.generation.store(generation_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
+            thread_local uint64_t localGen = 0;
+            if (++localGen >= 64) {
+                it->second.generation.store(generation_.fetch_add(localGen, std::memory_order_relaxed), std::memory_order_relaxed);
+                localGen = 0;
+            } else {
+                it->second.generation.store(generation_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            }
         }
-        hits_.fetch_add(1, std::memory_order_relaxed);
+        thread_local int hitCount = 0;
+        if (++hitCount >= 256) {
+            hits_.fetch_add(256, std::memory_order_relaxed);
+            hitCount = 0;
+        }
         return it->second.value;
     }
 
@@ -350,13 +364,27 @@ public:
         std::shared_lock lock{mutex_};
         auto it = map_.find(key);
         if (it == map_.end()) {
-            misses_.fetch_add(1, std::memory_order_relaxed);
+            thread_local int missCount = 0;
+            if (++missCount >= 256) {
+                misses_.fetch_add(256, std::memory_order_relaxed);
+                missCount = 0;
+            }
             return fallback;
         }
         if (config_.promote_on_read) {
-            it->second.generation.store(generation_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
+            thread_local uint64_t localGen = 0;
+            if (++localGen >= 64) {
+                it->second.generation.store(generation_.fetch_add(localGen, std::memory_order_relaxed), std::memory_order_relaxed);
+                localGen = 0;
+            } else {
+                it->second.generation.store(generation_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            }
         }
-        hits_.fetch_add(1, std::memory_order_relaxed);
+        thread_local int hitCount = 0;
+        if (++hitCount >= 256) {
+            hits_.fetch_add(256, std::memory_order_relaxed);
+            hitCount = 0;
+        }
         return it->second.value;
     }
 
@@ -368,13 +396,27 @@ public:
         std::shared_lock lock{mutex_};
         auto it = map_.find(key);
         if (it == map_.end()) {
-            misses_.fetch_add(1, std::memory_order_relaxed);
+            thread_local int missCount = 0;
+            if (++missCount >= 256) {
+                misses_.fetch_add(256, std::memory_order_relaxed);
+                missCount = 0;
+            }
             return fallback;
         }
         if (config_.promote_on_read) {
-            it->second.generation.store(generation_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
+            thread_local uint64_t localGen = 0;
+            if (++localGen >= 64) {
+                it->second.generation.store(generation_.fetch_add(localGen, std::memory_order_relaxed), std::memory_order_relaxed);
+                localGen = 0;
+            } else {
+                it->second.generation.store(generation_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            }
         }
-        hits_.fetch_add(1, std::memory_order_relaxed);
+        thread_local int hitCount = 0;
+        if (++hitCount >= 256) {
+            hits_.fetch_add(256, std::memory_order_relaxed);
+            hitCount = 0;
+        }
         return it->second.value;
     }
 
@@ -573,11 +615,12 @@ private:
             }
         }
 
-        // Sort oldest generation first.
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const Candidate& a, const Candidate& b) {
-                      return a.generation < b.generation;
-                  });
+        // Partial sort: only need the oldest evict_ratio fraction.
+        auto evictCount = static_cast<size_t>(candidates.size() * config_.evict_ratio);
+        if (evictCount == 0) evictCount = 1;
+        std::nth_element(candidates.begin(), candidates.begin() + evictCount, candidates.end(),
+            [](const Candidate& a, const Candidate& b) { return a.generation < b.generation; });
+        candidates.resize(evictCount);  // Only keep the ones to evict
 
         // Phase 2 -- evict under unique lock until under target.
         std::unique_lock lock{mutex_};

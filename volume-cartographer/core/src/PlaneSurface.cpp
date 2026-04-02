@@ -2,6 +2,7 @@
 #include "vc/core/util/Geometry.hpp"
 
 #include <opencv2/calib3d.hpp>
+#include "utils/Json.hpp"
 
 #include <cmath>
 #include <limits>
@@ -108,6 +109,9 @@ static cv::Vec3f rotateAroundAxis(const cv::Vec3f& vector, const cv::Vec3f& axis
 }
 
 } // anonymous namespace
+
+PlaneSurface::PlaneSurface() = default;
+PlaneSurface::~PlaneSurface() = default;
 
 PlaneSurface::PlaneSurface(cv::Vec3f origin_, cv::Vec3f normal) : _origin(origin_)
 {

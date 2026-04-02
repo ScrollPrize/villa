@@ -143,8 +143,19 @@ QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
     }
 
     // Build fused LUT: window/level (or stretch) → ARGB32
-    std::array<uint32_t, 256> lut;
-    buildFusedGrayLut(lut, params, gray);
+    // Thread-local cache: when stretchValues is false (common case), the LUT
+    // depends only on windowLow/windowHigh and is identical for every tile.
+    thread_local std::array<uint32_t, 256> cachedLut;
+    thread_local float cachedLow = -1.0f;
+    thread_local float cachedHigh = -1.0f;
+    thread_local bool cachedStretch = true;  // force rebuild on first call
+
+    if (params.stretchValues || params.windowLow != cachedLow || params.windowHigh != cachedHigh || cachedStretch != params.stretchValues) {
+        buildFusedGrayLut(cachedLut, params, gray);
+        cachedLow = params.windowLow;
+        cachedHigh = params.windowHigh;
+        cachedStretch = params.stretchValues;
+    }
 
     // Single-pass: gray → RGB32 via fused LUT (4x unrolled)
     const int rows = gray.rows;
@@ -153,7 +164,7 @@ QImage applyPostProcess(cv::Mat_<uint8_t>& gray,
 
     auto* bits = reinterpret_cast<uint32_t*>(result.bits());
     const int stride = result.bytesPerLine() / 4;
-    applyFusedLut(gray, lut, bits, stride);
+    applyFusedLut(gray, cachedLut, bits, stride);
 
     return result;
 }

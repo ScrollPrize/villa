@@ -137,6 +137,10 @@ public:
     std::vector<WorldTileKey> visibleTiles(const QRectF& viewportSceneRect,
                                             int buffer = tiled_config::VISIBLE_BUFFER_TILES) const;
 
+    // Returns the coarsest (worst) actual pyramid level among visible tiles,
+    // or -1 if no tiles have been rendered yet.
+    int worstVisibleLevel(const QRectF& viewportSceneRect) const;
+
     // Returns world keys of tiles whose rendered level is worse than desiredLevel,
     // limited to tiles visible in the given viewport rect.
     std::vector<WorldTileKey> staleTilesInRect(int desiredLevel, uint64_t epoch,

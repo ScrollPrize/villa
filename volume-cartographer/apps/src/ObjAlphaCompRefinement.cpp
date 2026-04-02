@@ -1,8 +1,5 @@
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
-#include <xtensor/containers/xarray.hpp>
-#include <xtensor/io/xio.hpp>
-#include <xtensor/views/xview.hpp>
 
 #include "vc/core/types/VcDataset.hpp"
 
@@ -50,54 +47,48 @@ struct RefinementConfig {
     std::size_t cache_bytes = static_cast<std::size_t>(10e9);
 };
 
-static RefinementConfig parse_config(const nlohmann::json& params)
+static RefinementConfig parse_config(const utils::Json& params)
 {
     RefinementConfig cfg;
-    auto try_set = [&params](const char* key, auto& out) {
-        if (params.contains(key)) {
-            out = params.at(key).get<std::decay_t<decltype(out)>>();
-        }
-    };
-
-    try_set("refine", cfg.refine);
-    try_set("start", cfg.start);
-    try_set("stop", cfg.stop);
-    try_set("step", cfg.step);
-    try_set("border_off", cfg.border_off);
-    try_set("r", cfg.r);
-    try_set("gen_vertexcolor", cfg.gen_vertexcolor);
-    try_set("overwrite", cfg.overwrite);
-    try_set("reader_scale", cfg.reader_scale);
+    if (params.contains("refine")) cfg.refine = params.at("refine").get_bool();
+    if (params.contains("start")) cfg.start = params.at("start").get_float();
+    if (params.contains("stop")) cfg.stop = params.at("stop").get_float();
+    if (params.contains("step")) cfg.step = params.at("step").get_float();
+    if (params.contains("border_off")) cfg.border_off = params.at("border_off").get_float();
+    if (params.contains("r")) cfg.r = params.at("r").get_int();
+    if (params.contains("gen_vertexcolor")) cfg.gen_vertexcolor = params.at("gen_vertexcolor").get_bool();
+    if (params.contains("overwrite")) cfg.overwrite = params.at("overwrite").get_bool();
+    if (params.contains("reader_scale")) cfg.reader_scale = params.at("reader_scale").get_float();
     if (params.contains("cache_bytes")) {
-        const auto bytes = params.at("cache_bytes").get<std::uint64_t>();
+        const auto bytes = params.at("cache_bytes").get_uint64();
         cfg.cache_bytes = static_cast<std::size_t>(bytes);
     } else if (params.contains("cache_mb")) {
-        const auto mb = params.at("cache_mb").get<double>();
+        const auto mb = params.at("cache_mb").get_double();
         cfg.cache_bytes = static_cast<std::size_t>(std::max(1.0, mb) * 1024.0 * 1024.0);
     } else if (params.contains("cache_gb")) {
-        const auto gb = params.at("cache_gb").get<double>();
+        const auto gb = params.at("cache_gb").get_double();
         cfg.cache_bytes = static_cast<std::size_t>(std::max(0.001, gb) * 1024.0 * 1024.0 * 1024.0);
     }
 
     if (params.contains("low")) {
-        double v = params.at("low").get<double>();
+        double v = params.at("low").get_double();
         if (v > 1.0) v /= 255.0;
         cfg.low = static_cast<float>(std::clamp(v, 0.0, 1.0));
     }
     if (params.contains("high")) {
-        double v = params.at("high").get<double>();
+        double v = params.at("high").get_double();
         if (v > 1.0) v /= 255.0;
         cfg.high = static_cast<float>(std::clamp(v, 0.0, 1.0));
     }
 
     if (params.contains("scale_group")) {
         const auto& v = params.at("scale_group");
-        cfg.dataset_group = v.is_string() ? v.get<std::string>()
-                                          : std::to_string(v.get<int>());
+        cfg.dataset_group = v.is_string() ? v.get_string()
+                                          : std::to_string(v.get_int());
     } else if (params.contains("scale_level")) {
         const auto& v = params.at("scale_level");
-        cfg.dataset_group = v.is_string() ? v.get<std::string>()
-                                          : std::to_string(v.get<int>());
+        cfg.dataset_group = v.is_string() ? v.get_string()
+                                          : std::to_string(v.get_int());
     }
 
     return cfg;
@@ -350,8 +341,8 @@ int process_tifxyz(const std::filesystem::path& src,
     }
     outSurf.id = uuid;
 
-    if (surf->meta) {
-        outSurf.meta = std::make_unique<nlohmann::json>(*surf->meta);
+    if (!surf->meta.is_null()) {
+        outSurf.meta = surf->meta;
     }
 
     try {
@@ -404,7 +395,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    const nlohmann::json params = nlohmann::json::parse(params_f);
+    const utils::Json params = utils::Json::parse_file(params_path);
     const RefinementConfig cfg = parse_config(params);
 
     std::unique_ptr<vc::VcDataset> ds = std::make_unique<vc::VcDataset>(vol_path / cfg.dataset_group);

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <fstream>
 
+#include "utils/Json.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 
@@ -146,9 +147,7 @@ std::filesystem::path downloadRemoteSegment(
     // Patch meta.json if required fields are missing (safety net for lite format)
     if (fs::exists(metaPath)) {
         try {
-            std::ifstream ifs(metaPath);
-            auto meta = nlohmann::json::parse(ifs);
-            ifs.close();
+            auto meta = utils::Json::parse_file(metaPath);
 
             bool patched = false;
             if (!meta.contains("type")) {
@@ -224,9 +223,7 @@ std::filesystem::path downloadRemoteSegmentMetadataOnly(
     // Patch meta.json if required fields are missing
     if (fs::exists(metaPath)) {
         try {
-            std::ifstream ifs(metaPath);
-            auto meta = nlohmann::json::parse(ifs);
-            ifs.close();
+            auto meta = utils::Json::parse_file(metaPath);
 
             bool patched = false;
             if (!meta.contains("type")) { meta["type"] = "seg"; patched = true; }

@@ -6,7 +6,7 @@
 
 #include <boost/program_options.hpp>
 #include <opencv2/opencv.hpp>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include <fstream>
 #include <atomic>
 #include <chrono>
@@ -16,8 +16,6 @@
 
 #include <omp.h>
 
-#include <xtensor/containers/xarray.hpp>
-#include <xtensor/containers/xtensor.hpp>
 
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/Slicing.hpp"
@@ -35,7 +33,7 @@ enum class SliceDirection { XY, XZ, YZ };
 
 namespace {
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
 struct DirectionMetrics {
     std::string direction;
@@ -130,7 +128,7 @@ static vc::core::util::NormalGridSliceDirection to_normal_grid_direction(SliceDi
 }
 
 static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) {
-    json out;
+    Json out;
     out["mode"] = "generate";
     out["input"] = metrics.inputPath;
     out["output"] = metrics.outputPath;
@@ -143,15 +141,19 @@ static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) 
     out["verify_grid_save"] = metrics.verifyGridSave;
     out["omp_threads"] = metrics.ompThreads;
     out["cache_budget_bytes"] = metrics.cacheBudgetBytes;
-    out["level_shape_zyx"] = metrics.levelShape;
+    {
+        Json arr = Json::array();
+        for (auto v : metrics.levelShape) arr.push_back(static_cast<int64_t>(v));
+        out["level_shape_zyx"] = std::move(arr);
+    }
     out["total_slices_all_dirs"] = metrics.totalSlicesAllDirs;
     out["total_processed_all_dirs"] = metrics.totalProcessedAllDirs;
     out["total_skipped_all_dirs"] = metrics.totalSkippedAllDirs;
     out["total_seconds"] = metrics.totalSeconds;
-    out["directions"] = json::array();
+    out["directions"] = Json::array();
 
     for (const auto& dir : metrics.directions) {
-        json d;
+        Json d;
         d["direction"] = dir.direction;
         d["num_slices"] = dir.numSlices;
         d["processed"] = dir.processed;
@@ -167,9 +169,9 @@ static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) 
         d["chunk_size_target"] = dir.chunkSizeTarget;
         d["bytes_per_slice"] = dir.bytesPerSlice;
         d["estimated_batch_bytes"] = dir.estimatedBatchBytes;
-        d["timings"] = json::object();
+        d["timings"] = Json::object();
         for (const auto& [name, total] : dir.timingTotals) {
-            json t;
+            Json t;
             t["total_seconds"] = total;
             const size_t count = dir.timingCounts.contains(name) ? dir.timingCounts.at(name) : 0;
             t["count"] = count;
@@ -483,7 +485,7 @@ void run_generate(const po::variables_map& vm) {
     fs::create_directories(output_fs_path / "xz_img");
     fs::create_directories(output_fs_path / "yz_img");
 
-    json metadata;
+    Json metadata;
     metadata["spiral-step"] = spiral_step;
     metadata["grid-step"] = grid_step;
     metadata["sparse-volume"] = sparse_volume;
@@ -492,7 +494,7 @@ void run_generate(const po::variables_map& vm) {
     metadata["preview-every"] = preview_every;
     metadata["verify-grid-save"] = verify_grid_save;
     std::ofstream o(output_fs_path / "metadata.json");
-    o << std::setw(4) << metadata << std::endl;
+    o << metadata.dump(4) << std::endl;
 
     int num_threads = omp_get_max_threads();
     if (num_threads == 0) num_threads = 1;
@@ -614,7 +616,7 @@ void run_generate(const po::variables_map& vm) {
                 run_metrics.totalProcessedAllDirs += chunk_size;
                 run_metrics.totalSkippedAllDirs += chunk_existing;
             } else {
-                std::vector<size_t> chunk_shape;
+                std::array<size_t, 3> chunk_shape;
                 cv::Vec3i chunk_offset;
 
                 switch (dir) {
@@ -633,9 +635,8 @@ void run_generate(const po::variables_map& vm) {
                 }
 
                 ALifeTime chunk_timer;
-                xt::xtensor<uint8_t, 3, xt::layout_type::column_major> chunk_data =
-                    xt::xtensor<uint8_t, 3, xt::layout_type::column_major>::from_shape(chunk_shape);
-                chunk_timer.mark("xtensor_init");
+                Array3D<uint8_t> chunk_data(chunk_shape);
+                chunk_timer.mark("array_init");
                 readArea3D(chunk_data, chunk_offset, cache.get(), 0);
                 chunk_timer.mark("read_chunk");
 

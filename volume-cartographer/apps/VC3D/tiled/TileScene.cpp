@@ -241,6 +241,22 @@ std::vector<WorldTileKey> TileScene::visibleTiles(const QRectF& viewportSceneRec
     return result;
 }
 
+int TileScene::worstVisibleLevel(const QRectF& viewportSceneRect) const
+{
+    int firstCol, firstRow, lastCol, lastRow;
+    visibleGridRange(viewportSceneRect, 0, firstCol, firstRow, lastCol, lastRow);
+    int worst = -1;
+    for (int r = firstRow; r <= lastRow; ++r) {
+        for (int c = firstCol; c <= lastCol; ++c) {
+            size_t idx = static_cast<size_t>(r) * _bounds.totalCols + c;
+            if (idx >= _meta.size()) continue;
+            int8_t lvl = _meta[idx].level;
+            if (lvl >= 0 && lvl > worst) worst = lvl;
+        }
+    }
+    return worst;
+}
+
 std::vector<WorldTileKey> TileScene::staleTilesInRect(int desiredLevel, uint64_t epoch,
                                                         const QRectF& viewportSceneRect,
                                                         int buffer) const

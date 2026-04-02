@@ -204,7 +204,6 @@ void TileRenderController::onParamsChanged(
     const std::function<TileRenderParams(const WorldTileKey&)>& buildParams,
     const QRectF& viewportRect)
 {
-    _cache.clear();
     onCameraChanged(camera, surface, volume, buildParams, viewportRect);
 }
 

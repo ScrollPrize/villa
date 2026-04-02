@@ -1,6 +1,7 @@
 #include "vc/core/types/VcDataset.hpp"
 
 #include <utils/zarr.hpp>
+#include "utils/Json.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -276,7 +277,7 @@ static void fillTypedElements(uint8_t* dst,
     }
 }
 
-static CompressorConfig parseCompressor(const nlohmann::json& zarray, int dtypeSize)
+static CompressorConfig parseCompressor(const utils::Json& zarray, int dtypeSize)
 {
     CompressorConfig cfg;
     cfg.blosc_typesize = dtypeSize;
@@ -287,17 +288,17 @@ static CompressorConfig parseCompressor(const nlohmann::json& zarray, int dtypeS
     }
 
     const auto& comp = zarray["compressor"];
-    std::string id = comp.value("id", "");
+    std::string id = comp.value("id", std::string(""));
 
     if (id == "blosc") {
         cfg.id = CompressorId::Blosc;
-        cfg.blosc_cname = comp.value("cname", "lz4");
+        cfg.blosc_cname = comp.value("cname", std::string("lz4"));
         cfg.blosc_clevel = comp.value("clevel", 5);
         cfg.blosc_shuffle = comp.value("shuffle", 1);
         if (comp.contains("blocksize"))
-            cfg.blosc_blocksize = comp["blocksize"].get<int>();
+            cfg.blosc_blocksize = comp["blocksize"].get_int();
         if (comp.contains("typesize"))
-            cfg.blosc_typesize = comp["typesize"].get<int>();
+            cfg.blosc_typesize = comp["typesize"].get_int();
         else
             cfg.blosc_typesize = dtypeSize;
     } else if (id == "zstd") {
@@ -351,11 +352,11 @@ struct VcDataset::Impl {
     std::shared_ptr<utils::FileSystemStore> store_;
     std::unique_ptr<utils::ZarrArray> zarrArray_;
 
-    void parseFillValue(const nlohmann::json& zarray)
+    void parseFillValue(const utils::Json& zarray)
     {
         std::int64_t rawFill = 0;
         if (zarray.contains("fill_value") && !zarray["fill_value"].is_null()) {
-            rawFill = zarray["fill_value"].get<std::int64_t>();
+            rawFill = zarray["fill_value"].get_int64();
         }
 
         fillValueBytes_.assign(dtypeSize_, 0);
@@ -381,20 +382,19 @@ struct VcDataset::Impl {
             throw std::runtime_error("Missing .zarray in " + path.string());
         }
 
-        std::ifstream f(zarrayPath);
-        nlohmann::json zarray = nlohmann::json::parse(f);
+        utils::Json zarray = utils::Json::parse_file(zarrayPath);
 
         // Shape
         auto shapeJson = zarray["shape"];
         shape_.clear();
         for (auto& v : shapeJson)
-            shape_.push_back(v.get<size_t>());
+            shape_.push_back(v.get_size_t());
 
         // Chunks
         auto chunksJson = zarray["chunks"];
         chunkShape_.clear();
         for (auto& v : chunksJson)
-            chunkShape_.push_back(v.get<size_t>());
+            chunkShape_.push_back(v.get_size_t());
 
         // Chunk size (product)
         chunkSize_ = 1;
@@ -402,7 +402,7 @@ struct VcDataset::Impl {
             chunkSize_ *= c;
 
         // Dtype
-        std::string dtypeStr = zarray["dtype"].get<std::string>();
+        std::string dtypeStr = zarray["dtype"].get_string();
         if (dtypeStr == "|u1" || dtypeStr == "<u1" || dtypeStr == "uint8") {
             dtype_ = VcDtype::uint8;
             dtypeSize_ = 1;
@@ -417,7 +417,7 @@ struct VcDataset::Impl {
 
         // Dimension separator
         if (zarray.contains("dimension_separator")) {
-            delimiter_ = zarray["dimension_separator"].get<std::string>();
+            delimiter_ = zarray["dimension_separator"].get_string();
         }
 
         // Compressor
@@ -820,18 +820,17 @@ std::vector<std::unique_ptr<VcDataset>> openZarrLevels(
     return result;
 }
 
-nlohmann::json readZarrAttributes(const std::filesystem::path& groupPath)
+utils::Json readZarrAttributes(const std::filesystem::path& groupPath)
 {
     auto attrsPath = groupPath / ".zattrs";
     if (!std::filesystem::exists(attrsPath)) {
-        return nlohmann::json::object();
+        return utils::Json::object();
     }
-    std::ifstream f(attrsPath);
-    return nlohmann::json::parse(f);
+    return utils::Json::parse_file(attrsPath);
 }
 
 void writeZarrAttributes(const std::filesystem::path& groupPath,
-                          const nlohmann::json& attrs)
+                          const utils::Json& attrs)
 {
     auto attrsPath = groupPath / ".zattrs";
     std::filesystem::create_directories(groupPath);
@@ -856,10 +855,18 @@ std::unique_ptr<VcDataset> createZarrDataset(
     fs::create_directories(dsPath);
 
     // Write .zarray metadata
-    nlohmann::json zarray;
+    utils::Json zarray;
     zarray["zarr_format"] = 2;
-    zarray["shape"] = shape;
-    zarray["chunks"] = chunks;
+    {
+        utils::Json shapeArr = utils::Json::array();
+        for (auto s : shape) shapeArr.push_back(static_cast<uint64_t>(s));
+        zarray["shape"] = std::move(shapeArr);
+    }
+    {
+        utils::Json chunksArr = utils::Json::array();
+        for (auto c : chunks) chunksArr.push_back(static_cast<uint64_t>(c));
+        zarray["chunks"] = std::move(chunksArr);
+    }
     zarray["dtype"] = (dtype == VcDtype::uint8) ? "|u1" : "<u2";
     zarray["fill_value"] = fillValue;
     zarray["order"] = "C";

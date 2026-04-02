@@ -1,5 +1,3 @@
-#include <nlohmann/json.hpp>
-
 #include <opencv2/core.hpp>
 
 #include "vc/core/util/Surface.hpp"
@@ -13,7 +11,7 @@
 #include <cmath>
 
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
 class MeasureLife
 {
@@ -54,10 +52,9 @@ QuadSurface* load_surface(const std::filesystem::path& path) {
         throw std::runtime_error("No meta.json found at: " + path.string());
     }
 
-    std::ifstream meta_f(meta_path);
-    json meta = json::parse(meta_f);
+    Json meta = Json::parse_file(meta_path);
 
-    std::string format = meta.value("format", "unknown");
+    std::string format = meta.value("format", std::string{"unknown"});
 
     if (format == "tifxyz") {
         return load_quad_from_tifxyz(path.string()).release();
@@ -97,12 +94,11 @@ int main(int argc, char *argv[])
         tolerance = std::stof(argv[5]);
     }
 
-    json params;
+    Json params;
     if (argc == 7) {
         std::filesystem::path params_path = argv[6];
         if (std::filesystem::exists(params_path)) {
-            std::ifstream params_f(params_path);
-            params = json::parse(params_f);
+            params = Json::parse_file(params_path);
         }
     }
 
@@ -171,8 +167,8 @@ int main(int argc, char *argv[])
         }
 
         // Prepare metadata
-        if (!result->meta) {
-            result->meta = std::make_unique<json>();
+        if (result->meta.is_null()) {
+            result->meta = Json::object();
         }
 
         // Generate output path - append operation and timestamp to the base name
@@ -200,15 +196,15 @@ int main(int argc, char *argv[])
         // Print statistics
         std::cout << "Result surface contains " << result->countValidPoints() << " valid points" << std::endl;
 
-        if (result->meta) {
+        if (!result->meta.is_null()) {
             const double area_vx2 = vc::surface::computeSurfaceAreaVox2(result->rawPoints());
-            (*result->meta)["area_vx2"] = area_vx2;
+            result->meta["area_vx2"] = area_vx2;
 
             if (params.contains("voxelsize")) {
-                const double voxelsize = params["voxelsize"];
+                const double voxelsize = params["voxelsize"].get_double();
                 if (std::isfinite(voxelsize) && voxelsize > 0.0) {
                     const double area_cm2 = area_vx2 * voxelsize * voxelsize / 1e8;
-                    (*result->meta)["area_cm2"] = area_cm2;
+                    result->meta["area_cm2"] = area_cm2;
                     std::cout << "Area: " << area_cm2 << " cm²" << std::endl;
                 }
             }

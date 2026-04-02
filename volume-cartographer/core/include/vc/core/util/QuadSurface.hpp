@@ -277,7 +277,7 @@ public:
     // Load from path with meta.json - lazy loading (only loads meta, loads points on first access)
     explicit QuadSurface(const std::filesystem::path &path_);
     // Load from path with provided meta json - lazy loading
-    QuadSurface(const std::filesystem::path &path_, const nlohmann::json &json);
+    QuadSurface(const std::filesystem::path &path_, const utils::Json &json);
     ~QuadSurface() override;
 
     // Ensure points are loaded (for lazy loading constructors)

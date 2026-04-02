@@ -32,9 +32,7 @@ TEST(GenNormalGridsHelpers, BatchPlanFallsBackToOneSliceWithZeroBudget)
 
 TEST(GenNormalGridsHelpers, ExtractBinarySliceMatchesExpectedXYXZYZ)
 {
-    xt::xtensor<uint8_t, 3, xt::layout_type::column_major> chunk =
-        xt::xtensor<uint8_t, 3, xt::layout_type::column_major>::from_shape({2, 3, 4});
-    chunk.fill(0);
+    Array3D<uint8_t> chunk({2, 3, 4});
     chunk(1, 2, 3) = 5;
     chunk(0, 1, 2) = 9;
     chunk(1, 0, 1) = 7;

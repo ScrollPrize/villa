@@ -1,3 +1,4 @@
+#include <iostream>
 #include <random>
 
 #include "vc/core/util/Slicing.hpp"
@@ -7,13 +8,12 @@
 #include "vc/core/util/Geometry.hpp"
 
 #include <opencv2/imgproc.hpp>
+#include "utils/Json.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
 
-
 #include "vc/core/types/VcDataset.hpp"
-#include <nlohmann/json.hpp>
 #include <boost/program_options.hpp>
 
 #include <omp.h>
@@ -30,9 +30,9 @@ namespace po = boost::program_options;
 using shape = std::vector<size_t>;
 
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
-static void add_target_context(json& meta, const std::filesystem::path& volume_path)
+static void add_target_context(Json& meta, const std::filesystem::path& volume_path)
 {
     std::filesystem::path normalized_volume_path = volume_path.lexically_normal();
     if (normalized_volume_path.filename().empty()) {
@@ -56,9 +56,9 @@ static void add_target_context(json& meta, const std::filesystem::path& volume_p
     std::error_code ec;
     if (std::filesystem::is_regular_file(config_path, ec)) {
         try {
-            auto cfg = json::parse(std::ifstream(config_path));
+            auto cfg = Json::parse_file(config_path);
             if (cfg.contains("name") && cfg["name"].is_string()) {
-                scroll_name = cfg["name"].get<std::string>();
+                scroll_name = cfg["name"].get_string();
             }
         } catch (...) {
             // Keep folder-based fallback if config.json cannot be parsed.
@@ -111,10 +111,9 @@ bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec
             continue;
         }
 
-        std::ifstream meta_f(meta_fn);
-        json meta = json::parse(meta_f);
+        auto meta = utils::Json::parse_file(meta_fn);
 
-        if (!meta.count("bbox") || meta.value("format","NONE") != "tifxyz") {
+        if (!meta.count("bbox") || meta.value("format", std::string{"NONE"}) != "tifxyz") {
             continue;
         }
 
@@ -127,7 +126,7 @@ bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec
     return false;
 }
 
-static auto load_direction_fields(json const&params, std::filesystem::path const &cache_root)
+static auto load_direction_fields(Json const&params, std::filesystem::path const &cache_root)
 {
     std::vector<DirectionField> direction_fields;
     if (params.contains("direction_fields")) {
@@ -135,13 +134,13 @@ static auto load_direction_fields(json const&params, std::filesystem::path const
             std::cerr << "WARNING: direction_fields must be an array; ignoring" << std::endl;
         }
         for (auto const& direction_field : params["direction_fields"]) {
-            std::string const zarr_path = direction_field["zarr"];
-            std::string const direction = direction_field["dir"];
+            std::string const zarr_path = direction_field["zarr"].get_string();
+            std::string const direction = direction_field["dir"].get_string();
             if (!std::ranges::contains(std::vector{"horizontal", "vertical", "normal"}, direction)) {
                 std::cerr << "WARNING: invalid direction in direction_field " << zarr_path << "; skipping" << std::endl;
                 continue;
             }
-            int const ome_scale = direction_field["scale"];
+            int const ome_scale = direction_field["scale"].get_int();
             float scale_factor = std::pow(2, -ome_scale);
             std::filesystem::path dirs_group_path(zarr_path);
             std::vector<std::unique_ptr<vc::VcDataset>> direction_dss;
@@ -152,7 +151,7 @@ static auto load_direction_fields(json const&params, std::filesystem::path const
             std::cout << "direction field dataset shape " << direction_dss.front()->shape() << std::endl;
             std::unique_ptr<vc::VcDataset> maybe_weight_ds;
             if (direction_field.contains("weight_zarr")) {
-                std::string const weight_zarr_path = direction_field["weight_zarr"];
+                std::string const weight_zarr_path = direction_field["weight_zarr"].get_string();
                 std::filesystem::path weight_ds_path = std::filesystem::path(weight_zarr_path) / std::to_string(ome_scale);
                 maybe_weight_ds = std::make_unique<vc::VcDataset>(weight_ds_path);
             }
@@ -160,7 +159,7 @@ static auto load_direction_fields(json const&params, std::filesystem::path const
             float weight = 1.0f;
             if (direction_field.contains("weight")) {
                 try {
-                    weight = std::clamp(direction_field["weight"].get<float>(), 0.0f, 10.0f);
+                    weight = std::clamp(direction_field["weight"].get_float(), 0.0f, 10.0f);
                 } catch (const std::exception& ex) {
                     std::cerr << "WARNING: invalid weight for direction field " << zarr_path << ": " << ex.what() << std::endl;
                 }
@@ -180,7 +179,7 @@ int main(int argc, char *argv[])
 {
     std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
     cv::Vec3d origin;
-    json params;
+    Json params;
     VCCollection corrections;
     bool skip_overlap_check = false;
     std::string segment_name;
@@ -256,8 +255,7 @@ int main(int argc, char *argv[])
             }
         }
         
-        std::ifstream params_f(params_path.string());
-        params = json::parse(params_f);
+        params = Json::parse_file(params_path);
 
         if (vm.count("rewind-gen")) {
             params["rewind_gen"] = vm["rewind-gen"].as<int>();
@@ -291,8 +289,7 @@ int main(int argc, char *argv[])
     }
 
     if (params.empty()) {
-        std::ifstream params_f(params_path.string());
-        params = json::parse(params_f);
+        params = Json::parse_file(params_path);
     }
 
     // Honor optional CUDA toggle from params (default true)
@@ -323,16 +320,16 @@ int main(int argc, char *argv[])
     int search_effort = params.value("search_effort", 10);
     int thread_limit = params.value("thread_limit", 0);
 
-    float voxelsize = json::parse(std::ifstream(vol_path/"meta.json"))["voxelsize"];
+    float voxelsize = Json::parse_file(vol_path/"meta.json")["voxelsize"].get_float();
     
     std::filesystem::path cache_root;
     if (params.contains("cache_root") && params["cache_root"].is_string()) {
-        cache_root = params["cache_root"].get<std::string>();
+        cache_root = params["cache_root"].get_string();
     } else if (params.contains("cache_root") && !params["cache_root"].is_null()) {
         std::cerr << "WARNING: cache_root must be a string; ignoring" << std::endl;
     }
 
-    std::string mode = params.value("mode", "seed");
+    std::string mode = params.value("mode", std::string("seed"));
     
     std::cout << "mode: " << mode << std::endl;
     std::cout << "step size: " << params.value("step_size", 20.0f) << std::endl;
@@ -370,13 +367,12 @@ int main(int argc, char *argv[])
                 if (!std::filesystem::exists(meta_fn))
                     continue;
 
-                std::ifstream meta_f(meta_fn);
-                json meta = json::parse(meta_f);
+                auto meta = utils::Json::parse_file(meta_fn);
 
                 if (!meta.count("bbox"))
                     continue;
 
-                if (meta.value("format","NONE") != "tifxyz")
+                if (meta.value("format", std::string{"NONE"}) != "tifxyz")
                     continue;
 
                 QuadSurface *sm = new QuadSurface(entry.path(), meta);
@@ -540,7 +536,7 @@ int main(int argc, char *argv[])
         origin = {0,0,0}; // Not used in resume mode, but needs to be initialized
     }
 
-    json meta_params;
+    Json meta_params;
     meta_params["source"] = "vc_grow_seg_from_seed";
     meta_params["vc_gsfs_params"] = params;
     meta_params["vc_gsfs_mode"] = mode;
@@ -1351,14 +1347,14 @@ int main(int argc, char *argv[])
         std::filesystem::path out_dir = tgt_dir / uuid_local;
 
         // Meta
-        nlohmann::json neighbor_meta;
+        Json neighbor_meta;
         neighbor_meta["source"] = "vc_grow_seg_from_seed";
         neighbor_meta["vc_gsfs_params"] = params;
         neighbor_meta["vc_gsfs_mode"] = mode;
         neighbor_meta["vc_gsfs_version"] = "dev";
         add_target_context(neighbor_meta, vol_path);
 
-        out_surf->meta = std::make_unique<nlohmann::json>(std::move(neighbor_meta));
+        out_surf->meta = neighbor_meta;
         out_surf->save(out_dir, uuid_local, true);
 
         // Done
@@ -1367,7 +1363,7 @@ int main(int argc, char *argv[])
 
     QuadSurface *surf = tracer(ds.get(), 1.0, chunk_cache.get(), 0, origin, params, cache_root, voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections);
 
-    double area_cm2 = (*surf->meta)["area_cm2"].get<double>();
+    double area_cm2 = surf->meta["area_cm2"].get_double();
     if (area_cm2 < min_area_cm) {
         if (std::filesystem::exists(seg_dir)) {
             std::filesystem::remove_all(seg_dir);
@@ -1416,13 +1412,12 @@ int main(int argc, char *argv[])
                 if (!std::filesystem::exists(meta_fn))
                     continue;
 
-                std::ifstream meta_f(meta_fn);
-                json meta = json::parse(meta_f);
+                auto meta = utils::Json::parse_file(meta_fn);
 
                 if (!meta.count("bbox"))
                     continue;
 
-                if (meta.value("format","NONE") != "tifxyz")
+                if (meta.value("format", std::string{"NONE"}) != "tifxyz")
                     continue;
 
                 QuadSurface other = QuadSurface(entry.path(), meta);

@@ -12,6 +12,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/LoadJson.hpp"
+#include "utils/Json.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 #include <QBrush>
@@ -45,10 +46,10 @@
 
 namespace {
 
-void sync_tag(nlohmann::json& dict, bool checked, const std::string& name, const std::string& username = {})
+void sync_tag(utils::Json& dict, bool checked, const std::string& name, const std::string& username = {})
 {
     if (checked && !dict.count(name)) {
-        dict[name] = nlohmann::json::object();
+        dict[name] = utils::Json::object();
         if (!username.empty()) {
             dict[name]["user"] = username;
         }
@@ -187,15 +188,15 @@ void SurfacePanelController::loadRemoteSurfaces(
             item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(id));
 
             auto* quadSurf = dynamic_cast<QuadSurface*>(surf.get());
-            if (quadSurf && quadSurf->meta) {
-                const double areaCm2 = vc::json::number_or(quadSurf->meta.get(), "area_cm2", -1.0);
-                const double avgCost = vc::json::number_or(quadSurf->meta.get(), "avg_cost", -1.0);
+            if (quadSurf && !quadSurf->meta.is_null()) {
+                const double areaCm2 = vc::json::number_or(quadSurf->meta, "area_cm2", -1.0);
+                const double avgCost = vc::json::number_or(quadSurf->meta, "avg_cost", -1.0);
                 item->setText(2, QString::number(areaCm2, 'f', 3));
                 item->setText(3, QString::number(avgCost, 'f', 3));
                 item->setText(4, QString::number(quadSurf->overlappingIds().size()));
                 QString timestamp;
-                if (quadSurf->meta->contains("date_last_modified")) {
-                    timestamp = QString::fromStdString((*quadSurf->meta)["date_last_modified"].get<std::string>());
+                if (quadSurf->meta.contains("date_last_modified")) {
+                    timestamp = QString::fromStdString(quadSurf->meta["date_last_modified"].get_string());
                 }
                 item->setText(5, timestamp);
             }
@@ -253,15 +254,15 @@ void SurfacePanelController::loadRemoteStubs(
                 // Fully cached segment - show normally
                 item->setText(SURFACE_ID_COLUMN, QString::fromStdString(segId));
                 auto* quadSurf = dynamic_cast<QuadSurface*>(it->second.get());
-                if (quadSurf && quadSurf->meta) {
-                    const double areaCm2 = vc::json::number_or(quadSurf->meta.get(), "area_cm2", -1.0);
-                    const double avgCost = vc::json::number_or(quadSurf->meta.get(), "avg_cost", -1.0);
+                if (quadSurf && !quadSurf->meta.is_null()) {
+                    const double areaCm2 = vc::json::number_or(quadSurf->meta, "area_cm2", -1.0);
+                    const double avgCost = vc::json::number_or(quadSurf->meta, "avg_cost", -1.0);
                     item->setText(2, QString::number(areaCm2, 'f', 3));
                     item->setText(3, QString::number(avgCost, 'f', 3));
                     item->setText(4, QString::number(quadSurf->overlappingIds().size()));
                     QString timestamp;
-                    if (quadSurf->meta->contains("date_last_modified")) {
-                        timestamp = QString::fromStdString((*quadSurf->meta)["date_last_modified"].get<std::string>());
+                    if (quadSurf->meta.contains("date_last_modified")) {
+                        timestamp = QString::fromStdString(quadSurf->meta["date_last_modified"].get_string());
                     }
                     item->setText(5, timestamp);
                 }
@@ -331,15 +332,15 @@ void SurfacePanelController::replaceStubWithSurface(
                 item->setForeground(SURFACE_ID_COLUMN, QBrush(Qt::black));
 
                 auto* quadSurf = dynamic_cast<QuadSurface*>(surface.get());
-                if (quadSurf && quadSurf->meta) {
-                    const double areaCm2 = vc::json::number_or(quadSurf->meta.get(), "area_cm2", -1.0);
-                    const double avgCost = vc::json::number_or(quadSurf->meta.get(), "avg_cost", -1.0);
+                if (quadSurf && !quadSurf->meta.is_null()) {
+                    const double areaCm2 = vc::json::number_or(quadSurf->meta, "area_cm2", -1.0);
+                    const double avgCost = vc::json::number_or(quadSurf->meta, "avg_cost", -1.0);
                     item->setText(2, QString::number(areaCm2, 'f', 3));
                     item->setText(3, QString::number(avgCost, 'f', 3));
                     item->setText(4, QString::number(quadSurf->overlappingIds().size()));
                     QString timestamp;
-                    if (quadSurf->meta->contains("date_last_modified")) {
-                        timestamp = QString::fromStdString((*quadSurf->meta)["date_last_modified"].get<std::string>());
+                    if (quadSurf->meta.contains("date_last_modified")) {
+                        timestamp = QString::fromStdString(quadSurf->meta["date_last_modified"].get_string());
                     }
                     item->setText(5, timestamp);
                     updateTreeItemIcon(item);
@@ -562,14 +563,14 @@ void SurfacePanelController::populateSurfaceTree()
         auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
         item->setText(SURFACE_ID_COLUMN, QString::fromStdString(id));
         item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(id));
-        const double areaCm2 = vc::json::number_or(surf->meta.get(), "area_cm2", -1.0);
-        const double avgCost = vc::json::number_or(surf->meta.get(), "avg_cost", -1.0);
+        const double areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);
+        const double avgCost = vc::json::number_or(surf->meta, "avg_cost", -1.0);
         item->setText(2, QString::number(areaCm2, 'f', 3));
         item->setText(3, QString::number(avgCost, 'f', 3));
         item->setText(4, QString::number(surf->overlappingIds().size()));
         QString timestamp;
-        if (surf->meta && surf->meta->contains("date_last_modified")) {
-            timestamp = QString::fromStdString((*surf->meta)["date_last_modified"].get<std::string>());
+        if (!surf->meta.is_null() && surf->meta.contains("date_last_modified")) {
+            timestamp = QString::fromStdString(surf->meta["date_last_modified"].get_string());
         }
         item->setText(5, timestamp);
         updateTreeItemIcon(item);
@@ -605,11 +606,11 @@ void SurfacePanelController::refreshSurfaceMetrics(const std::string& surfaceId)
     QString timestamp;
 
     if (surf) {
-        areaCm2 = vc::json::number_or(surf->meta.get(), "area_cm2", -1.0);
-        avgCost = vc::json::number_or(surf->meta.get(), "avg_cost", -1.0);
+        areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);
+        avgCost = vc::json::number_or(surf->meta, "avg_cost", -1.0);
         overlapCount = static_cast<int>(surf->overlappingIds().size());
-        if (surf->meta && surf->meta->contains("date_last_modified")) {
-            timestamp = QString::fromStdString((*surf->meta)["date_last_modified"].get<std::string>());
+        if (!surf->meta.is_null() && surf->meta.contains("date_last_modified")) {
+            timestamp = QString::fromStdString(surf->meta["date_last_modified"].get_string());
         }
     }
 
@@ -632,11 +633,11 @@ void SurfacePanelController::updateTreeItemIcon(SurfaceTreeWidgetItem* item)
 
     const auto id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
     auto surf = getSurfaceById(id);
-    if (!surf || !surf->meta) {
+    if (!surf || surf->meta.is_null()) {
         return;
     }
 
-    const auto tags = vc::json::tags_or_empty(surf->meta.get());
+    const auto tags = vc::json::tags_or_empty(surf->meta);
     item->updateItemIcon(tags.contains("approved"), tags.contains("defective"));
 }
 
@@ -662,14 +663,14 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
             auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
             item->setText(SURFACE_ID_COLUMN, QString::fromStdString(segId));
             item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(segId));
-            const double areaCm2 = vc::json::number_or(surf->meta.get(), "area_cm2", -1.0);
-            const double avgCost = vc::json::number_or(surf->meta.get(), "avg_cost", -1.0);
+            const double areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);
+            const double avgCost = vc::json::number_or(surf->meta, "avg_cost", -1.0);
             item->setText(2, QString::number(areaCm2, 'f', 3));
             item->setText(3, QString::number(avgCost, 'f', 3));
             item->setText(4, QString::number(surf->overlappingIds().size()));
             QString timestamp;
-            if (surf->meta && surf->meta->contains("date_last_modified")) {
-                timestamp = QString::fromStdString((*surf->meta)["date_last_modified"].get<std::string>());
+            if (!surf->meta.is_null() && surf->meta.contains("date_last_modified")) {
+                timestamp = QString::fromStdString(surf->meta["date_last_modified"].get_string());
             }
             item->setText(5, timestamp);
             updateTreeItemIcon(item);
@@ -967,11 +968,10 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
                     std::filesystem::path metaPath = backupPath / "meta.json";
                     if (std::filesystem::exists(metaPath)) {
                         try {
-                            std::ifstream f(metaPath);
-                            nlohmann::json meta = nlohmann::json::parse(f);
+                            auto meta = utils::Json::parse_file(metaPath);
                             if (meta.contains("backup_timestamp")) {
                                 label = tr("Backup %1 - %2").arg(idx).arg(
-                                    QString::fromStdString(meta["backup_timestamp"].get<std::string>()));
+                                    QString::fromStdString(meta["backup_timestamp"].get_string()));
                             }
                         } catch (...) {
                             // Couldn't read meta, use simple label
@@ -1584,16 +1584,16 @@ void SurfacePanelController::onTagCheckboxToggled()
         const std::string id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
         auto surface = _volumePkg ? _volumePkg->getSurface(id) : nullptr;
 
-        if (!surface || !surface->meta) {
+        if (!surface || surface->meta.is_null()) {
             continue;
         }
 
-        const bool wasReviewed = surface->meta->contains("tags") && surface->meta->at("tags").contains("reviewed");
+        const bool wasReviewed = surface->meta.contains("tags") && surface->meta.at("tags").contains("reviewed");
         const bool isNowReviewed = _tags.reviewed && _tags.reviewed->checkState() == Qt::Checked;
         const bool reviewedJustAdded = !wasReviewed && isNowReviewed;
 
-        if (surface->meta->contains("tags")) {
-            auto& tags = surface->meta->at("tags");
+        if (surface->meta.contains("tags")) {
+            auto& tags = surface->meta.at("tags");
             sync_tag(tags, _tags.approved && _tags.approved->checkState() == Qt::Checked, "approved", username);
             sync_tag(tags, _tags.defective && _tags.defective->checkState() == Qt::Checked, "defective", username);
             sync_tag(tags, _tags.reviewed && _tags.reviewed->checkState() == Qt::Checked, "reviewed", username);
@@ -1605,35 +1605,35 @@ void SurfacePanelController::onTagCheckboxToggled()
                    (_tags.reviewed && _tags.reviewed->checkState() == Qt::Checked) ||
                    (_tags.revisit && _tags.revisit->checkState() == Qt::Checked) ||
                    (_tags.inspect && _tags.inspect->checkState() == Qt::Checked)) {
-            (*surface->meta)["tags"] = nlohmann::json::object();
-            auto& tags = (*surface->meta)["tags"];
+            surface->meta["tags"] = utils::Json::object();
+            auto& tags = surface->meta["tags"];
 
             if (_tags.approved && _tags.approved->checkState() == Qt::Checked) {
-                tags["approved"] = nlohmann::json::object();
+                tags["approved"] = utils::Json::object();
                 if (!username.empty()) {
                     tags["approved"]["user"] = username;
                 }
             }
             if (_tags.defective && _tags.defective->checkState() == Qt::Checked) {
-                tags["defective"] = nlohmann::json::object();
+                tags["defective"] = utils::Json::object();
                 if (!username.empty()) {
                     tags["defective"]["user"] = username;
                 }
             }
             if (_tags.reviewed && _tags.reviewed->checkState() == Qt::Checked) {
-                tags["reviewed"] = nlohmann::json::object();
+                tags["reviewed"] = utils::Json::object();
                 if (!username.empty()) {
                     tags["reviewed"]["user"] = username;
                 }
             }
             if (_tags.revisit && _tags.revisit->checkState() == Qt::Checked) {
-                tags["revisit"] = nlohmann::json::object();
+                tags["revisit"] = utils::Json::object();
                 if (!username.empty()) {
                     tags["revisit"]["user"] = username;
                 }
             }
             if (_tags.inspect && _tags.inspect->checkState() == Qt::Checked) {
-                tags["inspect"] = nlohmann::json::object();
+                tags["inspect"] = utils::Json::object();
                 if (!username.empty()) {
                     tags["inspect"]["user"] = username;
                 }
@@ -1647,22 +1647,22 @@ void SurfacePanelController::onTagCheckboxToggled()
             if (surf) {
                 for (const auto& overlapId : surf->overlappingIds()) {
                     auto overlapMeta = _volumePkg->getSurface(overlapId);
-                    if (!overlapMeta || !overlapMeta->meta) {
+                    if (!overlapMeta || overlapMeta->meta.is_null()) {
                         continue;
                     }
 
-                    const bool alreadyReviewed = overlapMeta->meta->contains("tags") &&
-                                                 overlapMeta->meta->at("tags").contains("reviewed");
+                    const bool alreadyReviewed = overlapMeta->meta.contains("tags") &&
+                                                 overlapMeta->meta.at("tags").contains("reviewed");
                     if (alreadyReviewed) {
                         continue;
                     }
 
-                    if (!overlapMeta->meta->contains("tags")) {
-                        (*overlapMeta->meta)["tags"] = nlohmann::json::object();
+                    if (!overlapMeta->meta.contains("tags")) {
+                        overlapMeta->meta["tags"] = utils::Json::object();
                     }
 
-                    auto& overlapTags = (*overlapMeta->meta)["tags"];
-                    overlapTags["partial_review"] = nlohmann::json::object();
+                    auto& overlapTags = overlapMeta->meta["tags"];
+                    overlapTags["partial_review"] = utils::Json::object();
                     if (!username.empty()) {
                         overlapTags["partial_review"]["user"] = username;
                     }
@@ -1818,15 +1818,15 @@ void SurfacePanelController::applyFiltersInternal()
             }
 
             if (isChecked(_filters.unreviewed)) {
-                if (surf->meta) {
-                    const auto tags = vc::json::tags_or_empty(surf->meta.get());
+                if (!surf->meta.is_null()) {
+                    const auto tags = vc::json::tags_or_empty(surf->meta);
                     show = show && !tags.contains("reviewed");
                 }
             }
 
             if (isChecked(_filters.revisit)) {
-                if (surf->meta) {
-                    const auto tags = vc::json::tags_or_empty(surf->meta.get());
+                if (!surf->meta.is_null()) {
+                    const auto tags = vc::json::tags_or_empty(surf->meta);
                     show = show && tags.contains("revisit");
                 } else {
                     show = false;
@@ -1834,29 +1834,29 @@ void SurfacePanelController::applyFiltersInternal()
             }
 
             if (isChecked(_filters.noExpansion)) {
-                if (surf->meta) {
-                    const auto mode = vc::json::string_or(surf->meta.get(), "vc_gsfs_mode", std::string{});
+                if (!surf->meta.is_null()) {
+                    const auto mode = vc::json::string_or(surf->meta, "vc_gsfs_mode", std::string{});
                     show = show && (mode != "expansion");
                 }
             }
 
             if (isChecked(_filters.noDefective)) {
-                if (surf->meta) {
-                    const auto tags = vc::json::tags_or_empty(surf->meta.get());
+                if (!surf->meta.is_null()) {
+                    const auto tags = vc::json::tags_or_empty(surf->meta);
                     show = show && !tags.contains("defective");
                 }
             }
 
             if (isChecked(_filters.partialReview)) {
-                if (surf->meta) {
-                    const auto tags = vc::json::tags_or_empty(surf->meta.get());
+                if (!surf->meta.is_null()) {
+                    const auto tags = vc::json::tags_or_empty(surf->meta);
                     show = show && !tags.contains("partial_review");
                 }
             }
 
             if (isChecked(_filters.hideUnapproved)) {
-                if (surf->meta) {
-                    const auto tags = vc::json::tags_or_empty(surf->meta.get());
+                if (!surf->meta.is_null()) {
+                    const auto tags = vc::json::tags_or_empty(surf->meta);
                     show = show && tags.contains("approved");
                 } else {
                     show = false;
@@ -1864,8 +1864,8 @@ void SurfacePanelController::applyFiltersInternal()
             }
 
             if (isChecked(_filters.inspectOnly)) {
-                if (surf->meta) {
-                    const auto tags = vc::json::tags_or_empty(surf->meta.get());
+                if (!surf->meta.is_null()) {
+                    const auto tags = vc::json::tags_or_empty(surf->meta);
                     show = show && tags.contains("inspect");
                 } else {
                     show = false;
@@ -1928,12 +1928,12 @@ void SurfacePanelController::updateTagCheckboxStatesForSurface(QuadSurface* surf
 
     setTagCheckboxEnabled(true, true, true, true, true);
 
-    if (!surface->meta) {
+    if (surface->meta.is_null()) {
         setTagCheckboxEnabled(false, false, true, true, true);
         return;
     }
 
-    const auto tags = vc::json::tags_or_empty(surface->meta.get());
+    const auto tags = vc::json::tags_or_empty(surface->meta);
 
     auto applyTag = [&tags](QCheckBox* box, const char* name) {
         if (!box) {

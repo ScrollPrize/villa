@@ -35,7 +35,7 @@
 #include <mutex>
 #include <chrono>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include <blosc.h>
 
 #include "utils/video_codec.hpp"
@@ -43,7 +43,7 @@
 #include "utils/zarr.hpp"
 
 namespace fs = std::filesystem;
-using json = nlohmann::json;
+using Json = utils::Json;
 
 static constexpr size_t SHARD_DIM = 1024;  // shard shape per axis
 static constexpr size_t CHUNK_DIM = 128;   // inner chunk shape per axis
@@ -315,13 +315,13 @@ static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape, int q
     // Sub-chunk codec: h265 (VC3D video codec)
     utils::ZarrCodecConfig h265_codec;
     h265_codec.name = "h265";
-    h265_codec.configuration = json{{"qp", qp}};
+    h265_codec.configuration = std::make_shared<utils::JsonValue>(utils::JsonValue{{"qp", Json(qp)}});
     sc.sub_codecs.push_back(h265_codec);
 
     // Index codec: bytes (little-endian)
     utils::ZarrCodecConfig bytes_codec;
     bytes_codec.name = "bytes";
-    bytes_codec.configuration = json{{"endian", "little"}};
+    bytes_codec.configuration = std::make_shared<utils::JsonValue>(utils::JsonValue{{"endian", Json("little")}});
     sc.index_codecs.push_back(bytes_codec);
 
     meta.shard_config = sc;
@@ -330,7 +330,7 @@ static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape, int q
 }
 
 static std::string make_zarr_v3_group() {
-    json root;
+    Json root;
     root["zarr_format"] = 3;
     root["node_type"] = "group";
     return root.dump(2) + "\n";
@@ -340,34 +340,38 @@ static std::string make_zarr_v3_group_with_multiscales(
     const std::vector<int>& levels,
     const std::vector<std::vector<size_t>>& shapes)
 {
-    json root;
+    Json root;
     root["zarr_format"] = 3;
     root["node_type"] = "group";
 
     // OME-Zarr multiscales attribute
-    json axes = json::array();
-    axes.push_back({{"name", "z"}, {"type", "space"}});
-    axes.push_back({{"name", "y"}, {"type", "space"}});
-    axes.push_back({{"name", "x"}, {"type", "space"}});
+    Json axes = Json::array();
+    axes.push_back(Json({{"name", "z"}, {"type", "space"}}));
+    axes.push_back(Json({{"name", "y"}, {"type", "space"}}));
+    axes.push_back(Json({{"name", "x"}, {"type", "space"}}));
 
-    json datasets = json::array();
+    Json datasets = Json::array();
     for (size_t i = 0; i < levels.size(); i++) {
         double scale = std::pow(2.0, levels[i]);
-        json ds;
+        Json ds;
         ds["path"] = std::to_string(levels[i]);
-        ds["coordinateTransformations"] = json::array({
-            {{"type", "scale"}, {"scale", {scale, scale, scale}}}
-        });
+        Json scale_arr = Json::array();
+        scale_arr.push_back(scale); scale_arr.push_back(scale); scale_arr.push_back(scale);
+        Json ct = Json::array();
+        ct.push_back(Json({{"type", "scale"}, {"scale", scale_arr}}));
+        ds["coordinateTransformations"] = ct;
         datasets.push_back(ds);
     }
 
-    json ms;
+    Json ms;
     ms["version"] = "0.4";
     ms["name"] = "/";
     ms["axes"] = axes;
     ms["datasets"] = datasets;
 
-    root["attributes"] = {{"multiscales", json::array({ms})}};
+    Json ms_arr = Json::array();
+    ms_arr.push_back(ms);
+    root["attributes"] = Json({{"multiscales", ms_arr}});
     return root.dump(2) + "\n";
 }
 
@@ -515,12 +519,12 @@ int main(int argc, char** argv) {
         std::string zarray_key = std::to_string(l) + "/.zarray";
         std::string zarr_json_key = std::to_string(l) + "/zarr.json";
 
-        json zarray;
+        Json zarray;
         try {
             if (input->exists(zarray_key)) {
-                zarray = json::parse(input->read_string(zarray_key));
+                zarray = Json::parse(input->read_string(zarray_key));
             } else if (input->exists(zarr_json_key)) {
-                zarray = json::parse(input->read_string(zarr_json_key));
+                zarray = Json::parse(input->read_string(zarr_json_key));
             } else {
                 continue;
             }
@@ -528,7 +532,7 @@ int main(int argc, char** argv) {
 
         std::vector<size_t> shape;
         if (zarray.contains("shape")) {
-            for (auto& v : zarray["shape"]) shape.push_back(v.get<size_t>());
+            for (auto& v : zarray["shape"]) shape.push_back(v.get_size_t());
         }
 
         levels.push_back(l);
@@ -559,9 +563,9 @@ int main(int argc, char** argv) {
 
         // Read input .zarray to determine compressor, chunks, dtype, dim_sep
         std::string level_prefix = std::to_string(l) + "/";
-        json zarray;
+        Json zarray;
         try {
-            zarray = json::parse(input->read_string(level_prefix + ".zarray"));
+            zarray = Json::parse(input->read_string(level_prefix + ".zarray"));
         } catch (...) {}
 
         std::string compressor_id;
@@ -572,18 +576,18 @@ int main(int argc, char** argv) {
         std::vector<size_t> src_chunks = {128, 128, 128};
         if (zarray.contains("chunks")) {
             src_chunks.clear();
-            for (auto& v : zarray["chunks"]) src_chunks.push_back(v.get<size_t>());
+            for (auto& v : zarray["chunks"]) src_chunks.push_back(v.get_size_t());
         }
 
         std::string dim_sep = "/";
         if (zarray.contains("dimension_separator")) {
-            dim_sep = zarray["dimension_separator"].get<std::string>();
+            dim_sep = zarray["dimension_separator"].get_string();
         }
 
         // Detect dtype
         bool is_u16 = false;
         if (zarray.contains("dtype") && zarray["dtype"].is_string()) {
-            std::string dt = zarray["dtype"].get<std::string>();
+            std::string dt = zarray["dtype"].get_string();
             std::string_view sv = dt;
             if (!sv.empty() && (sv[0] == '<' || sv[0] == '>' || sv[0] == '|'))
                 sv.remove_prefix(1);
@@ -618,12 +622,12 @@ int main(int argc, char** argv) {
                     std::vector<size_t> mask_src_chunks = {128, 128, 128};
                     // Read mask level's actual chunk size
                     try {
-                        json mask_zarray = json::parse(
+                        Json mask_zarray = Json::parse(
                             input->read_string(std::to_string(mask_level) + "/.zarray"));
                         if (mask_zarray.contains("chunks")) {
                             mask_src_chunks.clear();
                             for (auto& v : mask_zarray["chunks"])
-                                mask_src_chunks.push_back(v.get<size_t>());
+                                mask_src_chunks.push_back(v.get_size_t());
                         }
                     } catch (...) {}
                     occ_mask = build_occupancy_mask(

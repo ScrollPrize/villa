@@ -7,7 +7,7 @@
 #include <limits>
 #include <system_error>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include <opencv2/core.hpp>
 #include <QLoggingCategory>
 #include <QString>
@@ -50,10 +50,10 @@ void ensureMetaObject(QuadSurface* surface)
     if (!surface) {
         return;
     }
-    if (surface->meta && surface->meta->is_object()) {
+    if (!surface->meta.is_null() && surface->meta.is_object()) {
         return;
     }
-    surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
+    surface->meta = utils::Json::object();
 }
 
 bool ensureGenerationsChannel(QuadSurface* surface)
@@ -271,9 +271,9 @@ void ensureNormalsInward(QuadSurface* surface, const Volume* volume)
     }
 }
 
-nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
+utils::Json buildTracerParams(const SegmentationGrowthRequest& request)
 {
-    nlohmann::json params;
+    utils::Json params = utils::Json::object();
     params["rewind_gen"] = -1;
     params["grow_mode"] = directionToString(request.direction).toStdString();
     params["grow_steps"] = std::max(0, request.steps);
@@ -322,16 +322,16 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
     const int allowedCount = static_cast<int>(allowUp) + static_cast<int>(allowDown) +
                              static_cast<int>(allowLeft) + static_cast<int>(allowRight);
     if (allowedCount > 0 && allowedCount < 4) {
-        std::vector<std::string> allowedStrings;
-        if (allowDown) allowedStrings.emplace_back("down");
-        if (allowRight) allowedStrings.emplace_back("right");
-        if (allowUp) allowedStrings.emplace_back("up");
-        if (allowLeft) allowedStrings.emplace_back("left");
-        params["growth_directions"] = allowedStrings;
+        utils::Json allowedArr = utils::Json::array();
+        if (allowDown) allowedArr.push_back(utils::Json("down"));
+        if (allowRight) allowedArr.push_back(utils::Json("right"));
+        if (allowUp) allowedArr.push_back(utils::Json("up"));
+        if (allowLeft) allowedArr.push_back(utils::Json("left"));
+        params["growth_directions"] = std::move(allowedArr);
     }
-    if (request.customParams) {
-        for (auto it = request.customParams->begin(); it != request.customParams->end(); ++it) {
-            params[it.key()] = it.value();
+    if (!request.customParams.is_null()) {
+        for (auto it = request.customParams.begin(); it != request.customParams.end(); ++it) {
+            params[it.key()] = *it;
         }
     }
     return params;
@@ -370,7 +370,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         }
     }
 
-    nlohmann::json params = buildTracerParams(request);
+    utils::Json params = buildTracerParams(request);
 
     int startGen = 0;
     {
@@ -382,12 +382,14 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
             startGen = static_cast<int>(std::round(maxVal));
         }
 
-        if (context.resumeSurface->meta && context.resumeSurface->meta->is_object()) {
-            const auto& meta = *context.resumeSurface->meta;
-            auto it = meta.find("max_gen");
-            if (it != meta.end() && it->is_number()) {
-                const int metaGen = static_cast<int>(std::round(it->get<double>()));
-                startGen = std::max(startGen, metaGen);
+        if (!context.resumeSurface->meta.is_null() && context.resumeSurface->meta.is_object()) {
+            const auto& meta = context.resumeSurface->meta;
+            if (meta.contains("max_gen")) {
+                const auto& v = meta["max_gen"];
+                if (v.is_number()) {
+                    const int metaGen = static_cast<int>(std::round(v.get_double()));
+                    startGen = std::max(startGen, metaGen);
+                }
             }
         }
 
@@ -504,7 +506,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                       directionFields,
                                       context.resumeSurface,
                                       std::filesystem::path(),
-                                      nlohmann::json{},
+                                      utils::Json{},
                                       correctionCollection);
 
         // Note: approval and mask channels are preserved inside the tracer
@@ -527,13 +529,13 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
 
     ensureMetaObject(surface);
 
-    const double previousAreaVx2 = vc::json::number_or(surface->meta.get(), "area_vx2", -1.0);
-    const double previousAreaCm2 = vc::json::number_or(surface->meta.get(), "area_cm2", -1.0);
+    const double previousAreaVx2 = surface->meta.contains("area_vx2") ? surface->meta["area_vx2"].get_double() : -1.0;
+    const double previousAreaCm2 = surface->meta.contains("area_cm2") ? surface->meta["area_cm2"].get_double() : -1.0;
 
     const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
     if (points && !points->empty()) {
         const double areaVx2 = vc::surface::computeSurfaceAreaVox2(*points);
-        (*surface->meta)["area_vx2"] = areaVx2;
+        surface->meta["area_vx2"] = areaVx2;
 
         double areaCm2 = std::numeric_limits<double>::quiet_NaN();
         if (voxelSize > 0.0) {
@@ -545,11 +547,11 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
         }
 
         if (std::isfinite(areaCm2)) {
-            (*surface->meta)["area_cm2"] = areaCm2;
+            surface->meta["area_cm2"] = areaCm2;
         } else {
             // Fall back to assuming the geometry is in microns and convert directly.
             const double assumedAreaCm2 = areaVx2 * 1e-8;
-            (*surface->meta)["area_cm2"] = assumedAreaCm2;
+            surface->meta["area_cm2"] = assumedAreaCm2;
             qCWarning(lcSegGrowth) << "Fallback surface area conversion applied due to missing voxel size metadata";
         }
     }
@@ -559,8 +561,8 @@ void updateSegmentationSurfaceMetadata(QuadSurface* surface,
         double minGen = 0.0;
         double maxGen = 0.0;
         cv::minMaxLoc(generations, &minGen, &maxGen);
-        (*surface->meta)["max_gen"] = static_cast<int>(std::round(maxGen));
+        surface->meta["max_gen"] = static_cast<int>(std::round(maxGen));
     }
 
-    (*surface->meta)["date_last_modified"] = get_surface_time_str();
+    surface->meta["date_last_modified"] = get_surface_time_str();
 }

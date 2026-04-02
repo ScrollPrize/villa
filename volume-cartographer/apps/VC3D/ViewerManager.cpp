@@ -25,7 +25,7 @@
 #include <iostream>
 #include <optional>
 #include <unordered_set>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include <opencv2/core.hpp>
 
 #include "vc/core/util/QuadSurface.hpp"

@@ -20,7 +20,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS on)
 # ---- Options -----------------------------------------------------------------
 option(VC_USE_OPENMP        "Enable OpenMP support"                              ON)
 option(VC_USE_VALGRIND      "Enable Valgrind support"                            OFF)
-option(VC_USE_PCH           "Enable precompiled headers (faster builds)" ON)
+option(VC_USE_PCH           "Enable precompiled headers (faster builds)" OFF)
 option(VC_WITH_PASTIX       "Build with PaStiX support"                          OFF)
 option(VC_DEVELOPER_WARNINGS "For developers: Enable extensive compiler warnings" OFF)
 option(VC_ENABLE_ASAN       "Enable AddressSanitizer for memory error detection" OFF)

@@ -11,7 +11,7 @@
 #include <omp.h>
 
 #include <boost/program_options.hpp>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -22,9 +22,6 @@
 
 #include <ceres/ceres.h>
 
-#include <xtensor/containers/xarray.hpp>
-#include <xtensor/containers/xtensor.hpp>
-#include <xtensor/generators/xbuilder.hpp>
 #include "vc/core/types/VcDataset.hpp"
 
 #include "vc/ui/VCCollection.hpp"
@@ -194,8 +191,7 @@ int main(int argc, char** argv) {
     std::clock_t start_cpu = std::clock();
 
     cv::Mat slice_mat(shape[1], shape[2], CV_8U);
-    std::vector<size_t> slice_shape = {1, shape[1], shape[2]};
-    xt::xtensor<uint8_t, 3, xt::layout_type::column_major> slice_data = xt::zeros<uint8_t>(slice_shape);
+    Array3D<uint8_t> slice_data({1, shape[1], shape[2]});
     cv::Vec3i offset = {z_slice, 0, 0};
     auto cache = vc::cache::createSimpleTieredCache(ds.get(), 4llu*1024*1024*1024, ds->path());
     readArea3D(slice_data, offset, cache.get(), 0);

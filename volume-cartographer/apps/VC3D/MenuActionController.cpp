@@ -59,7 +59,7 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -731,37 +731,34 @@ void MenuActionController::persistAttachedRemoteVolume(const QString& url, const
         return;
     }
 
-    nlohmann::json root = {
-        {"version", 1},
-        {"volumes", nlohmann::json::array()}
+    utils::Json root = {
+        {"version", utils::Json(1)},
+        {"volumes", utils::Json::array()}
     };
 
     try {
         if (QFileInfo::exists(registryPath)) {
-            std::ifstream input(registryPath.toStdString());
-            if (input.good()) {
-                input >> root;
-            }
+            root = utils::Json::parse_file(registryPath.toStdString());
         }
     } catch (const std::exception& e) {
         Logger()->warn("Failed reading remote volume registry '{}': {}", registryPath.toStdString(), e.what());
         root = {
-            {"version", 1},
-            {"volumes", nlohmann::json::array()}
+            {"version", utils::Json(1)},
+            {"volumes", utils::Json::array()}
         };
     }
 
     if (!root.is_object()) {
-        root = nlohmann::json::object();
+        root = utils::Json::object();
     }
     if (!root.contains("volumes") || !root["volumes"].is_array()) {
-        root["volumes"] = nlohmann::json::array();
+        root["volumes"] = utils::Json::array();
     }
     root["version"] = 1;
 
     const std::string urlStd = url.trimmed().toStdString();
     const std::string idStd = volume->id();
-    nlohmann::json updated = nlohmann::json::array();
+    utils::Json updated = utils::Json::array();
     bool replaced = false;
 
     for (const auto& entry : root["volumes"]) {
@@ -805,13 +802,9 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
         return;
     }
 
-    nlohmann::json root;
+    utils::Json root;
     try {
-        std::ifstream input(registryPath.toStdString());
-        if (!input.good()) {
-            return;
-        }
-        input >> root;
+        root = utils::Json::parse_file(registryPath.toStdString());
     } catch (const std::exception& e) {
         Logger()->warn("Failed to parse remote volume registry '{}': {}", registryPath.toStdString(), e.what());
         if (_window->statusBar()) {
@@ -820,8 +813,7 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
         return;
     }
 
-    const auto volumesIt = root.find("volumes");
-    if (volumesIt == root.end() || !volumesIt->is_array() || volumesIt->empty()) {
+    if (!root.contains("volumes") || !root["volumes"].is_array() || root["volumes"].empty()) {
         return;
     }
 
@@ -830,7 +822,7 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
     int attachedCount = 0;
     int skippedCount = 0;
 
-    for (const auto& entry : *volumesIt) {
+    for (const auto& entry : root["volumes"]) {
         if (!entry.is_object()) {
             continue;
         }
@@ -1734,21 +1726,19 @@ void MenuActionController::generateReviewReport()
 
     for (const auto& id : _window->_state->vpkg()->getLoadedSurfaceIDs()) {
         auto surf = _window->_state->vpkg()->getSurface(id);
-        if (!surf || !surf->meta) {
+        if (!surf || surf->meta.is_null()) {
             continue;
         }
 
-        nlohmann::json* meta = surf->meta.get();
-        const auto tags = vc::json::tags_or_empty(meta);
-        const auto itReviewed = tags.find("reviewed");
-        if (itReviewed == tags.end() || !itReviewed->is_object()) {
+        const auto tags = vc::json::tags_or_empty(surf->meta);
+        if (!tags.contains("reviewed") || !tags["reviewed"].is_object()) {
             continue;
         }
 
-        const nlohmann::json& reviewed = *itReviewed;
+        const auto& reviewed = tags["reviewed"];
 
         QString reviewDate = "Unknown";
-        const std::string reviewDateRaw = vc::json::string_or(&reviewed, "date", std::string{});
+        const std::string reviewDateRaw = vc::json::string_or(reviewed, "date", std::string{});
         if (!reviewDateRaw.empty()) {
             reviewDate = QString::fromStdString(reviewDateRaw).left(10);
         } else {
@@ -1759,12 +1749,12 @@ void MenuActionController::generateReviewReport()
         }
 
         QString username = "Unknown";
-        const std::string reviewerUser = vc::json::string_or(&reviewed, "user", std::string{});
+        const std::string reviewerUser = vc::json::string_or(reviewed, "user", std::string{});
         if (!reviewerUser.empty()) {
             username = QString::fromStdString(reviewerUser);
         }
 
-        const double area = vc::json::number_or(meta, "area_cm2", 0.0);
+        const double area = vc::json::number_or(surf->meta, "area_cm2", 0.0);
 
         dailyStats[reviewDate][username].totalArea += area;
         dailyStats[reviewDate][username].surfaceCount++;

@@ -2,9 +2,6 @@
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/types/Sampling.hpp"
 
-#include <xtensor/containers/xarray.hpp>
-#include <xtensor/containers/xtensor.hpp>
-#include <xtensor/generators/xbuilder.hpp>
 
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/cache/ChunkData.hpp"
@@ -68,6 +65,10 @@ struct CacheParams {
     bool chunk128;  // true when all chunk dims are exactly 128 (fastest path)
     int chunksZ, chunksY, chunksX;
 
+    // Precomputed strides for 16^3 block layout (used by trilinearBlockOffsets8)
+    int blocksPerX = 0;  // (cx >> 4)
+    int blocksPerZ = 0;  // (cy >> 4) * (cx >> 4)
+
     // Chunk index bounds from logical data extent.
     // Chunks outside [dbMinC*, dbMaxC*] are in zero-padded regions.
     int dbMinCz = 0, dbMaxCz = INT_MAX;
@@ -95,6 +96,9 @@ struct CacheParams {
         chunksZ = (sz + cz - 1) / cz;
         chunksY = (sy + cy - 1) / cy;
         chunksX = (sx + cx - 1) / cx;
+
+        blocksPerX = cx >> 4;
+        blocksPerZ = (cy >> 4) * blocksPerX;
 
         // Compute chunk-level data bounds from level-0 bounds.
         // Dilate by 1 chunk on each side — the level-0 bounds are already
@@ -140,9 +144,49 @@ struct CacheParams {
     // Pure bit ops for pow2 chunks.
     inline size_t blockOffset(int lz, int ly, int lx) const {
         int bz = lz >> 4, by = ly >> 4, bx = lx >> 4;
-        int blockIdx = bz * (cy >> 4) * (cx >> 4) + by * (cx >> 4) + bx;
+        int blockIdx = bz * blocksPerZ + by * blocksPerX + bx;
         int localOff = ((lz & 0xF) << 8) | ((ly & 0xF) << 4) | (lx & 0xF);
         return (static_cast<size_t>(blockIdx) << 12) | localOff;
+    }
+
+    // Compute all 8 trilinear offsets at once for adjacent voxels
+    // (lz0,ly0,lx0) and (lz0+1,ly0+1,lx0+1) in the same chunk.
+    // When none of the +1 coords cross a 16-boundary, offsets are
+    // simple additions from a base offset. Otherwise falls back to
+    // individual blockOffset calls.
+    inline void trilinearBlockOffsets8(
+        int lz0, int ly0, int lx0,
+        size_t (&off)[8]) const
+    {
+        // Check if +1 in any axis crosses a block-16 boundary
+        if (__builtin_expect(((lz0 & 0xF) != 0xF) &
+                             ((ly0 & 0xF) != 0xF) &
+                             ((lx0 & 0xF) != 0xF), 1)) {
+            // Fast path: all 8 corners in same 16^3 block
+            int bz = lz0 >> 4, by = ly0 >> 4, bx = lx0 >> 4;
+            size_t blockBase = static_cast<size_t>(bz * blocksPerZ + by * blocksPerX + bx) << 12;
+            int z0 = (lz0 & 0xF), y0 = (ly0 & 0xF), x0 = (lx0 & 0xF);
+            size_t base = blockBase | (z0 << 8) | (y0 << 4) | x0;
+            off[0] = base;              // (z0, y0, x0)
+            off[1] = base + 0x100;      // (z0+1, y0, x0)  = +1 in z = +(1<<8)
+            off[2] = base + 0x010;      // (z0, y0+1, x0)  = +1 in y = +(1<<4)
+            off[3] = base + 0x110;      // (z0+1, y0+1, x0)
+            off[4] = base + 0x001;      // (z0, y0, x0+1)  = +1 in x
+            off[5] = base + 0x101;      // (z0+1, y0, x0+1)
+            off[6] = base + 0x011;      // (z0, y0+1, x0+1)
+            off[7] = base + 0x111;      // (z0+1, y0+1, x0+1)
+        } else {
+            // Slow path: crosses block boundary
+            int lz1 = lz0 + 1, ly1 = ly0 + 1, lx1 = lx0 + 1;
+            off[0] = blockOffset(lz0, ly0, lx0);
+            off[1] = blockOffset(lz1, ly0, lx0);
+            off[2] = blockOffset(lz0, ly1, lx0);
+            off[3] = blockOffset(lz1, ly1, lx0);
+            off[4] = blockOffset(lz0, ly0, lx1);
+            off[5] = blockOffset(lz1, ly0, lx1);
+            off[6] = blockOffset(lz0, ly1, lx1);
+            off[7] = blockOffset(lz1, ly1, lx1);
+        }
     }
 
     static int log2_pow2(int v) {
@@ -423,16 +467,89 @@ struct ChunkSampler {
             if (!data) return 0;
 
             int lz0 = p.localZ(iz), ly0 = p.localY(iy), lx0 = p.localX(ix);
-            int lz1 = lz0 + 1, ly1 = ly0 + 1, lx1 = lx0 + 1;
 
-            float c000 = data[voxelOffset(lz0, ly0, lx0)];
-            float c100 = data[voxelOffset(lz1, ly0, lx0)];
-            float c010 = data[voxelOffset(lz0, ly1, lx0)];
-            float c110 = data[voxelOffset(lz1, ly1, lx0)];
-            float c001 = data[voxelOffset(lz0, ly0, lx1)];
-            float c101 = data[voxelOffset(lz1, ly0, lx1)];
-            float c011 = data[voxelOffset(lz0, ly1, lx1)];
-            float c111 = data[voxelOffset(lz1, ly1, lx1)];
+            size_t off[8];
+            if (__builtin_expect(useBlocks, 1)) {
+                p.trilinearBlockOffsets8(lz0, ly0, lx0, off);
+            } else {
+                size_t base = static_cast<size_t>(lz0) * s0 + static_cast<size_t>(ly0) * s1 + lx0;
+                off[0] = base;
+                off[1] = base + s0;
+                off[2] = base + s1;
+                off[3] = base + s0 + s1;
+                off[4] = base + 1;
+                off[5] = base + s0 + 1;
+                off[6] = base + s1 + 1;
+                off[7] = base + s0 + s1 + 1;
+            }
+
+            float c000 = data[off[0]];
+            float c100 = data[off[1]];
+            float c010 = data[off[2]];
+            float c110 = data[off[3]];
+            float c001 = data[off[4]];
+            float c101 = data[off[5]];
+            float c011 = data[off[6]];
+            float c111 = data[off[7]];
+
+            float fz = vz - iz;
+            float fy = vy - iy;
+            float fx = vx - ix;
+
+            float c00 = std::fma(fx, c001 - c000, c000);
+            float c01 = std::fma(fx, c011 - c010, c010);
+            float c10 = std::fma(fx, c101 - c100, c100);
+            float c11 = std::fma(fx, c111 - c110, c110);
+
+            float c0 = std::fma(fy, c01 - c00, c00);
+            float c1 = std::fma(fy, c11 - c10, c10);
+
+            return std::fma(fz, c1 - c0, c0);
+        }
+
+        return sampleTrilinear(vz, vy, vx);
+    }
+
+    // Same as sampleTrilinearFast but caller guarantees vz/vy/vx are in bounds
+    // (i.e., iz >= 0, iy >= 0, ix >= 0, iz+1 < p.sz, iy+1 < p.sy, ix+1 < p.sx).
+    float sampleTrilinearUnchecked(float vz, float vy, float vx) {
+        int iz = static_cast<int>(vz);
+        int iy = static_cast<int>(vy);
+        int ix = static_cast<int>(vx);
+
+        int ciz0 = p.chunkZ(iz), ciz1 = p.chunkZ(iz + 1);
+        int ciy0 = p.chunkY(iy), ciy1 = p.chunkY(iy + 1);
+        int cix0 = p.chunkX(ix), cix1 = p.chunkX(ix + 1);
+
+        if (ciz0 == ciz1 && ciy0 == ciy1 && cix0 == cix1) {
+            updateChunk(ciz0, ciy0, cix0);
+            if (!data) return 0;
+
+            int lz0 = p.localZ(iz), ly0 = p.localY(iy), lx0 = p.localX(ix);
+
+            size_t off[8];
+            if (__builtin_expect(useBlocks, 1)) {
+                p.trilinearBlockOffsets8(lz0, ly0, lx0, off);
+            } else {
+                size_t base = static_cast<size_t>(lz0) * s0 + static_cast<size_t>(ly0) * s1 + lx0;
+                off[0] = base;
+                off[1] = base + s0;
+                off[2] = base + s1;
+                off[3] = base + s0 + s1;
+                off[4] = base + 1;
+                off[5] = base + s0 + 1;
+                off[6] = base + s1 + 1;
+                off[7] = base + s0 + s1 + 1;
+            }
+
+            float c000 = data[off[0]];
+            float c100 = data[off[1]];
+            float c010 = data[off[2]];
+            float c110 = data[off[3]];
+            float c001 = data[off[4]];
+            float c101 = data[off[5]];
+            float c011 = data[off[6]];
+            float c111 = data[off[7]];
 
             float fz = vz - iz;
             float fy = vy - iy;
@@ -543,10 +660,25 @@ static void readVolumeImpl(
             }
         };
 
+        // Sparse grid sampling for chunk discovery.
+        // Coordinates are interpolated from a smooth surface, so a 32-pixel
+        // stride is well within a 128-voxel chunk — guarantees we visit every
+        // chunk boundary at least once.  Reduces O(w*h) to O((w/S+1)*(h/S+1)).
+        constexpr int S = 32; // sparse stride (must be < chunk size)
+
+        // Build sparse Y indices: edges every S pixels + last row
+        std::vector<int> sparseY, sparseX;
+        sparseY.reserve(h / S + 2);
+        sparseX.reserve(w / S + 2);
+        for (int y = 0; y < h; y += S) sparseY.push_back(y);
+        if (h > 0 && sparseY.back() != h - 1) sparseY.push_back(h - 1);
+        for (int x = 0; x < w; x += S) sparseX.push_back(x);
+        if (w > 0 && sparseX.back() != w - 1) sparseX.push_back(w - 1);
+
         if (numLayers == 1) {
-            for (int y = 0; y < h; y++) {
+            for (int y : sparseY) {
                 const auto* row = coords.ptr<cv::Vec3f>(y);
-                for (int x = 0; x < w; x++) {
+                for (int x : sparseX) {
                     float vx = row[x][0], vy = row[x][1], vz = row[x][2];
                     if constexpr (Mode == SampleMode::Tricubic) {
                         if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < p.sz && vy < p.sy && vx < p.sx)) continue;
@@ -572,9 +704,9 @@ static void readVolumeImpl(
             for (int l = 0; l < numLayers; l++)
                 layerOffsets[l] = (zStart + l) * zStep;
 
-            for (int y = 0; y < h; y++) {
+            for (int y : sparseY) {
                 const auto* row = coords.ptr<cv::Vec3f>(y);
-                for (int x = 0; x < w; x++) {
+                for (int x : sparseX) {
                     float bx = row[x][0], by = row[x][1], bz = row[x][2];
                     if (!(bz >= 0 && by >= 0 && bx >= 0 && bz < p.sz && by < p.sy && bx < p.sx)) continue;
                     cv::Vec3f n = getNormal(y, x);
@@ -619,10 +751,17 @@ static void readVolumeImpl(
     // the same chunk. We tile over the Y dimension (since X already has good
     // sequential locality within a row) using chunk-sized bands.
     const bool isComposite = (numLayers > 1);
-    const bool isMin = params && (params->method == "min");
-    const bool isMax = params && (params->method == "max");
-    const bool isMean = params && (params->method == "mean");
-    const bool needsLayerStorage = params && methodRequiresLayerStorage(params->method);
+
+    // Hoist composite method dispatch out of the per-pixel inner loop.
+    // The mode never changes, so the compiler can jump-table the switch
+    // and the branch predictor will lock on immediately.
+    enum AccumMode { kLayerStorage, kMax, kMin, kMean };
+    const AccumMode accumMode =
+        (params && methodRequiresLayerStorage(params->method)) ? kLayerStorage
+      : (params && params->method == "max") ? kMax
+      : (params && params->method == "min") ? kMin
+      : kMean;
+    const bool needsLayerStorage = (accumMode == kLayerStorage);
     const float firstLayerOffset = zStart * zStep;
 
     // Tile height: use chunk Y size for good locality (chunks are typically 128)
@@ -832,8 +971,8 @@ static void readVolumeImpl(
                             for (int k = 0; k < 4; k++) {
                                 float fvx = rawCoords[(x+k)*3], fvy = rawCoords[(x+k)*3+1], fvz = rawCoords[(x+k)*3+2];
                                 if (!(fvz >= 0 && fvy >= 0 && fvx >= 0 &&
-                                      fvz < p.sz && fvy < p.sy && fvx < p.sx)) continue;
-                                float v = sampler.sampleTrilinearFast(fvz, fvy, fvx);
+                                      fvz < p.sz - 1 && fvy < p.sy - 1 && fvx < p.sx - 1)) continue;
+                                float v = sampler.sampleTrilinearUnchecked(fvz, fvy, fvx);
                                 if constexpr (std::is_same_v<T, uint16_t>) {
                                     if (v < 0.f) v = 0.f;
                                     if (v > 65535.f) v = 65535.f;
@@ -958,8 +1097,8 @@ static void readVolumeImpl(
                         for (; x < w; x++) {
                             float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
                             if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0 &&
-                                  base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
-                            float v = sampler.sampleTrilinearFast(base_vz, base_vy, base_vx);
+                                  base_vz < p.sz - 1 && base_vy < p.sy - 1 && base_vx < p.sx - 1)) continue;
+                            float v = sampler.sampleTrilinearUnchecked(base_vz, base_vy, base_vx);
                             if constexpr (std::is_same_v<T, uint16_t>) {
                                 if (v < 0.f) v = 0.f;
                                 if (v > 65535.f) v = 65535.f;
@@ -1052,7 +1191,7 @@ static void readVolumeImpl(
                     cv::Vec3f n = getNormal(y, x);
                     float nz = n[2], ny = n[1], nx = n[0];
 
-                    float acc = isMin ? 255.0f : 0.0f;
+                    float acc = (accumMode == kMin) ? 255.0f : 0.0f;
                     int validCount = 0;
 
                     if (needsLayerStorage) {
@@ -1080,28 +1219,21 @@ static void readVolumeImpl(
                         vz += dz; vy += dy; vx += dx;
 
                         if (validSample) {
-                            if (needsLayerStorage) {
-                                stack.values[stack.validCount++] = value;
-                            } else if (isMax) {
-                                acc = value > acc ? value : acc;
-                                validCount++;
-                            } else if (isMin) {
-                                acc = value < acc ? value : acc;
-                                validCount++;
-                            } else {
-                                acc += value;
-                                validCount++;
+                            switch (accumMode) {
+                            case kLayerStorage: stack.values[stack.validCount++] = value; break;
+                            case kMax: acc = value > acc ? value : acc; validCount++; break;
+                            case kMin: acc = value < acc ? value : acc; validCount++; break;
+                            case kMean: acc += value; validCount++; break;
                             }
                         }
                     }
 
                     float result = 0.0f;
-                    if (needsLayerStorage) {
-                        result = compositeLayerStack(stack, *params);
-                    } else if (isMax || isMin) {
-                        result = acc;
-                    } else if (isMean && validCount > 0) {
-                        result = acc / static_cast<float>(validCount);
+                    switch (accumMode) {
+                    case kLayerStorage: result = compositeLayerStack(stack, *params); break;
+                    case kMax: // fallthrough
+                    case kMin: result = acc; break;
+                    case kMean: if (validCount > 0) result = acc / static_cast<float>(validCount); break;
                     }
 
                     if (params->lightingEnabled) {
@@ -1122,7 +1254,7 @@ static void readVolumeImpl(
 // ============================================================================
 
 template<typename T>
-static void readArea3DImpl(xt::xtensor<T, 3, xt::layout_type::column_major>& out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level) {
+static void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level) {
 
     CacheParams p(cache, level);
 
@@ -1188,11 +1320,11 @@ static void readArea3DImpl(xt::xtensor<T, 3, xt::layout_type::column_major>& out
     }
 }
 
-void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level) {
+void readArea3D(Array3D<uint8_t>& out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level) {
     readArea3DImpl(out, offset, cache, level);
 }
 
-void readArea3D(xt::xtensor<uint16_t, 3, xt::layout_type::column_major>& out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level) {
+void readArea3D(Array3D<uint16_t>& out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level) {
     readArea3DImpl(out, offset, cache, level);
 }
 
@@ -1371,8 +1503,8 @@ static void samplePlaneImpl(
                     float vx = row_base[0], vy = row_base[1], vz = row_base[2];
                     for (int x = 0; x < w; x++) {
                         if (vz >= 0 && vy >= 0 && vx >= 0 &&
-                            vz < p.sz && vy < p.sy && vx < p.sx) {
-                            float v = sampler.sampleTrilinearFast(vz, vy, vx);
+                            vz < p.sz - 1 && vy < p.sy - 1 && vx < p.sx - 1) {
+                            float v = sampler.sampleTrilinearUnchecked(vz, vy, vx);
                             if constexpr (std::is_same_v<T, uint16_t>) {
                                 v = std::clamp(v, 0.f, 65535.f);
                                 outRow[x] = static_cast<uint16_t>(v + 0.5f);
@@ -1723,8 +1855,8 @@ static void samplePlaneARGB32Impl(
                     float vx = row_base[0], vy = row_base[1], vz = row_base[2];
                     for (int x = 0; x < w; x++) {
                         if (vz >= 0 && vy >= 0 && vx >= 0 &&
-                            vz < p.sz && vy < p.sy && vx < p.sx) {
-                            float v = sampler.sampleTrilinearFast(vz, vy, vx);
+                            vz < p.sz - 1 && vy < p.sy - 1 && vx < p.sx - 1) {
+                            float v = sampler.sampleTrilinearUnchecked(vz, vy, vx);
                             nt_store_u32(&outRow[x], lut[static_cast<uint8_t>(v)]);
                         }
                         vx += vx_step[0]; vy += vx_step[1]; vz += vx_step[2];
@@ -2173,10 +2305,10 @@ static void readMultiSliceImpl(
                         float vy = bp[1] + sd[1] * off;
                         float vz = bp[2] + sd[2] * off;
 
-                        if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < lsz && vy < lsy && vx < lsx))
+                        if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < lsz - 1 && vy < lsy - 1 && vx < lsx - 1))
                             continue;
 
-                        float v = sampler.sampleTrilinearFast(vz, vy, vx);
+                        float v = sampler.sampleTrilinearUnchecked(vz, vy, vx);
                         v = std::max(0.f, std::min(maxVal, v + 0.5f));
                         out[si](y, x) = static_cast<T>(v);
                     }
@@ -2386,10 +2518,10 @@ static void sampleTileSlicesImpl(
                     float vy = bp[1] + sd[1] * off;
                     float vz = bp[2] + sd[2] * off;
 
-                    if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < lsz && vy < lsy && vx < lsx))
+                    if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < lsz - 1 && vy < lsy - 1 && vx < lsx - 1))
                         continue;
 
-                    float v = sampler.sampleTrilinearFast(vz, vy, vx);
+                    float v = sampler.sampleTrilinearUnchecked(vz, vy, vx);
                     v = std::max(0.f, std::min(maxVal, v + 0.5f));
                     out[si](y, x) = static_cast<T>(v);
                 }

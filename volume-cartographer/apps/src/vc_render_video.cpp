@@ -1,8 +1,6 @@
-#include <nlohmann/json.hpp>
+#include <iostream>
+#include "utils/Json.hpp"
 
-#include <xtensor/containers/xarray.hpp>
-#include <xtensor/io/xio.hpp>
-#include <xtensor/views/xview.hpp>
 
 #include "vc/core/types/VcDataset.hpp"
 
@@ -22,10 +20,9 @@
 #include "vc/core/util/StreamOperators.hpp"
 
 using shape = std::vector<size_t>;
-using namespace xt::placeholders;
 
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
 
 

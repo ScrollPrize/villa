@@ -23,14 +23,10 @@ struct TiledViewerCamera {
     // Normal offset (shift+wheel slice navigation)
     float zOff = 0.0f;
 
-    // Pyramid level index (0 = full res, higher = coarser)
+    // Pyramid level index (0 = full res, higher = coarser).
+    // Always the coarsest level that covers the current zoom — never finer
+    // than needed.  The renderer upscales from this single level.
     int dsScaleIdx = 1;
-
-    // Adjacent pyramid level for blending (finer or coarser than dsScaleIdx)
-    int dsScaleIdxFine = 0;
-
-    // Blend factor: 0.0 = fully dsScaleIdx, 1.0 = fully dsScaleIdxFine
-    float dsBlendFactor = 0.0f;
 
     // Derived: 2^(-dsScaleIdx), e.g., level 2 -> 0.25
     float dsScale = 0.5f;

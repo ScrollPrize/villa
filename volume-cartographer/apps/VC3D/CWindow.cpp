@@ -52,7 +52,7 @@
 #include <QDebug>
 #include <QScrollArea>
 #include <QSignalBlocker>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include <QGraphicsSimpleTextItem>
 #include <QPointer>
 #include <QPen>
@@ -335,13 +335,7 @@ cv::Matx44d loadAffineTransformMatrix(const std::filesystem::path& path)
         throw std::runtime_error("transform.json not found");
     }
 
-    std::ifstream input(path);
-    if (!input.is_open()) {
-        throw std::runtime_error("failed to open transform.json");
-    }
-
-    nlohmann::json json;
-    input >> json;
+    utils::Json json = utils::Json::parse_file(path);
 
     if (!json.contains("transformation_matrix")) {
         throw std::runtime_error("transform.json is missing transformation_matrix");
@@ -359,7 +353,7 @@ cv::Matx44d loadAffineTransformMatrix(const std::filesystem::path& path)
             throw std::runtime_error("each transformation_matrix row must have 4 values");
         }
         for (int col = 0; col < 4; ++col) {
-            matrix(row, col) = rowJson.at(col).get<double>();
+            matrix(row, col) = rowJson.at(col).get_double();
         }
     }
 
@@ -471,16 +465,25 @@ void refreshTransformedSurfaceState(QuadSurface* surface)
 
     surface->invalidateCache();
 
-    if (!surface->meta || !surface->meta->is_object()) {
-        surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
+    if (surface->meta.is_null() || !surface->meta.is_object()) {
+        surface->meta = utils::Json::object();
     }
 
     const auto bbox = surface->bbox();
-    (*surface->meta)["bbox"] = {
-        {bbox.low[0], bbox.low[1], bbox.low[2]},
-        {bbox.high[0], bbox.high[1], bbox.high[2]}
-    };
-    (*surface->meta)["scale"] = {surface->scale()[0], surface->scale()[1]};
+    {
+        auto lo = utils::Json::array();
+        lo.push_back(bbox.low[0]); lo.push_back(bbox.low[1]); lo.push_back(bbox.low[2]);
+        auto hi = utils::Json::array();
+        hi.push_back(bbox.high[0]); hi.push_back(bbox.high[1]); hi.push_back(bbox.high[2]);
+        auto bb = utils::Json::array();
+        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
+        surface->meta["bbox"] = std::move(bb);
+    }
+    {
+        auto sc = utils::Json::array();
+        sc.push_back(surface->scale()[0]); sc.push_back(surface->scale()[1]);
+        surface->meta["scale"] = std::move(sc);
+    }
 }
 
 std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<QuadSurface>& source)
@@ -490,9 +493,7 @@ std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<Quad
     }
 
     auto clone = std::make_shared<QuadSurface>(source->rawPoints(), source->scale());
-    clone->meta = source->meta
-        ? std::make_unique<nlohmann::json>(*source->meta)
-        : std::make_unique<nlohmann::json>(nlohmann::json::object());
+    clone->meta = source->meta.is_null() ? utils::Json::object() : source->meta;
     clone->id = source->id;
     clone->path = source->path;
     clone->setOverlappingIds(source->overlappingIds());
@@ -4684,7 +4685,7 @@ void CWindow::onEditMaskPressed(void)
         render_binary_mask(surf.get(), mask, coords, 1.0f);
         cv::imwrite(path.string(), mask);
 
-        (*surf->meta)["date_last_modified"] = get_surface_time_str();
+        surf->meta["date_last_modified"] = get_surface_time_str();
         surf->save_meta();
     }));
 }
@@ -4762,7 +4763,7 @@ void CWindow::onAppendMaskPressed(void)
             QString msg = QString("Appended surface image to existing mask (now %1 layers)")
                               .arg(existing_layers.size());
 
-            (*surf->meta)["date_last_modified"] = get_surface_time_str();
+            surf->meta["date_last_modified"] = get_surface_time_str();
             surf->save_meta();
             return msg;
 
@@ -4775,7 +4776,7 @@ void CWindow::onAppendMaskPressed(void)
             std::vector<cv::Mat> layers = {mask, img};
             imwritemulti(path.string(), layers);
 
-            (*surf->meta)["date_last_modified"] = get_surface_time_str();
+            surf->meta["date_last_modified"] = get_surface_time_str();
             surf->save_meta();
             return QString("Created new surface mask with image data");
         }

@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 // Helper to get point-to-line-segment squared distance
 static float dist_point_segment_sq(const cv::Vec3f& p, const cv::Vec3f& a, const cv::Vec3f& b) {
@@ -118,9 +118,9 @@ static cv::Vec2f find_closest_intersection(QuadSurface* surface, const cv::Vec3f
 }
 
 
-nlohmann::json calc_point_metrics(const VCCollection& collection, QuadSurface* surface, int z_min, int z_max)
+utils::Json calc_point_metrics(const VCCollection& collection, QuadSurface* surface, int z_min, int z_max)
 {
-    nlohmann::json results;
+    utils::Json results;
     int total_points_for_in_surface_metric = 0;
     int valid_in_surface_points = 0;
 
@@ -189,9 +189,9 @@ nlohmann::json calc_point_metrics(const VCCollection& collection, QuadSurface* s
     return results;
 }
 
-nlohmann::json calc_point_winding_metrics(const VCCollection& collection, QuadSurface* surface, const cv::Mat_<float>& winding, int z_min, int z_max)
+utils::Json calc_point_winding_metrics(const VCCollection& collection, QuadSurface* surface, const cv::Mat_<float>& winding, int z_min, int z_max)
 {
-    nlohmann::json results;
+    utils::Json results;
 
     int total_invalid_intersections = 0;
     int total_correct_winding = 0;

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <unordered_map>
 
 #if defined(__x86_64__)
 #include <immintrin.h>
@@ -139,25 +140,26 @@ QImage makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& sp
     }
 
     if (spec.kind == OverlayColormapKind::OpenCv) {
-        // OpenCV colormaps produce BGR output. Build a 256-entry XRGB LUT
-        // once, then map pixels directly — avoids applyColorMap's iterator overhead.
-        cv::Mat lut_input(1, 256, CV_8UC1);
-        for (int i = 0; i < 256; ++i)
-            lut_input.at<uint8_t>(0, i) = static_cast<uint8_t>(i);
-
-        cv::Mat lut_bgr;
-        cv::applyColorMap(lut_input, lut_bgr, spec.opencvCode);
-
-        // Convert BGR LUT to packed XRGB32
-        std::array<uint32_t, 256> lut{};
-        const auto* bgrRow = lut_bgr.ptr<cv::Vec3b>(0);
-        for (int i = 0; i < 256; ++i) {
-            lut[i] = 0xFF000000u
-                   | (static_cast<uint32_t>(bgrRow[i][2]) << 16)
-                   | (static_cast<uint32_t>(bgrRow[i][1]) << 8)
-                   |  static_cast<uint32_t>(bgrRow[i][0]);
+        // Cache OpenCV colormap LUTs — same opencvCode always produces the same LUT
+        static std::unordered_map<int, std::array<uint32_t, 256>> lutCache;
+        auto it = lutCache.find(spec.opencvCode);
+        if (it == lutCache.end()) {
+            cv::Mat lut_input(1, 256, CV_8UC1);
+            for (int i = 0; i < 256; ++i)
+                lut_input.at<uint8_t>(0, i) = static_cast<uint8_t>(i);
+            cv::Mat lut_bgr;
+            cv::applyColorMap(lut_input, lut_bgr, spec.opencvCode);
+            std::array<uint32_t, 256> lut{};
+            const auto* bgrRow = lut_bgr.ptr<cv::Vec3b>(0);
+            for (int i = 0; i < 256; ++i) {
+                lut[i] = 0xFF000000u
+                       | (static_cast<uint32_t>(bgrRow[i][2]) << 16)
+                       | (static_cast<uint32_t>(bgrRow[i][1]) << 8)
+                       |  static_cast<uint32_t>(bgrRow[i][0]);
+            }
+            it = lutCache.emplace(spec.opencvCode, lut).first;
         }
-        return applyPackedLut(values, lut.data());
+        return applyPackedLut(values, it->second.data());
     }
 
     if (spec.kind == OverlayColormapKind::DiscreteLut && spec.discreteLut != nullptr) {

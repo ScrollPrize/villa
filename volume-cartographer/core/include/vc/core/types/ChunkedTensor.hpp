@@ -3,18 +3,13 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 #include "vc/core/cache/SimpleCacheFactory.hpp"
+#include "vc/core/types/Array3D.hpp"
 
 #include <opencv2/core.hpp>
-
-#include <xtensor/containers/xtensor.hpp>
-#include <xtensor/containers/xadapt.hpp>
-#include <xtensor/views/xview.hpp>
 
 #include "vc/core/types/VcDataset.hpp"
 
 #include <deque>
-#include <fstream>
-#include <iomanip>
 #include <mutex>
 #include <set>
 #include <shared_mutex>
@@ -29,6 +24,12 @@
 #include <cerrno>
 #include <cstring>
 #include <sstream>
+
+// Helpers to keep nlohmann/json.hpp out of this header.
+// Reads meta.json in |dir|, returns canonical "dataset_source_path" or empty.
+std::filesystem::path read_cache_meta_dataset_path(const std::filesystem::path& meta_json_path);
+// Writes meta.json into |dir| with the given canonical dataset path.
+void write_cache_meta_json(const std::filesystem::path& dir, const std::filesystem::path& dataset_path);
 
 #ifndef CCI_TLS_MAX // Max number for ChunkedCachedInterpolator
 #define CCI_TLS_MAX 256
@@ -46,7 +47,7 @@ struct passTroughComputor
     {
         int low = int(BORDER);
         int high = int(BORDER)+int(CHUNK_SIZE);
-        small = view(large, xt::range(low,high),xt::range(low,high),xt::range(low,high));
+        small = large.subarray(low, high, low, high, low, high);
     }
 };
 
@@ -68,7 +69,7 @@ static std::string tmp_name_proc_thread()
 template <typename T, typename C>
 class Chunked3d {
 public:
-    using CHUNKT = xt::xtensor<T,3,xt::layout_type::column_major>;
+    using CHUNKT = Array3D<T>;
 
     Chunked3d(C &compute_f, vc::VcDataset *ds, vc::cache::TieredChunkCache *cache, int level) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
     {
@@ -106,25 +107,17 @@ public:
                 for (auto const& entry : std::filesystem::directory_iterator(root))
                     if (std::filesystem::is_directory(entry) && std::filesystem::exists(entry.path()/"meta.json") && std::filesystem::is_regular_file(entry.path()/"meta.json")) {
                         paths.insert(entry.path());
+                        auto src = read_cache_meta_dataset_path(entry.path()/"meta.json");
+                        if (src.empty())
+                            continue;
+                        if (!std::filesystem::exists(ds->path()))
+                            continue;
                         try {
-                            std::ifstream meta_f(entry.path()/"meta.json");
-                            nlohmann::json meta = nlohmann::json::parse(meta_f);
-                            // Skip entries with invalid or non-existent dataset paths
-                            if (!meta.contains("dataset_source_path") || !meta["dataset_source_path"].is_string())
-                                continue;
-                            std::filesystem::path src_candidate(meta["dataset_source_path"].get<std::string>());
-                            if (!std::filesystem::exists(src_candidate))
-                                continue;
-                            if (!std::filesystem::exists(ds->path()))
-                                continue;
-                            std::filesystem::path src = std::filesystem::canonical(src_candidate);
-                            std::filesystem::path cur = std::filesystem::canonical(ds->path());
-                            if (src == cur) {
+                            if (src == std::filesystem::canonical(ds->path())) {
                                 _cache_dir = entry.path();
                                 break;
                             }
                         } catch (const std::exception&) {
-                            // Ignore malformed cache entries or paths we cannot canonicalize
                             continue;
                         }
                     }
@@ -138,11 +131,8 @@ public:
             std::filesystem::create_directories(tmp_dir);
             
             if (_persistent) {
-                nlohmann::json meta;
-                meta["dataset_source_path"] = std::filesystem::canonical(ds->path()).string();
-                std::ofstream o(tmp_dir/"meta.json");
-                o << std::setw(4) << meta << std::endl;
-                
+                write_cache_meta_json(tmp_dir, std::filesystem::canonical(ds->path()));
+
                 std::filesystem::path tgt_path;
                 for(int i=0;i<1000;i++) {
                     tgt_path = root/std::to_string(i);
@@ -272,11 +262,11 @@ public:
             static_cast<int>(id[1]*s-_border),
             static_cast<int>(id[2]*s-_border)};
 
-        CHUNKT small = xt::empty<T>({s,s,s});
+        CHUNKT small = Array3D<T>({(size_t)s,(size_t)s,(size_t)s});
         CHUNKT large;
         if (_ds) {
-            large = xt::empty<T>({s+2*_border,s+2*_border,s+2*_border});
-            large = xt::full_like(large, C::FILL_V);
+            large = Array3D<T>({(size_t)(s+2*_border),(size_t)(s+2*_border),(size_t)(s+2*_border)});
+            large.fill(C::FILL_V);
 
             readArea3D(large, offset, _cache, _level);
         }
@@ -284,7 +274,7 @@ public:
         _compute_f.template compute<CHUNKT,T>(large, small, offset);
 
         for(int i=0;i<len;i++)
-            chunk[i] = (&small(0,0,0))[i];
+            chunk[i] = (small.data())[i];
 
         _mutex.lock();
         if (!_chunks.count(id)) {
@@ -312,7 +302,7 @@ public:
     T *cache_chunk_safe_alloc(const cv::Vec3i &id)
     {
         auto s = C::CHUNK_SIZE;
-        CHUNKT small = xt::empty<T>({s,s,s});
+        CHUNKT small = Array3D<T>({(size_t)s,(size_t)s,(size_t)s});
 
         cv::Vec3i offset =
         {static_cast<int>(id[0]*s-_border),
@@ -321,8 +311,8 @@ public:
             
         CHUNKT large;
         if (_ds) {
-            large = xt::empty<T>({s+2*_border,s+2*_border,s+2*_border});
-            large = xt::full_like(large, C::FILL_V);
+            large = Array3D<T>({(size_t)(s+2*_border),(size_t)(s+2*_border),(size_t)(s+2*_border)});
+            large.fill(C::FILL_V);
             
             readArea3D(large, offset, _cache, _level);
         }
@@ -334,7 +324,7 @@ public:
         _mutex.lock();
         if (!_chunks.count(id)) {
             chunk = (T*)malloc(s*s*s*sizeof(T));
-            memcpy(chunk, &small(0,0,0), s*s*s*sizeof(T));
+            memcpy(chunk, small.data(), s*s*s*sizeof(T));
             _chunks[id] = chunk;
         }
         else {
@@ -352,9 +342,9 @@ public:
     // T *cache_chunk_safe_alloc(const cv::Vec3i &id)
     // {
     //     auto s = C::CHUNK_SIZE;
-    //     CHUNKT large = xt::empty<T>({s+2*_border,s+2*_border,s+2*_border});
-    //     large = xt::full_like(large, C::FILL_V);
-    //     CHUNKT small = xt::empty<T>({s,s,s});
+    //     CHUNKT large = Array3D<T>({(size_t)(s+2*_border),(size_t)(s+2*_border),(size_t)(s+2*_border)});
+    //     large.fill(C::FILL_V);
+    //     CHUNKT small = Array3D<T>({(size_t)s,(size_t)s,(size_t)s});
     //
     //     cv::Vec3i offset =
     //     {id[0]*s-_border,
@@ -392,10 +382,10 @@ public:
     T *cache_chunk(const cv::Vec3i &id) {
         return cache_chunk_safe(id);
         // auto s = C::CHUNK_SIZE;
-        // CHUNKT large = xt::empty<T>({s+2*_border,s+2*_border,s+2*_border});
-        // large = xt::full_like(large, C::FILL_V);
+        // CHUNKT large = Array3D<T>({(size_t)(s+2*_border),(size_t)(s+2*_border),(size_t)(s+2*_border)});
+        // large.fill(C::FILL_V);
         // CHUNKT *small = new CHUNKT();
-        // *small = xt::empty<T>({s,s,s});
+        // *small = Array3D<T>({(size_t)s,(size_t)s,(size_t)s});
         //
         // cv::Vec3i offset =
         // {id[0]*s-_border,

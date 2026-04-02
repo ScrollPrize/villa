@@ -1,8 +1,6 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
-#include <xtensor/generators/xbuilder.hpp>
-#include <xtensor/views/xview.hpp>
 
 #include <opencv2/core.hpp>
 #include <opencv2/calib3d.hpp>

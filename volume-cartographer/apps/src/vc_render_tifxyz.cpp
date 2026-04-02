@@ -1,3 +1,4 @@
+#include <iostream>
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/cache/SimpleCacheFactory.hpp"
@@ -10,7 +11,7 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VcDataset.hpp"
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <opencv2/imgproc.hpp>
 #include <fstream>
@@ -32,7 +33,7 @@
 #include <omp.h>
 
 namespace po = boost::program_options;
-using json = nlohmann::json;
+using Json = utils::Json;
 
 // ============================================================
 // Logging infrastructure
@@ -116,7 +117,7 @@ static AffineTransform loadAffineTransform(const std::string& filename)
     if (!file.is_open())
         throw std::runtime_error("Cannot open affine transform file: " + filename);
     try {
-        json j; file >> j;
+        Json j = Json::parse_file(filename);
         if (j.contains("transformation_matrix")) {
             auto mat = j["transformation_matrix"];
             if (mat.size() != 3 && mat.size() != 4)
@@ -125,7 +126,7 @@ static AffineTransform loadAffineTransform(const std::string& filename)
                 if (mat[row].size() != 4)
                     throw std::runtime_error("Each row must have 4 elements");
                 for (int col = 0; col < 4; col++)
-                    transform.matrix(row, col) = mat[row][col].get<double>();
+                    transform.matrix(row, col) = mat[row][col].get_double();
             }
             if (mat.size() == 4) {
                 if (std::abs(transform.matrix(3,0)) > 1e-12 ||
@@ -135,7 +136,7 @@ static AffineTransform loadAffineTransform(const std::string& filename)
                     throw std::runtime_error("Bottom affine row must be [0,0,0,1]");
             }
         }
-    } catch (json::parse_error&) {
+    } catch (const std::exception&) {
         throw std::runtime_error("Error parsing affine transform file: " + filename);
     }
     return transform;
@@ -432,10 +433,9 @@ static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
     if (!file.is_open()) return {};
 
     try {
-        json marker;
-        file >> marker;
+        Json marker = Json::parse_file(markerPath);
         if (marker.contains("url") && marker["url"].is_string())
-            return marker["url"].get<std::string>();
+            return marker["url"].get_string();
     } catch (...) {
     }
     return {};

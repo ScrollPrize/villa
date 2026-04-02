@@ -134,8 +134,9 @@ void DiskStore::put(
     } else {
         // Update in-memory index
         size_t oldSize = 0;
-        auto mtime = std::filesystem::last_write_time(path, ec);
-        if (!ec) {
+        // We just wrote the file, so its mtime is now. Avoid the extra syscall.
+        auto mtime = std::filesystem::file_time_type::clock::now();
+        {
             std::lock_guard<std::mutex> lk(indexMtx_);
             // Remove old entry if overwriting an existing file
             auto pit = pathIndex_.find(path.string());

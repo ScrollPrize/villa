@@ -10,7 +10,7 @@
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/LifeTime.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/GridStore.hpp"
@@ -19,11 +19,10 @@
 
 #include "vc/core/types/VcDataset.hpp"
 
-#include <xtensor/views/xview.hpp>
-#include <xtensor/containers/xtensor.hpp>
 #include "edt.hpp"
 
 #include <iostream>
+#include <fstream>
 #include <cctype>
 #include <random>
 #include <optional>
@@ -728,9 +727,7 @@ static SDTChunk* get_or_compute_sdt_chunk(SDTContext& ctx, const cv::Vec3f& worl
 
     const int cs = ctx.chunk_size;
     const cv::Vec3i size(cs, cs, cs);
-    xt::xtensor<uint8_t, 3, xt::layout_type::column_major> binary_data(
-        std::array<size_t, 3>{static_cast<size_t>(cs), static_cast<size_t>(cs), static_cast<size_t>(cs)});
-    binary_data.fill(0);
+    Array3D<uint8_t> binary_data({static_cast<size_t>(cs), static_cast<size_t>(cs), static_cast<size_t>(cs)});
 
     auto shape = ctx.cache->levelShape(ctx.level); // z,y,x
     cv::Vec3i clamped_origin(
@@ -746,8 +743,7 @@ static SDTChunk* get_or_compute_sdt_chunk(SDTContext& ctx, const cv::Vec3f& worl
     if (read_size[0] > 0 && read_size[1] > 0 && read_size[2] > 0) {
         cv::Vec3i clamped_origin_zyx(clamped_origin[2], clamped_origin[1], clamped_origin[0]);
         cv::Vec3i read_size_zyx(read_size[2], read_size[1], read_size[0]);
-        xt::xtensor<uint8_t, 3, xt::layout_type::column_major> read_buf(
-            std::array<size_t, 3>{static_cast<size_t>(read_size_zyx[0]),
+        Array3D<uint8_t> read_buf({static_cast<size_t>(read_size_zyx[0]),
                                   static_cast<size_t>(read_size_zyx[1]),
                                   static_cast<size_t>(read_size_zyx[2])});
         readArea3D(read_buf, clamped_origin_zyx, ctx.cache, ctx.level);
@@ -929,14 +925,13 @@ struct LossSettings {
         return reference_raycast.surface && w[LossType::REFERENCE_RAY] > 0.0f;
     }
 
-    void applyJsonWeights(const nlohmann::json& params) {
+    void applyJsonWeights(const utils::Json& params) {
         const auto set_weight = [&](const char* key, LossType type) {
-            const auto it = params.find(key);
-            if (it == params.end() || it->is_null()) {
+            if (!params.contains(key) || params[key].is_null()) {
                 return;
             }
-            if (it->is_number()) {
-                w[type] = static_cast<float>(it->get<double>());
+            if (params[key].is_number()) {
+                w[type] = static_cast<float>(params[key].get_double());
             } else {
                 std::cerr << key << " must be numeric" << std::endl;
             }
@@ -981,7 +976,7 @@ struct LossSettings {
     bool space_line_invert = false;
 };
 
-static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& params)
+static std::vector<cv::Vec2i> parse_growth_directions(const utils::Json& params)
 {
     static const std::vector<cv::Vec2i> kDefaultDirections = {
         {1, 0},    // down / +row
@@ -994,12 +989,11 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
         {-1, -1}   // up-left
     };
 
-    const auto it = params.find("growth_directions");
-    if (it == params.end()) {
+    if (!params.contains("growth_directions")) {
         return kDefaultDirections;
     }
 
-    const nlohmann::json& directions = *it;
+    const utils::Json& directions = params["growth_directions"];
     if (!directions.is_array()) {
         std::cerr << "growth_directions parameter must be an array of strings" << std::endl;
         return kDefaultDirections;
@@ -1024,7 +1018,7 @@ static std::vector<cv::Vec2i> parse_growth_directions(const nlohmann::json& para
             continue;
         }
 
-        const std::string value = entry.get<std::string>();
+        const std::string value = entry.get_string();
         std::string normalized;
         normalized.reserve(value.size());
         for (char ch : value) {
@@ -2689,8 +2683,8 @@ static void _dist_iteration(T &from, T &to, int s)
 template <typename T, typename E>
 static T distance_transform(const T &chunk, int steps, int size)
 {
-    T c1 = xt::empty<E>(chunk.shape());
-    T c2 = xt::empty<E>(chunk.shape());
+    T c1(chunk.shape());
+    T c2(chunk.shape());
 
     c1 = chunk;
 
@@ -2720,7 +2714,7 @@ struct thresholdedDistance
     const std::string UNIQUE_ID_STRING = "dqk247q6vz_"+std::to_string(BORDER)+"_"+std::to_string(CHUNK_SIZE)+"_"+std::to_string(FILL_V)+"_"+std::to_string(TH);
     template <typename T, typename E> void compute(const T &large, T &small, const cv::Vec3i &offset_large)
     {
-        T outer = xt::empty<E>(large.shape());
+        T outer(large.shape());
 
         int s = CHUNK_SIZE+2*BORDER;
         E magic = -1;
@@ -2743,20 +2737,18 @@ struct thresholdedDistance
         int low = int(BORDER);
         int high = int(BORDER)+int(CHUNK_SIZE);
 
-        auto crop_outer = view(outer, xt::range(low,high),xt::range(low,high),xt::range(low,high));
-
-        small = crop_outer;
+        small = outer.subarray(low, high, low, high, low, high);
     }
 
 };
 
 
-QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache *cache, int level, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const VCCollection &corrections)
+QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections)
 {
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
     if (params.contains("neural_socket")) {
-        std::string socket_path = params["neural_socket"];
+        std::string socket_path = params["neural_socket"].get_string();
         if (!socket_path.empty()) {
             try {
                 neural_tracer = std::make_unique<NeuralTracerConnection>(socket_path);
@@ -2802,7 +2794,7 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache 
     // IMPORTANT: We auto-derive the correct scale factor from dataset shapes and ignore any JSON scale parameter.
     if (params.contains("normal3d_zarr_path") && params["normal3d_zarr_path"].is_string()) {
         try {
-            const std::filesystem::path zarr_root = params["normal3d_zarr_path"].get<std::string>();
+            const std::filesystem::path zarr_root = params["normal3d_zarr_path"].get_string();
 
             // Expect fixed layout: <root>/{x,y,z}/0
             const int scale_level = 0;
@@ -2815,11 +2807,11 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache 
                 if (!std::filesystem::exists(zarray_axis)) {
                     throw std::runtime_error(std::string("Missing ") + axis + "/0/.zarray under normal3d_zarr_path: " + zarr_root.string());
                 }
-                nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_axis));
+                utils::Json j = utils::Json::parse_file(zarray_axis);
                 if (!j.contains("fill_value")) {
                     throw std::runtime_error(std::string("Missing fill_value in ") + axis + "/0/.zarray under normal3d_zarr_path: " + zarr_root.string());
                 }
-                const int fv = j["fill_value"].get<int>();
+                const int fv = j["fill_value"].get_int();
                 if (fv != 128) {
                     std::stringstream msg;
                     msg << "normal3d_zarr_path fill_value=" << fv << " for " << axis << "/0; expected 128";
@@ -2832,12 +2824,12 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache 
             assert_fill_value_128("z");
 
             const std::filesystem::path zarray_x = zarr_root / "x" / "0" / ".zarray";
-            nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_x));
-            std::string delim = j.value<std::string>("dimension_separator", ".");
+            utils::Json j = utils::Json::parse_file(zarray_x);
+            std::string delim = j.value("dimension_separator", std::string("."));
 
             // Assert the direction-field was aligned by vc_ngrids --align-normals.
             try {
-                nlohmann::json attrs = vc::readZarrAttributes(zarr_root);
+                utils::Json attrs = vc::readZarrAttributes(zarr_root);
                 const bool aligned = attrs.value("align_normals", false);
                 if (!aligned) {
                     throw std::runtime_error("normal3d_zarr_path is not marked aligned (missing attrs.align_normals=true); run vc_ngrids --align-normals");
@@ -2926,16 +2918,15 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache 
 
     std::unique_ptr<QuadSurface> reference_surface;
     if (params.contains("reference_surface")) {
-        const nlohmann::json& ref_cfg = params["reference_surface"];
+        const utils::Json& ref_cfg = params["reference_surface"];
         std::string ref_path;
         if (ref_cfg.is_string()) {
-            ref_path = ref_cfg.get<std::string>();
+            ref_path = ref_cfg.get_string();
         } else if (ref_cfg.is_object()) {
-            const auto path_it = ref_cfg.find("path");
-            if (path_it != ref_cfg.end()) {
-                if (path_it->is_string()) {
-                    ref_path = path_it->get<std::string>();
-                } else if (!path_it->is_null()) {
+            if (ref_cfg.contains("path")) {
+                if (ref_cfg["path"].is_string()) {
+                    ref_path = ref_cfg["path"].get_string();
+                } else if (!ref_cfg["path"].is_null()) {
                     std::cerr << "reference_surface.path must be a string" << std::endl;
                 }
             }
@@ -2955,12 +2946,11 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache 
 
         if (loss_settings.reference_raycast.surface && ref_cfg.is_object()) {
             auto read_double = [&](const char* key, double current) {
-                const auto it = ref_cfg.find(key);
-                if (it == ref_cfg.end() || it->is_null()) {
+                if (!ref_cfg.contains(key) || ref_cfg[key].is_null()) {
                     return current;
                 }
-                if (it->is_number()) {
-                    return it->get<double>();
+                if (ref_cfg[key].is_number()) {
+                    return ref_cfg[key].get_double();
                 }
                 std::cerr << "reference_surface." << key << " must be numeric" << std::endl;
                 return current;
@@ -3004,7 +2994,7 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache 
     // Load normal grid first if provided, so we can use its spiral-step
     std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
     if (params.contains("normal_grid_path")) {
-        ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get<std::string>());
+        ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get_string());
     }
 
     // Determine step size with priority: explicit param > normal_grid > resume_surf > default
@@ -3013,7 +3003,7 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache 
         step = params.value("step_size", 20.0f);
     } else if (ngv) {
         // Use normal grid's spiral-step as authoritative (handles legacy surfaces with wrong scale)
-        step = ngv->metadata()["spiral-step"].get<float>();
+        step = ngv->metadata()["spiral-step"].get_float();
     } else if (resume_surf) {
         step = 1.0f / resume_surf->scale()[0];
     } else {
@@ -3023,7 +3013,7 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache 
 
     // Validate step matches normal grid if explicit step_size was provided
     if (ngv && params.contains("step_size")) {
-        float ngv_step = ngv->metadata()["spiral-step"].get<float>();
+        float ngv_step = ngv->metadata()["spiral-step"].get_float();
         if (std::abs(ngv_step - step) > 1e-6) {
             throw std::runtime_error("step_size parameter mismatch between normal grid volume and tracer.");
         }
@@ -3216,19 +3206,25 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache 
         const double voxel_size_d = static_cast<double>(voxelsize);
         const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
 
-        surf->meta = std::make_unique<nlohmann::json>(meta_params);
-        (*surf->meta)["area_vx2"] = area_est_vx2;
-        (*surf->meta)["area_cm2"] = area_est_cm2;
-        (*surf->meta)["max_gen"] = generation;
-        (*surf->meta)["seed"] = {origin[0], origin[1], origin[2]};
-        (*surf->meta)["elapsed_time_s"] = f_timer.seconds();
+        surf->meta = utils::Json::parse(meta_params.dump());
+        surf->meta["area_vx2"] = area_est_vx2;
+        surf->meta["area_cm2"] = area_est_cm2;
+        surf->meta["max_gen"] = generation;
+        {
+            auto seed_arr = utils::Json::array();
+            seed_arr.push_back(origin[0]); seed_arr.push_back(origin[1]); seed_arr.push_back(origin[2]);
+            surf->meta["seed"] = std::move(seed_arr);
+        }
+        surf->meta["elapsed_time_s"] = f_timer.seconds();
         if (resume_surf && !resume_surf->id.empty()) {
-            (*surf->meta)["seed_surface_id"] = resume_surf->id;
+            surf->meta["seed_surface_id"] = resume_surf->id;
             // Store grid offset for correction point remapping
             // new_coord = old_coord + offset
             const int offset_row = resume_pad_y - used_area_safe.y;
             const int offset_col = resume_pad_x - used_area_safe.x;
-            (*surf->meta)["grid_offset"] = {offset_col, offset_row};
+            auto off_arr = utils::Json::array();
+            off_arr.push_back(offset_col); off_arr.push_back(offset_row);
+            surf->meta["grid_offset"] = std::move(off_arr);
         }
 
         // Preserve approval and mask channels from resume surface with correct offset
@@ -3756,11 +3752,11 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache 
     }
     else
     {
-        if (params.value("resume_opt", "skip") == "global") {
+        if (params.value("resume_opt", std::string("skip")) == "global") {
             std::cout << "global opt" << std::endl;
             local_optimization(100, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
         }
-        else if (params.value("resume_opt", "skip") == "local") {
+        else if (params.value("resume_opt", std::string("skip")) == "local") {
             int opt_step = params.value("resume_local_opt_step", 16);
             if (opt_step <= 0) {
                 std::cerr << "WARNING: resume_local_opt_step must be > 0; defaulting to 16" << std::endl;

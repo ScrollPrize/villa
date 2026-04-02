@@ -1,5 +1,7 @@
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/HashFunctions.hpp"
+
+#include "utils/Json.hpp"
  
  #include <filesystem>
  #include <fstream>
@@ -23,7 +25,7 @@
      struct NormalGridVolume::pimpl {
          std::string base_path;
          int sparse_volume;
-         nlohmann::json metadata;
+         utils::Json metadata;
          mutable std::shared_mutex mutex;
          mutable std::unordered_map<cv::Vec2i, CacheEntry> grid_cache;
          mutable uint64_t generation_counter = 0;
@@ -37,11 +39,7 @@
          std::vector<std::string> plane_dirs = {"xy", "xz", "yz"};
  
          explicit pimpl(const std::string& path) : base_path(path) {
-             std::ifstream metadata_file((fs::path(base_path) / "metadata.json").string());
-             if (!metadata_file.is_open()) {
-                throw std::runtime_error("Failed to open metadata.json in " + base_path);
-            }
-            metadata_file >> metadata;
+            metadata = utils::Json::parse_file(fs::path(base_path) / "metadata.json");
             sparse_volume = metadata.value("sparse-volume", 1);
         }
 
@@ -249,7 +247,7 @@
     NormalGridVolume::~NormalGridVolume() = default;
     NormalGridVolume::NormalGridVolume(NormalGridVolume&&) noexcept = default;
     NormalGridVolume& NormalGridVolume::operator=(NormalGridVolume&&) noexcept = default;
-    const nlohmann::json& NormalGridVolume::metadata() const {
+    const utils::Json& NormalGridVolume::metadata() const {
         return pimpl_->metadata;
     }
 } // namespace vc::core::util

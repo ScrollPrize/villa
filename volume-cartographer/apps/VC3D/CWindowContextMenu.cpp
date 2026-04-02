@@ -21,7 +21,7 @@
 #include "ToolDialogs.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 // --------- local helpers for running external tools -------------------------
 static bool runProcessBlocking(const QString& program,

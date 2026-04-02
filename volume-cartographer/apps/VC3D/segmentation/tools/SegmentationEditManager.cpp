@@ -5,6 +5,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
+#include "utils/Json.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -25,10 +26,10 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
     if (!surface) {
         return;
     }
-    if (surface->meta && surface->meta->is_object()) {
+    if (!surface->meta.is_null() && surface->meta.is_object()) {
         return;
     }
-    surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
+    surface->meta = utils::Json::object();
 }
 }
 

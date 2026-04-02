@@ -8,7 +8,7 @@
 #include <vector>
 
 #include <opencv2/core.hpp>
-#include <xtensor/containers/xtensor.hpp>
+#include <vc/core/types/Array3D.hpp>
 
 namespace vc::core::util {
 
@@ -67,7 +67,7 @@ inline NormalGridBatchPlan planNormalGridBatch(
 }
 
 inline bool extractBinarySliceFromChunk(
-    const xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& chunkData,
+    const Array3D<uint8_t>& chunkData,
     NormalGridSliceDirection direction,
     size_t iChunk,
     cv::Mat& binarySlice)

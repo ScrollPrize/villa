@@ -6,7 +6,8 @@
 #include "vc/tracer/SurfaceModeling.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
+#include <fstream>
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -14,7 +15,7 @@
 
 
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
 static int trace_mul;
 static float dist_w;
@@ -773,7 +774,7 @@ int main(int argc, char *argv[])
     std::vector<cv::Mat_<cv::Vec2d>> surf_locs;
 
     std::ifstream params_f(argv[1]);
-    json params = json::parse(params_f);
+    Json params = Json::parse_file(argv[1]);
     
     trace_mul = params.value("trace_mul", 1);
     dist_w = params.value("dist_w", 0.3);
@@ -1434,8 +1435,8 @@ int main(int argc, char *argv[])
     {
         QuadSurface *surf_full = new QuadSurface(points(bbox), surfs[0]->_scale/trace_mul);
         std::filesystem::path tgt_dir = "./";
-        surf_full->meta = std::make_unique<nlohmann::json>();
-        (*surf_full->meta)["vc_fill_quadmesh_params"] = params;
+        surf_full->meta = utils::Json::object();
+        surf_full->meta["vc_fill_quadmesh_params"] = utils::Json::parse(params.dump());
         std::string name_prefix = "fuse_fill_";
         std::string uuid = name_prefix + time_str();
         std::filesystem::path seg_dir = tgt_dir / uuid;
@@ -1454,7 +1455,7 @@ int main(int argc, char *argv[])
     //     cv::Mat_<cv::Vec3f> points_hr = points_hr_grounding(state, tgt_wind, winding_in, points, points_in, trace_mul);
     //     QuadSurface *surf_hr = new QuadSurface(points_hr, surfs[0]->_scale);
     //     std::filesystem::path tgt_dir = "./";
-    //     surf_hr->meta = new nlohmann::json;
+    //     surf_hr->meta = new utils::Json;
     //     (*surf_hr->meta)["vc_fill_quadmesh_params"] = params;
     //     std::string name_prefix = "testing_fill_hr_";
     //     std::string uuid = name_prefix + time_str();

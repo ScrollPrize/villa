@@ -10,7 +10,7 @@
 
 #include <QSettings>
 #include <QFontMetricsF>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -163,6 +163,28 @@ void VectorOverlayController::collectDirectionHints(VolumeViewerBase* viewer,
         }
     };
 
+    // Read QSettings once for both QuadSurface and PlaneSurface branches
+    using namespace vc3d::settings;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    bool useSegStep = settings.value(viewer::USE_SEG_STEP_FOR_HINTS, viewer::USE_SEG_STEP_FOR_HINTS_DEFAULT).toBool();
+    int numPoints = std::max(0, std::min(100, settings.value(viewer::DIRECTION_STEP_POINTS, viewer::DIRECTION_STEP_POINTS_DEFAULT).toInt()));
+    float stepVal = settings.value(viewer::DIRECTION_STEP, static_cast<float>(viewer::DIRECTION_STEP_DEFAULT)).toFloat();
+    if (useSegStep && segSurface && !segSurface->meta.is_null()) {
+        try {
+            if (segSurface->meta.contains("vc_grow_seg_from_segments_params")) {
+                const auto& p = segSurface->meta.at("vc_grow_seg_from_segments_params");
+                if (p.contains("step")) {
+                    stepVal = p.at("step").get_float();
+                }
+            }
+        } catch (...) {
+            // keep default
+        }
+    }
+    if (stepVal <= 0.0f) {
+        stepVal = settings.value(viewer::DIRECTION_STEP, static_cast<float>(viewer::DIRECTION_STEP_DEFAULT)).toFloat();
+    }
+
     if (viewer->surfName() == "segmentation") {
         auto* quad = dynamic_cast<QuadSurface*>(currentSurface);
         if (!quad) {
@@ -190,27 +212,6 @@ void VectorOverlayController::collectDirectionHints(VolumeViewerBase* viewer,
 
         cv::Vec3f centerParam = quad->loc(ptr) * scale;
         addMarker(QPointF(centerParam[0], centerParam[1]), kCenterColor, kStepCenterRadius);
-
-        using namespace vc3d::settings;
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        bool useSegStep = settings.value(viewer::USE_SEG_STEP_FOR_HINTS, viewer::USE_SEG_STEP_FOR_HINTS_DEFAULT).toBool();
-        int numPoints = std::max(0, std::min(100, settings.value(viewer::DIRECTION_STEP_POINTS, viewer::DIRECTION_STEP_POINTS_DEFAULT).toInt()));
-        float stepVal = settings.value(viewer::DIRECTION_STEP, static_cast<float>(viewer::DIRECTION_STEP_DEFAULT)).toFloat();
-        if (useSegStep && quad->meta) {
-            try {
-                if (quad->meta->contains("vc_grow_seg_from_segments_params")) {
-                    auto& p = quad->meta->at("vc_grow_seg_from_segments_params");
-                    if (p.contains("step")) {
-                        stepVal = p.at("step").get<float>();
-                    }
-                }
-            } catch (...) {
-                // keep default
-            }
-        }
-        if (stepVal <= 0.0f) {
-            stepVal = settings.value(viewer::DIRECTION_STEP, static_cast<float>(viewer::DIRECTION_STEP_DEFAULT)).toFloat();
-        }
 
         for (int n = 1; n <= numPoints; ++n) {
             cv::Vec3f pos = quad->loc(ptr, {n * stepVal, 0, 0}) * scale;
@@ -272,27 +273,6 @@ void VectorOverlayController::collectDirectionHints(VolumeViewerBase* viewer,
         QPointF greenTip = anchor + downOffset - dir2;
         addLabel(redTip + QPointF(8.0, -8.0), QStringLiteral("false"), kArrowFalseColor);
         addLabel(greenTip + QPointF(8.0, -8.0), QStringLiteral("true"), kArrowTrueColor);
-
-        using namespace vc3d::settings;
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        bool useSegStep = settings.value(viewer::USE_SEG_STEP_FOR_HINTS, viewer::USE_SEG_STEP_FOR_HINTS_DEFAULT).toBool();
-        int numPoints = std::max(0, std::min(100, settings.value(viewer::DIRECTION_STEP_POINTS, viewer::DIRECTION_STEP_POINTS_DEFAULT).toInt()));
-        float stepVal = settings.value(viewer::DIRECTION_STEP, static_cast<float>(viewer::DIRECTION_STEP_DEFAULT)).toFloat();
-        if (useSegStep && segSurface->meta) {
-            try {
-                if (segSurface->meta->contains("vc_grow_seg_from_segments_params")) {
-                    auto& p = segSurface->meta->at("vc_grow_seg_from_segments_params");
-                    if (p.contains("step")) {
-                        stepVal = p.at("step").get<float>();
-                    }
-                }
-            } catch (...) {
-                // keep default
-            }
-        }
-        if (stepVal <= 0.0f) {
-            stepVal = settings.value(viewer::DIRECTION_STEP, static_cast<float>(viewer::DIRECTION_STEP_DEFAULT)).toFloat();
-        }
 
         addMarker(anchor, kCenterColor, kStepCenterRadius);
 
@@ -558,12 +538,12 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
 
     // Get step size from settings or segment metadata
     float stepVal = 50.0f;  // Default step in nominal coords
-    if (segSurface->meta) {
+    if (!segSurface->meta.is_null()) {
         try {
-            if (segSurface->meta->contains("vc_grow_seg_from_segments_params")) {
-                auto& p = segSurface->meta->at("vc_grow_seg_from_segments_params");
+            if (segSurface->meta.contains("vc_grow_seg_from_segments_params")) {
+                const auto& p = segSurface->meta.at("vc_grow_seg_from_segments_params");
                 if (p.contains("step")) {
-                    stepVal = p.at("step").get<float>();
+                    stepVal = p.at("step").get_float();
                 }
             }
         } catch (...) {}

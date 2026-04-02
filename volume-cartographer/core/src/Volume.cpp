@@ -13,8 +13,6 @@
 #endif
 
 #include <opencv2/imgcodecs.hpp>
-#include <nlohmann/json.hpp>
-
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/cache/TieredChunkCache.hpp"
@@ -34,9 +32,9 @@ Volume::Volume(std::filesystem::path path) : path_(std::move(path))
 {
     loadMetadata();
 
-    _width = metadata_["width"].get<int>();
-    _height = metadata_["height"].get<int>();
-    _slices = metadata_["slices"].get<int>();
+    _width = metadata_["width"].get_int();
+    _height = metadata_["height"].get_int();
+    _slices = metadata_["slices"].get_int();
 
     zarrOpen();
     mountInfo_ = vc::detectNetworkMount(path_);
@@ -102,12 +100,12 @@ void Volume::loadMetadata()
 
 std::string Volume::id() const
 {
-    return metadata_["uuid"].get<std::string>();
+    return metadata_["uuid"].get_string();
 }
 
 std::string Volume::name() const
 {
-    return metadata_["name"].get<std::string>();
+    return metadata_["name"].get_string();
 }
 
 void Volume::setName(const std::string& n)
@@ -146,7 +144,7 @@ static int ceilDivPow2(int v, int level)
 
 void Volume::zarrOpen()
 {
-    if (!metadata_.contains("format") || metadata_["format"].get<std::string>() != "zarr")
+    if (!metadata_.contains("format") || metadata_["format"].get_string() != "zarr")
         return;
 
     zarrDs_ = vc::openZarrLevels(path_);
@@ -312,7 +310,7 @@ int Volume::numSlices() const noexcept { return _slices; }
 std::array<int, 3> Volume::shape() const noexcept { return {_width, _height, _slices}; }
 double Volume::voxelSize() const
 {
-    return metadata_["voxelsize"].get<double>();
+    return metadata_["voxelsize"].get_double();
 }
 
 vc::VcDataset *Volume::zarrDataset(int level) const {
@@ -547,39 +545,36 @@ int Volume::sampleBestEffort(cv::Mat_<uint8_t>& out,
     // This avoids re-scanning border/interior pixels per level.
     auto wb = coordsWorldBBox(coords);
 
+    // Find best cached level without scaling coords each iteration.
+    int useLvl = -1;
     for (int lvl = level; lvl < nScales; lvl++) {
         if (allChunksCachedFast(wb, lvl)) {
-            const auto& scaled = scaleCoords(coords, lvl);
-            readInterpolated3D(out, tieredCache(), lvl, scaled, params.method);
-            if (lvl > level) {
-                // Prefetch desired level and one intermediate for progressive refinement
-                prefetchChunks(coords, level);
-                if (lvl - level > 1)
-                    prefetchChunks(coords, level + 1);
-            } else if (lvl > 0) {
-                // At desired level — prefetch next finer for smooth zoom-in
-                prefetchChunks(coords, lvl - 1);
-            }
-            if (!out.empty())
-                applyOptionalPostProcess(out, params);
-            return lvl;
+            useLvl = lvl;
+            break;
         }
     }
+    // No level had all chunks cached.  Fall back to the coarsest level
+    // (which is pinned hot in steady state, so this only blocks during
+    // initial loading).
+    if (useLvl < 0)
+        useLvl = std::max(0, nScales - 1);
 
-    // No level had all chunks cached.  Fall back to a blocking read at the
-    // coarsest level (which is pinned hot in steady state, so this only blocks
-    // during initial loading).  This matches sampleCompositeBestEffort behavior.
-    int last = std::max(0, nScales - 1);
-    const auto& scaled = scaleCoords(coords, last);
-    readInterpolated3D(out, tieredCache(), last, scaled, params.method);
-    if (last > level) {
+    // Scale coords ONCE for the chosen level.
+    const auto& scaled = scaleCoords(coords, useLvl);
+    readInterpolated3D(out, tieredCache(), useLvl, scaled, params.method);
+
+    if (useLvl > level) {
+        // Prefetch desired level and one intermediate for progressive refinement
         prefetchChunks(coords, level);
-        if (last - level > 1)
+        if (useLvl - level > 1)
             prefetchChunks(coords, level + 1);
+    } else if (useLvl > 0) {
+        // At desired level — prefetch next finer for smooth zoom-in
+        prefetchChunks(coords, useLvl - 1);
     }
     if (!out.empty())
         applyOptionalPostProcess(out, params);
-    return last;
+    return useLvl;
 }
 
 void Volume::sampleComposite(cv::Mat_<uint8_t>& out,
@@ -1249,13 +1244,19 @@ void Volume::prefetchLevels(int fromLevel, int toLevel)
     std::thread([cache = tieredCache_.get(), fromLevel, toLevel, diskBudget,
                  hasDataBounds, dbMinX, dbMaxX, dbMinY, dbMaxY, dbMinZ, dbMaxZ]() {
         for (int lvl = toLevel; lvl >= fromLevel; lvl--) {
-            int iz0 = 0, iy0 = 0, ix0 = 0;
+            // Skip levels that are already fully prefetched
+            if (cache->isLevelComplete(lvl)) {
+                std::fprintf(stderr, "[Volume] Level %d already complete, skipping\n", lvl);
+                continue;
+            }
+
             auto ls = cache->levelShape(lvl);
             auto cs = cache->chunkShape(lvl);
             int iz1 = (ls[0] + cs[0] - 1) / cs[0] - 1;
             int iy1 = (ls[1] + cs[1] - 1) / cs[1] - 1;
             int ix1 = (ls[2] + cs[2] - 1) / cs[2] - 1;
 
+            int iz0 = 0, iy0 = 0, ix0 = 0;
             if (hasDataBounds) {
                 // Only prefetch chunks that overlap the data bounds
                 float scale = 1.0f / static_cast<float>(1 << lvl);
@@ -1293,26 +1294,14 @@ void Volume::prefetchLevels(int fromLevel, int toLevel)
             std::fprintf(stderr, "[Volume] Prefetching level %d (%d chunks, ~%.1f GB)...\n",
                          lvl, total, estGB);
 
-            // Drip-feed: submit one z-slab at a time, waiting for the queue
-            // to drain between slabs so we don't overwhelm the IO pool.
-            int submitted = 0;
-            int slabSize = (iy1 - iy0 + 1) * (ix1 - ix0 + 1);
-
-            for (int iz = iz0; iz <= iz1; iz++) {
-                cache->prefetchRegion(lvl, iz, iy0, ix0, iz, iy1, ix1);
-                submitted += slabSize;
-
-                if (submitted % 5000 < slabSize)
+            // Delegate to prefetchLevel which uses the dedicated prefetch pool
+            cache->prefetchLevel(lvl, [lvl, total](int fetched, int t) {
+                if (fetched % 5000 < 1000)
                     std::fprintf(stderr, "[Volume] Level %d prefetch: %d/%d\n",
-                                 lvl, submitted, total);
-
-                // Wait for queue to drain before submitting more
-                while (cache->stats().ioPending > 10000) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-            }
+                                 lvl, fetched, t);
+            });
             std::fprintf(stderr, "[Volume] Level %d prefetch: %d/%d done\n",
-                         lvl, submitted, total);
+                         lvl, total, total);
         }
         std::fprintf(stderr, "[Volume] Level prefetch complete (levels %d-%d)\n",
                      fromLevel, toLevel);

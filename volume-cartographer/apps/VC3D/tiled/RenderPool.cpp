@@ -3,6 +3,8 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/types/Volume.hpp"
 
+static constexpr uint64_t kEpochSlack = 5;
+
 // ============================================================================
 // RenderPool
 // ============================================================================
@@ -51,7 +53,6 @@ void RenderPool::submit(const TileRenderParams& params,
             // are still useful — showing slightly-stale data is better than
             // showing nothing.  The tile-level freshness check in setTile()
             // ensures newer results always replace older ones.
-            constexpr uint64_t kEpochSlack = 5;
             uint64_t currentEpoch = epochRef->load(std::memory_order_relaxed);
             if (currentEpoch > kEpochSlack && params.epoch < currentEpoch - kEpochSlack) {
                 pendingCount_.fetch_sub(1, std::memory_order_relaxed);
@@ -76,30 +77,43 @@ std::vector<TileRenderResult> RenderPool::drainCompleted(int maxResults, uint64_
     // Reset debounce flag so the next pushResult emits tileReady again
     resultSignalPending_.store(false, std::memory_order_relaxed);
 
-    std::vector<TileRenderResult> results;
-    std::lock_guard<std::mutex> lock(resultsMutex_);
+    // Swap the entire vector out under lock — O(1) critical section.
+    std::vector<TileRenderResult> all;
+    {
+        std::lock_guard<std::mutex> lock(resultsMutex_);
+        std::swap(all, completedResults_);
+    }
 
-    results.reserve(std::min(static_cast<int>(completedResults_.size()), maxResults));
+    // Filter outside the lock
+    std::vector<TileRenderResult> results;
+    results.reserve(std::min(static_cast<int>(all.size()), maxResults));
 
     // Accept results from recent epochs (within kEpochSlack of minEpoch).
     // During rapid interaction the epoch advances quickly, but nearby-epoch
     // results are still visually useful and prevent gray/empty tiles.
-    constexpr uint64_t kEpochSlack = 5;
     uint64_t effectiveMin = (minEpoch > kEpochSlack) ? minEpoch - kEpochSlack : 0;
 
-    // Use reverse iteration with swap-and-pop to avoid O(n) shifts
-    for (int i = static_cast<int>(completedResults_.size()) - 1;
-         i >= 0 && static_cast<int>(results.size()) < maxResults; --i) {
-        auto& item = completedResults_[i];
+    std::vector<TileRenderResult> remaining;
+    remaining.reserve(all.size());
+
+    for (auto& item : all) {
         if (item.controllerId != controllerId) {
-            continue;  // belongs to another controller, skip
+            remaining.push_back(std::move(item));
+            continue;
         }
-        if (item.epoch >= effectiveMin) {
+        if (static_cast<int>(results.size()) < maxResults && item.epoch >= effectiveMin) {
             results.push_back(std::move(item));
         }
-        // Remove by swapping with back and popping (O(1) per element)
-        completedResults_[i] = std::move(completedResults_.back());
-        completedResults_.pop_back();
+        // else: discard stale results for this controller
+    }
+
+    // Push non-matching items back under lock — O(1) if empty, O(n) insert
+    // but only for items belonging to other controllers.
+    if (!remaining.empty()) {
+        std::lock_guard<std::mutex> lock(resultsMutex_);
+        completedResults_.insert(completedResults_.end(),
+            std::make_move_iterator(remaining.begin()),
+            std::make_move_iterator(remaining.end()));
     }
 
     return results;

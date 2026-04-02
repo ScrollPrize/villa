@@ -179,7 +179,7 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     fGraphicsView->setRenderHint(QPainter::Antialiasing);
     fGraphicsView->setScrollPanDisabled(true);
     // Software rendering — no OpenGL (eliminates ghosting from GL double-buffer)
-    fGraphicsView->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
+    fGraphicsView->setViewportUpdateMode(QGraphicsView::BoundingRectViewportUpdate);
 
     // Connect signals from view
     connect(fGraphicsView, &CVolumeViewerView::sendScrolled, this, &CTiledVolumeViewer::onScrolled);
@@ -910,17 +910,11 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 
 void CTiledVolumeViewer::setSliceOffset(float dz)
 {
-    beginInteractionRender();
-    _camera.zOff += dz;
-    // Track z-scroll velocity for directional prefetch
+    _camera.zOff = std::clamp(_camera.zOff + dz, -500.0f, 500.0f);
     _zVelocity = dz;
-    // Reset visual zoom transform so tiles render at correct scale
-    _zoomBaseScale = _camera.scale;
-    fGraphicsView->resetTransform();
-    rebuildContentGrid();
-    centerViewport();
     _camera.invalidate();
     submitRender();
+    updateStatusLabel();
 }
 
 void CTiledVolumeViewer::onZoom(int steps, QPointF scene_point, Qt::KeyboardModifiers modifiers)
@@ -1343,8 +1337,6 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     params.scale = _camera.scale;
     params.dsScale = _camera.dsScale;
     params.dsScaleIdx = _camera.dsScaleIdx;
-    params.dsScaleIdxFine = _camera.dsScaleIdxFine;
-    params.dsBlendFactor = _camera.dsBlendFactor;
     params.zOff = _camera.zOff;
 
     params.windowLow = _baseWindowLow;
@@ -1357,6 +1349,7 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     params.overlayWindowHigh = _overlayWindowHigh;
     params.overlayColormapId = _overlayColormapId;
     params.useFastInterpolation = _useFastInterpolation || interactionActive;
+    params.isPlaneSurface = dynamic_cast<PlaneSurface*>(_surfWeak.lock().get()) != nullptr;
     params.compositeSettings = _compositeSettings;
 
     return params;
@@ -1401,6 +1394,12 @@ cv::Vec2f CTiledVolumeViewer::sceneToSurfaceCoords(const QPointF& scenePos) cons
 void CTiledVolumeViewer::onCursorMove(QPointF scene_loc)
 {
     auto surf = _surfWeak.lock();
+    onCursorMoveImpl(scene_loc, surf);
+}
+
+void CTiledVolumeViewer::onCursorMoveImpl(QPointF scene_loc,
+                                           const std::shared_ptr<Surface>& surf)
+{
     if (!surf || !_state) return;
 
     auto updateCursorPoi = [this](const QPointF& cursorScenePos) {
@@ -1550,7 +1549,7 @@ void CTiledVolumeViewer::onMouseMove(QPointF scene_loc, Qt::MouseButtons buttons
                                       Qt::KeyboardModifiers modifiers)
 {
     auto surf = _surfWeak.lock();
-    onCursorMove(scene_loc);
+    onCursorMoveImpl(scene_loc, surf);
 
     if ((buttons & Qt::LeftButton) && _draggedPointId != 0) {
         cv::Vec3f p, n;
@@ -1576,7 +1575,7 @@ void CTiledVolumeViewer::onMouseRelease(QPointF scene_loc, Qt::MouseButton butto
     auto surf = _surfWeak.lock();
     if (button == Qt::LeftButton && _draggedPointId != 0) {
         _draggedPointId = 0;
-        onCursorMove(scene_loc);
+        onCursorMoveImpl(scene_loc, surf);
     }
 
     cv::Vec3f p, n;
@@ -1702,7 +1701,18 @@ void CTiledVolumeViewer::onPOIChanged(std::string name, POI* poi)
 void CTiledVolumeViewer::updateStatusLabel()
 {
     QString status = QString("%1x").arg(_camera.scale, 0, 'f', 2);
+
+    // Desired pyramid level
     status += QString(" 1:%1").arg(1 << _camera.dsScaleIdx);
+
+    // Actual worst level currently displayed (parenthesized when different)
+    if (_tileScene && fGraphicsView) {
+        QRectF vp = fGraphicsView->mapToScene(fGraphicsView->viewport()->rect()).boundingRect();
+        int actualWorst = _tileScene->worstVisibleLevel(vp);
+        if (actualWorst >= 0 && actualWorst != _camera.dsScaleIdx) {
+            status += QString("(1:%1)").arg(1 << actualWorst);
+        }
+    }
 
     status += QString(" z=%1").arg(_camera.zOff, 0, 'f', 1);
 
@@ -1892,6 +1902,7 @@ void CTiledVolumeViewer::setCompositeRenderSettings(const CompositeRenderSetting
 {
     if (_compositeSettings == settings) return;
     _compositeSettings = settings;
+    _compositeSettings.params.updateLightDir();
     updateParamsHash();
     // Params changed: clear cache and re-render
     auto surf = _surfWeak.lock();
@@ -2324,7 +2335,10 @@ void CTiledVolumeViewer::momentumTick()
         // Accumulate fractional zoom steps
         int zoomSteps = static_cast<int>(_momentumZoomV);
         if (zoomSteps != 0) {
-            zoomStepsAt(zoomSteps > 0 ? 1 : -1, _momentumZoomAnchor);
+            _momentumZoomV -= static_cast<float>(zoomSteps);
+            int dir = zoomSteps > 0 ? 1 : -1;
+            for (int i = 0; i < std::abs(zoomSteps); ++i)
+                zoomStepsAt(dir, _momentumZoomAnchor);
         }
         _momentumZoomV *= kDecay;
         anyActive = true;

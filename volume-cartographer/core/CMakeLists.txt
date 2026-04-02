@@ -14,6 +14,7 @@ add_library(vc_core
         src/Slicing.cpp
         src/Compositing.cpp
         src/PlaneSurface.cpp
+        src/Surface.cpp
         src/QuadSurface.cpp
         src/Render.cpp
         src/Tiff.cpp
@@ -27,6 +28,7 @@ add_library(vc_core
         src/cache/TieredChunkCache.cpp
         src/cache/VcDecompressor.cpp
         src/cache/SimpleCacheFactory.cpp
+        src/LoadJson.cpp
         src/RemoteUrl.cpp
         src/RemoteScroll.cpp
         src/PostProcess.cpp
@@ -45,7 +47,6 @@ target_link_libraries(vc_core
         opencv_calib3d
         opencv_video
         nlohmann_json::nlohmann_json
-        xtensor
         OpenMP::OpenMP_CXX
         TIFF::TIFF
         OpenABF
@@ -122,11 +123,6 @@ target_precompile_headers(vc_core PRIVATE
     <opencv2/imgcodecs.hpp>
     # Boost (used by CLI apps)
     <boost/program_options.hpp>
-    # xtensor (chunk buffer type - heavy templates)
-    <xtensor/containers/xarray.hpp>
-    <xtensor/containers/xadapt.hpp>
-    <xtensor/views/xview.hpp>
-    <xtensor/generators/xbuilder.hpp>
     # JSON (heavy templates, used in ~70 TUs)
     <nlohmann/json.hpp>
 )

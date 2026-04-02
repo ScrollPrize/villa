@@ -1,15 +1,16 @@
-# utils — header-only C++23 utility library (vendored)
+# utils — C++23 utility library (vendored)
 # Source: https://github.com/SuperOptimizer/utils
 
 find_package(nlohmann_json REQUIRED)
 
-add_library(utils INTERFACE)
-target_include_directories(utils INTERFACE
+add_library(utils STATIC src/zarr.cpp src/Json.cpp)
+target_include_directories(utils PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-target_compile_features(utils INTERFACE cxx_std_23)
-target_link_libraries(utils INTERFACE nlohmann_json::nlohmann_json)
+target_compile_features(utils PUBLIC cxx_std_23)
+target_link_libraries(utils PUBLIC nlohmann_json::nlohmann_json)
+set_target_properties(utils PROPERTIES AUTOMOC OFF AUTORCC OFF AUTOUIC OFF)
 
 # Individual header targets (for granular dependency management)
 set(UTILS_HEADERS
@@ -37,8 +38,8 @@ endforeach()
 # Optional: find curl for http_fetch.hpp
 find_package(CURL QUIET)
 if(CURL_FOUND)
-    target_link_libraries(utils INTERFACE CURL::libcurl)
-    target_compile_definitions(utils INTERFACE UTILS_HAS_CURL=1)
+    target_link_libraries(utils PUBLIC CURL::libcurl)
+    target_compile_definitions(utils PUBLIC UTILS_HAS_CURL=1)
     target_link_libraries(utils_http_fetch INTERFACE CURL::libcurl)
     target_link_libraries(utils_zarr INTERFACE CURL::libcurl)
 endif()
@@ -61,7 +62,7 @@ if(ZLIB_LIB)
     list(APPEND UTILS_COMPRESSION_LIBS ${ZLIB_LIB})
 endif()
 if(UTILS_COMPRESSION_LIBS)
-    target_link_libraries(utils INTERFACE ${UTILS_COMPRESSION_LIBS})
+    target_link_libraries(utils PUBLIC ${UTILS_COMPRESSION_LIBS})
     target_link_libraries(utils_zarr INTERFACE ${UTILS_COMPRESSION_LIBS})
     target_link_libraries(utils_compression INTERFACE ${UTILS_COMPRESSION_LIBS})
 endif()

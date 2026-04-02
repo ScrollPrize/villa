@@ -1,12 +1,12 @@
 #pragma once
 
-#include <xtensor/containers/xarray.hpp>
 #include <opencv2/core.hpp>
 #include <string>
 
 #include <vc/core/cache/TieredChunkCache.hpp>
 #include <vc/core/util/Compositing.hpp>
 #include <vc/core/types/Sampling.hpp>
+#include <vc/core/types/Array3D.hpp>
 
 // Forward declaration
 namespace vc { class VcDataset; }
@@ -20,8 +20,8 @@ void readInterpolated3D(cv::Mat_<uint8_t> &out, vc::cache::TieredChunkCache* cac
 void readInterpolated3D(cv::Mat_<uint16_t> &out, vc::cache::TieredChunkCache* cache, int level, const cv::Mat_<cv::Vec3f> &coords, vc::Sampling method);
 
 // Read a 3D area from a zarr dataset via TieredChunkCache
-void readArea3D(xt::xtensor<uint8_t,3,xt::layout_type::column_major> &out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level);
-void readArea3D(xt::xtensor<uint16_t,3,xt::layout_type::column_major> &out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level);
+void readArea3D(Array3D<uint8_t> &out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level);
+void readArea3D(Array3D<uint16_t> &out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level);
 
 // Composite rendering with configurable interpolation.
 void readCompositeFast(

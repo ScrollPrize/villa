@@ -5,14 +5,14 @@
 #include "vc/tracer/SurfaceModeling.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <omp.h>
 
 
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
 
 static inline float sdist(const cv::Vec3f &a, const cv::Vec3f &b)
@@ -346,8 +346,8 @@ int main(int argc, char *argv[])
         cv::Mat_<cv::Vec3f> points_hr = points_hr_grounding(wind_lr, points_lr, winds, surf_points, scale_factor);
         QuadSurface *surf_hr = new QuadSurface(points_hr, surfs[0]->_scale);
         std::filesystem::path tgt_dir = "./";
-        surf_hr->meta = std::make_unique<nlohmann::json>();
-        (*surf_hr->meta)["vc_tiffxyz_upscale_grounding_scale_factor"] = scale_factor;
+        surf_hr->meta = utils::Json::object();
+        surf_hr->meta["vc_tiffxyz_upscale_grounding_scale_factor"] = scale_factor;
         std::string name_prefix = "grounding_hr_";
         std::string uuid = name_prefix + time_str();
         std::filesystem::path seg_dir = tgt_dir / uuid;

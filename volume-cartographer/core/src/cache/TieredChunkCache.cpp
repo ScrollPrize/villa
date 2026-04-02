@@ -65,10 +65,11 @@ TieredChunkCache::TieredChunkCache(
     , source_(std::move(source))
     , decompress_(std::move(decompress))
     , ioPool_(config_.ioThreads, config_.ioQueueSize)
+    , prefetchPool_(config_.prefetchThreads, config_.ioQueueSize)
     , decompPool_(sharedDecompPool())
 {
-    // Wire up the IO pool: fetch = check cold first, then ice
-    ioPool_.setFetchFunc([this](const ChunkKey& key) -> std::vector<uint8_t> {
+    // Shared fetch function: check cold (disk) first, then ice (remote)
+    IOPool::FetchFunc fetchFunc = [this](const ChunkKey& key) -> std::vector<uint8_t> {
         using Clock = std::chrono::steady_clock;
         auto t0 = Clock::now();
 
@@ -164,12 +165,12 @@ TieredChunkCache::TieredChunkCache(
                          key.level, key.iz, key.iy, key.ix, data.size(), fetchMs, totalMs);
 
         return data;
-    });
+    };
 
-    // Wire up IO completion: compressed bytes → warm, then hand off
+    // Shared completion callback: compressed bytes -> warm, then hand off
     // decompression to the dedicated decompression pool so I/O threads
     // stay free to fetch more chunks.
-    ioPool_.setCompletionCallback(
+    IOPool::CompletionCallback completionCb =
         [this](const ChunkKey& key, std::vector<uint8_t>&& compressed) {
             if (compressed.empty()) {
                 // Empty fetch result: negative cache (chunk doesn't exist)
@@ -234,20 +235,28 @@ TieredChunkCache::TieredChunkCache(
                     }
                 }
             });
-        });
+        };
+
+    // Wire up both pools with the same fetch and completion logic
+    ioPool_.setFetchFunc(fetchFunc);
+    ioPool_.setCompletionCallback(completionCb);
+    prefetchPool_.setFetchFunc(fetchFunc);
+    prefetchPool_.setCompletionCallback(std::move(completionCb));
 
     // Start IO workers after callbacks are set to avoid data races.
     ioPool_.start();
+    prefetchPool_.start();
 
     loadNegativeCache();
 }
 
 TieredChunkCache::~TieredChunkCache()
 {
+    prefetchPool_.stop();
     ioPool_.stop();
     // Wait for any in-flight decompression tasks from this cache before
     // tearing down.  The pool is shared, so we just wait for idle (which
-    // covers our tasks since the IO pool — our only producer — is stopped).
+    // covers our tasks since both IO pools — our only producers — are stopped).
     if (decompPool_) decompPool_->wait_idle();
 
     // Print final fetch stats summary
@@ -498,16 +507,16 @@ void TieredChunkCache::prefetchLevel(int level, PrefetchProgressCb progressCb)
                 }
 
                 if (batch.size() >= BATCH_SIZE) {
-                    ioPool_.submitBackground(batch);
+                    prefetchPool_.submitBackground(batch);
                     submitted += static_cast<int>(batch.size());
                     batch.clear();
 
                     if (progressCb)
                         progressCb(submitted, total);
 
-                    // Wait for queue to drain below half capacity before
-                    // submitting the next batch.
-                    while (ioPool_.pendingCount() > config_.ioQueueSize / 2) {
+                    // Wait for prefetch queue to drain below half capacity
+                    // before submitting the next batch.
+                    while (prefetchPool_.pendingCount() > config_.ioQueueSize / 2) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     }
                 }
@@ -517,17 +526,33 @@ void TieredChunkCache::prefetchLevel(int level, PrefetchProgressCb progressCb)
 
     // Submit remainder
     if (!batch.empty()) {
-        ioPool_.submitBackground(batch);
+        prefetchPool_.submitBackground(batch);
         submitted += static_cast<int>(batch.size());
     }
 
     if (progressCb)
         progressCb(submitted, total);
+
+    // Wait for prefetch pool to drain completely before marking level done
+    while (prefetchPool_.pendingCount() > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    {
+        std::lock_guard<std::mutex> lock(completedLevelsMutex_);
+        completedLevels_.insert(level);
+    }
+}
+
+bool TieredChunkCache::isLevelComplete(int level) const
+{
+    std::lock_guard<std::mutex> lock(completedLevelsMutex_);
+    return completedLevels_.count(level) > 0;
 }
 
 void TieredChunkCache::cancelPendingPrefetch()
 {
     ioPool_.cancelPending();
+    prefetchPool_.cancelPending();
 }
 
 void TieredChunkCache::setIOEpoch(uint64_t epoch)
@@ -602,6 +627,7 @@ void TieredChunkCache::clearMemory()
 void TieredChunkCache::clearAll()
 {
     ioPool_.cancelPending();
+    prefetchPool_.cancelPending();
     clearMemory();
     bloomClear();
     {
@@ -732,6 +758,7 @@ auto TieredChunkCache::stats() const -> Stats
     s.hotBytes = hotCache_.byte_size();
     s.warmBytes = warmCache_.byte_size();
     s.ioPending = ioPool_.pendingCount();
+    s.prefetchPending = prefetchPool_.pendingCount();
     if (diskStore_) {
         s.diskFiles = diskStore_->fileCount();
         s.diskBytes = diskStore_->totalBytes();

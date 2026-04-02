@@ -245,6 +245,9 @@ signals:
     void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
 
 private:
+    // onCursorMove implementation with pre-locked surface to avoid redundant locks
+    void onCursorMoveImpl(QPointF scene_loc, const std::shared_ptr<Surface>& surf);
+
     // Core intersection rendering (bypasses throttle)
     void renderIntersectionsCore();
 

@@ -6,11 +6,10 @@
 #include <vc/ui/VCCollection.hpp>
 #include <vc/core/util/GridStore.hpp>
 #include "vc/core/types/VcDataset.hpp"
+#include "vc/core/util/Slicing.hpp"
 
 #include <boost/program_options.hpp>
 #include <opencv2/imgcodecs.hpp>
-#include <xtensor/containers/xtensor.hpp>
-#include <xtensor/generators/xbuilder.hpp>
 
 namespace po = boost::program_options;
 namespace fs = std::filesystem;
@@ -139,8 +138,7 @@ int continuous3d_main(const po::variables_map& vm) {
         static_cast<int>(std::round((*target_point)[0])) - box_w / 2
     };
 
-    std::vector<size_t> slice_shape = {(size_t)box_d, (size_t)box_h, (size_t)box_w};
-    xt::xtensor<uint8_t, 3, xt::layout_type::column_major> slice_data = xt::zeros<uint8_t>(slice_shape);
+    Array3D<uint8_t> slice_data({(size_t)box_d, (size_t)box_h, (size_t)box_w});
 
     auto cache = vc::cache::createSimpleTieredCache(ds.get(), 4llu*1024*1024*1024, ds->path());
     readArea3D(slice_data, offset, cache.get(), 0);

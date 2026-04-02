@@ -1,9 +1,10 @@
+#include <iostream>
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -11,7 +12,7 @@
 
 
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
 static inline cv::Vec2f mul(const cv::Vec2f &a, const cv::Vec2f &b)
 {

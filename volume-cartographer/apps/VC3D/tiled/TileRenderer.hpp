@@ -35,8 +35,6 @@ struct TileRenderParams {
     float scale = 1.0f;       // user zoom level
     float dsScale = 1.0f;     // pyramid downscale factor at dsScaleIdx
     int dsScaleIdx = 0;       // pyramid level index (0 = finest)
-    int dsScaleIdxFine = 0;   // adjacent pyramid level for blending
-    float dsBlendFactor = 0.0f; // 0.0 = fully dsScaleIdx, 1.0 = fully dsScaleIdxFine
     float zOff = 0.0f;        // Z-axis slice offset
 
     // --- Render settings ---
@@ -50,6 +48,7 @@ struct TileRenderParams {
     float overlayWindowHigh = 255.0f;   // overlay window high
     std::string overlayColormapId;      // overlay colormap identifier
     bool useFastInterpolation = false;  // nearest-neighbor instead of trilinear
+    bool isPlaneSurface = false;        // pre-computed: surface is PlaneSurface (avoids RTTI)
     CompositeRenderSettings compositeSettings;  // multi-layer composite params
 
     // --- Pool scheduling ---

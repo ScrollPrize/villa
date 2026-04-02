@@ -2,6 +2,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/ui/VCCollection.hpp"
+#include "utils/Json.hpp"
 
 namespace vc { class VcDataset; }
 namespace vc::cache { class TieredChunkCache; }
@@ -25,5 +26,5 @@ struct DirectionField
     float weight{1.0f};
 };
 
-QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const nlohmann::json &params, float voxelsize = 1.0);
-QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache *cache, int level, cv::Vec3f origin, const nlohmann::json &params, const std::string &cache_root = "", float voxelsize = 1.0, const std::vector<DirectionField> &direction_fields = {}, QuadSurface* resume_surf = nullptr, const std::filesystem::path& tgt_path = "", const nlohmann::json& meta_params = {}, const VCCollection &corrections = VCCollection());
+QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const utils::Json &params, float voxelsize = 1.0);
+QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root = "", float voxelsize = 1.0, const std::vector<DirectionField> &direction_fields = {}, QuadSurface* resume_surf = nullptr, const std::filesystem::path& tgt_path = "", const utils::Json& meta_params = {}, const VCCollection &corrections = VCCollection());

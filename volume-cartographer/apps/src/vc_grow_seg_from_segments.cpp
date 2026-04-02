@@ -1,7 +1,5 @@
-#include <nlohmann/json.hpp>
-
-#include <xtensor/io/xio.hpp>
-#include <xtensor/views/xview.hpp>
+#include <iostream>
+#include "utils/Json.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
 
@@ -19,12 +17,11 @@
 
 
 using shape = std::vector<size_t>;
-using namespace xt::placeholders;
 
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
-static void add_target_context(json& meta, const std::filesystem::path& volume_path)
+static void add_target_context(utils::Json& meta, const std::filesystem::path& volume_path)
 {
     std::filesystem::path normalized_volume_path = volume_path.lexically_normal();
     if (normalized_volume_path.filename().empty()) {
@@ -48,9 +45,9 @@ static void add_target_context(json& meta, const std::filesystem::path& volume_p
     std::error_code ec;
     if (std::filesystem::is_regular_file(config_path, ec)) {
         try {
-            auto cfg = json::parse(std::ifstream(config_path));
+            auto cfg = utils::Json::parse_file(config_path);
             if (cfg.contains("name") && cfg["name"].is_string()) {
-                scroll_name = cfg["name"].get<std::string>();
+                scroll_name = cfg["name"].get_string();
             }
         } catch (...) {
             // Keep folder-based fallback if config.json cannot be parsed.
@@ -81,7 +78,7 @@ int main(int argc, char *argv[])
         src_path = src_path.parent_path();
 
     std::ifstream params_f(params_path);
-    json params = json::parse(params_f);
+    Json params = Json::parse_file(params_path);
     // Honor optional CUDA toggle from params (default true)
     if (params.contains("use_cuda")) {
         set_space_tracing_use_cuda(params.value("use_cuda", true));
@@ -95,7 +92,7 @@ int main(int argc, char *argv[])
     std::cout << "zarr dataset size for scale group 0 " << ds->shape() << std::endl;
     std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
 
-    float voxelsize = json::parse(std::ifstream(vol_path/"meta.json"))["voxelsize"];
+    float voxelsize = Json::parse_file(vol_path/"meta.json")["voxelsize"].get_float();
 
     std::string name_prefix = "auto_grown_";
     std::vector<QuadSurface*> surfaces;
@@ -106,13 +103,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    std::ifstream meta_f(meta_fn);
-    if (!meta_f.is_open() || !meta_f.good()) {
-        std::cerr << "Error: Could not open " << meta_fn << std::endl;
-        return EXIT_FAILURE;
-    }
-
-    json meta = json::parse(meta_f);
+    utils::Json meta = utils::Json::parse_file(meta_fn);
     QuadSurface *src = new QuadSurface(src_path, meta);
     src->readOverlappingJson();
 
@@ -126,13 +117,12 @@ int main(int argc, char *argv[])
             if (!std::filesystem::exists(meta_fn))
                 continue;
 
-            std::ifstream meta_f(meta_fn);
-            json meta = json::parse(meta_f);
+            utils::Json meta = utils::Json::parse_file(meta_fn);
 
             if (!meta.count("bbox"))
                 continue;
 
-            if (meta.value("format","NONE") != "tifxyz")
+            if (meta.value("format", std::string{"NONE"}) != "tifxyz")
                 continue;
 
             QuadSurface *sm;
@@ -151,9 +141,9 @@ int main(int argc, char *argv[])
     if (!surf)
         return EXIT_SUCCESS;
 
-    (*surf->meta)["source"] = "vc_grow_seg_from_segments";
-    (*surf->meta)["vc_grow_seg_from_segments_params"] = params;
-    add_target_context(*surf->meta, vol_path);
+    surf->meta["source"] = "vc_grow_seg_from_segments";
+    surf->meta["vc_grow_seg_from_segments_params"] = utils::Json::parse(params.dump());
+    add_target_context(surf->meta, vol_path);
     std::string uuid = "auto_trace_" + get_surface_time_str();;
     std::filesystem::path seg_dir = tgt_dir / uuid;
     surf->save(seg_dir, uuid);

@@ -14,7 +14,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <algorithm>
 #include <array>
@@ -605,16 +605,12 @@ static std::optional<std::size_t> memAvailableBytes()
 #endif
 }
 
-static nlohmann::json readJsonFile(const fs::path& path)
+static utils::Json readJsonFile(const fs::path& path)
 {
-    std::ifstream in(path);
-    if (!in) {
-        throw std::runtime_error("failed to open json file: " + path.string());
-    }
-    return nlohmann::json::parse(in);
+    return utils::Json::parse_file(path);
 }
 
-static void writeJsonFile(const fs::path& path, const nlohmann::json& j)
+static void writeJsonFile(const fs::path& path, const utils::Json& j)
 {
     std::ofstream out(path);
     if (!out) {
@@ -1930,7 +1926,7 @@ static void rewriteOutputFillValue(const fs::path& outputRoot,
 {
     for (int level : levels) {
         const fs::path zarrayPath = outputRoot / std::to_string(level) / ".zarray";
-        nlohmann::json zarray = readJsonFile(zarrayPath);
+        utils::Json zarray = readJsonFile(zarrayPath);
         zarray["fill_value"] = static_cast<int>(fillValue);
         writeJsonFile(zarrayPath, zarray);
     }
@@ -2818,7 +2814,7 @@ static std::vector<ChunkIndex> collectActiveComputeChunks(
     return out;
 }
 
-static bool valueIsRasterized(const nlohmann::json& meta)
+static bool valueIsRasterized(const utils::Json& meta)
 {
     if (!meta.contains("label_volume")) {
         return false;
@@ -2826,7 +2822,7 @@ static bool valueIsRasterized(const nlohmann::json& meta)
     if (!meta["label_volume"].is_string()) {
         return false;
     }
-    return meta["label_volume"].get<std::string>() == "rasterized";
+    return meta["label_volume"].get_string() == "rasterized";
 }
 
 static void validateInputMetadata(const fs::path& inputRoot)
@@ -2844,23 +2840,23 @@ static void validateInputMetadata(const fs::path& inputRoot)
 
 static void writeOutputMetadata(const Config& cfg,
                                 const Shape3& shape0,
-                                const nlohmann::json& inputMeta,
+                                const utils::Json& inputMeta,
                                 const ProcessingStats& stats)
 {
-    nlohmann::json meta = inputMeta;
+    utils::Json meta = inputMeta;
 
     const std::string uuid = cfg.outputRoot.filename().string();
     meta["type"] = "vol";
     meta["uuid"] = uuid;
     meta["name"] = uuid;
-    meta["width"] = static_cast<long long>(shape0[2]);
-    meta["height"] = static_cast<long long>(shape0[1]);
-    meta["slices"] = static_cast<long long>(shape0[0]);
+    meta["width"] = static_cast<int64_t>(shape0[2]);
+    meta["height"] = static_cast<int64_t>(shape0[1]);
+    meta["slices"] = static_cast<int64_t>(shape0[0]);
     meta["format"] = "zarr";
     meta["min"] = 0.0;
     double maxValue = static_cast<double>(std::max(1, cfg.ignoreValue));
     if (meta.contains("max") && meta["max"].is_number()) {
-        maxValue = std::max(maxValue, meta["max"].get<double>());
+        maxValue = std::max(maxValue, meta["max"].get_double());
     }
     meta["max"] = maxValue;
     meta["label_volume"] = "rasterized";
@@ -2886,12 +2882,12 @@ static void writeOutputMetadata(const Config& cfg,
         {"reuse_output_tree", stats.reuseOutputTree},
         {"result_mode", stats.resultMode},
         {"cache_mode", stats.cacheMode},
-        {"cache_budget_bytes", static_cast<long long>(stats.cacheBudgetBytes)},
-        {"available_ram_bytes", static_cast<long long>(stats.availableRamBytes)},
-        {"preloaded_compute_bytes", static_cast<long long>(stats.preloadedComputeBytes)},
-        {"preloaded_compute_slices", static_cast<long long>(stats.preloadedComputeSlices)},
-        {"skipped_missing_chunks_level0", static_cast<long long>(stats.skippedMissingLevel0)},
-        {"skipped_missing_chunks_pyramid", static_cast<long long>(stats.skippedMissingPyramid)},
+        {"cache_budget_bytes", static_cast<int64_t>(stats.cacheBudgetBytes)},
+        {"available_ram_bytes", static_cast<int64_t>(stats.availableRamBytes)},
+        {"preloaded_compute_bytes", static_cast<int64_t>(stats.preloadedComputeBytes)},
+        {"preloaded_compute_slices", static_cast<int64_t>(stats.preloadedComputeSlices)},
+        {"skipped_missing_chunks_level0", static_cast<int64_t>(stats.skippedMissingLevel0)},
+        {"skipped_missing_chunks_pyramid", static_cast<int64_t>(stats.skippedMissingPyramid)},
         {"skip_outer", cfg.skipOuter},
         {"skip_inner", cfg.skipInner},
         {"z_min", cfg.zMin},
@@ -2907,10 +2903,10 @@ static void writeProfileJson(const fs::path& path,
                             const ProfileStats& profile,
                             const std::size_t totalWorkItems)
 {
-    nlohmann::json j;
+    utils::Json j;
     j["input"] = cfg.inputRoot.string();
     j["output"] = cfg.outputRoot.string();
-    j["workers"] = static_cast<long long>(cfg.workers);
+    j["workers"] = static_cast<int64_t>(cfg.workers);
     j["mode"] = processingModeToString(cfg.mode);
     j["compute_level"] = cfg.computeLevel;
     j["output_level"] = cfg.outputLevel;
@@ -2927,31 +2923,31 @@ static void writeProfileJson(const fs::path& path,
     j["z_min"] = cfg.zMin;
     j["z_max"] = cfg.zMax;
     if (cfg.mode == ProcessingMode::chunkAlphaWrap) {
-        j["chunk_total"] = static_cast<long long>(totalWorkItems);
+        j["chunk_total"] = static_cast<int64_t>(totalWorkItems);
     } else {
-        j["slice_total"] = static_cast<long long>(totalWorkItems);
+        j["slice_total"] = static_cast<int64_t>(totalWorkItems);
     }
-    j["slices_total"] = static_cast<long long>(profile.slicesTotal);
-    j["slices_skipped_empty"] = static_cast<long long>(profile.slicesSkippedEmpty);
-    j["slices_nonzero_fg"] = static_cast<long long>(profile.nonzeroFgSlices);
-    j["compute_chunks_total"] = static_cast<long long>(profile.computeChunksTotal);
-    j["compute_chunks_skipped_empty"] = static_cast<long long>(profile.computeChunksSkippedEmpty);
-    j["compute_chunks_wrapped"] = static_cast<long long>(profile.computeChunksWrapped);
-    j["fg_pixels"] = static_cast<long long>(profile.fgPixels);
-    j["mask_pixels"] = static_cast<long long>(profile.maskPixels);
-    j["touched_chunks_level0"] = static_cast<long long>(profile.touchedChunksLevel0);
-    j["chunk_cache_hits"] = static_cast<long long>(profile.chunkCacheHits);
-    j["chunk_cache_misses"] = static_cast<long long>(profile.chunkCacheMisses);
-    j["chunk_io_reads"] = static_cast<long long>(profile.chunkIoReads);
-    j["chunk_io_writes"] = static_cast<long long>(profile.chunkIoWrites);
-    j["bytes_read"] = static_cast<long long>(profile.bytesRead);
-    j["bytes_written"] = static_cast<long long>(profile.bytesWritten);
-    j["pyramid_read_calls"] = static_cast<long long>(profile.pyramidReadCalls);
-    j["pyramid_write_calls"] = static_cast<long long>(profile.pyramidWriteCalls);
-    j["total_chunks_in_masks"] = static_cast<long long>(profile.totalChunksInMasks);
-    j["skipped_missing_level0"] = static_cast<long long>(profile.skippedMissingLevel0);
-    j["skipped_missing_pyramid"] = static_cast<long long>(profile.skippedMissingPyramid);
-    j["input_voxels"] = static_cast<long long>(profile.inputVoxels);
+    j["slices_total"] = static_cast<int64_t>(profile.slicesTotal);
+    j["slices_skipped_empty"] = static_cast<int64_t>(profile.slicesSkippedEmpty);
+    j["slices_nonzero_fg"] = static_cast<int64_t>(profile.nonzeroFgSlices);
+    j["compute_chunks_total"] = static_cast<int64_t>(profile.computeChunksTotal);
+    j["compute_chunks_skipped_empty"] = static_cast<int64_t>(profile.computeChunksSkippedEmpty);
+    j["compute_chunks_wrapped"] = static_cast<int64_t>(profile.computeChunksWrapped);
+    j["fg_pixels"] = static_cast<int64_t>(profile.fgPixels);
+    j["mask_pixels"] = static_cast<int64_t>(profile.maskPixels);
+    j["touched_chunks_level0"] = static_cast<int64_t>(profile.touchedChunksLevel0);
+    j["chunk_cache_hits"] = static_cast<int64_t>(profile.chunkCacheHits);
+    j["chunk_cache_misses"] = static_cast<int64_t>(profile.chunkCacheMisses);
+    j["chunk_io_reads"] = static_cast<int64_t>(profile.chunkIoReads);
+    j["chunk_io_writes"] = static_cast<int64_t>(profile.chunkIoWrites);
+    j["bytes_read"] = static_cast<int64_t>(profile.bytesRead);
+    j["bytes_written"] = static_cast<int64_t>(profile.bytesWritten);
+    j["pyramid_read_calls"] = static_cast<int64_t>(profile.pyramidReadCalls);
+    j["pyramid_write_calls"] = static_cast<int64_t>(profile.pyramidWriteCalls);
+    j["total_chunks_in_masks"] = static_cast<int64_t>(profile.totalChunksInMasks);
+    j["skipped_missing_level0"] = static_cast<int64_t>(profile.skippedMissingLevel0);
+    j["skipped_missing_pyramid"] = static_cast<int64_t>(profile.skippedMissingPyramid);
+    j["input_voxels"] = static_cast<int64_t>(profile.inputVoxels);
     j["timing_sec"] = {
         {"slice_load", profile.tSliceLoad.seconds()},
         {"mask_build", profile.tMaskBuild.seconds()},
@@ -2982,7 +2978,7 @@ static void writeProfileJson(const fs::path& path,
 static int processChunkAlphaWrap(
     const Config& cfg,
     const std::vector<int>& levels,
-    const nlohmann::json& inputMeta,
+    const utils::Json& inputMeta,
     const std::unordered_map<int, std::unordered_set<ChunkIndex, ChunkIndexHash>>& existingByLevel,
     bool reuseOutputTree,
     double copyStageSeconds,
@@ -3968,7 +3964,7 @@ static int process(const Config& cfg)
         ? static_cast<std::size_t>(cfg.workers)
         : static_cast<std::size_t>(std::max(1u, std::thread::hardware_concurrency()));
 
-    const nlohmann::json inputMeta = readJsonFile(cfg.inputRoot / "meta.json");
+    const utils::Json inputMeta = readJsonFile(cfg.inputRoot / "meta.json");
     for (int level : levels) {
         vc::VcDataset inLevel(cfg.inputRoot / std::to_string(level));
         if (inLevel.getDtype() != vc::VcDtype::uint8) {

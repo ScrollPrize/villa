@@ -15,8 +15,8 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 
-#include <fstream>
-#include <nlohmann/json.hpp>
+#include <filesystem>
+#include "utils/Json.hpp"
 
 #include "vc/ui/VCCollection.hpp"
 
@@ -769,39 +769,44 @@ void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& 
     }
 
     try {
-        std::ifstream ifs(jsonPath);
-        if (!ifs.is_open()) {
+        if (!std::filesystem::exists(jsonPath)) {
             refreshTree();
             return;
         }
-        nlohmann::json j = nlohmann::json::parse(ifs);
+        utils::Json j = utils::Json::parse_file(jsonPath);
 
         if (j.contains("points") && j["points"].is_object()) {
-            for (auto& [key, val] : j["points"].items()) {
+            const auto& points = j["points"];
+            for (auto it = points.begin(); it != points.end(); ++it) {
+                const std::string key = it.key();
+                const auto& val = *it;
                 uint64_t pid = 0;
                 try { pid = std::stoull(key); } catch (...) { continue; }
                 CorrPointResult r;
                 if (val.contains("winding_obs") && val["winding_obs"].is_number()) {
-                    r.winding_obs = val["winding_obs"].get<float>();
+                    r.winding_obs = val["winding_obs"].get_float();
                 }
                 if (val.contains("winding_err") && val["winding_err"].is_number()) {
-                    r.winding_err = val["winding_err"].get<float>();
+                    r.winding_err = val["winding_err"].get_float();
                 }
                 if (val.contains("p") && val["p"].is_array() && val["p"].size() >= 3) {
-                    r.p[0] = val["p"][0].get<float>();
-                    r.p[1] = val["p"][1].get<float>();
-                    r.p[2] = val["p"][2].get<float>();
+                    r.p[0] = val["p"][0].get_float();
+                    r.p[1] = val["p"][1].get_float();
+                    r.p[2] = val["p"][2].get_float();
                 }
                 _corr_point_results[pid] = r;
             }
         }
 
         if (j.contains("collection_avgs") && j["collection_avgs"].is_object()) {
-            for (auto& [key, val] : j["collection_avgs"].items()) {
+            const auto& avgs = j["collection_avgs"];
+            for (auto it = avgs.begin(); it != avgs.end(); ++it) {
+                const std::string key = it.key();
+                const auto& val = *it;
                 uint64_t cid = 0;
                 try { cid = std::stoull(key); } catch (...) { continue; }
                 if (val.is_number()) {
-                    _corr_collection_avgs[cid] = val.get<float>();
+                    _corr_collection_avgs[cid] = val.get_float();
                 }
             }
         }

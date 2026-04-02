@@ -191,8 +191,12 @@ auto video_decode(
             const uint8_t* yPlane = de265_get_image_plane(img, 0, &stride);
             if (!yPlane) continue;
             auto* dst = reinterpret_cast<uint8_t*>(output.data()) + framesDecoded * Y * X;
-            for (int y = 0; y < Y; ++y)
-                std::memcpy(dst + y * X, yPlane + y * stride, X);
+            if (stride == X) {
+                std::memcpy(dst, yPlane, static_cast<size_t>(Y) * X);
+            } else {
+                for (int y = 0; y < Y; ++y)
+                    std::memcpy(dst + y * X, yPlane + y * stride, X);
+            }
             ++framesDecoded;
         }
     };

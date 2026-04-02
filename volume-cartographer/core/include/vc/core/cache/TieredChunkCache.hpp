@@ -54,6 +54,7 @@ public:
         std::string volumeId;                // for disk store keying
         int ioThreads = 8;
         size_t ioQueueSize = 50000;  // max pending IO tasks
+        int prefetchThreads = 2;     // dedicated threads for level prefetch
 
         // Optional: recompress chunks before storing to disk cache.
         // When set, chunks fetched from remote are decompressed first
@@ -112,6 +113,9 @@ public:
     // background thread if provided.
     using PrefetchProgressCb = std::function<void(int fetched, int total)>;
     void prefetchLevel(int level, PrefetchProgressCb progressCb = nullptr);
+
+    // Check if an entire level has been fully prefetched
+    [[nodiscard]] bool isLevelComplete(int level) const;
 
     // Cancel all pending (not in-flight) prefetch tasks.
     void cancelPendingPrefetch();
@@ -204,7 +208,8 @@ public:
         uint64_t warmEvictions = 0;
         size_t hotBytes = 0;
         size_t warmBytes = 0;
-        size_t ioPending = 0;   // pending + in-flight IO tasks
+        size_t ioPending = 0;       // pending + in-flight IO tasks
+        size_t prefetchPending = 0; // pending + in-flight prefetch tasks
         size_t diskFiles = 0;   // total chunk files on disk (all sessions)
         size_t diskBytes = 0;   // total bytes on disk
         uint64_t diskWrites = 0; // disk writes this session
@@ -242,6 +247,13 @@ private:
 
     // --- I/O pool ---
     IOPool ioPool_;
+
+    // --- Dedicated pool for level prefetch (doesn't compete with interactive) ---
+    IOPool prefetchPool_;
+
+    // --- Tracks which levels have been fully prefetched (persists for session) ---
+    mutable std::mutex completedLevelsMutex_;
+    std::unordered_set<int> completedLevels_;
 
     // --- Decompression pool (shared across all caches to cap total threads) ---
     std::shared_ptr<utils::ThreadPool> decompPool_;

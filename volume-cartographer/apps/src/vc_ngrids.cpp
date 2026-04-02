@@ -15,7 +15,7 @@
 #include <unordered_set>
 
 #include <boost/program_options.hpp>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include <opencv2/core/types.hpp>
 #include <opencv2/imgcodecs.hpp>
 
@@ -36,9 +36,9 @@ namespace po = boost::program_options;
 
 namespace {
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
-static void write_metrics_json(const fs::path& path, const json& metrics) {
+static void write_metrics_json(const fs::path& path, const Json& metrics) {
     std::ofstream out(path);
     if (!out) {
         throw std::runtime_error("Failed to open metrics json for writing: " + path.string());
@@ -985,8 +985,8 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
     {
         const fs::path zarray_path = zarr_root / "x" / "0" / ".zarray";
         if (fs::exists(zarray_path)) {
-            nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
-            delim = j.value<std::string>("dimension_separator", ".");
+            utils::Json j = utils::Json::parse_file(zarray_path);
+            delim = j.value("dimension_separator", std::string("."));
         }
     }
 
@@ -995,12 +995,12 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
     int step = 1;
     {
         try {
-            nlohmann::json attrs = vc::readZarrAttributes(zarr_root);
+            utils::Json attrs = vc::readZarrAttributes(zarr_root);
             if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
-                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
+                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get_int(), attrs["grid_origin_xyz"][1].get_int(), attrs["grid_origin_xyz"][2].get_int());
             }
             if (attrs.contains("sample_step")) {
-                step = std::max(1, attrs["sample_step"].get<int>());
+                step = std::max(1, attrs["sample_step"].get_int());
             }
         } catch (...) {
             // Attributes are optional; keep defaults.
@@ -1101,8 +1101,8 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
     {
         const fs::path zarray_path = zarr_root / "x" / "0" / ".zarray";
         if (fs::exists(zarray_path)) {
-            nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
-            delim = j.value<std::string>("dimension_separator", ".");
+            utils::Json j = utils::Json::parse_file(zarray_path);
+            delim = j.value("dimension_separator", std::string("."));
         }
     }
 
@@ -1111,12 +1111,12 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
     int step = 1;
     {
         try {
-            nlohmann::json attrs = vc::readZarrAttributes(zarr_root);
+            utils::Json attrs = vc::readZarrAttributes(zarr_root);
             if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
-                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
+                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get_int(), attrs["grid_origin_xyz"][1].get_int(), attrs["grid_origin_xyz"][2].get_int());
             }
             if (attrs.contains("sample_step")) {
-                step = std::max(1, attrs["sample_step"].get<int>());
+                step = std::max(1, attrs["sample_step"].get_int());
             }
         } catch (...) {
             // optional
@@ -1364,7 +1364,7 @@ static void run_align_normals_zarr(
     int candidate_samples_per_iter = 100,
     const std::optional<fs::path>& metrics_json_path = std::nullopt) {
     const auto total_start = std::chrono::steady_clock::now();
-    json metrics;
+    Json metrics;
     metrics["mode"] = "align-normals";
     metrics["input"] = zarr_root.string();
     metrics["output"] = out_zarr.string();
@@ -1378,8 +1378,8 @@ static void run_align_normals_zarr(
     {
         const fs::path zarray_path = zarr_root / "x" / "0" / ".zarray";
         if (fs::exists(zarray_path)) {
-            nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
-            delim = j.value<std::string>("dimension_separator", ".");
+            utils::Json j = utils::Json::parse_file(zarray_path);
+            delim = j.value("dimension_separator", std::string("."));
         }
     }
 
@@ -1388,12 +1388,12 @@ static void run_align_normals_zarr(
     int step = 1;
     {
         try {
-            nlohmann::json attrs = vc::readZarrAttributes(zarr_root);
+            utils::Json attrs = vc::readZarrAttributes(zarr_root);
             if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
-                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
+                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get_int(), attrs["grid_origin_xyz"][1].get_int(), attrs["grid_origin_xyz"][2].get_int());
             }
             if (attrs.contains("sample_step")) {
-                step = std::max(1, attrs["sample_step"].get<int>());
+                step = std::max(1, attrs["sample_step"].get_int());
             }
         } catch (...) {
             // attrs optional.
@@ -1424,11 +1424,11 @@ static void run_align_normals_zarr(
         if (!fs::exists(zarray_path)) {
             throw std::runtime_error(std::string("Missing ") + axis + "/0/.zarray under normals zarr root: " + zarr_root.string());
         }
-        nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
+        utils::Json j = utils::Json::parse_file(zarray_path);
         if (!j.contains("fill_value")) {
             throw std::runtime_error(std::string("Missing fill_value in ") + axis + "/0/.zarray under normals zarr root: " + zarr_root.string());
         }
-        const int fv = j["fill_value"].get<int>();
+        const int fv = j["fill_value"].get_int();
         if (fv != 128) {
             std::stringstream msg;
             msg << "Normals zarr has unexpected fill_value=" << fv
@@ -1821,30 +1821,48 @@ static void run_align_normals_zarr(
     writeZarrRegionU8ByChunk(out_dsz.get(), cropOff, cropShape, az.data(), 128);
 
     // Minimal attrs on root.
-    nlohmann::json attrs;
+    utils::Json attrs;
     attrs["source"] = "vc_ngrids";
     attrs["note_axes_order"] = "ZYX";
     attrs["encoding"] = "uint8_dir";
     attrs["decode"] = "(v-128)/127";
-    attrs["grid_origin_xyz"] = {origin_xyz[0], origin_xyz[1], origin_xyz[2]};
+    {
+        auto mk3 = [](auto a, auto b, auto c) {
+            utils::Json arr = utils::Json::array();
+            arr.push_back(static_cast<int64_t>(a));
+            arr.push_back(static_cast<int64_t>(b));
+            arr.push_back(static_cast<int64_t>(c));
+            return arr;
+        };
+        attrs["grid_origin_xyz"] = mk3(origin_xyz[0], origin_xyz[1], origin_xyz[2]);
+        attrs["crop_min_xyz"] = mk3(crop_xyz.min[0], crop_xyz.min[1], crop_xyz.min[2]);
+        attrs["crop_max_xyz"] = mk3(crop_xyz.max[0], crop_xyz.max[1], crop_xyz.max[2]);
+        attrs["crop_off_zyx"] = mk3(crop_zyx.off[0], crop_zyx.off[1], crop_zyx.off[2]);
+        attrs["crop_shape_zyx"] = mk3(crop_zyx.shape[0], crop_zyx.shape[1], crop_zyx.shape[2]);
+    }
     attrs["sample_step"] = step;
     attrs["align_normals"] = true;
     attrs["align_seed_samples"] = seed_samples;
     attrs["align_radius_step_units"] = radius;
     attrs["align_candidate_samples_per_iter"] = candidate_samples_per_iter;
-    attrs["crop_min_xyz"] = {crop_xyz.min[0], crop_xyz.min[1], crop_xyz.min[2]};
-    attrs["crop_max_xyz"] = {crop_xyz.max[0], crop_xyz.max[1], crop_xyz.max[2]};
-    attrs["crop_off_zyx"] = {crop_zyx.off[0], crop_zyx.off[1], crop_zyx.off[2]};
-    attrs["crop_shape_zyx"] = {crop_zyx.shape[0], crop_zyx.shape[1], crop_zyx.shape[2]};
     vc::writeZarrAttributes(out_zarr, attrs);
 
     metrics["write_seconds"] = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - write_start).count();
     metrics["total_seconds"] = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - total_start).count();
-    metrics["full_shape_zyx"] = {full_shape[0], full_shape[1], full_shape[2]};
-    metrics["crop_off_zyx"] = {crop_zyx.off[0], crop_zyx.off[1], crop_zyx.off[2]};
-    metrics["crop_shape_zyx"] = {crop_zyx.shape[0], crop_zyx.shape[1], crop_zyx.shape[2]};
+    {
+        auto mk3 = [](auto a, auto b, auto c) {
+            utils::Json arr = utils::Json::array();
+            arr.push_back(static_cast<int64_t>(a));
+            arr.push_back(static_cast<int64_t>(b));
+            arr.push_back(static_cast<int64_t>(c));
+            return arr;
+        };
+        metrics["full_shape_zyx"] = mk3(full_shape[0], full_shape[1], full_shape[2]);
+        metrics["crop_off_zyx"] = mk3(crop_zyx.off[0], crop_zyx.off[1], crop_zyx.off[2]);
+        metrics["crop_shape_zyx"] = mk3(crop_zyx.shape[0], crop_zyx.shape[1], crop_zyx.shape[2]);
+    }
     metrics["valid_normals"] = valid_lin.size();
     metrics["aligned_normals"] = aligned_count;
     if (metrics_json_path.has_value()) {
@@ -1862,7 +1880,7 @@ static void run_fit_normals(
     bool dbg_tif = false,
     const std::optional<fs::path>& metrics_json_path = std::nullopt) {
     const auto total_start = std::chrono::steady_clock::now();
-    json metrics;
+    Json metrics;
     metrics["mode"] = "fit-normals";
     metrics["input"] = input_dir.string();
     if (out_ply_opt.has_value()) metrics["output_ply"] = out_ply_opt->string();
@@ -2002,12 +2020,19 @@ static void run_fit_normals(
     const int crop_off_x = sx0 / step;
     const int crop_off_y = sy0 / step;
     const int crop_off_z = sz0 / step;
-    metrics["crop_min_xyz"] = {crop.min[0], crop.min[1], crop.min[2]};
-    metrics["crop_max_xyz"] = {crop.max[0], crop.max[1], crop.max[2]};
-    metrics["read_box_min_xyz"] = {read_box.min[0], read_box.min[1], read_box.min[2]};
-    metrics["read_box_max_xyz"] = {read_box.max[0], read_box.max[1], read_box.max[2]};
-    metrics["crop_shape_samples_zyx"] = {crop_nz, crop_ny, crop_nx};
-    metrics["crop_off_samples_zyx"] = {crop_off_z, crop_off_y, crop_off_x};
+    {
+        auto mk3i = [](int a, int b, int c) {
+            utils::Json arr = utils::Json::array();
+            arr.push_back(a); arr.push_back(b); arr.push_back(c);
+            return arr;
+        };
+        metrics["crop_min_xyz"] = mk3i(crop.min[0], crop.min[1], crop.min[2]);
+        metrics["crop_max_xyz"] = mk3i(crop.max[0], crop.max[1], crop.max[2]);
+        metrics["read_box_min_xyz"] = mk3i(read_box.min[0], read_box.min[1], read_box.min[2]);
+        metrics["read_box_max_xyz"] = mk3i(read_box.max[0], read_box.max[1], read_box.max[2]);
+        metrics["crop_shape_samples_zyx"] = mk3i(crop_nz, crop_ny, crop_nx);
+        metrics["crop_off_samples_zyx"] = mk3i(crop_off_z, crop_off_y, crop_off_x);
+    }
     metrics["total_samples"] = total_samples;
 
     std::vector<size_t> output_shape_zyx;
@@ -2651,16 +2676,25 @@ static void run_fit_normals(
         materialize_stats = materialize_fit_output_spool(out_zarr, *output_spool, static_cast<size_t>(nthreads));
 
         // Minimal attrs on root.
-        nlohmann::json attrs;
+        utils::Json attrs;
         attrs["source"] = "vc_ngrids";
         attrs["note_axes_order"] = "ZYX";
         attrs["encoding"] = "uint8_dir";
         attrs["decode"] = "(v-128)/127";
         attrs["sample_step"] = step;
         attrs["radius"] = radius;
-        attrs["crop_min_xyz"] = {crop.min[0], crop.min[1], crop.min[2]};
-        attrs["crop_max_xyz"] = {crop.max[0], crop.max[1], crop.max[2]};
-        attrs["grid_shape_zyx"] = {output_shape_zyx[0], output_shape_zyx[1], output_shape_zyx[2]};
+        {
+            auto mk3 = [](auto a, auto b, auto c) {
+                utils::Json arr = utils::Json::array();
+                arr.push_back(static_cast<int64_t>(a));
+                arr.push_back(static_cast<int64_t>(b));
+                arr.push_back(static_cast<int64_t>(c));
+                return arr;
+            };
+            attrs["crop_min_xyz"] = mk3(crop.min[0], crop.min[1], crop.min[2]);
+            attrs["crop_max_xyz"] = mk3(crop.max[0], crop.max[1], crop.max[2]);
+            attrs["grid_shape_zyx"] = mk3(output_shape_zyx[0], output_shape_zyx[1], output_shape_zyx[2]);
+        }
 
         // Diagnostics.
         attrs["fit_rms_group"] = "fit_rms/0";

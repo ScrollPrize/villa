@@ -30,7 +30,7 @@
 #include <utility>
 #include <vector>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -52,10 +52,10 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
     if (!surface) {
         return;
     }
-    if (surface->meta && surface->meta->is_object()) {
+    if (!surface->meta.is_null() && surface->meta.is_object()) {
         return;
     }
-    surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
+    surface->meta = utils::Json::object();
 }
 }
 
@@ -1802,9 +1802,7 @@ void SegmentationModule::performAutosave()
     // Copy metadata needed by save()
     snapshot->path = surfacePtr->path;
     snapshot->id = surfacePtr->id;
-    if (surfacePtr->meta) {
-        snapshot->meta = std::make_unique<nlohmann::json>(*surfacePtr->meta);
-    }
+    snapshot->meta = surfacePtr->meta;
 
     _pendingAutosave = false;
     _saveInProgress = true;

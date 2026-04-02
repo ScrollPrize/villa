@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <mutex>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 namespace vc::cache {
 
@@ -79,12 +79,9 @@ void FileSystemChunkSource::discoverLevels()
         auto zarrayPath = root_ / std::to_string(lvl) / ".zarray";
         if (!std::filesystem::exists(zarrayPath)) continue;
 
-        std::ifstream f(zarrayPath);
-        if (!f.is_open()) continue;
-
-        nlohmann::json meta;
+        utils::Json meta;
         try {
-            f >> meta;
+            meta = utils::Json::parse_file(zarrayPath);
         } catch (const std::exception& e) {
             if (auto* log = cacheDebugLog())
                 std::fprintf(log, "[CHUNK_SOURCE] Warning: failed to parse %s: %s\n",
@@ -96,14 +93,14 @@ void FileSystemChunkSource::discoverLevels()
         if (meta.contains("shape") && meta["shape"].is_array()) {
             auto& s = meta["shape"];
             if (s.size() >= 3) {
-                lm.shape = {s[0].get<int>(), s[1].get<int>(), s[2].get<int>()};
+                lm.shape = {s[0].get_int(), s[1].get_int(), s[2].get_int()};
             }
         }
         if (meta.contains("chunks") && meta["chunks"].is_array()) {
             auto& c = meta["chunks"];
             if (c.size() >= 3) {
                 lm.chunkShape = {
-                    c[0].get<int>(), c[1].get<int>(), c[2].get<int>()};
+                    c[0].get_int(), c[1].get_int(), c[2].get_int()};
             }
         }
         levels_.push_back(lm);

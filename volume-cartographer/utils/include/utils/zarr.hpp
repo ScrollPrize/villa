@@ -1,5 +1,5 @@
 #pragma once
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -41,39 +41,26 @@ namespace utils {
 // JSON type aliases (nlohmann/json)
 // ---------------------------------------------------------------------------
 
-using JsonValue  = nlohmann::json;
-using JsonObject = nlohmann::json;
-using JsonArray  = nlohmann::json;
+using JsonValue  = utils::Json;
+using JsonObject = utils::Json;
+using JsonArray  = utils::Json;
 
 /// Parse a JSON string. Replaces the former custom json_parse().
-[[nodiscard]] inline JsonValue json_parse(std::string_view text) {
-    return nlohmann::json::parse(text);
-}
+[[nodiscard]] JsonValue json_parse(std::string_view text);
 
 /// Serialize a JSON value. indent=0 means compact, indent>0 means pretty.
-[[nodiscard]] inline std::string json_serialize(const JsonValue& v, int indent = -1) {
-    return v.dump(indent);
-}
+[[nodiscard]] std::string json_serialize(const JsonValue& v, int indent = -1);
 
 /// Build a JSON object from an initializer list.
-[[nodiscard]] inline JsonValue json_object(
-    std::initializer_list<std::pair<const std::string, JsonValue>> pairs) {
-    return JsonValue(pairs);
-}
+[[nodiscard]] JsonValue json_object(
+    std::initializer_list<std::pair<const std::string, JsonValue>> pairs);
 
 /// Build a JSON array from an initializer list.
-[[nodiscard]] inline JsonValue json_array(std::initializer_list<JsonValue> values) {
-    return JsonValue(values);
-}
+[[nodiscard]] JsonValue json_array(std::initializer_list<JsonValue> values);
 
 /// Pointer-based find, matching the old custom JSON API.
 /// Returns nullptr if key not found or value is not an object.
-[[nodiscard]] inline const JsonValue* json_find(const JsonValue& obj, const std::string& key) {
-    if (!obj.is_object()) return nullptr;
-    auto it = obj.find(key);
-    if (it == obj.end()) return nullptr;
-    return &(*it);
-}
+[[nodiscard]] const JsonValue* json_find(const JsonValue& obj, const std::string& key);
 
 // ---------------------------------------------------------------------------
 // ZarrVersion
@@ -208,7 +195,7 @@ enum class ZarrDtype : std::uint8_t {
 
 struct ZarrCodecConfig {
     std::string name;           // e.g. "blosc", "gzip", "zstd", "bytes", "transpose", "sharding_indexed"
-    JsonValue configuration;    // codec-specific config as JSON (may be null)
+    std::shared_ptr<JsonValue> configuration;  // codec-specific config as JSON (may be null)
 };
 
 // ---------------------------------------------------------------------------
@@ -778,94 +765,7 @@ struct ShardIndex {
 
 // ----- .zarray (v2) parse / serialize -----
 
-inline ZarrMetadata parse_zarray(std::string_view json_str) {
-    auto root = json_parse(json_str);
-    if (!root.is_object())
-        throw std::runtime_error("zarr: .zarray root must be a JSON object");
-
-    ZarrMetadata meta;
-    meta.version = ZarrVersion::v2;
-
-    // shape
-    if (auto* p = json_find(root, "shape"); p && p->is_array())
-        for (const auto& v : (*p))
-            meta.shape.push_back(v.get<std::size_t>());
-
-    // chunks
-    if (auto* p = json_find(root, "chunks"); p && p->is_array())
-        for (const auto& v : (*p))
-            meta.chunks.push_back(v.get<std::size_t>());
-
-    // dtype (e.g. "<u2")
-    if (auto* p = json_find(root, "dtype"); p && p->is_string()) {
-        const auto& ds = p->get_ref<const std::string&>();
-        if (!ds.empty() && (ds[0] == '<' || ds[0] == '>' || ds[0] == '|'))
-            meta.byte_order = ds[0];
-        auto dt = parse_dtype(ds);
-        if (!dt) throw std::runtime_error("zarr: unsupported dtype: " + std::string(ds));
-        meta.dtype = *dt;
-    }
-
-    // compressor
-    if (auto* p = json_find(root, "compressor"); p) {
-        if (p->is_object()) {
-            if (auto* cid = json_find(*p, "id"); cid && cid->is_string())
-                meta.compressor_id = cid->get_ref<const std::string&>();
-            if (auto* cl = json_find(*p, "clevel"); cl && cl->is_number())
-                meta.compression_level = cl->get<int>();
-        }
-    }
-
-    // fill_value
-    if (auto* p = json_find(root, "fill_value"); p) {
-        if (p->is_number())
-            meta.fill_value = p->get<double>();
-        else if (p->is_null())
-            meta.fill_value = std::nullopt;
-    }
-
-    // dimension_separator
-    if (auto* p = json_find(root, "dimension_separator"); p && p->is_string())
-        meta.dimension_separator = p->get_ref<const std::string&>();
-
-    // filters
-    if (auto* p = json_find(root, "filters"); p && p->is_array()) {
-        for (const auto& fv : (*p)) {
-            if (!fv.is_object()) continue;
-            ZarrFilter filter;
-            auto* fid = json_find(fv, "id");
-            if (!fid || !fid->is_string()) continue;
-            const auto& id_str = fid->get_ref<const std::string&>();
-            if (id_str == "delta") {
-                filter.id = ZarrFilterId::delta;
-                if (auto* dt = json_find(fv, "dtype"); dt && dt->is_string()) {
-                    if (auto parsed = parse_dtype(dt->get_ref<const std::string&>())) filter.dtype = *parsed;
-                }
-                if (auto* at = json_find(fv, "astype"); at && at->is_string()) {
-                    if (auto parsed = parse_dtype(at->get_ref<const std::string&>())) filter.astype = *parsed;
-                }
-            } else if (id_str == "fixedscaleoffset") {
-                filter.id = ZarrFilterId::fixedscaleoffset;
-                if (auto* o = json_find(fv, "offset"); o && o->is_number()) filter.offset = o->get<double>();
-                if (auto* sc = json_find(fv, "scale"); sc && sc->is_number()) filter.scale = sc->get<double>();
-                if (auto* dt = json_find(fv, "dtype"); dt && dt->is_string()) {
-                    if (auto parsed = parse_dtype(dt->get_ref<const std::string&>())) filter.dtype = *parsed;
-                }
-            } else if (id_str == "quantize") {
-                filter.id = ZarrFilterId::quantize;
-                if (auto* d = json_find(fv, "digits"); d && d->is_number()) filter.digits = d->get<int>();
-                if (auto* dt = json_find(fv, "dtype"); dt && dt->is_string()) {
-                    if (auto parsed = parse_dtype(dt->get_ref<const std::string&>())) filter.dtype = *parsed;
-                }
-            } else {
-                continue; // skip unknown filters
-            }
-            meta.filters.push_back(filter);
-        }
-    }
-
-    return meta;
-}
+ZarrMetadata parse_zarray(std::string_view json_str);
 
 inline std::string serialize_zarray(const ZarrMetadata& meta) {
     std::string s = "{\n";
@@ -953,222 +853,13 @@ inline std::string serialize_zarray(const ZarrMetadata& meta) {
 
 // ----- zarr.json (v3) parse / serialize -----
 
-inline ZarrCodecConfig parse_codec_config(const JsonValue& jv) {
-    ZarrCodecConfig cc;
-    if (auto* n = json_find(jv, "name"); n && n->is_string())
-        cc.name = n->get_ref<const std::string&>();
-    if (auto* c = json_find(jv, "configuration"); c)
-        cc.configuration = *c;
-    return cc;
-}
+ZarrCodecConfig parse_codec_config(const JsonValue& jv);
 
-inline ZarrMetadata parse_zarr_json(std::string_view json_str) {
-    auto root = json_parse(json_str);
-    if (!root.is_object())
-        throw std::runtime_error("zarr: zarr.json root must be a JSON object");
+ZarrMetadata parse_zarr_json(std::string_view json_str);
 
-    ZarrMetadata meta;
-    meta.version = ZarrVersion::v3;
+JsonValue codec_config_to_json(const ZarrCodecConfig& cc);
 
-    // node_type
-    if (auto* p = json_find(root, "node_type"); p && p->is_string())
-        meta.node_type = p->get_ref<const std::string&>();
-
-    // shape
-    if (auto* p = json_find(root, "shape"); p && p->is_array())
-        for (const auto& v : (*p))
-            meta.shape.push_back(v.get<std::size_t>());
-
-    // data_type
-    if (auto* p = json_find(root, "data_type"); p && p->is_string()) {
-        auto dt = parse_dtype_v3(p->get_ref<const std::string&>());
-        if (!dt) throw std::runtime_error("zarr: unsupported v3 data_type: " + p->get_ref<const std::string&>());
-        meta.dtype = *dt;
-    }
-
-    // chunk_grid
-    if (auto* p = json_find(root, "chunk_grid"); p && p->is_object()) {
-        if (auto* cfg = json_find(*p, "configuration"); cfg && cfg->is_object()) {
-            if (auto* cs = json_find(*cfg, "chunk_shape"); cs && cs->is_array())
-                for (const auto& v : (*cs))
-                    meta.chunks.push_back(v.get<std::size_t>());
-        }
-    }
-
-    // chunk_key_encoding
-    if (auto* p = json_find(root, "chunk_key_encoding"); p && p->is_object()) {
-        if (auto* nm = json_find(*p, "name"); nm && nm->is_string())
-            meta.chunk_key_encoding = nm->get_ref<const std::string&>();
-        if (auto* cfg = json_find(*p, "configuration"); cfg && cfg->is_object()) {
-            if (auto* sep = json_find(*cfg, "separator"); sep && sep->is_string())
-                meta.dimension_separator = sep->get_ref<const std::string&>();
-        }
-    }
-    // Default separators.
-    if (meta.chunk_key_encoding == "default" && meta.dimension_separator == ".")
-        meta.dimension_separator = "/";
-
-    // fill_value
-    if (auto* p = json_find(root, "fill_value"); p) {
-        if (p->is_number())
-            meta.fill_value = p->get<double>();
-        else if (p->is_null())
-            meta.fill_value = std::nullopt;
-    }
-
-    // codecs
-    if (auto* p = json_find(root, "codecs"); p && p->is_array()) {
-        for (const auto& cv : (*p)) {
-            if (!cv.is_object()) continue;
-            auto cc = parse_codec_config(cv);
-
-            // Detect sharding_indexed codec.
-            if (cc.name == "sharding_indexed" && cc.configuration.is_object()) {
-                ShardConfig sc;
-                const auto& cfg = cc.configuration;
-                if (auto* cs = json_find(cfg, "chunk_shape"); cs && cs->is_array())
-                    for (const auto& v : (*cs))
-                        sc.sub_chunks.push_back(v.get<std::size_t>());
-                if (auto* il = json_find(cfg, "index_location"); il && il->is_string())
-                    sc.index_at_end = (il->get_ref<const std::string&>() == "end");
-                if (auto* ic = json_find(cfg, "index_codecs"); ic && ic->is_array())
-                    for (const auto& icv : (*ic))
-                        if (icv.is_object()) sc.index_codecs.push_back(parse_codec_config(icv));
-                if (auto* sc_codecs = json_find(cfg, "codecs"); sc_codecs && sc_codecs->is_array())
-                    for (const auto& scv : (*sc_codecs))
-                        if (scv.is_object()) sc.sub_codecs.push_back(parse_codec_config(scv));
-                meta.shard_config = std::move(sc);
-            }
-
-            meta.codecs.push_back(std::move(cc));
-        }
-    }
-
-    return meta;
-}
-
-inline JsonValue codec_config_to_json(const ZarrCodecConfig& cc) {
-    JsonObject obj;
-    obj["name"] = JsonValue(cc.name);
-    if (!cc.configuration.is_null())
-        obj["configuration"] = cc.configuration;
-    return JsonValue(std::move(obj));
-}
-
-inline std::string serialize_zarr_json(const ZarrMetadata& meta) {
-    JsonObject root;
-    root["zarr_format"] = JsonValue(3);
-    root["node_type"] = JsonValue(meta.node_type);
-
-    // data_type
-    root["data_type"] = JsonValue(std::string(dtype_string_v3(meta.dtype)));
-
-    // shape
-    {
-        JsonArray arr;
-        for (auto s : meta.shape) arr.push_back(JsonValue(s));
-        root["shape"] = JsonValue(std::move(arr));
-    }
-
-    // chunk_grid
-    {
-        JsonObject cg;
-        cg["name"] = JsonValue("regular");
-        JsonObject cg_cfg;
-        JsonArray cs;
-        for (auto c : meta.chunks) cs.push_back(JsonValue(c));
-        cg_cfg["chunk_shape"] = JsonValue(std::move(cs));
-        cg["configuration"] = JsonValue(std::move(cg_cfg));
-        root["chunk_grid"] = JsonValue(std::move(cg));
-    }
-
-    // chunk_key_encoding
-    {
-        JsonObject cke;
-        cke["name"] = JsonValue(meta.chunk_key_encoding);
-        if (meta.chunk_key_encoding == "v2") {
-            JsonObject cke_cfg;
-            cke_cfg["separator"] = JsonValue(meta.dimension_separator);
-            cke["configuration"] = JsonValue(std::move(cke_cfg));
-        }
-        root["chunk_key_encoding"] = JsonValue(std::move(cke));
-    }
-
-    // fill_value
-    if (meta.fill_value.has_value())
-        root["fill_value"] = JsonValue(*meta.fill_value);
-    else
-        root["fill_value"] = JsonValue(nullptr);
-
-    // codecs
-    {
-        JsonArray codecs_arr;
-
-        // If we have a shard_config but no codecs list was provided, build one.
-        if (meta.codecs.empty() && meta.shard_config) {
-            // Build sharding_indexed codec entry.
-            JsonObject sc_cfg;
-            {
-                JsonArray sub_cs;
-                for (auto c : meta.shard_config->sub_chunks)
-                    sub_cs.push_back(JsonValue(c));
-                sc_cfg["chunk_shape"] = JsonValue(std::move(sub_cs));
-            }
-            sc_cfg["index_location"] = JsonValue(meta.shard_config->index_at_end ? "end" : "start");
-
-            {
-                JsonArray idx_codecs;
-                for (const auto& ic : meta.shard_config->index_codecs)
-                    idx_codecs.push_back(codec_config_to_json(ic));
-                if (idx_codecs.empty()) {
-                    // Default: bytes codec for index.
-                    JsonObject bytes_codec;
-                    bytes_codec["name"] = JsonValue("bytes");
-                    JsonObject bytes_cfg;
-                    bytes_cfg["endian"] = JsonValue("little");
-                    bytes_codec["configuration"] = JsonValue(std::move(bytes_cfg));
-                    idx_codecs.push_back(JsonValue(std::move(bytes_codec)));
-                }
-                sc_cfg["index_codecs"] = JsonValue(std::move(idx_codecs));
-            }
-
-            {
-                JsonArray sub_codecs;
-                for (const auto& sc : meta.shard_config->sub_codecs)
-                    sub_codecs.push_back(codec_config_to_json(sc));
-                if (sub_codecs.empty()) {
-                    JsonObject bytes_codec;
-                    bytes_codec["name"] = JsonValue("bytes");
-                    JsonObject bytes_cfg;
-                    bytes_cfg["endian"] = JsonValue("little");
-                    bytes_codec["configuration"] = JsonValue(std::move(bytes_cfg));
-                    sub_codecs.push_back(JsonValue(std::move(bytes_codec)));
-                }
-                sc_cfg["codecs"] = JsonValue(std::move(sub_codecs));
-            }
-
-            JsonObject sharding_obj;
-            sharding_obj["name"] = JsonValue("sharding_indexed");
-            sharding_obj["configuration"] = JsonValue(std::move(sc_cfg));
-            codecs_arr.push_back(JsonValue(std::move(sharding_obj)));
-        } else if (meta.codecs.empty()) {
-            // Default: bytes codec.
-            JsonObject bytes_codec;
-            bytes_codec["name"] = JsonValue("bytes");
-            JsonObject bytes_cfg;
-            bytes_cfg["endian"] = JsonValue("little");
-            bytes_codec["configuration"] = JsonValue(std::move(bytes_cfg));
-            codecs_arr.push_back(JsonValue(std::move(bytes_codec)));
-        } else {
-            for (const auto& cc : meta.codecs)
-                codecs_arr.push_back(codec_config_to_json(cc));
-        }
-
-        root["codecs"] = JsonValue(std::move(codecs_arr));
-    }
-
-    return json_serialize(JsonValue(std::move(root)), 2) + "\n";
-}
+std::string serialize_zarr_json(const ZarrMetadata& meta);
 
 // ----- Consolidated metadata (.zmetadata, v2) -----
 
@@ -1177,31 +868,7 @@ struct ConsolidatedMetadata {
     std::unordered_map<std::string, JsonValue> attrs;       // path -> attributes
 
     /// Parse a .zmetadata JSON file.
-    static ConsolidatedMetadata parse(std::string_view json_str) {
-        auto root = json_parse(json_str);
-        ConsolidatedMetadata cm;
-        if (!root.is_object()) return cm;
-
-        auto* meta = json_find(root, "metadata");
-        if (!meta || !meta->is_object()) return cm;
-
-        for (const auto& [key, val] : meta->items()) {
-            if (key.size() >= 7 && key.substr(key.size() - 7) == ".zarray") {
-                // This is an array metadata entry.
-                auto array_path = key.substr(0, key.size() - 8); // strip "/.zarray"
-                if (!array_path.empty() && array_path.front() == '/')
-                    array_path = array_path.substr(1);
-                auto json_text = json_serialize(val);
-                cm.arrays[array_path] = parse_zarray(json_text);
-            } else if (key.size() >= 7 && key.substr(key.size() - 7) == ".zattrs") {
-                auto attr_path = key.substr(0, key.size() - 8);
-                if (!attr_path.empty() && attr_path.front() == '/')
-                    attr_path = attr_path.substr(1);
-                cm.attrs[attr_path] = val;
-            }
-        }
-        return cm;
-    }
+    static ConsolidatedMetadata parse(std::string_view json_str);
 };
 
 // ----- Auto-detect version -----
@@ -1504,75 +1171,9 @@ public:
 
     // -- Attributes ----------------------------------------------------------
 
-    [[nodiscard]] std::string read_attrs() const {
-        if (store_) {
-            // Store-backed: read via store, not filesystem.
-            auto key = [&](const std::string& name) -> std::string {
-                return array_key_.empty() ? name : array_key_ + "/" + name;
-            };
-            if (meta_.version == ZarrVersion::v3) {
-                auto data = store_->get_if_exists(key("zarr.json"));
-                if (!data) return "{}";
-                std::string str(reinterpret_cast<const char*>(data->data()), data->size());
-                auto root = json_parse(str);
-                if (auto* p = json_find(root, "attributes"); p)
-                    return json_serialize(*p, 2);
-                return "{}";
-            }
-            auto data = store_->get_if_exists(key(".zattrs"));
-            if (!data) return "{}";
-            return std::string(reinterpret_cast<const char*>(data->data()), data->size());
-        }
-        if (meta_.version == ZarrVersion::v3) {
-            // v3: attributes are in zarr.json under "attributes" key.
-            auto zj_path = root_ / "zarr.json";
-            if (!std::filesystem::exists(zj_path)) return "{}";
-            auto json = detail::read_file(zj_path);
-            auto root = json_parse(json);
-            if (auto* p = json_find(root, "attributes"); p)
-                return json_serialize(*p, 2);
-            return "{}";
-        }
-        auto p = root_ / ".zattrs";
-        if (!std::filesystem::exists(p)) return "{}";
-        return detail::read_file(p);
-    }
+    [[nodiscard]] std::string read_attrs() const;
 
-    void write_attrs(std::string_view json) {
-        if (store_) {
-            // Store-backed: write via store, not filesystem.
-            auto key = [&](const std::string& name) -> std::string {
-                return array_key_.empty() ? name : array_key_ + "/" + name;
-            };
-            if (meta_.version == ZarrVersion::v3) {
-                auto data = store_->get_if_exists(key("zarr.json"));
-                std::string zj_str = data
-                    ? std::string(reinterpret_cast<const char*>(data->data()), data->size())
-                    : "{}";
-                auto root = json_parse(zj_str);
-                auto attrs = json_parse(json);
-                root["attributes"] = std::move(attrs);
-                auto out = json_serialize(root, 2) + "\n";
-                auto bytes = std::as_bytes(std::span{out});
-                store_->set(key("zarr.json"), {bytes.data(), bytes.size()});
-            } else {
-                auto bytes = std::as_bytes(std::span{json});
-                store_->set(key(".zattrs"), {bytes.data(), bytes.size()});
-            }
-            return;
-        }
-        if (meta_.version == ZarrVersion::v3) {
-            // v3: merge attributes into zarr.json.
-            auto zj_path = root_ / "zarr.json";
-            auto zj_str = detail::read_file(zj_path);
-            auto root = json_parse(zj_str);
-            auto attrs = json_parse(json);
-            root["attributes"] = std::move(attrs);
-            detail::write_file(zj_path, json_serialize(root, 2) + "\n");
-        } else {
-            detail::write_file(root_ / ".zattrs", json);
-        }
-    }
+    void write_attrs(std::string_view json);
 
 private:
     // -- Construction --------------------------------------------------------
@@ -1604,28 +1205,7 @@ private:
         return needs_compression();
     }
 
-    [[nodiscard]] bool needs_byteswap() const noexcept {
-        auto elem_sz = dtype_size(meta_.dtype);
-        if (elem_sz <= 1) return false;
-        bool native_le = detail::is_little_endian();
-        if (meta_.version == ZarrVersion::v2) {
-            // '<' = little-endian, '>' = big-endian, '|' = not applicable
-            if (meta_.byte_order == '|') return false;
-            return (meta_.byte_order == '<') != native_le;
-        }
-        // v3: byte order is determined by the "bytes" codec endian field.
-        // Default is little-endian per the zarr v3 spec.
-        for (const auto& cc : meta_.codecs) {
-            if (cc.name == "bytes" && cc.configuration.is_object()) {
-                auto* e = json_find(cc.configuration, "endian");
-                if (e && e->is_string()) {
-                    bool stored_le = (e->get_ref<const std::string&>() == "little");
-                    return stored_le != native_le;
-                }
-            }
-        }
-        return false; // assume little-endian matches or unknown
-    }
+    [[nodiscard]] bool needs_byteswap() const noexcept;
 
     // -- Chunk key generation ------------------------------------------------
 
@@ -1710,90 +1290,7 @@ private:
     /// Extract a single inner chunk from shard data.
     [[nodiscard]] std::optional<std::vector<std::byte>>
     extract_inner_chunk(std::span<const std::byte> shard_data,
-                        std::span<const std::size_t> inner_indices) const {
-        const auto& sc = *meta_.shard_config;
-        const auto n_inner = meta_.total_sub_chunks_per_shard();
-        const std::size_t index_size = n_inner * 16;
-
-        if (shard_data.size() < index_size)
-            throw std::runtime_error("zarr: shard too small to contain index");
-
-        // Read index from start or end.
-        std::span<const std::byte> index_data;
-        if (sc.index_at_end) {
-            index_data = shard_data.subspan(shard_data.size() - index_size, index_size);
-        } else {
-            index_data = shard_data.subspan(0, index_size);
-        }
-
-        // Apply index_codecs to the raw index bytes before deserialization.
-        std::vector<std::byte> decoded_index;
-        if (!sc.index_codecs.empty()) {
-            decoded_index.assign(index_data.begin(), index_data.end());
-            for (const auto& ic : sc.index_codecs) {
-                if (ic.name == "bytes") {
-                    // The shard index is defined as little-endian uint64 pairs.
-                    // The bytes codec with endian="little" is a no-op on LE systems;
-                    // on BE systems we'd need to byteswap the 8-byte entries.
-                    if (ic.configuration.is_object()) {
-                        auto* e = json_find(ic.configuration, "endian");
-                        if (e && e->is_string() &&
-                            e->get_ref<const std::string&>() == "big" &&
-                            detail::is_little_endian()) {
-                            detail::byteswap_inplace(decoded_index, 8);
-                        } else if (e && e->is_string() &&
-                                   e->get_ref<const std::string&>() == "little" &&
-                                   !detail::is_little_endian()) {
-                            detail::byteswap_inplace(decoded_index, 8);
-                        }
-                    }
-                } else if (codec_.decompress) {
-                    // Apply decompression codec from registry if available.
-                    auto it = registry_.find(ic.name);
-                    if (it != registry_.end() && it->second.decompress) {
-                        decoded_index = it->second.decompress(
-                            decoded_index, n_inner * 16);
-                    }
-                }
-            }
-            index_data = decoded_index;
-        }
-
-        auto index = detail::ShardIndex::deserialize(index_data, n_inner);
-
-        // Compute linear index from inner chunk indices (C-order).
-        std::size_t linear = 0;
-        std::size_t stride = 1;
-        for (std::size_t d = inner_indices.size(); d-- > 0;) {
-            linear += inner_indices[d] * stride;
-            stride *= meta_.sub_chunks_per_shard(d);
-        }
-
-        if (linear >= n_inner)
-            throw std::runtime_error("zarr: inner chunk index out of range");
-
-        const auto& entry = index.entries[linear];
-        if (entry.is_missing()) return std::nullopt;
-
-        if (entry.offset + entry.nbytes > shard_data.size())
-            throw std::runtime_error("zarr: inner chunk offset/size exceeds shard data");
-
-        std::vector<std::byte> chunk(
-            shard_data.begin() + static_cast<std::ptrdiff_t>(entry.offset),
-            shard_data.begin() + static_cast<std::ptrdiff_t>(entry.offset + entry.nbytes));
-
-        // Decompress inner chunk if needed.
-        if (codec_.decompress && needs_decompression()) {
-            chunk = codec_.decompress(chunk, meta_.sub_chunk_byte_size());
-        }
-
-        // Byte-swap if the stored byte order differs from native.
-        if (needs_byteswap()) {
-            detail::byteswap_inplace(chunk, dtype_size(meta_.dtype));
-        }
-
-        return chunk;
-    }
+                        std::span<const std::size_t> inner_indices) const;
 
     // -- Members -------------------------------------------------------------
 
@@ -1861,12 +1358,8 @@ private:
 // ---------------------------------------------------------------------------
 
 /// Load consolidated metadata from .zmetadata file.
-[[nodiscard]] inline detail::ConsolidatedMetadata
-load_consolidated_metadata(const std::filesystem::path& root) {
-    auto zmetadata_path = root / ".zmetadata";
-    auto json = detail::read_file(zmetadata_path);
-    return detail::ConsolidatedMetadata::parse(json);
-}
+[[nodiscard]] detail::ConsolidatedMetadata
+load_consolidated_metadata(const std::filesystem::path& root);
 
 /// Open a zarr array using consolidated metadata (avoids per-array metadata reads).
 /// Uses the pre-parsed metadata directly without writing files.
@@ -2051,56 +1544,11 @@ namespace ome_detail {
     return "custom";
 }
 
-[[nodiscard]] inline std::vector<CoordinateTransform>
-parse_transforms(const JsonValue& arr) {
-    std::vector<CoordinateTransform> out;
-    if (!arr.is_array()) return out;
-    for (const auto& t : arr) {
-        if (!t.is_object()) continue;
-        auto* tp = json_find(t, "type");
-        if (!tp || !tp->is_string()) continue;
-        const auto& type_str = tp->get_ref<const std::string&>();
-        if (type_str == "scale") {
-            ScaleTransform st;
-            if (auto* s = json_find(t, "scale"); s && s->is_array()) {
-                for (const auto& v : (*s))
-                    st.scale.push_back(v.get<double>());
-            }
-            out.emplace_back(std::move(st));
-        } else if (type_str == "translation") {
-            TranslationTransform tt;
-            if (auto* s = json_find(t, "translation"); s && s->is_array()) {
-                for (const auto& v : (*s))
-                    tt.translation.push_back(v.get<double>());
-            }
-            out.emplace_back(std::move(tt));
-        }
-    }
-    return out;
-}
+[[nodiscard]] std::vector<CoordinateTransform>
+parse_transforms(const JsonValue& arr);
 
-[[nodiscard]] inline JsonValue serialize_transforms(
-    const std::vector<CoordinateTransform>& transforms) {
-    JsonArray arr;
-    for (const auto& t : transforms) {
-        if (auto* st = std::get_if<ScaleTransform>(&t)) {
-            JsonArray vals;
-            for (double v : st->scale) vals.emplace_back(v);
-            arr.push_back(json_object({
-                {"type", "scale"},
-                {"scale", JsonValue{std::move(vals)}}
-            }));
-        } else if (auto* tt = std::get_if<TranslationTransform>(&t)) {
-            JsonArray vals;
-            for (double v : tt->translation) vals.emplace_back(v);
-            arr.push_back(json_object({
-                {"type", "translation"},
-                {"translation", JsonValue{std::move(vals)}}
-            }));
-        }
-    }
-    return JsonValue{std::move(arr)};
-}
+[[nodiscard]] JsonValue serialize_transforms(
+    const std::vector<CoordinateTransform>& transforms);
 
 } // namespace ome_detail
 
@@ -2108,172 +1556,21 @@ parse_transforms(const JsonValue& arr) {
 // parse_ome_metadata
 // ---------------------------------------------------------------------------
 
-[[nodiscard]] inline MultiscaleMetadata parse_ome_metadata(const JsonValue& attrs) {
-    MultiscaleMetadata meta;
-
-    const JsonValue* ms_arr = json_find(attrs, "multiscales");
-    if (!ms_arr || !ms_arr->is_array() || (*ms_arr).empty())
-        throw std::runtime_error("zarr: missing or empty 'multiscales' in .zattrs");
-
-    const auto& ms = (*ms_arr).front();
-    if (!ms.is_object())
-        throw std::runtime_error("zarr: multiscales entry must be an object");
-
-    if (auto* p = json_find(ms, "version"); p && p->is_string())
-        meta.version = p->get_ref<const std::string&>();
-    if (auto* p = json_find(ms, "name"); p && p->is_string())
-        meta.name = p->get_ref<const std::string&>();
-    if (auto* p = json_find(ms, "type"); p && p->is_string())
-        meta.type = p->get_ref<const std::string&>();
-
-    if (auto* ax = json_find(ms, "axes"); ax && ax->is_array()) {
-        for (const auto& a : (*ax)) {
-            Axis axis;
-            if (auto* n = json_find(a, "name"); n && n->is_string())
-                axis.name = n->get_ref<const std::string&>();
-            if (auto* t = json_find(a, "type"); t && t->is_string())
-                axis.type = ome_detail::parse_axis_type(t->get_ref<const std::string&>());
-            if (auto* u = json_find(a, "unit"); u && u->is_string())
-                axis.unit = u->get_ref<const std::string&>();
-            meta.axes.push_back(std::move(axis));
-        }
-    }
-
-    if (auto* ds_arr = json_find(ms, "datasets"); ds_arr && ds_arr->is_array()) {
-        for (const auto& ds : (*ds_arr)) {
-            MultiscaleDataset dataset;
-            if (auto* p = json_find(ds, "path"); p && p->is_string())
-                dataset.path = p->get_ref<const std::string&>();
-            if (auto* ct = json_find(ds, "coordinateTransformations"))
-                dataset.transforms = ome_detail::parse_transforms(*ct);
-            meta.datasets.push_back(std::move(dataset));
-        }
-    }
-
-    return meta;
-}
+[[nodiscard]] MultiscaleMetadata parse_ome_metadata(const JsonValue& attrs);
 
 // ---------------------------------------------------------------------------
 // serialize_ome_metadata
 // ---------------------------------------------------------------------------
 
-[[nodiscard]] inline JsonValue serialize_ome_metadata(const MultiscaleMetadata& meta) {
-    JsonArray axes_arr;
-    for (const auto& ax : meta.axes) {
-        JsonObject obj;
-        obj["name"] = JsonValue{ax.name};
-        obj["type"] = JsonValue{std::string(ome_detail::axis_type_string(ax.type))};
-        if (!ax.unit.empty())
-            obj["unit"] = JsonValue{ax.unit};
-        axes_arr.push_back(JsonValue{std::move(obj)});
-    }
-
-    JsonArray ds_arr;
-    for (const auto& ds : meta.datasets) {
-        JsonObject obj;
-        obj["path"] = JsonValue{ds.path};
-        obj["coordinateTransformations"] =
-            ome_detail::serialize_transforms(ds.transforms);
-        ds_arr.push_back(JsonValue{std::move(obj)});
-    }
-
-    JsonObject ms;
-    ms["version"] = JsonValue{meta.version};
-    if (!meta.name.empty())
-        ms["name"] = JsonValue{meta.name};
-    if (!meta.type.empty())
-        ms["type"] = JsonValue{meta.type};
-    ms["axes"] = JsonValue{std::move(axes_arr)};
-    ms["datasets"] = JsonValue{std::move(ds_arr)};
-
-    JsonArray ms_arr;
-    ms_arr.push_back(JsonValue{std::move(ms)});
-
-    return json_object({{"multiscales", JsonValue{std::move(ms_arr)}}});
-}
+[[nodiscard]] JsonValue serialize_ome_metadata(const MultiscaleMetadata& meta);
 
 // ---------------------------------------------------------------------------
 // parse_label_metadata / parse_plate_metadata
 // ---------------------------------------------------------------------------
 
-[[nodiscard]] inline LabelMetadata parse_label_metadata(const JsonValue& attrs) {
-    LabelMetadata meta;
+[[nodiscard]] LabelMetadata parse_label_metadata(const JsonValue& attrs);
 
-    if (auto* p = json_find(attrs, "image-label")) {
-        if (!p->is_object())
-            throw std::runtime_error("zarr: 'image-label' must be an object");
-
-        if (auto* v = json_find(*p, "version"); v && v->is_string())
-            meta.version = v->get_ref<const std::string&>();
-
-        if (auto* colors = json_find(*p, "colors"); colors && colors->is_array()) {
-            for (const auto& c : (*colors)) {
-                LabelColor lc{};
-                if (auto* lv = json_find(c, "label-value"); lv && lv->is_number())
-                    lc.label_value = lv->get<std::uint32_t>();
-                if (auto* rgba = json_find(c, "rgba"); rgba && rgba->is_array()) {
-                    const auto& arr = (*rgba);
-                    for (std::size_t i = 0; i < 4 && i < arr.size(); ++i)
-                        lc.rgba[i] = arr[i].get<std::uint8_t>();
-                }
-                meta.colors.push_back(lc);
-            }
-        }
-
-        if (auto* props = json_find(*p, "properties"); props && props->is_array()) {
-            for (const auto& prop : (*props)) {
-                if (prop.is_string())
-                    meta.properties.push_back(prop.get_ref<const std::string&>());
-            }
-        }
-    }
-
-    return meta;
-}
-
-[[nodiscard]] inline PlateMetadata parse_plate_metadata(const JsonValue& attrs) {
-    PlateMetadata meta;
-
-    const JsonValue* plate = json_find(attrs, "plate");
-    if (!plate || !plate->is_object())
-        throw std::runtime_error("zarr: missing or invalid 'plate' in .zattrs");
-
-    if (auto* v = json_find(*plate, "version"); v && v->is_string())
-        meta.version = v->get_ref<const std::string&>();
-    if (auto* n = json_find(*plate, "name"); n && n->is_string())
-        meta.name = n->get_ref<const std::string&>();
-    if (auto* fc = json_find(*plate, "field_count"); fc && fc->is_number())
-        meta.field_count = fc->get<std::size_t>();
-
-    if (auto* cols = json_find(*plate, "columns"); cols && cols->is_array()) {
-        for (const auto& c : (*cols)) {
-            if (auto* n = json_find(c, "name"); n && n->is_string())
-                meta.columns.push_back(n->get_ref<const std::string&>());
-        }
-    }
-
-    if (auto* rows = json_find(*plate, "rows"); rows && rows->is_array()) {
-        for (const auto& r : (*rows)) {
-            if (auto* n = json_find(r, "name"); n && n->is_string())
-                meta.rows.push_back(n->get_ref<const std::string&>());
-        }
-    }
-
-    if (auto* wells = json_find(*plate, "wells"); wells && wells->is_array()) {
-        for (const auto& w : (*wells)) {
-            WellRef ref;
-            if (auto* p = json_find(w, "path"); p && p->is_string())
-                ref.path = p->get_ref<const std::string&>();
-            if (auto* r = json_find(w, "rowIndex"); r && r->is_number())
-                ref.row = r->get<std::size_t>();
-            if (auto* c = json_find(w, "columnIndex"); c && c->is_number())
-                ref.col = c->get<std::size_t>();
-            meta.wells.push_back(std::move(ref));
-        }
-    }
-
-    return meta;
-}
+[[nodiscard]] PlateMetadata parse_plate_metadata(const JsonValue& attrs);
 
 // ---------------------------------------------------------------------------
 // Pyramid generation helpers
@@ -2344,21 +1641,7 @@ parse_transforms(const JsonValue& arr) {
 
 class OmeZarrReader final {
 public:
-    explicit OmeZarrReader(const std::filesystem::path& root)
-        : root_(root) {
-        auto zattrs_path = root_ / ".zattrs";
-        if (!std::filesystem::exists(zattrs_path))
-            throw std::runtime_error("zarr: missing .zattrs at " + root_.string());
-
-        auto json_str = detail::read_file(zattrs_path);
-        attrs_ = json_parse(json_str);
-        meta_ = parse_ome_metadata(attrs_);
-
-        levels_.reserve(meta_.datasets.size());
-        for (const auto& ds : meta_.datasets) {
-            levels_.push_back(ZarrArray::open(root_ / ds.path));
-        }
-    }
+    explicit OmeZarrReader(const std::filesystem::path& root);
 
     [[nodiscard]] const MultiscaleMetadata& multiscale() const noexcept {
         return meta_;
@@ -2397,48 +1680,20 @@ public:
         return std::filesystem::is_directory(root_ / "labels");
     }
 
-    [[nodiscard]] std::vector<std::string> label_names() const {
-        std::vector<std::string> names;
-        auto labels_dir = root_ / "labels";
-        if (!std::filesystem::is_directory(labels_dir)) return names;
-
-        auto zattrs_path = labels_dir / ".zattrs";
-        if (std::filesystem::exists(zattrs_path)) {
-            auto json_str = detail::read_file(zattrs_path);
-            auto attrs = json_parse(json_str);
-            if (auto* p = json_find(attrs, "labels"); p && p->is_array()) {
-                for (const auto& v : (*p)) {
-                    if (v.is_string())
-                        names.push_back(v.get_ref<const std::string&>());
-                }
-                return names;
-            }
-        }
-
-        for (const auto& entry : std::filesystem::directory_iterator(labels_dir)) {
-            if (entry.is_directory())
-                names.push_back(entry.path().filename().string());
-        }
-        return names;
-    }
+    [[nodiscard]] std::vector<std::string> label_names() const;
 
     [[nodiscard]] OmeZarrReader open_label(std::string_view name) const {
         auto label_path = root_ / "labels" / std::string(name);
         return OmeZarrReader(label_path);
     }
 
-    [[nodiscard]] bool is_plate() const noexcept {
-        return json_find(attrs_, "plate") != nullptr;
-    }
+    [[nodiscard]] bool is_plate() const noexcept;
 
-    [[nodiscard]] std::optional<PlateMetadata> plate_metadata() const {
-        if (!is_plate()) return std::nullopt;
-        return parse_plate_metadata(attrs_);
-    }
+    [[nodiscard]] std::optional<PlateMetadata> plate_metadata() const;
 
 private:
     std::filesystem::path root_;
-    JsonValue attrs_;
+    std::shared_ptr<JsonValue> attrs_;
     MultiscaleMetadata meta_;
     std::vector<ZarrArray> levels_;
 };
@@ -2488,14 +1743,7 @@ public:
         levels_[lvl].write_chunk(chunk_indices, data);
     }
 
-    void finalize() {
-        detail::write_file(config_.root / ".zgroup",
-                           "{\"zarr_format\": 2}\n");
-
-        auto attrs = serialize_ome_metadata(config_.multiscale);
-        detail::write_file(config_.root / ".zattrs",
-                           json_serialize(attrs, 2) + "\n");
-    }
+    void finalize();
 
 private:
     Config config_;
