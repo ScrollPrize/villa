@@ -6,6 +6,7 @@ tr_config:
 model_config:
   guide_backbone: "/home/giorgio/Projects/dino-vesuvius/dino-checkpoints/checkpoint_step_342500.pt"
   guide_fusion_stage: "feature_encoder"
+  guide_feature_gate_alpha: 0.9
   guide_freeze: true
   guide_tokenbook_tokens: 256
   guide_tokenbook_prototype_weighting: "token_mlp"
