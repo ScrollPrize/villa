@@ -66,10 +66,22 @@ void RenderPool::submit(const TileRenderParams& params,
             // Convert raw ARGB32 pixels -> QPixmap on worker thread to
             // avoid GPU upload stalls on the main thread during drain.
             if (!result.pixels.empty()) {
-                QImage img(reinterpret_cast<const uchar*>(result.pixels.data()),
-                           result.width, result.height,
-                           result.width * 4, QImage::Format_RGB32);
-                result.pixmap = QPixmap::fromImage(img, Qt::NoFormatConversion);
+                // Create a QImage that owns its own data, then convert to pixmap.
+                // Copy row-by-row in case QImage stride != width*4 (alignment).
+                QImage img(result.width, result.height, QImage::Format_RGB32);
+                const int srcStride = result.width * 4;
+                const int dstStride = img.bytesPerLine();
+                if (srcStride == dstStride) {
+                    std::memcpy(img.bits(), result.pixels.data(),
+                                static_cast<size_t>(srcStride) * result.height);
+                } else {
+                    for (int y = 0; y < result.height; y++) {
+                        std::memcpy(img.scanLine(y),
+                                    reinterpret_cast<const uchar*>(result.pixels.data()) + y * srcStride,
+                                    srcStride);
+                    }
+                }
+                result.pixmap = QPixmap::fromImage(std::move(img), Qt::NoFormatConversion);
                 result.pixels.clear();
                 result.pixels.shrink_to_fit();
             }
