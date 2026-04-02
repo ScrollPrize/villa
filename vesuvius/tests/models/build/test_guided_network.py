@@ -51,6 +51,7 @@ def _make_mgr(
     guide_tokenbook_tokens: int | None = None,
     guide_compile_policy: str | None = None,
     guide_fusion_stage: str | None = None,
+    guide_tokenbook_prototype_weighting: str | None = None,
 ) -> SimpleNamespace:
     guided_config = {}
     if guide_tokenbook_tokens is not None:
@@ -59,6 +60,8 @@ def _make_mgr(
         guided_config["guide_compile_policy"] = str(guide_compile_policy)
     if guide_fusion_stage is not None:
         guided_config["guide_fusion_stage"] = str(guide_fusion_stage)
+    if guide_tokenbook_prototype_weighting is not None:
+        guided_config["guide_tokenbook_prototype_weighting"] = str(guide_tokenbook_prototype_weighting)
     return SimpleNamespace(
         targets={"ink": {"out_channels": 1, "activation": "none"}},
         train_patch_size=(16, 16, 16),
@@ -95,6 +98,23 @@ def test_tokenbook3d_returns_unit_interval_mask():
     guide = module(x)
 
     assert guide.shape == (2, 1, 2, 2, 2)
+    assert float(guide.min().detach()) >= 0.0
+    assert float(guide.max().detach()) <= 1.0
+
+
+def test_tokenbook3d_token_mlp_returns_unit_interval_mask():
+    module = TokenBook3D(
+        n_tokens=8,
+        embed_dim=16,
+        prototype_weighting="token_mlp",
+        weight_mlp_hidden=12,
+    )
+    x = torch.randn(2, 16, 2, 2, 2)
+
+    guide = module(x)
+
+    assert guide.shape == (2, 1, 2, 2, 2)
+    assert module.prototype_weight_mlp is not None
     assert float(guide.min().detach()) >= 0.0
     assert float(guide.max().detach()) <= 1.0
 
@@ -182,6 +202,33 @@ def test_feature_encoder_guidance_backprop_updates_all_stage_tokenbooks(tmp_path
     assert all(parameter.grad is None for parameter in model.guide_backbone.parameters())
 
 
+def test_feature_encoder_token_mlp_backprop_updates_stage_weight_mlps(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_fusion_stage="feature_encoder",
+        guide_tokenbook_prototype_weighting="token_mlp",
+    )
+    model = NetworkFromConfig(mgr)
+    model.train()
+
+    outputs, aux = model(torch.randn(2, 1, 16, 16, 16), return_aux=True)
+    loss = outputs["ink"].square().mean() + sum(stage_aux.mean() for stage_aux in aux.values())
+    loss.backward()
+
+    assert model.final_config["guide_tokenbook_prototype_weighting"] == "token_mlp"
+    assert all(
+        tokenbook.prototype_weight_mlp is not None
+        for tokenbook in model.guide_stage_tokenbooks.values()
+    )
+    assert all(
+        any(parameter.grad is not None for parameter in tokenbook.prototype_weight_mlp.parameters())
+        for tokenbook in model.guide_stage_tokenbooks.values()
+    )
+
+
 def test_guided_network_supports_reduced_tokenbook_prototype_count(tmp_path: Path):
     checkpoint_path = tmp_path / "guide_backbone.pt"
     _write_local_guide_checkpoint(checkpoint_path)
@@ -244,6 +291,21 @@ def test_feature_encoder_guidance_records_exact_fusion_stage(tmp_path: Path):
 
     assert model.guide_fusion_stage == "feature_encoder"
     assert model.final_config["guide_fusion_stage"] == "feature_encoder"
+
+
+def test_feature_encoder_guidance_records_token_mlp_weighting(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_fusion_stage="feature_encoder",
+        guide_tokenbook_prototype_weighting="token_mlp",
+    )
+    model = NetworkFromConfig(mgr)
+
+    assert model.guide_tokenbook_prototype_weighting == "token_mlp"
+    assert model.final_config["guide_tokenbook_prototype_weighting"] == "token_mlp"
 
 
 def test_guided_network_rejects_invalid_guide_compile_policy(tmp_path: Path):
