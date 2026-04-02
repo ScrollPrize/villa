@@ -136,17 +136,6 @@ void TileRenderController::onCameraChanged(
     int submitOrder = 0;  // encodes chunk-grouped spatial locality in priority
 
     for (const auto& wk : visibleKeys) {
-        SliceCacheKey cacheKey = SliceCacheKey::make(wk, camera, _paramsHash);
-
-        // Check slice cache — apply best available immediately
-        auto lookup = _cache.getBest(cacheKey);
-        if (lookup.level >= 0) {
-            _tileScene->setTileWorld(wk, lookup.pixmap, epoch, lookup.level);
-            if (lookup.level == camera.dsScaleIdx) {
-                continue;  // exact hit, no need to re-render
-            }
-        }
-
         // Submit to background pool for full-quality render (skip duplicates)
         if (_inFlightTiles.find(wk) == _inFlightTiles.end()) {
             TileRenderParams params = buildParams(wk);
@@ -226,25 +215,9 @@ void TileRenderController::drainResults()
         // Remove from in-flight tracking so tile can be re-submitted for refinement
         _inFlightTiles.erase(result.worldKey);
 
-        // Pixmap was already converted on the worker thread
-        const QPixmap& pixmap = result.pixmap;
-        const bool hasPixmap = !pixmap.isNull();
-
-        // Always cache with world tile key (even if tile is no longer visible)
-        TiledViewerCamera snapCamera;
-        snapCamera.scale = result.scale;
-        snapCamera.zOff = result.zOff;
-        snapCamera.dsScaleIdx = result.actualLevel;
-
-        SliceCacheKey cacheKey = SliceCacheKey::make(
-            result.worldKey, snapCamera, result.cacheIdentity);
-        if (hasPixmap) {
-            _cache.put(cacheKey, pixmap);
-        }
-
-        // Apply to scene directly via world key
-        if (hasPixmap &&
-            _tileScene->setTileWorld(result.worldKey, pixmap, result.epoch,
+        // Apply pixmap to scene directly via world key
+        if (!result.pixmap.isNull() &&
+            _tileScene->setTileWorld(result.worldKey, result.pixmap, result.epoch,
                                      static_cast<int8_t>(result.actualLevel))) {
             anyUpdated = true;
         }

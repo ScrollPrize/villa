@@ -9,10 +9,10 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "ChunkKey.hpp"
-#include <utils/lock_pool.hpp>
 
 namespace vc::cache {
 
@@ -20,8 +20,8 @@ namespace vc::cache {
 // Directory layout:
 //   <root>/<volumeId>/<level>/<iz>.<iy>.<ix>
 //
-// Thread-safe for concurrent read/write to different keys.
-// Same-key writes are serialized via a lock pool.
+// Thread-safe: index is protected by indexMtx_, file writes use
+// write-to-temp + atomic rename so no per-key locking is needed.
 class DiskStore {
 public:
     struct Config {
@@ -78,7 +78,7 @@ public:
     [[nodiscard]] size_t fileCount() const;
 
     // Perform initial directory scan to populate totalBytes_.
-    // Called automatically by the constructor if the cache directory exists.
+    // Called lazily on first access that needs the index.
     void initTotalBytes();
 
     // Remove all cached data for a volume.
@@ -97,14 +97,15 @@ private:
     // Remove the index entry for a file path (caller must hold indexMtx_).
     void removeFromIndex(const std::filesystem::path& path);
 
-    // Per-key lock pool to serialize same-key writes
-    mutable utils::LockPool<64> lockPool_;
+    // Lazy initialization: scan disk on first use instead of constructor.
+    void ensureInitialized() const;
 
     Config config_;
 
     // Incrementally tracked total bytes on disk.
-    // Initialized to 0; populated by initTotalBytes() on construction.
+    // Initialized to 0; populated lazily by initTotalBytes() on first use.
     std::atomic<size_t> totalBytes_{0};
+    mutable std::once_flag initOnce_;
 
     // In-memory index of cached files, ordered by modification time.
     // Enables O(1) eviction of the oldest entry instead of O(n) dir scan.

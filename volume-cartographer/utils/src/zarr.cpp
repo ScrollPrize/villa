@@ -87,41 +87,7 @@ ZarrMetadata parse_zarray(std::string_view json_str) {
     if (auto* p = json_find(root, "dimension_separator"); p && p->is_string())
         meta.dimension_separator = p->get_string();
 
-    // filters
-    if (auto* p = json_find(root, "filters"); p && p->is_array()) {
-        for (const auto& fv : (*p)) {
-            if (!fv.is_object()) continue;
-            ZarrFilter filter;
-            auto* fid = json_find(fv, "id");
-            if (!fid || !fid->is_string()) continue;
-            const auto& id_str = fid->get_string();
-            if (id_str == "delta") {
-                filter.id = ZarrFilterId::delta;
-                if (auto* dt = json_find(fv, "dtype"); dt && dt->is_string()) {
-                    if (auto parsed = parse_dtype(dt->get_string())) filter.dtype = *parsed;
-                }
-                if (auto* at = json_find(fv, "astype"); at && at->is_string()) {
-                    if (auto parsed = parse_dtype(at->get_string())) filter.astype = *parsed;
-                }
-            } else if (id_str == "fixedscaleoffset") {
-                filter.id = ZarrFilterId::fixedscaleoffset;
-                if (auto* o = json_find(fv, "offset"); o && o->is_number()) filter.offset = o->get_double();
-                if (auto* sc = json_find(fv, "scale"); sc && sc->is_number()) filter.scale = sc->get_double();
-                if (auto* dt = json_find(fv, "dtype"); dt && dt->is_string()) {
-                    if (auto parsed = parse_dtype(dt->get_string())) filter.dtype = *parsed;
-                }
-            } else if (id_str == "quantize") {
-                filter.id = ZarrFilterId::quantize;
-                if (auto* d = json_find(fv, "digits"); d && d->is_number()) filter.digits = d->get_int();
-                if (auto* dt = json_find(fv, "dtype"); dt && dt->is_string()) {
-                    if (auto parsed = parse_dtype(dt->get_string())) filter.dtype = *parsed;
-                }
-            } else {
-                continue; // skip unknown filters
-            }
-            meta.filters.push_back(filter);
-        }
-    }
+    // filters: not parsed (delta, fixedscaleoffset, quantize are unused)
 
     return meta;
 }

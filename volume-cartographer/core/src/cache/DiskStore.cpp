@@ -1,8 +1,6 @@
 #include "vc/core/cache/DiskStore.hpp"
 #include "vc/core/cache/CacheDebugLog.hpp"
 #include "vc/core/cache/CacheUtils.hpp"
-#include <utils/hash.hpp>
-
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -17,10 +15,16 @@ DiskStore::DiskStore(Config config) : config_(std::move(config))
 {
     if (!config_.root.empty()) {
         std::filesystem::create_directories(config_.root);
-        if (std::filesystem::exists(config_.root)) {
-            initTotalBytes();
-        }
     }
+}
+
+void DiskStore::ensureInitialized() const
+{
+    std::call_once(initOnce_, [this] {
+        if (!config_.root.empty() && std::filesystem::exists(config_.root)) {
+            const_cast<DiskStore*>(this)->initTotalBytes();
+        }
+    });
 }
 
 DiskStore::~DiskStore()
@@ -41,16 +45,11 @@ std::filesystem::path DiskStore::chunkPath(
     return base / std::to_string(key.level) / chunkFilename(key, config_.delimiter);
 }
 
-// Lock key combines volumeId and chunk key for per-key serialization.
-static size_t diskLockKey(const std::string& volumeId, const ChunkKey& key) noexcept
-{
-    return utils::hash_combine(std::hash<std::string>()(volumeId), ChunkKeyHash()(key));
-}
-
 std::optional<std::vector<uint8_t>> DiskStore::get(
     const std::string& volumeId,
     const ChunkKey& key) const
 {
+    ensureInitialized();
     return readFileToVector(chunkPath(volumeId, key));
 }
 
@@ -58,16 +57,10 @@ bool DiskStore::contains(
     const std::string& volumeId,
     const ChunkKey& key) const
 {
+    ensureInitialized();
     auto path = chunkPath(volumeId, key);
-    {
-        std::lock_guard<std::mutex> lk(indexMtx_);
-        if (pathIndex_.find(path.string()) != pathIndex_.end()) {
-            return true;
-        }
-    }
-
-    std::error_code ec;
-    return std::filesystem::exists(path, ec) && !ec;
+    std::lock_guard<std::mutex> lk(indexMtx_);
+    return pathIndex_.find(path.string()) != pathIndex_.end();
 }
 
 void DiskStore::put(
@@ -76,10 +69,8 @@ void DiskStore::put(
     const uint8_t* data,
     size_t size)
 {
+    ensureInitialized();
     auto path = chunkPath(volumeId, key);
-
-    // Serialize writes to same key
-    auto lock = lockPool_.lock<size_t>(diskLockKey(volumeId, key));
 
     // Create parent directories
     std::error_code ec;
@@ -252,11 +243,13 @@ void DiskStore::evictToSize(size_t targetBytes)
 
 size_t DiskStore::totalBytes() const
 {
+    ensureInitialized();
     return totalBytes_.load(std::memory_order_relaxed);
 }
 
 size_t DiskStore::fileCount() const
 {
+    ensureInitialized();
     std::lock_guard<std::mutex> lk(indexMtx_);
     return pathIndex_.size();
 }

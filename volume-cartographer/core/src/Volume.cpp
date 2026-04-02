@@ -614,6 +614,33 @@ int Volume::sampleCompositeBestEffort(cv::Mat_<uint8_t>& out,
     return last;
 }
 
+// Plane bounding box helper shared by samplePlaneBestEffort and ARGB32 variant.
+// Uses a local struct identical to Volume::WorldBBox (which is protected).
+struct PlaneBBox { float loX, loY, loZ, hiX, hiY, hiZ; };
+
+static PlaneBBox planeBBox(const cv::Vec3f& origin,
+                           const cv::Vec3f& vx_step,
+                           const cv::Vec3f& vy_step,
+                           int width, int height)
+{
+    cv::Vec3f corners[4] = {
+        origin,
+        origin + vx_step * static_cast<float>(width - 1),
+        origin + vy_step * static_cast<float>(height - 1),
+        origin + vx_step * static_cast<float>(width - 1) + vy_step * static_cast<float>(height - 1)
+    };
+    PlaneBBox wb;
+    wb.loX = corners[0][0]; wb.hiX = corners[0][0];
+    wb.loY = corners[0][1]; wb.hiY = corners[0][1];
+    wb.loZ = corners[0][2]; wb.hiZ = corners[0][2];
+    for (int c = 1; c < 4; c++) {
+        wb.loX = std::min(wb.loX, corners[c][0]); wb.hiX = std::max(wb.hiX, corners[c][0]);
+        wb.loY = std::min(wb.loY, corners[c][1]); wb.hiY = std::max(wb.hiY, corners[c][1]);
+        wb.loZ = std::min(wb.loZ, corners[c][2]); wb.hiZ = std::max(wb.hiZ, corners[c][2]);
+    }
+    return wb;
+}
+
 int Volume::samplePlaneBestEffort(cv::Mat_<uint8_t>& out,
                                    const cv::Vec3f& origin,
                                    const cv::Vec3f& vx_step,
@@ -624,22 +651,8 @@ int Volume::samplePlaneBestEffort(cv::Mat_<uint8_t>& out,
     const int nScales = static_cast<int>(numScales());
     const int level = params.level;
 
-    // Compute world-space bounding box from the 4 corners of the plane
-    cv::Vec3f corners[4] = {
-        origin,
-        origin + vx_step * static_cast<float>(width - 1),
-        origin + vy_step * static_cast<float>(height - 1),
-        origin + vx_step * static_cast<float>(width - 1) + vy_step * static_cast<float>(height - 1)
-    };
-    WorldBBox wb;
-    wb.loX = corners[0][0]; wb.hiX = corners[0][0];
-    wb.loY = corners[0][1]; wb.hiY = corners[0][1];
-    wb.loZ = corners[0][2]; wb.hiZ = corners[0][2];
-    for (int c = 1; c < 4; c++) {
-        wb.loX = std::min(wb.loX, corners[c][0]); wb.hiX = std::max(wb.hiX, corners[c][0]);
-        wb.loY = std::min(wb.loY, corners[c][1]); wb.hiY = std::max(wb.hiY, corners[c][1]);
-        wb.loZ = std::min(wb.loZ, corners[c][2]); wb.hiZ = std::max(wb.hiZ, corners[c][2]);
-    }
+    auto pb = planeBBox(origin, vx_step, vy_step, width, height);
+    WorldBBox wb{pb.loX, pb.loY, pb.loZ, pb.hiX, pb.hiY, pb.hiZ};
 
     for (int lvl = level; lvl < nScales; lvl++) {
         if (allChunksCachedFast(wb, lvl)) {
@@ -697,22 +710,8 @@ int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
     const int nScales = static_cast<int>(numScales());
     const int level = params.level;
 
-    // Compute world-space bounding box from the 4 corners of the plane
-    cv::Vec3f corners[4] = {
-        origin,
-        origin + vx_step * static_cast<float>(width - 1),
-        origin + vy_step * static_cast<float>(height - 1),
-        origin + vx_step * static_cast<float>(width - 1) + vy_step * static_cast<float>(height - 1)
-    };
-    WorldBBox wb;
-    wb.loX = corners[0][0]; wb.hiX = corners[0][0];
-    wb.loY = corners[0][1]; wb.hiY = corners[0][1];
-    wb.loZ = corners[0][2]; wb.hiZ = corners[0][2];
-    for (int c = 1; c < 4; c++) {
-        wb.loX = std::min(wb.loX, corners[c][0]); wb.hiX = std::max(wb.hiX, corners[c][0]);
-        wb.loY = std::min(wb.loY, corners[c][1]); wb.hiY = std::max(wb.hiY, corners[c][1]);
-        wb.loZ = std::min(wb.loZ, corners[c][2]); wb.hiZ = std::max(wb.hiZ, corners[c][2]);
-    }
+    auto pb = planeBBox(origin, vx_step, vy_step, width, height);
+    WorldBBox wb{pb.loX, pb.loY, pb.loZ, pb.hiX, pb.hiY, pb.hiZ};
 
     for (int lvl = level; lvl < nScales; lvl++) {
         if (allChunksCachedFast(wb, lvl)) {
@@ -933,13 +932,9 @@ void Volume::computeDataBounds()
 
 const Volume::DataBounds& Volume::dataBounds() const
 {
-    if (!boundsComputed_.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(boundsMutex_);
-        if (!boundsComputed_.load(std::memory_order_relaxed)) {
-            const_cast<Volume*>(this)->computeDataBounds();
-            boundsComputed_.store(true, std::memory_order_release);
-        }
-    }
+    std::call_once(boundsOnce_, [this] {
+        const_cast<Volume*>(this)->computeDataBounds();
+    });
     return dataBounds_;
 }
 

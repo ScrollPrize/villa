@@ -145,8 +145,6 @@ set(srcs
     tiled/TileRenderer.hpp
     tiled/TileRenderController.cpp
     tiled/TileRenderController.hpp
-    tiled/SliceCache.cpp
-    tiled/SliceCache.hpp
     tiled/RenderPool.cpp
     tiled/RenderPool.hpp
     tiled/PostProcess.cpp

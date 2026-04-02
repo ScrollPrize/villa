@@ -279,26 +279,6 @@ public:
         return perform(url, Method::PUT, data, content_type);
     }
 
-    // Check if URL exists (HEAD + check status)
-    [[nodiscard]] bool exists(std::string_view url) const {
-        return head(url).ok();
-    }
-
-    // Download to file
-    bool download(std::string_view url, const std::filesystem::path& dest) const {
-        auto resp = get(url);
-        if (!resp.ok())
-            return false;
-
-        std::ofstream out(dest, std::ios::binary);
-        if (!out)
-            return false;
-
-        out.write(reinterpret_cast<const char*>(resp.body.data()),
-                  static_cast<std::streamsize>(resp.body.size()));
-        return out.good();
-    }
-
 private:
     enum class Method { GET, GET_RANGE, HEAD, PUT };
 

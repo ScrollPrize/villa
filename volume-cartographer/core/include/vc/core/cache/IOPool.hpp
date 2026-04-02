@@ -28,7 +28,7 @@ public:
     // Called from worker threads. Must be thread-safe.
     using FetchFunc = std::function<std::vector<uint8_t>(const ChunkKey&)>;
 
-    explicit IOPool(int numThreads = 4, size_t maxQueueSize = 1000);
+    explicit IOPool(int numThreads = 4);
     ~IOPool();
 
     // Start worker threads. Must be called after setFetchFunc/setCompletionCallback.
@@ -51,9 +51,8 @@ public:
     // Uses backpressure: cancels pending tasks if queue would overflow.
     void submit(const std::vector<ChunkKey>& keys);
 
-    // Submit keys without cancel-on-overflow (for background prefetch).
-    // Silently drops keys that don't fit in the queue.
-    void submitBackground(const std::vector<ChunkKey>& keys);
+    // Alias for submit(vector) — kept for call-site clarity.
+    void submitBackground(const std::vector<ChunkKey>& keys) { submit(keys); }
 
     // Cancel all pending (not in-flight) tasks.
     void cancelPending();
@@ -96,7 +95,6 @@ private:
     CompletionCallback onComplete_;
 
     Queue queue_;
-    size_t maxQueueSize_;
     std::atomic<uint64_t> nextSeq_{0};
 
     int numThreads_;

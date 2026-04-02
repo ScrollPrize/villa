@@ -11,7 +11,6 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "SliceCache.hpp"
 #include "RenderPool.hpp"
 #include "TileScene.hpp"
 #include "TiledViewerCamera.hpp"
@@ -21,7 +20,7 @@ class QTimer;
 class Surface;
 class Volume;
 
-// Orchestrates tile rendering: checks cache, submits misses to background
+// Orchestrates tile rendering: submits visible tiles to the background
 // pool, drains completed results, and updates the tile scene.
 //
 // All public methods must be called from the main thread.
@@ -34,9 +33,7 @@ public:
     ~TileRenderController() override;
 
     // Called when camera state changes (pan, zoom, slice offset).
-    // For each visible tile:
-    //   - Cache hit -> apply pixmap immediately
-    //   - Cache miss -> submit to background pool
+    // Submits visible tiles to the background pool (skipping in-flight duplicates).
     void onCameraChanged(const TiledViewerCamera& camera,
                          const std::shared_ptr<Surface>& surface,
                          const std::shared_ptr<Volume>& volume,
@@ -44,7 +41,7 @@ public:
                          const QRectF& viewportRect);
 
     // Called when rendering parameters change (window/level, colormap, etc.)
-    // Clears the slice cache and re-renders everything.
+    // Re-renders everything.
     void onParamsChanged(const TiledViewerCamera& camera,
                          const std::shared_ptr<Surface>& surface,
                          const std::shared_ptr<Volume>& volume,
@@ -66,14 +63,7 @@ public:
     // (e.g. chunk-arrival) cannot re-trigger renders with an old volume.
     void clearState();
 
-    // Access the slice cache (for stats, manual invalidation, etc.)
-    SliceCache& sliceCache() { return _cache; }
     RenderPool* renderPool() const { return _renderPool; }
-
-    // Hash rendering parameters for cache key generation.
-    // Should be recomputed whenever window/level, colormap, composite settings change.
-    void setParamsHash(uint64_t hash) { _paramsHash = hash; }
-    uint64_t paramsHash() const { return _paramsHash; }
 
     // Progressive rendering: show coarse previews while full-res loads
     void setProgressiveEnabled(bool enabled) { _progressiveEnabled = enabled; }
@@ -102,14 +92,12 @@ private slots:
 
 private:
     TileScene* _tileScene;
-    SliceCache _cache;
     RenderPool* _renderPool;  // shared, not owned
     QTimer* _tickTimer;
 
     std::shared_ptr<std::atomic<uint64_t>> _currentEpoch = std::make_shared<std::atomic<uint64_t>>(0);
     int _controllerId;
     static inline std::atomic<int> _nextControllerId{0};
-    uint64_t _paramsHash = 0;
     QRectF _lastViewportRect;
     bool _progressiveEnabled = true;
 

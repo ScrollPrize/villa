@@ -125,11 +125,6 @@ public:
         return queued_set_.contains(item);
     }
 
-    [[nodiscard]] bool is_known(const T& item) const {
-        std::lock_guard lock(mutex_);
-        return queued_set_.contains(item);
-    }
-
     // -- size / state -------------------------------------------------------
 
     [[nodiscard]] std::size_t queued_count() const noexcept {

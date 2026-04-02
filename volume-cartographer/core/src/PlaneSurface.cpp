@@ -275,18 +275,32 @@ void PlaneSurface::gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals
             __m128 px = _mm_add_ps(base_x, _mm_mul_ps(idx4, step_x));
             __m128 py = _mm_add_ps(base_y, _mm_mul_ps(idx4, step_y));
             __m128 pz = _mm_add_ps(base_z, _mm_mul_ps(idx4, step_z));
-            // Interleave x,y,z for 4 Vec3f: need to produce [x0,y0,z0, x1,y1,z1, ...]
-            // Transpose from SOA to AOS
-            // px = [x0, x1, x2, x3], py = [y0, y1, y2, y3], pz = [z0, z1, z2, z3]
-            float xs[4], ys[4], zs[4];
-            _mm_storeu_ps(xs, px);
-            _mm_storeu_ps(ys, py);
-            _mm_storeu_ps(zs, pz);
+            // SOA -> AOS: [x0..x3],[y0..y3],[z0..z3] -> [x0,y0,z0,x1,y1,z1,...]
+            // Produce 3 output registers of 4 floats (12 floats for 4 Vec3f).
+            //
+            // _mm_shuffle_ps(A, B, _MM_SHUFFLE(d,c,b,a)):
+            //   result = [A[a], A[b], B[c], B[d]]
+            //
+            // Intermediates:
+            __m128 xy_lo = _mm_unpacklo_ps(px, py); // [x0,y0,x1,y1]
+            __m128 xy_hi = _mm_unpackhi_ps(px, py); // [x2,y2,x3,y3]
+            // out0 = [x0, y0, z0, x1]
+            //   [x0,y0] from xy_lo[0,1], [z0,x1] via shuffle of pz and px
+            __m128 zx = _mm_unpacklo_ps(pz, px);    // [z0,x0,z1,x1]
+            __m128 out0 = _mm_shuffle_ps(xy_lo, zx, _MM_SHUFFLE(3,0,1,0));
+            // out1 = [y1, z1, x2, y2]
+            //   [y1,z1] from yz interleave, [x2,y2] from xy_hi
+            __m128 yz = _mm_unpacklo_ps(py, pz);    // [y0,z0,y1,z1]
+            __m128 out1 = _mm_shuffle_ps(yz, xy_hi, _MM_SHUFFLE(1,0,3,2));
+            // out2 = [z2, x3, y3, z3]
+            //   [z2,x3] from zx_hi, [y3,z3] from yz_hi
+            __m128 zx_hi = _mm_unpackhi_ps(pz, px); // [z2,x2,z3,x3]
+            __m128 yz_hi = _mm_unpackhi_ps(py, pz); // [y2,z2,y3,z3]
+            __m128 out2 = _mm_shuffle_ps(zx_hi, yz_hi, _MM_SHUFFLE(3,2,3,0));
             float *dst = row + i * 3;
-            dst[0]  = xs[0]; dst[1]  = ys[0]; dst[2]  = zs[0];
-            dst[3]  = xs[1]; dst[4]  = ys[1]; dst[5]  = zs[1];
-            dst[6]  = xs[2]; dst[7]  = ys[2]; dst[8]  = zs[2];
-            dst[9]  = xs[3]; dst[10] = ys[3]; dst[11] = zs[3];
+            _mm_storeu_ps(dst + 0, out0);
+            _mm_storeu_ps(dst + 4, out1);
+            _mm_storeu_ps(dst + 8, out2);
             idx4 = _mm_add_ps(idx4, four);
         }
         // Scalar tail

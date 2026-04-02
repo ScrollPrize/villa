@@ -7,7 +7,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <optional>
@@ -40,7 +39,7 @@ namespace vc::cache {
 //   - get() / getBestAvailable(): safe from any thread
 //   - getBlocking(): safe from any thread (may block)
 //   - prefetch(): safe from any thread (non-blocking)
-//   - Hot tier: shared_mutex (many readers, occasional writer)
+//   - Hot tier: sharded LRU (many readers, occasional writer)
 class TieredChunkCache {
 public:
     struct Config {
@@ -203,7 +202,7 @@ public:
 
 private:
     // --- Hot tier (decompressed in RAM) ---
-    // Sharded across 16 independent LRU caches to eliminate shared_mutex
+    // Sharded across 16 independent LRU caches to eliminate mutex
     // atomic contention on concurrent reads (12% CPU on aarch64).
     utils::ShardedLRUCache<ChunkKey, ChunkDataPtr, ChunkKeyHash> hotCache_;
 
@@ -230,7 +229,7 @@ private:
     // Persisted to disk alongside the cold tier so it survives restarts.
     //
     // Fast path: atomic bloom filter rejects most lookups without taking the
-    // shared_mutex. The bloom filter has false positives but no false negatives,
+    // mutex. The bloom filter has false positives but no false negatives,
     // so a negative bloom result means "definitely not in negative cache"
     // (i.e. the chunk might exist -- proceed to fetch).
     static constexpr size_t kBloomBits = 65536;  // 8 KB, ~1% FPR at 5000 entries
@@ -238,7 +237,7 @@ private:
     void bloomAdd(const ChunkKey& key);
     [[nodiscard]] bool bloomMayContain(const ChunkKey& key) const;
     void bloomClear();
-    mutable std::shared_mutex negativeMutex_;
+    mutable std::mutex negativeMutex_;
     std::unordered_set<ChunkKey, ChunkKeyHash> negativeCache_;
     void loadNegativeCache();
     void saveNegativeCache() const;

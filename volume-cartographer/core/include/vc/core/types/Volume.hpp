@@ -216,8 +216,7 @@ protected:
 
     // Data bounds (lazy-computed from volume shape)
     mutable DataBounds dataBounds_;
-    mutable std::atomic<bool> boundsComputed_{false};
-    mutable std::mutex boundsMutex_;
+    mutable std::once_flag boundsOnce_;
 
     // Remote level-5 priming state
     mutable std::mutex remoteLevel5PrimeMutex_;

@@ -68,7 +68,6 @@ TileRenderResult TileRenderer::renderTile(
     TileRenderResult result;
     result.worldKey = params.worldKey;
     result.epoch = params.epoch;
-    result.cacheIdentity = params.cacheIdentity;
     result.scale = params.scale;
     result.zOff = params.zOff;
     result.dsScaleIdx = params.dsScaleIdx;

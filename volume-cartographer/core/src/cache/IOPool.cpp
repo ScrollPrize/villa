@@ -6,9 +6,8 @@
 
 namespace vc::cache {
 
-IOPool::IOPool(int numThreads, size_t maxQueueSize)
-    : maxQueueSize_(maxQueueSize)
-    , numThreads_(numThreads)
+IOPool::IOPool(int numThreads)
+    : numThreads_(numThreads)
 {
 }
 
@@ -73,16 +72,6 @@ void IOPool::submit(const ChunkKey& key)
 }
 
 void IOPool::submit(const std::vector<ChunkKey>& keys)
-{
-    std::vector<Task> tasks;
-    tasks.reserve(keys.size());
-    for (const auto& k : keys) {
-        tasks.push_back(Task{k, nextSeq_.fetch_add(1, std::memory_order_relaxed)});
-    }
-    queue_.submit_batch(tasks.begin(), tasks.end());
-}
-
-void IOPool::submitBackground(const std::vector<ChunkKey>& keys)
 {
     std::vector<Task> tasks;
     tasks.reserve(keys.size());

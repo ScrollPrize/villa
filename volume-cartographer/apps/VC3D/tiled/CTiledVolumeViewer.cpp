@@ -1,5 +1,4 @@
 #include "CTiledVolumeViewer.hpp"
-#include <utils/hash.hpp>
 
 #include "ViewerManager.hpp"
 #include "VCSettings.hpp"
@@ -335,7 +334,6 @@ void CTiledVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     // Invalidate all caches and cancel in-flight work from the old volume
     _renderController->cancelAll();
     _renderController->clearState();
-    _renderController->sliceCache().clear();
     _tileScene->resetMetadata();
 
     // Remove old chunk-ready listener before switching volumes
@@ -402,7 +400,7 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
         _surfBBoxCache = {};  // invalidate bounding box cache
         if (!surf) {
             _surfaceContentVersion = 0;
-            updateParamsHash();
+
             clearAllOverlayGroups();
             _tileScene->sceneCleared();
             _ov.cursor = nullptr;
@@ -417,24 +415,23 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
             invalidateVis();
             if (isInPlaceQuadEditUpdate) {
                 ++_surfaceContentVersion;
-                updateParamsHash();
+    
             } else if (isInPlacePlaneUpdate) {
                 _surfaceContentVersion = 0;
-                updateParamsHash();
+    
                 updateContentMinScale();
                 rebuildContentGrid();
                 centerViewport();
             } else {
                 _surfaceContentVersion = 0;
-                updateParamsHash();
+    
                 if (!isEditUpdate) {
                     _camera.zOff = 0.0f;
                 }
 
-                // Full surface changes: cancel stale work and clear cache,
+                // Full surface changes: cancel stale work,
                 // but keep old tiles visible via retained layer (no gray flash).
                 _renderController->cancelAll();
-                _renderController->sliceCache().clear();
 
                 updateContentMinScale();
                 rebuildContentGrid();
@@ -783,9 +780,8 @@ void CTiledVolumeViewer::onDataBoundsReady()
         }
     }
 
-    // Clear stale caches, rebuild grid with retained tile layer (no gray flash)
+    // Cancel stale work, rebuild grid with retained tile layer (no gray flash)
     _renderController->cancelAll();
-    _renderController->sliceCache().clear();
     updateContentMinScale();
     rebuildContentGrid();
     centerViewport();
@@ -1281,40 +1277,6 @@ bool CTiledVolumeViewer::computeQuadPrefetchBBox(const std::shared_ptr<Surface>&
     return clampToDataBounds(lo, hi);
 }
 
-void CTiledVolumeViewer::updateParamsHash()
-{
-    const std::string overlayId = _overlayVolume ? _overlayVolume->id() : std::string{};
-    auto h = utils::hash_combine_values(
-        _surfaceContentVersion,
-        _baseWindowLow, _baseWindowHigh, _stretchValues,
-        _baseColormapId, _useFastInterpolation,
-        overlayId, _overlayOpacity, _overlayColormapId,
-        _overlayWindowLow, _overlayWindowHigh,
-        // Composite settings — all fields that affect rendered output
-        _compositeSettings.enabled,
-        _compositeSettings.layersFront, _compositeSettings.layersBehind,
-        _compositeSettings.reverseDirection,
-        _compositeSettings.planeEnabled,
-        _compositeSettings.planeLayersFront, _compositeSettings.planeLayersBehind,
-        _compositeSettings.useVolumeGradients,
-        // CompositeParams
-        _compositeSettings.params.method,
-        _compositeSettings.params.isoCutoff,
-        _compositeSettings.params.alphaMin, _compositeSettings.params.alphaMax,
-        _compositeSettings.params.alphaOpacity, _compositeSettings.params.alphaCutoff,
-        _compositeSettings.params.blExtinction, _compositeSettings.params.blEmission,
-        _compositeSettings.params.blAmbient,
-        _compositeSettings.params.lightingEnabled,
-        _compositeSettings.params.lightAzimuth, _compositeSettings.params.lightElevation,
-        _compositeSettings.params.lightDiffuse, _compositeSettings.params.lightAmbient,
-        // Postprocessing
-        _compositeSettings.postStretchValues,
-        _compositeSettings.postRemoveSmallComponents,
-        _compositeSettings.postMinComponentSize);
-
-    _renderController->setParamsHash(h);
-}
-
 TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) const
 {
     TileRenderParams params;
@@ -1322,8 +1284,6 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     params.epoch = _camera.epoch;
 
     const bool interactionActive = interactionRenderActive();
-    uint64_t cacheIdentity = _renderController ? _renderController->paramsHash() : 0;
-    params.cacheIdentity = cacheIdentity;
 
     // Surface parameter ROI from world tile coordinates
     params.surfaceROI.x = wk.worldCol * _contentBounds.worldTileSize;
@@ -1724,15 +1684,6 @@ void CTiledVolumeViewer::updateStatusLabel()
             _compositeSettings.layersFront + _compositeSettings.layersBehind);
     }
 
-    // Cache stats
-    {
-        auto& sc = _renderController->sliceCache();
-        size_t scTotal = sc.hits() + sc.misses();
-        if (scTotal > 0) {
-            int scPct = static_cast<int>(100 * sc.hits() / scTotal);
-            status += QString(" | S%1").arg(scPct);
-        }
-    }
     if (_volume && _volume->tieredCache()) {
         auto s = _volume->tieredCache()->stats();
 
@@ -1902,8 +1853,8 @@ void CTiledVolumeViewer::setCompositeRenderSettings(const CompositeRenderSetting
     if (_compositeSettings == settings) return;
     _compositeSettings = settings;
     _compositeSettings.params.updateLightDir();
-    updateParamsHash();
-    // Params changed: clear cache and re-render
+
+    // Params changed: re-render
     auto surf = _surfWeak.lock();
     if (_volume && surf) {
         _camera.invalidate();
@@ -1923,7 +1874,7 @@ void CTiledVolumeViewer::setVolumeWindow(float low, float high)
     if (std::abs(cLow - _baseWindowLow) < 1e-6f && std::abs(cHigh - _baseWindowHigh) < 1e-6f) return;
     _baseWindowLow = cLow;
     _baseWindowHigh = cHigh;
-    updateParamsHash();
+
     if (_volume) renderVisible(true);
 }
 
@@ -1931,7 +1882,7 @@ void CTiledVolumeViewer::setBaseColormap(const std::string& id)
 {
     if (_baseColormapId == id) return;
     _baseColormapId = id;
-    updateParamsHash();
+
     if (_volume) renderVisible(true);
 }
 
@@ -1939,14 +1890,14 @@ void CTiledVolumeViewer::setStretchValues(bool enabled)
 {
     if (_stretchValues == enabled) return;
     _stretchValues = enabled;
-    updateParamsHash();
+
     if (_volume) renderVisible(true);
 }
 
 void CTiledVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> vol)
 {
     _overlayVolume = std::move(vol);
-    updateParamsHash();
+
     if (_volume) renderVisible(true);
 }
 
@@ -1955,7 +1906,7 @@ void CTiledVolumeViewer::setOverlayOpacity(float opacity)
     const float clamped = std::clamp(opacity, 0.0f, 1.0f);
     if (std::abs(clamped - _overlayOpacity) < 1e-6f) return;
     _overlayOpacity = clamped;
-    updateParamsHash();
+
     if (_volume) renderVisible(true);
 }
 
@@ -1963,7 +1914,7 @@ void CTiledVolumeViewer::setOverlayColormap(const std::string& id)
 {
     if (_overlayColormapId == id) return;
     _overlayColormapId = id;
-    updateParamsHash();
+
     if (_volume) renderVisible(true);
 }
 void CTiledVolumeViewer::setOverlayThreshold(float threshold) { setOverlayWindow(std::max(threshold, 0.0f), _overlayWindowHigh); }
@@ -1980,7 +1931,7 @@ void CTiledVolumeViewer::setOverlayWindow(float low, float high)
     }
     _overlayWindowLow = clampedLow;
     _overlayWindowHigh = clampedHigh;
-    updateParamsHash();
+
     if (_volume) renderVisible(true);
 }
 

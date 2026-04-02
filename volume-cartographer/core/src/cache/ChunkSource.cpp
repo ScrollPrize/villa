@@ -152,10 +152,33 @@ HttpChunkSource::HttpChunkSource(
         baseUrl_.pop_back();
     }
 
+    buildCachedAuth();
+
 #ifdef VC_USE_CURL
     static std::once_flag curlOnce;
     std::call_once(curlOnce, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
 #endif
+}
+
+void HttpChunkSource::buildCachedAuth()
+{
+    if (!auth_.awsSigv4) return;
+    cachedSigv4_ = "aws:amz:" + auth_.region + ":s3";
+    cachedUserpwd_ = auth_.accessKey + ":" + auth_.secretKey;
+    if (!auth_.sessionToken.empty())
+        cachedTokenHeader_ = "x-amz-security-token: " + auth_.sessionToken;
+}
+
+void HttpChunkSource::applyCachedAuth(
+    CURL* curl, struct curl_slist*& outHeaders) const
+{
+    if (!auth_.awsSigv4) return;
+    curl_easy_setopt(curl, CURLOPT_AWS_SIGV4, cachedSigv4_.c_str());
+    curl_easy_setopt(curl, CURLOPT_USERPWD, cachedUserpwd_.c_str());
+    if (!cachedTokenHeader_.empty()) {
+        outHeaders = curl_slist_append(outHeaders, cachedTokenHeader_.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, outHeaders);
+    }
 }
 
 HttpChunkSource::~HttpChunkSource() = default;
@@ -224,9 +247,10 @@ int HttpChunkSource::totalChunksPerShard() const
 }
 
 // Helper: perform a full HTTP GET, returning raw bytes.
+// Uses the pre-computed auth strings from the HttpChunkSource instance.
 #ifdef VC_USE_CURL
 static std::vector<uint8_t> httpGetBytes(
-    const std::string& url, const HttpAuth& auth, size_t reserveHint = 2 * 1024 * 1024)
+    const std::string& url, const HttpChunkSource& src, size_t reserveHint = 2 * 1024 * 1024)
 {
     thread_local CURL* curl = curl_easy_init();
     if (!curl) return {};
@@ -258,8 +282,10 @@ static std::vector<uint8_t> httpGetBytes(
     curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 512L * 1024L);
     curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
 
-    auto authGuard = applyCurlAuth(curl, auth);
+    struct curl_slist* authHeaders = nullptr;
+    src.applyCachedAuth(curl, authHeaders);
     CURLcode res = curl_easy_perform(curl);
+    if (authHeaders) curl_slist_free_all(authHeaders);
 
     if (res != CURLE_OK) {
         long httpCode = 0;
@@ -295,18 +321,23 @@ std::vector<uint8_t> HttpChunkSource::fetchFromShard(const ChunkKey& key)
 
     if (!shardData) {
 #ifdef VC_USE_CURL
-        auto raw = httpGetBytes(url, auth_, 8 * 1024 * 1024);
+        auto raw = httpGetBytes(url, *this, 8 * 1024 * 1024);
         if (raw.empty()) return {};
         shardData = std::make_shared<std::vector<uint8_t>>(std::move(raw));
 
         std::lock_guard<std::mutex> lock(shardCacheMutex_);
+        // Evict entire cache if over limit (shards are re-fetchable)
+        if (shardCache_.size() >= 16)
+            shardCache_.clear();
+
         // Another thread may have inserted while we fetched — keep first
         auto [it, inserted] = shardCache_.emplace(url, shardData);
         if (!inserted) shardData = it->second;
 
         if (auto* log = cacheDebugLog())
-            std::fprintf(log, "[SHARD] Cached %s (%zu bytes, %d entries)\n",
-                         url.c_str(), shardData->size(), totalChunksPerShard());
+            std::fprintf(log, "[SHARD] Cached %s (%zu bytes, %d entries, cache=%zu)\n",
+                         url.c_str(), shardData->size(), totalChunksPerShard(),
+                         shardCache_.size());
 #else
         return {};
 #endif
@@ -342,7 +373,7 @@ std::vector<uint8_t> HttpChunkSource::fetch(const ChunkKey& key)
         return fetchFromShard(key);
 
 #ifdef VC_USE_CURL
-    return httpGetBytes(chunkUrl(key), auth_);
+    return httpGetBytes(chunkUrl(key), *this);
 #else
     (void)key;
     return {};

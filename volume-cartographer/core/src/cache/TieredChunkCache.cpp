@@ -9,6 +9,17 @@
 
 namespace vc::cache {
 
+static bool isAllZero(const uint8_t* data, size_t size)
+{
+    const auto* p = reinterpret_cast<const uint64_t*>(data);
+    size_t n8 = size / 8;
+    for (size_t i = 0; i < n8; i++)
+        if (p[i] != 0) return false;
+    for (size_t i = n8 * 8; i < size; i++)
+        if (data[i] != 0) return false;
+    return true;
+}
+
 // Helper to build LRUCache config for the hot tier
 static auto makeHotConfig(const TieredChunkCache::Config& cfg) {
     using HotCache = utils::LRUCache<ChunkKey, ChunkDataPtr, ChunkKeyHash>;
@@ -32,7 +43,7 @@ TieredChunkCache::TieredChunkCache(
     , diskStore_(std::move(diskStore))
     , source_(std::move(source))
     , decompress_(std::move(decompress))
-    , ioPool_(config_.ioThreads, config_.ioQueueSize)
+    , ioPool_(config_.ioThreads)
 {
     // Shared fetch function: check cold (disk) first, then ice (remote)
     IOPool::FetchFunc fetchFunc = [this](const ChunkKey& key) -> std::vector<uint8_t> {
@@ -79,24 +90,11 @@ TieredChunkCache::TieredChunkCache(
         }
 
         // Detect all-zero chunks (zarr fill_value=0 for non-existent chunks).
-        {
-            bool allZero = true;
-            const auto* p = reinterpret_cast<const uint64_t*>(data.data());
-            size_t n8 = data.size() / 8;
-            for (size_t i = 0; i < n8; i++) {
-                if (p[i] != 0) { allZero = false; break; }
-            }
-            if (allZero) {
-                for (size_t i = n8 * 8; i < data.size(); i++) {
-                    if (data[i] != 0) { allZero = false; break; }
-                }
-            }
-            if (allZero) {
-                if (auto* log = cacheDebugLog())
-                    std::fprintf(log, "FETCH ice-allzero lvl=%d (%d,%d,%d) bytes=%zu %ldms\n",
-                                 key.level, key.iz, key.iy, key.ix, data.size(), fetchMs);
-                return {};
-            }
+        if (isAllZero(data.data(), data.size())) {
+            if (auto* log = cacheDebugLog())
+                std::fprintf(log, "FETCH ice-allzero lvl=%d (%d,%d,%d) bytes=%zu %ldms\n",
+                             key.level, key.iz, key.iy, key.ix, data.size(), fetchMs);
+            return {};
         }
 
         auto n = statIceFetches_.fetch_add(1, std::memory_order_relaxed);
@@ -125,7 +123,7 @@ TieredChunkCache::TieredChunkCache(
                 // Empty fetch result: negative cache (chunk doesn't exist)
                 bloomAdd(key);
                 {
-                    std::unique_lock lock(negativeMutex_);
+                    std::lock_guard lock(negativeMutex_);
                     negativeCache_.insert(key);
                 }
                 if (auto* log = cacheDebugLog())
@@ -270,24 +268,21 @@ ChunkDataPtr TieredChunkCache::getBlocking(const ChunkKey& key)
     if (coarse) return coarse;
 
     // Fast path: hot cache hit. This is the common case during rendering —
-    // just hash + shard + shared_lock + flat-map probe + return.
+    // just hash + shard + lock_guard + flat-map probe + return.
     auto hot = hotGet(key);
     if (hot) {
         statHotHits_.fetch_add(1, std::memory_order_relaxed);
         return hot;
     }
 
-    // Known non-existent? Bloom filter fast-reject avoids the shared_mutex.
-    if (bloomMayContain(key)) {
-        std::shared_lock lock(negativeMutex_);
-        if (negativeCache_.count(key)) return nullptr;
-    }
+    // Known non-existent?
+    if (isNegativeCached(key)) return nullptr;
 
     // Full promotion chain: cold → hot, or ice → cold → hot
     auto data = loadFull(key);
     if (!data) {
         bloomAdd(key);
-        std::unique_lock lock(negativeMutex_);
+        std::lock_guard lock(negativeMutex_);
         negativeCache_.insert(key);
     }
     return data;
@@ -382,12 +377,24 @@ void TieredChunkCache::prefetchLevel(int level, PrefetchProgressCb progressCb)
 
     std::vector<ChunkKey> keys;
     keys.reserve(total);
+    int skipped = 0;
     for (int iz = 0; iz < gridZ; iz++)
         for (int iy = 0; iy < gridY; iy++)
-            for (int ix = 0; ix < gridX; ix++)
-                keys.push_back({level, iz, iy, ix});
+            for (int ix = 0; ix < gridX; ix++) {
+                ChunkKey key{level, iz, iy, ix};
+                // Skip chunks already known to be empty (from propagateZeroChunks)
+                if (isNegativeCached(key)) {
+                    skipped++;
+                } else {
+                    keys.push_back(key);
+                }
+            }
 
-    ioPool_.submitBackground(keys);
+    if (!keys.empty())
+        ioPool_.submitBackground(keys);
+
+    std::fprintf(stderr, "[Volume] Level %d: %d to fetch, %d skipped (known empty)\n",
+                 level, static_cast<int>(keys.size()), skipped);
 
     if (progressCb)
         progressCb(total, total);
@@ -456,21 +463,14 @@ void TieredChunkCache::propagateZeroChunks(int coarseLevel)
             for (int ix = 0; ix < cGridX; ix++) {
                 ChunkKey key{coarseLevel, iz, iy, ix};
                 auto data = getCoarse(key);
-                if (!data) continue;  // not loaded, skip
+                if (!data) {
+                    // Null = chunk doesn't exist = all zeros (zarr fill_value=0)
+                    zeroChunks.push_back(key);
+                    continue;
+                }
 
-                // Check if chunk is all zeros
-                const auto* bytes = reinterpret_cast<const uint64_t*>(data->rawData());
-                size_t n8 = data->totalBytes() / 8;
-                bool allZero = true;
-                for (size_t i = 0; i < n8; i++) {
-                    if (bytes[i] != 0) { allZero = false; break; }
-                }
-                if (allZero) {
-                    for (size_t i = n8 * 8; i < data->totalBytes(); i++) {
-                        if (data->rawData()[i] != 0) { allZero = false; break; }
-                    }
-                }
-                if (allZero) {
+                // Check if chunk data is all zeros
+                if (isAllZero(data->rawData(), data->totalBytes())) {
                     zeroChunks.push_back(key);
                 }
             }
@@ -484,7 +484,7 @@ void TieredChunkCache::propagateZeroChunks(int coarseLevel)
     // Each coarse chunk covers a 2x region at the next finer level in each axis.
     int totalNegated = 0;
     {
-        std::unique_lock lock(negativeMutex_);
+        std::lock_guard lock(negativeMutex_);
         for (int lvl = coarseLevel - 1; lvl >= 0; lvl--) {
             int scale = 1 << (coarseLevel - lvl);  // 2, 4, 8, ...
             auto fineShape = levelShape(lvl);
@@ -532,7 +532,7 @@ void TieredChunkCache::clearAll()
     clearMemory();
     bloomClear();
     {
-        std::unique_lock lock(negativeMutex_);
+        std::lock_guard lock(negativeMutex_);
         negativeCache_.clear();
     }
     if (diskStore_) {
@@ -574,7 +574,7 @@ bool TieredChunkCache::isNegativeCached(const ChunkKey& key) const
 {
     // Bloom filter fast-reject: if bloom says no, definitely not cached.
     if (!bloomMayContain(key)) return false;
-    std::shared_lock lock(negativeMutex_);
+    std::lock_guard lock(negativeMutex_);
     return negativeCache_.count(key) > 0;
 }
 
@@ -659,7 +659,7 @@ auto TieredChunkCache::stats() const -> Stats
         s.diskWrites = statDiskWrites_.load(std::memory_order_relaxed);
     }
     {
-        std::shared_lock lock(negativeMutex_);
+        std::lock_guard lock(negativeMutex_);
         s.negativeCount = negativeCache_.size();
     }
     return s;
@@ -736,12 +736,7 @@ bool TieredChunkCache::isReadyForNonBlockingRead(const ChunkKey& key) const
     if (key.level == coarseLevel_ && !coarseData_.empty()) return true;
     if (hotCache_.contains(key)) return true;
 
-    // Bloom filter fast-reject avoids the shared_mutex on the common path
-    // (most keys are NOT negative-cached).
-    if (bloomMayContain(key)) {
-        std::shared_lock lock(negativeMutex_);
-        if (negativeCache_.count(key)) return true;
-    }
+    if (isNegativeCached(key)) return true;
 
     return false;
 }
@@ -801,7 +796,7 @@ void TieredChunkCache::saveNegativeCache() const
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f.is_open()) return;
 
-    std::shared_lock lock(negativeMutex_);
+    std::lock_guard lock(negativeMutex_);
     for (const auto& key : negativeCache_) {
         int32_t level = key.level, iz = key.iz, iy = key.iy, ix = key.ix;
         f.write(reinterpret_cast<const char*>(&level), 4);

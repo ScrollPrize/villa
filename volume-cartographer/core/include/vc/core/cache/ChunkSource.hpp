@@ -100,6 +100,10 @@ public:
     [[nodiscard]] std::array<int, 3> chunkShape(int level) const override;
     [[nodiscard]] std::array<int, 3> levelShape(int level) const override;
 
+    // Apply pre-computed auth to a CURL handle. outHeaders is appended to
+    // (caller must free after curl_easy_perform).
+    void applyCachedAuth(CURL* curl, struct curl_slist*& outHeaders) const;
+
 private:
     std::string chunkUrl(const ChunkKey& key) const;
     std::string shardUrl(const ChunkKey& key) const;
@@ -108,6 +112,12 @@ private:
 
     // Fetch entire shard file, cache it, extract chunk by inner index.
     std::vector<uint8_t> fetchFromShard(const ChunkKey& key);
+
+    // Pre-computed auth strings (built once in constructor, applied per request).
+    void buildCachedAuth();
+    std::string cachedSigv4_;
+    std::string cachedUserpwd_;
+    std::string cachedTokenHeader_;  // empty if no session token
 
     std::string baseUrl_;
     std::string delimiter_;

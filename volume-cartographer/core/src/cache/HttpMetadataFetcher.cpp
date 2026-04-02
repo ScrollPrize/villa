@@ -29,6 +29,18 @@ static size_t stringWriteCallback(
     str->append(ptr, size * nmemb);
     return size * nmemb;
 }
+
+// Set common CURL options after curl_easy_reset. Call this once per request.
+static void configureCurlDefaults(CURL* c)
+{
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+#if CURL_AT_LEAST_VERSION(7, 85, 0)
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
+}
 #endif
 
 std::string httpGetString(const std::string& url, const HttpAuth& auth)
@@ -37,18 +49,14 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
     // Thread-local CURL handle: reuses TCP+TLS connections across requests
     thread_local CURL* curl = [] {
         CURL* c = curl_easy_init();
-        if (c) {
-            curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
-        }
+        if (c) configureCurlDefaults(c);
         return c;
     }();
     if (!curl) return {};
 
     // Reset clears all options but keeps the connection alive
     curl_easy_reset(curl);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+    configureCurlDefaults(curl);
 
     std::string response;
 
@@ -57,13 +65,7 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-#if CURL_AT_LEAST_VERSION(7, 85, 0)
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
-#else
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-#endif
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     // Don't use FAILONERROR — we check HTTP codes ourselves to distinguish
     // 403 (auth error) from 404 (not found)
 
@@ -196,10 +198,7 @@ S3ListResult s3ListObjects(const std::string& httpsBaseUrl, const HttpAuth& auth
     // Thread-local CURL handle without FAILONERROR so we can log the status
     thread_local CURL* curl = [] {
         CURL* c = curl_easy_init();
-        if (c) {
-            curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
-        }
+        if (c) configureCurlDefaults(c);
         return c;
     }();
 
@@ -213,21 +212,14 @@ S3ListResult s3ListObjects(const std::string& httpsBaseUrl, const HttpAuth& auth
 
         // Reset clears all options but keeps the connection alive
         curl_easy_reset(curl);
-        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+        configureCurlDefaults(curl);
 
         curl_easy_setopt(curl, CURLOPT_URL, listUrl.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stringWriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &xml);
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-#if CURL_AT_LEAST_VERSION(7, 85, 0)
-        curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
-#else
-        curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-#endif
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
         auto authGuard = applyCurlAuth(curl, auth);
 
@@ -347,10 +339,7 @@ bool httpDownloadFile(const std::string& url, const std::filesystem::path& dest,
     // Thread-local CURL handle: reuses TCP+TLS connections across requests
     thread_local CURL* curl = [] {
         CURL* c = curl_easy_init();
-        if (c) {
-            curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
-        }
+        if (c) configureCurlDefaults(c);
         return c;
     }();
     if (!curl) {
@@ -360,21 +349,14 @@ bool httpDownloadFile(const std::string& url, const std::filesystem::path& dest,
 
     // Reset clears all options but keeps the connection alive
     curl_easy_reset(curl);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+    configureCurlDefaults(curl);
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fileWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-#if CURL_AT_LEAST_VERSION(7, 85, 0)
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
-#else
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-#endif
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
 
     auto authGuard = applyCurlAuth(curl, auth);

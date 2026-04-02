@@ -120,6 +120,5 @@ TEST_CASE("PriorityQueue: membership queries") {
     pq.submit(10);
     REQUIRE(pq.is_queued(10));
     REQUIRE(!pq.is_queued(20));
-    REQUIRE(pq.is_known(10));
     REQUIRE(!pq.empty());
 }

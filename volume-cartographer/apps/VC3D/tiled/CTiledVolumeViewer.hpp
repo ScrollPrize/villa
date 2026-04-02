@@ -273,9 +273,6 @@ private:
     // into a single deferred emission on the next event loop iteration.
     void scheduleOverlayUpdate();
 
-    // Recompute and update the params hash on the render controller
-    void updateParamsHash();
-
     // Recompute dynamic minimum scale so content never appears smaller than viewport
     void updateContentMinScale();
 

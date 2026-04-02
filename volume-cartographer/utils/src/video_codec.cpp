@@ -173,13 +173,14 @@ auto video_decode(
         reinterpret_cast<const uint8_t*>(compressed.data() + HEADER_SIZE);
     const int bitstreamLen = static_cast<int>(compressed.size() - HEADER_SIZE);
 
-    de265_decoder_context* ctx = de265_new_decoder();
-    if (!ctx) throw std::runtime_error("video_decode: failed to create decoder");
-    auto guard = std::unique_ptr<de265_decoder_context, void (*)(de265_decoder_context*)>(
-        ctx, [](de265_decoder_context* c) { de265_free_decoder(c); });
-
-    de265_set_parameter_bool(ctx, DE265_DECODER_PARAM_BOOL_SEI_CHECK_HASH, 0);
-    de265_start_worker_threads(ctx, 0);
+    static thread_local de265_decoder_context* ctx = nullptr;
+    if (!ctx) {
+        ctx = de265_new_decoder();
+        if (!ctx) throw std::runtime_error("video_decode: failed to create decoder");
+        de265_set_parameter_bool(ctx, DE265_DECODER_PARAM_BOOL_SEI_CHECK_HASH, 0);
+        de265_start_worker_threads(ctx, 0);
+    }
+    de265_reset(ctx);
 
     std::vector<std::byte> output(out_size, std::byte{0});
     int framesDecoded = 0;

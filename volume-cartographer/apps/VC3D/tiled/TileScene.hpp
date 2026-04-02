@@ -66,7 +66,6 @@ struct ContentBounds {
 // TILE_PX lives in TileScene (tightly coupled to grid layout).
 namespace tiled_config {
     constexpr int VISIBLE_BUFFER_TILES = 2;   // extra tiles around viewport for smooth scrolling
-    constexpr int MAX_COARSER_LEVELS   = 8;   // fallback levels searched in SliceCache::getBest()
     constexpr int DRAIN_BATCH_SIZE     = 128; // max results drained per tick cycle
 }
 
