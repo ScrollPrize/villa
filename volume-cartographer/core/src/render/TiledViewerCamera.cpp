@@ -9,18 +9,20 @@ void TiledViewerCamera::recalcPyramidLevel(int numScales) noexcept
         return;
     }
 
-    const float minScale = std::pow(2.0f, 1.0f - numScales);
+    const float minScale = std::pow(2.0f, -static_cast<float>(numScales));
 
-    if (scale >= 1.0f) {
+    if (scale >= 0.5f) {
+        // Native resolution for scale >= 0.5x (interpolate down from native)
         dsScaleIdx = 0;
     } else if (scale < minScale) {
         dsScaleIdx = numScales - 1;
     } else {
-        // Pick the coarser pyramid level. Add small epsilon before ceil
-        // to prevent float rounding near powers of 2 from jumping levels.
-        // e.g. scale=0.4999999 → log2=-1.0000001 → without epsilon → ceil=2 (wrong)
+        // Interpolate DOWN: always use the finer (higher-res) pyramid level.
+        // e.g. scale 0.3x → level 1 (2x downsample), NOT level 2.
+        // Formula: ceil(-log2(scale)) gives the coarser level; subtract 1 for finer.
+        // Epsilon prevents float rounding near exact powers of 2.
         float rawLevel = -std::log2(scale);
-        dsScaleIdx = static_cast<int>(std::ceil(rawLevel - 0.001f));
+        dsScaleIdx = std::max(0, static_cast<int>(std::ceil(rawLevel - 0.001f)) - 1);
     }
 
     dsScaleIdx = std::clamp(dsScaleIdx, 0, numScales - 1);
