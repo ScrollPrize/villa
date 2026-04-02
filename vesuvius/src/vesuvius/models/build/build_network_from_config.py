@@ -255,6 +255,7 @@ class NetworkFromConfig(nn.Module):
         self.guide_backbone = None
         self.guide_tokenbook = None
         self.guide_stage_tokenbooks = nn.ModuleDict()
+        self.guide_skip_projectors = nn.ModuleDict()
         self.guide_stage_keys = None
         self.guide_patch_grid = None
         self.guide_feature_gate_alpha = 1.0
@@ -276,10 +277,10 @@ class NetworkFromConfig(nn.Module):
                 raise ValueError("guide_backbone cannot be combined with pretrained_backbone in v1")
             if self.architecture_type.lower().startswith("primus"):
                 raise ValueError("guide_backbone is not supported with primus architectures in v1")
-            if self.guide_fusion_stage not in {"input", "input_gating", "feature_encoder"}:
+            if self.guide_fusion_stage not in {"input", "input_gating", "feature_encoder", "feature_skip_concat"}:
                 raise ValueError(
                     "Unsupported guide_fusion_stage. Expected one of "
-                    "{'input', 'input_gating', 'feature_encoder'}."
+                    "{'input', 'input_gating', 'feature_encoder', 'feature_skip_concat'}."
                 )
             if self.guide_fusion_stage == "feature_encoder":
                 gate_alpha = float(model_config.get("guide_feature_gate_alpha", 1.0))
@@ -646,11 +647,13 @@ class NetworkFromConfig(nn.Module):
 
         # If at least one task uses shared, build a single shared decoder trunk (features-only)
         if len(tasks_using_shared) > 0:
+            shared_decoder_skip_channels = self._decoder_skip_channels()
             self.shared_decoder = Decoder(
                 encoder=self.shared_encoder,
                 basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
                 num_classes=None,  # features-only mode
                 n_conv_per_stage=model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
+                skip_channels=shared_decoder_skip_channels,
                 deep_supervision=False
             )
             # Heads map from decoder feature channels at highest resolution to task outputs
@@ -666,11 +669,13 @@ class NetworkFromConfig(nn.Module):
         for target_name in sorted(tasks_using_separate):
             out_channels = self.targets[target_name]["out_channels"]
             activation_str = self.targets[target_name].get("activation", "none")
+            decoder_skip_channels = self._decoder_skip_channels()
             self.task_decoders[target_name] = Decoder(
                 encoder=self.shared_encoder,
                 basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
                 num_classes=out_channels,
                 n_conv_per_stage=model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
+                skip_channels=decoder_skip_channels,
                 deep_supervision=False
             )
             self.task_activations[target_name] = get_activation_module(activation_str)
@@ -745,6 +750,14 @@ class NetworkFromConfig(nn.Module):
     def _guide_uses_encoder_feature_gating(self) -> bool:
         return self.guide_enabled and self.guide_fusion_stage == "feature_encoder"
 
+    def _guide_uses_skip_feature_concat(self) -> bool:
+        return self.guide_enabled and self.guide_fusion_stage == "feature_skip_concat"
+
+    def _decoder_skip_channels(self):
+        if self._guide_uses_skip_feature_concat():
+            return [int(ch) * 2 for ch in self.shared_encoder.output_channels]
+        return list(self.shared_encoder.output_channels)
+
     def _init_guidance(self, model_config):
         if not self.guide_enabled:
             return
@@ -766,38 +779,79 @@ class NetworkFromConfig(nn.Module):
             )
 
         self.guide_patch_grid = tuple(size // patch for size, patch in zip(input_shape, patch_embed_size))
-        default_token_count = int(math.prod(self.guide_patch_grid))
-        configured_token_count = model_config.get("guide_tokenbook_tokens")
-        if configured_token_count is None:
-            token_count = default_token_count
-        else:
-            token_count = int(configured_token_count)
-            if token_count <= 0:
-                raise ValueError(f"guide_tokenbook_tokens must be > 0, got {token_count}")
-        self.guide_tokenbook_tokens = token_count
-        prototype_weighting = str(
-            model_config.get("guide_tokenbook_prototype_weighting", "mean")
-        ).strip().lower()
-        self.guide_tokenbook_prototype_weighting = prototype_weighting
-        self.guide_tokenbook_weight_mlp_hidden = model_config.get("guide_tokenbook_weight_mlp_hidden")
-        tokenbook_kwargs = {
-            "n_tokens": token_count,
-            "embed_dim": int(self.guide_backbone.embed_dim),
-            "dropout": float(model_config.get("guide_tokenbook_dropout", 0.0)),
-            "ema_decay": model_config.get("guide_tokenbook_ema_decay"),
-            "use_ema": bool(model_config.get("guide_tokenbook_use_ema", False)),
-            "prototype_weighting": prototype_weighting,
-            "weight_mlp_hidden": self.guide_tokenbook_weight_mlp_hidden,
-        }
+        self.guide_tokenbook_tokens = None
+        self.guide_tokenbook_prototype_weighting = "mean"
+        self.guide_tokenbook_weight_mlp_hidden = None
         if self._guide_uses_input_gating():
+            default_token_count = int(math.prod(self.guide_patch_grid))
+            configured_token_count = model_config.get("guide_tokenbook_tokens")
+            if configured_token_count is None:
+                token_count = default_token_count
+            else:
+                token_count = int(configured_token_count)
+                if token_count <= 0:
+                    raise ValueError(f"guide_tokenbook_tokens must be > 0, got {token_count}")
+            self.guide_tokenbook_tokens = token_count
+            prototype_weighting = str(
+                model_config.get("guide_tokenbook_prototype_weighting", "mean")
+            ).strip().lower()
+            self.guide_tokenbook_prototype_weighting = prototype_weighting
+            self.guide_tokenbook_weight_mlp_hidden = model_config.get("guide_tokenbook_weight_mlp_hidden")
+            tokenbook_kwargs = {
+                "n_tokens": token_count,
+                "embed_dim": int(self.guide_backbone.embed_dim),
+                "dropout": float(model_config.get("guide_tokenbook_dropout", 0.0)),
+                "ema_decay": model_config.get("guide_tokenbook_ema_decay"),
+                "use_ema": bool(model_config.get("guide_tokenbook_use_ema", False)),
+                "prototype_weighting": prototype_weighting,
+                "weight_mlp_hidden": self.guide_tokenbook_weight_mlp_hidden,
+            }
             self.guide_tokenbook = TokenBook3D(**tokenbook_kwargs)
             self.guide_stage_keys = None
         elif self._guide_uses_encoder_feature_gating():
+            default_token_count = int(math.prod(self.guide_patch_grid))
+            configured_token_count = model_config.get("guide_tokenbook_tokens")
+            if configured_token_count is None:
+                token_count = default_token_count
+            else:
+                token_count = int(configured_token_count)
+                if token_count <= 0:
+                    raise ValueError(f"guide_tokenbook_tokens must be > 0, got {token_count}")
+            self.guide_tokenbook_tokens = token_count
+            prototype_weighting = str(
+                model_config.get("guide_tokenbook_prototype_weighting", "mean")
+            ).strip().lower()
+            self.guide_tokenbook_prototype_weighting = prototype_weighting
+            self.guide_tokenbook_weight_mlp_hidden = model_config.get("guide_tokenbook_weight_mlp_hidden")
+            tokenbook_kwargs = {
+                "n_tokens": token_count,
+                "embed_dim": int(self.guide_backbone.embed_dim),
+                "dropout": float(model_config.get("guide_tokenbook_dropout", 0.0)),
+                "ema_decay": model_config.get("guide_tokenbook_ema_decay"),
+                "use_ema": bool(model_config.get("guide_tokenbook_use_ema", False)),
+                "prototype_weighting": prototype_weighting,
+                "weight_mlp_hidden": self.guide_tokenbook_weight_mlp_hidden,
+            }
             self.guide_stage_keys = [f"enc_{stage_idx}" for stage_idx in range(self.num_stages)]
             self.guide_stage_tokenbooks = nn.ModuleDict(
                 {
                     stage_key: TokenBook3D(**tokenbook_kwargs)
                     for stage_key in self.guide_stage_keys
+                }
+            )
+        elif self._guide_uses_skip_feature_concat():
+            self.guide_stage_keys = [f"enc_{stage_idx}" for stage_idx in range(self.num_stages)]
+            self.guide_skip_projectors = nn.ModuleDict(
+                {
+                    stage_key: self.conv_op(
+                        int(self.guide_backbone.embed_dim),
+                        int(self.shared_encoder.output_channels[stage_idx]),
+                        kernel_size=1,
+                        stride=1,
+                        padding=0,
+                        bias=True,
+                    )
+                    for stage_idx, stage_key in enumerate(self.guide_stage_keys)
                 }
             )
         self.guide_tokenbook_sample_rate = float(model_config.get("guide_tokenbook_sample_rate", 1.0))
@@ -849,6 +903,12 @@ class NetworkFromConfig(nn.Module):
                     self.guide_stage_tokenbooks[stage_key]
                 )
                 compiled_modules.append(f"guide_tokenbook:{stage_key}")
+        if compile_tokenbooks and len(self.guide_skip_projectors) > 0:
+            for stage_key in list(self.guide_skip_projectors.keys()):
+                self.guide_skip_projectors[stage_key] = self._compile_module_in_place(
+                    self.guide_skip_projectors[stage_key]
+                )
+                compiled_modules.append(f"guide_projector:{stage_key}")
         return compiled_modules
 
     @torch.compiler.disable(reason="guided backbone compile failure")
@@ -910,6 +970,24 @@ class NetworkFromConfig(nn.Module):
             feature_gates[stage_key] = stage_guide
             aux_outputs[stage_key] = stage_guide
         return feature_gates, aux_outputs
+
+    @torch.compiler.disable(reason="guided backbone compile failure")
+    def _build_skip_concat_features(self, x, encoder_features):
+        if not self._guide_uses_skip_feature_concat():
+            return encoder_features, {}
+
+        guide_features = self._compute_guide_features(x)
+        augmented_features = []
+        for stage_idx, (stage_key, stage_feature) in enumerate(zip(self.guide_stage_keys or [], encoder_features)):
+            projected = F.interpolate(
+                guide_features,
+                size=stage_feature.shape[2:],
+                mode="trilinear",
+                align_corners=False,
+            )
+            projected = self.guide_skip_projectors[stage_key](projected)
+            augmented_features.append(torch.cat([stage_feature, projected], dim=1))
+        return augmented_features, {}
     
     def _init_pretrained_backbone(self, mgr, model_config):
         print(f"--- Initializing pretrained backbone '{self.pretrained_backbone}' ---")
@@ -1219,6 +1297,8 @@ class NetworkFromConfig(nn.Module):
                 )
             else:
                 features = self.shared_encoder(x)
+            if self._guide_uses_skip_feature_concat():
+                features, aux_outputs = self._build_skip_concat_features(x, features)
             restoration_mask = None
         
         results = {}

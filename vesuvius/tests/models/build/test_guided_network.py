@@ -162,6 +162,26 @@ def test_feature_encoder_guidance_returns_encoder_stage_aux_outputs(tmp_path: Pa
     assert model.final_config["guide_feature_gate_alpha"] == pytest.approx(1.0)
     assert len(model.guide_stage_tokenbooks) == 3
 
+
+@pytest.mark.parametrize("basic_encoder_block", ["ConvBlock", "BasicBlockD"])
+def test_feature_skip_concat_forward_shapes_and_empty_aux_outputs(tmp_path: Path, basic_encoder_block: str):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block=basic_encoder_block,
+        guide_fusion_stage="feature_skip_concat",
+    )
+    model = NetworkFromConfig(mgr)
+
+    outputs, aux = model(torch.randn(2, 1, 16, 16, 16), return_aux=True)
+
+    assert outputs["ink"].shape == (2, 1, 16, 16, 16)
+    assert aux == {}
+    assert list(model.guide_skip_projectors.keys()) == ["enc_0", "enc_1", "enc_2"]
+    assert model.final_config["guide_fusion_stage"] == "feature_skip_concat"
+
+
 def test_encoder_skip_only_feature_gating_uses_residual_alpha_formula():
     class _TestStage(torch.nn.Module):
         def __init__(self, value: float):
@@ -207,6 +227,28 @@ def test_encoder_skip_only_feature_gating_uses_residual_alpha_formula():
     assert torch.allclose(skips[0], torch.full_like(skips[0], expected_stage0_skip))
     assert torch.allclose(skips[1], torch.full_like(skips[1], expected_stage1_skip))
     assert torch.allclose(stage1.last_input, torch.full_like(stage1.last_input, 2.0))
+
+
+def test_feature_skip_concat_decoder_contract_uses_augmented_skip_channels(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_fusion_stage="feature_skip_concat",
+    )
+    model = NetworkFromConfig(mgr)
+    decoder = model.task_decoders["ink"]
+
+    assert decoder.skip_channels == [16, 32, 64]
+    assert decoder.bottleneck_input_channels == 64
+    assert decoder.decoder_stage_input_channels == [16 + 32, 8 + 16]
+    assert decoder.decoder_stage_output_channels == [16, 8]
+    assert model.guide_stage_keys == ["enc_0", "enc_1", "enc_2"]
+    assert all(
+        projector.out_channels == native_width
+        for projector, native_width in zip(model.guide_skip_projectors.values(), [8, 16, 32])
+    )
 
 
 def test_guided_network_backprop_updates_tokenbook_but_not_frozen_guide_backbone(tmp_path: Path):
@@ -396,6 +438,21 @@ def test_feature_encoder_guidance_records_exact_fusion_stage(tmp_path: Path):
     assert model.guide_feature_gate_alpha == pytest.approx(1.0)
 
 
+def test_feature_skip_concat_records_exact_fusion_stage_and_no_alpha(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_fusion_stage="feature_skip_concat",
+    )
+    model = NetworkFromConfig(mgr)
+
+    assert model.guide_fusion_stage == "feature_skip_concat"
+    assert model.final_config["guide_fusion_stage"] == "feature_skip_concat"
+    assert model.final_config["guide_feature_gate_alpha"] is None
+
+
 def test_feature_encoder_guidance_records_configured_gate_alpha(tmp_path: Path):
     checkpoint_path = tmp_path / "guide_backbone.pt"
     _write_local_guide_checkpoint(checkpoint_path)
@@ -451,6 +508,30 @@ def test_guided_network_rejects_invalid_guide_compile_policy(tmp_path: Path):
 
     with pytest.raises(ValueError, match="guide_compile_policy"):
         NetworkFromConfig(mgr)
+
+
+def test_feature_skip_concat_all_guidance_compile_policy_compiles_backbone_and_projectors(tmp_path: Path, monkeypatch):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_compile_policy="all_guidance",
+        guide_fusion_stage="feature_skip_concat",
+    )
+    model = NetworkFromConfig(mgr)
+    compiled_targets: list[str] = []
+
+    def _record_compile(module):
+        compiled_targets.append(type(module).__name__)
+        return module
+
+    monkeypatch.setattr(model, "_compile_module_in_place", _record_compile)
+
+    compiled_modules = model._compile_guidance_submodules(device_type="cuda")
+
+    assert compiled_modules == ["guide_backbone", "guide_projector:enc_0", "guide_projector:enc_1", "guide_projector:enc_2"]
+    assert compiled_targets == ["Dinov2Backbone", "Conv3d", "Conv3d", "Conv3d"]
 
 
 def test_guided_network_rejects_primus_architecture(tmp_path: Path):

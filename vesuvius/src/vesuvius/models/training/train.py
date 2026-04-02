@@ -169,9 +169,10 @@ class BaseTrainer:
         self.guide_supervision_target = getattr(self.mgr, "guide_supervision_target", None)
         model_config = getattr(self.mgr, "model_config", {}) or {}
         self.guide_fusion_stage = str(model_config.get("guide_fusion_stage", "input")).strip().lower()
-        if self.guide_fusion_stage == "feature_encoder" and self.guide_loss_weight > 0.0:
+        if self.guide_fusion_stage in {"feature_encoder", "feature_skip_concat"} and self.guide_loss_weight > 0.0:
             raise ValueError(
-                "guide_loss_weight must be 0.0 when model_config.guide_fusion_stage='feature_encoder'"
+                "guide_loss_weight must be 0.0 when model_config.guide_fusion_stage is "
+                "'feature_encoder' or 'feature_skip_concat'"
             )
         self._current_aux_outputs = {}
         self.compile_policy = str(getattr(self.mgr, "compile_policy", "auto")).strip().lower()

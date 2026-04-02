@@ -235,6 +235,42 @@ def test_feature_encoder_checkpoint_roundtrip_preserves_plain_inference_forward(
     assert model_info["network"].final_config["guide_fusion_stage"] == "feature_encoder"
 
 
+def test_feature_skip_concat_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="feature_skip_concat",
+        guide_loss_weight=0.0,
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model()
+    checkpoint_path = tmp_path / "feature_skip_concat_model.pth"
+    torch.save({"model_config": model.final_config, "model": model.state_dict()}, checkpoint_path)
+
+    output_dir = tmp_path / "inference_out_feature_skip_concat"
+    output_dir.mkdir()
+    inferer = Inferer(
+        model_path=str(checkpoint_path),
+        input_dir=str(data_root / "images" / "volume1.zarr"),
+        output_dir=str(output_dir),
+        input_format="zarr",
+        do_tta=False,
+        device="cpu",
+        num_dataloader_workers=0,
+        model_type="train_py",
+    )
+
+    model_info = inferer._load_train_py_model(checkpoint_path)
+    output = model_info["network"](torch.randn(1, 1, 16, 16, 16))
+
+    assert isinstance(output, dict)
+    assert set(output.keys()) == {"ink"}
+    assert model_info["network"].final_config["guide_fusion_stage"] == "feature_skip_concat"
+
+
 def test_inferer_finalize_output_batch_returns_float16_numpy():
     inferer = object.__new__(Inferer)
     inferer.device = torch.device("cpu")
@@ -373,6 +409,34 @@ def test_feature_encoder_base_trainer_smoke_runs_two_training_steps_without_aux_
         optimizer.step()
 
 
+def test_feature_skip_concat_base_trainer_smoke_runs_two_training_steps_without_aux_outputs(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="feature_skip_concat",
+        guide_loss_weight=0.0,
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model().to(trainer.device)
+    loss_fns = trainer._build_loss()
+    dataset = trainer._configure_dataset(is_training=True)
+    batch = next(iter(DataLoader(dataset, batch_size=1, shuffle=False)))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    for _step in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        _inputs, targets_dict, outputs = trainer._get_model_outputs(model, batch)
+        loss, task_losses = trainer._compute_train_loss(outputs, targets_dict, loss_fns)
+        assert torch.isfinite(loss)
+        assert "guide_mask" not in task_losses
+        assert trainer._current_aux_outputs == {}
+        loss.backward()
+        optimizer.step()
+
+
 def test_feature_encoder_rejects_nonzero_guide_loss_weight(tmp_path: Path):
     data_root = _make_synthetic_dataset(tmp_path)
     guide_checkpoint = tmp_path / "guide_backbone.pt"
@@ -383,6 +447,21 @@ def test_feature_encoder_rejects_nonzero_guide_loss_weight(tmp_path: Path):
         guide_fusion_stage="feature_encoder",
         guide_loss_weight=0.25,
         guide_tokenbook_prototype_weighting="token_mlp",
+    )
+
+    with pytest.raises(ValueError, match="guide_loss_weight"):
+        BaseTrainer(mgr=mgr, verbose=False)
+
+
+def test_feature_skip_concat_rejects_nonzero_guide_loss_weight(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="feature_skip_concat",
+        guide_loss_weight=0.25,
     )
 
     with pytest.raises(ValueError, match="guide_loss_weight"):
