@@ -3,6 +3,7 @@
 // ============================================================================
 #include "utils/Json.hpp"
 #include <nlohmann/json.hpp>
+#include <deque>
 #include <fstream>
 #include <ostream>
 
@@ -119,81 +120,81 @@ size_t Json::count(const std::string& key) const { return impl_->j().count(key);
 Json& Json::operator[](const std::string& key) {
     // We need stable storage for the returned Json. Use thread_local cache.
     // Max depth of chained [] is small (typically 1-2).
-    thread_local std::vector<Json> cache;
+    thread_local std::deque<Json> cache;
     cache.emplace_back();
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(&(impl_->j()[key]), false);
     // Trim cache if it grows too large (shouldn't happen in practice)
-    if (cache.size() > 64) cache.erase(cache.begin(), cache.begin() + 32);
+    while (cache.size() > 64) cache.pop_front();
     return child;
 }
 
 const Json& Json::operator[](const std::string& key) const {
-    thread_local std::vector<Json> cache;
+    thread_local std::deque<Json> cache;
     cache.emplace_back();
     auto& child = cache.back();
     // const_cast is safe: the const version only exposes const& of the child
     child.impl_ = std::make_unique<Impl>(
         const_cast<njson*>(&(impl_->j().at(key))), false);
-    if (cache.size() > 64) cache.erase(cache.begin(), cache.begin() + 32);
+    while (cache.size() > 64) cache.pop_front();
     return child;
 }
 
 Json& Json::at(const std::string& key) {
-    thread_local std::vector<Json> cache;
+    thread_local std::deque<Json> cache;
     cache.emplace_back();
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(&(impl_->j().at(key)), false);
-    if (cache.size() > 64) cache.erase(cache.begin(), cache.begin() + 32);
+    while (cache.size() > 64) cache.pop_front();
     return child;
 }
 
 const Json& Json::at(const std::string& key) const {
-    thread_local std::vector<Json> cache;
+    thread_local std::deque<Json> cache;
     cache.emplace_back();
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(
         const_cast<njson*>(&(impl_->j().at(key))), false);
-    if (cache.size() > 64) cache.erase(cache.begin(), cache.begin() + 32);
+    while (cache.size() > 64) cache.pop_front();
     return child;
 }
 
 // ---- Array access ----
 Json& Json::operator[](size_t index) {
-    thread_local std::vector<Json> cache;
+    thread_local std::deque<Json> cache;
     cache.emplace_back();
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(&(impl_->j()[index]), false);
-    if (cache.size() > 64) cache.erase(cache.begin(), cache.begin() + 32);
+    while (cache.size() > 64) cache.pop_front();
     return child;
 }
 
 const Json& Json::operator[](size_t index) const {
-    thread_local std::vector<Json> cache;
+    thread_local std::deque<Json> cache;
     cache.emplace_back();
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(
         const_cast<njson*>(&(impl_->j().at(index))), false);
-    if (cache.size() > 64) cache.erase(cache.begin(), cache.begin() + 32);
+    while (cache.size() > 64) cache.pop_front();
     return child;
 }
 
 Json& Json::at(size_t index) {
-    thread_local std::vector<Json> cache;
+    thread_local std::deque<Json> cache;
     cache.emplace_back();
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(&(impl_->j().at(index)), false);
-    if (cache.size() > 64) cache.erase(cache.begin(), cache.begin() + 32);
+    while (cache.size() > 64) cache.pop_front();
     return child;
 }
 
 const Json& Json::at(size_t index) const {
-    thread_local std::vector<Json> cache;
+    thread_local std::deque<Json> cache;
     cache.emplace_back();
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(
         const_cast<njson*>(&(impl_->j().at(index))), false);
-    if (cache.size() > 64) cache.erase(cache.begin(), cache.begin() + 32);
+    while (cache.size() > 64) cache.pop_front();
     return child;
 }
 

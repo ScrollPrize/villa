@@ -87,9 +87,9 @@ void SegmentationModule::HoverState::clear()
 
 SegmentationModule::~SegmentationModule()
 {
-    // Wait for any in-progress background save to finish before destroying
+    // Cancel any in-progress background save on shutdown
     if (_saveInProgress && _saveFuture.isRunning()) {
-        _saveFuture.waitForFinished();
+        _saveFuture.cancel();
     }
 }
 

@@ -167,18 +167,6 @@ namespace perf {
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
     constexpr int DISK_CACHE_SIZE_GB_DEFAULT = 100;
 
-    // H.265 recompression for remote streaming
-    constexpr auto VIDEO_RECOMPRESS_ENABLED = "perf/video_recompress_enabled";
-    constexpr auto VIDEO_QUALITY_PRESET = "perf/video_quality_preset";
-
-    constexpr bool VIDEO_RECOMPRESS_ENABLED_DEFAULT = true;
-    constexpr int VIDEO_QUALITY_PRESET_DEFAULT = 3;  // Balanced
-
-    // Quality preset → H.265 QP mapping
-    // Index: 0=Lossless, 1=Near-lossless, 2=High, 3=Balanced, 4=Compact, 5=Max compression
-    constexpr int PRESET_COUNT = 6;
-    constexpr int PRESET_VIDEO_QP[PRESET_COUNT] = {0, 18, 22, 28, 35, 42};
-
     // Number of background IO (download) threads
     constexpr auto IO_THREADS = "perf/io_threads";
     constexpr int IO_THREADS_DEFAULT = 8;

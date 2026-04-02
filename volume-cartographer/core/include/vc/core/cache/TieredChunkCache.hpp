@@ -19,22 +19,18 @@
 #include "ChunkSource.hpp"
 #include "DiskStore.hpp"
 #include "IOPool.hpp"
-#include <utils/lock_pool.hpp>
 #include <utils/lru_cache.hpp>
-#include <utils/thread_pool.hpp>
 
 namespace vc::cache {
 
-// Multi-tiered chunk cache with four storage levels:
+// Multi-tiered chunk cache with three storage levels:
 //
 //   HOT   — decompressed in RAM, ready to sample (ChunkDataPtr)
-//   WARM  — compressed in RAM, fast to decompress (CompressedChunk)
 //   COLD  — on local disk, persistent between runs (DiskStore)
 //   ICE   — remote source, S3/HTTP/filesystem (ChunkSource)
 //
-// Promotion path:  ice → cold → warm → hot
-// Eviction:        hot entries removed (warm still has compressed copy);
-//                  warm entries removed (cold still has on-disk copy).
+// Promotion path:  ice → cold → hot  (decompression inline on IO thread)
+// Eviction:        hot entries removed (cold still has on-disk copy).
 //
 // The coarsest pyramid level is pinned in the hot tier and never evicted.
 // This guarantees getBestAvailable() always returns data.
@@ -44,25 +40,13 @@ namespace vc::cache {
 //   - getBlocking(): safe from any thread (may block)
 //   - prefetch(): safe from any thread (non-blocking)
 //   - Hot tier: shared_mutex (many readers, occasional writer)
-//   - Warm tier: mutex (less concurrent access)
-//   - Per-key lock pool prevents duplicate loads
 class TieredChunkCache {
 public:
     struct Config {
         size_t hotMaxBytes = 10ULL << 30;    // 10 GB
-        size_t warmMaxBytes = 2ULL << 30;    // 2 GB
         std::string volumeId;                // for disk store keying
         int ioThreads = 8;
-        size_t ioQueueSize = 50000;  // max pending IO tasks
-        int prefetchThreads = 2;     // dedicated threads for level prefetch
-
-        // Optional: recompress chunks before storing to disk cache.
-        // When set, chunks fetched from remote are decompressed first
-        // (using the normal decompress_ function), then recompressed
-        // with this function before writing to disk. The warm tier and
-        // disk cache store the recompressed format, so decompress_ must
-        // handle both the original and recompressed formats.
-        RecompressFn recompress;
+        size_t ioQueueSize = 10000000;  // max pending IO tasks
     };
 
     // source: where to fetch chunks (filesystem, HTTP, etc.)
@@ -81,7 +65,7 @@ public:
 
     // --- Non-blocking reads ---
 
-    // Returns immediately. Returns nullptr on miss (hot and warm both miss).
+    // Returns immediately. Returns nullptr on miss (hot cache miss).
     // Does NOT trigger a fetch. Use prefetch() to schedule background loading.
     [[nodiscard]] ChunkDataPtr get(const ChunkKey& key);
 
@@ -114,14 +98,8 @@ public:
     using PrefetchProgressCb = std::function<void(int fetched, int total)>;
     void prefetchLevel(int level, PrefetchProgressCb progressCb = nullptr);
 
-    // Check if an entire level has been fully prefetched
-    [[nodiscard]] bool isLevelComplete(int level) const;
-
     // Cancel all pending (not in-flight) prefetch tasks.
     void cancelPendingPrefetch();
-
-    // Set the IO pool epoch. Tasks from the current epoch get higher priority.
-    void setIOEpoch(uint64_t epoch);
 
     // --- Cache management ---
 
@@ -131,7 +109,7 @@ public:
     void pinLevel(int level, const std::array<int, 3>& gridDims,
                   bool blocking = true);
 
-    // Clear all tiers (hot, warm). Does not touch cold/ice.
+    // Clear hot tier. Does not touch cold/ice.
     void clearMemory();
 
     // Clear everything including disk cache for this volume.
@@ -170,14 +148,14 @@ public:
     [[nodiscard]] bool isNegativeCached(const ChunkKey& key) const;
 
     // Batch check: are ALL chunks in a region locally available (no remote
-    // fetch needed)?  Includes hot/warm tiers, negative-cached chunks, AND
+    // fetch needed)?  Includes hot tier, negative-cached chunks, AND
     // cold-disk-only entries.
     [[nodiscard]] bool areAllCachedInRegion(int level,
                               int iz0, int iy0, int ix0,
                               int iz1, int iy1, int ix1) const;
 
     // Count how many of the given keys are locally available (no remote
-    // fetch needed): hot/warm tiers, negative-cached, or on disk.
+    // fetch needed): hot tier, negative-cached, or on disk.
     [[nodiscard]] size_t countAvailable(const std::vector<ChunkKey>& keys) const;
 
     // --- Notifications ---
@@ -200,16 +178,12 @@ public:
 
     struct Stats {
         uint64_t hotHits = 0;
-        uint64_t warmHits = 0;
         uint64_t coldHits = 0;
         uint64_t iceFetches = 0;
-        uint64_t misses = 0;       // non-blocking misses (all tiers empty)
+        uint64_t misses = 0;       // non-blocking misses (hot miss)
         uint64_t hotEvictions = 0;
-        uint64_t warmEvictions = 0;
         size_t hotBytes = 0;
-        size_t warmBytes = 0;
         size_t ioPending = 0;       // pending + in-flight IO tasks
-        size_t prefetchPending = 0; // pending + in-flight prefetch tasks
         size_t diskFiles = 0;   // total chunk files on disk (all sessions)
         size_t diskBytes = 0;   // total bytes on disk
         uint64_t diskWrites = 0; // disk writes this session
@@ -227,12 +201,6 @@ private:
     [[nodiscard]] ChunkDataPtr hotGet(const ChunkKey& key);
     void hotPut(const ChunkKey& key, ChunkDataPtr data, bool pinned = false);
 
-    // --- Warm tier (compressed in RAM) ---
-    utils::ShardedLRUCache<ChunkKey, CompressedChunk, ChunkKeyHash> warmCache_;
-
-    [[nodiscard]] std::optional<CompressedChunk> warmGet(const ChunkKey& key);
-    void warmPut(const ChunkKey& key, std::vector<uint8_t> compressed);
-
     // --- Config (must be declared before ioPool_ for initialization order) ---
     Config config_;
 
@@ -247,16 +215,6 @@ private:
 
     // --- I/O pool ---
     IOPool ioPool_;
-
-    // --- Dedicated pool for level prefetch (doesn't compete with interactive) ---
-    IOPool prefetchPool_;
-
-    // --- Tracks which levels have been fully prefetched (persists for session) ---
-    mutable std::mutex completedLevelsMutex_;
-    std::unordered_set<int> completedLevels_;
-
-    // --- Decompression pool (shared across all caches to cap total threads) ---
-    std::shared_ptr<utils::ThreadPool> decompPool_;
 
     // --- Negative cache: chunks confirmed not to exist at the source ---
     // Prevents repeated S3 round-trips for out-of-bounds / sparse chunks.
@@ -280,27 +238,21 @@ private:
     std::mutex pinnedKeysMutex_;
     std::unordered_set<ChunkKey, ChunkKeyHash> pendingPinKeys_;
 
-    // --- Per-key lock pool (prevents duplicate loads) ---
-    utils::LockPool<64> lockPool_;
-
     // --- Promotion helpers ---
 
-    // Load from warm → hot. Returns the decompressed data.
-    [[nodiscard]] ChunkDataPtr promoteFromWarm(const ChunkKey& key, CompressedChunk warm);
-
-    // Load from cold → warm → hot. Returns the decompressed data.
+    // Load from cold → hot. Returns the decompressed data.
     [[nodiscard]] ChunkDataPtr promoteFromCold(const ChunkKey& key);
 
-    // Fetch from ice → cold → warm → hot. Returns the decompressed data.
+    // Fetch from ice → cold → hot. Returns the decompressed data.
     [[nodiscard]] ChunkDataPtr promoteFromIce(const ChunkKey& key);
 
     // Full promotion chain (checks each tier in order).
     [[nodiscard]] ChunkDataPtr loadFull(const ChunkKey& key);
 
-    // Ready for non-blocking access by get(): hot/warm or negative-cached.
+    // Ready for non-blocking access by get(): hot or negative-cached.
     [[nodiscard]] bool isReadyForNonBlockingRead(const ChunkKey& key) const;
 
-    // Locally available without a remote fetch: hot/warm, negative-cached,
+    // Locally available without a remote fetch: hot, negative-cached,
     // OR present on disk (cold tier).
     [[nodiscard]] bool isAvailableWithoutRemoteFetch(const ChunkKey& key) const;
 
@@ -315,7 +267,6 @@ private:
 
     // --- Stats ---
     mutable std::atomic<uint64_t> statHotHits_{0};
-    mutable std::atomic<uint64_t> statWarmHits_{0};
     std::atomic<uint64_t> statColdHits_{0};
     std::atomic<uint64_t> statIceFetches_{0};
     std::atomic<uint64_t> statDiskWrites_{0};

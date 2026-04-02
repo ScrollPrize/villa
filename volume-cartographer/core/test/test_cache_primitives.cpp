@@ -100,7 +100,6 @@ CacheHarness makeTestCache(
     vc::cache::TieredChunkCache::Config cfg;
     cfg.volumeId = "test-volume";
     cfg.hotMaxBytes = 1024;
-    cfg.warmMaxBytes = 1024;
     cfg.ioThreads = 1;
 
     auto* sourcePtr = source.get();

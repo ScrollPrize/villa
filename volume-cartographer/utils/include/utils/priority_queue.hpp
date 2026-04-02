@@ -43,22 +43,22 @@ public:
 
     // -- submission ---------------------------------------------------------
 
-    /// Submit a single item.  Returns false if already queued or in-flight.
+    /// Submit a single item.  Returns false if already queued.
     bool submit(const T& item) {
         {
             std::lock_guard lock(mutex_);
             if (shutdown_flag_) return false;
-            if (queued_set_.contains(item) || in_flight_.contains(item))
+            if (queued_set_.contains(item))
                 return false;
             queued_set_.insert(item);
             heap_.push(item);
         }
-        cv_.notify_one();
+        cv_.notify_all();
         return true;
     }
 
     /// Batch submit from an iterator range.  Returns the number of newly
-    /// queued items (those not already queued or in-flight).
+    /// queued items (those not already queued).
     template <typename Iter>
     std::size_t submit_batch(Iter begin, Iter end) {
         std::size_t added = 0;
@@ -66,7 +66,7 @@ public:
             std::lock_guard lock(mutex_);
             if (shutdown_flag_) return 0;
             for (auto it = begin; it != end; ++it) {
-                if (!queued_set_.contains(*it) && !in_flight_.contains(*it)) {
+                if (!queued_set_.contains(*it)) {
                     queued_set_.insert(*it);
                     heap_.push(*it);
                     ++added;
@@ -107,15 +107,9 @@ public:
         return pop_locked();
     }
 
-    // -- completion / cancellation ------------------------------------------
+    // -- cancellation --------------------------------------------------------
 
-    /// Mark an in-flight item as completed, removing it from tracking.
-    void complete(const T& item) {
-        std::lock_guard lock(mutex_);
-        in_flight_.erase(item);
-    }
-
-    /// Cancel every pending (queued) item.  In-flight items are unaffected.
+    /// Cancel every pending (queued) item.
     void cancel_pending() {
         std::lock_guard lock(mutex_);
         queued_set_.clear();
@@ -131,14 +125,9 @@ public:
         return queued_set_.contains(item);
     }
 
-    [[nodiscard]] bool is_in_flight(const T& item) const {
-        std::lock_guard lock(mutex_);
-        return in_flight_.contains(item);
-    }
-
     [[nodiscard]] bool is_known(const T& item) const {
         std::lock_guard lock(mutex_);
-        return queued_set_.contains(item) || in_flight_.contains(item);
+        return queued_set_.contains(item);
     }
 
     // -- size / state -------------------------------------------------------
@@ -146,11 +135,6 @@ public:
     [[nodiscard]] std::size_t queued_count() const noexcept {
         std::lock_guard lock(mutex_);
         return queued_set_.size();
-    }
-
-    [[nodiscard]] std::size_t in_flight_count() const noexcept {
-        std::lock_guard lock(mutex_);
-        return in_flight_.size();
     }
 
     [[nodiscard]] bool empty() const noexcept {
@@ -179,7 +163,6 @@ private:
         T item = heap_.top();
         heap_.pop();
         queued_set_.erase(item);
-        in_flight_.insert(item);
         return item;
     }
 
@@ -187,7 +170,6 @@ private:
     std::condition_variable cv_;
     Heap                    heap_;
     Set                     queued_set_;
-    Set                     in_flight_;
     bool                    shutdown_flag_ = false;
 };
 
@@ -195,7 +177,6 @@ private:
 // consume_loop  --  helper for worker / consumer threads
 //
 // Repeatedly pops items from the queue and passes them to `handler`.
-// After the handler returns (or throws), the item is marked complete.
 // The loop exits when pop() throws due to shutdown.
 // ---------------------------------------------------------------------------
 template <typename T, typename Hash, typename KeyEqual, typename Compare, typename F>
@@ -208,13 +189,7 @@ void consume_loop(DeduplicatingPriorityQueue<T, Hash, KeyEqual, Compare>& queue,
             // shutdown signalled
             return;
         }
-        try {
-            handler(item);
-        } catch (...) {
-            queue.complete(item);
-            throw;
-        }
-        queue.complete(item);
+        handler(item);
     }
 }
 

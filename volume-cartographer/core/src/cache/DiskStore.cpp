@@ -211,19 +211,24 @@ void DiskStore::evictToSize(size_t targetBytes)
     size_t tracked = totalBytes_.load(std::memory_order_relaxed);
     if (tracked > 0 && tracked <= targetBytes) return;
 
-    // Use in-memory index to evict oldest entries (already sorted by mtime)
-    std::lock_guard<std::mutex> lk(indexMtx_);
+    // Phase 1: Hold lock, collect eviction candidates into a local vector
+    struct EvictEntry {
+        std::filesystem::path path;
+        size_t bytes;
+    };
+    std::vector<EvictEntry> toEvict;
 
-    std::error_code ec;
-    auto it = timeIndex_.begin();
-    while (it != timeIndex_.end()) {
-        tracked = totalBytes_.load(std::memory_order_relaxed);
-        if (tracked <= targetBytes) break;
+    {
+        std::lock_guard<std::mutex> lk(indexMtx_);
+        auto it = timeIndex_.begin();
+        while (it != timeIndex_.end()) {
+            tracked = totalBytes_.load(std::memory_order_relaxed);
+            if (tracked <= targetBytes) break;
 
-        auto& entry = it->second;
-        std::filesystem::remove(entry.path, ec);
-        if (!ec) {
-            // Update totalBytes_, clamping to avoid underflow
+            auto& entry = it->second;
+            toEvict.push_back(EvictEntry{entry.path, entry.bytes});
+
+            // Optimistically update totalBytes_ and remove from index
             auto prev = totalBytes_.load(std::memory_order_relaxed);
             while (prev >= entry.bytes &&
                    !totalBytes_.compare_exchange_weak(
@@ -232,11 +237,16 @@ void DiskStore::evictToSize(size_t targetBytes)
 
             pathIndex_.erase(entry.path.string());
             it = timeIndex_.erase(it);
-        } else {
-            // File already gone or inaccessible; remove stale index entry
-            pathIndex_.erase(entry.path.string());
-            it = timeIndex_.erase(it);
         }
+    }
+
+    // Phase 2: Delete files without holding any lock
+    std::error_code ec;
+    for (auto& e : toEvict) {
+        std::filesystem::remove(e.path, ec);
+        // If remove fails, the bytes are already subtracted from totalBytes_.
+        // This is acceptable: the index no longer references the file, and
+        // initTotalBytes() will reconcile on next startup.
     }
 }
 

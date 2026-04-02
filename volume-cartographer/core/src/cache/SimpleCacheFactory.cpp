@@ -34,7 +34,6 @@ std::unique_ptr<TieredChunkCache> createSimpleTieredCache(
 
     TieredChunkCache::Config config;
     config.hotMaxBytes = maxBytes;
-    config.warmMaxBytes = 0;
 
     return std::make_unique<TieredChunkCache>(
         std::move(config),

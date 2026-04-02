@@ -6,6 +6,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
@@ -93,7 +94,7 @@ public:
     [[nodiscard]] vc::cache::TieredChunkCache* tieredCache();
 
     // Set cache budget (must be called before first tieredCache() access).
-    void setCacheBudget(size_t hotBytes, size_t warmBytes = 0);
+    void setCacheBudget(size_t hotBytes);
 
     // Inject a shared DiskStore for the cold cache tier.
     // Must be called before first tieredCache() access.
@@ -102,11 +103,6 @@ public:
     // Set the maximum size for the auto-created disk cache (remote volumes).
     // Must be called before first tieredCache() access.
     void setDiskCacheMaxBytes(size_t bytes);
-
-    // Enable H.265 recompression for disk-cached remote chunks.
-    // qp: quantization parameter (0-51). 0 = lossless.
-    // Must be called before first tieredCache() access.
-    void setVideoRecompression(bool enabled, int qp = 15);
 
     // Set the number of background IO threads for chunk fetching.
     // Must be called before first tieredCache() access.
@@ -211,13 +207,10 @@ protected:
     mutable std::unique_ptr<vc::cache::TieredChunkCache> tieredCache_;
     mutable std::once_flag cacheOnce_;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
-    size_t cacheBudgetWarm_ = 2ULL << 30;   // 2 GB default
     size_t diskCacheMaxBytes_ = 100ULL << 30; // 100 GB default
     std::shared_ptr<vc::cache::DiskStore> pendingDiskStore_;
-    bool videoRecompressEnabled_ = true;
-    int videoCodecQP_ = 15;
     int ioThreads_ = 0;  // 0 = use default
-    std::atomic<bool> prefetchStarted_{false};
+    std::atomic<bool> prefetchStop_{false};
 
     void ensureTieredCache() const;
 

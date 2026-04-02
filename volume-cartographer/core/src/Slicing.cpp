@@ -24,6 +24,14 @@
 #include <immintrin.h>
 #endif
 
+// Force-inline for hot-path functions.  -Oz suppresses inlining aggressively;
+// these functions are called millions of times per frame and must be inlined.
+#if defined(_MSC_VER)
+#define VC_FORCE_INLINE __forceinline
+#else
+#define VC_FORCE_INLINE __attribute__((always_inline)) inline
+#endif
+
 // Non-temporal store for write-only output — bypasses cache,
 // freeing cache lines for read-heavy chunk data.
 template<typename T>
@@ -118,31 +126,31 @@ struct CacheParams {
     }
 
     // Chunk index: shift for pow2, divide otherwise
-    inline int chunkIdx(int v, int c, int shift) const {
+    VC_FORCE_INLINE int chunkIdx(int v, int c, int shift) const {
         return __builtin_expect(pow2, 1) ? (v >> shift) : (v / c);
     }
 
     // Local offset within chunk: mask for pow2, modulo otherwise
-    inline int localOff(int v, int c, int mask) const {
+    VC_FORCE_INLINE int localOff(int v, int c, int mask) const {
         return __builtin_expect(pow2, 1) ? (v & mask) : (v % c);
     }
 
     // Convenience: chunk indices from voxel coords
     // chunk128 path uses compile-time constants — the compiler emits
     // immediate-operand shifts (e.g. shr reg, 7) with no register loads.
-    inline int chunkZ(int iz) const { return __builtin_expect(chunk128, 1) ? (iz >> kChunkShift) : __builtin_expect(pow2, 1) ? (iz >> czShift) : (iz / cz); }
-    inline int chunkY(int iy) const { return __builtin_expect(chunk128, 1) ? (iy >> kChunkShift) : __builtin_expect(pow2, 1) ? (iy >> cyShift) : (iy / cy); }
-    inline int chunkX(int ix) const { return __builtin_expect(chunk128, 1) ? (ix >> kChunkShift) : __builtin_expect(pow2, 1) ? (ix >> cxShift) : (ix / cx); }
+    VC_FORCE_INLINE int chunkZ(int iz) const { return __builtin_expect(chunk128, 1) ? (iz >> kChunkShift) : __builtin_expect(pow2, 1) ? (iz >> czShift) : (iz / cz); }
+    VC_FORCE_INLINE int chunkY(int iy) const { return __builtin_expect(chunk128, 1) ? (iy >> kChunkShift) : __builtin_expect(pow2, 1) ? (iy >> cyShift) : (iy / cy); }
+    VC_FORCE_INLINE int chunkX(int ix) const { return __builtin_expect(chunk128, 1) ? (ix >> kChunkShift) : __builtin_expect(pow2, 1) ? (ix >> cxShift) : (ix / cx); }
 
     // Convenience: local offsets from voxel coords
-    inline int localZ(int iz) const { return __builtin_expect(chunk128, 1) ? (iz & kChunkMask) : __builtin_expect(pow2, 1) ? (iz & czMask) : (iz % cz); }
-    inline int localY(int iy) const { return __builtin_expect(chunk128, 1) ? (iy & kChunkMask) : __builtin_expect(pow2, 1) ? (iy & cyMask) : (iy % cy); }
-    inline int localX(int ix) const { return __builtin_expect(chunk128, 1) ? (ix & kChunkMask) : __builtin_expect(pow2, 1) ? (ix & cxMask) : (ix % cx); }
+    VC_FORCE_INLINE int localZ(int iz) const { return __builtin_expect(chunk128, 1) ? (iz & kChunkMask) : __builtin_expect(pow2, 1) ? (iz & czMask) : (iz % cz); }
+    VC_FORCE_INLINE int localY(int iy) const { return __builtin_expect(chunk128, 1) ? (iy & kChunkMask) : __builtin_expect(pow2, 1) ? (iy & cyMask) : (iy % cy); }
+    VC_FORCE_INLINE int localX(int ix) const { return __builtin_expect(chunk128, 1) ? (ix & kChunkMask) : __builtin_expect(pow2, 1) ? (ix & cxMask) : (ix % cx); }
 
 
     // 16^3 block layout offset: local coords (lz, ly, lx) -> flat offset.
     // Pure bit ops for pow2 chunks.
-    inline size_t blockOffset(int lz, int ly, int lx) const {
+    VC_FORCE_INLINE size_t blockOffset(int lz, int ly, int lx) const {
         int bz = lz >> 4, by = ly >> 4, bx = lx >> 4;
         int blockIdx = bz * blocksPerZ + by * blocksPerX + bx;
         int localOff = ((lz & 0xF) << 8) | ((ly & 0xF) << 4) | (lx & 0xF);
@@ -154,7 +162,7 @@ struct CacheParams {
     // When none of the +1 coords cross a 16-boundary, offsets are
     // simple additions from a base offset. Otherwise falls back to
     // individual blockOffset calls.
-    inline void trilinearBlockOffsets8(
+    VC_FORCE_INLINE void trilinearBlockOffsets8(
         int lz0, int ly0, int lx0,
         size_t (&off)[8]) const
     {
@@ -231,7 +239,7 @@ struct ChunkSampler {
     // Grid dimensions for direct index computation
     int NY = 0, NX = 0;
 
-    static uint64_t packKey(int iz, int iy, int ix) {
+    VC_FORCE_INLINE static uint64_t packKey(int iz, int iy, int ix) {
         return (uint64_t(unsigned(iz)) << 40) | (uint64_t(unsigned(iy)) << 20) | uint64_t(unsigned(ix));
     }
 
@@ -246,18 +254,18 @@ struct ChunkSampler {
 
 
     // Compute flat offset from local coords, respecting current chunk layout.
-    inline size_t voxelOffset(int lz, int ly, int lx) const {
+    VC_FORCE_INLINE size_t voxelOffset(int lz, int ly, int lx) const {
         if (__builtin_expect(useBlocks, 1))
             return p.blockOffset(lz, ly, lx);
         return static_cast<size_t>(lz) * s0 + static_cast<size_t>(ly) * s1 + lx;
     }
 
     // Direct-mapped index: chunk coords → slot index via simple mask
-    int directIndex(int iz, int iy, int ix) const {
+    VC_FORCE_INLINE int directIndex(int iz, int iy, int ix) const {
         return (iz * NY * NX + iy * NX + ix) & kSlotMask;
     }
 
-    void updateChunk(int iz, int iy, int ix) {
+    VC_FORCE_INLINE void updateChunk(int iz, int iy, int ix) {
         uint64_t key = packKey(iz, iy, ix);
 
         // Fast MRU check — same chunk as last call
@@ -363,7 +371,7 @@ struct ChunkSampler {
         return vz >= 0 && vy >= 0 && vx >= 0 && vz < p.sz && vy < p.sy && vx < p.sx;
     }
 
-    T sampleNearest(float vz, float vy, float vx) {
+    VC_FORCE_INLINE T sampleNearest(float vz, float vy, float vx) {
         int iz = static_cast<int>(vz + 0.5f);
         int iy = static_cast<int>(vy + 0.5f);
         int ix = static_cast<int>(vx + 0.5f);
@@ -393,7 +401,7 @@ struct ChunkSampler {
         return data[voxelOffset(lz, ly, lx)];
     }
 
-    T sampleInt(int iz, int iy, int ix) {
+    VC_FORCE_INLINE T sampleInt(int iz, int iy, int ix) {
         if (__builtin_expect(iz < 0 || iy < 0 || ix < 0 || iz >= p.sz || iy >= p.sy || ix >= p.sx, 0))
             return 0;
 
@@ -419,7 +427,7 @@ struct ChunkSampler {
         return data[voxelOffset(lz, ly, lx)];
     }
 
-    float sampleTrilinear(float vz, float vy, float vx) {
+    VC_FORCE_INLINE float sampleTrilinear(float vz, float vy, float vx) {
         int iz = static_cast<int>(vz);
         int iy = static_cast<int>(vy);
         int ix = static_cast<int>(vx);
@@ -449,7 +457,7 @@ struct ChunkSampler {
     }
 
     // Fast path: when all 8 trilinear corners are in the same chunk
-    float sampleTrilinearFast(float vz, float vy, float vx) {
+    VC_FORCE_INLINE float sampleTrilinearFast(float vz, float vy, float vx) {
         int iz = static_cast<int>(vz);
         int iy = static_cast<int>(vy);
         int ix = static_cast<int>(vx);
@@ -512,7 +520,7 @@ struct ChunkSampler {
 
     // Same as sampleTrilinearFast but caller guarantees vz/vy/vx are in bounds
     // (i.e., iz >= 0, iy >= 0, ix >= 0, iz+1 < p.sz, iy+1 < p.sy, ix+1 < p.sx).
-    float sampleTrilinearUnchecked(float vz, float vy, float vx) {
+    VC_FORCE_INLINE float sampleTrilinearUnchecked(float vz, float vy, float vx) {
         int iz = static_cast<int>(vz);
         int iy = static_cast<int>(vy);
         int ix = static_cast<int>(vx);

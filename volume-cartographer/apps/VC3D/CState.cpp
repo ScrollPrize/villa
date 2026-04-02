@@ -84,19 +84,11 @@ size_t CState::cacheSizeBytes() const { return _cacheSizeBytes; }
 void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
     if (vol && _cacheSizeBytes > 0) {
-        size_t hotBytes = _cacheSizeBytes * 8 / 10;
-        size_t warmBytes = _cacheSizeBytes - hotBytes;
-        vol->setCacheBudget(hotBytes, warmBytes);
+        vol->setCacheBudget(_cacheSizeBytes);
         vol->setDiskCacheMaxBytes(_diskCacheSizeBytes);
 
-        // H.265 recompression settings
         using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        bool recompressEnabled = settings.value(perf::VIDEO_RECOMPRESS_ENABLED, perf::VIDEO_RECOMPRESS_ENABLED_DEFAULT).toBool();
-        int preset = settings.value(perf::VIDEO_QUALITY_PRESET, perf::VIDEO_QUALITY_PRESET_DEFAULT).toInt();
-        preset = std::clamp(preset, 0, perf::PRESET_COUNT - 1);
-        int qp = perf::PRESET_VIDEO_QP[preset];
-        vol->setVideoRecompression(recompressEnabled, qp);
 
         int ioThreads = settings.value(perf::IO_THREADS, perf::IO_THREADS_DEFAULT).toInt();
         vol->setIOThreads(std::clamp(ioThreads, 1, 100));

@@ -58,7 +58,11 @@ Volume::Volume(std::filesystem::path path, std::string uuid, std::string name)
     mountInfo_ = vc::detectNetworkMount(path_);
 }
 
-Volume::~Volume() noexcept = default;
+Volume::~Volume() noexcept
+{
+    // Request stop and join the prefetch thread before destroying the cache
+    prefetchStop_.store(true, std::memory_order_relaxed);
+}
 
 void Volume::loadMetadata()
 {
@@ -413,7 +417,6 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
     vc::cache::TieredChunkCache::Config config;
     config.volumeId = id();
     config.hotMaxBytes = cacheBudgetHot_;
-    config.warmMaxBytes = cacheBudgetWarm_;
     if (isRemote_ || mountInfo_.type == vc::FilesystemType::NetworkMount) {
         if (ioThreads_ > 0) {
             config.ioThreads = ioThreads_;
@@ -423,10 +426,6 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
             config.ioThreads = 8;  // HTTP/2 multiplexing: fewer connections, many streams each
         }
         fprintf(stderr, "[Volume] IO threads: %d\n", config.ioThreads);
-    }
-
-    if (videoRecompressEnabled_ && (isRemote_ || mountInfo_.type == vc::FilesystemType::NetworkMount)) {
-        config.recompress = vc::cache::makeVideoRecompressor(dsPtrs, videoCodecQP_);
     }
 
     return std::make_unique<vc::cache::TieredChunkCache>(
@@ -454,10 +453,9 @@ vc::cache::TieredChunkCache* Volume::tieredCache()
     return tieredCache_.get();
 }
 
-void Volume::setCacheBudget(size_t hotBytes, size_t warmBytes)
+void Volume::setCacheBudget(size_t hotBytes)
 {
     cacheBudgetHot_ = hotBytes;
-    cacheBudgetWarm_ = warmBytes;
 }
 
 void Volume::setDiskStore(std::shared_ptr<vc::cache::DiskStore> store)
@@ -473,12 +471,6 @@ void Volume::setDiskStore(std::shared_ptr<vc::cache::DiskStore> store)
 void Volume::setDiskCacheMaxBytes(size_t bytes)
 {
     diskCacheMaxBytes_ = bytes;
-}
-
-void Volume::setVideoRecompression(bool enabled, int qp)
-{
-    videoRecompressEnabled_ = enabled;
-    videoCodecQP_ = qp;
 }
 
 void Volume::setIOThreads(int count)
@@ -1219,11 +1211,6 @@ void Volume::prefetchChunks(const cv::Mat_<cv::Vec3f>& coords, int level)
 
 void Volume::prefetchLevels(int fromLevel, int toLevel)
 {
-    // Only allow one prefetch to run per volume
-    bool expected = false;
-    if (!prefetchStarted_.compare_exchange_strong(expected, true))
-        return;
-
     ensureTieredCache();
     if (!tieredCache_) return;
 
@@ -1231,70 +1218,20 @@ void Volume::prefetchLevels(int fromLevel, int toLevel)
     fromLevel = std::clamp(fromLevel, 0, maxLevel);
     toLevel = std::clamp(toLevel, 0, maxLevel);
 
-    // Use data bounds to limit prefetch to non-empty region
-    const auto& db = dataBounds();
-    bool hasDataBounds = db.valid;
-    int dbMinX = db.minX, dbMaxX = db.maxX;
-    int dbMinY = db.minY, dbMaxY = db.maxY;
-    int dbMinZ = db.minZ, dbMaxZ = db.maxZ;
-
-    size_t diskBudget = diskCacheMaxBytes_;
-
-    // Spawn a background thread that feeds levels coarsest-first
-    std::thread([cache = tieredCache_.get(), fromLevel, toLevel, diskBudget,
-                 hasDataBounds, dbMinX, dbMaxX, dbMinY, dbMaxY, dbMinZ, dbMaxZ]() {
-        for (int lvl = toLevel; lvl >= fromLevel; lvl--) {
-            // Skip levels that are already fully prefetched
-            if (cache->isLevelComplete(lvl)) {
-                std::fprintf(stderr, "[Volume] Level %d already complete, skipping\n", lvl);
-                continue;
-            }
-
+    // Spawn a detached background thread — never blocks the GUI
+    std::thread([cache = tieredCache_.get(), fromLevel, toLevel, &stop = prefetchStop_]() {
+        stop.store(false, std::memory_order_relaxed);
+        for (int lvl = toLevel; lvl >= fromLevel && !stop.load(std::memory_order_relaxed); lvl--) {
             auto ls = cache->levelShape(lvl);
             auto cs = cache->chunkShape(lvl);
-            int iz1 = (ls[0] + cs[0] - 1) / cs[0] - 1;
-            int iy1 = (ls[1] + cs[1] - 1) / cs[1] - 1;
-            int ix1 = (ls[2] + cs[2] - 1) / cs[2] - 1;
+            int gridZ = (ls[0] + cs[0] - 1) / cs[0];
+            int gridY = (ls[1] + cs[1] - 1) / cs[1];
+            int gridX = (ls[2] + cs[2] - 1) / cs[2];
+            int total = gridZ * gridY * gridX;
 
-            int iz0 = 0, iy0 = 0, ix0 = 0;
-            if (hasDataBounds) {
-                // Only prefetch chunks that overlap the data bounds
-                float scale = 1.0f / static_cast<float>(1 << lvl);
-                iz0 = std::max(0, static_cast<int>(dbMinZ * scale) / cs[0]);
-                iy0 = std::max(0, static_cast<int>(dbMinY * scale) / cs[1]);
-                ix0 = std::max(0, static_cast<int>(dbMinX * scale) / cs[2]);
-                iz1 = std::min(iz1, static_cast<int>(dbMaxZ * scale) / cs[0]);
-                iy1 = std::min(iy1, static_cast<int>(dbMaxY * scale) / cs[1]);
-                ix1 = std::min(ix1, static_cast<int>(dbMaxX * scale) / cs[2]);
-            }
+            std::fprintf(stderr, "[Volume] Prefetching level %d (%d chunks)...\n",
+                         lvl, total);
 
-            int total = (iz1 - iz0 + 1) * (iy1 - iy0 + 1) * (ix1 - ix0 + 1);
-
-            // Estimate on-disk size using average compressed bytes per file.
-            // DiskStore tracks actual compressed file sizes, so this accounts
-            // for recompression.
-            auto stats = cache->stats();
-            size_t diskUsed = stats.diskBytes;
-            size_t avgBytesPerChunk = (stats.diskFiles > 0)
-                ? diskUsed / stats.diskFiles
-                : static_cast<size_t>(cs[0]) * cs[1] * cs[2];  // fallback: uncompressed
-            size_t estimatedBytes = static_cast<size_t>(total) * avgBytesPerChunk;
-            if (diskBudget > 0 && diskUsed + estimatedBytes > diskBudget) {
-                double estGB = estimatedBytes / (1024.0 * 1024.0 * 1024.0);
-                double budgetGB = diskBudget / (1024.0 * 1024.0 * 1024.0);
-                double usedGB = diskUsed / (1024.0 * 1024.0 * 1024.0);
-                std::fprintf(stderr,
-                    "[Volume] Skipping level %d prefetch: %d chunks (~%.1f GB) "
-                    "would exceed disk budget (%.1f/%.1f GB used)\n",
-                    lvl, total, estGB, usedGB, budgetGB);
-                continue;
-            }
-
-            double estGB = estimatedBytes / (1024.0 * 1024.0 * 1024.0);
-            std::fprintf(stderr, "[Volume] Prefetching level %d (%d chunks, ~%.1f GB)...\n",
-                         lvl, total, estGB);
-
-            // Delegate to prefetchLevel which uses the dedicated prefetch pool
             cache->prefetchLevel(lvl, [lvl, total](int fetched, int t) {
                 if (fetched % 5000 < 1000)
                     std::fprintf(stderr, "[Volume] Level %d prefetch: %d/%d\n",
@@ -1310,6 +1247,8 @@ void Volume::prefetchLevels(int fromLevel, int toLevel)
 
 void Volume::cancelPendingPrefetch()
 {
+    // Stop the prefetch thread first
+    prefetchStop_.store(true, std::memory_order_relaxed);
     if (tieredCache_) {
         tieredCache_->cancelPendingPrefetch();
     }

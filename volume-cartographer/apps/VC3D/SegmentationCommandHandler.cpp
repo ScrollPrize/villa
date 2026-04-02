@@ -13,6 +13,8 @@
 #include <memory>
 #include <filesystem>
 #include <limits>
+#include <mutex>
+#include <condition_variable>
 
 #include <QSettings>
 #include <QMessageBox>
@@ -1381,6 +1383,14 @@ static RemoteChunkFetchResult fetchRemoteChunkKeys(
     result.initialAvailable = cache->countAvailable(keys);
     progress->availableKeys.store(result.initialAvailable, std::memory_order_relaxed);
 
+    // Use a condition_variable to wake up when chunks arrive instead of
+    // sleep-polling.  The cache fires its ChunkReadyCallback on the IO
+    // thread each time a chunk finishes; we signal the CV from there.
+    std::mutex cvMtx;
+    std::condition_variable cv;
+    auto listenerId = cache->addChunkReadyListener(
+        [&cv](const vc::cache::ChunkKey&) { cv.notify_one(); });
+
     cache->prefetch(keys);
 
     size_t available = result.initialAvailable;
@@ -1388,7 +1398,10 @@ static RemoteChunkFetchResult fetchRemoteChunkKeys(
     int idleRetries = 0;
 
     while (available < keys.size()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        {
+            std::unique_lock<std::mutex> lk(cvMtx);
+            cv.wait_for(lk, std::chrono::milliseconds(200));
+        }
         available = cache->countAvailable(keys);
         const auto stats = cache->stats();
         progress->availableKeys.store(available, std::memory_order_relaxed);
@@ -1400,6 +1413,7 @@ static RemoteChunkFetchResult fetchRemoteChunkKeys(
             ++idleRetries;
             cache->prefetch(keys);
             if (idleRetries > 3) {
+                cache->removeChunkReadyListener(listenerId);
                 result.error = QObject::tr("Remote chunk fetch stalled at %1 / %2 chunks.")
                                    .arg(available).arg(keys.size());
                 return result;
@@ -1409,6 +1423,8 @@ static RemoteChunkFetchResult fetchRemoteChunkKeys(
         }
         lastAvailable = available;
     }
+
+    cache->removeChunkReadyListener(listenerId);
 
     result.success = true;
     result.fetchedKeys = keys.size() - result.initialAvailable;
@@ -1613,7 +1629,6 @@ void SegmentationCommandHandler::onFetchRemoteChunks(const std::string& segmentI
         progress.exec();
     }
     timer.stop();
-    watcher.waitForFinished();
 
     const auto result = watcher.result();
     if (!result.success) {

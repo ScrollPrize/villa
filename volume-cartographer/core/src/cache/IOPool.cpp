@@ -37,18 +37,14 @@ void IOPool::start()
                         if (auto* log = cacheDebugLog())
                             std::fprintf(log, "[IOPOOL] fetch exception for lvl=%d pos=(%d,%d,%d): %s\n",
                                          task.key.level, task.key.iz, task.key.iy, task.key.ix, e.what());
-                        queue_.complete(task);
                         continue;
                     } catch (...) {
                         if (auto* log = cacheDebugLog())
                             std::fprintf(log, "[IOPOOL] unknown fetch exception for lvl=%d pos=(%d,%d,%d)\n",
                                          task.key.level, task.key.iz, task.key.iy, task.key.ix);
-                        queue_.complete(task);
                         continue;
                     }
                 }
-
-                queue_.complete(task);
 
                 // Notify completion
                 if (onComplete_) {
@@ -71,64 +67,27 @@ void IOPool::setCompletionCallback(CompletionCallback cb)
     onComplete_ = std::move(cb);
 }
 
-void IOPool::setCurrentEpoch(uint64_t epoch)
-{
-    currentEpoch_.store(epoch, std::memory_order_relaxed);
-}
-
 void IOPool::submit(const ChunkKey& key)
 {
-    // Backpressure: if queue is at capacity, flush all pending (queued but
-    // not in-flight) tasks to make room.  New requests are more relevant
-    // than old ones since the user has likely navigated elsewhere.
-    if (queue_.queued_count() >= maxQueueSize_) {
-        queue_.cancel_pending();
-    }
-
-    queue_.submit(Task{
-        key,
-        nextSeq_.fetch_add(1, std::memory_order_relaxed),
-        currentEpoch_.load(std::memory_order_relaxed)
-    });
+    queue_.submit(Task{key, nextSeq_.fetch_add(1, std::memory_order_relaxed)});
 }
 
 void IOPool::submit(const std::vector<ChunkKey>& keys)
 {
-    // Backpressure: if adding this batch would exceed capacity, flush all
-    // pending tasks first.  In-flight downloads continue uninterrupted.
-    size_t currentSize = queue_.queued_count();
-    if (currentSize + keys.size() > maxQueueSize_) {
-        queue_.cancel_pending();
-    }
-
-    uint64_t epoch = currentEpoch_.load(std::memory_order_relaxed);
     std::vector<Task> tasks;
     tasks.reserve(keys.size());
     for (const auto& k : keys) {
-        tasks.push_back(Task{
-            k,
-            nextSeq_.fetch_add(1, std::memory_order_relaxed),
-            epoch
-        });
+        tasks.push_back(Task{k, nextSeq_.fetch_add(1, std::memory_order_relaxed)});
     }
     queue_.submit_batch(tasks.begin(), tasks.end());
 }
 
 void IOPool::submitBackground(const std::vector<ChunkKey>& keys)
 {
-    // Background submit: no cancel_pending. If queue is full, just skip.
-    if (queue_.queued_count() >= maxQueueSize_) return;
-
-    // Use epoch 0 so background prefetch always has lower priority
-    // than interactive fetches (which use the current epoch).
     std::vector<Task> tasks;
     tasks.reserve(keys.size());
     for (const auto& k : keys) {
-        tasks.push_back(Task{
-            k,
-            nextSeq_.fetch_add(1, std::memory_order_relaxed),
-            0  // lowest priority
-        });
+        tasks.push_back(Task{k, nextSeq_.fetch_add(1, std::memory_order_relaxed)});
     }
     queue_.submit_batch(tasks.begin(), tasks.end());
 }
@@ -140,7 +99,7 @@ void IOPool::cancelPending()
 
 size_t IOPool::pendingCount() const
 {
-    return queue_.queued_count() + queue_.in_flight_count();
+    return queue_.queued_count();
 }
 
 void IOPool::stop()

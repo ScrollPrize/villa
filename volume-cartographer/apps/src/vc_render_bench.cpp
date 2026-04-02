@@ -122,19 +122,17 @@ static void printResult(const BenchResult& r, int tileW, int tileH) {
 
 static void printCacheStats(vc::cache::TieredChunkCache* cache) {
     auto s = cache->stats();
-    uint64_t total = s.hotHits + s.warmHits + s.coldHits + s.iceFetches + s.misses;
+    uint64_t total = s.hotHits + s.coldHits + s.iceFetches + s.misses;
     if (total == 0) total = 1;
 
     auto pct = [&](uint64_t n) { return 100.0 * n / total; };
 
     printf("\n  Cache stats:\n");
     printf("    Hot  hits:  %8llu  (%5.1f%%)\n", (unsigned long long)s.hotHits,  pct(s.hotHits));
-    printf("    Warm hits:  %8llu  (%5.1f%%)\n", (unsigned long long)s.warmHits, pct(s.warmHits));
     printf("    Cold hits:  %8llu  (%5.1f%%)\n", (unsigned long long)s.coldHits, pct(s.coldHits));
     printf("    Ice fetch:  %8llu  (%5.1f%%)\n", (unsigned long long)s.iceFetches, pct(s.iceFetches));
     printf("    Misses:     %8llu  (%5.1f%%)\n", (unsigned long long)s.misses,  pct(s.misses));
     printf("    Hot bytes:  %8.1f MB\n", s.hotBytes / (1024.0 * 1024.0));
-    printf("    Warm bytes: %8.1f MB\n", s.warmBytes / (1024.0 * 1024.0));
     printf("    IO pending: %8zu\n", s.ioPending);
     printf("    Disk files: %8zu  (%8.1f MB)\n", s.diskFiles, s.diskBytes / (1024.0 * 1024.0));
 }
@@ -189,7 +187,7 @@ int main(int argc, char** argv)
         vol = Volume::New(volumePath);
     }
 
-    vol->setCacheBudget((size_t)hotGb << 30, 2ULL << 30);
+    vol->setCacheBudget((size_t)hotGb << 30);
     vol->setIOThreads(ioThreads);
 
     auto shape = vol->shape();

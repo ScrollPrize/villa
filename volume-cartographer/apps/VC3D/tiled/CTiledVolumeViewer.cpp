@@ -275,7 +275,7 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
 CTiledVolumeViewer::~CTiledVolumeViewer()
 {
     _intersectionFutureWatcher.disconnect();
-    _intersectionFutureWatcher.waitForFinished();
+    _intersectionFutureWatcher.cancel();
     _intersectionThrottleTimer->stop();
 
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
@@ -1737,17 +1737,16 @@ void CTiledVolumeViewer::updateStatusLabel()
         auto s = _volume->tieredCache()->stats();
 
         // Hit ratios
-        uint64_t total = s.hotHits + s.warmHits + s.coldHits + s.iceFetches + s.misses;
+        uint64_t total = s.hotHits + s.coldHits + s.iceFetches + s.misses;
         if (total > 0) {
             auto pct = [&](uint64_t n) { return static_cast<int>(100 * n / total); };
-            status += QString(" | H%1 W%2 D%3")
-                .arg(pct(s.hotHits)).arg(pct(s.warmHits)).arg(pct(s.coldHits));
+            status += QString(" | H%1 D%2")
+                .arg(pct(s.hotHits)).arg(pct(s.coldHits));
         }
 
-        // RAM usage (hot + warm)
+        // RAM usage (hot tier)
         double hotGB = s.hotBytes / (1024.0 * 1024.0 * 1024.0);
-        double warmGB = s.warmBytes / (1024.0 * 1024.0 * 1024.0);
-        status += QString(" | ram %1+%2G").arg(hotGB, 0, 'f', 1).arg(warmGB, 0, 'f', 1);
+        status += QString(" | ram %1G").arg(hotGB, 0, 'f', 1);
 
         // Disk cache
         if (s.diskFiles > 0) {

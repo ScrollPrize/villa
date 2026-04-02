@@ -519,21 +519,11 @@ void primeRemoteLevel5WithDialog(CWindow* window, const std::shared_ptr<Volume>&
     auto* watcher = new QFutureWatcher<void>(window);
     QObject::connect(watcher, &QFutureWatcher<void>::finished, window, [window, volume, watcher]() {
         watcher->deleteLater();
-        try {
-            watcher->future().waitForFinished();  // rethrows exceptions
-            if (window->statusBar()) {
-                window->statusBar()->showMessage(
-                    window->tr("Cached remote level 5 overview for '%1'.")
-                        .arg(QString::fromStdString(volume->id())),
-                    5000);
-            }
-        } catch (const std::exception& e) {
-            if (window->statusBar()) {
-                window->statusBar()->showMessage(
-                    window->tr("Failed to cache level 5: %1")
-                        .arg(QString::fromUtf8(e.what())),
-                    5000);
-            }
+        if (window->statusBar()) {
+            window->statusBar()->showMessage(
+                window->tr("Cached remote level 5 overview for '%1'.")
+                    .arg(QString::fromStdString(volume->id())),
+                5000);
         }
     });
 
@@ -4668,15 +4658,9 @@ void CWindow::onEditMaskPressed(void)
                 ui.btnEditMask->setEnabled(true);
                 ui.btnAppendMask->setEnabled(true);
 
-                try {
-                    watcher->waitForFinished();
-                    statusBar()->showMessage(tr("Mask saved"), 3000);
-                    QDesktopServices::openUrl(QUrl::fromLocalFile(
-                        QString::fromStdString(path.string())));
-                } catch (const std::exception& e) {
-                    statusBar()->showMessage(
-                        tr("Mask render failed: %1").arg(e.what()), 5000);
-                }
+                statusBar()->showMessage(tr("Mask saved"), 3000);
+                QDesktopServices::openUrl(QUrl::fromLocalFile(
+                    QString::fromStdString(path.string())));
             });
 
     watcher->setFuture(QtConcurrent::run([surf, path]() {

@@ -414,8 +414,28 @@ static std::string synthesize_v2_metadata(const utils::Json& v3)
     v2["shape"] = v3["shape"];
 
     // Chunk shape: v3 uses chunk_grid.configuration.chunk_shape
-    auto& grid = v3["chunk_grid"];
-    v2["chunks"] = grid["configuration"]["chunk_shape"];
+    // For sharded arrays, this is the SHARD shape; the inner chunk shape
+    // is in the sharding_indexed codec. We need the inner chunk shape for v2.
+    utils::Json chunkShape;
+    if (v3.contains("chunk_grid") && v3["chunk_grid"].contains("configuration")) {
+        auto gridCfg = v3["chunk_grid"]["configuration"];
+        if (gridCfg.contains("chunk_shape"))
+            chunkShape = gridCfg["chunk_shape"];
+    }
+    // Check if sharding_indexed codec overrides the chunk shape
+    if (v3.contains("codecs") && v3["codecs"].is_array()) {
+        for (auto& codec : v3["codecs"]) {
+            if (codec.value("name", std::string("")) == "sharding_indexed") {
+                if (codec.contains("configuration")) {
+                    auto shardCfg = codec["configuration"];
+                    if (shardCfg.contains("chunk_shape"))
+                        chunkShape = shardCfg["chunk_shape"];
+                }
+                break;
+            }
+        }
+    }
+    v2["chunks"] = chunkShape;
 
     // Data type: v3 uses string like "uint8", "uint16"; map to v2 dtype codes
     std::string dtype = v3["data_type"].get_string();
@@ -479,25 +499,17 @@ static std::string synthesize_v2_metadata(const utils::Json& v3)
     return v2.dump(2);
 }
 
-// Parse shard configuration from zarr v3 storage_transformers.
-// Returns a ShardConfig with enabled=true if chunk_manifest_sharding is found.
+// Parse shard configuration from zarr v3 metadata.
+// Checks both storage_transformers (older v3 draft) and codecs (current v3 spec).
+// Returns a ShardConfig with enabled=true if sharding is found.
 static ShardConfig parse_v3_shard_config(
     const utils::Json& v3,
     const std::array<int, 3>& chunkShape)
 {
     ShardConfig config;
 
-    if (!v3.contains("storage_transformers") || !v3["storage_transformers"].is_array())
-        return config;
-
-    for (auto& t : v3["storage_transformers"]) {
-        std::string name = t.value("name", std::string(""));
-        if (name != "chunk_manifest_sharding") continue;
-
-        if (!t.contains("configuration")) continue;
-        auto& cfg = t["configuration"];
-
-        // Shard shape in chunks (how many chunks per shard in each dimension)
+    // Helper to parse shard config from a sharding codec/transformer config
+    auto tryParseShard = [&](const utils::Json& cfg) -> bool {
         if (cfg.contains("chunks_per_shard") && cfg["chunks_per_shard"].is_array() &&
             cfg["chunks_per_shard"].size() >= 3) {
             int cz = cfg["chunks_per_shard"][0].get_int();
@@ -509,8 +521,47 @@ static ShardConfig parse_v3_shard_config(
                 cy * chunkShape[1],
                 cx * chunkShape[2]
             };
+            return true;
         }
-        break;
+        // Standard v3: chunk_grid gives shard shape, inner chunk_shape is in codec config
+        if (cfg.contains("chunk_shape") && cfg["chunk_shape"].is_array() &&
+            cfg["chunk_shape"].size() >= 3) {
+            // chunk_grid.chunk_shape = shard extents, codec.chunk_shape = inner chunk extents
+            // Compute shard shape from chunk_grid if available
+            if (v3.contains("chunk_grid") && v3["chunk_grid"].contains("configuration")) {
+                auto gridCfg = v3["chunk_grid"]["configuration"];
+                if (gridCfg.contains("chunk_shape") && gridCfg["chunk_shape"].is_array()) {
+                    config.enabled = true;
+                    config.shardShape = {
+                        gridCfg["chunk_shape"][0].get_int(),
+                        gridCfg["chunk_shape"][1].get_int(),
+                        gridCfg["chunk_shape"][2].get_int()
+                    };
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // Check storage_transformers (older v3 draft format)
+    if (v3.contains("storage_transformers") && v3["storage_transformers"].is_array()) {
+        for (auto& t : v3["storage_transformers"]) {
+            std::string name = t.value("name", std::string(""));
+            if (name == "chunk_manifest_sharding" && t.contains("configuration")) {
+                if (tryParseShard(t["configuration"])) return config;
+            }
+        }
+    }
+
+    // Check codecs array (current v3 spec: sharding_indexed codec)
+    if (v3.contains("codecs") && v3["codecs"].is_array()) {
+        for (auto& codec : v3["codecs"]) {
+            std::string name = codec.value("name", std::string(""));
+            if (name == "sharding_indexed" && codec.contains("configuration")) {
+                if (tryParseShard(codec["configuration"])) return config;
+            }
+        }
     }
 
     return config;
@@ -833,12 +884,18 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
                         }
 
                         // Check for sharded storage
-                        auto& grid = v3["chunk_grid"];
-                        std::array<int, 3> chunkShape = {
-                            grid["configuration"]["chunk_shape"][0].get_int(),
-                            grid["configuration"]["chunk_shape"][1].get_int(),
-                            grid["configuration"]["chunk_shape"][2].get_int()
-                        };
+                        // Extract chunk shape carefully to avoid Json thread_local cache invalidation
+                        std::array<int, 3> chunkShape = {128, 128, 128};
+                        if (v3.contains("chunk_grid")) {
+                            auto grid = v3["chunk_grid"];
+                            if (grid.contains("configuration")) {
+                                auto gridCfg = grid["configuration"];
+                                if (gridCfg.contains("chunk_shape") && gridCfg["chunk_shape"].is_array()) {
+                                    auto cs = gridCfg["chunk_shape"];
+                                    chunkShape = {cs[0].get_int(), cs[1].get_int(), cs[2].get_int()};
+                                }
+                            }
+                        }
                         shardConfig = parse_v3_shard_config(v3, chunkShape);
 
                         if (shardConfig.enabled) {

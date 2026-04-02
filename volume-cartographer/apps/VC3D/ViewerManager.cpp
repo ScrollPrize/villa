@@ -447,9 +447,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
 
 void ViewerManager::waitForPendingIndexRebuild()
 {
-    if (_surfacePatchIndexWatcher && _surfacePatchIndexWatcher->isRunning()) {
-        _surfacePatchIndexWatcher->waitForFinished();
-    }
+    // No-op: never block the GUI thread waiting for index rebuild
 }
 
 void ViewerManager::primeSurfacePatchIndicesAsync()
@@ -458,7 +456,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         return;
     }
     if (_surfacePatchIndexWatcher->isRunning()) {
-        _surfacePatchIndexWatcher->waitForFinished();
+        _surfacePatchIndexWatcher->cancel();
     }
     if (!_state) {
         return;

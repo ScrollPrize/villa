@@ -59,7 +59,7 @@ static float search_min_line(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3
     float best = ldist(val, tgt_o, tgt_v);
     float res;
     
-    //TODO check maybe add more search patterns, compare motion estimatino for video compression, x264/x265, ...
+    //TODO check maybe add more search patterns, compare motion estimation for video compression, x265, ...
     std::vector<cv::Vec2f> search = {{0,-1},{0,1},{-1,-1},{-1,0},{-1,1},{1,-1},{1,0},{1,1}};
     // std::vector<cv::Vec2f> search = {{0,-1},{0,1},{-1,0},{1,0}};
     cv::Vec2f step = init_step;

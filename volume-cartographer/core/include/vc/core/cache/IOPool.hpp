@@ -43,9 +43,6 @@ public:
     // Set the completion callback (called from worker thread).
     void setCompletionCallback(CompletionCallback cb);
 
-    // Set the current epoch. Tasks from the current epoch get higher priority.
-    void setCurrentEpoch(uint64_t epoch);
-
     // Submit a chunk for background fetching.
     // Deduplicates: if the key is already queued or in-flight, this is a no-op.
     void submit(const ChunkKey& key);
@@ -72,13 +69,11 @@ private:
     struct Task {
         ChunkKey key;
         uint64_t seq = 0;
-        uint64_t epoch = 0;
 
-        // Priority ordering: coarser level first, then newer epoch, then FIFO.
+        // Priority ordering: coarser level first, then FIFO by seq.
         bool operator>(const Task& o) const noexcept
         {
             if (key.level != o.key.level) return key.level < o.key.level;
-            if (epoch != o.epoch) return epoch < o.epoch;
             return seq > o.seq;
         }
     };
@@ -103,7 +98,6 @@ private:
     Queue queue_;
     size_t maxQueueSize_;
     std::atomic<uint64_t> nextSeq_{0};
-    std::atomic<uint64_t> currentEpoch_{0};
 
     int numThreads_;
     std::vector<std::jthread> workers_;

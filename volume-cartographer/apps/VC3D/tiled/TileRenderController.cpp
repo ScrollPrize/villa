@@ -65,9 +65,6 @@ void TileRenderController::onCameraChanged(
 
     if (epochChanged) {
         _inFlightTiles.clear();  // new epoch → need fresh renders
-        if (volume && volume->tieredCache()) {
-            volume->tieredCache()->setIOEpoch(camera.epoch);
-        }
     } else {
         // Same epoch but pool may have been flushed — prune in-flight set
         // against pool pending count to avoid permanent dedup blocks
@@ -135,15 +132,7 @@ void TileRenderController::onCameraChanged(
             });
     }
 
-    // Determine coarsest level for synchronous preview fills.
-    // Skip sync fill when only zOff changed (tiles already have content from
-    // the previous slice — keeping them is better than blocking the UI).
-    const bool scaleOrViewChanged = (std::abs(camera.scale - _lastCamera.scale) > 1e-6f) ||
-                                     (viewportRect != _lastViewportRect);
-    const int coarsestLevel = volume ? std::max(0, static_cast<int>(volume->numScales()) - 1) : 0;
     const uint64_t epoch = _currentEpoch->load(std::memory_order_relaxed);
-    int syncFillCount = 0;
-    constexpr int kMaxSyncFills = 4;  // cap to avoid blocking UI thread
     int submitOrder = 0;  // encodes chunk-grouped spatial locality in priority
 
     for (const auto& wk : visibleKeys) {
@@ -155,32 +144,6 @@ void TileRenderController::onCameraChanged(
             _tileScene->setTileWorld(wk, lookup.pixmap, epoch, lookup.level);
             if (lookup.level == camera.dsScaleIdx) {
                 continue;  // exact hit, no need to re-render
-            }
-        } else if (volume && surface && scaleOrViewChanged
-                   && _tileScene->tileNeedsContent(wk)
-                   && syncFillCount < kMaxSyncFills) {
-            // Tile has no rendered content — render a coarse preview
-            // synchronously from pinned zarr data (~1ms/tile).
-            // Capped to avoid blocking the UI thread too long.
-            ++syncFillCount;
-            TileRenderParams coarseParams = buildParams(wk);
-            coarseParams.dsScaleIdx = coarsestLevel;
-            coarseParams.dsScale = std::pow(2.0f, -coarsestLevel);
-            coarseParams.useFastInterpolation = true;
-            coarseParams.overlayVolume = nullptr;
-            coarseParams.overlayOpacity = 0.0f;
-            coarseParams.compositeSettings = CompositeRenderSettings{};
-
-            auto preview = TileRenderer::renderTile(coarseParams, surface, volume.get());
-            if (!preview.image.isNull()) {
-                QPixmap px = QPixmap::fromImage(preview.image, Qt::NoFormatConversion);
-                _tileScene->setTileWorld(wk, px, epoch, static_cast<int8_t>(coarsestLevel));
-                TiledViewerCamera snapCam;
-                snapCam.scale = coarseParams.scale;
-                snapCam.zOff = coarseParams.zOff;
-                snapCam.dsScaleIdx = coarsestLevel;
-                SliceCacheKey coarseKey = SliceCacheKey::make(wk, snapCam, coarseParams.cacheIdentity);
-                _cache.put(coarseKey, px);
             }
         }
 

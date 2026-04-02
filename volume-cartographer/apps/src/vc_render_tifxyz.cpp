@@ -1315,7 +1315,7 @@ int main(int argc, char *argv[])
 
         try {
             remoteVolume = Volume::NewFromUrl(remoteUrl, vol_path.parent_path());
-            remoteVolume->setCacheBudget(cache_bytes, 0);
+            remoteVolume->setCacheBudget(cache_bytes);
             if (!pathsEquivalent(remoteVolume->path(), vol_path)) {
                 logPrintf(stderr,
                           "Error: remote cache path mismatch; refusing to use staged cache '%s' because remote metadata resolved to '%s'\n",

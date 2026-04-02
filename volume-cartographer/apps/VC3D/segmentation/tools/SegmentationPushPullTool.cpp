@@ -523,9 +523,9 @@ void SegmentationPushPullTool::stopAll()
     _activeAlphaEnabled = false;
     _alphaComputePending = false;
 
-    // If an async computation is running, wait for it so we can apply final results
+    // If an async computation is running, cancel it
     if (_alphaComputeRunning) {
-        _alphaWatcher.waitForFinished();
+        _alphaWatcher.cancel();
         _alphaComputeRunning = false;
     }
 

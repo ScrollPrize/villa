@@ -65,21 +65,14 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
         edtRemoteCachePath->setText(settings.value(viewer::REMOTE_CACHE_DIR, defaultCache).toString());
     }
 
-    // H.265 recompression settings
-    chkVideoRecompress->setChecked(settings.value(perf::VIDEO_RECOMPRESS_ENABLED, perf::VIDEO_RECOMPRESS_ENABLED_DEFAULT).toBool());
-    cmbVideoQualityPreset->setCurrentIndex(std::clamp(
-        settings.value(perf::VIDEO_QUALITY_PRESET, perf::VIDEO_QUALITY_PRESET_DEFAULT).toInt(),
-        0, perf::PRESET_COUNT - 1));
     spinPrefetchLevels->setValue(settings.value(perf::PREFETCH_LEVELS, perf::PREFETCH_LEVELS_DEFAULT).toInt());
     spinIOThreads->setValue(settings.value(perf::IO_THREADS, perf::IO_THREADS_DEFAULT).toInt());
 
-    // Enable/disable quality preset based on checkbox
-    auto updateVideoCodecEnabled = [this]{
-        bool enabled = chkVideoRecompress->isChecked();
-        cmbVideoQualityPreset->setEnabled(enabled);
-    };
-    updateVideoCodecEnabled();
-    connect(chkVideoRecompress, &QCheckBox::toggled, this, updateVideoCodecEnabled);
+    // Hide removed recompression UI
+    chkVideoRecompress->hide();
+    cmbVideoQualityPreset->hide();
+    if (auto* label = findChild<QLabel*>("labelVideoQualityPreset"))
+        label->hide();
 
     connect(btnBrowseRemoteCachePath, &QPushButton::clicked, this, [this]{
         QString dir = QFileDialog::getExistingDirectory(this, tr("Select Remote Cache Directory"),
@@ -144,9 +137,6 @@ void SettingsDialog::accept()
     settings.setValue(perf::DISK_CACHE_SIZE_GB, spinDiskCacheSizeGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
 
-    // H.265 recompression
-    settings.setValue(perf::VIDEO_RECOMPRESS_ENABLED, chkVideoRecompress->isChecked());
-    settings.setValue(perf::VIDEO_QUALITY_PRESET, cmbVideoQualityPreset->currentIndex());
     settings.setValue(perf::PREFETCH_LEVELS, spinPrefetchLevels->value());
     settings.setValue(perf::IO_THREADS, spinIOThreads->value());
 
