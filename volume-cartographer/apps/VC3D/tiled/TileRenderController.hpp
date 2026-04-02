@@ -3,12 +3,9 @@
 #include <QObject>
 #include <QRectF>
 
-#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <string>
-#include <unordered_map>
 
 #include "RenderPool.hpp"
 #include "TileScene.hpp"
@@ -89,23 +86,20 @@ signals:
     void sceneNeedsUpdate();
 
 private slots:
-    // Event-driven tick: scheduled via QTimer::singleShot(0) when there's work.
+    // Vsync-gated tick: runs at display refresh rate (60fps = 16ms).
+    // Drains all completed render results, syncs to scene, triggers repaint.
     void tick();
 
-    // Schedule a tick on the next event loop iteration if not already pending.
+    // Start the vsync timer if not already running.
     void ensureTickRunning();
 
 private:
-    // Sync tiles from ViewportRenderer's TileGrid to TileScene's QGraphicsPixmapItems.
-    // Returns true if any tiles were updated.
-    bool syncTilesToScene();
-
     TileScene* _tileScene;
     RenderPool* _renderPool;  // shared, not owned
     bool _tickPending = false;
+    bool _anyUpdatedThisTick = false;
+    int _tilesDisplayedThisTick = 0;
+    QTimer* _vsyncTimer = nullptr;
 
     vc::render::ViewportRenderer _viewportRenderer;
-
-    // Per-tile version tracking for sync: maps grid index -> last synced version
-    std::unordered_map<int, uint64_t> _syncedVersions;
 };

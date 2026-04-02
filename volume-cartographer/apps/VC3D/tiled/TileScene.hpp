@@ -6,7 +6,6 @@
 #include <QRectF>
 #include <vector>
 #include <cstdint>
-#include <cmath>
 #include <opencv2/core.hpp>
 
 #include "vc/core/render/TileTypes.hpp"
@@ -36,6 +35,12 @@ public:
     // Set tile by world key (converts to grid position internally).
     bool setTileWorld(const WorldTileKey& wk, const QPixmap& pixmap,
                       uint64_t epoch, int8_t level);
+
+    // Set only the QGraphicsPixmapItem pixmap without round-tripping pixels
+    // back into TileGrid.  Use when the grid already has the pixel data
+    // (e.g. syncTilesToScene reads from grid, converts to QPixmap, and just
+    // needs to update the display item).
+    bool setTilePixmapOnly(const WorldTileKey& wk, const QPixmap& pixmap);
 
     // Returns true if the tile at wk has no rendered content (level == -1).
     // Used to decide whether a synchronous coarse preview is needed.

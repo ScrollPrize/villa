@@ -25,7 +25,7 @@ static auto makeHotConfig(const TieredChunkCache::Config& cfg) {
     using HotCache = utils::LRUCache<ChunkKey, ChunkDataPtr, ChunkKeyHash>;
     typename HotCache::Config c;
     c.max_bytes = cfg.hotMaxBytes;
-    c.evict_ratio = 15.0 / 16.0;
+    c.evict_target = 15.0 / 16.0;
     c.promote_on_read = false;  // VC3D pattern: no LRU churn on reads
     c.size_fn = [](const ChunkDataPtr& p) -> std::size_t {
         return p ? p->totalBytes() : 0;
@@ -411,19 +411,19 @@ void TieredChunkCache::cancelPendingPrefetch()
 
 void TieredChunkCache::loadCoarseLevel(int level)
 {
-    coarseLevel_ = level;
     auto shape = levelShape(level);
     auto chunks = chunkShape(level);
-    coarseGrid_ = {
+    std::array<int, 3> grid = {
         (shape[0] + chunks[0] - 1) / chunks[0],
         (shape[1] + chunks[1] - 1) / chunks[1],
         (shape[2] + chunks[2] - 1) / chunks[2]
     };
-    int total = coarseGrid_[0] * coarseGrid_[1] * coarseGrid_[2];
+    int total = grid[0] * grid[1] * grid[2];
     if (total > 10000) {
         std::fprintf(stderr, "[Cache] WARNING: coarse level has %d chunks, skipping flat storage\n", total);
         return;
     }
+    coarseGrid_ = grid;
     coarseData_.resize(total);
 
     for (int iz = 0; iz < coarseGrid_[0]; iz++) {
@@ -436,6 +436,7 @@ void TieredChunkCache::loadCoarseLevel(int level)
             }
         }
     }
+    coarseLevel_ = level;
     std::fprintf(stderr, "[Cache] loadCoarseLevel: level=%d grid=%dx%dx%d (%d chunks)\n",
                  level, coarseGrid_[0], coarseGrid_[1], coarseGrid_[2], total);
 }
@@ -453,6 +454,11 @@ ChunkDataPtr TieredChunkCache::getCoarse(const ChunkKey& key) const
 void TieredChunkCache::propagateZeroChunks(int coarseLevel)
 {
     if (coarseLevel < 0 || coarseLevel >= numLevels()) return;
+
+    // If coarse data was never loaded (e.g. loadCoarseLevel bailed due to
+    // >10k chunks), getCoarse() returns nullptr for everything, which would
+    // incorrectly mark ALL descendant chunks as zero.  Bail out early.
+    if (coarseData_.empty() || coarseLevel != coarseLevel_) return;
 
     auto coarseShape = levelShape(coarseLevel);
     auto coarseChunks = chunkShape(coarseLevel);
@@ -507,6 +513,9 @@ void TieredChunkCache::propagateZeroChunks(int coarseLevel)
                     for (int fy = fy0; fy < fy1; fy++) {
                         for (int fx = fx0; fx < fx1; fx++) {
                             ChunkKey fineKey{lvl, fz, fy, fx};
+                            // Don't overwrite chunks already in the hot cache
+                            if (hotCache_.contains(fineKey))
+                                continue;
                             negativeCache_.insert(fineKey);
                             bloomAdd(fineKey);
                             totalNegated++;
@@ -587,24 +596,14 @@ bool TieredChunkCache::areAllCachedInRegion(
     int iz0, int iy0, int ix0,
     int iz1, int iy1, int ix1) const
 {
-    // Build keys for the region
-    std::vector<ChunkKey> allKeys;
-    allKeys.reserve(static_cast<size_t>(iz1 - iz0 + 1) * (iy1 - iy0 + 1) * (ix1 - ix0 + 1));
+    // Zero-allocation inline check: test each chunk key directly.
     for (int iz = iz0; iz <= iz1; iz++) {
         for (int iy = iy0; iy <= iy1; iy++) {
             for (int ix = ix0; ix <= ix1; ix++) {
-                allKeys.push_back(ChunkKey{level, iz, iy, ix});
+                ChunkKey key{level, iz, iy, ix};
+                if (hotCache_.contains(key)) continue;
+                if (!isAvailableWithoutRemoteFetch(key)) return false;
             }
-        }
-    }
-
-    // Use LRUCache batch operations
-    auto missingHot = hotCache_.missing_keys(allKeys.begin(), allKeys.end());
-    if (missingHot.empty()) return true;
-
-    for (const auto& key : missingHot) {
-        if (!isAvailableWithoutRemoteFetch(key)) {
-            return false;
         }
     }
     return true;
@@ -698,8 +697,10 @@ ChunkDataPtr TieredChunkCache::promoteFromCold(const ChunkKey& key)
 
     auto data = decompress_(*compressed, key);
     if (!data) return nullptr;
-    hotPut(key, data);
-    return data;
+    // Move into cache; shared_ptr copy kept for return
+    auto ret = data;
+    hotPut(key, std::move(data));
+    return ret;
 }
 
 ChunkDataPtr TieredChunkCache::promoteFromIce(const ChunkKey& key)
@@ -717,12 +718,16 @@ ChunkDataPtr TieredChunkCache::promoteFromIce(const ChunkKey& key)
         statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Decompress directly and promote to hot
+    // Decompress and promote to hot; release compressed bytes immediately after
     if (!decompress_) return nullptr;
     auto data = decompress_(compressed, key);
+    compressed.clear();
+    compressed.shrink_to_fit();
     if (!data) return nullptr;
-    hotPut(key, data);
-    return data;
+    // Move into cache; shared_ptr copy kept for return
+    auto ret = data;
+    hotPut(key, std::move(data));
+    return ret;
 }
 
 ChunkDataPtr TieredChunkCache::loadFull(const ChunkKey& key)

@@ -28,11 +28,18 @@ public:
     // Set tile with staleness check (grid-local coordinates).
     // Stores pixels and updates metadata.  Returns true if accepted.
     bool setTile(const TileKey& key, std::vector<uint32_t>&& pixels,
-                 int width, int height, uint64_t epoch, int8_t level);
+                 int width, int height, uint64_t epoch, int8_t level,
+                 std::chrono::steady_clock::time_point submitTime = {},
+                 std::chrono::steady_clock::time_point renderDone = {});
 
     // Set tile by world key (converts to grid position internally).
     bool setTileWorld(const WorldTileKey& wk, std::vector<uint32_t>&& pixels,
-                      int width, int height, uint64_t epoch, int8_t level);
+                      int width, int height, uint64_t epoch, int8_t level,
+                      std::chrono::steady_clock::time_point submitTime = {},
+                      std::chrono::steady_clock::time_point renderDone = {});
+
+    // Update metadata only (no pixel storage). Returns true if accepted by staleness check.
+    bool setTileMeta(const WorldTileKey& wk, uint64_t epoch, int8_t level);
 
     // Returns true if the tile at wk has no rendered content (level == -1).
     bool tileNeedsContent(const WorldTileKey& wk) const;
@@ -84,6 +91,10 @@ public:
     // Metadata access (for staleness checks by TileScene)
     const TileMetadata& metaAt(int idx) const { return _meta[idx]; }
 
+    // Timing access (for profiling)
+    std::chrono::steady_clock::time_point tileSubmitTime(const WorldTileKey& wk) const;
+    std::chrono::steady_clock::time_point tileRenderDone(const WorldTileKey& wk) const;
+
     // Iterate all tile keys (grid-local)
     template<typename Func>
     void forEachTile(Func&& fn) const {
@@ -109,6 +120,8 @@ private:
         int width = 0;
         int height = 0;
         uint64_t version = 0;
+        std::chrono::steady_clock::time_point submitTime;
+        std::chrono::steady_clock::time_point renderDone;
     };
     std::vector<TileData> _tiles;
     uint64_t _nextVersion = 1;

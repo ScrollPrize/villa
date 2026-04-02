@@ -166,7 +166,7 @@ void ViewportRenderer::clearState()
     _pendingVolume.reset();
     _pendingBuildParams = nullptr;
 
-    _chunkArrived = false;
+    _chunkArrived.store(false, std::memory_order_relaxed);
 }
 
 int ViewportRenderer::pendingCount() const
@@ -191,18 +191,17 @@ void ViewportRenderer::setOverlayCallback(std::function<void()> cb)
 
 void ViewportRenderer::markChunkArrived()
 {
-    _chunkArrived = true;
+    _chunkArrived.store(true, std::memory_order_release);
 }
 
 void ViewportRenderer::markOverlaysDirty()
 {
-    _overlaysDirty = true;
+    _overlaysDirty.store(true, std::memory_order_release);
 }
 
 void ViewportRenderer::drainResults()
 {
     auto results = pool()->drainCompleted(
-        tiled_config::DRAIN_BATCH_SIZE,
         _currentEpoch->load(std::memory_order_relaxed),
         _controllerId);
 
@@ -211,12 +210,18 @@ void ViewportRenderer::drainResults()
     for (auto& result : results) {
         _inFlightTiles.erase(result.worldKey);
 
-        if (!result.pixels.empty() &&
-            _tileGrid.setTileWorld(result.worldKey, std::move(result.pixels),
-                                   result.width, result.height,
-                                   result.epoch,
-                                   static_cast<int8_t>(result.actualLevel))) {
-            anyUpdated = true;
+        if (!result.pixels.empty()) {
+            // Update metadata in TileGrid (no pixel storage)
+            bool accepted = _tileGrid.setTileMeta(
+                result.worldKey, result.epoch,
+                static_cast<int8_t>(result.actualLevel));
+
+            if (accepted) {
+                anyUpdated = true;
+                // Pass pixels directly to Qt layer for QPixmap conversion
+                if (_resultCallback)
+                    _resultCallback(std::move(result));
+            }
         }
     }
 
@@ -244,10 +249,9 @@ bool ViewportRenderer::tick()
     int drainedAfter = pool()->pendingCount();
     bool drainedSomething = drainedAfter < drainedBefore;
 
-    // 2. Check if chunks arrived
-    bool chunksJustArrived = _chunkArrived;
-    if (_chunkArrived)
-        _chunkArrived = false;
+    // 2. Check if chunks arrived (atomic test-and-clear to avoid TOCTOU
+    //    with markChunkArrived() called from signal handlers on other threads)
+    bool chunksJustArrived = _chunkArrived.exchange(false, std::memory_order_acq_rel);
 
     // 3. Progressive refinement
     bool poolIdle = pool()->pendingCount() == 0;
@@ -276,9 +280,8 @@ bool ViewportRenderer::tick()
         }
     }
 
-    // 4. Overlay update
-    if (_overlaysDirty) {
-        _overlaysDirty = false;
+    // 4. Overlay update (atomic test-and-clear)
+    if (_overlaysDirty.exchange(false, std::memory_order_acq_rel)) {
         if (_overlayCallback) _overlayCallback();
     }
 

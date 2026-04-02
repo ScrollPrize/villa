@@ -33,7 +33,7 @@ public:
     // -- configuration ------------------------------------------------------
     struct Config {
         std::size_t max_bytes = 1ULL << 30;           // 1 GB default
-        double      evict_ratio = 15.0 / 16.0;        // hysteresis target
+        double      evict_target = 15.0 / 16.0;       // evict down to this fraction of max_bytes
         bool        promote_on_read = true;            // update generation on get()
         std::function<std::size_t(const V&)> size_fn = nullptr;
     };
@@ -63,61 +63,23 @@ public:
         std::shared_lock lock{mutex_};
         auto it = map_.find(key);
         if (it == map_.end()) {
-            thread_local int missCount = 0;
-            if (++missCount >= 256) {
-                misses_.fetch_add(256, std::memory_order_relaxed);
-                missCount = 0;
-            }
+            recordMiss();
             return std::nullopt;
         }
-        if (config_.promote_on_read) {
-            thread_local uint64_t localGen = 0;
-            if (++localGen >= 64) {
-                it->second.generation.store(generation_.fetch_add(localGen, std::memory_order_relaxed), std::memory_order_relaxed);
-                localGen = 0;
-            } else {
-                it->second.generation.store(generation_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            }
-        }
-        thread_local int hitCount = 0;
-        if (++hitCount >= 256) {
-            hits_.fetch_add(256, std::memory_order_relaxed);
-            hitCount = 0;
-        }
+        recordHit(it->second);
         return it->second.value;
     }
 
-    /// Non-blocking read returning a pointer to the stored value.
-    /// Returns nullptr on miss. The pointer is valid while the caller
-    /// holds no exclusive lock and the entry is not evicted.
-    /// For shared_ptr<T> values, callers should copy the shared_ptr
-    /// while the shared lock is held (which this method does internally).
+    /// Non-blocking read with fallback. Returns fallback on miss.
     [[nodiscard]] V get_or(const K& key, V fallback) const
     {
         std::shared_lock lock{mutex_};
         auto it = map_.find(key);
         if (it == map_.end()) {
-            thread_local int missCount = 0;
-            if (++missCount >= 256) {
-                misses_.fetch_add(256, std::memory_order_relaxed);
-                missCount = 0;
-            }
+            recordMiss();
             return fallback;
         }
-        if (config_.promote_on_read) {
-            thread_local uint64_t localGen = 0;
-            if (++localGen >= 64) {
-                it->second.generation.store(generation_.fetch_add(localGen, std::memory_order_relaxed), std::memory_order_relaxed);
-                localGen = 0;
-            } else {
-                it->second.generation.store(generation_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            }
-        }
-        thread_local int hitCount = 0;
-        if (++hitCount >= 256) {
-            hits_.fetch_add(256, std::memory_order_relaxed);
-            hitCount = 0;
-        }
+        recordHit(it->second);
         return it->second.value;
     }
 
@@ -248,6 +210,34 @@ private:
         }
     };
 
+    // -- read helpers (batched stat updates to reduce atomic contention) ----
+    void recordMiss() const
+    {
+        thread_local int missCount = 0;
+        if (++missCount >= 256) {
+            misses_.fetch_add(256, std::memory_order_relaxed);
+            missCount = 0;
+        }
+    }
+
+    void recordHit(const Entry& entry) const
+    {
+        if (config_.promote_on_read) {
+            thread_local uint64_t localGen = 0;
+            if (++localGen >= 64) {
+                entry.generation.store(generation_.fetch_add(localGen, std::memory_order_relaxed), std::memory_order_relaxed);
+                localGen = 0;
+            } else {
+                entry.generation.store(generation_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            }
+        }
+        thread_local int hitCount = 0;
+        if (++hitCount >= 256) {
+            hits_.fetch_add(256, std::memory_order_relaxed);
+            hitCount = 0;
+        }
+    }
+
     // -- size computation ---------------------------------------------------
     [[nodiscard]] std::size_t compute_size(const V& v) const
     {
@@ -296,7 +286,7 @@ private:
     void evict()
     {
         const auto target = static_cast<std::size_t>(
-            static_cast<double>(config_.max_bytes) * config_.evict_ratio);
+            static_cast<double>(config_.max_bytes) * config_.evict_target);
 
         // Phase 1 -- collect candidates under shared lock.
         struct Candidate {
@@ -316,12 +306,15 @@ private:
             }
         }
 
-        // Partial sort: only need the oldest evict_ratio fraction.
-        auto evictCount = static_cast<size_t>(candidates.size() * config_.evict_ratio);
+        // Partial sort: we need to evict (1 - evict_target) of entries; use 2x
+        // that as the candidate count to ensure enough entries after stale skips.
+        auto evictFraction = std::min(1.0, 2.0 * (1.0 - config_.evict_target));
+        auto evictCount = static_cast<size_t>(candidates.size() * evictFraction);
         if (evictCount == 0) evictCount = 1;
+        if (evictCount > candidates.size()) evictCount = candidates.size();
         std::nth_element(candidates.begin(), candidates.begin() + evictCount, candidates.end(),
             [](const Candidate& a, const Candidate& b) { return a.generation < b.generation; });
-        candidates.resize(evictCount);  // Only keep the ones to evict
+        candidates.resize(evictCount);  // Keep oldest candidates
 
         // Phase 2 -- evict under unique lock until under target.
         std::unique_lock lock{mutex_};

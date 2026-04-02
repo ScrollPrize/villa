@@ -4,7 +4,6 @@
 #include <cmath>
 #include <span>
 
-#include <opencv2/imgproc.hpp>
 #include <utils/compositing.hpp>
 
 namespace CompositeMethod {
@@ -107,17 +106,6 @@ bool methodRequiresLayerStorage(const std::string& method)
     return utils::method_requires_storage(utils::parse_compositing_method(method));
 }
 
-std::vector<std::string> availableCompositeMethods()
-{
-    return {
-        "mean",
-        "max",
-        "min",
-        "alpha",
-        "beerLambert"
-    };
-}
-
 float computeLightingFactor(const cv::Vec3f& normal, const CompositeParams& params)
 {
     if (!params.lightingEnabled) {
@@ -141,37 +129,3 @@ float computeLightingFactor(const cv::Vec3f& normal, const CompositeParams& para
     return std::min(1.0f, std::max(0.0f, lighting));
 }
 
-void postprocessComposite(cv::Mat_<uint8_t>& img, const CompositeRenderSettings& settings)
-{
-    if (img.empty()) return;
-
-    // Stretch values to full range
-    if (settings.postStretchValues) {
-        double minVal, maxVal;
-        cv::minMaxLoc(img, &minVal, &maxVal);
-        if (maxVal > minVal) {
-            img.convertTo(img, CV_8U, 255.0 / (maxVal - minVal), -minVal * 255.0 / (maxVal - minVal));
-        }
-    }
-
-    // Remove small connected components
-    if (settings.postRemoveSmallComponents && settings.postMinComponentSize > 1) {
-        cv::Mat_<uint8_t> binary;
-        cv::threshold(img, binary, 0, 255, cv::THRESH_BINARY);
-
-        cv::Mat labels, stats, centroids;
-        int numComponents = cv::connectedComponentsWithStats(binary, labels, stats, centroids, 8, CV_32S);
-
-        cv::Mat_<uint8_t> keepMask = cv::Mat_<uint8_t>::zeros(img.size());
-        for (int i = 1; i < numComponents; i++) {
-            int area = stats.at<int>(i, cv::CC_STAT_AREA);
-            if (area >= settings.postMinComponentSize) {
-                keepMask.setTo(255, labels == i);
-            }
-        }
-
-        cv::Mat_<uint8_t> filtered;
-        img.copyTo(filtered, keepMask);
-        img = filtered;
-    }
-}

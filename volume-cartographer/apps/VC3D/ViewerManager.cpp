@@ -39,7 +39,7 @@ ViewerManager::ViewerManager(CState* state,
     : QObject(parent)
     , _state(state)
     , _points(points)
-    , _renderPool(std::clamp(QThread::idealThreadCount() - 2, 4, 16), this)
+    , _renderPool(QThread::idealThreadCount() * 2, this)
 {
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);

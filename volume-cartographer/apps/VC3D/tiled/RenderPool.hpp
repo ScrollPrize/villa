@@ -4,7 +4,6 @@
 
 #include <atomic>
 #include <memory>
-#include <mutex>
 #include <vector>
 
 #include "TileRenderer.hpp"
@@ -37,10 +36,10 @@ public:
                 const std::shared_ptr<std::atomic<uint64_t>>& epochRef,
                 int controllerId);
 
-    // Take up to maxResults completed results belonging to controllerId.
+    // Take all completed results belonging to controllerId.
     // Results with epoch < minEpoch are discarded.
     // Converts raw pixel buffers to QPixmaps on the calling thread.
-    std::vector<QtTileRenderResult> drainCompleted(int maxResults, uint64_t minEpoch, int controllerId);
+    std::vector<QtTileRenderResult> drainCompleted(uint64_t minEpoch, int controllerId);
 
     // Cancel all pending work and clear results.  With a shared pool this
     // only resets bookkeeping — it does NOT call cancel_pending on the

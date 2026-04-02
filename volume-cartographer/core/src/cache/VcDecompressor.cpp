@@ -25,51 +25,10 @@ static bool isChunkEmpty(const uint8_t* data, size_t n)
 }
 
 
-// Thread-local pool of pre-allocated ChunkData objects to avoid
-// malloc/free churn on every decompress (0.46% of CPU in profiles).
-// Each thread keeps up to 4 recycled buffers. When a ChunkDataPtr's
-// refcount drops to 1 (only the pool holds it), it's available for reuse.
-//
-// Buffers are backed by the HugePageAllocator (2MB-aligned pages) when
-// the decoded chunk fits within 2MB (128^3 uint8 = 2MB exactly).
 static ChunkDataPtr acquireChunkData(size_t bytesNeeded)
 {
-    // Small thread-local free list
-    constexpr size_t kPoolSize = 4;
-    struct Pool {
-        ChunkDataPtr bufs[kPoolSize];
-        int count = 0;
-    };
-    thread_local Pool pool;
-
-    // Try to reuse a pooled buffer with sufficient capacity
-    for (int i = 0; i < pool.count; i++) {
-        if (pool.bufs[i].use_count() == 1 &&
-            pool.bufs[i]->totalBytes() >= bytesNeeded) {
-            auto result = pool.bufs[i];
-            result->resizeBytes(bytesNeeded);
-            return result;
-        }
-    }
-
-    // Allocate fresh — uses huge page pool for sizes <= 2MB
     auto result = std::make_shared<ChunkData>();
     result->resizeBytes(bytesNeeded);
-
-    // Try to add to pool for future reuse
-    if (pool.count < static_cast<int>(kPoolSize)) {
-        pool.bufs[pool.count++] = result;
-    } else {
-        // Replace the first entry with refcount > 1 (in active use, won't
-        // be recycled anyway), or the first entry if all are reclaimable.
-        for (int i = 0; i < static_cast<int>(kPoolSize); i++) {
-            if (pool.bufs[i].use_count() > 1) {
-                pool.bufs[i] = result;
-                break;
-            }
-        }
-    }
-
     return result;
 }
 
@@ -123,7 +82,6 @@ DecompressFn makeVcDecompressor(const std::vector<vc::VcDataset*>& datasets)
             result->elementSize = 1;
 
             std::memcpy(result->rawData(), decoded.data(), copySize);
-            result->blockLayout = false;
             result->isEmpty = isChunkEmpty(result->rawData(), chunkSize);
             return result;
         }

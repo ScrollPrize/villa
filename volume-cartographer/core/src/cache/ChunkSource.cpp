@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <fstream>
 #include <mutex>
@@ -258,9 +259,11 @@ int HttpChunkSource::totalChunksPerShard() const
 static std::vector<uint8_t> httpGetBytes(
     const std::string& url, const HttpChunkSource& src, size_t reserveHint = 2 * 1024 * 1024)
 {
-    thread_local CURL* curl = [] {
-        CURL* c = curl_easy_init();
-        if (!c) return c;
+    struct CurlDeleter { void operator()(CURL* c) const { if (c) curl_easy_cleanup(c); } };
+    thread_local std::unique_ptr<CURL, CurlDeleter> curlOwner = [] {
+        std::unique_ptr<CURL, CurlDeleter> p(curl_easy_init());
+        if (!p) return p;
+        CURL* c = p.get();
         // Constant options — set once, never cleared
         curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
@@ -282,8 +285,9 @@ static std::vector<uint8_t> httpGetBytes(
         curl_easy_setopt(c, CURLOPT_BUFFERSIZE, 512L * 1024L);
         curl_easy_setopt(c, CURLOPT_TCP_NODELAY, 1L);
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWriteCallback);
-        return c;
+        return p;
     }();
+    CURL* curl = curlOwner.get();
     if (!curl) return {};
 
     // Per-request options only

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <cmath>
 #include <memory>
@@ -70,7 +71,6 @@ struct ContentBounds {
 // TILE_PX lives in TileScene (tightly coupled to grid layout).
 namespace tiled_config {
     constexpr int VISIBLE_BUFFER_TILES = 2;   // extra tiles around viewport for smooth scrolling
-    constexpr int DRAIN_BATCH_SIZE     = 128; // max results drained per tick cycle
 }
 
 // Per-tile metadata for staleness checks during progressive rendering.
@@ -114,6 +114,9 @@ struct TileRenderParams {
 
     // --- Pool scheduling ---
     int submitPriority = 0;  // lower = higher urgency; set by TileRenderController
+
+    // --- Profiling ---
+    std::chrono::steady_clock::time_point submitTime;  // when submitted to pool
 };
 
 // Result from rendering a single tile.
@@ -136,4 +139,8 @@ struct TileRenderResult {
 
     // Identifies which controller submitted this task (for shared pool routing)
     int controllerId = -1;
+
+    // --- Profiling ---
+    std::chrono::steady_clock::time_point submitTime;   // copied from params
+    std::chrono::steady_clock::time_point renderDone;   // when renderTile() returned
 };

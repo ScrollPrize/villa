@@ -36,8 +36,10 @@ void CoreRenderPool::submit(const TileRenderParams& params,
 
     int priority = params.submitPriority;
 
+    auto submitTime = std::chrono::steady_clock::now();
+
     pool_->submit(priority,
-        [this, params, surface, volume, epochRef, controllerId]() {
+        [this, params, surface, volume, epochRef, controllerId, submitTime]() {
             uint64_t currentEpoch = epochRef->load(std::memory_order_relaxed);
             if (currentEpoch > kEpochSlack && params.epoch < currentEpoch - kEpochSlack) {
                 pendingCount_.fetch_sub(1, std::memory_order_relaxed);
@@ -46,12 +48,14 @@ void CoreRenderPool::submit(const TileRenderParams& params,
 
             TileRenderResult result = TileRenderer::renderTile(params, surface, volume.get());
             result.controllerId = controllerId;
+            result.submitTime = submitTime;
+            result.renderDone = std::chrono::steady_clock::now();
 
             pushResult(std::move(result));
         });
 }
 
-std::vector<TileRenderResult> CoreRenderPool::drainCompleted(int maxResults, uint64_t minEpoch, int controllerId)
+std::vector<TileRenderResult> CoreRenderPool::drainCompleted(uint64_t minEpoch, int controllerId)
 {
     resultSignalPending_.store(false, std::memory_order_relaxed);
 
@@ -61,20 +65,15 @@ std::vector<TileRenderResult> CoreRenderPool::drainCompleted(int maxResults, uin
         std::swap(all, completedResults_);
     }
 
-    std::vector<TileRenderResult> results;
-    results.reserve(std::min(static_cast<int>(all.size()), maxResults));
-
     uint64_t effectiveMin = (minEpoch > kEpochSlack) ? minEpoch - kEpochSlack : 0;
 
+    std::vector<TileRenderResult> results;
     std::vector<TileRenderResult> remaining;
-    remaining.reserve(all.size());
 
     for (auto& item : all) {
         if (item.controllerId != controllerId) {
             remaining.push_back(std::move(item));
-            continue;
-        }
-        if (static_cast<int>(results.size()) < maxResults && item.epoch >= effectiveMin) {
+        } else if (item.epoch >= effectiveMin) {
             results.push_back(std::move(item));
         }
     }

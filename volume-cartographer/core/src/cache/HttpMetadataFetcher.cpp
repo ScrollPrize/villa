@@ -5,6 +5,7 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include "utils/Json.hpp"
@@ -16,6 +17,11 @@
 #endif
 
 namespace vc::cache {
+
+#ifdef VC_USE_CURL
+struct CurlDeleter { void operator()(CURL* c) const { if (c) curl_easy_cleanup(c); } };
+using CurlHandle = std::unique_ptr<CURL, CurlDeleter>;
+#endif
 
 static constexpr const char* kRemoteSourceFile = ".remote_source.json";
 
@@ -46,12 +52,13 @@ static void configureCurlDefaults(CURL* c)
 std::string httpGetString(const std::string& url, const HttpAuth& auth)
 {
 #ifdef VC_USE_CURL
-    // Thread-local CURL handle: reuses TCP+TLS connections across requests
-    thread_local CURL* curl = [] {
-        CURL* c = curl_easy_init();
-        if (c) configureCurlDefaults(c);
-        return c;
+    // Thread-local CURL handle: reuses TCP+TLS connections, cleaned up on thread exit
+    thread_local CurlHandle curlOwner = [] {
+        CurlHandle p(curl_easy_init());
+        if (p) configureCurlDefaults(p.get());
+        return p;
     }();
+    CURL* curl = curlOwner.get();
     if (!curl) return {};
 
     // Reset clears all options but keeps the connection alive
@@ -196,11 +203,12 @@ S3ListResult s3ListObjects(const std::string& httpsBaseUrl, const HttpAuth& auth
         std::fprintf(log, "[S3] ListObjects: %s\n", listUrl.c_str());
 
     // Thread-local CURL handle without FAILONERROR so we can log the status
-    thread_local CURL* curl = [] {
-        CURL* c = curl_easy_init();
-        if (c) configureCurlDefaults(c);
-        return c;
+    thread_local CurlHandle curlOwner = [] {
+        CurlHandle p(curl_easy_init());
+        if (p) configureCurlDefaults(p.get());
+        return p;
     }();
+    CURL* curl = curlOwner.get();
 
     std::string xml;
     {
@@ -336,12 +344,13 @@ bool httpDownloadFile(const std::string& url, const std::filesystem::path& dest,
     std::FILE* fp = std::fopen(tempPath.c_str(), "wb");
     if (!fp) return false;
 
-    // Thread-local CURL handle: reuses TCP+TLS connections across requests
-    thread_local CURL* curl = [] {
-        CURL* c = curl_easy_init();
-        if (c) configureCurlDefaults(c);
-        return c;
+    // Thread-local CURL handle: reuses TCP+TLS connections, cleaned up on thread exit
+    thread_local CurlHandle curlOwner = [] {
+        CurlHandle p(curl_easy_init());
+        if (p) configureCurlDefaults(p.get());
+        return p;
     }();
+    CURL* curl = curlOwner.get();
     if (!curl) {
         std::fclose(fp);
         return false;
@@ -744,70 +753,18 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
     constexpr int kBatchSize = 8;
     constexpr int kMaxLevels = 20;
 
-    // --- Phase 1: try zarr v2 (.zarray) ---
-    for (int batchStart = 0; batchStart < kMaxLevels; batchStart += kBatchSize) {
-        int batchEnd = std::min(batchStart + kBatchSize, kMaxLevels);
-
-        // Launch async probes for this batch
-        std::vector<std::future<std::string>> futures;
-        futures.reserve(batchEnd - batchStart);
-        for (int lvl = batchStart; lvl < batchEnd; lvl++) {
-            std::string lvlUrl = baseUrl + "/" + std::to_string(lvl) + "/.zarray";
-            futures.push_back(std::async(std::launch::async,
-                [lvlUrl, &auth]() { return httpGetString(lvlUrl, auth); }));
-        }
-
-        // Collect results in order
-        bool batchHadMiss = false;
-        for (int i = 0; i < static_cast<int>(futures.size()); i++) {
-            int lvl = batchStart + i;
-            auto zarray = futures[i].get();
-
-            if (zarray.empty()) {
-                if (auto* log = cacheDebugLog())
-                    std::fprintf(log, "[REMOTE] Level %d: no .zarray\n", lvl);
-                batchHadMiss = true;
-                break;  // Stop at first gap — levels must be contiguous
-            }
-
-            auto levelDir = stagingDir / std::to_string(lvl);
-            writeFile(levelDir / ".zarray", zarray);
-            numLevels++;
-
-            if (auto* log = cacheDebugLog())
-                std::fprintf(log, "[REMOTE] Level %d: fetched .zarray (%zu bytes)\n",
-                             lvl, zarray.size());
-
-            // Parse level 0 for shape and delimiter
-            if (lvl == 0) {
-                try {
-                    level0Meta = utils::Json::parse(zarray);
-                    if (level0Meta.contains("dimension_separator")) {
-                        delimiter = level0Meta["dimension_separator"].get_string();
-                    }
-                } catch (const std::exception& e) {
-                    if (auto* log = cacheDebugLog())
-                        std::fprintf(log, "[REMOTE] Warning: failed to parse level 0 .zarray: %s\n", e.what());
-                }
-            }
-        }
-
-        // If any level in this batch was missing, no need to probe further
-        if (batchHadMiss) break;
-    }
-
-    // --- Phase 2: if v2 found nothing, try zarr v3 (zarr.json) ---
-    if (numLevels == 0) {
-        if (auto* log = cacheDebugLog())
-            std::fprintf(log, "[REMOTE] No zarr v2 levels found, trying zarr v3...\n");
-
+    // Probe levels in batches, calling onLevel for each response.
+    // Returns number of levels found. Stops at first gap (levels must be contiguous).
+    // urlSuffix: appended to baseUrl/<level>/ (e.g. ".zarray" or "zarr.json")
+    auto probeLevels = [&](const char* urlSuffix, auto&& onLevel) -> int {
+        int found = 0;
         for (int batchStart = 0; batchStart < kMaxLevels; batchStart += kBatchSize) {
             int batchEnd = std::min(batchStart + kBatchSize, kMaxLevels);
 
             std::vector<std::future<std::string>> futures;
             futures.reserve(batchEnd - batchStart);
             for (int lvl = batchStart; lvl < batchEnd; lvl++) {
-                std::string lvlUrl = baseUrl + "/" + std::to_string(lvl) + "/zarr.json";
+                std::string lvlUrl = baseUrl + "/" + std::to_string(lvl) + "/" + urlSuffix;
                 futures.push_back(std::async(std::launch::async,
                     [lvlUrl, &auth]() { return httpGetString(lvlUrl, auth); }));
             }
@@ -815,87 +772,116 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
             bool batchHadMiss = false;
             for (int i = 0; i < static_cast<int>(futures.size()); i++) {
                 int lvl = batchStart + i;
-                auto zarrJson = futures[i].get();
+                auto response = futures[i].get();
 
-                if (zarrJson.empty()) {
+                if (response.empty()) {
                     if (auto* log = cacheDebugLog())
-                        std::fprintf(log, "[REMOTE] Level %d: no zarr.json\n", lvl);
+                        std::fprintf(log, "[REMOTE] Level %d: no %s\n", lvl, urlSuffix);
                     batchHadMiss = true;
                     break;
                 }
 
-                // Parse zarr v3 metadata
-                utils::Json v3;
-                try {
-                    v3 = utils::Json::parse(zarrJson);
-                } catch (const std::exception& e) {
-                    if (auto* log = cacheDebugLog())
-                        std::fprintf(log, "[REMOTE] Level %d: failed to parse zarr.json: %s\n", lvl, e.what());
+                if (!onLevel(lvl, std::move(response))) {
                     batchHadMiss = true;
                     break;
                 }
-
-                // Verify this is actually zarr v3
-                if (v3.value("zarr_format", 0) != 3 ||
-                    v3.value("node_type", std::string("")) != "array") {
-                    if (auto* log = cacheDebugLog())
-                        std::fprintf(log, "[REMOTE] Level %d: zarr.json is not zarr v3 array\n", lvl);
-                    batchHadMiss = true;
-                    break;
-                }
-
-                // Synthesize v2-compatible .zarray from v3 metadata
-                std::string synthesized = synthesize_v2_metadata(v3);
-                auto levelDir = stagingDir / std::to_string(lvl);
-                writeFile(levelDir / ".zarray", synthesized);
-                numLevels++;
-                isV3 = true;
-
-                if (auto* log = cacheDebugLog())
-                    std::fprintf(log, "[REMOTE] Level %d: fetched zarr.json (v3), synthesized .zarray (%zu bytes)\n",
-                                 lvl, synthesized.size());
-
-                // Parse level 0 for shape, delimiter, and shard config
-                if (lvl == 0) {
-                    try {
-                        level0Meta = utils::Json::parse(synthesized);
-                        // v3 default delimiter is "/"
-                        delimiter = "/";
-                        if (level0Meta.contains("dimension_separator")) {
-                            delimiter = level0Meta["dimension_separator"].get_string();
-                        }
-
-                        // Check for sharded storage
-                        // Extract chunk shape carefully to avoid Json thread_local cache invalidation
-                        std::array<int, 3> chunkShape = {128, 128, 128};
-                        if (v3.contains("chunk_grid")) {
-                            auto grid = v3["chunk_grid"];
-                            if (grid.contains("configuration")) {
-                                auto gridCfg = grid["configuration"];
-                                if (gridCfg.contains("chunk_shape") && gridCfg["chunk_shape"].is_array()) {
-                                    auto cs = gridCfg["chunk_shape"];
-                                    chunkShape = {cs[0].get_int(), cs[1].get_int(), cs[2].get_int()};
-                                }
-                            }
-                        }
-                        shardConfig = parse_v3_shard_config(v3, chunkShape);
-
-                        if (shardConfig.enabled) {
-                            if (auto* log = cacheDebugLog())
-                                std::fprintf(log, "[REMOTE] Shard config: shape=[%d, %d, %d]\n",
-                                             shardConfig.shardShape[0],
-                                             shardConfig.shardShape[1],
-                                             shardConfig.shardShape[2]);
-                        }
-                    } catch (const std::exception& e) {
-                        if (auto* log = cacheDebugLog())
-                            std::fprintf(log, "[REMOTE] Warning: failed to parse level 0 synthesized .zarray: %s\n", e.what());
-                    }
-                }
+                found++;
             }
 
             if (batchHadMiss) break;
         }
+        return found;
+    };
+
+    // --- Phase 1: try zarr v2 (.zarray) ---
+    numLevels = probeLevels(".zarray", [&](int lvl, std::string zarray) -> bool {
+        auto levelDir = stagingDir / std::to_string(lvl);
+        writeFile(levelDir / ".zarray", zarray);
+
+        if (auto* log = cacheDebugLog())
+            std::fprintf(log, "[REMOTE] Level %d: fetched .zarray (%zu bytes)\n",
+                         lvl, zarray.size());
+
+        if (lvl == 0) {
+            try {
+                level0Meta = utils::Json::parse(zarray);
+                if (level0Meta.contains("dimension_separator")) {
+                    delimiter = level0Meta["dimension_separator"].get_string();
+                }
+            } catch (const std::exception& e) {
+                if (auto* log = cacheDebugLog())
+                    std::fprintf(log, "[REMOTE] Warning: failed to parse level 0 .zarray: %s\n", e.what());
+            }
+        }
+        return true;
+    });
+
+    // --- Phase 2: if v2 found nothing, try zarr v3 (zarr.json) ---
+    if (numLevels == 0) {
+        if (auto* log = cacheDebugLog())
+            std::fprintf(log, "[REMOTE] No zarr v2 levels found, trying zarr v3...\n");
+
+        numLevels = probeLevels("zarr.json", [&](int lvl, std::string zarrJson) -> bool {
+            utils::Json v3;
+            try {
+                v3 = utils::Json::parse(zarrJson);
+            } catch (const std::exception& e) {
+                if (auto* log = cacheDebugLog())
+                    std::fprintf(log, "[REMOTE] Level %d: failed to parse zarr.json: %s\n", lvl, e.what());
+                return false;
+            }
+
+            if (v3.value("zarr_format", 0) != 3 ||
+                v3.value("node_type", std::string("")) != "array") {
+                if (auto* log = cacheDebugLog())
+                    std::fprintf(log, "[REMOTE] Level %d: zarr.json is not zarr v3 array\n", lvl);
+                return false;
+            }
+
+            std::string synthesized = synthesize_v2_metadata(v3);
+            auto levelDir = stagingDir / std::to_string(lvl);
+            writeFile(levelDir / ".zarray", synthesized);
+            isV3 = true;
+
+            if (auto* log = cacheDebugLog())
+                std::fprintf(log, "[REMOTE] Level %d: fetched zarr.json (v3), synthesized .zarray (%zu bytes)\n",
+                             lvl, synthesized.size());
+
+            if (lvl == 0) {
+                try {
+                    level0Meta = utils::Json::parse(synthesized);
+                    delimiter = "/";
+                    if (level0Meta.contains("dimension_separator")) {
+                        delimiter = level0Meta["dimension_separator"].get_string();
+                    }
+
+                    std::array<int, 3> chunkShape = {128, 128, 128};
+                    if (v3.contains("chunk_grid")) {
+                        auto grid = v3["chunk_grid"];
+                        if (grid.contains("configuration")) {
+                            auto gridCfg = grid["configuration"];
+                            if (gridCfg.contains("chunk_shape") && gridCfg["chunk_shape"].is_array()) {
+                                auto cs = gridCfg["chunk_shape"];
+                                chunkShape = {cs[0].get_int(), cs[1].get_int(), cs[2].get_int()};
+                            }
+                        }
+                    }
+                    shardConfig = parse_v3_shard_config(v3, chunkShape);
+
+                    if (shardConfig.enabled) {
+                        if (auto* log = cacheDebugLog())
+                            std::fprintf(log, "[REMOTE] Shard config: shape=[%d, %d, %d]\n",
+                                         shardConfig.shardShape[0],
+                                         shardConfig.shardShape[1],
+                                         shardConfig.shardShape[2]);
+                    }
+                } catch (const std::exception& e) {
+                    if (auto* log = cacheDebugLog())
+                        std::fprintf(log, "[REMOTE] Warning: failed to parse level 0 synthesized .zarray: %s\n", e.what());
+                }
+            }
+            return true;
+        });
     }
 
     if (numLevels == 0) {

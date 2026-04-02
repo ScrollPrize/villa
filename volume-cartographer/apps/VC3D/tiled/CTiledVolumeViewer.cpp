@@ -26,19 +26,12 @@
 #include <QMdiSubWindow>
 #include <QPainterPath>
 #include <QWindowStateChangeEvent>
-#include <QScrollBar>
-#include <QTransform>
-#include <QOpenGLWidget>
-#include <QGuiApplication>
 #include <QPointer>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 
-#include <QtConcurrent/QtConcurrent>
-
-#include <QDebug>
 #include "vc/core/cache/TieredChunkCache.hpp"
 
 constexpr auto COLOR_CURSOR = Qt::cyan;

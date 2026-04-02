@@ -3,7 +3,6 @@
 #include <array>
 #include <atomic>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -45,14 +44,10 @@ public:
 
     explicit Volume(std::filesystem::path path);
 
-    Volume(std::filesystem::path path, std::string uuid, std::string name);
-
     ~Volume() noexcept;
 
 
     static std::shared_ptr<Volume> New(std::filesystem::path path);
-
-    static std::shared_ptr<Volume> New(std::filesystem::path path, std::string uuid, std::string name);
 
     // Create a Volume backed by a remote zarr store over HTTP.
     // Downloads metadata (.zarray files) to a local staging dir, then
@@ -69,9 +64,7 @@ public:
     [[nodiscard]] std::string name() const;
     [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
     [[nodiscard]] const vc::cache::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
-    void setName(const std::string& n);
     [[nodiscard]] std::filesystem::path path() const noexcept { return path_; }
-    void saveMetadata();
 
     [[nodiscard]] int sliceWidth() const noexcept;
     [[nodiscard]] int sliceHeight() const noexcept;
@@ -223,7 +216,7 @@ protected:
     bool remoteLevel5PrimeStarted_ = false;
     bool remoteLevel5PrimeDone_ = false;
 
-    // Bounding box of coords in chunk index space (helper for allChunksCached/prefetch)
+    // Bounding box of coords in chunk index space (helper for prefetch)
     struct ChunkBBox {
         int minIx, maxIx, minIy, maxIy, minIz, maxIz;
     };
@@ -235,7 +228,6 @@ protected:
     // Compute world-space bbox once, then derive chunk bbox for any level cheaply
     WorldBBox coordsWorldBBox(const cv::Mat_<cv::Vec3f>& coords) const;
     ChunkBBox worldBBoxToChunkBBox(const WorldBBox& wb, int level) const;
-    bool allChunksCached(const cv::Mat_<cv::Vec3f>& coords, int level) const;
     bool allChunksCachedFast(const WorldBBox& wb, int level) const;
     void prefetchChunks(const cv::Mat_<cv::Vec3f>& coords, int level);
 

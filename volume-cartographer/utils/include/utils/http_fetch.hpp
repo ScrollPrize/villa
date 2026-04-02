@@ -192,27 +192,6 @@ struct AwsAuth {
     }
 };
 
-/// Apply AWS SigV4 authentication to a CURL handle.
-/// The returned slist must outlive the curl_easy_perform() call.
-/// Pass nullptr for the return value if you don't need it (caller frees).
-[[nodiscard]] inline struct curl_slist* apply_aws_auth(CURL* curl, const AwsAuth& auth) {
-    if (auth.empty()) return nullptr;
-
-    std::string sigv4 = "aws:amz:" + auth.region + ":s3";
-    curl_easy_setopt(curl, CURLOPT_AWS_SIGV4, sigv4.c_str());
-
-    std::string userpwd = auth.access_key + ":" + auth.secret_key;
-    curl_easy_setopt(curl, CURLOPT_USERPWD, userpwd.c_str());
-
-    struct curl_slist* headers = nullptr;
-    if (!auth.session_token.empty()) {
-        std::string hdr = "x-amz-security-token: " + auth.session_token;
-        headers = curl_slist_append(headers, hdr.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    }
-    return headers;
-}
-
 // ---------------------------------------------------------------------------
 // HttpClient
 // ---------------------------------------------------------------------------

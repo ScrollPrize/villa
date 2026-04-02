@@ -83,6 +83,11 @@ public:
     void setSceneUpdatedCallback(std::function<void()> cb);
     void setOverlayCallback(std::function<void()> cb);
 
+    // Per-result callback: called for each drained result with the raw pixels.
+    // The callback receives ownership of the result (pixels are valid).
+    // TileGrid metadata is updated BEFORE the callback; pixels are NOT stored in TileGrid.
+    void setResultCallback(std::function<void(TileRenderResult&&)> cb) { _resultCallback = std::move(cb); }
+
     void setProgressiveEnabled(bool enabled) { _progressiveEnabled = enabled; }
     bool progressiveEnabled() const { return _progressiveEnabled; }
 
@@ -130,13 +135,15 @@ private:
     // In-flight tile tracking to avoid duplicate submissions
     std::unordered_set<WorldTileKey, WorldTileKeyHash> _inFlightTiles;
 
-    // Dirty flags
-    bool _overlaysDirty = false;
-    bool _chunkArrived = false;
+    // Dirty flags — set from signal handlers on potentially different threads,
+    // read on the main thread in tick().
+    std::atomic<bool> _overlaysDirty{false};
+    std::atomic<bool> _chunkArrived{false};
 
     // Callbacks
     std::function<void()> _sceneUpdatedCallback;
     std::function<void()> _overlayCallback;
+    std::function<void(TileRenderResult&&)> _resultCallback;
 };
 
 } // namespace vc::render

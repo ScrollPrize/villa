@@ -74,9 +74,6 @@ struct CompositeRenderSettings {
     bool operator==(const CompositeRenderSettings&) const = default;
 };
 
-// Apply postprocessing to a composited image (stretch values, remove small components)
-void postprocessComposite(cv::Mat_<uint8_t>& img, const CompositeRenderSettings& settings);
-
 // Layer values for a single pixel across all layers
 // Used by compositing methods to process per-pixel data
 struct LayerStack {
@@ -106,9 +103,6 @@ float compositeLayerStack(
 // Utility: check if method requires all layer values to be stored
 // (as opposed to running accumulator like max/min)
 bool methodRequiresLayerStorage(const std::string& method);
-
-// Utility: get list of available compositing methods
-std::vector<std::string> availableCompositeMethods();
 
 // Compute directional lighting factor for a surface normal
 // Returns a multiplier (0-1) based on Lambertian diffuse lighting

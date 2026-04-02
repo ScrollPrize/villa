@@ -7,20 +7,23 @@ namespace vc::render {
 
 bool TileGrid::rebuildGrid(const ContentBounds& bounds, int viewportW, int viewportH)
 {
-    // Skip rebuild if bounds haven't changed and grid already exists
-    if (bounds == _bounds && !_meta.empty()) {
+    // Only rebuild when grid STRUCTURE changes (tile count / world position).
+    // Scale-only changes just update bounds and re-render tiles in place —
+    // the old content stays visible until new renders replace it.
+    bool structureSame = (bounds.firstWorldCol == _bounds.firstWorldCol &&
+                          bounds.firstWorldRow == _bounds.firstWorldRow &&
+                          bounds.totalCols == _bounds.totalCols &&
+                          bounds.totalRows == _bounds.totalRows);
+
+    if (structureSame && !_meta.empty()) {
+        // Update scale/worldTileSize without destroying the grid
+        _bounds = bounds;
         float contentPxW = static_cast<float>(bounds.totalCols) * TILE_PX;
         float contentPxH = static_cast<float>(bounds.totalRows) * TILE_PX;
         float sceneW = std::max(contentPxW, static_cast<float>(viewportW));
         float sceneH = std::max(contentPxH, static_cast<float>(viewportH));
-        float newPadX = (sceneW - contentPxW) * 0.5f;
-        float newPadY = (sceneH - contentPxH) * 0.5f;
-        if (std::abs(newPadX - _padX) < 1.0f && std::abs(newPadY - _padY) < 1.0f) {
-            return false;  // Nothing changed
-        }
-        // Padding changed (viewport resized) — update but no grid rebuild
-        _padX = newPadX;
-        _padY = newPadY;
+        _padX = (sceneW - contentPxW) * 0.5f;
+        _padY = (sceneH - contentPxH) * 0.5f;
         return false;
     }
 
@@ -52,7 +55,9 @@ bool TileGrid::rebuildGrid(const ContentBounds& bounds, int viewportW, int viewp
 }
 
 bool TileGrid::setTile(const TileKey& key, std::vector<uint32_t>&& pixels,
-                        int width, int height, uint64_t epoch, int8_t level)
+                        int width, int height, uint64_t epoch, int8_t level,
+                        std::chrono::steady_clock::time_point submitTime,
+                        std::chrono::steady_clock::time_point renderDone)
 {
     if (key.col < 0 || key.col >= _bounds.totalCols ||
         key.row < 0 || key.row >= _bounds.totalRows) {
@@ -82,6 +87,8 @@ bool TileGrid::setTile(const TileKey& key, std::vector<uint32_t>&& pixels,
     td.width = width;
     td.height = height;
     td.version = _nextVersion++;
+    td.submitTime = submitTime;
+    td.renderDone = renderDone;
 
     if (wasFilling && level >= 0) {
         --_unfilledCount;
@@ -90,13 +97,58 @@ bool TileGrid::setTile(const TileKey& key, std::vector<uint32_t>&& pixels,
 }
 
 bool TileGrid::setTileWorld(const WorldTileKey& wk, std::vector<uint32_t>&& pixels,
-                             int width, int height, uint64_t epoch, int8_t level)
+                             int width, int height, uint64_t epoch, int8_t level,
+                             std::chrono::steady_clock::time_point submitTime,
+                             std::chrono::steady_clock::time_point renderDone)
 {
     int col, row;
     if (!_bounds.gridPosition(wk, col, row)) {
         return false;
     }
-    return setTile(TileKey{col, row}, std::move(pixels), width, height, epoch, level);
+    return setTile(TileKey{col, row}, std::move(pixels), width, height, epoch, level,
+                   submitTime, renderDone);
+}
+
+bool TileGrid::setTileMeta(const WorldTileKey& wk, uint64_t epoch, int8_t level)
+{
+    int col, row;
+    if (!_bounds.gridPosition(wk, col, row)) return false;
+    const int idx = row * _bounds.totalCols + col;
+    if (static_cast<size_t>(idx) >= _meta.size()) return false;
+
+    auto& m = _meta[idx];
+
+    // Same staleness check as setTile
+    if (epoch < m.epoch) {
+        constexpr uint64_t kEpochGrace = 3;
+        bool finerFromRecentEpoch = (m.epoch - epoch <= kEpochGrace) &&
+                                     m.level >= 0 && level >= 0 && level < m.level;
+        if (!finerFromRecentEpoch) return false;
+    }
+    if (epoch == m.epoch && m.level >= 0 && level >= m.level) return false;
+
+    bool wasFilling = (m.level < 0);
+    m.epoch = epoch;
+    m.level = level;
+
+    if (wasFilling && level >= 0)
+        --_unfilledCount;
+
+    return true;
+}
+
+std::chrono::steady_clock::time_point TileGrid::tileSubmitTime(const WorldTileKey& wk) const
+{
+    int col, row;
+    if (!_bounds.gridPosition(wk, col, row)) return {};
+    return _tiles[row * _bounds.totalCols + col].submitTime;
+}
+
+std::chrono::steady_clock::time_point TileGrid::tileRenderDone(const WorldTileKey& wk) const
+{
+    int col, row;
+    if (!_bounds.gridPosition(wk, col, row)) return {};
+    return _tiles[row * _bounds.totalCols + col].renderDone;
 }
 
 bool TileGrid::tileNeedsContent(const WorldTileKey& wk) const

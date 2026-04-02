@@ -33,9 +33,9 @@ void RenderPool::submit(const TileRenderParams& params,
     corePool_->submit(params, surface, volume, epochRef, controllerId);
 }
 
-std::vector<QtTileRenderResult> RenderPool::drainCompleted(int maxResults, uint64_t minEpoch, int controllerId)
+std::vector<QtTileRenderResult> RenderPool::drainCompleted(uint64_t minEpoch, int controllerId)
 {
-    auto coreResults = corePool_->drainCompleted(maxResults, minEpoch, controllerId);
+    auto coreResults = corePool_->drainCompleted(minEpoch, controllerId);
 
     std::vector<QtTileRenderResult> results;
     results.reserve(coreResults.size());

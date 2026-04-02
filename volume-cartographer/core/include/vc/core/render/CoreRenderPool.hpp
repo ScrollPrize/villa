@@ -34,9 +34,9 @@ public:
                 const std::shared_ptr<std::atomic<uint64_t>>& epochRef,
                 int controllerId);
 
-    // Take up to maxResults completed results belonging to controllerId.
+    // Take all completed results belonging to controllerId.
     // Results with epoch < minEpoch (minus slack) are discarded.
-    std::vector<TileRenderResult> drainCompleted(int maxResults, uint64_t minEpoch, int controllerId);
+    std::vector<TileRenderResult> drainCompleted(uint64_t minEpoch, int controllerId);
 
     // Cancel all pending work and clear results.
     void cancelAll();

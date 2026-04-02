@@ -4,7 +4,6 @@
 #include <QPointF>
 #include <QRectF>
 #include <QColor>
-#include <QString>
 
 #include <atomic>
 #include <map>

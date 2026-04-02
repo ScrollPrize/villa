@@ -1,7 +1,6 @@
 #include "TileScene.hpp"
 
 #include <algorithm>
-#include <cmath>
 
 TileScene::TileScene(QGraphicsScene* scene)
     : _scene(scene)
@@ -10,7 +9,9 @@ TileScene::TileScene(QGraphicsScene* scene)
 
 void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int viewportH)
 {
-    // Delegate data/logic to TileGrid
+    // Save old bounds before grid rebuild overwrites them
+    ContentBounds oldBounds = _grid.bounds();
+
     bool gridRebuilt = _grid.rebuildGrid(bounds, viewportW, viewportH);
 
     const auto& b = _grid.bounds();
@@ -18,7 +19,7 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
     float padY = _grid.padY();
 
     if (!gridRebuilt && !_items.empty()) {
-        // Bounds didn't change -- just reposition items for updated padding
+        // Structure didn't change -- just reposition for updated padding
         float contentPxW = static_cast<float>(b.totalCols) * TILE_PX;
         float contentPxH = static_cast<float>(b.totalRows) * TILE_PX;
         float sceneW = std::max(contentPxW, static_cast<float>(viewportW));
@@ -34,15 +35,16 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
         return;
     }
 
-    // Full rebuild -- delete old Qt items
-    clearRetained();
-    for (auto* item : _items) {
-        if (item && item->scene()) item->scene()->removeItem(item);
-        delete item;
-    }
+    // Save old items + their world keys for pixmap carry-over
+    auto oldItems = std::move(_items);
     _items.clear();
+    clearRetained();
 
     if (b.totalCols <= 0 || b.totalRows <= 0) {
+        for (auto* item : oldItems) {
+            if (item && item->scene()) item->scene()->removeItem(item);
+            delete item;
+        }
         _scene->setSceneRect(0, 0, viewportW, viewportH);
         return;
     }
@@ -51,20 +53,39 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
     const int contentPxH = b.totalRows * TILE_PX;
     const int sceneW = std::max(contentPxW, viewportW);
     const int sceneH = std::max(contentPxH, viewportH);
-
     _scene->setSceneRect(0, 0, sceneW, sceneH);
 
+    // Build new grid, carrying over pixmaps from old items at matching world positions.
+    // Never show empty content — reuse stale content until fresh renders arrive.
     const int count = b.totalRows * b.totalCols;
     _items.resize(count, nullptr);
 
-    // Create empty items -- invisible until a render result sets their pixmap
     for (int r = 0; r < b.totalRows; ++r) {
         for (int c = 0; c < b.totalCols; ++c) {
-            auto* item = _scene->addPixmap(QPixmap());
+            WorldTileKey wk = b.worldKeyAt(c, r);
+
+            // Check if this world position existed in the old grid
+            int oldCol, oldRow;
+            QPixmap carried;
+            if (oldBounds.gridPosition(wk, oldCol, oldRow) &&
+                !oldItems.empty()) {
+                int oldIdx = oldRow * oldBounds.totalCols + oldCol;
+                if (oldIdx >= 0 && oldIdx < static_cast<int>(oldItems.size()) && oldItems[oldIdx]) {
+                    carried = oldItems[oldIdx]->pixmap();
+                }
+            }
+
+            auto* item = _scene->addPixmap(carried.isNull() ? QPixmap() : carried);
             item->setPos(padX + c * TILE_PX, padY + r * TILE_PX);
             item->setZValue(0);
             _items[r * b.totalCols + c] = item;
         }
+    }
+
+    // Delete old items
+    for (auto* item : oldItems) {
+        if (item && item->scene()) item->scene()->removeItem(item);
+        delete item;
     }
 }
 
@@ -102,6 +123,20 @@ bool TileScene::setTileWorld(const WorldTileKey& wk, const QPixmap& pixmap,
         return false;
     }
     return setTile(TileKey{col, row}, pixmap, epoch, level);
+}
+
+bool TileScene::setTilePixmapOnly(const WorldTileKey& wk, const QPixmap& pixmap)
+{
+    int col, row;
+    if (!_grid.bounds().gridPosition(wk, col, row)) {
+        return false;
+    }
+    const auto& b = _grid.bounds();
+    if (col < 0 || col >= b.totalCols || row < 0 || row >= b.totalRows)
+        return false;
+    const int idx = row * b.totalCols + col;
+    _items[idx]->setPixmap(pixmap);
+    return true;
 }
 
 bool TileScene::tileNeedsContent(const WorldTileKey& wk) const

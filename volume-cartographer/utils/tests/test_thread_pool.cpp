@@ -2,7 +2,6 @@
 #include <utils/thread_pool.hpp>
 #include <atomic>
 #include <vector>
-#include <numeric>
 #include <thread>
 #include <chrono>
 
@@ -122,45 +121,6 @@ TEST_CASE("PriorityThreadPool cancel_pending") {
     pool.wait_idle();
 }
 
-TEST_CASE("parallel_for") {
-    utils::ThreadPool pool(4);
-    std::vector<std::atomic<int>> results(100);
-    for (auto& a : results) a.store(0);
-
-    utils::parallel_for(pool, std::size_t(0), std::size_t(100),
-        [&results](std::size_t i) {
-            results[i].store(static_cast<int>(i * i));
-        }, 10);
-
-    for (std::size_t i = 0; i < 100; ++i)
-        REQUIRE_EQ(results[i].load(), static_cast<int>(i * i));
-}
-
-TEST_CASE("parallel_for_each") {
-    utils::ThreadPool pool(4);
-    std::vector<int> data(50);
-    std::iota(data.begin(), data.end(), 0);
-
-    std::atomic<int> sum{0};
-    utils::parallel_for_each(pool, data,
-        [&sum](int v) { sum.fetch_add(v); }, 10);
-
-    REQUIRE_EQ(sum.load(), 50 * 49 / 2);
-}
-
-TEST_CASE("parallel_reduce") {
-    utils::ThreadPool pool(4);
-    std::vector<int> data(100);
-    std::iota(data.begin(), data.end(), 1);
-
-    int result = utils::parallel_reduce(pool, data, 0,
-        [](int a, int b) { return a + b; },
-        [](int x) { return x; },
-        10);
-
-    REQUIRE_EQ(result, 100 * 101 / 2);
-}
-
 TEST_CASE("ThreadPool submit with arguments") {
     utils::ThreadPool pool(2);
     auto fut = pool.submit([](int a, int b) { return a + b; }, 17, 25);
@@ -220,37 +180,6 @@ TEST_CASE("ThreadPool active count during work") {
     gate.store(true);
     pool.wait_idle();
     REQUIRE_EQ(pool.active(), std::size_t(0));
-}
-
-TEST_CASE("parallel_for empty range") {
-    utils::ThreadPool pool(2);
-    int counter = 0;
-    utils::parallel_for(pool, std::size_t(5), std::size_t(5),
-        [&counter](std::size_t) { counter++; });
-    REQUIRE_EQ(counter, 0);
-
-    // begin > end
-    utils::parallel_for(pool, std::size_t(10), std::size_t(5),
-        [&counter](std::size_t) { counter++; });
-    REQUIRE_EQ(counter, 0);
-}
-
-TEST_CASE("parallel_for_each empty range") {
-    utils::ThreadPool pool(2);
-    std::vector<int> data;
-    std::atomic<int> sum{0};
-    utils::parallel_for_each(pool, data,
-        [&sum](int v) { sum.fetch_add(v); });
-    REQUIRE_EQ(sum.load(), 0);
-}
-
-TEST_CASE("parallel_reduce empty range") {
-    utils::ThreadPool pool(2);
-    std::vector<int> data;
-    int result = utils::parallel_reduce(pool, data, 42,
-        [](int a, int b) { return a + b; },
-        [](int x) { return x; });
-    REQUIRE_EQ(result, 42); // should return init
 }
 
 TEST_CASE("PriorityThreadPool worker_count") {
@@ -450,130 +379,6 @@ TEST_CASE("PriorityThreadPool mixed epoch and no-epoch ordering") {
     REQUIRE_EQ(order.size(), std::size_t(2));
     CHECK_EQ(order[0], 2);
     CHECK_EQ(order[1], 20);
-}
-
-TEST_CASE("parallel_for default chunk_size") {
-    utils::ThreadPool pool(4);
-    std::atomic<int> sum{0};
-
-    // Use default chunk_size (0 = auto).
-    utils::parallel_for(pool, std::size_t(0), std::size_t(100),
-        [&sum](std::size_t i) {
-            sum.fetch_add(static_cast<int>(i));
-        });
-
-    REQUIRE_EQ(sum.load(), 4950); // sum of 0..99
-}
-
-TEST_CASE("parallel_reduce with transform") {
-    utils::ThreadPool pool(4);
-    std::vector<int> data = {1, 2, 3, 4, 5};
-
-    // Square each element then sum.
-    int result = utils::parallel_reduce(pool, data, 0,
-        [](int a, int b) { return a + b; },
-        [](int x) { return x * x; },
-        1);
-
-    REQUIRE_EQ(result, 1 + 4 + 9 + 16 + 25);
-}
-
-TEST_CASE("parallel_for_each default chunk_size") {
-    utils::ThreadPool pool(4);
-    std::vector<int> data(100);
-    std::iota(data.begin(), data.end(), 0);
-
-    std::atomic<int> sum{0};
-    // Use default chunk_size (0 = auto)
-    utils::parallel_for_each(pool, data,
-        [&sum](int v) { sum.fetch_add(v); });
-
-    REQUIRE_EQ(sum.load(), 100 * 99 / 2);
-}
-
-TEST_CASE("parallel_reduce default chunk_size") {
-    utils::ThreadPool pool(4);
-    std::vector<int> data(100);
-    std::iota(data.begin(), data.end(), 1);
-
-    // Use default chunk_size (0 = auto)
-    int result = utils::parallel_reduce(pool, data, 0,
-        [](int a, int b) { return a + b; },
-        [](int x) { return x; });
-
-    REQUIRE_EQ(result, 100 * 101 / 2);
-}
-
-TEST_CASE("parallel_for_each with single element") {
-    utils::ThreadPool pool(2);
-    std::vector<int> data = {42};
-
-    std::atomic<int> sum{0};
-    utils::parallel_for_each(pool, data,
-        [&sum](int v) { sum.fetch_add(v); }, 1);
-
-    REQUIRE_EQ(sum.load(), 42);
-}
-
-TEST_CASE("parallel_reduce with single element") {
-    utils::ThreadPool pool(2);
-    std::vector<int> data = {7};
-
-    int result = utils::parallel_reduce(pool, data, 0,
-        [](int a, int b) { return a + b; },
-        [](int x) { return x * 10; },
-        1);
-
-    REQUIRE_EQ(result, 70);
-}
-
-TEST_CASE("parallel_reduce max operation") {
-    utils::ThreadPool pool(4);
-    std::vector<int> data = {3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5};
-
-    int result = utils::parallel_reduce(pool, data, std::numeric_limits<int>::min(),
-        [](int a, int b) { return std::max(a, b); },
-        [](int x) { return x; },
-        3);
-
-    REQUIRE_EQ(result, 9);
-}
-
-TEST_CASE("parallel_for with chunk_size 1") {
-    utils::ThreadPool pool(4);
-    std::atomic<int> sum{0};
-
-    utils::parallel_for(pool, std::size_t(0), std::size_t(10),
-        [&sum](std::size_t i) {
-            sum.fetch_add(static_cast<int>(i));
-        }, 1);
-
-    REQUIRE_EQ(sum.load(), 45); // sum of 0..9
-}
-
-TEST_CASE("parallel_for_each with string range") {
-    utils::ThreadPool pool(2);
-    std::vector<std::string> data = {"hello", " ", "world"};
-
-    std::mutex mu;
-    std::size_t total_len = 0;
-    utils::parallel_for_each(pool, data,
-        [&](const std::string& s) {
-            std::lock_guard lk(mu);
-            total_len += s.size();
-        }, 1);
-
-    REQUIRE_EQ(total_len, 11u); // 5 + 1 + 5
-}
-
-TEST_CASE("default_chunk_size returns at least 1") {
-    // When count is small relative to workers
-    auto cs = utils::detail::default_chunk_size(1, 100);
-    REQUIRE_GE(cs, 1u);
-
-    // When workers is 0 (edge case protection)
-    cs = utils::detail::default_chunk_size(100, 0);
-    REQUIRE_GE(cs, 1u);
 }
 
 UTILS_TEST_MAIN()

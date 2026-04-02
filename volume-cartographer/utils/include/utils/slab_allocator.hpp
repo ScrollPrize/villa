@@ -20,7 +20,7 @@ namespace utils {
 // Common sizes in the rendering pipeline:
 //   4 KB  = 16^3 blocks
 //   1 MB  = 512*512*4 tile ARGB32 buffers
-//   2 MB  = 128^3 decoded chunks (handled by HugePageAllocator)
+//   2 MB  = 128^3 decoded chunks
 
 // Thread-safe variant: mutex-protected stack.
 // Use when allocate() and deallocate() may run on different threads
