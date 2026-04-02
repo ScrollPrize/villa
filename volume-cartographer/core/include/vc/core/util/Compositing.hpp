@@ -39,7 +39,7 @@ struct CompositeParams {
     uint8_t isoCutoff = 0;           // Highpass filter: values below this are set to 0
 
     // Recompute lightDir from lightAzimuth/lightElevation (degrees)
-    void updateLightDir() {
+    void updateLightDir() noexcept {
         float azRad = lightAzimuth * (std::numbers::pi_v<float> / 180.0f);
         float elRad = lightElevation * (std::numbers::pi_v<float> / 180.0f);
         float ce = std::cos(elRad);
@@ -85,11 +85,11 @@ struct LayerStack {
 // Each method takes a stack of layer values and returns a single output value
 namespace CompositeMethod {
 
-float mean(const LayerStack& stack);
-float max(const LayerStack& stack);
-float min(const LayerStack& stack);
-float alpha(const LayerStack& stack, const CompositeParams& params);
-float beerLambert(const LayerStack& stack, const CompositeParams& params);
+float mean(const LayerStack& stack) noexcept;
+float max(const LayerStack& stack) noexcept;
+float min(const LayerStack& stack) noexcept;
+float alpha(const LayerStack& stack, const CompositeParams& params) noexcept;
+float beerLambert(const LayerStack& stack, const CompositeParams& params) noexcept;
 
 } // namespace CompositeMethod
 
@@ -98,14 +98,14 @@ float beerLambert(const LayerStack& stack, const CompositeParams& params);
 float compositeLayerStack(
     const LayerStack& stack,
     const CompositeParams& params
-);
+) noexcept;
 
 // Utility: check if method requires all layer values to be stored
 // (as opposed to running accumulator like max/min)
-bool methodRequiresLayerStorage(const std::string& method);
+bool methodRequiresLayerStorage(const std::string& method) noexcept;
 
 // Compute directional lighting factor for a surface normal
 // Returns a multiplier (0-1) based on Lambertian diffuse lighting
 // normal: surface normal (should be normalized)
 // params: contains light direction and strength settings
-float computeLightingFactor(const cv::Vec3f& normal, const CompositeParams& params);
+float computeLightingFactor(const cv::Vec3f& normal, const CompositeParams& params) noexcept;

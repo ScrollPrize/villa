@@ -1,3 +1,4 @@
+#include <cmath>
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -84,16 +85,16 @@ float find_loc_wind_slow(cv::Vec2f &loc, float tgt_wind, const cv::Mat_<cv::Vec3
         if (r)
             cand = {static_cast<float>(rand_r(&sr) % points.cols), static_cast<float>(rand_r(&sr) % points.rows)};
         
-        if (std::isnan(winding(cand[1],cand[0])) || abs(winding(cand[1],cand[0])-tgt_wind) > 0.5)
+        if (std::isnan(winding(cand[1],cand[0])) || std::abs(winding(cand[1],cand[0])-tgt_wind) > 0.5)
             continue;
-        
+
         cv::Vec3f out_;
         float res = min_loc_plain(points, cand, out_, tgt, 4.0, 0.01);
-        
+
         if (res < 0)
             continue;
-        
-        if (std::isnan(winding(cand[1],cand[0])) || abs(winding(cand[1],cand[0])-tgt_wind) > 0.3)
+
+        if (std::isnan(winding(cand[1],cand[0])) || std::abs(winding(cand[1],cand[0])-tgt_wind) > 0.3)
             continue;
         
         if (res < th) {

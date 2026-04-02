@@ -58,7 +58,7 @@ public:
     void cancelPending();
 
     // Number of pending + in-flight tasks.
-    [[nodiscard]] size_t pendingCount() const;
+    [[nodiscard]] size_t pendingCount() const noexcept;
 
     // Gracefully stop all workers. Blocks until all threads exit.
     void stop();

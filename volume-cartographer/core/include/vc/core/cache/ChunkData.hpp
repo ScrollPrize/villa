@@ -20,12 +20,12 @@ struct ChunkData {
     int elementSize = 1;                  // bytes per element (1=u8, 2=u16, 4=f32)
     bool isEmpty = false;                 // true = all voxels are zero (skip sampling)
 
-    [[nodiscard]] size_t numElements() const noexcept
+    [[nodiscard]] constexpr size_t numElements() const noexcept
     {
         return static_cast<size_t>(shape[0]) * shape[1] * shape[2];
     }
 
-    [[nodiscard]] size_t totalBytes() const noexcept
+    [[nodiscard]] constexpr size_t totalBytes() const noexcept
     {
         return bytes.size();
     }
@@ -58,9 +58,9 @@ struct ChunkData {
 
     // Stride helpers for (z, y, x) indexing into the flat buffer.
     // Physical layout is row-major: z varies slowest, x varies fastest.
-    [[nodiscard]] int strideZ() const noexcept { return shape[1] * shape[2]; }
-    [[nodiscard]] int strideY() const noexcept { return shape[2]; }
-    [[nodiscard]] int strideX() const noexcept { return 1; }
+    [[nodiscard]] constexpr int strideZ() const noexcept { return shape[1] * shape[2]; }
+    [[nodiscard]] constexpr int strideY() const noexcept { return shape[2]; }
+    [[nodiscard]] constexpr int strideX() const noexcept { return 1; }
 };
 
 using ChunkDataPtr = std::shared_ptr<ChunkData>;

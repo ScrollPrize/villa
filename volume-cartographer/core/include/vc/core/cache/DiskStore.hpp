@@ -87,7 +87,7 @@ public:
     // Remove all cached data.
     void clearAll();
 
-    [[nodiscard]] const std::filesystem::path& root() const { return config_.root; }
+    [[nodiscard]] const std::filesystem::path& root() const noexcept { return config_.root; }
 
 private:
     std::filesystem::path chunkPath(

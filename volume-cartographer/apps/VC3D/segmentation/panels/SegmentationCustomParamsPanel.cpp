@@ -99,7 +99,7 @@ void SegmentationCustomParamsPanel::validateCustomParamsText()
     }
 
     QString error;
-    parseCustomParams(&error);
+    (void)parseCustomParams(&error);
     _customParamsError = error;
 }
 

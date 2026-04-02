@@ -4134,7 +4134,7 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache 
 
                     int flags = LOSS_DIST | LOSS_STRAIGHT;
                     if (trace_data.normal3d_field)
-                        flags | LOSS_3DNORMALLINE;
+                        flags |= LOSS_3DNORMALLINE;
                     if (trace_data.space_line_volume && loss_settings.w[LossType::SPACELINE] > 0.0f)
                         flags |= LOSS_SPACELINE;
 

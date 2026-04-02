@@ -94,7 +94,7 @@ std::string Volume::name() const
     return metadata_["name"].get_string();
 }
 
-bool Volume::checkDir(std::filesystem::path path)
+bool Volume::checkDir(const std::filesystem::path& path)
 {
     return std::filesystem::is_directory(path) &&
            (std::filesystem::exists(path / METADATA_FILE) ||
@@ -210,7 +210,7 @@ void Volume::zarrOpen()
 
 std::shared_ptr<Volume> Volume::New(std::filesystem::path path)
 {
-    return std::make_shared<Volume>(path);
+    return std::make_shared<Volume>(std::move(path));
 }
 
 std::shared_ptr<Volume> Volume::NewFromUrl(
@@ -921,7 +921,7 @@ bool Volume::needsRemoteLevel5Prime() const
 }
 
 void Volume::primeRemoteLevel5Blocking(
-    std::function<void(size_t completed, size_t total)> progressCb)
+    const std::function<void(size_t completed, size_t total)>& progressCb)
 {
     {
         std::lock_guard lock(remoteLevel5PrimeMutex_);
@@ -960,7 +960,7 @@ void Volume::primeRemoteLevel5Blocking(
             for (size_t j = i; j < end; j++)
                 tieredCache_->prefetch(allKeys[j]);
             for (size_t j = i; j < end; j++) {
-                tieredCache_->getBlocking(allKeys[j]);
+                (void)tieredCache_->getBlocking(allKeys[j]);
                 completed++;
                 if (progressCb)
                     progressCb(completed, total);

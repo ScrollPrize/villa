@@ -172,7 +172,7 @@ float tdist(const cv::Vec3f &a, const cv::Vec3f &b, float t_dist)
     cv::Vec3f d = a-b;
     float l = sqrtf(d.dot(d));
 
-    return abs(l-t_dist);
+    return std::abs(l-t_dist);
 }
 
 float tdist_sum(const cv::Vec3f &v, const std::vector<cv::Vec3f> &tgts, const std::vector<float> &tds)

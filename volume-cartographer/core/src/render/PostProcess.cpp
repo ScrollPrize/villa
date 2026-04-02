@@ -144,7 +144,7 @@ void applyRenderPostProcess(cv::Mat_<uint8_t>& gray,
 
 void buildWindowLevelLut(std::array<uint32_t, 256>& lut,
                          float windowLow, float windowHigh,
-                         float lightFactor)
+                         float lightFactor) noexcept
 {
     const int lo = static_cast<int>(std::clamp(windowLow, 0.0f, 255.0f));
     const int hi = static_cast<int>(

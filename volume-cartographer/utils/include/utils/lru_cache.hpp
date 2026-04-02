@@ -211,7 +211,7 @@ private:
     };
 
     // -- read helpers (batched stat updates to reduce atomic contention) ----
-    void recordMiss() const
+    void recordMiss() const noexcept
     {
         thread_local int missCount = 0;
         if (++missCount >= 256) {
@@ -220,7 +220,7 @@ private:
         }
     }
 
-    void recordHit(const Entry& entry) const
+    void recordHit(const Entry& entry) const noexcept
     {
         if (config_.promote_on_read) {
             thread_local uint64_t localGen = 0;
@@ -486,7 +486,7 @@ public:
     }
 
 private:
-    [[nodiscard]] LRUCache<K, V, Hash, KeyEqual>& shard(const K& key) const
+    [[nodiscard]] LRUCache<K, V, Hash, KeyEqual>& shard(const K& key) const noexcept
     {
         auto idx = Hash{}(key) % NumShards;
         return *shards_[idx];

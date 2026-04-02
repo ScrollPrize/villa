@@ -8,28 +8,28 @@
 
 namespace CompositeMethod {
 
-float mean(const LayerStack& stack)
+float mean(const LayerStack& stack) noexcept
 {
     if (stack.validCount == 0) return 0.0f;
     return utils::composite_mean(
         std::span<const float>(stack.values.data(), stack.validCount));
 }
 
-float max(const LayerStack& stack)
+float max(const LayerStack& stack) noexcept
 {
     if (stack.validCount == 0) return 0.0f;
     return utils::composite_max(
         std::span<const float>(stack.values.data(), stack.validCount));
 }
 
-float min(const LayerStack& stack)
+float min(const LayerStack& stack) noexcept
 {
     if (stack.validCount == 0) return 255.0f;
     return utils::composite_min(
         std::span<const float>(stack.values.data(), stack.validCount));
 }
 
-float alpha(const LayerStack& stack, const CompositeParams& params)
+float alpha(const LayerStack& stack, const CompositeParams& params) noexcept
 {
     if (stack.validCount == 0) return 0.0f;
 
@@ -45,7 +45,7 @@ float alpha(const LayerStack& stack, const CompositeParams& params)
     return result * 255.0f;
 }
 
-float beerLambert(const LayerStack& stack, const CompositeParams& params)
+float beerLambert(const LayerStack& stack, const CompositeParams& params) noexcept
 {
     if (stack.validCount == 0) return 0.0f;
 
@@ -78,7 +78,7 @@ float beerLambert(const LayerStack& stack, const CompositeParams& params)
 
 float compositeLayerStack(
     const LayerStack& stack,
-    const CompositeParams& params)
+    const CompositeParams& params) noexcept
 {
     if (stack.validCount == 0) return 0.0f;
 
@@ -101,12 +101,12 @@ float compositeLayerStack(
     return CompositeMethod::mean(stack);
 }
 
-bool methodRequiresLayerStorage(const std::string& method)
+bool methodRequiresLayerStorage(const std::string& method) noexcept
 {
     return utils::method_requires_storage(utils::parse_compositing_method(method));
 }
 
-float computeLightingFactor(const cv::Vec3f& normal, const CompositeParams& params)
+float computeLightingFactor(const cv::Vec3f& normal, const CompositeParams& params) noexcept
 {
     if (!params.lightingEnabled) {
         return 1.0f;

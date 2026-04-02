@@ -69,7 +69,7 @@ static void vxy_from_normal(cv::Vec3f orig, cv::Vec3f normal, cv::Vec3f &vx, cv:
     vy = vy_from_orig_norm(orig, normal);
 
     //TODO will there be a jump around the midpoint?
-    if (abs(vx[0]) >= abs(vy[1]))
+    if (std::abs(vx[0]) >= std::abs(vy[1]))
         vy = cv::Mat(normal).cross(cv::Mat(vx));
     else
         vx = cv::Mat(normal).cross(cv::Mat(vy));
@@ -141,7 +141,7 @@ float PlaneSurface::pointDist(cv::Vec3f wp)
     float plane_off = _origin.dot(_normal);
     float scalarp = wp.dot(_normal) - plane_off /*- _z_off*/;
 
-    return abs(scalarp);
+    return std::abs(scalarp);
 }
 
 void PlaneSurface::setInPlaneRotation(float radians)

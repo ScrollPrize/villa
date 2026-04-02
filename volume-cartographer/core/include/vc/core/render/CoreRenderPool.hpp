@@ -20,10 +20,10 @@ namespace vc::render {
 // collected by the caller via drainCompleted().
 //
 // Uses utils::PriorityThreadPool with epoch-based stale task filtering.
-class CoreRenderPool {
+class CoreRenderPool final {
 public:
     explicit CoreRenderPool(int numThreads = 2);
-    ~CoreRenderPool();
+    ~CoreRenderPool() noexcept;
 
     // Submit a tile for background rendering.
     // epochRef is checked before/after rendering to skip stale tasks.
@@ -42,7 +42,7 @@ public:
     void cancelAll();
 
     // Number of pending + in-flight tasks.
-    int pendingCount() const;
+    [[nodiscard]] int pendingCount() const noexcept;
 
     // Reset stuck pending count when the pool is idle but pendingCount > 0.
     // Returns true if the count was reset.

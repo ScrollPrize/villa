@@ -22,7 +22,7 @@ ViewportRenderer::ViewportRenderer(CoreRenderPool* externalPool)
 {
 }
 
-ViewportRenderer::~ViewportRenderer()
+ViewportRenderer::~ViewportRenderer() noexcept
 {
     _currentEpoch->fetch_add(1, std::memory_order_relaxed);
 }
@@ -169,7 +169,7 @@ void ViewportRenderer::clearState()
     _chunkArrived.store(false, std::memory_order_relaxed);
 }
 
-int ViewportRenderer::pendingCount() const
+int ViewportRenderer::pendingCount() const noexcept
 {
     return pool()->pendingCount();
 }

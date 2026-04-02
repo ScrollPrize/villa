@@ -325,7 +325,7 @@ void CTiledVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         _chunkCbId = 0;
     }
 
-    _volume = vol;
+    _volume = std::move(vol);
 
     // Reset pin progress tracking
     _pinTotal = 0;
@@ -358,7 +358,7 @@ void CTiledVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     updateStatusLabel();
 }
 
-void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surface> surf,
+void CTiledVolumeViewer::onSurfaceChanged(const std::string& name, const std::shared_ptr<Surface>& surf,
                                            bool isEditUpdate)
 {
     if (name == "segmentation" || name == _surfName) {
@@ -460,7 +460,7 @@ void CTiledVolumeViewer::onVolumeClosing()
     }
 }
 
-void CTiledVolumeViewer::onSurfaceWillBeDeleted(std::string /*name*/, std::shared_ptr<Surface> surf)
+void CTiledVolumeViewer::onSurfaceWillBeDeleted(const std::string& /*name*/, const std::shared_ptr<Surface>& surf)
 {
     auto current = _surfWeak.lock();
     if (current && current == surf) {
@@ -818,17 +818,20 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
         return;
     }
 
-    // Convert scene position to viewport coordinates for zoom-at-point math
+    // Zoom-at-point: the surface position under the cursor must stay fixed.
+    // Compute it from scene coords (stable) rather than accumulating float error.
+    // surfaceAnchor = gridToSurface(scenePos) is the surface point under the cursor.
+    // After zoom, we want: surfaceAnchor = surfacePtr + vpOffset / newScale
+    // => surfacePtr = surfaceAnchor - vpOffset / newScale
+    cv::Vec2f surfAnchor = _tileScene->sceneToSurface(scenePos);
     QPointF vpPos = fGraphicsView->mapFromScene(scenePos);
     QSize vpSize = fGraphicsView->viewport()->size();
-    const float vpCenterX = vpSize.width() * 0.5f;
-    const float vpCenterY = vpSize.height() * 0.5f;
-    const float dx = static_cast<float>(vpPos.x()) - vpCenterX;
-    const float dy = static_cast<float>(vpPos.y()) - vpCenterY;
+    const float vpOffX = static_cast<float>(vpPos.x()) - vpSize.width() * 0.5f;
+    const float vpOffY = static_cast<float>(vpPos.y()) - vpSize.height() * 0.5f;
 
-    _camera.surfacePtr[0] += dx * (1.0f / _camera.scale - 1.0f / newScale);
-    _camera.surfacePtr[1] += dy * (1.0f / _camera.scale - 1.0f / newScale);
     _camera.scale = newScale;
+    _camera.surfacePtr[0] = surfAnchor[0] - vpOffX / newScale;
+    _camera.surfacePtr[1] = surfAnchor[1] - vpOffY / newScale;
 
     if (_volume) {
         float oldDs = _camera.dsScale;
@@ -1513,7 +1516,7 @@ void CTiledVolumeViewer::onKeyPress(int key, Qt::KeyboardModifiers /*modifiers*/
 // POI handling
 // ============================================================================
 
-void CTiledVolumeViewer::onPOIChanged(std::string name, POI* poi)
+void CTiledVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
 {
     auto surf = _surfWeak.lock();
     if (!poi || !surf) return;

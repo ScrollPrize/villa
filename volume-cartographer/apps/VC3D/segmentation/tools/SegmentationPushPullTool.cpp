@@ -541,7 +541,7 @@ void SegmentationPushPullTool::stopAll()
     // Finalize the edits and trigger final surface update
     if (wasActive && _editManager && _editManager->hasSession() && _state) {
         // Capture delta for undo before applyPreview() clears edited vertices
-        _module.captureUndoDelta();
+        (void)_module.captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
         if (_module.autoApprovalEnabled() && _overlay && _overlay->hasApprovalMaskData()) {

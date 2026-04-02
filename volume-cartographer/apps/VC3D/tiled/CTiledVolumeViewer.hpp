@@ -62,35 +62,35 @@ public:
 
     // --- Rendering ---
     void renderVisible(bool force = false);
-    void renderIntersections();
+    void renderIntersections() override;
     void invalidateVis();
-    void invalidateIntersect(const std::string& name = "");
+    void invalidateIntersect(const std::string& name = "") override;
 
     // --- Accessors ---
     TileScene* tileScene() const { return _tileScene; }
-    std::string surfName() const { return _surfName; }
-    std::shared_ptr<Volume> currentVolume() const { return _volume; }
+    std::string surfName() const override { return _surfName; }
+    std::shared_ptr<Volume> currentVolume() const override { return _volume; }
     vc::cache::TieredChunkCache* chunkCachePtr() const override {
         return _volume ? _volume->tieredCache() : nullptr;
     }
-    int datasetScaleIndex() const { return _camera.dsScaleIdx; }
-    float datasetScaleFactor() const { return _camera.dsScale; }
-    float getCurrentScale() const { return _camera.scale; }
-    float dsScale() const { return _camera.dsScale; }
-    float normalOffset() const { return _camera.zOff; }
-    Surface* currentSurface() const;
-    VCCollection* pointCollection() const { return _pointCollection; }
-    uint64_t highlightedPointId() const { return _highlightedPointId; }
-    uint64_t selectedPointId() const { return _selectedPointId; }
-    uint64_t selectedCollectionId() const { return _selectedCollectionId; }
-    bool isPointDragActive() const { return _draggedPointId != 0; }
-    const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const { return _paths; }
+    int datasetScaleIndex() const override { return _camera.dsScaleIdx; }
+    float datasetScaleFactor() const override { return _camera.dsScale; }
+    float getCurrentScale() const override { return _camera.scale; }
+    float dsScale() const override { return _camera.dsScale; }
+    float normalOffset() const override { return _camera.zOff; }
+    Surface* currentSurface() const override;
+    VCCollection* pointCollection() const override { return _pointCollection; }
+    uint64_t highlightedPointId() const override { return _highlightedPointId; }
+    uint64_t selectedPointId() const override { return _selectedPointId; }
+    uint64_t selectedCollectionId() const override { return _selectedCollectionId; }
+    bool isPointDragActive() const override { return _draggedPointId != 0; }
+    const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override { return _paths; }
 
     // --- Composite settings ---
     void setCompositeRenderSettings(const CompositeRenderSettings& settings);
-    const CompositeRenderSettings& compositeRenderSettings() const { return _compositeSettings; }
-    bool isCompositeEnabled() const { return _compositeSettings.enabled; }
-    bool isPlaneCompositeEnabled() const { return _compositeSettings.planeEnabled; }
+    const CompositeRenderSettings& compositeRenderSettings() const override { return _compositeSettings; }
+    bool isCompositeEnabled() const override { return _compositeSettings.enabled; }
+    bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled; }
     int planeCompositeLayersFront() const { return _compositeSettings.planeLayersFront; }
     int planeCompositeLayersBehind() const { return _compositeSettings.planeLayersBehind; }
     bool postStretchValues() const { return _compositeSettings.postStretchValues; }
@@ -100,13 +100,13 @@ public:
     // --- Display settings ---
     void setResetViewOnSurfaceChange(bool reset);
     void setShowDirectionHints(bool on) { _showDirectionHints = on; updateAllOverlays(); }
-    bool isShowDirectionHints() const { return _showDirectionHints; }
+    bool isShowDirectionHints() const override { return _showDirectionHints; }
     void setShowSurfaceNormals(bool on) { _showSurfaceNormals = on; updateAllOverlays(); }
-    bool isShowSurfaceNormals() const { return _showSurfaceNormals; }
+    bool isShowSurfaceNormals() const override { return _showSurfaceNormals; }
     void setNormalArrowLengthScale(float scale) { _normalArrowLengthScale = scale; updateAllOverlays(); }
-    float normalArrowLengthScale() const { return _normalArrowLengthScale; }
+    float normalArrowLengthScale() const override { return _normalArrowLengthScale; }
     void setNormalMaxArrows(int maxArrows) { _normalMaxArrows = maxArrows; updateAllOverlays(); }
-    int normalMaxArrows() const { return _normalMaxArrows; }
+    int normalMaxArrows() const override { return _normalMaxArrows; }
 
     // --- Surface offset ---
     void adjustSurfaceOffset(float dn);
@@ -143,25 +143,25 @@ public:
 
     // --- Surface overlays ---
     void setSurfaceOverlayEnabled(bool enabled);
-    bool surfaceOverlayEnabled() const { return _surfaceOverlayEnabled; }
+    bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
     void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays);
-    const std::map<std::string, cv::Vec3b>& surfaceOverlays() const { return _surfaceOverlays; }
+    const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override { return _surfaceOverlays; }
     void setSurfaceOverlapThreshold(float threshold);
-    float surfaceOverlapThreshold() const { return _surfaceOverlapThreshold; }
+    float surfaceOverlapThreshold() const override { return _surfaceOverlapThreshold; }
 
     // --- Intersection rendering ---
     void setIntersectionOpacity(float opacity);
-    float intersectionOpacity() const { return _intersectionOpacity; }
+    float intersectionOpacity() const override { return _intersectionOpacity; }
     void setIntersectionThickness(float thickness);
-    float intersectionThickness() const { return _intersectionThickness; }
+    float intersectionThickness() const override { return _intersectionThickness; }
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
     void setSurfacePatchSamplingStride(int stride);
-    int surfacePatchSamplingStride() const { return _surfacePatchSamplingStride; }
+    int surfacePatchSamplingStride() const override { return _surfacePatchSamplingStride; }
 
     // --- Overlay group management ---
-    void setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items);
-    void clearOverlayGroup(const std::string& key);
-    void clearAllOverlayGroups();
+    void setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items) override;
+    void clearOverlayGroup(const std::string& key) override;
+    void clearAllOverlayGroups() override;
 
     void updateAllOverlays();
     void updateStatusLabel();
@@ -172,9 +172,9 @@ public:
 
     // --- Coordinate transforms ---
     // Transform from volume (world) coordinates to canvas scene coordinates
-    QPointF volumeToScene(const cv::Vec3f& vol_point);
+    QPointF volumeToScene(const cv::Vec3f& vol_point) override;
     // Transform from canvas scene coordinates to volume (world) coordinates
-    cv::Vec3f sceneToVolume(const QPointF& scenePoint) const;
+    cv::Vec3f sceneToVolume(const QPointF& scenePoint) const override;
     // Scene-to-volume coordinate conversion (returns position + normal)
     bool sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n, const QPointF& scenePos) const;
     // Transform from canvas scene coordinates to surface parameter coordinates
@@ -185,8 +185,8 @@ public:
     void setBBoxMode(bool enabled);
     bool isBBoxMode() const { return _bboxMode; }
     QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect);
-    auto selections() const -> std::vector<std::pair<QRectF, QColor>>;
-    std::optional<QRectF> activeBBoxSceneRect() const { return _activeBBoxSceneRect; }
+    auto selections() const -> std::vector<std::pair<QRectF, QColor>> override;
+    std::optional<QRectF> activeBBoxSceneRect() const override { return _activeBBoxSceneRect; }
     void clearSelections();
 
     // --- Misc ---
@@ -210,8 +210,8 @@ public slots:
     void onPanRelease(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onPanStart(Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onCollectionSelected(uint64_t collectionId);
-    void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
-    void onPOIChanged(std::string name, POI* poi);
+    void onSurfaceChanged(const std::string& name, const std::shared_ptr<Surface>& surf, bool isEditUpdate = false);
+    void onPOIChanged(const std::string& name, POI* poi);
     void onScrolled();
     void onResized();
     void onZoom(int steps, QPointF scene_point, Qt::KeyboardModifiers modifiers);
@@ -223,7 +223,7 @@ public slots:
     void onMouseMove(QPointF scene_loc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
     void onMouseRelease(QPointF scene_loc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onVolumeClosing();
-    void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
+    void onSurfaceWillBeDeleted(const std::string& name, const std::shared_ptr<Surface>& surf);
     void onKeyPress(int key, Qt::KeyboardModifiers modifiers);
     void onKeyRelease(int key, Qt::KeyboardModifiers modifiers);
 

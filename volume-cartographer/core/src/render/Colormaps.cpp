@@ -98,7 +98,7 @@ void applyPackedLut(const cv::Mat_<uint8_t>& values, const uint32_t* lut,
     }
 }
 
-const std::vector<OverlayColormapSpec>& specs()
+const std::vector<OverlayColormapSpec>& specs() noexcept
 {
     static const std::vector<OverlayColormapSpec>& specsRef = buildSpecs();
     return specsRef;
@@ -172,7 +172,7 @@ void makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec
     }
 }
 
-const std::vector<OverlayColormapEntry>& entries(const EntryScope scope)
+const std::vector<OverlayColormapEntry>& entries(const EntryScope scope) noexcept
 {
     static const std::vector<OverlayColormapEntry> sharedEntries = buildEntries(EntryScope::SharedOnly);
     static const std::vector<OverlayColormapEntry> overlayEntries = buildEntries(EntryScope::OverlayCompatible);

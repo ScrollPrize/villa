@@ -94,7 +94,7 @@ public:
     // overflow. Calls progressCb(fetched, total) periodically from the
     // background thread if provided.
     using PrefetchProgressCb = std::function<void(int fetched, int total)>;
-    void prefetchLevel(int level, PrefetchProgressCb progressCb = nullptr);
+    void prefetchLevel(int level, const PrefetchProgressCb& progressCb = nullptr);
 
     // Scan the coarsest level for all-zero chunks and propagate zero-knowledge
     // to all finer levels by adding descendant keys to the negative cache.
@@ -113,7 +113,7 @@ public:
 
     // Direct access to coarsest level data. Returns nullptr if not loaded
     // or out of range.
-    [[nodiscard]] ChunkDataPtr getCoarse(const ChunkKey& key) const;
+    [[nodiscard]] ChunkDataPtr getCoarse(const ChunkKey& key) const noexcept;
 
     // Clear hot tier. Does not touch cold/ice.
     void clearMemory();
@@ -122,13 +122,13 @@ public:
     void clearAll();
 
     // Number of pyramid levels in the source.
-    [[nodiscard]] int numLevels() const;
+    [[nodiscard]] int numLevels() const noexcept;
 
     // Chunk shape at a given level, in {z, y, x} order.
-    [[nodiscard]] std::array<int, 3> chunkShape(int level) const;
+    [[nodiscard]] std::array<int, 3> chunkShape(int level) const noexcept;
 
     // Full dataset shape at a given level, in {z, y, x} order.
-    [[nodiscard]] std::array<int, 3> levelShape(int level) const;
+    [[nodiscard]] std::array<int, 3> levelShape(int level) const noexcept;
 
     // Persist negative-cache entries to disk without destroying the cache.
     // Call after bulk operations (e.g. level-5 priming) so reopening the same
@@ -143,6 +143,8 @@ public:
         int minY = 0, maxY = 0;
         int minZ = 0, maxZ = 0;
         bool valid = false;
+
+        constexpr bool operator==(const DataBoundsL0&) const noexcept = default;
     };
 
     void setDataBounds(int minX, int maxX, int minY, int maxY, int minZ, int maxZ);
@@ -178,7 +180,7 @@ public:
 
     // Clear the chunk-arrived debounce flag. Call this after processing
     // the chunk-ready callback to allow the next notification.
-    void clearChunkArrivedFlag();
+    void clearChunkArrivedFlag() noexcept;
 
     // --- Stats ---
 
@@ -232,9 +234,9 @@ private:
     // (i.e. the chunk might exist -- proceed to fetch).
     static constexpr size_t kBloomBits = 65536;  // 8 KB, ~1% FPR at 5000 entries
     std::array<std::atomic<uint64_t>, kBloomBits / 64> negativeBloom_{};
-    void bloomAdd(const ChunkKey& key);
-    [[nodiscard]] bool bloomMayContain(const ChunkKey& key) const;
-    void bloomClear();
+    void bloomAdd(const ChunkKey& key) noexcept;
+    [[nodiscard]] bool bloomMayContain(const ChunkKey& key) const noexcept;
+    void bloomClear() noexcept;
     mutable std::mutex negativeMutex_;
     std::unordered_set<ChunkKey, ChunkKeyHash> negativeCache_;
     void loadNegativeCache();

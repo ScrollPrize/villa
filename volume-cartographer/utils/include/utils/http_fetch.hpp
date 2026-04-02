@@ -228,8 +228,8 @@ public:
     HttpClient(const HttpClient&) = delete;
     HttpClient& operator=(const HttpClient&) = delete;
 
-    HttpClient(HttpClient&&) noexcept = default;
-    HttpClient& operator=(HttpClient&&) noexcept = default;
+    HttpClient(HttpClient&&) = delete;
+    HttpClient& operator=(HttpClient&&) = delete;
 
     // GET request
     [[nodiscard]] HttpResponse get(std::string_view url) const {

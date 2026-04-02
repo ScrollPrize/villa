@@ -180,9 +180,9 @@ public:
     // Calls progressCb(completed, total) periodically for UI updates.
     // After completion, flushes persistent state so a reopen doesn't repeat.
     void primeRemoteLevel5Blocking(
-        std::function<void(size_t completed, size_t total)> progressCb = nullptr);
+        const std::function<void(size_t completed, size_t total)>& progressCb = nullptr);
 
-    [[nodiscard]] static bool checkDir(std::filesystem::path path);
+    [[nodiscard]] static bool checkDir(const std::filesystem::path& path);
 
 protected:
     std::filesystem::path path_;

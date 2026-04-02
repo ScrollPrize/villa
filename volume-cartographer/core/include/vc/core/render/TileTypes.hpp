@@ -17,7 +17,8 @@ struct TileKey {
     int col = 0;
     int row = 0;
 
-    bool operator==(const TileKey& o) const { return col == o.col && row == o.row; }
+    constexpr bool operator==(const TileKey& o) const noexcept { return col == o.col && row == o.row; }
+    constexpr bool operator!=(const TileKey& o) const noexcept { return !(*this == o); }
 };
 
 // A tile key in world-aligned coordinates (fixed surface parameter grid)
@@ -25,14 +26,15 @@ struct WorldTileKey {
     int worldCol = 0;
     int worldRow = 0;
 
-    bool operator==(const WorldTileKey& o) const {
+    constexpr bool operator==(const WorldTileKey& o) const noexcept {
         return worldCol == o.worldCol && worldRow == o.worldRow;
     }
+    constexpr bool operator!=(const WorldTileKey& o) const noexcept { return !(*this == o); }
 };
 
 // Hash for WorldTileKey (needed for unordered containers)
 struct WorldTileKeyHash {
-    size_t operator()(const WorldTileKey& k) const {
+    size_t operator()(const WorldTileKey& k) const noexcept {
         return std::hash<int>()(k.worldCol) ^ (std::hash<int>()(k.worldRow) << 16);
     }
 };
@@ -46,21 +48,21 @@ struct ContentBounds {
     float worldTileSize = 0; // surface units per tile = TILE_PX / scale
     float scale = 0;        // current zoom scale
 
-    bool operator==(const ContentBounds& o) const {
+    constexpr bool operator==(const ContentBounds& o) const noexcept {
         return firstWorldCol == o.firstWorldCol && firstWorldRow == o.firstWorldRow &&
                totalCols == o.totalCols && totalRows == o.totalRows &&
                std::abs(worldTileSize - o.worldTileSize) < 0.001f &&
                std::abs(scale - o.scale) < 1e-6f;
     }
-    bool operator!=(const ContentBounds& o) const { return !(*this == o); }
+    constexpr bool operator!=(const ContentBounds& o) const noexcept { return !(*this == o); }
 
     // Map grid position to world tile key
-    WorldTileKey worldKeyAt(int gridCol, int gridRow) const {
+    constexpr WorldTileKey worldKeyAt(int gridCol, int gridRow) const noexcept {
         return {firstWorldCol + gridCol, firstWorldRow + gridRow};
     }
 
     // Map world tile key to grid position. Returns false if out of range.
-    bool gridPosition(const WorldTileKey& wk, int& outCol, int& outRow) const {
+    constexpr bool gridPosition(const WorldTileKey& wk, int& outCol, int& outRow) const noexcept {
         outCol = wk.worldCol - firstWorldCol;
         outRow = wk.worldRow - firstWorldRow;
         return outCol >= 0 && outCol < totalCols && outRow >= 0 && outRow < totalRows;
@@ -77,6 +79,9 @@ namespace tiled_config {
 struct TileMetadata {
     uint64_t epoch = 0;
     int8_t level = -1;    // pyramid level of current pixmap (-1 = placeholder)
+
+    constexpr bool operator==(const TileMetadata& o) const noexcept { return epoch == o.epoch && level == o.level; }
+    constexpr bool operator!=(const TileMetadata& o) const noexcept { return !(*this == o); }
 };
 
 // Parameters for a single tile render call.

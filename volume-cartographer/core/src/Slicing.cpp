@@ -14,6 +14,7 @@
 #include <cassert>
 #include <cmath>
 #include <climits>
+#include <cstdint>
 #include <limits>
 #include <unordered_set>
 #include <omp.h>
@@ -31,6 +32,20 @@
 #else
 #define VC_FORCE_INLINE __attribute__((always_inline)) inline
 #endif
+
+// Bitwise NaN check — works under -ffast-math where std::isnan is a no-op
+VC_FORCE_INLINE bool isnan_bitwise(float f) {
+    uint32_t u;
+    __builtin_memcpy(&u, &f, 4);
+    return (u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0;
+}
+
+// Bitwise finiteness check — works under -ffast-math where std::isfinite is a no-op
+VC_FORCE_INLINE bool isfinite_bitwise(float f) {
+    uint32_t u;
+    __builtin_memcpy(&u, &f, 4);
+    return (u & 0x7f800000u) != 0x7f800000u;
+}
 
 // Non-temporal store for write-only output — bypasses cache,
 // freeing cache lines for read-heavy chunk data.
@@ -509,7 +524,7 @@ struct ChunkSampler {
     }
 
     // Catmull-Rom weight function for tricubic interpolation
-    static float catmullRom(float t) {
+    static VC_FORCE_INLINE float catmullRom(float t) {
         float at = std::abs(t);
         if (at < 1.0f) return 1.5f*at*at*at - 2.5f*at*at + 1.0f;
         if (at < 2.0f) return -0.5f*at*at*at + 2.5f*at*at - 4.0f*at + 2.0f;
@@ -543,7 +558,7 @@ struct ChunkSampler {
 // readVolumeImpl — unified inner loop
 // ============================================================================
 
-enum class SampleMode { Nearest, Trilinear, Tricubic };
+enum class SampleMode : std::uint8_t { Nearest, Trilinear, Tricubic };
 
 template<typename T, SampleMode Mode, typename NormalFn>
 static void readVolumeImpl(
@@ -694,7 +709,7 @@ static void readVolumeImpl(
     // Hoist composite method dispatch out of the per-pixel inner loop.
     // The mode never changes, so the compiler can jump-table the switch
     // and the branch predictor will lock on immediately.
-    enum AccumMode { kLayerStorage, kMax, kMin, kMean };
+    enum AccumMode : std::uint8_t { kLayerStorage, kMax, kMin, kMean };
     const AccumMode accumMode =
         (params && methodRequiresLayerStorage(params->method)) ? kLayerStorage
       : (params && params->method == "max") ? kMax
@@ -1371,7 +1386,7 @@ static void samplePlaneImpl(
             if constexpr (Mode == SampleMode::Trilinear) {
                 // Row-level same-chunk check: if first and last pixel
                 // map to the same chunk, skip all updateChunk calls.
-                cv::Vec3f first = row_base;
+                const cv::Vec3f& first = row_base;
                 cv::Vec3f last = row_base + vx_step * static_cast<float>(w - 1);
                 bool rowSingleChunk = false;
                 int rowCiz = 0, rowCiy = 0, rowCix = 0;
@@ -1470,7 +1485,7 @@ static void samplePlaneImpl(
                 // Instead of float-to-int per pixel, track integer coords with
                 // fractional accumulators (Bresenham-style).
                 const float dx = vx_step[0], dy = vx_step[1], dz = vx_step[2];
-                cv::Vec3f first = row_base;
+                const cv::Vec3f& first = row_base;
                 cv::Vec3f last = row_base + vx_step * static_cast<float>(w - 1);
 
                 // Row-level bounds: after nearest-rounding (+0.5f), int coords
@@ -1517,15 +1532,16 @@ static void samplePlaneImpl(
                         float fracX = fx - ix, fracY = fy - iy, fracZ = fz - iz;
                         for (int x = 0; x < w; x++) {
                             nt_store(&outRow[x], chunkData[vo(lz, ly, lx)]);
+                            // Branchless fractional stepping (CMOV instead of branches)
                             fracX += dx;
-                            if (fracX >= 1.0f) { lx++; fracX -= 1.0f; }
-                            else if (fracX < 0.0f) { lx--; fracX += 1.0f; }
+                            int ox = (fracX >= 1.0f) - (fracX < 0.0f);
+                            lx += ox; fracX -= static_cast<float>(ox);
                             fracY += dy;
-                            if (fracY >= 1.0f) { ly++; fracY -= 1.0f; }
-                            else if (fracY < 0.0f) { ly--; fracY += 1.0f; }
+                            int oy = (fracY >= 1.0f) - (fracY < 0.0f);
+                            ly += oy; fracY -= static_cast<float>(oy);
                             fracZ += dz;
-                            if (fracZ >= 1.0f) { lz++; fracZ -= 1.0f; }
-                            else if (fracZ < 0.0f) { lz--; fracZ += 1.0f; }
+                            int oz = (fracZ >= 1.0f) - (fracZ < 0.0f);
+                            lz += oz; fracZ -= static_cast<float>(oz);
                         }
                         // Prefetch next row's starting voxel into L2
                         if (y + 1 < yEnd) {
@@ -1561,15 +1577,16 @@ static void samplePlaneImpl(
                             int lz = p.localZ(iz), ly = p.localY(iy), lx = p.localX(ix);
                             nt_store(&outRow[x], curData[sampler.voxelOffset(lz, ly, lx)]);
                         }
+                        // Branchless fractional stepping (CMOV instead of branches)
                         fracX += dx;
-                        if (fracX >= 1.0f) { ix++; fracX -= 1.0f; }
-                        else if (fracX < 0.0f) { ix--; fracX += 1.0f; }
+                        int ox = (fracX >= 1.0f) - (fracX < 0.0f);
+                        ix += ox; fracX -= static_cast<float>(ox);
                         fracY += dy;
-                        if (fracY >= 1.0f) { iy++; fracY -= 1.0f; }
-                        else if (fracY < 0.0f) { iy--; fracY += 1.0f; }
+                        int oy = (fracY >= 1.0f) - (fracY < 0.0f);
+                        iy += oy; fracY -= static_cast<float>(oy);
                         fracZ += dz;
-                        if (fracZ >= 1.0f) { iz++; fracZ -= 1.0f; }
-                        else if (fracZ < 0.0f) { iz--; fracZ += 1.0f; }
+                        int oz = (fracZ >= 1.0f) - (fracZ < 0.0f);
+                        iz += oz; fracZ -= static_cast<float>(oz);
                     }
                     // Prefetch next row's first chunk data from sampler cache
                     if (y + 1 < yEnd) {
@@ -1719,7 +1736,7 @@ static void samplePlaneARGB32Impl(
             cv::Vec3f row_base = origin + vy_step * static_cast<float>(y);
 
             if constexpr (Mode == SampleMode::Trilinear) {
-                cv::Vec3f first = row_base;
+                const cv::Vec3f& first = row_base;
                 cv::Vec3f last = row_base + vx_step * static_cast<float>(w - 1);
                 bool rowSingleChunk = false;
                 int rowCiz = 0, rowCiy = 0, rowCix = 0;
@@ -1742,38 +1759,104 @@ static void samplePlaneARGB32Impl(
                 if (rowSingleChunk) {
                     sampler.updateChunk(rowCiz, rowCiy, rowCix);
                     if (sampler.data) {
-                        const uint8_t* chunkData = sampler.data;
-                        const auto vo = [&](int lz, int ly, int lx) { return sampler.voxelOffset(lz, ly, lx); };
-                        float vx = row_base[0], vy = row_base[1], vz = row_base[2];
-                        for (int x = 0; x < w; x++) {
-                            if (vz >= 0 && vy >= 0 && vx >= 0 &&
-                                vz < p.sz && vy < p.sy && vx < p.sx) {
-                                int iz = static_cast<int>(vz);
-                                int iy = static_cast<int>(vy);
-                                int ix = static_cast<int>(vx);
-                                int lz0 = p.localZ(iz), ly0 = p.localY(iy), lx0 = p.localX(ix);
+                        const uint8_t* __restrict__ cd = sampler.data;
+                        const size_t st0 = sampler.s0, st1 = sampler.s1;
+                        const float dx = vx_step[0], dy = vx_step[1], dz = vx_step[2];
+                        const float bx = row_base[0], by = row_base[1], bz = row_base[2];
+                        const int cmask = p.chunk128 ? 0x7f : (p.pow2 ? p.cxMask : 0);
 
-                                float c000 = chunkData[vo(lz0, ly0, lx0)];
-                                float c100 = chunkData[vo((lz0+1), ly0, lx0)];
-                                float c010 = chunkData[vo(lz0, (ly0+1), lx0)];
-                                float c110 = chunkData[vo((lz0+1), (ly0+1), lx0)];
-                                float c001 = chunkData[vo(lz0, ly0, (lx0+1))];
-                                float c101 = chunkData[vo((lz0+1), ly0, (lx0+1))];
-                                float c011 = chunkData[vo(lz0, (ly0+1), (lx0+1))];
-                                float c111 = chunkData[vo((lz0+1), (ly0+1), (lx0+1))];
+                        // 4-wide SoA trilinear: compute coords independently (not serially),
+                        // hoist bounds check to row level, separate gather from math
+                        // so the compiler can vectorize the interpolation.
+                        int x = 0;
+                        for (; x + 3 < w; x += 4) {
+                            // Independent coordinate computation (no serial dependency)
+                            float vx0 = bx + x * dx,       vy0 = by + x * dy,       vz0 = bz + x * dz;
+                            float vx1 = bx + (x+1) * dx,   vy1 = by + (x+1) * dy,   vz1 = bz + (x+1) * dz;
+                            float vx2 = bx + (x+2) * dx,   vy2 = by + (x+2) * dy,   vz2 = bz + (x+2) * dz;
+                            float vx3 = bx + (x+3) * dx,   vy3 = by + (x+3) * dy,   vz3 = bz + (x+3) * dz;
 
-                                float fz = vz - iz, fy = vy - iy, fx = vx - ix;
-                                float c00 = std::fma(fx, c001 - c000, c000);
-                                float c01 = std::fma(fx, c011 - c010, c010);
-                                float c10 = std::fma(fx, c101 - c100, c100);
-                                float c11 = std::fma(fx, c111 - c110, c110);
-                                float c0 = std::fma(fy, c01 - c00, c00);
-                                float c1 = std::fma(fy, c11 - c10, c10);
-                                float v = std::fma(fz, c1 - c0, c0);
+                            int ix0 = (int)vx0, iy0_ = (int)vy0, iz0_ = (int)vz0;
+                            int ix1 = (int)vx1, iy1_ = (int)vy1, iz1_ = (int)vz1;
+                            int ix2 = (int)vx2, iy2_ = (int)vy2, iz2_ = (int)vz2;
+                            int ix3 = (int)vx3, iy3_ = (int)vy3, iz3_ = (int)vz3;
 
-                                nt_store_u32(&outRow[x], lut[static_cast<uint8_t>(v)]);
+                            // Local coords via mask (chunk128 fast path)
+                            int lx0 = ix0 & cmask, ly0_ = iy0_ & cmask, lz0_ = iz0_ & cmask;
+                            int lx1 = ix1 & cmask, ly1_ = iy1_ & cmask, lz1_ = iz1_ & cmask;
+                            int lx2 = ix2 & cmask, ly2_ = iy2_ & cmask, lz2_ = iz2_ & cmask;
+                            int lx3 = ix3 & cmask, ly3_ = iy3_ & cmask, lz3_ = iz3_ & cmask;
+
+                            if (!p.chunk128 && !p.pow2) {
+                                lx0 = ix0 % p.cx; ly0_ = iy0_ % p.cy; lz0_ = iz0_ % p.cz;
+                                lx1 = ix1 % p.cx; ly1_ = iy1_ % p.cy; lz1_ = iz1_ % p.cz;
+                                lx2 = ix2 % p.cx; ly2_ = iy2_ % p.cy; lz2_ = iz2_ % p.cz;
+                                lx3 = ix3 % p.cx; ly3_ = iy3_ % p.cy; lz3_ = iz3_ % p.cz;
                             }
-                            vx += vx_step[0]; vy += vx_step[1]; vz += vx_step[2];
+
+                            // Base offsets (row-major)
+                            size_t o0 = lz0_*st0 + ly0_*st1 + lx0;
+                            size_t o1 = lz1_*st0 + ly1_*st1 + lx1;
+                            size_t o2 = lz2_*st0 + ly2_*st1 + lx2;
+                            size_t o3 = lz3_*st0 + ly3_*st1 + lx3;
+
+                            // Gather 8 corners × 4 pixels (32 loads, interleaved for ILP)
+                            float g[4][8];
+                            g[0][0] = cd[o0];              g[1][0] = cd[o1];
+                            g[2][0] = cd[o2];              g[3][0] = cd[o3];
+                            g[0][1] = cd[o0+st0];          g[1][1] = cd[o1+st0];
+                            g[2][1] = cd[o2+st0];          g[3][1] = cd[o3+st0];
+                            g[0][2] = cd[o0+st1];          g[1][2] = cd[o1+st1];
+                            g[2][2] = cd[o2+st1];          g[3][2] = cd[o3+st1];
+                            g[0][3] = cd[o0+st0+st1];      g[1][3] = cd[o1+st0+st1];
+                            g[2][3] = cd[o2+st0+st1];      g[3][3] = cd[o3+st0+st1];
+                            g[0][4] = cd[o0+1];            g[1][4] = cd[o1+1];
+                            g[2][4] = cd[o2+1];            g[3][4] = cd[o3+1];
+                            g[0][5] = cd[o0+st0+1];        g[1][5] = cd[o1+st0+1];
+                            g[2][5] = cd[o2+st0+1];        g[3][5] = cd[o3+st0+1];
+                            g[0][6] = cd[o0+st1+1];        g[1][6] = cd[o1+st1+1];
+                            g[2][6] = cd[o2+st1+1];        g[3][6] = cd[o3+st1+1];
+                            g[0][7] = cd[o0+st0+st1+1];    g[1][7] = cd[o1+st0+st1+1];
+                            g[2][7] = cd[o2+st0+st1+1];    g[3][7] = cd[o3+st0+st1+1];
+
+                            // Fractions
+                            float fx[4] = {vx0-ix0, vx1-ix1, vx2-ix2, vx3-ix3};
+                            float fy[4] = {vy0-iy0_, vy1-iy1_, vy2-iy2_, vy3-iy3_};
+                            float fz[4] = {vz0-iz0_, vz1-iz1_, vz2-iz2_, vz3-iz3_};
+
+                            // Trilinear interpolation — 4 independent chains,
+                            // written as parallel loops for auto-vectorization.
+                            float v[4];
+                            for (int i = 0; i < 4; i++) {
+                                float cx00 = g[i][0] + fx[i] * (g[i][4] - g[i][0]);
+                                float cx01 = g[i][2] + fx[i] * (g[i][6] - g[i][2]);
+                                float cx10 = g[i][1] + fx[i] * (g[i][5] - g[i][1]);
+                                float cx11 = g[i][3] + fx[i] * (g[i][7] - g[i][3]);
+                                float cy0 = cx00 + fy[i] * (cx01 - cx00);
+                                float cy1 = cx10 + fy[i] * (cx11 - cx10);
+                                v[i] = cy0 + fz[i] * (cy1 - cy0);
+                            }
+
+                            // LUT + store (scalar — LUT is inherently non-vectorizable)
+                            outRow[x]   = lut[static_cast<uint8_t>(v[0])];
+                            outRow[x+1] = lut[static_cast<uint8_t>(v[1])];
+                            outRow[x+2] = lut[static_cast<uint8_t>(v[2])];
+                            outRow[x+3] = lut[static_cast<uint8_t>(v[3])];
+                        }
+                        // Scalar tail
+                        for (; x < w; x++) {
+                            float cvx = bx + x * dx, cvy = by + x * dy, cvz = bz + x * dz;
+                            int cix = (int)cvx, ciy = (int)cvy, ciz = (int)cvz;
+                            int clx = p.localX(cix), cly = p.localY(ciy), clz = p.localZ(ciz);
+                            size_t co = clz*st0 + cly*st1 + clx;
+                            float cfx = cvx-cix, cfy = cvy-ciy, cfz = cvz-ciz;
+                            float cx00 = cd[co]       + cfx*(cd[co+1]         - cd[co]);
+                            float cx01 = cd[co+st1]   + cfx*(cd[co+st1+1]     - cd[co+st1]);
+                            float cx10 = cd[co+st0]   + cfx*(cd[co+st0+1]     - cd[co+st0]);
+                            float cx11 = cd[co+st0+st1]+cfx*(cd[co+st0+st1+1] - cd[co+st0+st1]);
+                            float cy0 = cx00 + cfy*(cx01-cx00);
+                            float cy1 = cx10 + cfy*(cx11-cx10);
+                            outRow[x] = lut[static_cast<uint8_t>(cy0 + cfz*(cy1-cy0))];
                         }
                     }
                 } else {
@@ -1800,7 +1883,7 @@ static void samplePlaneARGB32Impl(
             } else {
                 // Nearest -- integer stepping
                 const float dx = vx_step[0], dy = vx_step[1], dz = vx_step[2];
-                cv::Vec3f first = row_base;
+                const cv::Vec3f& first = row_base;
                 cv::Vec3f last = row_base + vx_step * static_cast<float>(w - 1);
 
                 float rowMinX = std::min(first[0], last[0]);
@@ -1842,15 +1925,16 @@ static void samplePlaneARGB32Impl(
                         float fracX = fx - ix, fracY = fy - iy, fracZ = fz - iz;
                         for (int x = 0; x < w; x++) {
                             nt_store_u32(&outRow[x], lut[chunkData[vo(lz, ly, lx)]]);
+                            // Branchless fractional stepping (CMOV instead of branches)
                             fracX += dx;
-                            if (fracX >= 1.0f) { lx++; fracX -= 1.0f; }
-                            else if (fracX < 0.0f) { lx--; fracX += 1.0f; }
+                            int ox = (fracX >= 1.0f) - (fracX < 0.0f);
+                            lx += ox; fracX -= static_cast<float>(ox);
                             fracY += dy;
-                            if (fracY >= 1.0f) { ly++; fracY -= 1.0f; }
-                            else if (fracY < 0.0f) { ly--; fracY += 1.0f; }
+                            int oy = (fracY >= 1.0f) - (fracY < 0.0f);
+                            ly += oy; fracY -= static_cast<float>(oy);
                             fracZ += dz;
-                            if (fracZ >= 1.0f) { lz++; fracZ -= 1.0f; }
-                            else if (fracZ < 0.0f) { lz--; fracZ += 1.0f; }
+                            int oz = (fracZ >= 1.0f) - (fracZ < 0.0f);
+                            lz += oz; fracZ -= static_cast<float>(oz);
                         }
                         // Prefetch next row's starting voxel into L2
                         if (y + 1 < yEnd) {
@@ -1885,15 +1969,16 @@ static void samplePlaneARGB32Impl(
                             int lz = p.localZ(iz), ly = p.localY(iy), lx = p.localX(ix);
                             nt_store_u32(&outRow[x], lut[curData[sampler.voxelOffset(lz, ly, lx)]]);
                         }
+                        // Branchless fractional stepping (CMOV instead of branches)
                         fracX += dx;
-                        if (fracX >= 1.0f) { ix++; fracX -= 1.0f; }
-                        else if (fracX < 0.0f) { ix--; fracX += 1.0f; }
+                        int ox = (fracX >= 1.0f) - (fracX < 0.0f);
+                        ix += ox; fracX -= static_cast<float>(ox);
                         fracY += dy;
-                        if (fracY >= 1.0f) { iy++; fracY -= 1.0f; }
-                        else if (fracY < 0.0f) { iy--; fracY += 1.0f; }
+                        int oy = (fracY >= 1.0f) - (fracY < 0.0f);
+                        iy += oy; fracY -= static_cast<float>(oy);
                         fracZ += dz;
-                        if (fracZ >= 1.0f) { iz++; fracZ -= 1.0f; }
-                        else if (fracZ < 0.0f) { iz--; fracZ += 1.0f; }
+                        int oz = (fracZ >= 1.0f) - (fracZ < 0.0f);
+                        iz += oz; fracZ -= static_cast<float>(oz);
                     }
                     // Prefetch next row's first chunk data from sampler cache
                     if (y + 1 < yEnd) {
@@ -2015,7 +2100,7 @@ void readCompositeFast(
     auto getNormal = [&](int y, int x) -> cv::Vec3f {
         if (hasNormals) {
             const cv::Vec3f& n = normals(y, x);
-            if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
+            if (isfinite_bitwise(n[0]) && isfinite_bitwise(n[1]) && isfinite_bitwise(n[2])) {
                 return n;
             }
         }
@@ -2091,7 +2176,7 @@ static void readMultiSliceImpl(
             for (int x = 0; x < w; x++) {
                 const cv::Vec3f& bp = basePoints(y, x);
                 const cv::Vec3f& sd = stepDirs(y, x);
-                if (std::isnan(bp[0])) continue;
+                if (isnan_bitwise(bp[0])) continue;
 
                 for (float off : {fOff, lOff}) {
                     float vx = bp[0] + sd[0] * off;
@@ -2147,7 +2232,7 @@ static void readMultiSliceImpl(
             for (int x = 0; x < w; x++) {
                 const cv::Vec3f& bp = basePoints(y, x);
                 const cv::Vec3f& sd = stepDirs(y, x);
-                if (std::isnan(bp[0])) continue;
+                if (isnan_bitwise(bp[0])) continue;
 
                 float vx0 = bp[0] + sd[0] * firstOff;
                 float vy0 = bp[1] + sd[1] * firstOff;
@@ -2316,7 +2401,7 @@ static void sampleTileSlicesImpl(
             for (int x = 0; x < w; x++) {
                 const cv::Vec3f& bp = basePoints(y, x);
                 const cv::Vec3f& sd = stepDirs(y, x);
-                if (std::isnan(bp[0])) continue;
+                if (isnan_bitwise(bp[0])) continue;
 
                 for (float off : {fOff, lOff}) {
                     float vx = bp[0] + sd[0] * off;
@@ -2360,7 +2445,7 @@ static void sampleTileSlicesImpl(
         for (int x = 0; x < w; x++) {
             const cv::Vec3f& bp = basePoints(y, x);
             const cv::Vec3f& sd = stepDirs(y, x);
-            if (std::isnan(bp[0])) continue;
+            if (isnan_bitwise(bp[0])) continue;
 
             float vx0 = bp[0] + sd[0] * firstOff;
             float vy0 = bp[1] + sd[1] * firstOff;

@@ -132,14 +132,11 @@ if(VC_DEVELOPER_WARNINGS)
         -Wno-padded
         -Wno-global-constructors -Wno-exit-time-destructors
         -Wno-covered-switch-default -Wno-switch-enum
-        -Wno-float-equal
         -Wno-missing-prototypes -Wno-missing-variable-declarations
+        -Wno-comment
         -Wno-documentation -Wno-documentation-unknown-command
         -Wno-shadow -Wno-shadow-field -Wno-shadow-field-in-constructor
         -Wno-shadow-uncaptured-local
-        -Wno-implicit-int-conversion -Wno-implicit-float-conversion
-        -Wno-implicit-int-float-conversion -Wno-shorten-64-to-32
-        -Wno-sign-conversion -Wno-double-promotion
         -Wno-disabled-macro-expansion -Wno-reserved-macro-identifier
         -Wno-reserved-identifier
         -Wno-newline-eof -Wno-extra-semi-stmt -Wno-extra-semi
@@ -150,7 +147,7 @@ if(VC_DEVELOPER_WARNINGS)
         -Wno-ctad-maybe-unsupported -Wno-undefined-reinterpret-cast
         -Wno-format-nonliteral
         -Wno-nested-anon-types -Wno-gnu-anonymous-struct
-        -Wno-nan-infinity-disabled -Wno-switch-default
+        -Wno-switch-default
         -Wno-thread-safety-negative -Wno-nrvo -Wno-unused-lambda-capture
     )
     message(STATUS "Developer warnings enabled (-Weverything with sensible exclusions)")

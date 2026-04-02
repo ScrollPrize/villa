@@ -23,7 +23,7 @@ namespace vc::render {
 // All public methods must be called from a single thread (the "main" thread).
 // The tick() method should be called periodically (~60 Hz) to drain results
 // and perform progressive refinement.
-class ViewportRenderer {
+class ViewportRenderer final {
 public:
     // Construct with an internal (owned) CoreRenderPool.
     explicit ViewportRenderer(int numThreads = 2);
@@ -32,7 +32,7 @@ public:
     // The caller must ensure the pool outlives this ViewportRenderer.
     explicit ViewportRenderer(CoreRenderPool* externalPool);
 
-    ~ViewportRenderer();
+    ~ViewportRenderer() noexcept;
 
     // Camera state changes (pan, zoom, slice offset).
     // Submits visible tiles to the background pool (skipping in-flight duplicates).
@@ -72,11 +72,11 @@ public:
     bool tick();
 
     // Access
-    TileGrid& tileGrid() { return _tileGrid; }
-    const TileGrid& tileGrid() const { return _tileGrid; }
-    CoreRenderPool& renderPool() { return *pool(); }
-    const CoreRenderPool& renderPool() const { return *pool(); }
-    int pendingCount() const;
+    [[nodiscard]] TileGrid& tileGrid() noexcept { return _tileGrid; }
+    [[nodiscard]] const TileGrid& tileGrid() const noexcept { return _tileGrid; }
+    [[nodiscard]] CoreRenderPool& renderPool() noexcept { return *pool(); }
+    [[nodiscard]] const CoreRenderPool& renderPool() const noexcept { return *pool(); }
+    [[nodiscard]] int pendingCount() const noexcept;
 
     // Callbacks
     void setTileReadyCallback(std::function<void()> cb);
@@ -88,21 +88,21 @@ public:
     // TileGrid metadata is updated BEFORE the callback; pixels are NOT stored in TileGrid.
     void setResultCallback(std::function<void(TileRenderResult&&)> cb) { _resultCallback = std::move(cb); }
 
-    void setProgressiveEnabled(bool enabled) { _progressiveEnabled = enabled; }
-    bool progressiveEnabled() const { return _progressiveEnabled; }
+    void setProgressiveEnabled(bool enabled) noexcept { _progressiveEnabled = enabled; }
+    [[nodiscard]] bool progressiveEnabled() const noexcept { return _progressiveEnabled; }
 
     // Controller identity (for shared pool routing)
-    int controllerId() const { return _controllerId; }
+    [[nodiscard]] int controllerId() const noexcept { return _controllerId; }
 
     // Current epoch
-    uint64_t epoch() const { return _currentEpoch->load(std::memory_order_relaxed); }
+    [[nodiscard]] uint64_t epoch() const noexcept { return _currentEpoch->load(std::memory_order_relaxed); }
 
 private:
     void drainResults();
 
     // Returns the active pool (owned or external).
-    CoreRenderPool* pool() { return _externalPool ? _externalPool : _renderPool.get(); }
-    const CoreRenderPool* pool() const { return _externalPool ? _externalPool : _renderPool.get(); }
+    [[nodiscard]] CoreRenderPool* pool() noexcept { return _externalPool ? _externalPool : _renderPool.get(); }
+    [[nodiscard]] const CoreRenderPool* pool() const noexcept { return _externalPool ? _externalPool : _renderPool.get(); }
 
     TileGrid _tileGrid;
     std::unique_ptr<CoreRenderPool> _renderPool;  // owned pool (null when using external)

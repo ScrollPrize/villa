@@ -397,6 +397,7 @@ struct LinChkDistLoss {
     LinChkDistLoss(const cv::Vec2d &p, float w) : _p(p), _w(w) {};
     template <typename T>
     bool operator()(const T* const p, T* residual) const {
+        using std::abs;
         T a = abs(p[0]-T(_p[0]));
         T b = abs(p[1]-T(_p[1]));
         if (a > T(0))
@@ -560,6 +561,7 @@ struct FiberDirectionLoss {
                                     + patch_u_disp_zyx[1] * patch_u_disp_zyx[1]
                                     + patch_u_disp_zyx[2] * patch_u_disp_zyx[2]
                                     + E(1e-12));
+        using std::abs;
         E const abs_dot = abs(patch_u_disp_zyx[0] * fiber_dir_zyx[0]
                               + patch_u_disp_zyx[1] * fiber_dir_zyx[1]
                               + patch_u_disp_zyx[2] * fiber_dir_zyx[2]) / patch_u_dist;
@@ -621,6 +623,7 @@ struct NormalDirectionLoss {
         };
         E const patch_normal_length = sqrt(patch_normal_zyx[0] * patch_normal_zyx[0] + patch_normal_zyx[1] * patch_normal_zyx[1] + patch_normal_zyx[2] * patch_normal_zyx[2]);
 
+        using std::abs;
         E const abs_dot = abs(patch_normal_zyx[0] * target_normal_zyx[0] + patch_normal_zyx[1] * target_normal_zyx[1] + patch_normal_zyx[2] * target_normal_zyx[2]) / patch_normal_length;
 
         E const weight_at_point = _maybe_weights ? E((*_maybe_weights)(unjet(l_base[2]), unjet(l_base[1]), unjet(l_base[0]))) : E(1);

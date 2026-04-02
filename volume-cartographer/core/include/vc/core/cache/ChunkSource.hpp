@@ -24,13 +24,13 @@ public:
     [[nodiscard]] virtual std::vector<uint8_t> fetch(const ChunkKey& key) = 0;
 
     // Number of pyramid levels available.
-    [[nodiscard]] virtual int numLevels() const = 0;
+    [[nodiscard]] virtual int numLevels() const noexcept = 0;
 
     // Chunk shape at a given level, in {z, y, x} order.
-    [[nodiscard]] virtual std::array<int, 3> chunkShape(int level) const = 0;
+    [[nodiscard]] virtual std::array<int, 3> chunkShape(int level) const noexcept = 0;
 
     // Full dataset shape at a given level, in {z, y, x} order.
-    [[nodiscard]] virtual std::array<int, 3> levelShape(int level) const = 0;
+    [[nodiscard]] virtual std::array<int, 3> levelShape(int level) const noexcept = 0;
 };
 
 // Reads compressed chunks from a local zarr v2 directory.
@@ -56,9 +56,9 @@ public:
         std::vector<LevelMeta> levels);
 
     [[nodiscard]] std::vector<uint8_t> fetch(const ChunkKey& key) override;
-    [[nodiscard]] int numLevels() const override;
-    [[nodiscard]] std::array<int, 3> chunkShape(int level) const override;
-    [[nodiscard]] std::array<int, 3> levelShape(int level) const override;
+    [[nodiscard]] int numLevels() const noexcept override;
+    [[nodiscard]] std::array<int, 3> chunkShape(int level) const noexcept override;
+    [[nodiscard]] std::array<int, 3> levelShape(int level) const noexcept override;
 
 private:
     std::filesystem::path chunkPath(const ChunkKey& key) const;
@@ -96,9 +96,9 @@ public:
     void setShardConfig(const ShardConfig& config);
 
     [[nodiscard]] std::vector<uint8_t> fetch(const ChunkKey& key) override;
-    [[nodiscard]] int numLevels() const override;
-    [[nodiscard]] std::array<int, 3> chunkShape(int level) const override;
-    [[nodiscard]] std::array<int, 3> levelShape(int level) const override;
+    [[nodiscard]] int numLevels() const noexcept override;
+    [[nodiscard]] std::array<int, 3> chunkShape(int level) const noexcept override;
+    [[nodiscard]] std::array<int, 3> levelShape(int level) const noexcept override;
 
     // Apply pre-computed auth to a CURL handle. outHeaders is appended to
     // (caller must free after curl_easy_perform).
@@ -107,8 +107,8 @@ public:
 private:
     std::string chunkUrl(const ChunkKey& key) const;
     std::string shardUrl(const ChunkKey& key) const;
-    int innerChunkIndex(const ChunkKey& key) const;
-    int totalChunksPerShard() const;
+    int innerChunkIndex(const ChunkKey& key) const noexcept;
+    int totalChunksPerShard() const noexcept;
 
     // Fetch entire shard file, cache it, extract chunk by inner index.
     std::vector<uint8_t> fetchFromShard(const ChunkKey& key);

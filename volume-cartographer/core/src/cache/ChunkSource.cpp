@@ -17,13 +17,13 @@ namespace vc::cache {
 
 using LevelMeta = FileSystemChunkSource::LevelMeta;
 
-static int levelsNumLevels(const std::vector<LevelMeta>& levels)
+static int levelsNumLevels(const std::vector<LevelMeta>& levels) noexcept
 {
     return static_cast<int>(levels.size());
 }
 
 static std::array<int, 3> levelsChunkShape(
-    const std::vector<LevelMeta>& levels, int level)
+    const std::vector<LevelMeta>& levels, int level) noexcept
 {
     if (level < 0 || level >= static_cast<int>(levels.size()))
         return {0, 0, 0};
@@ -31,7 +31,7 @@ static std::array<int, 3> levelsChunkShape(
 }
 
 static std::array<int, 3> levelsLevelShape(
-    const std::vector<LevelMeta>& levels, int level)
+    const std::vector<LevelMeta>& levels, int level) noexcept
 {
     if (level < 0 || level >= static_cast<int>(levels.size()))
         return {0, 0, 0};
@@ -120,9 +120,9 @@ std::vector<uint8_t> FileSystemChunkSource::fetch(const ChunkKey& key)
     return result ? std::move(*result) : std::vector<uint8_t>{};
 }
 
-int FileSystemChunkSource::numLevels() const { return levelsNumLevels(levels_); }
-std::array<int, 3> FileSystemChunkSource::chunkShape(int level) const { return levelsChunkShape(levels_, level); }
-std::array<int, 3> FileSystemChunkSource::levelShape(int level) const { return levelsLevelShape(levels_, level); }
+int FileSystemChunkSource::numLevels() const noexcept { return levelsNumLevels(levels_); }
+std::array<int, 3> FileSystemChunkSource::chunkShape(int level) const noexcept { return levelsChunkShape(levels_, level); }
+std::array<int, 3> FileSystemChunkSource::levelShape(int level) const noexcept { return levelsLevelShape(levels_, level); }
 
 // =============================================================================
 // HttpChunkSource
@@ -234,7 +234,7 @@ std::string HttpChunkSource::shardUrl(const ChunkKey& key) const
     return url;
 }
 
-int HttpChunkSource::innerChunkIndex(const ChunkKey& key) const
+int HttpChunkSource::innerChunkIndex(const ChunkKey& key) const noexcept
 {
     int iz = key.iz % chunksPerShard_[0];
     int iy = key.iy % chunksPerShard_[1];
@@ -242,7 +242,7 @@ int HttpChunkSource::innerChunkIndex(const ChunkKey& key) const
     return (iz * chunksPerShard_[1] + iy) * chunksPerShard_[2] + ix;
 }
 
-int HttpChunkSource::totalChunksPerShard() const
+int HttpChunkSource::totalChunksPerShard() const noexcept
 {
     return chunksPerShard_[0] * chunksPerShard_[1] * chunksPerShard_[2];
 }
@@ -399,8 +399,8 @@ std::vector<uint8_t> HttpChunkSource::fetch(const ChunkKey& key)
 #endif
 }
 
-int HttpChunkSource::numLevels() const { return levelsNumLevels(levels_); }
-std::array<int, 3> HttpChunkSource::chunkShape(int level) const { return levelsChunkShape(levels_, level); }
-std::array<int, 3> HttpChunkSource::levelShape(int level) const { return levelsLevelShape(levels_, level); }
+int HttpChunkSource::numLevels() const noexcept { return levelsNumLevels(levels_); }
+std::array<int, 3> HttpChunkSource::chunkShape(int level) const noexcept { return levelsChunkShape(levels_, level); }
+std::array<int, 3> HttpChunkSource::levelShape(int level) const noexcept { return levelsLevelShape(levels_, level); }
 
 }  // namespace vc::cache

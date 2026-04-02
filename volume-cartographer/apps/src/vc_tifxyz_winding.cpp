@@ -1,3 +1,4 @@
+#include <cmath>
 #include <iostream>
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Slicing.hpp"
@@ -145,7 +146,7 @@ IntersectVec getIntersects(const cv::Vec2i &seed, QuadSurface* surface)
     
     bool two_halves = false;
     for(int i=1;i<dist_locs.size()-1;i++) 
-        if (abs(dist_locs[i-1].first - dist_locs[i+1].first) < std::min(abs(dist_locs[i-1].first - dist_locs[i].first),abs(dist_locs[i].first - dist_locs[i+1].first))) {
+        if (std::abs(dist_locs[i-1].first - dist_locs[i+1].first) < std::min(std::abs(dist_locs[i-1].first - dist_locs[i].first),std::abs(dist_locs[i].first - dist_locs[i+1].first))) {
             two_halves = true;
         }
         
@@ -164,13 +165,13 @@ IntersectVec getIntersects(const cv::Vec2i &seed, QuadSurface* surface)
     dist_locs.erase(dist_locs.begin());
     dist_locs.erase(dist_locs.begin()+dist_locs.size()-1);
     
-    bool seed_in_a = (a.back().first == 0.01);
+    bool seed_in_a = (a.back().first == 0.01f);
     
     for(auto pair : dist_locs) {
         // std::cout << pair.first << std::endl;
-        if (abs(pair.first - a.back().first) < abs(pair.first - b.back().first)) {
+        if (std::abs(pair.first - a.back().first) < std::abs(pair.first - b.back().first)) {
             a.push_back(pair);
-            if (pair.first == 0.01)
+            if (pair.first == 0.01f)
                 seed_in_a = true;
         }
         else
@@ -227,7 +228,7 @@ float find_wind_x(cv::Mat_<float> &winding, cv::Vec2f &loc, float tgt_wind)
     if (!loc_valid_nan_xy(winding, loc))
         return -1;
     
-    float best_diff = abs(at_int(winding,loc)-tgt_wind);
+    float best_diff = std::abs(at_int(winding,loc)-tgt_wind);
     
     std::vector<cv::Vec2f> neighs = {{1,0},{-1,0}};
     
@@ -240,7 +241,7 @@ float find_wind_x(cv::Mat_<float> &winding, cv::Vec2f &loc, float tgt_wind)
             cv::Vec2f cand = loc + step*n;
             if (!loc_valid_nan_xy(winding, cand))
                 continue;
-            float diff = abs(at_int(winding,cand)-tgt_wind);
+            float diff = std::abs(at_int(winding,cand)-tgt_wind);
             if (diff < best_diff) {
                 best_diff = diff;
                 loc = cand;
@@ -560,7 +561,7 @@ int main(int argc, char *argv[])
                     if (wind_w(j,i) && wind_w(j,i+1)) {
                         float wind_g = winding(j,i+1) - winding(j,i);
                         wind_g = wind_g * wind_x_ref[i/wind_sd];
-                        winding_err(j,i) = abs(1-wind_g);
+                        winding_err(j,i) = std::abs(1-wind_g);
                     }
                 }
             // cv::imwrite("winding"+std::to_string(n)+".tif", winding);

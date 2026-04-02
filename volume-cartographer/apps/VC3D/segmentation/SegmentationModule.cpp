@@ -923,7 +923,7 @@ void SegmentationModule::applyEdits()
 
     // Capture delta for undo before applyPreview() clears edited vertices
     if (hadPendingChanges) {
-        captureUndoDelta();
+        (void)captureUndoDelta();
     }
 
     // Auto-approve edited regions if approval mask is active (you edited it, so it's reviewed)
@@ -1528,7 +1528,7 @@ void SegmentationModule::finishDrag()
 
     if (moved) {
         // Capture delta for undo before applyPreview() clears edited vertices
-        captureUndoDelta();
+        (void)captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
         if (_autoApprovalEnabled && _overlay && _overlay->hasApprovalMaskData()) {

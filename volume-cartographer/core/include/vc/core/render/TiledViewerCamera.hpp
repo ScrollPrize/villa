@@ -35,16 +35,16 @@ struct TiledViewerCamera {
     static constexpr float MAX_SCALE = 10.0f;
 
     // Bump epoch to invalidate all in-flight renders
-    void invalidate() { ++epoch; }
+    constexpr void invalidate() noexcept { ++epoch; }
 
     // Recalculate pyramid level from current scale.
     // numScales = volume->numScales()
-    void recalcPyramidLevel(int numScales);
+    void recalcPyramidLevel(int numScales) noexcept;
 
     // Snap scale to the nearest predefined zoom stop
-    static float roundScale(float s);
+    static float roundScale(float s) noexcept;
 
     // Step to the next (+1) or previous (-1) zoom stop from current scale.
     // |steps| > 1 skips multiple stops.  Returns the new scale.
-    static float stepScale(float current, int steps);
+    static float stepScale(float current, int steps) noexcept;
 };

@@ -27,7 +27,7 @@ struct OverlayColormapEntry {
     std::string id;
 };
 
-const std::vector<OverlayColormapSpec>& specs();
+const std::vector<OverlayColormapSpec>& specs() noexcept;
 const OverlayColormapSpec& resolve(const std::string& id);
 
 // Apply colormap and write directly into a caller-provided ARGB32 buffer.
@@ -36,11 +36,11 @@ const OverlayColormapSpec& resolve(const std::string& id);
 void makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec,
                 uint32_t* outBuf, int outStride);
 
-const std::vector<OverlayColormapEntry>& entries(EntryScope scope = EntryScope::OverlayCompatible);
+const std::vector<OverlayColormapEntry>& entries(EntryScope scope = EntryScope::OverlayCompatible) noexcept;
 
 // Non-temporal store for write-only ARGB32 output -- bypasses cache,
 // freeing cache lines for read-heavy LUT/chunk data.
-inline void nt_store_u32(uint32_t* dst, uint32_t val) {
+inline void nt_store_u32(uint32_t* dst, uint32_t val) noexcept {
 #if defined(__x86_64__)
     _mm_stream_si32(reinterpret_cast<int*>(dst), static_cast<int>(val));
 #elif defined(__aarch64__) && __has_builtin(__builtin_nontemporal_store)

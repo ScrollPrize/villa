@@ -122,7 +122,7 @@ void CPointCollectionWidget::setupUi()
 
     layout->addWidget(_collection_metadata_group);
  
-    connect(_absolute_winding_checkbox, &QCheckBox::stateChanged, this, &CPointCollectionWidget::onAbsoluteWindingChanged);
+    connect(_absolute_winding_checkbox, &QCheckBox::checkStateChanged, this, &CPointCollectionWidget::onAbsoluteWindingChanged);
     connect(_color_button, &QPushButton::clicked, this, &CPointCollectionWidget::onColorButtonClicked);
     connect(_fill_winding_plus_button, &QPushButton::clicked, this, &CPointCollectionWidget::onFillWindingPlusClicked);
     connect(_fill_winding_minus_button, &QPushButton::clicked, this, &CPointCollectionWidget::onFillWindingMinusClicked);
@@ -150,7 +150,7 @@ void CPointCollectionWidget::setupUi()
 
     layout->addWidget(_point_metadata_group);
  
-    connect(_winding_enabled_checkbox, &QCheckBox::stateChanged, this, &CPointCollectionWidget::onWindingEnabledChanged);
+    connect(_winding_enabled_checkbox, &QCheckBox::checkStateChanged, this, &CPointCollectionWidget::onWindingEnabledChanged);
     connect(_winding_spinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CPointCollectionWidget::onWindingEdited);
  
     layout->addStretch();
@@ -569,7 +569,7 @@ void CPointCollectionWidget::onNewNameClicked()
     selectCollection(new_id);
 }
 
-void CPointCollectionWidget::onAbsoluteWindingChanged(int state)
+void CPointCollectionWidget::onAbsoluteWindingChanged(Qt::CheckState state)
 {
     if (_selected_collection_id != 0) {
         const auto& collections = _point_collection->getAllCollections();
@@ -607,7 +607,7 @@ void CPointCollectionWidget::onWindingEdited(double value)
     }
 }
 
-void CPointCollectionWidget::onWindingEnabledChanged(int state)
+void CPointCollectionWidget::onWindingEnabledChanged(Qt::CheckState state)
 {
     if (_selected_point_id != 0) {
         auto point_opt = _point_collection->getPoint(_selected_point_id);

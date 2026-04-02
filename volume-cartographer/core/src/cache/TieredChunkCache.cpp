@@ -9,7 +9,7 @@
 
 namespace vc::cache {
 
-static bool isAllZero(const uint8_t* data, size_t size)
+static bool isAllZero(const uint8_t* data, size_t size) noexcept
 {
     const auto* p = reinterpret_cast<const uint64_t*>(data);
     size_t n8 = size / 8;
@@ -188,7 +188,7 @@ TieredChunkCache::~TieredChunkCache()
 // Bloom filter for negative cache (lock-free fast path)
 // =============================================================================
 
-void TieredChunkCache::bloomAdd(const ChunkKey& key)
+void TieredChunkCache::bloomAdd(const ChunkKey& key) noexcept
 {
     auto h = ChunkKeyHash{}(key);
     // Two hash functions derived from the single hash via golden ratio mixing
@@ -200,7 +200,7 @@ void TieredChunkCache::bloomAdd(const ChunkKey& key)
     negativeBloom_[idx2 / 64].fetch_or(1ULL << (idx2 % 64), std::memory_order_relaxed);
 }
 
-bool TieredChunkCache::bloomMayContain(const ChunkKey& key) const
+bool TieredChunkCache::bloomMayContain(const ChunkKey& key) const noexcept
 {
     auto h = ChunkKeyHash{}(key);
     auto h1 = h;
@@ -212,7 +212,7 @@ bool TieredChunkCache::bloomMayContain(const ChunkKey& key) const
     return b1 && b2;
 }
 
-void TieredChunkCache::bloomClear()
+void TieredChunkCache::bloomClear() noexcept
 {
     for (auto& word : negativeBloom_)
         word.store(0, std::memory_order_relaxed);
@@ -360,7 +360,7 @@ void TieredChunkCache::prefetchRegion(
     }
 }
 
-void TieredChunkCache::prefetchLevel(int level, PrefetchProgressCb progressCb)
+void TieredChunkCache::prefetchLevel(int level, const PrefetchProgressCb& progressCb)
 {
     if (level < 0 || level >= numLevels()) return;
 
@@ -441,7 +441,7 @@ void TieredChunkCache::loadCoarseLevel(int level)
                  level, coarseGrid_[0], coarseGrid_[1], coarseGrid_[2], total);
 }
 
-ChunkDataPtr TieredChunkCache::getCoarse(const ChunkKey& key) const
+ChunkDataPtr TieredChunkCache::getCoarse(const ChunkKey& key) const noexcept
 {
     if (key.level != coarseLevel_ || coarseData_.empty()) return nullptr;
     if (key.iz < 0 || key.iz >= coarseGrid_[0] ||
@@ -556,17 +556,17 @@ void TieredChunkCache::clearAll()
     }
 }
 
-int TieredChunkCache::numLevels() const
+int TieredChunkCache::numLevels() const noexcept
 {
     return source_ ? source_->numLevels() : 0;
 }
 
-std::array<int, 3> TieredChunkCache::chunkShape(int level) const
+std::array<int, 3> TieredChunkCache::chunkShape(int level) const noexcept
 {
     return source_ ? source_->chunkShape(level) : std::array<int, 3>{0, 0, 0};
 }
 
-std::array<int, 3> TieredChunkCache::levelShape(int level) const
+std::array<int, 3> TieredChunkCache::levelShape(int level) const noexcept
 {
     return source_ ? source_->levelShape(level) : std::array<int, 3>{0, 0, 0};
 }
@@ -637,7 +637,7 @@ void TieredChunkCache::removeChunkReadyListener(ChunkReadyCallbackId id)
     chunkReadyListeners_.erase(it, chunkReadyListeners_.end());
 }
 
-void TieredChunkCache::clearChunkArrivedFlag()
+void TieredChunkCache::clearChunkArrivedFlag() noexcept
 {
     chunkArrivedFlag_.store(false, std::memory_order_release);
 }

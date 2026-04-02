@@ -86,7 +86,7 @@ void IOPool::cancelPending()
     queue_.cancel_pending();
 }
 
-size_t IOPool::pendingCount() const
+size_t IOPool::pendingCount() const noexcept
 {
     return queue_.queued_count();
 }

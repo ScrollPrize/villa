@@ -627,9 +627,9 @@ uint64_t VCCollection::findOrCreateCollectionByName(const std::string& name)
 
     uint64_t new_id = getNextCollectionId();
     cv::Vec3f color = {
-        (float)rand() / RAND_MAX,
-        (float)rand() / RAND_MAX,
-        (float)rand() / RAND_MAX
+        static_cast<float>(rand()) / static_cast<float>(RAND_MAX),
+        static_cast<float>(rand()) / static_cast<float>(RAND_MAX),
+        static_cast<float>(rand()) / static_cast<float>(RAND_MAX)
     };
     _collections[new_id] = {new_id, name, {}, {}, color};
     emit collectionsAdded({new_id});

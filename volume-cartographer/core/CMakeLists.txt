@@ -73,6 +73,12 @@ target_link_libraries(vc_core PRIVATE
 
 target_compile_definitions(vc_core PUBLIC VC_USE_CURL)
 
+# Slicing.cpp is the hot sampling loop (87% of render time).
+# Force O3 + fast-math for maximum vectorization regardless of build type.
+set_source_files_properties(src/Slicing.cpp PROPERTIES
+    COMPILE_OPTIONS "-O3;-ffast-math"
+)
+
 # Precompiled headers for faster builds
 if(VC_USE_PCH)
 target_precompile_headers(vc_core PRIVATE

@@ -17,7 +17,7 @@ CoreRenderPool::CoreRenderPool(int numThreads)
 {
 }
 
-CoreRenderPool::~CoreRenderPool()
+CoreRenderPool::~CoreRenderPool() noexcept
 {
     cancelAll();
 }
@@ -111,7 +111,7 @@ bool CoreRenderPool::expireTimedOut()
     return true;
 }
 
-int CoreRenderPool::pendingCount() const
+int CoreRenderPool::pendingCount() const noexcept
 {
     return pendingCount_.load(std::memory_order_relaxed);
 }

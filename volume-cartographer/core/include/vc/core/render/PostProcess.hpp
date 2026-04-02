@@ -32,7 +32,7 @@ struct RenderPostProcessParams {
     std::string colormapId;
 
     // Convert to core params (without colormap)
-    PostProcessParams toCoreParams() const {
+    [[nodiscard]] constexpr PostProcessParams toCoreParams() const noexcept {
         PostProcessParams p;
         p.windowLow = windowLow;
         p.windowHigh = windowHigh;
@@ -64,6 +64,6 @@ void applyRenderPostProcess(cv::Mat_<uint8_t>& gray,
 // mapping, fusing directional lighting into the same LUT.
 void buildWindowLevelLut(std::array<uint32_t, 256>& lut,
                          float windowLow, float windowHigh,
-                         float lightFactor = 1.0f);
+                         float lightFactor = 1.0f) noexcept;
 
 }  // namespace vc

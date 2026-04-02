@@ -117,7 +117,7 @@ private:
     bool initializeCommandLineRunner(void);
 
     CTiledVolumeViewer *newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea);
-    void closeEvent(QCloseEvent* event);
+    void closeEvent(QCloseEvent* event) override;
 
     void setWidgetsEnabled(bool state);
 

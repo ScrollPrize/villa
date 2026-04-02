@@ -14,16 +14,16 @@ struct ChunkKey {
     int iy = 0;     // chunk index along y (height)
     int ix = 0;     // chunk index along x (width)
 
-    bool operator==(const ChunkKey& o) const noexcept
+    constexpr bool operator==(const ChunkKey& o) const noexcept
     {
         return level == o.level && iz == o.iz && iy == o.iy && ix == o.ix;
     }
 
-    bool operator!=(const ChunkKey& o) const noexcept { return !(*this == o); }
+    constexpr bool operator!=(const ChunkKey& o) const noexcept { return !(*this == o); }
 
     // Return the equivalent key at a coarser pyramid level.
     // Each level halves spatial resolution, so chunk indices halve.
-    [[nodiscard]] ChunkKey coarsen(int targetLevel) const noexcept
+    [[nodiscard]] constexpr ChunkKey coarsen(int targetLevel) const noexcept
     {
         if (targetLevel <= level) return *this;
         int shift = targetLevel - level;

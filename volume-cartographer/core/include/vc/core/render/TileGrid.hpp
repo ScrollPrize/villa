@@ -51,16 +51,16 @@ public:
     void clear();
 
     // Number of tiles that have no rendered content (level == -1).
-    int unfilledTileCount() const { return _unfilledCount; }
+    [[nodiscard]] int unfilledTileCount() const noexcept { return _unfilledCount; }
 
     // Content bounds
-    const ContentBounds& bounds() const { return _bounds; }
-    int cols() const { return _bounds.totalCols; }
-    int rows() const { return _bounds.totalRows; }
+    [[nodiscard]] const ContentBounds& bounds() const noexcept { return _bounds; }
+    [[nodiscard]] int cols() const noexcept { return _bounds.totalCols; }
+    [[nodiscard]] int rows() const noexcept { return _bounds.totalRows; }
 
     // Padding
-    float padX() const { return _padX; }
-    float padY() const { return _padY; }
+    [[nodiscard]] float padX() const noexcept { return _padX; }
+    [[nodiscard]] float padY() const noexcept { return _padY; }
 
     // Convert surface parameter coordinates to grid pixel coordinates.
     cv::Vec2f surfaceToGrid(float surfX, float surfY) const;
@@ -89,7 +89,7 @@ public:
     uint64_t tileVersion(const WorldTileKey& wk) const;
 
     // Metadata access (for staleness checks by TileScene)
-    const TileMetadata& metaAt(int idx) const { return _meta[idx]; }
+    [[nodiscard]] const TileMetadata& metaAt(int idx) const noexcept { return _meta[idx]; }
 
     // Timing access (for profiling)
     std::chrono::steady_clock::time_point tileSubmitTime(const WorldTileKey& wk) const;
