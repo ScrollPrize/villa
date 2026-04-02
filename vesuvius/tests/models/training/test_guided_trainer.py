@@ -70,7 +70,32 @@ def _make_synthetic_dataset(root: Path) -> Path:
     return data_root
 
 
-def _make_mgr(data_root: Path, guide_checkpoint: Path) -> SimpleNamespace:
+def _make_mgr(
+    data_root: Path,
+    guide_checkpoint: Path,
+    *,
+    guide_fusion_stage: str | None = None,
+    guide_loss_weight: float = 0.5,
+) -> SimpleNamespace:
+    guided_model_config = {
+        "features_per_stage": [8, 16, 32],
+        "n_stages": 3,
+        "n_blocks_per_stage": [1, 1, 1],
+        "n_conv_per_stage_decoder": [1, 1],
+        "kernel_sizes": [[3, 3, 3], [3, 3, 3], [3, 3, 3]],
+        "strides": [[1, 1, 1], [2, 2, 2], [2, 2, 2]],
+        "basic_encoder_block": "ConvBlock",
+        "basic_decoder_block": "ConvBlock",
+        "bottleneck_block": "BasicBlockD",
+        "separate_decoders": True,
+        "guide_backbone": str(guide_checkpoint),
+        "guide_freeze": True,
+        "guide_tokenbook_sample_rate": 1.0,
+        "input_shape": [16, 16, 16],
+    }
+    if guide_fusion_stage is not None:
+        guided_model_config["guide_fusion_stage"] = str(guide_fusion_stage)
+
     return SimpleNamespace(
         gpu_ids=None,
         use_ddp=False,
@@ -110,25 +135,10 @@ def _make_mgr(data_root: Path, guide_checkpoint: Path) -> SimpleNamespace:
         unlabeled_foreground_bbox_threshold=0.15,
         unlabeled_foreground_volumes=None,
         profile_augmentations=False,
-        guide_loss_weight=0.5,
+        guide_loss_weight=guide_loss_weight,
         guide_supervision_target="ink",
         train_num_dataloader_workers=0,
-        model_config={
-            "features_per_stage": [8, 16, 32],
-            "n_stages": 3,
-            "n_blocks_per_stage": [1, 1, 1],
-            "n_conv_per_stage_decoder": [1, 1],
-            "kernel_sizes": [[3, 3, 3], [3, 3, 3], [3, 3, 3]],
-            "strides": [[1, 1, 1], [2, 2, 2], [2, 2, 2]],
-            "basic_encoder_block": "ConvBlock",
-            "basic_decoder_block": "ConvBlock",
-            "bottleneck_block": "BasicBlockD",
-            "separate_decoders": True,
-            "guide_backbone": str(guide_checkpoint),
-            "guide_freeze": True,
-            "guide_tokenbook_sample_rate": 1.0,
-            "input_shape": [16, 16, 16],
-        },
+        model_config=guided_model_config,
     )
 
 
@@ -183,6 +193,42 @@ def test_guided_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path:
 
     assert isinstance(output, dict)
     assert set(output.keys()) == {"ink"}
+
+
+def test_feature_encoder_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="feature_encoder",
+        guide_loss_weight=0.0,
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model()
+    checkpoint_path = tmp_path / "feature_encoder_model.pth"
+    torch.save({"model_config": model.final_config, "model": model.state_dict()}, checkpoint_path)
+
+    output_dir = tmp_path / "inference_out_feature_encoder"
+    output_dir.mkdir()
+    inferer = Inferer(
+        model_path=str(checkpoint_path),
+        input_dir=str(data_root / "images" / "volume1.zarr"),
+        output_dir=str(output_dir),
+        input_format="zarr",
+        do_tta=False,
+        device="cpu",
+        num_dataloader_workers=0,
+        model_type="train_py",
+    )
+
+    model_info = inferer._load_train_py_model(checkpoint_path)
+    output = model_info["network"](torch.randn(1, 1, 16, 16, 16))
+
+    assert isinstance(output, dict)
+    assert set(output.keys()) == {"ink"}
+    assert model_info["network"].final_config["guide_fusion_stage"] == "feature_encoder"
 
 
 def test_inferer_finalize_output_batch_returns_float16_numpy():
@@ -244,7 +290,7 @@ def test_trainer_builds_guide_preview_and_media_payload():
     assert guide_preview is not None
     assert guide_preview.ndim == 3
     assert guide_preview.shape[2] == 3
-    assert set(payload.keys()) == {"debug_image"}
+    assert set(payload.keys()) == {"debug_image", "debug_guide_image"}
 
 
 def test_trainer_builds_only_standard_debug_payload_when_no_guide_preview():
@@ -263,8 +309,7 @@ def test_guided_base_trainer_omits_guide_loss_when_weight_is_zero(tmp_path: Path
     data_root = _make_synthetic_dataset(tmp_path)
     guide_checkpoint = tmp_path / "guide_backbone.pt"
     _write_local_guide_checkpoint(guide_checkpoint)
-    mgr = _make_mgr(data_root, guide_checkpoint)
-    mgr.guide_loss_weight = 0.0
+    mgr = _make_mgr(data_root, guide_checkpoint, guide_loss_weight=0.0)
     trainer = BaseTrainer(mgr=mgr, verbose=False)
     model = trainer._build_model().to(trainer.device)
     loss_fns = trainer._build_loss()
@@ -276,6 +321,49 @@ def test_guided_base_trainer_omits_guide_loss_when_weight_is_zero(tmp_path: Path
 
     assert torch.isfinite(loss)
     assert "guide_mask" not in task_losses
+
+
+def test_feature_encoder_base_trainer_smoke_runs_two_training_steps_without_aux_guide_loss(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="feature_encoder",
+        guide_loss_weight=0.0,
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model().to(trainer.device)
+    loss_fns = trainer._build_loss()
+    dataset = trainer._configure_dataset(is_training=True)
+    batch = next(iter(DataLoader(dataset, batch_size=1, shuffle=False)))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    for _step in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        _inputs, targets_dict, outputs = trainer._get_model_outputs(model, batch)
+        loss, task_losses = trainer._compute_train_loss(outputs, targets_dict, loss_fns)
+        assert torch.isfinite(loss)
+        assert "guide_mask" not in task_losses
+        assert set(trainer._current_aux_outputs.keys()) == {"enc_0", "enc_1", "enc_2"}
+        loss.backward()
+        optimizer.step()
+
+
+def test_feature_encoder_rejects_nonzero_guide_loss_weight(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="feature_encoder",
+        guide_loss_weight=0.25,
+    )
+
+    with pytest.raises(ValueError, match="guide_loss_weight"):
+        BaseTrainer(mgr=mgr, verbose=False)
 
 
 def test_prepare_metrics_for_logging_includes_guide_loss_entries():
@@ -295,6 +383,60 @@ def test_prepare_metrics_for_logging_includes_guide_loss_entries():
     assert metrics["val_loss_ink"] == pytest.approx(0.5)
     assert metrics["val_loss_guide_mask"] == pytest.approx(0.25)
     assert metrics["val_loss_total"] == pytest.approx(0.375)
+
+
+def test_feature_encoder_aux_outputs_stay_out_of_debug_composite():
+    mgr = _make_mgr(
+        Path("/tmp/guide_backbone.pt"),
+        Path("/tmp/guide_backbone.pt"),
+        guide_fusion_stage="feature_encoder",
+        guide_loss_weight=0.0,
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    aux_outputs_dict = {
+        "enc_0": torch.ones((1, 1, 8, 8, 8), dtype=torch.float32),
+        "enc_1": torch.ones((1, 1, 4, 4, 4), dtype=torch.float32),
+    }
+
+    prepared = trainer._prepare_aux_debug_outputs(
+        aux_outputs_dict,
+        torch.zeros((1, 1, 8, 8, 8), dtype=torch.float32),
+    )
+
+    assert prepared == {}
+
+
+def test_feature_encoder_trainer_builds_stage_montage_and_media_payload(tmp_path: Path):
+    mgr = _make_mgr(
+        tmp_path,
+        tmp_path / "guide_backbone.pt",
+        guide_fusion_stage="feature_encoder",
+        guide_loss_weight=0.0,
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    aux_outputs_dict = {
+        "enc_0": torch.zeros((1, 1, 8, 8, 8), dtype=torch.float32),
+        "enc_1": torch.zeros((1, 1, 4, 4, 4), dtype=torch.float32),
+        "enc_2": torch.zeros((1, 1, 2, 2, 2), dtype=torch.float32),
+    }
+    aux_outputs_dict["enc_0"][:, :, 4] = 1.0
+    aux_outputs_dict["enc_1"][:, :, 2] = 1.0
+    aux_outputs_dict["enc_2"][:, :, 1] = 1.0
+
+    guide_preview = trainer._make_feature_encoder_guide_preview_image(aux_outputs_dict)
+    save_path = tmp_path / "guide_preview.png"
+    trainer._save_preview_image(guide_preview, save_path)
+    payload = trainer._build_debug_media_payload(
+        debug_preview_image=np.zeros((8, 8, 3), dtype=np.uint8),
+        guide_preview_image=guide_preview,
+    )
+
+    assert guide_preview is not None
+    assert guide_preview.ndim == 3
+    assert guide_preview.shape[2] == 3
+    assert guide_preview.shape[:2] == (38, 24)
+    assert save_path.exists()
+    assert set(payload.keys()) == {"debug_image", "debug_guide_image"}
 
 
 class _DummyDataset:

@@ -3,6 +3,7 @@ from copy import deepcopy
 import os
 from time import perf_counter
 from datetime import datetime
+from PIL import Image
 from tqdm import tqdm
 import numpy as np
 import torch
@@ -14,7 +15,7 @@ from torch.utils.data import DataLoader, SubsetRandomSampler, Subset, WeightedRa
 from torch.utils.data.distributed import DistributedSampler
 from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.datasets import ZarrDataset
-from vesuvius.utils.plotting import save_debug, convert_slice_to_bgr, _compute_display_value_range
+from vesuvius.utils.plotting import save_debug, convert_slice_to_bgr, _compute_display_value_range, add_text_label
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
 from vesuvius.models.training.loss.losses import _create_loss
@@ -166,6 +167,12 @@ class BaseTrainer:
         self._volume_dilate_by_name = {}
         self.guide_loss_weight = float(getattr(self.mgr, "guide_loss_weight", 0.0))
         self.guide_supervision_target = getattr(self.mgr, "guide_supervision_target", None)
+        model_config = getattr(self.mgr, "model_config", {}) or {}
+        self.guide_fusion_stage = str(model_config.get("guide_fusion_stage", "input")).strip().lower()
+        if self.guide_fusion_stage == "feature_encoder" and self.guide_loss_weight > 0.0:
+            raise ValueError(
+                "guide_loss_weight must be 0.0 when model_config.guide_fusion_stage='feature_encoder'"
+            )
         self._current_aux_outputs = {}
         self.compile_policy = str(getattr(self.mgr, "compile_policy", "auto")).strip().lower()
         self.startup_timing = bool(getattr(self.mgr, "startup_timing", False))
@@ -596,6 +603,79 @@ class BaseTrainer:
             prepared[f"guide_{self._resolve_guide_supervision_target_name()}"] = upsampled.detach()
         return prepared
 
+    @staticmethod
+    def _is_feature_encoder_aux_output(name: str) -> bool:
+        raw = str(name).strip().lower()
+        if not raw.startswith("enc_"):
+            return False
+        try:
+            int(raw.split("_", 1)[1])
+        except (IndexError, ValueError):
+            return False
+        return True
+
+    def _make_feature_encoder_guide_preview_image(self, aux_outputs_dict):
+        if not aux_outputs_dict:
+            return None
+
+        stage_items = [
+            (name, tensor)
+            for name, tensor in aux_outputs_dict.items()
+            if self._is_feature_encoder_aux_output(name) and isinstance(tensor, torch.Tensor)
+        ]
+        if not stage_items:
+            return None
+
+        stage_items.sort(key=lambda item: int(str(item[0]).split("_", 1)[1]))
+        rendered_panels = []
+        max_height = 0
+        max_width = 0
+
+        for aux_name, aux_tensor in stage_items:
+            aux_tensor = aux_tensor.float() if aux_tensor.dtype == torch.bfloat16 else aux_tensor
+            aux_np = aux_tensor.detach().cpu().numpy()
+            while aux_np.ndim > 4:
+                aux_np = aux_np[0]
+            if aux_np.ndim == 4:
+                aux_np = aux_np[0]
+
+            if aux_np.ndim == 2:
+                preview_slice = aux_np
+                is_2d = True
+            else:
+                preview_slice = aux_np[max(aux_np.shape[0] // 2, 0)]
+                is_2d = False
+
+            value_range = _compute_display_value_range(
+                aux_np,
+                is_2d_run=is_2d,
+                task_name=aux_name,
+                task_cfg={},
+            )
+            preview = convert_slice_to_bgr(preview_slice, value_range=value_range)
+            rendered_panels.append((aux_name, np.ascontiguousarray(preview, dtype=np.uint8)))
+            max_height = max(max_height, preview.shape[0])
+            max_width = max(max_width, preview.shape[1])
+
+        labeled_panels = []
+        for aux_name, preview in rendered_panels:
+            if preview.shape[0] != max_height or preview.shape[1] != max_width:
+                preview = np.array(
+                    Image.fromarray(preview).resize((max_width, max_height), resample=Image.Resampling.NEAREST),
+                    dtype=np.uint8,
+                )
+            labeled_panels.append(add_text_label(preview, aux_name))
+
+        return np.ascontiguousarray(np.hstack(labeled_panels), dtype=np.uint8)
+
+    @staticmethod
+    def _save_preview_image(preview_image, save_path):
+        if preview_image is None or save_path is None:
+            return
+        out_path = Path(save_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(np.ascontiguousarray(preview_image, dtype=np.uint8)).save(out_path)
+
     def _make_aux_preview_image(self, aux_outputs_dict):
         if not aux_outputs_dict:
             return None
@@ -631,7 +711,7 @@ class BaseTrainer:
 
     def _build_debug_media_payload(self, debug_preview_image=None, guide_preview_image=None):
         payload = {}
-        for key, image in (("debug_image", debug_preview_image),):
+        for key, image in (("debug_image", debug_preview_image), ("debug_guide_image", guide_preview_image)):
             if image is None:
                 continue
             image_to_log = image
@@ -2178,12 +2258,17 @@ class BaseTrainer:
                                             outputs_dict_first[t_name] = p_val[0][b_idx: b_idx + 1]
                                         else:
                                             outputs_dict_first[t_name] = p_val[b_idx: b_idx + 1]
+                                    raw_aux_outputs_dict_first = self._slice_aux_outputs_for_debug(
+                                        getattr(self, "_current_aux_outputs", {}),
+                                        b_idx,
+                                    )
                                     aux_outputs_dict_first = self._prepare_aux_debug_outputs(
-                                        self._slice_aux_outputs_for_debug(getattr(self, "_current_aux_outputs", {}), b_idx),
+                                        raw_aux_outputs_dict_first,
                                         inputs_first,
                                     )
                                     # Use human-friendly 1-based epoch numbering in debug image filenames
                                     debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_debug_epoch{epoch + 1}.gif"
+                                    guide_debug_img_path = f"{ckpt_dir}/{self.mgr.model_name}_guide_epoch{epoch + 1}.png"
                                     
                                     # handle skel data from skeleton-based losses
                                     skeleton_dict = None
@@ -2232,6 +2317,11 @@ class BaseTrainer:
                                             unlabeled_outputs_dict=unlabeled_pred,
                                             save_media=save_debug_media,
                                         )
+                                        debug_guide_preview_image = self._make_feature_encoder_guide_preview_image(
+                                            raw_aux_outputs_dict_first
+                                        )
+                                        if save_debug_media and debug_guide_preview_image is not None:
+                                            self._save_preview_image(debug_guide_preview_image, guide_debug_img_path)
                                         if save_debug_media:
                                             debug_gif_history.append((epoch, debug_img_path))
 
