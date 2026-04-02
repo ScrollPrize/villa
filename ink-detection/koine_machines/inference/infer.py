@@ -218,6 +218,34 @@ def inference_depth_from_config(config: dict[str, Any]) -> int:
     )
 
 
+def parse_gpu_ids(value: str | None) -> list[int]:
+    if value is None:
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+
+    gpu_ids: list[int] = []
+    seen: set[int] = set()
+    for raw_part in text.split(","):
+        part = raw_part.strip()
+        if not part:
+            raise ValueError("--gpus must be a comma-separated list like 0,1,2,3")
+        try:
+            gpu_id = int(part)
+        except ValueError as exc:
+            raise ValueError(
+                f"--gpus entries must be integers, got {part!r} in {text!r}"
+            ) from exc
+        if gpu_id < 0:
+            raise ValueError(f"--gpus entries must be non-negative, got {gpu_id}")
+        if gpu_id in seen:
+            raise ValueError(f"--gpus cannot contain duplicate device ids, got {text!r}")
+        seen.add(gpu_id)
+        gpu_ids.append(gpu_id)
+    return gpu_ids
+
+
 def compute_importance_map_2d(
     *,
     patch_size: tuple[int, int],
@@ -312,6 +340,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Maximum number of mirror TTA variants to evaluate per forward pass. Defaults to all variants.",
     )
+    parser.add_argument(
+        "--gpus",
+        default=None,
+        help=(
+            "Comma-separated CUDA device ids to use for inference, for example 0 or 0,1,2,3. "
+            "When multiple GPUs are provided, each inference batch is split across those devices."
+        ),
+    )
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
     parser.set_defaults(compile_model=True)
@@ -320,6 +356,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--tta-batch-size must be a positive integer")
     if int(args.prefetch_factor) <= 0:
         parser.error("--prefetch-factor must be a positive integer")
+    try:
+        args.gpu_ids = parse_gpu_ids(args.gpus)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 
@@ -1190,6 +1230,51 @@ def maybe_compile_model(
     return compiled_model
 
 
+def prepare_model_for_inference(
+    *,
+    args: argparse.Namespace,
+    configured_model: ConfiguredModel,
+) -> tuple[ConfiguredModel, torch.device, bool]:
+    requested_gpu_ids = tuple(int(gpu_id) for gpu_id in getattr(args, "gpu_ids", []))
+    compile_enabled = bool(args.compile_model)
+
+    if requested_gpu_ids:
+        if not torch.cuda.is_available():
+            raise ValueError("--gpus was provided, but CUDA is not available in this environment.")
+        available_gpu_count = int(torch.cuda.device_count())
+        invalid_gpu_ids = [gpu_id for gpu_id in requested_gpu_ids if gpu_id >= available_gpu_count]
+        if invalid_gpu_ids:
+            raise ValueError(
+                f"Requested CUDA device ids {invalid_gpu_ids!r} are unavailable; "
+                f"visible device count is {available_gpu_count}."
+            )
+        device = torch.device(f"cuda:{requested_gpu_ids[0]}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    configured_model.model = configured_model.model.to(device)
+
+    if len(requested_gpu_ids) > 1:
+        if compile_enabled:
+            LOGGER.warning(
+                "Disabling torch.compile because multi-GPU inference uses DataParallel over --gpus=%s.",
+                ",".join(str(gpu_id) for gpu_id in requested_gpu_ids),
+            )
+            compile_enabled = False
+        configured_model.model = nn.DataParallel(
+            configured_model.model,
+            device_ids=list(requested_gpu_ids),
+            output_device=requested_gpu_ids[0],
+        )
+
+    configured_model.model = maybe_compile_model(
+        configured_model.model,
+        enabled=compile_enabled,
+        mode=str(args.compile_mode),
+    )
+    return configured_model, device, compile_enabled
+
+
 def run_block_inference(
     *,
     loader: DataLoader,
@@ -1328,9 +1413,11 @@ def infer_single_zarr(
     args: argparse.Namespace,
     input_zarr: str | Path,
     configured_model: ConfiguredModel,
+    device: torch.device,
     output_tiff: Path,
     layer_direction: str = "forward",
 ) -> None:
+    requested_gpu_ids = tuple(int(gpu_id) for gpu_id in getattr(args, "gpu_ids", []))
     resolution = str(args.resolution)
     root = open_zarr_readonly(input_zarr)
     if isinstance(root, zarr.Array):
@@ -1443,16 +1530,23 @@ def infer_single_zarr(
     )
     LOGGER.info("Selected %d patches for inference.", len(blocks))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset = OmeZarrBlockDataset(
         reader=reader,
         blocks=blocks,
         patch_size=patch_size,
         preprocessing=configured_model.preprocessing,
     )
+    effective_batch_size = int(args.batch_size) * max(1, len(requested_gpu_ids))
+    if len(requested_gpu_ids) > 1:
+        LOGGER.info(
+            "Using per-device batch_size=%d across %d GPUs (effective loader batch_size=%d).",
+            int(args.batch_size),
+            len(requested_gpu_ids),
+            effective_batch_size,
+        )
     loader_kwargs = {
         "dataset": dataset,
-        "batch_size": int(args.batch_size),
+        "batch_size": effective_batch_size,
         "shuffle": False,
         "num_workers": int(args.num_workers),
         "pin_memory": device.type == "cuda",
@@ -1552,7 +1646,12 @@ def resolve_segment_zarr_path(segment_dir: Path) -> Path:
     )
 
 
-def infer_folder(args: argparse.Namespace, configured_model: ConfiguredModel) -> None:
+def infer_folder(
+    args: argparse.Namespace,
+    configured_model: ConfiguredModel,
+    *,
+    device: torch.device,
+) -> None:
     folder = Path(args.folder)
     if not folder.exists() or not folder.is_dir():
         raise NotADirectoryError(f"--folder is not a directory: {folder}")
@@ -1593,6 +1692,7 @@ def infer_folder(args: argparse.Namespace, configured_model: ConfiguredModel) ->
             infer_single_zarr(
                 args=args,
                 configured_model=configured_model,
+                device=device,
                 input_zarr=input_zarr,
                 output_tiff=output_tiff,
                 layer_direction=direction,
@@ -1640,23 +1740,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         torch.set_float32_matmul_precision("high")
 
     configured_model = configure_model(args)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    configured_model.model = configured_model.model.to(device)
-    configured_model.model = maybe_compile_model(
-        configured_model.model,
-        enabled=bool(args.compile_model),
-        mode=str(args.compile_mode),
+    configured_model, device, compile_enabled = prepare_model_for_inference(
+        args=args,
+        configured_model=configured_model,
     )
+    if getattr(args, "gpu_ids", []):
+        if len(args.gpu_ids) == 1:
+            LOGGER.info("Using CUDA device %d for inference.", int(args.gpu_ids[0]))
+        else:
+            LOGGER.info(
+                "Using CUDA devices %s for inference via DataParallel.",
+                ",".join(str(int(gpu_id)) for gpu_id in args.gpu_ids),
+            )
+    else:
+        LOGGER.info("Using device %s for inference.", device)
     LOGGER.info(
         "Configured model source=%s roi_size=%d in_chans=%d preprocessing=%s compile=%s",
         configured_model.source,
         configured_model.roi_size,
         configured_model.in_chans,
         configured_model.preprocessing,
-        bool(args.compile_model),
+        bool(compile_enabled),
     )
     if args.folder is not None:
-        infer_folder(args=args, configured_model=configured_model)
+        infer_folder(args=args, configured_model=configured_model, device=device)
     else:
         for direction in resolve_run_directions(args.direction):
             output_tiff = resolve_single_output_path(
@@ -1668,6 +1775,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             infer_single_zarr(
                 args=args,
                 configured_model=configured_model,
+                device=device,
                 input_zarr=args.input_zarr,
                 output_tiff=output_tiff,
                 layer_direction=direction,
