@@ -57,14 +57,6 @@ _NATIVE_3D_TRAINING_MODES = {"normal_pooled_3d", "full_3d"}
 def _is_native_3d_training_mode(mode):
     return str(mode).strip().lower() in _NATIVE_3D_TRAINING_MODES
 
-
-def _drop_normal_pooling_feature_head_config(config: dict) -> dict:
-    normal_pooling = config.get('normal_pooling')
-    if isinstance(normal_pooling, dict):
-        normal_pooling.pop('feature_head', None)
-    return normal_pooling if isinstance(normal_pooling, dict) else {}
-
-
 def _build_full_3d_preview_batch(
     batch: dict,
     preds: torch.Tensor,
@@ -161,7 +153,6 @@ def train(config_path):
     mode = str(config.get('mode', 'flat')).strip().lower()
     native_3d_mode = _is_native_3d_training_mode(mode)
     normal_pooled_mode = mode == 'normal_pooled_3d'
-    pooling_config = _drop_normal_pooling_feature_head_config(config)
     deep_supervision_enabled = bool(config.get('enable_deep_supervision', False))
     model_type = str(config.get('model_type', '')).strip().lower()
     
@@ -571,24 +562,13 @@ def train(config_path):
             train_preview_ignore_mask = ignore_mask.detach()
             train_preview_volume_logits = (preds[0] if isinstance(preds, (list, tuple)) else preds).detach() if normal_pooled_mode else None
             if mode == 'full_3d':
-                (
-                    train_preview_batch,
-                    train_preview_preds,
-                    train_preview_targets,
-                    train_preview_ignore_mask,
-                ) = _build_full_3d_preview_batch(
+                (train_preview_batch,train_preview_preds,train_preview_targets,train_preview_ignore_mask) = _build_full_3d_preview_batch(
                     batch,
                     train_preview_preds,
                     train_preview_targets,
                     train_preview_ignore_mask,
                 )
-            train_preview.add_batch(
-                train_preview_batch,
-                train_preview_preds,
-                train_preview_targets,
-                train_preview_ignore_mask,
-                volume_logits=train_preview_volume_logits,
-            )
+            train_preview.add_batch(train_preview_batch,train_preview_preds,train_preview_targets,train_preview_ignore_mask,volume_logits=train_preview_volume_logits)
             model.eval()
             val_loss_total = torch.zeros((), device=accelerator.device, dtype=torch.float32)
             val_loss_batches = torch.zeros((), device=accelerator.device, dtype=torch.float32)
@@ -608,9 +588,7 @@ def train(config_path):
                     refresh_progress_bar(train_loss)
                 continue
             val_iterator = iter(val_dl)
-            preview_batch_indices = set(
-                random.sample(range(num_val_batches), k=min(val_preview_batches, num_val_batches))
-            )
+            preview_batch_indices = set(random.sample(range(num_val_batches), k=min(val_preview_batches, num_val_batches)))
             with torch.no_grad():
                 for val_batch_idx in range(num_val_batches):
                     val_batch = next(val_iterator)
@@ -622,10 +600,8 @@ def train(config_path):
                             stitched=use_stitched_forward,
                             use_gradient_checkpointing=stitched_gradient_checkpointing,
                         )
-                    val_loss_preds, val_targets, val_ignore_mask = prepare_loss_inputs(
-                        val_preds,
-                        val_batch,
-                    )
+                        
+                    val_loss_preds, val_targets, val_ignore_mask = prepare_loss_inputs(val_preds,val_batch)
                     primary_val_loss_preds = val_loss_preds[0] if isinstance(val_loss_preds, (list, tuple)) else val_loss_preds
                     preview_preds = primary_val_loss_preds
                     preview_volume_preds = val_preds[0] if isinstance(val_preds, (list, tuple)) else val_preds
@@ -659,11 +635,7 @@ def train(config_path):
                             valid_mask=(val_ignore_mask <= 0).detach(),
                         )
                     )
-                    gathered_batch_counts = accelerator.gather_for_metrics(
-                        torch.stack(
-                            (batch_counts.tp, batch_counts.fp, batch_counts.fn, batch_counts.tn)
-                        ).unsqueeze(0)
-                    )
+                    gathered_batch_counts = accelerator.gather_for_metrics(torch.stack((batch_counts.tp, batch_counts.fp, batch_counts.fn, batch_counts.tn)).unsqueeze(0))
                     validation_counts = Confusion.add_counts(
                         validation_counts,
                         ConfusionCounts(
@@ -682,10 +654,8 @@ def train(config_path):
                                 stitched=use_stitched_forward,
                                 use_gradient_checkpointing=stitched_gradient_checkpointing,
                             )
-                        ema_val_loss_preds, _, _ = prepare_loss_inputs(
-                            ema_val_preds,
-                            val_batch,
-                        )
+                            
+                        ema_val_loss_preds, _, _ = prepare_loss_inputs(ema_val_preds,val_batch)
                         ema_val_targets_with_ignore = build_deep_supervision_targets(val_targets, ema_val_loss_preds, mode='nearest')
                         ds_ignore = build_deep_supervision_targets(val_ignore_mask, ema_val_loss_preds, mode='nearest')
                         ema_val_targets_with_ignore = (
