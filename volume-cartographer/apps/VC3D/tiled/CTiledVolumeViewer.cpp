@@ -681,6 +681,7 @@ void CTiledVolumeViewer::rebuildContentGrid()
 
     QSize vpSize = fGraphicsView->viewport()->size();
     _tileScene->rebuildGrid(bounds, vpSize.width(), vpSize.height());
+    _renderController->syncGridBounds(bounds, vpSize.width(), vpSize.height());
 }
 
 void CTiledVolumeViewer::centerViewport()
@@ -881,8 +882,7 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
         }
     }
 
-    // Immediate zoom: rebuild grid and render right now. Retained tile layer
-    // + synchronous coarse fill prevent any gray flash. No debounce delay.
+    // Immediate zoom: rebuild grid and render right now.
     fGraphicsView->resetTransform();
     rebuildContentGrid();
     centerViewport();

@@ -8,17 +8,18 @@
 #include <vector>
 
 #include "TileRenderer.hpp"
-#include <utils/thread_pool.hpp>
+#include "vc/core/render/CoreRenderPool.hpp"
 
 class Surface;
 class Volume;
 
-// Background tile rendering pool.
+// Background tile rendering pool (Qt wrapper around CoreRenderPool).
 // Workers render tiles off the main thread. Completed results are
-// collected by the main thread via drainCompleted().
+// collected by the main thread via drainCompleted(), which converts
+// raw pixel buffers to QPixmaps.
 //
-// Internally uses utils::PriorityThreadPool with epoch-based stale
-// task filtering to replace QThreadPool.
+// Internally delegates to vc::render::CoreRenderPool for thread pool
+// management, task submission, and result storage.
 class RenderPool : public QObject
 {
     Q_OBJECT
@@ -38,7 +39,8 @@ public:
 
     // Take up to maxResults completed results belonging to controllerId.
     // Results with epoch < minEpoch are discarded.
-    std::vector<TileRenderResult> drainCompleted(int maxResults, uint64_t minEpoch, int controllerId);
+    // Converts raw pixel buffers to QPixmaps on the calling thread.
+    std::vector<QtTileRenderResult> drainCompleted(int maxResults, uint64_t minEpoch, int controllerId);
 
     // Cancel all pending work and clear results.  With a shared pool this
     // only resets bookkeeping — it does NOT call cancel_pending on the
@@ -53,18 +55,15 @@ public:
     // Returns true if the count was reset.
     bool expireTimedOut();
 
+    // Access the underlying core pool (for ViewportRenderer integration)
+    vc::render::CoreRenderPool& corePool() { return *corePool_; }
+    const vc::render::CoreRenderPool& corePool() const { return *corePool_; }
+
 signals:
     // Emitted (from worker thread) when a result is ready.
     // Connect with Qt::QueuedConnection to receive on main thread.
     void tileReady();
 
 private:
-    // Called from worker threads when a render completes.
-    void pushResult(TileRenderResult result);
-
-    std::unique_ptr<utils::PriorityThreadPool> pool_;
-    std::mutex resultsMutex_;
-    std::vector<TileRenderResult> completedResults_;
-    std::atomic<int> pendingCount_{0};
-    std::atomic<bool> resultSignalPending_{false};  // debounce tileReady emission
+    std::unique_ptr<vc::render::CoreRenderPool> corePool_;
 };

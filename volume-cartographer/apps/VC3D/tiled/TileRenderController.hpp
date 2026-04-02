@@ -9,19 +9,20 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 
 #include "RenderPool.hpp"
 #include "TileScene.hpp"
 #include "TiledViewerCamera.hpp"
 #include "TileRenderer.hpp"
+#include "vc/core/render/ViewportRenderer.hpp"
 
 class QTimer;
 class Surface;
 class Volume;
 
-// Orchestrates tile rendering: submits visible tiles to the background
-// pool, drains completed results, and updates the tile scene.
+// Orchestrates tile rendering: delegates to the platform-agnostic
+// ViewportRenderer for tile scheduling, draining, and progressive
+// refinement, and syncs results to TileScene's QGraphicsPixmapItems.
 //
 // All public methods must be called from the main thread.
 class TileRenderController : public QObject
@@ -66,13 +67,21 @@ public:
     RenderPool* renderPool() const { return _renderPool; }
 
     // Progressive rendering: show coarse previews while full-res loads
-    void setProgressiveEnabled(bool enabled) { _progressiveEnabled = enabled; }
-    bool progressiveEnabled() const { return _progressiveEnabled; }
+    void setProgressiveEnabled(bool enabled) { _viewportRenderer.setProgressiveEnabled(enabled); }
+    bool progressiveEnabled() const { return _viewportRenderer.progressiveEnabled(); }
 
     // --- Dirty flags (set by viewer, processed each tick) ---
     void markOverlaysDirty();
     void markChunkArrived();
     void setOverlayCallback(std::function<void()> cb);
+
+    // Rebuild ViewportRenderer's TileGrid to match TileScene's bounds.
+    // Call this after TileScene::rebuildGrid() so the two grids stay in sync.
+    void syncGridBounds(const ContentBounds& bounds, int viewportW, int viewportH);
+
+    // Access the underlying ViewportRenderer
+    vc::render::ViewportRenderer& viewportRenderer() { return _viewportRenderer; }
+    const vc::render::ViewportRenderer& viewportRenderer() const { return _viewportRenderer; }
 
 signals:
     // Emitted when drainResults() actually updated tile pixmaps.
@@ -81,9 +90,6 @@ signals:
     void sceneNeedsUpdate();
 
 private slots:
-    // Drain completed results from the render pool and update tile scene.
-    void drainResults();
-
     // Unified tick: runs at ~60 Hz, handles all periodic work.
     void tick();
 
@@ -91,40 +97,16 @@ private slots:
     void ensureTickRunning();
 
 private:
+    // Sync tiles from ViewportRenderer's TileGrid to TileScene's QGraphicsPixmapItems.
+    // Returns true if any tiles were updated.
+    bool syncTilesToScene();
+
     TileScene* _tileScene;
     RenderPool* _renderPool;  // shared, not owned
     QTimer* _tickTimer;
 
-    std::shared_ptr<std::atomic<uint64_t>> _currentEpoch = std::make_shared<std::atomic<uint64_t>>(0);
-    int _controllerId;
-    static inline std::atomic<int> _nextControllerId{0};
-    QRectF _lastViewportRect;
-    bool _progressiveEnabled = true;
+    vc::render::ViewportRenderer _viewportRenderer;
 
-    // Desired pyramid level for current render pass
-    int _desiredLevel = 0;
-
-    // Last render state for refinement re-submission
-    TiledViewerCamera _lastCamera;
-    std::shared_ptr<Surface> _lastSurface;
-    std::shared_ptr<Volume> _lastVolume;
-    std::function<TileRenderParams(const WorldTileKey&)> _lastBuildParams;
-
-    // Pending state for coalescing rapid viewport changes
-    bool _pendingDirty = false;
-    TiledViewerCamera _pendingCamera;
-    std::shared_ptr<Surface> _pendingSurface;
-    std::shared_ptr<Volume> _pendingVolume;
-    std::function<TileRenderParams(const WorldTileKey&)> _pendingBuildParams;
-    QRectF _pendingViewportRect;
-
-    // In-flight tile tracking to avoid duplicate submissions
-    std::unordered_set<WorldTileKey, WorldTileKeyHash> _inFlightTiles;
-
-    // Dirty flags set by the viewer, processed each tick
-    bool _overlaysDirty = false;
-    bool _chunkArrived = false;
-
-    // Callback to notify the viewer
-    std::function<void()> _overlayCallback;
+    // Per-tile version tracking for sync: maps grid index -> last synced version
+    std::unordered_map<int, uint64_t> _syncedVersions;
 };
