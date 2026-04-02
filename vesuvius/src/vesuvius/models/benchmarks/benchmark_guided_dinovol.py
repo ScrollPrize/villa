@@ -327,6 +327,36 @@ def _profile_guided_stages(
                     logits = model.task_decoders["ink"](features)
                     return logits
 
+        elif model.guide_fusion_stage == "feature_skip_concat":
+            stage_shapes = model._get_encoder_stage_shapes(inputs.shape[2:])
+
+            def _projected_features():
+                with _autocast_context(device):
+                    projected_features = []
+                    for stage_idx, stage_key in enumerate(model.guide_stage_keys or []):
+                        projected = F.interpolate(
+                            guide_features,
+                            size=stage_shapes[stage_idx],
+                            mode="trilinear",
+                            align_corners=False,
+                        )
+                        projected = model.guide_skip_projectors[stage_key](projected)
+                        projected_features.append(projected)
+                    return projected_features
+
+            projected_features, projector_ms = _timed_call(_projected_features, device=device)
+            timings["skip_projectors_ms"].append(projector_ms)
+
+            def _segmentation():
+                with _autocast_context(device):
+                    features = model.shared_encoder(inputs)
+                    features = [
+                        torch.cat([stage_feature, projected_feature], dim=1)
+                        for stage_feature, projected_feature in zip(features, projected_features)
+                    ]
+                    logits = model.task_decoders["ink"](features)
+                    return logits
+
         else:  # pragma: no cover - defensive path for future guide modes
             raise ValueError(f"Unsupported guided benchmark mode: {model.guide_fusion_stage!r}")
 
@@ -343,7 +373,7 @@ def _profile_guided_stages(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark baseline, input-gated, and encoder-guided volumetric Dinovol modes.")
+    parser = argparse.ArgumentParser(description="Benchmark baseline and guided volumetric Dinovol modes.")
     parser.add_argument(
         "--guide-checkpoint",
         type=str,
@@ -430,6 +460,17 @@ def main() -> None:
             compile_model=False,
             channels_last_3d=False,
         )
+        feature_skip_concat_eager_model = _build_model(
+            patch_size=patch_size,
+            device=device,
+            guide_checkpoint=str(guide_checkpoint),
+            guide_tokenbook_tokens=guide_tokenbook_tokens,
+            guide_fusion_stage="feature_skip_concat",
+            guide_tokenbook_prototype_weighting=args.guide_tokenbook_prototype_weighting,
+            guide_tokenbook_weight_mlp_hidden=args.guide_tokenbook_weight_mlp_hidden,
+            compile_model=False,
+            channels_last_3d=False,
+        )
 
         patch_summary: dict[str, object] = {}
         variants = {
@@ -446,6 +487,7 @@ def main() -> None:
             ),
             "guided_input_eager": guided_eager_model,
             "guided_feature_encoder_eager": feature_encoder_eager_model,
+            "guided_feature_skip_concat_eager": feature_skip_concat_eager_model,
         }
         if not args.skip_compile_variants:
             variants["guided_input_compile"] = _build_model(
@@ -492,6 +534,28 @@ def main() -> None:
                 compile_model=True,
                 channels_last_3d=True,
             )
+            variants["guided_feature_skip_concat_compile"] = _build_model(
+                patch_size=patch_size,
+                device=device,
+                guide_checkpoint=str(guide_checkpoint),
+                guide_tokenbook_tokens=guide_tokenbook_tokens,
+                guide_fusion_stage="feature_skip_concat",
+                guide_tokenbook_prototype_weighting=args.guide_tokenbook_prototype_weighting,
+                guide_tokenbook_weight_mlp_hidden=args.guide_tokenbook_weight_mlp_hidden,
+                compile_model=True,
+                channels_last_3d=False,
+            )
+            variants["guided_feature_skip_concat_compile_channels_last_3d"] = _build_model(
+                patch_size=patch_size,
+                device=device,
+                guide_checkpoint=str(guide_checkpoint),
+                guide_tokenbook_tokens=guide_tokenbook_tokens,
+                guide_fusion_stage="feature_skip_concat",
+                guide_tokenbook_prototype_weighting=args.guide_tokenbook_prototype_weighting,
+                guide_tokenbook_weight_mlp_hidden=args.guide_tokenbook_weight_mlp_hidden,
+                compile_model=True,
+                channels_last_3d=True,
+            )
 
         if not args.skip_stage_breakdown:
             patch_summary["guided_input_eager_stage_breakdown_ms"] = _profile_guided_stages(
@@ -502,6 +566,12 @@ def main() -> None:
             )
             patch_summary["guided_feature_encoder_eager_stage_breakdown_ms"] = _profile_guided_stages(
                 feature_encoder_eager_model,
+                device=device,
+                cpu_inputs=cpu_inputs.detach().clone(),
+                iterations=args.iterations,
+            )
+            patch_summary["guided_feature_skip_concat_eager_stage_breakdown_ms"] = _profile_guided_stages(
+                feature_skip_concat_eager_model,
                 device=device,
                 cpu_inputs=cpu_inputs.detach().clone(),
                 iterations=args.iterations,

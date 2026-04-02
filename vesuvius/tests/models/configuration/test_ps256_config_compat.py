@@ -95,3 +95,34 @@ def test_ps256_guided_feature_encoder_dicece_config_loads_and_builds():
     assert model.final_config["guide_tokenbook_tokens"] == 256
     assert model.final_config["guide_feature_gate_alpha"] == 0.9
     assert model.final_config["guide_tokenbook_prototype_weighting"] == "token_mlp"
+
+
+def test_ps128_guided_feature_skip_concat_config_loads_and_builds():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps128_guided_feature_skip_concat_ink.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (128, 128, 128)
+    assert list(mgr.targets.keys()) == ["ink"]
+    assert model.guide_enabled is True
+    assert model.final_config["guide_fusion_stage"] == "feature_skip_concat"
+    assert model.final_config["guide_stage_keys"] == ["enc_0", "enc_1", "enc_2", "enc_3", "enc_4"]
+
+
+def test_ps256_guided_feature_skip_concat_medial_config_loads_and_builds():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps256_guided_feature_skip_concat_medial.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (256, 256, 256)
+    assert list(mgr.targets.keys()) == ["surface"]
+    assert model.guide_enabled is True
+    assert model.final_config["guide_fusion_stage"] == "feature_skip_concat"
+
+
+def test_ps256_guided_feature_skip_concat_dicece_config_loads_and_builds():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps256_guided_feature_skip_concat_dicece.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (256, 256, 256)
+    assert list(mgr.targets.keys()) == ["surface"]
+    assert model.guide_enabled is True
+    assert model.final_config["guide_fusion_stage"] == "feature_skip_concat"

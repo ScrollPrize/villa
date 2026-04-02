@@ -1,0 +1,28 @@
+tr_config:
+  patch_size: [256, 256, 256]
+  batch_size: 1
+  guide_loss_weight: 0.0
+
+model_config:
+  guide_backbone: "/home/giorgio/Projects/dino-vesuvius/dino-checkpoints/checkpoint_step_342500.pt"
+  guide_fusion_stage: "feature_skip_concat"
+  guide_compile_policy: "all_guidance"
+  guide_feature_gate_alpha: 0.9
+  guide_freeze: true
+  guide_tokenbook_dropout: 0.0
+  guide_tokenbook_sample_rate: 1.0
+  guide_tokenbook_ema_decay: null
+  guide_tokenbook_use_ema: false
+  input_shape: [256, 256, 256]
+
+dataset_config:
+  min_labeled_ratio: 0
+  min_bbox_percent: 0
+  normalization_scheme: "zscore"
+  skip_patch_validation: true
+  targets:
+    surface:
+      activation: "none"
+      losses:
+        - name: "MedialSurfaceRecall"
+          weight: 1.0
