@@ -574,6 +574,24 @@ def test_feature_encoder_trainer_builds_train_and_val_stage_montage(tmp_path: Pa
     assert guide_preview.shape[:2] == (76, 24)
 
 
+def test_select_debug_sample_index_from_targets_prefers_first_nonzero_sample():
+    targets_dict = {
+        "surface": torch.tensor(
+            [
+                [[[[0.0, 0.0], [0.0, 0.0]]]],
+                [[[[0.0, 1.0], [0.0, 0.0]]]],
+                [[[[1.0, 1.0], [0.0, 0.0]]]],
+            ],
+            dtype=torch.float32,
+        )
+    }
+
+    index, found = BaseTrainer._select_debug_sample_index_from_targets(targets_dict)
+
+    assert found is True
+    assert index == 1
+
+
 class _DummyDataset:
     def __len__(self):
         return 1
