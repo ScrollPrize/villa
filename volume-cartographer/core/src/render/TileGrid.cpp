@@ -27,13 +27,15 @@ bool TileGrid::rebuildGrid(const ContentBounds& bounds, int viewportW, int viewp
         return false;
     }
 
-    _meta.clear();
-    _tiles.clear();
+    // Update bounds but preserve metadata for existing world positions.
+    // Don't clear — tiles at the same world key keep their staleness info.
     _bounds = bounds;
 
     if (_bounds.totalCols <= 0 || _bounds.totalRows <= 0) {
         _padX = 0;
         _padY = 0;
+        _meta.clear();
+        _tiles.clear();
         _unfilledCount = 0;
         return true;
     }
@@ -49,7 +51,11 @@ bool TileGrid::rebuildGrid(const ContentBounds& bounds, int viewportW, int viewp
     const size_t count = static_cast<size_t>(_bounds.totalRows) * static_cast<size_t>(_bounds.totalCols);
     _meta.resize(count);
     _tiles.resize(count);
-    _unfilledCount = static_cast<int>(count);
+    // Count unfilled tiles
+    _unfilledCount = 0;
+    for (const auto& m : _meta) {
+        if (m.level < 0) ++_unfilledCount;
+    }
 
     return true;
 }
