@@ -90,3 +90,14 @@ void samplePlaneARGB32(uint32_t* outBuf, int outStride,
                        int width, int height, vc::Sampling method,
                        const uint32_t lut[256]);
 
+// Fused plane composite: inline coords + nearest-neighbor per layer + composite + LUT → ARGB32.
+// No coord matrix allocation. For PlaneSurface composite rendering.
+void samplePlaneCompositeARGB32(
+    uint32_t* outBuf, int outStride,
+    vc::cache::TieredChunkCache* cache, int level,
+    const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
+    const cv::Vec3f& normal, float zStep, int zStart, int numLayers,
+    int width, int height,
+    const std::string& compositeMethod,
+    const uint32_t lut[256]);
+

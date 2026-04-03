@@ -708,6 +708,54 @@ int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
     return last;
 }
 
+int Volume::samplePlaneCompositeBestEffortARGB32(
+    uint32_t* outBuf, int outStride,
+    const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
+    const cv::Vec3f& normal, float zStep, int zStart, int numLayers,
+    int width, int height,
+    const std::string& compositeMethod,
+    const uint32_t lut[256])
+{
+    const int nScales = static_cast<int>(numScales());
+
+    // Use same best-effort level selection as samplePlaneBestEffortARGB32.
+    // The planeBBox needs to account for normal offsets.
+    auto pb = planeBBox(origin, vx_step, vy_step, width, height);
+    float minOff = static_cast<float>(zStart) * zStep;
+    float maxOff = static_cast<float>(zStart + numLayers - 1) * zStep;
+    if (minOff > maxOff) std::swap(minOff, maxOff);
+    // Expand bbox along normal direction
+    for (int a = 0; a < 3; a++) {
+        float nMin = normal[a] * minOff;
+        float nMax = normal[a] * maxOff;
+        if (nMin > nMax) std::swap(nMin, nMax);
+        (&pb.loX)[a] += nMin;
+        (&pb.hiX)[a] += nMax;
+    }
+    WorldBBox wb{pb.loX, pb.loY, pb.loZ, pb.hiX, pb.hiY, pb.hiZ};
+
+    int level = 0; // Always try finest first for composite
+    for (int lvl = level; lvl < nScales; lvl++) {
+        if (allChunksCachedFast(wb, lvl)) {
+            float scale = (lvl > 0) ? (1.0f / static_cast<float>(1 << lvl)) : 1.0f;
+            samplePlaneCompositeARGB32(outBuf, outStride, tieredCache(), lvl,
+                origin * scale, vx_step * scale, vy_step * scale,
+                normal, zStep, zStart, numLayers,
+                width, height, compositeMethod, lut);
+            return lvl;
+        }
+    }
+
+    // Fallback: block at coarsest level
+    int last = std::max(0, nScales - 1);
+    float scale = (last > 0) ? (1.0f / static_cast<float>(1 << last)) : 1.0f;
+    samplePlaneCompositeARGB32(outBuf, outStride, tieredCache(), last,
+        origin * scale, vx_step * scale, vy_step * scale,
+        normal, zStep, zStart, numLayers,
+        width, height, compositeMethod, lut);
+    return last;
+}
+
 // ============================================================================
 // Composite-aware chunk helpers
 // ============================================================================

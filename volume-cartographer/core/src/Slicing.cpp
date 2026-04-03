@@ -2030,6 +2030,140 @@ void samplePlaneARGB32(uint32_t* outBuf, int outStride,
 }
 
 // ============================================================================
+// samplePlaneCompositeARGB32 — fused plane composite: inline coords, nearest-
+// neighbor per layer, composite, LUT → ARGB32. No coord matrix allocation.
+// ============================================================================
+
+void samplePlaneCompositeARGB32(
+    uint32_t* __restrict__ outBuf, int outStride,
+    vc::cache::TieredChunkCache* cache, int level,
+    const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
+    const cv::Vec3f& normal, float zStep, int zStart, int numLayers,
+    int width, int height,
+    const std::string& compositeMethod,
+    const uint32_t lut[256])
+{
+    CacheParams p(cache, level);
+    const uint32_t bg = lut[0];
+
+    // Zero-fill with background
+    for (int y = 0; y < height; y++) {
+        uint32_t* row = outBuf + y * outStride;
+        for (int x = 0; x < width; x++)
+            row[x] = bg;
+    }
+
+    // Prefetch needed chunks (compute AABB from corners + layer extent)
+    {
+        cv::Vec3f corners[4] = {
+            origin,
+            origin + vx_step * static_cast<float>(width - 1),
+            origin + vy_step * static_cast<float>(height - 1),
+            origin + vx_step * static_cast<float>(width - 1) + vy_step * static_cast<float>(height - 1)
+        };
+        float minLayerOff = static_cast<float>(zStart) * zStep;
+        float maxLayerOff = static_cast<float>(zStart + numLayers - 1) * zStep;
+        if (minLayerOff > maxLayerOff) std::swap(minLayerOff, maxLayerOff);
+
+        float minVx = corners[0][0], maxVx = corners[0][0];
+        float minVy = corners[0][1], maxVy = corners[0][1];
+        float minVz = corners[0][2], maxVz = corners[0][2];
+        for (int c = 0; c < 4; c++) {
+            for (float off : {minLayerOff, maxLayerOff}) {
+                float vx = corners[c][0] + normal[0] * off;
+                float vy = corners[c][1] + normal[1] * off;
+                float vz = corners[c][2] + normal[2] * off;
+                minVx = std::min(minVx, vx); maxVx = std::max(maxVx, vx);
+                minVy = std::min(minVy, vy); maxVy = std::max(maxVy, vy);
+                minVz = std::min(minVz, vz); maxVz = std::max(maxVz, vz);
+            }
+        }
+        minVx -= 1; minVy -= 1; minVz -= 1;
+        maxVx += 1; maxVy += 1; maxVz += 1;
+
+        if (maxVx < 0 || maxVy < 0 || maxVz < 0 ||
+            minVx >= p.sx || minVy >= p.sy || minVz >= p.sz)
+            return;
+
+        int minCx = p.chunkX(std::max(0, static_cast<int>(minVx)));
+        int maxCx = p.chunkX(std::min(p.sx - 1, static_cast<int>(maxVx)));
+        int minCy = p.chunkY(std::max(0, static_cast<int>(minVy)));
+        int maxCy = p.chunkY(std::min(p.sy - 1, static_cast<int>(maxVy)));
+        int minCz = p.chunkZ(std::max(0, static_cast<int>(minVz)));
+        int maxCz = p.chunkZ(std::min(p.sz - 1, static_cast<int>(maxVz)));
+
+        thread_local std::vector<vc::cache::ChunkKey> neededKeys;
+        neededKeys.clear();
+        for (int cix = minCx; cix <= maxCx; cix++)
+            for (int ciy = minCy; ciy <= maxCy; ciy++)
+                for (int ciz = minCz; ciz <= maxCz; ciz++) {
+                    if (p.dbValid && (ciz < p.dbMinCz || ciz > p.dbMaxCz ||
+                                      ciy < p.dbMinCy || ciy > p.dbMaxCy ||
+                                      cix < p.dbMinCx || cix > p.dbMaxCx)) continue;
+                    neededKeys.push_back(vc::cache::ChunkKey{level, ciz, ciy, cix});
+                }
+        cache->prefetch(neededKeys);
+        for (auto& key : neededKeys)
+            (void)cache->getBlocking(key);
+    }
+
+    // Precompute layer offsets along normal
+    thread_local std::vector<cv::Vec3f> layerOffsets;
+    layerOffsets.resize(numLayers);
+    for (int l = 0; l < numLayers; l++) {
+        float off = static_cast<float>(zStart + l) * zStep;
+        layerOffsets[l] = normal * off;
+    }
+
+    // Determine composite mode
+    const bool useMax = (compositeMethod == "max");
+    const bool useMin = (compositeMethod == "min");
+    // Default: mean
+
+    // Sample — nearest-neighbor per layer, composite, LUT → ARGB32
+    ChunkSampler<uint8_t> sampler(p, *cache, level);
+    for (int y = 0; y < height; y++) {
+        uint32_t* __restrict__ outRow = outBuf + y * outStride;
+        cv::Vec3f rowBase = origin + vy_step * static_cast<float>(y);
+
+        for (int x = 0; x < width; x++) {
+            cv::Vec3f pos = rowBase + vx_step * static_cast<float>(x);
+
+            float accum = 0;
+            int validCount = 0;
+
+            for (int l = 0; l < numLayers; l++) {
+                float vx = pos[0] + layerOffsets[l][0];
+                float vy = pos[1] + layerOffsets[l][1];
+                float vz = pos[2] + layerOffsets[l][2];
+
+                if (vx < 0 || vy < 0 || vz < 0 ||
+                    vx >= p.sx || vy >= p.sy || vz >= p.sz)
+                    continue;
+
+                uint8_t val = sampler.sampleNearest(vz, vy, vx);
+                if (val == 0) continue;  // skip zero (fill value)
+
+                validCount++;
+                if (useMax) {
+                    accum = (validCount == 1) ? val : std::max(accum, static_cast<float>(val));
+                } else if (useMin) {
+                    accum = (validCount == 1) ? val : std::min(accum, static_cast<float>(val));
+                } else {
+                    accum += val;  // mean: accumulate
+                }
+            }
+
+            if (validCount > 0) {
+                if (!useMax && !useMin)
+                    accum /= static_cast<float>(validCount);  // mean
+                outRow[x] = lut[static_cast<uint8_t>(std::clamp(accum, 0.0f, 255.0f))];
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Public API — thin wrappers around readVolumeImpl
 // ============================================================================
 

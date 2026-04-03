@@ -231,6 +231,43 @@ TileRenderResult TileRenderer::renderTile(
         result.actualLevel = volume->sampleCompositeBestEffort(
             gray, coords, normals, sp);
     } else if (usePlaneComposite) {
+        // Fused plane composite: inline coords, nearest-neighbor per layer,
+        // composite, LUT → ARGB32. No coord matrix allocation.
+        int zStart = params.compositeSettings.reverseDirection
+                        ? -params.compositeSettings.planeLayersBehind
+                        : -params.compositeSettings.planeLayersFront;
+        int zEnd = params.compositeSettings.reverseDirection
+                      ? params.compositeSettings.planeLayersFront
+                      : params.compositeSettings.planeLayersBehind;
+        int numLayers = zEnd - zStart + 1;
+
+        // Check if we can use the fully fused ARGB32 path
+        const bool canFuseComposite =
+            params.colormapId.empty() && !params.stretchValues &&
+            !params.compositeSettings.postStretchValues &&
+            !params.compositeSettings.postRemoveSmallComponents;
+
+        if (canFuseComposite && numLayers > 0) {
+            float lightFactor = 1.0f;
+            if (params.compositeSettings.params.lightingEnabled)
+                lightFactor = computeLightingFactor(planeNormal, params.compositeSettings.params);
+
+            std::array<uint32_t, 256> lut;
+            vc::buildWindowLevelLut(lut, params.windowLow, params.windowHigh, lightFactor);
+
+            result.pixels.resize(params.tileW * params.tileH);
+            result.actualLevel = volume->samplePlaneCompositeBestEffortARGB32(
+                result.pixels.data(), params.tileW,
+                planeOrigin, planeVxStep, planeVyStep,
+                planeNormal, 1.0f,  // zStep=1.0: coords are scaled per-level by best-effort
+                zStart, numLayers,
+                params.tileW, params.tileH,
+                params.compositeSettings.params.method,
+                lut.data());
+            goto overlay;
+        }
+
+        // Fallback: use coord matrix path
         if (normals.size() != coords.size()) {
             normals.create(coords.size());
         }
@@ -239,12 +276,8 @@ TileRenderResult TileRenderer::renderTile(
         vc::SampleParams sp;
         sp.level = params.dsScaleIdx;
         sp.composite = params.compositeSettings.params;
-        sp.zStart = params.compositeSettings.reverseDirection
-                        ? -params.compositeSettings.planeLayersBehind
-                        : -params.compositeSettings.planeLayersFront;
-        sp.zEnd = params.compositeSettings.reverseDirection
-                      ? params.compositeSettings.planeLayersFront
-                      : params.compositeSettings.planeLayersBehind;
+        sp.zStart = zStart;
+        sp.zEnd = zEnd;
 
         result.actualLevel = volume->sampleCompositeBestEffort(
             gray, coords, normals, sp);

@@ -145,6 +145,16 @@ public:
                                     const vc::SampleParams& params,
                                     const uint32_t lut[256]);
 
+    // Fused plane composite: nearest-neighbor per layer + composite + LUT → ARGB32.
+    // No coord matrix. For PlaneSurface composite rendering.
+    int samplePlaneCompositeBestEffortARGB32(
+        uint32_t* outBuf, int outStride,
+        const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
+        const cv::Vec3f& normal, float zStep, int zStart, int numLayers,
+        int width, int height,
+        const std::string& compositeMethod,
+        const uint32_t lut[256]);
+
     // Pin the coarsest pyramid level in the hot tier (never evicted).
     // Guarantees sampleBestEffort() always returns data immediately.
     void pinCoarsestLevel(bool blocking = false);
