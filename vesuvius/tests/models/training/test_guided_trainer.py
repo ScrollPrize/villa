@@ -51,12 +51,15 @@ def _write_local_guide_checkpoint(path: Path) -> None:
 def _make_synthetic_dataset(root: Path) -> Path:
     data_root = root / "data"
     image_root = data_root / "images" / "volume1.zarr"
-    label_root = data_root / "labels" / "volume1_ink.zarr"
+    label_root_ink = data_root / "labels" / "volume1_ink.zarr"
+    label_root_surface = data_root / "labels" / "volume1_surface.zarr"
 
     image_group = zarr.open_group(str(image_root), mode="w")
-    label_group = zarr.open_group(str(label_root), mode="w")
+    label_group_ink = zarr.open_group(str(label_root_ink), mode="w")
+    label_group_surface = zarr.open_group(str(label_root_surface), mode="w")
     image_array = image_group.create_dataset("0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="float32")
-    label_array = label_group.create_dataset("0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="uint8")
+    label_array_ink = label_group_ink.create_dataset("0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="uint8")
+    label_array_surface = label_group_surface.create_dataset("0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="uint8")
 
     coords = np.linspace(-1.0, 1.0, 16, dtype=np.float32)
     z = coords[:, None, None]
@@ -66,7 +69,8 @@ def _make_synthetic_dataset(root: Path) -> Path:
     label = ((x * x + y * y + z * z) < 0.35).astype(np.uint8)
 
     image_array[:] = image
-    label_array[:] = label
+    label_array_ink[:] = label
+    label_array_surface[:] = label
     return data_root
 
 
@@ -143,6 +147,64 @@ def _make_mgr(
         guide_supervision_target="ink",
         train_num_dataloader_workers=0,
         model_config=guided_model_config,
+    )
+
+
+def _make_pretrained_backbone_mgr(
+    data_root: Path,
+    checkpoint_path: Path,
+    *,
+    pretrained_decoder_type: str = "pixelshuffle_conv",
+    losses: list[dict] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        gpu_ids=None,
+        use_ddp=False,
+        targets={
+            "surface": {
+                "out_channels": 2,
+                "activation": "none",
+                "losses": losses if losses is not None else [{"name": "nnUNet_DC_and_CE_loss", "weight": 1.0}],
+            }
+        },
+        tr_configs={},
+        model_name="pretrained_backbone_smoke",
+        train_patch_size=(16, 16, 16),
+        train_batch_size=1,
+        in_channels=1,
+        autoconfigure=False,
+        enable_deep_supervision=False,
+        spacing=(1.0, 1.0, 1.0),
+        data_path=data_root,
+        min_labeled_ratio=0.0,
+        min_bbox_percent=0.0,
+        skip_patch_validation=True,
+        allow_unlabeled_data=False,
+        normalization_scheme="zscore",
+        intensity_properties={},
+        skip_intensity_sampling=True,
+        no_spatial_augmentation=True,
+        no_scaling_augmentation=True,
+        cache_valid_patches=False,
+        dataset_config={},
+        ome_zarr_resolution=0,
+        valid_patch_find_resolution=0,
+        bg_sampling_enabled=False,
+        bg_to_fg_ratio=0.5,
+        unlabeled_foreground_enabled=False,
+        unlabeled_foreground_threshold=0.05,
+        unlabeled_foreground_bbox_threshold=0.15,
+        unlabeled_foreground_volumes=None,
+        profile_augmentations=False,
+        guide_loss_weight=0.0,
+        guide_supervision_target=None,
+        train_num_dataloader_workers=0,
+        model_config={
+            "pretrained_backbone": str(checkpoint_path),
+            "pretrained_decoder_type": str(pretrained_decoder_type),
+            "freeze_encoder": True,
+            "input_shape": [16, 16, 16],
+        },
     )
 
 
@@ -270,6 +332,42 @@ def test_feature_skip_concat_checkpoint_roundtrip_preserves_plain_inference_forw
     assert isinstance(output, dict)
     assert set(output.keys()) == {"ink"}
     assert model_info["network"].final_config["guide_fusion_stage"] == "feature_skip_concat"
+
+
+def test_pretrained_backbone_pixelshuffle_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_pretrained_backbone_mgr(
+        data_root,
+        guide_checkpoint,
+        pretrained_decoder_type="pixelshuffle_conv",
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model()
+    checkpoint_path = tmp_path / "pretrained_pixelshuffle_model.pth"
+    torch.save({"model_config": model.final_config, "model": model.state_dict()}, checkpoint_path)
+
+    output_dir = tmp_path / "inference_out_pretrained_pixelshuffle"
+    output_dir.mkdir()
+    inferer = Inferer(
+        model_path=str(checkpoint_path),
+        input_dir=str(data_root / "images" / "volume1.zarr"),
+        output_dir=str(output_dir),
+        input_format="zarr",
+        do_tta=False,
+        device="cpu",
+        num_dataloader_workers=0,
+        model_type="train_py",
+    )
+
+    model_info = inferer._load_train_py_model(checkpoint_path)
+    output = model_info["network"](torch.randn(1, 1, 16, 16, 16))
+
+    assert isinstance(output, dict)
+    assert set(output.keys()) == {"surface"}
+    assert output["surface"].shape == (1, 2, 16, 16, 16)
+    assert model_info["network"].final_config["pretrained_decoder_type"] == "pixelshuffle_conv"
 
 
 def test_direct_segmentation_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
@@ -471,6 +569,32 @@ def test_feature_skip_concat_base_trainer_smoke_runs_two_training_steps_without_
         assert torch.isfinite(loss)
         assert "guide_mask" not in task_losses
         assert trainer._current_aux_outputs == {}
+        loss.backward()
+        optimizer.step()
+
+
+def test_pretrained_backbone_pixelshuffle_base_trainer_smoke_runs_two_training_steps(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_pretrained_backbone_mgr(
+        data_root,
+        guide_checkpoint,
+        pretrained_decoder_type="pixelshuffle_conv",
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model().to(trainer.device)
+    loss_fns = trainer._build_loss()
+    dataset = trainer._configure_dataset(is_training=True)
+    batch = next(iter(DataLoader(dataset, batch_size=1, shuffle=False)))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    for _step in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        _inputs, targets_dict, outputs = trainer._get_model_outputs(model, batch)
+        loss, task_losses = trainer._compute_train_loss(outputs, targets_dict, loss_fns)
+        assert torch.isfinite(loss)
+        assert outputs["surface"].shape == (1, 2, 16, 16, 16)
         loss.backward()
         optimizer.step()
 
@@ -841,6 +965,21 @@ def _make_compile_mgr(tmp_path: Path, *, compile_policy: str) -> SimpleNamespace
     )
 
 
+def _make_pretrained_compile_mgr(tmp_path: Path, checkpoint_path: Path, *, compile_policy: str) -> SimpleNamespace:
+    mgr = _make_compile_mgr(tmp_path, compile_policy=compile_policy)
+    mgr.targets = {"surface": {"out_channels": 2, "activation": "none"}}
+    mgr.model_name = "compile_policy_pretrained_pixelshuffle"
+    mgr.train_patch_size = (16, 16, 16)
+    mgr.train_batch_size = 1
+    mgr.model_config = {
+        "pretrained_backbone": str(checkpoint_path),
+        "pretrained_decoder_type": "pixelshuffle_conv",
+        "freeze_encoder": True,
+        "input_shape": [16, 16, 16],
+    }
+    return mgr
+
+
 def _configure_compile_test_trainer(
     trainer: BaseTrainer,
     monkeypatch,
@@ -944,6 +1083,47 @@ def test_initialize_training_places_run_checkpoint_dir_under_ckpt_out_base(tmp_p
 
     assert str(state["ckpt_dir"]).startswith(str(mgr.ckpt_out_base))
     assert str(state["model_ckpt_dir"]).startswith(str(mgr.ckpt_out_base))
+
+
+def test_initialize_training_compiles_pretrained_pixelshuffle_model_before_ddp_wrap(tmp_path: Path, monkeypatch):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_pretrained_compile_mgr(tmp_path, checkpoint_path, compile_policy="module")
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    call_order: list[str] = []
+    dummy_dataset = _DummyDataset()
+
+    monkeypatch.setattr(trainer, "_configure_dataset", lambda is_training: dummy_dataset)
+    monkeypatch.setattr(trainer, "_build_dataset_for_mgr", lambda mgr, is_training: dummy_dataset)
+    monkeypatch.setattr(trainer, "_prepare_sample", lambda sample, is_training: sample)
+    monkeypatch.setattr(trainer, "_get_optimizer", lambda model: torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.1))
+    monkeypatch.setattr(
+        trainer,
+        "_get_scheduler",
+        lambda optimizer: (torch.optim.lr_scheduler.StepLR(optimizer, step_size=1), False),
+    )
+    monkeypatch.setattr(trainer, "_get_scaler", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        trainer,
+        "_configure_dataloaders",
+        lambda train_dataset, val_dataset: ([], [], [0], [0]),
+    )
+    monkeypatch.setattr(trainer, "_build_loss", lambda: {})
+    monkeypatch.setattr(trainer, "_initialize_ema_model", lambda model: None)
+    monkeypatch.setattr(
+        trainer,
+        "_wrap_model_for_distributed_training",
+        lambda model: call_order.append("wrap") or model,
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_maybe_compile_model",
+        lambda model: call_order.append("compile") or model,
+    )
+
+    trainer._initialize_training()
+
+    assert call_order == ["compile", "wrap"]
 
 
 def test_wrap_model_uses_guided_ddp_defaults(tmp_path: Path):

@@ -66,6 +66,58 @@ class PatchEmbed(nn.Module):
         return x
 
 
+def _compute_patch_decode_plan(
+    patch_size,
+    *,
+    embed_dim: int,
+    out_channels: int,
+):
+    patch_size = tuple(int(p) for p in patch_size)
+    if len(patch_size) not in (2, 3):
+        raise ValueError(f"Patch decoding only supports 2D or 3D patch sizes, got {patch_size}")
+    if max(patch_size) < 1:
+        raise ValueError(f"patch_size entries must be >= 1, got {patch_size}")
+
+    def _round_to_8(inp):
+        return int(max(8, np.round((inp + 1e-6) / 8) * 8))
+
+    num_stages = int(np.log(max(patch_size)) / np.log(2))
+    strides = [[2 if (p / 2**n) % 2 == 0 else 1 for p in patch_size] for n in range(num_stages)][::-1]
+    dim_red = (embed_dim / (2 * out_channels)) ** (1 / num_stages)
+    channels = [embed_dim] + [_round_to_8(embed_dim / dim_red ** (x + 1)) for x in range(num_stages)]
+    channels[-1] = out_channels
+    return num_stages, strides, channels
+
+
+class PixelShuffle3D(nn.Module):
+    def __init__(self, upscale_factor):
+        super().__init__()
+        if isinstance(upscale_factor, int):
+            upscale_factor = (upscale_factor, upscale_factor, upscale_factor)
+        self.upscale_factor = tuple(int(v) for v in upscale_factor)
+        if len(self.upscale_factor) != 3:
+            raise ValueError(f"PixelShuffle3D expects 3 scale factors, got {self.upscale_factor}")
+        if any(v < 1 for v in self.upscale_factor):
+            raise ValueError(f"PixelShuffle3D scale factors must be >= 1, got {self.upscale_factor}")
+        self.scale_volume = int(np.prod(self.upscale_factor))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 5:
+            raise ValueError(f"PixelShuffle3D expects [B, C, D, H, W], got {tuple(x.shape)}")
+
+        b, c, d, h, w = x.shape
+        rz, ry, rx = self.upscale_factor
+        if c % self.scale_volume != 0:
+            raise ValueError(
+                f"PixelShuffle3D input channels {c} must be divisible by product of scale factors {self.scale_volume}"
+            )
+
+        out_channels = c // self.scale_volume
+        x = x.reshape(b, out_channels, rz, ry, rx, d, h, w)
+        x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
+        return x.reshape(b, out_channels, d * rz, h * ry, w * rx)
+
+
 class PatchDecode(nn.Module):
     """
     Loosely inspired by SAM decoder
@@ -93,17 +145,11 @@ class PatchDecode(nn.Module):
         # Determine dimensionality from patch_size
         self.ndim = len(patch_size)
         conv_transpose_op = nn.ConvTranspose2d if self.ndim == 2 else nn.ConvTranspose3d
-
-        def _round_to_8(inp):
-            return int(max(8, np.round((inp + 1e-6) / 8) * 8))
-
-        num_stages = int(np.log(max(patch_size)) / np.log(2))
-        strides = [[2 if (p / 2**n) % 2 == 0 else 1 for p in patch_size] for n in range(num_stages)][::-1]
-        dim_red = (embed_dim / (2 * out_channels)) ** (1 / num_stages)
-
-        # don't question me
-        channels = [embed_dim] + [_round_to_8(embed_dim / dim_red ** (x + 1)) for x in range(num_stages)]
-        channels[-1] = out_channels
+        num_stages, strides, channels = _compute_patch_decode_plan(
+            patch_size,
+            embed_dim=embed_dim,
+            out_channels=out_channels,
+        )
 
         stages = []
         for s in range(num_stages - 1):

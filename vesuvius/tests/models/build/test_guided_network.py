@@ -10,7 +10,9 @@ import torch.nn.functional as F
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.build.guidance import TokenBook3D
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
+from vesuvius.models.build.pretrained_backbones.dinov2 import build_dinov2_backbone, build_dinov2_decoder
 from vesuvius.models.build.simple_conv_blocks import ConvDropoutNormReLU
+from vesuvius.models.build.transformers.patch_encode_decode import PixelShuffle3D
 from vesuvius.models.utils import InitWeights_He
 
 
@@ -105,6 +107,7 @@ def _make_pretrained_backbone_mgr(
     checkpoint_path: Path,
     *,
     freeze_encoder: bool,
+    decoder_type: str = "primus_patch_decode",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         targets={"surface": {"out_channels": 2, "activation": "none"}},
@@ -117,7 +120,7 @@ def _make_pretrained_backbone_mgr(
         spacing=(1.0, 1.0, 1.0),
         model_config={
             "pretrained_backbone": str(checkpoint_path),
-            "pretrained_decoder_type": "primus_patch_decode",
+            "pretrained_decoder_type": str(decoder_type),
             "freeze_encoder": bool(freeze_encoder),
             "input_shape": [16, 16, 16],
         },
@@ -150,6 +153,15 @@ def test_tokenbook3d_token_mlp_returns_unit_interval_mask():
     assert module.prototype_weight_mlp is not None
     assert float(guide.min().detach()) >= 0.0
     assert float(guide.max().detach()) <= 1.0
+
+
+def test_pixelshuffle3d_upsamples_tuple_factor_shape():
+    module = PixelShuffle3D((2, 2, 2))
+    x = torch.randn(2, 32, 3, 4, 5)
+
+    y = module(x)
+
+    assert y.shape == (2, 4, 6, 8, 10)
 
 
 @pytest.mark.parametrize("basic_encoder_block", ["ConvBlock", "BasicBlockD"])
@@ -247,6 +259,22 @@ def test_direct_segmentation_returns_two_channel_logits_and_low_res_guide_mask(t
     assert outputs["ink"].shape == (2, 2, 16, 16, 16)
     assert aux["guide_mask"].shape == (2, 1, 2, 2, 2)
     assert torch.allclose(probabilities, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_pretrained_backbone_pixelshuffle_conv_decoder_returns_input_resolution(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_pretrained_backbone_mgr(
+        checkpoint_path,
+        freeze_encoder=True,
+        decoder_type="pixelshuffle_conv",
+    )
+    model = NetworkFromConfig(mgr)
+
+    outputs = model(torch.randn(2, 1, 16, 16, 16))
+
+    assert outputs["surface"].shape == (2, 2, 16, 16, 16)
+    assert model.final_config["pretrained_decoder_type"] == "pixelshuffle_conv"
 
 
 def test_encoder_skip_only_feature_gating_uses_residual_alpha_formula():
@@ -536,6 +564,17 @@ def test_pretrained_backbone_without_freeze_encoder_still_reinitializes_conv_ste
 
     changed = [key for key in before if not torch.equal(before[key], after[key])]
     assert "backbone.down_projection.proj.weight" in changed
+
+
+def test_build_dinov2_decoder_accepts_pixelshuffle_conv(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    encoder = build_dinov2_backbone(str(checkpoint_path), input_channels=1, input_shape=(16, 16, 16))
+    decoder = build_dinov2_decoder("pixelshuffle_conv", encoder, num_classes=2)
+
+    output = decoder(torch.randn(1, encoder.embed_dim, 2, 2, 2))
+
+    assert output.shape == (1, 2, 16, 16, 16)
 
 
 def test_feature_encoder_guidance_backprop_updates_all_stage_tokenbooks(tmp_path: Path):
