@@ -598,13 +598,14 @@ bool TieredChunkCache::areAllCachedInRegion(
     int iz0, int iy0, int ix0,
     int iz1, int iy1, int ix1) const
 {
-    // Zero-allocation inline check: test each chunk key directly.
+    // Only count chunks in HOT cache (RAM) or negative-cached.
+    // Disk-only chunks still require blocking reads — don't count them
+    // as "cached" for best-effort level selection.
     for (int iz = iz0; iz <= iz1; iz++) {
         for (int iy = iy0; iy <= iy1; iy++) {
             for (int ix = ix0; ix <= ix1; ix++) {
                 ChunkKey key{level, iz, iy, ix};
-                if (hotCache_.contains(key)) continue;
-                if (!isAvailableWithoutRemoteFetch(key)) return false;
+                if (!isReadyForNonBlockingRead(key)) return false;
             }
         }
     }
