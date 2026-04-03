@@ -145,11 +145,14 @@ void TileRenderController::tick()
     _anyUpdatedThisTick = false;
     bool moreWork = _viewportRenderer.tick();
 
-    if (_anyUpdatedThisTick) {
-        _tileScene->flush();
+    // flush returns true if crossfade is still in progress
+    bool blending = false;
+    if (_anyUpdatedThisTick || _blendActive) {
+        blending = _tileScene->flush();
+        _blendActive = blending;
         emit sceneNeedsUpdate();
     }
 
-    if (!moreWork)
+    if (!moreWork && !blending)
         _vsyncTimer->stop();
 }

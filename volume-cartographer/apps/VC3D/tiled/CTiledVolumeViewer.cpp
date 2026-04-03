@@ -509,9 +509,7 @@ void CTiledVolumeViewer::updateContentMinScale()
         return;
     }
 
-    // Scale at which content just fills viewport (fit, not cover)
-    float fitScale = std::min(vpW / contentW, vpH / contentH);
-    _contentMinScale = std::max(fitScale, TiledViewerCamera::MIN_SCALE);
+    _contentMinScale = TiledViewerCamera::MIN_SCALE;
 }
 
 void CTiledVolumeViewer::rebuildContentGrid()
@@ -841,7 +839,7 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 
     const float newScale = std::max(
         TiledViewerCamera::stepScale(_camera.scale, scaledSteps), _contentMinScale);
-    if (std::abs(newScale - _camera.scale) < 0.001f) {
+    if (std::abs(newScale - _camera.scale) < _camera.scale * 0.005f) {
         return;
     }
 
@@ -879,27 +877,8 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 
     auto surf = _surfWeak.lock();
     if (surf && _volume && _volume->zarrDataset()) {
-        // Compute visible tiles directly from camera + blit formula.
-        // blitTile: dstX = (worldCol * wts - camX) * scale + vpCx
-        // Visible when dstX + 512 > 0 and dstX < fbW.
-        // → worldCol in range floor((camX - vpCx/scale) / wts) to floor((camX + vpCx/scale) / wts)
-        float vpW = static_cast<float>(fGraphicsView->viewport()->width());
-        float vpH = static_cast<float>(fGraphicsView->viewport()->height());
-        float wts = _contentBounds.worldTileSize;
-        if (wts > 0) {
-            float halfSurfW = vpW * 0.5f / _camera.scale;
-            float halfSurfH = vpH * 0.5f / _camera.scale;
-            int firstCol = static_cast<int>(std::floor((_camera.surfacePtr[0] - halfSurfW) / wts)) - tiled_config::VISIBLE_BUFFER_TILES;
-            int lastCol  = static_cast<int>(std::floor((_camera.surfacePtr[0] + halfSurfW) / wts)) + tiled_config::VISIBLE_BUFFER_TILES;
-            int firstRow = static_cast<int>(std::floor((_camera.surfacePtr[1] - halfSurfH) / wts)) - tiled_config::VISIBLE_BUFFER_TILES;
-            int lastRow  = static_cast<int>(std::floor((_camera.surfacePtr[1] + halfSurfH) / wts)) + tiled_config::VISIBLE_BUFFER_TILES;
-
-            std::vector<WorldTileKey> visibleKeys;
-            visibleKeys.reserve(static_cast<size_t>(lastCol - firstCol + 1) * static_cast<size_t>(lastRow - firstRow + 1));
-            for (int r = firstRow; r <= lastRow; r++)
-                for (int c = firstCol; c <= lastCol; c++)
-                    visibleKeys.push_back({c, r});
-
+        auto visibleKeys = computeVisibleKeys();
+        if (!visibleKeys.empty()) {
             auto buildParams = [this](const WorldTileKey& wk) { return buildRenderParams(wk); };
             _renderController->onCameraChangedDirect(_camera, surf, _volume, buildParams, visibleKeys);
         }
@@ -1087,21 +1066,34 @@ void CTiledVolumeViewer::renderVisible(bool force)
     submitRender();
 }
 
+std::vector<WorldTileKey> CTiledVolumeViewer::computeVisibleKeys() const
+{
+    std::vector<WorldTileKey> keys;
+    if (!fGraphicsView || _contentBounds.worldTileSize <= 0 || _camera.scale <= 0) return keys;
+
+    float vpW = static_cast<float>(fGraphicsView->viewport()->width());
+    float vpH = static_cast<float>(fGraphicsView->viewport()->height());
+    float wts = _contentBounds.worldTileSize;
+    float halfSurfW = vpW * 0.5f / _camera.scale;
+    float halfSurfH = vpH * 0.5f / _camera.scale;
+    int firstCol = static_cast<int>(std::floor((_camera.surfacePtr[0] - halfSurfW) / wts)) - tiled_config::VISIBLE_BUFFER_TILES;
+    int lastCol  = static_cast<int>(std::floor((_camera.surfacePtr[0] + halfSurfW) / wts)) + tiled_config::VISIBLE_BUFFER_TILES;
+    int firstRow = static_cast<int>(std::floor((_camera.surfacePtr[1] - halfSurfH) / wts)) - tiled_config::VISIBLE_BUFFER_TILES;
+    int lastRow  = static_cast<int>(std::floor((_camera.surfacePtr[1] + halfSurfH) / wts)) + tiled_config::VISIBLE_BUFFER_TILES;
+
+    keys.reserve(static_cast<size_t>(lastCol - firstCol + 1) * static_cast<size_t>(lastRow - firstRow + 1));
+    for (int r = firstRow; r <= lastRow; r++)
+        for (int c = firstCol; c <= lastCol; c++)
+            keys.push_back({c, r});
+    return keys;
+}
+
 void CTiledVolumeViewer::submitRender()
 {
     _pointSceneCache.clear();
 
     auto surf = _surfWeak.lock();
-    if (!surf || !_volume || !_volume->zarrDataset()) {
-        return;
-    }
-
-    if (_renderController->viewportRenderer().tileGrid().cols() == 0 ||
-        _renderController->viewportRenderer().tileGrid().rows() == 0) {
-        return;
-    }
-
-    QRectF vpRect = viewportSceneRect();
+    if (!surf || !_volume || !_volume->zarrDataset()) return;
 
     // Update center marker
     if (!_ov.centerMarker) {
@@ -1112,19 +1104,16 @@ void CTiledVolumeViewer::submitRender()
     QPointF centerScene = _tileScene->surfaceToScene(_focusSurfacePos[0], _focusSurfacePos[1]);
     _ov.centerMarker->setPos(centerScene);
 
+    auto visibleKeys = computeVisibleKeys();
+    if (visibleKeys.empty()) return;
+
     auto buildParams = [this](const WorldTileKey& wk) { return buildRenderParams(wk); };
-    // During active interaction (pan), coalesce via scheduleRender
-    // to avoid flooding the pool.  Other paths use direct onCameraChanged.
-    if (_isPanning) {
-        _renderController->scheduleRender(_camera, surf, _volume, buildParams, vpRect);
-    } else {
-        _renderController->onCameraChanged(_camera, surf, _volume, buildParams, vpRect);
-    }
+    _renderController->onCameraChangedDirect(_camera, surf, _volume, buildParams, visibleKeys);
 
     // Compute prefetch viewport: extend in pan direction for predictive prefetch
-    QRectF prefetchRect = vpRect;
+    QRectF prefetchRect = viewportSceneRect();
     if (_isPanning) {
-        QPointF currentCenter = vpRect.center();
+        QPointF currentCenter = prefetchRect.center();
         QPointF delta = currentCenter - _lastPanScenePos;
         _lastPanScenePos = currentCenter;
 
@@ -1853,9 +1842,12 @@ void CTiledVolumeViewer::setCompositeRenderSettings(const CompositeRenderSetting
     auto surf = _surfWeak.lock();
     if (_volume && surf) {
         _camera.invalidate();
-        _renderController->onParamsChanged(_camera, surf, _volume,
-            [this](const WorldTileKey& wk) { return buildRenderParams(wk); },
-            viewportSceneRect());
+        auto visibleKeys = computeVisibleKeys();
+        if (!visibleKeys.empty()) {
+            _renderController->onCameraChangedDirect(_camera, surf, _volume,
+                [this](const WorldTileKey& wk) { return buildRenderParams(wk); },
+                visibleKeys);
+        }
     }
     updateStatusLabel();
 }

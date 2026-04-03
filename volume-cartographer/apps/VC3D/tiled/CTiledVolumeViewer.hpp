@@ -311,6 +311,9 @@ private:
     // Get the current viewport rect in scene coordinates
     QRectF viewportSceneRect() const;
 
+    // Compute visible WorldTileKeys directly from camera + blit formula.
+    std::vector<WorldTileKey> computeVisibleKeys() const;
+
     // --- Widget components ---
     QGraphicsScene* _scene = nullptr;
     TileScene* _tileScene = nullptr;
