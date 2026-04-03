@@ -23,26 +23,12 @@ TileRenderController::TileRenderController(TileScene* tileScene, RenderPool* sha
             Qt::QueuedConnection);
 
     // Direct pixel→QPixmap conversion during drain — skips TileGrid pixel storage.
-    // One memcpy into QImage (which owns its buffer), then QPixmap::fromImage.
+    // Blit rendered tile pixels directly into the single framebuffer.
+    // No per-tile QImage/QPixmap creation — just a memcpy into the right position.
     _viewportRenderer.setResultCallback([this](TileRenderResult&& result) {
         if (result.pixels.empty()) return;
-
-        QImage img(result.width, result.height, QImage::Format_RGB32);
-        const size_t srcStride = static_cast<size_t>(result.width) * 4;
-        const size_t dstStride = static_cast<size_t>(img.bytesPerLine());
-        if (srcStride == dstStride) {
-            std::memcpy(img.bits(), result.pixels.data(),
-                        srcStride * static_cast<size_t>(result.height));
-        } else {
-            for (int y = 0; y < result.height; y++) {
-                std::memcpy(img.scanLine(y),
-                            reinterpret_cast<const uchar*>(result.pixels.data()) + static_cast<size_t>(y) * srcStride,
-                            srcStride);
-            }
-        }
-        QPixmap pixmap = QPixmap::fromImage(std::move(img), Qt::NoFormatConversion);
-
-        _tileScene->setTilePixmapOnly(result.worldKey, pixmap);
+        _tileScene->blitTile(result.worldKey, result.pixels.data(),
+                             result.width, result.height);
         _anyUpdatedThisTick = true;
     });
 }
@@ -145,8 +131,10 @@ void TileRenderController::tick()
     _anyUpdatedThisTick = false;
     bool moreWork = _viewportRenderer.tick();
 
-    if (_anyUpdatedThisTick)
+    if (_anyUpdatedThisTick) {
+        _tileScene->flush();
         emit sceneNeedsUpdate();
+    }
 
     if (!moreWork)
         _vsyncTimer->stop();

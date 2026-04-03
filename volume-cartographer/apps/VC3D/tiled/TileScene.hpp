@@ -2,6 +2,7 @@
 
 #include <QGraphicsScene>
 #include <QGraphicsPixmapItem>
+#include <QImage>
 #include <QPixmap>
 #include <QRectF>
 #include <vector>
@@ -11,9 +12,9 @@
 #include "vc/core/render/TileTypes.hpp"
 #include "vc/core/render/TileGrid.hpp"
 
-// Manages a grid of QGraphicsPixmapItems covering the full content on a QGraphicsScene.
-// Data/logic operations are delegated to the platform-agnostic TileGrid in core;
-// this class keeps only QGraphicsPixmapItem management for display.
+// Single-framebuffer display: one QGraphicsPixmapItem sized to the viewport.
+// The tiled rendering pipeline (TileGrid, ViewportRenderer) runs internally;
+// this class composites rendered tiles into a single QImage for display.
 class TileScene
 {
 public:
@@ -21,46 +22,30 @@ public:
 
     explicit TileScene(QGraphicsScene* scene);
 
-    // Rebuild the grid to cover the given content bounds.
-    // Retains old items as background layer and creates new ones.
-    // viewportW/H are used to pad the scene rect so centerOn() works when
-    // content is smaller than the viewport.
+    // Update grid bounds and resize the framebuffer.
     void rebuildGrid(const ContentBounds& bounds, int viewportW, int viewportH);
 
-    // Set tile with staleness check (uses grid-local coordinates).
-    // Returns true if pixmap was applied.
-    bool setTile(const TileKey& key, const QPixmap& pixmap,
-                 uint64_t epoch, int8_t level);
+    // Blit a rendered tile's pixels into the framebuffer at the correct position.
+    // Called from the result callback for each completed tile.
+    void blitTile(const WorldTileKey& wk, const uint32_t* pixels, int w, int h);
 
-    // Set tile by world key (converts to grid position internally).
-    bool setTileWorld(const WorldTileKey& wk, const QPixmap& pixmap,
-                      uint64_t epoch, int8_t level);
-
-    // Set only the QGraphicsPixmapItem pixmap without round-tripping pixels
-    // back into TileGrid.  Use when the grid already has the pixel data
-    // (e.g. syncTilesToScene reads from grid, converts to QPixmap, and just
-    // needs to update the display item).
-    bool setTilePixmapOnly(const WorldTileKey& wk, const QPixmap& pixmap);
-
-    // Returns true if the tile at wk has no rendered content (level == -1).
-    // Used to decide whether a synchronous coarse preview is needed.
-    bool tileNeedsContent(const WorldTileKey& wk) const;
+    // Push the framebuffer to the display item (call once per tick).
+    void flush();
 
     // Reset all tile metadata (on full invalidation)
     void resetMetadata();
 
-    // Set all tiles to a gray placeholder
+    // Clear framebuffer to gray
     void clearAll();
 
     // Call after the QGraphicsScene is cleared externally.
     void sceneCleared();
 
-    // Remove and delete retained (background) items from previous grid rebuilds.
-    void clearRetained();
-    bool hasRetainedItems() const { return !_retainedItems.empty(); }
-
-    // Number of tiles that have no rendered content (level == -1).
-    // Tracked incrementally -- O(1) to query.
+    // Legacy compatibility
+    bool setTilePixmapOnly(const WorldTileKey& wk, const QPixmap& pixmap);
+    bool tileNeedsContent(const WorldTileKey& wk) const;
+    void clearRetained() {}
+    bool hasRetainedItems() const { return false; }
     int unfilledTileCount() const { return _grid.unfilledTileCount(); }
 
     // Content bounds
@@ -78,31 +63,24 @@ public:
     std::vector<WorldTileKey> visibleTiles(const QRectF& viewportSceneRect,
                                             int buffer = tiled_config::VISIBLE_BUFFER_TILES) const;
 
-    // Returns the coarsest (worst) actual pyramid level among visible tiles,
-    // or -1 if no tiles have been rendered yet.
     int worstVisibleLevel(const QRectF& viewportSceneRect) const;
 
-    // Returns world keys of tiles whose rendered level is worse than desiredLevel,
-    // limited to tiles visible in the given viewport rect.
     std::vector<WorldTileKey> staleTilesInRect(int desiredLevel, uint64_t epoch,
                                                 const QRectF& viewportSceneRect,
                                                 int buffer = tiled_config::VISIBLE_BUFFER_TILES) const;
 
-    // Iterate all tile keys (grid-local)
     template<typename Func>
     void forEachTile(Func&& fn) const {
         _grid.forEachTile(std::forward<Func>(fn));
     }
 
-    // Access the underlying platform-agnostic grid
     vc::render::TileGrid& grid() { return _grid; }
     const vc::render::TileGrid& grid() const { return _grid; }
 
 private:
-    QGraphicsPixmapItem* itemAt(int col, int row) const;
-
     QGraphicsScene* _scene;
     vc::render::TileGrid _grid;
-    std::vector<QGraphicsPixmapItem*> _items; // row-major: [row * totalCols + col]
-    std::vector<QGraphicsPixmapItem*> _retainedItems; // old items kept as background during transition
+    QGraphicsPixmapItem* _displayItem = nullptr;  // single display item
+    QImage _framebuffer;                           // viewport-sized ARGB32 buffer
+    bool _dirty = false;                           // framebuffer changed since last flush
 };
