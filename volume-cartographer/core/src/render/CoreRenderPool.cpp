@@ -8,7 +8,6 @@
 
 #include <utils/thread_pool.hpp>
 
-static constexpr uint64_t kEpochSlack = 5;
 
 namespace vc::render {
 
@@ -40,12 +39,6 @@ void CoreRenderPool::submit(const TileRenderParams& params,
 
     pool_->submit(priority,
         [this, params, surface, volume, epochRef, controllerId, submitTime]() {
-            uint64_t currentEpoch = epochRef->load(std::memory_order_relaxed);
-            if (currentEpoch > kEpochSlack && params.epoch < currentEpoch - kEpochSlack) {
-                pendingCount_.fetch_sub(1, std::memory_order_relaxed);
-                return;
-            }
-
             TileRenderResult result = TileRenderer::renderTile(params, surface, volume.get());
             result.controllerId = controllerId;
             result.submitTime = submitTime;
@@ -65,15 +58,13 @@ std::vector<TileRenderResult> CoreRenderPool::drainCompleted(uint64_t minEpoch, 
         std::swap(all, completedResults_);
     }
 
-    uint64_t effectiveMin = (minEpoch > kEpochSlack) ? minEpoch - kEpochSlack : 0;
-
     std::vector<TileRenderResult> results;
     std::vector<TileRenderResult> remaining;
 
     for (auto& item : all) {
         if (item.controllerId != controllerId) {
             remaining.push_back(std::move(item));
-        } else if (item.epoch >= effectiveMin) {
+        } else {
             results.push_back(std::move(item));
         }
     }

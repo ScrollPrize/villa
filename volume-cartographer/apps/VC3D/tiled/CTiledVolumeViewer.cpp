@@ -864,13 +864,15 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
         }
     }
 
-    // Immediate zoom: rebuild grid and render right now.
+    // Rebuild grid and render. Don't bump epoch — tiles from the previous
+    // zoom step are still valid to display (just slightly wrong scale).
+    // Bumping epoch on every zoom step causes rapid staleness and tiles
+    // get dropped before they finish rendering.
     fGraphicsView->resetTransform();
     rebuildContentGrid();
     centerViewport();
     _focusSurfacePos[0] = _camera.surfacePtr[0];
     _focusSurfacePos[1] = _camera.surfacePtr[1];
-    _camera.invalidate();
 
     auto surf = _surfWeak.lock();
     if (surf && _volume && _volume->zarrDataset() &&

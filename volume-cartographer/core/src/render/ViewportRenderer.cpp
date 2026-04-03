@@ -250,6 +250,7 @@ bool ViewportRenderer::tick()
     int drainedAfter = pool()->pendingCount();
     bool drainedSomething = drainedAfter < drainedBefore;
 
+
     // 2. Check if chunks arrived (atomic test-and-clear to avoid TOCTOU
     //    with markChunkArrived() called from signal handlers on other threads)
     bool chunksJustArrived = _chunkArrived.exchange(false, std::memory_order_acq_rel);
