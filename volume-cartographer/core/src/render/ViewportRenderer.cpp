@@ -34,19 +34,8 @@ void ViewportRenderer::onCameraChanged(
     const std::function<TileRenderParams(const WorldTileKey&)>& buildParams,
     float vpLeft, float vpTop, float vpRight, float vpBottom)
 {
-    bool epochChanged = (camera.epoch != _currentEpoch->load(std::memory_order_relaxed));
-
-    if (!epochChanged &&
-        std::abs(vpLeft - _lastVpL) < 0.5f && std::abs(vpTop - _lastVpT) < 0.5f &&
-        std::abs(vpRight - _lastVpR) < 0.5f && std::abs(vpBottom - _lastVpB) < 0.5f) {
-        return;
-    }
-
     _currentEpoch->store(camera.epoch, std::memory_order_relaxed);
     _desiredLevel = camera.dsScaleIdx;
-
-    _inFlightTiles.clear();
-
     _lastCamera = camera;
     _lastSurface = surface;
     _lastVolume = volume;
@@ -56,60 +45,16 @@ void ViewportRenderer::onCameraChanged(
     _lastVpR = vpRight;
     _lastVpB = vpBottom;
 
+    // Get visible tiles and submit them all
     auto visibleKeys = _tileGrid.visibleTiles(vpLeft, vpTop, vpRight, vpBottom,
                                                tiled_config::VISIBLE_BUFFER_TILES);
 
-    // Compute chunk group size in tile units.
-    int chunkGroupSize = 4;
-    if (volume && volume->tieredCache()) {
-        auto cs = volume->tieredCache()->chunkShape(camera.dsScaleIdx);
-        float worldTileSize = _tileGrid.bounds().worldTileSize;
-        if (worldTileSize > 0)
-            chunkGroupSize = std::max(1, static_cast<int>(std::round(static_cast<float>(cs[1]) / worldTileSize)));
-    }
-
-    // Sort by chunk group (center-first within groups) for cache locality.
-    {
-        float vcx = (vpLeft + vpRight) * 0.5f / TileGrid::TILE_PX;
-        float vcy = (vpTop + vpBottom) * 0.5f / TileGrid::TILE_PX;
-        float cgsF = static_cast<float>(chunkGroupSize);
-        int cgs = chunkGroupSize;
-        auto floorDiv = [](int a, int b) { return (a >= 0) ? a / b : (a - b + 1) / b; };
-        std::sort(visibleKeys.begin(), visibleKeys.end(),
-            [vcx, vcy, cgs, cgsF, floorDiv](const WorldTileKey& a, const WorldTileKey& b) {
-                int gaCol = floorDiv(a.worldCol, cgs);
-                int gaRow = floorDiv(a.worldRow, cgs);
-                int gbCol = floorDiv(b.worldCol, cgs);
-                int gbRow = floorDiv(b.worldRow, cgs);
-                if (gaCol != gbCol || gaRow != gbRow) {
-                    float gaCx = static_cast<float>(gaCol) * cgsF + cgsF * 0.5f;
-                    float gaCy = static_cast<float>(gaRow) * cgsF + cgsF * 0.5f;
-                    float gbCx = static_cast<float>(gbCol) * cgsF + cgsF * 0.5f;
-                    float gbCy = static_cast<float>(gbRow) * cgsF + cgsF * 0.5f;
-                    float dga = (gaCx - vcx) * (gaCx - vcx) + (gaCy - vcy) * (gaCy - vcy);
-                    float dgb = (gbCx - vcx) * (gbCx - vcx) + (gbCy - vcy) * (gbCy - vcy);
-                    return dga < dgb;
-                }
-                float dax = static_cast<float>(a.worldCol) - vcx;
-                float day = static_cast<float>(a.worldRow) - vcy;
-                float dbx = static_cast<float>(b.worldCol) - vcx;
-                float dby = static_cast<float>(b.worldRow) - vcy;
-                float da = dax * dax + day * day;
-                float db = dbx * dbx + dby * dby;
-                return da < db;
-            });
-    }
-
-    int submitOrder = 0;
+    fprintf(stderr, "[cam] scale=%.3f visible=%zu vp=[%.0f,%.0f,%.0f,%.0f] pending=%d\n",
+        camera.scale, visibleKeys.size(), vpLeft, vpTop, vpRight, vpBottom, pool()->pendingCount());
 
     for (const auto& wk : visibleKeys) {
-        if (_inFlightTiles.find(wk) == _inFlightTiles.end()) {
-            TileRenderParams params = buildParams(wk);
-            params.submitPriority = -params.dsScaleIdx * 10000 + submitOrder;
-            pool()->submit(params, surface, volume, _currentEpoch, _controllerId);
-            _inFlightTiles.insert(wk);
-            ++submitOrder;
-        }
+        TileRenderParams params = buildParams(wk);
+        pool()->submit(params, surface, volume, _currentEpoch, _controllerId);
     }
 }
 
