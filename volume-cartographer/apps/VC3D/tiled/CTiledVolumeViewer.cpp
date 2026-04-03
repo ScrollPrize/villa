@@ -578,93 +578,64 @@ void CTiledVolumeViewer::rebuildContentGrid()
     // Cap grid size to prevent freeze at extreme zoom.
     // At 10x zoom on a large volume, uncapped grid can have 20,000+ tiles.
     // Limit to a window around the camera position.
-    constexpr int kMaxTilesPerAxis = 256;
-    constexpr int kMaxTotalTiles = kMaxTilesPerAxis * kMaxTilesPerAxis;
+    // Cap the grid to viewport-sized window to avoid creating thousands of
+    // off-screen QGraphicsPixmapItems at high zoom. The ViewportRenderer
+    // already only renders visible tiles, so the grid just needs to cover
+    // the viewport + buffer.
+    QSize vpSize2 = fGraphicsView->viewport()->size();
+    int vpTilesW = static_cast<int>(std::ceil(
+        static_cast<float>(vpSize2.width()) / TileScene::TILE_PX)) + 2 * tiled_config::VISIBLE_BUFFER_TILES;
+    int vpTilesH = static_cast<int>(std::ceil(
+        static_cast<float>(vpSize2.height()) / TileScene::TILE_PX)) + 2 * tiled_config::VISIBLE_BUFFER_TILES;
+
+    // Only window if the full grid is significantly larger than viewport
     _gridWindowed = false;
+    if (bounds.totalCols > vpTilesW * 2 || bounds.totalRows > vpTilesH * 2) {
+        int windowCols = vpTilesW * 2;
+        int windowRows = vpTilesH * 2;
 
-    if (bounds.totalCols > 0 && bounds.totalRows > 0 &&
-        bounds.totalCols * bounds.totalRows > kMaxTotalTiles) {
-
-        // Determine viewport size in tiles (+ buffer)
-        QSize vpSize = fGraphicsView->viewport()->size();
-        int vpTilesW = static_cast<int>(std::ceil(
-            static_cast<float>(vpSize.width()) / TileScene::TILE_PX)) + 2 * tiled_config::VISIBLE_BUFFER_TILES;
-        int vpTilesH = static_cast<int>(std::ceil(
-            static_cast<float>(vpSize.height()) / TileScene::TILE_PX)) + 2 * tiled_config::VISIBLE_BUFFER_TILES;
-
-        // Window size: enough for viewport + generous buffer, capped at max
-        int windowCols = std::min(std::max(vpTilesW * 2, 16), kMaxTilesPerAxis);
-        int windowRows = std::min(std::max(vpTilesH * 2, 16), kMaxTilesPerAxis);
-
-        if (windowCols * windowRows > kMaxTotalTiles) {
-            float aspect = static_cast<float>(windowCols) / static_cast<float>(windowRows);
-            windowCols = static_cast<int>(std::sqrt(kMaxTotalTiles * aspect));
-            windowRows = kMaxTotalTiles / windowCols;
-        }
-
-        // Keep the grid's firstWorldCol/Row stable to prevent visual jumps.
-        // When transitioning TO windowed, clamp the existing range rather than
-        // re-centering. When already windowed, keep position unless camera
-        // reaches the edge.
-        {
-        // Default: keep existing firstWorldCol, just shrink totalCols/Rows
         int contentFirstCol = bounds.firstWorldCol;
         int contentFirstRow = bounds.firstWorldRow;
         int contentTotalCols = bounds.totalCols;
         int contentTotalRows = bounds.totalRows;
 
-        // Camera position in tile coords
         float cameraTileCol = _camera.surfacePtr[0] / bounds.worldTileSize;
         float cameraTileRow = _camera.surfacePtr[1] / bounds.worldTileSize;
         int camCol = static_cast<int>(std::round(cameraTileCol));
         int camRow = static_cast<int>(std::round(cameraTileRow));
 
-        int winFirstCol, winFirstRow;
+        // Keep window position stable — only shift when camera nears edge
+        int winFirstCol = contentFirstCol;
+        int winFirstRow = contentFirstRow;
 
-        if (_gridWindowed) {
-            // Already windowed — keep position unless camera near edge
-            int margin = 4;
+        if (_contentBounds.totalCols > 0 && _contentBounds.totalCols <= windowCols + 4) {
+            // Previous grid was windowed with similar size — keep its position
             winFirstCol = _contentBounds.firstWorldCol;
             winFirstRow = _contentBounds.firstWorldRow;
+            int margin = vpTilesW / 2;
             if (camCol < winFirstCol + margin || camCol >= winFirstCol + windowCols - margin)
                 winFirstCol = camCol - windowCols / 2;
             if (camRow < winFirstRow + margin || camRow >= winFirstRow + windowRows - margin)
                 winFirstRow = camRow - windowRows / 2;
         } else {
-            // First time windowing — keep firstWorldCol, clamp window around camera
-            // Start from existing origin, only shift if camera would be outside
-            winFirstCol = contentFirstCol;
-            winFirstRow = contentFirstRow;
+            // First time or size changed — position window around camera
             if (camCol < winFirstCol || camCol >= winFirstCol + windowCols)
                 winFirstCol = camCol - windowCols / 2;
             if (camRow < winFirstRow || camRow >= winFirstRow + windowRows)
                 winFirstRow = camRow - windowRows / 2;
         }
 
-        // Clamp window to content extent
-        winFirstCol = std::max(winFirstCol, contentFirstCol);
-        winFirstRow = std::max(winFirstRow, contentFirstRow);
-        int winLastCol = winFirstCol + windowCols - 1;
-        int winLastRow = winFirstRow + windowRows - 1;
+        // Clamp to content extent
         int contentLastCol = contentFirstCol + contentTotalCols - 1;
         int contentLastRow = contentFirstRow + contentTotalRows - 1;
-        if (winLastCol > contentLastCol) {
-            winFirstCol -= (winLastCol - contentLastCol);
-            winFirstCol = std::max(winFirstCol, contentFirstCol);
-            winLastCol = contentLastCol;
-        }
-        if (winLastRow > contentLastRow) {
-            winFirstRow -= (winLastRow - contentLastRow);
-            winFirstRow = std::max(winFirstRow, contentFirstRow);
-            winLastRow = contentLastRow;
-        }
+        winFirstCol = std::clamp(winFirstCol, contentFirstCol, std::max(contentFirstCol, contentLastCol - windowCols + 1));
+        winFirstRow = std::clamp(winFirstRow, contentFirstRow, std::max(contentFirstRow, contentLastRow - windowRows + 1));
 
         bounds.firstWorldCol = winFirstCol;
         bounds.firstWorldRow = winFirstRow;
-        bounds.totalCols = winLastCol - winFirstCol + 1;
-        bounds.totalRows = winLastRow - winFirstRow + 1;
+        bounds.totalCols = std::min(windowCols, contentLastCol - winFirstCol + 1);
+        bounds.totalRows = std::min(windowRows, contentLastRow - winFirstRow + 1);
         _gridWindowed = true;
-        }
     }
 
     _contentBounds = bounds;
