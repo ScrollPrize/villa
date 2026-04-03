@@ -56,8 +56,9 @@ public:
     // Clear cached state so stale callbacks can't re-trigger renders.
     void clearState();
 
-    // Dirty flags.
-    void markChunkArrived();
+    // A chunk was loaded into hot cache. Only triggers re-render if
+    // the chunk is at a useful pyramid level for the current view.
+    void markChunkArrived(int chunkLevel);
     void markOverlaysDirty();
 
     // One tick = take results + blit + maybe refine. Returns true if more work pending.

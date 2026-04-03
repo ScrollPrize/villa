@@ -75,7 +75,7 @@ public:
 
     // --- Dirty flags (set by viewer, processed each tick) ---
     void markOverlaysDirty();
-    void markChunkArrived();
+    void markChunkArrived(int chunkLevel = 0);
     void setOverlayCallback(std::function<void()> cb);
 
     // Rebuild ViewportRenderer's TileGrid (the authoritative grid).
@@ -105,7 +105,6 @@ private:
     RenderPool* _renderPool;  // shared, not owned
     bool _tickPending = false;
     bool _anyUpdatedThisTick = false;
-    bool _blendActive = false;
     QTimer* _vsyncTimer = nullptr;
 
     vc::render::ViewportRenderer _viewportRenderer;

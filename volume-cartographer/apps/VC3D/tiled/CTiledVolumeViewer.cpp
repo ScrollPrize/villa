@@ -340,9 +340,9 @@ void CTiledVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         QPointer<CTiledVolumeViewer> viewerGuard(this);
         _chunkCbId = cache->addChunkReadyListener(
             [ctrl, viewerGuard, cache](const vc::cache::ChunkKey& key) {
-                (void)key;
-                QMetaObject::invokeMethod(ctrl, [ctrl, cache]() {
-                    ctrl->markChunkArrived();
+                int level = key.level;
+                QMetaObject::invokeMethod(ctrl, [ctrl, cache, level]() {
+                    ctrl->markChunkArrived(level);
                     cache->clearChunkArrivedFlag();
                 }, Qt::QueuedConnection);
                 QMetaObject::invokeMethod(qApp, [viewerGuard]() {
@@ -834,14 +834,13 @@ void CTiledVolumeViewer::zoomAt(float factor, const QPointF& scenePos)
 
 void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 {
-    int scaledSteps = static_cast<int>(std::round(static_cast<float>(steps) * _navSpeed));
-    if (scaledSteps == 0 && steps != 0) scaledSteps = (steps > 0) ? 1 : -1;
+    if (steps == 0) return;
 
-    const float newScale = std::max(
-        TiledViewerCamera::stepScale(_camera.scale, scaledSteps), _contentMinScale);
-    if (std::abs(newScale - _camera.scale) < _camera.scale * 0.005f) {
-        return;
-    }
+    // ~5% zoom per wheel notch (standard for map/image viewers), scaled by navSpeed.
+    float factor = std::pow(1.05f, static_cast<float>(steps) * _navSpeed);
+    float newScale = std::clamp(_camera.scale * factor,
+                                 _contentMinScale, TiledViewerCamera::MAX_SCALE);
+    if (std::abs(newScale - _camera.scale) < _camera.scale * 1e-6f) return;
 
     // Zoom-at-point: the surface position under the cursor stays fixed.
     // scenePos is viewport-relative coordinates (not scene coords).
@@ -887,7 +886,12 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 
 void CTiledVolumeViewer::setSliceOffset(float dz)
 {
-    _camera.zOff = std::clamp(_camera.zOff + dz, -500.0f, 500.0f);
+    float maxZ = 10000.0f;
+    if (_volume) {
+        auto [w, h, d] = _volume->shape();
+        maxZ = static_cast<float>(std::max({w, h, d}));
+    }
+    _camera.zOff = std::clamp(_camera.zOff + dz, -maxZ, maxZ);
     _zVelocity = dz;
     _camera.invalidate();
     submitRender();
@@ -911,8 +915,8 @@ void CTiledVolumeViewer::onZoom(int steps, QPointF scene_point, Qt::KeyboardModi
         if (steps == 0) return;
 
         PlaneSurface* plane = dynamic_cast<PlaneSurface*>(surf.get());
-        int stepSize = _viewerManager ? _viewerManager->sliceStepSize() : 1;
-        float adjustedSteps = static_cast<float>(steps * stepSize) * _navSpeed;
+        // 1 voxel per notch at navSpeed=1, scaled by navSpeed
+        float adjustedSteps = static_cast<float>(steps) * _navSpeed;
 
         if (_surfName != "segmentation" && plane && _state) {
             POI* focus = _state->poi("focus");

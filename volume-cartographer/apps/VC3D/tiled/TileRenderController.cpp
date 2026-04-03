@@ -124,9 +124,9 @@ void TileRenderController::markOverlaysDirty()
     ensureTickRunning();
 }
 
-void TileRenderController::markChunkArrived()
+void TileRenderController::markChunkArrived(int chunkLevel)
 {
-    _viewportRenderer.markChunkArrived();
+    _viewportRenderer.markChunkArrived(chunkLevel);
     ensureTickRunning();
 }
 
@@ -145,14 +145,11 @@ void TileRenderController::tick()
     _anyUpdatedThisTick = false;
     bool moreWork = _viewportRenderer.tick();
 
-    // flush returns true if crossfade is still in progress
-    bool blending = false;
-    if (_anyUpdatedThisTick || _blendActive) {
-        blending = _tileScene->flush();
-        _blendActive = blending;
+    if (_anyUpdatedThisTick) {
+        _tileScene->flush();
         emit sceneNeedsUpdate();
     }
 
-    if (!moreWork && !blending)
+    if (!moreWork)
         _vsyncTimer->stop();
 }

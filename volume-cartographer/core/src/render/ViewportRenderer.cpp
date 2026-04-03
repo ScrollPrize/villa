@@ -134,9 +134,14 @@ void ViewportRenderer::setOverlayCallback(std::function<void()> cb)
     _overlayCallback = std::move(cb);
 }
 
-void ViewportRenderer::markChunkArrived()
+void ViewportRenderer::markChunkArrived(int chunkLevel)
 {
-    _chunkArrived.store(true, std::memory_order_release);
+    // Only trigger re-render if the chunk could improve what's displayed.
+    // Chunks coarser than the desired level won't help. Chunks at the
+    // desired level or 1-2 levels coarser are useful (best-effort fallback).
+    if (chunkLevel <= _desiredLevel + 2) {
+        _chunkArrived.store(true, std::memory_order_release);
+    }
 }
 
 void ViewportRenderer::markOverlaysDirty()
@@ -184,9 +189,11 @@ bool ViewportRenderer::tick()
     // 2. Chunks arrived → re-render for finer data
     bool chunksJustArrived = _chunkArrived.exchange(false, std::memory_order_acq_rel);
 
-    // 3. Progressive refinement: if pool is idle, submit stale tiles
-    bool poolIdle = !pool()->busy();
-    bool shouldRefine = chunksJustArrived || (poolIdle && !_pendingDirty);
+    // 3. Progressive refinement: only re-render when new chunks arrived
+    //    (meaning finer data is now available). Don't spin re-rendering
+    //    on idle — if the same coarse level is all that's cached, we'd
+    //    just produce identical pixels and waste CPU.
+    bool shouldRefine = chunksJustArrived;
     if (_progressiveEnabled && shouldRefine) {
         if (_lastSurface && _lastVolume && _lastBuildParams) {
             auto stale = _tileGrid.staleTilesInRect(
