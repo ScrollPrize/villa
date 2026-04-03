@@ -12,61 +12,38 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
 {
     _grid.rebuildGrid(bounds, viewportW, viewportH);
 
-    const auto& b = _grid.bounds();
-    float padX = _grid.padX();
-    float padY = _grid.padY();
+    // Scene rect = viewport size. No scrolling — we blit directly.
+    _scene->setSceneRect(0, 0, viewportW, viewportH);
 
-    float contentPxW = static_cast<float>(b.totalCols) * TILE_PX;
-    float contentPxH = static_cast<float>(b.totalRows) * TILE_PX;
-    float sceneW = std::max(contentPxW, static_cast<float>(viewportW));
-    float sceneH = std::max(contentPxH, static_cast<float>(viewportH));
-    _scene->setSceneRect(0, 0, static_cast<qreal>(sceneW), static_cast<qreal>(sceneH));
-
-    // Framebuffer covers the full content grid.
-    // Only reallocate if it needs to GROW — never shrink (avoids clearing on
-    // every zoom step when windowing changes totalCols).
-    int fbW = std::max(1, static_cast<int>(contentPxW));
-    int fbH = std::max(1, static_cast<int>(contentPxH));
-
-    if (_framebuffer.isNull() || _framebuffer.width() < fbW || _framebuffer.height() < fbH) {
-        // Grow to at least the needed size, with some headroom to avoid
-        // repeated reallocations during zoom
-        int newW = std::max(fbW, _framebuffer.width());
-        int newH = std::max(fbH, _framebuffer.height());
-        QImage newFb(newW, newH, QImage::Format_RGB32);
-        newFb.fill(QColor(64, 64, 64));
-        // Copy old content if we had any
-        if (!_framebuffer.isNull()) {
-            int copyW = std::min(_framebuffer.width(), newW);
-            int copyH = std::min(_framebuffer.height(), newH);
-            for (int y = 0; y < copyH; y++) {
-                std::memcpy(newFb.scanLine(y), _framebuffer.constScanLine(y),
-                            static_cast<size_t>(copyW) * 4);
-            }
-        }
-        _framebuffer = std::move(newFb);
+    // Framebuffer = viewport size (always)
+    if (_framebuffer.isNull() || _framebuffer.width() != viewportW || _framebuffer.height() != viewportH) {
+        _framebuffer = QImage(std::max(1, viewportW), std::max(1, viewportH), QImage::Format_RGB32);
+        _framebuffer.fill(QColor(64, 64, 64));
     }
 
-    // Create or reposition the single display item
     if (!_displayItem) {
         _displayItem = _scene->addPixmap(QPixmap::fromImage(_framebuffer));
         _displayItem->setZValue(0);
     }
-    _displayItem->setPos(static_cast<qreal>(padX), static_cast<qreal>(padY));
+    // Display item always at (0,0) — it IS the viewport
+    _displayItem->setPos(0, 0);
     _dirty = true;
 }
 
 void TileScene::blitTile(const WorldTileKey& wk, const uint32_t* pixels, int w, int h)
 {
+    if (_framebuffer.isNull()) return;
     const auto& b = _grid.bounds();
-    int col, row;
-    if (!b.gridPosition(wk, col, row)) return;
+    if (b.scale <= 0 || b.worldTileSize <= 0) return;
 
-    // Tile position in the framebuffer
-    int dstX = col * TILE_PX;
-    int dstY = row * TILE_PX;
+    // Viewport-relative position: (tileSurf - camera) * scale + viewport/2
+    float tileSurfX = static_cast<float>(wk.worldCol) * b.worldTileSize;
+    float tileSurfY = static_cast<float>(wk.worldRow) * b.worldTileSize;
+    float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
+    float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
+    int dstX = static_cast<int>((tileSurfX - _camSurfX) * _camScale + vpCx);
+    int dstY = static_cast<int>((tileSurfY - _camSurfY) * _camScale + vpCy);
 
-    // Clip to framebuffer
     int fbW = _framebuffer.width();
     int fbH = _framebuffer.height();
     if (dstX >= fbW || dstY >= fbH || dstX + w <= 0 || dstY + h <= 0) return;
@@ -80,7 +57,6 @@ void TileScene::blitTile(const WorldTileKey& wk, const uint32_t* pixels, int w, 
     int dstStartX = std::max(0, dstX);
     int dstStartY = std::max(0, dstY);
 
-    // Blit row by row
     for (int y = 0; y < copyH; y++) {
         const uint32_t* srcRow = pixels + (srcStartY + y) * w + srcStartX;
         uchar* dstRow = _framebuffer.scanLine(dstStartY + y) + dstStartX * 4;
@@ -98,10 +74,8 @@ void TileScene::flush()
 
 bool TileScene::setTilePixmapOnly(const WorldTileKey& wk, const QPixmap& pixmap)
 {
-    // Legacy path: convert QPixmap to pixels and blit
     QImage img = pixmap.toImage().convertToFormat(QImage::Format_RGB32);
     if (img.isNull()) return false;
-    // The pixel data is ARGB32 = RGB32 in Qt
     const auto* pixels = reinterpret_cast<const uint32_t*>(img.constBits());
     blitTile(wk, pixels, img.width(), img.height());
     return true;
@@ -119,7 +93,8 @@ void TileScene::resetMetadata()
 
 void TileScene::clearAll()
 {
-    _framebuffer.fill(QColor(64, 64, 64));
+    if (!_framebuffer.isNull())
+        _framebuffer.fill(QColor(64, 64, 64));
     _dirty = true;
     resetMetadata();
 }
@@ -132,14 +107,21 @@ void TileScene::sceneCleared()
 
 QPointF TileScene::surfaceToScene(float surfX, float surfY) const
 {
-    auto v = _grid.surfaceToGrid(surfX, surfY);
-    return {static_cast<qreal>(v[0]), static_cast<qreal>(v[1])};
+    if (_framebuffer.isNull()) return {0, 0};
+    float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
+    float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
+    return {static_cast<qreal>((surfX - _camSurfX) * _camScale + vpCx),
+            static_cast<qreal>((surfY - _camSurfY) * _camScale + vpCy)};
 }
 
 cv::Vec2f TileScene::sceneToSurface(const QPointF& scenePos) const
 {
-    return _grid.gridToSurface(static_cast<float>(scenePos.x()),
-                               static_cast<float>(scenePos.y()));
+    if (_framebuffer.isNull() || _camScale <= 0) return {0, 0};
+    float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
+    float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
+    float surfX = (static_cast<float>(scenePos.x()) - vpCx) / _camScale + _camSurfX;
+    float surfY = (static_cast<float>(scenePos.y()) - vpCy) / _camScale + _camSurfY;
+    return {surfX, surfY};
 }
 
 std::vector<WorldTileKey> TileScene::visibleTiles(const QRectF& viewportSceneRect,

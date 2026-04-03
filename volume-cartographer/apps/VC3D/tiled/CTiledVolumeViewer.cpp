@@ -648,8 +648,7 @@ void CTiledVolumeViewer::rebuildContentGrid()
 void CTiledVolumeViewer::centerViewport()
 {
     if (!fGraphicsView || !_tileScene) return;
-    QPointF scenePos = _tileScene->surfaceToScene(_camera.surfacePtr[0], _camera.surfacePtr[1]);
-    fGraphicsView->centerOn(scenePos);
+    _tileScene->setCamera(_camera.surfacePtr[0], _camera.surfacePtr[1], _camera.scale);
 }
 
 void CTiledVolumeViewer::onPinComplete()

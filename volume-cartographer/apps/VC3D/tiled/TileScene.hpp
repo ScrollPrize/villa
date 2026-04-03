@@ -77,10 +77,18 @@ public:
     vc::render::TileGrid& grid() { return _grid; }
     const vc::render::TileGrid& grid() const { return _grid; }
 
+    // Set camera position for viewport-relative blitting
+    void setCamera(float surfX, float surfY, float scale) {
+        _camSurfX = surfX; _camSurfY = surfY; _camScale = scale;
+    }
+
 private:
     QGraphicsScene* _scene;
     vc::render::TileGrid _grid;
-    QGraphicsPixmapItem* _displayItem = nullptr;  // single display item
-    QImage _framebuffer;                           // viewport-sized ARGB32 buffer
-    bool _dirty = false;                           // framebuffer changed since last flush
+    QGraphicsPixmapItem* _displayItem = nullptr;
+    QImage _framebuffer;
+    bool _dirty = false;
+
+    // Camera state for viewport-relative positioning
+    float _camSurfX = 0, _camSurfY = 0, _camScale = 1.0f;
 };
