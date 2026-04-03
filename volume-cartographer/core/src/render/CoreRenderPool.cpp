@@ -27,10 +27,6 @@ void CoreRenderPool::submit(const TileRenderParams& params,
                             const std::shared_ptr<std::atomic<uint64_t>>& epochRef,
                             int controllerId)
 {
-    constexpr int kMaxQueuedTasks = 128;
-    if (pendingCount_.load(std::memory_order_relaxed) > kMaxQueuedTasks)
-        return;
-
     pendingCount_.fetch_add(1, std::memory_order_relaxed);
 
     int priority = params.submitPriority;
