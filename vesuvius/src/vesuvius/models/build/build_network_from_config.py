@@ -263,6 +263,7 @@ class NetworkFromConfig(nn.Module):
         self.guide_feature_gate_alpha = 1.0
         self.guide_direct_output_mode = None
         self.direct_segmentation_target_name = None
+        self.freeze_encoder = bool(model_config.get("freeze_encoder", False))
         self.guide_freeze = bool(model_config.get("guide_freeze", True))
         guide_compile_policy = str(model_config.get("guide_compile_policy", "off")).strip().lower()
         if guide_compile_policy not in {"off", "backbone_only", "tokenbook_only", "all_guidance"}:
@@ -1078,6 +1079,11 @@ class NetworkFromConfig(nn.Module):
             input_shape=input_shape,
             config_path=config_path,
         )
+        if self.freeze_encoder:
+            for parameter in self.shared_encoder.parameters():
+                parameter.requires_grad_(False)
+            self.shared_encoder.eval()
+            print("Encoder frozen — weights will not be updated during training")
         self.task_decoders = nn.ModuleDict()
         self.task_activations = nn.ModuleDict()
         self.task_heads = nn.ModuleDict()
@@ -1133,6 +1139,7 @@ class NetworkFromConfig(nn.Module):
             "architecture_type": self.architecture_type,
             "pretrained_backbone": self.pretrained_backbone,
             "pretrained_decoder_type": decoder_type,
+            "freeze_encoder": self.freeze_encoder,
             "input_shape": input_shape,
             "in_channels": self.in_channels,
             "targets": self.targets,
@@ -1323,6 +1330,8 @@ class NetworkFromConfig(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
+        if self.pretrained_backbone and self.freeze_encoder and self.shared_encoder is not None:
+            self.shared_encoder.eval()
         if self.guide_enabled and self.guide_freeze and self.guide_backbone is not None:
             self.guide_backbone.eval()
         return self
