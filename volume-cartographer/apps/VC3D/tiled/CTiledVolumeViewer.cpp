@@ -864,10 +864,6 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
         }
     }
 
-    // Rebuild grid and render. Don't bump epoch — tiles from the previous
-    // zoom step are still valid to display (just slightly wrong scale).
-    // Bumping epoch on every zoom step causes rapid staleness and tiles
-    // get dropped before they finish rendering.
     fGraphicsView->resetTransform();
     rebuildContentGrid();
     centerViewport();

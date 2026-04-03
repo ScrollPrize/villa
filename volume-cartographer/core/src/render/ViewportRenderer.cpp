@@ -45,12 +45,7 @@ void ViewportRenderer::onCameraChanged(
     _currentEpoch->store(camera.epoch, std::memory_order_relaxed);
     _desiredLevel = camera.dsScaleIdx;
 
-    if (epochChanged) {
-        _inFlightTiles.clear();
-    } else {
-        if (pool()->pendingCount() == 0)
-            _inFlightTiles.clear();
-    }
+    _inFlightTiles.clear();
 
     _lastCamera = camera;
     _lastSurface = surface;
