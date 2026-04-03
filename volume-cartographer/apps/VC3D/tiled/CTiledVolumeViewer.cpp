@@ -829,13 +829,12 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     }
 
     // Zoom-at-point: the surface position under the cursor stays fixed.
-    // Use viewport pixel offset from center — completely independent of
-    // grid state, scene coordinates, and Qt scroll position.
-    QPointF vpPos = fGraphicsView->mapFromScene(scenePos);
+    // scenePos is actually viewport-relative coordinates (not scene coords)
+    // to avoid dependency on Qt's scroll position which shifts when grid is windowed.
     float vpCx = static_cast<float>(fGraphicsView->viewport()->width()) * 0.5f;
     float vpCy = static_cast<float>(fGraphicsView->viewport()->height()) * 0.5f;
-    float dx = static_cast<float>(vpPos.x()) - vpCx;
-    float dy = static_cast<float>(vpPos.y()) - vpCy;
+    float dx = static_cast<float>(scenePos.x()) - vpCx;
+    float dy = static_cast<float>(scenePos.y()) - vpCy;
 
     _camera.surfacePtr[0] += dx * (1.0f / _camera.scale - 1.0f / newScale);
     _camera.surfacePtr[1] += dy * (1.0f / _camera.scale - 1.0f / newScale);
@@ -882,8 +881,10 @@ void CTiledVolumeViewer::onZoom(int steps, QPointF scene_point, Qt::KeyboardModi
     if (!surf) return;
 
     if (_segmentationEditActive && (modifiers & Qt::ControlModifier)) {
-        cv::Vec3f world = sceneToVolume(scene_point);
-        emit sendSegmentationRadiusWheel(steps, scene_point, world);
+        // scene_point is viewport-relative; convert to scene for segmentation
+        QPointF sp = fGraphicsView->mapToScene(scene_point.toPoint());
+        cv::Vec3f world = sceneToVolume(sp);
+        emit sendSegmentationRadiusWheel(steps, sp, world);
         return;
     }
 

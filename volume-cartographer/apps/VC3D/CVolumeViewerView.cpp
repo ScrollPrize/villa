@@ -97,10 +97,11 @@ void CVolumeViewerView::wheelEvent(QWheelEvent *event)
     }
     _wheelAccum -= steps * kStepThreshold;
 
-    QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
-    QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
-
-    sendZoom(steps, scene_loc, event->modifiers());
+    // Pass viewport-relative mouse position directly (not scene coords).
+    // Scene coords depend on Qt scroll position which shifts when the
+    // tile grid is windowed, causing zoom-at-point to jump.
+    QPointF vp_loc = viewport()->mapFromGlobal(event->globalPosition());
+    sendZoom(steps, vp_loc, event->modifiers());
     event->accept();
 }
 
