@@ -101,6 +101,29 @@ def _make_mgr(
     )
 
 
+def _make_pretrained_backbone_mgr(
+    checkpoint_path: Path,
+    *,
+    freeze_encoder: bool,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        targets={"surface": {"out_channels": 2, "activation": "none"}},
+        train_patch_size=(16, 16, 16),
+        train_batch_size=2,
+        in_channels=1,
+        autoconfigure=False,
+        model_name="pretrained_backbone_test",
+        enable_deep_supervision=False,
+        spacing=(1.0, 1.0, 1.0),
+        model_config={
+            "pretrained_backbone": str(checkpoint_path),
+            "pretrained_decoder_type": "primus_patch_decode",
+            "freeze_encoder": bool(freeze_encoder),
+            "input_shape": [16, 16, 16],
+        },
+    )
+
+
 def test_tokenbook3d_returns_unit_interval_mask():
     module = TokenBook3D(n_tokens=8, embed_dim=16)
     x = torch.randn(2, 16, 2, 2, 2)
@@ -475,6 +498,44 @@ def test_direct_segmentation_requires_single_binary_target(tmp_path: Path):
 
     with pytest.raises(ValueError, match="exactly one non-auxiliary target"):
         NetworkFromConfig(mgr)
+
+
+def test_pretrained_backbone_freeze_encoder_disables_grads_and_preserves_weights_under_init(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_pretrained_backbone_mgr(checkpoint_path, freeze_encoder=True)
+    model = NetworkFromConfig(mgr)
+
+    assert model.final_config["freeze_encoder"] is True
+    assert all(not parameter.requires_grad for parameter in model.shared_encoder.parameters())
+
+    before = {
+        key: value.detach().clone()
+        for key, value in model.shared_encoder.state_dict().items()
+    }
+    model.apply(InitWeights_He(neg_slope=0.2))
+    after = model.shared_encoder.state_dict()
+
+    assert all(torch.equal(before[key], after[key]) for key in before)
+    model.train()
+    assert model.shared_encoder.training is False
+
+
+def test_pretrained_backbone_without_freeze_encoder_still_reinitializes_conv_stem(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_pretrained_backbone_mgr(checkpoint_path, freeze_encoder=False)
+    model = NetworkFromConfig(mgr)
+
+    before = {
+        key: value.detach().clone()
+        for key, value in model.shared_encoder.state_dict().items()
+    }
+    model.apply(InitWeights_He(neg_slope=0.2))
+    after = model.shared_encoder.state_dict()
+
+    changed = [key for key in before if not torch.equal(before[key], after[key])]
+    assert "backbone.down_projection.proj.weight" in changed
 
 
 def test_feature_encoder_guidance_backprop_updates_all_stage_tokenbooks(tmp_path: Path):
