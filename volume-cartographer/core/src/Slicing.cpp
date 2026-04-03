@@ -2107,56 +2107,78 @@ void samplePlaneCompositeARGB32(
             (void)cache->getBlocking(key);
     }
 
-    // Precompute layer offsets along normal
-    thread_local std::vector<cv::Vec3f> layerOffsets;
-    layerOffsets.resize(numLayers);
+    // Precompute scalar layer offsets (normal is constant for plane)
+    const float nx = normal[0], ny = normal[1], nz = normal[2];
+    thread_local std::vector<float> layerOffsetsX, layerOffsetsY, layerOffsetsZ;
+    layerOffsetsX.resize(numLayers);
+    layerOffsetsY.resize(numLayers);
+    layerOffsetsZ.resize(numLayers);
     for (int l = 0; l < numLayers; l++) {
         float off = static_cast<float>(zStart + l) * zStep;
-        layerOffsets[l] = normal * off;
+        layerOffsetsX[l] = nx * off;
+        layerOffsetsY[l] = ny * off;
+        layerOffsetsZ[l] = nz * off;
     }
 
-    // Determine composite mode
+    // Determine composite mode once (avoid string compare per pixel)
     const bool useMax = (compositeMethod == "max");
     const bool useMin = (compositeMethod == "min");
-    // Default: mean
+
+    // Extract step scalars for incremental coordinate computation
+    const float dxX = vx_step[0], dxY = vx_step[1], dxZ = vx_step[2];
+    const float dyX = vy_step[0], dyY = vy_step[1], dyZ = vy_step[2];
+    const float ox = origin[0], oy = origin[1], oz = origin[2];
+    const float* lox = layerOffsetsX.data();
+    const float* loy = layerOffsetsY.data();
+    const float* loz = layerOffsetsZ.data();
+    const float sxf = static_cast<float>(p.sx);
+    const float syf = static_cast<float>(p.sy);
+    const float szf = static_cast<float>(p.sz);
 
     // Sample — nearest-neighbor per layer, composite, LUT → ARGB32
     ChunkSampler<uint8_t> sampler(p, *cache, level);
     for (int y = 0; y < height; y++) {
         uint32_t* __restrict__ outRow = outBuf + y * outStride;
-        cv::Vec3f rowBase = origin + vy_step * static_cast<float>(y);
+        const float yf = static_cast<float>(y);
+        // Row base = origin + y * vy_step (computed once per row)
+        float rbX = ox + yf * dyX;
+        float rbY = oy + yf * dyY;
+        float rbZ = oz + yf * dyZ;
 
         for (int x = 0; x < width; x++) {
-            cv::Vec3f pos = rowBase + vx_step * static_cast<float>(x);
+            // Incremental pixel position (add vx_step each iteration)
+            const float px = rbX + static_cast<float>(x) * dxX;
+            const float py = rbY + static_cast<float>(x) * dxY;
+            const float pz = rbZ + static_cast<float>(x) * dxZ;
 
             float accum = 0;
             int validCount = 0;
 
             for (int l = 0; l < numLayers; l++) {
-                float vx = pos[0] + layerOffsets[l][0];
-                float vy = pos[1] + layerOffsets[l][1];
-                float vz = pos[2] + layerOffsets[l][2];
+                float vx = px + lox[l];
+                float vy = py + loy[l];
+                float vz = pz + loz[l];
 
                 if (vx < 0 || vy < 0 || vz < 0 ||
-                    vx >= p.sx || vy >= p.sy || vz >= p.sz)
+                    vx >= sxf || vy >= syf || vz >= szf)
                     continue;
 
                 uint8_t val = sampler.sampleNearest(vz, vy, vx);
-                if (val == 0) continue;  // skip zero (fill value)
+                if (val == 0) continue;
 
                 validCount++;
                 if (useMax) {
-                    accum = (validCount == 1) ? val : std::max(accum, static_cast<float>(val));
+                    accum = (validCount == 1) ? static_cast<float>(val) : std::max(accum, static_cast<float>(val));
                 } else if (useMin) {
-                    accum = (validCount == 1) ? val : std::min(accum, static_cast<float>(val));
+                    accum = (validCount == 1) ? static_cast<float>(val) : std::min(accum, static_cast<float>(val));
                 } else {
-                    accum += val;  // mean: accumulate
+                    accum += static_cast<float>(val);
                 }
             }
 
             if (validCount > 0) {
                 if (!useMax && !useMin)
-                    accum /= static_cast<float>(validCount);  // mean
+                    accum /= static_cast<float>(validCount);
                 outRow[x] = lut[static_cast<uint8_t>(std::clamp(accum, 0.0f, 255.0f))];
             }
         }
