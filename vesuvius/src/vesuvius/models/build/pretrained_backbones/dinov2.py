@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -110,24 +111,44 @@ class PixelShuffleConvDinov2Decoder(nn.Module):
             out_channels=num_classes,
         )
         conv = nn.Conv3d
+        final_hidden_channels = max(
+            8,
+            channels[-2] if num_stages > 1 else min(64, max(8, encoder.embed_dim // 8)),
+        )
         stages = []
         for stage_idx in range(num_stages):
-            next_channels = channels[stage_idx + 1]
+            next_channels = channels[stage_idx + 1] if stage_idx < num_stages - 1 else final_hidden_channels
             scale_factors = tuple(int(v) for v in strides[stage_idx])
             expansion_channels = int(next_channels) * int(torch.tensor(scale_factors).prod().item())
             stage_ops = [
                 conv(channels[stage_idx], expansion_channels, kernel_size=1, stride=1, padding=0, bias=True),
                 PixelShuffle3D(scale_factors),
                 conv(next_channels, next_channels, kernel_size=3, stride=1, padding=1, bias=True),
+                nn.GroupNorm(_resolve_group_norm_groups(next_channels), next_channels),
+                nn.GELU(),
             ]
-            if stage_idx < num_stages - 1:
-                stage_ops.extend([LayerNormNd(next_channels), nn.GELU()])
             stages.append(nn.Sequential(*stage_ops))
         self.decode = nn.Sequential(*stages)
+        self.final_refine = nn.Sequential(
+            conv(final_hidden_channels, final_hidden_channels, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.GroupNorm(_resolve_group_norm_groups(final_hidden_channels), final_hidden_channels),
+            nn.GELU(),
+            conv(final_hidden_channels, final_hidden_channels, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.GroupNorm(_resolve_group_norm_groups(final_hidden_channels), final_hidden_channels),
+            nn.GELU(),
+            conv(final_hidden_channels, num_classes, kernel_size=1, stride=1, padding=0, bias=True),
+        )
 
     def forward(self, features):
         x = features[0] if isinstance(features, list) else features
-        return self.decode(x)
+        x = self.decode(x)
+        return self.final_refine(x)
+
+
+def _resolve_group_norm_groups(num_channels: int, max_groups: int = 8) -> int:
+    if num_channels < 1:
+        raise ValueError(f"GroupNorm requires num_channels >= 1, got {num_channels}")
+    return max(1, math.gcd(int(num_channels), int(max_groups)))
 
 
 def _load_model_config(spec, input_channels):
