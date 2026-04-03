@@ -477,8 +477,8 @@ void CTiledVolumeViewer::updateContentMinScale()
     if (!fGraphicsView) return;
 
     QSize vpSize = fGraphicsView->viewport()->size();
-    float vpW = vpSize.width();
-    float vpH = vpSize.height();
+    float vpW = static_cast<float>(vpSize.width());
+    float vpH = static_cast<float>(vpSize.height());
     if (vpW <= 0 || vpH <= 0) return;
 
     float contentW = 0, contentH = 0;
@@ -500,8 +500,8 @@ void CTiledVolumeViewer::updateContentMinScale()
         if (auto* quadSurf = dynamic_cast<QuadSurface*>(surf.get())) {
             const cv::Mat_<cv::Vec3f>& pts = quadSurf->rawPoints();
             cv::Vec2f sc = quadSurf->scale();
-            contentW = pts.cols / sc[0];
-            contentH = pts.rows / sc[1];
+            contentW = static_cast<float>(pts.cols) / sc[0];
+            contentH = static_cast<float>(pts.rows) / sc[1];
         }
     }
 
@@ -526,7 +526,7 @@ void CTiledVolumeViewer::rebuildContentGrid()
         if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
             // Project volume bounding box corners onto the plane
             auto [w, h, d] = _volume->shape();
-            float x0 = 0, x1 = (float)w, y0 = 0, y1 = (float)h, z0 = 0, z1 = (float)d;
+            float x0 = 0, x1 = static_cast<float>(w), y0 = 0, y1 = static_cast<float>(h), z0 = 0, z1 = static_cast<float>(d);
             float corners[][3] = {
                 {x0,y0,z0}, {x1,y0,z0}, {x0,y1,z0}, {x1,y1,z0},
                 {x0,y0,z1}, {x1,y0,z1}, {x0,y1,z1}, {x1,y1,z1}
@@ -543,8 +543,8 @@ void CTiledVolumeViewer::rebuildContentGrid()
         } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
             const cv::Mat_<cv::Vec3f>& pts = quad->rawPoints();
             cv::Vec2f sc = quad->scale();
-            float halfW = (pts.cols * 0.5f) / sc[0];
-            float halfH = (pts.rows * 0.5f) / sc[1];
+            float halfW = (static_cast<float>(pts.cols) * 0.5f) / sc[0];
+            float halfH = (static_cast<float>(pts.rows) * 0.5f) / sc[1];
             contentMinX = -halfW;
             contentMinY = -halfH;
             contentMaxX = halfW;
@@ -598,7 +598,7 @@ void CTiledVolumeViewer::rebuildContentGrid()
 
         // Also cap so total doesn't exceed budget
         if (windowCols * windowRows > kMaxTotalTiles) {
-            float aspect = static_cast<float>(windowCols) / windowRows;
+            float aspect = static_cast<float>(windowCols) / static_cast<float>(windowRows);
             windowCols = static_cast<int>(std::sqrt(kMaxTotalTiles * aspect));
             windowRows = kMaxTotalTiles / windowCols;
         }
@@ -661,7 +661,7 @@ void CTiledVolumeViewer::onPinComplete()
     // without waiting for a coarsest-level bounds scan.
     if (!_surfWeak.lock() && _volume && isAxisAlignedView()) {
         auto shape = _volume->shape();  // {width, height, slices} = {x, y, z}
-        cv::Vec3f center(shape[0] * 0.5f, shape[1] * 0.5f, shape[2] * 0.5f);
+        cv::Vec3f center(static_cast<float>(shape[0]) * 0.5f, static_cast<float>(shape[1]) * 0.5f, static_cast<float>(shape[2]) * 0.5f);
         cv::Vec3f normal;
         if (_surfName == "xy plane") normal = cv::Vec3f(0, 0, 1);
         else if (_surfName == "xz plane" || _surfName == "seg xz") normal = cv::Vec3f(0, 1, 0);
@@ -671,14 +671,14 @@ void CTiledVolumeViewer::onPinComplete()
         _surfWeak = defaultSurf;
     }
 
-    _camera.recalcPyramidLevel(_volume->numScales());
+    _camera.recalcPyramidLevel(static_cast<int>(_volume->numScales()));
     updateContentMinScale();
 
     rebuildContentGrid();
     centerViewport();
 
     // Update scalebar
-    double vs = _volume->voxelSize() / _camera.dsScale;
+    double vs = _volume->voxelSize() / static_cast<double>(_camera.dsScale);
     fGraphicsView->setVoxelSize(vs, vs);
 
     submitRender();
@@ -718,19 +718,22 @@ void CTiledVolumeViewer::onDataBoundsReady()
     if (_surfName == "xy plane") {
         auto surf = _surfWeak.lock();
         auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
+        float dbMinX = static_cast<float>(db.minX), dbMaxX = static_cast<float>(db.maxX);
+        float dbMinY = static_cast<float>(db.minY), dbMaxY = static_cast<float>(db.maxY);
+        float dbMinZ = static_cast<float>(db.minZ), dbMaxZ = static_cast<float>(db.maxZ);
         if (plane) {
-            cv::Vec3f center((db.minX + db.maxX) * 0.5f,
-                             (db.minY + db.maxY) * 0.5f,
-                             (db.minZ + db.maxZ) * 0.5f);
+            cv::Vec3f center((dbMinX + dbMaxX) * 0.5f,
+                             (dbMinY + dbMaxY) * 0.5f,
+                             (dbMinZ + dbMaxZ) * 0.5f);
             plane->setOrigin(center);
         }
 
         // Update focus POI — cascades to all axis-aligned viewers
         POI* focus = _state->poi("focus");
         if (focus) {
-            cv::Vec3f center((db.minX + db.maxX) * 0.5f,
-                             (db.minY + db.maxY) * 0.5f,
-                             (db.minZ + db.maxZ) * 0.5f);
+            cv::Vec3f center((dbMinX + dbMaxX) * 0.5f,
+                             (dbMinY + dbMaxY) * 0.5f,
+                             (dbMinZ + dbMaxZ) * 0.5f);
             focus->p = center;
             _state->setPOI("focus", focus);
         }
@@ -785,13 +788,17 @@ void CTiledVolumeViewer::panByF(float dx, float dy)
     if (_gridWindowed && _contentBounds.worldTileSize > 0) {
         float camCol = _camera.surfacePtr[0] / _contentBounds.worldTileSize;
         float camRow = _camera.surfacePtr[1] / _contentBounds.worldTileSize;
-        float marginCols = _contentBounds.totalCols * 0.25f;
-        float marginRows = _contentBounds.totalRows * 0.25f;
+        float fFirstCol = static_cast<float>(_contentBounds.firstWorldCol);
+        float fFirstRow = static_cast<float>(_contentBounds.firstWorldRow);
+        float fTotalCols = static_cast<float>(_contentBounds.totalCols);
+        float fTotalRows = static_cast<float>(_contentBounds.totalRows);
+        float marginCols = fTotalCols * 0.25f;
+        float marginRows = fTotalRows * 0.25f;
         bool nearEdge =
-            camCol < _contentBounds.firstWorldCol + marginCols ||
-            camCol > _contentBounds.firstWorldCol + _contentBounds.totalCols - marginCols ||
-            camRow < _contentBounds.firstWorldRow + marginRows ||
-            camRow > _contentBounds.firstWorldRow + _contentBounds.totalRows - marginRows;
+            camCol < fFirstCol + marginCols ||
+            camCol > fFirstCol + fTotalCols - marginCols ||
+            camRow < fFirstRow + marginRows ||
+            camRow > fFirstRow + fTotalRows - marginRows;
         if (nearEdge) {
             rebuildContentGrid();
             centerViewport();
@@ -812,7 +819,7 @@ void CTiledVolumeViewer::zoomAt(float factor, const QPointF& scenePos)
 
 void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 {
-    int scaledSteps = static_cast<int>(std::round(steps * _navSpeed));
+    int scaledSteps = static_cast<int>(std::round(static_cast<float>(steps) * _navSpeed));
     if (scaledSteps == 0 && steps != 0) scaledSteps = (steps > 0) ? 1 : -1;
 
     const float newScale = std::max(
@@ -822,25 +829,28 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     }
 
     // Zoom-at-point: the surface position under the cursor must stay fixed.
-    // Compute it from scene coords (stable) rather than accumulating float error.
-    // surfaceAnchor = gridToSurface(scenePos) is the surface point under the cursor.
-    // After zoom, we want: surfaceAnchor = surfacePtr + vpOffset / newScale
-    // => surfacePtr = surfaceAnchor - vpOffset / newScale
-    cv::Vec2f surfAnchor = _tileScene->sceneToSurface(scenePos);
+    // Compute surfAnchor from camera + viewport offset at the CURRENT scale
+    // (not from scene coords which change when the grid is rebuilt/windowed).
     QPointF vpPos = fGraphicsView->mapFromScene(scenePos);
     QSize vpSize = fGraphicsView->viewport()->size();
-    const float vpOffX = static_cast<float>(vpPos.x()) - vpSize.width() * 0.5f;
-    const float vpOffY = static_cast<float>(vpPos.y()) - vpSize.height() * 0.5f;
+    float vpW = static_cast<float>(vpSize.width());
+    float vpH = static_cast<float>(vpSize.height());
+    const float vpOffX = static_cast<float>(vpPos.x()) - vpW * 0.5f;
+    const float vpOffY = static_cast<float>(vpPos.y()) - vpH * 0.5f;
+
+    // surfAnchor = surfacePtr + vpOffset / currentScale (stable, no grid dependency)
+    float surfAnchorX = _camera.surfacePtr[0] + vpOffX / _camera.scale;
+    float surfAnchorY = _camera.surfacePtr[1] + vpOffY / _camera.scale;
 
     _camera.scale = newScale;
-    _camera.surfacePtr[0] = surfAnchor[0] - vpOffX / newScale;
-    _camera.surfacePtr[1] = surfAnchor[1] - vpOffY / newScale;
+    _camera.surfacePtr[0] = surfAnchorX - vpOffX / newScale;
+    _camera.surfacePtr[1] = surfAnchorY - vpOffY / newScale;
 
     if (_volume) {
         float oldDs = _camera.dsScale;
-        _camera.recalcPyramidLevel(_volume->numScales());
+        _camera.recalcPyramidLevel(static_cast<int>(_volume->numScales()));
         if (std::abs(_camera.dsScale - oldDs) > 1e-6f) {
-            double vs = _volume->voxelSize() / _camera.dsScale;
+            double vs = _volume->voxelSize() / static_cast<double>(_camera.dsScale);
             fGraphicsView->setVoxelSize(vs, vs);
         }
     }
@@ -1084,7 +1094,7 @@ void CTiledVolumeViewer::submitRender()
         // Extend viewport by 3 tile widths in the direction of pan movement
         // so prefetch stays ahead of rapid panning.
         constexpr int PREFETCH_TILES_AHEAD = 3;
-        const float tileExtent = static_cast<float>(TileScene::TILE_PX) * PREFETCH_TILES_AHEAD;
+        const double tileExtent = static_cast<double>(TileScene::TILE_PX) * PREFETCH_TILES_AHEAD;
         double lenSq = delta.x() * delta.x() + delta.y() * delta.y();
         if (lenSq > 1.0) {
             double len = std::sqrt(lenSq);
@@ -1372,7 +1382,7 @@ void CTiledVolumeViewer::onCursorMoveImpl(QPointF scene_loc,
                         _pointSceneCache[pt.id] = ptScene;
                     }
                     QPointF diff = scene_loc - ptScene;
-                    float distSq = QPointF::dotProduct(diff, diff);
+                    float distSq = static_cast<float>(QPointF::dotProduct(diff, diff));
                     if (distSq < minDistSq) {
                         minDistSq = distSq;
                         _highlightedPointId = pt.id;
@@ -1549,8 +1559,8 @@ void CTiledVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
         } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
             cv::Vec3f ptr(0, 0, 0);
             auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-            float dist = quad->pointTo(ptr, poi->p, 4.0, 100, patchIndex);
-            if (dist < 4.0) {
+            float dist = quad->pointTo(ptr, poi->p, 4.0f, 100, patchIndex);
+            if (dist < 4.0f) {
                 // Center camera on the focus point
                 cv::Vec3f loc = quad->loc(ptr);
                 _camera.surfacePtr[0] = loc[0];
@@ -1590,7 +1600,7 @@ void CTiledVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
             float dist = slicePlane->pointDist(poi->p);
             if (dist < 20.0f / _camera.scale) {
                 _ov.cursor->setPos(scenePos);
-                _ov.cursor->setOpacity(1.0 - dist * _camera.scale / 20.0);
+                _ov.cursor->setOpacity(static_cast<qreal>(1.0f - dist * _camera.scale / 20.0f));
             } else {
                 _ov.cursor->setOpacity(0.0);
             }
@@ -1643,12 +1653,12 @@ void CTiledVolumeViewer::updateStatusLabel()
         }
 
         // RAM usage (hot tier)
-        double hotGB = s.hotBytes / (1024.0 * 1024.0 * 1024.0);
+        double hotGB = static_cast<double>(s.hotBytes) / (1024.0 * 1024.0 * 1024.0);
         status += QString(" | ram %1G").arg(hotGB, 0, 'f', 1);
 
         // Disk cache
         if (s.diskFiles > 0) {
-            double diskGB = s.diskBytes / (1024.0 * 1024.0 * 1024.0);
+            double diskGB = static_cast<double>(s.diskBytes) / (1024.0 * 1024.0 * 1024.0);
             status += QString(" | disk %1 (%2G w%3)").arg(s.diskFiles).arg(diskGB, 0, 'f', 1).arg(s.diskWrites);
         }
 
@@ -1689,7 +1699,7 @@ void CTiledVolumeViewer::fitSurfaceInView()
         _camera.scale = 1.0f;
         _camera.surfacePtr = cv::Vec3f(0, 0, 0);
         _camera.zOff = 0;
-        if (_volume) _camera.recalcPyramidLevel(_volume->numScales());
+        if (_volume) _camera.recalcPyramidLevel(static_cast<int>(_volume->numScales()));
         _camera.invalidate();
         updateStatusLabel();
         fGraphicsView->resetTransform();
@@ -1708,7 +1718,7 @@ void CTiledVolumeViewer::fitSurfaceInView()
         int colMin = pts.cols, colMax = -1, rowMin = pts.rows, rowMax = -1;
         for (int j = 0; j < pts.rows; j++)
             for (int i = 0; i < pts.cols; i++)
-                if (pts(j, i)[0] != -1 && std::isfinite(pts(j, i)[0])) {
+                if (pts(j, i)[0] > -0.5f && std::isfinite(pts(j, i)[0])) {
                     colMin = std::min(colMin, i);
                     colMax = std::max(colMax, i);
                     rowMin = std::min(rowMin, j);
@@ -1722,7 +1732,7 @@ void CTiledVolumeViewer::fitSurfaceInView()
     if (colMax < colMin || rowMax < rowMin) {
         _camera.scale = 1.0f;
         _camera.surfacePtr = cv::Vec3f(0, 0, 0);
-        if (_volume) _camera.recalcPyramidLevel(_volume->numScales());
+        if (_volume) _camera.recalcPyramidLevel(static_cast<int>(_volume->numScales()));
         updateStatusLabel();
         return;
     }
@@ -1737,8 +1747,8 @@ void CTiledVolumeViewer::fitSurfaceInView()
     float validSurfH = validH / sc[1];
 
     QSize vpSize = fGraphicsView->viewport()->size();
-    float vpW = vpSize.width();
-    float vpH = vpSize.height();
+    float vpW = static_cast<float>(vpSize.width());
+    float vpH = static_cast<float>(vpSize.height());
     if (vpW <= 0 || vpH <= 0) return;
 
     float fitFactor = 0.8f;
@@ -1749,15 +1759,17 @@ void CTiledVolumeViewer::fitSurfaceInView()
     // Center on the valid region.
     // surfacePtr is in grid units; (0,0,0) maps to the grid center (cols/2, rows/2).
     // To center on grid position (gx, gy): surfacePtr = (gx - cols/2, gy - rows/2, 0)
-    float gridCenterX = (colMin + colMax) * 0.5f;
-    float gridCenterY = (rowMin + rowMax) * 0.5f;
-    _camera.surfacePtr[0] = gridCenterX - pts.cols * 0.5f;
-    _camera.surfacePtr[1] = gridCenterY - pts.rows * 0.5f;
+    float fColMin = static_cast<float>(colMin), fColMax = static_cast<float>(colMax);
+    float fRowMin = static_cast<float>(rowMin), fRowMax = static_cast<float>(rowMax);
+    float gridCenterX = (fColMin + fColMax) * 0.5f;
+    float gridCenterY = (fRowMin + fRowMax) * 0.5f;
+    _camera.surfacePtr[0] = gridCenterX - static_cast<float>(pts.cols) * 0.5f;
+    _camera.surfacePtr[1] = gridCenterY - static_cast<float>(pts.rows) * 0.5f;
     _camera.surfacePtr[2] = 0;
     _focusSurfacePos[0] = _camera.surfacePtr[0];
     _focusSurfacePos[1] = _camera.surfacePtr[1];
 
-    if (_volume) _camera.recalcPyramidLevel(_volume->numScales());
+    if (_volume) _camera.recalcPyramidLevel(static_cast<int>(_volume->numScales()));
     _camera.invalidate();
     updateStatusLabel();
     fGraphicsView->resetTransform();
@@ -2075,7 +2087,7 @@ void CTiledVolumeViewer::renderIntersectionsCore()
         bool operator==(const StyleKey& o) const { return rgba == o.rgba && z == o.z; }
     };
     struct StyleKeyHash {
-        size_t operator()(const StyleKey& k) const { return std::hash<uint64_t>{}((uint64_t(k.rgba) << 32) | k.z); }
+        size_t operator()(const StyleKey& k) const { return std::hash<uint64_t>{}((uint64_t(k.rgba) << 32) | static_cast<uint64_t>(k.z)); }
     };
     std::unordered_map<StyleKey, QPainterPath, StyleKeyHash> groupedPaths;
     std::unordered_map<StyleKey, QColor, StyleKeyHash> groupedColors;
@@ -2131,7 +2143,7 @@ void CTiledVolumeViewer::renderIntersectionsCore()
                 const QColor approvalColor = segOverlay->queryApprovalColor(row, col);
                 if (approvalColor.isValid()) {
                     color = approvalColor;
-                    alpha *= std::clamp(segOverlay->approvalMaskOpacity() / 100.0f, 0.0f, 1.0f);
+                    alpha *= std::clamp(static_cast<float>(segOverlay->approvalMaskOpacity()) / 100.0f, 0.0f, 1.0f);
                     segZ += 5;
                 }
             }
@@ -2157,7 +2169,7 @@ void CTiledVolumeViewer::renderIntersectionsCore()
         }
         auto* item = new QGraphicsPathItem(path);
         QPen pen(groupedColors[key]);
-        pen.setWidthF(_intersectionThickness);
+        pen.setWidthF(static_cast<qreal>(_intersectionThickness));
         pen.setCapStyle(Qt::RoundCap);
         pen.setJoinStyle(Qt::RoundJoin);
         item->setPen(pen);
@@ -2211,7 +2223,7 @@ void CTiledVolumeViewer::invalidateIntersect(const std::string& /*name*/)
 void CTiledVolumeViewer::onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths)
 {
     _paths.clear();
-    _paths.reserve(paths.size());
+    _paths.reserve(static_cast<size_t>(paths.size()));
     for (const auto& path : paths) _paths.push_back(path);
     scheduleOverlayUpdate();
 }
@@ -2293,8 +2305,8 @@ auto CTiledVolumeViewer::selections() const -> std::vector<std::pair<QRectF, QCo
     std::vector<std::pair<QRectF, QColor>> out;
     out.reserve(_selections.size());
     for (const auto& s : _selections) {
-        QPointF topLeft = _tileScene->surfaceToScene(s.surfRect.left(), s.surfRect.top());
-        QPointF botRight = _tileScene->surfaceToScene(s.surfRect.right(), s.surfRect.bottom());
+        QPointF topLeft = _tileScene->surfaceToScene(static_cast<float>(s.surfRect.left()), static_cast<float>(s.surfRect.top()));
+        QPointF botRight = _tileScene->surfaceToScene(static_cast<float>(s.surfRect.right()), static_cast<float>(s.surfRect.bottom()));
         QRectF sceneRect(topLeft, botRight);
         out.emplace_back(sceneRect.normalized(), s.color);
     }

@@ -50,9 +50,9 @@ void blendOverlayImage(uint32_t* base, int baseStride,
             const uint32_t sg = (s >> 8) & 0xFFu;
             const uint32_t sb = s & 0xFFu;
 
-            const uint32_t r = static_cast<uint32_t>(std::clamp(sr * alpha + dr * ia, 0.0f, 255.0f));
-            const uint32_t g = static_cast<uint32_t>(std::clamp(sg * alpha + dg * ia, 0.0f, 255.0f));
-            const uint32_t b = static_cast<uint32_t>(std::clamp(sb * alpha + db * ia, 0.0f, 255.0f));
+            const uint32_t r = static_cast<uint32_t>(std::clamp(static_cast<float>(sr) * alpha + static_cast<float>(dr) * ia, 0.0f, 255.0f));
+            const uint32_t g = static_cast<uint32_t>(std::clamp(static_cast<float>(sg) * alpha + static_cast<float>(dg) * ia, 0.0f, 255.0f));
+            const uint32_t b = static_cast<uint32_t>(std::clamp(static_cast<float>(sb) * alpha + static_cast<float>(db) * ia, 0.0f, 255.0f));
             dst[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
     }
@@ -153,6 +153,9 @@ TileRenderResult TileRenderer::renderTile(
     // skip the entire sampling pass (avoids cache lookups and prefetch requests).
     const auto& db = volume->dataBounds();
     if (db.valid) {
+        float dbMinX = static_cast<float>(db.minX), dbMaxX = static_cast<float>(db.maxX);
+        float dbMinY = static_cast<float>(db.minY), dbMaxY = static_cast<float>(db.maxY);
+        float dbMinZ = static_cast<float>(db.minZ), dbMaxZ = static_cast<float>(db.maxZ);
         float tMinX, tMaxX, tMinY, tMaxY, tMinZ, tMaxZ;
 
         if (plane) {
@@ -203,9 +206,9 @@ TileRenderResult TileRenderer::renderTile(
                 params.compositeSettings.planeLayersBehind}));
         }
 
-        if (tMaxX < db.minX - margin || tMinX > db.maxX + margin ||
-            tMaxY < db.minY - margin || tMinY > db.maxY + margin ||
-            tMaxZ < db.minZ - margin || tMinZ > db.maxZ + margin) {
+        if (tMaxX < dbMinX - margin || tMinX > dbMaxX + margin ||
+            tMaxY < dbMinY - margin || tMinY > dbMaxY + margin ||
+            tMaxZ < dbMinZ - margin || tMinZ > dbMaxZ + margin) {
             return result;
         }
     }
@@ -255,7 +258,7 @@ TileRenderResult TileRenderer::renderTile(
             std::array<uint32_t, 256> lut;
             vc::buildWindowLevelLut(lut, params.windowLow, params.windowHigh, lightFactor);
 
-            result.pixels.resize(params.tileW * params.tileH);
+            result.pixels.resize(static_cast<size_t>(params.tileW) * static_cast<size_t>(params.tileH));
             result.actualLevel = volume->samplePlaneCompositeBestEffortARGB32(
                 result.pixels.data(), params.tileW,
                 planeOrigin, planeVxStep, planeVyStep,
@@ -312,7 +315,7 @@ TileRenderResult TileRenderer::renderTile(
                                 lightFactor);
 
             // Write directly into pixel buffer -- one pass, zero copies.
-            result.pixels.resize(params.tileW * params.tileH);
+            result.pixels.resize(static_cast<size_t>(params.tileW) * static_cast<size_t>(params.tileH));
             auto* bits = result.pixels.data();
             const int stride = params.tileW;
 
@@ -399,7 +402,7 @@ TileRenderResult TileRenderer::renderTile(
         pp.postStretchValues = params.compositeSettings.postStretchValues;
         pp.removeSmallComponents = params.compositeSettings.postRemoveSmallComponents;
         pp.minComponentSize = params.compositeSettings.postMinComponentSize;
-        result.pixels.resize(params.tileW * params.tileH);
+        result.pixels.resize(static_cast<size_t>(params.tileW) * static_cast<size_t>(params.tileH));
         vc::applyRenderPostProcess(gray, pp, result.pixels.data(), params.tileW);
     }
 
@@ -445,7 +448,7 @@ overlay:
             const int ow = overlayGray.cols;
             const int oh = overlayGray.rows;
             thread_local std::vector<uint32_t> overlayBuf;
-            overlayBuf.resize(ow * oh);
+            overlayBuf.resize(static_cast<size_t>(ow) * static_cast<size_t>(oh));
             vc::applyRenderPostProcess(overlayGray, overlayParams, overlayBuf.data(), ow);
             blendOverlayImage(result.pixels.data(), params.tileW,
                               overlayBuf.data(), ow,

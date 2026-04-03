@@ -83,6 +83,7 @@ static constexpr int kChunkMask = 127;  // 128 - 1
 
 struct CacheParams {
     int cz, cy, cx, sz, sy, sx;
+    float szf, syf, sxf;  // float versions of sz, sy, sx for bounds checks
     int czShift, cyShift, cxShift, czMask, cyMask, cxMask;
     bool pow2;  // true when all chunk dims are powers of two (fast path)
     bool chunk128;  // true when all chunk dims are exactly 128 (fastest path)
@@ -100,6 +101,7 @@ struct CacheParams {
         cz = cs[0]; cy = cs[1]; cx = cs[2];
         auto shape = cache->levelShape(level);
         sz = shape[0]; sy = shape[1]; sx = shape[2];
+        szf = static_cast<float>(sz); syf = static_cast<float>(sy); sxf = static_cast<float>(sx);
 
         auto isPow2 = [](int v) { return v > 0 && (v & (v - 1)) == 0; };
         pow2 = isPow2(cz) && isPow2(cy) && isPow2(cx);
@@ -123,12 +125,12 @@ struct CacheParams {
         auto db = cache->dataBounds();
         if (db.valid) {
             float scale = 1.0f / static_cast<float>(1 << level);
-            dbMinCx = std::max(0, chunkIdx(static_cast<int>(std::floor(db.minX * scale)), cx, cxShift) - 1);
-            dbMaxCx = std::min(chunksX - 1, chunkIdx(static_cast<int>(std::ceil(db.maxX * scale)), cx, cxShift) + 1);
-            dbMinCy = std::max(0, chunkIdx(static_cast<int>(std::floor(db.minY * scale)), cy, cyShift) - 1);
-            dbMaxCy = std::min(chunksY - 1, chunkIdx(static_cast<int>(std::ceil(db.maxY * scale)), cy, cyShift) + 1);
-            dbMinCz = std::max(0, chunkIdx(static_cast<int>(std::floor(db.minZ * scale)), cz, czShift) - 1);
-            dbMaxCz = std::min(chunksZ - 1, chunkIdx(static_cast<int>(std::ceil(db.maxZ * scale)), cz, czShift) + 1);
+            dbMinCx = std::max(0, chunkIdx(static_cast<int>(std::floor(static_cast<float>(db.minX) * scale)), cx, cxShift) - 1);
+            dbMaxCx = std::min(chunksX - 1, chunkIdx(static_cast<int>(std::ceil(static_cast<float>(db.maxX) * scale)), cx, cxShift) + 1);
+            dbMinCy = std::max(0, chunkIdx(static_cast<int>(std::floor(static_cast<float>(db.minY) * scale)), cy, cyShift) - 1);
+            dbMaxCy = std::min(chunksY - 1, chunkIdx(static_cast<int>(std::ceil(static_cast<float>(db.maxY) * scale)), cy, cyShift) + 1);
+            dbMinCz = std::max(0, chunkIdx(static_cast<int>(std::floor(static_cast<float>(db.minZ) * scale)), cz, czShift) - 1);
+            dbMaxCz = std::min(chunksZ - 1, chunkIdx(static_cast<int>(std::ceil(static_cast<float>(db.maxZ) * scale)), cz, czShift) + 1);
             dbValid = true;
         }
     }
@@ -203,7 +205,7 @@ struct ChunkSampler {
     ChunkSampler(const CacheParams& p_, vc::cache::TieredChunkCache& cache_, int level_)
         : p(p_), cache(cache_), level(level_)
     {
-        s0 = static_cast<size_t>(p.cy) * p.cx;
+        s0 = static_cast<size_t>(p.cy) * static_cast<size_t>(p.cx);
         s1 = static_cast<size_t>(p.cx);
         NY = p.chunksY;
         NX = p.chunksX;
@@ -212,7 +214,7 @@ struct ChunkSampler {
 
     // Compute flat offset from local coords (row-major layout).
     VC_FORCE_INLINE size_t voxelOffset(int lz, int ly, int lx) const {
-        return static_cast<size_t>(lz) * s0 + static_cast<size_t>(ly) * s1 + lx;
+        return static_cast<size_t>(lz) * s0 + static_cast<size_t>(ly) * s1 + static_cast<size_t>(lx);
     }
 
     // Direct-mapped index: chunk coords → slot index via simple mask
@@ -318,7 +320,7 @@ struct ChunkSampler {
     }
 
     bool inBounds(float vz, float vy, float vx) const {
-        return vz >= 0 && vy >= 0 && vx >= 0 && vz < p.sz && vy < p.sy && vx < p.sx;
+        return vz >= 0 && vy >= 0 && vx >= 0 && vz < p.szf && vy < p.syf && vx < p.sxf;
     }
 
     VC_FORCE_INLINE T sampleNearest(float vz, float vy, float vx) {
@@ -391,9 +393,12 @@ struct ChunkSampler {
         float c011 = sampleInt(iz, iy + 1, ix + 1);
         float c111 = sampleInt(iz + 1, iy + 1, ix + 1);
 
-        float fz = vz - iz;
-        float fy = vy - iy;
-        float fx = vx - ix;
+        float izf = static_cast<float>(iz);
+        float iyf = static_cast<float>(iy);
+        float ixf = static_cast<float>(ix);
+        float fz = vz - izf;
+        float fy = vy - iyf;
+        float fx = vx - ixf;
 
         float c00 = std::fma(fx, c001 - c000, c000);
         float c01 = std::fma(fx, c011 - c010, c010);
@@ -428,7 +433,7 @@ struct ChunkSampler {
 
             size_t off[8];
             {
-                size_t base = static_cast<size_t>(lz0) * s0 + static_cast<size_t>(ly0) * s1 + lx0;
+                size_t base = static_cast<size_t>(lz0) * s0 + static_cast<size_t>(ly0) * s1 + static_cast<size_t>(lx0);
                 off[0] = base;
                 off[1] = base + s0;
                 off[2] = base + s1;
@@ -448,9 +453,12 @@ struct ChunkSampler {
             float c011 = data[off[6]];
             float c111 = data[off[7]];
 
-            float fz = vz - iz;
-            float fy = vy - iy;
-            float fx = vx - ix;
+            float izf = static_cast<float>(iz);
+            float iyf = static_cast<float>(iy);
+            float ixf = static_cast<float>(ix);
+            float fz = vz - izf;
+            float fy = vy - iyf;
+            float fx = vx - ixf;
 
             float c00 = std::fma(fx, c001 - c000, c000);
             float c01 = std::fma(fx, c011 - c010, c010);
@@ -485,7 +493,7 @@ struct ChunkSampler {
 
             size_t off[8];
             {
-                size_t base = static_cast<size_t>(lz0) * s0 + static_cast<size_t>(ly0) * s1 + lx0;
+                size_t base = static_cast<size_t>(lz0) * s0 + static_cast<size_t>(ly0) * s1 + static_cast<size_t>(lx0);
                 off[0] = base;
                 off[1] = base + s0;
                 off[2] = base + s1;
@@ -505,9 +513,12 @@ struct ChunkSampler {
             float c011 = data[off[6]];
             float c111 = data[off[7]];
 
-            float fz = vz - iz;
-            float fy = vy - iy;
-            float fx = vx - ix;
+            float izf = static_cast<float>(iz);
+            float iyf = static_cast<float>(iy);
+            float ixf = static_cast<float>(ix);
+            float fz = vz - izf;
+            float fy = vy - iyf;
+            float fx = vx - ixf;
 
             float c00 = std::fma(fx, c001 - c000, c000);
             float c01 = std::fma(fx, c011 - c010, c010);
@@ -535,16 +546,22 @@ struct ChunkSampler {
         int iz = static_cast<int>(std::floor(vz));
         int iy = static_cast<int>(std::floor(vy));
         int ix = static_cast<int>(std::floor(vx));
-        float fz = vz - iz, fy = vy - iy, fx = vx - ix;
+        float izf = static_cast<float>(iz);
+        float iyf = static_cast<float>(iy);
+        float ixf = static_cast<float>(ix);
+        float fz = vz - izf, fy = vy - iyf, fx = vx - ixf;
 
         float result = 0.0f;
         for (int dz = -1; dz <= 2; dz++) {
-            float wz = catmullRom(fz - dz);
+            float dzf = static_cast<float>(dz);
+            float wz = catmullRom(fz - dzf);
             for (int dy = -1; dy <= 2; dy++) {
-                float wy = catmullRom(fy - dy);
+                float dyf = static_cast<float>(dy);
+                float wy = catmullRom(fy - dyf);
                 float wzy = wz * wy;
                 for (int dx = -1; dx <= 2; dx++) {
-                    float wx = catmullRom(fx - dx);
+                    float dxf = static_cast<float>(dx);
+                    float wx = catmullRom(fx - dxf);
                     result += wzy * wx * static_cast<float>(sampleInt(iz+dz, iy+dy, ix+dx));
                 }
             }
@@ -584,14 +601,14 @@ static void readVolumeImpl(
 
     // Phase 1: Discover needed chunks and prefetch (single-threaded).
     {
-        const size_t totalChunks = static_cast<size_t>(p.chunksZ) * p.chunksY * p.chunksX;
+        const size_t totalChunks = static_cast<size_t>(p.chunksZ) * static_cast<size_t>(p.chunksY) * static_cast<size_t>(p.chunksX);
         std::vector<uint8_t> needed(totalChunks, 0);
         int minIz = p.chunksZ, maxIz = -1;
         int minIy = p.chunksY, maxIy = -1;
         int minIx = p.chunksX, maxIx = -1;
 
         auto markVoxel = [&](float vz, float vy, float vx) {
-            if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < p.sz && vy < p.sy && vx < p.sx)) return;
+            if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < p.szf && vy < p.syf && vx < p.sxf)) return;
             int iz = static_cast<int>(vz + 0.5f);
             int iy = static_cast<int>(vy + 0.5f);
             int ix = static_cast<int>(vx + 0.5f);
@@ -605,7 +622,7 @@ static void readVolumeImpl(
             if (p.dbValid && (ciz < p.dbMinCz || ciz > p.dbMaxCz ||
                               ciy < p.dbMinCy || ciy > p.dbMaxCy ||
                               cix < p.dbMinCx || cix > p.dbMaxCx)) return;
-            size_t idx = static_cast<size_t>(ciz) * p.chunksY * p.chunksX + static_cast<size_t>(ciy) * p.chunksX + cix;
+            size_t idx = static_cast<size_t>(ciz) * static_cast<size_t>(p.chunksY) * static_cast<size_t>(p.chunksX) + static_cast<size_t>(ciy) * static_cast<size_t>(p.chunksX) + static_cast<size_t>(cix);
             if (!needed[idx]) {
                 needed[idx] = 1;
                 minIz = std::min(minIz, ciz); maxIz = std::max(maxIz, ciz);
@@ -622,8 +639,8 @@ static void readVolumeImpl(
 
         // Build sparse Y indices: edges every S pixels + last row
         std::vector<int> sparseY, sparseX;
-        sparseY.reserve(h / S + 2);
-        sparseX.reserve(w / S + 2);
+        sparseY.reserve(static_cast<size_t>(h / S + 2));
+        sparseX.reserve(static_cast<size_t>(w / S + 2));
         for (int y = 0; y < h; y += S) sparseY.push_back(y);
         if (h > 0 && sparseY.back() != h - 1) sparseY.push_back(h - 1);
         for (int x = 0; x < w; x += S) sparseX.push_back(x);
@@ -635,37 +652,37 @@ static void readVolumeImpl(
                 for (int x : sparseX) {
                     float vx = row[x][0], vy = row[x][1], vz = row[x][2];
                     if constexpr (Mode == SampleMode::Tricubic) {
-                        if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < p.sz && vy < p.sy && vx < p.sx)) continue;
+                        if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < p.szf && vy < p.syf && vx < p.sxf)) continue;
                         int iz = static_cast<int>(std::floor(vz)), iy = static_cast<int>(std::floor(vy)), ix = static_cast<int>(std::floor(vx));
                         for (int dz = -1; dz <= 2; dz++)
                             for (int dy = -1; dy <= 2; dy++)
                                 for (int dx = -1; dx <= 2; dx++)
-                                    markVoxel(float(iz+dz), float(iy+dy), float(ix+dx));
+                                    markVoxel(static_cast<float>(iz+dz), static_cast<float>(iy+dy), static_cast<float>(ix+dx));
                     } else if constexpr (Mode == SampleMode::Trilinear) {
-                        if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < p.sz && vy < p.sy && vx < p.sx)) continue;
+                        if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < p.szf && vy < p.syf && vx < p.sxf)) continue;
                         int iz = static_cast<int>(vz), iy = static_cast<int>(vy), ix = static_cast<int>(vx);
                         for (int dz = 0; dz <= 1; dz++)
                             for (int dy = 0; dy <= 1; dy++)
                                 for (int dx = 0; dx <= 1; dx++)
-                                    markVoxel(float(iz+dz), float(iy+dy), float(ix+dx));
+                                    markVoxel(static_cast<float>(iz+dz), static_cast<float>(iy+dy), static_cast<float>(ix+dx));
                     } else {
                         markVoxel(vz, vy, vx);
                     }
                 }
             }
         } else {
-            std::vector<float> layerOffsets(numLayers);
+            std::vector<float> layerOffsets(static_cast<size_t>(numLayers));
             for (int l = 0; l < numLayers; l++)
-                layerOffsets[l] = (zStart + l) * zStep;
+                layerOffsets[static_cast<size_t>(l)] = static_cast<float>(zStart + l) * zStep;
 
             for (int y : sparseY) {
                 const auto* row = coords.ptr<cv::Vec3f>(y);
                 for (int x : sparseX) {
                     float bx = row[x][0], by = row[x][1], bz = row[x][2];
-                    if (!(bz >= 0 && by >= 0 && bx >= 0 && bz < p.sz && by < p.sy && bx < p.sx)) continue;
+                    if (!(bz >= 0 && by >= 0 && bx >= 0 && bz < p.szf && by < p.syf && bx < p.sxf)) continue;
                     cv::Vec3f n = getNormal(y, x);
                     for (int l = 0; l < numLayers; l++) {
-                        float off = layerOffsets[l];
+                        float off = layerOffsets[static_cast<size_t>(l)];
                         markVoxel(bz + n[2]*off, by + n[1]*off, bx + n[0]*off);
                     }
                 }
@@ -677,7 +694,7 @@ static void readVolumeImpl(
         for (int cix = minIx; cix <= maxIx; cix++)
             for (int ciy = minIy; ciy <= maxIy; ciy++)
                 for (int ciz = minIz; ciz <= maxIz; ciz++)
-                    if (needed[static_cast<size_t>(ciz) * p.chunksY * p.chunksX + static_cast<size_t>(ciy) * p.chunksX + cix])
+                    if (needed[static_cast<size_t>(ciz) * static_cast<size_t>(p.chunksY) * static_cast<size_t>(p.chunksX) + static_cast<size_t>(ciy) * static_cast<size_t>(p.chunksX) + static_cast<size_t>(cix)])
                         neededKeys.push_back(vc::cache::ChunkKey{level, ciz, ciy, cix});
 
         // Submit async prefetch so IO+decode pipelines across all chunks.
@@ -704,8 +721,6 @@ static void readVolumeImpl(
     // map to adjacent voxels, so tiling by chunk size keeps most pixels in
     // the same chunk. We tile over the Y dimension (since X already has good
     // sequential locality within a row) using chunk-sized bands.
-    const bool isComposite = (numLayers > 1);
-
     // Hoist composite method dispatch out of the per-pixel inner loop.
     // The mode never changes, so the compiler can jump-table the switch
     // and the branch predictor will lock on immediately.
@@ -716,7 +731,7 @@ static void readVolumeImpl(
       : (params && params->method == "min") ? kMin
       : kMean;
     const bool needsLayerStorage = (accumMode == kLayerStorage);
-    const float firstLayerOffset = zStart * zStep;
+    const float firstLayerOffset = static_cast<float>(zStart) * zStep;
 
     // Tile height: use chunk Y size for good locality (chunks are typically 128)
     // but clamp to reasonable range for the OMP scheduler.
@@ -734,7 +749,7 @@ static void readVolumeImpl(
         ChunkSampler<T> sampler(p, cache, level);
         LayerStack stack;
         if (needsLayerStorage) {
-            stack.values.resize(numLayers);
+            stack.values.resize(static_cast<size_t>(numLayers));
         }
 
         for (int y = yStart; y < yEnd; y++) {
@@ -758,8 +773,8 @@ static void readVolumeImpl(
                         float rEx = coordRow[w-1][0], rEy = coordRow[w-1][1], rEz = coordRow[w-1][2];
                         if (r0z >= 0 && r0y >= 0 && r0x >= 0 &&
                             rEz >= 0 && rEy >= 0 && rEx >= 0 &&
-                            r0z + 1 < p.sz && r0y + 1 < p.sy && r0x + 1 < p.sx &&
-                            rEz + 1 < p.sz && rEy + 1 < p.sy && rEx + 1 < p.sx) {
+                            r0z + 1 < p.szf && r0y + 1 < p.syf && r0x + 1 < p.sxf &&
+                            rEz + 1 < p.szf && rEy + 1 < p.syf && rEx + 1 < p.sxf) {
                             int iz0 = static_cast<int>(r0z), iy0 = static_cast<int>(r0y), ix0 = static_cast<int>(r0x);
                             int izE = static_cast<int>(rEz), iyE = static_cast<int>(rEy), ixE = static_cast<int>(rEx);
                             int ciz0 = p.chunkZ(iz0), ciy0 = p.chunkY(iy0), cix0 = p.chunkX(ix0);
@@ -780,7 +795,7 @@ static void readVolumeImpl(
                             for (int x = 0; x < w; x++) {
                                 float vx = coordRow[x][0], vy = coordRow[x][1], vz = coordRow[x][2];
                                 if (!(vz >= 0 && vy >= 0 && vx >= 0 &&
-                                      vz < p.sz && vy < p.sy && vx < p.sx)) continue;
+                                      vz < p.szf && vy < p.syf && vx < p.sxf)) continue;
 
                                 int iz = static_cast<int>(vz);
                                 int iy = static_cast<int>(vy);
@@ -796,7 +811,8 @@ static void readVolumeImpl(
                                 float c011 = chunkData[vo(lz0, (ly0+1), (lx0+1))];
                                 float c111 = chunkData[vo((lz0+1), (ly0+1), (lx0+1))];
 
-                                float fz = vz - iz, fy = vy - iy, fx = vx - ix;
+                                float izf = static_cast<float>(iz), iyf = static_cast<float>(iy), ixf = static_cast<float>(ix);
+                                float fz = vz - izf, fy = vy - iyf, fx = vx - ixf;
                                 float c00 = std::fma(fx, c001 - c000, c000);
                                 float c01 = std::fma(fx, c011 - c010, c010);
                                 float c10 = std::fma(fx, c101 - c100, c100);
@@ -899,7 +915,8 @@ static void readVolumeImpl(
                                         float c101 = cd[vo((lz0+1), ly0, (lx0+1))];
                                         float c011 = cd[vo(lz0, (ly0+1), (lx0+1))];
                                         float c111 = cd[vo((lz0+1), (ly0+1), (lx0+1))];
-                                        float fz = fvzArr[k] - iz, fy = fvyArr[k] - iy, fx = fvxArr[k] - ix;
+                                        float izf = static_cast<float>(iz), iyf = static_cast<float>(iy), ixf = static_cast<float>(ix);
+                                        float fz = fvzArr[k] - izf, fy = fvyArr[k] - iyf, fx = fvxArr[k] - ixf;
                                         float rc00 = std::fma(fx, c001 - c000, c000);
                                         float rc01 = std::fma(fx, c011 - c010, c010);
                                         float rc10 = std::fma(fx, c101 - c100, c100);
@@ -1010,7 +1027,8 @@ static void readVolumeImpl(
                                             float c101 = cd[vo((lz0+1), ly0, (lx0+1))];
                                             float c011 = cd[vo(lz0, (ly0+1), (lx0+1))];
                                             float c111 = cd[vo((lz0+1), (ly0+1), (lx0+1))];
-                                            float fz = zs[k] - iz, fy = ys[k] - iy, fx = xs[k] - ix;
+                                            float izf = static_cast<float>(iz), iyf = static_cast<float>(iy), ixf = static_cast<float>(ix);
+                                            float fz = zs[k] - izf, fy = ys[k] - iyf, fx = xs[k] - ixf;
                                             float rc00 = std::fma(fx, c001 - c000, c000);
                                             float rc01 = std::fma(fx, c011 - c010, c010);
                                             float rc10 = std::fma(fx, c101 - c100, c100);
@@ -1049,7 +1067,7 @@ static void readVolumeImpl(
                         for (; x < w; x++) {
                             float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
                             if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0 &&
-                                  base_vz < p.sz - 1 && base_vy < p.sy - 1 && base_vx < p.sx - 1)) continue;
+                                  base_vz < p.szf - 1.0f && base_vy < p.syf - 1.0f && base_vx < p.sxf - 1.0f)) continue;
                             float v = sampler.sampleTrilinearUnchecked(base_vz, base_vy, base_vx);
                             if constexpr (std::is_same_v<T, uint16_t>) {
                                 if (v < 0.f) v = 0.f;
@@ -1064,7 +1082,7 @@ static void readVolumeImpl(
                     for (int x = 0; x < w; x++) {
                         float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
                         if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0 &&
-                              base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                              base_vz < p.szf && base_vy < p.syf && base_vx < p.sxf)) continue;
                         float v = sampler.sampleTricubic(base_vz, base_vy, base_vx);
                         if constexpr (std::is_same_v<T, uint16_t>) {
                             if (v < 0.f) v = 0.f;
@@ -1083,8 +1101,8 @@ static void readVolumeImpl(
                         float rEx = coordRow[w-1][0], rEy = coordRow[w-1][1], rEz = coordRow[w-1][2];
                         if (r0z >= 0 && r0y >= 0 && r0x >= 0 &&
                             rEz >= 0 && rEy >= 0 && rEx >= 0 &&
-                            r0z < p.sz && r0y < p.sy && r0x < p.sx &&
-                            rEz < p.sz && rEy < p.sy && rEx < p.sx) {
+                            r0z < p.szf && r0y < p.syf && r0x < p.sxf &&
+                            rEz < p.szf && rEy < p.syf && rEx < p.sxf) {
                             int iz0 = std::min(static_cast<int>(r0z + 0.5f), p.sz - 1);
                             int iy0 = std::min(static_cast<int>(r0y + 0.5f), p.sy - 1);
                             int ix0 = std::min(static_cast<int>(r0x + 0.5f), p.sx - 1);
@@ -1111,7 +1129,7 @@ static void readVolumeImpl(
                             for (int x = 0; x < w; x++) {
                                 float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
                                 if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0 &&
-                                      base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                                      base_vz < p.szf && base_vy < p.syf && base_vx < p.sxf)) continue;
                                 int iz = static_cast<int>(base_vz + 0.5f);
                                 int iy = static_cast<int>(base_vy + 0.5f);
                                 int ix = static_cast<int>(base_vx + 0.5f);
@@ -1126,7 +1144,7 @@ static void readVolumeImpl(
                         for (int x = 0; x < w; x++) {
                             float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
                             if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0 &&
-                                  base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
+                                  base_vz < p.szf && base_vy < p.syf && base_vx < p.sxf)) continue;
                             if ((static_cast<int>(base_vz + 0.5f) | static_cast<int>(base_vy + 0.5f) | static_cast<int>(base_vx + 0.5f)) < 0) continue;
                             nt_store(&outRow[x], sampler.sampleNearest(base_vz, base_vy, base_vx));
                         }
@@ -1163,7 +1181,7 @@ static void readVolumeImpl(
                         float value = 0;
 
                         if (sampler.inBounds(vz, vy, vx)) {
-                            uint8_t raw = sampler.sampleNearest(vz, vy, vx);
+                            uint8_t raw = static_cast<uint8_t>(sampler.sampleNearest(vz, vy, vx));
                             value = static_cast<float>(raw < params->isoCutoff ? 0 : raw);
                             validSample = true;
                         }
@@ -1172,7 +1190,7 @@ static void readVolumeImpl(
 
                         if (validSample) {
                             switch (accumMode) {
-                            case kLayerStorage: stack.values[stack.validCount++] = value; break;
+                            case kLayerStorage: stack.values[static_cast<size_t>(stack.validCount++)] = value; break;
                             case kMax: acc = value > acc ? value : acc; validCount++; break;
                             case kMin: acc = value < acc ? value : acc; validCount++; break;
                             case kMean: acc += value; validCount++; break;
@@ -1253,8 +1271,8 @@ static void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset, vc::cache::
                         int lz = z - chunk_offset[0];
                         int ly = y - chunk_offset[1];
                         int lx = x - chunk_offset[2];
-                        size_t off = static_cast<size_t>(lz) * p.cy * p.cx + ly * p.cx + lx;
-                        out(z - offset[0], y - offset[1], x - offset[2]) = chunkData[off];
+                        size_t off = static_cast<size_t>(lz) * static_cast<size_t>(p.cy) * static_cast<size_t>(p.cx) + static_cast<size_t>(ly) * static_cast<size_t>(p.cx) + static_cast<size_t>(lx);
+                        out(static_cast<size_t>(z - offset[0]), static_cast<size_t>(y - offset[1]), static_cast<size_t>(x - offset[2])) = chunkData[off];
                     }
                 }
             }
@@ -1262,7 +1280,7 @@ static void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset, vc::cache::
             for (int z = copy_from_start[0]; z < copy_from_end[0]; ++z) {
                 for (int y = copy_from_start[1]; y < copy_from_end[1]; ++y) {
                     for (int x = copy_from_start[2]; x < copy_from_end[2]; ++x) {
-                        out(z - offset[0], y - offset[1], x - offset[2]) = 0;
+                        out(static_cast<size_t>(z - offset[0]), static_cast<size_t>(y - offset[1]), static_cast<size_t>(x - offset[2])) = 0;
                     }
                 }
             }
@@ -1326,7 +1344,7 @@ static void samplePlaneImpl(
 
         // Clamp to volume bounds
         if (maxVx < 0 || maxVy < 0 || maxVz < 0 ||
-            minVx >= p.sx || minVy >= p.sy || minVz >= p.sz) {
+            minVx >= p.sxf || minVy >= p.syf || minVz >= p.szf) {
             return;  // Entirely out of bounds
         }
 
@@ -1394,8 +1412,8 @@ static void samplePlaneImpl(
                 if (w > 1 &&
                     first[2] >= 0 && first[1] >= 0 && first[0] >= 0 &&
                     last[2] >= 0 && last[1] >= 0 && last[0] >= 0 &&
-                    first[2] + 1 < p.sz && first[1] + 1 < p.sy && first[0] + 1 < p.sx &&
-                    last[2] + 1 < p.sz && last[1] + 1 < p.sy && last[0] + 1 < p.sx) {
+                    first[2] + 1 < p.szf && first[1] + 1 < p.syf && first[0] + 1 < p.sxf &&
+                    last[2] + 1 < p.szf && last[1] + 1 < p.syf && last[0] + 1 < p.sxf) {
                     int iz0 = static_cast<int>(first[2]), iy0 = static_cast<int>(first[1]), ix0 = static_cast<int>(first[0]);
                     int izE = static_cast<int>(last[2]), iyE = static_cast<int>(last[1]), ixE = static_cast<int>(last[0]);
                     int ciz0 = p.chunkZ(iz0), ciy0 = p.chunkY(iy0), cix0 = p.chunkX(ix0);
@@ -1414,7 +1432,7 @@ static void samplePlaneImpl(
                         float vx = row_base[0], vy = row_base[1], vz = row_base[2];
                         for (int x = 0; x < w; x++) {
                             if (vz >= 0 && vy >= 0 && vx >= 0 &&
-                                vz < p.sz && vy < p.sy && vx < p.sx) {
+                                vz < p.szf && vy < p.syf && vx < p.sxf) {
                                 int iz = static_cast<int>(vz);
                                 int iy = static_cast<int>(vy);
                                 int ix = static_cast<int>(vx);
@@ -1429,7 +1447,8 @@ static void samplePlaneImpl(
                                 float c011 = chunkData[vo(lz0, (ly0+1), (lx0+1))];
                                 float c111 = chunkData[vo((lz0+1), (ly0+1), (lx0+1))];
 
-                                float fz = vz - iz, fy = vy - iy, fx = vx - ix;
+                                float izf = static_cast<float>(iz), iyf = static_cast<float>(iy), ixf = static_cast<float>(ix);
+                                float fz = vz - izf, fy = vy - iyf, fx = vx - ixf;
                                 float c00 = std::fma(fx, c001 - c000, c000);
                                 float c01 = std::fma(fx, c011 - c010, c010);
                                 float c10 = std::fma(fx, c101 - c100, c100);
@@ -1453,7 +1472,7 @@ static void samplePlaneImpl(
                     float vx = row_base[0], vy = row_base[1], vz = row_base[2];
                     for (int x = 0; x < w; x++) {
                         if (vz >= 0 && vy >= 0 && vx >= 0 &&
-                            vz < p.sz - 1 && vy < p.sy - 1 && vx < p.sx - 1) {
+                            vz < p.szf - 1.0f && vy < p.syf - 1.0f && vx < p.sxf - 1.0f) {
                             float v = sampler.sampleTrilinearUnchecked(vz, vy, vx);
                             if constexpr (std::is_same_v<T, uint16_t>) {
                                 v = std::clamp(v, 0.f, 65535.f);
@@ -1469,7 +1488,7 @@ static void samplePlaneImpl(
                 float vx = row_base[0], vy = row_base[1], vz = row_base[2];
                 for (int x = 0; x < w; x++) {
                     if (vz >= 0 && vy >= 0 && vx >= 0 &&
-                        vz < p.sz && vy < p.sy && vx < p.sx) {
+                        vz < p.szf && vy < p.syf && vx < p.sxf) {
                         float v = sampler.sampleTricubic(vz, vy, vx);
                         if constexpr (std::is_same_v<T, uint16_t>) {
                             v = std::clamp(v, 0.f, 65535.f);
@@ -1497,7 +1516,7 @@ static void samplePlaneImpl(
                 float rowMinZ = std::min(first[2], last[2]);
                 float rowMaxZ = std::max(first[2], last[2]);
                 bool rowInBounds = rowMinX >= -0.5f && rowMinY >= -0.5f && rowMinZ >= -0.5f &&
-                                   rowMaxX < p.sx - 0.5f && rowMaxY < p.sy - 0.5f && rowMaxZ < p.sz - 0.5f;
+                                   rowMaxX < p.sxf - 0.5f && rowMaxY < p.syf - 0.5f && rowMaxZ < p.szf - 0.5f;
 
                 // Single-chunk detection from integer bounding box
                 bool rowSingleChunk = false;
@@ -1529,7 +1548,7 @@ static void samplePlaneImpl(
                         int iy = static_cast<int>(fy);
                         int iz = static_cast<int>(fz);
                         int lx = p.localX(ix), ly = p.localY(iy), lz = p.localZ(iz);
-                        float fracX = fx - ix, fracY = fy - iy, fracZ = fz - iz;
+                        float fracX = fx - static_cast<float>(ix), fracY = fy - static_cast<float>(iy), fracZ = fz - static_cast<float>(iz);
                         for (int x = 0; x < w; x++) {
                             nt_store(&outRow[x], chunkData[vo(lz, ly, lx)]);
                             // Branchless fractional stepping (CMOV instead of branches)
@@ -1562,7 +1581,7 @@ static void samplePlaneImpl(
                     int ix = static_cast<int>(fx);
                     int iy = static_cast<int>(fy);
                     int iz = static_cast<int>(fz);
-                    float fracX = fx - ix, fracY = fy - iy, fracZ = fz - iz;
+                    float fracX = fx - static_cast<float>(ix), fracY = fy - static_cast<float>(iy), fracZ = fz - static_cast<float>(iz);
                     uint64_t curKey = UINT64_MAX;
                     const T* __restrict__ curData = nullptr;
                     for (int x = 0; x < w; x++) {
@@ -1608,7 +1627,7 @@ static void samplePlaneImpl(
                     float vx = row_base[0], vy = row_base[1], vz = row_base[2];
                     for (int x = 0; x < w; x++) {
                         if (vz >= 0 && vy >= 0 && vx >= 0 &&
-                            vz < p.sz && vy < p.sy && vx < p.sx) {
+                            vz < p.szf && vy < p.syf && vx < p.sxf) {
                             nt_store(&outRow[x], sampler.sampleNearest(vz, vy, vx));
                         }
                         vx += dx; vy += dy; vz += dz;
@@ -1690,7 +1709,7 @@ static void samplePlaneARGB32Impl(
         maxVx += margin; maxVy += margin; maxVz += margin;
 
         if (maxVx < 0 || maxVy < 0 || maxVz < 0 ||
-            minVx >= p.sx || minVy >= p.sy || minVz >= p.sz) {
+            minVx >= p.sxf || minVy >= p.syf || minVz >= p.szf) {
             return;
         }
 
@@ -1744,8 +1763,8 @@ static void samplePlaneARGB32Impl(
                 if (w > 1 &&
                     first[2] >= 0 && first[1] >= 0 && first[0] >= 0 &&
                     last[2] >= 0 && last[1] >= 0 && last[0] >= 0 &&
-                    first[2] + 1 < p.sz && first[1] + 1 < p.sy && first[0] + 1 < p.sx &&
-                    last[2] + 1 < p.sz && last[1] + 1 < p.sy && last[0] + 1 < p.sx) {
+                    first[2] + 1 < p.szf && first[1] + 1 < p.syf && first[0] + 1 < p.sxf &&
+                    last[2] + 1 < p.szf && last[1] + 1 < p.syf && last[0] + 1 < p.sxf) {
                     int iz0 = static_cast<int>(first[2]), iy0 = static_cast<int>(first[1]), ix0 = static_cast<int>(first[0]);
                     int izE = static_cast<int>(last[2]), iyE = static_cast<int>(last[1]), ixE = static_cast<int>(last[0]);
                     int ciz0 = p.chunkZ(iz0), ciy0 = p.chunkY(iy0), cix0 = p.chunkX(ix0);
@@ -1771,10 +1790,11 @@ static void samplePlaneARGB32Impl(
                         int x = 0;
                         for (; x + 3 < w; x += 4) {
                             // Independent coordinate computation (no serial dependency)
-                            float vx0 = bx + x * dx,       vy0 = by + x * dy,       vz0 = bz + x * dz;
-                            float vx1 = bx + (x+1) * dx,   vy1 = by + (x+1) * dy,   vz1 = bz + (x+1) * dz;
-                            float vx2 = bx + (x+2) * dx,   vy2 = by + (x+2) * dy,   vz2 = bz + (x+2) * dz;
-                            float vx3 = bx + (x+3) * dx,   vy3 = by + (x+3) * dy,   vz3 = bz + (x+3) * dz;
+                            float xf = static_cast<float>(x);
+                            float vx0 = bx + xf * dx,           vy0 = by + xf * dy,           vz0 = bz + xf * dz;
+                            float vx1 = bx + (xf+1.0f) * dx,   vy1 = by + (xf+1.0f) * dy,   vz1 = bz + (xf+1.0f) * dz;
+                            float vx2 = bx + (xf+2.0f) * dx,   vy2 = by + (xf+2.0f) * dy,   vz2 = bz + (xf+2.0f) * dz;
+                            float vx3 = bx + (xf+3.0f) * dx,   vy3 = by + (xf+3.0f) * dy,   vz3 = bz + (xf+3.0f) * dz;
 
                             int ix0 = (int)vx0, iy0_ = (int)vy0, iz0_ = (int)vz0;
                             int ix1 = (int)vx1, iy1_ = (int)vy1, iz1_ = (int)vz1;
@@ -1795,10 +1815,10 @@ static void samplePlaneARGB32Impl(
                             }
 
                             // Base offsets (row-major)
-                            size_t o0 = lz0_*st0 + ly0_*st1 + lx0;
-                            size_t o1 = lz1_*st0 + ly1_*st1 + lx1;
-                            size_t o2 = lz2_*st0 + ly2_*st1 + lx2;
-                            size_t o3 = lz3_*st0 + ly3_*st1 + lx3;
+                            size_t o0 = static_cast<size_t>(lz0_)*st0 + static_cast<size_t>(ly0_)*st1 + static_cast<size_t>(lx0);
+                            size_t o1 = static_cast<size_t>(lz1_)*st0 + static_cast<size_t>(ly1_)*st1 + static_cast<size_t>(lx1);
+                            size_t o2 = static_cast<size_t>(lz2_)*st0 + static_cast<size_t>(ly2_)*st1 + static_cast<size_t>(lx2);
+                            size_t o3 = static_cast<size_t>(lz3_)*st0 + static_cast<size_t>(ly3_)*st1 + static_cast<size_t>(lx3);
 
                             // Gather 8 corners × 4 pixels (32 loads, interleaved for ILP)
                             float g[4][8];
@@ -1820,9 +1840,9 @@ static void samplePlaneARGB32Impl(
                             g[2][7] = cd[o2+st0+st1+1];    g[3][7] = cd[o3+st0+st1+1];
 
                             // Fractions
-                            float fx[4] = {vx0-ix0, vx1-ix1, vx2-ix2, vx3-ix3};
-                            float fy[4] = {vy0-iy0_, vy1-iy1_, vy2-iy2_, vy3-iy3_};
-                            float fz[4] = {vz0-iz0_, vz1-iz1_, vz2-iz2_, vz3-iz3_};
+                            float fx[4] = {vx0-static_cast<float>(ix0), vx1-static_cast<float>(ix1), vx2-static_cast<float>(ix2), vx3-static_cast<float>(ix3)};
+                            float fy[4] = {vy0-static_cast<float>(iy0_), vy1-static_cast<float>(iy1_), vy2-static_cast<float>(iy2_), vy3-static_cast<float>(iy3_)};
+                            float fz[4] = {vz0-static_cast<float>(iz0_), vz1-static_cast<float>(iz1_), vz2-static_cast<float>(iz2_), vz3-static_cast<float>(iz3_)};
 
                             // Trilinear interpolation — 4 independent chains,
                             // written as parallel loops for auto-vectorization.
@@ -1845,11 +1865,12 @@ static void samplePlaneARGB32Impl(
                         }
                         // Scalar tail
                         for (; x < w; x++) {
-                            float cvx = bx + x * dx, cvy = by + x * dy, cvz = bz + x * dz;
-                            int cix = (int)cvx, ciy = (int)cvy, ciz = (int)cvz;
+                            float xf = static_cast<float>(x);
+                            float cvx = bx + xf * dx, cvy = by + xf * dy, cvz = bz + xf * dz;
+                            int cix = static_cast<int>(cvx), ciy = static_cast<int>(cvy), ciz = static_cast<int>(cvz);
                             int clx = p.localX(cix), cly = p.localY(ciy), clz = p.localZ(ciz);
-                            size_t co = clz*st0 + cly*st1 + clx;
-                            float cfx = cvx-cix, cfy = cvy-ciy, cfz = cvz-ciz;
+                            size_t co = static_cast<size_t>(clz)*st0 + static_cast<size_t>(cly)*st1 + static_cast<size_t>(clx);
+                            float cfx = cvx-static_cast<float>(cix), cfy = cvy-static_cast<float>(ciy), cfz = cvz-static_cast<float>(ciz);
                             float cx00 = cd[co]       + cfx*(cd[co+1]         - cd[co]);
                             float cx01 = cd[co+st1]   + cfx*(cd[co+st1+1]     - cd[co+st1]);
                             float cx10 = cd[co+st0]   + cfx*(cd[co+st0+1]     - cd[co+st0]);
@@ -1863,7 +1884,7 @@ static void samplePlaneARGB32Impl(
                     float vx = row_base[0], vy = row_base[1], vz = row_base[2];
                     for (int x = 0; x < w; x++) {
                         if (vz >= 0 && vy >= 0 && vx >= 0 &&
-                            vz < p.sz - 1 && vy < p.sy - 1 && vx < p.sx - 1) {
+                            vz < p.szf - 1.0f && vy < p.syf - 1.0f && vx < p.sxf - 1.0f) {
                             float v = sampler.sampleTrilinearUnchecked(vz, vy, vx);
                             nt_store_u32(&outRow[x], lut[static_cast<uint8_t>(v)]);
                         }
@@ -1874,7 +1895,7 @@ static void samplePlaneARGB32Impl(
                 float vx = row_base[0], vy = row_base[1], vz = row_base[2];
                 for (int x = 0; x < w; x++) {
                     if (vz >= 0 && vy >= 0 && vx >= 0 &&
-                        vz < p.sz && vy < p.sy && vx < p.sx) {
+                        vz < p.szf && vy < p.syf && vx < p.sxf) {
                         float v = sampler.sampleTricubic(vz, vy, vx);
                         nt_store_u32(&outRow[x], lut[static_cast<uint8_t>(v)]);
                     }
@@ -1893,7 +1914,7 @@ static void samplePlaneARGB32Impl(
                 float rowMinZ = std::min(first[2], last[2]);
                 float rowMaxZ = std::max(first[2], last[2]);
                 bool rowInBounds = rowMinX >= -0.5f && rowMinY >= -0.5f && rowMinZ >= -0.5f &&
-                                   rowMaxX < p.sx - 0.5f && rowMaxY < p.sy - 0.5f && rowMaxZ < p.sz - 0.5f;
+                                   rowMaxX < p.sxf - 0.5f && rowMaxY < p.syf - 0.5f && rowMaxZ < p.szf - 0.5f;
 
                 bool rowSingleChunk = false;
                 int rowCiz = 0, rowCiy = 0, rowCix = 0;
@@ -1954,7 +1975,7 @@ static void samplePlaneARGB32Impl(
                     int ix = static_cast<int>(fx);
                     int iy = static_cast<int>(fy);
                     int iz = static_cast<int>(fz);
-                    float fracX = fx - ix, fracY = fy - iy, fracZ = fz - iz;
+                    float fracX = fx - static_cast<float>(ix), fracY = fy - static_cast<float>(iy), fracZ = fz - static_cast<float>(iz);
                     uint64_t curKey = UINT64_MAX;
                     const uint8_t* __restrict__ curData = nullptr;
                     for (int x = 0; x < w; x++) {
@@ -1999,7 +2020,7 @@ static void samplePlaneARGB32Impl(
                     float vx = row_base[0], vy = row_base[1], vz = row_base[2];
                     for (int x = 0; x < w; x++) {
                         if (vz >= 0 && vy >= 0 && vx >= 0 &&
-                            vz < p.sz && vy < p.sy && vx < p.sx) {
+                            vz < p.szf && vy < p.syf && vx < p.sxf) {
                             nt_store_u32(&outRow[x], lut[sampler.sampleNearest(vz, vy, vx)]);
                         }
                         vx += dx; vy += dy; vz += dz;
@@ -2082,7 +2103,7 @@ void samplePlaneCompositeARGB32(
         maxVx += 1; maxVy += 1; maxVz += 1;
 
         if (maxVx < 0 || maxVy < 0 || maxVz < 0 ||
-            minVx >= p.sx || minVy >= p.sy || minVz >= p.sz)
+            minVx >= p.sxf || minVy >= p.syf || minVz >= p.szf)
             return;
 
         int minCx = p.chunkX(std::max(0, static_cast<int>(minVx)));
@@ -2110,14 +2131,15 @@ void samplePlaneCompositeARGB32(
     // Precompute scalar layer offsets (normal is constant for plane)
     const float nx = normal[0], ny = normal[1], nz = normal[2];
     thread_local std::vector<float> layerOffsetsX, layerOffsetsY, layerOffsetsZ;
-    layerOffsetsX.resize(numLayers);
-    layerOffsetsY.resize(numLayers);
-    layerOffsetsZ.resize(numLayers);
+    layerOffsetsX.resize(static_cast<size_t>(numLayers));
+    layerOffsetsY.resize(static_cast<size_t>(numLayers));
+    layerOffsetsZ.resize(static_cast<size_t>(numLayers));
     for (int l = 0; l < numLayers; l++) {
         float off = static_cast<float>(zStart + l) * zStep;
-        layerOffsetsX[l] = nx * off;
-        layerOffsetsY[l] = ny * off;
-        layerOffsetsZ[l] = nz * off;
+        size_t li = static_cast<size_t>(l);
+        layerOffsetsX[li] = nx * off;
+        layerOffsetsY[li] = ny * off;
+        layerOffsetsZ[li] = nz * off;
     }
 
     // Determine composite mode once (avoid string compare per pixel)
@@ -2298,15 +2320,15 @@ static void readMultiSliceImpl(
     const int w = basePoints.cols;
     const int numSlices = static_cast<int>(offsets.size());
 
-    out.resize(numSlices);
+    out.resize(static_cast<size_t>(numSlices));
     for (int s = 0; s < numSlices; s++)
-        out[s] = cv::Mat_<T>(basePoints.size(), 0);
+        out[static_cast<size_t>(s)] = cv::Mat_<T>(basePoints.size(), 0);
 
     if (numSlices == 0) return;
 
     // Phase 1: Discover needed chunks and prefetch in parallel.
     {
-        const size_t totalChunks = static_cast<size_t>(p.chunksZ) * p.chunksY * p.chunksX;
+        const size_t totalChunks = static_cast<size_t>(p.chunksZ) * static_cast<size_t>(p.chunksY) * static_cast<size_t>(p.chunksX);
         std::vector<uint8_t> needed(totalChunks, 0);
         int minIz = p.chunksZ, maxIz = -1;
         int minIy = p.chunksY, maxIy = -1;
@@ -2317,7 +2339,7 @@ static void readMultiSliceImpl(
             int ciz = p.chunkZ(iz);
             int ciy = p.chunkY(iy);
             int cix = p.chunkX(ix);
-            size_t idx = static_cast<size_t>(ciz) * p.chunksY * p.chunksX + ciy * p.chunksX + cix;
+            size_t idx = static_cast<size_t>(ciz) * static_cast<size_t>(p.chunksY) * static_cast<size_t>(p.chunksX) + static_cast<size_t>(ciy) * static_cast<size_t>(p.chunksX) + static_cast<size_t>(cix);
             if (!needed[idx]) {
                 needed[idx] = 1;
                 minIz = std::min(minIz, ciz); maxIz = std::max(maxIz, ciz);
@@ -2327,7 +2349,7 @@ static void readMultiSliceImpl(
         };
 
         const float fOff = offsets[0];
-        const float lOff = offsets[numSlices - 1];
+        const float lOff = offsets[static_cast<size_t>(numSlices - 1)];
         for (int y = 0; y < h; y++) {
             for (int x = 0; x < w; x++) {
                 const cv::Vec3f& bp = basePoints(y, x);
@@ -2354,7 +2376,7 @@ static void readMultiSliceImpl(
         for (int ciz = minIz; ciz <= maxIz; ciz++)
             for (int ciy = minIy; ciy <= maxIy; ciy++)
                 for (int cix = minIx; cix <= maxIx; cix++)
-                    if (needed[static_cast<size_t>(ciz) * p.chunksY * p.chunksX + ciy * p.chunksX + cix])
+                    if (needed[static_cast<size_t>(ciz) * static_cast<size_t>(p.chunksY) * static_cast<size_t>(p.chunksX) + static_cast<size_t>(ciy) * static_cast<size_t>(p.chunksX) + static_cast<size_t>(cix)])
                         neededKeys.push_back(vc::cache::ChunkKey{level, ciz, ciy, cix});
 
         // Submit async prefetch so IO+decode pipelines across all chunks.
@@ -2377,7 +2399,7 @@ static void readMultiSliceImpl(
     // Phase 2: Sample (all chunks for this band already cached).
     constexpr float maxVal = std::is_same_v<T, uint16_t> ? 65535.f : 255.f;
     const float firstOff = offsets[0];
-    const float lastOff = offsets[numSlices - 1];
+    const float lastOff = offsets[static_cast<size_t>(numSlices - 1)];
     const int lsz = p.sz, lsy = p.sy, lsx = p.sx;
 
     {
@@ -2429,7 +2451,7 @@ static void readMultiSliceImpl(
                     if (!d) continue;
 
                     for (int si = 0; si < numSlices; si++) {
-                        float off = offsets[si];
+                        float off = offsets[static_cast<size_t>(si)];
                         float vx = bp[0] + sd[0] * off;
                         float vy = bp[1] + sd[1] * off;
                         float vz = bp[2] + sd[2] * off;
@@ -2448,9 +2470,10 @@ static void readMultiSliceImpl(
                         float c011 = d[vo(lz0, ly0+1, lx0+1)];
                         float c111 = d[vo(lz0+1, ly0+1, lx0+1)];
 
-                        float fz = vz - iz;
-                        float fy = vy - iy;
-                        float fx = vx - ix;
+                        float izf = static_cast<float>(iz), iyf = static_cast<float>(iy), ixf = static_cast<float>(ix);
+                        float fz = vz - izf;
+                        float fy = vy - iyf;
+                        float fx = vx - ixf;
 
                         float c00 = std::fma(fx, c001 - c000, c000);
                         float c01 = std::fma(fx, c011 - c010, c010);
@@ -2462,21 +2485,21 @@ static void readMultiSliceImpl(
 
                         float v = std::fma(fz, c1 - c0, c0);
                         v = std::max(0.f, std::min(maxVal, v + 0.5f));
-                        out[si](y, x) = static_cast<T>(v);
+                        out[static_cast<size_t>(si)](y, x) = static_cast<T>(v);
                     }
                 } else {
                     for (int si = 0; si < numSlices; si++) {
-                        float off = offsets[si];
+                        float off = offsets[static_cast<size_t>(si)];
                         float vx = bp[0] + sd[0] * off;
                         float vy = bp[1] + sd[1] * off;
                         float vz = bp[2] + sd[2] * off;
 
-                        if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < lsz - 1 && vy < lsy - 1 && vx < lsx - 1))
+                        if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < static_cast<float>(lsz - 1) && vy < static_cast<float>(lsy - 1) && vx < static_cast<float>(lsx - 1)))
                             continue;
 
                         float v = sampler.sampleTrilinearUnchecked(vz, vy, vx);
                         v = std::max(0.f, std::min(maxVal, v + 0.5f));
-                        out[si](y, x) = static_cast<T>(v);
+                        out[static_cast<size_t>(si)](y, x) = static_cast<T>(v);
                     }
                 }
             }
@@ -2528,9 +2551,9 @@ static void sampleTileSlicesImpl(
     const int w = basePoints.cols;
     const int numSlices = static_cast<int>(offsets.size());
 
-    out.resize(numSlices);
+    out.resize(static_cast<size_t>(numSlices));
     for (int s = 0; s < numSlices; s++)
-        out[s] = cv::Mat_<T>(basePoints.size(), 0);
+        out[static_cast<size_t>(s)] = cv::Mat_<T>(basePoints.size(), 0);
 
     if (numSlices == 0) return;
 
@@ -2552,7 +2575,7 @@ static void sampleTileSlicesImpl(
         };
 
         const float fOff = offsets[0];
-        const float lOff = offsets[numSlices - 1];
+        const float lOff = offsets[static_cast<size_t>(numSlices - 1)];
         for (int y = 0; y < h; y++) {
             for (int x = 0; x < w; x++) {
                 const cv::Vec3f& bp = basePoints(y, x);
@@ -2591,7 +2614,7 @@ static void sampleTileSlicesImpl(
     // Phase 2: Sample (single-threaded, all chunks already cached).
     constexpr float maxVal = std::is_same_v<T, uint16_t> ? 65535.f : 255.f;
     const float firstOff = offsets[0];
-    const float lastOff = offsets[numSlices - 1];
+    const float lastOff = offsets[static_cast<size_t>(numSlices - 1)];
     const int lsz = p.sz, lsy = p.sy, lsx = p.sx;
 
     ChunkSampler<T, 8> sampler(p, cache, level);
@@ -2642,7 +2665,7 @@ static void sampleTileSlicesImpl(
                 if (!d) continue;
 
                 for (int si = 0; si < numSlices; si++) {
-                    float off = offsets[si];
+                    float off = offsets[static_cast<size_t>(si)];
                     float vx = bp[0] + sd[0] * off;
                     float vy = bp[1] + sd[1] * off;
                     float vz = bp[2] + sd[2] * off;
@@ -2661,9 +2684,10 @@ static void sampleTileSlicesImpl(
                     float c011 = d[vo(lz0, ly0+1, lx0+1)];
                     float c111 = d[vo(lz0+1, ly0+1, lx0+1)];
 
-                    float fz = vz - iz;
-                    float fy = vy - iy;
-                    float fx = vx - ix;
+                    float izf = static_cast<float>(iz), iyf = static_cast<float>(iy), ixf = static_cast<float>(ix);
+                    float fz = vz - izf;
+                    float fy = vy - iyf;
+                    float fx = vx - ixf;
 
                     float c00 = std::fma(fx, c001 - c000, c000);
                     float c01 = std::fma(fx, c011 - c010, c010);
@@ -2675,21 +2699,21 @@ static void sampleTileSlicesImpl(
 
                     float v = std::fma(fz, c1 - c0, c0);
                     v = std::max(0.f, std::min(maxVal, v + 0.5f));
-                    out[si](y, x) = static_cast<T>(v);
+                    out[static_cast<size_t>(si)](y, x) = static_cast<T>(v);
                 }
             } else {
                 for (int si = 0; si < numSlices; si++) {
-                    float off = offsets[si];
+                    float off = offsets[static_cast<size_t>(si)];
                     float vx = bp[0] + sd[0] * off;
                     float vy = bp[1] + sd[1] * off;
                     float vz = bp[2] + sd[2] * off;
 
-                    if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < lsz - 1 && vy < lsy - 1 && vx < lsx - 1))
+                    if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < static_cast<float>(lsz - 1) && vy < static_cast<float>(lsy - 1) && vx < static_cast<float>(lsx - 1)))
                         continue;
 
                     float v = sampler.sampleTrilinearUnchecked(vz, vy, vx);
                     v = std::max(0.f, std::min(maxVal, v + 0.5f));
-                    out[si](y, x) = static_cast<T>(v);
+                    out[static_cast<size_t>(si)](y, x) = static_cast<T>(v);
                 }
             }
         }

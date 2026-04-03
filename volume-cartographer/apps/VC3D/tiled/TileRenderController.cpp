@@ -39,7 +39,7 @@ struct TileLatencyStats {
         auto percentile = [](std::vector<double>& v, double p) -> double {
             if (v.empty()) return 0;
             std::sort(v.begin(), v.end());
-            size_t idx = std::min(static_cast<size_t>(v.size() * p), v.size() - 1);
+            size_t idx = std::min(static_cast<size_t>(static_cast<double>(v.size()) * p), v.size() - 1);
             return v[idx];
         };
 
@@ -51,7 +51,7 @@ struct TileLatencyStats {
         }
 
         auto avg = [](const std::vector<double>& v) {
-            return std::accumulate(v.begin(), v.end(), 0.0) / v.size();
+            return std::accumulate(v.begin(), v.end(), 0.0) / static_cast<double>(v.size());
         };
 
         fprintf(stderr,
@@ -100,15 +100,15 @@ TileRenderController::TileRenderController(TileScene* tileScene, RenderPool* sha
         if (result.pixels.empty()) return;
 
         QImage img(result.width, result.height, QImage::Format_RGB32);
-        const int srcStride = result.width * 4;
-        const int dstStride = img.bytesPerLine();
+        const size_t srcStride = static_cast<size_t>(result.width) * 4;
+        const size_t dstStride = static_cast<size_t>(img.bytesPerLine());
         if (srcStride == dstStride) {
             std::memcpy(img.bits(), result.pixels.data(),
-                        static_cast<size_t>(srcStride) * result.height);
+                        srcStride * static_cast<size_t>(result.height));
         } else {
             for (int y = 0; y < result.height; y++) {
                 std::memcpy(img.scanLine(y),
-                            reinterpret_cast<const uchar*>(result.pixels.data()) + y * srcStride,
+                            reinterpret_cast<const uchar*>(result.pixels.data()) + static_cast<size_t>(y) * srcStride,
                             srcStride);
             }
         }

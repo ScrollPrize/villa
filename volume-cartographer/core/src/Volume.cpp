@@ -140,7 +140,7 @@ void Volume::zarrOpen()
             const int levelInt = static_cast<int>(level);
 
             if (!hasReference) {
-                const int64_t scale = int64_t{1} << levelInt;
+                const size_t scale = size_t{1} << levelInt;
                 baseSlices = static_cast<int>(shape[0] * scale);
                 baseHeight = static_cast<int>(shape[1] * scale);
                 baseWidth = static_cast<int>(shape[2] * scale);
@@ -278,7 +278,7 @@ vc::VcDataset *Volume::zarrDataset(int level) const {
     if (static_cast<size_t>(level) >= zarrDs_.size())
         return nullptr;
 
-    return zarrDs_[level].get();
+    return zarrDs_[static_cast<size_t>(level)].get();
 }
 
 size_t Volume::numScales() const noexcept {
@@ -790,7 +790,7 @@ BBox6f computeCompositeBBox(const cv::Mat_<cv::Vec3f>& coords,
 
         cv::Vec3f n = hasNormals ? normals(r, c) : cv::Vec3f(1, 0, 0);
         for (int z : {zStart, zEnd}) {
-            float off = z * scale;
+            float off = static_cast<float>(z) * scale;
             float px = sx + n[0] * off;
             float py = sy + n[1] * off;
             float pz = sz + n[2] * off;
@@ -838,16 +838,17 @@ Volume::ChunkBBox Volume::compositeChunkBBox(
 
     auto cs = ds->defaultChunkShape();  // {cz, cy, cx}
     const auto& shape = ds->shape();    // {z, y, x}
+    float csX = static_cast<float>(cs[2]), csY = static_cast<float>(cs[1]), csZ = static_cast<float>(cs[0]);
 
     ChunkBBox cbbox;
-    cbbox.minIx = std::max(0, static_cast<int>(std::floor(bb.loX / cs[2])));
-    cbbox.maxIx = std::min(static_cast<int>(std::ceil(bb.hiX / cs[2])),
+    cbbox.minIx = std::max(0, static_cast<int>(std::floor(bb.loX / csX)));
+    cbbox.maxIx = std::min(static_cast<int>(std::ceil(bb.hiX / csX)),
                            static_cast<int>((shape[2] - 1) / cs[2]));
-    cbbox.minIy = std::max(0, static_cast<int>(std::floor(bb.loY / cs[1])));
-    cbbox.maxIy = std::min(static_cast<int>(std::ceil(bb.hiY / cs[1])),
+    cbbox.minIy = std::max(0, static_cast<int>(std::floor(bb.loY / csY)));
+    cbbox.maxIy = std::min(static_cast<int>(std::ceil(bb.hiY / csY)),
                            static_cast<int>((shape[1] - 1) / cs[1]));
-    cbbox.minIz = std::max(0, static_cast<int>(std::floor(bb.loZ / cs[0])));
-    cbbox.maxIz = std::min(static_cast<int>(std::ceil(bb.hiZ / cs[0])),
+    cbbox.minIz = std::max(0, static_cast<int>(std::floor(bb.loZ / csZ)));
+    cbbox.maxIz = std::min(static_cast<int>(std::ceil(bb.hiZ / csZ)),
                            static_cast<int>((shape[0] - 1) / cs[0]));
     return cbbox;
 }
@@ -985,7 +986,7 @@ void Volume::primeRemoteLevel5Blocking(
     int gridZ = (levelShape[0] + chunkShape[0] - 1) / chunkShape[0];
     int gridY = (levelShape[1] + chunkShape[1] - 1) / chunkShape[1];
     int gridX = (levelShape[2] + chunkShape[2] - 1) / chunkShape[2];
-    size_t total = static_cast<size_t>(gridZ) * gridY * gridX;
+    size_t total = static_cast<size_t>(gridZ) * static_cast<size_t>(gridY) * static_cast<size_t>(gridX);
     size_t completed = 0;
 
     try {
@@ -1133,6 +1134,7 @@ Volume::ChunkBBox Volume::worldBBoxToChunkBBox(const WorldBBox& wb, int level) c
     float scale = (level > 0) ? (1.0f / static_cast<float>(1 << level)) : 1.0f;
     auto cs = ds->defaultChunkShape();
     const auto& shape = ds->shape();
+    float csX = static_cast<float>(cs[2]), csY = static_cast<float>(cs[1]), csZ = static_cast<float>(cs[0]);
 
     // Apply scale + interpolation margin
     float loX = wb.loX * scale - 2.0f;
@@ -1143,14 +1145,14 @@ Volume::ChunkBBox Volume::worldBBoxToChunkBBox(const WorldBBox& wb, int level) c
     float hiZ = wb.hiZ * scale + 2.0f;
 
     ChunkBBox bb;
-    bb.minIx = std::max(0, static_cast<int>(std::floor(loX / cs[2])));
-    bb.maxIx = std::min(static_cast<int>(std::ceil(hiX / cs[2])),
+    bb.minIx = std::max(0, static_cast<int>(std::floor(loX / csX)));
+    bb.maxIx = std::min(static_cast<int>(std::ceil(hiX / csX)),
                         static_cast<int>((shape[2] - 1) / cs[2]));
-    bb.minIy = std::max(0, static_cast<int>(std::floor(loY / cs[1])));
-    bb.maxIy = std::min(static_cast<int>(std::ceil(hiY / cs[1])),
+    bb.minIy = std::max(0, static_cast<int>(std::floor(loY / csY)));
+    bb.maxIy = std::min(static_cast<int>(std::ceil(hiY / csY)),
                         static_cast<int>((shape[1] - 1) / cs[1]));
-    bb.minIz = std::max(0, static_cast<int>(std::floor(loZ / cs[0])));
-    bb.maxIz = std::min(static_cast<int>(std::ceil(hiZ / cs[0])),
+    bb.minIz = std::max(0, static_cast<int>(std::floor(loZ / csZ)));
+    bb.maxIz = std::min(static_cast<int>(std::ceil(hiZ / csZ)),
                         static_cast<int>((shape[0] - 1) / cs[0]));
     return bb;
 }
@@ -1217,7 +1219,7 @@ void Volume::prefetchLevels(int fromLevel, int toLevel)
             std::fprintf(stderr, "[Volume] Prefetching level %d (%d chunks)...\n",
                          lvl, total);
 
-            cache->prefetchLevel(lvl, [lvl, total](int fetched, int t) {
+            cache->prefetchLevel(lvl, [lvl](int fetched, int t) {
                 if (fetched % 5000 < 1000)
                     std::fprintf(stderr, "[Volume] Level %d prefetch: %d/%d\n",
                                  lvl, fetched, t);
@@ -1250,6 +1252,7 @@ void Volume::prefetchWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int lev
     float scale = (level > 0) ? (1.0f / static_cast<float>(1 << level)) : 1.0f;
     auto cs = ds->defaultChunkShape();  // {cz, cy, cx}
     const auto& shape = ds->shape();    // {z, y, x}
+    float csX = static_cast<float>(cs[2]), csY = static_cast<float>(cs[1]), csZ = static_cast<float>(cs[0]);
 
     // Apply margin to float coords, then floor/ceil to chunk indices
     float sLoX = lo[0] * scale - 1.0f;
@@ -1259,15 +1262,15 @@ void Volume::prefetchWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int lev
     float sLoZ = lo[2] * scale - 1.0f;
     float sHiZ = hi[2] * scale + 1.0f;
 
-    int minIx = std::max(0, static_cast<int>(std::floor(sLoX / cs[2])));
+    int minIx = std::max(0, static_cast<int>(std::floor(sLoX / csX)));
     int maxIx = std::min(static_cast<int>((shape[2] - 1) / cs[2]),
-                         static_cast<int>(std::ceil(sHiX / cs[2])));
-    int minIy = std::max(0, static_cast<int>(std::floor(sLoY / cs[1])));
+                         static_cast<int>(std::ceil(sHiX / csX)));
+    int minIy = std::max(0, static_cast<int>(std::floor(sLoY / csY)));
     int maxIy = std::min(static_cast<int>((shape[1] - 1) / cs[1]),
-                         static_cast<int>(std::ceil(sHiY / cs[1])));
-    int minIz = std::max(0, static_cast<int>(std::floor(sLoZ / cs[0])));
+                         static_cast<int>(std::ceil(sHiY / csY)));
+    int minIz = std::max(0, static_cast<int>(std::floor(sLoZ / csZ)));
     int maxIz = std::min(static_cast<int>((shape[0] - 1) / cs[0]),
-                         static_cast<int>(std::ceil(sHiZ / cs[0])));
+                         static_cast<int>(std::ceil(sHiZ / csZ)));
 
     if (minIx > maxIx || minIy > maxIy || minIz > maxIz) return;
 

@@ -70,26 +70,27 @@ void ViewportRenderer::onCameraChanged(
         auto cs = volume->tieredCache()->chunkShape(camera.dsScaleIdx);
         float worldTileSize = _tileGrid.bounds().worldTileSize;
         if (worldTileSize > 0)
-            chunkGroupSize = std::max(1, static_cast<int>(std::round(cs[1] / worldTileSize)));
+            chunkGroupSize = std::max(1, static_cast<int>(std::round(static_cast<float>(cs[1]) / worldTileSize)));
     }
 
     // Sort by chunk group (center-first within groups) for cache locality.
     {
         float vcx = (vpLeft + vpRight) * 0.5f / TileGrid::TILE_PX;
         float vcy = (vpTop + vpBottom) * 0.5f / TileGrid::TILE_PX;
+        float cgsF = static_cast<float>(chunkGroupSize);
         int cgs = chunkGroupSize;
         auto floorDiv = [](int a, int b) { return (a >= 0) ? a / b : (a - b + 1) / b; };
         std::sort(visibleKeys.begin(), visibleKeys.end(),
-            [vcx, vcy, cgs, floorDiv](const WorldTileKey& a, const WorldTileKey& b) {
+            [vcx, vcy, cgs, cgsF, floorDiv](const WorldTileKey& a, const WorldTileKey& b) {
                 int gaCol = floorDiv(a.worldCol, cgs);
                 int gaRow = floorDiv(a.worldRow, cgs);
                 int gbCol = floorDiv(b.worldCol, cgs);
                 int gbRow = floorDiv(b.worldRow, cgs);
                 if (gaCol != gbCol || gaRow != gbRow) {
-                    float gaCx = gaCol * cgs + cgs * 0.5f;
-                    float gaCy = gaRow * cgs + cgs * 0.5f;
-                    float gbCx = gbCol * cgs + cgs * 0.5f;
-                    float gbCy = gbRow * cgs + cgs * 0.5f;
+                    float gaCx = static_cast<float>(gaCol) * cgsF + cgsF * 0.5f;
+                    float gaCy = static_cast<float>(gaRow) * cgsF + cgsF * 0.5f;
+                    float gbCx = static_cast<float>(gbCol) * cgsF + cgsF * 0.5f;
+                    float gbCy = static_cast<float>(gbRow) * cgsF + cgsF * 0.5f;
                     float dga = (gaCx - vcx) * (gaCx - vcx) + (gaCy - vcy) * (gaCy - vcy);
                     float dgb = (gbCx - vcx) * (gbCx - vcx) + (gbCy - vcy) * (gbCy - vcy);
                     return dga < dgb;
@@ -104,7 +105,6 @@ void ViewportRenderer::onCameraChanged(
             });
     }
 
-    const uint64_t epoch = _currentEpoch->load(std::memory_order_relaxed);
     int submitOrder = 0;
 
     for (const auto& wk : visibleKeys) {

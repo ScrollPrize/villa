@@ -46,10 +46,10 @@ bool TileGrid::rebuildGrid(const ContentBounds& bounds, int viewportW, int viewp
     _padX = (sceneW - contentPxW) * 0.5f;
     _padY = (sceneH - contentPxH) * 0.5f;
 
-    const int count = _bounds.totalRows * _bounds.totalCols;
+    const size_t count = static_cast<size_t>(_bounds.totalRows) * static_cast<size_t>(_bounds.totalCols);
     _meta.resize(count);
     _tiles.resize(count);
-    _unfilledCount = count;
+    _unfilledCount = static_cast<int>(count);
 
     return true;
 }
@@ -64,7 +64,7 @@ bool TileGrid::setTile(const TileKey& key, std::vector<uint32_t>&& pixels,
         return false;
     }
 
-    const int idx = key.row * _bounds.totalCols + key.col;
+    const size_t idx = static_cast<size_t>(key.row) * static_cast<size_t>(_bounds.totalCols) + static_cast<size_t>(key.col);
     auto& m = _meta[idx];
 
     // Accept if newer epoch (any level -- new camera state wins).
@@ -113,8 +113,8 @@ bool TileGrid::setTileMeta(const WorldTileKey& wk, uint64_t epoch, int8_t level)
 {
     int col, row;
     if (!_bounds.gridPosition(wk, col, row)) return false;
-    const int idx = row * _bounds.totalCols + col;
-    if (static_cast<size_t>(idx) >= _meta.size()) return false;
+    const size_t idx = static_cast<size_t>(row) * static_cast<size_t>(_bounds.totalCols) + static_cast<size_t>(col);
+    if (idx >= _meta.size()) return false;
 
     auto& m = _meta[idx];
 
@@ -141,22 +141,22 @@ std::chrono::steady_clock::time_point TileGrid::tileSubmitTime(const WorldTileKe
 {
     int col, row;
     if (!_bounds.gridPosition(wk, col, row)) return {};
-    return _tiles[row * _bounds.totalCols + col].submitTime;
+    return _tiles[static_cast<size_t>(row) * static_cast<size_t>(_bounds.totalCols) + static_cast<size_t>(col)].submitTime;
 }
 
 std::chrono::steady_clock::time_point TileGrid::tileRenderDone(const WorldTileKey& wk) const
 {
     int col, row;
     if (!_bounds.gridPosition(wk, col, row)) return {};
-    return _tiles[row * _bounds.totalCols + col].renderDone;
+    return _tiles[static_cast<size_t>(row) * static_cast<size_t>(_bounds.totalCols) + static_cast<size_t>(col)].renderDone;
 }
 
 bool TileGrid::tileNeedsContent(const WorldTileKey& wk) const
 {
     int col, row;
     if (!_bounds.gridPosition(wk, col, row)) return false;
-    const int idx = row * _bounds.totalCols + col;
-    if (static_cast<size_t>(idx) >= _meta.size()) return false;
+    const size_t idx = static_cast<size_t>(row) * static_cast<size_t>(_bounds.totalCols) + static_cast<size_t>(col);
+    if (idx >= _meta.size()) return false;
     return _meta[idx].level < 0;
 }
 
@@ -237,7 +237,7 @@ std::vector<WorldTileKey> TileGrid::visibleTiles(float vpL, float vpT, float vpR
 
     std::vector<WorldTileKey> result;
     if (firstCol > lastCol || firstRow > lastRow) return result;
-    result.reserve(static_cast<size_t>(lastCol - firstCol + 1) * (lastRow - firstRow + 1));
+    result.reserve(static_cast<size_t>(lastCol - firstCol + 1) * static_cast<size_t>(lastRow - firstRow + 1));
     for (int r = firstRow; r <= lastRow; ++r)
         for (int c = firstCol; c <= lastCol; ++c)
             result.push_back(_bounds.worldKeyAt(c, r));
@@ -251,7 +251,7 @@ int TileGrid::worstVisibleLevel(float vpL, float vpT, float vpR, float vpB) cons
     int worst = -1;
     for (int r = firstRow; r <= lastRow; ++r) {
         for (int c = firstCol; c <= lastCol; ++c) {
-            size_t idx = static_cast<size_t>(r) * _bounds.totalCols + c;
+            size_t idx = static_cast<size_t>(r) * static_cast<size_t>(_bounds.totalCols) + static_cast<size_t>(c);
             if (idx >= _meta.size()) continue;
             int8_t lvl = _meta[idx].level;
             if (lvl >= 0 && lvl > worst) worst = lvl;
@@ -269,10 +269,10 @@ std::vector<WorldTileKey> TileGrid::staleTilesInRect(int desiredLevel, uint64_t 
 
     std::vector<WorldTileKey> result;
     if (firstCol > lastCol || firstRow > lastRow) return result;
-    result.reserve(static_cast<size_t>(lastCol - firstCol + 1) * (lastRow - firstRow + 1));
+    result.reserve(static_cast<size_t>(lastCol - firstCol + 1) * static_cast<size_t>(lastRow - firstRow + 1));
     for (int r = firstRow; r <= lastRow; ++r) {
         for (int c = firstCol; c <= lastCol; ++c) {
-            size_t idx = static_cast<size_t>(r) * _bounds.totalCols + c;
+            size_t idx = static_cast<size_t>(r) * static_cast<size_t>(_bounds.totalCols) + static_cast<size_t>(c);
             if (idx >= _meta.size()) continue;
             const auto& m = _meta[idx];
             if (m.level < 0 || m.level > desiredLevel || m.epoch < epoch) {
@@ -287,8 +287,8 @@ const uint32_t* TileGrid::tilePixels(const WorldTileKey& wk) const
 {
     int col, row;
     if (!_bounds.gridPosition(wk, col, row)) return nullptr;
-    const int idx = row * _bounds.totalCols + col;
-    if (static_cast<size_t>(idx) >= _tiles.size()) return nullptr;
+    const size_t idx = static_cast<size_t>(row) * static_cast<size_t>(_bounds.totalCols) + static_cast<size_t>(col);
+    if (idx >= _tiles.size()) return nullptr;
     const auto& td = _tiles[idx];
     return td.pixels.empty() ? nullptr : td.pixels.data();
 }
@@ -297,8 +297,8 @@ std::pair<int,int> TileGrid::tileSize(const WorldTileKey& wk) const
 {
     int col, row;
     if (!_bounds.gridPosition(wk, col, row)) return {0, 0};
-    const int idx = row * _bounds.totalCols + col;
-    if (static_cast<size_t>(idx) >= _tiles.size()) return {0, 0};
+    const size_t idx = static_cast<size_t>(row) * static_cast<size_t>(_bounds.totalCols) + static_cast<size_t>(col);
+    if (idx >= _tiles.size()) return {0, 0};
     return {_tiles[idx].width, _tiles[idx].height};
 }
 
@@ -306,8 +306,8 @@ uint64_t TileGrid::tileVersion(const WorldTileKey& wk) const
 {
     int col, row;
     if (!_bounds.gridPosition(wk, col, row)) return 0;
-    const int idx = row * _bounds.totalCols + col;
-    if (static_cast<size_t>(idx) >= _tiles.size()) return 0;
+    const size_t idx = static_cast<size_t>(row) * static_cast<size_t>(_bounds.totalCols) + static_cast<size_t>(col);
+    if (idx >= _tiles.size()) return 0;
     return _tiles[idx].version;
 }
 

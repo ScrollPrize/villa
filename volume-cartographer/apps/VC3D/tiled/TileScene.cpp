@@ -24,11 +24,12 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
         float contentPxH = static_cast<float>(b.totalRows) * TILE_PX;
         float sceneW = std::max(contentPxW, static_cast<float>(viewportW));
         float sceneH = std::max(contentPxH, static_cast<float>(viewportH));
-        _scene->setSceneRect(0, 0, sceneW, sceneH);
+        _scene->setSceneRect(0, 0, static_cast<qreal>(sceneW), static_cast<qreal>(sceneH));
         for (int r = 0; r < b.totalRows; ++r) {
             for (int c = 0; c < b.totalCols; ++c) {
                 if (auto* item = itemAt(c, r)) {
-                    item->setPos(padX + static_cast<float>(c) * TILE_PX, padY + static_cast<float>(r) * TILE_PX);
+                    item->setPos(static_cast<qreal>(padX + static_cast<float>(c) * TILE_PX),
+                                 static_cast<qreal>(padY + static_cast<float>(r) * TILE_PX));
                 }
             }
         }
@@ -53,11 +54,11 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
     const float contentPxH = static_cast<float>(b.totalRows) * TILE_PX;
     const float sceneW = std::max(contentPxW, static_cast<float>(viewportW));
     const float sceneH = std::max(contentPxH, static_cast<float>(viewportH));
-    _scene->setSceneRect(0, 0, sceneW, sceneH);
+    _scene->setSceneRect(0, 0, static_cast<qreal>(sceneW), static_cast<qreal>(sceneH));
 
     // Build new grid, carrying over pixmaps from old items at matching world positions.
     // Never show empty content — reuse stale content until fresh renders arrive.
-    const int count = b.totalRows * b.totalCols;
+    const size_t count = static_cast<size_t>(b.totalRows) * static_cast<size_t>(b.totalCols);
     _items.resize(count, nullptr);
 
     for (int r = 0; r < b.totalRows; ++r) {
@@ -69,16 +70,17 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
             QPixmap carried;
             if (oldBounds.gridPosition(wk, oldCol, oldRow) &&
                 !oldItems.empty()) {
-                int oldIdx = oldRow * oldBounds.totalCols + oldCol;
-                if (oldIdx >= 0 && oldIdx < static_cast<int>(oldItems.size()) && oldItems[oldIdx]) {
+                size_t oldIdx = static_cast<size_t>(oldRow) * static_cast<size_t>(oldBounds.totalCols) + static_cast<size_t>(oldCol);
+                if (oldIdx < oldItems.size() && oldItems[oldIdx]) {
                     carried = oldItems[oldIdx]->pixmap();
                 }
             }
 
             auto* item = _scene->addPixmap(carried.isNull() ? QPixmap() : carried);
-            item->setPos(padX + static_cast<float>(c) * TILE_PX, padY + static_cast<float>(r) * TILE_PX);
+            item->setPos(static_cast<qreal>(padX + static_cast<float>(c) * TILE_PX),
+                         static_cast<qreal>(padY + static_cast<float>(r) * TILE_PX));
             item->setZValue(0);
-            _items[r * b.totalCols + c] = item;
+            _items[static_cast<size_t>(r) * static_cast<size_t>(b.totalCols) + static_cast<size_t>(c)] = item;
         }
     }
 
@@ -100,16 +102,16 @@ bool TileScene::setTile(const TileKey& key, const QPixmap& pixmap,
 
     // Convert QPixmap to pixel vector for TileGrid
     QImage img = pixmap.toImage().convertToFormat(QImage::Format_ARGB32);
-    std::vector<uint32_t> pixels(img.width() * img.height());
+    std::vector<uint32_t> pixels(static_cast<size_t>(img.width()) * static_cast<size_t>(img.height()));
     for (int y = 0; y < img.height(); ++y) {
-        memcpy(pixels.data() + y * img.width(),
+        memcpy(pixels.data() + static_cast<size_t>(y) * static_cast<size_t>(img.width()),
                img.scanLine(y),
-               img.width() * sizeof(uint32_t));
+               static_cast<size_t>(img.width()) * sizeof(uint32_t));
     }
 
     bool accepted = _grid.setTile(key, std::move(pixels), img.width(), img.height(), epoch, level);
     if (accepted) {
-        const int idx = key.row * b.totalCols + key.col;
+        const size_t idx = static_cast<size_t>(key.row) * static_cast<size_t>(b.totalCols) + static_cast<size_t>(key.col);
         _items[idx]->setPixmap(pixmap);
     }
     return accepted;
@@ -134,7 +136,7 @@ bool TileScene::setTilePixmapOnly(const WorldTileKey& wk, const QPixmap& pixmap)
     const auto& b = _grid.bounds();
     if (col < 0 || col >= b.totalCols || row < 0 || row >= b.totalRows)
         return false;
-    const int idx = row * b.totalCols + col;
+    const size_t idx = static_cast<size_t>(row) * static_cast<size_t>(b.totalCols) + static_cast<size_t>(col);
     _items[idx]->setPixmap(pixmap);
     return true;
 }
@@ -184,7 +186,7 @@ void TileScene::sceneCleared()
 QPointF TileScene::surfaceToScene(float surfX, float surfY) const
 {
     auto v = _grid.surfaceToGrid(surfX, surfY);
-    return {v[0], v[1]};
+    return {static_cast<qreal>(v[0]), static_cast<qreal>(v[1])};
 }
 
 cv::Vec2f TileScene::sceneToSurface(const QPointF& scenePos) const
@@ -232,5 +234,5 @@ QGraphicsPixmapItem* TileScene::itemAt(int col, int row) const
     if (col < 0 || col >= b.totalCols || row < 0 || row >= b.totalRows) {
         return nullptr;
     }
-    return _items[row * b.totalCols + col];
+    return _items[static_cast<size_t>(row) * static_cast<size_t>(b.totalCols) + static_cast<size_t>(col)];
 }
