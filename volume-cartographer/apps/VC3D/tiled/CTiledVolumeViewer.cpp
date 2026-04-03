@@ -751,17 +751,24 @@ void CTiledVolumeViewer::onDataBoundsReady()
 QRectF CTiledVolumeViewer::viewportSceneRect() const
 {
     if (!fGraphicsView) return QRectF();
-    // With viewport-sized framebuffer and no scrolling,
-    // the "scene rect" for the grid = the grid-space coordinates
-    // of the viewport edges. Computed from camera state to match
-    // TileGrid's coordinate system.
+    // Compute visible world tile range directly from the blit formula:
+    //   dstX = (worldCol * worldTileSize - camSurfX) * scale + vpCx
+    // Solving for surfaceX at screen edges:
+    //   surfLeft  = camSurfX - vpCx / scale
+    //   surfRight = camSurfX + vpCx / scale
+    // Convert to worldCol: floor(surfX / worldTileSize)
+    // Return as a QRectF in "surface tile grid" units for visibleTiles.
+    float vpW = static_cast<float>(fGraphicsView->viewport()->width());
+    float vpH = static_cast<float>(fGraphicsView->viewport()->height());
+    float surfL = _camera.surfacePtr[0] - vpW * 0.5f / _camera.scale;
+    float surfR = _camera.surfacePtr[0] + vpW * 0.5f / _camera.scale;
+    float surfT = _camera.surfacePtr[1] - vpH * 0.5f / _camera.scale;
+    float surfB = _camera.surfacePtr[1] + vpH * 0.5f / _camera.scale;
+    // Convert to grid-pixel space for TileGrid::visibleGridRange compatibility.
+    // The grid uses: gridX = (surfX - originSurfX) * scale + padX
     auto& grid = _renderController->viewportRenderer().tileGrid();
-    auto topLeft = grid.surfaceToGrid(
-        _camera.surfacePtr[0] - static_cast<float>(fGraphicsView->viewport()->width()) * 0.5f / _camera.scale,
-        _camera.surfacePtr[1] - static_cast<float>(fGraphicsView->viewport()->height()) * 0.5f / _camera.scale);
-    auto botRight = grid.surfaceToGrid(
-        _camera.surfacePtr[0] + static_cast<float>(fGraphicsView->viewport()->width()) * 0.5f / _camera.scale,
-        _camera.surfacePtr[1] + static_cast<float>(fGraphicsView->viewport()->height()) * 0.5f / _camera.scale);
+    auto topLeft = grid.surfaceToGrid(surfL, surfT);
+    auto botRight = grid.surfaceToGrid(surfR, surfB);
     return QRectF(QPointF(topLeft[0], topLeft[1]), QPointF(botRight[0], botRight[1]));
 }
 
@@ -871,12 +878,31 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     _focusSurfacePos[1] = _camera.surfacePtr[1];
 
     auto surf = _surfWeak.lock();
-    if (surf && _volume && _volume->zarrDataset() &&
-        _renderController->viewportRenderer().tileGrid().cols() > 0 &&
-        _renderController->viewportRenderer().tileGrid().rows() > 0) {
-        QRectF vpRect = viewportSceneRect();
-        auto buildParams = [this](const WorldTileKey& wk) { return buildRenderParams(wk); };
-        _renderController->onCameraChanged(_camera, surf, _volume, buildParams, vpRect);
+    if (surf && _volume && _volume->zarrDataset()) {
+        // Compute visible tiles directly from camera + blit formula.
+        // blitTile: dstX = (worldCol * wts - camX) * scale + vpCx
+        // Visible when dstX + 512 > 0 and dstX < fbW.
+        // → worldCol in range floor((camX - vpCx/scale) / wts) to floor((camX + vpCx/scale) / wts)
+        float vpW = static_cast<float>(fGraphicsView->viewport()->width());
+        float vpH = static_cast<float>(fGraphicsView->viewport()->height());
+        float wts = _contentBounds.worldTileSize;
+        if (wts > 0) {
+            float halfSurfW = vpW * 0.5f / _camera.scale;
+            float halfSurfH = vpH * 0.5f / _camera.scale;
+            int firstCol = static_cast<int>(std::floor((_camera.surfacePtr[0] - halfSurfW) / wts)) - tiled_config::VISIBLE_BUFFER_TILES;
+            int lastCol  = static_cast<int>(std::floor((_camera.surfacePtr[0] + halfSurfW) / wts)) + tiled_config::VISIBLE_BUFFER_TILES;
+            int firstRow = static_cast<int>(std::floor((_camera.surfacePtr[1] - halfSurfH) / wts)) - tiled_config::VISIBLE_BUFFER_TILES;
+            int lastRow  = static_cast<int>(std::floor((_camera.surfacePtr[1] + halfSurfH) / wts)) + tiled_config::VISIBLE_BUFFER_TILES;
+
+            std::vector<WorldTileKey> visibleKeys;
+            visibleKeys.reserve(static_cast<size_t>(lastCol - firstCol + 1) * static_cast<size_t>(lastRow - firstRow + 1));
+            for (int r = firstRow; r <= lastRow; r++)
+                for (int c = firstCol; c <= lastCol; c++)
+                    visibleKeys.push_back({c, r});
+
+            auto buildParams = [this](const WorldTileKey& wk) { return buildRenderParams(wk); };
+            _renderController->onCameraChangedDirect(_camera, surf, _volume, buildParams, visibleKeys);
+        }
     }
 }
 
@@ -1689,12 +1715,8 @@ void CTiledVolumeViewer::updateStatusLabel()
         status += QString(" | downloading %1/%2").arg(_pinReceived).arg(_pinTotal.load());
     }
 
-    // Render pool pending count
-    if (_renderController) {
-        int pending = _renderController->renderPool()->pendingCount();
-        if (pending > 0) {
-            status += QString(" | pool %1").arg(pending);
-        }
+    if (_renderController && _renderController->renderPool()->corePool().busy()) {
+        status += " | rendering";
     }
 
     status += " [tiled]";

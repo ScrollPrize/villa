@@ -38,15 +38,37 @@ void TileScene::blitTile(const WorldTileKey& wk, const uint32_t* pixels, int w, 
     int dstX = static_cast<int>((tileSurfX - _camSurfX) * _camScale + vpCx);
     int dstY = static_cast<int>((tileSurfY - _camSurfY) * _camScale + vpCy);
 
+    static float lastLogScale = -1;
+    static int blitLog = 0;
+    static int blitVisible = 0;
+    static int blitClipped = 0;
+    if (std::abs(_camScale - lastLogScale) > 0.001f) {
+        if (lastLogScale > 0)
+            fprintf(stderr, "[blit-summary] scale=%.3f visible=%d clipped=%d\n", lastLogScale, blitVisible, blitClipped);
+        lastLogScale = _camScale;
+        blitLog = 0;
+        blitVisible = 0;
+        blitClipped = 0;
+    }
+
     int fbW = _framebuffer.width();
     int fbH = _framebuffer.height();
-    if (dstX >= fbW || dstY >= fbH || dstX + w <= 0 || dstY + h <= 0) return;
+    if (dstX >= fbW || dstY >= fbH || dstX + w <= 0 || dstY + h <= 0) {
+        blitClipped++;
+        return;
+    }
 
     int srcStartX = std::max(0, -dstX);
     int srcStartY = std::max(0, -dstY);
     int copyW = std::min(w - srcStartX, fbW - std::max(0, dstX));
     int copyH = std::min(h - srcStartY, fbH - std::max(0, dstY));
-    if (copyW <= 0 || copyH <= 0) return;
+    if (copyW <= 0 || copyH <= 0) { blitClipped++; return; }
+
+    blitVisible++;
+    if (blitLog++ < 5) {
+        fprintf(stderr, "[blit] scale=%.3f wts=%.1f dst=(%d,%d) copy=%dx%d fb=%dx%d wk=(%d,%d)\n",
+            _camScale, _worldTileSize, dstX, dstY, copyW, copyH, fbW, fbH, wk.worldCol, wk.worldRow);
+    }
 
     int dstStartX = std::max(0, dstX);
     int dstStartY = std::max(0, dstY);

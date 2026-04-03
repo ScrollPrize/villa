@@ -37,6 +37,8 @@ public:
     QPointF surfaceToScene(float surfX, float surfY) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
 
+    [[nodiscard]] float camScale() const noexcept { return _camScale; }
+
     // Set camera position for viewport-relative blitting.
     void setCamera(float surfX, float surfY, float scale) {
         _camSurfX = surfX; _camSurfY = surfY; _camScale = scale;

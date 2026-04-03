@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -15,41 +14,30 @@ class Volume;
 
 namespace vc::render {
 
-// Background tile rendering pool (no Qt dependency).
-// Workers render tiles off the main thread.  Completed results are
-// collected by the caller via drainCompleted().
-//
-// Uses utils::PriorityThreadPool with epoch-based stale task filtering.
+// Background tile rendering pool.
+// Submit tiles, take results. That's it.
 class CoreRenderPool final {
 public:
     explicit CoreRenderPool(int numThreads = 2);
     ~CoreRenderPool() noexcept;
 
-    // Submit a tile for background rendering.
-    // epochRef is checked before/after rendering to skip stale tasks.
-    // controllerId tags results so drainCompleted can filter by owner.
     void submit(const TileRenderParams& params,
                 const std::shared_ptr<Surface>& surface,
                 const std::shared_ptr<Volume>& volume,
-                const std::shared_ptr<std::atomic<uint64_t>>& epochRef,
                 int controllerId);
 
-    // Take all completed results belonging to controllerId.
-    // Results with epoch < minEpoch (minus slack) are discarded.
-    std::vector<TileRenderResult> drainCompleted(uint64_t minEpoch, int controllerId);
+    // Take all completed results for controllerId.
+    std::vector<TileRenderResult> takeResults(int controllerId);
 
-    // Cancel all pending work and clear results.
-    void cancelAll();
+    // Drop queued tasks. In-flight tasks finish normally.
+    void clearQueue();
 
-    // Number of pending + in-flight tasks.
-    [[nodiscard]] int pendingCount() const noexcept;
+    // Drop queued tasks + completed results.
+    void clearAll();
 
-    // Reset stuck pending count when the pool is idle but pendingCount > 0.
-    // Returns true if the count was reset.
-    bool expireTimedOut();
+    // True if pool has queued or in-flight tasks.
+    [[nodiscard]] bool busy() const noexcept;
 
-    // Callback invoked from a worker thread when a result is ready.
-    // Use to wake the main thread (e.g. ensureTickRunning).
     void setReadyCallback(std::function<void()> cb);
 
 private:
@@ -58,8 +46,6 @@ private:
     std::unique_ptr<utils::PriorityThreadPool> pool_;
     std::mutex resultsMutex_;
     std::vector<TileRenderResult> completedResults_;
-    std::atomic<int> pendingCount_{0};
-    std::atomic<bool> resultSignalPending_{false};
     std::function<void()> readyCallback_;
 };
 

@@ -37,6 +37,13 @@ public:
                          const std::function<TileRenderParams(const WorldTileKey&)>& buildParams,
                          const QRectF& viewportRect);
 
+    // Same but with pre-computed visible keys (bypasses grid coordinate system).
+    void onCameraChangedDirect(const TiledViewerCamera& camera,
+                               const std::shared_ptr<Surface>& surface,
+                               const std::shared_ptr<Volume>& volume,
+                               const std::function<TileRenderParams(const WorldTileKey&)>& buildParams,
+                               const std::vector<WorldTileKey>& visibleKeys);
+
     // Called when rendering parameters change (window/level, colormap, etc.)
     // Re-renders everything.
     void onParamsChanged(const TiledViewerCamera& camera,

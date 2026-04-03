@@ -1,13 +1,10 @@
 #include "vc/core/render/CoreRenderPool.hpp"
 
-#include <algorithm>
-
 #include "vc/core/render/TileRenderer.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Surface.hpp"
 
 #include <utils/thread_pool.hpp>
-
 
 namespace vc::render {
 
@@ -18,89 +15,65 @@ CoreRenderPool::CoreRenderPool(int numThreads)
 
 CoreRenderPool::~CoreRenderPool() noexcept
 {
-    cancelAll();
+    clearAll();
 }
 
 void CoreRenderPool::submit(const TileRenderParams& params,
                             const std::shared_ptr<Surface>& surface,
                             const std::shared_ptr<Volume>& volume,
-                            const std::shared_ptr<std::atomic<uint64_t>>& epochRef,
                             int controllerId)
 {
-    pendingCount_.fetch_add(1, std::memory_order_relaxed);
-
     int priority = params.submitPriority;
-
-    auto submitTime = std::chrono::steady_clock::now();
-
     pool_->submit(priority,
-        [this, params, surface, volume, epochRef, controllerId, submitTime]() {
+        [this, params, surface, volume, controllerId]() {
             TileRenderResult result = TileRenderer::renderTile(params, surface, volume.get());
             result.controllerId = controllerId;
-            result.submitTime = submitTime;
-            result.renderDone = std::chrono::steady_clock::now();
-
             pushResult(std::move(result));
         });
 }
 
-std::vector<TileRenderResult> CoreRenderPool::drainCompleted(uint64_t minEpoch, int controllerId)
+std::vector<TileRenderResult> CoreRenderPool::takeResults(int controllerId)
 {
-    resultSignalPending_.store(false, std::memory_order_relaxed);
-
     std::vector<TileRenderResult> all;
     {
         std::lock_guard<std::mutex> lock(resultsMutex_);
         std::swap(all, completedResults_);
     }
 
-    std::vector<TileRenderResult> results;
-    std::vector<TileRenderResult> remaining;
-
+    std::vector<TileRenderResult> mine;
+    std::vector<TileRenderResult> others;
     for (auto& item : all) {
-        if (item.controllerId != controllerId) {
-            remaining.push_back(std::move(item));
-        } else {
-            results.push_back(std::move(item));
-        }
+        if (item.controllerId == controllerId)
+            mine.push_back(std::move(item));
+        else
+            others.push_back(std::move(item));
     }
 
-    if (!remaining.empty()) {
+    if (!others.empty()) {
         std::lock_guard<std::mutex> lock(resultsMutex_);
         completedResults_.insert(completedResults_.end(),
-            std::make_move_iterator(remaining.begin()),
-            std::make_move_iterator(remaining.end()));
+            std::make_move_iterator(others.begin()),
+            std::make_move_iterator(others.end()));
     }
 
-    return results;
+    return mine;
 }
 
-void CoreRenderPool::cancelAll()
+void CoreRenderPool::clearQueue()
 {
     pool_->cancel_pending();
-
-    {
-        std::lock_guard<std::mutex> lock(resultsMutex_);
-        completedResults_.clear();
-    }
 }
 
-bool CoreRenderPool::expireTimedOut()
+void CoreRenderPool::clearAll()
 {
-    int pending = pendingCount_.load(std::memory_order_relaxed);
-    if (pending <= 0)
-        return false;
-
-    if (pool_->active() > 0 || pool_->pending() > 0)
-        return false;
-
-    pendingCount_.store(0, std::memory_order_relaxed);
-    return true;
+    pool_->cancel_pending();
+    std::lock_guard<std::mutex> lock(resultsMutex_);
+    completedResults_.clear();
 }
 
-int CoreRenderPool::pendingCount() const noexcept
+bool CoreRenderPool::busy() const noexcept
 {
-    return pendingCount_.load(std::memory_order_relaxed);
+    return pool_->pending() > 0 || pool_->active() > 0;
 }
 
 void CoreRenderPool::setReadyCallback(std::function<void()> cb)
@@ -114,12 +87,8 @@ void CoreRenderPool::pushResult(TileRenderResult result)
         std::lock_guard<std::mutex> lock(resultsMutex_);
         completedResults_.push_back(std::move(result));
     }
-    pendingCount_.fetch_sub(1, std::memory_order_acq_rel);
-
-    if (!resultSignalPending_.exchange(true, std::memory_order_relaxed)) {
-        if (readyCallback_)
-            readyCallback_();
-    }
+    if (readyCallback_)
+        readyCallback_();
 }
 
 } // namespace vc::render
