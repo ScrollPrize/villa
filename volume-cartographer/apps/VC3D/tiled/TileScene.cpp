@@ -22,17 +22,29 @@ void TileScene::rebuildGrid(const ContentBounds& bounds, int viewportW, int view
     float sceneH = std::max(contentPxH, static_cast<float>(viewportH));
     _scene->setSceneRect(0, 0, static_cast<qreal>(sceneW), static_cast<qreal>(sceneH));
 
-    // Resize framebuffer to cover the content area
-    int fbW = static_cast<int>(contentPxW);
-    int fbH = static_cast<int>(contentPxH);
-    if (fbW <= 0 || fbH <= 0) {
-        fbW = std::max(1, viewportW);
-        fbH = std::max(1, viewportH);
-    }
+    // Framebuffer covers the full content grid.
+    // Only reallocate if it needs to GROW — never shrink (avoids clearing on
+    // every zoom step when windowing changes totalCols).
+    int fbW = std::max(1, static_cast<int>(contentPxW));
+    int fbH = std::max(1, static_cast<int>(contentPxH));
 
-    if (_framebuffer.width() != fbW || _framebuffer.height() != fbH) {
-        _framebuffer = QImage(fbW, fbH, QImage::Format_RGB32);
-        _framebuffer.fill(QColor(64, 64, 64));
+    if (_framebuffer.isNull() || _framebuffer.width() < fbW || _framebuffer.height() < fbH) {
+        // Grow to at least the needed size, with some headroom to avoid
+        // repeated reallocations during zoom
+        int newW = std::max(fbW, _framebuffer.width());
+        int newH = std::max(fbH, _framebuffer.height());
+        QImage newFb(newW, newH, QImage::Format_RGB32);
+        newFb.fill(QColor(64, 64, 64));
+        // Copy old content if we had any
+        if (!_framebuffer.isNull()) {
+            int copyW = std::min(_framebuffer.width(), newW);
+            int copyH = std::min(_framebuffer.height(), newH);
+            for (int y = 0; y < copyH; y++) {
+                std::memcpy(newFb.scanLine(y), _framebuffer.constScanLine(y),
+                            static_cast<size_t>(copyW) * 4);
+            }
+        }
+        _framebuffer = std::move(newFb);
     }
 
     // Create or reposition the single display item
