@@ -6,7 +6,12 @@ import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
 
-from vesuvius.models.build.transformers.patch_encode_decode import LayerNormNd, PatchDecode
+from vesuvius.models.build.transformers.patch_encode_decode import (
+    LayerNormNd,
+    PatchDecode,
+    PixelShuffle3D,
+    _compute_patch_decode_plan,
+)
 
 from .dinovol_2_builder import build_dinovol_2_backbone
 
@@ -89,6 +94,40 @@ class PrimusPatchDecodeDinov2Decoder(nn.Module):
     def forward(self, features):
         x = features[0] if isinstance(features, list) else features
         return self.patch_decoder(x)
+
+
+class PixelShuffleConvDinov2Decoder(nn.Module):
+    def __init__(self, encoder, num_classes):
+        super().__init__()
+        if encoder.ndim != 3:
+            raise ValueError(
+                f"pixelshuffle_conv currently only supports 3D pretrained backbones, got ndim={encoder.ndim}"
+            )
+
+        num_stages, strides, channels = _compute_patch_decode_plan(
+            encoder.patch_embed_size,
+            embed_dim=encoder.embed_dim,
+            out_channels=num_classes,
+        )
+        conv = nn.Conv3d
+        stages = []
+        for stage_idx in range(num_stages):
+            next_channels = channels[stage_idx + 1]
+            scale_factors = tuple(int(v) for v in strides[stage_idx])
+            expansion_channels = int(next_channels) * int(torch.tensor(scale_factors).prod().item())
+            stage_ops = [
+                conv(channels[stage_idx], expansion_channels, kernel_size=1, stride=1, padding=0, bias=True),
+                PixelShuffle3D(scale_factors),
+                conv(next_channels, next_channels, kernel_size=3, stride=1, padding=1, bias=True),
+            ]
+            if stage_idx < num_stages - 1:
+                stage_ops.extend([LayerNormNd(next_channels), nn.GELU()])
+            stages.append(nn.Sequential(*stage_ops))
+        self.decode = nn.Sequential(*stages)
+
+    def forward(self, features):
+        x = features[0] if isinstance(features, list) else features
+        return self.decode(x)
 
 
 def _load_model_config(spec, input_channels):
@@ -210,6 +249,8 @@ def build_dinov2_decoder(name, encoder, num_classes):
         return MinimalDinov2Decoder(encoder, num_classes)
     if name == "primus_patch_decode":
         return PrimusPatchDecodeDinov2Decoder(encoder, num_classes)
+    if name == "pixelshuffle_conv":
+        return PixelShuffleConvDinov2Decoder(encoder, num_classes)
     raise ValueError(
-        f"Unknown pretrained_decoder_type {name!r}. Expected one of: minimal, primus_patch_decode"
+        f"Unknown pretrained_decoder_type {name!r}. Expected one of: minimal, primus_patch_decode, pixelshuffle_conv"
     )
