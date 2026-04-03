@@ -98,7 +98,6 @@ private:
     RenderPool* _renderPool;  // shared, not owned
     bool _tickPending = false;
     bool _anyUpdatedThisTick = false;
-    int _tilesDisplayedThisTick = 0;
     QTimer* _vsyncTimer = nullptr;
 
     vc::render::ViewportRenderer _viewportRenderer;

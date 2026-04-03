@@ -294,7 +294,7 @@ struct ChunkSampler {
         maxVx += margin; maxVy += margin; maxVz += margin;
 
         if (maxVx < 0 || maxVy < 0 || maxVz < 0 ||
-            minVx >= p.sx || minVy >= p.sy || minVz >= p.sz) return;
+            minVx >= p.sxf || minVy >= p.syf || minVz >= p.szf) return;
 
         int iMinX = std::max(0, static_cast<int>(std::floor(minVx)));
         int iMaxX = std::min(p.sx - 1, static_cast<int>(std::ceil(maxVx)));
@@ -1228,7 +1228,7 @@ static void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset, vc::cache::
 
     CacheParams p(cache, level);
 
-    cv::Vec3i size = {(int)out.shape()[0], (int)out.shape()[1], (int)out.shape()[2]};
+    cv::Vec3i size = {static_cast<int>(out.shape()[0]), static_cast<int>(out.shape()[1]), static_cast<int>(out.shape()[2])};
     cv::Vec3i to = offset + size;
 
     // Step 1: List all required chunks
@@ -1796,10 +1796,10 @@ static void samplePlaneARGB32Impl(
                             float vx2 = bx + (xf+2.0f) * dx,   vy2 = by + (xf+2.0f) * dy,   vz2 = bz + (xf+2.0f) * dz;
                             float vx3 = bx + (xf+3.0f) * dx,   vy3 = by + (xf+3.0f) * dy,   vz3 = bz + (xf+3.0f) * dz;
 
-                            int ix0 = (int)vx0, iy0_ = (int)vy0, iz0_ = (int)vz0;
-                            int ix1 = (int)vx1, iy1_ = (int)vy1, iz1_ = (int)vz1;
-                            int ix2 = (int)vx2, iy2_ = (int)vy2, iz2_ = (int)vz2;
-                            int ix3 = (int)vx3, iy3_ = (int)vy3, iz3_ = (int)vz3;
+                            int ix0 = static_cast<int>(vx0), iy0_ = static_cast<int>(vy0), iz0_ = static_cast<int>(vz0);
+                            int ix1 = static_cast<int>(vx1), iy1_ = static_cast<int>(vy1), iz1_ = static_cast<int>(vz1);
+                            int ix2 = static_cast<int>(vx2), iy2_ = static_cast<int>(vy2), iz2_ = static_cast<int>(vz2);
+                            int ix3 = static_cast<int>(vx3), iy3_ = static_cast<int>(vy3), iz3_ = static_cast<int>(vz3);
 
                             // Local coords via mask (chunk128 fast path)
                             int lx0 = ix0 & cmask, ly0_ = iy0_ & cmask, lz0_ = iz0_ & cmask;
@@ -1943,7 +1943,7 @@ static void samplePlaneARGB32Impl(
                         int iy = static_cast<int>(fy);
                         int iz = static_cast<int>(fz);
                         int lx = p.localX(ix), ly = p.localY(iy), lz = p.localZ(iz);
-                        float fracX = fx - ix, fracY = fy - iy, fracZ = fz - iz;
+                        float fracX = fx - static_cast<float>(ix), fracY = fy - static_cast<float>(iy), fracZ = fz - static_cast<float>(iz);
                         for (int x = 0; x < w; x++) {
                             nt_store_u32(&outRow[x], lut[chunkData[vo(lz, ly, lx)]]);
                             // Branchless fractional stepping (CMOV instead of branches)

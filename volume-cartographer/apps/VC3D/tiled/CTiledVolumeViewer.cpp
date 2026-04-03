@@ -828,23 +828,18 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
         return;
     }
 
-    // Zoom-at-point: the surface position under the cursor must stay fixed.
-    // Compute surfAnchor from camera + viewport offset at the CURRENT scale
-    // (not from scene coords which change when the grid is rebuilt/windowed).
+    // Zoom-at-point: the surface position under the cursor stays fixed.
+    // Use viewport pixel offset from center — completely independent of
+    // grid state, scene coordinates, and Qt scroll position.
     QPointF vpPos = fGraphicsView->mapFromScene(scenePos);
-    QSize vpSize = fGraphicsView->viewport()->size();
-    float vpW = static_cast<float>(vpSize.width());
-    float vpH = static_cast<float>(vpSize.height());
-    const float vpOffX = static_cast<float>(vpPos.x()) - vpW * 0.5f;
-    const float vpOffY = static_cast<float>(vpPos.y()) - vpH * 0.5f;
+    float vpCx = static_cast<float>(fGraphicsView->viewport()->width()) * 0.5f;
+    float vpCy = static_cast<float>(fGraphicsView->viewport()->height()) * 0.5f;
+    float dx = static_cast<float>(vpPos.x()) - vpCx;
+    float dy = static_cast<float>(vpPos.y()) - vpCy;
 
-    // surfAnchor = surfacePtr + vpOffset / currentScale (stable, no grid dependency)
-    float surfAnchorX = _camera.surfacePtr[0] + vpOffX / _camera.scale;
-    float surfAnchorY = _camera.surfacePtr[1] + vpOffY / _camera.scale;
-
+    _camera.surfacePtr[0] += dx * (1.0f / _camera.scale - 1.0f / newScale);
+    _camera.surfacePtr[1] += dy * (1.0f / _camera.scale - 1.0f / newScale);
     _camera.scale = newScale;
-    _camera.surfacePtr[0] = surfAnchorX - vpOffX / newScale;
-    _camera.surfacePtr[1] = surfAnchorY - vpOffY / newScale;
 
     if (_volume) {
         float oldDs = _camera.dsScale;
