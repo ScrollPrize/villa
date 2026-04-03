@@ -213,17 +213,16 @@ void ViewportRenderer::drainResults()
         _inFlightTiles.erase(result.worldKey);
 
         if (!result.pixels.empty()) {
-            // Update metadata in TileGrid (no pixel storage)
-            bool accepted = _tileGrid.setTileMeta(
+            // Update metadata (best-effort — may fail if grid bounds changed)
+            _tileGrid.setTileMeta(
                 result.worldKey, result.epoch,
                 static_cast<int8_t>(result.actualLevel));
 
-            if (accepted) {
-                anyUpdated = true;
-                // Pass pixels directly to Qt layer for QPixmap conversion
-                if (_resultCallback)
-                    _resultCallback(std::move(result));
-            }
+            // Always blit — display uses camera-relative positioning,
+            // not grid bounds. Don't gate on metadata acceptance.
+            anyUpdated = true;
+            if (_resultCallback)
+                _resultCallback(std::move(result));
         }
     }
 
