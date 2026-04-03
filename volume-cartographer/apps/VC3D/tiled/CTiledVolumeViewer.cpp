@@ -829,12 +829,17 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     }
 
     // Zoom-at-point: the surface position under the cursor stays fixed.
-    // scenePos is actually viewport-relative coordinates (not scene coords)
-    // to avoid dependency on Qt's scroll position which shifts when grid is windowed.
-    float vpCx = static_cast<float>(fGraphicsView->viewport()->width()) * 0.5f;
-    float vpCy = static_cast<float>(fGraphicsView->viewport()->height()) * 0.5f;
-    float dx = static_cast<float>(scenePos.x()) - vpCx;
-    float dy = static_cast<float>(scenePos.y()) - vpCy;
+    // scenePos is viewport-relative coordinates (not scene coords).
+    // If cursor is outside viewport, zoom at center (dx=dy=0).
+    float vpW = static_cast<float>(fGraphicsView->viewport()->width());
+    float vpH = static_cast<float>(fGraphicsView->viewport()->height());
+    float mx = static_cast<float>(scenePos.x());
+    float my = static_cast<float>(scenePos.y());
+    float dx = 0, dy = 0;
+    if (mx >= 0 && mx < vpW && my >= 0 && my < vpH) {
+        dx = mx - vpW * 0.5f;
+        dy = my - vpH * 0.5f;
+    }
 
     _camera.surfacePtr[0] += dx * (1.0f / _camera.scale - 1.0f / newScale);
     _camera.surfacePtr[1] += dy * (1.0f / _camera.scale - 1.0f / newScale);
