@@ -602,56 +602,60 @@ void CTiledVolumeViewer::rebuildContentGrid()
             windowRows = kMaxTotalTiles / windowCols;
         }
 
-        // If already windowed with the same size, keep the same window position
-        // to avoid grid shifts during zoom. Only re-center when the camera
-        // moves outside the visible region (panning).
-        if (_gridWindowed && _contentBounds.totalCols == windowCols &&
-            _contentBounds.totalRows == windowRows) {
-            // Check if camera is still within the windowed tiles
-            float cameraTileCol = _camera.surfacePtr[0] / bounds.worldTileSize;
-            float cameraTileRow = _camera.surfacePtr[1] / bounds.worldTileSize;
-            int camCol = static_cast<int>(std::round(cameraTileCol));
-            int camRow = static_cast<int>(std::round(cameraTileRow));
-            int margin = 4;  // re-center when camera is within 4 tiles of edge
-            if (camCol >= _contentBounds.firstWorldCol + margin &&
-                camCol < _contentBounds.firstWorldCol + _contentBounds.totalCols - margin &&
-                camRow >= _contentBounds.firstWorldRow + margin &&
-                camRow < _contentBounds.firstWorldRow + _contentBounds.totalRows - margin) {
-                // Camera is well within the current window — keep it
-                bounds.firstWorldCol = _contentBounds.firstWorldCol;
-                bounds.firstWorldRow = _contentBounds.firstWorldRow;
-                bounds.totalCols = _contentBounds.totalCols;
-                bounds.totalRows = _contentBounds.totalRows;
-                _gridWindowed = true;
-                goto windowDone;
-            }
-        }
-
+        // Keep the grid's firstWorldCol/Row stable to prevent visual jumps.
+        // When transitioning TO windowed, clamp the existing range rather than
+        // re-centering. When already windowed, keep position unless camera
+        // reaches the edge.
         {
-        // Center window on camera position
+        // Default: keep existing firstWorldCol, just shrink totalCols/Rows
+        int contentFirstCol = bounds.firstWorldCol;
+        int contentFirstRow = bounds.firstWorldRow;
+        int contentTotalCols = bounds.totalCols;
+        int contentTotalRows = bounds.totalRows;
+
+        // Camera position in tile coords
         float cameraTileCol = _camera.surfacePtr[0] / bounds.worldTileSize;
         float cameraTileRow = _camera.surfacePtr[1] / bounds.worldTileSize;
-        int centerCol = static_cast<int>(std::round(cameraTileCol));
-        int centerRow = static_cast<int>(std::round(cameraTileRow));
+        int camCol = static_cast<int>(std::round(cameraTileCol));
+        int camRow = static_cast<int>(std::round(cameraTileRow));
 
-        int winFirstCol = centerCol - windowCols / 2;
-        int winFirstRow = centerRow - windowRows / 2;
+        int winFirstCol, winFirstRow;
+
+        if (_gridWindowed) {
+            // Already windowed — keep position unless camera near edge
+            int margin = 4;
+            winFirstCol = _contentBounds.firstWorldCol;
+            winFirstRow = _contentBounds.firstWorldRow;
+            if (camCol < winFirstCol + margin || camCol >= winFirstCol + windowCols - margin)
+                winFirstCol = camCol - windowCols / 2;
+            if (camRow < winFirstRow + margin || camRow >= winFirstRow + windowRows - margin)
+                winFirstRow = camRow - windowRows / 2;
+        } else {
+            // First time windowing — keep firstWorldCol, clamp window around camera
+            // Start from existing origin, only shift if camera would be outside
+            winFirstCol = contentFirstCol;
+            winFirstRow = contentFirstRow;
+            if (camCol < winFirstCol || camCol >= winFirstCol + windowCols)
+                winFirstCol = camCol - windowCols / 2;
+            if (camRow < winFirstRow || camRow >= winFirstRow + windowRows)
+                winFirstRow = camRow - windowRows / 2;
+        }
 
         // Clamp window to content extent
-        winFirstCol = std::max(winFirstCol, bounds.firstWorldCol);
-        winFirstRow = std::max(winFirstRow, bounds.firstWorldRow);
+        winFirstCol = std::max(winFirstCol, contentFirstCol);
+        winFirstRow = std::max(winFirstRow, contentFirstRow);
         int winLastCol = winFirstCol + windowCols - 1;
         int winLastRow = winFirstRow + windowRows - 1;
-        int contentLastCol = bounds.firstWorldCol + bounds.totalCols - 1;
-        int contentLastRow = bounds.firstWorldRow + bounds.totalRows - 1;
+        int contentLastCol = contentFirstCol + contentTotalCols - 1;
+        int contentLastRow = contentFirstRow + contentTotalRows - 1;
         if (winLastCol > contentLastCol) {
             winFirstCol -= (winLastCol - contentLastCol);
-            winFirstCol = std::max(winFirstCol, bounds.firstWorldCol);
+            winFirstCol = std::max(winFirstCol, contentFirstCol);
             winLastCol = contentLastCol;
         }
         if (winLastRow > contentLastRow) {
             winFirstRow -= (winLastRow - contentLastRow);
-            winFirstRow = std::max(winFirstRow, bounds.firstWorldRow);
+            winFirstRow = std::max(winFirstRow, contentFirstRow);
             winLastRow = contentLastRow;
         }
 
@@ -660,9 +664,8 @@ void CTiledVolumeViewer::rebuildContentGrid()
         bounds.totalCols = winLastCol - winFirstCol + 1;
         bounds.totalRows = winLastRow - winFirstRow + 1;
         _gridWindowed = true;
-        }  // end of re-center block
+        }
     }
-    windowDone:
 
     _contentBounds = bounds;
 
