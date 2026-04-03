@@ -17,6 +17,13 @@ struct HttpAuth {
     std::string sessionToken;  // AWS_SESSION_TOKEN (optional, for STS)
 };
 
+// Load AWS credentials from ~/.aws/credentials and ~/.aws/config
+// (the files written by `aws configure` and `aws sso login`).
+// Falls back to environment variables for anything not in the files.
+// The user is expected to authenticate via `aws sso login` or `aws configure`
+// before running the application.
+HttpAuth loadAwsCredentials(const std::string& profile = "default");
+
 // Shard configuration for zarr v3 sharded storage.
 // When present, each level stores multiple chunks in shard files at
 // {level}/c/{sz}/{sy}/{sx}, and the HTTP chunk source must map logical

@@ -75,10 +75,12 @@ TileRenderResult TileRenderer::renderTile(
     result.height = params.tileH;
 
     if (!surface || !volume) {
+        fprintf(stderr, "[render] null surface or volume\n");
         return result;
     }
 
     if (!volume->zarrDataset(params.dsScaleIdx)) {
+        fprintf(stderr, "[render] no zarrDataset at level %d\n", params.dsScaleIdx);
         return result;
     }
 
@@ -122,6 +124,17 @@ TileRenderResult TileRenderer::renderTile(
         planeVxStep = vx / params.scale;
         planeVyStep = vy / params.scale;
         planeOrigin = vx * totalOffset[0] + vy * totalOffset[1] + useOrigin;
+
+        static int coordDbg = 0;
+        if (coordDbg++ < 5)
+            fprintf(stderr, "[render] tile(%d,%d) scale=%.3f dsIdx=%d origin=[%.1f,%.1f,%.1f] vxStep=[%.4f,%.4f,%.4f] vyStep=[%.4f,%.4f,%.4f] surfROI=[%.1f,%.1f] planeOrig=[%.1f,%.1f,%.1f]\n",
+                params.worldKey.worldCol, params.worldKey.worldRow,
+                params.scale, params.dsScaleIdx,
+                planeOrigin[0], planeOrigin[1], planeOrigin[2],
+                planeVxStep[0], planeVxStep[1], planeVxStep[2],
+                planeVyStep[0], planeVyStep[1], planeVyStep[2],
+                params.surfaceROI.x, params.surfaceROI.y,
+                plane->origin()[0], plane->origin()[1], plane->origin()[2]);
     }
 
     // Generate coordinates for non-fused paths.
@@ -205,6 +218,13 @@ TileRenderResult TileRenderer::renderTile(
         if (tMaxX < db.minX - margin || tMinX > db.maxX + margin ||
             tMaxY < db.minY - margin || tMinY > db.maxY + margin ||
             tMaxZ < db.minZ - margin || tMinZ > db.maxZ + margin) {
+            static int rejectCount = 0;
+            if (rejectCount++ < 20)
+                fprintf(stderr, "[render] AABB reject: tile(%d,%d) AABB[%.0f..%.0f, %.0f..%.0f, %.0f..%.0f] db[%.0f..%.0f, %.0f..%.0f, %.0f..%.0f] scale=%.3f dsIdx=%d\n",
+                    params.worldKey.worldCol, params.worldKey.worldRow,
+                    tMinX, tMaxX, tMinY, tMaxY, tMinZ, tMaxZ,
+                    db.minX, db.maxX, db.minY, db.maxY, db.minZ, db.maxZ,
+                    params.scale, params.dsScaleIdx);
             return result;
         }
     }
@@ -285,6 +305,19 @@ TileRenderResult TileRenderer::renderTile(
             result.actualLevel = volume->samplePlaneBestEffortARGB32(
                 bits, stride, planeOrigin, planeVxStep, planeVyStep,
                 params.tileW, params.tileH, sp, lut.data());
+
+            static int pixDbg = 0;
+            if (pixDbg++ < 5) {
+                int nonBlack = 0;
+                uint32_t bg = lut[0];
+                for (int i = 0; i < params.tileW * params.tileH; i++)
+                    if (bits[i] != bg) nonBlack++;
+                fprintf(stderr, "[render] tile(%d,%d) actualLevel=%d nonBlack=%d/%d lut0=0x%08x wLo=%.1f wHi=%.1f\n",
+                    params.worldKey.worldCol, params.worldKey.worldRow,
+                    result.actualLevel, nonBlack, params.tileW * params.tileH,
+                    bg, params.windowLow, params.windowHigh);
+            }
+
             // Skip the gray post-process path; jump directly to overlay
             goto overlay;
         }

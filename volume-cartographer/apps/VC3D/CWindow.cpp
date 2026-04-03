@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 
+#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "WindowRangeWidget.hpp"
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
@@ -159,16 +160,10 @@ vc::cache::HttpAuth authForRemoteTransformSource(const QString& source)
         return auth;
     }
 
-    auto getEnv = [](const char* name) -> std::string {
-        const char* value = std::getenv(name);
-        return value ? value : "";
-    };
-
-    auth.region = resolved.awsRegion;
-    auth.accessKey = getEnv("AWS_ACCESS_KEY_ID");
-    auth.secretKey = getEnv("AWS_SECRET_ACCESS_KEY");
-    auth.sessionToken = getEnv("AWS_SESSION_TOKEN");
-
+    auth = vc::cache::loadAwsCredentials();
+    if (auth.region.empty())
+        auth.region = resolved.awsRegion;
+    // Fall back to saved QSettings if ~/.aws/ files had nothing
     if (auth.accessKey.empty() || auth.secretKey.empty()) {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         const auto savedAccess = settings.value(vc3d::settings::aws::ACCESS_KEY).toString();
@@ -180,10 +175,6 @@ vc::cache::HttpAuth authForRemoteTransformSource(const QString& source)
             auth.secretKey = savedSecret.toStdString();
             auth.sessionToken = savedToken.toStdString();
         }
-    }
-
-    if (!auth.accessKey.empty() && !auth.secretKey.empty()) {
-        auth.awsSigv4 = true;
     }
 
     return auth;

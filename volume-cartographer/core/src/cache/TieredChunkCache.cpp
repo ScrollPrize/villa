@@ -513,8 +513,10 @@ void TieredChunkCache::propagateZeroChunks(int coarseLevel)
                     for (int fy = fy0; fy < fy1; fy++) {
                         for (int fx = fx0; fx < fx1; fx++) {
                             ChunkKey fineKey{lvl, fz, fy, fx};
-                            // Don't overwrite chunks already in the hot cache
+                            // Don't overwrite chunks already cached or on disk
                             if (hotCache_.contains(fineKey))
+                                continue;
+                            if (diskStore_ && diskStore_->contains(config_.volumeId, fineKey))
                                 continue;
                             negativeCache_.insert(fineKey);
                             bloomAdd(fineKey);

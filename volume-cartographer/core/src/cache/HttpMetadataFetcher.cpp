@@ -12,6 +12,70 @@
 
 #include <utils/hash.hpp>
 
+namespace vc::cache {
+
+HttpAuth loadAwsCredentials(const std::string& profile)
+{
+    HttpAuth auth;
+    auth.awsSigv4 = true;
+
+    auto getEnv = [](const char* name) -> std::string {
+        const char* v = std::getenv(name);
+        return v ? v : "";
+    };
+
+    auto parseIni = [&](const std::filesystem::path& path,
+                        const std::vector<std::pair<std::string, std::string*>>& keys) {
+        std::ifstream f(path);
+        if (!f) return;
+        bool inProfile = false;
+        std::string line;
+        while (std::getline(f, line)) {
+            auto start = line.find_first_not_of(" \t");
+            if (start == std::string::npos) continue;
+            line = line.substr(start);
+            if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+            if (line[0] == '[') {
+                auto end = line.find(']');
+                std::string section = (end != std::string::npos) ? line.substr(1, end - 1) : "";
+                inProfile = (section == profile || section == "profile " + profile);
+                continue;
+            }
+            if (!inProfile) continue;
+            auto eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            std::string key = line.substr(0, eq);
+            std::string val = line.substr(eq + 1);
+            key.erase(key.find_last_not_of(" \t") + 1);
+            val.erase(0, val.find_first_not_of(" \t"));
+            for (auto& [k, dst] : keys) {
+                if (key == k && dst->empty()) *dst = val;
+            }
+        }
+    };
+
+    std::filesystem::path home = getEnv("HOME");
+    if (home.empty()) home = "/tmp";
+
+    parseIni(home / ".aws" / "credentials", {
+        {"aws_access_key_id",     &auth.accessKey},
+        {"aws_secret_access_key", &auth.secretKey},
+        {"aws_session_token",     &auth.sessionToken},
+    });
+    parseIni(home / ".aws" / "config", {
+        {"region", &auth.region},
+    });
+
+    if (auth.accessKey.empty())    auth.accessKey = getEnv("AWS_ACCESS_KEY_ID");
+    if (auth.secretKey.empty())    auth.secretKey = getEnv("AWS_SECRET_ACCESS_KEY");
+    if (auth.sessionToken.empty()) auth.sessionToken = getEnv("AWS_SESSION_TOKEN");
+    if (auth.region.empty())       auth.region = getEnv("AWS_DEFAULT_REGION");
+
+    return auth;
+}
+
+}  // namespace vc::cache
+
 #ifdef VC_USE_CURL
 #include <curl/curl.h>
 #endif

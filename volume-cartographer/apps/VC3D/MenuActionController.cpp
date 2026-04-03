@@ -1,5 +1,6 @@
 #include "MenuActionController.hpp"
 
+#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "VCSettings.hpp"
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
@@ -628,14 +629,11 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
     authOut->awsSigv4 = true;
     authOut->region = resolved.awsRegion;
 
-    auto getEnv = [](const char* name) -> std::string {
-        const char* v = std::getenv(name);
-        return v ? v : "";
-    };
-
-    authOut->accessKey = getEnv("AWS_ACCESS_KEY_ID");
-    authOut->secretKey = getEnv("AWS_SECRET_ACCESS_KEY");
-    authOut->sessionToken = getEnv("AWS_SESSION_TOKEN");
+    auto awsCreds = vc::cache::loadAwsCredentials();
+    authOut->accessKey = awsCreds.accessKey;
+    authOut->secretKey = awsCreds.secretKey;
+    authOut->sessionToken = awsCreds.sessionToken;
+    if (authOut->region.empty()) authOut->region = awsCreds.region;
 
     if (authOut->accessKey.empty() || authOut->secretKey.empty()) {
         const auto savedAccess = settings.value(vc3d::settings::aws::ACCESS_KEY).toString();

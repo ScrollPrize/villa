@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -224,16 +225,11 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     auto resolved = vc::resolveRemoteUrl(url);
     vc::cache::HttpAuth auth = authIn;
     if (resolved.useAwsSigv4 && !auth.awsSigv4) {
-        // Caller didn't provide auth — populate from env vars
-        auth.awsSigv4 = true;
-        auth.region = resolved.awsRegion;
-        auto getEnv = [](const char* name) -> std::string {
-            const char* v = std::getenv(name);
-            return v ? v : "";
-        };
-        auth.accessKey = getEnv("AWS_ACCESS_KEY_ID");
-        auth.secretKey = getEnv("AWS_SECRET_ACCESS_KEY");
-        auth.sessionToken = getEnv("AWS_SESSION_TOKEN");
+        // Load from ~/.aws/ files (written by `aws configure` / `aws sso login`),
+        // falling back to environment variables.
+        auth = vc::cache::loadAwsCredentials();
+        if (auth.region.empty())
+            auth.region = resolved.awsRegion;
     } else if (resolved.useAwsSigv4 && auth.awsSigv4 && auth.region.empty()) {
         auth.region = resolved.awsRegion;
     }
