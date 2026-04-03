@@ -588,10 +588,7 @@ def test_build_dinov2_decoder_accepts_pixelshuffle_conv(tmp_path: Path):
     assert isinstance(decoder.final_input_detail[1], torch.nn.GroupNorm)
     assert isinstance(decoder.final_input_detail[2], torch.nn.GELU)
     assert decoder.final_refine[0].in_channels > decoder.decode[-1][2].out_channels
-    assert isinstance(decoder.final_refine[1], torch.nn.GroupNorm)
-    assert isinstance(decoder.final_refine[2], torch.nn.GELU)
-    assert isinstance(decoder.final_refine[4], torch.nn.GroupNorm)
-    assert isinstance(decoder.final_refine[5], torch.nn.GELU)
+    assert len(decoder.final_refine) == 3
     assert decoder.final_refine[-1].kernel_size == (1, 1, 1)
 
 
