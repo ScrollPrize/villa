@@ -751,7 +751,18 @@ void CTiledVolumeViewer::onDataBoundsReady()
 QRectF CTiledVolumeViewer::viewportSceneRect() const
 {
     if (!fGraphicsView) return QRectF();
-    return fGraphicsView->mapToScene(fGraphicsView->viewport()->rect()).boundingRect();
+    // With viewport-sized framebuffer and no scrolling,
+    // the "scene rect" for the grid = the grid-space coordinates
+    // of the viewport edges. Computed from camera state to match
+    // TileGrid's coordinate system.
+    auto& grid = _renderController->viewportRenderer().tileGrid();
+    auto topLeft = grid.surfaceToGrid(
+        _camera.surfacePtr[0] - static_cast<float>(fGraphicsView->viewport()->width()) * 0.5f / _camera.scale,
+        _camera.surfacePtr[1] - static_cast<float>(fGraphicsView->viewport()->height()) * 0.5f / _camera.scale);
+    auto botRight = grid.surfaceToGrid(
+        _camera.surfacePtr[0] + static_cast<float>(fGraphicsView->viewport()->width()) * 0.5f / _camera.scale,
+        _camera.surfacePtr[1] + static_cast<float>(fGraphicsView->viewport()->height()) * 0.5f / _camera.scale);
+    return QRectF(QPointF(topLeft[0], topLeft[1]), QPointF(botRight[0], botRight[1]));
 }
 
 // ============================================================================
