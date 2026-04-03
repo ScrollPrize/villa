@@ -71,8 +71,8 @@ public:
     void markChunkArrived();
     void setOverlayCallback(std::function<void()> cb);
 
-    // Rebuild ViewportRenderer's TileGrid to match TileScene's bounds.
-    // Call this after TileScene::rebuildGrid() so the two grids stay in sync.
+    // Rebuild ViewportRenderer's TileGrid (the authoritative grid).
+    // Call alongside TileScene::rebuildGrid() which just resizes the framebuffer.
     void syncGridBounds(const ContentBounds& bounds, int viewportW, int viewportH);
 
     // Access the underlying ViewportRenderer

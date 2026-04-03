@@ -7,6 +7,7 @@
 #include "../overlays/SegmentationOverlayController.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/render/TileGrid.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -211,9 +212,7 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
             this, [this]() {
                 fGraphicsView->viewport()->update();
                 updateStatusLabel();
-                if (_tileScene->hasRetainedItems() && _tileScene->unfilledTileCount() <= 0) {
-                    _tileScene->clearRetained();
-                }
+                // (retained items removed — single framebuffer now)
             });
 
     // Read settings
@@ -317,7 +316,7 @@ void CTiledVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     // Invalidate all caches and cancel in-flight work from the old volume
     _renderController->cancelAll();
     _renderController->clearState();
-    _tileScene->resetMetadata();
+    _renderController->viewportRenderer().tileGrid().resetMetadata();
 
     // Remove old chunk-ready listener before switching volumes
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
@@ -555,7 +554,7 @@ void CTiledVolumeViewer::rebuildContentGrid()
     // Compute content bounds
     ContentBounds bounds;
     bounds.scale = _camera.scale;
-    bounds.worldTileSize = static_cast<float>(TileScene::TILE_PX) / _camera.scale;
+    bounds.worldTileSize = static_cast<float>(vc::render::TileGrid::TILE_PX) / _camera.scale;
 
     if (bounds.worldTileSize > 0 && contentMaxX > contentMinX && contentMaxY > contentMinY) {
         bounds.firstWorldCol = static_cast<int>(std::floor(contentMinX / bounds.worldTileSize));
@@ -584,9 +583,9 @@ void CTiledVolumeViewer::rebuildContentGrid()
     // the viewport + buffer.
     QSize vpSize2 = fGraphicsView->viewport()->size();
     int vpTilesW = static_cast<int>(std::ceil(
-        static_cast<float>(vpSize2.width()) / TileScene::TILE_PX)) + 2 * tiled_config::VISIBLE_BUFFER_TILES;
+        static_cast<float>(vpSize2.width()) / vc::render::TileGrid::TILE_PX)) + 2 * tiled_config::VISIBLE_BUFFER_TILES;
     int vpTilesH = static_cast<int>(std::ceil(
-        static_cast<float>(vpSize2.height()) / TileScene::TILE_PX)) + 2 * tiled_config::VISIBLE_BUFFER_TILES;
+        static_cast<float>(vpSize2.height()) / vc::render::TileGrid::TILE_PX)) + 2 * tiled_config::VISIBLE_BUFFER_TILES;
 
     // Only window if the full grid is significantly larger than viewport
     _gridWindowed = false;
@@ -864,7 +863,8 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 
     auto surf = _surfWeak.lock();
     if (surf && _volume && _volume->zarrDataset() &&
-        _tileScene->cols() > 0 && _tileScene->rows() > 0) {
+        _renderController->viewportRenderer().tileGrid().cols() > 0 &&
+        _renderController->viewportRenderer().tileGrid().rows() > 0) {
         QRectF vpRect = viewportSceneRect();
         auto buildParams = [this](const WorldTileKey& wk) { return buildRenderParams(wk); };
         _renderController->onCameraChanged(_camera, surf, _volume, buildParams, vpRect);
@@ -1061,7 +1061,8 @@ void CTiledVolumeViewer::submitRender()
         return;
     }
 
-    if (_tileScene->cols() == 0 || _tileScene->rows() == 0) {
+    if (_renderController->viewportRenderer().tileGrid().cols() == 0 ||
+        _renderController->viewportRenderer().tileGrid().rows() == 0) {
         return;
     }
 
@@ -1095,7 +1096,7 @@ void CTiledVolumeViewer::submitRender()
         // Extend viewport by 3 tile widths in the direction of pan movement
         // so prefetch stays ahead of rapid panning.
         constexpr int PREFETCH_TILES_AHEAD = 3;
-        const double tileExtent = static_cast<double>(TileScene::TILE_PX) * PREFETCH_TILES_AHEAD;
+        const double tileExtent = static_cast<double>(vc::render::TileGrid::TILE_PX) * PREFETCH_TILES_AHEAD;
         double lenSq = delta.x() * delta.x() + delta.y() * delta.y();
         if (lenSq > 1.0) {
             double len = std::sqrt(lenSq);
@@ -1153,7 +1154,7 @@ bool CTiledVolumeViewer::computePlanePrefetchBBox(PlaneSurface* plane,
                                                    cv::Vec3f& lo, cv::Vec3f& hi) const
 {
     const float invScale = 1.0f / _camera.scale;
-    const float margin = TileScene::TILE_PX * invScale;
+    const float margin = vc::render::TileGrid::TILE_PX * invScale;
 
     cv::Vec2f vpTopLeft = _tileScene->sceneToSurface(QPointF(prefetchRect.left(), prefetchRect.top()));
     cv::Vec2f vpBotRight = _tileScene->sceneToSurface(QPointF(prefetchRect.right(), prefetchRect.bottom()));
@@ -1222,7 +1223,7 @@ bool CTiledVolumeViewer::computeQuadPrefetchBBox(const std::shared_ptr<Surface>&
     }
 
     // Add margin for interpolation + scrolling
-    float margin = TileScene::TILE_PX / _camera.scale;
+    float margin = vc::render::TileGrid::TILE_PX / _camera.scale;
     for (int i = 0; i < 3; i++) {
         lo[i] -= margin;
         hi[i] += margin;
@@ -1245,8 +1246,8 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     params.surfaceROI.width = _contentBounds.worldTileSize;
     params.surfaceROI.height = _contentBounds.worldTileSize;
 
-    params.tileW = TileScene::TILE_PX;
-    params.tileH = TileScene::TILE_PX;
+    params.tileW = vc::render::TileGrid::TILE_PX;
+    params.tileH = vc::render::TileGrid::TILE_PX;
 
     params.scale = _camera.scale;
     params.dsScale = _camera.dsScale;
@@ -1626,7 +1627,10 @@ void CTiledVolumeViewer::updateStatusLabel()
     // Actual worst level currently displayed (parenthesized when different)
     if (_tileScene && fGraphicsView) {
         QRectF vp = fGraphicsView->mapToScene(fGraphicsView->viewport()->rect()).boundingRect();
-        int actualWorst = _tileScene->worstVisibleLevel(vp);
+        auto& grid = _renderController->viewportRenderer().tileGrid();
+        int actualWorst = grid.worstVisibleLevel(
+            static_cast<float>(vp.left()), static_cast<float>(vp.top()),
+            static_cast<float>(vp.right()), static_cast<float>(vp.bottom()));
         if (actualWorst >= 0 && actualWorst != _camera.dsScaleIdx) {
             status += QString("(1:%1)").arg(1 << actualWorst);
         }
