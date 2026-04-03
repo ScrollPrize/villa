@@ -45,6 +45,8 @@ void ViewportRenderer::onCameraChanged(
     _currentEpoch->store(camera.epoch, std::memory_order_relaxed);
     _desiredLevel = camera.dsScaleIdx;
 
+    // Clear old queued tiles — only the latest camera state matters.
+    pool()->cancelAll();
     _inFlightTiles.clear();
 
     _lastCamera = camera;
