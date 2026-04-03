@@ -169,10 +169,10 @@ class BaseTrainer:
         self.guide_supervision_target = getattr(self.mgr, "guide_supervision_target", None)
         model_config = getattr(self.mgr, "model_config", {}) or {}
         self.guide_fusion_stage = str(model_config.get("guide_fusion_stage", "input")).strip().lower()
-        if self.guide_fusion_stage in {"feature_encoder", "feature_skip_concat"} and self.guide_loss_weight > 0.0:
+        if self.guide_fusion_stage in {"feature_encoder", "feature_skip_concat", "direct_segmentation"} and self.guide_loss_weight > 0.0:
             raise ValueError(
                 "guide_loss_weight must be 0.0 when model_config.guide_fusion_stage is "
-                "'feature_encoder' or 'feature_skip_concat'"
+                "'feature_encoder', 'feature_skip_concat', or 'direct_segmentation'"
             )
         self._current_aux_outputs = {}
         self.compile_policy = str(getattr(self.mgr, "compile_policy", "auto")).strip().lower()
@@ -501,10 +501,99 @@ class BaseTrainer:
         base_loss = getattr(loss_fn, 'loss', loss_fn)
         skeleton_losses = {'DC_SkelREC_and_CE_loss', 'SoftSkeletonRecallLoss'}
 
-        if skeleton_data is not None and base_loss.__class__.__name__ in skeleton_losses:
-            return loss_fn(prediction, ground_truth, skeleton_data)
+        extra_loss_kwargs = {}
+        if self.guide_fusion_stage == "direct_segmentation":
+            prediction, ground_truth, extra_loss_kwargs = self._adapt_direct_segmentation_loss_inputs(
+                base_loss,
+                prediction,
+                ground_truth,
+                target_name=target_name,
+            )
 
-        return loss_fn(prediction, ground_truth)
+        if skeleton_data is not None and base_loss.__class__.__name__ in skeleton_losses:
+            return loss_fn(prediction, ground_truth, skeleton_data, **extra_loss_kwargs)
+
+        return loss_fn(prediction, ground_truth, **extra_loss_kwargs)
+
+    def _resolve_target_ignore_value(self, target_name: str):
+        target_info = self.mgr.targets.get(target_name, {}) or {}
+        for alias in ("ignore_index", "ignore_label", "ignore_value"):
+            value = target_info.get(alias)
+            if value is not None:
+                return value
+        return None
+
+    @staticmethod
+    def _make_ignore_mask(target: torch.Tensor, ignore_label):
+        if ignore_label is None:
+            return None
+        if isinstance(ignore_label, float) and np.isnan(ignore_label):
+            return torch.isnan(target)
+        return target == float(ignore_label)
+
+    def _adapt_direct_segmentation_loss_inputs(self, base_loss, prediction, ground_truth, *, target_name: str):
+        loss_name = base_loss.__class__.__name__
+        ce_style_losses = {"DC_and_CE_loss", "DC_SkelREC_and_CE_loss"}
+        bce_region_losses = {"DC_and_BCE_loss", "LabelSmoothedDCAndBCELoss"}
+        bce_single_channel_losses = {"BCEWithLogitsLoss", "MemoryEfficientSoftDiceLoss", "SoftDiceLoss"}
+        supported_losses = ce_style_losses | bce_region_losses | bce_single_channel_losses
+        if loss_name not in supported_losses:
+            raise ValueError(
+                f"Loss '{loss_name}' is not supported with guide_fusion_stage='direct_segmentation'."
+            )
+
+        if not torch.is_tensor(ground_truth):
+            raise TypeError("direct_segmentation requires tensor targets")
+
+        target = ground_truth
+        if target.ndim == 4:
+            target = target.unsqueeze(1)
+        if target.ndim != 5:
+            raise ValueError(
+                "direct_segmentation expects 5D targets [B, C, D, H, W] or 4D label maps, "
+                f"got shape {tuple(ground_truth.shape)}"
+            )
+
+        ignore_label = self._resolve_target_ignore_value(target_name)
+        ignore_mask = self._make_ignore_mask(target, ignore_label)
+
+        if loss_name in ce_style_losses:
+            if target.shape[1] > 1:
+                target = torch.argmax(target, dim=1, keepdim=True)
+            return prediction, target, {}
+
+        if prediction.ndim != 5 or prediction.shape[1] < 2:
+            raise ValueError(
+                "direct_segmentation expects synthesized 2-channel logits for BCE-style losses, "
+                f"got shape {tuple(prediction.shape)}"
+            )
+        fg_prediction = prediction[:, 1:2]
+
+        if target.shape[1] > 1:
+            foreground = target[:, -1:].float()
+            ignore_mask = None
+        else:
+            foreground = (target > 0).float()
+            if ignore_mask is not None:
+                foreground = foreground.masked_fill(ignore_mask, 0.0)
+
+        if loss_name in bce_region_losses:
+            ignore_channel = ignore_mask.float() if ignore_mask is not None else torch.zeros_like(foreground)
+            region_target = torch.cat([foreground, ignore_channel], dim=1)
+            return fg_prediction, region_target, {}
+
+        if loss_name == "BCEWithLogitsLoss":
+            if ignore_mask is not None:
+                bce_target = target.float().clone()
+                bce_target = torch.where(ignore_mask, bce_target, foreground)
+            else:
+                bce_target = foreground
+            return fg_prediction, bce_target, {}
+
+        extra_loss_kwargs = {}
+        if ignore_mask is not None:
+            extra_loss_kwargs["loss_mask"] = (~ignore_mask).float()
+        return fg_prediction, foreground, extra_loss_kwargs
 
     def _resolve_guide_supervision_target(self, targets_dict):
         if self.guide_supervision_target is not None:
