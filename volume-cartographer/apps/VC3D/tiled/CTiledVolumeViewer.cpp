@@ -596,13 +596,38 @@ void CTiledVolumeViewer::rebuildContentGrid()
         int windowCols = std::min(std::max(vpTilesW * 2, 16), kMaxTilesPerAxis);
         int windowRows = std::min(std::max(vpTilesH * 2, 16), kMaxTilesPerAxis);
 
-        // Also cap so total doesn't exceed budget
         if (windowCols * windowRows > kMaxTotalTiles) {
             float aspect = static_cast<float>(windowCols) / static_cast<float>(windowRows);
             windowCols = static_cast<int>(std::sqrt(kMaxTotalTiles * aspect));
             windowRows = kMaxTotalTiles / windowCols;
         }
 
+        // If already windowed with the same size, keep the same window position
+        // to avoid grid shifts during zoom. Only re-center when the camera
+        // moves outside the visible region (panning).
+        if (_gridWindowed && _contentBounds.totalCols == windowCols &&
+            _contentBounds.totalRows == windowRows) {
+            // Check if camera is still within the windowed tiles
+            float cameraTileCol = _camera.surfacePtr[0] / bounds.worldTileSize;
+            float cameraTileRow = _camera.surfacePtr[1] / bounds.worldTileSize;
+            int camCol = static_cast<int>(std::round(cameraTileCol));
+            int camRow = static_cast<int>(std::round(cameraTileRow));
+            int margin = 4;  // re-center when camera is within 4 tiles of edge
+            if (camCol >= _contentBounds.firstWorldCol + margin &&
+                camCol < _contentBounds.firstWorldCol + _contentBounds.totalCols - margin &&
+                camRow >= _contentBounds.firstWorldRow + margin &&
+                camRow < _contentBounds.firstWorldRow + _contentBounds.totalRows - margin) {
+                // Camera is well within the current window — keep it
+                bounds.firstWorldCol = _contentBounds.firstWorldCol;
+                bounds.firstWorldRow = _contentBounds.firstWorldRow;
+                bounds.totalCols = _contentBounds.totalCols;
+                bounds.totalRows = _contentBounds.totalRows;
+                _gridWindowed = true;
+                goto windowDone;
+            }
+        }
+
+        {
         // Center window on camera position
         float cameraTileCol = _camera.surfacePtr[0] / bounds.worldTileSize;
         float cameraTileRow = _camera.surfacePtr[1] / bounds.worldTileSize;
@@ -635,7 +660,9 @@ void CTiledVolumeViewer::rebuildContentGrid()
         bounds.totalCols = winLastCol - winFirstCol + 1;
         bounds.totalRows = winLastRow - winFirstRow + 1;
         _gridWindowed = true;
+        }  // end of re-center block
     }
+    windowDone:
 
     _contentBounds = bounds;
 
