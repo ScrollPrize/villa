@@ -1401,10 +1401,7 @@ class NetworkFromConfig(nn.Module):
         # Handle tasks with separate decoders first
         ds_enabled = bool(getattr(self.mgr, 'enable_deep_supervision', False))
         for task_name, decoder in self.task_decoders.items():
-            if self.pretrained_backbone:
-                logits = decoder(features, input_image=x)
-            else:
-                logits = decoder(features)
+            logits = decoder(features)
             # If deep supervision is disabled, collapse to highest-res output for convenience.
             # If enabled, keep the list so training can supervise all scales.
             if isinstance(logits, (list, tuple)) and len(logits) > 0 and not ds_enabled:
@@ -1421,10 +1418,7 @@ class NetworkFromConfig(nn.Module):
         # Handle tasks that use shared decoder + heads
         if hasattr(self, 'task_heads') and len(self.task_heads) > 0:
             if shared_features is None:
-                if self.pretrained_backbone:
-                    shared_features = self.shared_decoder(features, input_image=x)
-                else:
-                    shared_features = self.shared_decoder(features)
+                shared_features = self.shared_decoder(features)
             for task_name, head in self.task_heads.items():
                 logits = head(shared_features)
                 logits = self._apply_z_projection(task_name, logits)
