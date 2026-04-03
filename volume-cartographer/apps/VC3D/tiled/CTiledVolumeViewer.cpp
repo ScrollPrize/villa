@@ -578,7 +578,7 @@ void CTiledVolumeViewer::rebuildContentGrid()
     // Cap grid size to prevent freeze at extreme zoom.
     // At 10x zoom on a large volume, uncapped grid can have 20,000+ tiles.
     // Limit to a window around the camera position.
-    constexpr int kMaxTilesPerAxis = 64;
+    constexpr int kMaxTilesPerAxis = 256;
     constexpr int kMaxTotalTiles = kMaxTilesPerAxis * kMaxTilesPerAxis;
     _gridWindowed = false;
 
