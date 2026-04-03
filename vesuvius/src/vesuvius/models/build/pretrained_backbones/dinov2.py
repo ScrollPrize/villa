@@ -32,12 +32,13 @@ _DINO_V2_PRETRAINED = {
 
 
 class Dinov2Backbone(nn.Module):
-    def __init__(self, backbone):
+    def __init__(self, backbone, input_channels: int):
         super().__init__()
         self.backbone = backbone
         self.patch_embed_size = tuple(int(v) for v in backbone.patch_size)
         self.ndim = len(self.patch_embed_size)
         self.embed_dim = int(backbone.embed_dim)
+        self.input_channels = int(input_channels)
         self.output_channels = [self.embed_dim]
         self.strides = [self.patch_embed_size]
 
@@ -73,7 +74,7 @@ class MinimalDinov2Decoder(nn.Module):
                 bias=True,
             )
 
-    def forward(self, features):
+    def forward(self, features, input_image=None):
         x = features[0] if isinstance(features, list) else features
         x = self.project(x)
         if self.upsample is not None:
@@ -92,7 +93,7 @@ class PrimusPatchDecodeDinov2Decoder(nn.Module):
             activation=nn.GELU,
         )
 
-    def forward(self, features):
+    def forward(self, features, input_image=None):
         x = features[0] if isinstance(features, list) else features
         return self.patch_decoder(x)
 
@@ -115,6 +116,7 @@ class PixelShuffleConvDinov2Decoder(nn.Module):
             8,
             channels[-2] if num_stages > 1 else min(64, max(8, encoder.embed_dim // 8)),
         )
+        detail_channels = min(16, final_hidden_channels)
         stages = []
         for stage_idx in range(num_stages):
             next_channels = channels[stage_idx + 1] if stage_idx < num_stages - 1 else final_hidden_channels
@@ -129,8 +131,13 @@ class PixelShuffleConvDinov2Decoder(nn.Module):
             ]
             stages.append(nn.Sequential(*stage_ops))
         self.decode = nn.Sequential(*stages)
+        self.final_input_detail = nn.Sequential(
+            conv(encoder.input_channels, detail_channels, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.GroupNorm(_resolve_group_norm_groups(detail_channels), detail_channels),
+            nn.GELU(),
+        )
         self.final_refine = nn.Sequential(
-            conv(final_hidden_channels, final_hidden_channels, kernel_size=3, stride=1, padding=1, bias=True),
+            conv(final_hidden_channels + detail_channels, final_hidden_channels, kernel_size=3, stride=1, padding=1, bias=True),
             nn.GroupNorm(_resolve_group_norm_groups(final_hidden_channels), final_hidden_channels),
             nn.GELU(),
             conv(final_hidden_channels, final_hidden_channels, kernel_size=3, stride=1, padding=1, bias=True),
@@ -139,9 +146,18 @@ class PixelShuffleConvDinov2Decoder(nn.Module):
             conv(final_hidden_channels, num_classes, kernel_size=1, stride=1, padding=0, bias=True),
         )
 
-    def forward(self, features):
+    def forward(self, features, input_image=None):
         x = features[0] if isinstance(features, list) else features
         x = self.decode(x)
+        if input_image is None:
+            raise ValueError("pixelshuffle_conv decoder requires the original input_image for final refinement")
+        if tuple(input_image.shape[2:]) != tuple(x.shape[2:]):
+            raise ValueError(
+                f"pixelshuffle_conv expected input_image spatial shape {tuple(x.shape[2:])}, "
+                f"got {tuple(input_image.shape[2:])}"
+            )
+        detail = self.final_input_detail(input_image)
+        x = torch.cat([x, detail], dim=1)
         return self.final_refine(x)
 
 
@@ -262,7 +278,7 @@ def build_dinov2_backbone(name, input_channels, input_shape, *, config_path=None
         )
     backbone = build_dinovol_2_backbone(model_config)
     backbone.load_pretrained_weights(_load_teacher_backbone_state(checkpoint), unchunk=True)
-    return Dinov2Backbone(backbone)
+    return Dinov2Backbone(backbone, input_channels=input_channels)
 
 
 def build_dinov2_decoder(name, encoder, num_classes):
