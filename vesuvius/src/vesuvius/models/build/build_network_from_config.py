@@ -261,6 +261,8 @@ class NetworkFromConfig(nn.Module):
         self.guide_patch_grid = None
         self.guide_skip_concat_projector_channels = None
         self.guide_feature_gate_alpha = 1.0
+        self.guide_direct_output_mode = None
+        self.direct_segmentation_target_name = None
         self.guide_freeze = bool(model_config.get("guide_freeze", True))
         guide_compile_policy = str(model_config.get("guide_compile_policy", "off")).strip().lower()
         if guide_compile_policy not in {"off", "backbone_only", "tokenbook_only", "all_guidance"}:
@@ -279,10 +281,10 @@ class NetworkFromConfig(nn.Module):
                 raise ValueError("guide_backbone cannot be combined with pretrained_backbone in v1")
             if self.architecture_type.lower().startswith("primus"):
                 raise ValueError("guide_backbone is not supported with primus architectures in v1")
-            if self.guide_fusion_stage not in {"input", "input_gating", "feature_encoder", "feature_skip_concat"}:
+            if self.guide_fusion_stage not in {"input", "input_gating", "feature_encoder", "feature_skip_concat", "direct_segmentation"}:
                 raise ValueError(
                     "Unsupported guide_fusion_stage. Expected one of "
-                    "{'input', 'input_gating', 'feature_encoder', 'feature_skip_concat'}."
+                    "{'input', 'input_gating', 'feature_encoder', 'feature_skip_concat', 'direct_segmentation'}."
                 )
             if self.guide_fusion_stage == "feature_encoder":
                 gate_alpha = float(model_config.get("guide_feature_gate_alpha", 1.0))
@@ -291,6 +293,8 @@ class NetworkFromConfig(nn.Module):
                         f"guide_feature_gate_alpha must be in [0, 1], got {gate_alpha}"
                     )
                 self.guide_feature_gate_alpha = gate_alpha
+            if self.guide_fusion_stage == "direct_segmentation" and ds_enabled:
+                raise ValueError("direct_segmentation does not support deep supervision")
 
         if self.pretrained_backbone:
             if ds_enabled:
@@ -300,6 +304,10 @@ class NetworkFromConfig(nn.Module):
                 )
                 setattr(mgr, "enable_deep_supervision", False)
             self._init_pretrained_backbone(mgr, model_config)
+            return
+
+        if self._guide_uses_direct_segmentation():
+            self._init_direct_segmentation(model_config)
             return
 
         # Primus decoders do not emit multi-scale logits; block DS to avoid silent misconfiguration
@@ -762,6 +770,9 @@ class NetworkFromConfig(nn.Module):
     def _guide_uses_skip_feature_concat(self) -> bool:
         return self.guide_enabled and self.guide_fusion_stage == "feature_skip_concat"
 
+    def _guide_uses_direct_segmentation(self) -> bool:
+        return self.guide_enabled and self.guide_fusion_stage == "direct_segmentation"
+
     def _resolve_skip_concat_projector_channels(self, model_config):
         native_skip_channels = [int(ch) for ch in self.shared_encoder.output_channels]
         configured = model_config.get("guide_skip_concat_projector_channels")
@@ -816,7 +827,7 @@ class NetworkFromConfig(nn.Module):
         self.guide_tokenbook_tokens = None
         self.guide_tokenbook_prototype_weighting = "mean"
         self.guide_tokenbook_weight_mlp_hidden = None
-        if self._guide_uses_input_gating():
+        if self._guide_uses_input_gating() or self._guide_uses_direct_segmentation():
             default_token_count = int(math.prod(self.guide_patch_grid))
             configured_token_count = model_config.get("guide_tokenbook_tokens")
             if configured_token_count is None:
@@ -956,8 +967,33 @@ class NetworkFromConfig(nn.Module):
         if self.guide_freeze:
             with torch.inference_mode():
                 frozen_features = self.guide_backbone(x)[0]
-            return frozen_features.clone()
+        return frozen_features.clone()
         return self.guide_backbone(x)[0]
+
+    def _build_direct_segmentation_outputs(self, x):
+        if not self._guide_uses_direct_segmentation():
+            return {}, {}
+
+        guide_features = self._compute_guide_features(x)
+        token_mask = self._sample_guide_token_mask(guide_features)
+        guide_mask = self.guide_tokenbook(guide_features, token_mask=token_mask)
+        guide_probability = F.interpolate(
+            guide_mask,
+            size=x.shape[2:],
+            mode="trilinear",
+            align_corners=False,
+        ).clamp_(1e-6, 1.0 - 1e-6)
+        fg_logit = torch.logit(guide_probability)
+        bg_logit = torch.zeros_like(fg_logit)
+        logits = torch.cat([bg_logit, fg_logit], dim=1)
+        logits = self._apply_z_projection(self.direct_segmentation_target_name, logits)
+
+        results = {self.direct_segmentation_target_name: logits}
+        if self.direct_segmentation_target_name in self.task_activations and not self.training:
+            activation_fn = self.task_activations[self.direct_segmentation_target_name]
+            if activation_fn is not None:
+                results[self.direct_segmentation_target_name] = activation_fn(logits)
+        return results, {"guide_mask": guide_mask}
 
     @torch.compiler.disable(reason="guided backbone compile failure")
     def _apply_input_guidance(self, x):
@@ -1297,6 +1333,14 @@ class NetworkFromConfig(nn.Module):
         aux_outputs = {}
         encoder_feature_gates = None
 
+        if self._guide_uses_direct_segmentation():
+            if return_mae_mask:
+                raise RuntimeError("direct_segmentation does not support return_mae_mask")
+            results, aux_outputs = self._build_direct_segmentation_outputs(x)
+            if return_aux:
+                return results, aux_outputs
+            return results
+
         if self._guide_uses_input_gating():
             x, aux_outputs = self._apply_input_guidance(x)
         elif self._guide_uses_encoder_feature_gating():
@@ -1385,3 +1429,65 @@ class NetworkFromConfig(nn.Module):
         if return_aux:
             return results, aux_outputs
         return results
+
+    def _init_direct_segmentation(self, model_config):
+        primary_targets = [
+            name for name, info in self.targets.items()
+            if not (info or {}).get("auxiliary_task", False)
+        ]
+        if len(primary_targets) != 1:
+            raise ValueError(
+                "direct_segmentation supports exactly one non-auxiliary target in v1, "
+                f"got {primary_targets}."
+            )
+
+        target_name = primary_targets[0]
+        target_info = self.targets[target_name]
+        configured_out_channels = target_info.get("out_channels", target_info.get("channels", 2))
+        if int(configured_out_channels) != 2:
+            raise ValueError(
+                "direct_segmentation expects a binary target configured with out_channels=2, "
+                f"got {configured_out_channels} for target '{target_name}'."
+            )
+        target_info["out_channels"] = 2
+        self._register_target_projection(target_name, target_info, model_config)
+        activation_str = target_info.get("activation", "none")
+
+        self.shared_encoder = None
+        self.shared_decoder = None
+        self.task_decoders = nn.ModuleDict()
+        self.task_heads = nn.ModuleDict()
+        self.task_activations = nn.ModuleDict({target_name: get_activation_module(activation_str)})
+        self.direct_segmentation_target_name = target_name
+        self.guide_direct_output_mode = "two_channel_logits"
+
+        self._init_guidance(model_config)
+
+        self.final_config = {
+            "model_name": self.mgr.model_name,
+            "architecture_type": "guide_only",
+            "patch_size": self.patch_size,
+            "batch_size": self.batch_size,
+            "in_channels": self.in_channels,
+            "autoconfigure": self.autoconfigure,
+            "targets": self.targets,
+            "target_z_projection": self.task_z_projection_cfg,
+            "guide_backbone": self.guide_backbone_name,
+            "guide_backbone_config_path": self.guide_backbone_config_path,
+            "guide_freeze": self.guide_freeze,
+            "guide_patch_grid": self.guide_patch_grid,
+            "guide_stage_keys": None,
+            "guide_skip_concat_projector_channels": None,
+            "guide_feature_gate_alpha": None,
+            "guide_tokenbook_tokens": getattr(self, "guide_tokenbook_tokens", None),
+            "guide_tokenbook_prototype_weighting": getattr(self, "guide_tokenbook_prototype_weighting", "mean"),
+            "guide_tokenbook_weight_mlp_hidden": getattr(self, "guide_tokenbook_weight_mlp_hidden", None),
+            "guide_compile_policy": self.guide_compile_policy,
+            "guide_fusion_stage": self.guide_fusion_stage,
+            "guide_direct_output_mode": self.guide_direct_output_mode,
+            "direct_segmentation_target_name": self.direct_segmentation_target_name,
+        }
+
+        print("NetworkFromConfig initialized with final configuration:")
+        for k, v in self.final_config.items():
+            print(f"  {k}: {v}")

@@ -136,10 +136,10 @@ def _make_cpu_batch(
     return image, labels
 
 
-def _compute_loss(logits_dict: dict[str, torch.Tensor], aux: dict[str, torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+def _compute_loss(logits_dict: dict[str, torch.Tensor], aux: dict[str, torch.Tensor], labels: torch.Tensor, *, guide_fusion_stage: str | None) -> torch.Tensor:
     logits = logits_dict["ink"].float()
     loss = F.cross_entropy(logits, labels)
-    if "guide_mask" in aux:
+    if "guide_mask" in aux and guide_fusion_stage in {"input", "input_gating"}:
         guide_target = (labels > 0).float().unsqueeze(1)
         guide_target = F.interpolate(guide_target, size=aux["guide_mask"].shape[2:], mode="nearest")
         loss = loss + 0.5 * F.binary_cross_entropy(
@@ -216,7 +216,12 @@ def _run_variant_benchmark(
                 logits_dict, aux = outputs
             else:
                 logits_dict, aux = outputs, {}
-            loss = _compute_loss(logits_dict, aux, labels)
+            loss = _compute_loss(
+                logits_dict,
+                aux,
+                labels,
+                guide_fusion_stage=getattr(model, "guide_fusion_stage", None),
+            )
             loss.backward()
             optimizer.step()
 
@@ -362,6 +367,26 @@ def _profile_guided_stages(
                     logits = model.task_decoders["ink"](features)
                     return logits
 
+        elif model.guide_fusion_stage == "direct_segmentation":
+            def _guide_mask():
+                with _autocast_context(device):
+                    return model.guide_tokenbook(guide_features, token_mask=token_mask)
+
+            guide_mask, tokenbook_ms = _timed_call(_guide_mask, device=device)
+            timings["tokenbook_ms"].append(tokenbook_ms)
+
+            def _segmentation():
+                with _autocast_context(device):
+                    guide_probability = F.interpolate(
+                        guide_mask,
+                        size=inputs.shape[2:],
+                        mode="trilinear",
+                        align_corners=False,
+                    ).clamp_(1e-6, 1.0 - 1e-6)
+                    fg_logit = torch.logit(guide_probability)
+                    bg_logit = torch.zeros_like(fg_logit)
+                    return torch.cat([bg_logit, fg_logit], dim=1)
+
         else:  # pragma: no cover - defensive path for future guide modes
             raise ValueError(f"Unsupported guided benchmark mode: {model.guide_fusion_stage!r}")
 
@@ -476,6 +501,17 @@ def main() -> None:
             compile_model=False,
             channels_last_3d=False,
         )
+        direct_segmentation_eager_model = _build_model(
+            patch_size=patch_size,
+            device=device,
+            guide_checkpoint=str(guide_checkpoint),
+            guide_tokenbook_tokens=guide_tokenbook_tokens,
+            guide_fusion_stage="direct_segmentation",
+            guide_tokenbook_prototype_weighting=args.guide_tokenbook_prototype_weighting,
+            guide_tokenbook_weight_mlp_hidden=args.guide_tokenbook_weight_mlp_hidden,
+            compile_model=False,
+            channels_last_3d=False,
+        )
 
         patch_summary: dict[str, object] = {}
         variants = {
@@ -493,6 +529,7 @@ def main() -> None:
             "guided_input_eager": guided_eager_model,
             "guided_feature_encoder_eager": feature_encoder_eager_model,
             "guided_feature_skip_concat_eager": feature_skip_concat_eager_model,
+            "guided_direct_segmentation_eager": direct_segmentation_eager_model,
         }
         if not args.skip_compile_variants:
             variants["guided_input_compile"] = _build_model(
@@ -561,6 +598,28 @@ def main() -> None:
                 compile_model=True,
                 channels_last_3d=True,
             )
+            variants["guided_direct_segmentation_compile"] = _build_model(
+                patch_size=patch_size,
+                device=device,
+                guide_checkpoint=str(guide_checkpoint),
+                guide_tokenbook_tokens=guide_tokenbook_tokens,
+                guide_fusion_stage="direct_segmentation",
+                guide_tokenbook_prototype_weighting=args.guide_tokenbook_prototype_weighting,
+                guide_tokenbook_weight_mlp_hidden=args.guide_tokenbook_weight_mlp_hidden,
+                compile_model=True,
+                channels_last_3d=False,
+            )
+            variants["guided_direct_segmentation_compile_channels_last_3d"] = _build_model(
+                patch_size=patch_size,
+                device=device,
+                guide_checkpoint=str(guide_checkpoint),
+                guide_tokenbook_tokens=guide_tokenbook_tokens,
+                guide_fusion_stage="direct_segmentation",
+                guide_tokenbook_prototype_weighting=args.guide_tokenbook_prototype_weighting,
+                guide_tokenbook_weight_mlp_hidden=args.guide_tokenbook_weight_mlp_hidden,
+                compile_model=True,
+                channels_last_3d=True,
+            )
 
         if not args.skip_stage_breakdown:
             patch_summary["guided_input_eager_stage_breakdown_ms"] = _profile_guided_stages(
@@ -577,6 +636,12 @@ def main() -> None:
             )
             patch_summary["guided_feature_skip_concat_eager_stage_breakdown_ms"] = _profile_guided_stages(
                 feature_skip_concat_eager_model,
+                device=device,
+                cpu_inputs=cpu_inputs.detach().clone(),
+                iterations=args.iterations,
+            )
+            patch_summary["guided_direct_segmentation_eager_stage_breakdown_ms"] = _profile_guided_stages(
+                direct_segmentation_eager_model,
                 device=device,
                 cpu_inputs=cpu_inputs.detach().clone(),
                 iterations=args.iterations,

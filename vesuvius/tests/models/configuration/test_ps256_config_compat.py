@@ -138,3 +138,36 @@ def test_ps256_guided_feature_skip_concat_dicece_config_loads_and_builds():
     assert model.final_config["guide_feature_gate_alpha"] is None
     assert model.final_config["guide_tokenbook_tokens"] is None
     assert model.final_config["guide_tokenbook_prototype_weighting"] is None
+
+
+def test_ps128_guided_direct_segmentation_config_loads_and_builds():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps128_guided_direct_segmentation_ink.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (128, 128, 128)
+    assert list(mgr.targets.keys()) == ["ink"]
+    assert model.guide_enabled is True
+    assert model.final_config["guide_fusion_stage"] == "direct_segmentation"
+    assert model.final_config["guide_direct_output_mode"] == "two_channel_logits"
+
+
+def test_ps256_guided_direct_segmentation_medial_config_loads_and_builds():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps256_guided_direct_segmentation_medial.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (256, 256, 256)
+    assert list(mgr.targets.keys()) == ["surface"]
+    assert model.guide_enabled is True
+    assert model.final_config["guide_fusion_stage"] == "direct_segmentation"
+    assert model.final_config["guide_direct_output_mode"] == "two_channel_logits"
+
+
+def test_ps256_guided_direct_segmentation_dicece_config_loads_and_builds():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps256_guided_direct_segmentation_dicece.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (256, 256, 256)
+    assert list(mgr.targets.keys()) == ["surface"]
+    assert model.guide_enabled is True
+    assert model.final_config["guide_fusion_stage"] == "direct_segmentation"
+    assert model.final_config["guide_direct_output_mode"] == "two_channel_logits"

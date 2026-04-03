@@ -5,11 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.build.guidance import TokenBook3D
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
 from vesuvius.models.build.simple_conv_blocks import ConvDropoutNormReLU
+from vesuvius.models.utils import InitWeights_He
 
 
 def _tiny_dinovol_model_config() -> dict:
@@ -55,6 +57,7 @@ def _make_mgr(
     guide_tokenbook_prototype_weighting: str | None = None,
     guide_feature_gate_alpha: float | None = None,
     guide_skip_concat_projector_channels: list[int] | None = None,
+    target_out_channels: int = 1,
 ) -> SimpleNamespace:
     guided_config = {}
     if guide_tokenbook_tokens is not None:
@@ -70,7 +73,7 @@ def _make_mgr(
     if guide_skip_concat_projector_channels is not None:
         guided_config["guide_skip_concat_projector_channels"] = [int(v) for v in guide_skip_concat_projector_channels]
     return SimpleNamespace(
-        targets={"ink": {"out_channels": 1, "activation": "none"}},
+        targets={"ink": {"out_channels": int(target_out_channels), "activation": "none"}},
         train_patch_size=(16, 16, 16),
         train_batch_size=2,
         in_channels=1,
@@ -192,6 +195,35 @@ def test_feature_skip_concat_forward_shapes_and_empty_aux_outputs(tmp_path: Path
     assert model.final_config["guide_tokenbook_tokens"] is None
     assert model.final_config["guide_tokenbook_prototype_weighting"] is None
     assert model.final_config["guide_tokenbook_weight_mlp_hidden"] is None
+
+
+def test_direct_segmentation_returns_two_channel_logits_and_low_res_guide_mask(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_fusion_stage="direct_segmentation",
+        guide_tokenbook_prototype_weighting="token_mlp",
+        target_out_channels=2,
+    )
+    model = NetworkFromConfig(mgr)
+
+    outputs, aux = model(torch.randn(2, 1, 16, 16, 16), return_aux=True)
+    probabilities = torch.softmax(outputs["ink"], dim=1)[:, 1:2]
+    expected = F.interpolate(
+        aux["guide_mask"],
+        size=probabilities.shape[2:],
+        mode="trilinear",
+        align_corners=False,
+    )
+
+    assert model.shared_encoder is None
+    assert model.final_config["guide_fusion_stage"] == "direct_segmentation"
+    assert model.final_config["guide_direct_output_mode"] == "two_channel_logits"
+    assert outputs["ink"].shape == (2, 2, 16, 16, 16)
+    assert aux["guide_mask"].shape == (2, 1, 2, 2, 2)
+    assert torch.allclose(probabilities, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_encoder_skip_only_feature_gating_uses_residual_alpha_formula():
@@ -361,6 +393,49 @@ def test_guided_network_backprop_updates_tokenbook_but_not_frozen_guide_backbone
     assert all(parameter.grad is None for parameter in model.guide_backbone.parameters())
 
 
+def test_direct_segmentation_backprop_updates_tokenbook_but_not_frozen_guide_backbone(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_fusion_stage="direct_segmentation",
+        target_out_channels=2,
+    )
+    model = NetworkFromConfig(mgr)
+    model.train()
+
+    x = torch.randn(2, 1, 16, 16, 16)
+    target = torch.randint(0, 2, (2, 16, 16, 16))
+    outputs, aux = model(x, return_aux=True)
+    loss = torch.nn.functional.cross_entropy(outputs["ink"], target) + aux["guide_mask"].mean()
+    loss.backward()
+
+    assert any(parameter.grad is not None for parameter in model.guide_tokenbook.parameters())
+    assert all(parameter.grad is None for parameter in model.guide_backbone.parameters())
+
+
+def test_init_weights_he_preserves_frozen_guide_backbone_weights(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(
+        checkpoint_path,
+        basic_encoder_block="ConvBlock",
+        guide_fusion_stage="direct_segmentation",
+        target_out_channels=2,
+    )
+    model = NetworkFromConfig(mgr)
+    before = {
+        key: value.detach().clone()
+        for key, value in model.guide_backbone.state_dict().items()
+    }
+
+    model.apply(InitWeights_He(neg_slope=0.2))
+
+    after = model.guide_backbone.state_dict()
+    assert all(torch.equal(before[key], after[key]) for key in before)
+
+
 def test_feature_skip_concat_requires_projector_channels_to_match_num_stages(tmp_path: Path):
     checkpoint_path = tmp_path / "guide_backbone.pt"
     _write_local_guide_checkpoint(checkpoint_path)
@@ -372,6 +447,33 @@ def test_feature_skip_concat_requires_projector_channels_to_match_num_stages(tmp
     )
 
     with pytest.raises(ValueError, match="guide_skip_concat_projector_channels must have as many entries"):
+        NetworkFromConfig(mgr)
+
+
+def test_direct_segmentation_requires_single_binary_target(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = SimpleNamespace(
+        targets={
+            "ink": {"out_channels": 2, "activation": "none"},
+            "surface": {"out_channels": 2, "activation": "none"},
+        },
+        train_patch_size=(16, 16, 16),
+        train_batch_size=2,
+        in_channels=1,
+        autoconfigure=False,
+        model_name="guided_test",
+        enable_deep_supervision=False,
+        spacing=(1.0, 1.0, 1.0),
+        model_config={
+            "guide_backbone": str(checkpoint_path),
+            "guide_freeze": True,
+            "guide_fusion_stage": "direct_segmentation",
+            "input_shape": [16, 16, 16],
+        },
+    )
+
+    with pytest.raises(ValueError, match="exactly one non-auxiliary target"):
         NetworkFromConfig(mgr)
 
 

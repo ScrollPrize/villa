@@ -77,6 +77,7 @@ def _make_mgr(
     guide_fusion_stage: str | None = None,
     guide_loss_weight: float = 0.5,
     guide_tokenbook_prototype_weighting: str | None = None,
+    losses: list[dict] | None = None,
 ) -> SimpleNamespace:
     guided_model_config = {
         "features_per_stage": [8, 16, 32],
@@ -106,7 +107,7 @@ def _make_mgr(
             "ink": {
                 "out_channels": 2,
                 "activation": "none",
-                "losses": [{"name": "nnUNet_DC_and_CE_loss", "weight": 1.0}],
+                "losses": losses if losses is not None else [{"name": "nnUNet_DC_and_CE_loss", "weight": 1.0}],
             }
         },
         tr_configs={},
@@ -269,6 +270,43 @@ def test_feature_skip_concat_checkpoint_roundtrip_preserves_plain_inference_forw
     assert isinstance(output, dict)
     assert set(output.keys()) == {"ink"}
     assert model_info["network"].final_config["guide_fusion_stage"] == "feature_skip_concat"
+
+
+def test_direct_segmentation_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="direct_segmentation",
+        guide_loss_weight=0.0,
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model()
+    checkpoint_path = tmp_path / "direct_segmentation_model.pth"
+    torch.save({"model_config": model.final_config, "model": model.state_dict()}, checkpoint_path)
+
+    output_dir = tmp_path / "inference_out_direct_segmentation"
+    output_dir.mkdir()
+    inferer = Inferer(
+        model_path=str(checkpoint_path),
+        input_dir=str(data_root / "images" / "volume1.zarr"),
+        output_dir=str(output_dir),
+        input_format="zarr",
+        do_tta=False,
+        device="cpu",
+        num_dataloader_workers=0,
+        model_type="train_py",
+    )
+
+    model_info = inferer._load_train_py_model(checkpoint_path)
+    output = model_info["network"](torch.randn(1, 1, 16, 16, 16))
+
+    assert isinstance(output, dict)
+    assert set(output.keys()) == {"ink"}
+    assert output["ink"].shape == (1, 2, 16, 16, 16)
+    assert model_info["network"].final_config["guide_fusion_stage"] == "direct_segmentation"
 
 
 def test_inferer_finalize_output_batch_returns_float16_numpy():
@@ -437,6 +475,107 @@ def test_feature_skip_concat_base_trainer_smoke_runs_two_training_steps_without_
         optimizer.step()
 
 
+def test_direct_segmentation_base_trainer_smoke_runs_two_training_steps_without_aux_guide_loss(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="direct_segmentation",
+        guide_loss_weight=0.0,
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model().to(trainer.device)
+    loss_fns = trainer._build_loss()
+    dataset = trainer._configure_dataset(is_training=True)
+    batch = next(iter(DataLoader(dataset, batch_size=1, shuffle=False)))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    for _step in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        _inputs, targets_dict, outputs = trainer._get_model_outputs(model, batch)
+        loss, task_losses = trainer._compute_train_loss(outputs, targets_dict, loss_fns)
+        assert torch.isfinite(loss)
+        assert outputs["ink"].shape == (1, 2, 16, 16, 16)
+        assert "guide_mask" not in task_losses
+        assert set(trainer._current_aux_outputs.keys()) == {"guide_mask"}
+        loss.backward()
+        optimizer.step()
+
+
+def test_direct_segmentation_bce_style_loss_smoke_runs(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="direct_segmentation",
+        guide_loss_weight=0.0,
+        losses=[{"name": "nnUNet_DC_and_BCE_loss", "weight": 1.0}],
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model().to(trainer.device)
+    loss_fns = trainer._build_loss()
+    dataset = trainer._configure_dataset(is_training=True)
+    batch = next(iter(DataLoader(dataset, batch_size=1, shuffle=False)))
+
+    _inputs, targets_dict, outputs = trainer._get_model_outputs(model, batch)
+    loss, task_losses = trainer._compute_train_loss(outputs, targets_dict, loss_fns)
+
+    assert torch.isfinite(loss)
+    assert "guide_mask" not in task_losses
+
+
+def test_direct_segmentation_plain_bce_with_logits_loss_smoke_runs(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="direct_segmentation",
+        guide_loss_weight=0.0,
+        losses=[{"name": "BCEWithLogitsLoss", "weight": 1.0}],
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model().to(trainer.device)
+    loss_fns = trainer._build_loss()
+    dataset = trainer._configure_dataset(is_training=True)
+    batch = next(iter(DataLoader(dataset, batch_size=1, shuffle=False)))
+
+    _inputs, targets_dict, outputs = trainer._get_model_outputs(model, batch)
+    loss, task_losses = trainer._compute_train_loss(outputs, targets_dict, loss_fns)
+
+    assert torch.isfinite(loss)
+    assert "guide_mask" not in task_losses
+
+
+def test_direct_segmentation_medial_surface_recall_smoke_runs(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="direct_segmentation",
+        guide_loss_weight=0.0,
+        losses=[{"name": "MedialSurfaceRecall", "weight": 1.0}],
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model().to(trainer.device)
+    loss_fns = trainer._build_loss()
+    dataset = trainer._configure_dataset(is_training=True)
+    batch = next(iter(DataLoader(dataset, batch_size=1, shuffle=False)))
+
+    _inputs, targets_dict, outputs = trainer._get_model_outputs(model, batch)
+    loss, task_losses = trainer._compute_train_loss(outputs, targets_dict, loss_fns)
+
+    assert torch.isfinite(loss)
+    assert "guide_mask" not in task_losses
+
+
 def test_feature_encoder_rejects_nonzero_guide_loss_weight(tmp_path: Path):
     data_root = _make_synthetic_dataset(tmp_path)
     guide_checkpoint = tmp_path / "guide_backbone.pt"
@@ -466,6 +605,44 @@ def test_feature_skip_concat_rejects_nonzero_guide_loss_weight(tmp_path: Path):
 
     with pytest.raises(ValueError, match="guide_loss_weight"):
         BaseTrainer(mgr=mgr, verbose=False)
+
+
+def test_direct_segmentation_rejects_nonzero_guide_loss_weight(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="direct_segmentation",
+        guide_loss_weight=0.25,
+    )
+
+    with pytest.raises(ValueError, match="guide_loss_weight"):
+        BaseTrainer(mgr=mgr, verbose=False)
+
+
+def test_direct_segmentation_rejects_unsupported_loss_name(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="direct_segmentation",
+        guide_loss_weight=0.0,
+        losses=[{"name": "MSELoss", "weight": 1.0}],
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model().to(trainer.device)
+    loss_fns = trainer._build_loss()
+    dataset = trainer._configure_dataset(is_training=True)
+    batch = next(iter(DataLoader(dataset, batch_size=1, shuffle=False)))
+
+    _inputs, targets_dict, outputs = trainer._get_model_outputs(model, batch)
+
+    with pytest.raises(ValueError, match="not supported with guide_fusion_stage='direct_segmentation'"):
+        trainer._compute_train_loss(outputs, targets_dict, loss_fns)
 
 
 def test_prepare_metrics_for_logging_includes_guide_loss_entries():
@@ -572,6 +749,28 @@ def test_feature_encoder_trainer_builds_train_and_val_stage_montage(tmp_path: Pa
     assert guide_preview.ndim == 3
     assert guide_preview.shape[2] == 3
     assert guide_preview.shape[:2] == (76, 24)
+
+
+def test_direct_segmentation_aux_outputs_render_only_standard_debug_payload():
+    mgr = _make_mgr(Path("/tmp/guide_backbone.pt"), Path("/tmp/guide_backbone.pt"), guide_fusion_stage="direct_segmentation", guide_loss_weight=0.0)
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    aux_outputs_dict = {
+        "guide_mask": torch.ones((1, 1, 4, 4, 4), dtype=torch.float32),
+    }
+
+    prepared = trainer._prepare_aux_debug_outputs(
+        aux_outputs_dict,
+        torch.zeros((1, 1, 8, 8, 8), dtype=torch.float32),
+    )
+    guide_preview = trainer._make_feature_encoder_guide_preview_image(aux_outputs_dict)
+    payload = trainer._build_debug_media_payload(
+        debug_preview_image=np.zeros((8, 8, 3), dtype=np.uint8),
+        guide_preview_image=guide_preview,
+    )
+
+    assert set(prepared.keys()) == {"guide_ink"}
+    assert guide_preview is None
+    assert set(payload.keys()) == {"debug_image"}
 
 
 def test_select_debug_sample_index_from_targets_prefers_first_nonzero_sample():
