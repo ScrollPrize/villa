@@ -10,7 +10,11 @@ import torch.nn.functional as F
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.build.guidance import TokenBook3D
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
-from vesuvius.models.build.pretrained_backbones.dinov2 import build_dinov2_backbone, build_dinov2_decoder
+from vesuvius.models.build.pretrained_backbones.dinov2 import (
+    PixelShuffleConvDinov2Decoder,
+    build_dinov2_backbone,
+    build_dinov2_decoder,
+)
 from vesuvius.models.build.simple_conv_blocks import ConvDropoutNormReLU
 from vesuvius.models.build.transformers.patch_encode_decode import PixelShuffle3D
 from vesuvius.models.utils import InitWeights_He
@@ -574,7 +578,16 @@ def test_build_dinov2_decoder_accepts_pixelshuffle_conv(tmp_path: Path):
 
     output = decoder(torch.randn(1, encoder.embed_dim, 2, 2, 2))
 
+    assert isinstance(decoder, PixelShuffleConvDinov2Decoder)
     assert output.shape == (1, 2, 16, 16, 16)
+    assert all(isinstance(stage[3], torch.nn.GroupNorm) for stage in decoder.decode)
+    assert all(isinstance(stage[4], torch.nn.GELU) for stage in decoder.decode)
+    assert decoder.decode[-1][2].out_channels > 2
+    assert isinstance(decoder.final_refine[1], torch.nn.GroupNorm)
+    assert isinstance(decoder.final_refine[2], torch.nn.GELU)
+    assert isinstance(decoder.final_refine[4], torch.nn.GroupNorm)
+    assert isinstance(decoder.final_refine[5], torch.nn.GELU)
+    assert decoder.final_refine[-1].kernel_size == (1, 1, 1)
 
 
 def test_feature_encoder_guidance_backprop_updates_all_stage_tokenbooks(tmp_path: Path):
