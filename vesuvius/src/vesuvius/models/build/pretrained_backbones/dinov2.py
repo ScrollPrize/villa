@@ -131,6 +131,8 @@ class PixelShuffleConvDinov2Decoder(nn.Module):
         self.decode = nn.Sequential(*stages)
         self.final_refine = nn.Sequential(
             conv(final_hidden_channels, final_hidden_channels, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.GroupNorm(_resolve_group_norm_groups(final_hidden_channels), final_hidden_channels),
+            nn.GELU(),
             conv(final_hidden_channels, final_hidden_channels, kernel_size=3, stride=1, padding=1, bias=True),
             conv(final_hidden_channels, num_classes, kernel_size=1, stride=1, padding=0, bias=True),
         )
