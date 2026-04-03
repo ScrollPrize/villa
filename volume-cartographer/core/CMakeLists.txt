@@ -22,7 +22,7 @@ add_library(vc_core
         src/VcDataset.cpp
         src/NetworkFilesystem.cpp
         src/cache/ChunkSource.cpp
-        src/cache/DiskStore.cpp
+        # DiskStore.cpp removed — cold tier now uses ZarrArray
         src/cache/HttpMetadataFetcher.cpp
         src/cache/IOPool.cpp
         src/cache/TieredChunkCache.cpp

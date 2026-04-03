@@ -19,10 +19,8 @@
 // Forward declarations
 namespace vc { class VcDataset; }
 
-namespace vc::cache {
-    class TieredChunkCache;
-    class DiskStore;
-}
+namespace vc::cache { class TieredChunkCache; }
+namespace utils { class ZarrArray; }
 
 struct CompositeParams;
 
@@ -76,9 +74,9 @@ public:
     [[nodiscard]] size_t numScales() const noexcept;
 
     // Create a TieredChunkCache backed by this volume's zarr data.
-    // diskStore: optional shared disk cache (nullptr to disable cold tier).
+    // diskZarr: optional local zarr v3 sharded array for cold tier.
     [[nodiscard]] std::unique_ptr<vc::cache::TieredChunkCache> createTieredCache(
-        std::shared_ptr<vc::cache::DiskStore> diskStore = nullptr) const;
+        std::shared_ptr<utils::ZarrArray> diskZarr = nullptr) const;
 
     // --- Cache management ---
 
@@ -89,9 +87,9 @@ public:
     // Set cache budget (must be called before first tieredCache() access).
     void setCacheBudget(size_t hotBytes);
 
-    // Inject a shared DiskStore for the cold cache tier.
+    // Inject a local zarr array for the cold cache tier.
     // Must be called before first tieredCache() access.
-    void setDiskStore(std::shared_ptr<vc::cache::DiskStore> store);
+    void setDiskZarr(std::shared_ptr<utils::ZarrArray> zarr);
 
     // Set the maximum size for the auto-created disk cache (remote volumes).
     // Must be called before first tieredCache() access.
@@ -211,7 +209,7 @@ protected:
     mutable std::once_flag cacheOnce_;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
     size_t diskCacheMaxBytes_ = 100ULL << 30; // 100 GB default
-    std::shared_ptr<vc::cache::DiskStore> pendingDiskStore_;
+    std::shared_ptr<utils::ZarrArray> pendingDiskZarr_;
     int ioThreads_ = 0;  // 0 = use default
     std::atomic<bool> prefetchStop_{false};
 

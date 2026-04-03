@@ -113,7 +113,7 @@
 #include "vc/core/util/Render.hpp"
 #include "vc/core/util/NetworkFilesystem.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
-#include "vc/core/cache/DiskStore.hpp"
+#include <utils/zarr.hpp>
 
 
 
@@ -4232,15 +4232,18 @@ void CWindow::OpenVolume(const QString& path)
                     if (!cacheDir.isEmpty()) {
                         settings.setValue(viewer::NETWORK_CACHE_DIR, cacheDir);
 
-                        vc::cache::DiskStore::Config dsCfg;
-                        dsCfg.root = fs::path(cacheDir.toStdString());
-                        dsCfg.directMode = false;
-                        dsCfg.persistent = true;
-                        auto diskStore = std::make_shared<vc::cache::DiskStore>(std::move(dsCfg));
-
+                        auto cachePath = fs::path(cacheDir.toStdString());
+                        // Open local zarr if it exists at the cache path
                         for (const auto& volId : _state->vpkg()->volumeIDs()) {
                             auto vol = _state->vpkg()->volume(volId);
-                            vol->setDiskStore(diskStore);
+                            auto zarrPath = cachePath / volId / "0";
+                            if (fs::exists(zarrPath / "zarr.json")) {
+                                try {
+                                    auto zarr = std::make_shared<utils::ZarrArray>(
+                                        utils::ZarrArray::open(zarrPath));
+                                    vol->setDiskZarr(zarr);
+                                } catch (...) {}
+                            }
                         }
 
                         Logger()->info("Network cache custom dir: {} (fs: {})",

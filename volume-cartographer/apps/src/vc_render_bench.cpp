@@ -134,7 +134,7 @@ static void printCacheStats(vc::cache::TieredChunkCache* cache) {
     printf("    Misses:     %8llu  (%5.1f%%)\n", (unsigned long long)s.misses,  pct(s.misses));
     printf("    Hot bytes:  %8.1f MB\n", s.hotBytes / (1024.0 * 1024.0));
     printf("    IO pending: %8zu\n", s.ioPending);
-    printf("    Disk files: %8zu  (%8.1f MB)\n", s.diskFiles, s.diskBytes / (1024.0 * 1024.0));
+    printf("    Disk writes:%8llu\n", (unsigned long long)s.diskWrites);
 }
 
 static bool isRemoteUrl(const std::string& path) {

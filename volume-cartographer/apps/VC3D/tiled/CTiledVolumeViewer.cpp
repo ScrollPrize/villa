@@ -1689,11 +1689,9 @@ void CTiledVolumeViewer::updateStatusLabel()
         double hotGB = static_cast<double>(s.hotBytes) / (1024.0 * 1024.0 * 1024.0);
         status += QString(" | ram %1G").arg(hotGB, 0, 'f', 1);
 
-        // Disk cache
-        if (s.diskFiles > 0) {
-            double diskGB = static_cast<double>(s.diskBytes) / (1024.0 * 1024.0 * 1024.0);
-            status += QString(" | disk %1 (%2G w%3)").arg(s.diskFiles).arg(diskGB, 0, 'f', 1).arg(s.diskWrites);
-        }
+        // Disk writes
+        if (s.diskWrites > 0)
+            status += QString(" | w%1").arg(s.diskWrites);
 
         // Negative cache
         if (s.negativeCount > 0)

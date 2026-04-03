@@ -1169,6 +1169,100 @@ public:
         write_chunk_raw(shard_indices, shard_data);
     }
 
+    /// Append a single chunk to its shard file. Index at start (fixed 8KB header).
+    /// Two tiny writes: (1) append chunk data at EOF, (2) update 16-byte index entry.
+    /// Creates shard with empty index if it doesn't exist.
+    void write_inner_chunk_to_shard(std::span<const std::size_t> chunk_indices,
+                                    std::span<const std::byte> data) {
+        if (!is_sharded())
+            throw std::runtime_error("zarr: not a sharded array");
+
+        const auto ndim = meta_.ndim();
+        const auto n_inner = meta_.total_sub_chunks_per_shard();
+        const std::size_t index_size = n_inner * 16;
+
+        std::vector<std::size_t> shard_idx(ndim);
+        std::vector<std::size_t> inner_idx(ndim);
+        for (std::size_t d = 0; d < ndim; ++d) {
+            auto ips = meta_.sub_chunks_per_shard(d);
+            shard_idx[d] = chunk_indices[d] / ips;
+            inner_idx[d] = chunk_indices[d] % ips;
+        }
+
+        std::size_t linear = 0;
+        std::size_t stride = 1;
+        for (std::size_t d = ndim; d-- > 0;) {
+            linear += inner_idx[d] * stride;
+            stride *= meta_.sub_chunks_per_shard(d);
+        }
+
+        auto key = chunk_key(shard_idx);
+        auto p = root_ / key;
+        std::filesystem::create_directories(p.parent_path());
+
+        // Create shard with empty index if it doesn't exist
+        if (!std::filesystem::exists(p)) {
+            std::ofstream create(p, std::ios::binary);
+            // Write empty index: all entries = (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF)
+            std::vector<std::byte> empty_index(index_size);
+            std::memset(empty_index.data(), 0xFF, index_size);
+            create.write(reinterpret_cast<const char*>(empty_index.data()),
+                         static_cast<std::streamsize>(index_size));
+        }
+
+        // Open for random read/write
+        std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
+        if (!f) return;
+
+        // 1. Seek to EOF, append chunk data
+        f.seekp(0, std::ios::end);
+        auto chunk_offset = static_cast<std::uint64_t>(f.tellp());
+        f.write(reinterpret_cast<const char*>(data.data()),
+                static_cast<std::streamsize>(data.size()));
+
+        // 2. Seek to index entry, write 16 bytes (offset + nbytes)
+        auto nbytes = static_cast<std::uint64_t>(data.size());
+        f.seekp(static_cast<std::streamoff>(linear * 16));
+        f.write(reinterpret_cast<const char*>(&chunk_offset), 8);
+        f.write(reinterpret_cast<const char*>(&nbytes), 8);
+        f.flush();
+    }
+
+    /// Check if an inner chunk exists. Reads only the 16-byte index entry.
+    [[nodiscard]] bool inner_chunk_exists(std::span<const std::size_t> chunk_indices) const {
+        if (!is_sharded()) return false;
+        const auto ndim = meta_.ndim();
+
+        std::vector<std::size_t> shard_idx(ndim);
+        std::vector<std::size_t> inner_idx(ndim);
+        for (std::size_t d = 0; d < ndim; ++d) {
+            auto ips = meta_.sub_chunks_per_shard(d);
+            shard_idx[d] = chunk_indices[d] / ips;
+            inner_idx[d] = chunk_indices[d] % ips;
+        }
+
+        std::size_t linear = 0;
+        std::size_t stride = 1;
+        for (std::size_t d = ndim; d-- > 0;) {
+            linear += inner_idx[d] * stride;
+            stride *= meta_.sub_chunks_per_shard(d);
+        }
+
+        auto p = root_ / chunk_key(shard_idx);
+        std::ifstream f(p, std::ios::binary);
+        if (!f) return false;
+
+        f.seekg(static_cast<std::streamoff>(linear * 16));
+        std::uint64_t offset = 0, nbytes = 0;
+        f.read(reinterpret_cast<char*>(&offset), 8);
+        f.read(reinterpret_cast<char*>(&nbytes), 8);
+        if (!f) return false;
+        return !(offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0));
+    }
+
+    /// Root path of the zarr array on disk.
+    [[nodiscard]] const std::filesystem::path& path() const noexcept { return root_; }
+
     // -- Attributes ----------------------------------------------------------
 
     [[nodiscard]] std::string read_attrs() const;
@@ -1243,6 +1337,7 @@ private:
         return detail::read_file_bytes(p);
     }
 
+public:
     [[nodiscard]] std::optional<std::vector<std::byte>>
     read_chunk_raw(std::span<const std::size_t> idx) const {
         return read_raw(chunk_key(idx));
@@ -1263,28 +1358,48 @@ private:
 
     // -- Shard reading helpers -----------------------------------------------
 
-    /// Convert global inner chunk indices to shard indices + inner indices.
+    /// Read a single chunk from its shard. Reads only the 16-byte index entry
+    /// + the chunk data. Does NOT read the whole shard.
     [[nodiscard]] std::optional<std::vector<std::byte>>
     read_inner_chunk_from_shard(std::span<const std::size_t> chunk_indices) const {
         if (!is_sharded()) return std::nullopt;
-        const auto& sc = *meta_.shard_config;
         const auto ndim = meta_.ndim();
 
-        // Compute shard indices and inner indices.
         std::vector<std::size_t> shard_idx(ndim);
         std::vector<std::size_t> inner_idx(ndim);
         for (std::size_t d = 0; d < ndim; ++d) {
-            auto inner_per_shard = meta_.sub_chunks_per_shard(d);
-            shard_idx[d] = chunk_indices[d] / inner_per_shard;
-            inner_idx[d] = chunk_indices[d] % inner_per_shard;
+            auto ips = meta_.sub_chunks_per_shard(d);
+            shard_idx[d] = chunk_indices[d] / ips;
+            inner_idx[d] = chunk_indices[d] % ips;
         }
 
-        // Read shard file.
-        auto shard_key = chunk_key(shard_idx);
-        auto shard_data = read_raw(shard_key);
-        if (!shard_data) return std::nullopt;
+        std::size_t linear = 0;
+        std::size_t stride = 1;
+        for (std::size_t d = ndim; d-- > 0;) {
+            linear += inner_idx[d] * stride;
+            stride *= meta_.sub_chunks_per_shard(d);
+        }
 
-        return extract_inner_chunk(*shard_data, inner_idx);
+        auto key = chunk_key(shard_idx);
+        auto p = root_ / key;
+        std::ifstream f(p, std::ios::binary);
+        if (!f) return std::nullopt;
+
+        // Read 16-byte index entry at position linear*16
+        f.seekg(static_cast<std::streamoff>(linear * 16));
+        std::uint64_t offset = 0, nbytes = 0;
+        f.read(reinterpret_cast<char*>(&offset), 8);
+        f.read(reinterpret_cast<char*>(&nbytes), 8);
+        if (!f) return std::nullopt;
+        if (offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0))
+            return std::nullopt;
+
+        // Read chunk data
+        f.seekg(static_cast<std::streamoff>(offset));
+        std::vector<std::byte> data(nbytes);
+        f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(nbytes));
+        if (!f) return std::nullopt;
+        return data;
     }
 
     /// Extract a single inner chunk from shard data.

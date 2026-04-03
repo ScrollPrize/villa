@@ -19,7 +19,7 @@
 #include "vc/core/cache/TieredChunkCache.hpp"
 #include "vc/core/cache/ChunkSource.hpp"
 #include "vc/core/cache/VcDecompressor.hpp"
-#include "vc/core/cache/DiskStore.hpp"
+#include <utils/zarr.hpp>
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/NetworkFilesystem.hpp"
@@ -286,7 +286,7 @@ size_t Volume::numScales() const noexcept {
 }
 
 std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
-    std::shared_ptr<vc::cache::DiskStore> diskStore) const
+    std::shared_ptr<utils::ZarrArray> diskZarr) const
 {
     if (zarrDs_.empty()) return nullptr;
 
@@ -321,41 +321,82 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
         }
         source = std::move(httpSource);
 
-        // For remote volumes, use the staging dir itself as the disk store.
-        if (!diskStore) {
-            vc::cache::DiskStore::Config dsCfg;
-            dsCfg.root = path_;
-            dsCfg.directMode = true;
-            dsCfg.delimiter = remoteDelimiter_;
-            dsCfg.maxBytes = diskCacheMaxBytes_;
-            diskStore = std::make_shared<vc::cache::DiskStore>(std::move(dsCfg));
+        // Create or open a canonical zarr v3 sharded cold cache.
+        // 128³ chunks in 1024³ shards, no codec (data is already H.265 compressed).
+        if (!diskZarr) {
+            auto zarrPath = path_ / "cache";
+            try {
+                if (std::filesystem::exists(zarrPath / "zarr.json")) {
+                    diskZarr = std::make_shared<utils::ZarrArray>(
+                        utils::ZarrArray::open(zarrPath));
+                } else {
+                    // Get level 0 shape from source metadata
+                    auto l0shape = source->levelShape(0);
+                    utils::ZarrMetadata meta;
+                    meta.version = utils::ZarrVersion::v3;
+                    meta.node_type = "array";
+                    meta.shape = {static_cast<size_t>(l0shape[0]),
+                                  static_cast<size_t>(l0shape[1]),
+                                  static_cast<size_t>(l0shape[2])};
+                    meta.chunks = {1024, 1024, 1024};  // shard shape
+                    meta.dtype = utils::ZarrDtype::uint8;
+                    meta.fill_value = 0;
+                    meta.chunk_key_encoding = "default";
+                    utils::ShardConfig sc;
+                    sc.sub_chunks = {128, 128, 128};   // inner chunk shape
+                    sc.index_at_end = false;  // index at start for append-only writes
+                    meta.shard_config = std::move(sc);
+                    diskZarr = std::make_shared<utils::ZarrArray>(
+                        utils::ZarrArray::create(zarrPath, std::move(meta)));
+                }
+                fprintf(stderr, "[Volume] Cold cache: %s (sharded=%s)\n",
+                        zarrPath.c_str(), diskZarr->is_sharded() ? "yes" : "no");
+            } catch (const std::exception& e) {
+                fprintf(stderr, "[Volume] Failed to create cold cache: %s\n", e.what());
+            }
         }
     } else {
         source = std::make_unique<vc::cache::FileSystemChunkSource>(
             path_, delimiter, std::move(levels));
 
-        // Auto-enable disk caching for network-mounted volumes (s3fs, NFS, etc.)
-        if (!diskStore && mountInfo_.type == vc::FilesystemType::NetworkMount) {
-            // If s3fs already has its own local cache (use_cache option),
-            // skip our DiskStore to avoid double-caching.
+        // Auto-enable disk caching for network-mounted volumes
+        if (!diskZarr && mountInfo_.type == vc::FilesystemType::NetworkMount) {
             if (!mountInfo_.cacheDir.empty()) {
                 fprintf(stderr, "[Volume] Detected %s mount with use_cache=%s; "
-                                "skipping app-level disk cache (s3fs handles it)\n",
+                                "skipping app-level disk cache\n",
                         mountInfo_.label.c_str(),
                         mountInfo_.cacheDir.c_str());
             } else {
                 namespace fs = std::filesystem;
                 auto home = std::getenv("HOME");
-                vc::cache::DiskStore::Config dsCfg;
-                dsCfg.root = fs::path(home ? home : "/tmp") / ".VC3D" / "network_cache" / id();
-                dsCfg.maxBytes = diskCacheMaxBytes_;
-                dsCfg.delimiter = delimiter;
-                std::string cacheRootStr = dsCfg.root.string();
-                diskStore = std::make_shared<vc::cache::DiskStore>(std::move(dsCfg));
-                fprintf(stderr, "[Volume] Detected network filesystem (%s); "
-                                "enabling local disk cache at %s\n",
-                        mountInfo_.label.c_str(),
-                        cacheRootStr.c_str());
+                auto zarrPath = fs::path(home ? home : "/tmp") / ".VC3D" / "network_cache" / id() / "cache";
+                try {
+                    if (fs::exists(zarrPath / "zarr.json")) {
+                        diskZarr = std::make_shared<utils::ZarrArray>(
+                            utils::ZarrArray::open(zarrPath));
+                    } else {
+                        auto l0shape = source->levelShape(0);
+                        utils::ZarrMetadata meta;
+                        meta.version = utils::ZarrVersion::v3;
+                        meta.node_type = "array";
+                        meta.shape = {static_cast<size_t>(l0shape[0]),
+                                      static_cast<size_t>(l0shape[1]),
+                                      static_cast<size_t>(l0shape[2])};
+                        meta.chunks = {1024, 1024, 1024};
+                        meta.dtype = utils::ZarrDtype::uint8;
+                        meta.fill_value = 0;
+                        meta.chunk_key_encoding = "default";
+                        utils::ShardConfig sc;
+                        sc.sub_chunks = {128, 128, 128};
+                        sc.index_at_end = false;  // index at start for append-only writes
+                        meta.shard_config = std::move(sc);
+                        diskZarr = std::make_shared<utils::ZarrArray>(
+                            utils::ZarrArray::create(zarrPath, std::move(meta)));
+                    }
+                    fprintf(stderr, "[Volume] Network cold cache: %s\n", zarrPath.c_str());
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "[Volume] Failed to create network cold cache: %s\n", e.what());
+                }
             }
         }
     }
@@ -386,7 +427,7 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
         std::move(config),
         std::move(source),
         std::move(decompress),
-        std::move(diskStore));
+        std::move(diskZarr));
 }
 
 // ============================================================================
@@ -397,7 +438,7 @@ void Volume::ensureTieredCache() const
 {
     std::call_once(cacheOnce_, [this]() {
         auto* self = const_cast<Volume*>(this);
-        tieredCache_ = self->createTieredCache(self->pendingDiskStore_);
+        tieredCache_ = self->createTieredCache(self->pendingDiskZarr_);
     });
 }
 
@@ -412,14 +453,14 @@ void Volume::setCacheBudget(size_t hotBytes)
     cacheBudgetHot_ = hotBytes;
 }
 
-void Volume::setDiskStore(std::shared_ptr<vc::cache::DiskStore> store)
+void Volume::setDiskZarr(std::shared_ptr<utils::ZarrArray> zarr)
 {
     if (tieredCache_) {
-        fprintf(stderr, "[Volume] WARNING: setDiskStore() called after cache "
+        fprintf(stderr, "[Volume] WARNING: setDiskZarr() called after cache "
                         "already created — ignoring\n");
         return;
     }
-    pendingDiskStore_ = std::move(store);
+    pendingDiskZarr_ = std::move(zarr);
 }
 
 void Volume::setDiskCacheMaxBytes(size_t bytes)
