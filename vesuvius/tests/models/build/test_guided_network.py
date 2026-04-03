@@ -577,35 +577,16 @@ def test_build_dinov2_decoder_accepts_pixelshuffle_conv(tmp_path: Path):
     decoder = build_dinov2_decoder("pixelshuffle_conv", encoder, num_classes=2)
 
     features = torch.randn(1, encoder.embed_dim, 2, 2, 2)
-    input_image = torch.randn(1, 1, 16, 16, 16)
-    output = decoder(features, input_image=input_image)
+    output = decoder(features)
 
     assert isinstance(decoder, PixelShuffleConvDinov2Decoder)
     assert output.shape == (1, 2, 16, 16, 16)
     assert all(isinstance(stage[3], torch.nn.GroupNorm) for stage in decoder.decode)
     assert all(isinstance(stage[4], torch.nn.GELU) for stage in decoder.decode)
     assert decoder.decode[-1][2].out_channels > 2
-    assert isinstance(decoder.final_input_detail[1], torch.nn.GroupNorm)
-    assert isinstance(decoder.final_input_detail[2], torch.nn.GELU)
-    assert decoder.final_refine[0].in_channels > decoder.decode[-1][2].out_channels
+    assert decoder.final_refine[0].in_channels == decoder.decode[-1][2].out_channels
     assert len(decoder.final_refine) == 3
     assert decoder.final_refine[-1].kernel_size == (1, 1, 1)
-
-
-def test_pixelshuffle_conv_decoder_uses_original_input_detail_branch(tmp_path: Path):
-    checkpoint_path = tmp_path / "guide_backbone.pt"
-    _write_local_guide_checkpoint(checkpoint_path)
-    encoder = build_dinov2_backbone(str(checkpoint_path), input_channels=1, input_shape=(16, 16, 16))
-    decoder = build_dinov2_decoder("pixelshuffle_conv", encoder, num_classes=2)
-    features = torch.zeros(1, encoder.embed_dim, 2, 2, 2)
-
-    zero_input = torch.zeros(1, 1, 16, 16, 16)
-    ones_input = torch.ones(1, 1, 16, 16, 16)
-
-    zero_output = decoder(features, input_image=zero_input)
-    one_output = decoder(features, input_image=ones_input)
-
-    assert not torch.allclose(zero_output, one_output)
 
 
 def test_feature_encoder_guidance_backprop_updates_all_stage_tokenbooks(tmp_path: Path):
