@@ -1,6 +1,7 @@
 import torch
 from types import SimpleNamespace
 
+from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.train import BaseTrainer
 
 
@@ -49,3 +50,19 @@ def test_base_trainer_should_include_target_in_loss():
     assert trainer._should_include_target_in_loss("ink") is True
     assert trainer._should_include_target_in_loss("ink_skel") is False
     assert trainer._should_include_target_in_loss("is_unlabeled") is False
+
+
+def test_create_optimizer_adamw_honors_eps_override():
+    model = torch.nn.Linear(4, 2)
+    optimizer = create_optimizer(
+        {
+            "name": "adamw",
+            "learning_rate": 1e-3,
+            "weight_decay": 3e-5,
+            "eps": 1e-4,
+        },
+        model,
+    )
+
+    assert isinstance(optimizer, torch.optim.AdamW)
+    assert optimizer.defaults["eps"] == 1e-4
