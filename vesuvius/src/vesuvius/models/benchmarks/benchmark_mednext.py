@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import subprocess
+import sys
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -59,29 +62,47 @@ def _make_unet_mgr(patch_size: tuple[int, int, int]) -> SimpleNamespace:
     )
 
 
-def _make_mednext_mgr(patch_size: tuple[int, int, int], model_id: str) -> SimpleNamespace:
+def _make_mednext_mgr(
+    patch_size: tuple[int, int, int],
+    *,
+    architecture_type: str,
+    model_id: str,
+    width_factor: int = 1,
+) -> SimpleNamespace:
     return SimpleNamespace(
         targets={"surface": {"out_channels": 2, "activation": "none"}},
         train_patch_size=patch_size,
         train_batch_size=1,
         in_channels=1,
         autoconfigure=False,
-        model_name=f"mednext_benchmark_{model_id.lower()}",
+        model_name=f"mednext_benchmark_{architecture_type}_{model_id.lower()}_w{width_factor}",
         enable_deep_supervision=False,
         spacing=(1.0, 1.0, 1.0),
         model_config={
-            "architecture_type": "mednext_v1",
+            "architecture_type": architecture_type,
             "mednext_model_id": model_id,
             "mednext_kernel_size": 3,
+            "mednext_width_factor": width_factor,
         },
     )
 
 
-def _build_model(variant: str, patch_size: tuple[int, int, int], model_id: str, device: torch.device) -> torch.nn.Module:
+def _build_model(
+    variant: str,
+    patch_size: tuple[int, int, int],
+    model_id: str,
+    width_factor: int,
+    device: torch.device,
+) -> torch.nn.Module:
     if variant == "unet":
         mgr = _make_unet_mgr(patch_size)
-    elif variant == "mednext_v1":
-        mgr = _make_mednext_mgr(patch_size, model_id)
+    elif variant in {"mednext_v1", "mednext_v2"}:
+        mgr = _make_mednext_mgr(
+            patch_size,
+            architecture_type=variant,
+            model_id=model_id,
+            width_factor=width_factor,
+        )
     else:
         raise ValueError(f"Unknown benchmark variant {variant!r}")
     return NetworkFromConfig(mgr).to(device)
@@ -100,10 +121,11 @@ def _run_variant(
     *,
     patch_size: tuple[int, int, int],
     model_id: str,
+    width_factor: int,
     device: torch.device,
     iterations: int,
 ) -> dict[str, float | str | None]:
-    model = _build_model(variant, patch_size, model_id, device)
+    model = _build_model(variant, patch_size, model_id, width_factor, device)
     inputs = torch.randn(1, 1, *patch_size, device=device)
     labels = torch.randint(0, 2, (1, *patch_size), device=device)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
@@ -162,22 +184,68 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--mednext-model-id", default="B")
     parser.add_argument("--output-json", type=Path, default=None)
+    parser.add_argument("--single-variant", default=None)
+    parser.add_argument("--single-patch", default=None)
+    parser.add_argument("--single-width-factor", type=int, default=1)
     args = parser.parse_args()
 
     device = torch.device(args.device)
+
+    if args.single_variant is not None:
+        if args.single_patch is None:
+            raise ValueError("--single-patch is required when --single-variant is set")
+        patch_size = _parse_patch_sizes([args.single_patch])[0]
+        capture = io.StringIO()
+        with redirect_stdout(capture):
+            result = _run_variant(
+                args.single_variant,
+                patch_size=patch_size,
+                model_id=args.mednext_model_id,
+                width_factor=args.single_width_factor,
+                device=device,
+                iterations=args.iterations,
+            )
+        print(json.dumps(result))
+        return
+
     patch_sizes = _parse_patch_sizes(args.patch_size)
+    variants = [
+        ("unet", "B", 1, "unet"),
+        ("mednext_v1", "B", 1, "mednext_v1_b"),
+        ("mednext_v2", "L", 1, "mednext_v2_l"),
+        ("mednext_v2", "L", 2, "mednext_v2_l_width2"),
+        ("mednext_v2", "B", 1, "mednext_v2_b"),
+    ]
 
     results = {}
     for patch_size in patch_sizes:
         patch_key = "x".join(str(v) for v in patch_size)
-        results[patch_key] = {
-            "unet": _run_variant("unet", patch_size=patch_size, model_id=args.mednext_model_id, device=device, iterations=args.iterations),
-            "mednext_v1": _run_variant("mednext_v1", patch_size=patch_size, model_id=args.mednext_model_id, device=device, iterations=args.iterations),
-        }
+        patch_arg = ",".join(str(v) for v in patch_size)
+        patch_results = {}
+        for variant, model_id, width_factor, label in variants:
+            cmd = [
+                sys.executable,
+                "-m",
+                "vesuvius.models.benchmarks.benchmark_mednext",
+                "--device",
+                str(device),
+                "--iterations",
+                str(args.iterations),
+                "--single-variant",
+                variant,
+                "--single-patch",
+                patch_arg,
+                "--mednext-model-id",
+                model_id,
+                "--single-width-factor",
+                str(width_factor),
+            ]
+            completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            patch_results[label] = json.loads(completed.stdout)
+        results[patch_key] = patch_results
 
     payload = {
         "device": str(device),
-        "mednext_model_id": args.mednext_model_id,
         "results": results,
     }
     print(json.dumps(payload, indent=2))
