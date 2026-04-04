@@ -213,3 +213,45 @@ def test_ps256_mednext_v1_medial_config_loads_and_builds():
     assert list(mgr.targets.keys()) == ["surface"]
     assert model.final_config["architecture_type"] == "mednext_v1"
     assert model.final_config["mednext_model_id"] == "B"
+
+
+def test_ps128_mednext_v2_l_medial_config_loads_and_builds():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps128_mednext_v2_l_medial.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (128, 128, 128)
+    assert list(mgr.targets.keys()) == ["surface"]
+    assert model.final_config["architecture_type"] == "mednext_v2"
+    assert model.final_config["mednext_model_id"] == "L"
+    assert model.final_config["mednext_grn"] is True
+
+
+def test_ps192_mednext_v2_l_medial_config_loads_and_builds():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps192_mednext_v2_l_medial.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (192, 192, 192)
+    assert list(mgr.targets.keys()) == ["surface"]
+    assert model.final_config["architecture_type"] == "mednext_v2"
+    assert model.final_config["mednext_model_id"] == "L"
+
+
+def test_ps128_mednext_v2_b_medial_config_loads_and_builds():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps128_mednext_v2_b_medial.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (128, 128, 128)
+    assert list(mgr.targets.keys()) == ["surface"]
+    assert model.final_config["architecture_type"] == "mednext_v2"
+    assert model.final_config["mednext_model_id"] == "B"
+
+
+def test_ps128_mednext_v2_l_width2_medial_config_loads_and_builds():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps128_mednext_v2_l_width2_medial.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (128, 128, 128)
+    assert list(mgr.targets.keys()) == ["surface"]
+    assert model.final_config["architecture_type"] == "mednext_v2"
+    assert model.final_config["mednext_model_id"] == "L"
+    assert model.final_config["mednext_width_factor"] == 2

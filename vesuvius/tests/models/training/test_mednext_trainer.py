@@ -188,3 +188,61 @@ def test_initialize_training_compiles_mednext_model_before_ddp_wrap(tmp_path: Pa
     trainer._initialize_training()
 
     assert call_order == ["compile", "wrap"]
+
+
+def test_mednext_v2_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    mgr = _make_mgr(data_root, architecture_type="mednext_v2", mednext_model_id="L")
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model()
+    checkpoint_path = tmp_path / "mednext_v2_model.pth"
+    torch.save({"model_config": model.final_config, "model": model.state_dict()}, checkpoint_path)
+
+    output_dir = tmp_path / "inference_out_v2"
+    output_dir.mkdir()
+    inferer = Inferer(
+        model_path=str(checkpoint_path),
+        input_dir=str(data_root / "images" / "volume1.zarr"),
+        output_dir=str(output_dir),
+        input_format="zarr",
+        do_tta=False,
+        device="cpu",
+        num_dataloader_workers=0,
+        model_type="train_py",
+    )
+
+    model_info = inferer._load_train_py_model(checkpoint_path)
+    output = model_info["network"](torch.randn(1, 1, 32, 32, 32))
+
+    assert isinstance(output, dict)
+    assert set(output.keys()) == {"surface"}
+    assert output["surface"].shape == (1, 2, 32, 32, 32)
+    assert model_info["network"].final_config["architecture_type"] == "mednext_v2"
+    assert model_info["network"].final_config["mednext_model_id"] == "L"
+
+
+def test_initialize_training_compiles_mednext_v2_model_before_ddp_wrap(tmp_path: Path, monkeypatch):
+    mgr = _make_mgr(tmp_path, architecture_type="mednext_v2", mednext_model_id="B", compile_policy="module")
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    call_order: list[str] = []
+    dummy_dataset = _DummyDataset()
+
+    monkeypatch.setattr(trainer, "_configure_dataset", lambda is_training: dummy_dataset)
+    monkeypatch.setattr(trainer, "_build_dataset_for_mgr", lambda mgr, is_training: dummy_dataset)
+    monkeypatch.setattr(trainer, "_prepare_sample", lambda sample, is_training: sample)
+    monkeypatch.setattr(trainer, "_get_optimizer", lambda model: torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.1))
+    monkeypatch.setattr(
+        trainer,
+        "_get_scheduler",
+        lambda optimizer: (torch.optim.lr_scheduler.StepLR(optimizer, step_size=1), False),
+    )
+    monkeypatch.setattr(trainer, "_get_scaler", lambda *args, **kwargs: object())
+    monkeypatch.setattr(trainer, "_configure_dataloaders", lambda train_dataset, val_dataset: ([], [], [0], [0]))
+    monkeypatch.setattr(trainer, "_build_loss", lambda: {})
+    monkeypatch.setattr(trainer, "_initialize_ema_model", lambda model: None)
+    monkeypatch.setattr(trainer, "_wrap_model_for_distributed_training", lambda model: call_order.append("wrap") or model)
+    monkeypatch.setattr(trainer, "_maybe_compile_model", lambda model: call_order.append("compile") or model)
+
+    trainer._initialize_training()
+
+    assert call_order == ["compile", "wrap"]
