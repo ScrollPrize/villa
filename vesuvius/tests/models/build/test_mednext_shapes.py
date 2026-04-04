@@ -123,3 +123,35 @@ def test_network_from_config_mednext_requires_explicit_model_id():
 
     with pytest.raises(ValueError, match="mednext_model_id"):
         NetworkFromConfig(mgr)
+
+
+def test_network_from_config_mednext_v2_uses_instance_norm_and_grn():
+    mgr = _make_mgr(architecture_type="mednext_v2", mednext_model_id="L")
+    model = NetworkFromConfig(mgr)
+
+    assert model.final_config["architecture_type"] == "mednext_v2"
+    assert model.final_config["mednext_norm_type"] == "instance"
+    assert model.final_config["mednext_grn"] is True
+    first_block = model.shared_encoder.enc_block_0[0]
+    assert isinstance(first_block.norm, torch.nn.InstanceNorm3d)
+    assert hasattr(first_block, "grn_gamma")
+    assert hasattr(first_block, "grn_beta")
+
+
+def test_network_from_config_mednext_v2_width_factor_doubles_base_channels():
+    model_base = NetworkFromConfig(_make_mgr(architecture_type="mednext_v2", mednext_model_id="B"))
+    model_wide = NetworkFromConfig(
+        SimpleNamespace(
+            **{
+                **_make_mgr(architecture_type="mednext_v2", mednext_model_id="B").__dict__,
+                "model_config": {
+                    **_make_mgr(architecture_type="mednext_v2", mednext_model_id="B").model_config,
+                    "mednext_width_factor": 2,
+                },
+            }
+        )
+    )
+
+    assert model_base.final_config["mednext_width_factor"] == 1
+    assert model_wide.final_config["mednext_width_factor"] == 2
+    assert model_wide.final_config["mednext_base_channels"] == 2 * model_base.final_config["mednext_base_channels"]

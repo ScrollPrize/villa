@@ -1169,10 +1169,10 @@ class NetworkFromConfig(nn.Module):
             raise ValueError("MedNeXt support is currently limited to 3D models in vesuvius")
 
         architecture_name = str(self.architecture_type).strip().lower()
-        if architecture_name != "mednext_v1":
+        if architecture_name not in {"mednext_v1", "mednext_v2"}:
             raise ValueError(
                 f"Unsupported mednext architecture_type {self.architecture_type!r}. "
-                "Stage 2 currently supports only 'mednext_v1'."
+                "Expected one of {'mednext_v1', 'mednext_v2'}."
             )
 
         model_id = model_config.get("mednext_model_id")
@@ -1180,21 +1180,36 @@ class NetworkFromConfig(nn.Module):
             raise ValueError("mednext_model_id must be explicitly set for mednext architectures")
 
         base_cfg = get_mednext_v1_config(model_id)
-        kernel_size = int(model_config.get("mednext_kernel_size", 3))
+        width_factor = int(model_config.get("mednext_width_factor", 1))
+        if width_factor not in {1, 2}:
+            raise ValueError(f"mednext_width_factor must be 1 or 2, got {width_factor}")
+        if architecture_name == "mednext_v1" and width_factor != 1:
+            raise ValueError("mednext_width_factor is only supported for mednext_v2")
+
+        if architecture_name == "mednext_v2":
+            if "mednext_kernel_size" in model_config and int(model_config["mednext_kernel_size"]) != 3:
+                raise ValueError("mednext_v2 fixes the MedNeXt kernel size to 3")
+            kernel_size = 3
+            norm_type = "instance"
+            use_grn = True
+        else:
+            kernel_size = int(model_config.get("mednext_kernel_size", 3))
+            norm_type = "group"
+            use_grn = False
         checkpoint_style = model_config.get("mednext_checkpoint_style", base_cfg["checkpoint_style"])
         if checkpoint_style == "":
             checkpoint_style = None
 
         resolved_cfg = {
             "model_id": base_cfg["model_id"],
-            "base_channels": int(base_cfg["n_channels"]),
+            "base_channels": int(base_cfg["n_channels"]) * width_factor,
             "exp_r": list(base_cfg["exp_r"]) if isinstance(base_cfg["exp_r"], (list, tuple)) else [int(base_cfg["exp_r"])] * 9,
             "block_counts": list(base_cfg["block_counts"]),
             "kernel_size": kernel_size,
             "checkpoint_style": checkpoint_style,
-            "norm_type": "group",
-            "grn": False,
-            "width_factor": 1,
+            "norm_type": norm_type,
+            "grn": use_grn,
+            "width_factor": width_factor,
         }
 
         self.shared_encoder = MedNeXtEncoder(
