@@ -1243,6 +1243,9 @@ class NetworkFromConfig(nn.Module):
             target_info["out_channels"] = out_channels
             self._register_target_projection(target_name, target_info, model_config)
             use_separate = target_info.get("separate_decoder", separate_decoders_default)
+            # Persist the resolved per-target decoder layout so strict checkpoint
+            # reloads can rebuild mixed shared/separate MedNeXt models exactly.
+            target_info["separate_decoder"] = bool(use_separate)
             if use_separate:
                 tasks_using_separate.add(target_name)
             else:

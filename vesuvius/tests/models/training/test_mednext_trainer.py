@@ -9,6 +9,7 @@ import zarr
 import numpy as np
 from torch.utils.data import DataLoader
 
+from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.run.inference import Inferer
 from vesuvius.models.training.train import BaseTrainer
 
@@ -41,11 +42,22 @@ def _make_mgr(
     architecture_type: str = "mednext_v1",
     mednext_model_id: str = "S",
     compile_policy: str = "off",
+    targets: dict | None = None,
+    enable_deep_supervision: bool = False,
+    separate_decoders: bool | None = None,
 ) -> SimpleNamespace:
+    model_config = {
+        "architecture_type": architecture_type,
+        "mednext_model_id": mednext_model_id,
+        "mednext_kernel_size": 3,
+    }
+    if separate_decoders is not None:
+        model_config["separate_decoders"] = separate_decoders
+
     return SimpleNamespace(
         gpu_ids=None,
         use_ddp=False,
-        targets={
+        targets=targets or {
             "surface": {
                 "out_channels": 2,
                 "activation": "none",
@@ -58,7 +70,7 @@ def _make_mgr(
         train_batch_size=1,
         in_channels=1,
         autoconfigure=False,
-        enable_deep_supervision=False,
+        enable_deep_supervision=enable_deep_supervision,
         spacing=(1.0, 1.0, 1.0),
         data_path=data_root,
         min_labeled_ratio=0.0,
@@ -96,11 +108,7 @@ def _make_mgr(
         ckpt_out_base=data_root / "ckpts",
         checkpoint_path=None,
         load_weights_only=False,
-        model_config={
-            "architecture_type": architecture_type,
-            "mednext_model_id": mednext_model_id,
-            "mednext_kernel_size": 3,
-        },
+        model_config=model_config,
     )
 
 
@@ -219,6 +227,90 @@ def test_mednext_v2_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_p
     assert output["surface"].shape == (1, 2, 32, 32, 32)
     assert model_info["network"].final_config["architecture_type"] == "mednext_v2"
     assert model_info["network"].final_config["mednext_model_id"] == "L"
+
+
+def test_mednext_v1_deep_supervision_checkpoint_roundtrip_loads_plain_inference_output(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    mgr = _make_mgr(data_root, enable_deep_supervision=True)
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model()
+    checkpoint_path = tmp_path / "mednext_ds_model.pth"
+    torch.save({"model_config": model.final_config, "model": model.state_dict()}, checkpoint_path)
+
+    output_dir = tmp_path / "inference_out_ds"
+    output_dir.mkdir()
+    inferer = Inferer(
+        model_path=str(checkpoint_path),
+        input_dir=str(data_root / "images" / "volume1.zarr"),
+        output_dir=str(output_dir),
+        input_format="zarr",
+        do_tta=False,
+        device="cpu",
+        num_dataloader_workers=0,
+        model_type="train_py",
+    )
+
+    model_info = inferer._load_train_py_model(checkpoint_path)
+    output = model_info["network"](torch.randn(1, 1, 32, 32, 32))
+
+    assert isinstance(output, dict)
+    assert isinstance(output["surface"], torch.Tensor)
+    assert output["surface"].shape == (1, 2, 32, 32, 32)
+    assert model_info["network"].final_config["enable_deep_supervision"] is True
+
+
+def test_mednext_mixed_decoder_checkpoint_roundtrip_preserves_layout(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    targets = {
+        "surface": {
+            "out_channels": 2,
+            "activation": "none",
+            "losses": [{"name": "nnUNet_DC_and_CE_loss", "weight": 1.0}],
+            "separate_decoder": True,
+        },
+        "tissue": {
+            "out_channels": 1,
+            "activation": "none",
+            "losses": [{"name": "nnUNet_DC_and_CE_loss", "weight": 1.0}],
+        },
+    }
+    mgr = _make_mgr(
+        data_root,
+        targets=targets,
+        separate_decoders=False,
+    )
+    model = NetworkFromConfig(mgr)
+    assert model.shared_decoder is not None
+    assert sorted(model.task_decoders.keys()) == ["surface"]
+    assert sorted(model.task_heads.keys()) == ["tissue"]
+
+    checkpoint_path = tmp_path / "mednext_mixed_model.pth"
+    torch.save({"model_config": model.final_config, "model": model.state_dict()}, checkpoint_path)
+
+    output_dir = tmp_path / "inference_out_mixed"
+    output_dir.mkdir()
+    inferer = Inferer(
+        model_path=str(checkpoint_path),
+        input_dir=str(data_root / "images" / "volume1.zarr"),
+        output_dir=str(output_dir),
+        input_format="zarr",
+        do_tta=False,
+        device="cpu",
+        num_dataloader_workers=0,
+        model_type="train_py",
+    )
+
+    model_info = inferer._load_train_py_model(checkpoint_path)
+    loaded = model_info["network"]
+    output = loaded(torch.randn(1, 1, 32, 32, 32))
+
+    assert isinstance(output, dict)
+    assert set(output.keys()) == {"surface", "tissue"}
+    assert loaded.shared_decoder is not None
+    assert sorted(loaded.task_decoders.keys()) == ["surface"]
+    assert sorted(loaded.task_heads.keys()) == ["tissue"]
+    assert loaded.final_config["targets"]["surface"]["separate_decoder"] is True
+    assert loaded.final_config["targets"]["tissue"]["separate_decoder"] is False
 
 
 def test_initialize_training_compiles_mednext_v2_model_before_ddp_wrap(tmp_path: Path, monkeypatch):
