@@ -17,6 +17,7 @@ def create_optimizer(optimizer_config, model):
     optim_name = optimizer_config.get('name', 'Adam')
     learning_rate = optimizer_config.get('learning_rate', 1e-3)
     weight_decay = optimizer_config.get('weight_decay', 0)
+    eps = optimizer_config.get('eps', None)
     optim_name = optim_name.lower()
 
     if optim_name == 'adadelta':
@@ -29,15 +30,23 @@ def create_optimizer(optimizer_config, model):
                                   weight_decay=weight_decay)
     elif optim_name == 'adamw':
         betas = tuple(optimizer_config.get('betas', (0.9, 0.999)))
-        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, betas=betas,
-                                weight_decay=weight_decay)
+        adamw_kwargs = {
+            'lr': learning_rate,
+            'betas': betas,
+            'weight_decay': weight_decay,
+        }
+        if eps is not None:
+            adamw_kwargs['eps'] = eps
+        optimizer = optim.AdamW(model.parameters(), **adamw_kwargs)
     elif optim_name == 'sparseadam':
         betas = tuple(optimizer_config.get('betas', (0.9, 0.999)))
         optimizer = optim.SparseAdam(model.parameters(), lr=learning_rate, betas=betas)
     elif optim_name == 'adamax':
         betas = tuple(optimizer_config.get('betas', (0.9, 0.999)))
-        optimizer = optim.Adamax(model.parameters(), lr=learning_rate, betas=betas,
-                                 weight_decay=weight_decay)
+        adamax_kwargs = {'lr': learning_rate, 'betas': betas, 'weight_decay': weight_decay}
+        if eps is not None:
+            adamax_kwargs['eps'] = eps
+        optimizer = optim.Adamax(model.parameters(), **adamax_kwargs)
     elif optim_name == 'asgd':
         lambd = optimizer_config.get('lambd', 0.0001)
         alpha = optimizer_config.get('alpha', 0.75)
@@ -61,8 +70,10 @@ def create_optimizer(optimizer_config, model):
                                 weight_decay=weight_decay)
     elif optim_name == 'radam':
         betas = tuple(optimizer_config.get('betas', (0.9, 0.999)))
-        optimizer = optim.RAdam(model.parameters(), lr=learning_rate, betas=betas,
-                                weight_decay=weight_decay)
+        radam_kwargs = {'lr': learning_rate, 'betas': betas, 'weight_decay': weight_decay}
+        if eps is not None:
+            radam_kwargs['eps'] = eps
+        optimizer = optim.RAdam(model.parameters(), **radam_kwargs)
     elif optim_name == 'rmsprop':
         alpha = optimizer_config.get('alpha', 0.99)
         optimizer = optim.RMSprop(model.parameters(), lr=learning_rate, alpha=alpha,
@@ -96,7 +107,9 @@ def create_optimizer(optimizer_config, model):
 
     else:  # Adam is default
         betas = tuple(optimizer_config.get('betas', (0.9, 0.999)))
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate, betas=betas,
-                               weight_decay=weight_decay)
+        adam_kwargs = {'lr': learning_rate, 'betas': betas, 'weight_decay': weight_decay}
+        if eps is not None:
+            adam_kwargs['eps'] = eps
+        optimizer = optim.Adam(model.parameters(), **adam_kwargs)
 
     return optimizer

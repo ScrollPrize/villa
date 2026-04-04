@@ -1246,6 +1246,17 @@ class BaseTrainer:
             'learning_rate': self.mgr.initial_lr,
             'weight_decay': self.mgr.weight_decay
         }
+        tr_configs = getattr(self.mgr, 'tr_configs', {}) or {}
+        if 'betas' in tr_configs:
+            optimizer_config['betas'] = tuple(tr_configs['betas'])
+        if 'eps' in tr_configs:
+            optimizer_config['eps'] = float(tr_configs['eps'])
+        if 'momentum' in tr_configs:
+            optimizer_config['momentum'] = float(tr_configs['momentum'])
+        if 'dampening' in tr_configs:
+            optimizer_config['dampening'] = float(tr_configs['dampening'])
+        if 'nesterov' in tr_configs:
+            optimizer_config['nesterov'] = bool(tr_configs['nesterov'])
 
         return create_optimizer(optimizer_config, model)
 
