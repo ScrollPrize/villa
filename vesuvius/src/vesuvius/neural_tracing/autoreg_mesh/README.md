@@ -11,6 +11,8 @@ This package implements a first MVP for tifxyz quad-lattice continuation from:
 - Tifxyz is treated as a regular 2D lattice of 3D vertices.
 - Training examples come from split conditioning on one wrap per sample.
 - The prompt is a narrow frontier band from the conditioning side.
+- By default the package serializes the full upsampled tifxyz lattice.
+- For very large stored-scale surfaces, set `use_stored_resolution_only=true` to split and serialize directly on the stored tifxyz lattice instead of materializing the full upsampled grid first.
 - The continuation is serialized in deterministic frontier order:
   - `left` / `right`: emit columns from the frontier outward
   - `up` / `down`: emit rows from the frontier outward
@@ -49,6 +51,15 @@ uv run --extra models --extra tests python -m vesuvius.neural_tracing.autoreg_me
 ```
 
 The config must include a local `dinov2_backbone` checkpoint path plus the usual dataset paths for `EdtSegDataset`.
+
+For datasets whose tifxyz `scale` is much smaller than `1.0` per lattice axis, the practical starting point is:
+
+```json
+{
+  "use_stored_resolution_only": true,
+  "surface_downsample_factor": 1
+}
+```
 
 ## Inference Example
 

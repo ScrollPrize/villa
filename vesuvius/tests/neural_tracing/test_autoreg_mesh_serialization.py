@@ -3,11 +3,17 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from vesuvius.neural_tracing.autoreg_mesh.dataset import (
+    create_split_conditioning_from_surface_grid,
+    extract_wrap_world_surface_stored,
+)
 from vesuvius.neural_tracing.autoreg_mesh.serialization import (
     deserialize_continuation_grid,
     deserialize_full_grid,
     serialize_split_conditioning_example,
 )
+from vesuvius.neural_tracing.datasets.common import ChunkPatch
+from vesuvius.tifxyz import Tifxyz
 
 
 def _make_surface(rows: int, cols: int) -> np.ndarray:
@@ -115,3 +121,50 @@ def test_frontier_prompt_band_is_extracted_without_default_downsampling() -> Non
         direction="left",
     )
     np.testing.assert_allclose(full_grid, np.concatenate([expected_prompt, masked], axis=1))
+
+
+def test_stored_surface_extraction_and_split_preserve_stored_lattice_shape() -> None:
+    row_axis = np.arange(4, dtype=np.float32)[:, None]
+    col_axis = np.arange(6, dtype=np.float32)[None, :]
+    row_grid = np.broadcast_to(row_axis, (4, 6))
+    col_grid = np.broadcast_to(col_axis, (4, 6))
+    x = 10.0 + col_grid
+    y = 20.0 + row_grid
+    z = 30.0 + (row_grid * 2.0) + col_grid
+    seg = Tifxyz(
+        _x=x.astype(np.float32),
+        _y=y.astype(np.float32),
+        _z=z.astype(np.float32),
+        uuid="stored_test",
+        _scale=(0.5, 0.5),
+        bbox=(float(x.min()), float(y.min()), float(z.min()), float(x.max()), float(y.max()), float(z.max())),
+        _mask=np.ones((4, 6), dtype=bool),
+        resolution="stored",
+    )
+    patch = ChunkPatch(
+        chunk_id=(0, 0, 0),
+        volume=np.zeros((64, 64, 64), dtype=np.uint8),
+        scale=0,
+        world_bbox=(0.0, 64.0, 0.0, 64.0, 0.0, 64.0),
+        wraps=[{"segment": seg, "bbox_2d": (0, 3, 0, 5), "wrap_id": 47, "segment_idx": 0}],
+        segments=[seg],
+    )
+
+    stored_surface = extract_wrap_world_surface_stored(patch, patch.wraps[0], require_all_valid=True)
+    assert stored_surface is not None
+    assert stored_surface.shape == (4, 6, 3)
+
+    dataset_stub = type("DatasetStub", (), {"crop_size": (64, 64, 64), "_cond_percent_min": 0.5, "_cond_percent_max": 0.5})()
+    conditioning = create_split_conditioning_from_surface_grid(
+        dataset_stub,
+        idx=0,
+        patch_idx=0,
+        wrap_idx=0,
+        patch=patch,
+        surface_zyx=stored_surface,
+        conditioning_percent=0.5,
+        cond_direction="left",
+    )
+    assert conditioning is not None
+    assert conditioning["cond_zyxs_unperturbed"].shape == (4, 3, 3)
+    assert conditioning["masked_zyxs"].shape == (4, 3, 3)

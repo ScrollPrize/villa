@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any
+import random
 
 import numpy as np
 import torch
@@ -13,7 +14,7 @@ from vesuvius.neural_tracing.autoreg_mesh.serialization import (
     IGNORE_INDEX,
     serialize_split_conditioning_example,
 )
-from vesuvius.neural_tracing.datasets.common import _read_volume_crop_from_patch
+from vesuvius.neural_tracing.datasets.common import _read_volume_crop_from_patch, _trim_to_world_bbox
 from vesuvius.neural_tracing.datasets.conditioning import create_split_conditioning
 from vesuvius.neural_tracing.datasets.dataset_defaults import (
     setdefault_rowcol_cond_dataset_config,
@@ -31,6 +32,157 @@ def _lookup_cached_vol_tokens(cache: Any, sample_key):
     if hasattr(cache, "get"):
         return cache.get(sample_key, None)
     return None
+
+
+def _normalize_surface_downsample_factor(surface_downsample_factor) -> tuple[int, int]:
+    if isinstance(surface_downsample_factor, int):
+        factor = max(1, int(surface_downsample_factor))
+        return factor, factor
+    if not isinstance(surface_downsample_factor, (list, tuple)) or len(surface_downsample_factor) != 2:
+        raise ValueError(
+            "surface_downsample_factor must be an int or length-2 sequence when used in dataset planning, "
+            f"got {surface_downsample_factor!r}"
+        )
+    return max(1, int(surface_downsample_factor[0])), max(1, int(surface_downsample_factor[1]))
+
+
+def _maybe_collapse_downsample_factor(factor_row: int, factor_col: int) -> int | tuple[int, int]:
+    if int(factor_row) == int(factor_col):
+        return int(factor_row)
+    return (int(factor_row), int(factor_col))
+
+
+def extract_wrap_world_surface_stored(patch, wrap: dict, *, require_all_valid: bool = True) -> np.ndarray | None:
+    """Extract one wrap directly on the stored tifxyz lattice in world ZYX coordinates."""
+    seg = wrap["segment"]
+    r_min, r_max, c_min, c_max = wrap["bbox_2d"]
+
+    seg_h, seg_w = seg._valid_mask.shape
+    r_min = max(0, int(r_min))
+    r_max = min(seg_h - 1, int(r_max))
+    c_min = max(0, int(c_min))
+    c_max = min(seg_w - 1, int(c_max))
+    if r_max < r_min or c_max < c_min:
+        return None
+
+    seg.use_stored_resolution()
+    x_s, y_s, z_s, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
+    if x_s.size == 0:
+        return None
+    if valid_s is not None:
+        if require_all_valid and not bool(valid_s.all()):
+            return None
+        if not require_all_valid and not bool(valid_s.any()):
+            return None
+
+    trimmed = _trim_to_world_bbox(
+        np.asarray(x_s, dtype=np.float32),
+        np.asarray(y_s, dtype=np.float32),
+        np.asarray(z_s, dtype=np.float32),
+        patch.world_bbox,
+    )
+    if trimmed is None:
+        return None
+    x_trim, y_trim, z_trim = trimmed
+    return np.stack([z_trim, y_trim, x_trim], axis=-1).astype(np.float32, copy=False)
+
+
+def create_split_conditioning_from_surface_grid(
+    dataset,
+    *,
+    idx: int,
+    patch_idx: int,
+    wrap_idx: int,
+    patch,
+    surface_zyx: np.ndarray,
+    conditioning_percent: float | None = None,
+    cond_direction: str | None = None,
+) -> dict | None:
+    """Mirror create_split_conditioning using a caller-provided surface grid."""
+    _ = idx
+    wrap = patch.wraps[wrap_idx]
+    seg = wrap["segment"]
+    r_min, r_max, c_min, c_max = wrap["bbox_2d"]
+
+    seg_h, seg_w = seg._valid_mask.shape
+    r_min = max(0, int(r_min))
+    r_max = min(seg_h - 1, int(r_max))
+    c_min = max(0, int(c_min))
+    c_max = min(seg_w - 1, int(c_max))
+    if r_max < r_min or c_max < c_min:
+        return None
+
+    surface = np.asarray(surface_zyx, dtype=np.float32)
+    if surface.ndim != 3 or surface.shape[-1] != 3:
+        raise ValueError(f"surface_zyx must have shape [H, W, 3], got {surface.shape!r}")
+
+    h_grid, w_grid = surface.shape[:2]
+    if h_grid < 2 and w_grid < 2:
+        return None
+
+    valid_directions = []
+    if w_grid >= 2:
+        valid_directions.extend(["left", "right"])
+    if h_grid >= 2:
+        valid_directions.extend(["up", "down"])
+    if not valid_directions:
+        return None
+
+    if conditioning_percent is None:
+        conditioning_percent = random.uniform(dataset._cond_percent_min, dataset._cond_percent_max)
+    conditioning_percent = float(conditioning_percent)
+    if cond_direction is None:
+        cond_direction = random.choice(valid_directions)
+    cond_direction = str(cond_direction).lower()
+    if cond_direction not in valid_directions:
+        return None
+
+    r_cond = int(round(h_grid * conditioning_percent))
+    c_cond = int(round(w_grid * conditioning_percent))
+    if h_grid >= 2:
+        r_cond = min(max(r_cond, 1), h_grid - 1)
+    if w_grid >= 2:
+        c_cond = min(max(c_cond, 1), w_grid - 1)
+
+    if cond_direction == "left":
+        cond_zyxs = surface[:, :c_cond, :]
+        masked_zyxs = surface[:, c_cond:, :]
+    elif cond_direction == "right":
+        split_col = w_grid - c_cond
+        cond_zyxs = surface[:, split_col:, :]
+        masked_zyxs = surface[:, :split_col, :]
+    elif cond_direction == "up":
+        cond_zyxs = surface[:r_cond, :, :]
+        masked_zyxs = surface[r_cond:, :, :]
+    elif cond_direction == "down":
+        split_row = h_grid - r_cond
+        cond_zyxs = surface[split_row:, :, :]
+        masked_zyxs = surface[:split_row, :, :]
+    else:
+        return None
+
+    if cond_zyxs.size == 0 or masked_zyxs.size == 0:
+        return None
+
+    crop_size = dataset.crop_size
+    z_min, _, y_min, _, x_min, _ = patch.world_bbox
+    min_corner = np.round([z_min, y_min, x_min]).astype(np.int64)
+    max_corner = min_corner + np.asarray(crop_size, dtype=np.int64)
+
+    return {
+        "wrap": wrap,
+        "seg": seg,
+        "r_min": r_min,
+        "r_max": r_max,
+        "c_min": c_min,
+        "c_max": c_max,
+        "conditioning_percent": conditioning_percent,
+        "cond_direction": cond_direction,
+        "cond_zyxs_unperturbed": cond_zyxs.copy(),
+        "masked_zyxs": masked_zyxs.copy(),
+        "min_corner": min_corner,
+        "max_corner": max_corner,
+    }
 
 
 class AutoregMeshDataset(Dataset):
@@ -69,31 +221,54 @@ class AutoregMeshDataset(Dataset):
     def export_patch_metadata(self):
         return self._base_dataset.export_patch_metadata()
 
-    def _resolve_surface_downsample_factor(self, conditioning: dict) -> int | tuple[int, int]:
-        factor = self.config["surface_downsample_factor"]
-        if not bool(self.config.get("use_stored_resolution_only", False)):
-            return factor
-        seg = conditioning.get("seg")
+    def _resolve_surface_sampling_plan(self, wrap: dict) -> tuple[bool, int | tuple[int, int]]:
+        factor_row, factor_col = _normalize_surface_downsample_factor(self.config["surface_downsample_factor"])
+        seg = wrap.get("segment")
         scale = getattr(seg, "_scale", None)
         if scale is None:
-            return factor
+            return bool(self.config.get("use_stored_resolution_only", False)), _maybe_collapse_downsample_factor(
+                factor_row,
+                factor_col,
+            )
+
         row_scale = float(scale[0])
         col_scale = float(scale[1])
-        row_factor = max(1, int(round(1.0 / max(row_scale, 1e-6))))
-        col_factor = max(1, int(round(1.0 / max(col_scale, 1e-6))))
-        factor_row, factor_col = row_factor, col_factor
-        if isinstance(factor, int):
-            factor_row = max(factor_row, int(factor))
-            factor_col = max(factor_col, int(factor))
-        else:
-            factor_row = max(factor_row, int(factor[0]))
-            factor_col = max(factor_col, int(factor[1]))
-        return (factor_row, factor_col)
+        use_stored_only = bool(self.config.get("use_stored_resolution_only", False))
+        can_approximate_requested_full_factor_from_stored = (
+            (factor_row * row_scale) >= 1.0 and
+            (factor_col * col_scale) >= 1.0
+        )
+        use_stored_surface = use_stored_only or can_approximate_requested_full_factor_from_stored
+        if not use_stored_surface:
+            return False, _maybe_collapse_downsample_factor(factor_row, factor_col)
+
+        stored_factor_row = max(1, int(round(factor_row * row_scale)))
+        stored_factor_col = max(1, int(round(factor_col * col_scale)))
+        return True, _maybe_collapse_downsample_factor(stored_factor_row, stored_factor_col)
 
     def _build_example(self, idx: int) -> dict | None:
         patch_idx, wrap_idx = self.sample_index[int(idx)]
         patch = self.patches[patch_idx]
-        conditioning = create_split_conditioning(self._base_dataset, int(idx), patch_idx, wrap_idx, patch)
+        wrap = patch.wraps[wrap_idx]
+        use_stored_surface, effective_surface_downsample_factor = self._resolve_surface_sampling_plan(wrap)
+        if use_stored_surface:
+            surface_stored = extract_wrap_world_surface_stored(
+                patch,
+                wrap,
+                require_all_valid=True,
+            )
+            if surface_stored is None:
+                return None
+            conditioning = create_split_conditioning_from_surface_grid(
+                self._base_dataset,
+                idx=int(idx),
+                patch_idx=patch_idx,
+                wrap_idx=wrap_idx,
+                patch=patch,
+                surface_zyx=surface_stored,
+            )
+        else:
+            conditioning = create_split_conditioning(self._base_dataset, int(idx), patch_idx, wrap_idx, patch)
         if conditioning is None:
             return None
 
@@ -112,8 +287,8 @@ class AutoregMeshDataset(Dataset):
             patch_size=self.config["patch_size"],
             offset_num_bins=self.config["offset_num_bins"],
             frontier_band_width=int(self.config["frontier_band_width"]),
-            surface_downsample_factor=self._resolve_surface_downsample_factor(conditioning),
-            use_stored_resolution_only=bool(self.config.get("use_stored_resolution_only", False)),
+            surface_downsample_factor=effective_surface_downsample_factor,
+            use_stored_resolution_only=use_stored_surface,
         )
 
         sample_key = (int(patch_idx), int(wrap_idx))
@@ -131,6 +306,7 @@ class AutoregMeshDataset(Dataset):
             "segment_idx": int(wrap.get("segment_idx", -1)),
             "bbox_2d": tuple(int(v) for v in wrap["bbox_2d"]),
             "segment_uuid": getattr(wrap.get("segment"), "uuid", ""),
+            "surface_sampling_mode": "stored" if use_stored_surface else "full",
         }
 
         return {
@@ -148,6 +324,7 @@ class AutoregMeshDataset(Dataset):
                 **serialized["prompt_meta"],
                 "conditioning_shape": tuple(int(v) for v in cond_local.shape[:2]),
                 "sample_key": sample_key,
+                "surface_sampling_mode": "stored" if use_stored_surface else "full",
             },
             "prompt_anchor_xyz": torch.from_numpy(serialized["prompt_anchor_xyz"]).to(torch.float32),
             "prompt_grid_local": torch.from_numpy(serialized["prompt_grid_local"]).to(torch.float32),
