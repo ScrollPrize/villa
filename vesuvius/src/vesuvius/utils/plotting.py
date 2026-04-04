@@ -331,6 +331,77 @@ def convert_slice_to_bgr(
         raise ValueError(f"Expected 2D or 3D array, got shape {slice_2d_or_3d.shape}")
 
 
+def _scale_with_fixed_value_range_to_8bit(
+    arr_np: np.ndarray,
+    value_range: Optional[tuple[float, float]] = None,
+) -> np.ndarray:
+    """Scale an array to uint8 using a fixed global range when provided."""
+    arr = arr_np.astype(np.float32, copy=False)
+    if value_range is None:
+        return minmax_scale_to_8bit(arr)
+
+    lower, upper = value_range
+    lower = float(lower)
+    upper = float(upper)
+    if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower:
+        return minmax_scale_to_8bit(arr)
+
+    arr = np.clip(arr, lower, upper)
+    arr = (arr - lower) / (upper - lower) * 255.0
+    return np.clip(arr, 0, 255).astype(np.uint8)
+
+
+def _gray_volume_to_bgr(volume_zhw: np.ndarray, value_range: Optional[tuple[float, float]]) -> np.ndarray:
+    gray_8u = _scale_with_fixed_value_range_to_8bit(volume_zhw, value_range)
+    return np.repeat(gray_8u[..., None], 3, axis=-1)
+
+
+def _render_3d_volume_to_bgr(
+    arr_np: np.ndarray,
+    *,
+    task_name: str | None = None,
+    task_cfg: Dict | None = None,
+    value_range: Optional[tuple[float, float]] = None,
+) -> np.ndarray:
+    """Render a full 3D tensor/volume to a Z-stacked uint8 BGR panel volume."""
+    task_cfg = task_cfg or {}
+    task_type = task_cfg.get("visualization") or task_cfg.get("type")
+    is_surface = (
+        (task_name is not None and task_name.endswith("surface_frame"))
+        or task_type == "surface_frame"
+        or (arr_np.ndim >= 4 and arr_np.shape[0] == 9)
+    )
+
+    if arr_np.ndim == 3:
+        return _gray_volume_to_bgr(arr_np, value_range)
+
+    if arr_np.ndim != 4:
+        raise ValueError(f"Expected 3D volume or 4D channel-first tensor, got shape {arr_np.shape}")
+
+    if is_surface:
+        return np.stack(
+            [_surface_frame_to_bgr(arr_np[:, z_idx, :, :]) for z_idx in range(arr_np.shape[1])],
+            axis=0,
+        )
+
+    if arr_np.shape[0] == 1:
+        return _gray_volume_to_bgr(arr_np[0], value_range)
+
+    if arr_np.shape[0] == 3:
+        rgb_zhwc = np.transpose(arr_np, (1, 2, 3, 0))
+        return _scale_with_fixed_value_range_to_8bit(rgb_zhwc, value_range)
+
+    if arr_np.shape[0] == 2:
+        return _gray_volume_to_bgr(arr_np[1], value_range)
+
+    is_affinity = (
+        task_type == "affinity"
+        or (task_name is not None and "affinity" in task_name.lower())
+    )
+    reduced = arr_np.mean(axis=0) if is_affinity else arr_np[0]
+    return _gray_volume_to_bgr(reduced, value_range)
+
+
 def save_debug(
     input_volume: torch.Tensor,          # shape [1, C, Z, H, W] for 3D or [1, C, H, W] for 2D
     targets_dict: dict,                 # e.g. {"sheet": tensor([1, Z, H, W]), "normals": tensor([3, Z, H, W])}
@@ -348,6 +419,7 @@ def save_debug(
     skeleton_dict: dict = None,         # Optional skeleton data for visualization
     train_skeleton_dict: dict = None,   # Optional train skeleton data
     apply_activation: bool = True,      # Whether to apply activation functions
+    save_media: bool = True,            # Whether to write the debug image/GIF to disk
     # Unlabeled sample visualization for semi-supervised training
     unlabeled_input: torch.Tensor = None,       # Optional unlabeled sample input
     unlabeled_pseudo_dict: dict = None,         # Teacher predictions (pseudo-labels)
@@ -774,19 +846,18 @@ def save_debug(
         # Stack rows and save
         rows = _pad_rows_to_uniform_width(rows)
         final_img = np.vstack(rows)
-        out_dir = Path(save_path).parent
-        out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[Epoch {epoch}] Saving PNG to: {save_path}")
-        # Use PIL for saving
-        Image.fromarray(final_img).save(save_path)
-
         preview_img = np.ascontiguousarray(final_img, dtype=np.uint8)
+        if save_media:
+            out_dir = Path(save_path).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[Epoch {epoch}] Saving PNG to: {save_path}")
+            # Use PIL for saving
+            Image.fromarray(final_img).save(save_path)
         return None, preview_img
 
     else:
         # Build frames for 3D GIF
         frames = []
-        preview_frame = None
         z_dim = inp_np.shape[0] if inp_np.ndim == 3 else inp_np.shape[1]
         mid_z_idx = max(z_dim // 2, 0)
 
@@ -877,46 +948,10 @@ def save_debug(
             for aux_name in sorted(aux_outputs_np.keys()):
                 val_imgs.append(add_text_label(aux_panel_volumes[aux_name][z_idx], _format_aux_panel_label(aux_name)))
             for t_name in sorted(targets_np.keys()):
-                gt = targets_np[t_name]
-                if gt.shape[0] == 1:
-                    gt_slice = gt[0, z_idx, :, :]
-                else:
-                    gt_slice = gt[:, z_idx, :, :]
                 label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                val_imgs.append(
-                    add_text_label(
-                        convert_slice_to_bgr(
-                            gt_slice,
-                            task_name=t_name,
-                            task_cfg=tasks_dict.get(t_name, {}),
-                            value_range=target_ranges.get(t_name),
-                        ),
-                        label,
-                    )
-                )
-            
-            # Show predictions (only for actual model outputs)
+                val_imgs.append(add_text_label(target_panel_volumes[t_name][z_idx], label))
             for t_name in pred_task_names:
-                pred = preds_np[t_name]
-                if pred.ndim == 4:
-                    if pred.shape[0] == 1:
-                        pred_slice = pred[0, z_idx, :, :]
-                    else:
-                        pred_slice = pred[:, z_idx, :, :]
-                else:
-                    pred_slice = pred[z_idx, :, :]
-                val_imgs.append(
-                    add_text_label(
-                        convert_slice_to_bgr(
-                            pred_slice,
-                            task_name=t_name,
-                            task_cfg=tasks_dict.get(t_name, {}),
-                            value_range=pred_ranges.get(t_name),
-                        ),
-                        f"Pred {t_name}",
-                    )
-                )
-            
+                val_imgs.append(add_text_label(pred_panel_volumes[t_name][z_idx], f"Pred {t_name}"))
             rows.append(np.hstack(val_imgs))
 
             if train_input_bgr is not None:
@@ -924,111 +959,32 @@ def save_debug(
                 for aux_name in sorted(train_aux_outputs_np.keys()):
                     train_imgs.append(add_text_label(train_aux_panel_volumes[aux_name][z_idx], _format_aux_panel_label(aux_name)))
                 for t_name in sorted(train_targets_np.keys()):
-                    gt = train_targets_np[t_name]
-                    if gt.shape[0] == 1:
-                        gt_slice = gt[0, z_idx, :, :]
-                    else:
-                        gt_slice = gt[:, z_idx, :, :]
                     label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                    train_imgs.append(
-                        add_text_label(
-                            convert_slice_to_bgr(
-                                gt_slice,
-                                task_name=t_name,
-                                task_cfg=tasks_dict.get(t_name, {}),
-                                value_range=train_target_ranges.get(t_name),
-                            ),
-                            label,
-                        )
-                    )
-                
-                # Show train predictions (only for actual model outputs)
+                    train_imgs.append(add_text_label(train_target_panel_volumes[t_name][z_idx], label))
                 for t_name in pred_task_names:
-                    if t_name in train_preds_np:
-                        pred = train_preds_np[t_name]
-                        if pred.ndim == 4:
-                            if pred.shape[0] == 1:
-                                pred_slice = pred[0, z_idx, :, :]
-                            else:
-                                pred_slice = pred[:, z_idx, :, :]
-                        else:
-                            pred_slice = pred[z_idx, :, :]
-                        train_imgs.append(
-                            add_text_label(
-                                convert_slice_to_bgr(
-                                    pred_slice,
-                                    task_name=t_name,
-                                    task_cfg=tasks_dict.get(t_name, {}),
-                                    value_range=train_pred_ranges.get(t_name),
-                                ),
-                                f"Pred {t_name}",
-                            )
-                        )
-
+                    if t_name in train_pred_panel_volumes:
+                        train_imgs.append(add_text_label(train_pred_panel_volumes[t_name][z_idx], f"Pred {t_name}"))
                 rows.append(np.hstack(train_imgs))
 
-            # Unlabeled row if available (for semi-supervised training)
-            if unlabeled_inp_np is not None:
-                unlabeled_slice = unlabeled_inp_np[z_idx] if unlabeled_inp_np.ndim == 3 else unlabeled_inp_np[:, z_idx, :, :]
-                unlabeled_imgs = [add_text_label(convert_slice_to_bgr(unlabeled_slice, value_range=unlabeled_input_range), "Unlabeled")]
-
-                # Show pseudo-labels (teacher predictions)
+            if unlabeled_input_bgr is not None:
+                unlabeled_imgs = [add_text_label(unlabeled_input_bgr[z_idx], "Unlabeled")]
                 for t_name in sorted(unlabeled_pseudo_np.keys()):
-                    pseudo = unlabeled_pseudo_np[t_name]
-                    if pseudo.ndim == 4:
-                        if pseudo.shape[0] == 1:
-                            pseudo_slice = pseudo[0, z_idx, :, :]
-                        else:
-                            pseudo_slice = pseudo[:, z_idx, :, :]
-                    else:
-                        pseudo_slice = pseudo[z_idx, :, :]
-                    unlabeled_imgs.append(
-                        add_text_label(
-                            convert_slice_to_bgr(
-                                pseudo_slice,
-                                task_name=t_name,
-                                task_cfg=tasks_dict.get(t_name, {}),
-                                value_range=unlabeled_pseudo_ranges.get(t_name),
-                            ),
-                            f"Pseudo {t_name}",
-                        )
-                    )
-
-                # Show student predictions on unlabeled data
+                    unlabeled_imgs.append(add_text_label(unlabeled_pseudo_panel_volumes[t_name][z_idx], f"Pseudo {t_name}"))
                 for t_name in pred_task_names:
-                    if t_name in unlabeled_preds_np:
-                        pred = unlabeled_preds_np[t_name]
-                        if pred.ndim == 4:
-                            if pred.shape[0] == 1:
-                                pred_slice = pred[0, z_idx, :, :]
-                            else:
-                                pred_slice = pred[:, z_idx, :, :]
-                        else:
-                            pred_slice = pred[z_idx, :, :]
-                        unlabeled_imgs.append(
-                            add_text_label(
-                                convert_slice_to_bgr(
-                                    pred_slice,
-                                    task_name=t_name,
-                                    task_cfg=tasks_dict.get(t_name, {}),
-                                    value_range=unlabeled_pred_ranges.get(t_name),
-                                ),
-                                f"Pred {t_name}",
-                            )
-                        )
-
+                    if t_name in unlabeled_pred_panel_volumes:
+                        unlabeled_imgs.append(add_text_label(unlabeled_pred_panel_volumes[t_name][z_idx], f"Pred {t_name}"))
                 rows.append(np.hstack(unlabeled_imgs))
 
-            # Stack rows for this frame
             rows = _pad_rows_to_uniform_width(rows)
-            frame = np.vstack(rows)
-            # Ensure frame is uint8 and contiguous
-            frame = np.ascontiguousarray(frame, dtype=np.uint8)
+            return np.ascontiguousarray(np.vstack(rows), dtype=np.uint8)
+
+        if not save_media:
+            return None, _build_3d_frame(mid_z_idx)
+
+        for z_idx in range(z_dim):
+            frame = _build_3d_frame(z_idx)
             frames.append(frame)
 
-            if z_idx == mid_z_idx:
-                preview_frame = frame.copy()
-        
         # Save GIF in a subprocess to avoid crashing main training process on encoder segfaults
         out_dir = Path(save_path).parent
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1043,19 +999,16 @@ def save_debug(
         if proc.is_alive():
             proc.terminate()
             print("Warning: GIF save timed out; skipping debug visualization")
-            if preview_frame is None and frames:
-                preview_frame = frames[len(frames) // 2].copy()
+            preview_frame = frames[mid_z_idx].copy() if frames else None
             return None, preview_frame
 
         if proc.exitcode == 0:
             print(f"Successfully saved GIF to: {save_path}")
-            if preview_frame is None and frames:
-                preview_frame = frames[len(frames) // 2].copy()
+            preview_frame = frames[mid_z_idx].copy() if frames else None
             return frames, preview_frame
         else:
             print(f"Warning: GIF save failed in subprocess (exit code {proc.exitcode}); skipping")
-            if preview_frame is None and frames:
-                preview_frame = frames[len(frames) // 2].copy()
+            preview_frame = frames[mid_z_idx].copy() if frames else None
             return None, preview_frame
 
 
