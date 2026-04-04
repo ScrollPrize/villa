@@ -88,7 +88,10 @@ def test_primus_single_train_step_backward():
     loss.backward()
 
     assert model.shared_encoder.patch_embed.stem.blocks[0].conv1.conv.weight.grad is not None
-    assert model.task_heads["ink"].weight.grad is not None
+    if "ink" in model.task_heads:
+        assert model.task_heads["ink"].weight.grad is not None
+    else:
+        assert model.task_decoders["ink"].patch_decoder.decode[-1].weight.grad is not None
     optim.step()
 
 

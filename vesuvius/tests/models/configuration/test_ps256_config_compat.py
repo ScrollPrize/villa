@@ -193,3 +193,23 @@ def test_ps256_pretrained_dino_pixelshuffle_medial_config_loads_and_builds():
     assert model.final_config["pretrained_backbone"] is not None
     assert model.final_config["pretrained_decoder_type"] == "pixelshuffle_conv"
     assert model.final_config["freeze_encoder"] is True
+
+
+def test_ps128_mednext_v1_medial_config_loads_and_builds():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps128_mednext_v1_medial.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (128, 128, 128)
+    assert list(mgr.targets.keys()) == ["surface"]
+    assert model.final_config["architecture_type"] == "mednext_v1"
+    assert model.final_config["mednext_model_id"] == "B"
+
+
+def test_ps256_mednext_v1_medial_config_loads_and_builds():
+    mgr = _load_mgr("src/vesuvius/models/configuration/single_task/ps256_mednext_v1_medial.yaml")
+    model = NetworkFromConfig(mgr)
+
+    assert mgr.train_patch_size == (256, 256, 256)
+    assert list(mgr.targets.keys()) == ["surface"]
+    assert model.final_config["architecture_type"] == "mednext_v1"
+    assert model.final_config["mednext_model_id"] == "B"

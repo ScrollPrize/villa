@@ -55,6 +55,9 @@ from .activations import SwiGLUBlock, GLUBlock
 from .simple_conv_blocks import ConvDropoutNormReLU
 from .guidance import TokenBook3D
 from .primus_wrapper import PrimusEncoder, PrimusDecoder
+from .mednext.factory import get_mednext_v1_config
+from .mednext_wrapper import MedNeXtEncoder, MedNeXtDecoder
+from .pretrained_backbones.dinov2 import build_dinov2_backbone, build_dinov2_decoder
 
 
 class LearnedMLPZProjection(nn.Module):
@@ -282,6 +285,8 @@ class NetworkFromConfig(nn.Module):
                 raise ValueError("guide_backbone cannot be combined with pretrained_backbone in v1")
             if self.architecture_type.lower().startswith("primus"):
                 raise ValueError("guide_backbone is not supported with primus architectures in v1")
+            if self.architecture_type.lower().startswith("mednext"):
+                raise ValueError("guide_backbone is not supported with mednext architectures in v1")
             if self.guide_fusion_stage not in {"input", "input_gating", "feature_encoder", "feature_skip_concat", "direct_segmentation"}:
                 raise ValueError(
                     "Unsupported guide_fusion_stage. Expected one of "
@@ -297,6 +302,9 @@ class NetworkFromConfig(nn.Module):
             if self.guide_fusion_stage == "direct_segmentation" and ds_enabled:
                 raise ValueError("direct_segmentation does not support deep supervision")
 
+        if self.architecture_type.lower().startswith("mednext") and self.pretrained_backbone:
+            raise ValueError("pretrained_backbone cannot be combined with mednext architectures in v1")
+
         if self.pretrained_backbone:
             if ds_enabled:
                 print(
@@ -309,6 +317,10 @@ class NetworkFromConfig(nn.Module):
 
         if self._guide_uses_direct_segmentation():
             self._init_direct_segmentation(model_config)
+            return
+
+        if self.architecture_type.lower().startswith("mednext"):
+            self._init_mednext(mgr, model_config)
             return
 
         # Primus decoders do not emit multi-scale logits; block DS to avoid silent misconfiguration
@@ -1149,6 +1161,136 @@ class NetworkFromConfig(nn.Module):
         }
 
         print("Pretrained backbone network initialized with configuration:")
+        for k, v in self.final_config.items():
+            print(f"  {k}: {v}")
+
+    def _init_mednext(self, mgr, model_config):
+        if self.op_dims != 3:
+            raise ValueError("MedNeXt support is currently limited to 3D models in vesuvius")
+
+        architecture_name = str(self.architecture_type).strip().lower()
+        if architecture_name != "mednext_v1":
+            raise ValueError(
+                f"Unsupported mednext architecture_type {self.architecture_type!r}. "
+                "Stage 2 currently supports only 'mednext_v1'."
+            )
+
+        model_id = model_config.get("mednext_model_id")
+        if model_id in (None, ""):
+            raise ValueError("mednext_model_id must be explicitly set for mednext architectures")
+
+        base_cfg = get_mednext_v1_config(model_id)
+        kernel_size = int(model_config.get("mednext_kernel_size", 3))
+        checkpoint_style = model_config.get("mednext_checkpoint_style", base_cfg["checkpoint_style"])
+        if checkpoint_style == "":
+            checkpoint_style = None
+
+        resolved_cfg = {
+            "model_id": base_cfg["model_id"],
+            "base_channels": int(base_cfg["n_channels"]),
+            "exp_r": list(base_cfg["exp_r"]) if isinstance(base_cfg["exp_r"], (list, tuple)) else [int(base_cfg["exp_r"])] * 9,
+            "block_counts": list(base_cfg["block_counts"]),
+            "kernel_size": kernel_size,
+            "checkpoint_style": checkpoint_style,
+            "norm_type": "group",
+            "grn": False,
+            "width_factor": 1,
+        }
+
+        self.shared_encoder = MedNeXtEncoder(
+            input_channels=self.in_channels,
+            n_channels=resolved_cfg["base_channels"],
+            exp_r=resolved_cfg["exp_r"],
+            block_counts=resolved_cfg["block_counts"],
+            kernel_size=resolved_cfg["kernel_size"],
+            checkpoint_style=resolved_cfg["checkpoint_style"],
+            norm_type=resolved_cfg["norm_type"],
+            grn=resolved_cfg["grn"],
+            do_res=True,
+            do_res_up_down=True,
+        )
+        self.task_decoders = nn.ModuleDict()
+        self.task_activations = nn.ModuleDict()
+        self.task_heads = nn.ModuleDict()
+
+        ds_enabled = bool(getattr(mgr, "enable_deep_supervision", False))
+        separate_decoders_default = model_config.get("separate_decoders", ds_enabled)
+        tasks_using_separate = set()
+        tasks_using_shared = set()
+        for target_name, target_info in self.targets.items():
+            if "out_channels" in target_info:
+                out_channels = target_info["out_channels"]
+            elif "channels" in target_info:
+                out_channels = target_info["channels"]
+            else:
+                out_channels = self.in_channels
+                print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels")
+            target_info["out_channels"] = out_channels
+            self._register_target_projection(target_name, target_info, model_config)
+            use_separate = target_info.get("separate_decoder", separate_decoders_default)
+            if use_separate:
+                tasks_using_separate.add(target_name)
+            else:
+                tasks_using_shared.add(target_name)
+
+        if ds_enabled and len(tasks_using_shared) > 0:
+            print(
+                "Deep supervision enabled: switching shared-decoder tasks to separate decoders for DS support:",
+                ", ".join(sorted(tasks_using_shared)),
+            )
+            tasks_using_separate.update(tasks_using_shared)
+            tasks_using_shared.clear()
+
+        if len(tasks_using_shared) > 0:
+            self.shared_decoder = MedNeXtDecoder(
+                encoder=self.shared_encoder,
+                num_classes=None,
+                deep_supervision=False,
+            )
+            head_in_ch = self.shared_encoder.output_channels[0]
+            for target_name in sorted(tasks_using_shared):
+                out_ch = self.targets[target_name]["out_channels"]
+                self.task_heads[target_name] = nn.Conv3d(head_in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=True)
+                activation_str = self.targets[target_name].get("activation", "none")
+                self.task_activations[target_name] = get_activation_module(activation_str)
+                print(f"MedNeXt task '{target_name}' configured with shared decoder + head ({out_ch} channels)")
+        else:
+            self.shared_decoder = None
+
+        for target_name in sorted(tasks_using_separate):
+            out_channels = self.targets[target_name]["out_channels"]
+            activation_str = self.targets[target_name].get("activation", "none")
+            self.task_decoders[target_name] = MedNeXtDecoder(
+                encoder=self.shared_encoder,
+                num_classes=out_channels,
+                deep_supervision=ds_enabled,
+            )
+            self.task_activations[target_name] = get_activation_module(activation_str)
+            print(f"MedNeXt task '{target_name}' configured with separate decoder ({out_channels} channels)")
+
+        self.final_config = {
+            "model_name": self.mgr.model_name,
+            "architecture_type": self.architecture_type,
+            "mednext_model_id": resolved_cfg["model_id"],
+            "mednext_base_channels": resolved_cfg["base_channels"],
+            "mednext_exp_r": resolved_cfg["exp_r"],
+            "mednext_block_counts": resolved_cfg["block_counts"],
+            "mednext_kernel_size": resolved_cfg["kernel_size"],
+            "mednext_checkpoint_style": resolved_cfg["checkpoint_style"],
+            "mednext_norm_type": resolved_cfg["norm_type"],
+            "mednext_grn": resolved_cfg["grn"],
+            "mednext_width_factor": resolved_cfg["width_factor"],
+            "patch_size": self.patch_size,
+            "batch_size": self.batch_size,
+            "in_channels": self.in_channels,
+            "autoconfigure": self.autoconfigure,
+            "targets": self.targets,
+            "target_z_projection": self.task_z_projection_cfg,
+            "separate_decoders": len(tasks_using_separate) > 0,
+            "enable_deep_supervision": ds_enabled,
+        }
+
+        print("MedNeXt network initialized with configuration:")
         for k, v in self.final_config.items():
             print(f"  {k}: {v}")
 
