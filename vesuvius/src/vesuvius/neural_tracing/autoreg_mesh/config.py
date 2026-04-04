@@ -33,10 +33,28 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "scheduler_kwargs": {},
     "batch_size": 1,
     "num_workers": 0,
+    "val_num_workers": 0,
+    "val_fraction": 0.1,
+    "val_batches_per_log": 4,
     "num_steps": 1000,
     "grad_clip": 1.0,
     "mixed_precision": "no",
     "occupancy_loss_weight": 0.0,
+    "out_dir": "./autoreg_mesh_runs",
+    "log_frequency": 100,
+    "ckpt_frequency": 5000,
+    "ckpt_at_step_zero": False,
+    "save_final_checkpoint": True,
+    "load_ckpt": None,
+    "load_weights_only": False,
+    "wandb_project": None,
+    "wandb_entity": None,
+    "wandb_run_name": None,
+    "wandb_resume": False,
+    "wandb_resume_mode": "allow",
+    "wandb_run_id": None,
+    "wandb_log_images": True,
+    "wandb_image_frequency": None,
 }
 
 
@@ -100,6 +118,35 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("pointer_temperature must be positive")
     if float(cfg["occupancy_loss_weight"]) < 0.0:
         raise ValueError("occupancy_loss_weight must be non-negative")
+    if int(cfg["num_steps"]) <= 0:
+        raise ValueError("num_steps must be positive")
+    if int(cfg["batch_size"]) <= 0:
+        raise ValueError("batch_size must be positive")
+    if int(cfg["num_workers"]) < 0:
+        raise ValueError("num_workers must be non-negative")
+    if int(cfg["val_num_workers"]) < 0:
+        raise ValueError("val_num_workers must be non-negative")
+    if float(cfg["val_fraction"]) < 0.0 or float(cfg["val_fraction"]) > 1.0:
+        raise ValueError("val_fraction must be within [0, 1]")
+    if int(cfg["val_batches_per_log"]) <= 0:
+        raise ValueError("val_batches_per_log must be positive")
+    if int(cfg["log_frequency"]) <= 0:
+        raise ValueError("log_frequency must be positive")
+    if int(cfg["ckpt_frequency"]) <= 0:
+        raise ValueError("ckpt_frequency must be positive")
+    if float(cfg["grad_clip"]) <= 0.0:
+        raise ValueError("grad_clip must be positive")
+    if cfg["out_dir"] is None or str(cfg["out_dir"]).strip() == "":
+        raise ValueError("out_dir must be a non-empty path")
+    if cfg.get("load_ckpt") is not None and str(cfg["load_ckpt"]).strip() == "":
+        raise ValueError("load_ckpt must be None or a non-empty path")
+    if cfg.get("wandb_resume_mode") not in {"allow", "must", "never", "auto"}:
+        raise ValueError("wandb_resume_mode must be one of {'allow', 'must', 'never', 'auto'}")
+
+    if cfg.get("wandb_image_frequency") is None:
+        cfg["wandb_image_frequency"] = int(cfg["log_frequency"])
+    if int(cfg["wandb_image_frequency"]) <= 0:
+        raise ValueError("wandb_image_frequency must be positive")
 
     optimizer = dict(cfg.get("optimizer") or {})
     optimizer.setdefault("name", "adamw")

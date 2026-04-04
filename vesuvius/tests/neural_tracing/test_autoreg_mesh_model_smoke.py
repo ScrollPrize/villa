@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from torch.utils.data import Dataset
 
@@ -111,6 +113,17 @@ def _make_sample(direction: str) -> dict:
     }
 
 
+def _make_cached_vol_tokens(decoder_dim: int = 96) -> torch.Tensor:
+    values = torch.linspace(-1.0, 1.0, steps=8 * decoder_dim, dtype=torch.float32)
+    return values.reshape(8, decoder_dim)
+
+
+def _make_sample_with_cached_tokens(direction: str, *, decoder_dim: int = 96) -> dict:
+    sample = _make_sample(direction)
+    sample["vol_tokens"] = _make_cached_vol_tokens(decoder_dim=decoder_dim)
+    return sample
+
+
 def _make_config(checkpoint_path: Path) -> dict:
     return {
         "dinov2_backbone": str(checkpoint_path),
@@ -124,8 +137,38 @@ def _make_config(checkpoint_path: Path) -> dict:
         "frontier_band_width": 1,
         "batch_size": 1,
         "num_workers": 0,
+        "val_num_workers": 0,
         "num_steps": 2,
+        "val_fraction": 0.0,
+        "val_batches_per_log": 1,
         "optimizer": {"name": "adamw", "learning_rate": 1e-3, "weight_decay": 0.0},
+        "log_frequency": 1,
+        "ckpt_frequency": 1,
+        "save_final_checkpoint": False,
+    }
+
+
+def _make_cached_token_config() -> dict:
+    return {
+        "dinov2_backbone": None,
+        "input_shape": [16, 16, 16],
+        "patch_size": [8, 8, 8],
+        "offset_num_bins": [4, 4, 4],
+        "decoder_dim": 96,
+        "decoder_depth": 2,
+        "decoder_num_heads": 4,
+        "cross_attention_every_n_blocks": 1,
+        "frontier_band_width": 1,
+        "batch_size": 1,
+        "num_workers": 0,
+        "val_num_workers": 0,
+        "num_steps": 2,
+        "val_fraction": 0.0,
+        "val_batches_per_log": 1,
+        "optimizer": {"name": "adamw", "learning_rate": 1e-3, "weight_decay": 0.0},
+        "log_frequency": 1,
+        "ckpt_frequency": 1,
+        "save_final_checkpoint": False,
     }
 
 
@@ -138,6 +181,54 @@ class _ListDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         return self.items[int(idx)]
+
+
+class _FakeWandbImage:
+    def __init__(self, data, caption=None) -> None:
+        self.data = np.asarray(data)
+        self.caption = caption
+
+
+class _FakeWandbRun:
+    def __init__(self, run_id: str) -> None:
+        self.id = str(run_id)
+
+
+class _FakeWandbModule:
+    def __init__(self) -> None:
+        self.init_calls: list[dict] = []
+        self.logs: list[dict] = []
+        self.finish_calls = 0
+        self.run = None
+        self._counter = 0
+
+    def init(self, **kwargs):
+        self.init_calls.append(dict(kwargs))
+        run_id = kwargs.get("id")
+        if run_id is None:
+            self._counter += 1
+            run_id = f"fake-run-{self._counter}"
+        self.run = _FakeWandbRun(run_id)
+        return self.run
+
+    def log(self, data, step=None):
+        self.logs.append({"data": dict(data), "step": step})
+
+    def finish(self):
+        self.finish_calls += 1
+        self.run = None
+
+    def Image(self, data, caption=None):
+        return _FakeWandbImage(data, caption=caption)
+
+
+def _make_training_dataset() -> _ListDataset:
+    return _ListDataset([
+        _make_sample_with_cached_tokens("left"),
+        _make_sample_with_cached_tokens("right"),
+        _make_sample_with_cached_tokens("up"),
+        _make_sample_with_cached_tokens("down"),
+    ])
 
 
 def _move_batch(batch: dict, device: torch.device) -> dict:
@@ -177,10 +268,9 @@ def test_autoreg_mesh_model_forward_and_losses_are_finite(tmp_path: Path) -> Non
 
 
 def test_autoreg_mesh_smoke_training_runs_two_steps(tmp_path: Path) -> None:
-    checkpoint = tmp_path / "tiny_dinovol.pt"
-    _write_local_guide_checkpoint(checkpoint)
-    config = _make_config(checkpoint)
-    dataset = _ListDataset([_make_sample("left"), _make_sample("right"), _make_sample("up")])
+    config = _make_cached_token_config()
+    config["out_dir"] = str(tmp_path / "runs")
+    dataset = _make_training_dataset()
     result = run_autoreg_mesh_training(config, dataset=dataset, device="cpu", max_steps=2)
 
     assert len(result["history"]) == 2
@@ -188,6 +278,9 @@ def test_autoreg_mesh_smoke_training_runs_two_steps(tmp_path: Path) -> None:
     assert np.isfinite(result["final_metrics"]["coarse_loss"])
     assert np.isfinite(result["final_metrics"]["offset_loss"])
     assert np.isfinite(result["final_metrics"]["stop_loss"])
+    assert "val_loss" not in result["final_metrics"]
+    assert result["wandb_run_id"] is None
+    assert Path(result["checkpoint_paths"][0]).exists()
 
 
 def test_autoreg_mesh_inference_reconstructs_lattice(tmp_path: Path) -> None:
@@ -211,3 +304,93 @@ def test_autoreg_mesh_inference_reconstructs_lattice(tmp_path: Path) -> None:
     assert result["continuation_grid_local"].shape == (*target_shape, 3)
     assert result["full_grid_local"].shape[-1] == 3
     assert result["full_grid_local"].shape[0] >= result["continuation_grid_local"].shape[0]
+
+
+def test_autoreg_mesh_validation_metrics_are_logged_in_history(tmp_path: Path) -> None:
+    config = _make_cached_token_config()
+    config["out_dir"] = str(tmp_path / "runs_val")
+    config["val_fraction"] = 0.5
+    dataset = _make_training_dataset()
+
+    result = run_autoreg_mesh_training(config, dataset=dataset, device="cpu", max_steps=1)
+
+    assert len(result["history"]) == 1
+    assert "val_loss" in result["history"][0]
+    assert "val_coarse_loss" in result["history"][0]
+    assert "val_offset_loss" in result["history"][0]
+    assert "val_stop_loss" in result["history"][0]
+
+
+def test_autoreg_mesh_wandb_logging_includes_metrics_and_images(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _make_cached_token_config()
+    config.update(
+        {
+            "out_dir": str(tmp_path / "runs_wandb"),
+            "wandb_project": "mesh-mvp",
+            "wandb_entity": "scroll",
+            "wandb_run_name": "smoke",
+            "wandb_log_images": True,
+            "wandb_image_frequency": 1,
+            "val_fraction": 0.5,
+        }
+    )
+    dataset = _make_training_dataset()
+    fake_wandb = _FakeWandbModule()
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    result = run_autoreg_mesh_training(config, dataset=dataset, device="cpu", max_steps=1)
+
+    assert result["wandb_run_id"] == "fake-run-1"
+    assert fake_wandb.init_calls[0]["project"] == "mesh-mvp"
+    assert fake_wandb.init_calls[0]["entity"] == "scroll"
+    assert fake_wandb.init_calls[0]["name"] == "smoke"
+    assert "config" in fake_wandb.init_calls[0]
+    assert fake_wandb.logs[0]["step"] == 1
+    logged = fake_wandb.logs[0]["data"]
+    assert "loss" in logged
+    assert "coarse_loss" in logged
+    assert "current_lr" in logged
+    assert "grad_norm" in logged
+    assert "val_loss" in logged
+    assert "train_example" in logged
+    assert "val_example" in logged
+    assert isinstance(logged["train_example"], _FakeWandbImage)
+    assert isinstance(logged["val_example"], _FakeWandbImage)
+    assert logged["train_example"].data.ndim == 3
+    assert logged["val_example"].data.ndim == 3
+    assert fake_wandb.finish_calls == 1
+
+
+def test_autoreg_mesh_resume_uses_checkpoint_wandb_run_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    dataset = _make_training_dataset()
+    fake_wandb = _FakeWandbModule()
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    first_config = _make_cached_token_config()
+    first_config.update(
+        {
+            "out_dir": str(tmp_path / "resume_runs"),
+            "wandb_project": "mesh-mvp",
+            "save_final_checkpoint": False,
+        }
+    )
+    first_result = run_autoreg_mesh_training(first_config, dataset=dataset, device="cpu", max_steps=1)
+    ckpt_path = Path(first_result["checkpoint_paths"][0])
+    saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    assert saved["wandb_run_id"] == "fake-run-1"
+
+    second_config = _make_cached_token_config()
+    second_config.update(
+        {
+            "out_dir": str(tmp_path / "resume_runs"),
+            "wandb_project": "mesh-mvp",
+            "wandb_resume": True,
+            "load_ckpt": str(ckpt_path),
+            "save_final_checkpoint": False,
+        }
+    )
+    second_result = run_autoreg_mesh_training(second_config, dataset=dataset, device="cpu", max_steps=2)
+
+    assert second_result["start_step"] == 1
+    assert fake_wandb.init_calls[1]["resume"] == "allow"
+    assert fake_wandb.init_calls[1]["id"] == "fake-run-1"
