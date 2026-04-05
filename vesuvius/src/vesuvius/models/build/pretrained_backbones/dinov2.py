@@ -143,12 +143,12 @@ class PixelShuffleConvDinov2Decoder(nn.Module):
         return self.final_refine(x)
 
 
-class PreRefPixelShuffleConvHeadBigDinov2Decoder(nn.Module):
+class PixelShuffleConvHeadBigDinov2Decoder(nn.Module):
     def __init__(self, encoder, num_classes):
         super().__init__()
         if encoder.ndim != 3:
             raise ValueError(
-                f"preref_pixelshuffle_convhead_big currently only supports 3D pretrained backbones, got ndim={encoder.ndim}"
+                f"pixelshuffle_convhead_big currently only supports 3D pretrained backbones, got ndim={encoder.ndim}"
             )
 
         num_stages, strides, channels = _compute_patch_decode_plan(
@@ -157,11 +157,6 @@ class PreRefPixelShuffleConvHeadBigDinov2Decoder(nn.Module):
             out_channels=num_classes,
         )
         conv = nn.Conv3d
-        self.pre_refine = nn.Sequential(
-            conv(encoder.embed_dim, encoder.embed_dim, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.GroupNorm(_resolve_group_norm_groups(encoder.embed_dim), encoder.embed_dim),
-            nn.GELU(),
-        )
         final_hidden_channels = max(
             8,
             channels[-2] if num_stages > 1 else min(64, max(8, encoder.embed_dim // 8)),
@@ -181,16 +176,15 @@ class PreRefPixelShuffleConvHeadBigDinov2Decoder(nn.Module):
             stages.append(nn.Sequential(*stage_ops))
         self.decode = nn.Sequential(*stages)
         self.final_refine = nn.Sequential(
-            conv(final_hidden_channels, final_hidden_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            conv(final_hidden_channels, final_hidden_channels, kernel_size=7, stride=1, padding=3, bias=False),
             nn.GroupNorm(_resolve_group_norm_groups(final_hidden_channels), final_hidden_channels),
             nn.GELU(),
-            conv(final_hidden_channels, final_hidden_channels, kernel_size=3, stride=1, padding=1, bias=True),
+            conv(final_hidden_channels, final_hidden_channels, kernel_size=7, stride=1, padding=3, bias=True),
             conv(final_hidden_channels, num_classes, kernel_size=1, stride=1, padding=0, bias=True),
         )
 
     def forward(self, features):
         x = features[0] if isinstance(features, list) else features
-        x = self.pre_refine(x)
         x = self.decode(x)
         return self.final_refine(x)
 
@@ -322,9 +316,9 @@ def build_dinov2_decoder(name, encoder, num_classes):
         return PrimusPatchDecodeDinov2Decoder(encoder, num_classes)
     if name == "pixelshuffle_conv":
         return PixelShuffleConvDinov2Decoder(encoder, num_classes)
-    if name == "preref_pixelshuffle_convhead_big":
-        return PreRefPixelShuffleConvHeadBigDinov2Decoder(encoder, num_classes)
+    if name == "pixelshuffle_convhead_big":
+        return PixelShuffleConvHeadBigDinov2Decoder(encoder, num_classes)
     raise ValueError(
         "Unknown pretrained_decoder_type "
-        f"{name!r}. Expected one of: minimal, primus_patch_decode, pixelshuffle_conv, preref_pixelshuffle_convhead_big"
+        f"{name!r}. Expected one of: minimal, primus_patch_decode, pixelshuffle_conv, pixelshuffle_convhead_big"
     )

@@ -370,21 +370,21 @@ def test_pretrained_backbone_pixelshuffle_checkpoint_roundtrip_preserves_plain_i
     assert model_info["network"].final_config["pretrained_decoder_type"] == "pixelshuffle_conv"
 
 
-def test_pretrained_backbone_preref_pixelshuffle_convhead_big_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
+def test_pretrained_backbone_pixelshuffle_convhead_big_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
     data_root = _make_synthetic_dataset(tmp_path)
     guide_checkpoint = tmp_path / "guide_backbone.pt"
     _write_local_guide_checkpoint(guide_checkpoint)
     mgr = _make_pretrained_backbone_mgr(
         data_root,
         guide_checkpoint,
-        pretrained_decoder_type="preref_pixelshuffle_convhead_big",
+        pretrained_decoder_type="pixelshuffle_convhead_big",
     )
     trainer = BaseTrainer(mgr=mgr, verbose=False)
     model = trainer._build_model()
-    checkpoint_path = tmp_path / "pretrained_preref_pixelshuffle_model.pth"
+    checkpoint_path = tmp_path / "pretrained_pixelshuffle_convhead_big_model.pth"
     torch.save({"model_config": model.final_config, "model": model.state_dict()}, checkpoint_path)
 
-    output_dir = tmp_path / "inference_out_pretrained_preref_pixelshuffle"
+    output_dir = tmp_path / "inference_out_pretrained_pixelshuffle_convhead_big"
     output_dir.mkdir()
     inferer = Inferer(
         model_path=str(checkpoint_path),
@@ -403,7 +403,7 @@ def test_pretrained_backbone_preref_pixelshuffle_convhead_big_checkpoint_roundtr
     assert isinstance(output, dict)
     assert set(output.keys()) == {"surface"}
     assert output["surface"].shape == (1, 2, 16, 16, 16)
-    assert model_info["network"].final_config["pretrained_decoder_type"] == "preref_pixelshuffle_convhead_big"
+    assert model_info["network"].final_config["pretrained_decoder_type"] == "pixelshuffle_convhead_big"
 
 
 def test_pretrained_backbone_explicit_volumes_dataset_loads_from_volume_specs(tmp_path: Path):
@@ -413,7 +413,7 @@ def test_pretrained_backbone_explicit_volumes_dataset_loads_from_volume_specs(tm
     mgr = _make_pretrained_backbone_mgr(
         data_root,
         guide_checkpoint,
-        pretrained_decoder_type="preref_pixelshuffle_convhead_big",
+        pretrained_decoder_type="pixelshuffle_convhead_big",
     )
 
     runtime_cfg_dir = tmp_path / "runtime_configs"
@@ -447,7 +447,7 @@ def test_pretrained_backbone_explicit_volumes_duplicate_image_ids_match_cache_na
     mgr = _make_pretrained_backbone_mgr(
         data_root,
         guide_checkpoint,
-        pretrained_decoder_type="preref_pixelshuffle_convhead_big",
+        pretrained_decoder_type="pixelshuffle_convhead_big",
     )
 
     runtime_cfg_dir = tmp_path / "runtime_configs"

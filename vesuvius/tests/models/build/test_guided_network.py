@@ -11,7 +11,7 @@ from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.build.guidance import TokenBook3D
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
 from vesuvius.models.build.pretrained_backbones.dinov2 import (
-    PreRefPixelShuffleConvHeadBigDinov2Decoder,
+    PixelShuffleConvHeadBigDinov2Decoder,
     PixelShuffleConvDinov2Decoder,
     build_dinov2_backbone,
     build_dinov2_decoder,
@@ -282,20 +282,20 @@ def test_pretrained_backbone_pixelshuffle_conv_decoder_returns_input_resolution(
     assert model.final_config["pretrained_decoder_type"] == "pixelshuffle_conv"
 
 
-def test_pretrained_backbone_preref_pixelshuffle_convhead_big_returns_input_resolution(tmp_path: Path):
+def test_pretrained_backbone_pixelshuffle_convhead_big_returns_input_resolution(tmp_path: Path):
     checkpoint_path = tmp_path / "guide_backbone.pt"
     _write_local_guide_checkpoint(checkpoint_path)
     mgr = _make_pretrained_backbone_mgr(
         checkpoint_path,
         freeze_encoder=True,
-        decoder_type="preref_pixelshuffle_convhead_big",
+        decoder_type="pixelshuffle_convhead_big",
     )
     model = NetworkFromConfig(mgr)
 
     outputs = model(torch.randn(2, 1, 16, 16, 16))
 
     assert outputs["surface"].shape == (2, 2, 16, 16, 16)
-    assert model.final_config["pretrained_decoder_type"] == "preref_pixelshuffle_convhead_big"
+    assert model.final_config["pretrained_decoder_type"] == "pixelshuffle_convhead_big"
 
 
 def test_encoder_skip_only_feature_gating_uses_residual_alpha_formula():
@@ -615,25 +615,18 @@ def test_build_dinov2_decoder_accepts_pixelshuffle_conv(tmp_path: Path):
     assert decoder.final_refine[3].kernel_size == (3, 3, 3)
 
 
-def test_build_dinov2_decoder_accepts_preref_pixelshuffle_convhead_big(tmp_path: Path):
+def test_build_dinov2_decoder_accepts_pixelshuffle_convhead_big(tmp_path: Path):
     checkpoint_path = tmp_path / "guide_backbone.pt"
     _write_local_guide_checkpoint(checkpoint_path)
     encoder = build_dinov2_backbone(str(checkpoint_path), input_channels=1, input_shape=(16, 16, 16))
-    decoder = build_dinov2_decoder("preref_pixelshuffle_convhead_big", encoder, num_classes=2)
+    decoder = build_dinov2_decoder("pixelshuffle_convhead_big", encoder, num_classes=2)
 
     features = torch.randn(1, encoder.embed_dim, 2, 2, 2)
     output = decoder(features)
 
-    assert isinstance(decoder, PreRefPixelShuffleConvHeadBigDinov2Decoder)
+    assert isinstance(decoder, PixelShuffleConvHeadBigDinov2Decoder)
     assert output.shape == (1, 2, 16, 16, 16)
-    assert isinstance(decoder.pre_refine[0], torch.nn.Conv3d)
-    assert decoder.pre_refine[0].kernel_size == (3, 3, 3)
-    assert decoder.pre_refine[0].in_channels == encoder.embed_dim
-    assert decoder.pre_refine[0].out_channels == encoder.embed_dim
-    assert decoder.pre_refine[0].bias is None
-    assert isinstance(decoder.pre_refine[1], torch.nn.GroupNorm)
-    assert isinstance(decoder.pre_refine[2], torch.nn.GELU)
-    assert decoder.decode[0][0].in_channels == encoder.embed_dim
+    assert not hasattr(decoder, "pre_refine")
     assert all(isinstance(stage[3], torch.nn.GroupNorm) for stage in decoder.decode)
     assert all(isinstance(stage[4], torch.nn.GELU) for stage in decoder.decode)
     assert all(isinstance(stage[2], torch.nn.Conv3d) for stage in decoder.decode)
@@ -647,8 +640,10 @@ def test_build_dinov2_decoder_accepts_preref_pixelshuffle_convhead_big(tmp_path:
     assert isinstance(decoder.final_refine[2], torch.nn.GELU)
     assert len(decoder.final_refine) == 5
     assert decoder.final_refine[-1].kernel_size == (1, 1, 1)
-    assert decoder.final_refine[0].kernel_size == (3, 3, 3)
-    assert decoder.final_refine[3].kernel_size == (3, 3, 3)
+    assert decoder.final_refine[0].kernel_size == (7, 7, 7)
+    assert decoder.final_refine[0].padding == (3, 3, 3)
+    assert decoder.final_refine[3].kernel_size == (7, 7, 7)
+    assert decoder.final_refine[3].padding == (3, 3, 3)
 
 
 def test_feature_encoder_guidance_backprop_updates_all_stage_tokenbooks(tmp_path: Path):
