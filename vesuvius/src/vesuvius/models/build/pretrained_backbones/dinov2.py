@@ -111,6 +111,11 @@ class PixelShuffleConvDinov2Decoder(nn.Module):
             out_channels=num_classes,
         )
         conv = nn.Conv3d
+        self.pre_refine = nn.Sequential(
+            conv(encoder.embed_dim, encoder.embed_dim, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.GroupNorm(_resolve_group_norm_groups(encoder.embed_dim), encoder.embed_dim),
+            nn.GELU(),
+        )
         final_hidden_channels = max(
             8,
             channels[-2] if num_stages > 1 else min(64, max(8, encoder.embed_dim // 8)),
@@ -123,7 +128,7 @@ class PixelShuffleConvDinov2Decoder(nn.Module):
             stage_ops = [
                 conv(channels[stage_idx], expansion_channels, kernel_size=1, stride=1, padding=0, bias=True),
                 PixelShuffle3D(scale_factors),
-                conv(next_channels, next_channels, kernel_size=3, stride=1, padding=1, bias=True),
+                conv(next_channels, next_channels, kernel_size=5, stride=1, padding=2, bias=True),
                 nn.GroupNorm(_resolve_group_norm_groups(next_channels), next_channels),
                 nn.GELU(),
             ]
@@ -139,6 +144,7 @@ class PixelShuffleConvDinov2Decoder(nn.Module):
 
     def forward(self, features):
         x = features[0] if isinstance(features, list) else features
+        x = self.pre_refine(x)
         x = self.decode(x)
         return self.final_refine(x)
 
