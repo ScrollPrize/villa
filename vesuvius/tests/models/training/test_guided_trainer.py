@@ -370,6 +370,42 @@ def test_pretrained_backbone_pixelshuffle_checkpoint_roundtrip_preserves_plain_i
     assert model_info["network"].final_config["pretrained_decoder_type"] == "pixelshuffle_conv"
 
 
+def test_pretrained_backbone_preref_pixelshuffle_convhead_big_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_pretrained_backbone_mgr(
+        data_root,
+        guide_checkpoint,
+        pretrained_decoder_type="preref_pixelshuffle_convhead_big",
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model()
+    checkpoint_path = tmp_path / "pretrained_preref_pixelshuffle_model.pth"
+    torch.save({"model_config": model.final_config, "model": model.state_dict()}, checkpoint_path)
+
+    output_dir = tmp_path / "inference_out_pretrained_preref_pixelshuffle"
+    output_dir.mkdir()
+    inferer = Inferer(
+        model_path=str(checkpoint_path),
+        input_dir=str(data_root / "images" / "volume1.zarr"),
+        output_dir=str(output_dir),
+        input_format="zarr",
+        do_tta=False,
+        device="cpu",
+        num_dataloader_workers=0,
+        model_type="train_py",
+    )
+
+    model_info = inferer._load_train_py_model(checkpoint_path)
+    output = model_info["network"](torch.randn(1, 1, 16, 16, 16))
+
+    assert isinstance(output, dict)
+    assert set(output.keys()) == {"surface"}
+    assert output["surface"].shape == (1, 2, 16, 16, 16)
+    assert model_info["network"].final_config["pretrained_decoder_type"] == "preref_pixelshuffle_convhead_big"
+
+
 def test_direct_segmentation_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
     data_root = _make_synthetic_dataset(tmp_path)
     guide_checkpoint = tmp_path / "guide_backbone.pt"
