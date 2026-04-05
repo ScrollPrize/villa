@@ -642,8 +642,8 @@ def test_build_dinov2_decoder_accepts_pixelshuffle_convhead_big(tmp_path: Path):
     assert decoder.final_refine[-1].kernel_size == (1, 1, 1)
     assert decoder.final_refine[0].kernel_size == (7, 7, 7)
     assert decoder.final_refine[0].padding == (3, 3, 3)
-    assert decoder.final_refine[3].kernel_size == (7, 7, 7)
-    assert decoder.final_refine[3].padding == (3, 3, 3)
+    assert decoder.final_refine[3].kernel_size == (3, 3, 3)
+    assert decoder.final_refine[3].padding == (1, 1, 1)
 
 
 def test_feature_encoder_guidance_backprop_updates_all_stage_tokenbooks(tmp_path: Path):

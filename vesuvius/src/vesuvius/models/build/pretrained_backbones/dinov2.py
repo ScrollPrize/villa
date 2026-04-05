@@ -179,7 +179,7 @@ class PixelShuffleConvHeadBigDinov2Decoder(nn.Module):
             conv(final_hidden_channels, final_hidden_channels, kernel_size=7, stride=1, padding=3, bias=False),
             nn.GroupNorm(_resolve_group_norm_groups(final_hidden_channels), final_hidden_channels),
             nn.GELU(),
-            conv(final_hidden_channels, final_hidden_channels, kernel_size=7, stride=1, padding=3, bias=True),
+            conv(final_hidden_channels, final_hidden_channels, kernel_size=3, stride=1, padding=1, bias=True),
             conv(final_hidden_channels, num_classes, kernel_size=1, stride=1, padding=0, bias=True),
         )
 
