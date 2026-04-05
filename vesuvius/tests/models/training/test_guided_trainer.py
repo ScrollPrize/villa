@@ -440,6 +440,37 @@ def test_pretrained_backbone_explicit_volumes_dataset_loads_from_volume_specs(tm
     assert len(dataset) > 0
 
 
+def test_pretrained_backbone_explicit_volumes_duplicate_image_ids_match_cache_naming(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_pretrained_backbone_mgr(
+        data_root,
+        guide_checkpoint,
+        pretrained_decoder_type="preref_pixelshuffle_convhead_big",
+    )
+
+    runtime_cfg_dir = tmp_path / "runtime_configs"
+    runtime_cfg_dir.mkdir()
+    image_path = data_root / "images" / "volume1.zarr"
+    label_path = data_root / "labels" / "volume1_surface.zarr"
+    mgr.data_path = runtime_cfg_dir
+    mgr.dataset_config = {
+        "volumes": [
+            {"image": str(image_path), "label": str(label_path)},
+            {"image": str(image_path), "label": str(label_path)},
+            {"image": str(image_path), "label": str(label_path)},
+        ],
+        "skip_patch_validation": True,
+    }
+    mgr.skip_patch_validation = True
+
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    dataset = trainer._configure_dataset(is_training=True)
+
+    assert [vol.volume_id for vol in dataset._volumes] == ["volume1", "volume1_1", "volume1_2"]
+
+
 def test_direct_segmentation_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
     data_root = _make_synthetic_dataset(tmp_path)
     guide_checkpoint = tmp_path / "guide_backbone.pt"

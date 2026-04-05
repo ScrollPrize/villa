@@ -236,7 +236,7 @@ class ZarrDataset(Dataset):
         else:
             raise ValueError("dataset_config.volumes must be a list or mapping")
 
-        seen_volume_ids: set[str] = set()
+        image_id_counts: Dict[str, int] = {}
         logger.info("Loading %d explicit volume specs", len(volume_specs))
 
         for volume_idx, spec in enumerate(volume_specs):
@@ -279,11 +279,8 @@ class ZarrDataset(Dataset):
                 spec=spec,
                 image_path=image_path,
                 label_paths=label_paths,
-                volume_idx=volume_idx,
+                image_id_counts=image_id_counts,
             )
-            if volume_id in seen_volume_ids:
-                volume_id = f"{volume_id}_{volume_idx:03d}"
-            seen_volume_ids.add(volume_id)
 
             self._volumes.append(
                 VolumeInfo(
@@ -339,18 +336,18 @@ class ZarrDataset(Dataset):
         spec: dict,
         image_path: Path,
         label_paths: Dict[str, Optional[Path]],
-        volume_idx: int,
+        image_id_counts: Dict[str, int],
     ) -> str:
         configured_id = spec.get("volume_id") or spec.get("name")
         if configured_id not in (None, ""):
             return str(configured_id)
 
-        labeled_stems = [path.stem for path in label_paths.values() if path is not None]
-        if len(labeled_stems) == 1:
-            return labeled_stems[0]
-        if len(labeled_stems) > 1:
-            return f"{image_path.stem}__{'__'.join(sorted(labeled_stems))}"
-        return f"{image_path.stem}_{volume_idx:03d}"
+        base_id = image_path.stem
+        duplicate_idx = image_id_counts.get(base_id, 0)
+        image_id_counts[base_id] = duplicate_idx + 1
+        if duplicate_idx == 0:
+            return base_id
+        return f"{base_id}_{duplicate_idx}"
 
     def _open_zarr(self, path: Path) -> zarr.Array:
         """Open a zarr array at the configured resolution level."""
