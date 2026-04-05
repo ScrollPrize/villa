@@ -112,7 +112,7 @@ class PixelShuffleConvDinov2Decoder(nn.Module):
         )
         conv = nn.Conv3d
         self.pre_refine = nn.Sequential(
-            conv(encoder.embed_dim, encoder.embed_dim, kernel_size=3, stride=1, padding=1, bias=True),
+            conv(encoder.embed_dim, encoder.embed_dim, kernel_size=3, stride=1, padding=1, bias=False),
             nn.GroupNorm(_resolve_group_norm_groups(encoder.embed_dim), encoder.embed_dim),
             nn.GELU(),
         )
@@ -128,14 +128,14 @@ class PixelShuffleConvDinov2Decoder(nn.Module):
             stage_ops = [
                 conv(channels[stage_idx], expansion_channels, kernel_size=1, stride=1, padding=0, bias=True),
                 PixelShuffle3D(scale_factors),
-                conv(next_channels, next_channels, kernel_size=5, stride=1, padding=2, bias=True),
+                conv(next_channels, next_channels, kernel_size=5, stride=1, padding=2, bias=False),
                 nn.GroupNorm(_resolve_group_norm_groups(next_channels), next_channels),
                 nn.GELU(),
             ]
             stages.append(nn.Sequential(*stage_ops))
         self.decode = nn.Sequential(*stages)
         self.final_refine = nn.Sequential(
-            conv(final_hidden_channels, final_hidden_channels, kernel_size=3, stride=1, padding=1, bias=True),
+            conv(final_hidden_channels, final_hidden_channels, kernel_size=3, stride=1, padding=1, bias=False),
             nn.GroupNorm(_resolve_group_norm_groups(final_hidden_channels), final_hidden_channels),
             nn.GELU(),
             conv(final_hidden_channels, final_hidden_channels, kernel_size=3, stride=1, padding=1, bias=True),
