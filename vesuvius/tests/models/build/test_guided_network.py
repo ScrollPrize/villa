@@ -637,8 +637,8 @@ def test_build_dinov2_decoder_accepts_preref_pixelshuffle_convhead_big(tmp_path:
     assert all(isinstance(stage[3], torch.nn.GroupNorm) for stage in decoder.decode)
     assert all(isinstance(stage[4], torch.nn.GELU) for stage in decoder.decode)
     assert all(isinstance(stage[2], torch.nn.Conv3d) for stage in decoder.decode)
-    assert all(stage[2].kernel_size == (5, 5, 5) for stage in decoder.decode)
-    assert all(stage[2].padding == (2, 2, 2) for stage in decoder.decode)
+    assert all(stage[2].kernel_size == (3, 3, 3) for stage in decoder.decode)
+    assert all(stage[2].padding == (1, 1, 1) for stage in decoder.decode)
     assert all(stage[2].bias is None for stage in decoder.decode)
     assert decoder.decode[-1][2].out_channels > 2
     assert decoder.final_refine[0].in_channels == decoder.decode[-1][2].out_channels

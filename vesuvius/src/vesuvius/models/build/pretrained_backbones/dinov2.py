@@ -174,7 +174,7 @@ class PreRefPixelShuffleConvHeadBigDinov2Decoder(nn.Module):
             stage_ops = [
                 conv(channels[stage_idx], expansion_channels, kernel_size=1, stride=1, padding=0, bias=True),
                 PixelShuffle3D(scale_factors),
-                conv(next_channels, next_channels, kernel_size=5, stride=1, padding=2, bias=False),
+                conv(next_channels, next_channels, kernel_size=3, stride=1, padding=1, bias=False),
                 nn.GroupNorm(_resolve_group_norm_groups(next_channels), next_channels),
                 nn.GELU(),
             ]
