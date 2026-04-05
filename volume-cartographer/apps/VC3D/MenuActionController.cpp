@@ -626,28 +626,22 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
     }
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    authOut->awsSigv4 = true;
-    authOut->region = resolved.awsRegion;
+    *authOut = vc::cache::loadAwsCredentials();
+    if (authOut->region.empty()) authOut->region = resolved.awsRegion;
 
-    auto awsCreds = vc::cache::loadAwsCredentials();
-    authOut->accessKey = awsCreds.accessKey;
-    authOut->secretKey = awsCreds.secretKey;
-    authOut->sessionToken = awsCreds.sessionToken;
-    if (authOut->region.empty()) authOut->region = awsCreds.region;
-
-    if (authOut->accessKey.empty() || authOut->secretKey.empty()) {
+    if (authOut->access_key.empty() || authOut->secret_key.empty()) {
         const auto savedAccess = settings.value(vc3d::settings::aws::ACCESS_KEY).toString();
         const auto savedSecret = settings.value(vc3d::settings::aws::SECRET_KEY).toString();
         const auto savedToken = settings.value(vc3d::settings::aws::SESSION_TOKEN).toString();
 
         if (!savedAccess.isEmpty() && !savedSecret.isEmpty()) {
-            authOut->accessKey = savedAccess.toStdString();
-            authOut->secretKey = savedSecret.toStdString();
-            authOut->sessionToken = savedToken.toStdString();
+            authOut->access_key = savedAccess.toStdString();
+            authOut->secret_key = savedSecret.toStdString();
+            authOut->session_token = savedToken.toStdString();
         }
     }
 
-    if (!authOut->accessKey.empty() && !authOut->secretKey.empty()) {
+    if (!authOut->access_key.empty() && !authOut->secret_key.empty()) {
         return true;
     }
 
@@ -695,9 +689,9 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
         return false;
     }
 
-    authOut->accessKey = accessKey.trimmed().toStdString();
-    authOut->secretKey = secretKey.trimmed().toStdString();
-    authOut->sessionToken = sessionToken.trimmed().toStdString();
+    authOut->access_key = accessKey.trimmed().toStdString();
+    authOut->secret_key = secretKey.trimmed().toStdString();
+    authOut->session_token = sessionToken.trimmed().toStdString();
 
     settings.setValue(vc3d::settings::aws::ACCESS_KEY, accessKey.trimmed());
     settings.setValue(vc3d::settings::aws::SECRET_KEY, secretKey.trimmed());
@@ -1095,14 +1089,10 @@ void MenuActionController::openRemoteZarr(
     auto* watcher = new QFutureWatcher<std::shared_ptr<Volume>>(this);
 
     connect(watcher, &QFutureWatcher<std::shared_ptr<Volume>>::finished, this,
-        [this, watcher, httpsUrl, cachePath]() {
+        [this, watcher, httpsUrl, cachePath, auth]() {
             watcher->deleteLater();
             _openRemoteAct->setEnabled(true);
 
-            // Check for exception before calling result() — Qt wraps
-            // task exceptions in QUnhandledException which can bypass
-            // catch(std::exception&) in signal/slot dispatch and call
-            // std::terminate instead.
             auto future = watcher->future();
             QString errorMsg;
 
@@ -1125,6 +1115,9 @@ void MenuActionController::openRemoteZarr(
                                 .arg(QString::fromStdString(vol->id())),
                             5000);
                     }
+
+                    // Offer to load remote segments
+                    promptAndLoadRemoteSegments(auth, cachePath);
                     return;
                 } catch (const std::exception& e) {
                     errorMsg = extractExceptionMessage(e);
@@ -1201,12 +1194,139 @@ void MenuActionController::openRemoteZarr(
     watcher->setFuture(future);
 }
 
-// Scroll discovery result that can be passed between threads
+// Result struct for background volume+segment loading
 struct ScrollOpenResult {
     std::shared_ptr<Volume> volume;
     std::vector<std::pair<std::string, std::shared_ptr<Surface>>> surfaces;
     std::string errorMsg;
 };
+
+void MenuActionController::promptAndLoadRemoteSegments(
+    const vc::cache::HttpAuth& auth,
+    const std::string& cachePath)
+{
+    bool ok = false;
+    QString segUrl = QInputDialog::getText(
+        _window,
+        QObject::tr("Remote Segments"),
+        QObject::tr("Enter S3/HTTPS URL of directory containing segments\n"
+                     "(leave empty to skip):"),
+        QLineEdit::Normal, QString(), &ok);
+
+    if (!ok || segUrl.trimmed().isEmpty())
+        return;
+
+    auto segResolved = vc::resolveRemoteUrl(segUrl.trimmed().toStdString());
+    vc::cache::HttpAuth segAuth = auth;
+    if (segResolved.useAwsSigv4 && segAuth.region.empty())
+        segAuth.region = segResolved.awsRegion;
+
+    std::string segBaseUrl = segResolved.httpsUrl;
+    while (!segBaseUrl.empty() && segBaseUrl.back() == '/')
+        segBaseUrl.pop_back();
+
+    if (_window->statusBar())
+        _window->statusBar()->showMessage(QObject::tr("Discovering remote segments..."));
+
+    // Probe the URL for segment subdirectories
+    auto* s3Watcher = new QFutureWatcher<vc::cache::S3ListResult>(this);
+    connect(s3Watcher, &QFutureWatcher<vc::cache::S3ListResult>::finished, this,
+        [this, s3Watcher, segBaseUrl, segAuth, cachePath]() {
+            s3Watcher->deleteLater();
+
+            vc::cache::S3ListResult extList;
+            try {
+                extList = s3Watcher->result();
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[RemoteSegments] s3ListObjects failed: %s\n", e.what());
+                if (_window->statusBar())
+                    _window->statusBar()->showMessage(
+                        QObject::tr("Failed to list segments: %1").arg(e.what()), 5000);
+                return;
+            }
+
+            if (extList.prefixes.empty()) {
+                if (_window->statusBar())
+                    _window->statusBar()->showMessage(
+                        QObject::tr("No segment directories found at that URL"), 5000);
+                return;
+            }
+
+            std::fprintf(stderr, "[RemoteSegments] Found %zu segments\n", extList.prefixes.size());
+
+            // Store remote scroll state for on-demand downloads
+            _window->_remoteScroll.baseUrl = segBaseUrl;
+            _window->_remoteScroll.segmentsBaseUrl = segBaseUrl;
+            _window->_remoteScroll.cachePath = cachePath;
+            _window->_remoteScroll.auth = segAuth;
+            _window->_remoteScroll.segSource = vc::RemoteSegmentSource::Direct;
+            _window->_remoteScroll.active = true;
+
+            // Download metadata + load cached surfaces on background thread
+            auto segIds = extList.prefixes;
+            auto* loadWatcher = new QFutureWatcher<ScrollOpenResult>(this);
+            connect(loadWatcher, &QFutureWatcher<ScrollOpenResult>::finished, this,
+                [this, loadWatcher, segIds]() {
+                    loadWatcher->deleteLater();
+
+                    ScrollOpenResult result;
+                    try {
+                        result = loadWatcher->result();
+                    } catch (const std::exception& e) {
+                        if (_window->statusBar())
+                            _window->statusBar()->showMessage(
+                                QObject::tr("Failed to load segments: %1").arg(e.what()), 5000);
+                        return;
+                    }
+
+                    _window->setRemoteStubs(segIds, result.surfaces);
+                    _window->UpdateView();
+
+                    int cached = static_cast<int>(result.surfaces.size());
+                    int total = static_cast<int>(segIds.size());
+                    if (_window->statusBar())
+                        _window->statusBar()->showMessage(
+                            QObject::tr("Loaded %1/%2 segments (rest on-demand)")
+                                .arg(cached).arg(total), 5000);
+                });
+
+            auto loadFuture = QtConcurrent::run(
+                [segBaseUrl, segIds, cachePath, segAuth]() -> ScrollOpenResult {
+                    ScrollOpenResult result;
+                    std::filesystem::path cacheDir = cachePath;
+                    for (const auto& segId : segIds) {
+                        try {
+                            vc::downloadRemoteSegmentMetadataOnly(
+                                segBaseUrl, segId, cacheDir, segAuth,
+                                vc::RemoteSegmentSource::Direct);
+
+                            if (vc::isRemoteSegmentFullyCached(
+                                    cacheDir, segId, vc::RemoteSegmentSource::Direct)) {
+                                // "Direct" uses "paths" subdir
+                                auto localDir = cacheDir / "paths" / segId;
+                                auto seg = Segmentation::New(localDir);
+                                if (seg && seg->canLoadSurface()) {
+                                    auto surf = seg->loadSurface();
+                                    if (surf)
+                                        result.surfaces.emplace_back(segId, surf);
+                                }
+                            }
+                        } catch (const std::exception& e) {
+                            std::fprintf(stderr, "[RemoteSegments] Failed to process segment %s: %s\n",
+                                         segId.c_str(), e.what());
+                        }
+                    }
+                    return result;
+                });
+            loadWatcher->setFuture(loadFuture);
+        });
+
+    auto s3Future = QtConcurrent::run(
+        [segBaseUrl, segAuth]() -> vc::cache::S3ListResult {
+            return vc::cache::s3ListObjects(segBaseUrl + "/", segAuth);
+        });
+    s3Watcher->setFuture(s3Future);
+}
 
 void MenuActionController::openRemoteScroll(
     const std::string& httpsUrl,
@@ -1272,18 +1392,18 @@ void MenuActionController::openRemoteScroll(
                     return;
                 }
 
-                freshAuth.accessKey = accessKey.trimmed().toStdString();
-                freshAuth.secretKey = secretKey.trimmed().toStdString();
-                freshAuth.sessionToken = sessionToken.trimmed().toStdString();
+                freshAuth.access_key = accessKey.trimmed().toStdString();
+                freshAuth.secret_key = secretKey.trimmed().toStdString();
+                freshAuth.session_token = sessionToken.trimmed().toStdString();
 
                 // Save the fresh credentials
                 QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
                 settings.setValue(vc3d::settings::aws::ACCESS_KEY,
-                                  QString::fromStdString(freshAuth.accessKey));
+                                  QString::fromStdString(freshAuth.access_key));
                 settings.setValue(vc3d::settings::aws::SECRET_KEY,
-                                  QString::fromStdString(freshAuth.secretKey));
+                                  QString::fromStdString(freshAuth.secret_key));
                 settings.setValue(vc3d::settings::aws::SESSION_TOKEN,
-                                  QString::fromStdString(freshAuth.sessionToken));
+                                  QString::fromStdString(freshAuth.session_token));
 
                 // Retry discovery with fresh credentials.
                 // Use QTimer::singleShot to break the call stack and limit
@@ -1507,8 +1627,7 @@ void MenuActionController::openRemoteScroll(
                 if (segOk && !segUrl.trimmed().isEmpty()) {
                     auto segResolved = vc::resolveRemoteUrl(segUrl.trimmed().toStdString());
                     vc::cache::HttpAuth segAuth = auth;
-                    if (segResolved.useAwsSigv4 && !segAuth.awsSigv4) {
-                        segAuth.awsSigv4 = true;
+                    if (segResolved.useAwsSigv4 && segAuth.region.empty()) {
                         segAuth.region = segResolved.awsRegion;
                     }
 

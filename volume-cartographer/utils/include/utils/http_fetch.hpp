@@ -22,6 +22,7 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -190,6 +191,13 @@ struct AwsAuth {
         if (auto* v = std::getenv("AWS_DEFAULT_REGION"))      auth.region = v;
         return auth;
     }
+
+    /// Full credential resolution. Tries in order:
+    ///   1. `aws configure export-credentials` (resolves SSO, assume-role, etc.)
+    ///   2. ~/.aws/credentials + ~/.aws/config INI files
+    ///   3. Environment variables
+    /// Respects AWS_PROFILE for methods 1 & 2.
+    [[nodiscard]] static AwsAuth load(const std::string& profile = "default");
 };
 
 // ---------------------------------------------------------------------------
@@ -256,6 +264,89 @@ public:
                                     std::span<const std::byte> data,
                                     std::string_view content_type = "application/octet-stream") const {
         return perform(url, Method::PUT, data, content_type);
+    }
+
+    // PUT from file (streams from disk, constant memory)
+    [[nodiscard]] HttpResponse put_file(std::string_view url,
+                                         const std::filesystem::path& file_path,
+                                         std::string_view content_type = "application/octet-stream") const {
+        std::lock_guard lk(mu_);
+        auto resolved = resolve_url(url);
+
+        FILE* f = std::fopen(file_path.c_str(), "rb");
+        if (!f) throw std::runtime_error("put_file: cannot open " + file_path.string());
+        std::fseek(f, 0, SEEK_END);
+        auto file_size = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+
+        HttpResponse resp;
+        for (std::size_t attempt = 0; attempt <= config_.max_retries; ++attempt) {
+            resp = HttpResponse{};
+            std::fseek(f, 0, SEEK_SET);
+            curl_easy_reset(handle_.get());
+            auto* curl = handle_.get();
+
+            curl_easy_setopt(curl, CURLOPT_URL, resolved.c_str());
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,
+                             static_cast<long>(config_.connect_timeout.count()));
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT,
+                             static_cast<long>(config_.transfer_timeout.count()));
+            curl_easy_setopt(curl, CURLOPT_USERAGENT, config_.user_agent.c_str());
+            if (config_.follow_redirects) {
+                curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+                curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+            }
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp.body);
+            curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
+            curl_easy_setopt(curl, CURLOPT_HEADERDATA, &resp);
+
+            auto auth_state = apply_auth(curl);
+
+            curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+            curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(file_size));
+            curl_easy_setopt(curl, CURLOPT_READDATA, f);
+            // Default read function is fread — no CURLOPT_READFUNCTION needed
+
+            struct curl_slist* extra_headers = nullptr;
+            std::string ct_header;
+            if (!content_type.empty()) {
+                ct_header = "Content-Type: " + std::string{content_type};
+                extra_headers = curl_slist_append(extra_headers, ct_header.c_str());
+                if (auth_state.headers) {
+                    for (auto* node = auth_state.headers; node; node = node->next)
+                        extra_headers = curl_slist_append(extra_headers, node->data);
+                    curl_slist_free_all(auth_state.headers);
+                    auth_state.headers = nullptr;
+                }
+                curl_easy_setopt(curl, CURLOPT_HTTPHEADER, extra_headers);
+            }
+
+            auto code = curl_easy_perform(curl);
+            if (extra_headers) curl_slist_free_all(extra_headers);
+
+            if (code == CURLE_OK) {
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp.status_code);
+                if (resp.status_code >= 500 && attempt < config_.max_retries) {
+                    thread_local std::mt19937 rng{std::random_device{}()};
+                    std::uniform_int_distribution<unsigned> jitter(0, 100);
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(200 * (1u << attempt) + jitter(rng)));
+                    continue;
+                }
+                std::fclose(f);
+                return resp;
+            }
+            if (attempt < config_.max_retries) {
+                thread_local std::mt19937 rng{std::random_device{}()};
+                std::uniform_int_distribution<unsigned> jitter(0, 100);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(200 * (1u << attempt) + jitter(rng)));
+                continue;
+            }
+        }
+        std::fclose(f);
+        return resp;
     }
 
 private:

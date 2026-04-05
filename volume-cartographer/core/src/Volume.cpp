@@ -224,13 +224,11 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     // Resolve s3:// URLs to https:// and detect AWS credentials
     auto resolved = vc::resolveRemoteUrl(url);
     vc::cache::HttpAuth auth = authIn;
-    if (resolved.useAwsSigv4 && !auth.awsSigv4) {
-        // Load from ~/.aws/ files (written by `aws configure` / `aws sso login`),
-        // falling back to environment variables.
+    if (resolved.useAwsSigv4 && auth.empty()) {
         auth = vc::cache::loadAwsCredentials();
         if (auth.region.empty())
             auth.region = resolved.awsRegion;
-    } else if (resolved.useAwsSigv4 && auth.awsSigv4 && auth.region.empty()) {
+    } else if (resolved.useAwsSigv4 && auth.region.empty()) {
         auth.region = resolved.awsRegion;
     }
 

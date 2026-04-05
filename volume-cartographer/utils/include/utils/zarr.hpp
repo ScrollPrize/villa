@@ -1447,8 +1447,8 @@ public:
 
         base_url = s3_to_https(*parsed);
 
-        // Resolve auth: explicit > env
-        AwsAuth aws = auth.value_or(AwsAuth::from_env());
+        // Resolve auth: explicit > load (SSO/files/env)
+        AwsAuth aws = auth.value_or(AwsAuth::load());
 
         // If the URL included a region, prefer that over env/explicit
         if (!parsed->region.empty())

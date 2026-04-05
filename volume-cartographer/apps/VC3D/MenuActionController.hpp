@@ -69,6 +69,7 @@ private:
     void attachRemoteZarrUrl(const QString& url, bool persistEntry = true);
     void openRemoteZarr(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
     void openRemoteScroll(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
+    void promptAndLoadRemoteSegments(const vc::cache::HttpAuth& auth, const std::string& cachePath);
     bool tryResolveRemoteAuth(const QString& url,
                               vc::cache::HttpAuth* authOut,
                               bool allowPrompt,

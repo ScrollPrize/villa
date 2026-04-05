@@ -33,6 +33,7 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <set>
 #include <chrono>
 
 #include "utils/Json.hpp"
@@ -63,6 +64,7 @@ struct IOBackend {
     virtual std::string read_string(const std::string& key) = 0;
     virtual bool exists(const std::string& key) = 0;
     virtual std::vector<std::string> list_chunks(const std::string& prefix) = 0;
+    virtual void write_from_file(const std::string& key, const std::string& file_path) = 0;
 };
 
 // --- Local filesystem backend ---
@@ -105,6 +107,17 @@ struct LocalBackend : IOBackend {
                            std::istreambuf_iterator<char>());
     }
 
+    void write_from_file(const std::string& key, const std::string& file_path) override {
+        auto p = root / key;
+        fs::create_directories(p.parent_path());
+        std::error_code ec;
+        fs::rename(file_path, p, ec);
+        if (ec) {
+            fs::copy_file(file_path, p, fs::copy_options::overwrite_existing);
+            fs::remove(file_path);
+        }
+    }
+
     bool exists(const std::string& key) override {
         return fs::exists(root / key);
     }
@@ -138,7 +151,7 @@ struct S3Backend : IOBackend {
 
         // Configure client with AWS auth
         utils::HttpClient::Config cfg;
-        cfg.aws_auth = utils::AwsAuth::from_env();
+        cfg.aws_auth = utils::AwsAuth::load();
         if (!parsed->region.empty()) cfg.aws_auth.region = parsed->region;
         if (cfg.aws_auth.region.empty()) cfg.aws_auth.region = "us-east-1";
         cfg.transfer_timeout = std::chrono::seconds(120);
@@ -176,6 +189,16 @@ struct S3Backend : IOBackend {
     std::string read_string(const std::string& key) override {
         auto data = read(key);
         return std::string(reinterpret_cast<const char*>(data.data()), data.size());
+    }
+
+    void write_from_file(const std::string& key, const std::string& file_path) override {
+        auto resp = client->put_file(url(key), file_path);
+        if (!resp.ok()) {
+            fs::remove(file_path);
+            throw std::runtime_error("S3 PUT failed (" + std::to_string(resp.status_code) +
+                                     "): " + url(key));
+        }
+        fs::remove(file_path);
     }
 
     bool exists(const std::string& key) override {
@@ -471,6 +494,7 @@ static std::vector<bool> build_occupancy_mask(
 // ============================================================================
 
 int main(int argc, char** argv) {
+    setlinebuf(stdout);
     if (argc < 3) {
         std::cerr << "Usage: vc_zarr_recompress <input> <output> [options]\n"
                   << "\n"
@@ -658,6 +682,24 @@ int main(int argc, char** argv) {
                 for (size_t sx = 0; sx < shard_nx; sx++)
                     shard_positions.push_back({sz, sy, sx});
 
+        // List existing shards for resume (one S3 list instead of per-shard HEAD)
+        std::set<std::string> existing_shards;
+        {
+            std::string shard_prefix = std::to_string(l) + "/c/";
+            auto keys = output->list_chunks(shard_prefix);
+            for (auto& k : keys) {
+                // Extract shard key: "level/c/sz/sy/sx" from "level/c/sz/sy/sx/..."
+                // Shard files are just "level/c/sz/sy/sx" (no subdirectory)
+                auto rel = k.substr(shard_prefix.size());
+                // rel is like "0/0/0" — reconstruct full shard key
+                existing_shards.insert(shard_prefix + rel);
+            }
+            if (!existing_shards.empty()) {
+                printf("  Resume: found %zu existing shards, will skip\n",
+                       existing_shards.size());
+            }
+        }
+
         std::atomic<size_t> total_raw{0}, total_compressed{0};
         std::atomic<int> processed_shards{0}, processed_chunks{0};
         std::atomic<int> errs{0}, skipped_chunks{0};
@@ -677,13 +719,32 @@ int main(int argc, char** argv) {
 
                 auto [sz, sy, sx] = shard_positions[si];
 
+                // Skip shards that already exist (resume support)
+                std::string shard_key = std::to_string(l) + "/c/" +
+                    std::to_string(sz) + "/" +
+                    std::to_string(sy) + "/" +
+                    std::to_string(sx);
+                if (existing_shards.count(shard_key)) {
+                    int s_count = processed_shards.fetch_add(1) + 1;
+                    if (s_count % 100 == 0) {
+                        std::lock_guard lk(print_mtx);
+                        printf("  %d/%zu shards (skipping existing)\n",
+                               s_count, total_shards);
+                    }
+                    continue;
+                }
+
                 // Base 128³ chunk coords for this shard
                 size_t base_cz = sz * CHUNKS_PER_SHARD;
                 size_t base_cy = sy * CHUNKS_PER_SHARD;
                 size_t base_cx = sx * CHUNKS_PER_SHARD;
 
-                // Build shard: encode each inner 128³ chunk
-                std::vector<std::byte> shard_data;
+                // Stream shard to temp file: encode each inner 128³ chunk
+                std::string temp_path = "/tmp/shard_" + std::to_string(l) + "_" +
+                    std::to_string(sz) + "_" + std::to_string(sy) + "_" +
+                    std::to_string(sx) + ".tmp";
+                std::ofstream shard_file(temp_path, std::ios::binary | std::ios::trunc);
+                size_t shard_pos = 0;
                 // Index: INNER_CHUNKS entries, 16 bytes each (offset + nbytes)
                 std::vector<std::byte> index_bytes(INNER_CHUNKS * 16);
                 // Initialize all index entries to missing (0xFFFFFFFFFFFFFFFF)
@@ -729,12 +790,13 @@ int main(int argc, char** argv) {
                                     // Write directly into shard
                                     size_t inner_idx = iz * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD +
                                                        iy * CHUNKS_PER_SHARD + ix;
-                                    uint64_t offset = shard_data.size();
+                                    uint64_t offset = shard_pos;
                                     uint64_t nbytes = data.size();
                                     write_le64(index_bytes.data() + inner_idx * 16, offset);
                                     write_le64(index_bytes.data() + inner_idx * 16 + 8, nbytes);
-                                    shard_data.insert(shard_data.end(),
-                                                      data.begin(), data.end());
+                                    shard_file.write(reinterpret_cast<const char*>(data.data()),
+                                                     data.size());
+                                    shard_pos += data.size();
                                     any_data = true;
                                     processed_chunks.fetch_add(1);
                                     total_compressed.fetch_add(data.size());
@@ -803,13 +865,14 @@ int main(int argc, char** argv) {
                             // Record in shard index
                             size_t inner_idx = iz * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD +
                                                iy * CHUNKS_PER_SHARD + ix;
-                            uint64_t offset = shard_data.size();
+                            uint64_t offset = shard_pos;
                             uint64_t nbytes = compressed.size();
                             write_le64(index_bytes.data() + inner_idx * 16, offset);
                             write_le64(index_bytes.data() + inner_idx * 16 + 8, nbytes);
 
-                            shard_data.insert(shard_data.end(),
-                                              compressed.begin(), compressed.end());
+                            shard_file.write(reinterpret_cast<const char*>(compressed.data()),
+                                             compressed.size());
+                            shard_pos += compressed.size();
                             any_data = true;
                             processed_chunks.fetch_add(1);
                         }
@@ -818,15 +881,13 @@ int main(int argc, char** argv) {
 
                 if (any_data) {
                     // Append index at end of shard
-                    shard_data.insert(shard_data.end(),
-                                      index_bytes.begin(), index_bytes.end());
-
-                    // Write shard: level/c/sz/sy/sx
-                    std::string shard_key = std::to_string(l) + "/c/" +
-                        std::to_string(sz) + "/" +
-                        std::to_string(sy) + "/" +
-                        std::to_string(sx);
-                    t_output->write(shard_key, shard_data);
+                    shard_file.write(reinterpret_cast<const char*>(index_bytes.data()),
+                                     index_bytes.size());
+                    shard_file.close();
+                    t_output->write_from_file(shard_key, temp_path);
+                } else {
+                    shard_file.close();
+                    fs::remove(temp_path);
                 }
 
                 int s_count = processed_shards.fetch_add(1) + 1;

@@ -71,7 +71,7 @@ target_link_libraries(vc_core PRIVATE
     $<BUILD_INTERFACE:blosc_static>
 )
 
-target_compile_definitions(vc_core PUBLIC VC_USE_CURL)
+
 
 # Slicing.cpp is the hot sampling loop (87% of render time).
 # Force O3 + fast-math for maximum vectorization regardless of build type.

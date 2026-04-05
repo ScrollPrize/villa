@@ -164,16 +164,16 @@ vc::cache::HttpAuth authForRemoteTransformSource(const QString& source)
     if (auth.region.empty())
         auth.region = resolved.awsRegion;
     // Fall back to saved QSettings if ~/.aws/ files had nothing
-    if (auth.accessKey.empty() || auth.secretKey.empty()) {
+    if (auth.access_key.empty() || auth.secret_key.empty()) {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         const auto savedAccess = settings.value(vc3d::settings::aws::ACCESS_KEY).toString();
         const auto savedSecret = settings.value(vc3d::settings::aws::SECRET_KEY).toString();
         const auto savedToken = settings.value(vc3d::settings::aws::SESSION_TOKEN).toString();
 
         if (!savedAccess.isEmpty() && !savedSecret.isEmpty()) {
-            auth.accessKey = savedAccess.toStdString();
-            auth.secretKey = savedSecret.toStdString();
-            auth.sessionToken = savedToken.toStdString();
+            auth.access_key = savedAccess.toStdString();
+            auth.secret_key = savedSecret.toStdString();
+            auth.session_token = savedToken.toStdString();
         }
     }
 
