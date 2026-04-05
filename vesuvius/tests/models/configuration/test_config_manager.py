@@ -182,3 +182,29 @@ class TestTargetNameValidation:
                 mgr.load_config(temp_path)
         finally:
             Path(temp_path).unlink()
+
+    def test_explicit_single_label_volume_does_not_force_allow_unlabeled(self):
+        config = {
+            "dataset_config": {
+                "targets": {
+                    "surface": {"out_channels": 2}
+                },
+                "volumes": [
+                    {
+                        "image": "/tmp/image.zarr",
+                        "label": "/tmp/label_surface.zarr",
+                    }
+                ],
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+
+        try:
+            mgr = ConfigManager(verbose=False)
+            mgr.load_config(temp_path)
+            assert mgr.allow_unlabeled_data is False
+        finally:
+            Path(temp_path).unlink()

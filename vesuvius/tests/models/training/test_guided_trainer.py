@@ -406,6 +406,40 @@ def test_pretrained_backbone_preref_pixelshuffle_convhead_big_checkpoint_roundtr
     assert model_info["network"].final_config["pretrained_decoder_type"] == "preref_pixelshuffle_convhead_big"
 
 
+def test_pretrained_backbone_explicit_volumes_dataset_loads_from_volume_specs(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_pretrained_backbone_mgr(
+        data_root,
+        guide_checkpoint,
+        pretrained_decoder_type="preref_pixelshuffle_convhead_big",
+    )
+
+    runtime_cfg_dir = tmp_path / "runtime_configs"
+    runtime_cfg_dir.mkdir()
+    mgr.data_path = runtime_cfg_dir
+    mgr.dataset_config = {
+        "volumes": [
+            {
+                "image": str(data_root / "images" / "volume1.zarr"),
+                "label": str(data_root / "labels" / "volume1_surface.zarr"),
+            }
+        ],
+        "skip_patch_validation": True,
+    }
+    mgr.skip_patch_validation = True
+
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    dataset = trainer._configure_dataset(is_training=True)
+
+    assert len(dataset._volumes) == 1
+    assert dataset._volumes[0].image_path == data_root / "images" / "volume1.zarr"
+    assert dataset._volumes[0].label_paths["surface"] == data_root / "labels" / "volume1_surface.zarr"
+    assert dataset._volumes[0].has_labels is True
+    assert len(dataset) > 0
+
+
 def test_direct_segmentation_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
     data_root = _make_synthetic_dataset(tmp_path)
     guide_checkpoint = tmp_path / "guide_backbone.pt"
