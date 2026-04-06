@@ -24,9 +24,6 @@ struct TiledViewerCamera {
     // Derived: 2^(-dsScaleIdx), e.g., level 2 -> 0.25
     float dsScale = 0.5f;
 
-    // Monotonic invalidation counter, bumped on every state change
-    uint64_t epoch = 0;
-
     // Additional override for downscale (from settings)
     int downscaleOverride = 0;
 
@@ -34,8 +31,7 @@ struct TiledViewerCamera {
     static constexpr float MIN_SCALE = 0.01f;
     static constexpr float MAX_SCALE = 10.0f;
 
-    // Bump epoch to invalidate all in-flight renders
-    constexpr void invalidate() noexcept { ++epoch; }
+    constexpr void invalidate() noexcept { }
 
     // Recalculate pyramid level from current scale.
     // numScales = volume->numScales()

@@ -27,9 +27,7 @@ TileRenderController::TileRenderController(TileScene* tileScene, RenderPool* sha
     // No per-tile QImage/QPixmap creation — just a memcpy into the right position.
     _viewportRenderer.setResultCallback([this](TileRenderResult&& result) {
         if (result.pixels.empty()) return;
-        // Discard stale tiles from previous zoom levels — their worldCol
-        // means a different surface position at the current worldTileSize.
-        if (std::abs(result.scale - _tileScene->camScale()) > 0.01f) return;
+        if (result.batch != _viewportRenderer.currentBatch()) return;
         _tileScene->blitTile(result.worldKey, result.pixels.data(),
                              result.width, result.height);
         _anyUpdatedThisTick = true;

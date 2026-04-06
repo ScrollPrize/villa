@@ -30,6 +30,8 @@ void ViewportRenderer::onCameraChanged(
     float vpLeft, float vpTop, float vpRight, float vpBottom)
 {
     pool()->clearQueue();
+    pool()->takeResults(_controllerId);
+    ++_batch;
 
     _desiredLevel = camera.dsScaleIdx;
     _lastCamera = camera;
@@ -46,6 +48,7 @@ void ViewportRenderer::onCameraChanged(
 
     for (const auto& wk : visibleKeys) {
         TileRenderParams params = buildParams(wk);
+        params.batch = _batch;
         pool()->submit(params, surface, volume, _controllerId);
     }
 }
@@ -58,15 +61,19 @@ void ViewportRenderer::onCameraChangedDirect(
     const std::vector<WorldTileKey>& visibleKeys)
 {
     pool()->clearQueue();
+    pool()->takeResults(_controllerId); // discard completed stale results
+    ++_batch;
 
     _desiredLevel = camera.dsScaleIdx;
     _lastCamera = camera;
     _lastSurface = surface;
     _lastVolume = volume;
     _lastBuildParams = buildParams;
+    _lastVisibleKeys = visibleKeys;
 
     for (const auto& wk : visibleKeys) {
         TileRenderParams params = buildParams(wk);
+        params.batch = _batch;
         pool()->submit(params, surface, volume, _controllerId);
     }
 }
@@ -88,20 +95,13 @@ void ViewportRenderer::scheduleRender(
     const std::function<TileRenderParams(const WorldTileKey&)>& buildParams,
     float vpLeft, float vpTop, float vpRight, float vpBottom)
 {
-    _pendingCamera = camera;
-    _pendingSurface = surface;
-    _pendingVolume = volume;
-    _pendingBuildParams = buildParams;
-    _pendingVpL = vpLeft;
-    _pendingVpT = vpTop;
-    _pendingVpR = vpRight;
-    _pendingVpB = vpBottom;
-    _pendingDirty = true;
+    onCameraChanged(camera, surface, volume, buildParams, vpLeft, vpTop, vpRight, vpBottom);
 }
 
 void ViewportRenderer::cancelAll()
 {
     pool()->clearQueue();
+    pool()->takeResults(_controllerId); // discard this view's stale results
 }
 
 void ViewportRenderer::clearState()
@@ -110,12 +110,6 @@ void ViewportRenderer::clearState()
     _lastVolume.reset();
     _lastBuildParams = nullptr;
     _lastVpL = _lastVpT = _lastVpR = _lastVpB = 0;
-
-    _pendingDirty = false;
-    _pendingSurface.reset();
-    _pendingVolume.reset();
-    _pendingBuildParams = nullptr;
-
     _chunkArrived.store(false, std::memory_order_relaxed);
 }
 
@@ -149,80 +143,22 @@ void ViewportRenderer::markOverlaysDirty()
     _overlaysDirty.store(true, std::memory_order_release);
 }
 
-void ViewportRenderer::drainResults()
+bool ViewportRenderer::tick()
 {
+    // Drain completed results and blit them
     auto results = pool()->takeResults(_controllerId);
-
     bool anyUpdated = false;
-
     for (auto& result : results) {
         if (!result.pixels.empty()) {
-            _tileGrid.setTileMeta(
-                result.worldKey, result.epoch,
-                static_cast<int8_t>(result.actualLevel));
-
             anyUpdated = true;
             if (_resultCallback)
                 _resultCallback(std::move(result));
         }
     }
-
     if (anyUpdated && _sceneUpdatedCallback)
         _sceneUpdatedCallback();
 
-    if (_pendingDirty) {
-        _pendingDirty = false;
-        onCameraChanged(_pendingCamera, _pendingSurface,
-                        _pendingVolume, _pendingBuildParams,
-                        _pendingVpL, _pendingVpT, _pendingVpR, _pendingVpB);
-        _pendingSurface.reset();
-        _pendingVolume.reset();
-        _pendingBuildParams = nullptr;
-    }
-}
-
-bool ViewportRenderer::tick()
-{
-    // 1. Take completed results and blit them
-    drainResults();
-
-    // 2. Chunks arrived → re-render for finer data
-    bool chunksJustArrived = _chunkArrived.exchange(false, std::memory_order_acq_rel);
-
-    // 3. Progressive refinement: only re-render when new chunks arrived
-    //    (meaning finer data is now available). Don't spin re-rendering
-    //    on idle — if the same coarse level is all that's cached, we'd
-    //    just produce identical pixels and waste CPU.
-    bool shouldRefine = chunksJustArrived;
-    if (_progressiveEnabled && shouldRefine) {
-        if (_lastSurface && _lastVolume && _lastBuildParams) {
-            auto stale = _tileGrid.staleTilesInRect(
-                _desiredLevel, 0,
-                _lastVpL, _lastVpT, _lastVpR, _lastVpB,
-                tiled_config::VISIBLE_BUFFER_TILES);
-            if (!stale.empty()) {
-                int submitted = 0;
-                for (const auto& wk : stale) {
-                    if (submitted >= 32) break;
-                    TileRenderParams params = _lastBuildParams(wk);
-                    params.submitPriority = 1000 + submitted;
-                    pool()->submit(params, _lastSurface, _lastVolume, _controllerId);
-                    ++submitted;
-                }
-                if (submitted > 0) return true;
-            }
-        }
-    }
-
-    // 4. Overlay update
-    if (_overlaysDirty.exchange(false, std::memory_order_acq_rel)) {
-        if (_overlayCallback) _overlayCallback();
-    }
-
-    if (pool()->busy() || _pendingDirty)
-        return true;
-
-    return false;
+    return pool()->busy();
 }
 
 } // namespace vc::render

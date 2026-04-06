@@ -215,29 +215,12 @@ public:
         std::string user_agent{"utils-http/1.0"};
     };
 
-    HttpClient()
-        : config_{}
-        , handle_(detail::make_curl())
-    {
-        if (!handle_)
-            throw std::runtime_error("http_fetch: failed to create curl handle");
-    }
+    HttpClient() = default;
 
     explicit HttpClient(Config config)
         : config_(std::move(config))
-        , handle_(detail::make_curl())
     {
-        if (!handle_)
-            throw std::runtime_error("http_fetch: failed to create curl handle");
     }
-
-    ~HttpClient() = default;
-
-    HttpClient(const HttpClient&) = delete;
-    HttpClient& operator=(const HttpClient&) = delete;
-
-    HttpClient(HttpClient&&) = delete;
-    HttpClient& operator=(HttpClient&&) = delete;
 
     // GET request
     [[nodiscard]] HttpResponse get(std::string_view url) const {
@@ -270,7 +253,6 @@ public:
     [[nodiscard]] HttpResponse put_file(std::string_view url,
                                          const std::filesystem::path& file_path,
                                          std::string_view content_type = "application/octet-stream") const {
-        std::lock_guard lk(mu_);
         auto resolved = resolve_url(url);
 
         FILE* f = std::fopen(file_path.c_str(), "rb");
@@ -283,8 +265,8 @@ public:
         for (std::size_t attempt = 0; attempt <= config_.max_retries; ++attempt) {
             resp = HttpResponse{};
             std::fseek(f, 0, SEEK_SET);
-            curl_easy_reset(handle_.get());
-            auto* curl = handle_.get();
+            auto* curl = thread_handle();
+            curl_easy_reset(curl);
 
             curl_easy_setopt(curl, CURLOPT_URL, resolved.c_str());
             curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,
@@ -479,19 +461,26 @@ private:
         return to_copy;
     }
 
+    [[nodiscard]] CURL* thread_handle() const {
+        thread_local detail::CurlHandle tl_handle{nullptr};
+        if (!tl_handle) {
+            tl_handle = detail::make_curl();
+        }
+        return tl_handle.get();
+    }
+
     [[nodiscard]] HttpResponse perform(std::string_view url,
                                         Method method,
                                         std::span<const std::byte> put_data,
                                         std::string_view content_type,
                                         std::string range = {}) const {
-        std::lock_guard lk(mu_);
         auto resolved = resolve_url(url);
         HttpResponse resp;
 
         for (std::size_t attempt = 0; attempt <= config_.max_retries; ++attempt) {
             resp = HttpResponse{};
-            curl_easy_reset(handle_.get());
-            auto* curl = handle_.get();
+            auto* curl = thread_handle();
+            curl_easy_reset(curl);
 
             // URL
             curl_easy_setopt(curl, CURLOPT_URL, resolved.c_str());
@@ -602,8 +591,6 @@ private:
     }
 
     Config config_;
-    detail::CurlHandle handle_;
-    mutable std::mutex mu_;
 };
 
 } // namespace utils

@@ -28,18 +28,18 @@ public:
     // Set tile with staleness check (grid-local coordinates).
     // Stores pixels and updates metadata.  Returns true if accepted.
     bool setTile(const TileKey& key, std::vector<uint32_t>&& pixels,
-                 int width, int height, uint64_t epoch, int8_t level,
+                 int width, int height, int8_t level,
                  std::chrono::steady_clock::time_point submitTime = {},
                  std::chrono::steady_clock::time_point renderDone = {});
 
     // Set tile by world key (converts to grid position internally).
     bool setTileWorld(const WorldTileKey& wk, std::vector<uint32_t>&& pixels,
-                      int width, int height, uint64_t epoch, int8_t level,
+                      int width, int height, int8_t level,
                       std::chrono::steady_clock::time_point submitTime = {},
                       std::chrono::steady_clock::time_point renderDone = {});
 
-    // Update metadata only (no pixel storage). Returns true if accepted by staleness check.
-    bool setTileMeta(const WorldTileKey& wk, uint64_t epoch, int8_t level);
+    // Update metadata only (no pixel storage). Returns true if accepted.
+    bool setTileMeta(const WorldTileKey& wk, int8_t level);
 
     // Returns true if the tile at wk has no rendered content (level == -1).
     bool tileNeedsContent(const WorldTileKey& wk) const;
@@ -77,7 +77,7 @@ public:
 
     // World keys of tiles whose rendered level is worse than desiredLevel,
     // limited to tiles visible in the given viewport rect.
-    std::vector<WorldTileKey> staleTilesInRect(int desiredLevel, uint64_t epoch,
+    std::vector<WorldTileKey> staleTilesInRect(int desiredLevel,
                                                float vpL, float vpT, float vpR, float vpB,
                                                int buffer = tiled_config::VISIBLE_BUFFER_TILES) const;
 

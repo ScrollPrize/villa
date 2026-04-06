@@ -66,6 +66,15 @@ void TileScene::flush()
     _dirty = false;
 }
 
+void TileScene::setCamera(float surfX, float surfY, float scale)
+{
+    bool changed = std::abs(surfX - _camSurfX) > 0.01f ||
+                   std::abs(surfY - _camSurfY) > 0.01f ||
+                   std::abs(scale - _camScale) > 1e-6f;
+    _camSurfX = surfX; _camSurfY = surfY; _camScale = scale;
+    if (changed) clearAll();
+}
+
 void TileScene::clearAll()
 {
     if (!_framebuffer.isNull())

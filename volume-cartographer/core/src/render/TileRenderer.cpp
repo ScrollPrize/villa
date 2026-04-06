@@ -67,10 +67,10 @@ TileRenderResult TileRenderer::renderTile(
 {
     TileRenderResult result;
     result.worldKey = params.worldKey;
-    result.epoch = params.epoch;
     result.scale = params.scale;
     result.zOff = params.zOff;
     result.dsScaleIdx = params.dsScaleIdx;
+    result.batch = params.batch;
     result.width = params.tileW;
     result.height = params.tileH;
 
@@ -122,7 +122,6 @@ TileRenderResult TileRenderer::renderTile(
         planeVxStep = vx / params.scale;
         planeVyStep = vy / params.scale;
         planeOrigin = vx * totalOffset[0] + vy * totalOffset[1] + useOrigin;
-
     }
 
     // Generate coordinates for non-fused paths.

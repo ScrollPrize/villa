@@ -69,10 +69,6 @@ public:
 
     RenderPool* renderPool() const { return _renderPool; }
 
-    // Progressive rendering: show coarse previews while full-res loads
-    void setProgressiveEnabled(bool enabled) { _viewportRenderer.setProgressiveEnabled(enabled); }
-    bool progressiveEnabled() const { return _viewportRenderer.progressiveEnabled(); }
-
     // --- Dirty flags (set by viewer, processed each tick) ---
     void markOverlaysDirty();
     void markChunkArrived(int chunkLevel = 0);

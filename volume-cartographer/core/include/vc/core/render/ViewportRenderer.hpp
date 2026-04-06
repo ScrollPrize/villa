@@ -76,13 +76,10 @@ public:
     void setOverlayCallback(std::function<void()> cb);
     void setResultCallback(std::function<void(TileRenderResult&&)> cb) { _resultCallback = std::move(cb); }
 
-    void setProgressiveEnabled(bool enabled) noexcept { _progressiveEnabled = enabled; }
-    [[nodiscard]] bool progressiveEnabled() const noexcept { return _progressiveEnabled; }
-
     [[nodiscard]] int controllerId() const noexcept { return _controllerId; }
+    [[nodiscard]] uint32_t currentBatch() const noexcept { return _batch; }
 
 private:
-    void drainResults();
 
     [[nodiscard]] CoreRenderPool* pool() noexcept { return _externalPool ? _externalPool : _renderPool.get(); }
     [[nodiscard]] const CoreRenderPool* pool() const noexcept { return _externalPool ? _externalPool : _renderPool.get(); }
@@ -92,26 +89,17 @@ private:
     CoreRenderPool* _externalPool = nullptr;
 
     int _controllerId;
+    uint32_t _batch = 0;
     static inline std::atomic<int> _nextControllerId{0};
 
     float _lastVpL = 0, _lastVpT = 0, _lastVpR = 0, _lastVpB = 0;
 
-    bool _progressiveEnabled = true;
     int _desiredLevel = 0;
-
-    // Last render state for refinement
     TiledViewerCamera _lastCamera;
     std::shared_ptr<Surface> _lastSurface;
     std::shared_ptr<Volume> _lastVolume;
     std::function<TileRenderParams(const WorldTileKey&)> _lastBuildParams;
-
-    // Pending state for coalescing
-    bool _pendingDirty = false;
-    TiledViewerCamera _pendingCamera;
-    std::shared_ptr<Surface> _pendingSurface;
-    std::shared_ptr<Volume> _pendingVolume;
-    std::function<TileRenderParams(const WorldTileKey&)> _pendingBuildParams;
-    float _pendingVpL = 0, _pendingVpT = 0, _pendingVpR = 0, _pendingVpB = 0;
+    std::vector<WorldTileKey> _lastVisibleKeys;
 
     std::atomic<bool> _overlaysDirty{false};
     std::atomic<bool> _chunkArrived{false};

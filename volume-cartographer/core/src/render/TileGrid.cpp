@@ -61,7 +61,7 @@ bool TileGrid::rebuildGrid(const ContentBounds& bounds, int viewportW, int viewp
 }
 
 bool TileGrid::setTile(const TileKey& key, std::vector<uint32_t>&& pixels,
-                        int width, int height, uint64_t epoch, int8_t level,
+                        int width, int height, int8_t level,
                         std::chrono::steady_clock::time_point submitTime,
                         std::chrono::steady_clock::time_point renderDone)
 {
@@ -73,19 +73,7 @@ bool TileGrid::setTile(const TileKey& key, std::vector<uint32_t>&& pixels,
     const size_t idx = static_cast<size_t>(key.row) * static_cast<size_t>(_bounds.totalCols) + static_cast<size_t>(key.col);
     auto& m = _meta[idx];
 
-    // Accept if newer epoch (any level -- new camera state wins).
-    // Accept if same epoch and finer level (progressive refinement).
-    // Also accept if slightly older epoch but MUCH finer level.
-    if (epoch < m.epoch) {
-        constexpr uint64_t kEpochGrace = 3;
-        bool finerFromRecentEpoch = (m.epoch - epoch <= kEpochGrace) &&
-                                     m.level >= 0 && level >= 0 && level < m.level;
-        if (!finerFromRecentEpoch) return false;
-    }
-    if (epoch == m.epoch && m.level >= 0 && level >= m.level) return false;
-
     bool wasFilling = (m.level < 0);
-    m.epoch = epoch;
     m.level = level;
 
     auto& td = _tiles[idx];
@@ -103,7 +91,7 @@ bool TileGrid::setTile(const TileKey& key, std::vector<uint32_t>&& pixels,
 }
 
 bool TileGrid::setTileWorld(const WorldTileKey& wk, std::vector<uint32_t>&& pixels,
-                             int width, int height, uint64_t epoch, int8_t level,
+                             int width, int height, int8_t level,
                              std::chrono::steady_clock::time_point submitTime,
                              std::chrono::steady_clock::time_point renderDone)
 {
@@ -111,11 +99,11 @@ bool TileGrid::setTileWorld(const WorldTileKey& wk, std::vector<uint32_t>&& pixe
     if (!_bounds.gridPosition(wk, col, row)) {
         return false;
     }
-    return setTile(TileKey{col, row}, std::move(pixels), width, height, epoch, level,
+    return setTile(TileKey{col, row}, std::move(pixels), width, height, level,
                    submitTime, renderDone);
 }
 
-bool TileGrid::setTileMeta(const WorldTileKey& wk, uint64_t epoch, int8_t level)
+bool TileGrid::setTileMeta(const WorldTileKey& wk, int8_t level)
 {
     int col, row;
     if (!_bounds.gridPosition(wk, col, row)) return false;
@@ -123,18 +111,7 @@ bool TileGrid::setTileMeta(const WorldTileKey& wk, uint64_t epoch, int8_t level)
     if (idx >= _meta.size()) return false;
 
     auto& m = _meta[idx];
-
-    // Same staleness check as setTile
-    if (epoch < m.epoch) {
-        constexpr uint64_t kEpochGrace = 3;
-        bool finerFromRecentEpoch = (m.epoch - epoch <= kEpochGrace) &&
-                                     m.level >= 0 && level >= 0 && level < m.level;
-        if (!finerFromRecentEpoch) return false;
-    }
-    if (epoch == m.epoch && m.level >= 0 && level >= m.level) return false;
-
     bool wasFilling = (m.level < 0);
-    m.epoch = epoch;
     m.level = level;
 
     if (wasFilling && level >= 0)
@@ -169,7 +146,6 @@ bool TileGrid::tileNeedsContent(const WorldTileKey& wk) const
 void TileGrid::resetMetadata()
 {
     for (auto& m : _meta) {
-        m.epoch = 0;
         m.level = -1;
     }
     _unfilledCount = static_cast<int>(_meta.size());
@@ -266,7 +242,7 @@ int TileGrid::worstVisibleLevel(float vpL, float vpT, float vpR, float vpB) cons
     return worst;
 }
 
-std::vector<WorldTileKey> TileGrid::staleTilesInRect(int desiredLevel, uint64_t epoch,
+std::vector<WorldTileKey> TileGrid::staleTilesInRect(int desiredLevel,
                                                       float vpL, float vpT, float vpR, float vpB,
                                                       int buffer) const
 {
@@ -281,7 +257,7 @@ std::vector<WorldTileKey> TileGrid::staleTilesInRect(int desiredLevel, uint64_t 
             size_t idx = static_cast<size_t>(r) * static_cast<size_t>(_bounds.totalCols) + static_cast<size_t>(c);
             if (idx >= _meta.size()) continue;
             const auto& m = _meta[idx];
-            if (m.level < 0 || m.level > desiredLevel || m.epoch < epoch) {
+            if (m.level < 0 || m.level > desiredLevel) {
                 result.push_back(_bounds.worldKeyAt(c, r));
             }
         }

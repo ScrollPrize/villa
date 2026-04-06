@@ -339,14 +339,11 @@ void CTiledVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         auto* cache = _volume->tieredCache();
         QPointer<CTiledVolumeViewer> viewerGuard(this);
         _chunkCbId = cache->addChunkReadyListener(
-            [ctrl, viewerGuard, cache](const vc::cache::ChunkKey& key) {
-                int level = key.level;
-                QMetaObject::invokeMethod(ctrl, [ctrl, cache, level]() {
-                    ctrl->markChunkArrived(level);
-                    cache->clearChunkArrivedFlag();
-                }, Qt::QueuedConnection);
-                QMetaObject::invokeMethod(qApp, [viewerGuard]() {
+            [ctrl, viewerGuard, cache](const vc::cache::ChunkKey&) {
+                QMetaObject::invokeMethod(qApp, [viewerGuard, cache]() {
                     if (viewerGuard) {
+                        cache->clearChunkArrivedFlag();
+                        viewerGuard->submitRender();
                         viewerGuard->updateStatusLabel();
                     }
                 }, Qt::QueuedConnection);
@@ -646,6 +643,7 @@ void CTiledVolumeViewer::centerViewport()
 {
     if (!fGraphicsView || !_tileScene) return;
     _tileScene->setCamera(_camera.surfacePtr[0], _camera.surfacePtr[1], _camera.scale);
+    _tileScene->setCamZOff(_camera.zOff);
 }
 
 void CTiledVolumeViewer::onPinComplete()
@@ -894,6 +892,7 @@ void CTiledVolumeViewer::setSliceOffset(float dz)
     _camera.zOff = std::clamp(_camera.zOff + dz, -maxZ, maxZ);
     _zVelocity = dz;
     _camera.invalidate();
+    centerViewport();
     submitRender();
     updateStatusLabel();
 }
@@ -1111,7 +1110,19 @@ void CTiledVolumeViewer::submitRender()
     auto visibleKeys = computeVisibleKeys();
     if (visibleKeys.empty()) return;
 
-    auto buildParams = [this](const WorldTileKey& wk) { return buildRenderParams(wk); };
+    // Snapshot ALL render state into a template so the lambda never reads
+    // live _camera — prevents Z-drift between tiles in the same batch
+    // and across chunk-arrival re-renders.
+    auto tmpl = buildRenderParams(WorldTileKey{0, 0});
+    float wts = _contentBounds.worldTileSize;
+    auto buildParams = [tmpl, wts](const WorldTileKey& wk) mutable {
+        tmpl.worldKey = wk;
+        tmpl.surfaceROI.x = static_cast<float>(wk.worldCol) * wts;
+        tmpl.surfaceROI.y = static_cast<float>(wk.worldRow) * wts;
+        tmpl.surfaceROI.width = wts;
+        tmpl.surfaceROI.height = wts;
+        return tmpl;
+    };
     _renderController->onCameraChangedDirect(_camera, surf, _volume, buildParams, visibleKeys);
 
     // Compute prefetch viewport: extend in pan direction for predictive prefetch
@@ -1264,7 +1275,6 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
 {
     TileRenderParams params;
     params.worldKey = wk;
-    params.epoch = _camera.epoch;
 
     const bool interactionActive = _isPanning;
 

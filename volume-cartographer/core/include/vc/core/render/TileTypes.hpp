@@ -81,10 +81,9 @@ namespace tiled_config {
 
 // Per-tile metadata for staleness checks during progressive rendering.
 struct TileMetadata {
-    uint64_t epoch = 0;
     int8_t level = -1;    // pyramid level of current pixmap (-1 = placeholder)
 
-    constexpr bool operator==(const TileMetadata& o) const noexcept { return epoch == o.epoch && level == o.level; }
+    constexpr bool operator==(const TileMetadata& o) const noexcept { return level == o.level; }
     constexpr bool operator!=(const TileMetadata& o) const noexcept { return !(*this == o); }
 };
 
@@ -93,7 +92,6 @@ struct TileMetadata {
 struct TileRenderParams {
     // --- Tile identity ---
     WorldTileKey worldKey;
-    uint64_t epoch = 0;
 
     // --- Tile geometry ---
     // Surface parameter space ROI for this tile (same for both surface types)
@@ -123,6 +121,7 @@ struct TileRenderParams {
 
     // --- Pool scheduling ---
     int submitPriority = 0;  // lower = higher urgency; set by TileRenderController
+    uint32_t batch = 0;      // submit generation — results from old batches are discarded
 
     // --- Profiling ---
     std::chrono::steady_clock::time_point submitTime;  // when submitted to pool
@@ -136,7 +135,6 @@ struct TileRenderResult {
     std::vector<uint32_t> pixels;  // ARGB32 buffer (tileW * tileH)
     int width = 0;                 // tile width in pixels
     int height = 0;                // tile height in pixels
-    uint64_t epoch = 0;
 
     // Camera state snapshot for cache key reconstruction
     float scale = 1.0f;
@@ -148,6 +146,7 @@ struct TileRenderResult {
 
     // Identifies which controller submitted this task (for shared pool routing)
     int controllerId = -1;
+    uint32_t batch = 0;
 
     // --- Profiling ---
     std::chrono::steady_clock::time_point submitTime;   // copied from params

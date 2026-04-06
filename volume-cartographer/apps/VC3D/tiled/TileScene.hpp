@@ -38,11 +38,12 @@ public:
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
 
     [[nodiscard]] float camScale() const noexcept { return _camScale; }
+    [[nodiscard]] float camZOff() const noexcept { return _camZOff; }
+    void setCamZOff(float z) noexcept { _camZOff = z; }
 
     // Set camera position for viewport-relative blitting.
-    void setCamera(float surfX, float surfY, float scale) {
-        _camSurfX = surfX; _camSurfY = surfY; _camScale = scale;
-    }
+    // Shifts framebuffer to compensate for pan; clears on zoom change.
+    void setCamera(float surfX, float surfY, float scale);
 
 private:
     QGraphicsScene* _scene;
@@ -51,6 +52,6 @@ private:
     bool _dirty = false;
 
     // Camera state for viewport-relative positioning
-    float _camSurfX = 0, _camSurfY = 0, _camScale = 1.0f;
+    float _camSurfX = 0, _camSurfY = 0, _camScale = 1.0f, _camZOff = 0;
     float _worldTileSize = 0;
 };
