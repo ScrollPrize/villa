@@ -2051,6 +2051,137 @@ void samplePlaneARGB32(uint32_t* outBuf, int outStride,
 }
 
 // ============================================================================
+// samplePlaneAdaptiveARGB32 — per-pixel adaptive level selection.
+//
+// For each pixel, computes the world coordinate and checks if the chunk at
+// the desired level is in the hot cache. If not, falls back to coarser levels.
+// Uses nearest-neighbor sampling for simplicity (trilinear at chunk boundaries
+// across levels would be incorrect). Prefetches desired-level chunks.
+// ============================================================================
+
+int samplePlaneAdaptiveARGB32(
+    uint32_t* outBuf, int outStride,
+    vc::cache::TieredChunkCache* cache,
+    int desiredLevel, int numLevels,
+    const cv::Vec3f& origin,
+    const cv::Vec3f& vx_step,
+    const cv::Vec3f& vy_step,
+    int w, int h,
+    const uint32_t lut[256])
+{
+    // Background fill
+    const uint32_t bg = lut[0];
+    for (int y = 0; y < h; y++) {
+        uint32_t* row = outBuf + y * outStride;
+        for (int x = 0; x < w; x++)
+            row[x] = bg;
+    }
+
+    // Build CacheParams for each level we might use
+    int maxLvl = std::min(numLevels, 8);
+    CacheParams* params[8];
+    for (int i = 0; i < maxLvl; i++)
+        params[i] = new CacheParams(cache, i);
+
+    // Prefetch desired-level chunks (non-blocking)
+    {
+        const auto& p = *params[desiredLevel];
+        cv::Vec3f corners[4] = {
+            origin, origin + vx_step * float(w-1),
+            origin + vy_step * float(h-1),
+            origin + vx_step * float(w-1) + vy_step * float(h-1)
+        };
+        float minV[3] = {corners[0][0], corners[0][1], corners[0][2]};
+        float maxV[3] = {corners[0][0], corners[0][1], corners[0][2]};
+        for (int c = 1; c < 4; c++)
+            for (int a = 0; a < 3; a++) {
+                minV[a] = std::min(minV[a], corners[c][a]);
+                maxV[a] = std::max(maxV[a], corners[c][a]);
+            }
+        // Scale to desired level
+        float scale = 1.0f / float(1 << desiredLevel);
+        for (int a = 0; a < 3; a++) { minV[a] *= scale; maxV[a] *= scale; }
+
+        int minCx = std::max(0, p.chunkX(std::max(0, int(std::floor(minV[0])))));
+        int maxCx = std::min(p.chunksX-1, p.chunkX(std::min(p.sx-1, int(std::ceil(maxV[0])))));
+        int minCy = std::max(0, p.chunkY(std::max(0, int(std::floor(minV[1])))));
+        int maxCy = std::min(p.chunksY-1, p.chunkY(std::min(p.sy-1, int(std::ceil(maxV[1])))));
+        int minCz = std::max(0, p.chunkZ(std::max(0, int(std::floor(minV[2])))));
+        int maxCz = std::min(p.chunksZ-1, p.chunkZ(std::min(p.sz-1, int(std::ceil(maxV[2])))));
+
+        thread_local std::vector<vc::cache::ChunkKey> prefetchKeys;
+        prefetchKeys.clear();
+        for (int cx = minCx; cx <= maxCx; cx++)
+            for (int cy = minCy; cy <= maxCy; cy++)
+                for (int cz = minCz; cz <= maxCz; cz++)
+                    prefetchKeys.push_back({desiredLevel, cz, cy, cx});
+        cache->prefetch(prefetchKeys);
+    }
+
+    // Per-level ChunkSampler (non-blocking: uses get() not getBlocking())
+    // We'll do the fallback manually per-pixel.
+    int worstUsed = desiredLevel;
+
+    for (int y = 0; y < h; y++) {
+        uint32_t* __restrict__ outRow = outBuf + y * outStride;
+        cv::Vec3f worldPos = origin + vy_step * float(y);
+
+        for (int x = 0; x < w; x++) {
+            float wx = worldPos[0], wy = worldPos[1], wz = worldPos[2];
+
+            // Try each level from finest to coarsest
+            for (int lvl = desiredLevel; lvl < maxLvl; lvl++) {
+                float scale = (lvl > 0) ? (1.0f / float(1 << lvl)) : 1.0f;
+                float vx = wx * scale, vy = wy * scale, vz = wz * scale;
+
+                const auto& p = *params[lvl];
+                // Bounds check
+                if (vx < -0.5f || vy < -0.5f || vz < -0.5f ||
+                    vx >= p.sxf - 0.5f || vy >= p.syf - 0.5f || vz >= p.szf - 0.5f)
+                    break;
+
+                // Nearest neighbor: round to int
+                int ix = static_cast<int>(vx + 0.5f);
+                int iy = static_cast<int>(vy + 0.5f);
+                int iz = static_cast<int>(vz + 0.5f);
+                ix = std::clamp(ix, 0, p.sx - 1);
+                iy = std::clamp(iy, 0, p.sy - 1);
+                iz = std::clamp(iz, 0, p.sz - 1);
+
+                int cix = p.chunkX(ix), ciy = p.chunkY(iy), ciz = p.chunkZ(iz);
+
+                // Data bounds check
+                if (p.dbValid && (ciz < p.dbMinCz || ciz > p.dbMaxCz ||
+                                  ciy < p.dbMinCy || ciy > p.dbMaxCy ||
+                                  cix < p.dbMinCx || cix > p.dbMaxCx))
+                    break;
+
+                // Non-blocking cache lookup
+                auto chunk = cache->get({lvl, ciz, ciy, cix});
+                if (!chunk || chunk->isEmpty) continue; // try coarser
+
+                // Sample the voxel
+                int lx = p.localX(ix), ly = p.localY(iy), lz = p.localZ(iz);
+                size_t stride0 = size_t(p.cy) * size_t(p.cx);
+                size_t stride1 = size_t(p.cx);
+                size_t offset = size_t(lz) * stride0 + size_t(ly) * stride1 + size_t(lx);
+                uint8_t val = chunk->data<uint8_t>()[offset];
+                outRow[x] = lut[val];
+                if (lvl > worstUsed) worstUsed = lvl;
+                break;
+            }
+
+            worldPos += vx_step;
+        }
+    }
+
+    for (int i = 0; i < maxLvl; i++)
+        delete params[i];
+
+    return worstUsed;
+}
+
+// ============================================================================
 // samplePlaneCompositeARGB32 — fused plane composite: inline coords, nearest-
 // neighbor per layer, composite, LUT → ARGB32. No coord matrix allocation.
 // ============================================================================

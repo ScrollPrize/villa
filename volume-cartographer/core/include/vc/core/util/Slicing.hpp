@@ -90,6 +90,19 @@ void samplePlaneARGB32(uint32_t* outBuf, int outStride,
                        int width, int height, vc::Sampling method,
                        const uint32_t lut[256]);
 
+// Adaptive plane sampling: per-pixel level fallback. For each pixel, tries the
+// desired level first; if that chunk isn't in hot cache, falls back to coarser
+// levels. This means half the image can be full-res while the rest is still loading.
+// Returns the coarsest level actually used (for prefetch decisions).
+int samplePlaneAdaptiveARGB32(uint32_t* outBuf, int outStride,
+                               vc::cache::TieredChunkCache* cache,
+                               int desiredLevel, int numLevels,
+                               const cv::Vec3f& origin,
+                               const cv::Vec3f& vx_step,
+                               const cv::Vec3f& vy_step,
+                               int width, int height,
+                               const uint32_t lut[256]);
+
 // Fused plane composite: inline coords + nearest-neighbor per layer + composite + LUT → ARGB32.
 // No coord matrix allocation. For PlaneSurface composite rendering.
 void samplePlaneCompositeARGB32(

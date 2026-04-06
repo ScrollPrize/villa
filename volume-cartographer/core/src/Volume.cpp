@@ -701,50 +701,12 @@ int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
                                          const uint32_t lut[256])
 {
     const int nScales = static_cast<int>(numScales());
-    const int level = params.level;
-
-    auto pb = planeBBox(origin, vx_step, vy_step, width, height);
-    WorldBBox wb{pb.loX, pb.loY, pb.loZ, pb.hiX, pb.hiY, pb.hiZ};
-
-    for (int lvl = level; lvl < nScales; lvl++) {
-        if (allChunksCachedFast(wb, lvl)) {
-            float scale = (lvl > 0) ? (1.0f / static_cast<float>(1 << lvl)) : 1.0f;
-            samplePlaneARGB32(outBuf, outStride, tieredCache(), lvl,
-                              origin * scale, vx_step * scale, vy_step * scale,
-                              width, height, params.method, lut);
-            if (lvl > level) {
-                prefetchWorldBBox(
-                    cv::Vec3f(wb.loX, wb.loY, wb.loZ),
-                    cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level);
-                if (lvl - level > 1)
-                    prefetchWorldBBox(
-                        cv::Vec3f(wb.loX, wb.loY, wb.loZ),
-                        cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level + 1);
-            } else if (lvl > 0) {
-                prefetchWorldBBox(
-                    cv::Vec3f(wb.loX, wb.loY, wb.loZ),
-                    cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), lvl - 1);
-            }
-            return lvl;
-        }
-    }
-
-    // No level cached -- block at coarsest level
-    int last = std::max(0, nScales - 1);
-    float scale = (last > 0) ? (1.0f / static_cast<float>(1 << last)) : 1.0f;
-    samplePlaneARGB32(outBuf, outStride, tieredCache(), last,
-                      origin * scale, vx_step * scale, vy_step * scale,
-                      width, height, params.method, lut);
-    if (last > level) {
-        prefetchWorldBBox(
-            cv::Vec3f(wb.loX, wb.loY, wb.loZ),
-            cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level);
-        if (last - level > 1)
-            prefetchWorldBBox(
-                cv::Vec3f(wb.loX, wb.loY, wb.loZ),
-                cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level + 1);
-    }
-    return last;
+    // Adaptive: each pixel samples from the finest cached chunk at its location.
+    // origin/vx_step/vy_step are in world (level-0) coordinates.
+    return samplePlaneAdaptiveARGB32(outBuf, outStride, tieredCache(),
+                                     params.level, nScales,
+                                     origin, vx_step, vy_step,
+                                     width, height, lut);
 }
 
 int Volume::samplePlaneCompositeBestEffortARGB32(
