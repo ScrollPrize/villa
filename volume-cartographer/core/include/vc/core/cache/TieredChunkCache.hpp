@@ -116,6 +116,8 @@ public:
         size_t ioPending = 0;
         uint64_t diskWrites = 0;
         size_t negativeCount = 0;
+        size_t diskBytes = 0;    // total bytes on disk across all level shards
+        size_t diskShards = 0;   // number of shard files on disk
     };
 
     [[nodiscard]] Stats stats() const;

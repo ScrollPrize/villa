@@ -766,6 +766,11 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
         double hotGB = static_cast<double>(s.hotBytes) / (1024.0 * 1024.0 * 1024.0);
         status += QString(" | ram %1G").arg(hotGB, 0, 'f', 1);
 
+        double diskGB = static_cast<double>(s.diskBytes) / (1024.0 * 1024.0 * 1024.0);
+        status += QString(" | disk %1G %2sh")
+            .arg(diskGB, 0, 'f', 1)
+            .arg(s.diskShards);
+
         status += QString(" | dl %1 w %2 q %3 neg %4")
             .arg(s.iceFetches)
             .arg(s.diskWrites)

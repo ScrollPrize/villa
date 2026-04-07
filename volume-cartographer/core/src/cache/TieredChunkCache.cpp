@@ -710,6 +710,18 @@ auto TieredChunkCache::stats() const -> Stats
         std::lock_guard lock(negativeMutex_);
         s.negativeCount = negativeCache_.size();
     }
+    // Disk cache stats: scan shard files across all levels
+    for (const auto& dz : diskLevels_) {
+        if (!dz) continue;
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        for (auto& entry : fs::recursive_directory_iterator(dz->path(), ec)) {
+            if (entry.is_regular_file(ec) && entry.path().filename() != "zarr.json") {
+                s.diskBytes += entry.file_size(ec);
+                s.diskShards++;
+            }
+        }
+    }
     return s;
 }
 
