@@ -165,6 +165,9 @@ target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
 add_executable(vc_zarr_recompress src/vc_zarr_recompress.cpp)
 target_link_libraries(vc_zarr_recompress vc_core blosc_static)
 
+add_executable(vc_zarr_verify src/vc_zarr_verify.cpp)
+target_link_libraries(vc_zarr_verify vc_core)
+
 
 # Precompiled headers for CLI apps (reuse vc_core's PCH)
 if(VC_USE_PCH)
