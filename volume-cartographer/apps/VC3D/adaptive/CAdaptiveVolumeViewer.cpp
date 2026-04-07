@@ -781,10 +781,11 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
             .arg(diskGB, 0, 'f', 1)
             .arg(s.diskShards);
 
-        status += QString(" | dl %1 w %2 q %3 neg %4")
+        status += QString(" | dl %1 w %2 iq %3 pq %4 neg %5")
             .arg(s.iceFetches)
             .arg(s.diskWrites)
-            .arg(s.ioPending)
+            .arg(s.ioInteractive)
+            .arg(s.ioPrefetch)
             .arg(s.negativeCount);
     }
 

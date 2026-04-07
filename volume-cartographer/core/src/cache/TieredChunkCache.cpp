@@ -339,7 +339,7 @@ void TieredChunkCache::prefetch(const ChunkKey& key)
     if (isReadyForNonBlockingRead(key)) return;
 
     statTotalSubmitted_.fetch_add(1, std::memory_order_relaxed);
-    ioPool_.submit(key);
+    ioPool_.submitPrefetch(key);
 }
 
 void TieredChunkCache::prefetch(const std::vector<ChunkKey>& keys)
@@ -356,8 +356,21 @@ void TieredChunkCache::prefetch(const std::vector<ChunkKey>& keys)
 
     if (!submitKeys.empty()) {
         statTotalSubmitted_.fetch_add(submitKeys.size(), std::memory_order_relaxed);
-        ioPool_.submit(submitKeys);
+        ioPool_.submitPrefetch(submitKeys);
     }
+}
+
+void TieredChunkCache::fetchInteractive(const std::vector<ChunkKey>& keys)
+{
+    if (keys.empty()) return;
+    std::vector<ChunkKey> submit;
+    submit.reserve(keys.size());
+    for (const auto& key : keys) {
+        if (!isReadyForNonBlockingRead(key))
+            submit.push_back(key);
+    }
+    if (!submit.empty())
+        ioPool_.submitInteractive(submit);
 }
 
 void TieredChunkCache::prefetchRegion(
@@ -399,17 +412,8 @@ void TieredChunkCache::prefetchRegion(
     }
     if (!keys.empty()) {
         statTotalSubmitted_.fetch_add(keys.size(), std::memory_order_relaxed);
-        ioPool_.submitBackground(keys);
+        ioPool_.submitPrefetch(keys);
     }
-}
-
-void TieredChunkCache::boostRegion(
-    int level, int iz0, int iy0, int ix0, int iz1, int iy1, int ix1)
-{
-    for (int iz = iz0; iz <= iz1; iz++)
-        for (int iy = iy0; iy <= iy1; iy++)
-            for (int ix = ix0; ix <= ix1; ix++)
-                ioPool_.boost(ChunkKey{level, iz, iy, ix});
 }
 
 void TieredChunkCache::prefetchLevel(int level, const PrefetchProgressCb& progressCb)
@@ -443,7 +447,7 @@ void TieredChunkCache::prefetchLevel(int level, const PrefetchProgressCb& progre
             }
 
     if (!keys.empty())
-        ioPool_.submitBackground(keys);
+        ioPool_.submitPrefetch(keys);
 
     std::fprintf(stderr, "[Volume] Level %d: %d to fetch, %d skipped (known empty)\n",
                  level, static_cast<int>(keys.size()), skipped);
@@ -711,6 +715,8 @@ auto TieredChunkCache::stats() const -> Stats
     s.hotEvictions = hotCache_.evictions();
     s.hotBytes = hotCache_.byte_size();
     s.ioPending = ioPool_.pendingCount();
+    s.ioInteractive = ioPool_.interactiveCount();
+    s.ioPrefetch = ioPool_.prefetchCount();
     s.diskWrites = statDiskWrites_.load(std::memory_order_relaxed);
     {
         std::lock_guard lock(negativeMutex_);

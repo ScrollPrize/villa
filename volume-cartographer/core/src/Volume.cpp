@@ -675,9 +675,9 @@ int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
     auto pb = planeBBox(origin, vx_step, vy_step, width, height);
     cv::Vec3f pfLo(pb.loX, pb.loY, pb.loZ);
     cv::Vec3f pfHi(pb.hiX, pb.hiY, pb.hiZ);
-    // Boost desired level chunks to front of queue (what user is looking at)
-    boostWorldBBox(pfLo, pfHi, desired);
-    // Prefetch all levels for progressive refinement
+    // Interactive: viewport chunks at desired level download first
+    fetchInteractiveWorldBBox(pfLo, pfHi, desired);
+    // Prefetch: all levels for progressive refinement (background queue)
     for (int lvl = desired; lvl < nScales; lvl++)
         prefetchWorldBBox(pfLo, pfHi, lvl);
     std::fprintf(stderr, "[ARGB32] desired=%d nScales=%d bbox=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) size=%dx%d\n",
@@ -1264,7 +1264,7 @@ void Volume::prefetchWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int lev
     tieredCache_->prefetchRegion(level, minIz, minIy, minIx, maxIz, maxIy, maxIx);
 }
 
-void Volume::boostWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level)
+void Volume::fetchInteractiveWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level)
 {
     ensureTieredCache();
     if (!tieredCache_) return;
@@ -1290,5 +1290,10 @@ void Volume::boostWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level)
 
     if (minIx > maxIx || minIy > maxIy || minIz > maxIz) return;
 
-    tieredCache_->boostRegion(level, minIz, minIy, minIx, maxIz, maxIy, maxIx);
+    std::vector<vc::cache::ChunkKey> keys;
+    for (int iz = minIz; iz <= maxIz; iz++)
+        for (int iy = minIy; iy <= maxIy; iy++)
+            for (int ix = minIx; ix <= maxIx; ix++)
+                keys.push_back(vc::cache::ChunkKey{level, iz, iy, ix});
+    tieredCache_->fetchInteractive(keys);
 }

@@ -2,102 +2,69 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <mutex>
+#include <condition_variable>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "ChunkKey.hpp"
-#include <utils/priority_queue.hpp>
 
 namespace vc::cache {
 
-// Background I/O thread pool for async chunk fetching.
-// Tasks are prioritized: coarser pyramid level = higher priority.
-// Duplicate submissions for the same key are deduplicated.
-//
-// Internally uses utils::DeduplicatingPriorityQueue for thread-safe
-// dedup + priority ordering, and std::jthread workers running consume_loop.
+// Two-queue IO pool: interactive + prefetch.
+// Workers always drain the interactive queue first.
+// Both queues dedup against a shared set — a chunk is never downloaded twice.
+// Before fetching from S3, the fetch function checks local disk cache.
 class IOPool {
 public:
-    // Callback signature: called from a worker thread when a chunk is fetched.
-    // (key, compressed bytes) — empty bytes means fetch failed.
     using CompletionCallback =
         std::function<void(const ChunkKey&, std::vector<uint8_t>&&)>;
-
-    // FetchFunc: the actual data fetching function (wraps ChunkSource::fetch).
-    // Called from worker threads. Must be thread-safe.
     using FetchFunc = std::function<std::vector<uint8_t>(const ChunkKey&)>;
 
     explicit IOPool(int numThreads = 4);
     ~IOPool();
 
-    // Start worker threads. Must be called after setFetchFunc/setCompletionCallback.
     void start();
 
     IOPool(const IOPool&) = delete;
     IOPool& operator=(const IOPool&) = delete;
 
-    // Set the fetch function (typically wraps ChunkSource + DiskStore lookup).
     void setFetchFunc(FetchFunc fn);
-
-    // Set the completion callback (called from worker thread).
     void setCompletionCallback(CompletionCallback cb);
 
-    // Submit a chunk for background fetching.
-    // Deduplicates: if the key is already queued or in-flight, this is a no-op.
-    void submit(const ChunkKey& key);
+    // Interactive queue: for chunks the user is looking at RIGHT NOW.
+    // These download before anything in the prefetch queue.
+    void submitInteractive(const ChunkKey& key);
+    void submitInteractive(const std::vector<ChunkKey>& keys);
 
-    // Submit multiple keys at once (batch, reduces lock contention).
-    // Uses backpressure: cancels pending tasks if queue would overflow.
-    void submit(const std::vector<ChunkKey>& keys);
+    // Prefetch queue: background bulk download of entire levels.
+    // Only processed when the interactive queue is empty.
+    void submitPrefetch(const ChunkKey& key);
+    void submitPrefetch(const std::vector<ChunkKey>& keys);
 
-    // Alias for submit(vector) — kept for call-site clarity.
-    void submitBackground(const std::vector<ChunkKey>& keys) { submit(keys); }
-
-    // Boost a key to the front of the queue. If not queued, adds it.
-    void boost(const ChunkKey& key);
-
-    // Cancel all pending (not in-flight) tasks.
     void cancelPending();
 
-    // Number of pending + in-flight tasks.
+    [[nodiscard]] size_t interactiveCount() const noexcept;
+    [[nodiscard]] size_t prefetchCount() const noexcept;
     [[nodiscard]] size_t pendingCount() const noexcept;
 
-    // Gracefully stop all workers. Blocks until all threads exit.
     void stop();
 
 private:
-    // Internal task type — stored in the priority queue.
-    struct Task {
-        ChunkKey key;
-        uint64_t seq = 0;
-
-        // Priority ordering: lowest seq first. Boosted items get seq=0.
-        bool operator>(const Task& o) const noexcept
-        {
-            return seq > o.seq;
-        }
-    };
-
-    // Hash/Equal that operate only on the ChunkKey for dedup.
-    struct TaskHash {
-        size_t operator()(const Task& t) const noexcept {
-            return ChunkKeyHash()(t.key);
-        }
-    };
-    struct TaskEqual {
-        bool operator()(const Task& a, const Task& b) const noexcept {
-            return a.key == b.key;
-        }
-    };
-
-    using Queue = utils::DeduplicatingPriorityQueue<Task, TaskHash, TaskEqual, std::greater<Task>>;
+    ChunkKey popNext();  // blocks until a key is available
 
     FetchFunc fetchFunc_;
     CompletionCallback onComplete_;
 
-    Queue queue_;
-    std::atomic<uint64_t> nextSeq_{0};
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<ChunkKey> interactive_;   // high priority
+    std::deque<ChunkKey> prefetch_;      // low priority
+    std::unordered_set<ChunkKey, ChunkKeyHash> seen_;  // dedup: never download twice
+    bool shutdown_ = false;
 
     int numThreads_;
     std::vector<std::jthread> workers_;

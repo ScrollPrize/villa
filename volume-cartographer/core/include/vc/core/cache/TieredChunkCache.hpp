@@ -56,18 +56,17 @@ public:
     // --- Blocking reads ---
     [[nodiscard]] ChunkDataPtr getBlocking(const ChunkKey& key);
 
-    // --- Async prefetch ---
+    // --- Async prefetch (background queue) ---
     void prefetch(const ChunkKey& key);
     void prefetch(const std::vector<ChunkKey>& keys);
     void prefetchRegion(int level, int iz0, int iy0, int ix0,
                         int iz1, int iy1, int ix1);
 
+    // --- Interactive fetch (high priority queue, for viewport chunks) ---
+    void fetchInteractive(const std::vector<ChunkKey>& keys);
+
     using PrefetchProgressCb = std::function<void(int fetched, int total)>;
     void prefetchLevel(int level, const PrefetchProgressCb& progressCb = nullptr);
-
-    // Boost chunks in a region to the front of the download queue.
-    void boostRegion(int level, int iz0, int iy0, int ix0,
-                     int iz1, int iy1, int ix1);
     void propagateZeroChunks(int coarseLevel);
     void cancelPendingPrefetch();
 
@@ -117,7 +116,9 @@ public:
         uint64_t misses = 0;
         uint64_t hotEvictions = 0;
         size_t hotBytes = 0;
-        size_t ioPending = 0;
+        size_t ioPending = 0;       // total (interactive + prefetch)
+        size_t ioInteractive = 0;   // interactive queue only
+        size_t ioPrefetch = 0;      // prefetch queue only
         uint64_t diskWrites = 0;
         size_t negativeCount = 0;
         size_t diskBytes = 0;    // total bytes on disk across all level shards

@@ -1,17 +1,31 @@
 #pragma once
-#include <deque>
+#include <queue>
 #include <unordered_set>
 #include <mutex>
 #include <condition_variable>
 #include <vector>
 #include <cstdint>
+#include <concepts>
+#include <functional>
 #include <optional>
-#include <stdexcept>
+#include <atomic>
+#include <utility>
+#include <chrono>
 
 namespace utils {
 
-// Thread-safe deque with deduplication.
-// submit() pushes to back. boost() pushes to front (or moves to front if already queued).
+// ---------------------------------------------------------------------------
+// DeduplicatingPriorityQueue
+//
+// Thread-safe priority queue with dual-set deduplication.  Items that are
+// either already queued or currently in-flight are rejected on submit(),
+// giving O(1) membership checks via unordered_set.
+//
+// The Compare parameter controls heap ordering (default std::greater<T>
+// yields a min-queue, matching std::priority_queue's convention when the
+// comparator returns true for "lower priority").  Users can supply an
+// epoch-aware comparator to implement epoch-based reordering.
+// ---------------------------------------------------------------------------
 template <typename T,
           typename Hash     = std::hash<T>,
           typename KeyEqual = std::equal_to<T>,
@@ -19,23 +33,32 @@ template <typename T,
 class DeduplicatingPriorityQueue final {
 public:
     DeduplicatingPriorityQueue() = default;
+
+    DeduplicatingPriorityQueue(const DeduplicatingPriorityQueue&)            = delete;
+    DeduplicatingPriorityQueue& operator=(const DeduplicatingPriorityQueue&) = delete;
+    DeduplicatingPriorityQueue(DeduplicatingPriorityQueue&&)                 = delete;
+    DeduplicatingPriorityQueue& operator=(DeduplicatingPriorityQueue&&)      = delete;
+
     ~DeduplicatingPriorityQueue() { shutdown(); }
 
-    DeduplicatingPriorityQueue(const DeduplicatingPriorityQueue&) = delete;
-    DeduplicatingPriorityQueue& operator=(const DeduplicatingPriorityQueue&) = delete;
+    // -- submission ---------------------------------------------------------
 
+    /// Submit a single item.  Returns false if already queued.
     bool submit(const T& item) {
         {
             std::lock_guard lock(mutex_);
             if (shutdown_flag_) return false;
-            if (set_.contains(item)) return false;
-            set_.insert(item);
-            deque_.push_back(item);
+            if (queued_set_.contains(item))
+                return false;
+            queued_set_.insert(item);
+            heap_.push(item);
         }
-        cv_.notify_one();
+        cv_.notify_all();
         return true;
     }
 
+    /// Batch submit from an iterator range.  Returns the number of newly
+    /// queued items (those not already queued).
     template <typename Iter>
     std::size_t submit_batch(Iter begin, Iter end) {
         std::size_t added = 0;
@@ -43,9 +66,9 @@ public:
             std::lock_guard lock(mutex_);
             if (shutdown_flag_) return 0;
             for (auto it = begin; it != end; ++it) {
-                if (!set_.contains(*it)) {
-                    set_.insert(*it);
-                    deque_.push_back(*it);
+                if (!queued_set_.contains(*it)) {
+                    queued_set_.insert(*it);
+                    heap_.push(*it);
                     ++added;
                 }
             }
@@ -54,78 +77,69 @@ public:
         return added;
     }
 
-    // Put at front. Stale duplicates in deque are skipped by pop().
-    bool boost(const T& item) {
-        {
-            std::lock_guard lock(mutex_);
-            if (shutdown_flag_) return false;
-            set_.insert(item);
-            deque_.push_front(item);
-        }
-        cv_.notify_one();
-        return true;
-    }
+    // -- consumption --------------------------------------------------------
 
+    /// Block until an item is available (or shutdown is signalled).
+    /// Moves the item from queued to in-flight atomically.
+    /// Throws std::runtime_error on shutdown with an empty queue.
     [[nodiscard]] T pop() {
         std::unique_lock lock(mutex_);
-        for (;;) {
-            cv_.wait(lock, [this] { return !deque_.empty() || shutdown_flag_; });
-            if (shutdown_flag_ && deque_.empty())
-                throw std::runtime_error("DeduplicatingPriorityQueue::pop(): shutdown");
-            while (!deque_.empty()) {
-                T item = deque_.front();
-                deque_.pop_front();
-                if (set_.erase(item))
-                    return item;
-            }
-            // All popped entries were stale duplicates — wait for more
-        }
+        cv_.wait(lock, [this] { return !heap_.empty() || shutdown_flag_; });
+        if (heap_.empty())
+            throw std::runtime_error("DeduplicatingPriorityQueue::pop(): shutdown");
+        return pop_locked();
     }
 
+    /// Non-blocking pop.
     [[nodiscard]] std::optional<T> try_pop() {
         std::lock_guard lock(mutex_);
-        while (!deque_.empty()) {
-            T item = deque_.front();
-            deque_.pop_front();
-            if (set_.erase(item)) return item;
-        }
-        return std::nullopt;
+        if (heap_.empty()) return std::nullopt;
+        return pop_locked();
     }
 
+    /// Pop with a timeout.
     template <typename Rep, typename Period>
     [[nodiscard]] std::optional<T> pop_for(std::chrono::duration<Rep, Period> timeout) {
         std::unique_lock lock(mutex_);
-        if (!cv_.wait_for(lock, timeout, [this] { return !deque_.empty() || shutdown_flag_; }))
+        if (!cv_.wait_for(lock, timeout, [this] { return !heap_.empty() || shutdown_flag_; }))
             return std::nullopt;
-        while (!deque_.empty()) {
-            T item = deque_.front();
-            deque_.pop_front();
-            if (set_.erase(item)) return item;
-        }
-        return std::nullopt;
+        if (heap_.empty()) return std::nullopt;
+        return pop_locked();
     }
 
+    // -- cancellation --------------------------------------------------------
+
+    /// Cancel every pending (queued) item.
     void cancel_pending() {
         std::lock_guard lock(mutex_);
-        set_.clear();
-        deque_.clear();
+        queued_set_.clear();
+        // std::priority_queue has no clear(); swap with an empty one.
+        Heap empty_heap;
+        std::swap(heap_, empty_heap);
     }
+
+    // -- membership queries -------------------------------------------------
 
     [[nodiscard]] bool is_queued(const T& item) const {
         std::lock_guard lock(mutex_);
-        return set_.contains(item);
+        return queued_set_.contains(item);
     }
+
+    // -- size / state -------------------------------------------------------
 
     [[nodiscard]] std::size_t queued_count() const noexcept {
         std::lock_guard lock(mutex_);
-        return set_.size();
+        return queued_set_.size();
     }
 
     [[nodiscard]] bool empty() const noexcept {
         std::lock_guard lock(mutex_);
-        return set_.empty();
+        return queued_set_.empty();
     }
 
+    // -- lifecycle ----------------------------------------------------------
+
+    /// Signal shutdown.  All blocked pop() calls will unblock.
     void shutdown() {
         {
             std::lock_guard lock(mutex_);
@@ -135,19 +149,31 @@ public:
         cv_.notify_all();
     }
 
-    // resubmit = boost (compat alias)
-    bool resubmit(const T& item) { return boost(item); }
-
 private:
-    using Set = std::unordered_set<T, Hash, KeyEqual>;
+    using Set  = std::unordered_set<T, Hash, KeyEqual>;
+    using Heap = std::priority_queue<T, std::vector<T>, Compare>;
+
+    /// Must be called while holding mutex_ and with a non-empty heap.
+    T pop_locked() {
+        T item = heap_.top();
+        heap_.pop();
+        queued_set_.erase(item);
+        return item;
+    }
 
     mutable std::mutex      mutex_;
     std::condition_variable cv_;
-    std::deque<T>           deque_;
-    Set                     set_;
+    Heap                    heap_;
+    Set                     queued_set_;
     bool                    shutdown_flag_ = false;
 };
 
+// ---------------------------------------------------------------------------
+// consume_loop  --  helper for worker / consumer threads
+//
+// Repeatedly pops items from the queue and passes them to `handler`.
+// The loop exits when pop() throws due to shutdown.
+// ---------------------------------------------------------------------------
 template <typename T, typename Hash, typename KeyEqual, typename Compare, typename F>
 void consume_loop(DeduplicatingPriorityQueue<T, Hash, KeyEqual, Compare>& queue, F&& handler) {
     for (;;) {
@@ -155,12 +181,14 @@ void consume_loop(DeduplicatingPriorityQueue<T, Hash, KeyEqual, Compare>& queue,
         try {
             item = queue.pop();
         } catch (const std::runtime_error&) {
+            // shutdown signalled
             return;
         }
         handler(item);
     }
 }
 
+/// Convenience overload that deduces default template parameters.
 template <typename T, typename F>
 void consume_loop(DeduplicatingPriorityQueue<T>& queue, F&& handler) {
     consume_loop<T, std::hash<T>, std::equal_to<T>, std::greater<T>, F>(
