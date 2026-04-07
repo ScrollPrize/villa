@@ -56,8 +56,7 @@ void IOPool::submitInteractive(const ChunkKey& key)
 {
     {
         std::lock_guard lock(mutex_);
-        if (shutdown_ || seen_.contains(key)) return;
-        seen_.insert(key);
+        if (shutdown_) return;
         interactive_.push_back(key);
     }
     cv_.notify_one();
@@ -65,19 +64,14 @@ void IOPool::submitInteractive(const ChunkKey& key)
 
 void IOPool::submitInteractive(const std::vector<ChunkKey>& keys)
 {
-    size_t added = 0;
+    if (keys.empty()) return;
     {
         std::lock_guard lock(mutex_);
         if (shutdown_) return;
-        for (const auto& k : keys) {
-            if (!seen_.contains(k)) {
-                seen_.insert(k);
-                interactive_.push_back(k);
-                added++;
-            }
-        }
+        for (const auto& k : keys)
+            interactive_.push_back(k);
     }
-    if (added > 0) cv_.notify_all();
+    cv_.notify_all();
 }
 
 void IOPool::submitPrefetch(const ChunkKey& key)
