@@ -323,7 +323,6 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
         // v3 sharded disk cache: path_/0/, path_/1/, ...
         // 128³ chunks, 1024³ shards, padded to chunk boundaries.
         // Open if zarr.json exists, create if not.
-        std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels;
         {
             int nLevels = source->numLevels();
             diskLevels.resize(nLevels);
@@ -332,8 +331,6 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
             };
             for (int lvl = 0; lvl < nLevels; lvl++) {
                 auto lvlPath = path_ / std::to_string(lvl);
-                // Always remove .zarray (v2 metadata from remote) — we only use v3
-                std::filesystem::remove(lvlPath / ".zarray");
                 if (std::filesystem::exists(lvlPath / "zarr.json")) {
                     diskLevels[lvl] = std::make_shared<utils::ZarrArray>(
                         utils::ZarrArray::open(lvlPath));

@@ -141,6 +141,11 @@ TieredChunkCache::TieredChunkCache(
         if (dzW) {
             zarrWriteChunk(*dzW, key, data.data(), data.size());
             statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            static std::atomic<int> warnCount{0};
+            if (warnCount.fetch_add(1) < 5)
+                std::fprintf(stderr, "[Cache] WRITE SKIP: lvl=%d diskLevels_.size()=%zu\n",
+                             key.level, diskLevels_.size());
         }
 
         auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
