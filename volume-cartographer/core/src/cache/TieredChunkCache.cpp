@@ -166,9 +166,13 @@ TieredChunkCache::TieredChunkCache(
                     std::lock_guard lock(negativeMutex_);
                     negativeCache_.insert(key);
                 }
-                if (auto* log = cacheDebugLog())
-                    std::fprintf(log, "COMPLETE empty lvl=%d (%d,%d,%d) [negative cached]\n",
-                                 key.level, key.iz, key.iy, key.ix);
+                // Mark empty in shard index so it persists across runs
+                auto* dz = (key.level < static_cast<int>(diskLevels_.size()))
+                    ? diskLevels_[key.level].get() : nullptr;
+                if (dz) {
+                    auto idx = chunkIndices(key);
+                    dz->mark_inner_chunk_empty(idx);
+                }
                 return;
             }
 
@@ -577,6 +581,11 @@ void TieredChunkCache::propagateZeroChunks(int coarseLevel)
                                 continue;
                             negativeCache_.insert(fineKey);
                             bloomAdd(fineKey);
+                            // Mark empty in shard index
+                            if (dzFine) {
+                                auto idx = chunkIndices(fineKey);
+                                dzFine->mark_inner_chunk_empty(idx);
+                            }
                             totalNegated++;
                         }
                     }

@@ -1261,7 +1261,91 @@ public:
         f.read(reinterpret_cast<char*>(&offset), 8);
         f.read(reinterpret_cast<char*>(&nbytes), 8);
         if (!f) return false;
-        return !(offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0));
+        // Not present: (0xFF..FF, 0xFF..FF). Empty/zero: (0xFF..FE, 0).
+        if (offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0)) return false;
+        if (offset == (~std::uint64_t(0) - 1) && nbytes == 0) return false;
+        return true;
+    }
+
+    /// Check if an inner chunk is marked as known-empty (zero data).
+    [[nodiscard]] bool inner_chunk_is_empty(std::span<const std::size_t> chunk_indices) const {
+        if (!is_sharded()) return false;
+        const auto ndim = meta_.ndim();
+
+        std::vector<std::size_t> shard_idx(ndim);
+        std::vector<std::size_t> inner_idx(ndim);
+        for (std::size_t d = 0; d < ndim; ++d) {
+            auto ips = meta_.sub_chunks_per_shard(d);
+            shard_idx[d] = chunk_indices[d] / ips;
+            inner_idx[d] = chunk_indices[d] % ips;
+        }
+
+        std::size_t linear = 0;
+        std::size_t stride = 1;
+        for (std::size_t d = ndim; d-- > 0;) {
+            linear += inner_idx[d] * stride;
+            stride *= meta_.sub_chunks_per_shard(d);
+        }
+
+        auto p = root_ / chunk_key(shard_idx);
+        std::ifstream f(p, std::ios::binary);
+        if (!f) return false;
+
+        f.seekg(static_cast<std::streamoff>(linear * 16));
+        std::uint64_t offset = 0, nbytes = 0;
+        f.read(reinterpret_cast<char*>(&offset), 8);
+        f.read(reinterpret_cast<char*>(&nbytes), 8);
+        if (!f) return false;
+        return (offset == (~std::uint64_t(0) - 1) && nbytes == 0);
+    }
+
+    /// Mark an inner chunk as known-empty (zero data). Writes sentinel to index.
+    void mark_inner_chunk_empty(std::span<const std::size_t> chunk_indices) {
+        if (!is_sharded())
+            throw std::runtime_error("zarr: not a sharded array");
+
+        const auto ndim = meta_.ndim();
+        const auto n_inner = meta_.total_sub_chunks_per_shard();
+        const std::size_t index_size = n_inner * 16;
+
+        std::vector<std::size_t> shard_idx(ndim);
+        std::vector<std::size_t> inner_idx(ndim);
+        for (std::size_t d = 0; d < ndim; ++d) {
+            auto ips = meta_.sub_chunks_per_shard(d);
+            shard_idx[d] = chunk_indices[d] / ips;
+            inner_idx[d] = chunk_indices[d] % ips;
+        }
+
+        std::size_t linear = 0;
+        std::size_t stride = 1;
+        for (std::size_t d = ndim; d-- > 0;) {
+            linear += inner_idx[d] * stride;
+            stride *= meta_.sub_chunks_per_shard(d);
+        }
+
+        auto key = chunk_key(shard_idx);
+        auto p = root_ / key;
+        std::filesystem::create_directories(p.parent_path());
+
+        if (!std::filesystem::exists(p)) {
+            std::ofstream create(p, std::ios::binary);
+            std::vector<std::byte> empty_index(index_size);
+            std::memset(empty_index.data(), 0xFF, index_size);
+            create.write(reinterpret_cast<const char*>(empty_index.data()),
+                         static_cast<std::streamsize>(index_size));
+        }
+
+        std::lock_guard lock(*shard_write_mutex_);
+        std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
+        if (!f) return;
+
+        // Write empty sentinel: (0xFF..FE, 0)
+        std::uint64_t sentinel_offset = ~std::uint64_t(0) - 1;
+        std::uint64_t sentinel_nbytes = 0;
+        f.seekp(static_cast<std::streamoff>(linear * 16));
+        f.write(reinterpret_cast<const char*>(&sentinel_offset), 8);
+        f.write(reinterpret_cast<const char*>(&sentinel_nbytes), 8);
+        f.flush();
     }
 
     /// Root path of the zarr array on disk.
