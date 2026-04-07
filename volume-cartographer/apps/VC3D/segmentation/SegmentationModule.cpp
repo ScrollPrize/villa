@@ -1,6 +1,6 @@
 #include "SegmentationModule.hpp"
 
-#include "tiled/CTiledVolumeViewer.hpp"
+#include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "CVolumeViewerView.hpp"
 #include "CState.hpp"
 #include "tools/SegmentationEditManager.hpp"

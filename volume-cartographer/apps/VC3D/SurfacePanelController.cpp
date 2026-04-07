@@ -3,7 +3,7 @@
 #include "SurfaceTreeWidget.hpp"
 #include "ViewerManager.hpp"
 #include "CState.hpp"
-#include "tiled/CTiledVolumeViewer.hpp"
+#include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "elements/DropdownChecklistButton.hpp"
 #include "VCSettings.hpp"
 

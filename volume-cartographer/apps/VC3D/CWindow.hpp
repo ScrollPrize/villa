@@ -20,7 +20,7 @@
 
 #include "CPointCollectionWidget.hpp"
 #include "CState.hpp"
-#include "tiled/CTiledVolumeViewer.hpp"
+#include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "DrawingWidget.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"

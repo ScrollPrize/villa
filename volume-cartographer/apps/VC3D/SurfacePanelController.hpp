@@ -16,7 +16,10 @@ class QLineEdit;
 class ViewerManager;
 class SurfaceTreeWidgetItem;
 class VolumePkg;
-class CTiledVolumeViewer;
+class CAdaptiveVolumeViewer;
+#ifndef CTiledVolumeViewer
+#define CTiledVolumeViewer CAdaptiveVolumeViewer
+#endif
 class VCCollection;
 class QTreeWidget;
 class QCheckBox;

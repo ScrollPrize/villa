@@ -701,10 +701,27 @@ int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
                                          const uint32_t lut[256])
 {
     const int nScales = static_cast<int>(numScales());
-    return samplePlaneAdaptiveARGB32(outBuf, outStride, tieredCache(),
-                                     params.level, nScales,
-                                     origin, vx_step, vy_step,
-                                     width, height, lut);
+    const int desired = std::clamp(params.level, 0, std::max(0, nScales - 1));
+
+    // Prefetch all levels from desired to coarsest BEFORE rendering.
+    // This ensures fallback levels have data, and the desired level
+    // starts downloading for progressive refinement.
+    auto pb = planeBBox(origin, vx_step, vy_step, width, height);
+    cv::Vec3f pfLo(pb.loX, pb.loY, pb.loZ);
+    cv::Vec3f pfHi(pb.hiX, pb.hiY, pb.hiZ);
+    for (int lvl = desired; lvl < nScales; lvl++)
+        prefetchWorldBBox(pfLo, pfHi, lvl);
+
+    // Render with per-pixel fallback to coarser levels.
+    // Each pixel tries the desired level first; if that chunk isn't in hot
+    // cache, falls back to the next coarser level that has data.
+    // This gives a mixed-resolution image that progressively refines as
+    // chunks arrive — better than showing black for uncached regions.
+    samplePlaneAdaptiveARGB32(outBuf, outStride, tieredCache(),
+                              desired, nScales,
+                              origin, vx_step, vy_step,
+                              width, height, lut);
+    return desired;
 }
 
 int Volume::samplePlaneCompositeBestEffortARGB32(

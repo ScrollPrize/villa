@@ -2032,10 +2032,70 @@ static void samplePlaneARGB32Impl(
 }
 
 // ============================================================================
-// samplePlaneAdaptiveARGB32 — simple per-pixel nearest-neighbor sampling.
-// For each pixel: world coord → level-0 voxel → chunk lookup → LUT → ARGB32.
-// Falls back to coarser levels if desired level chunk isn't in hot cache.
+// samplePlaneAdaptiveARGB32 — per-pixel nearest-neighbor with adaptive level
+// fallback.  Uses a direct-mapped chunk slot cache per level to avoid
+// per-pixel shared_ptr / mutex overhead from TieredChunkCache::get().
 // ============================================================================
+
+// Per-level non-blocking chunk cache.  Holds raw pointers to chunk data in a
+// direct-mapped slot array.  Only touches TieredChunkCache on slot miss.
+struct AdaptiveSlotCache {
+    static constexpr int kSlots = 32;
+    static constexpr int kMask  = kSlots - 1;
+
+    struct Slot {
+        uint64_t key = UINT64_MAX;
+        vc::cache::ChunkDataPtr chunk;   // keeps data alive
+        const uint8_t* data = nullptr;   // raw pointer for sampling
+    };
+
+    Slot slots[kSlots];
+    uint64_t lastKey = UINT64_MAX;
+    const uint8_t* lastData = nullptr;
+
+    VC_FORCE_INLINE static uint64_t pack(int ci, int cj, int ck) {
+        return (uint64_t(unsigned(ck)) << 40) |
+               (uint64_t(unsigned(cj)) << 20) |
+                uint64_t(unsigned(ci));
+    }
+
+    // Returns raw data pointer or nullptr (non-blocking).
+    // Only checks hot cache + coarse flat array. Missing chunks render as bg
+    // and will be filled in on next frame after async prefetch completes.
+    VC_FORCE_INLINE const uint8_t* lookup(
+        int ci, int cj, int ck, int level,
+        vc::cache::TieredChunkCache& cache)
+    {
+        uint64_t key = pack(ci, cj, ck);
+        if (key == lastKey) return lastData;
+
+        int idx = static_cast<int>((ci * 97 + cj * 31 + ck) & kMask);
+        auto& s = slots[idx];
+        if (s.key == key) {
+            lastKey = key;
+            lastData = s.data;
+            return s.data;
+        }
+
+        // Slot miss — non-blocking: hot cache + coarse array only
+        auto c = cache.get(vc::cache::ChunkKey{level, ck, cj, ci});
+        s.key = key;
+        if (!c || c->isEmpty) {
+            s.chunk = nullptr;
+            s.data = nullptr;
+        } else {
+            s.data = c->data<uint8_t>();
+            s.chunk = std::move(c);
+            if (s.data) {
+                __builtin_prefetch(s.data, 0, 3);
+                __builtin_prefetch(reinterpret_cast<const char*>(s.data) + 64, 0, 3);
+            }
+        }
+        lastKey = key;
+        lastData = s.data;
+        return s.data;
+    }
+};
 
 int samplePlaneAdaptiveARGB32(
     uint32_t* outBuf, int outStride,
@@ -2050,86 +2110,74 @@ int samplePlaneAdaptiveARGB32(
     const uint32_t bg = lut[0];
     const int maxLvl = std::min(numLevels, 8);
 
-    // Get level-0 shape for bounds checking
-    auto shape0 = cache->levelShape(0);
-    const float sx0 = static_cast<float>(shape0[0]); // Z
-    const float sy0 = static_cast<float>(shape0[1]); // Y
-    const float sx0x = static_cast<float>(shape0[2]); // X
+    // Per-level geometry — chunk shapes and level shapes can differ per level
+    struct LevelInfo {
+        CacheParams p;
+        AdaptiveSlotCache slotCache;
+        float scale;         // 1.0 / (1 << level)
+        LevelInfo(vc::cache::TieredChunkCache* c, int lvl)
+            : p(c, lvl), scale(1.0f / static_cast<float>(1 << lvl)) {}
+    };
 
-    // Current chunk state — avoid redundant cache lookups
-    vc::cache::ChunkDataPtr curChunk;
-    const uint8_t* curData = nullptr;
-    int curLevel = -1;
-    int curCi = -1, curCj = -1, curCk = -1;
+    // Build level info for each level we might sample from
+    std::vector<LevelInfo> levels;
+    levels.reserve(maxLvl);
+    for (int l = 0; l < maxLvl; l++)
+        levels.emplace_back(cache, l);
+
+    // Level-0 shape for world-space bounds checking
+    const float boundsX = levels[0].p.sxf;
+    const float boundsY = levels[0].p.syf;
+    const float boundsZ = levels[0].p.szf;
 
     for (int y = 0; y < h; y++) {
         uint32_t* row = outBuf + y * outStride;
 
-        // Compute world coords for start of row
-        float wy_x = origin[0] + vy_step[0] * static_cast<float>(y);
-        float wy_y = origin[1] + vy_step[1] * static_cast<float>(y);
-        float wy_z = origin[2] + vy_step[2] * static_cast<float>(y);
+        float ry_x = origin[0] + vy_step[0] * static_cast<float>(y);
+        float ry_y = origin[1] + vy_step[1] * static_cast<float>(y);
+        float ry_z = origin[2] + vy_step[2] * static_cast<float>(y);
 
         for (int x = 0; x < w; x++) {
-            float wx = wy_x + vx_step[0] * static_cast<float>(x);
-            float wy = wy_y + vx_step[1] * static_cast<float>(x);
-            float wz = wy_z + vx_step[2] * static_cast<float>(x);
+            float wx = ry_x + vx_step[0] * static_cast<float>(x);
+            float wy = ry_y + vx_step[1] * static_cast<float>(x);
+            float wz = ry_z + vx_step[2] * static_cast<float>(x);
 
-            // Bounds check against level-0 volume
             if (wx < 0 || wy < 0 || wz < 0 ||
-                wx >= sx0x || wy >= sy0 || wz >= sx0) {
+                wx >= boundsX || wy >= boundsY || wz >= boundsZ) {
                 row[x] = bg;
                 continue;
             }
 
             bool sampled = false;
             for (int l = desiredLevel; l < maxLvl; l++) {
-                float scale = 1.0f / static_cast<float>(1 << l);
-                int ix = static_cast<int>(wx * scale + 0.5f);
-                int iy = static_cast<int>(wy * scale + 0.5f);
-                int iz = static_cast<int>(wz * scale + 0.5f);
+                auto& li = levels[l];
+                const auto& p = li.p;
 
-                // Chunk coords
-                int ci = ix >> 7;
-                int cj = iy >> 7;
-                int ck = iz >> 7;
+                // World → level-scaled voxel (nearest neighbor)
+                int ix = static_cast<int>(wx * li.scale + 0.5f);
+                int iy = static_cast<int>(wy * li.scale + 0.5f);
+                int iz = static_cast<int>(wz * li.scale + 0.5f);
 
-                const uint8_t* data;
-                if (l == curLevel && ci == curCi && cj == curCj && ck == curCk && curData) {
-                    data = curData;
-                } else {
-                    auto c = cache->get({l, ck, cj, ci});
-                    if (!c || c->isEmpty) continue;
+                // Clamp to level shape
+                if (ix >= p.sx) ix = p.sx - 1;
+                if (iy >= p.sy) iy = p.sy - 1;
+                if (iz >= p.sz) iz = p.sz - 1;
 
-                    // Verify chunk data integrity: first 4 bytes as fingerprint
-                    auto* raw = c->data<uint8_t>();
-                    size_t sz = c->totalBytes();
-                    uint32_t fp = 0;
-                    if (sz >= 4) std::memcpy(&fp, raw, 4);
-                    // Store fingerprint keyed by chunk identity
-                    static thread_local std::unordered_map<uint64_t, uint32_t> fpMap;
-                    uint64_t fpKey = (uint64_t(unsigned(l)) << 48) |
-                                     (uint64_t(unsigned(ck)) << 32) |
-                                     (uint64_t(unsigned(cj)) << 16) |
-                                      uint64_t(unsigned(ci));
-                    auto [it, inserted] = fpMap.emplace(fpKey, fp);
-                    if (!inserted && it->second != fp) {
-                        fprintf(stderr, "[CORRUPT] chunk (%d,%d,%d) lvl=%d fingerprint changed: %08x -> %08x\n",
-                                ci, cj, ck, l, it->second, fp);
-                        it->second = fp;
-                    }
+                // Chunk coords using actual chunk dimensions for this level
+                int ci = p.chunkX(ix);
+                int cj = p.chunkY(iy);
+                int ck = p.chunkZ(iz);
 
-                    curChunk = std::move(c);
-                    curData = curChunk->data<uint8_t>();
-                    curLevel = l;
-                    curCi = ci; curCj = cj; curCk = ck;
-                    data = curData;
-                }
+                const uint8_t* data = li.slotCache.lookup(ci, cj, ck, l, *cache);
+                if (!data) continue;
 
-                // Linear offset into 128^3 chunk (ZYX C-order)
-                size_t off = (static_cast<size_t>(iz & 127) << 14) |
-                             (static_cast<size_t>(iy & 127) << 7) |
-                              static_cast<size_t>(ix & 127);
+                // Local offset using actual chunk dimensions
+                int lx = p.localX(ix);
+                int ly = p.localY(iy);
+                int lz = p.localZ(iz);
+                size_t off = static_cast<size_t>(lz) * static_cast<size_t>(p.cy) * static_cast<size_t>(p.cx)
+                           + static_cast<size_t>(ly) * static_cast<size_t>(p.cx)
+                           + static_cast<size_t>(lx);
 
                 row[x] = lut[data[off]];
                 sampled = true;

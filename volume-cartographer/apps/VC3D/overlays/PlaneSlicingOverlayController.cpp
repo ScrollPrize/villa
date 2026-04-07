@@ -1,6 +1,6 @@
 #include "PlaneSlicingOverlayController.hpp"
 
-#include "../tiled/CTiledVolumeViewer.hpp"
+#include "../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "../VolumeViewerBase.hpp"
 #include "../CState.hpp"
 #include "vc/core/util/Surface.hpp"

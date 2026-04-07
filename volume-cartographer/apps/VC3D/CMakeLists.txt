@@ -135,12 +135,8 @@ set(srcs
     CPointCollectionWidget.cpp
     elements/COutlinedTextItem.hpp
     elements/COutlinedTextItem.cpp
-    tiled/CTiledVolumeViewer.cpp
-    tiled/CTiledVolumeViewer.hpp
-    tiled/TiledViewerCamera.cpp
-    tiled/TiledViewerCamera.hpp
-    tiled/TileScene.cpp
-    tiled/TileScene.hpp
+    adaptive/CAdaptiveVolumeViewer.cpp
+    adaptive/CAdaptiveVolumeViewer.hpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)

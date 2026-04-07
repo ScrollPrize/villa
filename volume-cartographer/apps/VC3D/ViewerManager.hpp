@@ -15,7 +15,10 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QMdiArea;
-class CTiledVolumeViewer;
+class CAdaptiveVolumeViewer;
+#ifndef CTiledVolumeViewer
+#define CTiledVolumeViewer CAdaptiveVolumeViewer
+#endif
 class CState;
 class VCCollection;
 class SegmentationOverlayController;

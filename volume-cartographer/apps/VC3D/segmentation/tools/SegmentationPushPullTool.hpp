@@ -15,7 +15,10 @@ class SegmentationWidget;
 class SegmentationOverlayController;
 class CState;
 class SegmentationModule;
-class CTiledVolumeViewer;
+class CAdaptiveVolumeViewer;
+#ifndef CTiledVolumeViewer
+#define CTiledVolumeViewer CAdaptiveVolumeViewer
+#endif
 class QuadSurface;
 class Volume;
 class QTimer;

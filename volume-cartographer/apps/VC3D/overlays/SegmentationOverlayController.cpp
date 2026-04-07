@@ -1,7 +1,7 @@
 #include "SegmentationOverlayController.hpp"
 
 #include "../CState.hpp"
-#include "../tiled/CTiledVolumeViewer.hpp"
+#include "../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "../VolumeViewerBase.hpp"
 #include "../ViewerManager.hpp"
 #include "../segmentation/tools/SegmentationEditManager.hpp"

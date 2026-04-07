@@ -1,6 +1,6 @@
 #include "SegmentationModule.hpp"
 
-#include "tiled/CTiledVolumeViewer.hpp"
+#include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "tools/SegmentationBrushTool.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/CellReoptimizationTool.hpp"
