@@ -119,6 +119,7 @@ public:
     };
 
     [[nodiscard]] Stats stats() const;
+    [[nodiscard]] bool coarseLevelReady() const noexcept { return coarseLevel_ >= 0; }
 
 private:
     utils::ShardedLRUCache<ChunkKey, ChunkDataPtr, ChunkKeyHash> hotCache_;

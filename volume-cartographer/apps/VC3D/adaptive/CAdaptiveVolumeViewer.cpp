@@ -7,6 +7,7 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/render/PostProcess.hpp"
+#include "vc/core/util/Slicing.hpp"
 #include "vc/core/types/SampleParams.hpp"
 
 #include <QSettings>
@@ -332,7 +333,7 @@ void CAdaptiveVolumeViewer::submitRender()
             vx / _camera.scale, vy / _camera.scale,
             fbW, fbH, sp, lut.data());
     } else {
-        // QuadSurface: gen coords then sample (non-blocking best-effort)
+        // QuadSurface: gen coords then adaptive sample (non-blocking)
         cv::Mat_<cv::Vec3f> coords;
         cv::Vec3f offset(_camera.surfacePtr[0] * _camera.scale,
                          _camera.surfacePtr[1] * _camera.scale,
@@ -340,33 +341,28 @@ void CAdaptiveVolumeViewer::submitRender()
         surf->gen(&coords, nullptr, cv::Size(fbW, fbH), cv::Vec3f(0, 0, 0),
                   _camera.scale, offset);
 
-        // Prefetch: compute world bbox from coords and prefetch all levels
         if (!coords.empty()) {
+            // Prefetch visible chunks at all levels
             float loX = FLT_MAX, loY = FLT_MAX, loZ = FLT_MAX;
             float hiX = -FLT_MAX, hiY = -FLT_MAX, hiZ = -FLT_MAX;
             for (int r = 0; r < coords.rows; r += std::max(1, coords.rows / 8)) {
                 for (int c = 0; c < coords.cols; c += std::max(1, coords.cols / 8)) {
                     const auto& v = coords(r, c);
+                    if (v[0] < 0 || v[1] < 0 || v[2] < 0) continue;
                     loX = std::min(loX, v[0]); hiX = std::max(hiX, v[0]);
                     loY = std::min(loY, v[1]); hiY = std::max(hiY, v[1]);
                     loZ = std::min(loZ, v[2]); hiZ = std::max(hiZ, v[2]);
                 }
             }
-            for (int lvl = sp.level; lvl < static_cast<int>(_volume->numScales()); lvl++)
-                _volume->prefetchWorldBBox(cv::Vec3f(loX, loY, loZ), cv::Vec3f(hiX, hiY, hiZ), lvl);
-        }
+            if (loX < hiX)
+                for (int lvl = sp.level; lvl < static_cast<int>(_volume->numScales()); lvl++)
+                    _volume->prefetchWorldBBox(cv::Vec3f(loX, loY, loZ), cv::Vec3f(hiX, hiY, hiZ), lvl);
 
-        cv::Mat_<uint8_t> gray;
-        _volume->sampleBestEffort(gray, coords, sp);
-
-        // Apply LUT: gray → ARGB32
-        if (!gray.empty()) {
-            for (int y = 0; y < fbH && y < gray.rows; y++) {
-                const auto* src = gray.ptr<uint8_t>(y);
-                auto* dst = fbBits + y * fbStride;
-                for (int x = 0; x < fbW && x < gray.cols; x++)
-                    dst[x] = lut[src[x]];
-            }
+            // Non-blocking adaptive sampling — same as plane path but with coords
+            sampleCoordsAdaptiveARGB32(
+                fbBits, fbStride, _volume->tieredCache(),
+                sp.level, static_cast<int>(_volume->numScales()),
+                coords, lut.data());
         }
     }
 

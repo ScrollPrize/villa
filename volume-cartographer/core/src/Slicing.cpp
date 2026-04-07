@@ -2200,6 +2200,91 @@ int samplePlaneAdaptiveARGB32(
 }
 
 // ============================================================================
+// sampleCoordsAdaptiveARGB32 — same as samplePlaneAdaptiveARGB32 but takes a
+// pre-computed coords matrix (for QuadSurface). Non-blocking, per-pixel level
+// fallback, uses AdaptiveSlotCache.
+// ============================================================================
+
+void sampleCoordsAdaptiveARGB32(
+    uint32_t* outBuf, int outStride,
+    vc::cache::TieredChunkCache* cache,
+    int desiredLevel, int numLevels,
+    const cv::Mat_<cv::Vec3f>& coords,
+    const uint32_t lut[256])
+{
+    const uint32_t bg = lut[0];
+    const int maxLvl = std::min(numLevels, 8);
+    const int h = coords.rows, w = coords.cols;
+
+    struct LevelInfo {
+        CacheParams p;
+        AdaptiveSlotCache slotCache;
+        float scale;
+        LevelInfo(vc::cache::TieredChunkCache* c, int lvl)
+            : p(c, lvl), scale(1.0f / static_cast<float>(1 << lvl)) {}
+    };
+
+    std::vector<LevelInfo> levels;
+    levels.reserve(maxLvl);
+    for (int l = 0; l < maxLvl; l++)
+        levels.emplace_back(cache, l);
+
+    const float boundsX = levels[0].p.sxf;
+    const float boundsY = levels[0].p.syf;
+    const float boundsZ = levels[0].p.szf;
+
+    for (int y = 0; y < h; y++) {
+        uint32_t* row = outBuf + y * outStride;
+        const auto* coordRow = coords.ptr<cv::Vec3f>(y);
+
+        for (int x = 0; x < w; x++) {
+            const cv::Vec3f& c = coordRow[x];
+            float wx = c[0], wy = c[1], wz = c[2];
+
+            if (wx < 0 || wy < 0 || wz < 0 ||
+                wx >= boundsX || wy >= boundsY || wz >= boundsZ) {
+                row[x] = bg;
+                continue;
+            }
+
+            bool sampled = false;
+            for (int l = desiredLevel; l < maxLvl; l++) {
+                auto& li = levels[l];
+                const auto& p = li.p;
+
+                int ix = static_cast<int>(wx * li.scale + 0.5f);
+                int iy = static_cast<int>(wy * li.scale + 0.5f);
+                int iz = static_cast<int>(wz * li.scale + 0.5f);
+
+                if (ix >= p.sx) ix = p.sx - 1;
+                if (iy >= p.sy) iy = p.sy - 1;
+                if (iz >= p.sz) iz = p.sz - 1;
+
+                int ci = p.chunkX(ix);
+                int cj = p.chunkY(iy);
+                int ck = p.chunkZ(iz);
+
+                const uint8_t* data = li.slotCache.lookup(ci, cj, ck, l, *cache);
+                if (!data) continue;
+
+                int lx = p.localX(ix);
+                int ly = p.localY(iy);
+                int lz = p.localZ(iz);
+                size_t off = static_cast<size_t>(lz) * static_cast<size_t>(p.cy) * static_cast<size_t>(p.cx)
+                           + static_cast<size_t>(ly) * static_cast<size_t>(p.cx)
+                           + static_cast<size_t>(lx);
+
+                row[x] = lut[data[off]];
+                sampled = true;
+                break;
+            }
+            if (!sampled)
+                row[x] = bg;
+        }
+    }
+}
+
+// ============================================================================
 // samplePlaneCompositeARGB32 — fused plane composite: inline coords, nearest-
 // neighbor per layer, composite, LUT → ARGB32. No coord matrix allocation.
 // ============================================================================
