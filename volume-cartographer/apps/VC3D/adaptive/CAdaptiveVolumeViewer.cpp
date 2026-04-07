@@ -174,7 +174,17 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 
         // Prefetch coarsest levels immediately so we always have data
         if (nScales > 0)
-            _volume->prefetchLevels(std::max(0, nScales - 3), nScales - 1);
+            // Always prefetch the coarsest level
+            _volume->prefetchLevels(nScales - 1, nScales - 1);
+
+            // Prefetch additional levels per user setting
+            QSettings pfSettings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            int prefetchLvls = pfSettings.value(vc3d::settings::perf::PREFETCH_LEVELS,
+                                                vc3d::settings::perf::PREFETCH_LEVELS_DEFAULT).toInt();
+            if (prefetchLvls > 0) {
+                int from = std::max(0, nScales - 1 - prefetchLvls);
+                _volume->prefetchLevels(from, nScales - 1);
+            }
     }
 
     // Recompute content bounds
