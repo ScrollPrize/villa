@@ -320,42 +320,37 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
         }
         source = std::move(httpSource);
 
-        // Create or open per-level sharded zarr v3 cold cache.
-        // Each level is its own zarr array at path_/0/, path_/1/, etc.
-        // 128³ inner chunks in 1024³ shards.
+        // v3 sharded disk cache: path_/0/, path_/1/, ...
+        // 128³ chunks, 1024³ shards, padded to chunk boundaries.
+        // Open if zarr.json exists, create if not.
         std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels;
         {
             int nLevels = source->numLevels();
             diskLevels.resize(nLevels);
+            auto pad = [](int v, int chunk) -> size_t {
+                return static_cast<size_t>((v + chunk - 1) / chunk * chunk);
+            };
             for (int lvl = 0; lvl < nLevels; lvl++) {
                 auto lvlPath = path_ / std::to_string(lvl);
-                try {
-                    if (std::filesystem::exists(lvlPath / "zarr.json") ||
-                        std::filesystem::exists(lvlPath / ".zarray")) {
-                        // Try opening existing — may be v2 (.zarray) or v3 (zarr.json)
-                        diskLevels[lvl] = std::make_shared<utils::ZarrArray>(
-                            utils::ZarrArray::open(lvlPath));
-                    } else {
-                        auto shape = source->levelShape(lvl);
-                        // Pad shape up to chunk boundary (128)
-                        auto pad = [](int v) -> size_t { return static_cast<size_t>(std::max(v, 128)); };
-                        utils::ZarrMetadata meta;
-                        meta.version = utils::ZarrVersion::v3;
-                        meta.node_type = "array";
-                        meta.shape = {pad(shape[0]), pad(shape[1]), pad(shape[2])};
-                        meta.chunks = {1024, 1024, 1024};
-                        meta.dtype = utils::ZarrDtype::uint8;
-                        meta.fill_value = 0;
-                        meta.chunk_key_encoding = "default";
-                        utils::ShardConfig sc;
-                        sc.sub_chunks = {128, 128, 128};
-                        sc.index_at_end = false;
-                        meta.shard_config = std::move(sc);
-                        diskLevels[lvl] = std::make_shared<utils::ZarrArray>(
-                            utils::ZarrArray::create(lvlPath, std::move(meta)));
-                    }
-                } catch (const std::exception& e) {
-                    fprintf(stderr, "[Volume] Failed to open/create cold cache level %d: %s\n", lvl, e.what());
+                if (std::filesystem::exists(lvlPath / "zarr.json")) {
+                    diskLevels[lvl] = std::make_shared<utils::ZarrArray>(
+                        utils::ZarrArray::open(lvlPath));
+                } else {
+                    auto shape = source->levelShape(lvl);
+                    utils::ZarrMetadata meta;
+                    meta.version = utils::ZarrVersion::v3;
+                    meta.node_type = "array";
+                    meta.shape = {pad(shape[0], 128), pad(shape[1], 128), pad(shape[2], 128)};
+                    meta.chunks = {1024, 1024, 1024};
+                    meta.dtype = utils::ZarrDtype::uint8;
+                    meta.fill_value = 0;
+                    meta.chunk_key_encoding = "default";
+                    utils::ShardConfig sc;
+                    sc.sub_chunks = {128, 128, 128};
+                    sc.index_at_end = false;
+                    meta.shard_config = std::move(sc);
+                    diskLevels[lvl] = std::make_shared<utils::ZarrArray>(
+                        utils::ZarrArray::create(lvlPath, std::move(meta)));
                 }
             }
             fprintf(stderr, "[Volume] Cold cache: %d levels at %s\n",
