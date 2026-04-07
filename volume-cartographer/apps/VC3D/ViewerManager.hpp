@@ -13,7 +13,6 @@
 #include <opencv2/core.hpp>
 
 #include "vc/core/util/SurfacePatchIndex.hpp"
-#include "tiled/RenderPool.hpp"
 
 class QMdiArea;
 class CTiledVolumeViewer;
@@ -46,7 +45,6 @@ public:
                                      QMdiArea* mdiArea);
 
     const std::vector<CTiledVolumeViewer*>& viewers() const { return _viewers; }
-    RenderPool* renderPool() { return &_renderPool; }
 
     void setSegmentationOverlay(SegmentationOverlayController* overlay);
     SegmentationOverlayController* segmentationOverlay() const { return _segmentationOverlay; }
@@ -126,8 +124,6 @@ private:
 
     CState* _state;
     VCCollection* _points;
-    RenderPool _renderPool;  // shared across all viewers
-    // Cache is obtained from Volume::tieredCache()
     SegmentationOverlayController* _segmentationOverlay{nullptr};
     PointsOverlayController* _pointsOverlay{nullptr};
     RawPointsOverlayController* _rawPointsOverlay{nullptr};

@@ -81,15 +81,6 @@ void samplePlane(cv::Mat_<uint8_t>& out, vc::cache::TieredChunkCache* cache, int
                  const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
                  int width, int height, vc::Sampling method);
 
-// Fused plane sampling + LUT: samples uint8 voxels and writes ARGB32 directly
-// via lut[voxelValue], eliminating the intermediate cv::Mat and second pass.
-// outBuf must point to width*height uint32_t pixels (row-major, stride in uint32_t units).
-void samplePlaneARGB32(uint32_t* outBuf, int outStride,
-                       vc::cache::TieredChunkCache* cache, int level,
-                       const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
-                       int width, int height, vc::Sampling method,
-                       const uint32_t lut[256]);
-
 // Adaptive plane sampling: per-pixel level fallback. For each pixel, tries the
 // desired level first; if that chunk isn't in hot cache, falls back to coarser
 // levels. This means half the image can be full-res while the rest is still loading.

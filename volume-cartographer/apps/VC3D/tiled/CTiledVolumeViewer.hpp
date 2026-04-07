@@ -27,8 +27,6 @@
 
 #include "tiled/TiledViewerCamera.hpp"
 #include "tiled/TileScene.hpp"
-#include "tiled/TileRenderer.hpp"
-#include "tiled/TileRenderController.hpp"
 
 class QGraphicsScene;
 class QGraphicsItem;
@@ -260,9 +258,6 @@ private:
     void zoomStepsAt(int steps, const QPointF& scenePos);
     void setSliceOffset(float dz);
 
-    // Build TileRenderParams for a given tile key
-    TileRenderParams buildRenderParams(const WorldTileKey& wk) const;
-
     void markActiveSegmentationDirty();
 
     // Mark overlays dirty on the render controller AND notify external listeners
@@ -293,14 +288,17 @@ private:
                                  const QRectF& prefetchRect,
                                  cv::Vec3f& lo, cv::Vec3f& hi) const;
 
-    // Submit all visible tiles to the render controller (async path)
+    // Coalesce render requests to max one per 16ms per viewer
+    void scheduleRender();
+
+    // Render the full viewport directly to the framebuffer
     void submitRender();
 
-    // Compute content extent in surface parameter space and rebuild the tile grid
+    // Compute content extent in surface parameter space and resize framebuffer
     void rebuildContentGrid();
 
-    // Called on the main thread when pinCoarsestLevel completes (background thread)
-    void onPinComplete();
+    // Called when volume is ready for rendering
+    void onVolumeReady();
 
     // Called when data bounds become valid after async coarsest-level load
     void onDataBoundsReady();
@@ -311,19 +309,13 @@ private:
     // Get the current viewport rect in scene coordinates
     QRectF viewportSceneRect() const;
 
-    // Compute visible WorldTileKeys directly from camera + blit formula.
-    std::vector<WorldTileKey> computeVisibleKeys() const;
-
     // --- Widget components ---
     QGraphicsScene* _scene = nullptr;
     TileScene* _tileScene = nullptr;
     TiledViewerCamera _camera;
-    TileRenderController* _renderController = nullptr;
-    ContentBounds _contentBounds;
-    // Full content extent in surface coordinates (for pan clamping when grid is windowed)
+    // Content extent in surface coordinates (for pan clamping)
     float _fullContentMinU = 0, _fullContentMaxU = 0;
     float _fullContentMinV = 0, _fullContentMaxV = 0;
-    bool _gridWindowed = false;  // true when grid is capped (subset of full content)
 
     // --- Data ---
     std::shared_ptr<Volume> _volume;
@@ -422,6 +414,8 @@ private:
 
     // --- Status ---
     QLabel* _lbl = nullptr;
+    QTimer* _renderTimer = nullptr;
+    bool _renderPending = false;
     bool _dirtyWhileMinimized = false;
     bool _overlayUpdatePending = false;  // coalescing flag for scheduleOverlayUpdate()
     QTimer* _intersectionThrottleTimer = nullptr;  // coalesces renderIntersections calls
@@ -455,11 +449,6 @@ private:
     // --- Zoom limits ---
     float _contentMinScale = TiledViewerCamera::MIN_SCALE;  // dynamic minimum so content fills viewport
     float _navSpeed = 1.0f;  // navigation speed multiplier (zoom, pan, scroll)
-
-    // --- Remote volume pin progress ---
-    std::atomic<int> _pinTotal{0};   // total chunks to pin at coarsest level
-    int _pinReceived = 0;            // chunks received so far (main thread only)
-    int _pinLevel = -1;              // pyramid level being pinned
 
     // --- Chunk-ready listener tracking ---
     vc::cache::TieredChunkCache::ChunkReadyCallbackId _chunkCbId = 0;

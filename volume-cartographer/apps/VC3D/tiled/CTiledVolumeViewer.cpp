@@ -7,10 +7,11 @@
 #include "../overlays/SegmentationOverlayController.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/render/TileGrid.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/render/PostProcess.hpp"
+#include "vc/core/types/SampleParams.hpp"
 #include <limits>
 
 #include <QSettings>
@@ -34,6 +35,35 @@
 #include <cmath>
 
 #include "vc/core/cache/TieredChunkCache.hpp"
+#include "vc/core/render/PostProcess.hpp"
+#include "vc/core/render/Colormaps.hpp"
+
+namespace {
+
+void blendOverlay(uint32_t* base, int baseStride,
+                  const uint32_t* overlay, int overlayStride,
+                  const cv::Mat_<uint8_t>& overlayMask,
+                  float opacity, int rows, int cols)
+{
+    const float alpha = std::clamp(opacity, 0.0f, 1.0f);
+    if (alpha <= 0.0f) return;
+    const float ia = 1.0f - alpha;
+    for (int y = 0; y < rows; ++y) {
+        auto* dst = base + y * baseStride;
+        const auto* src = overlay + y * overlayStride;
+        const auto* mask = overlayMask.ptr<uint8_t>(y);
+        for (int x = 0; x < cols; ++x) {
+            if (mask[x] == 0) continue;
+            const uint32_t d = dst[x], s = src[x];
+            const auto r = static_cast<uint32_t>(static_cast<float>((s >> 16) & 0xFF) * alpha + static_cast<float>((d >> 16) & 0xFF) * ia);
+            const auto g = static_cast<uint32_t>(static_cast<float>((s >> 8) & 0xFF) * alpha + static_cast<float>((d >> 8) & 0xFF) * ia);
+            const auto b = static_cast<uint32_t>(static_cast<float>(s & 0xFF) * alpha + static_cast<float>(d & 0xFF) * ia);
+            dst[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+} // namespace
 
 constexpr auto COLOR_CURSOR = Qt::cyan;
 #define COLOR_FOCUS QColor(50, 255, 215)
@@ -169,10 +199,10 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     fGraphicsView->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     fGraphicsView->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     fGraphicsView->setTransformationAnchor(QGraphicsView::NoAnchor);
-    fGraphicsView->setRenderHint(QPainter::Antialiasing);
+    fGraphicsView->setRenderHint(QPainter::Antialiasing, false);
     fGraphicsView->setScrollPanDisabled(true);
     // Software rendering — no OpenGL (eliminates ghosting from GL double-buffer)
-    fGraphicsView->setViewportUpdateMode(QGraphicsView::BoundingRectViewportUpdate);
+    fGraphicsView->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
 
     // Connect signals from view
     connect(fGraphicsView, &CVolumeViewerView::sendScrolled, this, &CTiledVolumeViewer::onScrolled);
@@ -198,22 +228,23 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     // Create tile scene manager
     _tileScene = new TileScene(_scene);
 
-    // Create render controller (async tile rendering, shared pool from ViewerManager)
-    _renderController = new TileRenderController(_tileScene, manager->renderPool(), this);
-
     // Set the scene on the view
     fGraphicsView->setScene(_scene);
 
-    // Force viewport repaint when progressive refinement updates tiles.
-    // QGraphicsPixmapItem::setPixmap() should auto-trigger this, but the
-    // explicit signal guarantees the view refreshes when updates arrive
-    // while the view is otherwise idle (no user interaction).
-    connect(_renderController, &TileRenderController::sceneNeedsUpdate,
-            this, [this]() {
-                fGraphicsView->viewport()->update();
-                updateStatusLabel();
-                // (retained items removed — single framebuffer now)
-            });
+    // Paint framebuffer directly in drawBackground, bypassing QGraphicsPixmapItem
+    fGraphicsView->setDirectFramebuffer(&_tileScene->constFramebuffer());
+
+    // Render throttle: coalesce all render requests into one per 16ms
+    _renderTimer = new QTimer(this);
+    _renderTimer->setSingleShot(true);
+    _renderTimer->setInterval(16);
+    connect(_renderTimer, &QTimer::timeout, this, [this]() {
+        if (_renderPending) {
+            _renderPending = false;
+            submitRender();
+            updateStatusLabel();
+        }
+    });
 
     // Read settings
     using namespace vc3d::settings;
@@ -226,9 +257,6 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     auto* layout = new QVBoxLayout;
     layout->addWidget(fGraphicsView);
     setLayout(layout);
-
-    // Wire callbacks into the unified tick on the render controller
-    _renderController->setOverlayCallback([this]() { updateAllOverlays(); });
 
     _lbl = new QLabel(this);
     _lbl->setStyleSheet("QLabel { color : #00FF00; background-color: rgba(0,0,0,128); padding: 2px 4px; }");
@@ -313,11 +341,6 @@ Surface* CTiledVolumeViewer::currentSurface() const
 
 void CTiledVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 {
-    // Invalidate all caches and cancel in-flight work from the old volume
-    _renderController->cancelAll();
-    _renderController->clearState();
-    _renderController->viewportRenderer().tileGrid().resetMetadata();
-
     // Remove old chunk-ready listener before switching volumes
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
@@ -325,32 +348,24 @@ void CTiledVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     }
 
     _volume = std::move(vol);
-
-    // Reset pin progress tracking
-    _pinTotal = 0;
-    _pinReceived = 0;
-    _pinLevel = -1;
     _hadValidDataBounds = false;
 
-    // Set up tiered chunk cache for progressive rendering
+    // Wire chunk-ready listener so arriving chunks trigger re-render
     if (_volume && _volume->numScales() >= 1) {
-        // Wire chunk-ready listener so arriving chunks trigger refinement.
-        auto* ctrl = _renderController;
         auto* cache = _volume->tieredCache();
         QPointer<CTiledVolumeViewer> viewerGuard(this);
         _chunkCbId = cache->addChunkReadyListener(
-            [ctrl, viewerGuard, cache](const vc::cache::ChunkKey&) {
+            [viewerGuard, cache](const vc::cache::ChunkKey&) {
                 QMetaObject::invokeMethod(qApp, [viewerGuard, cache]() {
                     if (viewerGuard) {
                         cache->clearChunkArrivedFlag();
-                        viewerGuard->submitRender();
-                        viewerGuard->updateStatusLabel();
+                        viewerGuard->scheduleRender();
                     }
                 }, Qt::QueuedConnection);
             });
     }
 
-    onPinComplete();
+    onVolumeReady();
     updateStatusLabel();
 }
 
@@ -408,10 +423,6 @@ void CTiledVolumeViewer::onSurfaceChanged(const std::string& name, const std::sh
                     _camera.zOff = 0.0f;
                 }
 
-                // Full surface changes: cancel stale work,
-                // but keep old tiles visible via retained layer (no gray flash).
-                _renderController->cancelAll();
-
                 updateContentMinScale();
                 rebuildContentGrid();
                 centerViewport();
@@ -427,7 +438,6 @@ void CTiledVolumeViewer::onSurfaceChanged(const std::string& name, const std::sh
         submitRender();
     }
 
-    _renderController->markOverlaysDirty();
     if (name == "segmentation" || name == _surfName) {
         renderIntersections();
     }
@@ -435,9 +445,6 @@ void CTiledVolumeViewer::onSurfaceChanged(const std::string& name, const std::sh
 
 void CTiledVolumeViewer::onVolumeClosing()
 {
-    _renderController->cancelAll();
-    _renderController->clearState();
-
     if (_surfName == "segmentation") {
         onSurfaceChanged(_surfName, nullptr);
     } else if (isAxisAlignedView()) {
@@ -450,7 +457,6 @@ void CTiledVolumeViewer::onVolumeClosing()
         _ov.sliceVisItems.clear();
         _paths.clear();
         scheduleOverlayUpdate();
-        _contentBounds = ContentBounds{};
     } else {
         onSurfaceChanged(_surfName, nullptr);
     }
@@ -546,97 +552,15 @@ void CTiledVolumeViewer::rebuildContentGrid()
         }
     }
 
-    // Compute content bounds
-    ContentBounds bounds;
-    bounds.scale = _camera.scale;
-    bounds.worldTileSize = static_cast<float>(vc::render::TileGrid::TILE_PX) / _camera.scale;
+    // Store content extent for pan clamping
+    _fullContentMinU = contentMinX;
+    _fullContentMaxU = contentMaxX;
+    _fullContentMinV = contentMinY;
+    _fullContentMaxV = contentMaxY;
 
-    if (bounds.worldTileSize > 0 && contentMaxX > contentMinX && contentMaxY > contentMinY) {
-        bounds.firstWorldCol = static_cast<int>(std::floor(contentMinX / bounds.worldTileSize));
-        bounds.firstWorldRow = static_cast<int>(std::floor(contentMinY / bounds.worldTileSize));
-        int lastCol = static_cast<int>(std::floor(contentMaxX / bounds.worldTileSize));
-        int lastRow = static_cast<int>(std::floor(contentMaxY / bounds.worldTileSize));
-        bounds.totalCols = lastCol - bounds.firstWorldCol + 1;
-        bounds.totalRows = lastRow - bounds.firstWorldRow + 1;
-        // Float origin: exact surface coord of grid top-left (no int quantization)
-        bounds.originSurfX = static_cast<float>(bounds.firstWorldCol) * bounds.worldTileSize;
-        bounds.originSurfY = static_cast<float>(bounds.firstWorldRow) * bounds.worldTileSize;
-    }
-
-    // Store full content extent for pan clamping before any grid capping
-    _fullContentMinU = static_cast<float>(bounds.firstWorldCol) * bounds.worldTileSize;
-    _fullContentMaxU = static_cast<float>(bounds.firstWorldCol + bounds.totalCols) * bounds.worldTileSize;
-    _fullContentMinV = static_cast<float>(bounds.firstWorldRow) * bounds.worldTileSize;
-    _fullContentMaxV = static_cast<float>(bounds.firstWorldRow + bounds.totalRows) * bounds.worldTileSize;
-
-    // Cap grid size to prevent freeze at extreme zoom.
-    // At 10x zoom on a large volume, uncapped grid can have 20,000+ tiles.
-    // Limit to a window around the camera position.
-    // Cap the grid to viewport-sized window to avoid creating thousands of
-    // off-screen QGraphicsPixmapItems at high zoom. The ViewportRenderer
-    // already only renders visible tiles, so the grid just needs to cover
-    // the viewport + buffer.
-    QSize vpSize2 = fGraphicsView->viewport()->size();
-    int vpTilesW = static_cast<int>(std::ceil(
-        static_cast<float>(vpSize2.width()) / vc::render::TileGrid::TILE_PX)) + 2 * tiled_config::VISIBLE_BUFFER_TILES;
-    int vpTilesH = static_cast<int>(std::ceil(
-        static_cast<float>(vpSize2.height()) / vc::render::TileGrid::TILE_PX)) + 2 * tiled_config::VISIBLE_BUFFER_TILES;
-
-    // Only window if the full grid is significantly larger than viewport
-    _gridWindowed = false;
-    if (bounds.totalCols > vpTilesW * 2 || bounds.totalRows > vpTilesH * 2) {
-        int windowCols = vpTilesW * 2;
-        int windowRows = vpTilesH * 2;
-
-        int contentFirstCol = bounds.firstWorldCol;
-        int contentFirstRow = bounds.firstWorldRow;
-        int contentTotalCols = bounds.totalCols;
-        int contentTotalRows = bounds.totalRows;
-
-        float cameraTileCol = _camera.surfacePtr[0] / bounds.worldTileSize;
-        float cameraTileRow = _camera.surfacePtr[1] / bounds.worldTileSize;
-        int camCol = static_cast<int>(std::round(cameraTileCol));
-        int camRow = static_cast<int>(std::round(cameraTileRow));
-
-        // Keep window position stable — only shift when camera nears edge
-        int winFirstCol = contentFirstCol;
-        int winFirstRow = contentFirstRow;
-
-        if (_contentBounds.totalCols > 0 && _contentBounds.totalCols <= windowCols + 4) {
-            // Previous grid was windowed with similar size — keep its position
-            winFirstCol = _contentBounds.firstWorldCol;
-            winFirstRow = _contentBounds.firstWorldRow;
-            int margin = vpTilesW / 2;
-            if (camCol < winFirstCol + margin || camCol >= winFirstCol + windowCols - margin)
-                winFirstCol = camCol - windowCols / 2;
-            if (camRow < winFirstRow + margin || camRow >= winFirstRow + windowRows - margin)
-                winFirstRow = camRow - windowRows / 2;
-        } else {
-            // First time or size changed — position window around camera
-            if (camCol < winFirstCol || camCol >= winFirstCol + windowCols)
-                winFirstCol = camCol - windowCols / 2;
-            if (camRow < winFirstRow || camRow >= winFirstRow + windowRows)
-                winFirstRow = camRow - windowRows / 2;
-        }
-
-        // Clamp to content extent
-        int contentLastCol = contentFirstCol + contentTotalCols - 1;
-        int contentLastRow = contentFirstRow + contentTotalRows - 1;
-        winFirstCol = std::clamp(winFirstCol, contentFirstCol, std::max(contentFirstCol, contentLastCol - windowCols + 1));
-        winFirstRow = std::clamp(winFirstRow, contentFirstRow, std::max(contentFirstRow, contentLastRow - windowRows + 1));
-
-        bounds.firstWorldCol = winFirstCol;
-        bounds.firstWorldRow = winFirstRow;
-        bounds.totalCols = std::min(windowCols, contentLastCol - winFirstCol + 1);
-        bounds.totalRows = std::min(windowRows, contentLastRow - winFirstRow + 1);
-        _gridWindowed = true;
-    }
-
-    _contentBounds = bounds;
-
+    // Resize framebuffer to viewport size
     QSize vpSize = fGraphicsView->viewport()->size();
-    _tileScene->rebuildGrid(bounds, vpSize.width(), vpSize.height());
-    _renderController->syncGridBounds(bounds, vpSize.width(), vpSize.height());
+    _tileScene->rebuildGrid(vpSize.width(), vpSize.height());
 }
 
 void CTiledVolumeViewer::centerViewport()
@@ -646,21 +570,20 @@ void CTiledVolumeViewer::centerViewport()
     _tileScene->setCamZOff(_camera.zOff);
 }
 
-void CTiledVolumeViewer::onPinComplete()
+void CTiledVolumeViewer::onVolumeReady()
 {
     if (!_volume) return;
 
     _hadValidDataBounds = false;
 
-    // Create a default PlaneSurface immediately so remote volumes render
-    // without waiting for a coarsest-level bounds scan.
+    // Create a default PlaneSurface so axis-aligned views render immediately
     if (!_surfWeak.lock() && _volume && isAxisAlignedView()) {
-        auto shape = _volume->shape();  // {width, height, slices} = {x, y, z}
+        auto shape = _volume->shape();
         cv::Vec3f center(static_cast<float>(shape[0]) * 0.5f, static_cast<float>(shape[1]) * 0.5f, static_cast<float>(shape[2]) * 0.5f);
         cv::Vec3f normal;
         if (_surfName == "xy plane") normal = cv::Vec3f(0, 0, 1);
         else if (_surfName == "xz plane" || _surfName == "seg xz") normal = cv::Vec3f(0, 1, 0);
-        else normal = cv::Vec3f(1, 0, 0);  // yz plane / seg yz
+        else normal = cv::Vec3f(1, 0, 0);
         auto defaultSurf = std::make_shared<PlaneSurface>(center, normal);
         _defaultSurface = defaultSurf;
         _surfWeak = defaultSurf;
@@ -668,36 +591,15 @@ void CTiledVolumeViewer::onPinComplete()
 
     _camera.recalcPyramidLevel(static_cast<int>(_volume->numScales()));
     updateContentMinScale();
-
     rebuildContentGrid();
     centerViewport();
 
-    // Update scalebar
     double vs = _volume->voxelSize() / static_cast<double>(_camera.dsScale);
     fGraphicsView->setVoxelSize(vs, vs);
 
     submitRender();
     renderIntersections();
     updateStatusLabel();
-
-    // Trigger background prefetch of pyramid levels if configured.
-    // Setting value = how many of the coarsest levels to download.
-    // E.g., with levels 0-5: setting=1 downloads 5/, setting=2 downloads 5/+4/, etc.
-    // Level 5 (coarsest) is already pinned above, so we prefetch the rest.
-    if (_volume && _volume->isRemote()) {
-        using namespace vc3d::settings;
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        int prefetchCount = settings.value(perf::PREFETCH_LEVELS, perf::PREFETCH_LEVELS_DEFAULT).toInt();
-        if (prefetchCount > 1) {
-            int maxLevel = static_cast<int>(_volume->numScales()) - 1;
-            // Coarsest (maxLevel) is already pinned; prefetch the next ones down
-            int fromLevel = std::max(0, maxLevel - prefetchCount + 1);
-            int toLevel = maxLevel - 1;
-            if (toLevel >= fromLevel) {
-                _volume->prefetchLevels(fromLevel, toLevel);
-            }
-        }
-    }
 }
 
 void CTiledVolumeViewer::onDataBoundsReady()
@@ -734,8 +636,6 @@ void CTiledVolumeViewer::onDataBoundsReady()
         }
     }
 
-    // Cancel stale work, rebuild grid with retained tile layer (no gray flash)
-    _renderController->cancelAll();
     updateContentMinScale();
     rebuildContentGrid();
     centerViewport();
@@ -747,25 +647,9 @@ void CTiledVolumeViewer::onDataBoundsReady()
 QRectF CTiledVolumeViewer::viewportSceneRect() const
 {
     if (!fGraphicsView) return QRectF();
-    // Compute visible world tile range directly from the blit formula:
-    //   dstX = (worldCol * worldTileSize - camSurfX) * scale + vpCx
-    // Solving for surfaceX at screen edges:
-    //   surfLeft  = camSurfX - vpCx / scale
-    //   surfRight = camSurfX + vpCx / scale
-    // Convert to worldCol: floor(surfX / worldTileSize)
-    // Return as a QRectF in "surface tile grid" units for visibleTiles.
     float vpW = static_cast<float>(fGraphicsView->viewport()->width());
     float vpH = static_cast<float>(fGraphicsView->viewport()->height());
-    float surfL = _camera.surfacePtr[0] - vpW * 0.5f / _camera.scale;
-    float surfR = _camera.surfacePtr[0] + vpW * 0.5f / _camera.scale;
-    float surfT = _camera.surfacePtr[1] - vpH * 0.5f / _camera.scale;
-    float surfB = _camera.surfacePtr[1] + vpH * 0.5f / _camera.scale;
-    // Convert to grid-pixel space for TileGrid::visibleGridRange compatibility.
-    // The grid uses: gridX = (surfX - originSurfX) * scale + padX
-    auto& grid = _renderController->viewportRenderer().tileGrid();
-    auto topLeft = grid.surfaceToGrid(surfL, surfT);
-    auto botRight = grid.surfaceToGrid(surfR, surfB);
-    return QRectF(QPointF(topLeft[0], topLeft[1]), QPointF(botRight[0], botRight[1]));
+    return QRectF(0, 0, vpW, vpH);
 }
 
 // ============================================================================
@@ -794,29 +678,6 @@ void CTiledVolumeViewer::panByF(float dx, float dy)
 
     // Clear z-velocity on pan so z-prefetch reverts to symmetric
     _zVelocity = 0.0f;
-
-    // When grid is windowed (extreme zoom), rebuild the tile window if the
-    // camera has panned near the edge of the current window.  Use hysteresis
-    // (25% margin) to avoid rebuilding every frame.
-    if (_gridWindowed && _contentBounds.worldTileSize > 0) {
-        float camCol = _camera.surfacePtr[0] / _contentBounds.worldTileSize;
-        float camRow = _camera.surfacePtr[1] / _contentBounds.worldTileSize;
-        float fFirstCol = static_cast<float>(_contentBounds.firstWorldCol);
-        float fFirstRow = static_cast<float>(_contentBounds.firstWorldRow);
-        float fTotalCols = static_cast<float>(_contentBounds.totalCols);
-        float fTotalRows = static_cast<float>(_contentBounds.totalRows);
-        float marginCols = fTotalCols * 0.25f;
-        float marginRows = fTotalRows * 0.25f;
-        bool nearEdge =
-            camCol < fFirstCol + marginCols ||
-            camCol > fFirstCol + fTotalCols - marginCols ||
-            camRow < fFirstRow + marginRows ||
-            camRow > fFirstRow + fTotalRows - marginRows;
-        if (nearEdge) {
-            rebuildContentGrid();
-            centerViewport();
-        }
-    }
 
     centerViewport();
     submitRender();
@@ -872,14 +733,8 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     _focusSurfacePos[0] = _camera.surfacePtr[0];
     _focusSurfacePos[1] = _camera.surfacePtr[1];
 
-    auto surf = _surfWeak.lock();
-    if (surf && _volume && _volume->zarrDataset()) {
-        auto visibleKeys = computeVisibleKeys();
-        if (!visibleKeys.empty()) {
-            auto buildParams = [this](const WorldTileKey& wk) { return buildRenderParams(wk); };
-            _renderController->onCameraChangedDirect(_camera, surf, _volume, buildParams, visibleKeys);
-        }
-    }
+    _camera.invalidate();
+    submitRender();
 }
 
 void CTiledVolumeViewer::setSliceOffset(float dz)
@@ -1069,26 +924,12 @@ void CTiledVolumeViewer::renderVisible(bool force)
     submitRender();
 }
 
-std::vector<WorldTileKey> CTiledVolumeViewer::computeVisibleKeys() const
+
+void CTiledVolumeViewer::scheduleRender()
 {
-    std::vector<WorldTileKey> keys;
-    if (!fGraphicsView || _contentBounds.worldTileSize <= 0 || _camera.scale <= 0) return keys;
-
-    float vpW = static_cast<float>(fGraphicsView->viewport()->width());
-    float vpH = static_cast<float>(fGraphicsView->viewport()->height());
-    float wts = _contentBounds.worldTileSize;
-    float halfSurfW = vpW * 0.5f / _camera.scale;
-    float halfSurfH = vpH * 0.5f / _camera.scale;
-    int firstCol = static_cast<int>(std::floor((_camera.surfacePtr[0] - halfSurfW) / wts)) - tiled_config::VISIBLE_BUFFER_TILES;
-    int lastCol  = static_cast<int>(std::floor((_camera.surfacePtr[0] + halfSurfW) / wts)) + tiled_config::VISIBLE_BUFFER_TILES;
-    int firstRow = static_cast<int>(std::floor((_camera.surfacePtr[1] - halfSurfH) / wts)) - tiled_config::VISIBLE_BUFFER_TILES;
-    int lastRow  = static_cast<int>(std::floor((_camera.surfacePtr[1] + halfSurfH) / wts)) + tiled_config::VISIBLE_BUFFER_TILES;
-
-    keys.reserve(static_cast<size_t>(lastCol - firstCol + 1) * static_cast<size_t>(lastRow - firstRow + 1));
-    for (int r = firstRow; r <= lastRow; r++)
-        for (int c = firstCol; c <= lastCol; c++)
-            keys.push_back({c, r});
-    return keys;
+    _renderPending = true;
+    if (!_renderTimer->isActive())
+        _renderTimer->start();
 }
 
 void CTiledVolumeViewer::submitRender()
@@ -1098,75 +939,65 @@ void CTiledVolumeViewer::submitRender()
     auto surf = _surfWeak.lock();
     if (!surf || !_volume || !_volume->zarrDataset()) return;
 
-    // Update center marker
-    if (!_ov.centerMarker) {
-        _ov.centerMarker = _scene->addEllipse({-10, -10, 20, 20},
-            QPen(COLOR_FOCUS, 3, Qt::DashDotLine, Qt::RoundCap, Qt::RoundJoin));
-        _ov.centerMarker->setZValue(11);
-    }
-    QPointF centerScene = _tileScene->surfaceToScene(_focusSurfacePos[0], _focusSurfacePos[1]);
-    _ov.centerMarker->setPos(centerScene);
+    uint32_t* fbBits = _tileScene->framebufferBits();
+    int fbW = _tileScene->framebufferWidth();
+    int fbH = _tileScene->framebufferHeight();
+    int fbStride = _tileScene->framebufferStride();
+    if (!fbBits || fbW <= 0 || fbH <= 0) goto prefetch;
 
-    auto visibleKeys = computeVisibleKeys();
-    if (visibleKeys.empty()) return;
+    {
+        auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
+        if (plane) {
+            cv::Vec3f vx = plane->basisX();
+            cv::Vec3f vy = plane->basisY();
+            cv::Vec3f n = plane->normal(cv::Vec3f(0, 0, 0));
 
-    // Snapshot ALL render state into a template so the lambda never reads
-    // live _camera — prevents Z-drift between tiles in the same batch
-    // and across chunk-arrival re-renders.
-    auto tmpl = buildRenderParams(WorldTileKey{0, 0});
-    float wts = _contentBounds.worldTileSize;
-    auto buildParams = [tmpl, wts](const WorldTileKey& wk) mutable {
-        tmpl.worldKey = wk;
-        tmpl.surfaceROI.x = static_cast<float>(wk.worldCol) * wts;
-        tmpl.surfaceROI.y = static_cast<float>(wk.worldRow) * wts;
-        tmpl.surfaceROI.width = wts;
-        tmpl.surfaceROI.height = wts;
-        return tmpl;
-    };
-    _renderController->onCameraChangedDirect(_camera, surf, _volume, buildParams, visibleKeys);
+            float halfW = static_cast<float>(fbW) * 0.5f / _camera.scale;
+            float halfH = static_cast<float>(fbH) * 0.5f / _camera.scale;
 
-    // Compute prefetch viewport: extend in pan direction for predictive prefetch
-    QRectF prefetchRect = viewportSceneRect();
-    if (_isPanning) {
-        QPointF currentCenter = prefetchRect.center();
-        QPointF delta = currentCenter - _lastPanScenePos;
-        _lastPanScenePos = currentCenter;
+            cv::Vec3f origin = vx * (_camera.surfacePtr[0] - halfW)
+                             + vy * (_camera.surfacePtr[1] - halfH)
+                             + plane->origin() + n * _camera.zOff;
 
-        // Extend viewport by 3 tile widths in the direction of pan movement
-        // so prefetch stays ahead of rapid panning.
-        constexpr int PREFETCH_TILES_AHEAD = 3;
-        const double tileExtent = static_cast<double>(vc::render::TileGrid::TILE_PX) * PREFETCH_TILES_AHEAD;
-        double lenSq = delta.x() * delta.x() + delta.y() * delta.y();
-        if (lenSq > 1.0) {
-            double len = std::sqrt(lenSq);
-            double nx = delta.x() / len;
-            double ny = delta.y() / len;
-            double extX = nx * tileExtent;
-            double extY = ny * tileExtent;
+            std::array<uint32_t, 256> lut;
+            vc::buildWindowLevelLut(lut, _baseWindowLow, _baseWindowHigh);
 
-            // Extend the rect in the direction of movement
-            if (extX > 0) prefetchRect.setRight(prefetchRect.right() + extX);
-            else           prefetchRect.setLeft(prefetchRect.left() + extX);
-            if (extY > 0) prefetchRect.setBottom(prefetchRect.bottom() + extY);
-            else           prefetchRect.setTop(prefetchRect.top() + extY);
+            vc::SampleParams sp;
+            sp.level = _camera.dsScaleIdx;
+            sp.method = vc::Sampling::Nearest;
+
+            _volume->samplePlaneBestEffortARGB32(
+                fbBits, fbStride, origin,
+                vx / _camera.scale, vy / _camera.scale,
+                fbW, fbH, sp, lut.data());
         }
     }
 
-    // Viewport-aware prefetch: always prefetch current view.
-    // Velocity-biased z-slice prefetch: prefetch more slices ahead in the
-    // scroll direction so chunks are ready before the user arrives there.
-    if (_volume->tieredCache()) {
+    // Save every xy plane frame so we can check if glitch is in pixel data or display
+    if (_surfName == "xy plane") {
+        static int fn = 0;
+        if (fn >= 10 && fn < 30) {
+            _tileScene->rawFramebuffer().save(QString("/tmp/fb_%1.png").arg(fn));
+        }
+        fn++;
+    }
+
+    _tileScene->markDirty();
+    _tileScene->flush();
+    fGraphicsView->viewport()->repaint();
+
+prefetch:
+    // Viewport-aware prefetch
+    if (_volume && _volume->tieredCache()) {
+        auto* planeForPrefetch = dynamic_cast<PlaneSurface*>(surf.get());
         cv::Vec3f lo, hi;
-        auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
-        bool ok = plane
-            ? computePlanePrefetchBBox(plane, prefetchRect, lo, hi)
-            : computeQuadPrefetchBBox(surf, prefetchRect, lo, hi);
+        int pfbW = _tileScene->framebufferWidth(), pfbH = _tileScene->framebufferHeight();
+        bool ok = planeForPrefetch
+            ? computePlanePrefetchBBox(planeForPrefetch, QRectF(0, 0, pfbW, pfbH), lo, hi)
+            : computeQuadPrefetchBBox(surf, viewportSceneRect(), lo, hi);
         if (ok) {
             _volume->prefetchWorldBBox(lo, hi, _camera.dsScaleIdx);
 
-            // Extended z-slice prefetch: bias in the scroll direction.
-            // During active scrolling, prefetch further ahead in the
-            // movement direction; when idle, prefetch symmetrically.
             if (!_isPanning) {
                 constexpr float PREFETCH_Z_BEHIND = 4.0f;
                 constexpr float PREFETCH_Z_AHEAD = 24.0f;
@@ -1193,7 +1024,7 @@ bool CTiledVolumeViewer::computePlanePrefetchBBox(PlaneSurface* plane,
                                                    cv::Vec3f& lo, cv::Vec3f& hi) const
 {
     const float invScale = 1.0f / _camera.scale;
-    const float margin = vc::render::TileGrid::TILE_PX * invScale;
+    const float margin = 512.0f * invScale;
 
     cv::Vec2f vpTopLeft = _tileScene->sceneToSurface(QPointF(prefetchRect.left(), prefetchRect.top()));
     cv::Vec2f vpBotRight = _tileScene->sceneToSurface(QPointF(prefetchRect.right(), prefetchRect.bottom()));
@@ -1262,7 +1093,7 @@ bool CTiledVolumeViewer::computeQuadPrefetchBBox(const std::shared_ptr<Surface>&
     }
 
     // Add margin for interpolation + scrolling
-    float margin = vc::render::TileGrid::TILE_PX / _camera.scale;
+    float margin = 512.0f / _camera.scale;
     for (int i = 0; i < 3; i++) {
         lo[i] -= margin;
         hi[i] += margin;
@@ -1271,42 +1102,6 @@ bool CTiledVolumeViewer::computeQuadPrefetchBBox(const std::shared_ptr<Surface>&
     return clampToDataBounds(lo, hi);
 }
 
-TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) const
-{
-    TileRenderParams params;
-    params.worldKey = wk;
-
-    const bool interactionActive = _isPanning;
-
-    // Surface parameter ROI from world tile coordinates (float throughout)
-    params.surfaceROI.x = static_cast<float>(wk.worldCol) * _contentBounds.worldTileSize;
-    params.surfaceROI.y = static_cast<float>(wk.worldRow) * _contentBounds.worldTileSize;
-    params.surfaceROI.width = _contentBounds.worldTileSize;
-    params.surfaceROI.height = _contentBounds.worldTileSize;
-
-    params.tileW = vc::render::TileGrid::TILE_PX;
-    params.tileH = vc::render::TileGrid::TILE_PX;
-
-    params.scale = _camera.scale;
-    params.dsScale = _camera.dsScale;
-    params.dsScaleIdx = _camera.dsScaleIdx;
-    params.zOff = _camera.zOff;
-
-    params.windowLow = _baseWindowLow;
-    params.windowHigh = _baseWindowHigh;
-    params.stretchValues = _stretchValues;
-    params.colormapId = _baseColormapId;
-    params.overlayVolume = _overlayVolume;
-    params.overlayOpacity = _overlayOpacity;
-    params.overlayWindowLow = _overlayWindowLow;
-    params.overlayWindowHigh = _overlayWindowHigh;
-    params.overlayColormapId = _overlayColormapId;
-    params.useFastInterpolation = _useFastInterpolation || interactionActive;
-    params.isPlaneSurface = dynamic_cast<PlaneSurface*>(_surfWeak.lock().get()) != nullptr;
-    params.compositeSettings = _compositeSettings;
-
-    return params;
-}
 
 // ============================================================================
 // Coordinate transforms
@@ -1662,18 +1457,6 @@ void CTiledVolumeViewer::updateStatusLabel()
     // Desired pyramid level
     status += QString(" 1:%1").arg(1 << _camera.dsScaleIdx);
 
-    // Actual worst level currently displayed (parenthesized when different)
-    if (_tileScene && fGraphicsView) {
-        QRectF vp = fGraphicsView->mapToScene(fGraphicsView->viewport()->rect()).boundingRect();
-        auto& grid = _renderController->viewportRenderer().tileGrid();
-        int actualWorst = grid.worstVisibleLevel(
-            static_cast<float>(vp.left()), static_cast<float>(vp.top()),
-            static_cast<float>(vp.right()), static_cast<float>(vp.bottom()));
-        if (actualWorst >= 0 && actualWorst != _camera.dsScaleIdx) {
-            status += QString("(1:%1)").arg(1 << actualWorst);
-        }
-    }
-
     status += QString(" z=%1").arg(_camera.zOff, 0, 'f', 1);
 
     if (_compositeSettings.enabled) {
@@ -1712,12 +1495,6 @@ void CTiledVolumeViewer::updateStatusLabel()
             status += QString(" | q%1").arg(s.ioPending);
         if (s.iceFetches > 0)
             status += QString(" dl%1").arg(s.iceFetches);
-    } else if (_pinTotal > 0 && _pinReceived < _pinTotal) {
-        status += QString(" | downloading %1/%2").arg(_pinReceived).arg(_pinTotal.load());
-    }
-
-    if (_renderController && _renderController->renderPool()->corePool().busy()) {
-        status += " | rendering";
     }
 
     status += " [tiled]";
@@ -1850,17 +1627,7 @@ void CTiledVolumeViewer::setCompositeRenderSettings(const CompositeRenderSetting
     _compositeSettings = settings;
     _compositeSettings.params.updateLightDir();
 
-    // Params changed: re-render
-    auto surf = _surfWeak.lock();
-    if (_volume && surf) {
-        _camera.invalidate();
-        auto visibleKeys = computeVisibleKeys();
-        if (!visibleKeys.empty()) {
-            _renderController->onCameraChangedDirect(_camera, surf, _volume,
-                [this](const WorldTileKey& wk) { return buildRenderParams(wk); },
-                visibleKeys);
-        }
-    }
+    if (_volume) renderVisible(true);
     updateStatusLabel();
 }
 
@@ -2004,7 +1771,6 @@ void CTiledVolumeViewer::clearAllOverlayGroups()
 
 void CTiledVolumeViewer::invalidateOverlays()
 {
-    _renderController->markOverlaysDirty();
     scheduleOverlayUpdate();
 }
 
@@ -2223,7 +1989,7 @@ void CTiledVolumeViewer::renderIntersectionsCore()
     invalidateIntersect();
     if (!items.empty()) {
         _ov.intersectItems[kIntersectionItemsKey] = std::move(items);
-        fGraphicsView->viewport()->update();
+        fGraphicsView->viewport()->repaint();
     }
 }
 void CTiledVolumeViewer::invalidateVis()

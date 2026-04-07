@@ -12,6 +12,7 @@
 #include <cstring>
 #include <optional>
 #include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <algorithm>
 #include <numeric>
@@ -1210,6 +1211,9 @@ public:
                          static_cast<std::streamsize>(index_size));
         }
 
+        // Lock to prevent concurrent shard writes from corrupting the file
+        std::lock_guard lock(*shard_write_mutex_);
+
         // Open for random read/write
         std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
         if (!f) return;
@@ -1380,6 +1384,9 @@ public:
             stride *= meta_.sub_chunks_per_shard(d);
         }
 
+        // Lock to prevent reading while another thread is writing
+        std::lock_guard lock(*shard_write_mutex_);
+
         auto key = chunk_key(shard_idx);
         auto p = root_ / key;
         std::ifstream f(p, std::ios::binary);
@@ -1415,6 +1422,9 @@ public:
     ZarrMetadata meta_;
     Codec codec_;
     CodecRegistry registry_;
+
+    // Per-shard mutex for concurrent write safety
+    mutable std::shared_ptr<std::mutex> shard_write_mutex_ = std::make_shared<std::mutex>();
 };
 
 // ---------------------------------------------------------------------------

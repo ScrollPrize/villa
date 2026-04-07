@@ -73,9 +73,17 @@ void CVolumeViewerView::drawForeground(QPainter* p, const QRectF& sceneRect)
 }
 
 CVolumeViewerView::CVolumeViewerView(QWidget* parent) : QGraphicsView(parent)
-{ 
+{
     setMouseTracking(true);
 };
+
+void CVolumeViewerView::drawBackground(QPainter* painter, const QRectF& /*rect*/)
+{
+    if (_directFb && !_directFb->isNull()) {
+        painter->resetTransform();
+        painter->drawImage(0, 0, *_directFb);
+    }
+}
 
 void CVolumeViewerView::scrollContentsBy(int dx, int dy)
 {

@@ -701,8 +701,6 @@ int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
                                          const uint32_t lut[256])
 {
     const int nScales = static_cast<int>(numScales());
-    // Adaptive: each pixel samples from the finest cached chunk at its location.
-    // origin/vx_step/vy_step are in world (level-0) coordinates.
     return samplePlaneAdaptiveARGB32(outBuf, outStride, tieredCache(),
                                      params.level, nScales,
                                      origin, vx_step, vy_step,

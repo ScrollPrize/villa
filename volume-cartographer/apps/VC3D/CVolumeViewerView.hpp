@@ -43,6 +43,13 @@ protected:
     bool _left_button_pressed = false;
     /// Draw our scalebar on every repaint
     void drawForeground(QPainter* painter, const QRectF& sceneRect) override;
+    /// Paint framebuffer directly, bypassing QGraphicsPixmapItem
+    void drawBackground(QPainter* painter, const QRectF& rect) override;
+
+public:
+    void setDirectFramebuffer(const QImage* fb) { _directFb = fb; }
+private:
+    const QImage* _directFb = nullptr;
 
  private:
     /// Round “ideal” length to 1,2 or 5 × 10^n

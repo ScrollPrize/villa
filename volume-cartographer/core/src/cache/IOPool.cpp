@@ -45,9 +45,17 @@ void IOPool::start()
                     }
                 }
 
-                // Notify completion
+                // Notify completion (decompress + hot-put)
                 if (onComplete_) {
-                    onComplete_(task.key, std::move(data));
+                    try {
+                        onComplete_(task.key, std::move(data));
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "[IOPOOL] completion exception for lvl=%d pos=(%d,%d,%d): %s\n",
+                                     task.key.level, task.key.iz, task.key.iy, task.key.ix, e.what());
+                    } catch (...) {
+                        std::fprintf(stderr, "[IOPOOL] unknown completion exception for lvl=%d pos=(%d,%d,%d)\n",
+                                     task.key.level, task.key.iz, task.key.iy, task.key.ix);
+                    }
                 }
             }
         });

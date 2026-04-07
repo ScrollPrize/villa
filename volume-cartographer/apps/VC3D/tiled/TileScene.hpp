@@ -8,23 +8,18 @@
 #include <cstdint>
 #include <opencv2/core.hpp>
 
-#include "vc/core/render/TileTypes.hpp"
-
 // Single-framebuffer display: one QGraphicsPixmapItem sized to the viewport.
-// The tiled rendering pipeline (TileGrid, ViewportRenderer) lives in the core
-// layer; this class just composites rendered tiles into a single QImage.
+// Rendering writes directly to the framebuffer; this class just manages the
+// QImage and provides coordinate conversions.
 class TileScene
 {
 public:
     explicit TileScene(QGraphicsScene* scene);
 
-    // Resize the framebuffer (call when viewport or bounds change).
-    void rebuildGrid(const ContentBounds& bounds, int viewportW, int viewportH);
+    // Resize the framebuffer (call when viewport changes).
+    void rebuildGrid(int viewportW, int viewportH);
 
-    // Blit a rendered tile into the framebuffer at the correct position.
-    void blitTile(const WorldTileKey& wk, const uint32_t* pixels, int w, int h);
-
-    // Push the framebuffer to the display item (call once per tick).
+    // Push the framebuffer to the display item (call once per render).
     void flush();
 
     // Clear framebuffer to gray.
@@ -37,13 +32,20 @@ public:
     QPointF surfaceToScene(float surfX, float surfY) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
 
-    [[nodiscard]] float camScale() const noexcept { return _camScale; }
-    [[nodiscard]] float camZOff() const noexcept { return _camZOff; }
-    void setCamZOff(float z) noexcept { _camZOff = z; }
+    // Direct framebuffer access for full-viewport rendering.
+    uint32_t* framebufferBits() { return _framebuffer.isNull() ? nullptr : reinterpret_cast<uint32_t*>(_framebuffer.bits()); }
+    int framebufferStride() const { return _framebuffer.isNull() ? 0 : _framebuffer.bytesPerLine() / 4; }
+    int framebufferWidth() const { return _framebuffer.width(); }
+    int framebufferHeight() const { return _framebuffer.height(); }
+    void markDirty() { _dirty = true; }
+    QImage& rawFramebuffer() { return _framebuffer; }
+    const QImage& constFramebuffer() const { return _framebuffer; }
 
-    // Set camera position for viewport-relative blitting.
-    // Shifts framebuffer to compensate for pan; clears on zoom change.
+    // Set camera position for coordinate conversions.
+    // Clears framebuffer on zoom change.
     void setCamera(float surfX, float surfY, float scale);
+
+    void setCamZOff(float z) noexcept { _camZOff = z; }
 
 private:
     QGraphicsScene* _scene;
@@ -53,5 +55,7 @@ private:
 
     // Camera state for viewport-relative positioning
     float _camSurfX = 0, _camSurfY = 0, _camScale = 1.0f, _camZOff = 0;
-    float _worldTileSize = 0;
+
+    // Staging buffer — render here, then memcpy to QImage
+    std::vector<uint32_t> _staging;
 };

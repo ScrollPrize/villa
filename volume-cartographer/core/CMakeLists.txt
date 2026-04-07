@@ -35,14 +35,9 @@ add_library(vc_core
         src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
-        src/render/RenderCore.cpp
         src/render/TiledViewerCamera.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
-        src/render/TileRenderer.cpp
-        src/render/TileGrid.cpp
-        src/render/CoreRenderPool.cpp
-        src/render/ViewportRenderer.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
 

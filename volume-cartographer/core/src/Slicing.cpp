@@ -2031,32 +2031,10 @@ static void samplePlaneARGB32Impl(
     }
 }
 
-void samplePlaneARGB32(uint32_t* outBuf, int outStride,
-                       vc::cache::TieredChunkCache* cache, int level,
-                       const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
-                       int width, int height, vc::Sampling method,
-                       const uint32_t lut[256]) {
-    CacheParams p(cache, level);
-    switch (method) {
-        case vc::Sampling::Nearest:
-            samplePlaneARGB32Impl<SampleMode::Nearest>(outBuf, outStride, *cache, level, p, origin, vx_step, vy_step, width, height, lut);
-            break;
-        case vc::Sampling::Tricubic:
-            samplePlaneARGB32Impl<SampleMode::Tricubic>(outBuf, outStride, *cache, level, p, origin, vx_step, vy_step, width, height, lut);
-            break;
-        default:
-            samplePlaneARGB32Impl<SampleMode::Trilinear>(outBuf, outStride, *cache, level, p, origin, vx_step, vy_step, width, height, lut);
-            break;
-    }
-}
-
 // ============================================================================
-// samplePlaneAdaptiveARGB32 — per-pixel adaptive level selection.
-//
-// For each pixel, computes the world coordinate and checks if the chunk at
-// the desired level is in the hot cache. If not, falls back to coarser levels.
-// Uses nearest-neighbor sampling for simplicity (trilinear at chunk boundaries
-// across levels would be incorrect). Prefetches desired-level chunks.
+// samplePlaneAdaptiveARGB32 — simple per-pixel nearest-neighbor sampling.
+// For each pixel: world coord → level-0 voxel → chunk lookup → LUT → ARGB32.
+// Falls back to coarser levels if desired level chunk isn't in hot cache.
 // ============================================================================
 
 int samplePlaneAdaptiveARGB32(
@@ -2069,116 +2047,100 @@ int samplePlaneAdaptiveARGB32(
     int w, int h,
     const uint32_t lut[256])
 {
-    // Background fill
     const uint32_t bg = lut[0];
+    const int maxLvl = std::min(numLevels, 8);
+
+    // Get level-0 shape for bounds checking
+    auto shape0 = cache->levelShape(0);
+    const float sx0 = static_cast<float>(shape0[0]); // Z
+    const float sy0 = static_cast<float>(shape0[1]); // Y
+    const float sx0x = static_cast<float>(shape0[2]); // X
+
+    // Current chunk state — avoid redundant cache lookups
+    vc::cache::ChunkDataPtr curChunk;
+    const uint8_t* curData = nullptr;
+    int curLevel = -1;
+    int curCi = -1, curCj = -1, curCk = -1;
+
     for (int y = 0; y < h; y++) {
         uint32_t* row = outBuf + y * outStride;
-        for (int x = 0; x < w; x++)
-            row[x] = bg;
-    }
 
-    // Build CacheParams for each level we might use
-    int maxLvl = std::min(numLevels, 8);
-    CacheParams* params[8];
-    for (int i = 0; i < maxLvl; i++)
-        params[i] = new CacheParams(cache, i);
-
-    // Prefetch desired-level chunks (non-blocking)
-    {
-        const auto& p = *params[desiredLevel];
-        cv::Vec3f corners[4] = {
-            origin, origin + vx_step * float(w-1),
-            origin + vy_step * float(h-1),
-            origin + vx_step * float(w-1) + vy_step * float(h-1)
-        };
-        float minV[3] = {corners[0][0], corners[0][1], corners[0][2]};
-        float maxV[3] = {corners[0][0], corners[0][1], corners[0][2]};
-        for (int c = 1; c < 4; c++)
-            for (int a = 0; a < 3; a++) {
-                minV[a] = std::min(minV[a], corners[c][a]);
-                maxV[a] = std::max(maxV[a], corners[c][a]);
-            }
-        // Scale to desired level
-        float scale = 1.0f / float(1 << desiredLevel);
-        for (int a = 0; a < 3; a++) { minV[a] *= scale; maxV[a] *= scale; }
-
-        int minCx = std::max(0, p.chunkX(std::max(0, int(std::floor(minV[0])))));
-        int maxCx = std::min(p.chunksX-1, p.chunkX(std::min(p.sx-1, int(std::ceil(maxV[0])))));
-        int minCy = std::max(0, p.chunkY(std::max(0, int(std::floor(minV[1])))));
-        int maxCy = std::min(p.chunksY-1, p.chunkY(std::min(p.sy-1, int(std::ceil(maxV[1])))));
-        int minCz = std::max(0, p.chunkZ(std::max(0, int(std::floor(minV[2])))));
-        int maxCz = std::min(p.chunksZ-1, p.chunkZ(std::min(p.sz-1, int(std::ceil(maxV[2])))));
-
-        thread_local std::vector<vc::cache::ChunkKey> prefetchKeys;
-        prefetchKeys.clear();
-        for (int cx = minCx; cx <= maxCx; cx++)
-            for (int cy = minCy; cy <= maxCy; cy++)
-                for (int cz = minCz; cz <= maxCz; cz++)
-                    prefetchKeys.push_back({desiredLevel, cz, cy, cx});
-        cache->prefetch(prefetchKeys);
-    }
-
-    // Per-level ChunkSampler (non-blocking: uses get() not getBlocking())
-    // We'll do the fallback manually per-pixel.
-    int worstUsed = desiredLevel;
-
-    for (int y = 0; y < h; y++) {
-        uint32_t* __restrict__ outRow = outBuf + y * outStride;
-        cv::Vec3f worldPos = origin + vy_step * float(y);
+        // Compute world coords for start of row
+        float wy_x = origin[0] + vy_step[0] * static_cast<float>(y);
+        float wy_y = origin[1] + vy_step[1] * static_cast<float>(y);
+        float wy_z = origin[2] + vy_step[2] * static_cast<float>(y);
 
         for (int x = 0; x < w; x++) {
-            float wx = worldPos[0], wy = worldPos[1], wz = worldPos[2];
+            float wx = wy_x + vx_step[0] * static_cast<float>(x);
+            float wy = wy_y + vx_step[1] * static_cast<float>(x);
+            float wz = wy_z + vx_step[2] * static_cast<float>(x);
 
-            // Try each level from finest to coarsest
-            for (int lvl = desiredLevel; lvl < maxLvl; lvl++) {
-                float scale = (lvl > 0) ? (1.0f / float(1 << lvl)) : 1.0f;
-                float vx = wx * scale, vy = wy * scale, vz = wz * scale;
-
-                const auto& p = *params[lvl];
-                // Bounds check
-                if (vx < -0.5f || vy < -0.5f || vz < -0.5f ||
-                    vx >= p.sxf - 0.5f || vy >= p.syf - 0.5f || vz >= p.szf - 0.5f)
-                    break;
-
-                // Nearest neighbor: round to int
-                int ix = static_cast<int>(vx + 0.5f);
-                int iy = static_cast<int>(vy + 0.5f);
-                int iz = static_cast<int>(vz + 0.5f);
-                ix = std::clamp(ix, 0, p.sx - 1);
-                iy = std::clamp(iy, 0, p.sy - 1);
-                iz = std::clamp(iz, 0, p.sz - 1);
-
-                int cix = p.chunkX(ix), ciy = p.chunkY(iy), ciz = p.chunkZ(iz);
-
-                // Data bounds check
-                if (p.dbValid && (ciz < p.dbMinCz || ciz > p.dbMaxCz ||
-                                  ciy < p.dbMinCy || ciy > p.dbMaxCy ||
-                                  cix < p.dbMinCx || cix > p.dbMaxCx))
-                    break;
-
-                // Non-blocking cache lookup
-                auto chunk = cache->get({lvl, ciz, ciy, cix});
-                if (!chunk || chunk->isEmpty) continue; // try coarser
-
-                // Sample the voxel
-                int lx = p.localX(ix), ly = p.localY(iy), lz = p.localZ(iz);
-                size_t stride0 = size_t(p.cy) * size_t(p.cx);
-                size_t stride1 = size_t(p.cx);
-                size_t offset = size_t(lz) * stride0 + size_t(ly) * stride1 + size_t(lx);
-                uint8_t val = chunk->data<uint8_t>()[offset];
-                outRow[x] = lut[val];
-                if (lvl > worstUsed) worstUsed = lvl;
-                break;
+            // Bounds check against level-0 volume
+            if (wx < 0 || wy < 0 || wz < 0 ||
+                wx >= sx0x || wy >= sy0 || wz >= sx0) {
+                row[x] = bg;
+                continue;
             }
 
-            worldPos += vx_step;
+            bool sampled = false;
+            for (int l = desiredLevel; l < maxLvl; l++) {
+                float scale = 1.0f / static_cast<float>(1 << l);
+                int ix = static_cast<int>(wx * scale + 0.5f);
+                int iy = static_cast<int>(wy * scale + 0.5f);
+                int iz = static_cast<int>(wz * scale + 0.5f);
+
+                // Chunk coords
+                int ci = ix >> 7;
+                int cj = iy >> 7;
+                int ck = iz >> 7;
+
+                const uint8_t* data;
+                if (l == curLevel && ci == curCi && cj == curCj && ck == curCk && curData) {
+                    data = curData;
+                } else {
+                    auto c = cache->get({l, ck, cj, ci});
+                    if (!c || c->isEmpty) continue;
+
+                    // Verify chunk data integrity: first 4 bytes as fingerprint
+                    auto* raw = c->data<uint8_t>();
+                    size_t sz = c->totalBytes();
+                    uint32_t fp = 0;
+                    if (sz >= 4) std::memcpy(&fp, raw, 4);
+                    // Store fingerprint keyed by chunk identity
+                    static thread_local std::unordered_map<uint64_t, uint32_t> fpMap;
+                    uint64_t fpKey = (uint64_t(unsigned(l)) << 48) |
+                                     (uint64_t(unsigned(ck)) << 32) |
+                                     (uint64_t(unsigned(cj)) << 16) |
+                                      uint64_t(unsigned(ci));
+                    auto [it, inserted] = fpMap.emplace(fpKey, fp);
+                    if (!inserted && it->second != fp) {
+                        fprintf(stderr, "[CORRUPT] chunk (%d,%d,%d) lvl=%d fingerprint changed: %08x -> %08x\n",
+                                ci, cj, ck, l, it->second, fp);
+                        it->second = fp;
+                    }
+
+                    curChunk = std::move(c);
+                    curData = curChunk->data<uint8_t>();
+                    curLevel = l;
+                    curCi = ci; curCj = cj; curCk = ck;
+                    data = curData;
+                }
+
+                // Linear offset into 128^3 chunk (ZYX C-order)
+                size_t off = (static_cast<size_t>(iz & 127) << 14) |
+                             (static_cast<size_t>(iy & 127) << 7) |
+                              static_cast<size_t>(ix & 127);
+
+                row[x] = lut[data[off]];
+                sampled = true;
+                break;
+            }
+            if (!sampled)
+                row[x] = bg;
         }
     }
 
-    for (int i = 0; i < maxLvl; i++)
-        delete params[i];
-
-    return worstUsed;
+    return desiredLevel;
 }
 
 // ============================================================================
