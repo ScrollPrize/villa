@@ -40,6 +40,7 @@
 #include <QRegularExpressionValidator>
 #include <QDockWidget>
 #include <QLabel>
+#include <QDoubleSpinBox>
 #include <QSpinBox>
 #include <QSizePolicy>
 #include <QProcess>
@@ -2928,6 +2929,37 @@ void CWindow::CreateWidgets(void)
                    detachScrollContents(ui.scrollAreaView, ui.dockWidgetViewContents),
                    viewer::GROUP_VIEW_EXPANDED,
                    viewer::GROUP_VIEW_EXPANDED_DEFAULT);
+
+    // Navigation sensitivity controls
+    {
+        auto* navWidget = new QWidget;
+        auto* navLayout = new QGridLayout(navWidget);
+        navLayout->setContentsMargins(2, 2, 2, 2);
+        navLayout->setVerticalSpacing(2);
+
+        auto addSpin = [&](int row, const QString& label, const char* settingsKey, float defaultVal) {
+            navLayout->addWidget(new QLabel(label), row, 0);
+            auto* spin = new QDoubleSpinBox;
+            spin->setRange(0.1, 100.0);
+            spin->setSingleStep(0.1);
+            spin->setDecimals(1);
+            spin->setValue(settings.value(settingsKey, defaultVal).toDouble());
+            navLayout->addWidget(spin, row, 1);
+            connect(spin, &QDoubleSpinBox::valueChanged, this, [settingsKey](double v) {
+                QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+                s.setValue(settingsKey, v);
+            });
+        };
+        addSpin(0, tr("Pan sensitivity"), viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT);
+        addSpin(1, tr("Zoom sensitivity"), viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT);
+        addSpin(2, tr("Z-scroll sensitivity"), viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT);
+
+        addViewerGroup(tr("Navigation"),
+                       navWidget,
+                       "viewer_controls/group_navigation_expanded",
+                       true);
+    }
+
     addViewerGroup(tr("Overlay"),
                    detachScrollContents(ui.scrollAreaOverlay, ui.dockWidgetOverlayContents),
                    viewer::GROUP_OVERLAY_EXPANDED,

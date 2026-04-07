@@ -272,6 +272,9 @@ private:
     CompositeRenderSettings _compositeSettings;
     bool _resetViewOnSurfaceChange = true;
     float _navSpeed = 1.0f;
+    float _panSensitivity = 1.0f;
+    float _zoomSensitivity = 1.0f;
+    float _zScrollSensitivity = 1.0f;
 
     // --- Content bounds for pan clamping ---
     float _contentMinU = 0, _contentMaxU = 0;

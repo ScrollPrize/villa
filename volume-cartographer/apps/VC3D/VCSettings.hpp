@@ -45,6 +45,9 @@ namespace viewer {
     constexpr auto CENTER_ON_ZOOM = "viewer/center_on_zoom";
     constexpr auto SCROLL_SPEED = "viewer/scroll_speed";
     constexpr auto NAV_SPEED = "viewer/nav_speed";
+    constexpr auto PAN_SENSITIVITY = "viewer/pan_sensitivity";
+    constexpr auto ZOOM_SENSITIVITY = "viewer/zoom_sensitivity";
+    constexpr auto ZSCROLL_SENSITIVITY = "viewer/zscroll_sensitivity";
     constexpr auto IMPACT_RANGE_STEPS = "viewer/impact_range_steps";
     constexpr auto SCAN_RANGE_STEPS = "viewer/scan_range_steps";
 
@@ -52,6 +55,9 @@ namespace viewer {
     constexpr bool CENTER_ON_ZOOM_DEFAULT = false;
     constexpr int SCROLL_SPEED_DEFAULT = -1;
     constexpr float NAV_SPEED_DEFAULT = 1.0f;
+    constexpr float PAN_SENSITIVITY_DEFAULT = 1.0f;
+    constexpr float ZOOM_SENSITIVITY_DEFAULT = 1.0f;
+    constexpr float ZSCROLL_SENSITIVITY_DEFAULT = 1.0f;
     constexpr auto IMPACT_RANGE_STEPS_DEFAULT = "1-3, 5, 8, 11, 15, 20, 28, 40, 60, 100, 200";
     constexpr auto SCAN_RANGE_STEPS_DEFAULT = "1, 2, 5, 10, 20, 50, 100, 200, 500, 1000";
 

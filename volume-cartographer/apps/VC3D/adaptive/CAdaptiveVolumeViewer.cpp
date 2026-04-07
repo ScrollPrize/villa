@@ -78,6 +78,12 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
     _camera.downscaleOverride = settings.value(perf::DOWNSCALE_OVERRIDE, perf::DOWNSCALE_OVERRIDE_DEFAULT).toInt();
     _navSpeed = settings.value(viewer::NAV_SPEED, viewer::NAV_SPEED_DEFAULT).toFloat();
     if (_navSpeed <= 0.0f) _navSpeed = 1.0f;
+    _panSensitivity = settings.value(viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT).toFloat();
+    if (_panSensitivity <= 0.0f) _panSensitivity = 1.0f;
+    _zoomSensitivity = settings.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toFloat();
+    if (_zoomSensitivity <= 0.0f) _zoomSensitivity = 1.0f;
+    _zScrollSensitivity = settings.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat();
+    if (_zScrollSensitivity <= 0.0f) _zScrollSensitivity = 1.0f;
 
     auto* layout = new QVBoxLayout;
     layout->addWidget(_view);
@@ -389,7 +395,7 @@ void CAdaptiveVolumeViewer::renderVisible(bool force)
 
 void CAdaptiveVolumeViewer::panByF(float dx, float dy)
 {
-    const float invScale = _navSpeed / _camera.scale;
+    const float invScale = _panSensitivity / _camera.scale;
     _camera.surfacePtr[0] -= dx * invScale;
     _camera.surfacePtr[1] -= dy * invScale;
 
@@ -405,7 +411,7 @@ void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 {
     if (steps == 0) return;
 
-    float factor = std::pow(1.05f, static_cast<float>(steps) * _navSpeed);
+    float factor = std::pow(1.05f, static_cast<float>(steps) * _zoomSensitivity);
     float newScale = std::clamp(_camera.scale * factor,
                                 TiledViewerCamera::MIN_SCALE,
                                 TiledViewerCamera::MAX_SCALE);
@@ -470,7 +476,7 @@ void CAdaptiveVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMo
 
     if (modifiers & Qt::ShiftModifier) {
         // Z-scroll
-        float dz = static_cast<float>(steps) * _navSpeed;
+        float dz = static_cast<float>(steps) * _zScrollSensitivity;
 
         PlaneSurface* plane = dynamic_cast<PlaneSurface*>(surf.get());
         if (_surfName != "segmentation" && plane && _state) {
