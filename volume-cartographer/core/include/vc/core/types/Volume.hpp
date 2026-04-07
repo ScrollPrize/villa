@@ -160,6 +160,7 @@ public:
     // Prefetch all chunks overlapping a world-space axis-aligned bounding box.
     // lo/hi are in world (level 0) coordinates, (x, y, z).
     void prefetchWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level);
+    void boostWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level);
 
     // Prefetch entire pyramid levels in the background. Levels are fetched
     // from coarsest to finest (high level numbers first). Non-blocking.

@@ -675,9 +675,11 @@ int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
     auto pb = planeBBox(origin, vx_step, vy_step, width, height);
     cv::Vec3f pfLo(pb.loX, pb.loY, pb.loZ);
     cv::Vec3f pfHi(pb.hiX, pb.hiY, pb.hiZ);
-    for (int lvl = desired; lvl < nScales; lvl++) {
+    // Boost desired level chunks to front of queue (what user is looking at)
+    boostWorldBBox(pfLo, pfHi, desired);
+    // Prefetch all levels for progressive refinement
+    for (int lvl = desired; lvl < nScales; lvl++)
         prefetchWorldBBox(pfLo, pfHi, lvl);
-    }
     std::fprintf(stderr, "[ARGB32] desired=%d nScales=%d bbox=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) size=%dx%d\n",
                  desired, nScales, pb.loX, pb.loY, pb.loZ, pb.hiX, pb.hiY, pb.hiZ, width, height);
 
@@ -1260,4 +1262,33 @@ void Volume::prefetchWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int lev
     if (minIx > maxIx || minIy > maxIy || minIz > maxIz) return;
 
     tieredCache_->prefetchRegion(level, minIz, minIy, minIx, maxIz, maxIy, maxIx);
+}
+
+void Volume::boostWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level)
+{
+    ensureTieredCache();
+    if (!tieredCache_) return;
+
+    vc::VcDataset* ds = zarrDataset(level);
+    if (!ds) return;
+
+    float scale = (level > 0) ? (1.0f / static_cast<float>(1 << level)) : 1.0f;
+    auto cs = ds->defaultChunkShape();
+    const auto& shape = ds->shape();
+    float csX = static_cast<float>(cs[2]), csY = static_cast<float>(cs[1]), csZ = static_cast<float>(cs[0]);
+
+    float sLoX = lo[0] * scale - 1.0f, sHiX = hi[0] * scale + 1.0f;
+    float sLoY = lo[1] * scale - 1.0f, sHiY = hi[1] * scale + 1.0f;
+    float sLoZ = lo[2] * scale - 1.0f, sHiZ = hi[2] * scale + 1.0f;
+
+    int minIx = std::max(0, static_cast<int>(std::floor(sLoX / csX)));
+    int maxIx = std::min(static_cast<int>((shape[2] - 1) / cs[2]), static_cast<int>(std::ceil(sHiX / csX)));
+    int minIy = std::max(0, static_cast<int>(std::floor(sLoY / csY)));
+    int maxIy = std::min(static_cast<int>((shape[1] - 1) / cs[1]), static_cast<int>(std::ceil(sHiY / csY)));
+    int minIz = std::max(0, static_cast<int>(std::floor(sLoZ / csZ)));
+    int maxIz = std::min(static_cast<int>((shape[0] - 1) / cs[0]), static_cast<int>(std::ceil(sHiZ / csZ)));
+
+    if (minIx > maxIx || minIy > maxIy || minIz > maxIz) return;
+
+    tieredCache_->boostRegion(level, minIz, minIy, minIx, maxIz, maxIy, maxIx);
 }

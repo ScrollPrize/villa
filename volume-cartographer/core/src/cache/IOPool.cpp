@@ -89,6 +89,11 @@ void IOPool::submit(const std::vector<ChunkKey>& keys)
     queue_.submit_batch(tasks.begin(), tasks.end());
 }
 
+void IOPool::boost(const ChunkKey& key)
+{
+    queue_.boost(Task{key, 0});
+}
+
 void IOPool::cancelPending()
 {
     queue_.cancel_pending();

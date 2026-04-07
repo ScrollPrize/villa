@@ -403,6 +403,15 @@ void TieredChunkCache::prefetchRegion(
     }
 }
 
+void TieredChunkCache::boostRegion(
+    int level, int iz0, int iy0, int ix0, int iz1, int iy1, int ix1)
+{
+    for (int iz = iz0; iz <= iz1; iz++)
+        for (int iy = iy0; iy <= iy1; iy++)
+            for (int ix = ix0; ix <= ix1; ix++)
+                ioPool_.boost(ChunkKey{level, iz, iy, ix});
+}
+
 void TieredChunkCache::prefetchLevel(int level, const PrefetchProgressCb& progressCb)
 {
     if (level < 0 || level >= numLevels()) return;

@@ -64,6 +64,10 @@ public:
 
     using PrefetchProgressCb = std::function<void(int fetched, int total)>;
     void prefetchLevel(int level, const PrefetchProgressCb& progressCb = nullptr);
+
+    // Boost chunks in a region to the front of the download queue.
+    void boostRegion(int level, int iz0, int iy0, int ix0,
+                     int iz1, int iy1, int ix1);
     void propagateZeroChunks(int coarseLevel);
     void cancelPendingPrefetch();
 

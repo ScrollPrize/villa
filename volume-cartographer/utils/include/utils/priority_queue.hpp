@@ -57,6 +57,22 @@ public:
         return true;
     }
 
+    /// If the item is already queued, boost it to the front of the queue.
+    /// If not queued, submit it at the front. Returns true if boosted/submitted.
+    bool boost(const T& item) {
+        {
+            std::lock_guard lock(mutex_);
+            if (shutdown_flag_) return false;
+            boost_set_.insert(item);
+            if (!queued_set_.contains(item)) {
+                queued_set_.insert(item);
+                // Don't need to push to heap — pop_locked checks boost_set first
+            }
+        }
+        cv_.notify_all();
+        return true;
+    }
+
     /// Batch submit from an iterator range.  Returns the number of newly
     /// queued items (those not already queued).
     template <typename Iter>
@@ -84,8 +100,8 @@ public:
     /// Throws std::runtime_error on shutdown with an empty queue.
     [[nodiscard]] T pop() {
         std::unique_lock lock(mutex_);
-        cv_.wait(lock, [this] { return !heap_.empty() || shutdown_flag_; });
-        if (heap_.empty())
+        cv_.wait(lock, [this] { return !queued_set_.empty() || shutdown_flag_; });
+        if (queued_set_.empty())
             throw std::runtime_error("DeduplicatingPriorityQueue::pop(): shutdown");
         return pop_locked();
     }
@@ -93,7 +109,7 @@ public:
     /// Non-blocking pop.
     [[nodiscard]] std::optional<T> try_pop() {
         std::lock_guard lock(mutex_);
-        if (heap_.empty()) return std::nullopt;
+        if (queued_set_.empty()) return std::nullopt;
         return pop_locked();
     }
 
@@ -101,9 +117,9 @@ public:
     template <typename Rep, typename Period>
     [[nodiscard]] std::optional<T> pop_for(std::chrono::duration<Rep, Period> timeout) {
         std::unique_lock lock(mutex_);
-        if (!cv_.wait_for(lock, timeout, [this] { return !heap_.empty() || shutdown_flag_; }))
+        if (!cv_.wait_for(lock, timeout, [this] { return !queued_set_.empty() || shutdown_flag_; }))
             return std::nullopt;
-        if (heap_.empty()) return std::nullopt;
+        if (queued_set_.empty()) return std::nullopt;
         return pop_locked();
     }
 
@@ -113,7 +129,7 @@ public:
     void cancel_pending() {
         std::lock_guard lock(mutex_);
         queued_set_.clear();
-        // std::priority_queue has no clear(); swap with an empty one.
+        boost_set_.clear();
         Heap empty_heap;
         std::swap(heap_, empty_heap);
     }
@@ -153,18 +169,35 @@ private:
     using Set  = std::unordered_set<T, Hash, KeyEqual>;
     using Heap = std::priority_queue<T, std::vector<T>, Compare>;
 
-    /// Must be called while holding mutex_ and with a non-empty heap.
+    /// Must be called while holding mutex_ and with a non-empty queue.
     T pop_locked() {
-        T item = heap_.top();
-        heap_.pop();
-        queued_set_.erase(item);
-        return item;
+        // Boosted items get popped first
+        if (!boost_set_.empty()) {
+            auto it = boost_set_.begin();
+            T item = *it;
+            boost_set_.erase(it);
+            queued_set_.erase(item);
+            return item;
+        }
+        // Skip heap items that were already popped via boost
+        while (!heap_.empty()) {
+            T item = heap_.top();
+            heap_.pop();
+            if (queued_set_.contains(item)) {
+                queued_set_.erase(item);
+                return item;
+            }
+            // Item was already consumed via boost — skip it
+        }
+        // Should not reach here if callers check empty()
+        throw std::runtime_error("DeduplicatingPriorityQueue::pop_locked(): empty");
     }
 
     mutable std::mutex      mutex_;
     std::condition_variable cv_;
     Heap                    heap_;
     Set                     queued_set_;
+    Set                     boost_set_;  // items to pop before the heap
     bool                    shutdown_flag_ = false;
 };
 

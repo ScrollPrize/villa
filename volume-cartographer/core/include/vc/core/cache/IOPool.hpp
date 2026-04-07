@@ -54,6 +54,9 @@ public:
     // Alias for submit(vector) — kept for call-site clarity.
     void submitBackground(const std::vector<ChunkKey>& keys) { submit(keys); }
 
+    // Boost a key to the front of the queue. If not queued, adds it.
+    void boost(const ChunkKey& key);
+
     // Cancel all pending (not in-flight) tasks.
     void cancelPending();
 
