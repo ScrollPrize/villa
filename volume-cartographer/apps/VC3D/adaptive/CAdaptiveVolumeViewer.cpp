@@ -160,9 +160,14 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     }
 
     if (_volume) {
-        _camera.recalcPyramidLevel(static_cast<int>(_volume->numScales()));
+        int nScales = static_cast<int>(_volume->numScales());
+        _camera.recalcPyramidLevel(nScales);
         double vs = _volume->voxelSize() / static_cast<double>(_camera.dsScale);
         _view->setVoxelSize(vs, vs);
+
+        // Prefetch coarsest levels immediately so we always have data
+        if (nScales > 0)
+            _volume->prefetchLevels(std::max(0, nScales - 3), nScales - 1);
     }
 
     // Recompute content bounds
@@ -327,13 +332,29 @@ void CAdaptiveVolumeViewer::submitRender()
             vx / _camera.scale, vy / _camera.scale,
             fbW, fbH, sp, lut.data());
     } else {
-        // QuadSurface: gen coords then sample
+        // QuadSurface: gen coords then sample (non-blocking best-effort)
         cv::Mat_<cv::Vec3f> coords;
         cv::Vec3f offset(_camera.surfacePtr[0] * _camera.scale,
                          _camera.surfacePtr[1] * _camera.scale,
                          _camera.zOff);
         surf->gen(&coords, nullptr, cv::Size(fbW, fbH), cv::Vec3f(0, 0, 0),
                   _camera.scale, offset);
+
+        // Prefetch: compute world bbox from coords and prefetch all levels
+        if (!coords.empty()) {
+            float loX = FLT_MAX, loY = FLT_MAX, loZ = FLT_MAX;
+            float hiX = -FLT_MAX, hiY = -FLT_MAX, hiZ = -FLT_MAX;
+            for (int r = 0; r < coords.rows; r += std::max(1, coords.rows / 8)) {
+                for (int c = 0; c < coords.cols; c += std::max(1, coords.cols / 8)) {
+                    const auto& v = coords(r, c);
+                    loX = std::min(loX, v[0]); hiX = std::max(hiX, v[0]);
+                    loY = std::min(loY, v[1]); hiY = std::max(hiY, v[1]);
+                    loZ = std::min(loZ, v[2]); hiZ = std::max(hiZ, v[2]);
+                }
+            }
+            for (int lvl = sp.level; lvl < static_cast<int>(_volume->numScales()); lvl++)
+                _volume->prefetchWorldBBox(cv::Vec3f(loX, loY, loZ), cv::Vec3f(hiX, hiY, hiZ), lvl);
+        }
 
         cv::Mat_<uint8_t> gray;
         _volume->sampleBestEffort(gray, coords, sp);
