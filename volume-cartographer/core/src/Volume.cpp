@@ -332,6 +332,8 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
             };
             for (int lvl = 0; lvl < nLevels; lvl++) {
                 auto lvlPath = path_ / std::to_string(lvl);
+                // Always remove .zarray (v2 metadata from remote) — we only use v3
+                std::filesystem::remove(lvlPath / ".zarray");
                 if (std::filesystem::exists(lvlPath / "zarr.json")) {
                     diskLevels[lvl] = std::make_shared<utils::ZarrArray>(
                         utils::ZarrArray::open(lvlPath));
