@@ -72,10 +72,9 @@ private:
         ChunkKey key;
         uint64_t seq = 0;
 
-        // Priority ordering: coarser level first, then FIFO by seq.
+        // Priority ordering: lowest seq first. Boosted items get seq=0.
         bool operator>(const Task& o) const noexcept
         {
-            if (key.level != o.key.level) return key.level < o.key.level;
             return seq > o.seq;
         }
     };
