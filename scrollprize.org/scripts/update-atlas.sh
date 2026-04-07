@@ -40,10 +40,9 @@ if [ -n "$CSS_FILE" ] && [ -n "$JS_FILE" ]; then
   # Update the AtlasBrowser.js component with correct asset filenames
   COMPONENT_FILE="src/components/AtlasBrowser.js"
   if [ -f "$COMPONENT_FILE" ]; then
-    # Update CSS filename
-    sed -i "s|link.href = '/atlas/assets/.*\.css'|link.href = '/atlas/assets/$CSS_FILE'|g" "$COMPONENT_FILE"
-    # Update JS filename
-    sed -i "s|script.src = '/atlas/assets/.*\.js'|script.src = '/atlas/assets/$JS_FILE'|g" "$COMPONENT_FILE"
+    # Update CSS and JS asset URLs in constants
+    sed -i "s|const ATLAS_CSS_URL = '/atlas/assets/.*\.css'|const ATLAS_CSS_URL = '/atlas/assets/$CSS_FILE'|g" "$COMPONENT_FILE"
+    sed -i "s|const ATLAS_JS_URL = '/atlas/assets/.*\.js'|const ATLAS_JS_URL = '/atlas/assets/$JS_FILE'|g" "$COMPONENT_FILE"
     echo "Component updated successfully"
   fi
 fi
