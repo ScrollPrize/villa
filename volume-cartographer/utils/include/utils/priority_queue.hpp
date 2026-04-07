@@ -57,17 +57,17 @@ public:
         return true;
     }
 
-    /// If the item is already queued, boost it to the front of the queue.
-    /// If not queued, submit it at the front. Returns true if boosted/submitted.
-    bool boost(const T& item) {
+    /// Re-submit with updated priority. If already queued, the old copy
+    /// stays in the heap (harmless — pop_locked skips stale entries).
+    /// The new copy has higher priority and will be popped first.
+    bool resubmit(const T& item) {
         {
             std::lock_guard lock(mutex_);
             if (shutdown_flag_) return false;
-            boost_set_.insert(item);
-            if (!queued_set_.contains(item)) {
-                queued_set_.insert(item);
-                // Don't need to push to heap — pop_locked checks boost_set first
-            }
+            // Always push to heap — if already in queued_set_, the old
+            // copy becomes stale and gets skipped in pop_locked.
+            queued_set_.insert(item);
+            heap_.push(item);
         }
         cv_.notify_all();
         return true;
@@ -129,7 +129,6 @@ public:
     void cancel_pending() {
         std::lock_guard lock(mutex_);
         queued_set_.clear();
-        boost_set_.clear();
         Heap empty_heap;
         std::swap(heap_, empty_heap);
     }
@@ -171,25 +170,14 @@ private:
 
     /// Must be called while holding mutex_ and with a non-empty queue.
     T pop_locked() {
-        // Boosted items get popped first
-        if (!boost_set_.empty()) {
-            auto it = boost_set_.begin();
-            T item = *it;
-            boost_set_.erase(it);
-            queued_set_.erase(item);
-            return item;
-        }
-        // Skip heap items that were already popped via boost
+        // Skip stale heap entries (duplicates from resubmit)
         while (!heap_.empty()) {
             T item = heap_.top();
             heap_.pop();
-            if (queued_set_.contains(item)) {
-                queued_set_.erase(item);
+            if (queued_set_.erase(item))
                 return item;
-            }
-            // Item was already consumed via boost — skip it
+            // Stale duplicate — already popped, skip
         }
-        // Should not reach here if callers check empty()
         throw std::runtime_error("DeduplicatingPriorityQueue::pop_locked(): empty");
     }
 
@@ -197,7 +185,6 @@ private:
     std::condition_variable cv_;
     Heap                    heap_;
     Set                     queued_set_;
-    Set                     boost_set_;  // items to pop before the heap
     bool                    shutdown_flag_ = false;
 };
 
