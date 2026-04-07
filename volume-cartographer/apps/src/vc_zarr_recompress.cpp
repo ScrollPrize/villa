@@ -941,13 +941,17 @@ int main(int argc, char** argv) {
                 if (s_count % 10 == 0 || s_count == (int)total_shards) {
                     auto now = std::chrono::steady_clock::now();
                     double secs = std::chrono::duration<double>(now - t0).count();
-                    size_t tc = total_compressed.load();
-                    double mb_s = tc > 0 ? (double)tc / (1024 * 1024) / secs : 0;
+                    double mins = secs / 60.0;
+                    int pc = processed_chunks.load();
+                    double shards_per_min = mins > 0 ? s_count / mins : 0;
+                    double chunks_per_min = mins > 0 ? pc / mins : 0;
+                    int remaining = (int)total_shards - s_count;
+                    double eta_min = shards_per_min > 0 ? remaining / shards_per_min : 0;
                     std::lock_guard lk(print_mtx);
-                    printf("  %d/%zu shards, %d chunks, %d zero (%.0f/s, %.1f MB/s)\n",
-                           s_count, total_shards, processed_chunks.load(),
-                           zero_chunks.load(),
-                           processed_chunks.load() / secs, mb_s);
+                    printf("  %d/%zu shards (%.0f/min), %d chunks (%.0f/min), %d zero | ETA %.0fm\n",
+                           s_count, total_shards, shards_per_min,
+                           pc, chunks_per_min,
+                           zero_chunks.load(), eta_min);
                 }
             }
         };
