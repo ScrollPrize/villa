@@ -5,8 +5,18 @@
 // writes zarr v3 output to S3 or local filesystem.
 //
 // Each 128³ inner chunk is H265-encoded individually (VC3D header + H265
-// bitstream). Shards use the standard zarr v3 sharding_indexed format with
-// the index at end.
+// bitstream). Shards have a fixed 8192-byte index at the start (512 entries,
+// 16 bytes each: u64 offset + u64 size, little-endian).
+//
+// Shard index encoding:
+//   (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF) = missing chunk (not present)
+//   (0xFFFFFFFFFFFFFFFE, 0)                  = zero chunk (all-zero data)
+//   (offset, nbytes)                          = compressed chunk data
+//
+// Work is partitioned by output shard — each thread gets exclusive shards,
+// so no two threads ever read/write the same input chunks or output shards.
+//
+// All 6 pyramid levels (0-5) are processed in a single invocation.
 //
 // Usage:
 //   vc_zarr_recompress <input> <output> [options]
@@ -19,8 +29,8 @@
 // Options:
 //   --qp N        H265 quantization parameter (0-51) [default: 15]
 //   --verify      Verify roundtrip (decode after encode)
-//   --level N     Process only this pyramid level (-1=all) [default: -1]
-//   --jobs N      Worker threads [default: half hardware threads]
+//   --jobs N      Worker threads [default: all hardware threads]
+//   --log FILE    Log completed shards to this file [default: none]
 
 #include <cstdio>
 #include <cstdlib>
@@ -330,22 +340,16 @@ static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape, int q
     meta.chunk_key_encoding = "default";  // "/" separator
     meta.node_type = "array";
 
-    // Sharding config: 1024³ shards with 128³ inner chunks
+    // Sharding config: 1024³ shards with 128³ inner chunks, index at start
     utils::ShardConfig sc;
     sc.sub_chunks = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
-    sc.index_at_end = true;
+    sc.index_at_end = false;
 
     // Sub-chunk codec: h265 (VC3D video codec)
     utils::ZarrCodecConfig h265_codec;
     h265_codec.name = "h265";
     h265_codec.configuration = std::make_shared<utils::JsonValue>(utils::JsonValue{{"qp", Json(qp)}});
     sc.sub_codecs.push_back(h265_codec);
-
-    // Index codec: bytes (little-endian)
-    utils::ZarrCodecConfig bytes_codec;
-    bytes_codec.name = "bytes";
-    bytes_codec.configuration = std::make_shared<utils::JsonValue>(utils::JsonValue{{"endian", Json("little")}});
-    sc.index_codecs.push_back(bytes_codec);
 
     meta.shard_config = sc;
 
@@ -405,6 +409,22 @@ static std::string make_zarr_v3_group_with_multiscales(
 static void write_le64(std::byte* dst, uint64_t val) {
     for (int i = 0; i < 8; ++i)
         dst[i] = static_cast<std::byte>((val >> (8 * i)) & 0xFF);
+}
+
+static bool is_all_zero(const std::vector<std::byte>& data) {
+    auto* p = reinterpret_cast<const uint64_t*>(data.data());
+    size_t n64 = data.size() / 8;
+    for (size_t i = 0; i < n64; i++)
+        if (p[i]) return false;
+    for (size_t i = n64 * 8; i < data.size(); i++)
+        if (data[i] != std::byte{0}) return false;
+    return true;
+}
+
+// Zero chunk sentinel: offset = 0xFFFFFFFFFFFFFFFE, nbytes = 0
+static void write_zero_sentinel(std::byte* dst) {
+    write_le64(dst, ~uint64_t(0) - 1);
+    write_le64(dst + 8, 0);
 }
 
 // ============================================================================
@@ -503,8 +523,8 @@ int main(int argc, char** argv) {
                   << "Options:\n"
                   << "  --qp N        H265 quantization (0-51, lower=better) [15]\n"
                   << "  --verify      Verify roundtrip after encoding\n"
-                  << "  --level N     Single pyramid level (-1=all) [-1]\n"
-                  << "  --jobs N      Worker threads [half HW threads]\n";
+                  << "  --jobs N      Worker threads [all HW threads]\n"
+                  << "  --log FILE    Log completed shards to file\n";
         return 1;
     }
 
@@ -514,15 +534,26 @@ int main(int argc, char** argv) {
     std::string output_path = argv[2];
     int qp = 15;
     bool verify = false;
-    int target_level = -1;
-    int jobs = std::max(1, (int)std::thread::hardware_concurrency() / 2);
+    int jobs = std::max(1, (int)std::thread::hardware_concurrency());
+    std::string log_path;
 
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--qp" && i + 1 < argc) qp = std::atoi(argv[++i]);
         else if (arg == "--verify") verify = true;
-        else if (arg == "--level" && i + 1 < argc) target_level = std::atoi(argv[++i]);
         else if (arg == "--jobs" && i + 1 < argc) jobs = std::atoi(argv[++i]);
+        else if (arg == "--log" && i + 1 < argc) log_path = argv[++i];
+    }
+
+    // Open shared log file for shard completion logging
+    std::mutex log_mtx;
+    std::ofstream log_file;
+    if (!log_path.empty()) {
+        log_file.open(log_path, std::ios::app);
+        if (!log_file) {
+            fprintf(stderr, "Cannot open log file: %s\n", log_path.c_str());
+            return 1;
+        }
     }
 
     auto input = make_backend(input_path);
@@ -533,13 +564,11 @@ int main(int argc, char** argv) {
     printf("H265 QP: %d, shard: %zu³, chunk: %zu³\n", qp, SHARD_DIM, CHUNK_DIM);
     printf("Jobs: %d\n\n", jobs);
 
-    // Discover pyramid levels
+    // Discover pyramid levels (always process all 6: 0-5)
     std::vector<int> levels;
     std::vector<std::vector<size_t>> shapes;
 
-    for (int l = 0; l < 10; l++) {
-        if (target_level != -1 && l != target_level) continue;
-
+    for (int l = 0; l < 6; l++) {
         std::string zarray_key = std::to_string(l) + "/.zarray";
         std::string zarr_json_key = std::to_string(l) + "/zarr.json";
 
@@ -559,12 +588,21 @@ int main(int argc, char** argv) {
             for (auto& v : zarray["shape"]) shape.push_back(v.get_size_t());
         }
 
+        // Pad each dimension to next multiple of 1024 (minimum 1024)
+        std::vector<size_t> padded_shape = shape;
+        for (auto& d : padded_shape)
+            d = std::max(SHARD_DIM, ((d + SHARD_DIM - 1) / SHARD_DIM) * SHARD_DIM);
+
         levels.push_back(l);
-        shapes.push_back(shape);
-        printf("Found level %d: shape [%zu, %zu, %zu]\n",
-               l, shape.size() > 0 ? shape[0] : 0,
+        shapes.push_back(padded_shape);
+        printf("Found level %d: shape [%zu, %zu, %zu] -> padded [%zu, %zu, %zu]\n",
+               l,
+               shape.size() > 0 ? shape[0] : 0,
                shape.size() > 1 ? shape[1] : 0,
-               shape.size() > 2 ? shape[2] : 0);
+               shape.size() > 2 ? shape[2] : 0,
+               padded_shape.size() > 0 ? padded_shape[0] : 0,
+               padded_shape.size() > 1 ? padded_shape[1] : 0,
+               padded_shape.size() > 2 ? padded_shape[2] : 0);
     }
 
     if (levels.empty()) {
@@ -700,9 +738,11 @@ int main(int argc, char** argv) {
             }
         }
 
+        static constexpr size_t INDEX_BYTES = INNER_CHUNKS * 16;  // 8192
+
         std::atomic<size_t> total_raw{0}, total_compressed{0};
         std::atomic<int> processed_shards{0}, processed_chunks{0};
-        std::atomic<int> errs{0}, skipped_chunks{0};
+        std::atomic<int> errs{0}, skipped_chunks{0}, zero_chunks{0};
         std::atomic<int> verify_ok{0}, verify_fail{0};
         std::mutex print_mtx;
 
@@ -734,22 +774,17 @@ int main(int argc, char** argv) {
                     continue;
                 }
 
-                // Base 128³ chunk coords for this shard
                 size_t base_cz = sz * CHUNKS_PER_SHARD;
                 size_t base_cy = sy * CHUNKS_PER_SHARD;
                 size_t base_cx = sx * CHUNKS_PER_SHARD;
 
-                // Stream shard to temp file: encode each inner 128³ chunk
-                std::string temp_path = "/tmp/shard_" + std::to_string(l) + "_" +
-                    std::to_string(sz) + "_" + std::to_string(sy) + "_" +
-                    std::to_string(sx) + ".tmp";
-                std::ofstream shard_file(temp_path, std::ios::binary | std::ios::trunc);
-                size_t shard_pos = 0;
-                // Index: INNER_CHUNKS entries, 16 bytes each (offset + nbytes)
-                std::vector<std::byte> index_bytes(INNER_CHUNKS * 16);
-                // Initialize all index entries to missing (0xFFFFFFFFFFFFFFFF)
-                std::memset(index_bytes.data(), 0xFF, index_bytes.size());
+                // In-memory shard: [index (8192 bytes)][chunk data...]
+                // Index at start, all missing (0xFF) initially
+                std::vector<std::byte> index_bytes(INDEX_BYTES);
+                std::memset(index_bytes.data(), 0xFF, INDEX_BYTES);
 
+                // Compressed chunk data accumulator (appended one chunk at a time)
+                std::vector<std::byte> shard_data;
                 bool any_data = false;
 
                 for (size_t iz = 0; iz < CHUNKS_PER_SHARD; iz++) {
@@ -759,7 +794,9 @@ int main(int argc, char** argv) {
                             size_t cy = base_cy + iy;
                             size_t cx = base_cx + ix;
 
-                            // Out of bounds?
+                            size_t inner_idx = iz * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD +
+                                               iy * CHUNKS_PER_SHARD + ix;
+
                             if (cz >= out_nz || cy >= out_ny || cx >= out_nx) continue;
 
                             // Check occupancy mask
@@ -771,10 +808,6 @@ int main(int argc, char** argv) {
                                 }
                             }
 
-                            // Map output 128³ chunk to source chunk(s)
-                            // If source chunks are 128³, it's 1:1
-                            // If source chunks differ, we need to remap
-                            // For now, assume source chunks are 128³ (most common)
                             std::string src_key = level_prefix +
                                 std::to_string(cz) + dim_sep +
                                 std::to_string(cy) + dim_sep +
@@ -784,19 +817,14 @@ int main(int argc, char** argv) {
                             try {
                                 auto data = t_input->read(src_key);
 
-                                // Already VC3D? Use as-is
+                                // Already VC3D? Append as-is
                                 if (utils::is_video_compressed(
                                         std::span<const std::byte>(data))) {
-                                    // Write directly into shard
-                                    size_t inner_idx = iz * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD +
-                                                       iy * CHUNKS_PER_SHARD + ix;
-                                    uint64_t offset = shard_pos;
+                                    uint64_t offset = INDEX_BYTES + shard_data.size();
                                     uint64_t nbytes = data.size();
                                     write_le64(index_bytes.data() + inner_idx * 16, offset);
                                     write_le64(index_bytes.data() + inner_idx * 16 + 8, nbytes);
-                                    shard_file.write(reinterpret_cast<const char*>(data.data()),
-                                                     data.size());
-                                    shard_pos += data.size();
+                                    shard_data.insert(shard_data.end(), data.begin(), data.end());
                                     any_data = true;
                                     processed_chunks.fetch_add(1);
                                     total_compressed.fetch_add(data.size());
@@ -834,6 +862,14 @@ int main(int argc, char** argv) {
                                 raw.resize(CHUNK_VOXELS);
                             }
 
+                            // All-zero chunk? Mark with sentinel, don't encode
+                            if (is_all_zero(raw)) {
+                                write_zero_sentinel(index_bytes.data() + inner_idx * 16);
+                                any_data = true;
+                                zero_chunks.fetch_add(1);
+                                continue;
+                            }
+
                             total_raw.fetch_add(CHUNK_VOXELS);
 
                             // H265 encode
@@ -847,7 +883,7 @@ int main(int argc, char** argv) {
                                 std::span<const std::byte>(raw), params);
                             total_compressed.fetch_add(compressed.size());
 
-                            // Verify
+                            // Verify before freeing raw
                             if (verify) {
                                 auto decoded = utils::video_decode(
                                     std::span<const std::byte>(compressed),
@@ -862,17 +898,18 @@ int main(int argc, char** argv) {
                                 }
                             }
 
-                            // Record in shard index
-                            size_t inner_idx = iz * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD +
-                                               iy * CHUNKS_PER_SHARD + ix;
-                            uint64_t offset = shard_pos;
+                            // Free raw — only compressed data kept in shard buffer
+                            raw.clear();
+                            raw.shrink_to_fit();
+
+                            // Record in index: offsets relative to start of shard file
+                            uint64_t offset = INDEX_BYTES + shard_data.size();
                             uint64_t nbytes = compressed.size();
                             write_le64(index_bytes.data() + inner_idx * 16, offset);
                             write_le64(index_bytes.data() + inner_idx * 16 + 8, nbytes);
 
-                            shard_file.write(reinterpret_cast<const char*>(compressed.data()),
-                                             compressed.size());
-                            shard_pos += compressed.size();
+                            shard_data.insert(shard_data.end(),
+                                              compressed.begin(), compressed.end());
                             any_data = true;
                             processed_chunks.fetch_add(1);
                         }
@@ -880,25 +917,36 @@ int main(int argc, char** argv) {
                 }
 
                 if (any_data) {
-                    // Append index at end of shard
-                    shard_file.write(reinterpret_cast<const char*>(index_bytes.data()),
-                                     index_bytes.size());
-                    shard_file.close();
-                    t_output->write_from_file(shard_key, temp_path);
-                } else {
-                    shard_file.close();
-                    fs::remove(temp_path);
+                    // Build final shard: [index][chunk data]
+                    std::vector<std::byte> shard(INDEX_BYTES + shard_data.size());
+                    std::memcpy(shard.data(), index_bytes.data(), INDEX_BYTES);
+                    std::memcpy(shard.data() + INDEX_BYTES,
+                                shard_data.data(), shard_data.size());
+                    shard_data.clear();
+                    shard_data.shrink_to_fit();
+
+                    // Single write to output
+                    t_output->write(shard_key, shard);
                 }
 
                 int s_count = processed_shards.fetch_add(1) + 1;
+
+                // Log completed shard
+                if (log_file.is_open()) {
+                    std::lock_guard lk(log_mtx);
+                    log_file << shard_key << "\n";
+                    log_file.flush();
+                }
+
                 if (s_count % 10 == 0 || s_count == (int)total_shards) {
                     auto now = std::chrono::steady_clock::now();
                     double secs = std::chrono::duration<double>(now - t0).count();
                     size_t tc = total_compressed.load();
                     double mb_s = tc > 0 ? (double)tc / (1024 * 1024) / secs : 0;
                     std::lock_guard lk(print_mtx);
-                    printf("  %d/%zu shards, %d chunks (%.0f/s, %.1f MB/s)\n",
+                    printf("  %d/%zu shards, %d chunks, %d zero (%.0f/s, %.1f MB/s)\n",
                            s_count, total_shards, processed_chunks.load(),
+                           zero_chunks.load(),
                            processed_chunks.load() / secs, mb_s);
                 }
             }
@@ -915,9 +963,9 @@ int main(int argc, char** argv) {
         double ratio = tc > 0 ? (double)tr / tc : 0;
         double mb_s = tc > 0 ? (double)tc / (1024 * 1024) / elapsed : 0;
 
-        printf("  Processed: %d shards, %d chunks (skipped: %d, errors: %d)\n",
+        printf("  Processed: %d shards, %d chunks (zero: %d, skipped: %d, errors: %d)\n",
                processed_shards.load(), processed_chunks.load(),
-               skipped_chunks.load(), errs.load());
+               zero_chunks.load(), skipped_chunks.load(), errs.load());
         printf("  Raw: %zu MB -> Compressed: %zu MB (ratio: %.2f:1)\n",
                tr / 1024 / 1024, tc / 1024 / 1024, ratio);
         printf("  Time: %.1fs (%.0f chunks/s, %.1f MB/s)\n",
