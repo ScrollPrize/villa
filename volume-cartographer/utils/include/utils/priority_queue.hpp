@@ -68,17 +68,18 @@ public:
 
     [[nodiscard]] T pop() {
         std::unique_lock lock(mutex_);
-        cv_.wait(lock, [this] { return !set_.empty() || shutdown_flag_; });
-        if (set_.empty())
-            throw std::runtime_error("DeduplicatingPriorityQueue::pop(): shutdown");
-        // Skip stale duplicates from boost()
-        while (!deque_.empty()) {
-            T item = deque_.front();
-            deque_.pop_front();
-            if (set_.erase(item))
-                return item;
+        for (;;) {
+            cv_.wait(lock, [this] { return !deque_.empty() || shutdown_flag_; });
+            if (shutdown_flag_ && deque_.empty())
+                throw std::runtime_error("DeduplicatingPriorityQueue::pop(): shutdown");
+            while (!deque_.empty()) {
+                T item = deque_.front();
+                deque_.pop_front();
+                if (set_.erase(item))
+                    return item;
+            }
+            // All popped entries were stale duplicates — wait for more
         }
-        throw std::runtime_error("DeduplicatingPriorityQueue::pop(): empty");
     }
 
     [[nodiscard]] std::optional<T> try_pop() {
@@ -94,7 +95,7 @@ public:
     template <typename Rep, typename Period>
     [[nodiscard]] std::optional<T> pop_for(std::chrono::duration<Rep, Period> timeout) {
         std::unique_lock lock(mutex_);
-        if (!cv_.wait_for(lock, timeout, [this] { return !set_.empty() || shutdown_flag_; }))
+        if (!cv_.wait_for(lock, timeout, [this] { return !deque_.empty() || shutdown_flag_; }))
             return std::nullopt;
         while (!deque_.empty()) {
             T item = deque_.front();
