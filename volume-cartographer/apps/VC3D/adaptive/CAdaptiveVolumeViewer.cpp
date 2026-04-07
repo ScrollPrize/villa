@@ -304,6 +304,15 @@ void CAdaptiveVolumeViewer::scheduleRender()
 
 void CAdaptiveVolumeViewer::submitRender()
 {
+    // Re-read sensitivity settings (changed live via Viewer Controls panel)
+    {
+        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+        using namespace vc3d::settings;
+        _panSensitivity = std::max(0.01f, s.value(viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT).toFloat());
+        _zoomSensitivity = std::max(0.01f, s.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toFloat());
+        _zScrollSensitivity = std::max(0.01f, s.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat());
+    }
+
     auto surf = _surfWeak.lock();
     if (!surf || !_volume || !_volume->zarrDataset()) return;
 
