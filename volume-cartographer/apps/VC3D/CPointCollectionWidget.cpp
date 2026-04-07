@@ -122,7 +122,7 @@ void CPointCollectionWidget::setupUi()
 
     layout->addWidget(_collection_metadata_group);
  
-    connect(_absolute_winding_checkbox, &QCheckBox::checkStateChanged, this, &CPointCollectionWidget::onAbsoluteWindingChanged);
+    connect(_absolute_winding_checkbox, &QCheckBox::stateChanged, this, &CPointCollectionWidget::onAbsoluteWindingChanged);
     connect(_color_button, &QPushButton::clicked, this, &CPointCollectionWidget::onColorButtonClicked);
     connect(_fill_winding_plus_button, &QPushButton::clicked, this, &CPointCollectionWidget::onFillWindingPlusClicked);
     connect(_fill_winding_minus_button, &QPushButton::clicked, this, &CPointCollectionWidget::onFillWindingMinusClicked);
@@ -150,7 +150,7 @@ void CPointCollectionWidget::setupUi()
 
     layout->addWidget(_point_metadata_group);
  
-    connect(_winding_enabled_checkbox, &QCheckBox::checkStateChanged, this, &CPointCollectionWidget::onWindingEnabledChanged);
+    connect(_winding_enabled_checkbox, &QCheckBox::stateChanged, this, &CPointCollectionWidget::onWindingEnabledChanged);
     connect(_winding_spinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CPointCollectionWidget::onWindingEdited);
  
     layout->addStretch();
