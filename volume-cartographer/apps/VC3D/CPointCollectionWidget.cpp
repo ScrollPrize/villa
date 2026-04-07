@@ -2,16 +2,11 @@
 
 #include "Keybinds.hpp"
 
-// Qt 6.7+ renamed stateChanged to checkStateChanged with Qt::CheckState arg.
-// Older Qt6 only has stateChanged(int). Bridge with a lambda for compat.
-#if QT_VERSION < QT_VERSION_CHECK(6, 7, 0)
+// Qt compat: stateChanged(int) works on all Qt6 versions.
+// Lambda bridges to Qt::CheckState for the slot signature.
 #define CONNECT_CHECK_STATE(checkbox, receiver, slot) \
     connect(checkbox, &QCheckBox::stateChanged, receiver, \
             [receiver](int s) { receiver->slot(static_cast<Qt::CheckState>(s)); })
-#else
-#define CONNECT_CHECK_STATE(checkbox, receiver, slot) \
-    connect(checkbox, &QCheckBox::checkStateChanged, receiver, &std::remove_pointer_t<decltype(receiver)>::slot)
-#endif
 
 #include <QStandardItem>
 #include <stdexcept>
