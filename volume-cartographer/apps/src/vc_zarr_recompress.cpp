@@ -29,7 +29,7 @@
 // Options:
 //   --qp N        H265 quantization parameter (0-51) [default: 15]
 //   --verify      Verify roundtrip (decode after encode)
-//   --jobs N      Worker threads [default: all hardware threads]
+//   --jobs N      Worker threads [default: 2x hardware threads]
 //   --log FILE    Log completed shards to this file [default: none]
 
 #include <cstdio>
@@ -523,7 +523,7 @@ int main(int argc, char** argv) {
                   << "Options:\n"
                   << "  --qp N        H265 quantization (0-51, lower=better) [15]\n"
                   << "  --verify      Verify roundtrip after encoding\n"
-                  << "  --jobs N      Worker threads [all HW threads]\n"
+                  << "  --jobs N      Worker threads [2x HW threads]\n"
                   << "  --log FILE    Log completed shards to file\n";
         return 1;
     }
@@ -534,7 +534,7 @@ int main(int argc, char** argv) {
     std::string output_path = argv[2];
     int qp = 15;
     bool verify = false;
-    int jobs = std::max(1, (int)std::thread::hardware_concurrency());
+    int jobs = std::max(1, (int)std::thread::hardware_concurrency() * 2);
     std::string log_path;
 
     for (int i = 3; i < argc; i++) {
