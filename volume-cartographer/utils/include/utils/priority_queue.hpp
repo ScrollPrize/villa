@@ -54,23 +54,12 @@ public:
         return added;
     }
 
-    // If already queued, remove from current position and put at front.
-    // If not queued, add to front.
+    // Put at front. Stale duplicates in deque are skipped by pop().
     bool boost(const T& item) {
         {
             std::lock_guard lock(mutex_);
             if (shutdown_flag_) return false;
-            if (set_.contains(item)) {
-                // Remove from current position
-                for (auto it = deque_.begin(); it != deque_.end(); ++it) {
-                    if (KeyEqual{}(*it, item)) {
-                        deque_.erase(it);
-                        break;
-                    }
-                }
-            } else {
-                set_.insert(item);
-            }
+            set_.insert(item);
             deque_.push_front(item);
         }
         cv_.notify_one();
@@ -79,34 +68,40 @@ public:
 
     [[nodiscard]] T pop() {
         std::unique_lock lock(mutex_);
-        cv_.wait(lock, [this] { return !deque_.empty() || shutdown_flag_; });
-        if (deque_.empty())
+        cv_.wait(lock, [this] { return !set_.empty() || shutdown_flag_; });
+        if (set_.empty())
             throw std::runtime_error("DeduplicatingPriorityQueue::pop(): shutdown");
-        T item = deque_.front();
-        deque_.pop_front();
-        set_.erase(item);
-        return item;
+        // Skip stale duplicates from boost()
+        while (!deque_.empty()) {
+            T item = deque_.front();
+            deque_.pop_front();
+            if (set_.erase(item))
+                return item;
+        }
+        throw std::runtime_error("DeduplicatingPriorityQueue::pop(): empty");
     }
 
     [[nodiscard]] std::optional<T> try_pop() {
         std::lock_guard lock(mutex_);
-        if (deque_.empty()) return std::nullopt;
-        T item = deque_.front();
-        deque_.pop_front();
-        set_.erase(item);
-        return item;
+        while (!deque_.empty()) {
+            T item = deque_.front();
+            deque_.pop_front();
+            if (set_.erase(item)) return item;
+        }
+        return std::nullopt;
     }
 
     template <typename Rep, typename Period>
     [[nodiscard]] std::optional<T> pop_for(std::chrono::duration<Rep, Period> timeout) {
         std::unique_lock lock(mutex_);
-        if (!cv_.wait_for(lock, timeout, [this] { return !deque_.empty() || shutdown_flag_; }))
+        if (!cv_.wait_for(lock, timeout, [this] { return !set_.empty() || shutdown_flag_; }))
             return std::nullopt;
-        if (deque_.empty()) return std::nullopt;
-        T item = deque_.front();
-        deque_.pop_front();
-        set_.erase(item);
-        return item;
+        while (!deque_.empty()) {
+            T item = deque_.front();
+            deque_.pop_front();
+            if (set_.erase(item)) return item;
+        }
+        return std::nullopt;
     }
 
     void cancel_pending() {
