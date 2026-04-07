@@ -302,20 +302,6 @@ void CAdaptiveVolumeViewer::submitRender()
     auto* fbBits = reinterpret_cast<uint32_t*>(_framebuffer.bits());
     int fbStride = _framebuffer.bytesPerLine() / 4;
 
-    auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
-    if (!plane) return;
-
-    cv::Vec3f vx = plane->basisX();
-    cv::Vec3f vy = plane->basisY();
-    cv::Vec3f n = plane->normal(cv::Vec3f(0, 0, 0));
-
-    float halfW = static_cast<float>(fbW) * 0.5f / _camera.scale;
-    float halfH = static_cast<float>(fbH) * 0.5f / _camera.scale;
-
-    cv::Vec3f origin = vx * (_camera.surfacePtr[0] - halfW)
-                     + vy * (_camera.surfacePtr[1] - halfH)
-                     + plane->origin() + n * _camera.zOff;
-
     std::array<uint32_t, 256> lut;
     vc::buildWindowLevelLut(lut, _windowLow, _windowHigh);
 
@@ -323,12 +309,45 @@ void CAdaptiveVolumeViewer::submitRender()
     sp.level = _camera.dsScaleIdx;
     sp.method = vc::Sampling::Nearest;
 
-    _volume->samplePlaneBestEffortARGB32(
-        fbBits, fbStride, origin,
-        vx / _camera.scale, vy / _camera.scale,
-        fbW, fbH, sp, lut.data());
+    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+        // PlaneSurface: fused plane sampling
+        cv::Vec3f vx = plane->basisX();
+        cv::Vec3f vy = plane->basisY();
+        cv::Vec3f n = plane->normal(cv::Vec3f(0, 0, 0));
 
-    // Prefetch is now handled inside samplePlaneBestEffortARGB32
+        float halfW = static_cast<float>(fbW) * 0.5f / _camera.scale;
+        float halfH = static_cast<float>(fbH) * 0.5f / _camera.scale;
+
+        cv::Vec3f origin = vx * (_camera.surfacePtr[0] - halfW)
+                         + vy * (_camera.surfacePtr[1] - halfH)
+                         + plane->origin() + n * _camera.zOff;
+
+        _volume->samplePlaneBestEffortARGB32(
+            fbBits, fbStride, origin,
+            vx / _camera.scale, vy / _camera.scale,
+            fbW, fbH, sp, lut.data());
+    } else {
+        // QuadSurface: gen coords then sample
+        cv::Mat_<cv::Vec3f> coords;
+        cv::Vec3f offset(_camera.surfacePtr[0] * _camera.scale,
+                         _camera.surfacePtr[1] * _camera.scale,
+                         _camera.zOff);
+        surf->gen(&coords, nullptr, cv::Size(fbW, fbH), cv::Vec3f(0, 0, 0),
+                  _camera.scale, offset);
+
+        cv::Mat_<uint8_t> gray;
+        _volume->sampleBestEffort(gray, coords, sp);
+
+        // Apply LUT: gray → ARGB32
+        if (!gray.empty()) {
+            for (int y = 0; y < fbH && y < gray.rows; y++) {
+                const auto* src = gray.ptr<uint8_t>(y);
+                auto* dst = fbBits + y * fbStride;
+                for (int x = 0; x < fbW && x < gray.cols; x++)
+                    dst[x] = lut[src[x]];
+            }
+        }
+    }
 
     // Update camera tracking for coordinate conversions
     _camSurfX = _camera.surfacePtr[0];
