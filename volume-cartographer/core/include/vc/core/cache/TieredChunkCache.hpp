@@ -42,7 +42,7 @@ public:
         Config config,
         std::unique_ptr<ChunkSource> source,
         DecompressFn decompress,
-        std::shared_ptr<utils::ZarrArray> diskZarr = nullptr);
+        std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels = {});
 
     ~TieredChunkCache();
 
@@ -128,8 +128,8 @@ private:
 
     Config config_;
 
-    // --- Cold tier (local zarr v3 sharded) ---
-    std::shared_ptr<utils::ZarrArray> diskZarr_;
+    // --- Cold tier (per-level sharded zarr v3 arrays: path/0/, path/1/, ...) ---
+    std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels_;
 
     // --- Ice tier ---
     std::unique_ptr<ChunkSource> source_;

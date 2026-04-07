@@ -78,10 +78,10 @@ TieredChunkCache::TieredChunkCache(
     Config config,
     std::unique_ptr<ChunkSource> source,
     DecompressFn decompress,
-    std::shared_ptr<utils::ZarrArray> diskZarr)
+    std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels)
     : hotCache_(makeHotConfig(config))
     , config_(std::move(config))
-    , diskZarr_(std::move(diskZarr))
+    , diskLevels_(std::move(diskLevels))
     , source_(std::move(source))
     , decompress_(std::move(decompress))
     , ioPool_(config_.ioThreads)
@@ -92,8 +92,9 @@ TieredChunkCache::TieredChunkCache(
         auto t0 = Clock::now();
 
         // Try cold (disk cache) first
-        if (diskZarr_) {
-            auto diskData = zarrReadChunk(*diskZarr_, key);
+        auto* dz = (key.level < static_cast<int>(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
+        if (dz) {
+            auto diskData = zarrReadChunk(*dz, key);
             if (diskData && !diskData->empty()) {
                 auto n = statColdHits_.fetch_add(1, std::memory_order_relaxed);
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
@@ -147,8 +148,9 @@ TieredChunkCache::TieredChunkCache(
                          n + 1, key.level, key.iz, key.iy, key.ix, data.size(), fetchMs);
 
         // Store to cold (disk cache) for persistence.
-        if (diskZarr_) {
-            zarrWriteChunk(*diskZarr_, key, data.data(), data.size());
+        auto* dzW = (key.level < static_cast<int>(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
+        if (dzW) {
+            zarrWriteChunk(*dzW, key, data.data(), data.size());
             statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -560,7 +562,8 @@ void TieredChunkCache::propagateZeroChunks(int coarseLevel)
                             // Don't overwrite chunks already cached or on disk
                             if (hotCache_.contains(fineKey))
                                 continue;
-                            if (diskZarr_ && zarrChunkExists(*diskZarr_, fineKey))
+                            auto* dzFine = (fineKey.level < static_cast<int>(diskLevels_.size())) ? diskLevels_[fineKey.level].get() : nullptr;
+                            if (dzFine && zarrChunkExists(*dzFine, fineKey))
                                 continue;
                             negativeCache_.insert(fineKey);
                             bloomAdd(fineKey);
@@ -594,11 +597,10 @@ void TieredChunkCache::clearAll()
         std::lock_guard lock(negativeMutex_);
         negativeCache_.clear();
     }
-    if (diskZarr_) {
-        // TODO: clear local zarr shard files
+    if (!diskLevels_.empty()) {
         std::error_code ec;
         std::filesystem::remove(
-            diskZarr_->path() / (config_.volumeId + ".negative"), ec);
+            diskLevels_[0]->path().parent_path() / (config_.volumeId + ".negative"), ec);
     }
 }
 
@@ -731,9 +733,11 @@ void TieredChunkCache::hotPut(const ChunkKey& key, ChunkDataPtr data)
 
 ChunkDataPtr TieredChunkCache::promoteFromCold(const ChunkKey& key)
 {
-    if (!diskZarr_ || !decompress_) return nullptr;
+    if (!decompress_) return nullptr;
+    auto* dz = (key.level < static_cast<int>(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
+    if (!dz) return nullptr;
 
-    auto raw = zarrReadChunk(*diskZarr_, key);
+    auto raw = zarrReadChunk(*dz, key);
     if (!raw || raw->empty()) return nullptr;
 
     statColdHits_.fetch_add(1, std::memory_order_relaxed);
@@ -758,9 +762,10 @@ ChunkDataPtr TieredChunkCache::promoteFromIce(const ChunkKey& key)
 
     statIceFetches_.fetch_add(1, std::memory_order_relaxed);
 
-    // Store to cold (disk cache)
-    if (diskZarr_) {
-        zarrWriteChunk(*diskZarr_, key, compressed.data(), compressed.size());
+    // Store to cold (disk cache) — per-level zarr
+    auto* dzIce = (key.level < static_cast<int>(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
+    if (dzIce) {
+        zarrWriteChunk(*dzIce, key, compressed.data(), compressed.size());
         statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -801,7 +806,8 @@ bool TieredChunkCache::isAvailableWithoutRemoteFetch(const ChunkKey& key) const
     if (isReadyForNonBlockingRead(key)) return true;
 
     // Check cold tier (local zarr): if in shard, no remote fetch needed.
-    if (diskZarr_ && zarrChunkExists(*diskZarr_, key))
+    auto* dzAvail = (key.level < static_cast<int>(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
+    if (dzAvail && zarrChunkExists(*dzAvail, key))
         return true;
     return false;
 }
@@ -817,8 +823,8 @@ void TieredChunkCache::flushPersistentState()
 
 void TieredChunkCache::loadNegativeCache()
 {
-    if (!diskZarr_) return;
-    auto negRoot = diskZarr_->path();
+    if (diskLevels_.empty()) return;
+    auto negRoot = diskLevels_[0]->path().parent_path();
 
     auto path = negRoot / (config_.volumeId + ".negative");
     std::ifstream f(path, std::ios::binary);
@@ -844,8 +850,8 @@ void TieredChunkCache::loadNegativeCache()
 void TieredChunkCache::saveNegativeCache() const
 {
     if (negativeCache_.empty()) return;
-    if (!diskZarr_) return;
-    auto negRoot = diskZarr_->path();
+    if (diskLevels_.empty()) return;
+    auto negRoot = diskLevels_[0]->path().parent_path();
 
     auto path = negRoot / (config_.volumeId + ".negative");
     std::ofstream f(path, std::ios::binary | std::ios::trunc);

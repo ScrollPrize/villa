@@ -2158,6 +2158,14 @@ int samplePlaneAdaptiveARGB32(
                 int iy = static_cast<int>(wy * li.scale + 0.5f);
                 int iz = static_cast<int>(wz * li.scale + 0.5f);
 
+                // Debug: log first center pixel at each level
+                static int dbgCount = 0;
+                if (x == w/2 && y == h/2 && dbgCount < 50) {
+                    dbgCount++;
+                    fprintf(stderr, "[SAMPLE] px(%d,%d) world(%.1f,%.1f,%.1f) lvl=%d scale=%.4f -> vox(%d,%d,%d) shape(%d,%d,%d)\n",
+                            x, y, wx, wy, wz, l, li.scale, ix, iy, iz, p.sx, p.sy, p.sz);
+                }
+
                 // Clamp to level shape
                 if (ix >= p.sx) ix = p.sx - 1;
                 if (iy >= p.sy) iy = p.sy - 1;

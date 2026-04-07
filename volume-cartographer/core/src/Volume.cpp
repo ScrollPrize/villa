@@ -284,9 +284,10 @@ size_t Volume::numScales() const noexcept {
 }
 
 std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
-    std::shared_ptr<utils::ZarrArray> diskZarr) const
+    std::shared_ptr<utils::ZarrArray> /*diskZarr_unused*/) const
 {
     if (zarrDs_.empty()) return nullptr;
+    std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels;
 
     // Build level metadata from our zarr datasets
     std::vector<vc::cache::FileSystemChunkSource::LevelMeta> levels;
@@ -319,83 +320,54 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
         }
         source = std::move(httpSource);
 
-        // Create or open a canonical zarr v3 sharded cold cache.
-        // 128³ chunks in 1024³ shards, no codec (data is already H.265 compressed).
-        if (!diskZarr) {
-            auto zarrPath = path_ / "cache";
-            try {
-                if (std::filesystem::exists(zarrPath / "zarr.json")) {
-                    diskZarr = std::make_shared<utils::ZarrArray>(
-                        utils::ZarrArray::open(zarrPath));
-                } else {
-                    // Get level 0 shape from source metadata
-                    auto l0shape = source->levelShape(0);
-                    utils::ZarrMetadata meta;
-                    meta.version = utils::ZarrVersion::v3;
-                    meta.node_type = "array";
-                    meta.shape = {static_cast<size_t>(l0shape[0]),
-                                  static_cast<size_t>(l0shape[1]),
-                                  static_cast<size_t>(l0shape[2])};
-                    meta.chunks = {1024, 1024, 1024};  // shard shape
-                    meta.dtype = utils::ZarrDtype::uint8;
-                    meta.fill_value = 0;
-                    meta.chunk_key_encoding = "default";
-                    utils::ShardConfig sc;
-                    sc.sub_chunks = {128, 128, 128};   // inner chunk shape
-                    sc.index_at_end = false;  // index at start for append-only writes
-                    meta.shard_config = std::move(sc);
-                    diskZarr = std::make_shared<utils::ZarrArray>(
-                        utils::ZarrArray::create(zarrPath, std::move(meta)));
-                }
-                fprintf(stderr, "[Volume] Cold cache: %s (sharded=%s)\n",
-                        zarrPath.c_str(), diskZarr->is_sharded() ? "yes" : "no");
-            } catch (const std::exception& e) {
-                fprintf(stderr, "[Volume] Failed to create cold cache: %s\n", e.what());
-            }
-        }
-    } else {
-        source = std::make_unique<vc::cache::FileSystemChunkSource>(
-            path_, delimiter, std::move(levels));
-
-        // Auto-enable disk caching for network-mounted volumes
-        if (!diskZarr && mountInfo_.type == vc::FilesystemType::NetworkMount) {
-            if (!mountInfo_.cacheDir.empty()) {
-                fprintf(stderr, "[Volume] Detected %s mount with use_cache=%s; "
-                                "skipping app-level disk cache\n",
-                        mountInfo_.label.c_str(),
-                        mountInfo_.cacheDir.c_str());
-            } else {
-                namespace fs = std::filesystem;
-                auto home = std::getenv("HOME");
-                auto zarrPath = fs::path(home ? home : "/tmp") / ".VC3D" / "network_cache" / id() / "cache";
+        // Create or open per-level sharded zarr v3 cold cache.
+        // Each level is its own zarr array at path_/0/, path_/1/, etc.
+        // 128³ inner chunks in 1024³ shards.
+        std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels;
+        {
+            int nLevels = source->numLevels();
+            diskLevels.resize(nLevels);
+            for (int lvl = 0; lvl < nLevels; lvl++) {
+                auto lvlPath = path_ / std::to_string(lvl);
                 try {
-                    if (fs::exists(zarrPath / "zarr.json")) {
-                        diskZarr = std::make_shared<utils::ZarrArray>(
-                            utils::ZarrArray::open(zarrPath));
+                    if (std::filesystem::exists(lvlPath / "zarr.json") ||
+                        std::filesystem::exists(lvlPath / ".zarray")) {
+                        // Try opening existing — may be v2 (.zarray) or v3 (zarr.json)
+                        diskLevels[lvl] = std::make_shared<utils::ZarrArray>(
+                            utils::ZarrArray::open(lvlPath));
                     } else {
-                        auto l0shape = source->levelShape(0);
+                        auto shape = source->levelShape(lvl);
+                        // Pad shape up to chunk boundary (128)
+                        auto pad = [](int v) -> size_t { return static_cast<size_t>(std::max(v, 128)); };
                         utils::ZarrMetadata meta;
                         meta.version = utils::ZarrVersion::v3;
                         meta.node_type = "array";
-                        meta.shape = {static_cast<size_t>(l0shape[0]),
-                                      static_cast<size_t>(l0shape[1]),
-                                      static_cast<size_t>(l0shape[2])};
+                        meta.shape = {pad(shape[0]), pad(shape[1]), pad(shape[2])};
                         meta.chunks = {1024, 1024, 1024};
                         meta.dtype = utils::ZarrDtype::uint8;
                         meta.fill_value = 0;
                         meta.chunk_key_encoding = "default";
                         utils::ShardConfig sc;
                         sc.sub_chunks = {128, 128, 128};
-                        sc.index_at_end = false;  // index at start for append-only writes
+                        sc.index_at_end = false;
                         meta.shard_config = std::move(sc);
-                        diskZarr = std::make_shared<utils::ZarrArray>(
-                            utils::ZarrArray::create(zarrPath, std::move(meta)));
+                        diskLevels[lvl] = std::make_shared<utils::ZarrArray>(
+                            utils::ZarrArray::create(lvlPath, std::move(meta)));
                     }
-                    fprintf(stderr, "[Volume] Network cold cache: %s\n", zarrPath.c_str());
                 } catch (const std::exception& e) {
-                    fprintf(stderr, "[Volume] Failed to create network cold cache: %s\n", e.what());
+                    fprintf(stderr, "[Volume] Failed to open/create cold cache level %d: %s\n", lvl, e.what());
                 }
             }
+            fprintf(stderr, "[Volume] Cold cache: %d levels at %s\n",
+                    nLevels, path_.c_str());
+        }
+    } else {
+        source = std::make_unique<vc::cache::FileSystemChunkSource>(
+            path_, delimiter, std::move(levels));
+
+        // Network mount disk caching disabled — needs per-level conversion
+        if (mountInfo_.type == vc::FilesystemType::NetworkMount) {
+            fprintf(stderr, "[Volume] Network mount detected — disk cache not yet per-level, skipping\n");
         }
     }
 
@@ -425,7 +397,7 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
         std::move(config),
         std::move(source),
         std::move(decompress),
-        std::move(diskZarr));
+        std::move(diskLevels));
 }
 
 // ============================================================================
@@ -709,8 +681,11 @@ int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
     auto pb = planeBBox(origin, vx_step, vy_step, width, height);
     cv::Vec3f pfLo(pb.loX, pb.loY, pb.loZ);
     cv::Vec3f pfHi(pb.hiX, pb.hiY, pb.hiZ);
-    for (int lvl = desired; lvl < nScales; lvl++)
+    for (int lvl = desired; lvl < nScales; lvl++) {
         prefetchWorldBBox(pfLo, pfHi, lvl);
+    }
+    std::fprintf(stderr, "[ARGB32] desired=%d nScales=%d bbox=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) size=%dx%d\n",
+                 desired, nScales, pb.loX, pb.loY, pb.loZ, pb.hiX, pb.hiY, pb.hiZ, width, height);
 
     // Render with per-pixel fallback to coarser levels.
     // Each pixel tries the desired level first; if that chunk isn't in hot

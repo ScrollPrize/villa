@@ -38,8 +38,7 @@ std::unique_ptr<TieredChunkCache> createSimpleTieredCache(
     return std::make_unique<TieredChunkCache>(
         std::move(config),
         std::move(source),
-        std::move(decompress),
-        nullptr);  // no disk store
+        std::move(decompress));  // no disk cache
 }
 
 }  // namespace vc::cache
