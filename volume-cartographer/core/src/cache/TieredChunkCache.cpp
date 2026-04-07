@@ -344,6 +344,7 @@ void TieredChunkCache::prefetch(const ChunkKey& key)
     // Cold-disk-only chunks still need promotion, so they must be submitted.
     if (isReadyForNonBlockingRead(key)) return;
 
+    statTotalSubmitted_.fetch_add(1, std::memory_order_relaxed);
     ioPool_.submit(key);
 }
 
@@ -360,6 +361,7 @@ void TieredChunkCache::prefetch(const std::vector<ChunkKey>& keys)
     }
 
     if (!submitKeys.empty()) {
+        statTotalSubmitted_.fetch_add(submitKeys.size(), std::memory_order_relaxed);
         ioPool_.submit(submitKeys);
     }
 }
@@ -402,6 +404,7 @@ void TieredChunkCache::prefetchRegion(
         }
     }
     if (!keys.empty()) {
+        statTotalSubmitted_.fetch_add(keys.size(), std::memory_order_relaxed);
         ioPool_.submitBackground(keys);
     }
 }
@@ -710,6 +713,7 @@ auto TieredChunkCache::stats() const -> Stats
         std::lock_guard lock(negativeMutex_);
         s.negativeCount = negativeCache_.size();
     }
+    s.totalSubmitted = statTotalSubmitted_.load(std::memory_order_relaxed);
     // Disk cache stats: scan shard files across all levels
     for (const auto& dz : diskLevels_) {
         if (!dz) continue;

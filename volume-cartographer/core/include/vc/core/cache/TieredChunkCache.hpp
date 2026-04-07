@@ -118,6 +118,7 @@ public:
         size_t negativeCount = 0;
         size_t diskBytes = 0;    // total bytes on disk across all level shards
         size_t diskShards = 0;   // number of shard files on disk
+        uint64_t totalSubmitted = 0;  // total chunks ever submitted to IO pool
     };
 
     [[nodiscard]] Stats stats() const;
@@ -178,6 +179,7 @@ private:
     std::atomic<uint64_t> statColdHits_{0};
     std::atomic<uint64_t> statIceFetches_{0};
     std::atomic<uint64_t> statDiskWrites_{0};
+    std::atomic<uint64_t> statTotalSubmitted_{0};
     mutable std::atomic<uint64_t> statMisses_{0};
 };
 
