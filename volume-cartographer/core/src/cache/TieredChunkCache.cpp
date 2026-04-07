@@ -14,15 +14,11 @@ static std::array<size_t, 3> chunkIndices(const ChunkKey& key) {
     return {static_cast<size_t>(key.iz), static_cast<size_t>(key.iy), static_cast<size_t>(key.ix)};
 }
 
-// Read compressed chunk from ZarrArray (handles both sharded and unsharded)
 static std::optional<std::vector<std::byte>> zarrReadChunk(
     utils::ZarrArray& zarr, const ChunkKey& key)
 {
     auto idx = chunkIndices(key);
-    if (zarr.is_sharded()) {
-        return zarr.read_inner_chunk_from_shard(idx);
-    }
-    return zarr.read_chunk_raw(idx);
+    return zarr.read_inner_chunk_from_shard(idx);
 }
 
 // Write compressed chunk to ZarrArray (handles both sharded and unsharded)
@@ -33,21 +29,14 @@ static void zarrWriteChunk(
     auto idx = chunkIndices(key);
     std::span<const std::byte> byteSpan(
         reinterpret_cast<const std::byte*>(data), size);
-    if (zarr.is_sharded()) {
-        zarr.write_inner_chunk_to_shard(idx, byteSpan);
-    } else {
-        zarr.write_chunk_raw(idx, byteSpan);
-    }
+    zarr.write_inner_chunk_to_shard(idx, byteSpan);
 }
 
 // Check if chunk exists in ZarrArray
 static bool zarrChunkExists(const utils::ZarrArray& zarr, const ChunkKey& key)
 {
     auto idx = chunkIndices(key);
-    if (zarr.is_sharded()) {
-        return zarr.inner_chunk_exists(idx);
-    }
-    return zarr.read_chunk_raw(idx).has_value();
+    return zarr.inner_chunk_exists(idx);
 }
 
 static bool isAllZero(const uint8_t* data, size_t size) noexcept
