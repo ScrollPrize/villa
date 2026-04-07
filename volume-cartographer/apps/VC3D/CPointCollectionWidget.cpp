@@ -2,6 +2,17 @@
 
 #include "Keybinds.hpp"
 
+// Qt 6.7+ renamed stateChanged to checkStateChanged with Qt::CheckState arg.
+// Older Qt6 only has stateChanged(int). Bridge with a lambda for compat.
+#if QT_VERSION < QT_VERSION_CHECK(6, 7, 0)
+#define CONNECT_CHECK_STATE(checkbox, receiver, slot) \
+    connect(checkbox, &QCheckBox::stateChanged, receiver, \
+            [receiver](int s) { receiver->slot(static_cast<Qt::CheckState>(s)); })
+#else
+#define CONNECT_CHECK_STATE(checkbox, receiver, slot) \
+    connect(checkbox, &QCheckBox::checkStateChanged, receiver, &std::remove_pointer_t<decltype(receiver)>::slot)
+#endif
+
 #include <QStandardItem>
 #include <stdexcept>
 #include <vector>
@@ -122,7 +133,7 @@ void CPointCollectionWidget::setupUi()
 
     layout->addWidget(_collection_metadata_group);
  
-    connect(_absolute_winding_checkbox, &QCheckBox::stateChanged, this, &CPointCollectionWidget::onAbsoluteWindingChanged);
+    CONNECT_CHECK_STATE(_absolute_winding_checkbox, this, onAbsoluteWindingChanged);
     connect(_color_button, &QPushButton::clicked, this, &CPointCollectionWidget::onColorButtonClicked);
     connect(_fill_winding_plus_button, &QPushButton::clicked, this, &CPointCollectionWidget::onFillWindingPlusClicked);
     connect(_fill_winding_minus_button, &QPushButton::clicked, this, &CPointCollectionWidget::onFillWindingMinusClicked);
@@ -150,7 +161,7 @@ void CPointCollectionWidget::setupUi()
 
     layout->addWidget(_point_metadata_group);
  
-    connect(_winding_enabled_checkbox, &QCheckBox::stateChanged, this, &CPointCollectionWidget::onWindingEnabledChanged);
+    CONNECT_CHECK_STATE(_winding_enabled_checkbox, this, onWindingEnabledChanged);
     connect(_winding_spinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CPointCollectionWidget::onWindingEdited);
  
     layout->addStretch();
