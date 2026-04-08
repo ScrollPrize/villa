@@ -15,7 +15,8 @@ from vesuvius.neural_tracing.autoreg_mesh.infer import infer_autoreg_mesh
 from vesuvius.neural_tracing.autoreg_mesh.losses import compute_autoreg_mesh_losses
 from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
 from vesuvius.neural_tracing.autoreg_mesh.serialization import serialize_split_conditioning_example
-from vesuvius.neural_tracing.autoreg_mesh.train import run_autoreg_mesh_training
+from vesuvius.neural_tracing.autoreg_mesh.train import _restrict_dataset_samples, run_autoreg_mesh_training
+from vesuvius.neural_tracing.datasets.triplet_resampling import choose_replacement_index
 
 
 def _tiny_dinovol_model_config() -> dict:
@@ -185,6 +186,24 @@ class _ListDataset(Dataset):
         return self.items[int(idx)]
 
 
+class _ResamplingSampleIndexDataset(Dataset):
+    def __init__(self, items) -> None:
+        self.sample_index = list(items)
+
+    def __len__(self) -> int:
+        return len(self.sample_index)
+
+    def __getitem__(self, idx: int):
+        idx = int(idx)
+        value = self.sample_index[idx]
+        if value == (0, 0):
+            replacement = choose_replacement_index(self.sample_index, attempted_indices={idx})
+            if replacement is None:
+                raise RuntimeError("failed to resample")
+            return self[int(replacement)]
+        return {"value": value}
+
+
 class _FakeWandbImage:
     def __init__(self, data, caption=None) -> None:
         self.data = np.asarray(data)
@@ -333,6 +352,14 @@ def test_autoreg_mesh_validation_metrics_are_logged_in_history(tmp_path: Path) -
     assert "val_coarse_loss" in result["history"][0]
     assert "val_offset_loss" in result["history"][0]
     assert "val_stop_loss" in result["history"][0]
+
+
+def test_restrict_dataset_samples_prevents_cross_split_resampling() -> None:
+    train_dataset = _restrict_dataset_samples(_ResamplingSampleIndexDataset([(0, 0), (1, 0), (2, 0)]), [0, 1])
+    val_dataset = _restrict_dataset_samples(_ResamplingSampleIndexDataset([(0, 0), (1, 0), (2, 0)]), [0, 2])
+
+    assert train_dataset[0]["value"] == (1, 0)
+    assert val_dataset[0]["value"] == (2, 0)
 
 
 def test_autoreg_mesh_wandb_logging_includes_metrics_and_images(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

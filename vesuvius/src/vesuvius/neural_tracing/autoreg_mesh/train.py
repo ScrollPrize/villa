@@ -52,19 +52,49 @@ def _next_batch(iterator, dataloader):
     return batch, iterator
 
 
-def _split_dataset(dataset: Dataset, *, seed: int, val_fraction: float) -> tuple[Dataset, Dataset | None]:
-    total = len(dataset)
-    if total <= 0:
+def _split_indices(num_items: int, *, seed: int, val_fraction: float) -> tuple[list[int], list[int]]:
+    if num_items <= 0:
         raise ValueError("autoreg_mesh training requires a non-empty dataset")
-    if total < 2 or float(val_fraction) <= 0.0:
-        return dataset, None
+    if num_items < 2 or float(val_fraction) <= 0.0:
+        return list(range(num_items)), []
 
-    num_val = int(round(total * float(val_fraction)))
-    num_val = max(1, min(num_val, total - 1))
+    num_val = int(round(num_items * float(val_fraction)))
+    num_val = max(1, min(num_val, num_items - 1))
     rng = np.random.default_rng(int(seed))
-    indices = rng.permutation(total)
-    val_indices = indices[:num_val].tolist()
-    train_indices = indices[num_val:].tolist()
+    indices = rng.permutation(num_items).tolist()
+    return indices[num_val:], indices[:num_val]
+
+
+def _restrict_dataset_samples(dataset: Dataset, selected_indices: list[int]) -> Dataset:
+    if not hasattr(dataset, "sample_index"):
+        raise TypeError("dataset does not expose sample_index for in-place split restriction")
+    dataset.sample_index = [dataset.sample_index[int(i)] for i in selected_indices]
+    return dataset
+
+
+def _clone_autoreg_mesh_dataset(cfg: dict, patch_metadata) -> AutoregMeshDataset:
+    return AutoregMeshDataset(
+        cfg,
+        patch_metadata=patch_metadata,
+        apply_augmentation=False,
+        apply_perturbation=False,
+    )
+
+
+def _split_dataset(dataset: Dataset, *, cfg: dict, seed: int, val_fraction: float) -> tuple[Dataset, Dataset | None]:
+    total = len(dataset)
+    train_indices, val_indices = _split_indices(total, seed=seed, val_fraction=val_fraction)
+
+    if isinstance(dataset, AutoregMeshDataset):
+        patch_metadata = dataset.export_patch_metadata()
+        train_dataset = _restrict_dataset_samples(_clone_autoreg_mesh_dataset(cfg, patch_metadata), train_indices)
+        if not val_indices:
+            return train_dataset, None
+        val_dataset = _restrict_dataset_samples(_clone_autoreg_mesh_dataset(cfg, patch_metadata), val_indices)
+        return train_dataset, val_dataset
+
+    if not val_indices:
+        return dataset, None
     return Subset(dataset, train_indices), Subset(dataset, val_indices)
 
 
@@ -418,6 +448,7 @@ def run_autoreg_mesh_training(
         dataset = AutoregMeshDataset(cfg)
     train_dataset, val_dataset = _split_dataset(
         dataset,
+        cfg=cfg,
         seed=int(cfg["seed"]),
         val_fraction=float(cfg.get("val_fraction", 0.0)),
     )
