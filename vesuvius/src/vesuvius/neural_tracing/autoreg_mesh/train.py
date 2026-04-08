@@ -190,35 +190,125 @@ def _as_numpy_grid(grid) -> np.ndarray:
     return np.asarray(grid, dtype=np.float32)
 
 
-def _voxelize_grid_projection(grid_local: np.ndarray, crop_shape: tuple[int, int, int]) -> np.ndarray:
-    coords = np.asarray(grid_local, dtype=np.float32).reshape(-1, 3)
-    finite = np.isfinite(coords).all(axis=1)
-    coords = coords[finite]
-    vox = np.zeros(crop_shape, dtype=np.float32)
-    if coords.size > 0:
-        rounded = np.rint(coords).astype(np.int64, copy=False)
-        for axis, dim in enumerate(crop_shape):
-            rounded[:, axis] = np.clip(rounded[:, axis], 0, int(dim) - 1)
-        vox[rounded[:, 0], rounded[:, 1], rounded[:, 2]] = 1.0
-    projections = [
-        vox.max(axis=2),
-        vox.max(axis=1),
-        vox.max(axis=0),
+def _draw_line_2d(canvas: np.ndarray, r0: int, c0: int, r1: int, c1: int) -> None:
+    dr = abs(r1 - r0)
+    dc = abs(c1 - c0)
+    sr = 1 if r0 < r1 else -1
+    sc = 1 if c0 < c1 else -1
+    err = dc - dr
+
+    while True:
+        if 0 <= r0 < canvas.shape[0] and 0 <= c0 < canvas.shape[1]:
+            canvas[r0, c0] = 1.0
+        if r0 == r1 and c0 == c1:
+            break
+        err2 = 2 * err
+        if err2 > -dr:
+            err -= dr
+            c0 += sc
+        if err2 < dc:
+            err += dc
+            r0 += sr
+
+
+def _render_surface_projection(
+    grid_local: np.ndarray,
+    *,
+    axes: tuple[int, int],
+    panel_shape: tuple[int, int],
+) -> np.ndarray:
+    grid = np.asarray(grid_local, dtype=np.float32)
+    panel = np.zeros(panel_shape, dtype=np.float32)
+    valid = np.isfinite(grid).all(axis=-1)
+
+    def _project(point: np.ndarray) -> tuple[int, int]:
+        row = int(np.clip(np.rint(point[axes[0]]), 0, panel_shape[0] - 1))
+        col = int(np.clip(np.rint(point[axes[1]]), 0, panel_shape[1] - 1))
+        return row, col
+
+    rows, cols = grid.shape[:2]
+    for row_idx in range(rows):
+        for col_idx in range(cols):
+            if not valid[row_idx, col_idx]:
+                continue
+            r0, c0 = _project(grid[row_idx, col_idx])
+            panel[r0, c0] = 1.0
+            if col_idx + 1 < cols and valid[row_idx, col_idx + 1]:
+                r1, c1 = _project(grid[row_idx, col_idx + 1])
+                _draw_line_2d(panel, r0, c0, r1, c1)
+            if row_idx + 1 < rows and valid[row_idx + 1, col_idx]:
+                r1, c1 = _project(grid[row_idx + 1, col_idx])
+                _draw_line_2d(panel, r0, c0, r1, c1)
+    return panel
+
+
+def _voxelize_grid_projection_panels(grid_local: np.ndarray, crop_shape: tuple[int, int, int]) -> list[tuple[str, np.ndarray]]:
+    return [
+        ("ZY", _render_surface_projection(grid_local, axes=(0, 1), panel_shape=(crop_shape[0], crop_shape[1]))),
+        ("ZX", _render_surface_projection(grid_local, axes=(0, 2), panel_shape=(crop_shape[0], crop_shape[2]))),
+        ("YX", _render_surface_projection(grid_local, axes=(1, 2), panel_shape=(crop_shape[1], crop_shape[2]))),
     ]
-    target_height = max(int(panel.shape[0]) for panel in projections)
-    padded = []
-    for panel in projections:
-        if panel.shape[0] < target_height:
-            pad_rows = target_height - int(panel.shape[0])
-            panel = np.pad(panel, ((0, pad_rows), (0, 0)), mode="constant")
-        padded.append(panel)
-    return np.concatenate(padded, axis=1)
 
 
-def _panel_to_rgb(panel: np.ndarray) -> np.ndarray:
+def _panel_to_rgb(panel: np.ndarray, *, color: tuple[int, int, int]) -> np.ndarray:
     clipped = np.clip(panel, 0.0, 1.0)
-    image = (clipped * 255.0).astype(np.uint8)
-    return np.repeat(image[..., None], 3, axis=-1)
+    image = np.zeros((*clipped.shape, 3), dtype=np.uint8)
+    for channel, value in enumerate(color):
+        image[..., channel] = (clipped * float(value)).astype(np.uint8)
+    return image
+
+
+def _pad_panel_height(panel: np.ndarray, *, height: int) -> np.ndarray:
+    if int(panel.shape[0]) >= int(height):
+        return panel
+    pad_rows = int(height) - int(panel.shape[0])
+    return np.pad(panel, ((0, pad_rows), (0, 0)), mode="constant")
+
+
+def _add_header(canvas: np.ndarray, *, title: str, labels: list[str], background: tuple[int, int, int]) -> np.ndarray:
+    from PIL import Image, ImageDraw, ImageFont
+
+    header_height = 22
+    header = np.zeros((header_height, canvas.shape[1], 3), dtype=np.uint8)
+    header[..., 0] = background[0]
+    header[..., 1] = background[1]
+    header[..., 2] = background[2]
+    image = Image.fromarray(header)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    draw.text((6, 5), title, fill=(255, 255, 255), font=font)
+
+    panel_width = canvas.shape[1] // len(labels)
+    for idx, label in enumerate(labels):
+        x = idx * panel_width + max(6, panel_width // 2 - 12)
+        draw.text((x, 5), label, fill=(230, 230, 230), font=font)
+    return np.concatenate([np.asarray(image, dtype=np.uint8), canvas], axis=0)
+
+
+def _make_labeled_triptych(
+    *,
+    grid_local: np.ndarray,
+    crop_shape: tuple[int, int, int],
+    title: str,
+    color: tuple[int, int, int],
+) -> np.ndarray:
+    projection_panels = _voxelize_grid_projection_panels(grid_local, crop_shape)
+    target_height = max(int(panel.shape[0]) for _, panel in projection_panels)
+    rgb_panels = [
+        _panel_to_rgb(_pad_panel_height(panel, height=target_height), color=color)
+        for _, panel in projection_panels
+    ]
+    separator = np.full((target_height, 3, 3), 28, dtype=np.uint8)
+    body = np.concatenate(
+        [rgb_panels[0], separator, rgb_panels[1], separator.copy(), rgb_panels[2]],
+        axis=1,
+    )
+    return _add_header(
+        body,
+        title=title,
+        labels=[name for name, _ in projection_panels],
+        background=tuple(max(12, int(value * 0.18)) for value in color),
+    )
 
 
 def _make_projection_canvas(
@@ -228,10 +318,29 @@ def _make_projection_canvas(
     pred_grid_local: np.ndarray,
     crop_shape: tuple[int, int, int],
 ) -> np.ndarray:
-    prompt_panel = _panel_to_rgb(_voxelize_grid_projection(prompt_grid_local, crop_shape))
-    target_panel = _panel_to_rgb(_voxelize_grid_projection(target_grid_local, crop_shape))
-    pred_panel = _panel_to_rgb(_voxelize_grid_projection(pred_grid_local, crop_shape))
-    separator = np.full((prompt_panel.shape[0], 4, 3), 32, dtype=np.uint8)
+    prompt_panel = _make_labeled_triptych(
+        grid_local=prompt_grid_local,
+        crop_shape=crop_shape,
+        title="Prompt",
+        color=(90, 180, 255),
+    )
+    target_panel = _make_labeled_triptych(
+        grid_local=target_grid_local,
+        crop_shape=crop_shape,
+        title="Target",
+        color=(110, 235, 110),
+    )
+    pred_panel = _make_labeled_triptych(
+        grid_local=pred_grid_local,
+        crop_shape=crop_shape,
+        title="Prediction",
+        color=(255, 190, 90),
+    )
+    target_height = max(int(prompt_panel.shape[0]), int(target_panel.shape[0]), int(pred_panel.shape[0]))
+    prompt_panel = _pad_panel_height(prompt_panel, height=target_height)
+    target_panel = _pad_panel_height(target_panel, height=target_height)
+    pred_panel = _pad_panel_height(pred_panel, height=target_height)
+    separator = np.full((target_height, 8, 3), 24, dtype=np.uint8)
     return np.concatenate([prompt_panel, separator, target_panel, separator.copy(), pred_panel], axis=1)
 
 
