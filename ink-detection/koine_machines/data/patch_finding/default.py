@@ -34,6 +34,13 @@ def _labeled_patch_coverage(label_patch) -> float:
     return float(labeled_area) / float(patch.size)
 
 
+def _nonzero_patch_coverage(image_patch) -> float:
+    patch = np.asarray(image_patch)
+    if patch.size == 0:
+        return 0.0
+    return float(np.count_nonzero(patch)) / float(patch.size)
+
+
 def find_segment_patches(segment, patch_cls):
     volume_auth = segment.config.get("volume_auth_json")
     patch_size = tuple(int(v) for v in segment.patch_size)
@@ -111,4 +118,74 @@ def find_segment_patches(segment, patch_cls):
     return training_patches, validation_patches
 
 
-__all__ = ["find_segment_patches"]
+def find_segment_unlabeled_patches(segment, patch_cls):
+    volume_auth = segment.config.get("volume_auth_json")
+    patch_size = tuple(int(v) for v in segment.patch_size)
+    min_data_coverage = float(segment.config.get("unlabeled_patch_min_data_coverage", 0.15))
+
+    image_volume = open_zarr(segment.image_volume, resolution=segment.scale, auth=volume_auth)
+    supervision_mask = None
+    if segment.supervision_mask is not None:
+        supervision_mask = open_zarr(segment.supervision_mask, resolution=segment.scale, auth=volume_auth)
+    validation_mask = None
+    if segment.validation_mask is not None:
+        validation_mask = open_zarr(segment.validation_mask, resolution=segment.scale, auth=volume_auth)
+
+    surface = int(image_volume.shape[0] // 2)
+    surface_slice = np.asarray(image_volume[surface])
+    ys, xs = np.nonzero(surface_slice)
+    if len(ys) == 0:
+        raise ValueError(f"{segment.image_volume} contains no nonzero projected data")
+
+    stride = int(patch_size[1] * float(segment.config["patch_overlap"]))
+    if stride <= 0:
+        raise ValueError(f"patch_overlap produced non-positive stride={stride}")
+
+    patch_corners_top_left = np.unique(
+        np.stack([ys // stride * stride, xs // stride * stride], axis=1),
+        axis=0,
+    )
+
+    training_patches = []
+    for y0, x0 in patch_corners_top_left.tolist():
+        patch_bbox_zyx = _surface_patch_bbox(surface, int(y0), int(x0), patch_size)
+        image_patch = image_volume[
+            surface,
+            int(y0):int(y0) + patch_size[1],
+            int(x0):int(x0) + patch_size[2],
+        ]
+        if _nonzero_patch_coverage(image_patch) < min_data_coverage:
+            continue
+
+        if supervision_mask is not None:
+            supervision_patch = supervision_mask[
+                surface,
+                int(y0):int(y0) + patch_size[1],
+                int(x0):int(x0) + patch_size[2],
+            ]
+            if np.any(supervision_patch):
+                continue
+        if validation_mask is not None:
+            validation_patch = validation_mask[
+                surface,
+                int(y0):int(y0) + patch_size[1],
+                int(x0):int(x0) + patch_size[2],
+            ]
+            if np.any(validation_patch):
+                continue
+
+        training_patches.append(
+            patch_cls(
+                segment=segment,
+                bbox=patch_bbox_zyx,
+                is_unlabeled=True,
+            )
+        )
+
+    if len(training_patches) == 0:
+        raise ValueError(f"{segment.image_volume} produced no valid unlabeled patches")
+
+    return training_patches, []
+
+
+__all__ = ["find_segment_patches", "find_segment_unlabeled_patches"]

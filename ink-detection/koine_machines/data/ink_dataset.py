@@ -23,9 +23,11 @@ from koine_machines.data.patch import Patch
 from koine_machines.data.normal_pooled_sample import (
     _build_normal_pooled_flat_metadata,
     _filter_support_components_by_active_supervision,
+    _project_flat_patch_to_native_crop,
     _pack_normal_pooled_augmentation_data,
     _project_flat_labels_and_supervision_to_native_crop,
     _project_valid_surface_mask_to_native_crop,
+    _select_flat_pixels_for_native_crop,
     _restore_normal_pooled_augmentation_data,
     _select_flat_pixels_for_native_crop_via_stored_resolution,
     _slice_support_halo_for_subwindow,
@@ -81,7 +83,11 @@ class InkDataset(Dataset):
         self.debug            = debug
         self.config           = config
         self.patch_size       = config['patch_size']
-        self.datasets         = config['datasets']
+        self.discovery_mode   = str(config.get('patch_discovery_mode', 'labeled')).strip().lower()
+        if self.discovery_mode == 'unlabeled':
+            self.datasets = list(config.get('unlabeled_datasets') or [])
+        else:
+            self.datasets = list(config['datasets'])
         self.vol_auth         = config.get('volume_auth_json')
         self.num_workers      = config.get('dataloader_workers', 8)
         self.mode             = str(config.get('mode', 'flat')).strip().lower()
@@ -89,6 +95,7 @@ class InkDataset(Dataset):
         self.input_channels   = 1 + int(_is_native_3d_mode(self.mode))
         self.training_patches = []
         self.validation_patches = []
+        self.unlabeled_patches = []
         self._zarr_cache = {}
         self._tifxyz_cache = {}
         self._stored_resolution_zyx_cache = {}
@@ -132,10 +139,14 @@ class InkDataset(Dataset):
                         segment=segment,
                         bbox=tuple(record['bbox']),
                         is_validation=bool(record.get('is_validation', False)),
+                        is_unlabeled=bool(record.get('is_unlabeled', False)),
                         supervision_mask_override=record.get('active_supervision_mask_path') or None,
                     )
                     cached_patches.append(patch)
-                    if patch.is_validation:
+                    if patch.is_unlabeled:
+                        self.unlabeled_patches.append(patch)
+                        self.training_patches.append(patch)
+                    elif patch.is_validation:
                         self.validation_patches.append(patch)
                     else:
                         self.training_patches.append(patch)
@@ -152,12 +163,17 @@ class InkDataset(Dataset):
                 for training_patches, validation_patches in tqdm(pool.map(_process_segment, segments), total=len(segments), desc='Finding patches'):
                     self.training_patches.extend(training_patches)
                     self.validation_patches.extend(validation_patches)
+            self.unlabeled_patches = [patch for patch in self.training_patches if getattr(patch, 'is_unlabeled', False)]
             self.patches = self.training_patches + self.validation_patches
             save_flat_patch_cache(cache_path, self.patches)
         else:
             self.patches = list(patches)
-            self.training_patches = [patch for patch in self.patches if not getattr(patch, 'is_validation', False)]
+            self.training_patches = [
+                patch for patch in self.patches
+                if not getattr(patch, 'is_validation', False)
+            ]
             self.validation_patches = [patch for patch in self.patches if getattr(patch, 'is_validation', False)]
+            self.unlabeled_patches = [patch for patch in self.patches if getattr(patch, 'is_unlabeled', False)]
 
     def _get_cached_zarr(self, path, *, resolution):
         cache_key = (str(path), str(resolution), str(self.vol_auth))
@@ -217,7 +233,13 @@ class InkDataset(Dataset):
                     segment_dir=tifxyz_folder,
                     segment_name=tifxyz_folder.name,
                 )
-                inklabels, supervision_mask, validation_mask = segment.discover_labels(extension='.zarr')
+                if self.discovery_mode == 'unlabeled':
+                    inklabels, supervision_mask, validation_mask = segment.discover_labels(
+                        extension='.zarr',
+                        required=False,
+                    )
+                else:
+                    inklabels, supervision_mask, validation_mask = segment.discover_labels(extension='.zarr')
 
                 if self.debug:
                     print(image_volume)
@@ -225,10 +247,29 @@ class InkDataset(Dataset):
                     print(inklabels)
                     print(validation_mask)
 
-                if not (image_volume.exists() and supervision_mask.exists() and inklabels.exists()):
+                if not image_volume.exists():
+                    raise ValueError(f"{tifxyz_folder.name} is missing its image volume")
+                if self.discovery_mode != 'unlabeled' and not (
+                    supervision_mask is not None
+                    and inklabels is not None
+                    and supervision_mask.exists()
+                    and inklabels.exists()
+                ):
                     raise ValueError(f"{tifxyz_folder.name} is missing required data. make sure the image volume, supervision mask, and labels exist")
 
                 yield segment
+
+    def get_labeled_unlabeled_patch_indices(self):
+        labeled_indices = []
+        unlabeled_indices = []
+        for patch_idx, patch in enumerate(self.patches):
+            if getattr(patch, 'is_validation', False):
+                continue
+            if getattr(patch, 'is_unlabeled', False):
+                unlabeled_indices.append(int(patch_idx))
+            else:
+                labeled_indices.append(int(patch_idx))
+        return labeled_indices, unlabeled_indices
 
     def __len__(self):
         return len(self.patches)
@@ -409,22 +450,26 @@ class InkDataset(Dataset):
             # for pooled 2d, this is the only block that applies (outside of potential resampling)
             else:
                 image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
-                supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
-                inklabels = self._get_cached_zarr(patch.inklabels, resolution=patch.segment.scale)
-                validation_mask = None
-                if (not patch.is_validation) and patch.segment.validation_mask is not None:
-                    validation_mask = self._get_cached_zarr(patch.segment.validation_mask,resolution=patch.segment.scale)
-                    
                 image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, patch.bbox, fill_value=0)
-                supervision_crop, _ = _read_bbox_with_padding(supervision_mask, patch.bbox, fill_value=0)
-                if validation_mask is not None:
-                    validation_crop, _ = _read_bbox_with_padding(validation_mask, patch.bbox, fill_value=0)
-                    supervision_crop = _exclude_validation_voxels_from_training_supervision(
-                        supervision_crop,
-                        validation_crop,
-                        is_validation_patch=patch.is_validation,
-                    )
-                inklabels_crop, _ = _read_bbox_with_padding(inklabels, patch.bbox, fill_value=0)
+                if getattr(patch, 'is_unlabeled', False):
+                    supervision_crop = np.zeros(expected_shape, dtype=np.uint8)
+                    inklabels_crop = np.zeros(expected_shape, dtype=np.uint8)
+                else:
+                    supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
+                    inklabels = self._get_cached_zarr(patch.inklabels, resolution=patch.segment.scale)
+                    validation_mask = None
+                    if (not patch.is_validation) and patch.segment.validation_mask is not None:
+                        validation_mask = self._get_cached_zarr(patch.segment.validation_mask,resolution=patch.segment.scale)
+                        
+                    supervision_crop, _ = _read_bbox_with_padding(supervision_mask, patch.bbox, fill_value=0)
+                    if validation_mask is not None:
+                        validation_crop, _ = _read_bbox_with_padding(validation_mask, patch.bbox, fill_value=0)
+                        supervision_crop = _exclude_validation_voxels_from_training_supervision(
+                            supervision_crop,
+                            validation_crop,
+                            is_validation_patch=patch.is_validation,
+                        )
+                    inklabels_crop, _ = _read_bbox_with_padding(inklabels, patch.bbox, fill_value=0)
 
             if resample_idx is None:
                 image_crop = image_crop.astype(np.float32, copy=False)
@@ -478,6 +523,9 @@ class InkDataset(Dataset):
                         result = self.augmentations(**augmentation_data)
                 else:
                     result = data
+
+            if isinstance(result, dict):
+                result['is_unlabeled'] = torch.tensor(bool(getattr(patch, 'is_unlabeled', False)), dtype=torch.bool)
 
             if resample_idx is not None:
                 warnings.warn(

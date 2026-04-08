@@ -6,7 +6,7 @@ import fsspec
 import numpy as np
 import zarr
 
-_FLAT_PATCH_FINDING_CACHE_VERSION = "v2"
+_FLAT_PATCH_FINDING_CACHE_VERSION = "v3"
 
 
 def load_volume_auth(auth_json_path):
@@ -30,13 +30,15 @@ def flat_patch_cache_path(config):
         patch_size_key = "x".join(str(int(v)) for v in patch_size)
     version_key = label_version_cache_token(config.get("label_version"))
     patch_finding_key = flat_patch_finding_cache_token(config)
+    discovery_mode = str(config.get("patch_discovery_mode", "labeled")).strip().lower() or "labeled"
     return Path(config.get("out_dir", ".")) / (
-        f"flat_ink_patches_pf-{patch_finding_key}_ps-{patch_size_key}_labels-{version_key}.json"
+        f"flat_ink_patches_dm-{discovery_mode}_pf-{patch_finding_key}_ps-{patch_size_key}_labels-{version_key}.json"
     )
 
 
 def flat_patch_finding_cache_token(config):
     patch_finding_type = str(config.get("patch_finding_type", "default")).strip().lower() or "default"
+    discovery_mode = str(config.get("patch_discovery_mode", "labeled")).strip().lower() or "labeled"
     patch_size = config.get("patch_size", ())
     if isinstance(patch_size, int):
         patch_dims = [int(patch_size)]
@@ -51,11 +53,17 @@ def flat_patch_finding_cache_token(config):
         stride = int(config.get("patch_finding_stride", default_stride))
         filter_empty_tile = int(bool(config.get("patch_finding_filter_empty_tile", False)))
         return (
-            f"subtiling-{_FLAT_PATCH_FINDING_CACHE_VERSION}"
+            f"{discovery_mode}-subtiling-{_FLAT_PATCH_FINDING_CACHE_VERSION}"
             f"-ts-{tile_size}_st-{stride}_fe-{filter_empty_tile}"
         )
 
-    return f"default-{_FLAT_PATCH_FINDING_CACHE_VERSION}-po-{config.get('patch_overlap', '')}"
+    if discovery_mode == "unlabeled":
+        return (
+            f"unlabeled-default-{_FLAT_PATCH_FINDING_CACHE_VERSION}"
+            f"-po-{config.get('patch_overlap', '')}"
+            f"-mdc-{config.get('unlabeled_patch_min_data_coverage', 0.15)}"
+        )
+    return f"labeled-default-{_FLAT_PATCH_FINDING_CACHE_VERSION}-po-{config.get('patch_overlap', '')}"
 
 
 def save_flat_patch_cache(path, patches):
@@ -68,14 +76,23 @@ def save_flat_patch_cache(path, patches):
                     "dataset_idx": int(patch.segment.dataset_idx),
                     "segment_relpath": str(patch.segment.segment_relpath),
                     "scale": patch.segment.scale,
-                    "inklabels_path": str(patch.segment.inklabels),
-                    "supervision_mask_path": str(patch.segment.supervision_mask),
+                    "inklabels_path": (
+                        "" if getattr(patch.segment, "inklabels", None) is None
+                        else str(patch.segment.inklabels)
+                    ),
+                    "supervision_mask_path": (
+                        "" if getattr(patch.segment, "supervision_mask", None) is None
+                        else str(patch.segment.supervision_mask)
+                    ),
                     "validation_mask_path": (
                         "" if getattr(patch.segment, "validation_mask", None) is None
                         else str(patch.segment.validation_mask)
                     ),
-                    "active_supervision_mask_path": str(patch.supervision_mask),
+                    "active_supervision_mask_path": (
+                        "" if patch.supervision_mask is None else str(patch.supervision_mask)
+                    ),
                     "is_validation": bool(getattr(patch, "is_validation", False)),
+                    "is_unlabeled": bool(getattr(patch, "is_unlabeled", False)),
                     "patch_finding_key": flat_patch_finding_cache_token(
                         getattr(patch.segment, "config", {})
                     ),

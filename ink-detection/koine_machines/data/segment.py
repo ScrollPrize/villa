@@ -152,12 +152,12 @@ class Segment:
             int(self.dataset_idx),
             str(self.segment_relpath),
             self.scale,
-            str(self.inklabels),
-            str(self.supervision_mask),
+            "" if self.inklabels is None else str(self.inklabels),
+            "" if self.supervision_mask is None else str(self.supervision_mask),
             "" if self.validation_mask is None else str(self.validation_mask),
         )
     
-    def discover_labels(self, *, label_version=None, extension=".zarr"):
+    def discover_labels(self, *, label_version=None, extension=".zarr", required=True):
         if self.segment_dir is None:
             raise ValueError("segment_dir is required for local label discovery")
 
@@ -195,23 +195,38 @@ class Segment:
                 if f"v{version_num}" == requested_version:
                     selected = record
                     break
-            assert selected is not None, (
-                f"{self.segment_dir} does not contain matching {normalized_extension} labels "
-                f"for version {requested_version}."
-            )
-            inklabels = selected["inklabels"]
-            supervision_mask = selected["supervision_mask"]
-            validation_mask = selected.get("validation_mask")
+            if selected is None:
+                if required:
+                    raise AssertionError(
+                        f"{self.segment_dir} does not contain matching {normalized_extension} labels "
+                        f"for version {requested_version}."
+                    )
+                inklabels = None
+                supervision_mask = None
+                validation_mask = None
+            else:
+                inklabels = selected["inklabels"]
+                supervision_mask = selected["supervision_mask"]
+                validation_mask = selected.get("validation_mask")
         else:
-            assert candidates_by_kind["inklabels"], (
-                f"{self.segment_dir} must contain at least one inklabels {normalized_extension} asset."
-            )
-            assert candidates_by_kind["supervision_mask"], (
-                f"{self.segment_dir} must contain at least one supervision_mask {normalized_extension} asset."
-            )
+            if required:
+                assert candidates_by_kind["inklabels"], (
+                    f"{self.segment_dir} must contain at least one inklabels {normalized_extension} asset."
+                )
+                assert candidates_by_kind["supervision_mask"], (
+                    f"{self.segment_dir} must contain at least one supervision_mask {normalized_extension} asset."
+                )
             validation_candidates = candidates_by_kind["validation_mask"]
-            inklabels = candidates_by_kind["inklabels"][max(candidates_by_kind["inklabels"])]
-            supervision_mask = candidates_by_kind["supervision_mask"][max(candidates_by_kind["supervision_mask"])]
+            inklabels = (
+                candidates_by_kind["inklabels"][max(candidates_by_kind["inklabels"])]
+                if candidates_by_kind["inklabels"]
+                else None
+            )
+            supervision_mask = (
+                candidates_by_kind["supervision_mask"][max(candidates_by_kind["supervision_mask"])]
+                if candidates_by_kind["supervision_mask"]
+                else None
+            )
             validation_mask = (
                 validation_candidates[max(validation_candidates)] if validation_candidates else None
             )
@@ -222,10 +237,17 @@ class Segment:
         return inklabels, supervision_mask, validation_mask
     
     def _find_patches(self):
-        from koine_machines.data.patch_finding.default import find_segment_patches
+        from koine_machines.data.patch_finding.default import (
+            find_segment_patches,
+            find_segment_unlabeled_patches,
+        )
         from koine_machines.data.patch import Patch
 
-        training_patches, validation_patches = find_segment_patches(self, Patch)
+        patch_discovery_mode = str(self.config.get("patch_discovery_mode", "labeled")).strip().lower()
+        if patch_discovery_mode == "unlabeled":
+            training_patches, validation_patches = find_segment_unlabeled_patches(self, Patch)
+        else:
+            training_patches, validation_patches = find_segment_patches(self, Patch)
         self.training_patches = training_patches
         self.validation_patches = validation_patches
         self.patches = training_patches + validation_patches
