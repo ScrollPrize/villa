@@ -57,6 +57,15 @@ _NATIVE_3D_TRAINING_MODES = {"normal_pooled_3d", "full_3d"}
 def _is_native_3d_training_mode(mode):
     return str(mode).strip().lower() in _NATIVE_3D_TRAINING_MODES
 
+
+def _disable_z_projection_for_normal_pooled_3d(config):
+    config.setdefault('model_config', {})['z_projection_mode'] = 'none'
+    for target_info in (config.get('targets') or {}).values():
+        if isinstance(target_info, dict):
+            target_info['z_projection_mode'] = 'none'
+            if isinstance(target_info.get('z_projection'), dict):
+                target_info['z_projection']['mode'] = 'none'
+
 def _build_full_3d_preview_batch(
     batch: dict,
     preds: torch.Tensor,
@@ -160,12 +169,7 @@ def train(config_path):
     if normal_pooled_mode and model_type.startswith('resnet3d'):
         raise ValueError("normal_pooled_3d is currently only supported with the vesuvius_unet model path")
     if native_3d_mode:
-        config.setdefault('model_config', {})['z_projection_mode'] = 'none'
-        for target_info in (config.get('targets') or {}).values():
-            if isinstance(target_info, dict):
-                target_info['z_projection_mode'] = 'none'
-                if isinstance(target_info.get('z_projection'), dict):
-                    target_info['z_projection']['mode'] = 'none'
+        _disable_z_projection_for_normal_pooled_3d(config)
         config['in_channels'] = 2
 
     config.setdefault('volume_auth_json', None)

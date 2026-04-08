@@ -13,6 +13,7 @@ class Patch:
     segment: "Segment"
     bbox: tuple  # (z0, y0, x0, z1, y1, x1)
     is_validation: bool = False
+    is_unlabeled: bool = False
     supervision_mask_override: Any = None
 
     @property
