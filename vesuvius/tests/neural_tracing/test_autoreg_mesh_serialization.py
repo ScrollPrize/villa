@@ -123,6 +123,38 @@ def test_frontier_prompt_band_is_extracted_without_default_downsampling() -> Non
     np.testing.assert_allclose(full_grid, np.concatenate([expected_prompt, masked], axis=1))
 
 
+@pytest.mark.parametrize(
+    ("direction", "cond", "expected_frontier"),
+    [
+        ("left", _make_surface(3, 6), lambda cond: cond[:, -1:, :]),
+        ("right", _make_surface(3, 6), lambda cond: cond[:, :1, :]),
+        ("up", _make_surface(6, 3), lambda cond: cond[-1:, :, :]),
+        ("down", _make_surface(6, 3), lambda cond: cond[:1, :, :]),
+    ],
+)
+def test_downsample_surface_grid_preserves_true_split_frontier(
+    direction: str,
+    cond: np.ndarray,
+    expected_frontier,
+) -> None:
+    example = serialize_split_conditioning_example(
+        cond_zyxs_local=cond,
+        masked_zyxs_local=cond.copy(),
+        direction=direction,
+        volume_shape=(32, 32, 32),
+        patch_size=(8, 8, 8),
+        offset_num_bins=(4, 4, 4),
+        frontier_band_width=1,
+        surface_downsample_factor=2,
+    )
+
+    np.testing.assert_allclose(example["prompt_grid_local"], expected_frontier(example["conditioning_grid_local"]))
+    if direction in {"left", "right"}:
+        assert example["conditioning_grid_local"].shape[1] >= 2
+    else:
+        assert example["conditioning_grid_local"].shape[0] >= 2
+
+
 def test_stored_surface_extraction_and_split_preserve_stored_lattice_shape() -> None:
     row_axis = np.arange(4, dtype=np.float32)[:, None]
     col_axis = np.arange(6, dtype=np.float32)[None, :]

@@ -322,10 +322,11 @@ class AutoregMeshDataset(Dataset):
             },
             "prompt_meta": {
                 **serialized["prompt_meta"],
-                "conditioning_shape": tuple(int(v) for v in cond_local.shape[:2]),
+                "conditioning_shape": tuple(int(v) for v in serialized["conditioning_grid_local"].shape[:2]),
                 "sample_key": sample_key,
                 "surface_sampling_mode": "stored" if use_stored_surface else "full",
             },
+            "conditioning_grid_local": torch.from_numpy(serialized["conditioning_grid_local"]).to(torch.float32),
             "prompt_anchor_xyz": torch.from_numpy(serialized["prompt_anchor_xyz"]).to(torch.float32),
             "prompt_grid_local": torch.from_numpy(serialized["prompt_grid_local"]).to(torch.float32),
             "target_coarse_ids": torch.from_numpy(serialized["target_coarse_ids"]).to(torch.long),
@@ -415,6 +416,7 @@ def autoreg_mesh_collate(batch: list[dict]) -> dict:
         "prompt_anchor_xyz": torch.stack([item["prompt_anchor_xyz"] for item in batch], dim=0),
         "prompt_meta": [item["prompt_meta"] for item in batch],
         "wrap_metadata": [item["wrap_metadata"] for item in batch],
+        "conditioning_grid_local": [item["conditioning_grid_local"] for item in batch],
         "prompt_grid_local": [item["prompt_grid_local"] for item in batch],
         "target_grid_local": [item["target_grid_local"] for item in batch],
     }

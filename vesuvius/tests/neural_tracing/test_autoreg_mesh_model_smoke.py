@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import tifffile
 from torch.utils.data import Dataset
 
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
@@ -93,6 +94,7 @@ def _make_sample(direction: str) -> dict:
             "valid_mask": torch.from_numpy(serialized["prompt_tokens"]["valid_mask"]).to(torch.bool),
         },
         "prompt_meta": serialized["prompt_meta"],
+        "conditioning_grid_local": torch.from_numpy(serialized["conditioning_grid_local"]).to(torch.float32),
         "prompt_anchor_xyz": torch.from_numpy(serialized["prompt_anchor_xyz"]).to(torch.float32),
         "prompt_grid_local": torch.from_numpy(serialized["prompt_grid_local"]).to(torch.float32),
         "target_coarse_ids": torch.from_numpy(serialized["target_coarse_ids"]).to(torch.long),
@@ -297,13 +299,25 @@ def test_autoreg_mesh_inference_reconstructs_lattice(tmp_path: Path) -> None:
         max_steps=int(sample["target_coarse_ids"].shape[0]),
         stop_probability_threshold=1.1,
         greedy=True,
+        save_path=tmp_path,
     )
 
     target_shape = tuple(int(v) for v in sample["target_grid_shape"].tolist())
+    conditioning_shape = tuple(int(v) for v in sample["conditioning_grid_local"].shape[:2])
     assert result["predicted_continuation_vertices_local"].shape[0] == int(sample["target_coarse_ids"].shape[0])
     assert result["continuation_grid_local"].shape == (*target_shape, 3)
     assert result["full_grid_local"].shape[-1] == 3
-    assert result["full_grid_local"].shape[0] >= result["continuation_grid_local"].shape[0]
+    assert result["full_grid_local"].shape == (conditioning_shape[0] + target_shape[0], conditioning_shape[1], 3)
+    if sample["direction"] in {"left", "up"}:
+        merged_cond = result["full_grid_local"][: conditioning_shape[0]]
+    elif sample["direction"] in {"right", "down"}:
+        merged_cond = result["full_grid_local"][-conditioning_shape[0]:]
+    else:
+        raise AssertionError(f"unexpected direction {sample['direction']!r}")
+    np.testing.assert_allclose(merged_cond, sample["conditioning_grid_local"].numpy())
+    assert result["saved_tifxyz_path"] is not None
+    z_tif = tifffile.imread(Path(result["saved_tifxyz_path"]) / "z.tif")
+    assert tuple(z_tif.shape) == result["full_grid_local"].shape[:2]
 
 
 def test_autoreg_mesh_validation_metrics_are_logged_in_history(tmp_path: Path) -> None:

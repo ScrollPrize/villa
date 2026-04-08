@@ -69,15 +69,16 @@ def downsample_surface_grid(
     if col_indices[-1] != w - 1:
         col_indices = np.concatenate([col_indices, np.asarray([w - 1], dtype=np.int64)])
 
-    # Preserve the frontier-adjacent strip in optional ablation mode.
+    # Preserve the true split frontier so prompt extraction still references
+    # the conditioning edge after downsampling.
     if direction == "left":
-        col_indices = np.unique(np.concatenate([np.asarray([0], dtype=np.int64), col_indices]))
-    elif direction == "right":
         col_indices = np.unique(np.concatenate([col_indices, np.asarray([w - 1], dtype=np.int64)]))
+    elif direction == "right":
+        col_indices = np.unique(np.concatenate([np.asarray([0], dtype=np.int64), col_indices]))
     elif direction == "up":
-        row_indices = np.unique(np.concatenate([np.asarray([0], dtype=np.int64), row_indices]))
-    elif direction == "down":
         row_indices = np.unique(np.concatenate([row_indices, np.asarray([h - 1], dtype=np.int64)]))
+    elif direction == "down":
+        row_indices = np.unique(np.concatenate([np.asarray([0], dtype=np.int64), row_indices]))
 
     return surface[np.ix_(row_indices, col_indices)].astype(np.float32, copy=False)
 
@@ -377,10 +378,12 @@ def serialize_split_conditioning_example(
         "prompt_meta": {
             "direction": direction,
             "prompt_grid_shape": prompt_serialized["grid_shape"],
+            "conditioning_grid_shape": tuple(int(v) for v in cond.shape[:2]),
             "masked_grid_shape": target_serialized["grid_shape"],
             "frontier_band_width": int(frontier_band_width),
             "surface_downsample_factor": surface_downsample_factor,
         },
+        "conditioning_grid_local": cond,
         "prompt_grid_local": prompt_grid,
         "prompt_anchor_xyz": prompt_anchor_xyz,
         "target_coarse_ids": target_coarse_ids,

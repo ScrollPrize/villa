@@ -176,8 +176,8 @@ def infer_autoreg_mesh(
         direction=direction,
         grid_shape=target_grid_shape,
     )
-    prompt_grid_local = batch["prompt_grid_local"][0].detach().cpu().numpy().astype(np.float32, copy=False)
-    full_grid_local = deserialize_full_grid(prompt_grid_local, continuation_grid_local, direction=direction)
+    conditioning_grid_local = batch["conditioning_grid_local"][0].detach().cpu().numpy().astype(np.float32, copy=False)
+    full_grid_local = deserialize_full_grid(conditioning_grid_local, continuation_grid_local, direction=direction)
 
     min_corner = batch["min_corner"][0].detach().cpu().numpy().astype(np.float32, copy=False)
     predicted_xyz_world = predicted_xyz_local + min_corner[None, :]
