@@ -51,7 +51,7 @@ def _stop_loss(outputs: dict, batch: dict) -> Tensor:
     return _masked_mean(loss, batch["target_mask"])
 
 
-def _occupancy_loss(outputs: dict, batch: dict) -> Tensor:
+def _occupancy_metric(outputs: dict, batch: dict) -> Tensor:
     pred_xyz = outputs["pred_xyz"].detach().cpu()
     target_mask = batch["target_mask"].detach().cpu()
     volume = batch["volume"]
@@ -86,15 +86,16 @@ def compute_autoreg_mesh_losses(
     stop_loss = _stop_loss(outputs, batch)
     total_loss = coarse_loss + offset_loss + stop_loss
 
-    occupancy_loss = total_loss.new_zeros(())
+    occupancy_metric = total_loss.new_zeros(())
     if float(occupancy_loss_weight) > 0.0:
-        occupancy_loss = _occupancy_loss(outputs, batch)
-        total_loss = total_loss + float(occupancy_loss_weight) * occupancy_loss
+        # This metric is intentionally detached/non-differentiable; keep it out
+        # of the optimized objective until a differentiable rasterizer exists.
+        occupancy_metric = _occupancy_metric(outputs, batch)
 
     return {
         "loss": total_loss,
         "coarse_loss": coarse_loss,
         "offset_loss": offset_loss,
         "stop_loss": stop_loss,
-        "occupancy_loss": occupancy_loss,
+        "occupancy_metric": occupancy_metric,
     }

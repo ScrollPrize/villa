@@ -136,6 +136,10 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("ckpt_frequency must be positive")
     if float(cfg["grad_clip"]) <= 0.0:
         raise ValueError("grad_clip must be positive")
+    if str(cfg["mixed_precision"]).lower() != "no":
+        raise ValueError(
+            "autoreg_mesh currently does not implement mixed precision; set mixed_precision='no'"
+        )
     if cfg["out_dir"] is None or str(cfg["out_dir"]).strip() == "":
         raise ValueError("out_dir must be a non-empty path")
     if cfg.get("load_ckpt") is not None and str(cfg["load_ckpt"]).strip() == "":

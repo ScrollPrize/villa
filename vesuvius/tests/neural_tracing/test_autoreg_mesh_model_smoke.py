@@ -10,6 +10,8 @@ import tifffile
 from torch.utils.data import Dataset
 
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
+from vesuvius.neural_tracing.autoreg_mesh.benchmark import run_autoreg_mesh_benchmark
+from vesuvius.neural_tracing.autoreg_mesh.config import validate_autoreg_mesh_config
 from vesuvius.neural_tracing.autoreg_mesh.dataset import autoreg_mesh_collate
 from vesuvius.neural_tracing.autoreg_mesh.infer import infer_autoreg_mesh
 from vesuvius.neural_tracing.autoreg_mesh.losses import compute_autoreg_mesh_losses
@@ -286,6 +288,7 @@ def test_autoreg_mesh_model_forward_and_losses_are_finite(tmp_path: Path) -> Non
     assert outputs["stop_logits"].shape == batch["target_coarse_ids"].shape
     for value in losses.values():
         assert torch.isfinite(value)
+    assert "occupancy_metric" in losses
 
 
 def test_autoreg_mesh_smoke_training_runs_two_steps(tmp_path: Path) -> None:
@@ -360,6 +363,61 @@ def test_restrict_dataset_samples_prevents_cross_split_resampling() -> None:
 
     assert train_dataset[0]["value"] == (1, 0)
     assert val_dataset[0]["value"] == (2, 0)
+
+
+def test_occupancy_auxiliary_is_metric_only(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = _make_config(checkpoint)
+    model = AutoregMeshModel(config)
+
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    batch = _move_batch(batch, torch.device("cpu"))
+    outputs = model(batch)
+
+    base_losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        occupancy_loss_weight=0.0,
+    )
+    metric_losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        occupancy_loss_weight=1.0,
+    )
+
+    assert metric_losses["loss"].item() == pytest.approx(base_losses["loss"].item())
+    assert metric_losses["occupancy_metric"].item() >= 0.0
+
+
+def test_mixed_precision_is_rejected_until_supported() -> None:
+    config = _make_cached_token_config()
+    config["mixed_precision"] = "bf16"
+    with pytest.raises(ValueError, match="does not implement mixed precision"):
+        validate_autoreg_mesh_config(config)
+
+
+def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
+    config = _make_cached_token_config()
+    dataset = _make_training_dataset()
+    model = AutoregMeshModel(config).eval()
+
+    result = run_autoreg_mesh_benchmark(
+        config,
+        dataset=dataset,
+        model=model,
+        device="cpu",
+        sample_count=2,
+    )
+
+    assert result["dataset_length"] == len(dataset)
+    assert result["sample_count"] == 2
+    assert result["median_prompt_length"] > 0
+    assert result["median_target_length"] > 0
+    assert result["forward_ms"] >= 0.0
+    assert result["infer_ms"] >= 0.0
 
 
 def test_autoreg_mesh_wandb_logging_includes_metrics_and_images(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
