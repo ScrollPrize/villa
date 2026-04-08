@@ -37,9 +37,15 @@
   "optimizer": {
     "name": "adamw",
     "learning_rate": 0.0002,
-    "weight_decay": 0.0001
+    "weight_decay": 0.01,
+    "betas": [0.9, 0.95]
   },
-  "scheduler": "constant",
+  "scheduler": "cosine_warmup",
+  "scheduler_kwargs": {
+    "warmup_steps": 5000,
+    "min_lr": 1e-06,
+    "gamma": 1.0
+  },
   "grad_clip": 1.0,
   "log_frequency": 200,
   "ckpt_frequency": 10000,
