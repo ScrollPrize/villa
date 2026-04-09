@@ -32,7 +32,7 @@
   "scheduled_sampling_mode": "linear_full_token_greedy",
   "scheduled_sampling_max_prob": 0.10,
   "scheduled_sampling_start_step": 0,
-  "scheduled_sampling_ramp_steps": 50000,
+  "scheduled_sampling_ramp_steps": 5000,
   "batch_size": 16,
   "num_workers": 14,
   "val_num_workers": 2,
@@ -45,11 +45,10 @@
     "weight_decay": 0.01,
     "betas": [0.9, 0.95]
   },
-  "scheduler": "cosine_warmup",
+  "scheduler": "warmup_poly",
   "scheduler_kwargs": {
     "warmup_steps": 5000,
-    "min_lr": 1e-06,
-    "gamma": 1.0
+    "exponent": 1.0
   },
   "grad_clip": 1.0,
   "log_frequency": 200,
