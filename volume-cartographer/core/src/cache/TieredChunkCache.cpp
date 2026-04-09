@@ -1,11 +1,14 @@
 #include "vc/core/cache/TieredChunkCache.hpp"
+#include "vc/core/cache/ChunkSource.hpp"
 #include "vc/core/cache/CacheDebugLog.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <thread>
+#include <utils/video_codec.hpp>
 
 namespace vc::cache {
 
@@ -75,138 +78,190 @@ TieredChunkCache::TieredChunkCache(
     , decompress_(std::move(decompress))
     , ioPool_(config_.ioThreads)
 {
-    // Shared fetch function: check cold (disk) first, then ice (remote)
-    IOPool::FetchFunc fetchFunc = [this](const ChunkKey& key) -> std::vector<uint8_t> {
-        using Clock = std::chrono::steady_clock;
-        auto t0 = Clock::now();
+    auto* httpSource = dynamic_cast<HttpChunkSource*>(source_.get());
+    bool sharded = httpSource && httpSource->isSharded();
 
-        // Try cold (disk cache) first
-        auto* dz = (key.level < static_cast<int>(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
-        if (dz) {
-            auto diskData = zarrReadChunk(*dz, key);
-            if (diskData && !diskData->empty()) {
-                auto n = statColdHits_.fetch_add(1, std::memory_order_relaxed);
-                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
-                if (n < 10 || (n < 1000 && n % 100 == 0))
-                    std::fprintf(stderr, "[Cache] cold-hit #%lu lvl=%d (%d,%d,%d) bytes=%zu %ldms\n",
-                                 n + 1, key.level, key.iz, key.iy, key.ix, diskData->size(), ms);
-                if (auto* log = cacheDebugLog())
-                    std::fprintf(log, "FETCH cold-hit lvl=%d (%d,%d,%d) bytes=%zu %ldms\n",
-                                 key.level, key.iz, key.iy, key.ix, diskData->size(), ms);
-                // Convert std::byte → uint8_t
-                auto& bytes = *diskData;
-                return {reinterpret_cast<const uint8_t*>(bytes.data()),
-                        reinterpret_cast<const uint8_t*>(bytes.data() + bytes.size())};
-            }
-        }
+    // --- Shard mapper: ChunkKey → ShardKey ---
+    if (sharded) {
+        auto cps = httpSource->chunksPerShard();
+        ioPool_.setShardMapper([cps](const ChunkKey& key) -> ShardKey {
+            return {key.level, key.iz / cps[0], key.iy / cps[1], key.ix / cps[2]};
+        });
+    } else {
+        // Non-sharded: each chunk is its own "shard"
+        ioPool_.setShardMapper([](const ChunkKey& key) -> ShardKey {
+            return {key.level, key.iz, key.iy, key.ix};
+        });
+    }
 
-        // Fetch from ice (remote/filesystem source)
-        if (!source_) return {};
+    // --- Fetch function: ShardKey → all chunks from that shard ---
+    if (sharded) {
+        auto cps = httpSource->chunksPerShard();
+        ioPool_.setFetchFunc([this, cps](const ShardKey& shard) -> IOPool::FetchResult {
+            using Clock = std::chrono::steady_clock;
 
-        auto t1 = Clock::now();
-        std::vector<uint8_t> data;
-        try {
-            data = source_->fetch(key);
-        } catch (const std::exception& e) {
-            if (auto* log = cacheDebugLog())
-                std::fprintf(log, "FETCH ice-error lvl=%d (%d,%d,%d) %s\n",
-                             key.level, key.iz, key.iy, key.ix, e.what());
-            throw;
-        }
-        auto t2 = Clock::now();
-        auto fetchMs = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+            auto* dz = (shard.level < static_cast<int>(diskLevels_.size()))
+                ? diskLevels_[shard.level].get() : nullptr;
+            auto* http = dynamic_cast<HttpChunkSource*>(source_.get());
 
-        if (data.empty()) {
-            if (auto* log = cacheDebugLog())
-                std::fprintf(log, "FETCH ice-empty lvl=%d (%d,%d,%d) %ldms\n",
-                             key.level, key.iz, key.iy, key.ix, fetchMs);
-            return {};
-        }
+            // Ensure shard is on disk
+            if (dz) {
+                std::vector<std::size_t> shard_idx = {
+                    static_cast<std::size_t>(shard.sz),
+                    static_cast<std::size_t>(shard.sy),
+                    static_cast<std::size_t>(shard.sx)};
+                auto shard_path = dz->chunk_path(shard_idx);
 
-        // Detect all-zero chunks (zarr fill_value=0 for non-existent chunks).
-        if (isAllZero(data.data(), data.size())) {
-            if (auto* log = cacheDebugLog())
-                std::fprintf(log, "FETCH ice-allzero lvl=%d (%d,%d,%d) bytes=%zu %ldms\n",
-                             key.level, key.iz, key.iy, key.ix, data.size(), fetchMs);
-            return {};
-        }
+                if (!std::filesystem::exists(shard_path)) {
+                    auto t0 = Clock::now();
+                    auto shardBytes = http->fetchWholeShard(
+                        shard.level, shard.sz, shard.sy, shard.sx);
+                    auto fetchMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        Clock::now() - t0).count();
 
-        auto n = statIceFetches_.fetch_add(1, std::memory_order_relaxed);
-        if (n < 10 || (n < 1000 && n % 100 == 0))
-            std::fprintf(stderr, "[Cache] ice-fetch #%lu lvl=%d (%d,%d,%d) bytes=%zu %ldms\n",
-                         n + 1, key.level, key.iz, key.iy, key.ix, data.size(), fetchMs);
+                    if (!shardBytes.empty()) {
+                        std::filesystem::create_directories(shard_path.parent_path());
+                        std::ofstream f(shard_path, std::ios::binary | std::ios::trunc);
+                        f.write(reinterpret_cast<const char*>(shardBytes.data()),
+                                static_cast<std::streamsize>(shardBytes.size()));
 
-        // Store to cold (disk cache) for persistence.
-        auto* dzW = (key.level < static_cast<int>(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
-        if (dzW) {
-            zarrWriteChunk(*dzW, key, data.data(), data.size());
-            statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            static std::atomic<int> warnCount{0};
-            if (warnCount.fetch_add(1) < 5)
-                std::fprintf(stderr, "[Cache] WRITE SKIP: lvl=%d diskLevels_.size()=%zu\n",
-                             key.level, diskLevels_.size());
-        }
-
-        auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
-        if (auto* log = cacheDebugLog())
-            std::fprintf(log, "FETCH ice-ok lvl=%d (%d,%d,%d) bytes=%zu fetch=%ldms total=%ldms\n",
-                         key.level, key.iz, key.iy, key.ix, data.size(), fetchMs, totalMs);
-
-        return data;
-    };
-
-    // Shared completion callback: decompress inline on IO thread, then hotPut.
-    IOPool::CompletionCallback completionCb =
-        [this](const ChunkKey& key, std::vector<uint8_t>&& compressed) {
-            if (compressed.empty()) {
-                // Empty fetch result: negative cache (chunk doesn't exist)
-                bloomAdd(key);
-                {
-                    std::lock_guard lock(negativeMutex_);
-                    negativeCache_.insert(key);
-                }
-                // Mark empty in shard index so it persists across runs
-                auto* dz = (key.level < static_cast<int>(diskLevels_.size()))
-                    ? diskLevels_[key.level].get() : nullptr;
-                if (dz) {
-                    auto idx = chunkIndices(key);
-                    dz->mark_inner_chunk_empty(idx);
-                }
-                return;
-            }
-
-            // Decompress inline on the IO thread and put directly into hot tier
-            if (decompress_) {
-                using Clock = std::chrono::steady_clock;
-                auto t0 = Clock::now();
-                auto data = decompress_(compressed, key);
-                auto decompMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
-                if (data) {
-                    size_t decompBytes = data->totalBytes();
-                    hotPut(key, std::move(data));
-                    if (auto* log = cacheDebugLog())
-                        std::fprintf(log, "COMPLETE hot-put lvl=%d (%d,%d,%d) decompBytes=%zu decomp=%ldms\n",
-                                     key.level, key.iz, key.iy, key.ix, decompBytes, decompMs);
-                } else {
-                    if (auto* log = cacheDebugLog())
-                        std::fprintf(log, "COMPLETE decompress-fail lvl=%d (%d,%d,%d)\n",
-                                     key.level, key.iz, key.iy, key.ix);
+                        auto n = statIceFetches_.fetch_add(1, std::memory_order_relaxed);
+                        statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
+                        if (n < 20 || n % 100 == 0)
+                            std::fprintf(stderr, "[Cache] shard-fetch #%lu lvl=%d shard(%d,%d,%d) %zuB %ldms\n",
+                                         n + 1, shard.level, shard.sz, shard.sy, shard.sx,
+                                         shardBytes.size(), fetchMs);
+                    }
                 }
             }
 
-            // Notify listeners (e.g., to trigger UI refresh).
-            if (!chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
+            // Read ALL inner chunks from the shard on disk
+            IOPool::FetchResult result;
+            if (!dz) return result;
+
+            auto ls = http->levelShape(shard.level);
+            auto cs = http->chunkShape(shard.level);
+            int gridZ = (ls[0] + cs[0] - 1) / cs[0];
+            int gridY = (ls[1] + cs[1] - 1) / cs[1];
+            int gridX = (ls[2] + cs[2] - 1) / cs[2];
+
+            int baseZ = shard.sz * cps[0];
+            int baseY = shard.sy * cps[1];
+            int baseX = shard.sx * cps[2];
+
+            for (int dz_ = 0; dz_ < cps[0]; dz_++) {
+                for (int dy = 0; dy < cps[1]; dy++) {
+                    for (int dx = 0; dx < cps[2]; dx++) {
+                        int iz = baseZ + dz_, iy = baseY + dy, ix = baseX + dx;
+                        if (iz >= gridZ || iy >= gridY || ix >= gridX) continue;
+
+                        ChunkKey ck{shard.level, iz, iy, ix};
+                        auto diskData = zarrReadChunk(*dz, ck);
+                        if (diskData && !diskData->empty()) {
+                            auto& bytes = *diskData;
+                            result.emplace_back(ck, std::vector<uint8_t>(
+                                reinterpret_cast<const uint8_t*>(bytes.data()),
+                                reinterpret_cast<const uint8_t*>(bytes.data() + bytes.size())));
+                            statColdHits_.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        // Empty/missing chunks in shard are just skipped —
+                        // already handled by propagateZeroChunks at startup
+                    }
+                }
+            }
+            return result;
+        });
+    } else {
+        // Non-sharded: download individual chunk
+        ioPool_.setFetchFunc([this](const ShardKey& shard) -> IOPool::FetchResult {
+            ChunkKey key{shard.level, shard.sz, shard.sy, shard.sx};
+
+            // Check disk cache first
+            auto* dz = (key.level < static_cast<int>(diskLevels_.size()))
+                ? diskLevels_[key.level].get() : nullptr;
+            if (dz) {
+                auto diskData = zarrReadChunk(*dz, key);
+                if (diskData && !diskData->empty()) {
+                    statColdHits_.fetch_add(1, std::memory_order_relaxed);
+                    auto& bytes = *diskData;
+                    return {{key, {reinterpret_cast<const uint8_t*>(bytes.data()),
+                                   reinterpret_cast<const uint8_t*>(bytes.data() + bytes.size())}}};
+                }
+            }
+
+            // Fetch from remote
+            if (!source_) return {{key, {}}};
+            std::vector<uint8_t> data;
+            try {
+                data = source_->fetch(key);
+            } catch (const std::exception&) {
+                return {{key, {}}};
+            }
+            if (data.empty() || isAllZero(data.data(), data.size()))
+                return {{key, {}}};
+
+            statIceFetches_.fetch_add(1, std::memory_order_relaxed);
+            return {{key, std::move(data)}};
+        });
+    }
+
+    // --- Completion callback: decompress all chunks, hotPut, recompress if needed ---
+    ioPool_.setCompletionCallback(
+        [this, sharded](IOPool::FetchResult&& chunks) {
+            bool anyArrived = false;
+            ChunkKey lastKey{};
+
+            for (auto& [key, compressed] : chunks) {
+                if (compressed.empty()) {
+                    // Non-sharded: single chunk was empty, negative-cache it
+                    if (!sharded) {
+                        bloomAdd(key);
+                        std::lock_guard lock(negativeMutex_);
+                        negativeCache_.insert(key);
+                    }
+                    continue;
+                }
+
+                if (hotCache_.contains(key)) continue;
+
+                if (decompress_) {
+                    auto data = decompress_(compressed, key);
+                    if (data) {
+                        hotPut(key, std::move(data));
+                        anyArrived = true;
+                        lastKey = key;
+
+                        // Non-sharded: recompress to h265 and write to disk shard
+                        if (!sharded) {
+                            auto* dz = (key.level < static_cast<int>(diskLevels_.size()))
+                                ? diskLevels_[key.level].get() : nullptr;
+                            if (dz) {
+                                auto hotData = hotGet(key);
+                                if (hotData) {
+                                    auto cs = source_->chunkShape(key.level);
+                                    utils::VideoCodecParams vp;
+                                    vp.depth = cs[0]; vp.height = cs[1]; vp.width = cs[2];
+                                    vp.qp = 0;  // lossless
+                                    auto h265 = utils::video_encode(
+                                        {reinterpret_cast<const std::byte*>(hotData->rawData()),
+                                         hotData->totalBytes()}, vp);
+                                    zarrWriteChunk(*dz, key,
+                                        reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
+                                    statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Notify listeners once per shard completion
+            if (anyArrived && !chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
                 std::lock_guard cbLock(callbackMutex_);
-                for (const auto& [id, cb] : chunkReadyListeners_) {
-                    cb(key);
-                }
+                for (const auto& [id, cb] : chunkReadyListeners_)
+                    cb(lastKey);
             }
-        };
-
-    // Wire up IO pool with fetch and completion logic
-    ioPool_.setFetchFunc(fetchFunc);
-    ioPool_.setCompletionCallback(std::move(completionCb));
+        });
 
     // Start IO workers after callbacks are set to avoid data races.
     ioPool_.start();
@@ -338,29 +393,23 @@ ChunkDataPtr TieredChunkCache::getBlocking(const ChunkKey& key)
 
 void TieredChunkCache::prefetch(const ChunkKey& key)
 {
-    // Already ready for non-blocking use (or known sparse)? No-op.
-    // Cold-disk-only chunks still need promotion, so they must be submitted.
     if (isReadyForNonBlockingRead(key)) return;
-
     statTotalSubmitted_.fetch_add(1, std::memory_order_relaxed);
-    ioPool_.submitPrefetch(key);
+    ioPool_.submit({key}, Priority::Prefetch);
 }
 
 void TieredChunkCache::prefetch(const std::vector<ChunkKey>& keys)
 {
     if (keys.empty()) return;
-
-    std::vector<ChunkKey> submitKeys;
-    submitKeys.reserve(keys.size());
+    std::vector<ChunkKey> submit;
+    submit.reserve(keys.size());
     for (const auto& key : keys) {
-        if (!isReadyForNonBlockingRead(key)) {
-            submitKeys.push_back(key);
-        }
+        if (!isReadyForNonBlockingRead(key))
+            submit.push_back(key);
     }
-
-    if (!submitKeys.empty()) {
-        statTotalSubmitted_.fetch_add(submitKeys.size(), std::memory_order_relaxed);
-        ioPool_.submitPrefetch(submitKeys);
+    if (!submit.empty()) {
+        statTotalSubmitted_.fetch_add(submit.size(), std::memory_order_relaxed);
+        ioPool_.submit(submit, Priority::Prefetch);
     }
 }
 
@@ -374,7 +423,7 @@ void TieredChunkCache::fetchInteractive(const std::vector<ChunkKey>& keys)
             submit.push_back(key);
     }
     if (!submit.empty())
-        ioPool_.submitInteractive(submit);
+        ioPool_.updateInteractive(submit);
 }
 
 void TieredChunkCache::prefetchRegion(
@@ -416,7 +465,7 @@ void TieredChunkCache::prefetchRegion(
     }
     if (!keys.empty()) {
         statTotalSubmitted_.fetch_add(keys.size(), std::memory_order_relaxed);
-        ioPool_.submitPrefetch(keys);
+        ioPool_.submit(keys, Priority::Prefetch);
     }
 }
 
@@ -451,13 +500,77 @@ void TieredChunkCache::prefetchLevel(int level, const PrefetchProgressCb& progre
             }
 
     if (!keys.empty())
-        ioPool_.submitPrefetch(keys);
+        ioPool_.submit(keys, Priority::Prefetch);
 
     std::fprintf(stderr, "[Volume] Level %d: %d to fetch, %d skipped (known empty)\n",
                  level, static_cast<int>(keys.size()), skipped);
 
     if (progressCb)
         progressCb(total, total);
+}
+
+void TieredChunkCache::prefetchShardsLevel(int level, const PrefetchProgressCb& progressCb)
+{
+    if (level < 0 || level >= numLevels()) return;
+
+    auto* httpSource = dynamic_cast<HttpChunkSource*>(source_.get());
+    if (!httpSource || !httpSource->isSharded()) {
+        std::fprintf(stderr, "[prefetchShards] Not a sharded HTTP source, falling back to chunk prefetch\n");
+        prefetchLevel(level, progressCb);
+        return;
+    }
+
+    auto* dz = (level < static_cast<int>(diskLevels_.size())) ? diskLevels_[level].get() : nullptr;
+    if (!dz) {
+        std::fprintf(stderr, "[prefetchShards] No disk cache for level %d\n", level);
+        return;
+    }
+
+    auto grid = httpSource->shardsPerAxis(level);
+    int totalShards = grid[0] * grid[1] * grid[2];
+    std::fprintf(stderr, "[prefetchShards] Level %d: %dx%dx%d = %d shards\n",
+                 level, grid[0], grid[1], grid[2], totalShards);
+
+    int fetched = 0, skipped = 0;
+    for (int sz = 0; sz < grid[0]; sz++) {
+        for (int sy = 0; sy < grid[1]; sy++) {
+            for (int sx = 0; sx < grid[2]; sx++) {
+                // Check if shard already exists on disk
+                std::vector<std::size_t> shard_idx = {
+                    static_cast<std::size_t>(sz),
+                    static_cast<std::size_t>(sy),
+                    static_cast<std::size_t>(sx)};
+                auto shard_path = dz->chunk_path(shard_idx);
+                if (std::filesystem::exists(shard_path)) {
+                    skipped++;
+                    if (progressCb) progressCb(fetched + skipped, totalShards);
+                    continue;
+                }
+
+                // Download whole shard from S3
+                auto data = httpSource->fetchWholeShard(level, sz, sy, sx);
+                if (data.empty()) {
+                    skipped++;
+                    if (progressCb) progressCb(fetched + skipped, totalShards);
+                    continue;
+                }
+
+                // Write directly to disk cache — just copy the raw shard file
+                std::filesystem::create_directories(shard_path.parent_path());
+                std::ofstream f(shard_path, std::ios::binary | std::ios::trunc);
+                f.write(reinterpret_cast<const char*>(data.data()),
+                        static_cast<std::streamsize>(data.size()));
+                fetched++;
+
+                if (fetched % 10 == 0 || fetched + skipped == totalShards)
+                    std::fprintf(stderr, "[prefetchShards] Level %d: %d/%d fetched, %d skipped\n",
+                                 level, fetched, totalShards, skipped);
+                if (progressCb) progressCb(fetched + skipped, totalShards);
+            }
+        }
+    }
+    std::fprintf(stderr, "[prefetchShards] Level %d done: %d fetched, %d skipped\n",
+                 level, fetched, skipped);
 }
 
 void TieredChunkCache::cancelPendingPrefetch()
@@ -742,6 +855,14 @@ auto TieredChunkCache::stats() const -> Stats
                 s.diskBytes += entry.file_size(ec);
                 s.diskShards++;
             }
+        }
+    }
+    if (auto* http = dynamic_cast<HttpChunkSource*>(source_.get()))
+        s.sharded = http->isSharded();
+    // Also check disk levels — if any is sharded, the dataset is sharded
+    if (!s.sharded) {
+        for (const auto& dz : diskLevels_) {
+            if (dz && dz->is_sharded()) { s.sharded = true; break; }
         }
     }
     return s;

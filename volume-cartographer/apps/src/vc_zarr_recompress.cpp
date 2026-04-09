@@ -343,7 +343,6 @@ static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape, int q
     // Sharding config: 1024³ shards with 128³ inner chunks, index at start
     utils::ShardConfig sc;
     sc.sub_chunks = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
-    sc.index_at_end = false;
 
     // Sub-chunk codec: h265 (VC3D video codec)
     utils::ZarrCodecConfig h265_codec;

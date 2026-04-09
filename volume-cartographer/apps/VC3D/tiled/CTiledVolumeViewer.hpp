@@ -333,7 +333,6 @@ private:
     float _baseWindowHigh = 255.0f;
     bool _stretchValues = false;
     std::string _baseColormapId;
-    bool _useFastInterpolation = false;
 
     // --- Overlay volume ---
     std::shared_ptr<Volume> _overlayVolume;

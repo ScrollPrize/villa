@@ -38,4 +38,22 @@ struct ChunkKeyHash {
     }
 };
 
+// Identifies a shard in a multi-resolution volume pyramid.
+// For sharded datasets: maps to the shard grid (sz, sy, sx).
+// For non-sharded datasets: maps 1:1 to chunk indices (same as ChunkKey coords).
+struct ShardKey {
+    int level = 0;
+    int sz = 0, sy = 0, sx = 0;
+
+    constexpr bool operator==(const ShardKey&) const noexcept = default;
+    constexpr bool operator!=(const ShardKey& o) const noexcept { return !(*this == o); }
+};
+
+struct ShardKeyHash {
+    size_t operator()(const ShardKey& k) const noexcept
+    {
+        return utils::hash_combine_values(k.level, k.sz, k.sy, k.sx);
+    }
+};
+
 }  // namespace vc::cache

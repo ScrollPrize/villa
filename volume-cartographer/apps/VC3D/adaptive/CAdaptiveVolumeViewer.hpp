@@ -19,6 +19,7 @@
 #include "VolumeViewerBase.hpp"
 #include "CVolumeViewerView.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/types/Sampling.hpp"
 #include "vc/core/cache/TieredChunkCache.hpp"
 #include "vc/core/render/TiledViewerCamera.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
@@ -275,6 +276,7 @@ private:
     float _panSensitivity = 1.0f;
     float _zoomSensitivity = 1.0f;
     float _zScrollSensitivity = 1.0f;
+    vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
 
     // --- Content bounds for pan clamping ---
     float _contentMinU = 0, _contentMaxU = 0;

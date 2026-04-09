@@ -168,8 +168,7 @@ ZarrMetadata parse_zarr_json(std::string_view json_str) {
                 if (auto* cs = json_find(cfg, "chunk_shape"); cs && cs->is_array())
                     for (const auto& v : (*cs))
                         sc.sub_chunks.push_back(v.get_size_t());
-                if (auto* il = json_find(cfg, "index_location"); il && il->is_string())
-                    sc.index_at_end = (il->get_string() == "end");
+                // index_location is always "start" — ignore any "end" values
                 if (auto* ic = json_find(cfg, "index_codecs"); ic && ic->is_array())
                     for (const auto& icv : (*ic))
                         if (icv.is_object()) sc.index_codecs.push_back(parse_codec_config(icv));
@@ -253,7 +252,7 @@ std::string serialize_zarr_json(const ZarrMetadata& meta) {
                     sub_cs.push_back(JsonValue(c));
                 sc_cfg["chunk_shape"] = JsonValue(std::move(sub_cs));
             }
-            sc_cfg["index_location"] = JsonValue(meta.shard_config->index_at_end ? "end" : "start");
+            sc_cfg["index_location"] = JsonValue("start");
 
             {
                 JsonArray idx_codecs;
@@ -686,12 +685,8 @@ ZarrArray::extract_inner_chunk(std::span<const std::byte> shard_data,
     if (shard_data.size() < index_size)
         throw std::runtime_error("zarr: shard too small to contain index");
 
-    std::span<const std::byte> index_data;
-    if (sc.index_at_end) {
-        index_data = shard_data.subspan(shard_data.size() - index_size, index_size);
-    } else {
-        index_data = shard_data.subspan(0, index_size);
-    }
+    // Index is always at the start of the shard.
+    std::span<const std::byte> index_data = shard_data.subspan(0, index_size);
 
     std::vector<std::byte> decoded_index;
     if (!sc.index_codecs.empty()) {

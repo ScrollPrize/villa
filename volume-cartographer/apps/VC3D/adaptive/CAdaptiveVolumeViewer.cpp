@@ -173,18 +173,14 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         _view->setVoxelSize(vs, vs);
 
         // Prefetch coarsest levels immediately so we always have data
-        if (nScales > 0)
-            // Always prefetch the coarsest level
-            _volume->prefetchLevels(nScales - 1, nScales - 1);
-
-            // Prefetch additional levels per user setting
+        if (nScales > 0) {
+            // Prefetch levels per user setting (0 = coarsest only)
             QSettings pfSettings(vc3d::settingsFilePath(), QSettings::IniFormat);
             int prefetchLvls = pfSettings.value(vc3d::settings::perf::PREFETCH_LEVELS,
                                                 vc3d::settings::perf::PREFETCH_LEVELS_DEFAULT).toInt();
-            if (prefetchLvls > 0) {
-                int from = std::max(0, nScales - 1 - prefetchLvls);
-                _volume->prefetchLevels(from, nScales - 1);
-            }
+            int from = std::max(0, nScales - 1 - prefetchLvls);
+            _volume->prefetchLevels(from, nScales - 1);
+        }
     }
 
     // Recompute content bounds
@@ -321,6 +317,8 @@ void CAdaptiveVolumeViewer::submitRender()
         _panSensitivity = std::max(0.01f, s.value(viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT).toFloat());
         _zoomSensitivity = std::max(0.01f, s.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toFloat());
         _zScrollSensitivity = std::max(0.01f, s.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat());
+        int interpIdx = s.value(perf::INTERPOLATION_METHOD, 1).toInt();
+        _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 3));
     }
 
     auto surf = _surfWeak.lock();
@@ -338,7 +336,7 @@ void CAdaptiveVolumeViewer::submitRender()
 
     vc::SampleParams sp;
     sp.level = _camera.dsScaleIdx;
-    sp.method = vc::Sampling::Nearest;
+    sp.method = _samplingMethod;
 
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         // PlaneSurface: fused plane sampling
@@ -387,7 +385,7 @@ void CAdaptiveVolumeViewer::submitRender()
             sampleCoordsAdaptiveARGB32(
                 fbBits, fbStride, _volume->tieredCache(),
                 sp.level, static_cast<int>(_volume->numScales()),
-                coords, lut.data());
+                coords, lut.data(), _samplingMethod);
         }
     }
 
@@ -562,9 +560,7 @@ void CAdaptiveVolumeViewer::onCursorMove(QPointF scenePos)
         float dy = static_cast<float>(scenePos.y() - _lastPanSceneF.y());
         _lastPanSceneF = scenePos;
         if (std::abs(dx) > 0.001f || std::abs(dy) > 0.001f) {
-            float pxDx = dx * _camera.scale;
-            float pxDy = dy * _camera.scale;
-            panByF(pxDx, pxDy);
+            panByF(dx, dy);
         }
     }
 }
@@ -777,16 +773,29 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
         status += QString(" | ram %1G").arg(hotGB, 0, 'f', 1);
 
         double diskGB = static_cast<double>(s.diskBytes) / (1024.0 * 1024.0 * 1024.0);
-        status += QString(" | disk %1G %2sh")
+        const char* unit = s.sharded ? "shard" : "chunk";
+        status += QString(" | disk %1G %2%3")
             .arg(diskGB, 0, 'f', 1)
-            .arg(s.diskShards);
+            .arg(s.diskShards)
+            .arg(unit);
 
-        status += QString(" | dl %1 w %2 iq %3 pq %4 neg %5")
-            .arg(s.iceFetches)
-            .arg(s.diskWrites)
-            .arg(s.ioInteractive)
-            .arg(s.ioPrefetch)
-            .arg(s.negativeCount);
+        if (s.sharded) {
+            // Sharded: show shard-level stats. iq/pq are chunk-level (from interactive viewport)
+            // but dl/w are cumulative chunk fetches from individual chunk requests.
+            status += QString(" | dl %1sh w %2sh iq %3 pq %4 neg %5")
+                .arg(s.iceFetches)
+                .arg(s.diskWrites)
+                .arg(s.ioInteractive)
+                .arg(s.ioPrefetch)
+                .arg(s.negativeCount);
+        } else {
+            status += QString(" | dl %1 w %2 iq %3 pq %4 neg %5")
+                .arg(s.iceFetches)
+                .arg(s.diskWrites)
+                .arg(s.ioInteractive)
+                .arg(s.ioPrefetch)
+                .arg(s.negativeCount);
+        }
     }
 
     status += " [adaptive]";

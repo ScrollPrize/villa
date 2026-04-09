@@ -67,6 +67,10 @@ public:
 
     using PrefetchProgressCb = std::function<void(int fetched, int total)>;
     void prefetchLevel(int level, const PrefetchProgressCb& progressCb = nullptr);
+
+    // Bulk download whole shards directly to disk cache. Skips shards already on disk.
+    void prefetchShardsLevel(int level, const PrefetchProgressCb& progressCb = nullptr);
+
     void propagateZeroChunks(int coarseLevel);
     void cancelPendingPrefetch();
 
@@ -124,6 +128,7 @@ public:
         size_t diskBytes = 0;    // total bytes on disk across all level shards
         size_t diskShards = 0;   // number of shard files on disk
         uint64_t totalSubmitted = 0;  // total chunks ever submitted to IO pool
+        bool sharded = false;    // true if source uses sharded zarr
     };
 
     [[nodiscard]] Stats stats() const;

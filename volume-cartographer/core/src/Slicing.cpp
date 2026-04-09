@@ -2097,7 +2097,313 @@ struct AdaptiveSlotCache {
     }
 };
 
-int samplePlaneAdaptiveARGB32(
+// Per-level geometry for adaptive sampling
+struct AdaptiveLevelInfo {
+    CacheParams p;
+    AdaptiveSlotCache slotCache;
+    float scale;
+    AdaptiveLevelInfo(vc::cache::TieredChunkCache* c, int lvl)
+        : p(c, lvl), scale(1.0f / static_cast<float>(1 << lvl)) {}
+};
+
+// Lookup a voxel in the slot cache. Returns data pointer or nullptr.
+VC_FORCE_INLINE const uint8_t* adaptiveLookup(
+    AdaptiveLevelInfo& li, int ix, int iy, int iz)
+{
+    const auto& p = li.p;
+    return li.slotCache.lookup(p.chunkX(ix), p.chunkY(iy), p.chunkZ(iz),
+                                0 /* unused level param */, *static_cast<vc::cache::TieredChunkCache*>(nullptr));
+}
+
+// Fetch a single voxel value at integer coords from the adaptive cache.
+// Returns -1 if the chunk isn't available.
+VC_FORCE_INLINE int fetchVoxel(
+    AdaptiveLevelInfo& li, int ix, int iy, int iz,
+    vc::cache::TieredChunkCache& cache, int level)
+{
+    const auto& p = li.p;
+    if (ix < 0 || iy < 0 || iz < 0 || ix >= p.sx || iy >= p.sy || iz >= p.sz)
+        return 0; // out of bounds = fill value
+    const uint8_t* data = li.slotCache.lookup(p.chunkX(ix), p.chunkY(iy), p.chunkZ(iz), level, cache);
+    if (!data) return -1; // chunk not available
+    size_t off = static_cast<size_t>(p.localZ(iz)) * static_cast<size_t>(p.cy) * static_cast<size_t>(p.cx)
+               + static_cast<size_t>(p.localY(iy)) * static_cast<size_t>(p.cx)
+               + static_cast<size_t>(p.localX(ix));
+    return data[off];
+}
+
+// Direct voxel read from a known-valid chunk data pointer + local coords.
+// No chunk lookup, no bounds check — caller guarantees everything is in-range.
+VC_FORCE_INLINE uint8_t readLocal(const uint8_t* data, int lx, int ly, int lz, int cx, int cy) {
+    return data[static_cast<size_t>(lz) * static_cast<size_t>(cy) * static_cast<size_t>(cx)
+              + static_cast<size_t>(ly) * static_cast<size_t>(cx)
+              + static_cast<size_t>(lx)];
+}
+
+// Per-pixel adaptive sampling, templated on interpolation method.
+template<vc::Sampling Method>
+VC_FORCE_INLINE uint32_t samplePixelAdaptive(
+    float wx, float wy, float wz,
+    std::vector<AdaptiveLevelInfo>& levels,
+    int desiredLevel, int maxLvl,
+    vc::cache::TieredChunkCache& cache,
+    const uint32_t lut[256], uint32_t bg)
+{
+    for (int l = desiredLevel; l < maxLvl; l++) {
+        auto& li = levels[l];
+        const auto& p = li.p;
+        float vx = wx * li.scale;
+        float vy = wy * li.scale;
+        float vz = wz * li.scale;
+
+        if constexpr (Method == vc::Sampling::Nearest) {
+            int ix = static_cast<int>(vx + 0.5f);
+            int iy = static_cast<int>(vy + 0.5f);
+            int iz = static_cast<int>(vz + 0.5f);
+            if (ix < 0) ix = 0; if (ix >= p.sx) ix = p.sx - 1;
+            if (iy < 0) iy = 0; if (iy >= p.sy) iy = p.sy - 1;
+            if (iz < 0) iz = 0; if (iz >= p.sz) iz = p.sz - 1;
+            const uint8_t* data = li.slotCache.lookup(p.chunkX(ix), p.chunkY(iy), p.chunkZ(iz), l, cache);
+            if (!data) continue;
+            return lut[readLocal(data, p.localX(ix), p.localY(iy), p.localZ(iz), p.cx, p.cy)];
+        } else if constexpr (Method == vc::Sampling::Trilinear) {
+            int ix = static_cast<int>(vx);
+            int iy = static_cast<int>(vy);
+            int iz = static_cast<int>(vz);
+            float fx = vx - static_cast<float>(ix);
+            float fy = vy - static_cast<float>(iy);
+            float fz = vz - static_cast<float>(iz);
+
+            // Clamp: trilinear needs ix..ix+1 in [0, sx-1]
+            if (ix < 0) { ix = 0; fx = 0; }
+            if (ix >= p.sx - 1) { ix = p.sx - 2; fx = 1.0f; }
+            if (iy < 0) { iy = 0; fy = 0; }
+            if (iy >= p.sy - 1) { iy = p.sy - 2; fy = 1.0f; }
+            if (iz < 0) { iz = 0; fz = 0; }
+            if (iz >= p.sz - 1) { iz = p.sz - 2; fz = 1.0f; }
+
+            // Same-chunk fast path: all 8 corners in one chunk?
+            int ci = p.chunkX(ix), cj = p.chunkY(iy), ck = p.chunkZ(iz);
+            const uint8_t* data = li.slotCache.lookup(ci, cj, ck, l, cache);
+            if (!data) continue;
+
+            if (p.chunkX(ix+1) == ci && p.chunkY(iy+1) == cj && p.chunkZ(iz+1) == ck) {
+                // All 8 corners in same chunk — direct local reads, no more lookups
+                int lx = p.localX(ix), ly = p.localY(iy), lz = p.localZ(iz);
+                float v000 = readLocal(data, lx,   ly,   lz,   p.cx, p.cy);
+                float v100 = readLocal(data, lx+1, ly,   lz,   p.cx, p.cy);
+                float v010 = readLocal(data, lx,   ly+1, lz,   p.cx, p.cy);
+                float v110 = readLocal(data, lx+1, ly+1, lz,   p.cx, p.cy);
+                float v001 = readLocal(data, lx,   ly,   lz+1, p.cx, p.cy);
+                float v101 = readLocal(data, lx+1, ly,   lz+1, p.cx, p.cy);
+                float v011 = readLocal(data, lx,   ly+1, lz+1, p.cx, p.cy);
+                float v111 = readLocal(data, lx+1, ly+1, lz+1, p.cx, p.cy);
+
+                float c00 = std::fma(fx, v100 - v000, v000);
+                float c10 = std::fma(fx, v110 - v010, v010);
+                float c01 = std::fma(fx, v101 - v001, v001);
+                float c11 = std::fma(fx, v111 - v011, v011);
+                float c0 = std::fma(fy, c10 - c00, c00);
+                float c1 = std::fma(fy, c11 - c01, c01);
+                float val = std::fma(fz, c1 - c0, c0);
+                return lut[static_cast<uint8_t>(val + 0.5f)];
+            }
+
+            // Slow path: cross-chunk trilinear via fetchVoxel
+            int v000 = fetchVoxel(li, ix,   iy,   iz,   cache, l);
+            int v100 = fetchVoxel(li, ix+1, iy,   iz,   cache, l);
+            int v010 = fetchVoxel(li, ix,   iy+1, iz,   cache, l);
+            int v110 = fetchVoxel(li, ix+1, iy+1, iz,   cache, l);
+            int v001 = fetchVoxel(li, ix,   iy,   iz+1, cache, l);
+            int v101 = fetchVoxel(li, ix+1, iy,   iz+1, cache, l);
+            int v011 = fetchVoxel(li, ix,   iy+1, iz+1, cache, l);
+            int v111 = fetchVoxel(li, ix+1, iy+1, iz+1, cache, l);
+
+            if (v100 < 0 || v010 < 0 || v110 < 0 ||
+                v001 < 0 || v101 < 0 || v011 < 0 || v111 < 0) {
+                return lut[v000 >= 0 ? v000 : 0];
+            }
+
+            float c00 = std::fma(fx, static_cast<float>(v100 - v000), static_cast<float>(v000));
+            float c10 = std::fma(fx, static_cast<float>(v110 - v010), static_cast<float>(v010));
+            float c01 = std::fma(fx, static_cast<float>(v101 - v001), static_cast<float>(v001));
+            float c11 = std::fma(fx, static_cast<float>(v111 - v011), static_cast<float>(v011));
+            float c0 = std::fma(fy, c10 - c00, c00);
+            float c1 = std::fma(fy, c11 - c01, c01);
+            float val = std::fma(fz, c1 - c0, c0);
+            int iv = static_cast<int>(val + 0.5f);
+            if (iv < 0) iv = 0;
+            if (iv > 255) iv = 255;
+            return lut[iv];
+        } else if constexpr (Method == vc::Sampling::Tricubic) {
+            // Catmull-Rom tricubic: 4×4×4 = 64 samples
+            int ix = static_cast<int>(std::floor(vx));
+            int iy = static_cast<int>(std::floor(vy));
+            int iz = static_cast<int>(std::floor(vz));
+            float fx = vx - static_cast<float>(ix);
+            float fy = vy - static_cast<float>(iy);
+            float fz = vz - static_cast<float>(iz);
+
+            // Catmull-Rom weight
+            auto cr = [](float t) -> float {
+                float at = std::abs(t);
+                float at2 = at * at, at3 = at2 * at;
+                if (at < 1.0f) return 1.5f*at3 - 2.5f*at2 + 1.0f;
+                if (at < 2.0f) return -0.5f*at3 + 2.5f*at2 - 4.0f*at + 2.0f;
+                return 0.0f;
+            };
+
+            // Precompute 1D weights
+            float wxArr[4], wyArr[4], wzArr[4];
+            for (int i = 0; i < 4; i++) {
+                wxArr[i] = cr(fx - static_cast<float>(i - 1));
+                wyArr[i] = cr(fy - static_cast<float>(i - 1));
+                wzArr[i] = cr(fz - static_cast<float>(i - 1));
+            }
+
+            // Check center chunk available
+            int ci = p.chunkX(ix), cj = p.chunkY(iy), ck = p.chunkZ(iz);
+            const uint8_t* data = li.slotCache.lookup(ci, cj, ck, l, cache);
+            if (!data) continue;
+
+            // Same-chunk fast path: kernel spans ix-1..ix+2, iy-1..iy+2, iz-1..iz+2
+            if (ix >= 1 && iy >= 1 && iz >= 1 &&
+                ix + 2 < p.sx && iy + 2 < p.sy && iz + 2 < p.sz &&
+                p.chunkX(ix-1) == ci && p.chunkX(ix+2) == ci &&
+                p.chunkY(iy-1) == cj && p.chunkY(iy+2) == cj &&
+                p.chunkZ(iz-1) == ck && p.chunkZ(iz+2) == ck) {
+                int lx = p.localX(ix), ly = p.localY(iy), lz = p.localZ(iz);
+                float result = 0.0f;
+                for (int dz = -1; dz <= 2; dz++) {
+                    float wz = wzArr[dz + 1];
+                    for (int dy = -1; dy <= 2; dy++) {
+                        float wzy = wz * wyArr[dy + 1];
+                        for (int dx = -1; dx <= 2; dx++) {
+                            result += wzy * wxArr[dx + 1] *
+                                static_cast<float>(readLocal(data, lx+dx, ly+dy, lz+dz, p.cx, p.cy));
+                        }
+                    }
+                }
+                int iv = static_cast<int>(result + 0.5f);
+                if (iv < 0) iv = 0;
+                if (iv > 255) iv = 255;
+                return lut[iv];
+            }
+
+            // Slow path: cross-chunk
+            float result = 0.0f;
+            bool missing = false;
+            for (int dz = -1; dz <= 2 && !missing; dz++) {
+                float wz = wzArr[dz + 1];
+                for (int dy = -1; dy <= 2 && !missing; dy++) {
+                    float wzy = wz * wyArr[dy + 1];
+                    for (int dx = -1; dx <= 2; dx++) {
+                        int v = fetchVoxel(li, ix+dx, iy+dy, iz+dz, cache, l);
+                        if (v < 0) { missing = true; break; }
+                        result += wzy * wxArr[dx + 1] * static_cast<float>(v);
+                    }
+                }
+            }
+            if (missing) {
+                return lut[readLocal(data, p.localX(ix), p.localY(iy), p.localZ(iz), p.cx, p.cy)];
+            }
+            int iv = static_cast<int>(result + 0.5f);
+            if (iv < 0) iv = 0;
+            if (iv > 255) iv = 255;
+            return lut[iv];
+        } else if constexpr (Method == vc::Sampling::Lanczos) {
+            // Lanczos-3: 6×6×6 = 216 samples, polynomial sinc kernel
+            int ix = static_cast<int>(std::floor(vx));
+            int iy = static_cast<int>(std::floor(vy));
+            int iz = static_cast<int>(std::floor(vz));
+            float fx = vx - static_cast<float>(ix);
+            float fy = vy - static_cast<float>(iy);
+            float fz = vz - static_cast<float>(iz);
+
+            // Check center chunk available
+            int ci = p.chunkX(ix), cj = p.chunkY(iy), ck = p.chunkZ(iz);
+            const uint8_t* data = li.slotCache.lookup(ci, cj, ck, l, cache);
+            if (!data) continue;
+
+            // sinc(x) = sin(pi*x)/(pi*x), uses std::sinf (fast with -ffast-math)
+            constexpr float pi = 3.14159265358979323846f;
+            auto sinc = [](float x) -> float {
+                if (std::abs(x) < 1e-6f) return 1.0f;
+                float px = 3.14159265358979323846f * x;
+                return std::sin(px) / px;
+            };
+            auto lanczos3 = [&sinc](float t) -> float {
+                float at = std::abs(t);
+                if (at >= 3.0f) return 0.0f;
+                return sinc(t) * sinc(t * (1.0f / 3.0f));
+            };
+
+            // Precompute 1D weights
+            float wxArr[6], wyArr[6], wzArr[6];
+            for (int i = 0; i < 6; i++) {
+                wxArr[i] = lanczos3(fx - static_cast<float>(i - 2));
+                wyArr[i] = lanczos3(fy - static_cast<float>(i - 2));
+                wzArr[i] = lanczos3(fz - static_cast<float>(i - 2));
+            }
+
+            // Same-chunk fast path: kernel spans ix-2..ix+3
+            if (ix >= 2 && iy >= 2 && iz >= 2 &&
+                ix + 3 < p.sx && iy + 3 < p.sy && iz + 3 < p.sz &&
+                p.chunkX(ix-2) == ci && p.chunkX(ix+3) == ci &&
+                p.chunkY(iy-2) == cj && p.chunkY(iy+3) == cj &&
+                p.chunkZ(iz-2) == ck && p.chunkZ(iz+3) == ck) {
+                int lx = p.localX(ix), ly = p.localY(iy), lz = p.localZ(iz);
+                float result = 0.0f, wsum = 0.0f;
+                for (int dz = -2; dz <= 3; dz++) {
+                    float wz = wzArr[dz + 2];
+                    for (int dy = -2; dy <= 3; dy++) {
+                        float wzy = wz * wyArr[dy + 2];
+                        for (int dx = -2; dx <= 3; dx++) {
+                            float w = wzy * wxArr[dx + 2];
+                            result += w * static_cast<float>(
+                                readLocal(data, lx+dx, ly+dy, lz+dz, p.cx, p.cy));
+                            wsum += w;
+                        }
+                    }
+                }
+                if (wsum > 0.0f) result /= wsum;
+                int iv = static_cast<int>(result + 0.5f);
+                if (iv < 0) iv = 0;
+                if (iv > 255) iv = 255;
+                return lut[iv];
+            }
+
+            // Slow path: cross-chunk
+            float result = 0.0f, wsum = 0.0f;
+            bool missing = false;
+            for (int dz = -2; dz <= 3 && !missing; dz++) {
+                float wz = wzArr[dz + 2];
+                for (int dy = -2; dy <= 3 && !missing; dy++) {
+                    float wzy = wz * wyArr[dy + 2];
+                    for (int dx = -2; dx <= 3; dx++) {
+                        float w = wzy * wxArr[dx + 2];
+                        int v = fetchVoxel(li, ix+dx, iy+dy, iz+dz, cache, l);
+                        if (v < 0) { missing = true; break; }
+                        result += w * static_cast<float>(v);
+                        wsum += w;
+                    }
+                }
+            }
+            if (missing) {
+                return lut[readLocal(data, p.localX(ix), p.localY(iy), p.localZ(iz), p.cx, p.cy)];
+            }
+            if (wsum > 0.0f) result /= wsum;
+            int iv = static_cast<int>(result + 0.5f);
+            if (iv < 0) iv = 0;
+            if (iv > 255) iv = 255;
+            return lut[iv];
+        }
+    }
+    return bg;
+}
+
+template<vc::Sampling Method>
+static int samplePlaneAdaptiveImpl(
     uint32_t* outBuf, int outStride,
     vc::cache::TieredChunkCache* cache,
     int desiredLevel, int numLevels,
@@ -2110,29 +2416,17 @@ int samplePlaneAdaptiveARGB32(
     const uint32_t bg = lut[0];
     const int maxLvl = std::min(numLevels, 8);
 
-    // Per-level geometry — chunk shapes and level shapes can differ per level
-    struct LevelInfo {
-        CacheParams p;
-        AdaptiveSlotCache slotCache;
-        float scale;         // 1.0 / (1 << level)
-        LevelInfo(vc::cache::TieredChunkCache* c, int lvl)
-            : p(c, lvl), scale(1.0f / static_cast<float>(1 << lvl)) {}
-    };
-
-    // Build level info for each level we might sample from
-    std::vector<LevelInfo> levels;
+    std::vector<AdaptiveLevelInfo> levels;
     levels.reserve(maxLvl);
     for (int l = 0; l < maxLvl; l++)
         levels.emplace_back(cache, l);
 
-    // Level-0 shape for world-space bounds checking
     const float boundsX = levels[0].p.sxf;
     const float boundsY = levels[0].p.syf;
     const float boundsZ = levels[0].p.szf;
 
     for (int y = 0; y < h; y++) {
         uint32_t* row = outBuf + y * outStride;
-
         float ry_x = origin[0] + vy_step[0] * static_cast<float>(y);
         float ry_y = origin[1] + vy_step[1] * static_cast<float>(y);
         float ry_z = origin[2] + vy_step[2] * static_cast<float>(y);
@@ -2147,55 +2441,38 @@ int samplePlaneAdaptiveARGB32(
                 row[x] = bg;
                 continue;
             }
-
-            bool sampled = false;
-            for (int l = desiredLevel; l < maxLvl; l++) {
-                auto& li = levels[l];
-                const auto& p = li.p;
-
-                // World → level-scaled voxel (nearest neighbor)
-                int ix = static_cast<int>(wx * li.scale + 0.5f);
-                int iy = static_cast<int>(wy * li.scale + 0.5f);
-                int iz = static_cast<int>(wz * li.scale + 0.5f);
-
-                // Debug: log first center pixel at each level
-                static int dbgCount = 0;
-                if (x == w/2 && y == h/2 && dbgCount < 50) {
-                    dbgCount++;
-                    fprintf(stderr, "[SAMPLE] px(%d,%d) world(%.1f,%.1f,%.1f) lvl=%d scale=%.4f -> vox(%d,%d,%d) shape(%d,%d,%d)\n",
-                            x, y, wx, wy, wz, l, li.scale, ix, iy, iz, p.sx, p.sy, p.sz);
-                }
-
-                // Clamp to level shape
-                if (ix >= p.sx) ix = p.sx - 1;
-                if (iy >= p.sy) iy = p.sy - 1;
-                if (iz >= p.sz) iz = p.sz - 1;
-
-                // Chunk coords using actual chunk dimensions for this level
-                int ci = p.chunkX(ix);
-                int cj = p.chunkY(iy);
-                int ck = p.chunkZ(iz);
-
-                const uint8_t* data = li.slotCache.lookup(ci, cj, ck, l, *cache);
-                if (!data) continue;
-
-                // Local offset using actual chunk dimensions
-                int lx = p.localX(ix);
-                int ly = p.localY(iy);
-                int lz = p.localZ(iz);
-                size_t off = static_cast<size_t>(lz) * static_cast<size_t>(p.cy) * static_cast<size_t>(p.cx)
-                           + static_cast<size_t>(ly) * static_cast<size_t>(p.cx)
-                           + static_cast<size_t>(lx);
-
-                row[x] = lut[data[off]];
-                sampled = true;
-                break;
-            }
-            if (!sampled)
-                row[x] = bg;
+            row[x] = samplePixelAdaptive<Method>(
+                wx, wy, wz, levels, desiredLevel, maxLvl, *cache, lut, bg);
         }
     }
+    return desiredLevel;
+}
 
+int samplePlaneAdaptiveARGB32(
+    uint32_t* outBuf, int outStride,
+    vc::cache::TieredChunkCache* cache,
+    int desiredLevel, int numLevels,
+    const cv::Vec3f& origin,
+    const cv::Vec3f& vx_step,
+    const cv::Vec3f& vy_step,
+    int w, int h,
+    const uint32_t lut[256],
+    vc::Sampling method)
+{
+    switch (method) {
+    case vc::Sampling::Nearest:
+        return samplePlaneAdaptiveImpl<vc::Sampling::Nearest>(
+            outBuf, outStride, cache, desiredLevel, numLevels, origin, vx_step, vy_step, w, h, lut);
+    case vc::Sampling::Trilinear:
+        return samplePlaneAdaptiveImpl<vc::Sampling::Trilinear>(
+            outBuf, outStride, cache, desiredLevel, numLevels, origin, vx_step, vy_step, w, h, lut);
+    case vc::Sampling::Tricubic:
+        return samplePlaneAdaptiveImpl<vc::Sampling::Tricubic>(
+            outBuf, outStride, cache, desiredLevel, numLevels, origin, vx_step, vy_step, w, h, lut);
+    case vc::Sampling::Lanczos:
+        return samplePlaneAdaptiveImpl<vc::Sampling::Lanczos>(
+            outBuf, outStride, cache, desiredLevel, numLevels, origin, vx_step, vy_step, w, h, lut);
+    }
     return desiredLevel;
 }
 
@@ -2205,7 +2482,8 @@ int samplePlaneAdaptiveARGB32(
 // fallback, uses AdaptiveSlotCache.
 // ============================================================================
 
-void sampleCoordsAdaptiveARGB32(
+template<vc::Sampling Method>
+static void sampleCoordsAdaptiveImpl(
     uint32_t* outBuf, int outStride,
     vc::cache::TieredChunkCache* cache,
     int desiredLevel, int numLevels,
@@ -2216,15 +2494,7 @@ void sampleCoordsAdaptiveARGB32(
     const int maxLvl = std::min(numLevels, 8);
     const int h = coords.rows, w = coords.cols;
 
-    struct LevelInfo {
-        CacheParams p;
-        AdaptiveSlotCache slotCache;
-        float scale;
-        LevelInfo(vc::cache::TieredChunkCache* c, int lvl)
-            : p(c, lvl), scale(1.0f / static_cast<float>(1 << lvl)) {}
-    };
-
-    std::vector<LevelInfo> levels;
+    std::vector<AdaptiveLevelInfo> levels;
     levels.reserve(maxLvl);
     for (int l = 0; l < maxLvl; l++)
         levels.emplace_back(cache, l);
@@ -2246,41 +2516,37 @@ void sampleCoordsAdaptiveARGB32(
                 row[x] = bg;
                 continue;
             }
-
-            bool sampled = false;
-            for (int l = desiredLevel; l < maxLvl; l++) {
-                auto& li = levels[l];
-                const auto& p = li.p;
-
-                int ix = static_cast<int>(wx * li.scale + 0.5f);
-                int iy = static_cast<int>(wy * li.scale + 0.5f);
-                int iz = static_cast<int>(wz * li.scale + 0.5f);
-
-                if (ix >= p.sx) ix = p.sx - 1;
-                if (iy >= p.sy) iy = p.sy - 1;
-                if (iz >= p.sz) iz = p.sz - 1;
-
-                int ci = p.chunkX(ix);
-                int cj = p.chunkY(iy);
-                int ck = p.chunkZ(iz);
-
-                const uint8_t* data = li.slotCache.lookup(ci, cj, ck, l, *cache);
-                if (!data) continue;
-
-                int lx = p.localX(ix);
-                int ly = p.localY(iy);
-                int lz = p.localZ(iz);
-                size_t off = static_cast<size_t>(lz) * static_cast<size_t>(p.cy) * static_cast<size_t>(p.cx)
-                           + static_cast<size_t>(ly) * static_cast<size_t>(p.cx)
-                           + static_cast<size_t>(lx);
-
-                row[x] = lut[data[off]];
-                sampled = true;
-                break;
-            }
-            if (!sampled)
-                row[x] = bg;
+            row[x] = samplePixelAdaptive<Method>(
+                wx, wy, wz, levels, desiredLevel, maxLvl, *cache, lut, bg);
         }
+    }
+}
+
+void sampleCoordsAdaptiveARGB32(
+    uint32_t* outBuf, int outStride,
+    vc::cache::TieredChunkCache* cache,
+    int desiredLevel, int numLevels,
+    const cv::Mat_<cv::Vec3f>& coords,
+    const uint32_t lut[256],
+    vc::Sampling method)
+{
+    switch (method) {
+    case vc::Sampling::Nearest:
+        sampleCoordsAdaptiveImpl<vc::Sampling::Nearest>(
+            outBuf, outStride, cache, desiredLevel, numLevels, coords, lut);
+        break;
+    case vc::Sampling::Trilinear:
+        sampleCoordsAdaptiveImpl<vc::Sampling::Trilinear>(
+            outBuf, outStride, cache, desiredLevel, numLevels, coords, lut);
+        break;
+    case vc::Sampling::Tricubic:
+        sampleCoordsAdaptiveImpl<vc::Sampling::Tricubic>(
+            outBuf, outStride, cache, desiredLevel, numLevels, coords, lut);
+        break;
+    case vc::Sampling::Lanczos:
+        sampleCoordsAdaptiveImpl<vc::Sampling::Lanczos>(
+            outBuf, outStride, cache, desiredLevel, numLevels, coords, lut);
+        break;
     }
 }
 

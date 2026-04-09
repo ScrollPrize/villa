@@ -79,6 +79,13 @@ public:
     [[nodiscard]] std::array<int, 3> chunkShape(int level) const noexcept override;
     [[nodiscard]] std::array<int, 3> levelShape(int level) const noexcept override;
 
+    // Download an entire shard as raw bytes (for bulk prefetch to disk).
+    [[nodiscard]] std::vector<uint8_t> fetchWholeShard(int level, int sz, int sy, int sx);
+    [[nodiscard]] bool isSharded() const noexcept { return sharded_; }
+    [[nodiscard]] std::array<int, 3> shardsPerAxis(int level) const noexcept;
+    [[nodiscard]] std::array<int, 3> chunksPerShard() const noexcept { return chunksPerShard_; }
+    [[nodiscard]] std::array<int, 3> shardShape() const noexcept { return shardShape_; }
+
 private:
     std::string chunkUrl(const ChunkKey& key) const;
     std::string shardUrl(const ChunkKey& key) const;

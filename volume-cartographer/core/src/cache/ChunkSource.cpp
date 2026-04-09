@@ -249,15 +249,18 @@ std::vector<uint8_t> HttpChunkSource::fetchFromShard(const ChunkKey& key)
     int inner = innerChunkIndex(key);
     if (inner < 0 || inner >= nChunks) return {};
 
-    const uint8_t* indexBase = shardData->data() + shardData->size() - indexSize;
-    const uint8_t* entry = indexBase + inner * 16;
+    // Index is always at the start of the shard
+    const uint8_t* entry = shardData->data() + inner * 16;
 
     uint64_t offset = 0, nbytes = 0;
     std::memcpy(&offset, entry, 8);
     std::memcpy(&nbytes, entry + 8, 8);
 
+    // Missing chunk sentinel
     if (offset == UINT64_MAX && nbytes == UINT64_MAX) return {};
-    if (offset + nbytes > shardData->size() - indexSize) return {};
+    // Zero chunk sentinel
+    if (offset == (UINT64_MAX - 1) && nbytes == 0) return {};
+    if (offset + nbytes > shardData->size()) return {};
 
     return {shardData->data() + offset, shardData->data() + offset + nbytes};
 }
@@ -267,6 +270,32 @@ std::vector<uint8_t> HttpChunkSource::fetch(const ChunkKey& key)
     if (sharded_)
         return fetchFromShard(key);
     return httpGet(chunkUrl(key));
+}
+
+std::vector<uint8_t> HttpChunkSource::fetchWholeShard(int level, int sz, int sy, int sx)
+{
+    std::string url;
+    url.reserve(baseUrl_.size() + 32);
+    url += baseUrl_;
+    url += '/';
+    url += std::to_string(level);
+    url += "/c/";
+    url += std::to_string(sz);
+    url += '/';
+    url += std::to_string(sy);
+    url += '/';
+    url += std::to_string(sx);
+    return httpGet(url);
+}
+
+std::array<int, 3> HttpChunkSource::shardsPerAxis(int level) const noexcept
+{
+    auto shape = levelsLevelShape(levels_, level);
+    return {
+        (shape[0] + shardShape_[0] - 1) / std::max(shardShape_[0], 1),
+        (shape[1] + shardShape_[1] - 1) / std::max(shardShape_[1], 1),
+        (shape[2] + shardShape_[2] - 1) / std::max(shardShape_[2], 1),
+    };
 }
 
 int HttpChunkSource::numLevels() const noexcept { return levelsNumLevels(levels_); }

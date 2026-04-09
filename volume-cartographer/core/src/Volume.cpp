@@ -346,7 +346,6 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
                     meta.chunk_key_encoding = "default";
                     utils::ShardConfig sc;
                     sc.sub_chunks = {128, 128, 128};
-                    sc.index_at_end = false;
                     meta.shard_config = std::move(sc);
                     diskLevels[lvl] = std::make_shared<utils::ZarrArray>(
                         utils::ZarrArray::create(lvlPath, std::move(meta)));
@@ -680,8 +679,6 @@ int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
     // Prefetch: all levels for progressive refinement (background queue)
     for (int lvl = desired; lvl < nScales; lvl++)
         prefetchWorldBBox(pfLo, pfHi, lvl);
-    std::fprintf(stderr, "[ARGB32] desired=%d nScales=%d bbox=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) size=%dx%d\n",
-                 desired, nScales, pb.loX, pb.loY, pb.loZ, pb.hiX, pb.hiY, pb.hiZ, width, height);
 
     // Render with per-pixel fallback to coarser levels.
     // Each pixel tries the desired level first; if that chunk isn't in hot
@@ -691,7 +688,7 @@ int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
     samplePlaneAdaptiveARGB32(outBuf, outStride, tieredCache(),
                               desired, nScales,
                               origin, vx_step, vy_step,
-                              width, height, lut);
+                              width, height, lut, params.method);
     return desired;
 }
 
@@ -1206,13 +1203,14 @@ void Volume::prefetchLevels(int fromLevel, int toLevel)
             std::fprintf(stderr, "[Volume] Prefetching level %d (%d chunks)...\n",
                          lvl, total);
 
-            cache->prefetchLevel(lvl, [lvl](int fetched, int t) {
-                if (fetched % 5000 < 1000)
-                    std::fprintf(stderr, "[Volume] Level %d prefetch: %d/%d\n",
+            // Use whole-shard download for sharded datasets (1 S3 GET per shard
+            // instead of 512), falls back to per-chunk for non-sharded.
+            cache->prefetchShardsLevel(lvl, [lvl](int fetched, int t) {
+                if (fetched % 10 == 0 || fetched == t)
+                    std::fprintf(stderr, "[Volume] Level %d shard prefetch: %d/%d\n",
                                  lvl, fetched, t);
             });
-            std::fprintf(stderr, "[Volume] Level %d prefetch: %d/%d done\n",
-                         lvl, total, total);
+            std::fprintf(stderr, "[Volume] Level %d prefetch done\n", lvl);
         }
         std::fprintf(stderr, "[Volume] Level prefetch complete (levels %d-%d)\n",
                      fromLevel, toLevel);

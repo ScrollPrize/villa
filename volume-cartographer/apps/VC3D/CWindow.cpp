@@ -2930,6 +2930,27 @@ void CWindow::CreateWidgets(void)
                    viewer::GROUP_VIEW_EXPANDED,
                    viewer::GROUP_VIEW_EXPANDED_DEFAULT);
 
+    // Interpolation method selector
+    {
+        auto* interpWidget = new QWidget;
+        auto* interpLayout = new QHBoxLayout(interpWidget);
+        interpLayout->setContentsMargins(2, 2, 2, 2);
+        interpLayout->addWidget(new QLabel(tr("Interpolation")));
+        auto* cmbInterp = new QComboBox;
+        cmbInterp->addItem(tr("Nearest"));
+        cmbInterp->addItem(tr("Trilinear"));
+        cmbInterp->addItem(tr("Tricubic"));
+        cmbInterp->addItem(tr("Lanczos"));
+        cmbInterp->setCurrentIndex(settings.value(perf::INTERPOLATION_METHOD, 1).toInt());
+        interpLayout->addWidget(cmbInterp);
+        connect(cmbInterp, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int idx) {
+            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+            s.setValue(vc3d::settings::perf::INTERPOLATION_METHOD, idx);
+            _viewerManager->forEachViewer([](CTiledVolumeViewer* v) { v->update(); });
+        });
+        viewerControlsLayout->addWidget(interpWidget);
+    }
+
     // Navigation sensitivity controls
     {
         auto* navWidget = new QWidget;

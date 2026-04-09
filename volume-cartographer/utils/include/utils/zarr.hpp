@@ -382,7 +382,6 @@ private:
 
 struct ShardConfig {
     std::vector<std::size_t> sub_chunks;   // inner chunk shape
-    bool index_at_end = true;              // index_location: "end" (true) or "start" (false)
     std::vector<ZarrCodecConfig> index_codecs;  // codecs for the shard index
     std::vector<ZarrCodecConfig> sub_codecs;    // codecs for inner chunks
 };
@@ -1124,20 +1123,17 @@ public:
         if (inner_chunks.size() != n_inner)
             throw std::runtime_error("zarr: wrong number of inner chunks for shard");
 
-        // Build shard data: concatenate inner chunks and build index.
+        // Build shard data: [index][chunk0][chunk1]...
         std::vector<std::byte> shard_data;
         detail::ShardIndex index;
         index.entries.resize(n_inner);
 
-        // If index at start, reserve space for it.
+        // Index always at start — reserve space for it.
         const std::size_t index_size = n_inner * 16;
-        if (!sc.index_at_end) {
-            shard_data.resize(index_size);
-        }
+        shard_data.resize(index_size);
 
         for (std::size_t i = 0; i < n_inner; ++i) {
             if (!inner_chunks[i]) {
-                // Missing chunk.
                 index.entries[i].offset = ~std::uint64_t(0);
                 index.entries[i].nbytes  = ~std::uint64_t(0);
                 continue;
@@ -1146,7 +1142,6 @@ public:
             const auto& chunk_data = *inner_chunks[i];
             std::span<const std::byte> write_data = chunk_data;
 
-            // Compress inner chunk if codec available.
             std::vector<std::byte> compressed;
             if (codec_.compress && needs_compression()) {
                 compressed = codec_.compress(write_data);
@@ -1158,13 +1153,9 @@ public:
             shard_data.insert(shard_data.end(), write_data.begin(), write_data.end());
         }
 
-        // Serialize and append/prepend index.
+        // Write index at start.
         auto index_bytes = index.serialize();
-        if (sc.index_at_end) {
-            shard_data.insert(shard_data.end(), index_bytes.begin(), index_bytes.end());
-        } else {
-            std::memcpy(shard_data.data(), index_bytes.data(), index_size);
-        }
+        std::memcpy(shard_data.data(), index_bytes.data(), index_size);
 
         // Write shard file.
         write_chunk_raw(shard_indices, shard_data);

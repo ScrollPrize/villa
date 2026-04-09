@@ -92,7 +92,8 @@ int samplePlaneAdaptiveARGB32(uint32_t* outBuf, int outStride,
                                const cv::Vec3f& vx_step,
                                const cv::Vec3f& vy_step,
                                int width, int height,
-                               const uint32_t lut[256]);
+                               const uint32_t lut[256],
+                               vc::Sampling method = vc::Sampling::Nearest);
 
 // Adaptive coords sampling: per-pixel level fallback for QuadSurface.
 // Same as samplePlaneAdaptiveARGB32 but takes pre-computed coords matrix.
@@ -102,7 +103,8 @@ void sampleCoordsAdaptiveARGB32(
     vc::cache::TieredChunkCache* cache,
     int desiredLevel, int numLevels,
     const cv::Mat_<cv::Vec3f>& coords,
-    const uint32_t lut[256]);
+    const uint32_t lut[256],
+    vc::Sampling method = vc::Sampling::Nearest);
 
 // Fused plane composite: inline coords + nearest-neighbor per layer + composite + LUT → ARGB32.
 // No coord matrix allocation. For PlaneSurface composite rendering.
