@@ -37,7 +37,7 @@
   "position_refine_loss": "huber",
   "position_refine_weight": 0.05,
   "position_refine_start_step": 5000,
-  "batch_size": 16,
+  "batch_size": 8,
   "num_workers": 14,
   "val_num_workers": 2,
   "val_fraction": 0.05,
