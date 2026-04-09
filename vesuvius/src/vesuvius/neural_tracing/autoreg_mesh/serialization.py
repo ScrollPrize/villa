@@ -203,7 +203,7 @@ def quantize_local_xyz(
     volume_shape,
     patch_size,
     offset_num_bins,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     volume_shape_zyx = _as_3tuple(volume_shape)
     patch_size_zyx = _as_3tuple(patch_size)
     offset_bins_zyx = _as_3tuple(offset_num_bins)
@@ -213,24 +213,32 @@ def quantize_local_xyz(
     if coords.ndim != 2 or coords.shape[-1] != 3:
         raise ValueError(f"xyz must have shape [N, 3], got {coords.shape!r}")
 
-    max_coord = np.asarray(volume_shape_zyx, dtype=np.float32) - 1e-4
-    coords = np.clip(coords, 0.0, max_coord)
+    valid_mask = np.isfinite(coords).all(axis=1)
+    for axis, size in enumerate(volume_shape_zyx):
+        valid_mask &= coords[:, axis] >= 0.0
+        valid_mask &= coords[:, axis] < float(size)
 
+    coarse_ids = np.full((coords.shape[0],), IGNORE_INDEX, dtype=np.int64)
+    offset_bins = np.full((coords.shape[0], 3), IGNORE_INDEX, dtype=np.int64)
+    if not bool(valid_mask.any()):
+        return coarse_ids, offset_bins, valid_mask.astype(bool, copy=False)
+
+    valid_coords = coords[valid_mask]
     patch = np.asarray(patch_size_zyx, dtype=np.float32)
-    cell_indices = np.floor(coords / patch[None, :]).astype(np.int64)
+    cell_indices = np.floor(valid_coords / patch[None, :]).astype(np.int64)
     for axis, dim in enumerate(grid_shape):
         cell_indices[:, axis] = np.clip(cell_indices[:, axis], 0, dim - 1)
 
-    coarse_ids = flatten_coarse_ids(cell_indices, grid_shape_zyx=grid_shape)
-
+    coarse_ids[valid_mask] = flatten_coarse_ids(cell_indices, grid_shape_zyx=grid_shape)
     cell_starts = cell_indices.astype(np.float32) * patch[None, :]
-    offsets = np.clip(coords - cell_starts, 0.0, patch[None, :] - 1e-4)
-    offset_bins = np.zeros_like(cell_indices, dtype=np.int64)
+    offsets = valid_coords - cell_starts
+    valid_offset_bins = np.zeros_like(cell_indices, dtype=np.int64)
     for axis, bins in enumerate(offset_bins_zyx):
         bin_width = float(patch_size_zyx[axis]) / float(bins)
-        offset_bins[:, axis] = np.floor(offsets[:, axis] / max(bin_width, 1e-6)).astype(np.int64)
-        offset_bins[:, axis] = np.clip(offset_bins[:, axis], 0, bins - 1)
-    return coarse_ids.astype(np.int64, copy=False), offset_bins.astype(np.int64, copy=False)
+        valid_offset_bins[:, axis] = np.floor(offsets[:, axis] / max(bin_width, 1e-6)).astype(np.int64)
+        valid_offset_bins[:, axis] = np.clip(valid_offset_bins[:, axis], 0, bins - 1)
+    offset_bins[valid_mask] = valid_offset_bins
+    return coarse_ids, offset_bins, valid_mask.astype(bool, copy=False)
 
 
 def decode_local_xyz(
@@ -346,25 +354,29 @@ def serialize_split_conditioning_example(
     prompt_serialized = _serialize_surface(prompt_grid, direction=direction, region="prompt")
     target_serialized = _serialize_surface(masked, direction=direction, region="target")
 
-    prompt_coarse_ids, prompt_offset_bins = quantize_local_xyz(
+    prompt_coarse_ids, prompt_offset_bins, prompt_valid_mask = quantize_local_xyz(
         prompt_serialized["xyz"],
         volume_shape=volume_shape,
         patch_size=patch_size,
         offset_num_bins=offset_num_bins,
     )
-    target_coarse_ids, target_offset_bins = quantize_local_xyz(
+    target_coarse_ids, target_offset_bins, target_valid_mask = quantize_local_xyz(
         target_serialized["xyz"],
         volume_shape=volume_shape,
         patch_size=patch_size,
         offset_num_bins=offset_num_bins,
     )
     target_stop = np.zeros((target_serialized["xyz"].shape[0],), dtype=np.float32)
-    if target_stop.size > 0:
-        target_stop[-1] = 1.0
+    valid_target_indices = np.flatnonzero(target_valid_mask)
+    if valid_target_indices.size > 0:
+        target_stop[int(valid_target_indices[-1])] = 1.0
 
     prompt_anchor_xyz = np.zeros((3,), dtype=np.float32)
-    if prompt_serialized["xyz"].shape[0] > 0:
-        prompt_anchor_xyz = prompt_serialized["xyz"][0].astype(np.float32, copy=False)
+    prompt_anchor_valid = False
+    valid_prompt_indices = np.flatnonzero(prompt_valid_mask)
+    if valid_prompt_indices.size > 0:
+        prompt_anchor_valid = True
+        prompt_anchor_xyz = prompt_serialized["xyz"][int(valid_prompt_indices[0])].astype(np.float32, copy=False)
 
     return {
         "prompt_tokens": {
@@ -373,7 +385,7 @@ def serialize_split_conditioning_example(
             "xyz": prompt_serialized["xyz"],
             "strip_positions": prompt_serialized["strip_positions"],
             "strip_coords": prompt_serialized["strip_coords"],
-            "valid_mask": np.ones((prompt_serialized["xyz"].shape[0],), dtype=bool),
+            "valid_mask": prompt_valid_mask,
         },
         "prompt_meta": {
             "direction": direction,
@@ -386,8 +398,10 @@ def serialize_split_conditioning_example(
         "conditioning_grid_local": cond,
         "prompt_grid_local": prompt_grid,
         "prompt_anchor_xyz": prompt_anchor_xyz,
+        "prompt_anchor_valid": bool(prompt_anchor_valid),
         "target_coarse_ids": target_coarse_ids,
         "target_offset_bins": target_offset_bins,
+        "target_valid_mask": target_valid_mask,
         "target_stop": target_stop,
         "target_xyz": target_serialized["xyz"],
         "target_strip_positions": target_serialized["strip_positions"],

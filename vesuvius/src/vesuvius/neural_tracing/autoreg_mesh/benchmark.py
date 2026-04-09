@@ -63,10 +63,14 @@ def run_autoreg_mesh_benchmark(
     sample_count = max(1, min(int(sample_count), len(dataset)))
     prompt_lengths = []
     target_lengths = []
+    prompt_valid_counts = []
+    target_valid_counts = []
     for idx in range(sample_count):
         sample = dataset[idx]
         prompt_lengths.append(int(sample["prompt_tokens"]["coarse_ids"].shape[0]))
         target_lengths.append(int(sample["target_coarse_ids"].shape[0]))
+        prompt_valid_counts.append(int(sample["prompt_tokens"]["valid_mask"].sum().item()))
+        target_valid_counts.append(int(sample["target_valid_mask"].sum().item()))
 
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model = model or AutoregMeshModel(cfg)
@@ -99,6 +103,8 @@ def run_autoreg_mesh_benchmark(
         "sample_count": int(sample_count),
         "median_prompt_length": float(np.median(prompt_lengths)),
         "median_target_length": float(np.median(target_lengths)),
+        "median_valid_prompt_tokens": float(np.median(prompt_valid_counts)),
+        "median_valid_target_tokens": float(np.median(target_valid_counts)),
         "forward_ms": float(forward_ms),
         "infer_ms": float(infer_ms),
     }

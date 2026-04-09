@@ -290,6 +290,10 @@ class AutoregMeshDataset(Dataset):
             surface_downsample_factor=effective_surface_downsample_factor,
             use_stored_resolution_only=use_stored_surface,
         )
+        if not bool(np.any(serialized["prompt_tokens"]["valid_mask"])):
+            return None
+        if not bool(np.any(serialized["target_valid_mask"])):
+            return None
 
         sample_key = (int(patch_idx), int(wrap_idx))
         vol_tokens = None
@@ -328,9 +332,11 @@ class AutoregMeshDataset(Dataset):
             },
             "conditioning_grid_local": torch.from_numpy(serialized["conditioning_grid_local"]).to(torch.float32),
             "prompt_anchor_xyz": torch.from_numpy(serialized["prompt_anchor_xyz"]).to(torch.float32),
+            "prompt_anchor_valid": torch.tensor(bool(serialized["prompt_anchor_valid"]), dtype=torch.bool),
             "prompt_grid_local": torch.from_numpy(serialized["prompt_grid_local"]).to(torch.float32),
             "target_coarse_ids": torch.from_numpy(serialized["target_coarse_ids"]).to(torch.long),
             "target_offset_bins": torch.from_numpy(serialized["target_offset_bins"]).to(torch.long),
+            "target_valid_mask": torch.from_numpy(serialized["target_valid_mask"]).to(torch.bool),
             "target_stop": torch.from_numpy(serialized["target_stop"]).to(torch.float32),
             "target_xyz": torch.from_numpy(serialized["target_xyz"]).to(torch.float32),
             "target_strip_positions": torch.from_numpy(serialized["target_strip_positions"]).to(torch.long),
@@ -370,6 +376,19 @@ def _pad_1d_long(items: list[torch.Tensor], *, pad_value: int) -> tuple[torch.Te
         if length == 0:
             continue
         padded[batch_idx, :length] = item
+        mask[batch_idx, :length] = True
+    return padded, mask
+
+
+def _pad_1d_bool(items: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    max_len = max(int(item.shape[0]) for item in items)
+    padded = torch.zeros((len(items), max_len), dtype=torch.bool)
+    mask = torch.zeros((len(items), max_len), dtype=torch.bool)
+    for batch_idx, item in enumerate(items):
+        length = int(item.shape[0])
+        if length == 0:
+            continue
+        padded[batch_idx, :length] = item.to(torch.bool)
         mask[batch_idx, :length] = True
     return padded, mask
 
@@ -414,6 +433,7 @@ def autoreg_mesh_collate(batch: list[dict]) -> dict:
         "world_bbox": torch.stack([item["world_bbox"] for item in batch], dim=0),
         "target_grid_shape": torch.stack([item["target_grid_shape"] for item in batch], dim=0),
         "prompt_anchor_xyz": torch.stack([item["prompt_anchor_xyz"] for item in batch], dim=0),
+        "prompt_anchor_valid": torch.stack([item["prompt_anchor_valid"] for item in batch], dim=0),
         "prompt_meta": [item["prompt_meta"] for item in batch],
         "wrap_metadata": [item["wrap_metadata"] for item in batch],
         "conditioning_grid_local": [item["conditioning_grid_local"] for item in batch],
@@ -424,7 +444,7 @@ def autoreg_mesh_collate(batch: list[dict]) -> dict:
     if all(item.get("vol_tokens") is not None for item in batch):
         result["vol_tokens"] = torch.stack([item["vol_tokens"] for item in batch], dim=0)
 
-    prompt_coarse_ids, prompt_mask = _pad_1d_long(
+    prompt_coarse_ids, prompt_padding_mask = _pad_1d_long(
         [item["prompt_tokens"]["coarse_ids"] for item in batch],
         pad_value=IGNORE_INDEX,
     )
@@ -438,6 +458,7 @@ def autoreg_mesh_collate(batch: list[dict]) -> dict:
         pad_value=0,
     )
     prompt_strip_coords, _ = _pad_2d_float([item["prompt_tokens"]["strip_coords"] for item in batch])
+    prompt_valid_mask, _ = _pad_1d_bool([item["prompt_tokens"]["valid_mask"] for item in batch])
 
     result["prompt_tokens"] = {
         "coarse_ids": prompt_coarse_ids,
@@ -445,10 +466,11 @@ def autoreg_mesh_collate(batch: list[dict]) -> dict:
         "xyz": prompt_xyz,
         "strip_positions": prompt_strip_positions,
         "strip_coords": prompt_strip_coords,
-        "mask": prompt_mask,
+        "mask": prompt_padding_mask,
+        "valid_mask": prompt_valid_mask & prompt_padding_mask,
     }
 
-    target_coarse_ids, target_mask = _pad_1d_long(
+    target_coarse_ids, target_padding_mask = _pad_1d_long(
         [item["target_coarse_ids"] for item in batch],
         pad_value=IGNORE_INDEX,
     )
@@ -463,6 +485,7 @@ def autoreg_mesh_collate(batch: list[dict]) -> dict:
         pad_value=0,
     )
     target_strip_coords, _ = _pad_2d_float([item["target_strip_coords"] for item in batch])
+    target_valid_mask, _ = _pad_1d_bool([item["target_valid_mask"] for item in batch])
 
     result["target_coarse_ids"] = target_coarse_ids
     result["target_offset_bins"] = target_offset_bins
@@ -470,7 +493,9 @@ def autoreg_mesh_collate(batch: list[dict]) -> dict:
     result["target_stop"] = target_stop.squeeze(-1)
     result["target_strip_positions"] = target_strip_positions
     result["target_strip_coords"] = target_strip_coords
-    result["target_mask"] = target_mask
-    result["target_lengths"] = target_mask.sum(dim=1)
+    result["target_mask"] = target_padding_mask
+    result["target_valid_mask"] = target_valid_mask & target_padding_mask
+    result["target_supervision_mask"] = result["target_valid_mask"]
+    result["target_lengths"] = target_padding_mask.sum(dim=1)
     result["direction_id"] = torch.stack([torch.tensor(DIRECTION_TO_ID[item["direction"]], dtype=torch.long) for item in batch])
     return result

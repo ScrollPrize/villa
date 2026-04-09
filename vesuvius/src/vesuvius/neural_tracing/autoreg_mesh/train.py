@@ -214,6 +214,20 @@ def _mean_metric_dict(metric_dicts: list[dict[str, float]], *, prefix: str) -> d
     return {f"{prefix}{key}": value / float(len(metric_dicts)) for key, value in sums.items()}
 
 
+def _scheduled_sampling_prob(cfg: dict, *, global_step: int) -> float:
+    if not bool(cfg.get("scheduled_sampling_enabled", False)):
+        return 0.0
+    start_step = int(cfg.get("scheduled_sampling_start_step", 0))
+    if global_step < start_step:
+        return 0.0
+    max_prob = float(cfg.get("scheduled_sampling_max_prob", 0.0))
+    ramp_steps = int(cfg.get("scheduled_sampling_ramp_steps", 0))
+    if ramp_steps <= 0:
+        return max_prob
+    progress = min(1.0, max(0.0, float(global_step - start_step) / float(ramp_steps)))
+    return max_prob * progress
+
+
 def _as_numpy_grid(grid) -> np.ndarray:
     if torch.is_tensor(grid):
         return grid.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -418,7 +432,7 @@ def _evaluate_validation(
     for _ in range(int(cfg["val_batches_per_log"])):
         raw_batch, iterator = _next_batch(iterator, dataloader)
         batch = _move_batch_to_device(raw_batch, device)
-        outputs = model(batch)
+        outputs = model(batch, scheduled_sampling_prob=0.0)
         loss_dict = compute_autoreg_mesh_losses(
             outputs,
             batch,
@@ -554,7 +568,8 @@ def run_autoreg_mesh_training(
             batch = _move_batch_to_device(raw_batch, device)
 
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(batch)
+            scheduled_sampling_prob = _scheduled_sampling_prob(cfg, global_step=global_step)
+            outputs = model(batch, scheduled_sampling_prob=scheduled_sampling_prob)
             loss_dict = compute_autoreg_mesh_losses(
                 outputs,
                 batch,
@@ -580,6 +595,7 @@ def run_autoreg_mesh_training(
             metrics = _loss_dict_to_metrics(loss_dict)
             metrics["current_lr"] = float(optimizer.param_groups[0]["lr"])
             metrics["grad_norm"] = grad_norm_value
+            metrics["scheduled_sampling_prob"] = float(scheduled_sampling_prob)
             metrics["step"] = float(global_step)
             if skipped_step > 0.0:
                 metrics["skipped_step_nonfinite_grad"] = skipped_step

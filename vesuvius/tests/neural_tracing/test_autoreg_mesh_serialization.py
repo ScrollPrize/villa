@@ -77,7 +77,7 @@ def test_serialize_split_conditioning_example_orders_frontier_outward(
         cond_zyxs_local=cond,
         masked_zyxs_local=masked,
         direction=direction,
-        volume_shape=(16, 16, 16),
+        volume_shape=(64, 64, 64),
         patch_size=(8, 8, 8),
         offset_num_bins=(4, 4, 4),
         frontier_band_width=frontier_band_width,
@@ -104,7 +104,7 @@ def test_frontier_prompt_band_is_extracted_without_default_downsampling() -> Non
         cond_zyxs_local=cond,
         masked_zyxs_local=masked,
         direction="left",
-        volume_shape=(16, 16, 16),
+        volume_shape=(64, 64, 64),
         patch_size=(8, 8, 8),
         offset_num_bins=(4, 4, 4),
         frontier_band_width=2,
@@ -121,6 +121,23 @@ def test_frontier_prompt_band_is_extracted_without_default_downsampling() -> Non
         direction="left",
     )
     np.testing.assert_allclose(full_grid, np.concatenate([expected_prompt, masked], axis=1))
+
+
+def test_default_prompt_band_width_is_four() -> None:
+    full = _make_surface(3, 8)
+    cond = full[:, :6]
+    masked = full[:, 6:]
+    example = serialize_split_conditioning_example(
+        cond_zyxs_local=cond,
+        masked_zyxs_local=masked,
+        direction="left",
+        volume_shape=(64, 64, 64),
+        patch_size=(8, 8, 8),
+        offset_num_bins=(4, 4, 4),
+        frontier_band_width=4,
+    )
+    assert tuple(example["prompt_grid_local"].shape[:2]) == (3, 4)
+    np.testing.assert_allclose(example["prompt_grid_local"], cond[:, -4:, :])
 
 
 @pytest.mark.parametrize(
@@ -141,7 +158,7 @@ def test_downsample_surface_grid_preserves_true_split_frontier(
         cond_zyxs_local=cond,
         masked_zyxs_local=cond.copy(),
         direction=direction,
-        volume_shape=(32, 32, 32),
+        volume_shape=(64, 64, 64),
         patch_size=(8, 8, 8),
         offset_num_bins=(4, 4, 4),
         frontier_band_width=1,
@@ -200,3 +217,30 @@ def test_stored_surface_extraction_and_split_preserve_stored_lattice_shape() -> 
     assert conditioning is not None
     assert conditioning["cond_zyxs_unperturbed"].shape == (4, 3, 3)
     assert conditioning["masked_zyxs"].shape == (4, 3, 3)
+
+
+def test_out_of_bounds_vertices_are_masked_not_clamped() -> None:
+    cond = _make_surface(2, 4)
+    masked = _make_surface(2, 3)
+    masked = masked.copy()
+    masked[0, 0] = np.array([-2.0, 4.0, 8.0], dtype=np.float32)
+    masked[1, 2] = np.array([2.0, 40.0, 8.0], dtype=np.float32)
+    example = serialize_split_conditioning_example(
+        cond_zyxs_local=cond,
+        masked_zyxs_local=masked,
+        direction="left",
+        volume_shape=(16, 16, 16),
+        patch_size=(8, 8, 8),
+        offset_num_bins=(4, 4, 4),
+        frontier_band_width=2,
+    )
+
+    invalid_mask = ~example["target_valid_mask"]
+    assert invalid_mask.sum() == 2
+    np.testing.assert_array_equal(example["target_coarse_ids"][invalid_mask], np.full((2,), -100, dtype=np.int64))
+    np.testing.assert_array_equal(example["target_offset_bins"][invalid_mask], np.full((2, 3), -100, dtype=np.int64))
+    np.testing.assert_allclose(example["target_xyz"][0], np.array([-2.0, 4.0, 8.0], dtype=np.float32))
+    np.testing.assert_allclose(example["target_xyz"][-1], np.array([2.0, 40.0, 8.0], dtype=np.float32))
+    valid_stop_indices = np.flatnonzero(example["target_stop"])
+    assert valid_stop_indices.shape == (1,)
+    assert int(valid_stop_indices[0]) == int(np.flatnonzero(example["target_valid_mask"])[-1])

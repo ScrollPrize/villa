@@ -82,7 +82,7 @@ def _make_sample(direction: str) -> dict:
         volume_shape=(16, 16, 16),
         patch_size=(8, 8, 8),
         offset_num_bins=(4, 4, 4),
-        frontier_band_width=1,
+        frontier_band_width=4,
     )
     volume = torch.randn(1, 16, 16, 16, dtype=torch.float32)
     return {
@@ -99,9 +99,11 @@ def _make_sample(direction: str) -> dict:
         "prompt_meta": serialized["prompt_meta"],
         "conditioning_grid_local": torch.from_numpy(serialized["conditioning_grid_local"]).to(torch.float32),
         "prompt_anchor_xyz": torch.from_numpy(serialized["prompt_anchor_xyz"]).to(torch.float32),
+        "prompt_anchor_valid": torch.tensor(bool(serialized["prompt_anchor_valid"]), dtype=torch.bool),
         "prompt_grid_local": torch.from_numpy(serialized["prompt_grid_local"]).to(torch.float32),
         "target_coarse_ids": torch.from_numpy(serialized["target_coarse_ids"]).to(torch.long),
         "target_offset_bins": torch.from_numpy(serialized["target_offset_bins"]).to(torch.long),
+        "target_valid_mask": torch.from_numpy(serialized["target_valid_mask"]).to(torch.bool),
         "target_stop": torch.from_numpy(serialized["target_stop"]).to(torch.float32),
         "target_xyz": torch.from_numpy(serialized["target_xyz"]).to(torch.float32),
         "target_strip_positions": torch.from_numpy(serialized["target_strip_positions"]).to(torch.long),
@@ -139,7 +141,7 @@ def _make_config(checkpoint_path: Path) -> dict:
         "decoder_depth": 2,
         "decoder_num_heads": 4,
         "cross_attention_every_n_blocks": 1,
-        "frontier_band_width": 1,
+        "frontier_band_width": 4,
         "batch_size": 1,
         "num_workers": 0,
         "val_num_workers": 0,
@@ -163,7 +165,7 @@ def _make_cached_token_config() -> dict:
         "decoder_depth": 2,
         "decoder_num_heads": 4,
         "cross_attention_every_n_blocks": 1,
-        "frontier_band_width": 1,
+        "frontier_band_width": 4,
         "batch_size": 1,
         "num_workers": 0,
         "val_num_workers": 0,
@@ -286,6 +288,8 @@ def test_autoreg_mesh_model_forward_and_losses_are_finite(tmp_path: Path) -> Non
     assert outputs["offset_logits"].shape[:3] == (*batch["target_coarse_ids"].shape, 3)
     assert outputs["offset_logits"].shape[-1] == 4
     assert outputs["stop_logits"].shape == batch["target_coarse_ids"].shape
+    assert batch["target_valid_mask"].shape == batch["target_mask"].shape
+    assert batch["target_supervision_mask"].shape == batch["target_mask"].shape
     for value in losses.values():
         assert torch.isfinite(value)
     assert "occupancy_metric" in losses
@@ -392,6 +396,63 @@ def test_occupancy_auxiliary_is_metric_only(tmp_path: Path) -> None:
     assert metric_losses["occupancy_metric"].item() >= 0.0
 
 
+def test_invalid_target_positions_are_masked_from_loss(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = _make_config(checkpoint)
+    model = AutoregMeshModel(config)
+
+    sample = _make_sample("left")
+    sample["target_xyz"][0] = torch.tensor([-4.0, 4.0, 8.0], dtype=torch.float32)
+    sample["target_coarse_ids"][0] = -100
+    sample["target_offset_bins"][0] = torch.tensor([-100, -100, -100], dtype=torch.long)
+    sample["target_valid_mask"][0] = False
+    sample["target_stop"][0] = 0.0
+
+    batch = autoreg_mesh_collate([sample])
+    batch = _move_batch(batch, torch.device("cpu"))
+    outputs = model(batch)
+    losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+    )
+
+    assert not bool(batch["target_supervision_mask"][0, 0].item())
+    assert torch.isfinite(losses["loss"])
+
+
+def test_scheduled_sampling_probability_progression() -> None:
+    from vesuvius.neural_tracing.autoreg_mesh.train import _scheduled_sampling_prob
+
+    config = _make_cached_token_config()
+    config["scheduled_sampling_enabled"] = True
+    config["scheduled_sampling_max_prob"] = 0.10
+    config["scheduled_sampling_start_step"] = 10
+    config["scheduled_sampling_ramp_steps"] = 20
+
+    assert _scheduled_sampling_prob(config, global_step=0) == pytest.approx(0.0)
+    assert _scheduled_sampling_prob(config, global_step=10) == pytest.approx(0.0)
+    assert _scheduled_sampling_prob(config, global_step=20) == pytest.approx(0.05)
+    assert _scheduled_sampling_prob(config, global_step=40) == pytest.approx(0.10)
+
+
+def test_scheduled_sampling_enabled_smoke_train_runs(tmp_path: Path) -> None:
+    config = _make_cached_token_config()
+    config["out_dir"] = str(tmp_path / "runs_sched")
+    config["scheduled_sampling_enabled"] = True
+    config["scheduled_sampling_max_prob"] = 0.10
+    config["scheduled_sampling_start_step"] = 0
+    config["scheduled_sampling_ramp_steps"] = 2
+    dataset = _make_training_dataset()
+
+    result = run_autoreg_mesh_training(config, dataset=dataset, device="cpu", max_steps=2)
+
+    assert len(result["history"]) == 2
+    assert "scheduled_sampling_prob" in result["history"][-1]
+    assert result["history"][-1]["scheduled_sampling_prob"] >= 0.0
+
+
 def test_mixed_precision_is_rejected_until_supported() -> None:
     config = _make_cached_token_config()
     config["mixed_precision"] = "bf16"
@@ -416,6 +477,8 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     assert result["sample_count"] == 2
     assert result["median_prompt_length"] > 0
     assert result["median_target_length"] > 0
+    assert result["median_valid_prompt_tokens"] > 0
+    assert result["median_valid_target_tokens"] > 0
     assert result["forward_ms"] >= 0.0
     assert result["infer_ms"] >= 0.0
 

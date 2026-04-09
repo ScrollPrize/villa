@@ -9,7 +9,7 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "seed": 0,
     "crop_size": [128, 128, 128],
     "sample_mode": "wrap",
-    "frontier_band_width": 1,
+    "frontier_band_width": 4,
     "surface_downsample_factor": 1,
     "use_stored_resolution_only": False,
     "patch_size": [8, 8, 8],
@@ -28,6 +28,11 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "decoder_mlp_ratio": 4.0,
     "decoder_dropout": 0.0,
     "pointer_temperature": 1.0,
+    "scheduled_sampling_enabled": False,
+    "scheduled_sampling_mode": "linear_full_token_greedy",
+    "scheduled_sampling_max_prob": 0.10,
+    "scheduled_sampling_start_step": 0,
+    "scheduled_sampling_ramp_steps": 0,
     "optimizer": {"name": "adamw", "learning_rate": 1e-4, "weight_decay": 1e-4},
     "scheduler": "constant",
     "scheduler_kwargs": {},
@@ -116,6 +121,14 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("cross_attention_every_n_blocks must be positive")
     if float(cfg["pointer_temperature"]) <= 0.0:
         raise ValueError("pointer_temperature must be positive")
+    if str(cfg["scheduled_sampling_mode"]) != "linear_full_token_greedy":
+        raise ValueError("scheduled_sampling_mode must currently be 'linear_full_token_greedy'")
+    if float(cfg["scheduled_sampling_max_prob"]) < 0.0 or float(cfg["scheduled_sampling_max_prob"]) > 1.0:
+        raise ValueError("scheduled_sampling_max_prob must be within [0, 1]")
+    if int(cfg["scheduled_sampling_start_step"]) < 0:
+        raise ValueError("scheduled_sampling_start_step must be >= 0")
+    if int(cfg["scheduled_sampling_ramp_steps"]) < 0:
+        raise ValueError("scheduled_sampling_ramp_steps must be >= 0")
     if float(cfg["occupancy_loss_weight"]) < 0.0:
         raise ValueError("occupancy_loss_weight must be non-negative")
     if int(cfg["num_steps"]) <= 0:

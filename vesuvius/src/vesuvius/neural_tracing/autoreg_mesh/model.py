@@ -366,26 +366,33 @@ class AutoregMeshModel(nn.Module):
         strip_coords: Tensor,
         direction_id: Tensor,
         token_type: Tensor,
-        valid_mask: Tensor,
+        sequence_mask: Tensor,
+        geometry_valid_mask: Tensor,
         memory_tokens: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        gathered_memory = self._gather_memory_tokens(memory_tokens, coarse_ids, valid_mask & (coarse_ids >= 0))
-        offset_embed = self._embed_offset_bins(offset_bins, valid_mask)
-        xyz_norm = self._normalize_xyz(xyz)
+        gathered_memory = self._gather_memory_tokens(
+            memory_tokens,
+            coarse_ids,
+            geometry_valid_mask & (coarse_ids >= 0),
+        )
+        offset_embed = self._embed_offset_bins(offset_bins, geometry_valid_mask)
+        safe_xyz = torch.where(geometry_valid_mask.unsqueeze(-1), xyz, torch.zeros_like(xyz))
+        xyz_norm = self._normalize_xyz(safe_xyz)
         x = gathered_memory
         x = x + offset_embed
-        x = x + self.xyz_mlp(xyz_norm)
+        x = x + self.xyz_mlp(xyz_norm) * geometry_valid_mask.unsqueeze(-1).to(dtype=x.dtype)
         x = x + self.lattice_mlp(strip_coords)
         x = x + self.direction_embedding(direction_id).unsqueeze(1)
         x = x + self.token_type_embedding(token_type)
-        start_mask = (token_type == START_TOKEN_TYPE) & valid_mask
+        start_mask = (token_type == START_TOKEN_TYPE) & sequence_mask
         if start_mask.any():
             x = x + start_mask.unsqueeze(-1).to(dtype=x.dtype) * self.start_token.view(1, 1, -1)
-        x = x * valid_mask.unsqueeze(-1).to(dtype=x.dtype)
+        x = x * sequence_mask.unsqueeze(-1).to(dtype=x.dtype)
         return x, xyz_norm
 
-    def _build_generation_inputs(self, batch: dict) -> dict[str, Tensor]:
+    def _build_teacher_forced_generation_inputs(self, batch: dict) -> dict[str, Tensor]:
         target_mask = batch["target_mask"]
+        target_valid_mask = batch.get("target_valid_mask", batch["target_coarse_ids"] >= 0)
         target_coarse_ids = batch["target_coarse_ids"]
         target_offset_bins = batch["target_offset_bins"]
         target_xyz = batch["target_xyz"]
@@ -394,11 +401,14 @@ class AutoregMeshModel(nn.Module):
         shifted_coarse = torch.full_like(target_coarse_ids, IGNORE_INDEX)
         shifted_offset = torch.full_like(target_offset_bins, IGNORE_INDEX)
         shifted_xyz = torch.zeros_like(target_xyz)
+        shifted_valid = torch.zeros_like(target_mask, dtype=torch.bool)
         if target_coarse_ids.shape[1] > 1:
             shifted_coarse[:, 1:] = target_coarse_ids[:, :-1]
             shifted_offset[:, 1:, :] = target_offset_bins[:, :-1, :]
             shifted_xyz[:, 1:, :] = target_xyz[:, :-1, :]
+            shifted_valid[:, 1:] = target_valid_mask[:, :-1]
         shifted_xyz[:, 0, :] = batch["prompt_anchor_xyz"]
+        shifted_valid[:, 0] = batch.get("prompt_anchor_valid", torch.ones_like(target_mask[:, 0], dtype=torch.bool))
 
         token_type = torch.full_like(target_coarse_ids, GENERATED_TOKEN_TYPE)
         token_type[:, 0] = START_TOKEN_TYPE
@@ -408,8 +418,58 @@ class AutoregMeshModel(nn.Module):
             "xyz": shifted_xyz,
             "strip_coords": target_strip_coords,
             "token_type": token_type,
-            "valid_mask": target_mask,
+            "sequence_mask": target_mask,
+            "geometry_valid_mask": shifted_valid,
         }
+
+    def _build_scheduled_generation_inputs(
+        self,
+        batch: dict,
+        *,
+        teacher_outputs: dict[str, Tensor],
+        scheduled_sampling_prob: float,
+    ) -> dict[str, Tensor]:
+        generation_inputs = self._build_teacher_forced_generation_inputs(batch)
+        if float(scheduled_sampling_prob) <= 0.0:
+            return generation_inputs
+
+        target_mask = generation_inputs["sequence_mask"]
+        batch_size, target_len = target_mask.shape
+        if target_len <= 1:
+            return generation_inputs
+
+        replace_mask = torch.zeros_like(target_mask, dtype=torch.bool)
+        sampled = torch.rand((batch_size, target_len - 1), device=target_mask.device) < float(scheduled_sampling_prob)
+        replace_mask[:, 1:] = sampled & target_mask[:, 1:]
+        if not bool(replace_mask.any()):
+            return generation_inputs
+
+        shifted_pred_coarse = torch.full_like(generation_inputs["coarse_ids"], IGNORE_INDEX)
+        shifted_pred_offset = torch.full_like(generation_inputs["offset_bins"], IGNORE_INDEX)
+        shifted_pred_xyz = torch.zeros_like(generation_inputs["xyz"])
+        shifted_pred_valid = torch.zeros_like(generation_inputs["geometry_valid_mask"], dtype=torch.bool)
+        shifted_pred_coarse[:, 1:] = teacher_outputs["pred_coarse_ids"][:, :-1]
+        shifted_pred_offset[:, 1:, :] = teacher_outputs["pred_offset_bins"][:, :-1, :]
+        shifted_pred_xyz[:, 1:, :] = teacher_outputs["pred_xyz"][:, :-1, :]
+        shifted_pred_valid[:, 1:] = True
+
+        generation_inputs["coarse_ids"] = torch.where(replace_mask, shifted_pred_coarse, generation_inputs["coarse_ids"])
+        generation_inputs["offset_bins"] = torch.where(
+            replace_mask.unsqueeze(-1),
+            shifted_pred_offset,
+            generation_inputs["offset_bins"],
+        )
+        generation_inputs["xyz"] = torch.where(
+            replace_mask.unsqueeze(-1),
+            shifted_pred_xyz,
+            generation_inputs["xyz"],
+        )
+        generation_inputs["geometry_valid_mask"] = torch.where(
+            replace_mask,
+            shifted_pred_valid,
+            generation_inputs["geometry_valid_mask"],
+        )
+        return generation_inputs
 
     def _build_attention_mask(self, seq_mask: Tensor, *, dtype: torch.dtype) -> Tensor:
         batch_size, seq_len = seq_mask.shape
@@ -420,7 +480,13 @@ class AutoregMeshModel(nn.Module):
         attn_mask = attn_mask.masked_fill(~allowed, float("-inf"))
         return attn_mask
 
-    def forward_from_encoded(self, batch: dict, *, memory_tokens: Tensor) -> dict[str, Tensor]:
+    def forward_from_encoded(
+        self,
+        batch: dict,
+        *,
+        memory_tokens: Tensor,
+        generation_inputs: dict[str, Tensor] | None = None,
+    ) -> dict[str, Tensor]:
         prompt = batch["prompt_tokens"]
         prompt_token_type = torch.full_like(prompt["coarse_ids"], PROMPT_TOKEN_TYPE)
         prompt_embeddings, prompt_coords = self._build_input_embeddings(
@@ -430,11 +496,13 @@ class AutoregMeshModel(nn.Module):
             strip_coords=prompt["strip_coords"],
             direction_id=batch["direction_id"],
             token_type=prompt_token_type,
-            valid_mask=prompt["mask"],
+            sequence_mask=prompt["mask"],
+            geometry_valid_mask=prompt["valid_mask"],
             memory_tokens=memory_tokens,
         )
 
-        generation_inputs = self._build_generation_inputs(batch)
+        if generation_inputs is None:
+            generation_inputs = self._build_teacher_forced_generation_inputs(batch)
         generation_embeddings, generation_coords = self._build_input_embeddings(
             coarse_ids=generation_inputs["coarse_ids"],
             offset_bins=generation_inputs["offset_bins"],
@@ -442,13 +510,14 @@ class AutoregMeshModel(nn.Module):
             strip_coords=generation_inputs["strip_coords"],
             direction_id=batch["direction_id"],
             token_type=generation_inputs["token_type"],
-            valid_mask=generation_inputs["valid_mask"],
+            sequence_mask=generation_inputs["sequence_mask"],
+            geometry_valid_mask=generation_inputs["geometry_valid_mask"],
             memory_tokens=memory_tokens,
         )
 
         seq_embeddings = torch.cat([prompt_embeddings, generation_embeddings], dim=1)
         seq_coords = torch.cat([prompt_coords, generation_coords], dim=1)
-        seq_mask = torch.cat([prompt["mask"], batch["target_mask"]], dim=1)
+        seq_mask = torch.cat([prompt["mask"], generation_inputs["sequence_mask"]], dim=1)
         attn_mask = self._build_attention_mask(seq_mask, dtype=seq_embeddings.dtype)
 
         x = seq_embeddings
@@ -482,9 +551,22 @@ class AutoregMeshModel(nn.Module):
             "memory_tokens": memory_tokens,
         }
 
-    def forward(self, batch: dict) -> dict[str, Tensor]:
+    def forward(self, batch: dict, *, scheduled_sampling_prob: float = 0.0) -> dict[str, Tensor]:
         encoded = self.encode_conditioning(batch.get("volume"), batch.get("vol_tokens"))
-        return self.forward_from_encoded(batch, memory_tokens=encoded["memory_tokens"])
+        generation_inputs = None
+        if self.training and float(scheduled_sampling_prob) > 0.0:
+            with torch.no_grad():
+                teacher_outputs = self.forward_from_encoded(batch, memory_tokens=encoded["memory_tokens"])
+            generation_inputs = self._build_scheduled_generation_inputs(
+                batch,
+                teacher_outputs=teacher_outputs,
+                scheduled_sampling_prob=float(scheduled_sampling_prob),
+            )
+        return self.forward_from_encoded(
+            batch,
+            memory_tokens=encoded["memory_tokens"],
+            generation_inputs=generation_inputs,
+        )
 
     def decode_local_xyz(self, coarse_ids: Tensor, offset_bins: Tensor) -> Tensor:
         grid_shape = (
@@ -526,9 +608,11 @@ def build_pseudo_inference_batch(
     return {
         "prompt_tokens": prompt_tokens,
         "prompt_anchor_xyz": prompt_anchor_xyz,
+        "prompt_anchor_valid": torch.ones((batch_size,), device=prompt_anchor_xyz.device, dtype=torch.bool),
         "direction_id": direction_id,
         "target_coarse_ids": target_coarse_ids,
         "target_offset_bins": target_offset_bins,
+        "target_valid_mask": target_coarse_ids >= 0,
         "target_xyz": target_xyz,
         "target_strip_coords": target_strip_coords,
         "target_mask": target_mask,

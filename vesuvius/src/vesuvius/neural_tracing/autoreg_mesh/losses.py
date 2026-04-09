@@ -23,13 +23,13 @@ def _coarse_pointer_loss(outputs: dict, batch: dict) -> Tensor:
         ignore_index=IGNORE_INDEX,
         reduction="none",
     ).reshape_as(targets)
-    return _masked_mean(loss, batch["target_mask"])
+    return _masked_mean(loss, batch["target_supervision_mask"])
 
 
 def _offset_bin_loss(outputs: dict, batch: dict, offset_num_bins: tuple[int, int, int]) -> Tensor:
     logits = outputs["offset_logits"]
     targets = batch["target_offset_bins"]
-    mask = batch["target_mask"]
+    mask = batch["target_supervision_mask"]
     total = logits.new_zeros(())
     for axis, bins in enumerate(offset_num_bins):
         axis_logits = logits[:, :, axis, :bins]
@@ -48,12 +48,12 @@ def _stop_loss(outputs: dict, batch: dict) -> Tensor:
     logits = outputs["stop_logits"]
     targets = batch["target_stop"]
     loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-    return _masked_mean(loss, batch["target_mask"])
+    return _masked_mean(loss, batch["target_supervision_mask"])
 
 
 def _occupancy_metric(outputs: dict, batch: dict) -> Tensor:
     pred_xyz = outputs["pred_xyz"].detach().cpu()
-    target_mask = batch["target_mask"].detach().cpu()
+    target_mask = batch["target_supervision_mask"].detach().cpu()
     volume = batch["volume"]
     device = volume.device
     losses = []
