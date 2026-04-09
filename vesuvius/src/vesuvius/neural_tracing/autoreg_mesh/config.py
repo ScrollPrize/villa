@@ -33,6 +33,10 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "scheduled_sampling_max_prob": 0.10,
     "scheduled_sampling_start_step": 0,
     "scheduled_sampling_ramp_steps": 0,
+    "position_refine_enabled": True,
+    "position_refine_loss": "huber",
+    "position_refine_weight": 0.05,
+    "position_refine_start_step": 5000,
     "optimizer": {"name": "adamw", "learning_rate": 1e-4, "weight_decay": 1e-4},
     "scheduler": "constant",
     "scheduler_kwargs": {},
@@ -129,6 +133,12 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("scheduled_sampling_start_step must be >= 0")
     if int(cfg["scheduled_sampling_ramp_steps"]) < 0:
         raise ValueError("scheduled_sampling_ramp_steps must be >= 0")
+    if str(cfg["position_refine_loss"]) != "huber":
+        raise ValueError("position_refine_loss must currently be 'huber'")
+    if float(cfg["position_refine_weight"]) < 0.0:
+        raise ValueError("position_refine_weight must be non-negative")
+    if int(cfg["position_refine_start_step"]) < 0:
+        raise ValueError("position_refine_start_step must be >= 0")
     if float(cfg["occupancy_loss_weight"]) < 0.0:
         raise ValueError("occupancy_loss_weight must be non-negative")
     if int(cfg["num_steps"]) <= 0:

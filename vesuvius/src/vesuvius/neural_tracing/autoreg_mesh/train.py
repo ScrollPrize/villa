@@ -228,6 +228,14 @@ def _scheduled_sampling_prob(cfg: dict, *, global_step: int) -> float:
     return max_prob * progress
 
 
+def _position_refine_weight_active(cfg: dict, *, global_step: int) -> float:
+    if not bool(cfg.get("position_refine_enabled", True)):
+        return 0.0
+    if int(global_step) < int(cfg.get("position_refine_start_step", 5000)):
+        return 0.0
+    return float(cfg.get("position_refine_weight", 0.0))
+
+
 def _as_numpy_grid(grid) -> np.ndarray:
     if torch.is_tensor(grid):
         return grid.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -392,7 +400,7 @@ def _make_teacher_forced_prediction_canvas(batch: dict, outputs: dict, *, sample
     count = int(batch["target_lengths"][sample_idx].item())
     grid_shape = tuple(int(v) for v in batch["target_grid_shape"][sample_idx].tolist())
     direction = str(batch["direction"][sample_idx])
-    pred_xyz = outputs["pred_xyz"][sample_idx, :count].detach().cpu().numpy()
+    pred_xyz = outputs.get("pred_xyz_refined", outputs["pred_xyz"])[sample_idx, :count].detach().cpu().numpy()
     pred_grid_local = deserialize_continuation_grid(pred_xyz, direction=direction, grid_shape=grid_shape)
     prompt_grid_local = _as_numpy_grid(batch["prompt_grid_local"][sample_idx])
     target_grid_local = _as_numpy_grid(batch["target_grid_local"][sample_idx])
@@ -426,6 +434,7 @@ def _evaluate_validation(
     iterator,
     cfg: dict,
     device: torch.device,
+    global_step: int,
 ) -> tuple[dict[str, float], Any]:
     model.eval()
     metric_dicts: list[dict[str, float]] = []
@@ -438,6 +447,8 @@ def _evaluate_validation(
             batch,
             offset_num_bins=tuple(int(v) for v in cfg["offset_num_bins"]),
             occupancy_loss_weight=float(cfg.get("occupancy_loss_weight", 0.0)),
+            position_refine_weight_active=_position_refine_weight_active(cfg, global_step=global_step),
+            position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
         )
         metric_dicts.append(_loss_dict_to_metrics(loss_dict))
     model.train()
@@ -569,12 +580,15 @@ def run_autoreg_mesh_training(
 
             optimizer.zero_grad(set_to_none=True)
             scheduled_sampling_prob = _scheduled_sampling_prob(cfg, global_step=global_step)
+            position_refine_weight_active = _position_refine_weight_active(cfg, global_step=global_step)
             outputs = model(batch, scheduled_sampling_prob=scheduled_sampling_prob)
             loss_dict = compute_autoreg_mesh_losses(
                 outputs,
                 batch,
                 offset_num_bins=tuple(int(v) for v in cfg["offset_num_bins"]),
                 occupancy_loss_weight=float(cfg.get("occupancy_loss_weight", 0.0)),
+                position_refine_weight_active=position_refine_weight_active,
+                position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
             )
             loss = loss_dict["loss"]
             if not torch.isfinite(loss):
@@ -596,6 +610,7 @@ def run_autoreg_mesh_training(
             metrics["current_lr"] = float(optimizer.param_groups[0]["lr"])
             metrics["grad_norm"] = grad_norm_value
             metrics["scheduled_sampling_prob"] = float(scheduled_sampling_prob)
+            metrics["position_refine_weight_active"] = float(position_refine_weight_active)
             metrics["step"] = float(global_step)
             if skipped_step > 0.0:
                 metrics["skipped_step_nonfinite_grad"] = skipped_step
@@ -611,6 +626,7 @@ def run_autoreg_mesh_training(
                     iterator=val_iterator,
                     cfg=cfg,
                     device=device,
+                    global_step=global_step,
                 )
                 metrics.update(val_metrics)
 

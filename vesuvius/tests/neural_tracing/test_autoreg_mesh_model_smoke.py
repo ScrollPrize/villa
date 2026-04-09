@@ -106,6 +106,7 @@ def _make_sample(direction: str) -> dict:
         "target_valid_mask": torch.from_numpy(serialized["target_valid_mask"]).to(torch.bool),
         "target_stop": torch.from_numpy(serialized["target_stop"]).to(torch.float32),
         "target_xyz": torch.from_numpy(serialized["target_xyz"]).to(torch.float32),
+        "target_bin_center_xyz": torch.from_numpy(serialized["target_bin_center_xyz"]).to(torch.float32),
         "target_strip_positions": torch.from_numpy(serialized["target_strip_positions"]).to(torch.long),
         "target_strip_coords": torch.from_numpy(serialized["target_strip_coords"]).to(torch.float32),
         "target_grid_local": torch.from_numpy(serialized["target_grid_local"]).to(torch.float32),
@@ -288,6 +289,8 @@ def test_autoreg_mesh_model_forward_and_losses_are_finite(tmp_path: Path) -> Non
     assert outputs["offset_logits"].shape[:3] == (*batch["target_coarse_ids"].shape, 3)
     assert outputs["offset_logits"].shape[-1] == 4
     assert outputs["stop_logits"].shape == batch["target_coarse_ids"].shape
+    assert outputs["pred_refine_residual"].shape == batch["target_xyz"].shape
+    assert outputs["pred_xyz_refined"].shape == batch["target_xyz"].shape
     assert batch["target_valid_mask"].shape == batch["target_mask"].shape
     assert batch["target_supervision_mask"].shape == batch["target_mask"].shape
     for value in losses.values():
@@ -331,6 +334,7 @@ def test_autoreg_mesh_inference_reconstructs_lattice(tmp_path: Path) -> None:
     target_shape = tuple(int(v) for v in sample["target_grid_shape"].tolist())
     conditioning_shape = tuple(int(v) for v in sample["conditioning_grid_local"].shape[:2])
     assert result["predicted_continuation_vertices_local"].shape[0] == int(sample["target_coarse_ids"].shape[0])
+    assert result["predicted_bin_center_vertices_local"].shape == result["predicted_continuation_vertices_local"].shape
     assert result["continuation_grid_local"].shape == (*target_shape, 3)
     assert result["full_grid_local"].shape[-1] == 3
     assert result["full_grid_local"].shape == (conditioning_shape[0] + target_shape[0], conditioning_shape[1], 3)
@@ -396,6 +400,61 @@ def test_occupancy_auxiliary_is_metric_only(tmp_path: Path) -> None:
     assert metric_losses["occupancy_metric"].item() >= 0.0
 
 
+def test_position_refine_loss_is_gated_by_step_weight(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = _make_config(checkpoint)
+    model = AutoregMeshModel(config)
+
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    batch = _move_batch(batch, torch.device("cpu"))
+    outputs = model(batch)
+
+    off_losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        position_refine_weight_active=0.0,
+        position_refine_loss_type="huber",
+    )
+    on_losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        position_refine_weight_active=0.05,
+        position_refine_loss_type="huber",
+    )
+
+    assert off_losses["refine_loss_weight_active"].item() == pytest.approx(0.0)
+    assert on_losses["refine_loss_weight_active"].item() == pytest.approx(0.05)
+    assert on_losses["refine_loss"].item() >= 0.0
+    assert on_losses["loss"].item() >= off_losses["loss"].item()
+
+
+def test_refine_target_matches_bin_center_residual(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = _make_config(checkpoint)
+    model = AutoregMeshModel(config)
+
+    sample = _make_sample("left")
+    batch = autoreg_mesh_collate([sample])
+    batch = _move_batch(batch, torch.device("cpu"))
+    outputs = model(batch)
+    expected_residual = batch["target_xyz"] - batch["target_bin_center_xyz"]
+
+    losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        position_refine_weight_active=0.05,
+        position_refine_loss_type="huber",
+    )
+
+    assert torch.isfinite(expected_residual).all()
+    assert losses["refine_loss"].item() >= 0.0
+
+
 def test_invalid_target_positions_are_masked_from_loss(tmp_path: Path) -> None:
     checkpoint = tmp_path / "tiny_dinovol.pt"
     _write_local_guide_checkpoint(checkpoint)
@@ -453,6 +512,21 @@ def test_scheduled_sampling_enabled_smoke_train_runs(tmp_path: Path) -> None:
     assert result["history"][-1]["scheduled_sampling_prob"] >= 0.0
 
 
+def test_position_refine_weight_activates_after_start_step(tmp_path: Path) -> None:
+    config = _make_cached_token_config()
+    config["out_dir"] = str(tmp_path / "runs_refine")
+    config["position_refine_enabled"] = True
+    config["position_refine_weight"] = 0.05
+    config["position_refine_start_step"] = 1
+    dataset = _make_training_dataset()
+
+    result = run_autoreg_mesh_training(config, dataset=dataset, device="cpu", max_steps=2)
+
+    assert result["history"][0]["position_refine_weight_active"] == pytest.approx(0.0)
+    assert result["history"][1]["position_refine_weight_active"] == pytest.approx(0.05)
+    assert "refine_loss" in result["history"][1]
+
+
 def test_mixed_precision_is_rejected_until_supported() -> None:
     config = _make_cached_token_config()
     config["mixed_precision"] = "bf16"
@@ -479,6 +553,7 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     assert result["median_target_length"] > 0
     assert result["median_valid_prompt_tokens"] > 0
     assert result["median_valid_target_tokens"] > 0
+    assert result["refine_head_present"] is True
     assert result["forward_ms"] >= 0.0
     assert result["infer_ms"] >= 0.0
 

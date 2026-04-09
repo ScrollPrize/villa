@@ -82,7 +82,7 @@ def run_autoreg_mesh_benchmark(
 
     @torch.no_grad()
     def _forward():
-        model(batch)
+        return model(batch)
 
     @torch.no_grad()
     def _infer():
@@ -94,6 +94,7 @@ def run_autoreg_mesh_benchmark(
             stop_probability_threshold=1.1,
         )
 
+    forward_outputs = _forward()
     forward_ms = _measure_ms(_forward, device=device)
     infer_ms = _measure_ms(_infer, device=device)
 
@@ -105,6 +106,7 @@ def run_autoreg_mesh_benchmark(
         "median_target_length": float(np.median(target_lengths)),
         "median_valid_prompt_tokens": float(np.median(prompt_valid_counts)),
         "median_valid_target_tokens": float(np.median(target_valid_counts)),
+        "refine_head_present": bool("pred_refine_residual" in forward_outputs and "pred_xyz_refined" in forward_outputs),
         "forward_ms": float(forward_ms),
         "infer_ms": float(infer_ms),
     }

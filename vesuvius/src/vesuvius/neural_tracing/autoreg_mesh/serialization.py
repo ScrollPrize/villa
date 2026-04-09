@@ -366,6 +366,13 @@ def serialize_split_conditioning_example(
         patch_size=patch_size,
         offset_num_bins=offset_num_bins,
     )
+    target_bin_center_xyz = decode_local_xyz(
+        np.where(target_valid_mask, target_coarse_ids, 0),
+        np.where(target_valid_mask[:, None], target_offset_bins, 0),
+        volume_shape=volume_shape,
+        patch_size=patch_size,
+        offset_num_bins=offset_num_bins,
+    )
     target_stop = np.zeros((target_serialized["xyz"].shape[0],), dtype=np.float32)
     valid_target_indices = np.flatnonzero(target_valid_mask)
     if valid_target_indices.size > 0:
@@ -404,6 +411,7 @@ def serialize_split_conditioning_example(
         "target_valid_mask": target_valid_mask,
         "target_stop": target_stop,
         "target_xyz": target_serialized["xyz"],
+        "target_bin_center_xyz": target_bin_center_xyz,
         "target_strip_positions": target_serialized["strip_positions"],
         "target_strip_coords": target_serialized["strip_coords"],
         "target_grid_local": masked,

@@ -126,6 +126,7 @@ def infer_autoreg_mesh(
     generated_coarse: list[int] = []
     generated_offsets: list[list[int]] = []
     generated_xyz: list[np.ndarray] = []
+    generated_bin_center_xyz: list[np.ndarray] = []
     stop_probabilities: list[float] = []
 
     for step_idx in range(max_steps):
@@ -159,12 +160,14 @@ def infer_autoreg_mesh(
             offset_bins.append(int(_sample_from_logits(axis_logits, greedy=greedy).item()))
         offset_tensor = torch.tensor(offset_bins, dtype=torch.long, device=device).view(1, 1, 3)
         coarse_tensor = torch.tensor([[coarse_id]], dtype=torch.long, device=device)
-        xyz = model.decode_local_xyz(coarse_tensor, offset_tensor)[0, 0].detach().cpu().numpy()
+        bin_center_xyz = model.decode_local_xyz(coarse_tensor, offset_tensor)[0, 0].detach().cpu().numpy()
+        xyz = outputs["pred_xyz_refined"][0, current_len - 1].detach().cpu().numpy()
         stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, current_len - 1]).item())
 
         generated_coarse.append(coarse_id)
         generated_offsets.append(offset_bins)
         generated_xyz.append(xyz.astype(np.float32, copy=False))
+        generated_bin_center_xyz.append(bin_center_xyz.astype(np.float32, copy=False))
         stop_probabilities.append(stop_prob)
 
         if stop_probability_threshold is not None and stop_prob >= float(stop_probability_threshold):
@@ -181,6 +184,8 @@ def infer_autoreg_mesh(
 
     min_corner = batch["min_corner"][0].detach().cpu().numpy().astype(np.float32, copy=False)
     predicted_xyz_world = predicted_xyz_local + min_corner[None, :]
+    predicted_bin_center_xyz_local = np.asarray(generated_bin_center_xyz, dtype=np.float32)
+    predicted_bin_center_xyz_world = predicted_bin_center_xyz_local + min_corner[None, :]
     continuation_grid_world = continuation_grid_local.copy()
     full_grid_world = full_grid_local.copy()
     finite_cont = np.isfinite(continuation_grid_world).all(axis=-1)
@@ -203,6 +208,8 @@ def infer_autoreg_mesh(
         "predicted_offset_bins": np.asarray(generated_offsets, dtype=np.int64),
         "predicted_continuation_vertices_local": predicted_xyz_local,
         "predicted_continuation_vertices_world": predicted_xyz_world,
+        "predicted_bin_center_vertices_local": predicted_bin_center_xyz_local,
+        "predicted_bin_center_vertices_world": predicted_bin_center_xyz_world,
         "continuation_grid_local": continuation_grid_local,
         "continuation_grid_world": continuation_grid_world,
         "full_grid_local": full_grid_local,

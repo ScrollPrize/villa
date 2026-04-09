@@ -51,8 +51,17 @@ def _stop_loss(outputs: dict, batch: dict) -> Tensor:
     return _masked_mean(loss, batch["target_supervision_mask"])
 
 
+def _position_refine_loss(outputs: dict, batch: dict, *, loss_type: str) -> Tensor:
+    if str(loss_type) != "huber":
+        raise ValueError(f"Unsupported position_refine_loss={loss_type!r}")
+    target_residual = batch["target_xyz"] - batch["target_bin_center_xyz"]
+    pred_residual = outputs["pred_refine_residual"]
+    per_token = F.smooth_l1_loss(pred_residual, target_residual, reduction="none").mean(dim=-1)
+    return _masked_mean(per_token, batch["target_supervision_mask"])
+
+
 def _occupancy_metric(outputs: dict, batch: dict) -> Tensor:
-    pred_xyz = outputs["pred_xyz"].detach().cpu()
+    pred_xyz = outputs.get("pred_xyz_refined", outputs["pred_xyz"]).detach().cpu()
     target_mask = batch["target_supervision_mask"].detach().cpu()
     volume = batch["volume"]
     device = volume.device
@@ -80,11 +89,17 @@ def compute_autoreg_mesh_losses(
     *,
     offset_num_bins: tuple[int, int, int],
     occupancy_loss_weight: float = 0.0,
+    position_refine_weight_active: float = 0.0,
+    position_refine_loss_type: str = "huber",
 ) -> dict[str, Tensor]:
     coarse_loss = _coarse_pointer_loss(outputs, batch)
     offset_loss = _offset_bin_loss(outputs, batch, offset_num_bins=offset_num_bins)
     stop_loss = _stop_loss(outputs, batch)
     total_loss = coarse_loss + offset_loss + stop_loss
+    refine_loss = total_loss.new_zeros(())
+    if float(position_refine_weight_active) > 0.0:
+        refine_loss = _position_refine_loss(outputs, batch, loss_type=position_refine_loss_type)
+        total_loss = total_loss + float(position_refine_weight_active) * refine_loss
 
     occupancy_metric = total_loss.new_zeros(())
     if float(occupancy_loss_weight) > 0.0:
@@ -97,5 +112,7 @@ def compute_autoreg_mesh_losses(
         "coarse_loss": coarse_loss,
         "offset_loss": offset_loss,
         "stop_loss": stop_loss,
+        "refine_loss": refine_loss,
+        "refine_loss_weight_active": total_loss.new_tensor(float(position_refine_weight_active)),
         "occupancy_metric": occupancy_metric,
     }

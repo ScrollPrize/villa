@@ -289,6 +289,7 @@ class AutoregMeshModel(nn.Module):
         self.pointer_key = nn.Linear(self.decoder_dim, self.decoder_dim, bias=False)
         self.offset_head = nn.Linear(self.decoder_dim, 3 * max(self.offset_num_bins), bias=True)
         self.stop_head = nn.Linear(self.decoder_dim, 1, bias=True)
+        self.position_refine_head = nn.Linear(self.decoder_dim, 3, bias=True)
 
     def _normalize_xyz(self, xyz: Tensor) -> Tensor:
         shape = torch.tensor(self.input_shape, device=xyz.device, dtype=xyz.dtype)
@@ -450,7 +451,7 @@ class AutoregMeshModel(nn.Module):
         shifted_pred_valid = torch.zeros_like(generation_inputs["geometry_valid_mask"], dtype=torch.bool)
         shifted_pred_coarse[:, 1:] = teacher_outputs["pred_coarse_ids"][:, :-1]
         shifted_pred_offset[:, 1:, :] = teacher_outputs["pred_offset_bins"][:, :-1, :]
-        shifted_pred_xyz[:, 1:, :] = teacher_outputs["pred_xyz"][:, :-1, :]
+        shifted_pred_xyz[:, 1:, :] = teacher_outputs["pred_xyz_refined"][:, :-1, :]
         shifted_pred_valid[:, 1:] = True
 
         generation_inputs["coarse_ids"] = torch.where(replace_mask, shifted_pred_coarse, generation_inputs["coarse_ids"])
@@ -540,6 +541,12 @@ class AutoregMeshModel(nn.Module):
         for axis, bins in enumerate(self.offset_num_bins):
             pred_offset_bins.append(offset_logits[:, :, axis, :bins].argmax(dim=-1))
         pred_offset_bins_tensor = torch.stack(pred_offset_bins, dim=-1)
+        pred_xyz_bin_center = self.decode_local_xyz(pred_coarse_ids, pred_offset_bins_tensor)
+        pred_refine_residual = self.position_refine_head(hidden)
+        pred_xyz_refined = pred_xyz_bin_center + pred_refine_residual
+        max_coord = torch.tensor(self.input_shape, device=hidden.device, dtype=hidden.dtype) - 1e-4
+        pred_xyz_refined = torch.maximum(pred_xyz_refined, torch.zeros_like(pred_xyz_refined))
+        pred_xyz_refined = torch.minimum(pred_xyz_refined, max_coord.view(1, 1, 3))
 
         return {
             "coarse_logits": coarse_logits,
@@ -547,7 +554,9 @@ class AutoregMeshModel(nn.Module):
             "stop_logits": stop_logits,
             "pred_coarse_ids": pred_coarse_ids,
             "pred_offset_bins": pred_offset_bins_tensor,
-            "pred_xyz": self.decode_local_xyz(pred_coarse_ids, pred_offset_bins_tensor),
+            "pred_refine_residual": pred_refine_residual,
+            "pred_xyz": pred_xyz_bin_center,
+            "pred_xyz_refined": pred_xyz_refined,
             "memory_tokens": memory_tokens,
         }
 

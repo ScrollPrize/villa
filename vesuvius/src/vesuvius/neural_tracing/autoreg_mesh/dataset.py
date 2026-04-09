@@ -339,6 +339,7 @@ class AutoregMeshDataset(Dataset):
             "target_valid_mask": torch.from_numpy(serialized["target_valid_mask"]).to(torch.bool),
             "target_stop": torch.from_numpy(serialized["target_stop"]).to(torch.float32),
             "target_xyz": torch.from_numpy(serialized["target_xyz"]).to(torch.float32),
+            "target_bin_center_xyz": torch.from_numpy(serialized["target_bin_center_xyz"]).to(torch.float32),
             "target_strip_positions": torch.from_numpy(serialized["target_strip_positions"]).to(torch.long),
             "target_strip_coords": torch.from_numpy(serialized["target_strip_coords"]).to(torch.float32),
             "target_grid_local": torch.from_numpy(serialized["target_grid_local"]).to(torch.float32),
@@ -479,6 +480,7 @@ def autoreg_mesh_collate(batch: list[dict]) -> dict:
         pad_value=IGNORE_INDEX,
     )
     target_xyz, _ = _pad_2d_float([item["target_xyz"] for item in batch])
+    target_bin_center_xyz, _ = _pad_2d_float([item["target_bin_center_xyz"] for item in batch])
     target_stop, _ = _pad_2d_float([item["target_stop"].unsqueeze(-1) for item in batch])
     target_strip_positions, _ = _pad_2d_long(
         [item["target_strip_positions"] for item in batch],
@@ -490,6 +492,7 @@ def autoreg_mesh_collate(batch: list[dict]) -> dict:
     result["target_coarse_ids"] = target_coarse_ids
     result["target_offset_bins"] = target_offset_bins
     result["target_xyz"] = target_xyz
+    result["target_bin_center_xyz"] = target_bin_center_xyz
     result["target_stop"] = target_stop.squeeze(-1)
     result["target_strip_positions"] = target_strip_positions
     result["target_strip_coords"] = target_strip_coords
