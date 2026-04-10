@@ -6,7 +6,7 @@ import fsspec
 import numpy as np
 import zarr
 
-_FLAT_PATCH_FINDING_CACHE_VERSION = "v3"
+_FLAT_PATCH_FINDING_CACHE_VERSION = "v4"
 
 
 def load_volume_auth(auth_json_path):
@@ -57,13 +57,15 @@ def flat_patch_finding_cache_token(config):
             f"-ts-{tile_size}_st-{stride}_fe-{filter_empty_tile}"
         )
 
+    pfs = config.get('patch_finding_scale', '')
     if discovery_mode == "unlabeled":
         return (
             f"unlabeled-default-{_FLAT_PATCH_FINDING_CACHE_VERSION}"
             f"-po-{config.get('patch_overlap', '')}"
             f"-mdc-{config.get('unlabeled_patch_min_data_coverage', 0.15)}"
+            f"-pfs-{pfs}"
         )
-    return f"labeled-default-{_FLAT_PATCH_FINDING_CACHE_VERSION}-po-{config.get('patch_overlap', '')}"
+    return f"labeled-default-{_FLAT_PATCH_FINDING_CACHE_VERSION}-po-{config.get('patch_overlap', '')}-pfs-{pfs}"
 
 
 def save_flat_patch_cache(path, patches):

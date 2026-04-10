@@ -23,7 +23,11 @@ from koine_machines.models.load_checkpoint import (
     restore_training_state,
 )
 from koine_machines.models.make_model import make_model
-from koine_machines.training.deep_supervision import build_deep_supervision_targets
+from koine_machines.training.deep_supervision import (
+    DeepSupervisionWrapper,
+    _compute_ds_weights,
+    build_deep_supervision_targets,
+)
 from koine_machines.training.loss.losses import create_loss_from_config
 from koine_machines.training.semi_supervised.ramps import sigmoid_rampup
 from koine_machines.training.semi_supervised.two_stream_batch_sampler import (
@@ -31,6 +35,7 @@ from koine_machines.training.semi_supervised.two_stream_batch_sampler import (
 )
 from koine_machines.training.stitching import resolve_model_and_loader_patch_sizes
 from koine_machines.training.train import ValidationMetricBatch, _forward_model
+from koine_machines.training.visualization import PreviewAccumulator, build_validation_preview_log
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.models.training.optimizers import (
     OptimizerParamGroupTarget,
@@ -308,23 +313,43 @@ def train(config_path):
 
     out_dir = config["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
+    train_preview_dir = os.path.join(out_dir, "train_previews")
+    unlabeled_preview_dir = os.path.join(out_dir, "unlabeled_previews")
+    val_preview_dir = os.path.join(out_dir, "val_previews")
+    os.makedirs(train_preview_dir, exist_ok=True)
+    os.makedirs(unlabeled_preview_dir, exist_ok=True)
+    os.makedirs(val_preview_dir, exist_ok=True)
     set_seed(int(config["seed"]))
 
     dataset_config = deepcopy(config)
     dataset_config["patch_size"] = list(loader_patch_size)
 
-    labeled_shared_ds = InkDataset(dataset_config, do_augmentations=False)
-    if len(labeled_shared_ds.training_patches) == 0:
-        raise ValueError("InkDataset produced no labeled training patches after applying supervision masking")
+    # Run patch finding on main process first so it populates the cache,
+    # then other processes load from cache instead of redundant patch finding
+    if accelerator.is_main_process:
+        labeled_shared_ds = InkDataset(dataset_config, do_augmentations=False)
+        if len(labeled_shared_ds.training_patches) == 0:
+            raise ValueError("InkDataset produced no labeled training patches after applying supervision masking")
 
-    unlabeled_dataset_config = deepcopy(dataset_config)
-    unlabeled_dataset_config["patch_discovery_mode"] = "unlabeled"
-    unlabeled_shared_ds = InkDataset(unlabeled_dataset_config, do_augmentations=False)
-    if len(unlabeled_shared_ds.unlabeled_patches) == 0:
-        raise ValueError("InkDataset produced no unlabeled training patches")
+        unlabeled_dataset_config = deepcopy(dataset_config)
+        unlabeled_dataset_config["patch_discovery_mode"] = "unlabeled"
+        unlabeled_shared_ds = InkDataset(unlabeled_dataset_config, do_augmentations=False)
+        if len(unlabeled_shared_ds.unlabeled_segments) == 0:
+            raise ValueError("InkDataset produced no unlabeled segments")
+    accelerator.wait_for_everyone()
+    if not accelerator.is_main_process:
+        labeled_shared_ds = InkDataset(dataset_config, do_augmentations=False)
+        unlabeled_dataset_config = deepcopy(dataset_config)
+        unlabeled_dataset_config["patch_discovery_mode"] = "unlabeled"
+        unlabeled_shared_ds = InkDataset(unlabeled_dataset_config, do_augmentations=False)
 
-    train_patches = list(labeled_shared_ds.training_patches) + list(unlabeled_shared_ds.unlabeled_patches)
-    train_ds = InkDataset(dataset_config, do_augmentations=True, patches=train_patches)
+    train_patches = list(labeled_shared_ds.training_patches)
+    train_ds = InkDataset(
+        dataset_config,
+        do_augmentations=True,
+        patches=train_patches,
+        unlabeled_segments=list(unlabeled_shared_ds.unlabeled_segments),
+    )
     val_ds = InkDataset(dataset_config, do_augmentations=False, patches=labeled_shared_ds.validation_patches)
 
     train_dl, labeled_indices, unlabeled_indices = _build_train_dataloader(train_ds, config, accelerator)
@@ -394,6 +419,21 @@ def train(config_path):
         model.apply(InitWeights_He(neg_slope=0.2))
 
     loss = create_loss_from_config(config)
+    deep_supervision_enabled = bool(config.get("enable_deep_supervision", False))
+    if deep_supervision_enabled:
+        task_decoders = getattr(model, "task_decoders", None)
+        if not task_decoders:
+            raise ValueError(
+                "enable_deep_supervision requires per-task decoders, but the current model did not build any"
+            )
+        first_decoder = next(iter(task_decoders.values()))
+        ds_output_count = len(getattr(first_decoder, "stages", ()))
+        ds_weights = _compute_ds_weights(ds_output_count)
+        if ds_weights is None:
+            raise ValueError(
+                "enable_deep_supervision requires at least one decoder supervision stage"
+            )
+        loss = DeepSupervisionWrapper(loss, ds_weights)
     model, optimizer, train_dl, val_dl, lr_scheduler = accelerator.prepare(
         model,
         optimizer,
@@ -584,7 +624,27 @@ def train(config_path):
         if accelerator.is_main_process:
             refresh_progress_bar(train_loss)
 
-        if accelerator.is_main_process and step % log_every == 0:
+        # Reduce loss metrics on ALL ranks (collective op), then log only on main process.
+        should_log = step % log_every == 0
+        reduced_loss_metrics = None
+        if should_log:
+            latest_loss_metrics = getattr(loss, "latest_metrics", None)
+            if isinstance(latest_loss_metrics, dict):
+                reduced_loss_metrics = {}
+                for name, metric_value in latest_loss_metrics.items():
+                    metric_tensor = (
+                        metric_value.detach()
+                        if isinstance(metric_value, torch.Tensor)
+                        else torch.tensor(float(metric_value), device=accelerator.device)
+                    )
+                    reduced_loss_metrics[str(name)] = float(
+                        accelerator.reduce(
+                            metric_tensor.to(device=accelerator.device, dtype=torch.float32).reshape(()),
+                            reduction="mean",
+                        ).item()
+                    )
+
+        if accelerator.is_main_process and should_log:
             log_dict = {
                 "train/loss": train_loss,
                 "train/supervised_loss": supervised_loss_value,
@@ -594,24 +654,38 @@ def train(config_path):
                 "train/lr": optimizer.param_groups[0]["lr"],
                 "step": step,
             }
-            latest_loss_metrics = getattr(loss, "latest_metrics", None)
-            if isinstance(latest_loss_metrics, dict):
-                for name, metric_value in latest_loss_metrics.items():
-                    metric_tensor = (
-                        metric_value.detach()
-                        if isinstance(metric_value, torch.Tensor)
-                        else torch.tensor(float(metric_value), device=accelerator.device)
-                    )
-                    log_dict[str(name)] = float(
-                        accelerator.reduce(
-                            metric_tensor.to(device=accelerator.device, dtype=torch.float32).reshape(()),
-                            reduction="mean",
-                        ).item()
-                    )
+            if reduced_loss_metrics is not None:
+                log_dict.update(reduced_loss_metrics)
             if wandb.run is not None:
                 wandb.log(log_dict, step=step)
 
         if step % val_every == 0 and step > 0:
+            # -- Train previews: labeled batch --
+            train_preview = PreviewAccumulator(
+                accelerator=accelerator,
+                get_model_input=get_model_input,
+            )
+            labeled_batch_for_preview = {k: v[labeled_mask] if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            train_preview.add_batch(
+                labeled_batch_for_preview,
+                primary_loss_preds[labeled_mask].detach(),
+                targets[labeled_mask].detach(),
+                ignore_mask[labeled_mask].detach(),
+            )
+
+            # -- Train previews: unlabeled batch (use teacher pseudo-labels as targets) --
+            unlabeled_preview = PreviewAccumulator(
+                accelerator=accelerator,
+                get_model_input=get_model_input,
+            )
+            unlabeled_batch_for_preview = {k: v[unlabeled_mask] if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            unlabeled_preview.add_batch(
+                unlabeled_batch_for_preview,
+                student_unlabeled_logits.detach(),
+                teacher_mean_prob.detach(),
+                torch.zeros_like(teacher_mean_prob),
+            )
+
             model.eval()
             val_loss_total = torch.zeros((), device=accelerator.device, dtype=torch.float32)
             val_loss_batches = torch.zeros((), device=accelerator.device, dtype=torch.float32)
@@ -619,12 +693,16 @@ def train(config_path):
             ema_val_loss_batches = torch.zeros((), device=accelerator.device, dtype=torch.float32)
             validation_counts = Confusion.zero_counts(device=accelerator.device)
 
+            val_preview = PreviewAccumulator(
+                accelerator=accelerator,
+                get_model_input=get_model_input,
+            )
             num_val_batches = min(len(val_dl), int(config.get("val_steps", 10)))
             if num_val_batches == 0:
                 continue
             val_iterator = iter(val_dl)
             with torch.no_grad():
-                for _ in range(num_val_batches):
+                for val_batch_idx in range(num_val_batches):
                     val_batch = next(val_iterator)
                     val_inputs = get_model_input(val_batch)
                     with accelerator.autocast():
@@ -663,6 +741,14 @@ def train(config_path):
                         ),
                     )
 
+                    if val_batch_idx == 0:
+                        val_preview.add_batch(
+                            val_batch,
+                            primary_val_loss_preds.detach(),
+                            val_targets.detach(),
+                            val_ignore_mask.detach(),
+                        )
+
                     with accelerator.autocast():
                         ema_val_preds = _forward_model(
                             ema_model,
@@ -688,20 +774,32 @@ def train(config_path):
                 balanced_accuracy = float(
                     validation_balanced_accuracy_metric._from_counts(validation_counts).item()
                 )
+                log_dict = build_validation_preview_log(
+                    step=step,
+                    train_preview=train_preview,
+                    val_preview=val_preview,
+                    train_preview_dir=train_preview_dir,
+                    val_preview_dir=val_preview_dir,
+                    mean_val_loss=mean_val_loss,
+                    mean_ema_val_loss=mean_ema_val_loss,
+                    include_wandb_images=wandb.run is not None,
+                )
+                unlabeled_preview.save(os.path.join(unlabeled_preview_dir, f"unlabeled_preview_{step:06}.tif"))
                 if wandb.run is not None:
-                    wandb.log(
-                        {
-                            "val/loss": mean_val_loss,
-                            "val/ema_loss": mean_ema_val_loss,
-                            "val/balanced_accuracy": balanced_accuracy,
-                            "val/tp": float(validation_counts.tp.item()),
-                            "val/fp": float(validation_counts.fp.item()),
-                            "val/fn": float(validation_counts.fn.item()),
-                            "val/tn": float(validation_counts.tn.item()),
-                            "step": step,
-                        },
-                        step=step,
-                    )
+                    unlabeled_wandb_image = unlabeled_preview.wandb_image(f"step {step} unlabeled preview")
+                    if unlabeled_wandb_image is not None:
+                        log_dict["train/unlabeled_preview"] = unlabeled_wandb_image
+                log_dict.update(
+                    {
+                        "val/balanced_accuracy": balanced_accuracy,
+                        "val/tp": float(validation_counts.tp.item()),
+                        "val/fp": float(validation_counts.fp.item()),
+                        "val/fn": float(validation_counts.fn.item()),
+                        "val/tn": float(validation_counts.tn.item()),
+                    }
+                )
+                if wandb.run is not None:
+                    wandb.log(log_dict, step=step)
 
         if accelerator.is_main_process and step % save_every == 0 and step > 0:
             checkpoint_to_save = {

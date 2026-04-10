@@ -12,13 +12,19 @@ def dilate_label_batch_with_cucim(labels, padding_mask, distance, ignore_label=N
     if padding_mask.ndim == labels.ndim - 1:
         padding_mask = padding_mask.unsqueeze(1)
 
+    # Launch all batch samples concurrently on separate CUDA streams
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(out.shape[0])]
     for b in range(out.shape[0]):
-        for c in range(out.shape[1]):
-            x = cp.from_dlpack(out[b, c].contiguous())
-            valid = cp.from_dlpack(padding_mask[b, 0].contiguous())
-            source = (x == 1) & (valid > 0)
-            dist = distance_transform_edt(~source, return_indices=False, float64_distances=False)
-            fill = (x == 0) & (valid > 0) & (dist <= float(distance))
-            x[fill] = x.dtype.type(1)
+        with streams[b]:
+            for c in range(out.shape[1]):
+                x = cp.from_dlpack(out[b, c].contiguous())
+                valid = cp.from_dlpack(padding_mask[b, 0].contiguous())
+                source = (x == 1) & (valid > 0)
+                dist = distance_transform_edt(~source, return_indices=False, float64_distances=False)
+                fill = (x == 0) & (valid > 0) & (dist <= float(distance))
+                x[fill] = x.dtype.type(1)
+
+    for s in streams:
+        s.synchronize()
 
     return out

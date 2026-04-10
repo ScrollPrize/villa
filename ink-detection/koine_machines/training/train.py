@@ -39,6 +39,7 @@ from koine_machines.training.deep_supervision import (
 from koine_machines.training.visualization import PreviewAccumulator, build_validation_preview_log
 from koine_machines.training.loss.losses import create_loss_from_config
 from koine_machines.training.stitching import resolve_model_and_loader_patch_sizes, run_model_forward
+from vesuvius.models.augmentation.transforms.cucim_dilate import dilate_label_batch_with_cucim
 
 
 @dataclass
@@ -103,6 +104,42 @@ def _build_full_3d_preview_batch(
         targets[:, :, z_index],
         ignore_mask[:, :, z_index],
     )
+
+def _apply_cucim_label_dilation(batch, label_dilation_distance, supervision_dilation_distance):
+    """Apply GPU-accelerated dilation to inklabels and supervision_mask via cucim."""
+    inklabels = batch['inklabels']
+    supervision_mask = batch['supervision_mask']
+    ones = torch.ones(inklabels.shape[0], 1, *inklabels.shape[2:], device=inklabels.device, dtype=inklabels.dtype)
+    if label_dilation_distance > 0.0:
+        inklabels = dilate_label_batch_with_cucim(inklabels, ones, label_dilation_distance)
+    if supervision_dilation_distance > 0.0:
+        bg = ((supervision_mask > 0) & (inklabels <= 0)).to(dtype=inklabels.dtype)
+        bg = dilate_label_batch_with_cucim(bg, ones, supervision_dilation_distance)
+        bg = bg * (inklabels <= 0).to(dtype=bg.dtype)
+        supervision_mask = ((inklabels > 0) | (bg > 0)).to(dtype=supervision_mask.dtype)
+    elif label_dilation_distance > 0.0:
+        supervision_mask = ((inklabels > 0) | (supervision_mask > 0)).to(dtype=supervision_mask.dtype)
+    batch['inklabels'] = inklabels
+    batch['supervision_mask'] = supervision_mask
+
+
+def _distributed_mean_scalar(accelerator, value):
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+    else:
+        tensor = torch.tensor(float(value), device=accelerator.device)
+    tensor = tensor.to(device=accelerator.device, dtype=torch.float32).reshape(())
+    return accelerator.reduce(tensor, reduction='mean')
+
+
+def _distributed_mean_metrics(accelerator, metrics):
+    if not isinstance(metrics, dict):
+        return {}
+    return {
+        str(name): float(_distributed_mean_scalar(accelerator, metric_value).item())
+        for name, metric_value in metrics.items()
+    }
+
 
 def _forward_model(
     model,
@@ -196,12 +233,12 @@ def train(config_path):
     max_steps = config.get('max_steps', math.ceil(config['num_iterations'] / grad_acc_steps))
     val_every = int(config.get('val_every', 500))
     save_every = int(config.get('save_every', val_every))
-    log_every = config.get('log_every', 1)
+    log_every = config.get('log_every', 50)
     val_preview_batches = config.get('val_preview_batches', 3)
 
     dataloader_config = accelerate.DataLoaderConfiguration(non_blocking = True)
     ddp_kwargs = DistributedDataParallelKwargs(
-        find_unused_parameters=bool(config.get('ddp_find_unused_parameters', True)),
+        find_unused_parameters=bool(config.get('ddp_find_unused_parameters', False)),
         broadcast_buffers=bool(config.get('ddp_broadcast_buffers', False)),
     )
 
@@ -239,6 +276,17 @@ def train(config_path):
     dataset_config = deepcopy(config)
     dataset_config['patch_size'] = list(loader_patch_size)
 
+    full_3d_label_dilation = 0.0
+    full_3d_supervision_dilation = 0.0
+    if mode == 'full_3d':
+        _full_3d_config = config.get('full_3d') or {}
+        full_3d_label_dilation = float(_full_3d_config.get('label_dilation_distance', 0.0))
+        full_3d_supervision_dilation = float(_full_3d_config.get('supervision_dilation_distance', 0.0))
+        if full_3d_label_dilation > 0.0 or full_3d_supervision_dilation > 0.0:
+            ds_full_3d = dataset_config.setdefault('full_3d', {})
+            ds_full_3d['label_dilation_distance'] = 0.0
+            ds_full_3d['supervision_dilation_distance'] = 0.0
+
     shared_ds = InkDataset(dataset_config, do_augmentations=False)
     if len(shared_ds.training_patches) == 0:
         raise ValueError("FlatInkDataset produced no training patches after applying supervision masking")
@@ -254,6 +302,7 @@ def train(config_path):
     if dataloader_workers > 0:
         dataloader_kwargs['multiprocessing_context'] = 'spawn'
         dataloader_kwargs['persistent_workers'] = True
+        dataloader_kwargs['prefetch_factor'] = int(config.get('prefetch_factor', 2))
     if normal_pooled_mode:
         dataloader_kwargs['collate_fn'] = collate_normal_pooled_batch
 
@@ -281,7 +330,10 @@ def train(config_path):
     pretrained_backbone = (config.get('model_config') or {}).get('pretrained_backbone')
     freeze_encoder = False
     if pretrained_backbone:
-        freeze_encoder = bool(config.get('freeze_encoder', False))
+        freeze_encoder = bool(
+            config.get('freeze_encoder', False)
+            or (config.get('model_config') or {}).get('freeze_encoder', False)
+        )
         encoder_lr_mult = float(config.get('encoder_lr_mult', 1.0))
 
         encoder_params = list(model.shared_encoder.parameters())
@@ -339,9 +391,15 @@ def train(config_path):
             )
         loss = DeepSupervisionWrapper(loss, ds_weights)
 
-    model, optimizer, train_dl, val_dl, lr_scheduler = accelerator.prepare(
-            model, optimizer, train_dl, val_dl, lr_scheduler
+    model, optimizer, train_dl, val_dl = accelerator.prepare(
+            model, optimizer, train_dl, val_dl,
         )
+    # NOTE: we intentionally do NOT prepare lr_scheduler with Accelerate.
+    # AcceleratedScheduler calls scheduler.step() num_processes times per
+    # optimizer step (when split_batches=False), which makes the LR schedule
+    # run num_processes-x faster than intended.  Instead we step the raw
+    # scheduler ourselves exactly once per optimizer step inside the
+    # sync_gradients guard.
     unwrapped_model = accelerator.unwrap_model(model)
     frozen_encoder = unwrapped_model.shared_encoder if pretrained_backbone and freeze_encoder else None
     ema_model = deepcopy(unwrapped_model) if ema_enabled else None
@@ -467,6 +525,8 @@ def train(config_path):
         except StopIteration:
             train_iterator = iter(train_dl)
             batch = next(train_iterator)
+        if full_3d_label_dilation > 0.0 or full_3d_supervision_dilation > 0.0:
+            _apply_cucim_label_dilation(batch, full_3d_label_dilation, full_3d_supervision_dilation)
 
         with accelerator.accumulate(model):
             with accelerator.autocast():
@@ -506,9 +566,9 @@ def train(config_path):
             if grad_clip is not None and grad_clip > 0 and accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-            lr_scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             if accelerator.sync_gradients:
+                lr_scheduler.step()
                 optimizer_step += 1
                 if ema_model is not None and optimizer_step >= ema_start_step:
                     if (optimizer_step - ema_start_step) % ema_update_every_steps == 0:
@@ -521,33 +581,29 @@ def train(config_path):
                             else:
                                 ema_value.copy_(model_value)
 
-        train_loss = float(
-            accelerator.reduce(l.detach().to(device=accelerator.device, dtype=torch.float32).reshape(()), reduction='mean').item()
-        )
+        # Distributed reductions are collective ops — all ranks must participate.
+        should_log = step % log_every == 0
+        if should_log:
+            train_loss = float(_distributed_mean_scalar(accelerator, l).item())
+        else:
+            train_loss = float(l.item())
         if accelerator.is_main_process:
             refresh_progress_bar(train_loss)
 
-        if accelerator.is_main_process and step % log_every == 0:
+        reduced_loss_metrics = None
+        if should_log:
+            latest_loss_metrics = getattr(loss, 'latest_metrics', None)
+            if isinstance(latest_loss_metrics, dict):
+                reduced_loss_metrics = _distributed_mean_metrics(accelerator, latest_loss_metrics)
+
+        if accelerator.is_main_process and should_log:
             log_dict = {
                 'train/loss': train_loss,
                 'train/lr': optimizer.param_groups[0]['lr'],
                 'step': step,
             }
-            latest_loss_metrics = getattr(loss, 'latest_metrics', None)
-            if isinstance(latest_loss_metrics, dict):
-                log_dict.update({
-                    str(name): float(
-                        accelerator.reduce(
-                            (
-                                metric_value.detach()
-                                if isinstance(metric_value, torch.Tensor)
-                                else torch.tensor(float(metric_value), device=accelerator.device)
-                            ).to(device=accelerator.device, dtype=torch.float32).reshape(()),
-                            reduction='mean',
-                        ).item()
-                    )
-                    for name, metric_value in latest_loss_metrics.items()
-                })
+            if reduced_loss_metrics is not None:
+                log_dict.update(reduced_loss_metrics)
             if wandb.run is not None:
                 wandb.log(log_dict, step=step)
 
@@ -593,6 +649,8 @@ def train(config_path):
             with torch.no_grad():
                 for val_batch_idx in range(num_val_batches):
                     val_batch = next(val_iterator)
+                    if full_3d_label_dilation > 0.0 or full_3d_supervision_dilation > 0.0:
+                        _apply_cucim_label_dilation(val_batch, full_3d_label_dilation, full_3d_supervision_dilation)
                     with accelerator.autocast():
                         val_preds = _forward_model(
                             model,
@@ -624,10 +682,7 @@ def train(config_path):
                             else val_targets_with_ignore.float()
                         ),
                     )
-                    val_loss_total = val_loss_total + accelerator.reduce(
-                        val_l.detach().to(device=accelerator.device, dtype=torch.float32).reshape(()),
-                        reduction='mean',
-                    )
+                    val_loss_total = val_loss_total + _distributed_mean_scalar(accelerator, val_l)
                     val_loss_batches = val_loss_batches + 1.0
                     batch_counts = validation_confusion_metric.compute_batch(
                         ValidationMetricBatch(
@@ -675,9 +730,9 @@ def train(config_path):
                                 else ema_val_targets_with_ignore.float()
                             ),
                         )
-                        ema_val_loss_total = ema_val_loss_total + accelerator.reduce(
-                            ema_val_l.detach().to(device=accelerator.device, dtype=torch.float32).reshape(()),
-                            reduction='mean',
+                        ema_val_loss_total = ema_val_loss_total + _distributed_mean_scalar(
+                            accelerator,
+                            ema_val_l,
                         )
                         ema_val_loss_batches = ema_val_loss_batches + 1.0
                         preview_preds = ema_val_loss_preds[0] if isinstance(ema_val_loss_preds, (list, tuple)) else ema_val_loss_preds

@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import zarr
 
+from vesuvius.data.utils import open_zarr
 from vesuvius.models.configuration.config_manager import ConfigManager
 from vesuvius.models.datasets.find_valid_patches import find_valid_patches
 from .cache import (
@@ -27,13 +28,24 @@ from .cache import (
 logger = logging.getLogger(__name__)
 
 
+def _is_remote_path(path: Path | str) -> bool:
+    path_str = str(path)
+    return path_str.startswith(("s3://", "http://", "https://"))
+
+
+def _open_readonly_zarr(path: Path | str):
+    if _is_remote_path(path):
+        return open_zarr(str(path), mode="r")
+    return zarr.open(str(path), mode="r")
+
+
 @dataclass
 class VolumeInfo:
     """Metadata for a discovered OME-Zarr volume."""
 
     volume_id: str
-    image_path: Path
-    label_paths: Dict[str, Optional[Path]]
+    image_path: Path | str
+    label_paths: Dict[str, Optional[Path | str]]
 
 
 @dataclass
@@ -141,9 +153,9 @@ def generate_patch_caches(
     for vol in volumes:
         # Label array - pass zarr Group for multi-resolution support
         label_path = vol.label_paths.get(first_target)
-        if label_path and label_path.exists():
+        if label_path and (_is_remote_path(label_path) or Path(label_path).exists()):
             try:
-                label_arrays.append(zarr.open(label_path, mode="r"))
+                label_arrays.append(_open_readonly_zarr(label_path))
             except Exception as e:
                 logger.warning("Failed to open label %s: %s", label_path, e)
                 label_arrays.append(None)
@@ -157,7 +169,7 @@ def generate_patch_caches(
             should_use = not unlabeled_fg_volume_ids or vol.volume_id in unlabeled_fg_volume_ids
             if should_use:
                 try:
-                    image_arrays.append(zarr.open(vol.image_path, mode="r"))
+                    image_arrays.append(_open_readonly_zarr(vol.image_path))
                 except Exception as e:
                     logger.warning("Failed to open image %s: %s", vol.image_path, e)
                     image_arrays.append(None)
@@ -295,7 +307,7 @@ def _discover_volumes(
                 volumes.append(
                     VolumeInfo(
                         volume_id=str(spec["volume_id"]),
-                        image_path=Path(spec["image_path"]),
+                        image_path=spec["image_path"],
                         label_paths=label_paths,
                     )
                 )
