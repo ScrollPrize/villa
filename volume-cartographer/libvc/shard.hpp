@@ -2,31 +2,28 @@
 // Canonical shard format for vc volumes.
 //
 // Volume = pyramid of levels, each level = grid of shards.
-// Shard  = 1024^3 voxels = 8^3 chunks of 128^3 u8 voxels, H265 encoded.
-// Volumes are always padded to 1024 multiples. No partial shards/chunks.
+// Shard  = 1024^3 voxels = 8 z-slabs of 1024x1024 × 128 frames H.265 video.
+// Each slab is one video: 128 XY frames stacked along Z.
+// Volumes are always padded to 1024 multiples. No partial shards.
 //
-// Shard file layout (append-only):
-//   [chunk_0 H265 data][chunk_1 H265 data]...[chunk_511 H265 data][INDEX]
+// Shard file layout:
+//   [slab_0 H.265 bitstream][slab_1 bitstream]...[slab_7 bitstream][INDEX]
 //
-// INDEX = 512 entries of { uint32_t offset, uint32_t length }, 4096 bytes.
-//   Linear index: cz * 64 + cy * 8 + cx  (0 <= cz,cy,cx < 8)
-//   offset=0 && length=0 means chunk is empty (all zeros).
+// INDEX = 8 entries of { uint32_t offset, uint32_t length }, 64 bytes.
+//   slab i covers z-range [i*128, (i+1)*128) within the shard.
+//   offset=0 && length=0 means slab is empty (all zeros).
 //
 // On-disk layout:
-//   volume.zarr/
+//   volume/
 //     meta.json                  # {shape:[Z,Y,X], voxel_size:f, levels:N}
 //     0/                         # level 0 (full res)
 //       0.0.0.shard              # shard (sz=0, sy=0, sx=0)
-//       0.0.1.shard
-//       ...
-//     1/                         # level 1 (2x downsampled)
 //       ...
 
 #include "types.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -35,44 +32,31 @@
 
 namespace vc {
 
-inline constexpr int SHARD_DIM   = 1024;
-inline constexpr int CHUNK_DIM   = 128;
-inline constexpr int CHUNKS_PER  = SHARD_DIM / CHUNK_DIM;  // 8
-inline constexpr int INDEX_COUNT = CHUNKS_PER * CHUNKS_PER * CHUNKS_PER;  // 512
-inline constexpr int INDEX_BYTES = INDEX_COUNT * 8;  // 4096
+inline constexpr int SHARD_DIM  = 1024;
+inline constexpr int SLAB_FRAMES = 128;   // frames per slab video
+inline constexpr int SLABS_PER  = SHARD_DIM / SLAB_FRAMES;  // 8
+inline constexpr int SLAB_INDEX_COUNT = SLABS_PER;  // 8
+inline constexpr int SLAB_INDEX_BYTES = SLAB_INDEX_COUNT * 8;  // 64
 
-struct ShardIndex {
+struct SlabIndex {
     struct Entry { uint32_t offset, length; };
-    std::array<Entry, INDEX_COUNT> entries{};
-
-    static int linear(int cz, int cy, int cx) {
-        return cz * CHUNKS_PER * CHUNKS_PER + cy * CHUNKS_PER + cx;
-    }
-
-    Entry& at(int cz, int cy, int cx) { return entries[linear(cz, cy, cx)]; }
-    const Entry& at(int cz, int cy, int cx) const { return entries[linear(cz, cy, cx)]; }
+    std::array<Entry, SLABS_PER> entries{};
 };
 
-// Keys for addressing chunks and shards within a volume pyramid.
+// Keys
 struct ShardKey {
     int level, sz, sy, sx;
     bool operator==(const ShardKey&) const = default;
 };
 
-struct ChunkKey {
-    int level, sz, sy, sx, cz, cy, cx;
-    bool operator==(const ChunkKey&) const = default;
-
-    ShardKey shard() const { return {level, sz, sy, sx}; }
+struct FrameKey {
+    int level, z;  // global z coordinate at this level
+    bool operator==(const FrameKey&) const = default;
 };
 
-struct ChunkKeyHash {
-    size_t operator()(const ChunkKey& k) const noexcept {
-        // Pack into 64 bits: level(4) | sz(12) | sy(12) | sx(12) | cz(3) | cy(3) | cx(3)
-        auto h = uint64_t(k.level) << 45 | uint64_t(k.sz) << 33 |
-                 uint64_t(k.sy) << 21 | uint64_t(k.sx) << 9 |
-                 uint64_t(k.cz) << 6 | uint64_t(k.cy) << 3 | uint64_t(k.cx);
-        return std::hash<uint64_t>{}(h);
+struct FrameKeyHash {
+    size_t operator()(const FrameKey& k) const noexcept {
+        return std::hash<uint64_t>{}(uint64_t(k.level) << 32 | uint64_t(k.z));
     }
 };
 
@@ -84,16 +68,11 @@ struct ShardKeyHash {
     }
 };
 
-// Volume metadata (from meta.json)
+// Volume metadata
 struct VolumeMeta {
     Vec3i shape;        // level-0 shape {z, y, x}, always multiple of 1024
     float voxel_size;
-    int levels;         // number of pyramid levels
-
-    Vec3i shards_per_level(int level) const {
-        int s = 1 << level;
-        return {shape.z / (SHARD_DIM * s), shape.y / (SHARD_DIM * s), shape.x / (SHARD_DIM * s)};
-    }
+    int levels;
 
     Vec3i shape_at_level(int level) const {
         int s = 1 << level;
@@ -101,86 +80,79 @@ struct VolumeMeta {
     }
 };
 
-// -- Shard file path helpers ------------------------------------------------
+// A decoded frame: 1024x1024 u8 pixels.
+struct Frame {
+    std::vector<uint8_t> pixels;  // row-major, 1024*1024
+
+    Frame() : pixels(SHARD_DIM * SHARD_DIM, 0) {}
+
+    uint8_t at(int y, int x) const { return pixels[y * SHARD_DIM + x]; }
+    uint8_t* data() { return pixels.data(); }
+    const uint8_t* data() const { return pixels.data(); }
+    size_t byte_size() const { return pixels.size(); }
+};
+
+// -- File path helpers ------------------------------------------------------
 
 inline std::filesystem::path shard_path(const std::filesystem::path& root,
                                          int level, int sz, int sy, int sx) {
     return root / std::to_string(level) / std::format("{}.{}.{}.shard", sz, sy, sx);
 }
 
-// -- Read a shard index from a shard file or buffer -------------------------
+// -- Read slab index from shard file ----------------------------------------
 
-inline ShardIndex read_shard_index(const std::filesystem::path& path) {
-    ShardIndex idx{};
+inline SlabIndex read_slab_index(const std::filesystem::path& path) {
+    SlabIndex idx{};
     FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return idx;  // all zeros = all empty
-    fseek(f, -INDEX_BYTES, SEEK_END);
-    fread(idx.entries.data(), 1, INDEX_BYTES, f);
+    if (!f) return idx;
+    fseek(f, -SLAB_INDEX_BYTES, SEEK_END);
+    [[maybe_unused]] auto n = fread(idx.entries.data(), 1, SLAB_INDEX_BYTES, f);
     fclose(f);
     return idx;
 }
 
-inline ShardIndex read_shard_index(std::span<const uint8_t> shard_data) {
-    ShardIndex idx{};
-    if (shard_data.size() < INDEX_BYTES) return idx;
-    memcpy(idx.entries.data(), shard_data.data() + shard_data.size() - INDEX_BYTES, INDEX_BYTES);
-    return idx;
-}
+// -- Read a slab's compressed bitstream from a shard file -------------------
 
-// -- Read a single chunk from a shard file ----------------------------------
-// Returns H265 compressed bytes. Caller decodes with video_decode().
-
-inline std::vector<uint8_t> read_chunk_compressed(const std::filesystem::path& path,
-                                                    int cz, int cy, int cx) {
-    auto idx = read_shard_index(path);
-    auto e = idx.at(cz, cy, cx);
+inline std::vector<uint8_t> read_slab_compressed(const std::filesystem::path& path,
+                                                   int slab_idx) {
+    auto idx = read_slab_index(path);
+    auto e = idx.entries[slab_idx];
     if (e.length == 0) return {};
 
     std::vector<uint8_t> buf(e.length);
     FILE* f = fopen(path.c_str(), "rb");
     fseek(f, e.offset, SEEK_SET);
-    fread(buf.data(), 1, e.length, f);
+    [[maybe_unused]] auto n = fread(buf.data(), 1, e.length, f);
     fclose(f);
     return buf;
 }
 
-// Read a single chunk from an in-memory shard buffer.
-inline std::span<const uint8_t> read_chunk_compressed(std::span<const uint8_t> shard_data,
-                                                        int cz, int cy, int cx) {
-    auto idx = read_shard_index(shard_data);
-    auto e = idx.at(cz, cy, cx);
-    if (e.length == 0) return {};
-    return shard_data.subspan(e.offset, e.length);
-}
-
-// -- Write a complete shard from 512 compressed chunks ----------------------
-// chunks[i] may be empty (length 0) for all-zero chunks.
+// -- Write a shard from 8 compressed slab bitstreams ------------------------
 
 inline void write_shard(const std::filesystem::path& path,
-                         std::span<const std::vector<uint8_t>, INDEX_COUNT> chunks) {
+                         std::span<const std::vector<uint8_t>, SLABS_PER> slabs) {
     std::filesystem::create_directories(path.parent_path());
 
-    ShardIndex idx{};
+    SlabIndex idx{};
     uint32_t offset = 0;
-    for (int i = 0; i < INDEX_COUNT; ++i) {
-        if (chunks[i].empty()) {
+    for (int i = 0; i < SLABS_PER; ++i) {
+        if (slabs[i].empty()) {
             idx.entries[i] = {0, 0};
         } else {
-            idx.entries[i] = {offset, uint32_t(chunks[i].size())};
-            offset += uint32_t(chunks[i].size());
+            idx.entries[i] = {offset, uint32_t(slabs[i].size())};
+            offset += uint32_t(slabs[i].size());
         }
     }
 
     FILE* f = fopen(path.c_str(), "wb");
-    for (int i = 0; i < INDEX_COUNT; ++i) {
-        if (!chunks[i].empty())
-            fwrite(chunks[i].data(), 1, chunks[i].size(), f);
-    }
-    fwrite(idx.entries.data(), 1, INDEX_BYTES, f);
+    for (int i = 0; i < SLABS_PER; ++i)
+        if (!slabs[i].empty())
+            fwrite(slabs[i].data(), 1, slabs[i].size(), f);
+    fwrite(idx.entries.data(), 1, SLAB_INDEX_BYTES, f);
     fclose(f);
 }
 
-// -- Read an entire shard file into memory ----------------------------------
+// -- Read entire shard file into memory -------------------------------------
 
 inline std::vector<uint8_t> read_shard_file(const std::filesystem::path& path) {
     FILE* f = fopen(path.c_str(), "rb");
@@ -189,7 +161,7 @@ inline std::vector<uint8_t> read_shard_file(const std::filesystem::path& path) {
     auto sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     std::vector<uint8_t> buf(sz);
-    fread(buf.data(), 1, sz, f);
+    [[maybe_unused]] auto n = fread(buf.data(), 1, sz, f);
     fclose(f);
     return buf;
 }

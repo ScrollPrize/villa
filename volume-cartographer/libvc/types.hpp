@@ -98,24 +98,8 @@ struct Framebuffer {
     int stride() const { return width; }
 };
 
-// -- ChunkData --------------------------------------------------------------
-// Decompressed volume chunk. Plain byte buffer with shape.
+// -- Volume hierarchy constants ---------------------------------------------
 
-struct ChunkData {
-    std::vector<uint8_t> bytes;
-    Vec3i shape{};          // {z, y, x}
-    int elem_size = 1;      // 1=u8, 2=u16
-
-    bool empty() const { return bytes.empty(); }
-    std::size_t byte_size() const { return bytes.size(); }
-
-    template<typename T>
-    T* data() { return reinterpret_cast<T*>(bytes.data()); }
-    template<typename T>
-    const T* data() const { return reinterpret_cast<const T*>(bytes.data()); }
-
-    int stride_z() const { return shape.y * shape.x; }
-    int stride_y() const { return shape.x; }
-};
+inline constexpr int BLOCK_DIM = 16;  // smallest addressable unit
 
 } // namespace vc

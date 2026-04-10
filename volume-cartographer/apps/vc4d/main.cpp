@@ -98,10 +98,10 @@ public:
             emit volume_closed();
         }
 
-        vc::ChunkCache::Config cc;
-        cc.hot_max_bytes = 2ULL << 30;
+        vc::FrameCache::Config cc;
+        cc.max_bytes = 2ULL << 30;
         cc.io_threads = 4;
-        cc.decode = vc::h265_decode;
+        cc.decode = vc::h265_decode_slab;
 
         _vol = std::make_unique<vc::Volume>(vc::Volume::open(path, std::move(cc)));
 
