@@ -105,6 +105,7 @@ def run_autoreg_mesh_benchmark(
         "distance_aware_coarse_targets_enabled": bool(cfg.get("distance_aware_coarse_targets_enabled", True)),
         "distance_aware_coarse_target_radius": int(cfg.get("distance_aware_coarse_target_radius", 1)),
         "distance_aware_coarse_target_sigma": float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
+        "cross_attention_use_rope": bool(cfg.get("cross_attention_use_rope", True)),
         "rope_normalize_coords": cfg.get("rope_normalize_coords"),
         "rope_shift_coords": cfg.get("rope_shift_coords"),
         "rope_jitter_coords": cfg.get("rope_jitter_coords"),

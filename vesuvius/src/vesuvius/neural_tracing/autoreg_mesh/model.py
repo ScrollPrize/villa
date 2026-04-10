@@ -47,6 +47,42 @@ def _batched_rope_from_coords(rope: MixedRopePositionEmbedding, coords: Tensor) 
     return sin, cos
 
 
+def _batched_shared_rope_from_coords(
+    rope: MixedRopePositionEmbedding,
+    query_coords: Tensor,
+    key_coords: Tensor,
+) -> tuple[tuple[Tensor, Tensor], tuple[Tensor, Tensor]]:
+    if query_coords.ndim != 3 or query_coords.shape[-1] != 3:
+        raise ValueError(f"query_coords must have shape [B, Tq, 3], got {tuple(query_coords.shape)}")
+    if key_coords.ndim != 3 or key_coords.shape[-1] != 3:
+        raise ValueError(f"key_coords must have shape [B, Tk, 3], got {tuple(key_coords.shape)}")
+    if query_coords.shape[0] != key_coords.shape[0]:
+        raise ValueError("query_coords and key_coords must have matching batch size")
+
+    query_sin, query_cos = [], []
+    key_sin, key_cos = [], []
+    rope_dtype = rope.periods.dtype
+    for q_coords, k_coords in zip(query_coords, key_coords, strict=True):
+        q_coords = q_coords.to(dtype=rope_dtype)
+        k_coords = k_coords.to(dtype=rope_dtype)
+        shift, jitter, rescale = rope._sample_coord_augmentation_params(device=q_coords.device, dtype=q_coords.dtype)
+        q_coords = rope.apply_coord_augmentation_params(q_coords, shift=shift, jitter=jitter, rescale=rescale)
+        k_coords = rope.apply_coord_augmentation_params(k_coords, shift=shift, jitter=jitter, rescale=rescale)
+        q_sin, q_cos = rope.get_embed_from_coords(q_coords)
+        k_sin, k_cos = rope.get_embed_from_coords(k_coords)
+        query_sin.append(q_sin)
+        query_cos.append(q_cos)
+        key_sin.append(k_sin)
+        key_cos.append(k_cos)
+    return (
+        torch.stack(query_sin, dim=0),
+        torch.stack(query_cos, dim=0),
+    ), (
+        torch.stack(key_sin, dim=0),
+        torch.stack(key_cos, dim=0),
+    )
+
+
 class RotarySelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, rope: MixedRopePositionEmbedding, dropout: float = 0.0) -> None:
         super().__init__()
@@ -83,25 +119,41 @@ class RotarySelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        *,
+        rope: MixedRopePositionEmbedding | None = None,
+        use_rope: bool = True,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
         self.num_heads = int(num_heads)
         self.head_dim = int(dim // num_heads)
         self.scale = self.head_dim ** -0.5
+        self.rope = rope
+        self.use_rope = bool(use_rope and rope is not None)
         self.q_proj = nn.Linear(dim, dim, bias=True)
         self.k_proj = nn.Linear(dim, dim, bias=True)
         self.v_proj = nn.Linear(dim, dim, bias=True)
         self.out_proj = nn.Linear(dim, dim, bias=True)
         self.dropout = float(dropout)
 
-    def forward(self, x: Tensor, memory: Tensor) -> Tensor:
+    def forward(self, x: Tensor, memory: Tensor, *, query_coords: Tensor | None = None, memory_coords: Tensor | None = None) -> Tensor:
         batch_size, seq_len, dim = x.shape
         memory_len = int(memory.shape[1])
         q = self.q_proj(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(memory).reshape(batch_size, memory_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(memory).reshape(batch_size, memory_len, self.num_heads, self.head_dim).transpose(1, 2)
+        if self.use_rope:
+            if query_coords is None or memory_coords is None:
+                raise ValueError("query_coords and memory_coords are required when cross-attention RoPE is enabled")
+            (q_sin, q_cos), (k_sin, k_cos) = _batched_shared_rope_from_coords(self.rope, query_coords, memory_coords)
+            q = apply_rotary_embedding(q, (q_sin, q_cos)).type_as(v)
+            k = apply_rotary_embedding(k, (k_sin, k_cos)).type_as(v)
         q = q * self.scale
         out = F.scaled_dot_product_attention(
             q,
@@ -141,19 +193,23 @@ class DecoderBlock(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         enable_cross_attention: bool = True,
+        cross_attention_use_rope: bool = True,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.self_attn = RotarySelfAttention(dim, num_heads, rope=rope, dropout=dropout)
         self.norm2 = nn.LayerNorm(dim)
-        self.cross_attn = CrossAttention(dim, num_heads, dropout=dropout) if enable_cross_attention else None
+        self.cross_attn = (
+            CrossAttention(dim, num_heads, rope=rope, use_rope=cross_attention_use_rope, dropout=dropout)
+            if enable_cross_attention else None
+        )
         self.norm3 = nn.LayerNorm(dim)
         self.ffn = FeedForward(dim, mlp_ratio=mlp_ratio, dropout=dropout)
 
-    def forward(self, x: Tensor, coords: Tensor, attn_mask: Tensor, memory: Tensor) -> Tensor:
+    def forward(self, x: Tensor, coords: Tensor, attn_mask: Tensor, memory: Tensor, memory_coords: Tensor) -> Tensor:
         x = x + self.self_attn(self.norm1(x), coords=coords, attn_mask=attn_mask)
         if self.cross_attn is not None:
-            x = x + self.cross_attn(self.norm2(x), memory=memory)
+            x = x + self.cross_attn(self.norm2(x), memory=memory, query_coords=coords, memory_coords=memory_coords)
         x = x + self.ffn(self.norm3(x))
         return x
 
@@ -232,6 +288,7 @@ class AutoregMeshModel(nn.Module):
                     mlp_ratio=float(self.config["decoder_mlp_ratio"]),
                     dropout=float(self.config["decoder_dropout"]),
                     enable_cross_attention=(block_idx % self.cross_attention_every_n_blocks == 0),
+                    cross_attention_use_rope=bool(self.config.get("cross_attention_use_rope", True)),
                 )
                 for block_idx in range(self.decoder_depth)
             ]
@@ -439,6 +496,7 @@ class AutoregMeshModel(nn.Module):
         batch: dict,
         *,
         memory_tokens: Tensor,
+        memory_patch_centers: Tensor,
         generation_inputs: dict[str, Tensor] | None = None,
     ) -> dict[str, Tensor]:
         prompt = batch["prompt_tokens"]
@@ -476,7 +534,7 @@ class AutoregMeshModel(nn.Module):
 
         x = seq_embeddings
         for block in self.blocks:
-            x = block(x, coords=seq_coords, attn_mask=attn_mask, memory=memory_tokens)
+            x = block(x, coords=seq_coords, attn_mask=attn_mask, memory=memory_tokens, memory_coords=memory_patch_centers)
             x = x * seq_mask.unsqueeze(-1).to(dtype=x.dtype)
         x = self.final_norm(x)
 
@@ -519,7 +577,11 @@ class AutoregMeshModel(nn.Module):
         generation_inputs = None
         if self.training and float(scheduled_sampling_prob) > 0.0:
             with torch.no_grad():
-                teacher_outputs = self.forward_from_encoded(batch, memory_tokens=encoded["memory_tokens"])
+                teacher_outputs = self.forward_from_encoded(
+                    batch,
+                    memory_tokens=encoded["memory_tokens"],
+                    memory_patch_centers=encoded["memory_patch_centers"],
+                )
             generation_inputs = self._build_scheduled_generation_inputs(
                 batch,
                 teacher_outputs=teacher_outputs,
@@ -528,6 +590,7 @@ class AutoregMeshModel(nn.Module):
         outputs = self.forward_from_encoded(
             batch,
             memory_tokens=encoded["memory_tokens"],
+            memory_patch_centers=encoded["memory_patch_centers"],
             generation_inputs=generation_inputs,
         )
         outputs["coarse_grid_shape"] = encoded["coarse_grid_shape"]

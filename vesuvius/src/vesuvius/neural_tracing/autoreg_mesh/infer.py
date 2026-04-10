@@ -150,7 +150,11 @@ def infer_autoreg_mesh(
             target_xyz=target_xyz,
             target_strip_coords=target_strip_coords,
         )
-        outputs = model.forward_from_encoded(pseudo_batch, memory_tokens=memory_tokens)
+        outputs = model.forward_from_encoded(
+            pseudo_batch,
+            memory_tokens=memory_tokens,
+            memory_patch_centers=encoded["memory_patch_centers"],
+        )
 
         coarse_logits = outputs["coarse_logits"][0, current_len - 1]
         coarse_id = int(_sample_from_logits(coarse_logits, greedy=greedy).item())

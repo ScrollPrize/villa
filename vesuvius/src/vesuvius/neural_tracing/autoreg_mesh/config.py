@@ -49,6 +49,7 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "rope_jitter_coords": 1.05,
     "rope_rescale_coords": 2.0,
     "rope_dtype": "float32",
+    "cross_attention_use_rope": True,
     "scheduled_sampling_enabled": False,
     "scheduled_sampling_mode": "linear_full_token_greedy",
     "scheduled_sampling_max_prob": 0.10,
@@ -175,6 +176,8 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
     if cfg.get("rope_rescale_coords") is not None and float(cfg["rope_rescale_coords"]) <= 1.0:
         raise ValueError("rope_rescale_coords must be > 1.0")
     _resolve_rope_dtype(cfg.get("rope_dtype"))
+    if not isinstance(cfg.get("cross_attention_use_rope"), bool):
+        raise ValueError("cross_attention_use_rope must be a boolean")
     if str(cfg["scheduled_sampling_mode"]) != "linear_full_token_greedy":
         raise ValueError("scheduled_sampling_mode must currently be 'linear_full_token_greedy'")
     if float(cfg["scheduled_sampling_max_prob"]) < 0.0 or float(cfg["scheduled_sampling_max_prob"]) > 1.0:

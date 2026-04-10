@@ -654,6 +654,7 @@ def test_mixed_precision_is_rejected_until_supported() -> None:
 def test_rope_default_config_values() -> None:
     config = _make_cached_token_config()
     validated = validate_autoreg_mesh_config(config)
+    assert validated["cross_attention_use_rope"] is True
     assert validated["rope_normalize_coords"] == "separate"
     assert validated["rope_shift_coords"] == pytest.approx(0.05)
     assert validated["rope_jitter_coords"] == pytest.approx(1.05)
@@ -683,6 +684,11 @@ def test_rope_config_validation_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="rope_shift_coords"):
         validate_autoreg_mesh_config(bad_shift)
 
+    bad_cross_rope = _make_cached_token_config()
+    bad_cross_rope["cross_attention_use_rope"] = "yes"
+    with pytest.raises(ValueError, match="cross_attention_use_rope"):
+        validate_autoreg_mesh_config(bad_cross_rope)
+
 
 def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     config = _make_cached_token_config()
@@ -707,12 +713,27 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     assert result["distance_aware_coarse_targets_enabled"] is True
     assert result["distance_aware_coarse_target_radius"] == 1
     assert result["distance_aware_coarse_target_sigma"] == pytest.approx(1.0)
+    assert result["cross_attention_use_rope"] is True
     assert result["rope_normalize_coords"] == "separate"
     assert result["rope_shift_coords"] == pytest.approx(0.05)
     assert result["rope_jitter_coords"] == pytest.approx(1.05)
     assert result["rope_rescale_coords"] == pytest.approx(2.0)
     assert result["forward_ms"] >= 0.0
     assert result["infer_ms"] >= 0.0
+
+
+def test_cross_attention_rope_can_be_disabled(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = _make_config(checkpoint)
+    config["cross_attention_use_rope"] = False
+    model = AutoregMeshModel(config).eval()
+
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    batch = _move_batch(batch, torch.device("cpu"))
+    outputs = model(batch)
+
+    assert torch.isfinite(outputs["coarse_logits"]).all()
 
 
 def test_autoreg_mesh_wandb_logging_includes_metrics_and_images(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
