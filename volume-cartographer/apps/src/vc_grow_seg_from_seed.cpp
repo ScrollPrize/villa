@@ -640,6 +640,36 @@ int main(int argc, char *argv[])
             }
         }
 
+        // Flip normals inconsistent with the majority direction.
+        {
+            cv::Vec3d consensus(0.0, 0.0, 0.0);
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < cols; ++c) {
+                    if (ray_dir_valid(r, c)) {
+                        consensus += cv::Vec3d(ray_dirs(r, c));
+                    }
+                }
+            }
+            const double clen = cv::norm(consensus);
+            if (clen > 1e-6) {
+                consensus *= 1.0 / clen;
+                int flipped = 0;
+                for (int r = 0; r < rows; ++r) {
+                    for (int c = 0; c < cols; ++c) {
+                        if (!ray_dir_valid(r, c)) continue;
+                        if (consensus.dot(cv::Vec3d(ray_dirs(r, c))) < 0.0) {
+                            ray_dirs(r, c) *= -1.f;
+                            ++flipped;
+                        }
+                    }
+                }
+                if (flipped > 0) {
+                    std::cout << "gen_neighbor: flipped " << flipped
+                              << " normals to match majority direction" << std::endl;
+                }
+            }
+        }
+
         auto has_ray_dir = [&](int rr, int cc) -> bool {
             return ray_dir_valid(rr, cc) != 0;
         };
