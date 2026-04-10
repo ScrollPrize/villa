@@ -530,6 +530,46 @@ def test_position_refine_weight_activates_after_start_step(tmp_path: Path) -> No
     assert "refine_loss" in result["history"][1]
 
 
+def test_offset_loss_is_gated_by_active_weight(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = _make_config(checkpoint)
+    model = AutoregMeshModel(config)
+
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    batch = _move_batch(batch, torch.device("cpu"))
+    outputs = model(batch)
+
+    off_losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        offset_loss_weight_active=0.0,
+    )
+    on_losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        offset_loss_weight_active=1.0,
+    )
+
+    assert off_losses["offset_loss_weight_active"].item() == pytest.approx(0.0)
+    assert on_losses["offset_loss_weight_active"].item() == pytest.approx(1.0)
+    assert off_losses["loss"].item() < on_losses["loss"].item()
+
+
+def test_offset_loss_weight_activates_after_start_step(tmp_path: Path) -> None:
+    config = _make_cached_token_config()
+    config["out_dir"] = str(tmp_path / "runs_offset")
+    config["offset_loss_start_step"] = 1
+    dataset = _make_training_dataset()
+
+    result = run_autoreg_mesh_training(config, dataset=dataset, device="cpu", max_steps=2)
+
+    assert result["history"][0]["offset_loss_weight_active"] == pytest.approx(0.0)
+    assert result["history"][1]["offset_loss_weight_active"] == pytest.approx(1.0)
+
+
 def test_distance_aware_target_builder_normalizes_and_respects_edges() -> None:
     target_ids = torch.tensor([[0, 21]], dtype=torch.long)
     mask = torch.tensor([[True, True]], dtype=torch.bool)

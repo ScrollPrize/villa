@@ -236,6 +236,12 @@ def _position_refine_weight_active(cfg: dict, *, global_step: int) -> float:
     return float(cfg.get("position_refine_weight", 0.0))
 
 
+def _offset_loss_weight_active(cfg: dict, *, global_step: int) -> float:
+    if int(global_step) < int(cfg.get("offset_loss_start_step", 0)):
+        return 0.0
+    return 1.0
+
+
 def _as_numpy_grid(grid) -> np.ndarray:
     if torch.is_tensor(grid):
         return grid.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -447,6 +453,7 @@ def _evaluate_validation(
             batch,
             offset_num_bins=tuple(int(v) for v in cfg["offset_num_bins"]),
             occupancy_loss_weight=float(cfg.get("occupancy_loss_weight", 0.0)),
+            offset_loss_weight_active=_offset_loss_weight_active(cfg, global_step=global_step),
             position_refine_weight_active=_position_refine_weight_active(cfg, global_step=global_step),
             position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
             distance_aware_coarse_targets_enabled=bool(cfg.get("distance_aware_coarse_targets_enabled", True)),
@@ -584,6 +591,7 @@ def run_autoreg_mesh_training(
 
             optimizer.zero_grad(set_to_none=True)
             scheduled_sampling_prob = _scheduled_sampling_prob(cfg, global_step=global_step)
+            offset_loss_weight_active = _offset_loss_weight_active(cfg, global_step=global_step)
             position_refine_weight_active = _position_refine_weight_active(cfg, global_step=global_step)
             outputs = model(batch, scheduled_sampling_prob=scheduled_sampling_prob)
             loss_dict = compute_autoreg_mesh_losses(
@@ -591,6 +599,7 @@ def run_autoreg_mesh_training(
                 batch,
                 offset_num_bins=tuple(int(v) for v in cfg["offset_num_bins"]),
                 occupancy_loss_weight=float(cfg.get("occupancy_loss_weight", 0.0)),
+                offset_loss_weight_active=offset_loss_weight_active,
                 position_refine_weight_active=position_refine_weight_active,
                 position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
                 distance_aware_coarse_targets_enabled=bool(cfg.get("distance_aware_coarse_targets_enabled", True)),
@@ -618,6 +627,7 @@ def run_autoreg_mesh_training(
             metrics["current_lr"] = float(optimizer.param_groups[0]["lr"])
             metrics["grad_norm"] = grad_norm_value
             metrics["scheduled_sampling_prob"] = float(scheduled_sampling_prob)
+            metrics["offset_loss_weight_active"] = float(offset_loss_weight_active)
             metrics["position_refine_weight_active"] = float(position_refine_weight_active)
             metrics["step"] = float(global_step)
             if skipped_step > 0.0:

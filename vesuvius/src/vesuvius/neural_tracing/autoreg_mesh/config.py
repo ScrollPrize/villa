@@ -14,6 +14,7 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "use_stored_resolution_only": False,
     "patch_size": [8, 8, 8],
     "offset_num_bins": [16, 16, 16],
+    "offset_loss_start_step": 0,
     "direction_order": ["left", "right", "up", "down"],
     "cache_vol_tokens": False,
     "vol_token_cache": None,
@@ -109,6 +110,8 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError(f"patch_size must be positive, got {cfg['patch_size']!r}")
     if any(size <= 0 for size in cfg["offset_num_bins"]):
         raise ValueError(f"offset_num_bins must be positive, got {cfg['offset_num_bins']!r}")
+    if int(cfg["offset_loss_start_step"]) < 0:
+        raise ValueError("offset_loss_start_step must be >= 0")
     if any(size % patch != 0 for size, patch in zip(cfg["input_shape"], cfg["patch_size"])):
         raise ValueError(
             f"input_shape {cfg['input_shape']!r} must be divisible by patch_size {cfg['patch_size']!r}"

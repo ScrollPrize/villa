@@ -21,6 +21,7 @@
   "dinov2_backbone": "/ephemeral/dinov2_ckpts/shift005_jitter005_step_342500.pt/checkpoint_step_342500.pt",
   "patch_size": [8, 8, 8],
   "offset_num_bins": [16, 16, 16],
+  "offset_loss_start_step": 2000,
   "decoder_dim": 768,
   "decoder_depth": 16,
   "decoder_num_heads": 16,

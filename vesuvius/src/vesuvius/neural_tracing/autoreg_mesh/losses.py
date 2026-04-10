@@ -173,6 +173,7 @@ def compute_autoreg_mesh_losses(
     *,
     offset_num_bins: tuple[int, int, int],
     occupancy_loss_weight: float = 0.0,
+    offset_loss_weight_active: float = 1.0,
     position_refine_weight_active: float = 0.0,
     position_refine_loss_type: str = "huber",
     distance_aware_coarse_targets_enabled: bool = True,
@@ -190,7 +191,7 @@ def compute_autoreg_mesh_losses(
     )
     offset_loss = _offset_bin_loss(outputs, batch, offset_num_bins=offset_num_bins)
     stop_loss = _stop_loss(outputs, batch)
-    total_loss = coarse_loss + offset_loss + stop_loss
+    total_loss = coarse_loss + float(offset_loss_weight_active) * offset_loss + stop_loss
     refine_loss = total_loss.new_zeros(())
     if float(position_refine_weight_active) > 0.0:
         refine_loss = _position_refine_loss(outputs, batch, loss_type=position_refine_loss_type)
@@ -207,6 +208,7 @@ def compute_autoreg_mesh_losses(
         "coarse_loss": coarse_loss,
         "coarse_target_entropy": coarse_target_entropy,
         "offset_loss": offset_loss,
+        "offset_loss_weight_active": total_loss.new_tensor(float(offset_loss_weight_active)),
         "stop_loss": stop_loss,
         "refine_loss": refine_loss,
         "refine_loss_weight_active": total_loss.new_tensor(float(position_refine_weight_active)),
