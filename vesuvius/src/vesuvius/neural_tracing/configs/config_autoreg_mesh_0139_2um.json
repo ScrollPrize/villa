@@ -38,7 +38,7 @@
   "position_refine_weight": 0.05,
   "position_refine_start_step": 5000,
   "distance_aware_coarse_targets_enabled": true,
-  "distance_aware_coarse_target_radius": 2,
+  "distance_aware_coarse_target_radius": 1,
   "distance_aware_coarse_target_sigma": 1.0,
   "distance_aware_coarse_target_loss": "soft_ce",
   "batch_size": 14,

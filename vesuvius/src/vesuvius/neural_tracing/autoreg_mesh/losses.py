@@ -176,8 +176,8 @@ def compute_autoreg_mesh_losses(
     position_refine_weight_active: float = 0.0,
     position_refine_loss_type: str = "huber",
     distance_aware_coarse_targets_enabled: bool = True,
-    distance_aware_coarse_target_radius: int = 2,
-    distance_aware_coarse_target_sigma: float = 2.0,
+    distance_aware_coarse_target_radius: int = 1,
+    distance_aware_coarse_target_sigma: float = 1.0,
     distance_aware_coarse_target_loss: str = "soft_ce",
 ) -> dict[str, Tensor]:
     coarse_loss, coarse_target_entropy = _coarse_pointer_loss(

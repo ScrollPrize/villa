@@ -38,7 +38,7 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "position_refine_weight": 0.05,
     "position_refine_start_step": 5000,
     "distance_aware_coarse_targets_enabled": True,
-    "distance_aware_coarse_target_radius": 2,
+    "distance_aware_coarse_target_radius": 1,
     "distance_aware_coarse_target_sigma": 1.0,
     "distance_aware_coarse_target_loss": "soft_ce",
     "optimizer": {"name": "adamw", "learning_rate": 1e-4, "weight_decay": 1e-4},

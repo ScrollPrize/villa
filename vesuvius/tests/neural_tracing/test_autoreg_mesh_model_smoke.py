@@ -552,7 +552,7 @@ def test_distance_aware_target_default_config_values() -> None:
     config = _make_cached_token_config()
     validated = validate_autoreg_mesh_config(config)
     assert validated["distance_aware_coarse_targets_enabled"] is True
-    assert validated["distance_aware_coarse_target_radius"] == 2
+    assert validated["distance_aware_coarse_target_radius"] == 1
     assert validated["distance_aware_coarse_target_sigma"] == pytest.approx(1.0)
 
 
@@ -630,7 +630,7 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     assert result["median_valid_target_tokens"] > 0
     assert result["refine_head_present"] is True
     assert result["distance_aware_coarse_targets_enabled"] is True
-    assert result["distance_aware_coarse_target_radius"] == 2
+    assert result["distance_aware_coarse_target_radius"] == 1
     assert result["distance_aware_coarse_target_sigma"] == pytest.approx(1.0)
     assert result["forward_ms"] >= 0.0
     assert result["infer_ms"] >= 0.0
