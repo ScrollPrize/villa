@@ -18,8 +18,9 @@ class TwoStreamBatchSampler(Sampler[list[int]]):
     ):
         self.primary_indices = [int(idx) for idx in primary_indices]
         self.secondary_indices = [int(idx) for idx in secondary_indices]
+        self.batch_size = int(batch_size)
         self.secondary_batch_size = int(secondary_batch_size)
-        self.primary_batch_size = int(batch_size) - self.secondary_batch_size
+        self.primary_batch_size = self.batch_size - self.secondary_batch_size
         self.seed = int(seed)
         self._epoch = 0
 

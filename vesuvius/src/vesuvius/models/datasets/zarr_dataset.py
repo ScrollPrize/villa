@@ -22,6 +22,7 @@ import torch
 import zarr
 from torch.utils.data import Dataset
 
+from vesuvius.data.utils import open_zarr
 from vesuvius.utils.utils import pad_or_crop_3d, pad_or_crop_2d
 from .intensity_properties import initialize_intensity_properties
 from ..training.normalization import get_normalization
@@ -32,13 +33,18 @@ from ..augmentation.transforms.utils.perf import collect_augmentation_names
 logger = logging.getLogger(__name__)
 
 
+def _is_remote_path(path: Path | str) -> bool:
+    path_str = str(path)
+    return path_str.startswith(("s3://", "http://", "https://"))
+
+
 @dataclass
 class VolumeInfo:
     """Metadata for a loaded OME-Zarr volume."""
     volume_id: str
-    image_path: Path
+    image_path: Path | str
     image_array: zarr.Array
-    label_paths: Dict[str, Optional[Path]]
+    label_paths: Dict[str, Optional[Path | str]]
     label_arrays: Dict[str, Optional[zarr.Array]]
     spatial_shape: Tuple[int, ...]
     scale: Optional[int] = None
@@ -242,11 +248,11 @@ class ZarrDataset(Dataset):
         """Load explicitly configured image/label volume specs."""
         for spec in volume_specs:
             volume_id = str(spec["volume_id"])
-            image_path = Path(spec["image_path"])
+            image_path = spec["image_path"]
             scale = spec.get("scale")
             dilate = spec.get("dilate")
 
-            if not image_path.exists():
+            if not _is_remote_path(image_path) and not Path(image_path).exists():
                 raise FileNotFoundError(
                     f"Explicit image path for volume '{volume_id}' does not exist: {image_path}"
                 )
@@ -260,8 +266,7 @@ class ZarrDataset(Dataset):
             for target in self.target_names:
                 label_path = raw_label_paths.get(target)
                 if label_path is not None:
-                    label_path = Path(label_path)
-                    if not label_path.exists():
+                    if not _is_remote_path(label_path) and not Path(label_path).exists():
                         raise FileNotFoundError(
                             f"Explicit label path for volume '{volume_id}' target "
                             f"'{target}' does not exist: {label_path}"
@@ -306,9 +311,12 @@ class ZarrDataset(Dataset):
                 dilate,
             )
 
-    def _open_zarr(self, path: Path, scale: Optional[int] = None) -> zarr.Array:
+    def _open_zarr(self, path: Path | str, scale: Optional[int] = None) -> zarr.Array:
         """Open a zarr array at the configured resolution level."""
-        store = zarr.open(path, mode="r")
+        if _is_remote_path(path):
+            store = open_zarr(str(path), mode="r")
+        else:
+            store = zarr.open(str(path), mode="r")
 
         # Handle zarr Group (OME-Zarr format)
         if isinstance(store, zarr.Group):

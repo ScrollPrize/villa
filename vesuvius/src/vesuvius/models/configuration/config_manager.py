@@ -99,6 +99,10 @@ class ConfigManager:
         if raw_path in (None, ""):
             return None
 
+        raw_path_str = str(raw_path)
+        if raw_path_str.startswith(("s3://", "http://", "https://")):
+            return raw_path_str
+
         candidate = Path(raw_path)
         if not candidate.is_absolute():
             base_dir = self._config_path.parent if self._config_path is not None else Path.cwd()
@@ -127,6 +131,10 @@ class ConfigManager:
                 used_names[unique_candidate] = 1
                 return unique_candidate
             next_index += 1
+
+    @staticmethod
+    def _path_stem(path_value):
+        return Path(str(path_value).rstrip("/")).stem
 
     def get_explicit_volume_specs(self):
         """
@@ -163,7 +171,7 @@ class ConfigManager:
 
             if isinstance(spec, (str, Path)):
                 image_path = self._resolve_config_relative_path(spec)
-                volume_id = entry_name or image_path.stem or f"volume_{index}"
+                volume_id = entry_name or self._path_stem(image_path) or f"volume_{index}"
             elif isinstance(spec, dict):
                 image_raw = spec.get("image")
                 if image_raw is None:
@@ -179,7 +187,7 @@ class ConfigManager:
                     or spec.get("id")
                     or spec.get("name")
                     or entry_name
-                    or image_path.stem
+                    or self._path_stem(image_path)
                     or f"volume_{index}"
                 )
 

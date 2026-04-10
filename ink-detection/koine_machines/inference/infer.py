@@ -18,7 +18,10 @@ from urllib.parse import urlparse
 import numpy as np
 import tifffile
 import torch
+import torch.multiprocessing
 import torch.nn as nn
+
+torch.multiprocessing.set_start_method("spawn", force=True)
 import torch.nn.functional as F
 import zarr
 from torch.utils.data import DataLoader, Dataset
@@ -526,7 +529,7 @@ def logits_to_probabilities(
         raise ValueError(
             f"Expected model logits shaped [B, C, H, W], got {tuple(logits.shape)}"
         )
-    probs_t = torch.sigmoid(logits).to(dtype=torch.float32)
+    probs_t = logits.float().sigmoid_()
     if probs_t.shape[-2:] != tuple(int(v) for v in image_hw):
         if not logged_resize:
             LOGGER.info(
@@ -690,9 +693,11 @@ def convert_volume_dtype(data: np.ndarray) -> np.ndarray:
     if data.dtype == np.uint16:
         return np.ascontiguousarray((data >> 8).astype(np.uint8, copy=False))
     if np.issubdtype(data.dtype, np.integer):
-        return np.ascontiguousarray(np.clip(data, 0, 255).astype(np.uint8, copy=False))
+        np.clip(data, 0, 255, out=data)
+        return np.ascontiguousarray(data.astype(np.uint8, copy=False))
     if np.issubdtype(data.dtype, np.floating):
-        return np.ascontiguousarray(np.clip(data, 0, 255).astype(np.uint8, copy=False))
+        np.clip(data, 0, 255, out=data)
+        return np.ascontiguousarray(data.astype(np.uint8, copy=False))
     raise TypeError(f"Unsupported zarr dtype {data.dtype}")
 
 
@@ -914,9 +919,10 @@ class OmeZarrBlockDataset(Dataset):
 
             patch = normalize_robust(patch)
         else:
-            patch = patch.astype(np.float32, copy=False) / 255.0
+            patch = np.ascontiguousarray(patch, dtype=np.float32)
+            patch *= 1.0 / 255.0
         # Models trained in this repo consume channel-first 3D volumes: [C, Z, Y, X].
-        image = torch.from_numpy(np.ascontiguousarray(patch)).unsqueeze(0)
+        image = torch.from_numpy(patch).unsqueeze(0)
         meta = torch.tensor([block.y0, block.x0, block.valid_h, block.valid_w], dtype=torch.int64)
         return image, meta
 
@@ -1310,39 +1316,43 @@ def run_block_inference(
         )
     else:
         LOGGER.info("Mirror TTA disabled.")
-    with torch.inference_mode():
+    if mask is not None:
+        mask = mask.astype(np.float32, copy=False)
+    patch_h, patch_w = weight_map.shape
+    amp_context = (
+        torch.autocast(device_type="cuda", enabled=True, dtype=amp_dtype)
+        if autocast_enabled
+        else nullcontext()
+    )
+    with torch.inference_mode(), amp_context:
         for images, meta in tqdm(loader, desc="Infer", unit="block"):
             images = images.to(device, non_blocking=True)
-            amp_context = (
-                torch.autocast(device_type="cuda", enabled=True, dtype=amp_dtype)
-                if autocast_enabled
-                else nullcontext()
-            )
-            with amp_context:
-                if tta_axes:
-                    probs_t, logged_resize = predict_with_mirror_tta(
-                        model,
-                        images,
-                        tta_axes=tta_axes,
-                        tta_batch_size=tta_batch_size,
-                        logged_resize=logged_resize,
-                    )
-                else:
-                    logits = model(images)
-                    probs_t, logged_resize = logits_to_probabilities(
-                        logits,
-                        image_hw=tuple(int(v) for v in images.shape[-2:]),
-                        logged_resize=logged_resize,
-                    )
-            probs = probs_t.detach().cpu().numpy()[:, 0]
+            if tta_axes:
+                probs_t, logged_resize = predict_with_mirror_tta(
+                    model,
+                    images,
+                    tta_axes=tta_axes,
+                    tta_batch_size=tta_batch_size,
+                    logged_resize=logged_resize,
+                )
+            else:
+                logits = model(images)
+                probs_t, logged_resize = logits_to_probabilities(
+                    logits,
+                    image_hw=tuple(int(v) for v in images.shape[-2:]),
+                    logged_resize=logged_resize,
+                )
+            probs = probs_t.cpu().numpy()[:, 0]
             meta_np = meta.cpu().numpy()
             for i in range(probs.shape[0]):
                 y0, x0, valid_h, valid_w = [int(v) for v in meta_np[i]]
-                tile = np.asarray(probs[i, :valid_h, :valid_w], dtype=np.float32)
-                tile_weights = np.asarray(weight_map[:valid_h, :valid_w], dtype=np.float32)
+                tile = probs[i, :valid_h, :valid_w]
+                if valid_h == patch_h and valid_w == patch_w:
+                    tile_weights = weight_map
+                else:
+                    tile_weights = weight_map[:valid_h, :valid_w]
                 if mask is not None:
-                    mask_view = mask[y0:y0 + valid_h, x0:x0 + valid_w].astype(np.float32, copy=False)
-                    tile = tile * mask_view
+                    mask_view = mask[y0:y0 + valid_h, x0:x0 + valid_w]
                     tile_weights = tile_weights * mask_view
                 accumulator.add_tile(
                     y0=y0,
@@ -1361,9 +1371,10 @@ def iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape: tuple[i
             x1 = min(width, x0 + tile_w)
             prob = np.asarray(prob_sum_store[y0:y1, x0:x1], dtype=np.float32)
             weights = np.asarray(weight_sum_store[y0:y1, x0:x1], dtype=np.float32)
-            tile = np.divide(prob, np.clip(weights, 1e-6, None), out=np.zeros_like(prob), where=weights > 0)
-            tile = np.clip(tile, 0.0, 1.0)
-            yield (tile * 255.0).astype(np.uint8, copy=False)
+            np.divide(prob, weights, out=prob, where=weights > 1e-6)
+            np.clip(prob, 0.0, 1.0, out=prob)
+            prob *= 255.0
+            yield prob.astype(np.uint8, copy=False)
 
 
 def write_output_tiff(prob_sum_store, weight_sum_store, output_path: Path, tile_shape: tuple[int, int]) -> None:
@@ -1561,7 +1572,7 @@ def infer_single_zarr(
         patch_size=(patch_size, patch_size),
         mode=weight_mode,
         sigma_scale=0.125,
-    ).cpu().numpy().astype(np.float32, copy=False)
+    ).cpu().numpy()
 
     temp_parent = Path(tempfile.mkdtemp(prefix="ome_zarr_infer_"))
     LOGGER.info("Using temporary store %s", temp_parent)
@@ -1661,9 +1672,19 @@ def infer_folder(
     date_str = datetime.now().strftime("%d%m%y")
     output_prefix = f"{str(args.output_prefix)}_" if str(args.output_prefix) else ""
 
-    segment_dirs = sorted(path for path in folder.iterdir() if path.is_dir())
-    if not segment_dirs:
-        raise FileNotFoundError(f"No subdirectories were found under --folder {folder}")
+    # Check if the folder itself is a segment directory (contains a zarr directly).
+    try:
+        resolve_segment_zarr_path(folder)
+        is_single_segment = True
+    except FileNotFoundError:
+        is_single_segment = False
+
+    if is_single_segment:
+        segment_dirs = [folder]
+    else:
+        segment_dirs = sorted(path for path in folder.iterdir() if path.is_dir())
+        if not segment_dirs:
+            raise FileNotFoundError(f"No subdirectories were found under --folder {folder}")
 
     ran_count = 0
     skipped_count = 0
@@ -1677,6 +1698,20 @@ def infer_folder(
             continue
 
         for direction in run_directions:
+            # Check if a prediction with the same name (ignoring date) already exists.
+            name_prefix = f"{output_prefix}{segment_name}_{checkpoint_stem}_{direction}_"
+            preds_dir = segment_dir / "preds"
+            existing = list(preds_dir.glob(f"{name_prefix}*.tif")) if preds_dir.exists() else []
+            if existing:
+                LOGGER.info(
+                    "Skipping segment=%s direction=%s — already have %s",
+                    segment_name,
+                    direction,
+                    existing[0].name,
+                )
+                skipped_count += 1
+                continue
+
             output_tiff = (
                 segment_dir
                 / "preds"
