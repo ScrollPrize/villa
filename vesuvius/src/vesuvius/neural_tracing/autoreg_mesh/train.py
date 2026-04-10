@@ -449,6 +449,10 @@ def _evaluate_validation(
             occupancy_loss_weight=float(cfg.get("occupancy_loss_weight", 0.0)),
             position_refine_weight_active=_position_refine_weight_active(cfg, global_step=global_step),
             position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
+            distance_aware_coarse_targets_enabled=bool(cfg.get("distance_aware_coarse_targets_enabled", True)),
+            distance_aware_coarse_target_radius=int(cfg.get("distance_aware_coarse_target_radius", 2)),
+            distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 2.0)),
+            distance_aware_coarse_target_loss=str(cfg.get("distance_aware_coarse_target_loss", "soft_ce")),
         )
         metric_dicts.append(_loss_dict_to_metrics(loss_dict))
     model.train()
@@ -589,6 +593,10 @@ def run_autoreg_mesh_training(
                 occupancy_loss_weight=float(cfg.get("occupancy_loss_weight", 0.0)),
                 position_refine_weight_active=position_refine_weight_active,
                 position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
+                distance_aware_coarse_targets_enabled=bool(cfg.get("distance_aware_coarse_targets_enabled", True)),
+                distance_aware_coarse_target_radius=int(cfg.get("distance_aware_coarse_target_radius", 2)),
+                distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 2.0)),
+                distance_aware_coarse_target_loss=str(cfg.get("distance_aware_coarse_target_loss", "soft_ce")),
             )
             loss = loss_dict["loss"]
             if not torch.isfinite(loss):

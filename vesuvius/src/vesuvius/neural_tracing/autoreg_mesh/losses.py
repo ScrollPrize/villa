@@ -14,7 +14,60 @@ def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
     return (values * mask).sum() / denom
 
 
-def _coarse_pointer_loss(outputs: dict, batch: dict) -> Tensor:
+def _build_distance_aware_coarse_targets(
+    target_coarse_ids: Tensor,
+    supervision_mask: Tensor,
+    *,
+    coarse_grid_shape: tuple[int, int, int],
+    radius: int,
+    sigma: float,
+) -> tuple[Tensor, Tensor]:
+    gz, gy, gx = [int(v) for v in coarse_grid_shape]
+    device = target_coarse_ids.device
+    dtype = torch.float32
+    offsets_1d = torch.arange(-int(radius), int(radius) + 1, device=device, dtype=dtype)
+    offset_grid = torch.stack(torch.meshgrid(offsets_1d, offsets_1d, offsets_1d, indexing="ij"), dim=-1).reshape(-1, 3)
+    k = int(offset_grid.shape[0])
+
+    safe_ids = torch.where(supervision_mask, target_coarse_ids, torch.zeros_like(target_coarse_ids))
+    safe_ids = safe_ids.to(torch.long)
+    z = safe_ids // (gy * gx)
+    rem = safe_ids % (gy * gx)
+    y = rem // gx
+    x = rem % gx
+    gt_coords = torch.stack([z, y, x], dim=-1).to(dtype=dtype)
+
+    neighbor_coords = gt_coords.unsqueeze(-2) + offset_grid.view(1, 1, k, 3)
+    valid = supervision_mask.unsqueeze(-1).expand(-1, -1, k).clone()
+    valid &= neighbor_coords[..., 0] >= 0
+    valid &= neighbor_coords[..., 0] < gz
+    valid &= neighbor_coords[..., 1] >= 0
+    valid &= neighbor_coords[..., 1] < gy
+    valid &= neighbor_coords[..., 2] >= 0
+    valid &= neighbor_coords[..., 2] < gx
+
+    dist2 = (offset_grid ** 2).sum(dim=-1)
+    weights = torch.exp(-dist2 / (2.0 * float(sigma) * float(sigma))).view(1, 1, k).expand_as(valid.to(dtype))
+    weights = torch.where(valid, weights, torch.zeros_like(weights))
+    denom = weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    weights = weights / denom
+
+    neighbor_coords_long = neighbor_coords.to(torch.long)
+    neighbor_ids = (
+        neighbor_coords_long[..., 0] * (gy * gx) +
+        neighbor_coords_long[..., 1] * gx +
+        neighbor_coords_long[..., 2]
+    )
+    neighbor_ids = torch.where(valid, neighbor_ids, torch.zeros_like(neighbor_ids))
+    return neighbor_ids, weights
+
+
+def _coarse_target_entropy(target_probs: Tensor, supervision_mask: Tensor) -> Tensor:
+    entropy = -(target_probs * torch.log(target_probs.clamp(min=1e-8))).sum(dim=-1)
+    return _masked_mean(entropy, supervision_mask)
+
+
+def _hard_coarse_pointer_loss(outputs: dict, batch: dict) -> Tensor:
     logits = outputs["coarse_logits"]
     targets = batch["target_coarse_ids"]
     loss = F.cross_entropy(
@@ -24,6 +77,37 @@ def _coarse_pointer_loss(outputs: dict, batch: dict) -> Tensor:
         reduction="none",
     ).reshape_as(targets)
     return _masked_mean(loss, batch["target_supervision_mask"])
+
+
+def _coarse_pointer_loss(
+    outputs: dict,
+    batch: dict,
+    *,
+    distance_aware_enabled: bool,
+    distance_aware_radius: int,
+    distance_aware_sigma: float,
+    distance_aware_loss_type: str,
+) -> tuple[Tensor, Tensor]:
+    if not bool(distance_aware_enabled):
+        return _hard_coarse_pointer_loss(outputs, batch), outputs["coarse_logits"].new_zeros(())
+    if str(distance_aware_loss_type) != "soft_ce":
+        raise ValueError(f"Unsupported distance_aware_coarse_target_loss={distance_aware_loss_type!r}")
+
+    logits = outputs["coarse_logits"]
+    supervision_mask = batch["target_supervision_mask"]
+    neighbor_ids, target_probs = _build_distance_aware_coarse_targets(
+        batch["target_coarse_ids"],
+        supervision_mask,
+        coarse_grid_shape=tuple(int(v) for v in outputs["coarse_grid_shape"]),
+        radius=int(distance_aware_radius),
+        sigma=float(distance_aware_sigma),
+    )
+    log_probs = F.log_softmax(logits, dim=-1)
+    gathered_log_probs = torch.gather(log_probs, dim=-1, index=neighbor_ids)
+    per_token_loss = -(target_probs * gathered_log_probs).sum(dim=-1)
+    coarse_loss = _masked_mean(per_token_loss, supervision_mask)
+    coarse_target_entropy = _coarse_target_entropy(target_probs, supervision_mask)
+    return coarse_loss, coarse_target_entropy
 
 
 def _offset_bin_loss(outputs: dict, batch: dict, offset_num_bins: tuple[int, int, int]) -> Tensor:
@@ -91,8 +175,19 @@ def compute_autoreg_mesh_losses(
     occupancy_loss_weight: float = 0.0,
     position_refine_weight_active: float = 0.0,
     position_refine_loss_type: str = "huber",
+    distance_aware_coarse_targets_enabled: bool = True,
+    distance_aware_coarse_target_radius: int = 2,
+    distance_aware_coarse_target_sigma: float = 2.0,
+    distance_aware_coarse_target_loss: str = "soft_ce",
 ) -> dict[str, Tensor]:
-    coarse_loss = _coarse_pointer_loss(outputs, batch)
+    coarse_loss, coarse_target_entropy = _coarse_pointer_loss(
+        outputs,
+        batch,
+        distance_aware_enabled=distance_aware_coarse_targets_enabled,
+        distance_aware_radius=distance_aware_coarse_target_radius,
+        distance_aware_sigma=distance_aware_coarse_target_sigma,
+        distance_aware_loss_type=distance_aware_coarse_target_loss,
+    )
     offset_loss = _offset_bin_loss(outputs, batch, offset_num_bins=offset_num_bins)
     stop_loss = _stop_loss(outputs, batch)
     total_loss = coarse_loss + offset_loss + stop_loss
@@ -110,6 +205,7 @@ def compute_autoreg_mesh_losses(
     return {
         "loss": total_loss,
         "coarse_loss": coarse_loss,
+        "coarse_target_entropy": coarse_target_entropy,
         "offset_loss": offset_loss,
         "stop_loss": stop_loss,
         "refine_loss": refine_loss,

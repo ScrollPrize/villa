@@ -37,6 +37,10 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "position_refine_loss": "huber",
     "position_refine_weight": 0.05,
     "position_refine_start_step": 5000,
+    "distance_aware_coarse_targets_enabled": True,
+    "distance_aware_coarse_target_radius": 2,
+    "distance_aware_coarse_target_sigma": 2.0,
+    "distance_aware_coarse_target_loss": "soft_ce",
     "optimizer": {"name": "adamw", "learning_rate": 1e-4, "weight_decay": 1e-4},
     "scheduler": "constant",
     "scheduler_kwargs": {},
@@ -139,6 +143,12 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("position_refine_weight must be non-negative")
     if int(cfg["position_refine_start_step"]) < 0:
         raise ValueError("position_refine_start_step must be >= 0")
+    if int(cfg["distance_aware_coarse_target_radius"]) < 0:
+        raise ValueError("distance_aware_coarse_target_radius must be >= 0")
+    if float(cfg["distance_aware_coarse_target_sigma"]) <= 0.0:
+        raise ValueError("distance_aware_coarse_target_sigma must be > 0")
+    if str(cfg["distance_aware_coarse_target_loss"]) != "soft_ce":
+        raise ValueError("distance_aware_coarse_target_loss must currently be 'soft_ce'")
     if float(cfg["occupancy_loss_weight"]) < 0.0:
         raise ValueError("occupancy_loss_weight must be non-negative")
     if int(cfg["num_steps"]) <= 0:

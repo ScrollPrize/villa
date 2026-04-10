@@ -331,6 +331,7 @@ class AutoregMeshModel(nn.Module):
         return {
             "memory_tokens": memory_tokens,
             "memory_patch_centers": patch_centers,
+            "coarse_grid_shape": grid_shape,
         }
 
     def _gather_memory_tokens(self, memory_tokens: Tensor, coarse_ids: Tensor, valid_mask: Tensor) -> Tensor:
@@ -558,6 +559,7 @@ class AutoregMeshModel(nn.Module):
             "pred_xyz": pred_xyz_bin_center,
             "pred_xyz_refined": pred_xyz_refined,
             "memory_tokens": memory_tokens,
+            "coarse_grid_shape": tuple(int(v) for v in batch.get("coarse_grid_shape", ())),
         }
 
     def forward(self, batch: dict, *, scheduled_sampling_prob: float = 0.0) -> dict[str, Tensor]:
@@ -571,11 +573,13 @@ class AutoregMeshModel(nn.Module):
                 teacher_outputs=teacher_outputs,
                 scheduled_sampling_prob=float(scheduled_sampling_prob),
             )
-        return self.forward_from_encoded(
+        outputs = self.forward_from_encoded(
             batch,
             memory_tokens=encoded["memory_tokens"],
             generation_inputs=generation_inputs,
         )
+        outputs["coarse_grid_shape"] = encoded["coarse_grid_shape"]
+        return outputs
 
     def decode_local_xyz(self, coarse_ids: Tensor, offset_bins: Tensor) -> Tensor:
         grid_shape = (

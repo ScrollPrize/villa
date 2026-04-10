@@ -14,7 +14,10 @@ from vesuvius.neural_tracing.autoreg_mesh.benchmark import run_autoreg_mesh_benc
 from vesuvius.neural_tracing.autoreg_mesh.config import validate_autoreg_mesh_config
 from vesuvius.neural_tracing.autoreg_mesh.dataset import autoreg_mesh_collate
 from vesuvius.neural_tracing.autoreg_mesh.infer import infer_autoreg_mesh
-from vesuvius.neural_tracing.autoreg_mesh.losses import compute_autoreg_mesh_losses
+from vesuvius.neural_tracing.autoreg_mesh.losses import (
+    _build_distance_aware_coarse_targets,
+    compute_autoreg_mesh_losses,
+)
 from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
 from vesuvius.neural_tracing.autoreg_mesh.serialization import serialize_split_conditioning_example
 from vesuvius.neural_tracing.autoreg_mesh.train import _restrict_dataset_samples, run_autoreg_mesh_training
@@ -527,6 +530,78 @@ def test_position_refine_weight_activates_after_start_step(tmp_path: Path) -> No
     assert "refine_loss" in result["history"][1]
 
 
+def test_distance_aware_target_builder_normalizes_and_respects_edges() -> None:
+    target_ids = torch.tensor([[0, 21]], dtype=torch.long)
+    mask = torch.tensor([[True, True]], dtype=torch.bool)
+    neighbor_ids, target_probs = _build_distance_aware_coarse_targets(
+        target_ids,
+        mask,
+        coarse_grid_shape=(4, 4, 4),
+        radius=2,
+        sigma=2.0,
+    )
+
+    assert neighbor_ids.shape[-1] == 125
+    assert torch.allclose(target_probs.sum(dim=-1), torch.ones_like(target_probs.sum(dim=-1)))
+    assert torch.count_nonzero(target_probs[0, 0]) < torch.count_nonzero(target_probs[0, 1])
+    assert 0 in neighbor_ids[0, 0].tolist()
+    assert 21 in neighbor_ids[0, 1].tolist()
+
+
+def test_distance_aware_target_default_config_values() -> None:
+    config = _make_cached_token_config()
+    validated = validate_autoreg_mesh_config(config)
+    assert validated["distance_aware_coarse_targets_enabled"] is True
+    assert validated["distance_aware_coarse_target_radius"] == 2
+    assert validated["distance_aware_coarse_target_sigma"] == pytest.approx(2.0)
+
+
+def test_distance_aware_coarse_loss_prefers_nearby_cells() -> None:
+    target_ids = torch.tensor([[21]], dtype=torch.long)
+    supervision_mask = torch.tensor([[True]], dtype=torch.bool)
+    near_logits = torch.full((1, 1, 64), -10.0)
+    far_logits = torch.full((1, 1, 64), -10.0)
+    near_logits[0, 0, 22] = 10.0  # one-cell neighbor in flattened grid
+    far_logits[0, 0, 63] = 10.0
+
+    common_batch = {
+        "target_coarse_ids": target_ids,
+        "target_supervision_mask": supervision_mask,
+        "target_offset_bins": torch.zeros((1, 1, 3), dtype=torch.long),
+        "target_stop": torch.zeros((1, 1), dtype=torch.float32),
+        "target_xyz": torch.zeros((1, 1, 3), dtype=torch.float32),
+        "target_bin_center_xyz": torch.zeros((1, 1, 3), dtype=torch.float32),
+    }
+    common_outputs = {
+        "offset_logits": torch.zeros((1, 1, 3, 4), dtype=torch.float32),
+        "stop_logits": torch.zeros((1, 1), dtype=torch.float32),
+        "pred_refine_residual": torch.zeros((1, 1, 3), dtype=torch.float32),
+        "pred_xyz": torch.zeros((1, 1, 3), dtype=torch.float32),
+        "coarse_grid_shape": (4, 4, 4),
+    }
+
+    near_loss = compute_autoreg_mesh_losses(
+        {**common_outputs, "coarse_logits": near_logits},
+        common_batch,
+        offset_num_bins=(4, 4, 4),
+        distance_aware_coarse_targets_enabled=True,
+        distance_aware_coarse_target_radius=2,
+        distance_aware_coarse_target_sigma=2.0,
+        distance_aware_coarse_target_loss="soft_ce",
+    )["coarse_loss"]
+    far_loss = compute_autoreg_mesh_losses(
+        {**common_outputs, "coarse_logits": far_logits},
+        common_batch,
+        offset_num_bins=(4, 4, 4),
+        distance_aware_coarse_targets_enabled=True,
+        distance_aware_coarse_target_radius=2,
+        distance_aware_coarse_target_sigma=2.0,
+        distance_aware_coarse_target_loss="soft_ce",
+    )["coarse_loss"]
+
+    assert near_loss.item() < far_loss.item()
+
+
 def test_mixed_precision_is_rejected_until_supported() -> None:
     config = _make_cached_token_config()
     config["mixed_precision"] = "bf16"
@@ -554,6 +629,9 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     assert result["median_valid_prompt_tokens"] > 0
     assert result["median_valid_target_tokens"] > 0
     assert result["refine_head_present"] is True
+    assert result["distance_aware_coarse_targets_enabled"] is True
+    assert result["distance_aware_coarse_target_radius"] == 2
+    assert result["distance_aware_coarse_target_sigma"] == pytest.approx(2.0)
     assert result["forward_ms"] >= 0.0
     assert result["infer_ms"] >= 0.0
 
