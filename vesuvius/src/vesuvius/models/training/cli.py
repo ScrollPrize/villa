@@ -24,6 +24,26 @@ def _maybe_set_spawn_start_method(argv):
             pass
 
 
+def _resolve_trainer_name(cli_trainer, mgr):
+    """Resolve trainer precedence: CLI override, then YAML, then base."""
+    if cli_trainer is not None:
+        return str(cli_trainer).strip().lower()
+
+    for source in (
+        getattr(mgr, "tr_configs", {}) or {},
+        getattr(mgr, "tr_info", {}) or {},
+    ):
+        trainer_name = source.get("trainer")
+        if trainer_name not in (None, ""):
+            return str(trainer_name).strip().lower()
+
+    existing = getattr(mgr, "trainer_class", None)
+    if existing not in (None, ""):
+        return str(existing).strip().lower()
+
+    return "base"
+
+
 def main(argv=None):
     """Main entry point for the training script."""
     if argv is None:
@@ -169,8 +189,8 @@ def main(argv=None):
                            help="Number of warmup steps for cosine_warmup scheduler")
 
     # Trainer Selection
-    grp_trainer.add_argument("--trainer", "--tr", type=str, default="base",
-                             help="Trainer: base, surface_frame, mean_teacher, uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet")
+    grp_trainer.add_argument("--trainer", "--tr", type=str, default=None,
+                             help="Trainer override: base, surface_frame, mean_teacher, uncertainty_aware_mean_teacher, primus_mae, unet_mae, finetune_mae_unet. If omitted, uses YAML trainer or falls back to base.")
     grp_trainer.add_argument("--ssl-warmup", type=int, default=None,
                              help="Semi-supervised: epochs to ignore EMA consistency loss (0 disables)")
     # Semi-supervised sampling controls (used by mean_teacher/uncertainty_aware_mean_teacher)
@@ -346,7 +366,7 @@ def main(argv=None):
         else:
             print("DDP requested but only one process determined; proceeding single-process.")
 
-    trainer_name = args.trainer.lower()
+    trainer_name = _resolve_trainer_name(args.trainer, mgr)
     mgr.trainer_class = trainer_name
 
     # Enforce usage of --pretrained_checkpoint only for the MAE finetune trainer, and require it there
