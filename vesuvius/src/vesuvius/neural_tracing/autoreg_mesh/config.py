@@ -4,6 +4,18 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
+import torch
+
+
+_ROPE_DTYPE_ALIASES = {
+    "fp32": torch.float32,
+    "float32": torch.float32,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+}
+
 
 DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "seed": 0,
@@ -29,6 +41,14 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "decoder_mlp_ratio": 4.0,
     "decoder_dropout": 0.0,
     "pointer_temperature": 1.0,
+    "rope_base": 100.0,
+    "rope_min_period": None,
+    "rope_max_period": None,
+    "rope_normalize_coords": "separate",
+    "rope_shift_coords": 0.05,
+    "rope_jitter_coords": 1.05,
+    "rope_rescale_coords": 2.0,
+    "rope_dtype": "float32",
     "scheduled_sampling_enabled": False,
     "scheduled_sampling_mode": "linear_full_token_greedy",
     "scheduled_sampling_max_prob": 0.10,
@@ -78,6 +98,16 @@ def _as_3tuple(name: str, value) -> tuple[int, int, int]:
     if not isinstance(value, (list, tuple)) or len(value) != 3:
         raise ValueError(f"{name} must be an int or a length-3 sequence, got {value!r}")
     return tuple(int(v) for v in value)
+
+
+def _resolve_rope_dtype(value):
+    if value is None or isinstance(value, torch.dtype):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _ROPE_DTYPE_ALIASES:
+            return _ROPE_DTYPE_ALIASES[normalized]
+    raise ValueError(f"unsupported rope_dtype value: {value!r}")
 
 
 def setdefault_autoreg_mesh_config(config: dict) -> dict:
@@ -132,6 +162,19 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("cross_attention_every_n_blocks must be positive")
     if float(cfg["pointer_temperature"]) <= 0.0:
         raise ValueError("pointer_temperature must be positive")
+    if cfg.get("rope_normalize_coords") not in {"min", "max", "separate"}:
+        raise ValueError("rope_normalize_coords must be one of {'min', 'max', 'separate'}")
+    if cfg.get("rope_base") is not None and (cfg.get("rope_min_period") is not None or cfg.get("rope_max_period") is not None):
+        raise ValueError("rope_base cannot be set together with rope_min_period or rope_max_period")
+    if cfg.get("rope_base") is None and (cfg.get("rope_min_period") is None or cfg.get("rope_max_period") is None):
+        raise ValueError("when rope_base is None, both rope_min_period and rope_max_period must be set")
+    if cfg.get("rope_shift_coords") is not None and float(cfg["rope_shift_coords"]) < 0.0:
+        raise ValueError("rope_shift_coords must be >= 0")
+    if cfg.get("rope_jitter_coords") is not None and float(cfg["rope_jitter_coords"]) <= 1.0:
+        raise ValueError("rope_jitter_coords must be > 1.0")
+    if cfg.get("rope_rescale_coords") is not None and float(cfg["rope_rescale_coords"]) <= 1.0:
+        raise ValueError("rope_rescale_coords must be > 1.0")
+    _resolve_rope_dtype(cfg.get("rope_dtype"))
     if str(cfg["scheduled_sampling_mode"]) != "linear_full_token_greedy":
         raise ValueError("scheduled_sampling_mode must currently be 'linear_full_token_greedy'")
     if float(cfg["scheduled_sampling_max_prob"]) < 0.0 or float(cfg["scheduled_sampling_max_prob"]) > 1.0:

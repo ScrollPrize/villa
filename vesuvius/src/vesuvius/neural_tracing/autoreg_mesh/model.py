@@ -8,6 +8,10 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from vesuvius.models.build.pretrained_backbones.dinov2 import build_dinov2_backbone
+from vesuvius.models.build.pretrained_backbones.rope import (
+    MixedRopePositionEmbedding,
+    apply_rotary_embedding,
+)
 from vesuvius.neural_tracing.autoreg_mesh.config import validate_autoreg_mesh_config
 from vesuvius.neural_tracing.autoreg_mesh.serialization import IGNORE_INDEX
 
@@ -16,95 +20,35 @@ PROMPT_TOKEN_TYPE = 0
 GENERATED_TOKEN_TYPE = 1
 START_TOKEN_TYPE = 2
 
+_ROPE_DTYPE_ALIASES = {
+    "fp32": torch.float32,
+    "float32": torch.float32,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+}
 
-def _rotate_half(x: Tensor) -> Tensor:
-    x_first, x_second = x.chunk(2, dim=-1)
-    return torch.cat((-x_second, x_first), dim=-1)
 
-
-def _apply_rotary_embedding(x: Tensor, sin: Tensor, cos: Tensor) -> Tensor:
-    return (x * cos) + (_rotate_half(x) * sin)
-
-
-class ExplicitCoordMixedRope(nn.Module):
-    """Minimal mixed 3D RoPE with explicit-coordinate support for decoder tokens."""
-
-    def __init__(
-        self,
-        head_dim: int,
-        *,
-        num_heads: int,
-        ndim: int = 3,
-        base: float = 100.0,
-        dtype: torch.dtype = torch.float32,
-    ) -> None:
-        super().__init__()
-        if ndim != 3:
-            raise ValueError(f"ExplicitCoordMixedRope expects ndim=3, got {ndim}")
-        if head_dim % (2 * ndim) != 0:
-            raise ValueError(
-                f"head_dim must be divisible by {2 * ndim} for mixed 3D RoPE, got head_dim={head_dim}"
-            )
-        self.head_dim = int(head_dim)
-        self.num_heads = int(num_heads)
-        self.ndim = int(ndim)
-        self.dtype = dtype
-        self.freqs_per_axis = self.head_dim // (2 * self.ndim)
-        self.axis_dim = self.head_dim // self.ndim
-        self.num_pairs = self.head_dim // 2
-        self.base = float(base)
-
-        self.register_buffer("periods", torch.empty(self.freqs_per_axis, dtype=dtype), persistent=True)
-        self.mix_frequencies = nn.Parameter(
-            torch.empty(self.num_heads, self.num_pairs, self.ndim, dtype=dtype)
-        )
-        self._init_weights()
-
-    def _build_periods(self, count: int, denominator_dim: int, *, device: torch.device | None = None) -> Tensor:
-        device = device or torch.device("cpu")
-        return self.base ** (2 * torch.arange(count, device=device, dtype=self.dtype) / denominator_dim)
-
-    def _init_weights(self) -> None:
-        periods = self._build_periods(self.freqs_per_axis, self.axis_dim, device=self.periods.device)
-        self.periods.data.copy_(periods)
-        self.reset_mixed_frequencies_to_random_oriented()
-
-    @torch.no_grad()
-    def reset_mixed_frequencies_to_random_oriented(self) -> None:
-        inv_periods = self.periods.reciprocal()
-        basis = torch.randn(
-            self.num_heads,
-            self.ndim,
-            self.ndim,
-            device=self.periods.device,
-            dtype=self.periods.dtype,
-        )
-        basis, r = torch.linalg.qr(basis)
-        diag = torch.diagonal(r, dim1=-2, dim2=-1)
-        signs = torch.where(diag < 0, -torch.ones_like(diag), torch.ones_like(diag))
-        basis = basis * signs.unsqueeze(-2)
-        negative_det = torch.linalg.det(basis) < 0
-        if negative_det.any():
-            basis[negative_det, :, 0] *= -1
-
-        mixed = torch.empty_like(self.mix_frequencies)
-        for axis in range(self.ndim):
-            start = axis * self.freqs_per_axis
-            end = start + self.freqs_per_axis
-            mixed[:, start:end, :] = inv_periods[None, :, None] * basis[:, None, :, axis]
-        self.mix_frequencies.copy_(mixed)
-
-    def get_embed_from_coords(self, coords: Tensor) -> tuple[Tensor, Tensor]:
-        coords = coords.to(dtype=self.periods.dtype)
-        if coords.ndim != 3 or coords.shape[-1] != self.ndim:
-            raise ValueError(f"coords must have shape [B, T, {self.ndim}], got {tuple(coords.shape)}")
-        angles = 2.0 * math.pi * torch.einsum("btd,hpd->bhtp", coords, self.mix_frequencies)
-        angles = torch.cat([angles, angles], dim=-1)
-        return torch.sin(angles), torch.cos(angles)
+def _resolve_rope_dtype(value):
+    if value is None or isinstance(value, torch.dtype):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _ROPE_DTYPE_ALIASES:
+            return _ROPE_DTYPE_ALIASES[normalized]
+    raise ValueError(f"unsupported rope_dtype value: {value!r}")
+def _batched_rope_from_coords(rope: MixedRopePositionEmbedding, coords: Tensor) -> tuple[Tensor, Tensor]:
+    if coords.ndim != 3 or coords.shape[-1] != 3:
+        raise ValueError(f"coords must have shape [B, T, 3], got {tuple(coords.shape)}")
+    rope_values = [rope.get_embed_from_coords(sample_coords) for sample_coords in coords]
+    sin = torch.stack([item[0] for item in rope_values], dim=0)
+    cos = torch.stack([item[1] for item in rope_values], dim=0)
+    return sin, cos
 
 
 class RotarySelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, rope: ExplicitCoordMixedRope, dropout: float = 0.0) -> None:
+    def __init__(self, dim: int, num_heads: int, rope: MixedRopePositionEmbedding, dropout: float = 0.0) -> None:
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
@@ -122,9 +66,9 @@ class RotarySelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        sin, cos = self.rope.get_embed_from_coords(coords)
-        q = _apply_rotary_embedding(q, sin, cos).to(dtype=v.dtype)
-        k = _apply_rotary_embedding(k, sin, cos).to(dtype=v.dtype)
+        sin, cos = _batched_rope_from_coords(self.rope, coords)
+        q = apply_rotary_embedding(q, (sin, cos)).type_as(v)
+        k = apply_rotary_embedding(k, (sin, cos)).type_as(v)
         q = q * self.scale
         out = F.scaled_dot_product_attention(
             q,
@@ -192,7 +136,7 @@ class DecoderBlock(nn.Module):
         self,
         dim: int,
         num_heads: int,
-        rope: ExplicitCoordMixedRope,
+        rope: MixedRopePositionEmbedding,
         *,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
@@ -266,10 +210,18 @@ class AutoregMeshModel(nn.Module):
         )
         self.start_token = nn.Parameter(torch.zeros(self.decoder_dim))
 
-        self.rope = ExplicitCoordMixedRope(
+        self.rope = MixedRopePositionEmbedding(
             self.head_dim,
-            num_heads=self.decoder_num_heads,
             ndim=3,
+            num_heads=self.decoder_num_heads,
+            base=self.config.get("rope_base"),
+            min_period=self.config.get("rope_min_period"),
+            max_period=self.config.get("rope_max_period"),
+            normalize_coords=self.config.get("rope_normalize_coords", "separate"),
+            shift_coords=self.config.get("rope_shift_coords"),
+            jitter_coords=self.config.get("rope_jitter_coords"),
+            rescale_coords=self.config.get("rope_rescale_coords"),
+            dtype=_resolve_rope_dtype(self.config.get("rope_dtype")),
         )
         self.blocks = nn.ModuleList(
             [

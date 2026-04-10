@@ -192,13 +192,16 @@ class RopePositionEmbedding(_BaseRopePositionEmbedding):
         )
         self.periods.data.copy_(periods)
 
-    def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
-        coords = self._get_coords(shape)
+    def get_embed_from_coords(self, coords: Tensor) -> RopeEmbedding:
         angles = 2 * math.pi * coords[:, :, None] / self.periods[None, None, :]
         angles = angles.flatten(1, 2).tile(2)
         cos = torch.cos(angles)
         sin = torch.sin(angles)
         return sin, cos
+
+    def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
+        coords = self._get_coords(shape)
+        return self.get_embed_from_coords(coords)
 
     def forward(self, shape: Sequence[int]) -> RopeEmbedding:
         return self.get_embed(shape)
@@ -319,13 +322,16 @@ class MixedRopePositionEmbedding(_BaseRopePositionEmbedding):
     def no_weight_decay(self) -> set[str]:
         return {"mix_frequencies"}
 
-    def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
-        coords = self._get_coords(shape)
+    def get_embed_from_coords(self, coords: Tensor) -> RopeEmbedding:
         angles = 2 * math.pi * torch.einsum("td,hpd->htp", coords, self.mix_frequencies)
         angles = angles.tile(2)
         cos = torch.cos(angles)
         sin = torch.sin(angles)
         return sin, cos
+
+    def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
+        coords = self._get_coords(shape)
+        return self.get_embed_from_coords(coords)
 
     def forward(self, shape: Sequence[int]) -> RopeEmbedding:
         return self.get_embed(shape)

@@ -10,6 +10,7 @@ import tifffile
 from torch.utils.data import Dataset
 
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
+from vesuvius.models.build.pretrained_backbones.rope import MixedRopePositionEmbedding
 from vesuvius.neural_tracing.autoreg_mesh.benchmark import run_autoreg_mesh_benchmark
 from vesuvius.neural_tracing.autoreg_mesh.config import validate_autoreg_mesh_config
 from vesuvius.neural_tracing.autoreg_mesh.dataset import autoreg_mesh_collate
@@ -277,6 +278,7 @@ def test_autoreg_mesh_model_forward_and_losses_are_finite(tmp_path: Path) -> Non
     _write_local_guide_checkpoint(checkpoint)
     config = _make_config(checkpoint)
     model = AutoregMeshModel(config)
+    assert isinstance(model.rope, MixedRopePositionEmbedding)
 
     batch = autoreg_mesh_collate([_make_sample("left"), _make_sample("up")])
     batch = _move_batch(batch, torch.device("cpu"))
@@ -649,6 +651,39 @@ def test_mixed_precision_is_rejected_until_supported() -> None:
         validate_autoreg_mesh_config(config)
 
 
+def test_rope_default_config_values() -> None:
+    config = _make_cached_token_config()
+    validated = validate_autoreg_mesh_config(config)
+    assert validated["rope_normalize_coords"] == "separate"
+    assert validated["rope_shift_coords"] == pytest.approx(0.05)
+    assert validated["rope_jitter_coords"] == pytest.approx(1.05)
+    assert validated["rope_rescale_coords"] == pytest.approx(2.0)
+
+
+def test_rope_config_validation_rejects_invalid_values() -> None:
+    bad_normalize = _make_cached_token_config()
+    bad_normalize["rope_normalize_coords"] = "weird"
+    with pytest.raises(ValueError, match="rope_normalize_coords"):
+        validate_autoreg_mesh_config(bad_normalize)
+
+    bad_combo = _make_cached_token_config()
+    bad_combo["rope_base"] = None
+    bad_combo["rope_min_period"] = None
+    bad_combo["rope_max_period"] = 10.0
+    with pytest.raises(ValueError, match="rope_min_period"):
+        validate_autoreg_mesh_config(bad_combo)
+
+    bad_jitter = _make_cached_token_config()
+    bad_jitter["rope_jitter_coords"] = 1.0
+    with pytest.raises(ValueError, match="rope_jitter_coords"):
+        validate_autoreg_mesh_config(bad_jitter)
+
+    bad_shift = _make_cached_token_config()
+    bad_shift["rope_shift_coords"] = -0.1
+    with pytest.raises(ValueError, match="rope_shift_coords"):
+        validate_autoreg_mesh_config(bad_shift)
+
+
 def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     config = _make_cached_token_config()
     dataset = _make_training_dataset()
@@ -672,6 +707,10 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     assert result["distance_aware_coarse_targets_enabled"] is True
     assert result["distance_aware_coarse_target_radius"] == 1
     assert result["distance_aware_coarse_target_sigma"] == pytest.approx(1.0)
+    assert result["rope_normalize_coords"] == "separate"
+    assert result["rope_shift_coords"] == pytest.approx(0.05)
+    assert result["rope_jitter_coords"] == pytest.approx(1.05)
+    assert result["rope_rescale_coords"] == pytest.approx(2.0)
     assert result["forward_ms"] >= 0.0
     assert result["infer_ms"] >= 0.0
 
