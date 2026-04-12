@@ -18,7 +18,7 @@ set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 set(CMAKE_EXPORT_COMPILE_COMMANDS on)
 
 # ---- Options -----------------------------------------------------------------
-option(VC_USE_OPENMP        "Enable OpenMP support"                              ON)
+option(VC_USE_OPENMP        "Enable OpenMP support"                              OFF)
 option(VC_USE_VALGRIND      "Enable Valgrind support"                            OFF)
 option(VC_USE_PCH           "Enable precompiled headers (faster builds)" OFF)
 option(VC_WITH_PASTIX       "Build with PaStiX support"                          OFF)
