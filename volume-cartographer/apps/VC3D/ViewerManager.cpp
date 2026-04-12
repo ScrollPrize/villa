@@ -494,27 +494,27 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     _targetRefinedStride = 0;  // Reset refinement target
 
     if (!_surfacePatchStrideUserSet) {
+        // Floor at stride 2 for every tier — stride 1 produces one entry
+        // per cell and blows up the rtree (~4M entries per 2K² surface)
+        // without any visible benefit for overlay intersection drawing.
         int defaultStride;
         if (surfaceCount > 2500) {
-            // > 2500: build at 32x initially, then refine to 16x
             defaultStride = 32;
             _targetRefinedStride = 16;
         } else if (surfaceCount >= 500) {
-            // 500-2500: build at 16x initially, then refine to 8x
             defaultStride = 16;
             _targetRefinedStride = 8;
         } else if (surfaceCount >= 100) {
-            // 100-499: build at 8x initially, then refine to 4x
             defaultStride = 8;
             _targetRefinedStride = 4;
         } else if (surfaceCount >= 30) {
-            // 30-99: build at 4x initially, then refine to 2x
             defaultStride = 4;
             _targetRefinedStride = 2;
         } else {
-            // < 30: build at 2x initially, then refine to 1x
+            // Was: defaultStride=2, _targetRefinedStride=1. Stride 1 was
+            // the hot rebuild — keep stride 2 throughout.
             defaultStride = 2;
-            _targetRefinedStride = 1;
+            _targetRefinedStride = 2;
         }
         setSurfacePatchSamplingStride(defaultStride, false);
     }
