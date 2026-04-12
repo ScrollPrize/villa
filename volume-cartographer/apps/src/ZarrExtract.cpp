@@ -6,7 +6,7 @@
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/cache/SimpleCacheFactory.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/StreamOperators.hpp"
@@ -89,7 +89,7 @@ int main(int argc, char *argv[])
   // gen_plane.gen_coords(coords, 1000, 1000);
   // gen_grid.gen(&coords, &normals, {1000, 1000}, cv::Vec3f(0, 0, 0), 1.0, {0,0,0});
 
-    auto chunk_cache = vc::cache::createSimpleTieredCache(ds.get(), size_t(10*10e9), ds->path());
+    auto chunk_cache = vc::cache::openFilesystemPipeline(ds.get(), size_t(10*10e9), ds->path());
 
   // auto start = std::chrono::high_resolution_clock::now();
   // readInterpolated3D(img,ds.get(),coords, &chunk_cache);

@@ -1339,6 +1339,32 @@ public:
         f.flush();
     }
 
+    /// Write a shard file whose index marks every inner chunk as empty.
+    /// Used to record "this shard is known empty" without a remote round-trip.
+    void write_empty_shard(std::span<const std::size_t> shard_indices) {
+        if (!is_sharded())
+            throw std::runtime_error("zarr: not a sharded array");
+        const auto n_inner = meta_.total_sub_chunks_per_shard();
+
+        auto key = chunk_key(std::vector<std::size_t>(shard_indices.begin(), shard_indices.end()));
+        auto p = root_ / key;
+        std::filesystem::create_directories(p.parent_path());
+
+        std::vector<std::uint64_t> index(n_inner * 2);
+        const std::uint64_t sentinel_offset = ~std::uint64_t(0) - 1;
+        const std::uint64_t sentinel_nbytes = 0;
+        for (std::size_t i = 0; i < n_inner; ++i) {
+            index[i * 2]     = sentinel_offset;
+            index[i * 2 + 1] = sentinel_nbytes;
+        }
+
+        std::lock_guard lock(*shard_write_mutex_);
+        std::ofstream f(p, std::ios::binary | std::ios::trunc);
+        if (!f) return;
+        f.write(reinterpret_cast<const char*>(index.data()),
+                static_cast<std::streamsize>(index.size() * 8));
+    }
+
     /// Root path of the zarr array on disk.
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return root_; }
 

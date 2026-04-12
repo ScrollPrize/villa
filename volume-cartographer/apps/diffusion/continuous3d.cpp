@@ -1,7 +1,7 @@
 #include "continuous3d.hpp"
 
 #include "common.hpp"
-#include "vc/core/cache/SimpleCacheFactory.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 
 #include <vc/ui/VCCollection.hpp>
 #include <vc/core/util/GridStore.hpp>
@@ -140,7 +140,7 @@ int continuous3d_main(const po::variables_map& vm) {
 
     Array3D<uint8_t> slice_data({(size_t)box_d, (size_t)box_h, (size_t)box_w});
 
-    auto cache = vc::cache::createSimpleTieredCache(ds.get(), 4llu*1024*1024*1024, ds->path());
+    auto cache = vc::cache::openFilesystemPipeline(ds.get(), 4llu*1024*1024*1024, ds->path());
     readArea3D(slice_data, offset, cache.get(), 0);
 
     for (int z = 0; z < box_d; ++z) {

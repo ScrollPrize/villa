@@ -99,7 +99,7 @@ CacheHarness makeTestCache(
 {
     vc::cache::BlockPipeline::Config cfg;
     cfg.volumeId = "test-volume";
-    cfg.hotMaxBytes = 1024;
+    cfg.blockCacheBytes = 1024;
     cfg.ioThreads = 1;
 
     auto* sourcePtr = source.get();

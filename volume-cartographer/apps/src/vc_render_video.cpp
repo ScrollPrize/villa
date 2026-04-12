@@ -10,7 +10,7 @@
 #include <opencv2/videoio.hpp>
 
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/cache/SimpleCacheFactory.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -95,7 +95,7 @@ int main(int argc, char *argv[])
 
     cv::Size tgt_size = {3840, 2160};
 
-    auto chunk_cache = vc::cache::createSimpleTieredCache(ds.get(), 10e9, ds->path());
+    auto chunk_cache = vc::cache::openFilesystemPipeline(ds.get(), 10e9, ds->path());
 
     cv::VideoWriter vid(tgt_fn, cv::VideoWriter::fourcc('H','F','Y','U'), 5, tgt_size);
 

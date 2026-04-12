@@ -2,7 +2,7 @@
 #include <random>
 
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/cache/SimpleCacheFactory.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Geometry.hpp"
@@ -304,7 +304,7 @@ int main(int argc, char *argv[])
     std::cout << "zarr dataset size for scale group 0 " << ds->shape() << std::endl;
     std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
 
-    auto chunk_cache = vc::cache::createSimpleTieredCache(ds.get(), size_t(params.value("cache_size", 1e9)), ds->path());
+    auto chunk_cache = vc::cache::openFilesystemPipeline(ds.get(), size_t(params.value("cache_size", 1e9)), ds->path());
 
     passTroughComputor pass;
     Chunked3d<uint8_t,passTroughComputor> tensor(pass, ds.get(), chunk_cache.get(), 0);

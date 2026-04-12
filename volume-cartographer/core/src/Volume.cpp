@@ -370,7 +370,7 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache(
 
     vc::cache::BlockPipeline::Config config;
     config.volumeId = id();
-    config.hotMaxBytes = cacheBudgetHot_;
+    config.blockCacheBytes = cacheBudgetHot_;
     if (isRemote_ || mountInfo_.type == vc::FilesystemType::NetworkMount) {
         if (ioThreads_ > 0) {
             config.ioThreads = ioThreads_;
@@ -490,33 +490,12 @@ int Volume::sampleBestEffort(cv::Mat_<uint8_t>& out,
                               const vc::SampleParams& params)
 {
     const int nScales = static_cast<int>(numScales());
-    const int level = params.level;
-
-    // Compute world-space bounding box once, reuse for all level checks.
-    // This avoids re-scanning border/interior pixels per level.
-    auto wb = coordsWorldBBox(coords);
-
-    // Find best cached level without scaling coords each iteration.
-    int useLvl = -1;
-    for (int lvl = level; lvl < nScales; lvl++) {
-        if (allChunksCachedFast(wb, lvl)) {
-            useLvl = lvl;
-            break;
-        }
-    }
-    // No level had all chunks cached.  Fall back to the coarsest level
-    // (which is pinned hot in steady state, so this only blocks during
-    // initial loading).
-    if (useLvl < 0)
-        useLvl = std::max(0, nScales - 1);
-
-    // Scale coords ONCE for the chosen level.
-    const auto& scaled = scaleCoords(coords, useLvl);
-    readInterpolated3D(out, tieredCache(), useLvl, scaled, params.method);
-
+    const int level = std::clamp(params.level, 0, std::max(0, nScales - 1));
+    const auto& scaled = scaleCoords(coords, level);
+    readInterpolated3D(out, tieredCache(), level, scaled, params.method);
     if (!out.empty())
         applyOptionalPostProcess(out, params);
-    return useLvl;
+    return level;
 }
 
 void Volume::sampleComposite(cv::Mat_<uint8_t>& out,
@@ -539,51 +518,13 @@ int Volume::sampleCompositeBestEffort(cv::Mat_<uint8_t>& out,
                                        const vc::SampleParams& params)
 {
     const int nScales = static_cast<int>(numScales());
-    const int level = params.level;
-    const auto& cp = params.composite.value_or(CompositeParams{});
-
-    for (int lvl = level; lvl < nScales; lvl++) {
-        if (allCompositeChunksCached(coords, normals, params.zStart, params.zEnd, lvl)) {
-            vc::SampleParams lvlParams = params;
-            lvlParams.level = lvl;
-            sampleComposite(out, coords, normals, lvlParams);
-            return lvl;
-        }
-    }
-
-    int last = std::max(0, nScales - 1);
-    vc::SampleParams lastParams = params;
-    lastParams.level = last;
-    sampleComposite(out, coords, normals, lastParams);
-    return last;
+    const int level = std::clamp(params.level, 0, std::max(0, nScales - 1));
+    vc::SampleParams lvlParams = params;
+    lvlParams.level = level;
+    sampleComposite(out, coords, normals, lvlParams);
+    return level;
 }
 
-// Plane bounding box helper shared by samplePlaneBestEffort and ARGB32 variant.
-// Uses a local struct identical to Volume::WorldBBox (which is protected).
-struct PlaneBBox { float loX, loY, loZ, hiX, hiY, hiZ; };
-
-static PlaneBBox planeBBox(const cv::Vec3f& origin,
-                           const cv::Vec3f& vx_step,
-                           const cv::Vec3f& vy_step,
-                           int width, int height)
-{
-    cv::Vec3f corners[4] = {
-        origin,
-        origin + vx_step * static_cast<float>(width - 1),
-        origin + vy_step * static_cast<float>(height - 1),
-        origin + vx_step * static_cast<float>(width - 1) + vy_step * static_cast<float>(height - 1)
-    };
-    PlaneBBox wb;
-    wb.loX = corners[0][0]; wb.hiX = corners[0][0];
-    wb.loY = corners[0][1]; wb.hiY = corners[0][1];
-    wb.loZ = corners[0][2]; wb.hiZ = corners[0][2];
-    for (int c = 1; c < 4; c++) {
-        wb.loX = std::min(wb.loX, corners[c][0]); wb.hiX = std::max(wb.hiX, corners[c][0]);
-        wb.loY = std::min(wb.loY, corners[c][1]); wb.hiY = std::max(wb.hiY, corners[c][1]);
-        wb.loZ = std::min(wb.loZ, corners[c][2]); wb.hiZ = std::max(wb.hiZ, corners[c][2]);
-    }
-    return wb;
-}
 
 int Volume::samplePlaneBestEffort(cv::Mat_<uint8_t>& out,
                                    const cv::Vec3f& origin,
@@ -595,29 +536,14 @@ int Volume::samplePlaneBestEffort(cv::Mat_<uint8_t>& out,
     const int nScales = static_cast<int>(numScales());
     const int level = params.level;
 
-    auto pb = planeBBox(origin, vx_step, vy_step, width, height);
-    WorldBBox wb{pb.loX, pb.loY, pb.loZ, pb.hiX, pb.hiY, pb.hiZ};
-
-    for (int lvl = level; lvl < nScales; lvl++) {
-        if (allChunksCachedFast(wb, lvl)) {
-            float scale = (lvl > 0) ? (1.0f / static_cast<float>(1 << lvl)) : 1.0f;
-            samplePlane(out, tieredCache(), lvl,
-                        origin * scale, vx_step * scale, vy_step * scale,
-                        width, height, params.method);
-            if (!out.empty())
-                applyOptionalPostProcess(out, params);
-            return lvl;
-        }
-    }
-
-    int last = std::max(0, nScales - 1);
-    float scale = (last > 0) ? (1.0f / static_cast<float>(1 << last)) : 1.0f;
-    samplePlane(out, tieredCache(), last,
+    int lvl = std::clamp(level, 0, std::max(0, nScales - 1));
+    float scale = (lvl > 0) ? (1.0f / static_cast<float>(1 << lvl)) : 1.0f;
+    samplePlane(out, tieredCache(), lvl,
                 origin * scale, vx_step * scale, vy_step * scale,
                 width, height, params.method);
     if (!out.empty())
         applyOptionalPostProcess(out, params);
-    return last;
+    return lvl;
 }
 
 int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
@@ -630,17 +556,6 @@ int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
 {
     const int nScales = static_cast<int>(numScales());
     const int desired = std::clamp(params.level, 0, std::max(0, nScales - 1));
-
-    auto pb = planeBBox(origin, vx_step, vy_step, width, height);
-    cv::Vec3f pfLo(pb.loX, pb.loY, pb.loZ);
-    cv::Vec3f pfHi(pb.hiX, pb.hiY, pb.hiZ);
-    fetchInteractiveWorldBBox(pfLo, pfHi, desired);
-
-    // Render with per-pixel fallback to coarser levels.
-    // Each pixel tries the desired level first; if that chunk isn't in hot
-    // cache, falls back to the next coarser level that has data.
-    // This gives a mixed-resolution image that progressively refines as
-    // chunks arrive — better than showing black for uncached regions.
     samplePlaneAdaptiveARGB32(outBuf, outStride, tieredCache(),
                               desired, nScales,
                               origin, vx_step, vy_step,
@@ -656,159 +571,17 @@ int Volume::samplePlaneCompositeBestEffortARGB32(
     const std::string& compositeMethod,
     const uint32_t lut[256])
 {
-    const int nScales = static_cast<int>(numScales());
-
-    // Use same best-effort level selection as samplePlaneBestEffortARGB32.
-    // The planeBBox needs to account for normal offsets.
-    auto pb = planeBBox(origin, vx_step, vy_step, width, height);
-    float minOff = static_cast<float>(zStart) * zStep;
-    float maxOff = static_cast<float>(zStart + numLayers - 1) * zStep;
-    if (minOff > maxOff) std::swap(minOff, maxOff);
-    // Expand bbox along normal direction
-    for (int a = 0; a < 3; a++) {
-        float nMin = normal[a] * minOff;
-        float nMax = normal[a] * maxOff;
-        if (nMin > nMax) std::swap(nMin, nMax);
-        (&pb.loX)[a] += nMin;
-        (&pb.hiX)[a] += nMax;
-    }
-    WorldBBox wb{pb.loX, pb.loY, pb.loZ, pb.hiX, pb.hiY, pb.hiZ};
-
-    int level = 0; // Always try finest first for composite
-    for (int lvl = level; lvl < nScales; lvl++) {
-        if (allChunksCachedFast(wb, lvl)) {
-            float scale = (lvl > 0) ? (1.0f / static_cast<float>(1 << lvl)) : 1.0f;
-            samplePlaneCompositeARGB32(outBuf, outStride, tieredCache(), lvl,
-                origin * scale, vx_step * scale, vy_step * scale,
-                normal, zStep, zStart, numLayers,
-                width, height, compositeMethod, lut);
-            return lvl;
-        }
-    }
-
-    // Fallback: block at coarsest level
-    int last = std::max(0, nScales - 1);
-    float scale = (last > 0) ? (1.0f / static_cast<float>(1 << last)) : 1.0f;
-    samplePlaneCompositeARGB32(outBuf, outStride, tieredCache(), last,
-        origin * scale, vx_step * scale, vy_step * scale,
+    samplePlaneCompositeARGB32(outBuf, outStride, tieredCache(), 0,
+        origin, vx_step, vy_step,
         normal, zStep, zStart, numLayers,
         width, height, compositeMethod, lut);
-    return last;
+    return 0;
 }
 
 // ============================================================================
 // Composite-aware chunk helpers
 // ============================================================================
 
-namespace {
-struct BBox6f {
-    float loX, loY, loZ, hiX, hiY, hiZ;
-};
-
-BBox6f computeCompositeBBox(const cv::Mat_<cv::Vec3f>& coords,
-                            const cv::Mat_<cv::Vec3f>& normals,
-                            int zStart, int zEnd, int level)
-{
-    float scale = (level > 0) ? (1.0f / static_cast<float>(1 << level)) : 1.0f;
-
-    float loX = std::numeric_limits<float>::max();
-    float loY = std::numeric_limits<float>::max();
-    float loZ = std::numeric_limits<float>::max();
-    float hiX = std::numeric_limits<float>::lowest();
-    float hiY = std::numeric_limits<float>::lowest();
-    float hiZ = std::numeric_limits<float>::lowest();
-
-    const bool hasNormals = !normals.empty() && normals.size() == coords.size();
-    const int h = coords.rows;
-    const int w = coords.cols;
-
-    auto updateBounds = [&](int r, int c) {
-        const auto& v = coords(r, c);
-        float sx = v[0] * scale;
-        float sy = v[1] * scale;
-        float sz = v[2] * scale;
-
-        cv::Vec3f n = hasNormals ? normals(r, c) : cv::Vec3f(1, 0, 0);
-        for (int z : {zStart, zEnd}) {
-            float off = static_cast<float>(z) * scale;
-            float px = sx + n[0] * off;
-            float py = sy + n[1] * off;
-            float pz = sz + n[2] * off;
-            loX = std::min(loX, px); hiX = std::max(hiX, px);
-            loY = std::min(loY, py); hiY = std::max(hiY, py);
-            loZ = std::min(loZ, pz); hiZ = std::max(hiZ, pz);
-        }
-    };
-
-    // Sample border pixels + sparse grid instead of every pixel.
-    // Top and bottom rows
-    for (int c = 0; c < w; ++c) {
-        updateBounds(0, c);
-        updateBounds(h - 1, c);
-    }
-    // Left and right columns (excluding corners already covered)
-    for (int r = 1; r < h - 1; ++r) {
-        updateBounds(r, 0);
-        updateBounds(r, w - 1);
-    }
-    // Sparse interior grid (every 32 pixels) to catch curved surfaces
-    for (int r = 32; r < h - 1; r += 32) {
-        for (int c = 32; c < w - 1; c += 32) {
-            updateBounds(r, c);
-        }
-    }
-
-    // 1-voxel margin for interpolation (plus extra for normal offset curvature)
-    loX -= 2.0f; loY -= 2.0f; loZ -= 2.0f;
-    hiX += 2.0f; hiY += 2.0f; hiZ += 2.0f;
-
-    return {loX, loY, loZ, hiX, hiY, hiZ};
-}
-} // anonymous namespace
-
-Volume::ChunkBBox Volume::compositeChunkBBox(
-    const cv::Mat_<cv::Vec3f>& coords,
-    const cv::Mat_<cv::Vec3f>& normals,
-    int zStart, int zEnd, int level) const
-{
-    vc::VcDataset* ds = zarrDataset(level);
-    if (!ds || coords.empty()) return {0, -1, 0, -1, 0, -1};  // invalid
-
-    auto bb = computeCompositeBBox(coords, normals, zStart, zEnd, level);
-
-    auto cs = ds->defaultChunkShape();  // {cz, cy, cx}
-    const auto& shape = ds->shape();    // {z, y, x}
-    float csX = static_cast<float>(cs[2]), csY = static_cast<float>(cs[1]), csZ = static_cast<float>(cs[0]);
-
-    ChunkBBox cbbox;
-    cbbox.minIx = std::max(0, static_cast<int>(std::floor(bb.loX / csX)));
-    cbbox.maxIx = std::min(static_cast<int>(std::ceil(bb.hiX / csX)),
-                           static_cast<int>((shape[2] - 1) / cs[2]));
-    cbbox.minIy = std::max(0, static_cast<int>(std::floor(bb.loY / csY)));
-    cbbox.maxIy = std::min(static_cast<int>(std::ceil(bb.hiY / csY)),
-                           static_cast<int>((shape[1] - 1) / cs[1]));
-    cbbox.minIz = std::max(0, static_cast<int>(std::floor(bb.loZ / csZ)));
-    cbbox.maxIz = std::min(static_cast<int>(std::ceil(bb.hiZ / csZ)),
-                           static_cast<int>((shape[0] - 1) / cs[0]));
-    return cbbox;
-}
-
-bool Volume::allCompositeChunksCached(
-    const cv::Mat_<cv::Vec3f>& coords,
-    const cv::Mat_<cv::Vec3f>& normals,
-    int zStart, int zEnd, int level) const
-{
-    ensureTieredCache();
-    if (!tieredCache_ || coords.empty()) return false;
-
-    auto cbbox = compositeChunkBBox(coords, normals, zStart, zEnd, level);
-    if (cbbox.minIx > cbbox.maxIx || cbbox.minIy > cbbox.maxIy || cbbox.minIz > cbbox.maxIz)
-        return false;
-
-    return tieredCache_->areAllCachedInRegion(
-        level, cbbox.minIz, cbbox.minIy, cbbox.minIx,
-        cbbox.maxIz, cbbox.maxIy, cbbox.maxIx);
-}
 
 // ============================================================================
 // Data bounds
@@ -848,269 +621,4 @@ const Volume::DataBounds& Volume::dataBounds() const
     return dataBounds_;
 }
 
-bool Volume::needsRemoteLevel5Prime() const
-{
-    if (!isRemote_) return false;
-    if (zarrDs_.size() < 6) return false;  // need at least levels 0-5
 
-    {
-        std::lock_guard lock(remoteLevel5PrimeMutex_);
-        if (remoteLevel5PrimeStarted_ || remoteLevel5PrimeDone_) return false;
-    }
-
-    // Check if level 5 is already fully cached locally
-    const_cast<Volume*>(this)->ensureTieredCache();
-    if (!tieredCache_) return false;
-
-    auto levelShape = tieredCache_->levelShape(5);
-    auto chunkShape = tieredCache_->chunkShape(5);
-    int gridZ = (levelShape[0] + chunkShape[0] - 1) / chunkShape[0];
-    int gridY = (levelShape[1] + chunkShape[1] - 1) / chunkShape[1];
-    int gridX = (levelShape[2] + chunkShape[2] - 1) / chunkShape[2];
-
-    return !tieredCache_->areAllCachedInRegion(5, 0, 0, 0,
-                                                gridZ - 1, gridY - 1, gridX - 1);
-}
-
-void Volume::primeRemoteLevel5Blocking(
-    const std::function<void(size_t completed, size_t total)>& progressCb)
-{
-    {
-        std::lock_guard lock(remoteLevel5PrimeMutex_);
-        if (remoteLevel5PrimeDone_) return;
-        remoteLevel5PrimeStarted_ = true;
-    }
-
-    ensureTieredCache();
-    if (!tieredCache_ || zarrDs_.size() < 6) {
-        std::lock_guard lock(remoteLevel5PrimeMutex_);
-        remoteLevel5PrimeDone_ = true;
-        return;
-    }
-
-    auto levelShape = tieredCache_->levelShape(5);
-    auto chunkShape = tieredCache_->chunkShape(5);
-    int gridZ = (levelShape[0] + chunkShape[0] - 1) / chunkShape[0];
-    int gridY = (levelShape[1] + chunkShape[1] - 1) / chunkShape[1];
-    int gridX = (levelShape[2] + chunkShape[2] - 1) / chunkShape[2];
-    size_t total = static_cast<size_t>(gridZ) * static_cast<size_t>(gridY) * static_cast<size_t>(gridX);
-    size_t completed = 0;
-
-    try {
-        // Download chunks with bounded concurrency: prefetch a batch,
-        // then wait for them before submitting the next batch.
-        constexpr size_t kBatchSize = 32;
-        std::vector<vc::cache::ChunkKey> allKeys;
-        allKeys.reserve(total);
-        for (int iz = 0; iz < gridZ; iz++)
-            for (int iy = 0; iy < gridY; iy++)
-                for (int ix = 0; ix < gridX; ix++)
-                    allKeys.push_back(vc::cache::ChunkKey{5, iz, iy, ix});
-
-        for (size_t i = 0; i < allKeys.size(); i += kBatchSize) {
-            size_t end = std::min(i + kBatchSize, allKeys.size());
-            for (size_t j = i; j < end; j++) {
-                (void)tieredCache_->getBlocking(allKeys[j]);
-                completed++;
-                if (progressCb)
-                    progressCb(completed, total);
-            }
-        }
-        tieredCache_->flushPersistentState();
-    } catch (...) {
-        std::lock_guard lock(remoteLevel5PrimeMutex_);
-        remoteLevel5PrimeStarted_ = false;
-        throw;
-    }
-
-    std::lock_guard lock(remoteLevel5PrimeMutex_);
-    remoteLevel5PrimeDone_ = true;
-}
-
-// ============================================================================
-// Chunk query / prefetch
-// ============================================================================
-
-Volume::WorldBBox Volume::coordsWorldBBox(const cv::Mat_<cv::Vec3f>& coords) const
-{
-    WorldBBox wb;
-    wb.loX = std::numeric_limits<float>::max();
-    wb.loY = std::numeric_limits<float>::max();
-    wb.loZ = std::numeric_limits<float>::max();
-    wb.hiX = std::numeric_limits<float>::lowest();
-    wb.hiY = std::numeric_limits<float>::lowest();
-    wb.hiZ = std::numeric_limits<float>::lowest();
-
-    if (coords.empty()) return wb;
-
-    const int h = coords.rows;
-    const int w = coords.cols;
-
-#ifdef __aarch64__
-    // NEON with vld3q_f32 to deinterleave xyz — processes 4 Vec3f (12 floats) at a time
-    float32x4_t loX = vdupq_n_f32(std::numeric_limits<float>::max());
-    float32x4_t loY = loX, loZ = loX;
-    float32x4_t hiX = vdupq_n_f32(std::numeric_limits<float>::lowest());
-    float32x4_t hiY = hiX, hiZ = hiX;
-
-    auto scanRow = [&](const cv::Vec3f* row, int count) {
-        const float* p = reinterpret_cast<const float*>(row);
-        int i = 0;
-        for (; i + 4 <= count; i += 4) {
-            float32x4x3_t v = vld3q_f32(p + i * 3);
-            loX = vminq_f32(loX, v.val[0]);
-            loY = vminq_f32(loY, v.val[1]);
-            loZ = vminq_f32(loZ, v.val[2]);
-            hiX = vmaxq_f32(hiX, v.val[0]);
-            hiY = vmaxq_f32(hiY, v.val[1]);
-            hiZ = vmaxq_f32(hiZ, v.val[2]);
-        }
-        for (; i < count; i++) {
-            float x = p[i*3], y = p[i*3+1], z = p[i*3+2];
-            loX = vminq_f32(loX, vdupq_n_f32(x));
-            loY = vminq_f32(loY, vdupq_n_f32(y));
-            loZ = vminq_f32(loZ, vdupq_n_f32(z));
-            hiX = vmaxq_f32(hiX, vdupq_n_f32(x));
-            hiY = vmaxq_f32(hiY, vdupq_n_f32(y));
-            hiZ = vmaxq_f32(hiZ, vdupq_n_f32(z));
-        }
-    };
-
-    scanRow(coords.ptr<cv::Vec3f>(0), w);
-    if (h > 1) scanRow(coords.ptr<cv::Vec3f>(h - 1), w);
-
-    auto updateScalar = [&](const cv::Vec3f& v) {
-        loX = vminq_f32(loX, vdupq_n_f32(v[0]));
-        loY = vminq_f32(loY, vdupq_n_f32(v[1]));
-        loZ = vminq_f32(loZ, vdupq_n_f32(v[2]));
-        hiX = vmaxq_f32(hiX, vdupq_n_f32(v[0]));
-        hiY = vmaxq_f32(hiY, vdupq_n_f32(v[1]));
-        hiZ = vmaxq_f32(hiZ, vdupq_n_f32(v[2]));
-    };
-
-    for (int y = 1; y < h - 1; ++y) {
-        const auto* row = coords.ptr<cv::Vec3f>(y);
-        updateScalar(row[0]);
-        updateScalar(row[w - 1]);
-    }
-    for (int y = 32; y < h - 1; y += 32) {
-        const auto* row = coords.ptr<cv::Vec3f>(y);
-        for (int x = 32; x < w - 1; x += 32)
-            updateScalar(row[x]);
-    }
-
-    // Reduce each 4-lane accumulator to scalar
-    wb.loX = vminvq_f32(loX); wb.hiX = vmaxvq_f32(hiX);
-    wb.loY = vminvq_f32(loY); wb.hiY = vmaxvq_f32(hiY);
-    wb.loZ = vminvq_f32(loZ); wb.hiZ = vmaxvq_f32(hiZ);
-#else
-    auto updateBounds = [&](const cv::Vec3f& v) {
-        wb.loX = std::min(wb.loX, v[0]); wb.hiX = std::max(wb.hiX, v[0]);
-        wb.loY = std::min(wb.loY, v[1]); wb.hiY = std::max(wb.hiY, v[1]);
-        wb.loZ = std::min(wb.loZ, v[2]); wb.hiZ = std::max(wb.hiZ, v[2]);
-    };
-
-    const auto* topRow = coords.ptr<cv::Vec3f>(0);
-    const auto* botRow = coords.ptr<cv::Vec3f>(h - 1);
-    for (int x = 0; x < w; ++x) {
-        updateBounds(topRow[x]);
-        updateBounds(botRow[x]);
-    }
-    for (int y = 1; y < h - 1; ++y) {
-        const auto* row = coords.ptr<cv::Vec3f>(y);
-        updateBounds(row[0]);
-        updateBounds(row[w - 1]);
-    }
-    for (int y = 32; y < h - 1; y += 32) {
-        const auto* row = coords.ptr<cv::Vec3f>(y);
-        for (int x = 32; x < w - 1; x += 32)
-            updateBounds(row[x]);
-    }
-#endif
-
-    return wb;
-}
-
-Volume::ChunkBBox Volume::worldBBoxToChunkBBox(const WorldBBox& wb, int level) const
-{
-    vc::VcDataset* ds = zarrDataset(level);
-    if (!ds) return {0, -1, 0, -1, 0, -1};
-
-    float scale = (level > 0) ? (1.0f / static_cast<float>(1 << level)) : 1.0f;
-    auto cs = ds->defaultChunkShape();
-    const auto& shape = ds->shape();
-    float csX = static_cast<float>(cs[2]), csY = static_cast<float>(cs[1]), csZ = static_cast<float>(cs[0]);
-
-    // Apply scale + interpolation margin
-    float loX = wb.loX * scale - 2.0f;
-    float loY = wb.loY * scale - 2.0f;
-    float loZ = wb.loZ * scale - 2.0f;
-    float hiX = wb.hiX * scale + 2.0f;
-    float hiY = wb.hiY * scale + 2.0f;
-    float hiZ = wb.hiZ * scale + 2.0f;
-
-    ChunkBBox bb;
-    bb.minIx = std::max(0, static_cast<int>(std::floor(loX / csX)));
-    bb.maxIx = std::min(static_cast<int>(std::ceil(hiX / csX)),
-                        static_cast<int>((shape[2] - 1) / cs[2]));
-    bb.minIy = std::max(0, static_cast<int>(std::floor(loY / csY)));
-    bb.maxIy = std::min(static_cast<int>(std::ceil(hiY / csY)),
-                        static_cast<int>((shape[1] - 1) / cs[1]));
-    bb.minIz = std::max(0, static_cast<int>(std::floor(loZ / csZ)));
-    bb.maxIz = std::min(static_cast<int>(std::ceil(hiZ / csZ)),
-                        static_cast<int>((shape[0] - 1) / cs[0]));
-    return bb;
-}
-
-Volume::ChunkBBox Volume::coordsToChunkBBox(
-    const cv::Mat_<cv::Vec3f>& coords, int level) const
-{
-    return worldBBoxToChunkBBox(coordsWorldBBox(coords), level);
-}
-
-bool Volume::allChunksCachedFast(const WorldBBox& wb, int level) const
-{
-    ensureTieredCache();
-    if (!tieredCache_) return false;
-
-    auto bb = worldBBoxToChunkBBox(wb, level);
-    if (bb.minIx > bb.maxIx || bb.minIy > bb.maxIy || bb.minIz > bb.maxIz) return false;
-
-    return tieredCache_->areAllCachedInRegion(
-        level, bb.minIz, bb.minIy, bb.minIx,
-        bb.maxIz, bb.maxIy, bb.maxIx);
-}
-
-void Volume::fetchInteractiveWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level)
-{
-    ensureTieredCache();
-    if (!tieredCache_) return;
-
-    vc::VcDataset* ds = zarrDataset(level);
-    if (!ds) return;
-
-    float scale = (level > 0) ? (1.0f / static_cast<float>(1 << level)) : 1.0f;
-    auto cs = ds->defaultChunkShape();
-    const auto& shape = ds->shape();
-    float csX = static_cast<float>(cs[2]), csY = static_cast<float>(cs[1]), csZ = static_cast<float>(cs[0]);
-
-    float sLoX = lo[0] * scale - 1.0f, sHiX = hi[0] * scale + 1.0f;
-    float sLoY = lo[1] * scale - 1.0f, sHiY = hi[1] * scale + 1.0f;
-    float sLoZ = lo[2] * scale - 1.0f, sHiZ = hi[2] * scale + 1.0f;
-
-    int minIx = std::max(0, static_cast<int>(std::floor(sLoX / csX)));
-    int maxIx = std::min(static_cast<int>((shape[2] - 1) / cs[2]), static_cast<int>(std::ceil(sHiX / csX)));
-    int minIy = std::max(0, static_cast<int>(std::floor(sLoY / csY)));
-    int maxIy = std::min(static_cast<int>((shape[1] - 1) / cs[1]), static_cast<int>(std::ceil(sHiY / csY)));
-    int minIz = std::max(0, static_cast<int>(std::floor(sLoZ / csZ)));
-    int maxIz = std::min(static_cast<int>((shape[0] - 1) / cs[0]), static_cast<int>(std::ceil(sHiZ / csZ)));
-
-    if (minIx > maxIx || minIy > maxIy || minIz > maxIz) return;
-
-    std::vector<vc::cache::ChunkKey> keys;
-    for (int iz = minIz; iz <= maxIz; iz++)
-        for (int iy = minIy; iy <= maxIy; iy++)
-            for (int ix = minIx; ix <= maxIx; ix++)
-                keys.push_back(vc::cache::ChunkKey{level, iz, iy, ix});
-    tieredCache_->fetchInteractive(keys);
-}

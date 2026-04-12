@@ -2,7 +2,7 @@
 
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/HashFunctions.hpp"
-#include "vc/core/cache/SimpleCacheFactory.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/types/Array3D.hpp"
 
 #include <opencv2/core.hpp>
@@ -657,7 +657,7 @@ struct Chunked3dFloatFromUint8
 {
     Chunked3dFloatFromUint8(std::unique_ptr<vc::VcDataset> &&ds, float scale, std::string const &cache_root, std::string const &unique_id) :
         _passthrough{unique_id},
-        _ownedCache(vc::cache::createSimpleTieredCache(ds.get(), 128ULL << 20, ds->path())),
+        _ownedCache(vc::cache::openFilesystemPipeline(ds.get(), 128ULL << 20, ds->path())),
         _x(_passthrough, ds.get(), _ownedCache.get(), 0, cache_root),
         _scale(scale),
         _ds(std::move(ds))
@@ -691,9 +691,9 @@ struct Chunked3dVec3fFromUint8
         _passthrough_x{unique_id + "_x"},
         _passthrough_y{unique_id + "_y"},
         _passthrough_z{unique_id + "_z"},
-        _cacheX(vc::cache::createSimpleTieredCache(dss[0].get(), 128ULL << 20, dss[0]->path())),
-        _cacheY(vc::cache::createSimpleTieredCache(dss[1].get(), 128ULL << 20, dss[1]->path())),
-        _cacheZ(vc::cache::createSimpleTieredCache(dss[2].get(), 128ULL << 20, dss[2]->path())),
+        _cacheX(vc::cache::openFilesystemPipeline(dss[0].get(), 128ULL << 20, dss[0]->path())),
+        _cacheY(vc::cache::openFilesystemPipeline(dss[1].get(), 128ULL << 20, dss[1]->path())),
+        _cacheZ(vc::cache::openFilesystemPipeline(dss[2].get(), 128ULL << 20, dss[2]->path())),
         _x(_passthrough_x, dss[0].get(), _cacheX.get(), 0, cache_root),
         _y(_passthrough_y, dss[1].get(), _cacheY.get(), 0, cache_root),
         _z(_passthrough_z, dss[2].get(), _cacheZ.get(), 0, cache_root),

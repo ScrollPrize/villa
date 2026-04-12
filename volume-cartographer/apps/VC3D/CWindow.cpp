@@ -499,28 +499,13 @@ std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<Quad
 
 void primeRemoteLevel5WithDialog(CWindow* window, const std::shared_ptr<Volume>& volume)
 {
-    if (!window || !volume || !volume->needsRemoteLevel5Prime()) {
-        return;
-    }
-
-    if (window->statusBar()) {
-        window->statusBar()->showMessage(
-            window->tr("Downloading remote level 5 overview in background..."), 0);
-    }
-
+    if (!window || !volume) return;
+    // Level-5 is loaded automatically into the BlockCache resident region
+    // when the BlockPipeline is first created. Trigger it asynchronously.
     auto* watcher = new QFutureWatcher<void>(window);
-    QObject::connect(watcher, &QFutureWatcher<void>::finished, window, [window, volume, watcher]() {
-        watcher->deleteLater();
-        if (window->statusBar()) {
-            window->statusBar()->showMessage(
-                window->tr("Cached remote level 5 overview for '%1'.")
-                    .arg(QString::fromStdString(volume->id())),
-                5000);
-        }
-    });
-
+    QObject::connect(watcher, &QFutureWatcher<void>::finished, watcher, &QObject::deleteLater);
     watcher->setFuture(QtConcurrent::run([volume]() {
-        volume->primeRemoteLevel5Blocking(nullptr);
+        (void)volume->tieredCache();
     }));
 }
 

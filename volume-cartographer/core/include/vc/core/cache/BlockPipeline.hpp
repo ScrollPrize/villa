@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -16,29 +17,26 @@
 #include "ChunkKey.hpp"
 #include "ChunkSource.hpp"
 #include "IOPool.hpp"
-#include <utils/lru_cache.hpp>
 #include <utils/zarr.hpp>
+
+namespace vc { class VcDataset; }
 
 namespace vc::cache {
 
-// Multi-tiered chunk cache with three storage levels:
+// Block-granular cache pipeline. Data flows ice (remote) → cold (disk) →
+// decoded bytes → 16^3 blocks in the BlockCache.
 //
-//   HOT   — decompressed in RAM, ready to sample (ChunkDataPtr)
-//   COLD  — local zarr v3 sharded store on disk
-//   ICE   — remote source, S3/HTTP/filesystem (ChunkSource)
-//
-// Promotion path:  ice → cold → hot  (decompression inline on IO thread)
-// Eviction:        hot entries removed (cold still has on-disk copy).
+// Callers see only blocks. Chunks are an on-disk/IO artifact used internally
+// to amortize S3 and codec overhead.
 class BlockPipeline {
 public:
     struct Config {
-        size_t hotMaxBytes = 10ULL << 30;    // 10 GB
-        std::string volumeId;                // for disk store keying
+        size_t blockCacheBytes = 10ULL << 30;  // 10 GiB
+        std::string volumeId;
         int ioThreads = 8;
         size_t ioQueueSize = 10000000;
     };
 
-    // diskZarr: local zarr v3 sharded array for cold tier (may be nullptr)
     BlockPipeline(
         Config config,
         std::unique_ptr<ChunkSource> source,
@@ -50,30 +48,22 @@ public:
     BlockPipeline(const BlockPipeline&) = delete;
     BlockPipeline& operator=(const BlockPipeline&) = delete;
 
-    // --- Non-blocking reads ---
-    [[nodiscard]] ChunkDataPtr get(const ChunkKey& key);
-    [[nodiscard]] std::pair<ChunkDataPtr, int> getBestAvailable(const ChunkKey& key);
-
-    // --- Blocking reads ---
-    [[nodiscard]] ChunkDataPtr getBlocking(const ChunkKey& key);
-
-    // --- Interactive fetch (for viewport chunks) ---
-    void fetchInteractive(const std::vector<ChunkKey>& keys);
-
     // --- Block-level access ---
-    // Returns a shared pointer to a 16^3 uncompressed block, or null if not
-    // in RAM. Resident-level blocks are always available. Evictable-region
-    // blocks remain alive while the returned shared_ptr is held.
+    // Returns a shared_ptr to the 16^3 block, or null if not in RAM.
+    // Evicted blocks stay alive while any caller still holds a shared_ptr.
     [[nodiscard]] BlockPtr blockAt(const BlockKey& key) noexcept;
 
-    // Blocking: ensures the enclosing chunk is decoded (pulling from cold
-    // or ice if needed), then returns the block. Returns null if the data
-    // is negative-cached or unavailable.
+    // Blocking: ensures the enclosing chunk is decoded, then returns the
+    // block. Null if the region is negative-cached or unavailable.
     [[nodiscard]] BlockPtr getBlockingBlock(const BlockKey& key);
 
+    // --- Interactive fetch (for viewport chunks) ---
+    // Chunk keys are still the IO unit — after decode, each chunk is split
+    // into 16^3 blocks and inserted into the block cache.
+    void fetchInteractive(const std::vector<ChunkKey>& keys);
+
     // Populate the always-resident region with every block from `level`.
-    // Blocking: fetches any missing chunks through the normal chain. Call
-    // once on volume open.
+    // Blocking: fetches missing chunks through the normal chain.
     void loadResidentLevel(int level);
 
     // --- Cache management ---
@@ -99,9 +89,9 @@ public:
     [[nodiscard]] DataBoundsL0 dataBounds() const;
 
     [[nodiscard]] bool isNegativeCached(const ChunkKey& key) const;
-    [[nodiscard]] bool areAllCachedInRegion(int level,
-                              int iz0, int iy0, int ix0,
-                              int iz1, int iy1, int ix1) const;
+
+    // Counts how many of the given chunks are either already decoded
+    // (first block in block cache) or known-empty.
     [[nodiscard]] size_t countAvailable(const std::vector<ChunkKey>& keys) const;
 
     // --- Notifications ---
@@ -114,53 +104,41 @@ public:
 
     // --- Stats ---
     struct Stats {
-        uint64_t hotHits = 0;
+        uint64_t blockHits = 0;
         uint64_t coldHits = 0;
         uint64_t iceFetches = 0;
         uint64_t misses = 0;
-        uint64_t hotEvictions = 0;
-        size_t hotBytes = 0;
+        size_t blocksResident = 0;
+        size_t blocksEvictable = 0;
         size_t ioPending = 0;
         uint64_t diskWrites = 0;
         size_t negativeCount = 0;
-        size_t diskBytes = 0;    // total bytes on disk across all level shards
-        size_t diskShards = 0;   // number of shard files on disk
-        uint64_t totalSubmitted = 0;  // total chunks ever submitted to IO pool
-        bool sharded = false;    // true if source uses sharded zarr
+        size_t diskBytes = 0;
+        size_t diskShards = 0;
+        uint64_t totalSubmitted = 0;
+        bool sharded = false;
     };
 
     [[nodiscard]] Stats stats() const;
 
 private:
-    utils::ShardedLRUCache<ChunkKey, ChunkDataPtr, ChunkKeyHash> hotCache_;
-
-    [[nodiscard]] ChunkDataPtr hotGet(const ChunkKey& key);
-    void hotPut(const ChunkKey& key, ChunkDataPtr data);
-
     Config config_;
-
-    // --- Cold tier (per-level sharded zarr v3 arrays: path/0/, path/1/, ...) ---
     std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels_;
-
-    // --- Ice tier ---
     std::unique_ptr<ChunkSource> source_;
-
-    // --- Decompression ---
     DecompressFn decompress_;
-
-    // --- I/O pool ---
     IOPool ioPool_;
 
-    // --- Block cache ---
     BlockCache blockCache_;
     int residentLevel_ = -1;
 
-    // Split a decoded chunk into 16^3 blocks and insert them into blockCache_.
-    // resident=true places blocks in the always-resident region.
-    void insertChunkAsBlocks(const ChunkKey& key, const ChunkData& chunk,
-                             bool resident);
+    // Blocking chunk fetch (cold → ice) used internally to populate blocks.
+    // Returns raw decoded bytes packed as the chunk's native shape.
+    [[nodiscard]] ChunkDataPtr fetchChunkBlocking(const ChunkKey& key);
 
-    // --- Negative cache ---
+    // Split a decoded chunk into 16^3 blocks and insert into blockCache_.
+    void insertChunkAsBlocks(const ChunkKey& key, const ChunkData& chunk, bool resident);
+
+    // Negative cache (same design as before).
     static constexpr size_t kBloomBits = 65536;
     std::array<std::atomic<uint64_t>, kBloomBits / 64> negativeBloom_{};
     void bloomAdd(const ChunkKey& key) noexcept;
@@ -171,13 +149,6 @@ private:
     void loadNegativeCache();
     void saveNegativeCache() const;
 
-    // --- Promotion helpers ---
-    [[nodiscard]] ChunkDataPtr promoteFromCold(const ChunkKey& key);
-    [[nodiscard]] ChunkDataPtr promoteFromIce(const ChunkKey& key);
-    [[nodiscard]] ChunkDataPtr loadFull(const ChunkKey& key);
-    [[nodiscard]] bool isReadyForNonBlockingRead(const ChunkKey& key) const;
-    [[nodiscard]] bool isAvailableWithoutRemoteFetch(const ChunkKey& key) const;
-
     mutable std::mutex callbackMutex_;
     std::vector<std::pair<ChunkReadyCallbackId, ChunkReadyCallback>> chunkReadyListeners_;
     std::atomic<ChunkReadyCallbackId> nextListenerId_{1};
@@ -186,12 +157,17 @@ private:
     mutable std::mutex dataBoundsMutex_;
     DataBoundsL0 dataBoundsL0_;
 
-    mutable std::atomic<uint64_t> statHotHits_{0};
+    mutable std::atomic<uint64_t> statBlockHits_{0};
     std::atomic<uint64_t> statColdHits_{0};
     std::atomic<uint64_t> statIceFetches_{0};
     std::atomic<uint64_t> statDiskWrites_{0};
     std::atomic<uint64_t> statTotalSubmitted_{0};
     mutable std::atomic<uint64_t> statMisses_{0};
 };
+
+// Convenience: open a single-level BlockPipeline against a local zarr dataset
+// (no disk tier; filesystem serves as ice). Used by CLI tools, tracer, etc.
+std::unique_ptr<BlockPipeline> openFilesystemPipeline(
+    VcDataset* ds, size_t maxBytes, const std::filesystem::path& datasetPath);
 
 }  // namespace vc::cache

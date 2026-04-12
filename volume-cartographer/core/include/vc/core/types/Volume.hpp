@@ -153,28 +153,9 @@ public:
         const std::string& compositeMethod,
         const uint32_t lut[256]);
 
-    void fetchInteractiveWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level);
-
     // --- Data bounds ---
-
-    // Return the bounding box of the volume (level-0 voxel coords).
-    // Computed lazily from the volume shape.
     [[nodiscard]] const DataBounds& dataBounds() const;
-
-    // Set data bounds to the full volume shape.
     void computeDataBounds();
-
-    // --- Remote level-5 priming ---
-
-    // Returns true when the volume is remote, has >= 6 pyramid levels,
-    // and level 5 hasn't been fully downloaded yet.
-    [[nodiscard]] bool needsRemoteLevel5Prime() const;
-
-    // Download every chunk at pyramid level 5 synchronously.
-    // Calls progressCb(completed, total) periodically for UI updates.
-    // After completion, flushes persistent state so a reopen doesn't repeat.
-    void primeRemoteLevel5Blocking(
-        const std::function<void(size_t completed, size_t total)>& progressCb = nullptr);
 
     [[nodiscard]] static bool checkDir(const std::filesystem::path& path);
 
@@ -204,37 +185,10 @@ protected:
     mutable DataBounds dataBounds_;
     mutable std::once_flag boundsOnce_;
 
-    // Remote level-5 priming state
-    mutable std::mutex remoteLevel5PrimeMutex_;
-    bool remoteLevel5PrimeStarted_ = false;
-    bool remoteLevel5PrimeDone_ = false;
-
-    // Bounding box of coords in chunk index space (helper for prefetch)
-    struct ChunkBBox {
-        int minIx, maxIx, minIy, maxIy, minIz, maxIz;
-    };
-    // World-space bounding box (level-0 coordinates, no scaling applied)
-    struct WorldBBox {
-        float loX, loY, loZ, hiX, hiY, hiZ;
-    };
-    ChunkBBox coordsToChunkBBox(const cv::Mat_<cv::Vec3f>& coords, int level) const;
-    // Compute world-space bbox once, then derive chunk bbox for any level cheaply
-    WorldBBox coordsWorldBBox(const cv::Mat_<cv::Vec3f>& coords) const;
-    ChunkBBox worldBBoxToChunkBBox(const WorldBBox& wb, int level) const;
-    bool allChunksCachedFast(const WorldBBox& wb, int level) const;
-
     void sampleComposite(cv::Mat_<uint8_t>& out,
                          const cv::Mat_<cv::Vec3f>& coords,
                          const cv::Mat_<cv::Vec3f>& normals,
                          const vc::SampleParams& params);
-
-    // Composite-aware chunk helpers: expand bbox by normal offsets
-    ChunkBBox compositeChunkBBox(const cv::Mat_<cv::Vec3f>& coords,
-                                 const cv::Mat_<cv::Vec3f>& normals,
-                                 int zStart, int zEnd, int level) const;
-    bool allCompositeChunksCached(const cv::Mat_<cv::Vec3f>& coords,
-                                  const cv::Mat_<cv::Vec3f>& normals,
-                                  int zStart, int zEnd, int level) const;
 
     void loadMetadata();
 

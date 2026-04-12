@@ -1,7 +1,7 @@
 #include <iostream>
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
-#include "vc/core/cache/SimpleCacheFactory.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
@@ -1337,7 +1337,7 @@ int main(int argc, char *argv[])
     } else {
         ownedDs = std::make_unique<vc::VcDataset>(vol_path / std::to_string(group_idx));
         ds = ownedDs.get();
-        ownedChunkCache = vc::cache::createSimpleTieredCache(ds, cache_bytes, ds->path());
+        ownedChunkCache = vc::cache::openFilesystemPipeline(ds, cache_bytes, ds->path());
         chunk_cache = ownedChunkCache.get();
     }
 

@@ -736,14 +736,12 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
     if (_volume->tieredCache()) {
         auto s = _volume->tieredCache()->stats();
 
-        uint64_t total = s.hotHits + s.coldHits + s.iceFetches + s.misses;
+        uint64_t total = s.blockHits + s.coldHits + s.iceFetches + s.misses;
         if (total > 0) {
             auto pct = [&](uint64_t n) { return static_cast<int>(100 * n / total); };
-            status += QString(" | hot %1% cold %2%").arg(pct(s.hotHits)).arg(pct(s.coldHits));
+            status += QString(" | blk %1% cold %2%").arg(pct(s.blockHits)).arg(pct(s.coldHits));
         }
-
-        double hotGB = static_cast<double>(s.hotBytes) / (1024.0 * 1024.0 * 1024.0);
-        status += QString(" | ram %1G").arg(hotGB, 0, 'f', 1);
+        status += QString(" | blk %1r/%2e").arg(s.blocksResident).arg(s.blocksEvictable);
 
         double diskGB = static_cast<double>(s.diskBytes) / (1024.0 * 1024.0 * 1024.0);
         const char* unit = s.sharded ? "shard" : "chunk";
