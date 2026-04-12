@@ -711,10 +711,15 @@ void sampleCompositeAdaptiveImpl(
     if (coords) {
         float minVx=FLT_MAX, minVy=FLT_MAX, minVz=FLT_MAX;
         float maxVx=-FLT_MAX, maxVy=-FLT_MAX, maxVz=-FLT_MAX;
-        for (int r=0; r<coords->rows; r++) {
+        // Subsample the coord grid for bbox computation: for a ~1920x1080
+        // coords matrix, an 8x8 stride gives 30k samples instead of 2M
+        // and still bounds the actual bbox within a voxel of truth
+        // (prefetch is block-granular anyway).
+        const int stride = (coords->rows > 256) ? 8 : 1;
+        for (int r=0; r<coords->rows; r += stride) {
             const cv::Vec3f* row = coords->ptr<cv::Vec3f>(r);
             const cv::Vec3f* nrow = normals ? normals->ptr<cv::Vec3f>(r) : nullptr;
-            for (int c=0; c<coords->cols; c++) {
+            for (int c=0; c<coords->cols; c += stride) {
                 const auto& v = row[c];
                 if (!isfinite_bitwise(v[0])) continue;
                 cv::Vec3f n = nrow ? nrow[c] : cv::Vec3f(0,0,0);
