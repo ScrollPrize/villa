@@ -1,6 +1,7 @@
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/BinaryPyramid.hpp"
 #include "vc/core/util/Zarr.hpp"
+#include <utils/zarr.hpp>
 
 #include <boost/program_options.hpp>
 
@@ -1925,10 +1926,12 @@ static void rewriteOutputFillValue(const fs::path& outputRoot,
                                    uint8_t fillValue)
 {
     for (int level : levels) {
-        const fs::path zarrayPath = outputRoot / std::to_string(level) / ".zarray";
-        utils::Json zarray = readJsonFile(zarrayPath);
-        zarray["fill_value"] = static_cast<int>(fillValue);
-        writeJsonFile(zarrayPath, zarray);
+        const fs::path levelPath = outputRoot / std::to_string(level);
+        auto meta = utils::ZarrArray::open(levelPath).metadata();
+        meta.fill_value = static_cast<double>(fillValue);
+        auto zarray = utils::detail::serialize_zarray(meta);
+        std::ofstream out(levelPath / ".zarray", std::ios::binary | std::ios::trunc);
+        out << zarray;
     }
 }
 
