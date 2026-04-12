@@ -53,6 +53,7 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "cross_attention_use_rope": True,
     "scheduled_sampling_enabled": False,
     "scheduled_sampling_mode": "linear_full_token_greedy",
+    "scheduled_sampling_pattern": "stripwise_full_strip_greedy",
     "scheduled_sampling_max_prob": 0.10,
     "scheduled_sampling_start_step": 0,
     "scheduled_sampling_ramp_steps": 0,
@@ -60,6 +61,19 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "position_refine_loss": "huber",
     "position_refine_weight": 0.05,
     "position_refine_start_step": 5000,
+    "xyz_soft_loss_enabled": True,
+    "xyz_soft_loss_weight": 1.0,
+    "xyz_soft_loss_start_step": 0,
+    "xyz_soft_loss": "huber",
+    "seam_loss_enabled": True,
+    "seam_loss_weight": 0.25,
+    "seam_loss_start_step": 0,
+    "seam_loss": "edge_huber",
+    "seam_band_width": 1,
+    "triangle_barrier_enabled": True,
+    "triangle_barrier_weight": 0.1,
+    "triangle_barrier_start_step": 0,
+    "triangle_barrier_margin": 0.05,
     "geometry_metric_enabled": True,
     "geometry_metric_weight": 0.01,
     "geometry_metric_start_step": 2000,
@@ -79,6 +93,8 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "val_num_workers": 0,
     "val_fraction": 0.1,
     "val_batches_per_log": 4,
+    "rollout_val_examples_per_log": 1,
+    "rollout_val_max_steps": None,
     "num_steps": 1000,
     "grad_clip": 1.0,
     "mixed_precision": "no",
@@ -190,6 +206,8 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("cross_attention_use_rope must be a boolean")
     if str(cfg["scheduled_sampling_mode"]) != "linear_full_token_greedy":
         raise ValueError("scheduled_sampling_mode must currently be 'linear_full_token_greedy'")
+    if str(cfg["scheduled_sampling_pattern"]) != "stripwise_full_strip_greedy":
+        raise ValueError("scheduled_sampling_pattern must currently be 'stripwise_full_strip_greedy'")
     if float(cfg["scheduled_sampling_max_prob"]) < 0.0 or float(cfg["scheduled_sampling_max_prob"]) > 1.0:
         raise ValueError("scheduled_sampling_max_prob must be within [0, 1]")
     if int(cfg["scheduled_sampling_start_step"]) < 0:
@@ -202,6 +220,26 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("position_refine_weight must be non-negative")
     if int(cfg["position_refine_start_step"]) < 0:
         raise ValueError("position_refine_start_step must be >= 0")
+    if str(cfg["xyz_soft_loss"]) != "huber":
+        raise ValueError("xyz_soft_loss must currently be 'huber'")
+    if float(cfg["xyz_soft_loss_weight"]) < 0.0:
+        raise ValueError("xyz_soft_loss_weight must be non-negative")
+    if int(cfg["xyz_soft_loss_start_step"]) < 0:
+        raise ValueError("xyz_soft_loss_start_step must be >= 0")
+    if str(cfg["seam_loss"]) != "edge_huber":
+        raise ValueError("seam_loss must currently be 'edge_huber'")
+    if float(cfg["seam_loss_weight"]) < 0.0:
+        raise ValueError("seam_loss_weight must be non-negative")
+    if int(cfg["seam_loss_start_step"]) < 0:
+        raise ValueError("seam_loss_start_step must be >= 0")
+    if int(cfg["seam_band_width"]) <= 0:
+        raise ValueError("seam_band_width must be positive")
+    if float(cfg["triangle_barrier_weight"]) < 0.0:
+        raise ValueError("triangle_barrier_weight must be non-negative")
+    if int(cfg["triangle_barrier_start_step"]) < 0:
+        raise ValueError("triangle_barrier_start_step must be >= 0")
+    if float(cfg["triangle_barrier_margin"]) < 0.0:
+        raise ValueError("triangle_barrier_margin must be non-negative")
     if str(cfg["geometry_metric_loss"]) != "huber":
         raise ValueError("geometry_metric_loss must currently be 'huber'")
     if float(cfg["geometry_metric_weight"]) < 0.0:
@@ -232,6 +270,10 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("val_fraction must be within [0, 1]")
     if int(cfg["val_batches_per_log"]) <= 0:
         raise ValueError("val_batches_per_log must be positive")
+    if int(cfg["rollout_val_examples_per_log"]) <= 0:
+        raise ValueError("rollout_val_examples_per_log must be positive")
+    if cfg["rollout_val_max_steps"] is not None and int(cfg["rollout_val_max_steps"]) <= 0:
+        raise ValueError("rollout_val_max_steps must be None or positive")
     if int(cfg["log_frequency"]) <= 0:
         raise ValueError("log_frequency must be positive")
     if int(cfg["ckpt_frequency"]) <= 0:

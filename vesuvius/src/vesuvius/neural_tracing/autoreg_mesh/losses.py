@@ -204,6 +204,30 @@ def _factorized_coarse_pointer_loss(
     return coarse_loss, coarse_target_entropy, axis_losses
 
 
+def _coarse_accuracy_metrics(outputs: dict, batch: dict) -> dict[str, Tensor]:
+    if "pred_coarse_ids" not in outputs:
+        zeros = batch["target_xyz"].new_zeros(())
+        return {
+            "coarse_exact_acc": zeros,
+            "coarse_axis_acc_z": zeros,
+            "coarse_axis_acc_y": zeros,
+            "coarse_axis_acc_x": zeros,
+        }
+    mask = batch["target_supervision_mask"]
+    pred_coarse_ids = outputs["pred_coarse_ids"]
+    target_coarse_ids = batch["target_coarse_ids"]
+    exact_acc = _masked_mean((pred_coarse_ids == target_coarse_ids).to(dtype=torch.float32), mask)
+    coarse_grid_shape = tuple(int(v) for v in outputs["coarse_grid_shape"])
+    target_axis = _unflatten_coarse_axis_ids(target_coarse_ids, coarse_grid_shape=coarse_grid_shape)
+    pred_axis = outputs["pred_coarse_axis_ids"]
+    return {
+        "coarse_exact_acc": exact_acc,
+        "coarse_axis_acc_z": _masked_mean((pred_axis["z"] == target_axis["z"]).to(dtype=torch.float32), mask),
+        "coarse_axis_acc_y": _masked_mean((pred_axis["y"] == target_axis["y"]).to(dtype=torch.float32), mask),
+        "coarse_axis_acc_x": _masked_mean((pred_axis["x"] == target_axis["x"]).to(dtype=torch.float32), mask),
+    }
+
+
 def _offset_bin_loss(outputs: dict, batch: dict, offset_num_bins: tuple[int, int, int]) -> Tensor:
     logits = outputs["offset_logits"]
     targets = batch["target_offset_bins"]
@@ -239,10 +263,46 @@ def _position_refine_loss(outputs: dict, batch: dict, *, loss_type: str) -> Tens
 
 
 def _soft_geometry_xyz(outputs: dict, *, include_refine_residual: bool) -> Tensor:
-    pred_xyz_soft = outputs["pred_xyz_soft"]
+    if "pred_xyz_soft" in outputs:
+        pred_xyz_soft = outputs["pred_xyz_soft"]
+    elif "pred_xyz_refined" in outputs:
+        pred_xyz_soft = outputs["pred_xyz_refined"]
+    else:
+        pred_xyz_soft = outputs["pred_xyz"]
     if bool(include_refine_residual):
         return pred_xyz_soft
+    if "pred_refine_residual" not in outputs:
+        return pred_xyz_soft
     return pred_xyz_soft - outputs["pred_refine_residual"]
+
+
+def _geometry_batch_available(batch: dict) -> bool:
+    return (
+        "target_lengths" in batch and
+        "target_grid_shape" in batch and
+        "target_valid_mask" in batch and
+        "target_grid_local" in batch and
+        "conditioning_grid_local" in batch and
+        "direction" in batch
+    )
+
+
+def _as_grid_tensor(value, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+    if torch.is_tensor(value):
+        return value.to(device=device, dtype=dtype)
+    return torch.as_tensor(value, device=device, dtype=dtype)
+
+
+def _prediction_finite_mask(pred_xyz_sequence: Tensor) -> Tensor:
+    return torch.isfinite(pred_xyz_sequence).all(dim=-1)
+
+
+def _l1_xyz_metric(pred_xyz_sequence: Tensor, batch: dict) -> Tensor:
+    if "target_xyz" not in batch or "target_supervision_mask" not in batch:
+        return pred_xyz_sequence.new_zeros(())
+    mask = batch["target_supervision_mask"] & _prediction_finite_mask(pred_xyz_sequence)
+    per_token = (pred_xyz_sequence - batch["target_xyz"]).abs().mean(dim=-1)
+    return _masked_mean(per_token, mask)
 
 
 def _sequence_to_grid_torch(sequence: Tensor, *, grid_shape: tuple[int, int], direction: str) -> Tensor:
@@ -270,6 +330,240 @@ def _sequence_to_grid_torch(sequence: Tensor, *, grid_shape: tuple[int, int], di
     return sequence.index_select(0, flat_to_seq).reshape(h, w, *sequence.shape[1:])
 
 
+def _merge_grids_torch(cond_grid: Tensor, cont_grid: Tensor, *, direction: str) -> Tensor:
+    if direction == "left":
+        return torch.cat([cond_grid, cont_grid], dim=1)
+    if direction == "right":
+        return torch.cat([cont_grid, cond_grid], dim=1)
+    if direction == "up":
+        return torch.cat([cond_grid, cont_grid], dim=0)
+    if direction == "down":
+        return torch.cat([cont_grid, cond_grid], dim=0)
+    raise ValueError(f"unsupported direction {direction!r}")
+
+
+def _merge_region_masks_torch(cond_mask: Tensor, cont_mask: Tensor, *, direction: str) -> Tensor:
+    if direction == "left":
+        return torch.cat([cond_mask, cont_mask], dim=1)
+    if direction == "right":
+        return torch.cat([cont_mask, cond_mask], dim=1)
+    if direction == "up":
+        return torch.cat([cond_mask, cont_mask], dim=0)
+    if direction == "down":
+        return torch.cat([cont_mask, cond_mask], dim=0)
+    raise ValueError(f"unsupported direction {direction!r}")
+
+
+def _iter_geometry_examples(pred_xyz_sequence: Tensor, batch: dict):
+    if not _geometry_batch_available(batch):
+        return
+    for batch_idx, direction in enumerate(batch["direction"]):
+        target_len = int(batch["target_lengths"][batch_idx].item())
+        if target_len <= 0:
+            continue
+        grid_shape = tuple(int(v) for v in batch["target_grid_shape"][batch_idx].tolist())
+        pred_grid = _sequence_to_grid_torch(pred_xyz_sequence[batch_idx, :target_len], grid_shape=grid_shape, direction=direction)
+        target_grid = _as_grid_tensor(
+            batch["target_grid_local"][batch_idx],
+            device=pred_grid.device,
+            dtype=pred_grid.dtype,
+        )
+        cond_grid = _as_grid_tensor(
+            batch["conditioning_grid_local"][batch_idx],
+            device=pred_grid.device,
+            dtype=pred_grid.dtype,
+        )
+        target_valid_grid = _sequence_to_grid_torch(
+            batch["target_valid_mask"][batch_idx, :target_len],
+            grid_shape=grid_shape,
+            direction=direction,
+        ).bool()
+        yield {
+            "batch_idx": batch_idx,
+            "direction": str(direction),
+            "grid_shape": grid_shape,
+            "pred_grid": pred_grid,
+            "target_grid": target_grid,
+            "conditioning_grid": cond_grid,
+            "target_valid_grid": target_valid_grid,
+        }
+
+
+def _paired_seam_bands(example: dict, *, band_width: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    direction = str(example["direction"])
+    pred_grid = example["pred_grid"]
+    target_grid = example["target_grid"]
+    cond_grid = example["conditioning_grid"]
+    target_valid_grid = example["target_valid_grid"]
+    cond_valid = torch.isfinite(cond_grid).all(dim=-1)
+    pred_valid = torch.isfinite(pred_grid).all(dim=-1)
+    band = int(band_width)
+
+    if direction == "left":
+        band = min(band, int(cond_grid.shape[1]), int(pred_grid.shape[1]))
+        cond_band = torch.flip(cond_grid[:, -band:, :], dims=(1,))
+        pred_band = pred_grid[:, :band, :]
+        target_band = target_grid[:, :band, :]
+        valid_band = torch.flip(cond_valid[:, -band:], dims=(1,)) & pred_valid[:, :band] & target_valid_grid[:, :band]
+    elif direction == "right":
+        band = min(band, int(cond_grid.shape[1]), int(pred_grid.shape[1]))
+        cond_band = cond_grid[:, :band, :]
+        pred_band = torch.flip(pred_grid[:, -band:, :], dims=(1,))
+        target_band = torch.flip(target_grid[:, -band:, :], dims=(1,))
+        valid_band = cond_valid[:, :band] & torch.flip(pred_valid[:, -band:], dims=(1,)) & torch.flip(target_valid_grid[:, -band:], dims=(1,))
+    elif direction == "up":
+        band = min(band, int(cond_grid.shape[0]), int(pred_grid.shape[0]))
+        cond_band = torch.flip(cond_grid[-band:, :, :], dims=(0,))
+        pred_band = pred_grid[:band, :, :]
+        target_band = target_grid[:band, :, :]
+        valid_band = torch.flip(cond_valid[-band:, :], dims=(0,)) & pred_valid[:band, :] & target_valid_grid[:band, :]
+    elif direction == "down":
+        band = min(band, int(cond_grid.shape[0]), int(pred_grid.shape[0]))
+        cond_band = cond_grid[:band, :, :]
+        pred_band = torch.flip(pred_grid[-band:, :, :], dims=(0,))
+        target_band = torch.flip(target_grid[-band:, :, :], dims=(0,))
+        valid_band = cond_valid[:band, :] & torch.flip(pred_valid[-band:, :], dims=(0,)) & torch.flip(target_valid_grid[-band:, :], dims=(0,))
+    else:
+        raise ValueError(f"unsupported direction {direction!r}")
+    return cond_band, pred_band, target_band, valid_band
+
+
+def _seam_edge_error_from_sequence(pred_xyz_sequence: Tensor, batch: dict, *, band_width: int) -> Tensor:
+    if not _geometry_batch_available(batch):
+        return pred_xyz_sequence.new_zeros(())
+    losses = []
+    for example in _iter_geometry_examples(pred_xyz_sequence, batch):
+        cond_band, pred_band, target_band, valid_band = _paired_seam_bands(example, band_width=int(band_width))
+        edge_pred = pred_band - cond_band
+        edge_target = target_band - cond_band
+        per_vertex = (edge_pred - edge_target).abs().mean(dim=-1)
+        if bool(valid_band.any()):
+            losses.append(_masked_mean(per_vertex, valid_band))
+    if not losses:
+        return pred_xyz_sequence.new_zeros(())
+    return torch.stack(losses).mean()
+
+
+def _seam_edge_loss_from_sequence(pred_xyz_sequence: Tensor, batch: dict, *, band_width: int, loss_type: str) -> Tensor:
+    if str(loss_type) != "edge_huber":
+        raise ValueError(f"Unsupported seam_loss={loss_type!r}")
+    if not _geometry_batch_available(batch):
+        return pred_xyz_sequence.new_zeros(())
+    losses = []
+    for example in _iter_geometry_examples(pred_xyz_sequence, batch):
+        cond_band, pred_band, target_band, valid_band = _paired_seam_bands(example, band_width=int(band_width))
+        edge_pred = pred_band - cond_band
+        edge_target = target_band - cond_band
+        per_vertex = F.smooth_l1_loss(edge_pred, edge_target, reduction="none").mean(dim=-1)
+        if bool(valid_band.any()):
+            losses.append(_masked_mean(per_vertex, valid_band))
+    if not losses:
+        return pred_xyz_sequence.new_zeros(())
+    return torch.stack(losses).mean()
+
+
+def _triangle_det_ratio(
+    pred_p0: Tensor,
+    pred_p1: Tensor,
+    pred_p2: Tensor,
+    target_p0: Tensor,
+    target_p1: Tensor,
+    target_p2: Tensor,
+    *,
+    eps: float = 1e-6,
+) -> tuple[Tensor, Tensor]:
+    target_e1 = target_p1 - target_p0
+    target_e2 = target_p2 - target_p0
+    pred_e1 = pred_p1 - pred_p0
+    pred_e2 = pred_p2 - pred_p0
+
+    len1 = torch.linalg.norm(target_e1, dim=-1)
+    u = target_e1 / len1.clamp(min=eps).unsqueeze(-1)
+    proj = (target_e2 * u).sum(dim=-1)
+    v_temp = target_e2 - proj.unsqueeze(-1) * u
+    len2 = torch.linalg.norm(v_temp, dim=-1)
+    v = v_temp / len2.clamp(min=eps).unsqueeze(-1)
+
+    p11 = (pred_e1 * u).sum(dim=-1)
+    p21 = (pred_e1 * v).sum(dim=-1)
+    p12 = (pred_e2 * u).sum(dim=-1)
+    p22 = (pred_e2 * v).sum(dim=-1)
+    det_p = p11 * p22 - p12 * p21
+    det_q = len1 * len2
+    valid = (len1 > eps) & (len2 > eps)
+    return det_p / det_q.clamp(min=eps), valid
+
+
+def _triangle_det_ratio_from_sequence(pred_xyz_sequence: Tensor, batch: dict) -> tuple[list[Tensor], list[Tensor]]:
+    dets: list[Tensor] = []
+    masks: list[Tensor] = []
+    if not _geometry_batch_available(batch):
+        return dets, masks
+    for example in _iter_geometry_examples(pred_xyz_sequence, batch):
+        direction = str(example["direction"])
+        pred_grid = example["pred_grid"]
+        target_grid = example["target_grid"]
+        cond_grid = example["conditioning_grid"]
+        target_valid_grid = example["target_valid_grid"] & torch.isfinite(target_grid).all(dim=-1)
+        cond_valid = torch.isfinite(cond_grid).all(dim=-1)
+        pred_valid = torch.isfinite(pred_grid).all(dim=-1)
+
+        full_pred = _merge_grids_torch(cond_grid, pred_grid, direction=direction)
+        full_target = _merge_grids_torch(cond_grid, target_grid, direction=direction)
+        full_valid = _merge_region_masks_torch(cond_valid, pred_valid & target_valid_grid, direction=direction)
+        pred_region = _merge_region_masks_torch(
+            torch.zeros_like(cond_valid, dtype=torch.bool),
+            torch.ones_like(target_valid_grid, dtype=torch.bool),
+            direction=direction,
+        )
+
+        p00 = full_pred[:-1, :-1, :]
+        p01 = full_pred[:-1, 1:, :]
+        p10 = full_pred[1:, :-1, :]
+        p11 = full_pred[1:, 1:, :]
+        t00 = full_target[:-1, :-1, :]
+        t01 = full_target[:-1, 1:, :]
+        t10 = full_target[1:, :-1, :]
+        t11 = full_target[1:, 1:, :]
+
+        valid_a = full_valid[:-1, :-1] & full_valid[:-1, 1:] & full_valid[1:, :-1]
+        valid_b = full_valid[1:, 1:] & full_valid[1:, :-1] & full_valid[:-1, 1:]
+        region_a = pred_region[:-1, :-1] | pred_region[:-1, 1:] | pred_region[1:, :-1]
+        region_b = pred_region[1:, 1:] | pred_region[1:, :-1] | pred_region[:-1, 1:]
+
+        det_a, nondeg_a = _triangle_det_ratio(p00, p01, p10, t00, t01, t10)
+        det_b, nondeg_b = _triangle_det_ratio(p11, p10, p01, t11, t10, t01)
+        dets.extend([det_a, det_b])
+        masks.extend([valid_a & region_a & nondeg_a, valid_b & region_b & nondeg_b])
+    return dets, masks
+
+
+def _triangle_flip_rate_from_sequence(pred_xyz_sequence: Tensor, batch: dict) -> Tensor:
+    dets, masks = _triangle_det_ratio_from_sequence(pred_xyz_sequence, batch)
+    if not dets:
+        return pred_xyz_sequence.new_zeros(())
+    values = []
+    for det, mask in zip(dets, masks, strict=True):
+        if bool(mask.any()):
+            values.append(_masked_mean((det <= 0.0).to(dtype=det.dtype), mask))
+    if not values:
+        return pred_xyz_sequence.new_zeros(())
+    return torch.stack(values).mean()
+
+
+def _triangle_barrier_loss_from_sequence(pred_xyz_sequence: Tensor, batch: dict, *, margin: float) -> Tensor:
+    dets, masks = _triangle_det_ratio_from_sequence(pred_xyz_sequence, batch)
+    if not dets:
+        return pred_xyz_sequence.new_zeros(())
+    values = []
+    for det, mask in zip(dets, masks, strict=True):
+        if bool(mask.any()):
+            values.append(_masked_mean(F.softplus(float(margin) - det), mask))
+    if not values:
+        return pred_xyz_sequence.new_zeros(())
+    return torch.stack(values).mean()
+
+
 def _quad_gram_entries(grid_xyz: Tensor) -> Tensor:
     u = grid_xyz[:-1, 1:, :] - grid_xyz[:-1, :-1, :]
     v = grid_xyz[1:, :-1, :] - grid_xyz[:-1, :-1, :]
@@ -279,37 +573,19 @@ def _quad_gram_entries(grid_xyz: Tensor) -> Tensor:
     return torch.stack([uu, uv, vv], dim=-1)
 
 
-def _geometry_metric_loss(
-    outputs: dict,
-    batch: dict,
-    *,
-    loss_type: str,
-    include_refine_residual: bool,
-) -> Tensor:
+def _geometry_metric_loss_from_sequence(pred_xyz_sequence: Tensor, batch: dict, *, loss_type: str) -> Tensor:
     if str(loss_type) != "huber":
         raise ValueError(f"Unsupported geometry_metric_loss={loss_type!r}")
+    if not _geometry_batch_available(batch):
+        return pred_xyz_sequence.new_zeros(())
 
-    pred_xyz_soft = _soft_geometry_xyz(outputs, include_refine_residual=include_refine_residual)
-
-    target_xyz = batch["target_xyz"]
-    target_valid_mask = batch["target_valid_mask"]
-    target_lengths = batch["target_lengths"]
     losses = []
-    for batch_idx, direction in enumerate(batch["direction"]):
-        target_len = int(target_lengths[batch_idx].item())
-        if target_len <= 0:
+    for example in _iter_geometry_examples(pred_xyz_sequence, batch):
+        if min(example["grid_shape"]) < 2:
             continue
-        grid_shape = tuple(int(v) for v in batch["target_grid_shape"][batch_idx].tolist())
-        if min(grid_shape) < 2:
-            continue
-
-        pred_grid = _sequence_to_grid_torch(pred_xyz_soft[batch_idx, :target_len], grid_shape=grid_shape, direction=direction)
-        target_grid = _sequence_to_grid_torch(target_xyz[batch_idx, :target_len], grid_shape=grid_shape, direction=direction)
-        valid_grid = _sequence_to_grid_torch(
-            target_valid_mask[batch_idx, :target_len],
-            grid_shape=grid_shape,
-            direction=direction,
-        ).bool()
+        pred_grid = example["pred_grid"]
+        target_grid = example["target_grid"]
+        valid_grid = example["target_valid_grid"] & torch.isfinite(pred_grid).all(dim=-1) & torch.isfinite(target_grid).all(dim=-1)
         quad_mask = valid_grid[:-1, :-1] & valid_grid[:-1, 1:] & valid_grid[1:, :-1] & valid_grid[1:, 1:]
         if not bool(quad_mask.any()):
             continue
@@ -320,8 +596,22 @@ def _geometry_metric_loss(
         losses.append(_masked_mean(per_quad, quad_mask))
 
     if not losses:
-        return pred_xyz_soft.new_zeros(())
+        return pred_xyz_sequence.new_zeros(())
     return torch.stack(losses).mean()
+
+
+def _geometry_metric_loss(
+    outputs: dict,
+    batch: dict,
+    *,
+    loss_type: str,
+    include_refine_residual: bool,
+) -> Tensor:
+    return _geometry_metric_loss_from_sequence(
+        _soft_geometry_xyz(outputs, include_refine_residual=include_refine_residual),
+        batch,
+        loss_type=loss_type,
+    )
 
 
 def _triangle_gram_matrix(p0: Tensor, p1: Tensor, p2: Tensor) -> Tensor:
@@ -353,26 +643,22 @@ def _geometry_sd_loss(
     *,
     include_refine_residual: bool,
 ) -> Tensor:
-    pred_xyz_soft = _soft_geometry_xyz(outputs, include_refine_residual=include_refine_residual)
-    target_xyz = batch["target_xyz"]
-    target_valid_mask = batch["target_valid_mask"]
-    target_lengths = batch["target_lengths"]
-    losses = []
-    for batch_idx, direction in enumerate(batch["direction"]):
-        target_len = int(target_lengths[batch_idx].item())
-        if target_len <= 0:
-            continue
-        grid_shape = tuple(int(v) for v in batch["target_grid_shape"][batch_idx].tolist())
-        if min(grid_shape) < 2:
-            continue
+    return _geometry_sd_loss_from_sequence(
+        _soft_geometry_xyz(outputs, include_refine_residual=include_refine_residual),
+        batch,
+    )
 
-        pred_grid = _sequence_to_grid_torch(pred_xyz_soft[batch_idx, :target_len], grid_shape=grid_shape, direction=direction)
-        target_grid = _sequence_to_grid_torch(target_xyz[batch_idx, :target_len], grid_shape=grid_shape, direction=direction)
-        valid_grid = _sequence_to_grid_torch(
-            target_valid_mask[batch_idx, :target_len],
-            grid_shape=grid_shape,
-            direction=direction,
-        ).bool()
+
+def _geometry_sd_loss_from_sequence(pred_xyz_sequence: Tensor, batch: dict) -> Tensor:
+    if not _geometry_batch_available(batch):
+        return pred_xyz_sequence.new_zeros(())
+    losses = []
+    for example in _iter_geometry_examples(pred_xyz_sequence, batch):
+        if min(example["grid_shape"]) < 2:
+            continue
+        pred_grid = example["pred_grid"]
+        target_grid = example["target_grid"]
+        valid_grid = example["target_valid_grid"] & torch.isfinite(pred_grid).all(dim=-1) & torch.isfinite(target_grid).all(dim=-1)
 
         p00 = pred_grid[:-1, :-1, :]
         p01 = pred_grid[:-1, 1:, :]
@@ -396,7 +682,7 @@ def _geometry_sd_loss(
             losses.append(_masked_mean(_symmetric_dirichlet_from_gram(pred_gram_b, target_gram_b), tri_b_mask))
 
     if not losses:
-        return pred_xyz_soft.new_zeros(())
+        return pred_xyz_sequence.new_zeros(())
     return torch.stack(losses).mean()
 
 
@@ -432,6 +718,13 @@ def compute_autoreg_mesh_losses(
     offset_loss_weight_active: float = 1.0,
     position_refine_weight_active: float = 0.0,
     position_refine_loss_type: str = "huber",
+    xyz_soft_loss_weight_active: float = 0.0,
+    xyz_soft_loss_type: str = "huber",
+    seam_loss_weight_active: float = 0.0,
+    seam_loss_type: str = "edge_huber",
+    seam_band_width: int = 1,
+    triangle_barrier_weight_active: float = 0.0,
+    triangle_barrier_margin: float = 0.05,
     geometry_metric_weight_active: float = 0.0,
     geometry_metric_loss_type: str = "huber",
     geometry_sd_weight_active: float = 0.0,
@@ -463,15 +756,46 @@ def compute_autoreg_mesh_losses(
             distance_aware_radius=distance_aware_coarse_target_radius,
             distance_aware_sigma=distance_aware_coarse_target_sigma,
             distance_aware_loss_type=distance_aware_coarse_target_loss,
-        )
+    )
     offset_loss = _offset_bin_loss(outputs, batch, offset_num_bins=offset_num_bins)
     stop_loss = _stop_loss(outputs, batch)
     total_loss = coarse_loss + float(offset_loss_weight_active) * offset_loss + stop_loss
     coarse_excess_nll = coarse_loss - coarse_target_entropy
+    include_refine_residual = float(position_refine_weight_active) > 0.0
+    soft_xyz_for_loss = _soft_geometry_xyz(outputs, include_refine_residual=include_refine_residual)
+    if str(xyz_soft_loss_type) != "huber":
+        raise ValueError(f"Unsupported xyz_soft_loss={xyz_soft_loss_type!r}")
+    xyz_soft_mask = batch["target_supervision_mask"] & _prediction_finite_mask(soft_xyz_for_loss)
+    per_token_xyz_soft = F.smooth_l1_loss(soft_xyz_for_loss, batch["target_xyz"], reduction="none").mean(dim=-1)
+    xyz_soft_loss = _masked_mean(per_token_xyz_soft, xyz_soft_mask)
     refine_loss = total_loss.new_zeros(())
     if float(position_refine_weight_active) > 0.0:
         refine_loss = _position_refine_loss(outputs, batch, loss_type=position_refine_loss_type)
         total_loss = total_loss + float(position_refine_weight_active) * refine_loss
+
+    if float(xyz_soft_loss_weight_active) > 0.0:
+        total_loss = total_loss + float(xyz_soft_loss_weight_active) * xyz_soft_loss
+
+    seam_loss = total_loss.new_zeros(())
+    seam_edge_error_soft = _seam_edge_error_from_sequence(soft_xyz_for_loss.detach(), batch, band_width=int(seam_band_width))
+    if float(seam_loss_weight_active) > 0.0:
+        seam_loss = _seam_edge_loss_from_sequence(
+            soft_xyz_for_loss,
+            batch,
+            band_width=int(seam_band_width),
+            loss_type=seam_loss_type,
+        )
+        total_loss = total_loss + float(seam_loss_weight_active) * seam_loss
+
+    triangle_barrier_loss = total_loss.new_zeros(())
+    triangle_flip_rate_soft = _triangle_flip_rate_from_sequence(soft_xyz_for_loss.detach(), batch)
+    if float(triangle_barrier_weight_active) > 0.0:
+        triangle_barrier_loss = _triangle_barrier_loss_from_sequence(
+            soft_xyz_for_loss,
+            batch,
+            margin=float(triangle_barrier_margin),
+        )
+        total_loss = total_loss + float(triangle_barrier_weight_active) * triangle_barrier_loss
 
     geometry_metric_loss = total_loss.new_zeros(())
     if float(geometry_metric_weight_active) > 0.0:
@@ -479,7 +803,7 @@ def compute_autoreg_mesh_losses(
             outputs,
             batch,
             loss_type=geometry_metric_loss_type,
-            include_refine_residual=float(position_refine_weight_active) > 0.0,
+            include_refine_residual=include_refine_residual,
         )
         total_loss = total_loss + float(geometry_metric_weight_active) * geometry_metric_loss
 
@@ -488,9 +812,18 @@ def compute_autoreg_mesh_losses(
         geometry_sd_loss = _geometry_sd_loss(
             outputs,
             batch,
-            include_refine_residual=float(position_refine_weight_active) > 0.0,
+            include_refine_residual=include_refine_residual,
         )
         total_loss = total_loss + float(geometry_sd_weight_active) * geometry_sd_loss
+
+    pred_xyz_refined = outputs.get("pred_xyz_refined", outputs["pred_xyz"])
+    coarse_acc_metrics = _coarse_accuracy_metrics(outputs, batch)
+    xyz_l1_soft = _l1_xyz_metric(soft_xyz_for_loss.detach(), batch)
+    xyz_l1_refined = _l1_xyz_metric(pred_xyz_refined.detach(), batch)
+    seam_edge_error_refined = _seam_edge_error_from_sequence(pred_xyz_refined.detach(), batch, band_width=int(seam_band_width))
+    triangle_flip_rate_refined = _triangle_flip_rate_from_sequence(pred_xyz_refined.detach(), batch)
+    geometry_metric_refined = _geometry_metric_loss_from_sequence(pred_xyz_refined.detach(), batch, loss_type=geometry_metric_loss_type)
+    geometry_sd_refined = _geometry_sd_loss_from_sequence(pred_xyz_refined.detach(), batch)
 
     occupancy_metric = total_loss.new_zeros(())
     if float(occupancy_loss_weight) > 0.0:
@@ -506,14 +839,32 @@ def compute_autoreg_mesh_losses(
         "coarse_z_loss": axis_loss_metrics["z"],
         "coarse_y_loss": axis_loss_metrics["y"],
         "coarse_x_loss": axis_loss_metrics["x"],
+        "coarse_exact_acc": coarse_acc_metrics["coarse_exact_acc"],
+        "coarse_axis_acc_z": coarse_acc_metrics["coarse_axis_acc_z"],
+        "coarse_axis_acc_y": coarse_acc_metrics["coarse_axis_acc_y"],
+        "coarse_axis_acc_x": coarse_acc_metrics["coarse_axis_acc_x"],
         "offset_loss": offset_loss,
         "offset_loss_weight_active": total_loss.new_tensor(float(offset_loss_weight_active)),
         "stop_loss": stop_loss,
         "refine_loss": refine_loss,
         "refine_loss_weight_active": total_loss.new_tensor(float(position_refine_weight_active)),
+        "xyz_soft_loss": xyz_soft_loss,
+        "xyz_soft_loss_weight_active": total_loss.new_tensor(float(xyz_soft_loss_weight_active)),
+        "xyz_l1_soft": xyz_l1_soft,
+        "xyz_l1_refined": xyz_l1_refined,
+        "seam_loss": seam_loss,
+        "seam_loss_weight_active": total_loss.new_tensor(float(seam_loss_weight_active)),
+        "seam_edge_error_soft": seam_edge_error_soft,
+        "seam_edge_error_refined": seam_edge_error_refined,
+        "triangle_barrier_loss": triangle_barrier_loss,
+        "triangle_barrier_weight_active": total_loss.new_tensor(float(triangle_barrier_weight_active)),
+        "triangle_flip_rate_soft": triangle_flip_rate_soft,
+        "triangle_flip_rate_refined": triangle_flip_rate_refined,
         "geometry_metric_loss": geometry_metric_loss,
         "geometry_metric_weight_active": total_loss.new_tensor(float(geometry_metric_weight_active)),
+        "geometry_metric_refined": geometry_metric_refined,
         "geometry_sd_loss": geometry_sd_loss,
         "geometry_sd_weight_active": total_loss.new_tensor(float(geometry_sd_weight_active)),
+        "geometry_sd_refined": geometry_sd_refined,
         "occupancy_metric": occupancy_metric,
     }

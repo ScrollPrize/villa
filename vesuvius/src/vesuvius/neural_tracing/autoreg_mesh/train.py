@@ -16,7 +16,13 @@ from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.neural_tracing.autoreg_mesh.config import load_autoreg_mesh_config, validate_autoreg_mesh_config
 from vesuvius.neural_tracing.autoreg_mesh.dataset import AutoregMeshDataset, autoreg_mesh_collate
 from vesuvius.neural_tracing.autoreg_mesh.infer import infer_autoreg_mesh
-from vesuvius.neural_tracing.autoreg_mesh.losses import compute_autoreg_mesh_losses
+from vesuvius.neural_tracing.autoreg_mesh.losses import (
+    _coarse_accuracy_metrics,
+    _l1_xyz_metric,
+    _seam_edge_error_from_sequence,
+    _triangle_flip_rate_from_sequence,
+    compute_autoreg_mesh_losses,
+)
 from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
 from vesuvius.neural_tracing.autoreg_mesh.serialization import deserialize_continuation_grid
 
@@ -235,6 +241,84 @@ def _mean_metric_dict(metric_dicts: list[dict[str, float]], *, prefix: str) -> d
     return {f"{prefix}{key}": value / float(len(metric_dicts)) for key, value in sums.items()}
 
 
+def _make_rollout_metric_batch(raw_sample: dict, inference_result: dict) -> tuple[dict, torch.Tensor, torch.Tensor, dict[str, torch.Tensor] | None]:
+    batch = autoreg_mesh_collate([raw_sample])
+    target_len = int(batch["target_lengths"][0].item())
+    pred_xyz = np.asarray(inference_result["predicted_continuation_vertices_local"], dtype=np.float32)
+    pred_len = int(pred_xyz.shape[0])
+    pred_xyz_padded = torch.full((1, target_len, 3), float("nan"), dtype=torch.float32)
+    overlap = min(target_len, pred_len)
+    if overlap > 0:
+        pred_xyz_padded[0, :overlap] = torch.from_numpy(pred_xyz[:overlap])
+
+    pred_coarse_ids = torch.full((1, target_len), -100, dtype=torch.long)
+    pred_coarse_np = np.asarray(inference_result["predicted_coarse_ids"], dtype=np.int64)
+    if overlap > 0:
+        pred_coarse_ids[0, :overlap] = torch.from_numpy(pred_coarse_np[:overlap])
+
+    pred_axis_ids = None
+    if "predicted_coarse_axis_ids" in inference_result:
+        pred_axis_ids = {}
+        for axis_name in ("z", "y", "x"):
+            axis_padded = torch.full((1, target_len), -100, dtype=torch.long)
+            axis_np = np.asarray(inference_result["predicted_coarse_axis_ids"][axis_name], dtype=np.int64)
+            if overlap > 0:
+                axis_padded[0, :overlap] = torch.from_numpy(axis_np[:overlap])
+            pred_axis_ids[axis_name] = axis_padded
+    return batch, pred_xyz_padded, pred_coarse_ids, pred_axis_ids
+
+
+@torch.no_grad()
+def _evaluate_rollout_validation(
+    *,
+    model: AutoregMeshModel,
+    dataset: Dataset,
+    cfg: dict,
+) -> dict[str, float]:
+    num_examples = min(int(cfg.get("rollout_val_examples_per_log", 1)), len(dataset))
+    if num_examples <= 0:
+        return {}
+
+    seam_band_width = int(cfg.get("seam_band_width", 1))
+    max_steps_cfg = cfg.get("rollout_val_max_steps")
+    metric_dicts: list[dict[str, float]] = []
+    model.eval()
+    for sample_idx in range(num_examples):
+        raw_sample = dataset[sample_idx]
+        inference_result = infer_autoreg_mesh(
+            model,
+            raw_sample,
+            greedy=True,
+            max_steps=None if max_steps_cfg is None else int(max_steps_cfg),
+        )
+        batch, pred_xyz_padded, pred_coarse_ids, pred_axis_ids = _make_rollout_metric_batch(raw_sample, inference_result)
+        coarse_metrics = _coarse_accuracy_metrics(
+            {
+                "pred_coarse_ids": pred_coarse_ids,
+                "pred_coarse_axis_ids": pred_axis_ids if pred_axis_ids is not None else {
+                    "z": torch.zeros_like(pred_coarse_ids),
+                    "y": torch.zeros_like(pred_coarse_ids),
+                    "x": torch.zeros_like(pred_coarse_ids),
+                },
+                "coarse_grid_shape": tuple(int(v) for v in model.coarse_grid_shape),
+            },
+            batch,
+        )
+        target_len = int(batch["target_lengths"][0].item())
+        pred_len = int(np.asarray(inference_result["predicted_continuation_vertices_local"]).shape[0])
+        metric_dicts.append(
+            {
+                "xyz_l1_refined": float(_l1_xyz_metric(pred_xyz_padded, batch).item()),
+                "seam_edge_error": float(_seam_edge_error_from_sequence(pred_xyz_padded, batch, band_width=seam_band_width).item()),
+                "coarse_exact_acc": float(coarse_metrics["coarse_exact_acc"].item()),
+                "triangle_flip_rate": float(_triangle_flip_rate_from_sequence(pred_xyz_padded, batch).item()),
+                "stop_count_error": float(abs(pred_len - target_len)),
+            }
+        )
+    model.train()
+    return _mean_metric_dict(metric_dicts, prefix="rollout_val_")
+
+
 def _scheduled_sampling_prob(cfg: dict, *, global_step: int) -> float:
     if not bool(cfg.get("scheduled_sampling_enabled", False)):
         return 0.0
@@ -257,6 +341,30 @@ def _position_refine_weight_active(cfg: dict, *, global_step: int) -> float:
     return float(cfg.get("position_refine_weight", 0.0))
 
 
+def _xyz_soft_loss_weight_active(cfg: dict, *, global_step: int) -> float:
+    if not bool(cfg.get("xyz_soft_loss_enabled", True)):
+        return 0.0
+    if int(global_step) < int(cfg.get("xyz_soft_loss_start_step", 0)):
+        return 0.0
+    return float(cfg.get("xyz_soft_loss_weight", 0.0))
+
+
+def _seam_loss_weight_active(cfg: dict, *, global_step: int) -> float:
+    if not bool(cfg.get("seam_loss_enabled", True)):
+        return 0.0
+    if int(global_step) < int(cfg.get("seam_loss_start_step", 0)):
+        return 0.0
+    return float(cfg.get("seam_loss_weight", 0.0))
+
+
+def _triangle_barrier_weight_active(cfg: dict, *, global_step: int) -> float:
+    if not bool(cfg.get("triangle_barrier_enabled", True)):
+        return 0.0
+    if int(global_step) < int(cfg.get("triangle_barrier_start_step", 0)):
+        return 0.0
+    return float(cfg.get("triangle_barrier_weight", 0.0))
+
+
 def _geometry_metric_weight_active(cfg: dict, *, global_step: int) -> float:
     if not bool(cfg.get("geometry_metric_enabled", True)):
         return 0.0
@@ -277,6 +385,12 @@ def _offset_loss_weight_active(cfg: dict, *, global_step: int) -> float:
     if int(global_step) < int(cfg.get("offset_loss_start_step", 0)):
         return 0.0
     return 1.0
+
+
+def _scheduled_sampling_feedback_state(cfg: dict, *, global_step: int) -> tuple[bool, bool]:
+    offset_feedback_enabled = _offset_loss_weight_active(cfg, global_step=global_step) > 0.0
+    refine_feedback_enabled = _position_refine_weight_active(cfg, global_step=global_step) > 0.0
+    return bool(offset_feedback_enabled), bool(offset_feedback_enabled and refine_feedback_enabled)
 
 
 def _as_numpy_grid(grid) -> np.ndarray:
@@ -493,6 +607,13 @@ def _evaluate_validation(
             offset_loss_weight_active=_offset_loss_weight_active(cfg, global_step=global_step),
             position_refine_weight_active=_position_refine_weight_active(cfg, global_step=global_step),
             position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
+            xyz_soft_loss_weight_active=_xyz_soft_loss_weight_active(cfg, global_step=global_step),
+            xyz_soft_loss_type=str(cfg.get("xyz_soft_loss", "huber")),
+            seam_loss_weight_active=_seam_loss_weight_active(cfg, global_step=global_step),
+            seam_loss_type=str(cfg.get("seam_loss", "edge_huber")),
+            seam_band_width=int(cfg.get("seam_band_width", 1)),
+            triangle_barrier_weight_active=_triangle_barrier_weight_active(cfg, global_step=global_step),
+            triangle_barrier_margin=float(cfg.get("triangle_barrier_margin", 0.05)),
             geometry_metric_weight_active=_geometry_metric_weight_active(cfg, global_step=global_step),
             geometry_metric_loss_type=str(cfg.get("geometry_metric_loss", "huber")),
             geometry_sd_weight_active=_geometry_sd_weight_active(cfg, global_step=global_step),
@@ -634,9 +755,19 @@ def run_autoreg_mesh_training(
             scheduled_sampling_prob = _scheduled_sampling_prob(cfg, global_step=global_step)
             offset_loss_weight_active = _offset_loss_weight_active(cfg, global_step=global_step)
             position_refine_weight_active = _position_refine_weight_active(cfg, global_step=global_step)
+            xyz_soft_loss_weight_active = _xyz_soft_loss_weight_active(cfg, global_step=global_step)
+            seam_loss_weight_active = _seam_loss_weight_active(cfg, global_step=global_step)
+            triangle_barrier_weight_active = _triangle_barrier_weight_active(cfg, global_step=global_step)
             geometry_metric_weight_active = _geometry_metric_weight_active(cfg, global_step=global_step)
             geometry_sd_weight_active = _geometry_sd_weight_active(cfg, global_step=global_step)
-            outputs = model(batch, scheduled_sampling_prob=scheduled_sampling_prob)
+            offset_feedback_enabled, refine_feedback_enabled = _scheduled_sampling_feedback_state(cfg, global_step=global_step)
+            outputs = model(
+                batch,
+                scheduled_sampling_prob=scheduled_sampling_prob,
+                scheduled_sampling_pattern=str(cfg.get("scheduled_sampling_pattern", "stripwise_full_strip_greedy")),
+                scheduled_sampling_offset_feedback_enabled=offset_feedback_enabled,
+                scheduled_sampling_refine_feedback_enabled=refine_feedback_enabled,
+            )
             loss_dict = compute_autoreg_mesh_losses(
                 outputs,
                 batch,
@@ -645,6 +776,13 @@ def run_autoreg_mesh_training(
                 offset_loss_weight_active=offset_loss_weight_active,
                 position_refine_weight_active=position_refine_weight_active,
                 position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
+                xyz_soft_loss_weight_active=xyz_soft_loss_weight_active,
+                xyz_soft_loss_type=str(cfg.get("xyz_soft_loss", "huber")),
+                seam_loss_weight_active=seam_loss_weight_active,
+                seam_loss_type=str(cfg.get("seam_loss", "edge_huber")),
+                seam_band_width=int(cfg.get("seam_band_width", 1)),
+                triangle_barrier_weight_active=triangle_barrier_weight_active,
+                triangle_barrier_margin=float(cfg.get("triangle_barrier_margin", 0.05)),
                 geometry_metric_weight_active=geometry_metric_weight_active,
                 geometry_metric_loss_type=str(cfg.get("geometry_metric_loss", "huber")),
                 geometry_sd_weight_active=geometry_sd_weight_active,
@@ -675,6 +813,9 @@ def run_autoreg_mesh_training(
             metrics["scheduled_sampling_prob"] = float(scheduled_sampling_prob)
             metrics["offset_loss_weight_active"] = float(offset_loss_weight_active)
             metrics["position_refine_weight_active"] = float(position_refine_weight_active)
+            metrics["xyz_soft_loss_weight_active"] = float(xyz_soft_loss_weight_active)
+            metrics["seam_loss_weight_active"] = float(seam_loss_weight_active)
+            metrics["triangle_barrier_weight_active"] = float(triangle_barrier_weight_active)
             metrics["geometry_metric_weight_active"] = float(geometry_metric_weight_active)
             metrics["geometry_sd_weight_active"] = float(geometry_sd_weight_active)
             metrics["step"] = float(global_step)
@@ -695,6 +836,13 @@ def run_autoreg_mesh_training(
                     global_step=global_step,
                 )
                 metrics.update(val_metrics)
+                metrics.update(
+                    _evaluate_rollout_validation(
+                        model=model,
+                        dataset=val_dataset,
+                        cfg=cfg,
+                    )
+                )
 
             wandb_payload = dict(metrics)
             should_log_images = (

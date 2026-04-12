@@ -322,6 +322,8 @@ class AutoregMeshModel(nn.Module):
         self.offset_head = nn.Linear(self.decoder_dim, 3 * max(self.offset_num_bins), bias=True)
         self.stop_head = nn.Linear(self.decoder_dim, 1, bias=True)
         self.position_refine_head = nn.Linear(self.decoder_dim, 3, bias=True)
+        nn.init.zeros_(self.position_refine_head.weight)
+        nn.init.zeros_(self.position_refine_head.bias)
 
     def _normalize_xyz(self, xyz: Tensor) -> Tensor:
         shape = torch.tensor(self.input_shape, device=xyz.device, dtype=xyz.dtype)
@@ -569,10 +571,19 @@ class AutoregMeshModel(nn.Module):
         *,
         teacher_outputs: dict[str, Tensor],
         scheduled_sampling_prob: float,
+        scheduled_sampling_pattern: str,
+        offset_feedback_enabled: bool,
+        refine_feedback_enabled: bool,
     ) -> dict[str, Tensor]:
         generation_inputs = self._build_teacher_forced_generation_inputs(batch)
         if float(scheduled_sampling_prob) <= 0.0:
             return generation_inputs
+
+        if str(scheduled_sampling_pattern) != "stripwise_full_strip_greedy":
+            raise ValueError(
+                "scheduled_sampling_pattern must currently be 'stripwise_full_strip_greedy', "
+                f"got {scheduled_sampling_pattern!r}"
+            )
 
         target_mask = generation_inputs["sequence_mask"]
         batch_size, target_len = target_mask.shape
@@ -580,8 +591,15 @@ class AutoregMeshModel(nn.Module):
             return generation_inputs
 
         replace_mask = torch.zeros_like(target_mask, dtype=torch.bool)
-        sampled = torch.rand((batch_size, target_len - 1), device=target_mask.device) < float(scheduled_sampling_prob)
-        replace_mask[:, 1:] = sampled & target_mask[:, 1:]
+        shifted_strip_ids = torch.zeros_like(target_mask, dtype=torch.long)
+        shifted_strip_ids[:, 1:] = batch["target_strip_positions"][:, :-1, 0]
+        for batch_idx in range(batch_size):
+            num_strips = int(batch["num_strips"][batch_idx].item())
+            if num_strips <= 0:
+                continue
+            sampled_strips = torch.rand((num_strips,), device=target_mask.device) < float(scheduled_sampling_prob)
+            replace_mask[batch_idx, 1:] = sampled_strips[shifted_strip_ids[batch_idx, 1:].clamp(min=0, max=max(num_strips - 1, 0))]
+        replace_mask &= target_mask
         if not bool(replace_mask.any()):
             return generation_inputs
 
@@ -590,26 +608,32 @@ class AutoregMeshModel(nn.Module):
         shifted_pred_xyz = torch.zeros_like(generation_inputs["xyz"])
         shifted_pred_valid = torch.zeros_like(generation_inputs["geometry_valid_mask"], dtype=torch.bool)
         shifted_pred_coarse[:, 1:] = teacher_outputs["pred_coarse_ids"][:, :-1]
-        shifted_pred_offset[:, 1:, :] = teacher_outputs["pred_offset_bins"][:, :-1, :]
-        shifted_pred_xyz[:, 1:, :] = teacher_outputs["pred_xyz_refined"][:, :-1, :]
+        if bool(offset_feedback_enabled):
+            shifted_pred_offset[:, 1:, :] = teacher_outputs["pred_offset_bins"][:, :-1, :]
+            shifted_pred_xyz[:, 1:, :] = (
+                teacher_outputs["pred_xyz_refined"][:, :-1, :]
+                if bool(refine_feedback_enabled)
+                else teacher_outputs["pred_xyz"][:, :-1, :]
+            )
         shifted_pred_valid[:, 1:] = True
 
         generation_inputs["coarse_ids"] = torch.where(replace_mask, shifted_pred_coarse, generation_inputs["coarse_ids"])
-        generation_inputs["offset_bins"] = torch.where(
-            replace_mask.unsqueeze(-1),
-            shifted_pred_offset,
-            generation_inputs["offset_bins"],
-        )
-        generation_inputs["xyz"] = torch.where(
-            replace_mask.unsqueeze(-1),
-            shifted_pred_xyz,
-            generation_inputs["xyz"],
-        )
-        generation_inputs["geometry_valid_mask"] = torch.where(
-            replace_mask,
-            shifted_pred_valid,
-            generation_inputs["geometry_valid_mask"],
-        )
+        if bool(offset_feedback_enabled):
+            generation_inputs["offset_bins"] = torch.where(
+                replace_mask.unsqueeze(-1),
+                shifted_pred_offset,
+                generation_inputs["offset_bins"],
+            )
+            generation_inputs["xyz"] = torch.where(
+                replace_mask.unsqueeze(-1),
+                shifted_pred_xyz,
+                generation_inputs["xyz"],
+            )
+            generation_inputs["geometry_valid_mask"] = torch.where(
+                replace_mask,
+                shifted_pred_valid,
+                generation_inputs["geometry_valid_mask"],
+            )
         return generation_inputs
 
     def _build_attention_mask(self, seq_mask: Tensor, *, dtype: torch.dtype) -> Tensor:
@@ -709,7 +733,15 @@ class AutoregMeshModel(nn.Module):
             "coarse_prediction_mode": self.coarse_prediction_mode,
         }
 
-    def forward(self, batch: dict, *, scheduled_sampling_prob: float = 0.0) -> dict[str, Tensor]:
+    def forward(
+        self,
+        batch: dict,
+        *,
+        scheduled_sampling_prob: float = 0.0,
+        scheduled_sampling_pattern: str = "stripwise_full_strip_greedy",
+        scheduled_sampling_offset_feedback_enabled: bool = True,
+        scheduled_sampling_refine_feedback_enabled: bool = True,
+    ) -> dict[str, Tensor]:
         encoded = self.encode_conditioning(batch.get("volume"), batch.get("vol_tokens"))
         generation_inputs = None
         if self.training and float(scheduled_sampling_prob) > 0.0:
@@ -723,6 +755,9 @@ class AutoregMeshModel(nn.Module):
                 batch,
                 teacher_outputs=teacher_outputs,
                 scheduled_sampling_prob=float(scheduled_sampling_prob),
+                scheduled_sampling_pattern=str(scheduled_sampling_pattern),
+                offset_feedback_enabled=bool(scheduled_sampling_offset_feedback_enabled),
+                refine_feedback_enabled=bool(scheduled_sampling_refine_feedback_enabled),
             )
         outputs = self.forward_from_encoded(
             batch,

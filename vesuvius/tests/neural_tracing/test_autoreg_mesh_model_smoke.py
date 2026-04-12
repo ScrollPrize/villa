@@ -19,7 +19,9 @@ from vesuvius.neural_tracing.autoreg_mesh.losses import (
     _build_distance_aware_coarse_targets,
     _geometry_metric_loss,
     _geometry_sd_loss,
+    _seam_edge_loss_from_sequence,
     _sequence_to_grid_torch,
+    _triangle_barrier_loss_from_sequence,
     compute_autoreg_mesh_losses,
 )
 from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
@@ -28,6 +30,7 @@ from vesuvius.neural_tracing.autoreg_mesh.train import (
     _geometry_metric_weight_active,
     _geometry_sd_weight_active,
     _restrict_dataset_samples,
+    _scheduled_sampling_feedback_state,
     run_autoreg_mesh_training,
 )
 from vesuvius.neural_tracing.datasets.triplet_resampling import choose_replacement_index
@@ -350,6 +353,112 @@ def test_axis_factorized_autoreg_mesh_model_forward_and_losses_are_finite() -> N
         assert torch.isfinite(value)
 
 
+def test_position_refine_head_is_zero_initialized() -> None:
+    model = AutoregMeshModel(_make_cached_token_config())
+    assert torch.count_nonzero(model.position_refine_head.weight).item() == 0
+    assert torch.count_nonzero(model.position_refine_head.bias).item() == 0
+
+
+def test_scheduled_sampling_uses_stripwise_replacement() -> None:
+    model = AutoregMeshModel(_make_cached_token_config())
+    batch = autoreg_mesh_collate([_make_sample_with_cached_tokens("left")])
+    teacher_outputs = {
+        "pred_coarse_ids": batch["target_coarse_ids"] + 1000,
+        "pred_offset_bins": batch["target_offset_bins"] + 10,
+        "pred_xyz": batch["target_xyz"] + 10.0,
+        "pred_xyz_refined": batch["target_xyz"] + 20.0,
+    }
+
+    torch.manual_seed(0)
+    generation_inputs = model._build_scheduled_generation_inputs(
+        batch,
+        teacher_outputs=teacher_outputs,
+        scheduled_sampling_prob=0.5,
+        scheduled_sampling_pattern="stripwise_full_strip_greedy",
+        offset_feedback_enabled=True,
+        refine_feedback_enabled=True,
+    )
+
+    replaced = generation_inputs["coarse_ids"] != model._build_teacher_forced_generation_inputs(batch)["coarse_ids"]
+    shifted_strip_ids = torch.zeros_like(batch["target_mask"], dtype=torch.long)
+    shifted_strip_ids[:, 1:] = batch["target_strip_positions"][:, :-1, 0]
+    for strip_id in range(int(batch["num_strips"][0].item())):
+        strip_mask = shifted_strip_ids[0] == strip_id
+        strip_mask[0] = False
+        if bool(strip_mask.any()):
+            values = replaced[0, strip_mask]
+            assert bool(torch.all(values == values[0]))
+
+
+def test_scheduled_sampling_keeps_offsets_and_xyz_teacher_forced_before_offset_loss() -> None:
+    model = AutoregMeshModel(_make_cached_token_config())
+    batch = autoreg_mesh_collate([_make_sample_with_cached_tokens("left")])
+    teacher_inputs = model._build_teacher_forced_generation_inputs(batch)
+    teacher_outputs = {
+        "pred_coarse_ids": batch["target_coarse_ids"] + 1000,
+        "pred_offset_bins": batch["target_offset_bins"] + 10,
+        "pred_xyz": batch["target_xyz"] + 10.0,
+        "pred_xyz_refined": batch["target_xyz"] + 20.0,
+    }
+
+    generation_inputs = model._build_scheduled_generation_inputs(
+        batch,
+        teacher_outputs=teacher_outputs,
+        scheduled_sampling_prob=1.0,
+        scheduled_sampling_pattern="stripwise_full_strip_greedy",
+        offset_feedback_enabled=False,
+        refine_feedback_enabled=False,
+    )
+
+    assert torch.equal(generation_inputs["offset_bins"], teacher_inputs["offset_bins"])
+    assert torch.allclose(generation_inputs["xyz"], teacher_inputs["xyz"])
+    assert not torch.equal(generation_inputs["coarse_ids"], teacher_inputs["coarse_ids"])
+
+
+def test_scheduled_sampling_uses_bin_center_xyz_before_refine_is_active() -> None:
+    model = AutoregMeshModel(_make_cached_token_config())
+    batch = autoreg_mesh_collate([_make_sample_with_cached_tokens("left")])
+    teacher_outputs = {
+        "pred_coarse_ids": batch["target_coarse_ids"] + 1000,
+        "pred_offset_bins": batch["target_offset_bins"] + 10,
+        "pred_xyz": batch["target_xyz"] + 10.0,
+        "pred_xyz_refined": batch["target_xyz"] + 20.0,
+    }
+
+    generation_inputs = model._build_scheduled_generation_inputs(
+        batch,
+        teacher_outputs=teacher_outputs,
+        scheduled_sampling_prob=1.0,
+        scheduled_sampling_pattern="stripwise_full_strip_greedy",
+        offset_feedback_enabled=True,
+        refine_feedback_enabled=False,
+    )
+
+    assert torch.allclose(generation_inputs["xyz"][:, 1:], teacher_outputs["pred_xyz"][:, :-1])
+
+
+def test_scheduled_sampling_uses_refined_xyz_after_refine_is_active() -> None:
+    model = AutoregMeshModel(_make_cached_token_config())
+    batch = autoreg_mesh_collate([_make_sample_with_cached_tokens("left")])
+    teacher_outputs = {
+        "pred_coarse_ids": batch["target_coarse_ids"] + 1000,
+        "pred_offset_bins": batch["target_offset_bins"] + 10,
+        "pred_xyz": batch["target_xyz"] + 10.0,
+        "pred_xyz_refined": batch["target_xyz"] + 20.0,
+    }
+
+    generation_inputs = model._build_scheduled_generation_inputs(
+        batch,
+        teacher_outputs=teacher_outputs,
+        scheduled_sampling_prob=1.0,
+        scheduled_sampling_pattern="stripwise_full_strip_greedy",
+        offset_feedback_enabled=True,
+        refine_feedback_enabled=True,
+    )
+
+    assert torch.allclose(generation_inputs["xyz"][:, 1:], teacher_outputs["pred_xyz_refined"][:, :-1])
+
+
 def test_autoreg_mesh_smoke_training_runs_two_steps(tmp_path: Path) -> None:
     config = _make_cached_token_config()
     config["out_dir"] = str(tmp_path / "runs")
@@ -437,6 +546,9 @@ def test_autoreg_mesh_validation_metrics_are_logged_in_history(tmp_path: Path) -
     assert "val_coarse_excess_nll" in result["history"][0]
     assert "val_offset_loss" in result["history"][0]
     assert "val_stop_loss" in result["history"][0]
+    assert "rollout_val_xyz_l1_refined" in result["history"][0]
+    assert "rollout_val_seam_edge_error" in result["history"][0]
+    assert "rollout_val_triangle_flip_rate" in result["history"][0]
 
 
 def test_restrict_dataset_samples_prevents_cross_split_resampling() -> None:
@@ -716,6 +828,77 @@ def test_geometry_sd_loss_is_near_zero_on_isometric_copy_and_higher_on_stretch()
     assert stretched_loss.item() > translated_loss.item()
 
 
+def test_xyz_soft_loss_is_near_zero_on_ground_truth_and_excludes_residual_before_refine() -> None:
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    outputs = {
+        "coarse_logits": torch.zeros((1, batch["target_xyz"].shape[1], 8), dtype=torch.float32),
+        "offset_logits": torch.zeros((1, batch["target_xyz"].shape[1], 3, 4), dtype=torch.float32),
+        "stop_logits": torch.zeros((1, batch["target_xyz"].shape[1]), dtype=torch.float32),
+        "pred_refine_residual": torch.full_like(batch["target_xyz"], 3.0),
+        "pred_xyz": batch["target_xyz"].clone(),
+        "pred_xyz_soft": batch["target_xyz"].clone() + 3.0,
+        "pred_xyz_refined": batch["target_xyz"].clone() + 3.0,
+        "pred_coarse_ids": batch["target_coarse_ids"].clone(),
+        "pred_coarse_axis_ids": {
+            "z": torch.zeros_like(batch["target_coarse_ids"]),
+            "y": torch.zeros_like(batch["target_coarse_ids"]),
+            "x": torch.zeros_like(batch["target_coarse_ids"]),
+        },
+        "coarse_grid_shape": (2, 2, 2),
+    }
+
+    off_losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        xyz_soft_loss_weight_active=1.0,
+        position_refine_weight_active=0.0,
+    )
+    on_losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        xyz_soft_loss_weight_active=1.0,
+        position_refine_weight_active=0.05,
+    )
+
+    assert off_losses["xyz_soft_loss"].item() == pytest.approx(0.0, abs=1e-6)
+    assert on_losses["xyz_soft_loss"].item() > off_losses["xyz_soft_loss"].item()
+
+
+def test_seam_edge_loss_is_near_zero_on_ground_truth_and_increases_when_displaced() -> None:
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    gt_loss = _seam_edge_loss_from_sequence(batch["target_xyz"], batch, band_width=1, loss_type="edge_huber")
+    displaced = batch["target_xyz"].clone()
+    displaced[0, :3, :] = displaced[0, :3, :] + torch.tensor([0.0, 0.0, 4.0])
+    displaced_loss = _seam_edge_loss_from_sequence(displaced, batch, band_width=1, loss_type="edge_huber")
+
+    assert gt_loss.item() == pytest.approx(0.0, abs=1e-6)
+    assert displaced_loss.item() > gt_loss.item()
+
+
+def test_triangle_barrier_increases_for_flipped_continuation() -> None:
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    gt_barrier = _triangle_barrier_loss_from_sequence(batch["target_xyz"], batch, margin=0.05)
+    flipped = batch["target_xyz"].clone()
+    target_grid = _sequence_to_grid_torch(flipped[0], grid_shape=tuple(int(v) for v in batch["target_grid_shape"][0].tolist()), direction="left")
+    cond_grid = batch["conditioning_grid_local"][0]
+    target_grid[:, 0, :] = cond_grid[:, -1, :] - 0.2 * (target_grid[:, 0, :] - cond_grid[:, -1, :])
+    flipped[0] = torch.from_numpy(serialize_split_conditioning_example(
+        cond_zyxs_local=cond_grid.numpy(),
+        masked_zyxs_local=target_grid.numpy(),
+        direction="left",
+        volume_shape=(16, 16, 16),
+        patch_size=(8, 8, 8),
+        offset_num_bins=(4, 4, 4),
+        frontier_band_width=4,
+    )["target_xyz"]).to(torch.float32)
+    flipped_barrier = _triangle_barrier_loss_from_sequence(flipped, batch, margin=0.05)
+
+    assert gt_barrier.item() >= 0.0
+    assert flipped_barrier.item() > gt_barrier.item()
+
+
 def test_invalid_target_positions_are_masked_from_loss(tmp_path: Path) -> None:
     checkpoint = tmp_path / "tiny_dinovol.pt"
     _write_local_guide_checkpoint(checkpoint)
@@ -755,6 +938,17 @@ def test_scheduled_sampling_probability_progression() -> None:
     assert _scheduled_sampling_prob(config, global_step=10) == pytest.approx(0.0)
     assert _scheduled_sampling_prob(config, global_step=20) == pytest.approx(0.05)
     assert _scheduled_sampling_prob(config, global_step=40) == pytest.approx(0.10)
+
+
+def test_scheduled_sampling_feedback_state_tracks_offset_and_refine_steps() -> None:
+    config = _make_cached_token_config()
+    config["offset_loss_start_step"] = 2
+    config["position_refine_weight"] = 0.05
+    config["position_refine_start_step"] = 5
+
+    assert _scheduled_sampling_feedback_state(config, global_step=0) == (False, False)
+    assert _scheduled_sampling_feedback_state(config, global_step=2) == (True, False)
+    assert _scheduled_sampling_feedback_state(config, global_step=5) == (True, True)
 
 
 def test_scheduled_sampling_enabled_smoke_train_runs(tmp_path: Path) -> None:
@@ -885,6 +1079,16 @@ def test_distance_aware_target_default_config_values() -> None:
     validated = validate_autoreg_mesh_config(config)
     assert validated["pointer_temperature"] == pytest.approx(0.25)
     assert validated["coarse_prediction_mode"] == "joint_pointer"
+    assert validated["scheduled_sampling_pattern"] == "stripwise_full_strip_greedy"
+    assert validated["xyz_soft_loss_enabled"] is True
+    assert validated["xyz_soft_loss_weight"] == pytest.approx(1.0)
+    assert validated["seam_loss_enabled"] is True
+    assert validated["seam_loss_weight"] == pytest.approx(0.25)
+    assert validated["triangle_barrier_enabled"] is True
+    assert validated["triangle_barrier_weight"] == pytest.approx(0.1)
+    assert validated["triangle_barrier_margin"] == pytest.approx(0.05)
+    assert validated["rollout_val_examples_per_log"] == 1
+    assert validated["rollout_val_max_steps"] is None
     assert validated["geometry_metric_enabled"] is True
     assert validated["geometry_metric_weight"] == pytest.approx(0.01)
     assert validated["geometry_metric_start_step"] == 2000
@@ -1052,6 +1256,11 @@ def test_rope_config_validation_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="coarse_prediction_mode"):
         validate_autoreg_mesh_config(bad_coarse_mode)
 
+    bad_sched_pattern = _make_cached_token_config()
+    bad_sched_pattern["scheduled_sampling_pattern"] = "iid"
+    with pytest.raises(ValueError, match="scheduled_sampling_pattern"):
+        validate_autoreg_mesh_config(bad_sched_pattern)
+
 
 def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     config = _make_cached_token_config()
@@ -1156,9 +1365,18 @@ def test_autoreg_mesh_wandb_logging_includes_metrics_and_images(tmp_path: Path, 
     assert "loss" in logged
     assert "coarse_loss" in logged
     assert "coarse_excess_nll" in logged
+    assert "xyz_soft_loss" in logged
+    assert "seam_loss" in logged
+    assert "triangle_barrier_loss" in logged
+    assert "xyz_l1_refined" in logged
+    assert "seam_edge_error_refined" in logged
+    assert "triangle_flip_rate_refined" in logged
     assert "current_lr" in logged
     assert "grad_norm" in logged
     assert "val_loss" in logged
+    assert "rollout_val_xyz_l1_refined" in logged
+    assert "rollout_val_seam_edge_error" in logged
+    assert "rollout_val_triangle_flip_rate" in logged
     assert "train_example" in logged
     assert "val_example" in logged
     assert isinstance(logged["train_example"], _FakeWandbImage)
