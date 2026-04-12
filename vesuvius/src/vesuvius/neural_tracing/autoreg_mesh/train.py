@@ -236,6 +236,14 @@ def _position_refine_weight_active(cfg: dict, *, global_step: int) -> float:
     return float(cfg.get("position_refine_weight", 0.0))
 
 
+def _geometry_metric_weight_active(cfg: dict, *, global_step: int) -> float:
+    if not bool(cfg.get("geometry_metric_enabled", True)):
+        return 0.0
+    if int(global_step) < int(cfg.get("geometry_metric_start_step", 2000)):
+        return 0.0
+    return float(cfg.get("geometry_metric_weight", 0.0))
+
+
 def _offset_loss_weight_active(cfg: dict, *, global_step: int) -> float:
     if int(global_step) < int(cfg.get("offset_loss_start_step", 0)):
         return 0.0
@@ -456,6 +464,8 @@ def _evaluate_validation(
             offset_loss_weight_active=_offset_loss_weight_active(cfg, global_step=global_step),
             position_refine_weight_active=_position_refine_weight_active(cfg, global_step=global_step),
             position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
+            geometry_metric_weight_active=_geometry_metric_weight_active(cfg, global_step=global_step),
+            geometry_metric_loss_type=str(cfg.get("geometry_metric_loss", "huber")),
             distance_aware_coarse_targets_enabled=bool(cfg.get("distance_aware_coarse_targets_enabled", True)),
             distance_aware_coarse_target_radius=int(cfg.get("distance_aware_coarse_target_radius", 1)),
             distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
@@ -593,6 +603,7 @@ def run_autoreg_mesh_training(
             scheduled_sampling_prob = _scheduled_sampling_prob(cfg, global_step=global_step)
             offset_loss_weight_active = _offset_loss_weight_active(cfg, global_step=global_step)
             position_refine_weight_active = _position_refine_weight_active(cfg, global_step=global_step)
+            geometry_metric_weight_active = _geometry_metric_weight_active(cfg, global_step=global_step)
             outputs = model(batch, scheduled_sampling_prob=scheduled_sampling_prob)
             loss_dict = compute_autoreg_mesh_losses(
                 outputs,
@@ -602,6 +613,8 @@ def run_autoreg_mesh_training(
                 offset_loss_weight_active=offset_loss_weight_active,
                 position_refine_weight_active=position_refine_weight_active,
                 position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
+                geometry_metric_weight_active=geometry_metric_weight_active,
+                geometry_metric_loss_type=str(cfg.get("geometry_metric_loss", "huber")),
                 distance_aware_coarse_targets_enabled=bool(cfg.get("distance_aware_coarse_targets_enabled", True)),
                 distance_aware_coarse_target_radius=int(cfg.get("distance_aware_coarse_target_radius", 1)),
                 distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
@@ -629,6 +642,7 @@ def run_autoreg_mesh_training(
             metrics["scheduled_sampling_prob"] = float(scheduled_sampling_prob)
             metrics["offset_loss_weight_active"] = float(offset_loss_weight_active)
             metrics["position_refine_weight_active"] = float(position_refine_weight_active)
+            metrics["geometry_metric_weight_active"] = float(geometry_metric_weight_active)
             metrics["step"] = float(global_step)
             if skipped_step > 0.0:
                 metrics["skipped_step_nonfinite_grad"] = skipped_step

@@ -40,7 +40,7 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "cross_attention_every_n_blocks": 1,
     "decoder_mlp_ratio": 4.0,
     "decoder_dropout": 0.0,
-    "pointer_temperature": 1.0,
+    "pointer_temperature": 0.25,
     "rope_base": 100.0,
     "rope_min_period": None,
     "rope_max_period": None,
@@ -59,6 +59,10 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "position_refine_loss": "huber",
     "position_refine_weight": 0.05,
     "position_refine_start_step": 5000,
+    "geometry_metric_enabled": True,
+    "geometry_metric_weight": 0.01,
+    "geometry_metric_start_step": 2000,
+    "geometry_metric_loss": "huber",
     "distance_aware_coarse_targets_enabled": True,
     "distance_aware_coarse_target_radius": 1,
     "distance_aware_coarse_target_sigma": 1.0,
@@ -192,6 +196,12 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("position_refine_weight must be non-negative")
     if int(cfg["position_refine_start_step"]) < 0:
         raise ValueError("position_refine_start_step must be >= 0")
+    if str(cfg["geometry_metric_loss"]) != "huber":
+        raise ValueError("geometry_metric_loss must currently be 'huber'")
+    if float(cfg["geometry_metric_weight"]) < 0.0:
+        raise ValueError("geometry_metric_weight must be non-negative")
+    if int(cfg["geometry_metric_start_step"]) < 0:
+        raise ValueError("geometry_metric_start_step must be >= 0")
     if int(cfg["distance_aware_coarse_target_radius"]) < 0:
         raise ValueError("distance_aware_coarse_target_radius must be >= 0")
     if float(cfg["distance_aware_coarse_target_sigma"]) <= 0.0:

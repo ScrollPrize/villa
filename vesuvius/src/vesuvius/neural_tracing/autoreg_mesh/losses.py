@@ -144,6 +144,87 @@ def _position_refine_loss(outputs: dict, batch: dict, *, loss_type: str) -> Tens
     return _masked_mean(per_token, batch["target_supervision_mask"])
 
 
+def _sequence_to_grid_torch(sequence: Tensor, *, grid_shape: tuple[int, int], direction: str) -> Tensor:
+    h, w = int(grid_shape[0]), int(grid_shape[1])
+    expected = int(h * w)
+    if int(sequence.shape[0]) != expected:
+        raise ValueError(f"sequence length {sequence.shape[0]} does not match grid_shape {grid_shape!r}")
+
+    flat_to_seq = torch.empty((expected,), device=sequence.device, dtype=torch.long)
+    cursor = 0
+    if direction in {"left", "right"}:
+        strip_order = range(w) if direction == "left" else range(w - 1, -1, -1)
+        for col_idx in strip_order:
+            for row_idx in range(h):
+                flat_to_seq[row_idx * w + col_idx] = cursor
+                cursor += 1
+    elif direction in {"up", "down"}:
+        strip_order = range(h) if direction == "up" else range(h - 1, -1, -1)
+        for row_idx in strip_order:
+            for col_idx in range(w):
+                flat_to_seq[row_idx * w + col_idx] = cursor
+                cursor += 1
+    else:
+        raise ValueError(f"unsupported direction {direction!r}")
+    return sequence.index_select(0, flat_to_seq).reshape(h, w, *sequence.shape[1:])
+
+
+def _quad_gram_entries(grid_xyz: Tensor) -> Tensor:
+    u = grid_xyz[:-1, 1:, :] - grid_xyz[:-1, :-1, :]
+    v = grid_xyz[1:, :-1, :] - grid_xyz[:-1, :-1, :]
+    uu = (u * u).sum(dim=-1)
+    uv = (u * v).sum(dim=-1)
+    vv = (v * v).sum(dim=-1)
+    return torch.stack([uu, uv, vv], dim=-1)
+
+
+def _geometry_metric_loss(
+    outputs: dict,
+    batch: dict,
+    *,
+    loss_type: str,
+    include_refine_residual: bool,
+) -> Tensor:
+    if str(loss_type) != "huber":
+        raise ValueError(f"Unsupported geometry_metric_loss={loss_type!r}")
+
+    pred_xyz_soft = outputs["pred_xyz_soft"]
+    if not bool(include_refine_residual):
+        pred_xyz_soft = pred_xyz_soft - outputs["pred_refine_residual"]
+
+    target_xyz = batch["target_xyz"]
+    target_valid_mask = batch["target_valid_mask"]
+    target_lengths = batch["target_lengths"]
+    losses = []
+    for batch_idx, direction in enumerate(batch["direction"]):
+        target_len = int(target_lengths[batch_idx].item())
+        if target_len <= 0:
+            continue
+        grid_shape = tuple(int(v) for v in batch["target_grid_shape"][batch_idx].tolist())
+        if min(grid_shape) < 2:
+            continue
+
+        pred_grid = _sequence_to_grid_torch(pred_xyz_soft[batch_idx, :target_len], grid_shape=grid_shape, direction=direction)
+        target_grid = _sequence_to_grid_torch(target_xyz[batch_idx, :target_len], grid_shape=grid_shape, direction=direction)
+        valid_grid = _sequence_to_grid_torch(
+            target_valid_mask[batch_idx, :target_len],
+            grid_shape=grid_shape,
+            direction=direction,
+        ).bool()
+        quad_mask = valid_grid[:-1, :-1] & valid_grid[:-1, 1:] & valid_grid[1:, :-1] & valid_grid[1:, 1:]
+        if not bool(quad_mask.any()):
+            continue
+
+        pred_gram = _quad_gram_entries(pred_grid)
+        target_gram = _quad_gram_entries(target_grid)
+        per_quad = F.smooth_l1_loss(pred_gram, target_gram, reduction="none").mean(dim=-1)
+        losses.append(_masked_mean(per_quad, quad_mask))
+
+    if not losses:
+        return pred_xyz_soft.new_zeros(())
+    return torch.stack(losses).mean()
+
+
 def _occupancy_metric(outputs: dict, batch: dict) -> Tensor:
     pred_xyz = outputs.get("pred_xyz_refined", outputs["pred_xyz"]).detach().cpu()
     target_mask = batch["target_supervision_mask"].detach().cpu()
@@ -155,7 +236,7 @@ def _occupancy_metric(outputs: dict, batch: dict) -> Tensor:
         if count <= 0:
             continue
         grid_shape = tuple(int(v) for v in batch["target_grid_shape"][batch_idx].tolist())
-        pred_grid = outputs["pred_xyz"][batch_idx, :count].detach().cpu().numpy()
+        pred_grid = pred_xyz[batch_idx, :count].numpy()
         pred_grid = pred_grid.reshape(grid_shape[0], grid_shape[1], 3)
         target_grid = batch["target_grid_local"][batch_idx].detach().cpu().numpy()
         crop_shape = tuple(int(v) for v in volume.shape[-3:])
@@ -176,6 +257,8 @@ def compute_autoreg_mesh_losses(
     offset_loss_weight_active: float = 1.0,
     position_refine_weight_active: float = 0.0,
     position_refine_loss_type: str = "huber",
+    geometry_metric_weight_active: float = 0.0,
+    geometry_metric_loss_type: str = "huber",
     distance_aware_coarse_targets_enabled: bool = True,
     distance_aware_coarse_target_radius: int = 1,
     distance_aware_coarse_target_sigma: float = 1.0,
@@ -192,10 +275,21 @@ def compute_autoreg_mesh_losses(
     offset_loss = _offset_bin_loss(outputs, batch, offset_num_bins=offset_num_bins)
     stop_loss = _stop_loss(outputs, batch)
     total_loss = coarse_loss + float(offset_loss_weight_active) * offset_loss + stop_loss
+    coarse_excess_nll = coarse_loss - coarse_target_entropy
     refine_loss = total_loss.new_zeros(())
     if float(position_refine_weight_active) > 0.0:
         refine_loss = _position_refine_loss(outputs, batch, loss_type=position_refine_loss_type)
         total_loss = total_loss + float(position_refine_weight_active) * refine_loss
+
+    geometry_metric_loss = total_loss.new_zeros(())
+    if float(geometry_metric_weight_active) > 0.0:
+        geometry_metric_loss = _geometry_metric_loss(
+            outputs,
+            batch,
+            loss_type=geometry_metric_loss_type,
+            include_refine_residual=float(position_refine_weight_active) > 0.0,
+        )
+        total_loss = total_loss + float(geometry_metric_weight_active) * geometry_metric_loss
 
     occupancy_metric = total_loss.new_zeros(())
     if float(occupancy_loss_weight) > 0.0:
@@ -207,10 +301,13 @@ def compute_autoreg_mesh_losses(
         "loss": total_loss,
         "coarse_loss": coarse_loss,
         "coarse_target_entropy": coarse_target_entropy,
+        "coarse_excess_nll": coarse_excess_nll,
         "offset_loss": offset_loss,
         "offset_loss_weight_active": total_loss.new_tensor(float(offset_loss_weight_active)),
         "stop_loss": stop_loss,
         "refine_loss": refine_loss,
         "refine_loss_weight_active": total_loss.new_tensor(float(position_refine_weight_active)),
+        "geometry_metric_loss": geometry_metric_loss,
+        "geometry_metric_weight_active": total_loss.new_tensor(float(geometry_metric_weight_active)),
         "occupancy_metric": occupancy_metric,
     }

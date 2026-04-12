@@ -17,11 +17,13 @@ from vesuvius.neural_tracing.autoreg_mesh.dataset import autoreg_mesh_collate
 from vesuvius.neural_tracing.autoreg_mesh.infer import infer_autoreg_mesh
 from vesuvius.neural_tracing.autoreg_mesh.losses import (
     _build_distance_aware_coarse_targets,
+    _geometry_metric_loss,
+    _sequence_to_grid_torch,
     compute_autoreg_mesh_losses,
 )
 from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
-from vesuvius.neural_tracing.autoreg_mesh.serialization import serialize_split_conditioning_example
-from vesuvius.neural_tracing.autoreg_mesh.train import _restrict_dataset_samples, run_autoreg_mesh_training
+from vesuvius.neural_tracing.autoreg_mesh.serialization import deserialize_continuation_grid, serialize_split_conditioning_example
+from vesuvius.neural_tracing.autoreg_mesh.train import _geometry_metric_weight_active, _restrict_dataset_samples, run_autoreg_mesh_training
 from vesuvius.neural_tracing.datasets.triplet_resampling import choose_replacement_index
 
 
@@ -295,12 +297,15 @@ def test_autoreg_mesh_model_forward_and_losses_are_finite(tmp_path: Path) -> Non
     assert outputs["offset_logits"].shape[-1] == 4
     assert outputs["stop_logits"].shape == batch["target_coarse_ids"].shape
     assert outputs["pred_refine_residual"].shape == batch["target_xyz"].shape
+    assert outputs["pred_xyz_soft"].shape == batch["target_xyz"].shape
     assert outputs["pred_xyz_refined"].shape == batch["target_xyz"].shape
     assert batch["target_valid_mask"].shape == batch["target_mask"].shape
     assert batch["target_supervision_mask"].shape == batch["target_mask"].shape
     for value in losses.values():
         assert torch.isfinite(value)
     assert "occupancy_metric" in losses
+    assert "coarse_excess_nll" in losses
+    assert "geometry_metric_loss" in losses
 
 
 def test_autoreg_mesh_smoke_training_runs_two_steps(tmp_path: Path) -> None:
@@ -366,6 +371,7 @@ def test_autoreg_mesh_validation_metrics_are_logged_in_history(tmp_path: Path) -
     assert len(result["history"]) == 1
     assert "val_loss" in result["history"][0]
     assert "val_coarse_loss" in result["history"][0]
+    assert "val_coarse_excess_nll" in result["history"][0]
     assert "val_offset_loss" in result["history"][0]
     assert "val_stop_loss" in result["history"][0]
 
@@ -403,6 +409,67 @@ def test_occupancy_auxiliary_is_metric_only(tmp_path: Path) -> None:
 
     assert metric_losses["loss"].item() == pytest.approx(base_losses["loss"].item())
     assert metric_losses["occupancy_metric"].item() >= 0.0
+
+
+def test_pointer_temperature_sharpens_softmax_distribution() -> None:
+    raw_logits = torch.tensor([[[-0.4, 0.0, 0.8]]], dtype=torch.float32)
+    probs_t1 = torch.softmax(raw_logits / 1.0, dim=-1)
+    probs_t025 = torch.softmax(raw_logits / 0.25, dim=-1)
+    entropy_t1 = -(probs_t1 * probs_t1.clamp(min=1e-8).log()).sum(dim=-1)
+    entropy_t025 = -(probs_t025 * probs_t025.clamp(min=1e-8).log()).sum(dim=-1)
+
+    assert probs_t025.max().item() > probs_t1.max().item()
+    assert entropy_t025.item() < entropy_t1.item()
+
+
+def test_coarse_excess_nll_matches_loss_minus_target_entropy(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = _make_config(checkpoint)
+    model = AutoregMeshModel(config)
+
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    batch = _move_batch(batch, torch.device("cpu"))
+    outputs = model(batch)
+    losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+    )
+
+    assert losses["coarse_excess_nll"].item() == pytest.approx(
+        losses["coarse_loss"].item() - losses["coarse_target_entropy"].item()
+    )
+
+
+def test_occupancy_metric_uses_refined_predictions() -> None:
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    wrong_pred = torch.zeros_like(batch["target_xyz"])
+    right_pred = batch["target_xyz"].clone()
+    common_outputs = {
+        "coarse_logits": torch.zeros((1, batch["target_xyz"].shape[1], 8), dtype=torch.float32),
+        "offset_logits": torch.zeros((1, batch["target_xyz"].shape[1], 3, 4), dtype=torch.float32),
+        "stop_logits": torch.zeros((1, batch["target_xyz"].shape[1]), dtype=torch.float32),
+        "pred_refine_residual": torch.zeros_like(batch["target_xyz"]),
+        "pred_xyz": wrong_pred,
+        "pred_xyz_soft": wrong_pred,
+        "coarse_grid_shape": (2, 2, 2),
+    }
+
+    refined_losses = compute_autoreg_mesh_losses(
+        {**common_outputs, "pred_xyz_refined": right_pred},
+        batch,
+        offset_num_bins=(4, 4, 4),
+        occupancy_loss_weight=1.0,
+    )
+    wrong_losses = compute_autoreg_mesh_losses(
+        {**common_outputs, "pred_xyz_refined": wrong_pred},
+        batch,
+        offset_num_bins=(4, 4, 4),
+        occupancy_loss_weight=1.0,
+    )
+
+    assert refined_losses["occupancy_metric"].item() < wrong_losses["occupancy_metric"].item()
 
 
 def test_position_refine_loss_is_gated_by_step_weight(tmp_path: Path) -> None:
@@ -458,6 +525,74 @@ def test_refine_target_matches_bin_center_residual(tmp_path: Path) -> None:
 
     assert torch.isfinite(expected_residual).all()
     assert losses["refine_loss"].item() >= 0.0
+
+
+def test_soft_decode_matches_hard_decode_for_one_hot_logits() -> None:
+    model = AutoregMeshModel(_make_cached_token_config()).eval()
+    coarse_logits = torch.full((1, 1, 8), -40.0, dtype=torch.float32)
+    coarse_logits[0, 0, 5] = 40.0
+    offset_logits = torch.full((1, 1, 3, 4), -40.0, dtype=torch.float32)
+    offset_logits[0, 0, 0, 1] = 40.0
+    offset_logits[0, 0, 1, 2] = 40.0
+    offset_logits[0, 0, 2, 3] = 40.0
+    pred_refine_residual = torch.zeros((1, 1, 3), dtype=torch.float32)
+
+    soft_xyz = model._soft_decode_local_xyz(coarse_logits, offset_logits, pred_refine_residual)
+    hard_xyz = model.decode_local_xyz(
+        torch.tensor([[5]], dtype=torch.long),
+        torch.tensor([[[1, 2, 3]]], dtype=torch.long),
+    )
+
+    assert torch.allclose(soft_xyz, hard_xyz, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("direction", ["left", "right", "up", "down"])
+def test_sequence_to_grid_torch_matches_numpy_deserialize(direction: str) -> None:
+    sample = _make_sample(direction)
+    grid_shape = tuple(int(v) for v in sample["target_grid_shape"].tolist())
+    torch_grid = _sequence_to_grid_torch(
+        sample["target_xyz"],
+        grid_shape=grid_shape,
+        direction=direction,
+    )
+    numpy_grid = deserialize_continuation_grid(
+        sample["target_xyz"].numpy(),
+        direction=direction,
+        grid_shape=grid_shape,
+    )
+
+    np.testing.assert_allclose(torch_grid.numpy(), numpy_grid)
+
+
+def test_geometry_metric_loss_is_near_zero_on_isometric_copy_and_higher_on_stretch() -> None:
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    translated = batch["target_xyz"] + torch.tensor([3.0, -2.0, 1.0], dtype=torch.float32).view(1, 1, 3)
+    stretched = batch["target_xyz"].clone()
+    stretched[..., 1] = stretched[..., 1] * 1.5
+
+    zero_like = torch.zeros_like(batch["target_xyz"])
+    exact_loss = _geometry_metric_loss(
+        {"pred_xyz_soft": batch["target_xyz"].clone(), "pred_refine_residual": zero_like},
+        batch,
+        loss_type="huber",
+        include_refine_residual=False,
+    )
+    translated_loss = _geometry_metric_loss(
+        {"pred_xyz_soft": translated, "pred_refine_residual": zero_like},
+        batch,
+        loss_type="huber",
+        include_refine_residual=False,
+    )
+    stretched_loss = _geometry_metric_loss(
+        {"pred_xyz_soft": stretched, "pred_refine_residual": zero_like},
+        batch,
+        loss_type="huber",
+        include_refine_residual=False,
+    )
+
+    assert exact_loss.item() == pytest.approx(0.0, abs=1e-8)
+    assert translated_loss.item() == pytest.approx(0.0, abs=1e-8)
+    assert stretched_loss.item() > translated_loss.item()
 
 
 def test_invalid_target_positions_are_masked_from_loss(tmp_path: Path) -> None:
@@ -532,6 +667,23 @@ def test_position_refine_weight_activates_after_start_step(tmp_path: Path) -> No
     assert "refine_loss" in result["history"][1]
 
 
+def test_geometry_metric_weight_activates_after_start_step(tmp_path: Path) -> None:
+    config = _make_cached_token_config()
+    config["out_dir"] = str(tmp_path / "runs_geometry")
+    config["geometry_metric_enabled"] = True
+    config["geometry_metric_weight"] = 0.01
+    config["geometry_metric_start_step"] = 1
+    dataset = _make_training_dataset()
+
+    result = run_autoreg_mesh_training(config, dataset=dataset, device="cpu", max_steps=2)
+
+    assert _geometry_metric_weight_active(config, global_step=0) == pytest.approx(0.0)
+    assert _geometry_metric_weight_active(config, global_step=1) == pytest.approx(0.01)
+    assert result["history"][0]["geometry_metric_weight_active"] == pytest.approx(0.0)
+    assert result["history"][1]["geometry_metric_weight_active"] == pytest.approx(0.01)
+    assert "geometry_metric_loss" in result["history"][1]
+
+
 def test_offset_loss_is_gated_by_active_weight(tmp_path: Path) -> None:
     checkpoint = tmp_path / "tiny_dinovol.pt"
     _write_local_guide_checkpoint(checkpoint)
@@ -593,6 +745,10 @@ def test_distance_aware_target_builder_normalizes_and_respects_edges() -> None:
 def test_distance_aware_target_default_config_values() -> None:
     config = _make_cached_token_config()
     validated = validate_autoreg_mesh_config(config)
+    assert validated["pointer_temperature"] == pytest.approx(0.25)
+    assert validated["geometry_metric_enabled"] is True
+    assert validated["geometry_metric_weight"] == pytest.approx(0.01)
+    assert validated["geometry_metric_start_step"] == 2000
     assert validated["distance_aware_coarse_targets_enabled"] is True
     assert validated["distance_aware_coarse_target_radius"] == 1
     assert validated["distance_aware_coarse_target_sigma"] == pytest.approx(1.0)
@@ -710,6 +866,10 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     assert result["median_valid_prompt_tokens"] > 0
     assert result["median_valid_target_tokens"] > 0
     assert result["refine_head_present"] is True
+    assert result["pointer_temperature"] == pytest.approx(0.25)
+    assert result["geometry_metric_enabled"] is True
+    assert result["geometry_metric_weight"] == pytest.approx(0.01)
+    assert result["geometry_metric_start_step"] == 2000
     assert result["distance_aware_coarse_targets_enabled"] is True
     assert result["distance_aware_coarse_target_radius"] == 1
     assert result["distance_aware_coarse_target_sigma"] == pytest.approx(1.0)
@@ -764,6 +924,7 @@ def test_autoreg_mesh_wandb_logging_includes_metrics_and_images(tmp_path: Path, 
     logged = fake_wandb.logs[0]["data"]
     assert "loss" in logged
     assert "coarse_loss" in logged
+    assert "coarse_excess_nll" in logged
     assert "current_lr" in logged
     assert "grad_norm" in logged
     assert "val_loss" in logged

@@ -265,6 +265,7 @@ class AutoregMeshModel(nn.Module):
             [nn.Embedding(num_bins, self.decoder_dim) for num_bins in self.offset_num_bins]
         )
         self.start_token = nn.Parameter(torch.zeros(self.decoder_dim))
+        self.register_buffer("coarse_cell_starts", self._build_coarse_cell_starts(), persistent=False)
 
         self.rope = MixedRopePositionEmbedding(
             self.head_dim,
@@ -304,6 +305,18 @@ class AutoregMeshModel(nn.Module):
         shape = torch.tensor(self.input_shape, device=xyz.device, dtype=xyz.dtype)
         return (2.0 * (xyz / torch.clamp(shape - 1.0, min=1.0))) - 1.0
 
+    def _build_coarse_cell_starts(self) -> Tensor:
+        grid_shape = (
+            int(self.input_shape[0] // self.patch_size[0]),
+            int(self.input_shape[1] // self.patch_size[1]),
+            int(self.input_shape[2] // self.patch_size[2]),
+        )
+        patch = torch.tensor(self.patch_size, dtype=torch.float32)
+        z = torch.arange(grid_shape[0], dtype=torch.float32) * patch[0]
+        y = torch.arange(grid_shape[1], dtype=torch.float32) * patch[1]
+        x = torch.arange(grid_shape[2], dtype=torch.float32) * patch[2]
+        return torch.stack(torch.meshgrid(z, y, x, indexing="ij"), dim=-1).reshape(-1, 3)
+
     def _make_memory_patch_centers(self, grid_shape: tuple[int, int, int], *, device: torch.device, dtype: torch.dtype) -> Tensor:
         gz, gy, gx = grid_shape
         patch = torch.tensor(self.patch_size, device=device, dtype=dtype)
@@ -342,6 +355,26 @@ class AutoregMeshModel(nn.Module):
             "memory_patch_centers": patch_centers,
             "coarse_grid_shape": grid_shape,
         }
+
+    def _soft_decode_local_xyz(
+        self,
+        coarse_logits: Tensor,
+        offset_logits: Tensor,
+        pred_refine_residual: Tensor,
+    ) -> Tensor:
+        coarse_probs = torch.softmax(coarse_logits, dim=-1)
+        coarse_starts = self.coarse_cell_starts.to(device=coarse_logits.device, dtype=coarse_logits.dtype)
+        expected_coarse_start = torch.einsum("btn,nc->btc", coarse_probs, coarse_starts)
+
+        expected_offsets = []
+        for axis, bins in enumerate(self.offset_num_bins):
+            axis_logits = offset_logits[:, :, axis, :bins]
+            axis_probs = torch.softmax(axis_logits, dim=-1)
+            bin_width = float(self.patch_size[axis]) / float(bins)
+            bin_centers = (torch.arange(bins, device=axis_logits.device, dtype=axis_logits.dtype) + 0.5) * bin_width
+            expected_offsets.append(torch.einsum("btn,n->bt", axis_probs, bin_centers))
+        expected_offset = torch.stack(expected_offsets, dim=-1)
+        return expected_coarse_start + expected_offset + pred_refine_residual.to(dtype=expected_coarse_start.dtype)
 
     def _gather_memory_tokens(self, memory_tokens: Tensor, coarse_ids: Tensor, valid_mask: Tensor) -> Tensor:
         safe_ids = torch.where(valid_mask, coarse_ids.clamp(min=0), torch.zeros_like(coarse_ids))
@@ -554,6 +587,7 @@ class AutoregMeshModel(nn.Module):
         pred_offset_bins_tensor = torch.stack(pred_offset_bins, dim=-1)
         pred_xyz_bin_center = self.decode_local_xyz(pred_coarse_ids, pred_offset_bins_tensor)
         pred_refine_residual = self.position_refine_head(hidden)
+        pred_xyz_soft = self._soft_decode_local_xyz(coarse_logits, offset_logits, pred_refine_residual)
         pred_xyz_refined = pred_xyz_bin_center + pred_refine_residual
         max_coord = torch.tensor(self.input_shape, device=hidden.device, dtype=hidden.dtype) - 1e-4
         pred_xyz_refined = torch.maximum(pred_xyz_refined, torch.zeros_like(pred_xyz_refined))
@@ -567,6 +601,7 @@ class AutoregMeshModel(nn.Module):
             "pred_offset_bins": pred_offset_bins_tensor,
             "pred_refine_residual": pred_refine_residual,
             "pred_xyz": pred_xyz_bin_center,
+            "pred_xyz_soft": pred_xyz_soft,
             "pred_xyz_refined": pred_xyz_refined,
             "memory_tokens": memory_tokens,
             "coarse_grid_shape": tuple(int(v) for v in batch.get("coarse_grid_shape", ())),
