@@ -625,16 +625,42 @@ def _triangle_gram_matrix(p0: Tensor, p1: Tensor, p2: Tensor) -> Tensor:
     return torch.stack([row0, row1], dim=-2)
 
 
+def _regularize_2x2_gram(gram: Tensor, *, eps: float) -> Tensor:
+    gram = 0.5 * (gram + gram.transpose(-1, -2))
+    gram = torch.nan_to_num(gram, nan=0.0, posinf=0.0, neginf=0.0)
+    eye = torch.eye(2, device=gram.device, dtype=gram.dtype)
+    return gram + float(eps) * eye
+
+
+def _inverse_2x2(matrix: Tensor, *, det_floor: float) -> Tensor:
+    a = matrix[..., 0, 0]
+    b = matrix[..., 0, 1]
+    c = matrix[..., 1, 0]
+    d = matrix[..., 1, 1]
+    det = a * d - b * c
+    safe_det = det.clamp(min=float(det_floor))
+    inv = torch.stack(
+        [
+            torch.stack([d / safe_det, -b / safe_det], dim=-1),
+            torch.stack([-c / safe_det, a / safe_det], dim=-1),
+        ],
+        dim=-2,
+    )
+    return torch.nan_to_num(inv, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def _symmetric_dirichlet_from_gram(pred_gram: Tensor, target_gram: Tensor, *, eps: float = 1e-4) -> Tensor:
-    eye = torch.eye(2, device=pred_gram.device, dtype=pred_gram.dtype).view(1, 1, 2, 2)
-    pred_reg = pred_gram + eps * eye
-    target_reg = target_gram + eps * eye
-    forward = torch.linalg.solve(target_reg, pred_reg)
-    backward = torch.linalg.solve(pred_reg, target_reg)
+    pred_reg = _regularize_2x2_gram(pred_gram, eps=eps)
+    target_reg = _regularize_2x2_gram(target_gram, eps=eps)
+    det_floor = float(eps) * float(eps)
+    target_inv = _inverse_2x2(target_reg, det_floor=det_floor)
+    pred_inv = _inverse_2x2(pred_reg, det_floor=det_floor)
+    forward = target_inv @ pred_reg
+    backward = pred_inv @ target_reg
     forward_trace = torch.diagonal(forward, dim1=-2, dim2=-1).sum(dim=-1)
     backward_trace = torch.diagonal(backward, dim1=-2, dim2=-1).sum(dim=-1)
     energy = 0.25 * (forward_trace + backward_trace) - 1.0
-    return torch.clamp_min(energy, 0.0)
+    return torch.clamp_min(torch.nan_to_num(energy, nan=0.0, posinf=1e6, neginf=0.0), 0.0)
 
 
 def _geometry_sd_loss(

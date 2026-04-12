@@ -907,6 +907,20 @@ def test_geometry_sd_loss_is_near_zero_on_isometric_copy_and_higher_on_stretch()
     assert stretched_loss.item() > translated_loss.item()
 
 
+def test_geometry_sd_loss_stays_finite_for_degenerate_prediction() -> None:
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    zero_like = torch.zeros_like(batch["target_xyz"])
+    collapsed = torch.zeros_like(batch["target_xyz"])
+    loss = _geometry_sd_loss(
+        {"pred_xyz_soft": collapsed, "pred_refine_residual": zero_like},
+        batch,
+        include_refine_residual=False,
+    )
+
+    assert torch.isfinite(loss)
+    assert loss.item() >= 0.0
+
+
 def test_xyz_soft_loss_is_near_zero_on_ground_truth_and_excludes_residual_before_refine() -> None:
     batch = autoreg_mesh_collate([_make_sample("left")])
     outputs = {
