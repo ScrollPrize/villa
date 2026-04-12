@@ -66,4 +66,11 @@ void buildWindowLevelLut(std::array<uint32_t, 256>& lut,
                          float windowLow, float windowHigh,
                          float lightFactor = 1.0f) noexcept;
 
+// Same as buildWindowLevelLut but fuses in a colormap (by id).
+// Empty/unknown id => grayscale (same as buildWindowLevelLut).
+void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
+                                 float windowLow, float windowHigh,
+                                 const std::string& colormapId,
+                                 float lightFactor = 1.0f);
+
 }  // namespace vc

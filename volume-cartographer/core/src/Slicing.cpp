@@ -79,7 +79,7 @@ struct VolumeShape {
 // block cache only — never blocks on disk or network. Missing blocks make
 // sampleInt return 0 (black) for that voxel. Viewport-demand fetches feed
 // the cache asynchronously via BlockPipeline::fetchInteractive.
-template<typename T, int kSlots = 64>
+template<typename T, int kSlots = 512>
 struct BlockSampler {
     static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be power of 2");
     static constexpr int kSlotMask = kSlots - 1;
@@ -519,21 +519,51 @@ VC_FORCE_INLINE bool trySampleNB(BlockSampler<uint8_t>& s, float vz, float vy, f
         return s.sampleIntNB(iz, iy, ix, out);
     } else {
         int iz = int(vz), iy = int(vy), ix = int(vx);
-        uint8_t v000, v100, v010, v110, v001, v101, v011, v111;
-        if (!s.sampleIntNB(iz,     iy,     ix,     v000)) return false;
-        if (!s.sampleIntNB(iz + 1, iy,     ix,     v100)) return false;
-        if (!s.sampleIntNB(iz,     iy + 1, ix,     v010)) return false;
-        if (!s.sampleIntNB(iz + 1, iy + 1, ix,     v110)) return false;
-        if (!s.sampleIntNB(iz,     iy,     ix + 1, v001)) return false;
-        if (!s.sampleIntNB(iz + 1, iy,     ix + 1, v101)) return false;
-        if (!s.sampleIntNB(iz,     iy + 1, ix + 1, v011)) return false;
-        if (!s.sampleIntNB(iz + 1, iy + 1, ix + 1, v111)) return false;
+        float v000f, v100f, v010f, v110f, v001f, v101f, v011f, v111f;
+
+        // Fast path: all 8 corners share one block (the common case — ~82%
+        // of interior samples). Single block lookup, 8 direct reads.
+        const int lz = iz & kBlockMask;
+        const int ly = iy & kBlockMask;
+        const int lx = ix & kBlockMask;
+        if (lz != kBlockMask && ly != kBlockMask && lx != kBlockMask &&
+            iz >= 0 && iy >= 0 && ix >= 0 &&
+            iz + 1 < s.shape.sz && iy + 1 < s.shape.sy && ix + 1 < s.shape.sx) {
+            int bz = iz >> kBlockShift, by = iy >> kBlockShift, bx = ix >> kBlockShift;
+            s.tryUpdateBlockNonBlocking(bz, by, bx);
+            if (!s.data) return false;
+            const uint8_t* b = s.data + size_t(lz) * kStrideZ
+                                      + size_t(ly) * kStrideY
+                                      + size_t(lx);
+            v000f = float(b[0]);
+            v001f = float(b[1]);
+            v010f = float(b[kStrideY]);
+            v011f = float(b[kStrideY + 1]);
+            v100f = float(b[kStrideZ]);
+            v101f = float(b[kStrideZ + 1]);
+            v110f = float(b[kStrideZ + kStrideY]);
+            v111f = float(b[kStrideZ + kStrideY + 1]);
+        } else {
+            uint8_t v000, v100, v010, v110, v001, v101, v011, v111;
+            if (!s.sampleIntNB(iz,     iy,     ix,     v000)) return false;
+            if (!s.sampleIntNB(iz + 1, iy,     ix,     v100)) return false;
+            if (!s.sampleIntNB(iz,     iy + 1, ix,     v010)) return false;
+            if (!s.sampleIntNB(iz + 1, iy + 1, ix,     v110)) return false;
+            if (!s.sampleIntNB(iz,     iy,     ix + 1, v001)) return false;
+            if (!s.sampleIntNB(iz + 1, iy,     ix + 1, v101)) return false;
+            if (!s.sampleIntNB(iz,     iy + 1, ix + 1, v011)) return false;
+            if (!s.sampleIntNB(iz + 1, iy + 1, ix + 1, v111)) return false;
+            v000f = float(v000); v100f = float(v100);
+            v010f = float(v010); v110f = float(v110);
+            v001f = float(v001); v101f = float(v101);
+            v011f = float(v011); v111f = float(v111);
+        }
 
         float fz = vz - float(iz), fy = vy - float(iy), fx = vx - float(ix);
-        float c00 = std::fma(fx, float(v001) - float(v000), float(v000));
-        float c01 = std::fma(fx, float(v011) - float(v010), float(v010));
-        float c10 = std::fma(fx, float(v101) - float(v100), float(v100));
-        float c11 = std::fma(fx, float(v111) - float(v110), float(v110));
+        float c00 = std::fma(fx, v001f - v000f, v000f);
+        float c01 = std::fma(fx, v011f - v010f, v010f);
+        float c10 = std::fma(fx, v101f - v100f, v100f);
+        float c11 = std::fma(fx, v111f - v110f, v110f);
         float c0  = std::fma(fy, c01 - c00, c00);
         float c1  = std::fma(fy, c11 - c10, c10);
         float v   = std::fma(fz, c1 - c0, c0);
@@ -615,7 +645,209 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
     }
 }
 
+// ----------------------------------------------------------------------------
+// Unified composite-capable adaptive sampler.
+// numLayers=1 + nullptr normals = non-composite (same cost as the plain
+// adaptive path, no per-layer overhead).
+// ----------------------------------------------------------------------------
+
+enum class AccumMode2 : std::uint8_t { Max, Min, Mean, LayerStorage };
+
+static AccumMode2 accumModeFor(const std::string& m) {
+    if (m == "max") return AccumMode2::Max;
+    if (m == "min") return AccumMode2::Min;
+    if (m == "median" || m == "alpha" || m == "minabs") return AccumMode2::LayerStorage;
+    return AccumMode2::Mean;
+}
+
+template<SampleMode SMode, AccumMode2 AMode>
+void sampleCompositeAdaptiveImpl(
+    uint32_t* outBuf, int outStride,
+    BlockPipeline& cache, int desiredLevel, int numLevels,
+    const cv::Mat_<cv::Vec3f>* coords,
+    const cv::Vec3f* origin, const cv::Vec3f* vx_step, const cv::Vec3f* vy_step,
+    const cv::Mat_<cv::Vec3f>* normals,
+    const cv::Vec3f* planeNormal,
+    int numLayers, int zStart, float zStep,
+    int w, int h,
+    const std::string& compositeMethod,
+    const uint32_t lut[256])
+{
+    auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
+    const float zLo = float(zStart) * zStep;
+    const float zHi = float(zStart + numLayers - 1) * zStep;
+    const float zMin = std::min(zLo, zHi), zMax = std::max(zLo, zHi);
+
+    // Prefetch covered bbox across all fallback levels.
+    if (coords) {
+        float minVx=FLT_MAX, minVy=FLT_MAX, minVz=FLT_MAX;
+        float maxVx=-FLT_MAX, maxVy=-FLT_MAX, maxVz=-FLT_MAX;
+        for (int r=0; r<coords->rows; r++) {
+            const cv::Vec3f* row = coords->ptr<cv::Vec3f>(r);
+            const cv::Vec3f* nrow = normals ? normals->ptr<cv::Vec3f>(r) : nullptr;
+            for (int c=0; c<coords->cols; c++) {
+                const auto& v = row[c];
+                if (!isfinite_bitwise(v[0])) continue;
+                cv::Vec3f n = nrow ? nrow[c] : cv::Vec3f(0,0,0);
+                if (nrow && !isfinite_bitwise(n[0])) continue;
+                float lox = v[0]+n[0]*zMin, hix = v[0]+n[0]*zMax;
+                float loy = v[1]+n[1]*zMin, hiy = v[1]+n[1]*zMax;
+                float loz = v[2]+n[2]*zMin, hiz = v[2]+n[2]*zMax;
+                minVx=std::min(minVx,std::min(lox,hix)); maxVx=std::max(maxVx,std::max(lox,hix));
+                minVy=std::min(minVy,std::min(loy,hiy)); maxVy=std::max(maxVy,std::max(loy,hiy));
+                minVz=std::min(minVz,std::min(loz,hiz)); maxVz=std::max(maxVz,std::max(loz,hiz));
+            }
+        }
+        if (maxVx >= minVx) {
+            for (int lvl=desiredLevel; lvl<numLevels; lvl++) {
+                float s = levelScale(lvl);
+                prefetchRegion(cache, lvl, minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s);
+            }
+        }
+    } else {
+        cv::Vec3f p0 = *origin + (*planeNormal) * zMin;
+        cv::Vec3f p1 = *origin + (*vx_step)*float(w-1) + (*vy_step)*float(h-1) + (*planeNormal)*zMax;
+        float minVx=std::min(p0[0],p1[0]), maxVx=std::max(p0[0],p1[0]);
+        float minVy=std::min(p0[1],p1[1]), maxVy=std::max(p0[1],p1[1]);
+        float minVz=std::min(p0[2],p1[2]), maxVz=std::max(p0[2],p1[2]);
+        for (int lvl=desiredLevel; lvl<numLevels; lvl++) {
+            float s = levelScale(lvl);
+            prefetchRegion(cache, lvl, minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s);
+        }
+    }
+
+    #pragma omp parallel
+    {
+        std::vector<BlockSampler<uint8_t>> samplers;
+        const int nSamplers = numLevels - desiredLevel;
+        samplers.reserve(nSamplers);
+        for (int lvl=desiredLevel; lvl<numLevels; lvl++)
+            samplers.emplace_back(cache, lvl);
+        std::vector<float> layerVals;
+        if constexpr (AMode == AccumMode2::LayerStorage) layerVals.resize(numLayers);
+
+        #pragma omp for schedule(dynamic, 16)
+        for (int y=0; y<h; y++) {
+            uint32_t* outRow = outBuf + size_t(y) * size_t(outStride);
+            const cv::Vec3f* crow = coords ? coords->ptr<cv::Vec3f>(y) : nullptr;
+            const cv::Vec3f* nrow = normals ? normals->ptr<cv::Vec3f>(y) : nullptr;
+            for (int x=0; x<w; x++) {
+                cv::Vec3f base = crow ? crow[x] : (*origin + *vx_step*float(x) + *vy_step*float(y));
+                if (!isfinite_bitwise(base[0])) { outRow[x] = lut[0]; continue; }
+                cv::Vec3f nrm = nrow ? nrow[x] : (planeNormal ? *planeNormal : cv::Vec3f(0,0,0));
+                if (nrow && !isfinite_bitwise(nrm[0])) { outRow[x] = lut[0]; continue; }
+
+                float accum=0.f, mx=0.f, mn=255.f;
+                int count=0;
+                for (int li=0; li<numLayers; li++) {
+                    float z = float(zStart + li) * zStep;
+                    float wx = base[0] + nrm[0]*z;
+                    float wy = base[1] + nrm[1]*z;
+                    float wz = base[2] + nrm[2]*z;
+                    uint8_t v = 0;
+                    for (int i=0; i<nSamplers; i++) {
+                        int lvl = desiredLevel + i;
+                        float scl = (lvl > 0) ? 1.0f/float(1<<lvl) : 1.0f;
+                        if (trySampleNB<SMode>(samplers[i], wz*scl, wy*scl, wx*scl, v)) break;
+                    }
+                    if constexpr (AMode == AccumMode2::Max) { mx = std::max(mx, float(v)); }
+                    else if constexpr (AMode == AccumMode2::Min) { mn = std::min(mn, float(v)); }
+                    else if constexpr (AMode == AccumMode2::Mean) { accum += float(v); count++; }
+                    else { layerVals[li] = float(v); }
+                }
+
+                float val = 0.f;
+                if constexpr (AMode == AccumMode2::Max) val = mx;
+                else if constexpr (AMode == AccumMode2::Min) val = mn;
+                else if constexpr (AMode == AccumMode2::Mean) val = count ? accum/float(count) : 0.f;
+                else {
+                    if (compositeMethod == "median") {
+                        std::nth_element(layerVals.begin(), layerVals.begin()+numLayers/2, layerVals.end());
+                        val = layerVals[numLayers/2];
+                    } else if (compositeMethod == "minabs") {
+                        float best = layerVals[0];
+                        for (int i=1; i<numLayers; i++)
+                            if (std::abs(layerVals[i]-127.5f) < std::abs(best-127.5f)) best = layerVals[i];
+                        val = best;
+                    } else {
+                        float s=0.f; for (float v : layerVals) s += v;
+                        val = numLayers>0 ? s/float(numLayers) : 0.f;
+                    }
+                }
+                if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
+                outRow[x] = lut[uint8_t(val)];
+            }
+        }
+    }
+}
+
+template<SampleMode SMode>
+void dispatchCompositeAdaptive(
+    uint32_t* outBuf, int outStride,
+    BlockPipeline& cache, int desiredLevel, int numLevels,
+    const cv::Mat_<cv::Vec3f>* coords,
+    const cv::Vec3f* origin, const cv::Vec3f* vx_step, const cv::Vec3f* vy_step,
+    const cv::Mat_<cv::Vec3f>* normals,
+    const cv::Vec3f* planeNormal,
+    int numLayers, int zStart, float zStep,
+    int w, int h,
+    const std::string& method,
+    const uint32_t lut[256])
+{
+    switch (accumModeFor(method)) {
+        case AccumMode2::Max:
+            sampleCompositeAdaptiveImpl<SMode, AccumMode2::Max>(
+                outBuf, outStride, cache, desiredLevel, numLevels,
+                coords, origin, vx_step, vy_step, normals, planeNormal,
+                numLayers, zStart, zStep, w, h, method, lut); break;
+        case AccumMode2::Min:
+            sampleCompositeAdaptiveImpl<SMode, AccumMode2::Min>(
+                outBuf, outStride, cache, desiredLevel, numLevels,
+                coords, origin, vx_step, vy_step, normals, planeNormal,
+                numLayers, zStart, zStep, w, h, method, lut); break;
+        case AccumMode2::LayerStorage:
+            sampleCompositeAdaptiveImpl<SMode, AccumMode2::LayerStorage>(
+                outBuf, outStride, cache, desiredLevel, numLevels,
+                coords, origin, vx_step, vy_step, normals, planeNormal,
+                numLayers, zStart, zStep, w, h, method, lut); break;
+        default:
+            sampleCompositeAdaptiveImpl<SMode, AccumMode2::Mean>(
+                outBuf, outStride, cache, desiredLevel, numLevels,
+                coords, origin, vx_step, vy_step, normals, planeNormal,
+                numLayers, zStart, zStep, w, h, method, lut); break;
+    }
+}
+
 } // namespace
+
+void sampleAdaptiveARGB32(
+    uint32_t* outBuf, int outStride,
+    vc::cache::BlockPipeline* cache,
+    int desiredLevel, int numLevels,
+    const cv::Mat_<cv::Vec3f>* coords,
+    const cv::Vec3f* origin, const cv::Vec3f* vx_step, const cv::Vec3f* vy_step,
+    const cv::Mat_<cv::Vec3f>* normals,
+    const cv::Vec3f* planeNormal,
+    int numLayers, int zStart, float zStep,
+    int width, int height,
+    const std::string& compositeMethod,
+    const uint32_t lut[256],
+    vc::Sampling method)
+{
+    if (numLayers <= 0) numLayers = 1;
+    switch (method) {
+        case vc::Sampling::Nearest:
+            dispatchCompositeAdaptive<SampleMode::Nearest>(
+                outBuf, outStride, *cache, desiredLevel, numLevels,
+                coords, origin, vx_step, vy_step, normals, planeNormal,
+                numLayers, zStart, zStep, width, height, compositeMethod, lut); break;
+        default:
+            dispatchCompositeAdaptive<SampleMode::Trilinear>(
+                outBuf, outStride, *cache, desiredLevel, numLevels,
+                coords, origin, vx_step, vy_step, normals, planeNormal,
+                numLayers, zStart, zStep, width, height, compositeMethod, lut); break;
+    }
+}
 
 int samplePlaneAdaptiveARGB32(uint32_t* outBuf, int outStride,
                               BlockPipeline* cache,

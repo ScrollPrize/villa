@@ -492,35 +492,44 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     cv::warpAffine(valid_src, valid_big, A, size + cv::Size(8, 8),
                 cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
 
-    // --- normals: sample on SOURCE grid -------------------
+    // --- normals: warp cached source-grid normals -------------------
     cv::Mat_<cv::Vec3f> normals_big;
     if (need_normals) {
-        normals_big.create(size + cv::Size(8, 8));
-        normals_big.setTo(cv::Vec3f(std::numeric_limits<float>::quiet_NaN(),
-                                    std::numeric_limits<float>::quiet_NaN(),
-                                    std::numeric_limits<float>::quiet_NaN()));
-        #pragma omp parallel for collapse(2) schedule(dynamic, 16)
-        for (int j = 0; j < h; ++j) {
-            for (int i = 0; i < w; ++i) {
-                const double y = oy + (j + 4.0) * sy;
-                const double x = ox + (i + 4.0) * sx;
-                const int jj = j + 4, ii = i + 4;
-                if (valid_big.ptr<uint8_t>(jj)[ii]) {
-                    normals_big(jj, ii) = grid_normal(*_points,
-                        cv::Vec3f(static_cast<float>(x),
-                                static_cast<float>(y),
-                                0.0f));
+        // Build source-grid normal cache once per surface. Subsequent gen()
+        // calls (panning, zooming) reuse it — per-pixel grid_normal is the
+        // most expensive part of this function otherwise.
+        if (_normalCache.empty() || _normalCache.size() != _points->size()) {
+            _normalCache.create(_points->rows, _points->cols);
+            const cv::Vec3f qn(std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::quiet_NaN());
+            #pragma omp parallel for schedule(dynamic, 16)
+            for (int r = 0; r < _points->rows; r++) {
+                for (int c = 0; c < _points->cols; c++) {
+                    if ((*_points)(r, c)[0] == -1.f) {
+                        _normalCache(r, c) = qn;
+                    } else {
+                        _normalCache(r, c) = grid_normal(*_points,
+                            cv::Vec3f(float(c), float(r), 0.0f));
+                    }
                 }
             }
         }
+        const cv::Scalar qnScalar(std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN());
+        cv::warpAffine(_normalCache, normals_big, A, size + cv::Size(8, 8),
+                       cv::INTER_NEAREST, cv::BORDER_CONSTANT, qnScalar);
     }
 
     // --- crop away the 4px halo ----------------------------------------
+    // Take views, not clones: ref-counted buffers stay alive via the shared
+    // Mat header. Skips ~48MB/frame of memcpy for a 1920x1080 composite.
     cv::Rect inner(4, 4, w, h);
-    *coords = coords_big(inner).clone();
-    cv::Mat valid = valid_big(inner).clone();
+    *coords = coords_big(inner);
+    cv::Mat valid = valid_big(inner);
     if (need_normals) {
-        *normals = normals_big(inner).clone();
+        *normals = normals_big(inner);
     }
 
     // --- invalidate out-of-footprint pixels (kill GUI leakage) ----------

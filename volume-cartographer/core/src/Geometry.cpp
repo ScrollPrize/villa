@@ -26,32 +26,43 @@ static cv::Vec2f vmax(const cv::Vec2f &a, const cv::Vec2f &b)
 
 cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &loc)
 {
-    cv::Vec2f inb_loc = {loc[0], loc[1]};
-    //move inside from the grid border so w can access required locations
-    inb_loc = vmax(inb_loc, {1.f,1.f});
-    inb_loc = vmin(inb_loc, {static_cast<float>(points.cols-3), static_cast<float>(points.rows-3)});
+    const cv::Vec3f qnan(NAN, NAN, NAN);
+    // loc is (x, y) in grid coords; rows=y, cols=x.
+    float fx = loc[0], fy = loc[1];
+    // Clamp to [1, cols-3] x [1, rows-3] so +/-1 neighbors + bilinear cell fit.
+    const float maxX = float(points.cols - 3);
+    const float maxY = float(points.rows - 3);
+    if (fx < 1.f) fx = 1.f; else if (fx > maxX) fx = maxX;
+    if (fy < 1.f) fy = 1.f; else if (fy > maxY) fy = maxY;
 
-    if (!loc_valid_xy(points, inb_loc))
-        return {NAN,NAN,NAN};
+    const int ix = int(fx), iy = int(fy);
+    const float tx = fx - float(ix), ty = fy - float(iy);
 
-    if (!loc_valid_xy(points, inb_loc+cv::Vec2f(1,0)))
-        return {NAN,NAN,NAN};
-    if (!loc_valid_xy(points, inb_loc+cv::Vec2f(-1,0)))
-        return {NAN,NAN,NAN};
-    if (!loc_valid_xy(points, inb_loc+cv::Vec2f(0,1)))
-        return {NAN,NAN,NAN};
-    if (!loc_valid_xy(points, inb_loc+cv::Vec2f(0,-1)))
-        return {NAN,NAN,NAN};
+    // We need a 4x4 neighborhood: rows [iy-1, iy+2], cols [ix-1, ix+2].
+    // Plus one more row/col for the bilinear cell's lower-right neighbor of
+    // each of the 4 sample points. So the full window is rows [iy-1, iy+2]
+    // cols [ix-1, ix+2]. Check invalids (-1 marker) across that window.
+    for (int dy = -1; dy <= 2; ++dy) {
+        const cv::Vec3f* row = points.ptr<cv::Vec3f>(iy + dy);
+        for (int dx = -1; dx <= 2; ++dx) {
+            if (row[ix + dx][0] == -1.f) return qnan;
+        }
+    }
 
-    cv::Vec3f xv = normed(at_int(points,inb_loc+cv::Vec2f(1,0))-at_int(points,inb_loc-cv::Vec2f(1,0)));
-    cv::Vec3f yv = normed(at_int(points,inb_loc+cv::Vec2f(0,1))-at_int(points,inb_loc-cv::Vec2f(0,1)));
+    auto bilerp = [&](int bx, int by) -> cv::Vec3f {
+        const cv::Vec3f& p00 = points.ptr<cv::Vec3f>(by)[bx];
+        const cv::Vec3f& p01 = points.ptr<cv::Vec3f>(by)[bx + 1];
+        const cv::Vec3f& p10 = points.ptr<cv::Vec3f>(by + 1)[bx];
+        const cv::Vec3f& p11 = points.ptr<cv::Vec3f>(by + 1)[bx + 1];
+        cv::Vec3f a = (1.f - tx) * p00 + tx * p01;
+        cv::Vec3f b = (1.f - tx) * p10 + tx * p11;
+        return (1.f - ty) * a + ty * b;
+    };
 
-    // Left-hand rule: +U (xv) × +V (yv) = +Z (toward viewer)
+    cv::Vec3f xv = normed(bilerp(ix + 1, iy) - bilerp(ix - 1, iy));
+    cv::Vec3f yv = normed(bilerp(ix, iy + 1) - bilerp(ix, iy - 1));
     cv::Vec3f n = xv.cross(yv);
-
-    if (std::isnan(n[0]))
-        return {NAN,NAN,NAN};
-
+    if (n[0] != n[0]) return qnan;
     return normed(n);
 }
 

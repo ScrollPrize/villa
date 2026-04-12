@@ -106,6 +106,28 @@ void sampleCoordsAdaptiveARGB32(
     const uint32_t lut[256],
     vc::Sampling method = vc::Sampling::Nearest);
 
+// Unified composite-capable adaptive sampler with per-pixel level fallback.
+// One entry point for plane/coords and composite/non-composite rendering:
+//   - Plane mode: pass coords=nullptr and origin/vx_step/vy_step/planeNormal.
+//   - Coords mode (QuadSurface): pass coords, leave origin/vx_step/vy_step/planeNormal null.
+//   - Composite: pass normals (or planeNormal) with numLayers>1. numLayers=1
+//     and any normal (or zero) collapses the loop to a single sample.
+//   - compositeMethod: "max", "min", "mean", "median", "minabs", "alpha".
+// Non-blocking: missing blocks render as lut[0] after exhausting fallback levels.
+void sampleAdaptiveARGB32(
+    uint32_t* outBuf, int outStride,
+    vc::cache::BlockPipeline* cache,
+    int desiredLevel, int numLevels,
+    const cv::Mat_<cv::Vec3f>* coords,
+    const cv::Vec3f* origin, const cv::Vec3f* vx_step, const cv::Vec3f* vy_step,
+    const cv::Mat_<cv::Vec3f>* normals,
+    const cv::Vec3f* planeNormal,
+    int numLayers, int zStart, float zStep,
+    int width, int height,
+    const std::string& compositeMethod,
+    const uint32_t lut[256],
+    vc::Sampling method = vc::Sampling::Nearest);
+
 // Fused plane composite: inline coords + nearest-neighbor per layer + composite + LUT → ARGB32.
 // No coord matrix allocation. For PlaneSurface composite rendering.
 void samplePlaneCompositeARGB32(

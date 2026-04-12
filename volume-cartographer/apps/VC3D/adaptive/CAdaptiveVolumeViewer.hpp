@@ -89,7 +89,7 @@ public:
     void setVolumeWindow(float low, float high);
     float volumeWindowLow() const { return _windowLow; }
     float volumeWindowHigh() const { return _windowHigh; }
-    void setBaseColormap(const std::string&) { submitRender(); }
+    void setBaseColormap(const std::string& id) { _baseColormapId = id; submitRender(); }
     void setStretchValues(bool) { submitRender(); }
 
     // --- Display stubs ---
@@ -273,6 +273,7 @@ private:
     AdaptiveCamera _camera;
     float _windowLow = 0.0f;
     float _windowHigh = 255.0f;
+    std::string _baseColormapId;
     CompositeRenderSettings _compositeSettings;
     bool _resetViewOnSurfaceChange = true;
     float _navSpeed = 1.0f;
