@@ -400,8 +400,17 @@ void Volume::ensureTieredCache() const
         tieredCache_ = self->createTieredCache(self->pendingDiskZarr_);
         if (tieredCache_) {
             int nScales = tieredCache_->numLevels();
-            if (nScales > 0)
-                tieredCache_->loadResidentLevel(nScales - 1);
+            if (nScales > 0) {
+                // Run the (potentially 100+ chunk) coarsest-level preload in
+                // a detached background thread so the UI doesn't block during
+                // a fresh-cache fetch. Rendering falls back through missing
+                // blocks until they arrive.
+                auto* cache = tieredCache_.get();
+                int lvl = nScales - 1;
+                std::thread([cache, lvl]() {
+                    cache->loadResidentLevel(lvl);
+                }).detach();
+            }
         }
     });
 }
