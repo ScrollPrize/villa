@@ -688,16 +688,17 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
                 else        c = *origin + *vx_step * float(x) + *vy_step * float(y);
 
                 uint8_t pix = 0;
-                bool got = false;
-                for (int i = 0; i < nSamplers; i++) {
-                    float scale = scales[i];
-                    float vx = c[0] * scale, vy = c[1] * scale, vz = c[2] * scale;
-                    if (trySampleNB<Mode>(sampler(i), vz, vy, vx, pix)) {
-                        got = true;
-                        break;
+                // Surfaces report NaN or (0,0,0) for undefined pixels —
+                // both produce a black output pixel.
+                const bool skip = !isfinite_bitwise(c[0])
+                    || (c[0] == 0.f && c[1] == 0.f && c[2] == 0.f);
+                if (!skip) {
+                    for (int i = 0; i < nSamplers; i++) {
+                        float scale = scales[i];
+                        float vx = c[0] * scale, vy = c[1] * scale, vz = c[2] * scale;
+                        if (trySampleNB<Mode>(sampler(i), vz, vy, vx, pix)) break;
                     }
                 }
-                (void)got;
                 outRow[x] = lut[pix];
             }
         }
@@ -822,7 +823,12 @@ void sampleCompositeAdaptiveImpl(
             const cv::Vec3f* nrow = normals ? normals->ptr<cv::Vec3f>(y) : nullptr;
             for (int x=0; x<w; x++) {
                 cv::Vec3f base = crow ? crow[x] : (*origin + *vx_step*float(x) + *vy_step*float(y));
-                if (!isfinite_bitwise(base[0])) { outRow[x] = lut[0]; continue; }
+                // A surface can report NaN or (0,0,0) for "no data here" —
+                // both map to a black output pixel.
+                if (!isfinite_bitwise(base[0])
+                    || (base[0] == 0.f && base[1] == 0.f && base[2] == 0.f)) {
+                    outRow[x] = lut[0]; continue;
+                }
                 cv::Vec3f nrm = nrow ? nrow[x] : (planeNormal ? *planeNormal : cv::Vec3f(0,0,0));
                 if (nrow && !isfinite_bitwise(nrm[0])) { outRow[x] = lut[0]; continue; }
 
