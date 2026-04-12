@@ -124,7 +124,12 @@ void IOPool::updateInteractive(const std::vector<ChunkKey>& keys)
 
             auto it = shards_.find(sk);
             if (it != shards_.end()) {
-                if (it->second == ShardState::InFlight) continue;
+                // Already in flight or finished — don't re-queue. Re-fetching
+                // a finished chunk forces a redundant disk read + h265 decode
+                // per render pass; block cache evictions are handled via the
+                // blocking getBlockingBlock path on the sampler side.
+                if (it->second == ShardState::InFlight
+                    || it->second == ShardState::Done) continue;
                 it->second = ShardState::Queued;
             } else {
                 shards_[sk] = ShardState::Queued;
