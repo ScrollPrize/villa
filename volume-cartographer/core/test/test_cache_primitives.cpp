@@ -13,7 +13,7 @@
 #include "vc/core/cache/ChunkData.hpp"
 #include "vc/core/cache/CacheDebugLog.hpp"
 #include "vc/core/cache/CacheUtils.hpp"
-#include "vc/core/cache/ChunkSource.hpp"
+#include "vc/core/cache/VolumeSource.hpp"
 #include "vc/core/cache/DiskStore.hpp"
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"
@@ -22,7 +22,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-class FakeChunkSource : public vc::cache::ChunkSource {
+class FakeChunkSource : public vc::cache::VolumeSource {
 public:
     std::vector<uint8_t> fetch(const vc::cache::ChunkKey& key) override
     {

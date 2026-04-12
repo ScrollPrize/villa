@@ -1,5 +1,5 @@
 #include "vc/core/cache/BlockPipeline.hpp"
-#include "vc/core/cache/ChunkSource.hpp"
+#include "vc/core/cache/VolumeSource.hpp"
 #include "vc/core/cache/CacheDebugLog.hpp"
 #include "vc/core/cache/VcDecompressor.hpp"
 #include "vc/core/types/VcDataset.hpp"
@@ -41,7 +41,7 @@ static bool isAllZero(const uint8_t* data, size_t size) noexcept {
 
 BlockPipeline::BlockPipeline(
     Config config,
-    std::unique_ptr<ChunkSource> source,
+    std::unique_ptr<VolumeSource> source,
     DecompressFn decompress,
     std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels)
     : config_(std::move(config))
@@ -51,7 +51,7 @@ BlockPipeline::BlockPipeline(
     , ioPool_(config_.ioThreads)
     , blockCache_(BlockCache::Config{config_.blockCacheBytes})
 {
-    auto* httpSource = dynamic_cast<HttpChunkSource*>(source_.get());
+    auto* httpSource = dynamic_cast<HttpSource*>(source_.get());
     bool sharded = httpSource && httpSource->isSharded();
 
     if (sharded) {
@@ -72,7 +72,7 @@ BlockPipeline::BlockPipeline(
 
             auto* dz = (shard.level < int(diskLevels_.size()))
                 ? diskLevels_[shard.level].get() : nullptr;
-            auto* http = dynamic_cast<HttpChunkSource*>(source_.get());
+            auto* http = dynamic_cast<HttpSource*>(source_.get());
 
             bool shardMissing = false;
             if (dz) {
@@ -500,7 +500,7 @@ auto BlockPipeline::stats() const -> Stats {
             }
         }
     }
-    if (auto* http = dynamic_cast<HttpChunkSource*>(source_.get()))
+    if (auto* http = dynamic_cast<HttpSource*>(source_.get()))
         s.sharded = http->isSharded();
     if (!s.sharded) {
         for (const auto& dz : diskLevels_)
@@ -518,12 +518,12 @@ void BlockPipeline::flushPersistentState() {}
 std::unique_ptr<BlockPipeline> openFilesystemPipeline(
     VcDataset* ds, size_t maxBytes, const std::filesystem::path& datasetPath)
 {
-    FileSystemChunkSource::LevelMeta lm;
+    FileSystemSource::LevelMeta lm;
     const auto& shape = ds->shape();
     const auto& chunks = ds->defaultChunkShape();
     lm.shape = {int(shape[0]), int(shape[1]), int(shape[2])};
     lm.chunkShape = {int(chunks[0]), int(chunks[1]), int(chunks[2])};
-    auto source = std::make_unique<FileSystemChunkSource>(
+    auto source = std::make_unique<FileSystemSource>(
         datasetPath.parent_path(), ds->delimiter(), std::vector{lm});
     auto decompress = makeVcDecompressor(ds);
     BlockPipeline::Config cfg;

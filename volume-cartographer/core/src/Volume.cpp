@@ -17,7 +17,7 @@
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"
-#include "vc/core/cache/ChunkSource.hpp"
+#include "vc/core/cache/VolumeSource.hpp"
 #include "vc/core/cache/VcDecompressor.hpp"
 #include <utils/zarr.hpp>
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
@@ -286,12 +286,12 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache(
     std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels;
 
     // Build level metadata from our zarr datasets
-    std::vector<vc::cache::FileSystemChunkSource::LevelMeta> levels;
+    std::vector<vc::cache::FileSystemSource::LevelMeta> levels;
     levels.reserve(zarrDs_.size());
     for (auto& ds : zarrDs_) {
         const auto& shape = ds->shape();
         const auto& chunks = ds->defaultChunkShape();
-        vc::cache::FileSystemChunkSource::LevelMeta lm;
+        vc::cache::FileSystemSource::LevelMeta lm;
         lm.shape = {
             static_cast<int>(shape[0]),
             static_cast<int>(shape[1]),
@@ -307,9 +307,9 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache(
     std::string delimiter = zarrDs_[0]->delimiter();
 
     // Create chunk source: HTTP for remote volumes, filesystem for local
-    std::unique_ptr<vc::cache::ChunkSource> source;
+    std::unique_ptr<vc::cache::VolumeSource> source;
     if (isRemote_) {
-        auto httpSource = std::make_unique<vc::cache::HttpChunkSource>(
+        auto httpSource = std::make_unique<vc::cache::HttpSource>(
             remoteUrl_, remoteDelimiter_, std::move(levels), remoteAuth_);
         if (remoteShardConfig_.enabled) {
             httpSource->setShardConfig(remoteShardConfig_);
@@ -351,7 +351,7 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache(
                     nLevels, path_.c_str());
         }
     } else {
-        source = std::make_unique<vc::cache::FileSystemChunkSource>(
+        source = std::make_unique<vc::cache::FileSystemSource>(
             path_, delimiter, std::move(levels));
 
         // Network mount disk caching disabled — needs per-level conversion

@@ -17,9 +17,9 @@ namespace utils { class HttpClient; }
 namespace vc::cache {
 
 // Abstract interface for fetching raw compressed chunk bytes from a data source.
-class ChunkSource {
+class VolumeSource {
 public:
-    virtual ~ChunkSource() = default;
+    virtual ~VolumeSource() = default;
     [[nodiscard]] virtual std::vector<uint8_t> fetch(const ChunkKey& key) = 0;
     [[nodiscard]] virtual int numLevels() const noexcept = 0;
     [[nodiscard]] virtual std::array<int, 3> chunkShape(int level) const noexcept = 0;
@@ -27,18 +27,18 @@ public:
 };
 
 // Reads compressed chunks from a local zarr v2 directory.
-class FileSystemChunkSource : public ChunkSource {
+class FileSystemSource : public VolumeSource {
 public:
     struct LevelMeta {
         std::array<int, 3> shape;
         std::array<int, 3> chunkShape;
     };
 
-    explicit FileSystemChunkSource(
+    explicit FileSystemSource(
         const std::filesystem::path& zarrRoot,
         const std::string& delimiter = ".");
 
-    FileSystemChunkSource(
+    FileSystemSource(
         const std::filesystem::path& zarrRoot,
         const std::string& delimiter,
         std::vector<LevelMeta> levels);
@@ -60,17 +60,17 @@ private:
 struct ShardConfig;
 
 // Fetches compressed chunks from an HTTP/HTTPS zarr store via utils::HttpClient.
-class HttpChunkSource : public ChunkSource {
+class HttpSource : public VolumeSource {
 public:
-    using LevelMeta = FileSystemChunkSource::LevelMeta;
+    using LevelMeta = FileSystemSource::LevelMeta;
 
-    HttpChunkSource(
+    HttpSource(
         const std::string& baseUrl,
         const std::string& delimiter,
         std::vector<LevelMeta> levels,
         HttpAuth auth = {});
 
-    ~HttpChunkSource() override;
+    ~HttpSource() override;
 
     void setShardConfig(const ShardConfig& config);
 

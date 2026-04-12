@@ -1,4 +1,4 @@
-#include "vc/core/cache/ChunkSource.hpp"
+#include "vc/core/cache/VolumeSource.hpp"
 #include "vc/core/cache/CacheDebugLog.hpp"
 #include "vc/core/cache/CacheUtils.hpp"
 
@@ -13,7 +13,7 @@ namespace vc::cache {
 
 // --- Shared metadata helpers ---
 
-using LevelMeta = FileSystemChunkSource::LevelMeta;
+using LevelMeta = FileSystemSource::LevelMeta;
 
 static int levelsNumLevels(const std::vector<LevelMeta>& levels) noexcept
 {
@@ -37,10 +37,10 @@ static std::array<int, 3> levelsLevelShape(
 }
 
 // =============================================================================
-// FileSystemChunkSource
+// FileSystemSource
 // =============================================================================
 
-FileSystemChunkSource::FileSystemChunkSource(
+FileSystemSource::FileSystemSource(
     const std::filesystem::path& zarrRoot,
     const std::string& delimiter)
     : root_(zarrRoot), delimiter_(delimiter)
@@ -48,7 +48,7 @@ FileSystemChunkSource::FileSystemChunkSource(
     discoverLevels();
 }
 
-FileSystemChunkSource::FileSystemChunkSource(
+FileSystemSource::FileSystemSource(
     const std::filesystem::path& zarrRoot,
     const std::string& delimiter,
     std::vector<LevelMeta> levels)
@@ -56,7 +56,7 @@ FileSystemChunkSource::FileSystemChunkSource(
 {
 }
 
-void FileSystemChunkSource::discoverLevels()
+void FileSystemSource::discoverLevels()
 {
     std::vector<int> levelNums;
     for (auto& entry : std::filesystem::directory_iterator(root_)) {
@@ -99,26 +99,26 @@ void FileSystemChunkSource::discoverLevels()
     }
 }
 
-std::filesystem::path FileSystemChunkSource::chunkPath(const ChunkKey& key) const
+std::filesystem::path FileSystemSource::chunkPath(const ChunkKey& key) const
 {
     return root_ / std::to_string(key.level) / chunkFilename(key, delimiter_);
 }
 
-std::vector<uint8_t> FileSystemChunkSource::fetch(const ChunkKey& key)
+std::vector<uint8_t> FileSystemSource::fetch(const ChunkKey& key)
 {
     auto result = readFileToVector(chunkPath(key));
     return result ? std::move(*result) : std::vector<uint8_t>{};
 }
 
-int FileSystemChunkSource::numLevels() const noexcept { return levelsNumLevels(levels_); }
-std::array<int, 3> FileSystemChunkSource::chunkShape(int level) const noexcept { return levelsChunkShape(levels_, level); }
-std::array<int, 3> FileSystemChunkSource::levelShape(int level) const noexcept { return levelsLevelShape(levels_, level); }
+int FileSystemSource::numLevels() const noexcept { return levelsNumLevels(levels_); }
+std::array<int, 3> FileSystemSource::chunkShape(int level) const noexcept { return levelsChunkShape(levels_, level); }
+std::array<int, 3> FileSystemSource::levelShape(int level) const noexcept { return levelsLevelShape(levels_, level); }
 
 // =============================================================================
-// HttpChunkSource
+// HttpSource
 // =============================================================================
 
-HttpChunkSource::HttpChunkSource(
+HttpSource::HttpSource(
     const std::string& baseUrl,
     const std::string& delimiter,
     std::vector<LevelMeta> levels,
@@ -136,9 +136,9 @@ HttpChunkSource::HttpChunkSource(
     client_ = std::make_shared<utils::HttpClient>(std::move(cfg));
 }
 
-HttpChunkSource::~HttpChunkSource() = default;
+HttpSource::~HttpSource() = default;
 
-void HttpChunkSource::setShardConfig(const ShardConfig& config)
+void HttpSource::setShardConfig(const ShardConfig& config)
 {
     sharded_ = config.enabled;
     shardShape_ = config.shardShape;
@@ -152,7 +152,7 @@ void HttpChunkSource::setShardConfig(const ShardConfig& config)
     }
 }
 
-std::string HttpChunkSource::chunkUrl(const ChunkKey& key) const
+std::string HttpSource::chunkUrl(const ChunkKey& key) const
 {
     std::string url;
     url.reserve(baseUrl_.size() + 32);
@@ -168,7 +168,7 @@ std::string HttpChunkSource::chunkUrl(const ChunkKey& key) const
     return url;
 }
 
-std::string HttpChunkSource::shardUrl(const ChunkKey& key) const
+std::string HttpSource::shardUrl(const ChunkKey& key) const
 {
     int sz = key.iz / chunksPerShard_[0];
     int sy = key.iy / chunksPerShard_[1];
@@ -187,7 +187,7 @@ std::string HttpChunkSource::shardUrl(const ChunkKey& key) const
     return url;
 }
 
-int HttpChunkSource::innerChunkIndex(const ChunkKey& key) const noexcept
+int HttpSource::innerChunkIndex(const ChunkKey& key) const noexcept
 {
     int iz = key.iz % chunksPerShard_[0];
     int iy = key.iy % chunksPerShard_[1];
@@ -195,12 +195,12 @@ int HttpChunkSource::innerChunkIndex(const ChunkKey& key) const noexcept
     return (iz * chunksPerShard_[1] + iy) * chunksPerShard_[2] + ix;
 }
 
-int HttpChunkSource::totalChunksPerShard() const noexcept
+int HttpSource::totalChunksPerShard() const noexcept
 {
     return chunksPerShard_[0] * chunksPerShard_[1] * chunksPerShard_[2];
 }
 
-std::vector<uint8_t> HttpChunkSource::httpGet(const std::string& url)
+std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
 {
     auto resp = client_->get(url);
     if (!resp.ok()) return {};
@@ -212,7 +212,7 @@ std::vector<uint8_t> HttpChunkSource::httpGet(const std::string& url)
     return result;
 }
 
-std::vector<uint8_t> HttpChunkSource::fetchFromShard(const ChunkKey& key)
+std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
 {
     std::string url = shardUrl(key);
 
@@ -265,14 +265,14 @@ std::vector<uint8_t> HttpChunkSource::fetchFromShard(const ChunkKey& key)
     return {shardData->data() + offset, shardData->data() + offset + nbytes};
 }
 
-std::vector<uint8_t> HttpChunkSource::fetch(const ChunkKey& key)
+std::vector<uint8_t> HttpSource::fetch(const ChunkKey& key)
 {
     if (sharded_)
         return fetchFromShard(key);
     return httpGet(chunkUrl(key));
 }
 
-std::vector<uint8_t> HttpChunkSource::fetchWholeShard(int level, int sz, int sy, int sx)
+std::vector<uint8_t> HttpSource::fetchWholeShard(int level, int sz, int sy, int sx)
 {
     std::string url;
     url.reserve(baseUrl_.size() + 32);
@@ -288,7 +288,7 @@ std::vector<uint8_t> HttpChunkSource::fetchWholeShard(int level, int sz, int sy,
     return httpGet(url);
 }
 
-std::array<int, 3> HttpChunkSource::shardsPerAxis(int level) const noexcept
+std::array<int, 3> HttpSource::shardsPerAxis(int level) const noexcept
 {
     auto shape = levelsLevelShape(levels_, level);
     return {
@@ -298,8 +298,8 @@ std::array<int, 3> HttpChunkSource::shardsPerAxis(int level) const noexcept
     };
 }
 
-int HttpChunkSource::numLevels() const noexcept { return levelsNumLevels(levels_); }
-std::array<int, 3> HttpChunkSource::chunkShape(int level) const noexcept { return levelsChunkShape(levels_, level); }
-std::array<int, 3> HttpChunkSource::levelShape(int level) const noexcept { return levelsLevelShape(levels_, level); }
+int HttpSource::numLevels() const noexcept { return levelsNumLevels(levels_); }
+std::array<int, 3> HttpSource::chunkShape(int level) const noexcept { return levelsChunkShape(levels_, level); }
+std::array<int, 3> HttpSource::levelShape(int level) const noexcept { return levelsLevelShape(levels_, level); }
 
 }  // namespace vc::cache

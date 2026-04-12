@@ -15,7 +15,7 @@
 #include "BlockCache.hpp"
 #include "ChunkData.hpp"
 #include "ChunkKey.hpp"
-#include "ChunkSource.hpp"
+#include "VolumeSource.hpp"
 #include "IOPool.hpp"
 #include <utils/zarr.hpp>
 
@@ -39,7 +39,7 @@ public:
 
     BlockPipeline(
         Config config,
-        std::unique_ptr<ChunkSource> source,
+        std::unique_ptr<VolumeSource> source,
         DecompressFn decompress,
         std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels = {});
 
@@ -124,7 +124,7 @@ public:
 private:
     Config config_;
     std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels_;
-    std::unique_ptr<ChunkSource> source_;
+    std::unique_ptr<VolumeSource> source_;
     DecompressFn decompress_;
     IOPool ioPool_;
 
