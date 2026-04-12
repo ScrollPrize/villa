@@ -79,7 +79,7 @@ struct VolumeShape {
 // block cache only — never blocks on disk or network. Missing blocks make
 // sampleInt return 0 (black) for that voxel. Viewport-demand fetches feed
 // the cache asynchronously via BlockPipeline::fetchInteractive.
-template<typename T, int kSlots = 256>
+template<typename T, int kSlots = 1024>
 struct BlockSampler {
     static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be power of 2");
     static constexpr int kSlotMask = kSlots - 1;
@@ -121,11 +121,11 @@ struct BlockSampler {
     // Identical; kept for callers that want to be explicit about intent.
     VC_FORCE_INLINE void tryUpdateBlockNonBlocking(int bz, int by, int bx) {
         uint64_t key = packKey(bz, by, bx);
-        if (key == lastKey) return;
+        if (key == lastKey) [[likely]] return;
 
         int idx = slotIndex(bz, by, bx);
         HotSlot& slot = slots[idx];
-        if (slot.key == key) {
+        if (slot.key == key) [[likely]] {
             data = slot.data;
             lastKey = key;
             return;
@@ -640,10 +640,14 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
 
     #pragma omp parallel
     {
-        std::vector<BlockSampler<uint8_t>> samplers;
-        samplers.reserve(numLevels - desiredLevel);
-        for (int lvl = desiredLevel; lvl < numLevels; lvl++)
-            samplers.emplace_back(cache, lvl);
+        const int nSamplers = numLevels - desiredLevel;
+        std::array<std::optional<BlockSampler<uint8_t>>, 32> samplers;
+        if (nSamplers > 0) samplers[0].emplace(cache, desiredLevel);
+        auto sampler = [&](int i) -> BlockSampler<uint8_t>& {
+            if (!samplers[i].has_value())
+                samplers[i].emplace(cache, desiredLevel + i);
+            return *samplers[i];
+        };
 
         #pragma omp for schedule(dynamic, 16)
         for (int y = 0; y < h; y++) {
@@ -655,10 +659,10 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
 
                 uint8_t pix = 0;
                 bool got = false;
-                for (size_t i = 0; i < samplers.size(); i++) {
+                for (int i = 0; i < nSamplers; i++) {
                     float scale = scales[i];
                     float vx = c[0] * scale, vy = c[1] * scale, vz = c[2] * scale;
-                    if (trySampleNB<Mode>(samplers[i], vz, vy, vx, pix)) {
+                    if (trySampleNB<Mode>(sampler(i), vz, vy, vx, pix)) {
                         got = true;
                         break;
                     }
@@ -752,11 +756,19 @@ void sampleCompositeAdaptiveImpl(
 
     #pragma omp parallel
     {
-        std::vector<BlockSampler<uint8_t>> samplers;
+        // Lazy per-level samplers: construct the level-0 sampler eagerly
+        // (always used) and leave higher levels unconstructed until the
+        // adaptive fallback actually needs them. Each sampler carries a
+        // ~4KB hot slot cache; we don't want to pay that cost for levels
+        // we never touch.
         const int nSamplers = numLevels - desiredLevel;
-        samplers.reserve(nSamplers);
-        for (int lvl=desiredLevel; lvl<numLevels; lvl++)
-            samplers.emplace_back(cache, lvl);
+        std::array<std::optional<BlockSampler<uint8_t>>, 32> samplers;
+        if (nSamplers > 0) samplers[0].emplace(cache, desiredLevel);
+        auto sampler = [&](int i) -> BlockSampler<uint8_t>& {
+            if (!samplers[i].has_value())
+                samplers[i].emplace(cache, desiredLevel + i);
+            return *samplers[i];
+        };
         std::vector<float> layerVals;
         if constexpr (AMode == AccumMode2::LayerStorage) layerVals.resize(numLayers);
 
@@ -785,7 +797,7 @@ void sampleCompositeAdaptiveImpl(
                 // Pixel-level bounds precheck at level 0: if the entire
                 // z-line fits in bounds, skip all per-sample float compares.
                 // Reserves 1-voxel margin for nearest rounding.
-                const auto& sh0 = samplers[0].shape;
+                const auto& sh0 = sampler(0).shape;
                 const float endScale = scales[0];
                 const float fwx = wx * endScale, fwy = wy * endScale, fwz = wz * endScale;
                 const float tailFx = (wx + dx * float(numLayers - 1)) * endScale;
@@ -807,11 +819,11 @@ void sampleCompositeAdaptiveImpl(
                     if (fullyInBounds) {
                         // Hot path: no per-sample bounds check; no fallback.
                         // Missed block => v stays 0 (pixel currently loading).
-                        trySampleNearestUnchecked(samplers[0], wz, wy, wx, v);
+                        trySampleNearestUnchecked(*samplers[0], wz, wy, wx, v);
                     } else {
                         for (int i=0; i<nSamplers; i++) {
                             float scl = scales[i];
-                            if (trySampleNB<SMode>(samplers[i], wz*scl, wy*scl, wx*scl, v)) break;
+                            if (trySampleNB<SMode>(sampler(i), wz*scl, wy*scl, wx*scl, v)) break;
                         }
                     }
                     if constexpr (AMode == AccumMode2::Max) { mx = std::max(mx, float(v)); }
