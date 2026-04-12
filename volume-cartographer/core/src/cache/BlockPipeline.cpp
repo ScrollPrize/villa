@@ -39,6 +39,25 @@ static bool isAllZero(const uint8_t* data, size_t size) noexcept {
     return true;
 }
 
+// Check if a sharded disk array has a populated shard index entry marking
+// the inner chunk as absent (missing or zero-sentinel). Returns false if
+// the shard file doesn't exist on disk yet — in that case we haven't fetched
+// the enclosing shard, so we can't conclude the chunk is empty.
+static bool diskShardMarksChunkAbsent(utils::ZarrArray& dz, const ChunkKey& key) {
+    if (!dz.is_sharded()) return false;
+    auto idx = chunkIndices(key);
+    // Compute which shard file this chunk lives in.
+    const auto& meta = dz.metadata();
+    std::vector<size_t> shard_idx(idx.size());
+    for (size_t d = 0; d < idx.size(); ++d) {
+        auto ips = meta.sub_chunks_per_shard(d);
+        shard_idx[d] = ips ? (idx[d] / ips) : idx[d];
+    }
+    auto shardPath = dz.chunk_path(shard_idx);
+    if (!std::filesystem::exists(shardPath)) return false;
+    return !dz.inner_chunk_exists(idx);
+}
+
 // Decode a canonical h265 chunk from disk bytes. Uses the video header for
 // dims; independent of any source VcDataset.
 static ChunkDataPtr decodeCanonicalH265(const std::vector<uint8_t>& compressed) {
@@ -100,7 +119,7 @@ BlockPipeline::BlockPipeline(
         // Canonical disk tier first (remote-sourced volumes write transcoded
         // h265 chunks here; local-source volumes have no disk tier).
         if (dz) {
-            if (dz->is_sharded() && !dz->inner_chunk_exists(chunkIndices(key))) {
+            if (diskShardMarksChunkAbsent(*dz, key)) {
                 bloomAdd(key);
                 std::lock_guard lock(negativeMutex_);
                 negativeCache_.insert(key);
