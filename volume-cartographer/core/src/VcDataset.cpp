@@ -826,54 +826,31 @@ std::unique_ptr<VcDataset> createZarrDataset(
     std::int64_t fillValue)
 {
     namespace fs = std::filesystem;
-
-    // Create the directory structure
     fs::path dsPath = parentPath / name;
-    fs::create_directories(dsPath);
 
-    // Write .zarray metadata
-    utils::Json zarray;
-    zarray["zarr_format"] = 2;
-    {
-        utils::Json shapeArr = utils::Json::array();
-        for (auto s : shape) shapeArr.push_back(static_cast<uint64_t>(s));
-        zarray["shape"] = std::move(shapeArr);
-    }
-    {
-        utils::Json chunksArr = utils::Json::array();
-        for (auto c : chunks) chunksArr.push_back(static_cast<uint64_t>(c));
-        zarray["chunks"] = std::move(chunksArr);
-    }
-    zarray["dtype"] = (dtype == VcDtype::uint8) ? "|u1" : "<u2";
-    zarray["fill_value"] = fillValue;
-    zarray["order"] = "C";
-    zarray["dimension_separator"] = dimensionSeparator;
-
+    utils::ZarrMetadata meta;
+    meta.version = utils::ZarrVersion::v2;
+    meta.shape.assign(shape.begin(), shape.end());
+    meta.chunks.assign(chunks.begin(), chunks.end());
+    meta.dtype = (dtype == VcDtype::uint8) ? utils::ZarrDtype::uint8
+                                           : utils::ZarrDtype::uint16;
+    meta.fill_value = static_cast<double>(fillValue);
+    meta.dimension_separator = dimensionSeparator;
     if (compressor == "blosc") {
-        zarray["compressor"] = {
-            {"id", "blosc"},
-            {"cname", "zstd"},
-            {"clevel", 3},
-            {"shuffle", 1},
-            {"blocksize", 0}
-        };
+        meta.compressor_id = "blosc";
+        meta.compression_level = 3;
     } else if (compressor == "zstd") {
-        zarray["compressor"] = {
-            {"id", "zstd"},
-            {"level", 3}
-        };
+        meta.compressor_id = "zstd";
+        meta.compression_level = 3;
     } else if (compressor.empty() || compressor == "none") {
-        zarray["compressor"] = nullptr;
+        meta.compressor_id.clear();
     } else {
-        zarray["compressor"] = {{"id", compressor}};
+        meta.compressor_id = compressor;
     }
-    zarray["filters"] = nullptr;
 
-    std::ofstream f(dsPath / ".zarray");
-    f << zarray.dump(2) << '\n';
-    f.close();
+    // ZarrArray::create writes the .zarray file for us.
+    utils::ZarrArray::create(dsPath, meta);
 
-    // Also write .zgroup in parent if it doesn't exist
     auto zgroupPath = parentPath / ".zgroup";
     if (!fs::exists(zgroupPath)) {
         std::ofstream g(zgroupPath);
