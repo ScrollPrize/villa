@@ -144,6 +144,13 @@ def _position_refine_loss(outputs: dict, batch: dict, *, loss_type: str) -> Tens
     return _masked_mean(per_token, batch["target_supervision_mask"])
 
 
+def _soft_geometry_xyz(outputs: dict, *, include_refine_residual: bool) -> Tensor:
+    pred_xyz_soft = outputs["pred_xyz_soft"]
+    if bool(include_refine_residual):
+        return pred_xyz_soft
+    return pred_xyz_soft - outputs["pred_refine_residual"]
+
+
 def _sequence_to_grid_torch(sequence: Tensor, *, grid_shape: tuple[int, int], direction: str) -> Tensor:
     h, w = int(grid_shape[0]), int(grid_shape[1])
     expected = int(h * w)
@@ -188,9 +195,7 @@ def _geometry_metric_loss(
     if str(loss_type) != "huber":
         raise ValueError(f"Unsupported geometry_metric_loss={loss_type!r}")
 
-    pred_xyz_soft = outputs["pred_xyz_soft"]
-    if not bool(include_refine_residual):
-        pred_xyz_soft = pred_xyz_soft - outputs["pred_refine_residual"]
+    pred_xyz_soft = _soft_geometry_xyz(outputs, include_refine_residual=include_refine_residual)
 
     target_xyz = batch["target_xyz"]
     target_valid_mask = batch["target_valid_mask"]
@@ -219,6 +224,82 @@ def _geometry_metric_loss(
         target_gram = _quad_gram_entries(target_grid)
         per_quad = F.smooth_l1_loss(pred_gram, target_gram, reduction="none").mean(dim=-1)
         losses.append(_masked_mean(per_quad, quad_mask))
+
+    if not losses:
+        return pred_xyz_soft.new_zeros(())
+    return torch.stack(losses).mean()
+
+
+def _triangle_gram_matrix(p0: Tensor, p1: Tensor, p2: Tensor) -> Tensor:
+    e1 = p1 - p0
+    e2 = p2 - p0
+    g11 = (e1 * e1).sum(dim=-1)
+    g12 = (e1 * e2).sum(dim=-1)
+    g22 = (e2 * e2).sum(dim=-1)
+    row0 = torch.stack([g11, g12], dim=-1)
+    row1 = torch.stack([g12, g22], dim=-1)
+    return torch.stack([row0, row1], dim=-2)
+
+
+def _symmetric_dirichlet_from_gram(pred_gram: Tensor, target_gram: Tensor, *, eps: float = 1e-4) -> Tensor:
+    eye = torch.eye(2, device=pred_gram.device, dtype=pred_gram.dtype).view(1, 1, 2, 2)
+    pred_reg = pred_gram + eps * eye
+    target_reg = target_gram + eps * eye
+    forward = torch.linalg.solve(target_reg, pred_reg)
+    backward = torch.linalg.solve(pred_reg, target_reg)
+    forward_trace = torch.diagonal(forward, dim1=-2, dim2=-1).sum(dim=-1)
+    backward_trace = torch.diagonal(backward, dim1=-2, dim2=-1).sum(dim=-1)
+    energy = 0.25 * (forward_trace + backward_trace) - 1.0
+    return torch.clamp_min(energy, 0.0)
+
+
+def _geometry_sd_loss(
+    outputs: dict,
+    batch: dict,
+    *,
+    include_refine_residual: bool,
+) -> Tensor:
+    pred_xyz_soft = _soft_geometry_xyz(outputs, include_refine_residual=include_refine_residual)
+    target_xyz = batch["target_xyz"]
+    target_valid_mask = batch["target_valid_mask"]
+    target_lengths = batch["target_lengths"]
+    losses = []
+    for batch_idx, direction in enumerate(batch["direction"]):
+        target_len = int(target_lengths[batch_idx].item())
+        if target_len <= 0:
+            continue
+        grid_shape = tuple(int(v) for v in batch["target_grid_shape"][batch_idx].tolist())
+        if min(grid_shape) < 2:
+            continue
+
+        pred_grid = _sequence_to_grid_torch(pred_xyz_soft[batch_idx, :target_len], grid_shape=grid_shape, direction=direction)
+        target_grid = _sequence_to_grid_torch(target_xyz[batch_idx, :target_len], grid_shape=grid_shape, direction=direction)
+        valid_grid = _sequence_to_grid_torch(
+            target_valid_mask[batch_idx, :target_len],
+            grid_shape=grid_shape,
+            direction=direction,
+        ).bool()
+
+        p00 = pred_grid[:-1, :-1, :]
+        p01 = pred_grid[:-1, 1:, :]
+        p10 = pred_grid[1:, :-1, :]
+        p11 = pred_grid[1:, 1:, :]
+        t00 = target_grid[:-1, :-1, :]
+        t01 = target_grid[:-1, 1:, :]
+        t10 = target_grid[1:, :-1, :]
+        t11 = target_grid[1:, 1:, :]
+
+        tri_a_mask = valid_grid[:-1, :-1] & valid_grid[:-1, 1:] & valid_grid[1:, :-1]
+        tri_b_mask = valid_grid[1:, 1:] & valid_grid[1:, :-1] & valid_grid[:-1, 1:]
+
+        if bool(tri_a_mask.any()):
+            pred_gram_a = _triangle_gram_matrix(p00, p01, p10)
+            target_gram_a = _triangle_gram_matrix(t00, t01, t10)
+            losses.append(_masked_mean(_symmetric_dirichlet_from_gram(pred_gram_a, target_gram_a), tri_a_mask))
+        if bool(tri_b_mask.any()):
+            pred_gram_b = _triangle_gram_matrix(p11, p10, p01)
+            target_gram_b = _triangle_gram_matrix(t11, t10, t01)
+            losses.append(_masked_mean(_symmetric_dirichlet_from_gram(pred_gram_b, target_gram_b), tri_b_mask))
 
     if not losses:
         return pred_xyz_soft.new_zeros(())
@@ -259,6 +340,7 @@ def compute_autoreg_mesh_losses(
     position_refine_loss_type: str = "huber",
     geometry_metric_weight_active: float = 0.0,
     geometry_metric_loss_type: str = "huber",
+    geometry_sd_weight_active: float = 0.0,
     distance_aware_coarse_targets_enabled: bool = True,
     distance_aware_coarse_target_radius: int = 1,
     distance_aware_coarse_target_sigma: float = 1.0,
@@ -291,6 +373,15 @@ def compute_autoreg_mesh_losses(
         )
         total_loss = total_loss + float(geometry_metric_weight_active) * geometry_metric_loss
 
+    geometry_sd_loss = total_loss.new_zeros(())
+    if float(geometry_sd_weight_active) > 0.0:
+        geometry_sd_loss = _geometry_sd_loss(
+            outputs,
+            batch,
+            include_refine_residual=float(position_refine_weight_active) > 0.0,
+        )
+        total_loss = total_loss + float(geometry_sd_weight_active) * geometry_sd_loss
+
     occupancy_metric = total_loss.new_zeros(())
     if float(occupancy_loss_weight) > 0.0:
         # This metric is intentionally detached/non-differentiable; keep it out
@@ -309,5 +400,7 @@ def compute_autoreg_mesh_losses(
         "refine_loss_weight_active": total_loss.new_tensor(float(position_refine_weight_active)),
         "geometry_metric_loss": geometry_metric_loss,
         "geometry_metric_weight_active": total_loss.new_tensor(float(geometry_metric_weight_active)),
+        "geometry_sd_loss": geometry_sd_loss,
+        "geometry_sd_weight_active": total_loss.new_tensor(float(geometry_sd_weight_active)),
         "occupancy_metric": occupancy_metric,
     }

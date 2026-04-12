@@ -18,12 +18,18 @@ from vesuvius.neural_tracing.autoreg_mesh.infer import infer_autoreg_mesh
 from vesuvius.neural_tracing.autoreg_mesh.losses import (
     _build_distance_aware_coarse_targets,
     _geometry_metric_loss,
+    _geometry_sd_loss,
     _sequence_to_grid_torch,
     compute_autoreg_mesh_losses,
 )
 from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
 from vesuvius.neural_tracing.autoreg_mesh.serialization import deserialize_continuation_grid, serialize_split_conditioning_example
-from vesuvius.neural_tracing.autoreg_mesh.train import _geometry_metric_weight_active, _restrict_dataset_samples, run_autoreg_mesh_training
+from vesuvius.neural_tracing.autoreg_mesh.train import (
+    _geometry_metric_weight_active,
+    _geometry_sd_weight_active,
+    _restrict_dataset_samples,
+    run_autoreg_mesh_training,
+)
 from vesuvius.neural_tracing.datasets.triplet_resampling import choose_replacement_index
 
 
@@ -306,6 +312,7 @@ def test_autoreg_mesh_model_forward_and_losses_are_finite(tmp_path: Path) -> Non
     assert "occupancy_metric" in losses
     assert "coarse_excess_nll" in losses
     assert "geometry_metric_loss" in losses
+    assert "geometry_sd_loss" in losses
 
 
 def test_autoreg_mesh_smoke_training_runs_two_steps(tmp_path: Path) -> None:
@@ -595,6 +602,34 @@ def test_geometry_metric_loss_is_near_zero_on_isometric_copy_and_higher_on_stret
     assert stretched_loss.item() > translated_loss.item()
 
 
+def test_geometry_sd_loss_is_near_zero_on_isometric_copy_and_higher_on_stretch() -> None:
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    translated = batch["target_xyz"] + torch.tensor([3.0, -2.0, 1.0], dtype=torch.float32).view(1, 1, 3)
+    stretched = batch["target_xyz"].clone()
+    stretched[..., 1] = stretched[..., 1] * 1.5
+
+    zero_like = torch.zeros_like(batch["target_xyz"])
+    exact_loss = _geometry_sd_loss(
+        {"pred_xyz_soft": batch["target_xyz"].clone(), "pred_refine_residual": zero_like},
+        batch,
+        include_refine_residual=False,
+    )
+    translated_loss = _geometry_sd_loss(
+        {"pred_xyz_soft": translated, "pred_refine_residual": zero_like},
+        batch,
+        include_refine_residual=False,
+    )
+    stretched_loss = _geometry_sd_loss(
+        {"pred_xyz_soft": stretched, "pred_refine_residual": zero_like},
+        batch,
+        include_refine_residual=False,
+    )
+
+    assert exact_loss.item() == pytest.approx(0.0, abs=1e-6)
+    assert translated_loss.item() == pytest.approx(0.0, abs=1e-6)
+    assert stretched_loss.item() > translated_loss.item()
+
+
 def test_invalid_target_positions_are_masked_from_loss(tmp_path: Path) -> None:
     checkpoint = tmp_path / "tiny_dinovol.pt"
     _write_local_guide_checkpoint(checkpoint)
@@ -684,6 +719,23 @@ def test_geometry_metric_weight_activates_after_start_step(tmp_path: Path) -> No
     assert "geometry_metric_loss" in result["history"][1]
 
 
+def test_geometry_sd_weight_activates_after_start_step(tmp_path: Path) -> None:
+    config = _make_cached_token_config()
+    config["out_dir"] = str(tmp_path / "runs_geometry_sd")
+    config["geometry_sd_enabled"] = True
+    config["geometry_sd_weight"] = 0.005
+    config["geometry_sd_start_step"] = 1
+    dataset = _make_training_dataset()
+
+    result = run_autoreg_mesh_training(config, dataset=dataset, device="cpu", max_steps=2)
+
+    assert _geometry_sd_weight_active(config, global_step=0) == pytest.approx(0.0)
+    assert _geometry_sd_weight_active(config, global_step=1) == pytest.approx(0.005)
+    assert result["history"][0]["geometry_sd_weight_active"] == pytest.approx(0.0)
+    assert result["history"][1]["geometry_sd_weight_active"] == pytest.approx(0.005)
+    assert "geometry_sd_loss" in result["history"][1]
+
+
 def test_offset_loss_is_gated_by_active_weight(tmp_path: Path) -> None:
     checkpoint = tmp_path / "tiny_dinovol.pt"
     _write_local_guide_checkpoint(checkpoint)
@@ -749,6 +801,9 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["geometry_metric_enabled"] is True
     assert validated["geometry_metric_weight"] == pytest.approx(0.01)
     assert validated["geometry_metric_start_step"] == 2000
+    assert validated["geometry_sd_enabled"] is True
+    assert validated["geometry_sd_weight"] == pytest.approx(0.005)
+    assert validated["geometry_sd_start_step"] == 2000
     assert validated["distance_aware_coarse_targets_enabled"] is True
     assert validated["distance_aware_coarse_target_radius"] == 1
     assert validated["distance_aware_coarse_target_sigma"] == pytest.approx(1.0)
@@ -870,6 +925,9 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     assert result["geometry_metric_enabled"] is True
     assert result["geometry_metric_weight"] == pytest.approx(0.01)
     assert result["geometry_metric_start_step"] == 2000
+    assert result["geometry_sd_enabled"] is True
+    assert result["geometry_sd_weight"] == pytest.approx(0.005)
+    assert result["geometry_sd_start_step"] == 2000
     assert result["distance_aware_coarse_targets_enabled"] is True
     assert result["distance_aware_coarse_target_radius"] == 1
     assert result["distance_aware_coarse_target_sigma"] == pytest.approx(1.0)
