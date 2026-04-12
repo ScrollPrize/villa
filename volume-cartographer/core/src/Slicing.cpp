@@ -853,14 +853,19 @@ void sampleCompositeAdaptiveImpl(
 
                 for (int li=0; li<numLayers; li++) {
                     uint8_t v = 0;
+                    bool got = false;
                     if (fullyInBounds) {
-                        // Hot path: no per-sample bounds check; no fallback.
-                        // Scale world coords into the level-0-sampler's
+                        // Hot path: skip per-sample bounds check. Scale
+                        // world coords into the desiredLevel sampler's
                         // space (scales[0] = 1/2^desiredLevel).
-                        // Missed block => v stays 0 (pixel currently loading).
-                        trySampleNearestUnchecked(*samplers[0],
+                        got = trySampleNearestUnchecked(*samplers[0],
                             wz * endScale, wy * endScale, wx * endScale, v);
-                    } else {
+                    }
+                    if (!got) {
+                        // Fallback: either we're near a boundary or the
+                        // desired-level block isn't resident yet. Walk the
+                        // fallback chain from finest to coarsest — adaptive
+                        // sampling fills in from whichever level is ready.
                         for (int i=0; i<nSamplers; i++) {
                             float scl = scales[i];
                             if (trySampleNB<SMode>(sampler(i), wz*scl, wy*scl, wx*scl, v)) break;
