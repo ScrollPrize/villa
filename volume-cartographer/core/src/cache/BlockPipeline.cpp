@@ -324,7 +324,7 @@ ChunkDataPtr BlockPipeline::fetchChunkBlocking(const ChunkKey& key) {
 
     // Canonical disk tier first.
     if (dz) {
-        if (dz->is_sharded() && !dz->inner_chunk_exists(chunkIndices(key))) {
+        if (diskShardMarksChunkAbsent(*dz, key)) {
             bloomAdd(key);
             std::lock_guard lock(negativeMutex_);
             negativeCache_.insert(key);
@@ -444,11 +444,12 @@ void BlockPipeline::loadResidentLevel(int level) {
     residentLevel_ = level;
     int nScales = numLevels();
     if (level < 0 || level >= nScales) return;
+    // Canonical 128^3 grid: iterate over canonical chunks, not source chunks.
     auto shape = levelShape(level);
-    auto chunks = chunkShape(level);
-    int gridZ = (shape[0] + chunks[0] - 1) / chunks[0];
-    int gridY = (shape[1] + chunks[1] - 1) / chunks[1];
-    int gridX = (shape[2] + chunks[2] - 1) / chunks[2];
+    constexpr int C = 128;
+    int gridZ = (shape[0] + C - 1) / C;
+    int gridY = (shape[1] + C - 1) / C;
+    int gridX = (shape[2] + C - 1) / C;
     for (int iz = 0; iz < gridZ; ++iz)
         for (int iy = 0; iy < gridY; ++iy)
             for (int ix = 0; ix < gridX; ++ix) {

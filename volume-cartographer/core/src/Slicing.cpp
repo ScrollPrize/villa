@@ -580,8 +580,7 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
 
         #pragma omp for schedule(dynamic, 16)
         for (int y = 0; y < h; y++) {
-            uint32_t* outRow = reinterpret_cast<uint32_t*>(
-                reinterpret_cast<char*>(outBuf) + size_t(y) * outStride);
+            uint32_t* outRow = outBuf + size_t(y) * size_t(outStride);
             for (int x = 0; x < w; x++) {
                 cv::Vec3f c;
                 if (coords) c = (*coords)(y, x);
@@ -804,8 +803,7 @@ void samplePlaneCompositeARGB32(
         std::vector<float> layerVals(numLayers);
         #pragma omp for schedule(dynamic, 16)
         for (int y = 0; y < h; y++) {
-            uint32_t* outRow = reinterpret_cast<uint32_t*>(
-                reinterpret_cast<char*>(outBuf) + size_t(y) * outStride);
+            uint32_t* outRow = outBuf + size_t(y) * size_t(outStride);
             for (int x = 0; x < w; x++) {
                 cv::Vec3f base = origin + vx_step * float(x) + vy_step * float(y);
 
