@@ -83,6 +83,15 @@ static std::vector<std::byte> encodeCanonicalH265(const ChunkData& chunk) {
         vp);
 }
 
+// Does `bytes` already carry the canonical VC3D/h265 magic header?
+// If so we can skip the decode+re-encode cycle and passthrough the bytes
+// to the canonical disk directly.
+static bool bytesAreCanonicalH265(const std::vector<uint8_t>& bytes) {
+    return utils::is_video_compressed(
+        std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(bytes.data()), bytes.size()));
+}
+
 BlockPipeline::BlockPipeline(
     Config config,
     std::unique_ptr<VolumeSource> source,
@@ -103,14 +112,18 @@ BlockPipeline::BlockPipeline(
         return {key.level, key.iz, key.iy, key.ix};
     });
 
+    // Fetch func does all the work on an IOPool worker thread: source fetch,
+    // decode (exactly once with the source codec or canonical h265), insert
+    // into the block cache, and — for remote-sourced volumes — h265-encode
+    // (exactly once) and write to canonical disk. Returns an empty result
+    // so the completion callback is just for arrival notifications.
     ioPool_.setFetchFunc([this](const ShardKey& shard) -> IOPool::FetchResult {
         ChunkKey key{shard.level, shard.sz, shard.sy, shard.sx};
         if (isNegativeCached(key)) return {};
 
         auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
+        ChunkDataPtr decoded;
 
-        // Canonical disk tier first (remote-sourced volumes write transcoded
-        // h265 chunks here; local-source volumes have no disk tier).
         if (dz) {
             if (diskShardMarksChunkEmpty(*dz, key)) {
                 bloomAdd(key);
@@ -124,80 +137,63 @@ BlockPipeline::BlockPipeline(
                 std::vector<uint8_t> buf(
                     reinterpret_cast<const uint8_t*>(diskBytes->data()),
                     reinterpret_cast<const uint8_t*>(diskBytes->data() + diskBytes->size()));
-                return {{key, std::move(buf)}};
+                decoded = decodeCanonicalH265(buf);
             }
         }
 
-        if (!source_) return {};
-
-        // Local source (no disk tier): pass source bytes through; the
-        // completion callback decompresses with the source codec.
-        if (!dz) {
-            std::vector<uint8_t> compressed;
-            try { compressed = source_->fetch(key); } catch (...) { return {}; }
-            if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
-                bloomAdd(key);
-                std::lock_guard lock(negativeMutex_);
-                negativeCache_.insert(key);
-                return {};
+        if (!decoded) {
+            if (!source_) return {};
+            if (!dz) {
+                // Local source: no disk tier, decode straight from source bytes.
+                std::vector<uint8_t> compressed;
+                try { compressed = source_->fetch(key); } catch (...) { return {}; }
+                if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
+                    bloomAdd(key);
+                    std::lock_guard lock(negativeMutex_);
+                    negativeCache_.insert(key);
+                    return {};
+                }
+                statIceFetches_.fetch_add(1, std::memory_order_relaxed);
+                if (decompress_) decoded = decompress_(compressed, key);
+                if (!decoded) return {};
+            } else {
+                // Remote source + canonical disk. Assemble canonical 128^3 from
+                // source (decoding once with the source codec), encode once to
+                // h265, write the h265 bytes to disk. Keep the decoded buffer
+                // for block-cache population below.
+                decoded = assembleCanonicalChunk(key);
+                if (!decoded) {
+                    auto* http = dynamic_cast<HttpSource*>(source_.get());
+                    if (!http || !http->hadTransientError()) {
+                        bloomAdd(key);
+                        std::lock_guard lock(negativeMutex_);
+                        negativeCache_.insert(key);
+                        if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
+                    }
+                    return {};
+                }
+                statIceFetches_.fetch_add(1, std::memory_order_relaxed);
+                auto h265 = encodeCanonicalH265(*decoded);
+                zarrWriteChunk(*dz, key,
+                    reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
+                statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
             }
-            statIceFetches_.fetch_add(1, std::memory_order_relaxed);
-            return {{key, std::move(compressed)}};
         }
 
-        // Remote source with canonical disk tier. Assemble the canonical 128^3
-        // chunk (rechunking if source granularity differs), h265-encode, write
-        // to canonical disk, return canonical h265 bytes.
-        auto data = assembleCanonicalChunk(key);
-        if (!data) {
-            // If the source is having transient HTTP trouble (auth, network),
-            // leave it unmarked so a later session has a chance to fetch.
-            auto* http = dynamic_cast<HttpSource*>(source_.get());
-            if (!http || !http->hadTransientError()) {
-                bloomAdd(key);
-                std::lock_guard lock(negativeMutex_);
-                negativeCache_.insert(key);
-                if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
+        if (decoded) {
+            insertChunkAsBlocks(key, *decoded, key.level == residentLevel_);
+            if (!chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
+                std::lock_guard cbLock(callbackMutex_);
+                for (const auto& [id, cb] : chunkReadyListeners_)
+                    cb(key);
             }
-            return {};
         }
-        statIceFetches_.fetch_add(1, std::memory_order_relaxed);
-
-        auto h265 = encodeCanonicalH265(*data);
-        zarrWriteChunk(*dz, key,
-            reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
-        statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
-
-        std::vector<uint8_t> out(h265.size());
-        std::memcpy(out.data(), h265.data(), h265.size());
-        return {{key, std::move(out)}};
+        return {};
     });
 
     ioPool_.setCompletionCallback(
-        [this](IOPool::FetchResult&& chunks) {
-            bool anyArrived = false;
-            ChunkKey lastKey{};
-            for (auto& [key, compressed] : chunks) {
-                if (compressed.empty()) continue;
-
-                // For volumes with a canonical disk tier, the fetch func always
-                // returns canonical h265 (either read from disk or freshly
-                // transcoded). For local-source volumes there is no disk tier
-                // and bytes are raw source-codec.
-                ChunkDataPtr data = decodeCanonicalH265(compressed);
-                if (!data && decompress_) data = decompress_(compressed, key);
-                if (!data) continue;
-
-                insertChunkAsBlocks(key, *data, key.level == residentLevel_);
-                anyArrived = true;
-                lastKey = key;
-            }
-
-            if (anyArrived && !chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
-                std::lock_guard cbLock(callbackMutex_);
-                for (const auto& [id, cb] : chunkReadyListeners_)
-                    cb(lastKey);
-            }
+        [](IOPool::FetchResult&&) {
+            // Work already done inside the fetch func.
         });
 
     ioPool_.start();

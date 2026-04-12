@@ -16,6 +16,7 @@
 
 #include <boost/program_options.hpp>
 #include "utils/Json.hpp"
+#include <utils/zarr.hpp>
 #include <opencv2/core/types.hpp>
 #include <opencv2/imgcodecs.hpp>
 
@@ -983,11 +984,10 @@ static void run_vis_normals_zarr_as_ply(const fs::path& zarr_root, const fs::pat
     // Determine delimiter from x/0/.zarray (fallback "." to match other tools).
     std::string delim = ".";
     {
-        const fs::path zarray_path = zarr_root / "x" / "0" / ".zarray";
-        if (fs::exists(zarray_path)) {
-            utils::Json j = utils::Json::parse_file(zarray_path);
-            delim = j.value("dimension_separator", std::string("."));
-        }
+        try {
+            auto meta = utils::ZarrArray::open(zarr_root / "x" / "0").metadata();
+            if (!meta.dimension_separator.empty()) delim = meta.dimension_separator;
+        } catch (...) {}
     }
 
     // Optional metadata written by vc_ngrids --output-zarr.
@@ -1099,11 +1099,10 @@ static void run_vis_normals_zarr_on_surf_edges_as_ply(
     // Determine delimiter from x/0/.zarray (fallback ".").
     std::string delim = ".";
     {
-        const fs::path zarray_path = zarr_root / "x" / "0" / ".zarray";
-        if (fs::exists(zarray_path)) {
-            utils::Json j = utils::Json::parse_file(zarray_path);
-            delim = j.value("dimension_separator", std::string("."));
-        }
+        try {
+            auto meta = utils::ZarrArray::open(zarr_root / "x" / "0").metadata();
+            if (!meta.dimension_separator.empty()) delim = meta.dimension_separator;
+        } catch (...) {}
     }
 
     // Optional metadata written by vc_ngrids --output-zarr.
@@ -1376,11 +1375,10 @@ static void run_align_normals_zarr(
     // Determine delimiter from x/0/.zarray (fallback "." to match other tools).
     std::string delim = ".";
     {
-        const fs::path zarray_path = zarr_root / "x" / "0" / ".zarray";
-        if (fs::exists(zarray_path)) {
-            utils::Json j = utils::Json::parse_file(zarray_path);
-            delim = j.value("dimension_separator", std::string("."));
-        }
+        try {
+            auto meta = utils::ZarrArray::open(zarr_root / "x" / "0").metadata();
+            if (!meta.dimension_separator.empty()) delim = meta.dimension_separator;
+        } catch (...) {}
     }
 
     // Optional origin/step from attrs (if present) so crop can be applied in voxel coords.
@@ -1420,15 +1418,18 @@ static void run_align_normals_zarr(
 
     // Assert fill_value is 128 (neutral "no normal"); vc_ngrids relies on this convention.
     auto assert_fill_value_128 = [&](const char* axis) {
-        const fs::path zarray_path = zarr_root / axis / "0" / ".zarray";
-        if (!fs::exists(zarray_path)) {
-            throw std::runtime_error(std::string("Missing ") + axis + "/0/.zarray under normals zarr root: " + zarr_root.string());
+        utils::ZarrMetadata meta;
+        try {
+            meta = utils::ZarrArray::open(zarr_root / axis / "0").metadata();
+        } catch (const std::exception& e) {
+            throw std::runtime_error(std::string("Failed to open ") + axis +
+                "/0 zarr under normals zarr root " + zarr_root.string() + ": " + e.what());
         }
-        utils::Json j = utils::Json::parse_file(zarray_path);
-        if (!j.contains("fill_value")) {
-            throw std::runtime_error(std::string("Missing fill_value in ") + axis + "/0/.zarray under normals zarr root: " + zarr_root.string());
+        if (!meta.fill_value.has_value()) {
+            throw std::runtime_error(std::string("Missing fill_value in ") + axis +
+                "/0 zarr under normals zarr root: " + zarr_root.string());
         }
-        const int fv = j["fill_value"].get_int();
+        const int fv = int(*meta.fill_value);
         if (fv != 128) {
             std::stringstream msg;
             msg << "Normals zarr has unexpected fill_value=" << fv

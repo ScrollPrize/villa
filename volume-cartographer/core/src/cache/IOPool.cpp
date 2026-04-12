@@ -97,41 +97,32 @@ void IOPool::updateInteractive(const std::vector<ChunkKey>& keys)
         std::lock_guard lock(mutex_);
         if (shutdown_) return;
 
-        std::unordered_set<ShardKey, ShardKeyHash> wanted;
-        wanted.reserve(keys.size());
-        for (const auto& key : keys)
-            wanted.insert(shardMapper_(key));
-
-        // Drop queued shards no longer wanted; keep queued shards still wanted.
-        std::deque<ShardKey> newQueue;
+        // New-viewport semantics: the most-recent fetchInteractive call
+        // reflects what the user is looking at *right now*. Drop the
+        // currently-queued backlog entirely (in-flight work keeps running)
+        // and prepend the new keys in order so they're processed first.
         for (const auto& sk : queue_) {
             auto it = shards_.find(sk);
-            if (it == shards_.end() || it->second != ShardState::Queued)
-                continue;
-            if (wanted.contains(sk)) {
-                newQueue.push_back(sk);
-                wanted.erase(sk);
-            } else {
+            if (it != shards_.end() && it->second == ShardState::Queued)
                 shards_.erase(it);
-            }
         }
+        queue_.clear();
 
-        // Remaining wanted shards: add fresh (skip in-flight/done).
-        for (const auto& sk : wanted) {
+        std::unordered_set<ShardKey, ShardKeyHash> seen;
+        seen.reserve(keys.size());
+        for (const auto& key : keys) {
+            ShardKey sk = shardMapper_(key);
+            if (!seen.insert(sk).second) continue;  // dedupe
+
             auto it = shards_.find(sk);
             if (it != shards_.end()) {
-                if (it->second == ShardState::InFlight)
-                    continue;
-                if (it->second == ShardState::Done) {
-                    it->second = ShardState::Queued;
-                }
+                if (it->second == ShardState::InFlight) continue;
+                it->second = ShardState::Queued;
             } else {
                 shards_[sk] = ShardState::Queued;
             }
-            newQueue.push_back(sk);
+            queue_.push_back(sk);
         }
-
-        queue_ = std::move(newQueue);
     }
     cv_.notify_all();
 }
