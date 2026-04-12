@@ -288,7 +288,8 @@ void appendChunksForRegion(BlockPipeline& cache, int level,
 void prefetchRegion(BlockPipeline& cache, int level,
                     float minVx, float minVy, float minVz,
                     float maxVx, float maxVy, float maxVz) {
-    std::vector<vc::cache::ChunkKey> keys;
+    thread_local std::vector<vc::cache::ChunkKey> keys;
+    keys.clear();
     appendChunksForRegion(cache, level, minVx, minVy, minVz,
                           maxVx, maxVy, maxVz, keys);
     if (!keys.empty()) cache.fetchInteractive(keys);
@@ -622,7 +623,9 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
     // everything into one fetchInteractive call — the IOPool's queue
     // rebuild is O(N) and we'd otherwise pay it once per level.
     auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
-    std::vector<vc::cache::ChunkKey> prefetchKeys;
+    // Thread-local to avoid per-frame alloc/free.
+    thread_local std::vector<vc::cache::ChunkKey> prefetchKeys;
+    prefetchKeys.clear();
     if (coords) {
         // Compute world-space bbox once, subsample like the composite path.
         float minVx = FLT_MAX, minVy = FLT_MAX, minVz = FLT_MAX;
@@ -679,10 +682,20 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
             return *samplers[i];
         };
 
-        #pragma omp for schedule(dynamic, 16)
-        for (int y = 0; y < h; y++) {
+        // Tile-major iteration: see note in sampleCompositeAdaptiveImpl.
+        constexpr int kTile = 32;
+        const int nTilesY = (h + kTile - 1) / kTile;
+        const int nTilesX = (w + kTile - 1) / kTile;
+        #pragma omp for schedule(dynamic, 1) collapse(2)
+        for (int tyi = 0; tyi < nTilesY; tyi++) {
+        for (int txi = 0; txi < nTilesX; txi++) {
+            const int ty = tyi * kTile;
+            const int tx = txi * kTile;
+            const int yEnd = std::min(ty + kTile, h);
+            const int xEnd = std::min(tx + kTile, w);
+        for (int y = ty; y < yEnd; y++) {
             uint32_t* outRow = outBuf + size_t(y) * size_t(outStride);
-            for (int x = 0; x < w; x++) {
+            for (int x = tx; x < xEnd; x++) {
                 cv::Vec3f c;
                 if (coords) c = (*coords)(y, x);
                 else        c = *origin + *vx_step * float(x) + *vy_step * float(y);
@@ -702,6 +715,8 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
                 outRow[x] = lut[pix];
             }
         }
+        }  // tile x
+        }  // tile y
     }
 }
 
@@ -766,7 +781,8 @@ void sampleCompositeAdaptiveImpl(
             }
         }
         if (maxVx >= minVx) {
-            std::vector<vc::cache::ChunkKey> keys;
+            thread_local std::vector<vc::cache::ChunkKey> keys;
+            keys.clear();
             for (int lvl=desiredLevel; lvl<numLevels; lvl++) {
                 float s = levelScale(lvl);
                 appendChunksForRegion(cache, lvl,
@@ -780,7 +796,8 @@ void sampleCompositeAdaptiveImpl(
         float minVx=std::min(p0[0],p1[0]), maxVx=std::max(p0[0],p1[0]);
         float minVy=std::min(p0[1],p1[1]), maxVy=std::max(p0[1],p1[1]);
         float minVz=std::min(p0[2],p1[2]), maxVz=std::max(p0[2],p1[2]);
-        std::vector<vc::cache::ChunkKey> keys;
+        thread_local std::vector<vc::cache::ChunkKey> keys;
+        keys.clear();
         for (int lvl=desiredLevel; lvl<numLevels; lvl++) {
             float s = levelScale(lvl);
             appendChunksForRegion(cache, lvl,
@@ -816,12 +833,25 @@ void sampleCompositeAdaptiveImpl(
         std::vector<float> layerVals;
         if constexpr (AMode == AccumMode2::LayerStorage) layerVals.resize(numLayers);
 
-        #pragma omp for schedule(dynamic, 16)
-        for (int y=0; y<h; y++) {
+        // Tile the output into 32x32 blocks. Most pixels in a tile map
+        // into the same 1-4 level-0 blocks, so the sampler's slot cache
+        // stays hot — vs row-major which touches ~120 blocks across a
+        // row before cycling back to the same y-row.
+        constexpr int kTile = 32;
+        const int nTilesY = (h + kTile - 1) / kTile;
+        const int nTilesX = (w + kTile - 1) / kTile;
+        #pragma omp for schedule(dynamic, 1) collapse(2)
+        for (int tyi = 0; tyi < nTilesY; tyi++) {
+        for (int txi = 0; txi < nTilesX; txi++) {
+            const int ty = tyi * kTile;
+            const int tx = txi * kTile;
+            const int yEnd = std::min(ty + kTile, h);
+            const int xEnd = std::min(tx + kTile, w);
+        for (int y=ty; y<yEnd; y++) {
             uint32_t* outRow = outBuf + size_t(y) * size_t(outStride);
             const cv::Vec3f* crow = coords ? coords->ptr<cv::Vec3f>(y) : nullptr;
             const cv::Vec3f* nrow = normals ? normals->ptr<cv::Vec3f>(y) : nullptr;
-            for (int x=0; x<w; x++) {
+            for (int x=tx; x<xEnd; x++) {
                 cv::Vec3f base = crow ? crow[x] : (*origin + *vx_step*float(x) + *vy_step*float(y));
                 // A surface can report NaN or (0,0,0) for "no data here" —
                 // both map to a black output pixel.
@@ -920,6 +950,8 @@ void sampleCompositeAdaptiveImpl(
                 outRow[x] = lut[uint8_t(val)];
             }
         }
+        }  // tile x
+        }  // tile y
     }
 }
 

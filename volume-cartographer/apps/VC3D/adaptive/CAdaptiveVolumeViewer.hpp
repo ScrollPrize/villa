@@ -274,6 +274,19 @@ private:
     float _windowLow = 0.0f;
     float _windowHigh = 255.0f;
     std::string _baseColormapId;
+
+    // LUT cache: rebuild only when inputs change.
+    std::array<uint32_t, 256> _cachedLut{};
+    float _cachedWindowLow = -1.f;
+    float _cachedWindowHigh = -1.f;
+    std::string _cachedColormapId;
+    uint8_t _cachedIsoCutoff = 255;  // force first-build mismatch
+
+    // Stretch post-pass: cached min/max reused next frame so static views
+    // render in one pass. A camera change invalidates via _cachedStretchValid.
+    bool _cachedStretchValid = false;
+    int _cachedStretchLo = 0;
+    int _cachedStretchHi = 255;
     CompositeRenderSettings _compositeSettings;
     bool _resetViewOnSurfaceChange = true;
     float _navSpeed = 1.0f;

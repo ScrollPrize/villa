@@ -323,26 +323,43 @@ void CAdaptiveVolumeViewer::submitRender()
     auto* fbBits = reinterpret_cast<uint32_t*>(_framebuffer.bits());
     int fbStride = _framebuffer.bytesPerLine() / 4;
 
-    // Build the render LUT. For stretch mode we do a 2-pass render: pass 1
-    // uses an identity-gray LUT so we can scan min/max from the framebuffer
-    // after sampling, then re-blit through the final (stretched + colormap
-    // + iso-cutoff) LUT.
+    // Build the render LUT. For stretch mode we use last frame's min/max
+    // so the render is a single pass; we refresh the cached range by
+    // scanning the framebuffer after. A camera change invalidates the
+    // cache and forces a 2-pass on the first frame after motion.
     const bool stretch = _compositeSettings.postStretchValues;
     const uint8_t isoCutoff = _compositeSettings.params.isoCutoff;
-    std::array<uint32_t, 256> lut;
-    auto applyIsoCutoff = [&](std::array<uint32_t, 256>& l) {
-        if (isoCutoff == 0) return;
+    auto applyIsoCutoff = [&](std::array<uint32_t, 256>& l, uint8_t cutoff) {
+        if (cutoff == 0) return;
         const uint32_t zero = l[0];
-        for (int i = 0; i < isoCutoff; i++) l[i] = zero;
+        for (int i = 0; i < cutoff; i++) l[i] = zero;
     };
-    if (stretch) {
+
+    std::array<uint32_t, 256> lut;
+    const bool stretchFirstPass = stretch && !_cachedStretchValid;
+    if (stretchFirstPass) {
+        // Identity gray LUT so we can extract the raw sample after sampling.
         for (int i = 0; i < 256; i++) {
             uint32_t v = uint32_t(i);
             lut[i] = 0xFF000000u | (v << 16) | (v << 8) | v;
         }
     } else {
-        vc::buildWindowLevelColormapLut(lut, _windowLow, _windowHigh, _baseColormapId);
-        applyIsoCutoff(lut);
+        float wlo = stretch ? float(_cachedStretchLo) : _windowLow;
+        float whi = stretch ? float(_cachedStretchHi) : _windowHigh;
+        // Reuse previous LUT if the inputs haven't changed.
+        if (_cachedWindowLow == wlo && _cachedWindowHigh == whi
+            && _cachedColormapId == _baseColormapId
+            && _cachedIsoCutoff == isoCutoff) {
+            lut = _cachedLut;
+        } else {
+            vc::buildWindowLevelColormapLut(lut, wlo, whi, _baseColormapId);
+            applyIsoCutoff(lut, isoCutoff);
+            _cachedLut = lut;
+            _cachedWindowLow = wlo;
+            _cachedWindowHigh = whi;
+            _cachedColormapId = _baseColormapId;
+            _cachedIsoCutoff = isoCutoff;
+        }
     }
 
     vc::SampleParams sp;
@@ -432,8 +449,14 @@ void CAdaptiveVolumeViewer::submitRender()
         }
     }
 
-    // Stretch post-pass: scan the identity-blitted framebuffer for min/max
-    // gray, rebuild the LUT with that range as window, re-apply.
+    // Stretch handling:
+    //   - First pass after a camera change: the identity LUT is active;
+    //     scan min/max, build the stretched LUT, re-blit. Cache the range
+    //     so subsequent frames render in a single pass.
+    //   - Subsequent frames (cached valid): the stretched LUT already
+    //     ran inside sampleAdaptiveARGB32. Refresh the cached min/max in
+    //     the background by sampling the framebuffer so the stretch
+    //     tracks drifting scene content.
     if (stretch) {
         int lo = 255, hi = 0;
         for (int y = 0; y < fbH; y++) {
@@ -444,20 +467,34 @@ void CAdaptiveVolumeViewer::submitRender()
                 if (v > hi) hi = v;
             }
         }
-        std::array<uint32_t, 256> stretchedLut;
-        if (hi > lo) {
-            vc::buildWindowLevelColormapLut(stretchedLut,
-                float(lo), float(hi), _baseColormapId);
-        } else {
-            vc::buildWindowLevelColormapLut(stretchedLut,
-                _windowLow, _windowHigh, _baseColormapId);
-        }
-        applyIsoCutoff(stretchedLut);
-        for (int y = 0; y < fbH; y++) {
-            uint32_t* row = fbBits + size_t(y) * size_t(fbStride);
-            for (int x = 0; x < fbW; x++) {
-                row[x] = stretchedLut[row[x] & 0xFFu];
+        if (stretchFirstPass) {
+            // One-time 2-pass: re-LUT the identity output we just rendered.
+            std::array<uint32_t, 256> stretchedLut;
+            if (hi > lo) {
+                vc::buildWindowLevelColormapLut(stretchedLut,
+                    float(lo), float(hi), _baseColormapId);
+            } else {
+                vc::buildWindowLevelColormapLut(stretchedLut,
+                    _windowLow, _windowHigh, _baseColormapId);
             }
+            applyIsoCutoff(stretchedLut, isoCutoff);
+            for (int y = 0; y < fbH; y++) {
+                uint32_t* row = fbBits + size_t(y) * size_t(fbStride);
+                for (int x = 0; x < fbW; x++) {
+                    row[x] = stretchedLut[row[x] & 0xFFu];
+                }
+            }
+            // Populate cached LUT for the next render.
+            _cachedLut = stretchedLut;
+            _cachedWindowLow = float(lo);
+            _cachedWindowHigh = float(hi);
+            _cachedColormapId = _baseColormapId;
+            _cachedIsoCutoff = isoCutoff;
+        }
+        if (hi > lo) {
+            _cachedStretchLo = lo;
+            _cachedStretchHi = hi;
+            _cachedStretchValid = true;
         }
     }
 
@@ -493,6 +530,7 @@ void CAdaptiveVolumeViewer::panByF(float dx, float dy)
         _camera.surfacePtr[1] = std::clamp(_camera.surfacePtr[1], _contentMinV, _contentMaxV);
     }
 
+    _cachedStretchValid = false;
     submitRender();
 }
 
@@ -542,6 +580,7 @@ void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     }
     _scene->setSceneRect(0, 0, w, h);
 
+    _cachedStretchValid = false;
     submitRender();
 }
 
