@@ -632,10 +632,11 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
             const cv::Vec3f* row = coords->ptr<cv::Vec3f>(r);
             for (int c = 0; c < coords->cols; c += stride) {
                 const auto& v = row[c];
-                if (!isfinite_bitwise(v[0])) continue;
-                minVx = std::min(minVx, v[0]); maxVx = std::max(maxVx, v[0]);
-                minVy = std::min(minVy, v[1]); maxVy = std::max(maxVy, v[1]);
-                minVz = std::min(minVz, v[2]); maxVz = std::max(maxVz, v[2]);
+                // Branchless NaN-safe reduction: fmin/fmax propagate
+                // the non-NaN operand on NEON.
+                minVx = std::fmin(minVx, v[0]); maxVx = std::fmax(maxVx, v[0]);
+                minVy = std::fmin(minVy, v[1]); maxVy = std::fmax(maxVy, v[1]);
+                minVz = std::fmin(minVz, v[2]); maxVz = std::fmax(maxVz, v[2]);
             }
         }
         if (maxVx >= minVx) {
@@ -745,20 +746,22 @@ void sampleCompositeAdaptiveImpl(
         // and still bounds the actual bbox within a voxel of truth
         // (prefetch is block-granular anyway).
         const int stride = (coords->rows > 256) ? 8 : 1;
+        // Hoist the normals pointer out of the per-pixel branch and use
+        // fmin/fmax so the reduction vectorizes — NaN coords/normals
+        // propagate their non-NaN counterpart through the reduction.
+        const bool haveNormals = normals != nullptr;
         for (int r=0; r<coords->rows; r += stride) {
             const cv::Vec3f* row = coords->ptr<cv::Vec3f>(r);
-            const cv::Vec3f* nrow = normals ? normals->ptr<cv::Vec3f>(r) : nullptr;
+            const cv::Vec3f* nrow = haveNormals ? normals->ptr<cv::Vec3f>(r) : nullptr;
             for (int c=0; c<coords->cols; c += stride) {
-                const auto& v = row[c];
-                if (!isfinite_bitwise(v[0])) continue;
-                cv::Vec3f n = nrow ? nrow[c] : cv::Vec3f(0,0,0);
-                if (nrow && !isfinite_bitwise(n[0])) continue;
+                const cv::Vec3f v = row[c];
+                const cv::Vec3f n = haveNormals ? nrow[c] : cv::Vec3f(0,0,0);
                 float lox = v[0]+n[0]*zMin, hix = v[0]+n[0]*zMax;
                 float loy = v[1]+n[1]*zMin, hiy = v[1]+n[1]*zMax;
                 float loz = v[2]+n[2]*zMin, hiz = v[2]+n[2]*zMax;
-                minVx=std::min(minVx,std::min(lox,hix)); maxVx=std::max(maxVx,std::max(lox,hix));
-                minVy=std::min(minVy,std::min(loy,hiy)); maxVy=std::max(maxVy,std::max(loy,hiy));
-                minVz=std::min(minVz,std::min(loz,hiz)); maxVz=std::max(maxVz,std::max(loz,hiz));
+                minVx=std::fmin(minVx,std::fmin(lox,hix)); maxVx=std::fmax(maxVx,std::fmax(lox,hix));
+                minVy=std::fmin(minVy,std::fmin(loy,hiy)); maxVy=std::fmax(maxVy,std::fmax(loy,hiy));
+                minVz=std::fmin(minVz,std::fmin(loz,hiz)); maxVz=std::fmax(maxVz,std::fmax(loz,hiz));
             }
         }
         if (maxVx >= minVx) {
