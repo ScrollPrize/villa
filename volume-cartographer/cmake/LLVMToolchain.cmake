@@ -112,6 +112,28 @@ if(NOT VC_STRIP_BINARIES)
     set(VC_STRIP_FLAGS "")
 endif()
 
+option(VC_VECTORIZATION_REPORT "Emit clang vectorization remarks during compile" OFF)
+if(VC_VECTORIZATION_REPORT)
+    add_compile_options(
+        -Rpass=loop-vectorize
+        -Rpass-missed=loop-vectorize
+        -Rpass-analysis=loop-vectorize
+        -Rpass=slp-vectorize
+        -Rpass-missed=slp-vectorize
+        -fsave-optimization-record
+    )
+    # ThinLTO defers vectorization to the link step; stream remarks from lld
+    # via llvm -mllvm flags. stderr carries each remark as it fires.
+    add_link_options(
+        -Wl,-mllvm,-pass-remarks=loop-vectorize
+        -Wl,-mllvm,-pass-remarks-missed=loop-vectorize
+        -Wl,-mllvm,-pass-remarks-analysis=loop-vectorize
+        -Wl,-mllvm,-pass-remarks=slp-vectorize
+        -Wl,-mllvm,-pass-remarks-missed=slp-vectorize
+    )
+    message(STATUS "Clang vectorization remarks enabled (compile + LTO link)")
+endif()
+
 add_compile_options(
     -Weverything
     # --- Noise: suppress (harmless, unfixable, or style-only) ---

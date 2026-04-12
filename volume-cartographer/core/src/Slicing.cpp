@@ -851,7 +851,15 @@ void sampleCompositeAdaptiveImpl(
                     && minFy >= 0.5f && maxFy < float(sh0.sy) - 0.5f
                     && minFz >= 0.5f && maxFz < float(sh0.sz) - 0.5f;
 
-                for (int li=0; li<numLayers; li++) {
+                // UI caps composite layers at 16 front + 16 behind + center,
+                // so the loop trip count is always <= 33. Bound-clamping lets
+                // the unroller estimate the trip count and the branch
+                // predictor size the loop body accurately.
+                constexpr int kMaxLayers = 33;
+                int nL = numLayers;
+                if (nL > kMaxLayers) nL = kMaxLayers;
+                #pragma clang loop unroll(enable) vectorize(enable)
+                for (int li=0; li<nL; li++) {
                     uint8_t v = 0;
                     bool got = false;
                     if (fullyInBounds) {

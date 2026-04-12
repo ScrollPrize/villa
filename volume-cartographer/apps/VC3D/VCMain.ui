@@ -673,7 +673,7 @@
           <number>0</number>
          </property>
          <property name="maximum">
-          <number>100</number>
+          <number>16</number>
          </property>
          <property name="value">
           <number>8</number>
@@ -693,7 +693,7 @@
           <number>0</number>
          </property>
          <property name="maximum">
-          <number>100</number>
+          <number>16</number>
          </property>
          <property name="value">
           <number>0</number>
@@ -1110,7 +1110,7 @@
           <number>0</number>
          </property>
          <property name="maximum">
-          <number>100</number>
+          <number>16</number>
          </property>
          <property name="value">
           <number>4</number>
@@ -1133,7 +1133,7 @@
           <number>0</number>
          </property>
          <property name="maximum">
-          <number>100</number>
+          <number>16</number>
          </property>
          <property name="value">
           <number>4</number>
