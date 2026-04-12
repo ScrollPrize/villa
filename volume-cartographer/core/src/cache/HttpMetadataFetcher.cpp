@@ -223,147 +223,6 @@ bool httpDownloadFile(const std::string& url, const std::filesystem::path& dest,
 }
 
 // ---------------------------------------------------------------------------
-// zarr v3 helpers (unchanged)
-// ---------------------------------------------------------------------------
-
-static std::string synthesize_v2_metadata(const utils::Json& v3)
-{
-    utils::Json v2;
-    v2["zarr_format"] = 2;
-    v2["shape"] = v3["shape"];
-
-    utils::Json chunkShape;
-    if (v3.contains("chunk_grid") && v3["chunk_grid"].contains("configuration")) {
-        auto gridCfg = v3["chunk_grid"]["configuration"];
-        if (gridCfg.contains("chunk_shape"))
-            chunkShape = gridCfg["chunk_shape"];
-    }
-    if (v3.contains("codecs") && v3["codecs"].is_array()) {
-        for (auto& codec : v3["codecs"]) {
-            if (codec.value("name", std::string("")) == "sharding_indexed") {
-                if (codec.contains("configuration")) {
-                    auto shardCfg = codec["configuration"];
-                    if (shardCfg.contains("chunk_shape"))
-                        chunkShape = shardCfg["chunk_shape"];
-                }
-                break;
-            }
-        }
-    }
-    v2["chunks"] = chunkShape;
-
-    std::string dtype = v3["data_type"].get_string();
-    if (dtype == "uint8")       v2["dtype"] = "|u1";
-    else if (dtype == "uint16") v2["dtype"] = "<u2";
-    else                        v2["dtype"] = dtype;
-
-    v2["fill_value"] = v3.value("fill_value", 0);
-    v2["order"] = "C";
-    v2["dimension_separator"] = "/";
-
-    v2["compressor"] = nullptr;
-    if (v3.contains("codecs") && v3["codecs"].is_array()) {
-        for (auto& codec : v3["codecs"]) {
-            std::string name = codec.value("name", std::string(""));
-            if (name == "blosc") {
-                auto& cfg = codec["configuration"];
-                utils::Json comp;
-                comp["id"] = "blosc";
-                comp["cname"] = cfg.value("cname", std::string("lz4"));
-                comp["clevel"] = cfg.value("clevel", 5);
-                comp["shuffle"] = cfg.value("shuffle", 1);
-                if (cfg.contains("typesize"))
-                    comp["typesize"] = cfg["typesize"];
-                if (cfg.contains("blocksize"))
-                    comp["blocksize"] = cfg["blocksize"];
-                v2["compressor"] = comp;
-                break;
-            } else if (name == "zstd") {
-                utils::Json comp;
-                comp["id"] = "zstd";
-                comp["level"] = codec["configuration"].value("level", 3);
-                v2["compressor"] = comp;
-                break;
-            } else if (name == "gzip" || name == "zlib") {
-                utils::Json comp;
-                comp["id"] = "gzip";
-                comp["level"] = codec["configuration"].value("level", 5);
-                v2["compressor"] = comp;
-                break;
-            } else if (name == "lz4") {
-                utils::Json comp;
-                comp["id"] = "lz4";
-                comp["acceleration"] = codec["configuration"].value("acceleration", 1);
-                v2["compressor"] = comp;
-                break;
-            }
-        }
-    }
-
-    v2["filters"] = nullptr;
-    return v2.dump(2);
-}
-
-static ShardConfig parse_v3_shard_config(
-    const utils::Json& v3,
-    const std::array<int, 3>& chunkShape)
-{
-    ShardConfig config;
-
-    auto tryParseShard = [&](const utils::Json& cfg) -> bool {
-        if (cfg.contains("chunks_per_shard") && cfg["chunks_per_shard"].is_array() &&
-            cfg["chunks_per_shard"].size() >= 3) {
-            int cz = cfg["chunks_per_shard"][0].get_int();
-            int cy = cfg["chunks_per_shard"][1].get_int();
-            int cx = cfg["chunks_per_shard"][2].get_int();
-            config.enabled = true;
-            config.shardShape = {
-                cz * chunkShape[0],
-                cy * chunkShape[1],
-                cx * chunkShape[2]
-            };
-            return true;
-        }
-        if (cfg.contains("chunk_shape") && cfg["chunk_shape"].is_array() &&
-            cfg["chunk_shape"].size() >= 3) {
-            if (v3.contains("chunk_grid") && v3["chunk_grid"].contains("configuration")) {
-                auto gridCfg = v3["chunk_grid"]["configuration"];
-                if (gridCfg.contains("chunk_shape") && gridCfg["chunk_shape"].is_array()) {
-                    config.enabled = true;
-                    config.shardShape = {
-                        gridCfg["chunk_shape"][0].get_int(),
-                        gridCfg["chunk_shape"][1].get_int(),
-                        gridCfg["chunk_shape"][2].get_int()
-                    };
-                    return true;
-                }
-            }
-        }
-        return false;
-    };
-
-    if (v3.contains("storage_transformers") && v3["storage_transformers"].is_array()) {
-        for (auto& t : v3["storage_transformers"]) {
-            std::string name = t.value("name", std::string(""));
-            if (name == "chunk_manifest_sharding" && t.contains("configuration")) {
-                if (tryParseShard(t["configuration"])) return config;
-            }
-        }
-    }
-
-    if (v3.contains("codecs") && v3["codecs"].is_array()) {
-        for (auto& codec : v3["codecs"]) {
-            std::string name = codec.value("name", std::string(""));
-            if (name == "sharding_indexed" && codec.contains("configuration")) {
-                if (tryParseShard(codec["configuration"])) return config;
-            }
-        }
-    }
-
-    return config;
-}
-
-// ---------------------------------------------------------------------------
 // metadata fetcher
 // ---------------------------------------------------------------------------
 
@@ -597,23 +456,29 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
             std::fprintf(log, "[REMOTE] No zarr v2 levels found, trying zarr v3...\n");
 
         numLevels = probeLevels("zarr.json", [&](int lvl, std::string zarrJson) -> bool {
-            utils::Json v3;
+            utils::ZarrMetadata meta;
             try {
-                v3 = utils::Json::parse(zarrJson);
+                meta = utils::detail::parse_zarr_json(zarrJson);
             } catch (const std::exception& e) {
                 if (auto* log = cacheDebugLog())
-                    std::fprintf(log, "[REMOTE] Level %d: failed to parse zarr.json: %s\n", lvl, e.what());
+                    std::fprintf(log, "[REMOTE] Level %d: parse_zarr_json failed: %s\n", lvl, e.what());
                 return false;
             }
 
-            if (v3.value("zarr_format", 0) != 3 ||
-                v3.value("node_type", std::string("")) != "array") {
+            if (meta.version != utils::ZarrVersion::v3 || meta.node_type != "array") {
                 if (auto* log = cacheDebugLog())
                     std::fprintf(log, "[REMOTE] Level %d: zarr.json is not zarr v3 array\n", lvl);
                 return false;
             }
 
-            std::string synthesized = synthesize_v2_metadata(v3);
+            // v2 emission for the VcDataset reader. For sharded v3 the v2
+            // "chunks" is the finest granularity (inner chunk shape).
+            utils::ZarrMetadata v2meta = meta;
+            v2meta.version = utils::ZarrVersion::v2;
+            if (meta.shard_config && meta.shard_config->sub_chunks.size() >= 3) {
+                v2meta.chunks = meta.shard_config->sub_chunks;
+            }
+            std::string synthesized = utils::detail::serialize_zarray(v2meta);
             auto levelDir = stagingDir / std::to_string(lvl);
             writeFile(levelDir / ".zarray", synthesized);
             isV3 = true;
@@ -623,35 +488,18 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
                              lvl, synthesized.size());
 
             if (lvl == 0) {
-                try {
-                    level0Meta = utils::Json::parse(synthesized);
-                    delimiter = "/";
-                    if (level0Meta.contains("dimension_separator"))
-                        delimiter = level0Meta["dimension_separator"].get_string();
-
-                    std::array<int, 3> cs = {128, 128, 128};
-                    if (v3.contains("chunk_grid")) {
-                        auto grid = v3["chunk_grid"];
-                        if (grid.contains("configuration")) {
-                            auto gridCfg = grid["configuration"];
-                            if (gridCfg.contains("chunk_shape") && gridCfg["chunk_shape"].is_array()) {
-                                auto s = gridCfg["chunk_shape"];
-                                cs = {s[0].get_int(), s[1].get_int(), s[2].get_int()};
-                            }
-                        }
-                    }
-                    shardConfig = parse_v3_shard_config(v3, cs);
-
-                    if (shardConfig.enabled) {
-                        if (auto* log = cacheDebugLog())
-                            std::fprintf(log, "[REMOTE] Shard config: shape=[%d, %d, %d]\n",
-                                         shardConfig.shardShape[0],
-                                         shardConfig.shardShape[1],
-                                         shardConfig.shardShape[2]);
-                    }
-                } catch (const std::exception& e) {
+                level0Meta = utils::Json::parse(synthesized);
+                delimiter = meta.dimension_separator.empty() ? "/" : meta.dimension_separator;
+                if (meta.shard_config && meta.chunks.size() >= 3) {
+                    shardConfig.enabled = true;
+                    shardConfig.shardShape = {
+                        int(meta.chunks[0]), int(meta.chunks[1]), int(meta.chunks[2])
+                    };
                     if (auto* log = cacheDebugLog())
-                        std::fprintf(log, "[REMOTE] Warning: failed to parse level 0 synthesized .zarray: %s\n", e.what());
+                        std::fprintf(log, "[REMOTE] Shard config: shape=[%d, %d, %d]\n",
+                                     shardConfig.shardShape[0],
+                                     shardConfig.shardShape[1],
+                                     shardConfig.shardShape[2]);
                 }
             }
             return true;
