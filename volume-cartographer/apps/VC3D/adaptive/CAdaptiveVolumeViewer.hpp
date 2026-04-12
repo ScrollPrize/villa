@@ -254,9 +254,7 @@ private:
     QGraphicsScene* _scene = nullptr;
     QLabel* _lbl = nullptr;
     QTimer* _renderTimer = nullptr;
-    QTimer* _qualityTimer = nullptr;   // fires after motion stops to kick a full-res render
     bool _renderPending = false;
-    bool _isMoving = false;            // half-res render while true
 
     // --- Framebuffer ---
     QImage _framebuffer;

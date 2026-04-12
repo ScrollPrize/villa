@@ -73,17 +73,6 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
         }
     });
 
-    // Progressive refinement: during active camera motion we render at half
-    // resolution (4x faster) and upscale; when the user settles, fire a
-    // full-res pass after 150ms of no input.
-    _qualityTimer = new QTimer(this);
-    _qualityTimer->setSingleShot(true);
-    _qualityTimer->setInterval(150);
-    connect(_qualityTimer, &QTimer::timeout, this, [this]() {
-        _isMoving = false;
-        submitRender();
-        updateStatusLabel();
-    });
 
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -330,22 +319,8 @@ void CAdaptiveVolumeViewer::submitRender()
     int fbH = _framebuffer.height();
     if (fbW <= 0 || fbH <= 0) return;
 
-    auto* fbFullBits = reinterpret_cast<uint32_t*>(_framebuffer.bits());
-    int fbFullStride = _framebuffer.bytesPerLine() / 4;
-
-    // Progressive refinement: half-res during camera motion. 4x fewer
-    // pixels to sample; nearest-upscale blit at the end is ~0.15ms.
-    static thread_local std::vector<uint32_t> tmpBuf;
-    const bool halfRes = _isMoving;
-    const int renderW = halfRes ? fbW / 2 : fbW;
-    const int renderH = halfRes ? fbH / 2 : fbH;
-    uint32_t* fbBits = fbFullBits;
-    int fbStride = fbFullStride;
-    if (halfRes) {
-        tmpBuf.resize(size_t(renderW) * size_t(renderH));
-        fbBits = tmpBuf.data();
-        fbStride = renderW;
-    }
+    auto* fbBits = reinterpret_cast<uint32_t*>(_framebuffer.bits());
+    int fbStride = _framebuffer.bytesPerLine() / 4;
 
     std::array<uint32_t, 256> lut;
     vc::buildWindowLevelColormapLut(lut, _windowLow, _windowHigh, _baseColormapId);
@@ -367,11 +342,8 @@ void CAdaptiveVolumeViewer::submitRender()
         cv::Vec3f origin = vx * (_camera.surfacePtr[0] - halfW)
                          + vy * (_camera.surfacePtr[1] - halfH)
                          + plane->origin() + n * _camera.zOff;
-        // Half-res: each output pixel covers 2 full-res pixels, so step
-        // per render-pixel doubles. Origin stays at the same world anchor.
-        const float pixelScale = float(fbW) / float(renderW);
-        cv::Vec3f vx_step = vx * (pixelScale / _camera.scale);
-        cv::Vec3f vy_step = vy * (pixelScale / _camera.scale);
+        cv::Vec3f vx_step = vx / _camera.scale;
+        cv::Vec3f vy_step = vy / _camera.scale;
 
         int numLayers = 1, zStart = 0;
         float zStep = 1.0f;
@@ -399,7 +371,7 @@ void CAdaptiveVolumeViewer::submitRender()
             nullptr, &origin, &vx_step, &vy_step,
             nullptr, pNormal,
             numLayers, zStart, zStep,
-            renderW, renderH, method, lut.data(), sampleMethod);
+            fbW, fbH, method, lut.data(), sampleMethod);
     } else {
         cv::Mat_<cv::Vec3f> coords;
         cv::Mat_<cv::Vec3f> normals;
@@ -407,11 +379,9 @@ void CAdaptiveVolumeViewer::submitRender()
                          _camera.surfacePtr[1] * _camera.scale,
                          _camera.zOff);
         const bool wantComposite = _compositeSettings.enabled;
-        // Half-res gen: ask for renderW x renderH and scale accordingly.
-        const float genScale = _camera.scale * float(renderW) / float(fbW);
         surf->gen(&coords, wantComposite ? &normals : nullptr,
-                  cv::Size(renderW, renderH), cv::Vec3f(0, 0, 0),
-                  genScale, offset);
+                  cv::Size(fbW, fbH), cv::Vec3f(0, 0, 0),
+                  _camera.scale, offset);
 
         if (!coords.empty()) {
             int numLayers = 1, zStart = 0;
@@ -435,17 +405,7 @@ void CAdaptiveVolumeViewer::submitRender()
                 &coords, nullptr, nullptr, nullptr,
                 pNormals, nullptr,
                 numLayers, zStart, zStep,
-                renderW, renderH, method, lut.data(), sampleMethod);
-        }
-    }
-
-    // Upscale half-res temp buffer to the full framebuffer (nearest).
-    if (halfRes) {
-        for (int y = 0; y < fbH; y++) {
-            const uint32_t* src = tmpBuf.data()
-                + size_t(y >> 1) * size_t(renderW);
-            uint32_t* dst = fbFullBits + size_t(y) * size_t(fbFullStride);
-            for (int x = 0; x < fbW; x++) dst[x] = src[x >> 1];
+                fbW, fbH, method, lut.data(), sampleMethod);
         }
     }
 
@@ -481,8 +441,6 @@ void CAdaptiveVolumeViewer::panByF(float dx, float dy)
         _camera.surfacePtr[1] = std::clamp(_camera.surfacePtr[1], _contentMinV, _contentMaxV);
     }
 
-    _isMoving = true;
-    if (_qualityTimer) _qualityTimer->start();
     submitRender();
 }
 
@@ -532,8 +490,6 @@ void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     }
     _scene->setSceneRect(0, 0, w, h);
 
-    _isMoving = true;
-    if (_qualityTimer) _qualityTimer->start();
     submitRender();
 }
 
