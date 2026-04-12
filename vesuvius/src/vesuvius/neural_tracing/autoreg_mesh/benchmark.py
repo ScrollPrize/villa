@@ -103,6 +103,13 @@ def run_autoreg_mesh_benchmark(
         "dataset_length": int(len(dataset)),
         "sample_count": int(sample_count),
         "pointer_temperature": float(cfg.get("pointer_temperature", 0.25)),
+        "coarse_prediction_mode": str(cfg.get("coarse_prediction_mode", "joint_pointer")),
+        "coarse_grid_shape": list(int(v) for v in model.coarse_grid_shape),
+        "coarse_axis_sizes": {
+            "z": int(model.coarse_grid_shape[0]),
+            "y": int(model.coarse_grid_shape[1]),
+            "x": int(model.coarse_grid_shape[2]),
+        },
         "distance_aware_coarse_targets_enabled": bool(cfg.get("distance_aware_coarse_targets_enabled", True)),
         "distance_aware_coarse_target_radius": int(cfg.get("distance_aware_coarse_target_radius", 1)),
         "distance_aware_coarse_target_sigma": float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),

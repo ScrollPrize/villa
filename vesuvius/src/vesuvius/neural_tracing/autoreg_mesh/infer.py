@@ -124,6 +124,7 @@ def infer_autoreg_mesh(
     all_target_strip_coords = _build_target_strip_coords(direction, target_grid_shape, device=device)
 
     generated_coarse: list[int] = []
+    generated_coarse_axes: dict[str, list[int]] = {"z": [], "y": [], "x": []}
     generated_offsets: list[list[int]] = []
     generated_xyz: list[np.ndarray] = []
     generated_bin_center_xyz: list[np.ndarray] = []
@@ -156,8 +157,26 @@ def infer_autoreg_mesh(
             memory_patch_centers=encoded["memory_patch_centers"],
         )
 
-        coarse_logits = outputs["coarse_logits"][0, current_len - 1]
-        coarse_id = int(_sample_from_logits(coarse_logits, greedy=greedy).item())
+        if str(outputs.get("coarse_prediction_mode", getattr(model, "coarse_prediction_mode", "joint_pointer"))) == "axis_factorized":
+            coarse_axis_ids = {}
+            for axis_name in ("z", "y", "x"):
+                axis_logits = outputs["coarse_axis_logits"][axis_name][0, current_len - 1]
+                coarse_axis_ids[axis_name] = int(_sample_from_logits(axis_logits, greedy=greedy).item())
+            coarse_id = int(
+                model._flatten_coarse_axis_ids(
+                    torch.tensor(coarse_axis_ids["z"], dtype=torch.long, device=device),
+                    torch.tensor(coarse_axis_ids["y"], dtype=torch.long, device=device),
+                    torch.tensor(coarse_axis_ids["x"], dtype=torch.long, device=device),
+                ).item()
+            )
+        else:
+            coarse_logits = outputs["coarse_logits"][0, current_len - 1]
+            coarse_id = int(_sample_from_logits(coarse_logits, greedy=greedy).item())
+            coarse_axis_ids = {
+                "z": int(outputs["pred_coarse_axis_ids"]["z"][0, current_len - 1].item()),
+                "y": int(outputs["pred_coarse_axis_ids"]["y"][0, current_len - 1].item()),
+                "x": int(outputs["pred_coarse_axis_ids"]["x"][0, current_len - 1].item()),
+            }
         offset_bins = []
         for axis, bins in enumerate(model.offset_num_bins):
             axis_logits = outputs["offset_logits"][0, current_len - 1, axis, :bins]
@@ -169,6 +188,8 @@ def infer_autoreg_mesh(
         stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, current_len - 1]).item())
 
         generated_coarse.append(coarse_id)
+        for axis_name in ("z", "y", "x"):
+            generated_coarse_axes[axis_name].append(coarse_axis_ids[axis_name])
         generated_offsets.append(offset_bins)
         generated_xyz.append(xyz.astype(np.float32, copy=False))
         generated_bin_center_xyz.append(bin_center_xyz.astype(np.float32, copy=False))
@@ -207,7 +228,7 @@ def infer_autoreg_mesh(
         surface = _build_tifxyz_from_grid(full_grid_world, uuid=surface_uuid)
         tifxyz_path = write_tifxyz(Path(save_path) / surface_uuid, surface, overwrite=True)
 
-    return {
+    result = {
         "predicted_coarse_ids": np.asarray(generated_coarse, dtype=np.int64),
         "predicted_offset_bins": np.asarray(generated_offsets, dtype=np.int64),
         "predicted_continuation_vertices_local": predicted_xyz_local,
@@ -221,3 +242,9 @@ def infer_autoreg_mesh(
         "stop_probabilities": np.asarray(stop_probabilities, dtype=np.float32),
         "saved_tifxyz_path": None if tifxyz_path is None else str(tifxyz_path),
     }
+    if str(getattr(model, "coarse_prediction_mode", "joint_pointer")) == "axis_factorized":
+        result["predicted_coarse_axis_ids"] = {
+            axis_name: np.asarray(values, dtype=np.int64)
+            for axis_name, values in generated_coarse_axes.items()
+        }
+    return result

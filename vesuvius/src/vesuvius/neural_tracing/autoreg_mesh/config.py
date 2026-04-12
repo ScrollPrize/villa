@@ -41,6 +41,7 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "decoder_mlp_ratio": 4.0,
     "decoder_dropout": 0.0,
     "pointer_temperature": 0.25,
+    "coarse_prediction_mode": "joint_pointer",
     "rope_base": 100.0,
     "rope_min_period": None,
     "rope_max_period": None,
@@ -170,6 +171,8 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("cross_attention_every_n_blocks must be positive")
     if float(cfg["pointer_temperature"]) <= 0.0:
         raise ValueError("pointer_temperature must be positive")
+    if str(cfg["coarse_prediction_mode"]) not in {"joint_pointer", "axis_factorized"}:
+        raise ValueError("coarse_prediction_mode must be one of {'joint_pointer', 'axis_factorized'}")
     if cfg.get("rope_normalize_coords") not in {"min", "max", "separate"}:
         raise ValueError("rope_normalize_coords must be one of {'min', 'max', 'separate'}")
     if cfg.get("rope_base") is not None and (cfg.get("rope_min_period") is not None or cfg.get("rope_max_period") is not None):

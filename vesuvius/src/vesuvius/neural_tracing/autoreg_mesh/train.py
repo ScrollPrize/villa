@@ -150,6 +150,27 @@ def _resolve_wandb_run_id(cfg: dict, ckpt_payload: dict | None) -> str | None:
     return None if run_id is None else str(run_id)
 
 
+def _checkpoint_coarse_prediction_mode(ckpt_payload: dict | None) -> str:
+    if ckpt_payload is None:
+        return "joint_pointer"
+    ckpt_config = ckpt_payload.get("config", {})
+    if isinstance(ckpt_config, dict):
+        return str(ckpt_config.get("coarse_prediction_mode", "joint_pointer"))
+    return "joint_pointer"
+
+
+def _validate_checkpoint_compatibility(cfg: dict, ckpt_payload: dict | None) -> None:
+    if ckpt_payload is None:
+        return
+    expected_mode = str(cfg.get("coarse_prediction_mode", "joint_pointer"))
+    checkpoint_mode = _checkpoint_coarse_prediction_mode(ckpt_payload)
+    if checkpoint_mode != expected_mode:
+        raise ValueError(
+            "load_ckpt uses incompatible coarse_prediction_mode: "
+            f"checkpoint={checkpoint_mode!r} current_config={expected_mode!r}"
+        )
+
+
 def _make_checkpoint_payload(
     *,
     model: AutoregMeshModel,
@@ -547,6 +568,7 @@ def run_autoreg_mesh_training(
         )
 
     preloaded_ckpt = _load_checkpoint_payload(cfg.get("load_ckpt"))
+    _validate_checkpoint_compatibility(cfg, preloaded_ckpt)
     resolved_wandb_run_id = _resolve_wandb_run_id(cfg, preloaded_ckpt)
     if resolved_wandb_run_id is not None:
         cfg["wandb_run_id"] = resolved_wandb_run_id

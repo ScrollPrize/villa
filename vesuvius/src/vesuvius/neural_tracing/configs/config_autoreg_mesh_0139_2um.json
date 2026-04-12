@@ -28,6 +28,7 @@
   "decoder_mlp_ratio": 4.0,
   "decoder_dropout": 0.0,
   "pointer_temperature": 0.25,
+  "coarse_prediction_mode": "joint_pointer",
   "scheduled_sampling_enabled": true,
   "scheduled_sampling_mode": "linear_full_token_greedy",
   "scheduled_sampling_max_prob": 0.10,

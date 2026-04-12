@@ -20,6 +20,9 @@ This package implements a first MVP for tifxyz quad-lattice continuation from:
   - a coarse Dinovol patch-cell id
   - per-axis local offset bins inside that cell
   - a stop logit
+- The coarse head is configurable:
+  - `joint_pointer`: one flattened pointer over the full coarse grid
+  - `axis_factorized`: separate `z/y/x` coarse predictions pooled from the same volume memory
 
 ## Model I/O
 
@@ -37,10 +40,12 @@ This package implements a first MVP for tifxyz quad-lattice continuation from:
   - `world_bbox`
   - `wrap_metadata`
 - Model output includes:
-  - `coarse_logits`
+  - `coarse_logits` for `joint_pointer`, or `coarse_axis_logits` for `axis_factorized`
   - `offset_logits`
   - `stop_logits`
   - `pred_xyz`
+
+Checkpoint resume across coarse-head modes is intentionally unsupported. A checkpoint trained with `joint_pointer` must resume with `joint_pointer`, and likewise for `axis_factorized`.
 
 ## Smoke Train
 

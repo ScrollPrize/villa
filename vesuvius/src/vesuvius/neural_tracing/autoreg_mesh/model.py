@@ -220,6 +220,11 @@ class AutoregMeshModel(nn.Module):
         self.config = validate_autoreg_mesh_config(config)
         self.input_shape = tuple(int(v) for v in self.config["input_shape"])
         self.patch_size = tuple(int(v) for v in self.config["patch_size"])
+        self.coarse_grid_shape = (
+            int(self.input_shape[0] // self.patch_size[0]),
+            int(self.input_shape[1] // self.patch_size[1]),
+            int(self.input_shape[2] // self.patch_size[2]),
+        )
         self.offset_num_bins = tuple(int(v) for v in self.config["offset_num_bins"])
         self.decoder_dim = int(self.config["decoder_dim"])
         self.decoder_depth = int(self.config["decoder_depth"])
@@ -227,6 +232,7 @@ class AutoregMeshModel(nn.Module):
         self.head_dim = self.decoder_dim // self.decoder_num_heads
         self.cross_attention_every_n_blocks = int(self.config["cross_attention_every_n_blocks"])
         self.pointer_temperature = float(self.config["pointer_temperature"])
+        self.coarse_prediction_mode = str(self.config["coarse_prediction_mode"])
 
         self.backbone = None
         memory_in_dim = self.decoder_dim
@@ -295,8 +301,24 @@ class AutoregMeshModel(nn.Module):
             ]
         )
         self.final_norm = nn.LayerNorm(self.decoder_dim)
-        self.pointer_query = nn.Linear(self.decoder_dim, self.decoder_dim, bias=True)
-        self.pointer_key = nn.Linear(self.decoder_dim, self.decoder_dim, bias=False)
+        if self.coarse_prediction_mode == "joint_pointer":
+            self.pointer_query = nn.Linear(self.decoder_dim, self.decoder_dim, bias=True)
+            self.pointer_key = nn.Linear(self.decoder_dim, self.decoder_dim, bias=False)
+            self.pointer_query_z = None
+            self.pointer_query_y = None
+            self.pointer_query_x = None
+            self.pointer_key_z = None
+            self.pointer_key_y = None
+            self.pointer_key_x = None
+        else:
+            self.pointer_query = None
+            self.pointer_key = None
+            self.pointer_query_z = nn.Linear(self.decoder_dim, self.decoder_dim, bias=True)
+            self.pointer_query_y = nn.Linear(self.decoder_dim, self.decoder_dim, bias=True)
+            self.pointer_query_x = nn.Linear(self.decoder_dim, self.decoder_dim, bias=True)
+            self.pointer_key_z = nn.Linear(self.decoder_dim, self.decoder_dim, bias=False)
+            self.pointer_key_y = nn.Linear(self.decoder_dim, self.decoder_dim, bias=False)
+            self.pointer_key_x = nn.Linear(self.decoder_dim, self.decoder_dim, bias=False)
         self.offset_head = nn.Linear(self.decoder_dim, 3 * max(self.offset_num_bins), bias=True)
         self.stop_head = nn.Linear(self.decoder_dim, 1, bias=True)
         self.position_refine_head = nn.Linear(self.decoder_dim, 3, bias=True)
@@ -356,15 +378,90 @@ class AutoregMeshModel(nn.Module):
             "coarse_grid_shape": grid_shape,
         }
 
+    def _unflatten_coarse_ids(self, coarse_ids: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        gz, gy, gx = self.coarse_grid_shape
+        coarse = coarse_ids.clamp(min=0)
+        z = coarse // (gy * gx)
+        rem = coarse % (gy * gx)
+        y = rem // gx
+        x = rem % gx
+        return z, y, x
+
+    def _flatten_coarse_axis_ids(self, z: Tensor, y: Tensor, x: Tensor) -> Tensor:
+        _, gy, gx = self.coarse_grid_shape
+        return (z * (gy * gx)) + (y * gx) + x
+
+    def _factorized_axis_memory(self, memory_tokens: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        gz, gy, gx = self.coarse_grid_shape
+        memory_5d = memory_tokens.reshape(memory_tokens.shape[0], gz, gy, gx, memory_tokens.shape[-1])
+        z_memory = memory_5d.mean(dim=(2, 3))
+        y_memory = memory_5d.mean(dim=(1, 3))
+        x_memory = memory_5d.mean(dim=(1, 2))
+        return z_memory, y_memory, x_memory
+
+    def _compute_coarse_outputs(self, hidden: Tensor, memory_tokens: Tensor) -> dict[str, Any]:
+        if self.coarse_prediction_mode == "joint_pointer":
+            pointer_q = F.normalize(self.pointer_query(hidden), dim=-1)
+            pointer_k = F.normalize(self.pointer_key(memory_tokens), dim=-1)
+            coarse_logits = torch.einsum("btd,bnd->btn", pointer_q, pointer_k) / self.pointer_temperature
+            pred_coarse_ids = coarse_logits.argmax(dim=-1)
+            z_ids, y_ids, x_ids = self._unflatten_coarse_ids(pred_coarse_ids)
+            return {
+                "coarse_logits": coarse_logits,
+                "coarse_axis_logits": None,
+                "pred_coarse_ids": pred_coarse_ids,
+                "pred_coarse_axis_ids": {"z": z_ids, "y": y_ids, "x": x_ids},
+            }
+
+        z_memory, y_memory, x_memory = self._factorized_axis_memory(memory_tokens)
+        z_query = F.normalize(self.pointer_query_z(hidden), dim=-1)
+        y_query = F.normalize(self.pointer_query_y(hidden), dim=-1)
+        x_query = F.normalize(self.pointer_query_x(hidden), dim=-1)
+        z_key = F.normalize(self.pointer_key_z(z_memory), dim=-1)
+        y_key = F.normalize(self.pointer_key_y(y_memory), dim=-1)
+        x_key = F.normalize(self.pointer_key_x(x_memory), dim=-1)
+        z_logits = torch.einsum("btd,bzd->btz", z_query, z_key) / self.pointer_temperature
+        y_logits = torch.einsum("btd,byd->bty", y_query, y_key) / self.pointer_temperature
+        x_logits = torch.einsum("btd,bxd->btx", x_query, x_key) / self.pointer_temperature
+        z_ids = z_logits.argmax(dim=-1)
+        y_ids = y_logits.argmax(dim=-1)
+        x_ids = x_logits.argmax(dim=-1)
+        pred_coarse_ids = self._flatten_coarse_axis_ids(z_ids, y_ids, x_ids)
+        return {
+            "coarse_logits": None,
+            "coarse_axis_logits": {"z": z_logits, "y": y_logits, "x": x_logits},
+            "pred_coarse_ids": pred_coarse_ids,
+            "pred_coarse_axis_ids": {"z": z_ids, "y": y_ids, "x": x_ids},
+        }
+
     def _soft_decode_local_xyz(
         self,
-        coarse_logits: Tensor,
+        coarse_logits: Tensor | None,
+        coarse_axis_logits: dict[str, Tensor] | None,
         offset_logits: Tensor,
         pred_refine_residual: Tensor,
     ) -> Tensor:
-        coarse_probs = torch.softmax(coarse_logits, dim=-1)
-        coarse_starts = self.coarse_cell_starts.to(device=coarse_logits.device, dtype=coarse_logits.dtype)
-        expected_coarse_start = torch.einsum("btn,nc->btc", coarse_probs, coarse_starts)
+        if self.coarse_prediction_mode == "joint_pointer":
+            if coarse_logits is None:
+                raise ValueError("coarse_logits are required for joint_pointer mode")
+            coarse_probs = torch.softmax(coarse_logits, dim=-1)
+            coarse_starts = self.coarse_cell_starts.to(device=coarse_logits.device, dtype=coarse_logits.dtype)
+            expected_coarse_start = torch.einsum("btn,nc->btc", coarse_probs, coarse_starts)
+        else:
+            if coarse_axis_logits is None:
+                raise ValueError("coarse_axis_logits are required for axis_factorized mode")
+            expected_starts = []
+            for axis_name, size, patch in zip(
+                ("z", "y", "x"),
+                self.coarse_grid_shape,
+                self.patch_size,
+                strict=True,
+            ):
+                axis_logits = coarse_axis_logits[axis_name]
+                axis_probs = torch.softmax(axis_logits, dim=-1)
+                axis_positions = torch.arange(size, device=axis_logits.device, dtype=axis_logits.dtype)
+                expected_starts.append(torch.einsum("btn,n->bt", axis_probs, axis_positions) * float(patch))
+            expected_coarse_start = torch.stack(expected_starts, dim=-1)
 
         expected_offsets = []
         for axis, bins in enumerate(self.offset_num_bins):
@@ -573,38 +670,43 @@ class AutoregMeshModel(nn.Module):
 
         prompt_len = int(prompt["mask"].shape[1])
         hidden = x[:, prompt_len:, :]
-        pointer_q = F.normalize(self.pointer_query(hidden), dim=-1)
-        pointer_k = F.normalize(self.pointer_key(memory_tokens), dim=-1)
-        coarse_logits = torch.einsum("btd,bnd->btn", pointer_q, pointer_k) / self.pointer_temperature
+        coarse_outputs = self._compute_coarse_outputs(hidden, memory_tokens)
 
         max_bins = max(self.offset_num_bins)
         offset_logits = self.offset_head(hidden).reshape(hidden.shape[0], hidden.shape[1], 3, max_bins)
         stop_logits = self.stop_head(hidden).squeeze(-1)
-        pred_coarse_ids = coarse_logits.argmax(dim=-1)
         pred_offset_bins = []
         for axis, bins in enumerate(self.offset_num_bins):
             pred_offset_bins.append(offset_logits[:, :, axis, :bins].argmax(dim=-1))
         pred_offset_bins_tensor = torch.stack(pred_offset_bins, dim=-1)
-        pred_xyz_bin_center = self.decode_local_xyz(pred_coarse_ids, pred_offset_bins_tensor)
+        pred_xyz_bin_center = self.decode_local_xyz(coarse_outputs["pred_coarse_ids"], pred_offset_bins_tensor)
         pred_refine_residual = self.position_refine_head(hidden)
-        pred_xyz_soft = self._soft_decode_local_xyz(coarse_logits, offset_logits, pred_refine_residual)
+        pred_xyz_soft = self._soft_decode_local_xyz(
+            coarse_outputs["coarse_logits"],
+            coarse_outputs["coarse_axis_logits"],
+            offset_logits,
+            pred_refine_residual,
+        )
         pred_xyz_refined = pred_xyz_bin_center + pred_refine_residual
         max_coord = torch.tensor(self.input_shape, device=hidden.device, dtype=hidden.dtype) - 1e-4
         pred_xyz_refined = torch.maximum(pred_xyz_refined, torch.zeros_like(pred_xyz_refined))
         pred_xyz_refined = torch.minimum(pred_xyz_refined, max_coord.view(1, 1, 3))
 
         return {
-            "coarse_logits": coarse_logits,
+            "coarse_logits": coarse_outputs["coarse_logits"],
+            "coarse_axis_logits": coarse_outputs["coarse_axis_logits"],
             "offset_logits": offset_logits,
             "stop_logits": stop_logits,
-            "pred_coarse_ids": pred_coarse_ids,
+            "pred_coarse_ids": coarse_outputs["pred_coarse_ids"],
+            "pred_coarse_axis_ids": coarse_outputs["pred_coarse_axis_ids"],
             "pred_offset_bins": pred_offset_bins_tensor,
             "pred_refine_residual": pred_refine_residual,
             "pred_xyz": pred_xyz_bin_center,
             "pred_xyz_soft": pred_xyz_soft,
             "pred_xyz_refined": pred_xyz_refined,
             "memory_tokens": memory_tokens,
-            "coarse_grid_shape": tuple(int(v) for v in batch.get("coarse_grid_shape", ())),
+            "coarse_grid_shape": self.coarse_grid_shape,
+            "coarse_prediction_mode": self.coarse_prediction_mode,
         }
 
     def forward(self, batch: dict, *, scheduled_sampling_prob: float = 0.0) -> dict[str, Tensor]:

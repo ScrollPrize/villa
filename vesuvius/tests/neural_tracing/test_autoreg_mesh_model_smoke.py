@@ -192,6 +192,12 @@ def _make_cached_token_config() -> dict:
     }
 
 
+def _make_factorized_cached_token_config() -> dict:
+    config = _make_cached_token_config()
+    config["coarse_prediction_mode"] = "axis_factorized"
+    return config
+
+
 class _ListDataset(Dataset):
     def __init__(self, items: list[dict]) -> None:
         self.items = list(items)
@@ -315,6 +321,35 @@ def test_autoreg_mesh_model_forward_and_losses_are_finite(tmp_path: Path) -> Non
     assert "geometry_sd_loss" in losses
 
 
+def test_axis_factorized_autoreg_mesh_model_forward_and_losses_are_finite() -> None:
+    config = _make_factorized_cached_token_config()
+    model = AutoregMeshModel(config)
+
+    batch = autoreg_mesh_collate([_make_sample_with_cached_tokens("left"), _make_sample_with_cached_tokens("up")])
+    batch = _move_batch(batch, torch.device("cpu"))
+    outputs = model(batch)
+    losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+    )
+
+    assert outputs["coarse_prediction_mode"] == "axis_factorized"
+    assert outputs["coarse_logits"] is None
+    assert outputs["coarse_axis_logits"]["z"].shape == (*batch["target_coarse_ids"].shape, 2)
+    assert outputs["coarse_axis_logits"]["y"].shape == (*batch["target_coarse_ids"].shape, 2)
+    assert outputs["coarse_axis_logits"]["x"].shape == (*batch["target_coarse_ids"].shape, 2)
+    assert outputs["pred_coarse_axis_ids"]["z"].shape == batch["target_coarse_ids"].shape
+    assert outputs["pred_coarse_axis_ids"]["y"].shape == batch["target_coarse_ids"].shape
+    assert outputs["pred_coarse_axis_ids"]["x"].shape == batch["target_coarse_ids"].shape
+    assert outputs["pred_coarse_ids"].shape == batch["target_coarse_ids"].shape
+    assert torch.isfinite(losses["coarse_z_loss"])
+    assert torch.isfinite(losses["coarse_y_loss"])
+    assert torch.isfinite(losses["coarse_x_loss"])
+    for value in losses.values():
+        assert torch.isfinite(value)
+
+
 def test_autoreg_mesh_smoke_training_runs_two_steps(tmp_path: Path) -> None:
     config = _make_cached_token_config()
     config["out_dir"] = str(tmp_path / "runs")
@@ -365,6 +400,27 @@ def test_autoreg_mesh_inference_reconstructs_lattice(tmp_path: Path) -> None:
     assert result["saved_tifxyz_path"] is not None
     z_tif = tifffile.imread(Path(result["saved_tifxyz_path"]) / "z.tif")
     assert tuple(z_tif.shape) == result["full_grid_local"].shape[:2]
+
+
+def test_axis_factorized_autoreg_mesh_inference_reconstructs_lattice() -> None:
+    config = _make_factorized_cached_token_config()
+    model = AutoregMeshModel(config).eval()
+
+    sample = _make_sample_with_cached_tokens("down")
+    result = infer_autoreg_mesh(
+        model,
+        sample,
+        max_steps=int(sample["target_coarse_ids"].shape[0]),
+        stop_probability_threshold=1.1,
+        greedy=True,
+    )
+
+    target_shape = tuple(int(v) for v in sample["target_grid_shape"].tolist())
+    assert result["predicted_continuation_vertices_local"].shape[0] == int(sample["target_coarse_ids"].shape[0])
+    assert result["continuation_grid_local"].shape == (*target_shape, 3)
+    assert "predicted_coarse_axis_ids" in result
+    assert tuple(result["predicted_coarse_axis_ids"].keys()) == ("z", "y", "x")
+    assert result["predicted_coarse_axis_ids"]["z"].shape[0] == int(sample["target_coarse_ids"].shape[0])
 
 
 def test_autoreg_mesh_validation_metrics_are_logged_in_history(tmp_path: Path) -> None:
@@ -544,9 +600,39 @@ def test_soft_decode_matches_hard_decode_for_one_hot_logits() -> None:
     offset_logits[0, 0, 2, 3] = 40.0
     pred_refine_residual = torch.zeros((1, 1, 3), dtype=torch.float32)
 
-    soft_xyz = model._soft_decode_local_xyz(coarse_logits, offset_logits, pred_refine_residual)
+    soft_xyz = model._soft_decode_local_xyz(coarse_logits, None, offset_logits, pred_refine_residual)
     hard_xyz = model.decode_local_xyz(
         torch.tensor([[5]], dtype=torch.long),
+        torch.tensor([[[1, 2, 3]]], dtype=torch.long),
+    )
+
+    assert torch.allclose(soft_xyz, hard_xyz, atol=1e-4, rtol=1e-4)
+
+
+def test_factorized_soft_decode_matches_hard_decode_for_one_hot_axis_logits() -> None:
+    model = AutoregMeshModel(_make_factorized_cached_token_config()).eval()
+    coarse_axis_logits = {
+        "z": torch.full((1, 1, 2), -40.0, dtype=torch.float32),
+        "y": torch.full((1, 1, 2), -40.0, dtype=torch.float32),
+        "x": torch.full((1, 1, 2), -40.0, dtype=torch.float32),
+    }
+    coarse_axis_logits["z"][0, 0, 1] = 40.0
+    coarse_axis_logits["y"][0, 0, 0] = 40.0
+    coarse_axis_logits["x"][0, 0, 1] = 40.0
+    offset_logits = torch.full((1, 1, 3, 4), -40.0, dtype=torch.float32)
+    offset_logits[0, 0, 0, 1] = 40.0
+    offset_logits[0, 0, 1, 2] = 40.0
+    offset_logits[0, 0, 2, 3] = 40.0
+    pred_refine_residual = torch.zeros((1, 1, 3), dtype=torch.float32)
+
+    soft_xyz = model._soft_decode_local_xyz(None, coarse_axis_logits, offset_logits, pred_refine_residual)
+    coarse_id = model._flatten_coarse_axis_ids(
+        torch.tensor([[1]], dtype=torch.long),
+        torch.tensor([[0]], dtype=torch.long),
+        torch.tensor([[1]], dtype=torch.long),
+    )
+    hard_xyz = model.decode_local_xyz(
+        coarse_id,
         torch.tensor([[[1, 2, 3]]], dtype=torch.long),
     )
 
@@ -798,6 +884,7 @@ def test_distance_aware_target_default_config_values() -> None:
     config = _make_cached_token_config()
     validated = validate_autoreg_mesh_config(config)
     assert validated["pointer_temperature"] == pytest.approx(0.25)
+    assert validated["coarse_prediction_mode"] == "joint_pointer"
     assert validated["geometry_metric_enabled"] is True
     assert validated["geometry_metric_weight"] == pytest.approx(0.01)
     assert validated["geometry_metric_start_step"] == 2000
@@ -855,6 +942,66 @@ def test_distance_aware_coarse_loss_prefers_nearby_cells() -> None:
     assert near_loss.item() < far_loss.item()
 
 
+def test_factorized_distance_aware_coarse_loss_prefers_nearby_axis_cells() -> None:
+    target_ids = torch.tensor([[21]], dtype=torch.long)
+    supervision_mask = torch.tensor([[True]], dtype=torch.bool)
+    near_axis_logits = {
+        "z": torch.full((1, 1, 4), -10.0),
+        "y": torch.full((1, 1, 4), -10.0),
+        "x": torch.full((1, 1, 4), -10.0),
+    }
+    far_axis_logits = {
+        "z": torch.full((1, 1, 4), -10.0),
+        "y": torch.full((1, 1, 4), -10.0),
+        "x": torch.full((1, 1, 4), -10.0),
+    }
+    near_axis_logits["z"][0, 0, 1] = 10.0
+    near_axis_logits["y"][0, 0, 1] = 10.0
+    near_axis_logits["x"][0, 0, 2] = 10.0
+    far_axis_logits["z"][0, 0, 3] = 10.0
+    far_axis_logits["y"][0, 0, 3] = 10.0
+    far_axis_logits["x"][0, 0, 3] = 10.0
+
+    common_batch = {
+        "target_coarse_ids": target_ids,
+        "target_supervision_mask": supervision_mask,
+        "target_offset_bins": torch.zeros((1, 1, 3), dtype=torch.long),
+        "target_stop": torch.zeros((1, 1), dtype=torch.float32),
+        "target_xyz": torch.zeros((1, 1, 3), dtype=torch.float32),
+        "target_bin_center_xyz": torch.zeros((1, 1, 3), dtype=torch.float32),
+    }
+    common_outputs = {
+        "coarse_prediction_mode": "axis_factorized",
+        "offset_logits": torch.zeros((1, 1, 3, 4), dtype=torch.float32),
+        "stop_logits": torch.zeros((1, 1), dtype=torch.float32),
+        "pred_refine_residual": torch.zeros((1, 1, 3), dtype=torch.float32),
+        "pred_xyz": torch.zeros((1, 1, 3), dtype=torch.float32),
+        "pred_xyz_soft": torch.zeros((1, 1, 3), dtype=torch.float32),
+        "coarse_grid_shape": (4, 4, 4),
+    }
+
+    near_loss = compute_autoreg_mesh_losses(
+        {**common_outputs, "coarse_axis_logits": near_axis_logits},
+        common_batch,
+        offset_num_bins=(4, 4, 4),
+        distance_aware_coarse_targets_enabled=True,
+        distance_aware_coarse_target_radius=1,
+        distance_aware_coarse_target_sigma=1.0,
+        distance_aware_coarse_target_loss="soft_ce",
+    )["coarse_loss"]
+    far_loss = compute_autoreg_mesh_losses(
+        {**common_outputs, "coarse_axis_logits": far_axis_logits},
+        common_batch,
+        offset_num_bins=(4, 4, 4),
+        distance_aware_coarse_targets_enabled=True,
+        distance_aware_coarse_target_radius=1,
+        distance_aware_coarse_target_sigma=1.0,
+        distance_aware_coarse_target_loss="soft_ce",
+    )["coarse_loss"]
+
+    assert near_loss.item() < far_loss.item()
+
+
 def test_mixed_precision_is_rejected_until_supported() -> None:
     config = _make_cached_token_config()
     config["mixed_precision"] = "bf16"
@@ -900,6 +1047,11 @@ def test_rope_config_validation_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="cross_attention_use_rope"):
         validate_autoreg_mesh_config(bad_cross_rope)
 
+    bad_coarse_mode = _make_cached_token_config()
+    bad_coarse_mode["coarse_prediction_mode"] = "weird"
+    with pytest.raises(ValueError, match="coarse_prediction_mode"):
+        validate_autoreg_mesh_config(bad_coarse_mode)
+
 
 def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     config = _make_cached_token_config()
@@ -916,6 +1068,9 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
 
     assert result["dataset_length"] == len(dataset)
     assert result["sample_count"] == 2
+    assert result["coarse_prediction_mode"] == "joint_pointer"
+    assert result["coarse_grid_shape"] == [2, 2, 2]
+    assert result["coarse_axis_sizes"] == {"z": 2, "y": 2, "x": 2}
     assert result["median_prompt_length"] > 0
     assert result["median_target_length"] > 0
     assert result["median_valid_prompt_tokens"] > 0
@@ -938,6 +1093,24 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     assert result["rope_rescale_coords"] == pytest.approx(2.0)
     assert result["forward_ms"] >= 0.0
     assert result["infer_ms"] >= 0.0
+
+
+def test_axis_factorized_benchmark_reports_mode_and_axis_sizes() -> None:
+    config = _make_factorized_cached_token_config()
+    dataset = _make_training_dataset()
+    model = AutoregMeshModel(config).eval()
+
+    result = run_autoreg_mesh_benchmark(
+        config,
+        dataset=dataset,
+        model=model,
+        device="cpu",
+        sample_count=1,
+    )
+
+    assert result["coarse_prediction_mode"] == "axis_factorized"
+    assert result["coarse_grid_shape"] == [2, 2, 2]
+    assert result["coarse_axis_sizes"] == {"z": 2, "y": 2, "x": 2}
 
 
 def test_cross_attention_rope_can_be_disabled(tmp_path: Path) -> None:
@@ -1028,3 +1201,28 @@ def test_autoreg_mesh_resume_uses_checkpoint_wandb_run_id(tmp_path: Path, monkey
     assert second_result["start_step"] == 1
     assert fake_wandb.init_calls[1]["resume"] == "allow"
     assert fake_wandb.init_calls[1]["id"] == "fake-run-1"
+
+
+def test_autoreg_mesh_resume_rejects_mismatched_coarse_prediction_mode(tmp_path: Path) -> None:
+    dataset = _make_training_dataset()
+
+    first_config = _make_cached_token_config()
+    first_config.update(
+        {
+            "out_dir": str(tmp_path / "mode_resume_runs"),
+            "save_final_checkpoint": False,
+        }
+    )
+    first_result = run_autoreg_mesh_training(first_config, dataset=dataset, device="cpu", max_steps=1)
+    ckpt_path = Path(first_result["checkpoint_paths"][0])
+
+    second_config = _make_factorized_cached_token_config()
+    second_config.update(
+        {
+            "out_dir": str(tmp_path / "mode_resume_runs"),
+            "load_ckpt": str(ckpt_path),
+            "save_final_checkpoint": False,
+        }
+    )
+    with pytest.raises(ValueError, match="coarse_prediction_mode"):
+        run_autoreg_mesh_training(second_config, dataset=dataset, device="cpu", max_steps=2)
