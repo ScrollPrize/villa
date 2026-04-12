@@ -250,11 +250,15 @@ struct BlockSampler {
     }
 };
 
-// Given a region of voxel coords, submit the enclosing chunk keys to the
-// IO pool so that decode begins before sampling starts.
-void prefetchRegion(BlockPipeline& cache, int level,
-                    float minVx, float minVy, float minVz,
-                    float maxVx, float maxVy, float maxVz) {
+// Append the chunk keys that enclose a world-space bbox to `out`. Callers
+// that submit multiple regions/levels in one frame should accumulate into
+// a single vector and call cache.fetchInteractive(keys) exactly once —
+// every fetchInteractive call rebuilds the IOPool priority queue, so
+// batching matters.
+void appendChunksForRegion(BlockPipeline& cache, int level,
+                           float minVx, float minVy, float minVz,
+                           float maxVx, float maxVy, float maxVz,
+                           std::vector<vc::cache::ChunkKey>& out) {
     auto cs = cache.chunkShape(level);
     if (cs[0] <= 0) return;
     auto ls = cache.levelShape(level);
@@ -274,11 +278,19 @@ void prefetchRegion(BlockPipeline& cache, int level,
     int cMinY = iMinY / cs[1], cMaxY = iMaxY / cs[1];
     int cMinZ = iMinZ / cs[0], cMaxZ = iMaxZ / cs[0];
 
-    std::vector<vc::cache::ChunkKey> keys;
     for (int iz = cMinZ; iz <= cMaxZ && iz < chunksZ; iz++)
         for (int iy = cMinY; iy <= cMaxY && iy < chunksY; iy++)
             for (int ix = cMinX; ix <= cMaxX && ix < chunksX; ix++)
-                keys.push_back({level, iz, iy, ix});
+                out.push_back({level, iz, iy, ix});
+}
+
+// Convenience wrapper: single-region, single-level. Submits immediately.
+void prefetchRegion(BlockPipeline& cache, int level,
+                    float minVx, float minVy, float minVz,
+                    float maxVx, float maxVy, float maxVz) {
+    std::vector<vc::cache::ChunkKey> keys;
+    appendChunksForRegion(cache, level, minVx, minVy, minVz,
+                          maxVx, maxVy, maxVz, keys);
     if (!keys.empty()) cache.fetchInteractive(keys);
 }
 
@@ -603,35 +615,49 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
                                 int w, int h, const uint32_t lut[256])
 {
     // Pre-start fetches for all levels. Coords/origin are in world (level-0)
-    // voxel space; scale to each level before enumerating chunks.
+    // voxel space; scale to each level before enumerating chunks. Batch
+    // everything into one fetchInteractive call — the IOPool's queue
+    // rebuild is O(N) and we'd otherwise pay it once per level.
     auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
+    std::vector<vc::cache::ChunkKey> prefetchKeys;
     if (coords) {
-        for (int lvl = desiredLevel; lvl < numLevels; lvl++) {
-            float s = levelScale(lvl);
-            float minVx = FLT_MAX, minVy = FLT_MAX, minVz = FLT_MAX;
-            float maxVx = -FLT_MAX, maxVy = -FLT_MAX, maxVz = -FLT_MAX;
-            for (int r = 0; r < coords->rows; r++) {
-                const cv::Vec3f* row = coords->ptr<cv::Vec3f>(r);
-                for (int c = 0; c < coords->cols; c++) {
-                    const auto& v = row[c];
-                    if (!isfinite_bitwise(v[0])) continue;
-                    minVx = std::min(minVx, v[0]); maxVx = std::max(maxVx, v[0]);
-                    minVy = std::min(minVy, v[1]); maxVy = std::max(maxVy, v[1]);
-                    minVz = std::min(minVz, v[2]); maxVz = std::max(maxVz, v[2]);
-                }
+        // Compute world-space bbox once, subsample like the composite path.
+        float minVx = FLT_MAX, minVy = FLT_MAX, minVz = FLT_MAX;
+        float maxVx = -FLT_MAX, maxVy = -FLT_MAX, maxVz = -FLT_MAX;
+        const int stride = (coords->rows > 256) ? 8 : 1;
+        for (int r = 0; r < coords->rows; r += stride) {
+            const cv::Vec3f* row = coords->ptr<cv::Vec3f>(r);
+            for (int c = 0; c < coords->cols; c += stride) {
+                const auto& v = row[c];
+                if (!isfinite_bitwise(v[0])) continue;
+                minVx = std::min(minVx, v[0]); maxVx = std::max(maxVx, v[0]);
+                minVy = std::min(minVy, v[1]); maxVy = std::max(maxVy, v[1]);
+                minVz = std::min(minVz, v[2]); maxVz = std::max(maxVz, v[2]);
             }
-            if (maxVx < minVx) continue;
-            prefetchRegion(cache, lvl,
-                           minVx * s, minVy * s, minVz * s,
-                           maxVx * s, maxVy * s, maxVz * s);
+        }
+        if (maxVx >= minVx) {
+            for (int lvl = desiredLevel; lvl < numLevels; lvl++) {
+                float s = levelScale(lvl);
+                appendChunksForRegion(cache, lvl,
+                    minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s,
+                    prefetchKeys);
+            }
         }
     } else {
+        // Plane bbox from corners, compute once then scale per level.
+        cv::Vec3f p0 = *origin;
+        cv::Vec3f p1 = *origin + (*vx_step) * float(w-1) + (*vy_step) * float(h-1);
+        float minVx = std::min(p0[0], p1[0]), maxVx = std::max(p0[0], p1[0]);
+        float minVy = std::min(p0[1], p1[1]), maxVy = std::max(p0[1], p1[1]);
+        float minVz = std::min(p0[2], p1[2]), maxVz = std::max(p0[2], p1[2]);
         for (int lvl = desiredLevel; lvl < numLevels; lvl++) {
             float s = levelScale(lvl);
-            prefetchPlaneRegion(cache, lvl,
-                (*origin) * s, (*vx_step) * s, (*vy_step) * s, w, h);
+            appendChunksForRegion(cache, lvl,
+                minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s,
+                prefetchKeys);
         }
     }
+    if (!prefetchKeys.empty()) cache.fetchInteractive(prefetchKeys);
 
     float scales[32] = {};
     const int nSamplersTotal = numLevels - desiredLevel;
@@ -733,10 +759,13 @@ void sampleCompositeAdaptiveImpl(
             }
         }
         if (maxVx >= minVx) {
+            std::vector<vc::cache::ChunkKey> keys;
             for (int lvl=desiredLevel; lvl<numLevels; lvl++) {
                 float s = levelScale(lvl);
-                prefetchRegion(cache, lvl, minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s);
+                appendChunksForRegion(cache, lvl,
+                    minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s, keys);
             }
+            if (!keys.empty()) cache.fetchInteractive(keys);
         }
     } else {
         cv::Vec3f p0 = *origin + (*planeNormal) * zMin;
@@ -744,10 +773,13 @@ void sampleCompositeAdaptiveImpl(
         float minVx=std::min(p0[0],p1[0]), maxVx=std::max(p0[0],p1[0]);
         float minVy=std::min(p0[1],p1[1]), maxVy=std::max(p0[1],p1[1]);
         float minVz=std::min(p0[2],p1[2]), maxVz=std::max(p0[2],p1[2]);
+        std::vector<vc::cache::ChunkKey> keys;
         for (int lvl=desiredLevel; lvl<numLevels; lvl++) {
             float s = levelScale(lvl);
-            prefetchRegion(cache, lvl, minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s);
+            appendChunksForRegion(cache, lvl,
+                minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s, keys);
         }
+        if (!keys.empty()) cache.fetchInteractive(keys);
     }
 
     // Precompute per-level scale factor once (1.0 / 2^lvl). Hoists the
@@ -823,8 +855,11 @@ void sampleCompositeAdaptiveImpl(
                     uint8_t v = 0;
                     if (fullyInBounds) {
                         // Hot path: no per-sample bounds check; no fallback.
+                        // Scale world coords into the level-0-sampler's
+                        // space (scales[0] = 1/2^desiredLevel).
                         // Missed block => v stays 0 (pixel currently loading).
-                        trySampleNearestUnchecked(*samplers[0], wz, wy, wx, v);
+                        trySampleNearestUnchecked(*samplers[0],
+                            wz * endScale, wy * endScale, wx * endScale, v);
                     } else {
                         for (int i=0; i<nSamplers; i++) {
                             float scl = scales[i];
