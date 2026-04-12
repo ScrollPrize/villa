@@ -52,10 +52,6 @@ public:
     // Evicted blocks stay alive while any caller still holds a shared_ptr.
     [[nodiscard]] BlockPtr blockAt(const BlockKey& key) noexcept;
 
-    // Blocking: ensures the enclosing chunk is decoded, then returns the
-    // block. Null if the region is negative-cached or unavailable.
-    [[nodiscard]] BlockPtr getBlockingBlock(const BlockKey& key);
-
     // --- Interactive fetch (for viewport chunks) ---
     // Chunk keys are still the IO unit — after decode, each chunk is split
     // into 16^3 blocks and inserted into the block cache.
@@ -123,10 +119,6 @@ private:
     IOPool ioPool_;
 
     BlockCache blockCache_;
-
-    // Blocking chunk fetch (canonical disk → source, with rechunking if the
-    // source granularity differs). Returns a decoded ChunkData.
-    [[nodiscard]] ChunkDataPtr fetchChunkBlocking(const ChunkKey& key);
 
     // Assemble a canonical 128^3 chunk from one or more source chunks at
     // `canonKey.level`, rechunking as needed. Null if the canonical region

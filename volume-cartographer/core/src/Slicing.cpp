@@ -75,9 +75,10 @@ struct VolumeShape {
     }
 };
 
-// Direct-mapped block cache keyed by (bz, by, bx). On miss, pulls the block
-// synchronously via BlockPipeline::getBlockingBlock. Slots hold the BlockPtr
-// to keep the block alive while in use.
+// Direct-mapped block cache keyed by (bz, by, bx). On miss, consults the
+// block cache only — never blocks on disk or network. Missing blocks make
+// sampleInt return 0 (black) for that voxel. Viewport-demand fetches feed
+// the cache asynchronously via BlockPipeline::fetchInteractive.
 template<typename T, int kSlots = 64>
 struct BlockSampler {
     static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be power of 2");
@@ -108,28 +109,13 @@ struct BlockSampler {
         return int(h) & kSlotMask;
     }
 
-    // Fetch the block pointer for (bz, by, bx). Updates `data`.
+    // Fetch the block pointer for (bz, by, bx). Non-blocking: returns null
+    // data if the block isn't resident in the cache.
     VC_FORCE_INLINE void updateBlock(int bz, int by, int bx) {
-        uint64_t key = packKey(bz, by, bx);
-        if (key == lastKey) return;
-
-        int idx = slotIndex(bz, by, bx);
-        Slot& slot = slots[idx];
-        if (slot.key == key) {
-            data = slot.data;
-            lastKey = key;
-            return;
-        }
-
-        BlockKey bk{level, bz, by, bx};
-        slot.block = cache.getBlockingBlock(bk);
-        slot.data = slot.block ? reinterpret_cast<const T*>(slot.block->data) : nullptr;
-        slot.key = key;
-        data = slot.data;
-        lastKey = key;
+        tryUpdateBlockNonBlocking(bz, by, bx);
     }
 
-    // Non-blocking variant: only consults the RAM block cache, never fetches.
+    // Identical; kept for callers that want to be explicit about intent.
     VC_FORCE_INLINE void tryUpdateBlockNonBlocking(int bz, int by, int bx) {
         uint64_t key = packKey(bz, by, bx);
         if (key == lastKey) return;
