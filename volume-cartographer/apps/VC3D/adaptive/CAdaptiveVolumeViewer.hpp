@@ -55,13 +55,13 @@ public:
     // --- Data setup ---
     void setPointCollection(VCCollection* pc) { _pointCollection = pc; }
     void setSurface(const std::string& name);
-    void setIntersects(const std::set<std::string>&) {}
+    void setIntersects(const std::set<std::string>& names) { _intersectTgts = names; renderIntersections(); }
 
     // --- Rendering ---
     void renderVisible(bool force = false);
-    void renderIntersections() override {}
+    void renderIntersections() override;
     void invalidateVis() {}
-    void invalidateIntersect(const std::string& = "") override {}
+    void invalidateIntersect(const std::string& = "") override;
 
     // --- Accessors ---
     std::string surfName() const override { return _surfName; }
@@ -137,14 +137,18 @@ public:
     auto selections() const -> std::vector<std::pair<QRectF, QColor>> override { return {}; }
     std::optional<QRectF> activeBBoxSceneRect() const override { return std::nullopt; }
 
-    // --- Intersection stubs ---
-    float intersectionOpacity() const override { return 1.0f; }
-    float intersectionThickness() const override { return 0.0f; }
-    int surfacePatchSamplingStride() const override { return 1; }
-    void setIntersectionOpacity(float) {}
-    void setIntersectionThickness(float) {}
-    void setHighlightedSurfaceIds(const std::vector<std::string>&) {}
-    void setSurfacePatchSamplingStride(int) {}
+    // --- Intersection ---
+    float intersectionOpacity() const override { return _intersectionOpacity; }
+    float intersectionThickness() const override { return _intersectionThickness; }
+    int surfacePatchSamplingStride() const override { return _surfacePatchSamplingStride; }
+    void setIntersectionOpacity(float v) { _intersectionOpacity = v; renderIntersections(); }
+    void setIntersectionThickness(float v) { _intersectionThickness = v; renderIntersections(); }
+    void setHighlightedSurfaceIds(const std::vector<std::string>& ids) {
+        _highlightedSurfaceIds.clear();
+        for (const auto& id : ids) _highlightedSurfaceIds.insert(id);
+        renderIntersections();
+    }
+    void setSurfacePatchSamplingStride(int s) { _surfacePatchSamplingStride = s; }
 
     // --- Surface overlay stubs ---
     bool surfaceOverlayEnabled() const override { return false; }
@@ -306,6 +310,16 @@ private:
 
     // --- Overlay groups (stored for VolumeViewerBase interface) ---
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
+
+    // --- Intersection overlay ---
+    std::set<std::string> _intersectTgts;
+    std::unordered_set<std::string> _highlightedSurfaceIds;
+    std::vector<QGraphicsItem*> _intersectionItems;
+    float _intersectionOpacity = 0.7f;
+    float _intersectionThickness = 0.0f;
+    int _surfacePatchSamplingStride = 2;
+    std::unordered_map<std::string, size_t> _surfaceColorAssignments;
+    size_t _nextColorIndex = 0;
 
     // --- Chunk-ready listener ---
     vc::cache::BlockPipeline::ChunkReadyCallbackId _chunkCbId = 0;
