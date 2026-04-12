@@ -714,32 +714,6 @@
             </item>
            </widget>
           </item>
-          <item row="6" column="0">
-           <widget class="QLabel" name="lblPrefetchLevels">
-            <property name="text">
-             <string>Prefetch levels on open:</string>
-            </property>
-            <property name="toolTip">
-             <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;How many of the coarsest pyramid levels to download when opening a remote volume.&lt;/p&gt;&lt;p&gt;E.g., with a volume that has levels 0/ through 5/:&lt;/p&gt;&lt;ul&gt;&lt;li&gt;0 = no prefetch (on-demand only)&lt;/li&gt;&lt;li&gt;1 = download 5/ (already happens by default)&lt;/li&gt;&lt;li&gt;2 = download 5/ and 4/&lt;/li&gt;&lt;li&gt;3 = download 5/, 4/, and 3/&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;Downloads go through the normal pipeline (recompression if enabled). Non-blocking.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-            </property>
-           </widget>
-          </item>
-          <item row="6" column="1">
-           <widget class="QSpinBox" name="spinPrefetchLevels">
-            <property name="minimum">
-             <number>0</number>
-            </property>
-            <property name="maximum">
-             <number>6</number>
-            </property>
-            <property name="value">
-             <number>0</number>
-            </property>
-            <property name="toolTip">
-             <string>Number of coarsest pyramid levels to prefetch (0 = disabled)</string>
-            </property>
-           </widget>
-          </item>
           <item row="7" column="0">
            <widget class="QLabel" name="lblIOThreads">
             <property name="text">

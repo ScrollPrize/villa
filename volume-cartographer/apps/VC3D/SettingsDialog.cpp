@@ -64,7 +64,6 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
         edtRemoteCachePath->setText(settings.value(viewer::REMOTE_CACHE_DIR, defaultCache).toString());
     }
 
-    spinPrefetchLevels->setValue(settings.value(perf::PREFETCH_LEVELS, perf::PREFETCH_LEVELS_DEFAULT).toInt());
     spinIOThreads->setValue(settings.value(perf::IO_THREADS, perf::IO_THREADS_DEFAULT).toInt());
 
     // Hide removed recompression UI
@@ -134,7 +133,6 @@ void SettingsDialog::accept()
     settings.setValue(perf::DISK_CACHE_SIZE_GB, spinDiskCacheSizeGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
 
-    settings.setValue(perf::PREFETCH_LEVELS, spinPrefetchLevels->value());
     settings.setValue(perf::IO_THREADS, spinIOThreads->value());
 
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));

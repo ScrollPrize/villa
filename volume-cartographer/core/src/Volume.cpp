@@ -41,11 +41,7 @@ Volume::Volume(std::filesystem::path path) : path_(std::move(path))
     mountInfo_ = vc::detectNetworkMount(path_);
 }
 
-Volume::~Volume() noexcept
-{
-    // Request stop and join the prefetch thread before destroying the cache
-    prefetchStop_.store(true, std::memory_order_relaxed);
-}
+Volume::~Volume() noexcept = default;
 
 void Volume::loadMetadata()
 {
@@ -513,15 +509,6 @@ int Volume::sampleBestEffort(cv::Mat_<uint8_t>& out,
     const auto& scaled = scaleCoords(coords, useLvl);
     readInterpolated3D(out, tieredCache(), useLvl, scaled, params.method);
 
-    if (useLvl > level) {
-        // Prefetch desired level and one intermediate for progressive refinement
-        prefetchChunks(coords, level);
-        if (useLvl - level > 1)
-            prefetchChunks(coords, level + 1);
-    } else if (useLvl > 0) {
-        // At desired level — prefetch next finer for smooth zoom-in
-        prefetchChunks(coords, useLvl - 1);
-    }
     if (!out.empty())
         applyOptionalPostProcess(out, params);
     return useLvl;
@@ -552,23 +539,17 @@ int Volume::sampleCompositeBestEffort(cv::Mat_<uint8_t>& out,
 
     for (int lvl = level; lvl < nScales; lvl++) {
         if (allCompositeChunksCached(coords, normals, params.zStart, params.zEnd, lvl)) {
-            // Render at this level
             vc::SampleParams lvlParams = params;
             lvlParams.level = lvl;
             sampleComposite(out, coords, normals, lvlParams);
-            if (lvl > level)
-                prefetchCompositeChunks(coords, normals, params.zStart, params.zEnd, level);
             return lvl;
         }
     }
 
-    // Coarsest level — block
     int last = std::max(0, nScales - 1);
     vc::SampleParams lastParams = params;
     lastParams.level = last;
     sampleComposite(out, coords, normals, lastParams);
-    if (last > level)
-        prefetchCompositeChunks(coords, normals, params.zStart, params.zEnd, level);
     return last;
 }
 
@@ -618,40 +599,17 @@ int Volume::samplePlaneBestEffort(cv::Mat_<uint8_t>& out,
             samplePlane(out, tieredCache(), lvl,
                         origin * scale, vx_step * scale, vy_step * scale,
                         width, height, params.method);
-            if (lvl > level) {
-                prefetchWorldBBox(
-                    cv::Vec3f(wb.loX, wb.loY, wb.loZ),
-                    cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level);
-                if (lvl - level > 1)
-                    prefetchWorldBBox(
-                        cv::Vec3f(wb.loX, wb.loY, wb.loZ),
-                        cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level + 1);
-            } else if (lvl > 0) {
-                prefetchWorldBBox(
-                    cv::Vec3f(wb.loX, wb.loY, wb.loZ),
-                    cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), lvl - 1);
-            }
             if (!out.empty())
                 applyOptionalPostProcess(out, params);
             return lvl;
         }
     }
 
-    // No level cached — block at coarsest level
     int last = std::max(0, nScales - 1);
     float scale = (last > 0) ? (1.0f / static_cast<float>(1 << last)) : 1.0f;
     samplePlane(out, tieredCache(), last,
                 origin * scale, vx_step * scale, vy_step * scale,
                 width, height, params.method);
-    if (last > level) {
-        prefetchWorldBBox(
-            cv::Vec3f(wb.loX, wb.loY, wb.loZ),
-            cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level);
-        if (last - level > 1)
-            prefetchWorldBBox(
-                cv::Vec3f(wb.loX, wb.loY, wb.loZ),
-                cv::Vec3f(wb.hiX, wb.hiY, wb.hiZ), level + 1);
-    }
     if (!out.empty())
         applyOptionalPostProcess(out, params);
     return last;
@@ -668,17 +626,10 @@ int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
     const int nScales = static_cast<int>(numScales());
     const int desired = std::clamp(params.level, 0, std::max(0, nScales - 1));
 
-    // Prefetch all levels from desired to coarsest BEFORE rendering.
-    // This ensures fallback levels have data, and the desired level
-    // starts downloading for progressive refinement.
     auto pb = planeBBox(origin, vx_step, vy_step, width, height);
     cv::Vec3f pfLo(pb.loX, pb.loY, pb.loZ);
     cv::Vec3f pfHi(pb.hiX, pb.hiY, pb.hiZ);
-    // Interactive: viewport chunks at desired level download first
     fetchInteractiveWorldBBox(pfLo, pfHi, desired);
-    // Prefetch: all levels for progressive refinement (background queue)
-    for (int lvl = desired; lvl < nScales; lvl++)
-        prefetchWorldBBox(pfLo, pfHi, lvl);
 
     // Render with per-pixel fallback to coarser levels.
     // Each pixel tries the desired level first; if that chunk isn't in hot
@@ -854,39 +805,6 @@ bool Volume::allCompositeChunksCached(
         cbbox.maxIz, cbbox.maxIy, cbbox.maxIx);
 }
 
-void Volume::prefetchCompositeChunks(
-    const cv::Mat_<cv::Vec3f>& coords,
-    const cv::Mat_<cv::Vec3f>& normals,
-    int zStart, int zEnd, int level)
-{
-    ensureTieredCache();
-    if (!tieredCache_ || coords.empty()) return;
-
-    auto cbbox = compositeChunkBBox(coords, normals, zStart, zEnd, level);
-    if (cbbox.minIx > cbbox.maxIx || cbbox.minIy > cbbox.maxIy || cbbox.minIz > cbbox.maxIz)
-        return;
-
-    tieredCache_->prefetchRegion(level, cbbox.minIz, cbbox.minIy, cbbox.minIx,
-                                 cbbox.maxIz, cbbox.maxIy, cbbox.maxIx);
-}
-
-void Volume::pinCoarsestLevel(bool blocking)
-{
-    ensureTieredCache();
-    if (!tieredCache_ || zarrDs_.empty()) return;
-
-    int last = static_cast<int>(zarrDs_.size()) - 1;
-    tieredCache_->loadCoarseLevel(last);
-
-    // Scan the coarsest level for all-zero chunks and propagate
-    // zero-knowledge to all finer levels. This eliminates network requests
-    // for chunks in masked/padded regions of the volume.
-    tieredCache_->propagateZeroChunks(last);
-    if (blocking) {
-        computeDataBounds();
-    }
-}
-
 // ============================================================================
 // Data bounds
 // ============================================================================
@@ -986,8 +904,6 @@ void Volume::primeRemoteLevel5Blocking(
 
         for (size_t i = 0; i < allKeys.size(); i += kBatchSize) {
             size_t end = std::min(i + kBatchSize, allKeys.size());
-            for (size_t j = i; j < end; j++)
-                tieredCache_->prefetch(allKeys[j]);
             for (size_t j = i; j < end; j++) {
                 (void)tieredCache_->getBlocking(allKeys[j]);
                 completed++;
@@ -1158,108 +1074,6 @@ bool Volume::allChunksCachedFast(const WorldBBox& wb, int level) const
     return tieredCache_->areAllCachedInRegion(
         level, bb.minIz, bb.minIy, bb.minIx,
         bb.maxIz, bb.maxIy, bb.maxIx);
-}
-
-void Volume::prefetchChunks(const cv::Mat_<cv::Vec3f>& coords, int level)
-{
-    ensureTieredCache();
-    if (!tieredCache_) return;
-
-    auto bb = coordsToChunkBBox(coords, level);
-    if (bb.minIx > bb.maxIx || bb.minIy > bb.maxIy || bb.minIz > bb.maxIz) return;  // invalid bbox
-
-    tieredCache_->prefetchRegion(level,
-        bb.minIz, bb.minIy, bb.minIx,
-        bb.maxIz, bb.maxIy, bb.maxIx);
-}
-
-void Volume::prefetchLevels(int fromLevel, int toLevel)
-{
-    ensureTieredCache();
-    if (!tieredCache_) return;
-
-    int maxLevel = tieredCache_->numLevels() - 1;
-    fromLevel = std::clamp(fromLevel, 0, maxLevel);
-    toLevel = std::clamp(toLevel, 0, maxLevel);
-
-    // Spawn a detached background thread — never blocks the GUI
-    std::thread([cache = tieredCache_.get(), fromLevel, toLevel, &stop = prefetchStop_]() {
-        stop.store(false, std::memory_order_relaxed);
-
-        // Load the coarsest level into dedicated flat storage, then scan for
-        // all-zero chunks and propagate to finer levels.
-        // This eliminates network requests for chunks in masked/padded regions.
-        cache->loadCoarseLevel(toLevel);
-        cache->propagateZeroChunks(toLevel);
-
-        for (int lvl = toLevel - 1; lvl >= fromLevel && !stop.load(std::memory_order_relaxed); lvl--) {
-            auto ls = cache->levelShape(lvl);
-            auto cs = cache->chunkShape(lvl);
-            int gridZ = (ls[0] + cs[0] - 1) / cs[0];
-            int gridY = (ls[1] + cs[1] - 1) / cs[1];
-            int gridX = (ls[2] + cs[2] - 1) / cs[2];
-            int total = gridZ * gridY * gridX;
-
-            std::fprintf(stderr, "[Volume] Prefetching level %d (%d chunks)...\n",
-                         lvl, total);
-
-            // Use whole-shard download for sharded datasets (1 S3 GET per shard
-            // instead of 512), falls back to per-chunk for non-sharded.
-            cache->prefetchShardsLevel(lvl, [lvl](int fetched, int t) {
-                if (fetched % 10 == 0 || fetched == t)
-                    std::fprintf(stderr, "[Volume] Level %d shard prefetch: %d/%d\n",
-                                 lvl, fetched, t);
-            });
-            std::fprintf(stderr, "[Volume] Level %d prefetch done\n", lvl);
-        }
-        std::fprintf(stderr, "[Volume] Level prefetch complete (levels %d-%d)\n",
-                     fromLevel, toLevel);
-    }).detach();
-}
-
-void Volume::cancelPendingPrefetch()
-{
-    // Stop the prefetch thread first
-    prefetchStop_.store(true, std::memory_order_relaxed);
-    if (tieredCache_) {
-        tieredCache_->cancelPendingPrefetch();
-    }
-}
-
-void Volume::prefetchWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level)
-{
-    ensureTieredCache();
-    if (!tieredCache_) return;
-
-    vc::VcDataset* ds = zarrDataset(level);
-    if (!ds) return;
-
-    float scale = (level > 0) ? (1.0f / static_cast<float>(1 << level)) : 1.0f;
-    auto cs = ds->defaultChunkShape();  // {cz, cy, cx}
-    const auto& shape = ds->shape();    // {z, y, x}
-    float csX = static_cast<float>(cs[2]), csY = static_cast<float>(cs[1]), csZ = static_cast<float>(cs[0]);
-
-    // Apply margin to float coords, then floor/ceil to chunk indices
-    float sLoX = lo[0] * scale - 1.0f;
-    float sHiX = hi[0] * scale + 1.0f;
-    float sLoY = lo[1] * scale - 1.0f;
-    float sHiY = hi[1] * scale + 1.0f;
-    float sLoZ = lo[2] * scale - 1.0f;
-    float sHiZ = hi[2] * scale + 1.0f;
-
-    int minIx = std::max(0, static_cast<int>(std::floor(sLoX / csX)));
-    int maxIx = std::min(static_cast<int>((shape[2] - 1) / cs[2]),
-                         static_cast<int>(std::ceil(sHiX / csX)));
-    int minIy = std::max(0, static_cast<int>(std::floor(sLoY / csY)));
-    int maxIy = std::min(static_cast<int>((shape[1] - 1) / cs[1]),
-                         static_cast<int>(std::ceil(sHiY / csY)));
-    int minIz = std::max(0, static_cast<int>(std::floor(sLoZ / csZ)));
-    int maxIz = std::min(static_cast<int>((shape[0] - 1) / cs[0]),
-                         static_cast<int>(std::ceil(sHiZ / csZ)));
-
-    if (minIx > maxIx || minIy > maxIy || minIz > maxIz) return;
-
-    tieredCache_->prefetchRegion(level, minIz, minIy, minIx, maxIz, maxIy, maxIx);
 }
 
 void Volume::fetchInteractiveWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level)

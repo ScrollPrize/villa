@@ -164,8 +164,6 @@ TieredChunkCache::TieredChunkCache(
                                 reinterpret_cast<const uint8_t*>(bytes.data() + bytes.size())));
                             statColdHits_.fetch_add(1, std::memory_order_relaxed);
                         }
-                        // Empty/missing chunks in shard are just skipped —
-                        // already handled by propagateZeroChunks at startup
                     }
                 }
             }
@@ -323,10 +321,6 @@ void TieredChunkCache::bloomClear() noexcept
 
 ChunkDataPtr TieredChunkCache::get(const ChunkKey& key)
 {
-    // Direct access for coarsest level — no cache lookup
-    auto coarse = getCoarse(key);
-    if (coarse) return coarse;
-
     // Check hot tier
     auto hot = hotGet(key);
     if (hot) {
@@ -362,10 +356,6 @@ std::pair<ChunkDataPtr, int> TieredChunkCache::getBestAvailable(
 
 ChunkDataPtr TieredChunkCache::getBlocking(const ChunkKey& key)
 {
-    // Direct access for coarsest level — no cache lookup
-    auto coarse = getCoarse(key);
-    if (coarse) return coarse;
-
     // Fast path: hot cache hit. This is the common case during rendering —
     // just hash + shard + lock_guard + flat-map probe + return.
     auto hot = hotGet(key);
@@ -388,30 +378,8 @@ ChunkDataPtr TieredChunkCache::getBlocking(const ChunkKey& key)
 }
 
 // =============================================================================
-// Async prefetch
+// Interactive fetch
 // =============================================================================
-
-void TieredChunkCache::prefetch(const ChunkKey& key)
-{
-    if (isReadyForNonBlockingRead(key)) return;
-    statTotalSubmitted_.fetch_add(1, std::memory_order_relaxed);
-    ioPool_.submit({key}, Priority::Prefetch);
-}
-
-void TieredChunkCache::prefetch(const std::vector<ChunkKey>& keys)
-{
-    if (keys.empty()) return;
-    std::vector<ChunkKey> submit;
-    submit.reserve(keys.size());
-    for (const auto& key : keys) {
-        if (!isReadyForNonBlockingRead(key))
-            submit.push_back(key);
-    }
-    if (!submit.empty()) {
-        statTotalSubmitted_.fetch_add(submit.size(), std::memory_order_relaxed);
-        ioPool_.submit(submit, Priority::Prefetch);
-    }
-}
 
 void TieredChunkCache::fetchInteractive(const std::vector<ChunkKey>& keys)
 {
@@ -426,290 +394,6 @@ void TieredChunkCache::fetchInteractive(const std::vector<ChunkKey>& keys)
         ioPool_.updateInteractive(submit);
 }
 
-void TieredChunkCache::prefetchRegion(
-    int level, int iz0, int iy0, int ix0, int iz1, int iy1, int ix1)
-{
-    // Build all candidate keys
-    int totalChecked = 0;
-    std::vector<ChunkKey> allKeys;
-    allKeys.reserve(static_cast<size_t>(iz1 - iz0 + 1) * (iy1 - iy0 + 1) * (ix1 - ix0 + 1));
-    for (int iz = iz0; iz <= iz1; iz++) {
-        for (int iy = iy0; iy <= iy1; iy++) {
-            for (int ix = ix0; ix <= ix1; ix++) {
-                totalChecked++;
-                allKeys.push_back(ChunkKey{level, iz, iy, ix});
-            }
-        }
-    }
-
-    // Use LRUCache batch operations to filter efficiently
-    auto missingHot = hotCache_.missing_keys(allKeys.begin(), allKeys.end());
-
-    // Filter out negative-cached keys
-    std::vector<ChunkKey> keys;
-    if (!missingHot.empty()) {
-        keys.reserve(missingHot.size());
-        for (const auto& key : missingHot) {
-            if (!isReadyForNonBlockingRead(key)) {
-                keys.push_back(key);
-            }
-        }
-    }
-    if (auto* log = cacheDebugLog()) {
-        static std::atomic<int> prefetchLogCount{0};
-        int n = prefetchLogCount.fetch_add(1, std::memory_order_relaxed);
-        if (n < 5) {
-            std::fprintf(log, "prefetchRegion: level=%d range=(%d-%d,%d-%d,%d-%d) checked=%d toSubmit=%zu\n",
-                         level, iz0, iz1, iy0, iy1, ix0, ix1, totalChecked, keys.size());
-        }
-    }
-    if (!keys.empty()) {
-        statTotalSubmitted_.fetch_add(keys.size(), std::memory_order_relaxed);
-        ioPool_.submit(keys, Priority::Prefetch);
-    }
-}
-
-void TieredChunkCache::prefetchLevel(int level, const PrefetchProgressCb& progressCb)
-{
-    if (level < 0 || level >= numLevels()) return;
-
-    auto shape = levelShape(level);
-    auto chunks = chunkShape(level);
-    int gridZ = (shape[0] + chunks[0] - 1) / chunks[0];
-    int gridY = (shape[1] + chunks[1] - 1) / chunks[1];
-    int gridX = (shape[2] + chunks[2] - 1) / chunks[2];
-    int total = gridZ * gridY * gridX;
-
-    if (auto* log = cacheDebugLog())
-        std::fprintf(log, "prefetchLevel: level=%d grid=%dx%dx%d total=%d\n",
-                     level, gridZ, gridY, gridX, total);
-
-    std::vector<ChunkKey> keys;
-    keys.reserve(total);
-    int skipped = 0;
-    for (int iz = 0; iz < gridZ; iz++)
-        for (int iy = 0; iy < gridY; iy++)
-            for (int ix = 0; ix < gridX; ix++) {
-                ChunkKey key{level, iz, iy, ix};
-                // Skip chunks already known to be empty (from propagateZeroChunks)
-                if (isNegativeCached(key)) {
-                    skipped++;
-                } else {
-                    keys.push_back(key);
-                }
-            }
-
-    if (!keys.empty())
-        ioPool_.submit(keys, Priority::Prefetch);
-
-    std::fprintf(stderr, "[Volume] Level %d: %d to fetch, %d skipped (known empty)\n",
-                 level, static_cast<int>(keys.size()), skipped);
-
-    if (progressCb)
-        progressCb(total, total);
-}
-
-void TieredChunkCache::prefetchShardsLevel(int level, const PrefetchProgressCb& progressCb)
-{
-    if (level < 0 || level >= numLevels()) return;
-
-    auto* httpSource = dynamic_cast<HttpChunkSource*>(source_.get());
-    if (!httpSource || !httpSource->isSharded()) {
-        std::fprintf(stderr, "[prefetchShards] Not a sharded HTTP source, falling back to chunk prefetch\n");
-        prefetchLevel(level, progressCb);
-        return;
-    }
-
-    auto* dz = (level < static_cast<int>(diskLevels_.size())) ? diskLevels_[level].get() : nullptr;
-    if (!dz) {
-        std::fprintf(stderr, "[prefetchShards] No disk cache for level %d\n", level);
-        return;
-    }
-
-    auto grid = httpSource->shardsPerAxis(level);
-    int totalShards = grid[0] * grid[1] * grid[2];
-    std::fprintf(stderr, "[prefetchShards] Level %d: %dx%dx%d = %d shards\n",
-                 level, grid[0], grid[1], grid[2], totalShards);
-
-    int fetched = 0, skipped = 0;
-    for (int sz = 0; sz < grid[0]; sz++) {
-        for (int sy = 0; sy < grid[1]; sy++) {
-            for (int sx = 0; sx < grid[2]; sx++) {
-                // Check if shard already exists on disk
-                std::vector<std::size_t> shard_idx = {
-                    static_cast<std::size_t>(sz),
-                    static_cast<std::size_t>(sy),
-                    static_cast<std::size_t>(sx)};
-                auto shard_path = dz->chunk_path(shard_idx);
-                if (std::filesystem::exists(shard_path)) {
-                    skipped++;
-                    if (progressCb) progressCb(fetched + skipped, totalShards);
-                    continue;
-                }
-
-                // Download whole shard from S3
-                auto data = httpSource->fetchWholeShard(level, sz, sy, sx);
-                if (data.empty()) {
-                    skipped++;
-                    if (progressCb) progressCb(fetched + skipped, totalShards);
-                    continue;
-                }
-
-                // Write directly to disk cache — just copy the raw shard file
-                std::filesystem::create_directories(shard_path.parent_path());
-                std::ofstream f(shard_path, std::ios::binary | std::ios::trunc);
-                f.write(reinterpret_cast<const char*>(data.data()),
-                        static_cast<std::streamsize>(data.size()));
-                fetched++;
-
-                if (fetched % 10 == 0 || fetched + skipped == totalShards)
-                    std::fprintf(stderr, "[prefetchShards] Level %d: %d/%d fetched, %d skipped\n",
-                                 level, fetched, totalShards, skipped);
-                if (progressCb) progressCb(fetched + skipped, totalShards);
-            }
-        }
-    }
-    std::fprintf(stderr, "[prefetchShards] Level %d done: %d fetched, %d skipped\n",
-                 level, fetched, skipped);
-}
-
-void TieredChunkCache::cancelPendingPrefetch()
-{
-    ioPool_.cancelPending();
-}
-
-// =============================================================================
-// Coarse level — dedicated flat storage
-// =============================================================================
-
-void TieredChunkCache::loadCoarseLevel(int level)
-{
-    auto shape = levelShape(level);
-    auto chunks = chunkShape(level);
-    std::array<int, 3> grid = {
-        (shape[0] + chunks[0] - 1) / chunks[0],
-        (shape[1] + chunks[1] - 1) / chunks[1],
-        (shape[2] + chunks[2] - 1) / chunks[2]
-    };
-    int total = grid[0] * grid[1] * grid[2];
-    if (total > 10000) {
-        std::fprintf(stderr, "[Cache] WARNING: coarse level has %d chunks, skipping flat storage\n", total);
-        return;
-    }
-    coarseGrid_ = grid;
-    coarseData_.resize(total);
-
-    for (int iz = 0; iz < coarseGrid_[0]; iz++) {
-        for (int iy = 0; iy < coarseGrid_[1]; iy++) {
-            for (int ix = 0; ix < coarseGrid_[2]; ix++) {
-                ChunkKey key{level, iz, iy, ix};
-                auto data = getBlocking(key);
-                int idx = iz * coarseGrid_[1] * coarseGrid_[2] + iy * coarseGrid_[2] + ix;
-                coarseData_[idx] = std::move(data);
-            }
-        }
-    }
-    coarseLevel_ = level;
-    std::fprintf(stderr, "[Cache] loadCoarseLevel: level=%d grid=%dx%dx%d (%d chunks)\n",
-                 level, coarseGrid_[0], coarseGrid_[1], coarseGrid_[2], total);
-}
-
-ChunkDataPtr TieredChunkCache::getCoarse(const ChunkKey& key) const noexcept
-{
-    if (key.level != coarseLevel_ || coarseData_.empty()) return nullptr;
-    if (key.iz < 0 || key.iz >= coarseGrid_[0] ||
-        key.iy < 0 || key.iy >= coarseGrid_[1] ||
-        key.ix < 0 || key.ix >= coarseGrid_[2]) return nullptr;
-    int idx = key.iz * coarseGrid_[1] * coarseGrid_[2] + key.iy * coarseGrid_[2] + key.ix;
-    return coarseData_[idx];
-}
-
-void TieredChunkCache::propagateZeroChunks(int coarseLevel)
-{
-    if (coarseLevel < 0 || coarseLevel >= numLevels()) return;
-
-    // If coarse data was never loaded (e.g. loadCoarseLevel bailed due to
-    // >10k chunks), getCoarse() returns nullptr for everything, which would
-    // incorrectly mark ALL descendant chunks as zero.  Bail out early.
-    if (coarseData_.empty() || coarseLevel != coarseLevel_) return;
-
-    auto coarseShape = levelShape(coarseLevel);
-    auto coarseChunks = chunkShape(coarseLevel);
-    int cGridZ = (coarseShape[0] + coarseChunks[0] - 1) / coarseChunks[0];
-    int cGridY = (coarseShape[1] + coarseChunks[1] - 1) / coarseChunks[1];
-    int cGridX = (coarseShape[2] + coarseChunks[2] - 1) / coarseChunks[2];
-
-    // Find all-zero chunks at the coarse level
-    std::vector<ChunkKey> zeroChunks;
-    for (int iz = 0; iz < cGridZ; iz++) {
-        for (int iy = 0; iy < cGridY; iy++) {
-            for (int ix = 0; ix < cGridX; ix++) {
-                ChunkKey key{coarseLevel, iz, iy, ix};
-                auto data = getCoarse(key);
-                if (!data) {
-                    // Null = chunk doesn't exist = all zeros (zarr fill_value=0)
-                    zeroChunks.push_back(key);
-                    continue;
-                }
-
-                // Check if chunk data is all zeros
-                if (isAllZero(data->rawData(), data->totalBytes())) {
-                    zeroChunks.push_back(key);
-                }
-            }
-        }
-    }
-
-    if (zeroChunks.empty()) return;
-
-    // For each zero chunk at the coarse level, compute all descendant chunk
-    // keys at every finer level and add them to the negative cache.
-    // Each coarse chunk covers a 2x region at the next finer level in each axis.
-    int totalNegated = 0;
-    {
-        std::lock_guard lock(negativeMutex_);
-        for (int lvl = coarseLevel - 1; lvl >= 0; lvl--) {
-            int scale = 1 << (coarseLevel - lvl);  // 2, 4, 8, ...
-            auto fineShape = levelShape(lvl);
-            auto fineChunks = chunkShape(lvl);
-            int fGridZ = (fineShape[0] + fineChunks[0] - 1) / fineChunks[0];
-            int fGridY = (fineShape[1] + fineChunks[1] - 1) / fineChunks[1];
-            int fGridX = (fineShape[2] + fineChunks[2] - 1) / fineChunks[2];
-
-            for (const auto& zk : zeroChunks) {
-                // This coarse chunk covers fine chunks [zk*scale .. (zk+1)*scale-1]
-                int fz0 = zk.iz * scale, fz1 = std::min(fz0 + scale, fGridZ);
-                int fy0 = zk.iy * scale, fy1 = std::min(fy0 + scale, fGridY);
-                int fx0 = zk.ix * scale, fx1 = std::min(fx0 + scale, fGridX);
-
-                for (int fz = fz0; fz < fz1; fz++) {
-                    for (int fy = fy0; fy < fy1; fy++) {
-                        for (int fx = fx0; fx < fx1; fx++) {
-                            ChunkKey fineKey{lvl, fz, fy, fx};
-                            // Don't overwrite chunks already cached or on disk
-                            if (hotCache_.contains(fineKey))
-                                continue;
-                            auto* dzFine = (fineKey.level < static_cast<int>(diskLevels_.size())) ? diskLevels_[fineKey.level].get() : nullptr;
-                            if (dzFine && zarrChunkExists(*dzFine, fineKey))
-                                continue;
-                            negativeCache_.insert(fineKey);
-                            bloomAdd(fineKey);
-                            // Mark empty in shard index
-                            if (dzFine) {
-                                auto idx = chunkIndices(fineKey);
-                                dzFine->mark_inner_chunk_empty(idx);
-                            }
-                            totalNegated++;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    std::fprintf(stderr, "[Cache] propagateZeroChunks: %zu zero chunks at level %d → %d descendant keys negative-cached\n",
-                 zeroChunks.size(), coarseLevel, totalNegated);
-}
 
 // =============================================================================
 // Cache management
@@ -837,8 +521,6 @@ auto TieredChunkCache::stats() const -> Stats
     s.hotEvictions = hotCache_.evictions();
     s.hotBytes = hotCache_.byte_size();
     s.ioPending = ioPool_.pendingCount();
-    s.ioInteractive = ioPool_.interactiveCount();
-    s.ioPrefetch = ioPool_.prefetchCount();
     s.diskWrites = statDiskWrites_.load(std::memory_order_relaxed);
     {
         std::lock_guard lock(negativeMutex_);
@@ -948,7 +630,6 @@ ChunkDataPtr TieredChunkCache::loadFull(const ChunkKey& key)
 
 bool TieredChunkCache::isReadyForNonBlockingRead(const ChunkKey& key) const
 {
-    if (key.level == coarseLevel_ && !coarseData_.empty()) return true;
     if (hotCache_.contains(key)) return true;
 
     if (isNegativeCached(key)) return true;

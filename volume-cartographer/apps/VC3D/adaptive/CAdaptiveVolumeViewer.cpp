@@ -171,16 +171,6 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         _camera.recalcPyramidLevel(nScales);
         double vs = _volume->voxelSize() / static_cast<double>(_camera.dsScale);
         _view->setVoxelSize(vs, vs);
-
-        // Prefetch coarsest levels immediately so we always have data
-        if (nScales > 0) {
-            // Prefetch levels per user setting (0 = coarsest only)
-            QSettings pfSettings(vc3d::settingsFilePath(), QSettings::IniFormat);
-            int prefetchLvls = pfSettings.value(vc3d::settings::perf::PREFETCH_LEVELS,
-                                                vc3d::settings::perf::PREFETCH_LEVELS_DEFAULT).toInt();
-            int from = std::max(0, nScales - 1 - prefetchLvls);
-            _volume->prefetchLevels(from, nScales - 1);
-        }
     }
 
     // Recompute content bounds
@@ -365,23 +355,6 @@ void CAdaptiveVolumeViewer::submitRender()
                   _camera.scale, offset);
 
         if (!coords.empty()) {
-            // Prefetch visible chunks at all levels
-            float loX = FLT_MAX, loY = FLT_MAX, loZ = FLT_MAX;
-            float hiX = -FLT_MAX, hiY = -FLT_MAX, hiZ = -FLT_MAX;
-            for (int r = 0; r < coords.rows; r += std::max(1, coords.rows / 8)) {
-                for (int c = 0; c < coords.cols; c += std::max(1, coords.cols / 8)) {
-                    const auto& v = coords(r, c);
-                    if (v[0] < 0 || v[1] < 0 || v[2] < 0) continue;
-                    loX = std::min(loX, v[0]); hiX = std::max(hiX, v[0]);
-                    loY = std::min(loY, v[1]); hiY = std::max(hiY, v[1]);
-                    loZ = std::min(loZ, v[2]); hiZ = std::max(hiZ, v[2]);
-                }
-            }
-            if (loX < hiX)
-                for (int lvl = sp.level; lvl < static_cast<int>(_volume->numScales()); lvl++)
-                    _volume->prefetchWorldBBox(cv::Vec3f(loX, loY, loZ), cv::Vec3f(hiX, hiY, hiZ), lvl);
-
-            // Non-blocking adaptive sampling — same as plane path but with coords
             sampleCoordsAdaptiveARGB32(
                 fbBits, fbStride, _volume->tieredCache(),
                 sp.level, static_cast<int>(_volume->numScales()),
@@ -430,8 +403,8 @@ void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 
     float factor = std::pow(1.05f, static_cast<float>(steps) * _zoomSensitivity);
     float newScale = std::clamp(_camera.scale * factor,
-                                TiledViewerCamera::MIN_SCALE,
-                                TiledViewerCamera::MAX_SCALE);
+                                AdaptiveCamera::MIN_SCALE,
+                                AdaptiveCamera::MAX_SCALE);
     if (std::abs(newScale - _camera.scale) < _camera.scale * 1e-6f) return;
 
     // Zoom-at-point: surface position under cursor stays fixed
@@ -780,20 +753,16 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
             .arg(unit);
 
         if (s.sharded) {
-            // Sharded: show shard-level stats. iq/pq are chunk-level (from interactive viewport)
-            // but dl/w are cumulative chunk fetches from individual chunk requests.
-            status += QString(" | dl %1sh w %2sh iq %3 pq %4 neg %5")
+            status += QString(" | dl %1sh w %2sh io %3 neg %4")
                 .arg(s.iceFetches)
                 .arg(s.diskWrites)
-                .arg(s.ioInteractive)
-                .arg(s.ioPrefetch)
+                .arg(s.ioPending)
                 .arg(s.negativeCount);
         } else {
-            status += QString(" | dl %1 w %2 iq %3 pq %4 neg %5")
+            status += QString(" | dl %1 w %2 io %3 neg %4")
                 .arg(s.iceFetches)
                 .arg(s.diskWrites)
-                .arg(s.ioInteractive)
-                .arg(s.ioPrefetch)
+                .arg(s.ioPending)
                 .arg(s.negativeCount);
         }
     }

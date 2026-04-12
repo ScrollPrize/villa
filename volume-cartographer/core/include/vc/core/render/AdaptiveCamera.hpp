@@ -6,7 +6,7 @@
 
 // Camera state for the tiled volume viewer.
 // All fields are main-thread only (no locking needed).
-struct TiledViewerCamera {
+struct AdaptiveCamera {
     // Center of view in surface parameter space
     cv::Vec3f surfacePtr{0, 0, 0};
 

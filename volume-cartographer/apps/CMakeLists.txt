@@ -2,7 +2,6 @@
 # GUI Apps #
 ############
 add_subdirectory(VC3D)
-add_subdirectory(vc4d)
 
 #################
 # CMD Line Apps #

@@ -547,7 +547,7 @@ static bool prefetchChunkKeys(
     size_t lastAvailable = available;
     size_t idleRetries = 0;
 
-    cache->prefetch(keys);
+    cache->fetchInteractive(keys);
 
     while (available < keys.size()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -584,7 +584,7 @@ static bool prefetchChunkKeys(
                           available, keys.size());
                 return false;
             }
-            cache->prefetch(keys);
+            cache->fetchInteractive(keys);
         } else {
             idleRetries = 0;
         }

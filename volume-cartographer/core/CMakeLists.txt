@@ -35,7 +35,7 @@ add_library(vc_core
         src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
-        src/render/TiledViewerCamera.cpp
+        src/render/AdaptiveCamera.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp

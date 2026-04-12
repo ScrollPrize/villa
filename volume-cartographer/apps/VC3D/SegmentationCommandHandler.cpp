@@ -1391,7 +1391,7 @@ static RemoteChunkFetchResult fetchRemoteChunkKeys(
     auto listenerId = cache->addChunkReadyListener(
         [&cv](const vc::cache::ChunkKey&) { cv.notify_one(); });
 
-    cache->prefetch(keys);
+    cache->fetchInteractive(keys);
 
     size_t available = result.initialAvailable;
     size_t lastAvailable = available;
@@ -1411,7 +1411,7 @@ static RemoteChunkFetchResult fetchRemoteChunkKeys(
 
         if (stats.ioPending == 0 && available == lastAvailable) {
             ++idleRetries;
-            cache->prefetch(keys);
+            cache->fetchInteractive(keys);
             if (idleRetries > 3) {
                 cache->removeChunkReadyListener(listenerId);
                 result.error = QObject::tr("Remote chunk fetch stalled at %1 / %2 chunks.")

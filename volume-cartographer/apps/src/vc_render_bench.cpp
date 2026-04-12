@@ -197,13 +197,6 @@ int main(int argc, char** argv)
            shape[0], shape[1], shape[2], numLevels);
     printf("  Open time: %.2f s\n\n", std::chrono::duration<double>(t1 - t0).count());
 
-    // Pin coarsest level for best-effort fallback
-    printf("Pinning coarsest pyramid level...\n");
-    t0 = Clock::now();
-    vol->pinCoarsestLevel(true);
-    t1 = Clock::now();
-    printf("  Pin time: %.2f s\n\n", std::chrono::duration<double>(t1 - t0).count());
-
     // Set up a PlaneSurface centered in the volume
     float cx = shape[0] / 2.0f;
     float cy = shape[1] / 2.0f;

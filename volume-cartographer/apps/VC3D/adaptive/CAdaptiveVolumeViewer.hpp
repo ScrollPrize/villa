@@ -21,7 +21,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/cache/TieredChunkCache.hpp"
-#include "vc/core/render/TiledViewerCamera.hpp"
+#include "vc/core/render/AdaptiveCamera.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QGraphicsScene;
@@ -267,7 +267,7 @@ private:
     VCCollection* _pointCollection = nullptr;
 
     // --- Camera ---
-    TiledViewerCamera _camera;
+    AdaptiveCamera _camera;
     float _windowLow = 0.0f;
     float _windowHigh = 255.0f;
     CompositeRenderSettings _compositeSettings;

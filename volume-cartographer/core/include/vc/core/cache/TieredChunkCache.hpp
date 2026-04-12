@@ -56,27 +56,10 @@ public:
     // --- Blocking reads ---
     [[nodiscard]] ChunkDataPtr getBlocking(const ChunkKey& key);
 
-    // --- Async prefetch (background queue) ---
-    void prefetch(const ChunkKey& key);
-    void prefetch(const std::vector<ChunkKey>& keys);
-    void prefetchRegion(int level, int iz0, int iy0, int ix0,
-                        int iz1, int iy1, int ix1);
-
-    // --- Interactive fetch (high priority queue, for viewport chunks) ---
+    // --- Interactive fetch (for viewport chunks) ---
     void fetchInteractive(const std::vector<ChunkKey>& keys);
 
-    using PrefetchProgressCb = std::function<void(int fetched, int total)>;
-    void prefetchLevel(int level, const PrefetchProgressCb& progressCb = nullptr);
-
-    // Bulk download whole shards directly to disk cache. Skips shards already on disk.
-    void prefetchShardsLevel(int level, const PrefetchProgressCb& progressCb = nullptr);
-
-    void propagateZeroChunks(int coarseLevel);
-    void cancelPendingPrefetch();
-
     // --- Cache management ---
-    void loadCoarseLevel(int level);
-    [[nodiscard]] ChunkDataPtr getCoarse(const ChunkKey& key) const noexcept;
     void clearMemory();
     void clearAll();
 
@@ -120,9 +103,7 @@ public:
         uint64_t misses = 0;
         uint64_t hotEvictions = 0;
         size_t hotBytes = 0;
-        size_t ioPending = 0;       // total (interactive + prefetch)
-        size_t ioInteractive = 0;   // interactive queue only
-        size_t ioPrefetch = 0;      // prefetch queue only
+        size_t ioPending = 0;
         uint64_t diskWrites = 0;
         size_t negativeCount = 0;
         size_t diskBytes = 0;    // total bytes on disk across all level shards
@@ -132,7 +113,6 @@ public:
     };
 
     [[nodiscard]] Stats stats() const;
-    [[nodiscard]] bool coarseLevelReady() const noexcept { return coarseLevel_ >= 0; }
 
 private:
     utils::ShardedLRUCache<ChunkKey, ChunkDataPtr, ChunkKeyHash> hotCache_;
@@ -164,11 +144,6 @@ private:
     std::unordered_set<ChunkKey, ChunkKeyHash> negativeCache_;
     void loadNegativeCache();
     void saveNegativeCache() const;
-
-    // --- Coarsest level storage ---
-    int coarseLevel_ = -1;
-    std::array<int, 3> coarseGrid_ = {0, 0, 0};
-    std::vector<ChunkDataPtr> coarseData_;
 
     // --- Promotion helpers ---
     [[nodiscard]] ChunkDataPtr promoteFromCold(const ChunkKey& key);

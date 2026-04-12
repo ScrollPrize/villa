@@ -1,7 +1,7 @@
-#include "vc/core/render/TiledViewerCamera.hpp"
+#include "vc/core/render/AdaptiveCamera.hpp"
 #include <algorithm>
 
-void TiledViewerCamera::recalcPyramidLevel(int numScales) noexcept
+void AdaptiveCamera::recalcPyramidLevel(int numScales) noexcept
 {
     if (numScales <= 0) {
         dsScaleIdx = 0;
@@ -89,13 +89,13 @@ static int closestStopIndex(float s)
     return lo;
 }
 
-float TiledViewerCamera::roundScale(float s) noexcept
+float AdaptiveCamera::roundScale(float s) noexcept
 {
     s = std::clamp(s, MIN_SCALE, MAX_SCALE);
     return kZoomStops[closestStopIndex(s)];
 }
 
-float TiledViewerCamera::stepScale(float current, int steps) noexcept
+float AdaptiveCamera::stepScale(float current, int steps) noexcept
 {
     // Continuous zoom: 1% per step at all zoom levels.
     float result = current * std::pow(1.01f, static_cast<float>(steps));

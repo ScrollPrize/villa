@@ -153,22 +153,7 @@ public:
         const std::string& compositeMethod,
         const uint32_t lut[256]);
 
-    // Pin the coarsest pyramid level in the hot tier (never evicted).
-    // Guarantees sampleBestEffort() always returns data immediately.
-    void pinCoarsestLevel(bool blocking = false);
-
-    // Prefetch all chunks overlapping a world-space axis-aligned bounding box.
-    // lo/hi are in world (level 0) coordinates, (x, y, z).
-    void prefetchWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level);
     void fetchInteractiveWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level);
-
-    // Prefetch entire pyramid levels in the background. Levels are fetched
-    // from coarsest to finest (high level numbers first). Non-blocking.
-    // fromLevel/toLevel are inclusive. E.g., prefetchLevels(3, 5) fetches 5, 4, 3.
-    void prefetchLevels(int fromLevel, int toLevel);
-
-    // Cancel all pending (not in-flight) async prefetch tasks.
-    void cancelPendingPrefetch();
 
     // --- Data bounds ---
 
@@ -212,7 +197,6 @@ protected:
     size_t diskCacheMaxBytes_ = 100ULL << 30; // 100 GB default
     std::shared_ptr<utils::ZarrArray> pendingDiskZarr_;
     int ioThreads_ = 0;  // 0 = use default
-    std::atomic<bool> prefetchStop_{false};
 
     void ensureTieredCache() const;
 
@@ -238,7 +222,6 @@ protected:
     WorldBBox coordsWorldBBox(const cv::Mat_<cv::Vec3f>& coords) const;
     ChunkBBox worldBBoxToChunkBBox(const WorldBBox& wb, int level) const;
     bool allChunksCachedFast(const WorldBBox& wb, int level) const;
-    void prefetchChunks(const cv::Mat_<cv::Vec3f>& coords, int level);
 
     void sampleComposite(cv::Mat_<uint8_t>& out,
                          const cv::Mat_<cv::Vec3f>& coords,
@@ -252,9 +235,6 @@ protected:
     bool allCompositeChunksCached(const cv::Mat_<cv::Vec3f>& coords,
                                   const cv::Mat_<cv::Vec3f>& normals,
                                   int zStart, int zEnd, int level) const;
-    void prefetchCompositeChunks(const cv::Mat_<cv::Vec3f>& coords,
-                                 const cv::Mat_<cv::Vec3f>& normals,
-                                 int zStart, int zEnd, int level);
 
     void loadMetadata();
 

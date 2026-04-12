@@ -267,7 +267,7 @@ struct ChunkSampler {
 
     // Submit chunk keys for async IO+decode before the sampling loop starts.
     void prefetchKeys(const std::vector<vc::cache::ChunkKey>& keys) {
-        cache.prefetch(keys);
+        cache.fetchInteractive(keys);
     }
 
     // Compute and prefetch all chunk keys that a plane tile will touch.
@@ -316,7 +316,7 @@ struct ChunkSampler {
                                       cix < p.dbMinCx || cix > p.dbMaxCx)) continue;
                     keys.push_back(vc::cache::ChunkKey{level, ciz, ciy, cix});
                 }
-        if (!keys.empty()) cache.prefetch(keys);
+        if (!keys.empty()) cache.fetchInteractive(keys);
     }
 
     bool inBounds(float vz, float vy, float vx) const {
@@ -698,7 +698,7 @@ static void readVolumeImpl(
                         neededKeys.push_back(vc::cache::ChunkKey{level, ciz, ciy, cix});
 
         // Submit async prefetch so IO+decode pipelines across all chunks.
-        cache.prefetch(neededKeys);
+        cache.fetchInteractive(neededKeys);
 
         // Block until all chunks are available.
         bool anyMissing = false;
@@ -1371,7 +1371,7 @@ static void samplePlaneImpl(
                 }
 
         // Submit all needed keys for async IO+decode first.
-        cache.prefetch(neededKeys);
+        cache.fetchInteractive(neededKeys);
 
         bool anyMissing = false;
         for (auto& key : neededKeys) {
@@ -1736,7 +1736,7 @@ static void samplePlaneARGB32Impl(
                     neededKeys.push_back(vc::cache::ChunkKey{level, ciz, ciy, cix});
                 }
 
-        cache.prefetch(neededKeys);
+        cache.fetchInteractive(neededKeys);
 
         // Block until all chunks are available
         for (auto& key : neededKeys)
@@ -2623,7 +2623,6 @@ void samplePlaneCompositeARGB32(
                                       cix < p.dbMinCx || cix > p.dbMaxCx)) continue;
                     neededKeys.push_back(vc::cache::ChunkKey{level, ciz, ciy, cix});
                 }
-        cache->prefetch(neededKeys);
         for (auto& key : neededKeys)
             (void)cache->getBlocking(key);
     }
@@ -2880,7 +2879,7 @@ static void readMultiSliceImpl(
                         neededKeys.push_back(vc::cache::ChunkKey{level, ciz, ciy, cix});
 
         // Submit async prefetch so IO+decode pipelines across all chunks.
-        cache.prefetch(neededKeys);
+        cache.fetchInteractive(neededKeys);
 
         // Block until all chunks are available.
         bool anyMissing = false;
@@ -3105,7 +3104,7 @@ static void sampleTileSlicesImpl(
             keys.reserve(neededChunks.size());
             for (auto& c : neededChunks)
                 keys.push_back(vc::cache::ChunkKey{level, c[0], c[1], c[2]});
-            cache.prefetch(keys);
+            cache.fetchInteractive(keys);
         }
         for (auto& c : neededChunks)
             (void)cache.getBlocking(vc::cache::ChunkKey{level, c[0], c[1], c[2]});

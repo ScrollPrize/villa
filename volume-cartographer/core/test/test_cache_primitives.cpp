@@ -366,25 +366,6 @@ TEST(TieredChunkCache, DiskOnlyRegionIsNotReadyForNonBlockingRead)
     EXPECT_EQ(harness.source->fetchCount(), 0u);
 }
 
-TEST(TieredChunkCache, PrefetchPromotesDiskOnlyChunksWithoutRemoteFetch)
-{
-    CacheFixture fixture;
-    auto diskStore = fixture.makeDiskStore();
-    const std::string volumeId = "test-volume";
-    vc::cache::ChunkKey cachedKey{0, 0, 0, 2};
-    diskStore->put(volumeId, cachedKey, std::vector<uint8_t>{5});
-
-    auto harness = makeTestCache(fixture.makeDiskStore(), std::make_unique<FakeChunkSource>());
-
-    harness.cache->prefetchRegion(0, 0, 0, 2, 0, 0, 2);
-    ASSERT_TRUE(waitFor([&] {
-        return harness.cache->countAvailable({cachedKey}) == 1u;
-    }));
-
-    EXPECT_NE(harness.cache->get(cachedKey), nullptr);
-    EXPECT_EQ(harness.source->fetchCount(), 0u);
-}
-
 TEST(TieredChunkCache, CountAvailableIgnoresDiskOnlyButIncludesNegativeCached)
 {
     CacheFixture fixture;
@@ -422,10 +403,7 @@ TEST(TieredChunkCache, MixedRegionRequiresPromotionOfDiskOnlyChunk)
     harness.source->clearFetches();
 
     EXPECT_FALSE(harness.cache->areAllCachedInRegion(0, 0, 0, 0, 0, 0, 2));
-    harness.cache->prefetch(diskOnlyKey);
-    ASSERT_TRUE(waitFor([&] {
-        return harness.cache->countAvailable({diskOnlyKey}) == 1u;
-    }));
+    EXPECT_NE(harness.cache->getBlocking(diskOnlyKey), nullptr);
     EXPECT_TRUE(harness.cache->areAllCachedInRegion(0, 0, 0, 0, 0, 0, 2));
     EXPECT_EQ(harness.source->fetchCount(), 0u);
 }

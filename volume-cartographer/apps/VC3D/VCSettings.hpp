@@ -176,10 +176,6 @@ namespace perf {
     constexpr auto IO_THREADS = "perf/io_threads";
     constexpr int IO_THREADS_DEFAULT = 8;
 
-    // Prefetch pyramid levels on remote volume open
-    // 0 = none, 1 = coarsest only (already pinned), 2 = coarsest 2, etc.
-    constexpr auto PREFETCH_LEVELS = "perf/prefetch_levels";
-    constexpr int PREFETCH_LEVELS_DEFAULT = 0;  // disabled
 }
 
 // -----------------------------------------------------------------------------
