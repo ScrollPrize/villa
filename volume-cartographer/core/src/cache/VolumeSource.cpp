@@ -236,27 +236,26 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
                          shardCache_.size());
     }
 
-    int nChunks = totalChunksPerShard();
-    uint64_t indexSize = static_cast<uint64_t>(nChunks) * 16;
-    if (shardData->size() < indexSize) return {};
+    const int nChunks = totalChunksPerShard();
+    if (shardData->size() < size_t(nChunks) * 16) return {};
 
-    int inner = innerChunkIndex(key);
+    const int inner = innerChunkIndex(key);
     if (inner < 0 || inner >= nChunks) return {};
 
-    // Index is always at the start of the shard
-    const uint8_t* entry = shardData->data() + inner * 16;
+    // Deserialize the shard index (first n_inner * 16 bytes) and pick the
+    // entry for our inner chunk.
+    std::span<const std::byte> shardBytes(
+        reinterpret_cast<const std::byte*>(shardData->data()), shardData->size());
+    auto index = utils::detail::ShardIndex::deserialize(shardBytes, size_t(nChunks));
+    const auto& entry = index.entries[inner];
 
-    uint64_t offset = 0, nbytes = 0;
-    std::memcpy(&offset, entry, 8);
-    std::memcpy(&nbytes, entry + 8, 8);
+    if (entry.is_missing()) return {};
+    // Zero-chunk placeholder sentinel (offset = ~0ull - 1, nbytes = 0).
+    if (entry.offset == (~uint64_t(0) - 1) && entry.nbytes == 0) return {};
+    if (entry.offset + entry.nbytes > shardData->size()) return {};
 
-    // Missing chunk sentinel
-    if (offset == UINT64_MAX && nbytes == UINT64_MAX) return {};
-    // Zero chunk sentinel
-    if (offset == (UINT64_MAX - 1) && nbytes == 0) return {};
-    if (offset + nbytes > shardData->size()) return {};
-
-    return {shardData->data() + offset, shardData->data() + offset + nbytes};
+    return {shardData->data() + entry.offset,
+            shardData->data() + entry.offset + entry.nbytes};
 }
 
 std::vector<uint8_t> HttpSource::fetch(const ChunkKey& key)
