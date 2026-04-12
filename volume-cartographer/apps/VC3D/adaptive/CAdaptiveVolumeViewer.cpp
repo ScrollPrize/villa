@@ -329,7 +329,6 @@ void CAdaptiveVolumeViewer::submitRender()
     sp.method = _samplingMethod;
 
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-        // PlaneSurface: fused plane sampling
         cv::Vec3f vx = plane->basisX();
         cv::Vec3f vy = plane->basisY();
         cv::Vec3f n = plane->normal(cv::Vec3f(0, 0, 0));
@@ -341,20 +340,57 @@ void CAdaptiveVolumeViewer::submitRender()
                          + vy * (_camera.surfacePtr[1] - halfH)
                          + plane->origin() + n * _camera.zOff;
 
-        _volume->samplePlaneBestEffortARGB32(
-            fbBits, fbStride, origin,
-            vx / _camera.scale, vy / _camera.scale,
-            fbW, fbH, sp, lut.data());
+        if (_compositeSettings.planeEnabled) {
+            const int front = _compositeSettings.planeLayersFront;
+            const int behind = _compositeSettings.planeLayersBehind;
+            const int numLayers = front + behind + 1;
+            const int zStart = -behind;
+            const float zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
+            samplePlaneCompositeARGB32(
+                fbBits, fbStride, _volume->tieredCache(), sp.level,
+                origin, vx / _camera.scale, vy / _camera.scale,
+                n, zStep, zStart, numLayers,
+                fbW, fbH, _compositeSettings.params.method, lut.data());
+        } else {
+            _volume->samplePlaneBestEffortARGB32(
+                fbBits, fbStride, origin,
+                vx / _camera.scale, vy / _camera.scale,
+                fbW, fbH, sp, lut.data());
+        }
     } else {
-        // QuadSurface: gen coords then adaptive sample (non-blocking)
+        // QuadSurface: gen coords then sample (composite or plain)
         cv::Mat_<cv::Vec3f> coords;
+        cv::Mat_<cv::Vec3f> normals;
         cv::Vec3f offset(_camera.surfacePtr[0] * _camera.scale,
                          _camera.surfacePtr[1] * _camera.scale,
                          _camera.zOff);
-        surf->gen(&coords, nullptr, cv::Size(fbW, fbH), cv::Vec3f(0, 0, 0),
+        const bool wantComposite = _compositeSettings.enabled;
+        surf->gen(&coords, wantComposite ? &normals : nullptr,
+                  cv::Size(fbW, fbH), cv::Vec3f(0, 0, 0),
                   _camera.scale, offset);
 
-        if (!coords.empty()) {
+        if (coords.empty()) {
+            // nothing to do
+        } else if (wantComposite && !normals.empty()) {
+            // Composite via readCompositeFast at the desired level (non-adaptive).
+            cv::Mat_<uint8_t> compOut(fbH, fbW, uint8_t(0));
+            const float scale = (sp.level > 0) ? 1.0f / float(1 << sp.level) : 1.0f;
+            cv::Mat_<cv::Vec3f> scaledCoords = coords * scale;
+            const int front = _compositeSettings.layersFront;
+            const int behind = _compositeSettings.layersBehind;
+            const int zStart = -behind;
+            const int zEnd   = front;
+            const float zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
+            readCompositeFast(compOut, _volume->tieredCache(), sp.level,
+                              scaledCoords, normals, zStep, zStart, zEnd,
+                              _compositeSettings.params, _samplingMethod);
+            // Blit through the LUT.
+            for (int y = 0; y < fbH; y++) {
+                const uint8_t* inRow = compOut.ptr<uint8_t>(y);
+                uint32_t* outRow = fbBits + size_t(y) * size_t(fbStride);
+                for (int x = 0; x < fbW; x++) outRow[x] = lut[inRow[x]];
+            }
+        } else {
             sampleCoordsAdaptiveARGB32(
                 fbBits, fbStride, _volume->tieredCache(),
                 sp.level, static_cast<int>(_volume->numScales()),

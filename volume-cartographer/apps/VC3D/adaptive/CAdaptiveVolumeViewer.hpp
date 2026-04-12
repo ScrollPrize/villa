@@ -78,10 +78,13 @@ public:
     VCCollection* pointCollection() const override { return _pointCollection; }
 
     // --- Settings passthrough ---
-    void setCompositeRenderSettings(const CompositeRenderSettings& s) { _compositeSettings = s; }
+    void setCompositeRenderSettings(const CompositeRenderSettings& s) {
+        _compositeSettings = s;
+        submitRender();
+    }
     const CompositeRenderSettings& compositeRenderSettings() const override { return _compositeSettings; }
-    bool isCompositeEnabled() const override { return false; }
-    bool isPlaneCompositeEnabled() const override { return false; }
+    bool isCompositeEnabled() const override { return _compositeSettings.enabled; }
+    bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled; }
 
     void setVolumeWindow(float low, float high);
     float volumeWindowLow() const { return _windowLow; }
