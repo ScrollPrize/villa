@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include "utils/Json.hpp"
 #include <utils/http_fetch.hpp>
+#include <utils/zarr.hpp>
 
 namespace vc::cache {
 
@@ -71,31 +72,24 @@ void FileSystemSource::discoverLevels()
 
     levels_.clear();
     for (int lvl : levelNums) {
-        auto zarrayPath = root_ / std::to_string(lvl) / ".zarray";
-        if (!std::filesystem::exists(zarrayPath)) continue;
-
-        utils::Json meta;
+        auto levelPath = root_ / std::to_string(lvl);
         try {
-            meta = utils::Json::parse_file(zarrayPath);
+            auto meta = utils::ZarrArray::open(levelPath).metadata();
+            LevelMeta lm{};
+            // Finest granularity: inner chunks for sharded v3, chunks otherwise.
+            const auto& cs = meta.shard_config ? meta.shard_config->sub_chunks
+                                               : meta.chunks;
+            if (meta.shape.size() >= 3)
+                lm.shape = {int(meta.shape[0]), int(meta.shape[1]), int(meta.shape[2])};
+            if (cs.size() >= 3)
+                lm.chunkShape = {int(cs[0]), int(cs[1]), int(cs[2])};
+            levels_.push_back(lm);
         } catch (const std::exception& e) {
             if (auto* log = cacheDebugLog())
-                std::fprintf(log, "[CHUNK_SOURCE] Warning: failed to parse %s: %s\n",
-                             zarrayPath.c_str(), e.what());
+                std::fprintf(log, "[CHUNK_SOURCE] Warning: failed to open %s: %s\n",
+                             levelPath.c_str(), e.what());
             continue;
         }
-
-        LevelMeta lm{};
-        if (meta.contains("shape") && meta["shape"].is_array()) {
-            auto& s = meta["shape"];
-            if (s.size() >= 3)
-                lm.shape = {s[0].get_int(), s[1].get_int(), s[2].get_int()};
-        }
-        if (meta.contains("chunks") && meta["chunks"].is_array()) {
-            auto& c = meta["chunks"];
-            if (c.size() >= 3)
-                lm.chunkShape = {c[0].get_int(), c[1].get_int(), c[2].get_int()};
-        }
-        levels_.push_back(lm);
     }
 }
 
