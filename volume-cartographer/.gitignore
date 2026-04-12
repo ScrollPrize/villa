@@ -54,3 +54,6 @@ cmake-build*/
 VC.ini
 
 build/perf.data
+
+# Claude Code runtime
+.claude/
