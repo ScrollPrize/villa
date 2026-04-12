@@ -299,6 +299,7 @@ void CAdaptiveVolumeViewer::scheduleRender()
         _renderTimer->start();
 }
 
+
 void CAdaptiveVolumeViewer::submitRender()
 {
     // Re-read sensitivity settings (changed live via Viewer Controls panel)
@@ -326,10 +327,13 @@ void CAdaptiveVolumeViewer::submitRender()
     vc::buildWindowLevelColormapLut(lut, _windowLow, _windowHigh, _baseColormapId);
 
     vc::SampleParams sp;
+    const int numLevels = static_cast<int>(_volume->numScales());
+    // Always render at the user-requested level. The sampler's per-pixel
+    // adaptive fallback handles regions that aren't ready yet by dropping
+    // those pixels to whichever coarser level is resident — no whole-frame
+    // resolution cycling, and cached fine chunks are used immediately.
     sp.level = _camera.dsScaleIdx;
     sp.method = _samplingMethod;
-
-    const int numLevels = static_cast<int>(_volume->numScales());
 
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         cv::Vec3f vx = plane->basisX();
