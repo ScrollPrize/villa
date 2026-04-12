@@ -114,6 +114,11 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "wandb_run_id": None,
     "wandb_log_images": True,
     "wandb_image_frequency": None,
+    "wandb_log_xy_slice_images": True,
+    "wandb_xy_slice_image_frequency": None,
+    "wandb_xy_slice_mode": "best_xy_slice",
+    "wandb_xy_slice_line_thickness": 1,
+    "wandb_xy_slice_depth_tolerance": 0.75,
 }
 
 
@@ -295,6 +300,16 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         cfg["wandb_image_frequency"] = int(cfg["log_frequency"])
     if int(cfg["wandb_image_frequency"]) <= 0:
         raise ValueError("wandb_image_frequency must be positive")
+    if cfg.get("wandb_xy_slice_image_frequency") is None:
+        cfg["wandb_xy_slice_image_frequency"] = int(cfg["wandb_image_frequency"])
+    if int(cfg["wandb_xy_slice_image_frequency"]) <= 0:
+        raise ValueError("wandb_xy_slice_image_frequency must be positive")
+    if str(cfg["wandb_xy_slice_mode"]) != "best_xy_slice":
+        raise ValueError("wandb_xy_slice_mode must currently be 'best_xy_slice'")
+    if int(cfg["wandb_xy_slice_line_thickness"]) <= 0:
+        raise ValueError("wandb_xy_slice_line_thickness must be positive")
+    if float(cfg["wandb_xy_slice_depth_tolerance"]) <= 0.0:
+        raise ValueError("wandb_xy_slice_depth_tolerance must be positive")
 
     optimizer = dict(cfg.get("optimizer") or {})
     optimizer.setdefault("name", "adamw")

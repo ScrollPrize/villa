@@ -420,6 +420,203 @@ def _draw_line_2d(canvas: np.ndarray, r0: int, c0: int, r1: int, c1: int) -> Non
             r0 += sr
 
 
+def _draw_line_2d_thick(canvas: np.ndarray, r0: int, c0: int, r1: int, c1: int, *, thickness: int) -> None:
+    radius = max(0, int(thickness) - 1)
+    for dr in range(-radius, radius + 1):
+        for dc in range(-radius, radius + 1):
+            _draw_line_2d(canvas, r0 + dr, c0 + dc, r1 + dr, c1 + dc)
+
+
+def _normalize_slice_to_rgb(slice_2d: np.ndarray) -> np.ndarray:
+    slice_arr = np.asarray(slice_2d, dtype=np.float32)
+    finite = np.isfinite(slice_arr)
+    if not bool(finite.any()):
+        gray = np.zeros_like(slice_arr, dtype=np.uint8)
+    else:
+        low = float(slice_arr[finite].min())
+        high = float(slice_arr[finite].max())
+        if high <= low + 1e-6:
+            gray = np.zeros_like(slice_arr, dtype=np.uint8)
+        else:
+            normalized = np.clip((slice_arr - low) / (high - low), 0.0, 1.0)
+            gray = (255.0 * normalized).astype(np.uint8)
+    return np.repeat(gray[..., None], 3, axis=-1)
+
+
+def _iter_grid_edges_xy(grid_local: np.ndarray):
+    grid = np.asarray(grid_local, dtype=np.float32)
+    valid = np.isfinite(grid).all(axis=-1)
+    rows, cols = grid.shape[:2]
+    for row_idx in range(rows):
+        for col_idx in range(cols - 1):
+            if valid[row_idx, col_idx] and valid[row_idx, col_idx + 1]:
+                yield grid[row_idx, col_idx], grid[row_idx, col_idx + 1]
+    for row_idx in range(rows - 1):
+        for col_idx in range(cols):
+            if valid[row_idx, col_idx] and valid[row_idx + 1, col_idx]:
+                yield grid[row_idx, col_idx], grid[row_idx + 1, col_idx]
+
+
+def _edge_segment_on_z_slice(
+    p0: np.ndarray,
+    p1: np.ndarray,
+    *,
+    z_slice: int,
+    depth_tolerance: float,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    p0 = np.asarray(p0, dtype=np.float32)
+    p1 = np.asarray(p1, dtype=np.float32)
+    z_min = float(z_slice) - float(depth_tolerance)
+    z_max = float(z_slice) + float(depth_tolerance)
+    z0 = float(p0[0])
+    z1 = float(p1[0])
+    dz = z1 - z0
+
+    if abs(dz) < 1e-6:
+        if z_min <= z0 <= z_max:
+            return p0[1:].copy(), p1[1:].copy()
+        return None
+
+    t0 = (z_min - z0) / dz
+    t1 = (z_max - z0) / dz
+    t_lo = max(0.0, min(t0, t1))
+    t_hi = min(1.0, max(t0, t1))
+    if t_hi < 0.0 or t_lo > 1.0 or t_lo > t_hi:
+        return None
+
+    pa = p0 + t_lo * (p1 - p0)
+    pb = p0 + t_hi * (p1 - p0)
+    return pa[1:].copy(), pb[1:].copy()
+
+
+def _count_slice_support(grid_local: np.ndarray, *, z_slice: int, depth_tolerance: float) -> int:
+    count = 0
+    for p0, p1 in _iter_grid_edges_xy(grid_local):
+        if _edge_segment_on_z_slice(p0, p1, z_slice=z_slice, depth_tolerance=depth_tolerance) is not None:
+            count += 1
+    return count
+
+
+def _choose_best_xy_slice(
+    grids_local: list[np.ndarray],
+    *,
+    depth: int,
+    depth_tolerance: float,
+) -> int:
+    finite_z = []
+    for grid in grids_local:
+        grid_arr = np.asarray(grid, dtype=np.float32)
+        valid = np.isfinite(grid_arr).all(axis=-1)
+        if bool(valid.any()):
+            finite_z.append(grid_arr[..., 0][valid])
+    if not finite_z:
+        return max(0, min(int(depth) - 1, int(depth) // 2))
+
+    z_values = np.concatenate(finite_z, axis=0)
+    z_lo = max(0, int(np.floor(float(z_values.min()) - float(depth_tolerance))))
+    z_hi = min(int(depth) - 1, int(np.ceil(float(z_values.max()) + float(depth_tolerance))))
+    if z_hi < z_lo:
+        return max(0, min(int(depth) - 1, int(np.rint(float(np.median(z_values))))))
+
+    best_slice = z_lo
+    best_score = -1
+    center = 0.5 * float(max(0, int(depth) - 1))
+    for z_slice in range(z_lo, z_hi + 1):
+        score = sum(_count_slice_support(grid, z_slice=z_slice, depth_tolerance=depth_tolerance) for grid in grids_local)
+        if score > best_score:
+            best_score = score
+            best_slice = z_slice
+        elif score == best_score and abs(float(z_slice) - center) < abs(float(best_slice) - center):
+            best_slice = z_slice
+    return int(best_slice)
+
+
+def _blend_line_mask(canvas: np.ndarray, mask: np.ndarray, *, color: tuple[int, int, int], alpha: float = 0.8) -> np.ndarray:
+    blended = np.asarray(canvas, dtype=np.float32).copy()
+    mask_bool = mask > 0.0
+    if not bool(mask_bool.any()):
+        return canvas
+    color_arr = np.asarray(color, dtype=np.float32)
+    blended[mask_bool] = (1.0 - float(alpha)) * blended[mask_bool] + float(alpha) * color_arr[None, :]
+    return np.clip(blended, 0.0, 255.0).astype(np.uint8)
+
+
+def _rasterize_grid_on_xy_slice(
+    grid_local: np.ndarray,
+    *,
+    z_slice: int,
+    panel_shape: tuple[int, int],
+    line_thickness: int,
+    depth_tolerance: float,
+) -> np.ndarray:
+    mask = np.zeros(panel_shape, dtype=np.float32)
+    for p0, p1 in _iter_grid_edges_xy(grid_local):
+        clipped = _edge_segment_on_z_slice(p0, p1, z_slice=z_slice, depth_tolerance=depth_tolerance)
+        if clipped is None:
+            continue
+        a_xy, b_xy = clipped
+        r0 = int(np.clip(np.rint(a_xy[0]), 0, panel_shape[0] - 1))
+        c0 = int(np.clip(np.rint(a_xy[1]), 0, panel_shape[1] - 1))
+        r1 = int(np.clip(np.rint(b_xy[0]), 0, panel_shape[0] - 1))
+        c1 = int(np.clip(np.rint(b_xy[1]), 0, panel_shape[1] - 1))
+        _draw_line_2d_thick(mask, r0, c0, r1, c1, thickness=int(line_thickness))
+    return mask
+
+
+def _make_xy_slice_overlay_canvas(
+    *,
+    volume: np.ndarray,
+    prompt_grid_local: np.ndarray,
+    target_grid_local: np.ndarray,
+    pred_grid_local: np.ndarray,
+    line_thickness: int,
+    depth_tolerance: float,
+) -> np.ndarray:
+    volume_np = np.asarray(volume, dtype=np.float32)
+    if volume_np.ndim == 4:
+        volume_np = volume_np[0]
+    if volume_np.ndim != 3:
+        raise ValueError(f"volume must have shape [D,H,W] or [1,D,H,W], got {volume_np.shape!r}")
+    z_slice = _choose_best_xy_slice(
+        [prompt_grid_local, target_grid_local, pred_grid_local],
+        depth=volume_np.shape[0],
+        depth_tolerance=float(depth_tolerance),
+    )
+    slice_rgb = _normalize_slice_to_rgb(volume_np[z_slice])
+    panel_shape = tuple(int(v) for v in volume_np.shape[1:])
+    prompt_mask = _rasterize_grid_on_xy_slice(
+        prompt_grid_local,
+        z_slice=z_slice,
+        panel_shape=panel_shape,
+        line_thickness=int(line_thickness),
+        depth_tolerance=float(depth_tolerance),
+    )
+    target_mask = _rasterize_grid_on_xy_slice(
+        target_grid_local,
+        z_slice=z_slice,
+        panel_shape=panel_shape,
+        line_thickness=int(line_thickness),
+        depth_tolerance=float(depth_tolerance),
+    )
+    pred_mask = _rasterize_grid_on_xy_slice(
+        pred_grid_local,
+        z_slice=z_slice,
+        panel_shape=panel_shape,
+        line_thickness=int(line_thickness),
+        depth_tolerance=float(depth_tolerance),
+    )
+    overlay = slice_rgb
+    overlay = _blend_line_mask(overlay, prompt_mask, color=(90, 180, 255))
+    overlay = _blend_line_mask(overlay, target_mask, color=(110, 235, 110))
+    overlay = _blend_line_mask(overlay, pred_mask, color=(255, 190, 90))
+    return _add_header(
+        overlay,
+        title=f"XY Slice z={z_slice}  prompt/gt/pred",
+        labels=["XY"],
+        background=(24, 24, 24),
+    )
+
+
 def _render_surface_projection(
     grid_local: np.ndarray,
     *,
@@ -570,6 +767,32 @@ def _make_teacher_forced_prediction_canvas(batch: dict, outputs: dict, *, sample
     )
 
 
+def _make_teacher_forced_xy_slice_canvas(
+    batch: dict,
+    outputs: dict,
+    *,
+    sample_idx: int = 0,
+    line_thickness: int,
+    depth_tolerance: float,
+) -> np.ndarray:
+    count = int(batch["target_lengths"][sample_idx].item())
+    grid_shape = tuple(int(v) for v in batch["target_grid_shape"][sample_idx].tolist())
+    direction = str(batch["direction"][sample_idx])
+    pred_xyz = outputs.get("pred_xyz_refined", outputs["pred_xyz"])[sample_idx, :count].detach().cpu().numpy()
+    pred_grid_local = deserialize_continuation_grid(pred_xyz, direction=direction, grid_shape=grid_shape)
+    prompt_grid_local = _as_numpy_grid(batch["prompt_grid_local"][sample_idx])
+    target_grid_local = _as_numpy_grid(batch["target_grid_local"][sample_idx])
+    volume = batch["volume"][sample_idx].detach().cpu().numpy()
+    return _make_xy_slice_overlay_canvas(
+        volume=volume,
+        prompt_grid_local=prompt_grid_local,
+        target_grid_local=target_grid_local,
+        pred_grid_local=pred_grid_local,
+        line_thickness=int(line_thickness),
+        depth_tolerance=float(depth_tolerance),
+    )
+
+
 def _make_inference_prediction_canvas(raw_sample: dict, inference_result: dict) -> np.ndarray:
     prompt_grid_local = _as_numpy_grid(raw_sample["prompt_grid_local"])
     target_grid_local = _as_numpy_grid(raw_sample["target_grid_local"])
@@ -580,6 +803,27 @@ def _make_inference_prediction_canvas(raw_sample: dict, inference_result: dict) 
         target_grid_local=target_grid_local,
         pred_grid_local=pred_grid_local,
         crop_shape=crop_shape,
+    )
+
+
+def _make_inference_xy_slice_canvas(
+    raw_sample: dict,
+    inference_result: dict,
+    *,
+    line_thickness: int,
+    depth_tolerance: float,
+) -> np.ndarray:
+    prompt_grid_local = _as_numpy_grid(raw_sample["prompt_grid_local"])
+    target_grid_local = _as_numpy_grid(raw_sample["target_grid_local"])
+    pred_grid_local = np.asarray(inference_result["continuation_grid_local"], dtype=np.float32)
+    volume = _as_numpy_grid(raw_sample["volume"])
+    return _make_xy_slice_overlay_canvas(
+        volume=volume,
+        prompt_grid_local=prompt_grid_local,
+        target_grid_local=target_grid_local,
+        pred_grid_local=pred_grid_local,
+        line_thickness=int(line_thickness),
+        depth_tolerance=float(depth_tolerance),
     )
 
 
@@ -845,24 +1089,57 @@ def run_autoreg_mesh_training(
                 )
 
             wandb_payload = dict(metrics)
-            should_log_images = (
+            should_log_projection_images = (
                 wandb is not None and
                 bool(cfg.get("wandb_log_images", True)) and
                 global_step % int(cfg["wandb_image_frequency"]) == 0
             )
-            if should_log_images:
+            should_log_xy_images = (
+                wandb is not None and
+                bool(cfg.get("wandb_log_images", True)) and
+                bool(cfg.get("wandb_log_xy_slice_images", True)) and
+                global_step % int(cfg["wandb_xy_slice_image_frequency"]) == 0
+            )
+            if should_log_projection_images or should_log_xy_images:
+                raw_val_sample = None
+                val_infer = None
+                need_val_visual = val_dataset is not None and len(val_dataset) > 0
+                if need_val_visual:
+                    raw_val_sample = val_dataset[0]
+                    model.eval()
+                    val_infer = infer_autoreg_mesh(model, raw_val_sample, greedy=True)
+                    model.train()
+
+            if should_log_projection_images:
                 wandb_payload["train_example"] = wandb.Image(
                     _make_teacher_forced_prediction_canvas(batch, outputs, sample_idx=0),
                     caption=f"step={global_step} train teacher-forced",
                 )
-                if val_dataset is not None and len(val_dataset) > 0:
-                    model.eval()
-                    raw_val_sample = val_dataset[0]
-                    val_infer = infer_autoreg_mesh(model, raw_val_sample, greedy=True)
-                    model.train()
+                if raw_val_sample is not None and val_infer is not None:
                     wandb_payload["val_example"] = wandb.Image(
                         _make_inference_prediction_canvas(raw_val_sample, val_infer),
                         caption=f"step={global_step} val autoregressive",
+                    )
+            if should_log_xy_images:
+                wandb_payload["train_example_xy"] = wandb.Image(
+                    _make_teacher_forced_xy_slice_canvas(
+                        batch,
+                        outputs,
+                        sample_idx=0,
+                        line_thickness=int(cfg.get("wandb_xy_slice_line_thickness", 1)),
+                        depth_tolerance=float(cfg.get("wandb_xy_slice_depth_tolerance", 0.75)),
+                    ),
+                    caption=f"step={global_step} train xy slice",
+                )
+                if raw_val_sample is not None and val_infer is not None:
+                    wandb_payload["val_example_xy"] = wandb.Image(
+                        _make_inference_xy_slice_canvas(
+                            raw_val_sample,
+                            val_infer,
+                            line_thickness=int(cfg.get("wandb_xy_slice_line_thickness", 1)),
+                            depth_tolerance=float(cfg.get("wandb_xy_slice_depth_tolerance", 0.75)),
+                        ),
+                        caption=f"step={global_step} val xy slice",
                     )
 
             history.append(dict(metrics))

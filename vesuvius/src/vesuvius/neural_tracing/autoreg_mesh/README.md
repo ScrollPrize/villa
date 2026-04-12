@@ -82,3 +82,5 @@ result = infer_autoreg_mesh(
 ```
 
 The result contains sampled continuation vertices plus reconstructed continuation and merged full `zyx` grids in local and world coordinates.
+
+W&B logging can also emit XY-slice overlays that draw prompt, GT continuation, and predicted continuation lines directly over a selected volume slice for quick geometry/context inspection.

@@ -27,8 +27,12 @@ from vesuvius.neural_tracing.autoreg_mesh.losses import (
 from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
 from vesuvius.neural_tracing.autoreg_mesh.serialization import deserialize_continuation_grid, serialize_split_conditioning_example
 from vesuvius.neural_tracing.autoreg_mesh.train import (
+    _choose_best_xy_slice,
+    _edge_segment_on_z_slice,
     _geometry_metric_weight_active,
     _geometry_sd_weight_active,
+    _make_xy_slice_overlay_canvas,
+    _rasterize_grid_on_xy_slice,
     _restrict_dataset_samples,
     _scheduled_sampling_feedback_state,
     run_autoreg_mesh_training,
@@ -457,6 +461,81 @@ def test_scheduled_sampling_uses_refined_xyz_after_refine_is_active() -> None:
     )
 
     assert torch.allclose(generation_inputs["xyz"][:, 1:], teacher_outputs["pred_xyz_refined"][:, :-1])
+
+
+def test_edge_segment_on_z_slice_crossing_and_far_cases() -> None:
+    crossing = _edge_segment_on_z_slice(
+        np.array([4.0, 2.0, 3.0], dtype=np.float32),
+        np.array([6.0, 4.0, 7.0], dtype=np.float32),
+        z_slice=5,
+        depth_tolerance=0.25,
+    )
+    far = _edge_segment_on_z_slice(
+        np.array([1.0, 2.0, 3.0], dtype=np.float32),
+        np.array([2.0, 4.0, 7.0], dtype=np.float32),
+        z_slice=10,
+        depth_tolerance=0.25,
+    )
+
+    assert crossing is not None
+    assert far is None
+
+
+def test_choose_best_xy_slice_returns_in_bounds_slice() -> None:
+    sample = _make_sample("left")
+    z_slice = _choose_best_xy_slice(
+        [
+            sample["prompt_grid_local"].numpy(),
+            sample["target_grid_local"].numpy(),
+        ],
+        depth=16,
+        depth_tolerance=0.75,
+    )
+    assert 0 <= z_slice < 16
+
+
+def test_rasterize_grid_on_xy_slice_draws_near_slice_and_skips_far_edges() -> None:
+    grid = np.array(
+        [
+            [[5.0, 2.0, 2.0], [5.0, 2.0, 6.0]],
+            [[12.0, 6.0, 2.0], [12.0, 6.0, 6.0]],
+        ],
+        dtype=np.float32,
+    )
+    near_mask = _rasterize_grid_on_xy_slice(
+        grid[:1],
+        z_slice=5,
+        panel_shape=(16, 16),
+        line_thickness=1,
+        depth_tolerance=0.5,
+    )
+    far_mask = _rasterize_grid_on_xy_slice(
+        grid[1:],
+        z_slice=5,
+        panel_shape=(16, 16),
+        line_thickness=1,
+        depth_tolerance=0.5,
+    )
+
+    assert float(near_mask.sum()) > 0.0
+    assert float(far_mask.sum()) == pytest.approx(0.0)
+
+
+def test_xy_slice_overlay_canvas_returns_rgb_image() -> None:
+    sample = _make_sample("left")
+    image = _make_xy_slice_overlay_canvas(
+        volume=sample["volume"].numpy(),
+        prompt_grid_local=sample["prompt_grid_local"].numpy(),
+        target_grid_local=sample["target_grid_local"].numpy(),
+        pred_grid_local=sample["target_grid_local"].numpy(),
+        line_thickness=1,
+        depth_tolerance=0.75,
+    )
+
+    assert image.ndim == 3
+    assert image.shape[-1] == 3
+    assert image.shape[0] > 16
+    assert image.dtype == np.uint8
 
 
 def test_autoreg_mesh_smoke_training_runs_two_steps(tmp_path: Path) -> None:
@@ -1089,6 +1168,10 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["triangle_barrier_margin"] == pytest.approx(0.05)
     assert validated["rollout_val_examples_per_log"] == 1
     assert validated["rollout_val_max_steps"] is None
+    assert validated["wandb_log_xy_slice_images"] is True
+    assert validated["wandb_xy_slice_mode"] == "best_xy_slice"
+    assert validated["wandb_xy_slice_line_thickness"] == 1
+    assert validated["wandb_xy_slice_depth_tolerance"] == pytest.approx(0.75)
     assert validated["geometry_metric_enabled"] is True
     assert validated["geometry_metric_weight"] == pytest.approx(0.01)
     assert validated["geometry_metric_start_step"] == 2000
@@ -1261,6 +1344,11 @@ def test_rope_config_validation_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="scheduled_sampling_pattern"):
         validate_autoreg_mesh_config(bad_sched_pattern)
 
+    bad_xy_mode = _make_cached_token_config()
+    bad_xy_mode["wandb_xy_slice_mode"] = "triple"
+    with pytest.raises(ValueError, match="wandb_xy_slice_mode"):
+        validate_autoreg_mesh_config(bad_xy_mode)
+
 
 def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     config = _make_cached_token_config()
@@ -1378,11 +1466,17 @@ def test_autoreg_mesh_wandb_logging_includes_metrics_and_images(tmp_path: Path, 
     assert "rollout_val_seam_edge_error" in logged
     assert "rollout_val_triangle_flip_rate" in logged
     assert "train_example" in logged
+    assert "train_example_xy" in logged
     assert "val_example" in logged
+    assert "val_example_xy" in logged
     assert isinstance(logged["train_example"], _FakeWandbImage)
+    assert isinstance(logged["train_example_xy"], _FakeWandbImage)
     assert isinstance(logged["val_example"], _FakeWandbImage)
+    assert isinstance(logged["val_example_xy"], _FakeWandbImage)
     assert logged["train_example"].data.ndim == 3
+    assert logged["train_example_xy"].data.ndim == 3
     assert logged["val_example"].data.ndim == 3
+    assert logged["val_example_xy"].data.ndim == 3
     assert fake_wandb.finish_calls == 1
 
 
