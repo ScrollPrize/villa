@@ -160,6 +160,11 @@ private:
     std::atomic<uint64_t> statIceFetches_{0};
     std::atomic<uint64_t> statDiskWrites_{0};
     std::atomic<uint64_t> statTotalSubmitted_{0};
+    // Cumulative bytes written to the canonical disk cache this session.
+    std::atomic<uint64_t> statDiskBytes_{0};
+    // Distinct shard files touched this session.
+    mutable std::mutex writtenShardsMutex_;
+    std::unordered_set<ShardKey, ShardKeyHash> writtenShards_;
     mutable std::atomic<uint64_t> statMisses_{0};
 };
 

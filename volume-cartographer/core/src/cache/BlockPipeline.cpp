@@ -177,6 +177,19 @@ BlockPipeline::BlockPipeline(
                 zarrWriteChunk(*dz, key,
                     reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
                 statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
+                statDiskBytes_.fetch_add(h265.size(), std::memory_order_relaxed);
+                if (dz->is_sharded()) {
+                    const auto& m = dz->metadata();
+                    ShardKey sk{key.level, 0, 0, 0};
+                    auto bpcZ = m.sub_chunks_per_shard(0);
+                    auto bpcY = m.sub_chunks_per_shard(1);
+                    auto bpcX = m.sub_chunks_per_shard(2);
+                    sk.sz = bpcZ ? key.iz / int(bpcZ) : key.iz;
+                    sk.sy = bpcY ? key.iy / int(bpcY) : key.iy;
+                    sk.sx = bpcX ? key.ix / int(bpcX) : key.ix;
+                    std::lock_guard lk(writtenShardsMutex_);
+                    writtenShards_.insert(sk);
+                }
             }
         }
 
@@ -366,6 +379,19 @@ ChunkDataPtr BlockPipeline::fetchChunkBlocking(const ChunkKey& key) {
     zarrWriteChunk(*dz, key,
         reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
     statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
+    statDiskBytes_.fetch_add(h265.size(), std::memory_order_relaxed);
+    if (dz->is_sharded()) {
+        const auto& m = dz->metadata();
+        ShardKey sk{key.level, 0, 0, 0};
+        auto bpcZ = m.sub_chunks_per_shard(0);
+        auto bpcY = m.sub_chunks_per_shard(1);
+        auto bpcX = m.sub_chunks_per_shard(2);
+        sk.sz = bpcZ ? key.iz / int(bpcZ) : key.iz;
+        sk.sy = bpcY ? key.iy / int(bpcY) : key.iy;
+        sk.sx = bpcX ? key.ix / int(bpcX) : key.ix;
+        std::lock_guard lk(writtenShardsMutex_);
+        writtenShards_.insert(sk);
+    }
     return data;
 }
 
@@ -522,16 +548,10 @@ auto BlockPipeline::stats() const -> Stats {
         s.negativeCount = negativeCache_.size();
     }
     s.totalSubmitted = statTotalSubmitted_.load(std::memory_order_relaxed);
-    for (const auto& dz : diskLevels_) {
-        if (!dz) continue;
-        namespace fs = std::filesystem;
-        std::error_code ec;
-        for (auto& entry : fs::recursive_directory_iterator(dz->path(), ec)) {
-            if (entry.is_regular_file(ec) && entry.path().filename() != "zarr.json") {
-                s.diskBytes += entry.file_size(ec);
-                s.diskShards++;
-            }
-        }
+    s.diskBytes = statDiskBytes_.load(std::memory_order_relaxed);
+    {
+        std::lock_guard lk(writtenShardsMutex_);
+        s.diskShards = writtenShards_.size();
     }
     if (auto* http = dynamic_cast<HttpSource*>(source_.get()))
         s.sharded = http->isSharded();

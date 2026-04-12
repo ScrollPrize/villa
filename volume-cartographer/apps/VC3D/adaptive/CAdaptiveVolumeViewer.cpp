@@ -741,12 +741,14 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
             auto pct = [&](uint64_t n) { return static_cast<int>(100 * n / total); };
             status += QString(" | blk %1% cold %2%").arg(pct(s.blockHits)).arg(pct(s.coldHits));
         }
-        status += QString(" | blk %1").arg(s.blocks);
+        // Block cache: MB resident out of budget (4 KiB per block).
+        double blockMb = static_cast<double>(s.blocks) * 4.0 / 1024.0;
+        status += QString(" | blk %1M").arg(blockMb, 0, 'f', 0);
 
-        double diskGB = static_cast<double>(s.diskBytes) / (1024.0 * 1024.0 * 1024.0);
+        double diskMb = static_cast<double>(s.diskBytes) / (1024.0 * 1024.0);
         const char* unit = s.sharded ? "shard" : "chunk";
-        status += QString(" | disk %1G %2%3")
-            .arg(diskGB, 0, 'f', 1)
+        status += QString(" | disk %1M %2%3")
+            .arg(diskMb, 0, 'f', 1)
             .arg(s.diskShards)
             .arg(unit);
 
