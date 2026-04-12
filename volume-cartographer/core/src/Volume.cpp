@@ -16,7 +16,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/cache/TieredChunkCache.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/cache/ChunkSource.hpp"
 #include "vc/core/cache/VcDecompressor.hpp"
 #include <utils/zarr.hpp>
@@ -279,7 +279,7 @@ size_t Volume::numScales() const noexcept {
     return zarrDs_.size();
 }
 
-std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
+std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache(
     std::shared_ptr<utils::ZarrArray> /*diskZarr_unused*/) const
 {
     if (zarrDs_.empty()) return nullptr;
@@ -368,7 +368,7 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
     }
     auto decompress = vc::cache::makeVcDecompressor(dsPtrs);
 
-    vc::cache::TieredChunkCache::Config config;
+    vc::cache::BlockPipeline::Config config;
     config.volumeId = id();
     config.hotMaxBytes = cacheBudgetHot_;
     if (isRemote_ || mountInfo_.type == vc::FilesystemType::NetworkMount) {
@@ -382,7 +382,7 @@ std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
         fprintf(stderr, "[Volume] IO threads: %d\n", config.ioThreads);
     }
 
-    return std::make_unique<vc::cache::TieredChunkCache>(
+    return std::make_unique<vc::cache::BlockPipeline>(
         std::move(config),
         std::move(source),
         std::move(decompress),
@@ -398,10 +398,15 @@ void Volume::ensureTieredCache() const
     std::call_once(cacheOnce_, [this]() {
         auto* self = const_cast<Volume*>(this);
         tieredCache_ = self->createTieredCache(self->pendingDiskZarr_);
+        if (tieredCache_) {
+            int nScales = tieredCache_->numLevels();
+            if (nScales > 0)
+                tieredCache_->loadResidentLevel(nScales - 1);
+        }
     });
 }
 
-vc::cache::TieredChunkCache* Volume::tieredCache()
+vc::cache::BlockPipeline* Volume::tieredCache()
 {
     ensureTieredCache();
     return tieredCache_.get();

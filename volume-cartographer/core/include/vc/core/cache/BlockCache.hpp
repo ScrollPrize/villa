@@ -20,7 +20,7 @@ constexpr size_t kBlockBytes = size_t(kBlockSize) * kBlockSize * kBlockSize;
 
 struct BlockKey {
     int level = 0;
-    int bz = 0;  // block index along z (16-voxel units at this level)
+    int bz = 0;
     int by = 0;
     int bx = 0;
 
@@ -39,14 +39,17 @@ struct alignas(64) Block {
     std::atomic<uint8_t> used{1};  // clock-sweep NRU flag
 };
 
-// Block-granularity cache for voxel data. Two regions:
-//   - Resident: always-in-memory blocks (e.g. coarsest level). Never evicted.
-//   - Evictable: arena of fixed-size block slots; NRU clock-sweep eviction
-//     when full. Hashmap `BlockKey → Block*` for lookup.
+using BlockPtr = std::shared_ptr<Block>;
+
+// Block-granularity cache for voxel data.
 //
-// The evictable arena is sized at construction. Lookups return raw pointers
-// whose lifetime extends until the block is reclaimed by a sweep — the caller
-// must not retain pointers across cache-mutating operations.
+// Two regions:
+//   - Resident: always-in-memory blocks (e.g. coarsest level). Never evicted.
+//   - Evictable: bounded-capacity clock-sweep NRU arena.
+//
+// get() / put() yield std::shared_ptr<Block>. A block dropped from the
+// eviction arena while a sampler still holds a shared_ptr stays alive in
+// memory until the last reference is released.
 class BlockCache {
 public:
     struct Config {
@@ -59,47 +62,40 @@ public:
     BlockCache(const BlockCache&) = delete;
     BlockCache& operator=(const BlockCache&) = delete;
 
-    // Lookup a block. Returns nullptr if not present. On hit, sets the NRU
-    // `used` flag so the block survives the next eviction sweep.
-    [[nodiscard]] const Block* get(const BlockKey& key) noexcept;
+    // Lookup. Returns null if not cached. On evictable-region hit, marks the
+    // block as recently used.
+    [[nodiscard]] BlockPtr get(const BlockKey& key) noexcept;
 
-    // Insert a block, copying kBlockBytes from `src`. If the key already
-    // exists the existing entry is overwritten. For evictable insertions,
-    // evicts NRU entries if the arena is full.
+    // Insert into the evictable region, copying kBlockBytes from `src`.
+    // Evicts NRU entries if the arena is full; evicted blocks remain alive
+    // while outstanding shared_ptrs reference them.
     void put(const BlockKey& key, const uint8_t* src);
 
-    // Insert into the always-resident region (grows on demand, not evicted).
+    // Insert into the resident region (grows on demand, never evicted).
     void putResident(const BlockKey& key, const uint8_t* src);
 
-    [[nodiscard]] size_t evictableSlots() const noexcept { return nSlots_; }
-    [[nodiscard]] size_t residentSlots() const noexcept;
-    [[nodiscard]] size_t evictableUsed() const noexcept;
+    [[nodiscard]] size_t capacity() const noexcept { return nSlots_; }
+    [[nodiscard]] size_t residentSize() const noexcept;
+    [[nodiscard]] size_t evictableSize() const noexcept;
 
     void clearEvictable();
 
 private:
-    // Clock-sweep eviction. Advances the hand until a slot with used==0 is
-    // found, clearing used bits as it passes. Returns the reclaimed slot.
-    [[nodiscard]] Block* reclaimOneLocked();
+    [[nodiscard]] size_t reclaimSlotLocked();
 
     Config config_;
+    size_t nSlots_ = 0;
 
     mutable std::mutex mutex_;
-    std::unordered_map<BlockKey, Block*, BlockKeyHash> evictableMap_;
-    std::unordered_map<BlockKey, Block*, BlockKeyHash> residentMap_;
+    std::unordered_map<BlockKey, BlockPtr, BlockKeyHash> evictableMap_;
+    std::unordered_map<BlockKey, BlockPtr, BlockKeyHash> residentMap_;
 
-    // Evictable arena: contiguous slots, each mapped into evictableMap_ when
-    // populated. Reverse index `slotKeys_[i]` tells us which key currently
-    // owns slot `i` (or a sentinel if empty).
-    std::unique_ptr<Block[]> slots_;
-    size_t nSlots_ = 0;
-    std::vector<BlockKey> slotKeys_;
-    std::vector<uint8_t> slotOccupied_;  // 0 = empty, 1 = holds a block
+    // Parallel arrays sized to nSlots_. slot i is occupied iff occupied_[i].
+    std::vector<BlockPtr> slotBlock_;
+    std::vector<BlockKey> slotKey_;
+    std::vector<uint8_t> occupied_;
     size_t occupiedCount_ = 0;
     size_t clockHand_ = 0;
-
-    // Resident arena grows on demand; pointers are stable.
-    std::vector<std::unique_ptr<Block>> residentArena_;
 };
 
 }  // namespace vc::cache

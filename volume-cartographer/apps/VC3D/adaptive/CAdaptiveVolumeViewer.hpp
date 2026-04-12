@@ -20,7 +20,7 @@
 #include "CVolumeViewerView.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Sampling.hpp"
-#include "vc/core/cache/TieredChunkCache.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/render/AdaptiveCamera.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
@@ -66,7 +66,7 @@ public:
     // --- Accessors ---
     std::string surfName() const override { return _surfName; }
     std::shared_ptr<Volume> currentVolume() const override { return _volume; }
-    vc::cache::TieredChunkCache* chunkCachePtr() const override {
+    vc::cache::BlockPipeline* chunkCachePtr() const override {
         return _volume ? _volume->tieredCache() : nullptr;
     }
     int datasetScaleIndex() const override { return _camera.dsScaleIdx; }
@@ -291,7 +291,7 @@ private:
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
 
     // --- Chunk-ready listener ---
-    vc::cache::TieredChunkCache::ChunkReadyCallbackId _chunkCbId = 0;
+    vc::cache::BlockPipeline::ChunkReadyCallbackId _chunkCbId = 0;
     bool _hadValidDataBounds = false;
     bool _dirtyWhileMinimized = false;
 };

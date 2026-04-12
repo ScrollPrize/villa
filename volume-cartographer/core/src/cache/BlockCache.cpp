@@ -12,15 +12,15 @@ BlockCache::BlockCache(Config cfg)
     : config_(cfg)
 {
     nSlots_ = config_.evictableBytes / kBlockBytes;
-    slots_ = std::make_unique<Block[]>(nSlots_);
-    slotKeys_.assign(nSlots_, kEmptyKey);
-    slotOccupied_.assign(nSlots_, 0);
+    slotBlock_.assign(nSlots_, nullptr);
+    slotKey_.assign(nSlots_, kEmptyKey);
+    occupied_.assign(nSlots_, 0);
     evictableMap_.reserve(nSlots_);
 }
 
 BlockCache::~BlockCache() = default;
 
-const Block* BlockCache::get(const BlockKey& key) noexcept
+BlockPtr BlockCache::get(const BlockKey& key) noexcept
 {
     std::lock_guard lock(mutex_);
     if (auto it = residentMap_.find(key); it != residentMap_.end()) {
@@ -48,25 +48,23 @@ void BlockCache::put(const BlockKey& key, const uint8_t* src)
         return;
     }
 
-    Block* slot = nullptr;
+    size_t slot;
     if (occupiedCount_ < nSlots_) {
-        for (size_t i = clockHand_; ; i = (i + 1) % nSlots_) {
-            if (!slotOccupied_[i]) {
-                slot = &slots_[i];
-                slotOccupied_[i] = 1;
-                slotKeys_[i] = key;
-                occupiedCount_++;
-                clockHand_ = (i + 1) % nSlots_;
-                break;
-            }
-        }
+        slot = clockHand_;
+        while (occupied_[slot]) slot = (slot + 1) % nSlots_;
+        occupied_[slot] = 1;
+        occupiedCount_++;
+        clockHand_ = (slot + 1) % nSlots_;
     } else {
-        slot = reclaimOneLocked();
+        slot = reclaimSlotLocked();
     }
 
-    evictableMap_[key] = slot;
-    std::memcpy(slot->data, src, kBlockBytes);
-    slot->used.store(1, std::memory_order_relaxed);
+    auto block = std::make_shared<Block>();
+    std::memcpy(block->data, src, kBlockBytes);
+    block->used.store(1, std::memory_order_relaxed);
+    slotBlock_[slot] = block;
+    slotKey_[slot] = key;
+    evictableMap_[key] = std::move(block);
 }
 
 void BlockCache::putResident(const BlockKey& key, const uint8_t* src)
@@ -76,39 +74,36 @@ void BlockCache::putResident(const BlockKey& key, const uint8_t* src)
         std::memcpy(it->second->data, src, kBlockBytes);
         return;
     }
-    auto block = std::make_unique<Block>();
-    Block* ptr = block.get();
-    std::memcpy(ptr->data, src, kBlockBytes);
-    ptr->used.store(1, std::memory_order_relaxed);
-    residentArena_.push_back(std::move(block));
-    residentMap_[key] = ptr;
+    auto block = std::make_shared<Block>();
+    std::memcpy(block->data, src, kBlockBytes);
+    block->used.store(1, std::memory_order_relaxed);
+    residentMap_[key] = std::move(block);
 }
 
-Block* BlockCache::reclaimOneLocked()
+size_t BlockCache::reclaimSlotLocked()
 {
-    // Clock sweep: advance until we find a slot with used==0; clear used
-    // bits along the way. Occupied slots always exist here (caller ensures).
     for (;;) {
         size_t i = clockHand_;
         clockHand_ = (clockHand_ + 1) % nSlots_;
-        if (!slotOccupied_[i]) continue;
-        Block& b = slots_[i];
-        if (b.used.load(std::memory_order_relaxed) == 0) {
-            evictableMap_.erase(slotKeys_[i]);
-            slotKeys_[i] = kEmptyKey;
-            return &b;  // slot stays occupied; caller overwrites
+        if (!occupied_[i]) continue;
+        auto& block = slotBlock_[i];
+        if (block->used.load(std::memory_order_relaxed) == 0) {
+            evictableMap_.erase(slotKey_[i]);
+            slotBlock_[i].reset();     // drops our ref; external refs keep alive
+            slotKey_[i] = kEmptyKey;
+            return i;
         }
-        b.used.store(0, std::memory_order_relaxed);
+        block->used.store(0, std::memory_order_relaxed);
     }
 }
 
-size_t BlockCache::residentSlots() const noexcept
+size_t BlockCache::residentSize() const noexcept
 {
     std::lock_guard lock(mutex_);
-    return residentArena_.size();
+    return residentMap_.size();
 }
 
-size_t BlockCache::evictableUsed() const noexcept
+size_t BlockCache::evictableSize() const noexcept
 {
     std::lock_guard lock(mutex_);
     return occupiedCount_;
@@ -118,8 +113,9 @@ void BlockCache::clearEvictable()
 {
     std::lock_guard lock(mutex_);
     evictableMap_.clear();
-    std::fill(slotOccupied_.begin(), slotOccupied_.end(), 0);
-    std::fill(slotKeys_.begin(), slotKeys_.end(), kEmptyKey);
+    for (auto& p : slotBlock_) p.reset();
+    std::fill(slotKey_.begin(), slotKey_.end(), kEmptyKey);
+    std::fill(occupied_.begin(), occupied_.end(), 0);
     occupiedCount_ = 0;
     clockHand_ = 0;
 }

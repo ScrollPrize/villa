@@ -16,7 +16,7 @@
 #include "vc/core/cache/ChunkSource.hpp"
 #include "vc/core/cache/DiskStore.hpp"
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
-#include "vc/core/cache/TieredChunkCache.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 
 namespace fs = std::filesystem;
 
@@ -78,7 +78,7 @@ vc::cache::DecompressFn makeTestDecompress()
 }
 
 struct CacheHarness {
-    std::unique_ptr<vc::cache::TieredChunkCache> cache;
+    std::unique_ptr<vc::cache::BlockPipeline> cache;
     FakeChunkSource* source = nullptr;
 };
 
@@ -97,14 +97,14 @@ CacheHarness makeTestCache(
     std::shared_ptr<vc::cache::DiskStore> diskStore,
     std::unique_ptr<FakeChunkSource> source)
 {
-    vc::cache::TieredChunkCache::Config cfg;
+    vc::cache::BlockPipeline::Config cfg;
     cfg.volumeId = "test-volume";
     cfg.hotMaxBytes = 1024;
     cfg.ioThreads = 1;
 
     auto* sourcePtr = source.get();
     CacheHarness harness;
-    harness.cache = std::make_unique<vc::cache::TieredChunkCache>(
+    harness.cache = std::make_unique<vc::cache::BlockPipeline>(
         cfg,
         std::move(source),
         makeTestDecompress(),
@@ -350,7 +350,7 @@ TEST(HttpMetadataFetcher, RemoteVolumeIdNormalizesTrailingSlash)
     EXPECT_EQ(vc::cache::deriveRemoteVolumeId(a), vc::cache::deriveRemoteVolumeId(b));
 }
 
-TEST(TieredChunkCache, DiskOnlyRegionIsNotReadyForNonBlockingRead)
+TEST(BlockPipeline, DiskOnlyRegionIsNotReadyForNonBlockingRead)
 {
     CacheFixture fixture;
     auto diskStore = fixture.makeDiskStore();
@@ -366,7 +366,7 @@ TEST(TieredChunkCache, DiskOnlyRegionIsNotReadyForNonBlockingRead)
     EXPECT_EQ(harness.source->fetchCount(), 0u);
 }
 
-TEST(TieredChunkCache, CountAvailableIgnoresDiskOnlyButIncludesNegativeCached)
+TEST(BlockPipeline, CountAvailableIgnoresDiskOnlyButIncludesNegativeCached)
 {
     CacheFixture fixture;
     const std::string volumeId = "test-volume";
@@ -385,7 +385,7 @@ TEST(TieredChunkCache, CountAvailableIgnoresDiskOnlyButIncludesNegativeCached)
     EXPECT_EQ(harness.cache->countAvailable({hotKey, diskOnlyKey, missingKey}), 2u);
 }
 
-TEST(TieredChunkCache, MixedRegionRequiresPromotionOfDiskOnlyChunk)
+TEST(BlockPipeline, MixedRegionRequiresPromotionOfDiskOnlyChunk)
 {
     CacheFixture fixture;
     const std::string volumeId = "test-volume";

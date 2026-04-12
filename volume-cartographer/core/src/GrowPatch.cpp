@@ -693,7 +693,7 @@ struct Vec3iEqual {
 };
 
 struct SDTContext {
-    vc::cache::TieredChunkCache* cache = nullptr;
+    vc::cache::BlockPipeline* cache = nullptr;
     int level = 0;
     int chunk_size = 64;
     float threshold = 1.0f;
@@ -2743,7 +2743,7 @@ struct thresholdedDistance
 };
 
 
-QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::TieredChunkCache *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections)
+QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections)
 {
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;

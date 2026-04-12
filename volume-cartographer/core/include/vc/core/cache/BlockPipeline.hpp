@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "BlockCache.hpp"
 #include "ChunkData.hpp"
 #include "ChunkKey.hpp"
 #include "ChunkSource.hpp"
@@ -28,7 +29,7 @@ namespace vc::cache {
 //
 // Promotion path:  ice → cold → hot  (decompression inline on IO thread)
 // Eviction:        hot entries removed (cold still has on-disk copy).
-class TieredChunkCache {
+class BlockPipeline {
 public:
     struct Config {
         size_t hotMaxBytes = 10ULL << 30;    // 10 GB
@@ -38,16 +39,16 @@ public:
     };
 
     // diskZarr: local zarr v3 sharded array for cold tier (may be nullptr)
-    TieredChunkCache(
+    BlockPipeline(
         Config config,
         std::unique_ptr<ChunkSource> source,
         DecompressFn decompress,
         std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels = {});
 
-    ~TieredChunkCache();
+    ~BlockPipeline();
 
-    TieredChunkCache(const TieredChunkCache&) = delete;
-    TieredChunkCache& operator=(const TieredChunkCache&) = delete;
+    BlockPipeline(const BlockPipeline&) = delete;
+    BlockPipeline& operator=(const BlockPipeline&) = delete;
 
     // --- Non-blocking reads ---
     [[nodiscard]] ChunkDataPtr get(const ChunkKey& key);
@@ -58,6 +59,17 @@ public:
 
     // --- Interactive fetch (for viewport chunks) ---
     void fetchInteractive(const std::vector<ChunkKey>& keys);
+
+    // --- Block-level access ---
+    // Returns a shared pointer to a 16^3 uncompressed block, or null if not
+    // in RAM. Resident-level blocks are always available. Evictable-region
+    // blocks remain alive while the returned shared_ptr is held.
+    [[nodiscard]] BlockPtr blockAt(const BlockKey& key) noexcept;
+
+    // Populate the always-resident region with every block from `level`.
+    // Blocking: fetches any missing chunks through the normal chain. Call
+    // once on volume open.
+    void loadResidentLevel(int level);
 
     // --- Cache management ---
     void clearMemory();
@@ -133,6 +145,15 @@ private:
 
     // --- I/O pool ---
     IOPool ioPool_;
+
+    // --- Block cache ---
+    BlockCache blockCache_;
+    int residentLevel_ = -1;
+
+    // Split a decoded chunk into 16^3 blocks and insert them into blockCache_.
+    // resident=true places blocks in the always-resident region.
+    void insertChunkAsBlocks(const ChunkKey& key, const ChunkData& chunk,
+                             bool resident);
 
     // --- Negative cache ---
     static constexpr size_t kBloomBits = 65536;

@@ -131,7 +131,7 @@ bool istype(const std::string &line, const std::string &type)
 
 
 struct DSReader {
-    vc::cache::TieredChunkCache* cache;
+    vc::cache::BlockPipeline* cache;
     float scale;
     int level;
     std::mutex read_mutex;

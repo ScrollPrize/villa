@@ -71,7 +71,7 @@ class Chunked3d {
 public:
     using CHUNKT = Array3D<T>;
 
-    Chunked3d(C &compute_f, vc::VcDataset *ds, vc::cache::TieredChunkCache *cache, int level) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
+    Chunked3d(C &compute_f, vc::VcDataset *ds, vc::cache::BlockPipeline *cache, int level) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
     {
         _border = compute_f.BORDER;
     };
@@ -80,7 +80,7 @@ public:
         if (!_persistent)
             remove_all(_cache_dir);
     };
-    Chunked3d(C &compute_f, vc::VcDataset *ds, vc::cache::TieredChunkCache *cache, int level, const std::filesystem::path &cache_root) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
+    Chunked3d(C &compute_f, vc::VcDataset *ds, vc::cache::BlockPipeline *cache, int level, const std::filesystem::path &cache_root) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
     {
         _border = compute_f.BORDER;
         
@@ -428,7 +428,7 @@ public:
 
     std::unordered_map<cv::Vec3i,T*,vec3i_hash> _chunks;
     vc::VcDataset *_ds;
-    vc::cache::TieredChunkCache *_cache;
+    vc::cache::BlockPipeline *_cache;
     int _level;
     size_t _border;
     C &_compute_f;
@@ -679,7 +679,7 @@ struct Chunked3dFloatFromUint8
     }
 
     passTroughComputor _passthrough;
-    std::unique_ptr<vc::cache::TieredChunkCache> _ownedCache;
+    std::unique_ptr<vc::cache::BlockPipeline> _ownedCache;
     Chunked3d<uint8_t, passTroughComputor> _x;
     float _scale;
     std::unique_ptr<vc::VcDataset> _ds;
@@ -719,7 +719,7 @@ struct Chunked3dVec3fFromUint8
     }
 
     passTroughComputor _passthrough_x, _passthrough_y, _passthrough_z;
-    std::unique_ptr<vc::cache::TieredChunkCache> _cacheX, _cacheY, _cacheZ;
+    std::unique_ptr<vc::cache::BlockPipeline> _cacheX, _cacheY, _cacheZ;
     Chunked3d<uint8_t, passTroughComputor> _x, _y, _z;
     float _scale;
     std::vector<std::unique_ptr<vc::VcDataset>> _dss;

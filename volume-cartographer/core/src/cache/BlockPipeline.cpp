@@ -1,4 +1,4 @@
-#include "vc/core/cache/TieredChunkCache.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/cache/ChunkSource.hpp"
 #include "vc/core/cache/CacheDebugLog.hpp"
 
@@ -54,7 +54,7 @@ static bool isAllZero(const uint8_t* data, size_t size) noexcept
 }
 
 // Helper to build LRUCache config for the hot tier
-static auto makeHotConfig(const TieredChunkCache::Config& cfg) {
+static auto makeHotConfig(const BlockPipeline::Config& cfg) {
     using HotCache = utils::LRUCache<ChunkKey, ChunkDataPtr, ChunkKeyHash>;
     typename HotCache::Config c;
     c.max_bytes = cfg.hotMaxBytes;
@@ -66,7 +66,7 @@ static auto makeHotConfig(const TieredChunkCache::Config& cfg) {
     return c;
 }
 
-TieredChunkCache::TieredChunkCache(
+BlockPipeline::BlockPipeline(
     Config config,
     std::unique_ptr<ChunkSource> source,
     DecompressFn decompress,
@@ -77,6 +77,7 @@ TieredChunkCache::TieredChunkCache(
     , source_(std::move(source))
     , decompress_(std::move(decompress))
     , ioPool_(config_.ioThreads)
+    , blockCache_(BlockCache::Config{config_.hotMaxBytes})
 {
     auto* httpSource = dynamic_cast<HttpChunkSource*>(source_.get());
     bool sharded = httpSource && httpSource->isSharded();
@@ -225,7 +226,8 @@ TieredChunkCache::TieredChunkCache(
                 if (decompress_) {
                     auto data = decompress_(compressed, key);
                     if (data) {
-                        hotPut(key, std::move(data));
+                        insertChunkAsBlocks(key, *data, key.level == residentLevel_);
+                        hotPut(key, data);
                         anyArrived = true;
                         lastKey = key;
 
@@ -267,7 +269,7 @@ TieredChunkCache::TieredChunkCache(
     loadNegativeCache();
 }
 
-TieredChunkCache::~TieredChunkCache()
+BlockPipeline::~BlockPipeline()
 {
     ioPool_.stop();
 
@@ -285,7 +287,7 @@ TieredChunkCache::~TieredChunkCache()
 // Bloom filter for negative cache (lock-free fast path)
 // =============================================================================
 
-void TieredChunkCache::bloomAdd(const ChunkKey& key) noexcept
+void BlockPipeline::bloomAdd(const ChunkKey& key) noexcept
 {
     auto h = ChunkKeyHash{}(key);
     // Two hash functions derived from the single hash via golden ratio mixing
@@ -297,7 +299,7 @@ void TieredChunkCache::bloomAdd(const ChunkKey& key) noexcept
     negativeBloom_[idx2 / 64].fetch_or(1ULL << (idx2 % 64), std::memory_order_relaxed);
 }
 
-bool TieredChunkCache::bloomMayContain(const ChunkKey& key) const noexcept
+bool BlockPipeline::bloomMayContain(const ChunkKey& key) const noexcept
 {
     auto h = ChunkKeyHash{}(key);
     auto h1 = h;
@@ -309,7 +311,7 @@ bool TieredChunkCache::bloomMayContain(const ChunkKey& key) const noexcept
     return b1 && b2;
 }
 
-void TieredChunkCache::bloomClear() noexcept
+void BlockPipeline::bloomClear() noexcept
 {
     for (auto& word : negativeBloom_)
         word.store(0, std::memory_order_relaxed);
@@ -319,7 +321,7 @@ void TieredChunkCache::bloomClear() noexcept
 // Non-blocking reads
 // =============================================================================
 
-ChunkDataPtr TieredChunkCache::get(const ChunkKey& key)
+ChunkDataPtr BlockPipeline::get(const ChunkKey& key)
 {
     // Check hot tier
     auto hot = hotGet(key);
@@ -332,7 +334,7 @@ ChunkDataPtr TieredChunkCache::get(const ChunkKey& key)
     return nullptr;
 }
 
-std::pair<ChunkDataPtr, int> TieredChunkCache::getBestAvailable(
+std::pair<ChunkDataPtr, int> BlockPipeline::getBestAvailable(
     const ChunkKey& key)
 {
     int maxLevel = source_ ? source_->numLevels() - 1 : 0;
@@ -354,7 +356,7 @@ std::pair<ChunkDataPtr, int> TieredChunkCache::getBestAvailable(
 // Blocking reads
 // =============================================================================
 
-ChunkDataPtr TieredChunkCache::getBlocking(const ChunkKey& key)
+ChunkDataPtr BlockPipeline::getBlocking(const ChunkKey& key)
 {
     // Fast path: hot cache hit. This is the common case during rendering —
     // just hash + shard + lock_guard + flat-map probe + return.
@@ -381,7 +383,7 @@ ChunkDataPtr TieredChunkCache::getBlocking(const ChunkKey& key)
 // Interactive fetch
 // =============================================================================
 
-void TieredChunkCache::fetchInteractive(const std::vector<ChunkKey>& keys)
+void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys)
 {
     if (keys.empty()) return;
     std::vector<ChunkKey> submit;
@@ -399,12 +401,12 @@ void TieredChunkCache::fetchInteractive(const std::vector<ChunkKey>& keys)
 // Cache management
 // =============================================================================
 
-void TieredChunkCache::clearMemory()
+void BlockPipeline::clearMemory()
 {
     hotCache_.clear();
 }
 
-void TieredChunkCache::clearAll()
+void BlockPipeline::clearAll()
 {
     ioPool_.cancelPending();
     clearMemory();
@@ -420,34 +422,34 @@ void TieredChunkCache::clearAll()
     }
 }
 
-int TieredChunkCache::numLevels() const noexcept
+int BlockPipeline::numLevels() const noexcept
 {
     return source_ ? source_->numLevels() : 0;
 }
 
-std::array<int, 3> TieredChunkCache::chunkShape(int level) const noexcept
+std::array<int, 3> BlockPipeline::chunkShape(int level) const noexcept
 {
     return source_ ? source_->chunkShape(level) : std::array<int, 3>{0, 0, 0};
 }
 
-std::array<int, 3> TieredChunkCache::levelShape(int level) const noexcept
+std::array<int, 3> BlockPipeline::levelShape(int level) const noexcept
 {
     return source_ ? source_->levelShape(level) : std::array<int, 3>{0, 0, 0};
 }
 
-void TieredChunkCache::setDataBounds(int minX, int maxX, int minY, int maxY, int minZ, int maxZ)
+void BlockPipeline::setDataBounds(int minX, int maxX, int minY, int maxY, int minZ, int maxZ)
 {
     std::lock_guard lock(dataBoundsMutex_);
     dataBoundsL0_ = {minX, maxX, minY, maxY, minZ, maxZ, true};
 }
 
-TieredChunkCache::DataBoundsL0 TieredChunkCache::dataBounds() const
+BlockPipeline::DataBoundsL0 BlockPipeline::dataBounds() const
 {
     std::lock_guard lock(dataBoundsMutex_);
     return dataBoundsL0_;
 }
 
-bool TieredChunkCache::isNegativeCached(const ChunkKey& key) const
+bool BlockPipeline::isNegativeCached(const ChunkKey& key) const
 {
     // Bloom filter fast-reject: if bloom says no, definitely not cached.
     if (!bloomMayContain(key)) return false;
@@ -455,7 +457,7 @@ bool TieredChunkCache::isNegativeCached(const ChunkKey& key) const
     return negativeCache_.count(key) > 0;
 }
 
-bool TieredChunkCache::areAllCachedInRegion(
+bool BlockPipeline::areAllCachedInRegion(
     int level,
     int iz0, int iy0, int ix0,
     int iz1, int iy1, int ix1) const
@@ -474,7 +476,7 @@ bool TieredChunkCache::areAllCachedInRegion(
     return true;
 }
 
-size_t TieredChunkCache::countAvailable(const std::vector<ChunkKey>& keys) const
+size_t BlockPipeline::countAvailable(const std::vector<ChunkKey>& keys) const
 {
     size_t available = 0;
     for (const auto& key : keys) {
@@ -485,8 +487,8 @@ size_t TieredChunkCache::countAvailable(const std::vector<ChunkKey>& keys) const
     return available;
 }
 
-TieredChunkCache::ChunkReadyCallbackId
-TieredChunkCache::addChunkReadyListener(ChunkReadyCallback cb)
+BlockPipeline::ChunkReadyCallbackId
+BlockPipeline::addChunkReadyListener(ChunkReadyCallback cb)
 {
     std::lock_guard lock(callbackMutex_);
     auto id = nextListenerId_.fetch_add(1, std::memory_order_relaxed);
@@ -494,7 +496,7 @@ TieredChunkCache::addChunkReadyListener(ChunkReadyCallback cb)
     return id;
 }
 
-void TieredChunkCache::removeChunkReadyListener(ChunkReadyCallbackId id)
+void BlockPipeline::removeChunkReadyListener(ChunkReadyCallbackId id)
 {
     std::lock_guard lock(callbackMutex_);
     auto it = std::remove_if(chunkReadyListeners_.begin(), chunkReadyListeners_.end(),
@@ -502,7 +504,7 @@ void TieredChunkCache::removeChunkReadyListener(ChunkReadyCallbackId id)
     chunkReadyListeners_.erase(it, chunkReadyListeners_.end());
 }
 
-void TieredChunkCache::clearChunkArrivedFlag() noexcept
+void BlockPipeline::clearChunkArrivedFlag() noexcept
 {
     chunkArrivedFlag_.store(false, std::memory_order_release);
 }
@@ -511,7 +513,7 @@ void TieredChunkCache::clearChunkArrivedFlag() noexcept
 // Stats
 // =============================================================================
 
-auto TieredChunkCache::stats() const -> Stats
+auto BlockPipeline::stats() const -> Stats
 {
     Stats s;
     s.hotHits = statHotHits_.load(std::memory_order_relaxed);
@@ -554,21 +556,96 @@ auto TieredChunkCache::stats() const -> Stats
 // Hot tier — delegates to utils::LRUCache
 // =============================================================================
 
-ChunkDataPtr TieredChunkCache::hotGet(const ChunkKey& key)
+ChunkDataPtr BlockPipeline::hotGet(const ChunkKey& key)
 {
     return hotCache_.get_or(key, nullptr);
 }
 
-void TieredChunkCache::hotPut(const ChunkKey& key, ChunkDataPtr data)
+void BlockPipeline::hotPut(const ChunkKey& key, ChunkDataPtr data)
 {
+    if (data) insertChunkAsBlocks(key, *data, key.level == residentLevel_);
     hotCache_.put(key, std::move(data));
+}
+
+void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
+                                           const ChunkData& chunk,
+                                           bool resident)
+{
+    const int cz = chunk.shape[0];
+    const int cy = chunk.shape[1];
+    const int cx = chunk.shape[2];
+    if (cz <= 0 || cy <= 0 || cx <= 0) return;
+    // Blocks are 16^3; chunks must align.
+    const int bzN = cz / kBlockSize;
+    const int byN = cy / kBlockSize;
+    const int bxN = cx / kBlockSize;
+    if (bzN * kBlockSize != cz || byN * kBlockSize != cy || bxN * kBlockSize != cx) return;
+
+    const uint8_t* src = chunk.rawData();
+    const int strideZ = chunk.strideZ();
+    const int strideY = chunk.strideY();
+
+    // Starting block coord of this chunk at this level.
+    const int baseBz = key.iz * bzN;
+    const int baseBy = key.iy * byN;
+    const int baseBx = key.ix * bxN;
+
+    uint8_t tmp[kBlockBytes];
+
+    for (int bi = 0; bi < bzN; ++bi) {
+        for (int bj = 0; bj < byN; ++bj) {
+            for (int bk = 0; bk < bxN; ++bk) {
+                // Gather contiguous block out of the chunk buffer.
+                uint8_t* dst = tmp;
+                for (int lz = 0; lz < kBlockSize; ++lz) {
+                    const uint8_t* rowBase = src
+                        + (bi * kBlockSize + lz) * strideZ
+                        + (bj * kBlockSize) * strideY;
+                    for (int ly = 0; ly < kBlockSize; ++ly) {
+                        const uint8_t* p = rowBase + ly * strideY + bk * kBlockSize;
+                        std::memcpy(dst, p, kBlockSize);
+                        dst += kBlockSize;
+                    }
+                }
+                BlockKey bkKey{key.level, baseBz + bi, baseBy + bj, baseBx + bk};
+                if (resident)
+                    blockCache_.putResident(bkKey, tmp);
+                else
+                    blockCache_.put(bkKey, tmp);
+            }
+        }
+    }
+}
+
+BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept
+{
+    return blockCache_.get(key);
+}
+
+void BlockPipeline::loadResidentLevel(int level)
+{
+    residentLevel_ = level;
+    int nScales = numLevels();
+    if (level < 0 || level >= nScales) return;
+    auto shape = levelShape(level);
+    auto chunks = chunkShape(level);
+    int gridZ = (shape[0] + chunks[0] - 1) / chunks[0];
+    int gridY = (shape[1] + chunks[1] - 1) / chunks[1];
+    int gridX = (shape[2] + chunks[2] - 1) / chunks[2];
+
+    for (int iz = 0; iz < gridZ; ++iz)
+        for (int iy = 0; iy < gridY; ++iy)
+            for (int ix = 0; ix < gridX; ++ix) {
+                ChunkKey k{level, iz, iy, ix};
+                (void)getBlocking(k);  // populates blockCache_ as resident via hotPut
+            }
 }
 
 // =============================================================================
 // Promotion helpers
 // =============================================================================
 
-ChunkDataPtr TieredChunkCache::promoteFromCold(const ChunkKey& key)
+ChunkDataPtr BlockPipeline::promoteFromCold(const ChunkKey& key)
 {
     if (!decompress_) return nullptr;
     auto* dz = (key.level < static_cast<int>(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
@@ -590,7 +667,7 @@ ChunkDataPtr TieredChunkCache::promoteFromCold(const ChunkKey& key)
     return ret;
 }
 
-ChunkDataPtr TieredChunkCache::promoteFromIce(const ChunkKey& key)
+ChunkDataPtr BlockPipeline::promoteFromIce(const ChunkKey& key)
 {
     if (!source_) return nullptr;
 
@@ -618,7 +695,7 @@ ChunkDataPtr TieredChunkCache::promoteFromIce(const ChunkKey& key)
     return ret;
 }
 
-ChunkDataPtr TieredChunkCache::loadFull(const ChunkKey& key)
+ChunkDataPtr BlockPipeline::loadFull(const ChunkKey& key)
 {
     // Try cold (disk cache)
     auto data = promoteFromCold(key);
@@ -628,7 +705,7 @@ ChunkDataPtr TieredChunkCache::loadFull(const ChunkKey& key)
     return promoteFromIce(key);
 }
 
-bool TieredChunkCache::isReadyForNonBlockingRead(const ChunkKey& key) const
+bool BlockPipeline::isReadyForNonBlockingRead(const ChunkKey& key) const
 {
     if (hotCache_.contains(key)) return true;
 
@@ -637,7 +714,7 @@ bool TieredChunkCache::isReadyForNonBlockingRead(const ChunkKey& key) const
     return false;
 }
 
-bool TieredChunkCache::isAvailableWithoutRemoteFetch(const ChunkKey& key) const
+bool BlockPipeline::isAvailableWithoutRemoteFetch(const ChunkKey& key) const
 {
     if (isReadyForNonBlockingRead(key)) return true;
 
@@ -648,7 +725,7 @@ bool TieredChunkCache::isAvailableWithoutRemoteFetch(const ChunkKey& key) const
     return false;
 }
 
-void TieredChunkCache::flushPersistentState()
+void BlockPipeline::flushPersistentState()
 {
     saveNegativeCache();
 }
@@ -657,7 +734,7 @@ void TieredChunkCache::flushPersistentState()
 // Negative cache persistence
 // =============================================================================
 
-void TieredChunkCache::loadNegativeCache()
+void BlockPipeline::loadNegativeCache()
 {
     if (diskLevels_.empty()) return;
     auto negRoot = diskLevels_[0]->path().parent_path();
@@ -683,7 +760,7 @@ void TieredChunkCache::loadNegativeCache()
     }
 }
 
-void TieredChunkCache::saveNegativeCache() const
+void BlockPipeline::saveNegativeCache() const
 {
     if (negativeCache_.empty()) return;
     if (diskLevels_.empty()) return;

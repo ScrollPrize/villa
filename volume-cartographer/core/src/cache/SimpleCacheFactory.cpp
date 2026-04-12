@@ -1,13 +1,13 @@
 #include "vc/core/cache/SimpleCacheFactory.hpp"
 
 #include "vc/core/cache/ChunkSource.hpp"
-#include "vc/core/cache/TieredChunkCache.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/cache/VcDecompressor.hpp"
 #include "vc/core/types/VcDataset.hpp"
 
 namespace vc::cache {
 
-std::unique_ptr<TieredChunkCache> createSimpleTieredCache(
+std::unique_ptr<BlockPipeline> createSimpleTieredCache(
     VcDataset* ds, size_t maxBytes, const std::filesystem::path& datasetPath)
 {
     // Build single-level metadata from the dataset
@@ -32,10 +32,10 @@ std::unique_ptr<TieredChunkCache> createSimpleTieredCache(
 
     auto decompress = makeVcDecompressor(ds);
 
-    TieredChunkCache::Config config;
+    BlockPipeline::Config config;
     config.hotMaxBytes = maxBytes;
 
-    return std::make_unique<TieredChunkCache>(
+    return std::make_unique<BlockPipeline>(
         std::move(config),
         std::move(source),
         std::move(decompress));  // no disk cache

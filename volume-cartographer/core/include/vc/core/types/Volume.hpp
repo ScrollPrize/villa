@@ -19,7 +19,7 @@
 // Forward declarations
 namespace vc { class VcDataset; }
 
-namespace vc::cache { class TieredChunkCache; }
+namespace vc::cache { class BlockPipeline; }
 namespace utils { class ZarrArray; }
 
 struct CompositeParams;
@@ -73,16 +73,16 @@ public:
     [[nodiscard]] vc::VcDataset *zarrDataset(int level = 0) const;
     [[nodiscard]] size_t numScales() const noexcept;
 
-    // Create a TieredChunkCache backed by this volume's zarr data.
+    // Create a BlockPipeline backed by this volume's zarr data.
     // diskZarr: optional local zarr v3 sharded array for cold tier.
-    [[nodiscard]] std::unique_ptr<vc::cache::TieredChunkCache> createTieredCache(
+    [[nodiscard]] std::unique_ptr<vc::cache::BlockPipeline> createTieredCache(
         std::shared_ptr<utils::ZarrArray> diskZarr = nullptr) const;
 
     // --- Cache management ---
 
     // Lazily create and return the tiered chunk cache for this volume.
     // Thread-safe: creates on first call, returns same cache thereafter.
-    [[nodiscard]] vc::cache::TieredChunkCache* tieredCache();
+    [[nodiscard]] vc::cache::BlockPipeline* tieredCache();
 
     // Set cache budget (must be called before first tieredCache() access).
     void setCacheBudget(size_t hotBytes);
@@ -191,7 +191,7 @@ protected:
     void zarrOpen();
 
     // Cache ownership
-    mutable std::unique_ptr<vc::cache::TieredChunkCache> tieredCache_;
+    mutable std::unique_ptr<vc::cache::BlockPipeline> tieredCache_;
     mutable std::once_flag cacheOnce_;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
     size_t diskCacheMaxBytes_ = 100ULL << 30; // 100 GB default

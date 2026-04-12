@@ -536,7 +536,7 @@ static std::vector<vc::cache::ChunkKey> collectPrefetchKeysForRows(
 }
 
 static bool prefetchChunkKeys(
-    vc::cache::TieredChunkCache* cache,
+    vc::cache::BlockPipeline* cache,
     const std::vector<vc::cache::ChunkKey>& keys)
 {
     if (!cache || keys.empty()) return true;
@@ -625,7 +625,7 @@ static std::vector<cv::Mat> processRawSlices(std::vector<cv::Mat_<T>>& raw, int 
 template <typename T, typename WriteFn>
 static void renderBands(
     QuadSurface* surf, vc::VcDataset* ds,
-    vc::cache::TieredChunkCache* cache, int level,
+    vc::cache::BlockPipeline* cache, int level,
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
     float renderScale, float scaleSeg, float dsScale,
     bool hasAffine, const AffineTransform& aff,
@@ -741,7 +741,7 @@ static void writeTifBand(std::vector<TiffWriter>& writers,
 template <typename T>
 static void renderTiles(
     QuadSurface* surf, vc::VcDataset* ds,
-    vc::cache::TieredChunkCache* cache, int level,
+    vc::cache::BlockPipeline* cache, int level,
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
     float renderScale, float scaleSeg, float dsScale,
     bool hasAffine, const AffineTransform& aff,
@@ -1297,8 +1297,8 @@ int main(int argc, char *argv[])
     const int cacheLevel = useRemoteCache ? group_idx : 0;
 
     const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
-    std::unique_ptr<vc::cache::TieredChunkCache> ownedChunkCache;
-    vc::cache::TieredChunkCache* chunk_cache = nullptr;
+    std::unique_ptr<vc::cache::BlockPipeline> ownedChunkCache;
+    vc::cache::BlockPipeline* chunk_cache = nullptr;
 
     if (useRemoteCache) {
         const std::string expectedId = vc::cache::deriveRemoteVolumeId(remoteUrl);

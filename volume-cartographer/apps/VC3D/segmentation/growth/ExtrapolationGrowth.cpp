@@ -1,7 +1,7 @@
 #include "ExtrapolationGrowth.hpp"
 
 #include "utils/Json.hpp"
-#include <vc/core/cache/TieredChunkCache.hpp>
+#include <vc/core/cache/BlockPipeline.hpp>
 #include <algorithm>
 #include <cmath>
 #include <vector>

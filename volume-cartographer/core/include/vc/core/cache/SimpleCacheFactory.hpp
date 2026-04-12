@@ -10,14 +10,14 @@ class VcDataset;
 
 namespace vc::cache {
 
-class TieredChunkCache;
+class BlockPipeline;
 
-// Factory for creating a single-dataset TieredChunkCache (for CLI tools,
+// Factory for creating a single-dataset BlockPipeline (for CLI tools,
 // tracer, ChunkedTensor, etc. that only need one zarr level).
 //
 // Creates a 1-level cache backed by FileSystemChunkSource + VcDecompressor
 // with hot = maxBytes, warm = 0 (no warm tier).
-std::unique_ptr<TieredChunkCache> createSimpleTieredCache(
+std::unique_ptr<BlockPipeline> createSimpleTieredCache(
     VcDataset* ds, size_t maxBytes, const std::filesystem::path& datasetPath);
 
 }  // namespace vc::cache

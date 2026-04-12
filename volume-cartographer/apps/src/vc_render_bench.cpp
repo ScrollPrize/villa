@@ -32,7 +32,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/types/SampleParams.hpp"
-#include "vc/core/cache/TieredChunkCache.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 
 using Clock = std::chrono::high_resolution_clock;
@@ -120,7 +120,7 @@ static void printResult(const BenchResult& r, int tileW, int tileH) {
            voxelsPerSec / 1e6, mbPerSec);
 }
 
-static void printCacheStats(vc::cache::TieredChunkCache* cache) {
+static void printCacheStats(vc::cache::BlockPipeline* cache) {
     auto s = cache->stats();
     uint64_t total = s.hotHits + s.coldHits + s.iceFetches + s.misses;
     if (total == 0) total = 1;

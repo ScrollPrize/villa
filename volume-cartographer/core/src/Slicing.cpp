@@ -96,7 +96,7 @@ struct CacheParams {
     int dbMinCx = 0, dbMaxCx = INT_MAX;
     bool dbValid = false;
 
-    explicit CacheParams(vc::cache::TieredChunkCache* cache, int level) {
+    explicit CacheParams(vc::cache::BlockPipeline* cache, int level) {
         auto cs = cache->chunkShape(level);
         cz = cs[0]; cy = cs[1]; cx = cs[2];
         auto shape = cache->levelShape(level);
@@ -188,7 +188,7 @@ struct ChunkSampler {
     };
 
     const CacheParams& p;
-    vc::cache::TieredChunkCache& cache;
+    vc::cache::BlockPipeline& cache;
     int level;
     Slot slots[kSlots];
     uint64_t lastKey = UINT64_MAX;  // MRU key for fast repeat check
@@ -202,7 +202,7 @@ struct ChunkSampler {
         return (uint64_t(unsigned(iz)) << 40) | (uint64_t(unsigned(iy)) << 20) | uint64_t(unsigned(ix));
     }
 
-    ChunkSampler(const CacheParams& p_, vc::cache::TieredChunkCache& cache_, int level_)
+    ChunkSampler(const CacheParams& p_, vc::cache::BlockPipeline& cache_, int level_)
         : p(p_), cache(cache_), level(level_)
     {
         s0 = static_cast<size_t>(p.cy) * static_cast<size_t>(p.cx);
@@ -580,7 +580,7 @@ enum class SampleMode : std::uint8_t { Nearest, Trilinear, Tricubic };
 template<typename T, SampleMode Mode, typename NormalFn>
 static void readVolumeImpl(
     cv::Mat_<T>& out,
-    vc::cache::TieredChunkCache& cache,
+    vc::cache::BlockPipeline& cache,
     int level,
     const CacheParams& p,
     const cv::Mat_<cv::Vec3f>& coords,
@@ -1224,7 +1224,7 @@ static void readVolumeImpl(
 // ============================================================================
 
 template<typename T>
-static void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level) {
+static void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset, vc::cache::BlockPipeline* cache, int level) {
 
     CacheParams p(cache, level);
 
@@ -1288,11 +1288,11 @@ static void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset, vc::cache::
     }
 }
 
-void readArea3D(Array3D<uint8_t>& out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level) {
+void readArea3D(Array3D<uint8_t>& out, const cv::Vec3i& offset, vc::cache::BlockPipeline* cache, int level) {
     readArea3DImpl(out, offset, cache, level);
 }
 
-void readArea3D(Array3D<uint16_t>& out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level) {
+void readArea3D(Array3D<uint16_t>& out, const cv::Vec3i& offset, vc::cache::BlockPipeline* cache, int level) {
     readArea3DImpl(out, offset, cache, level);
 }
 
@@ -1304,7 +1304,7 @@ void readArea3D(Array3D<uint16_t>& out, const cv::Vec3i& offset, vc::cache::Tier
 template<typename T, SampleMode Mode>
 static void samplePlaneImpl(
     cv::Mat_<T>& out,
-    vc::cache::TieredChunkCache& cache,
+    vc::cache::BlockPipeline& cache,
     int level,
     const CacheParams& p,
     const cv::Vec3f& origin,
@@ -1638,7 +1638,7 @@ static void samplePlaneImpl(
     }
 }
 
-void samplePlane(cv::Mat_<uint8_t>& out, vc::cache::TieredChunkCache* cache, int level,
+void samplePlane(cv::Mat_<uint8_t>& out, vc::cache::BlockPipeline* cache, int level,
                  const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
                  int width, int height, vc::Sampling method) {
     CacheParams p(cache, level);
@@ -1669,7 +1669,7 @@ void samplePlane(cv::Mat_<uint8_t>& out, vc::cache::TieredChunkCache* cache, int
 template<SampleMode Mode>
 static void samplePlaneARGB32Impl(
     uint32_t* __restrict__ outBuf, int outStride,
-    vc::cache::TieredChunkCache& cache,
+    vc::cache::BlockPipeline& cache,
     int level,
     const CacheParams& p,
     const cv::Vec3f& origin,
@@ -2034,11 +2034,11 @@ static void samplePlaneARGB32Impl(
 // ============================================================================
 // samplePlaneAdaptiveARGB32 — per-pixel nearest-neighbor with adaptive level
 // fallback.  Uses a direct-mapped chunk slot cache per level to avoid
-// per-pixel shared_ptr / mutex overhead from TieredChunkCache::get().
+// per-pixel shared_ptr / mutex overhead from BlockPipeline::get().
 // ============================================================================
 
 // Per-level non-blocking chunk cache.  Holds raw pointers to chunk data in a
-// direct-mapped slot array.  Only touches TieredChunkCache on slot miss.
+// direct-mapped slot array.  Only touches BlockPipeline on slot miss.
 struct AdaptiveSlotCache {
     static constexpr int kSlots = 32;
     static constexpr int kMask  = kSlots - 1;
@@ -2064,7 +2064,7 @@ struct AdaptiveSlotCache {
     // and will be filled in on next frame after async prefetch completes.
     VC_FORCE_INLINE const uint8_t* lookup(
         int ci, int cj, int ck, int level,
-        vc::cache::TieredChunkCache& cache)
+        vc::cache::BlockPipeline& cache)
     {
         uint64_t key = pack(ci, cj, ck);
         if (key == lastKey) return lastData;
@@ -2102,7 +2102,7 @@ struct AdaptiveLevelInfo {
     CacheParams p;
     AdaptiveSlotCache slotCache;
     float scale;
-    AdaptiveLevelInfo(vc::cache::TieredChunkCache* c, int lvl)
+    AdaptiveLevelInfo(vc::cache::BlockPipeline* c, int lvl)
         : p(c, lvl), scale(1.0f / static_cast<float>(1 << lvl)) {}
 };
 
@@ -2112,14 +2112,14 @@ VC_FORCE_INLINE const uint8_t* adaptiveLookup(
 {
     const auto& p = li.p;
     return li.slotCache.lookup(p.chunkX(ix), p.chunkY(iy), p.chunkZ(iz),
-                                0 /* unused level param */, *static_cast<vc::cache::TieredChunkCache*>(nullptr));
+                                0 /* unused level param */, *static_cast<vc::cache::BlockPipeline*>(nullptr));
 }
 
 // Fetch a single voxel value at integer coords from the adaptive cache.
 // Returns -1 if the chunk isn't available.
 VC_FORCE_INLINE int fetchVoxel(
     AdaptiveLevelInfo& li, int ix, int iy, int iz,
-    vc::cache::TieredChunkCache& cache, int level)
+    vc::cache::BlockPipeline& cache, int level)
 {
     const auto& p = li.p;
     if (ix < 0 || iy < 0 || iz < 0 || ix >= p.sx || iy >= p.sy || iz >= p.sz)
@@ -2146,7 +2146,7 @@ VC_FORCE_INLINE uint32_t samplePixelAdaptive(
     float wx, float wy, float wz,
     std::vector<AdaptiveLevelInfo>& levels,
     int desiredLevel, int maxLvl,
-    vc::cache::TieredChunkCache& cache,
+    vc::cache::BlockPipeline& cache,
     const uint32_t lut[256], uint32_t bg)
 {
     for (int l = desiredLevel; l < maxLvl; l++) {
@@ -2405,7 +2405,7 @@ VC_FORCE_INLINE uint32_t samplePixelAdaptive(
 template<vc::Sampling Method>
 static int samplePlaneAdaptiveImpl(
     uint32_t* outBuf, int outStride,
-    vc::cache::TieredChunkCache* cache,
+    vc::cache::BlockPipeline* cache,
     int desiredLevel, int numLevels,
     const cv::Vec3f& origin,
     const cv::Vec3f& vx_step,
@@ -2450,7 +2450,7 @@ static int samplePlaneAdaptiveImpl(
 
 int samplePlaneAdaptiveARGB32(
     uint32_t* outBuf, int outStride,
-    vc::cache::TieredChunkCache* cache,
+    vc::cache::BlockPipeline* cache,
     int desiredLevel, int numLevels,
     const cv::Vec3f& origin,
     const cv::Vec3f& vx_step,
@@ -2485,7 +2485,7 @@ int samplePlaneAdaptiveARGB32(
 template<vc::Sampling Method>
 static void sampleCoordsAdaptiveImpl(
     uint32_t* outBuf, int outStride,
-    vc::cache::TieredChunkCache* cache,
+    vc::cache::BlockPipeline* cache,
     int desiredLevel, int numLevels,
     const cv::Mat_<cv::Vec3f>& coords,
     const uint32_t lut[256])
@@ -2524,7 +2524,7 @@ static void sampleCoordsAdaptiveImpl(
 
 void sampleCoordsAdaptiveARGB32(
     uint32_t* outBuf, int outStride,
-    vc::cache::TieredChunkCache* cache,
+    vc::cache::BlockPipeline* cache,
     int desiredLevel, int numLevels,
     const cv::Mat_<cv::Vec3f>& coords,
     const uint32_t lut[256],
@@ -2557,7 +2557,7 @@ void sampleCoordsAdaptiveARGB32(
 
 void samplePlaneCompositeARGB32(
     uint32_t* __restrict__ outBuf, int outStride,
-    vc::cache::TieredChunkCache* cache, int level,
+    vc::cache::BlockPipeline* cache, int level,
     const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
     const cv::Vec3f& normal, float zStep, int zStart, int numLayers,
     int width, int height,
@@ -2711,7 +2711,7 @@ void samplePlaneCompositeARGB32(
 // ============================================================================
 
 template<typename T>
-static void readInterpolated3DImpl(cv::Mat_<T>& out, vc::cache::TieredChunkCache* cache, int level,
+static void readInterpolated3DImpl(cv::Mat_<T>& out, vc::cache::BlockPipeline* cache, int level,
                                    const cv::Mat_<cv::Vec3f>& coords,
                                    vc::Sampling method) {
     CacheParams p(cache, level);
@@ -2734,25 +2734,25 @@ static void readInterpolated3DImpl(cv::Mat_<T>& out, vc::cache::TieredChunkCache
 }
 
 // Legacy bool overloads (backward compatible)
-void readInterpolated3D(cv::Mat_<uint8_t>& out, vc::cache::TieredChunkCache* cache, int level,
+void readInterpolated3D(cv::Mat_<uint8_t>& out, vc::cache::BlockPipeline* cache, int level,
                         const cv::Mat_<cv::Vec3f>& coords, bool nearest_neighbor) {
     readInterpolated3DImpl(out, cache, level, coords,
                            nearest_neighbor ? vc::Sampling::Nearest : vc::Sampling::Trilinear);
 }
 
-void readInterpolated3D(cv::Mat_<uint16_t>& out, vc::cache::TieredChunkCache* cache, int level,
+void readInterpolated3D(cv::Mat_<uint16_t>& out, vc::cache::BlockPipeline* cache, int level,
                         const cv::Mat_<cv::Vec3f>& coords, bool nearest_neighbor) {
     readInterpolated3DImpl(out, cache, level, coords,
                            nearest_neighbor ? vc::Sampling::Nearest : vc::Sampling::Trilinear);
 }
 
 // New overloads accepting vc::Sampling enum
-void readInterpolated3D(cv::Mat_<uint8_t>& out, vc::cache::TieredChunkCache* cache, int level,
+void readInterpolated3D(cv::Mat_<uint8_t>& out, vc::cache::BlockPipeline* cache, int level,
                         const cv::Mat_<cv::Vec3f>& coords, vc::Sampling method) {
     readInterpolated3DImpl(out, cache, level, coords, method);
 }
 
-void readInterpolated3D(cv::Mat_<uint16_t>& out, vc::cache::TieredChunkCache* cache, int level,
+void readInterpolated3D(cv::Mat_<uint16_t>& out, vc::cache::BlockPipeline* cache, int level,
                         const cv::Mat_<cv::Vec3f>& coords, vc::Sampling method) {
     readInterpolated3DImpl(out, cache, level, coords, method);
 }
@@ -2760,7 +2760,7 @@ void readInterpolated3D(cv::Mat_<uint16_t>& out, vc::cache::TieredChunkCache* ca
 
 void readCompositeFast(
     cv::Mat_<uint8_t>& out,
-    vc::cache::TieredChunkCache* cache,
+    vc::cache::BlockPipeline* cache,
     int level,
     const cv::Mat_<cv::Vec3f>& baseCoords,
     const cv::Mat_<cv::Vec3f>& normals,
@@ -2808,7 +2808,7 @@ void readCompositeFast(
 template<typename T>
 static void readMultiSliceImpl(
     std::vector<cv::Mat_<T>>& out,
-    vc::cache::TieredChunkCache& cache,
+    vc::cache::BlockPipeline& cache,
     int level,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
@@ -3009,7 +3009,7 @@ static void readMultiSliceImpl(
 
 void readMultiSlice(
     std::vector<cv::Mat_<uint8_t>>& out,
-    vc::cache::TieredChunkCache* cache,
+    vc::cache::BlockPipeline* cache,
     int level,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
@@ -3020,7 +3020,7 @@ void readMultiSlice(
 
 void readMultiSlice(
     std::vector<cv::Mat_<uint16_t>>& out,
-    vc::cache::TieredChunkCache* cache,
+    vc::cache::BlockPipeline* cache,
     int level,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
@@ -3039,7 +3039,7 @@ void readMultiSlice(
 template<typename T>
 static void sampleTileSlicesImpl(
     std::vector<cv::Mat_<T>>& out,
-    vc::cache::TieredChunkCache& cache,
+    vc::cache::BlockPipeline& cache,
     int level,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
@@ -3221,7 +3221,7 @@ static void sampleTileSlicesImpl(
 
 void sampleTileSlices(
     std::vector<cv::Mat_<uint8_t>>& out,
-    vc::cache::TieredChunkCache* cache,
+    vc::cache::BlockPipeline* cache,
     int level,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
@@ -3232,7 +3232,7 @@ void sampleTileSlices(
 
 void sampleTileSlices(
     std::vector<cv::Mat_<uint16_t>>& out,
-    vc::cache::TieredChunkCache* cache,
+    vc::cache::BlockPipeline* cache,
     int level,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,

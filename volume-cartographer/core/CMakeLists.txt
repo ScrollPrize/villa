@@ -26,7 +26,7 @@ add_library(vc_core
         src/cache/HttpMetadataFetcher.cpp
         src/cache/BlockCache.cpp
         src/cache/IOPool.cpp
-        src/cache/TieredChunkCache.cpp
+        src/cache/BlockPipeline.cpp
         src/cache/VcDecompressor.cpp
         src/cache/SimpleCacheFactory.cpp
         src/LoadJson.cpp

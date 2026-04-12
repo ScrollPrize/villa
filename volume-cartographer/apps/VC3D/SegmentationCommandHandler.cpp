@@ -61,7 +61,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/flattening/ABFFlattening.hpp"
-#include "vc/core/cache/TieredChunkCache.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/cache/ChunkKey.hpp"
 #include "vc/core/types/VcDataset.hpp"
 #include "ToolDialogs.hpp"
@@ -1364,7 +1364,7 @@ static std::vector<vc::cache::ChunkKey> collectRemoteChunkKeysForSurface(
 }
 
 static RemoteChunkFetchResult fetchRemoteChunkKeys(
-    vc::cache::TieredChunkCache* cache,
+    vc::cache::BlockPipeline* cache,
     const std::vector<vc::cache::ChunkKey>& keys,
     const std::shared_ptr<RemoteChunkFetchProgress>& progress)
 {

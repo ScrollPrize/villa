@@ -7,7 +7,7 @@
 #include <memory>
 #include <unordered_map>
 
-namespace vc::cache { class TieredChunkCache; }
+namespace vc::cache { class BlockPipeline; }
 
 class QuadSurface;
 
@@ -42,7 +42,7 @@ struct NewtonRefinementParams {
 
 // Context for SDT-guided refinement
 struct SDTContext {
-    vc::cache::TieredChunkCache* cache = nullptr;
+    vc::cache::BlockPipeline* cache = nullptr;
     int level = 0;
     NewtonRefinementParams params;
 
@@ -75,7 +75,7 @@ struct SkeletonPathParams {
 
 // Context for skeleton path extrapolation
 struct SkeletonPathContext {
-    vc::cache::TieredChunkCache* cache = nullptr;
+    vc::cache::BlockPipeline* cache = nullptr;
     int level = 0;
     SkeletonPathParams params;
 

@@ -89,8 +89,8 @@ private:
 
     passTroughComputor _passthrough_rms;
     passTroughComputor _passthrough_frac;
-    std::unique_ptr<vc::cache::TieredChunkCache> _cacheRms;
-    std::unique_ptr<vc::cache::TieredChunkCache> _cacheFrac;
+    std::unique_ptr<vc::cache::BlockPipeline> _cacheRms;
+    std::unique_ptr<vc::cache::BlockPipeline> _cacheFrac;
     Chunked3d<uint8_t, passTroughComputor> _rms;
     Chunked3d<uint8_t, passTroughComputor> _frac;
     float _scale;

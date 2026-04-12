@@ -34,7 +34,7 @@ shape idCoord(const std::unique_ptr<vc::VcDataset> &ds, shape id)
     return coord;
 }
 
-void timed_plane_slice(Surface &plane, vc::cache::TieredChunkCache *cache, int size, std::string msg, vc::Sampling method)
+void timed_plane_slice(Surface &plane, vc::cache::BlockPipeline *cache, int size, std::string msg, vc::Sampling method)
 {
     cv::Mat_<cv::Vec3f> coords;
     cv::Mat_<cv::Vec3f> normals;
