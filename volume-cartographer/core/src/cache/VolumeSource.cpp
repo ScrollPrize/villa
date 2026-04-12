@@ -197,9 +197,27 @@ int HttpSource::totalChunksPerShard() const noexcept
 std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
 {
     auto resp = client_->get(url);
-    if (!resp.ok()) return {};
+    if (!resp.ok()) {
+        // 404 is an expected "chunk doesn't exist" response — stay quiet.
+        // Anything else (403/401/5xx) almost always means auth or network
+        // trouble; log loudly so it doesn't look like an empty volume.
+        if (resp.status_code != 404) {
+            static std::atomic<int> errCount{0};
+            int n = errCount.fetch_add(1);
+            if (n < 5) {
+                std::fprintf(stderr, "[HTTP] GET %s -> status=%ld (%s)\n",
+                             url.c_str(),
+                             long(resp.status_code),
+                             resp.body.empty()
+                                 ? "(no body)"
+                                 : std::string(
+                                     reinterpret_cast<const char*>(resp.body.data()),
+                                     std::min(resp.body.size(), size_t(200))).c_str());
+            }
+        }
+        return {};
+    }
 
-    // Convert from vector<byte> to vector<uint8_t>
     std::vector<uint8_t> result(resp.body.size());
     if (!result.empty())
         std::memcpy(result.data(), resp.body.data(), result.size());
