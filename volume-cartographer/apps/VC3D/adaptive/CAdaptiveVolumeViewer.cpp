@@ -741,7 +741,7 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
             auto pct = [&](uint64_t n) { return static_cast<int>(100 * n / total); };
             status += QString(" | blk %1% cold %2%").arg(pct(s.blockHits)).arg(pct(s.coldHits));
         }
-        status += QString(" | blk %1r/%2e").arg(s.blocksResident).arg(s.blocksEvictable);
+        status += QString(" | blk %1").arg(s.blocks);
 
         double diskGB = static_cast<double>(s.diskBytes) / (1024.0 * 1024.0 * 1024.0);
         const char* unit = s.sharded ? "shard" : "chunk";

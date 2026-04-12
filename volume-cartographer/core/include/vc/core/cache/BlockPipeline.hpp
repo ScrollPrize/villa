@@ -31,7 +31,7 @@ namespace vc::cache {
 class BlockPipeline {
 public:
     struct Config {
-        size_t blockCacheBytes = 10ULL << 30;  // 10 GiB
+        size_t bytes = 10ULL << 30;  // 10 GiB
         std::string volumeId;
         int ioThreads = 8;
     };
@@ -60,10 +60,6 @@ public:
     // Chunk keys are still the IO unit — after decode, each chunk is split
     // into 16^3 blocks and inserted into the block cache.
     void fetchInteractive(const std::vector<ChunkKey>& keys);
-
-    // Populate the always-resident region with every block from `level`.
-    // Blocking: fetches missing chunks through the normal chain.
-    void loadResidentLevel(int level);
 
     // --- Cache management ---
     void clearMemory();
@@ -107,8 +103,7 @@ public:
         uint64_t coldHits = 0;
         uint64_t iceFetches = 0;
         uint64_t misses = 0;
-        size_t blocksResident = 0;
-        size_t blocksEvictable = 0;
+        size_t blocks = 0;
         size_t ioPending = 0;
         uint64_t diskWrites = 0;
         size_t negativeCount = 0;
@@ -128,7 +123,6 @@ private:
     IOPool ioPool_;
 
     BlockCache blockCache_;
-    int residentLevel_ = -1;
 
     // Blocking chunk fetch (canonical disk → source, with rechunking if the
     // source granularity differs). Returns a decoded ChunkData.
@@ -140,7 +134,7 @@ private:
     [[nodiscard]] ChunkDataPtr assembleCanonicalChunk(const ChunkKey& canonKey);
 
     // Split a decoded chunk into 16^3 blocks and insert into blockCache_.
-    void insertChunkAsBlocks(const ChunkKey& key, const ChunkData& chunk, bool resident);
+    void insertChunkAsBlocks(const ChunkKey& key, const ChunkData& chunk);
 
     // Negative cache (same design as before).
     static constexpr size_t kBloomBits = 65536;

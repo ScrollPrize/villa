@@ -97,22 +97,30 @@ void IOPool::updateInteractive(const std::vector<ChunkKey>& keys)
         std::lock_guard lock(mutex_);
         if (shutdown_) return;
 
-        // New-viewport semantics: the most-recent fetchInteractive call
-        // reflects what the user is looking at *right now*. Drop the
-        // currently-queued backlog entirely (in-flight work keeps running)
-        // and prepend the new keys in order so they're processed first.
+        // Priority model: the most-recent call reflects what the user is
+        // looking at *right now*. Its keys go to the front of the queue in
+        // order. Previously-queued keys not in the new request stay at the
+        // back as backlog (e.g., coarsest-level resident preload) so they
+        // still complete after viewport demand is satisfied. In-flight work
+        // keeps running regardless.
+        std::unordered_set<ShardKey, ShardKeyHash> newWanted;
+        newWanted.reserve(keys.size());
+        for (const auto& key : keys)
+            newWanted.insert(shardMapper_(key));
+
+        std::deque<ShardKey> backlog;
         for (const auto& sk : queue_) {
             auto it = shards_.find(sk);
-            if (it != shards_.end() && it->second == ShardState::Queued)
-                shards_.erase(it);
+            if (it == shards_.end() || it->second != ShardState::Queued) continue;
+            if (!newWanted.count(sk)) backlog.push_back(sk);
         }
-        queue_.clear();
 
+        std::deque<ShardKey> front;
         std::unordered_set<ShardKey, ShardKeyHash> seen;
         seen.reserve(keys.size());
         for (const auto& key : keys) {
             ShardKey sk = shardMapper_(key);
-            if (!seen.insert(sk).second) continue;  // dedupe
+            if (!seen.insert(sk).second) continue;
 
             auto it = shards_.find(sk);
             if (it != shards_.end()) {
@@ -121,8 +129,12 @@ void IOPool::updateInteractive(const std::vector<ChunkKey>& keys)
             } else {
                 shards_[sk] = ShardState::Queued;
             }
-            queue_.push_back(sk);
+            front.push_back(sk);
         }
+
+        queue_.clear();
+        queue_.insert(queue_.end(), front.begin(), front.end());
+        queue_.insert(queue_.end(), backlog.begin(), backlog.end());
     }
     cv_.notify_all();
 }

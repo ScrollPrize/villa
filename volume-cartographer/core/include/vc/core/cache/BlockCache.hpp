@@ -41,19 +41,14 @@ struct alignas(64) Block {
 
 using BlockPtr = std::shared_ptr<Block>;
 
-// Block-granularity cache for voxel data.
-//
-// Two regions:
-//   - Resident: always-in-memory blocks (e.g. coarsest level). Never evicted.
-//   - Evictable: bounded-capacity clock-sweep NRU arena.
-//
-// get() / put() yield std::shared_ptr<Block>. A block dropped from the
-// eviction arena while a sampler still holds a shared_ptr stays alive in
-// memory until the last reference is released.
+// Single-tier block cache. Clock-sweep NRU eviction over a fixed arena.
+// get() / put() yield std::shared_ptr<Block>; a block dropped from the
+// arena while a sampler still holds a pointer stays alive in memory until
+// the last reference is released.
 class BlockCache {
 public:
     struct Config {
-        size_t evictableBytes = 10ULL << 30;   // 10 GiB default
+        size_t bytes = 10ULL << 30;   // 10 GiB default
     };
 
     explicit BlockCache(Config cfg);
@@ -62,23 +57,16 @@ public:
     BlockCache(const BlockCache&) = delete;
     BlockCache& operator=(const BlockCache&) = delete;
 
-    // Lookup. Returns null if not cached. On evictable-region hit, marks the
-    // block as recently used.
+    // Lookup. Returns null if not cached. On hit, marks the block recently used.
     [[nodiscard]] BlockPtr get(const BlockKey& key) noexcept;
 
-    // Insert into the evictable region, copying kBlockBytes from `src`.
-    // Evicts NRU entries if the arena is full; evicted blocks remain alive
-    // while outstanding shared_ptrs reference them.
+    // Insert, copying kBlockBytes from `src`. Evicts NRU entries if full.
     void put(const BlockKey& key, const uint8_t* src);
 
-    // Insert into the resident region (grows on demand, never evicted).
-    void putResident(const BlockKey& key, const uint8_t* src);
-
     [[nodiscard]] size_t capacity() const noexcept { return nSlots_; }
-    [[nodiscard]] size_t residentSize() const noexcept;
-    [[nodiscard]] size_t evictableSize() const noexcept;
+    [[nodiscard]] size_t size() const noexcept;
 
-    void clearEvictable();
+    void clear();
 
 private:
     [[nodiscard]] size_t reclaimSlotLocked();
@@ -87,10 +75,8 @@ private:
     size_t nSlots_ = 0;
 
     mutable std::mutex mutex_;
-    std::unordered_map<BlockKey, BlockPtr, BlockKeyHash> evictableMap_;
-    std::unordered_map<BlockKey, BlockPtr, BlockKeyHash> residentMap_;
+    std::unordered_map<BlockKey, BlockPtr, BlockKeyHash> map_;
 
-    // Parallel arrays sized to nSlots_. slot i is occupied iff occupied_[i].
     std::vector<BlockPtr> slotBlock_;
     std::vector<BlockKey> slotKey_;
     std::vector<uint8_t> occupied_;

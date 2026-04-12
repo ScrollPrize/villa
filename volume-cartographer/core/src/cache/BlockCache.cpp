@@ -11,11 +11,11 @@ constexpr BlockKey kEmptyKey{-1, -1, -1, -1};
 BlockCache::BlockCache(Config cfg)
     : config_(cfg)
 {
-    nSlots_ = config_.evictableBytes / kBlockBytes;
+    nSlots_ = config_.bytes / kBlockBytes;
     slotBlock_.assign(nSlots_, nullptr);
     slotKey_.assign(nSlots_, kEmptyKey);
     occupied_.assign(nSlots_, 0);
-    evictableMap_.reserve(nSlots_);
+    map_.reserve(nSlots_);
 }
 
 BlockCache::~BlockCache() = default;
@@ -23,10 +23,7 @@ BlockCache::~BlockCache() = default;
 BlockPtr BlockCache::get(const BlockKey& key) noexcept
 {
     std::lock_guard lock(mutex_);
-    if (auto it = residentMap_.find(key); it != residentMap_.end()) {
-        return it->second;
-    }
-    if (auto it = evictableMap_.find(key); it != evictableMap_.end()) {
+    if (auto it = map_.find(key); it != map_.end()) {
         it->second->used.store(1, std::memory_order_relaxed);
         return it->second;
     }
@@ -37,12 +34,7 @@ void BlockCache::put(const BlockKey& key, const uint8_t* src)
 {
     std::lock_guard lock(mutex_);
 
-    if (auto it = residentMap_.find(key); it != residentMap_.end()) {
-        std::memcpy(it->second->data, src, kBlockBytes);
-        return;
-    }
-
-    if (auto it = evictableMap_.find(key); it != evictableMap_.end()) {
+    if (auto it = map_.find(key); it != map_.end()) {
         std::memcpy(it->second->data, src, kBlockBytes);
         it->second->used.store(1, std::memory_order_relaxed);
         return;
@@ -64,20 +56,7 @@ void BlockCache::put(const BlockKey& key, const uint8_t* src)
     block->used.store(1, std::memory_order_relaxed);
     slotBlock_[slot] = block;
     slotKey_[slot] = key;
-    evictableMap_[key] = std::move(block);
-}
-
-void BlockCache::putResident(const BlockKey& key, const uint8_t* src)
-{
-    std::lock_guard lock(mutex_);
-    if (auto it = residentMap_.find(key); it != residentMap_.end()) {
-        std::memcpy(it->second->data, src, kBlockBytes);
-        return;
-    }
-    auto block = std::make_shared<Block>();
-    std::memcpy(block->data, src, kBlockBytes);
-    block->used.store(1, std::memory_order_relaxed);
-    residentMap_[key] = std::move(block);
+    map_[key] = std::move(block);
 }
 
 size_t BlockCache::reclaimSlotLocked()
@@ -88,8 +67,8 @@ size_t BlockCache::reclaimSlotLocked()
         if (!occupied_[i]) continue;
         auto& block = slotBlock_[i];
         if (block->used.load(std::memory_order_relaxed) == 0) {
-            evictableMap_.erase(slotKey_[i]);
-            slotBlock_[i].reset();     // drops our ref; external refs keep alive
+            map_.erase(slotKey_[i]);
+            slotBlock_[i].reset();
             slotKey_[i] = kEmptyKey;
             return i;
         }
@@ -97,22 +76,16 @@ size_t BlockCache::reclaimSlotLocked()
     }
 }
 
-size_t BlockCache::residentSize() const noexcept
-{
-    std::lock_guard lock(mutex_);
-    return residentMap_.size();
-}
-
-size_t BlockCache::evictableSize() const noexcept
+size_t BlockCache::size() const noexcept
 {
     std::lock_guard lock(mutex_);
     return occupiedCount_;
 }
 
-void BlockCache::clearEvictable()
+void BlockCache::clear()
 {
     std::lock_guard lock(mutex_);
-    evictableMap_.clear();
+    map_.clear();
     for (auto& p : slotBlock_) p.reset();
     std::fill(slotKey_.begin(), slotKey_.end(), kEmptyKey);
     std::fill(occupied_.begin(), occupied_.end(), 0);

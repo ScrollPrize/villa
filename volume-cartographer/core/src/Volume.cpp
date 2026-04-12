@@ -370,7 +370,7 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache(
 
     vc::cache::BlockPipeline::Config config;
     config.volumeId = id();
-    config.blockCacheBytes = cacheBudgetHot_;
+    config.bytes = cacheBudgetHot_;
     if (isRemote_ || mountInfo_.type == vc::FilesystemType::NetworkMount) {
         if (ioThreads_ > 0) {
             config.ioThreads = ioThreads_;
@@ -398,20 +398,6 @@ void Volume::ensureTieredCache() const
     std::call_once(cacheOnce_, [this]() {
         auto* self = const_cast<Volume*>(this);
         tieredCache_ = self->createTieredCache(self->pendingDiskZarr_);
-        if (tieredCache_) {
-            int nScales = tieredCache_->numLevels();
-            if (nScales > 0) {
-                // Run the (potentially 100+ chunk) coarsest-level preload in
-                // a detached background thread so the UI doesn't block during
-                // a fresh-cache fetch. Rendering falls back through missing
-                // blocks until they arrive.
-                auto* cache = tieredCache_.get();
-                int lvl = nScales - 1;
-                std::thread([cache, lvl]() {
-                    cache->loadResidentLevel(lvl);
-                }).detach();
-            }
-        }
     });
 }
 

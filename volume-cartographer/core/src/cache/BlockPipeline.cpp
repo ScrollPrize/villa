@@ -102,7 +102,7 @@ BlockPipeline::BlockPipeline(
     , source_(std::move(source))
     , decompress_(std::move(decompress))
     , ioPool_(config_.ioThreads)
-    , blockCache_(BlockCache::Config{config_.blockCacheBytes})
+    , blockCache_(BlockCache::Config{config_.bytes})
 {
     // Per-chunk IOPool granularity. Shard mapper is identity; each canonical
     // chunk is its own work unit. When the HTTP source is itself sharded,
@@ -181,7 +181,7 @@ BlockPipeline::BlockPipeline(
         }
 
         if (decoded) {
-            insertChunkAsBlocks(key, *decoded, key.level == residentLevel_);
+            insertChunkAsBlocks(key, *decoded);
             if (!chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
                 std::lock_guard cbLock(callbackMutex_);
                 for (const auto& [id, cb] : chunkReadyListeners_)
@@ -388,13 +388,12 @@ BlockPtr BlockPipeline::getBlockingBlock(const BlockKey& key) {
     ChunkKey ck{key.level, key.bz / bpcZ, key.by / bpcY, key.bx / bpcX};
     auto data = fetchChunkBlocking(ck);
     if (!data) return nullptr;
-    insertChunkAsBlocks(ck, *data, ck.level == residentLevel_);
+    insertChunkAsBlocks(ck, *data);
     return blockCache_.get(key);
 }
 
 void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
-                                        const ChunkData& chunk,
-                                        bool resident) {
+                                        const ChunkData& chunk) {
     const int cz = chunk.shape[0];
     const int cy = chunk.shape[1];
     const int cx = chunk.shape[2];
@@ -426,39 +425,20 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
                     }
                 }
                 BlockKey bkKey{key.level, baseBz + bi, baseBy + bj, baseBx + bk};
-                if (resident) blockCache_.putResident(bkKey, tmp);
-                else          blockCache_.put(bkKey, tmp);
+                blockCache_.put(bkKey, tmp);
             }
         }
     }
 }
 
-void BlockPipeline::loadResidentLevel(int level) {
-    residentLevel_ = level;
-    int nScales = numLevels();
-    if (level < 0 || level >= nScales) return;
-    // Canonical 128^3 grid: iterate over canonical chunks, not source chunks.
-    auto shape = levelShape(level);
-    constexpr int C = 128;
-    int gridZ = (shape[0] + C - 1) / C;
-    int gridY = (shape[1] + C - 1) / C;
-    int gridX = (shape[2] + C - 1) / C;
-    for (int iz = 0; iz < gridZ; ++iz)
-        for (int iy = 0; iy < gridY; ++iy)
-            for (int ix = 0; ix < gridX; ++ix) {
-                ChunkKey k{level, iz, iy, ix};
-                auto data = fetchChunkBlocking(k);
-                if (data) insertChunkAsBlocks(k, *data, true);
-            }
-}
 
 void BlockPipeline::clearMemory() {
-    blockCache_.clearEvictable();
+    blockCache_.clear();
 }
 
 void BlockPipeline::clearAll() {
     ioPool_.cancelPending();
-    blockCache_.clearEvictable();
+    blockCache_.clear();
     bloomClear();
     std::lock_guard lock(negativeMutex_);
     negativeCache_.clear();
@@ -534,8 +514,7 @@ auto BlockPipeline::stats() const -> Stats {
     s.coldHits = statColdHits_.load(std::memory_order_relaxed);
     s.iceFetches = statIceFetches_.load(std::memory_order_relaxed);
     s.misses = statMisses_.load(std::memory_order_relaxed);
-    s.blocksResident = blockCache_.residentSize();
-    s.blocksEvictable = blockCache_.evictableSize();
+    s.blocks = blockCache_.size();
     s.ioPending = ioPool_.pendingCount();
     s.diskWrites = statDiskWrites_.load(std::memory_order_relaxed);
     {
@@ -581,7 +560,7 @@ std::unique_ptr<BlockPipeline> openFilesystemPipeline(
         datasetPath.parent_path(), ds->delimiter(), std::vector{lm});
     auto decompress = makeVcDecompressor(ds);
     BlockPipeline::Config cfg;
-    cfg.blockCacheBytes = maxBytes;
+    cfg.bytes = maxBytes;
     return std::make_unique<BlockPipeline>(
         std::move(cfg), std::move(source), std::move(decompress));
 }
