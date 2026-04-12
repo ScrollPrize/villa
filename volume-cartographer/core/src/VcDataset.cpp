@@ -277,43 +277,40 @@ static void fillTypedElements(uint8_t* dst,
     }
 }
 
-static CompressorConfig parseCompressor(const utils::Json& zarray, int dtypeSize)
+static CompressorConfig compressorFromMeta(const utils::ZarrMetadata& meta, int dtypeSize)
 {
     CompressorConfig cfg;
     cfg.blosc_typesize = dtypeSize;
 
-    if (!zarray.contains("compressor") || zarray["compressor"].is_null()) {
-        cfg.id = CompressorId::None;
+    // v2: meta.compressor_id set by parse_zarray
+    if (!meta.compressor_id.empty()) {
+        if (meta.compressor_id == "blosc") {
+            cfg.id = CompressorId::Blosc;
+            cfg.blosc_clevel = meta.compression_level > 0 ? meta.compression_level : 5;
+        } else if (meta.compressor_id == "zstd") {
+            cfg.id = CompressorId::Zstd;
+            cfg.level = meta.compression_level > 0 ? meta.compression_level : 3;
+        } else if (meta.compressor_id == "lz4") {
+            cfg.id = CompressorId::Lz4;
+            cfg.level = meta.compression_level > 0 ? meta.compression_level : 1;
+        } else if (meta.compressor_id == "gzip" || meta.compressor_id == "zlib") {
+            cfg.id = CompressorId::Gzip;
+            cfg.level = meta.compression_level > 0 ? meta.compression_level : 5;
+        } else {
+            throw std::runtime_error("Unsupported zarr compressor: " + meta.compressor_id);
+        }
         return cfg;
     }
 
-    const auto& comp = zarray["compressor"];
-    std::string id = comp.value("id", std::string(""));
-
-    if (id == "blosc") {
-        cfg.id = CompressorId::Blosc;
-        cfg.blosc_cname = comp.value("cname", std::string("lz4"));
-        cfg.blosc_clevel = comp.value("clevel", 5);
-        cfg.blosc_shuffle = comp.value("shuffle", 1);
-        if (comp.contains("blocksize"))
-            cfg.blosc_blocksize = comp["blocksize"].get_int();
-        if (comp.contains("typesize"))
-            cfg.blosc_typesize = comp["typesize"].get_int();
-        else
-            cfg.blosc_typesize = dtypeSize;
-    } else if (id == "zstd") {
-        cfg.id = CompressorId::Zstd;
-        cfg.level = comp.value("level", 3);
-    } else if (id == "lz4") {
-        cfg.id = CompressorId::Lz4;
-        cfg.level = comp.value("acceleration", 1);
-    } else if (id == "gzip" || id == "zlib") {
-        cfg.id = CompressorId::Gzip;
-        cfg.level = comp.value("level", 5);
-    } else {
-        throw std::runtime_error("Unsupported zarr compressor: " + id);
+    // v3: walk codec pipeline for a bytes→bytes codec
+    for (const auto& cc : meta.codecs) {
+        if (cc.name == "blosc") { cfg.id = CompressorId::Blosc; return cfg; }
+        if (cc.name == "zstd")  { cfg.id = CompressorId::Zstd;  return cfg; }
+        if (cc.name == "lz4")   { cfg.id = CompressorId::Lz4;   return cfg; }
+        if (cc.name == "gzip" || cc.name == "zlib") { cfg.id = CompressorId::Gzip; return cfg; }
     }
 
+    cfg.id = CompressorId::None;
     return cfg;
 }
 
@@ -352,90 +349,72 @@ struct VcDataset::Impl {
     std::shared_ptr<utils::FileSystemStore> store_;
     std::unique_ptr<utils::ZarrArray> zarrArray_;
 
-    void parseFillValue(const utils::Json& zarray)
-    {
-        std::int64_t rawFill = 0;
-        if (zarray.contains("fill_value") && !zarray["fill_value"].is_null()) {
-            rawFill = zarray["fill_value"].get_int64();
+    // Build a codec registry covering the compressors we decode (blosc,
+    // zstd, lz4, gzip). ZarrArray::open picks the right codec from meta.
+    static utils::ZarrArray::CodecRegistry buildCodecRegistry(int dtypeSize) {
+        utils::ZarrArray::CodecRegistry reg;
+        for (const char* name : {"blosc", "zstd", "lz4", "gzip", "zlib"}) {
+            CompressorConfig cfg;
+            if      (std::string(name) == "blosc") cfg.id = CompressorId::Blosc;
+            else if (std::string(name) == "zstd")  cfg.id = CompressorId::Zstd;
+            else if (std::string(name) == "lz4")   cfg.id = CompressorId::Lz4;
+            else                                   cfg.id = CompressorId::Gzip;
+            cfg.blosc_typesize = dtypeSize;
+            reg[name] = codecFromConfig(cfg);
         }
-
-        fillValueBytes_.assign(dtypeSize_, 0);
-        if (dtype_ == VcDtype::uint8) {
-            if (rawFill < 0 || rawFill > std::numeric_limits<uint8_t>::max()) {
-                throw std::runtime_error("uint8 zarr fill_value out of range");
-            }
-            fillValueBytes_[0] = static_cast<uint8_t>(rawFill);
-            return;
-        }
-
-        if (rawFill < 0 || rawFill > std::numeric_limits<uint16_t>::max()) {
-            throw std::runtime_error("uint16 zarr fill_value out of range");
-        }
-        const auto fill = static_cast<uint16_t>(rawFill);
-        std::memcpy(fillValueBytes_.data(), &fill, sizeof(fill));
+        return reg;
     }
 
-    void parseZarray(const std::filesystem::path& path)
-    {
-        auto zarrayPath = path / ".zarray";
-        if (!std::filesystem::exists(zarrayPath)) {
-            throw std::runtime_error("Missing .zarray in " + path.string());
+    void open(const std::filesystem::path& path) {
+        fsPath = path;
+        // Auto-detects v2 (.zarray) and v3 (zarr.json).
+        zarrArray_ = std::make_unique<utils::ZarrArray>(
+            utils::ZarrArray::open(path, buildCodecRegistry(/*dtypeSize guess*/1)));
+        const auto& meta = zarrArray_->metadata();
+
+        shape_.assign(meta.shape.begin(), meta.shape.end());
+
+        // Finest chunk granularity: v3 sharded uses inner (sub_chunks); v2 and
+        // v3 unsharded use meta.chunks directly.
+        if (meta.shard_config) {
+            chunkShape_.assign(meta.shard_config->sub_chunks.begin(),
+                               meta.shard_config->sub_chunks.end());
+        } else {
+            chunkShape_.assign(meta.chunks.begin(), meta.chunks.end());
         }
-
-        utils::Json zarray = utils::Json::parse_file(zarrayPath);
-
-        // Shape
-        auto shapeJson = zarray["shape"];
-        shape_.clear();
-        for (auto& v : shapeJson)
-            shape_.push_back(v.get_size_t());
-
-        // Chunks
-        auto chunksJson = zarray["chunks"];
-        chunkShape_.clear();
-        for (auto& v : chunksJson)
-            chunkShape_.push_back(v.get_size_t());
-
-        // Chunk size (product)
         chunkSize_ = 1;
-        for (auto c : chunkShape_)
-            chunkSize_ *= c;
+        for (auto c : chunkShape_) chunkSize_ *= c;
 
-        // Dtype
-        std::string dtypeStr = zarray["dtype"].get_string();
-        if (dtypeStr == "|u1" || dtypeStr == "<u1" || dtypeStr == "uint8") {
+        if (meta.dtype == utils::ZarrDtype::uint8) {
             dtype_ = VcDtype::uint8;
             dtypeSize_ = 1;
-        } else if (dtypeStr == "<u2" || dtypeStr == "|u2" || dtypeStr == "uint16") {
+        } else if (meta.dtype == utils::ZarrDtype::uint16) {
             dtype_ = VcDtype::uint16;
             dtypeSize_ = 2;
         } else {
-            throw std::runtime_error("Unsupported zarr dtype: " + dtypeStr);
+            throw std::runtime_error("Unsupported zarr dtype");
         }
 
-        parseFillValue(zarray);
+        delimiter_ = meta.dimension_separator.empty() ? "/" : meta.dimension_separator;
 
-        // Dimension separator
-        if (zarray.contains("dimension_separator")) {
-            delimiter_ = zarray["dimension_separator"].get_string();
+        fillValueBytes_.assign(dtypeSize_, 0);
+        if (meta.fill_value.has_value()) {
+            std::int64_t raw = static_cast<std::int64_t>(*meta.fill_value);
+            if (dtype_ == VcDtype::uint8) {
+                if (raw < 0) raw = 0;
+                if (raw > std::numeric_limits<uint8_t>::max())
+                    raw = std::numeric_limits<uint8_t>::max();
+                fillValueBytes_[0] = static_cast<uint8_t>(raw);
+            } else {
+                if (raw < 0) raw = 0;
+                if (raw > std::numeric_limits<uint16_t>::max())
+                    raw = std::numeric_limits<uint16_t>::max();
+                const auto v = static_cast<uint16_t>(raw);
+                std::memcpy(fillValueBytes_.data(), &v, sizeof(v));
+            }
         }
 
-        // Compressor
-        compressor_ = parseCompressor(zarray, static_cast<int>(dtypeSize_));
-    }
-
-    void openZarrArray()
-    {
-        // Open the zarr array directly from its path using utils
-        if (compressor_.id == CompressorId::None) {
-            zarrArray_ = std::make_unique<utils::ZarrArray>(
-                utils::ZarrArray::open(fsPath));
-            return;
-        }
-
-        auto codec = codecFromConfig(compressor_);
-        zarrArray_ = std::make_unique<utils::ZarrArray>(
-            utils::ZarrArray::open(fsPath, std::move(codec)));
+        compressor_ = compressorFromMeta(meta, static_cast<int>(dtypeSize_));
     }
 };
 
@@ -446,9 +425,7 @@ struct VcDataset::Impl {
 VcDataset::VcDataset(const std::filesystem::path& path)
     : impl_(std::make_unique<Impl>())
 {
-    impl_->fsPath = path;
-    impl_->parseZarray(path);
-    impl_->openZarrArray();
+    impl_->open(path);
 }
 
 VcDataset::~VcDataset() = default;

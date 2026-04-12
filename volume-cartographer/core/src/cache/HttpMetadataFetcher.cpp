@@ -1,6 +1,8 @@
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/cache/CacheDebugLog.hpp"
 
+#include <utils/zarr.hpp>
+
 #include <cstdio>
 #include <fstream>
 #include <future>
