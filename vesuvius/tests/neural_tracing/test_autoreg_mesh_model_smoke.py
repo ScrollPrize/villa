@@ -1480,16 +1480,22 @@ def test_autoreg_mesh_wandb_logging_includes_metrics_and_images(tmp_path: Path, 
     assert "rollout_val_seam_edge_error" in logged
     assert "rollout_val_triangle_flip_rate" in logged
     assert "train_example" in logged
+    assert "train_example_projection" in logged
     assert "train_example_xy" in logged
     assert "val_example" in logged
+    assert "val_example_projection" in logged
     assert "val_example_xy" in logged
     assert isinstance(logged["train_example"], _FakeWandbImage)
+    assert isinstance(logged["train_example_projection"], _FakeWandbImage)
     assert isinstance(logged["train_example_xy"], _FakeWandbImage)
     assert isinstance(logged["val_example"], _FakeWandbImage)
+    assert isinstance(logged["val_example_projection"], _FakeWandbImage)
     assert isinstance(logged["val_example_xy"], _FakeWandbImage)
     assert logged["train_example"].data.ndim == 3
+    assert logged["train_example_projection"].data.ndim == 3
     assert logged["train_example_xy"].data.ndim == 3
     assert logged["val_example"].data.ndim == 3
+    assert logged["val_example_projection"].data.ndim == 3
     assert logged["val_example_xy"].data.ndim == 3
     assert fake_wandb.finish_calls == 1
 

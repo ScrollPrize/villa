@@ -1111,15 +1111,19 @@ def run_autoreg_mesh_training(
                     model.train()
 
             if should_log_projection_images:
-                wandb_payload["train_example"] = wandb.Image(
+                train_projection_image = wandb.Image(
                     _make_teacher_forced_prediction_canvas(batch, outputs, sample_idx=0),
                     caption=f"step={global_step} train teacher-forced",
                 )
+                wandb_payload["train_example"] = train_projection_image
+                wandb_payload["train_example_projection"] = train_projection_image
                 if raw_val_sample is not None and val_infer is not None:
-                    wandb_payload["val_example"] = wandb.Image(
+                    val_projection_image = wandb.Image(
                         _make_inference_prediction_canvas(raw_val_sample, val_infer),
                         caption=f"step={global_step} val autoregressive",
                     )
+                    wandb_payload["val_example"] = val_projection_image
+                    wandb_payload["val_example_projection"] = val_projection_image
             if should_log_xy_images:
                 wandb_payload["train_example_xy"] = wandb.Image(
                     _make_teacher_forced_xy_slice_canvas(
