@@ -46,7 +46,7 @@
   "distance_aware_coarse_target_radius": 1,
   "distance_aware_coarse_target_sigma": 1.0,
   "distance_aware_coarse_target_loss": "soft_ce",
-  "batch_size": 14,
+  "batch_size": 8,
   "num_workers": 14,
   "val_num_workers": 2,
   "val_fraction": 0.05,
