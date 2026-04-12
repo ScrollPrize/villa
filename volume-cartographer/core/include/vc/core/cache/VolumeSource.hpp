@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -86,6 +87,13 @@ public:
     [[nodiscard]] std::array<int, 3> chunksPerShard() const noexcept { return chunksPerShard_; }
     [[nodiscard]] std::array<int, 3> shardShape() const noexcept { return shardShape_; }
 
+    // True if any HTTP fetch has failed with a non-404 status (typically
+    // auth/network). Callers should avoid negative-caching empty responses
+    // while this is set, since the emptiness may be transient.
+    [[nodiscard]] bool hadTransientError() const noexcept {
+        return transientError_.load(std::memory_order_relaxed);
+    }
+
 private:
     std::string chunkUrl(const ChunkKey& key) const;
     std::string shardUrl(const ChunkKey& key) const;
@@ -104,6 +112,8 @@ private:
 
     std::mutex shardCacheMutex_;
     std::unordered_map<std::string, std::shared_ptr<std::vector<uint8_t>>> shardCache_;
+
+    std::atomic<bool> transientError_{false};
 };
 
 }  // namespace vc::cache

@@ -157,12 +157,15 @@ BlockPipeline::BlockPipeline(
         // to canonical disk, return canonical h265 bytes.
         auto data = assembleCanonicalChunk(key);
         if (!data) {
-            bloomAdd(key);
-            {
+            // If the source is having transient HTTP trouble (auth, network),
+            // leave it unmarked so a later session has a chance to fetch.
+            auto* http = dynamic_cast<HttpSource*>(source_.get());
+            if (!http || !http->hadTransientError()) {
+                bloomAdd(key);
                 std::lock_guard lock(negativeMutex_);
                 negativeCache_.insert(key);
+                if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
             }
-            if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
             return {};
         }
         statIceFetches_.fetch_add(1, std::memory_order_relaxed);
@@ -359,12 +362,13 @@ ChunkDataPtr BlockPipeline::fetchChunkBlocking(const ChunkKey& key) {
     // Canonical disk tier: rechunk from source and persist as h265.
     auto data = assembleCanonicalChunk(key);
     if (!data) {
-        bloomAdd(key);
-        {
+        auto* http = dynamic_cast<HttpSource*>(source_.get());
+        if (!http || !http->hadTransientError()) {
+            bloomAdd(key);
             std::lock_guard lock(negativeMutex_);
             negativeCache_.insert(key);
+            if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
         }
-        if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
         return nullptr;
     }
     statIceFetches_.fetch_add(1, std::memory_order_relaxed);
