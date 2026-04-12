@@ -1,6 +1,8 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <utils/zarr.hpp>
+
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -2802,16 +2804,20 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
             // Read delimiter from x/0/.zarray.
             // Also assert direction-field fill_value uses the neutral (128,128,128) convention.
             // We treat that triplet as "no normal".
-            const auto assert_fill_value_128 = [&](const char* axis) {
-                const std::filesystem::path zarray_axis = zarr_root / axis / "0" / ".zarray";
-                if (!std::filesystem::exists(zarray_axis)) {
-                    throw std::runtime_error(std::string("Missing ") + axis + "/0/.zarray under normal3d_zarr_path: " + zarr_root.string());
+            const auto assertFillValue128 = [&](const char* axis) {
+                auto path = zarr_root / axis / "0";
+                utils::ZarrMetadata meta;
+                try {
+                    meta = utils::ZarrArray::open(path).metadata();
+                } catch (const std::exception& e) {
+                    throw std::runtime_error(std::string("Failed to open ") + axis +
+                        "/0 zarr at " + zarr_root.string() + ": " + e.what());
                 }
-                utils::Json j = utils::Json::parse_file(zarray_axis);
-                if (!j.contains("fill_value")) {
-                    throw std::runtime_error(std::string("Missing fill_value in ") + axis + "/0/.zarray under normal3d_zarr_path: " + zarr_root.string());
+                if (!meta.fill_value.has_value()) {
+                    throw std::runtime_error(std::string("Missing fill_value in ") + axis +
+                        "/0 zarr under normal3d_zarr_path: " + zarr_root.string());
                 }
-                const int fv = j["fill_value"].get_int();
+                const int fv = int(*meta.fill_value);
                 if (fv != 128) {
                     std::stringstream msg;
                     msg << "normal3d_zarr_path fill_value=" << fv << " for " << axis << "/0; expected 128";
@@ -2819,13 +2825,16 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
                 }
             };
 
-            assert_fill_value_128("x");
-            assert_fill_value_128("y");
-            assert_fill_value_128("z");
+            assertFillValue128("x");
+            assertFillValue128("y");
+            assertFillValue128("z");
 
-            const std::filesystem::path zarray_x = zarr_root / "x" / "0" / ".zarray";
-            utils::Json j = utils::Json::parse_file(zarray_x);
-            std::string delim = j.value("dimension_separator", std::string("."));
+            std::string delim = ".";
+            try {
+                auto meta = utils::ZarrArray::open(zarr_root / "x" / "0").metadata();
+                if (!meta.dimension_separator.empty())
+                    delim = meta.dimension_separator;
+            } catch (...) {}
 
             // Assert the direction-field was aligned by vc_ngrids --align-normals.
             try {
