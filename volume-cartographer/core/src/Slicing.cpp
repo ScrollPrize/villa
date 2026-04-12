@@ -79,21 +79,24 @@ struct VolumeShape {
 // block cache only — never blocks on disk or network. Missing blocks make
 // sampleInt return 0 (black) for that voxel. Viewport-demand fetches feed
 // the cache asynchronously via BlockPipeline::fetchInteractive.
-template<typename T, int kSlots = 512>
+template<typename T, int kSlots = 256>
 struct BlockSampler {
     static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be power of 2");
     static constexpr int kSlotMask = kSlots - 1;
 
-    struct Slot {
+    // Hot slot: packed key + data pointer, 16 bytes. 512 * 16 = 8KB, fits
+    // comfortably in L1D. The shared_ptr (refcounting keep-alive) lives
+    // in a cold parallel array, touched only on miss.
+    struct HotSlot {
         uint64_t key = UINT64_MAX;
-        BlockPtr block;
         const T* data = nullptr;
     };
 
     BlockPipeline& cache;
     int level;
     VolumeShape shape;
-    Slot slots[kSlots];
+    HotSlot slots[kSlots];
+    BlockPtr slotBlocks[kSlots];  // cold: refcount keep-alive
     uint64_t lastKey = UINT64_MAX;
     const T* data = nullptr;
 
@@ -121,7 +124,7 @@ struct BlockSampler {
         if (key == lastKey) return;
 
         int idx = slotIndex(bz, by, bx);
-        Slot& slot = slots[idx];
+        HotSlot& slot = slots[idx];
         if (slot.key == key) {
             data = slot.data;
             lastKey = key;
@@ -129,8 +132,8 @@ struct BlockSampler {
         }
 
         BlockKey bk{level, bz, by, bx};
-        slot.block = cache.blockAt(bk);
-        slot.data = slot.block ? reinterpret_cast<const T*>(slot.block->data) : nullptr;
+        slotBlocks[idx] = cache.blockAt(bk);
+        slot.data = slotBlocks[idx] ? reinterpret_cast<const T*>(slotBlocks[idx]->data) : nullptr;
         slot.key = key;
         data = slot.data;
         lastKey = key;
@@ -506,18 +509,36 @@ namespace {
 
 // Attempt a non-blocking fetch at level L; returns true and writes LUT pixel
 // if all needed blocks are present. Trilinear path uses 8 corners.
+// Nearest sample with caller-guaranteed in-bounds coords. Caller must have
+// verified 0 <= v{z,y,x} < shape.{sz,sy,sx}. Skips all bounds checks.
+VC_FORCE_INLINE bool trySampleNearestUnchecked(BlockSampler<uint8_t>& s,
+                                               float vz, float vy, float vx,
+                                               uint8_t& out) {
+    int iz = int(vz + 0.5f), iy = int(vy + 0.5f), ix = int(vx + 0.5f);
+    if (iz >= s.shape.sz) iz = s.shape.sz - 1;
+    if (iy >= s.shape.sy) iy = s.shape.sy - 1;
+    if (ix >= s.shape.sx) ix = s.shape.sx - 1;
+    int bz = iz >> kBlockShift, by = iy >> kBlockShift, bx = ix >> kBlockShift;
+    s.tryUpdateBlockNonBlocking(bz, by, bx);
+    if (!s.data) return false;
+    int lz = iz & kBlockMask, ly = iy & kBlockMask, lx = ix & kBlockMask;
+    out = s.data[size_t(lz) * kStrideZ + size_t(ly) * kStrideY + size_t(lx)];
+    return true;
+}
+
 template<SampleMode Mode>
 VC_FORCE_INLINE bool trySampleNB(BlockSampler<uint8_t>& s, float vz, float vy, float vx,
                                  uint8_t& out) {
-    if (!s.inBounds(vz, vy, vx)) { out = 0; return true; }
-
     if constexpr (Mode == SampleMode::Nearest) {
+        // Skip the float inBounds + per-axis clamp. sampleIntNB already
+        // rejects OOB via unsigned compare. Only need to guard negatives
+        // (truncation rounds small negatives to 0 incorrectly).
+        if (vz < 0.f || vy < 0.f || vx < 0.f) { out = 0; return true; }
         int iz = int(vz + 0.5f), iy = int(vy + 0.5f), ix = int(vx + 0.5f);
-        if (iz >= s.shape.sz) iz = s.shape.sz - 1;
-        if (iy >= s.shape.sy) iy = s.shape.sy - 1;
-        if (ix >= s.shape.sx) ix = s.shape.sx - 1;
         return s.sampleIntNB(iz, iy, ix, out);
-    } else {
+    }
+    if (!s.inBounds(vz, vy, vx)) { out = 0; return true; }
+    {
         int iz = int(vz), iy = int(vy), ix = int(vx);
         float v000f, v100f, v010f, v110f, v001f, v101f, v011f, v111f;
 
@@ -612,6 +633,11 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
         }
     }
 
+    float scales[32] = {};
+    const int nSamplersTotal = numLevels - desiredLevel;
+    for (int i = 0; i < nSamplersTotal && i < 32; i++)
+        scales[i] = levelScale(desiredLevel + i);
+
     #pragma omp parallel
     {
         std::vector<BlockSampler<uint8_t>> samplers;
@@ -630,8 +656,7 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
                 uint8_t pix = 0;
                 bool got = false;
                 for (size_t i = 0; i < samplers.size(); i++) {
-                    int lvl = desiredLevel + int(i);
-                    float scale = (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f;
+                    float scale = scales[i];
                     float vx = c[0] * scale, vy = c[1] * scale, vz = c[2] * scale;
                     if (trySampleNB<Mode>(samplers[i], vz, vy, vx, pix)) {
                         got = true;
@@ -716,6 +741,15 @@ void sampleCompositeAdaptiveImpl(
         }
     }
 
+    // Precompute per-level scale factor once (1.0 / 2^lvl). Hoists the
+    // integer shift + int->float convert + fdiv out of the hot inner loop.
+    float scales[32] = {};
+    const int nSamplersTotal = numLevels - desiredLevel;
+    for (int i = 0; i < nSamplersTotal && i < 32; i++) {
+        int lvl = desiredLevel + i;
+        scales[i] = (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f;
+    }
+
     #pragma omp parallel
     {
         std::vector<BlockSampler<uint8_t>> samplers;
@@ -739,21 +773,52 @@ void sampleCompositeAdaptiveImpl(
 
                 float accum=0.f, mx=0.f, mn=255.f;
                 int count=0;
+                // Incremental per-layer offset along the normal direction:
+                // one vector add per layer instead of 3 FMAs.
+                const float dx = nrm[0] * zStep;
+                const float dy = nrm[1] * zStep;
+                const float dz = nrm[2] * zStep;
+                float wx = base[0] + nrm[0] * float(zStart) * zStep;
+                float wy = base[1] + nrm[1] * float(zStart) * zStep;
+                float wz = base[2] + nrm[2] * float(zStart) * zStep;
+
+                // Pixel-level bounds precheck at level 0: if the entire
+                // z-line fits in bounds, skip all per-sample float compares.
+                // Reserves 1-voxel margin for nearest rounding.
+                const auto& sh0 = samplers[0].shape;
+                const float endScale = scales[0];
+                const float fwx = wx * endScale, fwy = wy * endScale, fwz = wz * endScale;
+                const float tailFx = (wx + dx * float(numLayers - 1)) * endScale;
+                const float tailFy = (wy + dy * float(numLayers - 1)) * endScale;
+                const float tailFz = (wz + dz * float(numLayers - 1)) * endScale;
+                const float minFx = std::min(fwx, tailFx);
+                const float maxFx = std::max(fwx, tailFx);
+                const float minFy = std::min(fwy, tailFy);
+                const float maxFy = std::max(fwy, tailFy);
+                const float minFz = std::min(fwz, tailFz);
+                const float maxFz = std::max(fwz, tailFz);
+                const bool fullyInBounds = SMode == SampleMode::Nearest
+                    && minFx >= 0.5f && maxFx < float(sh0.sx) - 0.5f
+                    && minFy >= 0.5f && maxFy < float(sh0.sy) - 0.5f
+                    && minFz >= 0.5f && maxFz < float(sh0.sz) - 0.5f;
+
                 for (int li=0; li<numLayers; li++) {
-                    float z = float(zStart + li) * zStep;
-                    float wx = base[0] + nrm[0]*z;
-                    float wy = base[1] + nrm[1]*z;
-                    float wz = base[2] + nrm[2]*z;
                     uint8_t v = 0;
-                    for (int i=0; i<nSamplers; i++) {
-                        int lvl = desiredLevel + i;
-                        float scl = (lvl > 0) ? 1.0f/float(1<<lvl) : 1.0f;
-                        if (trySampleNB<SMode>(samplers[i], wz*scl, wy*scl, wx*scl, v)) break;
+                    if (fullyInBounds) {
+                        // Hot path: no per-sample bounds check; no fallback.
+                        // Missed block => v stays 0 (pixel currently loading).
+                        trySampleNearestUnchecked(samplers[0], wz, wy, wx, v);
+                    } else {
+                        for (int i=0; i<nSamplers; i++) {
+                            float scl = scales[i];
+                            if (trySampleNB<SMode>(samplers[i], wz*scl, wy*scl, wx*scl, v)) break;
+                        }
                     }
                     if constexpr (AMode == AccumMode2::Max) { mx = std::max(mx, float(v)); }
                     else if constexpr (AMode == AccumMode2::Min) { mn = std::min(mn, float(v)); }
                     else if constexpr (AMode == AccumMode2::Mean) { accum += float(v); count++; }
                     else { layerVals[li] = float(v); }
+                    wx += dx; wy += dy; wz += dz;
                 }
 
                 float val = 0.f;
@@ -835,17 +900,21 @@ void sampleAdaptiveARGB32(
     vc::Sampling method)
 {
     if (numLayers <= 0) numLayers = 1;
-    switch (method) {
-        case vc::Sampling::Nearest:
-            dispatchCompositeAdaptive<SampleMode::Nearest>(
-                outBuf, outStride, *cache, desiredLevel, numLevels,
-                coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, width, height, compositeMethod, lut); break;
-        default:
-            dispatchCompositeAdaptive<SampleMode::Trilinear>(
-                outBuf, outStride, *cache, desiredLevel, numLevels,
-                coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, width, height, compositeMethod, lut); break;
+    // Composite rendering forces Nearest: averaging N layers already
+    // low-passes aliasing so per-voxel trilinear precision is wasted.
+    // Pin the template instantiation to SampleMode::Nearest so the entire
+    // inner loop compiles without any interp branch.
+    const bool composite = numLayers > 1;
+    if (composite || method == vc::Sampling::Nearest) {
+        dispatchCompositeAdaptive<SampleMode::Nearest>(
+            outBuf, outStride, *cache, desiredLevel, numLevels,
+            coords, origin, vx_step, vy_step, normals, planeNormal,
+            numLayers, zStart, zStep, width, height, compositeMethod, lut);
+    } else {
+        dispatchCompositeAdaptive<SampleMode::Trilinear>(
+            outBuf, outStride, *cache, desiredLevel, numLevels,
+            coords, origin, vx_step, vy_step, normals, planeNormal,
+            numLayers, zStart, zStep, width, height, compositeMethod, lut);
     }
 }
 

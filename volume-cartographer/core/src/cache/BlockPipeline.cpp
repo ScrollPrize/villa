@@ -104,6 +104,32 @@ BlockPipeline::BlockPipeline(
     , ioPool_(config_.ioThreads)
     , blockCache_(BlockCache::Config{config_.bytes})
 {
+    // Scan the on-disk cache once at startup so the stats bar reports
+    // actual usage instead of "0 GB / 0 shards" until we write something.
+    // Counts every regular file under each level root (each shard is one
+    // file in zarr v3 sharded layout). zarr.json is excluded.
+    for (const auto& dz : diskLevels_) {
+        if (!dz) continue;
+        const auto& root = dz->path();
+        std::error_code ec;
+        if (!std::filesystem::exists(root, ec)) continue;
+        std::filesystem::recursive_directory_iterator it(
+            root, std::filesystem::directory_options::skip_permission_denied, ec);
+        std::filesystem::recursive_directory_iterator end;
+        for (; !ec && it != end; it.increment(ec)) {
+            if (!it->is_regular_file(ec)) continue;
+            if (it->path().filename() == "zarr.json") continue;
+            auto sz = it->file_size(ec);
+            if (ec) { ec.clear(); continue; }
+            initialDiskBytes_ += sz;
+            initialDiskShards_ += 1;
+        }
+    }
+    if (initialDiskShards_ > 0) {
+        fprintf(stderr, "[BlockPipeline] disk cache scan: %zu shards, %.1f MB\n",
+                initialDiskShards_, double(initialDiskBytes_) / (1024.0 * 1024.0));
+    }
+
     // Per-chunk IOPool granularity. Shard mapper is identity; each canonical
     // chunk is its own work unit. When the HTTP source is itself sharded,
     // HttpSource's internal shard cache amortizes S3 GETs across chunks that
@@ -453,10 +479,11 @@ auto BlockPipeline::stats() const -> Stats {
         s.negativeCount = negativeCache_.size();
     }
     s.totalSubmitted = statTotalSubmitted_.load(std::memory_order_relaxed);
-    s.diskBytes = statDiskBytes_.load(std::memory_order_relaxed);
+    s.diskBytes = initialDiskBytes_
+                + statDiskBytes_.load(std::memory_order_relaxed);
     {
         std::lock_guard lk(writtenShardsMutex_);
-        s.diskShards = writtenShards_.size();
+        s.diskShards = initialDiskShards_ + writtenShards_.size();
     }
     if (auto* http = dynamic_cast<HttpSource*>(source_.get()))
         s.sharded = http->isSharded();

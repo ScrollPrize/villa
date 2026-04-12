@@ -158,6 +158,11 @@ private:
     mutable std::mutex writtenShardsMutex_;
     std::unordered_set<ShardKey, ShardKeyHash> writtenShards_;
     mutable std::atomic<uint64_t> statMisses_{0};
+
+    // Seeded from a startup scan of the on-disk cache so stats show real
+    // usage immediately; session-scoped writes accumulate on top.
+    size_t initialDiskBytes_ = 0;
+    size_t initialDiskShards_ = 0;
 };
 
 // Convenience: open a single-level BlockPipeline against a local zarr dataset

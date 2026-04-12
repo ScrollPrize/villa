@@ -360,13 +360,17 @@ void CAdaptiveVolumeViewer::submitRender()
             pNormal = &n; // ignored for numLayers=1
         }
 
+        // Composite averages ~11 layers — the averaging is itself a low-pass,
+        // so per-layer Nearest matches Trilinear visually at ~8x the speed.
+        vc::Sampling sampleMethod = (numLayers > 1) ? vc::Sampling::Nearest
+                                                    : _samplingMethod;
         sampleAdaptiveARGB32(
             fbBits, fbStride, _volume->tieredCache(),
             sp.level, numLevels,
             nullptr, &origin, &vx_step, &vy_step,
             nullptr, pNormal,
             numLayers, zStart, zStep,
-            fbW, fbH, method, lut.data(), _samplingMethod);
+            fbW, fbH, method, lut.data(), sampleMethod);
     } else {
         cv::Mat_<cv::Vec3f> coords;
         cv::Mat_<cv::Vec3f> normals;
@@ -392,13 +396,15 @@ void CAdaptiveVolumeViewer::submitRender()
                 pNormals = &normals;
                 method = _compositeSettings.params.method;
             }
+            vc::Sampling sampleMethod = (numLayers > 1) ? vc::Sampling::Nearest
+                                                        : _samplingMethod;
             sampleAdaptiveARGB32(
                 fbBits, fbStride, _volume->tieredCache(),
                 sp.level, numLevels,
                 &coords, nullptr, nullptr, nullptr,
                 pNormals, nullptr,
                 numLayers, zStart, zStep,
-                fbW, fbH, method, lut.data(), _samplingMethod);
+                fbW, fbH, method, lut.data(), sampleMethod);
         }
     }
 
