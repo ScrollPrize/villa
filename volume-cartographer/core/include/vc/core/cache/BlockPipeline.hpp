@@ -66,6 +66,11 @@ public:
     // blocks remain alive while the returned shared_ptr is held.
     [[nodiscard]] BlockPtr blockAt(const BlockKey& key) noexcept;
 
+    // Blocking: ensures the enclosing chunk is decoded (pulling from cold
+    // or ice if needed), then returns the block. Returns null if the data
+    // is negative-cached or unavailable.
+    [[nodiscard]] BlockPtr getBlockingBlock(const BlockKey& key);
+
     // Populate the always-resident region with every block from `level`.
     // Blocking: fetches any missing chunks through the normal chain. Call
     // once on volume open.

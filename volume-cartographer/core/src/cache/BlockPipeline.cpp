@@ -622,6 +622,22 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept
     return blockCache_.get(key);
 }
 
+BlockPtr BlockPipeline::getBlockingBlock(const BlockKey& key)
+{
+    if (auto b = blockCache_.get(key)) return b;
+
+    auto cs = chunkShape(key.level);
+    if (cs[0] <= 0 || cs[1] <= 0 || cs[2] <= 0) return nullptr;
+    int bpcZ = cs[0] / kBlockSize;
+    int bpcY = cs[1] / kBlockSize;
+    int bpcX = cs[2] / kBlockSize;
+    if (bpcZ <= 0 || bpcY <= 0 || bpcX <= 0) return nullptr;
+
+    ChunkKey ck{key.level, key.bz / bpcZ, key.by / bpcY, key.bx / bpcX};
+    (void)getBlocking(ck);  // side-effect: populates blockCache_ via hotPut
+    return blockCache_.get(key);
+}
+
 void BlockPipeline::loadResidentLevel(int level)
 {
     residentLevel_ = level;
