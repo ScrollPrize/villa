@@ -39,6 +39,38 @@ static bool isAllZero(const uint8_t* data, size_t size) noexcept {
     return true;
 }
 
+// Decode a canonical h265 chunk from disk bytes. Uses the video header for
+// dims; independent of any source VcDataset.
+static ChunkDataPtr decodeCanonicalH265(const std::vector<uint8_t>& compressed) {
+    std::span<const std::byte> bytes(
+        reinterpret_cast<const std::byte*>(compressed.data()), compressed.size());
+    if (!utils::is_video_compressed(bytes)) return nullptr;
+    auto dims = utils::video_header_dims(bytes);
+    utils::VideoCodecParams vp;
+    vp.depth = dims[0]; vp.height = dims[1]; vp.width = dims[2];
+    size_t n = size_t(dims[0]) * dims[1] * dims[2];
+    auto decoded = utils::video_decode(bytes, n, vp);
+    auto out = std::make_shared<ChunkData>();
+    out->shape = {int(dims[0]), int(dims[1]), int(dims[2])};
+    out->elementSize = 1;
+    out->bytes.resize(decoded.size());
+    std::memcpy(out->bytes.data(), decoded.data(), decoded.size());
+    return out;
+}
+
+// Encode decoded chunk bytes as canonical h265. qp=36 is the canonical
+// disk-storage quality for this codebase.
+static std::vector<std::byte> encodeCanonicalH265(const ChunkData& chunk) {
+    utils::VideoCodecParams vp;
+    vp.depth = chunk.shape[0];
+    vp.height = chunk.shape[1];
+    vp.width = chunk.shape[2];
+    vp.qp = 36;
+    return utils::video_encode(
+        {reinterpret_cast<const std::byte*>(chunk.rawData()), chunk.totalBytes()},
+        vp);
+}
+
 BlockPipeline::BlockPipeline(
     Config config,
     std::unique_ptr<VolumeSource> source,
@@ -51,157 +83,89 @@ BlockPipeline::BlockPipeline(
     , ioPool_(config_.ioThreads)
     , blockCache_(BlockCache::Config{config_.blockCacheBytes})
 {
-    auto* httpSource = dynamic_cast<HttpSource*>(source_.get());
-    bool sharded = httpSource && httpSource->isSharded();
+    // Per-chunk IOPool granularity. Shard mapper is identity; each canonical
+    // chunk is its own work unit. When the HTTP source is itself sharded,
+    // HttpSource's internal shard cache amortizes S3 GETs across chunks that
+    // fall in the same source shard.
+    ioPool_.setShardMapper([](const ChunkKey& key) -> ShardKey {
+        return {key.level, key.iz, key.iy, key.ix};
+    });
 
-    if (sharded) {
-        auto cps = httpSource->chunksPerShard();
-        ioPool_.setShardMapper([cps](const ChunkKey& key) -> ShardKey {
-            return {key.level, key.iz / cps[0], key.iy / cps[1], key.ix / cps[2]};
-        });
-    } else {
-        ioPool_.setShardMapper([](const ChunkKey& key) -> ShardKey {
-            return {key.level, key.iz, key.iy, key.ix};
-        });
-    }
+    ioPool_.setFetchFunc([this](const ShardKey& shard) -> IOPool::FetchResult {
+        ChunkKey key{shard.level, shard.sz, shard.sy, shard.sx};
+        if (isNegativeCached(key)) return {};
 
-    if (sharded) {
-        auto cps = httpSource->chunksPerShard();
-        ioPool_.setFetchFunc([this, cps](const ShardKey& shard) -> IOPool::FetchResult {
-            using Clock = std::chrono::steady_clock;
+        auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
 
-            auto* dz = (shard.level < int(diskLevels_.size()))
-                ? diskLevels_[shard.level].get() : nullptr;
-            auto* http = dynamic_cast<HttpSource*>(source_.get());
-
-            bool shardMissing = false;
-            if (dz) {
-                std::vector<size_t> shard_idx = {size_t(shard.sz), size_t(shard.sy), size_t(shard.sx)};
-                auto shard_path = dz->chunk_path(shard_idx);
-                if (!std::filesystem::exists(shard_path)) {
-                    auto t0 = Clock::now();
-                    auto shardBytes = http->fetchWholeShard(shard.level, shard.sz, shard.sy, shard.sx);
-                    auto fetchMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
-                    if (!shardBytes.empty()) {
-                        std::filesystem::create_directories(shard_path.parent_path());
-                        std::ofstream f(shard_path, std::ios::binary | std::ios::trunc);
-                        f.write(reinterpret_cast<const char*>(shardBytes.data()),
-                                std::streamsize(shardBytes.size()));
-                        auto n = statIceFetches_.fetch_add(1, std::memory_order_relaxed);
-                        statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
-                        if (n < 20 || n % 100 == 0)
-                            std::fprintf(stderr, "[Cache] shard-fetch #%lu lvl=%d shard(%d,%d,%d) %zuB %ldms\n",
-                                         n + 1, shard.level, shard.sz, shard.sy, shard.sx,
-                                         shardBytes.size(), fetchMs);
-                    } else {
-                        // Shard doesn't exist remotely: materialize an empty-sentinel
-                        // shard on disk so future sessions short-circuit without
-                        // another remote round-trip.
-                        std::vector<size_t> sidx = {size_t(shard.sz), size_t(shard.sy), size_t(shard.sx)};
-                        dz->write_empty_shard(sidx);
-                        statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
-                        shardMissing = true;
-                    }
-                }
-            }
-
-            IOPool::FetchResult result;
-            if (!dz) return result;
-
-            auto ls = http->levelShape(shard.level);
-            auto cs = http->chunkShape(shard.level);
-            int gridZ = (ls[0] + cs[0] - 1) / cs[0];
-            int gridY = (ls[1] + cs[1] - 1) / cs[1];
-            int gridX = (ls[2] + cs[2] - 1) / cs[2];
-
-            int baseZ = shard.sz * cps[0];
-            int baseY = shard.sy * cps[1];
-            int baseX = shard.sx * cps[2];
-
-            std::vector<ChunkKey> emptyKeys;
-            for (int dz_ = 0; dz_ < cps[0]; dz_++)
-                for (int dy = 0; dy < cps[1]; dy++)
-                    for (int dx = 0; dx < cps[2]; dx++) {
-                        int iz = baseZ + dz_, iy = baseY + dy, ix = baseX + dx;
-                        if (iz >= gridZ || iy >= gridY || ix >= gridX) continue;
-                        ChunkKey ck{shard.level, iz, iy, ix};
-                        auto diskData = zarrReadChunk(*dz, ck);
-                        if (diskData && !diskData->empty()) {
-                            auto& b = *diskData;
-                            result.emplace_back(ck, std::vector<uint8_t>(
-                                reinterpret_cast<const uint8_t*>(b.data()),
-                                reinterpret_cast<const uint8_t*>(b.data() + b.size())));
-                            statColdHits_.fetch_add(1, std::memory_order_relaxed);
-                        } else {
-                            // Shard index flags this inner chunk as empty or missing.
-                            // Record in the in-memory negative cache so future fetches skip it.
-                            emptyKeys.push_back(ck);
-                        }
-                    }
-            if (!emptyKeys.empty()) {
+        // Canonical disk tier first (remote-sourced volumes write transcoded
+        // h265 chunks here; local-source volumes have no disk tier).
+        if (dz) {
+            if (dz->is_sharded() && !dz->inner_chunk_exists(chunkIndices(key))) {
+                bloomAdd(key);
                 std::lock_guard lock(negativeMutex_);
-                for (auto& k : emptyKeys) {
-                    bloomAdd(k);
-                    negativeCache_.insert(k);
-                }
+                negativeCache_.insert(key);
+                return {};
             }
-            return result;
-        });
-    } else {
-        ioPool_.setFetchFunc([this](const ShardKey& shard) -> IOPool::FetchResult {
-            ChunkKey key{shard.level, shard.sz, shard.sy, shard.sx};
-            auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
-            if (dz) {
-                auto diskData = zarrReadChunk(*dz, key);
-                if (diskData && !diskData->empty()) {
-                    statColdHits_.fetch_add(1, std::memory_order_relaxed);
-                    auto& b = *diskData;
-                    return {{key, {reinterpret_cast<const uint8_t*>(b.data()),
-                                   reinterpret_cast<const uint8_t*>(b.data() + b.size())}}};
-                }
+            auto diskBytes = zarrReadChunk(*dz, key);
+            if (diskBytes && !diskBytes->empty()) {
+                statColdHits_.fetch_add(1, std::memory_order_relaxed);
+                std::vector<uint8_t> buf(
+                    reinterpret_cast<const uint8_t*>(diskBytes->data()),
+                    reinterpret_cast<const uint8_t*>(diskBytes->data() + diskBytes->size()));
+                return {{key, std::move(buf)}};
             }
-            if (!source_) return {{key, {}}};
-            std::vector<uint8_t> data;
-            try { data = source_->fetch(key); } catch (...) { return {{key, {}}}; }
-            if (data.empty() || isAllZero(data.data(), data.size()))
-                return {{key, {}}};
-            statIceFetches_.fetch_add(1, std::memory_order_relaxed);
-            return {{key, std::move(data)}};
-        });
-    }
+        }
+
+        // Fetch from the source. HttpSource internally caches the enclosing
+        // shard for sharded sources, so N chunks in one source shard amount
+        // to one HTTP GET.
+        if (!source_) return {};
+        std::vector<uint8_t> compressed;
+        try { compressed = source_->fetch(key); } catch (...) { return {}; }
+        if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
+            bloomAdd(key);
+            {
+                std::lock_guard lock(negativeMutex_);
+                negativeCache_.insert(key);
+            }
+            if (dz && dz->is_sharded()) {
+                dz->mark_inner_chunk_empty(chunkIndices(key));
+            }
+            return {};
+        }
+        statIceFetches_.fetch_add(1, std::memory_order_relaxed);
+        return {{key, std::move(compressed)}};
+    });
 
     ioPool_.setCompletionCallback(
-        [this, sharded](IOPool::FetchResult&& chunks) {
+        [this](IOPool::FetchResult&& chunks) {
             bool anyArrived = false;
             ChunkKey lastKey{};
             for (auto& [key, compressed] : chunks) {
-                if (compressed.empty()) {
-                    if (!sharded) {
-                        bloomAdd(key);
-                        std::lock_guard lock(negativeMutex_);
-                        negativeCache_.insert(key);
-                    }
-                    continue;
-                }
-                if (!decompress_) continue;
-                auto data = decompress_(compressed, key);
+                if (compressed.empty()) continue;
+
+                auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
+
+                // Bytes came from either the canonical disk tier (h265) or
+                // the remote source (arbitrary source codec). Try canonical
+                // h265 first; fall back to the source decompressor.
+                ChunkDataPtr data = decodeCanonicalH265(compressed);
+                bool fromDisk = (data != nullptr);
+                if (!data && decompress_) data = decompress_(compressed, key);
                 if (!data) continue;
 
                 insertChunkAsBlocks(key, *data, key.level == residentLevel_);
                 anyArrived = true;
                 lastKey = key;
 
-                // Non-sharded: recompress to h265 and write to disk shard
-                if (!sharded) {
-                    auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
-                    if (dz) {
-                        auto cs = source_->chunkShape(key.level);
-                        utils::VideoCodecParams vp;
-                        vp.depth = cs[0]; vp.height = cs[1]; vp.width = cs[2];
-                        vp.qp = 0;
-                        auto h265 = utils::video_encode(
-                            {reinterpret_cast<const std::byte*>(data->rawData()),
-                             data->totalBytes()}, vp);
+                // Transcode to canonical disk when the bytes are source-codec
+                // (just pulled from remote) and the canonical copy isn't
+                // already there. Requires source chunk shape == canonical 128^3.
+                // Other shapes need voxel-level rechunking (future work).
+                if (!fromDisk && dz) {
+                    auto cs = source_->chunkShape(key.level);
+                    if (cs[0] == 128 && cs[1] == 128 && cs[2] == 128) {
+                        auto h265 = encodeCanonicalH265(*data);
                         zarrWriteChunk(*dz, key,
                             reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
                         statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
