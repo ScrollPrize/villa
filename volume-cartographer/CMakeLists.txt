@@ -44,7 +44,6 @@ add_subdirectory(misc)
 add_subdirectory(libs/OpenABF)
 
 add_subdirectory(utils)
-add_subdirectory(libvc)
 add_subdirectory(core)
 add_subdirectory(apps)
 

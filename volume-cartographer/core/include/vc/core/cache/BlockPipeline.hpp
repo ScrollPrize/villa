@@ -34,7 +34,6 @@ public:
         size_t blockCacheBytes = 10ULL << 30;  // 10 GiB
         std::string volumeId;
         int ioThreads = 8;
-        size_t ioQueueSize = 10000000;
     };
 
     BlockPipeline(
