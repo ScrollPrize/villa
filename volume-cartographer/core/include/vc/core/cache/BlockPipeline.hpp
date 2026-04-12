@@ -131,9 +131,14 @@ private:
     BlockCache blockCache_;
     int residentLevel_ = -1;
 
-    // Blocking chunk fetch (cold → ice) used internally to populate blocks.
-    // Returns raw decoded bytes packed as the chunk's native shape.
+    // Blocking chunk fetch (canonical disk → source, with rechunking if the
+    // source granularity differs). Returns a decoded ChunkData.
     [[nodiscard]] ChunkDataPtr fetchChunkBlocking(const ChunkKey& key);
+
+    // Assemble a canonical 128^3 chunk from one or more source chunks at
+    // `canonKey.level`, rechunking as needed. Null if the canonical region
+    // is entirely absent from the source.
+    [[nodiscard]] ChunkDataPtr assembleCanonicalChunk(const ChunkKey& canonKey);
 
     // Split a decoded chunk into 16^3 blocks and insert into blockCache_.
     void insertChunkAsBlocks(const ChunkKey& key, const ChunkData& chunk, bool resident);

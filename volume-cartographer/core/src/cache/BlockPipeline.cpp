@@ -116,25 +116,46 @@ BlockPipeline::BlockPipeline(
             }
         }
 
-        // Fetch from the source. HttpSource internally caches the enclosing
-        // shard for sharded sources, so N chunks in one source shard amount
-        // to one HTTP GET.
         if (!source_) return {};
-        std::vector<uint8_t> compressed;
-        try { compressed = source_->fetch(key); } catch (...) { return {}; }
-        if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
+
+        // Local source (no disk tier): pass source bytes through; the
+        // completion callback decompresses with the source codec.
+        if (!dz) {
+            std::vector<uint8_t> compressed;
+            try { compressed = source_->fetch(key); } catch (...) { return {}; }
+            if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
+                bloomAdd(key);
+                std::lock_guard lock(negativeMutex_);
+                negativeCache_.insert(key);
+                return {};
+            }
+            statIceFetches_.fetch_add(1, std::memory_order_relaxed);
+            return {{key, std::move(compressed)}};
+        }
+
+        // Remote source with canonical disk tier. Assemble the canonical 128^3
+        // chunk (rechunking if source granularity differs), h265-encode, write
+        // to canonical disk, return canonical h265 bytes.
+        auto data = assembleCanonicalChunk(key);
+        if (!data) {
             bloomAdd(key);
             {
                 std::lock_guard lock(negativeMutex_);
                 negativeCache_.insert(key);
             }
-            if (dz && dz->is_sharded()) {
-                dz->mark_inner_chunk_empty(chunkIndices(key));
-            }
+            if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
             return {};
         }
         statIceFetches_.fetch_add(1, std::memory_order_relaxed);
-        return {{key, std::move(compressed)}};
+
+        auto h265 = encodeCanonicalH265(*data);
+        zarrWriteChunk(*dz, key,
+            reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
+        statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
+
+        std::vector<uint8_t> out(h265.size());
+        std::memcpy(out.data(), h265.data(), h265.size());
+        return {{key, std::move(out)}};
     });
 
     ioPool_.setCompletionCallback(
@@ -144,33 +165,17 @@ BlockPipeline::BlockPipeline(
             for (auto& [key, compressed] : chunks) {
                 if (compressed.empty()) continue;
 
-                auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
-
-                // Bytes came from either the canonical disk tier (h265) or
-                // the remote source (arbitrary source codec). Try canonical
-                // h265 first; fall back to the source decompressor.
+                // For volumes with a canonical disk tier, the fetch func always
+                // returns canonical h265 (either read from disk or freshly
+                // transcoded). For local-source volumes there is no disk tier
+                // and bytes are raw source-codec.
                 ChunkDataPtr data = decodeCanonicalH265(compressed);
-                bool fromDisk = (data != nullptr);
                 if (!data && decompress_) data = decompress_(compressed, key);
                 if (!data) continue;
 
                 insertChunkAsBlocks(key, *data, key.level == residentLevel_);
                 anyArrived = true;
                 lastKey = key;
-
-                // Transcode to canonical disk when the bytes are source-codec
-                // (just pulled from remote) and the canonical copy isn't
-                // already there. Requires source chunk shape == canonical 128^3.
-                // Other shapes need voxel-level rechunking (future work).
-                if (!fromDisk && dz) {
-                    auto cs = source_->chunkShape(key.level);
-                    if (cs[0] == 128 && cs[1] == 128 && cs[2] == 128) {
-                        auto h265 = encodeCanonicalH265(*data);
-                        zarrWriteChunk(*dz, key,
-                            reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
-                        statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
             }
 
             if (anyArrived && !chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
@@ -234,22 +239,77 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
     return b;
 }
 
+// Rechunk source chunks into a canonical 128^3 chunk. Returns a decoded
+// ChunkData for the canonical chunk, or null if the canonical region is
+// entirely absent from the source.
+ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
+    if (!source_ || !decompress_) return nullptr;
+    constexpr int C = 128;
+    auto scs = source_->chunkShape(canonKey.level);
+    if (scs[0] <= 0 || scs[1] <= 0 || scs[2] <= 0) return nullptr;
+
+    int cz0 = canonKey.iz * C, cy0 = canonKey.iy * C, cx0 = canonKey.ix * C;
+    int cz1 = cz0 + C,         cy1 = cy0 + C,         cx1 = cx0 + C;
+    int sz0 = cz0 / scs[0], sz1 = (cz1 + scs[0] - 1) / scs[0];
+    int sy0 = cy0 / scs[1], sy1 = (cy1 + scs[1] - 1) / scs[1];
+    int sx0 = cx0 / scs[2], sx1 = (cx1 + scs[2] - 1) / scs[2];
+
+    auto out = std::make_shared<ChunkData>();
+    out->shape = {C, C, C};
+    out->elementSize = 1;
+    out->bytes.assign(size_t(C) * C * C, 0);
+    bool anyData = false;
+
+    for (int siz = sz0; siz < sz1; ++siz)
+    for (int siy = sy0; siy < sy1; ++siy)
+    for (int six = sx0; six < sx1; ++six) {
+        ChunkKey srcKey{canonKey.level, siz, siy, six};
+        std::vector<uint8_t> compressed;
+        try { compressed = source_->fetch(srcKey); } catch (...) { continue; }
+        if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) continue;
+        auto data = decompress_(compressed, srcKey);
+        if (!data) continue;
+        anyData = true;
+
+        int svz = siz * scs[0], svy = siy * scs[1], svx = six * scs[2];
+        int oz0 = std::max(svz,          cz0), oz1 = std::min(svz + scs[0], cz1);
+        int oy0 = std::max(svy,          cy0), oy1 = std::min(svy + scs[1], cy1);
+        int ox0 = std::max(svx,          cx0), ox1 = std::min(svx + scs[2], cx1);
+        if (oz1 <= oz0 || oy1 <= oy0 || ox1 <= ox0) continue;
+
+        const uint8_t* src = data->rawData();
+        int srcStrideZ = data->strideZ(), srcStrideY = data->strideY();
+        int runLen = ox1 - ox0;
+        uint8_t* dst = out->rawData();
+
+        for (int z = oz0; z < oz1; ++z)
+        for (int y = oy0; y < oy1; ++y) {
+            int srcLz = z - svz, srcLy = y - svy, srcLx0 = ox0 - svx;
+            int canLz = z - cz0, canLy = y - cy0, canLx0 = ox0 - cx0;
+            const uint8_t* s = src + size_t(srcLz) * srcStrideZ
+                                   + size_t(srcLy) * srcStrideY + srcLx0;
+            uint8_t*       d = dst + size_t(canLz) * C * C
+                                   + size_t(canLy) * C + canLx0;
+            std::memcpy(d, s, runLen);
+        }
+    }
+
+    if (!anyData) return nullptr;
+    return out;
+}
+
 ChunkDataPtr BlockPipeline::fetchChunkBlocking(const ChunkKey& key) {
     if (isNegativeCached(key)) return nullptr;
 
-    // Try cold first.
     auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
-    if (dz && decompress_) {
-        // If the shard index already flags this inner chunk as empty/missing,
-        // negative-cache and short-circuit.
-        if (dz->is_sharded()) {
-            auto idx = chunkIndices(key);
-            if (!dz->inner_chunk_exists(idx)) {
-                bloomAdd(key);
-                std::lock_guard lock(negativeMutex_);
-                negativeCache_.insert(key);
-                return nullptr;
-            }
+
+    // Canonical disk tier first.
+    if (dz) {
+        if (dz->is_sharded() && !dz->inner_chunk_exists(chunkIndices(key))) {
+            bloomAdd(key);
+            std::lock_guard lock(negativeMutex_);
+            negativeCache_.insert(key);
+            return nullptr;
         }
         auto raw = zarrReadChunk(*dz, key);
         if (raw && !raw->empty()) {
@@ -257,30 +317,44 @@ ChunkDataPtr BlockPipeline::fetchChunkBlocking(const ChunkKey& key) {
             std::vector<uint8_t> compressed(
                 reinterpret_cast<const uint8_t*>(raw->data()),
                 reinterpret_cast<const uint8_t*>(raw->data() + raw->size()));
-            auto data = decompress_(compressed, key);
+            auto data = decodeCanonicalH265(compressed);
             if (data) return data;
         }
     }
 
-    // Ice.
-    if (!source_) return nullptr;
-    std::vector<uint8_t> compressed;
-    try { compressed = source_->fetch(key); } catch (...) { return nullptr; }
-    if (compressed.empty()) {
+    // No canonical disk tier (local source): fetch source chunk directly.
+    if (!dz) {
+        if (!source_ || !decompress_) return nullptr;
+        std::vector<uint8_t> compressed;
+        try { compressed = source_->fetch(key); } catch (...) { return nullptr; }
+        if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
+            bloomAdd(key);
+            std::lock_guard lock(negativeMutex_);
+            negativeCache_.insert(key);
+            return nullptr;
+        }
+        statIceFetches_.fetch_add(1, std::memory_order_relaxed);
+        return decompress_(compressed, key);
+    }
+
+    // Canonical disk tier: rechunk from source and persist as h265.
+    auto data = assembleCanonicalChunk(key);
+    if (!data) {
         bloomAdd(key);
-        std::lock_guard lock(negativeMutex_);
-        negativeCache_.insert(key);
+        {
+            std::lock_guard lock(negativeMutex_);
+            negativeCache_.insert(key);
+        }
+        if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
         return nullptr;
     }
     statIceFetches_.fetch_add(1, std::memory_order_relaxed);
 
-    if (dz) {
-        zarrWriteChunk(*dz, key, compressed.data(), compressed.size());
-        statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    if (!decompress_) return nullptr;
-    return decompress_(compressed, key);
+    auto h265 = encodeCanonicalH265(*data);
+    zarrWriteChunk(*dz, key,
+        reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
+    statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
+    return data;
 }
 
 BlockPtr BlockPipeline::getBlockingBlock(const BlockKey& key) {
@@ -289,7 +363,10 @@ BlockPtr BlockPipeline::getBlockingBlock(const BlockKey& key) {
         return b;
     }
 
-    auto cs = chunkShape(key.level);
+    // Canonical disk tier implies canonical 128^3 chunks; else use source.
+    auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
+    std::array<int, 3> cs = dz ? std::array<int, 3>{128, 128, 128}
+                               : chunkShape(key.level);
     if (cs[0] <= 0 || cs[1] <= 0 || cs[2] <= 0) return nullptr;
     int bpcZ = cs[0] / kBlockSize;
     int bpcY = cs[1] / kBlockSize;
