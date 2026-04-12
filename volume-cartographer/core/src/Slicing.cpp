@@ -293,6 +293,10 @@ void prefetchRegion(BlockPipeline& cache, int level,
     if (!keys.empty()) cache.fetchInteractive(keys);
 }
 
+// prefetchCoordsRegion / prefetchPlaneRegion: inputs are already in
+// LEVEL-space voxels (callers either pass already-scaled args or operate
+// at a single level). For the world-space → multi-level adaptive path,
+// see samplePixelsAdaptiveARGB32 which scales per-level before prefetching.
 void prefetchCoordsRegion(BlockPipeline& cache, int level,
                           const cv::Mat_<cv::Vec3f>& coords) {
     float minVx = FLT_MAX, minVy = FLT_MAX, minVz = FLT_MAX;
@@ -561,14 +565,35 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
                                 const cv::Vec3f* origin, const cv::Vec3f* vx_step, const cv::Vec3f* vy_step,
                                 int w, int h, const uint32_t lut[256])
 {
-    // Pre-start fetches for all levels. Coarsest should already be resident;
-    // finer levels will stream in.
+    // Pre-start fetches for all levels. Coords/origin are in world (level-0)
+    // voxel space; scale to each level before enumerating chunks.
+    auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
     if (coords) {
-        for (int lvl = desiredLevel; lvl < numLevels; lvl++)
-            prefetchCoordsRegion(cache, lvl, *coords);
+        for (int lvl = desiredLevel; lvl < numLevels; lvl++) {
+            float s = levelScale(lvl);
+            float minVx = FLT_MAX, minVy = FLT_MAX, minVz = FLT_MAX;
+            float maxVx = -FLT_MAX, maxVy = -FLT_MAX, maxVz = -FLT_MAX;
+            for (int r = 0; r < coords->rows; r++) {
+                const cv::Vec3f* row = coords->ptr<cv::Vec3f>(r);
+                for (int c = 0; c < coords->cols; c++) {
+                    const auto& v = row[c];
+                    if (!isfinite_bitwise(v[0])) continue;
+                    minVx = std::min(minVx, v[0]); maxVx = std::max(maxVx, v[0]);
+                    minVy = std::min(minVy, v[1]); maxVy = std::max(maxVy, v[1]);
+                    minVz = std::min(minVz, v[2]); maxVz = std::max(maxVz, v[2]);
+                }
+            }
+            if (maxVx < minVx) continue;
+            prefetchRegion(cache, lvl,
+                           minVx * s, minVy * s, minVz * s,
+                           maxVx * s, maxVy * s, maxVz * s);
+        }
     } else {
-        for (int lvl = desiredLevel; lvl < numLevels; lvl++)
-            prefetchPlaneRegion(cache, lvl, *origin, *vx_step, *vy_step, w, h);
+        for (int lvl = desiredLevel; lvl < numLevels; lvl++) {
+            float s = levelScale(lvl);
+            prefetchPlaneRegion(cache, lvl,
+                (*origin) * s, (*vx_step) * s, (*vy_step) * s, w, h);
+        }
     }
 
     #pragma omp parallel
