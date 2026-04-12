@@ -107,6 +107,10 @@ else()
     set(VC_THINLTO_CACHE_FLAGS "-Wl,--thinlto-cache-dir=${VC_THINLTO_CACHE_DIR} -Wl,--thinlto-cache-policy=cache_size_bytes=1g")
     set(VC_STRIP_FLAGS "-Wl,--strip-all")
 endif()
+option(VC_STRIP_BINARIES "Strip release binaries (disable for profiling)" ON)
+if(NOT VC_STRIP_BINARIES)
+    set(VC_STRIP_FLAGS "")
+endif()
 
 add_compile_options(
     -Weverything
