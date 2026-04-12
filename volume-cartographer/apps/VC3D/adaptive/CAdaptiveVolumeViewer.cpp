@@ -323,8 +323,27 @@ void CAdaptiveVolumeViewer::submitRender()
     auto* fbBits = reinterpret_cast<uint32_t*>(_framebuffer.bits());
     int fbStride = _framebuffer.bytesPerLine() / 4;
 
+    // Build the render LUT. For stretch mode we do a 2-pass render: pass 1
+    // uses an identity-gray LUT so we can scan min/max from the framebuffer
+    // after sampling, then re-blit through the final (stretched + colormap
+    // + iso-cutoff) LUT.
+    const bool stretch = _compositeSettings.postStretchValues;
+    const uint8_t isoCutoff = _compositeSettings.params.isoCutoff;
     std::array<uint32_t, 256> lut;
-    vc::buildWindowLevelColormapLut(lut, _windowLow, _windowHigh, _baseColormapId);
+    auto applyIsoCutoff = [&](std::array<uint32_t, 256>& l) {
+        if (isoCutoff == 0) return;
+        const uint32_t zero = l[0];
+        for (int i = 0; i < isoCutoff; i++) l[i] = zero;
+    };
+    if (stretch) {
+        for (int i = 0; i < 256; i++) {
+            uint32_t v = uint32_t(i);
+            lut[i] = 0xFF000000u | (v << 16) | (v << 8) | v;
+        }
+    } else {
+        vc::buildWindowLevelColormapLut(lut, _windowLow, _windowHigh, _baseColormapId);
+        applyIsoCutoff(lut);
+    }
 
     vc::SampleParams sp;
     const int numLevels = static_cast<int>(_volume->numScales());
@@ -410,6 +429,35 @@ void CAdaptiveVolumeViewer::submitRender()
                 pNormals, nullptr,
                 numLayers, zStart, zStep,
                 fbW, fbH, method, lut.data(), sampleMethod);
+        }
+    }
+
+    // Stretch post-pass: scan the identity-blitted framebuffer for min/max
+    // gray, rebuild the LUT with that range as window, re-apply.
+    if (stretch) {
+        int lo = 255, hi = 0;
+        for (int y = 0; y < fbH; y++) {
+            const uint32_t* row = fbBits + size_t(y) * size_t(fbStride);
+            for (int x = 0; x < fbW; x++) {
+                int v = int(row[x] & 0xFFu);
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+        }
+        std::array<uint32_t, 256> stretchedLut;
+        if (hi > lo) {
+            vc::buildWindowLevelColormapLut(stretchedLut,
+                float(lo), float(hi), _baseColormapId);
+        } else {
+            vc::buildWindowLevelColormapLut(stretchedLut,
+                _windowLow, _windowHigh, _baseColormapId);
+        }
+        applyIsoCutoff(stretchedLut);
+        for (int y = 0; y < fbH; y++) {
+            uint32_t* row = fbBits + size_t(y) * size_t(fbStride);
+            for (int x = 0; x < fbW; x++) {
+                row[x] = stretchedLut[row[x] & 0xFFu];
+            }
         }
     }
 
