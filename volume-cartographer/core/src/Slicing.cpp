@@ -300,16 +300,19 @@ void prefetchRegion(BlockPipeline& cache, int level,
 // see samplePixelsAdaptiveARGB32 which scales per-level before prefetching.
 void prefetchCoordsRegion(BlockPipeline& cache, int level,
                           const cv::Mat_<cv::Vec3f>& coords) {
+    // Unconditional min/max reductions so the vectorizer can fold the
+    // inner loop: invalid points are sentinels (usually NaN), and
+    // fminnm/fmaxnm on NEON treat NaN as "not a number, propagate the
+    // other operand" — same end result as a skip but no branch.
     float minVx = FLT_MAX, minVy = FLT_MAX, minVz = FLT_MAX;
     float maxVx = -FLT_MAX, maxVy = -FLT_MAX, maxVz = -FLT_MAX;
     for (int r = 0; r < coords.rows; r++) {
         const cv::Vec3f* row = coords.ptr<cv::Vec3f>(r);
         for (int c = 0; c < coords.cols; c++) {
             const auto& v = row[c];
-            if (!isfinite_bitwise(v[0])) continue;
-            minVx = std::min(minVx, v[0]); maxVx = std::max(maxVx, v[0]);
-            minVy = std::min(minVy, v[1]); maxVy = std::max(maxVy, v[1]);
-            minVz = std::min(minVz, v[2]); maxVz = std::max(maxVz, v[2]);
+            minVx = std::fmin(minVx, v[0]); maxVx = std::fmax(maxVx, v[0]);
+            minVy = std::fmin(minVy, v[1]); maxVy = std::fmax(maxVy, v[1]);
+            minVz = std::fmin(minVz, v[2]); maxVz = std::fmax(maxVz, v[2]);
         }
     }
     if (maxVx >= minVx)
