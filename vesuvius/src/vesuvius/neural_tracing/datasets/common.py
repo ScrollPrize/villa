@@ -4,6 +4,8 @@ import fsspec
 import json
 import os
 import threading
+import asyncio
+import time
 from numba import njit
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +33,42 @@ class OfflineCacheMiss(Exception):
     cached already, without issuing any network requests."""
 
 
+# Exceptions that are NEVER retried — they won't resolve by waiting.
+# OfflineCacheMiss must be here because it's our own marker and would
+# otherwise be caught by the broad OSError check.
+_NEVER_RETRY_EXCEPTIONS: tuple = (
+    OfflineCacheMiss,
+    PermissionError,        # OSError subclass; permanent denial
+    IsADirectoryError,      # OSError subclass; structural problem
+    NotADirectoryError,     # OSError subclass; structural problem
+)
+
+# Exceptions that ARE retried with backoff. OSError covers ConnectionError,
+# TimeoutError, asyncio.TimeoutError (Python 3.11+), aiohttp.ClientConnectionError
+# (which inherits OSError), most fsspec wrapped errors, etc. Anything in
+# _NEVER_RETRY_EXCEPTIONS is excluded earlier in the except chain.
+#
+# Note: zarr's FsspecStore.get already converts FileNotFoundError/KeyError
+# (the genuine "missing chunk" cases) into a None return via its
+# allowed_exceptions filter, so they never reach this retry layer.
+_RETRYABLE_EXCEPTIONS: tuple = (OSError,)
+
+# Add botocore exceptions when available so S3 endpoint/credential failures
+# get retried too. botocore.BotoCoreError is the base for connection/timeout
+# errors; ClientError covers HTTP 4xx/5xx returned by the service. We retry
+# both — permanent ClientErrors (NoSuchKey, AccessDenied) will burn the budget
+# and then propagate.
+try:
+    import botocore.exceptions as _botocore_exceptions
+    _RETRYABLE_EXCEPTIONS = _RETRYABLE_EXCEPTIONS + (
+        _botocore_exceptions.BotoCoreError,
+        _botocore_exceptions.ClientError,
+    )
+    del _botocore_exceptions
+except ImportError:
+    pass
+
+
 class _DiskCacheStore(zarr.abc.store.Store):
     """Zarr 3 store wrapper that caches remote chunks to local disk.
 
@@ -40,10 +78,11 @@ class _DiskCacheStore(zarr.abc.store.Store):
     """
 
     def __init__(self, remote: zarr.abc.store.Store, cache_dir: str, url: str,
-                 offline: bool = False) -> None:
+                 offline: bool = False, retry_budget_seconds: float = 600.0) -> None:
         super().__init__(read_only=True)
         self._remote = remote
         self._offline = offline
+        self._retry_budget_seconds = float(retry_budget_seconds)
         # Namespace cache by the normalized remote URL to prevent cross-dataset
         # chunk-key collisions. Zarr chunk keys are relative paths inside one
         # store (e.g. "c/0/1/2"), so without a per-URL prefix every dataset
@@ -60,6 +99,47 @@ class _DiskCacheStore(zarr.abc.store.Store):
     # Zarr chunk keys don't contain this pattern, so there's no collision
     # with a real cached chunk filename.
     _NEGATIVE_MARKER_SUFFIX = ".__notfound__"
+
+    async def _remote_get_with_retry(self, key, prototype, byte_range):
+        """Call the wrapped remote store's get() with exponential-backoff retry.
+
+        Retries on transient failures (connection/timeout/network errors,
+        botocore endpoint/throttling) up to `_retry_budget_seconds` of total
+        wall-clock wait. Permanent failures (PermissionError, our own
+        OfflineCacheMiss, etc.) propagate immediately. After the budget is
+        exhausted, the last exception is re-raised so callers crash with a
+        meaningful traceback rather than silently dropping data.
+        """
+        deadline = time.monotonic() + self._retry_budget_seconds
+        delay = 1.0
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self._remote.get(key, prototype, byte_range=byte_range)
+            except _NEVER_RETRY_EXCEPTIONS:
+                raise
+            except _RETRYABLE_EXCEPTIONS as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    print(
+                        f"[_DiskCacheStore] giving up on {key!r} after "
+                        f"{attempt} attempts, "
+                        f"{self._retry_budget_seconds:.0f}s budget exhausted: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    raise
+                wait = min(delay, remaining, 60.0)
+                print(
+                    f"[_DiskCacheStore] transient error fetching {key!r} "
+                    f"(attempt {attempt}): {type(exc).__name__}: {exc}; "
+                    f"retrying in {wait:.1f}s "
+                    f"(remaining budget {remaining:.0f}s)",
+                    flush=True,
+                )
+                await asyncio.sleep(wait)
+                delay = min(delay * 2.0, 60.0)
 
     def _atomic_write_bytes(self, target: str, data: bytes) -> None:
         """Write `data` to `target` atomically.
@@ -104,7 +184,7 @@ class _DiskCacheStore(zarr.abc.store.Store):
                 f"({self._cache_dir})"
             )
 
-        result = await self._remote.get(key, prototype, byte_range=byte_range)
+        result = await self._remote_get_with_retry(key, prototype, byte_range)
 
         # Only cache whole-chunk reads; byte-range reads aren't cacheable.
         if byte_range is None:
@@ -263,6 +343,7 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
             )
         cache_dir = str(_resolve_config_relative_path(cache_dir, config) or cache_dir)
         offline = bool(config.get('volume_cache_offline', False))
+        retry_budget = float(config.get('volume_cache_retry_seconds', 600.0))
 
     if is_http:
         storage_opts = {}
@@ -283,7 +364,10 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
             read_only=True,
             allowed_exceptions=store_exceptions,
         )
-        store = _DiskCacheStore(remote, cache_dir, url=path, offline=offline)
+        store = _DiskCacheStore(
+            remote, cache_dir, url=path,
+            offline=offline, retry_budget_seconds=retry_budget,
+        )
         return zarr.open(store, path=str(scale), mode='r')
 
     if is_s3:
@@ -292,7 +376,10 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
             storage_options={'anon': False},
             read_only=True,
         )
-        store = _DiskCacheStore(remote, cache_dir, url=path, offline=offline)
+        store = _DiskCacheStore(
+            remote, cache_dir, url=path,
+            offline=offline, retry_budget_seconds=retry_budget,
+        )
         return zarr.open(store, path=str(scale), mode='r')
 
     # Local path — no caching needed.
