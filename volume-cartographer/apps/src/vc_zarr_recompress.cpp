@@ -486,7 +486,8 @@ static void write_zero_sentinel(std::byte* dst) {
 // no separate-level mask scan — one round-trip per 10K chunks.
 static std::vector<bool> build_occupancy_from_listing(
     IOBackend& io, int level,
-    const std::vector<size_t>& shape, const std::vector<size_t>& chunks)
+    const std::vector<size_t>& shape, const std::vector<size_t>& chunks,
+    int parallelism = 32)
 {
     if (shape.size() < 3) return {};
     size_t nz = (shape[0] + chunks[0] - 1) / chunks[0];
@@ -494,34 +495,58 @@ static std::vector<bool> build_occupancy_from_listing(
     size_t nx = (shape[2] + chunks[2] - 1) / chunks[2];
     std::vector<bool> mask(nz * ny * nx, false);
 
-    std::string prefix = std::to_string(level) + "/";
-    auto keys = io.list_chunks(prefix);
-    size_t parsed = 0;
-    for (const auto& k : keys) {
-        // Expect "<level>/<cz>/<cy>/<cx>".  Find the three trailing ints.
-        size_t e = k.size();
-        auto find_prev_slash = [&](size_t end) -> size_t {
-            for (size_t i = end; i > 0; --i) if (k[i - 1] == '/') return i - 1;
-            return std::string::npos;
-        };
-        size_t s3 = find_prev_slash(e);
-        if (s3 == std::string::npos) continue;
-        size_t s2 = find_prev_slash(s3);
-        if (s2 == std::string::npos) continue;
-        size_t s1 = find_prev_slash(s2);
-        if (s1 == std::string::npos) continue;
-        try {
-            size_t cz = std::stoul(k.substr(s1 + 1, s2 - s1 - 1));
-            size_t cy = std::stoul(k.substr(s2 + 1, s3 - s2 - 1));
-            size_t cx = std::stoul(k.substr(s3 + 1));
-            if (cz < nz && cy < ny && cx < nx) {
-                mask[cz * ny * nx + cy * nx + cx] = true;
-                ++parsed;
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Fan out one paginated LIST per cz prefix (e.g. "0/123/").  Each LIST
+    // returns up to ~ny*nx keys (16K for L0 cy×cx = 256×256 = 65K worst case
+    // → ~7 pages).  With `parallelism` workers in flight we hide RTT.
+    std::atomic<size_t> next_cz{0};
+    std::atomic<size_t> parsed{0};
+    std::mutex mask_mtx;
+
+    auto worker = [&]() {
+        for (;;) {
+            size_t cz = next_cz.fetch_add(1);
+            if (cz >= nz) break;
+            std::string prefix = std::to_string(level) + "/" + std::to_string(cz) + "/";
+            std::vector<std::string> keys;
+            try {
+                keys = io.list_chunks(prefix);
+            } catch (...) {
+                continue;
             }
-        } catch (...) { /* skip non-chunk keys */ }
-    }
-    printf("  Occupancy from LIST: %zu / %zu chunks present (%.1f%% sparse)\n",
-           parsed, mask.size(), 100.0 * (1.0 - (double)parsed / mask.size()));
+            std::vector<std::pair<size_t,size_t>> local;  // (cy, cx)
+            local.reserve(keys.size());
+            for (const auto& k : keys) {
+                size_t s3 = k.rfind('/');
+                if (s3 == std::string::npos) continue;
+                size_t s2 = k.rfind('/', s3 - 1);
+                if (s2 == std::string::npos) continue;
+                try {
+                    size_t cy = std::stoul(k.substr(s2 + 1, s3 - s2 - 1));
+                    size_t cx = std::stoul(k.substr(s3 + 1));
+                    if (cy < ny && cx < nx) local.emplace_back(cy, cx);
+                } catch (...) {}
+            }
+            if (!local.empty()) {
+                std::lock_guard lk(mask_mtx);
+                for (auto [cy, cx] : local) {
+                    mask[cz * ny * nx + cy * nx + cx] = true;
+                }
+                parsed.fetch_add(local.size());
+            }
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(parallelism);
+    for (int i = 0; i < parallelism; ++i) workers.emplace_back(worker);
+    for (auto& t : workers) t.join();
+
+    auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    size_t p = parsed.load();
+    printf("  Occupancy LIST: %zu / %zu chunks present (%.1f%% sparse) in %.1fs\n",
+           p, mask.size(), 100.0 * (1.0 - (double)p / mask.size()), dt);
     return mask;
 }
 
@@ -801,10 +826,13 @@ int main(int argc, char** argv) {
         size_t shard_nx = (shape[2] + SHARD_DIM - 1) / SHARD_DIM;
         size_t total_shards = shard_nz * shard_ny * shard_nx;
 
-        // No global occupancy mask needed: each shard worker LISTs its own
-        // cz-plane prefixes (already parallel across workers and S3
-        // continuation-aware).  Empty shards naturally produce zero output.
-        std::vector<bool> occ_mask;
+        // Build a global per-chunk occupancy bitmap up front via parallel
+        // per-cz LISTs.  Workers will look up bits instead of doing 8 LISTs
+        // per shard.  For L0 this is ~593 LISTs (32 in flight) ≈ 10-30 sec
+        // upfront cost vs 76800 × 8 LISTs spread across the run.
+        std::vector<size_t> chunk128 = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
+        std::vector<bool> occ_mask =
+            build_occupancy_from_listing(*input, l, shape, chunk128, 64);
 
         printf("  Source: chunks [%zu,%zu,%zu], compressor: %s, sep: '%s', dtype: %s\n",
                src_chunks[0], src_chunks[1], src_chunks[2],
@@ -1235,12 +1263,11 @@ int main(int argc, char** argv) {
             size_t base_cy = sy * CHUNKS_PER_SHARD;
             size_t base_cx = sx * CHUNKS_PER_SHARD;
 
-            // LIST input chunks for this shard's cz planes — fan out the
-            // 8 per-cz LISTs in parallel via std::async so RTT stacks don't
-            // serialize.  Each LIST is one S3 round-trip (~50 ms); 8 in
-            // parallel turns 400 ms of wall time into ~50 ms.
+            // Per-shard LIST removed: occ_mask was built up front with one
+            // parallel LIST per cz prefix.  Workers consult occ_mask
+            // directly, so existing_input is no longer needed.
             std::unordered_set<std::string> existing_input;
-            {
+            if (false) {
                 std::vector<std::future<std::vector<std::string>>> list_futs;
                 list_futs.reserve(CHUNKS_PER_SHARD);
                 for (size_t iz = 0; iz < CHUNKS_PER_SHARD; iz++) {
