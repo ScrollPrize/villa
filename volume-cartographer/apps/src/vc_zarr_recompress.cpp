@@ -1220,8 +1220,11 @@ int main(int argc, char** argv) {
         // encode pool defaults to hardware_concurrency (we can saturate CPU
         // independently of how many downloads are in flight).
         const int n_dl = std::max(1, inner_jobs);
+        // 2x hardware_concurrency: x265's internal pool already adds parallelism
+        // so we don't need a 1:1 thread-to-core ratio. The extra encode threads
+        // hide x265 internal sync stalls and let CPU saturate.
         const int n_enc = std::max(1,
-            (int)std::thread::hardware_concurrency());
+            (int)std::thread::hardware_concurrency() * 2);
         std::vector<std::thread> dl_threads;
         dl_threads.reserve(n_dl);
         for (int i = 0; i < n_dl; i++) dl_threads.emplace_back(dl_fn);
