@@ -265,7 +265,10 @@ struct S3Backend : IOBackend {
 
             auto resp = client->get(list_url);
             if (!resp.ok()) {
-                throw std::runtime_error("S3 list failed: " + std::to_string(resp.status_code));
+                std::string body{reinterpret_cast<const char*>(resp.body.data()),
+                                 std::min<size_t>(resp.body.size(), 1024)};
+                throw std::runtime_error("S3 list failed: " + std::to_string(resp.status_code)
+                                         + " url=" + list_url + " body=" + body);
             }
 
             auto body = std::string(resp.body_string());
