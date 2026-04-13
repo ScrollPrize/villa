@@ -124,16 +124,14 @@ auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params
     xparam->bRepeatHeaders = 1;
     xparam->rc.rateControlMode = X265_RC_CQP;
     xparam->rc.qp = params.qp;
-    // Encode-level parallelism within a single chunk:
-    //   bEnableWavefront = 1: rows of CTUs in a frame encoded in parallel
-    //     (4 rows per 128x128 frame at maxCUSize=32 → up to 4-way intra-frame).
-    //   frameNumThreads = 2: two adjacent frames in flight at once
-    //     (capped low because bframes=2 limits useful frame parallelism).
-    // Together these let one chunk saturate ~6-8 cores during the long-tail
-    // phase when only a few dense shards remain.  Caller is responsible for
-    // not over-subscribing (combine with reduced --jobs / --inner-jobs).
+    // Encode-level parallelism within a single chunk.  We're fine with
+    // oversubscription — the OS scheduler handles it, and the gains during
+    // long-tail (1 dense shard remaining) outweigh any contention cost.
+    //   bEnableWavefront = 1: rows of CTUs in a frame in parallel
+    //     (4 rows per 128x128 frame at maxCUSize=32).
+    //   frameNumThreads = 4: 4 adjacent frames in flight at once.
     xparam->bEnableWavefront = 1;
-    xparam->frameNumThreads = 2;
+    xparam->frameNumThreads = 4;
     xparam->logLevel = X265_LOG_NONE;
 
     // Small frames (128x128 per Z slice): 32x32 CTUs match the content
