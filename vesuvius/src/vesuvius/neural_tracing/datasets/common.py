@@ -22,6 +22,15 @@ import warnings
 _HTTP_PREFIXES = ('http://', 'https://')
 
 
+class OfflineCacheMiss(Exception):
+    """Raised when a zarr chunk fetch is attempted in offline mode but the
+    chunk is not present in the local _DiskCacheStore cache (neither as data
+    nor as a negative marker).
+
+    Used by testing/dev flows that want to train on whatever happens to be
+    cached already, without issuing any network requests."""
+
+
 class _DiskCacheStore(zarr.abc.store.Store):
     """Zarr 3 store wrapper that caches remote chunks to local disk.
 
@@ -30,9 +39,11 @@ class _DiskCacheStore(zarr.abc.store.Store):
     filesystem to support async (which ``WholeFileCacheFileSystem`` does not).
     """
 
-    def __init__(self, remote: zarr.abc.store.Store, cache_dir: str, url: str) -> None:
+    def __init__(self, remote: zarr.abc.store.Store, cache_dir: str, url: str,
+                 offline: bool = False) -> None:
         super().__init__(read_only=True)
         self._remote = remote
+        self._offline = offline
         # Namespace cache by the normalized remote URL to prevent cross-dataset
         # chunk-key collisions. Zarr chunk keys are relative paths inside one
         # store (e.g. "c/0/1/2"), so without a per-URL prefix every dataset
@@ -87,6 +98,12 @@ class _DiskCacheStore(zarr.abc.store.Store):
             if os.path.isfile(marker):
                 return None
 
+        if self._offline:
+            raise OfflineCacheMiss(
+                f"offline mode: chunk {key!r} not in local cache "
+                f"({self._cache_dir})"
+            )
+
         result = await self._remote.get(key, prototype, byte_range=byte_range)
 
         # Only cache whole-chunk reads; byte-range reads aren't cacheable.
@@ -108,6 +125,11 @@ class _DiskCacheStore(zarr.abc.store.Store):
         return result
 
     async def get_partial_values(self, prototype, key_ranges):
+        if self._offline:
+            raise OfflineCacheMiss(
+                "offline mode: byte-range reads are not cached and would "
+                "require network access"
+            )
         return await self._remote.get_partial_values(prototype, key_ranges)
 
     async def exists(self, key):
@@ -115,6 +137,8 @@ class _DiskCacheStore(zarr.abc.store.Store):
         if os.path.isfile(cached):
             return True
         if os.path.isfile(cached + self._NEGATIVE_MARKER_SUFFIX):
+            return False
+        if self._offline:
             return False
         return await self._remote.exists(key)
 
@@ -238,6 +262,7 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
                 f'{{"volume_cache_dir": "/data/zarr_cache"}}'
             )
         cache_dir = str(_resolve_config_relative_path(cache_dir, config) or cache_dir)
+        offline = bool(config.get('volume_cache_offline', False))
 
     if is_http:
         storage_opts = {}
@@ -258,7 +283,7 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
             read_only=True,
             allowed_exceptions=store_exceptions,
         )
-        store = _DiskCacheStore(remote, cache_dir, url=path)
+        store = _DiskCacheStore(remote, cache_dir, url=path, offline=offline)
         return zarr.open(store, path=str(scale), mode='r')
 
     if is_s3:
@@ -267,7 +292,7 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
             storage_options={'anon': False},
             read_only=True,
         )
-        store = _DiskCacheStore(remote, cache_dir, url=path)
+        store = _DiskCacheStore(remote, cache_dir, url=path, offline=offline)
         return zarr.open(store, path=str(scale), mode='r')
 
     # Local path — no caching needed.

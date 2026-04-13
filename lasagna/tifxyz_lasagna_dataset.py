@@ -21,6 +21,7 @@ import vesuvius.tifxyz as tifxyz
 from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
 from vesuvius.neural_tracing.datasets.common import (
     ChunkPatch,
+    OfflineCacheMiss,
     open_zarr,
     _parse_z_range,
     _read_volume_crop_from_patch,
@@ -419,6 +420,45 @@ class TifxyzLasagnaDataset(Dataset):
         self.patches = _find_patches_world_chunks(config, self.patch_size_zyx)
 
         print(f"{TAG} loaded {len(self.patches)} patches")
+
+        # Optional offline-mode filter: keep only patches whose volume crops
+        # can be read entirely from the local zarr chunk cache. Used by tests
+        # and dev runs where we want to train against pre-cached data without
+        # any network access. open_zarr() has already configured the store in
+        # offline mode (volume_cache_offline=True), so any cache miss raises
+        # OfflineCacheMiss instead of fetching.
+        if bool(config.get("volume_cache_offline", False)):
+            self.patches = self._filter_to_cached_patches(self.patches)
+            print(f"{TAG} offline filter: {len(self.patches)} patches with full local cache")
+
+    def _filter_to_cached_patches(self, patches):
+        """Return only patches whose volume crops are fully in the local cache."""
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(patches, desc=f"{TAG} offline filter", dynamic_ncols=True)
+        except ImportError:
+            iterator = patches
+
+        crop_size = tuple(int(v) for v in self.patch_size_zyx)
+        crop_size_arr = np.array(crop_size, dtype=np.int64)
+        kept = []
+        dropped = 0
+        for patch in iterator:
+            z0, _, y0, _, x0, _ = patch.world_bbox
+            min_corner = np.array([z0, y0, x0], dtype=np.int64)
+            max_corner = min_corner + crop_size_arr
+            try:
+                _read_volume_crop_from_patch(
+                    patch, crop_size=crop_size,
+                    min_corner=min_corner, max_corner=max_corner,
+                )
+            except OfflineCacheMiss:
+                dropped += 1
+                continue
+            kept.append(patch)
+        if dropped:
+            print(f"{TAG} offline filter: dropped {dropped} patches missing chunks")
+        return kept
 
     def __len__(self):
         return len(self.patches)
