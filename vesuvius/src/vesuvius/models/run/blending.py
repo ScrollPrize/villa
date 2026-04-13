@@ -1029,16 +1029,15 @@ def blend_and_finalize_main():
     # Finalization args
     parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
                         help='Finalization mode. Default: binary')
-    from vesuvius.models.run.finalize_outputs import add_threshold_argument
-    add_threshold_argument(parser)
+    from vesuvius.models.run.finalize_outputs import add_threshold_arguments, resolve_threshold
+    add_threshold_arguments(parser)
 
     args = parser.parse_args()
 
     if args.part_id < 0 or args.part_id >= args.num_parts:
         parser.error(f"Invalid part_id {args.part_id} for num_parts {args.num_parts}.")
 
-    from vesuvius.models.run.finalize_outputs import validate_threshold_args
-    validate_threshold_args(parser, args)
+    effective_threshold = resolve_threshold(parser, args)
 
     chunks = None
     if args.chunk_size:
@@ -1050,7 +1049,7 @@ def blend_and_finalize_main():
             parser.error("Invalid chunk_size format. Expected 3 comma-separated integers (Z,Y,X).")
 
     from vesuvius.models.run.finalize_outputs import FinalizeConfig
-    finalize_config = FinalizeConfig(mode=args.mode, threshold=args.threshold)
+    finalize_config = FinalizeConfig(mode=args.mode, threshold=effective_threshold)
 
     try:
         merge_inference_outputs(

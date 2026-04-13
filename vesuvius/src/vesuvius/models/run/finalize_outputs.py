@@ -517,44 +517,35 @@ def finalize_logits(
 
 
 # --- Shared CLI helpers ---
-THRESHOLD_HELP = (
-    'Binarize the probability map. Bare flag cuts at 0.5; '
-    '--threshold 0.3 cuts at 0.3 (must be in (0, 1)). '
-    'In multiclass mode only the bare form is accepted '
-    '(emits the argmax channel).'
-)
+def add_threshold_arguments(parser):
+    """Register the shared `--threshold` / `--threshold-value` arguments on an argparse parser.
+
+    - `--threshold` toggles thresholding on (default cutoff = 0.5).
+    - `--threshold-value T` overrides the cutoff (must be in (0, 1)); requires --threshold.
+    """
+    parser.add_argument('--threshold', dest='threshold', action='store_true',
+                        help='Binarize the probability map (default cutoff 0.5). '
+                             'In multiclass mode this emits the argmax channel.')
+    parser.add_argument('--threshold-value', dest='threshold_value', type=float, default=None,
+                        help='Override the probability cutoff used by --threshold '
+                             '(float in (0, 1)). Binary mode only.')
 
 
-def add_threshold_argument(parser):
-    """Register the shared `--threshold` argument on an argparse parser."""
-    parser.add_argument('--threshold', dest='threshold', type=float, nargs='?',
-                        const=0.5, default=None, help=THRESHOLD_HELP)
+def resolve_threshold(parser, args):
+    """Validate --threshold / --threshold-value and return the effective Optional[float] cutoff.
 
-
-def _threshold_had_explicit_value():
-    """Return True iff `--threshold <value>` was passed on argv with an explicit numeric value
-    (as opposed to the bare `--threshold` form, which uses the argparse `const`).
-    Used to reject numeric thresholds in multiclass mode without false-flagging the bare form."""
-    import sys
-    argv = sys.argv[1:]
-    for i, arg in enumerate(argv):
-        if arg == '--threshold' and i + 1 < len(argv):
-            try:
-                float(argv[i + 1])
-                return True
-            except ValueError:
-                return False
-        if arg.startswith('--threshold='):
-            return True
-    return False
-
-
-def validate_threshold_args(parser, args):
-    """Shared validation for --threshold + --mode combinations. Calls parser.error on failure."""
-    if args.threshold is not None and not (0.0 < args.threshold < 1.0):
-        parser.error(f"--threshold must be in (0, 1), got {args.threshold}")
-    if args.mode == 'multiclass' and args.threshold is not None and _threshold_had_explicit_value():
-        parser.error("--threshold in multiclass mode only accepts the bare flag form (no numeric value)")
+    Returns None if thresholding is disabled, else a float in (0, 1) (0.5 if no override).
+    Calls parser.error on invalid combinations.
+    """
+    if args.threshold_value is not None and not args.threshold:
+        parser.error("--threshold-value requires --threshold")
+    if args.threshold_value is not None and not (0.0 < args.threshold_value < 1.0):
+        parser.error(f"--threshold-value must be in (0, 1), got {args.threshold_value}")
+    if args.mode == 'multiclass' and args.threshold_value is not None:
+        parser.error("--threshold-value is not applicable in multiclass mode (argmax ignores the cutoff)")
+    if not args.threshold:
+        return None
+    return args.threshold_value if args.threshold_value is not None else 0.5
 
 
 # --- Command Line Interface ---
@@ -567,7 +558,7 @@ def main():
                       help='Path for the finalized output Zarr store')
     parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
                       help='Processing mode. "binary" for 2-class segmentation, "multiclass" for >2 classes. Default: binary')
-    add_threshold_argument(parser)
+    add_threshold_arguments(parser)
     parser.add_argument('--delete-intermediates', dest='delete_intermediates', action='store_true',
                       help='Delete intermediate logits after processing')
     parser.add_argument('--chunk-size', dest='chunk_size', type=str, default=None,
@@ -587,7 +578,7 @@ def main():
     if args.part_id < 0 or args.part_id >= args.num_parts:
         parser.error(f"Invalid part_id {args.part_id} for num_parts {args.num_parts}. part_id must be 0 <= part_id < num_parts")
 
-    validate_threshold_args(parser, args)
+    effective_threshold = resolve_threshold(parser, args)
 
     chunks = None
     if args.chunk_size:
@@ -602,7 +593,7 @@ def main():
             input_path=args.input_path,
             output_path=args.output_path,
             mode=args.mode,
-            threshold=args.threshold,
+            threshold=effective_threshold,
             delete_intermediates=args.delete_intermediates,
             chunk_size=chunks,
             num_workers=args.num_workers,
