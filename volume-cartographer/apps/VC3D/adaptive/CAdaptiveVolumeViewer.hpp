@@ -321,6 +321,19 @@ private:
     std::unordered_map<std::string, size_t> _surfaceColorAssignments;
     size_t _nextColorIndex = 0;
 
+    // Intersection cache fingerprint: skip the whole rebuild if nothing changed.
+    struct IntersectFingerprint {
+        int roiX = 0, roiY = 0, roiW = 0, roiH = 0;
+        float opacity = -1.0f;
+        float thickness = -1.0f;
+        size_t patchCount = 0;
+        size_t surfaceCount = 0;
+        size_t targetHash = 0;
+        bool valid = false;
+        bool operator==(const IntersectFingerprint&) const = default;
+    };
+    IntersectFingerprint _lastIntersectFp;
+
     // --- Chunk-ready listener ---
     vc::cache::BlockPipeline::ChunkReadyCallbackId _chunkCbId = 0;
     bool _hadValidDataBounds = false;

@@ -7,6 +7,10 @@ set(srcs
     VCAppMain.cpp
     CState.cpp
     CState.hpp
+    SurfaceLRU.cpp
+    SurfaceLRU.hpp
+    RamStats.cpp
+    RamStats.hpp
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp
@@ -168,7 +172,14 @@ else()
     target_compile_definitions(VC3D PRIVATE VC_HAVE_AVAHI=0)
 endif()
 
+find_package(mimalloc QUIET)
+if(mimalloc_FOUND)
+    target_compile_definitions(VC3D PRIVATE VC_HAVE_MIMALLOC=1)
+endif()
+
 target_link_libraries(VC3D
+    # mimalloc first so its symbols win malloc/free resolution.
+    $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
     vc_ui
     vc_tracer

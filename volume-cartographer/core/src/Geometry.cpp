@@ -24,6 +24,39 @@ static cv::Vec2f vmax(const cv::Vec2f &a, const cv::Vec2f &b)
     return {std::max(a[0],b[0]),std::max(a[1],b[1])};
 }
 
+cv::Vec3f grid_normal_int(const cv::Mat_<cv::Vec3f> &points, int row, int col)
+{
+    // Specialized path for integer grid coordinates. Caller guarantees
+    // 1 <= row <= rows-2 and 1 <= col <= cols-2 so no clamp is needed,
+    // and the fractional bilerp degenerates to a direct corner read.
+    const cv::Vec3f* rPrev = points.ptr<cv::Vec3f>(row - 1);
+    const cv::Vec3f* rCur  = points.ptr<cv::Vec3f>(row);
+    const cv::Vec3f* rNext = points.ptr<cv::Vec3f>(row + 1);
+
+    const cv::Vec3f& xl = rCur[col - 1];
+    const cv::Vec3f& xr = rCur[col + 1];
+    const cv::Vec3f& yu = rPrev[col];
+    const cv::Vec3f& yd = rNext[col];
+
+    // Branchless invalid check: any sentinel (-1) → return NaN.
+    const int bad = (xl[0] == -1.f) | (xr[0] == -1.f)
+                  | (yu[0] == -1.f) | (yd[0] == -1.f);
+    if (bad) return {NAN, NAN, NAN};
+
+    cv::Vec3f xv = xr - xl;
+    cv::Vec3f yv = yd - yu;
+    // Cross product (xv × yv).
+    cv::Vec3f n{
+        xv[1] * yv[2] - xv[2] * yv[1],
+        xv[2] * yv[0] - xv[0] * yv[2],
+        xv[0] * yv[1] - xv[1] * yv[0]
+    };
+    const float len2 = n[0]*n[0] + n[1]*n[1] + n[2]*n[2];
+    if (len2 == 0.0f || len2 != len2) return {NAN, NAN, NAN};
+    const float inv = 1.0f / std::sqrt(len2);
+    return {n[0]*inv, n[1]*inv, n[2]*inv};
+}
+
 cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &loc)
 {
     const cv::Vec3f qnan(NAN, NAN, NAN);

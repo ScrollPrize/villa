@@ -931,19 +931,26 @@ void sampleCompositeAdaptiveImpl(
                 float val = 0.f;
                 if constexpr (AMode == AccumMode2::Max) val = mx;
                 else if constexpr (AMode == AccumMode2::Min) val = mn;
-                else if constexpr (AMode == AccumMode2::Mean) val = count ? accum/float(count) : 0.f;
+                else if constexpr (AMode == AccumMode2::Mean) val = count ? accum * (1.0f/float(count)) : 0.f;
                 else {
                     if (compositeMethod == "median") {
                         std::nth_element(layerVals.begin(), layerVals.begin()+numLayers/2, layerVals.end());
                         val = layerVals[numLayers/2];
                     } else if (compositeMethod == "minabs") {
+                        // Hoist abs(best-127.5) out of the loop and use std::fabs
+                        // (hardware fabs opcode vs. std::abs's integer-path).
                         float best = layerVals[0];
-                        for (int i=1; i<numLayers; i++)
-                            if (std::abs(layerVals[i]-127.5f) < std::abs(best-127.5f)) best = layerVals[i];
+                        float bestAbs = std::fabs(best - 127.5f);
+                        for (int i=1; i<numLayers; i++) {
+                            const float d = std::fabs(layerVals[i] - 127.5f);
+                            if (d < bestAbs) { best = layerVals[i]; bestAbs = d; }
+                        }
                         val = best;
                     } else {
                         float s=0.f; for (float v : layerVals) s += v;
-                        val = numLayers>0 ? s/float(numLayers) : 0.f;
+                        // Replace divide with multiply by pre-computed reciprocal.
+                        const float invN = numLayers>0 ? 1.0f/float(numLayers) : 0.f;
+                        val = s * invN;
                     }
                 }
                 if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
@@ -1341,7 +1348,7 @@ void readMultiSliceImpl(
                         if (v > maxV) v = maxV;
                         val = T(v + (std::is_same_v<T, uint16_t> ? 0.5f : 0.f));
                     }
-                    out[i].template at<T>(y, x) = val;
+                    out[i].template ptr<T>(y)[x] = val;
                 }
             }
         }
@@ -1382,7 +1389,7 @@ void sampleTileSlicesImpl(
                     if (v > maxV) v = maxV;
                     val = T(v + (std::is_same_v<T, uint16_t> ? 0.5f : 0.f));
                 }
-                out[i].template at<T>(y, x) = val;
+                out[i].template ptr<T>(y)[x] = val;
             }
         }
     }

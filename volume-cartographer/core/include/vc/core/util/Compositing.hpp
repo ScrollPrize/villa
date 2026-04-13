@@ -71,6 +71,11 @@ struct CompositeRenderSettings {
     bool postRemoveSmallComponents = false;
     int postMinComponentSize = 50;
 
+    // CLAHE (contrast-limited adaptive histogram equalization)
+    bool postClaheEnabled = false;
+    float postClaheClipLimit = 2.0f;
+    int postClaheTileSize = 8;
+
     bool operator==(const CompositeRenderSettings&) const = default;
 };
 

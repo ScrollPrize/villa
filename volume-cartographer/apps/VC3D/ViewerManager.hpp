@@ -168,5 +168,9 @@ private:
     std::vector<std::pair<std::string, std::shared_ptr<Surface>>> _surfacesQueuedForRemovalDuringRebuild;
     QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>* _surfacePatchIndexWatcher{nullptr};
 
+    // Surfaces currently pinned in the LRU as "highlighted/visible".
+    // We track them so we can unpin the right set when highlights change.
+    std::vector<std::shared_ptr<QuadSurface>> _pinnedHighlightSurfaces;
+
     void rebuildSurfacePatchIndexIfNeeded();
 };

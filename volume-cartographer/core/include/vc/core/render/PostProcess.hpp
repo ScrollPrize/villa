@@ -56,7 +56,7 @@ struct RenderPostProcessParams {
 //   5. Colormap or grayscale -> ARGB32
 void applyRenderPostProcess(cv::Mat_<uint8_t>& gray,
                             const RenderPostProcessParams& params,
-                            uint32_t* outBuf, int outStride);
+                            uint32_t* outBuf, int outStride) noexcept;
 
 // Build a window/level LUT mapping uint8 -> ARGB32 for the fused sampling path.
 // Only valid for non-stretch grayscale mode (no colormap, no stretchValues).

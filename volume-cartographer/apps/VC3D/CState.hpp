@@ -14,6 +14,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/ui/VCCollection.hpp"
+#include "SurfaceLRU.hpp"
 
 struct POI
 {
@@ -60,6 +61,9 @@ public:
     // --- Teardown ---
     void closeAll();
 
+    // --- Surface LRU (point-grid eviction) ---
+    SurfaceLRU& surfaceLRU() { return _surfaceLRU; }
+
     // --- Surfaces (inlined from CSurfaceCollection) ---
     void setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend = false, bool isEditUpdate = false);
     std::shared_ptr<Surface> surface(const std::string& name);
@@ -105,4 +109,6 @@ private:
     // Surface/POI data (formerly in CSurfaceCollection)
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;
     std::unordered_map<std::string, std::unique_ptr<POI>> _pois;
+
+    SurfaceLRU _surfaceLRU{8};
 };

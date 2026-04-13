@@ -82,7 +82,7 @@ static void applyFusedLut(const cv::Mat_<uint8_t>& gray,
 
 void applyRenderPostProcess(cv::Mat_<uint8_t>& gray,
                             const RenderPostProcessParams& params,
-                            uint32_t* outBuf, int outStride)
+                            uint32_t* outBuf, int outStride) noexcept
 {
     const OverlayColormapSpec* spec = nullptr;
     if (!params.colormapId.empty()) {
@@ -179,6 +179,7 @@ void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
     }
 
     const OverlayColormapSpec& spec = vc::resolve(colormapId);
+    constexpr uint32_t kBlack = 0xFF000000u;
 
     if (spec.kind == OverlayColormapKind::DiscreteLut && spec.discreteLut) {
         // Apply window/level to index, then look up discrete palette.
@@ -186,6 +187,7 @@ void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
             uint8_t mapped = static_cast<uint8_t>(wl[i] & 0xFF);  // gray value
             lut[i] = spec.discreteLut[mapped];
         }
+        lut[0] = kBlack;
         return;
     }
 
@@ -201,6 +203,7 @@ void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
                    | (static_cast<uint32_t>(G) << 8)
                    | static_cast<uint32_t>(B);
         }
+        lut[0] = kBlack;
         return;
     }
 
@@ -218,6 +221,7 @@ void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
                | (static_cast<uint32_t>(bgr[1]) << 8)
                | static_cast<uint32_t>(bgr[0]);
     }
+    lut[0] = kBlack;
 }
 
 }  // namespace vc

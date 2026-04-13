@@ -308,6 +308,24 @@ public:
 
     bool isLoaded() const { return !_needsLoad; }
 
+    // Drop derived caches (validity mask, etc.) without unloading _points.
+    // Called when this surface is no longer the active editing target so
+    // RAM is reserved for the segment the user is currently working on.
+    void unloadCaches();
+
+    // True iff this surface was loaded from disk and can be safely unloaded.
+    bool canUnload() const { return !path.empty(); }
+
+    // Drop _points and all derived caches; ensureLoaded() will re-read from
+    // disk on next access. No-op for in-memory-only surfaces.
+    void unloadPoints();
+
+    // Crop _points to the bounding box of valid (non-sentinel) cells.
+    // Shifts _center so existing ptr-space coords still resolve to the same
+    // world positions. Returns true if a trim was applied. No-op if the trim
+    // would save less than 25%.
+    bool trimToValidBbox();
+
     virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); return *_points; }
     virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { ensureLoaded(); return _points.get(); }
     virtual const cv::Mat_<cv::Vec3f> *rawPointsPtr() const { const_cast<QuadSurface*>(this)->ensureLoaded(); return _points.get(); }
@@ -353,7 +371,6 @@ public:
 
     mutable cv::Mat_<uint8_t> _validMaskCache;
     mutable cv::Mat_<cv::Vec3f> _normalCache;
-
     cv::Vec2f _scale;
 
     void setChannel(const std::string& name, const cv::Mat& channel);

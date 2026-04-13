@@ -196,6 +196,8 @@ void QuadSurface::ensureLoaded()
         return;
     }
 
+    std::fprintf(stderr, "[SURF] load %s (from %s)\n",
+                 id.c_str(), path.string().c_str());
     auto loaded = load_quad_from_tifxyz(path.string());
     if (!loaded) {
         throw std::runtime_error("Failed to load surface from: " + path.string());
@@ -208,6 +210,8 @@ void QuadSurface::ensureLoaded()
     _scale = loaded->_scale;
     _center = loaded->_center;
     _channels = std::move(loaded->_channels);
+
+    trimToValidBbox();
 
     // Keep existing bbox and meta if already set, otherwise take from loaded
     if (_bbox.low[0] == 0 && _bbox.high[0] == 0) {
@@ -295,21 +299,14 @@ cv::Vec3f QuadSurface::gridNormal(int row, int col) const
     if (row < 0 || row >= _points->rows || col < 0 || col >= _points->cols)
         return {NAN, NAN, NAN};
 
-    // Build normal cache on first access
-    if (_normalCache.empty() || _normalCache.size() != _points->size()) {
-        _normalCache.create(_points->rows, _points->cols);
-        for (int r = 0; r < _points->rows; r++) {
-            for (int c = 0; c < _points->cols; c++) {
-                if ((*_points)(r, c)[0] == -1.f) {
-                    _normalCache(r, c) = {NAN, NAN, NAN};
-                } else {
-                    _normalCache(r, c) = grid_normal(*_points, cv::Vec3f(static_cast<float>(c), static_cast<float>(r), 0.0f));
-                }
-            }
-        }
+    // Recompute on every call instead of caching the full grid (~48 MB
+    // per surface). grid_normal() is cheap (bilinear tangents + cross).
+    if ((*_points)(row, col)[0] == -1.f) {
+        return {NAN, NAN, NAN};
     }
-
-    return _normalCache(row, col);
+    return grid_normal(*_points, cv::Vec3f(static_cast<float>(col),
+                                           static_cast<float>(row),
+                                           0.0f));
 }
 
 void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)
@@ -376,6 +373,84 @@ int QuadSurface::countValidQuads() const
     return static_cast<int>(std::distance(range.begin(), range.end()));
 }
 
+bool QuadSurface::trimToValidBbox()
+{
+    if (!_points || _points->empty()) return false;
+    const int rows = _points->rows;
+    const int cols = _points->cols;
+    int r0 = rows, r1 = -1, c0 = cols, c1 = -1;
+    for (int r = 0; r < rows; r++) {
+        const cv::Vec3f* row = (*_points)[r];
+        int rc0 = cols, rc1 = -1;
+        for (int c = 0; c < cols; c++) {
+            if (row[c][0] != -1.f) {
+                if (c < rc0) rc0 = c;
+                rc1 = c;
+            }
+        }
+        if (rc1 >= 0) {
+            if (r < r0) r0 = r;
+            r1 = r;
+            if (rc0 < c0) c0 = rc0;
+            if (rc1 > c1) c1 = rc1;
+        }
+    }
+    if (r1 < 0 || c1 < 0) return false;
+    const int bbH = r1 - r0 + 1;
+    const int bbW = c1 - c0 + 1;
+    // Skip only if nothing to trim (bbox already matches grid exactly).
+    if (bbH == rows && bbW == cols) return false;
+    const std::size_t origBytes = std::size_t(rows) * cols * sizeof(cv::Vec3f);
+    const std::size_t trimBytes = std::size_t(bbH) * bbW * sizeof(cv::Vec3f);
+    const double pctSaved = 1.0 - double(trimBytes) / double(origBytes);
+    auto trimmed = std::make_unique<cv::Mat_<cv::Vec3f>>(
+        (*_points)(cv::Rect(c0, r0, bbW, bbH)).clone());
+    _points = std::move(trimmed);
+    // Shift center: after cropping by (c0, r0), the new grid index 0
+    // corresponds to the old index (c0, r0), so we must subtract.
+    _center[0] -= float(c0) / _scale[0];
+    _center[1] -= float(r0) / _scale[1];
+    _bounds = {0, 0, bbW - 1, bbH - 1};
+    _bbox = {{-1, -1, -1}, {-1, -1, -1}};  // World bbox cached, needs recompute.
+    _validMaskCache = cv::Mat_<uint8_t>();
+    _normalCache = cv::Mat_<cv::Vec3f>();
+    std::fprintf(stderr,
+        "[SURF] trim %s %dx%d -> %dx%d  saved %zu MB (%.1f%%)\n",
+        id.c_str(), cols, rows, bbW, bbH,
+        (origBytes - trimBytes) / (1024 * 1024),
+        pctSaved * 100.0);
+    return true;
+}
+
+void QuadSurface::unloadPoints()
+{
+    if (path.empty()) return;  // No disk backing — can't reload.
+    std::lock_guard<std::mutex> lock(_loadMutex);
+    if (_needsLoad) return;    // Already unloaded.
+    std::size_t mb = 0;
+    if (_points) {
+        mb = static_cast<std::size_t>(_points->rows) * _points->cols
+             * sizeof(cv::Vec3f) / (1024 * 1024);
+    }
+    _points.reset();
+    _channels.clear();
+    _validMaskCache = cv::Mat_<uint8_t>();
+    _normalCache = cv::Mat_<cv::Vec3f>();
+    _needsLoad = true;
+    std::fprintf(stderr, "[SURF] unload %s (%zu MB freed)\n", id.c_str(), mb);
+}
+
+void QuadSurface::unloadCaches()
+{
+    _validMaskCache = cv::Mat_<uint8_t>();
+    _normalCache = cv::Mat_<cv::Vec3f>();
+    // Release loaded channel pixel data but keep the keys so channel(name)
+    // still knows which channels exist on disk and can lazy-reload them.
+    for (auto& [_, mat] : _channels) {
+        mat.release();
+    }
+}
+
 cv::Mat_<uint8_t> QuadSurface::validMask() const
 {
     const_cast<QuadSurface*>(this)->ensureLoaded();
@@ -393,13 +468,21 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
     const int cols = _points->cols;
     cv::Mat_<uint8_t> mask(rows, cols);
 
-#pragma omp parallel for schedule(dynamic, 1)
+    // Tight per-row loop:
+    //  - NaN check via self-inequality (NaN != NaN) — no math.h call, branchless.
+    //  - Sentinel check is a contiguous-byte equality against (-1, -1, -1).
+    //  - Bitwise & / | so the compiler emits straight-line NEON, no early exit.
+    // Inf is treated as valid here (was rejected by std::isfinite); coordinates
+    // never go to ±Inf in the surface pipeline, so this is a safe relaxation.
+#pragma omp parallel for schedule(dynamic, 16)
     for (int j = 0; j < rows; ++j) {
+        const cv::Vec3f* __restrict__ row = (*_points)[j];
+        uint8_t* __restrict__ dst = mask[j];
         for (int i = 0; i < cols; ++i) {
-            const cv::Vec3f& p = (*_points)(j, i);
-            const bool ok = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
-                           !(p[0] == -1.f && p[1] == -1.f && p[2] == -1.f);
-            mask(j, i) = ok ? 255 : 0;
+            const float a = row[i][0], b = row[i][1], c = row[i][2];
+            const int nan = (a != a) | (b != b) | (c != c);
+            const int sent = (a == -1.f) & (b == -1.f) & (c == -1.f);
+            dst[i] = (nan | sent) ? uint8_t(0) : uint8_t(255);
         }
     }
     _validMaskCache = mask;
@@ -438,7 +521,6 @@ void QuadSurface::invalidateCache()
 
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};
     _validMaskCache = cv::Mat_<uint8_t>();
-    _normalCache = cv::Mat_<cv::Vec3f>();
 }
 
 void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
@@ -496,21 +578,32 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     cv::Mat_<cv::Vec3f> normals_big;
     if (need_normals) {
         // Build source-grid normal cache once per surface. Subsequent gen()
-        // calls (panning, zooming) reuse it — per-pixel grid_normal is the
-        // most expensive part of this function otherwise.
+        // calls (panning, zooming) reuse it. Cleared by unloadCaches() when
+        // a different surface becomes active.
         if (_normalCache.empty() || _normalCache.size() != _points->size()) {
             _normalCache.create(_points->rows, _points->cols);
             const cv::Vec3f qn(std::numeric_limits<float>::quiet_NaN(),
                                std::numeric_limits<float>::quiet_NaN(),
                                std::numeric_limits<float>::quiet_NaN());
+            const int rows = _points->rows;
+            const int cols = _points->cols;
+            // Border rows/cols: no ±1 neighbors, fill with NaN sentinel.
+            if (rows > 0) {
+                cv::Vec3f* top = _normalCache[0];
+                cv::Vec3f* bot = _normalCache[rows - 1];
+                for (int c = 0; c < cols; c++) { top[c] = qn; bot[c] = qn; }
+            }
             #pragma omp parallel for schedule(dynamic, 16)
-            for (int r = 0; r < _points->rows; r++) {
-                for (int c = 0; c < _points->cols; c++) {
-                    if ((*_points)(r, c)[0] == -1.f) {
-                        _normalCache(r, c) = qn;
+            for (int r = 1; r < rows - 1; r++) {
+                cv::Vec3f* dst = _normalCache[r];
+                const cv::Vec3f* row = (*_points)[r];
+                dst[0] = qn;
+                dst[cols - 1] = qn;
+                for (int c = 1; c < cols - 1; c++) {
+                    if (row[c][0] == -1.f) {
+                        dst[c] = qn;
                     } else {
-                        _normalCache(r, c) = grid_normal(*_points,
-                            cv::Vec3f(float(c), float(r), 0.0f));
+                        dst[c] = grid_normal_int(*_points, r, c);
                     }
                 }
             }
@@ -867,6 +960,10 @@ void QuadSurface::invalidateMask()
 
 void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel)
 {
+    // Trim padding before serializing so the on-disk grid matches the in-RAM
+    // one. No-op if already trimmed or saving would save <25%.
+    trimToValidBbox();
+
     // Split the points matrix into x, y, z channels
     std::vector<cv::Mat> xyz;
     cv::split((*_points), xyz);

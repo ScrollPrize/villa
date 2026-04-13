@@ -58,9 +58,23 @@ bool DiskStore::contains(
     const ChunkKey& key) const
 {
     ensureInitialized();
-    auto path = chunkPath(volumeId, key);
+    // Format the path into a thread-local scratch string to avoid
+    // allocating a fresh filesystem::path + its .string() on every hit-test.
+    thread_local std::string scratch;
+    scratch.assign(config_.root.native());
+    if (!config_.directMode) {
+        scratch.push_back('/');
+        scratch.append(volumeId);
+    }
+    char tail[96];
+    const int n = std::snprintf(tail, sizeof(tail), "/%d/%d%s%d%s%d",
+                                key.level, key.iz, config_.delimiter.c_str(),
+                                key.iy, config_.delimiter.c_str(), key.ix);
+    if (n > 0) {
+        scratch.append(tail, static_cast<size_t>(n));
+    }
     std::lock_guard<std::mutex> lk(indexMtx_);
-    return pathIndex_.find(path.string()) != pathIndex_.end();
+    return pathIndex_.find(scratch) != pathIndex_.end();
 }
 
 void DiskStore::put(

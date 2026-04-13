@@ -242,9 +242,17 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
         if (raw.empty()) return {};
         shardData = std::make_shared<std::vector<uint8_t>>(std::move(raw));
 
+        // Cap by total bytes (~256 MB) instead of count. Shards can be
+        // 10–100 MB each; counting was letting peak grow to ~1.6 GB.
+        constexpr size_t kShardCacheBudget = 256ull << 20;
         std::lock_guard<std::mutex> lock(shardCacheMutex_);
-        if (shardCache_.size() >= 16)
+        size_t totalBytes = shardData->size();
+        for (const auto& [_, sp] : shardCache_) {
+            if (sp) totalBytes += sp->size();
+        }
+        if (totalBytes > kShardCacheBudget) {
             shardCache_.clear();
+        }
 
         auto [it, inserted] = shardCache_.emplace(url, shardData);
         if (!inserted) shardData = it->second;

@@ -11,6 +11,8 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/types/SampleParams.hpp"
 
+#include <opencv2/imgproc.hpp>
+
 #include <QSettings>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -340,6 +342,12 @@ void CAdaptiveVolumeViewer::submitRender()
 
     std::array<uint32_t, 256> lut;
     const bool stretchFirstPass = stretch && !_cachedStretchValid;
+    // When CLAHE is active the colormap must be deferred until after CLAHE.
+    // In that case the sampling LUT is grayscale-only.
+    const bool deferColormap = _compositeSettings.postClaheEnabled
+                               && !_baseColormapId.empty();
+    const std::string& sampleColormapId = deferColormap
+        ? std::string() : _baseColormapId;
     if (stretchFirstPass) {
         // Identity gray LUT so we can extract the raw sample after sampling.
         for (int i = 0; i < 256; i++) {
@@ -351,16 +359,16 @@ void CAdaptiveVolumeViewer::submitRender()
         float whi = stretch ? float(_cachedStretchHi) : _windowHigh;
         // Reuse previous LUT if the inputs haven't changed.
         if (_cachedWindowLow == wlo && _cachedWindowHigh == whi
-            && _cachedColormapId == _baseColormapId
+            && _cachedColormapId == sampleColormapId
             && _cachedIsoCutoff == isoCutoff) {
             lut = _cachedLut;
         } else {
-            vc::buildWindowLevelColormapLut(lut, wlo, whi, _baseColormapId);
+            vc::buildWindowLevelColormapLut(lut, wlo, whi, sampleColormapId);
             applyIsoCutoff(lut, isoCutoff);
             _cachedLut = lut;
             _cachedWindowLow = wlo;
             _cachedWindowHigh = whi;
-            _cachedColormapId = _baseColormapId;
+            _cachedColormapId = sampleColormapId;
             _cachedIsoCutoff = isoCutoff;
         }
     }
@@ -498,6 +506,41 @@ void CAdaptiveVolumeViewer::submitRender()
             _cachedStretchLo = lo;
             _cachedStretchHi = hi;
             _cachedStretchValid = true;
+        }
+    }
+
+    // CLAHE post-pass — runs on grayscale before any colormap is applied.
+    // When a colormap is selected we also run the colormap LUT here.
+    if (_compositeSettings.postClaheEnabled) {
+        cv::Mat_<uint8_t> gray(fbH, fbW);
+        for (int y = 0; y < fbH; y++) {
+            const uint32_t* row = fbBits + size_t(y) * size_t(fbStride);
+            uint8_t* dst = gray.ptr<uint8_t>(y);
+            for (int x = 0; x < fbW; x++) dst[x] = uint8_t(row[x] & 0xFFu);
+        }
+        const int tile = std::max(1, _compositeSettings.postClaheTileSize);
+        const double clip = std::max(0.01, double(_compositeSettings.postClaheClipLimit));
+        auto clahe = cv::createCLAHE(clip, cv::Size(tile, tile));
+        clahe->apply(gray, gray);
+
+        if (deferColormap) {
+            // Identity window/level (gray is already windowed) + user colormap.
+            std::array<uint32_t, 256> cmapLut;
+            vc::buildWindowLevelColormapLut(cmapLut, 0.0f, 255.0f, _baseColormapId);
+            for (int y = 0; y < fbH; y++) {
+                uint32_t* row = fbBits + size_t(y) * size_t(fbStride);
+                const uint8_t* src = gray.ptr<uint8_t>(y);
+                for (int x = 0; x < fbW; x++) row[x] = cmapLut[src[x]];
+            }
+        } else {
+            for (int y = 0; y < fbH; y++) {
+                uint32_t* row = fbBits + size_t(y) * size_t(fbStride);
+                const uint8_t* src = gray.ptr<uint8_t>(y);
+                for (int x = 0; x < fbW; x++) {
+                    uint32_t v = src[x];
+                    row[x] = 0xFF000000u | (v << 16) | (v << 8) | v;
+                }
+            }
         }
     }
 
@@ -811,14 +854,20 @@ void CAdaptiveVolumeViewer::invalidateIntersect(const std::string&)
 
 void CAdaptiveVolumeViewer::renderIntersections()
 {
-    invalidateIntersect();
-
     auto surf = _surfWeak.lock();
     auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
-    if (!plane || !_state || !_viewerManager || !_scene || !_view) return;
+    if (!plane || !_state || !_viewerManager || !_scene || !_view) {
+        invalidateIntersect();
+        _lastIntersectFp = {};
+        return;
+    }
 
     auto* patchIndex = _viewerManager->surfacePatchIndex();
-    if (!patchIndex || patchIndex->empty()) return;
+    if (!patchIndex || patchIndex->empty()) {
+        invalidateIntersect();
+        _lastIntersectFp = {};
+        return;
+    }
 
     // Resolve target surface names to shared_ptrs.
     std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
@@ -834,11 +883,11 @@ void CAdaptiveVolumeViewer::renderIntersections()
             addTarget(name);
         }
     }
-    if (targets.empty()) return;
+    if (targets.empty()) { invalidateIntersect(); _lastIntersectFp = {}; return; }
 
     // Compute the plane ROI in surface-param space covering the current viewport.
     QRectF sceneRect = _view->mapToScene(_view->viewport()->rect()).boundingRect();
-    if (!sceneRect.isValid()) return;
+    if (!sceneRect.isValid()) { invalidateIntersect(); _lastIntersectFp = {}; return; }
 
     float minX = std::numeric_limits<float>::max();
     float minY = std::numeric_limits<float>::max();
@@ -859,8 +908,30 @@ void CAdaptiveVolumeViewer::renderIntersections()
                       std::max(1, int(std::ceil(maxX - minX))),
                       std::max(1, int(std::ceil(maxY - minY)))};
 
+    // Skip the rebuild entirely if nothing material has changed.
+    IntersectFingerprint fp;
+    fp.roiX = planeRoi.x;
+    fp.roiY = planeRoi.y;
+    fp.roiW = planeRoi.width;
+    fp.roiH = planeRoi.height;
+    fp.opacity = _intersectionOpacity;
+    fp.thickness = _intersectionThickness;
+    fp.patchCount = patchIndex->patchCount();
+    fp.surfaceCount = patchIndex->surfaceCount();
+    size_t th = 0;
+    for (const auto& t : targets) {
+        th ^= std::hash<const void*>{}(t.get()) + 0x9e3779b9u + (th << 6) + (th >> 2);
+    }
+    fp.targetHash = th;
+    fp.valid = true;
+    if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
+        return;
+    }
+    invalidateIntersect();
+    _lastIntersectFp = fp;
+
     auto intersections = patchIndex->computePlaneIntersections(*plane, planeRoi, targets);
-    if (intersections.empty()) return;
+    if (intersections.empty()) { /* kept cleared by invalidate above */ return; }
 
     auto activeSeg = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
 

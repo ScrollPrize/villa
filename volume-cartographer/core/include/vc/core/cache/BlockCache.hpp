@@ -1,10 +1,8 @@
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -34,17 +32,23 @@ struct BlockKeyHash {
     }
 };
 
-struct alignas(64) Block {
+// One block is exactly 4096 voxel bytes — nothing else. Put it in its own
+// type so callers see `block->data` rather than raw buffers, but keep the
+// struct size == page size so the arena has no per-slot waste.
+struct Block {
     uint8_t data[kBlockBytes];
-    std::atomic<uint8_t> used{1};  // clock-sweep NRU flag
 };
+static_assert(sizeof(Block) == 4096, "Block must be exactly one 4 KiB page");
 
-using BlockPtr = std::shared_ptr<Block>;
+// Non-owning pointer into the cache's mmap-backed arena. Eviction is handled
+// by overwriting in place; samplers holding a BlockPtr for a slot that has
+// since been reused will read the NEW contents, not the old ones (no UAF,
+// but 1 frame of stale voxel data is possible).
+using BlockPtr = Block*;
 
-// Single-tier block cache. Clock-sweep NRU eviction over a fixed arena.
-// get() / put() yield std::shared_ptr<Block>; a block dropped from the
-// arena while a sampler still holds a pointer stays alive in memory until
-// the last reference is released.
+// Single-tier block cache with a contiguous mmap-backed arena. Clock-sweep
+// NRU eviction over the slot array. On eviction idle we madvise(MADV_DONTNEED)
+// so the OS can reclaim physical pages while the virtual mapping persists.
 class BlockCache {
 public:
     struct Config {
@@ -61,7 +65,7 @@ public:
     [[nodiscard]] BlockPtr get(const BlockKey& key) noexcept;
 
     // Insert, copying kBlockBytes from `src`. Evicts NRU entries if full.
-    void put(const BlockKey& key, const uint8_t* src);
+    void put(const BlockKey& key, const uint8_t* src) noexcept;
 
     [[nodiscard]] size_t capacity() const noexcept { return nSlots_; }
     [[nodiscard]] size_t size() const noexcept;
@@ -74,14 +78,35 @@ private:
     Config config_;
     size_t nSlots_ = 0;
 
-    mutable std::mutex mutex_;
-    std::unordered_map<BlockKey, BlockPtr, BlockKeyHash> map_;
+    // Contiguous mmap'd arena of Block objects. Virtual region is sized at
+    // startup; physical pages commit only on first touch of each slot.
+    Block* arena_ = nullptr;
+    size_t arenaBytes_ = 0;
 
-    std::vector<BlockPtr> slotBlock_;
+    mutable std::mutex mutex_;
+    std::unordered_map<BlockKey, size_t, BlockKeyHash> map_;
+
     std::vector<BlockKey> slotKey_;
-    std::vector<uint8_t> occupied_;
+    // Parallel bitmasks (1 bit per slot): "occupied" (has valid key) and
+    // "used" (clock-sweep NRU flag). Packs 2.5M slots into 310 KB each
+    // vs. ~2.5 MB for a byte-per-slot vector.
+    std::vector<uint64_t> occupiedBits_;
+    std::vector<uint64_t> usedBits_;
     size_t occupiedCount_ = 0;
     size_t clockHand_ = 0;
+
+    static constexpr size_t bitWord(size_t i) noexcept { return i >> 6; }
+    static constexpr uint64_t bitMask(size_t i) noexcept { return uint64_t(1) << (i & 63u); }
+    bool isOccupied(size_t i) const noexcept { return (occupiedBits_[bitWord(i)] >> (i & 63u)) & 1u; }
+    void setOccupied(size_t i, bool v) noexcept {
+        if (v) occupiedBits_[bitWord(i)] |= bitMask(i);
+        else   occupiedBits_[bitWord(i)] &= ~bitMask(i);
+    }
+    bool isUsed(size_t i) const noexcept { return (usedBits_[bitWord(i)] >> (i & 63u)) & 1u; }
+    void setUsed(size_t i, bool v) noexcept {
+        if (v) usedBits_[bitWord(i)] |= bitMask(i);
+        else   usedBits_[bitWord(i)] &= ~bitMask(i);
+    }
 };
 
 }  // namespace vc::cache

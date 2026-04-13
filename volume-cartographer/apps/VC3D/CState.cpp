@@ -67,12 +67,21 @@ std::string CState::activeSurfaceId() const { return _activeSurfaceId; }
 
 void CState::setActiveSurface(const std::string& id, std::shared_ptr<QuadSurface> surf)
 {
+    // Drop derived caches on whichever surface was active before — we only
+    // keep them populated for the segment the user is currently editing.
+    auto prev = _activeSurface.lock();
+    if (prev && prev != surf) {
+        prev->unloadCaches();
+    }
     _activeSurfaceId = id;
     _activeSurface = surf;
 }
 
 void CState::clearActiveSurface()
 {
+    if (auto prev = _activeSurface.lock()) {
+        prev->unloadCaches();
+    }
     _activeSurface.reset();
     _activeSurfaceId.clear();
 }

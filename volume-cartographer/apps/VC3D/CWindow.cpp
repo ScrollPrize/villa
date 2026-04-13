@@ -1,6 +1,8 @@
 #include "CWindow.hpp"
+#include "RamStats.hpp"
 
 #include <cstdlib>
+#include <malloc.h>
 
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "WindowRangeWidget.hpp"
@@ -620,6 +622,17 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _windowStateSaveTimer->setSingleShot(true);
     _windowStateSaveTimer->setInterval(500);
     connect(_windowStateSaveTimer, &QTimer::timeout, this, &CWindow::saveWindowState);
+
+    // Periodic glibc heap trim: returns sbrk-grown segments back to the OS
+    // once they're no longer in use. Cheap (~µs) when nothing to trim.
+    // Also dumps a RAM stats line for live monitoring.
+    auto* trimTimer = new QTimer(this);
+    trimTimer->setInterval(1000);
+    connect(trimTimer, &QTimer::timeout, this, [this]() {
+        ::malloc_trim(0);
+        vc3d::ramstats::dumpOnce(_viewerManager.get(), _state);
+    });
+    trimTimer->start();
 
     const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     _mirrorCursorToSegmentation = settings.value(vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION,
@@ -3924,6 +3937,43 @@ void CWindow::CreateWidgets(void)
     // Initialize min component size controls based on checkbox state
     ui.spinMinComponentSize->setEnabled(ui.chkRemoveSmallComponents->isChecked());
     ui.lblMinComponentSize->setEnabled(ui.chkRemoveSmallComponents->isChecked());
+
+    // CLAHE postprocessing — applied to every viewer
+    auto setClaheEnabled = [this](bool on) {
+        ui.spinClaheClipLimit->setEnabled(on);
+        ui.spinClaheTileSize->setEnabled(on);
+        ui.lblClaheClipLimit->setEnabled(on);
+        ui.lblClaheTileSize->setEnabled(on);
+    };
+    setClaheEnabled(ui.chkClaheEnabled->isChecked());
+
+    connect(ui.chkClaheEnabled, &QCheckBox::toggled, this, [this, setClaheEnabled](bool checked) {
+        setClaheEnabled(checked);
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([checked](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postClaheEnabled = checked;
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+
+    connect(ui.spinClaheClipLimit, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postClaheClipLimit = static_cast<float>(value);
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+
+    connect(ui.spinClaheTileSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postClaheTileSize = std::clamp(value, 2, 64);
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
 
     bool resetViewOnSurfaceChange = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                                                    vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
