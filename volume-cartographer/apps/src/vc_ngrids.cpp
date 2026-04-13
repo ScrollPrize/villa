@@ -62,7 +62,8 @@ static void print_usage() {
         << "      --vis-surf PATH     Write --surf tifxyz surface as a quad-mesh PLY (faces)\n"
         << "      --fit-normals       Estimate local 3D normals from segments (within crop)\n"
         << "      --vis-normals PATH  Write fitted normals as PLY line segments\n\n"
-        << "      --output-zarr PATH  Write fitted normals to a zarr directory (direction-field encoding)\n\n"
+        << "      --output-zarr PATH  Write fitted normals to a zarr directory (direction-field encoding)\n"
+        << "      --step N            Sample step for --fit-normals (default: 16)\n"
         << "      --metrics-json PATH Write structured run metrics json for fit/align modes\n\n"
         << "      --align-normals     Align normals in an existing normals zarr (requires --output-zarr)\n\n"
         << "Notes:\n"
@@ -2742,6 +2743,7 @@ int main(int argc, char** argv) {
         ("vis-normals", po::value<std::string>(), "Write fitted normals as PLY line segments")
         ("dbg-tif", "Write debug float TIFFs for --fit-normals (workdir): rms, used radius, sample counts (first z layer only)")
         ("output-zarr", po::value<std::string>(), "Write fitted normals to a zarr directory (direction-field encoding)")
+        ("step", po::value<int>()->default_value(16), "Sample step for --fit-normals (default: 16)")
         ("metrics-json", po::value<std::string>(), "Write structured fit/align metrics json")
         ("align-normals", "Align normals in an existing normals zarr (requires --input zarr and --output-zarr)");
 
@@ -2854,11 +2856,12 @@ int main(int argc, char** argv) {
         if (vm.count("vis-normals")) {
             out_ply = fs::path(vm["vis-normals"].as<std::string>());
         }
+        const int step_val = vm["step"].as<int>();
         run_fit_normals(input_dir,
                         out_ply,
                         crop,
                         out_zarr,
-                        /*step=*/16,
+                        step_val,
                         /*radius=*/64.f,
                         /*dbg_tif=*/vm.count("dbg-tif") > 0,
                         metrics_json);

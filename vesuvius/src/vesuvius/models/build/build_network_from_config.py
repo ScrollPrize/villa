@@ -43,6 +43,8 @@ this is inspired by the nnUNet architecture.
 https://github.com/MIC-DKFZ/nnUNet
 """
 
+import functools
+
 import torch
 import torch.nn as nn
 from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage
@@ -267,6 +269,7 @@ class NetworkFromConfig(nn.Module):
         self.norm_op = model_config.get("norm_op", "nn.InstanceNorm3d")
         self.norm_op_kwargs = model_config.get("norm_op_kwargs", {"affine": True, "eps": 1e-5})
         self.conv_bias = model_config.get("conv_bias", True)
+        self.upsample_mode = model_config.get("upsample_mode", "transpconv")
         self.nonlin = model_config.get("nonlin", "nn.LeakyReLU")
         self.nonlin_kwargs = model_config.get("nonlin_kwargs", {"inplace": True})
 
@@ -279,7 +282,10 @@ class NetworkFromConfig(nn.Module):
                 self.conv_op = nn.Conv3d
                 print("Using 3D convolutions (nn.Conv3d)")
 
-        if isinstance(self.norm_op, str):
+        if self.norm_op is None:
+            self.norm_op_kwargs = {}
+            print("Normalization disabled (norm_op=None)")
+        elif isinstance(self.norm_op, str):
             norm_key = self.norm_op.strip().lower().replace(" ", "")
             if norm_key.startswith("torch.nn."):
                 norm_key = norm_key[len("torch.nn."):]
@@ -288,14 +294,18 @@ class NetworkFromConfig(nn.Module):
 
             is_batch = norm_key in {"batch", "batchnorm", "batchnorm2d", "batchnorm3d"}
             is_instance = norm_key in {"instance", "instancenorm", "instancenorm2d", "instancenorm3d"}
+            is_group = norm_key == "groupnorm"
 
-            if not (is_batch or is_instance):
+            if is_group:
+                num_groups = self.norm_op_kwargs.pop("num_groups", 32)
+                self.norm_op = functools.partial(nn.GroupNorm, num_groups)
+                print(f"Using GroupNorm (num_groups={num_groups})")
+            elif not (is_batch or is_instance):
                 raise ValueError(
                     f"Unknown norm_op string: {self.norm_op!r}. "
-                    "Expected batch/BatchNorm* or instance/InstanceNorm*."
+                    "Expected batch/BatchNorm*, instance/InstanceNorm*, or nn.GroupNorm."
                 )
-
-            if self.op_dims == 2:
+            elif self.op_dims == 2:
                 if is_batch:
                     self.norm_op = nn.BatchNorm2d
                     print("Using 2D normalization (nn.BatchNorm2d)")
@@ -598,7 +608,8 @@ class NetworkFromConfig(nn.Module):
                 basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
                 num_classes=None,  # features-only mode
                 n_conv_per_stage=model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
-                deep_supervision=False
+                deep_supervision=False,
+                upsample_mode=self.upsample_mode,
             )
             # Heads map from decoder feature channels at highest resolution to task outputs
             head_in_ch = self.shared_encoder.output_channels[0]
@@ -618,7 +629,8 @@ class NetworkFromConfig(nn.Module):
                 basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
                 num_classes=out_channels,
                 n_conv_per_stage=model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
-                deep_supervision=False
+                deep_supervision=False,
+                upsample_mode=self.upsample_mode,
             )
             self.task_activations[target_name] = get_activation_module(activation_str)
             print(f"Task '{target_name}' configured with separate decoder ({out_channels} channels)")
@@ -657,6 +669,7 @@ class NetworkFromConfig(nn.Module):
             "squeeze_excitation_type": model_config.get("squeeze_excitation_type", "channel"),
             "squeeze_excitation_add_maxpool": model_config.get("squeeze_excitation_add_maxpool", False),
             "pool_type": model_config.get("pool_type", "conv"),
+            "upsample_mode": self.upsample_mode,
             "op_dims": self.op_dims,
             "patch_size": self.patch_size,
             "batch_size": self.batch_size,

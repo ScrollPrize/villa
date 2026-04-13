@@ -170,13 +170,13 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         _heightSpin->setSingleStep(64);
         dimLayout->addWidget(_heightSpin, 1);
 
-        dimLayout->addWidget(new QLabel(tr("D:"), dimWidget));
-        _depthSpin = new QSpinBox(dimWidget);
-        _depthSpin->setRange(1, 999999);
-        _depthSpin->setValue(2048);
-        _depthSpin->setSingleStep(64);
-        _depthSpin->setToolTip(tr("Depth in full-resolution voxels"));
-        dimLayout->addWidget(_depthSpin, 1);
+        dimLayout->addWidget(new QLabel(tr("N:"), dimWidget));
+        _windingsSpin = new QSpinBox(dimWidget);
+        _windingsSpin->setRange(1, 999);
+        _windingsSpin->setValue(3);
+        _windingsSpin->setSingleStep(1);
+        _windingsSpin->setToolTip(tr("Number of windings"));
+        dimLayout->addWidget(_windingsSpin, 1);
 
         _newModelGroup->contentLayout()->addWidget(dimWidget);
     }
@@ -343,9 +343,19 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         _externalHost = text.trimmed();
         writeSetting(QStringLiteral("lasagna_external_host"), _externalHost);
     });
+    connect(_hostEdit, &QLineEdit::editingFinished, this, [this]() {
+        if (_connectionMode == 1 && !_externalHost.isEmpty() && _externalPort > 0) {
+            LasagnaServiceManager::instance().connectToExternal(_externalHost, _externalPort);
+        }
+    });
     connect(_portEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         _externalPort = text.trimmed().toInt();
         writeSetting(QStringLiteral("lasagna_external_port"), _externalPort);
+    });
+    connect(_portEdit, &QLineEdit::editingFinished, this, [this]() {
+        if (_connectionMode == 1 && !_externalHost.isEmpty() && _externalPort > 0) {
+            LasagnaServiceManager::instance().connectToExternal(_externalHost, _externalPort);
+        }
     });
 
     // -- Data input --
@@ -361,18 +371,30 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
 
     connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::datasetsReceived,
             this, [this](const QJsonArray& datasets) {
+        QString prevPath = _lasagnaDataInputPath;
         _datasetCombo->clear();
         if (datasets.isEmpty()) {
-            _dataInputStack->setCurrentIndex(0);
+            _datasetCombo->setEnabled(false);
+            if (_newModelBtn) _newModelBtn->setEnabled(false);
+            if (_reoptBtn) _reoptBtn->setEnabled(false);
+            if (_expandBtn) _expandBtn->setEnabled(false);
             return;
         }
-        for (const auto& val : datasets) {
-            QJsonObject ds = val.toObject();
+        int restoreIdx = 0;
+        for (int i = 0; i < datasets.size(); ++i) {
+            QJsonObject ds = datasets[i].toObject();
             QString name = ds[QStringLiteral("name")].toString();
             QString path = ds[QStringLiteral("path")].toString();
             _datasetCombo->addItem(name, path);
+            if (path == prevPath)
+                restoreIdx = i;
         }
+        _datasetCombo->setCurrentIndex(restoreIdx);
+        _datasetCombo->setEnabled(true);
         _dataInputStack->setCurrentIndex(1);
+        if (_newModelBtn) _newModelBtn->setEnabled(true);
+        if (_reoptBtn) _reoptBtn->setEnabled(true);
+        if (_expandBtn) _expandBtn->setEnabled(true);
     });
 
     connect(_dataInputEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
@@ -397,8 +419,8 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     connect(_heightSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
         writeSetting(QStringLiteral("lasagna_new_model_height"), v);
     });
-    connect(_depthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
-        writeSetting(QStringLiteral("lasagna_new_model_depth"), v);
+    connect(_windingsSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        writeSetting(QStringLiteral("lasagna_new_model_windings"), v);
     });
     connect(_seedEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         writeSetting(QStringLiteral("lasagna_seed_point"), text.trimmed());
@@ -566,9 +588,17 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         }
         if (_stopBtn) _stopBtn->setEnabled(false);
         if (_stopServiceBtn) _stopServiceBtn->setEnabled(false);
-        if (_newModelBtn) _newModelBtn->setEnabled(true);
-        if (_reoptBtn) _reoptBtn->setEnabled(true);
-        if (_expandBtn) _expandBtn->setEnabled(true);
+        if (_connectionMode == 1) {
+            // External mode: clear datasets and disable controls
+            if (_datasetCombo) { _datasetCombo->clear(); _datasetCombo->setEnabled(false); }
+            if (_newModelBtn) _newModelBtn->setEnabled(false);
+            if (_reoptBtn) _reoptBtn->setEnabled(false);
+            if (_expandBtn) _expandBtn->setEnabled(false);
+        } else {
+            if (_newModelBtn) _newModelBtn->setEnabled(true);
+            if (_reoptBtn) _reoptBtn->setEnabled(true);
+            if (_expandBtn) _expandBtn->setEnabled(true);
+        }
     });
     connect(&mgr, &LasagnaServiceManager::serviceError, this, [this](const QString& err) {
         std::cerr << "[lasagna] service error: " << err.toStdString() << std::endl;
@@ -576,6 +606,12 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             _progressLabel->setText(tr("Error: %1").arg(err));
             _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
             _progressLabel->setVisible(true);
+        }
+        if (_connectionMode == 1) {
+            if (_datasetCombo) _datasetCombo->setEnabled(false);
+            if (_newModelBtn) _newModelBtn->setEnabled(false);
+            if (_reoptBtn) _reoptBtn->setEnabled(false);
+            if (_expandBtn) _expandBtn->setEnabled(false);
         }
     });
     connect(&mgr, &LasagnaServiceManager::optimizationStarted, this, [this]() {
@@ -770,9 +806,9 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
         const QSignalBlocker b(_heightSpin);
         _heightSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_height"), 2048).toInt());
     }
-    if (_depthSpin) {
-        const QSignalBlocker b(_depthSpin);
-        _depthSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_depth"), 2048).toInt());
+    if (_windingsSpin) {
+        const QSignalBlocker b(_windingsSpin);
+        _windingsSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_windings"), 3).toInt());
     }
 
     // Connection settings
@@ -1027,9 +1063,9 @@ int SegmentationLasagnaPanel::newModelHeight() const
     return _heightSpin ? _heightSpin->value() : 2048;
 }
 
-int SegmentationLasagnaPanel::newModelDepth() const
+int SegmentationLasagnaPanel::newModelWindings() const
 {
-    return _depthSpin ? _depthSpin->value() : 2048;
+    return _windingsSpin ? _windingsSpin->value() : 3;
 }
 
 QString SegmentationLasagnaPanel::seedPointText() const
@@ -1071,16 +1107,26 @@ void SegmentationLasagnaPanel::onConnectionModeChanged(int index)
 void SegmentationLasagnaPanel::updateConnectionWidgets()
 {
     bool external = (_connectionMode == 1);
-
-    // Show/hide external widgets (discovery + host/port)
     if (_externalWidget) _externalWidget->setVisible(external);
 
-    // Reset data input stack when switching to internal
-    if (!external) {
-        if (_dataInputStack) _dataInputStack->setCurrentIndex(0);
+    if (_dataInputStack) {
+        _dataInputStack->setCurrentIndex(external ? 1 : 0);
+    }
+    // When in external mode with no datasets yet, disable combo + action buttons
+    if (external && _datasetCombo) {
+        bool hasDatasets = (_datasetCombo->count() > 0);
+        _datasetCombo->setEnabled(hasDatasets);
+        if (_newModelBtn) _newModelBtn->setEnabled(hasDatasets);
+        if (_reoptBtn) _reoptBtn->setEnabled(hasDatasets);
+        if (_expandBtn) _expandBtn->setEnabled(hasDatasets);
+    } else {
+        // Internal mode: re-enable controls
+        if (_datasetCombo) _datasetCombo->setEnabled(true);
+        if (_newModelBtn) _newModelBtn->setEnabled(true);
+        if (_reoptBtn) _reoptBtn->setEnabled(true);
+        if (_expandBtn) _expandBtn->setEnabled(true);
     }
 
-    // When switching to external, try connecting (triggers dataset fetch via serviceStarted)
     if (external && !_restoringSettings && !_externalHost.isEmpty() && _externalPort > 0) {
         LasagnaServiceManager::instance().connectToExternal(_externalHost, _externalPort);
     }

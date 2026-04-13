@@ -6,11 +6,44 @@ import numpy as np
 from typing import Union, Tuple, List, Type
 
 import torch
+import torch.nn.functional as F
 from vesuvius.models.utilities.utils import get_matching_convtransp
 from .resblocks import StackedResidualBlocks
 from .simple_conv_blocks import StackedConvBlocks
 from torch import nn
 from torch.nn.modules.dropout import _DropoutNd
+
+
+class TrilinearUpsample3d(nn.Module):
+    """Trilinear interpolation + 1x1 conv to adjust channels."""
+
+    def __init__(self, in_channels, out_channels, stride, bias=True):
+        super().__init__()
+        self.scale_factor = [int(s) for s in stride]
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=1, bias=bias)
+
+    def forward(self, x):
+        x = F.interpolate(x, scale_factor=self.scale_factor, mode='trilinear', align_corners=False)
+        return self.conv(x)
+
+
+class PixelShuffle3d(nn.Module):
+    """1x1 conv expanding channels by r^3, then spatial rearrange."""
+
+    def __init__(self, in_channels, out_channels, stride, bias=True):
+        super().__init__()
+        r = int(stride[0])  # assume isotropic stride
+        self.r = r
+        self.conv = nn.Conv3d(in_channels, out_channels * r * r * r, kernel_size=1, bias=bias)
+
+    def forward(self, x):
+        x = self.conv(x)
+        B, C_total, D, H, W = x.shape
+        r = self.r
+        C = C_total // (r * r * r)
+        x = x.view(B, C, r, r, r, D, H, W)
+        x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
+        return x.view(B, C, D * r, H * r, W * r)
 
 
 class Decoder(nn.Module):
@@ -27,7 +60,8 @@ class Decoder(nn.Module):
                  dropout_op_kwargs: dict = None,
                  nonlin: Union[None, Type[torch.nn.Module]] = None,
                  nonlin_kwargs: dict = None,
-                 conv_bias: bool = None
+                 conv_bias: bool = None,
+                 upsample_mode: str = "transpconv",
                  ):
         """
         This class needs the skips of the encoder as input in its forward.
@@ -77,10 +111,17 @@ class Decoder(nn.Module):
                 input_features_below = encoder.output_channels[-s]
                 input_features_skip = encoder.output_channels[-(s + 1)]
                 stride_for_transpconv = encoder.strides[-s]
-                transpconvs.append(transpconv_op(
-                    input_features_below, input_features_skip, stride_for_transpconv, stride_for_transpconv,
-                    bias=encoder.conv_bias
-                ))
+                if upsample_mode == "trilinear":
+                    transpconvs.append(TrilinearUpsample3d(
+                        input_features_below, input_features_skip, stride_for_transpconv, bias=encoder.conv_bias))
+                elif upsample_mode == "pixelshuffle":
+                    transpconvs.append(PixelShuffle3d(
+                        input_features_below, input_features_skip, stride_for_transpconv, bias=encoder.conv_bias))
+                else:
+                    transpconvs.append(transpconv_op(
+                        input_features_below, input_features_skip, stride_for_transpconv, stride_for_transpconv,
+                        bias=encoder.conv_bias
+                    ))
                 # input features to conv is 2x input_features_skip (concat input_features_skip with transpconv output)
                 stages.append(StackedResidualBlocks(
                     n_blocks=n_conv_per_stage[s - 1],
@@ -113,10 +154,17 @@ class Decoder(nn.Module):
                 input_features_below = encoder.output_channels[-s]
                 input_features_skip = encoder.output_channels[-(s + 1)]
                 stride_for_transpconv = encoder.strides[-s]
-                transpconvs.append(transpconv_op(
-                    input_features_below, input_features_skip, stride_for_transpconv, stride_for_transpconv,
-                    bias=conv_bias
-                ))
+                if upsample_mode == "trilinear":
+                    transpconvs.append(TrilinearUpsample3d(
+                        input_features_below, input_features_skip, stride_for_transpconv, bias=conv_bias))
+                elif upsample_mode == "pixelshuffle":
+                    transpconvs.append(PixelShuffle3d(
+                        input_features_below, input_features_skip, stride_for_transpconv, bias=conv_bias))
+                else:
+                    transpconvs.append(transpconv_op(
+                        input_features_below, input_features_skip, stride_for_transpconv, stride_for_transpconv,
+                        bias=conv_bias
+                    ))
                 # input features to conv is 2x input_features_skip (concat input_features_skip with transpconv output)
                 stages.append(StackedConvBlocks(
                     n_conv_per_stage[s - 1], encoder.conv_op, 2 * input_features_skip, input_features_skip,

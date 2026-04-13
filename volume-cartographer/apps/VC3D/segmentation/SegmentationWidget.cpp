@@ -434,7 +434,7 @@ QString SegmentationWidget::lasagnaConfigText() const { return _lasagnaPanel->la
 int SegmentationWidget::lasagnaMode() const { return static_cast<int>(_lasagnaPanel->lasagnaMode()); }
 int SegmentationWidget::newModelWidth() const { return _lasagnaPanel->newModelWidth(); }
 int SegmentationWidget::newModelHeight() const { return _lasagnaPanel->newModelHeight(); }
-int SegmentationWidget::newModelDepth() const { return _lasagnaPanel->newModelDepth(); }
+int SegmentationWidget::newModelWindings() const { return _lasagnaPanel->newModelWindings(); }
 QString SegmentationWidget::seedPointText() const { return _lasagnaPanel->seedPointText(); }
 QString SegmentationWidget::newModelOutputName() const { return _lasagnaPanel->newModelOutputName(); }
 

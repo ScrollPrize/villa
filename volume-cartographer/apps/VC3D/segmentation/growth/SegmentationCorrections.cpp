@@ -149,7 +149,7 @@ uint64_t CorrectionsState::createCollection(bool announce)
     return newId;
 }
 
-void CorrectionsState::handlePointAdded(const cv::Vec3f& worldPos)
+void CorrectionsState::handlePointAdded(const cv::Vec3f& worldPos, float wind_a)
 {
     if (!_collection || _activeCollectionId == 0) {
         return;
@@ -163,7 +163,11 @@ void CorrectionsState::handlePointAdded(const cv::Vec3f& worldPos)
         return;
     }
 
-    _collection->addPoint(it->second.name, worldPos);
+    ColPoint pt = _collection->addPoint(it->second.name, worldPos);
+    if (!std::isnan(wind_a)) {
+        pt.winding_annotation = wind_a;
+        _collection->updatePoint(pt);
+    }
 }
 
 void CorrectionsState::handlePointRemoved(const cv::Vec3f& worldPos)

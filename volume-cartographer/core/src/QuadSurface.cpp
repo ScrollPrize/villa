@@ -624,6 +624,27 @@ float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f
     return pointTo_(loc, points, tgt, th, max_iters, scale);
 }
 
+float lookupDepthIndex(QuadSurface* surface, int row, int col)
+{
+    if (!surface) {
+        return NAN;
+    }
+    cv::Mat dChannel = surface->channel("d");
+    if (dChannel.empty()) {
+        return NAN;
+    }
+    if (row < 0 || row >= dChannel.rows || col < 0 || col >= dChannel.cols) {
+        return NAN;
+    }
+    if (dChannel.type() == CV_32F) {
+        return dChannel.at<float>(row, col);
+    }
+    if (dChannel.type() == CV_64F) {
+        return static_cast<float>(dChannel.at<double>(row, col));
+    }
+    return NAN;
+}
+
 //search the surface point that is closest to the target coord
 float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters,
                            SurfacePatchIndex* surfaceIndex, PointIndex* pointIndex)

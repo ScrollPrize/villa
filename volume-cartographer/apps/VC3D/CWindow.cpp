@@ -98,6 +98,7 @@
 #include "FocusHistoryManager.hpp"
 #include "SurfaceAreaCalculator.hpp"
 #include "SegmentationCommandHandler.hpp"
+#include "LasagnaServiceManager.hpp"
 #include "vc/core/Version.hpp"
 
 #include "vc/core/util/Logging.hpp"
@@ -2261,6 +2262,10 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onConvertToObj(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::visLasagnaObjRequested,
+            this, [this](const QString& segmentId) {
+                onVisLasagnaObj(segmentId.toStdString());
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::cropBoundsRequested,
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onCropSurfaceToValidRegion(segmentId.toStdString());
@@ -2538,6 +2543,293 @@ void CWindow::CreateWidgets(void)
                                                                    : std::string{});
                 _segmentationWidget->setActiveVolume(fallbackId);
                 _state->setSegmentationGrowthVolumeId(_state->currentVolumeId());
+            }
+        }
+    });
+
+    // -- Lasagna connections --
+    connect(_segmentationWidget, &SegmentationWidget::seedFromFocusRequested, this, [this]() {
+        POI* focus = _state ? _state->poi("focus") : nullptr;
+        if (focus)
+            _segmentationWidget->setSeedFromFocus(
+                static_cast<int>(focus->p[0]),
+                static_cast<int>(focus->p[1]),
+                static_cast<int>(focus->p[2]));
+    });
+
+    connect(_segmentationWidget, &SegmentationWidget::lasagnaOptimizeRequested, this, [this]() {
+        auto& mgr = LasagnaServiceManager::instance();
+        const bool isNewModel = (_segmentationWidget->lasagnaMode() == 1);
+
+        // Ensure service is running (external or internal)
+        if (mgr.isExternal()) {
+            if (!mgr.isRunning()) {
+                auto msg = tr("External service not connected. Select a service or check host/port.");
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                statusBar()->showMessage(msg, 5000);
+                return;
+            }
+        } else {
+            if (!mgr.ensureServiceRunning()) {
+                auto msg = tr("Failed to start lasagna service: %1").arg(mgr.lastError());
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                statusBar()->showMessage(msg, 5000);
+                return;
+            }
+        }
+
+        // Get the active segment path
+        std::filesystem::path segPath;
+        auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(
+            _state->surface("segmentation"));
+        if (activeSurface && !activeSurface->path.empty()) {
+            segPath = activeSurface->path;
+        }
+
+        // Model path — required for re-optimize, optional for new model
+        QString modelPath;
+        if (!isNewModel) {
+            if (!segPath.empty()) {
+                auto modelFile = segPath / "model.pt";
+                if (std::filesystem::exists(modelFile)) {
+                    try {
+                        modelPath = QString::fromStdString(
+                            std::filesystem::canonical(modelFile).string());
+                    } catch (const std::filesystem::filesystem_error&) {}
+                }
+            }
+            if (modelPath.isEmpty()) {
+                auto msg = tr("No model.pt found in segment directory. Cannot run lasagna.");
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                statusBar()->showMessage(msg, 5000);
+                return;
+            }
+        }
+
+        // Data input path (zarr)
+        QString dataInput = _segmentationWidget->lasagnaDataInputPath();
+        if (dataInput.isEmpty()) {
+            auto msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            statusBar()->showMessage(msg, 5000);
+            return;
+        }
+
+        // Output dir: for re-optimize use the segment's parent directory;
+        // for new model use the volpkg's segmentation directory
+        QString outputDir;
+        if (!segPath.empty()) {
+            outputDir = QString::fromStdString(segPath.parent_path().string());
+        } else if (_state->vpkg()) {
+            auto vpkgRoot = std::filesystem::path(_state->vpkg()->getVolpkgDirectory());
+            auto segDir = vpkgRoot / _state->vpkg()->getSegmentationDirectory();
+            outputDir = QString::fromStdString(segDir.string());
+        }
+
+        // --- Compute next version name ---
+        QString outputName;
+        {
+            std::string rootName = "new_model";  // Default fallback
+            const std::string tifxyzSuffix = ".tifxyz";
+
+            if (isNewModel) {
+                // New model: use the output name field, fall back to "new_model"
+                QString nmName = _segmentationWidget->newModelOutputName();
+                if (!nmName.isEmpty()) {
+                    rootName = nmName.toStdString();
+                }
+            } else if (!segPath.empty()) {
+                // Re-optimize: derive from existing segment name
+                auto segName = segPath.filename().string();
+                std::string baseName = segName;
+                if (baseName.size() > tifxyzSuffix.size() &&
+                    baseName.compare(baseName.size() - tifxyzSuffix.size(),
+                                     tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                    baseName = baseName.substr(0, baseName.size() - tifxyzSuffix.size());
+                }
+                rootName = baseName;
+                if (rootName.size() > 5) {
+                    auto pos = rootName.rfind("_v");
+                    if (pos != std::string::npos && pos + 2 < rootName.size()) {
+                        bool allDigits = true;
+                        for (size_t i = pos + 2; i < rootName.size(); ++i) {
+                            if (!std::isdigit(static_cast<unsigned char>(rootName[i]))) {
+                                allDigits = false;
+                                break;
+                            }
+                        }
+                        if (allDigits) rootName = rootName.substr(0, pos);
+                    }
+                }
+            }
+
+            // Scan for highest existing version in the output directory
+            int maxVersion = 0;
+            if (!outputDir.isEmpty()) {
+                std::error_code ec;
+                for (auto& entry : std::filesystem::directory_iterator(
+                         outputDir.toStdString(), ec)) {
+                    auto name = entry.path().filename().string();
+                    std::string prefix = rootName + "_v";
+                    if (name.size() > prefix.size() + tifxyzSuffix.size() &&
+                        name.compare(0, prefix.size(), prefix) == 0 &&
+                        name.compare(name.size() - tifxyzSuffix.size(),
+                                     tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                        auto numStr = name.substr(prefix.size(),
+                            name.size() - prefix.size() - tifxyzSuffix.size());
+                        bool allDigits = true;
+                        for (auto c : numStr) {
+                            if (!std::isdigit(static_cast<unsigned char>(c)))
+                                allDigits = false;
+                        }
+                        if (allDigits && !numStr.empty()) {
+                            int v = std::stoi(numStr);
+                            if (v > maxVersion) maxVersion = v;
+                        }
+                    }
+                }
+            }
+            char numBuf[16];
+            std::snprintf(numBuf, sizeof(numBuf), "_v%03d", maxVersion + 1);
+            outputName = QString::fromStdString(rootName + numBuf + ".tifxyz");
+        }
+
+        // Parse config JSON from the editor
+        QJsonObject config;
+        QString configText = _segmentationWidget->lasagnaConfigText().trimmed();
+        if (!configText.isEmpty()) {
+            QJsonDocument doc = QJsonDocument::fromJson(configText.toUtf8());
+            if (doc.isObject()) {
+                config = doc.object();
+            }
+        }
+
+        // --- New Model: inject crop, init_size_frac, z_size, grow into config ---
+        if (isNewModel) {
+            int nmW = _segmentationWidget->newModelWidth();
+            int nmH = _segmentationWidget->newModelHeight();
+            int nmN = _segmentationWidget->newModelWindings();
+
+            // Get bbox center: use seed point if specified, otherwise focus
+            int cx, cy, cz;
+            QString seedText = _segmentationWidget->seedPointText();
+            bool seedOk = false;
+            if (!seedText.isEmpty()) {
+                QStringList parts = seedText.split(',');
+                if (parts.size() == 3) {
+                    bool ok0, ok1, ok2;
+                    cx = parts[0].trimmed().toInt(&ok0);
+                    cy = parts[1].trimmed().toInt(&ok1);
+                    cz = parts[2].trimmed().toInt(&ok2);
+                    seedOk = ok0 && ok1 && ok2;
+                }
+            }
+            if (!seedOk) {
+                POI* focus = _state ? _state->poi("focus") : nullptr;
+                if (!focus) {
+                    auto msg = tr("No focus position or seed point set. Place the cursor or enter a seed.");
+                    std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                    statusBar()->showMessage(msg, 5000);
+                    return;
+                }
+                cx = static_cast<int>(focus->p[0]);
+                cy = static_cast<int>(focus->p[1]);
+                cz = static_cast<int>(focus->p[2]);
+            }
+
+            // Build/override the "args" section with seed, model-w, model-h, windings
+            QJsonObject args = config[QStringLiteral("args")].toObject();
+            args[QStringLiteral("seed")] = QJsonArray{cx, cy, cz};
+            args[QStringLiteral("model-w")] = nmW;
+            args[QStringLiteral("model-h")] = nmH;
+            args[QStringLiteral("windings")] = nmN;
+            config[QStringLiteral("args")] = args;
+
+            std::cerr << "[lasagna] new model: seed=(" << cx << "," << cy
+                      << "," << cz << ") w=" << nmW << " h=" << nmH
+                      << " windings=" << nmN << std::endl;
+        }
+
+        // Inject loaded point collections as corr_points
+        if (_state->pointCollection()) {
+            const auto& cols = _state->pointCollection()->getAllCollections();
+            if (!cols.empty()) {
+                nlohmann::json corr_json;
+                nlohmann::json cols_json = nlohmann::json::object();
+                for (const auto& [cid, col] : cols) {
+                    cols_json[std::to_string(cid)] = col;
+                }
+                corr_json["collections"] = cols_json;
+                QJsonDocument corrDoc = QJsonDocument::fromJson(
+                    QByteArray::fromStdString(corr_json.dump()));
+                if (corrDoc.isObject()) {
+                    config[QStringLiteral("corr_points")] = corrDoc.object();
+                    std::cerr << "[lasagna] injected " << cols.size()
+                              << " point collection(s) as corr_points" << std::endl;
+                }
+            }
+        }
+
+        // Inject voxel_size_um from the current volume
+        if (_state->currentVolume()) {
+            try {
+                double vs = _state->currentVolume()->voxelSize();
+                if (std::isfinite(vs) && vs > 0.0) {
+                    config[QStringLiteral("voxel_size_um")] = vs;
+                }
+            } catch (...) {}
+        }
+
+        // Build optimization request
+        QJsonObject request;
+        request[QStringLiteral("data_input")] = dataInput;
+        request[QStringLiteral("single_segment")] = true;
+        request[QStringLiteral("copy_model")] = true;
+        if (!outputName.isEmpty()) {
+            request[QStringLiteral("output_name")] = outputName;
+        }
+        request[QStringLiteral("config")] = config;
+
+        if (!isNewModel) {
+            // Re-optimize / Expand: send model.pt as base64 data
+            QFile modelFile(modelPath);
+            if (!modelFile.open(QIODevice::ReadOnly)) {
+                auto msg = tr("Cannot read model file: %1").arg(modelPath);
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                statusBar()->showMessage(msg, 5000);
+                return;
+            }
+            QByteArray modelBytes = modelFile.readAll();
+            modelFile.close();
+            request[QStringLiteral("model_data")] =
+                QString::fromLatin1(modelBytes.toBase64());
+        }
+
+        mgr.startOptimization(request, outputDir);
+        statusBar()->showMessage(
+            tr("Lasagna optimization started (%1). Output: %2")
+                .arg(isNewModel ? tr("new model") : tr("re-optimize"))
+                .arg(outputName), 3000);
+    });
+
+    connect(_segmentationWidget, &SegmentationWidget::lasagnaStopRequested, this, [this]() {
+        LasagnaServiceManager::instance().stopOptimization();
+        statusBar()->showMessage(tr("Lasagna optimization stop requested."), 3000);
+    });
+
+    // Auto-reload segments when fit optimization finishes
+    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::optimizationFinished,
+            this, [this](const QString& outputDir) {
+        statusBar()->showMessage(
+            tr("Lasagna optimization finished. Reloading segments from %1").arg(outputDir), 5000);
+        if (_surfacePanel) {
+            _surfacePanel->loadSurfacesIncremental();
+        }
+        // Reload corr_points_results for the active surface
+        if (_point_collection_widget) {
+            auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+            if (surf && !surf->path.empty()) {
+                _point_collection_widget->loadCorrPointsResults(surf->path / "corr_points_results.json");
             }
         }
     });

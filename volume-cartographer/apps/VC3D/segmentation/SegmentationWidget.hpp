@@ -187,7 +187,7 @@ public:
     [[nodiscard]] int lasagnaMode() const;
     [[nodiscard]] int newModelWidth() const;
     [[nodiscard]] int newModelHeight() const;
-    [[nodiscard]] int newModelDepth() const;
+    [[nodiscard]] int newModelWindings() const;
     [[nodiscard]] QString seedPointText() const;
     [[nodiscard]] QString newModelOutputName() const;
 

@@ -368,3 +368,40 @@ private:
     QSpinBox* spIterations_{nullptr};
     QSpinBox* spDownsample_{nullptr};
 };
+
+class VisLasagnaObjDialog : public QDialog {
+    Q_OBJECT
+public:
+    VisLasagnaObjDialog(QWidget* parent, const QString& outputDir);
+
+    QString outputDir() const;
+    QStringList slices() const;
+    QStringList channels() const;
+    QStringList losses() const;
+    bool includeMesh() const;
+    bool includeConnections() const;
+
+private:
+    // Session defaults (in-memory)
+    static bool s_haveSession;
+    static bool s_xy, s_xz, s_yz;
+    static bool s_cos, s_gradMag;
+    static bool s_lStep, s_lSmooth, s_lWinding, s_lNormal;
+    static bool s_mesh, s_conn;
+
+    void applySessionDefaults();
+    void updateSessionFromUI();
+
+    QLineEdit* edtOutput_{nullptr};
+    QCheckBox* chkXY_{nullptr};
+    QCheckBox* chkXZ_{nullptr};
+    QCheckBox* chkYZ_{nullptr};
+    QCheckBox* chkCos_{nullptr};
+    QCheckBox* chkGradMag_{nullptr};
+    QCheckBox* chkLossStep_{nullptr};
+    QCheckBox* chkLossSmooth_{nullptr};
+    QCheckBox* chkLossWinding_{nullptr};
+    QCheckBox* chkLossNormal_{nullptr};
+    QCheckBox* chkMesh_{nullptr};
+    QCheckBox* chkConn_{nullptr};
+};

@@ -1,0 +1,20 @@
+{
+	"base": {
+		"normal": 1.0,
+		"step": 0.0
+	},
+	"stages": [
+		{
+			"name": "arc_only",
+			"steps": 1000,
+			"lr": 1.0,
+			"params": ["arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1"]
+		},
+		{
+			"name": "opt",
+			"steps": 1000,
+			"lr": [0.1, 0.01, 0.001],
+			"params": ["mesh_ms", "conn_offset_ms"]
+		}
+	]
+}

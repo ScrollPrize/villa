@@ -119,6 +119,7 @@ signals:
     void growSegmentRequested(const QString& segmentId);
     void addOverlapRequested(const QString& segmentId);
     void convertToObjRequested(const QString& segmentId);
+    void visLasagnaObjRequested(const QString& segmentId);
     void cropBoundsRequested(const QString& segmentId);
     void slimFlattenRequested(const QString& segmentId);
     void abfFlattenRequested(const QString& segmentId);
