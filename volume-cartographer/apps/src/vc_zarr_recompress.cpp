@@ -814,10 +814,9 @@ int main(int argc, char** argv) {
                 // rel is like "0/0/0" — reconstruct full shard key
                 existing_shards.insert(shard_prefix + rel);
             }
-            if (!existing_shards.empty()) {
-                printf("  Resume: found %zu existing shards, will skip\n",
-                       existing_shards.size());
-            }
+            printf("  Resume LIST: %zu existing shards in S3 (will skip on resume)\n",
+                   existing_shards.size());
+            fflush(stdout);
         }
 
         static constexpr size_t INDEX_BYTES = INNER_CHUNKS * 16;  // 8192
