@@ -773,13 +773,10 @@ int main(int argc, char** argv) {
         size_t shard_nx = (shape[2] + SHARD_DIM - 1) / SHARD_DIM;
         size_t total_shards = shard_nz * shard_ny * shard_nx;
 
-        // Occupancy at 128^3 chunk granularity from a single LIST of the
-        // source level (one paginated round-trip, ≤10K keys per page).
-        // No need for the old L5-mask scan path: LIST gives exact existence
-        // for every chunk in one shot.
-        std::vector<size_t> chunk128 = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
-        std::vector<bool> occ_mask =
-            build_occupancy_from_listing(*input, l, shape, chunk128);
+        // No global occupancy mask needed: each shard worker LISTs its own
+        // cz-plane prefixes (already parallel across workers and S3
+        // continuation-aware).  Empty shards naturally produce zero output.
+        std::vector<bool> occ_mask;
 
         printf("  Source: chunks [%zu,%zu,%zu], compressor: %s, sep: '%s', dtype: %s\n",
                src_chunks[0], src_chunks[1], src_chunks[2],
