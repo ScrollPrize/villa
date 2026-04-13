@@ -537,6 +537,17 @@ bool VcDataset::readChunk(size_t iz, size_t iy, size_t ix, void* output) const
     return true;
 }
 
+bool VcDataset::readChunkOrFill(size_t iz, size_t iy, size_t ix, void* output) const
+{
+    if (readChunk(iz, iy, ix, output)) {
+        return true;
+    }
+
+    auto* outBytes = static_cast<uint8_t*>(output);
+    fillTypedElements(outBytes, impl_->chunkSize_, impl_->fillValueBytes_);
+    return false;
+}
+
 bool VcDataset::writeChunk(size_t iz, size_t iy, size_t ix,
                             const void* input, size_t nbytes)
 {
@@ -545,6 +556,21 @@ bool VcDataset::writeChunk(size_t iz, size_t iy, size_t ix,
         static_cast<const std::byte*>(input), nbytes);
     impl_->zarrArray_->write_chunk(indices, data);
     return true;
+}
+
+bool VcDataset::removeChunk(size_t iz, size_t iy, size_t ix)
+{
+    auto p = impl_->fsPath /
+        (std::to_string(iz) + impl_->delimiter_ +
+         std::to_string(iy) + impl_->delimiter_ +
+         std::to_string(ix));
+
+    std::error_code ec;
+    const bool removed = std::filesystem::remove(p, ec);
+    if (ec) {
+        throw std::runtime_error("failed removing chunk: " + p.string());
+    }
+    return removed;
 }
 
 bool VcDataset::readRegion(const std::vector<size_t>& offset,

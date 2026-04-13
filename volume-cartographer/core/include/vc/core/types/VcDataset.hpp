@@ -46,9 +46,16 @@ public:
     // Returns false if chunk doesn't exist.
     bool readChunk(size_t iz, size_t iy, size_t ix, void* output) const;
 
+    // Read a chunk when present, or materialize the dataset fill value when absent.
+    // Returns true if the chunk existed on disk, false if output was filled instead.
+    bool readChunkOrFill(size_t iz, size_t iy, size_t ix, void* output) const;
+
     // Write a chunk (input is raw uncompressed data).
     bool writeChunk(size_t iz, size_t iy, size_t ix,
                     const void* input, size_t nbytes);
+
+    // Remove a chunk file if it exists.
+    bool removeChunk(size_t iz, size_t iy, size_t ix);
 
     // --- Region I/O (replaces z5::multiarray::readSubarray) ---
     bool readRegion(const std::vector<size_t>& offset,

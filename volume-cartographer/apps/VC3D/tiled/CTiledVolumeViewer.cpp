@@ -14,6 +14,7 @@
 #include <limits>
 
 #include <QSettings>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QLabel>
 #include <QPainter>
@@ -33,6 +34,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <iostream>
 
 #include <QDebug>
 #include "vc/core/cache/TieredChunkCache.hpp"
@@ -43,9 +45,58 @@ constexpr auto COLOR_CURSOR = Qt::cyan;
 #define COLOR_SEG_XZ Qt::red
 #define COLOR_SEG_XY QColor(255, 140, 0)
 
+static const QColor kIntersectionPalette[] = {
+    // Vibrant saturated colors
+    QColor(80, 180, 255),  // sky blue
+    QColor(180, 80, 220),  // violet
+    QColor(80, 220, 200),  // aqua/teal
+    QColor(220, 80, 180),  // magenta
+    QColor(80, 130, 255),  // medium blue
+    QColor(160, 80, 255),  // purple
+    QColor(80, 255, 220),  // cyan
+    QColor(255, 80, 200),  // hot pink
+    QColor(120, 220, 80),  // lime green
+    QColor(80, 180, 120),  // spring green
+    // Lighter/pastel variants
+    QColor(150, 200, 255),  // light sky blue
+    QColor(200, 150, 230),  // light violet
+    QColor(150, 230, 210),  // light aqua
+    QColor(230, 150, 200),  // light magenta
+    QColor(150, 170, 255),  // light blue
+    QColor(190, 150, 255),  // light purple
+    QColor(150, 255, 230),  // light cyan
+    QColor(255, 150, 210),  // light pink
+    QColor(180, 240, 150),  // light lime
+    QColor(150, 230, 170),  // light spring green
+    // Deeper/darker variants
+    QColor(50, 120, 200),  // deep blue
+    QColor(140, 50, 180),  // deep violet
+    QColor(50, 180, 160),  // deep teal
+    QColor(180, 50, 140),  // deep magenta
+    QColor(50, 90, 200),   // navy blue
+    QColor(120, 50, 200),  // deep purple
+    QColor(50, 200, 180),  // deep cyan
+    QColor(200, 50, 160),  // deep pink
+    QColor(80, 160, 60),   // forest green
+    QColor(50, 140, 100),  // deep sea green
+    // Extra variations with different saturation
+    QColor(100, 160, 220),  // muted blue
+    QColor(160, 100, 200),  // muted violet
+    QColor(100, 200, 180),  // muted teal
+    QColor(200, 100, 170),  // muted magenta
+    QColor(120, 180, 240),  // soft blue
+    QColor(180, 120, 220),  // soft purple
+    QColor(120, 220, 200),  // soft cyan
+    QColor(220, 120, 190),  // soft pink
+    QColor(140, 200, 100),  // soft lime
+    QColor(100, 180, 130),  // muted green
+};
+
 namespace
 {
 constexpr qreal kIntersectionZ = 18.0;
+constexpr qreal kActiveSegZ = 20.0;
+constexpr qreal kHighlightZ = 22.0;
 constexpr auto kIntersectionItemsKey = "__plane_intersections__";
 
 bool isFinitePoint(const QPointF& point)
@@ -182,6 +233,16 @@ CTiledVolumeViewer::CTiledVolumeViewer(CState* state,
     _lbl->setStyleSheet("QLabel { color : #00FF00; background-color: rgba(0,0,0,128); padding: 2px 4px; }");
     _lbl->setMinimumWidth(300);
     _lbl->move(10, 5);
+
+    // Periodic status refresh so download/queue counters update even when idle
+    auto* statusTimer = new QTimer(this);
+    connect(statusTimer, &QTimer::timeout, this, &CTiledVolumeViewer::updateStatusLabel);
+    statusTimer->start(250);
+
+    _interactionSettleTimer = new QTimer(this);
+    _interactionSettleTimer->setSingleShot(true);
+    _interactionSettleTimer->setInterval(125);
+    connect(_interactionSettleTimer, &QTimer::timeout, this, &CTiledVolumeViewer::settleInteractionRender);
 }
 
 CTiledVolumeViewer::~CTiledVolumeViewer()
@@ -262,54 +323,26 @@ void CTiledVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 
     // Set up tiered chunk cache for progressive rendering
     if (_volume && _volume->numScales() >= 1) {
-        // Wire chunk-ready listener BEFORE pin to ensure no callbacks are missed
+        // Wire chunk-ready listener so arriving chunks trigger refinement.
         auto* ctrl = _renderController;
-        int coarsestLevel = static_cast<int>(_volume->numScales()) - 1;
         auto* cache = _volume->tieredCache();
         QPointer<CTiledVolumeViewer> viewerGuard(this);
         _chunkCbId = cache->addChunkReadyListener(
-            [ctrl, viewerGuard, cache, coarsestLevel](const vc::cache::ChunkKey& key) {
+            [ctrl, viewerGuard, cache](const vc::cache::ChunkKey& key) {
+                (void)key;
                 QMetaObject::invokeMethod(ctrl, [ctrl, cache]() {
                     ctrl->markChunkArrived();
                     cache->clearChunkArrivedFlag();
                 }, Qt::QueuedConnection);
-                // Track coarsest-level pin progress for status display
-                if (key.level == coarsestLevel) {
-                    QMetaObject::invokeMethod(qApp, [viewerGuard]() {
-                        if (!viewerGuard) return;
-                        if (viewerGuard->_pinTotal.load(std::memory_order_relaxed) > 0) {
-                            viewerGuard->_pinReceived++;
-                            viewerGuard->updateStatusLabel();
-                        }
-                    }, Qt::QueuedConnection);
-                }
+                QMetaObject::invokeMethod(qApp, [viewerGuard]() {
+                    if (viewerGuard) {
+                        viewerGuard->updateStatusLabel();
+                    }
+                }, Qt::QueuedConnection);
             });
-
-        // Compute total coarsest-level chunks for pin progress tracking
-        auto levelShape = cache->levelShape(coarsestLevel);
-        auto chunkShape = cache->chunkShape(coarsestLevel);
-        int gridZ = (levelShape[0] + chunkShape[0] - 1) / chunkShape[0];
-        int gridY = (levelShape[1] + chunkShape[1] - 1) / chunkShape[1];
-        int gridX = (levelShape[2] + chunkShape[2] - 1) / chunkShape[2];
-        _pinTotal = gridZ * gridY * gridX;
-        _pinLevel = coarsestLevel;
-        _pinReceived = 0;
-
-        // Pin coarsest level on a background thread so the UI stays responsive.
-        // Once pinning completes, post back to the main thread to finish setup.
-        // Use QPointer to guard against the viewer being destroyed before the
-        // background thread finishes.
-        auto vol = _volume;
-        QPointer<CTiledVolumeViewer> guard(this);
-        std::thread([guard, vol]() {
-            vol->pinCoarsestLevel(/*blocking=*/true);
-            QMetaObject::invokeMethod(qApp, [guard]() {
-                if (guard)
-                    guard->onPinComplete();
-            }, Qt::QueuedConnection);
-        }).detach();
     }
 
+    onPinComplete();
     updateStatusLabel();
 }
 
@@ -328,6 +361,11 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
             previousSurf &&
             previousSurf.get() == surf.get() &&
             dynamic_cast<QuadSurface*>(surf.get()) != nullptr;
+        const bool isInPlacePlaneUpdate =
+            surf &&
+            previousSurf &&
+            previousSurf.get() == surf.get() &&
+            dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
 
         _surfWeak = surf;
         _surfBBoxCache = {};  // invalidate bounding box cache
@@ -349,6 +387,13 @@ void CTiledVolumeViewer::onSurfaceChanged(std::string name, std::shared_ptr<Surf
             if (isInPlaceQuadEditUpdate) {
                 ++_surfaceContentVersion;
                 updateParamsHash();
+            } else if (isInPlacePlaneUpdate) {
+                _surfaceContentVersion = 0;
+                updateParamsHash();
+                updateContentMinScale();
+                rebuildContentGrid();
+                centerViewport();
+                _renderController->setAtomicNextEpochSwap(true);
             } else {
                 _surfaceContentVersion = 0;
                 updateParamsHash();
@@ -460,6 +505,32 @@ void CTiledVolumeViewer::updateContentMinScale()
     _contentMinScale = std::max(fitScale, TiledViewerCamera::MIN_SCALE);
 }
 
+void CTiledVolumeViewer::beginInteractionRender()
+{
+    _interactionQualityActive = true;
+    if (_interactionSettleTimer) {
+        _interactionSettleTimer->start();
+    }
+}
+
+void CTiledVolumeViewer::settleInteractionRender()
+{
+    if (_isPanning || !_interactionQualityActive) {
+        return;
+    }
+
+    _interactionQualityActive = false;
+    _camera.invalidate();
+    submitRender();
+    renderIntersections();
+    updateStatusLabel();
+}
+
+bool CTiledVolumeViewer::interactionRenderActive() const
+{
+    return _isPanning || _interactionQualityActive;
+}
+
 void CTiledVolumeViewer::rebuildContentGrid()
 {
     if (!fGraphicsView) return;
@@ -528,21 +599,13 @@ void CTiledVolumeViewer::onPinComplete()
 {
     if (!_volume) return;
 
-    _hadValidDataBounds = _volume->dataBounds().valid;
+    _hadValidDataBounds = false;
 
-    // For remote volumes with no surface, create a default PlaneSurface
-    // centered in the volume so the axis-aligned viewers can render.
+    // Create a default PlaneSurface immediately so remote volumes render
+    // without waiting for a coarsest-level bounds scan.
     if (!_surfWeak.lock() && _volume && isAxisAlignedView()) {
         auto shape = _volume->shape();  // {width, height, slices} = {x, y, z}
-        const auto& db = _volume->dataBounds();
-        cv::Vec3f center;
-        if (db.valid) {
-            center = cv::Vec3f((db.minX + db.maxX) * 0.5f,
-                               (db.minY + db.maxY) * 0.5f,
-                               (db.minZ + db.maxZ) * 0.5f);
-        } else {
-            center = cv::Vec3f(shape[0] * 0.5f, shape[1] * 0.5f, shape[2] * 0.5f);
-        }
+        cv::Vec3f center(shape[0] * 0.5f, shape[1] * 0.5f, shape[2] * 0.5f);
         cv::Vec3f normal;
         if (_surfName == "xy plane") normal = cv::Vec3f(0, 0, 1);
         else if (_surfName == "xz plane" || _surfName == "seg xz") normal = cv::Vec3f(0, 1, 0);
@@ -565,6 +628,25 @@ void CTiledVolumeViewer::onPinComplete()
     submitRender();
     renderIntersections();
     updateStatusLabel();
+
+    // Trigger background prefetch of pyramid levels if configured.
+    // Setting value = how many of the coarsest levels to download.
+    // E.g., with levels 0-5: setting=1 downloads 5/, setting=2 downloads 5/+4/, etc.
+    // Level 5 (coarsest) is already pinned above, so we prefetch the rest.
+    if (_volume && _volume->isRemote()) {
+        using namespace vc3d::settings;
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        int prefetchCount = settings.value(perf::PREFETCH_LEVELS, perf::PREFETCH_LEVELS_DEFAULT).toInt();
+        if (prefetchCount > 1) {
+            int maxLevel = static_cast<int>(_volume->numScales()) - 1;
+            // Coarsest (maxLevel) is already pinned; prefetch the next ones down
+            int fromLevel = std::max(0, maxLevel - prefetchCount + 1);
+            int toLevel = maxLevel - 1;
+            if (toLevel >= fromLevel) {
+                _volume->prefetchLevels(fromLevel, toLevel);
+            }
+        }
+    }
 }
 
 void CTiledVolumeViewer::onDataBoundsReady()
@@ -692,6 +774,7 @@ void CTiledVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 
 void CTiledVolumeViewer::setSliceOffset(float dz)
 {
+    beginInteractionRender();
     _camera.zOff += dz;
     _camera.invalidate();
     submitRender();
@@ -798,6 +881,9 @@ void CTiledVolumeViewer::resetSurfaceOffsets()
 void CTiledVolumeViewer::onPanStart(Qt::MouseButton /*buttons*/, Qt::KeyboardModifiers /*modifiers*/)
 {
     _isPanning = true;
+    if (_interactionSettleTimer) {
+        _interactionSettleTimer->stop();
+    }
     // The view handles pan tracking with _last_pan_position internally,
     // but since we disabled scrollbars, its scroll-based panning won't work.
     // We need to intercept the mouse move deltas instead.
@@ -812,6 +898,10 @@ void CTiledVolumeViewer::onPanStart(Qt::MouseButton /*buttons*/, Qt::KeyboardMod
 void CTiledVolumeViewer::onPanRelease(Qt::MouseButton /*buttons*/, Qt::KeyboardModifiers /*modifiers*/)
 {
     _isPanning = false;
+    if (!_interactionQualityActive) {
+        _camera.invalidate();
+        submitRender();
+    }
     _renderController->markOverlaysDirty();
     renderIntersections();
 }
@@ -890,7 +980,7 @@ void CTiledVolumeViewer::submitRender()
             QPen(COLOR_FOCUS, 3, Qt::DashDotLine, Qt::RoundCap, Qt::RoundJoin));
         _ov.centerMarker->setZValue(11);
     }
-    QPointF centerScene = _tileScene->surfaceToScene(_camera.surfacePtr[0], _camera.surfacePtr[1]);
+    QPointF centerScene = _tileScene->surfaceToScene(_focusSurfacePos[0], _focusSurfacePos[1]);
     _ov.centerMarker->setPos(centerScene);
 
     // Submit to async render controller
@@ -1059,7 +1149,11 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     TileRenderParams params;
     params.worldKey = wk;
     params.epoch = _camera.epoch;
-    params.cacheIdentity = _renderController ? _renderController->paramsHash() : 0;
+
+    const bool interactionActive = interactionRenderActive();
+    uint64_t cacheIdentity = _renderController ? _renderController->paramsHash() : 0;
+    cacheIdentity = utils::hash_combine_values(cacheIdentity, interactionActive);
+    params.cacheIdentity = cacheIdentity;
 
     // Surface parameter ROI from world tile coordinates
     params.surfaceROI.x = wk.worldCol * _contentBounds.worldTileSize;
@@ -1075,6 +1169,12 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     params.dsScaleIdx = _camera.dsScaleIdx;
     params.zOff = _camera.zOff;
 
+    if (interactionActive && _volume) {
+        const int maxLevel = std::max(0, static_cast<int>(_volume->numScales()) - 1);
+        params.dsScaleIdx = std::min(_camera.dsScaleIdx + 1, maxLevel);
+        params.dsScale = std::pow(2.0f, -params.dsScaleIdx);
+    }
+
     params.windowLow = _baseWindowLow;
     params.windowHigh = _baseWindowHigh;
     params.stretchValues = _stretchValues;
@@ -1084,7 +1184,7 @@ TileRenderParams CTiledVolumeViewer::buildRenderParams(const WorldTileKey& wk) c
     params.overlayWindowLow = _overlayWindowLow;
     params.overlayWindowHigh = _overlayWindowHigh;
     params.overlayColormapId = _overlayColormapId;
-    params.useFastInterpolation = _useFastInterpolation;
+    params.useFastInterpolation = _useFastInterpolation || interactionActive;
     params.compositeSettings = _compositeSettings;
 
     return params;
@@ -1115,6 +1215,11 @@ bool CTiledVolumeViewer::sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n,
 {
     auto surf = _surfWeak.lock();
     return tiledSceneToVolume(surf.get(), _tileScene, scenePos, p, n);
+}
+
+cv::Vec2f CTiledVolumeViewer::sceneToSurfaceCoords(const QPointF& scenePos) const
+{
+    return _tileScene->sceneToSurface(scenePos);
 }
 
 // ============================================================================
@@ -1348,10 +1453,28 @@ void CTiledVolumeViewer::onPOIChanged(std::string name, POI* poi)
 
     if (name == "focus") {
         if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-            if (poi->p == plane->origin()) return;
-            plane->setOrigin(poi->p);
+            beginInteractionRender();
+            const bool originChanged = (poi->p != plane->origin());
+            if (originChanged) {
+                plane->setOrigin(poi->p);
+            }
+
+            // Plane viewers should center on the new focus point itself,
+            // not preserve the old pan offset from the previous plane origin.
+            _camera.surfacePtr[0] = 0.0f;
+            _camera.surfacePtr[1] = 0.0f;
+            _focusSurfacePos[0] = 0.0f;
+            _focusSurfacePos[1] = 0.0f;
+            centerViewport();
             scheduleOverlayUpdate();
-            _state->setSurface(_surfName, surf);
+            if (originChanged) {
+                _state->setSurface(_surfName, surf);
+            } else {
+                _camera.invalidate();
+                submitRender();
+                renderIntersections();
+                updateStatusLabel();
+            }
         } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
             cv::Vec3f ptr(0, 0, 0);
             auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
@@ -1361,6 +1484,8 @@ void CTiledVolumeViewer::onPOIChanged(std::string name, POI* poi)
                 cv::Vec3f loc = quad->loc(ptr);
                 _camera.surfacePtr[0] = loc[0];
                 _camera.surfacePtr[1] = loc[1];
+                _focusSurfacePos[0] = loc[0];
+                _focusSurfacePos[1] = loc[1];
                 _camera.invalidate();
                 submitRender();
             }
@@ -1411,12 +1536,6 @@ void CTiledVolumeViewer::onPOIChanged(std::string name, POI* poi)
 
 void CTiledVolumeViewer::updateStatusLabel()
 {
-    // Debounce: skip if less than 100ms since last update
-    auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - _lastStatusUpdate).count() < 100)
-        return;
-    _lastStatusUpdate = now;
-
     QString status = QString("%1x").arg(_camera.scale, 0, 'f', 2);
 
     status += QString(" z=%1").arg(_camera.zOff, 0, 'f', 1);
@@ -1440,29 +1559,43 @@ void CTiledVolumeViewer::updateStatusLabel()
     }
     if (_volume && _volume->tieredCache()) {
         auto s = _volume->tieredCache()->stats();
+
+        // Hit ratios
         uint64_t total = s.hotHits + s.warmHits + s.coldHits + s.iceFetches + s.misses;
         if (total > 0) {
             auto pct = [&](uint64_t n) { return static_cast<int>(100 * n / total); };
             status += QString(" | H%1 W%2 D%3")
                 .arg(pct(s.hotHits)).arg(pct(s.warmHits)).arg(pct(s.coldHits));
         }
-    }
 
-    // Remote download stats
-    if (_volume && _volume->tieredCache()) {
-        auto s = _volume->tieredCache()->stats();
-        if (s.iceFetches > 0 || s.ioPending > 0) {
-            status += QString(" | dl %1").arg(s.iceFetches);
-            if (s.ioPending > 0)
-                status += QString(" q%1").arg(s.ioPending);
+        // RAM usage (hot + warm)
+        double hotGB = s.hotBytes / (1024.0 * 1024.0 * 1024.0);
+        double warmGB = s.warmBytes / (1024.0 * 1024.0 * 1024.0);
+        status += QString(" | ram %1+%2G").arg(hotGB, 0, 'f', 1).arg(warmGB, 0, 'f', 1);
+
+        // Disk cache
+        if (s.diskFiles > 0) {
+            double diskGB = s.diskBytes / (1024.0 * 1024.0 * 1024.0);
+            status += QString(" | disk %1 (%2G)").arg(s.diskFiles).arg(diskGB, 0, 'f', 1);
         }
+
+        // Negative cache
+        if (s.negativeCount > 0)
+            status += QString(" | neg %1").arg(s.negativeCount);
+
+        // Queue & downloads
+        if (s.ioPending > 0)
+            status += QString(" | q%1").arg(s.ioPending);
+        if (s.iceFetches > 0)
+            status += QString(" dl%1").arg(s.iceFetches);
     } else if (_pinTotal > 0 && _pinReceived < _pinTotal) {
-        status += QString(" | downloading %1/%2").arg(static_cast<int>(_pinReceived)).arg(static_cast<int>(_pinTotal));
+        status += QString(" | downloading %1/%2").arg(_pinReceived).arg(_pinTotal.load());
     }
 
     status += " [tiled]";
 
     _lbl->setText(status);
+    _lbl->adjustSize();
 }
 
 void CTiledVolumeViewer::fitSurfaceInView()
@@ -1539,6 +1672,8 @@ void CTiledVolumeViewer::fitSurfaceInView()
     _camera.surfacePtr[0] = gridCenterX - pts.cols * 0.5f;
     _camera.surfacePtr[1] = gridCenterY - pts.rows * 0.5f;
     _camera.surfacePtr[2] = 0;
+    _focusSurfacePos[0] = _camera.surfacePtr[0];
+    _focusSurfacePos[1] = _camera.surfacePtr[1];
 
     if (_volume) _camera.recalcPyramidLevel(_volume->numScales());
     _camera.invalidate();
@@ -1770,16 +1905,21 @@ void CTiledVolumeViewer::renderIntersections()
     auto surf = _surfWeak.lock();
     auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
     if (!plane || !_state || !_tileScene || !_viewerManager) {
+        std::cout << "[renderIntersections:" << _surfName << "] early return: plane=" << (plane != nullptr) << " state=" << (_state != nullptr)
+                  << " tileScene=" << (_tileScene != nullptr) << " viewerManager=" << (_viewerManager != nullptr) << std::endl;
         return;
     }
 
     auto* patchIndex = _viewerManager->surfacePatchIndex();
     if (!patchIndex || patchIndex->empty()) {
+        std::cout << "[renderIntersections:" << _surfName << "] early return: patchIndex=" << (patchIndex != nullptr)
+                  << " empty=" << (patchIndex ? patchIndex->empty() : true) << std::endl;
         return;
     }
 
     const QRectF sceneRect = viewportSceneRect();
     if (!sceneRect.isValid()) {
+        std::cout << "[renderIntersections:" << _surfName << "] early return: invalid sceneRect" << std::endl;
         return;
     }
 
@@ -1805,6 +1945,8 @@ void CTiledVolumeViewer::renderIntersections()
         addTarget(name);
     }
 
+    std::cout << "[renderIntersections:" << _surfName << "] intersectTgts=" << _intersectTgts.size() << " targets=" << targets.size() << std::endl;
+
     if (targets.empty()) {
         return;
     }
@@ -1820,22 +1962,59 @@ void CTiledVolumeViewer::renderIntersections()
     }
 
     const auto& activeSeg = activeSegmentationHandle();
-    const QColor defaultColor = activeSeg.accentColor.isValid() ? activeSeg.accentColor : QColor(COLOR_SEG_XY);
+    const QColor activeSegColor = activeSeg.accentColor.isValid() ? activeSeg.accentColor
+                                                                  : (_surfName == "seg yz"   ? QColor(COLOR_SEG_YZ)
+                                                                     : _surfName == "seg xz" ? QColor(COLOR_SEG_XZ)
+                                                                                             : QColor(COLOR_SEG_XY));
     auto activeSegShared = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
     auto* segOverlay = _viewerManager->segmentationOverlay();
     const bool useApprovalMask = segOverlay && segOverlay->hasApprovalMaskData() && activeSegShared;
 
-    std::unordered_map<QRgb, QPainterPath> groupedPaths;
-    std::unordered_map<QRgb, QColor> groupedColors;
+    // Group paths by (color, z-value) for efficient batching
+    struct StyleKey {
+        QRgb rgba;
+        int z;
+        bool operator==(const StyleKey& o) const { return rgba == o.rgba && z == o.z; }
+    };
+    struct StyleKeyHash {
+        size_t operator()(const StyleKey& k) const { return std::hash<uint64_t>{}((uint64_t(k.rgba) << 32) | k.z); }
+    };
+    std::unordered_map<StyleKey, QPainterPath, StyleKeyHash> groupedPaths;
+    std::unordered_map<StyleKey, QColor, StyleKeyHash> groupedColors;
 
     for (const auto& [targetSurface, segments] : intersections) {
         if (!targetSurface || segments.empty()) {
             continue;
         }
 
-        QColor baseColor = (activeSeg.surface && targetSurface.get() == activeSeg.surface)
-            ? defaultColor
-            : (_highlightedSurfaceIds.count(targetSurface->id) > 0 ? QColor(Qt::cyan) : defaultColor);
+        const bool isActiveSeg = activeSegShared && targetSurface == activeSegShared;
+        const bool isHighlighted = _highlightedSurfaceIds.count(targetSurface->id) > 0;
+
+        // Determine base color and z-value for this surface
+        QColor baseColor;
+        int zValue;
+        if (isActiveSeg) {
+            baseColor = activeSegColor;
+            zValue = static_cast<int>(kActiveSegZ);
+        } else if (isHighlighted) {
+            baseColor = QColor(0, 220, 255);  // cyan
+            zValue = static_cast<int>(kHighlightZ);
+        } else {
+            // Persistent palette color assignment
+            const auto& surfId = targetSurface->id;
+            size_t colorIndex;
+            auto colorIt = _surfaceColorAssignments.find(surfId);
+            if (colorIt != _surfaceColorAssignments.end()) {
+                colorIndex = colorIt->second;
+            } else if (_surfaceColorAssignments.size() < 500) {
+                colorIndex = _nextColorIndex++;
+                _surfaceColorAssignments[surfId] = colorIndex;
+            } else {
+                colorIndex = std::hash<std::string>{}(surfId);
+            }
+            baseColor = kIntersectionPalette[colorIndex % std::size(kIntersectionPalette)];
+            zValue = static_cast<int>(kIntersectionZ);
+        }
 
         for (const auto& segment : segments) {
             QPointF a = volumeToScene(segment.world[0]);
@@ -1846,14 +2025,16 @@ void CTiledVolumeViewer::renderIntersections()
 
             QColor color = baseColor;
             float alpha = _intersectionOpacity;
+            int segZ = zValue;
 
-            if (useApprovalMask && targetSurface.get() == activeSegShared.get()) {
+            if (useApprovalMask && isActiveSeg) {
                 const cv::Vec3f midParam = (segment.surfaceParams[0] + segment.surfaceParams[1]) * 0.5f;
                 const auto [row, col] = surfaceParamToGrid(targetSurface.get(), midParam);
                 const QColor approvalColor = segOverlay->queryApprovalColor(row, col);
                 if (approvalColor.isValid()) {
                     color = approvalColor;
                     alpha *= std::clamp(segOverlay->approvalMaskOpacity() / 100.0f, 0.0f, 1.0f);
+                    segZ += 5;
                 }
             }
 
@@ -1862,7 +2043,7 @@ void CTiledVolumeViewer::renderIntersections()
                 continue;
             }
 
-            const QRgb key = color.rgba();
+            StyleKey key{color.rgba(), segZ};
             QPainterPath& path = groupedPaths[key];
             path.moveTo(a);
             path.lineTo(b);
@@ -1883,7 +2064,7 @@ void CTiledVolumeViewer::renderIntersections()
         pen.setJoinStyle(Qt::RoundJoin);
         item->setPen(pen);
         item->setBrush(Qt::NoBrush);
-        item->setZValue(kIntersectionZ);
+        item->setZValue(key.z);
         _scene->addItem(item);
         items.push_back(item);
     }

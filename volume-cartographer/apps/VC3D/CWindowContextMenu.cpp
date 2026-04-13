@@ -4,6 +4,9 @@
 #include "SegmentationCommandHandler.hpp"
 
 #include <QDialogButtonBox>
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
 #include <QSettings>
 #include <QMessageBox>
 #include <QStandardPaths>
@@ -45,6 +48,35 @@ static bool runProcessBlocking(const QString& program,
 }
 
 // --------- locate generic vc_* executables -----------------------------------
+static bool isExecutableFile(const QString& path)
+{
+    QFileInfo fi(path);
+    return fi.exists() && fi.isFile() && fi.isExecutable();
+}
+
+static QStringList applicationRelativeExecutablePaths(const QString& name)
+{
+#ifdef _WIN32
+    const QString executableName = name.endsWith(QStringLiteral(".exe"), Qt::CaseInsensitive)
+        ? name
+        : name + QStringLiteral(".exe");
+#else
+    const QString executableName = name;
+#endif
+
+    const QString appDir = QCoreApplication::applicationDirPath();
+    QStringList candidates{
+        QDir(appDir).filePath(executableName),
+        QDir(appDir).filePath(QStringLiteral("../") + executableName),
+        QDir(appDir).filePath(QStringLiteral("../bin/") + executableName),
+        QDir(appDir).filePath(QStringLiteral("../../bin/") + executableName),
+        QDir(appDir).filePath(QStringLiteral("../libexec/") + executableName),
+        QDir(appDir).filePath(QStringLiteral("../Resources/bin/") + executableName),
+    };
+    candidates.removeDuplicates();
+    return candidates;
+}
+
 static QString findVcTool(const char* name)
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -52,10 +84,14 @@ static QString findVcTool(const char* name)
     const QString key2 = QStringLiteral("tools/%1").arg(name);
     const QString iniPath =
         settings.value(key1, settings.value(key2)).toString().trimmed();
-    if (!iniPath.isEmpty()) {
-        QFileInfo fi(iniPath);
-        if (fi.exists() && fi.isFile() && fi.isExecutable())
-            return fi.absoluteFilePath();
+    if (!iniPath.isEmpty() && isExecutableFile(iniPath)) {
+        return QFileInfo(iniPath).absoluteFilePath();
+    }
+
+    for (const QString& candidate : applicationRelativeExecutablePaths(QString::fromLatin1(name))) {
+        if (isExecutableFile(candidate)) {
+            return QFileInfo(candidate).absoluteFilePath();
+        }
     }
 
 #if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
