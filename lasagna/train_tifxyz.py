@@ -23,6 +23,22 @@ Config JSON format:
 """
 from __future__ import annotations
 
+# Pre-warm numba LLVM runtime before any other imports. torch pulls in
+# opt_einsum, whose backends/__init__.py eagerly imports
+# opt_einsum.backends.tensorflow, which loads tensorflow's LLVM and poisons
+# llvmlite's runtime. A later @njit compile then aborts with
+# "LLVM ERROR: Symbol not found: NRT_MemInfo_call_dtor". Forcing numba to
+# initialize first keeps its runtime symbols registered.
+import numba as _numba  # noqa: E402
+import numpy as _np  # noqa: E402
+
+@_numba.njit
+def _numba_warmup():
+    return _np.zeros(1, dtype=_np.int32)
+
+_numba_warmup()
+del _numba, _np, _numba_warmup
+
 import argparse
 import json
 import math
@@ -38,6 +54,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 from types import SimpleNamespace
 
 # Ensure lasagna/ dir is on sys.path for sibling imports
@@ -48,7 +65,7 @@ if _LASAGNA_DIR not in sys.path:
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
 from tifxyz_labels import compute_patch_labels, encode_direction_channels
-from tifxyz_dataset import TifxyzLasagnaDataset, collate_variable_surfaces
+from tifxyz_lasagna_dataset import TifxyzLasagnaDataset, collate_variable_surfaces
 
 
 TAG = "[train_tifxyz]"
@@ -373,6 +390,7 @@ def train(
     norm_type: str = "instance",
     upsample_mode: str = "trilinear",
     precision: str = "bf16",
+    verbose: bool = False,
 ) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path(log_dir) / f"{timestamp}_{run_name}"
@@ -465,7 +483,15 @@ def train(
         model.train()
         epoch_losses: List[float] = []
 
-        for batch in train_loader:
+        train_iter = train_loader
+        if verbose:
+            train_iter = tqdm(
+                train_loader,
+                desc=f"epoch {epoch + 1}/{epochs} train",
+                dynamic_ncols=True,
+            )
+
+        for batch in train_iter:
             image = batch["image"].to(device, non_blocking=True)
 
             # Compute targets on GPU from surface masks
@@ -515,6 +541,10 @@ def train(
             if not math.isfinite(loss.item()):
                 print(f"{TAG} NaN/Inf at step {global_step}: loss={loss.item()}", flush=True)
 
+            if verbose:
+                running = sum(epoch_losses[-20:]) / min(len(epoch_losses), 20)
+                train_iter.set_postfix(loss=f"{loss.item():.4f}", avg20=f"{running:.4f}")
+
             if global_step % 10 == 0:
                 writer.add_scalar("train/loss", loss.item(), global_step)
                 writer.add_scalar("train/loss_cos", loss_cos.item(), global_step)
@@ -535,6 +565,7 @@ def train(
             device, writer, global_step,
             w_cos, w_mag, w_dir,
             amp_dtype=amp_dtype, use_autocast=use_autocast,
+            verbose=verbose,
         )
 
         mean_train = sum(epoch_losses) / max(len(epoch_losses), 1)
@@ -567,13 +598,18 @@ def _evaluate(
     device, writer, global_step,
     w_cos, w_mag, w_dir,
     amp_dtype=torch.bfloat16, use_autocast=True,
+    verbose: bool = False,
 ):
     model.eval()
     losses = []
     vis_done = False
 
+    val_iter = loader
+    if verbose:
+        val_iter = tqdm(loader, desc="val", dynamic_ncols=True, leave=False)
+
     with torch.no_grad(), torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_autocast):
-        for batch in loader:
+        for batch in val_iter:
             image = batch["image"].to(device)
             targets, validity, normals_valid, dir_weight = compute_batch_targets(
                 batch, device,
@@ -593,6 +629,9 @@ def _evaluate(
             loss_dir = scale_loss_mse(pred[:, 2:8], targets[:, 2:8], mask=dir_mask, weight=dir_weight)
             loss = w_cos * loss_cos + w_mag * loss_mag + w_dir * loss_dir
             losses.append(loss.item())
+
+            if verbose:
+                val_iter.set_postfix(loss=f"{loss.item():.4f}")
 
             if not vis_done:
                 _log_vis(writer, "val", image, pred, targets, cos_mask, global_step)
@@ -633,6 +672,8 @@ def main() -> None:
                         choices=["transpconv", "trilinear", "pixelshuffle"])
     parser.add_argument("--precision", type=str, default="bf16",
                         choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Show per-sample progress bar with running loss.")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -654,6 +695,7 @@ def main() -> None:
         norm_type=args.norm_type,
         upsample_mode=args.upsample_mode,
         precision=args.precision,
+        verbose=args.verbose,
     )
 
 

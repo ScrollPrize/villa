@@ -167,3 +167,7 @@ python $SRC/preprocess_cos_omezarr.py integrate --z-volume ../s5/PHerc172.volpkg
 for ax in z y x; do     python ${SRC}/preprocess_cos_omezarr.py         --axis $ax         --input $VOLUME         --output cos_3d_${ax}.zarr         --unet-checkpoint $CKPT         --crop 1500 2000 6000 3000 3000 4000; done && python $SRC/preprocess_cos_omezarr.py integrate --z-volume cos_3d_z.zarr --y-volume cos_3d_y.zarr --x-volume cos_3d_x.zarr --output cos_3d.zarr --pred-dt /home/hendrik/remote/turbosheep/home/hendrik/business/aiconsulting/vesuviuschallenge/data/s5/PHerc172.volpkg/volumes/s5_059_medial_ome.zarr/0/
 
 python $SRC/preprocess_cos_omezarr.py integrate --z-volume cos_3d_z.zarr --y-volume cos_3d_y.zarr --x-volume cos_3d_x.zarr --output cos3_3d.zarr --pred-dt /home/hendrik/business/aiconsulting/vesuviuschallenge/data/s5/PHerc172.volpkg/volumes/s5_059_medial_ome.zarr/0/
+
+PYTHONPATH=$SRC/vesuvius/src/:$SRC/ python $SRC/lasagna/train_tifxyz.py --config $SRC/lasagna/configs/tifxyz_train_s3.json --patch-size 64 --batch-size 1 --epochs 2 --num-workers 0
+
+

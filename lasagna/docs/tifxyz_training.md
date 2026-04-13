@@ -196,9 +196,9 @@ Resume training with `--weights path/to/model_current.pt`.
 
 ## Pipeline Overview
 
-1. **Patch finding** -- `find_patches()` scans tifxyz segments, finds 3D
-   patches that overlap surfaces within `z_range`. Results are cached to
-   `.tifxyz_patch_cache.json` per segments directory.
+1. **Patch finding** -- `find_world_chunk_patches()` tiles the volume into
+   3D chunks and finds surface wraps within each chunk. Results are cached to
+   `.patch_cache/world_chunks_*.json` per segments directory.
 
 2. **Dataset `__getitem__`** -- reads a CT crop from zarr, voxelizes surface
    masks and direction channels from tifxyz grids.
@@ -218,8 +218,8 @@ Resume training with `--weights path/to/model_current.pt`.
 | File | Purpose |
 |------|---------|
 | `lasagna/train_tifxyz.py` | Training script and CLI |
-| `lasagna/tifxyz_dataset.py` | `TifxyzLasagnaDataset` -- CT crops + surface voxelization |
+| `lasagna/tifxyz_lasagna_dataset.py` | `TifxyzLasagnaDataset` -- CT crops + surface voxelization |
 | `lasagna/tifxyz_labels.py` | `compute_patch_labels()` -- GPU label derivation |
-| `ink-detection/tifxyz_dataset/patch_finding.py` | `find_patches()` -- patch discovery |
-| `vesuvius/src/vesuvius/neural_tracing/datasets/common.py` | `open_zarr()` -- volume access with S3/HTTP + caching |
+| `vesuvius/src/vesuvius/neural_tracing/datasets/patch_finding.py` | `find_world_chunk_patches()` -- world-chunk patch discovery |
+| `vesuvius/src/vesuvius/neural_tracing/datasets/common.py` | `open_zarr()`, `voxelize_surface_grid_masked()`, `ChunkPatch` |
 | `vesuvius/src/vesuvius/image_proc/edt.py` | GPU-accelerated EDT (CuPy > edt > scipy fallback) |

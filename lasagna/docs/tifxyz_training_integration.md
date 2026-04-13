@@ -95,8 +95,8 @@ environment (S3, HTTPS `volumes.aws.ash2txt.org`, or local mount).
 Each dataset specifies a `z_range: [lo, hi]` defining the safe Z-slice range
 for that scroll. Regions outside this range extend beyond the physical scroll
 (e.g. above/below the rolled papyrus) and should be excluded from training.
-The patch-finding code in `ink-detection/tifxyz_dataset/patch_finding.py`
-already filters segments via `_segment_overlaps_z_range()`.
+The patch-finding code in `vesuvius/src/vesuvius/neural_tracing/datasets/patch_finding.py`
+filters segments via `_segment_overlaps_z_range()` from `common.py`.
 
 ### Volume access
 
@@ -126,9 +126,9 @@ accidental uncached streaming.
 }
 ```
 
-The neural tracer's `find_patches()` calls `open_zarr()` per dataset entry,
-so switching from local to remote volumes only requires changing `volume_path`
-and adding `volume_cache_dir`.
+The `find_world_chunk_patches()` call (via `open_zarr()`) handles per-dataset
+volume access, so switching from local to remote volumes only requires
+changing `volume_path` and adding `volume_cache_dir`.
 
 ### Tifxyz surface access
 
@@ -159,15 +159,14 @@ Key capabilities:
 | Scale | `_scale` tuple | Grid spacing: stored-res → full-res factor |
 | Labels | `load_label(selector)` | Associated label TIFFs (e.g. ink labels) |
 
-The neural tracer's `TifxyzInkDataset` (`ink-detection/tifxyz_dataset/`)
-already demonstrates:
-- Finding 3D patches that overlap surfaces
-  (`ink-detection/tifxyz_dataset/patch_finding.py`)
-- Sampling surface grids into volume patches with interpolation
-  (`_sample_patch_supervision_grid` in `common.py`)
-- Computing normals per grid point (`_estimate_surface_normals_zyx`)
-- Voxelizing surface points into 3D volumes (`_voxelize_surface_from_sampled_grid`)
-- Reading CT volume crops from zarr (`_read_volume_crop_from_patch_dict`)
+The neural tracing pipeline (`vesuvius/src/vesuvius/neural_tracing/datasets/`)
+provides:
+- World-chunk patch tiling
+  (`patch_finding.py:find_world_chunk_patches()`)
+- Surface extraction and upsampling
+  (`common.py:_upsample_world_triplet()`, `_trim_to_world_bbox()`)
+- Voxelizing surface grids into 3D volumes (`common.py:voxelize_surface_grid_masked()`)
+- Reading CT volume crops from zarr (`common.py:_read_volume_crop_from_patch()`)
 
 
 ---
@@ -385,22 +384,21 @@ We extend this to splat multi-channel values (not just binary presence).
 
 ### Approach A: New dataset class (like TifxyzInkDataset) — IMPLEMENTED
 
-Implemented in `lasagna/tifxyz_dataset.py` as `TifxyzLasagnaDataset`.
+Implemented in `lasagna/tifxyz_lasagna_dataset.py` as `TifxyzLasagnaDataset`.
 
-- Uses the same `find_patches()` from `ink-detection/tifxyz_dataset/patch_finding.py`
-  (unmodified — the neural tracer datasets have ink labels AND a pre-computed
-  `.tifxyz_patch_cache.json`, so `find_patches()` loads cached patches instantly)
-- Default `patch_cache_filename` is `_PATCH_CACHE_DEFAULT_FILENAME`
-  (`.tifxyz_patch_cache.json`) to match the neural tracer's existing cache
+- Uses `find_world_chunk_patches()` from `vesuvius/neural_tracing/datasets/patch_finding.py`
+  which tiles the volume into 3D chunks and finds surface wraps within each
+  chunk. Results are cached to `.patch_cache/world_chunks_*.json` per segments
+  directory.
 - In `__getitem__`, reads a CT crop and voxelizes surface masks + direction channels
 - EDT, chain ordering, cos/grad_mag derivation happen on GPU in the train step
   via `lasagna/tifxyz_labels.py:compute_patch_labels()`
 
 **Key implementation details:**
-- `find_patches()` is called with its standard signature (no modifications to
-  `patch_finding.py` — labels are required and present in the datasets)
-- Multi-surface overlap: finds all segments overlapping each patch bbox, voxelizes
-  each into a separate mask, splats direction channels from all surfaces combined
+- `find_world_chunk_patches()` handles patch discovery with caching; each chunk
+  contains pre-computed wraps with segment references and 2D bboxes
+- Multi-surface wraps: each chunk's wraps are voxelized into separate masks,
+  direction channels are splatted from all wraps combined
 - Multi-channel trilinear splatting via `_splat_multichannel_trilinear_numba()`
   (numba) with numpy fallback
 
@@ -503,12 +501,11 @@ class LasagnaTrainer(BaseTrainer):
 | Tifxyz data type | `vesuvius/src/vesuvius/tifxyz/types.py` | `Tifxyz`, `compute_normals()`, `get_normals()` |
 | Tifxyz loading | `vesuvius/src/vesuvius/tifxyz/io.py` | `read_tifxyz()`, `load_folder()` |
 | Tifxyz interpolation | `vesuvius/src/vesuvius/tifxyz/upsampling.py` | `interpolate_at_points()` |
-| Neural tracer dataset | `ink-detection/tifxyz_dataset/tifxyz_dataset.py` | `TifxyzInkDataset` |
-| Patch finding | `ink-detection/tifxyz_dataset/patch_finding.py` | `find_patches()` |
-| Surface sampling | `ink-detection/tifxyz_dataset/common.py` | `_sample_patch_supervision_grid()` |
-| Normal estimation | `ink-detection/tifxyz_dataset/common.py` | `_estimate_surface_normals_zyx()` |
-| Voxelization | `ink-detection/tifxyz_dataset/common.py` | `_voxelize_surface_from_sampled_grid()`, `_splat_points_trilinear_numba()` |
-| Volume crop reading | `ink-detection/tifxyz_dataset/common.py` | `_read_volume_crop_from_patch_dict()` |
+| Patch finding | `vesuvius/.../datasets/patch_finding.py` | `find_world_chunk_patches()` |
+| Surface extraction | `vesuvius/.../datasets/common.py` | `_upsample_world_triplet()`, `_trim_to_world_bbox()` |
+| Voxelization | `vesuvius/.../datasets/common.py` | `voxelize_surface_grid_masked()` |
+| Volume crop reading | `vesuvius/.../datasets/common.py` | `_read_volume_crop_from_patch()` |
+| Chunk patch type | `vesuvius/.../datasets/common.py` | `ChunkPatch` |
 | Vesuvius ZarrDataset | `vesuvius/src/vesuvius/models/datasets/zarr_dataset.py` | `ZarrDataset` |
 | Vesuvius BaseTrainer | `vesuvius/src/vesuvius/models/training/train.py` | `BaseTrainer` |
 | Config manager | `vesuvius/src/vesuvius/models/configuration/config_manager.py` | `ConfigManager` |
@@ -523,15 +520,15 @@ class LasagnaTrainer(BaseTrainer):
 ## 7. Chosen Approach
 
 **Approach A (on-the-fly dataset)** was implemented directly, skipping the
-preprocessing phase. The neural tracer datasets already have ink labels and
-pre-computed `.tifxyz_patch_cache.json` files, so `find_patches()` loads
-patches from cache instantly with no progress bars or recomputation.
+preprocessing phase. The neural tracing pipeline's `find_world_chunk_patches()`
+uses pre-computed `.patch_cache/world_chunks_*.json` files, loading cached
+patches instantly with no progress bars or recomputation.
 
 ### Implementation files
 
 | File | Purpose |
 |------|---------|
-| `lasagna/tifxyz_dataset.py` | `TifxyzLasagnaDataset` — data loading (CT crops, surface masks, direction channels) |
+| `lasagna/tifxyz_lasagna_dataset.py` | `TifxyzLasagnaDataset` — data loading (CT crops, surface masks, direction channels) |
 | `lasagna/tifxyz_labels.py` | `compute_patch_labels()` — GPU label derivation (EDT, chain ordering, cos/grad_mag) |
 | `lasagna/train_tifxyz.py` | Training script |
 
@@ -539,7 +536,7 @@ patches from cache instantly with no progress bars or recomputation.
 
 The multi-channel trilinear splatting kernel
 (`_splat_multichannel_trilinear_numba`) is implemented in
-`lasagna/tifxyz_dataset.py` with a numpy fallback when numba is unavailable.
+`lasagna/tifxyz_lasagna_dataset.py` with a numpy fallback when numba is unavailable.
 
 ### Handling multiple surfaces in one patch
 

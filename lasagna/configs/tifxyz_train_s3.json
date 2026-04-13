@@ -1,8 +1,12 @@
 {
     "volume_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/zarr_cache",
+    "patch_size": 192,
+    "overlap_fraction": 0.25,
+    "chunk_pad": 20.0,
     "datasets": [
         {
-            "volume_path": "s3://volpkgs/PHerc0139.volpkg/volumes/2um_ds2_raw.zarr/",
+            "__volume_path": "s3://volpkgs/PHerc0139.volpkg/volumes/2um_ds2_raw.zarr/",
+            "volume_path": null,
             "volume_scale": 2,
             "segments_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/neural_tracer_dataset/nt_dataset_022026/PHerc0139/tifxyz",
             "z_range": [2000, 7000]

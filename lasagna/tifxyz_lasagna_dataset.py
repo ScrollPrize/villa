@@ -5,39 +5,29 @@ Produces training patches where:
 - Surface masks and direction channels are voxelized from tifxyz grids (CPU)
 - EDT, chain ordering, cos/grad_mag/validity derivation happens on GPU in the train step
 
-Uses helpers from ink-detection/tifxyz_dataset/ for patch finding, surface sampling,
+Uses helpers from vesuvius neural tracing for patch finding, surface extraction,
 and voxelization.
 """
 from __future__ import annotations
 
-import math
-import os
-import sys
 import warnings
-from typing import Optional
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-# Add ink-detection to path for tifxyz_dataset imports
-_INK_DETECTION_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "ink-detection",
-)
-if _INK_DETECTION_DIR not in sys.path:
-    sys.path.insert(0, _INK_DETECTION_DIR)
-
-from tifxyz_dataset.common import (
-    _normalize_patch_size_zyx,
-    _read_volume_crop_from_patch_dict,
-    _sample_patch_supervision_grid,
-    _voxelize_surface_from_sampled_grid,
-    _estimate_surface_normals_zyx,
-)
-from tifxyz_dataset.patch_finding import (
-    _PATCH_CACHE_DEFAULT_FILENAME,
-    find_patches,
+import vesuvius.tifxyz as tifxyz
+from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
+from vesuvius.neural_tracing.datasets.common import (
+    ChunkPatch,
+    open_zarr,
+    _parse_z_range,
+    _read_volume_crop_from_patch,
+    _segment_overlaps_z_range,
+    _trim_to_world_bbox,
+    _upsample_world_triplet,
+    voxelize_surface_grid_masked,
 )
 
 try:
@@ -234,6 +224,156 @@ def compute_direction_values(normals_zyx):
 
 
 # ---------------------------------------------------------------------------
+# Surface normal estimation from grid
+# ---------------------------------------------------------------------------
+
+def _estimate_grid_normals(zyx_grid):
+    """Estimate surface normals from a (H, W, 3) ZYX grid via cross product of tangent vectors."""
+    tangent_r = np.zeros_like(zyx_grid)
+    tangent_r[:-1] = zyx_grid[1:] - zyx_grid[:-1]
+    tangent_r[-1] = tangent_r[-2]
+    tangent_c = np.zeros_like(zyx_grid)
+    tangent_c[:, :-1] = zyx_grid[:, 1:] - zyx_grid[:, :-1]
+    tangent_c[:, -1] = tangent_c[:, -2]
+    normals = np.cross(tangent_r, tangent_c)
+    norm = np.linalg.norm(normals, axis=-1, keepdims=True) + 1e-6
+    return normals / norm
+
+
+# ---------------------------------------------------------------------------
+# Patch finding (world-chunk method)
+# ---------------------------------------------------------------------------
+
+def _find_patches_world_chunks(config, patch_size_zyx):
+    """Find training patches using the world-chunk tiling method.
+
+    Follows the pattern from dataset_rowcol_cond.py, using find_world_chunk_patches
+    from the neural tracing pipeline.
+    """
+    # Defaults from dataset_defaults.py:50-62
+    overlap_fraction = float(config.get("overlap_fraction", 0.0))
+    min_span_ratio = float(config.get("min_span_ratio", 1.0))
+    edge_touch_frac = float(config.get("edge_touch_frac", 0.1))
+    edge_touch_min_count_base = int(config.get("edge_touch_min_count", 10))
+    edge_touch_pad = int(config.get("edge_touch_pad", 0))
+    min_points_per_wrap_base = int(config.get("min_points_per_wrap", 100))
+    scale_normalize = bool(config.get("scale_normalize_patch_counts", True))
+    ref_scale = int(config.get("patch_count_reference_scale", 0))
+    bbox_pad_2d = int(config.get("bbox_pad_2d", 0))
+    require_all_valid = bool(config.get("require_all_valid_in_bbox", True))
+    skip_invalid = bool(config.get("skip_chunk_if_any_invalid", False))
+    inner_bbox_fraction = float(config.get("inner_bbox_fraction", 0.7))
+    force_recompute = bool(config.get("force_recompute_patches", False))
+    chunk_pad = float(config.get("chunk_pad", 0.0))
+    verbose = bool(config.get("verbose", False))
+
+    target_size = tuple(int(v) for v in patch_size_zyx)
+
+    patches = []
+    for dataset_idx, dataset in enumerate(config["datasets"]):
+        volume_path = dataset.get("volume_path")
+        if volume_path is None:
+            continue
+
+        volume_scale = int(dataset["volume_scale"])
+        segments_path = dataset.get("segments_path")
+        if not segments_path:
+            continue
+
+        # Open zarr volume (handles local, S3, HTTPS with caching)
+        volume_auth_json = dataset.get(
+            "volume_auth_json", config.get("volume_auth_json")
+        )
+        volume = open_zarr(
+            volume_path, scale=volume_scale,
+            auth_json_path=volume_auth_json, config=config,
+        )
+
+        # Load and retarget segments. Per neural tracer convention, z_range
+        # is specified in retargeted (volume) coordinate space — same space
+        # as segments AFTER retarget — so we do NOT scale it here. Users
+        # whose volume_scale differs from what their z_range targets should
+        # either align volume_scale or update z_range to match.
+        retarget_factor = 2 ** volume_scale
+        z_range = _parse_z_range(dataset.get("z_range"))
+        dataset_segments = list(tifxyz.load_folder(segments_path))
+        scaled_segments = []
+        dropped_by_z_range = 0
+        for seg in dataset_segments:
+            seg_scaled = seg.retarget(retarget_factor)
+            if not _segment_overlaps_z_range(seg_scaled, z_range):
+                dropped_by_z_range += 1
+                continue
+            seg_scaled.volume = volume
+            scaled_segments.append(seg_scaled)
+
+        if not scaled_segments:
+            warnings.warn(
+                f"No segments remain after z_range filtering for dataset_idx={dataset_idx} "
+                f"(segments_path={segments_path}, z_range={z_range}); skipping."
+            )
+            continue
+
+        # Scale-normalize patch counts (dataset_rowcol_cond.py:297-309)
+        if scale_normalize:
+            count_scale = float(2 ** (volume_scale - ref_scale))
+            count_scale_sq = count_scale * count_scale
+        else:
+            count_scale_sq = 1.0
+
+        min_points_per_wrap = max(
+            1, int(round(min_points_per_wrap_base * count_scale_sq))
+        )
+        edge_touch_min_count = max(
+            1, int(round(edge_touch_min_count_base * count_scale_sq))
+        )
+
+        # Find world-chunk patches
+        cache_dir = Path(segments_path) / ".patch_cache"
+        chunk_results = find_world_chunk_patches(
+            segments=scaled_segments,
+            target_size=target_size,
+            overlap_fraction=overlap_fraction,
+            min_span_ratio=min_span_ratio,
+            edge_touch_frac=edge_touch_frac,
+            edge_touch_min_count=edge_touch_min_count,
+            edge_touch_pad=edge_touch_pad,
+            min_points_per_wrap=min_points_per_wrap,
+            bbox_pad_2d=bbox_pad_2d,
+            require_all_valid_in_bbox=require_all_valid,
+            skip_chunk_if_any_invalid=skip_invalid,
+            inner_bbox_fraction=inner_bbox_fraction,
+            cache_dir=cache_dir,
+            force_recompute=force_recompute,
+            verbose=verbose,
+            chunk_pad=chunk_pad,
+        )
+
+        # Convert chunk dicts to ChunkPatch objects (dataset_rowcol_cond.py:332-349)
+        for chunk in chunk_results:
+            wraps_in_chunk = []
+            for w in chunk["wraps"]:
+                seg_idx = w["segment_idx"]
+                wraps_in_chunk.append({
+                    "segment": scaled_segments[seg_idx],
+                    "bbox_2d": tuple(w["bbox_2d"]),
+                    "wrap_id": w["wrap_id"],
+                    "segment_idx": seg_idx,
+                })
+
+            patches.append(ChunkPatch(
+                chunk_id=tuple(chunk["chunk_id"]),
+                volume=volume,
+                scale=volume_scale,
+                world_bbox=tuple(chunk["bbox_3d"]),
+                wraps=wraps_in_chunk,
+                segments=scaled_segments,
+            ))
+
+    return patches
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
@@ -257,41 +397,13 @@ class TifxyzLasagnaDataset(Dataset):
         config: dict,
         apply_augmentation: bool = True,
     ):
-        self.patch_size = config["patch_size"]
-        self.patch_size_zyx = _normalize_patch_size_zyx(self.patch_size)
+        # Normalize patch_size to 3-element ZYX array
+        patch_size_zyx = np.asarray(config["patch_size"], dtype=np.int32).reshape(-1)
+        if patch_size_zyx.size == 1:
+            patch_size_zyx = np.repeat(patch_size_zyx, 3)
+        self.patch_size_zyx = patch_size_zyx
 
-        self.surface_bbox_pad = float(config.get("surface_bbox_pad", 2.0))
-        if self.surface_bbox_pad < 0.0:
-            self.surface_bbox_pad = 0.0
-        self.surface_interp_method = str(
-            config.get("surface_interp_method", "catmull_rom")
-        ).strip().lower()
-
-        # Required by _sample_patch_supervision_grid for ink label loading
-        # (returns empty when no labels exist, which is fine for lasagna)
-        self.bg_dilate_distance = int(config.get("bg_dilate_distance", 0))
-        self._segment_ink_label_path_by_uuid = {}
-
-        self.overlap_fraction = float(config.get("overlap_fraction", 0.25))
-        self.min_positive_fraction = float(config.get("min_positive_fraction", 0.0))
-        self.min_span_ratio = float(config.get("min_span_ratio", 0.50))
-        self.patch_finding_workers = int(config.get("patch_finding_workers", 4))
-        self.patch_cache_force_recompute = bool(
-            config.get("patch_cache_force_recompute", False)
-        )
-        self.patch_cache_filename = str(
-            config.get("patch_cache_filename", _PATCH_CACHE_DEFAULT_FILENAME)
-        )
-        self.auto_fix_padding_multiples = [64, 256]
         self.max_surfaces_per_patch = int(config.get("max_surfaces_per_patch", 8))
-
-        # Caches
-        self._segment_grid_cache = {}
-        self._segment_normal_cache = {}
-        self._segment_world_bounds_cache = {}
-        self._segment_ink_mask_cache = {}
-        self._segment_positive_samples_cache = {}
-        self._segment_positive_points_cache = {}
 
         # Augmentation
         if apply_augmentation:
@@ -303,180 +415,136 @@ class TifxyzLasagnaDataset(Dataset):
         else:
             self.augmentations = None
 
-        # Find patches (uses pre-computed cache from neural tracer datasets)
-        self.patches, self.patch_generation_stats = find_patches(
-            config,
-            patch_size_zyx=self.patch_size_zyx,
-            overlap_fraction=self.overlap_fraction,
-            min_positive_fraction=self.min_positive_fraction,
-            min_span_ratio=self.min_span_ratio,
-            patch_finding_workers=self.patch_finding_workers,
-            patch_cache_force_recompute=self.patch_cache_force_recompute,
-            patch_cache_filename=self.patch_cache_filename,
-            auto_fix_padding_multiples=self.auto_fix_padding_multiples,
-        )
-
-        # Collect all segments per dataset for multi-surface overlap detection
-        self._segments_by_dataset_idx = {}
-        for patch in self.patches:
-            dataset_idx = int(patch.get("dataset_idx", -1))
-            segment = patch.get("segment")
-            if segment is not None:
-                seg_map = self._segments_by_dataset_idx.setdefault(dataset_idx, {})
-                seg_map.setdefault(str(segment.uuid), segment)
-        self._segments_by_dataset_idx = {
-            int(k): tuple(v.values())
-            for k, v in self._segments_by_dataset_idx.items()
-        }
+        # Find patches using world-chunk method
+        self.patches = _find_patches_world_chunks(config, self.patch_size_zyx)
 
         print(f"{TAG} loaded {len(self.patches)} patches")
 
     def __len__(self):
         return len(self.patches)
 
-    def _get_segment_stored_grid(self, segment):
-        """Cache and return the stored-resolution grid for a segment."""
-        segment_uuid = str(segment.uuid)
-        cached = self._segment_grid_cache.get(segment_uuid)
-        if cached is not None:
-            return cached
+    def _extract_and_voxelize_wrap(self, patch, wrap, min_corner, crop_size):
+        """Extract a wrap surface, voxelize it, and compute direction channels.
 
-        segment.use_stored_resolution()
-        x_stored, y_stored, z_stored, valid_stored = segment[:, :]
-        x_stored = np.asarray(x_stored, dtype=np.float32)
-        y_stored = np.asarray(y_stored, dtype=np.float32)
-        z_stored = np.asarray(z_stored, dtype=np.float32)
-        valid_mask = np.asarray(valid_stored, dtype=bool)
-        valid_mask &= np.isfinite(x_stored)
-        valid_mask &= np.isfinite(y_stored)
-        valid_mask &= np.isfinite(z_stored)
-
-        cached = {
-            "x": x_stored, "y": y_stored, "z": z_stored,
-            "valid": valid_mask,
-            "shape": (int(x_stored.shape[0]), int(x_stored.shape[1])),
-        }
-        self._segment_grid_cache[segment_uuid] = cached
-        return cached
-
-    def _get_segment_world_bounds(self, segment):
-        """Get (z_min, z_max, y_min, y_max, x_min, x_max) for a segment."""
-        segment_uuid = str(segment.uuid)
-        if segment_uuid in self._segment_world_bounds_cache:
-            return self._segment_world_bounds_cache[segment_uuid]
-
-        grid = self._get_segment_stored_grid(segment)
-        valid = np.asarray(grid["valid"], dtype=bool)
-        if not np.any(valid):
-            self._segment_world_bounds_cache[segment_uuid] = None
-            return None
-
-        z_vals = grid["z"][valid]
-        y_vals = grid["y"][valid]
-        x_vals = grid["x"][valid]
-        bounds = (
-            float(np.min(z_vals)), float(np.max(z_vals)),
-            float(np.min(y_vals)), float(np.max(y_vals)),
-            float(np.min(x_vals)), float(np.max(x_vals)),
-        )
-        self._segment_world_bounds_cache[segment_uuid] = bounds
-        return bounds
-
-    @staticmethod
-    def _bounds_intersect(bounds, min_corner, max_corner):
-        if bounds is None:
-            return False
-        min_c = np.asarray(min_corner, dtype=np.float32).reshape(3)
-        max_c = np.asarray(max_corner, dtype=np.float32).reshape(3)
-        z_min, z_max, y_min, y_max, x_min, x_max = [float(v) for v in bounds]
-        return not (
-            z_max < float(min_c[0]) or z_min >= float(max_c[0]) or
-            y_max < float(min_c[1]) or y_min >= float(max_c[1]) or
-            x_max < float(min_c[2]) or x_min >= float(max_c[2])
-        )
-
-    def _find_overlapping_segments(self, patch, min_corner, max_corner):
-        """Find all segments from this dataset that overlap the patch bbox."""
-        dataset_idx = int(patch.get("dataset_idx", -1))
-        segments = self._segments_by_dataset_idx.get(dataset_idx, ())
-        result = []
-        for segment in segments:
-            bounds = self._get_segment_world_bounds(segment)
-            if self._bounds_intersect(bounds, min_corner, max_corner):
-                result.append(segment)
-            if len(result) >= self.max_surfaces_per_patch:
-                break
-        return result
-
-    def _sample_and_voxelize_segment(self, segment, min_corner, max_corner, crop_size):
-        """Sample a tifxyz segment within a patch and produce mask + direction channels.
+        Args:
+            patch: ChunkPatch containing the volume and world_bbox
+            wrap: dict with "segment", "bbox_2d", etc.
+            min_corner: (3,) int64 array — ZYX origin of the crop
+            crop_size: (Z, Y, X) int tuple
 
         Returns:
             surface_mask: (Z, Y, X) float32 — binary voxelization
             dir_points_local: (M, 3) float32 — local ZYX positions for splatting
             dir_values: (M, 6) float32 — direction channel values
-            normals_points_local: (M, 3) float32 — positions where normals are valid
         """
         crop_size_tuple = tuple(int(v) for v in crop_size)
+        empty_pts = np.zeros((0, 3), dtype=np.float32)
+        empty_vals = np.zeros((0, 6), dtype=np.float32)
+        empty_mask = np.zeros(crop_size_tuple, dtype=np.float32)
 
-        # Sample grid
-        sampled = _sample_patch_supervision_grid(
-            self, segment, min_corner=min_corner, max_corner=max_corner,
-            extra_bbox_pad=0.0,
+        seg = wrap["segment"]
+        r_min, r_max, c_min, c_max = wrap["bbox_2d"]
+
+        # Clamp to segment bounds
+        seg_h, seg_w = seg._valid_mask.shape
+        r_min = max(0, r_min)
+        r_max = min(seg_h - 1, r_max)
+        c_min = max(0, c_min)
+        c_max = min(seg_w - 1, c_max)
+        if r_max < r_min or c_max < c_min:
+            return empty_mask, empty_pts, empty_vals
+
+        # Read stored-resolution grid
+        seg.use_stored_resolution()
+        scale_y, scale_x = seg._scale
+        x_s, y_s, z_s, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
+        if x_s.size == 0:
+            return empty_mask, empty_pts, empty_vals
+
+        # Skip wraps with invalid cells in stored grid (upsampling requires all-valid)
+        if valid_s is not None and not valid_s.all():
+            return empty_mask, empty_pts, empty_vals
+
+        # Upsample to full resolution
+        try:
+            x_full, y_full, z_full = _upsample_world_triplet(
+                x_s, y_s, z_s, scale_y, scale_x,
+            )
+        except ValueError:
+            return empty_mask, empty_pts, empty_vals
+
+        # Trim to world bbox
+        trimmed = _trim_to_world_bbox(x_full, y_full, z_full, patch.world_bbox)
+        if trimmed is None:
+            return empty_mask, empty_pts, empty_vals
+        x_full, y_full, z_full = trimmed
+
+        # Build (H, W, 3) ZYX grid in world coordinates
+        zyx_world = np.stack(
+            [z_full, y_full, x_full], axis=-1,
+        ).astype(np.float32)
+
+        # Convert to local coordinates
+        min_corner_f = min_corner.astype(np.float32)
+        zyx_local = zyx_world - min_corner_f
+
+        # Compute validity mask (finite + within crop bounds)
+        valid = (
+            np.isfinite(zyx_local).all(axis=-1)
+            & (zyx_local[..., 0] >= -0.5)
+            & (zyx_local[..., 0] < crop_size_tuple[0] - 0.5)
+            & (zyx_local[..., 1] >= -0.5)
+            & (zyx_local[..., 1] < crop_size_tuple[1] - 0.5)
+            & (zyx_local[..., 2] >= -0.5)
+            & (zyx_local[..., 2] < crop_size_tuple[2] - 0.5)
         )
 
-        # Binary mask voxelization
-        surface_mask = _voxelize_surface_from_sampled_grid(
-            self, segment, min_corner=min_corner, max_corner=max_corner,
-            crop_size=crop_size_tuple, sampled_grid=sampled,
+        if not np.any(valid):
+            return empty_mask, empty_pts, empty_vals
+
+        # Voxelize using neural tracing's line-drawing rasterizer
+        surface_mask = voxelize_surface_grid_masked(
+            zyx_local, crop_size_tuple, valid,
         )
 
-        # Direction channels from normals
-        local_grid = sampled["local_grid"]
-        in_patch = sampled["in_patch"]
-        normals_zyx = sampled["normals_zyx"]
-        normals_valid = sampled["normals_valid"]
+        # Compute normals from the grid
+        normals_zyx = _estimate_grid_normals(zyx_world)
 
-        # Points with valid normals inside the patch
-        valid_for_dir = in_patch & normals_valid
+        # Direction encoding from normals
+        valid_for_dir = valid & np.isfinite(normals_zyx).all(axis=-1)
         if not np.any(valid_for_dir):
-            empty_pts = np.zeros((0, 3), dtype=np.float32)
-            empty_vals = np.zeros((0, 6), dtype=np.float32)
             return surface_mask, empty_pts, empty_vals
 
-        pts_local = local_grid[valid_for_dir].astype(np.float32)
-        normals_at_pts = normals_zyx[valid_for_dir].astype(np.float32)
-
-        # Compute direction encoding
-        dir_vals = compute_direction_values(normals_at_pts)
+        pts_local = zyx_local[valid_for_dir].astype(np.float32)
+        dir_vals = compute_direction_values(
+            normals_zyx[valid_for_dir].astype(np.float32),
+        )
 
         return surface_mask, pts_local, dir_vals
 
     def __getitem__(self, idx):
         patch = self.patches[idx]
 
-        z0, z1, y0, y1, x0, x1 = patch["world_bbox"]
-        min_corner = np.array([z0, y0, x0], dtype=np.int32)
-        max_corner = np.array([z1 + 1, y1 + 1, x1 + 1], dtype=np.int32)
+        z0, z1, y0, y1, x0, x1 = patch.world_bbox
         crop_size = tuple(int(v) for v in self.patch_size_zyx)
+        # world_bbox is half-open: [z0, z1), so max_corner = min_corner + crop_size
+        min_corner = np.array([z0, y0, x0], dtype=np.int64)
+        max_corner = min_corner + np.array(crop_size, dtype=np.int64)
 
         # Read CT crop (z-score normalized)
-        vol_crop = _read_volume_crop_from_patch_dict(
+        vol_crop = _read_volume_crop_from_patch(
             patch, crop_size=crop_size,
             min_corner=min_corner, max_corner=max_corner,
         )
-
-        # Find all overlapping surfaces
-        segments = self._find_overlapping_segments(patch, min_corner, max_corner)
 
         # Per-surface: voxelize mask and compute direction channels
         surface_masks = []
         all_dir_points = []
         all_dir_values = []
 
-        for segment in segments:
-            mask, dir_pts, dir_vals = self._sample_and_voxelize_segment(
-                segment, min_corner, max_corner, crop_size,
+        for wrap in patch.wraps[:self.max_surfaces_per_patch]:
+            mask, dir_pts, dir_vals = self._extract_and_voxelize_wrap(
+                patch, wrap, min_corner, crop_size,
             )
             if np.any(mask > 0):
                 surface_masks.append(mask)
@@ -524,9 +592,8 @@ class TifxyzLasagnaDataset(Dataset):
             "num_surfaces": num_surfaces,
             "padding_mask": padding_mask_t,             # (1, Z, Y, X)
             "patch_info": {
-                "dataset_idx": int(patch.get("dataset_idx", -1)),
-                "segment_uuid": str(patch.get("segment_uuid", "")),
-                "world_bbox": patch["world_bbox"],
+                "segment_uuid": str(patch.wraps[0]["segment"].uuid) if patch.wraps else "",
+                "world_bbox": patch.world_bbox,
                 "idx": int(idx),
             },
         }
