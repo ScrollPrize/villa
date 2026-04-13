@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -462,6 +463,7 @@ def build_model(
     weights: Optional[str] = None,
     norm_type: Optional[str] = None,
     upsample_mode: Optional[str] = None,
+    output_sigmoid: Optional[bool] = None,
     batch_size: int = 2,
 ) -> nn.Module:
     """Build 3D UNet via vesuvius NetworkFromConfig.
@@ -470,6 +472,8 @@ def build_model(
         norm_type: "instance", "group", or "none".
             If None and weights is provided, auto-detects from checkpoint metadata.
         upsample_mode: "transpconv", "trilinear", or "pixelshuffle".
+            If None and weights is provided, auto-detects from checkpoint metadata.
+        output_sigmoid: Whether to apply sigmoid to model output.
             If None and weights is provided, auto-detects from checkpoint metadata.
     """
     # Auto-detect from checkpoint if not specified
@@ -481,10 +485,14 @@ def build_model(
                 norm_type = ckpt.get("norm_type", "instance")
             if upsample_mode is None:
                 upsample_mode = ckpt.get("upsample_mode", "transpconv")
+            if output_sigmoid is None:
+                output_sigmoid = ckpt.get("output_sigmoid", True)
     if norm_type is None:
         norm_type = "instance"
     if upsample_mode is None:
         upsample_mode = "transpconv"
+    if output_sigmoid is None:
+        output_sigmoid = True
 
     mgr = SimpleNamespace()
     model_config = {"autoconfigure": True, "architecture_type": "unet"}
@@ -496,8 +504,8 @@ def build_model(
     # else "instance" — keep defaults (InstanceNorm3d)
     model_config["upsample_mode"] = upsample_mode
     mgr.model_config = model_config
-    # activation='none' so we apply sigmoid ourselves (consistently in
-    # both train and eval: pool full-res logits to label-res, then sigmoid).
+    # activation='none' so we handle output activation ourselves
+    # (sigmoid or clamp, configured via output_sigmoid).
     mgr.targets = {"output": {"out_channels": 8, "activation": "none"}}
     mgr.train_patch_size = (patch_size, patch_size, patch_size)
     mgr.train_batch_size = batch_size
@@ -527,7 +535,7 @@ def build_model(
         if missing:
             print(f"[model] randomly initialized: {missing[:5]}{'...' if len(missing) > 5 else ''}")
 
-    return model, norm_type, upsample_mode
+    return model, norm_type, upsample_mode, output_sigmoid
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +607,7 @@ def train(
     norm_type: str = "instance",
     upsample_mode: str = "trilinear",
     precision: str = "bf16",
+    output_sigmoid: bool = False,
 ) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path(log_dir) / f"{timestamp}_{run_name}"
@@ -615,8 +624,23 @@ def train(
         "norm_type": norm_type,
         "upsample_mode": upsample_mode,
         "precision": precision,
+        "output_sigmoid": output_sigmoid,
         "cmd": " ".join(sys.argv),
     }
+    # Git state for reproducibility
+    git_diff = ""
+    try:
+        git_hash = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        git_diff = subprocess.run(
+            ["git", "diff", "HEAD"], capture_output=True, text=True, timeout=10,
+        ).stdout
+        config["git_hash"] = git_hash
+        if git_diff:
+            (run_dir / "git_diff.patch").write_text(git_diff)
+    except Exception:
+        pass
     (run_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
     # Datasets
@@ -650,9 +674,10 @@ def train(
     print(f"[train] {n_train} train / {n_val} val samples, step={step}")
 
     # Model
-    model, norm_type, upsample_mode = build_model(
+    model, norm_type, upsample_mode, output_sigmoid = build_model(
         patch_size, device, weights, norm_type=norm_type,
-        upsample_mode=upsample_mode, batch_size=batch_size,
+        upsample_mode=upsample_mode, output_sigmoid=output_sigmoid,
+        batch_size=batch_size,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     # LR warmup + cosine decay
@@ -679,13 +704,17 @@ def train(
         amp_dtype = torch.float32
         use_autocast = False
         scaler = torch.amp.GradScaler(enabled=False)
-    print(f"[train] precision: {precision}, upsample: {upsample_mode}, warmup: {warmup_steps} steps")
+    print(f"[train] precision: {precision}, upsample: {upsample_mode}, "
+          f"output_sigmoid: {output_sigmoid}, warmup: {warmup_steps} steps")
 
     # Losses
     masked_mse = MaskedMSE()
     scale_loss = ScaleSpaceLoss3D(masked_mse, num_scales=3)
 
     writer = SummaryWriter(log_dir=str(run_dir))
+    writer.add_text("config", json.dumps(config, indent=2), 0)
+    if git_diff:
+        writer.add_text("git_diff", git_diff, 0)
     best_val_loss = float("inf")
     global_step = 0
 
@@ -719,7 +748,10 @@ def train(
                 results = model(image)
                 pred_full = results["output"]  # (B, 8, D, H, W) at full res
 
-                pred = torch.sigmoid(pred_full)
+                if output_sigmoid:
+                    pred = torch.sigmoid(pred_full)
+                else:
+                    pred = pred_full
 
                 # Upsample targets and mask to full resolution
                 if step > 1:
@@ -754,8 +786,9 @@ def train(
                 writer.add_scalar("train/loss_dir", loss_dir.item(), global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
 
-            if global_step % 100 == 0:
-                _log_vis(writer, "train", image, pred, targets, mask, global_step)
+            if global_step % 1000 == 0:
+                vis_pred = pred.clamp(0, 1) if not output_sigmoid else pred
+                _log_vis(writer, "train", image, vis_pred, targets, mask, global_step)
 
             global_step += 1
 
@@ -765,6 +798,7 @@ def train(
         val_loss = _evaluate(
             model, eval_loader, scale_loss, step, device, writer, global_step,
             w_cos, w_mag, w_dir, amp_dtype=amp_dtype, use_autocast=use_autocast,
+            output_sigmoid=output_sigmoid,
         )
 
         mean_train = sum(epoch_losses) / max(len(epoch_losses), 1)
@@ -780,6 +814,7 @@ def train(
             "norm_type": norm_type,
             "upsample_mode": upsample_mode,
             "precision": precision,
+            "output_sigmoid": output_sigmoid,
         }
         torch.save(ckpt_data, run_dir / "model_current.pt")
         if val_loss < best_val_loss:
@@ -804,6 +839,7 @@ def _evaluate(
     w_dir: float,
     amp_dtype: torch.dtype = torch.bfloat16,
     use_autocast: bool = True,
+    output_sigmoid: bool = True,
 ) -> float:
     model.eval()
     losses: List[float] = []
@@ -823,7 +859,10 @@ def _evaluate(
             targets, mask, dir_weight = compute_targets_3d(normal, winding, validity, density)
             results = model(image)
             pred_full = results["output"]
-            pred = torch.sigmoid(pred_full)
+            if output_sigmoid:
+                pred = torch.sigmoid(pred_full)
+            else:
+                pred = pred_full.clamp(0, 1)
 
             # Upsample targets and mask to full resolution
             if step > 1:
@@ -900,6 +939,8 @@ def main() -> None:
     parser.add_argument("--precision", type=str, default="bf16",
                         choices=["bf16", "fp16", "fp32"],
                         help="Training precision (default: bf16).")
+    parser.add_argument("--output-sigmoid", action="store_true", default=False,
+                        help="Apply sigmoid to model output (default: off, use raw output + clamp).")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -924,6 +965,7 @@ def main() -> None:
         norm_type=args.norm_type,
         upsample_mode=args.upsample_mode,
         precision=args.precision,
+        output_sigmoid=args.output_sigmoid,
     )
 
 

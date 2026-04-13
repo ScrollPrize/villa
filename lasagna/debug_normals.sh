@@ -23,7 +23,7 @@ set -euo pipefail
 # --- Edit these paths directly ---
 INPUT_ZARR=$VOL/volumes_webcache/s5_rechunked.zarr/0/
 # CHECKPOINT=../train3d/runs/unet3d/20260319_214354_3d/model_best.pt #original long train
-CHECKPOINT=../train3d/runs/unet3d/20260324_165356_3d/model_best.pt #trilin upsample, bf16, nonorms
+CHECKPOINT=../train3d/runs_srv/unet3d/20260325_011010_3d/model_current.pt #trilin upsample, bf16, nonorms
 OUTPUT_DIR=./debug_normals_out
 REF_ZARR=../s5/PHerc172.volpkg/volumes_lasagna/cos3_3d.zarr
 CHECKPOINT_2D=../../exps_2d/logs/20251205_125909_test_newgrad_lr1e-3/unet_current.pt
@@ -37,9 +37,9 @@ PY="${PY:-3695}"
 PZ="${PZ:-8577}"
 WH="${WH:-1000}"
 SCALEDOWN="${SCALEDOWN:-4}"
-TILE_SIZE="${TILE_SIZE:-192}"
-OVERLAP="${OVERLAP:-0}"
-BORDER="${BORDER:-0}"
+TILE_SIZE="${TILE_SIZE:-320}"
+OVERLAP="${OVERLAP:-160}"
+BORDER="${BORDER:-64}"
 REF_ZARR="${REF_ZARR:-}"
 CHECKPOINT_2D="${CHECKPOINT_2D:-}"
 

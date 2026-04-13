@@ -6,9 +6,13 @@ must share the same ``scaledown`` and spatial shape.  When their
 ``crop_xyzwhd`` regions differ the output is restricted to the
 intersection.
 
+This variant bypasses zarr-python v3's async store layer for data I/O,
+using direct file reads/writes (which release the GIL) so that threads
+can saturate the filesystem without event-loop contention.
+
 Example::
 
-    python lasagna/mix_channels.py \
+    python lasagna/mix_channels_parallel.py \
         --base pred_3d.zarr \
         --other pred_2d.zarr \
         --output mixed.zarr \
@@ -17,18 +21,143 @@ Example::
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+import multiprocessing
 import os
-import threading
 import time
 
+import numcodecs
 import numpy as np
 import zarr
 
 
 CHUNK_SPATIAL = 32  # chunk size for all spatial dims
-WORK_TILE = 128     # work unit tile size (multiple of CHUNK_SPATIAL)
 
+
+# ---------------------------------------------------------------------------
+# Direct zarr v2 chunk I/O – bypasses zarr-python v3's async store layer so
+# that plain file reads/writes (which release the GIL) can saturate the
+# filesystem from many threads without event-loop contention.
+# ---------------------------------------------------------------------------
+
+def _load_zarr_meta(zarr_path: str) -> dict:
+    """Read .zarray metadata for direct chunk I/O."""
+    with open(os.path.join(zarr_path, '.zarray')) as f:
+        meta = json.load(f)
+    comp_cfg = meta.get('compressor')
+    return {
+        'path': zarr_path,
+        'chunks': tuple(meta['chunks']),
+        'dtype': np.dtype(meta['dtype']),
+        'shape': tuple(meta['shape']),
+        'fill_value': meta.get('fill_value', 0),
+        'order': meta.get('order', 'C'),
+        'dim_sep': meta.get('dimension_separator', '.'),
+        'compressor': numcodecs.get_codec(comp_cfg) if comp_cfg else None,
+        'filters': [numcodecs.get_codec(f) for f in (meta.get('filters') or [])],
+    }
+
+
+def _chunk_key(dim_sep: str, *indices: int) -> str:
+    return dim_sep.join(str(i) for i in indices)
+
+
+def _read_chunk_file(meta: dict, key: str, chunk_shape: tuple) -> np.ndarray:
+    """Read and decode a single zarr v2 chunk file."""
+    fpath = os.path.join(meta['path'], key.replace('/', os.sep))
+    try:
+        with open(fpath, 'rb') as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return np.full(chunk_shape, meta['fill_value'], dtype=meta['dtype'])
+    if meta['compressor'] is not None:
+        raw = meta['compressor'].decode(raw)
+    for filt in reversed(meta['filters']):
+        raw = filt.decode(raw)
+    return np.frombuffer(raw, dtype=meta['dtype']).reshape(
+        chunk_shape, order=meta['order']).copy()
+
+
+def _copy_chunk(src_meta: dict, si: int,
+                out_path: str, out_compressor, out_filters: list,
+                out_order: str, out_dim_sep: str,
+                ci: int, cz_idx: int, cy_idx: int, cx_idx: int,
+                zs: int, ze: int, ys: int, ye: int, xs: int, xe: int):
+    """Read one source chunk, write one output chunk via direct file I/O."""
+    _, cs_z, cs_y, cs_x = src_meta['chunks']
+    src_key = _chunk_key(src_meta['dim_sep'], si, cz_idx, cy_idx, cx_idx)
+    chunk = _read_chunk_file(src_meta, src_key, (cs_z, cs_y, cs_x))
+
+    # Crop to the active region within the chunk
+    oz = zs - cz_idx * cs_z
+    oy = ys - cy_idx * cs_y
+    ox = xs - cx_idx * cs_x
+    cdata = chunk[oz:oz + (ze - zs), oy:oy + (ye - ys), ox:ox + (xe - xs)]
+
+    # Pad partial edge chunks to full output chunk size (zarr v2 spec)
+    cs = CHUNK_SPATIAL
+    if cdata.shape != (cs, cs, cs):
+        padded = np.zeros((cs, cs, cs), dtype=cdata.dtype)
+        padded[:cdata.shape[0], :cdata.shape[1], :cdata.shape[2]] = cdata
+        cdata = padded
+
+    raw = (np.ascontiguousarray(cdata) if out_order == 'C'
+           else np.asfortranarray(cdata)).tobytes()
+    for filt in out_filters:
+        raw = filt.encode(raw)
+    if out_compressor is not None:
+        raw = out_compressor.encode(raw)
+
+    out_key = _chunk_key(out_dim_sep, ci, cz_idx, cy_idx, cx_idx)
+    fpath = os.path.join(out_path, out_key.replace('/', os.sep))
+    if out_dim_sep == '/':
+        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+    with open(fpath, 'wb') as f:
+        f.write(raw)
+
+
+# ---------------------------------------------------------------------------
+# Multiprocessing worker – each process gets its own GIL
+# ---------------------------------------------------------------------------
+
+_w_base_meta: dict | None = None
+_w_other_meta: dict | None = None
+_w_out_path: str = ""
+_w_out_compressor = None
+_w_out_filters: list = []
+_w_out_order: str = "C"
+_w_out_dim_sep: str = "."
+
+
+def _init_worker(base_path: str, other_path: str, output_path: str):
+    """Called once per worker process — load zarr metadata into globals."""
+    global _w_base_meta, _w_other_meta
+    global _w_out_path, _w_out_compressor, _w_out_filters
+    global _w_out_order, _w_out_dim_sep
+    _w_base_meta = _load_zarr_meta(base_path)
+    _w_other_meta = _load_zarr_meta(other_path)
+    out_meta = _load_zarr_meta(output_path)
+    _w_out_path = output_path
+    _w_out_compressor = out_meta['compressor']
+    _w_out_filters = out_meta['filters']
+    _w_out_order = out_meta['order']
+    _w_out_dim_sep = out_meta['dim_sep']
+
+
+def _worker_fn(item: tuple):
+    """Process one chunk. item = (src_is_base, si, ci, cz, cy, cx, zs, ze, ys, ye, xs, xe)."""
+    src_is_base, si, ci, cz_idx, cy_idx, cx_idx, zs, ze, ys, ye, xs, xe = item
+    src_meta = _w_base_meta if src_is_base else _w_other_meta
+    _copy_chunk(src_meta, si,
+                _w_out_path, _w_out_compressor, _w_out_filters,
+                _w_out_order, _w_out_dim_sep,
+                ci, cz_idx, cy_idx, cx_idx,
+                zs, ze, ys, ye, xs, xe)
+
+
+# ---------------------------------------------------------------------------
+# Metadata helpers (same as mix_channels.py)
+# ---------------------------------------------------------------------------
 
 def _parse_params(arr: zarr.Array) -> dict:
     params = dict(getattr(arr, "attrs", {}).get("preprocess_params", {}) or {})
@@ -106,7 +235,7 @@ def main():
     )
     args = ap.parse_args()
 
-    # --- Open sources ---
+    # --- Open sources (zarr API for metadata only) ---
     base = zarr.open(args.base, mode="r")
     other = zarr.open(args.other, mode="r")
     if not isinstance(base, zarr.Array):
@@ -202,7 +331,7 @@ def main():
     n_workers = max(1, args.workers)
     print(f"[mix_channels] output {args.output} shape={out_shape} chunks={out_chunks} workers={n_workers}")
 
-    # --- Create output ---
+    # --- Create output (zarr API for metadata, then direct I/O for data) ---
     out = zarr.open(
         args.output,
         mode="w",
@@ -230,59 +359,46 @@ def main():
         out_params["crop_xyzwhd"] = out_crop
     out.attrs["preprocess_params"] = out_params
 
-    # --- Build work units: one per WORK_TILE (channel × z × y × x tile) ---
-    # Each work unit covers 128³ voxels (= 64 underlying 32³ zarr chunks).
-    # Clamp to the crop region for partial border tiles.
-    WT = WORK_TILE
-    work: list[tuple[int, int, int, int, int, int, int, zarr.Array, int]] = []
+    # --- Build work units: one per 32³ output chunk (plain tuples for IPC) ---
+    CS = CHUNK_SPATIAL
+    work: list[tuple] = []
     for ci, (src, si, _name) in enumerate(channel_map):
-        for zs in range(z0 // WT * WT, z1, WT):
-            ze = min(zs + WT, z1)
-            zs_c = max(zs, z0)
-            for ys in range(y0 // WT * WT, y1, WT):
-                ye = min(ys + WT, y1)
-                ys_c = max(ys, y0)
-                for xs in range(x0 // WT * WT, x1, WT):
-                    xe = min(xs + WT, x1)
-                    xs_c = max(xs, x0)
-                    work.append((ci, zs_c, ze, ys_c, ye, xs_c, xe, src, si))
+        src_is_base = src is base
+        for cz in range(z0 // CS * CS, z1, CS):
+            cz_idx = cz // CS
+            zs_c = max(cz, z0)
+            ze_c = min(cz + CS, z1)
+            for cy in range(y0 // CS * CS, y1, CS):
+                cy_idx = cy // CS
+                ys_c = max(cy, y0)
+                ye_c = min(cy + CS, y1)
+                for cx in range(x0 // CS * CS, x1, CS):
+                    cx_idx = cx // CS
+                    xs_c = max(cx, x0)
+                    xe_c = min(cx + CS, x1)
+                    work.append((src_is_base, si,
+                                 ci, cz_idx, cy_idx, cx_idx,
+                                 zs_c, ze_c, ys_c, ye_c, xs_c, xe_c))
 
     total = len(work)
-    done_count = 0
-    lock = threading.Lock()
     t0 = time.time()
 
-    def _copy_chunk(ci: int, zs: int, ze: int,
-                    ys: int, ye: int, xs: int, xe: int,
-                    src: zarr.Array, si: int):
-        nonlocal done_count
-        # Materialize to numpy before writing to avoid zarr internal
-        # executor conflicts between concurrent read and write paths.
-        data = np.array(src[si, zs:ze, ys:ye, xs:xe])
-        out[ci, zs:ze, ys:ye, xs:xe] = data
-        with lock:
+    with multiprocessing.Pool(
+        processes=n_workers,
+        initializer=_init_worker,
+        initargs=(args.base, args.other, args.output),
+    ) as pool:
+        done_count = 0
+        for _ in pool.imap_unordered(_worker_fn, work, chunksize=256):
             done_count += 1
-            n = done_count
-        elapsed = time.time() - t0
-        eta = elapsed / n * (total - n) if n < total else 0
-        print(
-            f"\r  chunk {n}/{total}  "
-            f"elapsed={elapsed:.1f}s  ETA={eta:.1f}s   ",
-            end="", flush=True,
-        )
-
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futs = [pool.submit(_copy_chunk, *w) for w in work]
-        # Collect all results before pool shutdown to ensure zarr's
-        # internal async tasks finish while the executor is alive.
-        errors = []
-        for f in as_completed(futs):
-            try:
-                f.result()
-            except Exception as e:
-                errors.append(e)
-        if errors:
-            raise errors[0]
+            if done_count % 500 == 0 or done_count == total:
+                elapsed = time.time() - t0
+                eta = elapsed / done_count * (total - done_count) if done_count < total else 0
+                print(
+                    f"\r  chunk {done_count}/{total}  "
+                    f"elapsed={elapsed:.1f}s  ETA={eta:.1f}s   ",
+                    end="", flush=True,
+                )
 
     print()
     print(f"[mix_channels] done — {args.output}  ({time.time() - t0:.1f}s)")

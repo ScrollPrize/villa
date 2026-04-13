@@ -73,6 +73,27 @@ def _pyrdown2d(arr: np.ndarray, *, factor: int) -> np.ndarray:
 	return out
 
 
+def _pyrdown3d(t: torch.Tensor, *, factor: int) -> torch.Tensor:
+	"""Gaussian pyramid downscale for 3D volume tensors.
+	Uses the same [1,4,6,4,1]/16 kernel as cv2.pyrDown, applied separably."""
+	f = int(factor)
+	if f <= 1:
+		return t
+	if (f & (f - 1)) != 0:
+		raise ValueError("downscale factor must be a power of 2 for pyramid scaling")
+	k = torch.tensor([1, 4, 6, 4, 1], dtype=t.dtype, device=t.device) / 16.0
+	while f > 1:
+		C = t.shape[0]
+		for dim, pad_arg in enumerate([(0,0,0,0,2,2), (0,0,2,2,0,0), (2,2,0,0,0,0)]):
+			shape = [1, 1, 1, 1, 1]
+			shape[dim + 2] = 5
+			kd = k.view(*shape).expand(C, 1, *shape[2:])
+			t = F.conv3d(F.pad(t.unsqueeze(0), pad_arg, mode='reflect'), kd, groups=C)[0]
+		t = t[:, ::2, ::2, ::2]
+		f //= 2
+	return t
+
+
 def _decode_dir_angle(dir0: np.ndarray, dir1: np.ndarray) -> np.ndarray:
 	"""Decode dir0+dir1 (in [0,1]) to angle θ ∈ (-π/2, π/2]."""
 	cos2t = 2.0 * dir0 - 1.0
@@ -777,6 +798,7 @@ def _infer_tiled_3d(
 	out_channels: int = 8,
 	scaledown: int = 1,
 	tmp_dir: str | None = None,
+	output_sigmoid: bool = True,
 ) -> np.ndarray:
 	"""Run 3D UNet inference on a volume using overlapping tiles with linear blending.
 
@@ -873,9 +895,7 @@ def _infer_tiled_3d(
 
 	# Precompute downscaled weight (or full-res weight) as numpy for accumulation
 	if sd > 1:
-		w_lr = F.avg_pool3d(
-			w_full.unsqueeze(0).unsqueeze(0), sd, sd
-		).squeeze(0).squeeze(0).cpu().numpy()  # (tile//sd, tile//sd, tile//sd)
+		w_lr = _pyrdown3d(w_full.unsqueeze(0), factor=sd).squeeze(0).cpu().numpy()  # (tile//sd, tile//sd, tile//sd)
 	else:
 		w_lr = w_full.cpu().numpy()  # (tile, tile, tile)
 
@@ -924,7 +944,7 @@ def _infer_tiled_3d(
 				tile_f = tile_np.astype(np.float32) / 255.0
 				tile_t = torch.from_numpy(tile_f).unsqueeze(0).unsqueeze(0).to(device)
 
-				with torch.inference_mode():
+				with torch.inference_mode(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
 					pred = model(tile_t)
 				# Model returns dict {"output": tensor} or plain tensor
 				if isinstance(pred, dict):
@@ -944,15 +964,18 @@ def _infer_tiled_3d(
 						flush=True,
 					)
 
-				# Sigmoid on GPU
-				pred = torch.sigmoid(pred.float())  # (1, C, tz, ty, tx)
+				# Activate on GPU
+				if output_sigmoid:
+					pred = torch.sigmoid(pred.float())  # (1, C, tz, ty, tx)
+				else:
+					pred = pred.float().clamp(0.0, 1.0)
 
 				# Apply blend weight on GPU
 				pred_w = pred[0] * w_full  # (C, tz, ty, tx)
 
 				# Downscale on GPU if needed
 				if sd > 1:
-					pred_w = F.avg_pool3d(pred_w.unsqueeze(0), sd, sd)[0]  # (C, tz/sd, ty/sd, tx/sd)
+					pred_w = _pyrdown3d(pred_w, factor=sd)  # (C, tz/sd, ty/sd, tx/sd)
 
 				pred_np = pred_w.cpu().numpy()  # (C, tz_out, ty_out, tx_out)
 
@@ -1171,7 +1194,7 @@ def run_preprocess_3d(
 
 	# --- Phase 2: tiled 3D inference ---
 	if not skip_inference:
-		model, _norm_type, _upsample_mode = build_model_3d(tile_size, str(torch_device), weights=str(unet3d_checkpoint))
+		model, _norm_type, _upsample_mode, _output_sigmoid = build_model_3d(tile_size, str(torch_device), weights=str(unet3d_checkpoint))
 		model.eval()
 
 		if calibrate_norm:
@@ -1192,7 +1215,8 @@ def run_preprocess_3d(
 			border=border,
 			scaledown=scaledown,
 			tmp_dir=out_dir,
-		)  # (8, out_nz, out_ny, out_nx) float32, sigmoid already applied
+			output_sigmoid=_output_sigmoid,
+		)  # (8, out_nz, out_ny, out_nx) float32, activated to [0,1]
 		del model
 		torch.cuda.empty_cache()
 
