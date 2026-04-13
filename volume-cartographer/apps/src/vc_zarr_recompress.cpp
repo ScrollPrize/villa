@@ -34,6 +34,9 @@
 //                   [default: hardware_concurrency]
 //   --shift N       Grid shift (see original code)
 //   --log FILE      Log completed shards to this file [default: none]
+//   --stats-pct N   Sample N% of encoded chunks and compute lossy-codec
+//                   quality metrics (MAE, RMSE, PSNR, percentiles).
+//                   Default 0 (disabled).  1-5 is cheap and representative.
 
 #include <cstdio>
 #include <cstdlib>
@@ -46,8 +49,10 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <array>
 #include <condition_variable>
 #include <deque>
+#include <random>
 #include <set>
 #include <unordered_set>
 #include <chrono>
@@ -532,7 +537,9 @@ int main(int argc, char** argv) {
                   << "  --inner-jobs K   Inner workers per shard (chunks in flight)\n"
                   << "                   [default: hardware_concurrency]\n"
                   << "  --shift N        Grid shift\n"
-                  << "  --log FILE       Log completed shards to file\n";
+                  << "  --log FILE       Log completed shards to file\n"
+                  << "  --stats-pct N    Sample N%% of chunks for quality metrics\n"
+                  << "                   (MAE, RMSE, PSNR, percentiles).  [0 = off]\n";
         return 1;
     }
 
@@ -551,6 +558,7 @@ int main(int argc, char** argv) {
     // RTT (one chunk fetch ~30-80 ms over S3) and CPU on encode.
     int inner_jobs = std::max(1, (int)std::thread::hardware_concurrency());
     std::string log_path;
+    int stats_pct = 0;
 
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
@@ -559,7 +567,10 @@ int main(int argc, char** argv) {
         else if (arg == "--jobs" && i + 1 < argc) jobs = std::atoi(argv[++i]);
         else if (arg == "--inner-jobs" && i + 1 < argc) inner_jobs = std::atoi(argv[++i]);
         else if (arg == "--log" && i + 1 < argc) log_path = argv[++i];
+        else if (arg == "--stats-pct" && i + 1 < argc) stats_pct = std::atoi(argv[++i]);
     }
+    if (stats_pct < 0) stats_pct = 0;
+    if (stats_pct > 100) stats_pct = 100;
 
     // Open shared log file for shard completion logging
     std::mutex log_mtx;
@@ -761,6 +772,14 @@ int main(int argc, char** argv) {
         std::atomic<int> errs{0}, skipped_chunks{0}, zero_chunks{0};
         std::atomic<int> verify_ok{0}, verify_fail{0};
         std::mutex print_mtx;
+
+        // Lossy-codec quality sampling. Histogram is 256 bins — one per
+        // possible abs(uint8 - uint8) value — summed across sampled chunks.
+        // Aggregating this way avoids per-voxel storage; percentiles fall
+        // out of a cumulative walk at end-of-level.
+        std::array<std::atomic<uint64_t>, 256> stats_err_hist{};
+        std::atomic<uint64_t> stats_voxels_total{0};
+        std::atomic<uint64_t> stats_chunks_sampled{0};
 
         auto t0 = std::chrono::steady_clock::now();
         std::atomic<size_t> next_shard{0};
@@ -1046,6 +1065,33 @@ int main(int argc, char** argv) {
                     }
                 }
 
+                // Quality sampling: decode a random subset of encoded chunks
+                // and fold the error histogram into the per-level aggregate.
+                if (stats_pct > 0) {
+                    thread_local std::mt19937 rng{std::random_device{}()};
+                    thread_local std::uniform_int_distribution<int> roll(1, 100);
+                    if (roll(rng) <= stats_pct) {
+                        auto decoded = utils::video_decode(
+                            std::span<const std::byte>(compressed),
+                            CHUNK_VOXELS, params);
+                        size_t n = std::min(decoded.size(), task.raw.size());
+                        std::array<uint64_t, 256> local_hist{};
+                        for (size_t i = 0; i < n; i++) {
+                            int diff = std::abs(
+                                (int)static_cast<uint8_t>(decoded[i]) -
+                                (int)static_cast<uint8_t>(task.raw[i]));
+                            local_hist[diff]++;
+                        }
+                        for (int i = 0; i < 256; i++) {
+                            if (local_hist[i])
+                                stats_err_hist[i].fetch_add(local_hist[i],
+                                                            std::memory_order_relaxed);
+                        }
+                        stats_voxels_total.fetch_add(n, std::memory_order_relaxed);
+                        stats_chunks_sampled.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+
                 task.shard->result_data[task.job_idx] = std::move(compressed);
                 task.shard->result_kind[task.job_idx] = RESULT_COMPRESSED;
                 task.shard->any_data.store(true);
@@ -1208,6 +1254,47 @@ int main(int argc, char** argv) {
                elapsed, processed_chunks.load() / elapsed, mb_s);
         if (verify) {
             printf("  Verify: %d OK, %d FAIL\n", verify_ok.load(), verify_fail.load());
+        }
+
+        // Dump lossy-codec quality stats for this level if sampling was on.
+        uint64_t sv = stats_voxels_total.load();
+        if (sv > 0) {
+            uint64_t sum = 0, sum_sq = 0;
+            int pmax = 0;
+            for (int i = 0; i < 256; i++) {
+                uint64_t c = stats_err_hist[i].load();
+                sum += uint64_t(i) * c;
+                sum_sq += uint64_t(i) * i * c;
+                if (c > 0) pmax = i;
+            }
+            auto pct_bin = [&](double p) -> int {
+                uint64_t target = uint64_t(double(sv) * p);
+                uint64_t acc = 0;
+                for (int i = 0; i < 256; i++) {
+                    acc += stats_err_hist[i].load();
+                    if (acc >= target) return i;
+                }
+                return pmax;
+            };
+            double mae = double(sum) / double(sv);
+            double mse = double(sum_sq) / double(sv);
+            double rmse = std::sqrt(mse);
+            double psnr = mse > 0 ? 10.0 * std::log10(255.0 * 255.0 / mse) : 1e9;
+            int p50 = pct_bin(0.50), p90 = pct_bin(0.90),
+                p95 = pct_bin(0.95), p99 = pct_bin(0.99);
+            printf("  Quality (%%%d sample, %lu chunks, %lu voxels):\n",
+                   stats_pct,
+                   (unsigned long)stats_chunks_sampled.load(),
+                   (unsigned long)sv);
+            printf("    MAE=%.3f  RMSE=%.3f  PSNR=%.2f dB\n",
+                   mae, rmse, psnr);
+            printf("    percentiles: p50=%d  p90=%d  p95=%d  p99=%d  max=%d\n",
+                   p50, p90, p95, p99, pmax);
+
+            // Reset histogram for next level.
+            for (int i = 0; i < 256; i++) stats_err_hist[i].store(0);
+            stats_voxels_total.store(0);
+            stats_chunks_sampled.store(0);
         }
     }
 
