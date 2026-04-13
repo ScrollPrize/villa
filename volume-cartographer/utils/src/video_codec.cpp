@@ -12,7 +12,17 @@ namespace utils {
 namespace {
 
 constexpr char MAGIC[4] = {'V', 'C', '3', 'D'};
-constexpr std::size_t HEADER_SIZE = 20;
+// 24-byte header:
+//   offset  0..3: magic "VC3D"
+//   offset  4..5: codec type (1 = H265)
+//   offset  6..7: qp
+//   offset  8..11: depth (Z)
+//   offset 12..15: height (Y)
+//   offset 16..19: width (X)
+//   offset 20:    u8 air_clamp (0 = off; decode zeros v<=air_clamp)
+//   offset 21:    u8 shift_n   (0 = off; decode left-shifts by shift_n)
+//   offset 22..23: reserved, must be 0
+constexpr std::size_t HEADER_SIZE = 24;
 
 auto pad2(int v) -> int { return std::max(16, (v + 1) & ~1); }
 
@@ -44,7 +54,8 @@ auto read_le32(const std::byte* src) -> uint32_t
            (static_cast<uint32_t>(static_cast<uint8_t>(src[3])) << 24);
 }
 
-void write_header(std::vector<std::byte>& output, int qp, int Z, int Y, int X)
+void write_header(std::vector<std::byte>& output, int qp, int Z, int Y, int X,
+                  int air_clamp, int shift_n)
 {
     output.resize(HEADER_SIZE);
     std::memcpy(output.data(), MAGIC, 4);
@@ -53,15 +64,28 @@ void write_header(std::vector<std::byte>& output, int qp, int Z, int Y, int X)
     write_le32(output.data() + 8, static_cast<uint32_t>(Z));
     write_le32(output.data() + 12, static_cast<uint32_t>(Y));
     write_le32(output.data() + 16, static_cast<uint32_t>(X));
+    output[20] = static_cast<std::byte>(air_clamp & 0xFF);
+    output[21] = static_cast<std::byte>(shift_n & 0xFF);
+    output[22] = std::byte{0};
+    output[23] = std::byte{0};
 }
 
 void fill_y_plane(
-    std::vector<uint8_t>& yBuf, const uint8_t* src, int X, int Y, int padW, int padH)
+    std::vector<uint8_t>& yBuf, const uint8_t* src, int X, int Y, int padW, int padH,
+    int air_clamp, int shift_n)
 {
+    const uint8_t t = static_cast<uint8_t>(air_clamp);
     for (int y = 0; y < Y; ++y) {
-        std::memcpy(yBuf.data() + y * padW, src + y * X, X);
+        const uint8_t* srow = src + y * X;
+        uint8_t* drow = yBuf.data() + y * padW;
+        for (int x = 0; x < X; ++x) {
+            uint8_t v = srow[x];
+            if (air_clamp > 0 && v < t) v = t;  // snap [0,t] -> t
+            if (shift_n > 0) v >>= shift_n;      // strip low bits
+            drow[x] = v;
+        }
         if (padW > X)
-            std::memset(yBuf.data() + y * padW + X, 0, padW - X);
+            std::memset(drow + X, 0, padW - X);
     }
     for (int y = Y; y < padH; ++y)
         std::memset(yBuf.data() + y * padW, 0, padW);
@@ -149,15 +173,18 @@ auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params
     pic->stride[2] = 0;
     pic->colorSpace = X265_CSP_I400;
 
+    const int air_clamp = std::max(0, std::min(255, params.air_clamp));
+    const int shift_n = std::max(0, std::min(7, params.shift_n));
+
     std::vector<std::byte> output;
-    write_header(output, params.qp, Z, Y, X);
+    write_header(output, params.qp, Z, Y, X, air_clamp, shift_n);
 
     x265_nal* nals = nullptr;
     uint32_t nalCount = 0;
 
     for (int z = 0; z < Z; ++z) {
         const auto* src = reinterpret_cast<const uint8_t*>(raw.data()) + z * Y * X;
-        fill_y_plane(yBuf, src, X, Y, padW, padH);
+        fill_y_plane(yBuf, src, X, Y, padW, padH, air_clamp, shift_n);
         pic->pts = z;
 
         int ret = x265_encoder_encode(enc, &nals, &nalCount, pic, nullptr);
@@ -198,6 +225,11 @@ auto video_decode(
 
     if (out_size != static_cast<std::size_t>(Z) * Y * X)
         throw std::runtime_error("video_decode: out_size mismatch with header dimensions");
+
+    int air_clamp = static_cast<int>(static_cast<uint8_t>(compressed[20]));
+    int shift_n = static_cast<int>(static_cast<uint8_t>(compressed[21]));
+    if (shift_n > 7)
+        throw std::runtime_error("video_decode: invalid shift_n");
 
     const auto* bitstream =
         reinterpret_cast<const uint8_t*>(compressed.data() + HEADER_SIZE);
@@ -242,6 +274,21 @@ auto video_decode(
         if (framesDecoded >= Z) break;
         if (!more && err != DE265_OK) break;
         if (err == DE265_ERROR_WAITING_FOR_INPUT_DATA) break;
+    }
+
+    // Post-decode: left-shift by shift_n first (inverse of encode-side
+    // right-shift), then apply air-clamp zero threshold.  Order matters
+    // because air_clamp is expressed in the original (pre-shift) value
+    // domain — easier for callers to reason about.
+    if (shift_n > 0 || air_clamp > 0) {
+        const uint8_t t = static_cast<uint8_t>(air_clamp);
+        auto* p = reinterpret_cast<uint8_t*>(output.data());
+        for (size_t i = 0; i < output.size(); ++i) {
+            uint8_t v = p[i];
+            if (shift_n > 0) v = static_cast<uint8_t>(v << shift_n);
+            if (air_clamp > 0 && v <= t) v = 0;
+            p[i] = v;
+        }
     }
 
     return output;

@@ -32,7 +32,10 @@
 //   --jobs N        Outer worker threads (shards in flight) [default: 8]
 //   --inner-jobs K  Inner worker threads per shard (chunks in flight)
 //                   [default: hardware_concurrency]
-//   --shift N       Grid shift (see original code)
+//   --bit-shift N   Right-shift input by N bits pre-encode (0..7, default 0).
+//                   Ultra-compression at the expense of signal quality; decode
+//                   left-shifts by N to restore range. Use only when aggressive
+//                   compression is needed (e.g. streaming 4-bit previews).
 //   --log FILE      Log completed shards to this file [default: none]
 //   --stats-pct N   Sample N% of encoded chunks and compute lossy-codec
 //                   quality metrics (MAE, RMSE, PSNR, percentiles).
@@ -61,6 +64,7 @@
 #include <deque>
 #include <random>
 #include <set>
+#include <sstream>
 #include <unordered_set>
 #include <chrono>
 
@@ -543,11 +547,12 @@ int main(int argc, char** argv) {
                   << "  --jobs N         Outer workers (shards in flight) [8]\n"
                   << "  --inner-jobs K   Inner workers per shard (chunks in flight)\n"
                   << "                   [default: hardware_concurrency]\n"
-                  << "  --shift N        Grid shift\n"
                   << "  --log FILE       Log completed shards to file\n"
                   << "  --stats-pct N    Sample N%% of chunks for quality metrics\n"
                   << "                   (MAE, RMSE, PSNR, percentiles).  [0 = off]\n"
-                  << "  --air-clamp T    Clamp voxels v<=T to T pre-encode. [0 = off]\n";
+                  << "  --air-clamp T    Clamp voxels v<=T to T pre-encode. [0 = off]\n"
+                  << "  --bit-shift N    Right-shift input by N bits (0..7). [0 = off]\n"
+                  << "  --levels CSV     Process only listed levels (e.g. 4,5). [default: all]\n";
         return 1;
     }
 
@@ -567,7 +572,9 @@ int main(int argc, char** argv) {
     int inner_jobs = std::max(1, (int)std::thread::hardware_concurrency());
     std::string log_path;
     int stats_pct = 0;
-    int air_clamp = 0;  // 0 = disabled
+    int air_clamp = 0;         // legacy high-clamp (snap v<=T to T). 0=off.
+    int shift_n = 0;           // right-shift input by N (ultra-compression, off by default)
+    std::string levels_arg;    // empty = all discovered; else CSV of levels
 
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
@@ -578,11 +585,15 @@ int main(int argc, char** argv) {
         else if (arg == "--log" && i + 1 < argc) log_path = argv[++i];
         else if (arg == "--stats-pct" && i + 1 < argc) stats_pct = std::atoi(argv[++i]);
         else if (arg == "--air-clamp" && i + 1 < argc) air_clamp = std::atoi(argv[++i]);
+        else if (arg == "--bit-shift" && i + 1 < argc) shift_n = std::atoi(argv[++i]);
+        else if (arg == "--levels" && i + 1 < argc) levels_arg = argv[++i];
     }
     if (stats_pct < 0) stats_pct = 0;
     if (stats_pct > 100) stats_pct = 100;
     if (air_clamp < 0) air_clamp = 0;
     if (air_clamp > 255) air_clamp = 255;
+    if (shift_n < 0) shift_n = 0;
+    if (shift_n > 7) shift_n = 7;
 
     // Open shared log file for shard completion logging
     std::mutex log_mtx;
@@ -602,16 +613,23 @@ int main(int argc, char** argv) {
     printf("Output: %s\n", output_path.c_str());
     printf("H265 QP: %d, shard: %zu³, chunk: %zu³\n", qp, SHARD_DIM, CHUNK_DIM);
     printf("Outer jobs: %d  |  Inner jobs/shard: %d\n", jobs, inner_jobs);
-    if (air_clamp > 0) {
-        printf("Air clamp: v <= %d -> %d\n", air_clamp, air_clamp);
-    }
+    if (air_clamp > 0) printf("Air clamp: v <= %d -> %d\n", air_clamp, air_clamp);
+    if (shift_n > 0) printf("Bit-shift: %d (ultra-compression mode)\n", shift_n);
     printf("\n");
 
-    // Discover pyramid levels (always process all 6: 0-5)
+    // Discover pyramid levels (all 6 by default, or a --levels CSV subset).
+    std::set<int> levels_filter;
+    if (!levels_arg.empty()) {
+        std::stringstream ss(levels_arg);
+        std::string tok;
+        while (std::getline(ss, tok, ','))
+            if (!tok.empty()) levels_filter.insert(std::atoi(tok.c_str()));
+    }
     std::vector<int> levels;
     std::vector<std::vector<size_t>> shapes;
 
     for (int l = 0; l < 6; l++) {
+        if (!levels_filter.empty() && !levels_filter.count(l)) continue;
         std::string zarray_key = std::to_string(l) + "/.zarray";
         std::string zarr_json_key = std::to_string(l) + "/zarr.json";
 
@@ -885,7 +903,7 @@ int main(int argc, char** argv) {
         struct EncodeTask {
             std::shared_ptr<ShardState> shard;
             size_t job_idx;
-            std::vector<std::byte> raw;  // 128^3 bytes ready to encode
+            std::vector<std::byte> raw;      // 128^3 bytes ready to encode
         };
 
         std::deque<DownloadTask> dl_q;
@@ -1031,18 +1049,9 @@ int main(int argc, char** argv) {
                     raw.resize(CHUNK_VOXELS);
                 }
 
-                // Physics-derived air clamp: snap all voxels <= air_clamp to
-                // exactly air_clamp.  Reconstruction noise sitting in the
-                // "air/void" attenuation band carries no segmentation info,
-                // so flattening it lets h265 encode those regions at
-                // near-zero bit cost without affecting scroll material.
-                if (air_clamp > 0) {
-                    const uint8_t t = static_cast<uint8_t>(air_clamp);
-                    auto* bytes = reinterpret_cast<uint8_t*>(raw.data());
-                    for (size_t i = 0; i < raw.size(); i++) {
-                        if (bytes[i] <= t) bytes[i] = t;
-                    }
-                }
+                // Air-clamp is applied inside the codec (and the threshold is
+                // stored in the chunk header so decode auto-zeros). We do not
+                // pre-snap here.
 
                 if (is_all_zero(raw)) {
                     zero_chunks.fetch_add(1);
@@ -1076,6 +1085,8 @@ int main(int argc, char** argv) {
                 params.depth = CHUNK_DIM;
                 params.height = CHUNK_DIM;
                 params.width = CHUNK_DIM;
+                params.air_clamp = air_clamp;
+                params.shift_n = shift_n;
 
                 auto compressed = utils::video_encode(
                     std::span<const std::byte>(task.raw), params);

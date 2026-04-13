@@ -168,6 +168,9 @@ target_link_libraries(vc_zarr_recompress vc_core blosc_static)
 add_executable(vc_zarr_verify src/vc_zarr_verify.cpp)
 target_link_libraries(vc_zarr_verify vc_core)
 
+add_executable(vc_encode_test src/vc_encode_test.cpp)
+target_link_libraries(vc_encode_test utils_video_codec)
+
 
 # Precompiled headers for CLI apps (reuse vc_core's PCH)
 if(VC_USE_PCH)

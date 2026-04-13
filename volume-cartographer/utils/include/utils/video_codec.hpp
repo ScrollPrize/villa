@@ -27,6 +27,22 @@ struct VideoCodecParams {
     int depth = 0;   // Z
     int height = 0;  // Y
     int width = 0;   // X
+
+    // Air-clamp threshold (0 = disabled).  Encode side snaps any voxel
+    // v <= air_clamp to v = air_clamp before encoding (gives the codec a
+    // flat constant region in the air/void instead of reconstruction noise).
+    // Decode side zeroes any voxel v <= air_clamp post-decode, so end-users
+    // see clean zero where the original had air noise.  Threshold is
+    // recorded in the chunk header (v2) so decode is automatic.
+    int air_clamp = 0;
+
+    // Bit-shift (0..7, default 0 = off).  Opt-in ultra-compression at the
+    // expense of signal quality: encode right-shifts input by shift_n,
+    // decode left-shifts back (low shift_n bits become zero).  Recorded in
+    // header (v3) so decode reconstructs the shifted range automatically.
+    // Compounds with codec quantization error — only use when aggressive
+    // compression matters more than fidelity.
+    int shift_n = 0;
 };
 
 // Encode a 3D chunk as an H.265 bitstream.
@@ -46,7 +62,7 @@ struct VideoCodecParams {
 // Check if a compressed buffer has the VC3D video codec magic header.
 [[nodiscard]] inline bool is_video_compressed(std::span<const std::byte> data) noexcept
 {
-    return data.size() >= 20 &&
+    return data.size() >= 24 &&
         static_cast<char>(data[0]) == 'V' &&
         static_cast<char>(data[1]) == 'C' &&
         static_cast<char>(data[2]) == '3' &&
@@ -62,7 +78,7 @@ struct VideoCodecParams {
             uint32_t(uint8_t(p[0])) | (uint32_t(uint8_t(p[1])) << 8) |
             (uint32_t(uint8_t(p[2])) << 16) | (uint32_t(uint8_t(p[3])) << 24));
     };
-    if (data.size() < 20) return {0, 0, 0};
+    if (data.size() < 24) return {0, 0, 0};
     return {rd32(data.data() + 8), rd32(data.data() + 12), rd32(data.data() + 16)};
 }
 
