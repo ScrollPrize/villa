@@ -65,6 +65,7 @@
 #include <random>
 #include <set>
 #include <sstream>
+#include <future>
 #include <unordered_set>
 #include <chrono>
 
@@ -1211,24 +1212,34 @@ int main(int argc, char** argv) {
             size_t base_cy = sy * CHUNKS_PER_SHARD;
             size_t base_cx = sx * CHUNKS_PER_SHARD;
 
-            // LIST input chunks once for this shard's cz planes.
+            // LIST input chunks for this shard's cz planes — fan out the
+            // 8 per-cz LISTs in parallel via std::async so RTT stacks don't
+            // serialize.  Each LIST is one S3 round-trip (~50 ms); 8 in
+            // parallel turns 400 ms of wall time into ~50 ms.
             std::unordered_set<std::string> existing_input;
-            for (size_t iz = 0; iz < CHUNKS_PER_SHARD; iz++) {
-                size_t cz = base_cz + iz;
-                if (cz >= out_nz) break;
-                std::string cz_prefix = level_prefix + std::to_string(cz) + dim_sep;
-                try {
-                    auto keys = submitter_input->list_chunks(cz_prefix);
-                    for (auto& k : keys) existing_input.insert(std::move(k));
-                } catch (const std::exception& e) {
-                    static std::atomic<int> warn_count{0};
-                    int n = warn_count.fetch_add(1);
-                    if (n < 20) {
-                        std::lock_guard lk(print_mtx);
-                        fprintf(stderr, "[warn] per-cz LIST failed (prefix=%s): %s\n",
-                                cz_prefix.c_str(), e.what());
-                    }
+            {
+                std::vector<std::future<std::vector<std::string>>> list_futs;
+                list_futs.reserve(CHUNKS_PER_SHARD);
+                for (size_t iz = 0; iz < CHUNKS_PER_SHARD; iz++) {
+                    size_t cz = base_cz + iz;
+                    if (cz >= out_nz) break;
+                    std::string cz_prefix = level_prefix + std::to_string(cz) + dim_sep;
+                    list_futs.push_back(std::async(std::launch::async,
+                        [in = submitter_input.get(), prefix = std::move(cz_prefix)]() {
+                            try {
+                                return in->list_chunks(prefix);
+                            } catch (const std::exception& e) {
+                                static std::atomic<int> warn_count{0};
+                                int n = warn_count.fetch_add(1);
+                                if (n < 20)
+                                    fprintf(stderr, "[warn] per-cz LIST failed "
+                                            "(prefix=%s): %s\n", prefix.c_str(), e.what());
+                                return std::vector<std::string>{};
+                            }
+                        }));
                 }
+                for (auto& f : list_futs)
+                    for (auto& k : f.get()) existing_input.insert(std::move(k));
             }
 
             auto shard = std::make_shared<ShardState>();
