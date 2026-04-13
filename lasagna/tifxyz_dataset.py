@@ -303,7 +303,7 @@ class TifxyzLasagnaDataset(Dataset):
         else:
             self.augmentations = None
 
-        # Find patches (no ink labels required)
+        # Find patches (uses pre-computed cache from neural tracer datasets)
         self.patches, self.patch_generation_stats = find_patches(
             config,
             patch_size_zyx=self.patch_size_zyx,

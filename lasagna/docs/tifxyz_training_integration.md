@@ -100,13 +100,35 @@ already filters segments via `_segment_overlaps_z_range()`.
 
 ### Volume access
 
-CT volumes are opened via `vesuvius.data.utils.open_zarr()`, which handles
-local paths, S3 (`s3://...`), and HTTPS (`https://volumes.aws.ash2txt.org/...`)
-natively using fsspec. For authenticated HTTPS access, pass an `auth_json_path`
-pointing to a JSON file with `{"username": "...", "password": "..."}`.
+CT volumes are opened via `vesuvius.neural_tracing.datasets.common.open_zarr()`,
+which handles local paths, S3 (`s3://...`), and HTTPS
+(`https://volumes.aws.ash2txt.org/...`) using fsspec. For authenticated HTTPS
+access, pass an `auth_json_path` pointing to a JSON file with
+`{"username": "...", "password": "..."}`.
+
+**Remote paths require `volume_cache_dir` in config.** When set, fsspec's
+`filecache` protocol caches each zarr chunk locally on first access, so
+subsequent reads (across epochs and training runs) are served from local disk.
+Without `volume_cache_dir`, remote paths raise a `ValueError` to prevent
+accidental uncached streaming.
+
+```json
+{
+    "volume_cache_dir": "/mnt/raid_nvme/zarr_cache",
+    "datasets": [
+        {
+            "volume_path": "s3://philodemos/full-scrolls/PHerc0139/volumes/0139_2um_ds2_raw.zarr",
+            "volume_scale": 0,
+            "segments_path": "/local/path/to/PHerc0139/tifxyz",
+            "z_range": [2000, 7000]
+        }
+    ]
+}
+```
 
 The neural tracer's `find_patches()` calls `open_zarr()` per dataset entry,
-so switching from local to remote volumes only requires changing `volume_path`.
+so switching from local to remote volumes only requires changing `volume_path`
+and adding `volume_cache_dir`.
 
 ### Tifxyz surface access
 
@@ -361,78 +383,38 @@ We extend this to splat multi-channel values (not just binary presence).
 
 ## 5. Integration Approaches
 
-### Approach A: New dataset class (like TifxyzInkDataset)
+### Approach A: New dataset class (like TifxyzInkDataset) — IMPLEMENTED
 
-Create a `TifxyzLasagnaDataset` modeled on `TifxyzInkDataset` that:
-- Uses the same patch-finding infrastructure (`find_patches`)
-- In `__getitem__`, reads a CT crop and derives the 8 label channels on-the-fly
-- Plugs into the vesuvius `BaseTrainer` as a custom dataset
+Implemented in `lasagna/tifxyz_dataset.py` as `TifxyzLasagnaDataset`.
 
-**Pros:**
-- Full control over label derivation
-- Reuses existing patch-finding and voxelization code
-- Can handle multi-surface patches natively
-- Natural fit — same data sources (volumes + tifxyz folders)
+- Uses the same `find_patches()` from `ink-detection/tifxyz_dataset/patch_finding.py`
+  (unmodified — the neural tracer datasets have ink labels AND a pre-computed
+  `.tifxyz_patch_cache.json`, so `find_patches()` loads cached patches instantly)
+- Default `patch_cache_filename` is `_PATCH_CACHE_DEFAULT_FILENAME`
+  (`.tifxyz_patch_cache.json`) to match the neural tracer's existing cache
+- In `__getitem__`, reads a CT crop and voxelizes surface masks + direction channels
+- EDT, chain ordering, cos/grad_mag derivation happen on GPU in the train step
+  via `lasagna/tifxyz_labels.py:compute_patch_labels()`
 
-**Cons:**
-- New dataset class to maintain
-- Doesn't use vesuvius `ZarrDataset`'s pre-built patch validation / caching
-- On-the-fly computation adds latency to data loading
+**Key implementation details:**
+- `find_patches()` is called with its standard signature (no modifications to
+  `patch_finding.py` — labels are required and present in the datasets)
+- Multi-surface overlap: finds all segments overlapping each patch bbox, voxelizes
+  each into a separate mask, splats direction channels from all surfaces combined
+- Multi-channel trilinear splatting via `_splat_multichannel_trilinear_numba()`
+  (numba) with numpy fallback
 
-**Implementation sketch:**
-
+**`__getitem__` returns:**
 ```python
-class TifxyzLasagnaDataset(Dataset):
-    """Dataset that derives lasagna training channels from tifxyz surfaces."""
-
-    def __init__(self, config, apply_augmentation=True):
-        self.scaledown = config.get("scaledown", 4)
-        self.patch_size = config["patch_size"]  # full-res patch size
-
-        # Reuse TifxyzInkDataset's patch finding
-        self.patches = find_patches(config, ...)
-
-        # For each patch, we know: volume, segment, world_bbox
-        if apply_augmentation:
-            self.augmentations = create_training_transforms(...)
-
-    def __getitem__(self, idx):
-        patch = self.patches[idx]
-        # 1. Read CT crop (full res)
-        vol_crop = _read_volume_crop_from_patch_dict(patch, ...)
-
-        # 2. Sample tifxyz surface within patch bbox
-        segment = patch["segment"]
-        sampled = _sample_patch_supervision_grid(self, segment, ...)
-        # sampled contains: local_grid, normals_zyx, in_patch, valid_interp
-
-        # 3. Derive 8 channels from normals + distance transform
-        labels = self._compute_lasagna_labels(sampled, ...)
-
-        # 4. Pool labels to step resolution
-        labels_step = avg_pool3d(labels, self.scaledown)
-
-        return {"image": vol_crop, "labels": labels_step}
-
-    def _compute_lasagna_labels(self, sampled, ...):
-        """Derive cos, grad_mag, dir_{z,y,x} from surface grid."""
-        normals = sampled["normals_zyx"]  # (H, W, 3) in ZYX
-        nz, ny, nx = normals[..., 0], normals[..., 1], normals[..., 2]
-
-        # Direction encoding
-        dir0_z, dir1_z = _encode_dir(nx, ny)
-        dir0_y, dir1_y = _encode_dir(nx, nz)
-        dir0_x, dir1_x = _encode_dir(ny, nz)
-
-        # Voxelize direction channels + per-surface binary masks
-        # ... (splat per-point channel values using trilinear weighting)
-
-        # Per-surface distance transforms → cos and grad_mag (see §3.2)
-        # dts = [edt(~mask_k) for mask_k in per_surface_masks]
-        # d1, d2 = two smallest distances at each voxel
-        # cos = 0.5 + 0.5 * cos(π * d1 / ((d1+d2)/2))
-        # grad_mag = 1 / (d1 + d2)
-        # ...
+{
+    "image":              # (1, Z, Y, X) float32 — z-score normalized CT crop
+    "surface_masks":      # (N, Z, Y, X) float32 — per-surface binary voxelization
+    "direction_channels": # (6, Z, Y, X) float32 — splatted direction values
+    "normals_valid":      # (1, Z, Y, X) float32 — where directions were splatted
+    "num_surfaces":       # int
+    "padding_mask":       # (1, Z, Y, X) float32 — where CT data exists
+    "patch_info":         # dict with dataset_idx, segment_uuid, world_bbox, idx
+}
 ```
 
 ### Approach B: Preprocessing script + ZarrDataset
@@ -538,79 +520,26 @@ class LasagnaTrainer(BaseTrainer):
 
 ---
 
-## 7. Recommended Approach
+## 7. Chosen Approach
 
-**Start with Approach B (preprocessing + ZarrDataset)** for initial
-experiments, then migrate to **Approach A/D (on-the-fly dataset)** once the
-label derivation is validated.
+**Approach A (on-the-fly dataset)** was implemented directly, skipping the
+preprocessing phase. The neural tracer datasets already have ink labels and
+pre-computed `.tifxyz_patch_cache.json` files, so `find_patches()` loads
+patches from cache instantly with no progress bars or recomputation.
 
-### Phase 1: Validate label derivation (Approach B)
+### Implementation files
 
-1. Write `tifxyz_to_lasagna_labels.py`:
-   - Load tifxyz surfaces for a region via `tifxyz.load_folder()`
-   - Compute normals via `Tifxyz.compute_normals()`
-   - Voxelize normals + per-surface binary masks using adapted splatting from
-     the neural tracer
-   - Per-surface distance transforms → sort → d1, d2 → cos and grad_mag
-   - Encode direction channels from splatted normals
-   - Compute validity mask (≥2 surfaces, boundary erosion)
-   - Write as zarr label volumes
+| File | Purpose |
+|------|---------|
+| `lasagna/tifxyz_dataset.py` | `TifxyzLasagnaDataset` — data loading (CT crops, surface masks, direction channels) |
+| `lasagna/tifxyz_labels.py` | `compute_patch_labels()` — GPU label derivation (EDT, chain ordering, cos/grad_mag) |
+| `lasagna/train_tifxyz.py` | Training script |
 
-2. Visually verify labels are correct (compare to existing 2D UNet output or
-   fit-data output)
+### Multi-channel splatting
 
-3. Train with standard vesuvius pipeline using `ZarrDataset`
-
-### Phase 2: On-the-fly dataset (Approach A + D)
-
-1. Create `TifxyzLasagnaDataset` reusing neural tracer infrastructure
-
-2. Create `LasagnaTrainer(BaseTrainer)` that uses the new dataset
-
-3. This avoids the storage overhead and allows iterating on label derivation
-   without re-preprocessing
-
-### Voxelization detail: multi-channel splatting
-
-The neural tracer's existing splatting code (`_splat_points_trilinear_numba`)
-only splats binary/scalar values. For the lasagna channels, we need to splat
-8-channel vectors. Extend the numba kernel:
-
-```python
-@njit(cache=True)
-def _splat_multichannel_trilinear(points, values, size_z, size_y, size_x, n_channels):
-    """Splat (N, n_channels) values at (N, 3) positions into a volume."""
-    vox = np.zeros((n_channels, size_z, size_y, size_x), dtype=np.float32)
-    weights = np.zeros((size_z, size_y, size_x), dtype=np.float32)
-    for i in range(points.shape[0]):
-        pz, py, px = points[i, 0], points[i, 1], points[i, 2]
-        z0, y0, x0 = int(np.floor(pz)), int(np.floor(py)), int(np.floor(px))
-        dz, dy, dx = pz - z0, py - y0, px - x0
-        for oz in range(2):
-            zi = z0 + oz
-            if zi < 0 or zi >= size_z: continue
-            wz = (1.0 - dz) if oz == 0 else dz
-            for oy in range(2):
-                yi = y0 + oy
-                if yi < 0 or yi >= size_y: continue
-                wy = (1.0 - dy) if oy == 0 else dy
-                for ox in range(2):
-                    xi = x0 + ox
-                    if xi < 0 or xi >= size_x: continue
-                    wx = (1.0 - dx) if ox == 0 else dx
-                    w = wz * wy * wx
-                    weights[zi, yi, xi] += w
-                    for c in range(n_channels):
-                        vox[c, zi, yi, xi] += w * values[i, c]
-    # Normalize by accumulated weight
-    for zi in range(size_z):
-        for yi in range(size_y):
-            for xi in range(size_x):
-                if weights[zi, yi, xi] > 0:
-                    for c in range(n_channels):
-                        vox[c, zi, yi, xi] /= weights[zi, yi, xi]
-    return vox
-```
+The multi-channel trilinear splatting kernel
+(`_splat_multichannel_trilinear_numba`) is implemented in
+`lasagna/tifxyz_dataset.py` with a numpy fallback when numba is unavailable.
 
 ### Handling multiple surfaces in one patch
 

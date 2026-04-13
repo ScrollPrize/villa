@@ -1,0 +1,41 @@
+{
+    "volume_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/zarr_cache",
+    "datasets": [
+        {
+            "volume_path": "s3://volpkgs/PHerc0139.volpkg/volumes/2um_ds2_raw.zarr/",
+            "volume_scale": 2,
+            "segments_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/neural_tracer_dataset/nt_dataset_022026/PHerc0139/tifxyz",
+            "z_range": [2000, 7000]
+        },
+        {
+            "volume_path": "s3://volpkgs/PHerc1667.volpkg/volumes/s4.zarr/",
+            "volume_scale": 0,
+            "segments_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/neural_tracer_dataset/nt_dataset_022026/PHerc1667/tifxyz",
+            "z_range": [3500, 9000]
+        },
+        {
+            "volume_path": "s3://volpkgs/PHercParis4.volpkg/volumes/s1_8um_uint8.zarr/",
+            "volume_scale": 0,
+            "segments_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/neural_tracer_dataset/nt_dataset_022026/PHercParis4/tifxyz",
+            "z_range": [1000, 9250]
+        },
+        {
+            "volume_path": null,
+            "volume_scale": 2,
+            "segments_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/neural_tracer_dataset/nt_dataset_022026/PHerc0343p/tifxyz",
+            "z_range": [1314, 3000]
+        },
+        {
+            "volume_path": "s3://volpkgs/PHercMANBp.volpkg/volumes/PHercMANBp-ct-2um.zarr/",
+            "volume_scale": 2,
+            "segments_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/neural_tracer_dataset/nt_dataset_022026/PHercMANBp/tifxyz",
+            "z_range": [1000, 3000]
+        },
+        {
+            "volume_path": null,
+            "volume_scale": 1,
+            "segments_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/neural_tracer_dataset/nt_dataset_022026/PHerc0500p2/tifxyz",
+            "z_range": [1700, 6000]
+        }
+    ]
+}
