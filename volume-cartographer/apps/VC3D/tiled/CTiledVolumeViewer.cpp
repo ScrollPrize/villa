@@ -1212,17 +1212,37 @@ void CTiledVolumeViewer::onVolumeClicked(QPointF scene_loc, Qt::MouseButton butt
     if (buttons == Qt::LeftButton) {
         bool isShift = modifiers.testFlag(Qt::ShiftModifier);
         if (isShift && !_segmentationEditActive && _pointCollection) {
+            ColPoint newPt{};
             if (_selectedCollectionId != 0) {
                 const auto& collections = _pointCollection->getAllCollections();
                 auto it = collections.find(_selectedCollectionId);
                 if (it != collections.end()) {
-                    _pointCollection->addPoint(it->second.name, p);
+                    newPt = _pointCollection->addPoint(it->second.name, p);
                 }
             } else {
                 std::string newName = _pointCollection->generateNewCollectionName("col");
-                auto newPoint = _pointCollection->addPoint(newName, p);
-                _selectedCollectionId = newPoint.collectionId;
+                newPt = _pointCollection->addPoint(newName, p);
+                _selectedCollectionId = newPt.collectionId;
                 emit sendCollectionSelected(_selectedCollectionId);
+            }
+
+            // Look up winding depth index from d.tif on the segmentation surface
+            if (newPt.id != 0) {
+                const auto& seg = activeSegmentationHandle();
+                if (seg.surface) {
+                    cv::Vec3f ptr = seg.surface->pointer();
+                    float dist = seg.surface->pointTo(ptr, p, std::numeric_limits<float>::max(), 400);
+                    if (dist >= 0.0f) {
+                        cv::Vec3f raw = seg.surface->loc_raw(ptr);
+                        int row = static_cast<int>(std::round(raw[1]));
+                        int col = static_cast<int>(std::round(raw[0]));
+                        float wind_a = lookupDepthIndex(seg.surface, row, col);
+                        if (!std::isnan(wind_a)) {
+                            newPt.winding_annotation = wind_a;
+                            _pointCollection->updatePoint(newPt);
+                        }
+                    }
+                }
             }
         } else if (_highlightedPointId != 0) {
             emit pointClicked(_highlightedPointId);
@@ -1437,7 +1457,7 @@ void CTiledVolumeViewer::updateStatusLabel()
                 status += QString(" q%1").arg(s.ioPending);
         }
     } else if (_pinTotal > 0 && _pinReceived < _pinTotal) {
-        status += QString(" | downloading %1/%2").arg(_pinReceived).arg(_pinTotal);
+        status += QString(" | downloading %1/%2").arg(static_cast<int>(_pinReceived)).arg(static_cast<int>(_pinTotal));
     }
 
     status += " [tiled]";
