@@ -46,6 +46,8 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <set>
 #include <unordered_set>
 #include <chrono>
@@ -763,6 +765,56 @@ int main(int argc, char** argv) {
         auto t0 = std::chrono::steady_clock::now();
         std::atomic<size_t> next_shard{0};
 
+        // Async upload queue. Outer workers hand assembled shards to this
+        // queue and immediately begin the next shard's downloads, so the
+        // S3 PUT of shard N overlaps with the S3 GETs of shard N+1.
+        // Bounded to (jobs + up_jobs) items so we don't let shard bytes pile
+        // up in memory faster than we can drain them.
+        struct UploadJob {
+            std::string key;
+            std::vector<std::byte> bytes;
+        };
+        const int up_jobs = std::max(1, jobs);
+        const size_t up_queue_max = static_cast<size_t>(jobs) + up_jobs;
+        std::deque<UploadJob> upload_queue;
+        std::mutex up_mtx;
+        std::condition_variable up_not_empty;
+        std::condition_variable up_not_full;
+        bool up_done = false;
+
+        auto enqueue_upload = [&](std::string key, std::vector<std::byte>&& bytes) {
+            std::unique_lock lk(up_mtx);
+            up_not_full.wait(lk, [&]{ return upload_queue.size() < up_queue_max; });
+            upload_queue.push_back({std::move(key), std::move(bytes)});
+            up_not_empty.notify_one();
+        };
+
+        auto upload_worker = [&]() {
+            auto u_output = make_backend(output_path);
+            for (;;) {
+                UploadJob job;
+                {
+                    std::unique_lock lk(up_mtx);
+                    up_not_empty.wait(lk, [&]{ return up_done || !upload_queue.empty(); });
+                    if (upload_queue.empty()) return;
+                    job = std::move(upload_queue.front());
+                    upload_queue.pop_front();
+                    up_not_full.notify_one();
+                }
+                try {
+                    u_output->write(job.key, job.bytes);
+                } catch (const std::exception& e) {
+                    std::lock_guard lk(print_mtx);
+                    fprintf(stderr, "  UPLOAD FAIL: %s (%s)\n", job.key.c_str(), e.what());
+                    errs.fetch_add(1);
+                }
+            }
+        };
+
+        std::vector<std::thread> upload_threads;
+        upload_threads.reserve(up_jobs);
+        for (int i = 0; i < up_jobs; i++) upload_threads.emplace_back(upload_worker);
+
         auto worker = [&]() {
             auto t_input = make_backend(input_path);
             auto t_output = make_backend(output_path);
@@ -998,8 +1050,10 @@ int main(int argc, char** argv) {
                     shard_data.clear();
                     shard_data.shrink_to_fit();
 
-                    // Single write to output
-                    t_output->write(shard_key, shard);
+                    // Async upload: hand off to the upload pool and move on.
+                    // Bounded queue provides back-pressure if uploads fall
+                    // behind encoding (rare — encoding is usually slower).
+                    enqueue_upload(shard_key, std::move(shard));
                 }
 
                 int s_count = processed_shards.fetch_add(1) + 1;
@@ -1032,6 +1086,14 @@ int main(int argc, char** argv) {
         std::vector<std::thread> threads;
         for (int j = 0; j < jobs; j++) threads.emplace_back(worker);
         for (auto& t : threads) t.join();
+
+        // All shards enqueued. Signal the upload pool to drain and exit.
+        {
+            std::lock_guard lk(up_mtx);
+            up_done = true;
+            up_not_empty.notify_all();
+        }
+        for (auto& t : upload_threads) t.join();
 
         auto t1 = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(t1 - t0).count();
