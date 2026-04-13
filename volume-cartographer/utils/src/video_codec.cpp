@@ -124,14 +124,12 @@ auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params
     xparam->bRepeatHeaders = 1;
     xparam->rc.rateControlMode = X265_RC_CQP;
     xparam->rc.qp = params.qp;
-    // Encode-level parallelism within a single chunk.  We're fine with
-    // oversubscription — the OS scheduler handles it, and the gains during
-    // long-tail (1 dense shard remaining) outweigh any contention cost.
-    //   bEnableWavefront = 1: rows of CTUs in a frame in parallel
-    //     (4 rows per 128x128 frame at maxCUSize=32).
-    //   frameNumThreads = 4: 4 adjacent frames in flight at once.
-    xparam->bEnableWavefront = 1;
-    xparam->frameNumThreads = 4;
+    // Encode is single-threaded per chunk: the caller runs a thread pool of
+    // encoder instances, so chunk-level parallelism already saturates cores.
+    // Disabling WPP + frame-threads removes x265's internal sync overhead,
+    // which on 128x128 frames with Z=128 costs more than it saves.
+    xparam->bEnableWavefront = 0;
+    xparam->frameNumThreads = 1;
     xparam->logLevel = X265_LOG_NONE;
 
     // Small frames (128x128 per Z slice): 32x32 CTUs match the content
