@@ -37,6 +37,13 @@
 //   --stats-pct N   Sample N% of encoded chunks and compute lossy-codec
 //                   quality metrics (MAE, RMSE, PSNR, percentiles).
 //                   Default 0 (disabled).  1-5 is cheap and representative.
+//   --air-clamp T   Physics-derived dark clamp: any voxel v <= T is snapped
+//                   to v = T before encoding.  Removes the air/void noise
+//                   band (reconstruction noise sitting around the air u8
+//                   value has no segmentation-relevant information) and
+//                   lets h265 compress those regions as near-constant.
+//                   Typical T for 78 keV BM18 scans: ~54 (air ~39 + 15
+//                   noise margin).  Default 0 (disabled).
 
 #include <cstdio>
 #include <cstdlib>
@@ -539,7 +546,8 @@ int main(int argc, char** argv) {
                   << "  --shift N        Grid shift\n"
                   << "  --log FILE       Log completed shards to file\n"
                   << "  --stats-pct N    Sample N%% of chunks for quality metrics\n"
-                  << "                   (MAE, RMSE, PSNR, percentiles).  [0 = off]\n";
+                  << "                   (MAE, RMSE, PSNR, percentiles).  [0 = off]\n"
+                  << "  --air-clamp T    Clamp voxels v<=T to T pre-encode. [0 = off]\n";
         return 1;
     }
 
@@ -559,6 +567,7 @@ int main(int argc, char** argv) {
     int inner_jobs = std::max(1, (int)std::thread::hardware_concurrency());
     std::string log_path;
     int stats_pct = 0;
+    int air_clamp = 0;  // 0 = disabled
 
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
@@ -568,9 +577,12 @@ int main(int argc, char** argv) {
         else if (arg == "--inner-jobs" && i + 1 < argc) inner_jobs = std::atoi(argv[++i]);
         else if (arg == "--log" && i + 1 < argc) log_path = argv[++i];
         else if (arg == "--stats-pct" && i + 1 < argc) stats_pct = std::atoi(argv[++i]);
+        else if (arg == "--air-clamp" && i + 1 < argc) air_clamp = std::atoi(argv[++i]);
     }
     if (stats_pct < 0) stats_pct = 0;
     if (stats_pct > 100) stats_pct = 100;
+    if (air_clamp < 0) air_clamp = 0;
+    if (air_clamp > 255) air_clamp = 255;
 
     // Open shared log file for shard completion logging
     std::mutex log_mtx;
@@ -589,7 +601,11 @@ int main(int argc, char** argv) {
     printf("Input:  %s\n", input_path.c_str());
     printf("Output: %s\n", output_path.c_str());
     printf("H265 QP: %d, shard: %zu³, chunk: %zu³\n", qp, SHARD_DIM, CHUNK_DIM);
-    printf("Outer jobs: %d  |  Inner jobs/shard: %d\n\n", jobs, inner_jobs);
+    printf("Outer jobs: %d  |  Inner jobs/shard: %d\n", jobs, inner_jobs);
+    if (air_clamp > 0) {
+        printf("Air clamp: v <= %d -> %d\n", air_clamp, air_clamp);
+    }
+    printf("\n");
 
     // Discover pyramid levels (always process all 6: 0-5)
     std::vector<int> levels;
@@ -1013,6 +1029,19 @@ int main(int argc, char** argv) {
                     raw = std::move(padded);
                 } else if (raw.size() > CHUNK_VOXELS) {
                     raw.resize(CHUNK_VOXELS);
+                }
+
+                // Physics-derived air clamp: snap all voxels <= air_clamp to
+                // exactly air_clamp.  Reconstruction noise sitting in the
+                // "air/void" attenuation band carries no segmentation info,
+                // so flattening it lets h265 encode those regions at
+                // near-zero bit cost without affecting scroll material.
+                if (air_clamp > 0) {
+                    const uint8_t t = static_cast<uint8_t>(air_clamp);
+                    auto* bytes = reinterpret_cast<uint8_t*>(raw.data());
+                    for (size_t i = 0; i < raw.size(); i++) {
+                        if (bytes[i] <= t) bytes[i] = t;
+                    }
                 }
 
                 if (is_all_zero(raw)) {
