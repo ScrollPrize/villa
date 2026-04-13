@@ -1220,7 +1220,15 @@ int main(int argc, char** argv) {
                 try {
                     auto keys = submitter_input->list_chunks(cz_prefix);
                     for (auto& k : keys) existing_input.insert(std::move(k));
-                } catch (...) {}
+                } catch (const std::exception& e) {
+                    static std::atomic<int> warn_count{0};
+                    int n = warn_count.fetch_add(1);
+                    if (n < 20) {
+                        std::lock_guard lk(print_mtx);
+                        fprintf(stderr, "[warn] per-cz LIST failed (prefix=%s): %s\n",
+                                cz_prefix.c_str(), e.what());
+                    }
+                }
             }
 
             auto shard = std::make_shared<ShardState>();
