@@ -650,7 +650,10 @@ int main(int argc, char** argv) {
                   << "                   (MAE, RMSE, PSNR, percentiles).  [0 = off]\n"
                   << "  --air-clamp T    Clamp voxels v<=T to T pre-encode. [0 = off]\n"
                   << "  --bit-shift N    Right-shift input by N bits (0..7). [0 = off]\n"
-                  << "  --levels CSV     Process only listed levels (e.g. 4,5). [default: all]\n";
+                  << "  --levels CSV     Process only listed levels (e.g. 4,5). [default: all]\n"
+                  << "  --rank N         VM index in fanout (0..world-1). [default: 0]\n"
+                  << "  --world N        Total VM count for horizontal scaling. [default: 1]\n"
+                  << "                   With --world 4, VM 0 handles sz%%4==0, VM 1 sz%%4==1, etc.\n";
         return 1;
     }
 
@@ -673,6 +676,8 @@ int main(int argc, char** argv) {
     int air_clamp = 0;         // legacy high-clamp (snap v<=T to T). 0=off.
     int shift_n = 0;           // right-shift input by N (ultra-compression, off by default)
     std::string levels_arg;    // empty = all discovered; else CSV of levels
+    int rank = 0;              // this VM's index in the fanout (0..world-1)
+    int world = 1;             // total VM count for horizontal scaling
 
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
@@ -685,6 +690,8 @@ int main(int argc, char** argv) {
         else if (arg == "--air-clamp" && i + 1 < argc) air_clamp = std::atoi(argv[++i]);
         else if (arg == "--bit-shift" && i + 1 < argc) shift_n = std::atoi(argv[++i]);
         else if (arg == "--levels" && i + 1 < argc) levels_arg = argv[++i];
+        else if (arg == "--rank" && i + 1 < argc) rank = std::atoi(argv[++i]);
+        else if (arg == "--world" && i + 1 < argc) world = std::atoi(argv[++i]);
     }
     if (stats_pct < 0) stats_pct = 0;
     if (stats_pct > 100) stats_pct = 100;
@@ -692,6 +699,11 @@ int main(int argc, char** argv) {
     if (air_clamp > 255) air_clamp = 255;
     if (shift_n < 0) shift_n = 0;
     if (shift_n > 7) shift_n = 7;
+    if (world < 1) world = 1;
+    if (rank < 0 || rank >= world) {
+        fprintf(stderr, "Invalid --rank %d (must be 0..%d)\n", rank, world - 1);
+        return 1;
+    }
 
     // Open shared log file for shard completion logging
     std::mutex log_mtx;
@@ -713,6 +725,8 @@ int main(int argc, char** argv) {
     printf("Outer jobs: %d  |  Inner jobs/shard: %d\n", jobs, inner_jobs);
     if (air_clamp > 0) printf("Air clamp: v <= %d -> %d\n", air_clamp, air_clamp);
     if (shift_n > 0) printf("Bit-shift: %d (ultra-compression mode)\n", shift_n);
+    if (world > 1) printf("Fanout: rank %d / world %d (sz %% %d == %d)\n",
+                           rank, world, world, rank);
     printf("\n");
 
     // Discover pyramid levels (all 6 by default, or a --levels CSV subset).
@@ -846,13 +860,22 @@ int main(int argc, char** argv) {
         size_t out_ny = (shape[1] + CHUNK_DIM - 1) / CHUNK_DIM;
         size_t out_nx = (shape[2] + CHUNK_DIM - 1) / CHUNK_DIM;
 
-        // Build list of shard positions to process
+        // Build list of shard positions to process.  With --world > 1 we
+        // only take sz planes where (sz % world == rank).  Interleaving by
+        // sz gives each VM a mix of dense and empty regions so wall times
+        // stay balanced.
         struct ShardPos { size_t sz, sy, sx; };
         std::vector<ShardPos> shard_positions;
-        for (size_t sz = 0; sz < shard_nz; sz++)
+        for (size_t sz = 0; sz < shard_nz; sz++) {
+            if (world > 1 && (sz % (size_t)world) != (size_t)rank) continue;
             for (size_t sy = 0; sy < shard_ny; sy++)
                 for (size_t sx = 0; sx < shard_nx; sx++)
                     shard_positions.push_back({sz, sy, sx});
+        }
+        if (world > 1) {
+            printf("  Fanout: this VM owns %zu of %zu shards\n",
+                   shard_positions.size(), shard_nz * shard_ny * shard_nx);
+        }
 
         // List existing shards for resume (one S3 list instead of per-shard HEAD)
         std::set<std::string> existing_shards;
