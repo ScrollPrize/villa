@@ -965,29 +965,31 @@ int main(int argc, char** argv) {
         // bytes, hands it to the upload pool, and releases the in-flight
         // shard slot.
         auto finalize_shard = [&](std::shared_ptr<ShardState> shard) {
-            if (shard->any_data.load()) {
-                std::vector<std::byte> shard_data;
-                for (size_t j = 0; j < shard->result_kind.size(); j++) {
-                    uint8_t kind = shard->result_kind[j];
-                    if (kind == RESULT_NONE) continue;
-                    size_t inner_idx = shard->result_inner_idx[j];
-                    if (kind == RESULT_ZERO) {
-                        write_zero_sentinel(shard->index_bytes.data() + inner_idx * 16);
-                    } else {
-                        const auto& bytes = shard->result_data[j];
-                        uint64_t offset = INDEX_BYTES + shard_data.size();
-                        uint64_t nbytes = bytes.size();
-                        write_le64(shard->index_bytes.data() + inner_idx * 16, offset);
-                        write_le64(shard->index_bytes.data() + inner_idx * 16 + 8, nbytes);
-                        shard_data.insert(shard_data.end(), bytes.begin(), bytes.end());
-                    }
+            // Always write the shard, even when it has no inner-chunk content:
+            // index_bytes is pre-filled with 0xFF (missing-sentinel for all 512
+            // inner chunks), so an empty shard is a valid 8KB-only object.
+            // Downstream readers expect every shard slot in the grid to exist.
+            std::vector<std::byte> shard_data;
+            for (size_t j = 0; j < shard->result_kind.size(); j++) {
+                uint8_t kind = shard->result_kind[j];
+                if (kind == RESULT_NONE) continue;
+                size_t inner_idx = shard->result_inner_idx[j];
+                if (kind == RESULT_ZERO) {
+                    write_zero_sentinel(shard->index_bytes.data() + inner_idx * 16);
+                } else {
+                    const auto& bytes = shard->result_data[j];
+                    uint64_t offset = INDEX_BYTES + shard_data.size();
+                    uint64_t nbytes = bytes.size();
+                    write_le64(shard->index_bytes.data() + inner_idx * 16, offset);
+                    write_le64(shard->index_bytes.data() + inner_idx * 16 + 8, nbytes);
+                    shard_data.insert(shard_data.end(), bytes.begin(), bytes.end());
                 }
-                std::vector<std::byte> shard_bytes(INDEX_BYTES + shard_data.size());
-                std::memcpy(shard_bytes.data(), shard->index_bytes.data(), INDEX_BYTES);
-                std::memcpy(shard_bytes.data() + INDEX_BYTES,
-                            shard_data.data(), shard_data.size());
-                enqueue_upload(shard->shard_key, std::move(shard_bytes));
             }
+            std::vector<std::byte> shard_bytes(INDEX_BYTES + shard_data.size());
+            std::memcpy(shard_bytes.data(), shard->index_bytes.data(), INDEX_BYTES);
+            std::memcpy(shard_bytes.data() + INDEX_BYTES,
+                        shard_data.data(), shard_data.size());
+            enqueue_upload(shard->shard_key, std::move(shard_bytes));
 
             int s_count = processed_shards.fetch_add(1) + 1;
             if (log_file.is_open()) {
