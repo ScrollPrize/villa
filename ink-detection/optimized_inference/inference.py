@@ -425,17 +425,13 @@ def predict_fn(
             for (images, xys, valids) in test_loader:
                 batch_count += 1
                 raw_batch_size = int(images.size(0))
-                # Drop fully-empty tiles: they contribute 0 to mask_pred/mask_count,
-                # so the forward pass on them is wasted compute.
-                nonempty = valids.view(raw_batch_size, -1).any(dim=1).bool()
-                if not bool(nonempty.all()):
-                    images = images[nonempty]
-                    xys = xys[nonempty]
-                    valids = valids[nonempty]
-                if images.size(0) == 0:
+                # If the whole batch is empty (all tiles fully zero), skip the forward
+                # pass entirely. We don't filter within a batch because torch.compile
+                # is invoked with dynamic=False and would recompile on every new shape.
+                if not bool(valids.view(raw_batch_size, -1).any()):
                     pbar.update(raw_batch_size)
                     continue
-                tile_count += int(images.size(0))
+                tile_count += raw_batch_size
                 with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=detailed_sync):
                     images = images.to(device, non_blocking=True)
 
