@@ -254,13 +254,37 @@ struct S3Backend : IOBackend {
             root_prefix = after_scheme.substr(host_end + 1);
         }
 
+        // Percent-encode a string for use as an S3 query parameter value.
+        // S3's continuation-token contains raw '+', '/', '=' bytes that
+        // collide with URL syntax; SigV4 canonicalization expects them
+        // percent-encoded so the canonical query string matches the wire form.
+        auto pct_encode = [](const std::string& s) {
+            std::string out;
+            out.reserve(s.size() * 3);
+            for (unsigned char c : s) {
+                bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                                  || (c >= '0' && c <= '9') || c == '-' || c == '_'
+                                  || c == '.' || c == '~';
+                if (unreserved) {
+                    out.push_back(static_cast<char>(c));
+                } else {
+                    static const char hex[] = "0123456789ABCDEF";
+                    out.push_back('%');
+                    out.push_back(hex[c >> 4]);
+                    out.push_back(hex[c & 0xF]);
+                }
+            }
+            return out;
+        };
+
         std::string full_prefix = root_prefix.empty() ? prefix : root_prefix + "/" + prefix;
-        std::string list_url_base = "https://" + host + "/?list-type=2&prefix=" + full_prefix;
+        std::string list_url_base =
+            "https://" + host + "/?list-type=2&prefix=" + pct_encode(full_prefix);
 
         do {
             std::string list_url = list_url_base;
             if (!continuation_token.empty()) {
-                list_url += "&continuation-token=" + continuation_token;
+                list_url += "&continuation-token=" + pct_encode(continuation_token);
             }
             list_url += "&max-keys=10000";
 
