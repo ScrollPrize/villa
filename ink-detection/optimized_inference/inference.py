@@ -271,12 +271,15 @@ class SlidingWindowDataset(Dataset):
                 worker_profiler.increment_counter("local_read_bytes", int(tile.nbytes), flag="approximate")
             if self.reverse:
                 tile = tile[:, :, ::-1]
+            # Validity: pixel is valid iff at least one z-layer is non-zero.
+            # Computed from the raw ROI before clipping so it reflects true surface coverage.
+            valid = np.any(tile != 0, axis=-1).astype(np.uint8)  # (tile_h, tile_w)
             # Clip to match training range - in-place for speed
             np.clip(tile, 0, CFG.max_clip_value, out=tile)
 
             data = self.transform(image=tile)  # -> tensor (C,H,W)
             tens = data["image"].unsqueeze(0)  # -> (1,C,H,W) so C becomes frames
-            return tens, self.xyxys[idx]
+            return tens, self.xyxys[idx], valid
 
 def create_inference_dataloader(
     source: LayersSource,
@@ -419,7 +422,7 @@ def predict_fn(
                 and getattr(profiler, "detailed_enabled", False)
             )
 
-            for (images, xys) in test_loader:
+            for (images, xys, valids) in test_loader:
                 batch_count += 1
                 tile_count += int(images.size(0))
                 with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=detailed_sync):
@@ -463,10 +466,15 @@ def predict_fn(
                 with scoped_timer(profiler, "postprocess_seconds"):
                     if torch.is_tensor(xys):
                         xys = xys.cpu().numpy().astype(np.int32)
+                    if torch.is_tensor(valids):
+                        valids_np = valids.cpu().numpy().astype(np.float32)
+                    else:
+                        valids_np = np.asarray(valids, dtype=np.float32)
                     for i in range(xys.shape[0]):
                         x1, y1, x2, y2 = [int(v) for v in xys[i]]
-                        mask_pred[y1:y2, x1:x2] += y_cpu[i]
-                        mask_count[y1:y2, x1:x2] += w_cpu
+                        v = valids_np[i]
+                        mask_pred[y1:y2, x1:x2] += y_cpu[i] * v
+                        mask_count[y1:y2, x1:x2] += w_cpu * v
                 pbar.update(images.size(0))
             pbar.close()
 
