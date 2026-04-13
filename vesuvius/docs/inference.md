@@ -90,9 +90,11 @@ Finalize logits into probabilities or masks and optionally build a multiscale py
 ```bash
 vesuvius.finalize_outputs /tmp/merged_logits.zarr /tmp/final_output.zarr \
   --mode binary \
-  --threshold \
+  --threshold 0.3 \
   --delete-intermediates
 ```
+
+`--threshold` accepts an optional probability cutoff in `(0, 1)`. Bare `--threshold` defaults to `0.5` (backwards-compatible). The right value is model-dependent and should come from validation — `0.3` above is illustrative, not a recommendation.
 
 ### Options
 
@@ -101,7 +103,7 @@ vesuvius.finalize_outputs /tmp/merged_logits.zarr /tmp/final_output.zarr \
 | `input_path` | Path to the blended logits Zarr (level `0` is the logits array).
 | `output_path` | Destination multiscale Zarr root.
 | `--mode` | `binary` (default), `multiclass`, or `surface_frame` (keeps 9-channel frame outputs; no thresholding).
-| `--threshold` | For binary: emit a single-channel argmax mask. For multiclass: emit just the argmax channel. Ignored in `surface_frame` mode.
+| `--threshold [VALUE]` | For binary: binarize the probability map at the given cutoff (bare flag defaults to `0.5`; accepts any value in `(0, 1)`, e.g. `--threshold 0.3`). For multiclass: only the bare form is accepted and emits the argmax channel — numeric values are rejected. Ignored in `surface_frame` mode.
 | `--delete-intermediates` | Remove the source logits after a successful run.
 | `--chunk-size` | Spatial chunk size for the output store (`Z,Y,X`). Defaults to the logits chunking.
 | `--num-workers` | Worker processes for finalization (defaults to half of CPU cores).
@@ -130,7 +132,7 @@ vesuvius.blend_logits s3://vesuvius/tmp/logits s3://vesuvius/tmp/merged_logits.z
     --num_workers 32 \
     --chunk_size 256,256,256
 
-# 3. Finalize outputs
+# 3. Finalize outputs (bare --threshold = 0.5; use e.g. --threshold 0.3 for a different cutoff)
 vesuvius.finalize_outputs s3://vesuvius/tmp/merged_logits.zarr s3://vesuvius/output/final.zarr \
     --mode binary \
     --threshold \

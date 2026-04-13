@@ -1029,13 +1029,16 @@ def blend_and_finalize_main():
     # Finalization args
     parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
                         help='Finalization mode. Default: binary')
-    parser.add_argument('--threshold', action='store_true',
-                        help='Apply argmax and only save class predictions (no probabilities).')
+    from vesuvius.models.run.finalize_outputs import add_threshold_argument
+    add_threshold_argument(parser)
 
     args = parser.parse_args()
 
     if args.part_id < 0 or args.part_id >= args.num_parts:
         parser.error(f"Invalid part_id {args.part_id} for num_parts {args.num_parts}.")
+
+    from vesuvius.models.run.finalize_outputs import validate_threshold_args
+    validate_threshold_args(parser, args)
 
     chunks = None
     if args.chunk_size:
