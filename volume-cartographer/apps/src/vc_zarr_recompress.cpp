@@ -27,10 +27,13 @@
 //   s3+us-east-1://bucket/...     (S3 with explicit region)
 //
 // Options:
-//   --qp N        H265 quantization parameter (0-51) [default: 15]
-//   --verify      Verify roundtrip (decode after encode)
-//   --jobs N      Worker threads [default: 2x hardware threads]
-//   --log FILE    Log completed shards to this file [default: none]
+//   --qp N          H265 quantization parameter (0-51) [default: 36]
+//   --verify        Verify roundtrip (decode after encode)
+//   --jobs N        Outer worker threads (shards in flight) [default: 8]
+//   --inner-jobs K  Inner worker threads per shard (chunks in flight)
+//                   [default: hardware_concurrency]
+//   --shift N       Grid shift (see original code)
+//   --log FILE      Log completed shards to this file [default: none]
 
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +47,7 @@
 #include <thread>
 #include <mutex>
 #include <set>
+#include <unordered_set>
 #include <chrono>
 
 #include "utils/Json.hpp"
@@ -520,10 +524,13 @@ int main(int argc, char** argv) {
                   << "Input/output: local path or s3://bucket/path\n"
                   << "\n"
                   << "Options:\n"
-                  << "  --qp N        H265 quantization (0-51, lower=better) [15]\n"
-                  << "  --verify      Verify roundtrip after encoding\n"
-                  << "  --jobs N      Worker threads [2x HW threads]\n"
-                  << "  --log FILE    Log completed shards to file\n";
+                  << "  --qp N           H265 quantization (0-51, lower=better) [36]\n"
+                  << "  --verify         Verify roundtrip after encoding\n"
+                  << "  --jobs N         Outer workers (shards in flight) [8]\n"
+                  << "  --inner-jobs K   Inner workers per shard (chunks in flight)\n"
+                  << "                   [default: hardware_concurrency]\n"
+                  << "  --shift N        Grid shift\n"
+                  << "  --log FILE       Log completed shards to file\n";
         return 1;
     }
 
@@ -531,9 +538,16 @@ int main(int argc, char** argv) {
 
     std::string input_path = argv[1];
     std::string output_path = argv[2];
-    int qp = 15;
+    int qp = 36;
     bool verify = false;
-    int jobs = std::max(1, (int)std::thread::hardware_concurrency() * 2);
+    // Outer workers process shards in parallel. Since the per-shard work is
+    // now mostly parallel internally (see --inner-jobs), a modest outer count
+    // is enough to hide per-shard upload latency. Default 8.
+    int jobs = 8;
+    // Inner workers do concurrent chunk download + decode + encode within
+    // a single shard. Scale with hardware_concurrency to saturate network
+    // RTT (one chunk fetch ~30-80 ms over S3) and CPU on encode.
+    int inner_jobs = std::max(1, (int)std::thread::hardware_concurrency());
     std::string log_path;
 
     for (int i = 3; i < argc; i++) {
@@ -541,6 +555,7 @@ int main(int argc, char** argv) {
         if (arg == "--qp" && i + 1 < argc) qp = std::atoi(argv[++i]);
         else if (arg == "--verify") verify = true;
         else if (arg == "--jobs" && i + 1 < argc) jobs = std::atoi(argv[++i]);
+        else if (arg == "--inner-jobs" && i + 1 < argc) inner_jobs = std::atoi(argv[++i]);
         else if (arg == "--log" && i + 1 < argc) log_path = argv[++i];
     }
 
@@ -561,7 +576,7 @@ int main(int argc, char** argv) {
     printf("Input:  %s\n", input_path.c_str());
     printf("Output: %s\n", output_path.c_str());
     printf("H265 QP: %d, shard: %zu³, chunk: %zu³\n", qp, SHARD_DIM, CHUNK_DIM);
-    printf("Jobs: %d\n\n", jobs);
+    printf("Outer jobs: %d  |  Inner jobs/shard: %d\n\n", jobs, inner_jobs);
 
     // Discover pyramid levels (always process all 6: 0-5)
     std::vector<int> levels;
@@ -782,23 +797,40 @@ int main(int argc, char** argv) {
                 std::vector<std::byte> index_bytes(INDEX_BYTES);
                 std::memset(index_bytes.data(), 0xFF, INDEX_BYTES);
 
-                // Compressed chunk data accumulator (appended one chunk at a time)
-                std::vector<std::byte> shard_data;
-                bool any_data = false;
+                // 1) Pre-list input chunks for this shard's region so we
+                //    can skip GETs for non-existent chunks (avoids 404 RTT
+                //    waste on sparse volumes). One LIST per cz plane in the
+                //    shard — up to 8 LIST calls vs 512 per-chunk GETs.
+                std::unordered_set<std::string> existing_input;
+                for (size_t iz = 0; iz < CHUNKS_PER_SHARD; iz++) {
+                    size_t cz = base_cz + iz;
+                    if (cz >= out_nz) break;
+                    std::string cz_prefix = level_prefix + std::to_string(cz) + dim_sep;
+                    try {
+                        auto keys = t_input->list_chunks(cz_prefix);
+                        for (auto& k : keys) existing_input.insert(std::move(k));
+                    } catch (...) {
+                        // LIST failure isn't fatal — fall through to per-chunk GET.
+                    }
+                }
 
+                // 2) Enumerate the pending chunks for this shard.
+                struct ChunkJob {
+                    size_t inner_idx;
+                    size_t cz, cy, cx;
+                    std::string src_key;
+                };
+                std::vector<ChunkJob> jobs_list;
+                jobs_list.reserve(INNER_CHUNKS);
                 for (size_t iz = 0; iz < CHUNKS_PER_SHARD; iz++) {
                     for (size_t iy = 0; iy < CHUNKS_PER_SHARD; iy++) {
                         for (size_t ix = 0; ix < CHUNKS_PER_SHARD; ix++) {
                             size_t cz = base_cz + iz;
                             size_t cy = base_cy + iy;
                             size_t cx = base_cx + ix;
-
-                            size_t inner_idx = iz * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD +
-                                               iy * CHUNKS_PER_SHARD + ix;
-
+                            size_t inner_idx = iz * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD
+                                             + iy * CHUNKS_PER_SHARD + ix;
                             if (cz >= out_nz || cy >= out_ny || cx >= out_nx) continue;
-
-                            // Check occupancy mask
                             if (!occ_mask.empty()) {
                                 size_t flat = cz * out_ny * out_nx + cy * out_nx + cx;
                                 if (!occ_mask[flat]) {
@@ -806,112 +838,154 @@ int main(int argc, char** argv) {
                                     continue;
                                 }
                             }
-
                             std::string src_key = level_prefix +
                                 std::to_string(cz) + dim_sep +
                                 std::to_string(cy) + dim_sep +
                                 std::to_string(cx);
-
-                            std::vector<std::byte> raw;
-                            try {
-                                auto data = t_input->read(src_key);
-
-                                // Already VC3D? Append as-is
-                                if (utils::is_video_compressed(
-                                        std::span<const std::byte>(data))) {
-                                    uint64_t offset = INDEX_BYTES + shard_data.size();
-                                    uint64_t nbytes = data.size();
-                                    write_le64(index_bytes.data() + inner_idx * 16, offset);
-                                    write_le64(index_bytes.data() + inner_idx * 16 + 8, nbytes);
-                                    shard_data.insert(shard_data.end(), data.begin(), data.end());
-                                    any_data = true;
-                                    processed_chunks.fetch_add(1);
-                                    total_compressed.fetch_add(data.size());
-                                    total_raw.fetch_add(CHUNK_VOXELS);
-                                    continue;
-                                }
-
-                                // Decompress blosc/zstd
-                                if (!compressor_id.empty()) {
-                                    raw = decompress_blosc(data, src_raw_bytes);
-                                } else {
-                                    raw = std::move(data);
-                                }
-                            } catch (...) {
-                                continue;  // chunk doesn't exist
+                            // If we have a listing and the chunk isn't in it,
+                            // skip entirely (saves a 404 round-trip).
+                            if (!existing_input.empty()
+                                && !existing_input.count(src_key)) {
+                                continue;
                             }
+                            jobs_list.push_back({inner_idx, cz, cy, cx, std::move(src_key)});
+                        }
+                    }
+                }
 
-                            // Convert uint16 -> uint8
-                            if (is_u16) {
-                                size_t n_voxels = raw.size() / 2;
-                                auto* src = reinterpret_cast<const uint16_t*>(raw.data());
-                                for (size_t i = 0; i < n_voxels; i++) {
-                                    raw[i] = static_cast<std::byte>(
-                                        static_cast<uint8_t>(src[i] / 257));
-                                }
-                                raw.resize(n_voxels);
-                            }
+                // 3) Results in the same order as jobs_list. Each entry either
+                //    holds a compressed chunk buffer, or a zero sentinel flag.
+                struct ChunkResult {
+                    bool has_data = false;   // true if any output (zero or compressed)
+                    bool is_zero = false;    // write zero sentinel to index
+                    std::vector<std::byte> compressed;  // non-empty if has_data && !is_zero
+                    size_t raw_bytes = 0;    // for stats
+                };
+                std::vector<ChunkResult> results(jobs_list.size());
 
-                            // Pad to 128³
-                            if (raw.size() < CHUNK_VOXELS) {
-                                std::vector<std::byte> padded(CHUNK_VOXELS, std::byte{0});
-                                std::memcpy(padded.data(), raw.data(), raw.size());
-                                raw = std::move(padded);
-                            } else if (raw.size() > CHUNK_VOXELS) {
-                                raw.resize(CHUNK_VOXELS);
-                            }
+                // 4) Inner parallelism: spawn K threads, each with its own
+                //    backend (curl handle) and libde265 decoder. Each pops
+                //    the next chunk index and fills results[i] independently.
+                const int n_inner = std::min<int>(inner_jobs,
+                                                  std::max<int>(1, (int)jobs_list.size()));
+                std::atomic<size_t> next_chunk{0};
+                auto inner_fn = [&]() {
+                    auto tt_input = make_backend(input_path);
+                    while (true) {
+                        size_t j = next_chunk.fetch_add(1);
+                        if (j >= jobs_list.size()) return;
+                        const ChunkJob& job = jobs_list[j];
+                        ChunkResult& res = results[j];
 
-                            // All-zero chunk? Mark with sentinel, don't encode
-                            if (is_all_zero(raw)) {
-                                write_zero_sentinel(index_bytes.data() + inner_idx * 16);
-                                any_data = true;
-                                zero_chunks.fetch_add(1);
+                        std::vector<std::byte> raw;
+                        try {
+                            auto data = tt_input->read(job.src_key);
+
+                            // Already VC3D? Pass through.
+                            if (utils::is_video_compressed(
+                                    std::span<const std::byte>(data))) {
+                                res.has_data = true;
+                                res.compressed = std::move(data);
+                                res.raw_bytes = CHUNK_VOXELS;
+                                total_raw.fetch_add(CHUNK_VOXELS);
+                                total_compressed.fetch_add(res.compressed.size());
+                                processed_chunks.fetch_add(1);
                                 continue;
                             }
 
-                            total_raw.fetch_add(CHUNK_VOXELS);
-
-                            // H265 encode
-                            utils::VideoCodecParams params;
-                            params.qp = qp;
-                            params.depth = CHUNK_DIM;
-                            params.height = CHUNK_DIM;
-                            params.width = CHUNK_DIM;
-
-                            auto compressed = utils::video_encode(
-                                std::span<const std::byte>(raw), params);
-                            total_compressed.fetch_add(compressed.size());
-
-                            // Verify before freeing raw
-                            if (verify) {
-                                auto decoded = utils::video_decode(
-                                    std::span<const std::byte>(compressed),
-                                    CHUNK_VOXELS, params);
-                                if (decoded.size() != raw.size() ||
-                                    std::memcmp(decoded.data(), raw.data(), raw.size()) != 0) {
-                                    verify_fail.fetch_add(1);
-                                    std::lock_guard lk(print_mtx);
-                                    fprintf(stderr, "  VERIFY FAIL: %s\n", src_key.c_str());
-                                } else {
-                                    verify_ok.fetch_add(1);
-                                }
+                            if (!compressor_id.empty()) {
+                                raw = decompress_blosc(data, src_raw_bytes);
+                            } else {
+                                raw = std::move(data);
                             }
-
-                            // Free raw — only compressed data kept in shard buffer
-                            raw.clear();
-                            raw.shrink_to_fit();
-
-                            // Record in index: offsets relative to start of shard file
-                            uint64_t offset = INDEX_BYTES + shard_data.size();
-                            uint64_t nbytes = compressed.size();
-                            write_le64(index_bytes.data() + inner_idx * 16, offset);
-                            write_le64(index_bytes.data() + inner_idx * 16 + 8, nbytes);
-
-                            shard_data.insert(shard_data.end(),
-                                              compressed.begin(), compressed.end());
-                            any_data = true;
-                            processed_chunks.fetch_add(1);
+                        } catch (...) {
+                            continue;  // chunk doesn't exist or read failed
                         }
+
+                        if (is_u16) {
+                            size_t n_voxels = raw.size() / 2;
+                            auto* src = reinterpret_cast<const uint16_t*>(raw.data());
+                            for (size_t i = 0; i < n_voxels; i++) {
+                                raw[i] = static_cast<std::byte>(
+                                    static_cast<uint8_t>(src[i] / 257));
+                            }
+                            raw.resize(n_voxels);
+                        }
+
+                        if (raw.size() < CHUNK_VOXELS) {
+                            std::vector<std::byte> padded(CHUNK_VOXELS, std::byte{0});
+                            std::memcpy(padded.data(), raw.data(), raw.size());
+                            raw = std::move(padded);
+                        } else if (raw.size() > CHUNK_VOXELS) {
+                            raw.resize(CHUNK_VOXELS);
+                        }
+
+                        if (is_all_zero(raw)) {
+                            res.has_data = true;
+                            res.is_zero = true;
+                            zero_chunks.fetch_add(1);
+                            continue;
+                        }
+
+                        total_raw.fetch_add(CHUNK_VOXELS);
+
+                        utils::VideoCodecParams params;
+                        params.qp = qp;
+                        params.depth = CHUNK_DIM;
+                        params.height = CHUNK_DIM;
+                        params.width = CHUNK_DIM;
+
+                        auto compressed = utils::video_encode(
+                            std::span<const std::byte>(raw), params);
+                        total_compressed.fetch_add(compressed.size());
+
+                        if (verify) {
+                            auto decoded = utils::video_decode(
+                                std::span<const std::byte>(compressed),
+                                CHUNK_VOXELS, params);
+                            if (decoded.size() != raw.size() ||
+                                std::memcmp(decoded.data(), raw.data(), raw.size()) != 0) {
+                                verify_fail.fetch_add(1);
+                                std::lock_guard lk(print_mtx);
+                                fprintf(stderr, "  VERIFY FAIL: %s\n", job.src_key.c_str());
+                            } else {
+                                verify_ok.fetch_add(1);
+                            }
+                        }
+
+                        res.has_data = true;
+                        res.compressed = std::move(compressed);
+                        res.raw_bytes = CHUNK_VOXELS;
+                        processed_chunks.fetch_add(1);
+                    }
+                };
+
+                std::vector<std::thread> inner_threads;
+                inner_threads.reserve(n_inner);
+                for (int i = 0; i < n_inner; i++) inner_threads.emplace_back(inner_fn);
+                for (auto& t : inner_threads) t.join();
+
+                // 5) Assemble shard in inner_idx order — compressed chunks may
+                //    be appended in any order as long as the index points to
+                //    each chunk's offset.
+                std::vector<std::byte> shard_data;
+                bool any_data = false;
+                for (size_t j = 0; j < results.size(); j++) {
+                    const ChunkResult& res = results[j];
+                    if (!res.has_data) continue;
+                    size_t inner_idx = jobs_list[j].inner_idx;
+                    if (res.is_zero) {
+                        write_zero_sentinel(index_bytes.data() + inner_idx * 16);
+                        any_data = true;
+                    } else {
+                        uint64_t offset = INDEX_BYTES + shard_data.size();
+                        uint64_t nbytes = res.compressed.size();
+                        write_le64(index_bytes.data() + inner_idx * 16, offset);
+                        write_le64(index_bytes.data() + inner_idx * 16 + 8, nbytes);
+                        shard_data.insert(shard_data.end(),
+                                          res.compressed.begin(),
+                                          res.compressed.end());
+                        any_data = true;
                     }
                 }
 
