@@ -85,7 +85,12 @@ auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params
     auto param_guard = std::unique_ptr<x265_param, void (*)(x265_param*)>(
         xparam, x265_param_free);
 
-    x265_param_default_preset(xparam, "ultrafast", "zerolatency");
+    // ultrafast: max encode speed.
+    // fastdecode: bitstream biased toward fast decode (fewer refs, simpler
+    //   entropy). Matters for us because VC3D decodes chunks many times per
+    //   chunk during viewing. (zerolatency is for streaming and disables
+    //   bframes; we get better ratio with fastdecode + bframes=2.)
+    x265_param_default_preset(xparam, "ultrafast", "fastdecode");
     xparam->sourceWidth = padW;
     xparam->sourceHeight = padH;
     xparam->internalCsp = X265_CSP_I400;
@@ -98,6 +103,31 @@ auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params
     xparam->bEnableWavefront = 0;
     xparam->frameNumThreads = 1;
     xparam->logLevel = X265_LOG_NONE;
+
+    // Small frames (128x128 per Z slice): 32x32 CTUs match the content
+    // better than the default 64x64. Fewer CTUs per frame, each fully
+    // covered instead of mostly-wasted. Also bound min CU at 16 so the
+    // encoder doesn't waste time on 8x8 partition search.
+    xparam->maxCUSize = 32;
+    xparam->minCUSize = 16;
+
+    // Allow 2 B-frames under ultrafast+fastdecode. Gives the encoder some
+    // temporal redundancy to exploit. Typically 5-15% smaller files with
+    // minor encode-time cost; decode cost is still bounded by fastdecode
+    // (refs capped, no weighted prediction).
+    xparam->bframes = 2;
+
+    // Disable in-loop filters on decode. Deblocking and SAO are there to
+    // clean up blocking artifacts at low bitrates for human viewing.
+    // Our data is scientific uint8 voxels — we'd rather have fewer decode
+    // cycles per chunk. Quality hit at qp=36 is negligible.
+    xparam->bEnableLoopFilter = 0;
+    xparam->bEnableSAO = 0;
+
+    // Psycho-visual rate distortion targets human perception. Zero effect
+    // for scientific grayscale; turning it off saves encode time.
+    xparam->psyRd = 0.0;
+    xparam->psyRdoq = 0.0;
 
     x265_encoder* enc = x265_encoder_open(xparam);
     if (!enc) throw std::runtime_error("video_encode: encoder open failed");
