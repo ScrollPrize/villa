@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <limits>
 #include <algorithm>
 #include <numeric>
 #include <random>
@@ -145,6 +146,7 @@ int main(int argc, char** argv) {
     std::vector<int> all_errors;
     size_t total_compared = 0;
     double total_abs_error = 0;
+    double total_sq_error = 0;  // for PSNR
     int chunks_compared = 0;
     int chunks_skipped = 0;
 
@@ -250,12 +252,15 @@ int main(int argc, char** argv) {
 
                     // Compare
                     size_t n = std::min(decoded.size(), raw.size());
+                    double shard_sq_error_local = 0;
                     for (size_t i = 0; i < n; i++) {
                         int diff = std::abs((int)static_cast<uint8_t>(decoded[i]) -
                                             (int)static_cast<uint8_t>(raw[i]));
                         shard_abs_error += diff;
+                        shard_sq_error_local += double(diff) * diff;
                         if (diff > 0) shard_errors.push_back(diff);
                     }
+                    total_sq_error += shard_sq_error_local;
                     shard_voxels += n;
                     shard_chunks++;
                     chunks_compared++;
@@ -289,7 +294,13 @@ int main(int argc, char** argv) {
 
     if (total_compared > 0) {
         double mae = total_abs_error / total_compared;
-        printf("Global MAE: %.4f\n", mae);
+        double mse = total_sq_error / total_compared;
+        double psnr = (mse > 0) ? 10.0 * std::log10(255.0 * 255.0 / mse)
+                                : std::numeric_limits<double>::infinity();
+        double rmse = std::sqrt(mse);
+        printf("Global MAE:  %.4f\n", mae);
+        printf("Global RMSE: %.4f\n", rmse);
+        printf("Global PSNR: %.2f dB\n", psnr);
 
         if (!all_errors.empty()) {
             std::sort(all_errors.begin(), all_errors.end());
