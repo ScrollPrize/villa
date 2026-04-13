@@ -424,6 +424,17 @@ def predict_fn(
 
             for (images, xys, valids) in test_loader:
                 batch_count += 1
+                raw_batch_size = int(images.size(0))
+                # Drop fully-empty tiles: they contribute 0 to mask_pred/mask_count,
+                # so the forward pass on them is wasted compute.
+                nonempty = valids.view(raw_batch_size, -1).any(dim=1)
+                if not bool(nonempty.all()):
+                    images = images[nonempty]
+                    xys = xys[nonempty]
+                    valids = valids[nonempty]
+                if images.size(0) == 0:
+                    pbar.update(raw_batch_size)
+                    continue
                 tile_count += int(images.size(0))
                 with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=detailed_sync):
                     images = images.to(device, non_blocking=True)
@@ -475,7 +486,7 @@ def predict_fn(
                         v = valids_np[i]
                         mask_pred[y1:y2, x1:x2] += y_cpu[i] * v
                         mask_count[y1:y2, x1:x2] += w_cpu * v
-                pbar.update(images.size(0))
+                pbar.update(raw_batch_size)
             pbar.close()
 
         # Always write results to zarr
